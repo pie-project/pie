@@ -163,11 +163,8 @@ pub fn roots(package: &LaunchPackage, at: usize) -> Vec<u32> {
         }
     };
     for op in &stage.ops {
-        for &arg in &op.args {
+        for arg in op.reads() {
             note(arg, &mut roots);
-        }
-        if op.tag == tags::PIVOT_THRESHOLD {
-            note(op.pred_payload, &mut roots);
         }
     }
     for put in &stage.puts {

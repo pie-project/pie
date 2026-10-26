@@ -75,13 +75,9 @@ pub struct LaunchOp {
 }
 
 impl LaunchOp {
-    /// Every value the op reads: its arguments, and a pivot's predicate
-    /// operand, kept beside them in `pred_payload`.
+    /// Every value the op reads, by the wire's rule ([`eta_ir::wire::reads`]).
     pub fn reads(&self) -> impl Iterator<Item = u32> + '_ {
-        self.args
-            .iter()
-            .copied()
-            .chain((self.tag == tags::PIVOT_THRESHOLD).then_some(self.pred_payload))
+        eta_ir::wire::reads(self.tag, &self.args, self.pred_payload)
     }
 }
 

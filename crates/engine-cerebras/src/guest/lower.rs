@@ -261,11 +261,8 @@ pub fn roots(package: &LaunchPackage, at: usize) -> Vec<u32> {
         }
     };
     for op in &stage.ops {
-        for &arg in &op.args {
+        for arg in op.reads() {
             note(arg, &mut roots);
-        }
-        if op.tag == tags::PIVOT_THRESHOLD {
-            note(op.pred_payload, &mut roots);
         }
     }
     for put in &stage.puts {
@@ -319,7 +316,7 @@ fn packed_masks(package: &LaunchPackage, stage: &LaunchStage, v: u32) -> HashSet
             let mut used = false;
             for op in &stage.ops {
                 let arity = op.args.len();
-                for (k, &arg) in op.args.iter().enumerate() {
+                for (k, arg) in op.reads().enumerate() {
                     if arg != id {
                         continue;
                     }
@@ -331,9 +328,6 @@ fn packed_masks(package: &LaunchPackage, stage: &LaunchStage, v: u32) -> HashSet
                     if !fine {
                         continue 'ids;
                     }
-                }
-                if op.tag == tags::PIVOT_THRESHOLD && op.pred_payload == id {
-                    continue 'ids;
                 }
             }
             if used {
@@ -652,11 +646,8 @@ pub fn lower(package: &LaunchPackage, at: usize, batch: Batch) -> Lowering<Lower
     // Where each value is read last (a put value lives to the end).
     let mut last_use: HashMap<u32, usize> = HashMap::new();
     for (i, op) in stage.ops.iter().enumerate() {
-        for &arg in &op.args {
+        for arg in op.reads() {
             last_use.insert(arg, i);
-        }
-        if op.tag == tags::PIVOT_THRESHOLD {
-            last_use.insert(op.pred_payload, i);
         }
     }
     for put in &stage.puts {
