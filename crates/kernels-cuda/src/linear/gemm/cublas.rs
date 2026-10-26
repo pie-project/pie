@@ -486,11 +486,37 @@ pub(crate) fn anchored(
             let bytes = (m as usize) * (n as usize) * (parts as usize) * epi.product_bytes();
             let products = ctx.scratch_stream(op, ANCHOR_PRODUCTS, bytes)?.addr() as u64;
             product(ctx, op, epi, act, w, products, m, n * parts, k)?;
-            leg.fire(ctx, products, ins, outs, m.unsigned_abs(), n.unsigned_abs())?;
+            let ins = scaled(ctx, op, epi, act, ins, m.unsigned_abs(), k.unsigned_abs())?;
+            leg.fire(ctx, products, &ins, outs, m.unsigned_abs(), n.unsigned_abs())?;
             Ok(true)
         }
         _ => unfused(ctx, op, epi, act, w, ins, outs, m, n, k),
     }
+}
+
+/// `ins` as the unfused leg reads them: a normed operand's row scales (`m`
+/// rows of `act`, `k` wide) landed by `norm_scales` in a plane of their own,
+/// the norm's input reading it; the rest as they are.
+fn scaled(
+    ctx: &Ctx,
+    op: &'static str,
+    epi: &Epilogue,
+    act: u64,
+    ins: &[In],
+    m: u32,
+    k: u32,
+) -> Result<Vec<In>, Error> {
+    let Some(norm) = epi.norm() else {
+        return Ok(ins.to_vec());
+    };
+    let scales = ctx
+        .scratch_stream(op, ANCHOR_SCALES, m as usize * 4)?
+        .addr() as u64;
+    crate::linear::skeleton::norm_scales(ctx, norm, act, scales, m, k)?;
+    Ok(ins
+        .iter()
+        .map(|&input| if input.is_norm() { In::norm().at(scales) } else { input })
+        .collect())
 }
 
 /// `out = epi(act . w^T)` on cuBLASLt's own epilogue alone, at the first of
@@ -596,11 +622,25 @@ fn unfused(
     let products = ctx
         .scratch_stream(op, ANCHOR_PRODUCTS, run * row_bytes)?
         .addr() as u64;
+    // A normed operand's row scales, f32, the leg's to read.
+    let scales = match epi.norm() {
+        Some(_) => ctx.scratch_stream(op, ANCHOR_SCALES, run * 4)?.addr() as u64,
+        None => 0,
+    };
     let mut from = 0usize;
     while from < m as usize {
         let rows = run.min(m as usize - from);
         let at = |base: u64, width: usize| base + (from * width * 2) as u64;
-        let ins: Vec<In> = ins.iter().map(|input| input.from_row(from)).collect();
+        let ins: Vec<In> = ins
+            .iter()
+            .map(|input| {
+                if input.is_norm() {
+                    In::norm().at(scales)
+                } else {
+                    input.from_row(from)
+                }
+            })
+            .collect();
         let outs: Vec<u64> = (0..outs.len())
             .zip(outs)
             .map(|(r, &out)| at(out, epi.window(r, n.unsigned_abs()).width as usize))
@@ -617,6 +657,16 @@ fn unfused(
             wide as i32,
             k,
         )?;
+        if let Some(norm) = epi.norm() {
+            crate::linear::skeleton::norm_scales(
+                ctx,
+                norm,
+                at(act, k as usize),
+                scales,
+                rows_i.unsigned_abs(),
+                k.unsigned_abs(),
+            )?;
+        }
         leg.fire(
             ctx,
             products,
@@ -656,6 +706,9 @@ const UNFUSED_BYTES: usize = 64 << 20;
 
 /// The plane an anchored region's unfused leg lands its products in.
 const ANCHOR_PRODUCTS: &str = "linear.anchor_products";
+
+/// The plane a normed operand's row scales land in, the unfused leg's.
+const ANCHOR_SCALES: &str = "linear.anchor_scales";
 
 fn run_tactic(
     handle: cublasHandle_t,
@@ -756,7 +809,23 @@ fn run_tactic(
             } else {
                 gemm_ex_f32(handle, plain) == cublasStatus_t::CUBLAS_STATUS_SUCCESS
             };
+            // A normed operand's row scales, the leg's to read.
+            let scaled = a.epi.norm().is_none_or(|norm| {
+                a.ins().iter().find(|i| i.is_norm()).is_some_and(|input| {
+                    crate::linear::skeleton::norm_scales(
+                        // SAFETY: as above.
+                        &unsafe { Ctx::on(stream) }.with_tuning(tuning),
+                        norm,
+                        call.act,
+                        input.base(),
+                        call.m.unsigned_abs(),
+                        call.k.unsigned_abs(),
+                    )
+                    .is_ok()
+                })
+            });
             landed
+                && scaled
                 && leg
                     .fire(
                         // SAFETY: as above.
@@ -1854,7 +1923,10 @@ impl TuneArena {
         let act_bytes = ((call.m as usize) * (call.k as usize) * 2).max(1);
         // An anchored region's products, then its results.
         let tiles = call.anchor.map_or(1, |a| {
-            a.epi.parts() as usize * a.epi.product_bytes() / 2 + a.n_outs
+            // and a normed operand's row scales, a tile holding them
+            a.epi.parts() as usize * a.epi.product_bytes() / 2
+                + a.n_outs
+                + usize::from(a.epi.norm().is_some())
         });
         let y_bytes = ((call.m as usize) * (call.n as usize) * 2 * tiles).max(1);
         self.workspace_bytes = workspace_bytes;
@@ -1944,6 +2016,12 @@ impl TuneArena {
             let products = u64::from(a.epi.parts()) * tile * a.epi.product_bytes() as u64 / 2;
             for (r, out) in (0u64..).zip(a.outs.iter_mut().take(a.n_outs)) {
                 *out = y + products + r * tile;
+            }
+            let scales = y + products + a.n_outs as u64 * tile;
+            for input in a.ins.iter_mut().take(a.n_ins) {
+                if input.is_norm() {
+                    *input = In::norm().at(scales);
+                }
             }
             a
         });
