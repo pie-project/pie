@@ -586,8 +586,6 @@ struct Pass<'p> {
     prologue: String,
     body: Bodies,
     pointer: &'p mut dyn FnMut(u32) -> String,
-    /// A value's whole storage and descriptor, for a keyed draw's state.
-    whole: &'p mut dyn FnMut(u32) -> (String, String),
 }
 
 fn read(streams: &Streams<'_>, value: u32, want: Dtype, pass: &mut Pass<'_>) -> String {
@@ -807,7 +805,6 @@ pub(super) fn emit_stream(
     streams: &Streams<'_>,
     at: usize,
     pointer: &mut dyn FnMut(u32) -> String,
-    whole: &mut dyn FnMut(u32) -> (String, String),
     tail: &str,
 ) -> Option<usize> {
     let members = streams.plan(at)?;
@@ -855,7 +852,6 @@ pub(super) fn emit_stream(
         prologue: String::new(),
         body: Bodies::default(),
         pointer,
-        whole,
     };
     let mut epilogue = String::new();
     let mut float_reductions = 0u32;
@@ -900,10 +896,11 @@ pub(super) fn emit_stream(
                         "    const m1_u64 seed{node} = ptir_rng_seed_eff_stream((m1_u32)p{node}.rng_seed, p{node}.imm);"
                     );
                 } else {
-                    let (state, state_desc) = (pass.whole)(op.args[0]);
+                    let state = op.args[0];
+                    let sp = (pass.pointer)(state);
                     let _ = writeln!(
                         pass.prologue,
-                        "    const m1_u64 seed{node} = ptir_rng_state_seed({state}, {state_desc});"
+                        "    const m1_u64 seed{node} = ptir_rng_state_seed({sp}, descriptors[{state}u]);"
                     );
                 }
                 if op.kind == eta_ir::types::RngKind::Normal as u8 {

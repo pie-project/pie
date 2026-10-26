@@ -164,16 +164,9 @@ pub(crate) fn fused_partition(
             continue;
         }
         let (geometry, witness) = class(node);
-        // A keyed draw reads its state whole, every row of it: a state the
-        // run computes row by row is another block's until the run ends.
-        let reads_run_rows = matches!(geometry, Geometry::Rows { .. })
-            && match &stage.ops[node.index()] {
-                Op::RngKeyed { state, .. } => index
-                    .producer(*state)
-                    .is_some_and(|producer| generated.contains(&producer)),
-                _ => false,
-            };
-        if reads_run_rows || run.is_some_and(|(seen, _)| seen != geometry) {
+        if run.is_some_and(|(seen, _)| seen != geometry)
+            || splits_a_view(stage, index, &generated, node, geometry, alias)
+        {
             flush_generated_run(stage, index, &mut regions, &mut generated, &mut run, alias);
         }
         match run {
@@ -190,6 +183,45 @@ pub(crate) fn fused_partition(
         regions,
         whole_stage_fallback: false,
     }
+}
+
+/// Whether `node` would read a value whole that the run reads or writes by
+/// rows, or by rows one the run reads whole. A region gives each value one
+/// view (`row_views`): a value read whole is every row of it, which a block
+/// computing or reading only its own row does not hold.
+fn splits_a_view(
+    stage: &NormalizedStage,
+    index: &StageIndex,
+    run: &[NodeIndex],
+    node: NodeIndex,
+    geometry: Geometry,
+    alias: Option<(u32, u64)>,
+) -> bool {
+    let Geometry::Rows { fixed, extent } = geometry else {
+        return false;
+    };
+    let alias = alias
+        .filter(|&(role, _)| fixed == 1 && role == extent)
+        .map(|(_, count)| count);
+    let by_rows = |value: ValueId| {
+        stage
+            .value_types
+            .get(value as usize)
+            .is_some_and(|ty| row_view(&ty.dims, fixed, extent, alias) != RowView::Whole)
+    };
+    let op = &stage.ops[node.index()];
+    op.operands()
+        .into_iter()
+        .filter(|&v| by_rows(v))
+        .any(|value| {
+            let whole = reads_whole(op, value);
+            run.iter().any(|&other| {
+                let other_op = &stage.ops[other.index()];
+                (whole && index.producer(value) == Some(other))
+                    || (other_op.operands().contains(&value)
+                        && reads_whole(other_op, value) != whole)
+            })
+        })
 }
 
 fn flush_generated_run(
@@ -510,6 +542,72 @@ pub fn same_rows(shape: (u64, u32), geometry: (u64, u32), alias: Option<u64>) ->
     shape == geometry || (geometry.0 == 1 && alias.is_some_and(|n| shape == (n, u32::MAX)))
 }
 
+/// How a value sits in the rows of a row-parallel region: each row's block
+/// holds one row of it, one element of it, or the whole of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum RowView {
+    Whole = 0,
+    Row = 1,
+    Element = 2,
+}
+
+/// The view a value's shape gives it in rows `(fixed, extent)`.
+pub(crate) fn row_view(dims: &[Dimension], fixed: u64, extent: u32, alias: Option<u64>) -> RowView {
+    if dims.len() >= 2
+        && value_rows(dims).is_some_and(|shape| same_rows(shape, (fixed, extent), alias))
+    {
+        RowView::Row
+    } else if is_row_vector(dims, fixed, extent, alias) {
+        RowView::Element
+    } else {
+        RowView::Whole
+    }
+}
+
+/// Whether `op` reads its operand `value` whole wherever it runs: one value,
+/// never a row's slice of it, whatever rows its shape resembles. A keyed
+/// draw's state `[key, counter]` is one.
+pub(crate) fn reads_whole(op: &Op, value: ValueId) -> bool {
+    matches!(op, Op::RngKeyed { state, .. } if *state == value)
+}
+
+/// The view of each of the stage's values in `region`, a row-parallel
+/// region of rows `geometry`: its shape's, but whole where an op of the
+/// region reads it whole. The partition keeps every other op of the region
+/// from reading or writing such a value by rows, so a value's one view serves
+/// each of its uses.
+pub(crate) fn row_views(
+    stage: &NormalizedStage,
+    region: &Region,
+    geometry: (u64, u32),
+) -> Vec<RowView> {
+    // Rows that are a role the stage also states as a count: the region was
+    // formed on the role, whichever form its witness takes, and reads values
+    // of either form as its rows.
+    let (fixed, extent) = match (geometry, region.row_alias) {
+        ((n, u32::MAX), Some((role, m))) if n == m => (1, role),
+        _ => geometry,
+    };
+    let alias = region.row_alias.map(|(_, count)| count);
+    let mut views: Vec<RowView> = stage
+        .value_types
+        .iter()
+        .map(|ty| row_view(&ty.dims, fixed, extent, alias))
+        .collect();
+    for node in &region.nodes {
+        let op = &stage.ops[node.index()];
+        for value in op.operands() {
+            if reads_whole(op, value)
+                && let Some(view) = views.get_mut(value as usize)
+            {
+                *view = RowView::Whole;
+            }
+        }
+    }
+    views
+}
+
 pub(crate) fn row_alias(stage: &NormalizedStage, index: &StageIndex) -> Option<(u32, u64)> {
     let mut found: Option<(u32, u64)> = None;
     for node in (0..stage.ops.len() as u32).map(NodeIndex) {
@@ -673,12 +771,11 @@ pub(crate) fn node_geometry(
     if !whitelisted {
         return (Geometry::Mixed, None);
     }
-    let state = matches!(op.tag(), tags::RNG | tags::RNG_KEYED);
     if vectors.iter().any(|&v| {
         stage.value_types.get(v as usize).is_none_or(|t| {
             !is_row_vector(&t.dims, fixed, extent, static_rows)
                 && !matches!(t.dims.as_slice(), [Dimension::Static(1)])
-                && !(state && operands.contains(&v))
+                && !(operands.contains(&v) && reads_whole(op, v))
         })
     }) {
         return (Geometry::Mixed, None);

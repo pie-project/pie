@@ -341,31 +341,12 @@ pub(crate) fn row_geometry(stage: &CompiledStage, region: &Region) -> Option<(u6
         .filter(|&(fixed, extent)| !(fixed == 1 && extent == u32::MAX))
 }
 
+/// Each value's row kind in a row-parallel region, as the planner views it
+/// (`plan::row_views`): 1 a row, 2 an element, 0 whole.
 pub(crate) fn row_kinds(stage: &CompiledStage, region: &Region, geometry: (u64, u32)) -> Vec<u8> {
-    // Rows that are a role the stage also states as a count: the region was
-    // formed on the role, whichever form its witness takes, and reads values
-    // of either form as its rows.
-    let (fixed, extent) = match (geometry, region.row_alias) {
-        ((n, u32::MAX), Some((role, m))) if n == m => (1, role),
-        _ => geometry,
-    };
-    let alias = region.row_alias.map(|(_, count)| count);
-    stage
-        .normalized
-        .value_types
-        .iter()
-        .map(|ty| {
-            if ty.dims.len() >= 2
-                && crate::plan::value_rows(&ty.dims)
-                    .is_some_and(|shape| crate::plan::same_rows(shape, (fixed, extent), alias))
-            {
-                1
-            } else if crate::plan::is_row_vector(&ty.dims, fixed, extent, alias) {
-                2
-            } else {
-                0
-            }
-        })
+    crate::plan::row_views(&stage.normalized, region, geometry)
+        .into_iter()
+        .map(|view| view as u8)
         .collect()
 }
 
@@ -539,10 +520,6 @@ pub fn emit_fused_region(
 ",
         );
         source.push_str(
-            "  const M1ValueDesc* const ptir_wholedesc = descriptors;
-",
-        );
-        source.push_str(
             "  descriptors = ptir_rowdesc;
 ",
         );
@@ -581,21 +558,9 @@ pub fn emit_fused_region(
                 let value = aliases.resolve(value);
                 format!("scratch + offsets[{value}] + ptir_rowshift[{value}]")
             };
-            let mut whole = |value: u32| {
-                let value = aliases.resolve(value);
-                (
-                    format!("scratch + offsets[{value}]"),
-                    format!("ptir_wholedesc[{value}u]"),
-                )
-            };
-            if let Some(covered) = super::stream::emit_stream(
-                &mut source,
-                streams,
-                at - 1,
-                &mut pointer,
-                &mut whole,
-                TAIL,
-            ) {
+            if let Some(covered) =
+                super::stream::emit_stream(&mut source, streams, at - 1, &mut pointer, TAIL)
+            {
                 at += covered - 1;
                 continue;
             }
@@ -617,24 +582,11 @@ pub fn emit_fused_region(
                 format!("scratch + offsets[{value}]")
             }
         };
-        // A keyed draw's state is one value `[key, counter]`, read whole —
-        // as the planner reads it — whatever rows its shape resembles.
-        let whole = |value: u32| {
-            let value = aliases.resolve(value);
-            let table = if row_parallel {
-                "ptir_wholedesc"
-            } else {
-                "descriptors"
-            };
-            (
-                format!("scratch + offsets[{value}]"),
-                format!("{table}[{value}u]"),
-            )
-        };
         let mut slots = Slots::of(op, base, resolve);
         let gumbel = direct.gumbel[node].map(|chain| GumbelSlots {
             intrinsic: chain.intrinsic,
-            state: whole(chain.state),
+            state: resolve(chain.state),
+            state_desc: aliases.resolve(chain.state),
             divisor: chain.divisor.map(resolve),
             divisor_desc: chain.divisor.map(|d| aliases.resolve(d)),
             noise_desc: aliases.resolve(chain.noise),
@@ -676,25 +628,16 @@ pub fn emit_fused_region(
                 "reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index])".to_string();
         }
 
-        if op.tag == tags::RNG_KEYED {
-            let (state, state_desc) = whole(op.args[0]);
-            let o0 = &slots.o0;
-            let _ = writeln!(
-                source,
-                "    ptir_parallel_rng_keyed({state}, {state_desc}, {o0}, descriptors[p.o0], p);"
-            );
-        } else {
-            emit_body(
-                &mut source,
-                stage,
-                op,
-                node,
-                &direct.intrinsic,
-                &slots,
-                gumbel.as_ref(),
-                dialect.cut_mark,
-            );
-        }
+        emit_body(
+            &mut source,
+            stage,
+            op,
+            node,
+            &direct.intrinsic,
+            &slots,
+            gumbel.as_ref(),
+            dialect.cut_mark,
+        );
 
         source.push_str(TAIL);
         if op.tag == tags::CHAN_PUT {
@@ -752,8 +695,8 @@ fn emit_table_staging(source: &mut String, ops: usize, values: usize) {
 
 struct GumbelSlots {
     intrinsic: u16,
-    /// The state's whole storage and descriptor.
-    state: (String, String),
+    state: String,
+    state_desc: u32,
     divisor: Option<String>,
     divisor_desc: Option<u32>,
     noise_desc: u32,
@@ -871,8 +814,8 @@ fn emit_body(
                 "        intrinsic_offsets[gumbel_intrinsic_index] + lane_row,
 ",
             );
-            let _ = writeln!(source, "        {},", chain.state.0);
-            let _ = writeln!(source, "        {},", chain.state.1);
+            let _ = writeln!(source, "        {},", chain.state);
+            let _ = writeln!(source, "        descriptors[{}u],", chain.state_desc);
             match (&chain.divisor, chain.divisor_desc) {
                 (Some(divisor), Some(desc)) => {
                     let _ = writeln!(source, "        {divisor},");
