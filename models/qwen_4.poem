@@ -957,7 +957,7 @@ def forward(m, inputs):
             r = inject(f, normed, w.mlp_res, m, r)
 
             x, _ = mix_in(r, mtp.mixer, m)
-            draft = ops.linear.lm_head(x, m.head)
+            draft = ops.linear.lm_head(ops.gather.gather_rows(x, input_mtp.readout_rows()), m.head)
             if step == 0:
                 output("mtp.logits", draft)
             token = ops.sampling.argmax([draft])
