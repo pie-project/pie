@@ -262,8 +262,11 @@ fn deviations(got: &[Vec<f32>], want: &[Vec<f32>]) -> Vec<(f32, f32)> {
 /// `kernel.elemwise.rows_vec`). Each step's logits then stay within
 /// [`SPREAD`] of the reference's spread, or twice the ops' own carry where
 /// that is wider, and the top token is the reference's unless the
-/// reference's gap to it is within the deviation (a near tie either run
-/// may break).
+/// reference's gap to it is within twice the deviation: the two tokens'
+/// logits may each move by it, so a near tie that close either run may
+/// break. (Each run's products are the GEMM tuner's timed picks, so which
+/// near ties break differs from one process to the next, though a process
+/// lands the same logits every time.)
 fn close(got: &[Vec<f32>], want: &[Vec<f32>], carry: &[Vec<f32>], against: &str) {
     close_within(got, want, carry, against, SPREAD);
 }
@@ -296,7 +299,7 @@ fn close_within(
         let (top, picked) = (argmax(want), argmax(got));
         let gap = want[top as usize] - want[picked as usize];
         assert!(
-            top == picked || gap <= deviation,
+            top == picked || gap <= 2.0 * deviation,
             "step {step}: token {picked} tops the logits, {against} token {top} by {gap}"
         );
     }
