@@ -358,6 +358,37 @@ __global__ void gather_bits(const u8* __restrict__ src, u8* __restrict__ dst, u3
     }
 }
 
+struct BitRun {
+    const u8* src;
+    u32 dst_byte;
+    u32 bits;
+};
+
+static_assert(sizeof(BitRun) == 16, "BitRun: the Rust `channel::BitRun` mirrors this layout");
+
+// Packs each of `run_count` runs, a block a run: run r's `bits` bool bytes
+// at its `src` (a lane's row of a channel cell) into the little-endian bits
+// `dst_byte` bytes past `dst` (that lane's row of the staged attention mask).
+__global__ void gather_bit_runs(
+    const BitRun* __restrict__ runs,
+    u8* __restrict__ dst,
+    u32 run_count)
+{
+    const u32 run = blockIdx.x;
+    if (run >= run_count) return;
+    const BitRun r = runs[run];
+    const u32 bytes = (r.bits + 7u) / 8u;
+    for (u32 byte = threadIdx.x; byte < bytes; byte += blockDim.x) {
+        u8 packed = 0;
+        for (u32 bit = 0; bit < 8u; ++bit) {
+            const u32 at = byte * 8u + bit;
+            if (at >= r.bits) break;
+            if (r.src[at] != 0u) packed |= static_cast<u8>(1u << bit);
+        }
+        dst[r.dst_byte + byte] = packed;
+    }
+}
+
 struct WordRun {
     const u32* src;
     u32 dst_word;

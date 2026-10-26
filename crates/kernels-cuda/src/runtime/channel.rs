@@ -344,6 +344,41 @@ pub fn gather_bits(ctx: &Ctx, src: DevicePtr, dst: DevicePtr, bits: u32) -> Resu
     )
 }
 
+/// One run of [`gather_bit_runs`]: `bits` bool bytes at `src` packed into
+/// bits `dst_byte` bytes past the destination.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BitRun {
+    pub src: DevicePtr,
+    pub dst_byte: u32,
+    pub bits: u32,
+}
+
+const _: () = assert!(size_of::<BitRun>() == 16);
+
+/// Packs each of `run_count` [`BitRun`]s at `runs` into `dst`, a block a run.
+pub fn gather_bit_runs(
+    ctx: &Ctx,
+    runs: DevicePtr,
+    dst: DevicePtr,
+    run_count: u32,
+) -> Result<(), Error> {
+    const OP: &str = "channel.gather_bit_runs";
+    if run_count == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::runtime::channel::gather_bit_runs"))
+            .apply(Launch::grid([run_count, 1, 1], [BITS_BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(runs),
+            ArgValue::Ptr(dst),
+            ArgValue::U32(run_count),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

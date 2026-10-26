@@ -438,6 +438,52 @@ fn gather_injects(
     Ok(())
 }
 
+/// Packs each lane's device-carried mask into its row of the staged mask at
+/// `mask`: past a few lanes in one gather launch over a staged run table,
+/// one launch each inside a stream capture.
+fn inject_masks(
+    device: &crate::device::Context,
+    runs: &mut Option<Buffer>,
+    mask: u64,
+    injects: &[MaskInject],
+) -> Result<()> {
+    let stream = device.stream();
+    if injects.len() < GATHERED_INJECTS || crate::device::alloc::is_capturing(stream) {
+        for inject in injects {
+            kernels_cuda::runtime::channel::gather_bits(
+                device.ctx(),
+                inject.src,
+                mask + inject.dst_off,
+                inject.bits,
+            )?;
+        }
+        return Ok(());
+    }
+    let table: Vec<kernels_cuda::runtime::channel::BitRun> = injects
+        .iter()
+        .map(|inject| kernels_cuda::runtime::channel::BitRun {
+            src: inject.src,
+            dst_byte: u32::try_from(inject.dst_off).unwrap_or(u32::MAX),
+            bits: inject.bits,
+        })
+        .collect();
+    let bytes = table.len() * size_of::<kernels_cuda::runtime::channel::BitRun>();
+    if runs.as_ref().is_none_or(|held| held.bytes() < bytes) {
+        *runs = Some(Buffer::zeroed(bytes.next_power_of_two())?);
+    }
+    let held = runs.as_mut().expect("sized just above");
+    // SAFETY: `BitRun` is plain `repr(C)` data, read as its bytes.
+    let raw = unsafe { core::slice::from_raw_parts(table.as_ptr().cast::<u8>(), bytes) };
+    held.stage(stream, 0, raw)?;
+    kernels_cuda::runtime::channel::gather_bit_runs(
+        device.ctx(),
+        held.ptr(),
+        mask,
+        u32::try_from(table.len()).unwrap_or(u32::MAX),
+    )?;
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Inputs {
     store: Buffer,
@@ -474,6 +520,8 @@ pub struct Inputs {
     plans: Vec<Option<Workspace>>,
     plan_values: usize,
     inject_runs: Option<Buffer>,
+    /// The staged run table of [`inject_masks`].
+    mask_runs: Option<Buffer>,
     /// Staged apart from the slab: their size is the groups', not the load's.
     group_masks: Option<Buffer>,
     /// Smaller ones it outgrew, kept: an earlier fire may still read them.
@@ -656,6 +704,7 @@ impl Inputs {
             max_lanes: crate::window::lane_capacity(budget.max_lanes),
             max_rows: budget.max_tokens,
             inject_runs: None,
+            mask_runs: None,
             group_masks: None,
             outgrown: Vec::new(),
             plan_values: grants.len(),
@@ -1153,6 +1202,7 @@ impl Inputs {
             store,
             staging,
             inject_runs,
+            mask_runs,
             ..
         } = self;
         let host = staging[slot.at() as usize].host();
@@ -1228,14 +1278,7 @@ impl Inputs {
             ));
         }
         // Over the cleared rows just staged, in stream order.
-        for inject in mask_injects {
-            kernels_cuda::runtime::channel::gather_bits(
-                device.ctx(),
-                inject.src,
-                base + at_mask + inject.dst_off,
-                inject.bits,
-            )?;
-        }
+        inject_masks(device, mask_runs, base + at_mask, mask_injects)?;
 
         Ok(Handles {
             tokens: i32s(base + at_tokens, rows),
