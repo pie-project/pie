@@ -52,15 +52,10 @@ impl Body {
                     .into(),
             ));
         }
-        let source = print::body(&kernel).map_err(|why| match why {
-            print::Unprinted::Rounding(dtype) => Refusal(format!(
+        let source = print::body(&kernel).map_err(|print::Unprinted(dtype)| {
+            Refusal(format!(
                 "a value rounds to {dtype:?}, which no hook rounds to"
-            )),
-            print::Unprinted::Vectors => Refusal(
-                "a small vector one a row or a repeat over one, which HIP's skeleton does not \
-                 hold yet"
-                    .into(),
-            ),
+            ))
         })?;
         Ok(Body {
             hash: kernels_ir::fnv1a64(source.as_bytes()),
@@ -87,25 +82,4 @@ impl Body {
 #[must_use]
 pub fn entrypoint(per: u32, ins: usize, outs: usize, ones: u32) -> String {
     format!("::pie::elemwise::row_skeleton<{BODY}, {BLOCK}, {per}, {ins}, {outs}, {ones}u>")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use kernels_ir::{Binary, Op, Shape};
-
-    /// A row scaled by a value of a small vector one a row: HIP's skeleton
-    /// holds no small vector yet, and its printer says so.
-    #[test]
-    fn a_small_vector_is_refused_by_name() {
-        let region = Region {
-            width: 64,
-            params: vec![Shape::Row, Shape::Vector(4)],
-            ops: vec![Op::Pick(1, 2), Op::Binary(Binary::Mul, 0, 2)],
-            results: vec![3],
-            rounds: vec![],
-        };
-        let why = Body::of(&region).expect_err("refused").to_string();
-        assert!(why.contains("small vector"), "{why}");
-    }
 }

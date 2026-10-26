@@ -43,10 +43,6 @@ pub trait Skeleton {
     fn share(&mut self, e: usize, v: f32);
     /// The shared row at column `c` (column 0 past the row).
     fn peer(&self, c: u32) -> f32;
-    /// Value `i` of small-vector parameter `k`, one a row.
-    fn vector(&self, k: u32, i: usize) -> f32;
-    /// Writes value `i` of small-vector result `k`, one a row.
-    fn store_vector(&mut self, k: u32, i: usize, v: f32);
 }
 
 /// `x` rounded to bf16 (nearest, ties to even) and widened back.

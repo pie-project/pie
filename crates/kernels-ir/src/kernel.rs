@@ -43,9 +43,6 @@ pub enum Operand {
     Table { at: u32, period: u32 },
     /// A value of a table's entry, computed where the table is.
     Entry(ValueId),
-    /// Small-vector parameter `k`, its values one a row (an element `i` of
-    /// it where an expression picks one).
-    Vector(u32),
 }
 
 /// What a kernel computes of its operands.
@@ -68,22 +65,6 @@ pub enum Expr {
     Column,
     /// The row a pass shared, at the column the operand names.
     Peer(Operand),
-    /// Element `i` of a small vector.
-    Pick(Operand, u32),
-    /// A small vector with element `i` the scalar.
-    Insert(Operand, u32, Operand),
-    /// A small vector, each value the scalar.
-    Splat(Operand),
-    /// A repeat's carried value, opened from its initial value: the
-    /// uniforms after it, up to its [`Expr::Repeat`], run as its body.
-    Carry(Operand),
-    /// The repeat that `carry` opened closed: its body run `count` times,
-    /// each pass's `next` the next pass's carried value.
-    Repeat {
-        count: u32,
-        carry: ValueId,
-        next: Operand,
-    },
 }
 
 /// A value one a head, computed before its phase's pass a vector at a time.
@@ -106,19 +87,14 @@ pub struct Table {
     pub entries: Vec<(ValueId, Elem, Expr)>,
 }
 
-/// A value one a row, computed before its phase's pass: a scalar, or a
-/// small vector of `vector` values.
-#[derive(Clone, Debug, PartialEq)]
+/// A value one a row, computed before its phase's pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Uniform {
     pub value: ValueId,
     pub elem: Elem,
     pub expr: Expr,
     /// Rounded where it is defined.
     pub round: Option<Dtype>,
-    /// The values a small vector holds; `None` for a scalar.
-    pub vector: Option<u32>,
-    /// The results it is stored as (a small vector, its values one a row).
-    pub stores: Vec<u32>,
 }
 
 /// A row value computed in a pass.

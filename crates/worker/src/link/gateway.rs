@@ -345,7 +345,9 @@ impl WorkerControlServer {
             );
         }
 
-        let turns = self.session_turns(req.session, &req.tenant).await?;
+        let turns = self
+            .session_turns(req.session, &req.tenant, &req.user)
+            .await?;
         turns
             .send(req)
             .await
@@ -357,6 +359,7 @@ impl WorkerControlServer {
         &self,
         session: SessionId,
         tenant: &TenantId,
+        user: &str,
     ) -> Result<mpsc::Sender<Request>> {
         let mut map = self.sessions.sessions.lock().await;
         if let Some(handle) = map.get(&session)
@@ -364,7 +367,7 @@ impl WorkerControlServer {
         {
             return Ok(handle.turns.clone());
         }
-        let client_id = runtime::server::open_session_for(tenant.0.clone())
+        let client_id = runtime::server::open_session_for(tenant.0.clone(), user.to_string())
             .map_err(|e| anyhow!("open session: {e}"))?;
         let (turns_tx, turns_rx) = mpsc::channel::<Request>(TURN_QUEUE_DEPTH);
         let cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>> = Arc::default();

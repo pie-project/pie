@@ -693,3 +693,18 @@ pub mod host;
 pub mod linear_ref;
 pub mod spatial;
 pub mod tc5;
+
+/// With `PIE_KERNEL_ERR=1`, prints `KERR <what> max_abs=<x> max_rel=<y>`
+/// for `got` against `want`.
+pub fn report_err(what: &str, got: &[f32], want: &[f32]) {
+    if std::env::var("PIE_KERNEL_ERR").as_deref() != Ok("1") {
+        return;
+    }
+    let (mut abs, mut rel) = (0f32, 0f32);
+    for (g, w) in got.iter().zip(want) {
+        let e = (g - w).abs();
+        abs = abs.max(e);
+        rel = rel.max(e / w.abs().max(1e-6));
+    }
+    println!("KERR {} max_abs={abs} max_rel={rel}", what.replace(' ', "_"));
+}

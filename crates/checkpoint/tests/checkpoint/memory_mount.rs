@@ -327,12 +327,7 @@ fn a_chunked_mount_reads_like_the_file() {
             path: &from_mount.files[0].path,
             size_bytes: bytes.len() as u64,
         }],
-        sources: Vec::new(),
-        tensors: Vec::new(),
-        instr_count: 0,
-        schedule: Vec::new(),
-        finalized: Vec::new(),
-        reads: Vec::new(),
+        ..Default::default()
     };
     assert!(checkpoint::verify::verify(&view, None).is_ok());
     let mounted = Execution::new(&plan, Path::new("/")).run().unwrap();

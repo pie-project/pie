@@ -189,15 +189,21 @@ shelved!(
         "sm80.toml",
         "sm80/nvidia-a100.toml",
         "sm86.toml",
+        "sm86/nvidia-a40.toml",
         "sm87.toml",
         "sm89.toml",
+        "sm89/nvidia-geforce-rtx-4090.toml",
         "sm89/nvidia-l40s.toml",
         "sm90.toml",
+        "sm90/nvidia-h100-80gb-hbm3.toml",
+        "sm90/nvidia-h200.toml",
         "sm100.toml",
         "sm100/nvidia-b200.toml",
         "sm103.toml",
         "sm110.toml",
         "sm120.toml",
+        "sm120/nvidia-geforce-rtx-5090.toml",
+        "sm120/nvidia-rtx-pro-6000-blackwell-server-edition.toml",
         "sm121.toml",
     ],
     rocm: ["gfx94.toml"],
@@ -752,7 +758,6 @@ mod tests {
             poem_compiler::DeviceProfile {
                 synth_regions: cfg!(not(feature = "rocm")),
                 synth_anchors: cfg!(not(feature = "rocm")),
-                fold_norms: cfg!(not(feature = "rocm")),
                 ..poem_compiler::DeviceProfile::default()
             }
         );

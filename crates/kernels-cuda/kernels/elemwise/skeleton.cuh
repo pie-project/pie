@@ -1,7 +1,7 @@
 #pragma once
 
 #include "elemwise/row.cuh"
-#include <cuda_fp8.h>
+#include "prim/store.cuh"
 
 namespace pie::elemwise {
 
@@ -18,26 +18,6 @@ struct Plane {
     const int* ids;
     int period;
     int bound;
-};
-
-// Where a result's row lands: its vectors of 8 from `from` up to `to` (every
-// one where `to` is 0), at its plane's row, from the plane row's first
-// element; or, where `page` is set, at the paged cache row `page[r] *
-// page_size + slot[r]` (none where the slot lies past the page or `valid[r]`
-// is 0), as e4m3 elements where `e4m3`, each `e4m3(x / scale)`.
-struct Store {
-    const int* page;
-    const int* slot;
-    const unsigned char* valid;
-    int from;
-    int to;
-    int page_size;
-    int e4m3;
-    float scale;
-    // a head-major window's head and stride, in vectors (0: whole)
-    int head;
-    int stride;
-    int unused;
 };
 
 // What a row skeleton fires over: its body's IN parameters and OUT results,
@@ -104,8 +84,7 @@ struct OrderOf<B, decltype(static_cast<void>(B::vector(0u)))> {
 };
 
 template <int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES, unsigned long long DT,
-          bool READ_ONLY, unsigned LATE = 0u, class ORDER = InOrder, unsigned STREAM = 0u,
-          unsigned VECTORS = 0u>
+          bool READ_ONLY, unsigned LATE = 0u, class ORDER = InOrder, unsigned STREAM = 0u>
 struct RowSkeleton {
     static_assert((LANES & (LANES - 1)) == 0 && LANES <= BLOCK && (LANES <= 32 || LANES % 32 == 0),
                   "a row is a power-of-two run of a block's threads");
@@ -123,20 +102,13 @@ struct RowSkeleton {
     float* buf;
     float* row;
     float* tab;
-    uint4* dst[OUT];
-    // Each result's first f32 a row, where it is a small vector one a row.
-    float* vdst[OUT];
-    // Each small-vector parameter's (`VECTORS`) first f32 a row.
-    const float* vsrc[IN];
-    // Each result's window of vectors and whether its row lands at all (a
-    // paged row past its page, or not live, does not).
-    int from[OUT];
-    int to[OUT];
-    int head[OUT];
-    int stride[OUT];
+    // Each result's store, the plane element its row starts at, and whether
+    // its row lands at all (a paged row past its page, or not live, does
+    // not).
+    Store store[OUT];
+    void* dst[OUT];
+    long long dst_row[OUT];
     bool lands[OUT];
-    bool e4m3[OUT];
-    float scale[OUT];
     // A late parameter's first vector, issued by `load<k>()`.
     const uint4* src[IN];
     // The vector of 8 each of this thread's slots holds (`ORDER`).
@@ -177,49 +149,24 @@ struct RowSkeleton {
         for (int p = 0; p < VECS; ++p) at[p] = ORDER::vector(static_cast<unsigned>(lane + p * LANES));
 #pragma unroll
         for (int k = 0; k < OUT; ++k) {
-            const Store& store = planes.store[k];
-            from[k] = store.from;
-            head[k] = store.head;
-            stride[k] = store.stride;
-            to[k] = store.to > 0 ? store.to : planes.width / 8;
-            e4m3[k] = store.e4m3 != 0;
-            scale[k] = store.scale;
+            store[k] = planes.store[k];
+            if (store[k].to == 0) store[k].to = planes.width;
             lands[k] = true;
-            long long row_at = start_of(planes.out[k], of, part, width, true);
-            if (store.page != nullptr) {
-                // the paged cache row this row's page and slot name
-                const int page = live ? store.page[of] : 0;
-                const int slot = live ? store.slot[of] : -1;
-                lands[k] = slot >= 0 && slot < store.page_size && page >= 0 &&
-                           (store.valid == nullptr || store.valid[of] != 0);
-                const long long cell = static_cast<long long>(page) * store.page_size + slot;
-                row_at = (lands[k] ? cell : 0) * planes.out[k].row_stride +
-                         static_cast<long long>(part) * width;
+            dst[k] = const_cast<void*>(planes.out[k].base);
+            // the window's first column lands at the plane row's start, or
+            // the paged cache row this row's page and slot name
+            dst_row[k] = start_of(planes.out[k], of, part, width, true);
+            if (store[k].page != nullptr) {
+                const long long cell = live ? store_cell(store[k], of) : -1;
+                lands[k] = cell >= 0;
+                dst_row[k] = (lands[k] ? cell : 0) * planes.out[k].row_stride +
+                             static_cast<long long>(part) * width;
             }
-            // the window's first vector lands at the plane row's start
-            if (e4m3[k]) {
-                dst[k] = reinterpret_cast<uint4*>(
-                    static_cast<unsigned char*>(const_cast<void*>(planes.out[k].base)) + row_at);
-            } else {
-                dst[k] = reinterpret_cast<uint4*>(
-                    static_cast<bf16*>(const_cast<void*>(planes.out[k].base)) + row_at);
-            }
-        }
-#pragma unroll
-        for (int k = 0; k < OUT; ++k) {
-            vdst[k] = static_cast<float*>(const_cast<void*>(planes.out[k].base)) +
-                      start_of(planes.out[k], of, part, width, false);
         }
         if (!live) return;
 #pragma unroll
         for (int k = 0; k < IN; ++k) {
             const Plane& plane = planes.in[k];
-            if ((VECTORS >> k) & 1u) {
-                // a small vector one a row: its row's first f32, read where
-                // the body asks
-                vsrc[k] = static_cast<const float*>(plane.base) + start_of(plane, of, part, width, false);
-                continue;
-            }
             const long long at = start_of(plane, of, part, width, !((ONES >> k) & 1u));
             if ((ONES >> k) & 1u) {
                 if (dtype(k) == kI32) {
@@ -456,17 +403,6 @@ struct RowSkeleton {
 
     __device__ __forceinline__ unsigned thread() const { return threadIdx.x; }
 
-    // Value `i` of small-vector parameter `k`, one a row (every thread of
-    // the row reading it).
-    __device__ __forceinline__ float vec(int k, int i) const { return live ? __ldg(vsrc[k] + i) : 0.f; }
-
-    // Value `i` of small-vector result `K`, one a row: the row's first
-    // thread lands it, the rest computing it alike.
-    template <int K>
-    __device__ __forceinline__ void st_vec(int i, float v) {
-        if (live && lane == 0) vdst[K][i] = v;
-    }
-
     // Result `K`'s row to memory: a body flushes a result once its last
     // element is written, so the store overlaps whatever follows.
     template <int K>
@@ -475,25 +411,10 @@ struct RowSkeleton {
 #pragma unroll
         for (int p = 0; p < VECS; ++p) {
             const int slot = lane + p * LANES;
-            const int i = static_cast<int>(at[p]);
-            if (slot >= vectors || i < from[K] || i >= to[K]) continue;
-            // the vector the window lands it at: a head's of every stride
-            int dst_at = i - from[K];
-            if (head[K] > 0) {
-                const int j = dst_at % stride[K];
-                if (j >= head[K]) continue;
-                dst_at = dst_at / stride[K] * head[K] + j;
-            }
-            if (e4m3[K]) {
-                // the bf16 the result holds, each element to e4m3
-                const bf16* held = reinterpret_cast<const bf16*>(&out[K][p]);
-                __align__(8) __nv_fp8_e4m3 q[8];
-#pragma unroll
-                for (int e = 0; e < 8; ++e) q[e] = __nv_fp8_e4m3(bf16_to_f32(held[e]) / scale[K]);
-                reinterpret_cast<uint2*>(dst[K])[dst_at] = *reinterpret_cast<const uint2*>(q);
-            } else {
-                dst[K][dst_at] = out[K][p];
-            }
+            // the column the window lands the vector at: a head's of every
+            // stride
+            const long long landed = slot < vectors ? store_at(store[K], at[p] * 8ll, store[K].to) : -1;
+            if (landed >= 0) store8(dst[K], dst_row[K] + landed, out[K][p], store[K]);
         }
     }
 };
@@ -505,7 +426,7 @@ struct RowSkeleton {
 // memory, and one that shares its row BLOCK * VECS * 8 floats more.
 template <class Body, int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES = 0u,
           unsigned long long DT = 0ull, bool READ_ONLY = false, unsigned LATE = 0u,
-          unsigned STREAM = 0u, unsigned VECTORS = 0u>
+          unsigned STREAM = 0u>
 __global__ void __launch_bounds__(BLOCK) row_skeleton(
     const Planes<IN, OUT> planes,
     const Body body,
@@ -535,7 +456,7 @@ __global__ void __launch_bounds__(BLOCK) row_skeleton(
     __shared__ float buf[(VECS > kBatch ? VECS : kBatch) * (BLOCK / 32) + 1];
     extern __shared__ float shared[];
     RowSkeleton<BLOCK, LANES, VECS, IN, OUT, ONES, DT, READ_ONLY, LATE,
-                typename OrderOf<Body>::type, STREAM, VECTORS>
+                typename OrderOf<Body>::type, STREAM>
         f(
         planes, of, part, row < live_rows, buf, shared);
     body(f);

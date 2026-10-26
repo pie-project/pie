@@ -2,8 +2,8 @@
 //! product form an anchor (`fuse::anchor`): one kernels-ir anchored region,
 //! its contraction the matmul and its epilogue the ops, verified pointwise
 //! over the product tile and folded into one `fused.anchored` op where the
-//! backend serves it. The product keeps its accumulator through the
-//! epilogue, and the interpreter lands what the ops do over it.
+//! backend serves it. The product keeps its accumulator through a bias
+//! alone, and the interpreter lands what the ops do over it.
 
 use kernels_ir::anchor::{Given, eval};
 use kernels_ir::skeleton::round_bf16;
@@ -36,8 +36,14 @@ fn values(count: usize, seed: usize) -> Vec<f32> {
         .collect()
 }
 
+/// `a · wᵀ` summed in f64 and rounded to bf16, as the program lands a
+/// linear's output and an epilogue that only adds a bias does not read it.
+fn landed(a: &[f32], w: &[f32], mnk: [usize; 3]) -> Vec<f32> {
+    product(a, w, mnk).into_iter().map(round_bf16).collect()
+}
+
 /// `a · wᵀ` summed in f64 and rounded to f32 once, as the interpreter sums
-/// a contraction: the epilogue reads it so, no op between them rounding it.
+/// a contraction: an epilogue that only adds a bias reads it so.
 fn product(a: &[f32], w: &[f32], [m, n, k]: [usize; 3]) -> Vec<f32> {
     (0..m * n)
         .map(|i| {
@@ -120,13 +126,14 @@ fn a_packed_glu_reads_the_banks_two_parts() {
     let anchor = the_one(&formed);
     let c = &anchor.anchored.contraction;
     assert_eq!((c.n, c.layout), (N as u32, Layout::Packed(2)));
+    assert_eq!(c.acc, Some(Dtype::Bf16), "its halves read as their projections land them");
 
     let [m, n, k] = [2usize, N as usize, K as usize];
     let (a, w) = (values(m * k, 4), values(2 * n * k, 5));
     let got = eval(&anchor.anchored, m, &a, &w, &[], &[]).expect("runs");
     let (g, u) = (
-        product(&a, &w[..n * k], [m, n, k]),
-        product(&a, &w[n * k..], [m, n, k]),
+        landed(&a, &w[..n * k], [m, n, k]),
+        landed(&a, &w[n * k..], [m, n, k]),
     );
     let want: Vec<f32> = (0..m * n)
         .map(|i| {
@@ -234,11 +241,11 @@ fn a_packed_qkvs_split_norms_and_turn_are_one_epilogue_of_windows() {
         Given::Row(vec![0.0, 3.0, 17.0]),
     ];
     let got = eval(&anchor.anchored, m, &a, &w, &[], &given).expect("runs");
-    let y = product(&a, &w, [m, n as usize, k]);
+    let y = landed(&a, &w, [m, n as usize, k]);
     let v: Vec<f32> = (0..m)
         .flat_map(|r| y[r * n as usize + (qw + kvw) as usize..(r + 1) * n as usize].to_vec())
         .collect();
-    assert_eq!(got[0], v, "v lands its products as they are summed");
+    assert_eq!(got[0], v, "v lands its products as the program does");
     // At position 0 nothing turns: q's heads are their norms.
     let q0 = &got[1][..qw as usize];
     let head = &y[..D as usize];
@@ -274,111 +281,6 @@ fn a_rows_norm_over_a_piece_is_no_ones_span() {
     let anchor = the_one(&formed);
     assert_eq!(anchor.nodes, [0, 1], "the split alone");
     assert_eq!(anchor.anchored.windows.len(), 3);
-}
-
-/// An RMS norm whose row a product's epilogue reads (a SwiGLU's packed
-/// bank) folds into the anchor: its operand the norm's input, which the
-/// residual stream still reads, each row's scale the epilogue's
-/// `Input::Norm`, the gain the load's to fold into the bank. Over the bank
-/// as `fold_bank` declares it, the interpreter lands the unfolded program
-/// within each side's rounding. A bare product, a normed row something
-/// else reads, and the fold off keep the norm its own op.
-#[test]
-fn an_rms_norm_before_an_epilogued_product_folds_into_its_anchor() {
-    use kernels_ir::anchor::{fold_bank, norm_scales};
-    use kernels_ir::{Gain, RowNorm};
-    use poem_compiler::fuse::anchor::anchors_with;
-    let build = |bare: bool, shared: bool| {
-        trace(|p| {
-            let x = p.rows("x", K);
-            let normed = elemwise::rmsnorm(&x, &p.weight("norm", [K]), 1e-6);
-            let packed = linear::matmul(&normed, &p.weight("gate_up", [2 * N, K]));
-            if bare {
-                p.export("packed", &packed);
-            } else {
-                let y = linear::glu(&packed, GluAct::Swiglu, Some(N as u32), None, None, None);
-                p.export("y", &y);
-            }
-            if shared {
-                let _ = elemwise::residual_add(&normed, &p.rows("other", K));
-            }
-            let _ = elemwise::residual_add(&x, &p.rows("stream", K));
-        })
-    };
-    let t = build(false, false);
-    let formed = anchors_with(&t, &all, Some(&|_| true));
-    let anchor = &formed[0];
-    assert_eq!(anchor.nodes, [0, 1, 2], "the norm, the product and its GLU");
-    let Operation::Elemwise(poem_ir::Elemwise::Rmsnorm { x, .. }) = t.nodes[0].op else {
-        panic!("{:?}", t.nodes[0].op);
-    };
-    assert_eq!(anchor.act, x, "the norm's input");
-    assert!(anchor.gain.is_some(), "the gain the load folds");
-    let norm = anchor.anchored.norm.expect("a norm");
-    assert_eq!(norm.gain, Gain::Scale);
-    let epi = anchor.anchored.epilogue.as_ref().expect("an epilogue");
-    assert_eq!(epi.inputs.last(), Some(&Input::Norm));
-
-    let [m, n, k] = [3usize, N as usize, K as usize];
-    let (a, w, g) = (values(m * k, 1), values(2 * n * k, 2), values(k, 3));
-    let bank = fold_bank(&norm, &w, &g);
-    let got = eval(&anchor.anchored, m, &a, &bank, &[], &[]).expect("runs");
-    // The unfolded program: the normed row rounded to bf16, then the GLU
-    // over its products.
-    let r = norm_scales(
-        &RowNorm {
-            eps: 1e-6,
-            gain: Gain::None,
-        },
-        &a,
-        k,
-    );
-    let normed: Vec<f32> = (0..m * k)
-        .map(|i| round_bf16(a[i] * r[i / k] * g[i % k]))
-        .collect();
-    let (gate, up) = (
-        product(&normed, &w[..n * k], [m, n, k]),
-        product(&normed, &w[n * k..], [m, n, k]),
-    );
-    // Each side rounds each term once (the normed row, or the folded bank):
-    // a product off by a bf16 place of its terms' magnitudes' sum, carried
-    // through the GLU (silu's slope at most 1.1), then the GLU's roundings.
-    let place = 2f32.powi(-8);
-    let magnitude = |bank: &[f32], i: usize| -> f32 {
-        let (row, col) = (i / n, i % n);
-        (0..k)
-            .map(|j| (normed[row * k + j] * bank[col * k + j]).abs())
-            .sum()
-    };
-    for i in 0..m * n {
-        let silu = gate[i] / (1.0 + (-gate[i]).exp());
-        let want = silu * up[i];
-        let (dg, du) = (
-            place * (magnitude(&w[..n * k], i) + gate[i].abs()),
-            place * (magnitude(&w[n * k..], i) + up[i].abs()),
-        );
-        let bound = 1.1 * dg * up[i].abs() + silu.abs() * du + 2.0 * place * want.abs() + 1e-3;
-        assert!(
-            (got[0][i] - want).abs() <= bound,
-            "{i}: {} vs {want} (within {bound})",
-            got[0][i]
-        );
-    }
-
-    for (bare, shared, norms, why) in [
-        (true, false, true, "a bare product"),
-        (false, true, true, "a normed row read past the product"),
-        (false, false, false, "the fold off"),
-    ] {
-        let t = build(bare, shared);
-        let formed = anchors_with(&t, &all, norms.then_some(&|_| true));
-        assert!(
-            formed
-                .iter()
-                .all(|a| a.anchored.norm.is_none() && !a.nodes.contains(&0)),
-            "{why}: {formed:#?}"
-        );
-    }
 }
 
 /// A KV append the qkv prologue ends in folds into its anchor: k and v
@@ -583,12 +485,12 @@ fn a_gated_qs_windows_land_its_norms_and_partial_turn() {
         Given::Row(positions.to_vec()),
     ];
     let got = eval(&anchor.anchored, m, &a, &w, &[], &given).expect("runs");
-    let y = product(&a, &w, [m, n, k]);
+    let y = landed(&a, &w, [m, n, k]);
     let d = D as usize;
     for row in 0..m {
         for head in 0..2 {
             let from = row * n + head * 2 * d;
-            // the gate's head: its products as they are summed
+            // the gate's head: its products as the program lands them
             let gate = &got[gate_at][row * 2 * d + head * d..][..d];
             assert_eq!(
                 gate,

@@ -338,6 +338,18 @@ impl Builder<'_> {
     }
 
     fn check_declared_shape(&mut self, contract: &TensorContract) -> Result<()> {
+        if let Some((axis, expected_legs)) = &contract.composite_axis {
+            let actual_legs =
+                self.resolver
+                    .infer_composite_legs(&contract.expr, *axis, &contract.name)?;
+            if actual_legs != *expected_legs {
+                return Err(Error::Contract(format!(
+                    "axis {} declares composite sum-axis type {:?} but expression yields {:?}; \
+                     each leg of a composite axis must be sharded with its own replication factor prior to Concat",
+                    axis.0, expected_legs, actual_legs
+                )));
+            }
+        }
         let Some(declared) = &contract.shape else {
             return Ok(());
         };

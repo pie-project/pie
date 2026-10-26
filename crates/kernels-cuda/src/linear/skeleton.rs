@@ -31,10 +31,11 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use crate::elemwise::skeleton::{Cache, Store};
 use dtype::Dtype;
 pub use kernels_ir::anchor::{
-    Anchored, CacheDtype, CachePlane, Contraction, Gain, Input, Layout, Paged, Pointwise, Quant,
-    RowNorm, Window,
+    Anchored, CacheDtype, CachePlane, Contraction, Input, Layout, Paged, Pointwise, Quant,
+    Window,
 };
 
 /// Where a paged epilogue's cache rows live, past each result's own plane
@@ -126,39 +127,13 @@ impl In {
         In { dtype: 1, ..self }
     }
 
-    /// The operand row's norm scale: no plane, the contraction's own.
-    #[must_use]
-    pub const fn norm() -> In {
-        In {
-            dtype: 3,
-            ..In::of(0, 0, 0)
-        }
-    }
-
-    /// The norm scale read from `scales` (f32, one a row): the unfused
-    /// leg's, landed by `norm_scales`.
-    #[cfg(feature = "cuda")]
-    #[must_use]
-    pub(crate) const fn at(self, scales: u64) -> In {
-        In {
-            base: scales,
-            ..self
-        }
-    }
-
-    /// Whether it is a row's norm scale.
-    #[must_use]
-    pub const fn is_norm(self) -> bool {
-        self.dtype == 3
-    }
-
     /// How its elements are stored.
     #[must_use]
     pub const fn dtype(self) -> Dtype {
-        match self.dtype {
-            1 => Dtype::I32,
-            3 => Dtype::F32,
-            _ => Dtype::Bf16,
+        if self.dtype == 1 {
+            Dtype::I32
+        } else {
+            Dtype::Bf16
         }
     }
 
@@ -182,9 +157,6 @@ impl In {
 
     /// The input kind its strides read.
     const fn kind(self) -> Input {
-        if self.dtype == 3 {
-            return Input::Norm;
-        }
         match (self.row_stride, self.col_stride) {
             (0, 0) => Input::One,
             (0, _) if self.period > 0 => Input::Head(self.period as u32),
@@ -222,12 +194,8 @@ pub struct Epilogue {
     /// columns, reads a column's index or lands windows): a fire of any
     /// other `n` is no fire of it.
     fixed: Option<u32>,
-    /// How each input is stored: bf16, or i32 (a row's position); a row's
-    /// norm scale f32, where the unfused leg reads it from a plane.
+    /// How each input is stored: bf16, or i32 (a row's position).
     stored: Vec<Dtype>,
-    /// The operand's rows normed: each row's scale the epilogue's
-    /// `Input::Norm`, the skeleton's own.
-    norm: Option<RowNorm>,
     /// Each result's cache, where it lands in one ([`Paged`]).
     paged: Vec<Option<Paged>>,
 }
@@ -315,7 +283,6 @@ impl PartialEq for Epilogue {
             && self.windows == other.windows
             && self.fixed == other.fixed
             && self.stored == other.stored
-            && self.norm == other.norm
             && self.paged == other.paged
     }
 }
@@ -328,12 +295,12 @@ impl Epilogue {
     /// runs as a region of its own before the product), rounds a product to
     /// bf16 or not at all, and lands bf16 planes; its inputs bf16.
     pub fn of(anchored: &Anchored) -> Result<Epilogue, Error> {
-        Epilogue::of_stored(anchored, &vec![Dtype::Bf16; planes_of(anchored)])
+        let inputs = anchored.epilogue.as_ref().map_or(0, |e| e.inputs.len());
+        Epilogue::of_stored(anchored, &vec![Dtype::Bf16; inputs])
     }
 
-    /// [`Epilogue::of`] with its inputs' planes stored as `stored` says (one
-    /// an input but a row's norm scale, which has none): bf16, or i32 where
-    /// an input is one element a row or one value (a position).
+    /// [`Epilogue::of`] with its inputs stored as `stored` says: bf16, or
+    /// i32 where an input is one element a row or one value (a position).
     pub fn of_stored(anchored: &Anchored, stored: &[Dtype]) -> Result<Epilogue, Error> {
         anchored
             .verify()
@@ -388,23 +355,13 @@ impl Epilogue {
         {
             return Err(refuse(OP, "a result stored other than bf16"));
         }
-        if stored.len() != planes_of(anchored) {
-            return Err(refuse(OP, "the inputs' dtypes are not one a plane"));
+        if stored.len() != inputs.len() {
+            return Err(refuse(OP, "the inputs' dtypes are not one an input"));
         }
-        // A row's norm scale is f32 where a plane holds it (the leg's).
-        let mut planes = stored.iter();
-        let stored: Vec<Dtype> = inputs
-            .iter()
-            .map(|input| match input {
-                Input::Norm => Dtype::F32,
-                _ => *planes.next().unwrap_or(&Dtype::Bf16),
-            })
-            .collect();
-        for (input, dtype) in inputs.iter().zip(&stored) {
+        for (input, dtype) in inputs.iter().zip(stored) {
             let held = match dtype {
-                Dtype::Bf16 => *input != Input::Norm,
+                Dtype::Bf16 => true,
                 Dtype::I32 => matches!(input, Input::Row | Input::One),
-                Dtype::F32 => *input == Input::Norm,
                 _ => false,
             };
             if !held {
@@ -441,7 +398,7 @@ impl Epilogue {
         let span = anchored.epilogue.as_ref().map_or(1, |e| e.span(c.n));
         let columned = region.ops.iter().any(|op| matches!(op, Op::Column));
         let fixed = (span > 1 || columned || !windows.is_empty()).then_some(c.n);
-        let lt = if parts == 1 && !round && !plain && fixed.is_none() && anchored.norm.is_none() {
+        let lt = if parts == 1 && !round && !plain && fixed.is_none() {
             LtEpilogue::matching(&region, &inputs)
         } else {
             None
@@ -459,8 +416,7 @@ impl Epilogue {
             windows,
             span,
             fixed,
-            stored,
-            norm: anchored.norm,
+            stored: stored.to_vec(),
             paged: anchored.paged.clone(),
         })
     }
@@ -468,7 +424,8 @@ impl Epilogue {
     /// `anchored`'s epilogue ([`Epilogue::of`]), one for the life of the
     /// process: the same reference for every call with the same region.
     pub fn interned(anchored: &Anchored) -> Result<&'static Epilogue, Error> {
-        Epilogue::interned_stored(anchored, &vec![Dtype::Bf16; planes_of(anchored)])
+        let inputs = anchored.epilogue.as_ref().map_or(0, |e| e.inputs.len());
+        Epilogue::interned_stored(anchored, &vec![Dtype::Bf16; inputs])
     }
 
     /// [`Epilogue::of_stored`], one for the life of the process.
@@ -590,12 +547,6 @@ impl Epilogue {
         self.paged.iter().any(Option::is_some)
     }
 
-    /// The norm its operand's rows take, where they are normed.
-    #[must_use]
-    pub const fn norm(&self) -> Option<RowNorm> {
-        self.norm
-    }
-
     /// The floats its body tables what a column alone computes in.
     #[must_use]
     pub const fn table(&self) -> u32 {
@@ -608,12 +559,11 @@ impl Epilogue {
         crate::jit::generated(
             self.root,
             &format!(
-                "::pie::linear::{template}<{BODY}, {class}, {}, {}, {}, {}, {}>",
+                "::pie::linear::{template}<{BODY}, {class}, {}, {}, {}, {}>",
                 self.parts,
                 self.inputs.len(),
                 self.results,
-                self.round,
-                self.norm.is_some()
+                self.round
             ),
         )
     }
@@ -647,9 +597,7 @@ impl Epilogue {
         for (k, ((input, kind), dtype)) in
             ins.iter().zip(&self.inputs).zip(&self.stored).enumerate()
         {
-            let unplaned = *kind == Input::Norm;
-            if (input.base == 0 && !unplaned) || input.kind() != *kind || input.dtype() != *dtype
-            {
+            if input.base == 0 || input.kind() != *kind || input.dtype() != *dtype {
                 return Err(refuse(
                     OP,
                     format!("input {k} is not a {kind:?} plane stored {dtype:?}"),
@@ -677,30 +625,19 @@ impl Epilogue {
         words.extend(outs);
         let windows: Vec<Window> = (0..outs.len()).map(|k| self.window(k, n)).collect();
         words.extend(windows.iter().map(|w| u64::from(w.width)));
-        words.extend(windows.iter().map(|w| u64::from(w.from)));
-        words.extend(windows.iter().map(|w| u64::from(w.end())));
-        words.extend(windows.iter().map(|w| u64::from(w.head)));
-        words.extend(windows.iter().map(|w| u64::from(w.stride)));
-        words.push(u64::from(self.norm.map_or(0, |norm| norm.eps.to_bits())));
-        // Each result's paging: its page and slot inputs, its cache's element.
-        let paged: Vec<Option<Paged>> = (0..outs.len()).map(|k| self.paged(k)).collect();
-        let index = |at: u32| u64::from(at);
-        words.extend(paged.iter().map(|p| p.map_or(u64::MAX, |p| index(p.page))));
-        words.extend(paged.iter().map(|p| p.map_or(u64::MAX, |p| index(p.slot))));
-        words.extend(
-            paged
-                .iter()
-                .map(|p| u64::from(matches!(p, Some(Paged { dtype: CacheDtype::E4m3 { .. }, .. })))),
-        );
-        words.extend(paged.iter().map(|p| match p {
-            Some(Paged {
-                dtype: CacheDtype::E4m3 { scale },
-                ..
-            }) => u64::from(scale.to_bits()),
-            _ => u64::from(1f32.to_bits()),
-        }));
-        words.push(paging.map_or(0, |p| p.valid));
-        words.push(u64::from(paging.map_or(0, |p| p.page_size)));
+        // Each result's store: its window, and a paged one's cache row.
+        for (k, w) in windows.iter().enumerate() {
+            let cache = self.paged(k).zip(paging).map(|(p, paging)| Cache {
+                base: 0,
+                width: 0,
+                page: ins[p.page as usize].base,
+                slot: ins[p.slot as usize].base,
+                valid: paging.valid,
+                page_size: paging.page_size,
+                e4m3: if let CacheDtype::E4m3 { scale } = p.dtype { Some(scale) } else { None },
+            });
+            words.extend(Store::of(*w, cache.as_ref()).words());
+        }
         Ok(words)
     }
 
@@ -776,7 +713,7 @@ impl Epilogue {
                     .map(|(input, &dtype)| match input {
                         Input::Tile => Form::Rows(bf16),
                         Input::Column | Input::Head(_) => Form::Shared(bf16),
-                        Input::Row | Input::Norm => Form::Each(dtype),
+                        Input::Row => Form::Each(dtype),
                         Input::One => Form::One(dtype),
                     }),
             )
@@ -795,8 +732,28 @@ impl Epilogue {
             n.is_multiple_of(*c) && (n / c).is_multiple_of(8) && (n / c).is_multiple_of(strides)
         })?;
         let width = n / slices;
-        let mut shaped = Vec::with_capacity(slices as usize);
-        for piece in 0..slices {
+        // Every slice the first's, one launch of `slices` rows a row: the
+        // region repeating every slice, each result the whole tile, no
+        // input a column's own (a slice's columns past the first) and no
+        // result paged.
+        let uniform = slices > 1
+            && (Pointwise {
+                region: self.region.clone(),
+                inputs: self.inputs.clone(),
+            })
+            .repeats(n, width)
+            && (0..self.results).all(|k| {
+                let w = self.window(k, n);
+                w.whole() && w.from == 0 && w.width == n && self.paged(k).is_none()
+            })
+            && self.inputs.iter().all(|input| match input {
+                Input::Column => false,
+                Input::Head(head) => width.is_multiple_of(*head),
+                _ => true,
+            });
+        let slices_of = if uniform { 1 } else { slices };
+        let mut shaped = Vec::with_capacity(slices_of as usize);
+        for piece in 0..slices_of {
             let from = piece * width;
             let outs: Vec<Land> = (0..self.results)
                 .filter_map(|k| {
@@ -821,7 +778,8 @@ impl Epilogue {
                         });
                     }
                     let (lo, hi) = (w.from.max(from), (w.from + w.width).min(from + width));
-                    (lo < hi).then_some(Land {
+                    // (built only where the piece holds some of the window)
+                    (lo < hi).then(|| Land {
                         k,
                         from: lo - from,
                         to: hi - from,
@@ -860,6 +818,7 @@ impl Epilogue {
         Some(LegShape {
             ins,
             pieces: shaped,
+            slices: if uniform { slices } else { 1 },
         })
     }
 
@@ -896,7 +855,8 @@ pub fn serves(anchored: &Anchored, ins: &[Dtype], outs: &[Dtype]) -> Result<(), 
     let epi = Epilogue::interned_stored(anchored, ins)?;
     // a paged result's plane is its cache's, no value of the op's
     let planed = (0..epi.results).filter(|k| epi.paged(*k).is_none()).count();
-    if ins.len() != planes_of(anchored) || outs.len() != planed {
+    let inputs = anchored.epilogue.as_ref().map_or(0, |e| e.inputs.len());
+    if ins.len() != inputs || outs.len() != planed {
         return Err(refuse(
             OP,
             "the planes given are not the epilogue's inputs and results",
@@ -922,20 +882,16 @@ const fn lcm(a: u32, b: u32) -> u32 {
     a / gcd(a, b) * b
 }
 
-/// The planes `anchored`'s epilogue reads: one an input but a row's norm
-/// scale, the contraction's own.
-fn planes_of(anchored: &Anchored) -> usize {
-    anchored.epilogue.as_ref().map_or(0, |e| {
-        e.inputs.iter().filter(|i| **i != Input::Norm).count()
-    })
-}
-
 /// An epilogue's unfused leg as the row skeleton takes it: its parameters'
 /// forms and its pieces.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct LegShape {
     ins: Vec<crate::synth::In>,
     pieces: Vec<PieceShape>,
+    /// The slices one launch's rows cut each row into, where every slice
+    /// computes what the first does (its one piece): 1 where each piece is
+    /// its own launch.
+    slices: u32,
 }
 
 /// One piece of a leg: the region over the tile's columns `from..from +
@@ -1010,13 +966,6 @@ fn shifted(region: &Region, from: u32, width: u32, results: Vec<u32>) -> Region 
             Op::Reduce(r, a) => push(&mut ops, Op::Reduce(r, m(a))),
             Op::ReduceHeads(r, a, size) => push(&mut ops, Op::ReduceHeads(r, m(a), size)),
             Op::Fma(x, y, z) => push(&mut ops, Op::Fma(m(x), m(y), m(z))),
-            // a row's small vectors and repeats, which no anchored region
-            // holds (`kernels_ir::anchor` refuses them), as they are
-            Op::Pick(v, i) => push(&mut ops, Op::Pick(m(v), i)),
-            Op::Insert(v, i, x) => push(&mut ops, Op::Insert(m(v), i, m(x))),
-            Op::Splat(x, n) => push(&mut ops, Op::Splat(m(x), n)),
-            Op::Carry(a) => push(&mut ops, Op::Carry(m(a))),
-            Op::Repeat(count, carry, next) => push(&mut ops, Op::Repeat(count, m(carry), m(next))),
         };
         of.push(id);
     }
@@ -1227,6 +1176,9 @@ impl Skeleton {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowLeg {
     pieces: &'static [Piece],
+    /// The slices its one piece's launch cuts each row into (1: each piece
+    /// its own launch).
+    slices: u32,
     parts: u32,
     /// The products' dtype: bf16, or f32 where the epilogue reads them as
     /// they are summed.
@@ -1280,6 +1232,7 @@ impl RowLeg {
                 }
                 Some(RowLeg {
                     pieces: Box::leak(pieces.into_boxed_slice()),
+                    slices: shape.slices,
                     parts: epi.parts,
                     product: if epi.round { Dtype::Bf16 } else { Dtype::F32 },
                 })
@@ -1338,8 +1291,6 @@ impl RowLeg {
                         Plane::shared(&Tensor::new(input.base, 1, head, Dtype::Bf16))
                     }
                     Input::Row => Plane::each(&Tensor::new(input.base, m, 1, dtype)),
-                    // each row's norm scale, the plane `norm_scales` landed
-                    Input::Norm => Plane::each(&Tensor::new(input.base, m, 1, Dtype::F32)),
                     Input::One => Plane::shared(&Tensor::new(input.base, 1, piece.width, dtype)),
                 });
             }
@@ -1391,7 +1342,9 @@ impl RowLeg {
                     }
                 });
             }
-            fired = piece.kernel.fire(ctx, &planes, &results, m);
+            fired = piece
+                .kernel
+                .fire_parts(ctx, &planes, &results, m, self.slices);
             if fired.is_err() {
                 break;
             }
@@ -1401,39 +1354,6 @@ impl RowLeg {
         }
         fired
     }
-}
-
-/// Each of `m` operand rows' norm scale under `norm` (`rsqrt(Σ a² / k +
-/// eps)`, f32) into `out`: what a normed epilogue's unfused leg reads as its
-/// `Input::Norm` (`In::norm().at(out)`), a skeleton computing its own.
-#[cfg(feature = "cuda")]
-pub(crate) fn norm_scales(
-    ctx: &crate::jit::Ctx,
-    norm: RowNorm,
-    act: u64,
-    out: u64,
-    m: u32,
-    k: u32,
-) -> Result<(), Error> {
-    use crate::jit::{ArgValue, Fire, Launch};
-    const BLOCK: u32 = 256;
-    if k == 0 || !k.is_multiple_of(8) {
-        return Err(refuse(OP, format!("a row of {k} is no whole run of eight")));
-    }
-    ctx.fire(
-        "linear.norm_scales",
-        Fire::at(crate::jit::kernel(
-            "linear/contract.cu",
-            &format!("::pie::linear::norm_scales<{BLOCK}>"),
-        ))
-        .apply(Launch::per_row(m, BLOCK).programmatic(ctx.tuning().pdl)),
-        &[
-            ArgValue::Ptr(act),
-            ArgValue::Ptr(out),
-            ArgValue::I32(count_of(k)?),
-            ArgValue::F32(norm.eps),
-        ],
-    )
 }
 
 /// The most rows the few-rows skeleton holds.
@@ -1501,14 +1421,12 @@ mod tests {
         assert!(bias.planes(&[], &[128], 8, None).is_err());
         let words = bias.planes(&[In::column(64)], &[128], 8, None).expect("a bias");
         // One input (its base, strides, dtype and period), one unread, one
-        // result, its row's stride, its window's columns, head and stride,
-        // the norm's eps (none), then its paging (none).
+        // result, its row's stride, then its store: no cache row, its
+        // window's columns 0..8, a unit scale.
         assert_eq!(words, vec![
-                64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0, 8, 0, 0, 0,
-                u64::MAX, u64::MAX, 0, 0x3f80_0000, 0, 0
+                64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0,
+                0, 0, 8 << 32, 0, 0x3f80_0000, 0
             ]);
-        // A row's norm scale is no plane: its input carries none.
-        assert_eq!(In::norm().kind(), Input::Norm);
         // A head's weight and a row's i32 position, each of its kind.
         assert_eq!(In::head(64, 32).kind(), Input::Head(32));
         assert_eq!(In::row(64).i32().dtype(), Dtype::I32);

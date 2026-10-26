@@ -71,15 +71,6 @@ pub struct SynthRegions;
 #[decision(id = "compiler.synth_anchors", flag, default = false, tune = engine)]
 pub struct SynthAnchors;
 
-/// Whether an anchored region over an RMS norm's row folds the norm in
-/// (`fuse::anchor::anchors_with`): its scale one more op of the product's
-/// epilogue, its gain folded into the bank at load, the norm's own launch
-/// and its normed row gone. Under `compiler.synth_anchors`; off unless the
-/// backend registers it on ([`register_regions`], CUDA).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "compiler.fold_norms", flag, default = false, tune = engine)]
-pub struct FoldNorms;
-
 /// The widest fire, in rows, that runs `compiler.dag_streams`' schedule on
 /// the side streams; wider fires walk every region on the main stream
 /// (each launch fills the card alone). 0: every fire.
@@ -143,7 +134,6 @@ fn register_all(
         .add::<DagStreamsUntil>()
         .add_defaulting::<SynthRegions>(if regions { "true" } else { "false" })
         .add_defaulting::<SynthAnchors>(if regions { "true" } else { "false" })
-        .add_defaulting::<FoldNorms>(if regions { "true" } else { "false" })
         .add_defaulting::<SideStreams>(&side_streams.to_string());
 }
 
@@ -167,7 +157,6 @@ impl DeviceProfile {
             dag_streams_until: profile.get::<DagStreamsUntil>().0,
             synth_regions: profile.on::<SynthRegions>(&profile::Anywhere),
             synth_anchors: profile.on::<SynthAnchors>(&profile::Anywhere),
-            fold_norms: profile.on::<FoldNorms>(&profile::Anywhere),
 
             family_us: FamilyCosts {
                 attn: us(profile.get::<AttnUs>().0),

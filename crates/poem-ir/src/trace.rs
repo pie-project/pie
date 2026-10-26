@@ -136,6 +136,63 @@ pub struct ExpertSlots {
     pub slots: u32,
 }
 
+/// The quantized KV rows a u8 plane holds, a row of its format's bytes a
+/// position (`CacheRow::Kv::rows`): DeepSeek's and vLLM's standard fp8
+/// ones. A page of `p` positions holds `p` data rows, then `p` scale rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum KvRows {
+    /// V4's (FlashMLA's `fp8_ds_mla`): 448 e4m3 codes under one ue8m0
+    /// exponent a 64, then the 64 rotated dims in bf16; 576 data bytes and
+    /// 8 scale bytes (seven exponents and a zero).
+    V4,
+    /// V4.1's window: 512 e4m3 codes under one ue8m0 exponent a 32; 512
+    /// data bytes and 16 scale bytes.
+    Mx8,
+    /// V4.1's compressed rows: 512 e2m1 codes (two a byte, the lower dim in
+    /// the low nibble) under one e4m3 scale a 16; 256 data bytes and 32
+    /// scale bytes.
+    Nv4,
+    /// V4.1's FP4 index keys: 128 e2m1 codes under one ue8m0 exponent a 32;
+    /// 64 data bytes and 4 scale bytes.
+    Fp4Keys,
+    /// vLLM's standard fp8 rows (an MLA latent and its rotated dims): each
+    /// of `width` columns e4m3 under one scale of 1, a byte a column and no
+    /// scale bytes.
+    Fp8 { width: u32 },
+}
+
+impl KvRows {
+    /// The data bytes of a row.
+    #[must_use]
+    pub const fn data(self) -> u64 {
+        match self {
+            Self::V4 => 576,
+            Self::Mx8 => 512,
+            Self::Nv4 => 256,
+            Self::Fp4Keys => 64,
+            Self::Fp8 { width } => width as u64,
+        }
+    }
+
+    /// The scale bytes of a row.
+    #[must_use]
+    pub const fn scales(self) -> u64 {
+        match self {
+            Self::V4 => 8,
+            Self::Mx8 => 16,
+            Self::Nv4 => 32,
+            Self::Fp4Keys => 4,
+            Self::Fp8 { .. } => 0,
+        }
+    }
+
+    /// The bytes of a position: its data and its scales.
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        self.data() + self.scales()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheRow {
     Kv {
@@ -161,6 +218,11 @@ pub enum CacheRow {
         /// split between them.
         #[serde(default)]
         shard: Shard,
+        /// The block-scaled rows a u8 plane holds, a position's row each:
+        /// the element format the deployment declares, fixed at compile
+        /// time. `None` for planes of `dtype`'s own elements.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rows: Option<KvRows>,
     },
     State {
         name: String,

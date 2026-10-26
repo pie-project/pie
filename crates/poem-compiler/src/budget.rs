@@ -235,10 +235,6 @@ pub struct DeviceProfile {
     /// `fused.anchored` ops (`fuse::anchor`, `compiler.synth_anchors`).
     pub synth_anchors: bool,
 
-    /// Whether an anchored region over an RMS norm's row folds the norm in
-    /// (`fuse::anchor::anchors_with`, `compiler.fold_norms`).
-    pub fold_norms: bool,
-
     pub family_us: FamilyCosts,
 
     pub exclusive: Vec<String>,
@@ -353,7 +349,6 @@ impl Default for DeviceProfile {
             dag_streams_until: 0,
             synth_regions: false,
             synth_anchors: false,
-            fold_norms: false,
             family_us: FamilyCosts::default(),
             exclusive: Vec::new(),
             grouped: Vec::new(),

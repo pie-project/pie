@@ -37,15 +37,16 @@ pub struct Plane {
     ids: u64,
     period: u32,
     bound: u32,
-    /// Where a result's row lands, past its plane's own rows: `pie::elemwise::Store`.
+    /// Where a result's row lands, past its plane's own rows: `pie::Store`.
     store: Store,
 }
 
-/// `pie::elemwise::Store`: a result's vectors of 8 from `from` up to `to`
-/// (every one where `to` is 0) landing from its plane row's first element;
-/// or, paged, at the cache row `page[r] · page_size + slot[r]` (none where
-/// the slot lies past the page or `valid[r]` is 0), as e4m3 elements
-/// `e4m3(x / scale)` where `e4m3`.
+/// `pie::Store` (`prim/store.cuh`), the row skeleton's and the contraction
+/// skeletons' alike: a result's columns from `from` up to `to` (every one
+/// where `to` is 0) landing from its plane row's first element, `head` of
+/// every `stride` where `head` is set; or, paged, at the cache row
+/// `page[r] · page_size + slot[r]` (none where the slot lies past the page
+/// or `valid[r]` is 0), as e4m3 elements `e4m3(x / scale)` where `e4m3`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Store {
     page: u64,
@@ -56,7 +57,7 @@ pub struct Store {
     page_size: u32,
     e4m3: bool,
     scale: f32,
-    /// A head-major window's head and stride, in vectors (0: whole).
+    /// A head-major window's head and stride (0: whole).
     head: u32,
     stride: u32,
 }
@@ -75,8 +76,26 @@ impl Store {
         stride: 0,
     };
 
-    /// Its words, as `fire` passes them.
-    fn words(self) -> [u64; 7] {
+    /// Window `w`'s columns (a head-major one's heads, one after another),
+    /// at the row `cache`'s page and slot name where it lands in one.
+    pub(crate) fn of(w: kernels_ir::Window, cache: Option<&Cache>) -> Store {
+        let c = cache.map_or((0, 0, 0, 0, None), |c| (c.page, c.slot, c.valid, c.page_size, c.e4m3));
+        Store {
+            page: c.0,
+            slot: c.1,
+            valid: c.2,
+            from: w.from,
+            to: w.end(),
+            page_size: c.3,
+            e4m3: c.4.is_some(),
+            scale: c.4.unwrap_or(1.0),
+            head: w.head,
+            stride: w.stride,
+        }
+    }
+
+    /// Its words, as a fire passes them.
+    pub(crate) fn words(self) -> [u64; 7] {
         [
             self.page,
             self.slot,
@@ -176,11 +195,7 @@ impl Plane {
     #[must_use]
     pub fn window(t: &Tensor, from: u32, width: u32) -> Self {
         Self {
-            store: Store {
-                from: from / VEC_WIDTH,
-                to: (from + width) / VEC_WIDTH,
-                ..Store::WHOLE
-            },
+            store: Store::of(kernels_ir::Window::of(from, width), None),
             ..Self::rows(t)
         }
     }
@@ -190,15 +205,8 @@ impl Plane {
     /// its gate a head), `width` of them in `t`, one head after another.
     #[must_use]
     pub fn window_strided(t: &Tensor, from: u32, width: u32, head: u32, stride: u32) -> Self {
-        let heads = width / head.max(1);
         Self {
-            store: Store {
-                from: from / VEC_WIDTH,
-                to: (from + heads.saturating_sub(1) * stride + head) / VEC_WIDTH,
-                head: head / VEC_WIDTH,
-                stride: stride / VEC_WIDTH,
-                ..Store::WHOLE
-            },
+            store: Store::of(kernels_ir::Window::strided(from, width, head, stride), None),
             ..Self::rows(t)
         }
     }
@@ -213,18 +221,7 @@ impl Plane {
             ids: 0,
             period: 0,
             bound: 0,
-            store: Store {
-                page: cache.page,
-                slot: cache.slot,
-                valid: cache.valid,
-                from: from / VEC_WIDTH,
-                to: (from + width) / VEC_WIDTH,
-                page_size: cache.page_size,
-                e4m3: cache.e4m3.is_some(),
-                scale: cache.e4m3.unwrap_or(1.0),
-                head: 0,
-                stride: 0,
-            },
+            store: Store::of(kernels_ir::Window::of(from, width), Some(&cache)),
         }
     }
 
@@ -350,7 +347,7 @@ pub(crate) fn entrypoint(
     per: u32,
     stored: &[Stored],
     outs: usize,
-    (ones, late, stream, vectors): (u32, u32, u32, u32),
+    (ones, late, stream): (u32, u32, u32),
     read_only: bool,
     schedule: Schedule,
 ) -> String {
@@ -358,7 +355,7 @@ pub(crate) fn entrypoint(
         .zip(stored)
         .fold(0u64, |dt, (k, form)| dt | (*form as u64) << (2 * k));
     format!(
-        "::pie::elemwise::row_skeleton<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}, {late}u, {stream}u, {vectors}u>",
+        "::pie::elemwise::row_skeleton<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}, {late}u, {stream}u>",
         block(width, schedule),
         lanes(width),
         stored.len()
@@ -389,7 +386,7 @@ pub(crate) fn fire(
     outs: &[Plane],
     (rows, parts): (u32, u32),
     width: u32,
-    (ones, vectors, vector_outs): (u32, u32, u32),
+    ones: u32,
     shared: Shared,
     schedule: Schedule,
 ) -> Result<(), Error> {
@@ -400,17 +397,11 @@ pub(crate) fn fire(
         .ok_or_else(|| refuse(op, format!("{rows} rows of {parts} parts overflow a grid")))?;
     // a row plane's every row starts on 16 bytes: a whole number of 8 bf16
     // or 4 f32 apart
-    // (a small vector one a row is read and landed an f32 at a time)
     let mut rowed = (0u32..)
         .zip(ins.iter().zip(stored))
-        .filter(|(k, _)| ((ones | vectors) >> k) & 1 == 0)
+        .filter(|(k, _)| (ones >> k) & 1 == 0)
         .map(|(_, (p, form))| (p, *form == Stored::F32))
-        .chain(
-            (0u32..)
-                .zip(outs)
-                .filter(|(k, _)| (vector_outs >> k) & 1 == 0)
-                .map(|(_, p)| (p, false)),
-        );
+        .chain(outs.iter().map(|p| (p, false)));
     if !rowed.all(|(p, wide)| aligned16(p.base) && p.row_stride % if wide { 4 } else { 8 } == 0) {
         return Err(refuse(op, "a plane is not 16-byte aligned at every row"));
     }
@@ -491,7 +482,7 @@ pub fn residual_add_rmsnorm(
                 per,
                 &[Stored::Bf16; 3],
                 2,
-                (0, 0, 0, 0),
+                (0, 0, 0),
                 false,
                 Schedule::Packed,
             ),
@@ -504,7 +495,7 @@ pub fn residual_add_rmsnorm(
         &[Plane::rows(out), Plane::rows(y)],
         (y.rows, 1),
         y.width,
-        (0, 0, 0),
+        0,
         Shared::default(),
         Schedule::Packed,
     )

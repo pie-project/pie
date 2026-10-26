@@ -20,16 +20,16 @@ pub use operands::{Operands, Part, Slot};
 pub use ops::{
     ActFn, ActQuant, Attn, BinaryOp, Blocks, Bounds, Collective, Conv, Elemwise, Fused,
     GateActivation, GateHeads, Gather, GluAct, GridRule, IndexScore, Linear, ModulateForm,
-    MropeForm, NormAxis, NormKind, NormNext, NormWeight, Operation, PixelOrder, RaggedMask, RegionRead,
-    Relative, ResidualGate, RopeForm, RopeFreqs, RouteScore, Sampling, Ssm, TapKind, TimePad, Turn,
-    VoxelSegment, Yarn,
+    MropeForm, NormAxis, NormKind, NormNext, NormWeight, Operation, PixelOrder, RaggedMask,
+    RegionRead, Relative, ResidualGate, RopeForm, RopeFreqs, RouteScore, Sampling, Ssm, TapKind,
+    TimePad, Turn, VoxelSegment, Yarn,
 };
 pub use poem_ir_macros::Op;
 pub use request::Request;
 pub use trace::{
-    BlockDrafter, CacheRow, ExpertSlots, GuestInput, InputDecl, LaneClass, LaneClasses, Node,
-    Output, OutputDecl, Param, ParamLayout, ParamPlacement, ParamSource, Platform, RowCount, Shard,
-    Trace,
+    BlockDrafter, CacheRow, ExpertSlots, GuestInput, InputDecl, KvRows, LaneClass, LaneClasses,
+    Node, Output, OutputDecl, Param, ParamLayout, ParamPlacement, ParamSource, Platform, RowCount,
+    Shard, Trace,
 };
 pub use value::{
     BIASES, Def, Dim, Dtype, GLOBAL_SCALES, GeomKind, INPUT_SCALES, InputAxis, PerAxis, RowAxis,
