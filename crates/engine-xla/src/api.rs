@@ -330,7 +330,7 @@ impl Engine for Xla {
             budgets,
             residency,
             ordinal,
-            frames_in_flight,
+            frames_in_flight: _,
         } = request;
         let mut boot = self.boot.clone();
         if ordinal > 0 {
@@ -349,13 +349,7 @@ impl Engine for Xla {
             budgets.max_clips,
             budgets.max_lanes,
         );
-        let slots = poem_compiler::state_slots(
-            budgets.slots,
-            &trace,
-            voxels.as_ref(),
-            frames_in_flight,
-            DEFAULT_STATE_SLOTS,
-        );
+        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let shell = Shell::load_with(
             Boot {
                 patches,

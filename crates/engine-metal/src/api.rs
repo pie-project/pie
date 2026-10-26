@@ -347,23 +347,14 @@ impl Engine for Metal {
             (device.working_set(), device.held_elsewhere())
         };
         let util = residency.device_memory_share;
-        let slots = poem_compiler::state_slots(
-            budgets.slots,
-            &trace,
-            poem_compiler::VoxelLadder::of(
-                &trace,
-                budgets.max_voxels,
-                budgets.max_clips,
-                budgets.max_lanes,
-            )
-            .as_ref(),
-            frames_in_flight,
-            DEFAULT_STATE_SLOTS,
-        );
+        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let paging = crate::store::kv::Paging::of(
             budgets.page_size,
             budgets.max_context,
-            engine::fit::least_state_slots(1).min(slots),
+            match slots {
+                0 => engine::fit::least_state_slots(1),
+                slots => engine::fit::least_state_slots(1).min(slots),
+            },
             1,
         )
         .map_err(|error| fault(Fault::from(error)))?;
@@ -408,7 +399,7 @@ impl Engine for Metal {
                 .pool
                 .saturating_sub(kv_pool)
                 / 2;
-            let voxels = poem_compiler::fit_voxels(
+            let mut fitted = poem_compiler::fit_voxels(
                 &trace,
                 poem_compiler::Budgets {
                     tokens: bake_budgets(&budgets),
@@ -422,8 +413,18 @@ impl Engine for Metal {
                 },
                 &DeviceProfile::default(),
                 room,
-            )
-            .voxels;
+            );
+            let slots = match slots {
+                0 => poem_compiler::fit_frame_slots(
+                    &trace,
+                    fitted.voxels.as_mut(),
+                    room,
+                    engine::fit::least_state_slots(1),
+                    frames_in_flight,
+                ),
+                slots => slots,
+            };
+            let voxels = fitted.voxels;
             let prepared = Shell::prepare(Boot {
                 trace: trace.clone(),
                 contract: &contract,

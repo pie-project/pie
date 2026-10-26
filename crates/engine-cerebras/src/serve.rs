@@ -419,7 +419,7 @@ impl Shell {
     }
 
     fn load_on(
-        boot: Boot<'_>,
+        mut boot: Boot<'_>,
         voxels: Option<poem_compiler::VoxelLadder>,
         device: Device,
     ) -> Result<Shell> {
@@ -461,8 +461,17 @@ impl Shell {
                 .saturating_sub(DEVICE_HEADROOM)
                 / 2
         });
-        let budgets =
+        let mut budgets =
             poem_compiler::fit_voxels(&boot.trace, budgets, &DeviceProfile::default(), room);
+        if boot.slots == 0 {
+            boot.slots = poem_compiler::fit_frame_slots(
+                &boot.trace,
+                budgets.voxels.as_mut(),
+                room,
+                engine::fit::least_state_slots(1),
+                1,
+            );
+        }
         let compiled = compile_axes(&boot.trace, &budgets, &DeviceProfile::default())?;
         let facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;

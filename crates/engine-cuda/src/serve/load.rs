@@ -95,8 +95,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     boot.slots = poem_compiler::state_slots(
         boot.slots,
         &boot.trace,
-        boot.voxels.as_ref(),
-        boot.runahead.frames_in_flight,
         match engine.state_slots_per_lane {
             0 => DEFAULT_STATE_SLOTS,
             per_lane => per_lane.saturating_mul(boot.budget.max_lanes).max(1),
@@ -297,6 +295,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         }
         voxels => voxels,
     };
+    let cache_room = (boot.slots == 0).then(|| {
+        let seat = voxels.as_ref().map_or(0, |ladder| {
+            crate::voxels::Seat::of(&boot.trace, ladder).payload_bytes()
+        });
+        after_weights
+            .saturating_sub(working(tokens, &voxels))
+            .saturating_sub(seat)
+            .saturating_sub(crate::store::BODIES_FLOOR_BYTES)
+    });
     if tokens != asked_tokens {
         eprintln!(
             "engine-cuda: [engine] max_forward_tokens {asked_tokens} is served at {tokens}: at \
@@ -311,6 +318,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         boot.budget = budget_at(tokens);
     }
     boot.voxels = voxels;
+    if let Some(room) = cache_room {
+        boot.slots = poem_compiler::fit_frame_slots(
+            &boot.trace,
+            boot.voxels.as_mut(),
+            room,
+            engine::fit::least_state_slots(1),
+            boot.runahead.frames_in_flight,
+        );
+    }
     let budgets = Budgets {
         tokens: boot.budget.clone(),
         patches: boot.patches.clone(),

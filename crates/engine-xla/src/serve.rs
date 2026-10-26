@@ -362,7 +362,7 @@ impl Shell {
         let tuning = kernels_xla::tuning::Tuning::on(&chip, tpu.vmem_bytes());
         let engine = crate::chip::Engine::of(&chip);
         let pad = engine.pad;
-        let boot = Boot {
+        let mut boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
                 poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS),
@@ -406,7 +406,16 @@ impl Shell {
                 .saturating_sub(tpu.headroom())
                 / 2
         });
-        let budgets = poem_compiler::fit_voxels(&boot.trace, budgets, &profile, room);
+        let mut budgets = poem_compiler::fit_voxels(&boot.trace, budgets, &profile, room);
+        if boot.slots == 0 {
+            boot.slots = poem_compiler::fit_frame_slots(
+                &boot.trace,
+                budgets.voxels.as_mut(),
+                room,
+                engine::fit::least_state_slots(1),
+                1,
+            );
+        }
         let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
         let facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;

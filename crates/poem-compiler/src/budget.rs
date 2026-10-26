@@ -391,26 +391,45 @@ pub fn voxels_within(room: u64, floor: u32, bytes_at: impl Fn(u32) -> u64) -> u3
     voxels
 }
 
-/// The state slots a load holds: `stated`, or where none is (0) and the
-/// model's only state is voxel frame caches, one for each clip a fire
-/// carries in each fire in flight; else `otherwise`.
+/// The state slots a load asks for: `stated`; else 0 where the model's only
+/// state is voxel frame caches, which [`fit_frame_slots`] fits to memory;
+/// else `otherwise`.
 #[must_use]
-pub fn state_slots(
-    stated: u32,
+pub fn state_slots(stated: u32, trace: &poem_ir::Trace, otherwise: u32) -> u32 {
+    match stated {
+        0 if frame_caches_only(trace) => 0,
+        0 => otherwise,
+        stated => stated,
+    }
+}
+
+/// The frame-cache slots `room` holds, never under `least`; a fire then
+/// carries no more clips than they seat `frames_in_flight` fires deep.
+pub fn fit_frame_slots(
     trace: &poem_ir::Trace,
-    voxels: Option<&VoxelLadder>,
+    voxels: Option<&mut VoxelLadder>,
+    room: u64,
+    least: u32,
     frames_in_flight: u8,
-    otherwise: u32,
 ) -> u32 {
-    if stated > 0 {
-        return stated;
+    let slot: u64 = trace
+        .caches
+        .iter()
+        .filter_map(|row| match row {
+            poem_ir::CacheRow::State { slab, dtype, .. } => {
+                Some(slab.iter().product::<u64>() * crate::arena::elem_bytes(*dtype).unwrap_or(2))
+            }
+            poem_ir::CacheRow::Kv { .. } => None,
+        })
+        .sum();
+    let slots = u32::try_from(room / slot.max(1))
+        .unwrap_or(u32::MAX)
+        .max(least);
+    if let Some(ladder) = voxels {
+        let clips = (slots / u32::from(frames_in_flight.max(1))).max(1);
+        ladder.max_clips = ladder.max_clips.min(clips);
     }
-    match voxels {
-        Some(ladder) if frame_caches_only(trace) => ladder
-            .max_clips
-            .saturating_mul(u32::from(frames_in_flight.max(1))),
-        _ => otherwise,
-    }
+    slots
 }
 
 fn frame_caches_only(trace: &poem_ir::Trace) -> bool {

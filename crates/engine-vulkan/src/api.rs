@@ -345,13 +345,7 @@ impl Engine for Vulkan {
             budgets.max_clips,
             budgets.max_lanes,
         );
-        let slots = poem_compiler::state_slots(
-            budgets.slots,
-            &trace,
-            voxels.as_ref(),
-            frames_in_flight,
-            DEFAULT_STATE_SLOTS,
-        );
+        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let (disk_kv_budget, disk_kv_dir, seats) = (
             residency.disk_kv_budget,
             residency.disk_kv_dir.clone(),

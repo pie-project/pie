@@ -392,13 +392,7 @@ impl Engine for Wgpu {
             budgets.max_clips,
             budgets.max_lanes,
         );
-        let slots = poem_compiler::state_slots(
-            budgets.slots,
-            &trace,
-            voxels.as_ref(),
-            frames_in_flight,
-            DEFAULT_STATE_SLOTS,
-        );
+        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let shell = Shell::load(Boot {
             trace,
             contract: &contract,

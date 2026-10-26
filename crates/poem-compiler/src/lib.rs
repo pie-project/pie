@@ -27,7 +27,7 @@ use poem_ir::{ClassTable, Def, Operands, Operation, Trace, Ty, resolve_classes};
 pub use arena::{ArenaMap, Concurrency, Extent, FireRows, Placement, RowExpr, Span};
 pub use budget::{
     Budget, Budgets, DeviceProfile, FamilyCosts, Ladder, PATCH_LATTICE_FLOOR, PatchLadder,
-    VoxelLadder, state_slots, voxels_within,
+    VoxelLadder, fit_frame_slots, state_slots, voxels_within,
 };
 pub use compiled::{
     AxisPlan, ClassOrder, CompiledModel, EventId, Fallback, FallbackRow, FallbackTable, Lowering,

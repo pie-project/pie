@@ -442,7 +442,7 @@ impl Shell {
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
         let tuning = crate::tuning::Tuning::new(chip, device.cores(), device.storage_buffers());
         let chip = tuning.profile();
-        let boot = Boot {
+        let mut boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
                 poem_compiler::fuse::flags::on(chip, &crate::FUSIONS),
@@ -466,7 +466,16 @@ impl Shell {
         };
         let weights: u64 = crate::weights::plane_bytes(&boot.trace)?.iter().sum();
         let room = device.working_set().saturating_sub(weights) / 2;
-        let budgets = poem_compiler::fit_voxels(&boot.trace, budgets, &profile, room);
+        let mut budgets = poem_compiler::fit_voxels(&boot.trace, budgets, &profile, room);
+        if boot.slots == 0 {
+            boot.slots = poem_compiler::fit_frame_slots(
+                &boot.trace,
+                budgets.voxels.as_mut(),
+                room,
+                engine::fit::least_state_slots(1),
+                boot.runahead.frames_in_flight,
+            );
+        }
         let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
 
         let facts = kv::probe(&boot.trace)?;
