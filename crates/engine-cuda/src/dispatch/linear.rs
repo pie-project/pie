@@ -357,8 +357,16 @@ impl Run<'_> {
                 ins,
                 key,
                 outs,
+                cache,
                 ..
-            } => self.anchored(*act, *w, ins, *key, outs),
+            } => self.anchored(*act, *w, ins, *key, outs, *cache),
+            Fused::Epilogue {
+                y,
+                ins,
+                key,
+                outs,
+                cache,
+            } => self.epilogue(*y, ins, *key, outs, *cache),
             _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }
     }
@@ -374,6 +382,7 @@ impl Run<'_> {
         ins: &[ValueId],
         key: u64,
         outs: &[ValueId],
+        cache: Option<ValueId>,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "fused.anchored";
         let broken = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
@@ -386,6 +395,74 @@ impl Run<'_> {
                 w.0
             )));
         }
+        let (planes, landed, paging) = self.anchor_planes(epi, ins, outs, cache)?;
+        if linear::gemm::anchored(
+            self.ctx(),
+            OP,
+            epi,
+            self.tensor(act),
+            self.tensor(w),
+            &planes,
+            &landed,
+            paging,
+        )? {
+            Ok(())
+        } else {
+            Err(broken(
+                "neither a contraction skeleton nor the unfused leg landed it, and the fold forms \
+                 only what one does"
+                    .into(),
+            ))
+        }
+    }
+
+    /// A `fused.epilogue`: an anchored region's epilogue over the product
+    /// `y` its own op landed, on the row skeleton.
+    fn epilogue(
+        &mut self,
+        y: ValueId,
+        ins: &[ValueId],
+        key: u64,
+        outs: &[ValueId],
+        cache: Option<ValueId>,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "fused.epilogue";
+        let broken = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
+        let epi = self
+            .anchor_epilogue(key)
+            .ok_or_else(|| broken(format!("the load loaded no epilogue for {key:016x}")))?;
+        let (planes, landed, paging) = self.anchor_planes(epi, ins, outs, cache)?;
+        if linear::gemm::epilogue(self.ctx(), OP, epi, self.tensor(y), &planes, &landed, paging)? {
+            Ok(())
+        } else {
+            Err(broken(
+                "the row skeleton did not land it, and the fold forms only what it does".into(),
+            ))
+        }
+    }
+
+    /// An anchored region's input planes (the op's values in order, a
+    /// normed operand's row scale the contraction's own), its results'
+    /// (the op's values in order, a paged result its cache's keys or values:
+    /// a bf16 or unit-scaled e4m3 pool of rows a cell, every row live where
+    /// its `row_valid` says) and where its cache rows live.
+    #[allow(clippy::type_complexity)]
+    fn anchor_planes(
+        &self,
+        epi: &linear::skeleton::Epilogue,
+        ins: &[ValueId],
+        outs: &[ValueId],
+        cache: Option<ValueId>,
+    ) -> Result<
+        (
+            Vec<linear::skeleton::In>,
+            Vec<Tensor>,
+            Option<linear::skeleton::Paging>,
+        ),
+        kernels_cuda::Error,
+    > {
+        const OP: &str = "fused.anchored";
+        let broken = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
         // Each input's plane, the op's values in order; a normed operand's
         // row scale (no value) the contraction's own.
         let mut values = ins.iter();
@@ -417,24 +494,42 @@ impl Run<'_> {
                 })
             })
             .collect::<Result<_, kernels_cuda::Error>>()?;
-        let landed: Vec<Tensor> = outs.iter().map(|&v| self.tensor(v)).collect();
-        if linear::gemm::anchored(
-            self.ctx(),
-            OP,
-            epi,
-            self.tensor(act),
-            self.tensor(w),
-            &planes,
-            &landed,
-        )? {
-            Ok(())
-        } else {
-            Err(broken(
-                "neither a contraction skeleton nor the unfused leg landed it, and the fold forms \
-                 only what one does"
-                    .into(),
-            ))
+        // Each result's plane: the op's values in order, a paged result its
+        // cache's keys or values (a bf16 or unit-scaled e4m3 pool of rows a
+        // cell, every row live where its `row_valid` says).
+        let pool = cache.map(|c| self.pool(c));
+        let mut values = outs.iter();
+        let mut landed: Vec<Tensor> = Vec::with_capacity(epi.results());
+        for k in 0..epi.results() {
+            landed.push(match epi.paged(k) {
+                Some(paged) => {
+                    let pool = pool.as_ref().ok_or_else(|| {
+                        broken("a paged result, and the op names no cache".into())
+                    })?;
+                    let native = kernels_cuda::attn::kv::native_bf16(pool)
+                        || kernels_cuda::attn::kv::native_e4m3(pool);
+                    if !native || pool.layout != 0 || pool.has_envelopes {
+                        return Err(broken(
+                            "a paged result lands in a bf16 or unit-scaled e4m3 pool of rows a \
+                             cell, with no envelopes"
+                                .into(),
+                        ));
+                    }
+                    match paged.plane {
+                        linear::skeleton::CachePlane::Keys => pool.keys,
+                        linear::skeleton::CachePlane::Values => pool.values,
+                    }
+                }
+                None => self.tensor(*values.next().ok_or_else(|| {
+                    broken("the op lands fewer values than its epilogue's results".into())
+                })?),
+            });
         }
+        let paging = pool.as_ref().map(|pool| linear::skeleton::Paging {
+            valid: pool.row_valid.ptr,
+            page_size: u32::try_from(pool.page_size).unwrap_or(0),
+        });
+        Ok((planes, landed, paging))
     }
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {

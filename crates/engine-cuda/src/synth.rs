@@ -65,14 +65,18 @@ pub fn fold_anchors(
     )
 }
 
-/// Every `fused.anchored` of `trace`: its node, key and the values it
-/// reads and lands.
-fn anchored(trace: &Trace) -> impl Iterator<Item = (u32, u64, &[ValueId], &[ValueId])> {
+/// Every `fused.anchored` (and `fused.epilogue`, over a product landed
+/// apart: `true`) of `trace`: its node, key and the values it reads and
+/// lands.
+fn anchored(trace: &Trace) -> impl Iterator<Item = (u32, u64, &[ValueId], &[ValueId], bool)> {
     (0u32..)
         .zip(&trace.nodes)
         .filter_map(|(node, n)| match &n.op {
             Operation::Fused(Fused::Anchored { ins, key, outs, .. }) => {
-                Some((node, *key, ins.as_slice(), outs.as_slice()))
+                Some((node, *key, ins.as_slice(), outs.as_slice(), false))
+            }
+            Operation::Fused(Fused::Epilogue { ins, key, outs, .. }) => {
+                Some((node, *key, ins.as_slice(), outs.as_slice(), true))
             }
             _ => None,
         })
@@ -125,7 +129,7 @@ impl Regions {
         tuning: &kernels_cuda::tuning::Tuning,
     ) -> Result<Regions> {
         let mut anchors = BTreeMap::new();
-        for (node, key, ins, outs) in anchored(trace) {
+        for (node, key, ins, outs, landed) in anchored(trace) {
             let broken = |why: String| Fault::Region {
                 node,
                 body: key,
@@ -153,7 +157,12 @@ impl Regions {
                 .map_err(|why| broken(why.to_string()))?;
             let epi = Epilogue::interned_stored(held, &read)?;
             let c = &held.contraction;
-            epi.load_every(c.n, c.k, tuning)?;
+            if landed {
+                // its product its own op's: the row skeleton's leg alone
+                epi.load_leg(c.n)?;
+            } else {
+                epi.load_every(c.n, c.k, tuning)?;
+            }
             anchors.insert(key, epi);
         }
         let mut kernels = BTreeMap::new();

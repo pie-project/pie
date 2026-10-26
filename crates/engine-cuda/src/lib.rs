@@ -58,14 +58,13 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
         use poem_compiler::fuse::rules;
         use poem_ir::ops::fused::Intermediates;
         vec![
-            rules::split_qkv_fused(),
-            rules::qkv_fused_qknorm_rope_vnorm_write(),
+            rules::qkv_fused_padded(),
             rules::moe_mega(),
             rules::moe_experts(),
             rules::moe_select_glu(),
             rules::matmul_moe_route(),
             rules::matmul_split_rows(),
-            rules::norm_rope_last_append(),
+            rules::norm_rope_last_append_rows(),
             rules::split_rope_yarn_append(),
             rules::rope_yarn_append(),
             rules::q_gate_norm_rope_append(Intermediates::Unwritten),
@@ -123,13 +122,20 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 /// product rules CUDA's anchored regions replace (`fuse::anchor`): a
 /// product's bias, its soft cap and a packed bank's GEGLU and SwiGLU, each
 /// the epilogue of its contraction skeleton, timed against the product and
-/// the epilogue on the row skeleton. The qkv writes stay: a packed qkv
-/// product's split, norms and turn are an anchored region (Qwen3's, every
-/// site no rule holds), but the hand kernel writes k and v into the paged
-/// cache in the same launch, an epilogue lands tiles, and Gemma 4's
-/// 512-wide global heads and MiMo's padded split are no epilogue's span;
-/// Muse Spark's `qkv | gate` is `matmul_split_rows`'s first, whose long
-/// fires land each half by a GEMM of its own, no product landed and cut.
+/// the epilogue on the row skeleton. And the KV writes an epilogue now pages
+/// into the cache (kernels-ir's `Paged`): the qkv write's split, norms and
+/// turn with k and v landed at their pages and slots (an anchored region's,
+/// or over a product landed apart, a quantized bank's or Muse Spark's
+/// `qkv | gate` half, a `fused.epilogue`), and DeepSeek-V4's k row normed,
+/// turned and written. (`split_qkv_fused` is gone too, and is not listed:
+/// without it `matmul_split_rows` takes its split first, so it finds no
+/// site to hold to this; its sites are that product's `fused.epilogue`.) What stays: MiMo's padded qkv write (its cache's
+/// heads padded past their widths, no window's), the fp8 rows of DeepSeek's
+/// cache (`norm_rope_last_append_rows`: its blocks' scales and bf16 tail no
+/// paged store's element), Qwen3.5's gated q (`q_gate_norm_rope_append`: q
+/// and gate interleaved a head, no window), YaRN's turn of every pair
+/// (`rope_yarn_append`, its attention factor no builder's turn yet) and the
+/// pooled and paired writes.
 #[cfg(not(feature = "rocm"))]
 #[must_use]
 pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
@@ -140,6 +146,8 @@ pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
         rules::matmul_glu(&[poem_ir::GluAct::GegluTanh, poem_ir::GluAct::Swiglu]),
         rules::matmul_softcap(),
         rules::matmul_bias(),
+        rules::qkv_fused_qknorm_rope_vnorm_write(),
+        rules::norm_rope_last_append(),
         rules::embed_scale_add_select(),
         rules::embed_scale_add(),
         rules::norm_modulate(),
@@ -393,6 +401,10 @@ mod tests {
                     }
                     Operation::Fused(Fused::Anchored { act, ins, outs, .. }) => Some((
                         [*act].into_iter().chain(ins.iter().copied()).collect(),
+                        outs.clone(),
+                    )),
+                    Operation::Fused(Fused::Epilogue { y, ins, outs, .. }) => Some((
+                        [*y].into_iter().chain(ins.iter().copied()).collect(),
                         outs.clone(),
                     )),
                     _ => None,

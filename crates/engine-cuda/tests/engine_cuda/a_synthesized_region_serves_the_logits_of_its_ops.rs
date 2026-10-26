@@ -120,7 +120,13 @@ fn fixture(model: &'static str) -> Fixture {
 /// q, k and v one product, a gate and an up one packed bank, so a norm
 /// before them is one product's operand alone and folds into its anchor.
 fn packed_fixture(model: &'static str) -> Fixture {
-    let trace = poem_compiler::catalog::trace_of(model, Dtype::Bf16, Dtype::Bf16, Platform::Cuda);
+    packed_fixture_kv(model, Dtype::Bf16)
+}
+
+/// [`packed_fixture`] with its KV cache stored as `kv` (bf16, or e4m3 under
+/// a unit scale).
+fn packed_fixture_kv(model: &'static str, kv: Dtype) -> Fixture {
+    let trace = poem_compiler::catalog::trace_of(model, Dtype::Bf16, kv, Platform::Cuda);
     let shape = poem_compiler::pack::shape(&trace);
     fixture_of(model, poem_compiler::pack::pack_as(trace, &shape))
 }
@@ -259,6 +265,17 @@ fn deviations(got: &[Vec<f32>], want: &[Vec<f32>]) -> Vec<(f32, f32)> {
 /// reference's gap to it is within the deviation (a near tie either run
 /// may break).
 fn close(got: &[Vec<f32>], want: &[Vec<f32>], carry: &[Vec<f32>], against: &str) {
+    close_within(got, want, carry, against, SPREAD);
+}
+
+/// [`close`] within `share` of each step's spread.
+fn close_within(
+    got: &[Vec<f32>],
+    want: &[Vec<f32>],
+    carry: &[Vec<f32>],
+    against: &str,
+    share: f32,
+) {
     let carried = deviations(carry, want);
     for (step, (((deviation, spread), (own, _)), (got, want))) in deviations(got, want)
         .into_iter()
@@ -266,7 +283,7 @@ fn close(got: &[Vec<f32>], want: &[Vec<f32>], carry: &[Vec<f32>], against: &str)
         .zip(got.iter().zip(want))
         .enumerate()
     {
-        let bound = (SPREAD * spread).max(2.0 * own);
+        let bound = (share * spread).max(2.0 * own);
         eprintln!(
             "{against}, step {step}: logits at most {deviation} apart over a spread of {spread}; \
              the ops in another order {own} apart"
@@ -287,6 +304,12 @@ fn close(got: &[Vec<f32>], want: &[Vec<f32>], carry: &[Vec<f32>], against: &str)
 
 /// A step's logits within this share of their spread of the reference's.
 const SPREAD: f32 = 2e-2;
+
+/// [`SPREAD`] over an e4m3 cache: each cached element rounds to 3 mantissa
+/// bits, so a bf16 place apart before the cache (the epilogue's own order)
+/// can land a whole e4m3 place apart (2^-3, sixteen of bf16's), the
+/// reference's own append rounding the row it is handed so too.
+const SPREAD_FP8: f32 = 4e-2;
 
 /// The norms' register forms: the unfused ops summing in another order.
 const NUDGED: &str = "[kernel]\nelemwise.rows_vec = true\n";
@@ -408,6 +431,51 @@ fn an_anchored_region_serves_the_logits_of_its_ops() {
     }
 }
 
+/// Each KV append an epilogue pages into the cache (kernels-ir's `Paged`:
+/// the qkv write's k and v, at their pages and slots, from the epilogue's
+/// own registers) served against the products, their ops and the cache's
+/// own append as their own kernels, over a bf16 cache and an e4m3 one (each
+/// element rounded to bf16 and then to e4m3, as the hand append rounds the
+/// bf16 row it is handed; its logits held within [`SPREAD_FP8`]): Gemma
+/// 4's qkv write (its hand rule retired on
+/// CUDA, its k and v normed, the v scaleless) and GLM-4.5's biased qkv with
+/// its partial turn. A prefill past every skeleton's rows (the unfused leg)
+/// and one of a few, then the decode steps, each step's logits within
+/// [`close`]'s bound (and a routed model's within
+/// [`close_past_routing`]'s).
+#[test]
+fn a_paged_epilogue_serves_the_logits_of_its_kv_append() {
+    let _one = serialized();
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    const ROWS_OFF: &str = "[compiler]\nsynth_regions = false\n";
+    for (model, routed) in [("gemma4-e4b-mini-l1", false), ("glm45-air-mini", true)] {
+        for kv in [Dtype::Bf16, Dtype::E4m3] {
+            let fixture = packed_fixture_kv(model, kv);
+            for prompted in [37u32, 100] {
+                let ops = served_from(&fixture, OPS, false, None, prompted);
+                let carry = served_from(
+                    &fixture,
+                    &format!("{OPS}{REORDERED}"),
+                    false,
+                    Some(&ops),
+                    prompted,
+                );
+                let paged = served_from(&fixture, ROWS_OFF, true, Some(&ops), prompted);
+                let against = format!("{model}'s unfused ops, a {kv:?} cache ({prompted} rows)");
+                let share = if kv == Dtype::E4m3 { SPREAD_FP8 } else { SPREAD };
+                if routed {
+                    close_past_routing_within(&paged, &ops, &carry, &against, share);
+                } else {
+                    close_within(&paged, &ops, &carry, &against, share);
+                }
+            }
+        }
+    }
+}
+
 /// [`close`] for a routed model, whose experts a last-bit difference may
 /// pick apart: the top token is the reference's at every step (or its
 /// runner-up within twice what the ops in another order move a logit, a tie
@@ -417,6 +485,17 @@ fn an_anchored_region_serves_the_logits_of_its_ops() {
 /// than the reference's: a step past the bound with the reference's top
 /// token is let through with a note, a minority of them.
 fn close_past_routing(got: &[Vec<f32>], want: &[Vec<f32>], carry: &[Vec<f32>], against: &str) {
+    close_past_routing_within(got, want, carry, against, SPREAD);
+}
+
+/// [`close_past_routing`] within `share` of each step's spread.
+fn close_past_routing_within(
+    got: &[Vec<f32>],
+    want: &[Vec<f32>],
+    carry: &[Vec<f32>],
+    against: &str,
+    share: f32,
+) {
     let carried = deviations(carry, want);
     let mut routed_apart = 0usize;
     for (step, (((deviation, spread), (own, _)), (got, want))) in deviations(got, want)
@@ -425,7 +504,7 @@ fn close_past_routing(got: &[Vec<f32>], want: &[Vec<f32>], carry: &[Vec<f32>], a
         .zip(got.iter().zip(want))
         .enumerate()
     {
-        let bound = (SPREAD * spread).max(2.0 * own);
+        let bound = (share * spread).max(2.0 * own);
         let (top, picked) = (argmax(want), argmax(got));
         eprintln!(
             "{against}, step {step}: logits at most {deviation} apart over a spread of {spread}; \

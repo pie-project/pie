@@ -88,6 +88,7 @@ impl DispatchFused for Run<'_> {
             Fused::HcFoldPre { .. } => self.hc_fold_pre(op),
             Fused::HcPre { .. } => self.hc_pre(op),
             Fused::Anchored { .. }
+            | Fused::Epilogue { .. }
             | Fused::MatmulGlu { .. }
             | Fused::MatmulSwigluMatmul { .. }
             | Fused::MatmulMoeRoute { .. }
