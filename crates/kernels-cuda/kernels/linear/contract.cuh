@@ -230,6 +230,9 @@ struct HeadHook : TileHook<P, 8, IN, OUT, ROUND> {
     __device__ __forceinline__ float* table() const { return tab; }
     __device__ __forceinline__ unsigned thread() const { return threadIdx.x; }
     __device__ __forceinline__ void sync_block() { __syncthreads(); }
+    // The table whole before a read that follows a share: a head's share
+    // meets its warp alone, so the table takes the block's barrier.
+    __device__ __forceinline__ void sync_table() { __syncthreads(); }
 };
 
 // A warp's dot of weight row `row` (K wide) with the activation `act`,

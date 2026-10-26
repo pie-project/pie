@@ -342,7 +342,9 @@ fn a_modulated_norms_region_lands_its_math() {
                     NORM_SCALED,
                 );
                 let (apart_n, most) = apart(&land(By::Ops).1, want.last().expect("a result"));
-                eprintln!("{case}: the ops {apart_n} of {n} apart from the math, {most} ulps at most");
+                eprintln!(
+                    "{case}: the ops {apart_n} of {n} apart from the math, {most} ulps at most"
+                );
             }
         }
     }

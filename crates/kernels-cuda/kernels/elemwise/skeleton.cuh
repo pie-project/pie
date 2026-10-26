@@ -60,8 +60,24 @@ constexpr int kI32 = 2;
 // no registers through the passes before it. A row past the fire's
 // (`!live`) computes on garbage beside its block's live rows, through
 // every barrier they meet, and stores nothing.
+// The vector of 8 each thread's slot holds: the slot's own (`lane + p *
+// LANES`), or where a body lays its vectors out (`Body::vector`, a
+// pair-packed turn's turned vectors on the first threads).
+struct InOrder {
+    __device__ __forceinline__ static unsigned vector(unsigned s) { return s; }
+};
+
+template <class B, class = void>
+struct OrderOf {
+    using type = InOrder;
+};
+template <class B>
+struct OrderOf<B, decltype(static_cast<void>(B::vector(0u)))> {
+    using type = B;
+};
+
 template <int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES, unsigned long long DT,
-          bool READ_ONLY, unsigned LATE = 0u>
+          bool READ_ONLY, unsigned LATE = 0u, class ORDER = InOrder>
 struct RowSkeleton {
     static_assert((LANES & (LANES - 1)) == 0 && LANES <= BLOCK && (LANES <= 32 || LANES % 32 == 0),
                   "a row is a power-of-two run of a block's threads");
@@ -82,6 +98,8 @@ struct RowSkeleton {
     uint4* dst[OUT];
     // A late parameter's first vector, issued by `load<k>()`.
     const uint4* src[IN];
+    // The vector of 8 each of this thread's slots holds (`ORDER`).
+    unsigned at[VECS];
     uint4 in[IN][VECS];
     // An f32 plane's vector of 8 is two words; its last four elements here.
     uint4 hi[IN][VECS];
@@ -114,6 +132,8 @@ struct RowSkeleton {
           buf(buf),
           row(shared + planes.table + (static_cast<int>(threadIdx.x) / LANES) * SHARED),
           tab(shared) {
+#pragma unroll
+        for (int p = 0; p < VECS; ++p) at[p] = ORDER::vector(static_cast<unsigned>(lane + p * LANES));
 #pragma unroll
         for (int k = 0; k < OUT; ++k) {
             dst[k] = reinterpret_cast<uint4*>(static_cast<bf16*>(const_cast<void*>(planes.out[k].base)) +
@@ -149,8 +169,9 @@ struct RowSkeleton {
     __device__ __forceinline__ void issue(int k) {
 #pragma unroll
         for (int p = 0; p < VECS; ++p) {
-            const int i = lane + p * LANES;
-            if (i >= vectors) continue;
+            const int slot = lane + p * LANES;
+            if (slot >= vectors) continue;
+            const int i = static_cast<int>(at[p]);
             const int v = period[k] > 0 ? i % period[k] : i;
             if (dtype(k) == kF32) {
                 in[k][p] = READ_ONLY ? __ldg(src[k] + 2 * v) : src[k][2 * v];
@@ -174,10 +195,16 @@ struct RowSkeleton {
     __device__ __forceinline__ bool valid(int e) const { return lane + (e / 8) * LANES < vectors; }
 
     __device__ __forceinline__ unsigned col(int e) const {
-        return static_cast<unsigned>((lane + (e / 8) * LANES) * 8 + e % 8);
+        return at[e / 8] * 8u + static_cast<unsigned>(e % 8);
     }
 
     __device__ __forceinline__ float one(int k) const { return ones[k]; }
+
+    // Whether slot `q` of this thread is one of the first `k` of its row: a
+    // pair-packed turn's turned vectors.
+    __device__ __forceinline__ bool turned(int q, unsigned k) const {
+        return static_cast<unsigned>(lane + q * LANES) < k;
+    }
 
     __device__ __forceinline__ float ld(int k, int e) const {
         if (dtype(k) == kF32) {
@@ -301,6 +328,14 @@ struct RowSkeleton {
     // The block's table complete for every thread.
     __device__ __forceinline__ void sync_block() { __syncthreads(); }
 
+    // The block's table complete for every thread by the first read of it,
+    // which follows a row's share (`sync()`): that share meets the whole
+    // block where a row is more than a warp's threads; a warp's row meets
+    // its warp alone, so the table takes a barrier of its own.
+    __device__ __forceinline__ void sync_table() {
+        if constexpr (LANES <= 32) __syncthreads();
+    }
+
     __device__ __forceinline__ float peer(unsigned c) const { return row[c < SHARED ? c : 0u]; }
 
     // What a column alone computes, tabled once a block: the body writes
@@ -317,8 +352,8 @@ struct RowSkeleton {
         if (!live) return;
 #pragma unroll
         for (int p = 0; p < VECS; ++p) {
-            const int i = lane + p * LANES;
-            if (i < vectors) dst[K][i] = out[K][p];
+            const int slot = lane + p * LANES;
+            if (slot < vectors) dst[K][at[p]] = out[K][p];
         }
     }
 };
@@ -358,7 +393,9 @@ __global__ void __launch_bounds__(BLOCK) row_skeleton(
 
     __shared__ float buf[VECS * (BLOCK / 32) + 1];
     extern __shared__ float shared[];
-    RowSkeleton<BLOCK, LANES, VECS, IN, OUT, ONES, DT, READ_ONLY, LATE> f(
+    RowSkeleton<BLOCK, LANES, VECS, IN, OUT, ONES, DT, READ_ONLY, LATE,
+                typename OrderOf<Body>::type>
+        f(
         planes, of, part, row < live_rows, buf, shared);
     body(f);
 }

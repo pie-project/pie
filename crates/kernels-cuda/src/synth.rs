@@ -46,6 +46,10 @@ pub struct Body {
     /// The parameters (by bit) it loads where it first wants them
     /// ([`print::late`]), not up front.
     pub late: u32,
+    /// The body packed rows run where it is not this one: a pair-packed
+    /// turn ([`print::packing`]), which many rows' warps of no turned pair
+    /// skip and a decode's few would wait on.
+    pub packed: Option<Box<Body>>,
 }
 
 impl Body {
@@ -54,18 +58,29 @@ impl Body {
     pub fn of(region: &Region) -> Result<Body, Refusal> {
         let kernel = kernels_ir::schedule(region)
             .map_err(|why| refusal(format!("the row core does not schedule the region: {why}")))?;
-        let source = print::body(&kernel).map_err(|print::Unprinted(dtype)| {
-            refusal(format!(
-                "a value rounds to {dtype:?}, which no hook rounds to"
-            ))
-        })?;
+        let printed = |packing: Option<&print::Packing>| {
+            let source =
+                print::body_with(&kernel, packing).map_err(|print::Unprinted(dtype)| {
+                    refusal(format!(
+                        "a value rounds to {dtype:?}, which no hook rounds to"
+                    ))
+                })?;
+            Ok::<Body, Refusal>(Body {
+                hash: kernels_ir::fnv1a64(source.as_bytes()),
+                source,
+                passes: kernel.passes(),
+                table: kernel.table,
+                shares: kernel.shares,
+                late: print::late(&kernel),
+                packed: None,
+            })
+        };
+        let packed = print::packing(&kernel, region.width)
+            .map(|packing| printed(Some(&packing)).map(Box::new))
+            .transpose()?;
         Ok(Body {
-            hash: kernels_ir::fnv1a64(source.as_bytes()),
-            source,
-            passes: kernel.passes(),
-            table: kernel.table,
-            shares: kernel.shares,
-            late: print::late(&kernel),
+            packed,
+            ..printed(None)?
         })
     }
 }
@@ -277,19 +292,37 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
     }
     let per = skeleton::per(OP, width)?;
     let root = unit(body)?;
+    // Packed rows run the packed body where there is one.
+    let packed_root = body
+        .packed
+        .as_deref()
+        .map(unit)
+        .transpose()?
+        .unwrap_or(root);
     // Packed rows issue a later pass's parameters late; spread ones load
     // every parameter up front.
     let late = body.late & !ones;
     let laid = |schedule| {
         crate::jit::generated(
-            root,
+            if schedule == Schedule::Packed {
+                packed_root
+            } else {
+                root
+            },
             &skeleton::entrypoint(
                 BODY,
                 width,
                 per,
                 &stored[..ins.len()],
                 outs,
-                (ones, if schedule == Schedule::Packed { late } else { 0 }),
+                (
+                    ones,
+                    if schedule == Schedule::Packed {
+                        late
+                    } else {
+                        0
+                    },
+                ),
                 true,
                 schedule,
             ),
@@ -297,8 +330,9 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
     };
     let spread = (skeleton::block(width, Schedule::Spread)
         < skeleton::block(width, Schedule::Packed)
-        || late != 0)
-        .then(|| laid(Schedule::Spread));
+        || late != 0
+        || body.packed.is_some())
+    .then(|| laid(Schedule::Spread));
     Ok(Synthesized {
         kernel: laid(Schedule::Packed),
         spread,
@@ -546,6 +580,68 @@ mod tests {
         let load = body.source.find("f.template load<2>();").expect("issued");
         let sum = body.source.find("f.reduce_sum").expect("summed");
         assert!(load < sum, "{}", body.source);
+    }
+
+    /// A head's norm and its turn, as the chain lowers them: the head
+    /// `head` wide, its first `rotary` dims' pairs `span` apart turned.
+    fn norm_turn(head: u32, rotary: u32, span: u32) -> Region {
+        use kernels_ir::build::{Ops, Pairs, Turn};
+        let mut b = Ops::new(3);
+        let n = b.rms_normed(0, head, 1e-6);
+        let y = b.push(Op::Binary(Binary::Mul, n, 1));
+        let turn = Turn {
+            head_dim: head,
+            pairs: Pairs::Halves { rotary, span },
+            theta: 1e6,
+            inverse: false,
+            ramp: None,
+        };
+        let out = b.rotate(y, 2, &turn);
+        Region {
+            width: head,
+            params: vec![Shape::Row, Shape::Row, Shape::Scalar],
+            ops: b.ops,
+            results: vec![out],
+            rounds: vec![(y, Dtype::Bf16), (out, Dtype::Bf16)],
+        }
+    }
+
+    /// Gemma 4's global q (a 512-wide head, a quarter of it turned) packs
+    /// its turned vectors onto the first threads for packed rows, its spread
+    /// body as it was; its local q (a 256-wide head, turned whole) and a row
+    /// no wider than a warp's vectors keep their order.
+    #[test]
+    fn a_wide_heads_part_turned_is_pair_packed_for_packed_rows() {
+        let body = Body::of(&norm_turn(512, 128, 256)).expect("printed");
+        let packed = body.packed.as_deref().expect("pair-packed");
+        assert!(packed.source.contains("static unsigned vector(unsigned s)"));
+        assert!(
+            packed.source.contains("f.turned(q, 16u)"),
+            "{}",
+            packed.source
+        );
+        assert!(!body.source.contains("vector("), "{}", body.source);
+        let ins = [
+            In::Rows(Dtype::Bf16),
+            In::Shared(Dtype::Bf16),
+            In::Each(Dtype::I32),
+        ];
+        assert_eq!(
+            supports(&norm_turn(512, 128, 256), &ins, &OUTS[..1]),
+            Ok(())
+        );
+        assert!(
+            Body::of(&norm_turn(256, 256, 128))
+                .expect("printed")
+                .packed
+                .is_none()
+        );
+        assert!(
+            Body::of(&norm_turn(256, 64, 128))
+                .expect("printed")
+                .packed
+                .is_none()
+        );
     }
 
     #[test]

@@ -149,10 +149,12 @@ impl Schedule {
     pub const ALL: [Schedule; 2] = [Schedule::Packed, Schedule::Spread];
 
     /// The schedule for `rows` rows of `width` on a device of
-    /// `multiprocessors`: spread until packing them would fill each
-    /// multiprocessor's eight blocks (measured on an L40S: Gemma 4's heads
-    /// and dots3's k row land faster spread through a prefill's 512 rows,
-    /// packed at 4096), packed past it. A row a block either way (a row as
+    /// `multiprocessors`: rows narrower than a block are spread while
+    /// packing them takes at most a block for each eight multiprocessors,
+    /// packed past it (measured on an L40S, its packed rows issuing a later
+    /// pass's parameters late: dots3's k row lands faster spread through 512
+    /// rows, sixteen blocks packed; Gemma 4's and DeepSeek-V4's heads and
+    /// Gemma 4's per-layer rows packed from 32 blocks). A row a block either way (a row as
     /// wide as a block) is spread while each multiprocessor holds at most
     /// two: its parameters all in flight at once, as a decode's latency
     /// wants, where more rows want the registers a later pass's parameters
@@ -162,7 +164,7 @@ impl Schedule {
     pub fn of(width: u32, rows: u32, multiprocessors: u32) -> Schedule {
         let packed = rows.div_ceil(BLOCK / lanes(width));
         let spread = if block(width, Schedule::Spread) < BLOCK {
-            packed < 8 * multiprocessors
+            8 * packed <= multiprocessors
         } else {
             rows <= 2 * multiprocessors
         };

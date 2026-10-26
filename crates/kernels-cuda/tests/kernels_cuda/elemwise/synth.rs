@@ -86,6 +86,7 @@ fn hand_body() -> Body {
         shares: false,
         table: 0,
         late: 0,
+        packed: None,
     }
 }
 
