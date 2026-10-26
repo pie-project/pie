@@ -88,6 +88,7 @@ fn hand_body() -> Body {
         late: 0,
         vectors: 0,
         vector_outs: 0,
+        side: false,
         packed: None,
     }
 }

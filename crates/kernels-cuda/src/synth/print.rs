@@ -22,12 +22,17 @@
 //! | `column(e)` | `f.col(e)` |
 //! | `reduce_heads(Sum or Max, seg, a)` | `f.template reduce_sum_heads<seg>(a)`, `reduce_max_heads` |
 //! | `share(e, v)`, `peer(c)` | `f.share(e, v)`, `f.peer(c)`, the row complete between (`f.sync()`) |
+//! | `vector(k, i)`, `store_vector(k, i, v)` | `f.vec(k, i)`, `f.template st_lane<k>(i, v)` from the lane holding value `i` (`lanes`) |
 //!
 //! A table is `f.table()`, its entries written a column a thread
 //! (`f.thread()` on by `F::THREADS`) and complete for the block
 //! (`f.sync_block()`) before the first pass. A value one a head is an array
 //! of `F::PER`, one a vector of 8. Sines and cosines are the skeleton's
 //! (`f.sin`, `f.cos`: an angle as its kernels turn one).
+//!
+//! A kernel with a small vector one a row or a repeat prints its uniforms
+//! over a warp's lanes (`lanes`): an `n`-vector's value `i` in lane `i %
+//! F::SPAN`, a pick a shuffle (`f.pick`, `f.gather`), a repeat a loop.
 //!
 //! Every `k` and `e` the body passes is a constant once its loops unroll, so
 //! the skeleton's arrays stay in registers. The math is f32 through `expf`,
@@ -39,6 +44,8 @@ use std::fmt::Write as _;
 
 use dtype::Dtype;
 use kernels_ir::{Binary, Elem, Expr, Kernel, Literal, Loop, Operand, Reduce, Unary};
+
+mod lanes;
 
 /// Where an expression is printed: a pass's element `e`, a head loop's
 /// vector `p`, or a table's column `c`.
@@ -129,144 +136,27 @@ fn operands(e: &Expr) -> Vec<Operand> {
     }
 }
 
-/// A value one a row at element `j` (a C++ expression): a small vector's
-/// `j`th, a scalar's one.
-fn lane(o: Operand, j: &str, vectors: &std::collections::HashMap<u32, u32>) -> String {
-    match o {
-        Operand::Vector(k) => format!("f.vec({k}, {j})"),
-        Operand::Local(v) if vectors.contains_key(&v) => format!("v{v}[{j}]"),
-        other => operand(other, At::Elem),
-    }
-}
-
-/// A phase's uniforms printed: scalars one a row, small vectors as arrays a
-/// thread holds (every thread computing its row's alike), a repeat as a
-/// loop around its body, a small-vector result stored by the row's first
-/// thread (`f.st_vec`).
-fn uniforms(
-    s: &mut String,
-    us: &[kernels_ir::Uniform],
-    vectors: &std::collections::HashMap<u32, u32>,
-    indent: &str,
-) -> Result<(), Unprinted> {
-    let mut i = 0;
-    while i < us.len() {
-        let u = &us[i];
-        let ty = c_type(u.elem);
-        let v = u.value;
-        if let Expr::Carry(init) = u.expr {
-            let close = (i + 1..us.len())
-                .find(|&k| matches!(us[k].expr, Expr::Repeat { carry, .. } if carry == v))
-                .expect("a carry's repeat closes it in its phase");
-            let Expr::Repeat { count, next, .. } = us[close].expr else {
-                unreachable!("found above");
-            };
-            let r = us[close].value;
-            match u.vector {
-                Some(n) => {
-                    let _ = writeln!(s, "{indent}{ty} v{v}[{n}];");
-                    let _ = writeln!(s, "{indent}#pragma unroll");
-                    let _ = writeln!(
-                        s,
-                        "{indent}for (int j = 0; j < {n}; ++j) v{v}[j] = {};",
-                        lane(init, "j", vectors)
-                    );
-                }
-                None => {
-                    let _ = writeln!(s, "{indent}{ty} v{v} = {};", lane(init, "0", vectors));
-                }
-            }
-            let _ = writeln!(
-                s,
-                "{indent}for (int it{v} = 0; it{v} < {count}; ++it{v}) {{"
-            );
-            let inner = format!("{indent}  ");
-            uniforms(s, &us[i + 1..close], vectors, &inner)?;
-            match u.vector {
-                Some(n) => {
-                    let _ = writeln!(s, "{inner}#pragma unroll");
-                    let _ = writeln!(
-                        s,
-                        "{inner}for (int j = 0; j < {n}; ++j) v{v}[j] = {};",
-                        lane(next, "j", vectors)
-                    );
-                }
-                None => {
-                    let _ = writeln!(s, "{inner}v{v} = {};", lane(next, "0", vectors));
-                }
-            }
-            let _ = writeln!(s, "{indent}}}");
-            match u.vector {
-                Some(n) => {
-                    let _ = writeln!(s, "{indent}{ty} v{r}[{n}];");
-                    let _ = writeln!(s, "{indent}#pragma unroll");
-                    let _ = writeln!(
-                        s,
-                        "{indent}for (int j = 0; j < {n}; ++j) v{r}[j] = v{v}[j];"
-                    );
-                }
-                None => {
-                    let _ = writeln!(s, "{indent}const {ty} v{r} = v{v};");
-                }
-            }
-            stores(s, &us[close], vectors, indent);
-            i = close + 1;
-            continue;
-        }
-        match u.vector {
-            Some(n) => {
-                let _ = writeln!(s, "{indent}{ty} v{v}[{n}];");
-                let _ = writeln!(s, "{indent}#pragma unroll");
-                let element = match u.expr {
-                    Expr::Insert(src, _, _) => lane(src, "j", vectors),
-                    Expr::Splat(x) => lane(x, "0", vectors),
-                    ref e => expr_of(e, At::Elem, u.elem, &|x| lane(x, "j", vectors)),
-                };
-                let _ = writeln!(
-                    s,
-                    "{indent}for (int j = 0; j < {n}; ++j) v{v}[j] = {};",
-                    held(u.round, element)?
-                );
-                if let Expr::Insert(_, at, x) = u.expr {
-                    let _ = writeln!(
-                        s,
-                        "{indent}v{v}[{at}] = {};",
-                        held(u.round, lane(x, "0", vectors))?
-                    );
-                }
-            }
-            None => {
-                let e = match u.expr {
-                    Expr::Pick(src, at) => lane(src, &at.to_string(), vectors),
-                    ref e => expr_of(e, At::Elem, u.elem, &|x| lane(x, "0", vectors)),
-                };
-                let _ = writeln!(s, "{indent}const {ty} v{v} = {};", held(u.round, e)?);
-            }
-        }
-        stores(s, u, vectors, indent);
-        i += 1;
+/// A phase's uniforms printed where the kernel holds no small vector and
+/// no repeat: scalars one a row, each thread computing its row's alike.
+fn uniforms(s: &mut String, us: &[kernels_ir::Uniform], indent: &str) -> Result<(), Unprinted> {
+    for u in us {
+        let e = expr(&u.expr, At::Elem, u.elem);
+        let _ = writeln!(
+            s,
+            "{indent}const {} v{} = {};",
+            c_type(u.elem),
+            u.value,
+            held(u.round, e)?
+        );
     }
     Ok(())
 }
 
-/// A small vector's stores as the results it is.
-fn stores(
-    s: &mut String,
-    u: &kernels_ir::Uniform,
-    _vectors: &std::collections::HashMap<u32, u32>,
-    indent: &str,
-) {
-    let Some(n) = u.vector else {
-        return;
-    };
-    for k in &u.stores {
-        let _ = writeln!(s, "{indent}#pragma unroll");
-        let _ = writeln!(
-            s,
-            "{indent}for (int j = 0; j < {n}; ++j) f.template st_vec<{k}>(j, v{}[j]);",
-            u.value
-        );
-    }
+/// Whether `kernel`'s body computes what only lands on side blocks where
+/// its skeleton has them (`F::SIDE`).
+#[must_use]
+pub fn sides(kernel: &Kernel) -> bool {
+    lanes::wanted(kernel) && lanes::Lanes::of(kernel).side()
 }
 
 /// `kernel`'s body, its source.
@@ -736,15 +626,16 @@ fn elements(
 /// `packing` says.
 pub fn body_with(kernel: &Kernel, packing: Option<&Packing>) -> Result<String, Unprinted> {
     let first = first_reads(kernel);
-    // The small vectors one a row, by value, and their lengths.
-    let vectors: std::collections::HashMap<u32, u32> = kernel
-        .phases
-        .iter()
-        .flat_map(|phase| &phase.uniforms)
-        .filter_map(|u| u.vector.map(|n| (u.value, n)))
-        .collect();
+    // Small vectors and repeats over a warp's lanes.
+    let lanes = lanes::wanted(kernel).then(|| lanes::Lanes::of(kernel));
     let mut pass_at = 0usize;
     let mut s = String::new();
+    let side = lanes.as_ref().is_some_and(lanes::Lanes::side);
+    if let Some(lanes) = lanes.as_ref().filter(|_| side) {
+        s.push_str("  if constexpr (F::SIDE) {\n    if (f.side()) {\n      if (f.lead()) {\n");
+        lanes.print_side(&mut s, &kernel.phases[0].uniforms, "        ")?;
+        s.push_str("      }\n      return;\n    }\n  }\n");
+    }
     for (v, elem) in &kernel.kept {
         let _ = writeln!(s, "  {} v{v}[F::N];", c_type(*elem));
     }
@@ -752,7 +643,26 @@ pub fn body_with(kernel: &Kernel, packing: Option<&Packing>) -> Result<String, U
         let _ = writeln!(s, "  {} v{v}[F::PER];", c_type(*elem));
     }
     for (at, phase) in kernel.phases.iter().enumerate() {
-        uniforms(&mut s, &phase.uniforms, &vectors, "  ")?;
+        match &lanes {
+            None => uniforms(&mut s, &phase.uniforms, "  ")?,
+            Some(lanes) => {
+                lanes.print(&mut s, &phase.uniforms, false, "  ")?;
+                // What only lands, by the row's first warp, once the
+                // phases it reads are done.
+                // (on side blocks where the kernel has them)
+                if lanes.lead_at == Some(at) {
+                    s.push_str(if side {
+                        "  if (!F::SIDE && f.lead()) {\n"
+                    } else {
+                        "  if (f.lead()) {\n"
+                    });
+                    for earlier in &kernel.phases[..=at] {
+                        lanes.print(&mut s, &earlier.uniforms, true, "    ")?;
+                    }
+                    s.push_str("  }\n");
+                }
+            }
+        }
         // The tables, once the first phase's uniforms (their constants) are.
         if at == 0 && !kernel.tables.is_empty() {
             for t in &kernel.tables {
