@@ -201,6 +201,19 @@ impl TensorType {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AxisLeg {
+    pub extent: i64,
+    pub replicas: u32,
+}
+
+impl AxisLeg {
+    #[must_use]
+    pub const fn new(extent: i64, replicas: u32) -> Self {
+        Self { extent, replicas }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorContract {
     pub name: String,
@@ -210,6 +223,8 @@ pub struct TensorContract {
     pub scales: Option<Scales>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zero_points: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composite_axis: Option<(Axis, Vec<AxisLeg>)>,
     #[serde(default)]
     pub visibility: Visibility,
 }
@@ -232,6 +247,7 @@ impl TensorContract {
             encoding,
             scales: None,
             zero_points: None,
+            composite_axis: None,
             visibility: Visibility::Public,
         }
     }
@@ -244,6 +260,7 @@ impl TensorContract {
             encoding,
             scales: None,
             zero_points: None,
+            composite_axis: None,
             visibility: Visibility::Public,
         }
     }
@@ -260,6 +277,12 @@ impl TensorContract {
 
     pub fn offsetting(mut self, of: impl Into<String>) -> Self {
         self.zero_points = Some(of.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_composite_axis(mut self, axis: u8, legs: Vec<AxisLeg>) -> Self {
+        self.composite_axis = Some((Axis(axis), legs));
         self
     }
 }
