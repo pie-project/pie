@@ -841,7 +841,8 @@ impl Epilogue {
                         });
                     }
                     let (lo, hi) = (w.from.max(from), (w.from + w.width).min(from + width));
-                    (lo < hi).then_some(Land {
+                    // (built only where the piece holds some of the window)
+                    (lo < hi).then(|| Land {
                         k,
                         from: lo - from,
                         to: hi - from,
