@@ -606,6 +606,98 @@ impl Pointwise {
             })
     }
 
+    /// Whether, over a tile `n` wide, every `w` columns from a multiple of
+    /// `w` compute what the first `w` do: each value of the column alone
+    /// that the ops over the parameters read repeats every `w` columns (a
+    /// head's position in its head, its pair's frequency), and each
+    /// gathered mate sits as far from its column in every slice. A slice of
+    /// such a tile is then any slice's region, each a part of one launch's
+    /// rows.
+    #[must_use]
+    pub fn repeats(&self, n: u32, w: u32) -> bool {
+        let region = &self.region;
+        if w == 0 || !n.is_multiple_of(w) {
+            return false;
+        }
+        if w == n {
+            return true;
+        }
+        let params = region.params.len() as u32;
+        // whether each value is a function of the column alone
+        let mut alone = vec![false; params as usize + region.ops.len()];
+        for (at, op) in region.ops.iter().enumerate() {
+            alone[params as usize + at] = match op {
+                Op::Peer(..) | Op::Reduce(..) | Op::ReduceHeads(..) | Op::Carry(..) => false,
+                op => op.args().iter().all(|&a| a >= params && alone[a as usize]),
+            };
+        }
+        // what the ops over the parameters read of the column alone, and
+        // each gather's mate
+        let mut read: Vec<ValueId> = Vec::new();
+        let mut mates: Vec<ValueId> = Vec::new();
+        for (at, op) in region.ops.iter().enumerate() {
+            if alone[params as usize + at] {
+                continue;
+            }
+            // a gather's mate is its column's: as far from it in each slice
+            let mate = match *op {
+                Op::Peer(_, mate) => {
+                    mates.push(mate);
+                    Some(mate)
+                }
+                _ => None,
+            };
+            for a in op.args() {
+                if Some(a) != mate && a >= params && alone[a as usize] && !read.contains(&a) {
+                    read.push(a);
+                }
+            }
+        }
+        for &r in &region.results {
+            if r >= params && alone[r as usize] && !read.contains(&r) {
+                read.push(r);
+            }
+        }
+        let periodic = |values: &[f32], shifted: bool| {
+            let (n, w) = (n as usize, w as usize);
+            (w..n).all(|c| {
+                let (x, first) = (values[c], values[c % w]);
+                if shifted {
+                    x - c as f32 == first - (c % w) as f32
+                } else {
+                    x.to_bits() == first.to_bits()
+                }
+            })
+        };
+        let probe = |v: ValueId| -> Option<Vec<f32>> {
+            let mut ops: Vec<Op> = region.ops[..(v - params + 1) as usize].to_vec();
+            ops.push(Op::Cast(v, crate::region::Elem::F32));
+            let probe = Region {
+                width: n,
+                params: region.params.clone(),
+                ops,
+                results: vec![params + (v - params + 1)],
+                rounds: Vec::new(),
+            };
+            let args: Vec<Arg> = region
+                .params
+                .iter()
+                .map(|shape| match shape {
+                    Shape::Scalar => Arg::Scalar(0.0),
+                    _ => Arg::Row(vec![0.0; n as usize]),
+                })
+                .collect();
+            interp::eval(&probe, &args).ok().map(|mut l| l.swap_remove(0))
+        };
+        read.iter()
+            .all(|&v| probe(v).is_some_and(|values| periodic(&values, false)))
+            && mates.iter().all(|&m| {
+                self.columns(m, n).is_some_and(|c| {
+                    periodic(&c.iter().map(|x| *x as f32).collect::<Vec<_>>(), true)
+                })
+            })
+    }
+
     /// Value `v`'s u32 at each of `n` columns, where it is a function of
     /// the column alone: its ops read no parameter. `None` where one does.
     fn columns(&self, v: ValueId, n: u32) -> Option<Vec<u32>> {
@@ -1930,6 +2022,56 @@ mod tests {
 
     /// A turn at frequencies stated outright (Llama 3's scaled rope): each
     /// pair's from the table, its cos and sin times the table's scale; and
+    /// A turn of 64-wide heads computes in every head what it computes in
+    /// the first: its slices of whole heads repeat, a half head's do not.
+    #[test]
+    fn a_heads_turn_repeats_every_head_and_no_narrower() {
+        use crate::build::{Ops, Pairs, Turn};
+        let mut b = Ops::new(2);
+        let turn = Turn {
+            head_dim: 64,
+            pairs: Pairs::Halves {
+                rotary: 64,
+                span: 32,
+            },
+            theta: 10000.0,
+            inverse: false,
+            ramp: None,
+            mscale: None,
+        };
+        let turned = b.rotate(0, 1, &turn);
+        let turned = Pointwise {
+            region: Region {
+                width: 256,
+                params: vec![Shape::Row, Shape::Scalar],
+                ops: b.ops,
+                results: vec![turned],
+                rounds: vec![],
+            },
+            inputs: vec![Input::Row],
+        };
+        assert!(turned.repeats(256, 64));
+        assert!(turned.repeats(256, 128));
+        assert!(!turned.repeats(256, 32));
+        // a column read as it is never repeats
+        let column = Pointwise {
+            region: Region {
+                width: 256,
+                params: vec![Shape::Row],
+                ops: vec![
+                    Op::Column,
+                    Op::Cast(1, crate::region::Elem::F32),
+                    Op::Binary(Binary::Add, 0, 2),
+                ],
+                results: vec![3],
+                rounds: vec![],
+            },
+            inputs: vec![],
+        };
+        assert!(!column.repeats(256, 64));
+        assert!(column.repeats(256, 256));
+    }
+
     /// YaRN's every pair at its ramped frequency, times its attention factor.
     #[test]
     fn a_turn_reads_its_tables_frequencies_and_scale() {

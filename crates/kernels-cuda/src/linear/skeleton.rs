@@ -795,8 +795,28 @@ impl Epilogue {
             n.is_multiple_of(*c) && (n / c).is_multiple_of(8) && (n / c).is_multiple_of(strides)
         })?;
         let width = n / slices;
-        let mut shaped = Vec::with_capacity(slices as usize);
-        for piece in 0..slices {
+        // Every slice the first's, one launch of `slices` rows a row: the
+        // region repeating every slice, each result the whole tile, no
+        // input a column's own (a slice's columns past the first) and no
+        // result paged.
+        let uniform = slices > 1
+            && (Pointwise {
+                region: self.region.clone(),
+                inputs: self.inputs.clone(),
+            })
+            .repeats(n, width)
+            && (0..self.results).all(|k| {
+                let w = self.window(k, n);
+                w.whole() && w.from == 0 && w.width == n && self.paged(k).is_none()
+            })
+            && self.inputs.iter().all(|input| match input {
+                Input::Column => false,
+                Input::Head(head) => width.is_multiple_of(*head),
+                _ => true,
+            });
+        let slices_of = if uniform { 1 } else { slices };
+        let mut shaped = Vec::with_capacity(slices_of as usize);
+        for piece in 0..slices_of {
             let from = piece * width;
             let outs: Vec<Land> = (0..self.results)
                 .filter_map(|k| {
@@ -867,6 +887,7 @@ impl Epilogue {
         Some(LegShape {
             ins,
             pieces: shaped,
+            slices: if uniform { slices } else { 1 },
         })
     }
 
@@ -943,6 +964,10 @@ fn planes_of(anchored: &Anchored) -> usize {
 struct LegShape {
     ins: Vec<crate::synth::In>,
     pieces: Vec<PieceShape>,
+    /// The slices one launch's rows cut each row into, where every slice
+    /// computes what the first does (its one piece): 1 where each piece is
+    /// its own launch.
+    slices: u32,
 }
 
 /// One piece of a leg: the region over the tile's columns `from..from +
@@ -1247,6 +1272,9 @@ impl Skeleton {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowLeg {
     pieces: &'static [Piece],
+    /// The slices its one piece's launch cuts each row into (1: each piece
+    /// its own launch).
+    slices: u32,
     parts: u32,
     /// The products' dtype: bf16, or f32 where the epilogue reads them as
     /// they are summed.
@@ -1312,6 +1340,7 @@ impl RowLeg {
                 }
                 Some(RowLeg {
                     pieces: Box::leak(pieces.into_boxed_slice()),
+                    slices: shape.slices,
                     parts: epi.parts,
                     product: if epi.round { Dtype::Bf16 } else { Dtype::F32 },
                 })
@@ -1431,7 +1460,9 @@ impl RowLeg {
                     }
                 });
             }
-            fired = piece.kernel.fire(ctx, &planes, &results, m);
+            fired = piece
+                .kernel
+                .fire_parts(ctx, &planes, &results, m, self.slices);
             if fired.is_err() {
                 break;
             }
