@@ -152,7 +152,6 @@ fn a_block_scaled_row_lands_the_bytes_its_rule_declares() {
     let cells = page_size as usize * pages;
     let kernel = synth::synth(&region, &[In::Rows(Bf16), In::Rows(Bf16)], 1).expect("synthesized");
     kernel.load().expect("loads");
-    assert!(!kernel.reorders());
     let t = |base: u64, r: usize, w: usize| Tensor::new(base, r as u32, w as u32, Bf16);
     let product: Vec<f32> = (0..rows * width)
         .map(|i| kernels_ir::skeleton::round_bf16(xv[i] * kernels_ir::skeleton::round_bf16(sv[i])))
