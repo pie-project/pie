@@ -299,9 +299,19 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
         .map(unit)
         .transpose()?
         .unwrap_or(root);
-    // Packed rows issue a later pass's parameters late; spread ones load
-    // every parameter up front.
-    let late = body.late & !ones;
+    // A row whose planes overflow the registers (a blend's candidates)
+    // streams its row parameters through its passes; packed rows otherwise
+    // issue a later pass's parameters late, and spread ones load every
+    // parameter up front.
+    let stream = if fits(&stored[..ins.len()], ones, outs, per) {
+        0
+    } else {
+        (0u32..)
+            .zip(ins)
+            .filter(|(_, form)| !form.scalar())
+            .fold(0u32, |mask, (k, _)| mask | 1 << k)
+    };
+    let late = body.late & !ones & !stream;
     let laid = |schedule| {
         crate::jit::generated(
             if schedule == Schedule::Packed {
@@ -322,6 +332,7 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
                     } else {
                         0
                     },
+                    stream,
                 ),
                 true,
                 schedule,
@@ -346,6 +357,24 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
             shares: body.shares,
         },
     })
+}
+
+/// The vectors of 8 a thread holds of every plane at most: past them a row
+/// no longer stays in its registers (five planes at the widest row, more
+/// as the row narrows), and the skeleton streams its row parameters.
+const RESIDENT: u32 = 5 * skeleton::MAX_PER;
+
+/// Whether the planes of a kernel (its row parameters as stored, an f32 row
+/// two planes' worth, and its results), `per` vectors of 8 a thread each,
+/// stay in a thread's registers.
+fn fits(stored: &[Stored], ones: u32, outs: usize, per: u32) -> bool {
+    let planes: u32 = (0u32..)
+        .zip(stored)
+        .filter(|(k, _)| (ones >> k) & 1 == 0)
+        .map(|(_, form)| if *form == Stored::F32 { 2 } else { 1 })
+        .sum::<u32>()
+        + u32::try_from(outs).unwrap_or(u32::MAX);
+    planes.saturating_mul(per) <= RESIDENT
 }
 
 /// The generated unit of `body`: one a body hash, for the life of the

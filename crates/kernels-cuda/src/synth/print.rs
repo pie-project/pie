@@ -532,6 +532,21 @@ fn shared_before_table(kernel: &Kernel) -> bool {
     false
 }
 
+/// The row parameters `pass` reads, by bit: what it fetches a vector at a
+/// time where the skeleton streams them (`f.template fetch<m>(p)`).
+fn pass_reads(pass: &Loop) -> u32 {
+    pass.rows
+        .iter()
+        .flat_map(|r| operands(&r.expr))
+        .chain(pass.partials.iter().map(|p| p.input))
+        .chain(pass.shares.iter().copied())
+        .chain(pass.copies.iter().map(|(_, from)| Operand::Param(*from)))
+        .fold(0u32, |mask, o| match o {
+            Operand::Param(k) if k < 32 => mask | 1 << k,
+            _ => mask,
+        })
+}
+
 /// A pass's work at element `e`: its rows (the select at `decided`'s row
 /// as its arm there, the other arm's own rows left out), copies, partial
 /// sums and shares.
@@ -661,6 +676,10 @@ pub fn body_with(kernel: &Kernel, packing: Option<&Packing>) -> Result<String, U
             None => {
                 s.push_str("#pragma unroll\n");
                 s.push_str("  for (int e = 0; e < F::N; ++e) {\n");
+                let reads = pass_reads(pass);
+                if reads != 0 {
+                    let _ = writeln!(s, "    if (e % 8 == 0) f.template fetch<{reads}u>(e / 8);");
+                }
                 elements(&mut s, pass, None, "    ")?;
                 s.push_str("  }\n");
             }
@@ -670,6 +689,10 @@ pub fn body_with(kernel: &Kernel, packing: Option<&Packing>) -> Result<String, U
                 let lazy = Lazy::of(pass);
                 s.push_str("#pragma unroll\n");
                 s.push_str("  for (int q = 0; q < F::PER; ++q) {\n");
+                let reads = pass_reads(pass);
+                if reads != 0 {
+                    let _ = writeln!(s, "    f.template fetch<{reads}u>(q);");
+                }
                 let _ = writeln!(s, "    if (f.turned(q, {}u)) {{", pk.turned.len());
                 for (arm, close) in [(true, "    } else {\n"), (false, "    }\n")] {
                     s.push_str("#pragma unroll\n");
@@ -695,7 +718,33 @@ pub fn body_with(kernel: &Kernel, packing: Option<&Packing>) -> Result<String, U
                 let _ = writeln!(s, "  f.template load<{k}>();");
             }
         }
+        // A pass's several sums over the row (a blend's candidates' square
+        // sums and dots) combine in one batch of the block's barriers.
+        let sums: Vec<_> = pass
+            .totals
+            .iter()
+            .filter(|t| t.seg.is_none() && t.op == Reduce::Sum)
+            .collect();
+        let batched = sums.len() > 1;
+        if batched {
+            let first = sums[0].value;
+            let parts: Vec<String> = sums.iter().map(|t| format!("a{}", t.value)).collect();
+            let _ = writeln!(
+                s,
+                "  float r{first}[{}] = {{{}}};",
+                sums.len(),
+                parts.join(", ")
+            );
+            let _ = writeln!(s, "  f.template reduce_sums<{}>(r{first});", sums.len());
+            for (j, t) in sums.iter().enumerate() {
+                let total = held(t.round, format!("r{first}[{j}]"))?;
+                let _ = writeln!(s, "  const float v{} = {total};", t.value);
+            }
+        }
         for t in &pass.totals {
+            if batched && t.seg.is_none() && t.op == Reduce::Sum {
+                continue;
+            }
             let Some(seg) = t.seg else {
                 let total = held(t.round, finish(t.op, t.value))?;
                 let _ = writeln!(s, "  const float v{} = {total};", t.value);

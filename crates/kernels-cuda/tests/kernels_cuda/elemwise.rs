@@ -11,6 +11,7 @@ mod rope_partial;
 mod rope_table;
 mod skeleton;
 mod synth;
+mod synth_blend;
 mod synth_embed;
 mod synth_modulate;
 mod synth_paged;

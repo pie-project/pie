@@ -313,8 +313,9 @@ pub fn shared_floats(width: u32, block: u32) -> u32 {
 /// The skeleton's kernel around `body` (a type the unit defines) for `ins`
 /// parameters stored as `stored` and `outs` results, rows `width` wide in
 /// blocks as `schedule` lays them, the parameters `ones` sets (by bit) read
-/// as one element and those `late` sets loaded where the body asks
-/// (`load<k>()`). A `read_only` skeleton's results land over none of its
+/// as one element, those `late` sets loaded where the body asks
+/// (`load<k>()`) and those `stream` sets fetched a vector at a time where
+/// each pass reaches it (`fetch<m>(p)`), never held across passes. A `read_only` skeleton's results land over none of its
 /// parameters, so it reads them through the read-only path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn entrypoint(
@@ -323,7 +324,7 @@ pub(crate) fn entrypoint(
     per: u32,
     stored: &[Stored],
     outs: usize,
-    (ones, late): (u32, u32),
+    (ones, late, stream): (u32, u32, u32),
     read_only: bool,
     schedule: Schedule,
 ) -> String {
@@ -331,7 +332,7 @@ pub(crate) fn entrypoint(
         .zip(stored)
         .fold(0u64, |dt, (k, form)| dt | (*form as u64) << (2 * k));
     format!(
-        "::pie::elemwise::row_skeleton<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}, {late}u>",
+        "::pie::elemwise::row_skeleton<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}, {late}u, {stream}u>",
         block(width, schedule),
         lanes(width),
         stored.len()
@@ -458,7 +459,7 @@ pub fn residual_add_rmsnorm(
                 per,
                 &[Stored::Bf16; 3],
                 2,
-                (0, 0),
+                (0, 0, 0),
                 false,
                 Schedule::Packed,
             ),

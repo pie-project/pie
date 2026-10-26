@@ -60,6 +60,10 @@ constexpr int kBf16 = 0;
 constexpr int kF32 = 1;
 constexpr int kI32 = 2;
 
+// The sums a skeleton combines over the row in one pass of its barriers
+// (`reduce_sums`).
+constexpr int kBatch = 8;
+
 // One row of planes held whole in registers: LANES threads a row (BLOCK /
 // LANES rows a block), each holding VECS vectors of 8 elements of each
 // parameter and each result. A body names an element by its index `e` in
@@ -97,7 +101,7 @@ struct OrderOf<B, decltype(static_cast<void>(B::vector(0u)))> {
 };
 
 template <int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES, unsigned long long DT,
-          bool READ_ONLY, unsigned LATE = 0u, class ORDER = InOrder>
+          bool READ_ONLY, unsigned LATE = 0u, class ORDER = InOrder, unsigned STREAM = 0u>
 struct RowSkeleton {
     static_assert((LANES & (LANES - 1)) == 0 && LANES <= BLOCK && (LANES <= 32 || LANES % 32 == 0),
                   "a row is a power-of-two run of a block's threads");
@@ -209,26 +213,42 @@ struct RowSkeleton {
                          : reinterpret_cast<const uint4*>(static_cast<const bf16*>(plane.base) + at);
             // the vectors repeat every `period` (a head's weight); else 0
             period[k] = plane.period;
-            if (!((LATE >> k) & 1u)) issue(k);
+            if (!(((LATE | STREAM) >> k) & 1u)) issue(k);
         }
     }
 
     int period[IN];
 
+    // Parameter `k`'s vector `p` from `src[k]`.
+    __device__ __forceinline__ void issue_one(int k, int p) {
+        const int slot = lane + p * LANES;
+        if (slot >= vectors) return;
+        const int i = static_cast<int>(at[p]);
+        const int v = period[k] > 0 ? i % period[k] : i;
+        if (dtype(k) == kF32) {
+            in[k][p] = READ_ONLY ? __ldg(src[k] + 2 * v) : src[k][2 * v];
+            hi[k][p] = READ_ONLY ? __ldg(src[k] + 2 * v + 1) : src[k][2 * v + 1];
+        } else {
+            in[k][p] = READ_ONLY ? __ldg(src[k] + v) : src[k][v];
+        }
+    }
+
     // Parameter `k`'s vectors from `src[k]`.
     __device__ __forceinline__ void issue(int k) {
 #pragma unroll
-        for (int p = 0; p < VECS; ++p) {
-            const int slot = lane + p * LANES;
-            if (slot >= vectors) continue;
-            const int i = static_cast<int>(at[p]);
-            const int v = period[k] > 0 ? i % period[k] : i;
-            if (dtype(k) == kF32) {
-                in[k][p] = READ_ONLY ? __ldg(src[k] + 2 * v) : src[k][2 * v];
-                hi[k][p] = READ_ONLY ? __ldg(src[k] + 2 * v + 1) : src[k][2 * v + 1];
-            } else {
-                in[k][p] = READ_ONLY ? __ldg(src[k] + v) : src[k][v];
-            }
+        for (int p = 0; p < VECS; ++p) issue_one(k, p);
+    }
+
+    // The streamed parameters of `M` (a pass's reads) at vector `p`, where
+    // the pass reaches it: a row too many planes wide for the registers
+    // holds one vector of each at a time, read again by each pass.
+    template <unsigned M>
+    __device__ __forceinline__ void fetch(int p) {
+        if constexpr ((M & STREAM) != 0u) {
+            if (!live) return;
+#pragma unroll
+            for (int k = 0; k < IN; ++k)
+                if (((M & STREAM) >> k) & 1u) issue_one(k, p);
         }
     }
 
@@ -320,6 +340,24 @@ struct RowSkeleton {
                 a[p] = t[0];
             }
             __syncthreads();
+        }
+    }
+
+    // `K` sums over the row at once, in place, a batch of up to kBatch
+    // through one pass of the block's barriers: a blend's candidates' square
+    // sums and dots.
+    template <int K>
+    __device__ __forceinline__ void reduce_sums(float (&a)[K]) {
+#pragma unroll
+        for (int at0 = 0; at0 < K; at0 += kBatch) {
+            constexpr int kMost = K < kBatch ? K : kBatch;
+            float batch[kMost];
+#pragma unroll
+            for (int j = 0; j < kMost; ++j) batch[j] = at0 + j < K ? a[at0 + j] : 0.f;
+            reduce_runs<LANES, false>(batch);
+#pragma unroll
+            for (int j = 0; j < kMost; ++j)
+                if (at0 + j < K) a[at0 + j] = batch[j];
         }
     }
 
@@ -425,7 +463,8 @@ struct RowSkeleton {
 // columns' values is fired with `planes.table` floats of dynamic shared
 // memory, and one that shares its row BLOCK * VECS * 8 floats more.
 template <class Body, int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES = 0u,
-          unsigned long long DT = 0ull, bool READ_ONLY = false, unsigned LATE = 0u>
+          unsigned long long DT = 0ull, bool READ_ONLY = false, unsigned LATE = 0u,
+          unsigned STREAM = 0u>
 __global__ void __launch_bounds__(BLOCK) row_skeleton(
     const Planes<IN, OUT> planes,
     const Body body,
@@ -452,10 +491,10 @@ __global__ void __launch_bounds__(BLOCK) row_skeleton(
     }
     if (win != nullptr) of += static_cast<int>(win[1]);
 
-    __shared__ float buf[VECS * (BLOCK / 32) + 1];
+    __shared__ float buf[(VECS > kBatch ? VECS : kBatch) * (BLOCK / 32) + 1];
     extern __shared__ float shared[];
     RowSkeleton<BLOCK, LANES, VECS, IN, OUT, ONES, DT, READ_ONLY, LATE,
-                typename OrderOf<Body>::type>
+                typename OrderOf<Body>::type, STREAM>
         f(
         planes, of, part, row < live_rows, buf, shared);
     body(f);
