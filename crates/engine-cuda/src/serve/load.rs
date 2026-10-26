@@ -712,7 +712,7 @@ impl Shell {
         let media = media_classes(&boot.trace, &compiled);
         let tiers = crate::record::Tiers {
             plain: plain_of(&landing),
-            whole: whole_of(&landing, &compiled, &feeds, &media),
+            whole: whole_of(&boot.trace, &landing, &compiled, &feeds, &media),
         };
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);

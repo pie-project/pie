@@ -332,21 +332,43 @@ pub(crate) fn plain_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
 /// The classes one body per bucket lays out whole ([`crate::record::Tiers::whole`]),
 /// in the order a fire lays their rows out: each a request lands in, that
 /// stages no media and reads no guest input, so a synthetic lane stands in
-/// for it when the body is armed.
+/// for it when the body is armed. A wide body launches each region at one
+/// ceiling whichever of its classes a fire seats, which a region's classes
+/// allow only where they are one run of that order (a grouped op,
+/// [`crate::GROUPED`], walks their hull instead): the classes of a region
+/// they lie apart in stay out, until every region's are one run. A class
+/// that runs a region over a recurrent state stays out too: no wide body of
+/// one has answered its walk with such a class alone (the hybrid rows'
+/// chunked scans), so those fires walk as before.
 #[must_use]
 pub(crate) fn whole_of(
+    trace: &Trace,
     landing: &[Vec<poem_ir::Request>],
     compiled: &CompiledModel,
     feeds: &poem_exec::feeds::Feeds,
     media: &poem_ir::ClassSet,
 ) -> Box<[u32]> {
-    let every = poem_ir::ClassSet::of(
+    let recurrent = classes_running(trace, compiled, |op| {
+        let mut inputs: Vec<ValueId> = Vec::new();
+        op.inputs(&mut inputs);
+        inputs.iter().any(|value| {
+            matches!(
+                trace.values.get(value.0 as usize).map(|decl| &decl.def),
+                Some(poem_ir::Def::Cache(row)) if matches!(
+                    trace.caches.get(*row as usize),
+                    Some(poem_ir::CacheRow::State { .. })
+                )
+            )
+        })
+    });
+    let mut every = poem_ir::ClassSet::of(
         landing
             .iter()
             .enumerate()
             .filter(|(class, requests)| {
                 !requests.is_empty()
                     && !media.contains(*class)
+                    && !recurrent.contains(*class)
                     && !feeds
                         .inputs
                         .iter()
@@ -354,11 +376,48 @@ pub(crate) fn whole_of(
             })
             .map(|(class, _)| class),
     );
-    let order = compiled.order_for(poem_ir::RowAxis::Tokens).map_or_else(
-        || every.iter().map(|class| class as u8).collect(),
-        |order| order.class_order(&every),
-    );
-    order.into_iter().map(u32::from).collect()
+    let order_of = |every: &poem_ir::ClassSet| -> Vec<u8> {
+        compiled.order_for(poem_ir::RowAxis::Tokens).map_or_else(
+            || every.iter().map(|class| class as u8).collect(),
+            |order| order.class_order(every),
+        )
+    };
+    let regions: Vec<&poem_compiler::Region> = compiled
+        .template()
+        .iter()
+        .filter(|region| {
+            region.phase == poem_compiler::Phase::Capture
+                && !region.nodes.clone().all(|node| {
+                    trace.nodes.get(node as usize).is_some_and(|node| {
+                        crate::GROUPED.contains(&poem_ir::Operands::name(&node.op))
+                    })
+                })
+        })
+        .collect();
+    loop {
+        let order = order_of(&every);
+        let apart = regions.iter().find(|region| {
+            let held: Vec<bool> = order
+                .iter()
+                .map(|class| region.mask.contains(usize::from(*class)))
+                .collect();
+            match (
+                held.iter().position(|&on| on),
+                held.iter().rposition(|&on| on),
+            ) {
+                (Some(first), Some(last)) => held[first..=last].iter().any(|&on| !on),
+                _ => false,
+            }
+        });
+        match apart {
+            Some(region) => {
+                every = poem_ir::ClassSet::of(
+                    every.iter().filter(|class| !region.mask.contains(*class)),
+                );
+            }
+            None => return order.into_iter().map(u32::from).collect(),
+        }
+    }
 }
 
 #[must_use]

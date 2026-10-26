@@ -630,6 +630,18 @@ impl Shell {
         armed
     }
 
+    /// The scores each capturing lane of the fire just landed holds, after
+    /// its readouts: a golden compares what a body captures too.
+    fn observed_into(&self, owned: &[Synthetic], out: &mut Vec<Vec<f32>>) -> Result<()> {
+        let capturing = owned.iter().filter(|lane| lane.captures).count() as u32;
+        for seat in 0..capturing {
+            if let Some(planes) = self.observed(seat)? {
+                out.push(planes);
+            }
+        }
+        Ok(())
+    }
+
     fn golden(&mut self, key: &record::BodyKey, owned: &[Synthetic]) -> Result<()> {
         use crate::serve::Golden;
 
@@ -649,8 +661,9 @@ impl Shell {
             for &slot in &slots {
                 shell.open(slot)?;
             }
-            let out = shell.fire_synthetic_as(owned, arm)?;
+            let mut out = shell.fire_synthetic_as(owned, arm)?;
             shell.device.synchronize()?;
+            shell.observed_into(owned, &mut out)?;
             Ok(out)
         };
         if crate::record::ptr_traced(key) {
@@ -891,8 +904,9 @@ impl Shell {
                 shell.open(slot)?;
             }
             shell.fire_synthetic_as(owned, Golden::Eager)?;
-            let out = shell.fire_synthetic_as(&real, arm)?;
+            let mut out = shell.fire_synthetic_as(&real, arm)?;
             shell.device.synchronize()?;
+            shell.observed_into(&real, &mut out)?;
             Ok(out)
         };
         let Ok(walked) = fire(self, Golden::Eager) else {
@@ -906,22 +920,20 @@ impl Shell {
         }
     }
 
-    /// A wide body's lanes, each class off the plain tier alone, at the
-    /// bucket's rows so the fire keys the same body with every other class
-    /// absent: a prefilling class its own lanes, the bucket's other rows on
-    /// its last; a decoding class one lane a row, where the bucket seats
-    /// that many.
-    fn wide_alone(&self, lanes: &[LaneRows], bucket: u32) -> Vec<Vec<LaneRows>> {
+    /// Each class of the whole tier off the plain tier alone at `bucket`'s
+    /// rows, so the fire keys the same wide body with every other class
+    /// absent: a decoding class one lane a row where the bucket seats that
+    /// many (a capturing one within the score slab), any other one lane of
+    /// the bucket's rows.
+    fn wide_alone(&self, bucket: u32) -> Vec<Vec<LaneRows>> {
         let seats = (self.held.len() as u32).min(self.budget.max_lanes);
         let scoring = self.scores.as_ref().map_or(0, crate::scores::Scores::seats);
-        let mut classes: Vec<usize> = Vec::new();
-        for (class, _) in lanes {
-            if !classes.contains(class) && !self.tiers.plain.contains(*class) {
-                classes.push(*class);
-            }
-        }
-        classes
-            .into_iter()
+        let context = self.pools.paging().context();
+        self.tiers
+            .whole
+            .iter()
+            .map(|&class| class as usize)
+            .filter(|class| !self.tiers.plain.contains(*class))
             .filter_map(|class| {
                 if self.decoding.contains(class) {
                     let seats = if self.exports.capturing.contains(class) {
@@ -929,18 +941,10 @@ impl Shell {
                     } else {
                         seats
                     };
-                    return (bucket <= seats).then(|| vec![(class, 1u32); bucket as usize]);
+                    (bucket <= seats).then(|| vec![(class, 1u32); bucket as usize])
+                } else {
+                    (bucket <= context).then(|| vec![(class, bucket)])
                 }
-                let mut alone: Vec<LaneRows> = lanes
-                    .iter()
-                    .copied()
-                    .filter(|(held, _)| *held == class)
-                    .collect();
-                let rows: u32 = alone.iter().map(|(_, rows)| rows).sum();
-                if let Some(last) = alone.last_mut() {
-                    last.1 += bucket.saturating_sub(rows);
-                }
-                Some(alone)
             })
             .collect()
     }
@@ -1203,9 +1207,10 @@ impl Shell {
                 // The wide body answers each class of its key alone, every
                 // other class's regions launching empty.
                 if let BodySynth::Wide { .. } = &target {
-                    for alone in self.wide_alone(&lanes, bucket) {
+                    for alone in self.wide_alone(bucket) {
                         let owned = self.synthetic_lanes(&alone);
                         self.golden(key, &owned)?;
+                        self.golden_real(key, &owned)?;
                     }
                 }
             }

@@ -692,26 +692,21 @@ impl AxisCarve<'_> {
     /// The rungs before a region's classes and its own, read off the
     /// ladder (which lists its classes in the order a fire lays them out)
     /// by the region's mask: the same for every fire of the key, whichever
-    /// of its classes are present. `None` where the mask's ladder classes
-    /// are not one run of the ladder or the ladder holds none of them.
+    /// of its classes are present. Its own rungs run from the mask's first
+    /// ladder class to its last, the classes between included: a launch
+    /// there walks whatever of that hull a fire seats (a grouped op its
+    /// union, [`crate::GROUPED`]). `None` where the ladder holds none of
+    /// the mask's classes.
     fn of_mask(&self, mask: &poem_ir::ClassSet, cap: u32) -> Option<(u32, u32)> {
-        let (mut before, mut own) = (0u32, 0u32);
-        let (mut opened, mut closed) = (false, false);
-        for &(class, rung) in self.ladder.rungs() {
-            let rung = rung.min(cap);
-            if mask.contains(class as usize) {
-                if closed {
-                    return None;
-                }
-                opened = true;
-                own += rung;
-            } else if opened {
-                closed = true;
-            } else {
-                before += rung;
-            }
-        }
-        opened.then_some((before, own))
+        let rungs = self.ladder.rungs();
+        let first = rungs
+            .iter()
+            .position(|(class, _)| mask.contains(*class as usize))?;
+        let last = rungs
+            .iter()
+            .rposition(|(class, _)| mask.contains(*class as usize))?;
+        let sum = |held: &[(u32, u32)]| held.iter().map(|(_, rung)| (*rung).min(cap)).sum();
+        Some((sum(&rungs[..first]), sum(&rungs[first..=last])))
     }
 
     fn prefix(&self, span: MaskSpan, cap: u32) -> Option<(u32, u32)> {
@@ -1573,14 +1568,14 @@ mod tests {
         );
         let split = poem_ir::ClassSet::of([2usize, 1]);
         let apart = AxisCarve {
-            classes: &every,
+            classes: &none,
             ladder: &ladder,
             lane_ceiling: None,
         };
         assert_eq!(
-            apart.of_mask(&split, u32::MAX),
-            None,
-            "a mask that is not one run of the ladder is placed by the fire's rows"
+            apart.ceiling(MaskSpan::default(), Some(&split)),
+            Some((0, 20)),
+            "a mask apart on the ladder launches over its hull, whatever is present"
         );
     }
 
