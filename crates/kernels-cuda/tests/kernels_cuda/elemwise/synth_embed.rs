@@ -1,23 +1,19 @@
 #![cfg(feature = "cuda")]
 
-//! `fused.embed_scale_add`'s chain, Gemma 4's per-layer input (a table's
-//! row by token id, scaled, added to the layer's projected row and scaled
-//! again), as the fold forms it once the rule is off: one generated row
-//! kernel, against its math by the interpreter (`super::within`) and the
-//! hand fused kernel, what each lands.
+//! Gemma 4's per-layer input (a table's row by token id, scaled, added to
+//! the layer's projected row and scaled again), the chain CUDA forms where
+//! the hand rule `fuse.embed_scale_add` once did: one generated row kernel,
+//! against its math by the interpreter (`super::within`).
 //!
 //! The region is the one poem-compiler's `fuse::chain` lowers the four ops
 //! to: the table read where each row's id picks it (an id past the table
 //! picks row 0, as the gather does), each scale as the bf16 the scaling
 //! kernel holds it, each value rounded to bf16 where an op defines it, and
-//! only what is read past the chain (the scaled sum) written. The hand
-//! kernel writes the gathered row, its scaled row and the sum too, which
-//! the trace reads no further.
+//! only what is read past the chain (the scaled sum) written.
 
 use crate::common::attn_ref::ten;
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype::{Bf16, I32};
-use kernels_cuda::gather;
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::synth::{self, In, Out, Plane, Region, Synthesized};
 use kernels_ir::interp::Arg;
@@ -65,8 +61,6 @@ fn generated() -> Synthesized {
 struct Planes {
     ids: u64,
     y: u64,
-    e: u64,
-    e_scaled: u64,
     y_scaled: u64,
 }
 
@@ -76,28 +70,9 @@ impl Planes {
         Planes {
             ids: gpu.zeros(rows * 4),
             y: gpu.zeros(plane),
-            e: gpu.zeros(plane),
-            e_scaled: gpu.zeros(plane),
             y_scaled: gpu.zeros(plane),
         }
     }
-}
-
-fn fire_hand(ctx: &Ctx, table: u64, rows: usize, p: Planes) {
-    let t = |at| ten(at, rows, WIDTH, Bf16);
-    gather::embed_scale_add(
-        ctx,
-        ten(p.ids, rows, 1, I32),
-        ten(table, VOCAB, WIDTH, Bf16),
-        VOCAB as u32,
-        &mut t(p.e),
-        EMBED_SCALE,
-        &mut t(p.e_scaled),
-        &mut t(p.y),
-        OUT_SCALE,
-        &mut t(p.y_scaled),
-    )
-    .expect("the hand kernel fires");
 }
 
 fn fire_region(ctx: &Ctx, kernel: Synthesized, table: u64, rows: usize, p: Planes) {
@@ -117,8 +92,7 @@ fn fire_region(ctx: &Ctx, kernel: Synthesized, table: u64, rows: usize, p: Plane
 }
 
 /// The region lands its math's bits (IEEE ops and declared roundings), ids
-/// past the table (and below it) picking row 0 as the gather picks it; the
-/// hand kernel lands the same.
+/// past the table (and below it) picking row 0 as the gather picks it.
 #[test]
 fn a_per_layer_inputs_region_lands_its_math() {
     let kernel = generated();
@@ -140,8 +114,7 @@ fn a_per_layer_inputs_region_lands_its_math() {
             y: gpu.up(&y),
             ..Planes::zeros(gpu, rows)
         };
-        let (hand, ours) = (drawn(&mut gpu), drawn(&mut gpu));
-        fire_hand(&gpu.ctx(), table, rows, hand);
+        let ours = drawn(&mut gpu);
         fire_region(&gpu.ctx(), kernel, table, rows, ours);
         gpu.sync();
         let n = rows * WIDTH;
@@ -161,11 +134,5 @@ fn a_per_layer_inputs_region_lands_its_math() {
         });
         let case = format!("{rows} rows");
         assert_within(&case, &ours, &want[0], EXACT);
-        assert_within(
-            &format!("{case}, the hand kernel"),
-            &gpu.down::<u16>(hand.y_scaled, n),
-            &want[0],
-            EXACT,
-        );
     }
 }

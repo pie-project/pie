@@ -1,10 +1,10 @@
 #![cfg(feature = "cuda")]
 
-//! `fused.norm_modulate`'s and `fused.gated_residual_norm_modulate`'s
-//! chains, a DiT block's norm and its modulation by the lane's scale and
-//! shift (after the gated residual), as the fold forms them once the rules
-//! are off: one generated row kernel each, against the ops they replace and
-//! the hand fused kernels, what each lands.
+//! A DiT block's norm and its modulation by the lane's scale and shift
+//! (after the gated residual), the chains CUDA forms where the hand rules
+//! `fuse.norm_modulate` and `fuse.gated_residual_norm_modulate` once did:
+//! one generated row kernel each, against the ops they replace, what each
+//! lands.
 //!
 //! Each region is the one poem-compiler's `fuse::chain` lowers the ops to:
 //! the stream `y + g ⊙ x` in one rounding (the gated add's `fmaf`), the
@@ -12,9 +12,9 @@
 //! norm's plane stores it, then `n (1 + scale) + shift` in one rounding,
 //! the f32 modulation picked by the row's lane, its scale the first half of
 //! the lane's row and its shift the second. It is held to that math by the
-//! interpreter (`super::within`); the ops and the hand fused kernels (which
-//! modulate the norm's f32 values, not its rounded row) are shown beside
-//! it, not held to it.
+//! interpreter (`super::within`), from a decode's rows (every parameter
+//! loaded up front) to a prefill's (the scale and shift issued after the
+//! norm's sums); the ops are shown beside it, not held to it.
 
 use crate::common::attn_ref::ten;
 use crate::common::{Gpu, Lcg};
@@ -179,7 +179,6 @@ struct Fixed {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum By {
     Ops,
-    Hand,
     Region,
 }
 
@@ -198,11 +197,6 @@ fn fire(
     let lanes = ten(f.lanes, rows, 1, I32);
     let g = ten(f.g, LANES, width, F32);
     let m = ten(f.m, LANES, 2 * width, F32);
-    let ln = if chain.rms() {
-        modulate::NormKind::RmsNormNoScale { eps: EPS }
-    } else {
-        modulate::NormKind::LayerNormNoAffine { eps: EPS }
-    };
     let normed = |x: Tensor, y: &mut Tensor| {
         if chain.rms() {
             norm::rmsnorm_no_scale(ctx, x, 0, EPS, y)
@@ -249,21 +243,6 @@ fn fire(
             modulate::scale_shift(ctx, t(p.normed), m, Some(lanes), &mut t(p.out))
                 .expect("modulate");
         }
-        (By::Hand, false) => {
-            modulate::norm_modulate(ctx, t(p.x), m, Some(lanes), ln, &mut t(p.out)).expect("hand")
-        }
-        (By::Hand, true) => modulate::gated_residual_norm_modulate(
-            ctx,
-            t(p.y),
-            g,
-            t(p.x),
-            m,
-            Some(lanes),
-            ln,
-            &mut t(p.sum),
-            &mut t(p.out),
-        )
-        .expect("hand"),
     }
 }
 
@@ -340,7 +319,7 @@ fn a_modulated_norms_region_lands_its_math() {
     for chain in Chain::BOTH {
         for width in WIDTHS {
             let kernel = generated(chain, width);
-            for rows in [1usize, 7, 64] {
+            for rows in [1usize, 7, 64, 600] {
                 let n = rows * width;
                 let land = |by: By| {
                     let mut gpu = Gpu::open();
@@ -362,12 +341,8 @@ fn a_modulated_norms_region_lands_its_math() {
                     want.last().expect("a result"),
                     NORM_SCALED,
                 );
-                for by in [By::Ops, By::Hand] {
-                    let (apart_n, most) = apart(&land(by).1, want.last().expect("a result"));
-                    eprintln!(
-                        "{case}: {by:?} {apart_n} of {n} apart from the math, {most} ulps at most"
-                    );
-                }
+                let (apart_n, most) = apart(&land(By::Ops).1, want.last().expect("a result"));
+                eprintln!("{case}: the ops {apart_n} of {n} apart from the math, {most} ulps at most");
             }
         }
     }

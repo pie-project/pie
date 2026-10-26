@@ -10,12 +10,16 @@ use crate::run::Run;
 
 /// The fused ops this backend's dispatch turns away. Its rules form none of
 /// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`): the residual
-/// norms run as generated regions here, a product's bias, soft cap and
-/// GEGLU as anchored ones (`fused.anchored`), their fused ops ROCm's and
-/// Metal's.
+/// norms, a scaled embedding's chain and a DiT block's norm and modulation
+/// run as generated regions here, a product's bias, soft cap and GEGLU as
+/// anchored ones (`fused.anchored`), their fused ops ROCm's and Metal's.
 pub(crate) fn refuses(op: &Fused) -> bool {
     match op {
         Fused::GdnStep { .. }
+        | Fused::EmbedScaleAdd { .. }
+        | Fused::EmbedScaleAddSelect { .. }
+        | Fused::NormModulate { .. }
+        | Fused::GatedResidualNormModulate { .. }
         | Fused::MatmulBias { .. }
         | Fused::MatmulSoftcap { .. }
         | Fused::ResidualAddRmsnorm { .. }
@@ -52,6 +56,10 @@ impl DispatchFused for Run<'_> {
                 }
             }
             Fused::GdnStep { .. }
+            | Fused::EmbedScaleAdd { .. }
+            | Fused::EmbedScaleAddSelect { .. }
+            | Fused::NormModulate { .. }
+            | Fused::GatedResidualNormModulate { .. }
             | Fused::MatmulBias { .. }
             | Fused::MatmulSoftcap { .. }
             | Fused::ResidualAddRmsnorm { .. }
@@ -88,12 +96,7 @@ impl DispatchFused for Run<'_> {
             | Fused::MoeSelectGlu { .. }
             | Fused::MoeExperts { .. }
             | Fused::MoeMega { .. } => self.fused_linear(op),
-            Fused::EmbedScaleAdd { .. }
-            | Fused::EmbedScaleAddSelect { .. }
-            | Fused::NormRope { .. }
-            | Fused::HcNormProject { .. }
-            | Fused::NormModulate { .. }
-            | Fused::GatedResidualNormModulate { .. } => {
+            Fused::NormRope { .. } | Fused::HcNormProject { .. } => {
                 let mut outputs = Vec::new();
                 op.outputs(&mut outputs);
                 if outputs.first().is_some_and(|out| self.lane_shaped(*out)) {

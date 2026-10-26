@@ -61,16 +61,12 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
         vec![
             rules::split_qkv_fused(),
             rules::qkv_fused_qknorm_rope_vnorm_write(),
-            rules::embed_scale_add_select(),
-            rules::embed_scale_add(),
             rules::matmul_glu(&[GluAct::Swiglu]),
             rules::moe_mega(),
             rules::moe_experts(),
             rules::moe_select_glu(),
             rules::matmul_moe_route(),
             rules::matmul_split_rows(),
-            rules::gated_residual_norm_modulate(),
-            rules::norm_modulate(),
             rules::norm_rope(Rotated::First),
             rules::norm_rope_last_append(),
             rules::split_rope_yarn_append(),
@@ -120,7 +116,12 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 /// and, at the default knobs, outruns the rule's hand kernel. A head's norm
 /// and the turn of its tail (`norm_rope`'s `Last`: dots3's k row,
 /// DeepSeek-V4's q). Its `First` (Gemma 4's split turn) stays: a 512-wide
-/// head's region trails the hand kernel at a decode's rows. And the hand
+/// head's region trails the hand kernel at a decode's rows. A scaled
+/// embedding's chain (`embed_scale_add`, Gemma 4's per-layer rows picked
+/// from their stack with `embed_scale_add_select`) and a DiT block's norm
+/// and modulation (`norm_modulate`, after the gated residual
+/// `gated_residual_norm_modulate`): each a generated kernel that ties the
+/// hand one at a decode's rows and outruns it from 512. And the hand
 /// product rules CUDA's anchored regions replace (`fuse::anchor`): a
 /// product's bias, its soft cap and a packed bank's GEGLU, each the
 /// epilogue of its contraction skeleton, timed against the product and the
@@ -134,6 +135,10 @@ pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
         rules::matmul_glu(&[poem_ir::GluAct::GegluTanh]),
         rules::matmul_softcap(),
         rules::matmul_bias(),
+        rules::embed_scale_add_select(),
+        rules::embed_scale_add(),
+        rules::norm_modulate(),
+        rules::gated_residual_norm_modulate(),
     ]
 }
 

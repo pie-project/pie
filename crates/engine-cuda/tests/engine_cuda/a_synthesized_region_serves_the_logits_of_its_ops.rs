@@ -5,7 +5,8 @@
 //! logits it answers with the flag off, where the chain's ops run as their
 //! hand kernels: a prefill and the decode steps after it, armed and
 //! captured. Qwen3's residual norms, and Gemma 4's sandwich norms with
-//! their layer scale; CUDA forms no hand fused op for either.
+//! their layer scale and its scaled per-layer embedding; CUDA forms no hand
+//! fused op for any of them.
 //!
 //! Close, not bit for bit. A chain rounds every value it defines where the
 //! unfused ops store it, its stream among them (read on by the norm as
@@ -339,9 +340,9 @@ fn a_synthesized_region_serves_the_logits_of_its_ops() {
 
 /// The chains hand rules form on CUDA served as generated kernels with the
 /// rules off, against the rules off and the chains' ops as their own
-/// kernels: a head's norm and its rotation (`fuse.norm_rope`), Gemma 4's
-/// scaled embedding and its per-layer rows (`fuse.embed_scale_add`,
-/// `embed_scale_add_select`).
+/// kernels: a head's norm and its rotation (`fuse.norm_rope`). Gemma 4's
+/// scaled embedding and its per-layer rows, their rules gone from CUDA's
+/// list, are [`MODELS`]' regions.
 #[test]
 fn a_generated_kernel_for_a_hand_rules_chain_serves_the_logits_of_its_ops() {
     let _one = serialized();
@@ -366,14 +367,10 @@ fn a_generated_kernel_for_a_hand_rules_chain_serves_the_logits_of_its_ops() {
 
 /// The models served by [`a_generated_kernel_for_a_hand_rules_chain_serves_the_logits_of_its_ops`],
 /// each with the rules whose chains it forms.
-const RULED: [(&str, &[&str]); 4] = [
+const RULED: [(&str, &[&str]); 3] = [
     ("dots3-note-mini", &["norm_rope"]),
     ("gemma4-e4b-mini-l30", &["norm_rope"]),
     ("gemma4-e4b-mini-l36", &["norm_rope"]),
-    (
-        "gemma4-e4b-mini-l6",
-        &["embed_scale_add", "embed_scale_add_select"],
-    ),
 ];
 
 /// Each matmul and the pointwise ops over its product served as one

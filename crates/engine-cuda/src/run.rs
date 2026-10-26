@@ -1596,6 +1596,7 @@ impl<'c> Run<'c> {
         self.place.run.get()
     }
 
+    #[cfg(feature = "rocm")]
     pub(crate) fn read_elsewhere(&self, normed: ValueId) -> bool {
         use poem_ir::Operands as _;
         let mut inputs: Vec<ValueId> = Vec::new();

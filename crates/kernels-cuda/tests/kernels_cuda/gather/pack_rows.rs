@@ -2,7 +2,7 @@
 
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype;
-use kernels_cuda::elemwise::modulate::{self, NormKind};
+use kernels_cuda::elemwise::modulate;
 use kernels_cuda::elemwise::pointwise;
 use kernels_cuda::elemwise::posenc::sinusoid;
 use kernels_cuda::elemwise::rope::{RopeForm, rope_axes};
@@ -17,7 +17,6 @@ const PLANES: usize = 8;
 
 const WIDTH: usize = 64;
 const HEAD_DIM: usize = 32;
-const EPS: f32 = 1e-6;
 
 const SENTINEL: u8 = 0xa5;
 
@@ -82,7 +81,6 @@ fn bf16(plane: u64, shift: u32, rows: u32, width: usize) -> Tensor {
 #[test]
 fn every_dit_seat_entry_retires_the_staged_windows_padded_rows_every_case() {
     the_modulations_retire_their_padded_rows();
-    the_deferred_residual_pair_retires_its_padded_rows_on_both_outputs();
     the_timestep_embedding_retires_its_padded_rows();
     the_axial_rotation_retires_its_padded_rows();
     the_row_permutations_retire_their_padded_rows();
@@ -94,17 +92,14 @@ fn the_modulations_retire_their_padded_rows() {
     let (x_raw, _) = lcg.row(PLANES * WIDTH);
     let (y_raw, _) = lcg.row(PLANES * WIDTH);
     let (m_raw, _) = lcg.row(PLANES * 2 * WIDTH);
-    let (w_raw, _) = lcg.row(WIDTH);
 
-    for form in 0..3 {
+    for form in 0..2 {
         let mut gpu = Gpu::open();
         let x = gpu.up(&x_raw);
         let y = gpu.up(&y_raw);
         let m = gpu.up(&m_raw);
-        let w = gpu.up(&w_raw);
         let pair = destinations(&mut gpu, WIDTH * 2);
         let ctx = gpu.ctx();
-        let weight = Tensor::new(w, WIDTH as u32, 1, Dtype::Bf16);
 
         let fire = |shift: u32, rows: u32, dst: u64| {
             let x = bf16(x, shift, rows, WIDTH);
@@ -114,15 +109,7 @@ fn the_modulations_retire_their_padded_rows() {
             let mut o = bf16(dst, shift, rows, WIDTH);
             match form {
                 0 => modulate::scale_shift(&ctx, x, m2, None, &mut o),
-                1 => modulate::gated_residual_add(&ctx, x, m1, y, None, &mut o),
-                _ => modulate::norm_modulate(
-                    &ctx,
-                    x,
-                    m2,
-                    None,
-                    NormKind::RmsNorm { weight, eps: EPS },
-                    &mut o,
-                ),
+                _ => modulate::gated_residual_add(&ctx, x, m1, y, None, &mut o),
             }
             .expect("fires");
         };
@@ -133,45 +120,6 @@ fn the_modulations_retire_their_padded_rows() {
         gpu.sync();
         agree(&gpu, pair, WIDTH * 2, &format!("modulation form {form}"));
     }
-}
-
-fn the_deferred_residual_pair_retires_its_padded_rows_on_both_outputs() {
-    let mut lcg = Lcg::seeded(0x5ea72);
-    let (r_raw, _) = lcg.row(PLANES * WIDTH);
-    let (y_raw, _) = lcg.row(PLANES * WIDTH);
-    let (g_raw, _) = lcg.row(PLANES * WIDTH);
-    let (m_raw, _) = lcg.row(PLANES * 2 * WIDTH);
-
-    let mut gpu = Gpu::open();
-    let r = gpu.up(&r_raw);
-    let y = gpu.up(&y_raw);
-    let g = gpu.up(&g_raw);
-    let m = gpu.up(&m_raw);
-    let residual = destinations(&mut gpu, WIDTH * 2);
-    let normed = destinations(&mut gpu, WIDTH * 2);
-    let ctx = gpu.ctx();
-
-    let fire = |shift: u32, rows: u32, r_out: u64, o_out: u64| {
-        modulate::gated_residual_norm_modulate(
-            &ctx,
-            bf16(r, shift, rows, WIDTH),
-            bf16(g, shift, rows, WIDTH),
-            bf16(y, shift, rows, WIDTH),
-            view(m, shift, rows, 2 * WIDTH, Dtype::Bf16, 2),
-            None,
-            NormKind::LayerNormNoAffine { eps: EPS },
-            &mut bf16(r_out, shift, rows, WIDTH),
-            &mut bf16(o_out, shift, rows, WIDTH),
-        )
-        .expect("fires");
-    };
-    arm(&mut gpu, &ctx);
-    fire(0, BUCKET, residual.staged, normed.staged);
-    ctx.disarm_stage();
-    fire(BASE, LIVE, residual.shifted, normed.shifted);
-    gpu.sync();
-    agree(&gpu, residual, WIDTH * 2, "the pair's residual");
-    agree(&gpu, normed, WIDTH * 2, "the pair's normed row");
 }
 
 fn the_timestep_embedding_retires_its_padded_rows() {
