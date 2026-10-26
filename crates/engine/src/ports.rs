@@ -17,6 +17,9 @@ pub struct Envelope {
     pub kv_len: Option<Vec<u32>>,
     pub mask: Option<Vec<bool>>,
     pub fold: Option<Vec<u32>>,
+    /// Rows the fire placed for each of the attachment's lanes; cuts the vectors of an
+    /// envelope that places no slots of its own.
+    pub host_rows: Vec<u32>,
 }
 
 impl Envelope {
@@ -35,7 +38,7 @@ impl Envelope {
     pub fn lanes(&self) -> usize {
         match &self.qo_indptr {
             Some(csr) if self.owns_slots() && csr.len() >= 2 => csr.len() - 1,
-            _ => 1,
+            _ => self.host_rows.len().max(1),
         }
     }
 
@@ -64,7 +67,29 @@ impl Envelope {
                 }
                 start as usize..end as usize
             }
-            _ => 0..self.tokens.as_ref().map_or(0, Vec::len),
+            _ if self.host_rows.is_empty() => 0..self.tokens.as_ref().map_or(0, Vec::len),
+            _ => {
+                let placed: u32 = self.host_rows.iter().sum();
+                if let Some(tokens) = &self.tokens
+                    && tokens.len() != placed as usize
+                {
+                    return Err(PortError(format!(
+                        "lane {source}'s `embed_tokens` port carries {} id(s) and the fire \
+                         placed {placed} row(s) across the {} lane(s) of its instance",
+                        tokens.len(),
+                        self.host_rows.len()
+                    )));
+                }
+                let Some(&rows) = self.host_rows.get(at) else {
+                    return Err(PortError(format!(
+                        "lane {source} is lane {at} of its instance, which the fire placed \
+                         {} lane(s) for",
+                        self.host_rows.len()
+                    )));
+                };
+                let start: u32 = self.host_rows[..at].iter().sum();
+                start as usize..(start + rows) as usize
+            }
         };
         Ok(LanePorts {
             envelope: self,
@@ -79,6 +104,7 @@ impl Envelope {
             Some(csr) if self.owns_slots() && csr.len() >= 2 => {
                 csr.last().copied().unwrap_or(0) as usize
             }
+            _ if !self.host_rows.is_empty() => self.host_rows.iter().sum::<u32>() as usize,
             _ => self.tokens.as_ref().map_or(0, Vec::len),
         }
     }
@@ -316,6 +342,7 @@ mod tests {
         positions_are_checked_against_the_seat_only_where_the_seat_owns_the_slots();
         a_slot_run_that_disagrees_with_the_rows_is_refused_by_both_numbers();
         one_instances_flat_vectors_cut_into_its_lanes_by_the_token_csr();
+        an_envelope_placing_no_slots_cuts_by_the_host_rows();
         a_row_is_roped_at_its_slot_unless_the_program_says_otherwise();
         a_decode_envelope_resolves_its_tokens_and_not_where_they_land();
     }
@@ -420,6 +447,21 @@ mod tests {
                 "lane {at} keeps its own prefix"
             );
         }
+    }
+
+    fn an_envelope_placing_no_slots_cuts_by_the_host_rows() {
+        let envelope = Envelope {
+            tokens: Some(vec![11, 22]),
+            host_rows: vec![1, 1],
+            ..Envelope::default()
+        };
+        assert_eq!(envelope.lanes(), 2);
+        assert_eq!(envelope.lane(1, 1).unwrap().tokens_for(1).unwrap(), &[22]);
+        let short = Envelope {
+            host_rows: vec![1, 2],
+            ..envelope
+        };
+        assert!(short.lane(0, 0).is_err());
     }
 
     fn a_row_is_roped_at_its_slot_unless_the_program_says_otherwise() {
