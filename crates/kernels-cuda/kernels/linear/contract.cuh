@@ -18,7 +18,8 @@
 // serves both: `F::N` elements a call, `f.ld(k, e)` (a product where `k` is
 // below the parts, else an input's element), `f.one(k)` (an input's one
 // value a row), `f.st(k, e, v)`, `f.valid(e)`, `f.round_bf16(v)`,
-// `f.col(e)`, `f.sin(v)`, `f.cos(v)` and `f.flush<k>()`. An epilogue reduces
+// `f.col(e)`, `f.sin(v)`, `f.cos(v)`, `f.load<k>()` (nothing to issue: an input is
+// read where it is asked for) and `f.flush<k>()`. An epilogue reduces
 // nothing across its row (kernels-ir refuses one that does), so a skeleton
 // offers no row reduction. One that combines columns within a head (its
 // span: a head's norm, a rotary pair) is the skinny skeleton's alone, its
@@ -107,6 +108,11 @@ struct TileHook {
     }
 
     __device__ __forceinline__ float one(int k) const { return epi_ld(epi.in[k - P], row, 0); }
+
+    // A late parameter's vectors: the tile hook reads each input where the
+    // body asks for it, so there is nothing to issue ahead.
+    template <int K>
+    __device__ __forceinline__ void load() {}
 
     // `v` as result `k` holds it, rounded to its bf16 plane.
     __device__ __forceinline__ float st(int k, int e, float v) {
