@@ -17,7 +17,7 @@ __global__ __launch_bounds__(WAVES * 64) void score_capture(
     const i32* __restrict__ last_page_lens, float* __restrict__ scores,
     const i32* __restrict__ seat_of, int page_size,
     int num_q_heads, int num_kv_heads, int head_dim, float sm_scale, int observe, int lane_offset,
-    int plane_stride, int plane, int kv_max) {
+    int plane_stride, int plane, int kv_max, const u32* __restrict__ win) {
     static_assert(HEAD_DIM_MAX % kWave == 0, "a lane takes whole elements of the head");
     constexpr int VPT = HEAD_DIM_MAX / kWave;
     extern __shared__ float smem[];
@@ -25,22 +25,27 @@ __global__ __launch_bounds__(WAVES * 64) void score_capture(
     float* wm = q_s + head_dim;
     float* wl = wm + WAVES;
 
+    // Under a captured window (`win`: rows, row offset, lanes, lane offset)
+    // the region's lanes are read off the device, and every table (rows,
+    // pages, seats) is the whole fire's.
     const int request = static_cast<int>(blockIdx.x);
+    if (win != nullptr && request >= static_cast<int>(win[2])) return;
+    const int fire_lane = win != nullptr ? request + static_cast<int>(win[3]) : request;
     const int head = static_cast<int>(blockIdx.y);
     const int ln = lane();
     const int wave = static_cast<int>(threadIdx.x) / kWave;
 
-    const int seat = seat_of[lane_offset + request];
+    const int seat = seat_of[lane_offset + fire_lane];
     if (seat < 0) return;
     float* out = scores + (static_cast<long long>(seat) * plane_stride + plane + head) *
                               static_cast<long long>(kv_max);
     for (int i = threadIdx.x; i < kv_max; i += blockDim.x) out[i] = 0.f;
 
-    const int page_first = page_indptr[request];
-    const int pages = page_indptr[request + 1] - page_first;
-    const int kv_len = pages > 0 ? (pages - 1) * page_size + last_page_lens[request] : 0;
-    const int qo_hi = qo_indptr[request + 1];
-    const int rows = min(observe, qo_hi - qo_indptr[request]);
+    const int page_first = page_indptr[fire_lane];
+    const int pages = page_indptr[fire_lane + 1] - page_first;
+    const int kv_len = pages > 0 ? (pages - 1) * page_size + last_page_lens[fire_lane] : 0;
+    const int qo_hi = qo_indptr[fire_lane + 1];
+    const int rows = min(observe, qo_hi - qo_indptr[fire_lane]);
     if (pages <= 0 || kv_len <= 0 || rows <= 0) return;
 
     const int kv_head = head / (num_q_heads / num_kv_heads);

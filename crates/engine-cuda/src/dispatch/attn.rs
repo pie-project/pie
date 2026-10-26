@@ -44,15 +44,23 @@ impl Run<'_> {
         let Some(plane) = seat.plane_of(lse) else {
             return Ok(());
         };
-        let lane_offset = self.window().span().lane_offset;
         let mut slab = seat.slab;
-        let mut q_rows = self.ragged(q);
-        q_rows.data = self.windowed(q_rows.data);
+        // A captured, shifting region reads its lanes off the device (the
+        // capture's `win`) over the fire's whole row, page and seat tables, as
+        // its attention does: a body replays it wherever the region's lanes
+        // sit. Walked, the window is the host's.
+        let (q_rows, pool, lane_offset) = if self.plane_base() {
+            (self.ragged_q(q), self.pool_absolute(cache), 0)
+        } else {
+            let mut q_rows = self.ragged(q);
+            q_rows.data = self.windowed(q_rows.data);
+            (q_rows, self.pool(cache), self.window().span().lane_offset)
+        };
         kernels_cuda::attn::score::capture(
             self.ctx(),
             q_rows,
             self.prefill_plan(plan),
-            &self.pool(cache),
+            &pool,
             window,
             head_dim,
             kv_heads,

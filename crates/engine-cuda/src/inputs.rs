@@ -936,7 +936,9 @@ impl Inputs {
             }
         };
 
-        let scored = !fire.score_seats.is_empty();
+        // A seated fire binds the seats whether or not a lane captures (none
+        // then): an absent capturing class's region still launches.
+        let scored = !fire.score_seats.is_empty() || fire.seated;
         if scored {
             let mut seats = fire.score_seats.to_vec();
             seats.resize(space_lanes as usize, -1);

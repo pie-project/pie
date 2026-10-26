@@ -1234,7 +1234,7 @@ impl<'c> Run<'c> {
         if standing.whole { pad } else { Pad::default() }
     }
 
-    fn plane_base(&self) -> bool {
+    pub(crate) fn plane_base(&self) -> bool {
         self.standing().plane()
     }
 

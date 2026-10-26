@@ -22,11 +22,19 @@ __global__ void score_capture(
     int lane_offset,
     int plane_stride,
     int plane,
-    int kv_max)
+    int kv_max,
+    const u32* __restrict__ win)
 {
     constexpr int VPT = HEAD_DIM_MAX / 32;
 
+    // Under a captured window (`win`: rows, row offset, lanes, lane offset)
+    // the region's lanes are read off the device, and every table (rows,
+    // pages, seats) is the whole fire's.
     const int request = static_cast<int>(blockIdx.x);
+    if (win != nullptr && request >= static_cast<int>(win[2])) {
+        return;
+    }
+    const int fire_lane = win != nullptr ? request + static_cast<int>(win[3]) : request;
     const int head = static_cast<int>(blockIdx.y);
     const int threads = static_cast<int>(blockDim.x);
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -37,7 +45,7 @@ __global__ void score_capture(
     float* wm = q_s + head_dim;
     float* wl = wm + WARPS;
 
-    const int seat = static_cast<int>(seat_of[lane_offset + request]);
+    const int seat = static_cast<int>(seat_of[lane_offset + fire_lane]);
     if (seat < 0) {
         return;
     }
@@ -50,13 +58,13 @@ __global__ void score_capture(
         out[i] = 0.f;
     }
 
-    const int page_first = static_cast<int>(kv_page_indptr[request]);
-    const int pages = static_cast<int>(kv_page_indptr[request + 1]) - page_first;
+    const int page_first = static_cast<int>(kv_page_indptr[fire_lane]);
+    const int pages = static_cast<int>(kv_page_indptr[fire_lane + 1]) - page_first;
     const int kv_len =
-        pages > 0 ? (pages - 1) * page_size + static_cast<int>(kv_last_page_lens[request])
+        pages > 0 ? (pages - 1) * page_size + static_cast<int>(kv_last_page_lens[fire_lane])
                   : 0;
-    const int qo_lo = static_cast<int>(qo_indptr[request]);
-    const int qo_hi = static_cast<int>(qo_indptr[request + 1]);
+    const int qo_lo = static_cast<int>(qo_indptr[fire_lane]);
+    const int qo_hi = static_cast<int>(qo_indptr[fire_lane + 1]);
     const int qo_len = qo_hi - qo_lo;
     const int rows = observe < qo_len ? observe : qo_len;
 

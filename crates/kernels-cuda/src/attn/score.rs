@@ -183,6 +183,7 @@ pub fn capture(
             stated(OP, plane_stride)?.arg(),
             stated(OP, plane)?.arg(),
             kv_ceiling.arg(),
+            ctx.stage(),
         ],
     )
 }
