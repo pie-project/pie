@@ -361,7 +361,8 @@ pub fn window_fire_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
 }
 
 /// One sequence's cache rows: its kv pages at the declared context and the
-/// recurrent slabs, the least `Pools::fit_the_card` seats before refusing.
+/// recurrent slabs of the least state slots, the least `Pools::fit_the_card`
+/// seats before refusing.
 pub fn least_sequence_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut state: u64 = 0;
     for row in &trace.caches {
@@ -373,7 +374,8 @@ pub fn least_sequence_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
             state = state.saturating_add(stride * elem_bytes(name, *dtype)?);
         }
     }
-    Ok(one_slot_bytes(trace, paging)?.saturating_add(state))
+    let slots = u64::from(engine::fit::least_state_slots(1));
+    Ok(one_slot_bytes(trace, paging)?.saturating_add(state.saturating_mul(slots)))
 }
 
 pub fn admit_the_card(

@@ -277,7 +277,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let voxels = match voxels.clone() {
         Some(ladder) if derive_voxels => {
             let floor = ladder.max_clips;
-            let fitted = poem_compiler::voxels_within(share, floor, |rows| {
+            let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
+            let cache = crate::store::least_sequence_bytes(&boot.trace, paging)?;
+            let room = share.min(after_weights.saturating_sub(cache));
+            let fitted = poem_compiler::voxels_within(room, floor, |rows| {
                 let at = ladder.clone().at(rows);
                 let seat = crate::voxels::Seat::of(&boot.trace, &at);
                 working(tokens, &Some(at)).saturating_add(seat.payload_bytes())
