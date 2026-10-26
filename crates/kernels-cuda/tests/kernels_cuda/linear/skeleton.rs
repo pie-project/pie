@@ -263,7 +263,9 @@ fn each_skeleton_lands_each_epilogue_as_the_interpreter() {
             let ctx = gpu.ctx();
             let fire = || {
                 skeleton
-                    .fire(&ctx, epi, w, act, &ins, &outs, None, m as i32, n as i32, k as i32)
+                    .fire(
+                        &ctx, epi, w, act, &ins, &outs, None, m as i32, n as i32, k as i32,
+                    )
                     .unwrap_or_else(|e| panic!("{what} fires: {e:?}"));
             };
             fire();
@@ -604,7 +606,7 @@ fn qkv(q_heads: usize, kv_heads: usize, hd: usize, k: usize, normed: bool) -> An
         theta: 1_000_000.0,
         inverse: false,
         ramp: None,
-    mscale: None,
+        mscale: None,
     };
     let turned = b.rotate(x, pos, &turn);
     let mut rounds = vec![(turned, Bf16)];
@@ -877,11 +879,25 @@ fn a_normed_operand_lands_its_scaled_products_as_the_interpreter() {
             let folded = fold_bank(&a.norm.expect("a norm"), &wv, &gv);
             let landed: Vec<u16> = gpu.down(w, n * k);
             let bits: Vec<u16> = folded.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
-            assert!(landed == bits, "{what}: the device's fold is the declared one");
+            assert!(
+                landed == bits,
+                "{what}: the device's fold is the declared one"
+            );
             let y = gpu.zeros(m * n * 2);
             let ins = [In::norm(), In::tile(res, n as u32)];
             skeleton
-                .fire(&ctx, epi, w, act, &ins, &[y], None, m as i32, n as i32, k as i32)
+                .fire(
+                    &ctx,
+                    epi,
+                    w,
+                    act,
+                    &ins,
+                    &[y],
+                    None,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                )
                 .unwrap_or_else(|e| panic!("{what} fires: {e:?}"));
             gpu.sync();
             let want = eval(&a, m, &av, &folded, &[], &[Given::Tile(rv.clone())]).expect("runs");
@@ -1041,7 +1057,7 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
             theta: 10000.0,
             inverse: false,
             ramp: None,
-        mscale: None,
+            mscale: None,
         };
         let turned = b.rotate(0, 1, &turn);
         let paged = |plane| {
@@ -1087,14 +1103,19 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
             let pos: Vec<i32> = (0..rows).map(|r| (r * 37 % 1000) as i32).collect();
             // every cache row once, a few rows past a page or not live
             let cells = rows as u32 + 8;
-            let page: Vec<i32> = (0..rows).map(|r| ((r as u32 * 7) % cells / page_size) as i32).collect();
-            let mut slot: Vec<i32> = (0..rows).map(|r| ((r as u32 * 7) % cells % page_size) as i32).collect();
+            let page: Vec<i32> = (0..rows)
+                .map(|r| ((r as u32 * 7) % cells / page_size) as i32)
+                .collect();
+            let mut slot: Vec<i32> = (0..rows)
+                .map(|r| ((r as u32 * 7) % cells % page_size) as i32)
+                .collect();
             slot[rows / 2] = page_size as i32;
             let valid: Vec<u8> = (0..rows).map(|r| u8::from(r % 9 != 4)).collect();
             let (pg, sl, va, ps) = (gpu.up(&page), gpu.up(&slot), gpu.up(&valid), gpu.up(&pos));
             let bytes = match dtype {
                 CacheDtype::Bf16 => 2,
                 CacheDtype::E4m3 { .. } => 1,
+                CacheDtype::Blocks(_) => unreachable!("an element a column"),
             };
             let pages_cells = (cells.div_ceil(page_size) * page_size) as usize;
             let (qo, keys, values) = (
@@ -1111,6 +1132,7 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
             let element = match dtype {
                 CacheDtype::Bf16 => Bf16,
                 CacheDtype::E4m3 { .. } => Dtype::E4m3,
+                CacheDtype::Blocks(_) => unreachable!("an element a column"),
             };
             for _ in 0..2 {
                 if through {
@@ -1156,7 +1178,12 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
             ];
             let want = eval(&a, rows, &av, &wv, &[], &given).expect("runs");
             let want_q: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
-            assert_within(&format!("{what}: q"), &gpu.down::<u16>(qo, rows * q), &want_q, TURNED);
+            assert_within(
+                &format!("{what}: q"),
+                &gpu.down::<u16>(qo, rows * q),
+                &want_q,
+                TURNED,
+            );
             for (r, plane) in [(1usize, keys), (2, values)] {
                 let at = paged_rows(&a, r, &given, page_size).expect("paged");
                 let landed: Vec<f32> = match dtype {
@@ -1170,6 +1197,7 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
                         .iter()
                         .map(|&b| e4m3_of(b))
                         .collect(),
+                    CacheDtype::Blocks(_) => unreachable!("an element a column"),
                 };
                 for cell in 0..pages_cells {
                     let row = (0..rows).find(|&m| valid[m] != 0 && at[m] == Some(cell as u64));
@@ -1184,8 +1212,13 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
                         // interpreter's rounding, where the f32s are within
                         // the turn's tolerance
                         let place = match dtype {
-                            CacheDtype::Bf16 => 2f32.powi(want.abs().max(0.5).log2().floor() as i32 - 7) * TURNED,
-                            CacheDtype::E4m3 { .. } => 2f32.powi(want.abs().max(2f32.powi(-6)).log2().floor() as i32 - 3),
+                            CacheDtype::Bf16 => {
+                                2f32.powi(want.abs().max(0.5).log2().floor() as i32 - 7) * TURNED
+                            }
+                            CacheDtype::E4m3 { .. } => {
+                                2f32.powi(want.abs().max(2f32.powi(-6)).log2().floor() as i32 - 3)
+                            }
+                            CacheDtype::Blocks(_) => unreachable!("an element a column"),
                         };
                         assert!(
                             (got - want).abs() <= place,
@@ -1269,7 +1302,18 @@ fn a_head_major_window_lands_a_head_of_every_stride() {
                 assert!(served, "{what}");
             } else {
                 Skeleton::Skinny
-                    .fire(&ctx, epi, w, act, &[], &outs, None, rows as i32, n as i32, k as i32)
+                    .fire(
+                        &ctx,
+                        epi,
+                        w,
+                        act,
+                        &[],
+                        &outs,
+                        None,
+                        rows as i32,
+                        n as i32,
+                        k as i32,
+                    )
                     .unwrap_or_else(|e| panic!("{what}: {e:?}"));
             }
         }

@@ -59,6 +59,9 @@ pub struct Store {
     /// A head-major window's head and stride, in vectors (0: whole).
     head: u32,
     stride: u32,
+    /// A block-scaled row's layout, packed ([`blocks_word`]), its floor
+    /// `scale`; 0 where the result is not one.
+    blocks: u32,
 }
 
 impl Store {
@@ -73,6 +76,7 @@ impl Store {
         scale: 1.0,
         head: 0,
         stride: 0,
+        blocks: 0,
     };
 
     /// Its words, as `fire` passes them.
@@ -84,7 +88,7 @@ impl Store {
             u64::from(self.from) | u64::from(self.to) << 32,
             u64::from(self.page_size) | u64::from(u32::from(self.e4m3)) << 32,
             u64::from(self.scale.to_bits()) | u64::from(self.head) << 32,
-            u64::from(self.stride),
+            u64::from(self.stride) | u64::from(self.blocks) << 32,
         ]
     }
 }
@@ -102,6 +106,35 @@ pub struct Cache {
     pub valid: u64,
     pub page_size: u32,
     pub e4m3: Option<f32>,
+    /// A block-scaled row's layout, where each row is one (its data rows,
+    /// then its scale rows, a page).
+    pub blocks: Option<kernels_ir::BlockRows>,
+}
+
+/// `rows` packed as `pie::elemwise::Store::blocks` reads it, or `None`
+/// where a field does not fit its bits.
+#[must_use]
+pub fn blocks_word(rows: &kernels_ir::BlockRows) -> Option<u32> {
+    use kernels_ir::{BlockScale, Code};
+    let fits = |v: u32, bits: u32| v < 1 << bits;
+    let (coded, tail, scales) = (rows.coded / 8, rows.tail / 8, rows.scale_bytes / 4);
+    (rows.verify()
+        && rows.coded.is_multiple_of(8)
+        && rows.tail.is_multiple_of(8)
+        && rows.scale_bytes.is_multiple_of(4)
+        && rows.block.is_multiple_of(8)
+        && fits(rows.block, 8)
+        && fits(coded, 8)
+        && fits(tail, 8)
+        && fits(scales, 5))
+    .then(|| {
+        1 | u32::from(rows.code == Code::E2m1) << 1
+            | u32::from(rows.scale == BlockScale::E4m3) << 2
+            | rows.block << 3
+            | coded << 11
+            | tail << 19
+            | scales << 27
+    })
 }
 
 impl Plane {
@@ -221,9 +254,12 @@ impl Plane {
                 to: (from + width) / VEC_WIDTH,
                 page_size: cache.page_size,
                 e4m3: cache.e4m3.is_some(),
-                scale: cache.e4m3.unwrap_or(1.0),
+                scale: cache
+                    .blocks
+                    .map_or(cache.e4m3.unwrap_or(1.0), |rows| rows.floor),
                 head: 0,
                 stride: 0,
+                blocks: cache.blocks.as_ref().and_then(blocks_word).unwrap_or(0),
             },
         }
     }

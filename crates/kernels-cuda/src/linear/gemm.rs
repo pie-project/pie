@@ -83,18 +83,33 @@ pub fn anchored(
     // Each result its window of the tile (every column, or a split's piece).
     // A paged result's plane is its cache's: rows its pages hold, its
     // elements the cache's.
-    let shaped = (0..outs.len()).zip(outs).all(|(at, y)| match epi.paged(at) {
-        None => {
-            y.dtype == Dtype::Bf16 && y.width == epi.window(at, tile).width && y.rows == act.rows
-        }
-        Some(paged) => {
-            let element = match paged.dtype {
-                crate::linear::skeleton::CacheDtype::Bf16 => Dtype::Bf16,
-                crate::linear::skeleton::CacheDtype::E4m3 { .. } => Dtype::E4m3,
-            };
-            y.dtype == element && y.width == epi.window(at, tile).width && paging.is_some()
-        }
-    });
+    let shaped = (0..outs.len())
+        .zip(outs)
+        .all(|(at, y)| match epi.paged(at) {
+            None => {
+                y.dtype == Dtype::Bf16
+                    && y.width == epi.window(at, tile).width
+                    && y.rows == act.rows
+            }
+            Some(paged) => {
+                let window = epi.window(at, tile).width;
+                let shaped = match paged.dtype {
+                    crate::linear::skeleton::CacheDtype::Bf16 => {
+                        y.dtype == Dtype::Bf16 && y.width == window
+                    }
+                    crate::linear::skeleton::CacheDtype::E4m3 { .. } => {
+                        y.dtype == Dtype::E4m3 && y.width == window
+                    }
+                    // a u8 plane of whole block-scaled rows
+                    crate::linear::skeleton::CacheDtype::Blocks(rows) => {
+                        y.dtype == Dtype::U8
+                            && y.width == rows.row_bytes()
+                            && window == rows.width()
+                    }
+                };
+                shaped && paging.is_some()
+            }
+        });
     if !shaped || w.width != act.width || w.rows != tile * epi.parts() || !epi.fits(tile) {
         return Err(crate::jit::refuse(
             op,
@@ -148,7 +163,10 @@ pub fn epilogue(
         ));
     }
     if epi.pages() && paging.is_none() {
-        return Err(crate::jit::refuse(op, "a paged result fired with no paging"));
+        return Err(crate::jit::refuse(
+            op,
+            "a paged result fired with no paging",
+        ));
     }
     if y.rows == 0 {
         return Ok(true);
@@ -160,7 +178,16 @@ pub fn epilogue(
         };
         let m = ctx.opaque_rows(stated(op, y.rows)?);
         let planes: Vec<u64> = outs.iter().map(|t| t.ptr).collect();
-        leg.fire(epi, ctx, y.ptr, ins, &planes, paging, m.unsigned_abs(), tile)?;
+        leg.fire(
+            epi,
+            ctx,
+            y.ptr,
+            ins,
+            &planes,
+            paging,
+            m.unsigned_abs(),
+            tile,
+        )?;
         Ok(true)
     }
     #[cfg(not(feature = "cuda"))]
