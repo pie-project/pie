@@ -25,7 +25,6 @@ struct Output {
     text: String,
     /// How many tokens it is.
     count: usize,
-    /// Last on purpose: `pie::sweep::fleet` reads a lane's answer from the last `[`.
     tokens: Vec<u32>,
 }
 
@@ -52,7 +51,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut prompt = inferlet::chat::prefix();
     prompt.extend(model::encode(&input.prompt));
     if prompt.is_empty() {
-        prompt.push(0);
+        return Err("empty prompt".into());
     }
     let n = prompt.len() as u32;
 

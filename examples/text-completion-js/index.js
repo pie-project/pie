@@ -19,8 +19,8 @@ export function main(input) {
 
   // The model's opening (`<bos>` where it has one) before the raw text: a
   // gemma without it answers noise.
-  let prompt = [...chat.prefix(), ...model.encode(promptText)];
-  if (prompt.length === 0) prompt = [0];
+  const prompt = [...chat.prefix(), ...model.encode(promptText)];
+  if (prompt.length === 0) throw new Error('empty prompt');
   const n = prompt.length;
 
   const pipe = new Pipeline();

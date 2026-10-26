@@ -69,17 +69,12 @@ fn chain(e: client::Error) -> String {
 }
 
 fn parse_tokens(json: &str) -> Option<Vec<i64>> {
-    let lb = json.rfind('[')?;
-    let rb = json[lb..].find(']')? + lb;
-    let tokens: Vec<i64> = json[lb + 1..rb]
-        .split(',')
-        .filter_map(|s| s.trim().parse::<i64>().ok())
-        .collect();
-    if tokens.is_empty() {
-        None
-    } else {
-        Some(tokens)
+    #[derive(serde::Deserialize)]
+    struct Returned {
+        tokens: Vec<i64>,
     }
+    let tokens = serde_json::from_str::<Returned>(json).ok()?.tokens;
+    (!tokens.is_empty()).then_some(tokens)
 }
 
 pub async fn run(addr: &str, program: &str, inputs: &[String]) -> FleetRun {

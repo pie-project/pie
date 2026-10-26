@@ -40,7 +40,7 @@ async def main(input: dict) -> dict:
     # gemma without it answers noise.
     prompt = chat.prefix() + model.encode(prompt_text)
     if not prompt:
-        prompt = [0]
+        raise ValueError("empty prompt")
     n = len(prompt)
 
     pipe = Pipeline()

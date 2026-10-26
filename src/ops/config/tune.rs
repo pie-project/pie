@@ -316,7 +316,9 @@ impl crate::ui::Report for TuneReport {
 }
 
 pub fn lane_inputs(fleet: usize, tokens: usize) -> Vec<String> {
-    (0..fleet).map(|_| tokens.to_string()).collect()
+    (0..fleet)
+        .map(|_| serde_json::json!({ "max_tokens": tokens }).to_string())
+        .collect()
 }
 
 pub fn apply(content: &str, knobs: Knobs) -> Result<String> {
