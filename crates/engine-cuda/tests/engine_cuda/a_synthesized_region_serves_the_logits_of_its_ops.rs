@@ -4,9 +4,10 @@
 //! chain of elementwise and row ops one generated kernel, answers the
 //! logits it answers with the flag off, where the chain's ops run as their
 //! hand kernels: a prefill and the decode steps after it, armed and
-//! captured. Qwen3's residual norms, and Gemma 4's sandwich norms with
-//! their layer scale and its scaled per-layer embedding; CUDA forms no hand
-//! fused op for any of them.
+//! captured. Qwen3's residual norms; Gemma 4's sandwich norms with their
+//! layer scale, its scaled per-layer embedding and its q's norm and split
+//! turn (a 512-wide global head's pair-packed); dots3's k row's norm and
+//! turn. CUDA forms no hand fused op for any of them.
 //!
 //! Close, not bit for bit. A chain rounds every value it defines where the
 //! unfused ops store it, its stream among them (read on by the norm as
@@ -294,7 +295,13 @@ const TOKENS: u32 = 256;
 const DECODES: usize = 4;
 
 /// The models served: Qwen3's residual norms, Gemma 4's sandwich norms.
-const MODELS: [&str; 2] = ["qwen3-micro-text", "gemma4-e4b-mini-l1"];
+const MODELS: [&str; 5] = [
+    "qwen3-micro-text",
+    "gemma4-e4b-mini-l1",
+    "dots3-note-mini",
+    "gemma4-e4b-mini-l30",
+    "gemma4-e4b-mini-l36",
+];
 
 /// `fixture` served under `overrides`: a prefill's logits, then each greedy
 /// decode step's after it; `generates` whether the load generates a kernel.
@@ -352,41 +359,6 @@ fn a_synthesized_region_serves_the_logits_of_its_ops() {
         close(&synth, &ops, &carry, &format!("{model}'s unfused ops"));
     }
 }
-
-/// The chains hand rules form on CUDA served as generated kernels with the
-/// rules off, against the rules off and the chains' ops as their own
-/// kernels: a head's norm and its rotation (`fuse.norm_rope`). Gemma 4's
-/// scaled embedding and its per-layer rows, their rules gone from CUDA's
-/// list, are [`MODELS`]' regions.
-#[test]
-fn a_generated_kernel_for_a_hand_rules_chain_serves_the_logits_of_its_ops() {
-    let _one = serialized();
-    if !engine_cuda::device::present() {
-        eprintln!("skipping: no CUDA device on this machine");
-        return;
-    }
-    for (model, rules) in RULED {
-        let fixture = fixture(model);
-        let off: String = rules
-            .iter()
-            .map(|rule| format!("{rule} = false\n"))
-            .collect();
-        let off = format!("[fuse]\n{off}[compiler]\n");
-        let unfused = format!("{off}synth_regions = false\nsynth_anchors = false\n");
-        let ops = served(&fixture, &unfused, false);
-        let carry = served_along(&fixture, &format!("{unfused}{NUDGED}"), false, Some(&ops));
-        let synth = served_along(&fixture, &off, true, Some(&ops));
-        close(&synth, &ops, &carry, &format!("{model}'s unfused ops"));
-    }
-}
-
-/// The models served by [`a_generated_kernel_for_a_hand_rules_chain_serves_the_logits_of_its_ops`],
-/// each with the rules whose chains it forms.
-const RULED: [(&str, &[&str]); 3] = [
-    ("dots3-note-mini", &["norm_rope"]),
-    ("gemma4-e4b-mini-l30", &["norm_rope"]),
-    ("gemma4-e4b-mini-l36", &["norm_rope"]),
-];
 
 /// Each matmul and the pointwise ops over its product served as one
 /// anchored region (`compiler.synth_anchors`, the hand rules
@@ -520,7 +492,7 @@ fn two_models_served_at_once_answer_what_each_answers_alone() {
         eprintln!("skipping: no CUDA device on this machine");
         return;
     }
-    let fixtures: Vec<Fixture> = MODELS.into_iter().map(fixture).collect();
+    let fixtures: Vec<Fixture> = MODELS[..2].iter().copied().map(fixture).collect();
     let alone: Vec<Vec<Vec<f32>>> = fixtures.iter().map(|f| served(f, "", true)).collect();
     // Each loaded and served again and again, so one's loads (its weights'
     // uploads) land beside the other's arming (its captures) and its fires.

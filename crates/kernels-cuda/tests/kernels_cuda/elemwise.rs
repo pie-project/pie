@@ -2,7 +2,6 @@ mod group_norm;
 mod hc;
 mod modulate;
 mod norm;
-mod norm_rope;
 mod pointwise;
 mod posenc_bucket;
 mod posenc_sinusoid;

@@ -55,7 +55,7 @@ pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 #[cfg(not(feature = "rocm"))]
 pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
     std::sync::LazyLock::new(|| {
-        use poem_compiler::fuse::rules::{self, Rotated};
+        use poem_compiler::fuse::rules;
         use poem_ir::ops::fused::Intermediates;
         vec![
             rules::split_qkv_fused(),
@@ -65,7 +65,6 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::moe_select_glu(),
             rules::matmul_moe_route(),
             rules::matmul_split_rows(),
-            rules::norm_rope(Rotated::First),
             rules::norm_rope_last_append(),
             rules::split_rope_yarn_append(),
             rules::rope_yarn_append(),
@@ -113,8 +112,9 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 /// into a generated row kernel (`fuse::chain`) that lands its ops' bits
 /// and, at the default knobs, outruns the rule's hand kernel. A head's norm
 /// and the turn of its tail (`norm_rope`'s `Last`: dots3's k row,
-/// DeepSeek-V4's q). Its `First` (Gemma 4's split turn) stays: a 512-wide
-/// head's region trails the hand kernel at a decode's rows. A scaled
+/// DeepSeek-V4's q), and of its first dims (`First`: Gemma 4's split turn,
+/// a 512-wide head's quarter turned pair-packed, its turned vectors on
+/// whole warps where its rows are packed). A scaled
 /// embedding's chain (`embed_scale_add`, Gemma 4's per-layer rows picked
 /// from their stack with `embed_scale_add_select`) and a DiT block's norm
 /// and modulation (`norm_modulate`, after the gated residual
@@ -136,6 +136,7 @@ pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
     use poem_compiler::fuse::rules;
     vec![
         rules::norm_rope(rules::Rotated::Last),
+        rules::norm_rope(rules::Rotated::First),
         rules::matmul_glu(&[poem_ir::GluAct::GegluTanh, poem_ir::GluAct::Swiglu]),
         rules::matmul_softcap(),
         rules::matmul_bias(),

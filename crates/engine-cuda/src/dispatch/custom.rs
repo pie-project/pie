@@ -10,8 +10,9 @@ use crate::run::Run;
 
 /// The fused ops this backend's dispatch turns away. Its rules form none of
 /// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`): the residual
-/// norms, a scaled embedding's chain and a DiT block's norm and modulation
-/// run as generated regions here, a product's bias, soft cap and GEGLU as
+/// norms, a scaled embedding's chain, a DiT block's norm and modulation and
+/// a head's norm and the turn of its first dims run as generated regions
+/// here, a product's bias, soft cap and GEGLU as
 /// anchored ones (`fused.anchored`), their fused ops ROCm's and Metal's.
 pub(crate) fn refuses(op: &Fused) -> bool {
     match op {
@@ -29,11 +30,9 @@ pub(crate) fn refuses(op: &Fused) -> bool {
             ..
         } => true,
         Fused::MatmulGlu { glu, .. } => !matches!(glu, poem_ir::GluAct::Swiglu),
-        Fused::NormRope { weight, turn, .. } => match turn {
-            poem_ir::Turn::Partial { .. } => weight.is_none(),
-            poem_ir::Turn::Last { .. } => false,
-            _ => true,
-        },
+        // A turn of the tail stays: DeepSeek-V4's q and kv pair falls back
+        // to it.
+        Fused::NormRope { turn, .. } => !matches!(turn, poem_ir::Turn::Last { .. }),
         _ => false,
     }
 }

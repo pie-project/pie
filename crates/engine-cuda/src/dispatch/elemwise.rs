@@ -189,6 +189,9 @@ impl Run<'_> {
                 *out_scale,
                 &mut self.tensor(*y_scaled),
             ),
+            // CUDA runs a head's norm and the turn of its first dims as a
+            // generated region; ROCm forms the fused op.
+            #[cfg(feature = "rocm")]
             Fused::NormRope {
                 x,
                 weight: Some(weight),

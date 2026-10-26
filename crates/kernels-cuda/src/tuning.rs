@@ -618,13 +618,6 @@ pub struct SsmGdnScanUntil(pub u32);
 #[decision(id = "kernel.elemwise.rows_vec", flag, default = false, tune = search)]
 pub struct ElemwiseRowsVec;
 
-/// Whether q's fused per-head RMS norm and partial rotation (Gemma 4's global
-/// layers) runs a warp a (row, head) over 16-byte runs staged in shared memory
-/// rather than a 128-thread block a (row, head) an element a thread.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.elemwise.q_norm_rope_warp", flag, default = false, tune = search)]
-pub struct ElemwiseQNormRopeWarp;
-
 /// Whether the hyper-connection kernels run their tiled and 16-byte forms:
 /// the mix projection a block 64 rows of every column over shared-memory
 /// tiles, the fold and the gates' pre-mix eight columns a thread, and a
@@ -819,7 +812,6 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnTc5>()
         .add::<SsmGdnScanUntil>()
         .add::<ElemwiseRowsVec>()
-        .add::<ElemwiseQNormRopeWarp>()
         .add::<ElemwiseHcTile>()
         .add::<ElemwiseHcMma>()
         .add::<ElemwiseHcMegaUntil>()
@@ -958,7 +950,6 @@ tuning! {
     ssm_gdn_tc5: bool = false, on SsmGdnTc5;
     ssm_gdn_scan_until: u32 = 32, get SsmGdnScanUntil;
     rows_vec: bool = false, on ElemwiseRowsVec;
-    q_norm_rope_warp: bool = false, on ElemwiseQNormRopeWarp;
     hc_tile: bool = false, on ElemwiseHcTile;
     hc_mma: bool = false, on ElemwiseHcMma;
     hc_mega_until: u32 = 0, get ElemwiseHcMegaUntil;

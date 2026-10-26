@@ -2,8 +2,11 @@
 
 //! `fused.norm_rope`'s chain, a head's RMS norm and the rotation of its
 //! heads at each row's position, as the fold forms it once the rule is off:
-//! one generated row kernel, against the two ops it replaces and the hand
-//! fused kernel, what each lands.
+//! one generated row kernel, against the two ops it replaces and (a turn of
+//! the tail) the hand fused kernel, what each lands. A turn of the first
+//! dims across a wide head (Gemma 4's global q) is pair-packed where its
+//! rows are: its turned vectors on whole warps, the rest's warps skipping
+//! the turn.
 //!
 //! Each region is the one poem-compiler's `fuse::chain` lowers the two ops
 //! to (kernels-ir's `build`, the builder it lowers with): the norm over
@@ -270,7 +273,7 @@ enum By {
 
 /// The knobs the hand kernels run under: none (the L40S's profile, every
 /// chip's default), or the register and warp forms B200's and H200's turn
-/// on (`kernel.elemwise.{rows_vec, hc_tile, q_norm_rope_warp}`).
+/// on (`kernel.elemwise.{rows_vec, hc_tile}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Knobs {
     Default,
@@ -286,7 +289,6 @@ impl Knobs {
             Knobs::Tuned => tuned(|t| {
                 t.rows_vec = true;
                 t.hc_tile = true;
-                t.q_norm_rope_warp = true;
             }),
         }
     }
@@ -348,19 +350,9 @@ fn fire(
             }
             .expect("the generated kernel fires");
         }
-        (By::Hand, Some(span)) => norm_rope::rmsnorm_rope_partial_q(
-            ctx,
-            x,
-            w,
-            case.head,
-            case.eps,
-            positions,
-            case.rotary,
-            case.theta,
-            span,
-            &mut y,
-        )
-        .expect("the hand kernel fires"),
+        (By::Hand, Some(_)) => {
+            unreachable!("CUDA holds no hand kernel for a turn of the first dims")
+        }
         (By::Hand, None) => norm_rope::norm_rope_last(
             ctx,
             x,
@@ -548,7 +540,14 @@ fn a_norm_and_its_turn_land_their_math() {
                 assert_within(&format!("{name}, {schedule:?}"), &laid, &want, TURN);
             }
             for knobs in Knobs::BOTH {
-                for by in [By::Ops, By::Hand] {
+                // the hand fused kernel where CUDA still holds one: a turn
+                // of the tail
+                let hand: &[By] = if case.span.is_some() {
+                    &[]
+                } else {
+                    &[By::Hand]
+                };
+                for &by in [By::Ops].iter().chain(hand) {
                     let (n, most) = apart(&land(case, rows, by, knobs), &want);
                     eprintln!(
                         "{name}: {by:?} {knobs:?}: {n} of {total} apart from the math, {most} ulps at most"
