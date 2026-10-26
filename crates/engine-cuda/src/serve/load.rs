@@ -143,19 +143,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // a product's epilogue is its contraction skeleton's.
     #[cfg(not(feature = "rocm"))]
     let anchored = if profile.synth_anchors {
-        // `compiler.fold_norms`: a norm folds into the anchor over its row
-        // where the load holds the anchor's bank whole on the device, the
-        // gain folded into it in place (`Weights::fold_gains`); a bank the
-        // host tier streams keeps its norm.
-        let residency = &boot.residency;
-        let trace = &boot.trace;
-        let held = |w: poem_ir::ValueId| match trace.values[w.0 as usize].def {
-            poem_ir::Def::Weight(p) => !residency.streamed_whole(p as usize),
-            _ => false,
-        };
-        let folds: Option<poem_compiler::fuse::anchor::Folds<'_>> =
-            profile.fold_norms.then_some(&held);
-        let (folded, anchored) = crate::synth::fold_anchors(boot.trace.clone(), folds);
+        let (folded, anchored) = crate::synth::fold_anchors(boot.trace.clone());
         boot.trace = folded;
         anchored
     } else {
@@ -612,10 +600,6 @@ impl Shell {
             decode_dense,
             boot.deferred_tier,
         )?;
-        // `compiler.fold_norms`: each folded norm's gain into its bank, once,
-        // before anything reads it.
-        #[cfg(feature = "cuda")]
-        weights.fold_gains(&boot.trace, &anchored, device.stream())?;
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
         // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
         #[cfg(feature = "cuda")]

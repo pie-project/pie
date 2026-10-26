@@ -463,20 +463,17 @@ impl Run<'_> {
     > {
         const OP: &str = "fused.anchored";
         let broken = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
-        // Each input's plane, the op's values in order; a normed operand's
-        // row scale (no value) the contraction's own.
-        let mut values = ins.iter();
-        let planes: Vec<linear::skeleton::In> = epi
-            .inputs()
+        // Each input's plane, the op's values in order.
+        if ins.len() != epi.inputs().len() {
+            return Err(broken(
+                "the op reads other values than its epilogue's inputs".into(),
+            ));
+        }
+        let planes: Vec<linear::skeleton::In> = ins
             .iter()
-            .map(|input| {
+            .zip(epi.inputs())
+            .map(|(&v, input)| {
                 use linear::skeleton::{In, Input};
-                if *input == Input::Norm {
-                    return Ok(In::norm());
-                }
-                let v = *values.next().ok_or_else(|| {
-                    broken("the op reads fewer values than its epilogue's inputs".into())
-                })?;
                 let t = self.tensor(v);
                 let plane = match *input {
                     Input::Tile => In::tile(t.ptr, t.width),
@@ -484,16 +481,15 @@ impl Run<'_> {
                     Input::Head(size) => In::head(t.ptr, size),
                     Input::Row => In::row(t.ptr),
                     Input::One => In::one(t.ptr),
-                    Input::Norm => unreachable!("taken above"),
                 };
                 // a row's position is stored i32
-                Ok(if t.dtype == Dtype::I32 {
+                if t.dtype == Dtype::I32 {
                     plane.i32()
                 } else {
                     plane
-                })
+                }
             })
-            .collect::<Result<_, kernels_cuda::Error>>()?;
+            .collect();
         // Each result's plane: the op's values in order, a paged result its
         // cache's keys or values (a bf16 or unit-scaled e4m3 pool of rows a
         // cell, every row live where its `row_valid` says).

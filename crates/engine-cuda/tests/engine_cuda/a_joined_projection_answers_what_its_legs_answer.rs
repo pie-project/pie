@@ -157,14 +157,9 @@ fn load(trace: &Trace, joins: &[Join], unjoined: &Trace, tag: &str) -> (Shell, S
         ordinal: 0,
         // Eager: what a joined weight answers is the question, not how a
         // body records it, and capturing every composition of eleven rows
-        // twice was most of this test's time. Norms unfolded: a norm before
-        // a joined bank folds into it (`compiler.fold_norms`, a rewrite held
-        // to its own tolerance) where the legs' readers keep it apart, and
-        // the question is the join.
+        // twice was most of this test's time.
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::profile(
-                "[engine]\ngraphs = \"off\"\n[compiler]\nfold_norms = false\n",
-            )),
+            chip: Some(engine_cuda::chip::profile("[engine]\ngraphs = \"off\"\n")),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,
