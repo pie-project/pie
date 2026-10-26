@@ -19,6 +19,20 @@ pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};
 pub(crate) use settle::Readback;
 pub use settle::{Done, Settled};
 
+/// The rows a fire's kernels launch over on an axis of `rows` rows padded to
+/// `bucket`. A padded load (`Recording::pad`) launches every fire at its
+/// bucket, eager or bodied, and under expert parallelism (`received`) every
+/// fire takes every rank's rows at the bucket. Every per-row table staged for
+/// a fire is carved to this, its padded rows written as inert (no write, no
+/// route, no row), so no padded row reads what an earlier fire staged.
+pub(crate) fn launched_rows(pad: bool, received: bool, rows: u32, bucket: u32) -> u32 {
+    if pad || received {
+        bucket.max(rows)
+    } else {
+        rows
+    }
+}
+
 use engine::frame::{
     Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Shell as FrameShell,
 };

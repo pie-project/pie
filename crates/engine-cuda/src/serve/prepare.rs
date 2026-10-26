@@ -464,15 +464,14 @@ impl FrameShell for Shell {
             })
             .min()
             .unwrap_or_else(|| poem_compiler::arena::readouts_ceiling(&self.budget));
-        let readout_extent = readout_extent(
+        let received = !self.compiled.expert.is_empty();
+        let launched = super::launched_rows(
+            self.pad,
+            received,
             composition.rows(),
-            if self.pad {
-                composition.bucket()
-            } else {
-                composition.rows()
-            },
-            readout_rows.len(),
+            composition.bucket(),
         );
+        let readout_extent = readout_extent(composition.rows(), launched, readout_rows.len());
         if readout_extent > readouts_ceiling {
             return Err(Fault::Ceiling {
                 what: "rows one fire reads out through its readout plane",
@@ -682,21 +681,28 @@ impl FrameShell for Shell {
             )?
         };
 
+        // The patch rows the fire launches over, the padded ones inert.
+        let patch_rows = super::launched_rows(
+            self.pad,
+            false,
+            composition.patch_rows(),
+            composition.patch_bucket(),
+        ) as usize;
         let (patch_payload, patch_segments, patch_routes, patch_positions, patch_grids) =
             if composition.patch_rows() == 0 {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
             } else {
                 let stride = row_bytes as usize;
-                let mut payload = vec![0u8; composition.patch_rows() as usize * stride];
+                let mut payload = vec![0u8; patch_rows * stride];
                 let mut routes = vec![
                     if self.drops_patch_rows {
                         PATCH_ROUTE_DROP
                     } else {
                         0
                     };
-                    composition.patch_rows() as usize
+                    patch_rows
                 ];
-                let mut positions = vec![0i32; composition.patch_rows() as usize * MROPE_COORDS];
+                let mut positions = vec![0i32; patch_rows * MROPE_COORDS];
                 let fold = (self.patch_fold as usize).max(1);
                 let mut grids = vec![0i32; composition.images() as usize * MROPE_COORDS];
                 let mut per_image = vec![0u32; composition.images() as usize];
@@ -1350,17 +1356,18 @@ impl FrameShell for Shell {
         let readout_live = readout_rows.len() as u32;
         if bodied {
             readout_rows.resize(readout_ceiling as usize, 0);
+        } else {
+            // An eager fire's readout rows are carved to what its readout
+            // launches over (`readout_extent`), the padded ones row 0.
+            readout_rows.resize(readout_rows.len().max(readout_extent as usize), 0);
         }
 
         if arming {
             self.armed_body = bodied.then(|| key.clone());
         }
 
-        let carve_rows = if bodied || !self.compiled.expert.is_empty() {
-            composition.bucket().max(composition.rows())
-        } else {
-            composition.rows()
-        };
+        // Every per-row table is carved to the rows the fire launches over.
+        let carve_rows = launched;
         let mut lane_of_row: Vec<i32> = Vec::with_capacity(carve_rows as usize);
         for (fire_lane, row) in composition.lanes().iter().enumerate() {
             lane_of_row.extend(std::iter::repeat_n(fire_lane as i32, row.rows as usize));

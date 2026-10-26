@@ -460,12 +460,38 @@ impl FireCtx<'_> {
         // Under expert parallelism the received rows are every rank's, at
         // the bucket: every fire carves for them.
         let received = !self.compiled.expert.is_empty();
-        let carve_rows = if p.bodied || received {
-            u64::from(p.composition.bucket()).max(u64::from(rows))
-        } else {
-            u64::from(rows)
-        };
+        let carve_rows = u64::from(super::launched_rows(
+            self.pad,
+            received,
+            rows,
+            p.composition.bucket(),
+        ));
         let carve_lanes = u64::from(p.lane_carve).max(u64::from(lane_count));
+        // A guest input's rows past the fire's own are read by its padded
+        // rows: they hold zeros, not what an earlier fire fed.
+        for seat in self.inputs.guest_seats() {
+            let (fed, carved) = if seat.per_lane() {
+                (u64::from(lane_count), carve_lanes)
+            } else {
+                (u64::from(rows), carve_rows)
+            };
+            if carved <= fed {
+                continue;
+            }
+            let Some(rectangle) = self
+                .inputs
+                .seat(seat.id, u32::try_from(carved).unwrap_or(u32::MAX))
+            else {
+                continue;
+            };
+            let at = rectangle.ptr + fed * seat.row_bytes();
+            let len = (u64::from(rectangle.rows).saturating_sub(fed)) * seat.row_bytes();
+            crate::device::zero_span_on(
+                self.device.stream(),
+                at,
+                usize::try_from(len).unwrap_or(0),
+            )?;
+        }
         let inputs: Vec<crate::run::InputBinding> = self
             .inputs
             .guest_seats()
@@ -484,11 +510,12 @@ impl FireCtx<'_> {
                     })
             })
             .collect();
-        let carve_patches = if p.bodied {
-            u64::from(p.composition.patch_bucket()).max(u64::from(p.composition.patch_rows()))
-        } else {
-            u64::from(p.composition.patch_rows())
-        };
+        let carve_patches = u64::from(super::launched_rows(
+            self.pad,
+            false,
+            p.composition.patch_rows(),
+            p.composition.patch_bucket(),
+        ));
         // A fire that runs the side streams carves the arena laid out for
         // them (`CompiledModel::arena_forked`); the rest the one in order.
         let forks = !self.device.side_ctx().is_empty() && {
@@ -702,19 +729,21 @@ impl FireCtx<'_> {
             });
         let armed = kernels_cuda::Pad {
             rows: p.composition.rows(),
-            bucket: if self.pad || !self.compiled.expert.is_empty() {
-                p.composition.bucket()
-            } else {
-                p.composition.rows()
-            },
+            bucket: super::launched_rows(
+                self.pad,
+                !self.compiled.expert.is_empty(),
+                p.composition.rows(),
+                p.composition.bucket(),
+            ),
         };
         let armed_patches = kernels_cuda::Pad {
             rows: p.composition.patch_rows(),
-            bucket: if self.pad {
-                p.composition.patch_bucket()
-            } else {
-                p.composition.patch_rows()
-            },
+            bucket: super::launched_rows(
+                self.pad,
+                false,
+                p.composition.patch_rows(),
+                p.composition.patch_bucket(),
+            ),
         };
         let armed_voxels = kernels_cuda::Pad {
             rows: p.composition.voxel_rows(),
