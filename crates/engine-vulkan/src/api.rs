@@ -230,27 +230,6 @@ fn patch_bytes(
     }
 }
 
-#[must_use]
-pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<poem_compiler::VoxelLadder> {
-    const DERIVED_VOXEL_CEILING: u32 = 65_536;
-    let declares_voxels = trace.values.iter().any(|decl| {
-        matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Voxels))
-    });
-    if !declares_voxels {
-        return None;
-    }
-    let max_voxels = budgets.max_voxels.unwrap_or(DERIVED_VOXEL_CEILING).max(1);
-    Some(poem_compiler::VoxelLadder {
-        max_voxels,
-        buckets: Vec::new(),
-        max_clips: budgets
-            .max_clips
-            .unwrap_or(budgets.max_lanes)
-            .clamp(1, max_voxels),
-    })
-}
-
 fn voxel_bytes(
     payload: &[f32],
     element: poem_ir::Dtype,
@@ -358,7 +337,12 @@ impl Engine for Vulkan {
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
         let patches = patch_ladder(&trace, &budgets);
-        let voxels = voxel_ladder(&trace, &budgets);
+        let voxels = poem_compiler::VoxelLadder::of(
+            &trace,
+            budgets.max_voxels,
+            budgets.max_clips,
+            budgets.max_lanes,
+        );
         let (disk_kv_budget, disk_kv_dir, seats) = (
             residency.disk_kv_budget,
             residency.disk_kv_dir.clone(),

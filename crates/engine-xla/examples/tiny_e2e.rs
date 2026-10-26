@@ -89,7 +89,7 @@ fn run(
         .and_then(|paging| engine_xla::store::pool_demand(&trace, paging))
         .map_err(|fault| format!("pool: {fault}"))?;
     let patches = engine_xla::api::patch_ladder(&trace, &budgets);
-    let voxels = engine_xla::dit::voxel_ladder(&trace, Some(4096), Some(4), budgets.max_lanes);
+    let voxels = poem_compiler::VoxelLadder::of(&trace, Some(4096), Some(4), budgets.max_lanes);
     let _device = engine_xla::bench::lock_device();
     let t0 = Instant::now();
     let mut shell = Shell::load_with(

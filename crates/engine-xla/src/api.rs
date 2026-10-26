@@ -341,7 +341,7 @@ impl Engine for Xla {
         };
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
         let patches = patch_ladder(&trace, &budgets);
-        let voxels = crate::dit::voxel_ladder(
+        let voxels = poem_compiler::VoxelLadder::of(
             &trace,
             budgets.max_voxels,
             budgets.max_clips,

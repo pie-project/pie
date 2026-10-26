@@ -423,7 +423,9 @@ mod tests {
             if let Some(ladder) = crate::api::patch_ladder(&folded, &load) {
                 budgets = budgets.with_patches(ladder);
             }
-            if let Some(ladder) = crate::api::voxel_ladder(&folded, &load) {
+            if let Some(ladder) =
+                poem_compiler::VoxelLadder::of(&folded, Some(4096), None, load.max_lanes)
+            {
                 budgets = budgets.with_voxels(ladder);
             }
             let Ok(compiled) = poem_compiler::compile_axes(&folded, &budgets, &profile) else {

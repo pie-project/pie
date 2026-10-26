@@ -157,7 +157,7 @@ fn one(
             .and_then(|paging| engine_cerebras::store::pool_demand(&trace, paging))
             .map_err(|fault| format!("pool: {fault}"))?;
     let patches = engine_cerebras::api::patch_ladder(&trace, &budgets);
-    let voxels = engine_cerebras::dit::voxel_ladder(&trace, Some(4096), Some(4), budgets.max_lanes);
+    let voxels = poem_compiler::VoxelLadder::of(&trace, Some(4096), Some(4), budgets.max_lanes);
     let contract = checkpoint::contract::ModelContract {
         alignment: 1,
         tensors: Vec::new(),

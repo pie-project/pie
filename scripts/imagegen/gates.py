@@ -104,7 +104,6 @@ verbose = false
 name = "gates-{name}"
 source = "{model}"
 device_memory_share = {mem}
-{voxels}
 
 [engine]
 type = "cuda"
@@ -142,18 +141,13 @@ def write_config(ctx, gate) -> str:
     scratch = os.path.join(ctx.out, gate.name, "scratch")
     os.makedirs(scratch, exist_ok=True)
     # A smaller card overrides what the roster states: PIE_GATES_ROWS (the
-    # slot ceiling), PIE_GATES_MEM (utilisation) and PIE_GATES_VOXELS (the
-    # VAE ladder, which is 21 GiB at the 65 536 default).
-    if os.environ.get("PIE_GATES_VOXELS"):
-        spec["voxels"] = int(os.environ["PIE_GATES_VOXELS"])
+    # slot ceiling) and PIE_GATES_MEM (utilisation).
     text = CONFIG.format(
         name=gate.name, port=port, scratch=scratch,
         model=spec.pop("model"),
         mem=float(os.environ.get("PIE_GATES_MEM") or spec.pop("mem", 0.90)),
         rows=int(os.environ.get("PIE_GATES_ROWS") or spec.pop("rows", 32768)),
         timeout=spec.pop("timeout", "600s"),
-        voxels=("max_voxels = {}".format(spec.pop("voxels"))
-                if "voxels" in spec else ""),
     )
     spec.pop("mem", None)
     spec.pop("rows", None)

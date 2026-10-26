@@ -27,6 +27,11 @@ impl Seat {
     }
 
     #[must_use]
+    pub fn payload_bytes(&self) -> u64 {
+        self.rows * self.row_bytes()
+    }
+
+    #[must_use]
     pub fn of(trace: &poem_ir::Trace, ladder: &VoxelLadder) -> Seat {
         let mut channels = 0u32;
         let mut widths: Vec<u32> = Vec::new();

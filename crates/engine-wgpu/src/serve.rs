@@ -464,6 +464,9 @@ impl Shell {
                 Some(ladder) => base.with_voxels(ladder),
             }
         };
+        let weights: u64 = crate::weights::plane_bytes(&boot.trace)?.iter().sum();
+        let room = device.working_set().saturating_sub(weights) / 2;
+        let budgets = poem_compiler::fit_voxels(&boot.trace, budgets, &profile, room);
         let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
 
         let facts = kv::probe(&boot.trace)?;
@@ -638,7 +641,7 @@ impl Shell {
             .nodes
             .iter()
             .any(|node| matches!(node.op, Operation::Gather(Gather::ScatterLiveRows { .. })));
-        let voxel_seat = boot.voxels.as_ref().map(|ladder| {
+        let voxel_seat = budgets.voxels.as_ref().map(|ladder| {
             let mut channels = 0u64;
             let mut dtype = None;
             for decl in &boot.trace.values {

@@ -396,7 +396,7 @@ impl Shell {
     }
 
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
-        let voxels = crate::dit::voxel_ladder(&boot.trace, None, None, boot.budget.max_lanes);
+        let voxels = poem_compiler::VoxelLadder::of(&boot.trace, None, None, boot.budget.max_lanes);
         Shell::load_with(boot, voxels)
     }
 
@@ -452,6 +452,17 @@ impl Shell {
             None => budgets,
             Some(ladder) => budgets.with_voxels(ladder),
         };
+        let weight_floor = boot.trace.params.iter().try_fold(0u64, |sum, p| {
+            crate::weights::plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
+        })?;
+        let room = device.memory().map_or(u64::MAX, |bytes| {
+            ((bytes as f64 * boot.memory_share) as u64)
+                .saturating_sub(weight_floor)
+                .saturating_sub(DEVICE_HEADROOM)
+                / 2
+        });
+        let budgets =
+            poem_compiler::fit_voxels(&boot.trace, budgets, &DeviceProfile::default(), room);
         let compiled = compile_axes(&boot.trace, &budgets, &DeviceProfile::default())?;
         let facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;

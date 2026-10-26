@@ -133,8 +133,7 @@ mask (`forward-pass.mask`) through four modes and checks its identities
 without a golden; `gates.py` runs that as `attn-classes`.
 
 On a card smaller than the roster assumes, `gates.py` takes `PIE_GATES_ROWS`,
-`PIE_GATES_MEM`, `PIE_GATES_VOXELS` (the VAE ladder asks 21 GiB at its 65 536
-default) and `PIE_GATES_T2I_BIG` / `PIE_GATES_T2I_SMALL` (the text-to-image gate's
+`PIE_GATES_MEM` and `PIE_GATES_T2I_BIG` / `PIE_GATES_T2I_SMALL` (the text-to-image gate's
 picture sizes). The mini-dit golden dir needs a `tokenizer.json` beside the weights
 before `pie model import` (any BPE tokenizer; the runtime insists on one).
 
