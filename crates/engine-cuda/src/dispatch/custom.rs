@@ -131,9 +131,12 @@ impl Run<'_> {
             ))
         })?;
         let landed: Vec<Tensor> = outs.iter().map(|&v| self.tensor(v)).collect();
-        let rows = landed.first().map_or(0, |t| t.rows);
+        // The rows a widest result lands (a small vector one a row lands
+        // fewer values a row than the row's).
+        let widest = landed.iter().max_by_key(|t| t.width);
+        let rows = widest.map_or(0, |t| t.rows);
         // A row cut into its heads: each part of it one of the kernel's rows.
-        let row_width = landed.first().map_or(width, |t| t.width);
+        let row_width = widest.map_or(width, |t| t.width);
         if width == 0 || row_width % width != 0 {
             return Err(broken(format!(
                 "the region's rows are {width} wide and it lands rows {row_width} wide"
