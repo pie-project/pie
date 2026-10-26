@@ -360,6 +360,15 @@ pub struct TokenInject {
     pub bytes: usize,
 }
 
+/// A lane's device-carried attention mask: the `bits` bool bytes at `src`
+/// packed into its row of the staged mask, `dst_off` bytes in.
+#[derive(Clone, Copy, Debug)]
+pub struct MaskInject {
+    pub dst_off: u64,
+    pub src: u64,
+    pub bits: u32,
+}
+
 /// The fewest device-carried token runs one gather launch takes; under it
 /// each is copied on its own.
 const GATHERED_INJECTS: usize = 4;
@@ -1107,6 +1116,7 @@ impl Inputs {
         slot: &SlotGuard,
         staged: &Staged,
         token_injects: &[TokenInject],
+        mask_injects: &[MaskInject],
     ) -> Result<Handles> {
         let Staged {
             rows,
@@ -1210,6 +1220,22 @@ impl Inputs {
         unsafe { store.stage_batch_from(stream, &spans)? };
 
         inject_tokens(device, inject_runs, base + at_tokens, token_injects)?;
+        if !mask_injects.is_empty() && mask_bytes.is_none() {
+            return Err(crate::error::Fault::program(
+                "inputs::commit",
+                "a lane's attention mask is carried on the device and the fire stages no mask \
+                 to pack it into",
+            ));
+        }
+        // Over the cleared rows just staged, in stream order.
+        for inject in mask_injects {
+            kernels_cuda::runtime::channel::gather_bits(
+                device.ctx(),
+                inject.src,
+                base + at_mask + inject.dst_off,
+                inject.bits,
+            )?;
+        }
 
         Ok(Handles {
             tokens: i32s(base + at_tokens, rows),

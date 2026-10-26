@@ -283,4 +283,23 @@ __global__ void mask_from_commit(const u32* const* __restrict__ commits, const i
     }
 }
 
+// Packs `bits` bool bytes at `src` (a channel's native cell) into the
+// little-endian bits at `dst` (a lane's row of the staged attention mask),
+// a byte a thread: the mask the device carries for a fire staged before
+// the fire that computes it has run.
+__global__ void gather_bits(const u8* __restrict__ src, u8* __restrict__ dst, u32 bits)
+{
+    const u32 bytes = (bits + 7u) / 8u;
+    for (u32 byte = blockIdx.x * blockDim.x + threadIdx.x; byte < bytes;
+         byte += gridDim.x * blockDim.x) {
+        u8 packed = 0;
+        for (u32 bit = 0; bit < 8u; ++bit) {
+            const u32 at = byte * 8u + bit;
+            if (at >= bits) break;
+            if (src[at] != 0u) packed |= static_cast<u8>(1u << bit);
+        }
+        dst[byte] = packed;
+    }
+}
+
 }  // namespace pie::channel
