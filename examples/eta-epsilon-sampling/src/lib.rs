@@ -200,7 +200,7 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.state(&[&ws], StateGeometry::folding())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let (token, kept, kmass) = truncation_step(logits, vocab, mode, temperature, epsilon, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
@@ -240,7 +240,7 @@ async fn main(input: Input) -> Result<Output> {
         fwd.epilogue(move || {
             // Takes and compute first, puts last (value-id discipline).
             let r = rng.take();
-            let logits = intrinsics::logits();
+            let logits = intrinsics::output(0, "logits");
             let (token, kept, kmass) =
                 truncation_step(logits, vocab, mode, temperature, epsilon, &r);
 

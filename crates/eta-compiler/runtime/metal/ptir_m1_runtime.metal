@@ -37,6 +37,14 @@ struct M1OpParams {
   uint sink_bytes;
 };
 
+// An output's slot: its lane's first element, how it is stored
+// (0 f32, 1 bf16, 2 i32) and its row pitch in elements (0: its width).
+struct M1OutputSeat {
+  ulong at;
+  uint storage;
+  uint stride;
+};
+
 struct M1ArgmaxCandidate {
   float value;
   uint index;
@@ -648,40 +656,7 @@ inline void ptir_m1_execute_part(
     return;
   }
   if (p.tag == 0xA0) {
-
-    if (p.intr == 7u) {
-
-      const device float* planes = reinterpret_cast<const device float*>(a0);
-      device float* score_out = reinterpret_cast<device float*>(o0);
-      for (uint i = tid; i < out0.len; i += nthreads) score_out[i] = planes[i];
-      return;
-    }
-    const device bfloat* logits =
-        reinterpret_cast<const device bfloat*>(a0) +
-        ulong(p.imm2) * p.imm;
-    if (p.intr == 6u) {
-      if (p.imm == 0u) {
-        if (tid == 0) m1_fault_op(status, 2u, p);
-        return;
-      }
-      for (uint row = tid; row < out0.len; row += nthreads) {
-        float best_value = -INFINITY;
-        uint best_index = 0u;
-        bool have = false;
-        for (uint column = 0; column < p.imm; ++column) {
-          const float value = float(logits[ulong(row) * p.imm + column]);
-          if (!isnan(value) &&
-              (!have || value > best_value ||
-               (value == best_value && column < best_index))) {
-            best_value = value;
-            best_index = column;
-            have = true;
-          }
-        }
-        m1_store_i(o0, row, int(have ? best_index : 0u));
-      }
-      return;
-    }
+    const device bfloat* logits = reinterpret_cast<const device bfloat*>(a0);
     device float* out_f = reinterpret_cast<device float*>(o0);
     if (nthreads > 1u) {
       for (uint i = tid; i < out0.len; i += nthreads) out_f[i] = float(logits[i]);

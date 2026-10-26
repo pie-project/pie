@@ -104,14 +104,14 @@ async fn pass(
     }
     fwd.epilogue(move || {
         if drafting {
-            out.put(reshape(intrinsics::mtp_drafts(shown), [shown]));
+            out.put(reshape(intrinsics::output(0, "mtp.drafts"), [shown]));
             return;
         }
         let Some((pick, proposals, chances)) = &sampled else {
-            out.put(reshape(reduce_argmax(intrinsics::logits()), [shown]));
+            out.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [shown]));
             return;
         };
-        let logits = reshape(intrinsics::logits(), [shown, pick.vocab]);
+        let logits = reshape(intrinsics::output(0, "logits"), [shown, pick.vocab]);
         let r = pick.noise.take();
         let (chance, draws) = point_rows(
             &(&logits / pick.temperature),

@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::op::{self, ChannelIndex, IntrinsicId, Op, WireField};
+use super::op::{self, ChannelIndex, Op, WireField};
 use super::read::{ReadError, Reader};
 use super::registry::{Port, Stage};
 use super::wire::{OpWire, predicate_tags};
@@ -243,7 +243,6 @@ pub fn encode_op(w: &mut Vec<u8>, op: &Op) {
                 put_u32(w, wire.lit_bits);
             }
             WireField::Name => put_u16(w, wire.name_idx),
-            WireField::Intrinsic => put_u16(w, wire.intr),
             WireField::Args => {
                 let rest = &wire.args[value..];
                 w.push(wire_len(rest.len(), "operand"));
@@ -516,16 +515,6 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
                 wire.lit_dtype = dtype;
             }
             WireField::Name => wire.name_idx = r.u16()?,
-            WireField::Intrinsic => {
-                let intr = r.u16()?;
-                if IntrinsicId::from_u16(intr).is_none() {
-                    return Err(ContainerDecodeError::UnknownTag {
-                        what: "intrinsic (low byte)",
-                        tag: intr.to_le_bytes()[0],
-                    });
-                }
-                wire.intr = intr;
-            }
             WireField::Args => {
                 let count = r.u8()? as usize;
                 wire.args.reserve(count);
@@ -584,7 +573,7 @@ mod tests {
     fn sample() -> TraceContainer {
         let vocab = 32u32;
         TraceContainer {
-            names: vec!["envelope_dot".to_string()],
+            names: vec!["logits".to_string()],
             channels: vec![
                 ChannelDecl {
                     shape: Shape::vector(1),
@@ -618,8 +607,8 @@ mod tests {
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
                 ops: vec![
-                    Op::IntrinsicVal {
-                        intr: IntrinsicId::Logits,
+                    Op::Output {
+                        index: 0,
                         lane: 0,
                         shape: Shape::matrix(1, vocab),
                         dtype: Dtype::F32,

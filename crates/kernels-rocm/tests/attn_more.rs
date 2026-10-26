@@ -644,33 +644,27 @@ fn score_capture_averages_the_observed_rows_mass() {
         },
     )
     .unwrap();
-    let (observe, lane_offset, plane_stride, plane, kv_max) = (3u32, 1u32, hq + 2, 1u32, 40u32);
-    let slab_rows = (lane_offset + n) * plane_stride;
+    let (observe, lane_offset, kv_max) = (3u32, 1u32, 40u32);
+    let rows = lane_offset + n;
     let mut scores = gpu.tensor(
-        &vec![9.0; (slab_rows * kv_max) as usize],
-        slab_rows,
-        kv_max,
+        &vec![9.0; (rows * hq * kv_max) as usize],
+        rows,
+        hq * kv_max,
         Dtype::F32,
     );
     let scale = 1.0 / (d as f32).sqrt();
-    // Each lane seated at its own block.
-    let seat_of = gpu.column(&(0..(lane_offset + n) as i32).collect::<Vec<_>>());
     kernels_rocm::attn::score::capture(
         &ctx,
         q,
         &built,
         &pool,
-        None,
         d,
         hk,
         scale,
         observe,
         lane_offset,
-        plane_stride,
-        plane,
         kv_max,
         &mut scores,
-        &seat_of,
     )
     .unwrap();
     let got = gpu.read(&scores);
@@ -701,8 +695,7 @@ fn score_capture_averages_the_observed_rows_mass() {
                     }
                 }
             }
-            let at = (((lane_offset as usize + r) * plane_stride as usize) + plane as usize + h)
-                * kv_max as usize;
+            let at = ((lane_offset as usize + r) * hq as usize + h) * kv_max as usize;
             let want: Vec<f32> = want.iter().map(|&x| x as f32).collect();
             close_abs(
                 &format!("score req {r} head {h}"),
@@ -712,9 +705,9 @@ fn score_capture_averages_the_observed_rows_mass() {
             );
         }
     }
-    // The planes this capture does not own keep what they held.
+    // The lanes before the capture's keep what they held.
     assert!(
-        got[..(lane_offset * plane_stride * kv_max) as usize]
+        got[..(lane_offset * hq * kv_max) as usize]
             .iter()
             .all(|&x| x == 9.0)
     );

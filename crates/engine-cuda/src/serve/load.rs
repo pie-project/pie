@@ -366,14 +366,7 @@ fn refit(
     let live = crate::device::elastic::budget_bytes(free, total, boot.memory_share);
     let facts = kv::probe(&boot.trace)?;
     let window = crate::store::window_of(&boot.trace)?;
-    let exports = Exports::of(&boot.trace, &compiled)?;
-    let out_row = match exports.out {
-        Some(out) => kv::width_of(&boot.trace, out)?.saturating_mul(4),
-        None => 0,
-    };
-    let score_values: Vec<poem_ir::ValueId> =
-        exports.scores.iter().map(|export| export.value).collect();
-    let score_heads = score_heads(&boot.trace, &exports);
+    let out_row = Exports::of(&boot.trace, &compiled)?.readout_row_bytes();
     let (asked_lanes, asked_tokens) = (boot.budget.max_lanes, boot.budget.max_tokens);
     let budget_at = |lanes: u32, tokens: u32| {
         let mut budget = boot.budget.clone();
@@ -440,12 +433,6 @@ fn refit(
             .saturating_add(crate::store::program_scratch_reserve(
                 lanes.min(device.device().num_sm),
                 out_row,
-            ))
-            .saturating_add(crate::scores::bytes_for(
-                &score_values,
-                score_heads,
-                engine.scoring_lanes.min(lanes),
-                boot.world,
             ))
             .saturating_add(
                 u64::from(lanes)
@@ -525,21 +512,6 @@ fn refit(
     let compiled = poem_compiler::compile_axes(&boot.trace, &budgets, profile)?;
     let planes = decoded_weight_planes(&boot.trace, &compiled, table);
     Ok((compiled, budgets, tiles_of(&planes, scoped)))
-}
-
-/// The query heads a score export carries per layer, zero when none is.
-fn score_heads(trace: &poem_ir::Trace, exports: &Exports) -> u32 {
-    exports
-        .scores
-        .first()
-        .and_then(|export| match &trace.values[export.value.0 as usize].ty {
-            poem_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
-                poem_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
-                _ => None,
-            }),
-            poem_ir::Ty::Struct(_) => None,
-        })
-        .unwrap_or(0)
 }
 
 impl Shell {
@@ -885,16 +857,6 @@ impl Shell {
 
         let exports = Exports::of(&boot.trace, &compiled)?;
 
-        let score_heads = score_heads(&boot.trace, &exports);
-        let score_values: Vec<poem_ir::ValueId> =
-            exports.scores.iter().map(|export| export.value).collect();
-        let scores = crate::scores::Scores::reserve(
-            &score_values,
-            score_heads,
-            engine.scoring_lanes.min(boot.budget.max_lanes),
-            boot.world,
-        )?;
-
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;
         pools.watch(airborne.clone());
@@ -957,7 +919,6 @@ impl Shell {
             staging,
             schedule_readers,
             adapters: crate::blob::Adapters::new(adapter_seats),
-            scores,
             held: vec![0; boot.slots as usize],
             readout_rows,
             exports,
@@ -1040,7 +1001,7 @@ impl Shell {
         shell.programs.set_flight(flight);
         let programs = crate::store::program_scratch_reserve(
             boot.budget.max_lanes.min(flight),
-            shell.out_width().map_or(0, |width| width.saturating_mul(4)),
+            shell.exports.readout_row_bytes(),
         );
         // A plane stored as codes and scales is decoded to bf16 before a
         // prefill's dense gemm, into one tile a stream. The tile is taken
@@ -1235,10 +1196,6 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
         inputs: shell.inputs.bytes(),
         buffers: shell.buffer_bytes(),
         readout: shell.readout_rows.bytes() as u64,
-        scores: shell
-            .scores
-            .as_ref()
-            .map_or(0, crate::scores::Scores::bytes),
         cache_rows: shell.pools.committed_bytes(),
         bodies: shell.cache.body_stats().census.bytes as u64,
         scratch: kernels_cuda::jit::Slabs::census()
@@ -1260,7 +1217,6 @@ struct Footprint {
     inputs: u64,
     buffers: u64,
     readout: u64,
-    scores: u64,
     cache_rows: u64,
     bodies: u64,
     scratch: u64,
@@ -1272,8 +1228,7 @@ impl core::fmt::Display for Footprint {
             f,
             "the device holds {} bytes, {} of them in use before this load began; this load \
              put down weights {}, activation arena {}, inputs {}, buffered activations {}, \
-             readout rows {}, attention scores {}, cache rows {}, graph bodies {}, kernel \
-             scratch {}",
+             readout rows {}, cache rows {}, graph bodies {}, kernel scratch {}",
             self.total,
             self.before,
             self.weights,
@@ -1281,7 +1236,6 @@ impl core::fmt::Display for Footprint {
             self.inputs,
             self.buffers,
             self.readout,
-            self.scores,
             self.cache_rows,
             self.bodies,
             self.scratch,

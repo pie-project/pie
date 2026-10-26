@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use poem::generative::ScheduleKind;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, Operation, Platform, RaggedMask, Request, RopeForm,
-    RuntimeInput, Trace, Ty, seam,
+    RuntimeInput, Trace, Ty,
 };
 use poem_ir::InputAxis;
 
@@ -46,8 +46,8 @@ fn is_flagship(deployment: &str) -> bool {
 }
 
 fn seams(plan: &Trace) -> BTreeMap<&str, usize> {
-    plan.seams.iter().fold(BTreeMap::new(), |mut acc, s| {
-        *acc.entry(s.seam.as_str()).or_default() += 1;
+    plan.outputs.iter().fold(BTreeMap::new(), |mut acc, s| {
+        *acc.entry(s.name.as_str()).or_default() += 1;
         acc
     })
 }
@@ -56,7 +56,7 @@ fn seams(plan: &Trace) -> BTreeMap<&str, usize> {
 fn the_minimax_h3_rows_bake_every_case() {
     the_video_and_reference_latents_are_patched_in_the_graph();
     every_row_traces_on_every_platform_with_the_encoder_it_declares();
-    the_seams_are_the_two_float_readouts_and_never_logits();
+    the_outputs_are_float_readouts_and_never_logits();
     every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve();
     one_joint_read_per_block_and_one_lane_read_per_refiner();
     the_trunk_turns_three_neox_axes_and_the_refiner_turns_nothing();
@@ -131,24 +131,29 @@ fn every_row_traces_on_every_platform_with_the_encoder_it_declares() {
     }
 }
 
-fn the_seams_are_the_two_float_readouts_and_never_logits() {
+fn the_outputs_are_float_readouts_and_never_logits() {
     for deployment in ROWS {
         let plan = trace(deployment, Platform::Cuda);
         let found = seams(&plan);
         assert!(
-            !found.contains_key(seam::OUT.name),
+            !found.contains_key("logits"),
             "`{deployment}`: no reading of this family has logits, and it planted `{}`",
-            seam::OUT.name
+            "logits"
         );
         assert_eq!(
-            found.get(seam::VELOCITY.name),
+            found.get("velocity"),
             Some(&1),
             "`{deployment}`: one velocity planting (the video head); found {found:?}"
         );
         assert_eq!(
-            found.get(seam::HIDDEN.name),
-            Some(&if is_flagship(deployment) { 3 } else { 2 }),
+            found.get("hidden"),
+            Some(&if is_flagship(deployment) { 2 } else { 1 }),
             "`{deployment}`: hidden plantings; found {found:?}"
+        );
+        assert_eq!(
+            found.get("audio.velocity"),
+            Some(&1),
+            "`{deployment}`: the audio head's velocity; found {found:?}"
         );
     }
 }
@@ -570,11 +575,11 @@ fn the_video_and_reference_latents_are_patched_in_the_graph() {
             "`{deployment}`: the video velocity patched back out"
         );
         let velocity = plan
-            .seams
+            .outputs
             .iter()
-            .find(|s| s.seam == seam::VELOCITY.name)
+            .find(|s| s.name == "velocity")
             .expect("a velocity seam")
-            .values[0];
+            .value;
         assert!(
             matches!(&plan.values[velocity.0 as usize].ty,
                 Ty::Tensor { shape, .. } if shape.as_slice()

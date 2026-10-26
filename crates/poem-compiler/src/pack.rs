@@ -13,8 +13,9 @@
 //! dataflow cuts, the joined weight then held whole. What reads their
 //! results says how: two a gated unit reads as its gate and its up become
 //! one packed unit; legs a concat reads side by side (GDN's beta and alpha)
-//! are the one product the concat was; legs a seam names, all of those left
-//! (GDN's qkv and z), are split back after the product the seam then marks.
+//! are the one product the concat was; legs left that cut by more than one
+//! segment, when they are all those left (GDN's qkv and z), are split back
+//! after the one product, its rows cut after it.
 //! The rest, each of one segment and stating its heads as the others do,
 //! join by their activation alone: three whose last two are as wide (q, k,
 //! v) a split into three, two a split into two, more the last peeled off by
@@ -142,9 +143,6 @@ struct Group {
     form: Form,
     /// The axis the weights join along: their rows, a bank's axis 1.
     axis: usize,
-    /// The seam over the legs' results, in order, which marks the joined
-    /// one instead.
-    seam: Option<usize>,
 }
 
 fn reads(trace: &Trace) -> Vec<u32> {
@@ -157,8 +155,8 @@ fn reads(trace: &Trace) -> Vec<u32> {
             count[v.0 as usize] += 1;
         }
     }
-    for seam in &trace.seams {
-        for v in &seam.values {
+    for output in &trace.outputs {
+        for v in output.values() {
             count[v.0 as usize] += 1;
         }
     }
@@ -249,10 +247,11 @@ fn biased(trace: &Trace, shape: &[Param], read: &[u32], y: ValueId) -> Option<Bi
 }
 
 /// The legs of one key, by what reads their results: a gated unit's gate
-/// and up and a concat's pieces join as they read them, and a seam over
-/// every leg left as it names them; the rest (each of one segment) join by
-/// their activation alone, two, three whose last two are as wide, or more. Each is the legs' indices in
-/// the order their rows join, its form and the seam it moves.
+/// and up and a concat's pieces join as they read them, and every leg left,
+/// when one cuts by more than one segment, in the order they are traced; the
+/// rest (each of one segment) join by their activation alone, two, three
+/// whose last two are as wide, or more. Each is the legs' indices in the
+/// order their rows join, and its form.
 fn subgroups(
     trace: &Trace,
     read: &[u32],
@@ -260,7 +259,7 @@ fn subgroups(
     single: &[bool],
     headed: &[bool],
     widths: &[u64],
-) -> Vec<(Vec<usize>, Form, Option<usize>)> {
+) -> Vec<(Vec<usize>, Form)> {
     let index: BTreeMap<ValueId, usize> = ys.iter().enumerate().map(|(i, y)| (*y, i)).collect();
     let mut left: BTreeSet<usize> = (0..ys.len()).collect();
     let mut out = Vec::new();
@@ -281,7 +280,7 @@ fn subgroups(
             }) if read[g.0 as usize] == 1 && read[u.0 as usize] == 1 => {
                 if let Some(legs) = take(&left, &[*g, *u]) {
                     left.retain(|i| !legs.contains(i));
-                    out.push((legs, Form::Glu { at }, None));
+                    out.push((legs, Form::Glu { at }));
                 }
             }
             Operation::Gather(Gather::ConcatCols { xs, .. })
@@ -289,22 +288,21 @@ fn subgroups(
             {
                 if let Some(legs) = take(&left, xs) {
                     left.retain(|i| !legs.contains(i));
-                    out.push((legs, Form::Concat { at }, None));
+                    out.push((legs, Form::Concat { at }));
                 }
             }
             _ => {}
         }
     }
-    // A seam over every leg left, in the order it names them, marks their
-    // joined result (a projection's rows cut after it, as GDN's qkv and z).
-    for (s, seam) in trace.seams.iter().enumerate() {
-        if let Some(legs) = take(&left, &seam.values)
-            && legs.len() == left.len()
-            && splits(&legs.iter().map(|i| widths[*i]).collect::<Vec<_>>())
-        {
-            left.retain(|i| !legs.contains(i));
-            out.push((legs, Form::Split, Some(s)));
-        }
+    // Every leg left, when one cuts by more than one segment, is one
+    // projection's rows cut after it (GDN's qkv and z).
+    let all: Vec<usize> = left.iter().copied().collect();
+    if all.len() >= 2
+        && all.iter().any(|i| !single[*i])
+        && splits(&all.iter().map(|i| widths[*i]).collect::<Vec<_>>())
+    {
+        left.clear();
+        out.push((all, Form::Split));
     }
     // The rest join with the rest that state their heads as they do.
     for heads in [false, true] {
@@ -318,7 +316,7 @@ fn subgroups(
             _ => rest.len() > 3 && splits(&rest_widths),
         };
         if joins {
-            out.push((rest, Form::Split, None));
+            out.push((rest, Form::Split));
         }
     }
     out
@@ -524,7 +522,6 @@ fn groups(trace: &Trace, shape: &[Param]) -> Vec<Group> {
                 nodes,
                 form: Form::Glu { at: glu },
                 axis: 1,
-                seam: None,
             });
             continue;
         }
@@ -566,7 +563,7 @@ fn groups(trace: &Trace, shape: &[Param]) -> Vec<Group> {
             .iter()
             .map(|p| headed(cut_as(*p)))
             .collect();
-        for (legs, form, seam) in subgroups(trace, &read, &ys, &single, &heads, &all_widths) {
+        for (legs, form) in subgroups(trace, &read, &ys, &single, &heads, &all_widths) {
             let params: Vec<u32> = legs.iter().map(|i| all_params[*i]).collect();
             let widths: Vec<u64> = legs.iter().map(|i| all_widths[*i]).collect();
             let biases: Option<Vec<Biased>> = all_biases
@@ -594,7 +591,6 @@ fn groups(trace: &Trace, shape: &[Param]) -> Vec<Group> {
                 planes,
                 widths,
                 form,
-                seam,
             });
         }
     }
@@ -965,9 +961,6 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
             }
             _ => y,
         };
-        if let Some(s) = group.seam {
-            trace.seams[s].values = vec![y];
-        }
         match group.form {
             Form::Glu { at } => {
                 if let Operation::Linear(Linear::Glu {
@@ -1006,8 +999,8 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
         for node in &mut trace.nodes {
             node.op = crate::tree::remap(&node.op, &to);
         }
-        for seam in &mut trace.seams {
-            for v in &mut seam.values {
+        for output in &mut trace.outputs {
+            for v in output.values_mut() {
                 *v = to(*v);
             }
         }
@@ -1102,8 +1095,8 @@ fn compact(mut trace: Trace) -> Trace {
         node.op.outputs(&mut ids);
     }
     live.extend(ids.drain(..));
-    for seam in &trace.seams {
-        live.extend(seam.values.iter().copied());
+    for output in &trace.outputs {
+        live.extend(output.values());
     }
     // A merge's arms are live with it; inputs and caches are kept as they are.
     for (v, decl) in trace.values.iter().enumerate() {
@@ -1139,8 +1132,8 @@ fn compact(mut trace: Trace) -> Trace {
     for node in &mut trace.nodes {
         node.op = crate::tree::remap(&node.op, &at);
     }
-    for seam in &mut trace.seams {
-        for v in &mut seam.values {
+    for output in &mut trace.outputs {
+        for v in output.values_mut() {
             *v = at(*v);
         }
     }

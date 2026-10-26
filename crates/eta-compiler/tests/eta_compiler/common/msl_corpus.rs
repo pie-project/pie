@@ -2,8 +2,8 @@
 
 use eta_compiler::plan::{CompiledStage, compile_bound, debug_stage_plan};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind, Stage};
+use eta_ir::op::Op;
+use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Stage};
 use eta_ir::types::{Dtype, RngKind, Shape};
 use eta_ir::validate::bind;
 
@@ -53,23 +53,31 @@ pub fn golden_container(name: &str) -> TraceContainer {
     eta_ir::container::decode(&unhex(line)).unwrap_or_else(|e| panic!("{name}: {e:?}"))
 }
 
+/// The model a corpus program is bound against: one lane reading its
+/// logits, a draft head's (where `drafts`), a hidden row and the scores.
 #[derive(Clone, Copy, Debug)]
 pub struct Served {
     pub vocab: u32,
-    pub graph: Graph,
+    pub drafts: bool,
     pub caps: EngineCaps,
+}
+
+fn decl(name: &str, axis: Axis, width: u32, dtype: Dtype, readout: bool) -> OutputDecl {
+    OutputDecl {
+        name: name.into(),
+        axis,
+        width,
+        dtype,
+        layers: 0,
+        readout,
+    }
 }
 
 impl Served {
     pub fn of(vocab: u32) -> Served {
         Served {
             vocab,
-            graph: Graph {
-                num_layers: 2,
-                mtp_logits: true,
-                mtp_depth: 1,
-                attn_score: true,
-            },
+            drafts: true,
             caps: EngineCaps {
                 lora: true,
                 attn_page_mask: true,
@@ -77,15 +85,24 @@ impl Served {
         }
     }
 
+    pub fn outputs(&self) -> Vec<Vec<OutputDecl>> {
+        let mut lane = vec![
+            decl("logits", Axis::Row, self.vocab, Dtype::F32, true),
+            decl("hidden", Axis::Row, 8, Dtype::F32, false),
+            decl("attn.scores", Axis::Lane, 2048, Dtype::F32, false),
+        ];
+        if self.drafts {
+            lane.push(decl("mtp.logits", Axis::Row, self.vocab, Dtype::F32, true));
+            lane.push(decl("mtp.drafts", Axis::Row, 3, Dtype::I32, true));
+        }
+        vec![lane]
+    }
+
     pub fn bind(
         &self,
         container: TraceContainer,
     ) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
-        let logits = Readout {
-            kind: ReadoutKind::Logits,
-            width: self.vocab,
-        };
-        bind(container, vec![Some(logits)], self.graph, self.caps)
+        bind(container, self.outputs(), self.caps)
     }
 }
 
@@ -102,10 +119,7 @@ pub fn golden_served(name: &str) -> Served {
         | "neg_t10_nonreplayable" => Served::of(32),
         "staged_dispatch" => Served::of(4),
         "neg_model_gated_missing" => Served {
-            graph: Graph {
-                mtp_logits: false,
-                ..Served::of(32).graph
-            },
+            drafts: false,
             ..Served::of(32)
         },
         _ => Served::of(8),
@@ -176,30 +190,37 @@ pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, Served)> {
         ),
         (
             "synthetic_mtp_drafts",
-            epilogue(
-                vec![chan(Shape::vector(3), Dtype::I32, HostRole::Reader, false)],
-                vec![
-                    Op::IntrinsicVal {
-                        intr: IntrinsicId::MtpDrafts,
-                        lane: 0,
-                        shape: Shape::vector(3),
-                        dtype: Dtype::I32,
-                    },
-                    Op::IntrinsicVal {
-                        intr: IntrinsicId::MtpLogits,
-                        lane: 0,
-                        shape: Shape::matrix(3, 8),
-                        dtype: Dtype::F32,
-                    },
-                    Op::ReduceArgmax(1),
-                    Op::Cast {
-                        value: 2,
-                        dtype: Dtype::I32,
-                    },
-                    Op::Add(0, 3),
-                    Op::ChanPut { chan: 0, value: 4 },
-                ],
-            ),
+            TraceContainer {
+                names: vec!["mtp.drafts".into(), "mtp.logits".into()],
+                ..epilogue(
+                    vec![chan(Shape::vector(3), Dtype::I32, HostRole::Reader, false)],
+                    vec![
+                        Op::Output {
+                            index: 0,
+                            lane: 0,
+                            shape: Shape::matrix(1, 3),
+                            dtype: Dtype::I32,
+                        },
+                        Op::Reshape {
+                            value: 0,
+                            shape: Shape::vector(3),
+                        },
+                        Op::Output {
+                            index: 1,
+                            lane: 0,
+                            shape: Shape::matrix(3, 8),
+                            dtype: Dtype::F32,
+                        },
+                        Op::ReduceArgmax(2),
+                        Op::Cast {
+                            value: 3,
+                            dtype: Dtype::I32,
+                        },
+                        Op::Add(1, 4),
+                        Op::ChanPut { chan: 0, value: 5 },
+                    ],
+                )
+            },
             small,
         ),
         (
@@ -465,60 +486,44 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
         ),
         (
             "extended_hidden",
-            staged(
-                Stage::Epilogue,
-                vec![write(1)],
-                vec![
-                    Op::IntrinsicVal {
-                        intr: IntrinsicId::Hidden,
-                        lane: 0,
-                        shape: Shape::matrix(1, 8),
-                        dtype: Dtype::F32,
-                    },
-                    Op::ReduceSum(0),
-                    Op::ChanPut { chan: 0, value: 1 },
-                ],
-            ),
-            small,
-        ),
-        (
-            "extended_on_attn",
-            staged(
-                Stage::OnAttn,
-                vec![chan(
-                    Shape::new(&[]).unwrap(),
-                    Dtype::U32,
-                    HostRole::Reader,
-                    false,
-                )],
-                vec![
-                    Op::IntrinsicVal {
-                        intr: IntrinsicId::Layer,
-                        lane: 0,
-                        shape: Shape::new(&[]).unwrap(),
-                        dtype: Dtype::U32,
-                    },
-                    Op::ChanPut { chan: 0, value: 0 },
-                ],
-            ),
+            TraceContainer {
+                names: vec!["hidden".into()],
+                ..staged(
+                    Stage::Epilogue,
+                    vec![write(1)],
+                    vec![
+                        Op::Output {
+                            index: 0,
+                            lane: 0,
+                            shape: Shape::matrix(1, 8),
+                            dtype: Dtype::F32,
+                        },
+                        Op::ReduceSum(0),
+                        Op::ChanPut { chan: 0, value: 1 },
+                    ],
+                )
+            },
             small,
         ),
         (
             "extended_attn_score",
-            staged(
-                Stage::Epilogue,
-                vec![write(1)],
-                vec![
-                    Op::IntrinsicVal {
-                        intr: IntrinsicId::AttnScore,
-                        lane: 0,
-                        shape: Shape::matrix(1, eta_ir::registry::ATTN_SCORE_KV_MAX),
-                        dtype: Dtype::F32,
-                    },
-                    Op::ReduceSum(0),
-                    Op::ChanPut { chan: 0, value: 1 },
-                ],
-            ),
+            TraceContainer {
+                names: vec!["attn.scores".into()],
+                ..staged(
+                    Stage::Epilogue,
+                    vec![write(1)],
+                    vec![
+                        Op::Output {
+                            index: 0,
+                            lane: 0,
+                            shape: Shape::matrix(1, 2048),
+                            dtype: Dtype::F32,
+                        },
+                        Op::ReduceSum(0),
+                        Op::ChanPut { chan: 0, value: 1 },
+                    ],
+                )
+            },
             attn,
         ),
     ]

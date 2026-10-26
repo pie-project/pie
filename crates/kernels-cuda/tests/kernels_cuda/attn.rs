@@ -8,6 +8,7 @@ mod mla_lse;
 mod mla_prep;
 mod mla_sparse;
 mod ragged;
+mod score;
 mod selected;
 mod voxel;
 mod voxel_segments;

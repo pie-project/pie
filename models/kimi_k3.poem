@@ -609,7 +609,6 @@ def run_kda(x, inputs, k):
     qkv = ops.gather.concat_cols([ops.linear.matmul(x, k.q), ops.linear.matmul(x, k.k), ops.linear.matmul(x, k.v)])
     f = ops.linear.matmul(ops.linear.matmul(x, k.f_a), k.f_b)
     b = ops.linear.matmul(x, k.b)
-    seam.at(seam.RECURRENT, [qkv])
 
     one = fact.single_token()
     step = ops.ssm.kda(
@@ -675,7 +674,6 @@ def attend(x, q_nope, q_pe, pages, plan, a, selection = None):
 
     if a.gate != None:
         o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
-    seam.at(seam.ATTN_OUT, [o])
     return ops.linear.matmul(o, a.o_proj)
 
 def arm(decode, q_nope, plan, q_pe, selection, pages, a):
@@ -748,7 +746,7 @@ def forward(m, inputs):
         y = ops.elemwise.res_blend(y, blocks, r.norm, r.norm_eps, r.proj)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    return ops.linear.lm_head(x, m.head)
+    output("logits", ops.linear.lm_head(x, m.head))
 
 def mlp(x, f):
     if not f.routed:
@@ -789,8 +787,7 @@ def mlp(x, f):
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
 def mla_mixer(x, inputs, plan, a):
-    """Latent attention over every cached key, its rope part unrotated and
-    no ATTN_QV seam marked."""
+    """Latent attention over every cached key, its rope part unrotated."""
     pages = inputs.kv(a.kv)
     write_page = inputs.write_page(a.kv)
     write_offset = inputs.write_offset(a.kv)

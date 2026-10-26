@@ -2,7 +2,7 @@ use crate::msl_corpus::Served;
 use eta_compiler::codegen::cuda::emit_fused_region;
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::Stage;
 use eta_ir::types::RngKind;
 use eta_ir::types::{Dtype, Literal, Shape};
@@ -37,8 +37,8 @@ fn subject() -> TraceContainer {
             value: 0,
             shape: Shape::new(&[]).unwrap(),
         },
-        Op::IntrinsicVal {
-            intr: IntrinsicId::Logits,
+        Op::Output {
+            index: 0,
             lane: 0,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
@@ -77,7 +77,7 @@ fn subject() -> TraceContainer {
         Op::ChanPut { chan: 4, value: 14 },
     ];
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".into()],
         channels: vec![
             scalar_writer(),
             rows_out(Dtype::I32),
@@ -161,8 +161,8 @@ fn a_reshaped_row_vector_broadcasts_through_the_stream() {
             value: 0,
             shape: Shape::new(&[]).unwrap(),
         },
-        Op::IntrinsicVal {
-            intr: IntrinsicId::Logits,
+        Op::Output {
+            index: 0,
             lane: 0,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
@@ -183,7 +183,7 @@ fn a_reshaped_row_vector_broadcasts_through_the_stream() {
         Op::ChanPut { chan: 1, value: 9 },
     ];
     let container = TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".into()],
         channels: vec![scalar_writer(), rows_out(Dtype::F32)],
         ports: Vec::new(),
         stages: vec![StageProgram {
@@ -231,8 +231,8 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
             value: 0,
             shape: Shape::new(&[]).unwrap(),
         },
-        Op::IntrinsicVal {
-            intr: IntrinsicId::Logits,
+        Op::Output {
+            index: 0,
             lane: 0,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
@@ -262,7 +262,7 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
         seeded: false,
     };
     let container = TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".into()],
         channels: vec![scalar_writer(), rows_out(Dtype::F32), taps_out],
         ports: Vec::new(),
         stages: vec![StageProgram {

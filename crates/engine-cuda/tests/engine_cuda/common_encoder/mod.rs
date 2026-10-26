@@ -20,8 +20,7 @@ use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Value, Weight, ops, seam,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Weight, ops, trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -40,7 +39,7 @@ impl ForwardHybrid for EncoderLayer {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -75,8 +74,7 @@ impl ForwardHybrid for EncoderLayer {
         let o = ops::gather::unpack_rows(&o, &perm);
         let y = ops::linear::matmul(&o, &w("o", WIDTH, HEADS * HEAD_DIM));
         let out = ops::elemwise::residual_add(&x, &y);
-        seam::at(seam::HIDDEN, &[&out]);
-        out
+        poem::output("hidden", &out, None);
     }
 }
 
@@ -346,15 +344,15 @@ impl Rig {
         }
     }
 
-    pub fn reads_out(&self, kind: poem_ir::ReadoutKind) -> Option<u32> {
+    pub fn reads_out(&self, name: &str) -> Option<u32> {
         self.loaded
             .caps
             .classes
             .classes
             .iter()
-            .filter_map(|class| class.readout)
-            .find(|readout| readout.kind == kind)
-            .map(|readout| readout.width)
+            .flat_map(|class| &class.outputs)
+            .find(|decl| decl.name == name)
+            .map(|decl| decl.width)
     }
 
     fn program(&mut self, rows: u32) -> ProgramId {

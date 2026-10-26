@@ -65,7 +65,7 @@ export class Frames {
   /**
   * Build a handle from a channel's committed cell, WITHOUT the pixels
   * entering linear memory. This is the VAE road: a
-  * VAE decode pass's epilogue reads `intrinsics::pixels()` and puts
+  * VAE decode pass's epilogue reads its pixels output and puts
   * the plane on `ch`; this takes that cell host-side, the way
   * `channel.take` would, and turns it into frames.
   * 

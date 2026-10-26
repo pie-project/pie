@@ -515,10 +515,9 @@ def forward(m, inputs):
     video, audio = m.connectors
     refine(reading("refine.video"), video, m)
     refine(reading("refine.audio"), audio, m)
-    velocity = denoise(reading("denoise"), m)
+    denoise(reading("denoise"), m)
     if m.vae != None:
         vae_decode(reading("vae.decode"), m.vae)
-    return velocity
 
 def rms(x):
     return ops.elemwise.rmsnorm_no_scale(x, x.width(), NORM_EPS)
@@ -725,7 +724,7 @@ def denoise(arm, m):
         ops.conv.unpatchify(vv, vid.token_grid(PATCH), PATCH, vid.grid()),
         ops.conv.unpatchify(va, aud.token_grid(PATCH), PATCH, aud.grid()),
     ])
-    seam.at(seam.VELOCITY, [velocity])
+    output("velocity", velocity)
     return velocity
 
 def text_positions(arm, m):
@@ -759,7 +758,7 @@ def refine(arm, conn, m):
 
     h = arm.fold_layers(conn.blocks, h, step)
     out = rms(h)
-    seam.at(seam.HIDDEN, [out])
+    output("hidden", out)
 
 def vconv(x, g, c):
     shape = conv3d(k = [3, 3, 3], stride = [1, 1, 1], pad = [1, 1, 1], pad_back = [1, 1, 1], time_pad = "replicate")
@@ -791,5 +790,5 @@ def vae_decode(arm, vae):
     x = norm_silu(x)
     y, gy = vconv(x, g, vae.conv_out)
     pixels, gp = ops.conv.pixel_shuffle(y, gy, [1, vae.patch, vae.patch])
-    seam.at(seam.PIXELS, [pixels, gp])
+    output("pixels", pixels, grid = gp)
     return pixels

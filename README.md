@@ -72,7 +72,7 @@ async def main(input: dict) -> dict:
         fwd = ForwardPass()
         fwd.embed(tokens[done:])                        # the new tokens
         fwd.bind_state(ws, ws.geometry(done, len(tokens)))
-        out = fwd.epilogue(lambda: reduce_argmax(intrinsics.logits()))  # runs on the device
+        out = fwd.epilogue(lambda: reduce_argmax(intrinsics.output(0, "logits")))  # runs on the device
         pipe.submit(fwd)
         done = len(tokens)
         tokens.append(await out)

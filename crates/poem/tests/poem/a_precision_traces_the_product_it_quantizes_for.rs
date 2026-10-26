@@ -1,5 +1,5 @@
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Precision, Value, Weight, ops, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Precision, Weight, ops, trace_hybrid,
 };
 use poem_ir::{ActQuant, Def, Linear, Operation, Trace};
 
@@ -14,11 +14,11 @@ impl ForwardHybrid for OneProduct {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let table = Weight::sym("embed", [u64::from(VOCAB), HIDDEN], Dtype::Bf16);
         let x = ops::gather::embed(&inputs.tokens(), &table, VOCAB);
         let w = Weight::at("proj", [384, HIDDEN], self.0);
-        ops::linear::matmul(&x, &w)
+        poem::output("logits", &ops::linear::matmul(&x, &w), None);
     }
 }
 

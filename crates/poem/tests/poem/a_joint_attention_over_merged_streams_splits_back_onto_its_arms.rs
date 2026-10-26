@@ -1,7 +1,7 @@
 use poem::fact;
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Value, Weight, ops,
-    seam, trace_hybrid,
+    trace_hybrid,
 };
 use poem_ir::{Attn, Def, Elemwise, GeomKind, Guard, Operation, RuntimeInput, Selection};
 
@@ -14,7 +14,7 @@ impl ForwardHybrid for DoubleBlock {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs
             .recorder()
             .declare_switch("stream", &["text", "image", "video", "audio"]);
@@ -59,8 +59,7 @@ impl ForwardHybrid for DoubleBlock {
         let r_txt = ops::elemwise::residual_add(&y_txt, &x_txt);
         let r_img = ops::elemwise::residual_add(&y_img, &x_img);
         let out = Value::merge(vec![r_txt, r_img]);
-        seam::at(seam::VELOCITY, &[&out]);
-        out
+        poem::output("velocity", &out, None);
     }
 }
 

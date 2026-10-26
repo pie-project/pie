@@ -34,10 +34,6 @@ pub struct Rule {
     shapes: Vec<Shape>,
     when: fn(&Match) -> bool,
     replace: fn(&Match) -> Fused,
-    /// Whether a seam no shell reads (a marker such as `attn.qv`, not one of
-    /// `EXPORT_SEAMS`) may hold a value this rule folds away. Every rule
-    /// keeps every seam's values but the ones that say otherwise.
-    through_markers: bool,
 }
 
 impl Rule {
@@ -62,15 +58,7 @@ impl Rule {
             shapes,
             when: |_| true,
             replace,
-            through_markers: false,
         }
-    }
-
-    /// A marker seam (one no shell reads) does not keep this rule from
-    /// folding the value it marks.
-    fn through_markers(mut self) -> Rule {
-        self.through_markers = true;
-        self
     }
 
     /// The rule forms its op's `form`; it runs at that form's place.

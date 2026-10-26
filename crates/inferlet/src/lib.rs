@@ -52,11 +52,11 @@ pub mod latent;
 
 pub mod model {
     pub use crate::pie::inferlet::model::{
-        BlockDrafter, InputAxis, InputDecl, LaneDecl, LatentSpace, Readout, ReadoutKind, RowCount,
+        BlockDrafter, InputAxis, InputDecl, LaneDecl, LatentSpace, OutputDecl, RowCount,
         ScheduleFact, ScheduleKind, SwitchDecl, architecture, channel_capacity,
         default_system_speculation, draft_block, frame_size, kv_page_size, lane, latent,
-        max_latent_rows, max_readout_rows, mtp_depth, name, output_vocab_size, rs_state_size,
-        run_ahead_window, schedule, submit_deadline_us, switches,
+        max_latent_rows, name, output_vocab_size, rs_state_size, run_ahead_window, schedule,
+        submit_deadline_us, switches,
     };
 
     /// What a lane under these `(name, value)` switches binds.

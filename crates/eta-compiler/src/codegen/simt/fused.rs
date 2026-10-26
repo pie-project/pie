@@ -5,11 +5,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 use eta_ir::Dtype;
-use eta_ir::op::{intrinsic_tags, tags};
+use eta_ir::op::tags;
 
 use crate::plan::{CompiledStage, Dimension, LANE_TABLE_ABI_VERSION, Region};
 
-use crate::codegen::op_view::{OpView, result_bases};
+use crate::codegen::op_view::{OpView, output_slot, reads_readout_plane, result_bases};
 use crate::codegen::slots::Slots;
 
 use super::runtime::{Dialect, runtime_source};
@@ -20,8 +20,8 @@ pub(super) const PROLOGUE: &str = include_str!("../../../runtime/cuda/fused_bloc
 pub(super) const SIGNATURE: &str = include_str!("../../../runtime/cuda/fused_block1.cuh");
 pub(super) const PREAMBLE: &str = include_str!("../../../runtime/cuda/fused_block2.cuh");
 
-pub(crate) fn intrinsic_pitch(stage: &CompiledStage) -> u32 {
-    eta_ir::op::intrinsic_pitch(&stage.normalized.ops)
+pub(crate) fn output_pitch(stage: &CompiledStage) -> u32 {
+    eta_ir::op::output_pitch(&stage.normalized.ops)
 }
 
 fn parallel_elementwise(tag: u8) -> bool {
@@ -260,9 +260,7 @@ pub(crate) fn analyze_direct_argmax(
                 value = op.args[0];
                 continue;
             }
-            if op.tag != tags::INTRINSIC_VAL
-                || (op.intr != intrinsic_tags::LOGITS && op.intr != intrinsic_tags::MTP_LOGITS)
-            {
+            if !reads_readout_plane(stage, op, bases[producer as usize]) {
                 break;
             }
             let source_shape =
@@ -283,7 +281,7 @@ pub(crate) fn analyze_direct_argmax(
             if let Some((state, divisor, noise)) = gumbel {
                 if exact_shape || runtime_single_row {
                     analysis.gumbel[node] = Some(GumbelChain {
-                        intrinsic: op.intr,
+                        intrinsic: output_slot(stage, op),
                         state,
                         divisor,
                         noise,
@@ -295,7 +293,7 @@ pub(crate) fn analyze_direct_argmax(
                 break;
             }
             if exact_shape || runtime_single_row {
-                analysis.intrinsic[node] = op.intr;
+                analysis.intrinsic[node] = output_slot(stage, op);
                 analysis.source_value[node] = bases[producer as usize];
                 analysis.requires_single_row[node] = u8::from(runtime_single_row);
                 for &skipped in &chain {
@@ -327,7 +325,7 @@ pub(crate) fn analyze_direct_topk(stage: &CompiledStage) -> Vec<Option<TopKDirec
             )?;
             let producer = direct.intrinsic.index();
             Some(TopKDirect {
-                intrinsic: ops[producer].intr,
+                intrinsic: output_slot(stage, &ops[producer]),
                 node: producer as u32,
                 divisor: direct.divisor,
             })
@@ -626,11 +624,11 @@ pub fn emit_fused_region(
                       channel.pending_cell : channel.committed_cell)"
                     .to_string();
             }
-        } else if op.tag == tags::INTRINSIC_VAL {
+        } else if op.tag == tags::OUTPUT {
             let _ = writeln!(
                 source,
                 "    const m1_u32 intrinsic_index = dispatch_lane * {}u + p.intr;",
-                intrinsic_pitch(stage)
+                output_pitch(stage)
             );
             source.push_str("    p.intrinsic_dtype = intrinsic_modes[intrinsic_index];\n");
             source.push_str("    p.imm = intrinsic_widths[intrinsic_index];\n");
@@ -760,8 +758,8 @@ fn emit_body(
         );
     } else if tag == tags::CHAN_PUT {
         emit_chan_put(source, op, a0, o0);
-    } else if tag == tags::INTRINSIC_VAL {
-        if op.intr == intrinsic_tags::LAYER || op.intr == intrinsic_tags::MTP_DRAFTS {
+    } else if tag == tags::OUTPUT {
+        if op.dtype == eta_ir::types::wire_dtype(Dtype::I32) {
             fallback(source);
         } else {
             let _ = writeln!(
@@ -799,7 +797,7 @@ fn emit_body(
             let _ = writeln!(
                 source,
                 "    const m1_u32 gumbel_intrinsic_index = dispatch_lane * {}u + {}u;",
-                intrinsic_pitch(stage),
+                output_pitch(stage),
                 chain.intrinsic
             );
             source.push_str(
@@ -854,7 +852,7 @@ fn emit_body(
             let _ = writeln!(
                 source,
                 "    const m1_u32 direct_intrinsic_index = dispatch_lane * {}u + {}u;",
-                intrinsic_pitch(stage),
+                output_pitch(stage),
                 direct_intrinsic[node]
             );
             source.push_str("    ptir_fast_argmax_intrinsic(\n");

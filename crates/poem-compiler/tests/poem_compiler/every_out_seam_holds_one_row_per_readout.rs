@@ -1,4 +1,4 @@
-use poem::{Dim, Platform, Ty, seam};
+use poem::{Dim, Platform, Ty};
 
 /// The engine reads the `out` seam by readout index: a lane's rows in the
 /// readback are `readout_first..readout_first + readout_count`, counted over
@@ -13,8 +13,8 @@ fn every_out_seam_holds_one_row_per_readout() {
 
     for row in poem_compiler::catalog::deployments().chain(poem_compiler::catalog::splits()) {
         let trace = row.trace(Platform::Cuda);
-        for out in trace.seams.iter().filter(|s| s.seam == seam::OUT.name) {
-            for value in &out.values {
+        for out in trace.outputs.iter().filter(|s| s.name == "logits") {
+            for value in out.values() {
                 seen += 1;
                 let rows = match &trace.values[value.0 as usize].ty {
                     Ty::Tensor { shape, .. } => shape.first().copied(),

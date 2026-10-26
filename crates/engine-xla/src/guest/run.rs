@@ -2,8 +2,8 @@
 //!
 //! [`OnDevice`] is an `eta_exec::StageRunner`: `eta_exec::step_with` drives
 //! one instance's pass and hands each stage here, which packs the stage's
-//! roots into one upload, runs the stage's executable (the logits read
-//! straight out of the fire's device readout) and unpacks the one download
+//! roots into one upload, runs the stage's executable (the outputs read
+//! straight out of the fire's device planes) and unpacks the one download
 //! of what the stage puts.
 //!
 //! [`step_group`] is the same pass for several instances of one program at
@@ -13,17 +13,49 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use eta_compiler::codegen::launch::{LaunchPackage, ValueOrigin};
+use eta_compiler::codegen::launch::{LaunchPackage, LaunchValue, ValueOrigin};
 use eta_exec::{ExecPlan, InterpInstance, StagePlan, StageRunner, StepOutcome, Value};
 use eta_ir::Dtype;
-use eta_ir::op::IntrinsicId;
 use eta_ir::registry::Stage;
 use eta_ir::validate::Direction;
 
-use super::lower::{self, Batch, Feed, Layout, Slot};
+use super::lower::{self, Batch, Feed, Layout, Read, Slot};
 use crate::device::{Device, Program};
 use crate::pjrt::{Arg, Buffer};
 use crate::readout::{Kept, Seat};
+
+/// Where a pass reads output `name` of its lane `lane`: plane `plane` of
+/// the fire's, at `seat`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bound {
+    pub name: String,
+    pub lane: u32,
+    pub plane: usize,
+    pub seat: Seat,
+}
+
+/// Where an instance attached at the fire's lane `lane` reads every output
+/// `plan` reads, when each binds on the device.
+#[must_use]
+pub fn bound(plan: &ExecPlan, kept: Option<&Kept>, lane: u32) -> Option<Vec<Bound>> {
+    let bound: Vec<Bound> = (plan.outputs().into_iter())
+        .map(|(name, k)| {
+            let (plane, seat) = kept?.bound(lane as usize + k as usize, name)?;
+            Some(Bound {
+                name: name.to_string(),
+                lane: k,
+                plane,
+                seat,
+            })
+        })
+        .collect::<Option<_>>()?;
+    let binds = plan
+        .package
+        .values
+        .iter()
+        .all(|v| v.source != ValueOrigin::Output || device_binds(v, kept, &bound));
+    binds.then_some(bound)
+}
 
 /// A lowered stage, compiled; `program` is `None` for a stage that puts
 /// nothing (there is nothing to run).
@@ -55,7 +87,7 @@ impl Stages {
         batch: Batch,
         carried: &[u32],
     ) -> Result<Arc<Staged>, String> {
-        let slot = (key, at, batch, carried.to_vec());
+        let slot = (key, at, batch.clone(), carried.to_vec());
         if let Some(hit) = self.map.get(&slot) {
             return Ok(Arc::clone(hit));
         }
@@ -92,17 +124,33 @@ impl Stages {
     }
 }
 
-/// The batch shape stage `at` runs at for `lanes` lanes against `kept`.
+/// The batch shape stage `at` runs at for `lanes` lanes against `kept`,
+/// its outputs read where `bound` says.
 #[must_use]
-pub fn batch_of(package: &LaunchPackage, at: usize, lanes: u32, kept: Option<&Kept>) -> Batch {
-    let (logits, mtp) = lower::reads(package, at);
-    Batch {
-        lanes,
-        logits: kept.filter(|_| logits).map(|k| (k.rows, k.width)),
-        mtp: kept
-            .filter(|_| mtp)
-            .and_then(|k| k.mtp.as_ref().map(|(_, w)| (k.rows, *w))),
-    }
+pub fn batch_of(
+    package: &LaunchPackage,
+    at: usize,
+    lanes: u32,
+    kept: Option<&Kept>,
+    bound: &[Bound],
+) -> Batch {
+    let reads = kept.map_or_else(Vec::new, |kept| {
+        (lower::outputs(package, at).into_iter())
+            .filter_map(|(name, lane)| {
+                let b = bound.iter().find(|b| b.name == name && b.lane == lane)?;
+                let plane = &kept.planes[b.plane];
+                Some(Read {
+                    name,
+                    lane,
+                    rows: plane.rows,
+                    layers: plane.layers,
+                    width: plane.width,
+                    dtype: plane.dtype,
+                })
+            })
+            .collect()
+    });
+    Batch { lanes, reads }
 }
 
 /// Lanes padded to a power of two, so a group's size changes the
@@ -113,10 +161,10 @@ pub fn padded(lanes: usize) -> u32 {
 }
 
 /// One lane's feed for a stage: its values (by package-global id; only
-/// the stage's host-fed roots are read) and where its readout rows sit.
+/// the stage's host-fed roots are read) and where its outputs sit.
 pub struct Feeding<'a> {
     pub vals: &'a [Value],
-    pub seat: Option<Seat>,
+    pub bound: &'a [Bound],
 }
 
 fn encode(value: &Value, dtype: Dtype, n: usize, out: &mut Vec<u32>) -> Result<(), String> {
@@ -216,21 +264,23 @@ pub fn launch_stage(
                 Feed::Value(dtype, n) => {
                     encode(&lane.vals[slot.value as usize], dtype, n, &mut words)?;
                 }
-                Feed::Row { intrinsic, rows } => {
-                    let seat = lane.seat.ok_or_else(|| {
-                        format!(
-                            "this pass reads the `{}` intrinsic and its lane offered no \
-                             readout rows",
-                            intrinsic.name()
-                        )
-                    })?;
-                    if rows > seat.count {
-                        return Err(
-                            "logits intrinsic row range exceeds the forward's readout rows"
-                                .to_owned(),
-                        );
+                Feed::Row { read, rows } => {
+                    let read = &layout.reads[read];
+                    let b = (lane.bound.iter())
+                        .find(|b| b.name == read.name && b.lane == read.lane)
+                        .ok_or_else(|| {
+                            format!(
+                                "this pass reads output `{}` and its lane binds none",
+                                read.name
+                            )
+                        })?;
+                    if rows > b.seat.count {
+                        return Err(format!(
+                            "this pass reads {rows} rows of output `{}` and its lane holds {}",
+                            read.name, b.seat.count
+                        ));
                     }
-                    words.push(seat.first);
+                    words.push(b.seat.first);
                 }
             }
         }
@@ -259,15 +309,13 @@ pub fn launch_stage(
     if let Some(pack) = &pack {
         args.push(Arg::Keep(pack));
     }
-    if layout.logits {
-        let kept = kept.ok_or("this stage reads the logits and the fire kept no readout")?;
-        args.push(Arg::Keep(&kept.logits));
-    }
-    if layout.mtp {
-        let (mtp, _) = kept
-            .and_then(|k| k.mtp.as_ref())
-            .ok_or("this stage reads the draft head and the fire kept none")?;
-        args.push(Arg::Keep(mtp));
+    for read in &layout.reads {
+        let kept = kept.ok_or("this stage reads an output and the fire kept none")?;
+        let plane = (lanes[0].bound.iter())
+            .find(|b| b.name == read.name && b.lane == read.lane)
+            .ok_or("this stage reads an output its lanes bind none of")?
+            .plane;
+        args.push(Arg::Keep(&kept.planes[plane].buffer));
     }
     let mut fresh = fresh.iter();
     for (chan, _) in &layout.carried_in {
@@ -384,15 +432,15 @@ pub fn run_stage(
     Ok((values, launched.carried))
 }
 
-/// Whether the device binds `id` for a lane seated at `seat` in `kept`.
-fn device_binds(id: Option<IntrinsicId>, kept: Option<&Kept>, seat: Option<Seat>) -> bool {
-    match id {
-        Some(IntrinsicId::Logits) => kept.is_some_and(|k| k.f32) && seat.is_some(),
-        Some(IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts) => {
-            kept.is_some_and(|k| k.f32 && k.mtp.is_some()) && seat.is_some()
-        }
-        _ => false,
-    }
+/// Whether the device binds the output `root` reads where `bound` says: a
+/// plane of `kept` landed as the dtype the program reads.
+fn device_binds(root: &LaunchValue, kept: Option<&Kept>, bound: &[Bound]) -> bool {
+    let (Some(kept), Some(name)) = (kept, root.output.as_deref()) else {
+        return false;
+    };
+    (bound.iter())
+        .find(|b| b.name == name && b.lane == root.lane)
+        .is_some_and(|b| kept.planes[b.plane].dtype == root.dtype)
 }
 
 /// One instance's stages on the device, as `step_with`'s runner.
@@ -401,7 +449,7 @@ pub struct OnDevice<'a> {
     stages: &'a mut Stages,
     key: [u8; 32],
     kept: Option<&'a Kept>,
-    seat: Option<Seat>,
+    bound: Vec<Bound>,
     ran: usize,
 }
 
@@ -411,14 +459,14 @@ impl<'a> OnDevice<'a> {
         stages: &'a mut Stages,
         key: [u8; 32],
         kept: Option<&'a Kept>,
-        seat: Option<Seat>,
+        bound: Vec<Bound>,
     ) -> OnDevice<'a> {
         OnDevice {
             device,
             stages,
             key,
             kept,
-            seat,
+            bound,
             ran: 0,
         }
     }
@@ -441,7 +489,7 @@ impl StageRunner for OnDevice<'_> {
     ) -> eta_exec::Result<()> {
         let at = sp.stage_index;
         let fail = |message: String| eta_exec::Error { message };
-        let batch = batch_of(&plan.package, at, 1, self.seat.and(self.kept));
+        let batch = batch_of(&plan.package, at, 1, self.kept, &self.bound);
         let staged = self
             .stages
             .get(self.device, &plan.package, self.key, at, batch, &[])
@@ -452,7 +500,7 @@ impl StageRunner for OnDevice<'_> {
             self.kept,
             &[Feeding {
                 vals,
-                seat: self.seat,
+                bound: &self.bound,
             }],
             None,
         )
@@ -466,25 +514,16 @@ impl StageRunner for OnDevice<'_> {
         Ok(())
     }
 
-    fn binds(&self, id: Option<IntrinsicId>) -> bool {
-        device_binds(id, self.kept, self.seat)
+    fn binds(&self, root: &LaunchValue) -> bool {
+        device_binds(root, self.kept, &self.bound)
     }
 }
 
-/// Whether every intrinsic `plan` reads binds on the device for lanes that
-/// have readout seats in `kept` (so a group needs no host-side binding).
-#[must_use]
-pub fn groups(plan: &ExecPlan, kept: Option<&Kept>) -> bool {
-    plan.package.values.iter().all(|v| {
-        v.source != ValueOrigin::Intrinsic
-            || device_binds(v.intrinsic, kept, Some(Seat { first: 0, count: 1 }))
-    })
-}
-
-/// One instance of a group.
+/// One instance of a group: every member reads its outputs off the same
+/// planes.
 pub struct Member<'a> {
     pub inst: &'a mut InterpInstance,
-    pub seat: Option<Seat>,
+    pub bound: Vec<Bound>,
 }
 
 /// A cell a pass puts: known on the host, or lane `row`'s `slot` of the
@@ -597,8 +636,8 @@ pub fn flush(
 
 /// `eta_exec::step_with` for every member at once: the same readiness
 /// check, overlay and commit per instance, and each stage one executable
-/// over the members. Members must all run `plan` and every intrinsic it
-/// reads must bind on the device (`groups`).
+/// over the members. Members must all run `plan` and every output it reads
+/// must bind on the device (`bound`).
 ///
 /// The `carried` channels' cells stay on the device: `cells` are the last
 /// pass's (row `r` is member `r`'s) and the pass's come back when every
@@ -755,7 +794,13 @@ fn step_group_with(
                 continue;
             }
             let at = sp.stage_index;
-            let batch = batch_of(&plan.package, at, padded(live.len()), kept);
+            let batch = batch_of(
+                &plan.package,
+                at,
+                padded(live.len()),
+                kept,
+                &members[live[0]].bound,
+            );
             let staged = stages.get(device, &plan.package, key, at, batch, carried);
             let leave = defer
                 && last == Some(at)
@@ -767,7 +812,7 @@ fn step_group_with(
                     .iter()
                     .map(|&m| Feeding {
                         vals: &vals[m],
-                        seat: members[m].seat,
+                        bound: &members[m].bound,
                     })
                     .collect();
                 if leave {
@@ -905,10 +950,10 @@ fn bind_roots(
             ValueOrigin::Const => const_root(root),
             ValueOrigin::ChannelTake => overlay.take(inst, root.channel),
             ValueOrigin::ChannelRead => overlay.resolve(inst, root.channel),
-            ValueOrigin::Intrinsic => Value::F32(Vec::new()),
+            ValueOrigin::Output => Value::F32(Vec::new()),
             ValueOrigin::OpResult => {
                 return Err(
-                    "unresolved value root (intrinsic/host input) reached execution".to_owned(),
+                    "unresolved value root (output/host input) reached execution".to_owned(),
                 );
             }
         };

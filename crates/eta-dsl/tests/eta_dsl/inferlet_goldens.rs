@@ -1,6 +1,7 @@
 use eta_dsl::builder::Builder;
 use eta_dsl::prelude::*;
 use eta_dsl::{Channel, Traced};
+use eta_ir::registry::{Axis, OutputDecl};
 
 const VOCAB: u32 = 151_936;
 const PAGE: u32 = 32;
@@ -24,11 +25,12 @@ fn s3() -> Traced {
     let rng_ch: &'static Channel = leak(Channel::from([7u32, 0]).named("rng"));
     tok.put([1i32]);
     let mut b = Builder::new(vocab, 16);
+    b.outputs(crate::outputs::logits(vocab));
     b.bind_port(Port::EmbedTokens, tok);
     b.bind_port(Port::EmbedIndptr, indptr);
     b.bind_port(Port::KvLen, len);
     b.stage(Stage::Epilogue, move || {
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let r = rng_ch.take();
         let g = gumbel(&r, [intrinsics::vocab()]);
         let t = reduce_argmax(add(mask_apply(logits, mask.take()), g));
@@ -47,11 +49,12 @@ fn text_completion_decode() -> Traced {
     let fold: &'static Channel = leak(Channel::from([u32::MAX]).named("fold"));
     let tok_out: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok_out"));
     let mut b = Builder::new(VOCAB, PAGE);
+    b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::EmbedTokens, tok_in);
     b.bind_port(Port::EmbedIndptr, embed_indptr);
     b.bind_port(Port::Fold, fold);
     b.stage(Stage::Epilogue, move || {
-        tok_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+        tok_out.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
     });
     tok_out.note_host_take();
     b.build().unwrap()
@@ -71,12 +74,13 @@ fn naive_decode() -> Traced {
     let lane1: &'static Channel = leak(Channel::from([0u32, 1u32]).named("embed_indptr"));
     let fold: &'static Channel = leak(Channel::from([u32::MAX]).named("fold"));
     let mut b = Builder::new(VOCAB, PAGE);
+    b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::EmbedTokens, tok_in);
     b.bind_port(Port::EmbedIndptr, lane1);
     b.bind_port(Port::Fold, fold);
     b.stage(Stage::Epilogue, move || {
         let r = rng.take();
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let scaled = &logits / temperature;
         let token = gumbel_max(scaled, &r);
         let r_next = &r + iota(2);
@@ -105,10 +109,11 @@ fn coverage() -> Traced {
     let stat2: &'static Channel = leak(Channel::new([4], dtype::f32).named("stat2"));
     let flag: &'static Channel = leak(Channel::new([1], dtype::bool).named("flag"));
     let mut b = Builder::new(VOCAB, PAGE);
+    b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::EmbedTokens, tok);
     b.bind_port(Port::EmbedIndptr, indptr_ch);
     b.stage(Stage::Epilogue, move || {
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let r = rng_ch.take();
         let p = softmax(&logits);
         let lp = log_softmax(&logits);
@@ -183,22 +188,15 @@ fn sinks() -> Traced {
     a.put(vec![0.0f32; 64]);
     bch.put(vec![0.0f32; 64]);
     let mut b = Builder::new(VOCAB, PAGE);
+    b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::EmbedTokens, tok);
     b.bind_port(Port::EmbedIndptr, indptr_ch);
     b.stage(Stage::Prologue, move || {
         intrinsics::kernel::lora(a.read(), bch.read(), Tensor::constant(1u32 | 4u32));
         intrinsics::kernel::attn_page_mask(iota(4));
     });
-    b.stage(Stage::OnAttnProj, move || {
-        let q = intrinsics::query(16);
-        let s = intrinsics::kernel::envelope_dot(4);
-        let _ = (q, s);
-        intrinsics::kernel::attn_page_mask(
-            cast(gt(intrinsics::kernel::envelope_dot(4), 0.0f32), dtype::u32) + intrinsics::layer(),
-        );
-    });
     b.stage(Stage::Epilogue, move || {
-        out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+        out.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
     });
     out.note_host_take();
     b.build().unwrap()
@@ -238,6 +236,7 @@ fn diffusion_step() -> Traced {
     let tap_weights_out: &'static Channel =
         leak(Channel::new([length, taps], dtype::f32).named("tap_weights"));
     let mut b = Builder::new(VOCAB, PAGE);
+    b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::EmbedTokens, toks);
     b.bind_port(Port::EmbedIndptr, embed_indptr);
     b.bind_port(Port::KvLen, kv_len);
@@ -248,7 +247,7 @@ fn diffusion_step() -> Traced {
 
         let r = rng_state.take();
         let t = reshape(temp.read(), []);
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let scaled = div(&logits, &t);
         let probs = softmax(&scaled);
         let h = entropy(&probs);
@@ -327,6 +326,7 @@ fn beam_step() -> Traced {
             .named("out_greedy"),
     );
     let mut b = Builder::new(VOCAB, PAGE);
+    b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::KvLen, klen);
     b.bind_port(Port::Positions, pos);
     b.bind_port(Port::Slots, slots);
@@ -334,7 +334,7 @@ fn beam_step() -> Traced {
     b.bind_port(Port::EmbedTokens, toks);
     b.bind_port(Port::EmbedIndptr, lanes_b);
     b.stage(Stage::Epilogue, move || {
-        let logits = reshape(intrinsics::logits(), [B, v]);
+        let logits = reshape(intrinsics::output(0, "logits"), [B, v]);
         let cand = add(
             broadcast(reshape(scores.take(), [B, 1]), [B, v]),
             log_softmax(&logits),
@@ -390,6 +390,12 @@ fn latent_step() -> Traced {
     let norm_out: &'static Channel = leak(Channel::new([rows], dtype::f32).named("norms"));
     latent.put(vec![0.0f32; (rows * channels) as usize]);
     let mut b = Builder::new(VOCAB, PAGE);
+    b.outputs(vec![vec![crate::outputs::decl(
+        "velocity",
+        Axis::Row,
+        channels,
+        false,
+    )]]);
     b.bind_port(Port::EmbedTokens, tok);
     b.bind_port(Port::EmbedIndptr, indptr_ch);
     b.bind_port(Port::KvLen, kv_len);
@@ -397,7 +403,7 @@ fn latent_step() -> Traced {
     b.bind_port(Port::Readout, readout);
     b.stage(Stage::Epilogue, move || {
         positions.put(positions.take());
-        let v = intrinsics::velocity(0, rows, channels);
+        let v = intrinsics::output_rows(0, "velocity", rows);
         let x = latent.take();
         let d = reshape(dsigma.read(), []);
 
@@ -440,8 +446,14 @@ fn vae_readback() -> Traced {
     let (rows, rgb) = (16u32, 3u32);
     let out: &'static Channel = leak(Channel::new([rows, rgb], dtype::f32).named("pixels_out"));
     let mut b = Builder::new(VOCAB, PAGE);
+    b.outputs(vec![vec![crate::outputs::decl(
+        "pixels",
+        Axis::Voxel,
+        rgb,
+        false,
+    )]]);
     b.stage(Stage::Epilogue, move || {
-        let px = intrinsics::pixels(0, rows, rgb);
+        let px = intrinsics::output_rows(0, "pixels", rows);
         let shifted = add(&px, 1.0f32);
         let unit = mul(&shifted, 0.5f32);
         out.put(&unit);
@@ -457,6 +469,7 @@ fn noised_input() -> Traced {
     let latent: &'static Channel = leak(Channel::new([rows, width], dtype::f32).named("latent"));
     let timestep: &'static Channel = leak(Channel::from([0.5f32]).named("timestep"));
     let mut b = Builder::new(VOCAB, PAGE);
+    b.outputs(crate::outputs::logits(VOCAB));
     b.bind_input(latent);
     b.bind_input(timestep);
     b.stage(Stage::Prologue, move || {
@@ -517,36 +530,24 @@ fn sdk_port_goldens_are_pinned() {
 
 fn bind_lanes(
     container: eta_ir::container::TraceContainer,
-    lanes: Vec<Option<eta_ir::registry::Readout>>,
+    lanes: Vec<Vec<OutputDecl>>,
 ) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
-    eta_ir::validate::bind(
-        container,
-        lanes,
-        eta_ir::registry::Graph::default(),
-        eta_ir::registry::EngineCaps::default(),
-    )
+    eta_ir::validate::bind(container, lanes, eta_ir::registry::EngineCaps::default())
 }
 
 fn the_latent_step_binds_against_a_denoising_model() {
-    let velocity = eta_ir::registry::Readout {
-        kind: eta_ir::registry::ReadoutKind::Velocity,
-        width: 16,
-    };
-    bind_lanes(latent_step().container().clone(), vec![Some(velocity)])
+    let velocity = crate::outputs::decl("velocity", Axis::Row, 16, false);
+    bind_lanes(latent_step().container().clone(), vec![vec![velocity]])
         .expect("the latent step binds against a lane that predicts a velocity");
 }
 
 fn the_vae_readback_binds_against_a_model_that_lands_pixels() {
-    let pixels = eta_ir::registry::Readout {
-        kind: eta_ir::registry::ReadoutKind::Pixels,
-        width: 3,
-    };
-    bind_lanes(vae_readback().container().clone(), vec![Some(pixels)])
+    let pixels = crate::outputs::decl("pixels", Axis::Voxel, 3, false);
+    bind_lanes(vae_readback().container().clone(), vec![vec![pixels]])
         .expect("the readback binds against a lane whose VAE lands pixels");
-    let logits = eta_ir::registry::Readout {
-        kind: eta_ir::registry::ReadoutKind::Logits,
-        width: VOCAB,
-    };
-    bind_lanes(vae_readback().container().clone(), vec![Some(logits)])
-        .expect_err("a lane that lands no pixels refuses the readback at bind");
+    bind_lanes(
+        vae_readback().container().clone(),
+        crate::outputs::logits(VOCAB),
+    )
+    .expect_err("a lane that lands no pixels refuses the readback at bind");
 }

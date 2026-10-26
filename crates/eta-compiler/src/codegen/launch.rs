@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use eta_ir::container::{ChanDType, ExternDir, HostRole, PortSource};
-use eta_ir::op::{ChannelIndex, IntrinsicId, intrinsic_tags, tags};
+use eta_ir::op::{ChannelIndex, tags};
 use eta_ir::registry::{Port, Stage};
 use eta_ir::types::{Dtype, RngKind, ValueType, from_wire};
 use eta_ir::validate::{BoundTrace, Direction};
@@ -18,7 +18,7 @@ use crate::codegen::op_view::OpView;
 #[repr(u8)]
 pub enum ValueOrigin {
     Const = 0,
-    Intrinsic = 1,
+    Output = 1,
     ChannelTake = 2,
     ChannelRead = 3,
     #[default]
@@ -30,7 +30,8 @@ pub struct LaunchValue {
     pub id: u32,
     pub source: ValueOrigin,
     pub dtype: Dtype,
-    pub intrinsic: Option<IntrinsicId>,
+    /// The output it reads, by name.
+    pub output: Option<String>,
     #[serde(default)]
     pub lane: u32,
     pub channel: ChannelIndex,
@@ -44,7 +45,7 @@ impl Default for LaunchValue {
             id: 0,
             source: ValueOrigin::OpResult,
             dtype: Dtype::F32,
-            intrinsic: None,
+            output: None,
             lane: 0,
             channel: 0,
             literal_bits: 0,
@@ -58,7 +59,6 @@ pub struct LaunchOp {
     pub tag: u8,
     pub result_count: u16,
     pub result_id: u32,
-    pub intrinsic: Option<IntrinsicId>,
     pub lit_dtype: Dtype,
     pub dtype: Dtype,
     pub pred_tag: u8,
@@ -80,7 +80,6 @@ impl Default for LaunchOp {
             tag: 0,
             result_count: 0,
             result_id: 0,
-            intrinsic: None,
             lit_dtype: Dtype::F32,
             dtype: Dtype::F32,
             pred_tag: 0,
@@ -216,13 +215,8 @@ pub struct LaunchChannelRule {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StageNeeds {
-    pub query: bool,
-    pub layer: bool,
-    pub attn_score: bool,
     pub kernel_call: bool,
     pub page_mask: bool,
-    pub mtp_rows: bool,
-    pub mtp_drafts: bool,
     pub lora: bool,
     pub grouped_valid: bool,
 }
@@ -232,10 +226,9 @@ pub struct LaunchStagePlan {
     pub signature_hash: u64,
     pub identity: u64,
     pub needs: StageNeeds,
-    pub mtp_rows: u32,
-    #[serde(default)]
-    pub drafts_len: u32,
-    pub intrinsic_pitch: u32,
+    /// The slots one lane takes in the stage's output table, and all of them.
+    pub output_slots: u32,
+    pub output_pitch: u32,
     pub ops: Vec<LaunchOp>,
     pub source_ops: Vec<Vec<u32>>,
     pub value_types: Vec<LaunchPlanValue>,
@@ -336,12 +329,16 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                     );
                     local += 1;
                 }
-                tags::INTRINSIC_VAL => {
+                tags::OUTPUT => {
                     push(
                         local,
                         LaunchValue {
-                            source: ValueOrigin::Intrinsic,
-                            intrinsic: IntrinsicId::from_u16(view.intr),
+                            source: ValueOrigin::Output,
+                            output: bound
+                                .container
+                                .names
+                                .get(usize::from(view.name_idx))
+                                .cloned(),
                             lane: view.imm,
                             ..LaunchValue::default()
                         },
@@ -460,7 +457,7 @@ fn lower_stages(bound: &BoundTrace) -> Vec<LaunchStage> {
                     }
                     local += 1;
                 }
-                tags::CONST | tags::INTRINSIC_VAL => local += 1,
+                tags::CONST | tags::OUTPUT => local += 1,
                 tags::CHAN_PUT => stage.puts.push(LaunchPut {
                     channel: view.chan as u32,
                     value: global(view.args[0]),
@@ -471,7 +468,6 @@ fn lower_stages(bound: &BoundTrace) -> Vec<LaunchStage> {
                         tag: view.tag,
                         result_count: view.results as u16,
                         result_id: global(local),
-                        intrinsic: None,
                         lit_dtype: dtype(view.lit_dtype),
                         dtype: value_type.dtype,
                         pred_tag: view.pred_tag,
@@ -510,9 +506,8 @@ fn lower_plan(stage: &CompiledStage) -> LaunchStagePlan {
         signature_hash: stage.signature.hash,
         identity: stage_identity(stage),
         needs: grouped.needs,
-        mtp_rows: grouped.mtp_rows,
-        drafts_len: grouped.drafts_len,
-        intrinsic_pitch: eta_ir::op::intrinsic_pitch(&normalized.ops),
+        output_slots: eta_ir::op::output_table(&normalized.ops).0,
+        output_pitch: eta_ir::op::output_pitch(&normalized.ops),
         ops: ops.iter().map(lower_plan_op).collect(),
         source_ops: normalized.source_ops.clone(),
         value_map: normalized.value_map.clone(),
@@ -536,9 +531,6 @@ fn lower_plan_op(view: &OpView) -> LaunchOp {
         tag: view.tag,
         result_count: view.results as u16,
         result_id: 0,
-        intrinsic: (view.tag == tags::INTRINSIC_VAL)
-            .then(|| IntrinsicId::from_u16(view.intr))
-            .flatten(),
         lit_dtype: dtype(view.lit_dtype),
         dtype: dtype(view.dtype),
         pred_tag: view.pred_tag,
@@ -608,8 +600,6 @@ fn lower_region(stage: &CompiledStage, region: &Region) -> LaunchRegion {
 #[derive(Default)]
 struct GroupedPlan {
     needs: StageNeeds,
-    mtp_rows: u32,
-    drafts_len: u32,
     used_extents: Vec<SymbolicExtent>,
     channel_rules: Vec<LaunchChannelRule>,
     error: String,
@@ -651,7 +641,6 @@ impl GroupedPlan {
 
         for (node, op) in ops.iter().enumerate() {
             if op.tag == tags::KERNEL_CALL {
-                plan.needs.query = true;
                 plan.needs.kernel_call = true;
                 continue;
             }
@@ -665,39 +654,6 @@ impl GroupedPlan {
             if !grouped_supported_tag(op.tag) {
                 return plan.invalid("stage contains an unsupported grouped op");
             }
-            if op.tag == tags::INTRINSIC_VAL {
-                match op.intr {
-                    intrinsic_tags::QUERY => plan.needs.query = true,
-                    intrinsic_tags::LAYER => plan.needs.layer = true,
-                    intrinsic_tags::ATTN_SCORE => plan.needs.attn_score = true,
-                    intrinsic_tags::MTP_LOGITS => {
-                        let value = value_bases[node] as usize;
-                        let rows = match value_types.get(value).map(|ty| ty.dims.as_slice()) {
-                            Some([Dimension::Static(rows), _]) => *rows,
-                            _ => return plan.invalid("MtpLogits has no static draft-row layout"),
-                        };
-                        if plan.needs.mtp_rows && plan.mtp_rows != rows {
-                            return plan.invalid(
-                                "MtpLogits stages declare incompatible draft-row layouts",
-                            );
-                        }
-                        plan.needs.mtp_rows = true;
-                        plan.mtp_rows = rows;
-                    }
-                    intrinsic_tags::MTP_DRAFTS => {
-                        plan.needs.mtp_drafts = true;
-                        let value = value_bases[node] as usize;
-                        if let Some([Dimension::Static(len)]) =
-                            value_types.get(value).map(|ty| ty.dims.as_slice())
-                        {
-                            plan.drafts_len = plan.drafts_len.max(*len);
-                        }
-                    }
-                    intrinsic_tags::LOGITS => {}
-                    _ => return plan.invalid("stage uses an unsupported intrinsic"),
-                }
-            }
-
             let value = match op.tag {
                 tags::CHAN_TAKE | tags::CHAN_READ => value_bases[node],
                 tags::CHAN_PUT if !op.args.is_empty() => op.args[0],

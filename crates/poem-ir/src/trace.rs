@@ -172,11 +172,26 @@ pub enum CacheRow {
     },
 }
 
+/// A value the model reads out to its guest under `name`. `layer` is the
+/// layer it was written in; `grid` lays out a voxel output's own clips.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Seam {
-    pub seam: String,
-    pub values: Vec<ValueId>,
+pub struct Output {
+    pub name: String,
+    pub value: ValueId,
     pub layer: Option<u32>,
+    #[serde(default)]
+    pub grid: Option<ValueId>,
+}
+
+impl Output {
+    /// The value, and its grid where it has one.
+    pub fn values(&self) -> impl Iterator<Item = ValueId> {
+        core::iter::once(self.value).chain(self.grid)
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut ValueId> {
+        core::iter::once(&mut self.value).chain(self.grid.as_mut())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -194,7 +209,7 @@ pub struct Trace {
     pub caches: Vec<CacheRow>,
     pub values: Vec<ValueDecl>,
     pub nodes: Vec<Node>,
-    pub seams: Vec<Seam>,
+    pub outputs: Vec<Output>,
     #[serde(default)]
     pub drafter: Option<BlockDrafter>,
     /// The facts the trace's guards branch on, and the bits each takes.
@@ -239,18 +254,20 @@ impl InputDecl {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ReadoutKind {
-    Logits,
-    Velocity,
-    Hidden,
-    Pixels,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Readout {
-    pub kind: ReadoutKind,
+/// An output as a lane reads it: `width` values of `dtype` per `axis` entry,
+/// stacked `layers` deep when it is written per layer (0 when it is not).
+/// `readout`: its rows are the lane's readout rows. `tail`: the last rows of
+/// a lane it is computed over, which a lane's last fire must hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputDecl {
+    pub name: String,
+    pub axis: InputAxis,
     pub width: u32,
+    pub dtype: Dtype,
+    pub layers: u32,
+    pub readout: bool,
+    #[serde(default)]
+    pub tail: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,7 +279,7 @@ pub struct LaneClass {
     pub reads_state: bool,
     pub embeds: bool,
     pub wide: bool,
-    pub readout: Option<Readout>,
+    pub outputs: Vec<OutputDecl>,
     /// A voxel lane of it attends as one token row per patch of its voxels.
     #[serde(default)]
     pub patch: Option<[u32; 3]>,

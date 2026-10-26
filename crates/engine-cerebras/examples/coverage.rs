@@ -9,8 +9,8 @@
 //! cargo run --release -p engine-cerebras --example coverage -- [--compile] [--lean] [--dump DIR] [--shard I/N] [-v] [filter...]
 //! ```
 //!
-//! `--lean` skips the classes that run a custom-mask, adapter or score
-//! capture arm. `--compile` also compiles every emitted program with cslc;
+//! `--lean` skips the classes that run a custom-mask or adapter arm.
+//! `--compile` also compiles every emitted program with cslc;
 //! `--dump DIR` writes each deployment's programs as
 //! `DIR/<deployment>.<n>.csl.txt`; `--shard I/N` takes every Nth deployment
 //! from the Ith (one process of N side by side); `-v` prints every fire.

@@ -32,19 +32,6 @@ use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase
 use engine::runahead::Runahead;
 use eta_ir::registry::Stage;
 
-const OUT_SEAM: &str = poem_compiler::EXPORT_SEAMS[0];
-
-const MTP_SEAM: &str = poem_compiler::EXPORT_SEAMS[1];
-const DRAFTS_SEAM: &str = poem_compiler::EXPORT_SEAMS[3];
-
-const VELOCITY_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[0];
-
-const HIDDEN_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[1];
-
-const PIXELS_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[2];
-
-const SCORES_SEAM: &str = poem_compiler::EXPORT_SEAMS[2];
-
 pub struct Boot<'a> {
     pub trace: Trace,
     pub contract: &'a ModelContract,
@@ -71,12 +58,9 @@ pub struct Boot<'a> {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
-fn on_voxels(trace: &Trace, value: ValueId) -> bool {
-    matches!(
-        &trace.values[value.0 as usize].ty,
-        Ty::Tensor { shape, .. }
-            if matches!(shape.first(), Some(poem_ir::Dim::Voxels | poem_ir::Dim::VoxelsTimes(_)))
-    )
+/// Whether a lane can be read back on the host through `out`.
+fn read_back(out: &poem_exec::feeds::ClassOutput) -> bool {
+    out.decl.axis != poem_ir::InputAxis::Lane && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32)
 }
 
 fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
@@ -183,7 +167,6 @@ pub struct Seated<'a> {
     /// Rows inside the lane whose recurrent state also lands in a slot of
     /// its own (`Lane::rs_snapshots`).
     pub rs_snapshots: &'a [engine::fire::RsSnapshot],
-    pub captures_scores: bool,
     pub translation: &'a [u32],
 }
 
@@ -202,7 +185,6 @@ impl<'a> Seated<'a> {
             adapter: None,
             positions: &[],
             readout: None,
-            captures_scores: false,
             translation: &[],
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
@@ -215,14 +197,6 @@ impl<'a> Seated<'a> {
     pub fn adapted(lane: Lane<'a>, id: u32) -> Seated<'a> {
         Seated {
             adapter: Some(id),
-            ..Seated::of(lane)
-        }
-    }
-
-    #[must_use]
-    pub fn capturing(lane: Lane<'a>) -> Seated<'a> {
-        Seated {
-            captures_scores: true,
             ..Seated::of(lane)
         }
     }
@@ -285,22 +259,16 @@ pub struct Shell {
     scratch: Scratch,
     inputs: Vec<Inputs>,
     readout: Vec<Buffer>,
-    out_width: u32,
-    readout_bytes: u64,
-    readout_seam: engine::fire::ReadoutSeam,
-    readout_value: ValueId,
-    readouts: Vec<(ValueId, engine::fire::ReadoutSeam, poem_ir::ClassSet)>,
-    pixels: Vec<(
-        ValueId,
-        ValueId,
-        poem_ir::ClassSet,
-        Option<Vec<poem_ir::GridRule>>,
-    )>,
+    /// The widest row a lane reads back, in bytes.
+    readout_row_bytes: u64,
+    outputs: Vec<poem_exec::feeds::ClassOutput>,
+    /// Each voxel output's walk from the port grid to its own.
+    grid_chains: Vec<Option<Vec<poem_ir::GridRule>>>,
     arms: Arms,
     airborne: Airborne,
     inflight: VecDeque<Flight>,
     grafted: Option<Pending>,
-    landed: BTreeMap<u64, Vec<Vec<f32>>>,
+    landed: BTreeMap<u64, Vec<(String, Vec<f32>)>>,
     host_rows: bool,
     rows_wanted: bool,
     nan_flags: Option<Buffer>,
@@ -329,11 +297,6 @@ pub struct Shell {
     run_caps: Vec<u32>,
     run_passes: Vec<u32>,
     held: Vec<u32>,
-    out: Option<ValueId>,
-    mtp: Option<ValueId>,
-    drafts_plane: Option<(ValueId, u32)>,
-    scores: Option<crate::scores::Scores>,
-    capturing: poem_ir::ClassSet,
     programs: crate::program::Plane,
     #[cfg(target_vendor = "apple")]
     icb: Option<crate::icb::Icb>,
@@ -548,38 +511,6 @@ impl PreparedLoad<'_> {
             if runs_correction {
                 for class in region.mask.iter() {
                     corrected.insert(class);
-                }
-            }
-        }
-
-        let score_values: Vec<ValueId> = boot
-            .trace
-            .seams
-            .iter()
-            .filter(|seam| seam.seam == SCORES_SEAM)
-            .flat_map(|seam| seam.values.iter().copied())
-            .collect();
-        let mut capturing = poem_ir::ClassSet::default();
-        {
-            use poem_ir::Operands;
-            let mut outputs: Vec<ValueId> = Vec::new();
-            let writers: Vec<u32> = boot
-                .trace
-                .nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, node)| {
-                    outputs.clear();
-                    node.op.outputs(&mut outputs);
-                    outputs.iter().any(|out| score_values.contains(out))
-                })
-                .map(|(at, _)| u32::try_from(at).unwrap_or(u32::MAX))
-                .collect();
-            for region in compiled.template() {
-                if region.nodes.clone().any(|node| writers.contains(&node)) {
-                    for class in region.mask.iter() {
-                        capturing.insert(class);
-                    }
                 }
             }
         }
@@ -908,202 +839,35 @@ impl PreparedLoad<'_> {
             }
         };
 
-        let pixels: Vec<(
-            ValueId,
-            ValueId,
-            poem_ir::ClassSet,
-            Option<Vec<poem_ir::GridRule>>,
-        )> = boot
-            .trace
-            .seams
+        let outputs =
+            poem_exec::feeds::class_outputs(&boot.trace, &compiled).map_err(Fault::Recipe)?;
+        let grid_chains = outputs
             .iter()
-            .filter(|seam| seam.seam == PIXELS_SEAM)
-            .filter_map(|seam| match seam.values.as_slice() {
-                [plane, grid, ..] => Some((
-                    *plane,
-                    *grid,
-                    crate::feeds::writer_classes(&boot.trace, &compiled, *plane),
-                    grid_chain(*grid),
-                )),
-                _ => None,
-            })
+            .map(|out| out.grid.and_then(&grid_chain))
             .collect();
-
-        let out = boot
-            .trace
-            .seams
+        if outputs.is_empty() {
+            return Err(Fault::Unbound {
+                what: "no output, so a fire would compute nothing a reader can take".to_string(),
+            });
+        }
+        let readout_row_bytes = outputs
             .iter()
-            .find(|seam| seam.seam == OUT_SEAM)
-            .and_then(|seam| seam.values.first().copied());
-        let last_of = |name: &str| {
-            boot.trace
-                .seams
-                .iter()
-                .rfind(|seam| seam.seam == name)
-                .and_then(|seam| seam.values.first().copied())
-        };
-        let (readout_value, readout_seam) = match out {
-            Some(out) => (out, engine::fire::ReadoutSeam::Logits),
-            None => match last_of(VELOCITY_SEAM) {
-                Some(v) => (v, engine::fire::ReadoutSeam::Velocity),
-                None => match last_of(HIDDEN_SEAM) {
-                    Some(h) => (h, engine::fire::ReadoutSeam::Hidden),
-                    None => {
-                        return Err(Fault::Unbound {
-                            what: format!(
-                                "no `{OUT_SEAM}`, `{VELOCITY_SEAM}` or `{HIDDEN_SEAM}` seam, \
-                                 so a fire would compute nothing a reader can take"
-                            ),
-                        });
-                    }
-                },
-            },
-        };
-        let readouts: Vec<(ValueId, engine::fire::ReadoutSeam, poem_ir::ClassSet)> = {
-            let mut rows = Vec::new();
-            if let Some(out) = out {
-                rows.push((
-                    out,
-                    engine::fire::ReadoutSeam::Logits,
-                    crate::feeds::writer_classes(&boot.trace, &compiled, out),
-                ));
-            }
-            for seam in boot.trace.seams.iter().filter(|s| s.seam == VELOCITY_SEAM) {
-                if let Some(&value) = seam.values.first() {
-                    rows.push((
-                        value,
-                        engine::fire::ReadoutSeam::Velocity,
-                        crate::feeds::writer_classes(&boot.trace, &compiled, value),
-                    ));
-                }
-            }
-            for seam in boot.trace.seams.iter().filter(|s| s.seam == HIDDEN_SEAM) {
-                if let Some(&value) = seam.values.first() {
-                    rows.push((
-                        value,
-                        engine::fire::ReadoutSeam::Hidden,
-                        crate::feeds::writer_classes(&boot.trace, &compiled, value),
-                    ));
-                }
-            }
-            rows
-        };
-
-        let mtp = boot
-            .trace
-            .seams
-            .iter()
-            .find(|seam| seam.seam == MTP_SEAM)
-            .and_then(|seam| seam.values.first().copied());
-        let drafts_seam = boot
-            .trace
-            .seams
-            .iter()
-            .find(|seam| seam.seam == DRAFTS_SEAM)
-            .and_then(|seam| seam.values.first().copied());
-        let (out_width, readout_bytes, drafts_plane) = {
-            let carved = arena.slots(&handles, &compiled.arena, FireRows::ceilings(&budgets))?;
-            let logits = carved.0[readout_value.0 as usize].ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "value {}, the `{readout_seam:?}` readout seam, which the carve gave no \
-                     rectangle",
-                    readout_value.0
-                ),
-            })?;
-            let readout_bytes: u64 = match logits.dtype {
-                Dtype::Bf16 => 2,
-                Dtype::F32 => 4,
-                other => {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "a `{readout_seam:?}` readout seam landed as {other:?}, which this \
-                             shell cannot read back"
-                        ),
-                    });
-                }
-            };
-            if readout_seam == engine::fire::ReadoutSeam::Logits && logits.dtype != Dtype::Bf16 {
-                return Err(Fault::Unbound {
-                    what: format!(
-                        "an out seam landed as {:?}, which this shell cannot read back",
-                        logits.dtype
-                    ),
-                });
-            }
-            if let Some(mtp) = mtp {
-                let column = carved.0[mtp.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, the `{MTP_SEAM}` export, which the carve gave no rectangle",
-                        mtp.0
-                    ),
-                })?;
-                if column.dtype != Dtype::Bf16 {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "an `{MTP_SEAM}` export landed as {:?}, which this shell cannot \
-                             point an intrinsic at",
-                            column.dtype
-                        ),
-                    });
-                }
-            }
-            let drafts_plane = match drafts_seam {
-                Some(value) => {
-                    let plane = carved.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
-                        what: format!(
-                            "value {}, the `{DRAFTS_SEAM}` export, which the carve gave no \
-                             rectangle",
-                            value.0
-                        ),
-                    })?;
-                    if plane.dtype != Dtype::I32 {
-                        return Err(Fault::Unbound {
-                            what: format!(
-                                "a `{DRAFTS_SEAM}` export landed as {:?}, and the draft ids \
-                                 are read as i32",
-                                plane.dtype
-                            ),
-                        });
-                    }
-                    let depth = plane.width;
-                    if depth == 0 {
-                        return Err(Fault::Unbound {
-                            what: format!("a `{DRAFTS_SEAM}` export of width zero drafts nothing"),
-                        });
-                    }
-                    Some((value, depth))
-                }
-                None => None,
-            };
-            handles.rewind();
-            (logits.width, readout_bytes, drafts_plane)
-        };
+            .filter(|out| read_back(out) && out.grid.is_none())
+            .map(|out| {
+                u64::from(out.decl.width)
+                    * poem_compiler::arena::elem_bytes(out.decl.dtype).unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0);
 
         let readout = (0..arms)
             .map(|_| {
                 Buffer::zeroed(
                     &device,
-                    u64::from(boot.budget.max_lanes) * u64::from(out_width) * readout_bytes,
+                    (u64::from(boot.budget.max_lanes) * readout_row_bytes).max(1),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-
-        let score_heads = score_values
-            .first()
-            .and_then(|value| match &boot.trace.values[value.0 as usize].ty {
-                poem_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
-                    poem_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
-                    _ => None,
-                }),
-                poem_ir::Ty::Struct(_) => None,
-            })
-            .unwrap_or(0);
-        let scores = crate::scores::Scores::reserve(
-            &device,
-            &score_values,
-            score_heads,
-            boot.budget.max_lanes,
-        )?;
 
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
@@ -1134,12 +898,9 @@ impl PreparedLoad<'_> {
             scratch,
             inputs,
             readout,
-            out_width,
-            readout_bytes,
-            readout_seam,
-            readout_value,
-            readouts,
-            pixels,
+            readout_row_bytes,
+            outputs,
+            grid_chains,
             arms: Arms::of(arms),
             airborne: Airborne::new(),
             inflight: VecDeque::new(),
@@ -1170,11 +931,6 @@ impl PreparedLoad<'_> {
             run_caps,
             run_passes,
             held: vec![0; paging.slots as usize],
-            out,
-            mtp,
-            drafts_plane,
-            scores,
-            capturing,
             programs: crate::program::Plane::new(),
             #[cfg(target_vendor = "apple")]
             icb: None,
@@ -1347,7 +1103,7 @@ impl Shell {
 
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
-        poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
+        poem_exec::feeds::lane_classes(&self.trace, &self.compiled, &self.outputs)
     }
 
     #[must_use]
@@ -1414,92 +1170,71 @@ impl Shell {
         self.pipelines.compiled()
     }
 
-    pub fn out_width(&self) -> Result<u64> {
-        Ok(u64::from(self.out_width))
-    }
-
-    /// The `seam` plane `class` writes, or the load's one `seam` plane.
-    fn plane_for(&self, seam: engine::fire::ReadoutSeam, class: Option<usize>) -> Option<ValueId> {
-        let planes = || self.readouts.iter().filter(move |(_, at, _)| *at == seam);
-        planes()
-            .rfind(|(_, _, classes)| class.is_some_and(|class| classes.contains(class)))
-            .or_else(|| {
-                let mut planes = planes();
-                let one = planes.next();
-                planes.next().is_none().then_some(one).flatten()
-            })
-            .map(|(value, _, _)| *value)
-    }
-
-    fn plane_row(
-        &self,
-        prepared: &Prepared<'_>,
-        value: ValueId,
-        seam: engine::fire::ReadoutSeam,
-    ) -> Result<(u64, u32, Dtype)> {
+    /// Where `value`'s rectangle lies in the arena: its offset, width and dtype.
+    fn plane_row(&self, prepared: &Prepared<'_>, value: ValueId) -> Result<(u64, u32, Dtype)> {
         let rect = prepared.slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
             what: format!(
-                "value {}, a {seam:?} readout planting, which the carve gave no rectangle",
+                "value {}, an output, which the carve gave no rectangle",
                 value.0
             ),
         })?;
         let row = self.handles.get(rect.buf).ok_or_else(|| Fault::Unbound {
             what: format!(
-                "handle {}, a readout planting's, which this fire minted no row for",
+                "handle {}, an output's, which this fire minted no row for",
                 rect.buf
             ),
         })?;
+        if crate::device::alloc::slab_id(row.slab())
+            != crate::device::alloc::slab_id(self.arena.store().slab())
+        {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "value {}, an output this carve did not put in the arena, which an \
+                     epilogue is bound against",
+                    value.0
+                ),
+            });
+        }
         Ok((row.offset(), rect.width, rect.dtype))
     }
 
-    fn readout_for(&self, class: Option<usize>) -> (ValueId, engine::fire::ReadoutSeam) {
-        let mine = |want: engine::fire::ReadoutSeam| {
-            class.and_then(|class| {
-                self.readouts
-                    .iter()
-                    .rfind(|(_, seam, classes)| *seam == want && classes.contains(class))
-                    .map(|(value, seam, _)| (*value, *seam))
-            })
+    /// What a lane of `class` is read back through on the host: the last
+    /// float row or voxel output its class writes.
+    fn readback(&self, class: usize) -> Option<&poem_exec::feeds::ClassOutput> {
+        self.outputs
+            .iter()
+            .rfind(|out| out.classes.contains(class) && read_back(out))
+    }
+
+    /// The row a lane is read back at, in the arena, with its output's name,
+    /// width and element bytes; `None` for a lane read back through a grid.
+    fn readback_row(
+        &self,
+        p: &Prepared<'_>,
+        row: &poem_exec::fire::LaneRow,
+    ) -> Result<Option<(String, u64, u32, u64)>> {
+        let Some(out) = self.readback(row.class as usize) else {
+            return Ok(None);
         };
-        mine(engine::fire::ReadoutSeam::Logits)
-            .or_else(|| mine(engine::fire::ReadoutSeam::Velocity))
-            .or_else(|| mine(engine::fire::ReadoutSeam::Hidden))
-            .unwrap_or((self.readout_value, self.readout_seam))
-    }
-
-    #[must_use]
-    pub fn pixels_width(&self) -> Option<u32> {
-        let mut width = None;
-        for (plane, _, _, _) in &self.pixels {
-            let here = match &self.trace.values[plane.0 as usize].ty {
-                poem_ir::Ty::Tensor { shape, .. } => match shape.get(1) {
-                    Some(poem_ir::Dim::Const(w)) => u32::try_from(*w).ok()?,
-                    _ => return None,
-                },
-                poem_ir::Ty::Struct(_) => return None,
-            };
-            match width {
-                None => width = Some(here),
-                Some(seen) if seen == here => {}
-                Some(_) => return None,
-            }
+        if out.grid.is_some() {
+            return Ok(None);
         }
-        width
-    }
-
-    #[must_use]
-    pub fn readout_seam(&self) -> engine::fire::ReadoutSeam {
-        self.readout_seam
-    }
-
-    #[must_use]
-    pub const fn drafts(&self) -> bool {
-        self.mtp.is_some()
-    }
-
-    #[must_use]
-    pub fn mtp_depth(&self) -> u32 {
-        self.drafts_plane.map_or(0, |(_, depth)| depth)
+        let (offset, width, dtype) = self.plane_row(p, out.values[0])?;
+        let element = poem_compiler::arena::elem_bytes(dtype).unwrap_or(0);
+        let at = if self.gathers_readout {
+            p.readout_first
+                .get(row.source as usize)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            row.row_offset + row.rows - 1
+        };
+        Ok(Some((
+            out.decl.name.clone(),
+            offset + u64::from(at) * u64::from(width) * element,
+            width,
+            element,
+        )))
     }
 
     #[must_use]
@@ -1551,33 +1286,8 @@ impl Shell {
             self.arena.bytes(),
             self.pools.bytes(),
             self.inputs.iter().map(Inputs::bytes).sum::<u64>()
-                + self.readout.iter().map(Buffer::bytes).sum::<u64>()
-                + self.scores.as_ref().map_or(0, crate::scores::Scores::bytes),
+                + self.readout.iter().map(Buffer::bytes).sum::<u64>(),
         )
-    }
-
-    #[must_use]
-    pub fn observes_scores(&self) -> bool {
-        self.scores.is_some()
-    }
-
-    #[must_use]
-    pub fn score_planes(&self) -> u32 {
-        self.scores
-            .as_ref()
-            .map_or(0, crate::scores::Scores::planes)
-    }
-
-    #[must_use]
-    pub fn score_heads(&self) -> u32 {
-        self.scores.as_ref().map_or(0, crate::scores::Scores::heads)
-    }
-
-    pub fn observed(&self, lane: u32) -> Result<Option<Vec<f32>>> {
-        self.scores
-            .as_ref()
-            .map(|scores| scores.read_lane(lane))
-            .transpose()
     }
 
     pub fn register_program(
@@ -1848,7 +1558,11 @@ impl Shell {
         let answer = (|| {
             let enqueued = FrameShell::enqueue(self, prepared)?;
             let landed = FrameShell::settle(self, enqueued)?;
-            self.rows_of(&landed)
+            Ok(self
+                .rows_of(&landed)?
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect())
         })();
         self.rows_wanted = asked;
         answer
@@ -1886,7 +1600,8 @@ impl Shell {
         self.pools.read_slot(slot)
     }
 
-    pub fn rows_of(&mut self, landed: &Landed) -> Result<Vec<Vec<f32>>> {
+    /// Each lane's read-back row, by its output's name.
+    pub fn rows_of(&mut self, landed: &Landed) -> Result<Vec<(String, Vec<f32>)>> {
         self.harvest_through(landed.seq)?;
         self.landed
             .remove(&landed.seq)
@@ -2003,18 +1718,15 @@ impl Shell {
                 }
             }
         }
-        let rows: Vec<Vec<f32>> = if self.host_rows || self.rows_wanted {
-            let width = self.out_width as usize;
-            let stride = self.readout_bytes as usize;
-            let mut raw = vec![0u8; flight.lanes * width * stride];
-            self.readout[flight.arm].read(0, &mut raw)?;
-            raw.chunks_exact(width.max(1) * stride)
-                .take(flight.lanes)
-                .map(|row| widen(row, stride))
-                .collect()
-        } else {
-            vec![Vec::new(); flight.lanes]
-        };
+        let mut rows = vec![(String::new(), Vec::new()); flight.lanes];
+        for (lane, read) in flight.readbacks.iter().enumerate() {
+            let Some((name, width, element)) = read else {
+                continue;
+            };
+            let mut raw = vec![0u8; *width as usize * *element as usize];
+            self.readout[flight.arm].read(lane as u64 * self.readout_row_bytes, &mut raw)?;
+            rows[lane] = (name.clone(), widen(&raw, *element as usize));
+        }
         fire_trace(|| format!("readout-done seq={} rows={}", flight.seq, flight.lanes));
         self.arms.give(flight.arm);
         self.landed.insert(flight.seq, rows);
@@ -2028,48 +1740,17 @@ impl Shell {
         }
     }
 
-    fn pixels_seat(&self, prepared: &Prepared<'_>, lane: usize) -> Result<((u64, u32), u64)> {
-        let class = prepared
-            .composition
-            .lanes()
-            .iter()
-            .find(|row| row.source as usize == lane)
-            .map(|row| row.class as usize);
-        let (plane, _grid, _, chain) = self
-            .pixels
-            .iter()
-            .find(|(_, _, classes, _)| class.is_some_and(|class| classes.contains(class)))
-            .or_else(|| (self.pixels.len() == 1).then(|| &self.pixels[0]))
-            .ok_or_else(|| Fault::Program {
-                at: "serve::enqueue",
-                why: format!(
-                    "lane {lane}'s epilogue reads `pixels` and this load plants {} pixel \
-                     plane(s), none of them on this lane's arm",
-                    self.pixels.len()
-                ),
-            })?;
-        let rect = prepared.slots.0[plane.0 as usize].ok_or_else(|| Fault::Unbound {
-            what: format!(
-                "value {}, a `{PIXELS_SEAM}` planting, which the carve gave no rectangle",
-                plane.0
-            ),
-        })?;
-        if rect.dtype != Dtype::Bf16 {
-            return Err(Fault::Unbound {
-                what: format!(
-                    "a `{PIXELS_SEAM}` planting landed as {:?}; the emitted gather reads it \
-                     as bf16 and has no other element",
-                    rect.dtype
-                ),
-            });
-        }
-        let row = self.handles.get(rect.buf).ok_or_else(|| Fault::Unbound {
-            what: format!(
-                "handle {}, a pixel plane's, which this fire minted no row for",
-                rect.buf
-            ),
-        })?;
-
+    /// Where lane `lane`'s voxels of grid output `out` start: the plane's
+    /// offset there, its width and dtype.
+    fn grid_seat(
+        &self,
+        prepared: &Prepared<'_>,
+        lane: usize,
+        out: usize,
+    ) -> Result<(u64, u32, Dtype)> {
+        let value = self.outputs[out].values[0];
+        let (offset, width, dtype) = self.plane_row(prepared, value)?;
+        let rows = prepared.slots.0[value.0 as usize].map_or(0, |rect| rect.rows);
         let first_clip: u32 = prepared
             .composition
             .lanes()
@@ -2078,9 +1759,9 @@ impl Shell {
             .filter(|row| row.voxel_offset < Self::first_voxel(prepared, lane))
             .map(|row| row.clips)
             .sum();
-        let Some(chain) = chain.as_ref() else {
+        let Some(chain) = self.grid_chains[out].as_ref() else {
             if first_clip == 0 {
-                return Ok(((row.offset(), rect.width), 0));
+                return Ok((offset, width, dtype));
             }
             return Err(Fault::Program {
                 at: "serve::enqueue",
@@ -2108,19 +1789,19 @@ impl Shell {
                     * u64::try_from(clip[2]).unwrap_or(0)
             })
             .sum();
-        if out_voxels != u64::from(rect.rows) {
+        if out_voxels != u64::from(rows) {
             return Err(Fault::Program {
                 at: "serve::enqueue",
                 why: format!(
                     "replaying this plane's `conv.grid` chain over the fire's own port \
                      grid lands {out_voxels} voxels and the carve gave the plane {} rows; \
                      the chain walked at load is not the one this fire runs",
-                    rect.rows
+                    rows
                 ),
             });
         }
         if first_clip == 0 {
-            return Ok(((row.offset(), rect.width), 0));
+            return Ok((offset, width, dtype));
         }
         let at = table
             .as_chunks::<4>()
@@ -2134,8 +1815,12 @@ impl Shell {
                     table.len() / 4
                 ),
             })?;
-        let offset = u64::try_from(at).unwrap_or(0) * u64::from(rect.width) * 2;
-        Ok(((row.offset(), rect.width), offset))
+        let element = poem_compiler::arena::elem_bytes(dtype).unwrap_or(0);
+        Ok((
+            offset + u64::try_from(at).unwrap_or(0) * u64::from(width) * element,
+            width,
+            dtype,
+        ))
     }
 
     fn first_voxel(prepared: &Prepared<'_>, lane: usize) -> u32 {
@@ -2151,10 +1836,6 @@ impl Shell {
         &mut self,
         frame: &mut Frame,
         prepared: &Prepared<'_>,
-        base: u64,
-        width: u64,
-        draft: Option<(u64, u64)>,
-        drafts: Option<(u64, u64)>,
     ) -> Result<Vec<engine::InstanceId>> {
         if !prepared.attachments.iter().any(|a| !a.adapter_only) {
             return Ok(Vec::new());
@@ -2163,13 +1844,11 @@ impl Shell {
         let count = prepared.lanes.len();
         let mut first_row = vec![0u32; count];
         let mut lane_rows = vec![0u32; count];
-        let mut fire_lane = vec![0u32; count];
-        for (at_fire, row) in prepared.composition.lanes().iter().enumerate() {
+        for row in prepared.composition.lanes() {
             let at = row.source as usize;
             if at < count {
                 first_row[at] = row.row_offset;
                 lane_rows[at] = row.rows;
-                fire_lane[at] = u32::try_from(at_fire).unwrap_or(u32::MAX);
             }
         }
 
@@ -2179,10 +1858,7 @@ impl Shell {
         }
 
         let mut owed = Vec::with_capacity(prepared.attachments.len());
-        match self.stage_epilogues(
-            frame, prepared, base, width, draft, drafts, &first_row, &lane_rows, &fire_lane,
-            &mut owed,
-        ) {
+        match self.stage_epilogues(frame, prepared, &first_row, &lane_rows, &mut owed) {
             Ok(()) => Ok(owed),
             Err(fault) => {
                 for instance in owed {
@@ -2193,253 +1869,89 @@ impl Shell {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn stage_epilogues(
         &mut self,
         frame: &mut Frame,
         prepared: &Prepared<'_>,
-        base: u64,
-        width: u64,
-        draft: Option<(u64, u64)>,
-        drafts: Option<(u64, u64)>,
         first_row: &[u32],
         lane_rows: &[u32],
-        fire_lane: &[u32],
         owed: &mut Vec<engine::InstanceId>,
     ) -> Result<()> {
-        let mut staged = Vec::with_capacity(prepared.attachments.len());
-        for attached in prepared.attachments.iter().filter(|a| !a.adapter_only) {
-            let lane = attached.lane as usize;
-            // A lane's readout row: its gathered first, else its first named row, else its last.
-            let row_of = |lane: usize| -> Result<u32> {
-                let owned = lane_rows.get(lane).copied().unwrap_or(0);
-                if owned == 0 {
+        // A lane's readout row: its gathered first, else its first named row, else its last.
+        let row_of = |lane: usize| -> Result<u32> {
+            let owned = lane_rows.get(lane).copied().unwrap_or(0);
+            if owned == 0 {
+                return Err(Fault::Ceiling {
+                    what: "rows in the lane an epilogue is attached to",
+                    need: 1,
+                    have: 0,
+                });
+            }
+            if self.gathers_readout {
+                if prepared.readout_count.get(lane).copied().unwrap_or(0) == 0 {
                     return Err(Fault::Ceiling {
-                        what: "rows in the lane an epilogue is attached to",
+                        what: "readout rows in the lane an epilogue is attached to",
                         need: 1,
                         have: 0,
                     });
                 }
-                if self.gathers_readout {
-                    if prepared.readout_count.get(lane).copied().unwrap_or(0) == 0 {
-                        return Err(Fault::Ceiling {
-                            what: "readout rows in the lane an epilogue is attached to",
-                            need: 1,
-                            have: 0,
-                        });
-                    }
-                    return Ok(prepared.readout_first.get(lane).copied().unwrap_or(0));
-                }
-                let last = first_row[lane] + owned - 1;
-                match prepared.lanes.get(lane).and_then(|seated| seated.readout) {
-                    None => Ok(last),
-                    Some(rows) => {
-                        for &row in rows {
-                            if row >= owned {
-                                return Err(Fault::Ceiling {
-                                    what: "rows in the lane a readout names",
-                                    need: u64::from(row) + 1,
-                                    have: u64::from(owned),
-                                });
-                            }
+                return Ok(prepared.readout_first.get(lane).copied().unwrap_or(0));
+            }
+            let last = first_row[lane] + owned - 1;
+            match prepared.lanes.get(lane).and_then(|seated| seated.readout) {
+                None => Ok(last),
+                Some(rows) => {
+                    for &row in rows {
+                        if row >= owned {
+                            return Err(Fault::Ceiling {
+                                what: "rows in the lane a readout names",
+                                need: u64::from(row) + 1,
+                                have: u64::from(owned),
+                            });
                         }
-                        Ok(rows.first().map_or(last, |&row| first_row[lane] + row))
                     }
+                    Ok(rows.first().map_or(last, |&row| first_row[lane] + row))
                 }
-            };
-            let at = row_of(lane)?;
-            let class_of = |lane: usize| {
-                prepared
+            }
+        };
+        let mut staged = Vec::with_capacity(prepared.attachments.len());
+        for attached in prepared.attachments.iter().filter(|a| !a.adapter_only) {
+            let reads = self.programs.reads(attached.instance)?;
+            for k in 0..attached.lanes.max(1) {
+                let at = attached.lane as usize + k as usize;
+                let Some((fire_lane, row)) = prepared
                     .composition
                     .lanes()
                     .iter()
-                    .find(|row| row.source as usize == lane)
-                    .map(|row| row.class as usize)
-            };
-
-            let (value, seam) = self.readout_for(class_of(lane));
-            if seam == engine::fire::ReadoutSeam::Logits {
-                let (base, width) = if value == self.readout_value {
-                    (base, width)
-                } else {
-                    let (offset, width, _) = self.plane_row(prepared, value, seam)?;
-                    (offset, u64::from(width))
+                    .enumerate()
+                    .find(|(_, row)| row.source as usize == at)
+                else {
+                    continue;
                 };
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::Logits,
-                    0,
-                    self.arena.store(),
-                    base + u64::from(at) * width * self.readout_bytes,
-                    u32::try_from(width).unwrap_or(u32::MAX),
-                    Dtype::Bf16,
-                )?;
-            }
-
-            // A voxel-axis velocity reads at the lane's first voxel, a token-axis one at its
-            // readout row.
-            for k in 0..attached.lanes.max(1) {
-                let at = lane + k as usize;
-                for (intrinsic, seam) in [
-                    (
-                        eta_ir::op::IntrinsicId::Velocity,
-                        engine::fire::ReadoutSeam::Velocity,
-                    ),
-                    (
-                        eta_ir::op::IntrinsicId::Hidden,
-                        engine::fire::ReadoutSeam::Hidden,
-                    ),
-                ] {
-                    if !self.programs.reads_lane(attached.instance, intrinsic, k)? {
+                for out in 0..self.outputs.len() {
+                    let decl = &self.outputs[out].decl;
+                    if !self.outputs[out].classes.contains(row.class as usize)
+                        || !reads
+                            .iter()
+                            .any(|(name, lane)| *name == decl.name && *lane == k)
+                    {
                         continue;
                     }
-                    let value = self.plane_for(seam, class_of(at)).ok_or_else(|| {
-                        Fault::program(
-                            "serve::enqueue",
-                            format!(
-                                "instance {} reads {intrinsic:?} of its lane {k} and this \
-                                 load plants no {seam:?} plane on that lane's class",
-                                attached.instance
-                            ),
-                        )
-                    })?;
-                    let (offset, width, dtype) = self.plane_row(prepared, value, seam)?;
-                    let row = if on_voxels(&self.trace, value) {
-                        Self::first_voxel(prepared, at)
-                    } else {
-                        row_of(at)?
-                    };
-                    let element = poem_compiler::arena::elem_bytes(dtype).unwrap_or(0);
-                    self.programs.bind_intrinsic(
+                    let (offset, width, dtype, stride) =
+                        self.output_seat(prepared, out, at, fire_lane, &row_of)?;
+                    let name = self.outputs[out].decl.name.clone();
+                    self.programs.bind_output(
                         attached.instance,
-                        intrinsic,
+                        &name,
                         k,
                         self.arena.store(),
-                        offset + u64::from(row) * u64::from(width) * element,
-                        width,
+                        offset,
                         dtype,
-                    )?;
-                }
-                if self.programs.reads_lane(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::Pixels,
-                    k,
-                )? {
-                    let (plane, offset) = self.pixels_seat(prepared, at)?;
-                    self.programs.bind_intrinsic(
-                        attached.instance,
-                        eta_ir::op::IntrinsicId::Pixels,
-                        k,
-                        self.arena.store(),
-                        plane.0 + offset,
-                        plane.1,
-                        Dtype::Bf16,
+                        width,
+                        stride,
                     )?;
                 }
             }
-
-            if self.programs.needs_mtp_logits(attached.instance)? {
-                let (column, mtp_width) = draft.ok_or_else(|| {
-                    Fault::program(
-                        "serve::enqueue",
-                        format!(
-                            "instance {} reads the `mtp_logits` intrinsic and this load \
-                             carved no `{MTP_SEAM}` rectangle; the attachment gate was \
-                             supposed to have refused it",
-                            attached.instance
-                        ),
-                    )
-                })?;
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::MtpLogits,
-                    0,
-                    self.arena.store(),
-                    column + u64::from(first_row[lane]) * mtp_width * 2,
-                    u32::try_from(mtp_width).unwrap_or(u32::MAX),
-                    Dtype::Bf16,
-                )?;
-            }
-
-            if self.programs.needs_mtp_drafts(attached.instance)? {
-                let (plane, depth) = drafts.ok_or_else(|| {
-                    Fault::program(
-                        "serve::enqueue",
-                        format!(
-                            "instance {} reads the `mtp_drafts` intrinsic and this load \
-                             carved no `{DRAFTS_SEAM}` rectangle; the attachment gate was \
-                             supposed to have refused it",
-                            attached.instance
-                        ),
-                    )
-                })?;
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::MtpDrafts,
-                    0,
-                    self.arena.store(),
-                    plane + u64::from(at) * depth * 4,
-                    u32::try_from(depth).unwrap_or(u32::MAX),
-                    Dtype::I32,
-                )?;
-            }
-
-            if self.programs.needs_attn_scores(attached.instance)? {
-                let slab = self.scores.as_ref().ok_or_else(|| {
-                    Fault::program(
-                        "serve::enqueue",
-                        format!(
-                            "instance {} reads the `attn_score` intrinsic and this load carved \
-                             no observability slab; the attachment gate was supposed to have \
-                             refused it",
-                            attached.instance
-                        ),
-                    )
-                })?;
-                if !prepared
-                    .lanes
-                    .get(lane)
-                    .is_some_and(|seated| seated.captures_scores)
-                {
-                    return Err(Fault::program(
-                        "serve::enqueue",
-                        format!(
-                            "instance {} reads the `attn_score` intrinsic at lane {lane}, which \
-                             did not ask to capture its attention: nothing wrote that lane's \
-                             block of the slab this fire, so the program would read the last \
-                             fire's mass",
-                            attached.instance
-                        ),
-                    ));
-                }
-                let at = fire_lane.get(lane).copied().unwrap_or(u32::MAX);
-                if at >= slab.lanes() {
-                    return Err(Fault::Ceiling {
-                        what: "fire lanes the score slab seats",
-                        need: u64::from(at) + 1,
-                        have: u64::from(slab.lanes()),
-                    });
-                }
-                if let Some(declared) = self.programs.declared_score_planes(attached.instance)
-                    && declared > slab.planes()
-                {
-                    return Err(Fault::Ceiling {
-                        what: "attention-score planes this load exports",
-                        need: u64::from(declared),
-                        have: u64::from(slab.planes()),
-                    });
-                }
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::AttnScore,
-                    0,
-                    slab.store(),
-                    slab.lane_base(at),
-                    crate::scores::KV_MAX,
-                    Dtype::F32,
-                )?;
-            }
-
             staged.push(attached.instance);
         }
         let mut refusal = None;
@@ -2455,6 +1967,59 @@ impl Shell {
             return Err(refused(&fired, instance));
         }
         Ok(())
+    }
+
+    /// Where lane `at` (the fire's lane `fire_lane`) reads output `out`: a
+    /// lane output at its row (a layer a plane after another), a row output
+    /// at its readout row, a voxel output from its first voxel.
+    fn output_seat(
+        &self,
+        prepared: &Prepared<'_>,
+        out: usize,
+        at: usize,
+        fire_lane: usize,
+        row_of: &dyn Fn(usize) -> Result<u32>,
+    ) -> Result<(u64, u32, Dtype, u32)> {
+        let output = &self.outputs[out];
+        let name = &output.decl.name;
+        let (offset, width, dtype) = self.plane_row(prepared, output.values[0])?;
+        let element = poem_compiler::arena::elem_bytes(dtype).unwrap_or(0);
+        let at_row = |row: u64| offset + row * u64::from(width) * element;
+        Ok(match output.decl.axis {
+            poem_ir::InputAxis::Lane => {
+                let mut stride = width;
+                if let Some(&next) = output.values.get(1) {
+                    let gap = self.plane_row(prepared, next)?.0.wrapping_sub(offset);
+                    for pair in output.values.windows(2) {
+                        let (a, b) = (
+                            self.plane_row(prepared, pair[0])?.0,
+                            self.plane_row(prepared, pair[1])?.0,
+                        );
+                        if b.wrapping_sub(a) != gap || element == 0 || gap % element != 0 {
+                            return Err(Fault::Unbound {
+                                what: format!(
+                                    "output `{name}`'s layers, which do not sit one plane \
+                                     after another"
+                                ),
+                            });
+                        }
+                    }
+                    stride = u32::try_from(gap / element).unwrap_or(u32::MAX);
+                }
+                (at_row(fire_lane as u64), width, dtype, stride)
+            }
+            poem_ir::InputAxis::Row => (at_row(u64::from(row_of(at)?)), width, dtype, width),
+            poem_ir::InputAxis::Voxel if output.grid.is_some() => {
+                let (offset, width, dtype) = self.grid_seat(prepared, at, out)?;
+                (offset, width, dtype, width)
+            }
+            poem_ir::InputAxis::Voxel => (
+                at_row(u64::from(Self::first_voxel(prepared, at))),
+                width,
+                dtype,
+                width,
+            ),
+        })
     }
 
     fn fence_instances(&mut self, instances: &[engine::InstanceId]) -> Result<()> {
@@ -2539,49 +2104,6 @@ impl Shell {
                     ),
                 ));
             }
-            if self.out.is_none() && self.programs.needs_logits(attached.instance)? {
-                return Err(Fault::program(
-                    "serve::prepare",
-                    format!(
-                        "instance {} reads the `logits` intrinsic and this load plants no \
-                         `{OUT_SEAM}` seam — its readout is the {:?} one, which a sampler \
-                         cannot read as a vocabulary",
-                        attached.instance, self.readout_seam
-                    ),
-                ));
-            }
-            if self.mtp.is_none() && self.programs.needs_mtp_logits(attached.instance)? {
-                return Err(Fault::program(
-                    "serve::prepare",
-                    format!(
-                        "instance {} reads the `mtp_logits` intrinsic and this load's \
-                         model text declares no `{MTP_SEAM}` seam, so there is no draft \
-                         column to point it at",
-                        attached.instance
-                    ),
-                ));
-            }
-            if self.drafts_plane.is_none() && self.programs.needs_mtp_drafts(attached.instance)? {
-                return Err(Fault::program(
-                    "serve::prepare",
-                    format!(
-                        "instance {} reads the `mtp_drafts` intrinsic and this load's \
-                         model text declares no `{DRAFTS_SEAM}` seam, so there is no token \
-                         plane to point it at",
-                        attached.instance
-                    ),
-                ));
-            }
-            if self.scores.is_none() && self.programs.needs_attn_scores(attached.instance)? {
-                return Err(Fault::program(
-                    "serve::prepare",
-                    format!(
-                        "instance {} reads the `attn_score` intrinsic and this load carves no \
-                         observability slab, so there is no per-key rectangle to point it at",
-                        attached.instance
-                    ),
-                ));
-            }
             if let Some(blocked) = self.programs.ready(attached.instance)? {
                 return Err(Fault::program(
                     "serve::prepare",
@@ -2603,9 +2125,9 @@ impl Shell {
                     "serve::prepare",
                     format!(
                         "lane {} states a readout list that is not one ascending run \
-                         ({rows:?}), and instance {}'s `logits` intrinsic is one \
-                         buffer binding at one offset: this plane can point a guest at \
-                         `start .. start + k` and at nothing else",
+                         ({rows:?}), and instance {}'s readout rows are one binding at \
+                         one offset: this plane can point a guest at `start .. start + k` \
+                         and at nothing else",
                         attached.lane, attached.instance
                     ),
                 ));
@@ -3069,17 +2591,6 @@ impl Shell {
                     lane: row.source,
                     word: lane.word,
                     runs_correction,
-                });
-            }
-            let runs_capture_arm = self.capturing.contains(row.class as usize);
-            if seated.captures_scores && self.capturing.is_empty() {
-                return Err(Fault::Scoreless { lane: row.source });
-            }
-            if seated.captures_scores != runs_capture_arm {
-                return Err(Fault::ScoreWord {
-                    lane: row.source,
-                    word: lane.word,
-                    runs_capture_arm,
                 });
             }
             if any_adapter {
@@ -3782,12 +3293,6 @@ impl Shell {
                 mask_enabled: bound.mask_enabled,
                 mask_stride: bound.mask_stride,
             },
-            scores: match self.scores.as_ref() {
-                Some(scores) if lanes.iter().any(|seated| seated.captures_scores) => {
-                    Some(scores.seat(&self.handles)?)
-                }
-                _ => None,
-            },
             rs_snaps: bound.rs_snaps,
             rs: if rs_active {
                 let (Some(layout), Some(buffers), Some(scratch)) =
@@ -4241,32 +3746,14 @@ impl Shell {
             Mode::Encode => unreachable!("checked above"),
         }
 
-        let logits = p.slots.0[self.readout_value.0 as usize].ok_or_else(|| Fault::Unbound {
-            what: format!(
-                "value {}, the {:?} readout seam, which the carve gave no rectangle",
-                self.readout_value.0, self.readout_seam
-            ),
-        })?;
-        let width = logits.width as usize;
-        let stride = self.readout_bytes as usize;
         let mut taken = vec![Vec::new(); lanes.len()];
-        let mut raw = vec![0u8; width * stride];
         for row in p.composition.lanes() {
-            let at = if self.gathers_readout {
-                p.readout_first
-                    .get(row.source as usize)
-                    .copied()
-                    .unwrap_or(0)
-            } else {
-                row.row_offset + row.rows - 1
+            let Some((_, offset, width, element)) = self.readback_row(&p, row)? else {
+                continue;
             };
-            self.arena.read_view(
-                &self.handles,
-                logits.buf,
-                u64::from(at) * width as u64 * self.readout_bytes,
-                &mut raw,
-            )?;
-            taken[row.source as usize] = widen(&raw, stride);
+            let mut raw = vec![0u8; width as usize * element as usize];
+            self.arena.read(offset, &mut raw)?;
+            taken[row.source as usize] = widen(&raw, element as usize);
         }
 
         self.advance(&p);
@@ -4377,6 +3864,8 @@ pub struct Enqueued<'a> {
     lanes: usize,
     launches: u32,
     attached: Vec<engine::InstanceId>,
+    /// Each lane's read-back row: its output's name, width and element bytes.
+    readbacks: Vec<Option<(String, u32, u64)>>,
     step: PhantomData<&'a ()>,
 }
 
@@ -4418,6 +3907,7 @@ struct Flight {
     lanes: usize,
     pending: Pending,
     attached: Vec<engine::InstanceId>,
+    readbacks: Vec<Option<(String, u32, u64)>>,
 }
 
 impl engine::frame::Shell for Shell {
@@ -4505,117 +3995,26 @@ impl engine::frame::Shell for Shell {
         }
         let mut frame = walked.frame.expect("the encoding mode opened a frame");
 
-        let logits =
-            prepared.slots.0[self.readout_value.0 as usize].ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "value {}, the {:?} readout seam, which the carve gave no rectangle",
-                    self.readout_value.0, self.readout_seam
-                ),
-            })?;
-        if logits.width != self.out_width {
-            return Err(Fault::Ceiling {
-                what: "elements in one readout row",
-                need: u64::from(logits.width),
-                have: u64::from(self.out_width),
-            });
-        }
-        let width = u64::from(logits.width);
-        let (source, base) = {
-            let row = self.handles.get(logits.buf).ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "handle {}, the out seam's, which this load minted no row for",
-                    logits.buf
-                ),
-            })?;
-            (row.slab().clone(), row.offset())
-        };
+        let mut readbacks = vec![None; prepared.lanes.len()];
         if self.host_rows || self.rows_wanted {
             let seat = self.readout[prepared.arm].slab().clone();
-            let stride = width * self.readout_bytes;
             for row in prepared.composition.lanes() {
-                let at = if self.gathers_readout {
-                    prepared
-                        .readout_first
-                        .get(row.source as usize)
-                        .copied()
-                        .unwrap_or(0)
-                } else {
-                    row.row_offset + row.rows - 1
+                let Some((name, offset, width, element)) = self.readback_row(&prepared, row)?
+                else {
+                    continue;
                 };
                 frame.copy(
-                    &source,
-                    base + u64::from(at) * stride,
+                    self.arena.store().slab(),
+                    offset,
                     &seat,
-                    u64::from(row.source) * stride,
-                    stride,
+                    u64::from(row.source) * self.readout_row_bytes,
+                    u64::from(width) * element,
                 )?;
+                readbacks[row.source as usize] = Some((name, width, element));
             }
         }
 
-        let mut draft = None;
-        let mut drafts = None;
-        if prepared.attachments.iter().any(|a| !a.adapter_only) {
-            let arena = crate::device::alloc::slab_id(self.arena.store().slab());
-            if crate::device::alloc::slab_id(&source) != arena {
-                return Err(Fault::Unbound {
-                    what: "the out seam, which this carve did not put in the arena; an \
-                           attached epilogue is bound against the arena's own \
-                           reservation"
-                        .to_string(),
-                });
-            }
-            if let Some(mtp) = self.mtp {
-                let column = prepared.slots.0[mtp.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, the `{MTP_SEAM}` export, which the carve gave no rectangle",
-                        mtp.0
-                    ),
-                })?;
-                let row = self.handles.get(column.buf).ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "handle {}, the `{MTP_SEAM}` export's, which this load minted no \
-                         row for",
-                        column.buf
-                    ),
-                })?;
-                if crate::device::alloc::slab_id(row.slab()) != arena {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "the `{MTP_SEAM}` export, which this carve did not put in the \
-                             arena; an attached epilogue is bound against the arena's own \
-                             reservation"
-                        ),
-                    });
-                }
-                draft = Some((row.offset(), u64::from(column.width)));
-            }
-            if let Some((value, depth)) = self.drafts_plane {
-                let plane = prepared.slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, the `{DRAFTS_SEAM}` export, which the carve gave no rectangle",
-                        value.0
-                    ),
-                })?;
-                let row = self.handles.get(plane.buf).ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "handle {}, the `{DRAFTS_SEAM}` export's, which this load minted no \
-                         row for",
-                        plane.buf
-                    ),
-                })?;
-                if crate::device::alloc::slab_id(row.slab()) != arena {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "the `{DRAFTS_SEAM}` export, which this carve did not put in the \
-                             arena; an attached epilogue is bound against the arena's own \
-                             reservation"
-                        ),
-                    });
-                }
-                drafts = Some((row.offset(), u64::from(depth)));
-            }
-        }
-        let attached = self.encode_epilogues(&mut frame, &prepared, base, width, draft, drafts)?;
+        let attached = self.encode_epilogues(&mut frame, &prepared)?;
         fire_trace(|| "epilogues-encoded".to_string());
 
         self.advance(&prepared);
@@ -4656,6 +4055,7 @@ impl engine::frame::Shell for Shell {
             lanes: prepared.lanes.len(),
             launches: walked.launches,
             attached,
+            readbacks,
             step: PhantomData,
         })
     }
@@ -4671,6 +4071,7 @@ impl engine::frame::Shell for Shell {
             lanes,
             launches,
             attached,
+            readbacks,
             step: _,
         } = enqueued;
         self.arms.take(arm);
@@ -4681,6 +4082,7 @@ impl engine::frame::Shell for Shell {
             lanes,
             pending,
             attached,
+            readbacks,
         });
         Ok(Landed {
             seq,

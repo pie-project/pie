@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use engine_cpu::forward::{Output, Values};
 use engine_cpu::{Exchange, Forward, Group};
 use poem::star::{Deploy, Package};
 use poem_ir::{Dtype, Platform, Request, Trace};
@@ -101,6 +102,16 @@ fn word(trace: &Trace, tokens: usize) -> u64 {
 const PROMPT: [u32; 9] = [7, 300, 41, 511, 2, 96, 257, 13, 404];
 const NEXT: u32 = 77;
 
+fn logits(outs: Vec<Output>) -> Vec<f32> {
+    match outs.into_iter().find(|out| out.name == "logits") {
+        Some(Output {
+            values: Values::F32(v),
+            ..
+        }) => v,
+        _ => Vec::new(),
+    }
+}
+
 /// The prefill's and the decode's logits of one forward, `group` its rank.
 fn steps(trace: &Trace, group: Option<Group>) -> [Vec<f32>; 2] {
     let mut me = Forward::new(trace.clone(), group, &plane).expect("the micro loads");
@@ -110,7 +121,7 @@ fn steps(trace: &Trace, group: Option<Group>) -> [Vec<f32>; 2] {
     let second = me
         .step(&[NEXT], PROMPT.len() as u32, word(trace, 1))
         .expect("the decode runs");
-    [first, second]
+    [logits(first), logits(second)]
 }
 
 fn group(trace: &Trace, ranks: usize) -> Vec<[Vec<f32>; 2]> {

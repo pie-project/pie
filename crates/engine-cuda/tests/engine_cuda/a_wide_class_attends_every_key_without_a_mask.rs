@@ -6,7 +6,7 @@ use crate::common_encoder::{Weights, contract_for};
 use engine::fire::{Mask, Masking, Readout};
 use engine_cuda::{Boot, Graphs, Lane, Seated, Shell};
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Value, Weight, fact, ops,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Weight, fact, ops,
     trace_hybrid,
 };
 use poem_compiler::Budget;
@@ -33,7 +33,7 @@ impl ForwardHybrid for Micro {
         spec
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs
             .recorder()
             .declare_switch("mode", &["encode", "denoise"]);
@@ -88,15 +88,14 @@ impl ForwardHybrid for Micro {
                 None,
                 Some(&!fact::switch_is("mode", "denoise")),
                 false,
-                false,
-                None,
                 None,
                 None,
                 false,
             )
         };
         let h = ops::linear::matmul(&a, &w("o", WIDTH, plane));
-        ops::linear::lm_head(&h, &table)
+        let logits = ops::linear::lm_head(&h, &table);
+        poem::output("logits", &logits, None);
     }
 }
 

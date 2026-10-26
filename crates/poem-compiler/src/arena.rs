@@ -7,61 +7,6 @@ use crate::budget::Budgets;
 use crate::compiled::Region;
 use crate::error::{Error, Share, Unrectangled};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Readers {
-    EveryClass,
-    ItsOwnClasses,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Export {
-    seam: &'static str,
-    read_by: Readers,
-}
-
-const EXPORTS: [Export; 7] = [
-    Export {
-        seam: "out",
-        read_by: Readers::EveryClass,
-    },
-    Export {
-        seam: "mtp",
-        read_by: Readers::ItsOwnClasses,
-    },
-    Export {
-        seam: "attn.scores",
-        read_by: Readers::ItsOwnClasses,
-    },
-    Export {
-        seam: "mtp.drafts",
-        read_by: Readers::ItsOwnClasses,
-    },
-    Export {
-        seam: "velocity",
-        read_by: Readers::ItsOwnClasses,
-    },
-    Export {
-        seam: "hidden",
-        read_by: Readers::ItsOwnClasses,
-    },
-    Export {
-        seam: "pixels",
-        read_by: Readers::ItsOwnClasses,
-    },
-];
-
-pub const EXPORT_SEAMS: [&str; 7] = [
-    EXPORTS[0].seam,
-    EXPORTS[1].seam,
-    EXPORTS[2].seam,
-    EXPORTS[3].seam,
-    EXPORTS[4].seam,
-    EXPORTS[5].seam,
-    EXPORTS[6].seam,
-];
-
-pub const FLOAT_READOUT_SEAMS: [&str; 3] = [EXPORTS[4].seam, EXPORTS[5].seam, EXPORTS[6].seam];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowExpr {
     Const(u64),
@@ -179,9 +124,9 @@ pub const READOUTS_FLOOR: u32 = 4;
 
 /// The logit rows a lane may read out in one fire under `trace`: a block
 /// drafter's verified block (and its anchor where proposals start at row 0),
-/// or an MTP head's drafts and the anchor they
-/// follow, never under [`READOUTS_FLOOR`]. On a vocab-wide head each row a
-/// lane is the vocab's width again in every readout plane (two 1.9 GiB
+/// or the tokens an output of ids drafts past each readout row and the row
+/// they follow, never under [`READOUTS_FLOOR`]. On a vocab-wide head each row
+/// a lane is the vocab's width again in every readout plane (two 1.9 GiB
 /// planes at 16 rows a lane on Qwen3.6-27B's 248k vocab, 256 lanes).
 #[must_use]
 pub fn readouts_per_lane(trace: &Trace) -> u32 {
@@ -190,23 +135,26 @@ pub fn readouts_per_lane(trace: &Trace) -> u32 {
     let block = trace.drafter.as_ref().map_or(0, |drafter| {
         drafter.rows + u32::from(drafter.proposals_from == 0)
     });
-    let mtp = trace
-        .seams
+    let drafted = trace
+        .outputs
         .iter()
-        .filter(|seam| seam.seam == EXPORTS[3].seam)
-        .flat_map(|seam| seam.values.iter())
-        .filter_map(|value| match &trace.values.get(value.0 as usize)?.ty {
-            Ty::Tensor { shape, .. } => {
-                shape.iter().skip(1).try_fold(1u32, |width, dim| match dim {
-                    Dim::Const(n) => width.checked_mul(u32::try_from(*n).ok()?),
-                    _ => None,
-                })
-            }
-            Ty::Struct(_) => None,
-        })
+        .filter_map(
+            |output| match &trace.values.get(output.value.0 as usize)?.ty {
+                Ty::Tensor {
+                    shape,
+                    dtype: Dtype::I32,
+                } if shape.first() == Some(&Dim::Readouts) => {
+                    shape.iter().skip(1).try_fold(1u32, |width, dim| match dim {
+                        Dim::Const(n) => width.checked_mul(u32::try_from(*n).ok()?),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            },
+        )
         .max()
         .map_or(0, |drafts| drafts.saturating_add(1));
-    READOUTS_FLOOR.max(block).max(mtp)
+    READOUTS_FLOOR.max(block).max(drafted)
 }
 
 /// A readout plane whose row is at most this wide (a velocity or hidden
@@ -669,9 +617,24 @@ pub(crate) fn carve(
     let (mut spans, live_in) = lives(trace, &placements, classes);
     outlive_the_region(trace, conc, &mut spans);
 
+    let stacks = stacks(trace, &placements);
     let mut conservative = placements.clone();
-    let blind = place(&mut conservative, &spans, &live_in, conc, Columns::PerValue);
-    let shared = place(&mut placements, &spans, &live_in, conc, Columns::Shared);
+    let blind = place(
+        &mut conservative,
+        &spans,
+        &live_in,
+        &stacks,
+        conc,
+        Columns::PerValue,
+    );
+    let shared = place(
+        &mut placements,
+        &spans,
+        &live_in,
+        &stacks,
+        conc,
+        Columns::Shared,
+    );
     let (placements, bytes) = if shared < blind {
         (placements, shared)
     } else {
@@ -939,26 +902,21 @@ fn lives(
         }
     }
 
-    for export in EXPORTS {
-        for seam in trace.seams.iter().filter(|s| s.seam == export.seam) {
-            for value in &seam.values {
-                let root = root(placements, *value);
-                if !placements
-                    .get(root.0 as usize)
-                    .is_some_and(Placement::is_arena)
-                {
-                    continue;
-                }
-                spans[root.0 as usize]
-                    .get_or_insert(Span {
-                        first: 0,
-                        last: end,
-                    })
-                    .last = end;
-                if export.read_by == Readers::EveryClass {
-                    widen(&mut live_in[root.0 as usize], &everywhere);
-                }
+    for output in &trace.outputs {
+        for value in core::iter::once(output.value).chain(output.grid) {
+            let root = root(placements, value);
+            if !placements
+                .get(root.0 as usize)
+                .is_some_and(Placement::is_arena)
+            {
+                continue;
             }
+            spans[root.0 as usize]
+                .get_or_insert(Span {
+                    first: 0,
+                    last: end,
+                })
+                .last = end;
         }
     }
 
@@ -1046,17 +1004,62 @@ fn align(bytes: u64) -> u64 {
     bytes.div_ceil(BIND_ALIGN) * BIND_ALIGN
 }
 
+/// The slots of each output written at several layers, in the order it was
+/// written: one plane, a layer after another. An output whose layers differ
+/// in shape, or share a slot, is left to its slots.
+fn stacks(trace: &Trace, placements: &[Placement]) -> Vec<Vec<usize>> {
+    let mut names: Vec<&str> = Vec::new();
+    for output in &trace.outputs {
+        if output.layer.is_some() && !names.contains(&output.name.as_str()) {
+            names.push(&output.name);
+        }
+    }
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let slots: Vec<usize> = trace
+                .outputs
+                .iter()
+                .filter(|output| output.name == name && output.layer.is_some())
+                .map(|output| root(placements, output.value).0 as usize)
+                .collect();
+            let first = placements.get(*slots.first()?)?;
+            let alike = slots.iter().enumerate().all(|(at, slot)| {
+                placements.get(*slot).is_some_and(|placed| {
+                    placed.is_arena() && pitch_and_bytes(placed) == pitch_and_bytes(first)
+                }) && !slots[..at].contains(slot)
+            });
+            (slots.len() > 1 && alike).then_some(slots)
+        })
+        .collect()
+}
+
+fn pitch_and_bytes(slot: &Placement) -> Option<(RowExpr, u64, Dtype, u64)> {
+    match slot {
+        Placement::Arena {
+            rows,
+            width,
+            dtype,
+            bytes,
+            ..
+        } => Some((*rows, *width, *dtype, *bytes)),
+        _ => None,
+    }
+}
+
 fn place(
     placements: &mut [Placement],
     spans: &[Option<Span>],
     live_in: &[ClassSet],
+    stacks: &[Vec<usize>],
     conc: &Concurrency,
     mode: Columns,
 ) -> u64 {
+    let stacked = |id: usize| stacks.iter().any(|stack| stack.contains(&id));
     let mut order: Vec<(u64, Span, usize)> = placements
         .iter()
         .enumerate()
-        .filter(|(_, slot)| slot.is_arena())
+        .filter(|(id, slot)| slot.is_arena() && !stacked(*id))
         .map(|(id, slot)| {
             let span = spans[id].expect("`spans` answers every arena slot");
             (align(slot.bytes()), span, id)
@@ -1079,7 +1082,28 @@ fn place(
             .then(a.2.cmp(&b.2))
     });
 
-    let columns = gather(placements, live_in, &order, mode);
+    let mut columns: Vec<Column> = stacks
+        .iter()
+        .map(|stack| {
+            let slot = align(placements[stack[0]].bytes());
+            let mut column = Column {
+                size: slot * stack.len() as u64,
+                span: spans[stack[0]].expect("`spans` answers every arena slot"),
+                classes: ClassSet::default(),
+                pitch: None,
+                members: Vec::with_capacity(stack.len()),
+            };
+            for (layer, id) in stack.iter().enumerate() {
+                let span = spans[*id].expect("`spans` answers every arena slot");
+                column.span.first = column.span.first.min(span.first);
+                column.span.last = column.span.last.max(span.last);
+                widen(&mut column.classes, &live_in[*id]);
+                column.members.push((*id, slot * layer as u64));
+            }
+            column
+        })
+        .collect();
+    columns.extend(gather(placements, live_in, &order, mode));
 
     let mut placed: Vec<(u64, u64, Reach)> = Vec::with_capacity(columns.len());
     let mut blockers: Vec<(u64, u64)> = Vec::new();
@@ -1101,11 +1125,11 @@ fn place(
             }
             at = at.max(*to);
         }
-        for id in &column.members {
+        for (id, within) in &column.members {
             let Placement::Arena { offset, .. } = &mut placements[*id] else {
                 unreachable!("only arena placements are gathered into columns")
             };
-            *offset = at;
+            *offset = at + within;
         }
         placed.push((at, column.size, reach));
         bytes = bytes.max(at + column.size);
@@ -1124,7 +1148,8 @@ struct Column {
     span: Span,
     classes: ClassSet,
     pitch: Option<(RowExpr, u64, Dtype)>,
-    members: Vec<usize>,
+    /// Each slot, and where it sits inside the column.
+    members: Vec<(usize, u64)>,
 }
 
 fn gather(
@@ -1153,14 +1178,14 @@ fn gather(
                 column.span.first = column.span.first.min(span.first);
                 column.span.last = column.span.last.max(span.last);
                 widen(&mut column.classes, classes);
-                column.members.push(*id);
+                column.members.push((*id, 0));
             }
             None => columns.push(Column {
                 size: *size,
                 span: *span,
                 classes: classes.clone(),
                 pitch,
-                members: vec![*id],
+                members: vec![(*id, 0)],
             }),
         }
     }

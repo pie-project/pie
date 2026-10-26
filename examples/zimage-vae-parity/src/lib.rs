@@ -9,8 +9,7 @@
 //!    clip's box (`[h, w, 16]`), so the geometry the input needs and the
 //!    numbers it reads travel together and neither is a payload the guest
 //!    hands the shell;
-//! 3. the epilogue reads the `pixels` seam through `intrinsics::pixels(0,
-//!    rows, 3)` — `8h·8w` rows of RGB in `[-1, 1]` — and puts it on one channel;
+//! 3. the epilogue reads the `pixels` seam through `intrinsics::output_rows(0, "pixels", //!    rows)` — `8h·8w` rows of RGB in `[-1, 1]` — and puts it on one channel;
 //! 4. that channel becomes a `frames` handle through
 //!    `Channel::take_frames`, and `session::send_frames` streams it to the
 //!    client as a PNG. The pixels never enter linear memory on that road.
@@ -141,10 +140,10 @@ fn decode_reading() -> Result<Decode> {
             continue;
         };
         let Some(width) = lane
-            .readout
-            .as_ref()
-            .filter(|readout| readout.kind == model::ReadoutKind::Pixels && !lane.embeds)
-            .map(|readout| readout.width)
+            .outputs
+            .iter()
+            .find(|output| output.name == "pixels" && !lane.embeds)
+            .map(|output| output.width)
         else {
             continue;
         };
@@ -261,7 +260,7 @@ async fn main(input: Input) -> Result<Output> {
     let out = Channel::new([rows, width], dtype::f32).named("pixels");
     let readback = out;
     pass.epilogue(move || {
-        readback.put(intrinsics::pixels(0, rows, width));
+        readback.put(intrinsics::output_rows(0, "pixels", rows));
     });
     pass.submit(&pipe).context("the vae.decode lane")?;
 

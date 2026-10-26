@@ -63,7 +63,7 @@ fn every_drafter_text_states_its_block() {
         for platform in PLATFORMS {
             let trace = row(prefix).trace(platform);
             assert_eq!(trace.drafter, Some(want), "{prefix}* on {platform:?}");
-            let seams: Vec<&str> = trace.seams.iter().map(|s| s.seam.as_str()).collect();
+            let seams: Vec<&str> = trace.outputs.iter().map(|s| s.name.as_str()).collect();
             assert!(
                 seams.iter().any(|s| s.contains("mtp")),
                 "{prefix}* on {platform:?} plants no draft seam; seams are {seams:?}"

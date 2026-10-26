@@ -344,7 +344,7 @@ impl Block<'_> {
 
                 let r = rng_state.take();
                 let t = reshape(temp.read(), []);
-                let logits = intrinsics::logits(); // [length, vocab]
+                let logits = intrinsics::output(0, "logits"); // [length, vocab]
                 let scaled = &logits / &t;
                 let probs = softmax(&scaled);
                 let h = entropy(&probs); // [length]
@@ -600,7 +600,11 @@ async fn main(input: Input) -> Result<Output> {
     let taps_width = self_cond_taps()?;
     let taps_used = input.taps.unwrap_or(taps_width).min(taps_width);
     // The canvas attends both ways, so the runtime cannot cut it: one fire reads every row.
-    let readable = max_readout_rows(model::ReadoutKind::Logits);
+    let readable = model::lane_of(&[])?
+        .outputs
+        .iter()
+        .find(|output| output.name == "logits")
+        .map_or(1, |output| output.max_rows) as usize;
     if readable < length as usize {
         return Err(format!(
             "the engine reads out at most {readable} rows a fire and a canvas is {length}"
@@ -782,7 +786,7 @@ async fn encode(
         let q_out = Channel::new([1], dtype::f32).named("quality_e");
         let denom = (len - 1) as f32;
         fwd.epilogue(move || {
-            let lp = log_softmax(intrinsics::logits()); // [len, vocab]
+            let lp = log_softmax(intrinsics::output(0, "logits")); // [len, vocab]
             let picks = gather_row(&lp, next.read()); // [len]
             let mean = &reduce_sum(&(&picks * &weight.read())) / denom;
             q_out.put(reshape(&mean, [1]));
@@ -794,7 +798,7 @@ async fn encode(
         let last = Channel::new([1], dtype::i32).named("last_e");
         fwd.epilogue(move || {
             last.put(reshape(
-                cast(reduce_argmax(intrinsics::logits()), dtype::i32),
+                cast(reduce_argmax(intrinsics::output(0, "logits")), dtype::i32),
                 [1],
             ));
         });

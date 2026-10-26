@@ -1,6 +1,6 @@
 use poem_compiler::{Budget, Budgets, DeviceProfile, PatchLadder, RowAxis, compile, compile_axes};
 use poem_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, Node, Operation, Param, Seam, Trace, Ty, ValueDecl, ValueId,
+    CacheRow, Def, Dim, Dtype, Guard, Node, Operation, Param, Trace, Ty, ValueDecl, ValueId,
 };
 use poem_ir::{NormAxis, NormWeight};
 
@@ -83,10 +83,11 @@ fn tower_and_trunk() -> Trace {
         }],
         values,
         nodes,
-        seams: vec![Seam {
-            seam: "out".to_string(),
-            values: vec![chain],
+        outputs: vec![poem_ir::Output {
+            name: "logits".to_string(),
+            value: chain,
             layer: None,
+            grid: None,
         }],
         drafter: None,
         inputs: Vec::new(),

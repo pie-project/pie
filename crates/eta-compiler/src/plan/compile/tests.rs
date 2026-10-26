@@ -3,8 +3,8 @@ use alloc::vec;
 use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
-use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{EngineCaps, Graph, Port, Readout, ReadoutKind};
+use eta_ir::op::Op;
+use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port};
 use eta_ir::types::{Dtype, Literal, Shape};
 use eta_ir::validate::bind;
 
@@ -21,14 +21,14 @@ fn channel(shape: Shape, dtype: Dtype, role: HostRole, seeded: bool) -> ChannelD
 fn served(c: TraceContainer, vocab: u32) -> BoundTrace {
     bind(
         c,
-        vec![Some(Readout {
-            kind: ReadoutKind::Logits,
+        vec![vec![OutputDecl {
+            name: "logits".into(),
+            axis: Axis::Row,
             width: vocab,
-        })],
-        Graph {
-            num_layers: 2,
-            ..Graph::default()
-        },
+            dtype: Dtype::F32,
+            layers: 0,
+            readout: true,
+        }]],
         EngineCaps::default(),
     )
     .unwrap()
@@ -66,8 +66,8 @@ pub(super) fn program(prefix_constant: u32, global_channel_offset: usize) -> Bou
         StageProgram {
             stage: Stage::Epilogue,
             ops: vec![
-                Op::IntrinsicVal {
-                    intr: IntrinsicId::Logits,
+                Op::Output {
+                    index: 0,
                     lane: 0,
                     shape: Shape::matrix(1, vocab),
                     dtype: Dtype::F32,
@@ -85,7 +85,7 @@ pub(super) fn program(prefix_constant: u32, global_channel_offset: usize) -> Bou
         },
     ];
     let container = TraceContainer {
-        names: vec![],
+        names: vec!["logits".into()],
         channels,
         ports: vec![
             PortBinding {

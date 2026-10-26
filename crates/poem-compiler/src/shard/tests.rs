@@ -1,5 +1,19 @@
 use poem_ir::Platform;
 
+/// The gathers that bring a layer's captured scores back whole, each read
+/// out as `attn.scores`: one per layer whose attention captures them.
+fn score_gathers(trace: &poem_ir::Trace) -> usize {
+    (trace.outputs.iter())
+        .filter(|output| output.name == "attn.scores")
+        .filter(|output| match trace.values[output.value.0 as usize].def {
+            poem_ir::Def::Op(at) => {
+                poem_ir::Operands::name(&trace.nodes[at as usize].op) == "collective.all_gather"
+            }
+            _ => false,
+        })
+        .count()
+}
+
 /// A row-parallel projection leaves each rank a partial sum, which is reduced
 /// once, right after it; the tied table is cut by its rows, its lookup's rows
 /// summed once and its head's logits gathered once, and nothing else is
@@ -21,15 +35,16 @@ fn a_split_row_reduces_each_projection_once() {
         48 + 1,
         "one per mixer and one per mlp, and the tied table's lookup"
     );
+    let scores = score_gathers(&trace);
     assert_eq!(
         count("collective.all_gather"),
-        1,
-        "the tied head's logits, once"
+        1 + scores,
+        "the tied head's logits, once, and each full layer's scores"
     );
     let whole = crate::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16")
         .expect("the one-rank row")
         .trace(Platform::Cuda);
-    assert_eq!(trace.nodes.len(), whole.nodes.len() + 48 + 2);
+    assert_eq!(trace.nodes.len(), whole.nodes.len() + 48 + 2 + scores);
 }
 
 /// A package that leaves its cuts to the compiler splits as Megatron does:
@@ -62,10 +77,15 @@ fn an_inferred_package_reduces_each_projection_once() {
         2 * LLAMA_8B_LAYERS,
         "one per attention and one per mlp"
     );
-    assert_eq!(count("collective.all_gather"), 1, "the logits, once");
+    assert_eq!(score_gathers(&trace), LLAMA_8B_LAYERS, "each layer's scores");
+    assert_eq!(
+        count("collective.all_gather"),
+        1 + LLAMA_8B_LAYERS,
+        "the logits, once, and each layer's scores"
+    );
     assert_eq!(
         trace.nodes.len(),
-        whole.nodes.len() + 2 * LLAMA_8B_LAYERS + 1
+        whole.nodes.len() + 2 * LLAMA_8B_LAYERS + 1 + LLAMA_8B_LAYERS
     );
 }
 

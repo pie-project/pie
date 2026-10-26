@@ -339,8 +339,6 @@ pub struct FireBindings {
 
     pub tables: FireTables,
 
-    pub scores: Option<crate::scores::ScoreSeat>,
-
     pub device: Device,
 
     pub toggles: Toggles,

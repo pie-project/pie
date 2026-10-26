@@ -16,7 +16,7 @@ pub enum Site {
     Output { node: usize, op: &'static str },
     Alias { node: usize, op: &'static str },
     MergeArm { merge: ValueId },
-    Seam { seam: String },
+    Named { output: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,12 +588,12 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
         }
     }
 
-    for seam in &trace.seams {
-        for &id in &seam.values {
+    for output in &trace.outputs {
+        for id in output.values() {
             if !in_range(id) {
                 faults.push(Fault::OutOfRange {
-                    site: Site::Seam {
-                        seam: seam.seam.clone(),
+                    site: Site::Named {
+                        output: output.name.clone(),
                     },
                     id,
                     len,
@@ -759,7 +759,7 @@ impl Display for Site {
             Site::Output { node, op } => write!(f, "node {node} ({op}): output"),
             Site::Alias { node, op } => write!(f, "node {node} ({op}): alias"),
             Site::MergeArm { merge } => write!(f, "merge {}: arm", V(*merge)),
-            Site::Seam { seam } => write!(f, "seam \"{seam}\": value"),
+            Site::Named { output } => write!(f, "output \"{output}\": value"),
         }
     }
 }

@@ -68,7 +68,7 @@ async def main(input: dict) -> dict:
     @fwd_p.epilogue
     def _prefill_epilogue():
         r = rng_p.take()
-        logits = intrinsics.logits()
+        logits = intrinsics.output(0, "logits")
         token = step(logits, temperature, r)
         r_next = r + iota(2)
         tok_out_p.put(token)
@@ -102,7 +102,7 @@ async def main(input: dict) -> dict:
         @fwd.epilogue
         def _decode_epilogue():
             r = rng.take()
-            logits = intrinsics.logits()
+            logits = intrinsics.output(0, "logits")
             token = step(logits, temperature, r)
 
             r_next = r + iota(2)

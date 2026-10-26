@@ -119,7 +119,7 @@ async fn main(input: Input) -> Result<String> {
             // producer still executes and writes a full [B, vocab] tensor into
             // that elided 4-byte slot, corrupting the sampler's scratch — the
             // failure is silent and yields plausible-looking junk tokens.
-            let logits = intrinsics::logits(); // [1, vocab] (single read-out row)
+            let logits = intrinsics::output(0, "logits"); // [1, vocab] (single read-out row)
             let scaled = &reshape(&logits, [1, vocab]) / temperature;
             let probs = softmax(&scaled);
             let keep = pivot_threshold(&probs, cummass_le(top_p));
@@ -173,9 +173,9 @@ async fn main(input: Input) -> Result<String> {
             // B=1 arrives squeezed to `[vocab]`; B>=2 must stay the bare intrinsic,
             // or the fused nucleus fast path is skipped and the sample comes back empty.
             let logits = if b == 1 {
-                reshape(intrinsics::logits(), [b, vocab])
+                reshape(intrinsics::output(0, "logits"), [b, vocab])
             } else {
-                intrinsics::logits()
+                intrinsics::output(0, "logits")
             }; // [B, vocab]
             let scaled = &logits / temperature;
             let probs = softmax(&scaled);

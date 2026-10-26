@@ -4,10 +4,10 @@
 // Attention mass capture, one workgroup a (request, query head): each of the
 // request's last `observe` query rows takes a causal softmax over the keys
 // in its pages, and the mean of those rows' probabilities lands per key in
-// an f32 slab row (lane `lane_offset + request`, plane `plane + head`, a row
-// `kv_max` wide). Eight strips of 32 lanes walk the keys; a dot reduces
-// through workgroup memory, no subgroup operation. Two passes a row: the
-// first finds the softmax's maximum and sum, the second lands the mass.
+// an f32 row (lane `lane_offset + request`, a `kv_max` run per query head).
+// Eight strips of 32 lanes walk the keys; a dot reduces through workgroup
+// memory, no subgroup operation. Two passes a row: the first finds the
+// softmax's maximum and sum, the second lands the mass.
 
 #ifndef PIE_HEAD_DIM_MAX
 #error "attn/score.slang is compiled at a head width bound: -DPIE_HEAD_DIM_MAX"
@@ -34,8 +34,6 @@ struct Params {
     float sm_scale;
     int observe;
     int lane_offset;
-    int plane_stride;
-    int plane;
     int kv_max;
 };
 PIE_PARAMS(7, Params, params);
@@ -90,8 +88,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint lane = tid % uint(PIE_LANES);
     uint head_dim = uint(params.head_dim);
 
-    uint out_base = (uint(params.lane_offset + request) * uint(params.plane_stride)
-        + uint(params.plane + head)) * uint(params.kv_max);
+    uint out_base = (uint(params.lane_offset + request) * uint(params.num_q_heads)
+        + uint(head)) * uint(params.kv_max);
     for (uint i = tid; i < uint(params.kv_max); i += uint(PIE_THREADS)) {
         scores[out_base + i] = 0.0;
     }

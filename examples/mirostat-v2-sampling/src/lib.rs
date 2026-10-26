@@ -178,7 +178,7 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.epilogue(move || {
         let mu_v = mu_p.take();
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
-        let logits = intrinsics::logits(); // [vocab] f32 (single read-out row)
+        let logits = intrinsics::output(0, "logits"); // [vocab] f32 (single read-out row)
         let (token, surprise) = mirostat_step(floor, logits, vocab, &mu_v, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
@@ -216,7 +216,7 @@ async fn main(input: Input) -> Result<Output> {
             // Takes + compute first, PUTS last (value-id discipline).
             let mu_v = mu_state.take(); // [1] f32, device loop-carried
             let r = rng.take(); // [2] u32 rng state
-            let logits = intrinsics::logits(); // [vocab] f32
+            let logits = intrinsics::output(0, "logits"); // [vocab] f32
             let (token, surprise) = mirostat_step(floor, logits, vocab, &mu_v, &r);
 
             let r_next = &r + iota(2);

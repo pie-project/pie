@@ -16,7 +16,7 @@ use eta_compiler::plan::compile_bound;
 use eta_dsl::Traced;
 use eta_dsl::prelude::*;
 use eta_exec::Extents;
-use eta_ir::registry::{EngineCaps, GeometryClass, Graph, Readout, ReadoutKind};
+use eta_ir::registry::{EngineCaps, GeometryClass};
 use eta_ir::validate::bind;
 
 const ROWS: u32 = 5;
@@ -84,11 +84,7 @@ fn a_verify_lands_what_the_point_rule_reads() {
     let at = |name: &str| names.iter().position(|n| n == name).unwrap() as u32;
     let bound = bind(
         traced.container().clone(),
-        vec![Some(Readout {
-            kind: ReadoutKind::Logits,
-            width: VOCAB,
-        })],
-        Graph::default(),
+        vec![vec![crate::bound::logits_decl(VOCAB)]],
         EngineCaps::default(),
     )
     .expect("the epilogue binds");

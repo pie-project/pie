@@ -19,7 +19,7 @@ import * as witWs from 'pie:inferlet/working-set@0.3.0';
 import { Audio, Image } from '../media.js';
 import { Builder, DslChannel } from './builder.js';
 import { kernel } from './intrinsics.js';
-import { Dtype, Port, Shape, Stage, numel, portName, shapeOf } from './ir.js';
+import { Axis, Dtype, OutputDecl, Port, Shape, Stage, numel, portName, shapeOf } from './ir.js';
 import { ChannelState, TraceError } from './trace.js';
 import { ConstData, ConstLike, Tensor, constData, reshape, unpackElems } from './value.js';
 
@@ -429,9 +429,6 @@ export const submitDeadlineUs = () => cached('submitDeadlineUs', () => Number(wi
 export const channelCapacity = () => Math.max(witModel.channelCapacity(), 2);
 export const kvPageSize = () => cached('kvPageSize', () => witModel.kvPageSize());
 const rsStateSize = () => cached('rsStateSize', () => Number(witModel.rsStateSize()));
-/** The most rows one pass may read out through `kind`; the pass itself may be any length. */
-export const maxReadoutRows = (kind: witModel.ReadoutKind) =>
-  cached(`maxReadoutRows:${kind}`, () => Math.max(witModel.maxReadoutRows(kind), 1));
 
 function evenSpans(n: number, cap: number): [number, number][] {
   if (n === 0) return [];
@@ -449,9 +446,34 @@ function evenSpans(n: number, cap: number): [number, number][] {
   return out;
 }
 
-/** Even `[start, end)` spans of `n` rows, each at most `maxReadoutRows(kind)`. */
-export function readoutSpans(n: number, kind: witModel.ReadoutKind): [number, number][] {
-  return evenSpans(n, maxReadoutRows(kind));
+/** Even `[start, end)` spans of `n` rows, each at most `max` (an output's `maxRows`). */
+export function readoutSpans(n: number, max: number): [number, number][] {
+  return evenSpans(n, Math.max(max, 1));
+}
+
+const declared = new Map<string, OutputDecl[]>();
+
+/** An output as the program reads it: an i32 output as i32, any float one f32. */
+function outputDecl(decl: witModel.OutputDecl): OutputDecl {
+  return {
+    name: decl.name,
+    axis: decl.axis as Axis,
+    width: decl.width,
+    dtype: decl.dtype === 'i32' ? Dtype.I32 : Dtype.F32,
+    layers: decl.layers,
+    readout: decl.readout,
+  };
+}
+
+/** The outputs a lane of these switches reads, by the model's lane decl. */
+function laneOutputs(switches: [string, string][]): OutputDecl[] {
+  const key = JSON.stringify(switches);
+  let outputs = declared.get(key);
+  if (!outputs) {
+    outputs = wit('model.lane', () => witModel.lane(switches)).outputs.map(outputDecl);
+    declared.set(key, outputs);
+  }
+  return outputs;
 }
 
 // ---------------------------------------------------------------------------
@@ -657,16 +679,21 @@ export class ForwardPass {
     });
     return out;
   }
-  onAttnProj(body: () => void): void {
-    this.setStage(Stage.ON_ATTN_PROJ, body);
-  }
-  onAttn(body: () => void): void {
-    this.setStage(Stage.ON_ATTN, body);
-  }
 
   attachProgram(): void {
     if (this.programAttached) return;
     const builder = new Builder(this.vocab, this.pageSize);
+    const lanes = Math.max(
+      1,
+      this.lanes.length,
+      ...this.switches.map(([lane]) => lane + 1),
+      ...this.inputs.map(([lane]) => lane + 1),
+    );
+    builder.setOutputs(
+      Array.from({ length: lanes }, (_, lane) =>
+        laneOutputs(this.switches.filter(([at]) => at === lane).map(([, name, value]) => [name, value])),
+      ),
+    );
     for (const [port, ch] of this.ports) builder.bindPort(port, ch.dsl);
     // A channel several lanes read is one program input.
     const listed: Channel[] = [];

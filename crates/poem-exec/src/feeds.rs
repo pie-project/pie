@@ -1,7 +1,7 @@
 use poem_compiler::CompiledModel;
 use poem_ir::{
-    ClassSet, Def, Dtype, GeomKind, InputAxis, InputDecl, LaneClass, LaneClasses, Operands as _,
-    Readout, ReadoutKind, RuntimeInput, Selection, Trace, ValueId,
+    ClassSet, Def, Dim, Dtype, GeomKind, InputAxis, InputDecl, LaneClass, LaneClasses,
+    Operands as _, OutputDecl, RuntimeInput, Selection, Trace, Ty, ValueId,
 };
 
 /// A guest input as a fire lands it: `width` values of `dtype` per lane, row or voxel.
@@ -215,9 +215,183 @@ pub fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -
     classes
 }
 
-/// A class's readout is its first export seam of `out`, `velocity`, `hidden`, `pixels`.
+/// An output as the classes in `classes` write it: its values a layer after
+/// another (one when it is not written per layer), and the grid laying out a
+/// voxel output's own clips.
+#[derive(Debug, Clone)]
+pub struct ClassOutput {
+    pub decl: OutputDecl,
+    pub values: Vec<ValueId>,
+    pub grid: Option<ValueId>,
+    pub classes: ClassSet,
+}
+
+/// Every output by the classes writing it. Classes writing the same values
+/// of a name share one; a name written at several layers stacks them.
+pub fn class_outputs(trace: &Trace, compiled: &CompiledModel) -> Result<Vec<ClassOutput>, String> {
+    // A class whose words all set two values of one switch is no lane's.
+    let table = &compiled.classes;
+    let landed = ClassSet::of((0..table.classes.len()).filter(|&class| {
+        table.classes[class]
+            .words
+            .iter()
+            .any(|&word| one_value_a_switch(&trace.facts, word))
+    }));
+    let mut outs: Vec<ClassOutput> = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
+    for output in &trace.outputs {
+        if !names.contains(&output.name.as_str()) {
+            names.push(&output.name);
+        }
+    }
+    for name in names {
+        let records: Vec<(&poem_ir::Output, ClassSet)> = trace
+            .outputs
+            .iter()
+            .filter(|output| output.name == name)
+            .map(|output| (output, computing_classes(trace, compiled, output.value)))
+            .collect();
+        for class in landed.iter() {
+            let mine: Vec<&poem_ir::Output> = records
+                .iter()
+                .filter(|(_, writers)| writers.contains(class))
+                .map(|(output, _)| *output)
+                .collect();
+            let Some(first) = mine.first() else {
+                continue;
+            };
+            let values: Vec<ValueId> = mine.iter().map(|output| output.value).collect();
+            if let Some(out) = outs
+                .iter_mut()
+                .find(|out| out.decl.name == name && out.values == values)
+            {
+                out.classes.insert(class);
+                continue;
+            }
+            let decl = output_decl(trace, name, &values)?;
+            outs.push(ClassOutput {
+                decl,
+                values,
+                grid: first.grid,
+                classes: ClassSet::of([class]),
+            });
+        }
+    }
+    Ok(outs)
+}
+
+fn output_decl(trace: &Trace, name: &str, values: &[ValueId]) -> Result<OutputDecl, String> {
+    let shape = |value: ValueId| match trace.values.get(value.0 as usize).map(|decl| &decl.ty) {
+        Some(Ty::Tensor { shape, dtype }) => Ok((shape.first().copied(), *dtype)),
+        _ => Err(format!("output `{name}` reads out no tensor")),
+    };
+    let (first, dtype) = shape(values[0])?;
+    let width = crate::store::kv::width_of(trace, values[0])
+        .map_err(|why| format!("output `{name}`: {why}"))?;
+    for value in &values[1..] {
+        let width_here = crate::store::kv::width_of(trace, *value)
+            .map_err(|why| format!("output `{name}`: {why}"))?;
+        if shape(*value)? != (first, dtype) || width_here != width {
+            return Err(format!(
+                "output `{name}` is written at {} layers in different shapes",
+                values.len()
+            ));
+        }
+    }
+    let axis = match first {
+        Some(Dim::Lanes | Dim::LanesPlus(_)) => InputAxis::Lane,
+        Some(Dim::Voxels | Dim::VoxelsTimes(_)) => InputAxis::Voxel,
+        Some(Dim::Tokens | Dim::TokensTimes(_) | Dim::Readouts) => InputAxis::Row,
+        other => {
+            return Err(format!(
+                "output `{name}` lies along {other:?}, no lane, row or voxel"
+            ));
+        }
+    };
+    let layers = if values.len() > 1 {
+        if axis != InputAxis::Lane {
+            return Err(format!(
+                "output `{name}` is written per layer along {axis:?}; only a lane output stacks \
+                 its layers"
+            ));
+        }
+        u32::try_from(values.len()).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    let tail = values
+        .iter()
+        .filter_map(|value| observed(trace, *value))
+        .max()
+        .unwrap_or(0);
+    Ok(OutputDecl {
+        name: name.to_string(),
+        axis,
+        width: u32::try_from(width).map_err(|_| format!("output `{name}` is {width} wide"))?,
+        dtype,
+        layers,
+        readout: first == Some(Dim::Readouts),
+        tail,
+    })
+}
+
+fn one_value_a_switch(facts: &poem_ir::Facts, word: u64) -> bool {
+    facts.switches.iter().all(|decl| {
+        facts
+            .table
+            .iter()
+            .enumerate()
+            .filter(|(bit, fact)| {
+                matches!(fact, poem_ir::Fact::Switch { name, .. } if *name == decl.name)
+                    && word & (1 << bit) != 0
+            })
+            .count()
+            <= 1
+    })
+}
+
+/// The classes whose nodes compute `value`, or an arm of it.
+fn computing_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> ClassSet {
+    match trace.values.get(value.0 as usize).map(|decl| &decl.def) {
+        Some(Def::Op(node)) => compiled
+            .classes
+            .node_mask
+            .get(*node as usize)
+            .cloned()
+            .unwrap_or_default(),
+        Some(Def::Merge(_)) => match compiled.classes.arms_of(value) {
+            Some(arms) => ClassSet::of(
+                arms.iter()
+                    .enumerate()
+                    .filter(|(_, arm)| arm.is_some())
+                    .map(|(class, _)| class),
+            ),
+            None => ClassSet::default(),
+        },
+        _ => ClassSet::default(),
+    }
+}
+
+/// The rows a score capture `value` (or its gather across ranks) observes.
+fn observed(trace: &Trace, value: ValueId) -> Option<u32> {
+    let Def::Op(node) = trace.values.get(value.0 as usize)?.def else {
+        return None;
+    };
+    match trace.nodes.get(node as usize)?.op {
+        poem_ir::Operation::Attn(poem_ir::Attn::ScoreCapture { observe, .. }) => Some(observe),
+        poem_ir::Operation::Collective(poem_ir::Collective::AllGather { x, .. }) => {
+            observed(trace, x)
+        }
+        _ => None,
+    }
+}
+
 #[must_use]
-pub fn lane_classes(trace: &Trace, compiled: &CompiledModel) -> LaneClasses {
+pub fn lane_classes(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    outputs: &[ClassOutput],
+) -> LaneClasses {
     let kv = classes_reading(trace, compiled, |def| {
         matches!(def, Def::Cache(row) if matches!(
             trace.caches.get(*row as usize),
@@ -239,37 +413,6 @@ pub fn lane_classes(trace: &Trace, compiled: &CompiledModel) -> LaneClasses {
             poem_ir::Operation::Attn(poem_ir::Attn::Prefill { causal: false, .. })
         )
     });
-    let [out, _, _, _, velocity, hidden, pixels] = poem_compiler::EXPORT_SEAMS;
-    let exports: Vec<(ReadoutKind, Readout, ClassSet)> = [
-        (out, ReadoutKind::Logits),
-        (velocity, ReadoutKind::Velocity),
-        (hidden, ReadoutKind::Hidden),
-        (pixels, ReadoutKind::Pixels),
-    ]
-    .into_iter()
-    .flat_map(|(name, kind)| {
-        let seams: Vec<_> = trace
-            .seams
-            .iter()
-            .filter(|seam| seam.seam == name)
-            .filter_map(|seam| seam.values.first().copied())
-            .collect();
-        // The last `hidden` a class writes is the one it reads out.
-        let seams: Vec<_> = if kind == ReadoutKind::Hidden {
-            seams.into_iter().rev().collect()
-        } else {
-            seams
-        };
-        seams.into_iter().filter_map(move |value| {
-            let width = crate::store::kv::width_of(trace, value).ok()?;
-            let readout = Readout {
-                kind,
-                width: u32::try_from(width).ok()?,
-            };
-            Some((kind, readout, writer_classes(trace, compiled, value)))
-        })
-    })
-    .collect();
     let patches: Vec<([u32; 3], ClassSet)> = trace
         .values
         .iter()
@@ -299,10 +442,11 @@ pub fn lane_classes(trace: &Trace, compiled: &CompiledModel) -> LaneClasses {
                 reads_state: state.contains(class),
                 embeds: embeds.contains(class),
                 wide: wide.contains(class),
-                readout: exports
+                outputs: outputs
                     .iter()
-                    .find(|(_, _, classes)| classes.contains(class))
-                    .map(|(_, readout, _)| *readout),
+                    .filter(|out| out.classes.contains(class))
+                    .map(|out| out.decl.clone())
+                    .collect(),
                 patch: patches
                     .iter()
                     .find(|(_, readers)| readers.contains(class))

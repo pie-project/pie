@@ -832,7 +832,7 @@ mod tests {
                     layer: None,
                 })
                 .collect(),
-            seams: Vec::new(),
+            outputs: Vec::new(),
             drafter: None,
             inputs: Vec::new(),
         }

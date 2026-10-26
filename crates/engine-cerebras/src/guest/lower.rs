@@ -33,7 +33,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
 use eta_compiler::codegen::launch::{LaunchOp, LaunchPackage, LaunchStage, ValueOrigin};
-use eta_ir::op::{IntrinsicId, tags};
+use eta_ir::op::tags;
 use eta_ir::{Dtype, RngKind, rng};
 use kernels_cerebras::csl::Block;
 use kernels_cerebras::phase::Shard;
@@ -56,15 +56,25 @@ fn refuse<T>(why: impl Into<String>) -> Lowering<T> {
     Err(Refused(why.into()))
 }
 
+/// Output `name` of the pass's lane `lane`, cut by the host from a fire's
+/// plane `layers` deep (0: one), `width` of `dtype` wide.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Read {
+    pub name: String,
+    pub lane: u32,
+    pub layers: u32,
+    pub width: u32,
+    pub dtype: Dtype,
+}
+
 /// The shape of one lowering: how many lanes, how many PEs each lane
-/// spreads over, and the width of the readout planes the host cuts rows
-/// from (`None`: the intrinsic is fed as a value).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// spreads over, and the outputs the host cuts rows of (any other output
+/// is fed as a value).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Batch {
     pub lanes: u32,
     pub cols: u32,
-    pub logits: Option<u32>,
-    pub mtp: Option<u32>,
+    pub reads: Vec<Read>,
 }
 
 /// What a packed slot carries.
@@ -73,14 +83,10 @@ pub enum Feed {
     /// The value itself: `dtype` over `numel` elements (a wide value: the
     /// PE's block of them).
     Value(Dtype, usize),
-    /// `rows` rows of `width` f32 words the host cuts from the readout
-    /// `intrinsic` reads, starting at the lane's first row (a wide feed:
-    /// the PE's block of each row).
-    Rows {
-        intrinsic: IntrinsicId,
-        rows: u32,
-        width: u32,
-    },
+    /// `rows` rows of `width` words the host cuts from `Layout::reads[read]`,
+    /// each layer's from the lane's first row (a wide feed: the PE's block
+    /// of each row).
+    Rows { read: usize, rows: u32, width: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +125,8 @@ pub struct Layout {
     pub out_words: usize,
     /// PEs a lane spreads over.
     pub cols: u32,
+    /// The outputs the host cuts rows of.
+    pub reads: Vec<Read>,
     /// The wide axis (the vocabulary), when the stage has one.
     pub wide: Option<u32>,
     /// Elements of the wide axis each PE holds (`block_len`): PE `x` holds
@@ -266,35 +274,26 @@ pub fn roots(package: &LaunchPackage, at: usize) -> Vec<u32> {
     roots
 }
 
-/// Which readouts stage `at` reads: the logits, the draft head's.
+/// The outputs stage `at` reads, by name and the pass's lane.
 #[must_use]
-pub fn reads(package: &LaunchPackage, at: usize) -> (bool, bool) {
-    let mut logits = false;
-    let mut mtp = false;
-    for id in roots(package, at) {
-        match package.values.get(id as usize).and_then(|v| v.intrinsic) {
-            Some(IntrinsicId::Logits) => logits = true,
-            Some(IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts) => mtp = true,
-            _ => {}
-        }
-    }
-    (logits, mtp)
+pub fn outputs(package: &LaunchPackage, at: usize) -> Vec<(String, u32)> {
+    roots(package, at)
+        .iter()
+        .filter_map(|&id| {
+            let value = package.values.get(id as usize)?;
+            Some((value.output.clone()?, value.lane))
+        })
+        .collect()
 }
 
-/// The wide axis of `package`: the last dimension of its logits intrinsic
-/// (the vocabulary), when it reads one.
+/// The wide axis of `package`: the last dimension of a float output it
+/// reads (the vocabulary), when it reads one.
 #[must_use]
 pub fn wide_axis(package: &LaunchPackage) -> Option<u32> {
     package
         .values
         .iter()
-        .filter(|v| {
-            v.source == ValueOrigin::Intrinsic
-                && matches!(
-                    v.intrinsic,
-                    Some(IntrinsicId::Logits | IntrinsicId::MtpLogits)
-                )
-        })
+        .filter(|v| v.source == ValueOrigin::Output && v.dtype == Dtype::F32)
         .filter_map(|v| v.shape.last().copied())
         .max()
 }
@@ -546,32 +545,38 @@ pub fn lower(package: &LaunchPackage, at: usize, batch: Batch) -> Lowering<Lower
         let feed = match value.source {
             ValueOrigin::Const => continue,
             ValueOrigin::ChannelTake | ValueOrigin::ChannelRead => Feed::Value(value.dtype, n),
-            ValueOrigin::Intrinsic => {
-                let intrinsic = value
-                    .intrinsic
-                    .ok_or_else(|| Refused(format!("intrinsic root {id} names no intrinsic")))?;
-                let read = match intrinsic {
-                    IntrinsicId::Logits => batch.logits,
-                    IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts => batch.mtp,
-                    _ => None,
-                };
-                match read {
+            ValueOrigin::Output => {
+                let name = value.output.as_deref().unwrap_or("");
+                let found =
+                    (batch.reads.iter()).find(|read| read.name == name && read.lane == value.lane);
+                match found {
                     None => Feed::Value(value.dtype, n),
-                    Some(width) => {
-                        let rows = if intrinsic == IntrinsicId::MtpDrafts {
-                            n as u32
-                        } else {
-                            if width == 0 || !n.is_multiple_of(width as usize) {
-                                return refuse(format!(
-                                    "the `{}` root holds {n} values, not whole {width}-wide rows",
-                                    intrinsic.name()
-                                ));
+                    Some(read) => {
+                        if read.dtype != value.dtype {
+                            return refuse(format!(
+                                "output `{name}` is read as {:?} and lands as {:?}",
+                                value.dtype, read.dtype
+                            ));
+                        }
+                        let width = read.width;
+                        let per = width as usize * read.layers.max(1) as usize;
+                        if per == 0 || !n.is_multiple_of(per) {
+                            return refuse(format!(
+                                "output `{name}` holds {n} values, not whole {width}-wide rows \
+                                 of {} layer(s)",
+                                read.layers.max(1)
+                            ));
+                        }
+                        let at = match layout.reads.iter().position(|seen| seen == read) {
+                            Some(at) => at,
+                            None => {
+                                layout.reads.push(read.clone());
+                                layout.reads.len() - 1
                             }
-                            (n / width as usize) as u32
                         };
                         Feed::Rows {
-                            intrinsic,
-                            rows,
+                            read: at,
+                            rows: (n / width as usize) as u32,
                             width,
                         }
                     }
@@ -586,16 +591,13 @@ pub fn lower(package: &LaunchPackage, at: usize, batch: Batch) -> Lowering<Lower
         let (per_pe, wide_slot) = match feed {
             Feed::Value(dtype, _) => (block_of(dtype, id), w),
             Feed::Rows { rows, width, .. } => {
-                if cols > 1 && Some(width) != wide {
+                if w && Some(width) != wide {
                     return refuse(format!(
-                        "a {width}-wide readout beside a {}-wide axis",
+                        "a {width}-wide output beside a {}-wide axis",
                         wide.unwrap_or(0)
                     ));
                 }
-                (
-                    rows as usize * if cols > 1 { block } else { width as usize },
-                    cols > 1,
-                )
+                (rows as usize * if w { block } else { width as usize }, w)
             }
         };
         let direct = !matches!(feed, Feed::Value(Dtype::Bool, _));
@@ -1220,42 +1222,12 @@ impl Gen<'_> {
                 });
                 self.bind(id, v);
             }
-            Feed::Rows {
-                intrinsic,
-                rows,
-                width,
-            } => {
-                let (rows, width) = (
-                    rows as usize,
-                    if slot.wide {
-                        self.block()
-                    } else {
-                        width as usize
-                    },
-                );
+            Feed::Rows { .. } => {
                 // The rows land in the value's array itself.
-                if intrinsic == IntrinsicId::MtpDrafts {
-                    if ty != Ty::I32 {
-                        return refuse("the draft tokens are i32");
-                    }
-                    // Each row's argmax, as the interpreter binds the drafts:
-                    // the rows as a (wide) f32 value, then the argmax.
-                    let plane = self.fresh(Ty::F32, rows * width, slot.wide, id);
-                    self.exports
-                        .push((plane.name.clone(), "f32", format!("in{k}")));
-                    let v = self.fresh(Ty::I32, n, false, id);
-                    self.argmax_rows(&plane, rows, width, &v);
-                    // The rows were this op's own.
-                    self.op_temps.push(plane.name);
-                    self.bind(id, v);
-                } else {
-                    if ty != Ty::F32 {
-                        return refuse("a readout is f32");
-                    }
-                    let v = self.fresh(Ty::F32, n, slot.wide, id);
-                    self.exports.push((v.name.clone(), "f32", format!("in{k}")));
-                    self.bind(id, v);
-                }
+                let v = self.fresh(ty, n, slot.wide, id);
+                self.exports
+                    .push((v.name.clone(), ty.elem(), format!("in{k}")));
+                self.bind(id, v);
             }
         }
         Ok(())

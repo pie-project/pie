@@ -85,12 +85,10 @@ export enum RngKind {
 
 export enum Stage {
   PROLOGUE = 0,
-  ON_ATTN_PROJ = 1,
-  ON_ATTN = 2,
   EPILOGUE = 3,
 }
 
-export const STAGE_NAMES = ['prologue', 'on_attn_proj', 'on_attn', 'epilogue'] as const;
+export const STAGE_NAMES: Record<Stage, string> = { [Stage.PROLOGUE]: 'prologue', [Stage.EPILOGUE]: 'epilogue' };
 
 export enum Port {
   EMBED_TOKENS = 0,
@@ -119,24 +117,22 @@ export function portName(p: Port): string {
   return Port[p].toLowerCase();
 }
 
-export enum Intrinsic {
-  LOGITS = 0,
-  MTP_LOGITS = 1,
-  HIDDEN = 2,
-  QUERY = 3,
-  LAYER = 5,
-  MTP_DRAFTS = 6,
-  ATTN_SCORE = 7,
-  VELOCITY = 8,
-  PIXELS = 9,
+/** Whether an output is one row a lane, a row or a voxel. */
+export enum Axis {
+  LANE = 'lane',
+  ROW = 'row',
+  VOXEL = 'voxel',
 }
 
-export enum SinkScope {
-  PASS_WIDE = 0,
-  ATTENTION = 1,
+/** An output of the model as a lane reads it — `eta_ir::registry::OutputDecl`. */
+export interface OutputDecl {
+  name: string;
+  axis: Axis;
+  width: number;
+  dtype: Dtype;
+  layers: number;
+  readout: boolean;
 }
-
-export const ATTN_SCORE_KV_MAX = 2048;
 
 export enum HostRole {
   NONE = 0,
@@ -162,7 +158,6 @@ export const enum Field {
   PREDICATE,
   LITERAL,
   NAME,
-  INTRINSIC,
   ARGS,
 }
 
@@ -223,7 +218,7 @@ export const tags = {
   CHAN_TAKE: 0x90,
   CHAN_READ: 0x91,
   CHAN_PUT: 0x92,
-  INTRINSIC_VAL: 0xa0,
+  OUTPUT: 0xa0,
   KERNEL_CALL: 0xa1,
   SINK_CALL: 0xa2,
 } as const;
@@ -288,7 +283,7 @@ export const OP_TABLE: ReadonlyMap<number, Row> = new Map<number, Row>([
   [tags.CHAN_TAKE, ['chan_take', 1, [Field.CHAN]]],
   [tags.CHAN_READ, ['chan_read', 1, [Field.CHAN]]],
   [tags.CHAN_PUT, ['chan_put', 0, [Field.CHAN, V]]],
-  [tags.INTRINSIC_VAL, ['intrinsic_val', 1, [Field.INTRINSIC, Field.IMM, Field.DTYPE, Field.SHAPE]]],
+  [tags.OUTPUT, ['output', 1, [Field.NAME, Field.IMM, Field.DTYPE, Field.SHAPE]]],
   [tags.KERNEL_CALL, ['kernel_call', 1, [Field.NAME, Field.DTYPE, Field.SHAPE, Field.ARGS]]],
   [tags.SINK_CALL, ['sink_call', 0, [Field.NAME, Field.ARGS]]],
 ]);
@@ -307,7 +302,6 @@ export class Op {
   litDtype = 0;
   litBits = 0;
   nameIdx = 0;
-  intr = 0;
 
   constructor(tag: number, args: number[] = []) {
     this.tag = tag;
@@ -411,10 +405,10 @@ export class Op {
     op.chan = chan;
     return op;
   }
-  /** `lane` (0 for non-per-lane intrinsics) rides the op's imm. */
-  static intrinsicVal(intr: Intrinsic, shape: Shape, dt: Dtype, lane = 0): Op {
-    const op = new Op(tags.INTRINSIC_VAL);
-    op.intr = intr;
+  /** The output the name `index` names, read by `lane` (the op's imm). */
+  static output(index: number, lane: number, shape: Shape, dt: Dtype): Op {
+    const op = new Op(tags.OUTPUT);
+    op.nameIdx = index;
     op.imms = [lane];
     op.shape = shape;
     op.dtype = dt;
@@ -579,9 +573,6 @@ export function encodeOp(w: Writer, op: Op): void {
         break;
       case Field.NAME:
         w.u16(op.nameIdx);
-        break;
-      case Field.INTRINSIC:
-        w.u16(op.intr);
         break;
       case Field.ARGS: {
         const rest = op.args.slice(value);

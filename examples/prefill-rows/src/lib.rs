@@ -30,10 +30,12 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
     let prompt_i32: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
     let mut rows = Rows::default();
-    for (at, &(base, end)) in readout_spans(n, model::ReadoutKind::Logits)
+    let max = model::lane_of(&[])?
+        .outputs
         .iter()
-        .enumerate()
-    {
+        .find(|output| output.name == "logits")
+        .map_or(1, |output| output.max_rows);
+    for (at, &(base, end)) in readout_spans(n, max).iter().enumerate() {
         let len = end - base;
         let toks =
             Channel::from(&prompt_i32[base as usize..end as usize]).named(&format!("toks_{at}"));
@@ -49,7 +51,7 @@ async fn main(input: Input) -> Result<Output> {
         fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.readout(&readout)?;
         fwd.epilogue(move || {
-            let logits = intrinsics::logits();
+            let logits = intrinsics::output(0, "logits");
             let probs = softmax(&logits);
             let (top_p, top_i) = top_k(&probs, 8);
             arg_out.put(reduce_argmax(&logits));

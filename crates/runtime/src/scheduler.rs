@@ -384,7 +384,6 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     copy_dst: Vec<u32>,
     rs_copy: Option<::engine::StateCopy>,
     frame: Option<FrameStamp>,
-    hook_program: bool,
     lora_program: bool,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
@@ -404,7 +403,6 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         prelaunch_copy,
         rs_copy,
         frame,
-        hook_program,
         lora_program,
     )
 }

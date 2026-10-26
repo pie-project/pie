@@ -91,16 +91,6 @@ pub enum Fault {
         have: u64,
     },
 
-    Scoreless {
-        lane: u32,
-    },
-
-    ScoreWord {
-        lane: u32,
-        word: u64,
-        runs_capture_arm: bool,
-    },
-
     Adapter {
         bank: String,
         why: String,
@@ -292,33 +282,6 @@ impl fmt::Display for Fault {
                 "this load wants {need} bytes of device memory and the device has \
                  {have} free"
             ),
-            Self::Scoreless { lane } => write!(
-                f,
-                "lane {lane} asks to capture its attention mass and this load's artifact \
-                 declares no capture arm: a score axis is a fact the MODEL states \
-                 and this plan carries no `attn.scores` export to read"
-            ),
-            Self::ScoreWord {
-                lane,
-                word,
-                runs_capture_arm,
-            } => {
-                if *runs_capture_arm {
-                    write!(
-                        f,
-                        "lane {lane}'s word {word:#x} puts it in a class that runs \
-                         `attention.prefill_lse`, and it asked for no capture, so the mass \
-                         column would be written and never read"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "lane {lane} asks to capture its attention mass and its word {word:#x} \
-                         puts it on the plain arm, which produces none — the empty capture \
-                         cannot be told from a captured nothing"
-                    )
-                }
-            }
             Self::Adapter { bank, why } => {
                 write!(f, "the adapter bank `{bank}` {why}")
             }

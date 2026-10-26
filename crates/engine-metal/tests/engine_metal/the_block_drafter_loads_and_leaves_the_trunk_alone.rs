@@ -158,11 +158,25 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
     eprintln!(
         "loaded {DEPLOYMENT} in {:.1}s; drafts advertised: {}, depth {}",
         booted.elapsed().as_secs_f64(),
-        shell.drafts(),
-        shell.mtp_depth(),
+        shell
+            .classes()
+            .classes
+            .iter()
+            .any(|class| class.outputs.iter().any(|out| out.name == "mtp.drafts")),
+        shell
+            .classes()
+            .classes
+            .iter()
+            .flat_map(|class| class.outputs.iter())
+            .find(|out| out.name == "mtp.drafts")
+            .map_or(0, |out| out.width),
     );
     assert!(
-        shell.drafts(),
+        shell
+            .classes()
+            .classes
+            .iter()
+            .any(|class| class.outputs.iter().any(|out| out.name == "mtp.drafts")),
         "the load carries a block drafter and advertises no draft head"
     );
 

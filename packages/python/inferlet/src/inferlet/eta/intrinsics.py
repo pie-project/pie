@@ -5,11 +5,11 @@
 
 from __future__ import annotations
 
-from .ir import ATTN_SCORE_KV_MAX, SCALAR, Dtype, Intrinsic, Op, SinkScope, shape_of
-from .trace import ValueType, current_rows, emit, intern_name, record_sink
+from .ir import Axis, Dtype, Op, OutputDecl, shape_of
+from .trace import current_rows, declared_output, emit, intern_name, record_sink
 from .trace import page_size as _page_size
 from .trace import vocab as _vocab
-from .value import Tensor, intrinsic_val, materialize, reshape
+from .value import Tensor, materialize, output_val, reshape
 
 # The interpreter-visible activation dtype. Always F32.
 activation_type = Dtype.F32
@@ -32,74 +32,38 @@ def _single_row_reshape(t: Tensor) -> Tensor:
     return t
 
 
-def logits() -> Tensor:
-    """The LM-head logits, `[n_out, vocab]` f32 — reshaped to `[vocab]` for a
-    single read-out row so single-position samplers read a vector."""
-    rows = max(current_rows(), 1)
-    t = intrinsic_val(Intrinsic.LOGITS, shape_of([rows, vocab()]), Dtype.F32)
-    return _single_row_reshape(t)
+def _declared(lane: int, name: str) -> OutputDecl:
+    decl = declared_output(lane, name)
+    if decl is None:
+        raise ValueError(f"lane {lane} of this pass reads out no output `{name}`")
+    return decl
 
 
-def mtp_logits(k: int) -> Tensor:
-    """The model's `k` draft/future-token heads, `[k, vocab]`; model-gated."""
-    return intrinsic_val(Intrinsic.MTP_LOGITS, shape_of([k, vocab()]), Dtype.F32)
+def output(lane: int, name: str) -> Tensor:
+    """Lane `lane`'s output `name` as the model declares it: its readout rows
+    (a lone row read as its width alone), or its layers stacked."""
+    decl = _declared(lane, name)
+    if decl.axis == Axis.LANE:
+        rows = max(decl.layers, 1)
+    elif decl.readout:
+        rows = max(current_rows(), 1)
+    else:
+        raise ValueError(
+            f"output `{name}` is one row a token or voxel of lane {lane}: "
+            "`output_rows` reads the rows it names"
+        )
+    t = output_val(intern_name(name), lane, shape_of([rows, decl.width]), decl.dtype)
+    return _single_row_reshape(t) if decl.readout else t
 
 
-def mtp_drafts(n: int) -> Tensor:
-    """The draft head's token ids for the fire's readout rows, `[n]` i32."""
-    return intrinsic_val(Intrinsic.MTP_DRAFTS, shape_of([max(n, 1)]), Dtype.I32)
-
-
-def hidden(lane: int, rows: int, width: int) -> Tensor:
-    """The `rows` hidden rows lane `lane` of the pass reads out, `width` wide."""
-    return intrinsic_val(Intrinsic.HIDDEN, shape_of([max(rows, 1), max(width, 1)]), activation_type, lane)
-
-
-def velocity(lane: int, rows: int, width: int) -> Tensor:
-    """The velocity lane `lane` predicts, `[rows, width]`."""
-    return intrinsic_val(Intrinsic.VELOCITY, shape_of([max(rows, 1), max(width, 1)]), activation_type, lane)
-
-
-def pixels(lane: int, rows: int, width: int) -> Tensor:
-    """The pixels lane `lane`'s VAE decode lands, one `[rows, width]` row per output voxel."""
-    return intrinsic_val(Intrinsic.PIXELS, shape_of([max(rows, 1), max(width, 1)]), activation_type, lane)
-
-
-def query(width: int) -> Tensor:
-    """This layer's projected query (attn taps), `[width]`."""
-    return intrinsic_val(Intrinsic.QUERY, shape_of([max(width, 1)]), activation_type)
-
-
-def layer() -> Tensor:
-    """The invocation's layer index (attn taps; u32 scalar)."""
-    return intrinsic_val(Intrinsic.LAYER, SCALAR, Dtype.U32)
-
-
-def attn_score(planes: int) -> Tensor:
-    """Per-(layer, head) attention mass over live KV, `[planes, ATTN_SCORE_KV_MAX]`."""
-    return intrinsic_val(
-        Intrinsic.ATTN_SCORE, shape_of([max(planes, 1), ATTN_SCORE_KV_MAX]), Dtype.F32
-    )
-
-
-def attn_score_kv_max() -> int:
-    return ATTN_SCORE_KV_MAX
+def output_rows(lane: int, name: str, rows: int) -> Tensor:
+    """`rows` rows of lane `lane`'s output `name`, one a token or voxel."""
+    decl = _declared(lane, name)
+    return output_val(intern_name(name), lane, shape_of([max(rows, 1), decl.width]), decl.dtype)
 
 
 class kernel:  # noqa: N801 — spelled like `intrinsics::kernel::*`.
     """Second-party kernels and configuration sinks."""
-
-    @staticmethod
-    def envelope_dot(p_max: int) -> Tensor:
-        """Quest page criticality for this layer, `[p_max]` f32; model-gated."""
-        query_ty = ValueType(shape_of([1]), activation_type)
-        q = emit(Op.intrinsic_val(Intrinsic.QUERY, query_ty.shape, query_ty.dtype), (query_ty,))
-        score_ty = ValueType(shape_of([p_max]), Dtype.F32)
-        name = intern_name("envelope_dot")
-        return Tensor.node(
-            emit(Op.kernel_call(name, [q], score_ty.shape, score_ty.dtype), (score_ty,)),
-            score_ty,
-        )
 
     @staticmethod
     def attn_page_mask(mask) -> None:
@@ -107,7 +71,7 @@ class kernel:  # noqa: N801 — spelled like `intrinsics::kernel::*`.
         mid, _ = materialize(mask)
         name = intern_name("attn_page_mask")
         emit(Op.sink_call(name, [mid]), ())
-        record_sink("attn_page_mask", SinkScope.ATTENTION)
+        record_sink("attn_page_mask")
 
     @staticmethod
     def lora(a, b, sites) -> None:
@@ -118,7 +82,7 @@ class kernel:  # noqa: N801 — spelled like `intrinsics::kernel::*`.
         sid, _ = materialize(sites)
         name = intern_name("lora")
         emit(Op.sink_call(name, [aid, bid, sid]), ())
-        record_sink("lora", SinkScope.PASS_WIDE)
+        record_sink("lora")
 
     @staticmethod
     def adapter_scale(l, sites) -> None:  # noqa: E741
@@ -127,4 +91,4 @@ class kernel:  # noqa: N801 — spelled like `intrinsics::kernel::*`.
         sid, _ = materialize(sites)
         name = intern_name("lora")
         emit(Op.sink_call(name, [lid, sid]), ())
-        record_sink("lora", SinkScope.PASS_WIDE)
+        record_sink("lora")

@@ -22,8 +22,8 @@ sampler drives), and `[engine] max_model_len` large enough for the image's
 latent tokens plus the prompt's rows.
 
 The picture arrives as `./out/image.png`: the guest fires the model's
-`vae.decode` reading on the voxel axis, reads the `pixels` seam with
-`intrinsics::pixels()`, and hands the channel's cell to `send_frames`, so the
+`vae.decode` reading on the voxel axis, reads its `pixels` output with
+`intrinsics::output_rows`, and hands the channel's cell to `send_frames`, so the
 picture never enters WASM memory. A model with no `vae.decode` reading is
 refused by name.
 
@@ -46,6 +46,21 @@ exactly the inputs `model::lane_of` says it reads, and an input it reads by
 any other name is refused by name instead of zero-filled. Positions are not
 among them: the model computes its own, and patches its own latent.
 
+## Standard output names
+
+The sampler reads a model's outputs by name too:
+
+| output | what it is |
+|---|---|
+| `logits` | a lane's logit rows, at its readout rows |
+| `hidden` | the text encoder's rows |
+| `velocity` | the denoiser's velocity, on the voxel axis |
+| `pixels` | the VAE's decoded (or encoded) rows, on the voxel axis |
+
+Like the input names, these are a convention between a model and its guests,
+not runtime vocabulary: a lane reads out whatever `model::lane_of` lists,
+under the names the model gives them.
+
 ## How it finds its way around
 
 The readings are the values of the model's `reading` switch, and what each
@@ -53,16 +68,16 @@ one is comes from what its lanes bind (`model::lane_of`):
 
 | role | the fact that says so |
 |---|---|
-| text encoder | a lane that `embeds` and reads out `Hidden` |
-| denoiser | a token-less lane that reads `latents` and reads out `Velocity` |
+| text encoder | a lane that `embeds` and reads out `hidden` |
+| denoiser | a token-less lane that reads `latents` and reads out `velocity` |
 | the latent / prompt lane | the `stream` whose lane reads `latents` / `context` |
-| a bridge | when the encoder's width is not `context`'s: a token-less `Hidden` reading of `context`'s width whose one non-standard input is a row input of the encoder's width |
+| a bridge | when the encoder's width is not `context`'s: a token-less `hidden` reading of `context`'s width whose one non-standard input is a row input of the encoder's width |
 | VAE decode / encode | `vae.decode` / `vae.encode` |
 
 The latent's size comes from `model::latent()` (channels and spatial
 compression), the step count and trajectory from `model::schedule()`, whose
 kind must be `flow`: the sampler is Euler on a rectified flow. The velocity
-readout must be as wide as the latent's channels. A model with no text reading is refused BY NAME ("this model has no text reading"),
+output must be as wide as the latent's channels. A model with no text reading is refused BY NAME ("this model has no text reading"),
 which is the right answer for the `mini-dit` fixture.
 
 ## One pipeline, nothing back

@@ -25,6 +25,12 @@ As `text-to-image`: `latents` (the VAE's own `[t, h, w, C]` latent, on the
 voxel axis), `timestep`, `guidance`, `context` and `length`. A lane binds
 exactly the inputs `model::lane_of` says it reads; any other name is refused.
 
+## Standard output names
+
+As `text-to-image`: `hidden` (the encoder's rows), `velocity` (the denoiser's)
+and `pixels` (the decode's), read by name from what `model::lane_of` says a
+lane reads out.
+
 ## The path
 
 Text encoder, `steps` denoise fires, then the decode, down one pipeline,

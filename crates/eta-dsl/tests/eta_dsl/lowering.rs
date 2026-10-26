@@ -5,7 +5,7 @@ use eta_dsl::{Channel, TraceError, Traced};
 const VOCAB: u32 = 32_000;
 const PAGE: u32 = 16;
 
-const GOLDEN_S3: u64 = 4138931922745078840;
+const GOLDEN_S3: u64 = 4833977871790530779;
 
 fn leak<T>(v: T) -> &'static T {
     Box::leak(Box::new(v))
@@ -27,11 +27,12 @@ fn build_s3() -> Traced {
     tok.put([1i32]);
 
     let mut b = Builder::new(VOCAB, PAGE);
+    b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::EmbedTokens, tok);
     b.bind_port(Port::EmbedIndptr, indptr);
     b.bind_port(Port::KvLen, len);
     b.stage(Stage::Epilogue, move || {
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let r = rng_ch.take();
         let g = gumbel(&r, [intrinsics::vocab()]);
         let t = reduce_argmax(add(mask_apply(logits, mask.take()), g));
@@ -71,11 +72,12 @@ fn lint_double_endpoint_host_both_ends() {
     dup.note_host_take();
 
     let mut b = Builder::new(VOCAB, PAGE);
+    b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::EmbedTokens, tok);
     b.bind_port(Port::EmbedIndptr, indptr);
     b.stage(Stage::Epilogue, move || {
         let v = dup.take();
-        tok.put(add(&v, reduce_argmax(intrinsics::logits())));
+        tok.put(add(&v, reduce_argmax(intrinsics::output(0, "logits"))));
     });
 
     let err = b.build().expect_err("host-both-endpoints must fail");

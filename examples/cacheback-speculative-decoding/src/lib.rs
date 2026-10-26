@@ -142,7 +142,7 @@ async fn fire(
         },
     )?;
     fwd.epilogue(move || {
-        truth_out.put(reduce_argmax(intrinsics::logits()));
+        truth_out.put(reduce_argmax(intrinsics::output(0, "logits")));
     });
     fwd.submit(pipeline).context("verify-and-extend")?;
 

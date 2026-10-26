@@ -4,18 +4,18 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write as _;
-use eta_ir::op::{intrinsic_tags, tags};
+use eta_ir::op::tags;
 use eta_ir::wire::predicate_tags;
 
 use crate::plan::{CompiledStage, Dimension, Region, SymbolicType};
 
 use super::fused::{
     METAL_M3_REGION_THREADS, emit_addressed_gather, emit_intrinsic_table, emit_logits_argmax,
-    emit_logits_gather, emit_mtp_drafts, emit_score_gather,
+    emit_logits_gather,
 };
 use super::intrinsics::{M3_INTRINSIC_TABLE_BUFFER, addressed_slot};
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
-use super::validate::{grouped_intrinsics_bindable, library_region_valid, used_channel_slots};
+use super::validate::{library_region_valid, outputs_bindable, used_channel_slots};
 use crate::codegen::alias::AliasTable;
 use crate::codegen::fault::M3_THREADS_EXCEEDED;
 use crate::codegen::op_view::{OpView, result_bases};
@@ -761,7 +761,7 @@ pub(super) fn kernel_head(
     source.push_str("    constant M4Step& step [[buffer(11)]],\n");
     let _ = writeln!(
         source,
-        "    const device ulong* all_intrinsic_at [[buffer({M3_INTRINSIC_TABLE_BUFFER})]],"
+        "    const device M1OutputSeat* all_intrinsic_at [[buffer({M3_INTRINSIC_TABLE_BUFFER})]],"
     );
     source.push_str("    uint2 m4_group [[threadgroup_position_in_grid]],\n");
     source.push_str("    uint2 m4_groups [[threadgroups_per_grid]],\n");
@@ -862,7 +862,7 @@ pub fn emit_streamed_region(
         return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::GroupedFused));
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
-    grouped_intrinsics_bindable(&ops, region)?;
+    outputs_bindable(&ops, region)?;
     let bases = result_bases(&ops);
     let channel_count = used_channel_slots(&ops);
     let value_types = &stage.normalized.value_types;
@@ -931,9 +931,7 @@ pub fn emit_streamed_region(
         let producer = region.nodes.iter().map(|n| n.index()).find(|&n| {
             bases[n] == source_value
                 && ops.get(n).is_some_and(|p| {
-                    p.tag == tags::INTRINSIC_VAL
-                        && (p.intr == intrinsic_tags::LOGITS
-                            || p.intr == intrinsic_tags::MTP_LOGITS)
+                    p.tag == tags::OUTPUT && addressed_slot(stage, p, bases[n]).is_none()
                 })
         });
         if let Some(producer) = producer {
@@ -966,12 +964,7 @@ pub fn emit_streamed_region(
         if let Some(&producer) = fused_argmax.get(&node) {
             let slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
             let mut body = String::new();
-            emit_logits_argmax(
-                &mut body,
-                bases[producer],
-                ops[producer].intr == intrinsic_tags::MTP_LOGITS,
-                &slots.o0,
-            );
+            emit_logits_argmax(&mut body, bases[producer], &slots.o0);
             planned.push((node_u32, Plan::Single(body)));
             continue;
         }
@@ -980,54 +973,20 @@ pub fn emit_streamed_region(
         if op.tag == tags::PIVOT_THRESHOLD {
             reads.push(alias.resolve(op.pred_payload));
         }
-        if op.tag == tags::INTRINSIC_VAL {
+        if op.tag == tags::OUTPUT {
             let single_row = key_of(base).len() <= 1;
             let mut body = String::new();
-            match op.intr {
-                _ if let Some(slot) = addressed_slot(op.intr, op.imm) => {
-                    emit_addressed_gather(
-                        &mut body,
-                        base,
-                        slot,
-                        &slots.o0,
-                        "m4_gtid",
-                        "m4_gthreads",
-                    );
-                }
-                intrinsic_tags::MTP_DRAFTS => {
-                    emit_mtp_drafts(&mut body, base, &slots.o0, "m4_gtid", "m4_gthreads");
-                }
-                intrinsic_tags::ATTN_SCORE => {
-                    emit_score_gather(&mut body, base, &slots.o0, "m4_gtid", "m4_gthreads");
-                }
-                intrinsic_tags::LOGITS | intrinsic_tags::MTP_LOGITS => {
-                    emit_logits_gather(
-                        &mut body,
-                        base,
-                        op.intr == intrinsic_tags::MTP_LOGITS,
-                        &slots.o0,
-                        "m4_gtid",
-                        "m4_gthreads",
-                    );
-                }
-                _ => {
-                    slots.a0 = "reinterpret_cast<const device uchar*>(logits)".to_string();
-                    let text = format!(
-                        "    ptir_m1_execute_part({}u, status, descriptors, lane_params + {node}, {}, {}, {}, {}, {}, temporary, m4_gtid, m4_gthreads);\n",
-                        op.tag, slots.a0, slots.a1, slots.a2, slots.o0, slots.o1
-                    );
-                    planned.push((
-                        node_u32,
-                        Plan::Generic {
-                            text,
-                            reads: Vec::new(),
-                            writes: base,
-                            len: key_of(base),
-                            cross: true,
-                        },
-                    ));
-                    continue;
-                }
+            match addressed_slot(stage, op, base) {
+                Some(slot) => emit_addressed_gather(
+                    &mut body,
+                    op,
+                    base,
+                    slot,
+                    &slots.o0,
+                    "m4_gtid",
+                    "m4_gthreads",
+                ),
+                None => emit_logits_gather(&mut body, base, &slots.o0, "m4_gtid", "m4_gthreads"),
             }
             planned.push((
                 node_u32,

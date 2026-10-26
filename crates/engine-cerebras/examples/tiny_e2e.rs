@@ -271,7 +271,7 @@ fn run(
         }
     }
     let mut line = format!("load {loaded:.1}s, {fires} synthetic fires finite ({fired:.1}s)");
-    if shell.readout_seam() == engine::fire::ReadoutSeam::Logits {
+    if shell.readout_width().is_some() {
         match agree(&mut shell) {
             Ok(said) => line.push_str(&format!("; {said}")),
             // A plan whose token lanes read float ports (positions, a
@@ -290,7 +290,7 @@ fn run(
 fn agree(shell: &mut Shell) -> Result<String, String> {
     let facts = shell.trace().facts.clone();
     let word = |query_len: u32| facts.word(&Request::new(query_len, false));
-    let vocab = shell.out_width();
+    let vocab = shell.readout_width().unwrap_or(0);
     let mut lcg = 0x2545_f491_4f6c_dd1du64;
     let prompt: Vec<u32> = (0..6)
         .map(|_| {

@@ -397,16 +397,16 @@ def forward(m, inputs):
         else:
             q, k, v = ops.gather.split_qkv(packed, m.q_heads * d, kv_heads * d)
         v = v * f32(m.value_scale)
-        seam.at(seam.ATTN_QV, [q, v])
         q, k = ops.elemwise.rope(q, positions, d, at.theta, rotary.partial(m.rotary_dim), k = k)
         ops.attn.kv_append(k, v, pages, inputs.write_page(at.kv), inputs.write_offset(at.kv))
-        seam.at(seam.ATTN_Q, [q])
 
-        # Each lane by its kind; a layer with sinks folds them in and keeps
-        # its scores in, one without reads them out at their seam.
+        # Each lane by its kind; a layer with sinks folds them in, one
+        # without reads its scores out.
         a = ops.attn.attend(q, inputs, at.kv, m.q_heads, kv_heads, d, m.sm_scale, window = win,
-                            sinks = at.sinks, mask = True, scores = True, scores_seam = at.sinks == None)
-        seam.at(seam.ATTN_OUT, [a])
+                            sinks = at.sinks, mask = True)
+        if at.sinks == None:
+            scores = ops.attn.score_capture(q, inputs, at.kv, m.q_heads, kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
+            output("attn.scores", scores)
 
         # Each head's values are its first half; the padding after them is
         # cut off before the output projection reads them.
@@ -423,7 +423,7 @@ def forward(m, inputs):
 
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    return ops.linear.lm_head(x, m.head)
+    output("logits", ops.linear.lm_head(x, m.head))
 
 def mlp(x, f):
     if not f.routed:

@@ -968,13 +968,13 @@ def forward(m, inputs):
             x, _ = mix_in(r, mtp.mixer, m)
             draft = ops.linear.lm_head(x, m.head)
             if step == 0:
-                seam.at(seam.MTP, [draft])
+                output("mtp.logits", draft)
             token = ops.sampling.argmax([draft])
             hidden = r
             chain.append(draft)
-        seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax(chain)])
+        output("mtp.drafts", ops.sampling.argmax(chain))
 
-    return logits
+    output("logits", logits)
 
 def mix_in(y, res, m):
     normed = ops.elemwise.rmsnorm_grouped_plus_one(y, res.norm, m.hidden, res.eps)
@@ -1050,18 +1050,17 @@ def attn_mixer(x, inputs, m, a, ix):
     q, gate = ops.gather.split_q_gate(ops.linear.matmul(x, a.qg_proj), d)
     k = ops.linear.matmul(x, a.k_proj)
     v = ops.linear.matmul(x, a.v_proj)
-    seam.at(seam.ATTN_QV, [q, v])
     q = ops.elemwise.rmsnorm_per_head_plus_one(q, a.q_norm, d, a.q_norm_eps)
     k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, d, a.k_norm_eps)
     q, k = rotate(q, k, positions(inputs, m.tower != None), m, a)
     ops.attn.kv_append(k, v, pages, write_page, write_offset)
-    seam.at(seam.ATTN_Q, [q])
 
     # Each lane by its kind; decode and prefill lanes read the key blocks
     # the selector picked.
-    o = ops.attn.attend(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, mask = True, scores = True,
+    o = ops.attn.attend(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, mask = True,
                         selection = qsa_select(x, inputs, m, a, ix), ratio = ix.ratio)
-    seam.at(seam.ATTN_OUT, [o])
+    scores = ops.attn.score_capture(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, observe = 32, kv_max = 2048)
+    output("attn.scores", scores)
     return ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(o, gate), a.o_proj)
 
 def gdn_mixer(x, inputs, g):
@@ -1071,7 +1070,6 @@ def gdn_mixer(x, inputs, g):
     z = ops.linear.matmul(x, g.in_z)
     # The gates read each v head's beta and alpha side by side.
     ba = ops.gather.concat_cols([ops.linear.matmul(x, g.in_b), ops.linear.matmul(x, g.in_a)])
-    seam.at(seam.RECURRENT, [qkv, z])
     one = fact.single_token()
     qkv_d, qkv_p = qkv.on(one), qkv.on(~one)
     z_d, z_p = z.on(one), z.on(~one)

@@ -1126,22 +1126,19 @@ impl Run<'_> {
                 causal: true,
                 selected: None,
                 rel: None,
-            } => {
-                kernels_cuda::attn::prefill_lse_sink(
-                    self.ctx(),
-                    self.ragged_q(q),
-                    self.prefill_plan(plan),
-                    &self.pool_absolute(cache),
-                    window,
-                    head_dim,
-                    kv_heads,
-                    sm_scale,
-                    &mut self.tensor(*o_out),
-                    &mut self.tensor(lse),
-                    sinks,
-                )?;
-                self.capture_scores(q, plan, cache, window, head_dim, kv_heads, sm_scale, lse)
-            }
+            } => kernels_cuda::attn::prefill_lse_sink(
+                self.ctx(),
+                self.ragged_q(q),
+                self.prefill_plan(plan),
+                &self.pool_absolute(cache),
+                window,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                &mut self.tensor(*o_out),
+                &mut self.tensor(lse),
+                sinks,
+            ),
             _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }
     }

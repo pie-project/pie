@@ -17,7 +17,7 @@ export function main(input) {
     const fwd = new ForwardPass();
     fwd.embed(tokens.slice(done));                       // the new tokens
     fwd.state([ws], { fold: 'all' });                    // appended, and final
-    const out = fwd.epilogue(() => reduceArgmax(intrinsics.logits())); // runs on the device
+    const out = fwd.epilogue(() => reduceArgmax(intrinsics.output(0, 'logits'))); // runs on the device
     pipe.submit(fwd);
     done = tokens.length;
     tokens.push(out.takeScalar());

@@ -110,7 +110,7 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
     Ok(lane)
 }
 
-fn reading(readout: model::ReadoutKind, lanes: &[(&str, &[&str])]) -> Result<Reading> {
+fn reading(output: &str, lanes: &[(&str, &[&str])]) -> Result<Reading> {
     let readings = model::switch("reading")
         .map(|decl| decl.values)
         .unwrap_or_default();
@@ -128,15 +128,15 @@ fn reading(readout: model::ReadoutKind, lanes: &[(&str, &[&str])]) -> Result<Rea
                 return None;
             }
             let width = decls.iter().find_map(|lane| {
-                lane.readout
-                    .as_ref()
-                    .filter(|r| r.kind == readout)
-                    .map(|r| r.width)
+                lane.outputs
+                    .iter()
+                    .find(|o| o.name == output)
+                    .map(|o| o.width)
             })?;
             Some((name, width))
         })
         .ok_or_else(|| {
-            format!("this model declares no token-less reading with a {readout:?} readout")
+            format!("this model declares no token-less reading reading out `{output}`")
         })?;
     for (stream, binds) in lanes {
         let lane = lane_reading(&name, stream, binds)?;
@@ -167,10 +167,7 @@ fn length(case: &Case) -> Channel {
 
 /// The refined caption, its width and the padded caption rows.
 async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
-    let r = reading(
-        model::ReadoutKind::Hidden,
-        &[("context", &["caption", "length"])],
-    )?;
+    let r = reading("hidden", &[("context", &["caption", "length"])])?;
     let lane = model::lane_of(&[("reading", r.name.as_str()), ("stream", "context")])?;
     let decl = lane
         .inputs
@@ -190,7 +187,7 @@ async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     let width = r.readout_width;
     let out = Channel::new([rows, width], dtype::f32).named("refined");
     pass.epilogue(move || {
-        out.put(intrinsics::hidden(0, rows, width));
+        out.put(intrinsics::output_rows(0, "hidden", rows));
     });
     pass.submit(pipe).context("refine lane")?;
     let rows_out: Vec<f32> = out.take_host().await?;
@@ -199,7 +196,7 @@ async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
 
 fn denoise_reading() -> Result<Reading> {
     reading(
-        model::ReadoutKind::Velocity,
+        "velocity",
         &[
             ("context", &["context", "timestep", "length"]),
             ("image", &["latents", "timestep"]),
@@ -267,9 +264,9 @@ async fn denoise(
     let out = Channel::new([voxels, width], dtype::f32).named("velocity");
     let ctx_out = ctx_tap.then(|| Channel::new([caption_rows, width], dtype::f32).named("ctx_tap"));
     pass.epilogue(move || {
-        out.put(intrinsics::velocity(1, voxels, width));
+        out.put(intrinsics::output_rows(1, "velocity", voxels));
         if let Some(tapped) = &ctx_out {
-            tapped.put(intrinsics::velocity(0, caption_rows, width));
+            tapped.put(intrinsics::output_rows(0, "velocity", caption_rows));
         }
     });
 
@@ -290,7 +287,6 @@ async fn trajectory(
     stop: Option<u32>,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
     let r = denoise_reading()?;
-    let width = r.readout_width;
     let voxels = case.height * case.width;
     let lat = [case.height, case.width, case.channels];
     let sched = FlowMatchEuler::from_model(steps, None)?;
@@ -304,7 +300,7 @@ async fn trajectory(
     loops.drive(&pass, move |k| {
         let next = euler_step(
             &reshape(latent.take(), [voxels, lat[2]]),
-            &intrinsics::velocity(1, voxels, width),
+            &intrinsics::output_rows(1, "velocity", voxels),
             &at(&dts.read(), k),
         );
         let next = reshape(&next, lat);
@@ -332,16 +328,20 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
         .into_iter()
         .find_map(|name| {
             let lane = model::lane_of(&[("reading", name.as_str())]).ok()?;
-            let hidden = lane.readout.as_ref().map(|r| r.kind) == Some(model::ReadoutKind::Hidden);
+            let hidden = lane.outputs.iter().any(|o| o.name == "hidden");
             (lane.embeds && hidden).then_some((name, lane))
         })
-        .ok_or("this row declares no token reading with a hidden readout (the miniature has no encoder)")?;
+        .ok_or("this row declares no token reading with a hidden output (the miniature has no encoder)")?;
     if !lane.state {
         return Err(format!(
             "reading `{name}` takes tokens but binds no kv space"
         ));
     }
-    let width = lane.readout.map_or(0, |r| r.width);
+    let width = lane
+        .outputs
+        .iter()
+        .find(|o| o.name == "hidden")
+        .map_or(0, |o| o.width);
     let mut ids = inferlet::chat::prefix();
     ids.extend(inferlet::chat::user(prompt));
     ids.extend(inferlet::chat::cue());
@@ -367,7 +367,7 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     pass.state(&[&ws], StateGeometry::default())?;
     let readback = out;
     pass.epilogue(move || {
-        readback.put(intrinsics::hidden(0, len, width));
+        readback.put(intrinsics::output_rows(0, "hidden", len));
     });
     pass.submit(pipe).context("text lane")?;
     let rows: Vec<f32> = out.take_host().await?;

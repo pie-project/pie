@@ -1,5 +1,5 @@
 #![allow(unsafe_code)]
-use engine::fire::{LayerScores, Readout};
+use engine::fire::Readout;
 
 use crate::error::{Fault, Result};
 
@@ -7,12 +7,13 @@ use super::{Enqueued, Shell};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Readback {
-    pub(crate) lanes: Vec<Option<(engine::fire::ReadoutSeam, kernels_cuda::Tensor)>>,
-    pub(crate) columns: Vec<(u32, kernels_cuda::Tensor)>,
+    /// The output each lane reads back, and where its rows are when it is
+    /// not laid out by clips of its own.
+    pub(crate) names: Vec<String>,
+    pub(crate) lanes: Vec<Option<(String, kernels_cuda::Tensor)>>,
     pub(crate) last_row: Vec<u32>,
     pub(crate) first_row: Vec<u32>,
     pub(crate) lane_rows: Vec<u32>,
-    pub(crate) captures: Vec<bool>,
     pub(crate) pixels: Option<PixelsReadback>,
 }
 
@@ -27,8 +28,8 @@ pub(crate) struct PixelsReadback {
 pub struct Settled {
     pub logits: Vec<Vec<f32>>,
     pub rows: Vec<u32>,
-    pub scores: Vec<Vec<LayerScores>>,
-    pub seams: Vec<engine::fire::ReadoutSeam>,
+    /// The output each lane read back.
+    pub outputs: Vec<String>,
     pub pixels: Vec<super::Pixels>,
     pub(super) readback: Option<Readback>,
 }
@@ -163,14 +164,9 @@ impl Shell {
         Ok(Settled {
             logits: Vec::new(),
             rows: Vec::new(),
-            scores: Vec::new(),
-            seams: readback.as_ref().map_or_else(Vec::new, |readback| {
-                readback
-                    .lanes
-                    .iter()
-                    .map(|lane| lane.map_or(engine::fire::ReadoutSeam::Pixels, |(seam, _)| seam))
-                    .collect()
-            }),
+            outputs: readback
+                .as_ref()
+                .map_or_else(Vec::new, |readback| readback.names.clone()),
             pixels: Vec::new(),
             readback,
         })
@@ -228,9 +224,9 @@ impl Shell {
         let mut counts = vec![0u32; lanes];
         let mut raw = Vec::new();
         for lane in 0..lanes {
-            let logits = readback.lanes[lane].map_or_else(
+            let logits = readback.lanes[lane].as_ref().map_or_else(
                 || kernels_cuda::Tensor::new(0, 0, 0, poem_ir::Dtype::Bf16),
-                |(_, plane)| plane,
+                |(_, plane)| *plane,
             );
             let width = logits.width as usize;
             let element = if logits.dtype == poem_ir::Dtype::F32 {
@@ -287,42 +283,6 @@ impl Shell {
             taken[lane] = values;
         }
 
-        let mut scores: Vec<Vec<LayerScores>> = vec![Vec::new(); lanes];
-        if !readback.columns.is_empty() {
-            let mut mass: Vec<u8> = Vec::new();
-            for (lane, scored) in scores.iter_mut().enumerate() {
-                if !readback.captures[lane] {
-                    continue;
-                }
-                let rows = readback.lane_rows[lane];
-                let first = readback.first_row[lane];
-                let mut layers = Vec::with_capacity(readback.columns.len());
-                for (layer, column) in &readback.columns {
-                    let heads = column.width;
-                    let bytes = rows as usize * heads as usize * 4;
-                    mass.clear();
-                    mass.resize(bytes, 0);
-                    self.arena.read(
-                        stream,
-                        column.ptr + u64::from(first) * u64::from(heads) * 4,
-                        &mut mass,
-                    )?;
-                    layers.push(LayerScores {
-                        layer: *layer,
-                        rows,
-                        heads,
-                        lse: mass
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|word| f32::from_le_bytes(*word))
-                            .collect(),
-                    });
-                }
-                *scored = layers;
-            }
-        }
-
         let mut pixels: Vec<super::Pixels> = vec![(Vec::new(), Vec::new()); lanes];
         if let Some(seat) = readback.pixels.as_ref() {
             let clips = seat.grid.rows as usize;
@@ -374,7 +334,6 @@ impl Shell {
 
         settled.logits = taken;
         settled.rows = counts;
-        settled.scores = scores;
         settled.pixels = pixels;
         Ok(())
     }

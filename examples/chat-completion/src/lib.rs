@@ -47,7 +47,7 @@ fn default_top_p() -> f32 {
 /// Returns the sampled token `[1]` i32. Zero temperature is exact greedy
 /// decoding; positive temperatures use nucleus sampling.
 fn sample_token(r: &Tensor, temperature: f32, top_p: f32) -> Tensor {
-    let logits = intrinsics::logits(); // [1, vocab] f32 (read-out row)
+    let logits = intrinsics::output(0, "logits"); // [1, vocab] f32 (read-out row)
     if temperature == 0.0 {
         return reduce_argmax(&logits);
     }

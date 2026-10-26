@@ -1,5 +1,5 @@
 //! What a forward may use: the rows it reads, the facts it branches them on,
-//! the DSL's ops over them and the seams it plants.
+//! the DSL's ops over them and the outputs it reads out.
 //!
 //! The DSL's values hold the trace being recorded, which no Starlark heap
 //! may: a forward handles them by place in the trail this thread records,
@@ -479,6 +479,22 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
+    /// Reads `value` out to the guest as `name`; a voxel `value` laid out
+    /// by clips of its own names their `grid`.
+    fn output<'v>(
+        #[starlark(require = pos)] name: &str,
+        #[starlark(require = pos)] value: Star<'v>,
+        #[starlark(require = named, default = NoneOr::None)] grid: NoneOr<Star<'v>>,
+    ) -> anyhow::Result<NoneType> {
+        let value = <Value as crate::star::bind::Arg>::arg(Some(value))?;
+        let grid = match grid {
+            NoneOr::Other(grid) => Some(<Value as crate::star::bind::Arg>::arg(Some(grid))?),
+            NoneOr::None => None,
+        };
+        dsl("output", || crate::output(name, &value, grid.as_ref()))?;
+        Ok(NoneType)
+    }
+
     /// Joins arms computed over disjoint rows into one value over all of them.
     fn merge<'v>(
         #[starlark(require = pos)] arms: UnpackList<Star<'v>>,
@@ -505,7 +521,6 @@ pub(crate) fn ops(builder: &mut GlobalsBuilder) {
     });
     builder.namespace("fact", facts);
     crate::star::bind::wholes(builder);
-    builder.namespace("seam", seams);
     builder.namespace("rotary", crate::star::bind::rotary);
     builder.namespace("gating", crate::star::bind::gating);
     builder.namespace("routing", crate::star::bind::routing);
@@ -547,39 +562,5 @@ fn facts(builder: &mut GlobalsBuilder) {
 
     fn fresh() -> anyhow::Result<PredicateValue> {
         Ok(PredicateValue(fact::fresh()))
-    }
-}
-
-#[starlark_module]
-fn seams(builder: &mut GlobalsBuilder) {
-    const ATTN_Q: &str = crate::seam::ATTN_Q.name;
-    const ATTN_OUT: &str = crate::seam::ATTN_OUT.name;
-    const ATTN_QV: &str = crate::seam::ATTN_QV.name;
-    const RECURRENT: &str = crate::seam::RECURRENT.name;
-    const IN: &str = crate::seam::IN.name;
-    const OUT: &str = crate::seam::OUT.name;
-    const MTP: &str = crate::seam::MTP.name;
-    const MTP_DRAFTS: &str = crate::seam::MTP_DRAFTS.name;
-    const SCORES: &str = crate::seam::SCORES.name;
-    const VELOCITY: &str = crate::seam::VELOCITY.name;
-    const HIDDEN: &str = crate::seam::HIDDEN.name;
-    const PIXELS: &str = crate::seam::PIXELS.name;
-
-    /// Plants the seam `name` over `values`.
-    fn at<'v>(
-        #[starlark(require = pos)] name: &str,
-        #[starlark(require = pos)] values: UnpackList<Star<'v>>,
-    ) -> anyhow::Result<NoneType> {
-        let values: Vec<Value> = values
-            .items
-            .into_iter()
-            .map(|v| <Value as crate::star::bind::Arg>::arg(Some(v)))
-            .collect::<anyhow::Result<_>>()?;
-        let refs: Vec<&Value> = values.iter().collect();
-        let first = refs
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("seam `{name}` names no value"))?;
-        dsl("seam", || first.rec().seam(name, &refs))?;
-        Ok(NoneType)
     }
 }

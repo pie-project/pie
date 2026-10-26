@@ -39,10 +39,6 @@ pub struct FireLimits {
     /// 0: as many as `max_tokens`.
     #[serde(default)]
     pub max_readouts: u32,
-    /// The lanes of one fire that may capture attention scores (0: as many
-    /// as `max_lanes`).
-    #[serde(default)]
-    pub max_scoring_lanes: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,21 +149,12 @@ pub struct Capabilities {
     #[serde(default)]
     pub has_attn_page_mask: bool,
 
-    /// The loaded graph drafts `mtp_depth` ids a fire.
-    #[serde(default)]
-    pub has_mtp_logits: bool,
-    #[serde(default)]
-    pub mtp_depth: u32,
-
     #[serde(default)]
     pub draft_block: u32,
     #[serde(default)]
     pub draft_mask_token: u32,
     #[serde(default)]
     pub draft_proposals_from: u32,
-
-    #[serde(default)]
-    pub has_attn_score: bool,
 
     /// The facts the loaded trace's rows branch on, which a lane's word is
     /// classified by.

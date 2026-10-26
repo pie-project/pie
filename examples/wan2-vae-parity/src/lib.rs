@@ -63,10 +63,13 @@ struct Output {
     pixels_bytes: u32,
 }
 
-fn readout(reading: &str) -> Option<model::Readout> {
+/// The `pixels` output a reading's video lane reads out, if any.
+fn pixels(reading: &str) -> Option<model::OutputDecl> {
     model::lane_of(&[("reading", reading), ("stream", "video")])
         .ok()?
-        .readout
+        .outputs
+        .into_iter()
+        .find(|output| output.name == "pixels")
 }
 
 fn decoder() -> Result<String> {
@@ -74,10 +77,7 @@ fn decoder() -> Result<String> {
         .map(|decl| decl.values)
         .unwrap_or_default()
         .into_iter()
-        .find(|r| {
-            !r.starts_with("vae.encode")
-                && readout(r).is_some_and(|readout| readout.kind == model::ReadoutKind::Pixels)
-        })
+        .find(|r| !r.starts_with("vae.encode") && pixels(r).is_some())
         .ok_or_else(|| "this model declares no `vae.decode` reading".into())
 }
 
@@ -105,9 +105,9 @@ async fn decode_frame(
 ) -> Result<Vec<f32>> {
     let input = voxel_input(reading)?;
     let rows = frames * pixel_h * pixel_w;
-    let width = readout(reading)
-        .map(|readout| readout.width)
-        .ok_or_else(|| format!("reading `{reading}` reads nothing out on its `video` lane"))?;
+    let width = pixels(reading)
+        .map(|pixels| pixels.width)
+        .ok_or_else(|| format!("reading `{reading}` reads no pixels out on its `video` lane"))?;
     let pass = ForwardPass::new();
     pass.switch(0, "reading", reading)?;
     pass.switch(0, "stream", "video")?;
@@ -118,7 +118,7 @@ async fn decode_frame(
     let out = Channel::new([rows, width], dtype::f32).named("vae_pixels");
     let readback = out;
     pass.epilogue(move || {
-        readback.put(intrinsics::pixels(0, rows, width));
+        readback.put(intrinsics::output_rows(0, "pixels", rows));
     });
     pass.submit(pipe)
         .with_context(|| format!("the `{reading}` fire"))?;

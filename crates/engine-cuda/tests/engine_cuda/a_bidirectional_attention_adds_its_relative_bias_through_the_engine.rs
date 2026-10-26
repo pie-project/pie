@@ -4,7 +4,6 @@ use crate::common_encoder;
 
 use common_encoder::{Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane, reference};
 use engine::Engine;
-use engine::fire::ReadoutSeam;
 use engine_cuda::Graphs;
 
 const ROWS: [usize; 3] = [5, 13, 29];
@@ -42,7 +41,7 @@ fn fire_and_compare(graphs: Graphs) {
     let readouts = &ticket.steps[0].readouts;
     assert_eq!(readouts.len(), 3);
     for (at, readout) in readouts.iter().enumerate() {
-        assert_eq!(readout.seam, ReadoutSeam::Hidden);
+        assert_eq!(readout.output, "hidden");
         assert_eq!(readout.width, WIDTH);
         assert_close(
             &readout.values,

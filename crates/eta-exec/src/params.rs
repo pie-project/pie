@@ -1,14 +1,6 @@
 use eta_compiler::codegen::launch::LaunchOp;
-use eta_ir::op::IntrinsicId;
 use eta_ir::op::tags;
 use eta_ir::types::wire_dtype;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Runtime {
-    pub vocab: u32,
-
-    pub mtp_draft_row: Option<u32>,
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -81,9 +73,10 @@ impl OpParams {
     }
 
     #[must_use]
-    pub fn of(op: &LaunchOp, result_base: u32, runtime: Runtime) -> OpParams {
+    /// `output_slots`: the slots one lane takes in its stage's output table.
+    pub fn of(op: &LaunchOp, result_base: u32, output_slots: u32) -> OpParams {
         let tag = op.tag;
-        let intrinsic = tag == tags::INTRINSIC_VAL;
+        let output = tag == tags::OUTPUT;
         let a0 = op.args.first().copied().unwrap_or(0);
 
         let a1 = op
@@ -109,26 +102,21 @@ impl OpParams {
             } else {
                 o0
             },
-            imm: if intrinsic { runtime.vocab } else { op.imm },
-            imm2: match runtime.mtp_draft_row {
-                Some(row) if intrinsic && op.intrinsic.is_some_and(is_mtp) => row,
-                _ => op.imm2,
-            },
+            imm: op.imm,
+            imm2: op.imm2,
             imm3: op.imm3,
             kind: op.rng_kind as u32,
             pred_tag: u32::from(op.pred_tag),
             lit_dtype: u32::from(wire_dtype(op.lit_dtype)),
             lit_bits: op.lit_bits,
             channel_slot: op.channel.unwrap_or(NO_CHANNEL),
-            // The slot it is bound at; an intrinsic op's `imm` is its lane.
-            intr: op
-                .intrinsic
-                .map_or(0, |intrinsic| eta_ir::op::intrinsic_slot(intrinsic, op.imm)),
+            // The slot it is bound at; an output op's `imm` is its lane.
+            intr: if output {
+                op.name_index + output_slots * op.imm
+            } else {
+                0
+            },
             sink_bytes: 0,
         }
     }
-}
-
-fn is_mtp(intrinsic: IntrinsicId) -> bool {
-    matches!(intrinsic, IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts)
 }

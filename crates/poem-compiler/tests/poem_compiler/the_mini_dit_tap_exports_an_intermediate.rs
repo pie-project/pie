@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::mini_dit_dims;
 
 use mini_dit_dims as model;
-use poem::{Def, Dim, Platform, RuntimeInput, Trace, Ty, seam};
+use poem::{Def, Dim, Platform, RuntimeInput, Trace, Ty};
 
 const ROW: &str = "mini-dit-bf16-kv-bf16";
 
@@ -24,12 +24,12 @@ fn traced(tap: Option<&str>) -> Trace {
 
 fn velocity_width(plan: &Trace) -> u64 {
     let seams: Vec<_> = plan
-        .seams
+        .outputs
         .iter()
-        .filter(|s| s.seam == seam::VELOCITY.name)
+        .filter(|s| s.name == "velocity")
         .collect();
-    assert_eq!(seams.len(), 1, "one velocity seam, found {seams:?}");
-    let value = seams[0].values[0];
+    assert_eq!(seams.len(), 1, "one velocity found {seams:?}");
+    let value = seams[0].value;
     match &plan.values[value.0 as usize].ty {
         Ty::Tensor { shape, .. } => match shape.as_slice() {
             [Dim::Tokens | Dim::Voxels, Dim::Const(width)] => *width,
@@ -83,14 +83,14 @@ fn a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width() {
 fn a_tap_is_still_one_float_readout_and_no_logits() {
     for tap in ["x_embed", "b0.attn_heads", "b1.out_img", "b2.cross_q"] {
         let plan = traced(Some(tap));
-        let seams: Vec<&str> = plan.seams.iter().map(|s| s.seam.as_str()).collect();
+        let seams: Vec<&str> = plan.outputs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
-            seams.iter().filter(|s| **s == seam::VELOCITY.name).count(),
+            seams.iter().filter(|s| **s == "velocity").count(),
             1,
             "{tap}: one velocity seam; seams are {seams:?}"
         );
         assert!(
-            !seams.contains(&seam::OUT.name),
+            !seams.contains(&"logits"),
             "{tap}: a probe has no logits either; seams are {seams:?}"
         );
     }

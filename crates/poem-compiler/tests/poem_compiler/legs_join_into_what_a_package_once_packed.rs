@@ -3,7 +3,7 @@
 //! stating them packed: one product by the joined weight, its bias added
 //! once, split after; one packed gated unit.
 
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
 use poem_ir::canon;
 
 const VOCAB: u32 = 64;
@@ -56,7 +56,7 @@ impl ForwardHybrid for Apart {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
         let q = ops::elemwise::add_bias(&self.q_bias, &ops::linear::matmul(&x, &self.q));
         let k = ops::elemwise::add_bias(&self.k_bias, &ops::linear::matmul(&x, &self.k));
@@ -65,7 +65,8 @@ impl ForwardHybrid for Apart {
         let gate = ops::linear::matmul(&h, &self.gate);
         let up = ops::linear::matmul(&h, &self.up);
         let f = ops::linear::glu(&gate, poem_ir::GluAct::Swiglu, None, Some(&up), None, None);
-        ops::linear::lm_head(&f, &self.head)
+        let logits = ops::linear::lm_head(&f, &self.head);
+        poem::output("logits", &logits, None);
     }
 }
 
@@ -74,7 +75,7 @@ impl ForwardHybrid for Packed {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
         let qkv = ops::elemwise::add_bias(&self.qkv_bias, &ops::linear::matmul(&x, &self.qkv));
         let (q, k, v) = ops::gather::split_qkv(&qkv, Q as u32, KV as u32);
@@ -88,7 +89,8 @@ impl ForwardHybrid for Packed {
             None,
             None,
         );
-        ops::linear::lm_head(&f, &self.head)
+        let logits = ops::linear::lm_head(&f, &self.head);
+        poem::output("logits", &logits, None);
     }
 }
 
@@ -143,7 +145,7 @@ impl ForwardHybrid for Banks {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         use ops::linear::{glu, matmul, moe_matmul_select, moe_route, moe_weighted_sum};
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
         let logits = matmul(&x, &self.router);
@@ -179,7 +181,8 @@ impl ForwardHybrid for Banks {
         };
         let routed = moe_matmul_select(&act, &self.down, &routes, TOP_K, None);
         let y = moe_weighted_sum(&routed, &weights);
-        ops::linear::lm_head(&y, &self.head)
+        let logits = ops::linear::lm_head(&y, &self.head);
+        poem::output("logits", &logits, None);
     }
 }
 
@@ -219,9 +222,8 @@ const QKV: u64 = 96;
 const Z: u64 = 128;
 const HEADS: u64 = 32;
 
-/// A GDN mixer's projections, apart or packed: q, k and v and z, which a
-/// seam marks the rows of, and beta and alpha, which its gates read side by
-/// side.
+/// A GDN mixer's projections, apart or packed: q, k and v and z, cut by
+/// their segments, and beta and alpha, which its gates read side by side.
 struct Gdn {
     embed: Weight,
     legs: Option<[Weight; 4]>,
@@ -234,34 +236,33 @@ impl ForwardHybrid for Gdn {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         use ops::linear::matmul;
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
         let (qkv, z, ba) = match (&self.legs, &self.packed) {
             (Some([qkv, z, b, a]), None) => {
                 let (qkv, z) = (matmul(&x, qkv), matmul(&x, z));
-                x.rec().seam("recurrent", &[&qkv, &z]);
                 let ba = ops::gather::concat_cols(&[&matmul(&x, b), &matmul(&x, a)]);
                 (qkv, z, ba)
             }
             (None, Some([qkvz, ba])) => {
                 let qkvz = matmul(&x, qkvz);
-                x.rec().seam("recurrent", &[&qkvz]);
                 let (qkv, z) = ops::gather::split_rows(&qkvz, QKV as u32);
                 (qkv, z, matmul(&x, ba))
             }
             _ => unreachable!("a micro states its projections one way"),
         };
         let h = ops::elemwise::residual_add(&ops::gather::concat_cols(&[&qkv, &ba]), &z);
-        ops::linear::lm_head(&ops::linear::matmul(&h, &self.embed), &self.head)
+        let logits = ops::linear::lm_head(&ops::linear::matmul(&h, &self.embed), &self.head);
+        poem::output("logits", &logits, None);
     }
 }
 
-/// GDN's q, k and v and its z, a seam over both, join into the one product
-/// split back by rows that a package once stated packed; its beta and alpha,
+/// GDN's q, k and v and its z, the legs left and cut by segments, join into
+/// the one product split back by rows that a package once stated packed; its beta and alpha,
 /// read side by side, into the one product their concat was.
 #[test]
-fn a_seam_and_a_concat_join_their_legs() {
+fn segmented_legs_and_a_concat_join_their_legs() {
     let w = |name: &str, rows: u64| weight(name, rows).columns();
     let apart = Gdn {
         embed: embed(),
@@ -300,7 +301,7 @@ impl ForwardHybrid for Gated {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         use ops::linear::matmul;
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
         let (q, k, v, g) = match (&self.legs, &self.packed) {
@@ -314,7 +315,8 @@ impl ForwardHybrid for Gated {
         };
         let kv = ops::gather::concat_cols(&[&k, &v, &k, &v]);
         let h = ops::elemwise::residual_add(&ops::elemwise::residual_add(&q, &g), &kv);
-        ops::linear::lm_head(&h, &self.head)
+        let logits = ops::linear::lm_head(&h, &self.head);
+        poem::output("logits", &logits, None);
     }
 }
 
@@ -357,7 +359,7 @@ fn legs_held_whole_join_whole() {
         fn caches(&self) -> HybridSpec {
             HybridSpec::new()
         }
-        fn forward(&self, inputs: Input) -> Value {
+        fn forward(&self, inputs: Input) {
             use ops::linear::{glu, matmul};
             let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
             let act = match (&self.gate, &self.up, &self.gate_up) {
@@ -379,7 +381,8 @@ fn legs_held_whole_join_whole() {
                 ),
                 _ => unreachable!("a micro states its mlp one way"),
             };
-            ops::linear::lm_head(&act, &self.head)
+            let logits = ops::linear::lm_head(&act, &self.head);
+            poem::output("logits", &logits, None);
         }
     }
     let apart = Mlp {
@@ -437,7 +440,7 @@ fn biased_routed_legs_join_with_their_biases() {
         fn caches(&self) -> HybridSpec {
             HybridSpec::new()
         }
-        fn forward(&self, inputs: Input) -> Value {
+        fn forward(&self, inputs: Input) {
             use ops::linear::{glu, matmul, moe_matmul_select, moe_route, moe_weighted_sum};
             let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
             let (routes, weights) = moe_route(
@@ -471,7 +474,8 @@ fn biased_routed_legs_join_with_their_biases() {
                 _ => unreachable!("a micro states its banks one way"),
             };
             let routed = moe_matmul_select(&act, &self.down, &routes, TOP_K, None);
-            ops::linear::lm_head(&moe_weighted_sum(&routed, &weights), &self.head)
+            let logits = ops::linear::lm_head(&moe_weighted_sum(&routed, &weights), &self.head);
+            poem::output("logits", &logits, None);
         }
     }
     let bank = |name: &str, rows: u64| {

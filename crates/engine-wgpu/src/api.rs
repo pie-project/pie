@@ -207,7 +207,6 @@ fn fault(fault: Fault) -> Error {
             wanted: 1,
             available: 0,
         },
-        Fault::Scoreless { .. } | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
 
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
@@ -477,16 +476,12 @@ impl Engine for Wgpu {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
-                max_scoring_lanes: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
-            has_mtp_logits: shell.drafts(),
-            mtp_depth: shell.mtp_depth(),
             draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
             draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
             draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
-            has_attn_score: false,
 
             ports: PortMask::DECODE_ENVELOPE
                 .with(eta_ir::registry::Port::Fold)
@@ -509,7 +504,12 @@ impl Engine for Wgpu {
             facts: shell.trace().facts.clone(),
             inputs: poem_exec::feeds::Feeds::of(shell.trace(), shell.compiled_model())
                 .decls(shell.trace(), shell.compiled_model()),
-            classes: poem_exec::feeds::lane_classes(shell.trace(), shell.compiled_model()),
+            classes: poem_exec::feeds::lane_classes(
+                shell.trace(),
+                shell.compiled_model(),
+                &poem_exec::feeds::class_outputs(shell.trace(), shell.compiled_model())
+                    .unwrap_or_default(),
+            ),
         };
 
         self.shell = Some(shell);
@@ -823,17 +823,12 @@ impl Wgpu {
             return Ok(None);
         }
         let device = self.loaded()?.device().clone();
-        let policies = submission
-            .lanes
-            .iter()
-            .map(|lane| lane.readout.clone())
-            .collect();
         self.programs
             .deferred(
                 &device,
                 program_attachments(submission)
                     .map(|attachment| (attachment.instance, attachment.lane)),
-                policies,
+                self.loaded()?.output_names(),
             )
             .map(Some)
             .map_err(refusal)
@@ -1016,6 +1011,15 @@ impl Wgpu {
 
         let guests = self.deferred_guests(submission)?;
 
+        let mut reads: Vec<Vec<String>> = vec![Vec::new(); submission.lanes.len()];
+        for attachment in program_attachments(submission) {
+            for (name, k) in self.programs.reads(attachment.instance) {
+                if let Some(lane) = reads.get_mut((attachment.lane + k) as usize) {
+                    lane.push(name);
+                }
+            }
+        }
+
         let sink = self.sink.clone();
 
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
@@ -1062,7 +1066,6 @@ impl Wgpu {
                 pages: &lane.kv.pages,
                 held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                 kv_less: lane.kv_less,
-                captures_scores: lane.captures_scores,
 
                 mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
 
@@ -1073,6 +1076,7 @@ impl Wgpu {
                     Readout::Rows(rows) => Some(rows.as_slice()),
                     Readout::Last | Readout::None => None,
                 },
+                reads: &reads[at],
 
                 translation: &lane.kv.translation,
 
@@ -1127,7 +1131,7 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
     lane_readouts(&step.readout, step.rows.as_deref().unwrap_or(&[]))
 }
 
-pub(crate) fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<LaneReadout> {
+fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<LaneReadout> {
     policies
         .iter()
         .enumerate()

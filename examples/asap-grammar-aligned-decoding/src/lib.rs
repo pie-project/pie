@@ -259,8 +259,14 @@ async fn main(input: Input) -> Result<Output> {
             let idx = pre_alpha_idx.take();
             let val = pre_alpha_val.take();
             let r = pre_rng.take();
-            let (token, mass, prob, wmass) =
-                asap_step(intrinsics::logits(), vocab, &allowed, &idx, &val, &r);
+            let (token, mass, prob, wmass) = asap_step(
+                intrinsics::output(0, "logits"),
+                vocab,
+                &allowed,
+                &idx,
+                &val,
+                &r,
+            );
             pre_token.put(&token);
             pre_mass.put(&mass);
             pre_prob.put(&prob);
@@ -309,8 +315,14 @@ async fn main(input: Input) -> Result<Output> {
                 let idx = alpha_idx.take();
                 let val = alpha_val.take();
                 let r = rng.take();
-                let (token, mass, prob, wmass) =
-                    asap_step(intrinsics::logits(), vocab, &allowed, &idx, &val, &r);
+                let (token, mass, prob, wmass) = asap_step(
+                    intrinsics::output(0, "logits"),
+                    vocab,
+                    &allowed,
+                    &idx,
+                    &val,
+                    &r,
+                );
 
                 token_in.put(&token);
                 rng.put(&r + iota(2));

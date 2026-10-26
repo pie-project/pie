@@ -1,7 +1,5 @@
 use poem::ops::conv::{self, ConvShape};
-use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, seam, trace_hybrid,
-};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
 use poem_compiler::{
     Budget, Budgets, DeviceProfile, Error, Placement, RowAxis, RowExpr, VoxelLadder, compile,
     compile_axes,
@@ -25,7 +23,7 @@ impl ForwardHybrid for Encoder {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let g = inputs.grid();
         let x = inputs.input("voxels", Dtype::Bf16, poem_ir::InputAxis::Voxel, C, None);
         let (h, g1) = conv::conv3d(&x, &g, &conv("conv", C, C), None, ConvShape::same3(), None);
@@ -41,7 +39,8 @@ impl ForwardHybrid for Encoder {
         let tg = inputs.token_grid([1, 2, 2]);
         let tokens = conv::patchify(&h, &g1, [1, 2, 2], &tg);
         let w = Weight::sym("proj", [64, u64::from(C) * 4], Dtype::Bf16);
-        ops::linear::matmul(&tokens, &w)
+        let logits = ops::linear::matmul(&tokens, &w);
+        poem::output("logits", &logits, None);
     }
 }
 
@@ -51,7 +50,7 @@ impl ForwardHybrid for Decoder {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let latents = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, C * 4, None);
         let w = Weight::sym("proj", [u64::from(C) * 4, u64::from(C) * 4], Dtype::Bf16);
         let tokens = ops::linear::matmul(&latents, &w);
@@ -69,8 +68,7 @@ impl ForwardHybrid for Decoder {
             None,
         );
         let (y, g4) = conv::pixel_shuffle(&h, &g3, [1, 2, 2]);
-        seam::at(seam::PIXELS, &[&y, &g4]);
-        y
+        poem::output("pixels", &y, Some(&g4));
     }
 }
 
@@ -160,11 +158,14 @@ fn a_decoder_carves_its_pixels_at_sixteen_voxel_ceilings_and_shares_no_column() 
     );
 
     let pixels = trace
-        .seams
+        .outputs
         .iter()
-        .find(|s| s.seam == "pixels")
+        .find(|s| s.name == "pixels")
         .expect("planted");
-    let (plane, grid) = (pixels.values[0], pixels.values[1]);
+    let (plane, grid) = (
+        pixels.value,
+        pixels.grid.expect("the pixels name their grid"),
+    );
     let Placement::Arena { rows, bytes, .. } = &compiled.arena.placements[plane.0 as usize] else {
         panic!("the pixel plane is a rectangle of the arena")
     };

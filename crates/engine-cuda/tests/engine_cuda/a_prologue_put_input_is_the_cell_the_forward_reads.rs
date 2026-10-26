@@ -2,9 +2,9 @@
 
 use crate::common_two_axis::{Rig, WIDTH, Weights, assert_close, frame, trace, velocity_epilogue};
 use engine::Engine;
-use engine::fire::{Attachment, ReadoutSeam};
+use engine::fire::Attachment;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Literal, Shape};
 
@@ -65,8 +65,8 @@ fn noising_prologue() -> TraceContainer {
                 stage: Stage::Epilogue,
                 ops: vec![
                     Op::ChanTake(0),
-                    Op::IntrinsicVal {
-                        intr: IntrinsicId::Velocity,
+                    Op::Output {
+                        index: 0,
                         lane: 0,
                         shape: Shape::matrix(ROWS, WIDTH),
                         dtype: Dtype::F32,
@@ -76,6 +76,7 @@ fn noising_prologue() -> TraceContainer {
             },
         ],
         inputs: vec![0, 1, 2],
+        names: vec!["velocity".to_string()],
         ..TraceContainer::default()
     }
 }
@@ -124,7 +125,7 @@ fn the_forward_reads_the_latent_its_prologue_put() {
             .settle_frame(&mut ticket)
             .unwrap_or_else(|why| panic!("fire {fire}: the noising fire settles: {why}"));
         let readout = ticket.steps[0].readouts[0].clone();
-        assert_eq!(readout.seam, ReadoutSeam::Velocity);
+        assert_eq!(readout.output, "velocity");
         let epilogue = rig.take(noised, 3);
         assert_close(
             &epilogue,

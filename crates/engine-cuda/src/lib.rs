@@ -31,7 +31,6 @@ pub mod record;
 pub mod replay;
 pub mod rotate;
 pub mod run;
-pub mod scores;
 pub mod serve;
 pub mod settle;
 #[cfg(feature = "rocm")]
@@ -202,7 +201,6 @@ pub use serve::{
 pub use blob::{
     Adapters, Binding, Site as AdapterSite, Source as AdapterSource, layer_of, role_of, site_of,
 };
-pub use engine::fire::LayerScores;
 pub use weights::{AdapterPlane, BankSeat};
 pub use window::{Cursor, Window, WindowShape, Windows};
 

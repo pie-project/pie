@@ -2,8 +2,7 @@ use crate::common;
 
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, RaggedMask, Request, Value, Weight, ops, seam,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, RaggedMask, Request, Weight, ops, trace_hybrid,
 };
 use poem_compiler::Placement;
 use poem_ir::{Attn, Def, Gather, Linear, Operation, RuntimeInput};
@@ -19,7 +18,7 @@ impl ForwardHybrid for CrossAttention {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs
             .recorder()
             .declare_switch("stream", &["text", "audio", "video"]);
@@ -61,8 +60,7 @@ impl ForwardHybrid for CrossAttention {
         );
         let o = ops::gather::unpack_rows(&o, &audio.row_permutation());
         let out = ops::linear::matmul(&o, &wo);
-        seam::at(seam::VELOCITY, &[&out]);
-        out
+        poem::output("velocity", &out, None);
     }
 }
 
@@ -72,7 +70,7 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
         let trace = trace_hybrid("cross", &CrossAttention, platform);
         assert!(trace.caches.is_empty());
         assert!(
-            !trace.seams.iter().any(|seam| seam.seam == seam::OUT.name),
+            !trace.outputs.iter().any(|seam| seam.name == "logits"),
             "no logits"
         );
 
@@ -175,10 +173,10 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
         );
 
         let velocity = trace
-            .seams
+            .outputs
             .iter()
-            .find(|seam| seam.seam == seam::VELOCITY.name)
-            .and_then(|seam| seam.values.first().copied())
+            .find(|seam| seam.name == "velocity")
+            .map(|seam| seam.value)
             .expect("the velocity seam names its value");
         let at = velocity.0 as usize;
         assert!(

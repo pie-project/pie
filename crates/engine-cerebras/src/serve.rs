@@ -36,26 +36,17 @@ use crate::window::Windows;
 
 pub use crate::dit::{Clips, InputCell, Pixels};
 
-const OUT_SEAM: &str = poem_compiler::EXPORT_SEAMS[0];
-
-const MTP_SEAM: &str = poem_compiler::EXPORT_SEAMS[1];
-
-const SCORES_SEAM: &str = poem_compiler::EXPORT_SEAMS[2];
-
-/// What one fire hands back: per real lane, the logits rows its readout
-/// asked for and (when the plan exports one) the draft head's rows.
+/// What one fire hands back: per real lane, the rows of its read-back
+/// output its readout asked for.
 #[derive(Debug, Clone, Default)]
 pub struct Fired {
     pub rows: Vec<Vec<f32>>,
-    pub drafts: Vec<Vec<f32>>,
-    /// Per real lane that captured scores, each layer's log-sum-exp rows.
-    pub scores: Vec<Vec<engine::fire::LayerScores>>,
-    /// The readout as the executable returned it, on the device (guest
-    /// stages read it there). After `fire_kept`, `rows` and `drafts` are
-    /// left empty and a host reader downloads through this.
+    /// The outputs as the program returned them (guest stages read them
+    /// there). After `fire_kept`, `rows` is left empty and a host reader
+    /// reads through this.
     pub kept: Option<std::sync::Arc<crate::readout::Kept>>,
     /// Per real lane that submitted clips, its pixels and output boxes
-    /// (when the plan exports `seam::PIXELS`).
+    /// (when the plan reads out pixels).
     pub pixels: Vec<Pixels>,
     /// Each probed value's plane as the walk wrote it (`Shell::probe`):
     /// `(value, width, rows × width f32)`, one entry per write.
@@ -148,8 +139,6 @@ pub struct Seated<'a> {
 
     pub rs_slot: Option<u32>,
 
-    pub captures_scores: bool,
-
     pub rs: &'a engine::fire::RsVerb,
 
     pub media: Option<Media<'a>>,
@@ -192,7 +181,6 @@ impl<'a> Seated<'a> {
             readout: None,
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
-            captures_scores: false,
             rs: &FOLD,
             media: None,
             inputs: &[],
@@ -236,17 +224,11 @@ pub struct Shell {
     weights: Weights,
     pools: Pools,
     spaces: usize,
-    /// The readout every token lane reads back: logits, else the plan's
-    /// velocity or hidden export; `None` for a plan that only decodes
-    /// pixels.
-    out: Option<ValueId>,
-    readout_seam: engine::fire::ReadoutSeam,
-    out_width: u32,
+    /// The outputs the plan's classes write, and per class the one its
+    /// lanes read back to the host: the last float row or voxel output.
+    exports: Vec<poem_exec::feeds::ClassOutput>,
+    readback: Vec<Option<usize>>,
     dit: crate::dit::Dit,
-    mtp: Option<(ValueId, u32)>,
-    /// The `attn.scores` exports, by layer, and the classes that write them.
-    scores: Vec<(u32, ValueId)>,
-    capturing: poem_ir::ClassSet,
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     masked: poem_ir::ClassSet,
     wide: poem_ir::ClassSet,
@@ -618,76 +600,25 @@ impl Shell {
             .max()
             .unwrap_or(0);
 
-        let (out, readout_seam) = match boot
-            .trace
-            .seams
-            .iter()
-            .find(|seam| seam.seam == OUT_SEAM)
-            .and_then(|seam| seam.values.first().copied())
-        {
-            Some(out) => (Some(out), engine::fire::ReadoutSeam::Logits),
-            None => match dit.float_readout() {
-                Some((seam, value)) => (Some(value), seam),
-                None if dit.pixels_facts().0 => (None, engine::fire::ReadoutSeam::Pixels),
-                None => {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "no `{OUT_SEAM}` seam and no float readout ({}), so a fire would \
-                             compute nothing a reader can take",
-                            poem_compiler::FLOAT_READOUT_SEAMS.join(", ")
-                        ),
-                    });
-                }
-            },
-        };
-        let ceiling = FireRows::ceilings(&budgets);
-        let out_width = match out {
-            Some(out) => {
-                poem_exec::store::arena::rect(&compiled.arena, out, ceiling)
-                    .ok_or_else(|| Fault::Unbound {
-                        what: format!(
-                            "value {}, the readout seam, which the arena gave no rectangle",
-                            out.0
-                        ),
-                    })?
-                    .width
-            }
-            None => 0,
-        };
-        let mtp = boot
-            .trace
-            .seams
-            .iter()
-            .find(|seam| seam.seam == MTP_SEAM)
-            .and_then(|seam| seam.values.first().copied())
-            .and_then(|value| {
-                poem_exec::store::arena::rect(&compiled.arena, value, ceiling)
-                    .map(|rect| (value, rect.width))
+        let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
+            .map_err(|why| Fault::Unbound { what: why })?;
+        if exports.is_empty() {
+            return Err(Fault::Unbound {
+                what: "no output, so a fire would compute nothing a reader can take".to_string(),
             });
-        let mut scores: Vec<(u32, ValueId)> = Vec::new();
-        for seam in boot
-            .trace
-            .seams
-            .iter()
-            .filter(|seam| seam.seam == SCORES_SEAM)
-        {
-            for &value in &seam.values {
-                let layer = match boot.trace.values[value.0 as usize].def {
-                    poem_ir::Def::Op(node) => boot.trace.nodes[node as usize].layer.unwrap_or(0),
-                    _ => 0,
-                };
-                scores.push((layer, value));
-            }
         }
-        let capturing = classes_running(&boot.trace, &compiled, |op| {
-            use poem_ir::Operands;
-            let mut outs = Vec::new();
-            match op {
-                poem_ir::Operation::Attn(a) => a.outputs(&mut outs),
-                _ => return false,
-            }
-            outs.iter().any(|v| scores.iter().any(|(_, s)| s == v))
-        });
+        let readback = (0..compiled.classes.classes.len())
+            .map(|class| {
+                (exports.iter().enumerate())
+                    .filter(|(_, out)| {
+                        out.classes.contains(class)
+                            && out.decl.axis != poem_ir::InputAxis::Lane
+                            && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32)
+                    })
+                    .map(|(at, _)| at)
+                    .next_back()
+            })
+            .collect();
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
                 let (
@@ -755,13 +686,9 @@ impl Shell {
             weights,
             pools,
             spaces,
-            out,
-            readout_seam,
-            out_width,
+            exports,
+            readback,
             dit,
-            mtp,
-            scores,
-            capturing,
             rs_layout,
             masked,
             wide,
@@ -812,9 +739,13 @@ impl Shell {
         &self.device
     }
 
+    /// The width of the float output read at the readout rows, when the plan
+    /// reads one.
     #[must_use]
-    pub fn out_width(&self) -> u32 {
-        self.out_width
+    pub fn readout_width(&self) -> Option<u32> {
+        (self.exports.iter())
+            .find(|out| out.decl.readout && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32))
+            .map(|out| out.decl.width)
     }
 
     /// The patch element the plan's image tower reads, if it has one.
@@ -824,11 +755,13 @@ impl Shell {
         self.probes = values;
     }
 
-    /// What a token lane's readout is: logits, velocity or hidden rows
-    /// (`Pixels` for a plan that reads back no token rows).
+    /// The output a decoder's pixels are read back under.
     #[must_use]
-    pub fn readout_seam(&self) -> engine::fire::ReadoutSeam {
-        self.readout_seam
+    pub fn pixels_name(&self) -> String {
+        (self.trace.outputs.iter())
+            .find(|output| output.grid.is_some())
+            .map(|output| output.name.clone())
+            .unwrap_or_default()
     }
 
     /// Whether the plan exports pixels, and the pixel row's width.
@@ -854,7 +787,7 @@ impl Shell {
 
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
-        poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
+        poem_exec::feeds::lane_classes(&self.trace, &self.compiled, &self.exports)
     }
 
     #[must_use]
@@ -866,18 +799,6 @@ impl Shell {
     #[must_use]
     pub fn serves_rs_verbs(&self) -> bool {
         self.rs_layout.is_some()
-    }
-
-    /// Whether the plan exports attention scores a lane can capture.
-    #[must_use]
-    pub fn observes_scores(&self) -> bool {
-        !self.scores.is_empty()
-    }
-
-    /// The draft head's width, when the plan exports one.
-    #[must_use]
-    pub fn mtp_width(&self) -> Option<u32> {
-        self.mtp.map(|(_, width)| width)
     }
 
     #[must_use]
@@ -1041,9 +962,8 @@ impl Shell {
         self.fire_full(lanes).map(|fired| fired.rows)
     }
 
-    /// Like `fire_seated`, with the draft head's rows as well.
-    /// Like `fire_full`, with the readout left on the device: `rows` and
-    /// `drafts` come back empty and `kept` holds the planes.
+    /// Like `fire_full`, with the outputs left on the device: `rows` comes
+    /// back empty and `kept` holds the planes.
     pub fn fire_kept(&mut self, lanes: &[Seated<'_>]) -> Result<Fired> {
         self.fire_kept_with(lanes, &[])
     }
@@ -1085,7 +1005,7 @@ impl Shell {
         let fired = self.fire_full_with(lanes, clips)?;
         if fired.pixels.is_empty() {
             return Err(Fault::Unbound {
-                what: "pixels, which this plan exports no `seam::PIXELS` for".to_string(),
+                what: "pixels, which this plan reads out none of".to_string(),
             });
         }
         Ok(fired.pixels)
@@ -1127,7 +1047,7 @@ impl Shell {
     /// class's word) and the rows at theirs (the rest in one lane of the
     /// class with the most rows), so the program is keyed by rungs and not
     /// by how the runtime happened to cut its lanes. `None` when a class
-    /// present reads more than tokens (a mask, an adapter, scores, media),
+    /// present reads more than tokens (a mask, an adapter, media),
     /// or the padding does not fit the rows or the lanes.
     fn canonical_pads(&self, lanes: &[Seated<'_>], real_rows: u32) -> Option<Vec<(u32, u64)>> {
         let classes = &self.compiled.classes;
@@ -1137,7 +1057,6 @@ impl Shell {
             if seated.media.is_some()
                 || seated.mask.is_some()
                 || seated.adapter.is_some()
-                || seated.captures_scores
                 || seated.kv_less
                 || seated.readout.is_some()
                 || !seated.inputs.is_empty()
@@ -1150,7 +1069,6 @@ impl Shell {
             if self.masked.contains(class)
                 || self.wide.contains(class)
                 || self.corrected.contains(class)
-                || self.capturing.contains(class)
             {
                 return None;
             }
@@ -1390,17 +1308,6 @@ impl Shell {
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),
             });
-            let runs_capture_arm = self.capturing.contains(row.class as usize);
-            if seated.captures_scores && self.capturing.is_empty() {
-                return Err(Fault::Scoreless { lane: row.source });
-            }
-            if seated.captures_scores != runs_capture_arm {
-                return Err(Fault::ScoreWord {
-                    lane: row.source,
-                    word: lane.word,
-                    runs_capture_arm,
-                });
-            }
             let runs_correction = self.corrected.contains(row.class as usize);
             if seated.adapter.is_some() && self.corrected.is_empty() {
                 return Err(Fault::Adapterless { lane: row.source });
@@ -1792,6 +1699,7 @@ impl Shell {
             readouts,
         };
         let slots = self.slots(fire_rows);
+        let planes = self.planes(&composition, &slots, readout_rows.len() as u32)?;
 
         let bindings = FireBindings {
             tokens: tokens_t,
@@ -1812,13 +1720,12 @@ impl Shell {
             dit: dit_bindings,
         };
 
-        let capture = lanes.iter().any(|s| s.captures_scores);
         let t1 = std::time::Instant::now();
         // Everything the program text depends on: the walk's windows and
         // descriptor, every input's shape, the page bound and the readout.
         let key = *blake3::hash(
             format!(
-                "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{capture}|{rs_active}|{dit_key}|{:?}",
+                "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}",
                 inputs.shapes(),
                 readout_rows.len(),
                 self.gathers_readout,
@@ -1831,7 +1738,6 @@ impl Shell {
         // probes) is also keyed by its shape alone, so lanes cut differently
         // skip the walk too.
         let plain = !rs_active
-            && !capture
             && dit_key.is_empty()
             && composition.patch_rows() == 0
             && composition.voxel_rows() == 0
@@ -1866,9 +1772,7 @@ impl Shell {
                 bindings,
                 &windows,
                 &descriptor,
-                readout_t,
-                readout_rows.len() as i64,
-                capture,
+                &planes,
                 rs_seat,
                 inputs.pack_len(),
                 &lands,
@@ -1897,9 +1801,7 @@ impl Shell {
                     bindings,
                     &windows,
                     &descriptor,
-                    readout_t,
-                    readout_rows.len() as i64,
-                    capture,
+                    &planes,
                     rs_seat.clone(),
                     inputs.pack_len(),
                     &lands,
@@ -1943,28 +1845,13 @@ impl Shell {
         )?;
         let t3 = std::time::Instant::now();
         let keep = self.keep_readout;
-        // The program's outputs: the readout and the draft head's rows (when
-        // the plan reads token rows back), the score columns of a capturing
-        // fire, then a decoder's pixel plane and its grid. Every one came
-        // back as a whole plane: the readout seams are gathered to the rows
-        // the fire asked for here, the rest are widened to f32.
-        let seams = usize::from(self.out.is_some()) + usize::from(self.out.and(self.mtp).is_some());
-        let gathered =
-            self.gathers_readout && self.readout_seam == engine::fire::ReadoutSeam::Logits;
+        // The program's outputs: each plane's layers, whole, then a
+        // decoder's pixel plane and its grid, then the probes.
+        let layers: usize = planes.iter().map(|plane| plane.handles.len()).sum();
         let mut outs: Vec<crate::device::Buffer> = outs
             .into_iter()
             .enumerate()
-            .map(|(at, buffer)| {
-                if at < seams {
-                    Self::gather_readout(
-                        &buffer,
-                        (!gathered).then_some(readout_rows.as_slice()),
-                        readout_rows.len(),
-                    )
-                } else {
-                    buffer.as_f32()
-                }
-            })
+            .map(|(at, buffer)| if at < layers { buffer } else { buffer.as_f32() })
             .collect();
         let probed_ids = self.probed.get(&key).cloned().unwrap_or_default();
         let mut probes = Vec::with_capacity(probed_ids.len());
@@ -2002,15 +1889,34 @@ impl Shell {
             }
             None => Vec::new(),
         };
-        if self.out.is_some() && outs.is_empty() {
+        if outs.len() != layers {
             return Err(Fault::Unbound {
-                what: "the readout, which the program did not return".to_string(),
+                what: format!(
+                    "{layers} output planes, of which the program returned {}",
+                    outs.len()
+                ),
             });
         }
-        let raw = match outs.first() {
-            Some(first) if !keep && self.out.is_some() => first.download()?,
-            _ => Vec::new(),
-        };
+        let ids = (!self.gathers_readout).then_some(readout_rows.as_slice());
+        let mut outs = outs.into_iter();
+        let buffers: Vec<crate::device::Buffer> = planes
+            .iter()
+            .map(|plane| {
+                let readout = self.exports[plane.export].decl.readout;
+                let words: Vec<u32> = (outs.by_ref().take(plane.handles.len()))
+                    .flat_map(|buffer| {
+                        if readout {
+                            Self::gather_readout(&buffer, ids, readout_rows.len())
+                        } else {
+                            buffer.words().to_vec()
+                        }
+                    })
+                    .collect();
+                let rows = u32::try_from(words.len() / plane.width.max(1) as usize).unwrap_or(0);
+                crate::device::Buffer::new(plane.dtype, rows, plane.width, words)
+                    .expect("f32 and i32 have a storage form")
+            })
+            .collect();
         tracing::debug!(
             rows,
             stage_ms = (t1 - t0).as_secs_f64() * 1e3,
@@ -2029,24 +1935,6 @@ impl Shell {
                 t0.duration_since(*timing_epoch()).as_secs_f64()
             );
         }
-        let width = self.out_width as usize;
-        let rows_out = if keep || self.out.is_none() {
-            vec![Vec::new(); real]
-        } else {
-            rows_from(&raw, &readout_layout, width, readout_rows.len())
-        };
-        let drafts = match (self.mtp, outs.get(1)) {
-            (Some((_, mtp_width)), Some(buffer)) if !keep => {
-                let raw = buffer.download()?;
-                rows_from(
-                    &raw,
-                    &readout_layout,
-                    mtp_width as usize,
-                    readout_rows.len(),
-                )
-            }
-            _ => Vec::new(),
-        };
 
         for ((row, seat), table) in composition.lanes().iter().zip(&seats).zip(&tables) {
             if (row.source as usize) < real
@@ -2057,69 +1945,167 @@ impl Shell {
                 *slot = seat.have + seat.rows;
             }
         }
-        let mut scores = vec![Vec::new(); real];
-        if capture {
-            let first = usize::from(self.out.is_some()) + usize::from(self.mtp.is_some());
-            let mut columns = Vec::with_capacity(self.scores.len());
-            for (i, &(layer, _)) in self.scores.iter().enumerate() {
-                let Some(buffer) = outs.get(first + i) else {
-                    break;
-                };
-                let dims = buffer.dims()?;
-                let heads = dims.get(1).copied().unwrap_or(1) as usize;
-                let raw = buffer.download()?;
-                let values: Vec<f32> = raw
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|c| f32::from_le_bytes(*c))
-                    .collect();
-                columns.push((layer, heads, values));
-            }
-            for row in composition.lanes() {
-                let source = row.source as usize;
-                if source >= real || !lanes[source].captures_scores {
-                    continue;
-                }
-                scores[source] = columns
-                    .iter()
-                    .map(|(layer, heads, values)| {
-                        let from = row.row_offset as usize * heads;
-                        let to = (from + row.rows as usize * heads).min(values.len());
-                        engine::fire::LayerScores {
-                            layer: *layer,
-                            rows: row.rows,
-                            heads: *heads as u32,
-                            lse: values[from.min(to)..to].to_vec(),
-                        }
-                    })
-                    .collect();
-            }
-        }
-        let kept = if self.out.is_some() {
-            let logits = outs.remove(0);
-            let mtp = match self.mtp {
-                Some((_, w)) if !outs.is_empty() => Some((outs.remove(0), w)),
-                _ => None,
-            };
-            Some(std::sync::Arc::new(crate::readout::Kept::new(
-                logits,
-                readout_rows.len() as u32,
-                self.out_width,
-                mtp,
-                readout_layout,
-            )))
-        } else {
-            None
+        let kept = self.kept(
+            &composition,
+            &planes,
+            buffers,
+            (&readout_rows, &readout_layout),
+            &pixels,
+            real,
+        );
+        let rows_out = match &kept {
+            Some(kept) if !keep => (0..real)
+                .map(|lane| {
+                    kept.lane_rows(lane)
+                        .map(|read| read.map(|(_, _, values)| values).unwrap_or_default())
+                        .map_err(|why| Fault::Program {
+                            at: "serve::readout",
+                            why,
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => vec![Vec::new(); real],
         };
         Ok(Fired {
             rows: rows_out,
-            drafts,
-            scores,
             kept,
             pixels,
             probes,
         })
+    }
+
+    /// The planes a fire over `composition` returns: each output its
+    /// classes write that is f32 or i32 and has no clips of its own,
+    /// `readouts` rows deep when it is the readout rows.
+    fn planes(
+        &self,
+        composition: &poem_exec::fire::Composition,
+        slots: &SlotTable,
+        readouts: u32,
+    ) -> Result<Vec<PlaneShape>> {
+        let mut planes = Vec::new();
+        for (export, out) in self.exports.iter().enumerate() {
+            if out.grid.is_some()
+                || !matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32 | Dtype::I32)
+                || !(composition.lanes().iter()).any(|row| out.classes.contains(row.class as usize))
+            {
+                continue;
+            }
+            let handles = (out.values.iter())
+                .map(|value| {
+                    slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "value {}, of output `{}`, which the carve gave no rectangle",
+                            value.0, out.decl.name
+                        ),
+                    })
+                })
+                .collect::<Result<Vec<Tensor>>>()?;
+            planes.push(PlaneShape {
+                export,
+                rows: if out.decl.readout {
+                    readouts
+                } else {
+                    handles[0].rows
+                },
+                width: handles[0].width,
+                dtype: if out.decl.dtype == Dtype::I32 {
+                    Dtype::I32
+                } else {
+                    Dtype::F32
+                },
+                handles,
+            });
+        }
+        Ok(planes)
+    }
+
+    /// The fire's returned planes as each real lane reads them.
+    fn kept(
+        &self,
+        composition: &poem_exec::fire::Composition,
+        planes: &[PlaneShape],
+        buffers: Vec<crate::device::Buffer>,
+        (readout_rows, readout_layout): (&[i32], &[(u32, u32)]),
+        pixels: &[Pixels],
+        real: usize,
+    ) -> Option<std::sync::Arc<crate::readout::Kept>> {
+        use crate::readout::{Plane, Seat};
+        use poem_ir::InputAxis;
+        if planes.is_empty() && pixels.is_empty() {
+            return None;
+        }
+        let mut seats = vec![vec![None; planes.len()]; real];
+        let mut readback = vec![None; real];
+        for (at, row) in composition.lanes().iter().enumerate() {
+            let source = row.source as usize;
+            if source >= real {
+                continue;
+            }
+            let (first, count) = readout_layout[source];
+            for (p, plane) in planes.iter().enumerate() {
+                let out = &self.exports[plane.export];
+                if !out.classes.contains(row.class as usize) {
+                    continue;
+                }
+                seats[source][p] = Some(match out.decl.axis {
+                    _ if out.decl.readout => Seat { first, count },
+                    InputAxis::Row => Seat {
+                        first: row.row_offset,
+                        count: row.rows,
+                    },
+                    InputAxis::Lane => Seat {
+                        first: at as u32,
+                        count: 1,
+                    },
+                    InputAxis::Voxel => Seat {
+                        first: row.voxel_offset,
+                        count: row.voxels,
+                    },
+                });
+            }
+            let read = (self.readback.get(row.class as usize).copied().flatten())
+                .and_then(|export| planes.iter().position(|plane| plane.export == export));
+            readback[source] = read.and_then(|p| {
+                let seat = seats[source][p]?;
+                let out = &self.exports[planes[p].export];
+                let rows: Vec<u32> = if out.decl.axis == InputAxis::Row && !out.decl.readout {
+                    readout_rows[first as usize..(first + count) as usize]
+                        .iter()
+                        .map(|&row| row as u32)
+                        .collect()
+                } else {
+                    (seat.first..seat.first + seat.count).collect()
+                };
+                Some((p, rows))
+            });
+        }
+        let planes = planes
+            .iter()
+            .zip(buffers)
+            .map(|(plane, buffer)| {
+                let out = &self.exports[plane.export];
+                Plane {
+                    name: out.decl.name.clone(),
+                    axis: out.decl.axis,
+                    readout: out.decl.readout,
+                    buffer,
+                    rows: plane.rows,
+                    width: plane.width,
+                    layers: out.decl.layers,
+                    dtype: plane.dtype,
+                }
+            })
+            .collect();
+        Some(std::sync::Arc::new(crate::readout::Kept {
+            planes,
+            seats,
+            readback,
+            pixels: (
+                self.pixels_name(),
+                pixels.iter().map(|(values, _)| values.clone()).collect(),
+            ),
+        }))
     }
 
     /// Walks the plan once for this fire's shape and compiles what it
@@ -2132,17 +2118,14 @@ impl Shell {
         bindings: FireBindings,
         windows: &Windows,
         descriptor: &FireDescriptor,
-        readout_t: Tensor,
-        n: i64,
-        capture: bool,
+        planes: &[PlaneShape],
         rs: Option<std::rc::Rc<crate::rs::Seat>>,
         pack_len: u32,
         lands: &[crate::dit::Land],
         pixels: Option<&crate::dit::PixelsSeat>,
     ) -> Result<(std::sync::Arc<crate::device::Program>, Vec<ValueId>)> {
         let (text, sig, probed) = self.trace_text(
-            slots, caches, bindings, windows, descriptor, readout_t, n, capture, rs, pack_len,
-            lands, pixels,
+            slots, caches, bindings, windows, descriptor, planes, rs, pack_len, lands, pixels,
         )?;
         Ok((self.device.program(&text, sig)?, probed))
     }
@@ -2156,9 +2139,7 @@ impl Shell {
         bindings: FireBindings,
         windows: &Windows,
         descriptor: &FireDescriptor,
-        readout_t: Tensor,
-        n: i64,
-        capture: bool,
+        planes: &[PlaneShape],
         rs: Option<std::rc::Rc<crate::rs::Seat>>,
         pack_len: u32,
         lands: &[crate::dit::Land],
@@ -2196,35 +2177,16 @@ impl Shell {
             run.take_probed()
         };
 
-        // Every readout plane comes back whole; the host gathers the rows the
-        // fire asked for (`gather_readout`) after the run.
-        let _ = (readout_t, n);
-        let seams = self
-            .out
-            .into_iter()
-            .chain(self.out.and(self.mtp).map(|(value, _)| value));
-        for value in seams {
-            let plane = slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "value {}, an exported seam, which the carve gave no rectangle",
-                    value.0
-                ),
-            })?;
-            tracer.extra(plane)?;
-        }
-        if capture {
-            for &(_, value) in &self.scores {
-                let Some(plane) = slots.0[value.0 as usize] else {
-                    continue;
-                };
-                tracer.extra(plane)?;
-            }
+        // Every output plane comes back whole, a layer after another; the
+        // host gathers the readout rows the fire asked for after the run.
+        for handle in planes.iter().flat_map(|plane| &plane.handles) {
+            tracer.extra(*handle)?;
         }
         if let Some(seat) = pixels {
             for (value, what) in [(seat.plane, "plane"), (seat.grid, "grid")] {
                 let handle = slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
                     what: format!(
-                        "value {}, the pixels seam's {what}, which the carve gave no rectangle",
+                        "value {}, the pixels output's {what}, which the carve gave no rectangle",
                         value.0
                     ),
                 })?;
@@ -2239,14 +2201,9 @@ impl Shell {
         Ok((text, sig, probed_ids))
     }
 
-    /// The readout rows a fire asked for, as an f32 plane: rows `ids` of
-    /// `plane` (clamped into it), or its first `n` rows when the plan gathered
-    /// them already.
-    fn gather_readout(
-        plane: &crate::device::Buffer,
-        ids: Option<&[i32]>,
-        n: usize,
-    ) -> crate::device::Buffer {
+    /// The readout rows a fire asked for: rows `ids` of `plane` (clamped
+    /// into it), or its first `n` rows when the plan gathered them already.
+    fn gather_readout(plane: &crate::device::Buffer, ids: Option<&[i32]>, n: usize) -> Vec<u32> {
         let (rows, width) = plane.shape();
         let (rows, width) = (rows as usize, width as usize);
         let words = plane.words();
@@ -2261,9 +2218,7 @@ impl Shell {
                 })
                 .collect(),
         };
-        let out_rows = picked.len() / width.max(1);
-        crate::device::Buffer::new(poem_ir::Dtype::F32, out_rows as u32, width as u32, picked)
-            .expect("f32 has a storage form")
+        picked
     }
 
     /// Refuses media rows this load cannot seat, before anything is staged.
@@ -2433,45 +2388,17 @@ impl Shell {
     }
 }
 
-/// Each lane's rows out of a readout of `n` rows of `width`, in one pass
-/// from the downloaded bytes (bf16 or f32, whichever the seam holds).
-fn rows_from(raw: &[u8], layout: &[(u32, u32)], width: usize, n: usize) -> Vec<Vec<f32>> {
-    let element = raw.len().checked_div(n * width).unwrap_or(4);
-    layout
-        .iter()
-        .map(|&(start, count)| {
-            let from = start as usize * width * element;
-            let to = from + count as usize * width * element;
-            let bytes = &raw[from.min(raw.len())..to.min(raw.len())];
-            if element == 2 {
-                bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
-                    .collect()
-            } else {
-                bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|c| f32::from_le_bytes(*c))
-                    .collect()
-            }
-        })
-        .collect()
+/// One output plane a fire returns: its export, its layers' handles, and
+/// the rows of a layer it comes back with.
+#[derive(Debug, Clone)]
+struct PlaneShape {
+    export: usize,
+    handles: Vec<Tensor>,
+    rows: u32,
+    width: u32,
+    dtype: Dtype,
 }
 
-#[allow(dead_code)]
-fn split_rows(values: &[f32], layout: &[(u32, u32)], width: usize) -> Vec<Vec<f32>> {
-    layout
-        .iter()
-        .map(|&(start, count)| {
-            let from = start as usize * width;
-            values[from..from + count as usize * width].to_vec()
-        })
-        .collect()
-}
 type ReadoutTable = (Vec<i32>, Vec<(u32, u32)>);
 
 /// The token rows whose logits come back, and per real lane where its rows

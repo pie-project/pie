@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
 use poem_ir::{TILED_BAND, TILED_STEP, Trace};
 
 const VOCAB: u32 = 1000;
@@ -54,10 +54,11 @@ impl ForwardHybrid for Micro {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
         let h = ops::linear::matmul(&x, &self.proj);
-        ops::linear::lm_head(&h, &self.head)
+        let logits = ops::linear::lm_head(&h, &self.head);
+        poem::output("logits", &logits, None);
     }
 }
 

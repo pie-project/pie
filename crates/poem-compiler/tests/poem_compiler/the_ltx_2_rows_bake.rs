@@ -4,7 +4,7 @@ use crate::ltx_2_dims::{self as model, Dims};
 use poem::generative::ScheduleKind;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, RaggedMask, Request,
-    RopeForm, RuntimeInput, Selection, Trace, Ty, ValueId, seam,
+    RopeForm, RuntimeInput, Selection, Trace, Ty, ValueId,
 };
 
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
@@ -72,26 +72,26 @@ fn every_row_traces_on_every_platform_holding_nothing_between_fires() {
                 "{deployment} {platform:?}: a denoiser and two connectors hold nothing between fires"
             );
             let seams: BTreeMap<&str, usize> =
-                plan.seams.iter().fold(BTreeMap::new(), |mut acc, s| {
-                    *acc.entry(s.seam.as_str()).or_default() += 1;
+                plan.outputs.iter().fold(BTreeMap::new(), |mut acc, s| {
+                    *acc.entry(s.name.as_str()).or_default() += 1;
                     acc
                 });
             assert_eq!(
-                seams.get(seam::VELOCITY.name),
+                seams.get("velocity"),
                 Some(&1),
                 "{deployment}: one velocity, planted on the merge of the two modalities"
             );
             assert_eq!(
-                seams.get(seam::HIDDEN.name),
+                seams.get("hidden"),
                 Some(&2),
                 "{deployment}: one hidden per connector"
             );
             assert!(
-                !seams.contains_key(seam::OUT.name),
+                !seams.contains_key("logits"),
                 "{deployment}: a denoiser has no logits, and `out` was planted anyway"
             );
             assert_eq!(
-                seams.get(seam::PIXELS.name),
+                seams.get("pixels"),
                 is_flagship(deployment).then_some(&1),
                 "{deployment}: one `pixels` planting iff the row carries the VAE decoder"
             );
@@ -535,11 +535,11 @@ fn the_latents_ride_the_voxels_and_the_positions_are_computed() {
             Some(vec!["computed".to_string(), "given".to_string()])
         );
         let velocity = plan
-            .seams
+            .outputs
             .iter()
-            .find(|s| s.seam == seam::VELOCITY.name)
+            .find(|s| s.name == "velocity")
             .expect("a velocity seam")
-            .values[0];
+            .value;
         assert_eq!(
             plan.values[velocity.0 as usize].ty,
             Ty::Tensor {

@@ -10,7 +10,7 @@ use eta_ir::registry::Stage as Attach;
 use crate::arena::Arena;
 use crate::device::{Buffer, Context, graph::Event};
 use crate::error::{Fault, Result};
-use crate::exports::{DRAFTS_SEAM, Exports, MTP_SEAM, SCORES_SEAM};
+use crate::exports::Exports;
 use crate::inputs::{Handles, Inputs, PatchHandles, SlotGuard};
 use crate::program::launch::{INTRINSIC_STORAGE_RAW_BF16, INTRINSIC_STORAGE_RAW_I32};
 use crate::program::{Fired, Plane as ProgramPlane};
@@ -19,7 +19,6 @@ use crate::run::{
     CacheGeometry, CachePlanning, CacheTable, Ceilings, FireBindings, FireTables, RsMove, RsSeat,
     Run, ScheduleSeat, SlotTable,
 };
-use crate::scores::Scores;
 use crate::settle::Airborne;
 use crate::store::Pools;
 use crate::store::kv::{self, Paging};
@@ -166,7 +165,6 @@ impl Shell {
             owed: &mut self.owed,
             spare_events: &mut self.spare_events,
             airborne: &self.airborne,
-            scores: self.scores.as_ref(),
             shifted: &self.shifted,
             schedule_readers: &self.schedule_readers,
             decoding: &self.decoding,
@@ -229,7 +227,6 @@ struct FireCtx<'a> {
     owed: &'a mut Owed,
     spare_events: &'a mut Vec<Event>,
     airborne: &'a Airborne,
-    scores: Option<&'a Scores>,
     shifted: &'a [bool],
     schedule_readers: &'a [Option<u32>],
     decoding: &'a poem_ir::ClassSet,
@@ -309,7 +306,6 @@ impl Shell {
 }
 
 impl FireCtx<'_> {
-    
     fn gate(&mut self, p: &Prepared<'_>) -> Result<()> {
         let lane_count = p.composition.lane_count();
         if p.rs.predicated || p.rs.truncates {
@@ -680,10 +676,6 @@ impl FireCtx<'_> {
                 mask_indptr: handles.mask_indptr,
                 pool_state: self.pools.pool_slabs(),
             },
-            scores: self
-                .scores
-                .zip(handles.score_seats)
-                .map(|(slab, seat_of)| slab.seat(seat_of)),
             device: self.device.device(),
             toggles: self.device.toggles(),
             capture: self.graphs.shaped(),
@@ -883,75 +875,21 @@ impl FireCtx<'_> {
             return Ok(None);
         }
         let slots = &staged.slots;
-        let voxel_class = p
-            .composition
-            .voxel_classes()
-            .present_in_order()
-            .next()
-            .map(|class| class as usize);
-        let pixels = match self.exports.pixels_for(voxel_class) {
-            Some((plane, grid)) if p.composition.voxel_rows() > 0 => {
-                let rect = |id: poem_ir::ValueId, what: &str| {
-                    slots.0[id.0 as usize].ok_or_else(|| Fault::Unbound {
-                        what: format!(
-                            "value {}, the pixels seam's {what}, which the carve gave no rectangle",
-                            id.0
-                        ),
-                    })
-                };
-                let mut lane_clips = vec![(0u32, 0u32); p.lanes.len()];
-                for row in p.composition.lanes() {
-                    lane_clips[row.source as usize] = (row.clip_offset, row.clips);
-                }
-                Some(super::settle::PixelsReadback {
-                    plane: rect(plane, "plane")?,
-                    grid: rect(grid, "grid")?,
-                    lane_clips,
-                })
-            }
-            _ => None,
-        };
-        let mut class_of = vec![0usize; p.lanes.len()];
-        let mut voxel_first = vec![0u32; p.lanes.len()];
-        for row in p.composition.lanes() {
-            class_of[row.source as usize] = row.class as usize;
-            voxel_first[row.source as usize] = row.voxel_offset;
-        }
-        let lane_class_of = |lane: usize| class_of.get(lane).copied().unwrap_or(0);
-        let mut pixels_at: Vec<Option<(kernels_cuda::Tensor, u32, u32)>> =
-            vec![None; p.lanes.len()];
-        if let (Some(seat), Some((_, grid))) =
-            (pixels.as_ref(), self.exports.pixels_for(voxel_class))
-            && let Some(table) = crate::voxels::host_grid(self.trace, &p.voxel_tables.grid, grid)
-        {
-            for (lane, &(first, count)) in seat.lane_clips.iter().enumerate() {
-                // A denoise lane's voxels read out velocity, not pixels.
-                if count == 0 || !self.exports.writes_pixels(lane_class_of(lane)) {
-                    continue;
-                }
-                let at = first as usize * 4;
-                let Some(&offset) = table.get(at + 3) else {
-                    continue;
-                };
-                let rows: i64 = (first..first + count)
-                    .filter_map(|clip| table.get(clip as usize * 4..clip as usize * 4 + 3))
-                    .map(|b| i64::from(b[0]) * i64::from(b[1]) * i64::from(b[2]))
-                    .sum();
-                pixels_at[lane] = Some((
-                    seat.plane,
-                    u32::try_from(offset).unwrap_or(0),
-                    u32::try_from(rows).unwrap_or(u32::MAX),
-                ));
-            }
-        }
         let lane_count = p.lanes.len();
+        let mut lane_class = vec![0usize; lane_count];
+        let mut lane_row = vec![0u32; lane_count];
+        let mut voxel_first = vec![0u32; lane_count];
+        let mut lane_clips = vec![(0u32, 0u32); lane_count];
+        for (at, row) in p.composition.lanes().iter().enumerate() {
+            let source = row.source as usize;
+            lane_class[source] = row.class as usize;
+            lane_row[source] = u32::try_from(at).unwrap_or(u32::MAX);
+            voxel_first[source] = row.voxel_offset;
+            lane_clips[source] = (row.clip_offset, row.clips);
+        }
         let mut last_row = vec![0u32; lane_count];
         let mut first_row = vec![0u32; lane_count];
         let mut lane_rows = vec![0u32; lane_count];
-        let mut lane_class = vec![0usize; lane_count];
-        for row in p.composition.lanes() {
-            lane_class[row.source as usize] = row.class as usize;
-        }
         for lane in 0..lane_count {
             let first = p.readout_first.get(lane).copied().unwrap_or(0);
             let count = p.readout_count.get(lane).copied().unwrap_or(0);
@@ -959,102 +897,67 @@ impl FireCtx<'_> {
             lane_rows[lane] = count;
             last_row[lane] = first + count.saturating_sub(1);
         }
-        let plane_of = |value: poem_ir::ValueId, what: &str| -> Result<kernels_cuda::Tensor> {
-            let plane = slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
+        let plane_of = |value: poem_ir::ValueId, name: &str| -> Result<kernels_cuda::Tensor> {
+            slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
                 what: format!(
-                    "value {}, the {what} export, which the carve gave no rectangle",
+                    "value {}, of output `{name}`, which the carve gave no rectangle",
                     value.0
                 ),
-            })?;
-            if !matches!(plane.dtype, Dtype::Bf16 | Dtype::F32) {
-                return Err(Fault::Unbound {
-                    what: format!(
-                        "the {what} export landed as {:?}, which this shell cannot read back",
-                        plane.dtype
-                    ),
-                });
-            }
-            Ok(plane)
+            })
         };
-        let mut lane_planes: Vec<Option<(engine::fire::ReadoutSeam, kernels_cuda::Tensor)>> =
-            vec![None; lane_count];
+        // A voxel output laid out by clips of its own starts each lane at its
+        // first clip's offset in that grid.
+        let grids: Vec<Option<Vec<i32>>> = self
+            .exports
+            .outputs
+            .iter()
+            .map(|out| {
+                out.grid.and_then(|grid| {
+                    crate::voxels::host_grid(self.trace, &p.voxel_tables.grid, grid)
+                })
+            })
+            .collect();
+        let first_voxel = |out: usize, lane: usize| -> u32 {
+            match &grids[out] {
+                Some(table) => {
+                    let (first, _) = lane_clips[lane];
+                    table
+                        .get(first as usize * 4 + 3)
+                        .map_or(0, |&offset| u32::try_from(offset).unwrap_or(0))
+                }
+                None => voxel_first[lane],
+            }
+        };
+
+        let mut lane_planes: Vec<Option<(String, kernels_cuda::Tensor)>> = vec![None; lane_count];
+        let mut names = vec![String::new(); lane_count];
+        let mut pixels = None;
         for lane in 0..lane_count {
-            match self.exports.readout_for(lane_class[lane]) {
-                Some(readout) => {
-                    let plane = plane_of(readout.value, &format!("{:?} readout", readout.seam))?;
-                    if readout.seam == engine::fire::ReadoutSeam::Logits
-                        && plane.dtype != Dtype::Bf16
-                    {
-                        return Err(Fault::Unbound {
-                            what: format!(
-                                "an out seam landed as {:?}, which this shell cannot read back",
-                                plane.dtype
-                            ),
-                        });
-                    }
-                    lane_planes[lane] = Some((readout.seam, plane));
-                }
-                None if pixels.is_some() => {}
-                None => {
-                    return Err(Fault::Unbound {
-                        what: "a plan with no `out` seam and no float readout, which boot should \
-                               have refused"
-                            .to_string(),
+            let Some(out) = self.exports.readback(lane_class[lane]) else {
+                continue;
+            };
+            names[lane] = out.decl.name.clone();
+            let plane = plane_of(out.values[0], &out.decl.name)?;
+            if let Some(grid) = out.grid {
+                if pixels.is_none() && p.composition.voxel_rows() > 0 {
+                    pixels = Some(super::settle::PixelsReadback {
+                        plane,
+                        grid: plane_of(grid, &out.decl.name)?,
+                        lane_clips: lane_clips.clone(),
                     });
                 }
+                continue;
             }
+            lane_planes[lane] = Some((out.decl.name.clone(), plane));
         }
 
-        let mut columns = Vec::with_capacity(self.exports.scores.len());
-        if p.lanes.iter().any(|seated| seated.captures_scores) {
-            for export in &self.exports.scores {
-                let column = slots.0[export.value.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, an `{SCORES_SEAM}` export, which the carve gave no \
-                         rectangle",
-                        export.value.0
-                    ),
-                })?;
-                if column.dtype != Dtype::F32 {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "an `{SCORES_SEAM}` export landed as {:?}; the kernel's \
-                             log-sum-exp is F32 and this shell reads back no other",
-                            column.dtype
-                        ),
-                    });
-                }
-                columns.push((export.layer, column));
-            }
-        }
-
-        let storage_of = |plane: kernels_cuda::Tensor| {
-            if plane.dtype == Dtype::F32 {
-                crate::program::launch::INTRINSIC_STORAGE_F32
-            } else {
-                INTRINSIC_STORAGE_RAW_BF16
-            }
-        };
-        let draft = match &self.exports.mtp {
-            Some(export) => {
-                let column = slots.0[export.value.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, the `{MTP_SEAM}` export, which the carve gave no rectangle",
-                        export.value.0
-                    ),
-                })?;
-                if column.dtype != Dtype::Bf16 {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "an `{MTP_SEAM}` export landed as {:?}, which this shell cannot \
-                             point an intrinsic at",
-                            column.dtype
-                        ),
-                    });
-                }
-                Some(column)
-            }
-            None => None,
+        let storage_of = |dtype: Dtype| match dtype {
+            Dtype::F32 => Ok(crate::program::launch::INTRINSIC_STORAGE_F32),
+            Dtype::Bf16 => Ok(INTRINSIC_STORAGE_RAW_BF16),
+            Dtype::I32 => Ok(INTRINSIC_STORAGE_RAW_I32),
+            other => Err(Fault::Unbound {
+                what: format!("an output landed as {other:?}, which an epilogue cannot read"),
+            }),
         };
         // An instance may have a fire airborne still: its next mints against
         // the cursors that one predicted, so only what has landed settles here
@@ -1068,219 +971,32 @@ impl FireCtx<'_> {
             Reap::Landed,
         )?;
         super::btrace::mark("epi_reap");
-        // a tensor-parallel rank captured only its band of each layer's heads;
-        // the epilogue reads the model's planes, so the bands are gathered
-        // first (every rank fires the same frame, so every rank gathers the
-        // same seats)
-        if let Some(slab) = self.scores {
-            for seat in p.score_seat_of.iter().flatten() {
-                slab.gather(self.device.ctx(), *seat)?;
-            }
-        }
         let mut epilogues = AirborneFires::default();
         for attached in p.attachments.iter().filter(|a| !a.adapter_only) {
-            let lane = attached.lane as usize;
-            let owned = lane_rows.get(lane).copied().unwrap_or(0);
-            let stated = p.lanes.get(lane).and_then(|seated| seated.readout);
-            let wanted: Vec<u32> = match stated {
-                None | Some([]) => vec![last_row[lane]],
-                Some(rows) => {
-                    if rows.len() as u32 > owned {
-                        return Err(Fault::Ceiling {
-                            what: "rows in the lane a readout names",
-                            need: rows.len() as u64,
-                            have: u64::from(owned),
-                        });
-                    }
-                    (0..rows.len() as u32)
-                        .map(|i| first_row[lane] + i)
-                        .collect()
-                }
-            };
-            let consecutive = wanted
-                .windows(2)
-                .all(|pair| pair[1] == pair[0].wrapping_add(1));
-            
+            let reads = self.programs.reads(attached.instance)?;
             for k in 0..attached.lanes {
-                let at = lane + k as usize;
-                let class = lane_class[at];
-                let velocity = match self.exports.velocity_for(class) {
-                    Some(export) => Some((
-                        plane_of(export.value, "velocity")?,
-                        self.exports.on_voxels(self.trace, export.value),
-                    )),
-                    None => None,
-                };
-                let hidden = match self.exports.hidden_for(class) {
-                    Some(export) => Some(plane_of(export.value, "hidden")?),
-                    None => None,
-                };
-                if let Some((plane, voxel)) = velocity {
-                    // Voxel-axis velocity starts at the lane's first voxel, token-axis at its first row.
-                    self.programs.bind_intrinsic(
+                let at = attached.lane as usize + k as usize;
+                for (index, out) in self.exports.outputs.iter().enumerate() {
+                    if !out.classes.contains(lane_class[at])
+                        || !reads
+                            .iter()
+                            .any(|(name, lane)| *name == out.decl.name && *lane == k)
+                    {
+                        continue;
+                    }
+                    self.bind_output(
+                        p,
                         attached.instance,
-                        eta_ir::op::IntrinsicId::Velocity,
                         k,
-                        plane.ptr,
-                        storage_of(plane),
-                        plane.width,
-                        plane.width,
-                        if voxel {
-                            voxel_first[at]
-                        } else {
-                            first_row[at]
-                        },
+                        at,
+                        out,
+                        &plane_of,
+                        &storage_of,
+                        (first_row[at], last_row[at], lane_rows[at]),
+                        lane_row[at],
+                        first_voxel(index, at),
                     )?;
                 }
-                if let Some(plane) = hidden {
-                    self.programs.bind_intrinsic(
-                        attached.instance,
-                        eta_ir::op::IntrinsicId::Hidden,
-                        k,
-                        plane.ptr,
-                        storage_of(plane),
-                        plane.width,
-                        plane.width,
-                        first_row[at],
-                    )?;
-                }
-                if let Some((plane, first, _)) = pixels_at[at] {
-                    self.programs.bind_intrinsic(
-                        attached.instance,
-                        eta_ir::op::IntrinsicId::Pixels,
-                        k,
-                        plane.ptr,
-                        storage_of(plane),
-                        plane.width,
-                        plane.width,
-                        first,
-                    )?;
-                }
-            }
-            let logits = match lane_planes[lane] {
-                Some((engine::fire::ReadoutSeam::Logits, plane)) => plane,
-                _ => kernels_cuda::Tensor::new(0, 0, 0, Dtype::Bf16),
-            };
-            let vocab = logits.width;
-            if logits.ptr == 0 {
-            } else if consecutive {
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::Logits,
-                    0,
-                    logits.ptr,
-                    INTRINSIC_STORAGE_RAW_BF16,
-                    vocab,
-                    vocab,
-                    wanted[0],
-                )?;
-            } else {
-                let row_bytes = u64::from(vocab) * 2;
-                let table: Vec<u8> = wanted
-                    .iter()
-                    .flat_map(|row| (logits.ptr + u64::from(*row) * row_bytes).to_le_bytes())
-                    .collect();
-                let at = u64::from(self.budget.max_tokens)
-                    .saturating_mul(8)
-                    .saturating_mul(lane as u64);
-                self.readout_rows.stage(self.device.stream(), at, &table)?;
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::Logits,
-                    0,
-                    self.readout_rows.ptr() + at,
-                    crate::program::launch::INTRINSIC_STORAGE_ROW_POINTERS,
-                    vocab,
-                    vocab,
-                    0,
-                )?;
-            }
-            if let Some(column) = draft {
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::MtpLogits,
-                    0,
-                    column.ptr,
-                    INTRINSIC_STORAGE_RAW_BF16,
-                    column.width,
-                    column.width,
-                    first_row[attached.lane as usize],
-                )?;
-            }
-            if self.programs.needs_mtp_drafts(attached.instance)? {
-                let export = self.exports.drafts.as_ref().ok_or_else(|| {
-                    Fault::program(
-                        "serve::enqueue",
-                        format!(
-                            "instance {} reads the `mtp_drafts` intrinsic and this load \
-                             declares no `{DRAFTS_SEAM}` export; the attachment gate was \
-                             supposed to have refused it",
-                            attached.instance
-                        ),
-                    )
-                })?;
-                let plane = slots.0[export.value.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, the `{DRAFTS_SEAM}` export, which the carve gave no rectangle",
-                        export.value.0
-                    ),
-                })?;
-                if plane.dtype != Dtype::I32 {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "a `{DRAFTS_SEAM}` export landed as {:?}, and the draft ids are \
-                             read as i32",
-                            plane.dtype
-                        ),
-                    });
-                }
-                let depth = self.exports.drafts_depth;
-                if plane.width != depth {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "the `{DRAFTS_SEAM}` export landed {} wide and the text declared \
-                             {depth}",
-                            plane.width
-                        ),
-                    });
-                }
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::MtpDrafts,
-                    0,
-                    plane.ptr + u64::from(wanted[0]) * u64::from(depth) * 4,
-                    INTRINSIC_STORAGE_RAW_I32,
-                    depth,
-                    depth,
-                    0,
-                )?;
-            }
-            if let Some((slab, seat)) = self.scores.zip(
-                p.score_seat_of
-                    .get(attached.lane as usize)
-                    .copied()
-                    .flatten(),
-            ) {
-                let declared = self.programs.declared_score_planes(attached.instance);
-                if let Some(declared) = declared
-                    && declared > slab.planes()
-                {
-                    return Err(Fault::Ceiling {
-                        what: "attention-score planes this load exports",
-                        need: u64::from(declared),
-                        have: u64::from(slab.planes()),
-                    });
-                }
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::AttnScore,
-                    0,
-                    slab.seat_base(seat),
-                    crate::program::launch::INTRINSIC_STORAGE_F32,
-                    crate::scores::KV_MAX,
-                    crate::scores::KV_MAX,
-                    0,
-                )?;
             }
             if let Some(fired) = epilogues.stage(
                 self.device,
@@ -1329,14 +1045,136 @@ impl FireCtx<'_> {
         }
 
         Ok(Some(Readback {
+            names,
             lanes: lane_planes,
-            columns,
             last_row,
             first_row,
             lane_rows,
-            captures: p.lanes.iter().map(|s| s.captures_scores).collect(),
             pixels,
         }))
+    }
+
+    /// Points instance `instance`'s reads of `out` for its lane `k` (the
+    /// fire's lane `at`) at where the fire wrote it: a readout output at the
+    /// rows the lane reads out, a lane output at the lane's row (a layer
+    /// after another), a row or voxel output from the lane's first.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_output(
+        &mut self,
+        p: &Prepared<'_>,
+        instance: engine::InstanceId,
+        k: u32,
+        at: usize,
+        out: &poem_exec::feeds::ClassOutput,
+        plane_of: &dyn Fn(poem_ir::ValueId, &str) -> Result<kernels_cuda::Tensor>,
+        storage_of: &dyn Fn(Dtype) -> Result<u32>,
+        (first_row, last_row, owned): (u32, u32, u32),
+        lane_row: u32,
+        first_voxel: u32,
+    ) -> Result<()> {
+        let name = &out.decl.name;
+        let plane = plane_of(out.values[0], name)?;
+        let storage = storage_of(plane.dtype)?;
+        let width = plane.width;
+        match out.decl.axis {
+            poem_ir::InputAxis::Lane => {
+                let elem = poem_compiler::arena::elem_bytes(plane.dtype).unwrap_or(0);
+                let stride = match out.values.get(1) {
+                    Some(&next) => {
+                        let gap = plane_of(next, name)?.ptr.wrapping_sub(plane.ptr);
+                        let uniform = out.values.windows(2).try_fold(true, |all, pair| {
+                            let (a, b) = (plane_of(pair[0], name)?, plane_of(pair[1], name)?);
+                            Ok::<bool, Fault>(all && b.ptr.wrapping_sub(a.ptr) == gap)
+                        })?;
+                        if !uniform || elem == 0 || gap % elem != 0 {
+                            return Err(Fault::Unbound {
+                                what: format!(
+                                    "output `{name}`'s layers do not sit one plane after \
+                                     another"
+                                ),
+                            });
+                        }
+                        u32::try_from(gap / elem).unwrap_or(u32::MAX)
+                    }
+                    None => width,
+                };
+                self.programs.bind_output(
+                    instance,
+                    name,
+                    k,
+                    plane.ptr + u64::from(lane_row) * u64::from(width) * elem,
+                    storage,
+                    width,
+                    stride,
+                    0,
+                )
+            }
+            poem_ir::InputAxis::Row if out.decl.readout => {
+                let wanted: Vec<u32> = match p.lanes.get(at).and_then(|seated| seated.readout) {
+                    None | Some([]) => vec![last_row],
+                    Some(rows) => {
+                        if rows.len() as u32 > owned {
+                            return Err(Fault::Ceiling {
+                                what: "rows in the lane a readout names",
+                                need: rows.len() as u64,
+                                have: u64::from(owned),
+                            });
+                        }
+                        (0..rows.len() as u32).map(|i| first_row + i).collect()
+                    }
+                };
+                let consecutive = wanted
+                    .windows(2)
+                    .all(|pair| pair[1] == pair[0].wrapping_add(1));
+                if consecutive {
+                    return self.programs.bind_output(
+                        instance, name, k, plane.ptr, storage, width, width, wanted[0],
+                    );
+                }
+                if plane.dtype != Dtype::Bf16 {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "output `{name}` landed as {:?}, and only bf16 readout rows are \
+                             read apart",
+                            plane.dtype
+                        ),
+                    });
+                }
+                let row_bytes = u64::from(width) * 2;
+                let table: Vec<u8> = wanted
+                    .iter()
+                    .flat_map(|row| (plane.ptr + u64::from(*row) * row_bytes).to_le_bytes())
+                    .collect();
+                let staged_at = u64::from(self.budget.max_tokens)
+                    .saturating_mul(8)
+                    .saturating_mul(at as u64);
+                self.readout_rows
+                    .stage(self.device.stream(), staged_at, &table)?;
+                self.programs.bind_output(
+                    instance,
+                    name,
+                    k,
+                    self.readout_rows.ptr() + staged_at,
+                    crate::program::launch::INTRINSIC_STORAGE_ROW_POINTERS,
+                    width,
+                    width,
+                    0,
+                )
+            }
+            poem_ir::InputAxis::Row => self.programs.bind_output(
+                instance, name, k, plane.ptr, storage, width, width, first_row,
+            ),
+            poem_ir::InputAxis::Voxel => self.programs.bind_output(
+                instance,
+                name,
+                k,
+                plane.ptr,
+                storage,
+                width,
+                width,
+                first_voxel,
+            ),
+        }
     }
 }
 

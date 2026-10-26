@@ -77,8 +77,7 @@ async fn main(input: Input) -> Result<Output> {
                 switches.push(("stream", stream.as_str()));
             }
             let lane = model::lane_of(&switches).ok()?;
-            let velocity = lane.readout.as_ref().map(|readout| readout.kind)
-                == Some(model::ReadoutKind::Velocity);
+            let velocity = lane.outputs.iter().any(|output| output.name == "velocity");
             if input.reading.is_none() && (lane.embeds || !velocity) {
                 return None;
             }
@@ -86,21 +85,18 @@ async fn main(input: Input) -> Result<Output> {
             Some((reading.clone(), stream.clone(), lane, latents))
         })
         .ok_or(
-            "this model declares no token-less lane with a velocity readout that reads `latents`",
+            "this model declares no token-less lane reading out a velocity that reads `latents`",
         )?;
     if lane.state || lane.embeds {
         return Err(format!(
             "reading `{reading}` is a sequence reading (tokens and KV); the probe drives a float lane"
         ));
     }
-    let velocity_width = match &lane.readout {
-        Some(readout) if readout.kind == model::ReadoutKind::Velocity => readout.width,
-        other => {
-            return Err(format!(
-                "reading `{reading}` reads out {other:?}; the probe integrates a velocity"
-            ));
-        }
-    };
+    if !lane.outputs.iter().any(|output| output.name == "velocity") {
+        return Err(format!(
+            "reading `{reading}` reads out no velocity; the probe integrates one"
+        ));
+    }
     let rows = input.rows.max(1);
     let max_rows = model::max_latent_rows();
     if max_rows > 0 && rows > max_rows {
@@ -191,7 +187,7 @@ async fn main(input: Input) -> Result<Output> {
     pass.epilogue(move || {
         let k = step.take();
         let x_cur = x.take();
-        let v = intrinsics::velocity(0, rows, velocity_width);
+        let v = intrinsics::output_rows(0, "velocity", rows);
         let dt = gather(dts_ch.read(), &k);
         let next = euler_step(&x_cur, &v, &dt);
         let r = rng.take();

@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use eta_ir::container::const_elem_size;
 use eta_ir::expand;
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape, ValueId, ValueType};
 
 use crate::context::{self, emit};
@@ -1189,12 +1189,12 @@ pub fn nucleus_sample(logits: impl AsTensor, top_p: impl AsTensor, state: impl A
     Tensor::node(result, token_type)
 }
 
-pub(crate) fn intrinsic_val(intr: IntrinsicId, lane: u32, shape: Shape, dtype: Dtype) -> Tensor {
+pub(crate) fn output_val(index: u16, lane: u32, shape: Shape, dtype: Dtype) -> Tensor {
     let ty = ValueType::new(shape, dtype);
     Tensor::node(
         emit(
-            Op::IntrinsicVal {
-                intr,
+            Op::Output {
+                index,
                 lane,
                 shape,
                 dtype,

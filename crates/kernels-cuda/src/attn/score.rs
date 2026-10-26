@@ -34,29 +34,16 @@ pub fn capture(
     q: RaggedTensor,
     plan: &PrefillPlan,
     pool: &KvPool,
-    window: Option<u32>,
     head_dim: u32,
     kv_heads: u32,
     sm_scale: f32,
     observe: u32,
     lane_offset: u32,
-    plane_stride: u32,
-    plane: u32,
     kv_max: u32,
     scores: &mut Tensor,
-    seat_of: &Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.score_capture";
-    plan.accepts(OP, head_dim, Some(kv_heads), window)?;
-    if window.is_some() {
-        return Err(refuse(
-            OP,
-            "a sliding window is stated, and a windowed row is not the softmax the \
-             eviction and interpretability papers define: the mass would be a \
-             distribution over the window rather than over the request's keys, and \
-             every key outside it would read as unattended rather than as excluded",
-        ));
-    }
+    plan.accepts(OP, head_dim, Some(kv_heads), None)?;
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     if !kv::native_bf16(pool) {
         return Err(refuse(
@@ -73,19 +60,8 @@ pub fn capture(
         return Err(refuse(
             OP,
             format!(
-                "the score slab is {:?}, and a per-key mass is an f32 rectangle",
+                "the score rows are {:?}, and a per-key mass is an f32 rectangle",
                 scores.dtype
-            ),
-        ));
-    }
-    if scores.width != kv_max {
-        return Err(refuse(
-            OP,
-            format!(
-                "the score slab's row is {} wide and the stated kv ceiling is {kv_max}; \
-                 the row IS the ceiling, and a disagreement would stripe one lane's mass \
-                 across another's",
-                scores.width
             ),
         ));
     }
@@ -124,22 +100,18 @@ pub fn capture(
         num_q_heads, plan.shape.num_q_heads,
         "`{OP}` captures one row per query head of the plan it was carved with"
     );
-    debug_assert!(
-        plane + num_q_heads <= plane_stride,
-        "`{OP}` writes one plane per query head inside a lane's block of {plane_stride}"
-    );
-    // A seat's bound is in the table on the device; the host bounds the
-    // planes a seat's block holds and the lanes the table names.
-    debug_assert!(
-        plane_stride <= scores.rows,
-        "`{OP}` writes a block of {plane_stride} planes into a slab of {} rows",
-        scores.rows
-    );
-    debug_assert!(
-        lane_offset + requests <= seat_of.rows,
-        "`{OP}` seats {requests} lanes from lane {lane_offset}, and the seat table holds {}",
-        seat_of.rows
-    );
+    if scores.width != num_q_heads.saturating_mul(kv_max)
+        || scores.rows < lane_offset.saturating_add(requests)
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "the score rows are {} by {}, and {requests} lanes from lane {lane_offset} \
+                 capture {num_q_heads} heads of {kv_max} keys",
+                scores.rows, scores.width
+            ),
+        ));
+    }
 
     let floats = head_width.saturating_add(2 * WARPS);
     let smem = floats
@@ -172,7 +144,6 @@ pub fn capture(
             pool.page_indptr.arg(),
             pool.last_page_lens.arg(),
             scores.arg(),
-            seat_of.arg(),
             page_size.arg(),
             stated(OP, num_q_heads)?.arg(),
             stated(OP, num_kv_heads)?.arg(),
@@ -180,8 +151,6 @@ pub fn capture(
             sm_scale.arg(),
             stated(OP, observe)?.arg(),
             stated(OP, lane_offset)?.arg(),
-            stated(OP, plane_stride)?.arg(),
-            stated(OP, plane)?.arg(),
             kv_ceiling.arg(),
         ],
     )

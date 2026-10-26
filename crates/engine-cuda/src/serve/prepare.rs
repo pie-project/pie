@@ -66,17 +66,6 @@ impl FrameShell for Shell {
                     ),
                 ));
             }
-            if self.exports.drafts.is_none() && self.programs.needs_mtp_drafts(attached.instance)? {
-                return Err(Fault::program(
-                    "serve::prepare",
-                    format!(
-                        "instance {} reads the `mtp_drafts` intrinsic and this load's model \
-                         text plants no `{}` export, so there is no token plane to point it at",
-                        attached.instance,
-                        crate::exports::DRAFTS_SEAM
-                    ),
-                ));
-            }
             if attachments[..index]
                 .iter()
                 .any(|earlier| earlier.instance == attached.instance)
@@ -448,23 +437,24 @@ impl FrameShell for Shell {
                 }
             }
         }
-        // Logits are gathered into the readouts-carved plane; a velocity or
-        // hidden seam is read off a tokens-shaped plane and is bounded by the
-        // fire's own rows.
+        // Readout rows are gathered into the readouts-carved plane; a row or
+        // voxel output is read off a tokens-shaped plane and is bounded by
+        // the fire's own rows.
         let readouts_ceiling = composition
             .lanes()
             .iter()
             .filter(|row| readout_count[row.source as usize] > 0)
-            .map(|row| match self.exports.readout_for(row.class as usize) {
-                Some(seam) if seam.seam != engine::fire::ReadoutSeam::Logits => {
-                    u64::from(self.budget.max_tokens)
-                }
-                Some(seam) => self
+            .map(|row| match self.exports.readback(row.class as usize) {
+                Some(out) if !out.decl.readout => u64::from(self.budget.max_tokens),
+                Some(out) => self
                     .compiled
                     .arena
-                    .readout_ceiling_of(seam.value)
+                    .readout_ceiling_of(out.values[0])
                     .unwrap_or_else(|| poem_compiler::arena::readouts_ceiling(&self.budget)),
-                None => poem_compiler::arena::readouts_ceiling(&self.budget),
+                None if self.exports.reads_readout_rows() => {
+                    poem_compiler::arena::readouts_ceiling(&self.budget)
+                }
+                None => u64::from(self.budget.max_tokens),
             })
             .min()
             .unwrap_or_else(|| poem_compiler::arena::readouts_ceiling(&self.budget));
@@ -760,11 +750,6 @@ impl FrameShell for Shell {
             indptr: vec![0],
             ..Default::default()
         };
-        let scoring = lanes.iter().any(|seated| seated.captures_scores);
-        let seated_scores = self.scores.as_ref().map_or(0, crate::scores::Scores::seats);
-        let mut score_seats: Vec<i32> = Vec::new();
-        let mut score_seat_of: Vec<Option<u32>> = vec![None; lanes.len()];
-        let mut next_seat = 0u32;
         let mut adapter_routes: Vec<i32> = Vec::new();
         let any_adapter = lanes.iter().any(|seated| seated.adapter.is_some());
         if any_adapter {
@@ -869,24 +854,6 @@ impl FrameShell for Shell {
                 wide: self.wide.contains(row.class as usize),
             });
             slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
-            if scoring {
-                // Capturing lanes take the slab's seats in the order the
-                // fire lays its lanes out.
-                if seated.captures_scores {
-                    if next_seat >= seated_scores {
-                        return Err(Fault::Ceiling {
-                            what: "capturing lanes the score slab seats",
-                            need: u64::from(next_seat) + 1,
-                            have: u64::from(seated_scores),
-                        });
-                    }
-                    score_seat_of[source] = Some(next_seat);
-                    score_seats.push(next_seat as i32);
-                    next_seat += 1;
-                } else {
-                    score_seats.push(-1);
-                }
-            }
             if !seated.rs_snapshots.is_empty() && row.rows as usize != lane.tokens.len() {
                 return Err(Fault::program(
                     "serve::rs",
@@ -1010,17 +977,6 @@ impl FrameShell for Shell {
                     lane: row.source,
                     word: lane.word,
                     runs_correction,
-                });
-            }
-            let runs_capture_arm = self.exports.capturing.contains(row.class as usize);
-            if seated.captures_scores && self.exports.scores.is_empty() {
-                return Err(Fault::Scoreless { lane: row.source });
-            }
-            if seated.captures_scores != runs_capture_arm {
-                return Err(Fault::ScoreWord {
-                    lane: row.source,
-                    word: lane.word,
-                    runs_capture_arm,
                 });
             }
             if any_adapter {
@@ -1369,17 +1325,17 @@ impl FrameShell for Shell {
             && !self.cache.body_refused(&key)
             && self.cuttable(&key, admits.as_ref());
         super::btrace::mark("cuttable");
-        // A logits class reads its lanes' last rows; a velocity or hidden
-        // class reads every row of its rung, as the eager ceiling above lets it.
+        // A class reading out readout rows reads its lanes' last rows; one
+        // reading a row output reads every row of its rung, as the eager
+        // ceiling above lets it.
         let (last_rows, every_row) =
             ladder
                 .rungs()
                 .iter()
                 .fold((0, 0), |(last, every), &(class, rung)| {
-                    match self.exports.readout_for(class as usize) {
-                        Some(seam) if seam.seam != engine::fire::ReadoutSeam::Logits => {
-                            (last, every + rung)
-                        }
+                    match self.exports.readback(class as usize) {
+                        Some(out) if !out.decl.readout => (last, every + rung),
+                        None if !self.exports.reads_readout_rows() => (last, every + rung),
                         _ => (last + rung.min(lane_ceiling), every),
                     }
                 });
@@ -1461,7 +1417,6 @@ impl FrameShell for Shell {
                 lane_reach: lane_carve,
                 lane_of_row: &lane_of_row,
                 group_of_lane: &group_of_lane,
-                score_seats: &score_seats,
                 packings: &packing_fires,
             },
         )?;
@@ -1535,7 +1490,6 @@ impl FrameShell for Shell {
             patch_ladder,
             towered: self.towered,
             lanes,
-            score_seat_of,
             attachments,
             composition,
             readout_rows,
@@ -1674,7 +1628,6 @@ fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
 }
 
 impl Shell {
-    
     fn group_masks_of(
         &self,
         lanes: &[super::lanes::Seated<'_>],

@@ -1,6 +1,6 @@
 //! `ops.attn.attend` records what a model's hand-written dispatch did: the
-//! same plans over the same lanes, the same kernels on the same rows, the
-//! same scores seam. A model that calls it traces to the same computation.
+//! same plans over the same lanes, the same kernels on the same rows. A
+//! model that calls it traces to the same computation.
 
 use poem_compiler::catalog::{one_rank, replacing, trace_of};
 use poem_ir::{Dtype, Platform, canon};
@@ -9,12 +9,11 @@ use poem_ir::{Dtype, Platform, canon};
 /// front, its kinds of lane told apart by hand.
 const BY_HAND: &str = r#"
 def forward(m, inputs):
-    ([input_m, input_s, input_d], input_p) = inputs.partition([fact.has(fact.Mask), fact.scores(), fact.single_token()])
+    ([input_m, input_d], input_p) = inputs.partition([fact.has(fact.Mask), fact.single_token()])
     plans = struct(
         m = ops.attn.plan_prefill(input_m, m.q_heads, m.kv_heads, m.head_dim, None),
         d = ops.attn.plan_decode(input_d, m.q_heads, m.kv_heads, m.head_dim, None),
         p = ops.attn.plan_prefill(input_p, m.q_heads, m.kv_heads, m.head_dim, None),
-        s = ops.attn.plan_prefill(input_s, m.q_heads, m.kv_heads, m.head_dim, None),
     )
     mask = inputs.mask()
     positions = inputs.positions()
@@ -41,28 +40,20 @@ def forward(m, inputs):
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    return ops.linear.lm_head(x, m.head)
+    output("logits", ops.linear.lm_head(x, m.head))
 
 def attention_by_hand(x, inputs, m, plans, mask, positions, scaling, w):
     pages = inputs.kv(w.kv)
     d = m.head_dim
     q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
-    seam.at(seam.ATTN_QV, [q, v])
     q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k, scaling = scaling)
     ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
-    seam.at(seam.ATTN_Q, [q])
-
-    def scored(q):
-        o, lse = ops.attn.prefill(q, plans.s, pages, None, d, m.kv_heads, m.sm_scale, lse = True)
-        seam.at(seam.SCORES, [lse])
-        return o
 
     o = branch(q, [
         (fact.has(fact.Mask), lambda q: ops.attn.prefill(q, plans.m, pages, None, d, m.kv_heads, m.sm_scale, mask = mask)),
-        (fact.scores(), scored),
         (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, m.sm_scale)),
     ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, m.sm_scale))
-    seam.at(seam.ATTN_OUT, [o])
+    output("attn.scores", ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048))
     return ops.linear.matmul(o, w.o)
 "#;
 

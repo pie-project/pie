@@ -511,7 +511,11 @@ const MASK_TOKEN: i32 = 248_070;
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::mtp_depth() == 0 && input.drafter != "ngram" {
+    let drafts = model::lane_of(&[])?
+        .outputs
+        .iter()
+        .any(|output| output.name == "mtp.drafts");
+    if !drafts && input.drafter != "ngram" {
         return Err("this deployment ships no draft head".into());
     }
     let advertised = model::draft_block();
@@ -557,7 +561,12 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
 
     let mut anchor: i32 = 0;
-    for &(base, end) in &readout_spans(n, model::ReadoutKind::Logits) {
+    let max = model::lane_of(&[])?
+        .outputs
+        .iter()
+        .find(|output| output.name == "logits")
+        .map_or(1, |output| output.max_rows);
+    for &(base, end) in &readout_spans(n, max) {
         let len = end - base;
         let toks = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
         let indptr = Channel::from([0u32, len]).named("embed_indptr_p");
@@ -569,7 +578,7 @@ async fn main(input: Input) -> Result<Output> {
         fwd.readout(&readout)?;
         fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.epilogue(move || {
-            next.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+            next.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
         });
         fwd.submit(&pipe).context("prefill submit")?;
         anchor = next
@@ -625,7 +634,7 @@ async fn main(input: Input) -> Result<Output> {
             fwd.embed(&toks, &indptr)?;
             fwd.state(&[&ws], StateGeometry::folding())?;
             fwd.epilogue(move || {
-                next.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+                next.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
             });
             let fired_at = monotonic_now_ns();
             fwd.submit(&pipe).context("baseline submit")?;
@@ -732,15 +741,15 @@ async fn main(input: Input) -> Result<Output> {
             )?;
             {
                 fwd.epilogue(move || {
-                    out.put(reshape(intrinsics::mtp_drafts(shown), [shown]));
+                    out.put(reshape(intrinsics::output(0, "mtp.drafts"), [shown]));
                     if want_margin {
-                        let (value, _) = top_k(intrinsics::logits(), 2);
+                        let (value, _) = top_k(intrinsics::output(0, "logits"), 2);
                         conf.put(reshape(value, [shown * 2]));
                     }
                     if want_sure {
                         // Each row's largest probability at temperature 1,
                         // 1 / sum(exp(logit - max)): two passes over the row.
-                        let logits = intrinsics::logits();
+                        let logits = intrinsics::output(0, "logits");
                         let top = broadcast(reduce_max(&logits), [shown, intrinsics::vocab()]);
                         let mass = reduce_sum(exp(&logits - top));
                         sure.put(reshape(recip(mass), [shown]));
@@ -812,7 +821,10 @@ async fn main(input: Input) -> Result<Output> {
         )?;
         {
             fwd.epilogue(move || {
-                truth.put(reshape(reduce_argmax(intrinsics::logits()), [verify]));
+                truth.put(reshape(
+                    reduce_argmax(intrinsics::output(0, "logits")),
+                    [verify],
+                ));
             });
         }
         let verified_at = monotonic_now_ns();

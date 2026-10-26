@@ -36,8 +36,7 @@ pub use engine::{
 pub use error::{Error, Result};
 pub use fire::{
     Attachment, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket, KvDelta, Lane,
-    LaneReadout, LayerScores, Mask, Masking, MediaEncode, Readout, RsReset, RsSnapshot, RsVerb,
-    Serves, Step,
+    LaneReadout, Mask, Masking, MediaEncode, Readout, RsReset, RsSnapshot, RsVerb, Serves, Step,
 };
 pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
 pub use program::{

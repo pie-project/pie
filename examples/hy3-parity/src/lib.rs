@@ -25,7 +25,7 @@
 //!
 //! The two voxel arms bind their clip as a CHANNEL whose shape is the box
 //! (`[h, w, C + 256]`, design D8) and read their seam with
-//! `intrinsics::pixels(0, rows, width)`. The timestep's sinusoid rides in the
+//! `intrinsics::output_rows(0, "pixels", rows)`. The timestep's sinusoid rides in the
 //! SAME rectangle, appended to every voxel row: the CUDA shell seats one
 //! voxel width a fire and refuses a lane that feeds two, and a voxel-axis
 //! lane broadcast (which is what an adaGN vector wants) does not exist.
@@ -171,11 +171,13 @@ struct Output {
     latent_channels: u32,
 }
 
-fn readout_width(reading: &str) -> Result<u32> {
+fn output_width(reading: &str, name: &str) -> Result<u32> {
     model::lane_of(&[("reading", reading)])?
-        .readout
-        .map(|readout| readout.width)
-        .ok_or_else(|| format!("reading `{reading}` reads nothing out"))
+        .outputs
+        .into_iter()
+        .find(|output| output.name == name)
+        .map(|output| output.width)
+        .ok_or_else(|| format!("reading `{reading}` reads out no `{name}`"))
 }
 
 fn lane_reading(reading: &str, binds: &[&str]) -> Result<model::LaneDecl> {
@@ -242,7 +244,7 @@ fn prefill(
     pass.readout(&readout)?;
     let (argmax_out, max_out) = (argmax, max);
     pass.epilogue(move || {
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         argmax_out.put(cast(reduce_argmax(&logits), dtype::i32));
         max_out.put(reduce_max(&logits));
     });
@@ -312,10 +314,9 @@ fn denoise_step(
         },
     )?;
     pass.readout(&readout)?;
-    let hidden = case.hidden;
     let readback = out;
     pass.epilogue(move || {
-        readback.put(intrinsics::hidden(0, canvas_len, hidden));
+        readback.put(intrinsics::output_rows(0, "hidden", canvas_len));
     });
     pass.submit(pipe)
         .with_context(|| format!("the `{tag}` denoise step"))?;
@@ -351,11 +352,11 @@ fn voxel_arm(
     let x = Channel::from_shaped([case.token_h, case.token_w, width_in], packed.as_slice())
         .named(&format!("clip_{tag}"));
     pass.input(0, &voxel_input(arm)?, &x)?;
-    let width = readout_width(arm)?;
+    let width = output_width(arm, "pixels")?;
     let out = Channel::new([rows, width], dtype::f32).named(&format!("pixels_{tag}"));
     let readback = out;
     pass.epilogue(move || {
-        readback.put(intrinsics::pixels(0, rows, width));
+        readback.put(intrinsics::output_rows(0, "pixels", rows));
     });
     pass.submit(pipe)
         .with_context(|| format!("the `{arm}` lane"))?;
@@ -400,7 +401,7 @@ async fn main(input: Input) -> Result<Output> {
     if !(encode_lane.state && denoise_lane.state) {
         return Err("both token-axis readings of this family bind a working set".into());
     }
-    let canvas_width = readout_width(denoise)?;
+    let canvas_width = output_width(denoise, "hidden")?;
     if canvas_width != case.hidden {
         return Err(format!(
             "the model reads a {canvas_width}-wide canvas row and the case carries {}",
@@ -439,7 +440,7 @@ async fn main(input: Input) -> Result<Output> {
     // ---- the image head, going in: `patch_embed` on the voxel axis -------
     let image_in = "image.in";
     let image_out = "image.out";
-    let image_in_width = readout_width(image_in)?;
+    let image_in_width = output_width(image_in, "pixels")?;
     if image_in_width != case.hidden {
         return Err(format!(
             "`image.in` lands {image_in_width}-wide rows and the case's trunk is {} wide",

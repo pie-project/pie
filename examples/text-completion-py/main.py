@@ -56,7 +56,7 @@ async def main(input: dict) -> dict:
 
     @fwd.epilogue
     def _prefill_epilogue():
-        tok_out.put(greedy(intrinsics.logits()))
+        tok_out.put(greedy(intrinsics.output(0, "logits")))
 
     pipe.submit(fwd)
     first = await tok_out.take_scalar()
@@ -74,7 +74,7 @@ async def main(input: dict) -> dict:
 
         @fwd.epilogue
         def _decode_epilogue():
-            token = greedy(intrinsics.logits())
+            token = greedy(intrinsics.output(0, "logits"))
             tok_in.put(token)
             tok_out.put(token)
 

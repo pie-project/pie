@@ -212,6 +212,7 @@ fn routes(q8: bool) {
             };
             let pre = PrefillPlan {
                 positions: plan.positions,
+                last_page_len: plan.positions,
                 request_of_token: plan.request_of_token,
                 mask: plan.mask,
                 mask_enabled: plan.mask_enabled,

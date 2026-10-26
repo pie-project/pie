@@ -18,8 +18,6 @@ struct Input {
     /// KV positions TOVA would keep.
     #[serde(default = "default_cache_size")]
     cache_size: u32,
-    #[serde(default = "default_layers")]
-    layers: u32,
     #[serde(default = "default_heads")]
     heads: u32,
 }
@@ -38,10 +36,6 @@ fn default_seed() -> u32 {
 }
 fn default_cache_size() -> u32 {
     16
-}
-/// Qwen3.5-0.8B: 6 of its 24 layers are attention layers.
-fn default_layers() -> u32 {
-    6
 }
 /// Qwen3.5-0.8B: 8 query heads.
 fn default_heads() -> u32 {
@@ -91,11 +85,23 @@ async fn main(input: Input) -> Result<Output> {
     if input.cache_size == 0 {
         return Err("cache_size must be at least 1".into());
     }
-    if input.layers == 0 || input.heads == 0 {
-        return Err("layers and heads must both be at least 1".into());
+    if input.heads == 0 {
+        return Err("heads must be at least 1".into());
     }
-    let layers = input.layers;
+    let scores = model::lane_of(&[])?
+        .outputs
+        .into_iter()
+        .find(|output| output.name == "attn.scores")
+        .ok_or("this model reads out no attention scores")?;
+    let layers = scores.layers.max(1);
     let heads = input.heads;
+    let score_kv = scores.width / heads;
+    if score_kv * heads != scores.width {
+        return Err(format!(
+            "the {}-wide score row does not split into {heads} heads",
+            scores.width
+        ));
+    }
     let Some(planes) = layers.checked_mul(heads) else {
         return Err("layers * heads overflows the plane count".into());
     };
@@ -118,11 +124,10 @@ async fn main(input: Input) -> Result<Output> {
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
     let kv_max = max_pages * page_size;
-    if kv_max > intrinsics::attn_score_kv_max() {
+    if kv_max > score_kv {
         return Err(format!(
-            "prompt + max_tokens needs {kv_max} KV slots, past the published \
-             attn_score ceiling of {}",
-            intrinsics::attn_score_kv_max()
+            "prompt + max_tokens needs {kv_max} KV slots, past the model's \
+             score ceiling of {score_kv}"
         ));
     }
     let cache_size = input.cache_size.min(kv_max);
@@ -142,7 +147,7 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.state(&[&ws], StateGeometry::folding())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let token = step(logits, temperature, &r);
         tok_out_p.put(&token);
         rng_p.put(&(&r + iota(2)));
@@ -178,7 +183,7 @@ async fn main(input: Input) -> Result<Output> {
 
         fwd.epilogue(move || {
             let r = rng.take();
-            let logits = intrinsics::logits();
+            let logits = intrinsics::output(0, "logits");
             let token = step(logits, temperature, &r);
 
             tok_in.put(&token);
@@ -186,7 +191,7 @@ async fn main(input: Input) -> Result<Output> {
             rng.put(&(&r + iota(2)));
 
             // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
-            let rect = intrinsics::attn_score(planes);
+            let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
             let folded = &reduce_sum(transpose(&rect)) / heads_f;
             scores_out.put(gather(&folded, iota(kv_max)));
         });

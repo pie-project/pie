@@ -277,7 +277,7 @@ fn sample(
     histogram: Option<(&Tensor, &Tensor)>,
     mask: Option<&Tensor>,
 ) -> (Tensor, Option<Tensor>, Option<Landed>) {
-    let mut logits = reshape(intrinsics::logits(), [vocab]);
+    let mut logits = reshape(intrinsics::output(0, "logits"), [vocab]);
     let raw = k.logprobs.map(|_| logits.clone());
     if let Some((counts, present)) = histogram {
         let zero = broadcast(0.0f32, [vocab]);
@@ -430,8 +430,13 @@ async fn score_prompt(
 ) -> Result<Vec<Logprob>> {
     let vocab = model::output_vocab_size();
     let rows = prompt.len().saturating_sub(1) as u32;
+    let max = model::lane_of(&[])?
+        .outputs
+        .iter()
+        .find(|output| output.name == "logits")
+        .map_or(1, |output| output.max_rows);
     let mut scored = Vec::with_capacity(rows as usize);
-    for (at, &(base, end)) in readout_spans(rows, model::ReadoutKind::Logits)
+    for (at, &(base, end)) in readout_spans(rows, max)
         .iter()
         .enumerate()
     {
@@ -455,7 +460,7 @@ async fn score_prompt(
         fwd.state(&[ws], StateGeometry::folding())?;
         fwd.readout(&readout)?;
         fwd.epilogue(move || {
-            let lp = log_softmax(reshape(intrinsics::logits(), [len, vocab]));
+            let lp = log_softmax(reshape(intrinsics::output(0, "logits"), [len, vocab]));
             let chosen = scalar_gather(&lp, targets.take());
             // Rank 1 is the likeliest: one more than the tokens likelier.
             let likelier = gt(&lp, broadcast(reshape(&chosen, [len, 1]), [len, vocab]));

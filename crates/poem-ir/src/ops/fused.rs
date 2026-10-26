@@ -46,8 +46,8 @@ impl Part for Scaled {
 /// What a fused op writes of the values between its primitives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Intermediates {
-    /// Every intermediate keeps its value: one may be read past the op (a
-    /// seam's), and a backend that cannot take the op whole runs its
+    /// Every intermediate keeps its value: one may be read past the op (an
+    /// output's), and a backend that cannot take the op whole runs its
     /// primitives over them.
     Written,
     /// Nothing reads them past the op, so they may be left unwritten.

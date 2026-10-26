@@ -516,7 +516,7 @@ mod tests {
     /// chances, and each row's draw, over `steps` steps of one Gumbel stream.
     fn landed(logits: &[f32], proposals: [i32; 3], steps: usize) -> (Vec<f32>, Vec<[u32; 3]>) {
         use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
-        use eta_dsl::eta::registry::{EngineCaps, Graph, Readout, ReadoutKind};
+        use eta_dsl::eta::registry::{Axis, EngineCaps, OutputDecl};
         use eta_dsl::eta::validate::bind;
         use eta_dsl::prelude::*;
         const ROWS: u32 = 3;
@@ -532,7 +532,16 @@ mod tests {
         let chances = leak(Channel::new([ROWS], dtype::f32).named("chances"));
         let draws = leak(Channel::new([ROWS], dtype::i32).named("draws"));
         tok.put(proposals);
+        let decl = OutputDecl {
+            name: "logits".into(),
+            axis: Axis::Row,
+            width: vocab,
+            dtype: dtype::f32,
+            layers: 0,
+            readout: true,
+        };
         let mut b = Builder::new(vocab, 4);
+        b.outputs(vec![vec![decl.clone()]]);
         b.bind_port(Port::EmbedTokens, tok);
         b.bind_port(Port::EmbedIndptr, indptr);
         b.bind_port(Port::KvLen, kv_len);
@@ -542,7 +551,7 @@ mod tests {
             tok.put(tok.take());
             positions.put(positions.take());
             let r = rng.take();
-            let logits = reshape(intrinsics::logits(), [ROWS, vocab]);
+            let logits = reshape(intrinsics::output(0, "logits"), [ROWS, vocab]);
             let (c, d) = point_rows(&logits, &props.read(), ROWS, vocab, &r);
             chances.put(c);
             draws.put(d);
@@ -551,18 +560,9 @@ mod tests {
         chances.note_host_take();
         draws.note_host_take();
         let traced = b.build().expect("the epilogue traces");
-        let lanes = vec![Some(Readout {
-            kind: ReadoutKind::Logits,
-            width: vocab,
-        })];
-        let graph = Graph {
-            num_layers: 2,
-            ..Graph::default()
-        };
         let bound = bind(
             traced.container().clone(),
-            lanes,
-            graph,
+            vec![vec![decl]],
             EngineCaps::default(),
         )
         .expect("the trace binds");
@@ -579,8 +579,7 @@ mod tests {
         ];
         let mut instance = Instance::new(&bound, &seeds).expect("the trace instantiates");
         let inputs = PassInputs {
-            logits: Some(Value::F32(logits.to_vec())),
-            ..Default::default()
+            outputs: vec![("logits".into(), 0, Value::F32(logits.to_vec()))],
         };
         let (mut first, mut out) = (Vec::new(), Vec::new());
         for _ in 0..steps {

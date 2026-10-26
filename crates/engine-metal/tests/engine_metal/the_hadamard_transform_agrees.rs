@@ -353,7 +353,7 @@ fn hadamard_check_faults(d: u64, block: u32) -> bool {
             guard: Guard::Always,
             layer: None,
         }],
-        seams: Vec::new(),
+        outputs: Vec::new(),
         drafter: None,
     };
 
@@ -408,7 +408,7 @@ fn hadamard_sign_dtype_faults(act: Dtype, sign: Dtype) -> bool {
             guard: Guard::Always,
             layer: None,
         }],
-        seams: Vec::new(),
+        outputs: Vec::new(),
         drafter: None,
     };
 

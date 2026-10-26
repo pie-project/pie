@@ -18,7 +18,7 @@ export function main(input) {
     const fwd = new ForwardPass();
     fwd.embed(tokens.slice(done));                       // the new tokens
     fwd.state([ws], { fold: 'all' });                    // appended, and final
-    const out = fwd.epilogue(() => reduceArgmax(intrinsics.logits())); // traced once, runs on the device
+    const out = fwd.epilogue(() => reduceArgmax(intrinsics.output(0, 'logits'))); // traced once, runs on the device
     pipe.submit(fwd);
     done = tokens.length;
     tokens.push(out.takeScalar());                       // blocks until the fire settles
@@ -57,11 +57,12 @@ A model receives two things per fire: **inputs** (device channels) and
 `ForwardPass` holds every lane of one computation (a CFG denoise step's text
 and image lanes of both branches, say); `switch(lane, name, value)`,
 `input(lane, name, ch)`, `media(lane, spans)` and `group(lane, id)` address a
-lane by index, `mask(rows)` is pass-wide, and epilogue intrinsics take the lane
-(`velocity(lane, …)`, `hidden(lane, …)`, `pixels(lane, …)`). `model.switches()`
+lane by index, `mask(rows)` is pass-wide, and an epilogue reads a lane's outputs
+by the names the model gives them (`output(lane, name)`, `outputRows(lane, name, rows)`). `model.switches()`
 lists a model's switches and `model.lane(switches)` says what a lane with those
 values binds: its inputs, whether it binds a working set (`state`), whether it
-embeds tokens, and its readout. Generative latents are the VAE's own
+embeds tokens, and the outputs it may read (`logits`, `velocity`, `hidden`,
+`pixels` by convention). Generative latents are the VAE's own
 `[t, h, w, C]`; patching and positions live in the model. A causal VAE
 decodes frame by frame into a working set, one latent frame per slot, and the
 runtime's `fresh` switch (cursor 0) picks its first-frame branch. A `prologue`

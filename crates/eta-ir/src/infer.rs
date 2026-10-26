@@ -533,7 +533,7 @@ fn infer(
             }
         }
 
-        Op::IntrinsicVal { shape, dtype, .. } => push(&mut out, ValueType::new(shape, dtype)),
+        Op::Output { shape, dtype, .. } => push(&mut out, ValueType::new(shape, dtype)),
         Op::KernelCall {
             name,
             ref args,

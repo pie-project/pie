@@ -583,7 +583,7 @@ def vae_decode(vae, z, grid):
             h = convolve(up, grid, block.upsample)
     h = run_group_norm(h, grid, d.norm_out, True)
     y = convolve(h, grid, d.conv_out)
-    seam.at(seam.PIXELS, [y, grid])
+    output("pixels", y, grid = grid)
     return y
 
 def vae_encode(vae, arm):
@@ -638,7 +638,7 @@ def qwen3_encode(arm, te, tap = None):
         if tap != None:
             tap(l, y)
         elif l == last:
-            seam.at(seam.HIDDEN, [y])
+            output("hidden", y)
         return y
 
     arm.fold_layers(te.layers, y, layer)
@@ -662,11 +662,10 @@ def forward(m, inputs):
     if m.te != None:
         qwen3_encode(reading("text"), m.te)
     refine(reading("refine"), m)
-    velocity = denoise(reading("denoise"), m)
+    denoise(reading("denoise"), m)
     if m.vae != None:
         decode(reading("vae.decode"), m)
         encode(reading("vae.encode"), m)
-    return velocity
 
 PATCH_BOX = [1, PATCH, PATCH]
 
@@ -713,7 +712,7 @@ def refine(arm, m):
     def layer(l, b, c):
         c = run_block(c, b, None, m, geom, "")[0]
         if l == last:
-            seam.at(seam.HIDDEN, [c])
+            output("hidden", c)
         return c
 
     arm.fold_layers(dit.context_refiner, c, layer)
@@ -727,14 +726,14 @@ def adaln(mods, dim):
         gate_mlp = ops.elemwise.tanh(gate_mlp),
     )
 
-def seam_tapped(image, context):
+def tapped_velocity(image, context):
     """`image` and `context`, cut to `image`'s width, read out as the
     velocity at a tap."""
     width = image.width()
     if width < context.width():
         context = ops.gather.split_rows(context, width)[0]
     both = merge([image, context])
-    seam.at(seam.VELOCITY, [both])
+    output("velocity", both)
     return both
 
 def denoise(arm, m):
@@ -784,15 +783,15 @@ def denoise(arm, m):
     # intermediate; a fold carries `struct(tapped = ...)` past its rest.
     tap = m.tap
     context = ctx.input("context", dtype.bf16, "row", d.dim, rows = CAPTION_ROWS) if tap else None
-    stop = lambda v: struct(tapped = seam_tapped(v, context))
+    stop = lambda v: struct(tapped = tapped_velocity(v, context))
     if tap == "latents":
-        return seam_tapped(x, context)
+        return tapped_velocity(x, context)
     x = run_linear(dit.x_embed, x)
     x = ops.elemwise.modulate(x, ops.linear.matmul(x_pad, dit.x_pad_mod), None, "scale_shift")
     if tap == "x_linear":
-        return seam_tapped(x, context)
+        return tapped_velocity(x, context)
     if tap == "x_embed":
-        return seam_tapped(x, context)
+        return tapped_velocity(x, context)
 
     def refiner(l, b, x):
         if type(x) == "struct":
@@ -814,7 +813,7 @@ def denoise(arm, m):
     if type(x) == "struct":
         return x.tapped
     if tap == "x_refined":
-        return seam_tapped(x, context)
+        return tapped_velocity(x, context)
     c = context if context != None else ctx.input("context", dtype.bf16, "row", d.dim, rows = CAPTION_ROWS)
 
     def layer(l, b, u):
@@ -823,7 +822,7 @@ def denoise(arm, m):
         mods = adaln(run_linear(b.ada, temb), d.dim)
         u = run_block(u, b, (mods, lanes), m, joint, "")[0]
         if tap == "layer{}".format(l):
-            return struct(tapped = seam_tapped(u.on(image), u.on(~image)))
+            return struct(tapped = tapped_velocity(u.on(image), u.on(~image)))
         return u
 
     u = arm.fold_layers(dit.layers, merge([x, c]), layer)
@@ -834,14 +833,14 @@ def denoise(arm, m):
     u = u.on(image)
     h = ops.elemwise.modulate(ops.elemwise.layernorm_no_scale(u, FINAL_LN_EPS), scale, img_lanes, "scale")
     if tap == "final_norm":
-        return seam_tapped(h, context)
+        return tapped_velocity(h, context)
     v = run_linear(dit.final_linear, h)
     if tap == "final_linear":
-        return seam_tapped(v, context)
+        return tapped_velocity(v, context)
     if tap:
         fail("the tap {} names no intermediate of z-image".format(tap))
     velocity = ops.conv.unpatchify(ops.elemwise.mul_scalar(-1.0, v), tgrid, PATCH_BOX, grid)
-    seam.at(seam.VELOCITY, [velocity])
+    output("velocity", velocity)
     return velocity
 
 def run_block(x, b, mods, m, g, tap):
@@ -915,5 +914,5 @@ def encode(arm, m):
     mean, grid = vae_encode(m.vae, arm)
     # (mean - shift) * s: the latent the denoiser reads and `decode` takes.
     z = ops.elemwise.standardize(mean, m.vae.latent.shift, m.vae.latent.scale)
-    seam.at(seam.PIXELS, [z, grid])
+    output("pixels", z, grid = grid)
     return z

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import Sequence
 
 # ---------------------------------------------------------------------------
@@ -127,13 +127,11 @@ class RngKind(IntEnum):
 
 class Stage(IntEnum):
     PROLOGUE = 0
-    ON_ATTN_PROJ = 1
-    ON_ATTN = 2
     EPILOGUE = 3
 
     @property
     def wire_name(self) -> str:
-        return ("prologue", "on_attn_proj", "on_attn", "epilogue")[self]
+        return self.name.lower()
 
 
 class Port(IntEnum):
@@ -162,30 +160,27 @@ class Port(IntEnum):
         return self.name.lower()
 
 
-class Intrinsic(IntEnum):
-    LOGITS = 0
-    MTP_LOGITS = 1
-    HIDDEN = 2
-    QUERY = 3
-    LAYER = 5
-    MTP_DRAFTS = 6
-    ATTN_SCORE = 7
-    VELOCITY = 8
-    PIXELS = 9
+KNOWN_SINKS = ("attn_page_mask", "lora", "minference_sparse")
 
 
-class SinkScope(IntEnum):
-    PASS_WIDE = 0
-    ATTENTION = 1
+class Axis(str, Enum):
+    """Whether an output is one row a lane, a row or a voxel."""
+
+    LANE = "lane"
+    ROW = "row"
+    VOXEL = "voxel"
 
 
-KNOWN_SINKS = {
-    "attn_page_mask": SinkScope.ATTENTION,
-    "lora": SinkScope.PASS_WIDE,
-    "minference_sparse": SinkScope.PASS_WIDE,
-}
+@dataclass(frozen=True)
+class OutputDecl:
+    """An output of the model as a lane reads it — `eta_ir::registry::OutputDecl`."""
 
-ATTN_SCORE_KV_MAX = 2048
+    name: str
+    axis: Axis
+    width: int
+    dtype: "Dtype"
+    layers: int
+    readout: bool
 
 
 class HostRole(IntEnum):
@@ -214,7 +209,6 @@ RNG_KIND = "rng_kind"
 PREDICATE = "predicate"
 LITERAL = "literal"
 NAME = "name"
-INTRINSIC = "intrinsic"
 ARGS = "args"
 
 
@@ -275,7 +269,7 @@ class tags:  # noqa: N801
     CHAN_TAKE = 0x90
     CHAN_READ = 0x91
     CHAN_PUT = 0x92
-    INTRINSIC_VAL = 0xA0
+    OUTPUT = 0xA0
     KERNEL_CALL = 0xA1
     SINK_CALL = 0xA2
 
@@ -338,7 +332,7 @@ OP_TABLE: dict[int, tuple[str, int, tuple[str, ...]]] = {
     tags.CHAN_TAKE: ("chan_take", 1, (CHAN,)),
     tags.CHAN_READ: ("chan_read", 1, (CHAN,)),
     tags.CHAN_PUT: ("chan_put", 0, (CHAN, VALUE)),
-    tags.INTRINSIC_VAL: ("intrinsic_val", 1, (INTRINSIC, IMM, DTYPE, SHAPE)),
+    tags.OUTPUT: ("output", 1, (NAME, IMM, DTYPE, SHAPE)),
     tags.KERNEL_CALL: ("kernel_call", 1, (NAME, DTYPE, SHAPE, ARGS)),
     tags.SINK_CALL: ("sink_call", 0, (NAME, ARGS)),
 }
@@ -361,7 +355,6 @@ class Op:
     lit_dtype: int = 0
     lit_bits: int = 0
     name_idx: int = 0
-    intr: int = 0
 
     @property
     def name(self) -> str:
@@ -446,9 +439,9 @@ class Op:
         return Op(tags.CHAN_PUT, [value], chan=chan)
 
     @staticmethod
-    def intrinsic_val(intr: Intrinsic, shape: Shape, dt: Dtype, lane: int = 0) -> "Op":
-        # `lane` (0 for non-per-lane intrinsics) rides the op's imm.
-        return Op(tags.INTRINSIC_VAL, intr=int(intr), imms=(lane,), shape=shape, dtype=int(dt))
+    def output(index: int, lane: int, shape: Shape, dt: Dtype) -> "Op":
+        # The output the name `index` names; the reading `lane` rides the op's imm.
+        return Op(tags.OUTPUT, name_idx=index, imms=(lane,), shape=shape, dtype=int(dt))
 
     @staticmethod
     def kernel_call(name: int, args: list[int], shape: Shape, dt: Dtype) -> "Op":
@@ -587,8 +580,6 @@ def encode_op(w: bytearray, op: Op) -> None:
             _u32(w, op.lit_bits)
         elif f == NAME:
             _u16(w, op.name_idx)
-        elif f == INTRINSIC:
-            _u16(w, op.intr)
         elif f == ARGS:
             rest = op.args[value:]
             _u8(w, len(rest))

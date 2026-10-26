@@ -21,7 +21,7 @@ function appendTokens(ws, pipeline, tokens) {
   fwd.embed(tokenInput, embedIndptr);
   fwd.state([ws], { fold: 'all' });
   fwd.epilogue(() => {
-    nextToken.put(reshape(reduceArgmax(intrinsics.logits()), [1]));
+    nextToken.put(reshape(reduceArgmax(intrinsics.output(0, 'logits')), [1]));
   });
   pipeline.submit(fwd);
   return nextToken.takeScalar();
@@ -42,7 +42,7 @@ function generate(ws, pipeline, firstToken, maxTokens) {
   fwd.embed(tokenIn, embedIndptr);
   fwd.state([ws], { fold: 'all' });
   fwd.epilogue(() => {
-    const token = reshape(reduceArgmax(intrinsics.logits()), [1]);
+    const token = reshape(reduceArgmax(intrinsics.output(0, 'logits')), [1]);
     tokenIn.put(token);
     tokenOut.put(token);
   });

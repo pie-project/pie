@@ -4,7 +4,7 @@ use crate::z_image_dims::{self as model, Dims};
 use poem::generative::ScheduleKind;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, Gather, GeomKind, InputAxis, Operation, Platform, Request,
-    RopeForm, RuntimeInput, Selection, Trace, Ty, ValueId, seam,
+    RopeForm, RuntimeInput, Selection, Trace, Ty, ValueId,
 };
 use poem_ir::Conv;
 
@@ -144,11 +144,11 @@ fn the_latent_is_patched_in_the_graph_and_the_positions_follow_the_caption() {
             model::CHANNELS
         );
         let velocity = plan
-            .seams
+            .outputs
             .iter()
-            .find(|s| s.seam == seam::VELOCITY.name)
+            .find(|s| s.name == "velocity")
             .expect("a velocity seam")
-            .values[0];
+            .value;
         assert_eq!(
             plan.values[velocity.0 as usize].ty,
             Ty::Tensor {
@@ -201,30 +201,30 @@ fn every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states() {
                 "{deployment} {platform:?}: the encoder's kv rows, and nothing else, are held"
             );
             let seams: BTreeMap<&str, usize> =
-                plan.seams.iter().fold(BTreeMap::new(), |mut acc, s| {
-                    *acc.entry(s.seam.as_str()).or_default() += 1;
+                plan.outputs.iter().fold(BTreeMap::new(), |mut acc, s| {
+                    *acc.entry(s.name.as_str()).or_default() += 1;
                     acc
                 });
             assert_eq!(
-                seams.get(seam::VELOCITY.name),
+                seams.get("velocity"),
                 Some(&1),
                 "{deployment}: one velocity"
             );
             assert!(
-                !seams.contains_key(seam::OUT.name),
+                !seams.contains_key("logits"),
                 "{deployment}: a denoiser has no logits, and `out` was planted anyway"
             );
             let hidden = if deployment == TURBO { 2 } else { 1 };
             assert_eq!(
-                seams.get(seam::HIDDEN.name),
+                seams.get("hidden"),
                 Some(&hidden),
                 "{deployment}: one `hidden` per reading that reads hidden rows back"
             );
             if deployment == TURBO {
                 let taps: BTreeSet<Option<u32>> = plan
-                    .seams
+                    .outputs
                     .iter()
-                    .filter(|s| s.seam == seam::HIDDEN.name)
+                    .filter(|s| s.name == "hidden")
                     .map(|s| s.layer)
                     .collect();
                 assert!(

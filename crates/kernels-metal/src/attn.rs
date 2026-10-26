@@ -100,6 +100,9 @@ pub struct DecodePlan {
 pub struct PrefillPlan {
     pub positions: Tensor,
 
+    /// Each request's keys on its last page.
+    pub last_page_len: Tensor,
+
     pub request_of_token: Tensor,
 
     pub mask: Tensor,
@@ -195,14 +198,14 @@ pub fn plan_decode(
 
 pub fn plan_prefill(
     ctx: &Ctx<'_>,
-    kv_len: Tensor,
+    last_page_len: Tensor,
     positions: Tensor,
     request_of_token: Tensor,
     mask: Tensor,
     mask_enabled: Tensor,
     mask_stride: u32,
 ) -> Result<PrefillPlan, Error> {
-    let _ = (ctx, kv_len);
+    let _ = ctx;
     tables_agree(
         "attn.plan_prefill",
         positions,
@@ -212,6 +215,7 @@ pub fn plan_prefill(
     )?;
     Ok(PrefillPlan {
         positions,
+        last_page_len,
         request_of_token,
         mask,
         mask_enabled,

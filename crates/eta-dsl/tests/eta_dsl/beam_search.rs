@@ -1,5 +1,5 @@
 use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
-use eta_ir::registry::{EngineCaps, Graph, Port, Readout, ReadoutKind};
+use eta_ir::registry::{EngineCaps, OutputDecl, Port};
 use eta_ir::validate::BoundTrace;
 
 use eta_dsl::builder::Builder;
@@ -32,6 +32,7 @@ fn build_designb() -> Traced {
     let lanes_b = leak(Channel::from((0u32..=B).collect::<Vec<_>>()).named("indptr"));
 
     let mut b = Builder::new(V, PAGE_T);
+    b.outputs(crate::outputs::logits(V));
     b.bind_port(Port::EmbedTokens, toks);
     b.bind_port(Port::EmbedIndptr, lanes_b);
     b.bind_port(Port::Positions, pos);
@@ -41,7 +42,7 @@ fn build_designb() -> Traced {
     b.stage(Stage::Epilogue, move || {
         let cand = add(
             broadcast(reshape(scores.take(), [B, 1]), [B, V]),
-            log_softmax(intrinsics::logits()),
+            log_softmax(intrinsics::output(0, "logits")),
         );
         let (s, i) = top_k(reshape(cand, [B * V]), B);
         let parent = div(&i, V);
@@ -81,16 +82,11 @@ fn build_designb() -> Traced {
 
 fn served(
     container: eta_ir::container::TraceContainer,
-    lanes: Vec<Option<Readout>>,
-    num_layers: u32,
+    lanes: Vec<Vec<OutputDecl>>,
 ) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
     eta_ir::validate::bind(
         container,
         lanes,
-        Graph {
-            num_layers,
-            ..Graph::default()
-        },
         EngineCaps {
             lora: true,
             attn_page_mask: true,
@@ -98,11 +94,8 @@ fn served(
     )
 }
 
-fn logits_lane(vocab: u32) -> Vec<Option<Readout>> {
-    vec![Some(Readout {
-        kind: ReadoutKind::Logits,
-        width: vocab,
-    })]
+fn logits_lane(vocab: u32) -> Vec<Vec<OutputDecl>> {
+    crate::outputs::logits(vocab)
 }
 
 fn u32s(v: &[u32]) -> Value {
@@ -125,8 +118,7 @@ fn logits_forcing_parent(parent_beam: u32, t0: u32, t1: u32) -> PassInputs {
     l[row + t0 as usize] = 20.0;
     l[row + t1 as usize] = 19.0;
     PassInputs {
-        logits: Some(Value::F32(l)),
-        ..Default::default()
+        outputs: vec![("logits".into(), 0, Value::F32(l))],
     }
 }
 
@@ -154,7 +146,7 @@ fn harvest(inst: &mut Instance, bound: &BoundTrace) -> Harvest {
 #[test]
 fn golden_designb_fork_from_shared_prefix() {
     let traced = build_designb();
-    let bound = served(traced.container().clone(), logits_lane(V), 2).unwrap();
+    let bound = served(traced.container().clone(), logits_lane(V)).unwrap();
 
     let seeds: Vec<(u32, Value)> = vec![
         (0, mask_of(&[&[0, 1], &[0, 1]])),

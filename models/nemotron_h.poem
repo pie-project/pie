@@ -424,14 +424,13 @@ def forward(m, inputs):
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    return ops.linear.lm_head(x, m.head)
+    output("logits", ops.linear.lm_head(x, m.head))
 
 def mamba(x, inputs, m, k):
     conv_state = inputs.state(k.conv_state)
     ssm_state = inputs.state(k.ssm_state)
     z, rest = ops.gather.split_rows(ops.linear.matmul(x, k.in_proj), m.inner)
     xbc, dt = ops.gather.split_rows(rest, m.conv_dim)
-    seam.at(seam.RECURRENT, [xbc])
 
     def scan(xbc, chunked):
         rows = (lambda v: v.on(~fact.single_token())) if chunked else (lambda v: v.on(fact.single_token()))
@@ -461,13 +460,13 @@ def attention(x, inputs, m, a):
     q = ops.linear.matmul(x, a.q)
     k = ops.linear.matmul(x, a.k)
     v = ops.linear.matmul(x, a.v)
-    seam.at(seam.ATTN_QV, [q, v])
     ops.attn.kv_append(k, v, pages, inputs.write_page(a.kv), inputs.write_offset(a.kv))
-    seam.at(seam.ATTN_Q, [q])
 
-    # Each lane by its kind; a lane may bring its own mask or capture scores.
-    o = ops.attn.attend(q, inputs, a.kv, m.heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
-    seam.at(seam.ATTN_OUT, [o])
+    # Each lane by its kind; a lane may bring its own mask. A lane capturing
+    # scores reads them out too.
+    o = ops.attn.attend(q, inputs, a.kv, m.heads, m.kv_heads, d, m.sm_scale, mask = True)
+    scores = ops.attn.score_capture(q, inputs, a.kv, m.heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
+    output("attn.scores", scores)
     return ops.linear.matmul(o, a.o)
 
 def moe(x, m, f):

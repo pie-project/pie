@@ -1,11 +1,4 @@
 #![allow(unsafe_code)]
-fn container_has_attention_stages(container: &eta_ir::container::TraceContainer) -> bool {
-    use eta_ir::registry::Stage;
-    container
-        .stages
-        .iter()
-        .any(|s| matches!(s.stage, Stage::OnAttnProj | Stage::OnAttn))
-}
 
 /// A prologue that takes or puts a channel commits before its fire's forward.
 fn container_prologue_moves(container: &eta_ir::container::TraceContainer) -> bool {
@@ -504,17 +497,10 @@ async fn settle_device_folds<C: FireContext>(
     )
 }
 
-/// What changes the KV a pass writes beyond its tokens.
-fn hook_program_of<C: FireContext>(
-    ctx: &mut C,
-    fwd: &Resource<ForwardPass>,
-) -> Anyhow<(bool, bool)> {
+/// Whether the pass's program adapts the KV it writes beyond its tokens.
+fn lora_program_of<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyhow<bool> {
     let p = ctx.resources().get(fwd)?;
-    let container = &p.instance.program.bound.container;
-    Ok((
-        container_has_attention_stages(container),
-        container_has_lora_sink(container),
-    ))
+    Ok(container_has_lora_sink(&p.instance.program.bound.container))
 }
 
 /// `PIE_FIRE_ROWS` overrides it, so a test compares outputs cut at the same
@@ -545,12 +531,14 @@ fn fire_rows() -> Option<u32> {
 /// Each piece but the last ends on a page boundary; the last holds every row
 /// the program reads out. The pages before the first media row are a piece
 /// of their own, which seals.
+/// `tail`: the last rows of the lane an output it reads is computed over.
 fn host_cuts(
     req: &crate::engine::FireRequest,
     cuttable: bool,
     share: u32,
     page: u32,
     forced: &[u32],
+    tail: u32,
 ) -> Vec<(u32, u32)> {
     let rows = |lane: &::engine::Lane| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
     let [lane] = req.lanes.as_slice() else {
@@ -562,7 +550,7 @@ fn host_cuts(
     }
     let (held, page) = (lane.kv.held, page.max(1));
     let media = first_media_row(req);
-    let tail = tail_row(lane, rows).min(media.unwrap_or(rows));
+    let tail = tail_row(lane, rows, tail).min(media.unwrap_or(rows));
     let mut ends: Vec<u32> = forced
         .iter()
         .copied()
@@ -597,7 +585,6 @@ fn host_cuts(
 fn plain_rows(req: &crate::engine::FireRequest) -> bool {
     separable_rows(req)
         && req.lanes[0].mask.is_none()
-        && !req.lanes[0].captures_scores
         && matches!(req.lanes[0].readout, ::engine::Readout::Last)
 }
 
@@ -621,16 +608,16 @@ fn plain_lane(lane: &::engine::Lane) -> bool {
     lane.adapter.is_none() && lane.inputs.is_empty() && !lane.kv_less
 }
 
-/// The first row the last piece must hold: what the readout names and what a
-/// score capture observes.
-fn tail_row(lane: &::engine::Lane, rows: u32) -> u32 {
+/// The first row the last piece must hold: what the readout names, and the
+/// last `tail` rows an output the program reads is computed over.
+fn tail_row(lane: &::engine::Lane, rows: u32, tail: u32) -> u32 {
     let read = match &lane.readout {
         ::engine::Readout::Last => rows.saturating_sub(1),
         ::engine::Readout::Rows(read) => read.iter().copied().min().unwrap_or(rows),
         ::engine::Readout::None => rows,
     };
-    if lane.captures_scores {
-        read.min(rows.saturating_sub(eta_ir::registry::ATTN_SCORE_OBSERVE))
+    if tail > 0 {
+        read.min(rows.saturating_sub(tail))
     } else {
         read
     }
@@ -672,7 +659,6 @@ fn rows_of_lanes(
                 }
             } else {
                 lane.readout = ::engine::Readout::None;
-                lane.captures_scores = false;
                 lane.channels.clear();
             }
             Some(lane)
@@ -711,7 +697,9 @@ fn pass_pieces(
     share: u32,
     page: u32,
     forced: &[u32],
+    tails: &[u32],
 ) -> Vec<Vec<Option<(u32, u32)>>> {
+    let tail = |lane: usize| tails.get(lane).copied().unwrap_or(0);
     let whole = || {
         vec![
             req.lanes
@@ -721,7 +709,7 @@ fn pass_pieces(
         ]
     };
     if req.lanes.len() <= 1 {
-        return host_cuts(req, cuttable, share, page, forced)
+        return host_cuts(req, cuttable, share, page, forced, tail(0))
             .into_iter()
             .map(|cut| vec![Some(cut)])
             .collect();
@@ -735,9 +723,10 @@ fn pass_pieces(
     let per_lane: Vec<Vec<(u32, u32)>> = req
         .lanes
         .iter()
-        .map(|lane| {
+        .enumerate()
+        .map(|(at, lane)| {
             let one = crate::engine::FireRequest::one(lane.clone());
-            host_cuts(&one, true, share, page, &[])
+            host_cuts(&one, true, share, page, &[], tail(at))
         })
         .collect();
     let count = per_lane.iter().map(Vec::len).max().unwrap_or(1);
@@ -1339,8 +1328,8 @@ enum FoldBy {
     },
 }
 
-fn plain_decode(req: &crate::engine::FireRequest, hooked: bool, fire_wide_mask: bool) -> bool {
-    !hooked
+fn plain_decode(req: &crate::engine::FireRequest, adapted: bool, fire_wide_mask: bool) -> bool {
+    !adapted
         && !fire_wide_mask
         && matches!(req.lanes.as_slice(), [lane] if plain_lane(lane) && lane.mask.is_none())
 }
@@ -1544,28 +1533,58 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
     }
 }
 
+/// Each lane's guest switches, and what the outputs the program reads ask of
+/// it: the runtime switches their writers run under, and the last rows they
+/// are computed over.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Switched {
     pub(crate) lanes: Vec<Vec<(String, String)>>,
-    pub(crate) drafts: bool,
+    pub(crate) on: Vec<Vec<poem_ir::Builtin>>,
+    pub(crate) tails: Vec<u32>,
+    /// It reads a row output a cut fire would not hold whole.
+    pub(crate) rows_read: bool,
 }
 
 impl Switched {
     pub(crate) fn of(pass: &ForwardPass) -> Switched {
+        let model = crate::model::model();
+        let lanes: Vec<Vec<(String, String)>> = pass
+            .facts
+            .iter()
+            .map(|lane| lane.switches.clone())
+            .collect();
+        let mut on = vec![Vec::new(); lanes.len()];
+        let mut tails = vec![0; lanes.len()];
+        let mut rows_read = false;
+        for (name, lane) in &pass.instance.program.reads {
+            let switches = model.output_switches(name);
+            if let Some(decl) = model.output(name) {
+                rows_read |= decl.axis != poem_ir::InputAxis::Lane
+                    && (!decl.readout || !switches.is_empty());
+                if let Some(tail) = tails.get_mut(*lane as usize) {
+                    *tail = (*tail).max(decl.tail);
+                }
+            }
+            if let Some(lane_on) = on.get_mut(*lane as usize) {
+                for builtin in switches {
+                    if !lane_on.contains(&builtin) {
+                        lane_on.push(builtin);
+                    }
+                }
+            }
+        }
         Switched {
-            lanes: pass
-                .facts
-                .iter()
-                .map(|lane| lane.switches.clone())
-                .collect(),
-            drafts: pass.instance.program.reads_mtp_logits,
+            lanes,
+            on,
+            tails,
+            rows_read,
         }
     }
 
     /// Whether the pass's rows may be cut, keyed and logged by their tokens.
     pub(crate) fn plain(&self) -> bool {
         let facts = crate::model::model().facts();
-        !self.drafts
+        !self.rows_read
             && self.lanes.iter().flatten().all(|(name, value)| {
                 facts
                     .declared(name)
@@ -1591,10 +1610,14 @@ fn stamp_lane_words(
         let rows = device_rows
             .and_then(|rows| rows.get(at).copied())
             .unwrap_or_else(|| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX));
+        let on = of
+            .get(at)
+            .and_then(|&pass_lane| switched.on.get(pass_lane))
+            .map_or(&[][..], Vec::as_slice);
         let request = poem::Request::new(rows, lane.mask.is_some() || fire_wide_mask)
             .adapted(lane.adapter.is_some())
-            .drafting(switched.drafts)
-            .capturing_scores(lane.captures_scores)
+            .drafting(on.contains(&poem_ir::Builtin::Drafts))
+            .capturing_scores(on.contains(&poem_ir::Builtin::Scores))
             .with_media(media.contains(&(at as u32)))
             .starting(starts(lane));
         let switches = of
@@ -2221,8 +2244,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             attn_mask,
             accesses,
             decode_envelope,
-            p_reads_attn_score,
-            p_reads_mtp_logits,
         ) = {
             let p = ctx.resources().get_mut(&fwd)?;
             if let Some(e) = &p.failed {
@@ -2265,8 +2286,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             };
             crate::probe_fire_record!(submit_probe.geometry_us, geometry_clock.elapsed());
             let accesses = p.instance.program.channel_accesses.clone();
-            let reads_attn_score = p.instance.program.reads_attn_score;
-            let reads_mtp_logits = p.instance.program.reads_mtp_logits;
             (
                 geometry,
                 p.cells.clone(),
@@ -2277,8 +2296,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 attn_mask,
                 accesses,
                 p.decode_envelope,
-                reads_attn_score,
-                reads_mtp_logits,
             )
         };
         let mut pass_lanes = pass_lanes(ctx, &fwd)?;
@@ -2301,11 +2318,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let fold = geometry.fold.clone();
         stamp_lane_facts(ctx, &fwd, &mut req)?;
         req.boundary_program = true;
-        if p_reads_attn_score {
-            for lane in &mut req.lanes {
-                lane.captures_scores = true;
-            }
-        }
         let switched = Switched::of(ctx.resources().get(&fwd)?);
         let lanes_of = every_lane(&req);
         req.geometry = if decode_envelope.is_some() {
@@ -2404,27 +2416,23 @@ pub async fn submit_pass_stamped<C: FireContext>(
             || [0, u32::MAX]
                 .into_iter()
                 .any(|count| (0..req.lanes.len()).all(|lane| fold.of(lane) == Some(count)));
-        let (attention_stages, adapted) = hook_program_of(ctx, &fwd)?;
+        let adapted = lora_program_of(ctx, &fwd)?;
         // The program runs on a cut pass's last fire, after the first fires' forwards.
         let prologue_moves =
             container_prologue_moves(&ctx.resources().get(&fwd)?.instance.program.bound.container);
-        let hooked = attention_stages || adapted;
         let plain = switched.plain();
         let keyable = decode_envelope.is_none()
             && !wide
             && plain
             && groups.len() == 1
-            && !hooked
-            && !fire_wide_mask
-            && !p_reads_mtp_logits;
+            && !adapted
+            && !fire_wide_mask;
         let cuttable = decode_envelope.is_none()
             && !wide
             && plain
-            && !attention_stages
             && !prologue_moves
             && (!adapted || crate::model::model().eta_caps().adapter_attachments)
             && !fire_wide_mask
-            && !p_reads_mtp_logits
             && !ring
             && folds_all;
         let mut full = req;
@@ -2561,6 +2569,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             prefill_share(page_size, engine),
             page_size,
             &forced,
+            &switched.tails,
         );
         let rows_total = full
             .lanes
@@ -2586,17 +2595,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if decode_envelope.is_some() || fire_wide_mask {
                 why.push("its geometry or mask resolves on the device");
             }
-            if attention_stages {
-                why.push("its program has stages at attention");
-            }
             if prologue_moves {
                 why.push("its prologue takes or puts a channel before the forward");
             }
             if adapted && !crate::model::model().eta_caps().adapter_attachments {
                 why.push("this engine cannot carry its adapter on a fire of its own");
             }
-            if p_reads_mtp_logits {
-                why.push("its draft arm reads every row");
+            if switched.rows_read {
+                why.push("it reads out an output of rows a cut fire would not hold");
             }
             if ring {
                 why.push("its model keeps a window ring");
@@ -2708,7 +2714,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 && decode_envelope.is_some()
                 && !wide
                 && plain
-                && plain_decode(&req, hooked, fire_wide_mask);
+                && plain_decode(&req, adapted, fire_wide_mask);
             let mut parts = Vec::with_capacity(group_sets.len());
             for (group, ((set, (slots, written)), (lease, kvtxn))) in group_sets
                 .iter()
@@ -2827,7 +2833,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     copy_dst,
                     rs_copy,
                     piece_frames[at],
-                    attention_stages,
                     adapted,
                 )
                 .err()
@@ -3759,14 +3764,7 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
-    let switched = {
-        let pass = ctx.resources().get(&fwd)?;
-        let captures = pass.instance.program.reads_attn_score;
-        for lane in &mut req.lanes {
-            lane.captures_scores = captures;
-        }
-        Switched::of(pass)
-    };
+    let switched = Switched::of(ctx.resources().get(&fwd)?);
     // A split narrow enough to stage no host rows still knows each lane's
     // rows; its words carry them.
     let device_rows: Option<Vec<u32>> =
@@ -3793,18 +3791,17 @@ async fn fire_device_geometry<C: FireContext>(
         geometry = ?req.geometry,
         lanes = req.lanes.len(),
         qo_indptr = ?resolved_qo_indptr,
-        reads_mtp_logits = switched.drafts,
+        reads_rows = switched.rows_read,
         "fire geometry resolved on device path"
     );
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
 
-    let (hook_program, lora_program) = hook_program_of(ctx, &fwd)?;
+    let lora_program = lora_program_of(ctx, &fwd)?;
     // A decode lane whose KV is its tokens' alone asks the engine what it
     // wrote, so its slots are logged.
-    let plain_decode = !reads_each_other
-        && switched.plain()
-        && plain_decode(&req, hook_program || lora_program, fire_wide_mask);
+    let plain_decode =
+        !reads_each_other && switched.plain() && plain_decode(&req, lora_program, fire_wide_mask);
     let mut parts = Vec::with_capacity(group_sets.len());
     for ((((set, (log_seq, log_pages)), lease), kvtxn), (_, lanes)) in group_sets
         .iter()
@@ -3860,7 +3857,6 @@ async fn fire_device_geometry<C: FireContext>(
         copy_dst,
         rs_copy,
         frame,
-        hook_program,
         lora_program,
     )
     .err()
@@ -4238,34 +4234,34 @@ mod cut_tests {
     fn a_long_plain_pass_is_cut_on_page_boundaries() {
         let req = prefill_lane(5, 100, 16);
         assert_eq!(
-            host_cuts(&req, true, 128, 16, &[]),
+            host_cuts(&req, true, 128, 16, &[], 0),
             [(0, 100)],
             "short enough"
         );
         assert_eq!(
-            host_cuts(&req, false, 32, 16, &[]),
+            host_cuts(&req, false, 32, 16, &[], 0),
             [(0, 100)],
             "not cuttable"
         );
         // Held 5: the first cut ends where page 2 does (32 - 5).
         assert_eq!(
-            host_cuts(&req, true, 32, 16, &[]),
+            host_cuts(&req, true, 32, 16, &[], 0),
             [(0, 27), (27, 59), (59, 91), (91, 100)]
         );
         let mut masked = req.clone();
         masked.lanes[0].readout = ::engine::Readout::Rows(vec![3]);
         assert_eq!(
-            host_cuts(&masked, true, 32, 16, &[]),
+            host_cuts(&masked, true, 32, 16, &[], 0),
             [(0, 100)],
             "reads a middle row"
         );
         // Checkpoint rows cut it too, short as it is.
         assert_eq!(
-            host_cuts(&req, true, 128, 16, &[43, 100, 0]),
+            host_cuts(&req, true, 128, 16, &[43, 100, 0], 0),
             [(0, 43), (43, 100)]
         );
         assert_eq!(
-            host_cuts(&req, true, 32, 16, &[43]),
+            host_cuts(&req, true, 32, 16, &[43], 0),
             [(0, 27), (27, 43), (43, 59), (59, 91), (91, 100)]
         );
     }
@@ -4304,7 +4300,7 @@ mod cut_tests {
             token_positions: (0..300).collect(),
             ..Default::default()
         });
-        let cuts = host_cuts(&req, true, 32, 16, &[]);
+        let cuts = host_cuts(&req, true, 32, 16, &[], 0);
         assert_eq!(cuts, [(0, 27), (27, 59), (59, 100)], "no cut past row 60");
         let first = rows_of_lanes(&req, &[Some((0, 27))], false, 16);
         assert!(first.media.is_empty(), "the text before it carries none");
@@ -4325,7 +4321,7 @@ mod cut_tests {
             ..Default::default()
         });
         assert_eq!(keyed_rows(&req), 60, "up to its first media row");
-        let cuts = host_cuts(&req, true, 128, 16, &[]);
+        let cuts = host_cuts(&req, true, 128, 16, &[], 0);
         assert_eq!(cuts, [(0, 59), (59, 100)]);
         let first = rows_of_lanes(&req, &[Some(cuts[0])], false, 16);
         assert!(first.media.is_empty(), "it logs its rows and seals");
@@ -4340,7 +4336,7 @@ mod cut_tests {
         let mut req = prefill_lane(5, 100, 16);
         let other = prefill_lane(0, 40, 16).lanes.remove(0);
         req.lanes.push(other);
-        let pieces = pass_pieces(&req, true, true, 32, 16, &[]);
+        let pieces = pass_pieces(&req, true, true, 32, 16, &[], &[]);
         let last = pieces.last().unwrap();
         assert_eq!(
             last,
@@ -4367,7 +4363,7 @@ mod cut_tests {
         assert_eq!(tail.lanes.len(), 2);
         assert!(tail.boundary_program);
         assert_eq!(
-            pass_pieces(&req, true, false, 32, 16, &[]).len(),
+            pass_pieces(&req, true, false, 32, 16, &[], &[]).len(),
             1,
             "not where the lanes carry recurrent state"
         );
@@ -4380,20 +4376,16 @@ mod cut_tests {
         assert_eq!(tail.lanes[0].readout, ::engine::Readout::Rows(vec![5, 4]));
         req.lanes[0].readout = ::engine::Readout::Rows(vec![60, 99]);
         assert_eq!(
-            host_cuts(&req, true, 32, 16, &[]),
+            host_cuts(&req, true, 32, 16, &[], 0),
             [(0, 27), (27, 59), (59, 100)],
             "no cut past the first row read"
         );
-        // A score capture observes its fire's last rows: the last piece
-        // holds them all.
-        let mut req = prefill_lane(5, 100, 16);
-        req.lanes[0].captures_scores = true;
+        // An output over the lane's last rows: the last piece holds them all.
+        let req = prefill_lane(5, 100, 16);
         assert_eq!(
-            host_cuts(&req, true, 32, 16, &[]),
+            host_cuts(&req, true, 32, 16, &[], 32),
             [(0, 27), (27, 59), (59, 100)]
         );
-        let first = rows_of_lanes(&req, &[Some((0, 27))], false, 16);
-        assert!(!first.lanes[0].captures_scores);
     }
 
     fn a_masked_pass_is_cut_with_its_rows_masks() {

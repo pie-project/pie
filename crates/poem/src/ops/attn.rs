@@ -1115,15 +1115,13 @@ pub fn voxel_over(
 
 /// Attention of `q` over the kv row `kv`, each lane by its kind: a lane
 /// `causal` does not hold for over every key it holds, a lane with its own
-/// mask by that mask (when the model opens `mask`), a lane capturing
-/// scores by its own arm (when it opens `scores`), its log-sum-exp read out
-/// at the scores seam where `scores_seam` holds, a lane querying one token by
-/// decode, and the rest by prefill. The kinds are taken in that order, each
+/// mask by that mask (when the model opens `mask`), a lane querying one
+/// token by decode, and the rest by prefill. The kinds are taken in that order, each
 /// lane by the first that holds. With `sinks`, every kind is attended with
 /// its log-sum-exp and the sink logits folded in. With a `selection` (the
 /// key blocks an indexer picked a row, `ratio` keys a block, one pick a head
 /// when `per_head`), decode and prefill lanes read only those blocks; a
-/// masked or score-capturing lane reads every key.
+/// masked lane reads every key.
 ///
 /// The host plans are the compiler's: each kind's is built once a trace,
 /// over the lanes of that kind and outside any layer, and every layer asking
@@ -1141,14 +1139,10 @@ pub fn attend(
     sinks: Option<&Weight>,
     causal: Option<&Predicate>,
     mask: bool,
-    scores: bool,
-    scores_seam: Option<bool>,
     selection: Option<&Value>,
     ratio: Option<u32>,
     per_head: bool,
 ) -> Value {
-    // Scores a model opens go out at their seam unless it says otherwise.
-    let scores_seam = scores_seam.unwrap_or(scores);
     let selected = selection.map(|selection| {
         assert!(
             sinks.is_none(),
@@ -1184,9 +1178,6 @@ pub fn attend(
         cases.extend(wide.clone());
         if mask {
             cases.push(fact::has(fact::Mask));
-        }
-        if scores {
-            cases.push(fact::scores());
         }
         cases.push(fact::single_token());
         let mut picked = None;
@@ -1277,38 +1268,6 @@ pub fn attend(
             None => o,
         });
     }
-    if scores && let Some(q) = rows_of(first.case(rec.guard_of(&fact::scores()))) {
-        let p = plan(false, &lanes(Some(fact::scores())));
-        // The log-sum-exp only where something reads it.
-        let (o, lse) = prefill(
-            &q,
-            &p,
-            pages,
-            window,
-            head_dim,
-            kv_heads,
-            sm_scale,
-            scores_seam || sinks.is_some(),
-            None,
-            true,
-            None,
-            None,
-            None,
-            false,
-            None,
-            None,
-            None,
-        );
-        arms.push(match lse {
-            Some(lse) => {
-                if scores_seam {
-                    crate::seam::at(crate::seam::SCORES, &[&lse]);
-                }
-                sunk((o, lse))
-            }
-            None => o,
-        });
-    }
     let single = first.case(rec.guard_of(&fact::single_token()));
     if let Some(q) = rows_of(single.clone()) {
         let p = plan(true, &lanes(Some(fact::single_token())));
@@ -1370,6 +1329,57 @@ pub fn attend(
         return arms.remove(0);
     }
     Value::merge(arms)
+}
+
+/// The attention mass of each lane capturing scores (`fact::scores`) over
+/// its first `kv_max` keys of `kv`, averaged over the lane's last `observe`
+/// query rows of `q`: `[lanes, q_heads * kv_max]`, a `kv_max` run per query
+/// head.
+#[allow(clippy::too_many_arguments)]
+pub fn score_capture(
+    q: &Value,
+    inputs: &Input,
+    kv: &str,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    observe: u32,
+    kv_max: u32,
+) -> Value {
+    let rec = inputs.recorder();
+    let rows = poem_ir::Guard::and(q.cond(), rec.guard_of(&crate::fact::scores()));
+    let scoring = crate::record::Refine::refined(inputs, rows);
+    let key = format!(
+        "attn.plan_prefill {:?} {q_heads} {kv_heads} {head_dim} None",
+        scoring.rows()
+    );
+    let plan = rec.once(key, || {
+        plan_prefill(&scoring, q_heads, kv_heads, head_dim, None)
+    });
+    let q = crate::record::Refine::refined(q, scoring.rows().clone());
+    let scores = rec.fresh(Ty::Tensor {
+        shape: vec![
+            Dim::Lanes,
+            Dim::Const(u64::from(q_heads) * u64::from(kv_max)),
+        ],
+        dtype: Dtype::F32,
+    });
+    rec.push(
+        Attn::ScoreCapture {
+            q: q.id(),
+            plan: plan.id(),
+            cache: inputs.kv(kv),
+            head_dim,
+            kv_heads,
+            sm_scale,
+            observe,
+            kv_max,
+            scores: scores.id(),
+        },
+        &[&q, &plan],
+    );
+    scores
 }
 
 /// Whether any row of `x` can be one `rows` holds for.

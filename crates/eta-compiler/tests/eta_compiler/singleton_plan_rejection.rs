@@ -2,10 +2,17 @@ use crate::msl_corpus::{corpus_stages, extended_stages};
 use crate::msl_mutations::{MUTATIONS, mutate};
 use eta_compiler::codegen::metal::validate_singleton_plan;
 
-const TOLERATED: &[(&str, &str)] = &[(
-    "none",
-    "the unmutated plan; here to prove the harness accepts something",
-)];
+const TOLERATED: &[(&str, &str)] = &[
+    (
+        "none",
+        "the unmutated plan; here to prove the harness accepts something",
+    ),
+    (
+        "rename_names",
+        "an output is bound by its name at the engine, which refuses a read nothing \
+         was bound to; the plan itself stays well-formed",
+    ),
+];
 
 fn verdicts() -> Vec<(&'static str, usize, usize)> {
     let stages: Vec<_> = corpus_stages()

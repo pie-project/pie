@@ -10,7 +10,7 @@ use engine_wgpu::api::DeviceBoot;
 use engine_wgpu::serve::{Boot, Clips, Lane, Seated, Shell};
 use poem::ops::attn;
 use poem::ops::conv::{self, ConvShape};
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, seam, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, trace_hybrid};
 use poem_compiler::{Budget, VoxelLadder};
 
 const C_IN: usize = 8;
@@ -67,7 +67,7 @@ impl ForwardHybrid for Decoder {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let g = inputs.grid();
         let x = inputs.input(
             "voxels",
@@ -96,8 +96,7 @@ impl ForwardHybrid for Decoder {
             None,
         );
         let (y, g4) = conv::pixel_shuffle(&h, &g3, [1, 2, 2]);
-        seam::at(seam::PIXELS, &[&y, &g4]);
-        y
+        poem::output("pixels", &y, Some(&g4));
     }
 }
 

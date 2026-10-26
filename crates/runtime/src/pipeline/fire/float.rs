@@ -3,7 +3,7 @@ use wasmtime::component::Resource;
 use super::context::FireContext;
 use super::{
     FireWs, PendingFire, PendingOp, Reserved, Switched, TicketReservation, advance_shadow,
-    bound_rs_working_sets, every_lane, hook_program_of, open_pipeline, record_submit_failure,
+    bound_rs_working_sets, every_lane, lora_program_of, open_pipeline, record_submit_failure,
     reserve, rs, settle_and_wait_resident, stamp_lane_facts, stamp_lane_words,
 };
 use crate::inferlet::host::working_set::WorkingSet;
@@ -251,14 +251,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         Err(error) => return Ok(Err(format!("pipeline: fire attention mask: {error}"))),
     }
     stamp_lane_facts(ctx, &fwd, &mut req)?;
-    let switched = {
-        let pass = ctx.resources().get(&fwd)?;
-        let captures = pass.instance.program.reads_attn_score;
-        for lane in &mut req.lanes {
-            lane.captures_scores = captures;
-        }
-        Switched::of(pass)
-    };
+    let switched = Switched::of(ctx.resources().get(&fwd)?);
     req.single_token_mode = false;
     // A lane binding no state touches no state row.
     let rs_ids = match kvs.first() {
@@ -302,7 +295,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         .reserve_completion();
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
-    let (hook_program, lora_program) = hook_program_of(ctx, &fwd)?;
+    let lora_program = lora_program_of(ctx, &fwd)?;
     let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
         req,
@@ -314,7 +307,6 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         Vec::new(),
         rs_copy,
         frame,
-        hook_program,
         lora_program,
     )
     .err()

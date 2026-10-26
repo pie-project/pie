@@ -613,8 +613,6 @@ pub fn split_rope_yarn_append() -> Rule {
             v_out: m.value("v_split"),
         }
     })
-    // gpt-oss marks its split q and v with `attn.qv`, which no shell reads.
-    .through_markers()
     .when(|m| {
         let d = m.u32("d");
         m.dtype("packed") == Some(Dtype::Bf16)
@@ -742,7 +740,6 @@ pub fn qkv_fused_qknorm_rope_vnorm_write() -> Rule {
         |m| qkv_fused(m, m.value("packed")),
     )
     .when(qkv_admits)
-    .through_markers()
 }
 
 /// The fused qkv write on the first columns of a row split, the rest of each
@@ -757,7 +754,6 @@ pub fn split_qkv_fused() -> Rule {
         }
     })
     .when(qkv_admits)
-    .through_markers()
 }
 
 /// The qkv write's forms (each read off a row split where `split`): Gemma's
@@ -1607,8 +1603,7 @@ pub fn matmul_moe_route() -> Rule {
     })
 }
 
-/// A projection cut into two row halves (Qwen3.5's packed qkv|z), through
-/// the `recurrent` marker the cut's caller sets on the packed rows.
+/// A projection cut into two row halves (Qwen3.5's packed qkv|z).
 #[must_use]
 pub fn matmul_split_rows() -> Rule {
     let pattern = template(|p| {
@@ -1637,7 +1632,6 @@ pub fn matmul_split_rows() -> Rule {
             right: m.value("right"),
         }
     })
-    .through_markers()
 }
 
 #[derive(Clone, Copy)]
@@ -2302,10 +2296,9 @@ pub fn gdn_step() -> Rule {
 /// norms, the partial rotation and the kv append, all under one guard.
 /// Qwen's gated attention prologue: q cut from its gate, q and k normed per
 /// head (plus-one weights), turned, and k with its v written to the cache.
-/// Under `Intermediates::Written` the cut q may be read past it (a seam's,
-/// `ATTN_QV`) and every intermediate lands. Under `Unwritten` nothing reads
-/// them, though a marker seam (`attn.qv`) may name them, and the gated row is
-/// bf16.
+/// Under `Intermediates::Written` the cut q may be read past it and every
+/// intermediate lands. Under `Unwritten` nothing reads them, and the gated
+/// row is bf16.
 #[must_use]
 pub fn q_gate_norm_rope_append(intermediates: Intermediates) -> Rule {
     let written = intermediates == Intermediates::Written;
@@ -2387,7 +2380,6 @@ pub fn q_gate_norm_rope_append(intermediates: Intermediates) -> Rule {
             replace(m, Intermediates::Unwritten)
         })
         .form("unwritten")
-        .through_markers()
         .when(|m| m.dtype("qg") == Some(Dtype::Bf16))
     }
 }

@@ -118,20 +118,16 @@ fn operands(op: &Operation, sink: &mut BTreeSet<ValueId>) {
     sink.extend(ids);
 }
 
-/// Who reads each value, and the seams and merges that hold one.
+/// Who reads each value, and the outputs and merges that hold one.
 struct Uses {
     readers: Vec<Vec<u32>>,
     held: Vec<bool>,
-    /// Held by a merge or by a seam a shell reads (`EXPORT_SEAMS`), not by a
-    /// marker alone.
-    read_held: Vec<bool>,
 }
 
 impl Uses {
     fn of(trace: &Trace) -> Uses {
         let mut readers = vec![Vec::new(); trace.values.len()];
         let mut held = vec![false; trace.values.len()];
-        let mut read_held = vec![false; trace.values.len()];
         let mut ins = Vec::new();
         for (i, node) in trace.nodes.iter().enumerate() {
             ins.clear();
@@ -144,22 +140,15 @@ impl Uses {
             if let Def::Merge(arms) = &decl.def {
                 for (arm, _) in arms {
                     held[arm.0 as usize] = true;
-                    read_held[arm.0 as usize] = true;
                 }
             }
         }
-        for seam in &trace.seams {
-            let read = crate::EXPORT_SEAMS.contains(&seam.seam.as_str());
-            for v in &seam.values {
+        for output in &trace.outputs {
+            for v in output.values() {
                 held[v.0 as usize] = true;
-                read_held[v.0 as usize] |= read;
             }
         }
-        Uses {
-            readers,
-            held,
-            read_held,
-        }
+        Uses { readers, held }
     }
 }
 
@@ -210,7 +199,7 @@ fn matched(trace: &Trace, uses: &Uses, rule: &Rule, shape: &Shape, at: usize) ->
     };
     let mut found = None;
     extend(trace, uses, shape, 0, at, start, &mut |binding| {
-        let ok = escapes_nothing(uses, shape, binding, rule.through_markers)
+        let ok = escapes_nothing(uses, shape, binding)
             && keeps_order(trace, binding)
             && (rule.when)(&Match {
                 trace,
@@ -330,12 +319,8 @@ fn unify(trace: &Trace, shape: &Shape, p: &Tree, t: &Tree, b: &mut Binding) -> b
 
 /// A value the pattern computes but does not export is gone once fused, so
 /// nothing outside the match may read it.
-fn escapes_nothing(uses: &Uses, shape: &Shape, b: &Binding, through_markers: bool) -> bool {
-    let held = if through_markers {
-        &uses.read_held
-    } else {
-        &uses.held
-    };
+fn escapes_nothing(uses: &Uses, shape: &Shape, b: &Binding) -> bool {
+    let held = &uses.held;
     let matched: Vec<usize> = b.nodes.iter().flatten().copied().collect();
     shape.kinds.iter().enumerate().all(|(pv, kind)| {
         if *kind != Kind::Computed || shape.template.exports.contains(&ValueId(pv as u32)) {
@@ -478,13 +463,8 @@ pub(super) fn compact(mut trace: Trace) -> Trace {
     for node in &mut trace.nodes {
         node.op = tree::remap(&node.op, &f);
     }
-    for seam in &mut trace.seams {
-        // A marker seam (one no shell reads) lets go of a value a rule
-        // folded through it; a read seam keeps every value, or this panics.
-        if !crate::EXPORT_SEAMS.contains(&seam.seam.as_str()) {
-            seam.values.retain(|v| keep[v.0 as usize]);
-        }
-        for v in &mut seam.values {
+    for output in &mut trace.outputs {
+        for v in output.values_mut() {
             *v = f(*v);
         }
     }

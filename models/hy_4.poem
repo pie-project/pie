@@ -480,7 +480,6 @@ def run_attention(x, inputs, positions, a, selection, prefill_only = False):
     q_a = ops.elemwise.rmsnorm(q_a, a.q_a_norm, a.q_a_norm_eps)
     q_b = ops.linear.matmul(q_a, a.q_b_proj)
     kv_a = ops.linear.matmul(x, a.kv_a_proj)
-    seam.at(seam.ATTN_QV, [q_b, kv_a])
 
     if a.indexer != None:
         selection = index_select(x, q_a, inputs, positions, a.indexer)
@@ -501,7 +500,6 @@ def run_attention(x, inputs, positions, a, selection, prefill_only = False):
     q_nope, q_pe = ops.attn.mla_split_q_b(q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim)
     q_pe = ops.elemwise.rope(q_pe, positions, a.qk_rope_head_dim, a.theta, rotary.partial(a.qk_rope_head_dim))
     q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    seam.at(seam.ATTN_Q, [q])
 
     # The picked keys, the sinks folded in once over both kinds of lane.
     scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
@@ -509,7 +507,6 @@ def run_attention(x, inputs, positions, a, selection, prefill_only = False):
 
     o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
-    seam.at(seam.ATTN_OUT, [o])
     return ops.linear.matmul(o, a.o_proj), selection
 
 def index_select(x, q_a, inputs, positions, ix):
@@ -599,7 +596,7 @@ def forward(m, inputs):
 
     if m.mtp != None:
         draft(m, inputs, x, positions, logits)
-    return logits
+    output("logits", logits)
 
 def draft(m, inputs, hidden, positions, logits):
     """The MTP head's drafted token, from the trunk's last normed rows
@@ -624,5 +621,5 @@ def draft(m, inputs, hidden, positions, logits):
     x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.norm_eps)
     r = ops.elemwise.residual_add(mlp(x, mtp.mlp), r)
     proposal = ops.linear.lm_head(ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps), m.head)
-    seam.at(seam.MTP, [proposal])
-    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([proposal])])
+    output("mtp.logits", proposal)
+    output("mtp.drafts", ops.sampling.argmax([proposal]))

@@ -235,7 +235,7 @@ fn the_kv_write_round_trips() {
             }],
             values: Vec::new(),
             nodes: Vec::new(),
-            seams: Vec::new(),
+            outputs: Vec::new(),
             drafter: None,
         };
         let bf16_bytes_total = pool_demand(&kv_trace(Dtype::Bf16), paging).expect("bf16 demand");
@@ -429,7 +429,7 @@ fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
             }],
             values: Vec::new(),
             nodes: Vec::new(),
-            seams: Vec::new(),
+            outputs: Vec::new(),
             drafter: None,
         }
     };

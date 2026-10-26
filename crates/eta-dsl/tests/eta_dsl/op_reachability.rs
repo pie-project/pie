@@ -7,6 +7,10 @@ use eta_dsl::{Channel, Traced};
 
 const NOT_AUTHORABLE: &[(u8, &str)] = &[
     (
+        0xA1,
+        "`Op::KernelCall` names an engine's own kernel; the library authors none.",
+    ),
+    (
         0x65,
         "`Op::MaskApply` takes a packed `[ceil(n/32)]` U32 bitmask, so authoring \
          one would mean asking the caller to pack bits by hand. `mask_apply` \
@@ -40,6 +44,7 @@ fn arithmetic() -> Traced {
     let flags = Channel::new([8], dtype::bool);
 
     let mut builder = Builder::new(32_000, 16);
+    builder.outputs(crate::outputs::logits(32_000));
     builder.stage(Stage::Epilogue, || {
         let x = logits.take();
         let row = gather_row(&x, idx.take());
@@ -104,6 +109,7 @@ fn masking() -> Traced {
     let out = Channel::new([4, 8], dtype::f32);
 
     let mut builder = Builder::new(32_000, 16);
+    builder.outputs(crate::outputs::logits(32_000));
     builder.stage(Stage::Epilogue, || {
         let noise = rng(state.read(), [4, 8]);
         let jitter = gumbel(state.read(), [4, 8]);
@@ -130,16 +136,13 @@ fn calls() -> Traced {
     let out = Channel::new([1], dtype::i32);
 
     let mut builder = Builder::new(32_000, 16);
-    builder.stage(Stage::OnAttnProj, || {
+    builder.outputs(crate::outputs::logits(32_000));
+    builder.stage(Stage::Prologue, || {
         intrinsics::kernel::attn_page_mask(page_mask.read());
     });
     builder.stage(Stage::Epilogue, || {
-        let scores = intrinsics::kernel::envelope_dot(4);
-        let logits = intrinsics::logits();
-        out.put(cast(
-            reduce_argmax(add(logits, broadcast(reduce_sum(scores), [32_000]))),
-            dtype::i32,
-        ));
+        let logits = intrinsics::output(0, "logits");
+        out.put(cast(reduce_argmax(logits), dtype::i32));
     });
     builder.build().unwrap()
 }

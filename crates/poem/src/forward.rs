@@ -5,7 +5,6 @@ use poem_ir::{
 
 use crate::fact::Predicate;
 use crate::record::{Recorder, Refine, Value};
-use crate::seam;
 
 pub use poem_ir::Request;
 
@@ -120,25 +119,17 @@ impl DeclaredCache<'_> {
 
 pub trait ForwardHybrid {
     fn caches(&self) -> HybridSpec;
-    fn forward(&self, inputs: Input) -> Value;
+    fn forward(&self, inputs: Input);
 }
 
 pub fn trace_hybrid<M: ForwardHybrid>(name: &str, m: &M, platform: Platform) -> Trace {
     let caches = m.caches();
     let rec = Recorder::new(name, platform, caches.rows.clone());
-    rec.seam(seam::IN.name, &[]);
-    let logits = m.forward(Input {
+    m.forward(Input {
         rec: rec.clone(),
         caches,
         over: Guard::Always,
     });
-    let float_readout = seam::FLOAT_READOUTS
-        .iter()
-        .any(|name| rec.seamed(name, &logits));
-    if !float_readout {
-        rec.seam(seam::OUT.name, &[&logits]);
-    }
-    drop(logits);
     rec.finish()
 }
 

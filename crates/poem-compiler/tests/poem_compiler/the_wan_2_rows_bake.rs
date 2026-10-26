@@ -4,7 +4,7 @@ use crate::wan_2_dims::{self as model, Dims};
 use poem::generative::ScheduleKind;
 use poem::{
     Attn, CacheRow, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, RaggedMask,
-    Request, RopeForm, RuntimeInput, Selection, Trace, Ty, ValueId, seam,
+    Request, RopeForm, RuntimeInput, Selection, Trace, Ty, ValueId,
 };
 use poem_ir::{Conv, InputAxis};
 
@@ -111,11 +111,11 @@ fn the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells() {
             "{deployment}: the video positions are the token grid's cells"
         );
         let velocity = plan
-            .seams
+            .outputs
             .iter()
-            .find(|s| s.seam == seam::VELOCITY.name)
+            .find(|s| s.name == "velocity")
             .expect("a velocity seam")
-            .values[0];
+            .value;
         assert_eq!(
             plan.values[velocity.0 as usize].ty,
             Ty::Tensor {
@@ -174,33 +174,29 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
                 "{deployment} {platform:?}: one frame cache per causal conv of the VAE"
             );
             let seams: BTreeMap<&str, usize> =
-                plan.seams.iter().fold(BTreeMap::new(), |mut acc, s| {
-                    *acc.entry(s.seam.as_str()).or_default() += 1;
+                plan.outputs.iter().fold(BTreeMap::new(), |mut acc, s| {
+                    *acc.entry(s.name.as_str()).or_default() += 1;
                     acc
                 });
             assert_eq!(
-                seams.get(seam::VELOCITY.name),
+                seams.get("velocity"),
                 Some(&1),
                 "{deployment}: one velocity"
             );
             assert!(
-                !seams.contains_key(seam::OUT.name),
+                !seams.contains_key("logits"),
                 "{deployment}: a denoiser has no logits, and `out` was planted anyway"
             );
             if is_flagship(deployment) {
+                assert_eq!(seams.get("hidden"), Some(&1), "{deployment}: one hidden");
                 assert_eq!(
-                    seams.get(seam::HIDDEN.name),
-                    Some(&1),
-                    "{deployment}: one hidden"
-                );
-                assert_eq!(
-                    seams.get(seam::PIXELS.name),
+                    seams.get("pixels"),
                     Some(&4),
                     "{deployment}: the voxel-axis readout on all four VAE arms (decode and \
                      encode, each fresh and held)"
                 );
             } else {
-                for other in [seam::HIDDEN.name, seam::PIXELS.name] {
+                for other in ["hidden", "pixels"] {
                     assert!(
                         !seams.contains_key(other),
                         "{deployment}: a miniature reads out its velocity alone, got {seams:?}"

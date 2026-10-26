@@ -15,19 +15,12 @@ interface model {
     // Whether the bound model enables system speculation by default
     default-system-speculation: func() -> bool;
 
-    // The draft head's chain depth: how many tokens past each readout row
-    // the `mtp_drafts` intrinsic carries (`[n_out × depth]`, row-major,
-    // each row's chain conditioned on the trunk's argmax at that row). Zero
-    // for a model with no draft head, in which case `mtp_drafts` and
-    // `mtp_logits` are unavailable. Static, like `frame-size`.
-    mtp-depth: func() -> u32;
-
     // What a guest needs to seed a BLOCK drafter's draft pass: the rows one
     // pass carries (the anchor and `rows - 1` mask slots) and the id every
     // row but the first carries in. Facts the head was trained
     // at, not policy: which rows to verify, and whether to draft at all, stay
     // the guest's. `none` for a model with no block drafter (a chained head
-    // is `mtp-depth`). Static, like `mtp-depth`.
+    // reads its drafts out as an output). Static.
     record block-drafter {
         rows: u32,
         mask-token: u32,
@@ -47,16 +40,7 @@ interface model {
     // Every switch the bound model declares; empty for a one-path model.
     switches: func() -> list<switch-decl>;
 
-    // Which export seam a lane's epilogue reads; `pixels` is one row per
-    // output voxel of the pass's clip.
-    enum readout-kind {
-        logits,
-        velocity,
-        hidden,
-        pixels,
-    }
-
-    // Whether an input is one per lane, per row, or per voxel of the clip.
+    // Whether an input or output is one per lane, per row, or per voxel of the clip.
     enum input-axis {
         lane,
         row,
@@ -81,19 +65,28 @@ interface model {
         rows: option<row-count>,
     }
 
-    // What a lane's epilogue reads out, and how wide one row is.
-    record readout {
-        kind: readout-kind,
+    // One output a lane's epilogue may read, by the name the model gives it:
+    // `width` values of `dtype` per `axis` entry, stacked `layers` deep when
+    // the model writes it per layer (0 when it does not); at most `max-rows`
+    // rows a pass. `readout`: its rows are the lane's readout rows, which
+    // `forward-pass.readout` chooses.
+    record output-decl {
+        name: string,
+        axis: input-axis,
         width: u32,
+        dtype: dtype,
+        layers: u32,
+        max-rows: u32,
+        readout: bool,
     }
 
     // A lane of given switches: the inputs it binds (exactly these), whether
-    // it binds `state` and `embed`, and its readout (`none` if nothing).
+    // it binds `state` and `embed`, and the outputs it may read.
     record lane-decl {
         inputs: list<input-decl>,
         state: bool,
         embeds: bool,
-        readout: option<readout>,
+        outputs: list<output-decl>,
     }
 
     // The lane of these `(name, value)` switches; unset ones take defaults.
@@ -243,11 +236,6 @@ interface model {
     // guests read this rather than recovering it from `channel-capacity`.
     // Not static, for the same reason `channel-capacity` is not.
     run-ahead-window: func() -> u32;
-
-    // The most rows one pass may read out through `kind`: what a pass returns,
-    // not how long it is. A pass whose rows cannot run in pieces is refused
-    // past one fire.
-    max-readout-rows: func(kind: readout-kind) -> u32;
 
     // Size in bytes of one folded recurrent state. 0 if the model keeps
     // none (attention only, windowed or not).

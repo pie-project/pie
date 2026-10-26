@@ -23,8 +23,8 @@ use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
 use eta_compiler::plan::compile_bound;
 use eta_exec::Value;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{EngineCaps, GeometryClass, Graph, Readout, ReadoutKind, Stage};
+use eta_ir::op::Op;
+use eta_ir::registry::{EngineCaps, GeometryClass, Stage};
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
 use poem::{Platform, Request};
 use poem_compiler::Budget;
@@ -57,8 +57,8 @@ fn sampler(vocab: u32, top_k: bool, penalties: bool) -> TraceContainer {
         next: 0,
     };
     let r = p.op(Op::ChanTake(RNG));
-    let raw = p.op(Op::IntrinsicVal {
-        intr: IntrinsicId::Logits,
+    let raw = p.op(Op::Output {
+        index: 0,
         lane: 0,
         shape: Shape::matrix(1, vocab),
         dtype: Dtype::F32,
@@ -182,7 +182,7 @@ fn sampler(vocab: u32, top_k: bool, penalties: bool) -> TraceContainer {
             seeded,
         };
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".to_string()],
         channels: vec![
             chan(Shape::vector(2), Dtype::U32, HostRole::None, true, 1),
             chan(v, Dtype::F32, HostRole::None, true, 1),
@@ -251,7 +251,7 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         patches: None,
     })
     .expect("the shell loads");
-    let vocab = shell.out_width();
+    let vocab = shell.readout_width().expect("the plan reads out logits");
 
     // One program, registered with both planes; an instance per lane.
     let bound = eta_ir::validate::bind(
@@ -260,11 +260,14 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
             std::env::var_os("PIE_XLA_SAMPLER_TOP_K").is_some(),
             std::env::var("PIE_XLA_SAMPLER_PENALTIES").map_or(true, |v| v != "0"),
         ),
-        vec![Some(Readout {
-            kind: ReadoutKind::Logits,
+        vec![vec![eta_ir::registry::OutputDecl {
+            name: "logits".to_string(),
+            axis: eta_ir::registry::Axis::Row,
             width: vocab,
-        })],
-        Graph::default(),
+            dtype: eta_ir::types::Dtype::F32,
+            layers: 0,
+            readout: true,
+        }]],
         EngineCaps::default(),
     )
     .expect("the sampler binds");
@@ -369,8 +372,6 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
                 shell.device(),
                 &attached,
                 Some(&kept),
-                vocab,
-                0,
                 eta_ir::registry::Stage::Epilogue,
             )
             .expect("the guest passes run");
@@ -386,7 +387,12 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         let t2 = Instant::now();
         // The old path: every lane's rows to the host, then the interpreter.
         let rows: Vec<Vec<f32>> = (0..lanes as usize)
-            .map(|l| kept.lane_rows(l).expect("rows"))
+            .map(|l| {
+                kept.lane_rows(l)
+                    .expect("rows")
+                    .expect("the lane reads back")
+                    .2
+            })
             .collect();
         let t3 = Instant::now();
         let host_tokens: Vec<(i32, i32)> = (0..lanes)
@@ -395,11 +401,11 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
                 host_plane
                     .fire_interpreted(
                         h,
-                        Some(&rows[l as usize]),
-                        1,
-                        vocab,
-                        None,
-                        0,
+                        &[(
+                            "logits".to_string(),
+                            0,
+                            Value::F32(rows[l as usize].clone()),
+                        )],
                         eta_ir::registry::Stage::Epilogue,
                     )
                     .expect("the interpreter steps");

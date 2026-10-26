@@ -1035,9 +1035,9 @@ impl ProcessCtx {
                     inputs: lane.inputs.iter().map(InputBinding::feed).collect(),
                 })
                 .collect();
-            let readouts: Vec<Option<eta_ir::registry::Readout>> = decls
+            let readouts: Vec<Vec<eta_ir::registry::OutputDecl>> = decls
                 .iter()
-                .map(|decl| decl.readout.map(eta_readout))
+                .map(|decl| decl.outputs.iter().map(eta_output).collect())
                 .collect();
             let input_bindings: Vec<InputBinding> =
                 lanes.iter().flat_map(|lane| lane.inputs.clone()).collect();
@@ -1594,16 +1594,23 @@ fn lane_index(lane: u32) -> Result<usize, String> {
     }
 }
 
-fn eta_readout(readout: poem_ir::Readout) -> eta_ir::registry::Readout {
-    use eta_ir::registry::ReadoutKind as Kind;
-    eta_ir::registry::Readout {
-        kind: match readout.kind {
-            poem_ir::ReadoutKind::Logits => Kind::Logits,
-            poem_ir::ReadoutKind::Velocity => Kind::Velocity,
-            poem_ir::ReadoutKind::Hidden => Kind::Hidden,
-            poem_ir::ReadoutKind::Pixels => Kind::Pixels,
+/// An output as a program reads it: an i32 output as i32, any float one f32.
+fn eta_output(output: &poem_ir::OutputDecl) -> eta_ir::registry::OutputDecl {
+    use eta_ir::registry::Axis;
+    eta_ir::registry::OutputDecl {
+        name: output.name.clone(),
+        axis: match output.axis {
+            poem_ir::InputAxis::Lane => Axis::Lane,
+            poem_ir::InputAxis::Row => Axis::Row,
+            poem_ir::InputAxis::Voxel => Axis::Voxel,
         },
-        width: readout.width,
+        width: output.width,
+        dtype: match output.dtype {
+            poem_ir::Dtype::I32 => eta_ir::Dtype::I32,
+            _ => eta_ir::Dtype::F32,
+        },
+        layers: output.layers,
+        readout: output.readout,
     }
 }
 

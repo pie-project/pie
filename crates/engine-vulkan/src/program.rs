@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, StepOutcome, Value};
+#[cfg(feature = "vulkan")]
+use eta_exec::StepOutcome;
+use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, Value};
 use eta_ir::registry::{GeometryClass, Port, Stage};
 
 #[derive(Debug)]
@@ -21,6 +23,7 @@ impl From<String> for Refusal {
 }
 
 struct Instance {
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     program: ProgramId,
     ids: Vec<ChannelId>,
     plan: Arc<ExecPlan>,
@@ -66,7 +69,8 @@ pub struct Plane {
     #[cfg(feature = "vulkan")]
     built: crate::guest::session::BuiltStages,
 
-    tally: (u64, u64),
+    /// Passes run on the device.
+    tally: u64,
 }
 
 impl Plane {
@@ -442,6 +446,16 @@ impl Plane {
         }
     }
 
+    /// The outputs `instance`'s program reads, by name and lane.
+    #[must_use]
+    pub fn reads(&self, instance: InstanceId) -> Vec<(String, u32)> {
+        self.instances.get(&instance).map_or_else(Vec::new, |seat| {
+            (seat.plan.outputs().into_iter())
+                .map(|(name, lane)| (name.to_string(), lane))
+                .collect()
+        })
+    }
+
     #[must_use]
     pub fn prologue_runs(&self, instance: InstanceId) -> bool {
         self.instances
@@ -449,19 +463,12 @@ impl Plane {
             .is_some_and(|seat| seat.plan.prologue_runs())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn fire(
         &mut self,
         instance: InstanceId,
         at: Stage,
-        logits: Option<&[f32]>,
-        rows: u32,
-        vocab: u32,
-        mtp_logits: Option<&[f32]>,
-        mtp_width: u32,
         #[cfg(feature = "vulkan")] device: Option<&crate::device::Context>,
-        #[cfg(feature = "vulkan")] readouts: Vec<Option<crate::guest::run::Readout<'_>>>,
-        #[cfg(feature = "vulkan")] pixels: Vec<Option<crate::guest::run::Readout<'_>>>,
+        #[cfg(feature = "vulkan")] seats: Vec<Vec<crate::guest::run::Readout<'_>>>,
     ) -> Result<(), Refusal> {
         let Plane {
             instances,
@@ -493,39 +500,13 @@ impl Plane {
             }
         };
 
-        #[cfg(feature = "vulkan")]
-        let readout = readouts.first().copied().flatten();
-        #[cfg(feature = "vulkan")]
-        if seat.plan.needs_logits && readout.is_none() {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads logits, but its lane offered no readout seat"
-            )));
-        }
-
-        if let Some(values) = mtp_logits
-            && mtp_width != vocab
-        {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads a draft column {mtp_width} wide against a                  {vocab}-wide trunk readout ({} draft values); this shell reads both at                  one pitch",
-                values.len()
-            )));
-        }
-        let inputs = PassInputs {
-            logits,
-            mtp_logits,
-            rows,
-            vocab,
-
-            mtp_draft_row: mtp_logits.map(|_| 0),
-            attn_score: None,
-        };
+        let inputs = PassInputs::none();
 
         #[cfg(feature = "vulkan")]
         let (outcome, ran) = {
             let widen = widen.as_ref().expect("the device arm checked for one");
             let session = &mut seat.session;
-            let mut runner = crate::guest::run::OnDevice::new(device_half, session, widen, readout)
-                .with_lanes(readouts, pixels);
+            let mut runner = crate::guest::run::OnDevice::new(device_half, session, widen, seats);
             let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner, at);
             let ran = runner.ran().len();
             widen.disarm();
@@ -543,10 +524,10 @@ impl Plane {
         #[cfg(feature = "vulkan")]
         {
             if ran > 0 {
-                if tally.0 == 0 {
+                if *tally == 0 {
                     tracing::info!(stages = ran, "a guest pass dispatched on the device");
                 }
-                tally.0 += 1;
+                *tally += 1;
             }
             let program = seat.program;
             match outcome {
@@ -601,8 +582,7 @@ impl Plane {
         &mut self,
         instance: InstanceId,
         device: &crate::device::Context,
-        readouts: Vec<Option<crate::guest::run::Readout<'_>>>,
-        pixels: Vec<Option<crate::guest::run::Readout<'_>>>,
+        seats: Vec<Vec<crate::guest::run::Readout<'_>>>,
         done: Option<crate::settle::Done>,
     ) -> Result<(), Refusal> {
         let Plane {
@@ -620,24 +600,9 @@ impl Plane {
                 "instance {instance} has a device half, but the plane built no readout widen"
             ))
         })?;
-        let readout = readouts.first().copied().flatten();
-        if seat.plan.needs_logits && readout.is_none() {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads logits, but its lane offered no readout seat"
-            )));
-        }
-        let inputs = PassInputs {
-            logits: None,
-            mtp_logits: None,
-            rows: 0,
-            vocab: 0,
-            mtp_draft_row: None,
-            attn_score: None,
-        };
+        let inputs = PassInputs::none();
         let mut runner =
-            crate::guest::run::OnDevice::new(device, &mut seat.session, widen, readout)
-                .with_lanes(readouts, pixels)
-                .deferred();
+            crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats).deferred();
         let outcome = eta_exec::step_with(
             &mut seat.inst,
             &seat.plan,
@@ -661,7 +626,7 @@ impl Plane {
                 )));
             }
         }
-        tally.0 += 1;
+        *tally += 1;
 
         let crate::guest::run::Deferral {
             frame,
@@ -748,40 +713,6 @@ impl Plane {
         Ok(())
     }
 
-    #[doc(hidden)]
-    pub fn fire_interpreted(
-        &mut self,
-        instance: InstanceId,
-        logits: Option<&[f32]>,
-        rows: u32,
-        vocab: u32,
-    ) -> Result<(), Refusal> {
-        let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
-            what: "instance",
-            id: instance.0,
-        })?;
-        let inputs = PassInputs {
-            logits,
-            mtp_logits: None,
-            rows,
-            vocab,
-            mtp_draft_row: None,
-            attn_score: None,
-        };
-        let outcome = eta_exec::step(&mut seat.inst, &seat.plan, &inputs);
-        self.tally.1 += 1;
-        let program = seat.program;
-        match outcome {
-            StepOutcome::Committed => Ok(()),
-            StepOutcome::Blocked(channel) => Err(Refusal::Program(format!(
-                "instance {instance} (program {program}) blocked on channel {channel}"
-            ))),
-            StepOutcome::Faulted(why) => Err(Refusal::Program(format!(
-                "instance {instance} (program {program}) faulted: {why}"
-            ))),
-        }
-    }
-
     #[cfg(feature = "vulkan")]
     fn build_session(
         &mut self,
@@ -832,7 +763,7 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn tally(&self) -> (u64, u64) {
+    pub fn tally(&self) -> u64 {
         self.tally
     }
 

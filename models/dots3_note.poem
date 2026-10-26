@@ -300,7 +300,6 @@ def run_attention(x, inputs, a, select = None):
     q_a = ops.elemwise.rmsnorm(ops.linear.matmul(x, a.q_a_proj), a.q_a_norm, a.norm_eps)
     q_b = ops.linear.matmul(q_a, a.q_b_proj)
     kv_a = ops.linear.matmul(x, a.kv_a_proj)
-    seam.at(seam.ATTN_QV, [q_b, kv_a])
 
     selection = select(q_a) if select != None else None
 
@@ -311,7 +310,6 @@ def run_attention(x, inputs, a, select = None):
     q_nope, q_pe = ops.attn.mla_split_q_b(q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim)
     q_pe = rope(q_pe, positions, a)
     q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    seam.at(seam.ATTN_Q, [q])
 
     # A selection's lanes read the keys it picked; the rest their window.
     scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
@@ -319,7 +317,6 @@ def run_attention(x, inputs, a, select = None):
 
     o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     o = ops.elemwise.gate_sigmoid_mul_heads(o, ops.linear.matmul(x, a.gate), a.v_head_dim, 1.0)
-    seam.at(seam.ATTN_OUT, [o])
     return ops.linear.matmul(o, a.o_proj)
 
 def caches(m, c):
@@ -353,7 +350,7 @@ def forward(m, inputs):
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    return ops.linear.lm_head(x, m.head)
+    output("logits", ops.linear.lm_head(x, m.head))
 
 def mlp(x, f):
     if not f.routed:

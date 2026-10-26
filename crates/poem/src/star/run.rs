@@ -6,14 +6,14 @@ use std::cell::RefCell;
 
 use checkpoint::contract::ModelContract;
 
-use crate::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Precision, Trace, Value};
+use crate::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Precision, Trace};
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
 use starlark::values::ValueLike;
 use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, Value as Star};
 
-use crate::star::forward::{SpecHandle, TRAIL, Trail, ValueHandle, held, hold_input};
+use crate::star::forward::{SpecHandle, TRAIL, Trail, hold_input};
 use crate::star::package::Package;
 use crate::star::values::{DtypeValue, alloc_precision};
 
@@ -385,34 +385,23 @@ impl ForwardHybrid for Model<'_, '_, '_> {
         self.spec.clone()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let mut eval = self.eval.borrow_mut();
         let handle = hold_input(inputs);
         let heap = eval.heap();
-        let out = eval.eval_function(self.run, &[self.m, heap.alloc(handle)], &[]);
-        let value = match out {
-            Ok(out) => match out.downcast_ref::<ValueHandle>() {
-                Some(h) => Ok(held(*h)),
-                None => Err(anyhow::anyhow!(
-                    "`forward` returned {}, not the value its rows read out",
-                    out.get_type()
-                )),
-            },
-            Err(e) => Err(error(e)),
-        };
+        let out = eval
+            .eval_function(self.run, &[self.m, heap.alloc(handle)], &[])
+            .map_err(error);
         // The trail's values hold the trace, which finishes once this returns.
         TRAIL.with(|t| {
             let mut t = t.borrow_mut();
             t.values.clear();
             t.inputs.clear();
         });
-        match value {
-            Ok(value) => value,
-            Err(why) => {
-                let said = why.to_string();
-                *self.failed.borrow_mut() = Some(why);
-                panic!("{said}")
-            }
+        if let Err(why) = out {
+            let said = why.to_string();
+            *self.failed.borrow_mut() = Some(why);
+            panic!("{said}")
         }
     }
 }
