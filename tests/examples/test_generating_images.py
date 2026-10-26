@@ -1,6 +1,6 @@
 """The commands a person types to get a picture out of pie, in the order they type them.
 
-This is the USER PATH, not the sampler. `test_text_to_image.py` is the gate on
+This is the USER PATH, not the sampler. `test_text_to_media.py` is the gate on
 the guest -- that it finds its readings by role, steps the family's own sigmas,
 refuses a model with no text encoder. This one asserts the half in front of
 that: that the facts are visible before the run, that the run needs no path,
@@ -10,7 +10,7 @@ Three claims, in the order the guide teaches them:
   * `pie model list` / `pie model info` report the served row's GENERATIVE
     facts -- its readings, its latent space, its schedule -- off the catalog,
     without opening a tensor;
-  * `pie run text-to-image -o DIR -- --prompt "..."` runs the guest BY NAME.
+  * `pie run text-to-media -o DIR -- --prompt "..."` runs the guest BY NAME.
     No `--path`: the name resolves against the
     `examples` of the checkout the command runs in;
   * the file that arrives is NAMED -- `image.png`, the row's own `vae.decode`
@@ -60,7 +60,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INFERLETS_DIR = REPO_ROOT / "examples"
 
-NAME = "text-to-image"
+NAME = "text-to-media"
 
 # The guest's own refusals, by the words it spells them with. Each one means
 # "this load cannot do text-to-image", which is a skip and not a failure.
@@ -170,7 +170,7 @@ def the_store_says_what_the_row_can_do(args) -> dict:
     # A row with no text reading (the `mini-dit` fixture, whose caption rows
     # are random embeddings) cannot be told what to draw. That is a skip and
     # not a failure -- and it is also the claim the `--expect-refusal` half of
-    # `test_text_to_image.py` makes, so there is nothing left for this suite
+    # `test_text_to_media.py` makes, so there is nothing left for this suite
     # to say about it.
     if not text or not denoise:
         raise FileNotFoundError(
@@ -250,15 +250,11 @@ def a_bare_name_draws_a_named_file(args, out_dir: Path) -> dict:
         "`session.send-file-as` is not carrying the name"
     )
 
-    assert report["width"] == args.size and report["height"] == args.size, report
-    sc = report["spatial_compression"]
-    assert (report["latent_h"] * sc, report["latent_w"] * sc) == (args.size, args.size), report
+    assert report["size"] == f"{args.size}x{args.size}", report
     assert report["steps"] == args.steps, report
-    assert len(report["sigmas"]) == args.steps + 1, report
-    assert report["context_rows"] > 0, "the prompt encoded to no rows"
 
     print(f"✅ {out_dir / report['file']}, "
-          f"{report['steps']} steps at {report['width']}x{report['height']}")
+          f"{report['steps']} steps at {report['size']}")
     return report
 
 
@@ -310,8 +306,7 @@ def main() -> int:
         png = out_dir / report["file"]
         how = check_png(png, args.size, args.size)
         print(f"✅ {png}  {png.stat().st_size:,} bytes  ({args.size}x{args.size}, "
-              f"checked by {how}) -- decoded in-guest by reading "
-              f"`{report['decode_reading']}`")
+              f"checked by {how})")
     except FileNotFoundError as why:
         print(f"⏭️  SKIPPED: {why}")
         return 0

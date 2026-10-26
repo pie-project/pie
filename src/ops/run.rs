@@ -575,21 +575,21 @@ mod tests {
 
     fn a_curated_name_resolves_to_the_build_of_its_crate() {
         let dir = tempfile::tempdir().unwrap();
-        tree(dir.path(), "text-to-image", Some("release"));
-        let found = curated_in(&[dir.path().to_path_buf()], "text-to-image").unwrap();
+        tree(dir.path(), "text-to-media", Some("release"));
+        let found = curated_in(&[dir.path().to_path_buf()], "text-to-media").unwrap();
         assert_eq!(
             found.wasm.unwrap(),
             dir.path()
-                .join("target/wasm32-wasip3/release/text_to_image.wasm")
+                .join("target/wasm32-wasip3/release/text_to_media.wasm")
         );
     }
 
     fn an_unbuilt_curated_directory_is_found_without_a_wasm() {
         let dir = tempfile::tempdir().unwrap();
-        tree(dir.path(), "text-to-image", None);
-        let found = curated_in(&[dir.path().to_path_buf()], "text-to-image").unwrap();
+        tree(dir.path(), "text-to-media", None);
+        let found = curated_in(&[dir.path().to_path_buf()], "text-to-media").unwrap();
         assert!(found.wasm.is_none());
-        assert!(found.build_hint().contains("-p text-to-image"));
+        assert!(found.build_hint().contains("-p text-to-media"));
     }
 
     fn release_outranks_debug() {
@@ -602,9 +602,9 @@ mod tests {
 
     fn a_name_that_is_a_path_is_not_a_curated_name() {
         let dir = tempfile::tempdir().unwrap();
-        tree(dir.path(), "text-to-image", Some("release"));
+        tree(dir.path(), "text-to-media", Some("release"));
         let roots = [dir.path().to_path_buf()];
-        assert!(curated_in(&roots, "../text-to-image").is_none());
+        assert!(curated_in(&roots, "../text-to-media").is_none());
         assert!(curated_in(&roots, ".hidden").is_none());
         assert!(curated_in(&roots, "").is_none());
     }

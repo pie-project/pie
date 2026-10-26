@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 wan22_vae_parity.py -- decode a Wan 2.2 latent THROUGH THE RUNTIME, frame by
-frame as `examples/text-to-video` does, and score each chunk against the
+frame as `examples/text-to-media` does, and score each chunk against the
 diffusers reference.
 
     python wan22_golden.py --vae-ref        # the reference (vae/* only)

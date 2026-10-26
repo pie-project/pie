@@ -1,5 +1,5 @@
 //! The pie half of `scripts/imagegen/wan22_vae_parity.py`: decodes a `T`-frame
-//! latent as `text-to-video` does, one pass per latent frame over one working
+//! latent as `text-to-media` does, one pass per latent frame over one working
 //! set, and sends the pixels back as one raw `[F*H*W, 3]` f32 file.
 
 use inferlet::latent::prelude::*;

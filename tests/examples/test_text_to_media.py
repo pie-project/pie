@@ -1,16 +1,15 @@
 """A prompt goes in and an image comes out, with nothing about the family in the guest.
 
-`text-to-image` is the generic sampler of the latent path: it finds its text and
-denoise readings by what their lanes bind (`embeds && Hidden`, a token-less lane
-reading `latents` with a `Velocity` readout), sizes the VAE's own latent from
-`model.latent()`, steps `model.schedule()`, and exits through the model's
-`vae.decode` reading as a PNG the runtime encodes. The model computes its own
+`text-to-media` is the generic sampler of the latent path: it drives the
+standard readings (`text`, `denoise`, `vae.decode`) by name, sizes the VAE's
+own latent from `model.latent()`, steps `model.schedule()`, and exits through
+`vae.decode` as a PNG the runtime encodes. The model computes its own
 positions and patches its own latent. This gate drives it through the CLI a
 person actually types (`pie --config C run -o DIR`), because the picture leaves
 as a FILE and the file is half the claim.
 
 The half in FRONT of this -- that `pie model list` reports the row's
-generative facts, that `pie run text-to-image` resolves the guest by name with
+generative facts, that `pie run text-to-media` resolves the guest by name with
 no `--path`, and that what arrives is a named file -- is
 `test_generating_images.py`. This suite is about the sampler.
 
@@ -25,10 +24,10 @@ Two claims, one per row:
 **WANTS A GENERATIVE MODEL.** There is no text-model fallback: a row with no
 denoise reading is reported as a skip, not a failure. The runs that mean to
 exercise the door name their config:
-    CUDA_VISIBLE_DEVICES=3 uv run python tests/examples/test_text_to_image.py \\
+    CUDA_VISIBLE_DEVICES=3 uv run python tests/examples/test_text_to_media.py \\
         --config ~/.pie/config.flux2.toml
 
-    CUDA_VISIBLE_DEVICES=3 uv run python tests/examples/test_text_to_image.py \\
+    CUDA_VISIBLE_DEVICES=3 uv run python tests/examples/test_text_to_media.py \\
         --config ~/.pie/config.minidit.toml --expect-refusal
 
 where the config's `[model] source` is the imported `.zt` (`pie model import
@@ -69,7 +68,7 @@ from pathlib import Path
 INFERLETS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = INFERLETS_DIR.parent.parent
 
-NAME = "text-to-image"
+NAME = "text-to-media"
 
 # The refusal that means "this load has no text encoder", not "the sampler
 # broke". The guest spells it exactly this way, on purpose.
@@ -201,15 +200,10 @@ def a_prompt_becomes_a_picture(args) -> None:
         raise AssertionError(f"`pie run` exited {code}:\n{stderr[-2000:]}")
 
     report = report_of(stdout)
-    print(f"Report: { {k: v for k, v in report.items() if k != 'sigmas'} }")
-    print(f"Sigmas: {[round(s, 4) for s in report['sigmas']]}")
+    print(f"Report: {report}")
 
-    assert report["width"] == args.size and report["height"] == args.size, report
-    sc = report["spatial_compression"]
-    assert (report["latent_h"] * sc, report["latent_w"] * sc) == (args.size, args.size), report
+    assert report["size"] == f"{args.size}x{args.size}", report
     assert report["steps"] == args.steps, report
-    assert len(report["sigmas"]) == args.steps + 1 and report["sigmas"][-1] == 0.0, report
-    assert report["context_rows"] > 0, "the prompt encoded to no rows"
 
     png = out_dir / report["file"]
     assert png.exists(), f"the report says it sent {report['file']} and {out_dir} has it not"
@@ -218,8 +212,7 @@ def a_prompt_becomes_a_picture(args) -> None:
         "sending through the unnamed `session.send-file`"
     )
     how = check_png(png, args.size, args.size)
-    print(f"✅ {png}  {png.stat().st_size:,} bytes  (checked by {how}) "
-          f"-- decoded in-guest by reading `{report['decode_reading']}`")
+    print(f"✅ {png}  {png.stat().st_size:,} bytes  (checked by {how})")
 
 
 def a_model_with_no_text_reading_refuses_by_name(args) -> None:

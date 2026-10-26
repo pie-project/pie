@@ -604,7 +604,7 @@ CUDA_VISIBLE_DEVICES=3 python wan22_golden.py --vae     # needs `--full` to have
 `wan22_golden.py --vae-ref` decodes a seeded DiT-space latent (`torch.randn`,
 seed 0, 3×16×16×48; needs only the snapshot's `vae/*`) into
 `golden/wan22/wan22_vae_ref/`. `examples/wan2-vae-parity` decodes it through
-the runtime the way `text-to-video` does — one `vae.decode` fire per latent
+the runtime the way `text-to-media` does — one `vae.decode` fire per latent
 frame, one working set whose recurrent state is the conv caches (frame =
 token), one pipeline; the derived `fresh` switch picks the head branch where
 the state is empty — and the script scores each chunk at
