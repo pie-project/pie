@@ -143,6 +143,10 @@ impl ForwardPass {
         Ok(())
     }
 
+    pub fn take_bound(&mut self) -> Option<Box<BoundForwardPass>> {
+        self.bound.take()
+    }
+
     pub fn bound(&self) -> Result<&BoundForwardPass, String> {
         self.bound
             .as_deref()

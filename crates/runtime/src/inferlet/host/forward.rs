@@ -1449,19 +1449,11 @@ impl ProcessCtx {
     }
 
     async fn core_drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
-        let fires = self
-            .ctx()
-            .table
-            .get(&this)?
-            .bound()
-            .ok()
-            .and_then(|pass| pass.fires.clone());
-        if let Some(fires) = fires {
-            crate::pipeline::fire::finalize_all(self, &fires, false).await?;
-        }
-
-        let mut pass = self.ctx().table.delete(this)?;
-        if let Ok(bound) = pass.bound_mut() {
+        let rep = this.rep();
+        let Some(bound) = self.ctx().table.delete(this)?.take_bound() else {
+            return Ok(());
+        };
+        if let Some(mut bound) = crate::pipeline::fire::retire_pass(rep, bound) {
             bound.close_native();
         }
         Ok(())
