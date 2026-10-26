@@ -74,6 +74,10 @@ impl Repository {
         self.builtin.insert(name, component);
     }
 
+    pub fn has_builtin_named(&self, name: &str) -> bool {
+        self.builtin.keys().any(|p| p.name == name)
+    }
+
     /// Served from the binary: built in, and not shadowed by a disk copy.
     pub fn is_builtin(&self, name: &ProgramName) -> bool {
         self.builtin.contains_key(name) && !self.shadowed(name)
@@ -419,6 +423,8 @@ mod tests {
         let name = named("compat", "0.1.0");
         repo.add_builtin(name.clone(), b"\0asm-builtin");
         assert!(repo.exists(&name) && repo.is_builtin(&name));
+        assert!(repo.has_builtin_named("compat"));
+        assert!(!repo.has_builtin_named("compat-x"));
         assert_eq!(repo.fetch_binary(&name).await.unwrap(), b"\0asm-builtin");
         assert_eq!(repo.cached()[0].2, b"\0asm-builtin".len() as u64);
         assert!(

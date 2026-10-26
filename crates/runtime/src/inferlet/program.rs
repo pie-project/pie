@@ -204,6 +204,17 @@ pub async fn is_registered(name: &ProgramName) -> bool {
     rx.await.unwrap_or(false)
 }
 
+pub async fn is_builtin_name(name: &str) -> bool {
+    let (tx, rx) = oneshot::channel();
+    SERVICE
+        .send(Message::IsBuiltinName {
+            name: name.to_string(),
+            response: tx,
+        })
+        .ok();
+    rx.await.unwrap_or(false)
+}
+
 /// The newest installed version of a program named `name`.
 pub async fn newest(name: &str) -> Option<ProgramName> {
     let (tx, rx) = oneshot::channel();
@@ -507,6 +518,11 @@ enum Message {
         response: oneshot::Sender<Option<ProgramName>>,
     },
 
+    IsBuiltinName {
+        name: String,
+        response: oneshot::Sender<bool>,
+    },
+
     Install {
         name: ProgramName,
         response: oneshot::Sender<Result<()>>,
@@ -557,6 +573,9 @@ impl ServiceHandler for ProgramService {
             }
             Message::Newest { name, response } => {
                 let _ = response.send(self.repository.newest(&name));
+            }
+            Message::IsBuiltinName { name, response } => {
+                let _ = response.send(self.repository.has_builtin_named(&name));
             }
             Message::Install { name, response } => {
                 let _ = response.send(self.install(&name).await);
