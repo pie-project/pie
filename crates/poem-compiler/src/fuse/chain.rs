@@ -801,7 +801,37 @@ pub(super) fn rotation(width: u32, head_dim: u32, theta: f32, turn: &Turn) -> Op
     if head_dim == 0 || width % head_dim != 0 {
         return None;
     }
+    let mut mscale = None;
     let (pairs, inverse, ramp) = match *turn {
+        // every pair at YaRN's stretched frequencies (`theta^(-2d /
+        // head_dim)` ramped), cos and sin times the attention factor, as the
+        // hand YaRN turn lands it
+        Turn::Yarn {
+            yarn,
+            attention_factor,
+            interleaved,
+        } if head_dim.is_multiple_of(2) && yarn.original_max_position > 0 => {
+            let (low, high) = ramp_bounds(
+                i32::try_from(head_dim).ok()?,
+                theta,
+                yarn.beta_fast,
+                yarn.beta_slow,
+                i32::try_from(yarn.original_max_position).ok()?,
+            );
+            mscale = Some(attention_factor);
+            (
+                build::Pairs::Tail {
+                    rotary: head_dim,
+                    interleaved,
+                },
+                false,
+                Some(build::Ramp {
+                    factor: yarn.factor,
+                    low,
+                    high,
+                }),
+            )
+        }
         // every pair: the halves `i`, `i + head_dim / 2` at `theta^(-i /
         // (head_dim / 2))`, or `2i`, `2i + 1` at `theta^(-2i / head_dim)`
         Turn::Full { interleaved } if head_dim.is_multiple_of(2) => (
@@ -879,6 +909,7 @@ pub(super) fn rotation(width: u32, head_dim: u32, theta: f32, turn: &Turn) -> Op
         theta,
         inverse,
         ramp,
+        mscale,
     })
 }
 

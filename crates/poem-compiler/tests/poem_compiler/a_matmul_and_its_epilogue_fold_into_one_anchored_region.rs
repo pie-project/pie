@@ -221,15 +221,9 @@ fn a_packed_qkvs_split_norms_and_turn_are_one_epilogue_of_windows() {
     assert_eq!(
         anchor.anchored.windows,
         [
-            Window {
-                from: qw + kvw,
-                width: kvw
-            },
-            Window { from: 0, width: qw },
-            Window {
-                from: qw,
-                width: kvw
-            },
+            Window::of(qw + kvw, kvw),
+            Window::of(0, qw),
+            Window::of(qw, kvw),
         ]
     );
     let [m, k] = [3usize, K as usize];
@@ -429,7 +423,11 @@ fn a_kv_append_lands_k_and_v_in_the_caches_pages() {
     }
     let formed = anchors(&t, &all);
     let anchor = the_one(&formed);
-    assert_eq!(anchor.nodes, [0, 1, 2, 3], "the product, split, turn and append");
+    assert_eq!(
+        anchor.nodes,
+        [0, 1, 2, 3],
+        "the product, split, turn and append"
+    );
     assert!(anchor.cache.is_some() && !anchor.landed);
     assert_eq!(anchor.outs.len(), 1, "q alone a value");
     let epi = anchor.anchored.epilogue.as_ref().expect("an epilogue");
@@ -459,4 +457,170 @@ fn a_kv_append_lands_k_and_v_in_the_caches_pages() {
         folded.nodes[0].op,
         Operation::Fused(Fused::Anchored { cache: Some(_), .. })
     ));
+}
+
+/// Qwen 3.5's gated attention prologue: the packed q|gate piece cut a head
+/// at a time (q's and the gate's heads interleaved), q and k normed and
+/// turned, k and v paged. q and the gate land head-major windows of the
+/// product (a head of every two), k and v the cache's planes.
+#[test]
+fn a_gated_qs_heads_are_head_major_windows_of_the_product() {
+    use kernels_ir::Window;
+    use poem::ops::gather;
+    use poem_ir::Turn;
+    const D: u32 = 16;
+    let (qg, kvw) = (4 * D, D);
+    let mut t = trace(|p| {
+        let packed = linear::matmul(
+            &p.rows("x", K),
+            &p.weight("qkv", [u64::from(qg + 2 * kvw), K]),
+        );
+        let (q, k, v) = gather::split_qkv(&packed, qg, kvw);
+        let (q, gate) = gather::split_q_gate(&q, D);
+        let positions = p.indices("positions");
+        let (q, k) = elemwise::rope(
+            &q,
+            &positions,
+            D,
+            1e6,
+            Turn::Full { interleaved: false },
+            Some(&k),
+            None,
+        );
+        let cache = p.cache("cache");
+        let (page, offset) = (p.indices("write_page"), p.indices("write_offset"));
+        attn::kv_append(&k.expect("k turned"), Some(&v), cache, &page, &offset);
+        p.export("q", &q);
+        p.export("gate", &gate);
+    });
+    for row in &mut t.caches {
+        if let poem_ir::CacheRow::Kv { planes, .. } = row {
+            *planes = vec![u64::from(kvw), u64::from(kvw)];
+        }
+    }
+    let formed = anchors(&t, &all);
+    let anchor = the_one(&formed);
+    assert_eq!(
+        anchor.nodes,
+        [0, 1, 2, 3, 4],
+        "product, splits, turn and append"
+    );
+    let windows = &anchor.anchored.windows;
+    assert_eq!(windows[..2].len(), 2);
+    assert!(
+        windows.contains(&Window::strided(D, 2 * D, D, 2 * D)),
+        "the gate: {windows:?}"
+    );
+    assert!(
+        windows.contains(&Window::strided(0, 2 * D, D, 2 * D)),
+        "q: {windows:?}"
+    );
+    assert_eq!(anchor.anchored.verify(), Ok(()));
+}
+
+/// The gated q's head-major windows land what Qwen 3.5's ops do over them:
+/// q's heads normed (plus-one weights) and turned on a partial rotary, the
+/// gate's heads its products as they are summed.
+#[test]
+fn a_gated_qs_windows_land_its_norms_and_partial_turn() {
+    use kernels_ir::Window;
+    use poem::ops::gather;
+    use poem_ir::Turn;
+    const D: u32 = 16;
+    const ROTARY: u32 = 8;
+    const SPAN: u32 = 4;
+    const THETA: f32 = 1e4;
+    let (qg, kvw) = (4 * D, D);
+    let t = trace(|p| {
+        let packed = linear::matmul(
+            &p.rows("x", K),
+            &p.weight("qkv", [u64::from(qg + 2 * kvw), K]),
+        );
+        let (q, k, _) = gather::split_qkv(&packed, qg, kvw);
+        let (q, gate) = gather::split_q_gate(&q, D);
+        let q =
+            elemwise::rmsnorm_per_head_plus_one(&q, &p.weight("q_norm", [u64::from(D)]), D, 1e-6);
+        let k =
+            elemwise::rmsnorm_per_head_plus_one(&k, &p.weight("k_norm", [u64::from(D)]), D, 1e-6);
+        let (q, k) = elemwise::rope(
+            &q,
+            &p.indices("positions"),
+            D,
+            THETA,
+            Turn::Partial {
+                rotary_dim: ROTARY,
+                span: SPAN,
+            },
+            Some(&k),
+            None,
+        );
+        p.export("q", &q);
+        p.export("k", &k.expect("k turned"));
+        p.export("gate", &gate);
+    });
+    let formed = anchors(&t, &all);
+    let anchor = the_one(&formed);
+    let windows = &anchor.anchored.windows;
+    let at = |w: Window| {
+        windows
+            .iter()
+            .position(|&x| x == w)
+            .unwrap_or_else(|| panic!("{w:?} in {windows:?}"))
+    };
+    let (q_at, gate_at) = (
+        at(Window::strided(0, 2 * D, D, 2 * D)),
+        at(Window::strided(D, 2 * D, D, 2 * D)),
+    );
+    let epi = anchor.anchored.epilogue.as_ref().expect("an epilogue");
+    assert_eq!(epi.inputs, [Input::Head(D), Input::Head(D), Input::Row]);
+    let n = (qg + 2 * kvw) as usize;
+    let [m, k] = [3usize, K as usize];
+    let (a, w) = (values(m * k, 6), values(n * k, 7));
+    let (q_norm, positions) = (values(D as usize, 8), [0.0f32, 3.0, 17.0]);
+    let given = [
+        Given::Column(q_norm.clone()),
+        Given::Column(values(D as usize, 9)),
+        Given::Row(positions.to_vec()),
+    ];
+    let got = eval(&anchor.anchored, m, &a, &w, &[], &given).expect("runs");
+    let y = product(&a, &w, [m, n, k]);
+    let d = D as usize;
+    for row in 0..m {
+        for head in 0..2 {
+            let from = row * n + head * 2 * d;
+            // the gate's head: its products as they are summed
+            let gate = &got[gate_at][row * 2 * d + head * d..][..d];
+            assert_eq!(
+                gate,
+                &y[from + d..from + 2 * d],
+                "row {row} head {head}'s gate"
+            );
+            // q's head: normed in f64, then turned
+            let x = &y[from..from + d];
+            let rms = (x.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / f64::from(D) + 1e-6)
+                .sqrt()
+                .recip();
+            let normed: Vec<f64> = (0..d)
+                .map(|i| f64::from(x[i]) * rms * (1.0 + f64::from(q_norm[i])))
+                .collect();
+            let mut want = normed.clone();
+            for i in 0..(ROTARY / 2) as usize {
+                let j = i + SPAN as usize;
+                let angle = f64::from(positions[row])
+                    * f64::from(THETA).powf(-(i as f64) / f64::from(SPAN));
+                let (c, s) = (angle.cos(), angle.sin());
+                want[i] = normed[i] * c - normed[j] * s;
+                want[j] = normed[j] * c + normed[i] * s;
+            }
+            let q = &got[q_at][row * 2 * d + head * d..][..d];
+            for i in 0..d {
+                assert!(
+                    (f64::from(q[i]) - want[i]).abs() <= want[i].abs() / 128.0 + 1e-2,
+                    "row {row} head {head} column {i}: {} vs {}",
+                    q[i],
+                    want[i]
+                );
+            }
+        }
+    }
 }

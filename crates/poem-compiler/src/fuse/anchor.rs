@@ -248,12 +248,11 @@ pub fn anchors_with(trace: &Trace, serves: Serves<'_>, folds: Option<Folds<'_>>)
             // on the row skeleton alone: an anchor takes one only where it
             // lands a KV append (a shared-kv latent's k row), and keeps its
             // contraction skeletons elsewhere.
-            let reduces = anchor.anchored.epilogue.as_ref().is_some_and(|e| {
-                e.region
-                    .ops
-                    .iter()
-                    .any(|op| matches!(op, Op::Reduce(..)))
-            });
+            let reduces = anchor
+                .anchored
+                .epilogue
+                .as_ref()
+                .is_some_and(|e| e.region.ops.iter().any(|op| matches!(op, Op::Reduce(..))));
             if reduces && anchor.cache.is_none() {
                 return None;
             }
@@ -510,10 +509,7 @@ fn split_of(
 ) -> Option<Vec<(ValueId, Window)>> {
     let whole = |v: ValueId| {
         if full.contains(&v) {
-            Some(Window {
-                from: 0,
-                width: product.rows,
-            })
+            Some(Window::of(0, product.rows))
         } else {
             windows.get(&v).copied()
         }
@@ -528,17 +524,33 @@ fn split_of(
             v,
         }) => {
             let at = whole(packed)?;
-            if q_width.checked_add(kv_width.checked_mul(2)?)? != at.width {
+            if !at.whole() || q_width.checked_add(kv_width.checked_mul(2)?)? != at.width {
                 return None;
             }
-            let piece = |from: u32, width: u32| Window {
-                from: at.from + from,
-                width,
-            };
+            let piece = |from: u32, width: u32| Window::of(at.from + from, width);
             Some(vec![
                 (q, piece(0, q_width)),
                 (k, piece(q_width, kv_width)),
                 (v, piece(q_width + kv_width, kv_width)),
+            ])
+        }
+        // q and its gate interleaved a head (Qwen 3.5's): each a head of every
+        // two, head-major windows of the piece
+        Operation::Gather(Gather::SplitQGate {
+            packed,
+            head_dim,
+            q,
+            gate,
+        }) => {
+            let at = whole(packed)?;
+            let d = head_dim;
+            if !at.whole() || d == 0 || !at.width.is_multiple_of(2 * d) {
+                return None;
+            }
+            let width = at.width / 2;
+            Some(vec![
+                (q, Window::strided(at.from, width, d, 2 * d)),
+                (gate, Window::strided(at.from + d, width, d, 2 * d)),
             ])
         }
         Operation::Gather(Gather::SplitRows {
@@ -548,24 +560,12 @@ fn split_of(
             right,
         }) => {
             let at = whole(x)?;
-            if width == 0 || width >= at.width {
+            if !at.whole() || width == 0 || width >= at.width {
                 return None;
             }
             Some(vec![
-                (
-                    left,
-                    Window {
-                        from: at.from,
-                        width,
-                    },
-                ),
-                (
-                    right,
-                    Window {
-                        from: at.from + width,
-                        width: at.width - width,
-                    },
-                ),
+                (left, Window::of(at.from, width)),
+                (right, Window::of(at.from + width, at.width - width)),
             ])
         }
         _ => None,
@@ -642,6 +642,22 @@ fn full_of(trace: &Trace, run: &[u32], product: &Product) -> Vec<ValueId> {
     full
 }
 
+/// Whether a rotation's stated frequencies (`freqs`, none: `theta`'s) are
+/// one a pair it turns, where no ramp stretches them too.
+fn table_fits(turn: &kernels_ir::build::Turn, freqs: Option<&poem_ir::RopeFreqs>) -> bool {
+    let Some(freqs) = freqs else {
+        return true;
+    };
+    let pairs = match turn.pairs {
+        kernels_ir::build::Pairs::Halves { rotary, .. }
+        | kernels_ir::build::Pairs::Tail { rotary, .. } => rotary / 2,
+    };
+    turn.ramp.is_none()
+        && turn.mscale.is_none()
+        && freqs.inv_freq.len() == pairs as usize
+        && freqs.mscale.is_finite()
+}
+
 /// Whether `node`, an op over the windows `windows`, reads them as one op
 /// over each head of its own piece: every piece it reads one (the pair a
 /// rotation turns, q's and k's, each its own), of whole heads where it
@@ -680,7 +696,7 @@ fn over_pieces(
             k: Some(k),
             positions,
             head_dim,
-            freqs: None,
+            ref freqs,
             turn,
             theta,
             ..
@@ -691,7 +707,8 @@ fn over_pieces(
             whole(head_dim, qw)
                 && whole(head_dim, kw)
                 && matches!(chain::form(trace, positions), Some(chain::Form::Each))
-                && chain::rotation(head_dim, head_dim, theta, &turn).is_some()
+                && chain::rotation(head_dim, head_dim, theta, &turn)
+                    .is_some_and(|t| table_fits(&t, freqs.as_ref()))
         }
         Operation::Elemwise(Elemwise::Rmsnorm {
             axis: NormAxis::Head(head),
@@ -703,7 +720,9 @@ fn over_pieces(
         Operation::Elemwise(
             Elemwise::Act { .. } | Elemwise::Binary { .. } | Elemwise::Clamp { .. },
         ) => pieces.iter().all(|w| *w == piece) && chain::row_of(trace, node) == rows(piece),
-        Operation::Attn(Attn::KvAppend { .. }) => append_of(trace, node, product, windows).is_some(),
+        Operation::Attn(Attn::KvAppend { .. }) => {
+            append_of(trace, node, product, windows).is_some()
+        }
         _ => false,
     }
 }
@@ -724,7 +743,14 @@ fn joins(trace: &Trace, run: &[u32], node: u32, product: &Product) -> bool {
     if windows.is_empty() {
         // a split of the product, or of what the run lands of its whole tile
         if layout_of(trace, run, product).1 == Layout::Dense
-            && split_of(trace, node, product, &full_of(trace, run, product), &windows).is_some()
+            && split_of(
+                trace,
+                node,
+                product,
+                &full_of(trace, run, product),
+                &windows,
+            )
+            .is_some()
         {
             return true;
         }
@@ -854,6 +880,14 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
                     b.of.insert(piece, whole);
                 }
             }
+            Operation::Gather(Gather::SplitQGate {
+                packed, q, gate, ..
+            }) => {
+                let whole = b.get(packed)?;
+                for piece in [q, gate] {
+                    b.of.insert(piece, whole);
+                }
+            }
             // q's and k's heads turned as one row: each column its own
             // piece's value, one rotation over both.
             Operation::Elemwise(Elemwise::Rope {
@@ -863,11 +897,22 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
                 head_dim,
                 theta,
                 ref turn,
-                freqs: None,
+                ref freqs,
                 q_out,
                 k_out: Some(k_out),
             }) => {
-                let turn = chain::rotation(width, head_dim, theta, turn)?;
+                let mut turn = chain::rotation(width, head_dim, theta, turn)?;
+                // frequencies stated outright: each pair's, cos and sin
+                // carrying their scale
+                if !table_fits(&turn, freqs.as_ref()) {
+                    return None;
+                }
+                let table = freqs.as_ref().map(|f| f.inv_freq.as_slice());
+                if let Some(f) = freqs
+                    && f.mscale != 1.0
+                {
+                    turn.mscale = Some(turn.mscale.unwrap_or(1.0) * f.mscale);
+                }
                 let (xq, xk) = (b.get(q)?, b.get(k)?);
                 let x = if xq == xk {
                     xq
@@ -877,7 +922,7 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
                     let in_q = b.b.push(Op::Binary(Binary::Lt, col, edge));
                     b.b.push(Op::Select(in_q, xq, xk))
                 };
-                let turned = b.b.rotate(x, b.get(positions)?, &turn);
+                let turned = b.b.rotate_with(x, b.get(positions)?, &turn, table);
                 b.of.insert(q_out, turned);
                 b.of.insert(k_out, turned);
             }
@@ -971,7 +1016,7 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
     } else {
         outs.iter()
             .chain(paged.iter().map(|(v, _)| v))
-            .map(|v| windows.get(v).copied().unwrap_or(Window { from: 0, width }))
+            .map(|v| windows.get(v).copied().unwrap_or(Window::of(0, width)))
             .collect()
     };
     let paged: Vec<Option<Paged>> = if paged.is_empty() {
@@ -1066,11 +1111,9 @@ fn append_of(
     };
     // a piece of the product, or (no split) its whole tile
     let piece = |x: ValueId| {
-        windows.get(&x).copied().or_else(|| {
-            (windows.is_empty() && is_full(trace, x, product)).then_some(Window {
-                from: 0,
-                width: product.rows,
-            })
+        windows.get(&x).copied().filter(|w| w.whole()).or_else(|| {
+            (windows.is_empty() && is_full(trace, x, product))
+                .then_some(Window::of(0, product.rows))
         })
     };
     let kw = piece(k)?;
