@@ -159,18 +159,18 @@ async fn main(input: Input) -> Result<Output> {
     let stop_tokens = chat::stop_tokens();
 
     let ws = WorkingSet::new();
-    // The device picks the slots, so they are reserved up front; `2 * w` because it may run a
-    // window past `max_tokens` and lay out the one after it.
-    let max_extent = n + input.max_tokens as u32 + 2 * w;
+    // The device picks the slots, so they are reserved up front: past `max_tokens` it may
+    // run a window, every fire in flight one more, and lay out the next.
+    let max_extent = n + input.max_tokens as u32 + (model::run_ahead_window() + 2) * w;
     ws.reserve(max_extent)
         .context("reserve the decode's slots")?;
     let pipe = Pipeline::new();
 
-    // The drafting pass is not cut by the runtime, so it is no wider than a fire reads out.
+    // The drafting pass is the last prompt token alone: a draft head attends
+    // as its readout rows, so every row of a drafting fire is read out.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let tail = output("logits").map_or(1, |logits| logits.max_rows);
-    let spans = if k > 0 && n > tail {
-        vec![(0, n - tail), (n - tail, n)]
+    let spans = if k > 0 && n > 1 {
+        vec![(0, n - 1), (n - 1, n)]
     } else {
         vec![(0, n)]
     };
