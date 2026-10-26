@@ -71,6 +71,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::norm_rope_pair(),
             rules::index_topk_rope(),
             rules::hc_prenorm_project(),
+            rules::hc_gates_norm(),
             rules::res_blend_rmsnorm(),
             rules::hc_fold_pre(),
             rules::hc_pre(),
@@ -123,7 +124,6 @@ pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
         rules::embed_scale_add(),
         rules::norm_modulate(),
         rules::gated_residual_norm_modulate(),
-        rules::hc_gates_norm(),
     ]
 }
 

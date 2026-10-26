@@ -10,11 +10,10 @@ use crate::run::Run;
 
 /// The fused ops this backend's dispatch turns away. Its rules form none of
 /// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`): the residual
-/// norms, a scaled embedding's chain, a DiT block's norm and modulation, a
-/// head's norm and the turn of its first dims and a hyper-connection's
-/// gates and the norm of their row run as generated regions here, a
-/// product's bias, soft cap and GEGLU as anchored ones (`fused.anchored`),
-/// their fused ops ROCm's and Metal's.
+/// norms, a scaled embedding's chain, a DiT block's norm and modulation and
+/// a head's norm and the turn of its first dims run as generated regions
+/// here, a product's bias, soft cap and GEGLU as
+/// anchored ones (`fused.anchored`), their fused ops ROCm's and Metal's.
 pub(crate) fn refuses(op: &Fused) -> bool {
     match op {
         Fused::GdnStep { .. }
@@ -26,7 +25,6 @@ pub(crate) fn refuses(op: &Fused) -> bool {
         | Fused::MatmulSoftcap { .. }
         | Fused::ResidualAddRmsnorm { .. }
         | Fused::RmsnormResidualAdd { .. }
-        | Fused::HcGatesNorm { .. }
         | Fused::QGateNormRopeAppend {
             intermediates: Intermediates::Written,
             ..
@@ -65,7 +63,6 @@ impl DispatchFused for Run<'_> {
             | Fused::MatmulSoftcap { .. }
             | Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
-            | Fused::HcGatesNorm { .. }
             | Fused::QGateNormRopeAppend {
                 intermediates: Intermediates::Written,
                 ..
@@ -86,6 +83,7 @@ impl DispatchFused for Run<'_> {
             Fused::PoolAttention { .. } => self.pool_attention(op),
             Fused::MlaPrefillExpanded { .. } => self.mla_prefill_expanded(op),
             Fused::HcPrenormProject { .. } => self.hc_prenorm_project(op),
+            Fused::HcGatesNorm { .. } => self.hc_gates_norm(op),
             Fused::ResBlendRmsnorm { .. } => self.res_blend_rmsnorm(op),
             Fused::HcFoldPre { .. } => self.hc_fold_pre(op),
             Fused::HcPre { .. } => self.hc_pre(op),
@@ -468,6 +466,64 @@ impl Run<'_> {
             }
         }
         self.elemwise(blend)?;
+        self.elemwise(norm)
+    }
+
+    fn hc_gates_norm(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::HcGatesNorm { gates, norm } = op else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        let (
+            poem_ir::Elemwise::HcGates {
+                normed,
+                streams,
+                scale,
+                base,
+                stream_count,
+                gate_eps,
+                alpha,
+                sinkhorn,
+                comb: true,
+                post_mix,
+                comb_mix,
+                ..
+            },
+            poem_ir::Elemwise::Rmsnorm {
+                weight: NormWeight::Scale(weight),
+                eps,
+                y,
+                axis: NormAxis::Row,
+                ..
+            },
+        ) = (&**gates, &**norm)
+        else {
+            self.elemwise(gates)?;
+            return self.elemwise(norm);
+        };
+        if self.ctx().tuning().hc_tile {
+            let landed = kernels_cuda::elemwise::hc::gates_norm(
+                self.ctx(),
+                self.tensor(*normed),
+                self.tensor(*streams),
+                *stream_count,
+                kernels_cuda::elemwise::hc::Gate {
+                    scale: self.tensor(*scale),
+                    base: self.tensor(*base),
+                    gate_eps: *gate_eps,
+                    alpha: *alpha,
+                    sinkhorn: *sinkhorn,
+                },
+                self.tensor(*weight),
+                *eps,
+                &mut self.tensor(*post_mix),
+                &mut self.tensor(*comb_mix),
+                &mut self.tensor(*y),
+            )?;
+            if landed {
+                return Ok(());
+            }
+        }
+        self.elemwise(gates)?;
         self.elemwise(norm)
     }
 

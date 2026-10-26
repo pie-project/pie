@@ -78,6 +78,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("elemwise.hc_mix", Reads::Rows),
     entry("elemwise.hc_rmsnorm_f32", Reads::Rows),
     entry("fused.hc_prenorm_project", Reads::Rows),
+    entry("fused.hc_gates_norm", Reads::Rows),
     entry("fused.res_blend_rmsnorm", Reads::Rows),
     entry("fused.hc_fold_pre", Reads::Rows),
     entry("fused.hc_pre", Reads::Rows),
