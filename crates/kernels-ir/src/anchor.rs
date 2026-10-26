@@ -50,6 +50,7 @@ use std::fmt;
 
 use dtype::Dtype;
 
+use crate::blocks::BlockRows;
 use crate::interp::{self, Arg, InterpError};
 use crate::region::{Op, Region, RegionError, Shape, ValueId};
 use crate::skeleton::{round_bf16, round_e4m3};
@@ -242,23 +243,37 @@ impl Window {
     }
 }
 
-/// How a paged cache holds its elements: bf16, or e4m3 under a scale (each
-/// element `e4m3(x / scale)`, saturating; vLLM's `fp8` KV is a unit scale).
+/// How a paged cache holds its elements: bf16, e4m3 under a scale (each
+/// element `e4m3(x / scale)`, saturating; vLLM's `fp8` KV is a unit scale),
+/// or a whole row block-scaled ([`BlockRows`]: its blocks' codes under
+/// their scales, DeepSeek's rows).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CacheDtype {
     Bf16,
     E4m3 { scale: f32 },
+    Blocks(BlockRows),
 }
 
 impl CacheDtype {
     /// `x` as the cache stores it, read back: rounded to bf16 as the
-    /// result's own plane would hold it, then to the cache's element.
+    /// result's own plane would hold it, then to the cache's element. A
+    /// block-scaled row's element is its block's ([`CacheDtype::stored_row`]):
+    /// here, its bf16.
     #[must_use]
     pub fn stored(self, x: f32) -> f32 {
         let x = round_bf16(x);
         match self {
-            CacheDtype::Bf16 => x,
+            CacheDtype::Bf16 | CacheDtype::Blocks(_) => x,
             CacheDtype::E4m3 { scale } => round_e4m3(x / scale),
+        }
+    }
+
+    /// `row` as the cache stores it, read back.
+    #[must_use]
+    pub fn stored_row(self, row: &[f32]) -> Vec<f32> {
+        match self {
+            CacheDtype::Blocks(rows) => rows.stored(row),
+            _ => row.iter().map(|x| self.stored(*x)).collect(),
         }
     }
 }
@@ -691,13 +706,15 @@ impl Anchored {
         }
         let reads_norm = |p: &Pointwise| p.inputs.contains(&Input::Norm);
         if self.prologue.as_ref().is_some_and(reads_norm)
-            || self.norm.is_some()
-                != self.epilogue.as_ref().is_some_and(reads_norm)
+            || self.norm.is_some() != self.epilogue.as_ref().is_some_and(reads_norm)
             || (self.norm.is_some() && self.prologue.is_some())
         {
             return Err(AnchorError::Norm);
         }
-        if self.norm.is_some_and(|norm| !(norm.eps >= 0.0 && norm.eps.is_finite())) {
+        if self
+            .norm
+            .is_some_and(|norm| !(norm.eps >= 0.0 && norm.eps.is_finite()))
+        {
             return Err(AnchorError::Norm);
         }
         if !self.paged.is_empty() {
@@ -712,6 +729,14 @@ impl Anchored {
                 let scaled = match paged.dtype {
                     CacheDtype::Bf16 => true,
                     CacheDtype::E4m3 { scale } => scale.is_finite() && scale > 0.0,
+                    // a whole row of the layout's, one landed of the tile
+                    CacheDtype::Blocks(rows) => {
+                        let width = self
+                            .windows
+                            .get(result as usize)
+                            .map_or(c.n, |w| if w.whole() { w.width } else { 0 });
+                        rows.verify() && width == rows.width()
+                    }
                 };
                 if !row(paged.page) || !row(paged.slot) || !scaled {
                     return Err(AnchorError::Paged { result });
@@ -724,8 +749,7 @@ impl Anchored {
                 return Err(AnchorError::Window { result });
             }
             for (result, w) in (0u32..).zip(&self.windows) {
-                let strided = w.head == 0
-                    || (w.stride >= w.head && w.width.is_multiple_of(w.head));
+                let strided = w.head == 0 || (w.stride >= w.head && w.width.is_multiple_of(w.head));
                 let inside = w.from.checked_add(w.width).is_some()
                     && w.from.checked_add(w.stride).is_some()
                     && w.end() <= c.n;
@@ -810,7 +834,10 @@ impl Anchored {
     /// The window result `k` lands: its own, or every column.
     #[must_use]
     pub fn window(&self, k: usize) -> Window {
-        self.windows.get(k).copied().unwrap_or(Window::of(0, self.contraction.n))
+        self.windows
+            .get(k)
+            .copied()
+            .unwrap_or(Window::of(0, self.contraction.n))
     }
 
     /// The tiles it lands, each `m x n`: the epilogue's results, or each
@@ -976,7 +1003,15 @@ pub fn eval(
     if let Some(pro) = &anchored.prologue {
         for row in 0..m {
             let mut args = vec![Arg::Row(a[row * k..(row + 1) * k].to_vec())];
-            args.extend(row_args(Space::Operand, &pro.inputs, prologue, m, k, row, None)?);
+            args.extend(row_args(
+                Space::Operand,
+                &pro.inputs,
+                prologue,
+                m,
+                k,
+                row,
+                None,
+            )?);
             let fed = interp::eval(&pro.region, &args).map_err(EvalError::Interp)?;
             operand[row * k..(row + 1) * k].copy_from_slice(&fed[0]);
         }
@@ -1028,15 +1063,20 @@ pub fn eval(
             plane[row * n..(row + 1) * n].copy_from_slice(&values);
         }
     }
-    Ok(cached(anchored, windowed(anchored, out, m, n)))
+    Ok(cached(anchored, windowed(anchored, out, m, n), m))
 }
 
-/// Each paged result's values as its cache stores them ([`CacheDtype::stored`]).
-fn cached(anchored: &Anchored, mut tiles: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+/// Each paged result's `m` rows as its cache stores them
+/// ([`CacheDtype::stored_row`]).
+fn cached(anchored: &Anchored, mut tiles: Vec<Vec<f32>>, m: usize) -> Vec<Vec<f32>> {
     for (tile, paged) in tiles.iter_mut().zip(&anchored.paged) {
-        if let Some(paged) = paged {
-            for x in tile.iter_mut() {
-                *x = paged.dtype.stored(*x);
+        if let Some(paged) = paged
+            && m > 0
+        {
+            let width = tile.len() / m;
+            for row in tile.chunks_mut(width.max(1)) {
+                let stored = paged.dtype.stored_row(row);
+                row.copy_from_slice(&stored);
             }
         }
     }
@@ -1092,9 +1132,7 @@ fn windowed(anchored: &Anchored, tiles: Vec<Vec<f32>>, m: usize, n: usize) -> Ve
         .map(|(tile, w)| {
             let tile = &tile;
             (0..m)
-                .flat_map(|row| {
-                    (0..w.width).map(move |j| tile[row * n + w.column(j) as usize])
-                })
+                .flat_map(|row| (0..w.width).map(move |j| tile[row * n + w.column(j) as usize]))
                 .collect()
         })
         .collect()
@@ -1396,7 +1434,7 @@ mod tests {
             theta: 10000.0,
             inverse: false,
             ramp: None,
-        mscale: None,
+            mscale: None,
         };
         let rotated = b.rotate(normed, 1, &turn);
         let col = b.push(Op::Column);
@@ -1564,7 +1602,7 @@ mod tests {
             theta: 10000.0,
             inverse: false,
             ramp: None,
-        mscale: None,
+            mscale: None,
         };
         let turned = b.rotate(scaled, 3, &turn);
         let anchored = Anchored {
@@ -1745,7 +1783,10 @@ mod tests {
         let scaled: Vec<f32> = (0..m * k).map(|i| a[i] * r[i / k]).collect();
         let want = eval(&glu, m, &scaled, &w, &[], &[]).expect("runs");
         for (got, want) in got[0].iter().zip(&want[0]) {
-            assert!((got - want).abs() <= want.abs() * 1e-5 + 1e-6, "{got} vs {want}");
+            assert!(
+                (got - want).abs() <= want.abs() * 1e-5 + 1e-6,
+                "{got} vs {want}"
+            );
         }
         assert!(Anchored::plain(glu.contraction).normed(norm).is_none());
         assert!(normed.normed(norm).is_none());
@@ -1760,8 +1801,8 @@ mod tests {
         for (x, want) in [
             (0.0, 0.0),
             (1.0, 1.0),
-            (1.0625, 1.0),   // a tie between 1 and 1.125: to even
-            (1.1875, 1.25),  // a tie between 1.125 and 1.25: to even
+            (1.0625, 1.0),  // a tie between 1 and 1.125: to even
+            (1.1875, 1.25), // a tie between 1.125 and 1.25: to even
             (1.2, 1.25),
             (-3.3, -3.25),
             (448.0, 448.0),
@@ -1770,7 +1811,7 @@ mod tests {
             (0.001_953_125, 0.001_953_125), // 2^-9, the least subnormal
             (0.0009, 0.0),                  // below half of it
             (0.0015, 0.001_953_125),
-            (0.017, 0.017_578_125),         // 9 · 2^-9
+            (0.017, 0.017_578_125), // 9 · 2^-9
         ] {
             assert_eq!(round_e4m3(x), want, "{x}");
         }
@@ -1816,7 +1857,10 @@ mod tests {
         ];
         let got = eval(&anchored, m, &a, &w, &[], &given).expect("runs");
         for (plain, cached) in got[0].iter().zip(&got[1]) {
-            assert_eq!(*cached, crate::skeleton::round_e4m3(round_bf16(*plain) / 0.5));
+            assert_eq!(
+                *cached,
+                crate::skeleton::round_e4m3(round_bf16(*plain) / 0.5)
+            );
         }
         assert_eq!(
             paged_rows(&anchored, 1, &given, 16),
@@ -1861,7 +1905,10 @@ mod tests {
         };
         assert_eq!(anchored.verify(), Ok(()));
         let w = Window::strided(4, 8, 4, 8);
-        assert_eq!((w.column(5), w.landed(13), w.landed(8), w.end()), (13, Some(5), None, 16));
+        assert_eq!(
+            (w.column(5), w.landed(13), w.landed(8), w.end()),
+            (13, Some(5), None, 16)
+        );
         let (a, wt) = (values(m * k, 1), values(n * k, 2));
         let got = eval(&anchored, m, &a, &wt, &[], &[]).expect("runs");
         let y = eval(&Anchored::plain(anchored.contraction), m, &a, &wt, &[], &[]).expect("runs");
@@ -1921,7 +1968,11 @@ mod tests {
             } else {
                 x[i] * c + x[i - 4] * s
             };
-            assert!((got[0][i] - want).abs() <= 1e-6, "{i}: {} vs {want}", got[0][i]);
+            assert!(
+                (got[0][i] - want).abs() <= 1e-6,
+                "{i}: {} vs {want}",
+                got[0][i]
+            );
         }
     }
 

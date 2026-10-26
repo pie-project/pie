@@ -27,6 +27,7 @@
 //!   regions' printed bodies.
 
 pub mod anchor;
+pub mod blocks;
 pub mod build;
 pub mod interp;
 pub mod kernel;
@@ -38,6 +39,7 @@ pub use anchor::{
     Anchored, CacheDtype, CachePlane, Contraction, Gain, Input, Layout, Paged, Pointwise, Quant,
     RowNorm, Space, Window,
 };
+pub use blocks::{BlockRows, BlockScale, Code};
 pub use kernel::{
     Expr, HeadAssign, Kernel, Loop, Operand, Partial, Phase, RowAssign, Table, Total, Uniform,
 };
