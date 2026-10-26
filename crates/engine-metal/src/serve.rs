@@ -2687,10 +2687,17 @@ impl Shell {
                 attachments.iter().map(|a| a.instance).collect();
             self.fence_instances(&instances)?;
             for attached in attachments {
-                let Some(envelope) = self.programs.envelope(attached.instance)? else {
+                let Some(mut envelope) = self.programs.envelope(attached.instance)? else {
                     continue;
                 };
                 let first = attached.lane as usize;
+                // A decode envelope's flat ports span the lanes the runtime
+                // placed from this one on.
+                envelope.cut_by_lanes(
+                    lanes[first.min(lanes.len())..]
+                        .iter()
+                        .map(|seated| seated.lane.tokens.len() as u32),
+                );
                 let carried = envelope.lanes();
                 if first + carried > lanes.len() {
                     return Err(Fault::program(

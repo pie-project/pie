@@ -188,25 +188,30 @@ impl FrameShell for Shell {
             let src = self.programs.token_device_source(attached.instance);
             let envelope_class = self.programs.geometry_of(attached.instance)
                 == Some(eta_ir::registry::GeometryClass::DecodeEnvelope);
-            if can_runahead && envelope_class {
-                if let Some((src, native)) = src {
-                    let mut at = 0u32;
-                    let mut slices = Vec::new();
-                    for (lane, seated) in lanes.iter().enumerate().skip(first) {
-                        let bytes = seated.lane.tokens.len() as u32 * 4;
-                        if at >= native || at + bytes > native {
-                            break;
-                        }
-                        slices.push((lane, (src + u64::from(at), bytes)));
-                        at += bytes;
+            // A decode envelope's device-carried tokens span the lanes the
+            // runtime placed, a lane's rows each; a class that places its own
+            // lanes carries them whole, at its first.
+            if !envelope_class {
+                if first < lanes.len() {
+                    token_src_of[first] = src;
+                }
+            } else if let Some((src, native)) = src {
+                let mut at = 0u32;
+                let mut slices = Vec::new();
+                for (lane, seated) in lanes.iter().enumerate().skip(first) {
+                    let bytes = seated.lane.tokens.len() as u32 * 4;
+                    if at >= native || at + bytes > native {
+                        break;
                     }
-                    if at == native {
-                        for (lane, slice) in slices {
-                            token_src_of[lane] = Some(slice);
-                        }
-                    } else if first < lanes.len() {
-                        token_src_of[first] = Some((src, native));
+                    slices.push((lane, (src + u64::from(at), bytes)));
+                    at += bytes;
+                }
+                if at == native {
+                    for (lane, slice) in slices {
+                        token_src_of[lane] = Some(slice);
                     }
+                } else if first < lanes.len() {
+                    token_src_of[first] = Some((src, native));
                 }
             }
             if let Some((mask_src, native)) = self
@@ -247,12 +252,19 @@ impl FrameShell for Shell {
                 }
                 continue;
             }
-            let Some(envelope) = self
+            let Some(mut envelope) = self
                 .programs
                 .envelope(attached.instance, mask_on_device)?
             else {
                 continue;
             };
+            // A decode envelope states no slots: the runtime placed its lanes,
+            // and its flat ports span them.
+            envelope.cut_by_lanes(
+                span(attached)
+                    .iter()
+                    .map(|seated| seated.lane.tokens.len() as u32),
+            );
             let carried = envelope.lanes();
             if first + carried > lanes.len() {
                 return Err(Fault::program(
@@ -279,9 +291,6 @@ impl FrameShell for Shell {
                     ));
                 }
                 envelope_of[first + lane] = Some((held, lane));
-            }
-            if first < lanes.len() {
-                token_src_of[first] = src;
             }
             resolved.push(envelope);
         }
@@ -1147,7 +1156,14 @@ impl FrameShell for Shell {
                     for &token in ports.tokens_for(rows_here)? {
                         tokens.push(token as i32);
                     }
-                    match ports.positions_for(have, rows_here)? {
+                    // Positions the runtime resolved for a lane it places are the
+                    // lane's; the device's copy is checked only where it stated none.
+                    let carried = if ports.owns_slots() || seated.positions.is_empty() {
+                        ports.positions_for(have, rows_here)?
+                    } else {
+                        None
+                    };
+                    match carried {
                         Some(stated) => positions.extend(stated.iter().map(|&p| p as i32)),
                         None if !seated.positions.is_empty() => {
                             positions.extend(seated.positions.iter().map(|&p| p as i32))

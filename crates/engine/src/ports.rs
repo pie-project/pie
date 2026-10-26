@@ -17,6 +17,10 @@ pub struct Envelope {
     pub kv_len: Option<Vec<u32>>,
     pub mask: Option<Vec<bool>>,
     pub fold: Option<Vec<u32>>,
+    /// Where the fire's lanes cut an envelope that states no slots of its
+    /// own (a decode envelope, whose lanes the runtime places): a CSR over
+    /// its rows by the rows each lane carries ([`Envelope::cut_by_lanes`]).
+    pub placed: Option<Vec<u32>>,
 }
 
 impl Envelope {
@@ -33,9 +37,42 @@ impl Envelope {
 
     #[must_use]
     pub fn lanes(&self) -> usize {
-        match &self.qo_indptr {
-            Some(csr) if self.owns_slots() && csr.len() >= 2 => csr.len() - 1,
-            _ => 1,
+        self.csr().map_or(1, |csr| csr.len() - 1)
+    }
+
+    /// The CSR that cuts the envelope's rows into lanes: its own where it
+    /// states where its rows land, else where the fire placed them.
+    fn csr(&self) -> Option<&[u32]> {
+        let csr = if self.owns_slots() {
+            self.qo_indptr.as_deref()
+        } else {
+            self.placed.as_deref()
+        };
+        csr.filter(|csr| csr.len() >= 2)
+    }
+
+    /// Cuts an envelope that states no slots into the fire's lanes from the
+    /// one it is attached at, `rows` each: the runtime placed them, and one
+    /// instance's flat ports span them all. Lanes that do not cover its rows
+    /// exactly cut nothing, and it stays one lane.
+    pub fn cut_by_lanes(&mut self, rows: impl IntoIterator<Item = u32>) {
+        if self.owns_slots() {
+            return;
+        }
+        let Some(total) = self.tokens.as_ref().map(Vec::len) else {
+            return;
+        };
+        let mut csr = vec![0u32];
+        let mut at = 0usize;
+        for rows in rows {
+            if at >= total {
+                break;
+            }
+            at += rows as usize;
+            csr.push(u32::try_from(at).unwrap_or(u32::MAX));
+        }
+        if at == total {
+            self.placed = Some(csr);
         }
     }
 
@@ -45,8 +82,8 @@ impl Envelope {
     }
 
     pub fn lane(&self, at: usize, source: usize) -> Result<LanePorts<'_>> {
-        let rows = match &self.qo_indptr {
-            Some(csr) if self.owns_slots() && csr.len() >= 2 => {
+        let rows = match self.csr() {
+            Some(csr) => {
                 let (Some(&start), Some(&end)) = (csr.get(at), csr.get(at + 1)) else {
                     return Err(PortError(format!(
                         "lane {source} is lane {at} of its instance, whose \
@@ -75,11 +112,9 @@ impl Envelope {
     }
 
     fn spanned(&self) -> usize {
-        match &self.qo_indptr {
-            Some(csr) if self.owns_slots() && csr.len() >= 2 => {
-                csr.last().copied().unwrap_or(0) as usize
-            }
-            _ => self.tokens.as_ref().map_or(0, Vec::len),
+        match self.csr() {
+            Some(csr) => csr.last().copied().unwrap_or(0) as usize,
+            None => self.tokens.as_ref().map_or(0, Vec::len),
         }
     }
 }
@@ -319,6 +354,7 @@ mod tests {
         positions_are_checked_against_the_seat_only_where_the_seat_owns_the_slots();
         a_slot_run_that_disagrees_with_the_rows_is_refused_by_both_numbers();
         one_instances_flat_vectors_cut_into_its_lanes_by_the_token_csr();
+        a_decode_envelope_is_cut_where_the_fire_placed_its_lanes();
         a_row_is_roped_at_its_slot_unless_the_program_says_otherwise();
         a_decode_envelope_resolves_its_tokens_and_not_where_they_land();
     }
@@ -423,6 +459,32 @@ mod tests {
                 "lane {at} keeps its own prefix"
             );
         }
+    }
+
+    fn a_decode_envelope_is_cut_where_the_fire_placed_its_lanes() {
+        let mut envelope = Envelope {
+            tokens: Some(vec![11, 22, 33]),
+            mask: Some(vec![
+                true, false, false, false, true, true, false, false, true, true, true, false,
+            ]),
+            ..Envelope::default()
+        };
+        assert_eq!(envelope.lanes(), 1, "uncut, one lane spans every row");
+        envelope.cut_by_lanes([1, 1, 1, 4]);
+        assert_eq!(envelope.lanes(), 3, "the lanes past its rows are another's");
+        for (at, token) in [11u32, 22, 33].into_iter().enumerate() {
+            let lane = envelope.lane(at, at).expect("the cut describes it");
+            assert_eq!(lane.tokens_for(1).expect("one row"), &[token]);
+            let (cells, stride) = lane.mask(1).expect("a rectangle").expect("bound");
+            assert_eq!((cells.len(), stride), (4, 4));
+            assert_eq!(cells.iter().filter(|kept| **kept).count(), at + 1);
+        }
+        let mut short = Envelope {
+            tokens: Some(vec![11, 22, 33]),
+            ..Envelope::default()
+        };
+        short.cut_by_lanes([1, 1]);
+        assert_eq!(short.lanes(), 1, "lanes that do not cover its rows cut nothing");
     }
 
     fn a_row_is_roped_at_its_slot_unless_the_program_says_otherwise() {
