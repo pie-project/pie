@@ -31,6 +31,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use crate::elemwise::skeleton::{Cache, Store};
 use dtype::Dtype;
 pub use kernels_ir::anchor::{
     Anchored, CacheDtype, CachePlane, Contraction, Gain, Input, Layout, Paged, Pointwise, Quant,
@@ -677,30 +678,20 @@ impl Epilogue {
         words.extend(outs);
         let windows: Vec<Window> = (0..outs.len()).map(|k| self.window(k, n)).collect();
         words.extend(windows.iter().map(|w| u64::from(w.width)));
-        words.extend(windows.iter().map(|w| u64::from(w.from)));
-        words.extend(windows.iter().map(|w| u64::from(w.end())));
-        words.extend(windows.iter().map(|w| u64::from(w.head)));
-        words.extend(windows.iter().map(|w| u64::from(w.stride)));
         words.push(u64::from(self.norm.map_or(0, |norm| norm.eps.to_bits())));
-        // Each result's paging: its page and slot inputs, its cache's element.
-        let paged: Vec<Option<Paged>> = (0..outs.len()).map(|k| self.paged(k)).collect();
-        let index = |at: u32| u64::from(at);
-        words.extend(paged.iter().map(|p| p.map_or(u64::MAX, |p| index(p.page))));
-        words.extend(paged.iter().map(|p| p.map_or(u64::MAX, |p| index(p.slot))));
-        words.extend(
-            paged
-                .iter()
-                .map(|p| u64::from(matches!(p, Some(Paged { dtype: CacheDtype::E4m3 { .. }, .. })))),
-        );
-        words.extend(paged.iter().map(|p| match p {
-            Some(Paged {
-                dtype: CacheDtype::E4m3 { scale },
-                ..
-            }) => u64::from(scale.to_bits()),
-            _ => u64::from(1f32.to_bits()),
-        }));
-        words.push(paging.map_or(0, |p| p.valid));
-        words.push(u64::from(paging.map_or(0, |p| p.page_size)));
+        // Each result's store: its window, and a paged one's cache row.
+        for (k, w) in windows.iter().enumerate() {
+            let cache = self.paged(k).zip(paging).map(|(p, paging)| Cache {
+                base: 0,
+                width: 0,
+                page: ins[p.page as usize].base,
+                slot: ins[p.slot as usize].base,
+                valid: paging.valid,
+                page_size: paging.page_size,
+                e4m3: if let CacheDtype::E4m3 { scale } = p.dtype { Some(scale) } else { None },
+            });
+            words.extend(Store::of(*w, cache.as_ref()).words());
+        }
         Ok(words)
     }
 
@@ -1526,11 +1517,11 @@ mod tests {
         assert!(bias.planes(&[], &[128], 8, None).is_err());
         let words = bias.planes(&[In::column(64)], &[128], 8, None).expect("a bias");
         // One input (its base, strides, dtype and period), one unread, one
-        // result, its row's stride, its window's columns, head and stride,
-        // the norm's eps (none), then its paging (none).
+        // result, its row's stride, the norm's eps (none), then its store:
+        // no cache row, its window's columns 0..8, a unit scale.
         assert_eq!(words, vec![
-                64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0, 8, 0, 0, 0,
-                u64::MAX, u64::MAX, 0, 0x3f80_0000, 0, 0
+                64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0,
+                0, 0, 0, 8 << 32, 0, 0x3f80_0000, 0
             ]);
         // A row's norm scale is no plane: its input carries none.
         assert_eq!(In::norm().kind(), Input::Norm);

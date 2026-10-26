@@ -30,6 +30,7 @@
 #include "prim/device.cuh"
 #include "prim/mma_sm80.cuh"
 #include "prim/smem.cuh"
+#include "prim/store.cuh"
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
 #include <cuda_fp8.h>
@@ -59,34 +60,19 @@ __device__ __forceinline__ float epi_ld(const EpiIn& in, long long row, long lon
     return bf16_to_f32(in.base[at]);
 }
 
-// An epilogue's IN inputs and OUT results, result `k` the columns `from[k]`
-// to `to[k]` of the product tile (all of them, or a split's piece) in a bf16
-// plane `ld[k]` apart a row, its column `from[k]` the plane's first. One
-// input past IN, unread, so a body of none is a struct still.
+// An epilogue's IN inputs and OUT results, result `k` landing where
+// `store[k]` says (its window of the product tile's columns, or a paged
+// cache's row) in a plane `ld[k]` apart a row. One input past IN, unread, so
+// a body of none is a struct still.
 template <int IN, int OUT>
 struct Epi {
     EpiIn in[IN + 1];
     bf16* out[OUT];
     long long ld[OUT];
-    long long from[OUT];
-    long long to[OUT];
-    // A head-major window's head and stride (0: the window is whole): `head`
-    // columns of every `stride` from `from`, landed one head after another.
-    long long head[OUT];
-    long long stride[OUT];
     // A normed operand's `eps` (an f32's bits): its row's scale
     // `rsqrt(Σ a² / K + eps)`, where the skeleton norms (`NORM`).
     long long eps;
-    // A paged result's page and slot inputs (-1: not paged): its rows land
-    // at the cache row `page * page_size + slot` (none where the slot lies
-    // past the page or `valid[row]` is 0), as e4m3 where `e4m3` (each
-    // element `e4m3(x / scale)`, the scale an f32's bits).
-    long long page[OUT];
-    long long slot[OUT];
-    long long e4m3[OUT];
-    long long scale[OUT];
-    const unsigned char* valid;
-    long long page_size;
+    Store store[OUT];
 };
 
 // The scale of an operand row whose squares sum to `ss` over `K`.
@@ -158,68 +144,31 @@ struct TileHook {
 
     __device__ __forceinline__ float round_bf16(float v) const { return bf16_to_f32(f32_to_bf16(v)); }
 
-    // Paged result `K`'s elements of its window to its cache row.
-    template <int K>
-    __device__ __forceinline__ void flush_paged() {
-        const long long from = epi.from[K];
-        const long long to = epi.to[K];
-        const int page = static_cast<int>(epi_ld(epi.in[epi.page[K]], row, 0));
-        const int slot = static_cast<int>(epi_ld(epi.in[epi.slot[K]], row, 0));
-        if (slot < 0 || slot >= epi.page_size || page < 0) return;
-        if (epi.valid != nullptr && epi.valid[row] == 0) return;
-        const long long cell = static_cast<long long>(page) * epi.page_size + slot;
-        const long long at = cell * epi.ld[K] + (col_ - from);
-        const bool fp8 = epi.e4m3[K] != 0;
-        const float scale = __int_as_float(static_cast<int>(epi.scale[K]));
-#pragma unroll
-        for (int e = 0; e < kN; ++e) {
-            const long long c = col_ + e;
-            if (!valid(e) || c < from || c >= to) continue;
-            if (fp8) {
-                reinterpret_cast<__nv_fp8_e4m3*>(epi.out[K])[at + e] =
-                    __nv_fp8_e4m3(bf16_to_f32(res[K][e]) / scale);
-            } else {
-                epi.out[K][at + e] = res[K][e];
-            }
-        }
-    }
-
-    // Result `K`'s elements of its window to memory: whole vectors of 8
-    // where the skeleton holds them (its columns, windows and `ld` whole
-    // eights, its planes 16-byte aligned), else one by one.
+    // Result `K`'s elements of its window to its plane's row or its cache
+    // row: whole vectors of 8 where the skeleton holds them (its columns,
+    // windows and `ld` whole eights, its planes 16-byte aligned), else one
+    // by one.
     template <int K>
     __device__ __forceinline__ void flush() {
-        const long long from = epi.from[K];
-        const long long to = epi.to[K];
-        if (epi.page[K] >= 0) {
-            flush_paged<K>();
-            return;
+        const Store& s = epi.store[K];
+        long long base = row;
+        if (s.page != nullptr) {
+            base = store_cell(s, row);
+            if (base < 0) return;
         }
-        bf16* plane = epi.out[K] + row * epi.ld[K];
-        const long long head = epi.head[K];
-        const long long stride = epi.stride[K];
-        // the plane column tile column `c` lands at, or -1: past its window
-        auto landed = [&](long long c) -> long long {
-            if (c < from || c >= to) return -1;
-            if (head == 0) return c - from;
-            const long long at = c - from;
-            const long long j = at % stride;
-            return j < head ? at / stride * head + j : -1;
-        };
+        base *= epi.ld[K];
         if constexpr (kN % 8 == 0) {
 #pragma unroll
             for (int v = 0; v < kN / 8; ++v) {
                 const long long c = col_ + v * 8;
-                const long long at = c < width ? landed(c) : -1;
-                if (at >= 0) {
-                    *reinterpret_cast<uint4*>(plane + at) = *reinterpret_cast<const uint4*>(&res[K][v * 8]);
-                }
+                const long long at = c < width ? store_at(s, c, s.to) : -1;
+                if (at >= 0) store8(epi.out[K], base + at, *reinterpret_cast<const uint4*>(&res[K][v * 8]), s);
             }
         } else {
 #pragma unroll
             for (int e = 0; e < kN; ++e) {
-                const long long at = valid(e) ? landed(col_ + e) : -1;
-                if (at >= 0) plane[at] = res[K][e];
+                const long long at = valid(e) ? store_at(s, col_ + e, s.to) : -1;
+                if (at >= 0) store1(epi.out[K], base + at, res[K][e], s);
             }
         }
     }
