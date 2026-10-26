@@ -539,14 +539,6 @@ struct ForwardInner {
 }
 
 impl ForwardPass {
-    fn binds_device_mask(&self) -> bool {
-        self.inner
-            .borrow()
-            .ports
-            .iter()
-            .any(|(port, _)| *port == Port::AttnMask)
-    }
-
     /// Whether a switch is off its model's default; such a pass posts one fire at a time.
     fn switched(&self) -> bool {
         let inner = self.inner.borrow();
@@ -992,8 +984,10 @@ pub async fn run_ahead(
     if budget == 0 {
         return Ok(0);
     }
-    // A recurrent state, an off-default path and a ring all post one pass at a time.
-    let r = if pass.binds_device_mask() || crate::model::rs_state_size() > 0 || pass.switched() {
+    // A recurrent state and an off-default path post one pass at a time. A
+    // mask fills the frame: the runtime advances the pass's host shadow fire
+    // by fire, so a later slot reads the mask its predecessor's epilogue put.
+    let r = if crate::model::rs_state_size() > 0 || pass.switched() {
         1
     } else {
         frame_size()
