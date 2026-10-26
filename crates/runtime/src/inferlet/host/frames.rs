@@ -76,13 +76,23 @@ impl Frames {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        let (rgb, width, height) = still::decode(bytes)?;
+        if bytes.get(4..8) == Some(b"ftyp") {
+            return Err("mp4 is not decoded; convert it: \
+                        ffmpeg -i in.mp4 -pix_fmt yuv420p in.y4m"
+                .to_string());
+        }
+        let (rgb, width, height, count, fps) = if bytes.starts_with(b"YUV4MPEG2 ") {
+            y4m::decode(bytes)?
+        } else {
+            let (rgb, width, height) = still::decode(bytes)?;
+            (rgb, width, height, 1, 0.0)
+        };
         Ok(Frames {
             store: FrameStore::Host(rgb),
             width,
             height,
-            count: 1,
-            fps: 0.0,
+            count,
+            fps,
         })
     }
 
