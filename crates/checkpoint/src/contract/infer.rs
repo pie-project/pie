@@ -5,7 +5,8 @@ use crate::types::{
 
 use super::compile;
 use super::{
-    BiasBy, Expr, Partition, ScaleFactor, TensorType, UnaryOp, local_range, resolve_extents,
+    AxisLeg, BiasBy, Expr, Partition, ScaleFactor, TensorType, UnaryOp, local_range,
+    resolve_extents,
 };
 
 pub trait CheckpointTypes {
@@ -109,6 +110,43 @@ impl<'a> Resolver<'a> {
         let ty = self.infer(expr, what);
         self.scope.partition = partition;
         ty
+    }
+
+    pub fn infer_composite_legs(
+        &mut self,
+        expr: &Expr,
+        axis: Axis,
+        what: &str,
+    ) -> Result<Vec<AxisLeg>, Error> {
+        match expr {
+            Expr::Concat {
+                axis: concat_axis,
+                parts,
+            } if *concat_axis == axis => {
+                let mut legs = Vec::with_capacity(parts.len());
+                for part in parts {
+                    legs.extend(self.infer_composite_legs(part, axis, what)?);
+                }
+                Ok(legs)
+            }
+            Expr::Shard {
+                src,
+                axis: shard_axis,
+                replicas,
+            } if *shard_axis == axis => {
+                let ty = self.infer_whole(src, what)?;
+                let idx = axis_index(axis, ty.rank(), what)?;
+                Ok(vec![AxisLeg::new(ty.shape[idx], *replicas)])
+            }
+            other => {
+                let ty = self.infer_whole(other, what)?;
+                let idx = axis_index(axis, ty.rank(), what)?;
+                Ok(vec![AxisLeg::new(
+                    ty.shape[idx],
+                    self.scope.partition.world.max(1),
+                )])
+            }
+        }
     }
 
     pub fn specialize(&mut self, expr: Expr, what: &str) -> Result<Expr, Error> {
@@ -271,6 +309,31 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
             axis,
             replicas,
         } => {
+            if let Expr::Concat {
+                axis: concat_axis,
+                parts,
+            } = src.as_ref()
+                && concat_axis == axis
+            {
+                let mut part_extents = Vec::with_capacity(parts.len());
+                let mut any_sharded = false;
+                for part in parts {
+                    any_sharded |= part.is_sharded();
+                    let p_ty = infer(part, scope)?;
+                    let idx = axis_index(*axis, p_ty.rank(), &scope.what)?;
+                    part_extents.push(p_ty.shape[idx]);
+                }
+                let heterogeneous = part_extents
+                    .first()
+                    .is_some_and(|&first| part_extents.iter().any(|&ext| ext != first));
+                if any_sharded || heterogeneous {
+                    return Err(Error::Contract(format!(
+                        "'{}': flat Shard along axis {} cannot slice across composite Concat legs {:?}; \
+                         shard each leg with its own replication factor prior to Concat",
+                        scope.what, axis.0, part_extents
+                    )));
+                }
+            }
             let ty = infer(src, scope)?;
             let partition = scope.partition.grouped(*replicas)?;
             let (start, len) = shard_range(&ty, *axis, partition, &scope.what)?;
