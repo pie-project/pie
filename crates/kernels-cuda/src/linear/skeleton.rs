@@ -421,7 +421,17 @@ impl Epilogue {
         let plain = anchored.epilogue.is_none();
         let root = unit(&body)?;
         let windows = anchored.windows.clone();
-        if windows.iter().any(|w| w.from % 8 != 0 || w.width % 8 != 0) {
+        let eights = |w: &Window| {
+            w.from % 8 == 0 && w.width % 8 == 0 && w.head % 8 == 0 && w.stride % 8 == 0
+        };
+        let strided_paged = windows
+            .iter()
+            .zip(&anchored.paged)
+            .any(|(w, p)| !w.whole() && p.is_some());
+        if strided_paged {
+            return Err(refuse(OP, "a paged result lands a whole window of its row"));
+        }
+        if !windows.iter().all(eights) {
             return Err(refuse(
                 OP,
                 "a result's window is no whole run of eight columns, and the skeletons store \
@@ -552,7 +562,7 @@ impl Epilogue {
         self.windows
             .get(k)
             .copied()
-            .unwrap_or(Window { from: 0, width: n })
+            .unwrap_or(Window::of(0, n))
     }
 
     /// Whether it serves a tile of `n` columns: any, or the one its body is
@@ -668,7 +678,9 @@ impl Epilogue {
         let windows: Vec<Window> = (0..outs.len()).map(|k| self.window(k, n)).collect();
         words.extend(windows.iter().map(|w| u64::from(w.width)));
         words.extend(windows.iter().map(|w| u64::from(w.from)));
-        words.extend(windows.iter().map(|w| u64::from(w.from + w.width)));
+        words.extend(windows.iter().map(|w| u64::from(w.end())));
+        words.extend(windows.iter().map(|w| u64::from(w.head)));
+        words.extend(windows.iter().map(|w| u64::from(w.stride)));
         words.push(u64::from(self.norm.map_or(0, |norm| norm.eps.to_bits())));
         // Each result's paging: its page and slot inputs, its cache's element.
         let paged: Vec<Option<Paged>> = (0..outs.len()).map(|k| self.paged(k)).collect();
@@ -773,8 +785,14 @@ impl Epilogue {
         // whole groups of the span; each slice computes every result and
         // lands the part of each result's window it holds.
         let span = self.span.max(1);
+        // a slice whole groups of the span, and whole strides of every
+        // head-major window (each slice lands whole heads of it)
+        let strides = (0..self.results)
+            .map(|k| self.window(k, n))
+            .filter(|w| !w.whole())
+            .fold(span, |all, w| lcm(all, w.stride));
         let slices = (n.div_ceil(MAX_WIDTH)..=n / 8).find(|c| {
-            n.is_multiple_of(*c) && (n / c).is_multiple_of(8) && (n / c).is_multiple_of(span)
+            n.is_multiple_of(*c) && (n / c).is_multiple_of(8) && (n / c).is_multiple_of(strides)
         })?;
         let width = n / slices;
         let mut shaped = Vec::with_capacity(slices as usize);
@@ -783,6 +801,25 @@ impl Epilogue {
             let outs: Vec<Land> = (0..self.results)
                 .filter_map(|k| {
                     let w = self.window(k, n);
+                    if !w.whole() {
+                        // the heads of a head-major window the piece holds
+                        // whole: from the first starting in it
+                        let heads = w.width / w.head;
+                        let first = (0..heads).find(|h| w.from + h * w.stride >= from)?;
+                        let last = (first..heads)
+                            .take_while(|h| w.from + h * w.stride + w.head <= from + width)
+                            .last()?;
+                        let start = w.from + first * w.stride;
+                        return Some(Land {
+                            k,
+                            from: start - from,
+                            to: w.from + last * w.stride + w.head - from,
+                            at: first * w.head,
+                            ld: w.width,
+                            head: w.head,
+                            stride: w.stride,
+                        });
+                    }
                     let (lo, hi) = (w.from.max(from), (w.from + w.width).min(from + width));
                     (lo < hi).then_some(Land {
                         k,
@@ -790,9 +827,22 @@ impl Epilogue {
                         to: hi - from,
                         at: lo - w.from,
                         ld: w.width,
+                        head: 0,
+                        stride: 0,
                     })
                 })
                 .collect();
+            // no head of a head-major window straddles the piece's edges
+            if (0..self.results).any(|k| {
+                let w = self.window(k, n);
+                !w.whole()
+                    && (0..w.width / w.head).any(|h| {
+                        let start = w.from + h * w.stride;
+                        start < from + width && start + w.head > from + width
+                    })
+            }) {
+                return None;
+            }
             if outs.is_empty() {
                 continue;
             }
@@ -865,6 +915,13 @@ pub fn serves(anchored: &Anchored, ins: &[Dtype], outs: &[Dtype]) -> Result<(), 
     Ok(())
 }
 
+const fn lcm(a: u32, b: u32) -> u32 {
+    const fn gcd(a: u32, b: u32) -> u32 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    a / gcd(a, b) * b
+}
+
 /// The planes `anchored`'s epilogue reads: one an input but a row's norm
 /// scale, the contraction's own.
 fn planes_of(anchored: &Anchored) -> usize {
@@ -902,6 +959,9 @@ struct Land {
     to: u32,
     at: u32,
     ld: u32,
+    /// A head-major window's head and stride (0: whole).
+    head: u32,
+    stride: u32,
 }
 
 /// `region` over the `width` columns from `from` on, as a row of its own,
@@ -1287,6 +1347,21 @@ impl RowLeg {
             for land in &piece.outs {
                 let width = land.to - land.from;
                 results.push(match epi.paged(land.k) {
+                    None if land.head > 0 => {
+                        let heads = (land.to - land.from - land.head) / land.stride + 1;
+                        Plane::window_strided(
+                            &Tensor::new(
+                                outs[land.k] + u64::from(land.at) * 2,
+                                m,
+                                land.ld,
+                                Dtype::Bf16,
+                            ),
+                            land.from,
+                            heads * land.head,
+                            land.head,
+                            land.stride,
+                        )
+                    }
                     None => Plane::window(
                         &Tensor::new(outs[land.k] + u64::from(land.at) * 2, m, land.ld, Dtype::Bf16),
                         land.from,
@@ -1426,10 +1501,10 @@ mod tests {
         assert!(bias.planes(&[], &[128], 8, None).is_err());
         let words = bias.planes(&[In::column(64)], &[128], 8, None).expect("a bias");
         // One input (its base, strides, dtype and period), one unread, one
-        // result, its row's stride and its window's columns, then the norm's
-        // eps (none).
+        // result, its row's stride, its window's columns, head and stride,
+        // the norm's eps (none), then its paging (none).
         assert_eq!(words, vec![
-                64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0, 8, 0,
+                64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0, 8, 0, 0, 0,
                 u64::MAX, u64::MAX, 0, 0x3f80_0000, 0, 0
             ]);
         // A row's norm scale is no plane: its input carries none.

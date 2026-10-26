@@ -34,6 +34,9 @@ struct Store {
     int page_size;
     int e4m3;
     float scale;
+    // a head-major window's head and stride, in vectors (0: whole)
+    int head;
+    int stride;
     int unused;
 };
 
@@ -129,6 +132,8 @@ struct RowSkeleton {
     // paged row past its page, or not live, does not).
     int from[OUT];
     int to[OUT];
+    int head[OUT];
+    int stride[OUT];
     bool lands[OUT];
     bool e4m3[OUT];
     float scale[OUT];
@@ -174,6 +179,8 @@ struct RowSkeleton {
         for (int k = 0; k < OUT; ++k) {
             const Store& store = planes.store[k];
             from[k] = store.from;
+            head[k] = store.head;
+            stride[k] = store.stride;
             to[k] = store.to > 0 ? store.to : planes.width / 8;
             e4m3[k] = store.e4m3 != 0;
             scale[k] = store.scale;
@@ -470,15 +477,22 @@ struct RowSkeleton {
             const int slot = lane + p * LANES;
             const int i = static_cast<int>(at[p]);
             if (slot >= vectors || i < from[K] || i >= to[K]) continue;
+            // the vector the window lands it at: a head's of every stride
+            int dst_at = i - from[K];
+            if (head[K] > 0) {
+                const int j = dst_at % stride[K];
+                if (j >= head[K]) continue;
+                dst_at = dst_at / stride[K] * head[K] + j;
+            }
             if (e4m3[K]) {
                 // the bf16 the result holds, each element to e4m3
                 const bf16* held = reinterpret_cast<const bf16*>(&out[K][p]);
                 __align__(8) __nv_fp8_e4m3 q[8];
 #pragma unroll
                 for (int e = 0; e < 8; ++e) q[e] = __nv_fp8_e4m3(bf16_to_f32(held[e]) / scale[K]);
-                reinterpret_cast<uint2*>(dst[K])[i - from[K]] = *reinterpret_cast<const uint2*>(q);
+                reinterpret_cast<uint2*>(dst[K])[dst_at] = *reinterpret_cast<const uint2*>(q);
             } else {
-                dst[K][i - from[K]] = out[K][p];
+                dst[K][dst_at] = out[K][p];
             }
         }
     }

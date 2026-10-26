@@ -56,6 +56,9 @@ pub struct Store {
     page_size: u32,
     e4m3: bool,
     scale: f32,
+    /// A head-major window's head and stride, in vectors (0: whole).
+    head: u32,
+    stride: u32,
 }
 
 impl Store {
@@ -68,17 +71,20 @@ impl Store {
         page_size: 0,
         e4m3: false,
         scale: 1.0,
+        head: 0,
+        stride: 0,
     };
 
     /// Its words, as `fire` passes them.
-    fn words(self) -> [u64; 6] {
+    fn words(self) -> [u64; 7] {
         [
             self.page,
             self.slot,
             self.valid,
             u64::from(self.from) | u64::from(self.to) << 32,
             u64::from(self.page_size) | u64::from(u32::from(self.e4m3)) << 32,
-            u64::from(self.scale.to_bits()),
+            u64::from(self.scale.to_bits()) | u64::from(self.head) << 32,
+            u64::from(self.stride),
         ]
     }
 }
@@ -179,6 +185,24 @@ impl Plane {
         }
     }
 
+    /// A result landing `head` columns of every `stride` from `from` of
+    /// each of its rows (a head-major slice: Qwen 3.5's q, interleaved with
+    /// its gate a head), `width` of them in `t`, one head after another.
+    #[must_use]
+    pub fn window_strided(t: &Tensor, from: u32, width: u32, head: u32, stride: u32) -> Self {
+        let heads = width / head.max(1);
+        Self {
+            store: Store {
+                from: from / VEC_WIDTH,
+                to: (from + heads.saturating_sub(1) * stride + head) / VEC_WIDTH,
+                head: head / VEC_WIDTH,
+                stride: stride / VEC_WIDTH,
+                ..Store::WHOLE
+            },
+            ..Self::rows(t)
+        }
+    }
+
     /// A result landing the columns `from..from + width` of each row in
     /// `cache`'s row its page and slot name.
     #[must_use]
@@ -198,6 +222,8 @@ impl Plane {
                 page_size: cache.page_size,
                 e4m3: cache.e4m3.is_some(),
                 scale: cache.e4m3.unwrap_or(1.0),
+                head: 0,
+                stride: 0,
             },
         }
     }

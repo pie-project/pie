@@ -177,6 +177,7 @@ impl Case {
             theta: self.theta,
             inverse: false,
             ramp,
+            mscale: None,
         }
     }
 

@@ -668,6 +668,7 @@ mod tests {
             theta: 1e6,
             inverse: false,
             ramp: None,
+            mscale: None,
         };
         let out = b.rotate(y, 2, &turn);
         Region {

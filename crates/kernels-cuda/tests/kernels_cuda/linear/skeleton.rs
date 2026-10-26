@@ -604,6 +604,7 @@ fn qkv(q_heads: usize, kv_heads: usize, hd: usize, k: usize, normed: bool) -> An
         theta: 1_000_000.0,
         inverse: false,
         ramp: None,
+    mscale: None,
     };
     let turned = b.rotate(x, pos, &turn);
     let mut rounds = vec![(turned, Bf16)];
@@ -629,18 +630,9 @@ fn qkv(q_heads: usize, kv_heads: usize, hd: usize, k: usize, normed: bool) -> An
             inputs,
         }),
         windows: vec![
-            Window {
-                from: 0,
-                width: q as u32,
-            },
-            Window {
-                from: q as u32,
-                width: kv as u32,
-            },
-            Window {
-                from: (q + kv) as u32,
-                width: kv as u32,
-            },
+            Window::of(0, q as u32),
+            Window::of(q as u32, kv as u32),
+            Window::of((q + kv) as u32, kv as u32),
         ],
         ..Anchored::plain(contraction(n, k, Layout::Dense, None))
     }
@@ -1049,6 +1041,7 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
             theta: 10000.0,
             inverse: false,
             ramp: None,
+        mscale: None,
         };
         let turned = b.rotate(0, 1, &turn);
         let paged = |plane| {
@@ -1071,18 +1064,9 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
                 inputs: vec![Input::Row, Input::Row, Input::Row],
             }),
             windows: vec![
-                Window {
-                    from: 0,
-                    width: q as u32,
-                },
-                Window {
-                    from: q as u32,
-                    width: kv as u32,
-                },
-                Window {
-                    from: (q + kv) as u32,
-                    width: kv as u32,
-                },
+                Window::of(0, q as u32),
+                Window::of(q as u32, kv as u32),
+                Window::of((q + kv) as u32, kv as u32),
             ],
             paged: vec![None, paged(CachePlane::Keys), paged(CachePlane::Values)],
             ..Anchored::plain(contraction(n, k, Layout::Dense, None))
@@ -1223,5 +1207,82 @@ fn e4m3_of(byte: u8) -> f32 {
         mantissa * 2f32.powi(-9)
     } else {
         (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
+    }
+}
+
+/// Two head-major windows of one product (Qwen 3.5's q and gate, a head of
+/// each interleaved): each result lands a head of every two, one head after
+/// another, on the skinny skeleton, through the tuner's entry (the leg past
+/// its rows), and on a leg whose row is cut into slices, each slice landing
+/// the whole heads it holds.
+#[test]
+fn a_head_major_window_lands_a_head_of_every_stride() {
+    use kernels_ir::anchor::Window;
+    for (rows, d, n, through) in [
+        (5usize, 64usize, 256usize, false),
+        (5, 64, 256, true),
+        (100, 64, 256, true),
+        (100, 256, 18_432, true),
+    ] {
+        let k = 256usize;
+        let half = n / 2;
+        let anchored = Anchored {
+            epilogue: Some(Pointwise {
+                region: Region {
+                    width: n as u32,
+                    params: vec![Shape::Row],
+                    ops: vec![],
+                    results: vec![0, 0],
+                    rounds: vec![],
+                },
+                inputs: vec![],
+            }),
+            windows: vec![
+                Window::strided(0, half as u32, d as u32, 2 * d as u32),
+                Window::strided(d as u32, half as u32, d as u32, 2 * d as u32),
+            ],
+            ..Anchored::plain(contraction(n, k, Layout::Dense, None))
+        };
+        assert_eq!(anchored.verify(), Ok(()));
+        let what = format!("{rows}x{n}, heads {d}, through the tuner {through}");
+        let epi = Epilogue::interned(&anchored).expect("the skeletons take it");
+        let mut gpu = Gpu::open();
+        let mut lcg = Lcg::seeded(rows as u64 + n as u64);
+        let ((wr, wv), (ar, av)) = (lcg.row(n * k), lcg.row(rows * k));
+        let (w, act) = (gpu.up(&wr), gpu.up(&ar));
+        let outs = [gpu.zeros(rows * half * 2), gpu.zeros(rows * half * 2)];
+        let ctx = gpu.ctx();
+        for _ in 0..2 {
+            if through {
+                let landed = [t(outs[0], rows, half, Bf16), t(outs[1], rows, half, Bf16)];
+                let served = gemm::anchored(
+                    &ctx,
+                    "test.strided",
+                    epi,
+                    t(act, rows, k, Bf16),
+                    t(w, n, k, Bf16),
+                    &[],
+                    &landed,
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                assert!(served, "{what}");
+            } else {
+                Skeleton::Skinny
+                    .fire(&ctx, epi, w, act, &[], &outs, None, rows as i32, n as i32, k as i32)
+                    .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            }
+        }
+        gpu.sync();
+        let want = eval(&anchored, rows, &av, &wv, &[], &[]).expect("runs");
+        for (r, &at) in outs.iter().enumerate() {
+            let want: Vec<f32> = want[r].iter().map(|&v| round_bf16(v)).collect();
+            assert_within(
+                &format!("{what}: result {r}"),
+                &gpu.down::<u16>(at, rows * half),
+                &want,
+                PRODUCT,
+            );
+        }
     }
 }

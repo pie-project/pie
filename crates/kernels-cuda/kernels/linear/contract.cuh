@@ -70,6 +70,10 @@ struct Epi {
     long long ld[OUT];
     long long from[OUT];
     long long to[OUT];
+    // A head-major window's head and stride (0: the window is whole): `head`
+    // columns of every `stride` from `from`, landed one head after another.
+    long long head[OUT];
+    long long stride[OUT];
     // A normed operand's `eps` (an f32's bits): its row's scale
     // `rsqrt(Σ a² / K + eps)`, where the skeleton norms (`NORM`).
     long long eps;
@@ -191,20 +195,31 @@ struct TileHook {
             flush_paged<K>();
             return;
         }
-        bf16* dst = epi.out[K] + row * epi.ld[K] + (col_ - from);
+        bf16* plane = epi.out[K] + row * epi.ld[K];
+        const long long head = epi.head[K];
+        const long long stride = epi.stride[K];
+        // the plane column tile column `c` lands at, or -1: past its window
+        auto landed = [&](long long c) -> long long {
+            if (c < from || c >= to) return -1;
+            if (head == 0) return c - from;
+            const long long at = c - from;
+            const long long j = at % stride;
+            return j < head ? at / stride * head + j : -1;
+        };
         if constexpr (kN % 8 == 0) {
 #pragma unroll
             for (int v = 0; v < kN / 8; ++v) {
                 const long long c = col_ + v * 8;
-                if (c < width && c >= from && c < to) {
-                    *reinterpret_cast<uint4*>(dst + v * 8) = *reinterpret_cast<const uint4*>(&res[K][v * 8]);
+                const long long at = c < width ? landed(c) : -1;
+                if (at >= 0) {
+                    *reinterpret_cast<uint4*>(plane + at) = *reinterpret_cast<const uint4*>(&res[K][v * 8]);
                 }
             }
         } else {
 #pragma unroll
             for (int e = 0; e < kN; ++e) {
-                const long long c = col_ + e;
-                if (valid(e) && c >= from && c < to) dst[e] = res[K][e];
+                const long long at = valid(e) ? landed(col_ + e) : -1;
+                if (at >= 0) plane[at] = res[K][e];
             }
         }
     }
