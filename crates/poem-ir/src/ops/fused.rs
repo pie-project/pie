@@ -759,7 +759,10 @@ pub enum Fused {
     /// rows (an RMS norm rewritten as a scale of each row's products), `act`
     /// is the norm's input and `gain` its weight, which a load folds into
     /// `w` once, in place, as the region declares (kernels-ir's
-    /// `fold_bank`): `w` read by this op alone.
+    /// `fold_bank`): `w` read by this op alone. Where the region lands a
+    /// result in a paged cache (kernels-ir's `Paged`: a key or a value row
+    /// written at its page and slot, the slot mapping among `ins`), `cache`
+    /// is that cache and the result names no value of `outs`.
     Anchored {
         #[input]
         act: ValueId,
@@ -773,6 +776,26 @@ pub enum Fused {
         #[serde(default)]
         #[input]
         gain: Option<ValueId>,
+        #[serde(default)]
+        #[input(CACHE)]
+        cache: Option<ValueId>,
+    },
+    /// An anchored region's epilogue over a product its own op landed
+    /// (`y`: a quantized bank's, a projection's half), formed by the compiler
+    /// where no contraction skeleton holds the product (poem-compiler's
+    /// `fuse::anchor`): the epilogue at each `(m, n)` of `y`'s rows, as
+    /// stored, `ins` and `outs` and `cache` as [`Fused::Anchored`]'s, `key`
+    /// the anchored region whose epilogue it is.
+    Epilogue {
+        #[input]
+        y: ValueId,
+        #[input]
+        ins: Vec<ValueId>,
+        key: u64,
+        #[output]
+        outs: Vec<ValueId>,
+        #[input(CACHE)]
+        cache: Option<ValueId>,
     },
 }
 
@@ -941,6 +964,7 @@ mod tests {
             key: 0x5eed,
             outs: vec![v(4)],
             gain: None,
+            cache: None,
         };
         assert_eq!(operands(&anchored), (vec![1, 2, 3], vec![4], vec![]));
         let normed = Fused::Anchored {
@@ -950,6 +974,7 @@ mod tests {
             key: 0x5eed,
             outs: vec![v(4)],
             gain: Some(v(5)),
+            cache: None,
         };
         assert_eq!(operands(&normed), (vec![1, 2, 3, 5], vec![4], vec![]));
         assert_eq!(anchored.name(), "fused.anchored");
