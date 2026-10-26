@@ -357,6 +357,7 @@ impl Run<'_> {
                 ins,
                 key,
                 outs,
+                ..
             } => self.anchored(*act, *w, ins, *key, outs),
             _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }
@@ -385,11 +386,20 @@ impl Run<'_> {
                 w.0
             )));
         }
-        let planes: Vec<linear::skeleton::In> = ins
+        // Each input's plane, the op's values in order; a normed operand's
+        // row scale (no value) the contraction's own.
+        let mut values = ins.iter();
+        let planes: Vec<linear::skeleton::In> = epi
+            .inputs()
             .iter()
-            .zip(epi.inputs())
-            .map(|(&v, input)| {
+            .map(|input| {
                 use linear::skeleton::{In, Input};
+                if *input == Input::Norm {
+                    return Ok(In::norm());
+                }
+                let v = *values.next().ok_or_else(|| {
+                    broken("the op reads fewer values than its epilogue's inputs".into())
+                })?;
                 let t = self.tensor(v);
                 let plane = match *input {
                     Input::Tile => In::tile(t.ptr, t.width),
@@ -397,15 +407,16 @@ impl Run<'_> {
                     Input::Head(size) => In::head(t.ptr, size),
                     Input::Row => In::row(t.ptr),
                     Input::One => In::one(t.ptr),
+                    Input::Norm => unreachable!("taken above"),
                 };
                 // a row's position is stored i32
-                if t.dtype == Dtype::I32 {
+                Ok(if t.dtype == Dtype::I32 {
                     plane.i32()
                 } else {
                     plane
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, kernels_cuda::Error>>()?;
         let landed: Vec<Tensor> = outs.iter().map(|&v| self.tensor(v)).collect();
         if linear::gemm::anchored(
             self.ctx(),

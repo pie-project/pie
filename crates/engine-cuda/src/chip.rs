@@ -755,6 +755,7 @@ mod tests {
             poem_compiler::DeviceProfile {
                 synth_regions: cfg!(not(feature = "rocm")),
                 synth_anchors: cfg!(not(feature = "rocm")),
+                fold_norms: cfg!(not(feature = "rocm")),
                 ..poem_compiler::DeviceProfile::default()
             }
         );
