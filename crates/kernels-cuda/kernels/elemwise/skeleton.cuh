@@ -105,7 +105,7 @@ struct OrderOf<B, decltype(static_cast<void>(B::vector(0u)))> {
 
 template <int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES, unsigned long long DT,
           bool READ_ONLY, unsigned LATE = 0u, class ORDER = InOrder, unsigned STREAM = 0u,
-          unsigned VECTORS = 0u, bool SIDE_BLOCKS = false>
+          unsigned VECTORS = 0u>
 struct RowSkeleton {
     static_assert((LANES & (LANES - 1)) == 0 && LANES <= BLOCK && (LANES <= 32 || LANES % 32 == 0),
                   "a row is a power-of-two run of a block's threads");
@@ -114,23 +114,17 @@ struct RowSkeleton {
     static constexpr int N = VECS * 8;
     // The f32 a row shares (`share`): a row of its lanes' elements.
     static constexpr int SHARED = LANES * N;
-    // Whether the grid's blocks `y == 1` sit beside the rows' (`side()`):
-    // each of their rows' first warp computes what only lands, reading no
-    // row.
-    static constexpr bool SIDE = SIDE_BLOCKS;
 
     int width;
     int lane;
     int group;
     int vectors;
     bool live;
-    bool beside;
     float* buf;
     float* row;
     float* tab;
     uint4* dst[OUT];
-    // Each result's first f32 a row, where it is a small vector one a row
-    // (`st_lane`).
+    // Each result's first f32 a row, where it is a small vector one a row.
     float* vdst[OUT];
     // Each small-vector parameter's (`VECTORS`) first f32 a row.
     const float* vsrc[IN];
@@ -170,13 +164,12 @@ struct RowSkeleton {
 
     // Every parameter's vectors are issued up front, before any body math.
     __device__ __forceinline__ RowSkeleton(const Planes<IN, OUT>& planes, int of, int part,
-                                           bool live, bool beside, float* buf, float* shared)
+                                           bool live, float* buf, float* shared)
         : width(planes.width),
           lane(static_cast<int>(threadIdx.x) % LANES),
           group(static_cast<int>(threadIdx.x) / LANES),
           vectors(planes.width / 8),
           live(live),
-          beside(beside),
           buf(buf),
           row(shared + planes.table + (static_cast<int>(threadIdx.x) / LANES) * SHARED),
           tab(shared) {
@@ -238,8 +231,6 @@ struct RowSkeleton {
                 }
                 continue;
             }
-            // a side block reads no row
-            if (beside) continue;
             src[k] = dtype(k) == kF32
                          ? reinterpret_cast<const uint4*>(static_cast<const float*>(plane.base) + at)
                          : reinterpret_cast<const uint4*>(static_cast<const bf16*>(plane.base) + at);
@@ -465,70 +456,15 @@ struct RowSkeleton {
 
     __device__ __forceinline__ unsigned thread() const { return threadIdx.x; }
 
-    // A small vector one a row lies over the lanes of a warp the row takes
-    // (SPAN of them, its lanes past them computing it alike): value `i` in
-    // lane `i % SPAN`'s slot `i / SPAN`, a thread holding `(n + SPAN - 1)
-    // / SPAN` slots of an `n`-vector. A value one a row (a scalar) is the
-    // same in every lane.
-    static constexpr int SPAN = LANES < 32 ? LANES : 32;
-
-    // Whether this block is a side block (`SIDE`).
-    __device__ __forceinline__ bool side() const { return beside; }
-
-    // This thread's lane among them.
-    __device__ __forceinline__ int vlane() const { return lane % SPAN; }
-
-    // Whether this thread is in the row's first warp: the one that computes
-    // what only lands (a small-vector result no pass reads) and lands it.
-    __device__ __forceinline__ bool lead() const { return lane < SPAN; }
-
-    // Value `i` of small-vector parameter `k` (any lane may read any).
+    // Value `i` of small-vector parameter `k`, one a row (every thread of
+    // the row reading it).
     __device__ __forceinline__ float vec(int k, int i) const { return live ? __ldg(vsrc[k] + i) : 0.f; }
 
-    // `x` from lane `src` of this row's lanes.
-    __device__ __forceinline__ static float shfl(float x, int src) {
-        return __shfl_sync(0xffffffffu, x, src, SPAN);
-    }
-    __device__ __forceinline__ static unsigned shfl(unsigned x, int src) {
-        return __shfl_sync(0xffffffffu, x, src, SPAN);
-    }
-    __device__ __forceinline__ static bool shfl(bool x, int src) {
-        return __shfl_sync(0xffffffffu, static_cast<int>(x), src, SPAN) != 0;
-    }
-
-    // Value `j` of small vector `v` (`j` the same in every lane, a constant
-    // once the body's loops unroll), to every lane: a shuffle.
-    template <class T, int S>
-    __device__ __forceinline__ T pick(const T (&v)[S], int j) const {
-        return shfl(v[j / SPAN], j % SPAN);
-    }
-
-    // Value `j` of small vector `v`, `j` a lane's own: a shuffle of each
-    // slot, the one `j` lies in taken.
-    template <class T, int S>
-    __device__ __forceinline__ T gather(const T (&v)[S], int j) const {
-        T got = shfl(v[0], j % SPAN);
-#pragma unroll
-        for (int s = 1; s < S; ++s) {
-            const T o = shfl(v[s], j % SPAN);
-            got = j / SPAN == s ? o : got;
-        }
-        return got;
-    }
-
-    // Entry `i` of a table of up to 36 indices below 32, five bits each,
-    // twelve a word (0 past them).
-    __device__ __forceinline__ static int index(int i, unsigned long long a, unsigned long long b,
-                                                unsigned long long c) {
-        const unsigned long long w = i < 12 ? a : (i < 24 ? b : c);
-        return i < 36 ? static_cast<int>((w >> (5 * (i % 12))) & 31ull) : 0;
-    }
-
-    // Value `i` of small-vector result `K`, one a row, landed by the lane
-    // that holds it in the row's first warp.
+    // Value `i` of small-vector result `K`, one a row: the row's first
+    // thread lands it, the rest computing it alike.
     template <int K>
-    __device__ __forceinline__ void st_lane(int i, float v) {
-        if (live && lane < SPAN) vdst[K][i] = v;
+    __device__ __forceinline__ void st_vec(int i, float v) {
+        if (live && lane == 0) vdst[K][i] = v;
     }
 
     // Result `K`'s row to memory: a body flushes a result once its last
@@ -566,11 +502,10 @@ struct RowSkeleton {
 // over `f`, its own fields (a norm's eps) passed by value. The rows past a
 // staged window's live count are left as they are. A body that tables its
 // columns' values is fired with `planes.table` floats of dynamic shared
-// memory, and one that shares its row BLOCK * VECS * 8 floats more. Under
-// `SIDE` the grid is two blocks high, the blocks `y == 1` its side blocks.
+// memory, and one that shares its row BLOCK * VECS * 8 floats more.
 template <class Body, int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES = 0u,
           unsigned long long DT = 0ull, bool READ_ONLY = false, unsigned LATE = 0u,
-          unsigned STREAM = 0u, unsigned VECTORS = 0u, bool SIDE = false>
+          unsigned STREAM = 0u, unsigned VECTORS = 0u>
 __global__ void __launch_bounds__(BLOCK) row_skeleton(
     const Planes<IN, OUT> planes,
     const Body body,
@@ -600,9 +535,9 @@ __global__ void __launch_bounds__(BLOCK) row_skeleton(
     __shared__ float buf[(VECS > kBatch ? VECS : kBatch) * (BLOCK / 32) + 1];
     extern __shared__ float shared[];
     RowSkeleton<BLOCK, LANES, VECS, IN, OUT, ONES, DT, READ_ONLY, LATE,
-                typename OrderOf<Body>::type, STREAM, VECTORS, SIDE>
+                typename OrderOf<Body>::type, STREAM, VECTORS>
         f(
-        planes, of, part, row < live_rows, SIDE && blockIdx.y == 1, buf, shared);
+        planes, of, part, row < live_rows, buf, shared);
     body(f);
 }
 

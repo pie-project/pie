@@ -50,9 +50,6 @@ pub struct Body {
     /// (`f.vec`), and the results it lands as them (`f.st_vec`).
     pub vectors: u32,
     pub vector_outs: u32,
-    /// Whether what only lands runs on side blocks beside the rows' where
-    /// the skeleton has them ([`print::sides`]): spread rows' (a decode's).
-    pub side: bool,
     /// The body packed rows run where it is not this one: a pair-packed
     /// turn ([`print::packing`]), which many rows' warps of no turned pair
     /// skip and a decode's few would wait on.
@@ -93,7 +90,6 @@ impl Body {
                 late: print::late(&kernel),
                 vectors,
                 vector_outs,
-                side: print::sides(&kernel),
                 packed: None,
             })
         };
@@ -292,8 +288,6 @@ pub struct Synthesized {
     /// The parameters and results (by bit) that are small vectors one a row.
     vectors: u32,
     vector_outs: u32,
-    /// Whether its spread kernel has side blocks.
-    side: bool,
 }
 
 /// The most parameters one generated kernel reads.
@@ -381,7 +375,6 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
                     },
                     stream,
                     body.vectors,
-                    body.side && schedule == Schedule::Spread,
                 ),
                 true,
                 schedule,
@@ -391,9 +384,8 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
     let spread = (skeleton::block(width, Schedule::Spread)
         < skeleton::block(width, Schedule::Packed)
         || late != 0
-        || body.packed.is_some()
-        || body.side)
-        .then(|| laid(Schedule::Spread));
+        || body.packed.is_some())
+    .then(|| laid(Schedule::Spread));
     Ok(Synthesized {
         kernel: laid(Schedule::Packed),
         spread,
@@ -408,7 +400,6 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
         },
         vectors: body.vectors,
         vector_outs: body.vector_outs,
-        side: body.side,
     })
 }
 
@@ -567,12 +558,7 @@ impl Synthesized {
             outs,
             (rows, parts),
             self.width,
-            (
-                self.ones,
-                self.vectors,
-                self.vector_outs,
-                self.side && schedule == Schedule::Spread,
-            ),
+            (self.ones, self.vectors, self.vector_outs),
             self.shared,
             schedule,
         )
@@ -730,68 +716,6 @@ mod tests {
                 .packed
                 .is_none()
         );
-    }
-
-    /// A 2 x 2 small vector one a row normalized by its rows' sums, laid
-    /// beside its values, and landed; the row scaled by one of its values.
-    fn renormed() -> Region {
-        Region {
-            width: 64,
-            params: vec![Shape::Row, Shape::Vector(4)],
-            ops: vec![
-                Op::Binary(Binary::Mul, 1, 1),  // 2: the vector squared
-                Op::Pick(2, 0),                 // 3
-                Op::Pick(2, 1),                 // 4
-                Op::Pick(2, 2),                 // 5
-                Op::Pick(2, 3),                 // 6
-                Op::Binary(Binary::Add, 3, 4),  // 7: row 0's sum
-                Op::Binary(Binary::Add, 5, 6),  // 8: row 1's
-                Op::Splat(7, 4),                // 9
-                Op::Insert(9, 1, 7),            // 10
-                Op::Insert(10, 2, 8),           // 11
-                Op::Insert(11, 3, 8),           // 12
-                Op::Binary(Binary::Div, 2, 12), // 13
-                Op::Pick(1, 0),                 // 14
-                Op::Binary(Binary::Mul, 0, 14), // 15
-            ],
-            results: vec![15, 13],
-            rounds: vec![],
-        }
-    }
-
-    /// Each lane computes its own value of a vector laid out of one op over
-    /// picks: its picks gathered from the lanes that hold them, the sums no
-    /// scalar of their own; what only lands runs on the row's first warp,
-    /// or on side blocks where the skeleton has them.
-    #[test]
-    fn a_laid_out_vector_is_each_lanes_own_op_over_its_gathers() {
-        let body = Body::of(&renormed()).expect("printed");
-        let source = &body.source;
-        assert!(
-            source.contains("v12[t] = (f.gather(v2, f.index(i, ")
-                && source.contains(") + f.gather(v2, f.index(i, "),
-            "{source}"
-        );
-        for scalar in ["const float v3 ", "const float v7 ", "const float v8 "] {
-            assert!(!source.contains(scalar), "{scalar}: {source}");
-        }
-        assert!(
-            source.contains("const float v14 = f.vec(1, 0);"),
-            "{source}"
-        );
-        assert!(body.side, "{source}");
-        let side = source.find("if (f.side())").expect("a side block's work");
-        let lead = source
-            .find("if (!F::SIDE && f.lead())")
-            .expect("the lead warp's");
-        assert!(side < lead, "{source}");
-        assert!(
-            source.contains("f.template st_lane<1>(i, v13[t])"),
-            "{source}"
-        );
-        let ins = [In::Rows(Dtype::Bf16), In::Rows(Dtype::F32)];
-        let outs = [Out::Rows(Dtype::Bf16), Out::Rows(Dtype::F32)];
-        assert_eq!(supports(&renormed(), &ins, &outs), Ok(()));
     }
 
     #[test]

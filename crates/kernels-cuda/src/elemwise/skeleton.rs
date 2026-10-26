@@ -341,11 +341,8 @@ pub fn shared_floats(width: u32, block: u32) -> u32 {
 /// blocks as `schedule` lays them, the parameters `ones` sets (by bit) read
 /// as one element, those `late` sets loaded where the body asks
 /// (`load<k>()`) and those `stream` sets fetched a vector at a time where
-/// each pass reaches it (`fetch<m>(p)`), never held across passes, those
-/// `vectors` sets read as small vectors one a row (`f.vec`), and with
-/// `side` side blocks beside the rows' ([`fire`] two blocks high). A
-/// `read_only` skeleton's results land over none of its parameters, so it
-/// reads them through the read-only path.
+/// each pass reaches it (`fetch<m>(p)`), never held across passes. A `read_only` skeleton's results land over none of its
+/// parameters, so it reads them through the read-only path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn entrypoint(
     body: &str,
@@ -353,7 +350,7 @@ pub(crate) fn entrypoint(
     per: u32,
     stored: &[Stored],
     outs: usize,
-    (ones, late, stream, vectors, side): (u32, u32, u32, u32, bool),
+    (ones, late, stream, vectors): (u32, u32, u32, u32),
     read_only: bool,
     schedule: Schedule,
 ) -> String {
@@ -361,7 +358,7 @@ pub(crate) fn entrypoint(
         .zip(stored)
         .fold(0u64, |dt, (k, form)| dt | (*form as u64) << (2 * k));
     format!(
-        "::pie::elemwise::row_skeleton<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}, {late}u, {stream}u, {vectors}u, {side}>",
+        "::pie::elemwise::row_skeleton<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}, {late}u, {stream}u, {vectors}u>",
         block(width, schedule),
         lanes(width),
         stored.len()
@@ -381,7 +378,7 @@ pub(crate) struct Shared {
 /// `parts` of the skeleton's `width` wide: `ins[k]` is the body's parameter
 /// `k` (stored as `stored[k]`) and `outs[k]` its result `k`, a parameter
 /// `ones` sets (by bit) one element (a row's, every part of it reading it),
-/// read as is; a kernel of `side` blocks two blocks high.
+/// read as is.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fire(
     ctx: &Ctx,
@@ -392,7 +389,7 @@ pub(crate) fn fire(
     outs: &[Plane],
     (rows, parts): (u32, u32),
     width: u32,
-    (ones, vectors, vector_outs, side): (u32, u32, u32, bool),
+    (ones, vectors, vector_outs): (u32, u32, u32),
     shared: Shared,
     schedule: Schedule,
 ) -> Result<(), Error> {
@@ -449,7 +446,7 @@ pub(crate) fn fire(
         op,
         // The skeleton waits on its producer in-kernel (`kernel.pdl`).
         Fire::at(kernel).apply(
-            Launch::grid([blocks, if side { 2 } else { 1 }, 1], [threads, 1, 1])
+            Launch::per_row(blocks, threads)
                 .smem(floats * 4)
                 .programmatic(ctx.tuning().pdl),
         ),
@@ -494,7 +491,7 @@ pub fn residual_add_rmsnorm(
                 per,
                 &[Stored::Bf16; 3],
                 2,
-                (0, 0, 0, 0, false),
+                (0, 0, 0, 0),
                 false,
                 Schedule::Packed,
             ),
@@ -507,7 +504,7 @@ pub fn residual_add_rmsnorm(
         &[Plane::rows(out), Plane::rows(y)],
         (y.rows, 1),
         y.width,
-        (0, 0, 0, false),
+        (0, 0, 0),
         Shared::default(),
         Schedule::Packed,
     )
