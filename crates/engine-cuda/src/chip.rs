@@ -700,9 +700,12 @@ mod tests {
                 // The 99 KiB and A100 families take the two-launch gated
                 // delta scan and a prefill's MXFP4 selects on mma.sync
                 // alone; Orin keeps the three wmma launches and the GEMV.
+                // Ada walks a short gated delta run up to its measured
+                // crossover with that scan.
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         ssm_gdn_fused_scan: false,
+                        ssm_gdn_scan_until: defaults.ssm_gdn_scan_until,
                         mxfp4_mma_from: defaults.mxfp4_mma_from,
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
                         mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
@@ -712,6 +715,11 @@ mod tests {
                     "{gpu}"
                 );
                 assert_eq!(tuning.ssm_gdn_fused_scan, minor != 7, "{gpu}");
+                assert_eq!(
+                    tuning.ssm_gdn_scan_until,
+                    if minor == 9 { 12 } else { defaults.ssm_gdn_scan_until },
+                    "{gpu}"
+                );
                 assert_eq!(
                     tuning.mxfp4_mma_until,
                     if minor == 7 { 0 } else { 16_777_216 },
@@ -1047,20 +1055,24 @@ mod tests {
                 }
             );
             assert!(kernels_cuda::tuning::Tuning::of(p).ssm_gdn_fused_scan);
+            assert_eq!(kernels_cuda::tuning::Tuning::of(p).ssm_gdn_scan_until, 12);
             let defaults = kernels_cuda::tuning::Tuning::of(&registry().defaults());
             assert_eq!(
                 kernels_cuda::tuning::Tuning {
                     ssm_gdn_fused_scan: false,
+                    ssm_gdn_scan_until: defaults.ssm_gdn_scan_until,
                     mxfp4_mma_from: defaults.mxfp4_mma_from,
                     mxfp4_mma_until: defaults.mxfp4_mma_until,
                     mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
                 defaults,
-                "what an Ada GPU ran before its family file, past the gated delta scan and the MXFP4 selects"
+                "what an Ada GPU ran before its family file, past the gated delta scan, its walk \
+                 crossover and the MXFP4 selects"
             );
             for (spec, rungs, _) in p.entries() {
                 if spec.id == "kernel.ssm.gdn_fused_scan"
+                    || spec.id == "kernel.ssm.gdn_scan_until"
                     || spec.id.starts_with("kernel.moe.mxfp4_mma_")
                     || spec.id.starts_with("engine.prefill_lattice_")
                 {
