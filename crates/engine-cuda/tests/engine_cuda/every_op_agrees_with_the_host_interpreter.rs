@@ -942,6 +942,8 @@ impl Rig {
                         ..Extents::default()
                     },
                     GeometryClass::Host,
+                    eta_ir::registry::PortMask::NONE,
+                    false,
                     &vec![None; count],
                     &ids,
                     self.context.stream(),

@@ -129,6 +129,8 @@ impl Rig {
                 &wire_seeds,
                 extents,
                 GeometryClass::Host,
+                eta_ir::registry::PortMask::NONE,
+                false,
                 &vec![None; count],
                 &ids,
                 context.stream(),

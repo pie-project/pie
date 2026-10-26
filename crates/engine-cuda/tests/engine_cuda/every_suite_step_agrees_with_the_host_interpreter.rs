@@ -482,6 +482,8 @@ fn run(context: &Context, suite: &Suite) -> Vec<String> {
                             ..Extents::default()
                         },
                         GeometryClass::Host,
+                        eta_ir::registry::PortMask::NONE,
+                        false,
                         &vec![None; count],
                         &ids,
                         context.stream(),

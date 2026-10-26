@@ -793,6 +793,7 @@ impl Engine for Metal {
                 &seeds,
                 extents(&binding.extents),
                 binding.geometry,
+                binding.device_resolved,
                 &binding.channels,
             )
             .map_err(fault)?;

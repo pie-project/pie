@@ -766,12 +766,15 @@ impl Shell {
         seeds: &[(u32, Vec<u8>)],
         extents: eta_exec::Extents,
         geometry: eta_ir::registry::GeometryClass,
+        device: eta_ir::registry::PortMask,
         adopted: &[Option<std::sync::Arc<crate::program::Endpoint>>],
         ids: &[engine::ChannelId],
     ) -> Result<engine::InstanceId> {
         let stream = self.device.stream();
-        self.programs
-            .bind(program_id, seeds, extents, geometry, adopted, ids, stream)
+        let buffers_rs = self.buffers.is_some();
+        self.programs.bind(
+            program_id, seeds, extents, geometry, device, buffers_rs, adopted, ids, stream,
+        )
     }
 
     #[must_use]

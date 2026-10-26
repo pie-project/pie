@@ -3,7 +3,7 @@ use std::sync::Arc;
 use engine::ports::Envelope;
 use eta_exec::{ExecPlan, Extents};
 use eta_ir::container::HostRole;
-use eta_ir::registry::{GeometryClass, Port, Stage as Attach};
+use eta_ir::registry::{GeometryClass, Port, PortMask, Stage as Attach};
 use eta_ir::validate::Direction;
 use kernels_cuda::runtime::channel::{self, PublishLane, PullLane, SettleLane, Ticket};
 
@@ -66,6 +66,13 @@ pub struct Session {
     /// against cursors that did not happen and decline in turn.
     cascading: bool,
     shadow: bool,
+    /// The descriptor ports the program computes on the device
+    /// (`engine::InstanceBinding::device_resolved`): the ones this instance
+    /// resolves for a decode envelope.
+    device: PortMask,
+    /// A decode envelope's device-computed mask is packed into the staged
+    /// mask on the device and never read on the host ([`Self::resolve_on`]).
+    mask_on_device: bool,
 }
 
 #[derive(Debug)]
@@ -125,6 +132,8 @@ impl Session {
             pending: std::collections::VecDeque::new(),
             cascading: false,
             shadow,
+            device: PortMask::NONE,
+            mask_on_device: false,
         };
         for (channel, wire) in seeds {
             if shadow
@@ -339,41 +348,83 @@ impl Session {
         native_to_wire(shape.dtype, shape.numel, &native)
     }
 
-    /// The ports the host resolves under `class`; a mask the device carries
-    /// (`mask_on_device`, [`Self::mask_device_source`]) is not among them.
-    pub fn envelope(
-        &self,
+    /// Fixes, once at bind, which ports this instance resolves under
+    /// `class` (the `device` ones of a decode envelope, every one of the
+    /// wide class) and how it reads a decode envelope's mask. A mask the
+    /// device computes is packed on the device, unless the load buffers
+    /// recurrent state (`buffers_rs`): a buffered lane replays the slots its
+    /// mask admits, a schedule the host plans, so there the mask is read on
+    /// the host after the epilogue that writes it.
+    pub fn resolve_on(
+        &mut self,
         plan: &ExecPlan,
         class: GeometryClass,
-        mask_on_device: bool,
-    ) -> Result<Envelope> {
+        device: PortMask,
+        buffers_rs: bool,
+    ) {
+        self.device = device;
+        self.mask_on_device = !buffers_rs
+            && class == GeometryClass::DecodeEnvelope
+            && engine::ports::engine_resolves(class, device, Port::AttnMask)
+            && self.port_device_source(plan, Port::AttnMask).is_some();
+    }
+
+    /// Whether this instance resolves `port` under `class`
+    /// ([`engine::ports::engine_resolves`]).
+    #[must_use]
+    pub fn resolves(&self, class: GeometryClass, port: Port) -> bool {
+        engine::ports::engine_resolves(class, self.device, port)
+    }
+
+    /// The ports the host resolves under `class`; a mask packed on the device
+    /// ([`Self::mask_device_source`]) is not among them.
+    pub fn envelope(&self, plan: &ExecPlan, class: GeometryClass) -> Result<Envelope> {
         ports::resolve(
             plan,
             class,
+            self.device,
             &self.rings,
             &self.cursors_now(),
             &self.shapes,
-            mask_on_device,
+            self.mask_on_device,
         )
     }
 
     /// The device cell a decode envelope's attention mask is packed from,
-    /// `(address, bool bytes)`, where only the device holds it: like its
+    /// `(address, bool bytes)`, where it is packed on the device: like its
     /// tokens, a mask the device computes never rides the host.
     #[must_use]
-    pub fn mask_device_source(&self, plan: &ExecPlan, class: GeometryClass) -> Option<(u64, u32)> {
-        if class != GeometryClass::DecodeEnvelope {
+    pub fn mask_device_source(&self, plan: &ExecPlan) -> Option<(u64, u32)> {
+        if !self.mask_on_device {
             return None;
         }
         self.port_device_source(plan, Port::AttnMask)
     }
 
+    /// A decode envelope's device-computed mask this instance reads on the
+    /// host ([`Self::resolve_on`]): a fire carrying it is never staged ahead
+    /// of the epilogue that writes it.
+    #[must_use]
+    pub fn reads_mask_on_host(&self, class: GeometryClass) -> bool {
+        class == GeometryClass::DecodeEnvelope
+            && self.resolves(class, Port::AttnMask)
+            && !self.mask_on_device
+    }
+
     #[must_use]
     pub fn token_device_source(&self, plan: &ExecPlan, class: GeometryClass) -> Option<(u64, u32)> {
-        if !engine::ports::resolves(class, Port::EmbedTokens) {
+        if !self.resolves(class, Port::EmbedTokens) {
             return None;
         }
         self.port_device_source(plan, Port::EmbedTokens)
+    }
+
+    #[must_use]
+    pub fn fold_device_source(&self, plan: &ExecPlan, class: GeometryClass) -> Option<(u64, u32)> {
+        if !self.resolves(class, Port::Fold) {
+            return None;
+        }
+        self.port_device_source(plan, Port::Fold)
     }
 
     pub fn port_device_source(&self, plan: &ExecPlan, port: Port) -> Option<(u64, u32)> {
@@ -552,31 +603,23 @@ impl Session {
         })
     }
 
-    fn host_resolved_channels(
-        &self,
-        plan: &ExecPlan,
-        class: GeometryClass,
-        mask_on_device: bool,
-    ) -> Vec<u32> {
+    
+    fn host_resolved_channels(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<u32> {
         let tokens_on_device = self.token_device_source(plan, class).is_some();
-        let mask_on_device = mask_on_device && self.mask_device_source(plan, class).is_some();
+        let mask_on_device = self.mask_device_source(plan).is_some();
         plan.package
             .ports
             .iter()
-            .filter(|binding| !binding.is_const && engine::ports::resolves(class, binding.port))
+            .filter(|binding| !binding.is_const && self.resolves(class, binding.port))
             .filter(|binding| !(binding.port == Port::EmbedTokens && tokens_on_device))
             .filter(|binding| !(binding.port == Port::AttnMask && mask_on_device))
             .map(|binding| binding.channel)
             .collect()
     }
 
-    pub fn host_resolved_rings(
-        &self,
-        plan: &ExecPlan,
-        class: GeometryClass,
-        mask_on_device: bool,
-    ) -> Vec<usize> {
-        self.host_resolved_channels(plan, class, mask_on_device)
+    
+    pub fn host_resolved_rings(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<usize> {
+        self.host_resolved_channels(plan, class)
             .into_iter()
             .filter_map(|channel| {
                 self.rings
@@ -589,7 +632,7 @@ impl Session {
 
     #[must_use]
     pub fn resolves_prologue_put(&self, plan: &ExecPlan, class: GeometryClass) -> bool {
-        self.host_resolved_channels(plan, class, false)
+        self.host_resolved_channels(plan, class)
             .into_iter()
             .any(|channel| plan.puts_channel(channel, Attach::Prologue))
     }

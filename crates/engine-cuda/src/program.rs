@@ -11,7 +11,7 @@ use engine::channel::ChannelId;
 use engine::ports::Envelope;
 use engine::program::{InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{Boundaries, ExecPlan, Extents, Versions, adopt_launch_package_with};
-use eta_ir::registry::{GeometryClass, Stage as Attach};
+use eta_ir::registry::{GeometryClass, PortMask, Stage as Attach};
 
 use crate::device::Context;
 use crate::error::{Fault, Result};
@@ -246,6 +246,8 @@ impl Plane {
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
         geometry: GeometryClass,
+        device: PortMask,
+        buffers_rs: bool,
         adopted: &[Option<std::sync::Arc<Endpoint>>],
         ids: &[ChannelId],
         stream: *mut core::ffi::c_void,
@@ -258,7 +260,7 @@ impl Plane {
         let program = &*program;
         let endpoints = endpoints_for(&program.plan, adopted, stream)?;
         let held = endpoints.clone();
-        let session = match Session::bind(
+        let mut session = match Session::bind(
             &program.compiled,
             &program.plan,
             seeds,
@@ -273,6 +275,7 @@ impl Plane {
                 return Err(why);
             }
         };
+        session.resolve_on(&program.plan, geometry, device, buffers_rs);
         let id = InstanceId(self.next_instance);
         self.next_instance += 1;
         self.instances.insert(
@@ -288,7 +291,7 @@ impl Plane {
         Ok(id)
     }
 
-    pub fn envelope(&self, id: InstanceId, mask_on_device: bool) -> Result<Option<Envelope>> {
+    pub fn envelope(&self, id: InstanceId) -> Result<Option<Envelope>> {
         let bound = self
             .instances
             .get(&id)
@@ -307,7 +310,7 @@ impl Plane {
         })?;
         bound
             .session
-            .envelope(&program.plan, bound.geometry, mask_on_device)
+            .envelope(&program.plan, bound.geometry)
             .map(Some)
     }
 
@@ -319,7 +322,24 @@ impl Plane {
         let program = self.programs.get(&bound.program_id)?;
         bound
             .session
-            .mask_device_source(&program.plan, bound.geometry)
+            .mask_device_source(&program.plan)
+    }
+
+    /// Whether instance `id` resolves `port` ([`Session::resolves`]).
+    #[must_use]
+    pub fn resolves(&self, id: InstanceId, port: eta_ir::registry::Port) -> bool {
+        self.instances
+            .get(&id)
+            .is_some_and(|bound| bound.session.resolves(bound.geometry, port))
+    }
+
+    /// Whether instance `id` reads its decode-envelope mask on the host
+    /// ([`Session::reads_mask_on_host`]).
+    #[must_use]
+    pub fn reads_mask_on_host(&self, id: InstanceId) -> bool {
+        self.instances
+            .get(&id)
+            .is_some_and(|bound| bound.session.reads_mask_on_host(bound.geometry))
     }
 
     #[must_use]
@@ -345,7 +365,7 @@ impl Plane {
         let program = self.programs.get(&bound.program_id)?;
         bound
             .session
-            .port_device_source(&program.plan, eta_ir::registry::Port::Fold)
+            .fold_device_source(&program.plan, bound.geometry)
     }
 
     #[must_use]
@@ -696,7 +716,7 @@ impl Plane {
     /// The shared rings the host reads to resolve instance `id`'s
     /// descriptor ports (none for a host-geometry instance).
     #[must_use]
-    pub fn host_resolved_rings(&self, id: InstanceId, mask_on_device: bool) -> Vec<usize> {
+    pub fn host_resolved_rings(&self, id: InstanceId) -> Vec<usize> {
         let Some(bound) = self.instances.get(&id) else {
             return Vec::new();
         };
@@ -708,7 +728,7 @@ impl Plane {
         };
         bound
             .session
-            .host_resolved_rings(&program.plan, bound.geometry, mask_on_device)
+            .host_resolved_rings(&program.plan, bound.geometry)
     }
 
     #[must_use]

@@ -1,4 +1,4 @@
-use eta_ir::registry::{GeometryClass, Port};
+use eta_ir::registry::{GeometryClass, Port, PortMask};
 
 use crate::fire::{Mask, Masking};
 
@@ -306,6 +306,15 @@ pub fn resolves(class: GeometryClass, port: Port) -> bool {
     }
 }
 
+/// Whether the engine resolves `port` for an instance bound in `class`
+/// whose program computes `device` on the device. A decode envelope's other
+/// ports are resolved on the host and stated on the lanes, so each port has
+/// one source: the engine never reads a cell the runtime already resolved.
+#[must_use]
+pub fn engine_resolves(class: GeometryClass, device: PortMask, port: Port) -> bool {
+    resolves(class, port) && (class != GeometryClass::DecodeEnvelope || device.contains(port))
+}
+
 #[must_use]
 pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
     let rows = cells.len().checked_div(stride).unwrap_or(0);
@@ -348,6 +357,24 @@ mod tests {
         an_envelope_placing_no_slots_cuts_by_the_host_rows();
         a_row_is_roped_at_its_slot_unless_the_program_says_otherwise();
         a_decode_envelope_resolves_its_tokens_and_not_where_they_land();
+        an_engine_resolves_only_what_the_program_computes_on_the_device();
+    }
+
+    /// One source a port: what a decode envelope's program computes on the
+    /// device the engine resolves, and what the runtime resolved it never
+    /// reads; the wide class resolves every port it has.
+    fn an_engine_resolves_only_what_the_program_computes_on_the_device() {
+        use eta_ir::registry::{GeometryClass, PortMask};
+        let device = PortMask::of(&[Port::EmbedTokens, Port::AttnMask]);
+        let envelope = |port| super::engine_resolves(GeometryClass::DecodeEnvelope, device, port);
+        assert!(envelope(Port::EmbedTokens) && envelope(Port::AttnMask));
+        assert!(!envelope(Port::Positions), "positions the runtime resolved are the lane's");
+        assert!(!envelope(Port::Fold) && !envelope(Port::Slots));
+        assert!(super::engine_resolves(
+            GeometryClass::DeviceGeometry,
+            PortMask::NONE,
+            Port::Slots
+        ));
     }
 
     fn an_extent_that_disagrees_with_the_seat_is_refused_by_both_numbers() {
