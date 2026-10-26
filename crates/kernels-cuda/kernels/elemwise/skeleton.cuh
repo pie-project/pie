@@ -54,11 +54,14 @@ constexpr int kI32 = 2;
 // result lands over a parameter, so the parameters are read through the
 // read-only path (`ld.global.nc`), as a hand kernel reads its `const
 // __restrict__` rows; a skeleton that sums a stream in place (a parameter's
-// plane also a result's) reads them as plain loads. A row past the fire's
+// plane also a result's) reads them as plain loads. A parameter whose bit
+// `LATE` sets is a row the body first reads in a later pass: its vectors
+// are issued where the body asks (`load<k>()`), not up front, so they hold
+// no registers through the passes before it. A row past the fire's
 // (`!live`) computes on garbage beside its block's live rows, through
 // every barrier they meet, and stores nothing.
 template <int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES, unsigned long long DT,
-          bool READ_ONLY>
+          bool READ_ONLY, unsigned LATE = 0u>
 struct RowSkeleton {
     static_assert((LANES & (LANES - 1)) == 0 && LANES <= BLOCK && (LANES <= 32 || LANES % 32 == 0),
                   "a row is a power-of-two run of a block's threads");
@@ -77,6 +80,8 @@ struct RowSkeleton {
     float* row;
     float* tab;
     uint4* dst[OUT];
+    // A late parameter's first vector, issued by `load<k>()`.
+    const uint4* src[IN];
     uint4 in[IN][VECS];
     // An f32 plane's vector of 8 is two words; its last four elements here.
     uint4 hi[IN][VECS];
@@ -129,22 +134,40 @@ struct RowSkeleton {
                 }
                 continue;
             }
+            src[k] = dtype(k) == kF32
+                         ? reinterpret_cast<const uint4*>(static_cast<const float*>(plane.base) + at)
+                         : reinterpret_cast<const uint4*>(static_cast<const bf16*>(plane.base) + at);
+            // the vectors repeat every `period` (a head's weight); else 0
+            period[k] = plane.period;
+            if (!((LATE >> k) & 1u)) issue(k);
+        }
+    }
+
+    int period[IN];
+
+    // Parameter `k`'s vectors from `src[k]`.
+    __device__ __forceinline__ void issue(int k) {
 #pragma unroll
-            for (int p = 0; p < VECS; ++p) {
-                const int i = lane + p * LANES;
-                if (i >= vectors) continue;
-                const int v = plane.period > 0 ? i % plane.period : i;
-                if (dtype(k) == kF32) {
-                    const uint4* src =
-                        reinterpret_cast<const uint4*>(static_cast<const float*>(plane.base) + at);
-                    in[k][p] = READ_ONLY ? __ldg(src + 2 * v) : src[2 * v];
-                    hi[k][p] = READ_ONLY ? __ldg(src + 2 * v + 1) : src[2 * v + 1];
-                } else {
-                    const uint4* src =
-                        reinterpret_cast<const uint4*>(static_cast<const bf16*>(plane.base) + at);
-                    in[k][p] = READ_ONLY ? __ldg(src + v) : src[v];
-                }
+        for (int p = 0; p < VECS; ++p) {
+            const int i = lane + p * LANES;
+            if (i >= vectors) continue;
+            const int v = period[k] > 0 ? i % period[k] : i;
+            if (dtype(k) == kF32) {
+                in[k][p] = READ_ONLY ? __ldg(src[k] + 2 * v) : src[k][2 * v];
+                hi[k][p] = READ_ONLY ? __ldg(src[k] + 2 * v + 1) : src[k][2 * v + 1];
+            } else {
+                in[k][p] = READ_ONLY ? __ldg(src[k] + v) : src[k][v];
             }
+        }
+    }
+
+    // A late parameter's vectors, issued where the body first wants them
+    // near (the pass before the one that reads them); a parameter this
+    // skeleton loaded up front is already held.
+    template <int K>
+    __device__ __forceinline__ void load() {
+        if constexpr (((LATE >> K) & 1u) != 0u) {
+            if (live) issue(K);
         }
     }
 
@@ -306,7 +329,7 @@ struct RowSkeleton {
 // columns' values is fired with `planes.table` floats of dynamic shared
 // memory, and one that shares its row BLOCK * VECS * 8 floats more.
 template <class Body, int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES = 0u,
-          unsigned long long DT = 0ull, bool READ_ONLY = false>
+          unsigned long long DT = 0ull, bool READ_ONLY = false, unsigned LATE = 0u>
 __global__ void __launch_bounds__(BLOCK) row_skeleton(
     const Planes<IN, OUT> planes,
     const Body body,
@@ -335,8 +358,8 @@ __global__ void __launch_bounds__(BLOCK) row_skeleton(
 
     __shared__ float buf[VECS * (BLOCK / 32) + 1];
     extern __shared__ float shared[];
-    RowSkeleton<BLOCK, LANES, VECS, IN, OUT, ONES, DT, READ_ONLY> f(planes, of, part,
-                                                                    row < live_rows, buf, shared);
+    RowSkeleton<BLOCK, LANES, VECS, IN, OUT, ONES, DT, READ_ONLY, LATE> f(
+        planes, of, part, row < live_rows, buf, shared);
     body(f);
 }
 

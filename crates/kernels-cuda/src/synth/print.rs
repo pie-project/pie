@@ -53,8 +53,81 @@ enum At {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Unprinted(pub Dtype);
 
+/// The row parameters `kernel` first reads in a pass past its first, by
+/// bit: each one's vectors are issued (`f.template load<k>()`) once the
+/// pass before is done with its own, ahead of that pass's reductions, so
+/// they hold no registers through the passes that never read them (a
+/// modulation's scale and shift through its norm's sums).
+#[must_use]
+pub fn late(kernel: &Kernel) -> u32 {
+    first_reads(kernel)
+        .iter()
+        .enumerate()
+        .filter(|(_, first)| matches!(first, Some(pass) if *pass > 0))
+        .fold(0, |mask, (k, _)| mask | 1 << k)
+}
+
+/// The pass (counted among the phases that make one) each parameter is
+/// first read in as a row; a parameter read outside a pass's elements (a
+/// value one a head, a table) counts as read in the first.
+fn first_reads(kernel: &Kernel) -> Vec<Option<usize>> {
+    let mut first: Vec<Option<usize>> = vec![None; kernel.params as usize];
+    let mut mark = |o: Operand, pass: usize| {
+        if let Operand::Param(k) = o
+            && let Some(at) = first.get_mut(k as usize)
+        {
+            *at = Some(at.map_or(pass, |was| was.min(pass)));
+        }
+    };
+    let mut pass = 0usize;
+    for phase in &kernel.phases {
+        for o in phase
+            .uniforms
+            .iter()
+            .flat_map(|u| operands(&u.expr))
+            .chain(phase.heads.iter().flat_map(|h| operands(&h.expr)))
+        {
+            mark(o, 0);
+        }
+        let Some(lp) = &phase.pass else {
+            continue;
+        };
+        for o in lp
+            .rows
+            .iter()
+            .flat_map(|r| operands(&r.expr))
+            .chain(lp.partials.iter().map(|p| p.input))
+            .chain(lp.shares.iter().copied())
+            .chain(lp.copies.iter().map(|(_, from)| Operand::Param(*from)))
+        {
+            mark(o, pass);
+        }
+        pass += 1;
+    }
+    for t in &kernel.tables {
+        for o in t.entries.iter().flat_map(|(_, _, e)| operands(e)) {
+            mark(o, 0);
+        }
+    }
+    first
+}
+
+/// The operands `e` reads.
+fn operands(e: &Expr) -> Vec<Operand> {
+    match *e {
+        Expr::Literal(_) | Expr::Column => Vec::new(),
+        Expr::Copy(a) | Expr::Unary(_, a) | Expr::Cast { value: a, .. } | Expr::Peer(a) => {
+            vec![a]
+        }
+        Expr::Binary(_, a, b) => vec![a, b],
+        Expr::Select(a, b, c) | Expr::Fma(a, b, c) => vec![a, b, c],
+    }
+}
+
 /// `kernel`'s body, its source.
 pub fn body(kernel: &Kernel) -> Result<String, Unprinted> {
+    let first = first_reads(kernel);
+    let mut pass_at = 0usize;
     let mut s = String::new();
     for (v, elem) in &kernel.kept {
         let _ = writeln!(s, "  {} v{v}[F::N];", c_type(*elem));
@@ -177,6 +250,13 @@ pub fn body(kernel: &Kernel) -> Result<String, Unprinted> {
         }
         if !pass.shares.is_empty() {
             s.push_str("  f.sync();\n");
+        }
+        // The next pass's own parameters, issued ahead of this one's sums.
+        pass_at += 1;
+        for (k, at) in first.iter().enumerate() {
+            if *at == Some(pass_at) {
+                let _ = writeln!(s, "  f.template load<{k}>();");
+            }
         }
         for t in &pass.totals {
             let Some(seg) = t.seg else {

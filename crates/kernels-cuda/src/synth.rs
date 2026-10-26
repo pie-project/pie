@@ -43,6 +43,9 @@ pub struct Body {
     pub table: u32,
     /// Whether it shares its row (a gather within the row).
     pub shares: bool,
+    /// The parameters (by bit) it loads where it first wants them
+    /// ([`print::late`]), not up front.
+    pub late: u32,
 }
 
 impl Body {
@@ -62,6 +65,7 @@ impl Body {
             passes: kernel.passes(),
             table: kernel.table,
             shares: kernel.shares,
+            late: print::late(&kernel),
         })
     }
 }
@@ -215,8 +219,9 @@ fn heads(region: &Region) -> Result<(), Refusal> {
 
 /// A generated kernel: `body` in the row skeleton over `ins` parameters and
 /// `outs` results, rows `width` wide, packed in blocks and (where a row is
-/// narrower than a block) spread a row a block, each fire taking the one
-/// its rows want ([`Schedule::of`]).
+/// narrower than a block, or a later pass reads a parameter of its own)
+/// spread a row a block, each fire taking the one its rows want
+/// ([`Schedule::of`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Synthesized {
     kernel: &'static Kernel,
@@ -272,6 +277,9 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
     }
     let per = skeleton::per(OP, width)?;
     let root = unit(body)?;
+    // Packed rows issue a later pass's parameters late; spread ones load
+    // every parameter up front.
+    let late = body.late & !ones;
     let laid = |schedule| {
         crate::jit::generated(
             root,
@@ -281,15 +289,16 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
                 per,
                 &stored[..ins.len()],
                 outs,
-                ones,
+                (ones, if schedule == Schedule::Packed { late } else { 0 }),
                 true,
                 schedule,
             ),
         )
     };
     let spread = (skeleton::block(width, Schedule::Spread)
-        < skeleton::block(width, Schedule::Packed))
-    .then(|| laid(Schedule::Spread));
+        < skeleton::block(width, Schedule::Packed)
+        || late != 0)
+        .then(|| laid(Schedule::Spread));
     Ok(Synthesized {
         kernel: laid(Schedule::Packed),
         spread,
@@ -525,6 +534,18 @@ mod tests {
         region.results = vec![9];
         let why = refused(&region, &INS, &OUTS[..1]);
         assert!(why.contains("does not schedule"), "{why}");
+    }
+
+    /// The weight a residual norm's second pass alone reads is issued late,
+    /// after the first pass and ahead of its sum; the rows the first pass
+    /// reads are loaded up front.
+    #[test]
+    fn a_parameter_a_later_pass_first_reads_is_loaded_late() {
+        let body = Body::of(&residual_norm(4096)).expect("printed");
+        assert_eq!(body.late, 0b100);
+        let load = body.source.find("f.template load<2>();").expect("issued");
+        let sum = body.source.find("f.reduce_sum").expect("summed");
+        assert!(load < sum, "{}", body.source);
     }
 
     #[test]

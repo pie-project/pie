@@ -140,7 +140,8 @@ pub enum Schedule {
     Packed,
     /// A row a block of its own threads (a warp where a row is narrower,
     /// as many rows as it holds): a decode's few rows spread over the
-    /// multiprocessors, each finishing on its own.
+    /// multiprocessors, each finishing on its own. Every parameter is
+    /// loaded up front, where packed rows issue a later pass's own late.
     Spread,
 }
 
@@ -151,11 +152,21 @@ impl Schedule {
     /// `multiprocessors`: spread until packing them would fill each
     /// multiprocessor's eight blocks (measured on an L40S: Gemma 4's heads
     /// and dots3's k row land faster spread through a prefill's 512 rows,
-    /// packed at 4096), packed past it.
+    /// packed at 4096), packed past it. A row a block either way (a row as
+    /// wide as a block) is spread while each multiprocessor holds at most
+    /// two: its parameters all in flight at once, as a decode's latency
+    /// wants, where more rows want the registers a later pass's parameters
+    /// hold until then (a DiT block's modulation through its norm, at 512
+    /// rows).
     #[must_use]
     pub fn of(width: u32, rows: u32, multiprocessors: u32) -> Schedule {
         let packed = rows.div_ceil(BLOCK / lanes(width));
-        if block(width, Schedule::Spread) < BLOCK && packed < 8 * multiprocessors {
+        let spread = if block(width, Schedule::Spread) < BLOCK {
+            packed < 8 * multiprocessors
+        } else {
+            rows <= 2 * multiprocessors
+        };
+        if spread {
             Schedule::Spread
         } else {
             Schedule::Packed
@@ -202,7 +213,8 @@ pub fn shared_floats(width: u32, block: u32) -> u32 {
 /// The skeleton's kernel around `body` (a type the unit defines) for `ins`
 /// parameters stored as `stored` and `outs` results, rows `width` wide in
 /// blocks as `schedule` lays them, the parameters `ones` sets (by bit) read
-/// as one element. A `read_only` skeleton's results land over none of its
+/// as one element and those `late` sets loaded where the body asks
+/// (`load<k>()`). A `read_only` skeleton's results land over none of its
 /// parameters, so it reads them through the read-only path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn entrypoint(
@@ -211,7 +223,7 @@ pub(crate) fn entrypoint(
     per: u32,
     stored: &[Stored],
     outs: usize,
-    ones: u32,
+    (ones, late): (u32, u32),
     read_only: bool,
     schedule: Schedule,
 ) -> String {
@@ -219,7 +231,7 @@ pub(crate) fn entrypoint(
         .zip(stored)
         .fold(0u64, |dt, (k, form)| dt | (*form as u64) << (2 * k));
     format!(
-        "::pie::elemwise::row_skeleton<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}>",
+        "::pie::elemwise::row_skeleton<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}, {late}u>",
         block(width, schedule),
         lanes(width),
         stored.len()
@@ -345,7 +357,7 @@ pub fn residual_add_rmsnorm(
                 per,
                 &[Stored::Bf16; 3],
                 2,
-                0,
+                (0, 0),
                 false,
                 Schedule::Packed,
             ),
