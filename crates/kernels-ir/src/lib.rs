@@ -34,7 +34,7 @@ pub mod region;
 pub mod schedule;
 pub mod skeleton;
 
-pub use anchor::{Anchored, Contraction, Input, Layout, Pointwise, Quant, Space};
+pub use anchor::{Anchored, Contraction, Input, Layout, Pointwise, Quant, Space, Window};
 pub use kernel::{
     Expr, HeadAssign, Kernel, Loop, Operand, Partial, Phase, RowAssign, Table, Total, Uniform,
 };

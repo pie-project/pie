@@ -25,6 +25,17 @@
 //! each part's product) and then its [`Input`]s, each a tile, a vector a
 //! column, a vector a row or one value.
 //!
+//! **A head's epilogue.** An epilogue may combine columns within a group of
+//! them, its span ([`Pointwise::span`]): each head it reduces (a head's
+//! norm, `ReduceHeads`) and each column's gathered mate (a rotary pair,
+//! `Peer` at a column that is a function of the column alone), every group
+//! aligned, dividing `n` and at most [`MAX_SPAN`] wide, so a skeleton whose
+//! tile holds whole groups computes it a tile at a time. Its rotation's
+//! angle is the row's position (an [`Input::Row`]) by a frequency each
+//! column states (the region's column), the table of them the schedule's.
+//! A sum over the whole row, a head wider than [`MAX_SPAN`], or a gather at
+//! a column its values pick crosses tiles, and is refused.
+//!
 //! The interpreter ([`eval`]) is the contract a kernel is held to: the
 //! contraction summed in f64 and rounded to f32 once (as the interpreter
 //! sums a reduction), its declared rounding, then each
@@ -38,8 +49,15 @@ use std::fmt;
 use dtype::Dtype;
 
 use crate::interp::{self, Arg, InterpError};
-use crate::region::{Op, Region, RegionError, Shape};
+use crate::region::{Op, Region, RegionError, Shape, ValueId};
 use crate::skeleton::round_bf16;
+
+/// The widest group of a product tile's columns an epilogue combines
+/// within: a head, which a contraction skeleton holds whole in one tile, so
+/// a head's norm (its sum of squares over the head) and its rotary turn
+/// (each column with its mate in the head) are its tile's alone. The
+/// widest head a catalog model norms or turns is 256 columns.
+pub const MAX_SPAN: u32 = 256;
 
 /// How the weight's rows lay out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -104,6 +122,10 @@ pub enum Input {
     Tile,
     /// One value a column `i`, every row reading it (a bias).
     Column,
+    /// One value a column of a head `size` columns wide, every head of every
+    /// row reading it: column `i` reads entry `i % size` (a head's norm
+    /// weight).
+    Head(u32),
     /// One value a row `m` (a row's scale).
     Row,
     /// One value for the whole tile (a layer's scale).
@@ -116,7 +138,7 @@ impl Input {
     #[must_use]
     pub const fn shape(self) -> Shape {
         match self {
-            Input::Tile | Input::Column => Shape::Row,
+            Input::Tile | Input::Column | Input::Head(_) => Shape::Row,
             Input::Row | Input::One => Shape::Scalar,
         }
     }
@@ -131,12 +153,24 @@ pub struct Pointwise {
     pub inputs: Vec<Input>,
 }
 
+/// The columns of the product tile one result lands: `width` of them from
+/// column `from` (a split's piece: a packed qkv product's q, k or v), each
+/// row of its plane `width` wide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Window {
+    pub from: u32,
+    pub width: u32,
+}
+
 /// A contraction with its prologue and epilogue.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Anchored {
     pub contraction: Contraction,
     pub prologue: Option<Pointwise>,
     pub epilogue: Option<Pointwise>,
+    /// The window of the tile each result lands, one a result, or none:
+    /// every result lands every column.
+    pub windows: Vec<Window>,
 }
 
 /// Why an anchored region is not one.
@@ -166,11 +200,18 @@ pub enum AnchorError {
     /// An op that combines along the tile's inner axis (a reduction across
     /// `n` in an epilogue, across `k` in a prologue): not pointwise.
     Across { space: Space, op: u32 },
+    /// An epilogue whose gathers and head reductions stay within no group of
+    /// columns at most [`MAX_SPAN`] wide that divides `n` (a head's norm or
+    /// turn across more columns than one tile holds), or whose gather reads
+    /// a column its values pick.
+    Span { space: Space, op: u32 },
     /// A prologue that lands other than one operand, or an epilogue that
     /// lands nothing.
     Results { space: Space, results: usize },
     /// A result that is not an f32 element of the tile.
     Result { space: Space, result: u32 },
+    /// Windows not one a result, or one past the tile's columns or of none.
+    Window { result: u32 },
 }
 
 impl fmt::Display for AnchorError {
@@ -204,9 +245,19 @@ impl fmt::Display for AnchorError {
                 "the {space} region's op {op} combines along the tile's inner axis, and a \
                  region over a tile is pointwise in it"
             ),
+            AnchorError::Span { space, op } => write!(
+                f,
+                "the {space} region's op {op} combines columns past one group of at most \
+                 {MAX_SPAN} that divides the tile's, or gathers from a column its values pick"
+            ),
             AnchorError::Results { space, results } => {
                 write!(f, "the {space} region lands {results} result(s)")
             }
+            AnchorError::Window { result } => write!(
+                f,
+                "result {result}'s window is not one of the tile's columns, or the windows are \
+                 not one a result"
+            ),
             AnchorError::Result { space, result } => write!(
                 f,
                 "the {space} region's result {result} is not an f32 element of its tile"
@@ -259,6 +310,13 @@ impl Pointwise {
                 return Err(AnchorError::Param { space, param });
             }
         }
+        for (param, input) in (own..).zip(&self.inputs) {
+            if let Input::Head(size) = *input
+                && (size == 0 || !inner.is_multiple_of(size))
+            {
+                return Err(AnchorError::Param { space, param });
+            }
+        }
         for (op, at) in region.ops.iter().zip(0u32..) {
             // Every op is classed: one a new kind of op adds is pointwise
             // only once it is named here.
@@ -271,13 +329,19 @@ impl Pointwise {
                 | Op::Broadcast(_)
                 | Op::Fma(..)
                 | Op::Column => true,
-                // A sum across the row or its heads, and a gather within it,
-                // read other columns than their own.
-                Op::Reduce(..) | Op::ReduceHeads(..) | Op::Peer(..) => false,
+                // A head's sum and a gather within the row read other
+                // columns than their own: an epilogue's, within its span
+                // ([`Pointwise::span`]).
+                Op::ReduceHeads(..) | Op::Peer(..) => space == Space::Product,
+                // A sum across the whole row reads every tile's columns.
+                Op::Reduce(..) => false,
             };
             if !pointwise {
                 return Err(AnchorError::Across { space, op: at });
             }
+        }
+        if space == Space::Product {
+            self.span_of(inner)?;
         }
         let results = region.results.len();
         if results == 0 || (space == Space::Operand && results != 1) {
@@ -292,6 +356,115 @@ impl Pointwise {
     }
 }
 
+impl Pointwise {
+    /// The columns of each group its ops combine within, over a tile `n`
+    /// wide: 1 where it is pointwise, else the narrowest group (dividing
+    /// `n`, at most [`MAX_SPAN`]) that holds each head it reduces and each
+    /// column's gathered mate. A skeleton serves it only where a tile holds
+    /// whole groups. Its region is taken as verified.
+    #[must_use]
+    pub fn span(&self, n: u32) -> u32 {
+        self.span_of(n).unwrap_or(n)
+    }
+
+    fn span_of(&self, n: u32) -> Result<u32, AnchorError> {
+        let space = Space::Product;
+        let region = &self.region;
+        let mut heads = 1u32;
+        let mut peers: Vec<(u32, ValueId)> = Vec::new();
+        for (op, at) in region.ops.iter().zip(0u32..) {
+            match *op {
+                Op::ReduceHeads(_, _, size) => heads = lcm(heads, size),
+                Op::Peer(_, mate) => peers.push((at, mate)),
+                _ => {}
+            }
+        }
+        if peers.is_empty() && heads == 1 {
+            return Ok(1);
+        }
+        // Each gather's column, a function of the column alone (no
+        // parameter in it), over the tile's every column.
+        let mut mates: Vec<(u32, Vec<u32>)> = Vec::with_capacity(peers.len());
+        for &(op, mate) in &peers {
+            let columns = self
+                .columns(mate, n)
+                .ok_or(AnchorError::Span { space, op })?;
+            mates.push((op, columns));
+        }
+        let first = peers
+            .first()
+            .map_or_else(|| region.ops.len() as u32, |(op, _)| *op);
+        (1..=n.min(MAX_SPAN))
+            .filter(|g| n.is_multiple_of(*g) && g.is_multiple_of(heads))
+            .find(|&g| {
+                mates.iter().all(|(_, columns)| {
+                    (0u32..)
+                        .zip(columns)
+                        .all(|(c, &mate)| mate < n && mate / g == c / g)
+                })
+            })
+            .ok_or_else(|| {
+                let op = mates
+                    .iter()
+                    .find(|(_, columns)| columns.iter().any(|&mate| mate >= n))
+                    .map_or(first, |(op, _)| *op);
+                AnchorError::Span { space, op }
+            })
+    }
+
+    /// Value `v`'s u32 at each of `n` columns, where it is a function of
+    /// the column alone: its ops read no parameter. `None` where one does.
+    fn columns(&self, v: ValueId, n: u32) -> Option<Vec<u32>> {
+        let region = &self.region;
+        let params = region.params.len() as u32;
+        // The ops `v` reads, transitively.
+        let mut needed = vec![false; params as usize + region.ops.len()];
+        needed[v as usize] = true;
+        for at in (0..region.ops.len() as u32).rev() {
+            let id = params + at;
+            if !needed[id as usize] {
+                continue;
+            }
+            for arg in region.ops[at as usize].args() {
+                if arg < params {
+                    return None;
+                }
+                needed[arg as usize] = true;
+            }
+        }
+        // The region's own ops up to `v`, landing it as an f32 (a column's
+        // index is exact there): its parameters unread, each given zeros.
+        let mut ops: Vec<Op> = region.ops[..(v - params + 1) as usize].to_vec();
+        ops.push(Op::Cast(v, crate::region::Elem::F32));
+        let probe = Region {
+            width: n,
+            params: region.params.clone(),
+            ops,
+            results: vec![params + (v - params + 1)],
+            rounds: Vec::new(),
+        };
+        let args: Vec<Arg> = region
+            .params
+            .iter()
+            .map(|shape| match shape {
+                Shape::Scalar => Arg::Scalar(0.0),
+                _ => Arg::Row(vec![0.0; n as usize]),
+            })
+            .collect();
+        let landed = interp::eval(&probe, &args).ok()?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Some(landed[0].iter().map(|x| *x as u32).collect())
+    }
+}
+
+const fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+const fn lcm(a: u32, b: u32) -> u32 {
+    a / gcd(a, b) * b
+}
+
 impl Anchored {
     /// The plain contraction: no prologue, the products stored as they are.
     #[must_use]
@@ -300,12 +473,14 @@ impl Anchored {
             contraction,
             prologue: None,
             epilogue: None,
+            windows: Vec::new(),
         }
     }
 
     /// Whether this is an anchored region: a contraction of some extent,
     /// each region pointwise over its tile ([`Space`]) and of the
-    /// parameters its tile and inputs give.
+    /// parameters its tile and inputs give, an epilogue combining columns
+    /// only within its span ([`Pointwise::span`]).
     pub fn verify(&self) -> Result<(), AnchorError> {
         let c = &self.contraction;
         if c.n == 0 || c.k == 0 {
@@ -333,7 +508,27 @@ impl Anchored {
         if let Some(epilogue) = &self.epilogue {
             epilogue.verify(Space::Product, c.n, c.layout.parts())?;
         }
+        if !self.windows.is_empty() {
+            if self.windows.len() != self.results() {
+                let result = u32::try_from(self.windows.len().min(self.results())).unwrap_or(0);
+                return Err(AnchorError::Window { result });
+            }
+            for (result, w) in (0u32..).zip(&self.windows) {
+                if w.width == 0 || w.from.checked_add(w.width).is_none_or(|to| to > c.n) {
+                    return Err(AnchorError::Window { result });
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The window result `k` lands: its own, or every column.
+    #[must_use]
+    pub fn window(&self, k: usize) -> Window {
+        self.windows.get(k).copied().unwrap_or(Window {
+            from: 0,
+            width: self.contraction.n,
+        })
     }
 
     /// The tiles it lands, each `m x n`: the epilogue's results, or each
@@ -419,6 +614,9 @@ fn row_args(
                 Ok(Arg::Row(v[row * inner..(row + 1) * inner].to_vec()))
             }
             (Input::Column, Given::Column(v)) if v.len() == inner => Ok(Arg::Row(v.clone())),
+            (Input::Head(size), Given::Column(v)) if v.len() == *size as usize => {
+                Ok(Arg::Row((0..inner).map(|c| v[c % v.len()]).collect()))
+            }
             (Input::Row, Given::Row(v)) if v.len() == rows => Ok(Arg::Scalar(v[row])),
             (Input::One, Given::One(x)) => Ok(Arg::Scalar(*x)),
             _ => Err(EvalError::Given { space, input }),
@@ -427,8 +625,10 @@ fn row_args(
 }
 
 /// `anchored` over `m` rows: `a` the operand (`m x k`), `w` the weight
-/// (`parts · n x k`), each row-major, and each region's inputs. Its results
-/// come back each `m x n`, row-major, as the declared roundings land them.
+/// (`parts · n x k`), each row-major, and each region's inputs (a head's
+/// vector given as a column's, its `size` entries). Its results come back
+/// each `m x n` (or `m` rows of its window), row-major, as the declared
+/// roundings land them.
 pub fn eval(
     anchored: &Anchored,
     m: usize,
@@ -476,7 +676,7 @@ pub fn eval(
         }
     }
     let Some(epi) = &anchored.epilogue else {
-        return Ok(products);
+        return Ok(windowed(anchored, products, m, n));
     };
     let mut out = vec![vec![0f32; m * n]; epi.region.results.len()];
     for row in 0..m {
@@ -490,13 +690,30 @@ pub fn eval(
             plane[row * n..(row + 1) * n].copy_from_slice(&values);
         }
     }
-    Ok(out)
+    Ok(windowed(anchored, out, m, n))
+}
+
+/// Each result's window of its `m x n` tile.
+fn windowed(anchored: &Anchored, tiles: Vec<Vec<f32>>, m: usize, n: usize) -> Vec<Vec<f32>> {
+    if anchored.windows.is_empty() {
+        return tiles;
+    }
+    tiles
+        .into_iter()
+        .zip(&anchored.windows)
+        .map(|(tile, w)| {
+            let (from, width) = (w.from as usize, w.width as usize);
+            (0..m)
+                .flat_map(|row| tile[row * n + from..row * n + from + width].to_vec())
+                .collect()
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::region::{Binary, Literal, Reduce, Unary};
+    use crate::region::{Binary, Elem, Literal, Reduce, Unary};
 
     fn contraction(n: u32, k: u32, layout: Layout) -> Contraction {
         Contraction {
@@ -768,6 +985,260 @@ mod tests {
             packed_of_one.verify(),
             Err(AnchorError::Contraction(_))
         ));
+    }
+
+    /// Each head of a packed qkv product normed by its own mean square, its
+    /// q and k heads turned at the row's position (NeoX halves) and its v
+    /// heads kept: an epilogue whose span is one head.
+    fn head_norm_rope(heads: u32, hd: u32, turned: u32) -> Pointwise {
+        let mut b = crate::build::Ops::new(2);
+        let normed = b.rms_normed_heads(0, hd, 1e-6);
+        let turn = crate::build::Turn {
+            head_dim: hd,
+            pairs: crate::build::Pairs::Halves {
+                rotary: hd,
+                span: hd / 2,
+            },
+            theta: 10000.0,
+            inverse: false,
+            ramp: None,
+        };
+        let rotated = b.rotate(normed, 1, &turn);
+        let col = b.push(Op::Column);
+        let edge = b.u32(turned * hd);
+        let qk = b.push(Op::Binary(Binary::Lt, col, edge));
+        let out = b.push(Op::Select(qk, rotated, 0));
+        Pointwise {
+            region: Region {
+                width: heads * hd,
+                params: vec![Shape::Row, Shape::Scalar],
+                ops: b.ops,
+                results: vec![out],
+                rounds: vec![(normed, Dtype::Bf16), (out, Dtype::Bf16)],
+            },
+            inputs: vec![Input::Row],
+        }
+    }
+
+    #[test]
+    fn a_heads_norm_and_turn_is_an_epilogue_of_one_heads_span() {
+        let [m, heads, hd, k] = [3usize, 4, 64, 32];
+        let n = heads * hd;
+        let epi = head_norm_rope(heads as u32, hd as u32, 3);
+        let anchored = Anchored {
+            epilogue: Some(epi.clone()),
+            ..Anchored::plain(contraction(n as u32, k as u32, Layout::Dense))
+        };
+        assert_eq!(anchored.verify(), Ok(()));
+        assert_eq!(epi.span(n as u32), hd as u32);
+        let (a, w, pos) = (values(m * k, 1), values(n * k, 2), vec![0.0, 5.0, 37.0]);
+        let got = eval(&anchored, m, &a, &w, &[], &[Given::Row(pos.clone())]).expect("runs");
+        // The region over each product row, as the row core runs it.
+        let y = products(&a, &w, [m, n, k]);
+        for row in 0..m {
+            let want = interp::eval(
+                &epi.region,
+                &[
+                    Arg::Row(y[row * n..(row + 1) * n].to_vec()),
+                    Arg::Scalar(pos[row]),
+                ],
+            )
+            .expect("the region runs");
+            assert_eq!(got[0][row * n..(row + 1) * n], want[0][..]);
+        }
+        // The v heads land the products as they are.
+        assert_eq!(got[0][3 * hd], y[3 * hd]);
+        // A pointwise epilogue's span is one column.
+        assert_eq!(legal(16).span(16), 1);
+    }
+
+    #[test]
+    fn a_head_or_a_gather_past_one_tiles_span_is_rejected() {
+        let c = |n: u32| contraction(n, 32, Layout::Dense);
+        // A head 512 wide: past MAX_SPAN.
+        let wide = head_norm_rope(2, 512, 2);
+        let anchored = Anchored {
+            epilogue: Some(wide),
+            ..Anchored::plain(c(1024))
+        };
+        assert!(matches!(
+            anchored.verify(),
+            Err(AnchorError::Span {
+                space: Space::Product,
+                ..
+            })
+        ));
+        // Each column's mate half the row away, over a row of 1024.
+        let n = 1024;
+        let mut b = crate::build::Ops::new(1);
+        let col = b.push(Op::Column);
+        let half = b.u32(n / 2);
+        let up = b.push(Op::Binary(Binary::Add, col, half));
+        let whole = b.u32(n);
+        let mate = b.push(Op::Binary(Binary::Rem, up, whole));
+        let out = b.push(Op::Peer(0, mate));
+        let far = Pointwise {
+            region: Region {
+                width: n,
+                params: vec![Shape::Row],
+                ops: b.ops,
+                results: vec![out],
+                rounds: vec![],
+            },
+            inputs: vec![],
+        };
+        let anchored = Anchored {
+            epilogue: Some(far.clone()),
+            ..Anchored::plain(c(n))
+        };
+        assert_eq!(
+            anchored.verify(),
+            Err(AnchorError::Span {
+                space: Space::Product,
+                op: 5
+            })
+        );
+        // Over a row of 256 the same gather is one tile's: one group.
+        let mut near = far;
+        near.region.width = 256;
+        near.region.ops[1] = Op::Const(Literal::U32(128));
+        near.region.ops[3] = Op::Const(Literal::U32(256));
+        assert_eq!(near.span(256), 256);
+        // A gather at a column a value picks crosses tiles where it likes.
+        let picked = Pointwise {
+            region: Region {
+                width: 64,
+                params: vec![Shape::Row, Shape::Row],
+                ops: vec![
+                    Op::Cast(1, Elem::U32), // 2
+                    Op::Peer(0, 2),         // 3
+                ],
+                results: vec![3],
+                rounds: vec![],
+            },
+            inputs: vec![Input::Tile],
+        };
+        let anchored = Anchored {
+            epilogue: Some(picked),
+            ..Anchored::plain(c(64))
+        };
+        assert_eq!(
+            anchored.verify(),
+            Err(AnchorError::Span {
+                space: Space::Product,
+                op: 1
+            })
+        );
+        // A prologue gathers nothing: its row is the contraction's.
+        let mut gathered = head_norm_rope(1, 32, 1);
+        gathered.inputs = vec![Input::Row];
+        let anchored = Anchored {
+            prologue: Some(gathered),
+            ..Anchored::plain(c(64))
+        };
+        assert!(matches!(
+            anchored.verify(),
+            Err(AnchorError::Across {
+                space: Space::Operand,
+                ..
+            })
+        ));
+    }
+
+    /// A packed qkv product: q's and k's heads normed by their own weights
+    /// (one head wide, every head reading it) and turned, v as it is, each
+    /// landing its own window.
+    #[test]
+    fn a_packed_qkv_lands_each_piece_in_its_window() {
+        let [m, hd, k] = [2usize, 32, 16];
+        let (q, kv) = (2 * hd, hd);
+        let n = q + 2 * kv;
+        let mut b = crate::build::Ops::new(4);
+        let normed = b.rms_normed_heads(0, hd as u32, 1e-6);
+        let col = b.push(Op::Column);
+        let edge = b.u32(q as u32);
+        let in_q = b.push(Op::Binary(Binary::Lt, col, edge));
+        let w = b.push(Op::Select(in_q, 1, 2));
+        let scaled = b.push(Op::Binary(Binary::Mul, normed, w));
+        let turn = crate::build::Turn {
+            head_dim: hd as u32,
+            pairs: crate::build::Pairs::Halves {
+                rotary: hd as u32,
+                span: hd as u32 / 2,
+            },
+            theta: 10000.0,
+            inverse: false,
+            ramp: None,
+        };
+        let turned = b.rotate(scaled, 3, &turn);
+        let anchored = Anchored {
+            epilogue: Some(Pointwise {
+                region: Region {
+                    width: n as u32,
+                    params: vec![Shape::Row, Shape::Row, Shape::Row, Shape::Scalar],
+                    ops: b.ops,
+                    results: vec![turned, turned, 0],
+                    rounds: vec![(scaled, Dtype::Bf16)],
+                },
+                inputs: vec![Input::Head(hd as u32), Input::Head(hd as u32), Input::Row],
+            }),
+            windows: vec![
+                Window {
+                    from: 0,
+                    width: q as u32,
+                },
+                Window {
+                    from: q as u32,
+                    width: kv as u32,
+                },
+                Window {
+                    from: (q + kv) as u32,
+                    width: kv as u32,
+                },
+            ],
+            ..Anchored::plain(Contraction {
+                acc: None,
+                ..contraction(n as u32, k as u32, Layout::Dense)
+            })
+        };
+        assert_eq!(anchored.verify(), Ok(()));
+        let (a, wt) = (values(m * k, 3), values(n * k, 4));
+        let (qw, kw, pos) = (values(hd, 5), values(hd, 6), vec![3.0, 11.0]);
+        let given = [
+            Given::Column(qw.clone()),
+            Given::Column(kw.clone()),
+            Given::Row(pos.clone()),
+        ];
+        let got = eval(&anchored, m, &a, &wt, &[], &given).expect("runs");
+        let whole = Anchored {
+            windows: Vec::new(),
+            ..anchored.clone()
+        };
+        let tiles = eval(&whole, m, &a, &wt, &[], &given).expect("runs");
+        for (r, (from, width)) in [(0, q), (q, kv), (q + kv, kv)].into_iter().enumerate() {
+            assert_eq!(got[r].len(), m * width);
+            for row in 0..m {
+                assert_eq!(
+                    got[r][row * width..(row + 1) * width],
+                    tiles[r][row * n + from..row * n + from + width]
+                );
+            }
+        }
+        // v lands its f32 products as they are; its plane rounds them.
+        let mut plain = whole.clone();
+        plain.epilogue = None;
+        let y = eval(&plain, m, &a, &wt, &[], &[]).expect("runs");
+        assert_eq!(got[2][..kv], y[0][q + kv..q + 2 * kv]);
+        // A head's weight past the tile's heads, and windows off the tile.
+        let mut off = anchored.clone();
+        off.epilogue.as_mut().unwrap().inputs[0] = Input::Head(48);
+        assert!(matches!(off.verify(), Err(AnchorError::Param { .. })));
+        let mut off = anchored.clone();
+        off.windows[2].width += 1;
+        assert_eq!(off.verify(), Err(AnchorError::Window { result: 2 }));
+        let mut off = anchored;
+        off.windows.pop();
+        assert!(matches!(off.verify(), Err(AnchorError::Window { .. })));
     }
 
     #[test]
