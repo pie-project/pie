@@ -46,6 +46,13 @@ pub fn classify_decode_envelope_why(
             "where its rows land or what they read is computed on the device".to_string(),
         );
     }
+    if channel_for(Port::KvLen).is_some() && channel_for(Port::AttnMask).is_some() {
+        return decline(
+            "it states a read extent beside an attention mask; a lane the host places reads \
+             up to its last row"
+                .to_string(),
+        );
+    }
     let Some(token_channel) = channel_index(Port::EmbedTokens) else {
         return decline("EmbedTokens is not bound to a channel".to_string());
     };
@@ -915,6 +922,7 @@ mod tests {
         a_decode_that_states_nothing_rides_the_envelope();
         a_device_mask_and_fold_ride_the_envelope();
         slots_computed_on_the_device_leave_the_envelope();
+        a_read_extent_beside_a_mask_leaves_the_envelope();
         device_positions_ride_only_beside_stated_slots();
         a_lane_appends_after_its_tail();
         rows_past_a_span_rotate_behind_their_slots();
@@ -988,6 +996,16 @@ mod tests {
         let container = decode(2, &[(Port::Slots, Shape::vector(2), Dtype::U32)]);
         assert_eq!(
             classify_decode_envelope(&container, &taint(&[Port::EmbedTokens, Port::Slots])),
+            Ok(None)
+        );
+    }
+
+    fn a_read_extent_beside_a_mask_leaves_the_envelope() {
+        assert_eq!(
+            classify_decode_envelope(
+                &masked_decode(2, 128),
+                &taint(&[Port::EmbedTokens, Port::AttnMask])
+            ),
             Ok(None)
         );
     }

@@ -721,7 +721,7 @@ impl Xla {
             if self.programs.geometry_of(attached.instance) != Some(GeometryClass::DeviceGeometry) {
                 continue;
             }
-            let Some(envelope) = self
+            let Some(mut envelope) = self
                 .programs
                 .device_envelope(attached.instance)
                 .map_err(refusal)?
@@ -729,6 +729,12 @@ impl Xla {
                 continue;
             };
             let first = attached.lane as usize;
+            envelope.host_rows = lanes
+                .iter()
+                .skip(first)
+                .take(attached.lanes.max(1) as usize)
+                .map(|lane| lane.tokens.len() as u32)
+                .collect();
             let carried = envelope.lanes();
             if first + carried > lanes.len() {
                 return Err(program(format!(

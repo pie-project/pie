@@ -2209,10 +2209,16 @@ impl Shell {
                 attachments.iter().map(|a| a.instance).collect();
             self.fence_instances(&instances)?;
             for attached in attachments {
-                let Some(envelope) = self.programs.envelope(attached.instance)? else {
+                let Some(mut envelope) = self.programs.envelope(attached.instance)? else {
                     continue;
                 };
                 let first = attached.lane as usize;
+                envelope.host_rows = lanes
+                    .iter()
+                    .skip(first)
+                    .take(attached.lanes.max(1) as usize)
+                    .map(|seated| seated.lane.tokens.len() as u32)
+                    .collect();
                 let carried = envelope.lanes();
                 if first + carried > lanes.len() {
                     return Err(Fault::program(
@@ -2679,19 +2685,6 @@ impl Shell {
             let rows_here = row.rows as usize;
             match ports.as_ref() {
                 Some(ports) => {
-                    if !seated.positions.is_empty() {
-                        return Err(Fault::program(
-                            "serve::prepare",
-                            format!(
-                                "lane {source} is bound in a device-resolved geometry \
-                                 class and its submission also states {} position(s); the \
-                                 class says the device resolves them, so honouring the \
-                                 submission would drop what the guest wrote and \
-                                 honouring the port would drop what the caller stated",
-                                seated.positions.len()
-                            ),
-                        ));
-                    }
                     ports.check_extent(have.saturating_add(row.rows))?;
                     for &token in ports.tokens_for(rows_here)? {
                         tokens.push(token as i32);
@@ -2701,6 +2694,11 @@ impl Shell {
                         .collect();
                     let stated: Vec<i32> = match ports.positions_for(have, rows_here)? {
                         Some(stated) => stated.iter().map(|&at| narrow(u64::from(at))).collect(),
+                        None if !seated.positions.is_empty() => seated
+                            .positions
+                            .iter()
+                            .map(|&at| narrow(u64::from(at)))
+                            .collect(),
                         None => rows.clone(),
                     };
                     positions.extend(if self.states_mrope { &rows } else { &stated });
