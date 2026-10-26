@@ -302,6 +302,11 @@ pub(crate) fn bind_context() -> Result<(), Fault> {
             })
         }
     };
+    // The driver first: in a process no runtime call has touched yet, the
+    // query answers `CUDA_ERROR_NOT_INITIALIZED`. Once initialized, `cuInit`
+    // returns at once and waits on nothing.
+    // SAFETY: takes only its flags, which must be 0.
+    driver("cuInit", unsafe { dr::cuInit(0) })?;
     let mut current: dr::CUcontext = std::ptr::null_mut();
     // SAFETY: `current` is a local out-pointer.
     driver("cuCtxGetCurrent", unsafe {
@@ -317,7 +322,6 @@ pub(crate) fn bind_context() -> Result<(), Fault> {
         // SAFETY: each out-pointer is a local, `ordinal` the runtime's own
         // device for this thread, and `primary` the context just retained.
         unsafe {
-            driver("cuInit", dr::cuInit(0))?;
             driver("cuDeviceGet", dr::cuDeviceGet(&raw mut device, ordinal))?;
             driver(
                 "cuDevicePrimaryCtxRetain",
