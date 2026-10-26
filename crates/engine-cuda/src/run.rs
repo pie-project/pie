@@ -775,16 +775,20 @@ impl<'c> Run<'c> {
     }
 
     /// Whether a region this fire seats no row of still launches: a bodied
-    /// fire's captured, shifting region launches at its ladder ceiling and
+    /// fire's captured, shifting region whose classes hold rungs of its key
+    /// (a wide key's, whichever are present) launches at that ceiling and
     /// reads its live rows (none) off the device, so the body holds the
-    /// same launches for every subset of its key's classes.
+    /// same launches for every subset of its key's classes. A region no rung
+    /// of the key holds (a plain key's absent class, an idle step's every
+    /// region) launches nothing, as walked.
     pub(crate) fn launches_at_ceiling(&self, region: u32) -> bool {
+        let standing = self.standing_at(region, 0);
         self.ceilings.carve.is_some()
             && self.windows.runs(region) == 1
             && self.windows.at(region, 0).span().rows == 0
-            && self.standing_at(region, 0).plane()
-            && self
-                .standing_at(region, 0)
+            && standing.plane()
+            && standing.ceiling().is_some_and(|(_, own)| own > 0)
+            && standing
                 .rows(MaskSpan::default())
                 .is_some_and(|rows| rows > 0)
     }
