@@ -139,6 +139,14 @@ impl Build {
         o
     }
 
+    /// `x` gathered whole across the tensor-parallel ranks.
+    pub(crate) fn gather(&mut self, x: ValueId, width: u64, guard: Guard) -> ValueId {
+        let node = self.trace.nodes.len() as u32;
+        let y = self.value(Def::Op(node), act(width));
+        self.push(Collective::AllGather { x, y }.into(), guard);
+        y
+    }
+
     pub(crate) fn merge(&mut self, arms: &[(ValueId, Guard)], width: u64) -> ValueId {
         self.value(Def::Merge(arms.to_vec()), act(width))
     }

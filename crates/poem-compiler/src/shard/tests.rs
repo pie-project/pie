@@ -1,13 +1,23 @@
 use poem_ir::Platform;
 
 /// The gathers that bring a layer's captured scores back whole, each read
-/// out as `attn.scores`: one per layer whose attention captures them.
+/// out as `attn.scores`: one per layer whose attention captures them, each
+/// under the scores fact as its capture is, so that a fire of no lane whose
+/// program reads scores runs neither (the walk skips a guarded gather where
+/// no row holds its guard).
 fn score_gathers(trace: &poem_ir::Trace) -> usize {
     (trace.outputs.iter())
         .filter(|output| output.name == "attn.scores")
         .filter(|output| match trace.values[output.value.0 as usize].def {
             poem_ir::Def::Op(at) => {
-                poem_ir::Operands::name(&trace.nodes[at as usize].op) == "collective.all_gather"
+                let node = &trace.nodes[at as usize];
+                let gathers = poem_ir::Operands::name(&node.op) == "collective.all_gather";
+                assert!(
+                    !gathers || trace.facts.implies(&node.guard, poem_ir::Builtin::Scores),
+                    "the gather at node {at} runs under {:?}, not the scores switch",
+                    node.guard
+                );
+                gathers
             }
             _ => false,
         })
@@ -77,7 +87,11 @@ fn an_inferred_package_reduces_each_projection_once() {
         2 * LLAMA_8B_LAYERS,
         "one per attention and one per mlp"
     );
-    assert_eq!(score_gathers(&trace), LLAMA_8B_LAYERS, "each layer's scores");
+    assert_eq!(
+        score_gathers(&trace),
+        LLAMA_8B_LAYERS,
+        "each layer's scores"
+    );
     assert_eq!(
         count("collective.all_gather"),
         1 + LLAMA_8B_LAYERS,

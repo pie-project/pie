@@ -173,8 +173,7 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
                 if passes > 1 {
                     sink.tail(node_at >= tail_start);
                 }
-                let collective = matches!(node.op, Operation::Collective(_));
-                if rows == 0 && !collective && !received(compiled, node, &mut outs) {
+                if rows == 0 && !runs_bare(node) && !received(compiled, node, &mut outs) {
                     continue;
                 }
                 dispatch.exec(node)?;
@@ -195,6 +194,24 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
     }
 
     Ok(())
+}
+
+/// Whether `node` runs over no rows of its own: a collective, which meets
+/// the other ranks of its group whatever its own rows (an expert's dispatch
+/// to a rank with none of its own). A tensor-parallel one under a guard (a
+/// layer's captured scores gathered whole, only for lanes whose program
+/// reads them) is the exception: every rank of its group fires the same
+/// lanes, so where none holds its guard every rank skips it together.
+fn runs_bare(node: &poem_ir::Node) -> bool {
+    match &node.op {
+        Operation::Collective(
+            poem_ir::Collective::AllReduce { .. }
+            | poem_ir::Collective::AllGather { .. }
+            | poem_ir::Collective::ReduceScatter { .. },
+        ) => node.guard == poem_ir::Guard::Always,
+        Operation::Collective(_) => true,
+        _ => false,
+    }
 }
 
 /// Whether `node` makes an expert region's value: it works on the rows this
@@ -340,6 +357,38 @@ mod tests {
 
     fn fire(compiled: &CompiledModel, lanes: &[Lane]) -> FireDescriptor {
         FireDescriptor::of(&compose(compiled, &budget(), lanes).expect("composes"))
+    }
+
+    /// A layer's scores captured and gathered whole under the fact a lane
+    /// holds only where its program reads them, beside the logits every lane
+    /// lands: a fire of no such lane skips the gather with the capture, as
+    /// every rank of the group does; one of such a lane runs both.
+    #[test]
+    fn a_guarded_gather_runs_only_where_a_lane_holds_its_guard() {
+        let mut b = Build::new();
+        let x = b.input(8);
+        let y = b.op(x, 4, Guard::Always);
+        let captured = b.op(x, 4, fact(0));
+        let whole = b.gather(captured, 8, fact(0));
+        let everyone = b.gather(y, 8, Guard::Always);
+        b.out(everyone).out(whole);
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
+        let ran = |word: u64| {
+            let descriptor = fire(&compiled, &[Lane::new(word, 3)]);
+            let mut dispatch = MockDispatch::new(&b.trace);
+            walk(
+                &b.trace,
+                &compiled,
+                &descriptor,
+                &mut dispatch,
+                &mut EagerSink,
+                Filter::default(),
+            )
+            .expect("walks");
+            dispatch.nodes()
+        };
+        assert_eq!(ran(0), vec![0, 3], "the logits and their gather alone");
+        assert_eq!(ran(1), vec![0, 1, 2, 3], "the capture and its gather too");
     }
 
     #[test]
