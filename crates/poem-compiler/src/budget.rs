@@ -390,3 +390,52 @@ pub fn voxels_within(room: u64, floor: u32, bytes_at: impl Fn(u32) -> u64) -> u3
     }
     voxels
 }
+
+/// The state slots a load holds: `stated`, or where none is (0) and the
+/// model's only state is voxel frame caches, one for each clip a fire
+/// carries in each fire in flight; else `otherwise`.
+#[must_use]
+pub fn state_slots(
+    stated: u32,
+    trace: &poem_ir::Trace,
+    voxels: Option<&VoxelLadder>,
+    frames_in_flight: u8,
+    otherwise: u32,
+) -> u32 {
+    if stated > 0 {
+        return stated;
+    }
+    match voxels {
+        Some(ladder) if frame_caches_only(trace) => ladder
+            .max_clips
+            .saturating_mul(u32::from(frames_in_flight.max(1))),
+        _ => otherwise,
+    }
+}
+
+fn frame_caches_only(trace: &poem_ir::Trace) -> bool {
+    use poem_ir::{CacheRow, Conv, Def, Operation};
+    let mut framed = vec![false; trace.caches.len()];
+    for node in &trace.nodes {
+        let cache = match &node.op {
+            Operation::Conv(Conv::Conv3d { cache, .. }) => *cache,
+            Operation::Conv(Conv::CacheStore { cache, .. }) => Some(*cache),
+            _ => None,
+        };
+        if let Some(Def::Cache(row)) = cache
+            .and_then(|v| trace.values.get(v.0 as usize))
+            .map(|d| &d.def)
+            && let Some(seen) = framed.get_mut(*row as usize)
+        {
+            *seen = true;
+        }
+    }
+    let states: Vec<bool> = trace
+        .caches
+        .iter()
+        .zip(&framed)
+        .filter(|(row, _)| matches!(row, CacheRow::State { .. }))
+        .map(|(_, framed)| *framed)
+        .collect();
+    !states.is_empty() && states.iter().all(|framed| *framed)
+}

@@ -92,12 +92,16 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             );
         }
     }
-    if boot.slots == 0 {
-        boot.slots = match engine.state_slots_per_lane {
+    boot.slots = poem_compiler::state_slots(
+        boot.slots,
+        &boot.trace,
+        boot.voxels.as_ref(),
+        boot.runahead.frames_in_flight,
+        match engine.state_slots_per_lane {
             0 => DEFAULT_STATE_SLOTS,
             per_lane => per_lane.saturating_mul(boot.budget.max_lanes).max(1),
-        };
-    }
+        },
+    );
 
     kernels_cuda::disk::install(boot.cache_dir);
 

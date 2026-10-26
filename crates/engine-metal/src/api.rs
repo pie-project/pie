@@ -174,6 +174,8 @@ fn extents(stated: &BindExtents) -> eta_exec::Extents {
 /// so its arena scratch fits beside resident weights.
 const MIN_FITTED_FORWARD_TOKENS: u32 = 512;
 
+const DEFAULT_STATE_SLOTS: u32 = 256;
+
 fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
@@ -345,10 +347,23 @@ impl Engine for Metal {
             (device.working_set(), device.held_elsewhere())
         };
         let util = residency.device_memory_share;
+        let slots = poem_compiler::state_slots(
+            budgets.slots,
+            &trace,
+            poem_compiler::VoxelLadder::of(
+                &trace,
+                budgets.max_voxels,
+                budgets.max_clips,
+                budgets.max_lanes,
+            )
+            .as_ref(),
+            frames_in_flight,
+            DEFAULT_STATE_SLOTS,
+        );
         let paging = crate::store::kv::Paging::of(
             budgets.page_size,
             budgets.max_context,
-            engine::fit::least_state_slots(1).min(budgets.slots),
+            engine::fit::least_state_slots(1).min(slots),
             1,
         )
         .map_err(|error| fault(Fault::from(error)))?;
@@ -419,7 +434,7 @@ impl Engine for Metal {
                 profile: None::<DeviceProfile>,
                 page_size: budgets.page_size,
                 context: budgets.max_context,
-                slots: budgets.slots,
+                slots,
                 kv_budget: residency.device_kv_budget,
                 memory_share: residency.device_memory_share,
                 runahead: engine::runahead::Runahead::of(frames_in_flight),

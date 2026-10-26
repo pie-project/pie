@@ -224,6 +224,8 @@ fn runahead_of(frames_in_flight: u8) -> engine::runahead::Runahead {
     engine::runahead::Runahead::of(frames_in_flight.max(1))
 }
 
+const DEFAULT_STATE_SLOTS: u32 = 256;
+
 fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
@@ -390,6 +392,13 @@ impl Engine for Wgpu {
             budgets.max_clips,
             budgets.max_lanes,
         );
+        let slots = poem_compiler::state_slots(
+            budgets.slots,
+            &trace,
+            voxels.as_ref(),
+            frames_in_flight,
+            DEFAULT_STATE_SLOTS,
+        );
         let shell = Shell::load(Boot {
             trace,
             contract: &contract,
@@ -401,7 +410,7 @@ impl Engine for Wgpu {
             profile: None::<DeviceProfile>,
             page_size: budgets.page_size,
             context: budgets.max_context,
-            slots: budgets.slots,
+            slots,
 
             runahead: runahead_of(frames_in_flight),
             device: &self.boot,

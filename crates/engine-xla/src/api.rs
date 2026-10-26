@@ -212,6 +212,8 @@ pub(crate) fn fault(fault: Fault) -> Error {
     }
 }
 
+const DEFAULT_STATE_SLOTS: u32 = 256;
+
 fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
@@ -328,7 +330,7 @@ impl Engine for Xla {
             budgets,
             residency,
             ordinal,
-            frames_in_flight: _,
+            frames_in_flight,
         } = request;
         let mut boot = self.boot.clone();
         if ordinal > 0 {
@@ -347,6 +349,13 @@ impl Engine for Xla {
             budgets.max_clips,
             budgets.max_lanes,
         );
+        let slots = poem_compiler::state_slots(
+            budgets.slots,
+            &trace,
+            voxels.as_ref(),
+            frames_in_flight,
+            DEFAULT_STATE_SLOTS,
+        );
         let shell = Shell::load_with(
             Boot {
                 patches,
@@ -356,7 +365,7 @@ impl Engine for Xla {
                 budget: bake_budgets(&budgets),
                 page_size: budgets.page_size,
                 context: budgets.max_context,
-                slots: budgets.slots,
+                slots,
                 kv_budget: residency.device_kv_budget,
                 memory_share: residency.device_memory_share,
                 device: &boot,
