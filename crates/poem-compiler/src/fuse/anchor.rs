@@ -1076,18 +1076,6 @@ struct Append {
 /// and v pieces of the product (`windows`) as wide as the cache's planes, a
 /// cache of bf16 or e4m3 (a unit scale, vLLM's `fp8`) holding whole heads,
 /// and the slot mapping one i32 a row.
-/// The block-scaled rows kernels-ir lands of a trace's declared format.
-#[must_use]
-pub fn block_rows(format: poem_ir::KvRows) -> kernels_ir::BlockRows {
-    match format {
-        poem_ir::KvRows::V4 => kernels_ir::BlockRows::V4,
-        poem_ir::KvRows::Mx8 => kernels_ir::BlockRows::MX8,
-        poem_ir::KvRows::Nv4 => kernels_ir::BlockRows::NV4,
-        poem_ir::KvRows::Fp4Keys => kernels_ir::BlockRows::FP4_KEYS,
-        poem_ir::KvRows::Fp8 { width } => kernels_ir::BlockRows::fp8(width),
-    }
-}
-
 fn append_of(
     trace: &Trace,
     node: u32,
@@ -1111,22 +1099,14 @@ fn append_of(
         planes,
         dtype,
         live: None,
-        rows,
         ..
     }) = trace.caches.get(row as usize)
     else {
         return None;
     };
-    let (dtype, blocks) = match (dtype, rows) {
-        (Dtype::Bf16, None) => (CacheDtype::Bf16, None),
-        (Dtype::E4m3, None) => (CacheDtype::E4m3 { scale: 1.0 }, None),
-        // vLLM's standard fp8 rows: e4m3 under a unit scale, a byte a column
-        (Dtype::U8, Some(poem_ir::KvRows::Fp8 { .. })) => (CacheDtype::E4m3 { scale: 1.0 }, None),
-        // DeepSeek's rows: a u8 plane a row of the format's bytes
-        (Dtype::U8, Some(format)) => {
-            let rows = block_rows(*format);
-            (CacheDtype::Blocks(rows), Some(rows))
-        }
+    let dtype = match dtype {
+        Dtype::Bf16 => CacheDtype::Bf16,
+        Dtype::E4m3 => CacheDtype::E4m3 { scale: 1.0 },
         _ => return None,
     };
     // a piece of the product, or (no split) its whole tile
@@ -1137,14 +1117,7 @@ fn append_of(
         })
     };
     let kw = piece(k)?;
-    // a plane of the window's columns, or of a block-scaled row's bytes
-    // where the window is the row's columns
-    let wide = |w: Window, plane: usize| match blocks {
-        None => planes.get(plane) == Some(&u64::from(w.width)),
-        Some(rows) => {
-            w.width == rows.width() && planes.get(plane) == Some(&u64::from(rows.row_bytes()))
-        }
-    };
+    let wide = |w: Window, plane: usize| planes.get(plane) == Some(&u64::from(w.width));
     let laid = match v {
         Some(v) => wide(kw, 0) && piece(v).is_some_and(|vw| wide(vw, 1)),
         None => planes.len() == 1 && wide(kw, 0),
