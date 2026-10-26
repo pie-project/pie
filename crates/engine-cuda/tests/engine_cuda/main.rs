@@ -29,6 +29,7 @@ mod common_two_axis;
 mod common_vae;
 
 mod a_bank_says_which_site_it_corrects;
+mod a_beam_reads_up_to_its_slot_what_its_mask_admits;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
 mod a_buffer_frees_after_another_context_closes;
 mod a_buffered_fold_is_the_fold_it_replaces;
@@ -38,6 +39,7 @@ mod a_cell_table_reads_each_rows_patch_and_group;
 mod a_channel_fed_voxel_input_lands_the_committed_cell;
 mod a_context_input_merged_into_the_stream_lands_its_rows;
 mod a_conv_decoder_fires_over_a_voxel_input;
+mod a_decode_envelope_packs_its_device_mask_into_each_lane;
 mod a_declined_mega_moe_answers_what_its_legs_answer;
 mod a_dit_plan_loads_at_a_sixty_four_k_row_ceiling;
 mod a_double_block_fires_two_streams_through_the_engine;
