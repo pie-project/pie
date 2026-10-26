@@ -213,6 +213,11 @@ fn inputs(gpu: &mut Gpu, lcg: &mut Lcg, case: Case, m: usize, n: usize) -> (Vec<
                 ins.push(In::tile(at, n as u32));
                 given.push(Given::Tile(v));
             }
+            Input::Head(size) => {
+                let (at, v) = up(size as usize);
+                ins.push(In::head(at, size));
+                given.push(Given::Column(v));
+            }
         }
     }
     (ins, given)
@@ -560,4 +565,259 @@ fn cublaslts_own_epilogue_lands_the_anchored_region() {
             .lt()
             .is_none()
     );
+}
+
+/// A packed qkv product's attention prologue as the compiler lowers it: each
+/// head normed by its own mean square (q's and k's heads each by their own
+/// weight, one head wide, where `normed`), q's and k's heads turned at the
+/// row's position (NeoX halves, every column of the head), v's as they are,
+/// each landing its own window: q, k, v.
+fn qkv(q_heads: usize, kv_heads: usize, hd: usize, k: usize, normed: bool) -> Anchored {
+    use kernels_ir::anchor::Window;
+    use kernels_ir::build::{Ops, Pairs, Turn};
+    let (q, kv) = (q_heads * hd, kv_heads * hd);
+    let n = q + 2 * kv;
+    let params = if normed { 4 } else { 2 };
+    let mut b = Ops::new(params);
+    let pos = params - 1;
+    let x = if normed {
+        let normed = b.rms_normed_heads(0, hd as u32, 1e-6);
+        let col = b.push(Op::Column);
+        let edge = b.u32(q as u32);
+        let in_q = b.push(Op::Binary(Binary::Lt, col, edge));
+        let w = b.push(Op::Select(in_q, 1, 2));
+        b.push(Op::Binary(Binary::Mul, normed, w))
+    } else {
+        0
+    };
+    let turn = Turn {
+        head_dim: hd as u32,
+        pairs: Pairs::Halves {
+            rotary: hd as u32,
+            span: hd as u32 / 2,
+        },
+        theta: 1_000_000.0,
+        inverse: false,
+        ramp: None,
+    };
+    let turned = b.rotate(x, pos, &turn);
+    let mut rounds = vec![(turned, Bf16)];
+    if normed {
+        rounds.push((x, Bf16));
+    }
+    let mut inputs = Vec::new();
+    if normed {
+        inputs.extend([Input::Head(hd as u32), Input::Head(hd as u32)]);
+    }
+    inputs.push(Input::Row);
+    let mut shapes = vec![Shape::Row; params as usize - 1];
+    shapes.push(Shape::Scalar);
+    Anchored {
+        epilogue: Some(Pointwise {
+            region: Region {
+                width: n as u32,
+                params: shapes,
+                ops: b.ops,
+                results: vec![turned, turned, 0],
+                rounds,
+            },
+            inputs,
+        }),
+        windows: vec![
+            Window {
+                from: 0,
+                width: q as u32,
+            },
+            Window {
+                from: q as u32,
+                width: kv as u32,
+            },
+            Window {
+                from: (q + kv) as u32,
+                width: kv as u32,
+            },
+        ],
+        ..Anchored::plain(contraction(n, k, Layout::Dense, None))
+    }
+}
+
+/// A product's ulp, then a norm's and a turn's ([`crate::elemwise::within`]'s
+/// `TURN`) over it.
+const TURNED: f32 = PRODUCT + 4.0;
+
+/// The inputs of [`qkv`]'s region at `m` rows: the heads' weights (where
+/// normed) and the rows' positions, stored i32.
+fn qkv_inputs(
+    gpu: &mut Gpu,
+    lcg: &mut Lcg,
+    m: usize,
+    hd: usize,
+    normed: bool,
+) -> (Vec<In>, Vec<Given>, Vec<Dtype>) {
+    let (mut ins, mut given, mut stored) = (Vec::new(), Vec::new(), Vec::new());
+    if normed {
+        for _ in 0..2 {
+            let (raw, exact) = lcg.row(hd);
+            ins.push(In::head(gpu.up(&raw), hd as u32));
+            given.push(Given::Column(exact));
+            stored.push(Bf16);
+        }
+    }
+    let pos: Vec<i32> = (0..m).map(|r| (r * 977 % 4093) as i32).collect();
+    ins.push(In::row(gpu.up(&pos)).i32());
+    given.push(Given::Row(pos.iter().map(|&p| p as f32).collect()));
+    stored.push(Dtype::I32);
+    (ins, given, stored)
+}
+
+/// [`qkv`]'s epilogue lands each window as the interpreter does: on the
+/// skinny skeleton, whose block holds whole heads (64, 128 and 256 wide, a
+/// head's lanes in one warp), at a decode's rows and a full tile, and
+/// through the tuner's entry, a prefill's rows past the skinny's on the
+/// unfused leg (one piece a window, each its columns shifted). The gemv and
+/// the few-rows skeletons, a column a warp, hold no head.
+#[test]
+fn a_heads_norm_and_turn_lands_its_windows_as_the_interpreter() {
+    let tuning = Tuning::DEFAULT;
+    #[rustfmt::skip]
+    let shapes = [
+        (1, 4, 2, 64, 256, true), (5, 4, 1, 128, 512, true), (64, 2, 1, 256, 256, true),
+        (3, 8, 2, 128, 256, false), (1, 16, 8, 128, 1024, true),
+    ];
+    for (m, qh, kvh, hd, k, normed) in shapes {
+        let anchored = qkv(qh, kvh, hd, k, normed);
+        assert_eq!(anchored.verify(), Ok(()));
+        let n = (qh + 2 * kvh) * hd;
+        let what = format!("{qh}+{kvh}x{hd} heads, {m}x{k}, normed {normed}");
+        let mut gpu = Gpu::open();
+        let mut lcg = Lcg::seeded((m * 13 + n + k) as u64);
+        let (ins, given, stored) = qkv_inputs(&mut gpu, &mut lcg, 100, hd, normed);
+        let epi = Epilogue::interned_stored(&anchored, &stored).expect("the skeletons take it");
+        assert_eq!(epi.span(), hd as u32, "{what}");
+        assert!(
+            skeleton::serves(&anchored, &stored, &[Bf16; 3]).is_ok(),
+            "{what}"
+        );
+        for other in [Skeleton::Gemv, Skeleton::Rows] {
+            assert!(!other.covers(epi, m as i32, n as i32, k as i32, &tuning));
+        }
+        assert!(
+            Skeleton::Skinny.covers(epi, m as i32, n as i32, k as i32, &tuning),
+            "{what}"
+        );
+        let widths = [qh * hd, kvh * hd, kvh * hd];
+        for (rows, through) in [(m, false), (m, true), (100, true)] {
+            let (wr, wv) = lcg.row(n * k);
+            let (ar, av) = lcg.row(rows * k);
+            let (w, act) = (gpu.up(&wr), gpu.up(&ar));
+            let outs: Vec<u64> = widths.iter().map(|wd| gpu.zeros(rows * wd * 2)).collect();
+            let fire = |gpu: &Gpu| {
+                let ctx = gpu.ctx();
+                if through {
+                    let landed: Vec<_> = outs
+                        .iter()
+                        .zip(widths)
+                        .map(|(&o, wd)| t(o, rows, wd, Bf16))
+                        .collect();
+                    let served = gemm::anchored(
+                        &ctx,
+                        "test.qkv",
+                        epi,
+                        t(act, rows, k, Bf16),
+                        t(w, n, k, Bf16),
+                        &ins,
+                        &landed,
+                    )
+                    .unwrap_or_else(|e| panic!("{what} fires: {e:?}"));
+                    assert!(served, "{what}: served at {rows} rows");
+                } else {
+                    Skeleton::Skinny
+                        .fire(
+                            &ctx,
+                            epi,
+                            w,
+                            act,
+                            &ins,
+                            &outs,
+                            rows as i32,
+                            n as i32,
+                            k as i32,
+                        )
+                        .unwrap_or_else(|e| panic!("{what} fires: {e:?}"));
+                }
+            };
+            // The tuner's first call times its candidates, the second fires
+            // its pick.
+            fire(&gpu);
+            fire(&gpu);
+            gpu.sync();
+            let given: Vec<Given> = given
+                .iter()
+                .map(|g| match g {
+                    Given::Row(p) => Given::Row(p[..rows].to_vec()),
+                    other => other.clone(),
+                })
+                .collect();
+            let want = eval(&anchored, rows, &av, &wv, &[], &given).expect("the interpreter runs");
+            let mut got = Vec::new();
+            for (r, (&at, wd)) in outs.iter().zip(widths).enumerate() {
+                let landed: Vec<u16> = gpu.down(at, rows * wd);
+                let want: Vec<f32> = want[r].iter().map(|&v| round_bf16(v)).collect();
+                let case = format!("{what}: {rows} rows through the tuner {through}, window {r}");
+                assert_within(&case, &landed, &want, TURNED);
+                got.push(landed);
+            }
+            fire(&gpu);
+            gpu.sync();
+            for (r, (&at, wd)) in outs.iter().zip(widths).enumerate() {
+                let again: Vec<u16> = gpu.down(at, rows * wd);
+                deterministic(&format!("{what}: window {r}"), &got[r], &again);
+            }
+        }
+    }
+}
+
+/// A turn of every head of a row wider than the row skeleton holds (q
+/// alone, no windows): its unfused leg cut into slices of whole heads, each
+/// reading its columns shifted to the slice's, lands what the whole row
+/// does.
+#[test]
+fn a_turned_row_past_the_row_skeletons_width_lands_on_its_slices() {
+    let (hd, heads, k, m) = (128usize, 72usize, 256usize, 100usize);
+    let n = hd * heads;
+    let mut anchored = qkv(heads, 0, hd, k, false);
+    anchored.windows.clear();
+    if let Some(epi) = anchored.epilogue.as_mut() {
+        epi.region.results = vec![epi.region.results[0]];
+    }
+    anchored.contraction.n = n as u32;
+    if let Some(epi) = anchored.epilogue.as_mut() {
+        epi.region.width = n as u32;
+    }
+    assert_eq!(anchored.verify(), Ok(()));
+    let mut gpu = Gpu::open();
+    let mut lcg = Lcg::seeded(77);
+    let (ins, given, stored) = qkv_inputs(&mut gpu, &mut lcg, m, hd, false);
+    let epi = Epilogue::interned_stored(&anchored, &stored).expect("the skeletons take it");
+    assert!(skeleton::serves(&anchored, &stored, &[Bf16]).is_ok());
+    let (wr, wv) = lcg.row(n * k);
+    let (ar, av) = lcg.row(m * k);
+    let (w, act, y) = (gpu.up(&wr), gpu.up(&ar), gpu.zeros(m * n * 2));
+    for _ in 0..2 {
+        let served = gemm::anchored(
+            &gpu.ctx(),
+            "test.turn",
+            epi,
+            t(act, m, k, Bf16),
+            t(w, n, k, Bf16),
+            &ins,
+            &[t(y, m, n, Bf16)],
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(served);
+    }
+    gpu.sync();
+    let want = eval(&anchored, m, &av, &wv, &[], &given).expect("runs");
+    let want: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
+    assert_within("a turn's slices", &gpu.down::<u16>(y, m * n), &want, TURNED);
 }

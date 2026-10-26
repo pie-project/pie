@@ -601,7 +601,10 @@ fn unfused(
         let rows = run.min(m as usize - from);
         let at = |base: u64, width: usize| base + (from * width * 2) as u64;
         let ins: Vec<In> = ins.iter().map(|input| input.from_row(from)).collect();
-        let outs: Vec<u64> = outs.iter().map(|&out| at(out, n as usize)).collect();
+        let outs: Vec<u64> = (0..outs.len())
+            .zip(outs)
+            .map(|(r, &out)| at(out, epi.window(r, n.unsigned_abs()).width as usize))
+            .collect();
         let rows_i = i32::try_from(rows).unwrap_or(i32::MAX);
         product(
             ctx,

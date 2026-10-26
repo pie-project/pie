@@ -209,7 +209,9 @@ pub fn body(kernel: &Kernel) -> Result<String, Unprinted> {
             }
             if row.kept {
                 let _ = writeln!(s, "    v{value}[e] = {e};");
-            } else if row.unread {
+            } else if row.unread && row.also.is_empty() {
+                // a value stored and read by nothing else; one stored to
+                // more results is named, the later stores reading it
                 let _ = writeln!(s, "    {e};");
             } else {
                 let _ = writeln!(s, "    const {} v{value} = {e};", c_type(row.elem));

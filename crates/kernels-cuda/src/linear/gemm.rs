@@ -72,20 +72,22 @@ pub fn anchored(
 ) -> Result<bool, Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
     dtype_dispatch!(op, w.dtype, { Bf16 => () });
-    let Some(first) = outs.first() else {
+    if outs.is_empty() {
         return Err(crate::jit::refuse(op, "an anchored region of no result"));
-    };
-    let n = count(op, "the columns this projection lands", first.width)?;
+    }
+    let tile = w.rows / epi.parts().max(1);
+    let n = count(op, "the columns this projection lands", tile)?;
     let k = count(op, "the contraction this projection walks", act.width)?;
-    let shaped = outs
-        .iter()
-        .all(|y| y.dtype == Dtype::Bf16 && y.width == first.width && y.rows == act.rows);
-    if !shaped || w.width != act.width || w.rows != first.width * epi.parts() {
+    // Each result its window of the tile (every column, or a split's piece).
+    let shaped = (0..outs.len()).zip(outs).all(|(at, y)| {
+        y.dtype == Dtype::Bf16 && y.width == epi.window(at, tile).width && y.rows == act.rows
+    });
+    if !shaped || w.width != act.width || w.rows != tile * epi.parts() || !epi.fits(tile) {
         return Err(crate::jit::refuse(
             op,
             format!(
                 "the weight is {} x {} and the region contracts {k} into {} part(s) of {n}, \
-                 every result bf16 and of the activation's rows",
+                 every result bf16, of the activation's rows and its window's columns",
                 w.rows,
                 w.width,
                 epi.parts()

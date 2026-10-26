@@ -8,9 +8,13 @@
 //!   [`Anchored`]) epilogue scheduled and printed by the row skeleton's printer
 //!   ([`crate::synth::Body`]), whose hooks the tile hook provides, `f.ld(k,
 //!   e)` reading the parts' products below the parts and the inputs above.
-//!   No epilogue is the plain store: each product stored as it is. A region
-//!   over a tile is pointwise (kernels-ir refuses one that is not), so its
-//!   body is the same at every width, and one epilogue serves every `n`.
+//!   No epilogue is the plain store: each product stored as it is. A
+//!   pointwise region's body is the same at every width, so one epilogue
+//!   serves every `n`; one that combines a head's columns (its span: a
+//!   head's norm, a rotary pair), reads a column's index or lands its
+//!   results in windows (a split's pieces) is of its own `n` alone, and
+//!   only the skinny skeleton, whose tile holds whole heads, fires a span.
+//!   An input is bf16, or i32 one element a row (a row's position).
 //! - **The skeletons** ([`Skeleton`]): which shapes each covers, and its fire with
 //!   an epilogue filled in.
 //! - **Identity.** One generated unit a body, `linear/hooked/<hash>.cu`:
@@ -28,8 +32,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use dtype::Dtype;
-pub use kernels_ir::anchor::{Anchored, Contraction, Input, Layout, Pointwise, Quant};
-use kernels_ir::{Region, Shape};
+pub use kernels_ir::anchor::{Anchored, Contraction, Input, Layout, Pointwise, Quant, Window};
+use kernels_ir::{Binary, Literal, Op, Region, Shape};
 
 use crate::error::Error;
 use crate::jit::{Kernel, Root, refuse};
@@ -47,53 +51,76 @@ pub(crate) const MAX_INS: usize = 8;
 pub(crate) const MAX_OUTS: usize = 4;
 
 /// `pie::linear::EpiIn`, field for field: an input's element `(row, col)`
-/// at `base[row * row_stride + col * col_stride]`.
+/// at `base[row * row_stride + (col % period) * col_stride]` (`period` 0:
+/// the column as it is), bf16 (`dtype` 0) or i32 (1).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct In {
     base: u64,
     row_stride: i64,
     col_stride: i64,
+    dtype: i64,
+    period: i64,
 }
 
 impl In {
+    const fn of(base: u64, row_stride: i64, col_stride: i64) -> In {
+        In {
+            base,
+            row_stride,
+            col_stride,
+            dtype: 0,
+            period: 0,
+        }
+    }
+
     /// A tile of the product's extent, its rows `ld` apart (a residual).
     #[must_use]
     pub const fn tile(base: u64, ld: u32) -> In {
-        In {
-            base,
-            row_stride: ld as i64,
-            col_stride: 1,
-        }
+        In::of(base, ld as i64, 1)
     }
 
     /// A vector one a column, every row reading it (a bias).
     #[must_use]
     pub const fn column(base: u64) -> In {
+        In::of(base, 0, 1)
+    }
+
+    /// A vector of a head `size` columns wide, every head reading it (a
+    /// head's norm weight).
+    #[must_use]
+    pub const fn head(base: u64, size: u32) -> In {
         In {
-            base,
-            row_stride: 0,
-            col_stride: 1,
+            period: size as i64,
+            ..In::of(base, 0, 1)
         }
     }
 
     /// A vector one a row (a row's scale).
     #[must_use]
     pub const fn row(base: u64) -> In {
-        In {
-            base,
-            row_stride: 1,
-            col_stride: 0,
-        }
+        In::of(base, 1, 0)
     }
 
     /// One value for the whole tile (a layer's scale).
     #[must_use]
     pub const fn one(base: u64) -> In {
-        In {
-            base,
-            row_stride: 0,
-            col_stride: 0,
+        In::of(base, 0, 0)
+    }
+
+    /// The same input stored as i32 (a row's position).
+    #[must_use]
+    pub const fn i32(self) -> In {
+        In { dtype: 1, ..self }
+    }
+
+    /// How its elements are stored.
+    #[must_use]
+    pub const fn dtype(self) -> Dtype {
+        if self.dtype == 1 {
+            Dtype::I32
+        } else {
+            Dtype::Bf16
         }
     }
 
@@ -102,8 +129,9 @@ impl In {
     #[cfg(feature = "cuda")]
     #[must_use]
     pub(crate) const fn from_row(self, row: usize) -> In {
+        let size = if self.dtype == 1 { 4 } else { 2 };
         In {
-            base: self.base + (row as i64 * self.row_stride * 2) as u64,
+            base: self.base + (row as i64 * self.row_stride * size) as u64,
             ..self
         }
     }
@@ -118,6 +146,7 @@ impl In {
     const fn kind(self) -> Input {
         match (self.row_stride, self.col_stride) {
             (0, 0) => Input::One,
+            (0, _) if self.period > 0 => Input::Head(self.period as u32),
             (0, _) => Input::Column,
             (_, 0) => Input::Row,
             _ => Input::Tile,
@@ -143,6 +172,17 @@ pub struct Epilogue {
     plain: bool,
     /// The cuBLASLt epilogue that lands what this one does, where one does.
     lt: Option<LtEpilogue>,
+    /// The window of the tile each result lands, or none: every column.
+    windows: Vec<Window>,
+    /// The columns of each group the body combines within (a head), 1
+    /// where it is pointwise ([`Pointwise::span`]).
+    span: u32,
+    /// The tile's columns, where the body is of them alone (it combines
+    /// columns, reads a column's index or lands windows): a fire of any
+    /// other `n` is no fire of it.
+    fixed: Option<u32>,
+    /// How each input is stored: bf16, or i32 (a row's position).
+    stored: Vec<Dtype>,
 }
 
 /// What cuBLASLt's own epilogues land over one dense bank's products: a
@@ -225,6 +265,9 @@ impl PartialEq for Epilogue {
             && self.inputs == other.inputs
             && self.results == other.results
             && self.round == other.round
+            && self.windows == other.windows
+            && self.fixed == other.fixed
+            && self.stored == other.stored
     }
 }
 
@@ -234,8 +277,15 @@ impl Epilogue {
     /// `anchored`'s epilogue printed for the skeletons' hook, or why no skeleton
     /// takes it: a skeleton reads bf16 operands as they are stored (a prologue
     /// runs as a region of its own before the product), rounds a product to
-    /// bf16 or not at all, and lands bf16 planes.
+    /// bf16 or not at all, and lands bf16 planes; its inputs bf16.
     pub fn of(anchored: &Anchored) -> Result<Epilogue, Error> {
+        let inputs = anchored.epilogue.as_ref().map_or(0, |e| e.inputs.len());
+        Epilogue::of_stored(anchored, &vec![Dtype::Bf16; inputs])
+    }
+
+    /// [`Epilogue::of`] with its inputs stored as `stored` says: bf16, or
+    /// i32 where an input is one element a row or one value (a position).
+    pub fn of_stored(anchored: &Anchored, stored: &[Dtype]) -> Result<Epilogue, Error> {
         anchored
             .verify()
             .map_err(|why| refuse(OP, format!("not an anchored region: {why}")))?;
@@ -289,10 +339,40 @@ impl Epilogue {
         {
             return Err(refuse(OP, "a result stored other than bf16"));
         }
+        if stored.len() != inputs.len() {
+            return Err(refuse(OP, "the inputs' dtypes are not one an input"));
+        }
+        for (input, dtype) in inputs.iter().zip(stored) {
+            let held = match dtype {
+                Dtype::Bf16 => true,
+                Dtype::I32 => matches!(input, Input::Row | Input::One),
+                _ => false,
+            };
+            if !held {
+                return Err(refuse(
+                    OP,
+                    format!(
+                        "an input {input:?} stored {dtype:?}: the skeletons read bf16, and i32 one \
+                         element a row or one value"
+                    ),
+                ));
+            }
+        }
         let body = Body::of(&region).map_err(|why| refuse(OP, why.to_string()))?;
         let plain = anchored.epilogue.is_none();
         let root = unit(&body)?;
-        let lt = if parts == 1 && !round && !plain {
+        let windows = anchored.windows.clone();
+        if windows.iter().any(|w| w.from % 8 != 0 || w.width % 8 != 0) {
+            return Err(refuse(
+                OP,
+                "a result's window is no whole run of eight columns, and the skeletons store \
+                 whole runs",
+            ));
+        }
+        let span = anchored.epilogue.as_ref().map_or(1, |e| e.span(c.n));
+        let columned = region.ops.iter().any(|op| matches!(op, Op::Column));
+        let fixed = (span > 1 || columned || !windows.is_empty()).then_some(c.n);
+        let lt = if parts == 1 && !round && !plain && fixed.is_none() {
             LtEpilogue::matching(&region, &inputs)
         } else {
             None
@@ -307,14 +387,28 @@ impl Epilogue {
             inputs,
             round,
             plain,
+            windows,
+            span,
+            fixed,
+            stored: stored.to_vec(),
         })
     }
 
     /// `anchored`'s epilogue ([`Epilogue::of`]), one for the life of the
     /// process: the same reference for every call with the same region.
     pub fn interned(anchored: &Anchored) -> Result<&'static Epilogue, Error> {
+        let inputs = anchored.epilogue.as_ref().map_or(0, |e| e.inputs.len());
+        Epilogue::interned_stored(anchored, &vec![Dtype::Bf16; inputs])
+    }
+
+    /// [`Epilogue::of_stored`], one for the life of the process.
+    pub fn interned_stored(
+        anchored: &Anchored,
+        stored: &[Dtype],
+    ) -> Result<&'static Epilogue, Error> {
         static EPILOGUES: OnceLock<Mutex<HashMap<u64, &'static Epilogue>>> = OnceLock::new();
-        let key = anchored.key();
+        let key =
+            anchored.key() ^ kernels_ir::fnv1a64(format!("{stored:?}").as_bytes()).rotate_left(29);
         let table = EPILOGUES.get_or_init(|| Mutex::new(HashMap::new()));
         if let Some(found) = table
             .lock()
@@ -323,7 +417,7 @@ impl Epilogue {
         {
             return Ok(found);
         }
-        let made: &'static Epilogue = Box::leak(Box::new(Epilogue::of(anchored)?));
+        let made: &'static Epilogue = Box::leak(Box::new(Epilogue::of_stored(anchored, stored)?));
         Ok(*table
             .lock()
             .expect("epilogue table lock poisoned")
@@ -385,10 +479,39 @@ impl Epilogue {
         self.plain
     }
 
+    /// The columns of each group its body combines within: 1 where it is
+    /// pointwise.
+    #[must_use]
+    pub const fn span(&self) -> u32 {
+        self.span
+    }
+
+    /// The window of the tile result `k` lands at `n` columns.
+    #[must_use]
+    pub fn window(&self, k: usize, n: u32) -> Window {
+        self.windows
+            .get(k)
+            .copied()
+            .unwrap_or(Window { from: 0, width: n })
+    }
+
+    /// Whether it serves a tile of `n` columns: any, or the one its body is
+    /// of alone.
+    #[must_use]
+    pub fn fits(&self, n: u32) -> bool {
+        self.fixed.is_none_or(|fixed| fixed == n)
+    }
+
     /// The printed body's hash: its part of a kernel's key.
     #[must_use]
     pub const fn hash(&self) -> u64 {
         self.body.hash
+    }
+
+    /// The floats its body tables what a column alone computes in.
+    #[must_use]
+    pub const fn table(&self) -> u32 {
+        self.body.table
     }
 
     /// The kernel of skeleton template `template` (`::pie::linear::<template>`)
@@ -407,9 +530,9 @@ impl Epilogue {
     }
 
     /// The `pie::linear::Epi<IN, OUT>` a fire passes: `ins` (one a region
-    /// input, each of its kind) and `outs` (one a result, each `m x n`, `ld`
-    /// elements a row).
-    pub(crate) fn planes(&self, ins: &[In], outs: &[u64], ld: u32) -> Result<Vec<u64>, Error> {
+    /// input, each of its kind) and `outs` (one a result, each `m` rows of
+    /// its window of the `n`-column tile, as wide a row).
+    pub(crate) fn planes(&self, ins: &[In], outs: &[u64], n: u32) -> Result<Vec<u64>, Error> {
         if ins.len() != self.inputs.len() || outs.len() != self.results {
             return Err(refuse(
                 OP,
@@ -423,15 +546,21 @@ impl Epilogue {
                 ),
             ));
         }
-        for (k, (input, kind)) in ins.iter().zip(&self.inputs).enumerate() {
-            if input.base == 0 || input.kind() != *kind {
-                return Err(refuse(OP, format!("input {k} is not a {kind:?} plane")));
+        for (k, ((input, kind), dtype)) in
+            ins.iter().zip(&self.inputs).zip(&self.stored).enumerate()
+        {
+            if input.base == 0 || input.kind() != *kind || input.dtype() != *dtype {
+                return Err(refuse(
+                    OP,
+                    format!("input {k} is not a {kind:?} plane stored {dtype:?}"),
+                ));
             }
         }
         if outs.contains(&0) {
             return Err(refuse(OP, "a result's plane is null"));
         }
-        // The inputs and one unread past them, the results, then `ld`.
+        // The inputs and one unread past them, the results, then each
+        // result's row and its window's columns.
         let mut words: Vec<u64> = ins
             .iter()
             .chain([&In::one(0)])
@@ -440,11 +569,16 @@ impl Epilogue {
                     p.base,
                     p.row_stride.cast_unsigned(),
                     p.col_stride.cast_unsigned(),
+                    p.dtype.cast_unsigned(),
+                    p.period.cast_unsigned(),
                 ]
             })
             .collect();
         words.extend(outs);
-        words.push(u64::from(ld));
+        let windows: Vec<Window> = (0..outs.len()).map(|k| self.window(k, n)).collect();
+        words.extend(windows.iter().map(|w| u64::from(w.width)));
+        words.extend(windows.iter().map(|w| u64::from(w.from)));
+        words.extend(windows.iter().map(|w| u64::from(w.from + w.width)));
         Ok(words)
     }
 
@@ -479,43 +613,81 @@ impl Epilogue {
         Ok(())
     }
 
-    /// The row skeleton's region, planes and slices of a row for this body's
-    /// unfused leg over `n` columns, or `None` where the row skeleton does not
-    /// carry it: a row in no whole runs of eight, or a region it refuses. A
-    /// row wider than the skeleton holds is cut into slices of equal width,
-    /// each its own launch over every row, so every input reads as it does
-    /// whole (a vector a column from the slice's column on).
+    /// The row skeleton's pieces of a row for this body's unfused leg over
+    /// `n` columns, or `None` where the row skeleton does not carry it: a row
+    /// in no whole runs of eight, a tile its body is not of, or a region it
+    /// refuses. A row wider than the skeleton holds is cut into slices of
+    /// equal width (whole groups of its span), each its own launch over every
+    /// row; an epilogue of windows is cut into them, each landing its
+    /// result. A piece from column `from` reads every input as it does
+    /// whole (a vector a column from the piece's column on) and computes
+    /// what the whole row does there: each column it reads and gathers at
+    /// shifted by `from` ([`shifted`]).
     fn leg(&self, n: u32) -> Option<LegShape> {
         use crate::synth::{In as Form, MAX_WIDTH, Out};
-        if self.plain || n == 0 || !n.is_multiple_of(8) {
+        if self.plain || n == 0 || !n.is_multiple_of(8) || !self.fits(n) {
             return None;
         }
-        let slices = (n.div_ceil(MAX_WIDTH)..=n / 8)
-            .find(|c| n.is_multiple_of(*c) && (n / c).is_multiple_of(8))?;
-        let width = n / slices;
         let bf16 = Dtype::Bf16;
         let product = if self.round { bf16 } else { Dtype::F32 };
         let ins: Vec<Form> = (0..self.parts)
             .map(|_| Form::Rows(product))
-            .chain(self.inputs.iter().map(|input| match input {
-                Input::Tile => Form::Rows(bf16),
-                Input::Column => Form::Shared(bf16),
-                Input::Row => Form::Each(bf16),
-                Input::One => Form::One(bf16),
-            }))
+            .chain(
+                self.inputs
+                    .iter()
+                    .zip(&self.stored)
+                    .map(|(input, &dtype)| match input {
+                        Input::Tile => Form::Rows(bf16),
+                        Input::Column | Input::Head(_) => Form::Shared(bf16),
+                        Input::Row => Form::Each(dtype),
+                        Input::One => Form::One(dtype),
+                    }),
+            )
             .collect();
-        let outs = vec![Out::Rows(bf16); self.results];
-        let region = Region {
-            width,
-            ..self.region.clone()
+        // Each window (the whole tile, or each result's), cut into slices of
+        // equal width the row skeleton holds, whole groups of the span:
+        // `(from, width, outs)`.
+        let segments: Vec<(u32, u32, Vec<(usize, u32, u32)>)> = if self.windows.is_empty() {
+            vec![(0, n, (0..self.results).map(|k| (k, 0, n)).collect())]
+        } else {
+            (0..self.results)
+                .map(|k| {
+                    let w = self.windows[k];
+                    (w.from, w.width, vec![(k, 0, w.width)])
+                })
+                .collect()
         };
-        crate::synth::supports(&region, &ins, &outs).ok()?;
+        let span = self.span.max(1);
+        let mut pieces: Vec<(u32, u32, Vec<(usize, u32, u32)>)> = Vec::new();
+        for (from, wide, outs) in segments {
+            let slices = (wide.div_ceil(MAX_WIDTH)..=wide / 8).find(|c| {
+                wide.is_multiple_of(*c)
+                    && (wide / c).is_multiple_of(8)
+                    && (wide / c).is_multiple_of(span)
+            })?;
+            let width = wide / slices;
+            for s in 0..slices {
+                let at = s * width;
+                let landed = outs.iter().map(|&(k, col, ld)| (k, col + at, ld)).collect();
+                pieces.push((from + at, width, landed));
+            }
+        }
+        let mut shaped = Vec::with_capacity(pieces.len());
+        for (from, width, outs) in pieces {
+            let results: Vec<u32> = outs.iter().map(|(k, ..)| self.region.results[*k]).collect();
+            let region = shifted(&self.region, from, width, results);
+            let landed = vec![Out::Rows(bf16); outs.len()];
+            crate::synth::supports(&region, &ins, &landed).ok()?;
+            shaped.push(PieceShape {
+                region,
+                from,
+                width,
+                outs,
+            });
+        }
         Some(LegShape {
-            region,
             ins,
-            outs: outs.len(),
-            width,
-            slices,
+            pieces: shaped,
         })
     }
 
@@ -543,13 +715,13 @@ impl Epilogue {
 /// lands all the same ([`crate::linear::gemm::anchored`]). What a compiler
 /// asks before it forms one.
 pub fn serves(anchored: &Anchored, ins: &[Dtype], outs: &[Dtype]) -> Result<(), Error> {
-    if let Some(dtype) = ins.iter().chain(outs).find(|d| **d != Dtype::Bf16) {
+    if let Some(dtype) = outs.iter().find(|d| **d != Dtype::Bf16) {
         return Err(refuse(
             OP,
-            format!("a plane stored {dtype:?}, and the skeletons read and land bf16"),
+            format!("a result stored {dtype:?}, and the skeletons land bf16"),
         ));
     }
-    let epi = Epilogue::interned(anchored)?;
+    let epi = Epilogue::interned_stored(anchored, ins)?;
     if ins.len() != epi.inputs.len() || outs.len() != epi.results {
         return Err(refuse(
             OP,
@@ -569,14 +741,85 @@ pub fn serves(anchored: &Anchored, ins: &[Dtype], outs: &[Dtype]) -> Result<(), 
     Ok(())
 }
 
-/// An epilogue's unfused leg as the row skeleton takes it.
+/// An epilogue's unfused leg as the row skeleton takes it: its parameters'
+/// forms and its pieces.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct LegShape {
-    region: Region,
     ins: Vec<crate::synth::In>,
-    outs: usize,
+    pieces: Vec<PieceShape>,
+}
+
+/// One piece of a leg: the region over the tile's columns `from..from +
+/// width`, landing each result `k` of `outs` into its plane from that
+/// plane's column `at`, its rows `ld` apart: `(k, at, ld)`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct PieceShape {
+    region: Region,
+    from: u32,
     width: u32,
-    slices: u32,
+    outs: Vec<(usize, u32, u32)>,
+}
+
+/// `region` over the `width` columns from `from` on, as a row of its own,
+/// landing `results`: each column it reads (`Op::Column`) and each one it
+/// gathers at (`Op::Peer`) shifted by `from`, so that it computes what the
+/// whole row computes there.
+fn shifted(region: &Region, from: u32, width: u32, results: Vec<u32>) -> Region {
+    let reads = region
+        .ops
+        .iter()
+        .any(|op| matches!(op, Op::Column | Op::Peer(..)));
+    if from == 0 || !reads {
+        let kept: Vec<u32> = results.clone();
+        return Region {
+            width,
+            results: kept,
+            ..region.clone()
+        };
+    }
+    let params = u32::try_from(region.params.len()).unwrap_or(u32::MAX);
+    let mut ops: Vec<Op> = Vec::with_capacity(region.ops.len() + 8);
+    let mut of: Vec<u32> = (0..params).collect();
+    let push = |ops: &mut Vec<Op>, op: Op| {
+        ops.push(op);
+        params + u32::try_from(ops.len() - 1).unwrap_or(u32::MAX)
+    };
+    for op in &region.ops {
+        let m = |v: u32| of[v as usize];
+        let id = match *op {
+            Op::Column => {
+                let c = push(&mut ops, Op::Column);
+                let k = push(&mut ops, Op::Const(Literal::U32(from)));
+                push(&mut ops, Op::Binary(Binary::Add, c, k))
+            }
+            Op::Peer(src, at) => {
+                let k = push(&mut ops, Op::Const(Literal::U32(from)));
+                let local = push(&mut ops, Op::Binary(Binary::Sub, m(at), k));
+                push(&mut ops, Op::Peer(m(src), local))
+            }
+            Op::Const(l) => push(&mut ops, Op::Const(l)),
+            Op::Unary(u, a) => push(&mut ops, Op::Unary(u, m(a))),
+            Op::Binary(b, x, y) => push(&mut ops, Op::Binary(b, m(x), m(y))),
+            Op::Select(c, x, y) => push(&mut ops, Op::Select(m(c), m(x), m(y))),
+            Op::Cast(a, e) => push(&mut ops, Op::Cast(m(a), e)),
+            Op::Broadcast(a) => push(&mut ops, Op::Broadcast(m(a))),
+            Op::Reduce(r, a) => push(&mut ops, Op::Reduce(r, m(a))),
+            Op::ReduceHeads(r, a, size) => push(&mut ops, Op::ReduceHeads(r, m(a), size)),
+            Op::Fma(x, y, z) => push(&mut ops, Op::Fma(m(x), m(y), m(z))),
+        };
+        of.push(id);
+    }
+    Region {
+        width,
+        params: region.params.clone(),
+        ops,
+        results: results.into_iter().map(|r| of[r as usize]).collect(),
+        rounds: region
+            .rounds
+            .iter()
+            .map(|&(v, dtype)| (of[v as usize], dtype))
+            .collect(),
+    }
 }
 
 fn count_of(x: u32) -> Result<i32, Error> {
@@ -663,15 +906,22 @@ impl Skeleton {
     /// `tuning`.
     #[must_use]
     pub fn covers(self, epi: &Epilogue, m: i32, n: i32, k: i32, tuning: &Tuning) -> bool {
-        if m <= 0 || n <= 0 || k <= 0 || k % 8 != 0 {
+        if m <= 0 || n <= 0 || k <= 0 || k % 8 != 0 || !epi.fits(n.unsigned_abs()) {
             return false;
         }
+        // A body that combines a head's columns needs the head's lanes side
+        // by side: the skinny skeleton's tile alone holds whole heads.
         match self {
-            Skeleton::Gemv => m == 1,
-            Skeleton::Rows => epi.parts == 1 && m <= ROWS_M as i32,
-            Skeleton::Skinny => {
-                crate::linear::skinny::covers(m, n, k, epi.parts, tuning.gemm_skinny_rows)
-            }
+            Skeleton::Gemv => m == 1 && epi.span == 1,
+            Skeleton::Rows => epi.parts == 1 && m <= ROWS_M as i32 && epi.span == 1,
+            Skeleton::Skinny => crate::linear::skinny::covers_span(
+                m,
+                n,
+                k,
+                epi.parts,
+                tuning.gemm_skinny_rows,
+                epi.span,
+            ),
         }
     }
 
@@ -752,29 +1002,39 @@ impl Skeleton {
 
 /// An epilogue unfused: the products landed by the plain contraction in a
 /// plane of their own, then the epilogue's region over them on the row
-/// skeleton (`crate::synth`), a row of the product tile a row of the skeleton (or,
-/// for a row wider than the skeleton holds, a slice of one a launch). The
-/// candidate a fused skeleton is measured against.
+/// skeleton (`crate::synth`), a row of the product tile a row of the skeleton
+/// (or, for a row wider than the skeleton holds or one of windows, a piece
+/// of one a launch). The candidate a fused skeleton is measured against.
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowLeg {
-    kernel: crate::synth::Synthesized,
+    pieces: &'static [Piece],
     parts: u32,
     /// The products' dtype: bf16, or f32 where the epilogue reads them as
     /// they are summed.
     product: Dtype,
+}
+
+/// One launch of a leg: the kernel over the tile's columns `from..from +
+/// width`, landing each result `(k, at, ld)` of `outs` from its plane's
+/// column `at`, its rows `ld` apart.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug)]
+struct Piece {
+    kernel: crate::synth::Synthesized,
+    from: u32,
     width: u32,
-    slices: u32,
+    outs: Vec<(usize, u32, u32)>,
 }
 
 #[cfg(feature = "cuda")]
 impl RowLeg {
-    /// The row skeleton's kernel for `epi` over `n` columns, loaded on the
+    /// The row skeleton's kernels for `epi` over `n` columns, loaded on the
     /// current device, or `None` where the row skeleton does not carry it
     /// ([`Epilogue::leg`]).
     pub(crate) fn of(epi: &Epilogue, n: u32) -> Option<RowLeg> {
-        /// Each epilogue's leg by body, parts, the products' rounding and
-        /// skeleton row width.
+        /// Each epilogue's leg by body, parts, the products' rounding, its
+        /// windows and inputs' storage, and the tile's columns.
         type Legs = HashMap<(u64, u32), Option<RowLeg>>;
         static LEGS: OnceLock<Mutex<Legs>> = OnceLock::new();
         let shape = epi.leg(n)?;
@@ -782,20 +1042,29 @@ impl RowLeg {
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .expect("row leg table lock poisoned");
+        let laid = kernels_ir::fnv1a64(format!("{:?}{:?}", epi.windows, epi.stored).as_bytes());
         *legs
             .entry((
-                epi.body.hash ^ u64::from(epi.parts) ^ (u64::from(epi.round) << 63),
-                shape.width,
+                epi.body.hash ^ u64::from(epi.parts) ^ (u64::from(epi.round) << 63) ^ laid,
+                n,
             ))
             .or_insert_with(|| {
-                let kernel = crate::synth::synth(&shape.region, &shape.ins, shape.outs).ok()?;
-                kernel.load().ok()?;
+                let mut pieces = Vec::with_capacity(shape.pieces.len());
+                for piece in shape.pieces {
+                    let kernel =
+                        crate::synth::synth(&piece.region, &shape.ins, piece.outs.len()).ok()?;
+                    kernel.load().ok()?;
+                    pieces.push(Piece {
+                        kernel,
+                        from: piece.from,
+                        width: piece.width,
+                        outs: piece.outs,
+                    });
+                }
                 Some(RowLeg {
-                    kernel,
+                    pieces: Box::leak(pieces.into_boxed_slice()),
                     parts: epi.parts,
                     product: if epi.round { Dtype::Bf16 } else { Dtype::F32 },
-                    width: shape.width,
-                    slices: shape.slices,
                 })
             })
     }
@@ -825,32 +1094,38 @@ impl RowLeg {
         };
         ctx.disarm_stage();
         let mut fired = Ok(());
-        for slice in 0..self.slices {
-            // The slice's first column, in bytes.
-            let at = u64::from(slice * self.width) * 2;
+        for piece in self.pieces {
+            // The piece's first column, in bytes of bf16.
+            let at = u64::from(piece.from) * 2;
             let mut planes: Vec<Plane> = (0..self.parts)
                 .map(|p| {
-                    let from = u64::from(p * n + slice * self.width) * size;
+                    let from = u64::from(p * n + piece.from) * size;
                     products_of(products + from, self.parts * n)
                 })
                 .collect();
             for input in ins {
+                let dtype = input.dtype();
                 planes.push(match input.kind() {
                     Input::Tile => {
                         let ld = u32::try_from(input.row_stride).unwrap_or(0);
                         rows(input.base + at, ld)
                     }
                     Input::Column => {
-                        Plane::shared(&Tensor::new(input.base + at, 1, self.width, Dtype::Bf16))
+                        Plane::shared(&Tensor::new(input.base + at, 1, piece.width, Dtype::Bf16))
                     }
-                    Input::Row => Plane::each(&Tensor::new(input.base, m, 1, Dtype::Bf16)),
-                    Input::One => {
-                        Plane::shared(&Tensor::new(input.base, 1, self.width, Dtype::Bf16))
+                    Input::Head(head) => {
+                        Plane::shared(&Tensor::new(input.base, 1, head, Dtype::Bf16))
                     }
+                    Input::Row => Plane::each(&Tensor::new(input.base, m, 1, dtype)),
+                    Input::One => Plane::shared(&Tensor::new(input.base, 1, piece.width, dtype)),
                 });
             }
-            let results: Vec<Plane> = outs.iter().map(|&out| rows(out + at, n)).collect();
-            fired = self.kernel.fire(ctx, &planes, &results, m);
+            let results: Vec<Plane> = piece
+                .outs
+                .iter()
+                .map(|&(k, col, ld)| rows(outs[k] + u64::from(col) * 2, ld))
+                .collect();
+            fired = piece.kernel.fire(ctx, &planes, &results, m);
             if fired.is_err() {
                 break;
             }
@@ -926,7 +1201,12 @@ mod tests {
         assert!(bias.planes(&[In::row(64)], &[128], 8).is_err());
         assert!(bias.planes(&[], &[128], 8).is_err());
         let words = bias.planes(&[In::column(64)], &[128], 8).expect("a bias");
-        // One input, one unread, one result, the row's stride.
-        assert_eq!(words, vec![64, 0, 1, 0, 0, 0, 128, 8]);
+        // One input (its base, strides, dtype and period), one unread, one
+        // result, its row's stride and its window's columns.
+        assert_eq!(words, vec![64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0, 8]);
+        // A head's weight and a row's i32 position, each of its kind.
+        assert_eq!(In::head(64, 32).kind(), Input::Head(32));
+        assert_eq!(In::row(64).i32().dtype(), Dtype::I32);
+        assert!(bias.planes(&[In::column(64).i32()], &[128], 8).is_err());
     }
 }

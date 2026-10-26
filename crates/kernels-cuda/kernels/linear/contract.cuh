@@ -18,8 +18,13 @@
 // serves both: `F::N` elements a call, `f.ld(k, e)` (a product where `k` is
 // below the parts, else an input's element), `f.one(k)` (an input's one
 // value a row), `f.st(k, e, v)`, `f.valid(e)`, `f.round_bf16(v)`,
-// `f.col(e)`, `f.sin(v)`, `f.cos(v)` and `f.flush<k>()`. An epilogue reduces nothing (kernels-ir refuses one that
-// does), so a skeleton offers no reduction.
+// `f.col(e)`, `f.sin(v)`, `f.cos(v)` and `f.flush<k>()`. An epilogue reduces
+// nothing across its row (kernels-ir refuses one that does), so a skeleton
+// offers no row reduction. One that combines columns within a head (its
+// span: a head's norm, a rotary pair) is the skinny skeleton's alone, its
+// tile whole heads: `HeadHook` adds a head's reduction over the lanes that
+// hold it, a gather within the head (`f.share`, `f.sync`, `f.peer`) and a
+// table of what a column alone computes (`f.table`).
 
 #include "prim/device.cuh"
 #include "prim/mma_sm80.cuh"
@@ -30,23 +35,37 @@
 namespace pie::linear {
 
 // One of an epilogue's inputs: its element `(row, col)` of the product tile
-// at `base[row * row_stride + col * col_stride]`. A tile is `(ld, 1)`, a
-// vector a column `(0, 1)`, a vector a row `(1, 0)`, one value `(0, 0)`.
+// at `base[row * row_stride + (col % period) * col_stride]` (`period` 0: the
+// column as it is). A tile is `(ld, 1)`, a vector a column `(0, 1)`, a head's
+// vector `(0, 1)` every `size` columns, a vector a row `(1, 0)`, one value
+// `(0, 0)`; its elements bf16 (`dtype` 0) or i32 (1, a position).
 // `kernels_cuda::linear::skeleton::In` mirrors it.
 struct EpiIn {
     const bf16* base;
     long long row_stride;
     long long col_stride;
+    long long dtype;
+    long long period;
 };
 
-// An epilogue's IN inputs and OUT results, each result an `m x n` bf16 plane
-// `ld` apart a row. One input past IN, unread, so a body of none is a struct
-// still.
+__device__ __forceinline__ float epi_ld(const EpiIn& in, long long row, long long col) {
+    if (in.period > 0) col %= in.period;
+    const long long at = row * in.row_stride + col * in.col_stride;
+    if (in.dtype == 1) return static_cast<float>(reinterpret_cast<const int*>(in.base)[at]);
+    return bf16_to_f32(in.base[at]);
+}
+
+// An epilogue's IN inputs and OUT results, result `k` the columns `from[k]`
+// to `to[k]` of the product tile (all of them, or a split's piece) in a bf16
+// plane `ld[k]` apart a row, its column `from[k]` the plane's first. One
+// input past IN, unread, so a body of none is a struct still.
 template <int IN, int OUT>
 struct Epi {
     EpiIn in[IN + 1];
     bf16* out[OUT];
-    long long ld;
+    long long ld[OUT];
+    long long from[OUT];
+    long long to[OUT];
 };
 
 // `kN` consecutive elements of one row of the product tile, from column
@@ -84,14 +103,10 @@ struct TileHook {
 
     __device__ __forceinline__ float ld(int k, int e) const {
         if (k < P) return acc[k < P ? k : 0][e];
-        const EpiIn& in = epi.in[k - P];
-        return bf16_to_f32(in.base[row * in.row_stride + static_cast<long long>(col_ + e) * in.col_stride]);
+        return epi_ld(epi.in[k - P], row, static_cast<long long>(col_ + e));
     }
 
-    __device__ __forceinline__ float one(int k) const {
-        const EpiIn& in = epi.in[k - P];
-        return bf16_to_f32(in.base[row * in.row_stride]);
-    }
+    __device__ __forceinline__ float one(int k) const { return epi_ld(epi.in[k - P], row, 0); }
 
     // `v` as result `k` holds it, rounded to its bf16 plane.
     __device__ __forceinline__ float st(int k, int e, float v) {
@@ -101,26 +116,98 @@ struct TileHook {
 
     __device__ __forceinline__ float round_bf16(float v) const { return bf16_to_f32(f32_to_bf16(v)); }
 
-    // Result `K`'s elements to memory: whole vectors of 8 where the skeleton
-    // holds them (its columns and `ld` whole eights, its planes 16-byte
-    // aligned), else one by one.
+    // Result `K`'s elements of its window to memory: whole vectors of 8
+    // where the skeleton holds them (its columns, windows and `ld` whole
+    // eights, its planes 16-byte aligned), else one by one.
     template <int K>
     __device__ __forceinline__ void flush() {
-        bf16* dst = epi.out[K] + row * epi.ld + col_;
+        const long long from = epi.from[K];
+        const long long to = epi.to[K];
+        bf16* dst = epi.out[K] + row * epi.ld[K] + (col_ - from);
         if constexpr (kN % 8 == 0) {
 #pragma unroll
             for (int v = 0; v < kN / 8; ++v) {
-                if (col_ + v * 8 < width) {
+                const long long c = col_ + v * 8;
+                if (c < width && c >= from && c < to) {
                     *reinterpret_cast<uint4*>(dst + v * 8) = *reinterpret_cast<const uint4*>(&res[K][v * 8]);
                 }
             }
         } else {
 #pragma unroll
             for (int e = 0; e < kN; ++e) {
-                if (valid(e)) dst[e] = res[K][e];
+                const long long c = col_ + e;
+                if (valid(e) && c >= from && c < to) dst[e] = res[K][e];
             }
         }
     }
+};
+
+// `TileHook` for a body that combines the columns of a head (its span): a
+// thread's 8 columns of one row, the `S / 8` lanes of a head side by side in
+// one warp, every thread of the block calling the body together (a row past
+// the fire's, `!live`, computes on zeros through every barrier and lands
+// nothing). `share` is the block's f32 of this pass's rows, the row's from
+// its tile's first column `c0`; `tab` its table.
+template <int P, int IN, int OUT, bool ROUND, int kThreads>
+struct HeadHook : TileHook<P, 8, IN, OUT, ROUND> {
+    using Base = TileHook<P, 8, IN, OUT, ROUND>;
+    static constexpr int PER = 1;
+    static constexpr int THREADS = kThreads;
+
+    bool live;
+    float* row_;
+    int c0;
+    float* tab;
+
+    __device__ __forceinline__ HeadHook(const Epi<IN, OUT>& epi, long long row, int col, int width,
+                                        bool live, float* row_, int c0, float* tab)
+        : Base(epi, row, col, width), live(live), row_(row_), c0(c0), tab(tab) {}
+
+    __device__ __forceinline__ float ld(int k, int e) const {
+        if (k >= P && !live) return 0.f;
+        return Base::ld(k, e);
+    }
+
+    __device__ __forceinline__ float one(int k) const { return live ? Base::one(k) : 0.f; }
+
+    template <int K>
+    __device__ __forceinline__ void flush() {
+        if (live) Base::template flush<K>();
+    }
+
+    // Each lane's partial combined over its head's S lanes, in place: the
+    // row skeleton's butterfly over a warp's lanes.
+    template <int S, bool MAX>
+    __device__ __forceinline__ void reduce_heads(float (&a)[1]) {
+        static_assert((S & (S - 1)) == 0 && S <= 32, "a head is a power-of-two run of a warp's lanes");
+#pragma unroll
+        for (int off = S / 2; off > 0; off >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, a[0], off);
+            a[0] = MAX ? fmaxf(a[0], other) : a[0] + other;
+        }
+    }
+
+    template <int S>
+    __device__ __forceinline__ void reduce_sum_heads(float (&a)[1]) {
+        reduce_heads<S, false>(a);
+    }
+
+    template <int S>
+    __device__ __forceinline__ void reduce_max_heads(float (&a)[1]) {
+        reduce_heads<S, true>(a);
+    }
+
+    // A gather within the head: its lanes share one warp.
+    __device__ __forceinline__ void share(int e, float v) { row_[this->col(e) - c0] = v; }
+    __device__ __forceinline__ void sync() { __syncwarp(); }
+    __device__ __forceinline__ float peer(unsigned c) const {
+        const unsigned at = c - static_cast<unsigned>(c0);
+        return row_[at < static_cast<unsigned>(this->width) ? at : 0u];
+    }
+
+    __device__ __forceinline__ float* table() const { return tab; }
+    __device__ __forceinline__ unsigned thread() const { return threadIdx.x; }
+    __device__ __forceinline__ void sync_block() { __syncthreads(); }
 };
 
 // A warp's dot of weight row `row` (K wide) with the activation `act`,
@@ -375,31 +462,31 @@ __global__ void __launch_bounds__(256) rows_skeleton(
     if constexpr (kCl > 1) {
         asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
     } else {
-        __syncthreads();
-    }
-    if (rank == 0) {
-        for (int t = static_cast<int>(threadIdx.x); t < kRows * kM; t += 256) {
-            const int n = block * kRows + t / kM;
-            float s = sum[t];
+            __syncthreads();
+        }
+        if (rank == 0) {
+            for (int t = static_cast<int>(threadIdx.x); t < kRows * kM; t += 256) {
+                const int n = block * kRows + t / kM;
+                float s = sum[t];
 #pragma unroll
-            for (int c = 1; c < kCl; ++c) {
-                const unsigned local = static_cast<unsigned>(__cvta_generic_to_shared(sum + t));
-                unsigned remote;
-                float v;
-                asm("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(local), "r"(c));
-                asm("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote));
-                s += v;
-            }
-            if (n < N) {
-                TileHook<1, 1, IN, OUT, ROUND> f(epi, t % kM, n, N);
-                f.set(0, 0, s);
-                body(f);
+                for (int c = 1; c < kCl; ++c) {
+                    const unsigned local = static_cast<unsigned>(__cvta_generic_to_shared(sum + t));
+                    unsigned remote;
+                    float v;
+                    asm("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(local), "r"(c));
+                    asm("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote));
+                    s += v;
+                }
+                if (n < N) {
+                    TileHook<1, 1, IN, OUT, ROUND> f(epi, t % kM, n, N);
+                    f.set(0, 0, s);
+                    body(f);
+                }
             }
         }
-    }
-    if constexpr (kCl > 1) {
-        // No block retires while the first may read its sums.
-        asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
+        if constexpr (kCl > 1) {
+            // No block retires while the first may read its sums.
+            asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
     }
 }
 
@@ -441,7 +528,8 @@ template <> struct SkinnyTile<true> { using T = bf16; };
 // streams through L2 once (evict-first), the activation stays (evict-last).
 // The products land in a tile over the ring; each thread then hands the body
 // 8 columns of one row, every part's product at each.
-template <class Body, int kWarps, int kStages, int kBK, int P, int IN, int OUT, bool ROUND>
+template <class Body, int kWarps, int kStages, int kBK, int kSpan, int kTable, int P, int IN, int OUT,
+          bool ROUND>
 __global__ __launch_bounds__(kWarps * 32) void skinny_skeleton(
     const bf16* __restrict__ w,
     const bf16* __restrict__ act,
@@ -603,6 +691,38 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_skeleton(
 
     constexpr int kChunksOfRow = kCols / 8;
     constexpr int kDrain = kSkinnyM * kChunksOfRow;
+    if constexpr (kSpan > 1) {
+        // A head's epilogue: every thread in every pass, a pass's rows whole
+        // (its threads a multiple of a row's chunks), each head's lanes in
+        // one warp, the gathers' rows and the table past the product tile.
+        static_assert(kCols % kSpan == 0 && kSpan % 8 == 0 && kSpan / 8 <= 32,
+                      "the block's columns are whole heads, a head a run of a warp's lanes");
+        static_assert(kThreads % kChunksOfRow == 0, "a pass's rows are whole");
+        constexpr int kTileBytes = (kSkinnyM * kLdC * static_cast<int>(sizeof(T)) + 15) / 16 * 16;
+        static_assert(kTileBytes + (kThreads * 8 + kTable) * 4 <= kStages * kStageElems * 2,
+                      "the gathers' rows and the table fit over the ring past the product tile");
+        float* shared = reinterpret_cast<float*>(skinny_smem + kTileBytes);
+        float* tab = shared + kThreads * 8;
+        float* row_of = shared + (tid - tid % kChunksOfRow) * 8;
+#pragma unroll 1
+        for (int i = 0; i < (kDrain + kThreads - 1) / kThreads; ++i) {
+            // The last pass's gathers and table read before this one writes.
+            if (i > 0) __syncthreads();
+            const int chunk = tid + i * kThreads;
+            const int r = chunk < kDrain ? chunk / kChunksOfRow : 0;
+            const int c = (chunk % kChunksOfRow) * 8;
+            const bool live = chunk < kDrain && r < m;
+            HeadHook<P, IN, OUT, ROUND, kThreads> f(epi, r, n0 + c, n, live, row_of, n0, tab);
+#pragma unroll
+            for (int p = 0; p < P; ++p) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    f.set(p, e, static_cast<float>(c_tile[r * kLdC + p * kCols + c + e]));
+                }
+            }
+            body(f);
+        }
+    } else {
 #pragma unroll
     for (int i = 0; i < (kDrain + kThreads - 1) / kThreads; ++i) {
         const int chunk = tid + i * kThreads;
@@ -621,6 +741,7 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_skeleton(
                 body(f);
             }
         }
+    }
     }
 }
 
