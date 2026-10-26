@@ -334,17 +334,18 @@ impl Standing {
         captured: bool,
         moves: bool,
         carve: Option<Carve<'_>>,
+        mask: Option<&poem_ir::ClassSet>,
     ) -> Self {
         let held = if captured {
             let span = window.span();
             Held::Captured {
-                plane: moves && window.is_interval(),
+                plane: moves && window.is_contiguous(),
                 ceiling: carve
                     .and_then(|carve| carve.on(axis))
-                    .and_then(|carve| carve.ceiling(span)),
+                    .and_then(|carve| carve.ceiling(span, mask)),
                 lanes: carve
                     .and_then(|carve| carve.on(axis))
-                    .and_then(|carve| carve.lanes(span)),
+                    .and_then(|carve| carve.lanes(span, mask)),
             }
         } else {
             Held::Eager
@@ -773,6 +774,21 @@ impl<'c> Run<'c> {
         self.standing_at(region, run)
     }
 
+    /// Whether a region this fire seats no row of still launches: a bodied
+    /// fire's captured, shifting region launches at its ladder ceiling and
+    /// reads its live rows (none) off the device, so the body holds the
+    /// same launches for every subset of its key's classes.
+    pub(crate) fn launches_at_ceiling(&self, region: u32) -> bool {
+        self.ceilings.carve.is_some()
+            && self.windows.runs(region) == 1
+            && self.windows.at(region, 0).span().rows == 0
+            && self.standing_at(region, 0).plane()
+            && self
+                .standing_at(region, 0)
+                .rows(MaskSpan::default())
+                .is_some_and(|rows| rows > 0)
+    }
+
     pub(crate) fn standing_at(&self, region: u32, run: u32) -> Standing {
         self.standing_as(
             region,
@@ -794,6 +810,10 @@ impl<'c> Run<'c> {
                 .copied()
                 .unwrap_or(false),
             self.ceilings.carve,
+            self.ceilings
+                .regions
+                .get(region as usize)
+                .map(|region| &region.mask),
         )
     }
 
@@ -1275,7 +1295,10 @@ impl<'c> Run<'c> {
     pub(crate) fn segments(&self) -> Option<Segments> {
         let window = self.window();
         let count = window.segs();
-        if count == 0 {
+        // A captured launch walks the window's union at its ceiling, the
+        // live rows read off the device: a grouped op passes the rows of
+        // other classes through by their routes ([`crate::GROUPED`]).
+        if count == 0 || self.standing().armed() {
             return None;
         }
         Some(Segments {

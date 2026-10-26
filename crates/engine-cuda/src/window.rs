@@ -57,6 +57,14 @@ impl Window {
         matches!(self.shape(), WindowShape::Interval)
     }
 
+    /// One span of rows its ops launch over: an interval, or a grouped
+    /// window's union, which a grouped op may walk whole
+    /// ([`crate::GROUPED`]).
+    #[must_use]
+    pub fn is_contiguous(&self) -> bool {
+        matches!(self.shape(), WindowShape::Interval | WindowShape::Grouped)
+    }
+
     #[must_use]
     pub fn is_whole(&self, total: u32) -> bool {
         let span = self.span();
@@ -713,7 +721,7 @@ impl Windows {
             let window = self.at(region, run);
             let span = window.span();
             let admitted = span.rows == 0
-                || (window.is_interval()
+                || (window.is_contiguous()
                     && (moves || (span.row_offset == 0 && span.rows >= total))
                     && (span.lane_offset == 0 || finds_its_lane));
             if !admitted && crate::serve::diag::on().arm_trace {

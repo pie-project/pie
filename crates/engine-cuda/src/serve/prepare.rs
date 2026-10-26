@@ -1658,6 +1658,7 @@ impl FrameShell for Shell {
                 group_of_lane: &group_of_lane,
                 score_seats: &score_seats,
                 packings: &packing_fires,
+                seated: bodied,
             },
         )?;
 

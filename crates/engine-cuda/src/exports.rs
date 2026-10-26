@@ -329,6 +329,38 @@ pub(crate) fn plain_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
     )
 }
 
+/// The classes one body per bucket lays out whole ([`crate::record::Tiers::whole`]),
+/// in the order a fire lays their rows out: each a request lands in, that
+/// stages no media and reads no guest input, so a synthetic lane stands in
+/// for it when the body is armed.
+#[must_use]
+pub(crate) fn whole_of(
+    landing: &[Vec<poem_ir::Request>],
+    compiled: &CompiledModel,
+    feeds: &poem_exec::feeds::Feeds,
+    media: &poem_ir::ClassSet,
+) -> Box<[u32]> {
+    let every = poem_ir::ClassSet::of(
+        landing
+            .iter()
+            .enumerate()
+            .filter(|(class, requests)| {
+                !requests.is_empty()
+                    && !media.contains(*class)
+                    && !feeds
+                        .inputs
+                        .iter()
+                        .any(|(_, readers)| readers.contains(*class))
+            })
+            .map(|(class, _)| class),
+    );
+    let order = compiled.order_for(poem_ir::RowAxis::Tokens).map_or_else(
+        || every.iter().map(|class| class as u8).collect(),
+        |order| order.class_order(&every),
+    );
+    order.into_iter().map(u32::from).collect()
+}
+
 #[must_use]
 pub(crate) fn decoding_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
     poem_ir::ClassSet::of(

@@ -8,7 +8,7 @@ use crate::error::{Fault, Result};
 use crate::exports::{
     Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes,
     media_classes, one_direction_per_mask, plain_of, read_only_by_decoders, regions_lane_shifting,
-    regions_launching_schedules, regions_shifting, schedule_streams, wide_classes,
+    regions_launching_schedules, regions_shifting, schedule_streams, whole_of, wide_classes,
 };
 use crate::inputs::Inputs;
 use crate::program::Plane as ProgramPlane;
@@ -709,10 +709,11 @@ impl Shell {
         // partials are sized for the lanes, not the widest fire's rows.
         facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
+        let media = media_classes(&boot.trace, &compiled);
         let tiers = crate::record::Tiers {
             plain: plain_of(&landing),
+            whole: whole_of(&landing, &compiled, &feeds, &media),
         };
-        let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
         let staging = crate::exports::regions_staging(&boot.trace, &compiled);

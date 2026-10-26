@@ -171,4 +171,8 @@ impl Serve for Run<'_> {
     fn scatter(&mut self, region: &Region) -> Result<(), KernelError> {
         self.move_rows(region, true).map_err(crate::error::kernel)
     }
+
+    fn launches_empty(&self, index: u32) -> bool {
+        self.launches_at_ceiling(index)
+    }
 }

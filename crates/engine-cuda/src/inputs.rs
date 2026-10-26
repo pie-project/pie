@@ -271,6 +271,11 @@ pub struct Fire<'a> {
     /// Empty when no lane of the fire captures scores.
     pub score_seats: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
+    /// A fire a recorded body serves: its mask and adapter-route seats are
+    /// bound whether or not a lane stages them, at the extents every fire of
+    /// the body binds, since a region of an absent class still launches (at
+    /// zero live rows) and its plan names the same tables.
+    pub seated: bool,
 }
 
 #[derive(Debug)]
@@ -357,6 +362,7 @@ pub struct Staged {
     space_lanes: u32,
     packed: bool,
     scored: bool,
+    seated: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -914,6 +920,18 @@ impl Inputs {
                     bytes_of(&staged.indptr),
                     "staged mask indptr",
                 )?;
+                // A seated fire binds the indptr over every lane it seats:
+                // the lanes past the fire's hold no bit.
+                let held = staged.indptr.len().saturating_sub(1) as u32;
+                if fire.seated && space_lanes > held {
+                    let last = staged.indptr.last().copied().unwrap_or(0);
+                    let inert = vec![last; (space_lanes - held) as usize];
+                    put(
+                        self.mask_indptr + u64::from(held + 1) * 4,
+                        bytes_of(&inert),
+                        "staged mask indptr padding",
+                    )?;
+                }
                 Some(u32::try_from(staged.bits.len()).unwrap_or(u32::MAX))
             }
         };
@@ -1008,6 +1026,7 @@ impl Inputs {
             space_lanes,
             packed,
             scored,
+            seated: fire.seated,
         })
     }
 
@@ -1154,7 +1173,12 @@ impl Inputs {
             space_lanes,
             packed,
             scored,
+            seated,
         } = staged;
+        let seated = *seated;
+        // A seated fire binds the whole mask seat (none where the load stages
+        // no mask).
+        let mask_seat = u32::try_from(self.mask_bytes).unwrap_or(u32::MAX);
         let readouts = *readouts;
         let (rows, lanes) = (*rows, *lanes);
         let packed = *packed;
@@ -1208,7 +1232,8 @@ impl Inputs {
         }
         if let Some(bytes) = mask_bytes {
             copy(at_mask, *bytes as usize)?;
-            copy(at_mask_indptr, (lanes as usize + 1) * 4)?;
+            let indptr = if seated { space_lanes } else { lanes };
+            copy(at_mask_indptr, (indptr as usize + 1) * 4)?;
         }
         if scored {
             copy(at_score_seats, space_lanes as usize * 4)?;
@@ -1274,12 +1299,22 @@ impl Inputs {
             live_rows: live.map(|_| base + at_live),
             spaces,
             slot_ids: i32s(base + at_slot_ids, space_lanes),
-            adapter_routes: adapter_rows.map(|rows| i32s(base + at_routes, rows)),
+            adapter_routes: adapter_rows
+                .or(seated.then_some(rows))
+                .map(|rows| i32s(base + at_routes, rows)),
             readout_rows: i32s(base + at_readouts, readouts),
             readout_live: base + at_readout_live,
             row_valid: Tensor::new(base + at_row_valid, rows, 1, Dtype::U8),
-            mask: mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8)),
-            mask_indptr: mask_bytes.map(|_| i32s(base + at_mask_indptr, lanes + 1)),
+            mask: if seated && mask_seat > 0 {
+                Some(Tensor::new(base + at_mask, mask_seat, 1, Dtype::U8))
+            } else {
+                mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8))
+            },
+            mask_indptr: if seated && mask_seat > 0 {
+                Some(i32s(base + at_mask_indptr, space_lanes + 1))
+            } else {
+                mask_bytes.map(|_| i32s(base + at_mask_indptr, lanes + 1))
+            },
             group_of_lane: packed.then(|| i32s(base + at_group_of_lane, space_lanes)),
             score_seats: scored.then(|| i32s(base + at_score_seats, space_lanes)),
             packings,

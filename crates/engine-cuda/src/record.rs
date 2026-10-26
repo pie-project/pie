@@ -365,6 +365,14 @@ pub const MAX_BODIES: usize = 1024;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tiers {
     pub plain: poem_ir::ClassSet,
+    /// The classes one body per bucket lays out whole, in the order a fire
+    /// lays their rows out: a composition holding a class off the plain
+    /// tier keys this list whichever of its classes are present, and its
+    /// body launches every class's regions at their rungs, an absent
+    /// class's with no live row ([`crate::run::Run::launches_at_ceiling`]).
+    /// So one body answers every subset, where a key per subset would
+    /// multiply with the classes a mix of programs seats.
+    pub whole: Box<[u32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -529,8 +537,13 @@ impl Ladder {
         let plain = classes
             .present_in_order()
             .all(|class| tiers.plain.contains(class as usize));
+        let whole = classes
+            .present_in_order()
+            .all(|class| tiers.whole.contains(&class));
         let listed: Vec<u32> = if plain {
             classes.present_in_order().collect()
+        } else if whole {
+            tiers.whole.to_vec()
         } else {
             Vec::new()
         };
@@ -658,16 +671,47 @@ impl<'a> Carve<'a> {
 }
 
 impl AxisCarve<'_> {
+    /// The rows before a region's classes and its own, by the region's
+    /// class mask where that answers ([`AxisCarve::of_mask`]), else by
+    /// where the fire's rows sit.
     #[must_use]
-    pub fn ceiling(&self, span: MaskSpan) -> Option<(u32, u32)> {
-        self.prefix(span, u32::MAX)
+    pub fn ceiling(&self, span: MaskSpan, mask: Option<&poem_ir::ClassSet>) -> Option<(u32, u32)> {
+        mask.and_then(|mask| self.of_mask(mask, u32::MAX))
+            .or_else(|| self.prefix(span, u32::MAX))
     }
 
     #[must_use]
-    pub fn lanes(&self, span: MaskSpan) -> Option<(u32, u32)> {
+    pub fn lanes(&self, span: MaskSpan, mask: Option<&poem_ir::ClassSet>) -> Option<(u32, u32)> {
         let cap = self.lane_ceiling?;
-        let (_, own) = self.prefix(span, cap)?;
+        let (_, own) = mask
+            .and_then(|mask| self.of_mask(mask, cap))
+            .or_else(|| self.prefix(span, cap))?;
         Some((span.lane_offset, own.min(cap)))
+    }
+
+    /// The rungs before a region's classes and its own, read off the
+    /// ladder (which lists its classes in the order a fire lays them out)
+    /// by the region's mask: the same for every fire of the key, whichever
+    /// of its classes are present. `None` where the mask's ladder classes
+    /// are not one run of the ladder or the ladder holds none of them.
+    fn of_mask(&self, mask: &poem_ir::ClassSet, cap: u32) -> Option<(u32, u32)> {
+        let (mut before, mut own) = (0u32, 0u32);
+        let (mut opened, mut closed) = (false, false);
+        for &(class, rung) in self.ladder.rungs() {
+            let rung = rung.min(cap);
+            if mask.contains(class as usize) {
+                if closed {
+                    return None;
+                }
+                opened = true;
+                own += rung;
+            } else if opened {
+                closed = true;
+            } else {
+                before += rung;
+            }
+        }
+        opened.then_some((before, own))
     }
 
     fn prefix(&self, span: MaskSpan, cap: u32) -> Option<(u32, u32)> {
@@ -1471,6 +1515,7 @@ mod tests {
     fn plain_tiers() -> Tiers {
         Tiers {
             plain: poem_ir::ClassSet::of(0..8usize),
+            whole: Box::new([]),
         }
     }
 
@@ -1499,6 +1544,71 @@ mod tests {
         what_a_load_has_spent_is_what_its_resident_bodies_weigh();
         the_map_never_inserts_a_body_whose_script_is_empty();
         a_sealed_decline_is_reported_once_a_shape_and_then_at_each_doubling();
+        a_carve_reads_a_regions_ceiling_off_its_mask_whatever_is_present();
+        a_composition_off_the_plain_tier_keys_the_whole_tier();
+    }
+
+    fn a_carve_reads_a_regions_ceiling_off_its_mask_whatever_is_present() {
+        // Three classes of the whole tier, laid out c2, c0, c1; the region runs c0 and c1.
+        let ladder = Ladder(vec![(2, 4), (0, 8), (1, 8)].into_boxed_slice());
+        let mask = poem_ir::ClassSet::of([0usize, 1]);
+        let carve = |classes: &WindowTable| {
+            let carve = AxisCarve {
+                classes,
+                ladder: &ladder,
+                lane_ceiling: Some(LANES),
+            };
+            (
+                carve.ceiling(MaskSpan::default(), Some(&mask)),
+                carve.lanes(MaskSpan::default(), Some(&mask)),
+            )
+        };
+        let every = table(&[(3, 3), (2, 2), (1, 1)]);
+        let none = table(&[(0, 0), (0, 0), (5, 5)]);
+        assert_eq!(carve(&every), (Some((4, 16)), Some((0, LANES))));
+        assert_eq!(
+            carve(&none),
+            carve(&every),
+            "a fire seating none of the region's classes launches it at the same ceiling"
+        );
+        let split = poem_ir::ClassSet::of([2usize, 1]);
+        let apart = AxisCarve {
+            classes: &every,
+            ladder: &ladder,
+            lane_ceiling: None,
+        };
+        assert_eq!(
+            apart.of_mask(&split, u32::MAX),
+            None,
+            "a mask that is not one run of the ladder is placed by the fire's rows"
+        );
+    }
+
+    fn a_composition_off_the_plain_tier_keys_the_whole_tier() {
+        let tiers = Tiers {
+            plain: poem_ir::ClassSet::of([0usize]),
+            whole: Box::new([1, 0]),
+        };
+        let decoding = prefill_only();
+        let key = |classes: &[(u32, u32)]| {
+            BodyKey::of(&table(classes), 8, &decoding, LANES, &tiers).to_string()
+        };
+        assert_eq!(
+            key(&[(8, 1)]),
+            "b8[c0:8]",
+            "a plain composition keys its own classes"
+        );
+        assert_eq!(key(&[(0, 0), (8, 1)]), "b8[c1:8 c0:8]");
+        assert_eq!(
+            key(&[(4, 1), (4, 1)]),
+            key(&[(0, 0), (8, 1)]),
+            "every subset holding a class off the plain tier keys one body"
+        );
+        assert_eq!(
+            key(&[(4, 1), (2, 1), (2, 1)]),
+            "b8[]",
+            "a class outside the whole tier keys none"
+        );
     }
 
     fn a_sealed_decline_is_reported_once_a_shape_and_then_at_each_doubling() {

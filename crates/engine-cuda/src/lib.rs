@@ -47,6 +47,11 @@ pub mod window;
 
 pub const EXCLUSIVE: [&str; 0] = [];
 
+/// Ops one launch serves over the runs of rows a region's classes hold, by a
+/// segment list. Each reads every row's own route and leaves a row that has
+/// none untouched, so a launch may also walk the runs' whole union: a
+/// captured body does, its live rows read off the device, so one body
+/// answers whichever of the region's classes a fire seats.
 pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 
 /// The fusions this backend implements: the compiler runs these rules alone,
