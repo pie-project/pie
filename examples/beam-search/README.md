@@ -45,25 +45,32 @@ a scalar score preserve the logits argmax.
 | --- | --- | --- | --- |
 | `max_tokens` | int | `16` | Number of generated tokens |
 | `beams` | int | `2` | Beam width; `1` degenerates to greedy decoding |
+| `prompt` | string | a short request | User message, rendered with the model's chat template |
+| `system` | string | a helpful-assistant prompt | System message |
+| `no_think` | bool | `false` | Turn a thinking model's thinking off |
+| `prompt_tokens` | int list | none | The prompt as token ids, in place of the templated `prompt` |
 
-There is deliberately no `prompt` parameter. This inferlet starts from the fixed
-Qwen BOS token.
+The search runs `max_tokens` steps; a beam that emits end of sequence is not
+retired, so width 1 is greedy decoding of the same prompt to the same length.
 
 ## Implementation notes
 
-The beams share one working set, a pool repeated for every lane and reserved
-for the whole search (BOS plus one slot per beam per step). Forking is logical:
+The prompt is prefilled once, and that fire's epilogue picks the first `beams`
+tokens (the top of the prompt's next-token distribution). The beams then share
+one working set, a pool repeated for every lane and reserved for the whole
+search (the prompt plus one slot per beam per step). Each lane reads the pool
+up to its own slot, where every ancestor stands, and its mask hides the other
+beams' cells. Forking is logical:
 each survivor inherits its parent's boolean attention mask, appends one new pool
 slot chosen on the device, and updates a parent pointer emitted by the epilogue.
 Dead cells are masked, not compacted. On a model with recurrent layers the same
 program runs: each beam's recurrent layers replay the slots its mask admits, its
 ancestry, before its own token.
 
-The suite includes the beam identity as a real check. With `beams = 1`,
-`beam-search` produced **0 mismatches** against greedy decoding over 16 steps.
-At width 4 it produced 46 mismatches and a better cumulative log-probability
-(-13.68 versus -19.80 for width 1), demonstrating both the identity at width 1
-and genuine search behaviour at larger widths.
+The inferlet checks the beam identity itself: at `beams = 1` every step's pick
+must equal the raw-logit argmax, and the run fails otherwise. Wider beams pick
+non-argmax continuations for their lower lanes and reach better cumulative
+log-probabilities.
 
 ## Run
 
