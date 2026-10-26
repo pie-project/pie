@@ -375,9 +375,8 @@ async fn main(input: Input) -> Result<Output> {
             } else {
                 j.take()
             };
-            let cells = &iota(lh * lw) + &broadcast(&at * (lh * lw), [lh * lw]);
             frame.put(reshape(
-                gather(reshape(x.read(), [n, c]), &cells),
+                gather(reshape(x.read(), [lt, lh * lw * c]), &at),
                 [lh, lw, c],
             ));
             j.put(&at + 1u32);
