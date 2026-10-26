@@ -386,3 +386,77 @@ fn an_rms_norm_before_an_epilogued_product_folds_into_its_anchor() {
         );
     }
 }
+
+/// A KV append the qkv prologue ends in folds into its anchor: k and v
+/// each a paged result (the cache's keys and values, at the rows the slot
+/// mapping names, its inputs one i32 a row), the cache the op's, q its one
+/// value landed.
+#[test]
+fn a_kv_append_lands_k_and_v_in_the_caches_pages() {
+    use kernels_ir::{CacheDtype, CachePlane, Paged};
+    use poem::ops::gather;
+    use poem_ir::Turn;
+    const D: u32 = 16;
+    let (qw, kvw) = (2 * D, D);
+    let build = |_: bool| {
+        trace(|p| {
+            let x = p.rows("x", K);
+            let w = p.weight("qkv", [u64::from(qw + 2 * kvw), K]);
+            let packed = linear::matmul(&x, &w);
+            let (q, k, v) = gather::split_qkv(&packed, qw, kvw);
+            let positions = p.indices("positions");
+            let (q, k) = elemwise::rope(
+                &q,
+                &positions,
+                D,
+                1e6,
+                Turn::Full { interleaved: false },
+                Some(&k),
+                None,
+            );
+            let cache = p.cache("cache");
+            let (page, offset) = (p.indices("write_page"), p.indices("write_offset"));
+            attn::kv_append(&k.expect("k turned"), Some(&v), cache, &page, &offset);
+            p.export("q", &q);
+        })
+    };
+    let mut t = build(false);
+    // the cache's planes as a model's trace states them: k's and v's rows
+    for row in &mut t.caches {
+        if let poem_ir::CacheRow::Kv { planes, .. } = row {
+            *planes = vec![u64::from(kvw), u64::from(kvw)];
+        }
+    }
+    let formed = anchors(&t, &all);
+    let anchor = the_one(&formed);
+    assert_eq!(anchor.nodes, [0, 1, 2, 3], "the product, split, turn and append");
+    assert!(anchor.cache.is_some() && !anchor.landed);
+    assert_eq!(anchor.outs.len(), 1, "q alone a value");
+    let epi = anchor.anchored.epilogue.as_ref().expect("an epilogue");
+    assert_eq!(epi.inputs, [Input::Row, Input::Row, Input::Row]);
+    assert_eq!(
+        anchor.anchored.paged,
+        [
+            None,
+            Some(Paged {
+                plane: CachePlane::Keys,
+                dtype: CacheDtype::Bf16,
+                page: 1,
+                slot: 2
+            }),
+            Some(Paged {
+                plane: CachePlane::Values,
+                dtype: CacheDtype::Bf16,
+                page: 1,
+                slot: 2
+            }),
+        ]
+    );
+    // The fold: one op, the cache its input, nothing past it but q.
+    let (folded, _) = fold(t, &all);
+    assert_eq!(folded.nodes.len(), 1, "{:#?}", folded.nodes);
+    assert!(matches!(
+        folded.nodes[0].op,
+        Operation::Fused(Fused::Anchored { cache: Some(_), .. })
+    ));
+}

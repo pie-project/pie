@@ -57,12 +57,12 @@
 use std::collections::BTreeMap;
 
 use kernels_ir::{
-    Anchored, Binary, Contraction, Gain, Input, Layout, Op, Pointwise, Quant, Region, RowNorm,
-    Shape, Window,
+    Anchored, Binary, CacheDtype, CachePlane, Contraction, Gain, Input, Layout, Op, Paged,
+    Pointwise, Quant, Region, RowNorm, Shape, Window,
 };
 use poem_ir::{
-    Def, Dim, Dtype, Elemwise, Fused, Gather, Linear, NormAxis, NormWeight, Operands, Operation,
-    Trace, Ty, ValueId,
+    Attn, CacheRow, Def, Dim, Dtype, Elemwise, Fused, Gather, Linear, NormAxis, NormWeight,
+    Operands, Operation, Trace, Ty, ValueId,
 };
 
 use super::chain::{self, Builder, Escapes, Form, In, Out};
@@ -83,6 +83,13 @@ pub struct Anchor {
     /// Where the anchor norms its operand's rows: the norm's gain, which a
     /// load folds into `w` (`act` then the norm's input).
     pub gain: Option<ValueId>,
+    /// Where it lands results in a paged cache (a KV append's k and v):
+    /// that cache. Its paged results name no value of `outs`.
+    pub cache: Option<ValueId>,
+    /// Its product landed apart by the first of `nodes`, which stays: the
+    /// anchor is that product's epilogue (`fused.epilogue`), `act` and `w`
+    /// the product op's.
+    pub landed: bool,
 }
 
 /// Whether a backend serves an anchored region at every count of rows a
@@ -115,6 +122,22 @@ pub fn fold_with(
     let mut folded: Vec<(Vec<u32>, Fused)> = Vec::new();
     for anchor in anchors_with(&trace, serves, folds) {
         let key = anchor.anchored.key();
+        if anchor.landed {
+            // the product's own op stays; the epilogue reads what it lands
+            let y = landed_y(&trace, anchor.nodes[0]);
+            folded.push((
+                anchor.nodes[1..].to_vec(),
+                Fused::Epilogue {
+                    y,
+                    ins: anchor.ins,
+                    key,
+                    outs: anchor.outs,
+                    cache: anchor.cache,
+                },
+            ));
+            anchored.entry(key).or_insert(anchor.anchored);
+            continue;
+        }
         folded.push((
             anchor.nodes,
             Fused::Anchored {
@@ -124,6 +147,7 @@ pub fn fold_with(
                 key,
                 outs: anchor.outs,
                 gain: anchor.gain,
+                cache: anchor.cache,
             },
         ));
         anchored.entry(key).or_insert(anchor.anchored);
@@ -135,6 +159,11 @@ pub fn fold_with(
         super::search::compact(chain::replace(trace, folded)),
         anchored,
     )
+}
+
+/// The product node `at` lands apart ([`landed_of`]).
+fn landed_y(trace: &Trace, at: u32) -> ValueId {
+    landed_of(trace, at).map_or(ValueId(0), |p| p.y)
 }
 
 /// Every anchor of `trace` that `serves` takes, in trace order; the ops
@@ -175,7 +204,7 @@ pub fn anchors_with(trace: &Trace, serves: Serves<'_>, folds: Option<Folds<'_>>)
         if taken[at as usize] {
             continue;
         }
-        let Some(product) = product_of(trace, at) else {
+        let Some(product) = product_of(trace, at).or_else(|| landed_of(trace, at)) else {
             continue;
         };
         // The run from the matmul: each op that joins it, up to the first
@@ -210,7 +239,26 @@ pub fn anchors_with(trace: &Trace, serves: Serves<'_>, folds: Option<Folds<'_>>)
             };
             // Its operand's norm too, where the norm is the anchor's and the
             // backend serves it so; else the anchor over the normed rows.
+            // A product landed apart is anchored only where its epilogue lands
+            // a KV append: the rest is the row chains'.
+            if product.landed && anchor.cache.is_none() {
+                return None;
+            }
+            // A sum across the whole row (a row one head wide, its norm) runs
+            // on the row skeleton alone: an anchor takes one only where it
+            // lands a KV append (a shared-kv latent's k row), and keeps its
+            // contraction skeletons elsewhere.
+            let reduces = anchor.anchored.epilogue.as_ref().is_some_and(|e| {
+                e.region
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, Op::Reduce(..)))
+            });
+            if reduces && anchor.cache.is_none() {
+                return None;
+            }
             if let Some(folds) = folds
+                && !product.landed
                 && folds(product.w)
                 && let Some(normed) = normed_of(trace, at, &product, &readers, &escapes)
                     .filter(|n| !taken[n.node as usize])
@@ -241,6 +289,9 @@ struct Product {
     /// The weight's rows: every part's columns.
     rows: u32,
     k: u32,
+    /// Landed apart by its own op (a quantized bank's, a projection's half):
+    /// its anchor is that op's epilogue alone (`fused.epilogue`).
+    landed: bool,
 }
 
 /// An RMS norm whose normed row is a product's operand, as an anchor folds
@@ -374,6 +425,45 @@ fn product_of(trace: &Trace, at: u32) -> Option<Product> {
         dim,
         rows: u32::try_from(rows).ok()?,
         k: u32::try_from(k).ok()?,
+        landed: false,
+    })
+}
+
+/// The product node `at` lands where no contraction skeleton holds it but
+/// an epilogue may read it as stored: bf16 rows of a matmul of any bank (a
+/// quantized one's), or the left half `matmul_split_rows` lands (Muse
+/// Spark's `qkv` of its `qkv | gate`).
+fn landed_of(trace: &Trace, at: u32) -> Option<Product> {
+    let (act, w, y) = match trace.nodes[at as usize].op {
+        Operation::Linear(Linear::Matmul {
+            act,
+            w,
+            y,
+            logits: false,
+            ..
+        }) => (act, w, y),
+        Operation::Fused(Fused::MatmulSplitRows { act, w, left, .. }) => (act, w, left),
+        _ => return None,
+    };
+    let rows_of = |v: ValueId| match &trace.values[v.0 as usize].ty {
+        Ty::Tensor { shape, dtype } => match shape.as_slice() {
+            [dim, Dim::Const(width)] if !matches!(dim, Dim::Const(_)) => {
+                Some((*dim, *width, *dtype))
+            }
+            _ => None,
+        },
+        Ty::Struct(_) => None,
+    };
+    let (dim, k, _) = rows_of(act)?;
+    let (out_dim, rows, dtype) = rows_of(y)?;
+    (out_dim == dim && dtype == Dtype::Bf16).then_some(Product {
+        act,
+        w,
+        y,
+        dim,
+        rows: u32::try_from(rows).ok()?,
+        k: u32::try_from(k).ok()?,
+        landed: true,
     })
 }
 
@@ -415,10 +505,11 @@ fn split_of(
     trace: &Trace,
     node: u32,
     product: &Product,
+    full: &[ValueId],
     windows: &BTreeMap<ValueId, Window>,
 ) -> Option<Vec<(ValueId, Window)>> {
     let whole = |v: ValueId| {
-        if v == product.y {
+        if full.contains(&v) {
             Some(Window {
                 from: 0,
                 width: product.rows,
@@ -487,19 +578,22 @@ fn split_of(
 /// rotation, each of its two).
 fn windows_of(trace: &Trace, run: &[u32], product: &Product) -> BTreeMap<ValueId, Window> {
     let mut windows = BTreeMap::new();
-    if run
-        .get(1)
-        .is_none_or(|&n| split_of(trace, n, product, &windows).is_none())
-    {
-        return windows;
-    }
+    let mut full = vec![product.y];
     let (mut ins, mut outs) = (Vec::new(), Vec::new());
     for &node in &run[1..] {
-        if let Some(pieces) = split_of(trace, node, product, &windows) {
+        if let Some(pieces) = split_of(trace, node, product, &full, &windows) {
             windows.extend(pieces);
             continue;
         }
         let op = &trace.nodes[node as usize].op;
+        // Before the first split, the run's values are the whole tile's (a
+        // bias over the product, the split then cutting its sum).
+        if windows.is_empty() {
+            outs.clear();
+            op.outputs(&mut outs);
+            full.extend(outs.iter().copied().filter(|&v| is_full(trace, v, product)));
+            continue;
+        }
         if let Operation::Elemwise(Elemwise::Rope {
             q,
             k: Some(k),
@@ -528,13 +622,38 @@ fn windows_of(trace: &Trace, run: &[u32], product: &Product) -> BTreeMap<ValueId
     windows
 }
 
+/// Whether `v` is a row of the whole product tile: as wide as every column
+/// of a dense product.
+fn is_full(trace: &Trace, v: ValueId, product: &Product) -> bool {
+    matches!(chain::form(trace, v), Some(Form::Rows { dim, width })
+        if dim == product.dim && width == u64::from(product.rows))
+}
+
+/// The values of the whole product tile `run` computes before any split:
+/// the product, and what each op of it lands as wide.
+fn full_of(trace: &Trace, run: &[u32], product: &Product) -> Vec<ValueId> {
+    let mut full = vec![product.y];
+    let mut outs = Vec::new();
+    for &node in &run[1..] {
+        outs.clear();
+        trace.nodes[node as usize].op.outputs(&mut outs);
+        full.extend(outs.iter().copied().filter(|&v| is_full(trace, v, product)));
+    }
+    full
+}
+
 /// Whether `node`, an op over the windows `windows`, reads them as one op
 /// over each head of its own piece: every piece it reads one (the pair a
 /// rotation turns, q's and k's, each its own), of whole heads where it
 /// names one, and the op pointwise or a head's alone (a head's norm, a
 /// rotation), so that the epilogue computes it over the whole tile and
 /// lands its piece.
-fn over_pieces(trace: &Trace, node: u32, windows: &BTreeMap<ValueId, Window>) -> bool {
+fn over_pieces(
+    trace: &Trace,
+    node: u32,
+    product: &Product,
+    windows: &BTreeMap<ValueId, Window>,
+) -> bool {
     let op = &trace.nodes[node as usize].op;
     let mut ins = Vec::new();
     op.inputs(&mut ins);
@@ -584,6 +703,7 @@ fn over_pieces(trace: &Trace, node: u32, windows: &BTreeMap<ValueId, Window>) ->
         Operation::Elemwise(
             Elemwise::Act { .. } | Elemwise::Binary { .. } | Elemwise::Clamp { .. },
         ) => pieces.iter().all(|w| *w == piece) && chain::row_of(trace, node) == rows(piece),
+        Operation::Attn(Attn::KvAppend { .. }) => append_of(trace, node, product, windows).is_some(),
         _ => false,
     }
 }
@@ -600,13 +720,23 @@ fn joins(trace: &Trace, run: &[u32], node: u32, product: &Product) -> bool {
     if run.len() == 1 && glu_of(trace, node, product).is_some() {
         return true;
     }
-    if run.len() == 1 && split_of(trace, node, product, &BTreeMap::new()).is_some() {
-        return true;
-    }
     let windows = windows_of(trace, run, product);
-    if !windows.is_empty() {
-        return split_of(trace, node, product, &windows).is_some()
-            || over_pieces(trace, node, &windows);
+    if windows.is_empty() {
+        // a split of the product, or of what the run lands of its whole tile
+        if layout_of(trace, run, product).1 == Layout::Dense
+            && split_of(trace, node, product, &full_of(trace, run, product), &windows).is_some()
+        {
+            return true;
+        }
+        // a KV append of the whole tile (a shared-kv latent's k row)
+        if layout_of(trace, run, product).1 == Layout::Dense
+            && append_of(trace, node, product, &windows).is_some()
+        {
+            return true;
+        }
+    } else {
+        return split_of(trace, node, product, &[], &windows).is_some()
+            || over_pieces(trace, node, product, &windows);
     }
     let (width, _) = layout_of(trace, run, product);
     let rows = chain::Rows {
@@ -634,6 +764,10 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
     // A split's pieces: each value over one computed over the whole tile,
     // landing its piece.
     let windows = windows_of(trace, run, product);
+    // A KV append the run ends in: its k and v paged into the cache.
+    let append = epilogue
+        .iter()
+        .find_map(|&node| append_of(trace, node, product, &windows));
 
     // The inputs: what the epilogue reads and does not compute, in
     // first-read order, each a value of the product tile's (or, read by an
@@ -658,6 +792,10 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
         for read in chain::reads_of(op, width) {
             let v = read.value;
             if computed.contains(&v) || ins.iter().any(|(held, _)| *held == v) {
+                continue;
+            }
+            // the cache a paged store lands in, no value the epilogue reads
+            if append.is_some_and(|a| a.cache == v) {
                 continue;
             }
             if read.by.is_some() || read.from > 0 || read.half {
@@ -743,6 +881,8 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
                 b.of.insert(q_out, turned);
                 b.of.insert(k_out, turned);
             }
+            // its k and v land as paged results, below
+            Operation::Attn(Attn::KvAppend { .. }) if append.is_some() => {}
             _ => b.node(trace, op)?,
         }
     }
@@ -752,8 +892,30 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
         .copied()
         .filter(|&v| escapes.leaves(v, run))
         .collect();
+    // The paged results past them: the append's k into the cache's keys,
+    // its v into its values.
+    let input_of = |v: ValueId| {
+        ins.iter()
+            .position(|(held, _)| *held == v)
+            .and_then(|at| u32::try_from(at).ok())
+    };
+    let mut paged: Vec<(ValueId, Paged)> = Vec::new();
+    if let Some(a) = append {
+        let (page, slot) = (input_of(a.page)?, input_of(a.slot)?);
+        let land = |plane| Paged {
+            plane,
+            dtype: a.dtype,
+            page,
+            slot,
+        };
+        paged.push((a.k, land(CachePlane::Keys)));
+        if let Some(v) = a.v {
+            paged.push((v, land(CachePlane::Values)));
+        }
+    }
     let results = outs
         .iter()
+        .chain(paged.iter().map(|(v, _)| v))
         .map(|v| b.get(*v))
         .collect::<Option<Vec<u32>>>()?;
     let mut rounds: Vec<(u32, Dtype)> = Vec::new();
@@ -808,11 +970,21 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
         Vec::new()
     } else {
         outs.iter()
+            .chain(paged.iter().map(|(v, _)| v))
             .map(|v| windows.get(v).copied().unwrap_or(Window { from: 0, width }))
+            .collect()
+    };
+    let paged: Vec<Option<Paged>> = if paged.is_empty() {
+        Vec::new()
+    } else {
+        outs.iter()
+            .map(|_| None)
+            .chain(paged.iter().map(|(_, p)| Some(*p)))
             .collect()
     };
     let anchored = Anchored {
         norm: None,
+        paged,
         windows: cut,
         contraction: Contraction {
             n: width,
@@ -820,8 +992,9 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
             layout,
             quant: Quant::Plain(Dtype::Bf16),
             // The product keeps its accumulator through the epilogue, as a
-            // matmul and its bias are one sum: no op between them rounds it.
-            acc: None,
+            // matmul and its bias are one sum: no op between them rounds it;
+            // one landed apart is read as its op stored it.
+            acc: product.landed.then_some(Dtype::Bf16),
         },
         prologue: None,
         epilogue: Some(Pointwise {
@@ -837,5 +1010,82 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
         outs,
         anchored,
         gain: None,
+        cache: append.map(|a| a.cache),
+        landed: product.landed,
+    })
+}
+
+/// A KV append a windowed run ends in, as its anchor lands it: k (and v)
+/// paged into `cache`'s planes at the rows `page` and `slot` name.
+#[derive(Debug, Clone, Copy)]
+struct Append {
+    k: ValueId,
+    v: Option<ValueId>,
+    cache: ValueId,
+    page: ValueId,
+    slot: ValueId,
+    dtype: CacheDtype,
+}
+
+/// The KV append node `node` is, where an anchor's paged store lands it: k
+/// and v pieces of the product (`windows`) as wide as the cache's planes, a
+/// cache of bf16 or e4m3 (a unit scale, vLLM's `fp8`) holding whole heads,
+/// and the slot mapping one i32 a row.
+fn append_of(
+    trace: &Trace,
+    node: u32,
+    product: &Product,
+    windows: &BTreeMap<ValueId, Window>,
+) -> Option<Append> {
+    let Operation::Attn(Attn::KvAppend {
+        k,
+        v,
+        cache,
+        write_page,
+        write_offset,
+    }) = trace.nodes[node as usize].op
+    else {
+        return None;
+    };
+    let Def::Cache(row) = trace.values[cache.0 as usize].def else {
+        return None;
+    };
+    let Some(CacheRow::Kv {
+        planes,
+        dtype,
+        live: None,
+        ..
+    }) = trace.caches.get(row as usize)
+    else {
+        return None;
+    };
+    let dtype = match dtype {
+        Dtype::Bf16 => CacheDtype::Bf16,
+        Dtype::E4m3 => CacheDtype::E4m3 { scale: 1.0 },
+        _ => return None,
+    };
+    // a piece of the product, or (no split) its whole tile
+    let piece = |x: ValueId| {
+        windows.get(&x).copied().or_else(|| {
+            (windows.is_empty() && is_full(trace, x, product)).then_some(Window {
+                from: 0,
+                width: product.rows,
+            })
+        })
+    };
+    let kw = piece(k)?;
+    let wide = |w: Window, plane: usize| planes.get(plane) == Some(&u64::from(w.width));
+    let laid = match v {
+        Some(v) => wide(kw, 0) && piece(v).is_some_and(|vw| wide(vw, 1)),
+        None => planes.len() == 1 && wide(kw, 0),
+    };
+    let each = |x: ValueId| matches!(chain::form(trace, x), Some(Form::Each));
+    (laid && each(write_page) && each(write_offset)).then_some(Append {
+        k,
+        v,
+        cache,
+        page: write_page,
+        slot: write_offset,
+        dtype,
     })
 }

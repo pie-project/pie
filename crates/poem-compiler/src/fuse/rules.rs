@@ -54,6 +54,7 @@ pub fn all() -> Vec<Rule> {
     vec![
         split_qkv_fused(),
         qkv_fused_qknorm_rope_vnorm_write(),
+        qkv_fused_padded(),
         rmsnorm_residual_add(),
         embed_scale_add_select(),
         embed_scale_add(),
@@ -77,6 +78,7 @@ pub fn all() -> Vec<Rule> {
         norm_rope_pair(),
         index_topk_rope(),
         norm_rope_last_append(),
+        norm_rope_last_append_rows(),
         norm_rope(Rotated::Last),
         q_gate_norm_rope_append(Intermediates::Unwritten),
         split_rope_yarn_append(),
@@ -740,6 +742,23 @@ pub fn qkv_fused_qknorm_rope_vnorm_write() -> Rule {
         |m| qkv_fused(m, m.value("packed")),
     )
     .when(qkv_admits)
+}
+
+/// [`qkv_fused_qknorm_rope_vnorm_write`]'s padded forms alone (MiMo's, its
+/// v scaled, its heads zero-padded in the cache past their widths): where a
+/// backend's anchored regions land the rest of the qkv writes, k and v
+/// paged into the cache by the epilogue, a cache whose heads carry padding
+/// past a piece's widths is one no window of the product addresses.
+#[must_use]
+pub fn qkv_fused_padded() -> Rule {
+    let patterns: Vec<Template> = qkv_patterns(false).into_iter().skip(4).collect();
+    Rule::new(
+        "fused.qkv_fused_qknorm_rope_vnorm_write",
+        patterns,
+        |m| qkv_fused(m, m.value("packed")),
+    )
+    .when(qkv_admits)
+    .form("padded")
 }
 
 /// The fused qkv write on the first columns of a row split, the rest of each
@@ -2146,6 +2165,29 @@ pub fn pool_compress() -> Rule {
             }
         },
     )
+}
+
+/// [`norm_rope_last_append`] where the cache holds DeepSeek's fp8 rows (u8
+/// planes: e4m3 blocks under their scales and a bf16 rotated tail), a row
+/// format no paged store of an epilogue lands; a bf16 cache's write is an
+/// anchored region's.
+#[must_use]
+pub fn norm_rope_last_append_rows() -> Rule {
+    norm_rope_last_append()
+        .when(|m| {
+            let cache = m.value("cache");
+            match m.trace.values[cache.0 as usize].def {
+                poem_ir::Def::Cache(row) => matches!(
+                    m.trace.caches.get(row as usize),
+                    Some(poem_ir::CacheRow::Kv {
+                        dtype: Dtype::U8,
+                        ..
+                    })
+                ),
+                _ => false,
+            }
+        })
+        .form("rows")
 }
 
 /// DeepSeek-V4's kv plane: a scaled norm of a row one head wide, its last
