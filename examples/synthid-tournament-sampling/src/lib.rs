@@ -383,16 +383,15 @@ async fn main(input: Input) -> Result<Output> {
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
     // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
-    let toks_p = Channel::from_iter(history.iter().take(n as usize).copied()).named("toks_p");
-    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-    let rng_p = Channel::from([input.seed, 0]).named("rng_p");
-    let hist_p = Channel::from(history.clone()).named("hist_p");
-    let hlen_p = Channel::from([n]).named("hlen_p");
-    let chist_p =
-        Channel::from(vec![u32::MAX; cfg.history_size as usize]).named("context_history_p");
-    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
-    let score_out_p = Channel::new([1], dtype::f32).named("score_out_p");
-    let null_out_p = Channel::new([1], dtype::f32).named("null_out_p");
+    let toks_p = Channel::from_iter(history.iter().take(n as usize).copied());
+    let embed_indptr_p = Channel::from([0u32, n]);
+    let rng_p = Channel::from([input.seed, 0]);
+    let hist_p = Channel::from(history.clone());
+    let hlen_p = Channel::from([n]);
+    let chist_p = Channel::from(vec![u32::MAX; cfg.history_size as usize]);
+    let tok_out_p = Channel::new([1], dtype::i32);
+    let score_out_p = Channel::new([1], dtype::f32);
+    let null_out_p = Channel::new([1], dtype::f32);
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -427,30 +426,28 @@ async fn main(input: Input) -> Result<Output> {
     // context n-gram sat in the ring buffer), and ride out beside the token
     // in one `[4]` cell: a token costs one host round trip, not three. The
     // prefill's step is never a repeat: the ring was empty.
-    let kept_score = Channel::from([s0]).named("kept_score");
-    let kept_null = Channel::from([n0]).named("kept_null");
-    let kept_count = Channel::from([1.0f32]).named("kept_count");
+    let kept_score = Channel::from([s0]);
+    let kept_null = Channel::from([n0]);
+    let kept_count = Channel::from([1.0f32]);
     let mut totals = [s0, n0, 1.0f32];
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
     if generated.len() < max_tokens {
         history[n as usize] = g0;
 
-        let tok_in = Channel::from([g0]).named("tok_in");
-        let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
-        let hist_c = Channel::from(history.clone()).named("hist");
-        let hlen_c = Channel::from([n + 1]).named("hlen");
+        let tok_in = Channel::from([g0]);
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
+        let hist_c = Channel::from(history.clone());
+        let hlen_c = Channel::from([n + 1]);
         // The decode fire gets its own channel, so the ring is seeded with the
         // entry the prefill fire wrote — otherwise the device and the host
         // mirror would disagree about the first context.
         let mut ring_seed = vec![u32::MAX; cfg.history_size as usize];
         ring_seed[(n % cfg.history_size) as usize] =
             host_counter(&history, n as usize, cfg.context_width);
-        let chist_c = Channel::from(ring_seed).named("context_history");
-        let out = Channel::new([4], dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named("out");
-        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let chist_c = Channel::from(ring_seed);
+        let out = Channel::new([4], dtype::f32).capacity(channel_capacity() as u32);
+        let lane1 = Channel::from([0u32, 1u32]);
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;

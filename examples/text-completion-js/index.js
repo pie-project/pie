@@ -26,9 +26,9 @@ export function main(input) {
   const pipe = new Pipeline();
   const generated = [];
 
-  const toks = Channel.from(prompt, dtype.i32).named('toks_p');
-  const embedIndptr = Channel.from([0, n], dtype.u32).named('embed_indptr_p');
-  const tokOut = new Channel([1], dtype.i32).named('tok_out_p');
+  const toks = Channel.from(prompt, dtype.i32);
+  const embedIndptr = Channel.from([0, n], dtype.u32);
+  const tokOut = new Channel([1], dtype.i32);
 
   const prefill = new ForwardPass();
   prefill.embed(toks, embedIndptr);
@@ -42,9 +42,9 @@ export function main(input) {
 
   // ── DECODE (1-wide, device loop-carried token) ─────────────────────────
   if (generated.length < maxTokens) {
-    const tokIn = Channel.from([first], dtype.i32).named('tok_in');
-    const tokOut = new Channel([1], dtype.i32).capacity(channelCapacity()).named('tok_out');
-    const embedIndptr = Channel.from([0, 1], dtype.u32).named('embed_indptr');
+    const tokIn = Channel.from([first], dtype.i32);
+    const tokOut = new Channel([1], dtype.i32).capacity(channelCapacity());
+    const embedIndptr = Channel.from([0, 1], dtype.u32);
 
     const fwd = new ForwardPass();
     fwd.embed(tokIn, embedIndptr);

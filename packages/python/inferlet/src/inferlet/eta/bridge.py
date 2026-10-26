@@ -117,7 +117,7 @@ class Channel:
     def _lazy(cls) -> "Channel":
         """An output channel declared by a stage body's return value: its
         shape and dtype are the returned tensor's, known once the pass
-        traces (at first submit). `capacity`/`named` before that are kept."""
+        traces (at first submit). `capacity` before that is kept."""
         ch = cls.__new__(cls)
         ch._dsl = None
         ch._pending = {}
@@ -133,8 +133,6 @@ class Channel:
         pending, self._pending = self._pending, None
         if "capacity" in pending:
             self._dsl.capacity(pending["capacity"])
-        if "name" in pending:
-            self._dsl.named(pending["name"])
         self._dsl.put_tensor(value)
 
     @property
@@ -189,21 +187,14 @@ class Channel:
         self._dsl.capacity(n)
         return self
 
-    def named(self, name: str) -> "Channel":
-        if self._dsl is None:
-            self._pending["name"] = name
-            return self
-        self._dsl.named(name)
-        return self
-
     @property
     def gid(self) -> int:
         """Declaration order — the container keys channels by it."""
         return self.dsl.gid
 
     @property
-    def name(self) -> str:
-        return self.dsl.name
+    def site(self) -> str:
+        return self.dsl.site
 
     @property
     def dtype(self) -> Dtype:
@@ -231,7 +222,7 @@ class Channel:
             return
         data = const_data(v, dtype if dtype is not None else self.dtype)
         if data.dtype is not self.dtype:
-            raise TypeError(f"channel {self.name} holds {self.dtype.wire_name}, put {data.dtype.wire_name}")
+            raise TypeError(f"channel {self.site} holds {self.dtype.wire_name}, put {data.dtype.wire_name}")
         self.dsl.note_host_put()
         try:
             self._wit().put(data.data)
@@ -242,7 +233,7 @@ class Channel:
     def set(self, v, dtype: Dtype | None = None) -> None:
         """Atomically replace the committed front cell (a host operation)."""
         data = const_data(v, dtype if dtype is not None else self.dtype)
-        _wit(self._wit().set, data.data, what=f"{self.name} set")
+        _wit(self._wit().set, data.data, what=f"channel {self.site} set")
 
     # -- host readback ---------------------------------------------------------
 
@@ -251,26 +242,26 @@ class Channel:
         (bools for a bool channel). Awaits in-flight fires; a poisoned
         channel raises `InferletError`."""
         self.dsl.note_host_take()
-        raw = await _wit_async(self._wit().take(), what=f"{self.name} take")
+        raw = await _wit_async(self._wit().take(), what=f"channel {self.site} take")
         return unpack_elems(bytes(raw), self.dtype)
 
     async def read_host(self) -> list:
         """Peek a cell on the host (leaves it full)."""
         self.dsl.note_host_read()
-        raw = await _wit_async(self._wit().read(), what=f"{self.name} read")
+        raw = await _wit_async(self._wit().read(), what=f"channel {self.site} read")
         return unpack_elems(bytes(raw), self.dtype)
 
     async def take_scalar(self):
         """`take_host()` for a one-element cell."""
         v = await self.take_host()
         if not v:
-            raise InferletError(f"{self.name} take: channel cell is empty")
+            raise InferletError(f"channel {self.site} take: channel cell is empty")
         return v[0]
 
     async def read_scalar(self):
         v = await self.read_host()
         if not v:
-            raise InferletError(f"{self.name} read: channel cell is empty")
+            raise InferletError(f"channel {self.site} read: channel cell is empty")
         return v[0]
 
     def __await__(self):

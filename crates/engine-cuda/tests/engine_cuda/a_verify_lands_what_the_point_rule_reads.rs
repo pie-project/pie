@@ -27,12 +27,13 @@ fn leak(channel: Channel) -> &'static Channel {
     Box::leak(Box::new(channel))
 }
 
-fn traced(logits: Vec<f32>, proposals: Vec<u32>) -> Traced {
-    let logits = leak(Channel::from_shaped([ROWS, VOCAB], logits).named("logits"));
-    let proposals = leak(Channel::from(proposals).named("proposals"));
-    let noise = leak(Channel::from([0u32, 0]).named("noise"));
-    let chances = leak(Channel::new([ROWS], dtype::f32).named("chances"));
-    let draws = leak(Channel::new([ROWS], dtype::i32).named("draws"));
+/// The trace, and its logits, proposals, noise, chances and draws channels.
+fn traced(logits: Vec<f32>, proposals: Vec<u32>) -> (Traced, [u64; 5]) {
+    let logits = leak(Channel::from_shaped([ROWS, VOCAB], logits));
+    let proposals = leak(Channel::from(proposals));
+    let noise = leak(Channel::from([0u32, 0]));
+    let chances = leak(Channel::new([ROWS], dtype::f32));
+    let draws = leak(Channel::new([ROWS], dtype::i32));
     let mut b = Builder::new(VOCAB, 16);
     b.stage(Stage::Epilogue, move || {
         let scaled = logits.read() / TEMPERATURE;
@@ -48,7 +49,8 @@ fn traced(logits: Vec<f32>, proposals: Vec<u32>) -> Traced {
     });
     chances.note_host_take();
     draws.note_host_take();
-    b.build().expect("the verify epilogue traces")
+    let gids = [logits, proposals, noise, chances, draws].map(Channel::gid);
+    (b.build().expect("the verify epilogue traces"), gids)
 }
 
 struct Noise(u64);
@@ -79,9 +81,18 @@ fn a_verify_lands_what_the_point_rule_reads() {
     for (r, &x) in proposals.iter().enumerate() {
         logits[r * VOCAB as usize + x as usize] = 14.0 + r as f32;
     }
-    let traced = traced(logits.clone(), proposals.clone());
-    let names = traced.channel_names();
-    let at = |name: &str| names.iter().position(|n| n == name).unwrap() as u32;
+    let (traced, gids) = traced(logits.clone(), proposals.clone());
+    let at = |name: &str| {
+        let gid = gids[["logits", "proposals", "noise", "chances", "draws"]
+            .iter()
+            .position(|n| *n == name)
+            .unwrap()];
+        traced
+            .channel_order()
+            .iter()
+            .position(|&g| g == gid)
+            .unwrap() as u32
+    };
     let bound = bind(
         traced.container().clone(),
         vec![vec![crate::bound::logits_decl(VOCAB)]],

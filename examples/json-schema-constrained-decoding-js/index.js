@@ -42,9 +42,9 @@ export function main(input) {
   const n = prompt.length;
 
   const promptTokens = Channel.from(prompt, dtype.i32);
-  const prefillIndptr = Channel.from([0, n], dtype.u32).named('prefill_indptr');
-  const prefillMask = new Channel([vocab], dtype.bool).named('prefill_mask');
-  const firstOut = new Channel([1], dtype.i32).named('first_token');
+  const prefillIndptr = Channel.from([0, n], dtype.u32);
+  const prefillMask = new Channel([vocab], dtype.bool);
+  const firstOut = new Channel([1], dtype.i32);
 
   const prefill = new ForwardPass();
   prefill.embed(promptTokens, prefillIndptr);
@@ -63,10 +63,10 @@ export function main(input) {
   constraint.acceptTokens([first]);
 
   if (!constraint.isTerminated() && generated.length < maxTokens) {
-    const tokenIn = Channel.from([first], dtype.i32).named('token_in');
-    const grammarMask = new Channel([vocab], dtype.bool).named('grammar_mask');
-    const embedIndptr = Channel.from([0, 1], dtype.u32).named('embed_indptr');
-    const tokenOut = new Channel([1], dtype.i32).capacity(channelCapacity()).named('token_out');
+    const tokenIn = Channel.from([first], dtype.i32);
+    const grammarMask = new Channel([vocab], dtype.bool);
+    const embedIndptr = Channel.from([0, 1], dtype.u32);
+    const tokenOut = new Channel([1], dtype.i32).capacity(channelCapacity());
 
     const decode = new ForwardPass();
     decode.embed(tokenIn, embedIndptr);

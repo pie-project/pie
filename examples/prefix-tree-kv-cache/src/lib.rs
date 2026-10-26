@@ -25,8 +25,8 @@ async fn append_tokens(ws: &WorkingSet, pipeline: &Pipeline, tokens: &[u32]) -> 
     }
     let n = tokens.len() as u32;
     let token_input = Channel::from_iter(tokens.iter().map(|&token| token as i32));
-    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
-    let next_token = Channel::new([1], dtype::i32).named("next_token");
+    let embed_indptr = Channel::from([0u32, n]);
+    let next_token = Channel::new([1], dtype::i32);
 
     let fwd = ForwardPass::new();
     fwd.embed(&token_input, &embed_indptr)?;
@@ -57,11 +57,9 @@ async fn generate(
         return Ok(generated);
     }
 
-    let token_in = Channel::from([first_token]).named("token_in");
-    let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
-    let token_out = Channel::new([1], dtype::i32)
-        .capacity(channel_capacity() as u32)
-        .named("token_out");
+    let token_in = Channel::from([first_token]);
+    let embed_indptr = Channel::from([0u32, 1]);
+    let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
 
     let fwd = ForwardPass::new();
     fwd.embed(&token_in, &embed_indptr)?;

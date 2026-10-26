@@ -135,7 +135,7 @@ async fn main(input: Input) -> Result<Output> {
             .flat_map(|query| (0..span).map(move |key| key <= query))
             .collect::<Vec<_>>(),
     );
-    let first_out = Channel::new([1], dtype::i32).named("first_token");
+    let first_out = Channel::new([1], dtype::i32);
 
     let prefill = ForwardPass::new();
     prefill.embed(&tokens, &embed_indptr)?;
@@ -158,15 +158,13 @@ async fn main(input: Input) -> Result<Output> {
         return report(&generated, n, sink, window, 0);
     }
 
-    let token_in = Channel::from([first as i32]).named("token_in");
-    let fill = Channel::from([n + 1]).named("fill");
+    let token_in = Channel::from([first as i32]);
+    let fill = Channel::from([n + 1]);
     let mask = Channel::from_shaped([1, span], host_sink_window_mask(span, n, sink, window));
-    let token_out = Channel::new([1], dtype::i32)
-        .capacity(channel_capacity() as u32)
-        .named("token_out");
+    let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
 
     let decode = ForwardPass::new();
-    let decode_indptr = Channel::from([0u32, 1]).named("decode_indptr");
+    let decode_indptr = Channel::from([0u32, 1]);
     decode.embed(&token_in, &decode_indptr)?;
     decode.mask(&mask)?;
     decode.state(&[&ws], StateGeometry::folding())?;

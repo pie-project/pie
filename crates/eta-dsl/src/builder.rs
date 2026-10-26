@@ -236,11 +236,9 @@ impl<'a> Builder<'a> {
         }
 
         let channel_order = channels.iter().map(|c| c.borrow().gid).collect();
-        let channel_names = channels.iter().map(|c| c.borrow().name.clone()).collect();
         Ok(Traced {
             container,
             channel_order,
-            channel_names,
         })
     }
 
@@ -275,7 +273,6 @@ impl<'a> Builder<'a> {
 pub struct Traced {
     container: TraceContainer,
     channel_order: Vec<u64>,
-    channel_names: Vec<String>,
 }
 
 impl Traced {
@@ -290,9 +287,6 @@ impl Traced {
     }
     pub fn channel_order(&self) -> &[u64] {
         &self.channel_order
-    }
-    pub fn channel_names(&self) -> &[String] {
-        &self.channel_names
     }
 }
 

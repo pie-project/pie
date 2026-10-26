@@ -207,7 +207,6 @@ fn video_lane(
     case: &Case,
     reading: &str,
     group: u32,
-    tag: &str,
     from: u32,
     to: u32,
     timestep: f32,
@@ -218,17 +217,15 @@ fn video_lane(
     pass.switch(lane, "reading", reading)?;
     pass.switch(lane, "stream", "video")?;
     pass.group(lane, group)?;
-    let x = Channel::from_shaped([to - from, case.height, case.width, case.channels], latents)
-        .named(&format!("latents_{tag}"));
-    let t = Channel::from([timestep]).named(&format!("t_{tag}"));
+    let x = Channel::from_shaped([to - from, case.height, case.width, case.channels], latents);
+    let t = Channel::from([timestep]);
     pass.input(lane, "latents", &x)?;
     pass.input(lane, "timestep", &t)?;
     if !case.positions.is_empty() {
         let rows = |frames: u32| (case.positions.len() as u32 / 3) / case.frames * frames;
         let (a, b) = (rows(from) as usize * 3, rows(to) as usize * 3);
         pass.switch(lane, "positions", "given")?;
-        let pos = Channel::from_shaped([rows(to - from), 3], &case.positions[a..b])
-            .named(&format!("positions_{tag}"));
+        let pos = Channel::from_shaped([rows(to - from), 3], &case.positions[a..b]);
         pass.input(lane, "positions", &pos)?;
     }
     Ok((to - from) * plane)
@@ -244,23 +241,12 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
     let ctx = Channel::from_shaped(
         [case.context_rows, case.context_width],
         case.context.as_slice(),
-    )
-    .named("context");
+    );
     pass.input(0, "context", &ctx)?;
 
     let mut videos: Vec<(u32, u32)> = Vec::new();
     if case.cond_frames > 0 {
-        let voxels = video_lane(
-            &pass,
-            1,
-            case,
-            reading,
-            group,
-            "cond",
-            0,
-            case.cond_frames,
-            0.0,
-        )?;
+        let voxels = video_lane(&pass, 1, case, reading, group, 0, case.cond_frames, 0.0)?;
         videos.push((1, voxels));
     }
     let main_lane = videos.len() as u32 + 1;
@@ -270,7 +256,6 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
         case,
         reading,
         group,
-        "main",
         case.cond_frames,
         case.frames,
         case.timestep,
@@ -281,8 +266,7 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
     let outs: Vec<(u32, u32, Channel)> = videos
         .iter()
         .map(|&(lane, voxels)| {
-            let out = Channel::new([voxels, velocity_width], dtype::f32)
-                .named(&format!("velocity_{lane}"));
+            let out = Channel::new([voxels, velocity_width], dtype::f32);
             (lane, voxels, out)
         })
         .collect();

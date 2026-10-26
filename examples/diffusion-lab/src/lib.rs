@@ -275,19 +275,19 @@ impl Block<'_> {
         for &(p, t) in clamps {
             canvas[p as usize] = t;
         }
-        let toks = Channel::from(canvas.clone()).named("canvas");
-        let embed_indptr = Channel::from([0u32, length]).named("embed_indptr");
-        let slots = Channel::from_iter(base..end).named("slots");
-        let readout = Channel::from_iter(0..length).named("readout");
+        let toks = Channel::from(canvas.clone());
+        let embed_indptr = Channel::from([0u32, length]);
+        let slots = Channel::from_iter(base..end);
+        let readout = Channel::from_iter(0..length);
         // Control words, host-`set` before each submit.
-        let temp = Channel::from([input.t_max]).named("temperature");
-        let count = Channel::from([0i32]).named("count");
-        let rng_state = Channel::from([seed, 0]).named("rng");
+        let temp = Channel::from([input.t_max]);
+        let count = Channel::from([0i32]);
+        let rng_state = Channel::from([seed, 0]);
         // Device-carried state across steps.
-        let history = Channel::from(vec![-1i32; n]).named("argmax_history");
-        let stable_run = Channel::from([0i32]).named("stable_run");
-        let frozen = Channel::from(vec![false; n]).named("frozen");
-        let frozen_ids = Channel::from(vec![-1i32; n]).named("frozen_ids");
+        let history = Channel::from(vec![-1i32; n]);
+        let stable_run = Channel::from([0i32]);
+        let frozen = Channel::from(vec![false; n]);
+        let frozen_ids = Channel::from(vec![-1i32; n]);
         // `klass`: the previous step's log-probabilities, a whole
         // [canvas, vocab] plane carried on the device, seeded uniform; and
         // the previous step's per-row KL, seeded past any bound.
@@ -297,30 +297,25 @@ impl Block<'_> {
         // for `a` the previous argmax — the one term of the full KL a
         // per-row gather can reach; the whole [canvas, vocab] plane of the
         // previous step (268 MB) is more than a guest can seed.
-        let prev_id =
-            (rule == Rule::Klass).then(|| Channel::from(vec![0u32; n]).named("prev_argmax"));
-        let prev_p = (rule == Rule::Klass).then(|| Channel::from(vec![0f32; n]).named("prev_top1"));
-        let prev_kl =
-            (rule == Rule::Klass).then(|| Channel::from(vec![1e30f32; n]).named("prev_kl"));
+        let prev_id = (rule == Rule::Klass).then(|| Channel::from(vec![0u32; n]));
+        let prev_p = (rule == Rule::Klass).then(|| Channel::from(vec![0f32; n]));
+        let prev_kl = (rule == Rule::Klass).then(|| Channel::from(vec![1e30f32; n]));
         // `remdm`: the step index, device-carried, switches remasking off
         // for the schedule's last fifth.
-        let step_index = Channel::from([0u32]).named("step_index");
+        let step_index = Channel::from([0u32]);
         // Outputs the host drains each step.
-        let canvas_out = Channel::new([length], dtype::i32).named("canvas_out");
-        let commit_out = Channel::new([length], dtype::i32).named("commit_out");
-        let stop = Channel::new([1], dtype::bool).named("stop");
-        let mean_out = Channel::new([1], dtype::f32).named("mean_entropy");
-        let tap_ids_out =
-            (taps_used > 0).then(|| Channel::new([length, taps_used], dtype::i32).named("tap_ids"));
-        let tap_weights_out = (taps_used > 0)
-            .then(|| Channel::new([length, taps_used], dtype::f32).named("tap_weights"));
+        let canvas_out = Channel::new([length], dtype::i32);
+        let commit_out = Channel::new([length], dtype::i32);
+        let stop = Channel::new([1], dtype::bool);
+        let mean_out = Channel::new([1], dtype::f32);
+        let tap_ids_out = (taps_used > 0).then(|| Channel::new([length, taps_used], dtype::i32));
+        let tap_weights_out =
+            (taps_used > 0).then(|| Channel::new([length, taps_used], dtype::f32));
         // The model's self-conditioning inputs, at its full tap width:
         // zeros (no signal) until the host `set`s a step's taps.
         let cells = n * taps_width as usize;
-        let self_cond_ids =
-            Channel::from_shaped([length, taps_width], vec![0i32; cells]).named("self_cond_ids");
-        let self_cond_weights = Channel::from_shaped([length, taps_width], vec![0f32; cells])
-            .named("self_cond_weights");
+        let self_cond_ids = Channel::from_shaped([length, taps_width], vec![0i32; cells]);
+        let self_cond_weights = Channel::from_shaped([length, taps_width], vec![0f32; cells]);
 
         let fwd = ForwardPass::new();
         fwd.switch(0, "mode", "denoise")?;
@@ -758,10 +753,10 @@ async fn encode(
     quality: bool,
 ) -> Result<Option<f32>> {
     let len = u32::try_from(tokens.len()).map_err(|_| "an encode span is too long")?;
-    let toks = Channel::from(tokens).named("toks_e");
-    let embed_indptr = Channel::from([0u32, len]).named("embed_indptr_e");
+    let toks = Channel::from(tokens);
+    let embed_indptr = Channel::from([0u32, len]);
     // Stated, not appended: a commit replaces the canvas scratch at `base..`.
-    let slots = Channel::from_iter(base..base + len).named("slots_e");
+    let slots = Channel::from_iter(base..base + len);
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;
@@ -773,7 +768,7 @@ async fn encode(
         },
     )?;
     if quality && len > 1 {
-        let readout = Channel::from_iter(0..len).named("readout_e");
+        let readout = Channel::from_iter(0..len);
         fwd.readout(&readout)?;
         // Row i predicts tokens[i + 1]; the last row predicts past the block
         // and gets weight 0.
@@ -781,9 +776,9 @@ async fn encode(
         next.push(0);
         let mut weight = vec![1.0f32; len as usize];
         weight[len as usize - 1] = 0.0;
-        let next = Channel::from(next).named("next_e");
-        let weight = Channel::from(weight).named("weight_e");
-        let q_out = Channel::new([1], dtype::f32).named("quality_e");
+        let next = Channel::from(next);
+        let weight = Channel::from(weight);
+        let q_out = Channel::new([1], dtype::f32);
         let denom = (len - 1) as f32;
         fwd.epilogue(move || {
             let lp = log_softmax(intrinsics::output(0, "logits")); // [len, vocab]
@@ -795,7 +790,7 @@ async fn encode(
         let q = q_out.take_host::<f32>().await?;
         Ok(Some(q))
     } else {
-        let last = Channel::new([1], dtype::i32).named("last_e");
+        let last = Channel::new([1], dtype::i32);
         fwd.epilogue(move || {
             last.put(reshape(
                 cast(reduce_argmax(intrinsics::output(0, "logits")), dtype::i32),

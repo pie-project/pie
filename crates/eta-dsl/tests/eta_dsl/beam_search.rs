@@ -16,20 +16,20 @@ fn leak<T>(v: T) -> &'static T {
 }
 
 fn build_designb() -> Traced {
-    let mask = leak(Channel::seeded([B, POOL], dtype::bool).named("mask"));
-    let scores = leak(Channel::from(vec![0.0f32; B as usize]).named("scores"));
-    let toks = leak(Channel::from(vec![1i32; B as usize]).named("toks"));
-    let pos = leak(Channel::from(vec![0u32; B as usize]).named("pos"));
-    let fill = leak(Channel::from(vec![0u32; 1]).named("fill"));
-    let klen = leak(Channel::from(vec![0u32; B as usize]).named("klen"));
-    let slots = leak(Channel::from(vec![0u32; B as usize]).named("slots"));
-    let out = leak(Channel::new([B], dtype::i32).named("out"));
-    let out_par = leak(Channel::new([B], dtype::u32).named("out_par"));
-    let out_scr = leak(Channel::new([B], dtype::f32).named("out_scr"));
-    let out_mask = leak(Channel::new([B, POOL], dtype::bool).named("out_mask"));
-    let out_slots = leak(Channel::new([B], dtype::u32).named("out_slots"));
+    let mask = leak(Channel::seeded([B, POOL], dtype::bool));
+    let scores = leak(Channel::from(vec![0.0f32; B as usize]));
+    let toks = leak(Channel::from(vec![1i32; B as usize]));
+    let pos = leak(Channel::from(vec![0u32; B as usize]));
+    let fill = leak(Channel::from(vec![0u32; 1]));
+    let klen = leak(Channel::from(vec![0u32; B as usize]));
+    let slots = leak(Channel::from(vec![0u32; B as usize]));
+    let out = leak(Channel::new([B], dtype::i32));
+    let out_par = leak(Channel::new([B], dtype::u32));
+    let out_scr = leak(Channel::new([B], dtype::f32));
+    let out_mask = leak(Channel::new([B, POOL], dtype::bool));
+    let out_slots = leak(Channel::new([B], dtype::u32));
 
-    let lanes_b = leak(Channel::from((0u32..=B).collect::<Vec<_>>()).named("indptr"));
+    let lanes_b = leak(Channel::from((0u32..=B).collect::<Vec<_>>()));
 
     let mut b = Builder::new(V, PAGE_T);
     b.outputs(crate::outputs::logits(V));

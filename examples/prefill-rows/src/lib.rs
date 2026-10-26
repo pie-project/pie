@@ -35,16 +35,15 @@ async fn main(input: Input) -> Result<Output> {
         .iter()
         .find(|output| output.name == "logits")
         .map_or(1, |output| output.max_rows);
-    for (at, &(base, end)) in readout_spans(n, max).iter().enumerate() {
+    for &(base, end) in readout_spans(n, max).iter() {
         let len = end - base;
-        let toks =
-            Channel::from(&prompt_i32[base as usize..end as usize]).named(&format!("toks_{at}"));
-        let embed_indptr = Channel::from([0u32, len]).named(&format!("embed_indptr_{at}"));
-        let readout = Channel::from_iter(0..len).named(&format!("readout_{at}"));
-        let arg_out = Channel::new([len], dtype::i32).named(&format!("arg_{at}"));
-        let ent_out = Channel::new([len], dtype::f32).named(&format!("ent_{at}"));
-        let ids_out = Channel::new([len, 8], dtype::u32).named(&format!("ids_{at}"));
-        let probs_out = Channel::new([len, 8], dtype::f32).named(&format!("probs_{at}"));
+        let toks = Channel::from(&prompt_i32[base as usize..end as usize]);
+        let embed_indptr = Channel::from([0u32, len]);
+        let readout = Channel::from_iter(0..len);
+        let arg_out = Channel::new([len], dtype::i32);
+        let ent_out = Channel::new([len], dtype::f32);
+        let ids_out = Channel::new([len, 8], dtype::u32);
+        let probs_out = Channel::new([len, 8], dtype::f32);
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &embed_indptr)?;

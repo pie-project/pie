@@ -162,7 +162,7 @@ fn padded(rows: Option<model::RowCount>, len: u32) -> Result<u32> {
 }
 
 fn length(case: &Case) -> Channel {
-    Channel::from([case.caption_rows as f32]).named("length")
+    Channel::from([case.caption_rows as f32])
 }
 
 /// The refined caption, its width and the padded caption rows.
@@ -180,12 +180,11 @@ async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     let pass = ForwardPass::new();
     pass.switch(0, "reading", &r.name)?;
     pass.switch(0, "stream", "context")?;
-    let caption =
-        Channel::from_shaped([rows, case.caption_width], rows_in.as_slice()).named("caption");
+    let caption = Channel::from_shaped([rows, case.caption_width], rows_in.as_slice());
     pass.input(0, "caption", &caption)?;
     pass.input(0, "length", &length(case))?;
     let width = r.readout_width;
-    let out = Channel::new([rows, width], dtype::f32).named("refined");
+    let out = Channel::new([rows, width], dtype::f32);
     pass.epilogue(move || {
         out.put(intrinsics::output_rows(0, "hidden", rows));
     });
@@ -238,12 +237,11 @@ fn readout_rows(case: &Case, width: u32) -> Result<u32> {
     })
 }
 
-fn latent_of(case: &Case, name: &str) -> Channel {
+fn latent_of(case: &Case) -> Channel {
     Channel::from_shaped(
         [case.height, case.width, case.channels],
         case.latents.as_slice(),
     )
-    .named(name)
 }
 
 async fn denoise(
@@ -256,13 +254,13 @@ async fn denoise(
     let width = r.readout_width;
     let voxels = readout_rows(case, width)?;
     let caption_rows = context.shape().dims()[0];
-    let t = Channel::from([case.timestep]).named("t");
-    let x = latent_of(case, "latents");
+    let t = Channel::from([case.timestep]);
+    let x = latent_of(case);
     let pass = ForwardPass::new();
     denoise_lanes(&pass, &r, case, context, &x, &t)?;
 
-    let out = Channel::new([voxels, width], dtype::f32).named("velocity");
-    let ctx_out = ctx_tap.then(|| Channel::new([caption_rows, width], dtype::f32).named("ctx_tap"));
+    let out = Channel::new([voxels, width], dtype::f32);
+    let ctx_out = ctx_tap.then(|| Channel::new([caption_rows, width], dtype::f32));
     pass.epilogue(move || {
         out.put(intrinsics::output_rows(1, "velocity", voxels));
         if let Some(tapped) = &ctx_out {
@@ -291,11 +289,11 @@ async fn trajectory(
     let lat = [case.height, case.width, case.channels];
     let sched = FlowMatchEuler::from_model(steps, None)?;
     let loops = DenoiseLoop::new(&sched);
-    let latent = latent_of(case, "traj_x");
+    let latent = latent_of(case);
     let pass = ForwardPass::new();
     denoise_lanes(&pass, &r, case, context, &latent, &loops.timestep())?;
 
-    let out = Channel::new(lat, dtype::f32).named("traj_out");
+    let out = Channel::new(lat, dtype::f32);
     let dts = loops.dts();
     loops.drive(&pass, move |k| {
         let next = euler_step(
@@ -358,7 +356,7 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     let toks = Channel::from(ids);
     let embed_indptr = Channel::from([0u32, len]);
     let readout = Channel::from_iter(0..len);
-    let out = Channel::new([len, width], dtype::f32).named("text");
+    let out = Channel::new([len, width], dtype::f32);
 
     let pass = ForwardPass::new();
     pass.switch(0, "reading", &name)?;
@@ -465,7 +463,7 @@ async fn main(input: Input) -> Result<Output> {
     };
     let (refined, dim, caption_rows) = refine(&case, &pipe).await?;
     // The refined caption: no pass writes it, so every denoise pass reads it.
-    let context = Channel::from_shaped([caption_rows, dim], refined.as_slice()).named("context");
+    let context = Channel::from_shaped([caption_rows, dim], refined.as_slice());
     let (mut latent, mut sigmas, mut timesteps) = (Vec::new(), Vec::new(), Vec::new());
     let (velocity, ctx_rows) = if input.refine_only {
         (Vec::new(), Vec::new())

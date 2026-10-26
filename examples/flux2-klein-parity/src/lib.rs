@@ -164,10 +164,10 @@ async fn text_rows(ids: &[u32], width: u32, pipe: &Pipeline) -> Result<Vec<f32>>
     let toks: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
     let ws = WorkingSet::new();
 
-    let toks = Channel::from(toks).named("ids");
+    let toks = Channel::from(toks);
     let embed_indptr = Channel::from([0u32, len]);
     let readout = Channel::from_iter(0..len);
-    let out = Channel::new([len, width], dtype::f32).named("hidden");
+    let out = Channel::new([len, width], dtype::f32);
 
     let pass = ForwardPass::new();
     pass.switch(0, "reading", "text")?;
@@ -203,17 +203,17 @@ async fn trajectory(
     let dts: Vec<f32> = (0..sigmas.len())
         .map(|i| sigmas.get(i + 1).copied().unwrap_or(0.0) - sigmas[i])
         .collect();
-    let ts_ch = Channel::from(ts.clone()).named("ts");
-    let dts_ch = Channel::from(dts).named("dts");
+    let ts_ch = Channel::from(ts.clone());
+    let dts_ch = Channel::from(dts);
 
     let voxels = lat[0] * lat[1];
     let channels = lat[2];
-    let x = Channel::from_shaped(lat, noise).named("latents");
+    let x = Channel::from_shaped(lat, noise);
     let velocity_width = dims.velocity_width;
     let (img_lane, txt_lane) = if image_first { (0, 1) } else { (1, 0) };
 
-    let t = Channel::from([ts[0]]).named("t");
-    let k = Channel::from([0u32]).named("k");
+    let t = Channel::from([ts[0]]);
+    let k = Channel::from([0u32]);
     let pass = ForwardPass::new();
     pass.switch(txt_lane, "reading", reading)?;
     pass.switch(txt_lane, "stream", "text")?;
@@ -226,8 +226,8 @@ async fn trajectory(
     pass.input(img_lane, "latents", &x)?;
     pass.input(img_lane, "timestep", &t)?;
 
-    let v_out = Channel::new([voxels, velocity_width], dtype::f32).named("v_out");
-    let x_out = Channel::new(lat, dtype::f32).named("x_out");
+    let v_out = Channel::new([voxels, velocity_width], dtype::f32);
+    let x_out = Channel::new(lat, dtype::f32);
     pass.epilogue(move || {
         let k_cur = k.take();
         let v = intrinsics::output_rows(img_lane, "velocity", voxels);
@@ -330,8 +330,7 @@ async fn main(input: Input) -> Result<Output> {
         &case.context_file,
         (case.text_rows * case.context_width) as usize,
     )?;
-    let golden =
-        Channel::from_shaped([case.text_rows, case.context_width], context).named("context");
+    let golden = Channel::from_shaped([case.text_rows, case.context_width], context);
     let (velocity0, latents) = trajectory(
         &golden,
         &noise,
@@ -371,7 +370,7 @@ async fn main(input: Input) -> Result<Output> {
 
     // The same trajectory over pie's own text rows.
     if case.native {
-        let native = Channel::from_shaped([len, hidden_width], hidden.clone()).named("native_ctx");
+        let native = Channel::from_shaped([len, hidden_width], hidden.clone());
         let (velocity0, latents) = trajectory(
             &native,
             &noise,

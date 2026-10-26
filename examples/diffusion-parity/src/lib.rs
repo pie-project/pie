@@ -145,18 +145,16 @@ async fn main(input: Input) -> Result<Output> {
             .map_or(1, |output| output.max_rows),
     );
     let mut prefill_rows = Rows::default();
-    for (at, &(base, end)) in spans.iter().enumerate() {
+    for &(base, end) in spans.iter() {
         let len = end - base;
-        let tag = format!("p{at}");
-        let toks =
-            Channel::from(&prompt_i32[base as usize..end as usize]).named(&format!("toks_{tag}"));
-        let embed_indptr = Channel::from([0u32, len]).named(&format!("embed_indptr_{tag}"));
-        let slots = Channel::from_iter(base..end).named(&format!("slots_{tag}"));
-        let readout = Channel::from_iter(0..len).named(&format!("readout_{tag}"));
-        let arg_out = Channel::new([len], dtype::i32).named(&format!("arg_{tag}"));
-        let ent_out = Channel::new([len], dtype::f32).named(&format!("ent_{tag}"));
-        let ids_out = Channel::new([len, 8], dtype::u32).named(&format!("ids_{tag}"));
-        let probs_out = Channel::new([len, 8], dtype::f32).named(&format!("probs_{tag}"));
+        let toks = Channel::from(&prompt_i32[base as usize..end as usize]);
+        let embed_indptr = Channel::from([0u32, len]);
+        let slots = Channel::from_iter(base..end);
+        let readout = Channel::from_iter(0..len);
+        let arg_out = Channel::new([len], dtype::i32);
+        let ent_out = Channel::new([len], dtype::f32);
+        let ids_out = Channel::new([len, 8], dtype::u32);
+        let probs_out = Channel::new([len, 8], dtype::f32);
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &embed_indptr)?;
@@ -220,15 +218,14 @@ async fn main(input: Input) -> Result<Output> {
         vec![&case.canvas0, &case.canvas1, &case.canvas0]
     };
     for (at, canvas) in canvases.into_iter().enumerate() {
-        let tag = format!("d{at}");
-        let toks = Channel::from(canvas.as_slice()).named(&format!("canvas_{tag}"));
-        let embed_indptr = Channel::from([0u32, length]).named(&format!("embed_indptr_{tag}"));
-        let slots = Channel::from_iter(n..n + length).named(&format!("slots_{tag}"));
-        let readout = Channel::from_iter(0..length).named(&format!("readout_{tag}"));
-        let arg_out = Channel::new([length], dtype::i32).named(&format!("arg_{tag}"));
-        let ent_out = Channel::new([length], dtype::f32).named(&format!("ent_{tag}"));
-        let ids_out = Channel::new([length, 8], dtype::u32).named(&format!("ids_{tag}"));
-        let probs_out = Channel::new([length, 8], dtype::f32).named(&format!("probs_{tag}"));
+        let toks = Channel::from(canvas.as_slice());
+        let embed_indptr = Channel::from([0u32, length]);
+        let slots = Channel::from_iter(n..n + length);
+        let readout = Channel::from_iter(0..length);
+        let arg_out = Channel::new([length], dtype::i32);
+        let ent_out = Channel::new([length], dtype::f32);
+        let ids_out = Channel::new([length, 8], dtype::u32);
+        let probs_out = Channel::new([length, 8], dtype::f32);
 
         let fwd = ForwardPass::new();
         let commit = at == 2;
@@ -268,10 +265,8 @@ async fn main(input: Input) -> Result<Output> {
             } else {
                 (vec![0i32; cells], vec![0f32; cells])
             };
-            let ids =
-                Channel::from_shaped([length, taps], ids).named(&format!("self_cond_ids_{tag}"));
-            let weights = Channel::from_shaped([length, taps], weights)
-                .named(&format!("self_cond_weights_{tag}"));
+            let ids = Channel::from_shaped([length, taps], ids);
+            let weights = Channel::from_shaped([length, taps], weights);
             fwd.input(0, "self_cond_ids", &ids)
                 .context("bind self_cond_ids")?;
             fwd.input(0, "self_cond_weights", &weights)

@@ -34,16 +34,16 @@ export function main(input) {
 
   const initialScores = new Array(B).fill(-Infinity);
   initialScores[0] = 0.0;
-  const scores = Channel.from(initialScores, dtype.f32).named('scores');
-  const toks = Channel.from(new Array(B).fill(BOS), dtype.i32).named('toks');
+  const scores = Channel.from(initialScores, dtype.f32);
+  const toks = Channel.from(new Array(B).fill(BOS), dtype.i32);
   const cap = channelCapacity();
-  const out = new Channel([B], dtype.i32).capacity(cap).named('out');
-  const outPar = new Channel([B], dtype.u32).capacity(cap).named('out_par');
-  const outScr = new Channel([B], dtype.f32).capacity(cap).named('out_scr');
+  const out = new Channel([B], dtype.i32).capacity(cap);
+  const outPar = new Channel([B], dtype.u32).capacity(cap);
+  const outScr = new Channel([B], dtype.f32).capacity(cap);
   // Independent per-lane greedy argmax over the RAW logits, beside the beam
   // pick: at `beams == 1` the two must agree on every step.
-  const outGreedy = new Channel([B], dtype.i32).capacity(cap).named('out_greedy');
-  const lanesB = Channel.from(range(0, B + 1), dtype.u32).named('embed_indptr');
+  const outGreedy = new Channel([B], dtype.i32).capacity(cap);
+  const lanesB = Channel.from(range(0, B + 1), dtype.u32);
 
   const step = () => {
     // `logits()` squeezes to `[v]` for a single read-out row, so reshape back.
@@ -89,12 +89,12 @@ export function main(input) {
 
   const initMask = [];
   for (let b = 0; b < B; b++) for (let p = 0; p < poolLen; p++) initMask.push(p === 0);
-  const mask = Channel.fromShaped([B, poolLen], initMask).named('mask');
-  const slots = Channel.from(new Array(B).fill(0), dtype.u32).named('slots');
+  const mask = Channel.fromShaped([B, poolLen], initMask);
+  const slots = Channel.from(new Array(B).fill(0), dtype.u32);
   // A beam's RoPE position is its depth, not its pool slot.
-  const pos = Channel.from(new Array(B).fill(0), dtype.u32).named('pos');
-  const fill = Channel.from([1], dtype.u32).named('fill');
-  const kvLen = Channel.from(new Array(B).fill(1), dtype.u32).named('kv_len');
+  const pos = Channel.from(new Array(B).fill(0), dtype.u32);
+  const fill = Channel.from([1], dtype.u32);
+  const kvLen = Channel.from(new Array(B).fill(1), dtype.u32);
   fwd.state(pool, { positions: pos, slots, kvLen });
   fwd.mask(mask);
   fwd.epilogue(() => {

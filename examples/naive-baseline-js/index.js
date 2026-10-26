@@ -48,12 +48,12 @@ export function main(input) {
   const generated = [];
   const pipe = new Pipeline();
 
-  const toksP = Channel.from(prompt, dtype.i32).named('toks_p');
-  const embedIndptrP = Channel.from([0, n], dtype.u32).named('embed_indptr_p');
-  const rngP = Channel.from([seed, 0], dtype.u32).named('rng_p');
-  const tokOutP = new Channel([1], dtype.i32).named('tok_out_p');
-  const s1OutP = new Channel([1], dtype.f32).named('s1_out_p');
-  const s2OutP = new Channel([1], dtype.f32).named('s2_out_p');
+  const toksP = Channel.from(prompt, dtype.i32);
+  const embedIndptrP = Channel.from([0, n], dtype.u32);
+  const rngP = Channel.from([seed, 0], dtype.u32);
+  const tokOutP = new Channel([1], dtype.i32);
+  const s1OutP = new Channel([1], dtype.f32);
+  const s2OutP = new Channel([1], dtype.f32);
 
   const fwdP = new ForwardPass();
   fwdP.embed(toksP, embedIndptrP);
@@ -82,12 +82,12 @@ export function main(input) {
   // ── DECODE LOOP (1-wide, run-ahead). ──
   if (generated.length < maxTokens) {
     const cap = channelCapacity();
-    const tokIn = Channel.from([g0], dtype.i32).named('tok_in');
-    const rng = Channel.from([seed ^ 0x5bd1, 0], dtype.u32).named('rng');
-    const tokOut = new Channel([1], dtype.i32).capacity(cap).named('tok_out');
-    const s1Out = new Channel([1], dtype.f32).capacity(cap).named('s1_out');
-    const s2Out = new Channel([1], dtype.f32).capacity(cap).named('s2_out');
-    const lane1 = Channel.from([0, 1], dtype.u32).named('embed_indptr');
+    const tokIn = Channel.from([g0], dtype.i32);
+    const rng = Channel.from([seed ^ 0x5bd1, 0], dtype.u32);
+    const tokOut = new Channel([1], dtype.i32).capacity(cap);
+    const s1Out = new Channel([1], dtype.f32).capacity(cap);
+    const s2Out = new Channel([1], dtype.f32).capacity(cap);
+    const lane1 = Channel.from([0, 1], dtype.u32);
 
     const fwd = new ForwardPass();
     fwd.embed(tokIn, lane1);

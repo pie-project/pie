@@ -103,10 +103,12 @@ pub struct Channel {
 pub const TOKEN_PAD: i32 = -1;
 
 impl Channel {
+    #[track_caller]
     pub fn new(shape: impl IntoShape, dtype: Dtype) -> Channel {
         Channel::build(shape.into_shape(), dtype, false)
     }
 
+    #[track_caller]
     pub fn writer(shape: impl IntoShape, dtype: Dtype) -> Channel {
         let channel = Channel::build(shape.into_shape(), dtype, false);
         channel.dsl().note_host_put();
@@ -131,11 +133,6 @@ impl Channel {
         self
     }
 
-    pub fn named(self, name: &str) -> Channel {
-        let _ = self.dsl().named(name);
-        self
-    }
-
     /// A queue between passes: another pass consumes it, so the pass that
     /// puts it does not read it as its output for the host; a pass that
     /// peeks it as a port (`kv_len`, `pages`, `page_indptr`) takes each value
@@ -146,6 +143,7 @@ impl Channel {
         self
     }
 
+    #[track_caller]
     pub fn from(v: impl IntoConst) -> Channel {
         let data: ConstData = v.into_const();
         let ch = Channel::build(data.shape, data.dtype, true);
@@ -155,10 +153,12 @@ impl Channel {
         ch
     }
 
+    #[track_caller]
     pub fn seeded(shape: impl IntoShape, dtype: Dtype) -> Channel {
         Channel::build(shape.into_shape(), dtype, true)
     }
 
+    #[track_caller]
     pub fn from_shaped(shape: impl IntoShape, v: impl IntoConst) -> Channel {
         let data: ConstData = v.into_const();
         let shape = shape.into_shape();
@@ -174,6 +174,7 @@ impl Channel {
         ch
     }
 
+    #[track_caller]
     fn build(shape: Shape, dtype: Dtype, seeded: bool) -> Channel {
         let dsl = if seeded {
             DslChannel::seeded(shape, dtype)
@@ -240,7 +241,7 @@ impl Channel {
     }
 
     fn host_label(&self, verb: &str) -> String {
-        format!("{} {verb}", self.dsl().name())
+        format!("channel {} {verb}", self.dsl().site().at())
     }
 
     fn check_host<T: FromChannel>(&self, verb: &str) -> Result<(), String> {

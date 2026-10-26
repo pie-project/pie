@@ -226,13 +226,12 @@ fn prefill(
     tag: &str,
 ) -> Result<(Channel, Channel)> {
     let n = shape.prefix_len;
-    let toks = Channel::from(ids.to_vec()).named(&format!("prefix_ids_{tag}"));
-    let indptr = Channel::from([0u32, n]).named(&format!("prefix_indptr_{tag}"));
-    let rope = Channel::from_shaped([n, shape.axes], case.prefix_positions.as_slice())
-        .named(&format!("prefix_positions_{tag}"));
-    let readout = Channel::from_iter(0..n).named(&format!("prefix_readout_{tag}"));
-    let argmax = Channel::new([n], dtype::i32).named(&format!("encode_argmax_{tag}"));
-    let max = Channel::new([n], dtype::f32).named(&format!("encode_max_{tag}"));
+    let toks = Channel::from(ids.to_vec());
+    let indptr = Channel::from([0u32, n]);
+    let rope = Channel::from_shaped([n, shape.axes], case.prefix_positions.as_slice());
+    let readout = Channel::from_iter(0..n);
+    let argmax = Channel::new([n], dtype::i32);
+    let max = Channel::new([n], dtype::f32);
 
     let pass = ForwardPass::new();
     pass.switch(0, "reading", encode)?;
@@ -284,19 +283,16 @@ fn denoise_step(
         })
         .collect();
 
-    let name = |what: &str| format!("canvas_{what}_{tag}");
-    let toks = Channel::from(ids).named(&name("ids"));
-    let indptr = Channel::from([0u32, canvas_len]).named(&name("indptr"));
-    let latents =
-        Channel::from_shaped([canvas_len, case.hidden], rows.as_slice()).named(&name("rows"));
-    let flag = Channel::from_shaped([canvas_len, 1], special.as_slice()).named(&name("special"));
-    let t = Channel::from([timestep]).named(&name("timestep"));
-    let rope = Channel::from_shaped([canvas_len, shape.axes], case.canvas_positions.as_slice())
-        .named(&name("positions"));
-    let slots = Channel::from(case.canvas_sequence.clone()).named(&name("slots"));
-    let slab = Channel::from_shaped([canvas_len, kv_len], mask.as_slice()).named(&name("mask"));
-    let readout = Channel::from_iter(0..canvas_len).named(&name("readout"));
-    let out = Channel::new([canvas_len, case.hidden], dtype::f32).named(&name("hidden"));
+    let toks = Channel::from(ids);
+    let indptr = Channel::from([0u32, canvas_len]);
+    let latents = Channel::from_shaped([canvas_len, case.hidden], rows.as_slice());
+    let flag = Channel::from_shaped([canvas_len, 1], special.as_slice());
+    let t = Channel::from([timestep]);
+    let rope = Channel::from_shaped([canvas_len, shape.axes], case.canvas_positions.as_slice());
+    let slots = Channel::from(case.canvas_sequence.clone());
+    let slab = Channel::from_shaped([canvas_len, kv_len], mask.as_slice());
+    let readout = Channel::from_iter(0..canvas_len);
+    let out = Channel::new([canvas_len, case.hidden], dtype::f32);
 
     let pass = ForwardPass::new();
     pass.switch(0, "reading", denoise)?;
@@ -336,7 +332,6 @@ fn voxel_arm(
     pipe: &Pipeline,
     clip: &[f32],
     channels: u32,
-    tag: &str,
 ) -> Result<Channel> {
     let rows = case.token_h * case.token_w;
     let freq = u32::try_from(case.tfreq.len()).map_err(|_| "a sinusoid too wide")?;
@@ -349,11 +344,10 @@ fn voxel_arm(
     }
     let pass = ForwardPass::new();
     pass.switch(0, "reading", arm)?;
-    let x = Channel::from_shaped([case.token_h, case.token_w, width_in], packed.as_slice())
-        .named(&format!("clip_{tag}"));
+    let x = Channel::from_shaped([case.token_h, case.token_w, width_in], packed.as_slice());
     pass.input(0, &voxel_input(arm)?, &x)?;
     let width = output_width(arm, "pixels")?;
-    let out = Channel::new([rows, width], dtype::f32).named(&format!("pixels_{tag}"));
+    let out = Channel::new([rows, width], dtype::f32);
     let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::output_rows(0, "pixels", rows));
@@ -447,14 +441,7 @@ async fn main(input: Input) -> Result<Output> {
             case.hidden
         ));
     }
-    let rows_channel = voxel_arm(
-        &case,
-        image_in,
-        &pipe,
-        &case.latent,
-        case.latent_channels,
-        "in",
-    )?;
+    let rows_channel = voxel_arm(&case, image_in, &pipe, &case.latent, case.latent_channels)?;
     let image_in_rows = rows_channel.take_host::<Vec<f32>>().await?;
 
     // ---- A: the prompt's prefix, then step 0 -----------------------------
@@ -526,7 +513,6 @@ async fn main(input: Input) -> Result<Output> {
         &pipe,
         &canvas_hidden[case.hidden as usize..],
         case.hidden,
-        "out",
     )?;
     let velocity = velocity_channel.take_host::<Vec<f32>>().await?;
     pipe.close();

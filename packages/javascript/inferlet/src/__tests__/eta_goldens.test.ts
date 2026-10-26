@@ -111,8 +111,8 @@ for (const line of readFileSync(goldensPath, 'utf8').split('\n')) {
   GOLDENS.set(name, { hash: BigInt(h), bytes });
 }
 
-const chFrom = (v: Iterable<number | boolean> | number[], dt: Dtype, name: string) => DslChannel.fromConst(constData(v, dt)).named(name);
-const chNew = (shape: number[], dt: Dtype, name: string) => DslChannel.new(shape, dt).named(name);
+const chFrom = (v: Iterable<number | boolean> | number[], dt: Dtype) => DslChannel.fromConst(constData(v, dt));
+const chNew = (shape: number[], dt: Dtype) => DslChannel.new(shape, dt);
 const hostPut = (ch: DslChannel, v: Iterable<number | boolean>, dt?: Dtype) => {
   constData(v, dt);
   ch.noteHostPut();
@@ -138,12 +138,12 @@ describe('eta goldens', () => {
   it('s3 matches lowering.rs', () => {
     const vocab = 32_000;
     const ctr1 = Tensor.constant([0, 1], Dtype.U32);
-    const tok = chNew([1], dtype.i32, 'tok');
-    const ind = chFrom([0, 1], dtype.u32, 'indptr');
-    const out = chNew([1], dtype.i32, 'out');
-    const mask = chNew([vocab], dtype.bool, 'mask');
-    const len = chFrom([1], dtype.u32, 'len');
-    const rngCh = chFrom([7, 0], dtype.u32, 'rng');
+    const tok = chNew([1], dtype.i32);
+    const ind = chFrom([0, 1], dtype.u32);
+    const out = chNew([1], dtype.i32);
+    const mask = chNew([vocab], dtype.bool);
+    const len = chFrom([1], dtype.u32);
+    const rngCh = chFrom([7, 0], dtype.u32);
     hostPut(tok, [1], dtype.i32);
     const b = new Builder(vocab, 16);
     b.setOutputs(logitsDecl(vocab));
@@ -167,10 +167,10 @@ describe('eta goldens', () => {
   });
 
   it('text_completion_decode', () => {
-    const tokIn = chFrom([42], dtype.i32, 'tok_in');
-    const embedIndptr = chFrom([0, 1], dtype.u32, 'embed_indptr');
-    const fold = chFrom([0xffff_ffff], dtype.u32, 'fold');
-    const tokOut = chNew([1], dtype.i32, 'tok_out');
+    const tokIn = chFrom([42], dtype.i32);
+    const embedIndptr = chFrom([0, 1], dtype.u32);
+    const fold = chFrom([0xffff_ffff], dtype.u32);
+    const tokOut = chNew([1], dtype.i32);
     const b = new Builder(VOCAB, PAGE);
     b.setOutputs(logitsDecl(VOCAB));
     bindGeometry(b, [
@@ -188,13 +188,13 @@ describe('eta goldens', () => {
   it('naive_decode', () => {
     const temperature = 0.7;
     const cap = 8;
-    const tokIn = chFrom([3], dtype.i32, 'tok_in');
-    const rngCh = chFrom([0x7ce1 ^ 0x5bd1, 0], dtype.u32, 'rng');
-    const tokOut = chNew([1], dtype.i32, 'tok_out').capacity(cap);
-    const s1 = chNew([1], dtype.f32, 's1_out').capacity(cap);
-    const s2 = chNew([1], dtype.f32, 's2_out').capacity(cap);
-    const lane1 = chFrom([0, 1], dtype.u32, 'embed_indptr');
-    const fold = chFrom([0xffff_ffff], dtype.u32, 'fold');
+    const tokIn = chFrom([3], dtype.i32);
+    const rngCh = chFrom([0x7ce1 ^ 0x5bd1, 0], dtype.u32);
+    const tokOut = chNew([1], dtype.i32).capacity(cap);
+    const s1 = chNew([1], dtype.f32).capacity(cap);
+    const s2 = chNew([1], dtype.f32).capacity(cap);
+    const lane1 = chFrom([0, 1], dtype.u32);
+    const fold = chFrom([0xffff_ffff], dtype.u32);
     const b = new Builder(VOCAB, PAGE);
     b.setOutputs(logitsDecl(VOCAB));
     bindGeometry(b, [
@@ -223,15 +223,15 @@ describe('eta goldens', () => {
 
   it('coverage', () => {
     const k = 8;
-    const tok = chFrom([1], dtype.i32, 'tok');
-    const ind = chFrom([0, 1], dtype.u32, 'indptr');
-    const rngCh = chFrom([1, 2], dtype.u32, 'rng');
-    const topP = chFrom([0.9], dtype.f32, 'top_p');
-    const bias = chFrom([0.0, -1.5, 2.25, 0.0], dtype.f32, 'bias');
-    const out = chNew([1], dtype.i32, 'out');
-    const stat = chNew([1], dtype.f32, 'stat');
-    const stat2 = chNew([4], dtype.f32, 'stat2');
-    const flag = chNew([1], dtype.bool, 'flag');
+    const tok = chFrom([1], dtype.i32);
+    const ind = chFrom([0, 1], dtype.u32);
+    const rngCh = chFrom([1, 2], dtype.u32);
+    const topP = chFrom([0.9], dtype.f32);
+    const bias = chFrom([0.0, -1.5, 2.25, 0.0], dtype.f32);
+    const out = chNew([1], dtype.i32);
+    const stat = chNew([1], dtype.f32);
+    const stat2 = chNew([4], dtype.f32);
+    const flag = chNew([1], dtype.bool);
     const b = new Builder(VOCAB, PAGE);
     b.setOutputs(logitsDecl(VOCAB));
     b.bindPort(Port.EMBED_TOKENS, tok);
@@ -306,11 +306,11 @@ describe('eta goldens', () => {
   });
 
   it('sinks', () => {
-    const tok = chFrom([1], dtype.i32, 'tok');
-    const ind = chFrom([0, 1], dtype.u32, 'indptr');
-    const a = chNew([2, 4, 8], dtype.f32, 'a');
-    const bch = chNew([2, 8, 4], dtype.f32, 'b');
-    const out = chNew([1], dtype.i32, 'out');
+    const tok = chFrom([1], dtype.i32);
+    const ind = chFrom([0, 1], dtype.u32);
+    const a = chNew([2, 4, 8], dtype.f32);
+    const bch = chNew([2, 8, 4], dtype.f32);
+    const out = chNew([1], dtype.i32);
     hostPut(a, new Array(64).fill(0.0), dtype.f32);
     hostPut(bch, new Array(64).fill(0.0), dtype.f32);
     const b = new Builder(VOCAB, PAGE);
@@ -329,9 +329,9 @@ describe('eta goldens', () => {
   });
 
   it('refuses a bulk constant', () => {
-    const tok = chFrom([1], dtype.i32, 'tok');
-    const ind = chFrom([0, 1], dtype.u32, 'indptr');
-    const out = chNew([4], dtype.f32, 'out');
+    const tok = chFrom([1], dtype.i32);
+    const ind = chFrom([0, 1], dtype.u32);
+    const out = chNew([4], dtype.f32);
     const b = new Builder(VOCAB, PAGE);
     b.setOutputs(logitsDecl(VOCAB));
     b.bindPort(Port.EMBED_TOKENS, tok);
@@ -342,10 +342,10 @@ describe('eta goldens', () => {
   });
 
   it('readiness lint', () => {
-    const tok = chFrom([1], dtype.i32, 'tok');
-    const ind = chFrom([0, 1], dtype.u32, 'indptr');
-    const never = chNew([1], dtype.f32, 'never');
-    const out = chNew([1], dtype.f32, 'out');
+    const tok = chFrom([1], dtype.i32);
+    const ind = chFrom([0, 1], dtype.u32);
+    const never = chNew([1], dtype.f32);
+    const out = chNew([1], dtype.f32);
     const b = new Builder(VOCAB, PAGE);
     b.setOutputs(logitsDecl(VOCAB));
     b.bindPort(Port.EMBED_TOKENS, tok);
@@ -359,9 +359,9 @@ describe('eta goldens', () => {
 describe('comparison methods', () => {
   const epilogueBytes = (body: (l: Tensor) => Tensor) => {
     const vocab = 32_000;
-    const tok = chNew([1], dtype.i32, 'tok');
-    const ind = chFrom([0, 1], dtype.u32, 'indptr');
-    const out = chNew([vocab], dtype.bool, 'out');
+    const tok = chNew([1], dtype.i32);
+    const ind = chFrom([0, 1], dtype.u32);
+    const out = chNew([vocab], dtype.bool);
     hostPut(tok, [1], dtype.i32);
     const b = new Builder(vocab, 16);
     b.setOutputs(logitsDecl(vocab));
@@ -389,20 +389,20 @@ describe('diffusion golden', () => {
     const end = base + length;
     const bound = 0.5;
     const confidence = 0.1;
-    const toks = chFrom(range(length).map((i) => (i * 7919) % 1000), dtype.i32, 'canvas');
-    const embedIndptr = chFrom([0, length], dtype.u32, 'embed_indptr');
-    const positions = chFrom(range(base, end), dtype.u32, 'positions');
-    const kvLen = chFrom([end], dtype.u32, 'kv_len');
-    const readout = chFrom(range(length), dtype.u32, 'readout');
-    const temp = chFrom([1.0], dtype.f32, 'temperature');
-    const rngState = chFrom([7, 0], dtype.u32, 'rng');
-    const history = chFrom(new Array(length).fill(-1), dtype.i32, 'argmax_history');
-    const canvasOut = chNew([length], dtype.i32, 'canvas_out');
-    const argmaxOut = chNew([length], dtype.i32, 'argmax_out');
-    const stop = chNew([1], dtype.bool, 'stop');
-    const meanOut = chNew([1], dtype.f32, 'mean_entropy');
-    const tapIdsOut = chNew([length, taps], dtype.u32, 'tap_ids');
-    const tapWeightsOut = chNew([length, taps], dtype.f32, 'tap_weights');
+    const toks = chFrom(range(length).map((i) => (i * 7919) % 1000), dtype.i32);
+    const embedIndptr = chFrom([0, length], dtype.u32);
+    const positions = chFrom(range(base, end), dtype.u32);
+    const kvLen = chFrom([end], dtype.u32);
+    const readout = chFrom(range(length), dtype.u32);
+    const temp = chFrom([1.0], dtype.f32);
+    const rngState = chFrom([7, 0], dtype.u32);
+    const history = chFrom(new Array(length).fill(-1), dtype.i32);
+    const canvasOut = chNew([length], dtype.i32);
+    const argmaxOut = chNew([length], dtype.i32);
+    const stop = chNew([1], dtype.bool);
+    const meanOut = chNew([1], dtype.f32);
+    const tapIdsOut = chNew([length, taps], dtype.u32);
+    const tapWeightsOut = chNew([length, taps], dtype.f32);
 
     const b = new Builder(VOCAB, PAGE);
     b.setOutputs(logitsDecl(VOCAB));
@@ -448,18 +448,18 @@ describe('beam golden', () => {
     const v = VOCAB;
     const initMask: boolean[] = [];
     for (let b = 0; b < B; b++) for (let p = 0; p < poolLen; p++) initMask.push(p === 0);
-    const mask = DslChannel.fromConst(new ConstData(shapeOf([B, poolLen]), Dtype.BOOL, packElems(initMask, Dtype.BOOL))).named('mask');
-    const scores = chFrom([0.0, -Infinity], dtype.f32, 'scores');
-    const toks = chFrom(new Array(B).fill(1), dtype.i32, 'toks');
-    const pos = chFrom(new Array(B).fill(0), dtype.u32, 'pos');
-    const fill = chFrom([1], dtype.u32, 'fill');
-    const klen = chFrom(new Array(B).fill(1), dtype.u32, 'klen');
-    const slots = chFrom(new Array(B).fill(0), dtype.u32, 'slots');
-    const lanesB = chFrom(range(B + 1), dtype.u32, 'embed_indptr');
-    const out = chNew([B], dtype.i32, 'out').capacity(8);
-    const outPar = chNew([B], dtype.u32, 'out_par').capacity(8);
-    const outScr = chNew([B], dtype.f32, 'out_scr').capacity(8);
-    const outGreedy = chNew([B], dtype.i32, 'out_greedy').capacity(8);
+    const mask = DslChannel.fromConst(new ConstData(shapeOf([B, poolLen]), Dtype.BOOL, packElems(initMask, Dtype.BOOL)));
+    const scores = chFrom([0.0, -Infinity], dtype.f32);
+    const toks = chFrom(new Array(B).fill(1), dtype.i32);
+    const pos = chFrom(new Array(B).fill(0), dtype.u32);
+    const fill = chFrom([1], dtype.u32);
+    const klen = chFrom(new Array(B).fill(1), dtype.u32);
+    const slots = chFrom(new Array(B).fill(0), dtype.u32);
+    const lanesB = chFrom(range(B + 1), dtype.u32);
+    const out = chNew([B], dtype.i32).capacity(8);
+    const outPar = chNew([B], dtype.u32).capacity(8);
+    const outScr = chNew([B], dtype.f32).capacity(8);
+    const outGreedy = chNew([B], dtype.i32).capacity(8);
 
     const b = new Builder(VOCAB, PAGE);
     b.setOutputs(logitsDecl(VOCAB));
@@ -506,16 +506,16 @@ describe('sampler golden', () => {
   it('latent_step', () => {
     const rows = 8;
     const channels = 16;
-    const tok = chFrom([1], dtype.i32, 'tok');
-    const indptrCh = chFrom([0, 1], dtype.u32, 'indptr');
-    const readout = chFrom(range(rows), dtype.u32, 'readout');
-    const kvLen = chFrom([rows], dtype.u32, 'kv_len');
-    const positions = chFrom(range(rows), dtype.u32, 'positions');
-    const latent = chNew([rows, channels], dtype.f32, 'latent');
-    const dsigma = chFrom([-0.25], dtype.f32, 'dsigma');
-    const rngCh = chFrom([9, 0], dtype.u32, 'rng');
-    const out = chNew([rows, channels], dtype.f32, 'latent_out');
-    const normOut = chNew([rows], dtype.f32, 'norms');
+    const tok = chFrom([1], dtype.i32);
+    const indptrCh = chFrom([0, 1], dtype.u32);
+    const readout = chFrom(range(rows), dtype.u32);
+    const kvLen = chFrom([rows], dtype.u32);
+    const positions = chFrom(range(rows), dtype.u32);
+    const latent = chNew([rows, channels], dtype.f32);
+    const dsigma = chFrom([-0.25], dtype.f32);
+    const rngCh = chFrom([9, 0], dtype.u32);
+    const out = chNew([rows, channels], dtype.f32);
+    const normOut = chNew([rows], dtype.f32);
     hostPut(latent, new Array(rows * channels).fill(0), dtype.f32);
 
     const b = new Builder(VOCAB, PAGE);
@@ -569,7 +569,7 @@ describe('sampler golden', () => {
   it('vae_readback matches the Rust golden', () => {
     const rows = 16;
     const rgb = 3;
-    const out = chNew([rows, rgb], dtype.f32, 'pixels_out');
+    const out = chNew([rows, rgb], dtype.f32);
     const b = new Builder(VOCAB, PAGE);
     b.setOutputs([[decl('pixels', Axis.VOXEL, rgb, false)]]);
     b.stage(Stage.EPILOGUE, () => {
@@ -585,9 +585,9 @@ describe('sampler golden', () => {
   it('noised_input matches the Rust golden', () => {
     const rows = 4;
     const width = 8;
-    const rngCh = chFrom([5, 0], dtype.u32, 'rng');
-    const latent = chNew([rows, width], dtype.f32, 'latent');
-    const timestep = chFrom([0.5], dtype.f32, 'timestep');
+    const rngCh = chFrom([5, 0], dtype.u32);
+    const latent = chNew([rows, width], dtype.f32);
+    const timestep = chFrom([0.5], dtype.f32);
     const b = new Builder(VOCAB, PAGE);
     b.setOutputs(logitsDecl(VOCAB));
     b.bindInput(latent);

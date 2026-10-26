@@ -30,11 +30,12 @@ fn logits_lane(vocab: u32) -> Vec<Vec<OutputDecl>> {
     crate::outputs::logits(vocab)
 }
 
-fn idx(names: &[String], name: &str) -> u32 {
-    names
+fn idx(traced: &Traced, ch: &Channel) -> u32 {
+    traced
+        .channel_order()
         .iter()
-        .position(|n| n == name)
-        .unwrap_or_else(|| panic!("no channel `{name}`")) as u32
+        .position(|&gid| gid == ch.gid())
+        .expect("channel in the trace") as u32
 }
 
 fn logits(v: Vec<f32>) -> PassInputs {
@@ -49,11 +50,11 @@ fn leak<T>(v: T) -> &'static T {
 
 #[test]
 fn greedy_argmax_tier0_matches_golden() {
-    let tok: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok"));
-    let indptr: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
-    let klen: &'static Channel = leak(Channel::from([1u32]).named("klen"));
-    let positions: &'static Channel = leak(Channel::from([0u32]).named("positions"));
-    let out: &'static Channel = leak(Channel::new([1], dtype::i32).named("out"));
+    let tok: &'static Channel = leak(Channel::new([1], dtype::i32));
+    let indptr: &'static Channel = leak(Channel::from([0u32, 1]));
+    let klen: &'static Channel = leak(Channel::from([1u32]));
+    let positions: &'static Channel = leak(Channel::from([0u32]));
+    let out: &'static Channel = leak(Channel::new([1], dtype::i32));
     tok.put([1i32]);
 
     let mut b = Builder::new(8, 4);
@@ -72,13 +73,12 @@ fn greedy_argmax_tier0_matches_golden() {
 
     let traced = b.build().expect("greedy builds");
     let bound = bound(&traced, 8);
-    let names = traced.channel_names();
     let (tok_i, indptr_i, klen_i, positions_i, out_i) = (
-        idx(names, "tok"),
-        idx(names, "indptr"),
-        idx(names, "klen"),
-        idx(names, "positions"),
-        idx(names, "out"),
+        idx(&traced, tok),
+        idx(&traced, indptr),
+        idx(&traced, klen),
+        idx(&traced, positions),
+        idx(&traced, out),
     );
 
     let bytes = traced.encode();

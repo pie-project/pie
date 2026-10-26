@@ -11,6 +11,8 @@ channel's host role, and runs the span lints. It knows nothing of WIT; the
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
 from typing import Callable
 
@@ -44,6 +46,17 @@ from .trace import (
 from .value import ConstData, Tensor, const_data, materialize, reshape_id_to
 
 
+_SDK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _creation_site() -> str:
+    """The first frame outside the SDK, as `file:line`."""
+    f = sys._getframe(1)
+    while f is not None and os.path.abspath(f.f_code.co_filename).startswith(_SDK):
+        f = f.f_back
+    return f"{f.f_code.co_filename}:{f.f_lineno}" if f is not None else "?"
+
+
 class DslChannel:
     """A handle to a channel's trace state. Inside a traced stage,
     `take`/`read`/`put` record the IR's channel ops."""
@@ -58,7 +71,7 @@ class DslChannel:
         gid = next_gid()
         state = ChannelState(
             gid=gid,
-            name=f"ch{gid}",
+            site=_creation_site(),
             shape=shape_of(shape),
             dtype=dtype,
             capacity=capacity,
@@ -85,17 +98,13 @@ class DslChannel:
         self.state.capacity = n
         return self
 
-    def named(self, name: str) -> "DslChannel":
-        self.state.name = name
-        return self
-
     @property
     def gid(self) -> int:
         return self.state.gid
 
     @property
-    def name(self) -> str:
-        return self.state.name
+    def site(self) -> str:
+        return self.state.site
 
     @property
     def shape(self):
@@ -131,7 +140,7 @@ class DslChannel:
     def take(self) -> Tensor:
         if not is_tracing():
             raise TraceError(
-                f"channel {self.name}: take() outside a stage body is a host operation; "
+                f"channel {self.site}: take() outside a stage body is a host operation; "
                 "use `await ch.take_host()`"
             )
         vid, ty = record_channel_read(self.state, True)
@@ -140,7 +149,7 @@ class DslChannel:
     def read(self) -> Tensor:
         if not is_tracing():
             raise TraceError(
-                f"channel {self.name}: read() outside a stage body is a host operation; "
+                f"channel {self.site}: read() outside a stage body is a host operation; "
                 "use `await ch.read_host()`"
             )
         vid, ty = record_channel_read(self.state, False)
@@ -148,7 +157,7 @@ class DslChannel:
 
     def put_tensor(self, t: Tensor) -> None:
         if not is_tracing():
-            raise TraceError(f"channel {self.name}: put(Tensor) outside a traced stage")
+            raise TraceError(f"channel {self.site}: put(Tensor) outside a traced stage")
         vid, ty = materialize(t)
         fitted = reshape_id_to(vid, ty, self.state.shape)
         record_channel_put(self.state, fitted)
@@ -316,13 +325,13 @@ def _lint(channels: list[ChannelState], sinks: list[tuple[Stage, SinkCall]]) -> 
         stage_consumes = bool(st.prog_takes) or st.desc_takes > 0
         if host_writes and host_consumes:
             errs.append(
-                f"channel `{st.name}` has two host endpoints (host writes and host consumes); "
+                f"channel {st.site} has two host endpoints (host writes and host consumes); "
                 "SPSC needs one pass endpoint"
             )
         produced = stage_puts or host_writes or st.seeded or st.has_seed
         consumed = stage_consumes or bool(st.prog_reads) or st.desc_reads > 0 or host_consumes
         if consumed and not produced:
-            errs.append(f"channel `{st.name}` is consumed but never produced or seeded")
+            errs.append(f"channel {st.site} is consumed but never produced or seeded")
     for stage, s in sinks:
         if stage != Stage.PROLOGUE:
             errs.append(f"sink `{s.name}` is misplaced in stage `{stage.wire_name}`")

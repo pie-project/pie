@@ -14,8 +14,8 @@ function appendTokens(ws, pipeline, tokens) {
   if (tokens.length === 0) throw new Error('cannot append an empty token sequence');
   const n = tokens.length;
   const tokenInput = Channel.from(tokens, dtype.i32);
-  const embedIndptr = Channel.from([0, n], dtype.u32).named('embed_indptr');
-  const nextToken = new Channel([1], dtype.i32).named('next_token');
+  const embedIndptr = Channel.from([0, n], dtype.u32);
+  const nextToken = new Channel([1], dtype.i32);
 
   const fwd = new ForwardPass();
   fwd.embed(tokenInput, embedIndptr);
@@ -34,9 +34,9 @@ function generate(ws, pipeline, firstToken, maxTokens) {
   if (!stop.has(firstToken)) generated.push(firstToken);
   if (generated.length >= maxTokens || stop.has(firstToken)) return generated;
 
-  const tokenIn = Channel.from([firstToken], dtype.i32).named('token_in');
-  const embedIndptr = Channel.from([0, 1], dtype.u32).named('embed_indptr');
-  const tokenOut = new Channel([1], dtype.i32).capacity(channelCapacity()).named('token_out');
+  const tokenIn = Channel.from([firstToken], dtype.i32);
+  const embedIndptr = Channel.from([0, 1], dtype.u32);
+  const tokenOut = new Channel([1], dtype.i32).capacity(channelCapacity());
 
   const fwd = new ForwardPass();
   fwd.embed(tokenIn, embedIndptr);

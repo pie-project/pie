@@ -112,10 +112,9 @@ async fn decode_frame(
     pass.switch(0, "reading", reading)?;
     pass.switch(0, "stream", "video")?;
     pass.state(&[state], StateGeometry::default())?;
-    let cell =
-        Channel::from_shaped([clip_h, clip_w, input.width], clip.to_vec()).named("vae_latent");
+    let cell = Channel::from_shaped([clip_h, clip_w, input.width], clip.to_vec());
     pass.input(0, &input.name, &cell)?;
-    let out = Channel::new([rows, width], dtype::f32).named("vae_pixels");
+    let out = Channel::new([rows, width], dtype::f32);
     let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::output_rows(0, "pixels", rows));

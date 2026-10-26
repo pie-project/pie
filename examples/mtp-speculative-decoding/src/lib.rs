@@ -178,11 +178,11 @@ async fn main(input: Input) -> Result<Output> {
     let mut seed: Vec<i32> = Vec::new();
     for (at, &(base, end)) in spans.iter().enumerate() {
         let len = end - base;
-        let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
-        let indptr_p = Channel::from([0u32, len]).named("embed_indptr_p");
+        let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]);
+        let indptr_p = Channel::from([0u32, len]);
         // The last row only: the first window is seeded off it.
-        let readout_p = Channel::from([len - 1]).named("readout_p");
-        let seed_p = Channel::new([w], dtype::i32).named("seed_p");
+        let readout_p = Channel::from([len - 1]);
+        let seed_p = Channel::new([w], dtype::i32);
         let drafting = at == last_span && k > 0;
 
         let fwd_p = ForwardPass::new();
@@ -233,24 +233,21 @@ async fn main(input: Input) -> Result<Output> {
     // One lane of `w` tokens, causal, each row read out: a windowed state
     // admits no two lanes on one working set.
     if !stopped {
-        let win = Channel::from(seed.as_slice()).named("win");
-        let base = Channel::from([n]).named("base");
-        let indptr_d = Channel::from([0u32, w]).named("embed_indptr");
-        let readout_d = Channel::from_iter(0..w).named("readout");
-        let slots = Channel::from_iter(n..n + w).named("slots");
-        let kv_len = Channel::from([n + w]).named("kv_len");
-        let fold = Channel::from([0u32]).named("fold");
-        let out = Channel::new([w], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("out");
+        let win = Channel::from(seed.as_slice());
+        let base = Channel::from([n]);
+        let indptr_d = Channel::from([0u32, w]);
+        let readout_d = Channel::from_iter(0..w);
+        let slots = Channel::from_iter(n..n + w);
+        let kv_len = Channel::from([n + w]);
+        let fold = Channel::from([0u32]);
+        let out = Channel::new([w], dtype::i32).capacity(channel_capacity() as u32);
         let tracing = input.trace;
         let margin = input.margin;
         // One diagnostic channel, the margin or the trace: a declared channel
         // takes a reader cell whether or not a stage touches it, and the pass
         // has room for twelve. f32 for both — a token id is exact in f32.
         let aux = Channel::new([if tracing { 2 * w } else { 1 }], dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named("aux");
+            .capacity(channel_capacity() as u32);
 
         let fwd = ForwardPass::new();
         fwd.embed(&win, &indptr_d)?;

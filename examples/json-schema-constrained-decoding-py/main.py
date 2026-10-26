@@ -57,9 +57,9 @@ async def main(input: dict) -> str:
     n = len(prompt)
 
     prompt_tokens = Channel.from_(prompt, dtype.i32)
-    prefill_indptr = Channel.from_([0, n], dtype.u32).named("prefill_indptr")
-    prefill_mask = Channel([vocab], dtype.bool).named("prefill_mask")
-    first_out = Channel([1], dtype.i32).named("first_token")
+    prefill_indptr = Channel.from_([0, n], dtype.u32)
+    prefill_mask = Channel([vocab], dtype.bool)
+    first_out = Channel([1], dtype.i32)
 
     prefill = ForwardPass()
     prefill.embed(prompt_tokens, prefill_indptr)
@@ -79,10 +79,10 @@ async def main(input: dict) -> str:
     constraint.accept_tokens([first])
 
     if not constraint.is_terminated() and len(generated) < max_tokens:
-        token_in = Channel.from_([first], dtype.i32).named("token_in")
-        grammar_mask = Channel([vocab], dtype.bool).named("grammar_mask")
-        embed_indptr = Channel.from_([0, 1], dtype.u32).named("embed_indptr")
-        token_out = Channel([1], dtype.i32).capacity(channel_capacity()).named("token_out")
+        token_in = Channel.from_([first], dtype.i32)
+        grammar_mask = Channel([vocab], dtype.bool)
+        embed_indptr = Channel.from_([0, 1], dtype.u32)
+        token_out = Channel([1], dtype.i32).capacity(channel_capacity())
 
         decode = ForwardPass()
         decode.embed(token_in, embed_indptr)

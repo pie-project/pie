@@ -154,9 +154,9 @@ async fn main(input: Input) -> Result<Output> {
     let n = prompt.len() as u32;
 
     let prompt_tokens = Channel::from_iter(prompt.iter().map(|&t| t as i32));
-    let prefill_indptr = Channel::from([0u32, n]).named("prefill_indptr");
-    let heal_mask = Channel::new([vocab], dtype::bool).named("heal_mask");
-    let first_out = Channel::new([1], dtype::i32).named("first_token");
+    let prefill_indptr = Channel::from([0u32, n]);
+    let heal_mask = Channel::new([vocab], dtype::bool);
+    let first_out = Channel::new([1], dtype::i32);
 
     let prefill = ForwardPass::new();
     prefill.embed(&prompt_tokens, &prefill_indptr)?;
@@ -177,11 +177,9 @@ async fn main(input: Input) -> Result<Output> {
     let mut generated = vec![first];
 
     if generated.len() < input.max_tokens {
-        let token_in = Channel::from([first as i32]).named("token_in");
-        let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
-        let token_out = Channel::new([1], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("token_out");
+        let token_in = Channel::from([first as i32]);
+        let embed_indptr = Channel::from([0u32, 1]);
+        let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
 
         let decode = ForwardPass::new();
         decode.embed(&token_in, &embed_indptr)?;

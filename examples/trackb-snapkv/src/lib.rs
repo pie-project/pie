@@ -153,14 +153,14 @@ async fn main(input: Input) -> Result<Output> {
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let pipe = Pipeline::new();
 
-    let toks_p = Channel::from(&prompt_i32[..]).named("toks_p");
-    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let toks_p = Channel::from(&prompt_i32[..]);
+    let embed_indptr_p = Channel::from([0u32, n]);
     // `naive-baseline`'s salt, so the all-keep arm differs from it only by the mask.
-    let rng_p = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng_p");
-    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
+    let rng_p = Channel::from([input.seed ^ 0x5bd1, 0]);
+    let tok_out_p = Channel::new([1], dtype::i32);
 
-    let scores_out = Channel::new([kv_max], dtype::f32).named("snapkv_scores");
-    let page_mass_out = Channel::new([p_max], dtype::f32).named("snapkv_page_mass");
+    let scores_out = Channel::new([kv_max], dtype::f32);
+    let page_mass_out = Channel::new([p_max], dtype::f32);
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -214,16 +214,14 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── DECODE LOOP (1-wide, run-ahead), enforcing the fixed keep-set. ──
     if generated.len() < max_tokens {
-        let tok_in = Channel::from([g0]).named("tok_in");
-        let rng = Channel::from([input.seed ^ 0x5bd1, 2]).named("rng");
-        let tok_out = Channel::new([1], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("tok_out");
-        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
-        let fill = Channel::from([n + 1]).named("fill");
+        let tok_in = Channel::from([g0]);
+        let rng = Channel::from([input.seed ^ 0x5bd1, 2]);
+        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+        let lane1 = Channel::from([0u32, 1u32]);
+        let fill = Channel::from([n + 1]);
 
         // A bound mask replaces the causal bound: the keep-set alone would admit unwritten slots.
-        let keep = Channel::from_shaped([1, kv_max], keep_row.clone()).named("snapkv_keep");
+        let keep = Channel::from_shaped([1, kv_max], keep_row.clone());
         let mask = Channel::from_shaped(
             [1, kv_max],
             keep_row
@@ -231,8 +229,7 @@ async fn main(input: Input) -> Result<Output> {
                 .enumerate()
                 .map(|(j, k)| *k && (j as u32) <= n)
                 .collect::<Vec<bool>>(),
-        )
-        .named("snapkv_mask");
+        );
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;

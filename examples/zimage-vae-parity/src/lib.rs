@@ -252,12 +252,11 @@ async fn main(input: Input) -> Result<Output> {
     let pass = ForwardPass::new();
     pass.switch(0, "reading", &d.name)?;
     pass.switch(0, "stream", "image")?;
-    let clip = Channel::from_shaped([case.h, case.w, case.channels], case.latent.as_slice())
-        .named("latent");
+    let clip = Channel::from_shaped([case.h, case.w, case.channels], case.latent.as_slice());
     pass.input(0, &d.input, &clip)?;
 
     // The answer: one row per OUTPUT voxel, RGB in [-1, 1].
-    let out = Channel::new([rows, width], dtype::f32).named("pixels");
+    let out = Channel::new([rows, width], dtype::f32);
     let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::output_rows(0, "pixels", rows));

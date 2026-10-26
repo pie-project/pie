@@ -159,10 +159,10 @@ async fn main(input: Input) -> Result<Output> {
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let pipe = Pipeline::new();
 
-    let toks_p = Channel::from(&prompt_i32[..]).named("toks_p");
-    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-    let rng_p = Channel::from([input.seed, 0]).named("rng_p");
-    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
+    let toks_p = Channel::from(&prompt_i32[..]);
+    let embed_indptr_p = Channel::from([0u32, n]);
+    let rng_p = Channel::from([input.seed, 0]);
+    let tok_out_p = Channel::new([1], dtype::i32);
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -201,25 +201,19 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── OBSERVATION LOOP (1-wide, run-ahead), with the score tap. ──
     if observe_fires > 0 {
-        let tok_in = Channel::from([g0]).named("tok_in");
+        let tok_in = Channel::from([g0]);
         // `naive-baseline`'s salt, so the all-keep arm differs from it only by the mask.
-        let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
-        let tok_out = Channel::new([1], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("tok_out");
-        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
+        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+        let lane1 = Channel::from([0u32, 1u32]);
 
         let seed: Vec<f32> = (0..kv_max)
             .map(|i| SEED_SCALE * (kv_max - i) as f32 / kv_max as f32)
             .collect();
-        let acc = Channel::from(seed).named("h2o_acc");
+        let acc = Channel::from(seed);
 
-        let scores_out = Channel::new([kv_max], dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named("h2o_scores");
-        let page_mass_out = Channel::new([p_max], dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named("h2o_page_mass");
+        let scores_out = Channel::new([kv_max], dtype::f32).capacity(channel_capacity() as u32);
+        let page_mass_out = Channel::new([p_max], dtype::f32).capacity(channel_capacity() as u32);
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
@@ -306,17 +300,15 @@ async fn main(input: Input) -> Result<Output> {
         let pipe = Pipeline::new();
         let last = *generated.last().expect("prefill emitted a token") as i32;
         let at = sel_len;
-        let tok_in = Channel::from([last]).named("e_tok_in");
+        let tok_in = Channel::from([last]);
         // Resume the Gumbel stream: each observation fire advanced `[s, k]` to `[s, k + 1]`.
-        let rng = Channel::from([input.seed ^ 0x5bd1, observe_fires as u32]).named("e_rng");
-        let tok_out = Channel::new([1], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("e_tok_out");
-        let lane1 = Channel::from([0u32, 1u32]).named("e_embed_indptr");
-        let fill = Channel::from([at + 1]).named("e_fill");
+        let rng = Channel::from([input.seed ^ 0x5bd1, observe_fires as u32]);
+        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+        let lane1 = Channel::from([0u32, 1u32]);
+        let fill = Channel::from([at + 1]);
 
         // A bound mask replaces the causal bound: the keep-set alone would admit unwritten slots.
-        let keep = Channel::from_shaped([1, kv_max], keep_row.clone()).named("e_keep");
+        let keep = Channel::from_shaped([1, kv_max], keep_row.clone());
         let mask = Channel::from_shaped(
             [1, kv_max],
             keep_row
@@ -324,8 +316,7 @@ async fn main(input: Input) -> Result<Output> {
                 .enumerate()
                 .map(|(j, k)| *k && (j as u32) <= at)
                 .collect::<Vec<bool>>(),
-        )
-        .named("e_mask");
+        );
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;

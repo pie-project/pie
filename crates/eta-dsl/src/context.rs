@@ -15,7 +15,8 @@ pub use eta_ir::registry::Stage;
 #[derive(Debug)]
 pub struct ChannelState {
     pub gid: u64,
-    pub name: String,
+    /// Where the channel was made; errors name it by this.
+    pub site: Span,
     pub shape: Shape,
     pub dtype: Dtype,
     pub capacity: u32,
