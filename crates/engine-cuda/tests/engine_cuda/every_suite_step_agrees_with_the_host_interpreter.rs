@@ -55,6 +55,7 @@ fn leak(channel: Channel) -> &'static Channel {
 fn builder(vocab: u32, rows: u32) -> Builder<'static> {
     let indptr = leak(Channel::from((0u32..=rows).collect::<Vec<u32>>()).named("embed_indptr"));
     let mut b = Builder::new(vocab, 16);
+    b.outputs(vec![vec![crate::bound::logits_decl(vocab)]]);
     b.bind_port(Port::EmbedIndptr, indptr);
     b
 }
