@@ -148,34 +148,6 @@ impl Run<'_> {
                     gate_add: gate_add.clone(),
                 })
             }
-            Fused::MatmulGlu {
-                act,
-                w,
-                intermediate,
-                glu: poem_ir::GluAct::Swiglu,
-                packed,
-                y,
-            } => {
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *w,
-                    y: *packed,
-                    input_scales: None,
-                    scales: None,
-                    quant: None,
-                    logits: false,
-                })?;
-                self.linear(&Linear::Glu {
-                    packed: Some(*packed),
-                    intermediate: *intermediate,
-                    y: *y,
-                    gate: None,
-                    weights: None,
-                    limit: None,
-                    act: poem_ir::GluAct::Swiglu,
-                    up: None,
-                })
-            }
             // Not in `FUSIONS`, so never formed here; whole, it is its three
             // primitives.
             Fused::MatmulSwigluMatmul {

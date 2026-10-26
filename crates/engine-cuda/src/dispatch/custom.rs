@@ -23,12 +23,12 @@ pub(crate) fn refuses(op: &Fused) -> bool {
         | Fused::GatedResidualNormModulate { .. }
         | Fused::MatmulBias { .. }
         | Fused::MatmulSoftcap { .. }
+        | Fused::MatmulGlu { .. }
         | Fused::ResidualAddRmsnorm { .. }
         | Fused::RmsnormResidualAdd { .. }
         | Fused::QGateNormRopeAppend { .. }
         | Fused::RopeYarnAppend { .. }
         | Fused::SplitRopeYarnAppend { .. } => true,
-        Fused::MatmulGlu { glu, .. } => !matches!(glu, poem_ir::GluAct::Swiglu),
         // A turn of the tail stays: DeepSeek-V4's q and kv pair falls back
         // to it.
         Fused::NormRope { turn, .. } => !matches!(turn, poem_ir::Turn::Last { .. }),
@@ -60,6 +60,7 @@ impl DispatchFused for Run<'_> {
             | Fused::GatedResidualNormModulate { .. }
             | Fused::MatmulBias { .. }
             | Fused::MatmulSoftcap { .. }
+            | Fused::MatmulGlu { .. }
             | Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::QGateNormRopeAppend { .. }
@@ -80,7 +81,6 @@ impl DispatchFused for Run<'_> {
             Fused::HcPre { .. } => self.hc_pre(op),
             Fused::Anchored { .. }
             | Fused::Epilogue { .. }
-            | Fused::MatmulGlu { .. }
             | Fused::MatmulSwigluMatmul { .. }
             | Fused::MatmulMoeRoute { .. }
             | Fused::MatmulSplitRows { .. }
