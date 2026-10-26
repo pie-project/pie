@@ -46,6 +46,9 @@ pub struct Turn {
     /// The angle negated: the turn undone.
     pub inverse: bool,
     pub ramp: Option<Ramp>,
+    /// A scale both the cos and the sin carry (YaRN's attention factor),
+    /// each times it in f32 before the pair turns.
+    pub mscale: Option<f32>,
 }
 
 impl Ops {
@@ -115,6 +118,20 @@ impl Ops {
     /// it is.
     #[allow(clippy::cast_precision_loss)]
     pub fn rotate(&mut self, x: ValueId, pos: ValueId, turn: &Turn) -> ValueId {
+        self.rotate_with(x, pos, turn, None)
+    }
+
+    /// [`Ops::rotate`] at frequencies stated outright (a checkpoint's rope
+    /// scaling, `table`: pair `d` turning at `table[d]`), where given, in
+    /// place of `theta`'s and the ramp's: each column's frequency its pair's
+    /// entry, a function of the column alone the schedule tables.
+    pub fn rotate_with(
+        &mut self,
+        x: ValueId,
+        pos: ValueId,
+        turn: &Turn,
+        table: Option<&[f32]>,
+    ) -> ValueId {
         let col = self.push(Op::Column);
         let head = self.u32(turn.head_dim);
         let i = self.bin(Binary::Rem, col, head);
@@ -170,6 +187,7 @@ impl Ops {
         let down = self.bin(Binary::Sub, col, hop);
         let mate = self.push(Op::Select(first, up, down));
         let mate = self.push(Op::Select(turned, mate, col));
+        let pair = d;
         let d = self.push(Op::Cast(d, Elem::F32));
         // the exponent as the kernels write it: `-d / span` or
         // `-2 * d / rotary`
@@ -187,8 +205,22 @@ impl Ops {
             }
         };
         let theta = self.f32(turn.theta);
-        let mut freq = self.bin(Binary::Pow, theta, exponent);
-        if let Some(ramp) = turn.ramp {
+        let mut freq = match table {
+            // each pair's entry: the first, then each later one where the
+            // pair is its
+            Some(table) => {
+                let mut freq = self.f32(table.first().copied().unwrap_or(0.0));
+                for (at, &entry) in (1u32..).zip(table.iter().skip(1)) {
+                    let at = self.u32(at);
+                    let here = self.bin(Binary::Eq, pair, at);
+                    let entry = self.f32(entry);
+                    freq = self.push(Op::Select(here, entry, freq));
+                }
+                freq
+            }
+            None => self.bin(Binary::Pow, theta, exponent),
+        };
+        if let Some(ramp) = turn.ramp.filter(|_| table.is_none()) {
             // YaRN's ramp as the kernels' `yarn_original_freq` takes it
             let denom = if ramp.high == ramp.low {
                 (ramp.high + 1e-3) - ramp.low
@@ -214,8 +246,13 @@ impl Ops {
             pos
         };
         let angle = self.bin(Binary::Mul, pos, freq);
-        let cos = self.push(Op::Unary(Unary::Cos, angle));
-        let sin = self.push(Op::Unary(Unary::Sin, angle));
+        let mut cos = self.push(Op::Unary(Unary::Cos, angle));
+        let mut sin = self.push(Op::Unary(Unary::Sin, angle));
+        if let Some(m) = turn.mscale {
+            let m = self.f32(m);
+            cos = self.bin(Binary::Mul, cos, m);
+            sin = self.bin(Binary::Mul, sin, m);
+        }
         let b = self.push(Op::Peer(x, mate));
         let ac = self.bin(Binary::Mul, x, cos);
         let bs = self.bin(Binary::Mul, b, sin);

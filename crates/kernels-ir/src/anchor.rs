@@ -162,11 +162,84 @@ pub struct Pointwise {
 
 /// The columns of the product tile one result lands: `width` of them from
 /// column `from` (a split's piece: a packed qkv product's q, k or v), each
-/// row of its plane `width` wide.
+/// row of its plane `width` wide; or, where `head` is set, `head` of them
+/// from every `stride` (a head-major slice: Qwen 3.5's q and gate, a head of
+/// each interleaved), `width / head` heads, landed one after another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Window {
     pub from: u32,
     pub width: u32,
+    /// The columns a head lands of every `stride` (0: the window is whole).
+    pub head: u32,
+    pub stride: u32,
+}
+
+impl Window {
+    /// `width` columns from `from`.
+    #[must_use]
+    pub const fn of(from: u32, width: u32) -> Window {
+        Window {
+            from,
+            width,
+            head: 0,
+            stride: 0,
+        }
+    }
+
+    /// `width / head` heads of `head` columns, one every `stride` from `from`.
+    #[must_use]
+    pub const fn strided(from: u32, width: u32, head: u32, stride: u32) -> Window {
+        Window {
+            from,
+            width,
+            head,
+            stride,
+        }
+    }
+
+    /// The tile column the window's `j`th landed column is.
+    #[must_use]
+    pub const fn column(self, j: u32) -> u32 {
+        if self.head == 0 {
+            self.from + j
+        } else {
+            self.from + j / self.head * self.stride + j % self.head
+        }
+    }
+
+    /// The landed column the tile's column `c` is, where the window holds it.
+    #[must_use]
+    pub const fn landed(self, c: u32) -> Option<u32> {
+        if c < self.from {
+            return None;
+        }
+        let at = c - self.from;
+        if self.head == 0 {
+            return if at < self.width { Some(at) } else { None };
+        }
+        let (h, j) = (at / self.stride, at % self.stride);
+        if j < self.head && h < self.width / self.head {
+            Some(h * self.head + j)
+        } else {
+            None
+        }
+    }
+
+    /// One past the last tile column it holds.
+    #[must_use]
+    pub const fn end(self) -> u32 {
+        if self.width == 0 {
+            self.from
+        } else {
+            self.column(self.width - 1) + 1
+        }
+    }
+
+    /// Whether it is whole, no head stride.
+    #[must_use]
+    pub const fn whole(self) -> bool {
+        self.head == 0
+    }
 }
 
 /// How a paged cache holds its elements: bf16, or e4m3 under a scale (each
@@ -651,7 +724,12 @@ impl Anchored {
                 return Err(AnchorError::Window { result });
             }
             for (result, w) in (0u32..).zip(&self.windows) {
-                if w.width == 0 || w.from.checked_add(w.width).is_none_or(|to| to > c.n) {
+                let strided = w.head == 0
+                    || (w.stride >= w.head && w.width.is_multiple_of(w.head));
+                let inside = w.from.checked_add(w.width).is_some()
+                    && w.from.checked_add(w.stride).is_some()
+                    && w.end() <= c.n;
+                if w.width == 0 || !strided || !inside {
                     return Err(AnchorError::Window { result });
                 }
             }
@@ -732,10 +810,7 @@ impl Anchored {
     /// The window result `k` lands: its own, or every column.
     #[must_use]
     pub fn window(&self, k: usize) -> Window {
-        self.windows.get(k).copied().unwrap_or(Window {
-            from: 0,
-            width: self.contraction.n,
-        })
+        self.windows.get(k).copied().unwrap_or(Window::of(0, self.contraction.n))
     }
 
     /// The tiles it lands, each `m x n`: the epilogue's results, or each
@@ -1015,9 +1090,11 @@ fn windowed(anchored: &Anchored, tiles: Vec<Vec<f32>>, m: usize, n: usize) -> Ve
         .into_iter()
         .zip(&anchored.windows)
         .map(|(tile, w)| {
-            let (from, width) = (w.from as usize, w.width as usize);
+            let tile = &tile;
             (0..m)
-                .flat_map(|row| tile[row * n + from..row * n + from + width].to_vec())
+                .flat_map(|row| {
+                    (0..w.width).map(move |j| tile[row * n + w.column(j) as usize])
+                })
                 .collect()
         })
         .collect()
@@ -1319,6 +1396,7 @@ mod tests {
             theta: 10000.0,
             inverse: false,
             ramp: None,
+        mscale: None,
         };
         let rotated = b.rotate(normed, 1, &turn);
         let col = b.push(Op::Column);
@@ -1486,6 +1564,7 @@ mod tests {
             theta: 10000.0,
             inverse: false,
             ramp: None,
+        mscale: None,
         };
         let turned = b.rotate(scaled, 3, &turn);
         let anchored = Anchored {
@@ -1500,18 +1579,9 @@ mod tests {
                 inputs: vec![Input::Head(hd as u32), Input::Head(hd as u32), Input::Row],
             }),
             windows: vec![
-                Window {
-                    from: 0,
-                    width: q as u32,
-                },
-                Window {
-                    from: q as u32,
-                    width: kv as u32,
-                },
-                Window {
-                    from: (q + kv) as u32,
-                    width: kv as u32,
-                },
+                Window::of(0, q as u32),
+                Window::of(q as u32, kv as u32),
+                Window::of((q + kv) as u32, kv as u32),
             ],
             ..Anchored::plain(Contraction {
                 acc: None,
@@ -1763,6 +1833,96 @@ mod tests {
             ..paged
         });
         assert_eq!(off.verify(), Err(AnchorError::Paged { result: 1 }));
+    }
+
+    /// A head-major window: `head` columns of every `stride` (Qwen 3.5's q,
+    /// a head interleaved with its gate's), its heads landed one after
+    /// another.
+    #[test]
+    fn a_strided_window_lands_a_head_of_every_stride() {
+        let [m, n, k] = [2usize, 16, 8];
+        let region = Region {
+            width: n as u32,
+            params: vec![Shape::Row],
+            ops: vec![],
+            results: vec![0, 0],
+            rounds: vec![],
+        };
+        let anchored = Anchored {
+            epilogue: Some(Pointwise {
+                region,
+                inputs: vec![],
+            }),
+            windows: vec![Window::strided(0, 8, 4, 8), Window::strided(4, 8, 4, 8)],
+            ..Anchored::plain(Contraction {
+                acc: None,
+                ..contraction(n as u32, k as u32, Layout::Dense)
+            })
+        };
+        assert_eq!(anchored.verify(), Ok(()));
+        let w = Window::strided(4, 8, 4, 8);
+        assert_eq!((w.column(5), w.landed(13), w.landed(8), w.end()), (13, Some(5), None, 16));
+        let (a, wt) = (values(m * k, 1), values(n * k, 2));
+        let got = eval(&anchored, m, &a, &wt, &[], &[]).expect("runs");
+        let y = eval(&Anchored::plain(anchored.contraction), m, &a, &wt, &[], &[]).expect("runs");
+        for row in 0..m {
+            for j in 0..8 {
+                let (q, g) = (j / 4 * 8 + j % 4, j / 4 * 8 + 4 + j % 4);
+                assert_eq!(got[0][row * 8 + j], y[0][row * n + q]);
+                assert_eq!(got[1][row * 8 + j], y[0][row * n + g]);
+            }
+        }
+        // A head past its stride, or a window past the tile's columns.
+        let mut off = anchored.clone();
+        off.windows[0] = Window::strided(0, 8, 8, 4);
+        assert_eq!(off.verify(), Err(AnchorError::Window { result: 0 }));
+        let mut off = anchored;
+        off.windows[1] = Window::strided(12, 8, 4, 8);
+        assert_eq!(off.verify(), Err(AnchorError::Window { result: 1 }));
+    }
+
+    /// A turn at frequencies stated outright (Llama 3's scaled rope): each
+    /// pair's from the table, its cos and sin times the table's scale; and
+    /// YaRN's every pair at its ramped frequency, times its attention factor.
+    #[test]
+    fn a_turn_reads_its_tables_frequencies_and_scale() {
+        use crate::build::{Ops, Pairs, Turn};
+        let hd = 8u32;
+        let table = [1.0f32, 0.25, 0.0625, 0.015_625];
+        let mut b = Ops::new(2);
+        let turn = Turn {
+            head_dim: hd,
+            pairs: Pairs::Halves {
+                rotary: hd,
+                span: hd / 2,
+            },
+            theta: 10000.0,
+            inverse: false,
+            ramp: None,
+            mscale: Some(0.5),
+        };
+        let out = b.rotate_with(0, 1, &turn, Some(&table));
+        let region = Region {
+            width: hd,
+            params: vec![Shape::Row, Shape::Scalar],
+            ops: b.ops,
+            results: vec![out],
+            rounds: vec![],
+        };
+        let x: Vec<f32> = (0..hd).map(|i| i as f32 * 0.25 - 1.0).collect();
+        let pos = 5.0f32;
+        let got = interp::eval(&region, &[Arg::Row(x.clone()), Arg::Scalar(pos)]).expect("runs");
+        for i in 0..hd as usize {
+            let d = i % 4;
+            let angle = pos * table[d];
+            let (c, s) = (angle.cos() * 0.5, angle.sin() * 0.5);
+            let want = if i < 4 {
+                x[i] * c - x[i + 4] * s
+            } else {
+                x[i] * c + x[i - 4] * s
+            };
+            assert!((got[0][i] - want).abs() <= 1e-6, "{i}: {} vs {want}", got[0][i]);
+        }
     }
 
     #[test]
