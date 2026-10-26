@@ -55,6 +55,7 @@ const MAX_TABLE: u32 = 1024;
 enum Held {
     Param(u32),
     One(u32),
+    Vector(u32),
     Uniform,
     Heads,
     Local,
@@ -108,9 +109,12 @@ pub fn schedule(region: &Region) -> Result<Kernel, Unscheduled> {
         return Err(whole("a value rounded to a dtype no hook rounds to"));
     }
     for &r in results {
-        if types[r as usize] != (Shape::Row, Elem::F32) {
+        if !matches!(
+            types[r as usize],
+            (Shape::Row | Shape::Vector(_), Elem::F32)
+        ) {
             return Err(whole(
-                "a result that is not an f32 row, and `f.st` writes one",
+                "a result that is not an f32 row or small vector, and `f.st` writes one",
             ));
         }
     }
@@ -123,23 +127,46 @@ pub fn schedule(region: &Region) -> Result<Kernel, Unscheduled> {
             phase: 0,
             held: match shape {
                 Shape::Scalar => Held::One(k),
+                Shape::Vector(_) => Held::Vector(k),
                 _ => Held::Param(k),
             },
         });
     }
 
-    // Each op's step and phase, in program order.
+    // Each op's step and phase, in program order. A repeat's body runs
+    // whole in one phase: the latest any value it reads from outside it (its
+    // initial value among them) lands in.
     let mut steps: Vec<(u32, Step)> = Vec::new();
+    let mut looping: Option<u32> = None;
     for (at, op) in region.ops.iter().enumerate() {
         let out = params + u32::try_from(at).unwrap_or(u32::MAX);
         let phase_of =
             |values: &[Option<Value>], v: ValueId| values[v as usize].map_or(0, |v| v.phase);
-        let phase = op
-            .args()
-            .iter()
-            .map(|&a| phase_of(&values, a))
-            .max()
-            .unwrap_or(0);
+        if let Op::Carry(_) = op {
+            let close = region.ops[at..]
+                .iter()
+                .position(|op| matches!(op, Op::Repeat(..)))
+                .map_or(region.ops.len(), |k| at + k);
+            looping = Some(
+                region.ops[at..close]
+                    .iter()
+                    .flat_map(Op::args)
+                    .filter(|&a| a < out)
+                    .map(|a| phase_of(&values, a))
+                    .max()
+                    .unwrap_or(0),
+            );
+        }
+        let phase = looping.unwrap_or_else(|| {
+            op.args()
+                .iter()
+                .map(|&a| phase_of(&values, a))
+                .max()
+                .unwrap_or(0)
+        });
+        if let Op::Repeat(..) = op {
+            looping = None;
+        }
         let (step, value, step_phase) = match (op, types[out as usize].0) {
             (Op::Reduce(..) | Op::ReduceHeads(..), shape) => (
                 Step::Reduce { value: out, op: at },
@@ -183,7 +210,7 @@ pub fn schedule(region: &Region) -> Result<Kernel, Unscheduled> {
                 },
                 phase,
             ),
-            (_, Shape::Scalar) => (
+            (_, Shape::Scalar | Shape::Vector(_)) => (
                 Step::Uniform { value: out, op: at },
                 Value {
                     phase,
@@ -336,6 +363,7 @@ pub fn schedule(region: &Region) -> Result<Kernel, Unscheduled> {
         match values[v as usize].map(|v| v.held) {
             Some(Held::Param(k)) => Operand::Param(k),
             Some(Held::One(k)) => Operand::One(k),
+            Some(Held::Vector(k)) => Operand::Vector(k),
             Some(Held::Kept) => Operand::Kept(v),
             Some(Held::Heads) => Operand::Heads(v),
             Some(Held::Table { at, period }) => Operand::Table { at, period },
@@ -357,6 +385,15 @@ pub fn schedule(region: &Region) -> Result<Kernel, Unscheduled> {
             },
             Op::Column => Expr::Column,
             Op::Peer(_, idx) => Expr::Peer(operand(idx)),
+            Op::Pick(v, i) => Expr::Pick(operand(v), i),
+            Op::Insert(v, i, x) => Expr::Insert(operand(v), i, operand(x)),
+            Op::Splat(x, _) => Expr::Splat(operand(x)),
+            Op::Carry(init) => Expr::Carry(operand(init)),
+            Op::Repeat(count, carry, next) => Expr::Repeat {
+                count,
+                carry,
+                next: operand(next),
+            },
             Op::Reduce(..) | Op::ReduceHeads(..) => unreachable!("a reduction is no expression"),
         }
     };
@@ -417,6 +454,16 @@ pub fn schedule(region: &Region) -> Result<Kernel, Unscheduled> {
                     elem: types[value as usize].1,
                     expr: expr(&region.ops[op], value),
                     round: round(value),
+                    vector: match types[value as usize].0 {
+                        Shape::Vector(n) => Some(n),
+                        _ => None,
+                    },
+                    stores: results
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, r)| **r == value)
+                        .map(|(k, _)| u32::try_from(k).unwrap_or(u32::MAX))
+                        .collect(),
                 }),
                 Step::Head { value, op } => heads.push(HeadAssign {
                     value,

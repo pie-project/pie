@@ -251,81 +251,151 @@ pub fn eval(region: &Region, args: &[Arg]) -> Result<Vec<Vec<f32>>, InterpError>
             param: u32::try_from(args.len().min(region.params.len())).unwrap_or(u32::MAX),
         });
     }
-    // Each value as a row of elements, a scalar its one.
-    let mut vals: Vec<Vec<V>> = Vec::with_capacity(types.len());
+    // Each value as its elements: a row's `width`, a small vector's `n`, a
+    // scalar its one.
+    let mut vals: Vec<Vec<V>> = vec![Vec::new(); types.len()];
     for (param, (arg, shape)) in (0u32..).zip(args.iter().zip(&region.params)) {
-        vals.push(match (arg, shape) {
+        vals[param as usize] = match (arg, shape) {
             (Arg::Row(row), Shape::Row) if row.len() == width => {
+                row.iter().map(|&x| V::F(x)).collect()
+            }
+            (Arg::Row(row), Shape::Vector(n)) if row.len() == *n as usize => {
                 row.iter().map(|&x| V::F(x)).collect()
             }
             (Arg::Scalar(x), Shape::Scalar) => vec![V::F(*x)],
             _ => return Err(InterpError::Arguments { param }),
-        });
+        };
     }
-    let at = |vals: &[Vec<V>], v: ValueId, e: usize| -> V {
-        let row = &vals[v as usize];
-        if row.len() == 1 { row[0] } else { row[e] }
-    };
-    for (op, k) in region.ops.iter().zip(0u32..) {
-        let out = region.params.len() as u32 + k;
-        let n = match types[out as usize].0 {
-            Shape::Row | Shape::Head(_) => width,
-            Shape::Scalar => 1,
-        };
-        let mut row: Vec<V> = match *op {
-            Op::Reduce(reduce, input) => {
-                let total = fold(reduce, (0..width).map(|e| at(&vals, input, e).f()));
-                vec![V::F(narrowed(total))]
-            }
-            Op::ReduceHeads(reduce, input, size) => {
-                let mut partials: Vec<f64> = (0..width / 8)
-                    .map(|p| fold(reduce, (p * 8..p * 8 + 8).map(|e| at(&vals, input, e).f())))
-                    .collect();
-                butterfly(reduce, size / 8, &mut partials);
-                (0..width)
-                    .map(|e| V::F(narrowed(partials[e / 8])))
-                    .collect()
-            }
-            _ => (0..n)
-                .map(|e| match *op {
-                    Op::Const(l) => literal(l),
-                    Op::Unary(u, a) => unary(u, at(&vals, a, e)),
-                    Op::Binary(b, x, y) => binary(b, at(&vals, x, e), at(&vals, y, e)),
-                    Op::Select(c, a, b) => {
-                        if at(&vals, c, e).b() {
-                            at(&vals, a, e)
-                        } else {
-                            at(&vals, b, e)
-                        }
-                    }
-                    Op::Cast(a, to) => cast(at(&vals, a, e), to),
-                    Op::Broadcast(a) => at(&vals, a, e),
-                    Op::Fma(a, b, c) => V::F(
-                        at(&vals, a, e)
-                            .f()
-                            .mul_add(at(&vals, b, e).f(), at(&vals, c, e).f()),
-                    ),
-                    Op::Column => V::U(u32::try_from(e).unwrap_or(u32::MAX)),
-                    Op::Peer(src, idx) => {
-                        let c = at(&vals, idx, e).u() as usize;
-                        at(&vals, src, if c < width { c } else { 0 })
-                    }
-                    Op::Reduce(..) | Op::ReduceHeads(..) => unreachable!("taken above"),
-                })
-                .collect(),
-        };
-        if let Some(dtype) = region.rounding(out) {
-            for x in &mut row {
-                *x = V::F(rounded(dtype, x.f())?);
-            }
+    let params = region.params.len();
+    // Each repeat's close, by its carry's op.
+    let mut closes = vec![0usize; region.ops.len()];
+    let mut open = 0usize;
+    for (k, op) in region.ops.iter().enumerate() {
+        match op {
+            Op::Carry(_) => open = k,
+            Op::Repeat(..) => closes[open] = k,
+            _ => {}
         }
-        vals.push(row);
+    }
+    let mut k = 0usize;
+    while k < region.ops.len() {
+        if let Op::Carry(init) = region.ops[k] {
+            let close = closes[k];
+            let Op::Repeat(count, carry, next) = region.ops[close] else {
+                unreachable!("a carry's close is a repeat");
+            };
+            let mut state = vals[init as usize].clone();
+            for _ in 0..count {
+                vals[carry as usize] = state;
+                for j in k + 1..close {
+                    eval_op(region, &types, &mut vals, params + j, width)?;
+                }
+                state = vals[next as usize].clone();
+            }
+            vals[params + close] = state;
+            k = close + 1;
+            continue;
+        }
+        eval_op(region, &types, &mut vals, params + k, width)?;
+        k += 1;
     }
     Ok(region
         .results
         .iter()
-        .map(|&r| (0..width).map(|e| at(&vals, r, e).f()).collect())
+        .map(|&r| {
+            let n = match types[r as usize].0 {
+                Shape::Vector(n) => n as usize,
+                _ => width,
+            };
+            (0..n).map(|e| at(&vals, r, e).f()).collect()
+        })
         .collect())
+}
+
+/// Element `e` of value `v`: a scalar's one at every element.
+fn at(vals: &[Vec<V>], v: ValueId, e: usize) -> V {
+    let row = &vals[v as usize];
+    if row.len() == 1 { row[0] } else { row[e] }
+}
+
+/// The value op `out` defines, from the values before it, rounded where
+/// the region rounds it.
+fn eval_op(
+    region: &Region,
+    types: &[(Shape, Elem)],
+    vals: &mut [Vec<V>],
+    out: usize,
+    width: usize,
+) -> Result<(), InterpError> {
+    let op = region.ops[out - region.params.len()];
+    let n = match types[out].0 {
+        Shape::Row | Shape::Head(_) => width,
+        Shape::Vector(n) => n as usize,
+        Shape::Scalar => 1,
+    };
+    let vals_ro: &[Vec<V>] = vals;
+    let mut row: Vec<V> = match op {
+        Op::Reduce(reduce, input) => {
+            let total = fold(reduce, (0..width).map(|e| at(vals_ro, input, e).f()));
+            vec![V::F(narrowed(total))]
+        }
+        Op::ReduceHeads(reduce, input, size) => {
+            let mut partials: Vec<f64> = (0..width / 8)
+                .map(|p| {
+                    fold(
+                        reduce,
+                        (p * 8..p * 8 + 8).map(|e| at(vals_ro, input, e).f()),
+                    )
+                })
+                .collect();
+            butterfly(reduce, size / 8, &mut partials);
+            (0..width)
+                .map(|e| V::F(narrowed(partials[e / 8])))
+                .collect()
+        }
+        Op::Pick(v, i) => vec![vals_ro[v as usize][i as usize]],
+        Op::Insert(v, i, x) => {
+            let mut row = vals_ro[v as usize].clone();
+            row[i as usize] = at(vals_ro, x, 0);
+            row
+        }
+        Op::Splat(x, size) => vec![at(vals_ro, x, 0); size as usize],
+        Op::Carry(_) | Op::Repeat(..) => unreachable!("a repeat is run by its carry"),
+        _ => (0..n)
+            .map(|e| match op {
+                Op::Const(l) => literal(l),
+                Op::Unary(u, a) => unary(u, at(vals_ro, a, e)),
+                Op::Binary(b, x, y) => binary(b, at(vals_ro, x, e), at(vals_ro, y, e)),
+                Op::Select(c, a, b) => {
+                    if at(vals_ro, c, e).b() {
+                        at(vals_ro, a, e)
+                    } else {
+                        at(vals_ro, b, e)
+                    }
+                }
+                Op::Cast(a, to) => cast(at(vals_ro, a, e), to),
+                Op::Broadcast(a) => at(vals_ro, a, e),
+                Op::Fma(a, b, c) => V::F(
+                    at(vals_ro, a, e)
+                        .f()
+                        .mul_add(at(vals_ro, b, e).f(), at(vals_ro, c, e).f()),
+                ),
+                Op::Column => V::U(u32::try_from(e).unwrap_or(u32::MAX)),
+                Op::Peer(src, idx) => {
+                    let c = at(vals_ro, idx, e).u() as usize;
+                    at(vals_ro, src, if c < width { c } else { 0 })
+                }
+                _ => unreachable!("taken above"),
+            })
+            .collect(),
+    };
+    if let Some(dtype) = region.rounding(u32::try_from(out).unwrap_or(u32::MAX)) {
+        for x in &mut row {
+            *x = V::F(rounded(dtype, x.f())?);
+        }
+    }
+    vals[out] = row;
+    Ok(())
 }
 
 /// The skeleton of one row on the host: one thread holding the whole row, its
@@ -353,6 +423,10 @@ impl OneRow {
                     rows.push(row.clone());
                     ones.push(0.0);
                 }
+                (Arg::Row(row), Shape::Vector(n)) if row.len() == *n as usize => {
+                    rows.push(row.clone());
+                    ones.push(0.0);
+                }
                 (Arg::Scalar(x), Shape::Scalar) => {
                     rows.push(Vec::new());
                     ones.push(*x);
@@ -360,11 +434,19 @@ impl OneRow {
                 _ => return Err(InterpError::Arguments { param }),
             }
         }
+        let types = region.types().map_err(InterpError::Region)?;
         Ok(OneRow {
             rows,
             ones,
             stored: region.results.iter().map(|&r| region.rounding(r)).collect(),
-            out: vec![vec![0.0; width]; region.results.len()],
+            out: region
+                .results
+                .iter()
+                .map(|&r| match types[r as usize].0 {
+                    Shape::Vector(n) => vec![0.0; n as usize],
+                    _ => vec![0.0; width],
+                })
+                .collect(),
             width,
             shared: vec![0.0; width],
         })
@@ -428,12 +510,21 @@ impl Skeleton for OneRow {
             .copied()
             .unwrap_or(self.shared[0])
     }
+
+    fn vector(&self, k: u32, i: usize) -> f32 {
+        self.rows[k as usize][i]
+    }
+
+    fn store_vector(&mut self, k: u32, i: usize, v: f32) {
+        self.out[k as usize][i] = v;
+    }
 }
 
 /// What a kernel has computed so far, by how it holds it.
 #[derive(Default)]
 struct State {
     uniforms: BTreeMap<ValueId, V>,
+    vectors: BTreeMap<ValueId, Vec<V>>,
     kept: BTreeMap<ValueId, Vec<V>>,
     heads: BTreeMap<ValueId, Vec<V>>,
     table: Vec<f32>,
@@ -459,12 +550,38 @@ pub fn run(kernel: &Kernel, skeleton: &mut impl Skeleton) {
     };
     let none = BTreeMap::new();
     for (at, phase) in kernel.phases.iter().enumerate() {
-        for u in &phase.uniforms {
-            let mut x = eval_expr(&u.expr, skeleton, &st, &none, 0);
-            if let Some(dtype) = u.round {
-                x = V::F(skeleton.round(dtype, x.f()));
+        let us = &phase.uniforms;
+        let mut i = 0;
+        while i < us.len() {
+            let Expr::Carry(init) = us[i].expr else {
+                uniform(&us[i], skeleton, &mut st);
+                i += 1;
+                continue;
+            };
+            // a repeat: its body (the uniforms up to its close) run its
+            // count of passes, each pass's next the next pass's carried value
+            let carry = us[i].value;
+            let close = (i + 1..us.len())
+                .find(|&j| matches!(us[j].expr, Expr::Repeat { carry: c, .. } if c == carry))
+                .expect("a carry's repeat closes it in its phase");
+            let Expr::Repeat { count, next, .. } = us[close].expr else {
+                unreachable!("found above");
+            };
+            let mut state = held(init, skeleton, &st, us[i].vector);
+            for _ in 0..count {
+                set(&mut st, carry, state);
+                for u in &us[i + 1..close] {
+                    uniform(u, skeleton, &mut st);
+                }
+                state = held(next, skeleton, &st, us[i].vector);
             }
-            st.uniforms.insert(u.value, x);
+            set(&mut st, us[close].value, state.clone());
+            for &k in &us[close].stores {
+                for (j, x) in state.iter().enumerate() {
+                    skeleton.store_vector(k, j, x.f());
+                }
+            }
+            i = close + 1;
         }
         if at == 0 {
             for t in &kernel.tables {
@@ -545,6 +662,68 @@ pub fn run(kernel: &Kernel, skeleton: &mut impl Skeleton) {
     }
 }
 
+/// A uniform's value: a scalar's one, a small vector's each, stored where
+/// it is a result.
+fn uniform(u: &crate::kernel::Uniform, skeleton: &mut impl Skeleton, st: &mut State) {
+    let n = u.vector.unwrap_or(1) as usize;
+    let mut xs: Vec<V> = match u.expr {
+        Expr::Pick(v, i) => vec![vector_at(v, skeleton, st, i as usize)],
+        Expr::Insert(v, i, x) => {
+            let mut xs: Vec<V> = (0..n).map(|j| vector_at(v, skeleton, st, j)).collect();
+            xs[i as usize] = vector_at(x, skeleton, st, 0);
+            xs
+        }
+        Expr::Splat(x) => vec![vector_at(x, skeleton, st, 0); n],
+        expr => (0..n)
+            .map(|j| apply(&expr, |o| vector_at(o, skeleton, st, j)))
+            .collect(),
+    };
+    if let Some(dtype) = u.round {
+        for x in &mut xs {
+            *x = V::F(skeleton.round(dtype, x.f()));
+        }
+    }
+    for &k in &u.stores {
+        for (j, x) in xs.iter().enumerate() {
+            skeleton.store_vector(k, j, x.f());
+        }
+    }
+    if u.vector.is_some() {
+        st.vectors.insert(u.value, xs);
+    } else {
+        st.uniforms.insert(u.value, xs[0]);
+    }
+}
+
+/// Element `j` of a value one a row: a small vector's `j`th, a scalar's one.
+fn vector_at(o: Operand, skeleton: &impl Skeleton, st: &State, j: usize) -> V {
+    match o {
+        Operand::Vector(k) => V::F(skeleton.vector(k, j)),
+        Operand::Local(v) => match st.vectors.get(&v) {
+            Some(xs) => xs[j],
+            None => st.uniforms[&v],
+        },
+        Operand::One(k) => V::F(skeleton.one(k)),
+        other => unreachable!("a value one a row reads no {other:?}"),
+    }
+}
+
+/// A value one a row as its elements: a small vector's `n`, a scalar's one.
+fn held(o: Operand, skeleton: &impl Skeleton, st: &State, vector: Option<u32>) -> Vec<V> {
+    (0..vector.unwrap_or(1) as usize)
+        .map(|j| vector_at(o, skeleton, st, j))
+        .collect()
+}
+
+/// Sets a value one a row: a small vector's elements, or a scalar.
+fn set(st: &mut State, v: ValueId, xs: Vec<V>) {
+    if st.vectors.contains_key(&v) || xs.len() > 1 {
+        st.vectors.insert(v, xs);
+    } else {
+        st.uniforms.insert(v, xs[0]);
+    }
+}
+
 /// A table's entries, each computed from its column.
 fn fill(t: &Table, skeleton: &impl Skeleton, st: &mut State) {
     for c in 0..t.period {
@@ -586,7 +765,13 @@ fn apply(expr: &Expr, o: impl Fn(Operand) -> V) -> V {
         }
         Expr::Cast { value, to, .. } => cast(o(value), to),
         Expr::Fma(a, b, c) => V::F(o(a).f().mul_add(o(b).f(), o(c).f())),
-        Expr::Column | Expr::Peer(_) => unreachable!("taken by the caller"),
+        Expr::Column
+        | Expr::Peer(_)
+        | Expr::Pick(..)
+        | Expr::Insert(..)
+        | Expr::Splat(_)
+        | Expr::Carry(_)
+        | Expr::Repeat { .. } => unreachable!("taken by the caller"),
     }
 }
 
@@ -605,6 +790,7 @@ fn operand(
         Operand::Table { at, period } => {
             V::F(st.table[(at + skeleton.column(e) % period) as usize])
         }
+        Operand::Vector(_) => unreachable!("a row's element reads no small vector"),
         Operand::Local(v) | Operand::Entry(v) => local
             .get(&v)
             .or_else(|| st.uniforms.get(&v))
@@ -801,6 +987,104 @@ mod tests {
                 "the mean square to its rsqrt, one a head"
             );
         }
+    }
+
+    /// A row's small vector normalized by its sum three times over (a
+    /// repeat), landed as its own result, its first value then scaling the
+    /// row.
+    fn renormed(width: u32) -> Region {
+        Region {
+            width,
+            params: vec![Shape::Row, Shape::Vector(4)],
+            ops: vec![
+                Op::Const(Literal::F32(1e-3)),   // 2: eps
+                Op::Carry(1),                    // 3
+                Op::Pick(3, 0),                  // 4
+                Op::Pick(3, 1),                  // 5
+                Op::Pick(3, 2),                  // 6
+                Op::Pick(3, 3),                  // 7
+                Op::Binary(Binary::Add, 4, 5),   // 8
+                Op::Binary(Binary::Add, 8, 6),   // 9
+                Op::Binary(Binary::Add, 9, 7),   // 10
+                Op::Binary(Binary::Add, 10, 2),  // 11: the sum, and eps
+                Op::Binary(Binary::Div, 3, 11),  // 12: the vector over it
+                Op::Unary(Unary::Exp, 4),        // 13
+                Op::Insert(12, 0, 13),           // 14: its first value e^c0
+                Op::Repeat(3, 3, 14),            // 15
+                Op::Pick(15, 0),                 // 16
+                Op::Binary(Binary::Mul, 0, 16),  // 17: the row scaled
+                Op::Splat(16, 4),                // 18
+                Op::Binary(Binary::Sub, 15, 18), // 19
+            ],
+            results: vec![17, 19],
+            rounds: vec![(17, Dtype::Bf16)],
+        }
+    }
+
+    #[test]
+    fn a_repeat_over_a_small_vector_lands_its_regions_bits() {
+        for width in [8, 64] {
+            let region = renormed(width);
+            region.verify().expect("a function of one row");
+            let args = vec![
+                Arg::Row(row(width, 3)),
+                Arg::Row(vec![0.5, -0.25, 1.5, 0.125]),
+            ];
+            let (got, want) = both(&region, &args);
+            assert_eq!(want[1].len(), 4, "a small vector's result is its own");
+            assert_eq!(bits(&got), bits(&want), "{width}");
+            let kernel = schedule(&region).expect("scheduled");
+            assert_eq!(kernel.passes(), 1, "the repeat is a row's scalar work");
+        }
+        // Zero passes leave the carried value as it came in.
+        let mut region = renormed(8);
+        region.ops[13] = Op::Repeat(0, 3, 14);
+        let args = vec![Arg::Row(row(8, 3)), Arg::Row(vec![0.5, -0.25, 1.5, 0.125])];
+        let out = eval(&region, &args).expect("runs");
+        assert_eq!(out[1], vec![0.0, -0.75, 1.0, -0.375]);
+    }
+
+    #[test]
+    fn a_repeat_stated_wrong_is_refused() {
+        let refused = |edit: &dyn Fn(&mut Region)| {
+            let mut region = renormed(8);
+            edit(&mut region);
+            region.verify().expect_err("refused")
+        };
+        // a row read inside the body
+        assert!(matches!(
+            refused(&|r| r.ops[10] = Op::Binary(Binary::Mul, 0, 2)),
+            RegionError::Mistyped { .. } | RegionError::Repeat { .. }
+        ));
+        // a repeat opened inside another
+        assert!(matches!(
+            refused(&|r| r.ops[9] = Op::Carry(2)),
+            RegionError::Repeat { .. }
+        ));
+        // a pass's next of another type than the carried value
+        assert!(matches!(
+            refused(&|r| r.ops[13] = Op::Repeat(3, 3, 13)),
+            RegionError::Repeat { .. }
+        ));
+        // a body's value read past its close, and as a result
+        assert!(matches!(
+            refused(&|r| r.ops[14] = Op::Pick(12, 0)),
+            RegionError::Repeat { .. }
+        ));
+        assert!(matches!(
+            refused(&|r| r.results = vec![17, 12]),
+            RegionError::Repeat { .. }
+        ));
+        // a carry never closed
+        assert!(matches!(
+            refused(&|r| r.ops.truncate(13)),
+            RegionError::Repeat { .. }
+        ));
+        // small vectors of two lengths together
+        assert!(matches!(
+            refused(&|r| r.ops[16] = Op::Splat(16, 3)),
+            RegionError::Mistyped { .. }
+        ));
     }
 
     #[test]

@@ -50,12 +50,67 @@ enum At {
     Column,
 }
 
-/// Why a kernel does not print: a rounding to a dtype no hook rounds to.
+/// Why a kernel does not print.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Unprinted(pub Dtype);
+pub enum Unprinted {
+    /// A rounding to a dtype no hook rounds to.
+    Rounding(Dtype),
+    /// A small vector one a row, or a repeat over one: this skeleton holds
+    /// neither yet.
+    Vectors,
+}
 
-/// `kernel`'s body, its source.
+/// Whether `kernel` holds a small vector one a row or a repeat, which this
+/// printer does not print.
+fn vectors(kernel: &Kernel) -> bool {
+    let reads = |e: &Expr| {
+        matches!(
+            e,
+            Expr::Pick(..)
+                | Expr::Insert(..)
+                | Expr::Splat(_)
+                | Expr::Carry(_)
+                | Expr::Repeat { .. }
+        ) || expr_operands(e)
+            .iter()
+            .any(|o| matches!(o, Operand::Vector(_)))
+    };
+    kernel.phases.iter().any(|phase| {
+        phase
+            .uniforms
+            .iter()
+            .any(|u| u.vector.is_some() || !u.stores.is_empty() || reads(&u.expr))
+            || phase.heads.iter().any(|h| reads(&h.expr))
+            || phase
+                .pass
+                .as_ref()
+                .is_some_and(|pass| pass.rows.iter().any(|r| reads(&r.expr)))
+    })
+}
+
+/// The operands `e` reads.
+fn expr_operands(e: &Expr) -> Vec<Operand> {
+    match *e {
+        Expr::Literal(_) | Expr::Column => Vec::new(),
+        Expr::Copy(a)
+        | Expr::Unary(_, a)
+        | Expr::Cast { value: a, .. }
+        | Expr::Peer(a)
+        | Expr::Pick(a, _)
+        | Expr::Splat(a)
+        | Expr::Carry(a) => vec![a],
+        Expr::Binary(_, a, b) | Expr::Insert(a, _, b) => vec![a, b],
+        Expr::Select(a, b, c) | Expr::Fma(a, b, c) => vec![a, b, c],
+        Expr::Repeat { next, .. } => vec![next],
+    }
+}
+
+/// `kernel`'s body, its source; refused where it holds a small vector or a
+/// repeat.
 pub fn body(kernel: &Kernel) -> Result<String, Unprinted> {
+    if vectors(kernel) {
+        return Err(Unprinted::Vectors);
+    }
     let mut s = String::new();
     for (v, elem) in &kernel.kept {
         let _ = writeln!(s, "  {} v{v}[F::N];", c_type(*elem));
@@ -233,7 +288,7 @@ fn held(round: Option<Dtype>, expr: String) -> Result<String, Unprinted> {
     match round {
         None => Ok(expr),
         Some(Dtype::Bf16) => Ok(format!("f.round_bf16({expr})")),
-        Some(other) => Err(Unprinted(other)),
+        Some(other) => Err(Unprinted::Rounding(other)),
     }
 }
 
@@ -249,6 +304,7 @@ const fn c_type(elem: Elem) -> &'static str {
 fn operand(o: Operand, at: At) -> String {
     match (o, at) {
         (Operand::Param(k), _) => format!("f.ld({k}, e)"),
+        (Operand::Vector(_), _) => unreachable!("`body` refuses a small vector"),
         (Operand::One(k), _) => format!("f.one({k})"),
         (Operand::Kept(v), _) => format!("v{v}[e]"),
         (Operand::Heads(v), At::Vector) => format!("v{v}[p]"),
@@ -286,6 +342,13 @@ fn expr(e: &Expr, at: At, elem: Elem) -> String {
         Expr::Column if at == At::Column => "c".into(),
         Expr::Column => "f.col(e)".into(),
         Expr::Peer(c) => format!("f.peer({})", o(c)),
+        Expr::Pick(..)
+        | Expr::Insert(..)
+        | Expr::Splat(_)
+        | Expr::Carry(_)
+        | Expr::Repeat { .. } => {
+            unreachable!("`body` refuses a small vector or a repeat")
+        }
         Expr::Fma(a, b, c) => format!("fmaf({}, {}, {})", o(a), o(b), o(c)),
         Expr::Copy(a) => o(a),
         Expr::Unary(u, a) if int => {

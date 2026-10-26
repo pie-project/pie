@@ -46,6 +46,10 @@ pub struct Body {
     /// The parameters (by bit) it loads where it first wants them
     /// ([`print::late`]), not up front.
     pub late: u32,
+    /// The parameters (by bit) it reads as small vectors one a row
+    /// (`f.vec`), and the results it lands as them (`f.st_vec`).
+    pub vectors: u32,
+    pub vector_outs: u32,
     /// The body packed rows run where it is not this one: a pair-packed
     /// turn ([`print::packing`]), which many rows' warps of no turned pair
     /// skip and a decode's few would wait on.
@@ -58,6 +62,18 @@ impl Body {
     pub fn of(region: &Region) -> Result<Body, Refusal> {
         let kernel = kernels_ir::schedule(region)
             .map_err(|why| refusal(format!("the row core does not schedule the region: {why}")))?;
+        let types = region
+            .types()
+            .map_err(|why| refusal(format!("the region is not one row: {why}")))?;
+        let vector = |v: u32| matches!(types[v as usize].0, Shape::Vector(_));
+        let vectors = (0u32..)
+            .zip(&region.params)
+            .filter(|(_, shape)| matches!(shape, Shape::Vector(_)))
+            .fold(0u32, |mask, (k, _)| mask | 1 << k);
+        let vector_outs = (0u32..)
+            .zip(&region.results)
+            .filter(|(_, r)| vector(**r))
+            .fold(0u32, |mask, (k, _)| mask | 1 << k);
         let printed = |packing: Option<&print::Packing>| {
             let source =
                 print::body_with(&kernel, packing).map_err(|print::Unprinted(dtype)| {
@@ -72,6 +88,8 @@ impl Body {
                 table: kernel.table,
                 shares: kernel.shares,
                 late: print::late(&kernel),
+                vectors,
+                vector_outs,
                 packed: None,
             })
         };
@@ -196,15 +214,32 @@ pub fn supports(region: &Region, ins: &[In], outs: &[Out]) -> Result<(), Refusal
             )));
         }
     }
-    for (k, Out::Rows(dtype)) in outs.iter().enumerate() {
-        if *dtype != Dtype::Bf16 {
+    let types = match region.types() {
+        Ok(types) => types,
+        Err(why) => return Err(refusal(format!("the region is not one row: {why}"))),
+    };
+    for (k, form) in ins.iter().enumerate() {
+        if matches!(region.params[k], Shape::Vector(_))
+            && !matches!(form, In::Rows(Dtype::F32) | In::Shared(Dtype::F32))
+        {
             return Err(refusal(format!(
-                "result {k} is stored {dtype:?}, and the skeleton's results are bf16"
+                "parameter {k} is a small vector one a row, stored as {form:?}, and the \
+                 skeleton reads one from f32 rows (its own or one every row reads)"
             )));
         }
     }
-    if let Err(why) = region.types() {
-        return Err(refusal(format!("the region is not one row: {why}")));
+    for (k, (Out::Rows(dtype), &r)) in outs.iter().zip(&region.results).enumerate() {
+        let vector = matches!(types[r as usize].0, Shape::Vector(_));
+        if vector && *dtype != Dtype::F32 {
+            return Err(refusal(format!(
+                "result {k} is a small vector stored {dtype:?}, and the skeleton lands one f32"
+            )));
+        }
+        if !vector && *dtype != Dtype::Bf16 {
+            return Err(refusal(format!(
+                "result {k} is stored {dtype:?}, and the skeleton's rows are bf16"
+            )));
+        }
     }
     skeleton::per(OP, region.width).map_err(|why| refusal(why.to_string()))?;
     heads(region)?;
@@ -250,6 +285,9 @@ pub struct Synthesized {
     stored: [Stored; MAX_PARAMS],
     /// The shared memory its body takes beside the skeleton.
     shared: Shared,
+    /// The parameters and results (by bit) that are small vectors one a row.
+    vectors: u32,
+    vector_outs: u32,
 }
 
 /// The most parameters one generated kernel reads.
@@ -303,15 +341,18 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
     // streams its row parameters through its passes; packed rows otherwise
     // issue a later pass's parameters late, and spread ones load every
     // parameter up front.
-    let stream = if fits(&stored[..ins.len()], ones, outs, per) {
+    // (a small vector one a row is read where the body asks, never held)
+    let held = ones | body.vectors;
+    let rows_out = outs - body.vector_outs.count_ones() as usize;
+    let stream = if fits(&stored[..ins.len()], held, rows_out, per) {
         0
     } else {
         (0u32..)
             .zip(ins)
-            .filter(|(_, form)| !form.scalar())
+            .filter(|(k, form)| !form.scalar() && (body.vectors >> k) & 1 == 0)
             .fold(0u32, |mask, (k, _)| mask | 1 << k)
     };
-    let late = body.late & !ones & !stream;
+    let late = body.late & !held & !stream;
     let laid = |schedule| {
         crate::jit::generated(
             if schedule == Schedule::Packed {
@@ -333,6 +374,7 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
                         0
                     },
                     stream,
+                    body.vectors,
                 ),
                 true,
                 schedule,
@@ -356,6 +398,8 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
             table: body.table,
             shares: body.shares,
         },
+        vectors: body.vectors,
+        vector_outs: body.vector_outs,
     })
 }
 
@@ -514,7 +558,7 @@ impl Synthesized {
             outs,
             (rows, parts),
             self.width,
-            self.ones,
+            (self.ones, self.vectors, self.vector_outs),
             self.shared,
             schedule,
         )

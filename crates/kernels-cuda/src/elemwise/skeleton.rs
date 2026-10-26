@@ -324,7 +324,7 @@ pub(crate) fn entrypoint(
     per: u32,
     stored: &[Stored],
     outs: usize,
-    (ones, late, stream): (u32, u32, u32),
+    (ones, late, stream, vectors): (u32, u32, u32, u32),
     read_only: bool,
     schedule: Schedule,
 ) -> String {
@@ -332,7 +332,7 @@ pub(crate) fn entrypoint(
         .zip(stored)
         .fold(0u64, |dt, (k, form)| dt | (*form as u64) << (2 * k));
     format!(
-        "::pie::elemwise::row_skeleton<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}, {late}u, {stream}u>",
+        "::pie::elemwise::row_skeleton<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}, {late}u, {stream}u, {vectors}u>",
         block(width, schedule),
         lanes(width),
         stored.len()
@@ -363,7 +363,7 @@ pub(crate) fn fire(
     outs: &[Plane],
     (rows, parts): (u32, u32),
     width: u32,
-    ones: u32,
+    (ones, vectors, vector_outs): (u32, u32, u32),
     shared: Shared,
     schedule: Schedule,
 ) -> Result<(), Error> {
@@ -374,11 +374,17 @@ pub(crate) fn fire(
         .ok_or_else(|| refuse(op, format!("{rows} rows of {parts} parts overflow a grid")))?;
     // a row plane's every row starts on 16 bytes: a whole number of 8 bf16
     // or 4 f32 apart
+    // (a small vector one a row is read and landed an f32 at a time)
     let mut rowed = (0u32..)
         .zip(ins.iter().zip(stored))
-        .filter(|(k, _)| (ones >> k) & 1 == 0)
+        .filter(|(k, _)| ((ones | vectors) >> k) & 1 == 0)
         .map(|(_, (p, form))| (p, *form == Stored::F32))
-        .chain(outs.iter().map(|p| (p, false)));
+        .chain(
+            (0u32..)
+                .zip(outs)
+                .filter(|(k, _)| (vector_outs >> k) & 1 == 0)
+                .map(|(_, p)| (p, false)),
+        );
     if !rowed.all(|(p, wide)| aligned16(p.base) && p.row_stride % if wide { 4 } else { 8 } == 0) {
         return Err(refuse(op, "a plane is not 16-byte aligned at every row"));
     }
@@ -459,7 +465,7 @@ pub fn residual_add_rmsnorm(
                 per,
                 &[Stored::Bf16; 3],
                 2,
-                (0, 0, 0),
+                (0, 0, 0, 0),
                 false,
                 Schedule::Packed,
             ),
@@ -472,7 +478,7 @@ pub fn residual_add_rmsnorm(
         &[Plane::rows(out), Plane::rows(y)],
         (y.rows, 1),
         y.width,
-        0,
+        (0, 0, 0),
         Shared::default(),
         Schedule::Packed,
     )
