@@ -55,7 +55,7 @@ fn the_skinny_skeleton_refuses_shapes_off_its_tile() {
     assert!(!covers(1, 64, 192, 1, ROWS) && !covers(1, 48, 128, 2, ROWS));
     let mut b = Bench::new(1);
     let (w, a, y) = (b.zeros(96 * 256), b.zeros(256), b.zeros(192));
-    let fired = skinny(&b.ctx(), Epilogue::store(), w, a, &[], &[y], 1, 96, 128);
+    let fired = skinny(&b.ctx(), Epilogue::store(), w, a, &[], &[y], None, 1, 96, 128);
     assert!(fired.is_err());
 }
 

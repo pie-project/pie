@@ -30,13 +30,72 @@ pub const MAX_WIDTH: u32 = BLOCK * VEC_WIDTH * MAX_PER;
 /// the row), and its rows, the ids' bound (an id past them picks row 0, as
 /// the gather kernels pick it).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Plane {
     base: u64,
     row_stride: i64,
     ids: u64,
     period: u32,
     bound: u32,
+    /// Where a result's row lands, past its plane's own rows: `pie::elemwise::Store`.
+    store: Store,
+}
+
+/// `pie::elemwise::Store`: a result's vectors of 8 from `from` up to `to`
+/// (every one where `to` is 0) landing from its plane row's first element;
+/// or, paged, at the cache row `page[r] · page_size + slot[r]` (none where
+/// the slot lies past the page or `valid[r]` is 0), as e4m3 elements
+/// `e4m3(x / scale)` where `e4m3`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Store {
+    page: u64,
+    slot: u64,
+    valid: u64,
+    from: u32,
+    to: u32,
+    page_size: u32,
+    e4m3: bool,
+    scale: f32,
+}
+
+impl Store {
+    const WHOLE: Store = Store {
+        page: 0,
+        slot: 0,
+        valid: 0,
+        from: 0,
+        to: 0,
+        page_size: 0,
+        e4m3: false,
+        scale: 1.0,
+    };
+
+    /// Its words, as `fire` passes them.
+    fn words(self) -> [u64; 6] {
+        [
+            self.page,
+            self.slot,
+            self.valid,
+            u64::from(self.from) | u64::from(self.to) << 32,
+            u64::from(self.page_size) | u64::from(u32::from(self.e4m3)) << 32,
+            u64::from(self.scale.to_bits()),
+        ]
+    }
+}
+
+/// A paged cache's plane as a result lands in it: its rows `cells` of
+/// `width`, each row's page and slot (`page`, `slot`, i32 a row), which rows
+/// are live (`valid`, a byte a row, or 0: every one), the page's rows, and
+/// whether its elements are e4m3 under `scale` (else bf16).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cache {
+    pub base: u64,
+    pub width: u32,
+    pub page: u64,
+    pub slot: u64,
+    pub valid: u64,
+    pub page_size: u32,
+    pub e4m3: Option<f32>,
 }
 
 impl Plane {
@@ -49,6 +108,7 @@ impl Plane {
             ids: 0,
             period: 0,
             bound: t.rows,
+            store: Store::WHOLE,
         }
     }
 
@@ -63,6 +123,7 @@ impl Plane {
             ids: 0,
             period: t.rows.saturating_mul(t.width) / VEC_WIDTH,
             bound: 0,
+            store: Store::WHOLE,
         }
     }
 
@@ -101,6 +162,43 @@ impl Plane {
         Self {
             ids: ids.ptr,
             ..self
+        }
+    }
+
+    /// A result landing the columns `from..from + width` of each of its
+    /// rows (a split's piece) in `t`, its rows `width` wide.
+    #[must_use]
+    pub fn window(t: &Tensor, from: u32, width: u32) -> Self {
+        Self {
+            store: Store {
+                from: from / VEC_WIDTH,
+                to: (from + width) / VEC_WIDTH,
+                ..Store::WHOLE
+            },
+            ..Self::rows(t)
+        }
+    }
+
+    /// A result landing the columns `from..from + width` of each row in
+    /// `cache`'s row its page and slot name.
+    #[must_use]
+    pub fn paged(cache: Cache, from: u32, width: u32) -> Self {
+        Self {
+            base: cache.base,
+            row_stride: i64::from(cache.width),
+            ids: 0,
+            period: 0,
+            bound: 0,
+            store: Store {
+                page: cache.page,
+                slot: cache.slot,
+                valid: cache.valid,
+                from: from / VEC_WIDTH,
+                to: (from + width) / VEC_WIDTH,
+                page_size: cache.page_size,
+                e4m3: cache.e4m3.is_some(),
+                scale: cache.e4m3.unwrap_or(1.0),
+            },
         }
     }
 
@@ -301,6 +399,7 @@ pub(crate) fn fire(
             u64::from(width) | u64::from(skeleton_rows) << 32,
             u64::from(parts) | u64::from(shared.table) << 32,
         ])
+        .chain(outs.iter().flat_map(|p| p.store.words()))
         .collect();
     let threads = block(width, schedule);
     let blocks = skeleton_rows.div_ceil(threads / lanes(width));

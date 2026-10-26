@@ -18,8 +18,8 @@ use cudarc::runtime::sys::{
     cudaError, cudaEvent_t, cudaEventCreate, cudaEventDestroy, cudaEventElapsedTime,
     cudaEventRecordExternal, cudaEventRecordWithFlags, cudaEventSynchronize, cudaFree,
     cudaGetDevice, cudaGetLastError, cudaGraph_t, cudaGraphDestroy, cudaGraphExec_t,
-    cudaGraphExecDestroy, cudaGraphInstantiateWithFlags, cudaGraphLaunch, cudaMalloc,
-    cudaMemsetAsync, cudaStreamBeginCapture, cudaStreamCaptureMode, cudaStreamCaptureStatus,
+    cudaGraphExecDestroy, cudaGraphInstantiateWithFlags, cudaGraphLaunch, cudaMalloc, cudaMemcpy,
+    cudaMemcpyKind, cudaMemsetAsync, cudaStreamBeginCapture, cudaStreamCaptureMode, cudaStreamCaptureStatus,
     cudaStreamCreateWithFlags, cudaStreamDestroy, cudaStreamEndCapture, cudaStreamNonBlocking,
     cudaStreamSynchronize,
 };
@@ -28,7 +28,7 @@ use crate::jit::device::capture_status;
 use crate::jit::{Ctx, refuse};
 use crate::linear::gemv::{gemm_narrow_bf16, gemm_rows_bf16, gemv_bf16, rows_cluster};
 use crate::linear::skeleton::{
-    Epilogue, In, LtEpilogue, MAX_INS, MAX_OUTS, ROWS_M, RowLeg, Skeleton,
+    Epilogue, In, LtEpilogue, MAX_INS, MAX_OUTS, Paging, ROWS_M, RowLeg, Skeleton,
 };
 use crate::linear::skinny;
 
@@ -77,6 +77,8 @@ struct Anchor {
     n_outs: usize,
     leg: Option<RowLeg>,
     inner: Option<Tactic>,
+    /// Where its paged results' cache rows live.
+    paging: Option<Paging>,
 }
 
 impl Anchor {
@@ -291,6 +293,7 @@ pub(crate) fn anchored(
     w: u64,
     ins: &[In],
     outs: &[u64],
+    paging: Option<Paging>,
     m: i32,
     n: i32,
     k: i32,
@@ -304,7 +307,7 @@ pub(crate) fn anchored(
         .filter(|f| f.covers(epi, m, n, k, &tuning))
         .collect();
     if skeletons.is_empty() && epi.lt().is_none() {
-        return unfused(ctx, op, epi, act, w, ins, outs, m, n, k);
+        return unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k);
     }
     let mut anchor = Anchor {
         epi,
@@ -314,6 +317,7 @@ pub(crate) fn anchored(
         n_outs: outs.len(),
         leg: None,
         inner: None,
+        paging,
     };
     anchor.ins[..ins.len()].copy_from_slice(ins);
     anchor.outs[..outs.len()].copy_from_slice(outs);
@@ -441,7 +445,7 @@ pub(crate) fn anchored(
                 epi.lt(),
                 plan.as_deref().and_then(|p| p.heuristics.get(index)),
             ) else {
-                return unfused(ctx, op, epi, act, w, ins, outs, m, n, k);
+                return unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k);
             };
             let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want) {
                 Ok(ws) if !ws.is_null() => (ws, want),
@@ -473,10 +477,10 @@ pub(crate) fn anchored(
                 return Ok(true);
             }
             clear_error();
-            unfused(ctx, op, epi, act, w, ins, outs, m, n, k)
+            unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k)
         }
         Some(Tactic::Skeleton(skeleton)) => {
-            skeleton.fire(ctx, epi, w, act, ins, outs, m, n, k)?;
+            skeleton.fire(ctx, epi, w, act, ins, outs, paging, m, n, k)?;
             Ok(true)
         }
         Some(Tactic::Unfused) => {
@@ -487,10 +491,10 @@ pub(crate) fn anchored(
             let products = ctx.scratch_stream(op, ANCHOR_PRODUCTS, bytes)?.addr() as u64;
             product(ctx, op, epi, act, w, products, m, n * parts, k)?;
             let ins = scaled(ctx, op, epi, act, ins, m.unsigned_abs(), k.unsigned_abs())?;
-            leg.fire(ctx, products, &ins, outs, m.unsigned_abs(), n.unsigned_abs())?;
+            leg.fire(epi, ctx, products, &ins, outs, paging, m.unsigned_abs(), n.unsigned_abs())?;
             Ok(true)
         }
-        _ => unfused(ctx, op, epi, act, w, ins, outs, m, n, k),
+        _ => unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k),
     }
 }
 
@@ -609,6 +613,7 @@ fn unfused(
     w: u64,
     ins: &[In],
     outs: &[u64],
+    paging: Option<Paging>,
     m: i32,
     n: i32,
     k: i32,
@@ -643,7 +648,14 @@ fn unfused(
             .collect();
         let outs: Vec<u64> = (0..outs.len())
             .zip(outs)
-            .map(|(r, &out)| at(out, epi.window(r, n.unsigned_abs()).width as usize))
+            .map(|(r, &out)| {
+                // a cache's rows are its page's and slot's, not the run's
+                if epi.paged(r).is_some() {
+                    out
+                } else {
+                    at(out, epi.window(r, n.unsigned_abs()).width as usize)
+                }
+            })
             .collect();
         let rows_i = i32::try_from(rows).unwrap_or(i32::MAX);
         product(
@@ -667,11 +679,18 @@ fn unfused(
                 k.unsigned_abs(),
             )?;
         }
+        // a paged result's live rows from the run's first
+        let paging = paging.map(|p| Paging {
+            valid: if p.valid == 0 { 0 } else { p.valid + from as u64 },
+            ..p
+        });
         leg.fire(
+            epi,
             ctx,
             products,
             &ins,
             &outs,
+            paging,
             rows_i.unsigned_abs(),
             n.unsigned_abs(),
         )?;
@@ -763,6 +782,7 @@ fn run_tactic(
                     call.act,
                     &[],
                     &[call.y],
+                    None,
                     call.m,
                     call.n,
                     call.k,
@@ -780,6 +800,7 @@ fn run_tactic(
                     call.act,
                     a.ins(),
                     a.outs(),
+                    a.paging,
                     call.m,
                     call.n,
                     call.k,
@@ -828,11 +849,13 @@ fn run_tactic(
                 && scaled
                 && leg
                     .fire(
+                        a.epi,
                         // SAFETY: as above.
                         &unsafe { Ctx::on(stream) }.with_tuning(tuning),
                         call.y,
                         a.ins(),
                         a.outs(),
+                        a.paging,
                         call.m.unsigned_abs(),
                         call.n.unsigned_abs(),
                     )
@@ -1856,6 +1879,10 @@ struct TuneArena {
     workspace_bytes: usize,
     flush: *mut c_void,
     flush_bytes: usize,
+    /// A paged epilogue's rows as the arena lands them: row `r` at page `r`
+    /// and slot 0 of pages one row long (`0..m`, then `m` zeros, i32), so its
+    /// caches are the arena's own tiles.
+    ids: *mut c_void,
     /// The evictions' span alone, timed once.
     alone: std::cell::Cell<Option<f32>>,
 }
@@ -1880,6 +1907,9 @@ impl Drop for TuneArena {
             }
             if !self.y.is_null() {
                 let _ = cudaFree(self.y);
+            }
+            if !self.ids.is_null() {
+                let _ = cudaFree(self.ids);
             }
             if !self.workspace.is_null() {
                 let _ = cudaFree(self.workspace);
@@ -1909,6 +1939,7 @@ impl TuneArena {
             workspace_bytes: 0,
             flush: std::ptr::null_mut(),
             flush_bytes: 0,
+            ids: std::ptr::null_mut(),
             alone: std::cell::Cell::new(None),
         }
     }
@@ -1980,6 +2011,27 @@ impl TuneArena {
             clear_error();
             return false;
         }
+        if call.anchor.is_some_and(|a| a.epi.pages()) {
+            let rows = call.m as usize;
+            let mut ids: Vec<i32> = (0..i32::try_from(rows).unwrap_or(i32::MAX)).collect();
+            ids.extend(std::iter::repeat_n(0, rows));
+            // SAFETY: `ids` is a local out-pointer for a fresh allocation this
+            // arena owns and `Drop` frees, `ids.len()` i32 long, filled from the
+            // host vector before anything reads it.
+            let landed = unsafe {
+                cudaMalloc(&raw mut self.ids, ids.len() * 4) == cudaError::cudaSuccess
+                    && cudaMemcpy(
+                        self.ids,
+                        ids.as_ptr().cast(),
+                        ids.len() * 4,
+                        cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    ) == cudaError::cudaSuccess
+            };
+            if !landed {
+                clear_error();
+                return false;
+            }
+        }
         true
     }
 
@@ -2022,6 +2074,20 @@ impl TuneArena {
                 if input.is_norm() {
                     *input = In::norm().at(scales);
                 }
+            }
+            // A paged result's cache is its tile: row `r` at page `r`, slot 0.
+            if a.epi.pages() {
+                let ids = self.ids.addr() as u64;
+                for k in 0..a.n_outs {
+                    if let Some(paged) = a.epi.paged(k) {
+                        a.ins[paged.page as usize] = In::row(ids).i32();
+                        a.ins[paged.slot as usize] = In::row(ids + call.m as u64 * 4).i32();
+                    }
+                }
+                a.paging = Some(Paging {
+                    valid: 0,
+                    page_size: 1,
+                });
             }
             a
         });

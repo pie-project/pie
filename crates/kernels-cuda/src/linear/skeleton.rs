@@ -33,8 +33,18 @@ use std::sync::{Mutex, OnceLock};
 
 use dtype::Dtype;
 pub use kernels_ir::anchor::{
-    Anchored, Contraction, Gain, Input, Layout, Pointwise, Quant, RowNorm, Window,
+    Anchored, CacheDtype, CachePlane, Contraction, Gain, Input, Layout, Paged, Pointwise, Quant,
+    RowNorm, Window,
 };
+
+/// Where a paged epilogue's cache rows live, past each result's own plane
+/// (a cache's, `outs[k]`): which of the fire's rows are live (`valid`, a
+/// byte a row, or 0: every one) and a page's rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Paging {
+    pub valid: u64,
+    pub page_size: u32,
+}
 use kernels_ir::{Binary, Literal, Op, Region, Shape};
 
 use crate::error::Error;
@@ -218,6 +228,8 @@ pub struct Epilogue {
     /// The operand's rows normed: each row's scale the epilogue's
     /// `Input::Norm`, the skeleton's own.
     norm: Option<RowNorm>,
+    /// Each result's cache, where it lands in one ([`Paged`]).
+    paged: Vec<Option<Paged>>,
 }
 
 /// What cuBLASLt's own epilogues land over one dense bank's products: a
@@ -304,6 +316,7 @@ impl PartialEq for Epilogue {
             && self.fixed == other.fixed
             && self.stored == other.stored
             && self.norm == other.norm
+            && self.paged == other.paged
     }
 }
 
@@ -438,6 +451,7 @@ impl Epilogue {
             fixed,
             stored,
             norm: anchored.norm,
+            paged: anchored.paged.clone(),
         })
     }
 
@@ -554,6 +568,18 @@ impl Epilogue {
         self.body.hash
     }
 
+    /// Result `k`'s cache, where it lands in one.
+    #[must_use]
+    pub fn paged(&self, k: usize) -> Option<Paged> {
+        self.paged.get(k).copied().flatten()
+    }
+
+    /// Whether any result lands in a cache.
+    #[must_use]
+    pub fn pages(&self) -> bool {
+        self.paged.iter().any(Option::is_some)
+    }
+
     /// The norm its operand's rows take, where they are normed.
     #[must_use]
     pub const fn norm(&self) -> Option<RowNorm> {
@@ -585,7 +611,16 @@ impl Epilogue {
     /// The `pie::linear::Epi<IN, OUT>` a fire passes: `ins` (one a region
     /// input, each of its kind) and `outs` (one a result, each `m` rows of
     /// its window of the `n`-column tile, as wide a row).
-    pub(crate) fn planes(&self, ins: &[In], outs: &[u64], n: u32) -> Result<Vec<u64>, Error> {
+    pub(crate) fn planes(
+        &self,
+        ins: &[In],
+        outs: &[u64],
+        n: u32,
+        paging: Option<Paging>,
+    ) -> Result<Vec<u64>, Error> {
+        if self.pages() && paging.is_none() {
+            return Err(refuse(OP, "a paged result fired with no paging"));
+        }
         if ins.len() != self.inputs.len() || outs.len() != self.results {
             return Err(refuse(
                 OP,
@@ -635,6 +670,25 @@ impl Epilogue {
         words.extend(windows.iter().map(|w| u64::from(w.from)));
         words.extend(windows.iter().map(|w| u64::from(w.from + w.width)));
         words.push(u64::from(self.norm.map_or(0, |norm| norm.eps.to_bits())));
+        // Each result's paging: its page and slot inputs, its cache's element.
+        let paged: Vec<Option<Paged>> = (0..outs.len()).map(|k| self.paged(k)).collect();
+        let index = |at: u32| u64::from(at);
+        words.extend(paged.iter().map(|p| p.map_or(u64::MAX, |p| index(p.page))));
+        words.extend(paged.iter().map(|p| p.map_or(u64::MAX, |p| index(p.slot))));
+        words.extend(
+            paged
+                .iter()
+                .map(|p| u64::from(matches!(p, Some(Paged { dtype: CacheDtype::E4m3 { .. }, .. })))),
+        );
+        words.extend(paged.iter().map(|p| match p {
+            Some(Paged {
+                dtype: CacheDtype::E4m3 { scale },
+                ..
+            }) => u64::from(scale.to_bits()),
+            _ => u64::from(1f32.to_bits()),
+        }));
+        words.push(paging.map_or(0, |p| p.valid));
+        words.push(u64::from(paging.map_or(0, |p| p.page_size)));
         Ok(words)
     }
 
@@ -669,6 +723,21 @@ impl Epilogue {
         Ok(())
     }
 
+    /// Compiles the unfused leg's row kernels of this body over `n` columns
+    /// (or reads them from the disk cache) and loads them on the current
+    /// device: an epilogue over a product landed apart runs on them alone.
+    pub fn load_leg(&self, n: u32) -> Result<(), Error> {
+        #[cfg(feature = "cuda")]
+        if RowLeg::of(self, n).is_none() {
+            return Err(refuse(
+                OP,
+                format!("the unfused leg's row kernel over {n} columns did not load"),
+            ));
+        }
+        let _ = n;
+        Ok(())
+    }
+
     /// The row skeleton's pieces of a row for this body's unfused leg over
     /// `n` columns, or `None` where the row skeleton does not carry it: a row
     /// in no whole runs of eight, a tile its body is not of, or a region it
@@ -700,37 +769,34 @@ impl Epilogue {
                     }),
             )
             .collect();
-        // Each window (the whole tile, or each result's), cut into slices of
-        // equal width the row skeleton holds, whole groups of the span:
-        // `(from, width, outs)`.
-        let segments: Vec<Cut> = if self.windows.is_empty() {
-            vec![(0, n, (0..self.results).map(|k| (k, 0, n)).collect())]
-        } else {
-            (0..self.results)
-                .map(|k| {
-                    let w = self.windows[k];
-                    (w.from, w.width, vec![(k, 0, w.width)])
-                })
-                .collect()
-        };
+        // The row cut into slices of equal width the row skeleton holds,
+        // whole groups of the span; each slice computes every result and
+        // lands the part of each result's window it holds.
         let span = self.span.max(1);
-        let mut pieces: Vec<Cut> = Vec::new();
-        for (from, wide, outs) in segments {
-            let slices = (wide.div_ceil(MAX_WIDTH)..=wide / 8).find(|c| {
-                wide.is_multiple_of(*c)
-                    && (wide / c).is_multiple_of(8)
-                    && (wide / c).is_multiple_of(span)
-            })?;
-            let width = wide / slices;
-            for s in 0..slices {
-                let at = s * width;
-                let landed = outs.iter().map(|&(k, col, ld)| (k, col + at, ld)).collect();
-                pieces.push((from + at, width, landed));
+        let slices = (n.div_ceil(MAX_WIDTH)..=n / 8).find(|c| {
+            n.is_multiple_of(*c) && (n / c).is_multiple_of(8) && (n / c).is_multiple_of(span)
+        })?;
+        let width = n / slices;
+        let mut shaped = Vec::with_capacity(slices as usize);
+        for piece in 0..slices {
+            let from = piece * width;
+            let outs: Vec<Land> = (0..self.results)
+                .filter_map(|k| {
+                    let w = self.window(k, n);
+                    let (lo, hi) = (w.from.max(from), (w.from + w.width).min(from + width));
+                    (lo < hi).then_some(Land {
+                        k,
+                        from: lo - from,
+                        to: hi - from,
+                        at: lo - w.from,
+                        ld: w.width,
+                    })
+                })
+                .collect();
+            if outs.is_empty() {
+                continue;
             }
-        }
-        let mut shaped = Vec::with_capacity(pieces.len());
-        for (from, width, outs) in pieces {
-            let results: Vec<u32> = outs.iter().map(|(k, ..)| self.region.results[*k]).collect();
+            let results: Vec<u32> = outs.iter().map(|o| self.region.results[o.k]).collect();
             let region = shifted(&self.region, from, width, results);
             let landed = vec![Out::Rows(bf16); outs.len()];
             crate::synth::supports(&region, &ins, &landed).ok()?;
@@ -778,7 +844,9 @@ pub fn serves(anchored: &Anchored, ins: &[Dtype], outs: &[Dtype]) -> Result<(), 
         ));
     }
     let epi = Epilogue::interned_stored(anchored, ins)?;
-    if ins.len() != planes_of(anchored) || outs.len() != epi.results {
+    // a paged result's plane is its cache's, no value of the op's
+    let planed = (0..epi.results).filter(|k| epi.paged(*k).is_none()).count();
+    if ins.len() != planes_of(anchored) || outs.len() != planed {
         return Err(refuse(
             OP,
             "the planes given are not the epilogue's inputs and results",
@@ -797,11 +865,6 @@ pub fn serves(anchored: &Anchored, ins: &[Dtype], outs: &[Dtype]) -> Result<(), 
     Ok(())
 }
 
-/// A run of the tile's columns, `(from, width, outs)`: each result `(k,
-/// at, ld)` of `outs` landed from its plane's column `at`, its rows `ld`
-/// apart.
-type Cut = (u32, u32, Vec<(usize, u32, u32)>);
-
 /// The planes `anchored`'s epilogue reads: one an input but a row's norm
 /// scale, the contraction's own.
 fn planes_of(anchored: &Anchored) -> usize {
@@ -819,14 +882,26 @@ struct LegShape {
 }
 
 /// One piece of a leg: the region over the tile's columns `from..from +
-/// width`, landing each result `k` of `outs` into its plane from that
-/// plane's column `at`, its rows `ld` apart: `(k, at, ld)`.
+/// width`, landing each result of `outs`.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct PieceShape {
     region: Region,
     from: u32,
     width: u32,
-    outs: Vec<(usize, u32, u32)>,
+    outs: Vec<Land>,
+}
+
+/// What a leg's piece lands of result `k`: the piece's columns `from..to`,
+/// at its plane's column `at` (the window's own), its plane's rows `ld`
+/// wide (the window's width).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct Land {
+    k: usize,
+    from: u32,
+    to: u32,
+    at: u32,
+    ld: u32,
 }
 
 /// `region` over the `width` columns from `from` on, as a row of its own,
@@ -983,6 +1058,11 @@ impl Skeleton {
         match self {
             Skeleton::Gemv => m == 1 && epi.span == 1,
             Skeleton::Rows => epi.parts == 1 && m <= ROWS_M as i32 && epi.span == 1,
+            // a sum across the whole row is the row skeleton's alone (the
+            // unfused leg's): a tile hook offers no row reduction
+            Skeleton::Skinny if epi.region.ops.iter().any(|op| matches!(op, Op::Reduce(..))) => {
+                false
+            }
             Skeleton::Skinny => crate::linear::skinny::covers_span(
                 m,
                 n,
@@ -1031,6 +1111,7 @@ impl Skeleton {
         act: u64,
         ins: &[In],
         outs: &[u64],
+        paging: Option<Paging>,
         m: i32,
         n: i32,
         k: i32,
@@ -1042,7 +1123,7 @@ impl Skeleton {
                     if m != 1 {
                         return Err(refuse(OP, format!("the gemv serves one row, not {m}")));
                     }
-                    crate::linear::gemv::gemv(ctx, epi, w, act, ins, outs, n, k)
+                    crate::linear::gemv::gemv(ctx, epi, w, act, ins, outs, paging, n, k)
                 }
                 Skeleton::Rows => crate::linear::gemv::gemm_rows(
                     ctx,
@@ -1051,19 +1132,20 @@ impl Skeleton {
                     act,
                     ins,
                     outs,
+                    paging,
                     m,
                     n,
                     k,
                     ctx.tuning().pdl,
                 ),
                 Skeleton::Skinny => {
-                    crate::linear::skinny::skinny(ctx, epi, w, act, ins, outs, m, n, k)
+                    crate::linear::skinny::skinny(ctx, epi, w, act, ins, outs, paging, m, n, k)
                 }
             }
         }
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = (ctx, epi, w, act, ins, outs, m, n, k);
+            let _ = (ctx, epi, w, act, ins, outs, paging, m, n, k);
             Err(crate::jit::runtimeless(OP))
         }
     }
@@ -1085,15 +1167,14 @@ pub(crate) struct RowLeg {
 }
 
 /// One launch of a leg: the kernel over the tile's columns `from..from +
-/// width`, landing each result `(k, at, ld)` of `outs` from its plane's
-/// column `at`, its rows `ld` apart.
+/// width`, landing each result of `outs` ([`Land`]).
 #[cfg(feature = "cuda")]
 #[derive(Clone, Debug)]
 struct Piece {
     kernel: crate::synth::Synthesized,
     from: u32,
     width: u32,
-    outs: Vec<(usize, u32, u32)>,
+    outs: Vec<Land>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1139,13 +1220,17 @@ impl RowLeg {
     }
 
     /// The epilogue over `products` (`m x parts · n`, the plain product of
-    /// the packed bank), `ins` its inputs and `outs` its results.
+    /// the packed bank), `ins` its inputs and `outs` its results (a paged
+    /// one's its cache's plane, `paging` where its rows live).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fire(
         self,
+        epi: &Epilogue,
         ctx: &crate::jit::Ctx,
         products: u64,
         ins: &[In],
         outs: &[u64],
+        paging: Option<Paging>,
         m: u32,
         n: u32,
     ) -> Result<(), Error> {
@@ -1191,11 +1276,39 @@ impl RowLeg {
                     Input::One => Plane::shared(&Tensor::new(input.base, 1, piece.width, dtype)),
                 });
             }
-            let results: Vec<Plane> = piece
-                .outs
-                .iter()
-                .map(|&(k, col, ld)| rows(outs[k] + u64::from(col) * 2, ld))
-                .collect();
+            let mut results: Vec<Plane> = Vec::with_capacity(piece.outs.len());
+            for land in &piece.outs {
+                let width = land.to - land.from;
+                results.push(match epi.paged(land.k) {
+                    None => Plane::window(
+                        &Tensor::new(outs[land.k] + u64::from(land.at) * 2, m, land.ld, Dtype::Bf16),
+                        land.from,
+                        width,
+                    ),
+                    Some(paged) => {
+                        let Some(paging) = paging else {
+                            return Err(refuse(OP, "a paged result fired with no paging"));
+                        };
+                        let (e4m3, bytes) = match paged.dtype {
+                            CacheDtype::Bf16 => (None, 2),
+                            CacheDtype::E4m3 { scale } => (Some(scale), 1),
+                        };
+                        Plane::paged(
+                            crate::elemwise::skeleton::Cache {
+                                base: outs[land.k] + u64::from(land.at) * bytes,
+                                width: land.ld,
+                                page: ins[paged.page as usize].base(),
+                                slot: ins[paged.slot as usize].base(),
+                                valid: paging.valid,
+                                page_size: paging.page_size,
+                                e4m3,
+                            },
+                            land.from,
+                            width,
+                        )
+                    }
+                });
+            }
             fired = piece.kernel.fire(ctx, &planes, &results, m);
             if fired.is_err() {
                 break;
@@ -1302,18 +1415,21 @@ mod tests {
             },
             vec![Input::Column],
         );
-        assert!(bias.planes(&[In::row(64)], &[128], 8).is_err());
-        assert!(bias.planes(&[], &[128], 8).is_err());
-        let words = bias.planes(&[In::column(64)], &[128], 8).expect("a bias");
+        assert!(bias.planes(&[In::row(64)], &[128], 8, None).is_err());
+        assert!(bias.planes(&[], &[128], 8, None).is_err());
+        let words = bias.planes(&[In::column(64)], &[128], 8, None).expect("a bias");
         // One input (its base, strides, dtype and period), one unread, one
         // result, its row's stride and its window's columns, then the norm's
         // eps (none).
-        assert_eq!(words, vec![64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0, 8, 0]);
+        assert_eq!(words, vec![
+                64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0, 8, 0,
+                u64::MAX, u64::MAX, 0, 0x3f80_0000, 0, 0
+            ]);
         // A row's norm scale is no plane: its input carries none.
         assert_eq!(In::norm().kind(), Input::Norm);
         // A head's weight and a row's i32 position, each of its kind.
         assert_eq!(In::head(64, 32).kind(), Input::Head(32));
         assert_eq!(In::row(64).i32().dtype(), Dtype::I32);
-        assert!(bias.planes(&[In::column(64).i32()], &[128], 8).is_err());
+        assert!(bias.planes(&[In::column(64).i32()], &[128], 8, None).is_err());
     }
 }

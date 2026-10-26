@@ -13,6 +13,7 @@ mod skeleton;
 mod synth;
 mod synth_embed;
 mod synth_modulate;
+mod synth_paged;
 mod synth_rope;
 mod synth_rules;
 pub(crate) mod within;

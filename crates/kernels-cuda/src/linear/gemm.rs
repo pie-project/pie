@@ -5,7 +5,7 @@
 use crate::error::Error;
 
 use crate::jit::{Ctx, count, dtype_dispatch, stated};
-use crate::linear::skeleton::{Epilogue, In};
+use crate::linear::skeleton::{Epilogue, In, Paging};
 use crate::tensor::Tensor;
 
 use dtype::Dtype;
@@ -61,6 +61,7 @@ pub fn matmul_f32(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(
 /// untimed) runs that unfused leg. False, landing nothing, only where the
 /// row skeleton does not carry the leg either ([`crate::linear::skeleton::serves`]
 /// says which do): the caller's unfused ops serve it then.
+#[allow(clippy::too_many_arguments)]
 pub fn anchored(
     ctx: &Ctx,
     op: &'static str,
@@ -69,6 +70,7 @@ pub fn anchored(
     w: Tensor,
     ins: &[In],
     outs: &[Tensor],
+    paging: Option<Paging>,
 ) -> Result<bool, Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
     dtype_dispatch!(op, w.dtype, { Bf16 => () });
@@ -79,8 +81,19 @@ pub fn anchored(
     let n = count(op, "the columns this projection lands", tile)?;
     let k = count(op, "the contraction this projection walks", act.width)?;
     // Each result its window of the tile (every column, or a split's piece).
-    let shaped = (0..outs.len()).zip(outs).all(|(at, y)| {
-        y.dtype == Dtype::Bf16 && y.width == epi.window(at, tile).width && y.rows == act.rows
+    // A paged result's plane is its cache's: rows its pages hold, its
+    // elements the cache's.
+    let shaped = (0..outs.len()).zip(outs).all(|(at, y)| match epi.paged(at) {
+        None => {
+            y.dtype == Dtype::Bf16 && y.width == epi.window(at, tile).width && y.rows == act.rows
+        }
+        Some(paged) => {
+            let element = match paged.dtype {
+                crate::linear::skeleton::CacheDtype::Bf16 => Dtype::Bf16,
+                crate::linear::skeleton::CacheDtype::E4m3 { .. } => Dtype::E4m3,
+            };
+            y.dtype == element && y.width == epi.window(at, tile).width && paging.is_some()
+        }
     });
     if !shaped || w.width != act.width || w.rows != tile * epi.parts() || !epi.fits(tile) {
         return Err(crate::jit::refuse(
@@ -101,11 +114,58 @@ pub fn anchored(
     #[cfg(feature = "cuda")]
     {
         let planes: Vec<u64> = outs.iter().map(|y| y.ptr).collect();
-        cublas::anchored(ctx, op, epi, act.ptr, w.ptr, ins, &planes, m, n, k)
+        cublas::anchored(ctx, op, epi, act.ptr, w.ptr, ins, &planes, paging, m, n, k)
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (ins, m, n, k);
+        let _ = (ins, paging, m, n, k);
+        Err(crate::jit::runtimeless(op))
+    }
+}
+
+/// `outs = epi(y)`: an anchored region's epilogue over a product its own op
+/// landed (`y`, bf16, `parts · n` wide), on the row skeleton (the region's
+/// unfused leg, every piece of the row), `ins` its inputs and `outs` its
+/// results (a paged one's its cache's plane, `paging` where its rows
+/// live). False, landing nothing, where the row skeleton does not carry the
+/// epilogue.
+pub fn epilogue(
+    ctx: &Ctx,
+    op: &'static str,
+    epi: &'static Epilogue,
+    y: Tensor,
+    ins: &[In],
+    outs: &[Tensor],
+    paging: Option<Paging>,
+) -> Result<bool, Error> {
+    dtype_dispatch!(op, y.dtype, { Bf16 => () });
+    let parts = epi.parts().max(1);
+    let tile = y.width / parts;
+    if y.width != tile * parts || !epi.rounds() || epi.norm().is_some() {
+        return Err(crate::jit::refuse(
+            op,
+            "an epilogue over a landed product reads its bf16 parts as stored, unnormed",
+        ));
+    }
+    if epi.pages() && paging.is_none() {
+        return Err(crate::jit::refuse(op, "a paged result fired with no paging"));
+    }
+    if y.rows == 0 {
+        return Ok(true);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let Some(leg) = crate::linear::skeleton::RowLeg::of(epi, tile) else {
+            return Ok(false);
+        };
+        let m = ctx.opaque_rows(stated(op, y.rows)?);
+        let planes: Vec<u64> = outs.iter().map(|t| t.ptr).collect();
+        leg.fire(epi, ctx, y.ptr, ins, &planes, paging, m.unsigned_abs(), tile)?;
+        Ok(true)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (ins, outs, paging);
         Err(crate::jit::runtimeless(op))
     }
 }

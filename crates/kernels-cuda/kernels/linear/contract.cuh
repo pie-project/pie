@@ -32,6 +32,7 @@
 #include "prim/smem.cuh"
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
+#include <cuda_fp8.h>
 
 namespace pie::linear {
 
@@ -72,6 +73,16 @@ struct Epi {
     // A normed operand's `eps` (an f32's bits): its row's scale
     // `rsqrt(Σ a² / K + eps)`, where the skeleton norms (`NORM`).
     long long eps;
+    // A paged result's page and slot inputs (-1: not paged): its rows land
+    // at the cache row `page * page_size + slot` (none where the slot lies
+    // past the page or `valid[row]` is 0), as e4m3 where `e4m3` (each
+    // element `e4m3(x / scale)`, the scale an f32's bits).
+    long long page[OUT];
+    long long slot[OUT];
+    long long e4m3[OUT];
+    long long scale[OUT];
+    const unsigned char* valid;
+    long long page_size;
 };
 
 // The scale of an operand row whose squares sum to `ss` over `K`.
@@ -138,6 +149,32 @@ struct TileHook {
 
     __device__ __forceinline__ float round_bf16(float v) const { return bf16_to_f32(f32_to_bf16(v)); }
 
+    // Paged result `K`'s elements of its window to its cache row.
+    template <int K>
+    __device__ __forceinline__ void flush_paged() {
+        const long long from = epi.from[K];
+        const long long to = epi.to[K];
+        const int page = static_cast<int>(epi_ld(epi.in[epi.page[K]], row, 0));
+        const int slot = static_cast<int>(epi_ld(epi.in[epi.slot[K]], row, 0));
+        if (slot < 0 || slot >= epi.page_size || page < 0) return;
+        if (epi.valid != nullptr && epi.valid[row] == 0) return;
+        const long long cell = static_cast<long long>(page) * epi.page_size + slot;
+        const long long at = cell * epi.ld[K] + (col_ - from);
+        const bool fp8 = epi.e4m3[K] != 0;
+        const float scale = __int_as_float(static_cast<int>(epi.scale[K]));
+#pragma unroll
+        for (int e = 0; e < kN; ++e) {
+            const long long c = col_ + e;
+            if (!valid(e) || c < from || c >= to) continue;
+            if (fp8) {
+                reinterpret_cast<__nv_fp8_e4m3*>(epi.out[K])[at + e] =
+                    __nv_fp8_e4m3(bf16_to_f32(res[K][e]) / scale);
+            } else {
+                epi.out[K][at + e] = res[K][e];
+            }
+        }
+    }
+
     // Result `K`'s elements of its window to memory: whole vectors of 8
     // where the skeleton holds them (its columns, windows and `ld` whole
     // eights, its planes 16-byte aligned), else one by one.
@@ -145,6 +182,10 @@ struct TileHook {
     __device__ __forceinline__ void flush() {
         const long long from = epi.from[K];
         const long long to = epi.to[K];
+        if (epi.page[K] >= 0) {
+            flush_paged<K>();
+            return;
+        }
         bf16* dst = epi.out[K] + row * epi.ld[K] + (col_ - from);
         if constexpr (kN % 8 == 0) {
 #pragma unroll

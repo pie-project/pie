@@ -263,7 +263,7 @@ fn each_skeleton_lands_each_epilogue_as_the_interpreter() {
             let ctx = gpu.ctx();
             let fire = || {
                 skeleton
-                    .fire(&ctx, epi, w, act, &ins, &outs, m as i32, n as i32, k as i32)
+                    .fire(&ctx, epi, w, act, &ins, &outs, None, m as i32, n as i32, k as i32)
                     .unwrap_or_else(|e| panic!("{what} fires: {e:?}"));
             };
             fire();
@@ -335,7 +335,7 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
         // Twice: the first call times the shape's candidates, the second
         // fires the pick.
         for _ in 0..2 {
-            let served = gemm::anchored(&ctx, "test.anchored", epi, a, wt, &[], &[yt])
+            let served = gemm::anchored(&ctx, "test.anchored", epi, a, wt, &[], &[yt], None)
                 .unwrap_or_else(|e| panic!("{what} fires: {e:?}"));
             assert!(served, "{what} is served");
         }
@@ -376,6 +376,7 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
         wt,
         &[In::row(s)],
         &[yt],
+        None,
     );
     assert_eq!(served.ok(), Some(true), "the leg serves {m} rows");
     gpu.sync();
@@ -395,6 +396,7 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
         t(w, 4, k, Bf16),
         &[In::row(s)],
         &[t(y, m, 4, Bf16)],
+        None,
     );
     assert_eq!(
         served.ok(),
@@ -547,6 +549,7 @@ fn cublaslts_own_epilogue_lands_the_anchored_region() {
                         t(w, n, k, Bf16),
                         &ins,
                         &[t(y2, m, n, Bf16)],
+                        None,
                     )
                     .unwrap_or_else(|e| panic!("{what}: {e:?}"));
                     assert!(served, "{what}");
@@ -729,6 +732,7 @@ fn a_heads_norm_and_turn_lands_its_windows_as_the_interpreter() {
                         t(w, n, k, Bf16),
                         &ins,
                         &landed,
+                        None,
                     )
                     .unwrap_or_else(|e| panic!("{what} fires: {e:?}"));
                     assert!(served, "{what}: served at {rows} rows");
@@ -741,6 +745,7 @@ fn a_heads_norm_and_turn_lands_its_windows_as_the_interpreter() {
                             act,
                             &ins,
                             &outs,
+                            None,
                             rows as i32,
                             n as i32,
                             k as i32,
@@ -814,6 +819,7 @@ fn a_turned_row_past_the_row_skeletons_width_lands_on_its_slices() {
             t(w, n, k, Bf16),
             &ins,
             &[t(y, m, n, Bf16)],
+            None,
         )
         .unwrap_or_else(|e| panic!("{e:?}"));
         assert!(served);
@@ -883,7 +889,7 @@ fn a_normed_operand_lands_its_scaled_products_as_the_interpreter() {
             let y = gpu.zeros(m * n * 2);
             let ins = [In::norm(), In::tile(res, n as u32)];
             skeleton
-                .fire(&ctx, epi, w, act, &ins, &[y], m as i32, n as i32, k as i32)
+                .fire(&ctx, epi, w, act, &ins, &[y], None, m as i32, n as i32, k as i32)
                 .unwrap_or_else(|e| panic!("{what} fires: {e:?}"));
             gpu.sync();
             let want = eval(&a, m, &av, &folded, &[], &[Given::Tile(rv.clone())]).expect("runs");
@@ -904,6 +910,7 @@ fn a_normed_operand_lands_its_scaled_products_as_the_interpreter() {
                         t(w, n, k, Bf16),
                         &ins,
                         &[t(y, rows, n, Bf16)],
+                        None,
                     )
                     .unwrap_or_else(|e| panic!("{what}: {e:?}"));
                     assert!(served);
@@ -996,6 +1003,7 @@ fn a_normed_operands_heads_land_their_windows_as_the_interpreter() {
                 t(w, n, k, Bf16),
                 &ins,
                 &landed,
+                None,
             )
             .unwrap_or_else(|e| panic!("{rows} rows: {e:?}"));
             assert!(served);
@@ -1011,5 +1019,209 @@ fn a_normed_operands_heads_land_their_windows_as_the_interpreter() {
                 TURNED,
             );
         }
+    }
+}
+
+/// A packed qkv product's q and k turned, q landing its window and k and v
+/// each their cache's rows: each row at `page · page_size + slot`, none
+/// where its slot lies past its page or the row is not live, as the cache
+/// stores its elements (bf16, or e4m3 under a scale). On the skinny skeleton
+/// and through the tuner's entry (a prefill's rows past the skinny's on the
+/// leg, one launch landing every window and cache), as the interpreter
+/// lands it: q within the turn's tolerance, a cached element within one of
+/// its own places of the interpreter's rounding of its value.
+#[test]
+fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
+    use kernels_cuda::linear::skeleton::{CacheDtype, CachePlane, Paged, Paging};
+    use kernels_ir::anchor::{Window, paged_rows};
+    use kernels_ir::build::{Ops, Pairs, Turn};
+    let (qh, kvh, hd, k) = (4usize, 2usize, 64usize, 256usize);
+    let (q, kv) = (qh * hd, kvh * hd);
+    let n = q + 2 * kv;
+    let anchored = |dtype: CacheDtype| {
+        let mut b = Ops::new(4);
+        let turn = Turn {
+            head_dim: hd as u32,
+            pairs: Pairs::Halves {
+                rotary: hd as u32,
+                span: hd as u32 / 2,
+            },
+            theta: 10000.0,
+            inverse: false,
+            ramp: None,
+        };
+        let turned = b.rotate(0, 1, &turn);
+        let paged = |plane| {
+            Some(Paged {
+                plane,
+                dtype,
+                page: 1,
+                slot: 2,
+            })
+        };
+        Anchored {
+            epilogue: Some(Pointwise {
+                region: Region {
+                    width: n as u32,
+                    params: vec![Shape::Row, Shape::Scalar, Shape::Scalar, Shape::Scalar],
+                    ops: b.ops,
+                    results: vec![turned, turned, 0],
+                    rounds: vec![(turned, Bf16)],
+                },
+                inputs: vec![Input::Row, Input::Row, Input::Row],
+            }),
+            windows: vec![
+                Window {
+                    from: 0,
+                    width: q as u32,
+                },
+                Window {
+                    from: q as u32,
+                    width: kv as u32,
+                },
+                Window {
+                    from: (q + kv) as u32,
+                    width: kv as u32,
+                },
+            ],
+            paged: vec![None, paged(CachePlane::Keys), paged(CachePlane::Values)],
+            ..Anchored::plain(contraction(n, k, Layout::Dense, None))
+        }
+    };
+    let page_size = 4u32;
+    for dtype in [CacheDtype::Bf16, CacheDtype::E4m3 { scale: 0.25 }] {
+        let a = anchored(dtype);
+        assert_eq!(a.verify(), Ok(()));
+        let stored = [Dtype::I32; 3];
+        let epi = Epilogue::interned_stored(&a, &stored).expect("the skeletons take it");
+        for (rows, through) in [(5usize, false), (64, false), (5, true), (100, true)] {
+            let what = format!("{dtype:?}, {rows} rows through the tuner {through}");
+            let mut gpu = Gpu::open();
+            let mut lcg = Lcg::seeded(rows as u64 + 11);
+            let ((wr, wv), (ar, av)) = (lcg.row(n * k), lcg.row(rows * k));
+            let (w, act) = (gpu.up(&wr), gpu.up(&ar));
+            let pos: Vec<i32> = (0..rows).map(|r| (r * 37 % 1000) as i32).collect();
+            // every cache row once, a few rows past a page or not live
+            let cells = rows as u32 + 8;
+            let page: Vec<i32> = (0..rows).map(|r| ((r as u32 * 7) % cells / page_size) as i32).collect();
+            let mut slot: Vec<i32> = (0..rows).map(|r| ((r as u32 * 7) % cells % page_size) as i32).collect();
+            slot[rows / 2] = page_size as i32;
+            let valid: Vec<u8> = (0..rows).map(|r| u8::from(r % 9 != 4)).collect();
+            let (pg, sl, va, ps) = (gpu.up(&page), gpu.up(&slot), gpu.up(&valid), gpu.up(&pos));
+            let bytes = match dtype {
+                CacheDtype::Bf16 => 2,
+                CacheDtype::E4m3 { .. } => 1,
+            };
+            let pages_cells = (cells.div_ceil(page_size) * page_size) as usize;
+            let (qo, keys, values) = (
+                gpu.zeros(rows * q * 2),
+                gpu.zeros(pages_cells * kv * bytes),
+                gpu.zeros(pages_cells * kv * bytes),
+            );
+            let ins = [In::row(ps).i32(), In::row(pg).i32(), In::row(sl).i32()];
+            let paging = Some(Paging {
+                valid: va,
+                page_size,
+            });
+            let ctx = gpu.ctx();
+            let element = match dtype {
+                CacheDtype::Bf16 => Bf16,
+                CacheDtype::E4m3 { .. } => Dtype::E4m3,
+            };
+            for _ in 0..2 {
+                if through {
+                    let landed = [
+                        t(qo, rows, q, Bf16),
+                        t(keys, pages_cells, kv, element),
+                        t(values, pages_cells, kv, element),
+                    ];
+                    let served = gemm::anchored(
+                        &ctx,
+                        "test.paged",
+                        epi,
+                        t(act, rows, k, Bf16),
+                        t(w, n, k, Bf16),
+                        &ins,
+                        &landed,
+                        paging,
+                    )
+                    .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                    assert!(served, "{what}");
+                } else {
+                    Skeleton::Skinny
+                        .fire(
+                            &ctx,
+                            epi,
+                            w,
+                            act,
+                            &ins,
+                            &[qo, keys, values],
+                            paging,
+                            rows as i32,
+                            n as i32,
+                            k as i32,
+                        )
+                        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                }
+            }
+            gpu.sync();
+            let given = [
+                Given::Row(pos.iter().map(|&p| p as f32).collect()),
+                Given::Row(page.iter().map(|&p| p as f32).collect()),
+                Given::Row(slot.iter().map(|&p| p as f32).collect()),
+            ];
+            let want = eval(&a, rows, &av, &wv, &[], &given).expect("runs");
+            let want_q: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
+            assert_within(&format!("{what}: q"), &gpu.down::<u16>(qo, rows * q), &want_q, TURNED);
+            for (r, plane) in [(1usize, keys), (2, values)] {
+                let at = paged_rows(&a, r, &given, page_size).expect("paged");
+                let landed: Vec<f32> = match dtype {
+                    CacheDtype::Bf16 => gpu
+                        .down::<u16>(plane, pages_cells * kv)
+                        .iter()
+                        .map(|&b| crate::common::from_bf16(b))
+                        .collect(),
+                    CacheDtype::E4m3 { .. } => gpu
+                        .down::<u8>(plane, pages_cells * kv)
+                        .iter()
+                        .map(|&b| e4m3_of(b))
+                        .collect(),
+                };
+                for cell in 0..pages_cells {
+                    let row = (0..rows).find(|&m| valid[m] != 0 && at[m] == Some(cell as u64));
+                    for c in 0..kv {
+                        let got = landed[cell * kv + c];
+                        let Some(m) = row else {
+                            assert_eq!(got, 0.0, "{what}: cell {cell} landed nothing");
+                            continue;
+                        };
+                        let want = want[r][m * kv + c];
+                        // within one of the cache's places of the
+                        // interpreter's rounding, where the f32s are within
+                        // the turn's tolerance
+                        let place = match dtype {
+                            CacheDtype::Bf16 => 2f32.powi(want.abs().max(0.5).log2().floor() as i32 - 7) * TURNED,
+                            CacheDtype::E4m3 { .. } => 2f32.powi(want.abs().max(2f32.powi(-6)).log2().floor() as i32 - 3),
+                        };
+                        assert!(
+                            (got - want).abs() <= place,
+                            "{what}: result {r} cell {cell} column {c}: {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An e4m3 byte's value.
+fn e4m3_of(byte: u8) -> f32 {
+    let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
+    let exponent = i32::from((byte >> 3) & 0xf);
+    let mantissa = f32::from(byte & 7);
+    sign * if exponent == 0 {
+        mantissa * 2f32.powi(-9)
+    } else {
+        (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
     }
 }

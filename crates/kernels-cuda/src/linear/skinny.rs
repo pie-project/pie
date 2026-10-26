@@ -9,7 +9,7 @@
 
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Kernel, Launch, aligned16, refuse};
-use crate::linear::skeleton::{Epilogue, In};
+use crate::linear::skeleton::{Epilogue, In, Paging};
 
 pub const ROWS: u32 = 64;
 
@@ -85,6 +85,7 @@ pub fn skinny(
     act: u64,
     ins: &[In],
     outs: &[u64],
+    paging: Option<Paging>,
     m: i32,
     n: i32,
     k: i32,
@@ -116,7 +117,7 @@ pub fn skinny(
             ));
         }
     }
-    let planes = epi.planes(ins, outs, n.unsigned_abs())?;
+    let planes = epi.planes(ins, outs, n.unsigned_abs(), paging)?;
     let (warps, step) = shape(span, parts).unwrap_or((WARPS, STEP));
     ctx.fire(
         OP,

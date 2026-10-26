@@ -1,7 +1,7 @@
 use crate::error::Error;
 
 use crate::jit::{ArgValue, Ctx, Fire, Kernel, Launch, aligned16, kernel, refuse};
-use crate::linear::skeleton::{Epilogue, In};
+use crate::linear::skeleton::{Epilogue, In, Paging};
 
 const GEMV: &str = "linear/gemv.cu";
 
@@ -15,7 +15,7 @@ pub(crate) fn gemv_bf16(
     n: i32,
     k: i32,
 ) -> Result<(), Error> {
-    gemv(ctx, Epilogue::store(), weight, act, &[], &[out], n, k)
+    gemv(ctx, Epilogue::store(), weight, act, &[], &[out], None, n, k)
 }
 
 /// The gemv skeleton's kernel for `epi` over `n` columns, and whether it splits
@@ -49,6 +49,7 @@ pub fn gemv(
     act: u64,
     ins: &[In],
     outs: &[u64],
+    paging: Option<Paging>,
     n: i32,
     k: i32,
 ) -> Result<(), Error> {
@@ -69,7 +70,7 @@ pub fn gemv(
             ));
         }
     }
-    let planes = epi.planes(ins, outs, n.unsigned_abs())?;
+    let planes = epi.planes(ins, outs, n.unsigned_abs(), paging)?;
     let tuning = ctx.tuning();
     let (kernel, split, warps) = gemv_kernel(epi, n, &tuning);
     let grid = if split {
@@ -153,6 +154,7 @@ pub fn gemm_rows_bf16(
         act,
         &[],
         &[out],
+        None,
         m,
         n,
         k,
@@ -173,6 +175,7 @@ pub fn gemm_rows(
     act: u64,
     ins: &[In],
     outs: &[u64],
+    paging: Option<Paging>,
     m: i32,
     n: i32,
     k: i32,
@@ -196,7 +199,7 @@ pub fn gemm_rows(
             "the weight and the activation are 16-byte aligned, and nothing is null",
         ));
     }
-    let planes = epi.planes(ins, outs, n.unsigned_abs())?;
+    let planes = epi.planes(ins, outs, n.unsigned_abs(), paging)?;
     let (kernel, blocks, cl) = rows_kernel(epi, m, n, k);
     ctx.fire(
         OP,
