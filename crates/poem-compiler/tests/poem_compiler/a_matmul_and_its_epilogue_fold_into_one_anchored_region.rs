@@ -624,3 +624,58 @@ fn a_gated_qs_windows_land_its_norms_and_partial_turn() {
         }
     }
 }
+
+/// DeepSeek's kv row (512 columns, RMS-normed, its last 64 turned in
+/// interleaved pairs) appended to a cache of its block-scaled rows (a u8
+/// plane a row of the format's bytes, the trace's declared format): its
+/// product's epilogue pages it as kernels-ir's `BlockRows` of that format.
+#[test]
+fn a_kv_row_appended_to_deepseeks_rows_pages_their_blocks() {
+    use kernels_ir::CacheDtype;
+    use poem_compiler::fuse::anchor::block_rows;
+    use poem_ir::{KvRows, Turn};
+    const KV: u32 = 512;
+    for format in [KvRows::V4, KvRows::Mx8, KvRows::Nv4] {
+        assert_eq!(u64::from(block_rows(format).row_bytes()), format.bytes());
+        let mut t = trace(|p| {
+            let kv = linear::matmul(&p.rows("x", K), &p.weight("wkv", [u64::from(KV), K]));
+            let kv = elemwise::rmsnorm(&kv, &p.weight("kv_norm", [u64::from(KV)]), 1e-6);
+            let (kv, _) = elemwise::rope(
+                &kv,
+                &p.indices("positions"),
+                KV,
+                1e4,
+                Turn::Last {
+                    rotary_dim: 64,
+                    interleaved: true,
+                    inverse: false,
+                    yarn: None,
+                },
+                None,
+                None,
+            );
+            let cache = p.cache("cache");
+            let (page, offset) = (p.indices("write_page"), p.indices("write_offset"));
+            attn::kv_append(&kv, None, cache, &page, &offset);
+        });
+        for row in &mut t.caches {
+            if let poem_ir::CacheRow::Kv {
+                planes,
+                dtype,
+                rows,
+                ..
+            } = row
+            {
+                *planes = vec![format.bytes()];
+                *dtype = Dtype::U8;
+                *rows = Some(format);
+            }
+        }
+        let formed = anchors(&t, &all);
+        let anchor = the_one(&formed);
+        assert!(anchor.cache.is_some(), "{format:?}: the append is the epilogue's");
+        let paged = anchor.anchored.paged.iter().flatten().next().expect("a paged result");
+        assert_eq!(paged.dtype, CacheDtype::Blocks(block_rows(format)));
+        assert_eq!(anchor.anchored.verify(), Ok(()));
+    }
+}
