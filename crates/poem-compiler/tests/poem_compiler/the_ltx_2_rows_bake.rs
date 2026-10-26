@@ -67,9 +67,10 @@ fn every_row_traces_on_every_platform_holding_nothing_between_fires() {
                 !plan.nodes.is_empty(),
                 "{deployment} {platform:?}: an empty plan"
             );
-            assert!(
-                plan.caches.is_empty(),
-                "{deployment} {platform:?}: a denoiser and two connectors hold nothing between fires"
+            assert_eq!(
+                plan.caches.len(),
+                if is_flagship(deployment) { model::TEXT_LAYERS } else { 0 },
+                "{deployment} {platform:?}: the text encoder's kv, and nothing else between fires"
             );
             let seams: BTreeMap<&str, usize> =
                 plan.outputs.iter().fold(BTreeMap::new(), |mut acc, s| {
@@ -83,8 +84,8 @@ fn every_row_traces_on_every_platform_holding_nothing_between_fires() {
             );
             assert_eq!(
                 seams.get("hidden"),
-                Some(&2),
-                "{deployment}: one hidden per connector"
+                is_flagship(deployment).then_some(&1),
+                "{deployment}: the text reading's rows iff the row carries the encoder"
             );
             assert!(
                 !seams.contains_key("logits"),
@@ -111,9 +112,8 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
         let mut lanes: Vec<(&str, Option<&str>)> = ["latents", "audio", "context", "audio_context"]
             .map(|stream| ("denoise", Some(stream)))
             .to_vec();
-        lanes.extend([("refine.video", None), ("refine.audio", None)]);
         if is_flagship(deployment) {
-            lanes.push(("vae.decode", None));
+            lanes.extend([("text", None), ("vae.decode", None)]);
         }
         let mut seen: Vec<((&str, Option<&str>), usize)> = Vec::new();
         for (reading, stream) in lanes {
@@ -131,7 +131,7 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
         );
         assert_eq!(
             seen.len(),
-            6 + usize::from(is_flagship(deployment)),
+            4 + 2 * usize::from(is_flagship(deployment)),
             "{deployment}: the lanes the facts list"
         );
     }
@@ -158,8 +158,6 @@ fn the_attentions_pair_as_the_architecture_says() {
         let audio = word(&plan, "denoise", Some("audio"));
         let ctx = word(&plan, "denoise", Some("context"));
         let actx = word(&plan, "denoise", Some("audio_context"));
-        let refine_v = word(&plan, "refine.video", None);
-        let refine_a = word(&plan, "refine.audio", None);
 
         let mut pairs: BTreeMap<(&str, &str), usize> = BTreeMap::new();
         let mut connector_reads = 0usize;
@@ -184,7 +182,7 @@ fn the_attentions_pair_as_the_architecture_says() {
                     q_indptr, kv_indptr,
                     "{deployment}: a connector reads itself"
                 );
-                assert!(q_sel.holds(refine_v) || q_sel.holds(refine_a));
+                assert!(q_sel.holds(ctx) != q_sel.holds(actx));
                 assert!(!q_sel.holds(video) && !q_sel.holds(audio));
                 continue;
             }
@@ -288,25 +286,16 @@ fn every_rope_is_one_ladder_across_the_row() {
             0,
             "{deployment}"
         );
-        let no_other = plan.nodes.iter().any(|node| {
-            matches!(
-                &node.op,
-                Operation::Elemwise(Elemwise::Rope {
-                    k: Some(_),
-                    turn: poem_ir::Turn::Full { .. },
-                    ..
-                }) | Operation::Elemwise(Elemwise::Rope {
-                    k: Some(_),
-                    turn: poem_ir::Turn::Partial { .. },
-                    ..
-                }) | Operation::Elemwise(Elemwise::Rope {
-                    k: Some(_),
-                    turn: poem_ir::Turn::Mrope { .. },
-                    ..
-                })
-            )
-        });
-        assert!(!no_other, "{deployment}: this text turns one kind of rope");
+        let encoder = plan
+            .nodes
+            .iter()
+            .filter(|node| matches!(&node.op, Operation::Elemwise(Elemwise::Rope { .. })))
+            .count();
+        assert_eq!(
+            encoder,
+            if is_flagship(deployment) { model::TEXT_LAYERS } else { 0 },
+            "{deployment}: the text encoder alone turns another rope, once a layer"
+        );
     }
 }
 
@@ -319,10 +308,11 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
             .declared("reading")
             .map(|s| s.values.clone())
             .unwrap_or_default();
-        let mut want = vec!["denoise", "refine.video", "refine.audio"];
-        if is_flagship(deployment) {
-            want.push("vae.decode");
-        }
+        let want = if is_flagship(deployment) {
+            vec!["text", "denoise", "vae.decode"]
+        } else {
+            vec!["denoise"]
+        };
         assert_eq!(
             names, want,
             "{deployment}: the decode reading iff the row carries the VAE"
@@ -493,6 +483,8 @@ fn the_latents_ride_the_voxels_and_the_positions_are_computed() {
             format!("latents:voxel:{}", d.channels),
             "fps:lane:1".to_string(),
             "text_positions:row:1".to_string(),
+            format!("context:row:{}", d.cross_dim + d.audio_cross_dim),
+            "length:lane:1".to_string(),
             format!("positions:row:{}", model::ROPE_AXES),
             format!("audio_positions:row:{}", model::AUDIO_ROPE_AXES),
         ] {
@@ -501,6 +493,12 @@ fn the_latents_ride_the_voxels_and_the_positions_are_computed() {
                 "{deployment}: no `{want}` in {inputs:?}"
             );
         }
+        let context = plan.inputs.iter().find(|i| i.name == "context");
+        assert_eq!(
+            context.and_then(|i| i.rows),
+            Some(poem_ir::RowCount::Exact(model::TEXT_LEN)),
+            "{deployment}: the prompt padded to the reference's rows"
+        );
         assert!(
             !inputs.iter().any(|i| i.starts_with("latents:row")),
             "{deployment}: the latent rides the voxel axis only"
