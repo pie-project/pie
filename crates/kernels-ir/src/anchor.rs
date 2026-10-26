@@ -101,11 +101,14 @@ pub struct Contraction {
     pub k: u32,
     pub layout: Layout,
     pub quant: Quant,
-    /// The dtype each product rounds to before an epilogue reads it, where
-    /// an op between them rounds it (a cast the program states), or `None`:
-    /// the epilogue reads the f32 accumulator, as a matmul and its bias are
-    /// one sum, and only the epilogue's own values round. The plain store
-    /// rounds the product to the dtype it lands.
+    /// The dtype each product rounds to before an epilogue reads it, as the
+    /// program lands a linear's output (bf16), or `None`: the epilogue reads
+    /// the f32 accumulator, where it only adds a bias to it (a linear's bias
+    /// sits inside its sum, as addmm's does), and only the epilogue's own
+    /// values round. The plain store rounds the product to the dtype it
+    /// lands. Under a folded norm ([`Anchored::normed`]) the row's scale is
+    /// the rewrite's own: the sum keeps its accumulator through it and the
+    /// scaled product rounds where the product did.
     pub acc: Option<Dtype>,
 }
 
@@ -830,8 +833,10 @@ impl Anchored {
     /// one over the rows as they are stored ([`RowNorm`]): each part's
     /// product scaled by the row's norm scale (an [`Input::Norm`] appended
     /// to the epilogue's inputs) before the epilogue reads it, the gain
-    /// folded into the bank. `None` where it has no epilogue (a plain
-    /// store's products would land unnormed), a prologue, or a norm already.
+    /// folded into the bank; a product that rounded before the epilogue
+    /// rounds once scaled (the sum keeps its accumulator through the
+    /// rewrite's scale). `None` where it has no epilogue (a plain store's
+    /// products would land unnormed), a prologue, or a norm already.
     #[must_use]
     pub fn normed(&self, norm: RowNorm) -> Option<Anchored> {
         if self.norm.is_some() || self.prologue.is_some() {
@@ -875,14 +880,26 @@ impl Anchored {
         shapes.push(Shape::Scalar);
         let mut inputs = epi.inputs.clone();
         inputs.push(Input::Norm);
+        // The scale is the rewrite's: the sum keeps its accumulator through
+        // it, and each scaled product rounds where the product did (the
+        // program's linear over the normed rows lands it so).
+        let mut rounds: Vec<(ValueId, Dtype)> =
+            region.rounds.iter().map(|&(v, d)| (at(v), d)).collect();
+        if let Some(dtype) = self.contraction.acc {
+            rounds.extend((0..parts).map(|p| (params + 1 + p, dtype)));
+        }
         Some(Anchored {
+            contraction: Contraction {
+                acc: None,
+                ..self.contraction
+            },
             epilogue: Some(Pointwise {
                 region: Region {
                     width: region.width,
                     params: shapes,
                     ops,
                     results: region.results.iter().map(|&r| at(r)).collect(),
-                    rounds: region.rounds.iter().map(|&(v, d)| (at(v), d)).collect(),
+                    rounds,
                 },
                 inputs,
             }),

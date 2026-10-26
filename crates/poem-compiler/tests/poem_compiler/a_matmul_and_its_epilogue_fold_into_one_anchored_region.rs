@@ -2,8 +2,8 @@
 //! product form an anchor (`fuse::anchor`): one kernels-ir anchored region,
 //! its contraction the matmul and its epilogue the ops, verified pointwise
 //! over the product tile and folded into one `fused.anchored` op where the
-//! backend serves it. The product keeps its accumulator through the
-//! epilogue, and the interpreter lands what the ops do over it.
+//! backend serves it. The product keeps its accumulator through a bias
+//! alone, and the interpreter lands what the ops do over it.
 
 use kernels_ir::anchor::{Given, eval};
 use kernels_ir::skeleton::round_bf16;
@@ -36,8 +36,14 @@ fn values(count: usize, seed: usize) -> Vec<f32> {
         .collect()
 }
 
+/// `a · wᵀ` summed in f64 and rounded to bf16, as the program lands a
+/// linear's output and an epilogue that only adds a bias does not read it.
+fn landed(a: &[f32], w: &[f32], mnk: [usize; 3]) -> Vec<f32> {
+    product(a, w, mnk).into_iter().map(round_bf16).collect()
+}
+
 /// `a · wᵀ` summed in f64 and rounded to f32 once, as the interpreter sums
-/// a contraction: the epilogue reads it so, no op between them rounding it.
+/// a contraction: an epilogue that only adds a bias reads it so.
 fn product(a: &[f32], w: &[f32], [m, n, k]: [usize; 3]) -> Vec<f32> {
     (0..m * n)
         .map(|i| {
@@ -120,13 +126,14 @@ fn a_packed_glu_reads_the_banks_two_parts() {
     let anchor = the_one(&formed);
     let c = &anchor.anchored.contraction;
     assert_eq!((c.n, c.layout), (N as u32, Layout::Packed(2)));
+    assert_eq!(c.acc, Some(Dtype::Bf16), "its halves read as their projections land them");
 
     let [m, n, k] = [2usize, N as usize, K as usize];
     let (a, w) = (values(m * k, 4), values(2 * n * k, 5));
     let got = eval(&anchor.anchored, m, &a, &w, &[], &[]).expect("runs");
     let (g, u) = (
-        product(&a, &w[..n * k], [m, n, k]),
-        product(&a, &w[n * k..], [m, n, k]),
+        landed(&a, &w[..n * k], [m, n, k]),
+        landed(&a, &w[n * k..], [m, n, k]),
     );
     let want: Vec<f32> = (0..m * n)
         .map(|i| {
@@ -234,11 +241,11 @@ fn a_packed_qkvs_split_norms_and_turn_are_one_epilogue_of_windows() {
         Given::Row(vec![0.0, 3.0, 17.0]),
     ];
     let got = eval(&anchor.anchored, m, &a, &w, &[], &given).expect("runs");
-    let y = product(&a, &w, [m, n as usize, k]);
+    let y = landed(&a, &w, [m, n as usize, k]);
     let v: Vec<f32> = (0..m)
         .flat_map(|r| y[r * n as usize + (qw + kvw) as usize..(r + 1) * n as usize].to_vec())
         .collect();
-    assert_eq!(got[0], v, "v lands its products as they are summed");
+    assert_eq!(got[0], v, "v lands its products as the program does");
     // At position 0 nothing turns: q's heads are their norms.
     let q0 = &got[1][..qw as usize];
     let head = &y[..D as usize];
@@ -583,12 +590,12 @@ fn a_gated_qs_windows_land_its_norms_and_partial_turn() {
         Given::Row(positions.to_vec()),
     ];
     let got = eval(&anchor.anchored, m, &a, &w, &[], &given).expect("runs");
-    let y = product(&a, &w, [m, n, k]);
+    let y = landed(&a, &w, [m, n, k]);
     let d = D as usize;
     for row in 0..m {
         for head in 0..2 {
             let from = row * n + head * 2 * d;
-            // the gate's head: its products as they are summed
+            // the gate's head: its products as the program lands them
             let gate = &got[gate_at][row * 2 * d + head * d..][..d];
             assert_eq!(
                 gate,
