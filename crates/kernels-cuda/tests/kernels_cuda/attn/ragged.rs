@@ -29,7 +29,7 @@ fn check(heads: [usize; 3], q_sizes: &[u32], kv_sizes: &[u32], mask: Mask, extra
     let (v_raw, v) = lcg.row(kr * kvh * hd);
     let (fill, span) = (lcg.row(qr * qh * hd).0, 2 * MAX_LEN - 1);
     let bias: Vec<f32> = (0..qh * span).map(|_| 2.0 * lcg.unit()).collect();
-    let classes: Vec<i32> = (0..qr as i32).map(|r| r % 3).collect();
+    let classes: Vec<i32> = (0..qr.max(kr) as i32).map(|r| r % 3).collect();
     let allowed: Vec<u8> = (0..9).map(|c| u8::from(c % 4 == 0 || c % 3 == 1)).collect();
     let scale = 2.0 / (hd as f32).sqrt();
     let mut want = ragged_attention([&q, &k, &v], &qt, &kt, heads, scale, |_, h, r, j| {
