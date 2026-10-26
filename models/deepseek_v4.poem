@@ -1354,6 +1354,11 @@ def caches(m, c):
             return [MX8_ROW]
         return [at.kv_down.shape[0]]
 
+    # The element format of the window's rows and of the pool's entries,
+    # fixed by the deployment's kv.
+    window_rows = "v4" if fp8 else "mx8" if fp4 else None
+    pool_rows = "v4" if fp8 else "nv4" if fp4 else None
+
     # A pool compressing `ratio` positions into an entry keeps its entries
     # compact, a row each: each position holds `1 / ratio` of a row (a page
     # of positions `page / ratio` entries), where the ratio divides a page.
@@ -1368,12 +1373,12 @@ def caches(m, c):
     kv = c.kv_space(rows, m.window)
     for w in m.layers:
         at = w.attn
-        c.kv(kv, at.kv, row(at), m.head_dim, heads = split_kv(m, at))
+        c.kv(kv, at.kv, row(at), m.head_dim, heads = split_kv(m, at), rows = window_rows)
         ratio = at.pool.ratio if at.pool != None else 1
         if at.pool != None and at.pool.owner:
             pool = c.kv_space(rows)
             entry = DS_ROW if fp8 else NV4_ROW if fp4 else m.head_dim
-            c.kv(pool, at.pool.entries, packed(entry, ratio), m.head_dim)
+            c.kv(pool, at.pool.entries, packed(entry, ratio), m.head_dim, rows = pool_rows)
         if at.indexer != None and at.indexer.owns_keys:
             index = c.kv_space(keys)
             key = FP4_KEY_ROW if fp4 else at.indexer.head_dim
@@ -1384,7 +1389,7 @@ def caches(m, c):
         c.state(REPLAY, [1], dtype.i32)
     if m.mtp != None:
         at = m.mtp.block.attn
-        c.kv(kv, at.kv, row(at), m.head_dim, heads = split_kv(m, at))
+        c.kv(kv, at.kv, row(at), m.head_dim, heads = split_kv(m, at), rows = window_rows)
     if m.dspark != None:
         # A DSpark stage's window: the last `m.window` committed positions
         # and the drafted block above them.
@@ -1392,7 +1397,7 @@ def caches(m, c):
         space = c.kv_space(rows, m.window + ds.block)
         for st in ds.stages:
             at = st.attn
-            c.kv(space, at.kv, row(at), m.head_dim, heads = split_kv(m, at))
+            c.kv(space, at.kv, row(at), m.head_dim, heads = split_kv(m, at), rows = window_rows)
 
 # The dtype the forward computes in on every deployment.
 ACT = dtype.bf16

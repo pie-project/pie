@@ -56,6 +56,7 @@ impl HybridSpec {
             head_dim,
             live: None,
             shard: Shard::Replicated,
+            rows: None,
         });
         DeclaredCache(self.rows.last_mut().expect("a row was just pushed"))
     }
@@ -86,6 +87,15 @@ impl DeclaredCache<'_> {
             panic!("only a kv row holds heads");
         };
         *live = Some([key, value]);
+        self
+    }
+
+    /// The kv row's u8 planes hold `format`'s block-scaled rows.
+    pub fn rows(&mut self, format: poem_ir::KvRows) -> &mut Self {
+        let CacheRow::Kv { rows, .. } = &mut *self.0 else {
+            panic!("only a kv row holds quantized rows");
+        };
+        *rows = Some(format);
         self
     }
 

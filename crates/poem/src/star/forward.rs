@@ -321,7 +321,9 @@ fn spec_methods(builder: &mut MethodsBuilder) {
     /// The kv row `name` in `space`, its planes of `planes` and heads of
     /// `head_dim`; `heads` cuts it between ranks by head; `live`, a key
     /// head's and a value head's widths, where heads are zero-padded past
-    /// them.
+    /// them; `rows`, the block-scaled rows a u8 plane holds (`"v4"`,
+    /// `"mx8"` or `"nv4"`), each plane a row of that format's width (or a
+    /// compact pool's share of one).
     fn kv(
         #[starlark(this)] _this: &SpecHandle,
         #[starlark(require = pos)] space: u32,
@@ -330,17 +332,41 @@ fn spec_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = pos)] head_dim: u32,
         #[starlark(require = named, default = false)] heads: bool,
         #[starlark(require = named)] live: Option<UnpackList<u32>>,
+        #[starlark(require = named, default = NoneOr::None)] rows: NoneOr<&str>,
     ) -> anyhow::Result<NoneType> {
         let live = match live.map(|l| l.items).as_deref() {
             None => None,
             Some(&[key, value]) => Some((key, value)),
             Some(other) => anyhow::bail!("`live` is a key and a value width, not {other:?}"),
         };
+        let rows = match rows.into_option() {
+            None => None,
+            Some("v4") => Some(poem_ir::KvRows::V4),
+            Some("mx8") => Some(poem_ir::KvRows::Mx8),
+            Some("nv4") => Some(poem_ir::KvRows::Nv4),
+            Some(other) => anyhow::bail!("`rows` is \"v4\", \"mx8\" or \"nv4\", not {other:?}"),
+        };
+        if let Some(format) = rows
+            && planes
+                .items
+                .iter()
+                .any(|&w| w == 0 || format.bytes() % w != 0)
+        {
+            anyhow::bail!(
+                "kv row `{name}` holds {format:?} rows, {} bytes a position (or a share of \
+                 them a compact pool's position), not planes of {:?}",
+                format.bytes(),
+                planes.items
+            );
+        }
         with(|t| {
             let spec = t.spec.get_or_insert_with(HybridSpec::new);
             let mut row = spec.kv(crate::KvSpace(space), name, planes.items, head_dim);
             if let Some((key, value)) = live {
                 row.live(key, value);
+            }
+            if let Some(format) = rows {
+                row.rows(format);
             }
             if heads {
                 row.heads();
