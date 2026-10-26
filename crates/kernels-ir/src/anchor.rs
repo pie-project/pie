@@ -33,8 +33,10 @@
 //! tile holds whole groups computes it a tile at a time. Its rotation's
 //! angle is the row's position (an [`Input::Row`]) by a frequency each
 //! column states (the region's column), the table of them the schedule's.
-//! A sum over the whole row, a head wider than [`MAX_SPAN`], or a gather at
-//! a column its values pick crosses tiles, and is refused.
+//! A sum over the whole row is one group of every column, legal where the
+//! row is at most [`MAX_SPAN`] wide (a row one head wide); over a wider row,
+//! a head wider than [`MAX_SPAN`], or a gather at a column its values pick,
+//! it crosses tiles, and is refused.
 //!
 //! The interpreter ([`eval`]) is the contract a kernel is held to: the
 //! contraction summed in f64 and rounded to f32 once (as the interpreter
@@ -50,14 +52,16 @@ use dtype::Dtype;
 
 use crate::interp::{self, Arg, InterpError};
 use crate::region::{Op, Region, RegionError, Shape, ValueId};
-use crate::skeleton::round_bf16;
+use crate::skeleton::{round_bf16, round_e4m3};
 
 /// The widest group of a product tile's columns an epilogue combines
-/// within: a head, which a contraction skeleton holds whole in one tile, so
-/// a head's norm (its sum of squares over the head) and its rotary turn
-/// (each column with its mate in the head) are its tile's alone. The
-/// widest head a catalog model norms or turns is 256 columns.
-pub const MAX_SPAN: u32 = 256;
+/// within: a head, which a skeleton holds whole (a contraction skeleton's
+/// tile, or a row skeleton's row), so a head's norm (its sum of squares over
+/// the head) and its rotary turn (each column with its mate in the head)
+/// are its own alone. The widest head a catalog model norms or turns is 512
+/// columns (Gemma 4's global layers); a backend serves a span its skeletons
+/// hold.
+pub const MAX_SPAN: u32 = 512;
 
 /// How the weight's rows lay out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -165,6 +169,49 @@ pub struct Window {
     pub width: u32,
 }
 
+/// How a paged cache holds its elements: bf16, or e4m3 under a scale (each
+/// element `e4m3(x / scale)`, saturating; vLLM's `fp8` KV is a unit scale).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CacheDtype {
+    Bf16,
+    E4m3 { scale: f32 },
+}
+
+impl CacheDtype {
+    /// `x` as the cache stores it, read back: rounded to bf16 as the
+    /// result's own plane would hold it, then to the cache's element.
+    #[must_use]
+    pub fn stored(self, x: f32) -> f32 {
+        let x = round_bf16(x);
+        match self {
+            CacheDtype::Bf16 => x,
+            CacheDtype::E4m3 { scale } => round_e4m3(x / scale),
+        }
+    }
+}
+
+/// A result landed in a paged cache's plane (a key's or a value's) rather
+/// than a plane of its own: each row at the cache row its page and slot
+/// name, `page · page_size + slot`, the row whose slot lies past its page
+/// landing nothing. `page` and `slot` are the epilogue's inputs (each one
+/// value a row, an i32), the slot mapping its fire states; how a cache lays
+/// out its pages and which rows are live is the backend's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Paged {
+    pub plane: CachePlane,
+    pub dtype: CacheDtype,
+    pub page: u32,
+    pub slot: u32,
+}
+
+/// Which of a cache's planes a paged result lands in: its keys' or its
+/// values' (a shared-kv latent's one plane is its keys').
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CachePlane {
+    Keys,
+    Values,
+}
+
 /// How a norm's gain `g` folds into the bank the contraction reads: none
 /// (a norm of no weight), `w ⊙ g`, or `w ⊙ (1 + g)` (Gemma's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -201,6 +248,9 @@ pub struct Anchored {
     /// The operand's rows normed, their scale the epilogue's
     /// [`Input::Norm`] and the gain folded into the bank.
     pub norm: Option<RowNorm>,
+    /// Where each result lands in a paged cache ([`Paged`]), one a result,
+    /// or none: every result its own plane.
+    pub paged: Vec<Option<Paged>>,
 }
 
 /// Why an anchored region is not one.
@@ -242,6 +292,10 @@ pub enum AnchorError {
     Result { space: Space, result: u32 },
     /// Windows not one a result, or one past the tile's columns or of none.
     Window { result: u32 },
+    /// A paged result whose page or slot is no input one value a row, a
+    /// scale no finite positive one, or pagings not one a result: a result
+    /// a cache cannot address by row.
+    Paged { result: u32 },
     /// A row's norm scale read with no norm declared, or a norm declared and
     /// its scale read by no epilogue (the products landed unnormed), or a
     /// norm over a prologue's operand (the scale is of the row as stored).
@@ -291,6 +345,11 @@ impl fmt::Display for AnchorError {
                 f,
                 "result {result}'s window is not one of the tile's columns, or the windows are \
                  not one a result"
+            ),
+            AnchorError::Paged { result } => write!(
+                f,
+                "result {result} lands in a cache it cannot address by row: its page or slot is \
+                 no input one value a row, or its scale no finite positive one"
             ),
             AnchorError::Norm => f.write_str(
                 "a row's norm scale read with no norm declared, a declared norm whose scale \
@@ -371,8 +430,10 @@ impl Pointwise {
                 // columns than their own: an epilogue's, within its span
                 // ([`Pointwise::span`]).
                 Op::ReduceHeads(..) | Op::Peer(..) => space == Space::Product,
-                // A sum across the whole row reads every tile's columns.
-                Op::Reduce(..) => false,
+                // A sum across the whole row reads every column: an
+                // epilogue's where the row is one span (a row one head
+                // wide, [`MAX_SPAN`] at most).
+                Op::Reduce(..) => space == Space::Product && inner <= MAX_SPAN,
             };
             if !pointwise {
                 return Err(AnchorError::Across { space, op: at });
@@ -413,6 +474,8 @@ impl Pointwise {
         for (op, at) in region.ops.iter().zip(0u32..) {
             match *op {
                 Op::ReduceHeads(_, _, size) => heads = lcm(heads, size),
+                // the row whole: one group of every column
+                Op::Reduce(..) => heads = lcm(heads, n),
                 Op::Peer(_, mate) => peers.push((at, mate)),
                 _ => {}
             }
@@ -513,6 +576,7 @@ impl Anchored {
             epilogue: None,
             windows: Vec::new(),
             norm: None,
+            paged: Vec::new(),
         }
     }
 
@@ -557,6 +621,24 @@ impl Anchored {
         }
         if self.norm.is_some_and(|norm| !(norm.eps >= 0.0 && norm.eps.is_finite())) {
             return Err(AnchorError::Norm);
+        }
+        if !self.paged.is_empty() {
+            let inputs = self.epilogue.as_ref().map_or(&[][..], |e| &e.inputs[..]);
+            let row = |k: u32| inputs.get(k as usize) == Some(&Input::Row);
+            if self.paged.len() != self.results() {
+                let result = u32::try_from(self.paged.len().min(self.results())).unwrap_or(0);
+                return Err(AnchorError::Paged { result });
+            }
+            for (result, paged) in (0u32..).zip(&self.paged) {
+                let Some(paged) = paged else { continue };
+                let scaled = match paged.dtype {
+                    CacheDtype::Bf16 => true,
+                    CacheDtype::E4m3 { scale } => scale.is_finite() && scale > 0.0,
+                };
+                if !row(paged.page) || !row(paged.slot) || !scaled {
+                    return Err(AnchorError::Paged { result });
+                }
+            }
         }
         if !self.windows.is_empty() {
             if self.windows.len() != self.results() {
@@ -861,7 +943,57 @@ pub fn eval(
             plane[row * n..(row + 1) * n].copy_from_slice(&values);
         }
     }
-    Ok(windowed(anchored, out, m, n))
+    Ok(cached(anchored, windowed(anchored, out, m, n)))
+}
+
+/// Each paged result's values as its cache stores them ([`CacheDtype::stored`]).
+fn cached(anchored: &Anchored, mut tiles: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    for (tile, paged) in tiles.iter_mut().zip(&anchored.paged) {
+        if let Some(paged) = paged {
+            for x in tile.iter_mut() {
+                *x = paged.dtype.stored(*x);
+            }
+        }
+    }
+    tiles
+}
+
+/// The cache row each of `m` rows of paged result `k` lands at,
+/// `page · page_size + slot` (`None` where its slot lies past its page), as
+/// the epilogue's given inputs name them; `None` where `k` is not paged.
+#[must_use]
+pub fn paged_rows(
+    anchored: &Anchored,
+    k: usize,
+    epilogue: &[Given],
+    page_size: u32,
+) -> Option<Vec<Option<u64>>> {
+    let paged = (*anchored.paged.get(k)?)?;
+    let inputs = &anchored.epilogue.as_ref()?.inputs;
+    // the given values, one an input but a row's norm scale (none)
+    let given = |at: u32| {
+        let skipped = inputs[..at as usize]
+            .iter()
+            .filter(|i| **i == Input::Norm)
+            .count();
+        match epilogue.get(at as usize - skipped)? {
+            Given::Row(v) => Some(v),
+            _ => None,
+        }
+    };
+    let (pages, slots) = (given(paged.page)?, given(paged.slot)?);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(
+        pages
+            .iter()
+            .zip(slots)
+            .map(|(&page, &slot)| {
+                let (page, slot) = (page as i64, slot as i64);
+                (slot >= 0 && slot < i64::from(page_size) && page >= 0)
+                    .then(|| (page * i64::from(page_size) + slot) as u64)
+            })
+            .collect(),
+    )
 }
 
 /// Each result's window of its `m x n` tile.
@@ -1037,37 +1169,41 @@ mod tests {
 
     #[test]
     fn an_epilogue_that_sums_across_n_is_rejected() {
-        let n = 16;
         // y / Σₙ y: a softmax's denominator, a function of the whole row.
-        let region = Region {
-            width: n,
-            params: vec![Shape::Row],
-            ops: vec![
-                Op::Reduce(Reduce::Sum, 0),    // 1
-                Op::Binary(Binary::Div, 0, 1), // 2
-            ],
-            results: vec![2],
-            rounds: vec![],
-        };
-        let anchored = Anchored {
+        let anchored = |n: u32| Anchored {
             epilogue: Some(Pointwise {
-                region,
+                region: Region {
+                    width: n,
+                    params: vec![Shape::Row],
+                    ops: vec![
+                        Op::Reduce(Reduce::Sum, 0),    // 1
+                        Op::Binary(Binary::Div, 0, 1), // 2
+                    ],
+                    results: vec![2],
+                    rounds: vec![],
+                },
                 inputs: vec![],
             }),
             ..Anchored::plain(contraction(n, 32, Layout::Dense))
         };
+        // A row wider than a span is every tile's.
+        let wide = anchored(1024);
         assert_eq!(
-            anchored.verify(),
+            wide.verify(),
             Err(AnchorError::Across {
                 space: Space::Product,
                 op: 0
             })
         );
-        let why = eval(&anchored, 1, &[0.0; 32], &[0.0; 16 * 32], &[], &[]);
+        let why = eval(&wide, 1, &[0.0; 32], &[0.0; 1024 * 32], &[], &[]);
         assert!(matches!(
             why,
             Err(EvalError::Anchor(AnchorError::Across { .. }))
         ));
+        // One a span wide (a row one head wide) is its own group.
+        let narrow = anchored(16);
+        assert_eq!(narrow.verify(), Ok(()));
+        assert_eq!(narrow.epilogue.as_ref().unwrap().span(16), 16);
     }
 
     #[test]
@@ -1226,11 +1362,11 @@ mod tests {
     #[test]
     fn a_head_or_a_gather_past_one_tiles_span_is_rejected() {
         let c = |n: u32| contraction(n, 32, Layout::Dense);
-        // A head 512 wide: past MAX_SPAN.
-        let wide = head_norm_rope(2, 512, 2);
+        // A head 1024 wide: past MAX_SPAN.
+        let wide = head_norm_rope(2, 1024, 2);
         let anchored = Anchored {
             epilogue: Some(wide),
-            ..Anchored::plain(c(1024))
+            ..Anchored::plain(c(2048))
         };
         assert!(matches!(
             anchored.verify(),
@@ -1239,8 +1375,8 @@ mod tests {
                 ..
             })
         ));
-        // Each column's mate half the row away, over a row of 1024.
-        let n = 1024;
+        // Each column's mate half the row away, over a row of 2048.
+        let n = 2048;
         let mut b = crate::build::Ops::new(1);
         let col = b.push(Op::Column);
         let half = b.u32(n / 2);
@@ -1533,6 +1669,90 @@ mod tests {
         }
         assert!(Anchored::plain(glu.contraction).normed(norm).is_none());
         assert!(normed.normed(norm).is_none());
+    }
+
+    /// e4m3's rounding as CUDA's `satfinite` conversion lands it: the
+    /// nearest of 3 mantissa bits (ties to even), subnormals 2^-9 apart,
+    /// ±448 at most.
+    #[test]
+    fn e4m3_rounds_to_the_nearest_and_saturates() {
+        use crate::skeleton::round_e4m3;
+        for (x, want) in [
+            (0.0, 0.0),
+            (1.0, 1.0),
+            (1.0625, 1.0),   // a tie between 1 and 1.125: to even
+            (1.1875, 1.25),  // a tie between 1.125 and 1.25: to even
+            (1.2, 1.25),
+            (-3.3, -3.25),
+            (448.0, 448.0),
+            (500.0, 448.0),
+            (-1e9, -448.0),
+            (0.001_953_125, 0.001_953_125), // 2^-9, the least subnormal
+            (0.0009, 0.0),                  // below half of it
+            (0.0015, 0.001_953_125),
+            (0.017, 0.017_578_125),         // 9 · 2^-9
+        ] {
+            assert_eq!(round_e4m3(x), want, "{x}");
+        }
+        assert!(round_e4m3(f32::NAN).is_nan());
+    }
+
+    /// k and v of a packed qkv product landed in a cache's pages: each row at
+    /// `page · page_size + slot`, stored as the cache's element; one whose
+    /// slot lies past its page lands nothing. A paged result's page or slot
+    /// must be an input one value a row.
+    #[test]
+    fn a_paged_result_lands_each_row_at_its_page_and_slot() {
+        let [m, n, k] = [3usize, 16, 32];
+        let region = Region {
+            width: n as u32,
+            params: vec![Shape::Row, Shape::Scalar, Shape::Scalar],
+            ops: vec![],
+            results: vec![0, 0],
+            rounds: vec![],
+        };
+        let paged = Paged {
+            plane: CachePlane::Values,
+            dtype: CacheDtype::E4m3 { scale: 0.5 },
+            page: 0,
+            slot: 1,
+        };
+        let anchored = Anchored {
+            epilogue: Some(Pointwise {
+                region,
+                inputs: vec![Input::Row, Input::Row],
+            }),
+            paged: vec![None, Some(paged)],
+            ..Anchored::plain(Contraction {
+                acc: None,
+                ..contraction(n as u32, k as u32, Layout::Dense)
+            })
+        };
+        assert_eq!(anchored.verify(), Ok(()));
+        let (a, w) = (values(m * k, 1), values(n * k, 2));
+        let given = [
+            Given::Row(vec![2.0, 0.0, 5.0]),
+            Given::Row(vec![3.0, 15.0, 16.0]),
+        ];
+        let got = eval(&anchored, m, &a, &w, &[], &given).expect("runs");
+        for (plain, cached) in got[0].iter().zip(&got[1]) {
+            assert_eq!(*cached, crate::skeleton::round_e4m3(round_bf16(*plain) / 0.5));
+        }
+        assert_eq!(
+            paged_rows(&anchored, 1, &given, 16),
+            Some(vec![Some(35), Some(15), None])
+        );
+        assert_eq!(paged_rows(&anchored, 0, &given, 16), None);
+        // A slot read from a column's vector names no row's slot.
+        let mut off = anchored.clone();
+        off.epilogue.as_mut().unwrap().inputs[1] = Input::One;
+        assert_eq!(off.verify(), Err(AnchorError::Paged { result: 1 }));
+        let mut off = anchored;
+        off.paged[1] = Some(Paged {
+            dtype: CacheDtype::E4m3 { scale: 0.0 },
+            ..paged
+        });
+        assert_eq!(off.verify(), Err(AnchorError::Paged { result: 1 }));
     }
 
     #[test]

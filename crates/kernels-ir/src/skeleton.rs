@@ -54,3 +54,19 @@ pub fn round_bf16(x: f32) -> f32 {
     let bits = x.to_bits();
     f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
 }
+
+/// `x` rounded to e4m3 (the nearest, ties to even; saturating at ±448, as
+/// CUDA's `satfinite` conversion lands it), as an f32.
+#[must_use]
+pub fn round_e4m3(x: f32) -> f32 {
+    if x.is_nan() {
+        return x;
+    }
+    const MAX: f32 = 448.0;
+    let a = x.abs();
+    // The quantum of a's binade: 2^(e - 3), or the subnormals' 2^-9.
+    let exponent = ((a.to_bits() >> 23) & 0xff) as i32 - 127;
+    let quantum = 2f32.powi(exponent.max(-6) - 3);
+    let q = ((a / quantum).round_ties_even() * quantum).min(MAX);
+    q.copysign(x)
+}
