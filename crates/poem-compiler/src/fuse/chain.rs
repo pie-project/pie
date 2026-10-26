@@ -157,7 +157,8 @@ pub const SKELETON_PLANES: usize = 5;
 /// bf16 and every row it reads bf16 or f32 (an f32 row two planes' worth),
 /// a scalar parameter (one element, bf16, f32 or i32) holding none, the
 /// width a whole number of eight-wide runs within one block's registers,
-/// at most [`SKELETON_PLANES`] planes each way, and each head it reduces over
+/// at most [`SKELETON_PLANES`] planes each way (a blend's candidates
+/// streamed past it, [`streams`]), and each head it reduces over
 /// a power-of-two run of the threads a row takes ([`skeleton_lanes`]). A
 /// chain the skeleton does not hold is never folded, so an engine never meets
 /// a region it cannot launch.
@@ -173,7 +174,7 @@ pub fn skeleton_holds(trace: &Trace, chain: &Chain, width: u32) -> bool {
         + chain.outs.len();
     width.is_multiple_of(8)
         && width <= SKELETON_BLOCK * SKELETON_PER * 8
-        && planes_fit(planes, width)
+        && (planes_fit(planes, width) || streams(trace, chain))
         && chain.ins.iter().all(|input| match dtype(input.value) {
             Dtype::Bf16 | Dtype::F32 => true,
             Dtype::I32 => input.one || input.each,
@@ -181,6 +182,23 @@ pub fn skeleton_holds(trace: &Trace, chain: &Chain, width: u32) -> bool {
         })
         && chain.outs.iter().all(|out| dtype(out.value) == Dtype::Bf16)
         && heads_fit(&chain.region, width)
+}
+
+/// The most parameters one skeleton reads.
+pub const SKELETON_PARAMS: usize = 32;
+
+/// Whether `chain` is a blend's (AttnRes's closed blocks and prefix), whose
+/// candidates the skeleton streams through its passes rather than holding
+/// them all in registers: each a row of the row's width, read once to score
+/// it and once to blend it.
+fn streams(trace: &Trace, chain: &Chain) -> bool {
+    chain.ins.len() <= SKELETON_PARAMS
+        && chain.nodes.iter().any(|&node| {
+            matches!(
+                trace.nodes[node as usize].op,
+                Operation::Elemwise(Elemwise::ResBlend { .. })
+            )
+        })
 }
 
 /// Whether `planes` rows of `width` stay in a skeleton's registers: as many
@@ -691,6 +709,8 @@ fn lowers(op: &Operation) -> bool {
             Elemwise::Softcap { .. } => true,
             Elemwise::GateSigmoidMul { heads, .. } => heads.is_none(),
             Elemwise::Clamp { bounds, .. } => matches!(bounds, Bounds::Fixed { .. }),
+            // AttnRes's blend of a row's closed blocks and its prefix
+            Elemwise::ResBlend { .. } => true,
             _ => false,
         },
         Operation::Fused(Fused::ResidualAddRmsnorm { .. }) => true,
@@ -1351,6 +1371,67 @@ impl Builder {
                 let turn = rotation(self.width, *head_dim, *theta, turn)?;
                 let out = self.b.rotate(self.get(*q)?, self.get(*positions)?, &turn);
                 self.set(*q_out, out);
+            }
+            // AttnRes's blend: each candidate (the closed blocks, then the
+            // prefix) scaled by the norm's weight and the projection and
+            // summed, times its RMS norm's scale, a logit a candidate (as
+            // the hand kernels compute it); their softmax; and the
+            // candidates summed under it.
+            Elemwise::ResBlend {
+                prefix,
+                blocks,
+                weight,
+                proj,
+                eps,
+                y,
+            } => {
+                let candidates = blocks
+                    .iter()
+                    .chain(core::iter::once(prefix))
+                    .map(|v| self.get(*v))
+                    .collect::<Option<Vec<u32>>>()?;
+                let (w, p) = (self.get(*weight)?, self.get(*proj)?);
+                let logits: Vec<u32> = candidates
+                    .iter()
+                    .map(|&x| {
+                        // the norm a scale of the row's sum, so a candidate's
+                        // square sum and its dot are one pass's
+                        let sq = self.push(Op::Binary(Binary::Mul, x, x));
+                        let ss = self.push(Op::Reduce(Reduce::Sum, sq));
+                        let n = self.konst(self.width as f32);
+                        let ms = self.push(Op::Binary(Binary::Div, ss, n));
+                        let e = self.konst(*eps);
+                        let shifted = self.push(Op::Binary(Binary::Add, ms, e));
+                        let r = self.push(Op::Unary(Unary::Rsqrt, shifted));
+                        let xw = self.push(Op::Binary(Binary::Mul, x, w));
+                        let d = self.push(Op::Binary(Binary::Mul, xw, p));
+                        let dot = self.push(Op::Reduce(Reduce::Sum, d));
+                        self.push(Op::Binary(Binary::Mul, dot, r))
+                    })
+                    .collect();
+                let most = logits[1..]
+                    .iter()
+                    .fold(logits[0], |m, &l| self.push(Op::Binary(Binary::Max, m, l)));
+                let exps: Vec<u32> = logits
+                    .iter()
+                    .map(|&l| {
+                        let shifted = self.push(Op::Binary(Binary::Sub, l, most));
+                        self.push(Op::Unary(Unary::Exp, shifted))
+                    })
+                    .collect();
+                let sum = exps[1..]
+                    .iter()
+                    .fold(exps[0], |a, &e| self.push(Op::Binary(Binary::Add, a, e)));
+                let mut blend = None;
+                for (&x, &e) in candidates.iter().zip(&exps) {
+                    let share = self.push(Op::Binary(Binary::Div, e, sum));
+                    let term = self.push(Op::Binary(Binary::Mul, share, x));
+                    blend = Some(match blend {
+                        None => term,
+                        Some(acc) => self.push(Op::Binary(Binary::Add, acc, term)),
+                    });
+                }
+                self.set(*y, blend?);
             }
             Elemwise::Layernorm {
                 x,
