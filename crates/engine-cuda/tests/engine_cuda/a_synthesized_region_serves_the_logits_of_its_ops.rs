@@ -441,11 +441,15 @@ fn an_anchored_region_serves_the_logits_of_its_ops() {
 /// element rounded to bf16 and then to e4m3, as the hand append rounds the
 /// bf16 row it is handed; its logits held within [`SPREAD_FP8`]): Gemma
 /// 4's qkv write (its hand rule retired on
-/// CUDA, its k and v normed, the v scaleless) and GLM-4.5's biased qkv with
-/// its partial turn. A prefill past every skeleton's rows (the unfused leg)
-/// and one of a few, then the decode steps, each step's logits within
-/// [`close`]'s bound (and a routed model's within
-/// [`close_past_routing`]'s).
+/// CUDA, its k and v normed, the v scaleless), GLM-4.5's biased qkv with
+/// its partial turn, and Qwen 3.5's gated q (its q and gate interleaved a
+/// head, each a head-major window of the product; its hand rule retired),
+/// over a bf16 cache alone: its miniature's logits span some 3, and its
+/// epilogue's one rounding of q's and k's norm and turn lands a step's
+/// logits 4.3% of that apart over an e4m3 cache. A prefill past every
+/// skeleton's rows (the unfused leg) and one of a few, then the decode
+/// steps, each step's logits within [`close`]'s bound (and a routed
+/// model's within [`close_past_routing`]'s).
 #[test]
 fn a_paged_epilogue_serves_the_logits_of_its_kv_append() {
     let _one = serialized();
@@ -454,8 +458,12 @@ fn a_paged_epilogue_serves_the_logits_of_its_kv_append() {
         return;
     }
     const ROWS_OFF: &str = "[compiler]\nsynth_regions = false\n";
-    for (model, routed) in [("gemma4-e4b-mini-l1", false), ("glm45-air-mini", true)] {
-        for kv in [Dtype::Bf16, Dtype::E4m3] {
+    for (model, routed, kvs) in [
+        ("gemma4-e4b-mini-l1", false, &[Dtype::Bf16, Dtype::E4m3][..]),
+        ("glm45-air-mini", true, &[Dtype::Bf16, Dtype::E4m3]),
+        ("qwen3-micro-text", false, &[Dtype::Bf16]),
+    ] {
+        for &kv in kvs {
             let fixture = packed_fixture_kv(model, kv);
             for prompted in [37u32, 100] {
                 let ops = served_from(&fixture, OPS, false, None, prompted);
@@ -468,7 +476,11 @@ fn a_paged_epilogue_serves_the_logits_of_its_kv_append() {
                 );
                 let paged = served_from(&fixture, ROWS_OFF, true, Some(&ops), prompted);
                 let against = format!("{model}'s unfused ops, a {kv:?} cache ({prompted} rows)");
-                let share = if kv == Dtype::E4m3 { SPREAD_FP8 } else { SPREAD };
+                let share = if kv == Dtype::E4m3 {
+                    SPREAD_FP8
+                } else {
+                    SPREAD
+                };
                 if routed {
                     close_past_routing_within(&paged, &ops, &carry, &against, share);
                 } else {

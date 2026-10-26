@@ -56,7 +56,6 @@ pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
     std::sync::LazyLock::new(|| {
         use poem_compiler::fuse::rules;
-        use poem_ir::ops::fused::Intermediates;
         vec![
             rules::qkv_fused_padded(),
             rules::moe_mega(),
@@ -65,9 +64,6 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::matmul_moe_route(),
             rules::matmul_split_rows(),
             rules::norm_rope_last_append_rows(),
-            rules::split_rope_yarn_append(),
-            rules::rope_yarn_append(),
-            rules::q_gate_norm_rope_append(Intermediates::Unwritten),
             rules::lse_sink(),
             rules::pool_attention(),
             rules::pool_compress(),
@@ -131,11 +127,13 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 /// without it `matmul_split_rows` takes its split first, so it finds no
 /// site to hold to this; its sites are that product's `fused.epilogue`.) What stays: MiMo's padded qkv write (its cache's
 /// heads padded past their widths, no window's), the fp8 rows of DeepSeek's
-/// cache (`norm_rope_last_append_rows`: its blocks' scales and bf16 tail no
-/// paged store's element), Qwen3.5's gated q (`q_gate_norm_rope_append`: q
-/// and gate interleaved a head, no window), YaRN's turn of every pair
-/// (`rope_yarn_append`, its attention factor no builder's turn yet) and the
-/// pooled and paired writes.
+/// cache (`norm_rope_last_append_rows`, `norm_rope_pair`: its blocks'
+/// scales and bf16 tail no paged store's element) and the pooled writes.
+/// YaRN's turn of every pair (`rope_yarn_append`, `split_rope_yarn_append`:
+/// the builder's tail pairs ramped, cos and sin times the attention factor)
+/// and Qwen 3.5's gated q (`q_gate_norm_rope_append`: q and its gate
+/// interleaved a head, each a head-major window of the product) are an
+/// epilogue's too.
 #[cfg(not(feature = "rocm"))]
 #[must_use]
 pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
@@ -148,6 +146,9 @@ pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
         rules::matmul_bias(),
         rules::qkv_fused_qknorm_rope_vnorm_write(),
         rules::norm_rope_last_append(),
+        rules::rope_yarn_append(),
+        rules::split_rope_yarn_append(),
+        rules::q_gate_norm_rope_append(poem_ir::ops::fused::Intermediates::Unwritten),
         rules::embed_scale_add_select(),
         rules::embed_scale_add(),
         rules::norm_modulate(),
