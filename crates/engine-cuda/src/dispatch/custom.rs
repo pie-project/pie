@@ -27,8 +27,7 @@ pub(crate) fn refuses(op: &Fused) -> bool {
         | Fused::RmsnormResidualAdd { .. }
         | Fused::QGateNormRopeAppend { .. }
         | Fused::RopeYarnAppend { .. }
-        | Fused::SplitRopeYarnAppend { .. }
-        | Fused::SplitQkvFused { .. } => true,
+        | Fused::SplitRopeYarnAppend { .. } => true,
         Fused::MatmulGlu { glu, .. } => !matches!(glu, poem_ir::GluAct::Swiglu),
         // A turn of the tail stays: DeepSeek-V4's q and kv pair falls back
         // to it.
@@ -65,8 +64,7 @@ impl DispatchFused for Run<'_> {
             | Fused::RmsnormResidualAdd { .. }
             | Fused::QGateNormRopeAppend { .. }
             | Fused::RopeYarnAppend { .. }
-            | Fused::SplitRopeYarnAppend { .. }
-            | Fused::SplitQkvFused { .. } => unreachable!("`refuses` names it"),
+            | Fused::SplitRopeYarnAppend { .. } => unreachable!("`refuses` names it"),
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.qkv_write(op),
             Fused::NormRopeLastAppend { .. } => self.norm_rope_last_append(op),
             Fused::PoolCompress { .. } => self.pool_compress(op),

@@ -30,7 +30,6 @@ pub(crate) fn refuses(op: &Fused) -> bool {
                 intermediates: poem_ir::ops::fused::Intermediates::Unwritten,
                 ..
             }
-            | Fused::SplitQkvFused { .. }
     )
 }
 
@@ -74,8 +73,7 @@ impl DispatchFused for Run<'_> {
             | Fused::HcPre { .. }
             | Fused::HcGatesNorm { .. }
             | Fused::HcPrenormProject { .. }
-            | Fused::ResBlendRmsnorm { .. }
-            | Fused::SplitQkvFused { .. } => unreachable!("`refuses` names it"),
+            | Fused::ResBlendRmsnorm { .. } => unreachable!("`refuses` names it"),
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::EmbedScaleAdd { .. }

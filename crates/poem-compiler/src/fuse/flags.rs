@@ -38,7 +38,6 @@ macro_rules! flags {
 }
 
 flags! {
-    SplitQkvFused = "fuse.split_qkv_fused" => "fused.split_qkv_fused",
     QkvFusedQknormRopeVnormWrite = "fuse.qkv_fused_qknorm_rope_vnorm_write" => "fused.qkv_fused_qknorm_rope_vnorm_write",
     RmsnormResidualAdd = "fuse.rmsnorm_residual_add" => "fused.rmsnorm_residual_add",
     EmbedScaleAddSelect = "fuse.embed_scale_add_select" => "fused.embed_scale_add_select",
