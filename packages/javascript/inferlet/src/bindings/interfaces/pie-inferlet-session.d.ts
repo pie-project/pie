@@ -34,6 +34,11 @@ export function sendFile(data: Blob): void;
 export function sendFileAs(data: Blob, name: string): void;
 /**
  * Receives an incoming file from the remote user client
+ * The file the client attached to this run under `name`
+ * (`pie run --file name=path`), or none.
+ */
+export function file(name: string): Blob | undefined;
+/**
  * Encodes `f` and streams the bytes to the client under `name`, WITHOUT
  * the encoded file ever entering WASM linear memory.
  * 

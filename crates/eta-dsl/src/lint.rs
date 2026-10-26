@@ -12,7 +12,7 @@ pub(crate) fn lint(
 ) {
     for ch in channels {
         let st = ch.borrow();
-        let name = st.name.clone();
+        let name = st.site;
 
         let host_writes = st.host_puts.first().copied();
         let host_consumes = st
@@ -25,7 +25,7 @@ pub(crate) fn lint(
 
         if let (Some(w), Some(c)) = (host_writes, host_consumes) {
             errs.push(TraceError::DoubleEndpoint {
-                channel: name.clone(),
+                channel: name,
                 role: "host",
                 first: (Endpoint::Host, w),
                 second: (Endpoint::Host, c),

@@ -25,9 +25,9 @@ async fn main(input: String) -> std::result::Result<String, String> {
     let tokens: Vec<i32> = input.tokens.iter().map(|&t| t as i32).collect();
     let ws = WorkingSet::new();
     let pipe = Pipeline::new();
-    let toks = Channel::from(&tokens[..]).named("toks");
-    let indptr = Channel::from([0u32, n]).named("embed_indptr");
-    let done = Channel::new([1], dtype::i32).named("done");
+    let toks = Channel::from(&tokens[..]);
+    let indptr = Channel::from([0u32, n]);
+    let done = Channel::new([1], dtype::i32);
     let landed = done;
 
     let fwd = ForwardPass::new();

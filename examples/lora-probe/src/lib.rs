@@ -198,10 +198,8 @@ impl Weights {
 
     fn channels(&self) -> (Channel, Channel) {
         (
-            Channel::from_shaped([self.layers, self.rank, self.hidden], self.a.clone())
-                .named("lora_a"),
-            Channel::from_shaped([self.layers, self.hidden, self.rank], self.b.clone())
-                .named("lora_b"),
+            Channel::from_shaped([self.layers, self.rank, self.hidden], self.a.clone()),
+            Channel::from_shaped([self.layers, self.hidden, self.rank], self.b.clone()),
         )
     }
 
@@ -214,7 +212,6 @@ impl Weights {
                 .map(|i| 1.0f32 + pattern(i, 0x0d0d_d0d0, 0.2))
                 .collect::<Vec<f32>>(),
         )
-        .named("lora_l")
     }
 }
 
@@ -293,10 +290,10 @@ async fn main(input: Input) -> Result<Output> {
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let pipe = Pipeline::new();
 
-    let toks_p = Channel::from(prompt_i32.clone()).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
-    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
+    let toks_p = Channel::from(prompt_i32.clone());
+    let embed_indptr_p = Channel::from(vec![0u32, n]);
+    let rng_p = Channel::from(vec![input.seed, 0]);
+    let tok_out_p = Channel::new([1], dtype::i32);
 
     let weights = Weights::build(layers, hidden, rank, adapter_scale);
     let fwd_p = ForwardPass::new();
@@ -325,12 +322,10 @@ async fn main(input: Input) -> Result<Output> {
     // ── DECODE LOOP (1-wide, run-ahead) — naive-baseline's shape, plus the
     //    adapter. ──
     if generated.len() < max_tokens {
-        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
-        let tok_out = Channel::new([1], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("tok_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+        let tok_in = Channel::from(vec![g0; 1]);
+        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]);
+        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+        let lane1 = Channel::from(vec![0u32, 1u32]);
 
         let weights = Weights::build(layers, hidden, rank, adapter_scale);
         let fwd = ForwardPass::new();

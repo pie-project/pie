@@ -4131,6 +4131,7 @@ dependencies = [
  "runtime",
  "rustls",
  "serde",
+ "serde_bytes",
  "serde_json",
  "tar",
  "tempfile",

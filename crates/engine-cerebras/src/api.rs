@@ -223,6 +223,8 @@ pub(crate) fn fault(fault: Fault) -> Error {
     }
 }
 
+const DEFAULT_STATE_SLOTS: u32 = 4;
+
 fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
@@ -352,12 +354,13 @@ impl Engine for Cerebras {
         };
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
         let patches = patch_ladder(&trace, &budgets);
-        let voxels = crate::dit::voxel_ladder(
+        let voxels = poem_compiler::VoxelLadder::of(
             &trace,
             budgets.max_voxels,
             budgets.max_clips,
             budgets.max_lanes,
         );
+        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let shell = Shell::load_with(
             Boot {
                 patches,
@@ -367,7 +370,7 @@ impl Engine for Cerebras {
                 budget: bake_budgets(&budgets),
                 page_size: budgets.page_size,
                 context: budgets.max_context,
-                slots: budgets.slots,
+                slots,
                 kv_budget: residency.device_kv_budget,
                 memory_share: residency.device_memory_share,
                 device: &boot,

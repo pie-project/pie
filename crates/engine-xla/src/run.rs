@@ -380,7 +380,9 @@ impl<'c> Run<'c> {
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
             Some(Dim::Voxels) => (voxel.row_offset, voxel.rows),
-            Some(Dim::VoxelsTimes(k)) => (voxel.row_offset * k, voxel.rows * k),
+            Some(&Dim::VoxelsScaled(n, d)) => {
+                poem_ir::value::scaled_span(n, d, voxel.row_offset, voxel.rows)
+            }
             Some(Dim::Clips) => (voxel.lane_offset, voxel.lanes),
             Some(Dim::ClipsPlus(k)) => (voxel.lane_offset, voxel.lanes + k),
         };

@@ -22,6 +22,11 @@ impl Span {
             col: l.column(),
         }
     }
+    /// `file:line`.
+    pub fn at(&self) -> String {
+        alloc::format!("{}:{}", self.file, self.line)
+    }
+
     pub fn of(l: &'static core::panic::Location<'static>) -> Span {
         Span {
             file: l.file(),
@@ -58,13 +63,13 @@ impl fmt::Display for Endpoint {
 #[non_exhaustive]
 pub enum TraceError {
     DoubleEndpoint {
-        channel: String,
+        channel: Span,
         role: &'static str,
         first: (Endpoint, Span),
         second: (Endpoint, Span),
     },
     ReadinessConflict {
-        channel: String,
+        channel: Span,
         detail: String,
         span: Span,
     },
@@ -90,8 +95,12 @@ impl fmt::Display for TraceError {
                 second,
             } => write!(
                 f,
-                "channel `{channel}` has two {role} endpoints (SPSC): first {} at {}, second {} at {}",
-                first.0, first.1, second.0, second.1
+                "channel {} has two {role} endpoints (SPSC): first {} at {}, second {} at {}",
+                channel.at(),
+                first.0,
+                first.1,
+                second.0,
+                second.1
             ),
             TraceError::ReadinessConflict {
                 channel,
@@ -100,7 +109,8 @@ impl fmt::Display for TraceError {
             } => {
                 write!(
                     f,
-                    "channel `{channel}` readiness conflict at {span}: {detail}"
+                    "channel {} readiness conflict at {span}: {detail}",
+                    channel.at()
                 )
             }
             TraceError::SinkMisplacement { sink, stage, span } => write!(

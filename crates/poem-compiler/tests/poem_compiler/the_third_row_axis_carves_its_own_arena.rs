@@ -169,8 +169,8 @@ fn a_decoder_carves_its_pixels_at_sixteen_voxel_ceilings_and_shares_no_column() 
     let Placement::Arena { rows, bytes, .. } = &compiled.arena.placements[plane.0 as usize] else {
         panic!("the pixel plane is a rectangle of the arena")
     };
-    assert_eq!(*rows, RowExpr::VoxelsTimes(16));
-    assert_eq!(*bytes, 16 * 256 * 3 * 2);
+    assert_eq!(*rows, RowExpr::Voxels(1, 1));
+    assert_eq!(*bytes, 256 * 3 * 2);
     let Placement::Arena { rows, bytes, .. } = &compiled.arena.placements[grid.0 as usize] else {
         panic!("the grid is a rectangle of the arena")
     };

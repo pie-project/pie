@@ -300,7 +300,7 @@ fn output_decl(trace: &Trace, name: &str, values: &[ValueId]) -> Result<OutputDe
     }
     let axis = match first {
         Some(Dim::Lanes | Dim::LanesPlus(_)) => InputAxis::Lane,
-        Some(Dim::Voxels | Dim::VoxelsTimes(_)) => InputAxis::Voxel,
+        Some(Dim::Voxels | Dim::VoxelsScaled(..)) => InputAxis::Voxel,
         Some(Dim::Tokens | Dim::TokensTimes(_) | Dim::Readouts) => InputAxis::Row,
         other => {
             return Err(format!(

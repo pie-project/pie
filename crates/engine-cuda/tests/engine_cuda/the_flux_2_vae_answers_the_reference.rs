@@ -40,7 +40,7 @@ fn fire(
     drop(src);
     let word = trace
         .facts
-        .word(&poem::Request::new(1, false).switched("stream", "image"));
+        .word(&poem::Request::new(1, false).switched("stream", "latents"));
     let started = Instant::now();
     let mut shell = common_vae::load(trace, &contract, root, max_voxels);
     let load_s = started.elapsed().as_secs_f64();

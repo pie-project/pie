@@ -1,9 +1,8 @@
 //! The pie half of the `z-image` goldens: `scripts/imagegen/zimage_golden.py`'s
-//! inputs in, the refined caption and the velocity out as JSON for `zimage_parity.py`.
+//! inputs in, the velocity out as JSON for `zimage_parity.py`.
 //! The caption is zero-padded to the family's `input-decl.rows`, as the reference pads.
 //!
-//! Two fires per case, in the reference's order: `refine` (one context lane), then
-//! `denoise` (lane 0 the refined caption, lane 1 the image, one group).
+//! One `denoise` fire per case: lane 0 the caption, lane 1 the image, one group.
 //!
 //! Under `steps` the second fire becomes the whole TRAJECTORY: `steps`
 //! denoise fires over the family's pinned sigmas with the latent carried on
@@ -22,11 +21,9 @@ struct Input {
     /// Turbo case is ~3 MB; a 128 KiB argument ceiling makes that ~30).
     #[serde(flatten)]
     pieces: std::collections::BTreeMap<String, inferlet::serde_json::Value>,
-    #[serde(default)]
-    refine_only: bool,
     /// Run the `text` reading on this prompt first (the flagship row only):
     /// the encoder's rows come back as `text`, and — unless `text_only` —
-    /// replace the case's caption rows before `refine`.
+    /// replace the case's caption rows.
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
@@ -72,10 +69,8 @@ struct Output {
     text: Vec<f32>,
     text_rows: u32,
     text_width: u32,
-    /// `[caption_rows, dim]`: the refine readout.
-    refined: Vec<f32>,
+    /// The caption's rows, padded.
     caption_rows: u32,
-    dim: u32,
     /// `[height · width, readout]` in the family's sign (the reference's
     /// `-model_out`); a tap's is `[readout_rows, readout]`.
     velocity: Vec<f32>,
@@ -162,36 +157,7 @@ fn padded(rows: Option<model::RowCount>, len: u32) -> Result<u32> {
 }
 
 fn length(case: &Case) -> Channel {
-    Channel::from([case.caption_rows as f32]).named("length")
-}
-
-/// The refined caption, its width and the padded caption rows.
-async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
-    let r = reading("hidden", &[("context", &["caption", "length"])])?;
-    let lane = model::lane_of(&[("reading", r.name.as_str()), ("stream", "context")])?;
-    let decl = lane
-        .inputs
-        .iter()
-        .find(|i| i.name == "caption")
-        .ok_or("the refine lane reads no caption")?;
-    let rows = padded(decl.rows, case.caption_rows)?;
-    let mut rows_in = case.caption.clone();
-    rows_in.resize((rows * case.caption_width) as usize, 0.0);
-    let pass = ForwardPass::new();
-    pass.switch(0, "reading", &r.name)?;
-    pass.switch(0, "stream", "context")?;
-    let caption =
-        Channel::from_shaped([rows, case.caption_width], rows_in.as_slice()).named("caption");
-    pass.input(0, "caption", &caption)?;
-    pass.input(0, "length", &length(case))?;
-    let width = r.readout_width;
-    let out = Channel::new([rows, width], dtype::f32).named("refined");
-    pass.epilogue(move || {
-        out.put(intrinsics::output_rows(0, "hidden", rows));
-    });
-    pass.submit(pipe).context("refine lane")?;
-    let rows_out: Vec<f32> = out.take_host().await?;
-    Ok((rows_out, width, rows))
+    Channel::from([case.caption_rows as f32])
 }
 
 fn denoise_reading() -> Result<Reading> {
@@ -199,12 +165,27 @@ fn denoise_reading() -> Result<Reading> {
         "velocity",
         &[
             ("context", &["context", "timestep", "length"]),
-            ("image", &["latents", "timestep"]),
+            ("latents", &["latents", "timestep"]),
         ],
     )
 }
 
-/// Binds lane 0 (the refined caption) and lane 1 (the image) in one group.
+/// The caption zero-padded to the context lane's rows.
+fn context(case: &Case) -> Result<Channel> {
+    let r = denoise_reading()?;
+    let lane = model::lane_of(&[("reading", r.name.as_str()), ("stream", "context")])?;
+    let decl = lane
+        .inputs
+        .iter()
+        .find(|i| i.name == "context")
+        .ok_or("the context lane reads no context")?;
+    let rows = padded(decl.rows, case.caption_rows)?;
+    let mut rows_in = case.caption.clone();
+    rows_in.resize((rows * case.caption_width) as usize, 0.0);
+    Ok(Channel::from_shaped([rows, case.caption_width], rows_in.as_slice()))
+}
+
+/// Binds lane 0 (the caption) and lane 1 (the image) in one group.
 fn denoise_lanes(
     pass: &ForwardPass,
     r: &Reading,
@@ -213,7 +194,7 @@ fn denoise_lanes(
     latent: &Channel,
     timestep: &Channel,
 ) -> Result<()> {
-    for (lane, stream) in [(0, "context"), (1, "image")] {
+    for (lane, stream) in [(0, "context"), (1, "latents")] {
         pass.switch(lane, "reading", &r.name)?;
         pass.switch(lane, "stream", stream)?;
         pass.group(lane, 0)?;
@@ -238,12 +219,11 @@ fn readout_rows(case: &Case, width: u32) -> Result<u32> {
     })
 }
 
-fn latent_of(case: &Case, name: &str) -> Channel {
+fn latent_of(case: &Case) -> Channel {
     Channel::from_shaped(
         [case.height, case.width, case.channels],
         case.latents.as_slice(),
     )
-    .named(name)
 }
 
 async fn denoise(
@@ -256,13 +236,13 @@ async fn denoise(
     let width = r.readout_width;
     let voxels = readout_rows(case, width)?;
     let caption_rows = context.shape().dims()[0];
-    let t = Channel::from([case.timestep]).named("t");
-    let x = latent_of(case, "latents");
+    let t = Channel::from([case.timestep]);
+    let x = latent_of(case);
     let pass = ForwardPass::new();
     denoise_lanes(&pass, &r, case, context, &x, &t)?;
 
-    let out = Channel::new([voxels, width], dtype::f32).named("velocity");
-    let ctx_out = ctx_tap.then(|| Channel::new([caption_rows, width], dtype::f32).named("ctx_tap"));
+    let out = Channel::new([voxels, width], dtype::f32);
+    let ctx_out = ctx_tap.then(|| Channel::new([caption_rows, width], dtype::f32));
     pass.epilogue(move || {
         out.put(intrinsics::output_rows(1, "velocity", voxels));
         if let Some(tapped) = &ctx_out {
@@ -291,11 +271,11 @@ async fn trajectory(
     let lat = [case.height, case.width, case.channels];
     let sched = FlowMatchEuler::from_model(steps, None)?;
     let loops = DenoiseLoop::new(&sched);
-    let latent = latent_of(case, "traj_x");
+    let latent = latent_of(case);
     let pass = ForwardPass::new();
     denoise_lanes(&pass, &r, case, context, &latent, &loops.timestep())?;
 
-    let out = Channel::new(lat, dtype::f32).named("traj_out");
+    let out = Channel::new(lat, dtype::f32);
     let dts = loops.dts();
     loops.drive(&pass, move |k| {
         let next = euler_step(
@@ -358,7 +338,7 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     let toks = Channel::from(ids);
     let embed_indptr = Channel::from([0u32, len]);
     let readout = Channel::from_iter(0..len);
-    let out = Channel::new([len, width], dtype::f32).named("text");
+    let out = Channel::new([len, width], dtype::f32);
 
     let pass = ForwardPass::new();
     pass.switch(0, "reading", &name)?;
@@ -388,9 +368,7 @@ async fn main(input: Input) -> Result<Output> {
             text: rows,
             text_rows,
             text_width,
-            refined: Vec::new(),
             caption_rows: 0,
-            dim: 0,
             velocity: Vec::new(),
             height: 0,
             width: 0,
@@ -463,13 +441,10 @@ async fn main(input: Input) -> Result<Output> {
         }
         None => (Vec::new(), 0, 0),
     };
-    let (refined, dim, caption_rows) = refine(&case, &pipe).await?;
-    // The refined caption: no pass writes it, so every denoise pass reads it.
-    let context = Channel::from_shaped([caption_rows, dim], refined.as_slice()).named("context");
+    let context = context(&case)?;
+    let caption_rows = context.shape().dims()[0];
     let (mut latent, mut sigmas, mut timesteps) = (Vec::new(), Vec::new(), Vec::new());
-    let (velocity, ctx_rows) = if input.refine_only {
-        (Vec::new(), Vec::new())
-    } else if input.steps > 0 {
+    let (velocity, ctx_rows) = if input.steps > 0 {
         let (rows, s, t) = trajectory(&case, &context, input.steps, input.stop).await?;
         latent = rows;
         sigmas = s;
@@ -491,9 +466,7 @@ async fn main(input: Input) -> Result<Output> {
         text: text_rows,
         text_rows: text_len,
         text_width,
-        refined,
         caption_rows,
-        dim,
         readout,
         velocity,
         height: case.height,

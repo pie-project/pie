@@ -95,9 +95,9 @@ async fn main(input: Input) -> Result<String> {
     let last_prompt = *prompt.last().unwrap_or(&0);
 
     let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
-    let prefill_indptr = Channel::from([0u32, n]).named("prefill_indptr");
-    let prefill_rng = Channel::from([0x51ed_u32, 0]).named("prefill_rng");
-    let first_out = Channel::new([1], dtype::i32).named("first_token");
+    let prefill_indptr = Channel::from([0u32, n]);
+    let prefill_rng = Channel::from([0x51ed_u32, 0]);
+    let first_out = Channel::new([1], dtype::i32);
 
     let prefill = ForwardPass::new();
     prefill.embed(&prompt_tokens, &prefill_indptr)?;
@@ -121,12 +121,10 @@ async fn main(input: Input) -> Result<String> {
     }
 
     if generated.len() < input.max_tokens && !stop_tokens.contains(&first) {
-        let token_in = Channel::from([first as i32]).named("token_in");
-        let rng = Channel::from([0x9e37_u32, 0]).named("rng");
-        let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
-        let token_out = Channel::new([1], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("token_out");
+        let token_in = Channel::from([first as i32]);
+        let rng = Channel::from([0x9e37_u32, 0]);
+        let embed_indptr = Channel::from([0u32, 1]);
+        let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
 
         let decode = ForwardPass::new();
         decode.embed(&token_in, &embed_indptr)?;

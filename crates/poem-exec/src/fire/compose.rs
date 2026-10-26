@@ -239,6 +239,7 @@ pub struct LaneRow {
 pub struct Composition {
     lanes: Vec<LaneRow>,
     axes: PerAxis<AxisComposition>,
+    voxel_widest: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -313,6 +314,13 @@ impl Composition {
     #[must_use]
     pub fn voxel_rows(&self) -> u32 {
         self.axes[RowAxis::Voxels].rows
+    }
+
+    /// The rows of the fire's widest voxel value: its voxel rows grown by
+    /// the widest growth among its classes. The arena's voxel rows count it.
+    #[must_use]
+    pub fn voxel_widest(&self) -> u32 {
+        self.voxel_widest
     }
 
     #[must_use]
@@ -470,10 +478,23 @@ fn seriate(
     let patches = patches as u32;
 
     let (voxels, clips) = totals[RowAxis::Voxels];
+    let (gn, gd) = tally[RowAxis::Voxels]
+        .iter()
+        .zip(&compiled.voxel_growth)
+        .filter(|((rows, _), _)| *rows > 0)
+        .map(|(_, growth)| *growth)
+        .fold((1u32, 1u32), |(an, ad), (bn, bd)| {
+            if u64::from(bn) * u64::from(ad) > u64::from(an) * u64::from(bd) {
+                (bn, bd)
+            } else {
+                (an, ad)
+            }
+        });
+    let widest = voxels.saturating_mul(u64::from(gn)).div_ceil(u64::from(gd));
     let (max_voxels, max_clips) = voxel_ladder.map_or((0, 0), |l| (l.max_rows, l.max_lanes));
-    if voxels > u64::from(max_voxels) {
+    if widest > u64::from(max_voxels) {
         return Err(Fault::TooManyVoxels {
-            voxels,
+            voxels: widest,
             max: max_voxels,
         }
         .into());
@@ -544,6 +565,7 @@ fn seriate(
     Ok(Composition {
         lanes: seriated,
         axes,
+        voxel_widest: widest as u32,
     })
 }
 

@@ -35,6 +35,22 @@ import {
 } from './trace.js';
 import { ConstData, Tensor, materialize, reshapeIdTo } from './value.js';
 
+const SDK_FRAMES = new Set(['build', 'new', 'fromConst', 'seeded', 'writer', 'from', 'fromShaped', 'seededWith', 'lazy', 'materialize', 'Channel', 'DslChannel', 'creationSite']);
+
+/** The first stack frame outside the channel constructors, as `file:line`. */
+function creationSite(): string {
+  for (const raw of (new Error().stack ?? '').split('\n').slice(1)) {
+    const line = raw.trim().replace(/^at (new )?/, '');
+    const at = line.indexOf('@');
+    const paren = line.indexOf(' (');
+    const [fn, loc] = at >= 0 ? [line.slice(0, at), line.slice(at + 1)] : paren >= 0 ? [line.slice(0, paren), line.slice(paren + 2, -1)] : ['', line];
+    if (SDK_FRAMES.has(fn.split('.').pop() ?? '')) continue;
+    const m = /^(.*):(\d+):\d+$/.exec(loc);
+    if (m) return `${m[1]}:${m[2]}`;
+  }
+  return '?';
+}
+
 /** A handle to a channel's trace state. */
 export class DslChannel {
   constructor(readonly state: ChannelState) {}
@@ -43,7 +59,7 @@ export class DslChannel {
     const gid = nextGid();
     const state: ChannelState = {
       gid,
-      name: `ch${gid}`,
+      site: creationSite(),
       shape: shapeOf(shape),
       dtype,
       capacity,
@@ -76,15 +92,11 @@ export class DslChannel {
     this.state.capacity = n;
     return this;
   }
-  named(name: string): this {
-    this.state.name = name;
-    return this;
-  }
   get gid(): number {
     return this.state.gid;
   }
-  get name(): string {
-    return this.state.name;
+  get site(): string {
+    return this.state.site;
   }
   get shape() {
     return this.state.shape;
@@ -111,17 +123,17 @@ export class DslChannel {
   }
 
   take(): Tensor {
-    if (!isTracing()) throw new TraceError(`channel ${this.name}: take() outside a stage body is a host operation; use ch.takeHost()`);
+    if (!isTracing()) throw new TraceError(`channel ${this.site}: take() outside a stage body is a host operation; use ch.takeHost()`);
     const [vid, ty] = recordChannelRead(this.state, true);
     return Tensor.node(vid, ty);
   }
   read(): Tensor {
-    if (!isTracing()) throw new TraceError(`channel ${this.name}: read() outside a stage body is a host operation; use ch.readHost()`);
+    if (!isTracing()) throw new TraceError(`channel ${this.site}: read() outside a stage body is a host operation; use ch.readHost()`);
     const [vid, ty] = recordChannelRead(this.state, false);
     return Tensor.node(vid, ty);
   }
   putTensor(t: Tensor): void {
-    if (!isTracing()) throw new TraceError(`channel ${this.name}: put(Tensor) outside a traced stage`);
+    if (!isTracing()) throw new TraceError(`channel ${this.site}: put(Tensor) outside a traced stage`);
     const [vid, ty] = materialize(t);
     const fitted = reshapeIdTo(vid, ty, this.state.shape);
     recordChannelPut(this.state, fitted);
@@ -266,10 +278,10 @@ function lint(channels: ChannelState[], sinks: [Stage, SinkCall][]): void {
     const hostConsumes = st.hostTakes > 0 || st.hostReads > 0;
     const stagePuts = st.progPuts.length > 0;
     const stageConsumes = st.progTakes.length > 0 || st.descTakes > 0;
-    if (hostWrites && hostConsumes) errs.push(`channel \`${st.name}\` has two host endpoints (host writes and host consumes); SPSC needs one pass endpoint`);
+    if (hostWrites && hostConsumes) errs.push(`channel ${st.site} has two host endpoints (host writes and host consumes); SPSC needs one pass endpoint`);
     const produced = stagePuts || hostWrites || st.seeded || st.hasSeed;
     const consumed = stageConsumes || st.progReads.length > 0 || st.descReads > 0 || hostConsumes;
-    if (consumed && !produced) errs.push(`channel \`${st.name}\` is consumed but never produced or seeded`);
+    if (consumed && !produced) errs.push(`channel ${st.site} is consumed but never produced or seeded`);
   }
   for (const [stage, s] of sinks) {
     if (stage !== Stage.PROLOGUE) errs.push(`sink \`${s.name}\` is misplaced in stage \`${STAGE_NAMES[stage]}\``);

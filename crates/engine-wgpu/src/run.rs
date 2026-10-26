@@ -411,7 +411,9 @@ impl<'c> Run<'c> {
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
             Some(Dim::Voxels) => (seated.voxel.row_offset, seated.voxel.rows),
-            Some(Dim::VoxelsTimes(k)) => (seated.voxel.row_offset * k, seated.voxel.rows * k),
+            Some(&Dim::VoxelsScaled(n, d)) => {
+                poem_ir::value::scaled_span(n, d, seated.voxel.row_offset, seated.voxel.rows)
+            }
             Some(Dim::Clips) => (seated.voxel.lane_offset, seated.voxel.lanes),
             Some(Dim::ClipsPlus(k)) => (seated.voxel.lane_offset, seated.voxel.lanes + k),
         };

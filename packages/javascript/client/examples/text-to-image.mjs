@@ -7,22 +7,22 @@
  *   node packages/javascript/client/examples/text-to-image.mjs \
  *       --prompt "a red bicycle leaning on a blue wall" --out ./out
  *
- * The whole point of this file is the FILE event. `text-to-image` streams a
+ * The whole point of this file is the FILE event. `text-to-media` streams a
  * progress line or two and then sends its output as a file; what arrives is a
  * `ReceivedFile` -- a Buffer, with the name the inferlet suggested attached.
  * That name is the difference between writing `file-0000.bin` and writing
  * `image.latent.f32` (or `image.png`, on a model whose VAE decode the
  * guest can drive), so it is what this example is about.
  *
- * `text-to-image` must already be on the server: `pie inferlet install
- * `pie run text-to-image` from a source checkout, which uploads it.
+ * `text-to-media` must already be on the server: `pie inferlet install
+ * `pie run text-to-media` from a source checkout, which uploads it.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { PieClient } from '../src/index.js';
 
-const INFERLET = 'text-to-image@0.1.0';
+const INFERLET = 'text-to-media@0.1.0';
 
 function flag(name, fallback) {
     const i = process.argv.indexOf(`--${name}`);
@@ -64,14 +64,10 @@ for (;;) {
         saved += 1;
         console.log(`wrote ${file} (${value.length.toLocaleString()} bytes)`);
     } else if (event === 'return') {
-        // The guest's report: the geometry, the sigmas it stepped, and the
-        // name it gave the file above.
+        // The guest's report: the size, the steps, and the file's name.
         if (value.startsWith('{')) {
             const report = JSON.parse(value);
-            console.log(
-                `${report.width}x${report.height} in ${report.steps} steps, ` +
-                `${report.rows} latent rows`,
-            );
+            console.log(`${report.size} in ${report.steps} steps`);
         }
         await client.close();
         process.exit(saved ? 0 : 1);

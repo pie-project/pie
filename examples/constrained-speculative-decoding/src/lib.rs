@@ -209,18 +209,17 @@ impl Target {
         let len = window.len() as u32;
 
         let tokens = Channel::from_iter(window.iter().map(|&token| token as i32));
-        let embed_indptr = Channel::from([0u32, len]).named("embed_indptr");
-        let readout = Channel::from_iter(len - rows..len).named("readout");
-        let slots = Channel::from_iter(start..start + len).named("slots");
-        let fold = Channel::from([start - self.folded]).named("fold");
+        let embed_indptr = Channel::from([0u32, len]);
+        let readout = Channel::from_iter(len - rows..len);
+        let slots = Channel::from_iter(start..start + len);
+        let fold = Channel::from([start - self.folded]);
         // A one-row `logits` is `[vocab]`, and `masked_argmax` needs the mask at the same rank.
         let allowed = if rows == 1 {
             Channel::new([vocab], dtype::bool)
         } else {
             Channel::new([rows, vocab], dtype::bool)
-        }
-        .named("allowed");
-        let target_out = Channel::new([rows], dtype::i32).named("target_tokens");
+        };
+        let target_out = Channel::new([rows], dtype::i32);
 
         let fwd = ForwardPass::new();
         fwd.embed(&tokens, &embed_indptr)?;

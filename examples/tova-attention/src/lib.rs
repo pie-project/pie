@@ -137,10 +137,10 @@ async fn main(input: Input) -> Result<Output> {
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let pipe = Pipeline::new();
 
-    let toks_p = Channel::from(&prompt_i32[..]).named("toks_p");
-    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-    let rng_p = Channel::from([input.seed, 0]).named("rng_p");
-    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
+    let toks_p = Channel::from(&prompt_i32[..]);
+    let embed_indptr_p = Channel::from([0u32, n]);
+    let rng_p = Channel::from([input.seed, 0]);
+    let tok_out_p = Channel::new([1], dtype::i32);
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -167,15 +167,11 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── DECODE LOOP (1-wide, run-ahead), with the TOVA tap. ──
     if generated.len() < max_tokens {
-        let tok_in = Channel::from([g0]).named("tok_in");
-        let rng = Channel::from([input.seed ^ 0x70a, 0]).named("rng");
-        let tok_out = Channel::new([1], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("tok_out");
-        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
-        let scores_out = Channel::new([kv_max], dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named("tova_scores");
+        let tok_in = Channel::from([g0]);
+        let rng = Channel::from([input.seed ^ 0x70a, 0]);
+        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+        let lane1 = Channel::from([0u32, 1u32]);
+        let scores_out = Channel::new([kv_max], dtype::f32).capacity(channel_capacity() as u32);
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;

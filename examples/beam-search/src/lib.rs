@@ -70,22 +70,14 @@ async fn main(input: Input) -> Result<String> {
     let scores = {
         let mut initial_scores = vec![f32::NEG_INFINITY; b as usize];
         initial_scores[0] = 0.0;
-        Channel::from(initial_scores).named("scores")
+        Channel::from(initial_scores)
     };
-    let toks = Channel::from(vec![BOS; b as usize]).named("toks");
-    let out = Channel::new([b], dtype::i32)
-        .capacity(channel_capacity() as u32)
-        .named("out");
-    let out_par = Channel::new([b], dtype::u32)
-        .capacity(channel_capacity() as u32)
-        .named("out_par");
-    let out_scr = Channel::new([b], dtype::f32)
-        .capacity(channel_capacity() as u32)
-        .named("out_scr");
-    let out_greedy = Channel::new([b], dtype::i32)
-        .capacity(channel_capacity() as u32)
-        .named("out_greedy");
-    let lanes_b = Channel::from_iter(0u32..=b).named("embed_indptr");
+    let toks = Channel::from(vec![BOS; b as usize]);
+    let out = Channel::new([b], dtype::i32).capacity(channel_capacity() as u32);
+    let out_par = Channel::new([b], dtype::u32).capacity(channel_capacity() as u32);
+    let out_scr = Channel::new([b], dtype::f32).capacity(channel_capacity() as u32);
+    let out_greedy = Channel::new([b], dtype::i32).capacity(channel_capacity() as u32);
+    let lanes_b = Channel::from_iter(0u32..=b);
 
     let pipeline = Pipeline::new();
     let fwd = ForwardPass::new();
@@ -105,12 +97,12 @@ async fn main(input: Input) -> Result<String> {
     let pool: Vec<&WorkingSet> = vec![&ws; b as usize];
 
     let init_mask: Vec<bool> = (0..b).flat_map(|_| (0..pool_len).map(|p| p == 0)).collect();
-    let mask = Channel::from_shaped([b, pool_len], init_mask).named("mask");
-    let slots = Channel::from(vec![0u32; b as usize]).named("slots");
+    let mask = Channel::from_shaped([b, pool_len], init_mask);
+    let slots = Channel::from(vec![0u32; b as usize]);
     // A beam's RoPE position is its depth, not its pool slot.
-    let pos = Channel::from(vec![0u32; b as usize]).named("pos");
-    let fill = Channel::from([1u32]).named("fill");
-    let kv_len = Channel::from(vec![1u32; b as usize]).named("kv_len");
+    let pos = Channel::from(vec![0u32; b as usize]);
+    let fill = Channel::from([1u32]);
+    let kv_len = Channel::from(vec![1u32; b as usize]);
     fwd.mask(&mask)?;
     fwd.state(
         &pool,

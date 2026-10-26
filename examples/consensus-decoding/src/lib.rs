@@ -96,10 +96,10 @@ async fn main(input: Input) -> Result<String> {
         let ws = WorkingSet::new();
 
         let prefix_i32: Vec<i32> = prefix.iter().map(|&t| t as i32).collect();
-        let toks_p = Channel::from(prefix_i32).named("toks_p"); // [N] i32 (seeded)
-        let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-        let rng_p = Channel::from([0x51ed_u32, 0]).named("rng_p");
-        let g0s_ch = Channel::new([1], dtype::i32).named("g0s");
+        let toks_p = Channel::from(prefix_i32); // [N] i32 (seeded)
+        let embed_indptr_p = Channel::from([0u32, n]);
+        let rng_p = Channel::from([0x51ed_u32, 0]);
+        let g0s_ch = Channel::new([1], dtype::i32);
 
         let fwd_p = ForwardPass::new();
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -154,12 +154,10 @@ async fn main(input: Input) -> Result<String> {
         }
 
         // ──────────────── 2. BATCHED DECODE (B lanes = candidates) ────────────
-        let tok_in = Channel::from(g0s.clone()).named("tok_in"); // [B] device loop-carried
-        let out = Channel::new([b], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("out");
-        let rng = Channel::from([0x9e37_u32, 0]).named("rng");
-        let lanes = Channel::from((0..=b).collect::<Vec<u32>>()).named("embed_indptr");
+        let tok_in = Channel::from(g0s.clone()); // [B] device loop-carried
+        let out = Channel::new([b], dtype::i32).capacity(channel_capacity() as u32);
+        let rng = Channel::from([0x9e37_u32, 0]);
+        let lanes = Channel::from((0..=b).collect::<Vec<u32>>());
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lanes)?;

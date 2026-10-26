@@ -467,7 +467,7 @@ impl Input {
             .refined(self.over.clone())
     }
 
-    /// The guest input `name`; one name is one input wherever it is read.
+    /// The guest input `name`, one input within any reading that reads it.
     #[must_use]
     pub fn input(
         &self,

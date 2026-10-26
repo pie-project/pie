@@ -263,7 +263,7 @@ struct Output {
     sweep_velocity: Vec<Vec<f32>>,
 }
 
-const STREAMS: [&str; 3] = ["text", "context", "image"];
+const STREAMS: [&str; 3] = ["text", "context", "latents"];
 
 struct Shared {
     text: Channel,
@@ -274,18 +274,15 @@ struct Shared {
 impl Shared {
     fn of(case: &Case) -> Shared {
         Shared {
-            text: Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
-                .named("text"),
+            text: Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice()),
             context: Channel::from_shaped(
                 [case.context_rows, case.context_width],
                 case.context.as_slice(),
-            )
-            .named("context"),
+            ),
             blank: Channel::from_shaped(
                 [case.context_rows, case.context_width],
                 vec![0f32; case.context.len()],
-            )
-            .named("blank_context"),
+            ),
         }
     }
 }
@@ -309,7 +306,7 @@ fn velocity_width(reading: &str) -> Result<u32> {
             }
         }
     }
-    let image = model::lane_of(&[("reading", reading), ("stream", "image")])?;
+    let image = model::lane_of(&[("reading", reading), ("stream", "latents")])?;
     image
         .outputs
         .iter()
@@ -356,7 +353,7 @@ async fn sweep_fire(
 ) -> Result<Vec<Vec<f32>>> {
     let rows = case.voxels();
     let pass = ForwardPass::new();
-    let t = Channel::from([case.timestep]).named("sweep_t");
+    let t = Channel::from([case.timestep]);
     let mut outs: Vec<(u32, Channel)> = Vec::new();
     for group in 0..groups {
         let scale = if group <= 1 {
@@ -365,11 +362,9 @@ async fn sweep_fire(
             1.0 + group as f32 / 4.0
         };
         let latents: Vec<f32> = case.latents.iter().map(|v| v * scale).collect();
-        let x = Channel::from_shaped(case.lat(), latents.as_slice())
-            .named(&format!("sweep_latents_g{group}"));
+        let x = Channel::from_shaped(case.lat(), latents.as_slice());
         let image = bind_group(&pass, reading, group, &shared.text, &shared.context, &x, &t)?;
-        let out =
-            Channel::new([rows, width], dtype::f32).named(&format!("sweep_velocity_g{group}"));
+        let out = Channel::new([rows, width], dtype::f32);
         outs.push((image, out));
     }
     let readbacks = outs.clone();
@@ -402,12 +397,12 @@ async fn guided_step(
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     let rows = case.voxels();
     let pass = ForwardPass::new();
-    let t = Channel::from([case.timestep]).named("cfg_t");
-    let x = Channel::from_shaped(case.lat(), case.latents.as_slice()).named("cfg_latents");
+    let t = Channel::from([case.timestep]);
+    let x = Channel::from_shaped(case.lat(), case.latents.as_slice());
     let cond = bind_group(&pass, reading, 0, &shared.text, &shared.context, &x, &t)?;
     let uncond = bind_group(&pass, reading, 1, &shared.text, &shared.blank, &x, &t)?;
-    let guided = Channel::new([rows, width], dtype::f32).named("cfg_guided");
-    let unguided = Channel::new([rows, width], dtype::f32).named("cfg_uncond");
+    let guided = Channel::new([rows, width], dtype::f32);
+    let unguided = Channel::new([rows, width], dtype::f32);
     pass.epilogue(move || {
         let v_u = intrinsics::output_rows(uncond, "velocity", rows);
         guided.put(cfg_combine(
@@ -451,8 +446,8 @@ async fn dpm2m_loop(
     let fires = loops.fires();
 
     let pass = ForwardPass::new();
-    let x = Channel::from_shaped(lat, case.latents.as_slice()).named("dpm_latents");
-    let x0_prev = Channel::from_shaped(flat, vec![0f32; (n * c) as usize]).named("dpm_x0_prev");
+    let x = Channel::from_shaped(lat, case.latents.as_slice());
+    let x0_prev = Channel::from_shaped(flat, vec![0f32; (n * c) as usize]);
     let image = bind_group(
         &pass,
         reading,
@@ -462,12 +457,8 @@ async fn dpm2m_loop(
         &x,
         &loops.timestep(),
     )?;
-    let out_x = Channel::new(flat, dtype::f32)
-        .capacity(channel_capacity() as u32)
-        .named("dpm_out_x");
-    let out_v = Channel::new(flat, dtype::f32)
-        .capacity(channel_capacity() as u32)
-        .named("dpm_out_v");
+    let out_x = Channel::new(flat, dtype::f32).capacity(channel_capacity() as u32);
+    let out_v = Channel::new(flat, dtype::f32).capacity(channel_capacity() as u32);
     loops.drive(&pass, move |k| {
         let v = intrinsics::output_rows(image, "velocity", n);
         // `dpm2m_step`'s arithmetic over the flattened latent.
@@ -552,7 +543,7 @@ async fn cached_loop(
 
     // `x` is both the image lane's `latents` input and the epilogue's loop state.
     let pass = ForwardPass::new();
-    let x = Channel::from_shaped(lat, vec![0f32; cells]).named("cache_latents");
+    let x = Channel::from_shaped(lat, vec![0f32; cells]);
     let image = bind_group(
         &pass,
         reading,
@@ -562,20 +553,16 @@ async fn cached_loop(
         &x,
         &loops.timestep(),
     )?;
-    let rng = Channel::from(rng_state(seed)).named("cache_rng");
-    let out = Channel::new(flat, dtype::f32)
-        .capacity(channel_capacity() as u32)
-        .named("cache_out");
+    let rng = Channel::from(rng_state(seed));
+    let out = Channel::new(flat, dtype::f32).capacity(channel_capacity() as u32);
     // `[rel this fire, did this fire skip, the device's running skip count]`.
-    let probe = Channel::new([3u32], dtype::f32)
-        .capacity(channel_capacity() as u32)
-        .named("cache_probe");
+    let probe = Channel::new([3u32], dtype::f32).capacity(channel_capacity() as u32);
 
     match threshold {
         Some(thr) => {
-            let cache = Channel::from_shaped(flat, vec![0f32; cells]).named("cache_velocity");
-            let skip = Channel::from([0f32]).named("cache_skip");
-            let count = Channel::from([0f32]).named("cache_count");
+            let cache = Channel::from_shaped(flat, vec![0f32; cells]);
+            let skip = Channel::from([0f32]);
+            let count = Channel::from([0f32]);
             loops.drive(&pass, move |k| {
                 let v_now = intrinsics::output_rows(image, "velocity", n);
                 let v_prev = cache.take();
@@ -651,15 +638,13 @@ async fn step(
     rows: u32,
     reading: &str,
     pipe: &Pipeline,
-    index: u32,
     latents: &[f32],
     timestep: f32,
     text_tap: Option<&mut Vec<f32>>,
     plan: Option<&ClassPlan>,
 ) -> Result<Vec<f32>> {
-    let tag = format!("s{index}_");
     let text_rows = case.text_rows;
-    let t = Channel::from([timestep]).named(&format!("{tag}t"));
+    let t = Channel::from([timestep]);
     let swapped = plan.filter(|plan| plan.swap_text).map(|plan| {
         let w = case.text_width as usize;
         let mut text = case.text.clone();
@@ -670,9 +655,9 @@ async fn step(
                 }
             }
         }
-        Channel::from_shaped([case.text_rows, case.text_width], text).named(&format!("{tag}text"))
+        Channel::from_shaped([case.text_rows, case.text_width], text)
     });
-    let x = Channel::from_shaped(case.lat(), latents).named(&format!("{tag}latents"));
+    let x = Channel::from_shaped(case.lat(), latents);
     let pass = ForwardPass::new();
     let image = bind_group(
         &pass,
@@ -685,13 +670,13 @@ async fn step(
     )?;
     if let Some(plan) = plan {
         let (n, cells) = plan.mask(case.context_rows);
-        let mask = Channel::from_shaped([n, n], cells).named(&format!("{tag}mask"));
+        let mask = Channel::from_shaped([n, n], cells);
         pass.mask(&mask)?;
     }
-    let out = Channel::new([rows, width], dtype::f32).named(&format!("{tag}velocity"));
+    let out = Channel::new([rows, width], dtype::f32);
     let text_out = text_tap
         .as_ref()
-        .map(|_| Channel::new([text_rows, width], dtype::f32).named(&format!("{tag}text_tap")));
+        .map(|_| Channel::new([text_rows, width], dtype::f32));
     let tapped = text_out;
     pass.epilogue(move || {
         out.put(intrinsics::output_rows(image, "velocity", rows));
@@ -842,7 +827,6 @@ async fn main(input: Input) -> Result<Output> {
             rows,
             reading,
             &pipe,
-            0,
             &case.latents,
             case.timestep,
             input.tap_text.then_some(&mut text_tap),
@@ -868,7 +852,6 @@ async fn main(input: Input) -> Result<Output> {
             rows,
             reading,
             &pipe,
-            0,
             &case.latents,
             case.timestep,
             input.tap_text.then_some(&mut text_tap),
@@ -907,7 +890,6 @@ async fn main(input: Input) -> Result<Output> {
             rows,
             reading,
             &pipe,
-            i,
             &x,
             sched.timestep(i),
             None,

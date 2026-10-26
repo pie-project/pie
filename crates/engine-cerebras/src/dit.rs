@@ -1,7 +1,7 @@
 //! Voxel axis, guest inputs, group packings and float exports for the diffusion and video families.
 
 use kernels_cerebras::Tensor;
-use poem_compiler::{CompiledModel, VoxelLadder};
+use poem_compiler::CompiledModel;
 use poem_exec::feeds::{Feeds, Seat};
 use poem_exec::fire::{Composition, LaneFacts, LaneRow};
 use poem_ir::{ClassSet, Def, Dtype, Operands, RuntimeInput, Trace, Ty, ValueId};
@@ -37,30 +37,6 @@ pub struct InputCell<'a> {
 /// What a lane decoded: its pixel rows (f32) and the output box of each of
 /// its clips.
 pub type Pixels = (Vec<f32>, Vec<[u32; 3]>);
-
-/// The voxel ladder a plan with a voxel axis loads at (engine-cuda
-/// `api::voxel_ladder`).
-#[must_use]
-pub fn voxel_ladder(
-    trace: &Trace,
-    max_voxels: Option<u32>,
-    max_clips: Option<u32>,
-    max_lanes: u32,
-) -> Option<VoxelLadder> {
-    const DERIVED_VOXEL_CEILING: u32 = 65_536;
-    let declares_voxels = trace.values.iter().any(|decl| {
-        matches!(&decl.ty, Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Voxels))
-    });
-    if !declares_voxels {
-        return None;
-    }
-    let max_voxels = max_voxels.unwrap_or(DERIVED_VOXEL_CEILING).max(1);
-    Some(VoxelLadder::new(
-        max_voxels,
-        max_clips.unwrap_or(max_lanes).clamp(1, max_voxels),
-    ))
-}
 
 #[derive(Debug, Clone)]
 struct VoxelSeat {

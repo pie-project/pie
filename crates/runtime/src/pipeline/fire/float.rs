@@ -356,6 +356,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             fwd_rep,
             cells,
             failure: pipeline_failure,
+            retired: None,
         }));
     Ok(Ok(()))
 }

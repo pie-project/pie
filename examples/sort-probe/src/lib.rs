@@ -174,28 +174,27 @@ async fn main(input: Input) -> Result<String> {
     let n = prompt.len() as u32;
 
     let toks = Channel::from_iter(prompt.iter().map(|&token| token as i32));
-    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
-    let logits_out = Channel::new([vocab], dtype::f32).named("logits");
-    let probs_out = Channel::new([vocab], dtype::f32).named("probabilities");
-    let keep_out = Channel::new([vocab], dtype::i32).named("nucleus_keep");
-    let cumsum_out = Channel::new([vocab], dtype::f32).named("cumsum");
-    let sorted_out = Channel::new([vocab], dtype::f32).named("sorted");
-    let order_out = Channel::new([vocab], dtype::i32).named("order");
-    let top1_v = Channel::new([K], dtype::f32).named("top1_v");
-    let top1_i = Channel::new([K], dtype::i32).named("top1_i");
-    let top2_v = Channel::new([K], dtype::f32).named("top2_v");
-    let top2_i = Channel::new([K], dtype::i32).named("top2_i");
-    let argmax2 = Channel::new([2], dtype::i32).named("argmax2");
-    let bc_out = Channel::new([5], dtype::f32).named("bcast_samples");
+    let embed_indptr = Channel::from([0u32, n]);
+    let logits_out = Channel::new([vocab], dtype::f32);
+    let probs_out = Channel::new([vocab], dtype::f32);
+    let keep_out = Channel::new([vocab], dtype::i32);
+    let cumsum_out = Channel::new([vocab], dtype::f32);
+    let sorted_out = Channel::new([vocab], dtype::f32);
+    let order_out = Channel::new([vocab], dtype::i32);
+    let top1_v = Channel::new([K], dtype::f32);
+    let top1_i = Channel::new([K], dtype::i32);
+    let top2_v = Channel::new([K], dtype::f32);
+    let top2_i = Channel::new([K], dtype::i32);
+    let argmax2 = Channel::new([2], dtype::i32);
+    let bc_out = Channel::new([5], dtype::f32);
     let bc_idx = Channel::from(vec![
         0i32,
         1,
         vocab as i32,
         vocab as i32 + 1,
         2 * vocab as i32 - 1,
-    ])
-    .named("bcast_idx");
-    let offs = Channel::from(vec![0.0f32, -0.5]).named("offs");
+    ]);
+    let offs = Channel::from(vec![0.0f32, -0.5]);
     const HIST: [i32; 16] = [5, 6, 7, 5, 6, 7, 5, 6, 0, 0, 0, 0, 0, 0, 0, 0];
     const HLEN: u32 = 8;
     let dry = DryCfg {
@@ -205,13 +204,13 @@ async fn main(input: Input) -> Result<String> {
         max_ngram: 8,
         capacity: 16,
     };
-    let hist_ch = Channel::from(HIST.to_vec()).named("hist");
-    let hlen_ch = Channel::from([HLEN]).named("hlen");
-    let m_out = Channel::new([16], dtype::f32).named("dry_m");
-    let cnt_out = Channel::new([1], dtype::f32).named("dry_count");
-    let peak_out = Channel::new([1], dtype::f32).named("dry_peak");
-    let argpen_out = Channel::new([1], dtype::i32).named("dry_argmax");
-    let histn_out = Channel::new([16], dtype::i32).named("dry_hist_next");
+    let hist_ch = Channel::from(HIST.to_vec());
+    let hlen_ch = Channel::from([HLEN]);
+    let m_out = Channel::new([16], dtype::f32);
+    let cnt_out = Channel::new([1], dtype::f32);
+    let peak_out = Channel::new([1], dtype::f32);
+    let argpen_out = Channel::new([1], dtype::i32);
+    let histn_out = Channel::new([16], dtype::i32);
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;

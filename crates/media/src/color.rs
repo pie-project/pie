@@ -44,6 +44,20 @@ pub fn rgb8_to_i420(rgb: &[u8], width: usize, height: usize, out: &mut Vec<u8>) 
     out.extend_from_slice(&vs);
 }
 
+pub fn i420_to_rgb8(yuv: &[u8], width: usize, height: usize, out: &mut Vec<u8>) {
+    let (us, vs) = yuv[width * height..].split_at(width * height / 4);
+    for y in 0..height {
+        for x in 0..width {
+            let c = 298 * (yuv[y * width + x] as i32 - 16);
+            let at = (y / 2) * (width / 2) + x / 2;
+            let (d, e) = (us[at] as i32 - 128, vs[at] as i32 - 128);
+            for v in [c + 409 * e, c - 100 * d - 208 * e, c + 516 * d] {
+                out.push(((v + 128) >> 8).clamp(0, 255) as u8);
+            }
+        }
+    }
+}
+
 pub fn rgb8_to_nv12_pitched(rgb: &[u8], width: usize, height: usize, pitch: usize, dst: &mut [u8]) {
     debug_assert_eq!(rgb.len(), width * height * 3);
     debug_assert!(pitch >= width);

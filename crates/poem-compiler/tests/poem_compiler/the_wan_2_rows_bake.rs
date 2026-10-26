@@ -233,8 +233,8 @@ fn each_reading_reads_out_what_its_facts_state() {
             .count();
         assert_eq!(
             voxels,
-            if is_flagship(deployment) { 3 } else { 1 },
-            "{deployment}: the denoiser's latent, and a voxel input per VAE clip width"
+            if is_flagship(deployment) { 2 } else { 1 },
+            "{deployment}: the latents the denoiser and the decoder read alike, and the pixels"
         );
     }
 }
@@ -245,7 +245,7 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
         let classes = poem::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{deployment}: a merge does not resolve: {why:?}"));
         let mut lanes: Vec<(&str, Option<&str>, bool)> = vec![
-            ("denoise", Some("video"), false),
+            ("denoise", Some("latents"), false),
             ("denoise", Some("context"), false),
         ];
         if is_flagship(deployment) {
@@ -293,7 +293,7 @@ fn the_attentions_pair_as_the_architecture_says() {
                 other => panic!("{deployment}: a ragged CSR that is not an indptr: {other:?}"),
             }
         };
-        let video = word(&plan, denoise, Some("video"));
+        let video = word(&plan, denoise, Some("latents"));
         let context = word(&plan, denoise, Some("context"));
         let (mut self_paired, mut crossed, mut encoder) = (0usize, 0usize, 0usize);
         for node in &plan.nodes {

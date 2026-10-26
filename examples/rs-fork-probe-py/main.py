@@ -28,8 +28,8 @@ async def append_tokens(ws: WorkingSet, pipeline: Pipeline, tokens: list[int]) -
         raise ValueError("cannot append an empty token sequence")
     n = len(tokens)
     token_input = Channel.from_(tokens, dtype.i32)
-    embed_indptr = Channel.from_([0, n], dtype.u32).named("embed_indptr")
-    next_token = Channel([1], dtype.i32).named("next_token")
+    embed_indptr = Channel.from_([0, n], dtype.u32)
+    next_token = Channel([1], dtype.i32)
 
     fwd = ForwardPass()
     fwd.embed(token_input, embed_indptr)
@@ -53,9 +53,9 @@ async def generate(ws: WorkingSet, pipeline: Pipeline, first_token: int, max_tok
     if len(generated) >= max_tokens or first_token in stop_tokens:
         return generated
 
-    token_in = Channel.from_([first_token], dtype.i32).named("token_in")
-    embed_indptr = Channel.from_([0, 1], dtype.u32).named("embed_indptr")
-    token_out = Channel([1], dtype.i32).capacity(channel_capacity()).named("token_out")
+    token_in = Channel.from_([first_token], dtype.i32)
+    embed_indptr = Channel.from_([0, 1], dtype.u32)
+    token_out = Channel([1], dtype.i32).capacity(channel_capacity())
 
     fwd = ForwardPass()
     fwd.embed(token_in, embed_indptr)

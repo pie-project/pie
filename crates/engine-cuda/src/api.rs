@@ -17,7 +17,7 @@ use engine::program::{
 };
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
-use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder};
+use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
 
 use crate::error::Fault;
@@ -456,28 +456,6 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
     })
 }
 
-#[must_use]
-pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<VoxelLadder> {
-    const DERIVED_VOXEL_CEILING: u32 = 65_536;
-
-    let declares_voxels = trace.values.iter().any(|decl| {
-        matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Voxels))
-    });
-    if !declares_voxels {
-        return None;
-    }
-    let max_voxels = budgets.max_voxels.unwrap_or(DERIVED_VOXEL_CEILING).max(1);
-    Some(VoxelLadder {
-        max_voxels,
-        buckets: Vec::new(),
-        max_clips: budgets
-            .max_clips
-            .unwrap_or(budgets.max_lanes)
-            .clamp(1, max_voxels),
-    })
-}
-
 fn adapter_of(
     shell: &mut Shell,
     program: engine::program::ProgramId,
@@ -612,7 +590,12 @@ impl Engine for Cuda {
         }
 
         let patches = patch_ladder(&trace, &budgets);
-        let voxels = voxel_ladder(&trace, &budgets);
+        let voxels = poem_compiler::VoxelLadder::of(
+            &trace,
+            budgets.max_voxels,
+            budgets.max_clips,
+            budgets.max_lanes,
+        );
         let budget = bake_budgets(&budgets, &trace);
         let mut staged = Shell::stage(Boot {
             trace,

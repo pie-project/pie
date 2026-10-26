@@ -568,10 +568,10 @@ async fn main(input: Input) -> Result<Output> {
         .map_or(1, |output| output.max_rows);
     for &(base, end) in &readout_spans(n, max) {
         let len = end - base;
-        let toks = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
-        let indptr = Channel::from([0u32, len]).named("embed_indptr_p");
-        let readout = Channel::from([len - 1]).named("readout_p");
-        let next = Channel::new([1], dtype::i32).named("next_p");
+        let toks = Channel::from(&prompt_i32[base as usize..end as usize]);
+        let indptr = Channel::from([0u32, len]);
+        let readout = Channel::from([len - 1]);
+        let next = Channel::new([1], dtype::i32);
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;
@@ -624,11 +624,9 @@ async fn main(input: Input) -> Result<Output> {
     while generated.len() < input.max_tokens && !generated.iter().any(|t| stop_tokens.contains(t)) {
         if input.baseline {
             // One token a fire, the road the speedup is measured against.
-            let toks = Channel::from([anchor]).named("toks_b");
-            let indptr = Channel::from([0u32, 1]).named("embed_indptr_b");
-            let next = Channel::new([1], dtype::i32)
-                .capacity(channel_capacity() as u32)
-                .named("next_b");
+            let toks = Channel::from([anchor]);
+            let indptr = Channel::from([0u32, 1]);
+            let next = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
 
             let fwd = ForwardPass::new();
             fwd.embed(&toks, &indptr)?;
@@ -690,7 +688,7 @@ async fn main(input: Input) -> Result<Output> {
         let mut verify = planned.unwrap_or(1);
 
         let drafting = planned.is_some();
-        let fold_len = Channel::from([survivors]).named("fold_len_v");
+        let fold_len = Channel::from([survivors]);
         let mut proposals_owned: Vec<i32> = Vec::new();
         // The draft's confidence at each proposal, under the verify budget.
         let mut confidence: Vec<f32> = Vec::new();
@@ -704,25 +702,19 @@ async fn main(input: Input) -> Result<Output> {
         } else {
             let mut ids = vec![mask_token; block as usize];
             ids[0] = anchor;
-            let toks = Channel::from(ids.as_slice()).named("toks_d");
-            let indptr = Channel::from([0u32, block]).named("embed_indptr_d");
-            let slots = Channel::from_iter(held..held + block).named("slots_d");
-            let kv_len = Channel::from([held + block]).named("kv_len_d");
+            let toks = Channel::from(ids.as_slice());
+            let indptr = Channel::from([0u32, block]);
+            let slots = Channel::from_iter(held..held + block);
+            let kv_len = Channel::from([held + block]);
             // A DFlash2 head's selector picks one row per block row, so the
             // readout covers the block; the proposals are cut to the verify
             // width afterwards.
             let shown = block;
-            let readout = Channel::from_iter(0..shown).named("readout_d");
-            let out = Channel::new([shown], dtype::i32)
-                .capacity(channel_capacity() as u32)
-                .named("drafts_d");
-            let conf = Channel::new([shown * 2], dtype::f32)
-                .capacity(channel_capacity() as u32)
-                .named("conf_d");
+            let readout = Channel::from_iter(0..shown);
+            let out = Channel::new([shown], dtype::i32).capacity(channel_capacity() as u32);
+            let conf = Channel::new([shown * 2], dtype::f32).capacity(channel_capacity() as u32);
             let want_margin = input.margin_width && !input.verify_budget;
-            let sure = Channel::new([shown], dtype::f32)
-                .capacity(channel_capacity() as u32)
-                .named("sure_d");
+            let sure = Channel::new([shown], dtype::f32).capacity(channel_capacity() as u32);
             let want_sure = input.verify_budget;
 
             let fwd = ForwardPass::new();
@@ -796,13 +788,11 @@ async fn main(input: Input) -> Result<Output> {
         // ── the verify: ONE trunk fire over `[anchor, proposals]` ────────
         let mut fed = vec![anchor];
         fed.extend_from_slice(&proposals[..verify as usize - 1]);
-        let toks = Channel::from(fed.as_slice()).named("toks_v");
-        let indptr = Channel::from([0u32, verify]).named("embed_indptr_v");
-        let slots = Channel::from_iter(held..held + verify).named("slots_v");
-        let readout = Channel::from_iter(0..verify).named("readout_v");
-        let truth = Channel::new([verify], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("truth_v");
+        let toks = Channel::from(fed.as_slice());
+        let indptr = Channel::from([0u32, verify]);
+        let slots = Channel::from_iter(held..held + verify);
+        let readout = Channel::from_iter(0..verify);
+        let truth = Channel::new([verify], dtype::i32).capacity(channel_capacity() as u32);
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;

@@ -204,10 +204,10 @@ impl DenoiseLoop {
         dts.push(0.0);
         DenoiseLoop {
             pipe: Pipeline::new(),
-            step: Channel::from([0u32]).named("step"),
-            timestep: Channel::from([ts[0]]).named("t"),
-            ts: Channel::from(ts).named("ts"),
-            dts: Channel::from(dts).named("dts"),
+            step: Channel::from([0u32]),
+            timestep: Channel::from([ts[0]]),
+            ts: Channel::from(ts),
+            dts: Channel::from(dts),
             fires: sched.steps() + 1,
         }
     }
@@ -304,10 +304,10 @@ impl Dpm2m {
     #[must_use]
     pub fn channels(&self) -> Dpm2mChannels {
         Dpm2mChannels {
-            sigma_s: Channel::from(self.sigma_s.clone()).named("dpm_sigma_s"),
-            ratio: Channel::from(self.ratio.clone()).named("dpm_ratio"),
-            gain: Channel::from(self.gain.clone()).named("dpm_gain"),
-            mix: Channel::from(self.mix.clone()).named("dpm_mix"),
+            sigma_s: Channel::from(self.sigma_s.clone()),
+            ratio: Channel::from(self.ratio.clone()),
+            gain: Channel::from(self.gain.clone()),
+            mix: Channel::from(self.mix.clone()),
         }
     }
 }

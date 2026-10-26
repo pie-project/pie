@@ -93,7 +93,7 @@ impl GenerativeFacts {
         parts.join(" · ")
     }
 
-    /// Whether it binds the `latents` and `timestep` inputs `text-to-image` drives.
+    /// Whether it binds the `latents` and `timestep` inputs `text-to-media` drives.
     pub fn text_to_image(&self) -> bool {
         ["latents[", "timestep["]
             .iter()

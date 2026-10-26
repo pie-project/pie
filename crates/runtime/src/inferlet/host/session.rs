@@ -168,6 +168,10 @@ impl pie::inferlet::session::Host for ProcessCtx {
         Ok(Ok(()))
     }
 
+    async fn file(&mut self, name: String) -> Result<Option<Vec<u8>>> {
+        Ok(ProcessCtx::file(self, &name))
+    }
+
     async fn receive_blocking(&mut self) -> Result<Option<String>> {
         let process_id = self.id();
         let message = idle_while(

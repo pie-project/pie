@@ -211,33 +211,21 @@ struct KnobChannels {
 }
 
 impl KnobChannels {
-    fn new(s: &Sampling, tag: &str) -> Self {
-        let f = |on: bool, v: f32, name: &str| {
-            on.then(|| Channel::from([v]).named(&format!("{name}{tag}")))
-        };
+    fn new(s: &Sampling) -> Self {
+        let f = |on: bool, v: f32| on.then(|| Channel::from([v]));
         let sampled = s.temperature > 0.0;
         let penalized = s.penalized();
         Self {
             temperature: sampled.then(|| s.temperature.max(1e-4)),
-            top_p: f(sampled && s.top_p < 1.0, s.top_p, "top_p"),
-            top_k: (sampled && s.top_k > 0)
-                .then(|| Channel::from([s.top_k]).named(&format!("top_k{tag}"))),
-            min_p: f(sampled && s.min_p > 0.0, s.min_p, "min_p"),
+            top_p: f(sampled && s.top_p < 1.0, s.top_p),
+            top_k: (sampled && s.top_k > 0).then(|| Channel::from([s.top_k])),
+            min_p: f(sampled && s.min_p > 0.0, s.min_p),
             repetition: f(
                 penalized && s.repetition_penalty != 1.0,
                 s.repetition_penalty,
-                "rep_pen",
             ),
-            frequency: f(
-                penalized && s.frequency_penalty != 0.0,
-                s.frequency_penalty,
-                "freq_pen",
-            ),
-            presence: f(
-                penalized && s.presence_penalty != 0.0,
-                s.presence_penalty,
-                "pres_pen",
-            ),
+            frequency: f(penalized && s.frequency_penalty != 0.0, s.frequency_penalty),
+            presence: f(penalized && s.presence_penalty != 0.0, s.presence_penalty),
             logprobs: s.logprobs,
         }
     }
@@ -374,21 +362,11 @@ fn logprob_of(values: &[f32], ids: &[i32]) -> Logprob {
 }
 
 /// The channels a pass lands its logprobs in, where asked.
-fn logprob_channels(
-    logprobs: Option<u32>,
-    tag: &str,
-    capacity: u32,
-) -> Option<(Channel, Option<Channel>)> {
+fn logprob_channels(logprobs: Option<u32>, capacity: u32) -> Option<(Channel, Option<Channel>)> {
     logprobs.map(|top| {
         (
-            Channel::new([1 + top], dtype::f32)
-                .capacity(capacity)
-                .named(&format!("lp{tag}")),
-            (top > 0).then(|| {
-                Channel::new([top], dtype::i32)
-                    .capacity(capacity)
-                    .named(&format!("lp_ids{tag}"))
-            }),
+            Channel::new([1 + top], dtype::f32).capacity(capacity),
+            (top > 0).then(|| Channel::new([top], dtype::i32).capacity(capacity)),
         )
     })
 }
@@ -436,22 +414,19 @@ async fn score_prompt(
         .find(|output| output.name == "logits")
         .map_or(1, |output| output.max_rows);
     let mut scored = Vec::with_capacity(rows as usize);
-    for (at, &(base, end)) in readout_spans(rows, max)
-        .iter()
-        .enumerate()
-    {
+    for &(base, end) in readout_spans(rows, max).iter() {
         let len = end - base;
         let (base, end) = (base as usize, end as usize);
-        let toks = Channel::from(&prompt[base..end]).named(&format!("toks_s{at}"));
-        let embed_indptr = Channel::from([0u32, len]).named(&format!("embed_indptr_s{at}"));
-        let readout = Channel::from_iter(0..len).named(&format!("readout_s{at}"));
-        let targets = Channel::from(&prompt[base + 1..end + 1]).named(&format!("targets_s{at}"));
-        let chosen_out = Channel::new([len], dtype::f32).named(&format!("chosen_s{at}"));
-        let rank_out = Channel::new([len], dtype::f32).named(&format!("rank_s{at}"));
+        let toks = Channel::from(&prompt[base..end]);
+        let embed_indptr = Channel::from([0u32, len]);
+        let readout = Channel::from_iter(0..len);
+        let targets = Channel::from(&prompt[base + 1..end + 1]);
+        let chosen_out = Channel::new([len], dtype::f32);
+        let rank_out = Channel::new([len], dtype::f32);
         let top_out = (top > 0).then(|| {
             (
-                Channel::new([len, top], dtype::f32).named(&format!("top_s{at}")),
-                Channel::new([len, top], dtype::i32).named(&format!("top_ids_s{at}")),
+                Channel::new([len, top], dtype::f32),
+                Channel::new([len, top], dtype::i32),
             )
         });
 
@@ -612,30 +587,28 @@ pub async fn generate(
     // logprobs, which the host reads beside each token.
     let carried_on = (guide.is_none() && sampling.logprobs.is_none()).then(|| {
         (
-            Channel::new([1], dtype::i32).named("tok_in").queued(),
+            Channel::new([1], dtype::i32).queued(),
             penalized.then(|| {
                 (
-                    Channel::new([vocab], dtype::f32).named("counts").queued(),
-                    Channel::new([vocab], dtype::f32).named("present").queued(),
+                    Channel::new([vocab], dtype::f32).queued(),
+                    Channel::new([vocab], dtype::f32).queued(),
                 )
             }),
         )
     });
-    let toks = Channel::from(&prompt_i32[base..]).named("toks_p");
-    let embed_indptr = Channel::from([0u32, n - base as u32]).named("embed_indptr_p");
-    let rng = Channel::from([sampling.seed, 0u32]).named("rng_p");
+    let toks = Channel::from(&prompt_i32[base..]);
+    let embed_indptr = Channel::from([0u32, n - base as u32]);
+    let rng = Channel::from([sampling.seed, 0u32]);
     let hist = penalized.then(|| {
         (
-            Channel::from(vec![0.0f32; vocab as usize]).named("counts_p"),
-            Channel::from(present.clone()).named("present_p"),
+            Channel::from(vec![0.0f32; vocab as usize]),
+            Channel::from(present.clone()),
         )
     });
-    let mask = guide
-        .is_some()
-        .then(|| Channel::new([vocab], dtype::bool).named("mask_p"));
-    let g0_ch = Channel::new([1], dtype::i32).named("g0");
-    let lp_ch = logprob_channels(sampling.logprobs, "_p", 1);
-    let knobs = KnobChannels::new(&sampling, "_p");
+    let mask = guide.is_some().then(|| Channel::new([vocab], dtype::bool));
+    let g0_ch = Channel::new([1], dtype::i32);
+    let lp_ch = logprob_channels(sampling.logprobs, 1);
+    let knobs = KnobChannels::new(&sampling);
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;
@@ -707,15 +680,13 @@ pub async fn generate(
 
     let (tok_in, carried_hist) = match carried_on {
         Some((tok_in, hist)) => (tok_in, Some(hist)),
-        None => (Channel::from([g0]).named("tok_in"), None),
+        None => (Channel::from([g0]), None),
     };
-    let out = Channel::new([1], dtype::i32)
-        .capacity(channel_capacity() as u32)
-        .named("out");
-    let rng = Channel::from([sampling.seed ^ 0x9e37, 1u32]).named("rng");
-    let knobs = KnobChannels::new(&sampling, "");
-    let lp_ch = logprob_channels(sampling.logprobs, "", channel_capacity() as u32);
-    let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+    let out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+    let rng = Channel::from([sampling.seed ^ 0x9e37, 1u32]);
+    let knobs = KnobChannels::new(&sampling);
+    let lp_ch = logprob_channels(sampling.logprobs, channel_capacity() as u32);
+    let lane1 = Channel::from([0u32, 1u32]);
     let hist = carried_hist.unwrap_or_else(|| {
         penalized.then(|| {
             let mut counts0 = vec![0.0f32; vocab as usize];
@@ -724,15 +695,10 @@ pub async fn generate(
             {
                 counts0[g0] = 1.0;
             }
-            (
-                Channel::from(counts0).named("counts"),
-                Channel::from(present.clone()).named("present"),
-            )
+            (Channel::from(counts0), Channel::from(present.clone()))
         })
     });
-    let mask = guide
-        .is_some()
-        .then(|| Channel::new([vocab], dtype::bool).named("mask"));
+    let mask = guide.is_some().then(|| Channel::new([vocab], dtype::bool));
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;

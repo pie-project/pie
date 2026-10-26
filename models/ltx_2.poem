@@ -1,5 +1,5 @@
-# LTX-2.5, an audio-video diffusion transformer, with its VAE decoder; and
-# a miniature of its transformer alone.
+# LTX-2.5, an audio-video diffusion transformer, with its Gemma 4 text
+# encoder and its VAE decoder; and a miniature of its transformer alone.
 
 load("//lib/spoken.poem", "QWEN_STOP")
 
@@ -26,7 +26,8 @@ DEPLOYMENTS = [
 
 # The weights of LTX-2.5: paired video and audio streams, each with its own
 # self- and cross-attention and their attention across to each other; the
-# text connectors that refine the prompt for each; and the video VAE decoder.
+# text connectors that refine the prompt for each; the text encoder with
+# both connectors' input projections; and the video VAE decoder.
 
 def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
@@ -63,15 +64,17 @@ PROMPT_SLICES = 2
 HEAD_SLICES = 2
 TRAIN_STEPS = 1000
 DISTILLED_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875]
-TEXT_LAYERS = 49
+# The reference pads every prompt to 1024 rows, its connectors' registers
+# filling the rows past it (128 of them, tiled).
 TEXT_LEN = 1024
+REGISTERS = 128
 CONN_FF_MULT = 4
 HEAD_DIM = 128
 AUDIO_HEAD_DIM = 64
 CHANNELS = 128
 FF_MULT = 4
 
-def dims(layers, heads, audio_heads, cross_dim, audio_cross_dim, caption, conn_layers):
+def dims(layers, heads, audio_heads, cross_dim, audio_cross_dim, conn_layers):
     dim = heads * HEAD_DIM
     audio_dim = audio_heads * AUDIO_HEAD_DIM
     f = dim // (2 * ROPE_AXES)
@@ -84,11 +87,9 @@ def dims(layers, heads, audio_heads, cross_dim, audio_cross_dim, caption, conn_l
         channels = CHANNELS,
         cross_dim = cross_dim,
         audio_cross_dim = audio_cross_dim,
-        caption = caption,
         conn_layers = conn_layers,
         dim = dim,
         audio_dim = audio_dim,
-        text_in = caption * TEXT_LAYERS,
         rope_dims = [2 * f, 2 * f, 2 * f, 0],
         audio_rope_dims = [audio_dim, 0, 0, 0],
     )
@@ -100,7 +101,6 @@ DIMS = {
         audio_heads = 32,
         cross_dim = 4096,
         audio_cross_dim = 2048,
-        caption = 3840,
         conn_layers = 8,
     ),
     "ltx25-mini": dims(
@@ -109,7 +109,6 @@ DIMS = {
         audio_heads = 2,
         cross_dim = 256,
         audio_cross_dim = 128,
-        caption = 16,
         conn_layers = 1,
     ),
 }
@@ -182,10 +181,10 @@ def stream(prefix, channels, dim, banks):
         proj_out = linear(channels, dim, banks),
     )
 
-def connector(prefix, text_in, dim, heads, layers, caption, banks):
+def connector(prefix, dim, heads, layers, banks):
     head_dim = dim // heads
     return struct(
-        aggregate = linear(dim, text_in, banks),
+        registers = weight([TEXT_LEN, dim]),
         blocks = [
             struct(
                 attn = attention("{}.block.{}.attn".format(prefix, l), dim, heads, head_dim, banks),
@@ -197,7 +196,59 @@ def connector(prefix, text_in, dim, heads, layers, caption, banks):
         heads = heads,
         head_dim = head_dim,
         rope_dims = [dim, 0, 0, 0],
-        rescale = f32(sqrt(dim / caption)),
+    )
+
+# Gemma 4 12B: sliding-window layers with a global one every sixth, each
+# global layer's values its keys.
+GEMMA = struct(
+    hidden = 3840,
+    vocab = 262144,
+    layers = 48,
+    q_heads = 16,
+    inter = 15360,
+    full_every = 6,
+    eps = 1e-6,
+    sliding = struct(kv_heads = 8, head_dim = 256, window = 1024, theta = 10000.0, turn = None),
+    full = struct(kv_heads = 1, head_dim = 512, window = None, theta = 1000000.0, turn = 128),
+)
+
+# The hidden states the connectors read: the embedding and every layer's.
+TEXT_STATES = GEMMA.layers + 1
+
+def text_encoder(d, banks):
+    g = GEMMA
+    norm = lambda: weight([g.hidden])
+
+    def layer(l):
+        a = g.full if l % g.full_every == g.full_every - 1 else g.sliding
+        q_w, kv_w = g.q_heads * a.head_dim, a.kv_heads * a.head_dim
+        return struct(
+            attn = a,
+            attn_norm = norm(),
+            post_attn_norm = norm(),
+            pre_ffw_norm = norm(),
+            post_ffw_norm = norm(),
+            q = weight([q_w, g.hidden], banks),
+            k = weight([kv_w, g.hidden], banks),
+            v = weight([kv_w, g.hidden], banks),
+            q_norm = weight([a.head_dim]),
+            k_norm = weight([a.head_dim]),
+            o = weight([g.hidden, q_w], banks),
+            gate = weight([g.inter, g.hidden], banks),
+            up = weight([g.inter, g.hidden], banks),
+            down = weight([g.hidden, g.inter], banks),
+            scalar = weight([1]),
+            kv = "te.kv.{}".format(l),
+        )
+
+    return struct(
+        embed = weight([g.vocab, g.hidden], banks),
+        layers = [layer(l) for l in range(g.layers)],
+        final_norm = norm(),
+        proj = [
+            struct(linear = linear(width, g.hidden * TEXT_STATES, banks), rescale = f32(sqrt(width / g.hidden)))
+            for width in [d.cross_dim, d.audio_cross_dim]
+        ],
     )
 
 def vae_conv(c_out, c_in, banks):
@@ -263,14 +314,17 @@ def rope_constants():
         audio_start = constant([float(CAUSAL_OFFSET - AUDIO_COMPRESSION)]),
         audio_end = constant([float(CAUSAL_OFFSET)]),
         minus_half_pi = constant([-HALF_PI]),
+        one = constant([1.0]),
         hw_bias = constant([hw_bias, hw_bias]),
     )
 
 def layout(id, deploy):
     banks = roles(deploy, "banks", exact = True).banks
     d = DIMS[id]
+    flagship = id == "ltx25"
     return struct(
         dims = d,
+        kv = deploy.kv,
         rope = rope_constants(),
         rope_axes = ROPE_AXES,
         t_freq_dim = T_FREQ_DIM,
@@ -282,10 +336,11 @@ def layout(id, deploy):
             blocks = [block("dit.block.{}".format(i), d, banks) for i in range(d.layers)],
         ),
         connectors = (
-            connector("connectors.video", d.text_in, d.cross_dim, d.heads, d.conn_layers, d.caption, banks),
-            connector("connectors.audio", d.text_in, d.audio_cross_dim, d.audio_heads, d.conn_layers, d.caption, banks),
+            connector("connectors.video", d.cross_dim, d.heads, d.conn_layers, banks),
+            connector("connectors.audio", d.audio_cross_dim, d.audio_heads, d.conn_layers, banks),
         ),
-        vae = vae(dtype.bf16) if id == "ltx25" else None,
+        te = text_encoder(d, banks) if flagship else None,
+        vae = vae(dtype.bf16) if flagship else None,
     )
 
 def generative(m):
@@ -301,8 +356,8 @@ def generative(m):
     )
 
 # How an LTX-2.5 checkpoint is laid out: a diffusers pipeline, the
-# transformer under `dit.`, the text connectors under `connectors.` and the
-# VAE under `vae.`.
+# transformer under `dit.`, the text connectors under `connectors.`, the
+# text encoder under `te.` and the VAE under `vae.`.
 
 def biased(reads, w, stem):
     """The projection `w` from `stem.weight`, and its bias (if any) from
@@ -333,6 +388,8 @@ def read(m, reads):
     dit(reads, m.dit, m.dims)
     read_connector(reads, m.connectors[0], "video")
     read_connector(reads, m.connectors[1], "audio")
+    if m.te != None:
+        read_text_encoder(reads, m.te, m.dims)
     if m.vae != None:
         read_vae(reads, m.vae)
 
@@ -443,11 +500,42 @@ def feed_forward(reads, ff, stem):
     biased(reads, ff.down, stem + ".net.2")
 
 def read_connector(reads, conn, stem):
-    biased(reads, conn.aggregate, "connectors.{}_text_proj_in".format(stem))
+    registers = "connectors.{}_connector.learnable_registers".format(stem)
+    reads.read_expr(conn.registers, concat(0, [src(registers)] * (TEXT_LEN // REGISTERS)))
     for l, b in enumerate(conn.blocks):
         at = "connectors.{}_connector.transformer_blocks.{}".format(stem, l)
         read_attention(reads, b.attn, at + ".attn1")
         feed_forward(reads, b.ffn, at + ".ff")
+
+def read_text_encoder(reads, te, d):
+    at = lambda leaf: "te.model.language_model." + leaf
+    reads.read(te.embed, at("embed_tokens.weight"))
+    reads.read(te.final_norm, at("norm.weight"))
+    for l, w in enumerate(te.layers):
+        n = lambda leaf: at("layers.{}.{}".format(l, leaf))
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        reads.read(w.post_attn_norm, n("post_attention_layernorm.weight"))
+        reads.read(w.pre_ffw_norm, n("pre_feedforward_layernorm.weight"))
+        reads.read(w.post_ffw_norm, n("post_feedforward_layernorm.weight"))
+        reads.read(w.q, n("self_attn.q_proj.weight"))
+        reads.read(w.k, n("self_attn.k_proj.weight"))
+        v = n("self_attn.v_proj.weight")
+        reads.read(w.v, v if has(v) else n("self_attn.k_proj.weight"))
+        reads.read(w.o, n("self_attn.o_proj.weight"))
+        reads.read(w.q_norm, n("self_attn.q_norm.weight"))
+        reads.read(w.k_norm, n("self_attn.k_norm.weight"))
+        reads.read(w.gate, n("mlp.gate_proj.weight"))
+        reads.read(w.up, n("mlp.up_proj.weight"))
+        reads.read(w.down, n("mlp.down_proj.weight"))
+        reads.read(w.scalar, n("layer_scalar"))
+
+    # The checkpoint stacks the states channel-major (`c·49 + state`), ours
+    # state-major.
+    cols = [c * TEXT_STATES + s for s in range(TEXT_STATES) for c in range(GEMMA.hidden)]
+    for p, stream in zip(te.proj, ["video", "audio"]):
+        stem = "connectors.{}_text_proj_in".format(stream)
+        reads.read_expr(p.linear.w, src(stem + ".weight").gather(1, cols))
+        reads.read(p.linear.bias, stem + ".bias")
 
 def table(reads, w, name, order):
     held = stored(name)
@@ -463,8 +551,9 @@ def ordered(name, order, width):
         return src(name)
     return reordered(src(name), order, width)
 
-# The forward of LTX-2.5: the denoiser over paired video and audio, the text
-# connectors' refining of the prompt for each stream, and the VAE decode.
+# The forward of LTX-2.5: the text encoder, the denoiser over paired video
+# and audio (each stream's text connector refining the prompt first), and the
+# VAE decode.
 
 def run_linear(w, x):
     """`x` through the projection `w`, plus its bias if it has one."""
@@ -505,22 +594,63 @@ GATE_SCALE = 2.0
 VAE_EPS = 1e-8
 
 def caches(m, c):
-    pass
+    if m.te == None:
+        return
+    spaces = [c.kv_space(m.kv, GEMMA.sliding.window), c.kv_space(m.kv)]
+    for w in m.te.layers:
+        plane = w.attn.kv_heads * w.attn.head_dim
+        c.kv(spaces[0 if w.attn.window else 1], w.kv, [plane, plane], w.attn.head_dim, heads = True)
 
 def forward(m, inputs):
-    switch("reading", ["denoise", "refine.video", "refine.audio"] + (["vae.decode"] if m.vae != None else []))
-    switch("stream", ["video", "audio", "context", "reference"])
+    switch("reading", (["text"] if m.te != None else []) + ["denoise"] + (["vae.decode"] if m.vae != None else []))
+    switch("stream", ["latents", "audio", "context", "audio_context"])
     switch("positions", ["computed", "given"])
     reading = lambda name: inputs.on(switch_is("reading", name))
-    video, audio = m.connectors
-    refine(reading("refine.video"), video, m)
-    refine(reading("refine.audio"), audio, m)
+    if m.te != None:
+        text(reading("text"), m.te)
     denoise(reading("denoise"), m)
     if m.vae != None:
         vae_decode(reading("vae.decode"), m.vae)
 
 def rms(x):
     return ops.elemwise.rmsnorm_no_scale(x, x.width(), NORM_EPS)
+
+def text(arm, te):
+    """Every hidden state of the encoder, the last one normed, each RMS-normed
+    alone and all side by side, through each connector's input projection
+    (its rows rescaled to its width), the two side by side."""
+    g = GEMMA
+    plans = [ops.attn.plan_prefill(arm, g.q_heads, a.kv_heads, a.head_dim, a.window) for a in [g.sliding, g.full]]
+    positions = arm.positions()
+    y = ops.gather.embed(arm.tokens(), te.embed, g.vocab) * f32(sqrt(g.hidden))
+    last = len(te.layers) - 1
+
+    def layer(l, w, carried):
+        y, states = carried
+        a = w.attn
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, g.eps)
+        q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
+        v = ops.elemwise.rmsnorm_no_scale(v, a.head_dim, g.eps)
+        q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, a.head_dim, g.eps)
+        k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, a.head_dim, g.eps)
+        turn = rotary.partial(a.turn, span = a.head_dim // 2) if a.turn else rotary.full()
+        q, k = ops.elemwise.rope(q, positions, a.head_dim, a.theta, turn, k = k)
+        pages = arm.kv(w.kv)
+        ops.attn.kv_append(k, v, pages, arm.write_page(w.kv), arm.write_offset(w.kv))
+        o = ops.attn.prefill(q, plans[0 if a.window else 1], pages, a.window, a.head_dim, a.kv_heads, 1.0)
+        y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(ops.linear.matmul(o, w.o), w.post_attn_norm, g.eps), y)
+        h = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, g.eps)
+        f = ops.linear.glu(ops.linear.matmul(h, w.gate), gating.geglu_tanh(), up = ops.linear.matmul(h, w.up))
+        f = ops.linear.matmul(f, w.down)
+        y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, g.eps), y)
+        y = ops.elemwise.scale(w.scalar, y)
+        return (y, states + [rms(y)] if l < last else states)
+
+    y, states = arm.fold_layers(te.layers, (y, [rms(y)]), layer)
+    states = states + [rms(ops.elemwise.rmsnorm(y, te.final_norm, g.eps))]
+    x = ops.gather.concat_cols(states)
+    out = [ops.elemwise.add_bias(p.linear.bias, ops.elemwise.mul_scalar(p.rescale, ops.linear.matmul(x, p.linear.w))) for p in te.proj]
+    output("hidden", ops.gather.concat_cols(out))
 
 def modulate(x, scale_shift, lanes):
     return ops.elemwise.modulate(x, scale_shift, lanes, "scale_shift")
@@ -675,8 +805,8 @@ def denoise(arm, m):
     dit = m.dit
     stream = lambda name: switch_is("stream", name)
     ctx, rest = arm.on(stream("context")), arm.on(~stream("context"))
-    actx, media = rest.on(stream("reference")), rest.on(~stream("reference"))
-    vid, aud = media.on(stream("video")), media.on(~stream("video"))
+    actx, media = rest.on(stream("audio_context")), rest.on(~stream("audio_context"))
+    vid, aud = media.on(stream("latents")), media.on(~stream("latents"))
 
     vg = struct(
         lanes = vid.request_of_token(),
@@ -692,6 +822,7 @@ def denoise(arm, m):
     )
     cg = struct(lanes = ctx.request_of_token(), perm = ctx.row_permutation(), csr = ctx.group_indptr())
     acg = struct(lanes = actx.request_of_token(), perm = actx.row_permutation(), csr = actx.group_indptr())
+    video_conn, audio_conn = m.connectors
     v_time, _ = ops.gather.split_rows(vg.positions, 1)
 
     vt = vid.input("timestep", dtype.f32, "lane", 1)
@@ -703,8 +834,8 @@ def denoise(arm, m):
 
     xv = run_linear(dit.video.patchify, patched(vid, d))
     xa = run_linear(dit.audio.patchify, patched(aud, d))
-    ctx_rows = ctx.input("context", dtype.bf16, "row", d.cross_dim)
-    actx_rows = actx.input("audio_context", dtype.bf16, "row", d.audio_cross_dim)
+    ctx_rows = connect(ctx, video_conn, 0, m)
+    actx_rows = connect(actx, audio_conn, 1, m)
 
     def step(l, b, carried):
         xv, xa = carried
@@ -727,26 +858,30 @@ def denoise(arm, m):
     output("velocity", velocity)
     return velocity
 
-def text_positions(arm, m):
+def text_positions(arm, m, j):
     """Prompt row `j` at `(2·j / base - 1)·π/2`."""
     given = switch_is("positions", "given")
     stated = arm.on(given).input("text_positions", dtype.f32, "row", 1)
-    rows = arm.on(~given)
-    j, _ = ops.gather.split_rows(ops.conv.cells(rows.token_grid(PATCH), rows.positions(), 0), 1)
-    t = ops.elemwise.mul_scalar(f32(HALF_PI * 2.0 / CONN_ROPE_BASE), j)
+    t = ops.elemwise.mul_scalar(f32(HALF_PI * 2.0 / CONN_ROPE_BASE), j.on(~given))
     return merge([stated, ops.elemwise.add_bias(m.rope.minus_half_pi, t)])
 
-def refine(arm, conn, m):
-    text_in = m.dims.text_in
+def connect(arm, conn, side, m):
+    """`conn` over its `side` of the text reading's rows: each row past the
+    lane's `length` (zero, as the guest pads it) its register, then every row
+    attending every other."""
+    d = m.dims
+    j, _ = ops.gather.split_rows(ops.conv.cells(arm.token_grid(PATCH), arm.positions(), 0), 1)
     g = struct(
-        lanes = arm.request_of_token(),
-        positions = text_positions(arm, m),
+        positions = text_positions(arm, m, ops.elemwise.copy(j)),
         perm = arm.row_permutation(),
         csr = arm.lane_indptr(),
     )
-    x = arm.input("text", dtype.bf16, "row", text_in)
-    h = ops.elemwise.mul_scalar(conn.rescale, ops.linear.matmul(x, conn.aggregate.w))
-    h = ops.elemwise.add_bias(conn.aggregate.bias, h)
+    length = ops.gather.gather_rows(arm.input("length", dtype.f32, "lane", 1), arm.request_of_token())
+    pad = ops.elemwise.add_bias(m.rope.one, ops.elemwise.add(j, ops.elemwise.mul_scalar(-1.0, length)))
+    pad = ops.elemwise.clamp(pad, 0.0, 1.0)
+    x = arm.input("context", dtype.bf16, "row", d.cross_dim + d.audio_cross_dim, rows = TEXT_LEN)
+    x = ops.gather.split_rows(x, d.cross_dim)[side]
+    h = ops.elemwise.residual_add(ops.gather.embed_weighted(arm.positions(), pad, conn.registers, TEXT_LEN), x)
 
     def step(l, b, h):
         n = rms(h)
@@ -756,9 +891,7 @@ def refine(arm, conn, m):
         f = run_linear(b.ffn.down, ops.elemwise.gelu(run_linear(b.ffn.up, n), True))
         return ops.elemwise.residual_add(f, h)
 
-    h = arm.fold_layers(conn.blocks, h, step)
-    out = rms(h)
-    output("hidden", out)
+    return rms(arm.fold_layers(conn.blocks, h, step))
 
 def vconv(x, g, c):
     shape = conv3d(k = [3, 3, 3], stride = [1, 1, 1], pad = [1, 1, 1], pad_back = [1, 1, 1], time_pad = "replicate")
@@ -774,7 +907,7 @@ def resnet(x, g, r):
 
 def vae_decode(arm, vae):
     g = arm.grid()
-    z = ops.elemwise.copy(arm.input("latent", dtype.bf16, "voxel", vae.z))
+    z = ops.elemwise.copy(arm.input("latents", dtype.bf16, "voxel", vae.z))
     z = ops.elemwise.standardize(z, vae.zero, vae.latents_std)
     z = ops.elemwise.add_bias(vae.latents_mean, z)
 

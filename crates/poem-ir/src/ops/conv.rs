@@ -118,12 +118,33 @@ impl GridRule {
         }
     }
 
+    /// The most out rows a rule makes of its in rows, as `num/den`: over
+    /// every box it accepts, each axis's out extent stays within its share.
     #[must_use]
-    pub fn growth(self) -> u32 {
+    pub fn row_scale(self) -> (u32, u32) {
         match self {
-            GridRule::Conv { .. } | GridRule::Unshuffle { .. } | GridRule::AvgDown { .. } => 1,
-            GridRule::Upsample { factor, .. } => factor[0] * factor[1] * factor[2],
-            GridRule::Shuffle { r, .. } => r[0] * r[1] * r[2],
+            GridRule::Conv {
+                k,
+                stride,
+                pad,
+                pad_back,
+                causal_t,
+            } => {
+                let back_t = if causal_t { 0 } else { pad_back[0] };
+                let backs = [back_t, pad_back[1], pad_back[2]];
+                (0..3).fold((1, 1), |(n, d), at| {
+                    let s = stride[at].max(1);
+                    if s > 1 && pad[at] + backs[at] + s <= k[at] {
+                        (n, d * s)
+                    } else {
+                        (n, d)
+                    }
+                })
+            }
+            GridRule::Upsample { factor, .. } => (factor[0] * factor[1] * factor[2], 1),
+            GridRule::Shuffle { r, .. } => (r[0] * r[1] * r[2], 1),
+            GridRule::Unshuffle { r } => (1, r[0] * r[1] * r[2]),
+            GridRule::AvgDown { factor } => (1, factor[1] * factor[2]),
         }
     }
 
@@ -331,7 +352,8 @@ mod tests {
             keep_first_frame: true,
         };
         assert_eq!(up.out_extent([3, 4, 4]), Some([5, 8, 8]));
-        assert_eq!(up.growth(), 8);
+        assert_eq!(up.row_scale(), (8, 1));
+        assert_eq!(down.row_scale(), (1, 4));
         assert_eq!(
             GridRule::Unshuffle { r: [1, 2, 2] }.out_extent([1, 3, 4]),
             None
@@ -351,7 +373,7 @@ mod tests {
         };
         assert_eq!(plain.out_extent([3, 4, 5]), Some([6, 8, 10]));
         assert_eq!(trimmed.out_extent([3, 4, 5]), Some([5, 8, 10]));
-        assert_eq!(trimmed.growth(), 8);
+        assert_eq!(trimmed.row_scale(), (8, 1));
         assert_eq!(
             trimmed.apply(&[1, 1, 1, 0, 3, 4, 5, 1]),
             Some(vec![1, 2, 2, 0, 5, 8, 10, 4])
@@ -384,7 +406,7 @@ mod tests {
             GridRule::AvgDown { factor: [1, 1, 1] }.out_extent([5, 8, 12]),
             Some([5, 8, 12])
         );
-        assert_eq!(two.growth(), 1);
+        assert_eq!(two.row_scale(), (1, 4));
         assert_eq!(
             two.apply(&[1, 2, 2, 0, 4, 2, 2, 1]),
             Some(vec![1, 1, 1, 0, 2, 1, 1, 1])

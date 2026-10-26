@@ -47,7 +47,6 @@ list, for a CI step that wants to read it.
 from __future__ import annotations
 
 import argparse
-import base64
 import glob
 import json
 import os
@@ -105,7 +104,6 @@ verbose = false
 name = "gates-{name}"
 source = "{model}"
 device_memory_share = {mem}
-{voxels}
 
 [engine]
 type = "cuda"
@@ -143,18 +141,13 @@ def write_config(ctx, gate) -> str:
     scratch = os.path.join(ctx.out, gate.name, "scratch")
     os.makedirs(scratch, exist_ok=True)
     # A smaller card overrides what the roster states: PIE_GATES_ROWS (the
-    # slot ceiling), PIE_GATES_MEM (utilisation) and PIE_GATES_VOXELS (the
-    # VAE ladder, which is 21 GiB at the 65 536 default).
-    if os.environ.get("PIE_GATES_VOXELS"):
-        spec["voxels"] = int(os.environ["PIE_GATES_VOXELS"])
+    # slot ceiling) and PIE_GATES_MEM (utilisation).
     text = CONFIG.format(
         name=gate.name, port=port, scratch=scratch,
         model=spec.pop("model"),
         mem=float(os.environ.get("PIE_GATES_MEM") or spec.pop("mem", 0.90)),
         rows=int(os.environ.get("PIE_GATES_ROWS") or spec.pop("rows", 32768)),
         timeout=spec.pop("timeout", "600s"),
-        voxels=("max_voxels = {}".format(spec.pop("voxels"))
-                if "voxels" in spec else ""),
     )
     spec.pop("mem", None)
     spec.pop("rows", None)
@@ -555,41 +548,20 @@ def cargo_test(name):
                  "--test", "engine_cuda", name, "--", "--ignored", "--nocapture"], REPO)
     return build
 
-PIECE = 96 * 1024
-
-def b64_pieces(path: str) -> list[str]:
-    """One picture as base64, split into argv-sized pieces.
-
-    Re-encoded to JPEG first: a 1024^2 PNG is 2.3 MB and base64 of it is past
-    `ARG_MAX` (2 MiB TOTAL, whatever the per-argument cap). The guest sniffs
-    the format, so the transport is the harness's to pick; JPEG at 92 is a
-    third of the bytes and visually transparent.
-    """
-    import io
-
-    from PIL import Image
-
-    buf = io.BytesIO()
-    Image.open(path).convert("RGB").save(buf, "JPEG", quality=92)
-    text = base64.b64encode(buf.getvalue()).decode("ascii")
-    n = max(1, -(-len(text) // PIECE))
-    step = -(-len(text) // n)
-    return [text[i * step:(i + 1) * step] for i in range(n)]
-
-def t2v_step(prompt_ids, width, height, frames, steps, seed,
-             negative_ids=None, guidance=None, out_name="clip",
+def t2v_step(prompt, width, height, frames, steps, seed,
+             negative=None, guidance=None, out_name="clip",
              init_from=None, strength=None, fmt=None):
     def build(ctx, gate):
         out = os.path.join(ctx.out, gate.name, out_name)
         os.makedirs(out, exist_ok=True)
         argv = [ctx.python, os.path.join(HERE, "gates.py"), "--text-to-video",
                 "--config", ctx.configs[gate.name], "--out", out,
-                "--pie", ctx.pie, "--prompt-ids", prompt_ids,
+                "--pie", ctx.pie, "--prompt", prompt,
                 "--width", str(width), "--height", str(height),
                 "--frames", str(frames), "--steps", str(steps),
                 "--seed", str(seed)]
-        if negative_ids is not None:
-            argv += ["--negative-ids", negative_ids]
+        if negative is not None:
+            argv += ["--negative", negative]
         if guidance is not None:
             argv += ["--guidance", str(guidance)]
         if fmt is not None:
@@ -868,11 +840,11 @@ def roster() -> list[Gate]:
         Gate(
             name="wan-video",
             wraps=("the_wan_2_vae_answers_the_reference, then the model-agnostic "
-                   "text-to-video guest on wan22-ti2v-5b.zt"),
+                   "text-to-media guest on wan22-ti2v-5b.zt"),
             expected="decode cos >= 0.999 per chunk and clip (landed 0.999986), encode the "
                      "same (landed 0.999988, cacheless 0.9409); a real mp4, "
                      "guidance at 5.0 must MOVE the latent; video2video at 1.0 lands "
-                     "text-to-video's own clip to within the row's run-to-run floor, "
+                     "text-to-media's own clip to within the row's run-to-run floor, "
                      "while 0.2 and 0.4 land nearer the input clip, in that order",
             needs=[(g("wan22", "wan22_vae", "shapes.json"),
                     "python scripts/imagegen/wan22_golden.py --vae"),
@@ -889,39 +861,36 @@ def roster() -> list[Gate]:
                    ("the VAE encoder against the reference",
                     cargo_test("the_wan_2_vae_encodes_the_reference")),
                    ("prompt -> clip",
-                    t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
+                    t2v_step("a red bicycle leaning on a blue wall",
                              832, 480, 17, 20, 0)),
                    ("the same prompt, guided at 5.0",
-                    t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
+                    t2v_step("a red bicycle leaning on a blue wall",
                              832, 480, 17, 20, 0,
-                             negative_ids="1", guidance=5.0, out_name="guided")),
+                             negative="", guidance=5.0, out_name="guided")),
                    ("a 64^2 clip to start from",
-                    t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
+                    t2v_step("a red bicycle leaning on a blue wall",
                              64, 64, 17, 8, 1, out_name="v2v-src", fmt="rgb8")),
                    ("that clip back in at 0.2",
-                    t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
+                    t2v_step("a red bicycle leaning on a blue wall",
                              64, 64, 17, 8, 2, out_name="v2v-02", fmt="rgb8",
                              init_from="v2v-src", strength=0.2)),
                    ("and at 0.4",
-                    t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
+                    t2v_step("a red bicycle leaning on a blue wall",
                              64, 64, 17, 8, 2, out_name="v2v-04", fmt="rgb8",
                              init_from="v2v-src", strength=0.4)),
                    ("and at 1.0, which is no init at all",
-                    t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
+                    t2v_step("a red bicycle leaning on a blue wall",
                              64, 64, 17, 8, 2, out_name="v2v-washed", fmt="rgb8",
                              init_from="v2v-src", strength=1.0)),
                    ("the same prompt and seed with no init",
-                    t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
+                    t2v_step("a red bicycle leaning on a blue wall",
                              64, 64, 17, 8, 2, out_name="txt2vid", fmt="rgb8")),
                    ("and once more, which is what the floor is",
-                    t2v_step("289,4062,188625,346,291,1350,369,289,15258,21006,1",
+                    t2v_step("a red bicycle leaning on a blue wall",
                              64, 64, 17, 8, 2, out_name="txt2vid-rep", fmt="rgb8"))],
             readout=wan_video_readout,
             timeout=5400,
-            note=("the prompt goes in as IDS: umT5's SentencePiece Unigram tokenizer does not "
-                  "compile in pie, and the artifact was imported from a staged snapshot "
-                  "(/root/.cache/pie-imagegen/wan22-stage) whose tokenizer/ is one pie CAN "
-                  "compile, because `pie model import` refuses the real one. video2video is "
+            note=("video2video is "
                   "the guest driving the family's TWO `vae.encode` arms, one chunk per fire "
                   "down one pipeline: the clip crosses as `frames` handles "
                   "(`frames.decode` per still, `frames.from-rgb8` per chunk, "
@@ -976,30 +945,30 @@ def text_to_image(args) -> int:
     One exit: the row's `vae.decode` reading, fired in-guest, hands back
     `image.png`. This prints `[gates] picture: <path>` and its pixel size.
     """
-    inferlet = os.path.join(REPO, "examples/text-to-image")
+    inferlet = os.path.join(REPO, "examples/text-to-media")
     workspace = os.path.dirname(inferlet)
     if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
-        done = subprocess.run(["cargo", "build", "-p", "text-to-image", "--release",
+        done = subprocess.run(["cargo", "build", "-p", "text-to-media", "--release",
                                "--target", "wasm32-wasip3"],
                               cwd=workspace, capture_output=True, text=True)
         if done.returncode != 0:
             sys.stderr.write(done.stderr)
             return 1
-    candidates = [os.path.join(workspace, "target/wasm32-wasip3", flavour, "text_to_image.wasm")
+    candidates = [os.path.join(workspace, "target/wasm32-wasip3", flavour, "text_to_media.wasm")
                   for flavour in ("release", "debug")]
     present = [p for p in candidates if os.path.exists(p)]
     if not present:
-        print(f"[gates] no text-to-image wasm; tried {candidates}")
+        print(f"[gates] no text-to-media wasm; tried {candidates}")
         return 1
     wasm = max(present, key=os.path.getmtime)
-    cmd = [args.pie, "--config", args.config, "run", "--path", wasm,
-           "-o", args.out, "--",
-           "--prompt", args.prompt, "--width", str(args.width),
-           "--height", str(args.height), "--steps", str(args.steps),
-           "--seed", str(args.seed), "--out", "image"]
+    cmd = [args.pie, "--config", args.config, "run", "--path", wasm, "-o", args.out]
     if args.init_image:
-        for i, piece in enumerate(b64_pieces(args.init_image)):
-            cmd += [f"--init_image_{i}", piece]
+        cmd += ["--file", f"init={args.init_image}"]
+    cmd += ["--",
+            "--prompt", args.prompt, "--width", str(args.width),
+            "--height", str(args.height), "--steps", str(args.steps),
+            "--seed", str(args.seed), "--out", "image"]
+    if args.init_image:
         cmd += ["--strength", str(args.strength)]
     if args.mask_rect:
         cmd += ["--mask_rect", args.mask_rect]
@@ -1036,54 +1005,45 @@ def text_to_video(args) -> int:
     One exit, not two: a video row must declare a `vae.decode` reading, or
     there is nothing here that can turn a latent volume into frames from
     inside pie, and the guest refuses by name.
-
-    The prompt goes in as IDS.  Wan 2.2's text encoder is umT5, whose
-    tokenizer is a SentencePiece Unigram model and `crates/tokenizer`
-    compiles BPE pipelines alone (`models::wan_2::tokenizer`), so the
-    artifact carries somebody else's vocabulary and `--prompt` on this row
-    would condition the DiT on ids it has never seen.  The ids below are
-    `T5Tokenizer(Wan2.2-TI2V-5B/tokenizer)("a red bicycle leaning on a blue
-    wall")` -- the golden's own prompt, so the clip is comparable with
-    `$PIE_IMAGEGEN_GOLDEN/wan22/wan22_golden.mp4`.
     """
-    inferlet = os.path.join(REPO, "examples/text-to-video")
+    inferlet = os.path.join(REPO, "examples/text-to-media")
     workspace = os.path.dirname(inferlet)
     if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
-        done = subprocess.run(["cargo", "build", "-p", "text-to-video", "--release",
+        done = subprocess.run(["cargo", "build", "-p", "text-to-media", "--release",
                                "--target", "wasm32-wasip3"],
                               cwd=workspace, capture_output=True, text=True)
         if done.returncode != 0:
             sys.stderr.write(done.stderr)
             return 1
-    candidates = [os.path.join(workspace, "target/wasm32-wasip3", flavour, "text_to_video.wasm")
+    candidates = [os.path.join(workspace, "target/wasm32-wasip3", flavour, "text_to_media.wasm")
                   for flavour in ("release", "debug")]
     present = [p for p in candidates if os.path.exists(p)]
     if not present:
-        print(f"[gates] no text-to-video wasm; tried {candidates}")
+        print(f"[gates] no text-to-media wasm; tried {candidates}")
         return 1
     wasm = max(present, key=os.path.getmtime)
-    cmd = [args.pie, "--config", args.config, "run", "--path", wasm,
-           "-o", args.out, "--",
-           "--prompt-ids", args.prompt_ids, "--width", str(args.width),
-           "--height", str(args.height), "--frames", str(args.frames),
-           "--steps", str(args.steps), "--seed", str(args.seed), "--out", "clip"]
-    fmt = args.clip_format or "mp4"
-    if fmt != "mp4":
-        cmd += ["--format", fmt]
+    cmd = [args.pie, "--config", args.config, "run", "--path", wasm, "-o", args.out]
+    stills = []
     if args.init_clip:
         stills = sorted(glob.glob(os.path.join(args.init_clip, "frame_*.png")))
         if not stills:
             print(f"[gates] no frame_*.png under {args.init_clip}")
             return 1
         for f, still in enumerate(stills):
-            for n, piece in enumerate(b64_pieces(still)):
-                cmd += [f"--init_frame_{f}_{n}", piece]
+            cmd += ["--file", f"init_{f}={still}"]
+    cmd += ["--",
+            "--prompt", args.prompt, "--width", str(args.width),
+            "--height", str(args.height), "--frames", str(args.frames),
+            "--steps", str(args.steps), "--seed", str(args.seed), "--out", "clip"]
+    fmt = args.clip_format or "mp4"
+    if fmt != "mp4":
+        cmd += ["--format", fmt]
+    if stills:
         cmd += ["--strength", str(args.strength)]
     if args.guidance is not None:
         cmd += ["--guidance", str(args.guidance)]
-    if args.negative_ids:
-        ids = args.negative_ids if "," in args.negative_ids else f"{args.negative_ids},"
-        cmd += ["--negative_prompt_ids", ids]
+    if args.negative is not None:
+        cmd += ["--negative_prompt", args.negative]
     print("$ " + " ".join(cmd), flush=True)
     done = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
     sys.stdout.write(done.stdout)
@@ -1212,8 +1172,7 @@ def main() -> int:
     ap.add_argument("--text-to-video", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--config", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--prompt", default="", help=argparse.SUPPRESS)
-    ap.add_argument("--prompt-ids", default="", help=argparse.SUPPRESS)
-    ap.add_argument("--negative-ids", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--negative", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--init-image", dest="init_image", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--init-clip", dest="init_clip", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--clip-format", dest="clip_format", default=None, help=argparse.SUPPRESS)

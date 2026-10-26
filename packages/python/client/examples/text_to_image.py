@@ -6,16 +6,16 @@ Run a pie that has a generative model bound, then:
     python packages/python/client/examples/text_to_image.py \
         --prompt "a red bicycle leaning on a blue wall" --out ./out
 
-The whole point of this file is the FILE event. `text-to-image` streams a
+The whole point of this file is the FILE event. `text-to-media` streams a
 progress line or two and then sends its output as a file; what arrives is a
 `ReceivedFile` -- bytes, with the name the inferlet suggested attached. That
 name is what makes the difference between writing `file-0000.bin` and writing
 `image.latent.f32` (or `image.png`, on a model whose VAE decode the
 guest can drive), so it is what this example is about.
 
-`text-to-image` must already be on the server: `pie inferlet install
-<text_to_image.wasm>`, or `client.install_program(wasm)` as below,
-or a `pie run text-to-image` from a source checkout, which uploads it.
+`text-to-media` must already be on the server: `pie inferlet install
+<text_to_media.wasm>`, or `client.install_program(wasm)` as below,
+or a `pie run text-to-media` from a source checkout, which uploads it.
 """
 
 import argparse
@@ -25,7 +25,7 @@ from pathlib import Path
 
 from pie_client import Event, PieClient
 
-INFERLET = "text-to-image@0.1.0"
+INFERLET = "text-to-media@0.1.0"
 
 
 async def draw(uri: str, prompt: str, out: Path, steps: int, size: int,
@@ -57,12 +57,10 @@ async def draw(uri: str, prompt: str, out: Path, steps: int, size: int,
                 print(f"wrote {path} ({len(value):,} bytes)")
 
             elif event is Event.Return:
-                # The guest's report: the geometry, the sigmas it stepped,
-                # and the name it gave the file above.
+                # The guest's report: the size, the steps, and the file's name.
                 report = json.loads(value) if value.startswith("{") else {}
                 if report:
-                    print(f"{report['width']}x{report['height']} in "
-                          f"{report['steps']} steps, {report['rows']} latent rows")
+                    print(f"{report['size']} in {report['steps']} steps")
                 return 0 if saved else 1
 
             elif event is Event.Error:

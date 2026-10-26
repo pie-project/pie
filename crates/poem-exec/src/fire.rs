@@ -296,7 +296,8 @@ impl fmt::Display for Fault {
             ),
             Self::TooManyVoxels { voxels, max } => write!(
                 f,
-                "this fire carries {voxels} voxel rows and every VAE column was cut at {max}"
+                "this fire's widest voxel value holds {voxels} rows and every VAE column was cut at \
+                 {max}"
             ),
             Self::TooManyClips { clips, max } => write!(
                 f,

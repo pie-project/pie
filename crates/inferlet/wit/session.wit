@@ -37,6 +37,10 @@ interface session {
     // Receives an incoming file from the remote user client
     receive-file: async func() -> option<blob>;
 
+    /// The file the client attached to this run under `name`
+    /// (`pie run --file name=path`), or none.
+    file: func(name: string) -> option<blob>;
+
     /// Encodes `f` and streams the bytes to the client under `name`, WITHOUT
     /// the encoded file ever entering WASM linear memory.
     ///

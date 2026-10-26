@@ -147,7 +147,7 @@ fn the_outputs_are_float_readouts_and_never_logits() {
         );
         assert_eq!(
             found.get("hidden"),
-            Some(&if is_flagship(deployment) { 2 } else { 1 }),
+            is_flagship(deployment).then_some(&1),
             "`{deployment}`: hidden plantings; found {found:?}"
         );
         assert_eq!(
@@ -161,10 +161,9 @@ fn the_outputs_are_float_readouts_and_never_logits() {
 fn lanes(deployment: &str) -> Vec<(&'static str, &'static str)> {
     let mut lanes = Vec::new();
     if is_flagship(deployment) {
-        lanes.push(("text", "text"));
+        lanes.push(("text", "context"));
     }
-    lanes.push(("refine", "text"));
-    for stream in ["text", "video", "audio", "reference"] {
+    for stream in ["context", "latents", "audio", "reference"] {
         lanes.push(("denoise", stream));
     }
     lanes
@@ -317,7 +316,7 @@ fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
                 );
             }
         }
-        let pairs: BTreeSet<(u32, usize)> = ["text", "video", "audio", "reference"]
+        let pairs: BTreeSet<(u32, usize)> = ["context", "latents", "audio", "reference"]
             .into_iter()
             .map(|s| (model::timestep_slot(s), model::modality(s)))
             .collect();
@@ -407,9 +406,9 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
         assert_eq!(
             names,
             if is_flagship(deployment) {
-                vec!["text", "refine", "denoise"]
+                vec!["text", "denoise"]
             } else {
-                vec!["refine", "denoise"]
+                vec!["denoise"]
             },
             "`{deployment}`: the readings a guest may name"
         );
@@ -427,8 +426,8 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
         assert_eq!(schedule.kind, ScheduleKind::Flow);
         assert_eq!(schedule.shift, model::VIDEO_SHIFT);
         assert_eq!(
-            schedule.stream_shifts.iter().find(|(s, _)| s == "video"),
-            Some(&("video".to_string(), model::VIDEO_SHIFT)),
+            schedule.stream_shifts.iter().find(|(s, _)| s == "latents"),
+            Some(&("latents".to_string(), model::VIDEO_SHIFT)),
             "`{deployment}`: the video grid's shift"
         );
         assert_eq!(

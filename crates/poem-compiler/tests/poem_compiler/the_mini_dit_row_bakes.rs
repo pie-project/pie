@@ -195,7 +195,7 @@ fn each_stream_classifies_into_its_own_class_and_every_merge_resolves() {
     let _row = poem_compiler::catalog::deployment(DEPLOYMENT).expect("the row is in the catalog");
 
     let mut seen = Vec::new();
-    for stream in ["text", "image", "context"] {
+    for stream in ["text", "latents", "context"] {
         let request = Request::new(1, false).switched("stream", stream);
         let word = plan.facts.word(&request);
         let class = classes
@@ -263,14 +263,14 @@ fn the_joint_attention_is_self_paired_and_the_cross_attention_is_not() {
             .word(&Request::new(1, false).switched("stream", stream))
     };
     assert!(joint.holds(word("text")));
-    assert!(joint.holds(word("image")));
+    assert!(joint.holds(word("latents")));
     assert!(!joint.holds(word("context")));
 
     let (q_csr, kv_csr, _) = crossed[0];
-    assert!(selection_of(*q_csr).holds(word("image")));
+    assert!(selection_of(*q_csr).holds(word("latents")));
     assert!(!selection_of(*q_csr).holds(word("context")));
     assert!(selection_of(*kv_csr).holds(word("context")));
-    assert!(!selection_of(*kv_csr).holds(word("image")));
+    assert!(!selection_of(*kv_csr).holds(word("latents")));
 
     let joins = plan
         .nodes
@@ -414,7 +414,7 @@ fn the_generative_facts_state_the_reading_its_latent_and_its_schedule() {
     );
     assert_eq!(
         declared("stream"),
-        Some(["text", "image", "context"].map(String::from).to_vec())
+        Some(["text", "latents", "context"].map(String::from).to_vec())
     );
 
     let latent = facts.latent.expect("a denoiser states its latent space");

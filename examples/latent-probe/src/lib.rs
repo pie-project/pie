@@ -129,17 +129,15 @@ async fn main(input: Input) -> Result<Output> {
     // Channels. The latent and the control words are loop-carried (the
     // epilogue takes and puts them); the readback is host-read once a fire.
     let cells = (rows * width) as usize;
-    let x = Channel::from_shaped([rows, width], vec![0f32; cells]).named("latents");
-    let t = Channel::from([ts[0]]).named("timestep");
-    let step = Channel::from([0u32]).named("step");
-    let rng = Channel::from(rng_state(input.seed)).named("rng");
+    let x = Channel::from_shaped([rows, width], vec![0f32; cells]);
+    let t = Channel::from([ts[0]]);
+    let step = Channel::from([0u32]);
+    let rng = Channel::from(rng_state(input.seed));
     // The schedule's vectors are channels, read by step index: the op set
     // carries constants as scalars only.
-    let dts_ch = Channel::from(dts).named("dts");
-    let ts_ch = Channel::from(ts).named("ts");
-    let out = Channel::new([rows, width], dtype::f32)
-        .capacity(channel_capacity() as u32)
-        .named("out");
+    let dts_ch = Channel::from(dts);
+    let ts_ch = Channel::from(ts);
+    let out = Channel::new([rows, width], dtype::f32).capacity(channel_capacity() as u32);
 
     let pass = ForwardPass::new();
     pass.switch(0, "reading", &reading)?;
@@ -162,12 +160,9 @@ async fn main(input: Input) -> Result<Output> {
             continue;
         }
         let ch = match decl.axis {
-            model::InputAxis::Lane => {
-                Channel::from(vec![1.0f32; decl.width as usize]).named(&decl.name)
-            }
+            model::InputAxis::Lane => Channel::from(vec![1.0f32; decl.width as usize]),
             model::InputAxis::Row => {
                 Channel::from_shaped([rows, decl.width], vec![0f32; (rows * decl.width) as usize])
-                    .named(&decl.name)
             }
             // A voxel input is a VAE tile's box on the third row axis (D8),
             // which is not a float lane this probe can plausibly fill.

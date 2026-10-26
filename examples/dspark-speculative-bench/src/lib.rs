@@ -156,13 +156,13 @@ async fn main(input: Input) -> Result<Output> {
     //    a pass (the prefill's last chunk lays out the first block, each
     //    verify the next) — a seeded channel attaches to one pass alone.
     let ring = (channel_capacity() + 7 * frame_size()) as u32;
-    let lane = |name: &str, len: u32, dt| Channel::new([len], dt).capacity(ring).named(name);
-    let blk = lane("blk", block, dtype::i32);
-    let base_d = lane("base_d", 1, dtype::u32).queued();
-    let slots_d = lane("slots_d", block, dtype::u32);
+    let lane = |len: u32, dt| Channel::new([len], dt).capacity(ring);
+    let blk = lane(block, dtype::i32);
+    let base_d = lane(1, dtype::u32).queued();
+    let slots_d = lane(block, dtype::u32);
     // Every row reads every slot up to the block's end: a port the draft
     // peeks, a queue it takes each value from, the verify's put appending.
-    let kv_len_d = lane("kv_len_d", 1, dtype::u32).queued();
+    let kv_len_d = lane(1, dtype::u32).queued();
     // Lays out the block anchored at `a` (`[1]` i32) at `b` (`[1]` u32).
     let lay_block = move |a: &Tensor, b: &Tensor| {
         let j = iota(block);
@@ -180,28 +180,20 @@ async fn main(input: Input) -> Result<Output> {
     // role is read off every pass that claims it, and the prefill's last
     // chunk puts the draft's inputs that only the draft consumes.
     // ── the draft pass: one lane of the block's rows ─────────────────
-    let indptr_d = Channel::from([0u32, block]).named("embed_indptr_d");
-    let readout_d = Channel::from_iter(0..block).named("readout_d");
+    let indptr_d = Channel::from([0u32, block]);
+    let readout_d = Channel::from_iter(0..block);
 
     // ── the verify pass: one lane of `w` rows, laid out a round ahead ──
-    let win = Channel::new([w], dtype::i32).capacity(ring).named("win");
-    let base_v = Channel::new([1], dtype::u32)
-        .capacity(ring)
-        .named("base_v")
-        .queued();
-    let indptr_v = Channel::from([0u32, w]).named("embed_indptr_v");
-    let readout_v = Channel::from_iter(0..w).named("readout_v");
-    let slots_v = Channel::new([w], dtype::u32)
-        .capacity(ring)
-        .named("slots_v");
-    let kv_len_v = Channel::new([1], dtype::u32)
-        .capacity(ring)
-        .named("kv_len_v")
-        .queued();
+    let win = Channel::new([w], dtype::i32).capacity(ring);
+    let base_v = Channel::new([1], dtype::u32).capacity(ring).queued();
+    let indptr_v = Channel::from([0u32, w]);
+    let readout_v = Channel::from_iter(0..w);
+    let slots_v = Channel::new([w], dtype::u32).capacity(ring);
+    let kv_len_v = Channel::new([1], dtype::u32).capacity(ring).queued();
     // The fold: the prefill froze everything, so the first verify freezes
     // nothing more; every verify's epilogue puts what the next one freezes.
-    let fold = Channel::from([0u32]).named("fold");
-    let out = Channel::new([w], dtype::i32).capacity(ring).named("out");
+    let fold = Channel::from([0u32]);
+    let out = Channel::new([w], dtype::i32).capacity(ring);
     // Lays out the verify of the block anchored at `b` (`[1]` u32): its
     // rows at b .. b + w, the lane reading b + w keys. Put a round ahead
     // (by the prefill, then by each verify for the next), so a verify's
@@ -307,10 +299,10 @@ async fn main(input: Input) -> Result<Output> {
     let last_span = spans.len() - 1;
     for (at, &(base, end)) in spans.iter().enumerate() {
         let len = end - base;
-        let toks = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
-        let indptr = Channel::from([0u32, len]).named("embed_indptr_p");
-        let readout = Channel::from([len - 1]).named("readout_p");
-        let next = Channel::new([1], dtype::i32).named("next_p");
+        let toks = Channel::from(&prompt_i32[base as usize..end as usize]);
+        let indptr = Channel::from([0u32, len]);
+        let readout = Channel::from([len - 1]);
+        let next = Channel::new([1], dtype::i32);
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;

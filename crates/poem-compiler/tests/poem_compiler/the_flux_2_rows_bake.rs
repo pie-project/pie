@@ -187,7 +187,7 @@ fn the_readings_state_their_streams_readouts_and_sinusoids() {
         let plan = trace(deployment, Platform::Cuda);
         assert_eq!(
             plan.facts.declared("stream").map(|s| s.values.clone()),
-            Some(vec!["text".into(), "image".into(), "reference".into()]),
+            Some(vec!["context".into(), "latents".into(), "reference".into()]),
             "{deployment}"
         );
         let mut sinusoids: Vec<(u32, f32, bool, f32)> = plan
@@ -226,7 +226,7 @@ fn the_readings_state_their_streams_readouts_and_sinusoids() {
     let latent = plan
         .inputs
         .iter()
-        .position(|i| i.name == "latent")
+        .position(|i| i.name == "latents")
         .expect("the decoder's latent input") as u32;
     let voxel_input = plan.values.iter().any(|decl| {
         matches!(
@@ -252,7 +252,7 @@ fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
         let _row = row(deployment);
 
         let mut seen = Vec::new();
-        for stream in ["text", "image", "reference"] {
+        for stream in ["context", "latents", "reference"] {
             let request = Request::new(1, false)
                 .switched("stream", stream)
                 .switched("reading", "denoise");
@@ -333,7 +333,7 @@ fn every_ragged_read_is_self_paired_over_the_group_csr() {
                     .switched("reading", "denoise"),
             )
         };
-        for stream in ["text", "image", "reference"] {
+        for stream in ["context", "latents", "reference"] {
             assert!(
                 select.holds(word(stream)),
                 "{deployment}: {stream:?} is in the joint group"

@@ -94,9 +94,8 @@ async fn main(input: Input) -> Result<String> {
     let amateur_ws = WorkingSet::new();
 
     let prompt_i32 = prompt.iter().map(|&token| token as i32).collect::<Vec<_>>();
-    let amateur_prompt = Channel::from(prompt_i32.clone()).named("amateur_prompt");
-    let amateur_prefill_embed_indptr =
-        Channel::from([0u32, n]).named("amateur_prefill_embed_indptr");
+    let amateur_prompt = Channel::from(prompt_i32.clone());
+    let amateur_prefill_embed_indptr = Channel::from([0u32, n]);
     let amateur_prefill_mask = Channel::from_shaped(
         [n, span],
         (0..n)
@@ -105,7 +104,7 @@ async fn main(input: Input) -> Result<String> {
             })
             .collect::<Vec<_>>(),
     );
-    let amateur_prefill_out = Channel::new([vocab], dtype::f32).named("amateur_prefill_logits");
+    let amateur_prefill_out = Channel::new([vocab], dtype::f32);
 
     let amateur_prefill = ForwardPass::new();
     amateur_prefill.embed(&amateur_prompt, &amateur_prefill_embed_indptr)?;
@@ -124,10 +123,10 @@ async fn main(input: Input) -> Result<String> {
     // The expert keeps the complete context and consumes the amateur logits in
     // its epilogue to perform the contrastive token selection on-device.
     let expert_ws = WorkingSet::new();
-    let expert_prompt = Channel::from(prompt_i32).named("expert_prompt");
-    let expert_prefill_embed_indptr = Channel::from([0u32, n]).named("expert_prefill_embed_indptr");
-    let expert_prefill_amateur = Channel::new([vocab], dtype::f32).named("expert_prefill_amateur");
-    let first_out = Channel::new([1], dtype::i32).named("first_token");
+    let expert_prompt = Channel::from(prompt_i32);
+    let expert_prefill_embed_indptr = Channel::from([0u32, n]);
+    let expert_prefill_amateur = Channel::new([vocab], dtype::f32);
+    let first_out = Channel::new([1], dtype::i32);
     let lambda = input.lambda;
     let alpha = input.alpha;
 
@@ -151,20 +150,18 @@ async fn main(input: Input) -> Result<String> {
         return model::decode(&generated);
     }
 
-    let amateur_token = Channel::new([1], dtype::i32).named("amateur_token");
-    let amateur_fill = Channel::from([n + 1]).named("amateur_fill");
+    let amateur_token = Channel::new([1], dtype::i32);
+    let amateur_fill = Channel::from([n + 1]);
     let amateur_mask = Channel::from_shaped(
         [1, span],
         (0..span)
             .map(|key| key <= n && key.saturating_add(window) > n)
             .collect::<Vec<_>>(),
     );
-    let amateur_logits_out = Channel::new([vocab], dtype::f32)
-        .capacity(channel_capacity() as u32)
-        .named("amateur_logits");
+    let amateur_logits_out = Channel::new([vocab], dtype::f32).capacity(channel_capacity() as u32);
 
     let amateur_decode = ForwardPass::new();
-    let amateur_embed_indptr = Channel::from([0u32, 1]).named("amateur_embed_indptr");
+    let amateur_embed_indptr = Channel::from([0u32, 1]);
     amateur_decode.embed(&amateur_token, &amateur_embed_indptr)?;
     amateur_decode.mask(&amateur_mask)?;
     amateur_decode.state(&[&amateur_ws], StateGeometry::folding())?;
@@ -185,12 +182,10 @@ async fn main(input: Input) -> Result<String> {
         amateur_mask.put(next_mask);
     });
 
-    let expert_token = Channel::from([first as i32]).named("expert_token");
-    let expert_embed_indptr = Channel::from([0u32, 1]).named("expert_embed_indptr");
-    let expert_amateur = Channel::writer([vocab], dtype::f32).named("expert_amateur_logits");
-    let expert_token_out = Channel::new([1], dtype::i32)
-        .capacity(channel_capacity() as u32)
-        .named("expert_token_out");
+    let expert_token = Channel::from([first as i32]);
+    let expert_embed_indptr = Channel::from([0u32, 1]);
+    let expert_amateur = Channel::writer([vocab], dtype::f32);
+    let expert_token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
 
     let expert_decode = ForwardPass::new();
     expert_decode.embed(&expert_token, &expert_embed_indptr)?;

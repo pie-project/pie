@@ -107,14 +107,12 @@ def logits_decl(vocab: int) -> list[list[OutputDecl]]:
     return [[decl("logits", Axis.ROW, vocab, True)]]
 
 
-def ch_from(v, dt=None, name=None):
-    c = DslChannel.from_const(const_data(v, dt))
-    return c.named(name) if name else c
+def ch_from(v, dt=None):
+    return DslChannel.from_const(const_data(v, dt))
 
 
-def ch_new(shape, dt, name=None):
-    c = DslChannel.new(shape, dt)
-    return c.named(name) if name else c
+def ch_new(shape, dt):
+    return DslChannel.new(shape, dt)
 
 
 def host_put(ch: DslChannel, v, dt=None):
@@ -135,12 +133,12 @@ def test_s3_matches_lowering_rs_golden():
     there as GOLDEN_S3, so this checks the Rust golden directly too."""
     vocab = 32_000
     ctr1 = Tensor.constant([0, 1], Dtype.U32)
-    tok = ch_new([1], dtype.i32, "tok")
-    indptr_ch = ch_from([0, 1], dtype.u32, "indptr")
-    out = ch_new([1], dtype.i32, "out")
-    mask = ch_new([vocab], dtype.bool, "mask")
-    length = ch_from([1], dtype.u32, "len")
-    rng_ch = ch_from([7, 0], dtype.u32, "rng")
+    tok = ch_new([1], dtype.i32)
+    indptr_ch = ch_from([0, 1], dtype.u32)
+    out = ch_new([1], dtype.i32)
+    mask = ch_new([vocab], dtype.bool)
+    length = ch_from([1], dtype.u32)
+    rng_ch = ch_from([7, 0], dtype.u32)
     host_put(tok, [1], dtype.i32)
 
     b = Builder(vocab, 16)
@@ -168,10 +166,10 @@ def test_s3_matches_lowering_rs_golden():
 
 
 def test_text_completion_decode():
-    tok_in = ch_from([42], dtype.i32, "tok_in")
-    embed_indptr = ch_from([0, 1], dtype.u32, "embed_indptr")
-    fold = ch_from([0xFFFF_FFFF], dtype.u32, "fold")
-    tok_out = ch_new([1], dtype.i32, "tok_out")
+    tok_in = ch_from([42], dtype.i32)
+    embed_indptr = ch_from([0, 1], dtype.u32)
+    fold = ch_from([0xFFFF_FFFF], dtype.u32)
+    tok_out = ch_new([1], dtype.i32)
 
     b = Builder(VOCAB, PAGE)
 
@@ -194,13 +192,13 @@ def test_text_completion_decode():
 def test_naive_decode():
     temperature = 0.7
     cap = 8
-    tok_in = ch_from([3], dtype.i32, "tok_in")
-    rng_ch = ch_from([0x7CE1 ^ 0x5BD1, 0], dtype.u32, "rng")
-    tok_out = ch_new([1], dtype.i32, "tok_out").capacity(cap)
-    s1_out = ch_new([1], dtype.f32, "s1_out").capacity(cap)
-    s2_out = ch_new([1], dtype.f32, "s2_out").capacity(cap)
-    lane1 = ch_from([0, 1], dtype.u32, "embed_indptr")
-    fold = ch_from([0xFFFF_FFFF], dtype.u32, "fold")
+    tok_in = ch_from([3], dtype.i32)
+    rng_ch = ch_from([0x7CE1 ^ 0x5BD1, 0], dtype.u32)
+    tok_out = ch_new([1], dtype.i32).capacity(cap)
+    s1_out = ch_new([1], dtype.f32).capacity(cap)
+    s2_out = ch_new([1], dtype.f32).capacity(cap)
+    lane1 = ch_from([0, 1], dtype.u32)
+    fold = ch_from([0xFFFF_FFFF], dtype.u32)
 
     b = Builder(VOCAB, PAGE)
 
@@ -234,15 +232,15 @@ def test_naive_decode():
 
 def test_coverage():
     k = 8
-    tok = ch_from([1], dtype.i32, "tok")
-    indptr_ch = ch_from([0, 1], dtype.u32, "indptr")
-    rng_ch = ch_from([1, 2], dtype.u32, "rng")
-    top_p = ch_from([0.9], dtype.f32, "top_p")
-    bias = ch_from([0.0, -1.5, 2.25, 0.0], dtype.f32, "bias")
-    out = ch_new([1], dtype.i32, "out")
-    stat = ch_new([1], dtype.f32, "stat")
-    stat2 = ch_new([4], dtype.f32, "stat2")
-    flag = ch_new([1], dtype.bool, "flag")
+    tok = ch_from([1], dtype.i32)
+    indptr_ch = ch_from([0, 1], dtype.u32)
+    rng_ch = ch_from([1, 2], dtype.u32)
+    top_p = ch_from([0.9], dtype.f32)
+    bias = ch_from([0.0, -1.5, 2.25, 0.0], dtype.f32)
+    out = ch_new([1], dtype.i32)
+    stat = ch_new([1], dtype.f32)
+    stat2 = ch_new([4], dtype.f32)
+    flag = ch_new([1], dtype.bool)
 
     b = Builder(VOCAB, PAGE)
 
@@ -327,11 +325,11 @@ def test_coverage():
 
 
 def test_sinks():
-    tok = ch_from([1], dtype.i32, "tok")
-    indptr_ch = ch_from([0, 1], dtype.u32, "indptr")
-    a = ch_new([2, 4, 8], dtype.f32, "a")
-    bch = ch_new([2, 8, 4], dtype.f32, "b")
-    out = ch_new([1], dtype.i32, "out")
+    tok = ch_from([1], dtype.i32)
+    indptr_ch = ch_from([0, 1], dtype.u32)
+    a = ch_new([2, 4, 8], dtype.f32)
+    bch = ch_new([2, 8, 4], dtype.f32)
+    out = ch_new([1], dtype.i32)
     host_put(a, [0.0] * 64)
     host_put(bch, [0.0] * 64)
 
@@ -357,9 +355,9 @@ def test_sinks():
 def test_bulk_constant_is_refused():
     from inferlet.eta.trace import TraceError
 
-    tok = ch_from([1], dtype.i32, "tok")
-    indptr_ch = ch_from([0, 1], dtype.u32, "indptr")
-    out = ch_new([4], dtype.f32, "out")
+    tok = ch_from([1], dtype.i32)
+    indptr_ch = ch_from([0, 1], dtype.u32)
+    out = ch_new([4], dtype.f32)
     b = Builder(VOCAB, PAGE)
     b.set_outputs(logits_decl(VOCAB))
     b.bind_port(Port.EMBED_TOKENS, tok)
@@ -373,10 +371,10 @@ def test_bulk_constant_is_refused():
 def test_readiness_lint():
     from inferlet.eta.trace import TraceError
 
-    tok = ch_from([1], dtype.i32, "tok")
-    indptr_ch = ch_from([0, 1], dtype.u32, "indptr")
-    never = ch_new([1], dtype.f32, "never")
-    out = ch_new([1], dtype.f32, "out")
+    tok = ch_from([1], dtype.i32)
+    indptr_ch = ch_from([0, 1], dtype.u32)
+    never = ch_new([1], dtype.f32)
+    out = ch_new([1], dtype.f32)
     b = Builder(VOCAB, PAGE)
     b.set_outputs(logits_decl(VOCAB))
     b.bind_port(Port.EMBED_TOKENS, tok)
@@ -389,9 +387,9 @@ def test_readiness_lint():
 
 def _epilogue_bytes(body) -> bytes:
     vocab = 32_000
-    tok = ch_new([1], dtype.i32, "tok")
-    indptr_ch = ch_from([0, 1], dtype.u32, "indptr")
-    out = ch_new([vocab], dtype.bool, "out")
+    tok = ch_new([1], dtype.i32)
+    indptr_ch = ch_from([0, 1], dtype.u32)
+    out = ch_new([vocab], dtype.bool)
     host_put(tok, [1], dtype.i32)
     b = Builder(vocab, 16)
     b.set_outputs(logits_decl(vocab))
@@ -421,20 +419,20 @@ def test_diffusion_step_matches_rust():
     length, taps, base = 8, 4, 5
     end = base + length
     bound, confidence = 0.5, 0.1
-    toks = ch_from([(i * 7919) % 1000 for i in range(length)], dtype.i32, "canvas")
-    embed_indptr = ch_from([0, length], dtype.u32, "embed_indptr")
-    positions = ch_from(range(base, end), dtype.u32, "positions")
-    kv_len = ch_from([end], dtype.u32, "kv_len")
-    readout = ch_from(range(length), dtype.u32, "readout")
-    temp = ch_from([1.0], dtype.f32, "temperature")
-    rng_state = ch_from([7, 0], dtype.u32, "rng")
-    history = ch_from([-1] * length, dtype.i32, "argmax_history")
-    canvas_out = ch_new([length], dtype.i32, "canvas_out")
-    argmax_out = ch_new([length], dtype.i32, "argmax_out")
-    stop = ch_new([1], dtype.bool, "stop")
-    mean_out = ch_new([1], dtype.f32, "mean_entropy")
-    tap_ids_out = ch_new([length, taps], dtype.u32, "tap_ids")
-    tap_weights_out = ch_new([length, taps], dtype.f32, "tap_weights")
+    toks = ch_from([(i * 7919) % 1000 for i in range(length)], dtype.i32)
+    embed_indptr = ch_from([0, length], dtype.u32)
+    positions = ch_from(range(base, end), dtype.u32)
+    kv_len = ch_from([end], dtype.u32)
+    readout = ch_from(range(length), dtype.u32)
+    temp = ch_from([1.0], dtype.f32)
+    rng_state = ch_from([7, 0], dtype.u32)
+    history = ch_from([-1] * length, dtype.i32)
+    canvas_out = ch_new([length], dtype.i32)
+    argmax_out = ch_new([length], dtype.i32)
+    stop = ch_new([1], dtype.bool)
+    mean_out = ch_new([1], dtype.f32)
+    tap_ids_out = ch_new([length, taps], dtype.u32)
+    tap_weights_out = ch_new([length, taps], dtype.f32)
 
     b = Builder(VOCAB, PAGE)
 
@@ -484,18 +482,18 @@ def test_beam_step_matches_rust():
     pool_len = 8 * PAGE
     v = VOCAB
     init_mask = [p == 0 for _ in range(B) for p in range(pool_len)]
-    mask = DslChannel.from_const(ConstData(shape_of([B, pool_len]), Dtype.BOOL, pack_elems(init_mask, Dtype.BOOL))).named("mask")
-    scores = ch_from([0.0, float("-inf")], dtype.f32, "scores")
-    toks = ch_from([1] * B, dtype.i32, "toks")
-    pos = ch_from([0] * B, dtype.u32, "pos")
-    fill = ch_from([1], dtype.u32, "fill")
-    klen = ch_from([1] * B, dtype.u32, "klen")
-    slots = ch_from([0] * B, dtype.u32, "slots")
-    lanes_b = ch_from(range(B + 1), dtype.u32, "embed_indptr")
-    out = ch_new([B], dtype.i32, "out").capacity(8)
-    out_par = ch_new([B], dtype.u32, "out_par").capacity(8)
-    out_scr = ch_new([B], dtype.f32, "out_scr").capacity(8)
-    out_greedy = ch_new([B], dtype.i32, "out_greedy").capacity(8)
+    mask = DslChannel.from_const(ConstData(shape_of([B, pool_len]), Dtype.BOOL, pack_elems(init_mask, Dtype.BOOL)))
+    scores = ch_from([0.0, float("-inf")], dtype.f32)
+    toks = ch_from([1] * B, dtype.i32)
+    pos = ch_from([0] * B, dtype.u32)
+    fill = ch_from([1], dtype.u32)
+    klen = ch_from([1] * B, dtype.u32)
+    slots = ch_from([0] * B, dtype.u32)
+    lanes_b = ch_from(range(B + 1), dtype.u32)
+    out = ch_new([B], dtype.i32).capacity(8)
+    out_par = ch_new([B], dtype.u32).capacity(8)
+    out_scr = ch_new([B], dtype.f32).capacity(8)
+    out_greedy = ch_new([B], dtype.i32).capacity(8)
 
     b = Builder(VOCAB, PAGE)
 
@@ -543,16 +541,16 @@ def test_latent_step_matches_rust():
     ops. The one golden that carries tags 0x08..0x0b, `RngKind.NORMAL` and
     `Intrinsic.VELOCITY`, so a port that drifts on any of them fails here."""
     rows, channels = 8, 16
-    tok = ch_from([1], dtype.i32, "tok")
-    indptr_ch = ch_from([0, 1], dtype.u32, "indptr")
-    readout = ch_from(range(rows), dtype.u32, "readout")
-    kv_len = ch_from([rows], dtype.u32, "kv_len")
-    positions = ch_from(range(rows), dtype.u32, "positions")
-    latent = ch_new([rows, channels], dtype.f32, "latent")
-    dsigma = ch_from([-0.25], dtype.f32, "dsigma")
-    rng_ch = ch_from([9, 0], dtype.u32, "rng")
-    out = ch_new([rows, channels], dtype.f32, "latent_out")
-    norm_out = ch_new([rows], dtype.f32, "norms")
+    tok = ch_from([1], dtype.i32)
+    indptr_ch = ch_from([0, 1], dtype.u32)
+    readout = ch_from(range(rows), dtype.u32)
+    kv_len = ch_from([rows], dtype.u32)
+    positions = ch_from(range(rows), dtype.u32)
+    latent = ch_new([rows, channels], dtype.f32)
+    dsigma = ch_from([-0.25], dtype.f32)
+    rng_ch = ch_from([9, 0], dtype.u32)
+    out = ch_new([rows, channels], dtype.f32)
+    norm_out = ch_new([rows], dtype.f32)
     host_put(latent, [0.0] * (rows * channels), dtype.f32)
 
     b = Builder(VOCAB, PAGE)
@@ -609,7 +607,7 @@ def test_latent_step_matches_rust():
 def test_vae_readback_matches_rust():
     """`inferlet_goldens.rs::vae_readback`: the one golden reading a voxel output."""
     rows, rgb = 16, 3
-    out = ch_new([rows, rgb], dtype.f32, "pixels_out")
+    out = ch_new([rows, rgb], dtype.f32)
 
     b = Builder(VOCAB, PAGE)
 
@@ -629,9 +627,9 @@ def test_vae_readback_matches_rust():
 def test_noised_input_matches_rust():
     """`inferlet_goldens.rs::noised_input`: the one golden carrying an input table."""
     rows, width = 4, 8
-    rng_ch = ch_from([5, 0], dtype.u32, "rng")
-    latent = ch_new([rows, width], dtype.f32, "latent")
-    timestep = ch_from([0.5], dtype.f32, "timestep")
+    rng_ch = ch_from([5, 0], dtype.u32)
+    latent = ch_new([rows, width], dtype.f32)
+    timestep = ch_from([0.5], dtype.f32)
 
     b = Builder(VOCAB, PAGE)
 

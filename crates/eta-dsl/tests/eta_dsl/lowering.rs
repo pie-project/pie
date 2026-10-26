@@ -17,12 +17,12 @@ fn initial_mask() -> Vec<bool> {
 
 fn build_s3() -> Traced {
     let ctr1: &'static Tensor = leak(Tensor::constant([0u32, 1]));
-    let tok: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok"));
-    let indptr: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
-    let out: &'static Channel = leak(Channel::new([1], dtype::i32).named("out"));
-    let mask: &'static Channel = leak(Channel::new([VOCAB], dtype::bool).named("mask"));
-    let len: &'static Channel = leak(Channel::from([1u32]).named("len"));
-    let rng_ch: &'static Channel = leak(Channel::from([7u32, 0]).named("rng"));
+    let tok: &'static Channel = leak(Channel::new([1], dtype::i32));
+    let indptr: &'static Channel = leak(Channel::from([0u32, 1]));
+    let out: &'static Channel = leak(Channel::new([1], dtype::i32));
+    let mask: &'static Channel = leak(Channel::new([VOCAB], dtype::bool));
+    let len: &'static Channel = leak(Channel::from([1u32]));
+    let rng_ch: &'static Channel = leak(Channel::from([7u32, 0]));
 
     tok.put([1i32]);
 
@@ -66,7 +66,7 @@ fn s3_identity_hash_is_stable() {
 fn lint_double_endpoint_host_both_ends() {
     let tok: &'static Channel = leak(Channel::new([1], dtype::i32));
     let indptr: &'static Channel = leak(Channel::from([0u32, 1]));
-    let dup: &'static Channel = leak(Channel::new([1], dtype::i32).named("dup"));
+    let dup: &'static Channel = leak(Channel::new([1], dtype::i32));
     tok.put([1i32]);
     dup.put([0i32]);
     dup.note_host_take();
@@ -85,7 +85,7 @@ fn lint_double_endpoint_host_both_ends() {
     assert!(
         err.0.iter().any(|e| matches!(
             e,
-            TraceError::DoubleEndpoint { role: "host", channel, .. } if channel == "dup"
+            TraceError::DoubleEndpoint { role: "host", channel, .. } if *channel == dup.site()
         )),
         "expected a host DoubleEndpoint on `dup`, got:\n{msg}"
     );

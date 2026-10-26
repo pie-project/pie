@@ -739,7 +739,7 @@ impl Display for D {
             Dim::Images => f.write_str("images"),
             Dim::ImagesPlus(k) => write!(f, "images+{k}"),
             Dim::Voxels => f.write_str("voxels"),
-            Dim::VoxelsTimes(k) => write!(f, "voxels*{k}"),
+            Dim::VoxelsScaled(n, d) => write!(f, "voxels*{n}/{d}"),
             Dim::Clips => f.write_str("clips"),
             Dim::ClipsPlus(k) => write!(f, "clips+{k}"),
         }

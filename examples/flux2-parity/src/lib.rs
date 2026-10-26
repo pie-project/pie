@@ -92,7 +92,7 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
 }
 
 fn dims(reading: &str, references: bool) -> Result<Dims> {
-    let image = model::lane_of(&[("reading", reading), ("stream", "image")])?;
+    let image = model::lane_of(&[("reading", reading), ("stream", "latents")])?;
     let guidance = image.inputs.iter().any(|i| i.name == "guidance");
     let scalars: &[&'static str] = if guidance {
         &["timestep", "guidance"]
@@ -100,8 +100,8 @@ fn dims(reading: &str, references: bool) -> Result<Dims> {
         &["timestep"]
     };
     let with = |rows: &[&'static str]| [rows, scalars].concat();
-    let image = lane_reading(reading, "image", &with(&["latents"]))?;
-    lane_reading(reading, "text", &with(&["context"]))?;
+    let image = lane_reading(reading, "latents", &with(&["latents"]))?;
+    lane_reading(reading, "context", &with(&["context"]))?;
     if references {
         lane_reading(reading, "reference", &with(&["latents", "reference"]))?;
     }
@@ -141,31 +141,31 @@ fn latent(at: &Latent, channels: u32, name: &str) -> Result<Channel> {
             at.width
         ));
     }
-    Ok(Channel::from_shaped([at.height, at.width, channels], at.latents.as_slice()).named(name))
+    Ok(Channel::from_shaped(
+        [at.height, at.width, channels],
+        at.latents.as_slice(),
+    ))
 }
 
 async fn step(case: &Case, dims: &Dims, reading: &str, pipe: &Pipeline) -> Result<Vec<f32>> {
     let group = 0;
     let pass = ForwardPass::new();
-    let t = Channel::from([case.timestep]).named("t");
-    let g = dims
-        .guidance
-        .then(|| Channel::from([case.guidance]).named("g"));
+    let t = Channel::from([case.timestep]);
+    let g = dims.guidance.then(|| Channel::from([case.guidance]));
 
     // The raw `[L, joint_attention_dim]` stack: the miniature has no encoder.
     pass.switch(0, "reading", reading)?;
-    pass.switch(0, "stream", "text")?;
+    pass.switch(0, "stream", "context")?;
     pass.group(0, group)?;
     let ctx = Channel::from_shaped(
         [case.text_rows, case.context_width],
         case.context.as_slice(),
-    )
-    .named("context");
+    );
     pass.input(0, "context", &ctx)?;
     scalars(&pass, 0, &t, g.as_ref())?;
 
     pass.switch(1, "reading", reading)?;
-    pass.switch(1, "stream", "image")?;
+    pass.switch(1, "stream", "latents")?;
     pass.group(1, group)?;
     let x = latent(&case.target, case.channels, "latents")?;
     pass.input(1, "latents", &x)?;
@@ -177,7 +177,7 @@ async fn step(case: &Case, dims: &Dims, reading: &str, pipe: &Pipeline) -> Resul
         pass.switch(lane, "stream", "reference")?;
         pass.group(lane, group)?;
         let r = latent(reference, case.channels, &format!("reference{k}"))?;
-        let ordinal = Channel::from([k as f32]).named(&format!("ordinal{k}"));
+        let ordinal = Channel::from([k as f32]);
         pass.input(lane, "latents", &r)?;
         pass.input(lane, "reference", &ordinal)?;
         scalars(&pass, lane, &t, g.as_ref())?;
@@ -185,7 +185,7 @@ async fn step(case: &Case, dims: &Dims, reading: &str, pipe: &Pipeline) -> Resul
 
     let voxels = case.target.height * case.target.width;
     let velocity_width = dims.velocity_width;
-    let out = Channel::new([voxels, velocity_width], dtype::f32).named("velocity");
+    let out = Channel::new([voxels, velocity_width], dtype::f32);
     pass.epilogue(move || {
         out.put(intrinsics::output_rows(1, "velocity", voxels));
     });

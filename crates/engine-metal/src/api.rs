@@ -174,6 +174,8 @@ fn extents(stated: &BindExtents) -> eta_exec::Extents {
 /// so its arena scratch fits beside resident weights.
 const MIN_FITTED_FORWARD_TOKENS: u32 = 512;
 
+const DEFAULT_STATE_SLOTS: u32 = 256;
+
 fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
@@ -214,28 +216,6 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
             .max(1),
         max_patches,
         buckets,
-    })
-}
-
-#[must_use]
-pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<poem_compiler::VoxelLadder> {
-    const DERIVED_VOXEL_CEILING: u32 = 65_536;
-
-    let declares_voxels = trace.values.iter().any(|decl| {
-        matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Voxels))
-    });
-    if !declares_voxels {
-        return None;
-    }
-    let max_voxels = budgets.max_voxels.unwrap_or(DERIVED_VOXEL_CEILING).max(1);
-    Some(poem_compiler::VoxelLadder {
-        max_voxels,
-        buckets: Vec::new(),
-        max_clips: budgets
-            .max_clips
-            .unwrap_or(budgets.max_lanes)
-            .clamp(1, max_voxels),
     })
 }
 
@@ -367,10 +347,14 @@ impl Engine for Metal {
             (device.working_set(), device.held_elsewhere())
         };
         let util = residency.device_memory_share;
+        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let paging = crate::store::kv::Paging::of(
             budgets.page_size,
             budgets.max_context,
-            engine::fit::least_state_slots(1).min(budgets.slots),
+            match slots {
+                0 => engine::fit::least_state_slots(1),
+                slots => engine::fit::least_state_slots(1).min(slots),
+            },
             1,
         )
         .map_err(|error| fault(Fault::from(error)))?;
@@ -411,17 +395,47 @@ impl Engine for Metal {
             let plan =
                 experts::Plan::beside(&trace, &planes, residency.device_weight_budget, gathered)
                     .map_err(fault)?;
+            let room = accounting(plan.device_demand(), 0)
+                .pool
+                .saturating_sub(kv_pool)
+                / 2;
+            let mut fitted = poem_compiler::fit_voxels(
+                &trace,
+                poem_compiler::Budgets {
+                    tokens: bake_budgets(&budgets),
+                    patches: patch_ladder(&trace, &budgets),
+                    voxels: poem_compiler::VoxelLadder::of(
+                        &trace,
+                        budgets.max_voxels,
+                        budgets.max_clips,
+                        budgets.max_lanes,
+                    ),
+                },
+                &DeviceProfile::default(),
+                room,
+            );
+            let slots = match slots {
+                0 => poem_compiler::fit_frame_slots(
+                    &trace,
+                    fitted.voxels.as_mut(),
+                    room,
+                    engine::fit::least_state_slots(1),
+                    frames_in_flight,
+                ),
+                slots => slots,
+            };
+            let voxels = fitted.voxels;
             let prepared = Shell::prepare(Boot {
                 trace: trace.clone(),
                 contract: &contract,
                 checkpoint: &path,
                 budget: bake_budgets(&budgets),
                 patches: patch_ladder(&trace, &budgets),
-                voxels: voxel_ladder(&trace, &budgets),
+                voxels,
                 profile: None::<DeviceProfile>,
                 page_size: budgets.page_size,
                 context: budgets.max_context,
-                slots: budgets.slots,
+                slots,
                 kv_budget: residency.device_kv_budget,
                 memory_share: residency.device_memory_share,
                 runahead: engine::runahead::Runahead::of(frames_in_flight),

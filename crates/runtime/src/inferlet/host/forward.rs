@@ -84,11 +84,13 @@ fn input_names(model: &crate::model::Model) -> String {
     if model.inputs().is_empty() {
         return "it reads none".to_string();
     }
-    let names: Vec<String> = model
-        .inputs()
-        .iter()
-        .map(|input| format!("`{}`", input.name))
-        .collect();
+    let mut names: Vec<String> = Vec::new();
+    for input in model.inputs() {
+        let name = format!("`{}`", input.name);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
     format!("it reads {}", names.join(", "))
 }
 
@@ -641,7 +643,13 @@ impl ProcessCtx {
             return Ok(Err("forward pass program is already attached".to_string()));
         }
         let model = crate::model::model();
-        let Some((id, input)) = model.input(&name) else {
+        let switches = pass
+            .bindings
+            .lanes
+            .get(lane)
+            .map(|bound| bound.switches.clone())
+            .unwrap_or_default();
+        let Some((id, input)) = model.input(&name, &switches) else {
             return Ok(Err(format!(
                 "this model reads no input `{name}`; {}",
                 input_names(model)
@@ -1449,19 +1457,11 @@ impl ProcessCtx {
     }
 
     async fn core_drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
-        let fires = self
-            .ctx()
-            .table
-            .get(&this)?
-            .bound()
-            .ok()
-            .and_then(|pass| pass.fires.clone());
-        if let Some(fires) = fires {
-            crate::pipeline::fire::finalize_all(self, &fires, false).await?;
-        }
-
-        let mut pass = self.ctx().table.delete(this)?;
-        if let Ok(bound) = pass.bound_mut() {
+        let rep = this.rep();
+        let Some(bound) = self.ctx().table.delete(this)?.take_bound() else {
+            return Ok(());
+        };
+        if let Some(mut bound) = crate::pipeline::fire::retire_pass(rep, bound) {
             bound.close_native();
         }
         Ok(())

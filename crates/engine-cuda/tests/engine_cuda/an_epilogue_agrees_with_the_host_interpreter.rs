@@ -308,6 +308,7 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     a_row_every_row_shares_broadcasts_to_each_row();
     the_acceptance_rule_agrees_with_the_interpreter();
     the_gaussian_draw_and_the_transcendentals_agree_with_the_interpreter();
+    a_frame_gathers_out_of_one_frame();
 }
 
 fn the_device_answers_what_the_interpreter_answers() {
@@ -769,4 +770,46 @@ fn the_gaussian_draw_and_the_transcendentals_agree_with_the_interpreter() {
         variance > 0.4,
         "the device drew a near-constant plane (variance {variance})"
     );
+}
+
+fn a_frame_gathers_out_of_one_frame() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let (frame, plane) = (Shape::new(&[4, 4, 8]).unwrap(), 128);
+    let ops = vec![
+        Op::ChanRead(0),
+        Op::Reshape {
+            value: 0,
+            shape: Shape::matrix(1, plane),
+        },
+        Op::ChanTake(1),
+        Op::Gather { src: 1, idx: 2 },
+        Op::Reshape {
+            value: 3,
+            shape: frame,
+        },
+        Op::ChanPut { chan: 2, value: 4 },
+    ];
+    let container = TraceContainer {
+        names: vec!["logits".to_string()],
+        channels: vec![
+            seeded(Shape::new(&[1, 4, 4, 8]).unwrap(), Dtype::F32),
+            seeded(Shape::vector(1), Dtype::U32),
+            reader(frame, Dtype::F32),
+        ],
+        ports: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Prologue,
+            ops,
+        }],
+        externs: Vec::new(),
+        inputs: Vec::new(),
+    };
+    let bound = crate::bound::logits(container, VOCAB).expect("the frame gather binds");
+    let x: Vec<f32> = (0..plane).map(|i| 1.0 + i as f32).collect();
+    let seeds = vec![(0, Value::F32(x.clone())), (1, Value::U32(vec![0]))];
+    let got = device_outputs(&bound, &seeds, ROWS, None, &[2]);
+    assert_eq!(wire_f32(&got[0]), x, "the one frame");
 }

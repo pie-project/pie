@@ -92,12 +92,14 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             );
         }
     }
-    if boot.slots == 0 {
-        boot.slots = match engine.state_slots_per_lane {
+    boot.slots = poem_compiler::state_slots(
+        boot.slots,
+        &boot.trace,
+        match engine.state_slots_per_lane {
             0 => DEFAULT_STATE_SLOTS,
             per_lane => per_lane.saturating_mul(boot.budget.max_lanes).max(1),
-        };
-    }
+        },
+    );
 
     kernels_cuda::disk::install(boot.cache_dir);
 
@@ -191,10 +193,25 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             crate::store::weight_tier_bytes(&boot.trace, boot.residency.device_demand(), 0)?,
         );
     let facts = kv::probe(&boot.trace)?;
-    let budgets_at = |budget: &Budget| Budgets {
+    let derive_voxels = boot
+        .voxels
+        .as_ref()
+        .is_some_and(|ladder| ladder.max_voxels == 0);
+    let least_voxels = |ladder: &poem_compiler::VoxelLadder| {
+        let clips = ladder.max_clips;
+        ladder.clone().at(clips)
+    };
+    let voxels = boot.voxels.as_ref().map(|ladder| {
+        if derive_voxels {
+            least_voxels(ladder)
+        } else {
+            ladder.clone()
+        }
+    });
+    let budgets_at = |budget: &Budget, voxels: &Option<poem_compiler::VoxelLadder>| Budgets {
         tokens: budget.clone(),
         patches: boot.patches.clone(),
-        voxels: boot.voxels.clone(),
+        voxels: voxels.clone(),
     };
     let budget_at = |tokens: u32| {
         let mut budget = boot.budget.clone();
@@ -219,7 +236,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let asked_tokens = boot.budget.max_tokens;
     let floor = boot.budget.max_lanes.max(TOKENS_FLOOR).min(asked_tokens);
     let window = crate::store::window_of(&boot.trace)?;
-    let working_at = |tokens: u32| -> u64 {
+    let working = |tokens: u32, voxels: &Option<poem_compiler::VoxelLadder>| -> u64 {
         let windowed = Paging::of(boot.page_size, boot.context, boot.slots, 1)
             .ok()
             .and_then(|paging| {
@@ -227,7 +244,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             })
             .unwrap_or(u64::MAX);
         let budget = budget_at(tokens);
-        let Ok(compiled) = poem_compiler::compile_axes(&boot.trace, &budgets_at(&budget), &profile)
+        let Ok(compiled) =
+            poem_compiler::compile_axes(&boot.trace, &budgets_at(&budget, voxels), &profile)
         else {
             return u64::MAX;
         };
@@ -243,8 +261,37 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             ))
             .saturating_add(windowed)
     };
+    let working_at = |tokens: u32| working(tokens, &voxels);
     let share = after_weights / 100 * u64::from(engine.working_set_percent);
     let tokens = crate::store::tokens_within(asked_tokens, floor, share, working_at);
+    let voxels = match voxels.clone() {
+        Some(ladder) if derive_voxels => {
+            let floor = ladder.max_clips;
+            let paging = Paging::of(boot.page_size, boot.context, boot.slots, 1)?;
+            let cache = crate::store::least_sequence_bytes(&boot.trace, paging)?;
+            let room = share.min(after_weights.saturating_sub(cache));
+            let fitted = poem_compiler::voxels_within(room, floor, |rows| {
+                let at = ladder.clone().at(rows);
+                let seat = crate::voxels::Seat::of(&boot.trace, &at);
+                working(tokens, &Some(at)).saturating_add(seat.payload_bytes())
+            });
+            eprintln!(
+                "engine-cuda: [model] max_voxels unstated: {fitted} rows of the widest voxel \
+                 value fit the working set beside {tokens} tokens"
+            );
+            Some(ladder.at(fitted))
+        }
+        voxels => voxels,
+    };
+    let cache_room = (boot.slots == 0).then(|| {
+        let seat = voxels.as_ref().map_or(0, |ladder| {
+            crate::voxels::Seat::of(&boot.trace, ladder).payload_bytes()
+        });
+        after_weights
+            .saturating_sub(working(tokens, &voxels))
+            .saturating_sub(seat)
+            .saturating_sub(crate::store::BODIES_FLOOR_BYTES)
+    });
     if tokens != asked_tokens {
         eprintln!(
             "engine-cuda: [engine] max_forward_tokens {asked_tokens} is served at {tokens}: at \
@@ -258,7 +305,21 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         );
         boot.budget = budget_at(tokens);
     }
-    let budgets = budgets_at(&boot.budget);
+    boot.voxels = voxels;
+    if let Some(room) = cache_room {
+        boot.slots = poem_compiler::fit_frame_slots(
+            &boot.trace,
+            boot.voxels.as_mut(),
+            room,
+            engine::fit::least_state_slots(1),
+            boot.runahead.frames_in_flight,
+        );
+    }
+    let budgets = Budgets {
+        tokens: boot.budget.clone(),
+        patches: boot.patches.clone(),
+        voxels: boot.voxels.clone(),
+    };
     let compiled = poem_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
     if boot.knobs.diagnostics.arm_trace {
         let mut streams: std::collections::BTreeMap<u32, Vec<String>> =

@@ -165,12 +165,12 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── PREFILL FIRE (N-wide) — first mirostat step over the prompt. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-    let mu_p = Channel::new([1], dtype::f32).named("mu_p");
-    let rng_p = Channel::from([0x9e37_u32, 0]).named("rng_p");
-    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
-    let s_out_p = Channel::new([1], dtype::f32).named("s_out_p");
+    let toks_p = Channel::from(prompt_i32);
+    let embed_indptr_p = Channel::from([0u32, n]);
+    let mu_p = Channel::new([1], dtype::f32);
+    let rng_p = Channel::from([0x9e37_u32, 0]);
+    let tok_out_p = Channel::new([1], dtype::i32);
+    let s_out_p = Channel::new([1], dtype::f32);
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -198,16 +198,12 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── DECODE LOOP (1-wide) ──
     if generated.len() < max_tokens {
-        let tok_in = Channel::from([g0]).named("tok_in");
-        let mu_state = Channel::from([mu]).named("mu_state");
-        let rng = Channel::from([0x51ed_u32, 0]).named("rng");
-        let tok_out = Channel::new([1], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("tok_out");
-        let s_out = Channel::new([1], dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named("s_out");
-        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let tok_in = Channel::from([g0]);
+        let mu_state = Channel::from([mu]);
+        let rng = Channel::from([0x51ed_u32, 0]);
+        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+        let s_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
+        let lane1 = Channel::from([0u32, 1u32]);
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;

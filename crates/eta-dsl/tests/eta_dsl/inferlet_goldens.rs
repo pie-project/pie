@@ -17,12 +17,12 @@ fn hex(b: &[u8]) -> String {
 fn s3() -> Traced {
     let vocab = 32_000u32;
     let ctr1: &'static Tensor = leak(Tensor::constant([0u32, 1]));
-    let tok: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok"));
-    let indptr: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
-    let out: &'static Channel = leak(Channel::new([1], dtype::i32).named("out"));
-    let mask: &'static Channel = leak(Channel::new([vocab], dtype::bool).named("mask"));
-    let len: &'static Channel = leak(Channel::from([1u32]).named("len"));
-    let rng_ch: &'static Channel = leak(Channel::from([7u32, 0]).named("rng"));
+    let tok: &'static Channel = leak(Channel::new([1], dtype::i32));
+    let indptr: &'static Channel = leak(Channel::from([0u32, 1]));
+    let out: &'static Channel = leak(Channel::new([1], dtype::i32));
+    let mask: &'static Channel = leak(Channel::new([vocab], dtype::bool));
+    let len: &'static Channel = leak(Channel::from([1u32]));
+    let rng_ch: &'static Channel = leak(Channel::from([7u32, 0]));
     tok.put([1i32]);
     let mut b = Builder::new(vocab, 16);
     b.outputs(crate::outputs::logits(vocab));
@@ -44,10 +44,10 @@ fn s3() -> Traced {
 }
 
 fn text_completion_decode() -> Traced {
-    let tok_in: &'static Channel = leak(Channel::from([42i32]).named("tok_in"));
-    let embed_indptr: &'static Channel = leak(Channel::from([0u32, 1]).named("embed_indptr"));
-    let fold: &'static Channel = leak(Channel::from([u32::MAX]).named("fold"));
-    let tok_out: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok_out"));
+    let tok_in: &'static Channel = leak(Channel::from([42i32]));
+    let embed_indptr: &'static Channel = leak(Channel::from([0u32, 1]));
+    let fold: &'static Channel = leak(Channel::from([u32::MAX]));
+    let tok_out: &'static Channel = leak(Channel::new([1], dtype::i32));
     let mut b = Builder::new(VOCAB, PAGE);
     b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::EmbedTokens, tok_in);
@@ -63,16 +63,13 @@ fn text_completion_decode() -> Traced {
 fn naive_decode() -> Traced {
     let temperature = 0.7f32;
     let cap = 8u32;
-    let tok_in: &'static Channel = leak(Channel::from([3i32]).named("tok_in"));
-    let rng: &'static Channel = leak(Channel::from([0x7ce1u32 ^ 0x5bd1, 0]).named("rng"));
-    let tok_out: &'static Channel =
-        leak(Channel::new([1], dtype::i32).capacity(cap).named("tok_out"));
-    let s1_out: &'static Channel =
-        leak(Channel::new([1], dtype::f32).capacity(cap).named("s1_out"));
-    let s2_out: &'static Channel =
-        leak(Channel::new([1], dtype::f32).capacity(cap).named("s2_out"));
-    let lane1: &'static Channel = leak(Channel::from([0u32, 1u32]).named("embed_indptr"));
-    let fold: &'static Channel = leak(Channel::from([u32::MAX]).named("fold"));
+    let tok_in: &'static Channel = leak(Channel::from([3i32]));
+    let rng: &'static Channel = leak(Channel::from([0x7ce1u32 ^ 0x5bd1, 0]));
+    let tok_out: &'static Channel = leak(Channel::new([1], dtype::i32).capacity(cap));
+    let s1_out: &'static Channel = leak(Channel::new([1], dtype::f32).capacity(cap));
+    let s2_out: &'static Channel = leak(Channel::new([1], dtype::f32).capacity(cap));
+    let lane1: &'static Channel = leak(Channel::from([0u32, 1u32]));
+    let fold: &'static Channel = leak(Channel::from([u32::MAX]));
     let mut b = Builder::new(VOCAB, PAGE);
     b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::EmbedTokens, tok_in);
@@ -99,15 +96,15 @@ fn naive_decode() -> Traced {
 
 fn coverage() -> Traced {
     let k = 8u32;
-    let tok: &'static Channel = leak(Channel::from([1i32]).named("tok"));
-    let indptr_ch: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
-    let rng_ch: &'static Channel = leak(Channel::from([1u32, 2]).named("rng"));
-    let top_p: &'static Channel = leak(Channel::from([0.9f32]).named("top_p"));
-    let bias: &'static Channel = leak(Channel::from(vec![0.0f32, -1.5, 2.25, 0.0]).named("bias"));
-    let out: &'static Channel = leak(Channel::new([1], dtype::i32).named("out"));
-    let stat: &'static Channel = leak(Channel::new([1], dtype::f32).named("stat"));
-    let stat2: &'static Channel = leak(Channel::new([4], dtype::f32).named("stat2"));
-    let flag: &'static Channel = leak(Channel::new([1], dtype::bool).named("flag"));
+    let tok: &'static Channel = leak(Channel::from([1i32]));
+    let indptr_ch: &'static Channel = leak(Channel::from([0u32, 1]));
+    let rng_ch: &'static Channel = leak(Channel::from([1u32, 2]));
+    let top_p: &'static Channel = leak(Channel::from([0.9f32]));
+    let bias: &'static Channel = leak(Channel::from(vec![0.0f32, -1.5, 2.25, 0.0]));
+    let out: &'static Channel = leak(Channel::new([1], dtype::i32));
+    let stat: &'static Channel = leak(Channel::new([1], dtype::f32));
+    let stat2: &'static Channel = leak(Channel::new([4], dtype::f32));
+    let flag: &'static Channel = leak(Channel::new([1], dtype::bool));
     let mut b = Builder::new(VOCAB, PAGE);
     b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::EmbedTokens, tok);
@@ -180,11 +177,11 @@ fn coverage() -> Traced {
 }
 
 fn sinks() -> Traced {
-    let tok: &'static Channel = leak(Channel::from([1i32]).named("tok"));
-    let indptr_ch: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
-    let a: &'static Channel = leak(Channel::new([2, 4, 8], dtype::f32).named("a"));
-    let bch: &'static Channel = leak(Channel::new([2, 8, 4], dtype::f32).named("b"));
-    let out: &'static Channel = leak(Channel::new([1], dtype::i32).named("out"));
+    let tok: &'static Channel = leak(Channel::from([1i32]));
+    let indptr_ch: &'static Channel = leak(Channel::from([0u32, 1]));
+    let a: &'static Channel = leak(Channel::new([2, 4, 8], dtype::f32));
+    let bch: &'static Channel = leak(Channel::new([2, 8, 4], dtype::f32));
+    let out: &'static Channel = leak(Channel::new([1], dtype::i32));
     a.put(vec![0.0f32; 64]);
     bch.put(vec![0.0f32; 64]);
     let mut b = Builder::new(VOCAB, PAGE);
@@ -209,32 +206,24 @@ fn diffusion_step() -> Traced {
     let end = base + length;
     let bound = 0.5f32;
     let confidence = 0.1f32;
-    let toks: &'static Channel = leak(
-        Channel::from(
-            (0..length)
-                .map(|i| (i * 7919 % 1000) as i32)
-                .collect::<Vec<_>>(),
-        )
-        .named("canvas"),
-    );
-    let embed_indptr: &'static Channel = leak(Channel::from([0u32, length]).named("embed_indptr"));
-    let positions: &'static Channel =
-        leak(Channel::from((base..end).collect::<Vec<_>>()).named("positions"));
-    let kv_len: &'static Channel = leak(Channel::from([end]).named("kv_len"));
-    let readout: &'static Channel =
-        leak(Channel::from((0..length).collect::<Vec<_>>()).named("readout"));
-    let temp: &'static Channel = leak(Channel::from([1.0f32]).named("temperature"));
-    let rng_state: &'static Channel = leak(Channel::from([7u32, 0]).named("rng"));
-    let history: &'static Channel =
-        leak(Channel::from(vec![-1i32; length as usize]).named("argmax_history"));
-    let canvas_out: &'static Channel = leak(Channel::new([length], dtype::i32).named("canvas_out"));
-    let argmax_out: &'static Channel = leak(Channel::new([length], dtype::i32).named("argmax_out"));
-    let stop: &'static Channel = leak(Channel::new([1], dtype::bool).named("stop"));
-    let mean_out: &'static Channel = leak(Channel::new([1], dtype::f32).named("mean_entropy"));
-    let tap_ids_out: &'static Channel =
-        leak(Channel::new([length, taps], dtype::u32).named("tap_ids"));
-    let tap_weights_out: &'static Channel =
-        leak(Channel::new([length, taps], dtype::f32).named("tap_weights"));
+    let toks: &'static Channel = leak(Channel::from(
+        (0..length)
+            .map(|i| (i * 7919 % 1000) as i32)
+            .collect::<Vec<_>>(),
+    ));
+    let embed_indptr: &'static Channel = leak(Channel::from([0u32, length]));
+    let positions: &'static Channel = leak(Channel::from((base..end).collect::<Vec<_>>()));
+    let kv_len: &'static Channel = leak(Channel::from([end]));
+    let readout: &'static Channel = leak(Channel::from((0..length).collect::<Vec<_>>()));
+    let temp: &'static Channel = leak(Channel::from([1.0f32]));
+    let rng_state: &'static Channel = leak(Channel::from([7u32, 0]));
+    let history: &'static Channel = leak(Channel::from(vec![-1i32; length as usize]));
+    let canvas_out: &'static Channel = leak(Channel::new([length], dtype::i32));
+    let argmax_out: &'static Channel = leak(Channel::new([length], dtype::i32));
+    let stop: &'static Channel = leak(Channel::new([1], dtype::bool));
+    let mean_out: &'static Channel = leak(Channel::new([1], dtype::f32));
+    let tap_ids_out: &'static Channel = leak(Channel::new([length, taps], dtype::u32));
+    let tap_weights_out: &'static Channel = leak(Channel::new([length, taps], dtype::f32));
     let mut b = Builder::new(VOCAB, PAGE);
     b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::EmbedTokens, toks);
@@ -305,26 +294,18 @@ fn beam_step() -> Traced {
     let pool_len = 8 * PAGE;
     let v = VOCAB;
     let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..pool_len).map(|p| p == 0)).collect();
-    let mask: &'static Channel = leak(Channel::from_shaped([B, pool_len], init_mask).named("mask"));
-    let scores: &'static Channel =
-        leak(Channel::from(vec![0.0f32, f32::NEG_INFINITY]).named("scores"));
-    let toks: &'static Channel = leak(Channel::from(vec![1i32; B as usize]).named("toks"));
-    let pos: &'static Channel = leak(Channel::from(vec![0u32; B as usize]).named("pos"));
-    let fill: &'static Channel = leak(Channel::from([1u32]).named("fill"));
-    let klen: &'static Channel = leak(Channel::from(vec![1u32; B as usize]).named("klen"));
-    let slots: &'static Channel = leak(Channel::from(vec![0u32; B as usize]).named("slots"));
-    let lanes_b: &'static Channel =
-        leak(Channel::from((0..=B).collect::<Vec<_>>()).named("embed_indptr"));
-    let out: &'static Channel = leak(Channel::new([B], dtype::i32).capacity(8).named("out"));
-    let out_par: &'static Channel =
-        leak(Channel::new([B], dtype::u32).capacity(8).named("out_par"));
-    let out_scr: &'static Channel =
-        leak(Channel::new([B], dtype::f32).capacity(8).named("out_scr"));
-    let out_greedy: &'static Channel = leak(
-        Channel::new([B], dtype::i32)
-            .capacity(8)
-            .named("out_greedy"),
-    );
+    let mask: &'static Channel = leak(Channel::from_shaped([B, pool_len], init_mask));
+    let scores: &'static Channel = leak(Channel::from(vec![0.0f32, f32::NEG_INFINITY]));
+    let toks: &'static Channel = leak(Channel::from(vec![1i32; B as usize]));
+    let pos: &'static Channel = leak(Channel::from(vec![0u32; B as usize]));
+    let fill: &'static Channel = leak(Channel::from([1u32]));
+    let klen: &'static Channel = leak(Channel::from(vec![1u32; B as usize]));
+    let slots: &'static Channel = leak(Channel::from(vec![0u32; B as usize]));
+    let lanes_b: &'static Channel = leak(Channel::from((0..=B).collect::<Vec<_>>()));
+    let out: &'static Channel = leak(Channel::new([B], dtype::i32).capacity(8));
+    let out_par: &'static Channel = leak(Channel::new([B], dtype::u32).capacity(8));
+    let out_scr: &'static Channel = leak(Channel::new([B], dtype::f32).capacity(8));
+    let out_greedy: &'static Channel = leak(Channel::new([B], dtype::i32).capacity(8));
     let mut b = Builder::new(VOCAB, PAGE);
     b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::KvLen, klen);
@@ -375,19 +356,16 @@ fn beam_step() -> Traced {
 fn latent_step() -> Traced {
     let rows = 8u32;
     let channels = 16u32;
-    let tok: &'static Channel = leak(Channel::from([1i32]).named("tok"));
-    let indptr_ch: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
-    let readout: &'static Channel =
-        leak(Channel::from((0..rows).collect::<Vec<_>>()).named("readout"));
-    let kv_len: &'static Channel = leak(Channel::from([rows]).named("kv_len"));
-    let positions: &'static Channel =
-        leak(Channel::from((0..rows).collect::<Vec<_>>()).named("positions"));
-    let latent: &'static Channel = leak(Channel::new([rows, channels], dtype::f32).named("latent"));
-    let dsigma: &'static Channel = leak(Channel::from([-0.25f32]).named("dsigma"));
-    let rng_ch: &'static Channel = leak(Channel::from([9u32, 0]).named("rng"));
-    let out: &'static Channel =
-        leak(Channel::new([rows, channels], dtype::f32).named("latent_out"));
-    let norm_out: &'static Channel = leak(Channel::new([rows], dtype::f32).named("norms"));
+    let tok: &'static Channel = leak(Channel::from([1i32]));
+    let indptr_ch: &'static Channel = leak(Channel::from([0u32, 1]));
+    let readout: &'static Channel = leak(Channel::from((0..rows).collect::<Vec<_>>()));
+    let kv_len: &'static Channel = leak(Channel::from([rows]));
+    let positions: &'static Channel = leak(Channel::from((0..rows).collect::<Vec<_>>()));
+    let latent: &'static Channel = leak(Channel::new([rows, channels], dtype::f32));
+    let dsigma: &'static Channel = leak(Channel::from([-0.25f32]));
+    let rng_ch: &'static Channel = leak(Channel::from([9u32, 0]));
+    let out: &'static Channel = leak(Channel::new([rows, channels], dtype::f32));
+    let norm_out: &'static Channel = leak(Channel::new([rows], dtype::f32));
     latent.put(vec![0.0f32; (rows * channels) as usize]);
     let mut b = Builder::new(VOCAB, PAGE);
     b.outputs(vec![vec![crate::outputs::decl(
@@ -444,7 +422,7 @@ fn latent_step() -> Traced {
 
 fn vae_readback() -> Traced {
     let (rows, rgb) = (16u32, 3u32);
-    let out: &'static Channel = leak(Channel::new([rows, rgb], dtype::f32).named("pixels_out"));
+    let out: &'static Channel = leak(Channel::new([rows, rgb], dtype::f32));
     let mut b = Builder::new(VOCAB, PAGE);
     b.outputs(vec![vec![crate::outputs::decl(
         "pixels",
@@ -465,9 +443,9 @@ fn vae_readback() -> Traced {
 /// The one golden that carries an input table.
 fn noised_input() -> Traced {
     let (rows, width) = (4u32, 8u32);
-    let rng_ch: &'static Channel = leak(Channel::from([5u32, 0]).named("rng"));
-    let latent: &'static Channel = leak(Channel::new([rows, width], dtype::f32).named("latent"));
-    let timestep: &'static Channel = leak(Channel::from([0.5f32]).named("timestep"));
+    let rng_ch: &'static Channel = leak(Channel::from([5u32, 0]));
+    let latent: &'static Channel = leak(Channel::new([rows, width], dtype::f32));
+    let timestep: &'static Channel = leak(Channel::from([0.5f32]));
     let mut b = Builder::new(VOCAB, PAGE);
     b.outputs(crate::outputs::logits(VOCAB));
     b.bind_input(latent);

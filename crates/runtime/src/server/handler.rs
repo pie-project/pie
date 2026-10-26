@@ -484,6 +484,7 @@ impl Session {
         capture_outputs: bool,
         mut props: client_api::Props,
         session: Option<String>,
+        files: client_api::Files,
         cluster_props: client_api::Props,
         executors: Vec<String>,
     ) {
@@ -552,6 +553,7 @@ impl Session {
             self.username.clone(),
             program_name,
             input,
+            std::sync::Arc::new(files),
             client_id,
             capture_outputs,
             None,

@@ -49,16 +49,16 @@ async def main(input: dict) -> str:
 
     initial_scores = [float("-inf")] * B
     initial_scores[0] = 0.0
-    scores = Channel.from_(initial_scores).named("scores")
-    toks = Channel.from_([BOS] * B, dtype.i32).named("toks")
+    scores = Channel.from_(initial_scores)
+    toks = Channel.from_([BOS] * B, dtype.i32)
     cap = channel_capacity()
-    out = Channel([B], dtype.i32).capacity(cap).named("out")
-    out_par = Channel([B], dtype.u32).capacity(cap).named("out_par")
-    out_scr = Channel([B], dtype.f32).capacity(cap).named("out_scr")
+    out = Channel([B], dtype.i32).capacity(cap)
+    out_par = Channel([B], dtype.u32).capacity(cap)
+    out_scr = Channel([B], dtype.f32).capacity(cap)
     # Independent per-lane greedy argmax over the RAW logits, beside the beam
     # pick: at `beams == 1` the two must agree on every step.
-    out_greedy = Channel([B], dtype.i32).capacity(cap).named("out_greedy")
-    lanes_b = Channel.from_(range(B + 1), dtype.u32).named("embed_indptr")
+    out_greedy = Channel([B], dtype.i32).capacity(cap)
+    lanes_b = Channel.from_(range(B + 1), dtype.u32)
 
     def step():
         # `logits()` squeezes to `[v]` for a single read-out row, so reshape back.
@@ -103,12 +103,12 @@ async def main(input: dict) -> str:
     pool = [ws] * B
 
     init_mask = [p == 0 for _ in range(B) for p in range(pool_len)]
-    mask = Channel.from_shaped([B, pool_len], init_mask).named("mask")
-    slots = Channel.from_([0] * B, dtype.u32).named("slots")
+    mask = Channel.from_shaped([B, pool_len], init_mask)
+    slots = Channel.from_([0] * B, dtype.u32)
     # A beam's RoPE position is its depth, not its pool slot.
-    pos = Channel.from_([0] * B, dtype.u32).named("pos")
-    fill = Channel.from_([1], dtype.u32).named("fill")
-    kv_len = Channel.from_([1] * B, dtype.u32).named("kv_len")
+    pos = Channel.from_([0] * B, dtype.u32)
+    fill = Channel.from_([1], dtype.u32)
+    kv_len = Channel.from_([1] * B, dtype.u32)
     fwd.state(pool, StateGeometry(positions=pos, slots=slots, kv_len=kv_len))
     fwd.mask(mask)
 

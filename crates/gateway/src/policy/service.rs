@@ -643,6 +643,7 @@ mod tests {
                 capture_outputs: true,
                 props: serde_json::from_value(props).unwrap(),
                 session: None,
+                files: Default::default(),
                 cluster_props: Props::new(),
                 executors: Vec::new(),
             },

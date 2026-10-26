@@ -498,7 +498,7 @@ impl crate::ui::Report for ModelInfo {
                     "  {}",
                     palette.dim(
                         "this deployment binds the standard `latents` and `timestep` inputs: \
-                         `pie run text-to-image -- --prompt \"...\"` drives it."
+                         `pie run text-to-media -- --prompt \"...\"` drives it."
                     )
                 );
             }

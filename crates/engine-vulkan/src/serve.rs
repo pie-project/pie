@@ -414,7 +414,7 @@ impl Shell {
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
         let tuning = crate::tuning::Tuning::new(chip, device.limits());
         let chip = tuning.profile();
-        let boot = Boot {
+        let mut boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
                 poem_compiler::fuse::flags::on(chip, &crate::FUSIONS),
@@ -437,6 +437,18 @@ impl Shell {
                 Some(ladder) => base.with_voxels(ladder),
             }
         };
+        let weights: u64 = crate::weights::plane_bytes(&boot.trace)?.iter().sum();
+        let room = device.working_set().saturating_sub(weights) / 2;
+        let mut budgets = poem_compiler::fit_voxels(&boot.trace, budgets, &profile, room);
+        if boot.slots == 0 {
+            boot.slots = poem_compiler::fit_frame_slots(
+                &boot.trace,
+                budgets.voxels.as_mut(),
+                room,
+                engine::fit::least_state_slots(1),
+                boot.runahead.frames_in_flight,
+            );
+        }
         let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
 
         let facts = kv::probe(&boot.trace)?;
@@ -604,7 +616,7 @@ impl Shell {
                 ),
             });
         }
-        let voxel_seat = boot.voxels.as_ref().map(|ladder| {
+        let voxel_seat = budgets.voxels.as_ref().map(|ladder| {
             let mut channels = 0u64;
             let mut dtype = None;
             for decl in &boot.trace.values {
@@ -2559,7 +2571,7 @@ impl Shell {
                 lanes: u64::from(lane_count),
                 patches: u64::from(composition.patch_rows()),
                 images: u64::from(composition.images()),
-                voxels: u64::from(composition.voxel_rows()),
+                voxels: u64::from(composition.voxel_widest()),
                 clips: u64::from(composition.clips()),
                 readouts,
             },

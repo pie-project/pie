@@ -167,12 +167,12 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
 
     // Freezes the haystack but buffers the question's rows: the answer below writes them again.
-    let toks_p = Channel::from(&prompt_i32[..]).named("toks_p");
-    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-    let fold_p = Channel::from([ask_at]).named("fold_p");
-    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
-    let page_mass_out = Channel::new([p_max], dtype::f32).named("evict_page_mass");
-    let total_out = Channel::new([1], dtype::f32).named("evict_total");
+    let toks_p = Channel::from(&prompt_i32[..]);
+    let embed_indptr_p = Channel::from([0u32, n]);
+    let fold_p = Channel::from([ask_at]);
+    let tok_out_p = Channel::new([1], dtype::i32);
+    let page_mass_out = Channel::new([p_max], dtype::f32);
+    let total_out = Channel::new([1], dtype::f32);
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -247,11 +247,11 @@ async fn main(input: Input) -> Result<Output> {
         })
         .collect();
 
-    let toks_q = Channel::from(&question_i32[..]).named("toks_q");
-    let embed_indptr_q = Channel::from([0u32, q]).named("embed_indptr_q");
-    let slots_q = Channel::from_iter(ask_at..n).named("slots_q");
-    let mask_q = Channel::from_shaped([q, kv_max], rows).named("mask_q");
-    let tok_out_q = Channel::new([1], dtype::i32).named("tok_out_q");
+    let toks_q = Channel::from(&question_i32[..]);
+    let embed_indptr_q = Channel::from([0u32, q]);
+    let slots_q = Channel::from_iter(ask_at..n);
+    let mask_q = Channel::from_shaped([q, kv_max], rows);
+    let tok_out_q = Channel::new([1], dtype::i32);
 
     let fwd_q = ForwardPass::new();
     fwd_q.embed(&toks_q, &embed_indptr_q)?;

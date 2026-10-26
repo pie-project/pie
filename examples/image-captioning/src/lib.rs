@@ -190,9 +190,9 @@ async fn main(input: Input) -> Result<Output> {
     //
     // The rows after an M-RoPE span, and the decode, rotate where the host says it leaves off.
     let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
-    let toks_p = Channel::from(&prompt_i32[..]).named("toks_p");
-    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-    let g0_ch = Channel::new([1], dtype::i32).named("g0");
+    let toks_p = Channel::from(&prompt_i32[..]);
+    let embed_indptr_p = Channel::from([0u32, n]);
+    let g0_ch = Channel::new([1], dtype::i32);
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -232,11 +232,9 @@ async fn main(input: Input) -> Result<Output> {
     } else {
         max_tokens.saturating_sub(1)
     };
-    let tok_in = Channel::from([g0]).named("tok_in");
-    let out = Channel::new([1], dtype::i32)
-        .capacity(channel_capacity() as u32)
-        .named("out");
-    let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+    let tok_in = Channel::from([g0]);
+    let out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+    let lane1 = Channel::from([0u32, 1u32]);
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;

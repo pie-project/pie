@@ -121,15 +121,15 @@ async fn main(input: Input) -> Result<Output> {
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let pipe = Pipeline::new();
 
-    let toks_p = Channel::from(prompt_i32.clone()).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
-    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
+    let toks_p = Channel::from(prompt_i32.clone());
+    let embed_indptr_p = Channel::from(vec![0u32, n]);
+    let rng_p = Channel::from(vec![input.seed, 0]);
+    let tok_out_p = Channel::new([1], dtype::i32);
     let mask_p = masked_prefill.then(|| {
         let rows: Vec<bool> = (0..n)
             .flat_map(|p| (0..span).map(move |j| j <= p))
             .collect();
-        Channel::from_shaped([n, span], rows).named("mask_p")
+        Channel::from_shaped([n, span], rows)
     });
 
     let fwd_p = ForwardPass::new();
@@ -159,22 +159,19 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── DECODE LOOP (1-wide, run-ahead) — chat-completion's decode shape. ──
     if generated.len() < max_tokens {
-        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-        let fill = Channel::from(vec![n + 1; 1]).named("fill");
+        let tok_in = Channel::from(vec![g0; 1]);
+        let fill = Channel::from(vec![n + 1; 1]);
         // Causal row for the fire-0 query at position n: attend all j <= n
         // (doc-isolation additionally blocks j < doc_start).
         let seed_mask: Vec<bool> = (0..span).map(|j| j >= doc_start && j <= n).collect();
-        let mask = Channel::from_shaped([1, span], seed_mask).named("mask");
+        let mask = Channel::from_shaped([1, span], seed_mask);
         let doc_row = Channel::from_shaped(
             [span],
             (0..span).map(|j| j >= doc_start).collect::<Vec<bool>>(),
-        )
-        .named("doc_row");
-        let tok_out = Channel::new([1], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("tok_out");
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+        );
+        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]);
+        let lane1 = Channel::from(vec![0u32, 1u32]);
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;

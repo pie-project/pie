@@ -49,26 +49,26 @@ async fn pass(
     let count = tokens.len() as u32;
     let end = base + count;
     let drafting = matches!(round, Round::Draft);
-    let toks = Channel::from(tokens).named("spec_tokens");
-    let indptr = Channel::from([0u32, count]).named("spec_indptr");
-    let slots = Channel::from_iter(base..end).named("spec_slots");
+    let toks = Channel::from(tokens);
+    let indptr = Channel::from([0u32, count]);
+    let slots = Channel::from_iter(base..end);
     let readouts = match round {
         Round::Prompt(_) => vec![count - 1],
         Round::Draft | Round::Verify(_) | Round::Plain => (0..count).collect(),
     };
     let shown = readouts.len() as u32;
-    let readout = Channel::from(readouts).named("spec_readout");
+    let readout = Channel::from(readouts);
     let fold = match round {
         Round::Prompt(_) | Round::Plain => None,
         Round::Draft => Some(0),
         Round::Verify(survivors) => Some(survivors),
     };
-    let fold = fold.map(|n| Channel::from([n]).named("spec_fold"));
+    let fold = fold.map(|n| Channel::from([n]));
     let fold = match &fold {
         Some(count) => Fold::Count(count),
         None => Fold::All,
     };
-    let out = Channel::new([shown], dtype::i32).named("spec_output");
+    let out = Channel::new([shown], dtype::i32);
     // Row `j` of a verify reads the token proposal `j` claims, the input
     // one past it; the last row (and a prompt's or plain fire's one) has
     // none.
@@ -80,8 +80,8 @@ async fn pass(
         proposals.resize(shown as usize, 0);
         (
             *pick,
-            Channel::from(proposals).named("spec_proposals"),
-            Channel::new([shown], dtype::f32).named("spec_chances"),
+            Channel::from(proposals),
+            Channel::new([shown], dtype::f32),
         )
     });
     let chances = sampled.as_ref().map(|(_, _, chances)| *chances);
@@ -108,7 +108,10 @@ async fn pass(
             return;
         }
         let Some((pick, proposals, chances)) = &sampled else {
-            out.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [shown]));
+            out.put(reshape(
+                reduce_argmax(intrinsics::output(0, "logits")),
+                [shown],
+            ));
             return;
         };
         let logits = reshape(intrinsics::output(0, "logits"), [shown, pick.vocab]);
@@ -257,7 +260,7 @@ pub async fn generate(
     let pick = sampled.map(|(temperature, seed)| Pick {
         temperature,
         vocab: model::output_vocab_size(),
-        noise: Channel::from([seed, 0u32]).named("spec_noise"),
+        noise: Channel::from([seed, 0u32]),
     });
     // The acceptance draws, a stream apart from the device's noise.
     let mut uniform = SplitMix64::new(u64::from(sampled.map_or(0, |(_, seed)| seed)) ^ 0x5bec);

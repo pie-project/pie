@@ -16,6 +16,10 @@ pub struct RunArgs {
     #[arg(long = "out", short = 'o', value_name = "DIR")]
     pub out: Option<PathBuf>,
 
+    /// Attaches a file the inferlet reads with `session.file(NAME)`.
+    #[arg(long = "file", value_name = "NAME=PATH", value_parser = parse_file)]
+    pub files: Vec<(String, PathBuf)>,
+
     #[arg(last = true, allow_hyphen_values = true)]
     pub arguments: Vec<String>,
 }
@@ -152,6 +156,26 @@ pub fn curated_in(roots: &[PathBuf], name: &str) -> Option<Curated> {
     })
 }
 
+fn parse_file(spec: &str) -> Result<(String, PathBuf), String> {
+    match spec.split_once('=') {
+        Some((name, path)) if !name.is_empty() && !path.is_empty() => {
+            Ok((name.to_string(), PathBuf::from(path)))
+        }
+        _ => Err(format!("{spec:?} is not NAME=PATH")),
+    }
+}
+
+fn read_files(files: &[(String, PathBuf)]) -> Result<client::message::Files> {
+    files
+        .iter()
+        .map(|(name, path)| {
+            let bytes =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            Ok((name.clone(), serde_bytes::ByteBuf::from(bytes)))
+        })
+        .collect()
+}
+
 pub fn arguments_to_input(arguments: &[String]) -> String {
     let mut object = serde_json::Map::new();
     let mut positional: Vec<serde_json::Value> = Vec::new();
@@ -283,6 +307,7 @@ pub async fn run(
     let model = worker.model.name.clone();
 
     let plan = resolve(target)?;
+    let files = read_files(&args.files)?;
 
     match &plan.upload {
         Some((path, _)) => println!(
@@ -302,6 +327,7 @@ pub async fn run(
         &pie.listen_addr.to_string(),
         &plan,
         &args.arguments,
+        files,
         args.out.as_deref(),
     )
     .await;
@@ -377,6 +403,7 @@ async fn drive(
     addr: &str,
     plan: &Plan,
     arguments: &[String],
+    files: client::message::Files,
     out_dir: Option<&Path>,
 ) -> Result<std::process::ExitCode> {
     let program = &plan.program;
@@ -407,7 +434,14 @@ async fn drive(
     }
 
     let mut process = client
-        .launch_process(program.to_string(), arguments_to_input(arguments), true)
+        .launch_process_with(
+            program.to_string(),
+            arguments_to_input(arguments),
+            true,
+            None,
+            Default::default(),
+            files,
+        )
         .await
         .with_context(|| format!("launching {program}"))?;
 
@@ -541,21 +575,21 @@ mod tests {
 
     fn a_curated_name_resolves_to_the_build_of_its_crate() {
         let dir = tempfile::tempdir().unwrap();
-        tree(dir.path(), "text-to-image", Some("release"));
-        let found = curated_in(&[dir.path().to_path_buf()], "text-to-image").unwrap();
+        tree(dir.path(), "text-to-media", Some("release"));
+        let found = curated_in(&[dir.path().to_path_buf()], "text-to-media").unwrap();
         assert_eq!(
             found.wasm.unwrap(),
             dir.path()
-                .join("target/wasm32-wasip3/release/text_to_image.wasm")
+                .join("target/wasm32-wasip3/release/text_to_media.wasm")
         );
     }
 
     fn an_unbuilt_curated_directory_is_found_without_a_wasm() {
         let dir = tempfile::tempdir().unwrap();
-        tree(dir.path(), "text-to-image", None);
-        let found = curated_in(&[dir.path().to_path_buf()], "text-to-image").unwrap();
+        tree(dir.path(), "text-to-media", None);
+        let found = curated_in(&[dir.path().to_path_buf()], "text-to-media").unwrap();
         assert!(found.wasm.is_none());
-        assert!(found.build_hint().contains("-p text-to-image"));
+        assert!(found.build_hint().contains("-p text-to-media"));
     }
 
     fn release_outranks_debug() {
@@ -568,9 +602,9 @@ mod tests {
 
     fn a_name_that_is_a_path_is_not_a_curated_name() {
         let dir = tempfile::tempdir().unwrap();
-        tree(dir.path(), "text-to-image", Some("release"));
+        tree(dir.path(), "text-to-media", Some("release"));
         let roots = [dir.path().to_path_buf()];
-        assert!(curated_in(&roots, "../text-to-image").is_none());
+        assert!(curated_in(&roots, "../text-to-media").is_none());
         assert!(curated_in(&roots, ".hidden").is_none());
         assert!(curated_in(&roots, "").is_none());
     }

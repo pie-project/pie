@@ -386,6 +386,7 @@ impl Session {
                 capture_outputs,
                 props,
                 session,
+                files,
                 cluster_props,
                 executors,
             } => {
@@ -396,6 +397,7 @@ impl Session {
                     capture_outputs,
                     props,
                     session,
+                    files,
                     cluster_props,
                     executors,
                 )
