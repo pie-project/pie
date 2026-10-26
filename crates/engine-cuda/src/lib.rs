@@ -56,12 +56,10 @@ pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
     std::sync::LazyLock::new(|| {
         use poem_compiler::fuse::rules::{self, Rotated};
-        use poem_ir::GluAct;
         use poem_ir::ops::fused::Intermediates;
         vec![
             rules::split_qkv_fused(),
             rules::qkv_fused_qknorm_rope_vnorm_write(),
-            rules::matmul_glu(&[GluAct::Swiglu]),
             rules::moe_mega(),
             rules::moe_experts(),
             rules::moe_select_glu(),
@@ -123,16 +121,22 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 /// `gated_residual_norm_modulate`): each a generated kernel that ties the
 /// hand one at a decode's rows and outruns it from 512. And the hand
 /// product rules CUDA's anchored regions replace (`fuse::anchor`): a
-/// product's bias, its soft cap and a packed bank's GEGLU, each the
-/// epilogue of its contraction skeleton, timed against the product and the
-/// epilogue on the row skeleton.
+/// product's bias, its soft cap and a packed bank's GEGLU and SwiGLU, each
+/// the epilogue of its contraction skeleton, timed against the product and
+/// the epilogue on the row skeleton. The qkv writes stay: a packed qkv
+/// product's split, norms and turn are an anchored region (Qwen3's, every
+/// site no rule holds), but the hand kernel writes k and v into the paged
+/// cache in the same launch, an epilogue lands tiles, and Gemma 4's
+/// 512-wide global heads and MiMo's padded split are no epilogue's span;
+/// Muse Spark's `qkv | gate` is `matmul_split_rows`'s first, whose long
+/// fires land each half by a GEMM of its own, no product landed and cut.
 #[cfg(not(feature = "rocm"))]
 #[must_use]
 pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
     use poem_compiler::fuse::rules;
     vec![
         rules::norm_rope(rules::Rotated::Last),
-        rules::matmul_glu(&[poem_ir::GluAct::GegluTanh]),
+        rules::matmul_glu(&[poem_ir::GluAct::GegluTanh, poem_ir::GluAct::Swiglu]),
         rules::matmul_softcap(),
         rules::matmul_bias(),
         rules::embed_scale_add_select(),

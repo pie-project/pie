@@ -375,12 +375,15 @@ const RULED: [(&str, &[&str]); 3] = [
 
 /// Each matmul and the pointwise ops over its product served as one
 /// anchored region (`compiler.synth_anchors`, the hand rules
-/// `fuse.matmul_bias`, `fuse.matmul_softcap` and GEGLU's `fuse.matmul_glu`
-/// gone from CUDA's list), its product read by the epilogue as it is summed,
+/// `fuse.matmul_bias`, `fuse.matmul_softcap` and `fuse.matmul_glu` gone
+/// from CUDA's list), its product read by the epilogue as it is summed,
 /// against the products and their ops as their own kernels, the row chains
 /// off in both: GLM-4.5's and GLM-4.7's biased projections (and the
 /// residual adds after their outputs), Gemma 4's GEGLU and soft-capped
-/// logits. A prefill of a few rows (the contraction skeletons, as the tuner
+/// logits, and Qwen3's attention prologue (its packed qkv product split, q's
+/// and k's heads normed and turned, each piece landing its own plane: an
+/// epilogue of one head's span), its SwiGLU and the residual adds after its
+/// output and down projections. A prefill of a few rows (the contraction skeletons, as the tuner
 /// picks) and one past every skeleton's (cuBLASLt's bias, the unfused leg),
 /// then the decode steps (the gemv), held as a routed model's logits are
 /// ([`close_past_routing`]).
@@ -416,8 +419,8 @@ fn an_anchored_region_serves_the_logits_of_its_ops() {
 
 /// [`close`] for a routed model, whose experts a last-bit difference may
 /// pick apart: the top token is the reference's at every step (or its
-/// runner-up within what the ops in another order move a logit, a tie the
-/// ops break themselves), and the logits stay within [`close`]'s bound at
+/// runner-up within twice what the ops in another order move a logit, a tie
+/// the ops break themselves), and the logits stay within [`close`]'s bound at
 /// most steps. A step answers for one row (the prompt's last, or the token
 /// decoded), and a last-bit difference may route that row to other experts
 /// than the reference's: a step past the bound with the reference's top
@@ -439,11 +442,12 @@ fn close_past_routing(got: &[Vec<f32>], want: &[Vec<f32>], carry: &[Vec<f32>], a
             if top == picked { "agrees" } else { "differs" }
         );
         // A tie the ops break themselves is no disagreement: the
-        // reference's own top two within what the ops in another order move
-        // a logit.
+        // reference's own top two within what the bound grants each logit
+        // past the spread's share, twice what the ops in another order move
+        // one (each of the two may move so, the one up and the other down).
         let gap = want[top as usize] - want[picked as usize];
         assert!(
-            top == picked || gap <= own,
+            top == picked || gap <= 2.0 * own,
             "step {step}: token {picked} tops the logits, {against} token {top} by {gap} (the \
              ops' own carry {own})"
         );
@@ -473,10 +477,11 @@ const REORDERED: &str =
 /// The models served by [`an_anchored_region_serves_the_logits_of_its_ops`],
 /// each from a few rows (the contraction skeletons) and past every skeleton's,
 /// and whether it routes its rows to experts.
-const ANCHORED: [(&str, &[u32], bool); 3] = [
+const ANCHORED: [(&str, &[u32], bool); 4] = [
     ("glm45-air-mini", &[37, 100], true),
     ("glm47-mini", &[37, 100], true),
     ("gemma4-e4b-mini-l1", &[37, 100], false),
+    ("qwen3-micro-text", &[37, 100], false),
 ];
 
 /// Two models loaded and served at once in one process, a thread each, as a

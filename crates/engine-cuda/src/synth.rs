@@ -140,9 +140,10 @@ impl Regions {
                     })
                     .collect::<Result<Vec<Dtype>>>()
             };
-            kernels_cuda::linear::skeleton::serves(held, &stored(ins)?, &stored(outs)?)
+            let read = stored(ins)?;
+            kernels_cuda::linear::skeleton::serves(held, &read, &stored(outs)?)
                 .map_err(|why| broken(why.to_string()))?;
-            let epi = Epilogue::interned(held)?;
+            let epi = Epilogue::interned_stored(held, &read)?;
             let c = &held.contraction;
             epi.load_every(c.n, c.k, tuning)?;
             anchors.insert(key, epi);

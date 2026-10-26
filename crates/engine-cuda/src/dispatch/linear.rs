@@ -389,12 +389,20 @@ impl Run<'_> {
             .iter()
             .zip(epi.inputs())
             .map(|(&v, input)| {
+                use linear::skeleton::{In, Input};
                 let t = self.tensor(v);
-                match input {
-                    linear::skeleton::Input::Tile => linear::skeleton::In::tile(t.ptr, t.width),
-                    linear::skeleton::Input::Column => linear::skeleton::In::column(t.ptr),
-                    linear::skeleton::Input::Row => linear::skeleton::In::row(t.ptr),
-                    linear::skeleton::Input::One => linear::skeleton::In::one(t.ptr),
+                let plane = match *input {
+                    Input::Tile => In::tile(t.ptr, t.width),
+                    Input::Column => In::column(t.ptr),
+                    Input::Head(size) => In::head(t.ptr, size),
+                    Input::Row => In::row(t.ptr),
+                    Input::One => In::one(t.ptr),
+                };
+                // a row's position is stored i32
+                if t.dtype == Dtype::I32 {
+                    plane.i32()
+                } else {
+                    plane
                 }
             })
             .collect();
