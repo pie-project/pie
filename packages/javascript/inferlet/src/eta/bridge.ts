@@ -348,13 +348,15 @@ export class Pipeline {
    */
   runAhead(fwd: ForwardPass, budget: number, onToken: () => boolean | void): number {
     if (budget === 0) return 0;
-    // Live slots per frame. A pass that binds a dense device mask takes one;
-    // so does a pass on a model with recurrent state, whose frame's waves
+    // Live slots per frame. A pass that binds a mask fills the frame: the
+    // runtime advances its host shadow fire by fire, so a later slot reads the
+    // mask its predecessor's epilogue put. A pass on a model with recurrent
+    // state takes one, whose frame's waves
     // carry the same sequence's state one into the next (a frame of one live
     // slot measured faster than a full one on Qwen3.5-0.8B), and a pass off
     // its model's default path (a canvas redrawn whole), which redraws what
     // the last wrote. Any other pass fills the frame.
-    const r = fwd.bindsDeviceMask() || rsStateSize() > 0 || fwd.switched() ? 1 : frameSize();
+    const r = rsStateSize() > 0 || fwd.switched() ? 1 : frameSize();
     const windowFrames = Math.max(Math.floor(witModel.runAheadWindow() / Math.max(r, 1)), 1);
     let submitted = 0;
     let consumed = 0;
@@ -510,10 +512,6 @@ export class ForwardPass {
     if (this.programAttached) throw new InferletError('forward pass program is already attached');
     const bound = new Set(this.ports.map(([p]) => p));
     for (const p of ports) if (bound.has(p)) throw new InferletError(`forward pass port ${portName(p)} is already bound`);
-  }
-
-  bindsDeviceMask(): boolean {
-    return this.ports.some(([p]) => p === Port.ATTN_MASK);
   }
 
   /** Bind token ids and the CSR row indptr. A token array becomes an i32
