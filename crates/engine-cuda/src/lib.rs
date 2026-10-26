@@ -63,10 +63,12 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::moe_select_glu(),
             rules::matmul_moe_route(),
             rules::matmul_split_rows(),
+            rules::norm_rope_last_append_rows(),
             rules::lse_sink(),
             rules::pool_attention(),
             rules::pool_compress(),
             rules::mla_prefill_expanded(),
+            rules::norm_rope_pair(),
             rules::index_topk_rope(),
             rules::hc_prenorm_project(),
             rules::res_blend_rmsnorm(),
@@ -129,13 +131,11 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 /// `qkv | gate` half, a `fused.epilogue`), and DeepSeek-V4's k row normed,
 /// turned and written. (`split_qkv_fused` is gone too, and is not listed:
 /// without it `matmul_split_rows` takes its split first, so it finds no
-/// site to hold to this; its sites are that product's `fused.epilogue`.)
-/// What stays: MiMo's padded qkv write (its cache's heads padded past their
-/// widths, no window's) and the pooled writes. DeepSeek's block-scaled rows
-/// (`norm_rope_last_append_rows`, `norm_rope_pair`: V4's fp8 rows and
-/// V4.1's MXFP8 ones, kernels-ir's `BlockRows`) are the row skeleton's
-/// paged store, q's and the kv row's norm and turn each its product's
-/// epilogue. YaRN's turn of every pair (`rope_yarn_append`, `split_rope_yarn_append`:
+/// site to hold to this; its sites are that product's `fused.epilogue`.) What stays: MiMo's padded qkv write (its cache's
+/// heads padded past their widths, no window's), the fp8 rows of DeepSeek's
+/// cache (`norm_rope_last_append_rows`, `norm_rope_pair`: its blocks'
+/// scales and bf16 tail no paged store's element) and the pooled writes.
+/// YaRN's turn of every pair (`rope_yarn_append`, `split_rope_yarn_append`:
 /// the builder's tail pairs ramped, cos and sin times the attention factor)
 /// and Qwen 3.5's gated q (`q_gate_norm_rope_append`: q and its gate
 /// interleaved a head, each a head-major window of the product) are an
@@ -152,8 +152,6 @@ pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
         rules::matmul_bias(),
         rules::qkv_fused_qknorm_rope_vnorm_write(),
         rules::norm_rope_last_append(),
-        rules::norm_rope_last_append_rows(),
-        rules::norm_rope_pair(),
         rules::rope_yarn_append(),
         rules::split_rope_yarn_append(),
         rules::q_gate_norm_rope_append(poem_ir::ops::fused::Intermediates::Unwritten),

@@ -62,36 +62,7 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
         .filter(|param| param.source == ParamSource::Checkpoint)
         .collect();
     planes.sort_by(|a, b| a.name.cmp(&b.name));
-    // A hashed route's table names experts a token, each one of the
-    // fewest experts any route of the row picks over.
-    let experts = trace
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.op {
-            poem_ir::Operation::Linear(poem_ir::Linear::MoeRoute { experts, .. }) => {
-                Some(u64::from(*experts))
-            }
-            _ => None,
-        })
-        .min()
-        .unwrap_or(1);
     for param in planes {
-        if param.dtype == Dtype::I64 {
-            let picks = param.shape.last().copied().unwrap_or(1);
-            let count: u64 = param.shape.iter().product();
-            let bytes: Vec<u8> = (0..count)
-                .flat_map(|at| (((at / picks) * 3 + at % picks) % experts).to_le_bytes())
-                .collect();
-            writer
-                .add(
-                    param.name.as_str(),
-                    param.shape.clone(),
-                    ztensor::Leaf::I64,
-                    &bytes,
-                )
-                .unwrap_or_else(|why| panic!("`{}`: {why}", param.name));
-            continue;
-        }
         let wide = match param.dtype {
             Dtype::Bf16 => false,
             Dtype::F32 => true,
@@ -491,7 +462,6 @@ fn a_paged_epilogue_serves_the_logits_of_its_kv_append() {
         ("gemma4-e4b-mini-l1", false, &[Dtype::Bf16, Dtype::E4m3][..]),
         ("glm45-air-mini", true, &[Dtype::Bf16, Dtype::E4m3]),
         ("qwen3-micro-text", false, &[Dtype::Bf16]),
-        ("dsv4-flash-mini", true, &[Dtype::Bf16]),
     ] {
         for &kv in kvs {
             let fixture = packed_fixture_kv(model, kv);
