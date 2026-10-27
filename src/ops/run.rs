@@ -594,9 +594,9 @@ mod tests {
 
     fn release_outranks_debug() {
         let dir = tempfile::tempdir().unwrap();
-        tree(dir.path(), "frames-probe", Some("debug"));
-        tree(dir.path(), "frames-probe", Some("release"));
-        let found = curated_in(&[dir.path().to_path_buf()], "frames-probe").unwrap();
+        tree(dir.path(), "text-completion", Some("debug"));
+        tree(dir.path(), "text-completion", Some("release"));
+        let found = curated_in(&[dir.path().to_path_buf()], "text-completion").unwrap();
         assert!(found.wasm.unwrap().to_string_lossy().contains("/release/"));
     }
 

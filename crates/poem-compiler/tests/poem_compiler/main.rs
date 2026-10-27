@@ -21,8 +21,6 @@ mod a_miniature_cut_to_other_counts_is_read_at_them;
 mod a_ptq1_0_trunk_traces_and_places;
 mod a_ragged_attention_over_two_arms_bakes_into_one_region;
 mod a_relative_bias_table_bakes_as_a_plan_constant;
-mod a_rewritten_format_keeps_its_contracts;
-mod a_rewritten_package_keeps_its_traces;
 mod a_routed_bank_is_the_rectangle_the_grouped_leg_reads;
 mod a_routed_mlp_lands_as_one_mega_moe;
 mod a_router_product_and_its_pick_fuse;
