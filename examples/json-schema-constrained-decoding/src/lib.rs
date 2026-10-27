@@ -48,10 +48,6 @@ fn default_max_tokens() -> usize {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    if input.max_tokens == 0 {
-        return Err("max_tokens must be at least 1".into());
-    }
-
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
     let constraint = Matcher::new(&Grammar::from_json_schema(&input.schema)?);
@@ -61,77 +57,51 @@ async fn main(input: Input) -> Result<String> {
         &input.prompt,
     );
     prompt.extend(chat::cue());
-    if prompt.is_empty() {
-        prompt.push(0);
+    let prompt: Vec<i32> = prompt.into_iter().map(|t| t as i32).collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
+
+    let pipeline = Pipeline::new();
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipeline).context("JSON-schema prefill")?;
     }
-    let n = prompt.len() as u32;
 
-    let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
-    let prefill_indptr = Channel::from([0u32, n]);
-    let prefill_mask = Channel::new([vocab], dtype::bool);
-    let first_out = Channel::new([1], dtype::i32);
+    let token_in = Channel::from([last]);
+    let grammar_mask = Channel::new([vocab], dtype::bool);
+    let embed_indptr = Channel::from([0u32, 1]);
+    let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
 
-    let prefill = ForwardPass::new();
-    prefill.embed(&prompt_tokens, &prefill_indptr)?;
-    prefill.state(&[&ws], StateGeometry::folding())?;
-    prefill.epilogue(move || {
-        let allowed = prefill_mask.take();
+    let decode = ForwardPass::new();
+    decode.embed(&token_in, &embed_indptr)?;
+    decode.state(&[&ws], StateGeometry::folding())?;
+    decode.epilogue(move || {
+        let allowed = grammar_mask.take();
         let token = reshape(
             masked_argmax(intrinsics::output(0, "logits"), &allowed),
             [1],
         );
-        first_out.put(&token);
+
+        token_in.put(&token);
+        token_out.put(&token);
     });
 
-    prefill_mask.put(unpack_mask(&constraint.mask(), vocab));
-    let pipeline = Pipeline::new();
-    prefill.submit(&pipeline).context("JSON-schema prefill")?;
-    let first = first_out.take_host::<i32>().await? as u32;
-
-    let mut generated = vec![first];
-    constraint
-        .accept_tokens(&[first])
-        .context("advance grammar")?;
-
-    if !constraint.is_terminated() && generated.len() < input.max_tokens {
-        let token_in = Channel::from([first as i32]);
-        let grammar_mask = Channel::new([vocab], dtype::bool);
-        let embed_indptr = Channel::from([0u32, 1]);
-        let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-
-        let decode = ForwardPass::new();
-        decode.embed(&token_in, &embed_indptr)?;
-        decode.state(&[&ws], StateGeometry::folding())?;
-        decode.epilogue(move || {
-            let allowed = grammar_mask.take();
-            let token = reshape(
-                masked_argmax(intrinsics::output(0, "logits"), &allowed),
-                [1],
-            );
-
-            token_in.put(&token);
-            token_out.put(&token);
-        });
-
-        // The grammar mask for fire k+1 is only known once fire k's token has
-        // advanced the matcher, so this loop is inherently depth-1. Running
-        // ahead would reuse a stale mask and silently drop the constraint.
-        let budget = input.max_tokens.saturating_sub(generated.len());
-        let mut submitted = 0usize;
-
-        while submitted < budget {
-            grammar_mask.put(unpack_mask(&constraint.mask(), vocab));
-            decode.submit(&pipeline).context("JSON-schema decode")?;
-            submitted += 1;
-            let token = token_out.take_host::<i32>().await? as u32;
-            generated.push(token);
-            constraint
-                .accept_tokens(&[token])
-                .context("advance grammar")?;
-            if constraint.is_terminated() || generated.len() == input.max_tokens {
-                break;
-            }
-        }
+    // The grammar mask for fire k+1 is only known once fire k's token has
+    // advanced the matcher, so this loop is inherently depth-1. Running
+    // ahead would reuse a stale mask and silently drop the constraint.
+    let mut generated = Vec::with_capacity(input.max_tokens);
+    while !constraint.is_terminated() && generated.len() < input.max_tokens {
+        grammar_mask.put(unpack_mask(&constraint.mask(), vocab));
+        decode.submit(&pipeline).context("JSON-schema decode")?;
+        let token = token_out.take_host::<i32>().await? as u32;
+        generated.push(token);
+        constraint
+            .accept_tokens(&[token])
+            .context("advance grammar")?;
     }
     pipeline.close();
 

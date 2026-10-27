@@ -42,8 +42,6 @@ async def main(input: dict) -> str:
     prompt_text = input.get("prompt", "Generate a profile for a fictional software engineer named Alice.")
     schema = input.get("schema", DEFAULT_SCHEMA)
     max_tokens = int(input.get("max_tokens", 512))
-    if max_tokens < 1:
-        raise ValueError("max_tokens must be at least 1")
 
     vocab = model.output_vocab_size()
     ws = WorkingSet()
@@ -53,61 +51,41 @@ async def main(input: dict) -> str:
         "Generate only the requested JSON value, with no markdown or explanation.", prompt_text
     ) + chat.cue()
     if not prompt:
-        prompt = [0]
-    n = len(prompt)
+        raise ValueError("empty prompt")
+    *head, last = prompt
 
-    prompt_tokens = Channel.from_(prompt, dtype.i32)
-    prefill_indptr = Channel.from_([0, n], dtype.u32)
-    prefill_mask = Channel([vocab], dtype.bool)
-    first_out = Channel([1], dtype.i32)
-
-    prefill = ForwardPass()
-    prefill.embed(prompt_tokens, prefill_indptr)
-    prefill.state([ws], StateGeometry.folding())
-
-    @prefill.epilogue
-    def _prefill():
-        allowed = prefill_mask.take()
-        first_out.put(reshape(masked_argmax(intrinsics.output(0, "logits"), allowed), [1]))
-
-    prefill_mask.put(mask.unpack_mask(constraint.mask(), vocab))
     pipeline = Pipeline()
-    pipeline.submit(prefill)
-    first = await first_out.take_scalar()
+    if head:
+        fill = ForwardPass()
+        fill.embed(Channel.from_(head, dtype.i32), Channel.from_([0, len(head)], dtype.u32))
+        fill.state([ws], StateGeometry.folding())
+        pipeline.submit(fill)
 
-    generated = [first]
-    constraint.accept_tokens([first])
+    token_in = Channel.from_([last], dtype.i32)
+    grammar_mask = Channel([vocab], dtype.bool)
+    embed_indptr = Channel.from_([0, 1], dtype.u32)
+    token_out = Channel([1], dtype.i32).capacity(channel_capacity())
 
-    if not constraint.is_terminated() and len(generated) < max_tokens:
-        token_in = Channel.from_([first], dtype.i32)
-        grammar_mask = Channel([vocab], dtype.bool)
-        embed_indptr = Channel.from_([0, 1], dtype.u32)
-        token_out = Channel([1], dtype.i32).capacity(channel_capacity())
+    decode = ForwardPass()
+    decode.embed(token_in, embed_indptr)
+    decode.state([ws], StateGeometry.folding())
 
-        decode = ForwardPass()
-        decode.embed(token_in, embed_indptr)
-        decode.state([ws], StateGeometry.folding())
+    @decode.epilogue
+    def _decode():
+        allowed = grammar_mask.take()
+        token = reshape(masked_argmax(intrinsics.output(0, "logits"), allowed), [1])
+        token_in.put(token)
+        token_out.put(token)
 
-        @decode.epilogue
-        def _decode():
-            allowed = grammar_mask.take()
-            token = reshape(masked_argmax(intrinsics.output(0, "logits"), allowed), [1])
-            token_in.put(token)
-            token_out.put(token)
-
-        # The grammar mask for fire k+1 is only known once fire k's token has
-        # advanced the matcher, so this loop is inherently depth-1.
-        budget = max_tokens - len(generated)
-        submitted = 0
-        while submitted < budget:
-            grammar_mask.put(mask.unpack_mask(constraint.mask(), vocab))
-            pipeline.submit(decode)
-            submitted += 1
-            token = await token_out.take_scalar()
-            generated.append(token)
-            constraint.accept_tokens([token])
-            if constraint.is_terminated() or len(generated) == max_tokens:
-                break
+    # The grammar mask for fire k+1 is only known once fire k's token has
+    # advanced the matcher, so this loop is inherently depth-1.
+    generated: list[int] = []
+    while not constraint.is_terminated() and len(generated) < max_tokens:
+        grammar_mask.put(mask.unpack_mask(constraint.mask(), vocab))
+        pipeline.submit(decode)
+        token = await token_out.take_scalar()
+        generated.append(token)
+        constraint.accept_tokens([token])
     pipeline.close()
 
     if not constraint.is_terminated():

@@ -197,22 +197,6 @@ fn context_counter(hist: &Tensor, hlen: &Tensor, cfg: Cfg) -> Tensor {
     h
 }
 
-/// The host mirror of `context_counter`, used to find which steps saw a context
-/// the detector has already scored.
-///
-/// It has to reproduce the device hash exactly, including the clamp at the
-/// start of the buffer and the `+1` applied to every token.
-fn host_counter(history: &[i32], hlen: usize, context_width: u32) -> u32 {
-    let last = hlen as i64 - 1;
-    let mut h: u32 = 0;
-    for d in (0..context_width as i64).rev() {
-        let idx = (last - d).max(0) as usize;
-        let tok = (history[idx] + 1) as u32;
-        h = (h * HASH_MULTIPLIER + tok) % HASH_MODULUS;
-    }
-    h
-}
-
 /// Four `[1]` f32 values as one `[4]` cell.
 fn pack4(a: &Tensor, b: &Tensor, c: &Tensor, d: &Tensor) -> Tensor {
     let lane = iota(4);
@@ -336,22 +320,7 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-
-    if max_tokens == 0 {
-        return Ok(Output {
-            sampler: "synthid-tournament-sampling",
-            text: String::new(),
-            count: 0,
-            secret: input.secret,
-            context_width: input.context_width,
-            depth: input.depth,
-            watermark: input.watermark,
-            mean_score: 0.0,
-            mean_null_score: 0.0,
-            z_score: 0.0,
-            unique_contexts: 0,
-        });
-    }
+    let pipe = Pipeline::new();
 
     // The chat template matters here: watermark strength is proportional to the
     // entropy the sampler has to work with, and a raw completion prompt on an
@@ -359,8 +328,16 @@ async fn main(input: Input) -> Result<Output> {
     // reweighting scheme can mark.
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     prompt.extend(chat::cue());
-    if prompt.is_empty() {
-        prompt.push(0);
+    let prompt: Vec<i32> = prompt.into_iter().map(|t| t as i32).collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe).context("prefill submit")?;
     }
     let n = prompt.len() as u32;
 
@@ -377,129 +354,73 @@ async fn main(input: Input) -> Result<Output> {
         capacity: n + max_tokens as u32,
     };
 
-    let mut history: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    let mut history = prompt.clone();
     history.resize(cfg.capacity as usize, -1);
 
-    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-
-    // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
-    let toks_p = Channel::from_iter(history.iter().take(n as usize).copied());
-    let embed_indptr_p = Channel::from([0u32, n]);
-    let rng_p = Channel::from([input.seed, 0]);
-    let hist_p = Channel::from(history.clone());
-    let hlen_p = Channel::from([n]);
-    let chist_p = Channel::from(vec![u32::MAX; cfg.history_size as usize]);
-    let tok_out_p = Channel::new([1], dtype::i32);
-    let score_out_p = Channel::new([1], dtype::f32);
-    let null_out_p = Channel::new([1], dtype::f32);
-
-    let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
-    fwd_p.epilogue(move || {
-        let r = rng_p.take();
-        let hist = hist_p.take();
-        let hlen = hlen_p.take();
-        let chist = chist_p.take();
-        let logits = intrinsics::output(0, "logits");
-        let (token, hist_next, chist_next, score, null, _repeated) =
-            step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
-        let r_next = &r + iota(2);
-        tok_out_p.put(&token);
-        score_out_p.put(&score);
-        null_out_p.put(&null);
-        chist_p.put(&chist_next);
-        hist_p.put(&hist_next);
-        hlen_p.put(&hlen + 1u32);
-        rng_p.put(&r_next);
-    });
-
-    let pipe = Pipeline::new();
-    fwd_p.submit(&pipe).context("prefill submit")?;
-
-    let g0 = tok_out_p.take_host::<i32>().await?;
-    let s0 = score_out_p.take_host::<f32>().await?;
-    let n0 = null_out_p.take_host::<f32>().await?;
-    generated.push(g0 as u32);
     // The detector's sums accumulate on the device, masked by the same
     // `repeated` flag the generator used (the reference masks a step whose
     // context n-gram sat in the ring buffer), and ride out beside the token
-    // in one `[4]` cell: a token costs one host round trip, not three. The
-    // prefill's step is never a repeat: the ring was empty.
-    let kept_score = Channel::from([s0]);
-    let kept_null = Channel::from([n0]);
-    let kept_count = Channel::from([1.0f32]);
-    let mut totals = [s0, n0, 1.0f32];
+    // in one `[4]` cell: a token costs one host round trip, not three.
+    let tok_in = Channel::from([last]);
+    let rng = Channel::from([input.seed, 0]);
+    let hist_c = Channel::from(history);
+    let hlen_c = Channel::from([n]);
+    let chist_c = Channel::from(vec![u32::MAX; cfg.history_size as usize]);
+    let kept_score = Channel::from([0.0f32]);
+    let kept_null = Channel::from([0.0f32]);
+    let kept_count = Channel::from([0.0f32]);
+    let out = Channel::new([4], dtype::f32).capacity(channel_capacity() as u32);
 
-    // ── DECODE LOOP (1-wide, run-ahead). ──
-    if generated.len() < max_tokens {
-        history[n as usize] = g0;
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, &Channel::from([0u32, 1]))?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
+    fwd.epilogue(move || {
+        let r = rng.take();
+        let hist = hist_c.take();
+        let hlen = hlen_c.take();
+        let chist = chist_c.take();
+        let score_so_far = kept_score.take();
+        let null_so_far = kept_null.take();
+        let count_so_far = kept_count.take();
+        let logits = intrinsics::output(0, "logits");
+        let (token, hist_next, chist_next, score, null, repeated) =
+            step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
+        let zero = broadcast(0.0f32, [1]);
+        let kept_now = select(&repeated, &zero, broadcast(1.0f32, [1]));
 
-        let tok_in = Channel::from([g0]);
-        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
-        let hist_c = Channel::from(history.clone());
-        let hlen_c = Channel::from([n + 1]);
-        // The decode fire gets its own channel, so the ring is seeded with the
-        // entry the prefill fire wrote — otherwise the device and the host
-        // mirror would disagree about the first context.
-        let mut ring_seed = vec![u32::MAX; cfg.history_size as usize];
-        ring_seed[(n % cfg.history_size) as usize] =
-            host_counter(&history, n as usize, cfg.context_width);
-        let chist_c = Channel::from(ring_seed);
-        let out = Channel::new([4], dtype::f32).capacity(channel_capacity() as u32);
-        let lane1 = Channel::from([0u32, 1u32]);
+        let r_next = &r + iota(2);
 
-        let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, &lane1)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
-        fwd.epilogue(move || {
-            // Takes and compute first, puts last (value-id discipline).
-            let r = rng.take();
-            let hist = hist_c.take();
-            let hlen = hlen_c.take();
-            let chist = chist_c.take();
-            let score_so_far = kept_score.take();
-            let null_so_far = kept_null.take();
-            let count_so_far = kept_count.take();
-            let logits = intrinsics::output(0, "logits");
-            let (token, hist_next, chist_next, score, null, repeated) =
-                step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
-            let zero = broadcast(0.0f32, [1]);
-            let kept_now = select(&repeated, &zero, broadcast(1.0f32, [1]));
+        tok_in.put(&token);
+        let score_next = &score_so_far + select(&repeated, &zero, &score);
+        let null_next = &null_so_far + select(&repeated, &zero, &null);
+        let count_next = &count_so_far + &kept_now;
+        out.put(pack4(
+            &cast(reshape(&token, [1]), dtype::f32),
+            &score_next,
+            &null_next,
+            &count_next,
+        ));
+        kept_score.put(&score_next);
+        kept_null.put(&null_next);
+        kept_count.put(&count_next);
+        chist_c.put(&chist_next);
+        hist_c.put(&hist_next);
+        hlen_c.put(&hlen + 1u32);
+        rng.put(&r_next);
+    });
 
-            let r_next = &r + iota(2);
-
-            tok_in.put(&token);
-            let score_next = &score_so_far + select(&repeated, &zero, &score);
-            let null_next = &null_so_far + select(&repeated, &zero, &null);
-            let count_next = &count_so_far + &kept_now;
-            out.put(pack4(
-                &cast(reshape(&token, [1]), dtype::f32),
-                &score_next,
-                &null_next,
-                &count_next,
-            ));
-            kept_score.put(&score_next);
-            kept_null.put(&null_next);
-            kept_count.put(&count_next);
-            chist_c.put(&chist_next);
-            hist_c.put(&hist_next);
-            hlen_c.put(&hlen + 1u32);
-            rng.put(&r_next);
-        });
-
-        let budget = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget, async || {
-            let v = out
-                .take_host::<Vec<f32>>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            generated.push(v[0] as u32);
-            totals = [v[1], v[2], v[3]];
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    }
+    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut totals = [0.0f32; 3];
+    run_ahead(&pipe, &fwd, max_tokens, async || {
+        let v = out
+            .take_host::<Vec<f32>>()
+            .await
+            .with_context(|| format!("@{}", generated.len()))?;
+        generated.push(v[0] as u32);
+        totals = [v[1], v[2], v[3]];
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipe.close();
     let [kept_score, kept_null, kept_n] = totals;
     let kept = kept_n as usize;

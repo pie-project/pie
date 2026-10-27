@@ -35,70 +35,48 @@ fn greedy(logits: Tensor) -> Tensor {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    let max_tokens = input.max_tokens;
     let ws = WorkingSet::new();
-
-    if max_tokens == 0 {
-        return Ok(Output {
-            text: String::new(),
-            count: 0,
-            tokens: Vec::new(),
-        });
-    }
+    let pipe = Pipeline::new();
 
     // The model's opening (`<bos>` where it has one) before the raw text: a
     // gemma without it answers noise.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
-    if prompt.is_empty() {
-        return Err("empty prompt".into());
+    let prompt: Vec<i32> = inferlet::chat::prefix()
+        .into_iter()
+        .chain(model::encode(&input.prompt))
+        .map(|t| t as i32)
+        .collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe).context("prefill submit")?;
     }
-    let n = prompt.len() as u32;
 
-    let pipe = Pipeline::new();
-    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-
-    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks = Channel::from(&prompt_i32[..]);
-    let embed_indptr = Channel::from([0u32, n]);
-    let tok_out = Channel::new([1], dtype::i32);
-
+    let tok_in = Channel::from([last]);
+    let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
     let fwd = ForwardPass::new();
-    fwd.embed(&toks, &embed_indptr)?;
+    fwd.embed(&tok_in, &Channel::from([0u32, 1]))?;
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
-        tok_out.put(greedy(intrinsics::output(0, "logits")));
+        let token = greedy(intrinsics::output(0, "logits"));
+        tok_in.put(&token);
+        tok_out.put(&token);
     });
-    fwd.submit(&pipe).context("prefill submit")?;
-    let first = tok_out.take_host::<i32>().await.context("prefill drain")?;
-    generated.push(first as u32);
 
-    // ── DECODE (1-wide, device loop-carried token) ─────────────────────────
-    if generated.len() < max_tokens {
-        let tok_in = Channel::from([first]);
-        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-        let embed_indptr = Channel::from([0u32, 1]);
-
-        let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, &embed_indptr)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
-        fwd.epilogue(move || {
-            let token = greedy(intrinsics::output(0, "logits"));
-            tok_in.put(&token);
-            tok_out.put(&token);
-        });
-
-        let budget = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget, async || {
-            let token = tok_out
-                .take_host::<i32>()
-                .await
-                .with_context(|| format!("decode drain @{}", generated.len()))?;
-            generated.push(token as u32);
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    }
+    let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
+    run_ahead(&pipe, &fwd, input.max_tokens, async || {
+        let token = tok_out
+            .take_host::<i32>()
+            .await
+            .with_context(|| format!("decode drain @{}", generated.len()))?;
+        generated.push(token as u32);
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipe.close();
 
     Ok(Output {

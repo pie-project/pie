@@ -66,10 +66,6 @@ async fn main(input: Input) -> Result<String> {
 
     let temperature = input.temperature;
     let top_p = input.top_p;
-    let max_tokens = input.max_tokens;
-    if max_tokens == 0 {
-        return Ok(String::new());
-    }
 
     // Chat-template the system and user messages, then add the assistant cue.
     // `cue` asks for a thinking answer, so the system turn is the one the
@@ -79,58 +75,23 @@ async fn main(input: Input) -> Result<String> {
         chat::system_thinking(Some(&input.system), chat::ReasoningEffort::Xhigh);
     prompt_tokens.extend(chat::user(&input.prompt));
     prompt_tokens.extend(chat::cue());
-    if prompt_tokens.is_empty() {
-        prompt_tokens.push(0);
-    }
-    let n = prompt_tokens.len() as u32;
+    let prompt: Vec<i32> = prompt_tokens.into_iter().map(|t| t as i32).collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
     let stop = chat::stop_tokens();
 
     let ws = WorkingSet::new();
-
     let pipe = Pipeline::new();
-
-    // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
-    let g0 = {
-        let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
-        let toks_p = Channel::from(prompt_i32); // [N] i32 (seeded)
-        let embed_indptr_p = Channel::from([0u32, n]);
-        let rng_p = Channel::from([0x51ed_u32, 0]);
-        let g0_ch = Channel::new([1], dtype::i32);
-
-        let fwd_p = ForwardPass::new();
-        fwd_p.embed(&toks_p, &embed_indptr_p)?;
-        fwd_p.state(&[&ws], StateGeometry::folding())?;
-        fwd_p.epilogue(move || {
-            let r = rng_p.take();
-            let tok = sample_token(&r, temperature, top_p);
-            let r_next = &r + iota(2); // advance ctr: [key, ctr+1]
-            g0_ch.put(&tok);
-            rng_p.put(&r_next);
-        });
-
-        fwd_p.submit(&pipe).context("prefill submit")?;
-        g0_ch.take_host::<i32>().await?
-    };
-
-    let chat_dec = chat::Decoder::new();
-    let mut text = String::new();
-    let mut done = stop.contains(&(g0 as u32));
-    if !stop.contains(&(g0 as u32)) {
-        match chat_dec.feed(&[g0 as u32])? {
-            chat::Event::Delta(s) => {
-                print!("{s}");
-                text.push_str(&s);
-            }
-            chat::Event::Done(s) => {
-                text = s;
-                done = true;
-            }
-            _ => {}
-        }
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe).context("prefill submit")?;
     }
 
-    // ───────────────────────── 2. DECODE LOOP (1-wide) ──────────────────────
-    let tok_in = Channel::from([g0]);
+    let tok_in = Channel::from([last]);
     // No mask: causal is the default, and a bound mask costs the run-ahead (one fire per frame).
     let out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
     let rng = Channel::from([0x9e37_u32, 0]);
@@ -151,12 +112,9 @@ async fn main(input: Input) -> Result<String> {
         rng.put(&r_next);
     });
 
-    let budget = if done {
-        0
-    } else {
-        max_tokens.saturating_sub(1) // g0 already emitted
-    };
-    run_ahead(&pipe, &fwd, budget, async || {
+    let chat_dec = chat::Decoder::new();
+    let mut text = String::new();
+    run_ahead(&pipe, &fwd, input.max_tokens, async || {
         let t = out.take_host::<Vec<i32>>().await?;
         let token = *t.first().unwrap_or(&0) as u32;
         if stop.contains(&token) {

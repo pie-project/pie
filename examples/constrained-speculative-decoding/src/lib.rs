@@ -174,13 +174,25 @@ struct Target {
 }
 
 impl Target {
-    fn new() -> Self {
-        Self {
-            ws: WorkingSet::new(),
-            pipeline: Pipeline::new(),
-            computed: 0,
-            folded: 0,
+    fn new(head: &[u32]) -> Result<Self> {
+        let ws = WorkingSet::new();
+        let pipeline = Pipeline::new();
+        if !head.is_empty() {
+            let fill = ForwardPass::new();
+            fill.embed(
+                &Channel::from_iter(head.iter().map(|&t| t as i32)),
+                &Channel::from([0u32, head.len() as u32]),
+            )?;
+            fill.state(&[&ws], StateGeometry::folding())?;
+            fill.submit(&pipeline).context("prefill submit")?;
         }
+        let n = head.len() as u32;
+        Ok(Self {
+            ws,
+            pipeline,
+            computed: n,
+            folded: n,
+        })
     }
 
     /// `masks[i]` is the grammar state after `committed ++ draft[..i]`. A rejected draft's
@@ -192,9 +204,6 @@ impl Target {
         masks: &[Vec<bool>],
         vocab: u32,
     ) -> Result<Vec<u32>> {
-        if committed.is_empty() {
-            return Err("cannot verify from an empty committed sequence".into());
-        }
         let rows = draft.len() as u32 + 1;
         if masks.len() != rows as usize {
             return Err(format!(
@@ -266,11 +275,9 @@ async fn main(input: Input) -> Result<Output> {
         &input.prompt,
     );
     committed.extend(chat::cue());
-    if committed.is_empty() {
-        committed.push(0);
-    }
+    let (_, head) = committed.split_last().ok_or("empty prompt")?;
 
-    let mut target_model = Target::new();
+    let mut target_model = Target::new(head)?;
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
     let mut total_drafted = 0usize;
     let mut total_accepted = 0usize;

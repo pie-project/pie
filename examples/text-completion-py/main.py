@@ -1,13 +1,4 @@
-"""Greedy text completion, device-carried — the Python twin of `text-completion`.
-
-Same program as `examples/text-completion/src/lib.rs`, traced from
-Python: one prefill pass whose greedy pick seeds the decode once, then a
-1-wide decode pass whose token is loop-carried on the device (`reduce_argmax`
-in the epilogue, put straight back into the channel `embed` reads) with the
-host draining a mirror behind the runtime's run-ahead window (`run_ahead`).
-The traced container is byte-identical to the Rust inferlet's, so both share
-one program-cache entry.
-"""
+"""Greedy text completion, device-carried — the Python twin of `text-completion`."""
 
 from inferlet import chat, model
 from inferlet.eta import (
@@ -32,59 +23,39 @@ async def main(input: dict) -> dict:
     max_tokens = int(input.get("max_tokens", 8))
 
     ws = WorkingSet()
-
-    if max_tokens == 0:
-        return {"text": "", "count": 0, "tokens": []}
+    pipe = Pipeline()
 
     # The model's opening (`<bos>` where it has one) before the raw text: a
     # gemma without it answers noise.
     prompt = chat.prefix() + model.encode(prompt_text)
     if not prompt:
         raise ValueError("empty prompt")
-    n = len(prompt)
+    *head, last = prompt
+    if head:
+        fill = ForwardPass()
+        fill.embed(Channel.from_(head, dtype.i32), Channel.from_([0, len(head)], dtype.u32))
+        fill.state([ws], StateGeometry.folding())
+        pipe.submit(fill)
 
-    pipe = Pipeline()
-    generated: list[int] = []
-
-    toks = Channel.from_(prompt, dtype.i32)
-    embed_indptr = Channel.from_([0, n], dtype.u32)
-    tok_out = Channel([1], dtype.i32)
-
+    tok_in = Channel.from_([last], dtype.i32)
+    tok_out = Channel([1], dtype.i32).capacity(channel_capacity())
     fwd = ForwardPass()
-    fwd.embed(toks, embed_indptr)
+    fwd.embed(tok_in, Channel.from_([0, 1], dtype.u32))
     fwd.state([ws], StateGeometry.folding())
 
     @fwd.epilogue
-    def _prefill_epilogue():
-        tok_out.put(greedy(intrinsics.output(0, "logits")))
+    def _():
+        token = greedy(intrinsics.output(0, "logits"))
+        tok_in.put(token)
+        tok_out.put(token)
 
-    pipe.submit(fwd)
-    first = await tok_out.take_scalar()
-    generated.append(first)
+    generated: list[int] = []
 
-    # ── DECODE (1-wide, device loop-carried token) ─────────────────────────
-    if len(generated) < max_tokens:
-        tok_in = Channel.from_([first], dtype.i32)
-        tok_out = Channel([1], dtype.i32).capacity(channel_capacity())
-        embed_indptr = Channel.from_([0, 1], dtype.u32)
+    async def on_token() -> bool:
+        generated.append(await tok_out.take_scalar())
+        return True
 
-        fwd = ForwardPass()
-        fwd.embed(tok_in, embed_indptr)
-        fwd.state([ws], StateGeometry.folding())
-
-        @fwd.epilogue
-        def _decode_epilogue():
-            token = greedy(intrinsics.output(0, "logits"))
-            tok_in.put(token)
-            tok_out.put(token)
-
-        budget = max_tokens - 1
-
-        async def on_token() -> bool:
-            generated.append(await tok_out.take_scalar())
-            return True
-
-        await pipe.run_ahead(fwd, budget, on_token)
+    await pipe.run_ahead(fwd, max_tokens, on_token)
     pipe.close()
 
     return {

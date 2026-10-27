@@ -67,19 +67,12 @@ async fn main(input: Input) -> Result<String> {
     if !input.alpha.is_finite() || !(0.0 < input.alpha && input.alpha <= 1.0) {
         return Err("alpha must be finite, greater than 0, and at most 1".into());
     }
-    if input.max_tokens == 0 {
-        return Ok(String::new());
-    }
-
     let max_tokens =
         u32::try_from(input.max_tokens).map_err(|_| "max_tokens exceeds the u32 range")?;
     let vocab = model::output_vocab_size();
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     prompt.extend(chat::cue());
-    if prompt.is_empty() {
-        prompt.push(0);
-    }
     let n = u32::try_from(prompt.len()).map_err(|_| "prompt is too long")?;
     let span = n
         .checked_add(max_tokens)
@@ -90,73 +83,40 @@ async fn main(input: Input) -> Result<String> {
         .ok_or("amateur attention geometry exceeds the u32 range")?;
     let stop_tokens = chat::stop_tokens();
 
+    let prompt: Vec<i32> = prompt.into_iter().map(|t| t as i32).collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
+    let h = head.len() as u32;
+    let visible = move |query: u32, key: u32| key <= query && key.saturating_add(window) > query;
+
     // Not shared with the expert: the amateur's windowed state must not leak into it.
     let amateur_ws = WorkingSet::new();
-
-    let prompt_i32 = prompt.iter().map(|&token| token as i32).collect::<Vec<_>>();
-    let amateur_prompt = Channel::from(prompt_i32.clone());
-    let amateur_prefill_embed_indptr = Channel::from([0u32, n]);
-    let amateur_prefill_mask = Channel::from_shaped(
-        [n, span],
-        (0..n)
-            .flat_map(|query| {
-                (0..span).map(move |key| key <= query && key.saturating_add(window) > query)
-            })
-            .collect::<Vec<_>>(),
-    );
-    let amateur_prefill_out = Channel::new([vocab], dtype::f32);
-
-    let amateur_prefill = ForwardPass::new();
-    amateur_prefill.embed(&amateur_prompt, &amateur_prefill_embed_indptr)?;
-    amateur_prefill.mask(&amateur_prefill_mask)?;
-    amateur_prefill.state(&[&amateur_ws], StateGeometry::folding())?;
-    amateur_prefill.epilogue(move || {
-        amateur_prefill_out.put(intrinsics::output(0, "logits"));
-    });
-
-    let pipeline = Pipeline::new();
-    amateur_prefill
-        .submit(&pipeline)
-        .context("amateur prefill")?;
-    let first_amateur_logits = amateur_prefill_out.take_host::<Vec<f32>>().await?;
-
-    // The expert keeps the complete context and consumes the amateur logits in
-    // its epilogue to perform the contrastive token selection on-device.
     let expert_ws = WorkingSet::new();
-    let expert_prompt = Channel::from(prompt_i32);
-    let expert_prefill_embed_indptr = Channel::from([0u32, n]);
-    let expert_prefill_amateur = Channel::new([vocab], dtype::f32);
-    let first_out = Channel::new([1], dtype::i32);
-    let lambda = input.lambda;
-    let alpha = input.alpha;
+    let pipeline = Pipeline::new();
+    if !head.is_empty() {
+        let amateur_prefill = ForwardPass::new();
+        amateur_prefill.embed(&Channel::from(head), &Channel::from([0u32, h]))?;
+        amateur_prefill.mask(&Channel::from_shaped(
+            [h, span],
+            (0..h)
+                .flat_map(|query| (0..span).map(move |key| visible(query, key)))
+                .collect::<Vec<_>>(),
+        ))?;
+        amateur_prefill.state(&[&amateur_ws], StateGeometry::folding())?;
+        amateur_prefill
+            .submit(&pipeline)
+            .context("amateur prefill")?;
 
-    let expert_prefill = ForwardPass::new();
-    expert_prefill.embed(&expert_prompt, &expert_prefill_embed_indptr)?;
-    expert_prefill.state(&[&expert_ws], StateGeometry::folding())?;
-    expert_prefill.epilogue(move || {
-        let token = contrastive_pick(&expert_prefill_amateur.take(), lambda, alpha, vocab);
-        first_out.put(token);
-    });
-
-    expert_prefill_amateur.put(first_amateur_logits);
-    expert_prefill.submit(&pipeline).context("expert prefill")?;
-    let first = read_expert_token(&first_out).await?;
-
-    let mut generated = Vec::with_capacity(input.max_tokens);
-    if !stop_tokens.contains(&first) {
-        generated.push(first);
-    }
-    if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
-        return model::decode(&generated);
+        let expert_prefill = ForwardPass::new();
+        expert_prefill.embed(&Channel::from(head), &Channel::from([0u32, h]))?;
+        expert_prefill.state(&[&expert_ws], StateGeometry::folding())?;
+        expert_prefill.submit(&pipeline).context("expert prefill")?;
     }
 
     let amateur_token = Channel::new([1], dtype::i32);
-    let amateur_fill = Channel::from([n + 1]);
+    let amateur_fill = Channel::from([h + 1]);
     let amateur_mask = Channel::from_shaped(
         [1, span],
-        (0..span)
-            .map(|key| key <= n && key.saturating_add(window) > n)
-            .collect::<Vec<_>>(),
+        (0..span).map(|key| visible(h, key)).collect::<Vec<_>>(),
     );
     let amateur_logits_out = Channel::new([vocab], dtype::f32).capacity(channel_capacity() as u32);
 
@@ -182,7 +142,11 @@ async fn main(input: Input) -> Result<String> {
         amateur_mask.put(next_mask);
     });
 
-    let expert_token = Channel::from([first as i32]);
+    // The expert keeps the complete context and consumes the amateur logits in
+    // its epilogue to perform the contrastive token selection on-device.
+    let lambda = input.lambda;
+    let alpha = input.alpha;
+    let expert_token = Channel::from([last]);
     let expert_embed_indptr = Channel::from([0u32, 1]);
     let expert_amateur = Channel::writer([vocab], dtype::f32);
     let expert_token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
@@ -200,24 +164,21 @@ async fn main(input: Input) -> Result<String> {
     // amateur's logits for step k, and the amateur's input for step k+1 is
     // that very pick. Every submit is therefore preceded by the host put of
     // the Writer channel the fire takes.
-    let budget = input.max_tokens.saturating_sub(generated.len());
-    amateur_token.put(vec![first as i32]);
-    amateur_decode.submit(&pipeline).context("amateur decode")?;
-
-    for step in 0..budget {
+    let mut generated = Vec::with_capacity(input.max_tokens);
+    let mut token = last;
+    for _ in 0..input.max_tokens {
+        amateur_token.put(vec![token]);
+        amateur_decode.submit(&pipeline).context("amateur decode")?;
         let amateur_logits = amateur_logits_out.take_host::<Vec<f32>>().await?;
 
         expert_amateur.put(amateur_logits);
         expert_decode.submit(&pipeline).context("expert decode")?;
-        let token = read_expert_token(&expert_token_out).await?;
-        if stop_tokens.contains(&token) {
+        let picked = read_expert_token(&expert_token_out).await?;
+        if stop_tokens.contains(&picked) {
             break;
         }
-        generated.push(token);
-        if step + 1 < budget {
-            amateur_token.put(vec![token as i32]);
-            amateur_decode.submit(&pipeline).context("amateur decode")?;
-        }
+        generated.push(picked);
+        token = picked as i32;
     }
     // Every submitted fire was drained above.
     pipeline.close();

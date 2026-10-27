@@ -61,9 +61,6 @@ struct Input {
     /// turnaround.
     #[serde(default)]
     run_ahead_frames: Option<usize>,
-    /// For a plane whose channel rings belong to the pass instance, not the channel.
-    #[serde(default)]
-    host_first_token: bool,
 }
 
 fn default_max_tokens() -> usize {
@@ -183,9 +180,8 @@ async fn run_one(
     };
     step(&mut prologue_us, input.report_timing); // [1] tokenize
     let num_prompt_tokens = prompt_vec.len();
-    if prompt_vec.is_empty() {
-        return Err("empty prompt".into());
-    }
+    let prompt: Vec<i32> = prompt_vec.iter().map(|&t| t as i32).collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
 
     if honor_wait_for_start && input.wait_for_start {
         session::send("ready");
@@ -196,32 +192,16 @@ async fn run_one(
     let run_start = std::time::Instant::now();
 
     let vocab = model::output_vocab_size();
-    let sampled_rng = (input.temperature > 0.0).then(|| Channel::from([rng_seed, 0u32]));
-    let prefill_rng =
-        (input.temperature > 0.0).then(|| Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]));
+    let rng = (input.temperature > 0.0).then(|| Channel::from([rng_seed, 0u32]));
     let temperature = input.temperature;
     let top_p = input.top_p;
 
     let ws = WorkingSet::new();
-    let n = prompt_vec.len() as u32;
     step(&mut prologue_us, input.report_timing); // [2] setup (vocab/rng/ws)
     // Nothing to reserve; the empty step keeps `prologue_us`'s shape.
     step(&mut prologue_us, input.report_timing); // [3] reserve
 
-    let prompt_i32: Vec<i32> = prompt_vec.iter().map(|&t| t as i32).collect();
-
-    // Recurrent state is kept where the prompt (one message) ends, as the
-    // compat routes keep it where messages end.
-    let checkpoints = [n];
-
-    let toks_p = Channel::from(&prompt_i32[..]);
-    let embed_indptr_p = Channel::from([0u32, n]);
-    // Decode fires: the prefill sample already spends one of the
-    // `max_tokens` sampler activations.
-    let budget = input.max_tokens - 1;
-    // A host-visible channel cannot attach to two passes, so this one is device-only.
-    let tok_in = (!input.host_first_token).then(|| Channel::new([1], dtype::i32));
-    let g0_ch = Channel::new([1], dtype::i32);
+    let budget = input.max_tokens;
     let live_slots = frame_size();
 
     // A frame of margin above the window (`7 * live_slots` covers every frame size): the ticket
@@ -239,144 +219,75 @@ async fn run_one(
     let out = Channel::new([1], dtype::i32).capacity(out_capacity as u32);
     let pipe = Pipeline::new();
 
-    let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p
-        .state(&[&ws], StateGeometry::folding())
-        .context("bind prefill state")?;
-    fwd_p.checkpoints(&checkpoints)?;
-    fwd_p.epilogue(move || {
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())
+            .context("bind prefill state")?;
+        // Recurrent state is kept where the prompt (one message) ends, as the
+        // compat routes keep it where messages end.
+        fill.checkpoints(&[head.len() as u32])?;
+        fill.submit(&pipe).context("prefill submit")?;
+    }
+
+    let tok_in = Channel::from([last]);
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, &Channel::from([0u32, 1u32]))?;
+    fwd.state(&[&ws], StateGeometry::folding())
+        .context("bind decode state")?;
+    fwd.epilogue(move || {
         let t = reshape(
             sample(
                 intrinsics::output(0, "logits"),
                 vocab,
                 temperature,
                 top_p,
-                prefill_rng,
+                rng,
             ),
             [1],
         );
-        if let Some(tok_in) = tok_in {
-            tok_in.put(&t);
-        }
-        g0_ch.put(&t);
+        tok_in.put(&t);
+        out.put(&t);
     });
 
-    // Built before the prefill submits, so its `tok_in` claim precedes the prefill's build.
-    let ws_ref = &ws;
-    let build_decode = move |tok_in: Channel| -> std::result::Result<Option<ForwardPass>, String> {
-        Ok(if budget > 0 {
-            let fwd = ForwardPass::new();
-            let embed_indptr = Channel::from([0u32, 1u32]);
-            fwd.embed(&tok_in, &embed_indptr)?;
-            fwd.state(&[ws_ref], StateGeometry::folding())
-                .context("bind decode state")?;
-            fwd.epilogue(move || {
-                let t = reshape(
-                    sample(
-                        intrinsics::output(0, "logits"),
-                        vocab,
-                        temperature,
-                        top_p,
-                        sampled_rng,
-                    ),
-                    [1],
-                );
-                tok_in.put(&t);
-                out.put(&t);
-            });
-            Some(fwd)
-        } else {
-            None
-        })
-    };
-
-    let mut build_decode = Some(build_decode);
-    let mut fwd_d: Option<ForwardPass> = match tok_in {
-        Some(tok_in) => build_decode
-            .take()
-            .expect("the decode builder is called once")(tok_in)?,
-        None => None,
-    };
-
-    // First frame: the prefill in slot 0, then up to live_slots-1
-    // decode slots. At live_slots = 1 this is a bare prefill submit
-    // (`submit` IS a single-slot frame); trailing slots pad to no-ops.
-    // Under `host_first_token` there is no decode pass yet, so the
-    // frame is one slot wide — the same shape live_slots = 1 already
-    // submits.
-    // The prefill goes alone, and the decode window is staged only after its
-    // token has reached the host (below): a window staged ahead held the
-    // first token's drain behind up to three decode fires, which the client
-    // saw as time to first token (Gemma-4-31B on an M5 Max: 754 ms of
-    // prefill, 866 ms to the first token). Throughput at 32 lanes is the same.
-    let first_decodes = 0;
-    let mut first_slots: Vec<Option<&ForwardPass>> = Vec::with_capacity(live_slots);
-    first_slots.push(Some(&fwd_p));
-    for _ in 0..first_decodes {
-        first_slots.push(Some(fwd_d.as_ref().expect("decode pass exists")));
+    // The first fire goes alone, and the decode window is staged only after
+    // its token has reached the host: a window staged ahead held the first
+    // token's drain behind up to three decode fires, which the client saw as
+    // time to first token (Gemma-4-31B on an M5 Max: 754 ms of prefill, 866
+    // ms to the first token). Throughput at 32 lanes is the same.
+    let mut submitted = 0usize;
+    if budget > 0 {
+        submit_frame(&pipe, &[Some(&fwd)]).context("first frame submit")?;
+        submitted = 1;
     }
-    submit_frame(&pipe, &first_slots).context("first frame submit")?;
-    let mut submitted = first_decodes;
-
-    // The pass is an argument: under `host_first_token` it is built after this closure.
-    let submit_ahead = |fwd: &ForwardPass,
-                        mut submitted: usize,
-                        drained: usize|
-     -> std::result::Result<usize, String> {
-        while submitted < budget {
-            let s = (budget - submitted).min(live_slots);
-            if submitted - drained + s > window_fires {
-                break;
+    let submit_ahead =
+        |mut submitted: usize, drained: usize| -> std::result::Result<usize, String> {
+            while submitted < budget {
+                let s = (budget - submitted).min(live_slots);
+                if submitted - drained + s > window_fires {
+                    break;
+                }
+                let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(&fwd)).collect();
+                submit_frame(&pipe, &slots).context("decode frame submit")?;
+                submitted += s;
             }
-            let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(fwd)).collect();
-            submit_frame(&pipe, &slots).context("decode frame submit")?;
-            submitted += s;
-        }
-        Ok(submitted)
-    };
+            Ok(submitted)
+        };
 
     step(&mut prologue_us, input.report_timing); // [4] build_submit (both passes)
 
-    // ── HOST DRAIN (off the critical path — the decode burst is already in
-    // the runtime while this first take waits on the prefill).
-    let g0 = g0_ch.take_host::<i32>().await?;
-
-    let ttft_us = input
-        .report_timing
-        .then(|| run_start.elapsed().as_micros() as u64);
-    if input.report_timing && honor_wait_for_start {
-        session::send("t0");
-    }
-    // The device arm stages its decode window now, with the first token out.
-    if build_decode.is_none()
-        && let Some(fwd) = fwd_d.as_ref()
-    {
-        submitted = submit_ahead(fwd, submitted, 0)?;
-    }
-    if let Some(build_decode) = build_decode.take() {
-        fwd_d = build_decode(Channel::from([g0]))?;
-        if let Some(fwd) = fwd_d.as_ref() {
-            submitted = submit_ahead(fwd, submitted, 0)?;
-        }
-    }
+    let mut ttft_us = None;
     let mut intertoken_us: Vec<u32> = Vec::new();
-    let mut last_tick = run_start.elapsed();
+    let mut last_tick = None;
     let mut token_monotonic_ns: Vec<u64> = Vec::new();
-    let first_token_monotonic_ns = input.report_arrivals.then(inferlet::monotonic_now_ns);
 
     let wasm_delay = std::time::Duration::from_micros(input.wasm_delay_us);
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
     let mut emitted = 0usize; // sampler emissions counted (stop excluded)
-
-    let mut stopped = stop_tokens.contains(&(g0 as u32));
-    if !stopped {
-        emitted += 1;
-        generated.push(g0 as u32);
-        if let Some(now_ns) = first_token_monotonic_ns {
-            token_monotonic_ns.push(now_ns);
-        }
-    }
+    let mut stopped = false;
 
     // Close early: the other lanes' frame seals stop waiting on this one.
     let mut closed = false;
@@ -391,6 +302,12 @@ async fn run_one(
         let Some(&t0) = t.first() else {
             return Err("out.take: empty tensor".into());
         };
+        if taken == 1 && input.report_timing {
+            ttft_us = Some(run_start.elapsed().as_micros() as u64);
+            if honor_wait_for_start {
+                session::send("t0");
+            }
+        }
         if stopped {
             continue; // a fire that settled before the close landed
         }
@@ -406,26 +323,23 @@ async fn run_one(
         generated.push(t0 as u32);
         if input.report_arrivals {
             let now_ns = inferlet::monotonic_now_ns();
-            let previous_ns = *token_monotonic_ns
-                .last()
-                .expect("first accepted token has a monotonic stamp");
-            intertoken_us.push(((now_ns - previous_ns) / 1_000) as u32);
+            if let Some(&previous_ns) = token_monotonic_ns.last() {
+                intertoken_us.push(((now_ns - previous_ns) / 1_000) as u32);
+            }
             token_monotonic_ns.push(now_ns);
         } else if input.report_timing {
             let now = run_start.elapsed();
-            intertoken_us.push((now - last_tick).as_micros() as u32);
-            last_tick = now;
+            if let Some(previous) = last_tick {
+                intertoken_us.push((now - previous).as_micros() as u32);
+            }
+            last_tick = Some(now);
         }
         if input.wasm_delay_us > 0 {
             std::thread::sleep(wasm_delay);
         }
         // Refill the window after draining an accepted token. A stopped lane
         // `continue`s above and never reaches here, so it never submits more.
-        submitted = submit_ahead(
-            fwd_d.as_ref().expect("decode pass exists while budget > 0"),
-            submitted,
-            taken,
-        )?;
+        submitted = submit_ahead(submitted, taken)?;
         if !closed && submitted >= budget {
             pipe.close();
             closed = true;

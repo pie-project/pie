@@ -2,7 +2,8 @@
 //!
 //! The common prompt is prefilled once. Two first-level branches fork that
 //! working set, append distinct text, and are each forked again into two leaves.
-//! Generation then continues independently from all four shared-prefix leaves.
+//! Generation then continues independently from all four shared-prefix leaves,
+//! one decode lane per leaf.
 
 use inferlet::chat;
 use inferlet::eta::prelude::*;
@@ -19,64 +20,60 @@ fn default_num_tokens() -> usize {
 }
 
 /// Freezes what it appends, so a later fork shares it instead of copying.
-async fn append_tokens(ws: &WorkingSet, pipeline: &Pipeline, tokens: &[u32]) -> Result<i32> {
+fn append_tokens(ws: &WorkingSet, pipeline: &Pipeline, tokens: &[u32]) -> Result<()> {
     if tokens.is_empty() {
         return Err("cannot append an empty token sequence".into());
     }
-    let n = tokens.len() as u32;
-    let token_input = Channel::from_iter(tokens.iter().map(|&token| token as i32));
-    let embed_indptr = Channel::from([0u32, n]);
-    let next_token = Channel::new([1], dtype::i32);
-
     let fwd = ForwardPass::new();
-    fwd.embed(&token_input, &embed_indptr)?;
+    fwd.embed(
+        &Channel::from_iter(tokens.iter().map(|&token| token as i32)),
+        &Channel::from([0u32, tokens.len() as u32]),
+    )?;
     fwd.state(&[ws], StateGeometry::folding())?;
-    fwd.epilogue(move || {
-        next_token.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
-    });
-    fwd.submit(pipeline).context("append shared prefix")?;
-    next_token.take_host::<i32>().await
+    fwd.submit(pipeline).context("append shared prefix")
 }
 
+/// Greedy decode, one lane per leaf, each seeded with its suffix's last token.
 async fn generate(
-    ws: &WorkingSet,
+    leaves: &[&WorkingSet],
     pipeline: &Pipeline,
-    first_token: i32,
+    last: Vec<i32>,
     max_tokens: usize,
-) -> Result<Vec<u32>> {
-    if max_tokens == 0 {
-        return Ok(Vec::new());
-    }
-
+) -> Result<Vec<Vec<u32>>> {
+    let b = leaves.len() as u32;
+    let vocab = model::output_vocab_size();
     let stop_tokens = chat::stop_tokens();
-    let mut generated = Vec::with_capacity(max_tokens);
-    if !stop_tokens.contains(&(first_token as u32)) {
-        generated.push(first_token as u32);
-    }
-    if generated.len() >= max_tokens || stop_tokens.contains(&(first_token as u32)) {
-        return Ok(generated);
-    }
-
-    let token_in = Channel::from([first_token]);
-    let embed_indptr = Channel::from([0u32, 1]);
-    let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+    let token_in = Channel::from(last);
+    let token_out = Channel::new([b], dtype::i32).capacity(channel_capacity() as u32);
 
     let fwd = ForwardPass::new();
-    fwd.embed(&token_in, &embed_indptr)?;
-    fwd.state(&[ws], StateGeometry::folding())?;
+    fwd.embed(&token_in, &Channel::from_iter(0..=b))?;
+    fwd.state(leaves, StateGeometry::folding())?;
     fwd.epilogue(move || {
-        let token = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
-        token_in.put(&token);
-        token_out.put(&token);
+        let logits = reshape(intrinsics::output(0, "logits"), [b, vocab]);
+        let tokens = reshape(reduce_argmax(logits), [b]);
+        token_in.put(&tokens);
+        token_out.put(&tokens);
     });
 
-    let budget = max_tokens.saturating_sub(generated.len());
-    run_ahead(pipeline, &fwd, budget, async || {
-        let token = token_out.take_host::<i32>().await? as u32;
-        if stop_tokens.contains(&token) {
+    let mut generated = vec![Vec::new(); leaves.len()];
+    let mut done = vec![false; leaves.len()];
+    run_ahead(pipeline, &fwd, max_tokens, async || {
+        let tokens = token_out.take_host::<Vec<i32>>().await?;
+        for (lane, token) in tokens.into_iter().enumerate() {
+            let token = token as u32;
+            if done[lane] {
+                continue;
+            }
+            if stop_tokens.contains(&token) {
+                done[lane] = true;
+            } else {
+                generated[lane].push(token);
+            }
+        }
+        if done.iter().all(|&d| d) {
             return Ok(ControlFlow::Break(()));
         }
-        generated.push(token);
         Ok(ControlFlow::Continue(()))
     })
     .await?;
@@ -91,45 +88,43 @@ struct Branch {
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let root = WorkingSet::new();
-
-    let root_tokens = model::encode("Write a short scene set");
-    if root_tokens.is_empty() {
-        return Err("tokenizer produced an empty root prompt".into());
-    }
-
-    let tree_pipeline = Pipeline::new();
-    append_tokens(&root, &tree_pipeline, &root_tokens).await?;
+    let pipeline = Pipeline::new();
+    append_tokens(&root, &pipeline, &model::encode("Write a short scene set"))?;
 
     let mut first_level = Vec::new();
     for suffix in [" in a city", " in a forest"] {
-        let child = root.fork(&tree_pipeline)?;
-        let tokens = model::encode(suffix);
-        append_tokens(&child, &tree_pipeline, &tokens).await?;
+        let child = root.fork(&pipeline)?;
+        append_tokens(&child, &pipeline, &model::encode(suffix))?;
         first_level.push(Branch {
             label: suffix.trim().into(),
             ws: child,
         });
     }
 
+    let mut labels = Vec::new();
     let mut leaves = Vec::new();
-    for parent in first_level {
+    let mut last = Vec::new();
+    for parent in &first_level {
         for suffix in [" at dawn", " at night"] {
-            let leaf = parent.ws.fork(&tree_pipeline)?;
+            let leaf = parent.ws.fork(&pipeline)?;
             let tokens = model::encode(suffix);
-            let first = append_tokens(&leaf, &tree_pipeline, &tokens).await?;
-            leaves.push((format!("{} {}", parent.label, suffix.trim()), leaf, first));
+            let (&tail, head) = tokens.split_last().ok_or("empty leaf suffix")?;
+            if !head.is_empty() {
+                append_tokens(&leaf, &pipeline, head)?;
+            }
+            labels.push(format!("{} {}", parent.label, suffix.trim()));
+            leaves.push(leaf);
+            last.push(tail as i32);
         }
     }
-    // The BUILD stream ends here: every append is submitted and nothing else
-    // will go on this pipeline.
-    tree_pipeline.close();
 
-    // One pipeline per leaf: `run_ahead` closes its pipeline when the budget is spent.
-    let mut outputs = Vec::with_capacity(leaves.len());
-    for (label, ws, first) in leaves {
-        let leaf_pipeline = Pipeline::new();
-        let generated = generate(&ws, &leaf_pipeline, first, input.num_tokens).await?;
-        outputs.push(format!("{label}: {}", model::decode(&generated)?));
+    let leaves: Vec<&WorkingSet> = leaves.iter().collect();
+    let generated = generate(&leaves, &pipeline, last, input.num_tokens).await?;
+    pipeline.close();
+
+    let mut outputs = Vec::with_capacity(labels.len());
+    for (label, tokens) in labels.iter().zip(&generated) {
+        outputs.push(format!("{label}: {}", model::decode(tokens)?));
     }
     Ok(outputs.join("\n"))
 }

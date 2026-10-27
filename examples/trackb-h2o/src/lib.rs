@@ -132,16 +132,13 @@ async fn main(input: Input) -> Result<Output> {
     let ws = WorkingSet::new();
     let page_size = kv_page_size();
 
-    if max_tokens == 0 {
-        return Err("max_tokens must be at least 1".into());
-    }
-
     // As `naive-baseline` opens, since the all-keep arm is compared against it.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
-    if prompt.is_empty() {
-        prompt.push(0);
-    }
+    let prompt: Vec<i32> = inferlet::chat::prefix()
+        .into_iter()
+        .chain(model::encode(&input.prompt))
+        .map(|t| t as i32)
+        .collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
     let kv_max = max_pages * page_size;
@@ -154,125 +151,102 @@ async fn main(input: Input) -> Result<Output> {
     let p_max = max_pages;
     let page_budget = input.page_budget.min(p_max);
 
-    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-
-    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let pipe = Pipeline::new();
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe).context("prefill submit")?;
+    }
 
-    let toks_p = Channel::from(&prompt_i32[..]);
-    let embed_indptr_p = Channel::from([0u32, n]);
-    let rng_p = Channel::from([input.seed, 0]);
-    let tok_out_p = Channel::new([1], dtype::i32);
-
-    let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
-    fwd_p.epilogue(move || {
-        let r = rng_p.take();
-        let logits = intrinsics::output(0, "logits");
-        let token = step(logits, temperature, &r);
-        tok_out_p.put(&token);
-        rng_p.put(&(&r + iota(2)));
-    });
-
-    fwd_p.submit(&pipe).context("prefill submit")?;
-
-    let g0 = tok_out_p
-        .take_host::<i32>()
-        .await
-        .context("prefill drain")?;
-    generated.push(g0 as u32);
-
+    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut last_scores: Vec<f32> = Vec::new();
     let mut last_page_mass: Vec<f32> = Vec::new();
     let mut layers_observed = 0u32;
     let layers_per_fire = layers;
-    let mut last_kv_len = n + 1;
+    let mut last_kv_len = 0;
     let mut trace: Vec<(u32, usize)> = Vec::new();
     let mut mass_trace: Vec<f32> = Vec::new();
 
     // A masked fire captures no scores, so the decode observes unmasked first, then enforces.
-    let decode_budget = max_tokens - generated.len();
     let enforce_tokens = input
         .enforce_tokens
-        .unwrap_or(decode_budget / 2)
-        .min(decode_budget);
-    let observe_fires = decode_budget - enforce_tokens;
+        .unwrap_or(max_tokens / 2)
+        .min(max_tokens);
+    let observe_fires = max_tokens - enforce_tokens;
 
     // ── OBSERVATION LOOP (1-wide, run-ahead), with the score tap. ──
-    if observe_fires > 0 {
-        let tok_in = Channel::from([g0]);
-        // `naive-baseline`'s salt, so the all-keep arm differs from it only by the mask.
-        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
-        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-        let lane1 = Channel::from([0u32, 1u32]);
+    let tok_in = Channel::from([last]);
+    let rng = Channel::from([input.seed, 0]);
+    let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+    let lane1 = Channel::from([0u32, 1u32]);
 
-        let seed: Vec<f32> = (0..kv_max)
-            .map(|i| SEED_SCALE * (kv_max - i) as f32 / kv_max as f32)
-            .collect();
-        let acc = Channel::from(seed);
+    let seed: Vec<f32> = (0..kv_max)
+        .map(|i| SEED_SCALE * (kv_max - i) as f32 / kv_max as f32)
+        .collect();
+    let acc = Channel::from(seed);
 
-        let scores_out = Channel::new([kv_max], dtype::f32).capacity(channel_capacity() as u32);
-        let page_mass_out = Channel::new([p_max], dtype::f32).capacity(channel_capacity() as u32);
+    let scores_out = Channel::new([kv_max], dtype::f32).capacity(channel_capacity() as u32);
+    let page_mass_out = Channel::new([p_max], dtype::f32).capacity(channel_capacity() as u32);
 
-        let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, &lane1)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, &lane1)?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
 
-        fwd.epilogue(move || {
-            let r = rng.take();
-            let logits = intrinsics::output(0, "logits");
-            let token = step(logits, temperature, &r);
+    fwd.epilogue(move || {
+        let r = rng.take();
+        let logits = intrinsics::output(0, "logits");
+        let token = step(logits, temperature, &r);
 
-            tok_in.put(&token);
-            tok_out.put(&token);
-            rng.put(&(&r + iota(2)));
+        tok_in.put(&token);
+        tok_out.put(&token);
+        rng.put(&(&r + iota(2)));
 
-            // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
-            let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
-            let fire_row = &reduce_sum(transpose(&rect)) / heads_f;
-            let prev = acc.take();
-            let folded = &prev + &gather(&fire_row, iota(kv_max));
-            scores_out.put(&folded);
-            acc.put(&folded);
+        // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
+        let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
+        let fire_row = &reduce_sum(transpose(&rect)) / heads_f;
+        let prev = acc.take();
+        let folded = &prev + &gather(&fire_row, iota(kv_max));
+        scores_out.put(&folded);
+        acc.put(&folded);
 
-            // Exact: `kv_max = p_max * page_size`.
-            page_mass_out.put(reduce_sum(reshape(&folded, [p_max, page_size])));
-        });
+        // Exact: `kv_max = p_max * page_size`.
+        page_mass_out.put(reduce_sum(reshape(&folded, [p_max, page_size])));
+    });
 
-        run_ahead(&pipe, &fwd, observe_fires, async || {
-            let t = tok_out
-                .take_host::<i32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            last_page_mass = page_mass_out
-                .take_host::<Vec<f32>>()
-                .await
-                .with_context(|| format!("page mass @{}", generated.len()))?;
-            last_scores = scores_out
-                .take_host::<Vec<f32>>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            // The prompt plus every token committed before this fire was live.
-            last_kv_len = n + generated.len() as u32;
-            layers_observed += layers_per_fire;
-            mass_trace.push(last_scores.iter().filter(|s| s.is_finite()).sum());
-            trace.push((
-                last_kv_len,
-                last_scores
-                    .iter()
-                    .rposition(|s| *s != 0.0)
-                    .map_or(0, |i| i + 1),
-            ));
-            generated.push(t as u32);
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    }
-    // Covers `observe_fires == 0`, where `run_ahead` (which closes it) never ran.
-    pipe.close();
+    run_ahead(&pipe, &fwd, observe_fires, async || {
+        let t = tok_out
+            .take_host::<i32>()
+            .await
+            .with_context(|| format!("@{}", generated.len()))?;
+        last_page_mass = page_mass_out
+            .take_host::<Vec<f32>>()
+            .await
+            .with_context(|| format!("page mass @{}", generated.len()))?;
+        last_scores = scores_out
+            .take_host::<Vec<f32>>()
+            .await
+            .with_context(|| format!("@{}", generated.len()))?;
+        // The prompt plus every token committed before this fire was live.
+        last_kv_len = n + generated.len() as u32;
+        layers_observed += layers_per_fire;
+        mass_trace.push(last_scores.iter().filter(|s| s.is_finite()).sum());
+        trace.push((
+            last_kv_len,
+            last_scores
+                .iter()
+                .rposition(|s| *s != 0.0)
+                .map_or(0, |i| i + 1),
+        ));
+        generated.push(t as u32);
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
 
-    let sel_len = n + generated.len() as u32 - 1;
+    let sel_len = n - 1 + generated.len() as u32;
     let sel_pages = sel_len.div_ceil(page_size).min(p_max);
     let mut sel_order: Vec<u32> = (0..sel_pages).collect();
     let mass_of = |p: u32| last_page_mass.get(p as usize).copied().unwrap_or(0.0);
@@ -295,14 +269,19 @@ async fn main(input: Input) -> Result<Output> {
         .filter(|k| **k)
         .count() as u32;
 
-    // A second pipeline: `run_ahead` closed the first when it spent its budget.
-    if enforce_tokens > 0 && generated.len() < max_tokens {
-        let pipe = Pipeline::new();
-        let last = *generated.last().expect("prefill emitted a token") as i32;
+    // `run_ahead` closed the first pipeline when it spent its budget. With
+    // no observation the fill is still in flight there, so the enforcement
+    // runs on it.
+    let pipe = if observe_fires > 0 {
+        Pipeline::new()
+    } else {
+        pipe
+    };
+    if enforce_tokens > 0 {
         let at = sel_len;
-        let tok_in = Channel::from([last]);
+        let tok_in = Channel::from([generated.last().map_or(last, |&t| t as i32)]);
         // Resume the Gumbel stream: each observation fire advanced `[s, k]` to `[s, k + 1]`.
-        let rng = Channel::from([input.seed ^ 0x5bd1, observe_fires as u32]);
+        let rng = Channel::from([input.seed, observe_fires as u32]);
         let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
         let lane1 = Channel::from([0u32, 1u32]);
         let fill = Channel::from([at + 1]);
@@ -348,6 +327,7 @@ async fn main(input: Input) -> Result<Output> {
         })
         .await?;
     }
+    pipe.close();
 
     let live = (last_kv_len as usize).min(last_scores.len());
     let live_pages = last_kv_len.div_ceil(page_size).min(p_max);

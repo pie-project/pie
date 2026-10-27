@@ -42,8 +42,6 @@ async def main(input: dict) -> str:
     B = int(input.get("beams", 2))
     if B == 0:
         raise ValueError("beams must be at least 1")
-    if max_steps == 0:
-        return ""
 
     v = model.output_vocab_size()
 

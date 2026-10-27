@@ -316,28 +316,24 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-
-    if max_tokens == 0 {
-        return Ok(Output {
-            sampler: "dry",
-            text: String::new(),
-            count: 0,
-            multiplier: input.multiplier,
-            base: input.base,
-            allowed_length: input.allowed_length,
-            max_ngram: input.max_ngram,
-            mean_penalized: 0.0,
-            peak_penalty: 0.0,
-            longest_repeat: 0,
-        });
-    }
+    let pipe = Pipeline::new();
 
     // The model's opening (`<bos>` where it has one) before the raw text: a
     // gemma without it answers noise.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
-    if prompt.is_empty() {
-        prompt.push(0);
+    let prompt: Vec<i32> = inferlet::chat::prefix()
+        .into_iter()
+        .chain(model::encode(&input.prompt))
+        .map(|t| t as i32)
+        .collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe).context("prefill submit")?;
     }
     let n = prompt.len() as u32;
 
@@ -352,110 +348,61 @@ async fn main(input: Input) -> Result<Output> {
 
     // The history buffer is the prompt padded out with a sentinel no token can
     // equal, so unwritten lanes never register a match.
-    let mut history: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    let mut history = prompt.clone();
     history.resize(cfg.capacity as usize, -1);
 
-    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-
-    // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
-    let toks_p = Channel::from_iter(history.iter().take(n as usize).copied());
-    let embed_indptr_p = Channel::from([0u32, n]);
-    let rng_p = Channel::from([input.seed, 0]);
-    let hist_p = Channel::from(history.clone());
-    let hlen_p = Channel::from([n]);
-    let tok_out_p = Channel::new([1], dtype::i32);
-    let cnt_out_p = Channel::new([1], dtype::f32);
-    let peak_out_p = Channel::new([1], dtype::f32);
-
-    let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
-    fwd_p.epilogue(move || {
-        let r = rng_p.take();
-        let hist = hist_p.take();
-        let hlen = hlen_p.take();
-        let logits = intrinsics::output(0, "logits");
-        let (token, hist_next, count, peak) = step(logits, vocab, cfg, &hist, &hlen, &r);
-        let r_next = &r + iota(2);
-        tok_out_p.put(&token);
-        cnt_out_p.put(&count);
-        peak_out_p.put(&peak);
-        hist_p.put(&hist_next);
-        hlen_p.put(&hlen + 1u32);
-        rng_p.put(&r_next);
-    });
-
-    let pipe = Pipeline::new();
-    fwd_p.submit(&pipe).context("prefill submit")?;
-
-    let g0 = tok_out_p.take_host::<i32>().await?;
-    let c0 = cnt_out_p.take_host::<f32>().await?;
-    let k0 = peak_out_p.take_host::<f32>().await?;
-    generated.push(g0 as u32);
     // The per-step statistics accumulate on the device — a running sum of
     // penalized counts and a running peak — and ride out beside the token in
     // one `[3]` cell, so a token costs one host round trip, not three.
-    let cnt_sum = Channel::from([c0]);
-    let peak_max = Channel::from([k0]);
-    let mut total_penalized = c0;
-    let mut peak = k0;
+    let tok_in = Channel::from([last]);
+    let rng = Channel::from([input.seed, 0]);
+    let hist_c = Channel::from(history);
+    let hlen_c = Channel::from([n]);
+    let cnt_sum = Channel::from([0.0f32]);
+    let peak_max = Channel::from([0.0f32]);
+    let out = Channel::new([3], dtype::f32).capacity(channel_capacity() as u32);
 
-    // ── DECODE LOOP (1-wide, run-ahead). ──
-    if generated.len() < max_tokens {
-        // The decode pass owns fresh channels, so the history has to be handed
-        // over explicitly, already carrying the prefill's token.
-        history[n as usize] = g0;
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, &Channel::from([0u32, 1]))?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
+    fwd.epilogue(move || {
+        let cnt_so_far = cnt_sum.take();
+        let peak_so_far = peak_max.take();
+        let r = rng.take();
+        let hist = hist_c.take();
+        let hlen = hlen_c.take();
+        let logits = intrinsics::output(0, "logits");
+        let (token, hist_next, count, peak) = step(logits, vocab, cfg, &hist, &hlen, &r);
+        let r_next = &r + iota(2);
+        tok_in.put(&token);
+        let cnt_next = &cnt_so_far + &count;
+        let peak_next = max_elem(&peak_so_far, &peak);
+        out.put(pack3(
+            &cast(reshape(&token, [1]), dtype::f32),
+            &cnt_next,
+            &peak_next,
+        ));
+        cnt_sum.put(&cnt_next);
+        peak_max.put(&peak_next);
+        hist_c.put(&hist_next);
+        hlen_c.put(&hlen + 1u32);
+        rng.put(&r_next);
+    });
 
-        let tok_in = Channel::from([g0]);
-        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
-        let hist_c = Channel::from(history.clone());
-        let hlen_c = Channel::from([n + 1]);
-        let out = Channel::new([3], dtype::f32).capacity(channel_capacity() as u32);
-        let lane1 = Channel::from([0u32, 1u32]);
-
-        let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, &lane1)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
-        fwd.epilogue(move || {
-            // Takes and compute first, puts last (value-id discipline).
-            let cnt_so_far = cnt_sum.take();
-            let peak_so_far = peak_max.take();
-            let r = rng.take();
-            let hist = hist_c.take();
-            let hlen = hlen_c.take();
-            let logits = intrinsics::output(0, "logits");
-            let (token, hist_next, count, peak) = step(logits, vocab, cfg, &hist, &hlen, &r);
-
-            let r_next = &r + iota(2);
-
-            tok_in.put(&token);
-            let cnt_next = &cnt_so_far + &count;
-            let peak_next = max_elem(&peak_so_far, &peak);
-            out.put(pack3(
-                &cast(reshape(&token, [1]), dtype::f32),
-                &cnt_next,
-                &peak_next,
-            ));
-            cnt_sum.put(&cnt_next);
-            peak_max.put(&peak_next);
-            hist_c.put(&hist_next);
-            hlen_c.put(&hlen + 1u32);
-            rng.put(&r_next);
-        });
-
-        let budget = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget, async || {
-            let v = out
-                .take_host::<Vec<f32>>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            generated.push(v[0] as u32);
-            total_penalized = v[1];
-            peak = v[2];
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    }
+    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut total_penalized = 0.0f32;
+    let mut peak = 0.0f32;
+    run_ahead(&pipe, &fwd, max_tokens, async || {
+        let v = out
+            .take_host::<Vec<f32>>()
+            .await
+            .with_context(|| format!("@{}", generated.len()))?;
+        generated.push(v[0] as u32);
+        total_penalized = v[1];
+        peak = v[2];
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipe.close();
 
     // The history is device state, so prove the scan actually saw it: with a
@@ -467,7 +414,7 @@ async fn main(input: Input) -> Result<Output> {
         );
     }
 
-    let mut full = prompt.clone();
+    let mut full: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
     full.extend_from_slice(&generated);
     Ok(Output {
         sampler: "dry",
@@ -477,7 +424,7 @@ async fn main(input: Input) -> Result<Output> {
         base: cfg.base,
         allowed_length: cfg.allowed_length,
         max_ngram: cfg.max_ngram,
-        mean_penalized: total_penalized / generated.len() as f32,
+        mean_penalized: total_penalized / generated.len().max(1) as f32,
         peak_penalty: peak,
         longest_repeat: longest_repeat(&full),
     })

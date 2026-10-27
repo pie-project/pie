@@ -42,92 +42,64 @@ export function main(input) {
 
   const vocab = model.outputVocabSize();
   const ws = new WorkingSet();
-  if (maxTokens === 0) return { sampler: 'top-a', text: '', count: 0, a, mean_kept: 0, min_kept: 0, mean_mass: 0 };
+  const pipe = new Pipeline();
 
   // The model's opening (`<bos>` where it has one) before the raw text: a
   // gemma without it answers noise.
-  let prompt = [...chat.prefix(), ...model.encode(promptText)];
-  if (prompt.length === 0) prompt = [0];
-  const n = prompt.length;
+  const head = [...chat.prefix(), ...model.encode(promptText)];
+  const last = head.pop();
+  if (last === undefined) throw new Error('empty prompt');
+  if (head.length > 0) {
+    const fill = new ForwardPass();
+    fill.embed(Channel.from(head, dtype.i32), Channel.from([0, head.length], dtype.u32));
+    fill.state([ws], { fold: 'all' });
+    pipe.submit(fill);
+  }
+
+  const cap = channelCapacity();
+  const tokIn = Channel.from([last], dtype.i32);
+  const rng = Channel.from([seed, 0], dtype.u32);
+  const tokOut = new Channel([1], dtype.i32).capacity(cap);
+  const s1Out = new Channel([1], dtype.f32).capacity(cap);
+  const s2Out = new Channel([1], dtype.f32).capacity(cap);
+
+  const fwd = new ForwardPass();
+  fwd.embed(tokIn, Channel.from([0, 1], dtype.u32));
+  fwd.state([ws], { fold: 'all' });
+  fwd.epilogue(() => {
+    const r = rng.take();
+    const logits = intrinsics.output(0, 'logits');
+    const [token, kept, mass] = step(logits, vocab, a, temperature, r);
+    const rNext = r.add(iota(2));
+    tokIn.put(token);
+    tokOut.put(token);
+    s1Out.put(kept);
+    s2Out.put(mass);
+    rng.put(rNext);
+  });
 
   const generated = [];
   const s1 = [];
   const s2 = [];
-
-  // ── PREFILL FIRE (N-wide) ──
-  const toksP = Channel.from(prompt, dtype.i32);
-  const embedIndptrP = Channel.from([0, n], dtype.u32);
-  const rngP = Channel.from([seed, 0], dtype.u32);
-  const tokOutP = new Channel([1], dtype.i32);
-  const s1OutP = new Channel([1], dtype.f32);
-  const s2OutP = new Channel([1], dtype.f32);
-
-  const fwdP = new ForwardPass();
-  fwdP.embed(toksP, embedIndptrP);
-  fwdP.state([ws], { fold: 'all' });
-  fwdP.epilogue(() => {
-    const r = rngP.take();
-    const logits = intrinsics.output(0, 'logits');
-    const [token, kept, mass] = step(logits, vocab, a, temperature, r);
-    const rNext = r.add(iota(2));
-    tokOutP.put(token);
-    s1OutP.put(kept);
-    s2OutP.put(mass);
-    rngP.put(rNext);
+  pipe.runAhead(fwd, maxTokens, () => {
+    generated.push(tokOut.takeScalar());
+    s1.push(s1Out.takeScalar());
+    s2.push(s2Out.takeScalar());
+    return true;
   });
-
-  const pipe = new Pipeline();
-  pipe.submit(fwdP);
-  generated.push(tokOutP.takeScalar());
-  s1.push(s1OutP.takeScalar());
-  s2.push(s2OutP.takeScalar());
-
-  // ── DECODE LOOP (1-wide, run-ahead) ──
-  if (generated.length < maxTokens) {
-    const cap = channelCapacity();
-    const tokIn = Channel.from([generated[0]], dtype.i32);
-    const rng = Channel.from([seed ^ 0x5bd1, 0], dtype.u32);
-    const tokOut = new Channel([1], dtype.i32).capacity(cap);
-    const s1Out = new Channel([1], dtype.f32).capacity(cap);
-    const s2Out = new Channel([1], dtype.f32).capacity(cap);
-    const lane1 = Channel.from([0, 1], dtype.u32);
-
-    const fwd = new ForwardPass();
-    fwd.embed(tokIn, lane1);
-    fwd.state([ws], { fold: 'all' });
-    fwd.epilogue(() => {
-      const r = rng.take();
-      const logits = intrinsics.output(0, 'logits');
-      const [token, kept, mass] = step(logits, vocab, a, temperature, r);
-      const rNext = r.add(iota(2));
-      tokIn.put(token);
-      tokOut.put(token);
-      s1Out.put(kept);
-      s2Out.put(mass);
-      rng.put(rNext);
-    });
-
-    pipe.runAhead(fwd, maxTokens - 1, () => {
-      generated.push(tokOut.takeScalar());
-      s1.push(s1Out.takeScalar());
-      s2.push(s2Out.takeScalar());
-      return true;
-    });
-  }
   pipe.close();
 
-  const meanS1 = s1.reduce((x, y) => x + y, 0) / s1.length;
-  const meanS2 = s2.reduce((x, y) => x + y, 0) / s2.length;
-  const minS1 = Math.max(Math.min(...s1), 0);
-  if (minS1 === 0) throw new Error('top-a keep-set was empty — the peak token was masked out');
+  const mean = (v) => v.reduce((x, y) => x + y, 0) / Math.max(v.length, 1);
+  const minS1 = s1.length ? Math.max(Math.min(...s1), 0) : 0;
+  if (s1.length && minS1 === 0) throw new Error('top-a keep-set was empty — the peak token was masked out');
   return {
     sampler: 'top-a',
     text: model.decode(generated),
     count: generated.length,
     a,
-    mean_kept: meanS1,
+    mean_kept: mean(s1),
     min_kept: Math.trunc(minS1),
-    mean_mass: meanS2,
+    mean_mass: mean(s2),
     tokens: generated,
   };
 }

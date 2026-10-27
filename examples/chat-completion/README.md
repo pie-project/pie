@@ -19,7 +19,8 @@ Other inferlets use it as a reference for output-equivalence checks, and
 The harness validates the production chat skeleton:
 
 - chat-template tokenization of system, user, and assistant cue;
-- one prefill pass followed by a 1-wide decode loop;
+- one epilogue-free prefill of the prompt head, then a 1-wide decode loop
+  seeded with the prompt's last token;
 - nucleus sampling at positive temperature and exact greedy decoding at
   `temperature = 0`;
 - host-side streaming and stop-token handling.
@@ -36,8 +37,7 @@ The harness validates the production chat skeleton:
 
 ## Implementation notes
 
-The prefill epilogue samples the first token and mirrors it to the host. The
-decode pass then carries the token and RNG state through device channels; where
+The decode pass carries the token and RNG state through device channels; where
 each token's row lands is the runtime's. The host drains tokens only for
 streaming text and stop checks; it does not feed the sampled token back into the
 next pass.

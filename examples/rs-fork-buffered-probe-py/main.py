@@ -3,9 +3,9 @@
 Forks a hybrid model's working set while rows it wrote are not yet frozen
 into its recurrent state.
 
-Prefill a prompt (freeze everything), decode `at` tokens one at a time (each
-fire freezes the last fire's row and leaves its own unfrozen), then at that
-point:
+Prefill all but the prompt's last token (freeze everything), fire that token
+and decode `at` tokens one at a time (each fire freezes the last fire's row and
+leaves its own unfrozen), then at that point:
 
   none    do nothing
   fork    fork the working set and keep the fork alive
@@ -34,7 +34,7 @@ async def fire(ws, pipe, tokens, fold):
     ids = Channel.from_(tokens, dtype.i32)
     embed_indptr = Channel.from_([0, n], dtype.u32)
     out = Channel([1], dtype.i32)
-    fold = "all" if fold is None else Channel.from_([fold], dtype.u32)
+    fold = Channel.from_([fold], dtype.u32)
 
     fwd = ForwardPass()
     fwd.embed(ids, embed_indptr)
@@ -81,8 +81,16 @@ async def main(input: dict) -> str:
     pipe = Pipeline()
     ws = WorkingSet()
     tokens = chat.prefix() + model.encode(prompt)
-    seq = Seq(ws, await fire(ws, pipe, tokens, None), 0)
-    for _ in range(at):
+    if not tokens:
+        raise ValueError("empty prompt")
+    *head, last = tokens
+    if head:
+        fill = ForwardPass()
+        fill.embed(Channel.from_(head, dtype.i32), Channel.from_([0, len(head)], dtype.u32))
+        fill.state([ws], StateGeometry.folding())
+        pipe.submit(fill)
+    seq = Seq(ws, last, 0)
+    for _ in range(at + 1):
         await seq.step(pipe)
 
     keep, out = [], []

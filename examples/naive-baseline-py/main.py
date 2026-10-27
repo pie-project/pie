@@ -1,10 +1,10 @@
 """Naive text completion — the Python twin of `naive-baseline`.
 
-One N-wide prefill fire, then a device-carried decode loop driven by
-`run_ahead`, which keeps the runtime's run-ahead window full ahead of the host
-drain. The epilogue temperature-scales the logits and draws a Gumbel-max
-sample; `stats` adds the two extra `[1]` f32 drains the algorithm inferlets
-carry. Traces to the same container bytes as the Rust inferlet.
+An epilogue-free fill of the prompt head, then a device-carried decode loop
+from the prompt's last token, driven by `run_ahead`, which keeps the runtime's
+run-ahead window full ahead of the host drain. The epilogue temperature-scales
+the logits and draws a Gumbel-max sample; `stats` adds the two extra `[1]` f32
+drains the algorithm inferlets carry. Traces to the same container bytes as the Rust inferlet.
 """
 
 from inferlet import chat, model
@@ -41,91 +41,55 @@ async def main(input: dict) -> dict:
         raise ValueError("temperature must be finite and greater than 0")
 
     ws = WorkingSet()
-
-    if max_tokens == 0:
-        return {"sampler": "naive-baseline-py", "text": "", "tokens": [], "count": 0, "stats": want_stats}
+    pipe = Pipeline()
 
     # The model's opening (`<bos>` where it has one) before the raw text.
     prompt = list(chat.prefix()) + list(model.encode(prompt_text))
     if not prompt:
-        prompt = [0]
-    n = len(prompt)
+        raise ValueError("empty prompt")
+    *head, last = prompt
+    if head:
+        fill = ForwardPass()
+        fill.embed(Channel.from_(head, dtype.i32), Channel.from_([0, len(head)], dtype.u32))
+        fill.state([ws], StateGeometry.folding())
+        pipe.submit(fill)
 
-    generated: list[int] = []
-    pipe = Pipeline()
+    cap = channel_capacity()
+    tok_in = Channel.from_([last], dtype.i32)
+    rng = Channel.from_([seed, 0], dtype.u32)
+    tok_out = Channel([1], dtype.i32).capacity(cap)
+    s1_out = Channel([1], dtype.f32).capacity(cap)
+    s2_out = Channel([1], dtype.f32).capacity(cap)
 
-    toks_p = Channel.from_(prompt, dtype.i32)
-    embed_indptr_p = Channel.from_([0, n], dtype.u32)
-    rng_p = Channel.from_([seed, 0], dtype.u32)
-    tok_out_p = Channel([1], dtype.i32)
-    s1_out_p = Channel([1], dtype.f32)
-    s2_out_p = Channel([1], dtype.f32)
+    fwd = ForwardPass()
+    fwd.embed(tok_in, Channel.from_([0, 1], dtype.u32))
+    fwd.state([ws], StateGeometry.folding())
 
-    fwd_p = ForwardPass()
-    fwd_p.embed(toks_p, embed_indptr_p)
-    fwd_p.state([ws], StateGeometry.folding())
-
-    @fwd_p.epilogue
-    def _prefill_epilogue():
-        r = rng_p.take()
+    @fwd.epilogue
+    def _():
+        r = rng.take()
         logits = intrinsics.output(0, "logits")
         token = step(logits, temperature, r)
         r_next = r + iota(2)
-        tok_out_p.put(token)
+        tok_in.put(token)
+        tok_out.put(token)
         if want_stats:
             mirror = reshape(cast(token, dtype.f32), [1])
-            s1_out_p.put(mirror)
-            s2_out_p.put(mirror)
-        rng_p.put(r_next)
+            s1_out.put(mirror)
+            s2_out.put(mirror)
+        rng.put(r_next)
 
-    pipe.submit(fwd_p)
-    g0 = await tok_out_p.take_scalar()
-    if want_stats:
-        await s1_out_p.take_host()
-        await s2_out_p.take_host()
-    generated.append(g0)
+    generated: list[int] = []
 
-    # ── DECODE LOOP (1-wide, run-ahead). ──
-    if len(generated) < max_tokens:
-        cap = channel_capacity()
-        tok_in = Channel.from_([g0], dtype.i32)
-        rng = Channel.from_([seed ^ 0x5BD1, 0], dtype.u32)
-        tok_out = Channel([1], dtype.i32).capacity(cap)
-        s1_out = Channel([1], dtype.f32).capacity(cap)
-        s2_out = Channel([1], dtype.f32).capacity(cap)
-        lane1 = Channel.from_([0, 1], dtype.u32)
+    async def on_token() -> bool:
+        t = await tok_out.take_scalar()
+        if want_stats:
+            await s1_out.take_host()
+            await s2_out.take_host()
+        generated.append(t)
+        return True
 
-        fwd = ForwardPass()
-        fwd.embed(tok_in, lane1)
-        fwd.state([ws], StateGeometry.folding())
-
-        @fwd.epilogue
-        def _decode_epilogue():
-            r = rng.take()
-            logits = intrinsics.output(0, "logits")
-            token = step(logits, temperature, r)
-
-            r_next = r + iota(2)
-
-            tok_in.put(token)
-            tok_out.put(token)
-            if want_stats:
-                mirror = reshape(cast(token, dtype.f32), [1])
-                s1_out.put(mirror)
-                s2_out.put(mirror)
-            rng.put(r_next)
-
-        budget = max_tokens - 1
-
-        async def on_token() -> bool:
-            t = await tok_out.take_scalar()
-            if want_stats:
-                await s1_out.take_host()
-                await s2_out.take_host()
-            generated.append(t)
-            return True
-
-        await pipe.run_ahead(fwd, budget, on_token)
+    await pipe.run_ahead(fwd, max_tokens, on_token)
     pipe.close()
 
     return {

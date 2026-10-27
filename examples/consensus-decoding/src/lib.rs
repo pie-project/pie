@@ -80,10 +80,8 @@ async fn main(input: Input) -> Result<String> {
     // it folds into the shared prefill.
     let mut prefix = chat::system_user(SYSTEM_PROMPT, &question);
     prefix.extend(chat::cue());
-    if prefix.is_empty() {
-        prefix.push(0);
-    }
-    let n = prefix.len() as u32;
+    let prefix: Vec<i32> = prefix.into_iter().map(|t| t as i32).collect();
+    let (&last, head) = prefix.split_last().ok_or("empty prompt")?;
 
     println!(
         "--- Generating {} candidates in parallel ---",
@@ -92,59 +90,64 @@ async fn main(input: Input) -> Result<String> {
 
     let mut cand_tokens: Vec<Vec<u32>> = vec![Vec::new(); num_candidates];
 
-    if max_tokens > 0 {
-        let ws = WorkingSet::new();
+    let ws = WorkingSet::new();
+    let pipe = Pipeline::new();
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe).context("prefill submit")?;
+    }
+    let candidates_ws = (0..num_candidates)
+        .map(|_| ws.fork(&pipe))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("fork the shared prefix")?;
+    let lanes_ws: Vec<&WorkingSet> = candidates_ws.iter().collect();
 
-        let prefix_i32: Vec<i32> = prefix.iter().map(|&t| t as i32).collect();
-        let toks_p = Channel::from(prefix_i32); // [N] i32 (seeded)
-        let embed_indptr_p = Channel::from([0u32, n]);
-        let rng_p = Channel::from([0x51ed_u32, 0]);
-        let g0s_ch = Channel::new([1], dtype::i32);
+    // ──────────────── BATCHED DECODE (B lanes = candidates) ────────────────
+    let tok_in = Channel::from(vec![last; num_candidates]); // [B] device loop-carried
+    let out = Channel::new([b], dtype::i32).capacity(channel_capacity() as u32);
+    let rng = Channel::from([0x9e37_u32, 0]);
+    let lanes = Channel::from((0..=b).collect::<Vec<u32>>());
 
-        let fwd_p = ForwardPass::new();
-        fwd_p.embed(&toks_p, &embed_indptr_p)?;
-        fwd_p.state(&[&ws], StateGeometry::folding())?;
-        fwd_p.epilogue(move || {
-            let r = rng_p.take();
-            // Nucleus sample the single read-out row. The B candidates all start
-            // from this same token; divergence comes from the decode loop, whose
-            // logits really are [B, vocab] and therefore carry B independent
-            // Gumbel draws.
-            //
-            // Do NOT `broadcast` the read-out row to [B, vocab] here. The
-            // compiler still matches `LibraryOp::NucleusSample` on the widened
-            // form, but the engine's library fast path assumes its logits input
-            // is the logits intrinsic (behind at most a reshape) and elides the
-            // scratch for it (`fused_runtime.cuh` nucleus prep). A `broadcast`
-            // producer still executes and writes a full [B, vocab] tensor into
-            // that elided 4-byte slot, corrupting the sampler's scratch — the
-            // failure is silent and yields plausible-looking junk tokens.
-            let logits = intrinsics::output(0, "logits"); // [1, vocab] (single read-out row)
-            let scaled = &reshape(&logits, [1, vocab]) / temperature;
-            let probs = softmax(&scaled);
-            let keep = pivot_threshold(&probs, cummass_le(top_p));
-            let masked = mask_apply(&scaled, &keep); // [1, vocab]
-            let g = gumbel(&r, [1, vocab]);
-            let toks0 = reduce_argmax(&masked + &g); // [1] i32
-            let r_next = &r + iota(2); // advance ctr: [key, ctr+1]
-            g0s_ch.put(&toks0);
-            rng_p.put(&r_next);
-        });
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, &lanes)?;
+    fwd.state(&lanes_ws, StateGeometry::folding())?;
+    fwd.epilogue(move || {
+        // TAKES + compute first, PUTS last (value-id discipline).
+        let r = rng.take();
 
-        let pipe = Pipeline::new();
-        fwd_p.submit(&pipe).context("prefill submit")?;
-        let candidates_ws = (0..num_candidates)
-            .map(|_| ws.fork(&pipe))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("fork the shared prefix")?;
-        let lanes_ws: Vec<&WorkingSet> = candidates_ws.iter().collect();
-        let g0s: Vec<i32> = g0s_ch.take_host::<Vec<i32>>().await?;
-        // All B candidates share the prefill's token; they diverge in the decode
-        // loop, where each lane draws its own Gumbel noise.
-        let g0s: Vec<i32> = vec![g0s[0]; num_candidates];
+        // Per-lane top-p + temperature sample over [B, vocab] logits
+        // (row-wise nucleus, independent Gumbel noise per lane).
+        // B=1 arrives squeezed to `[vocab]`; B>=2 must stay the bare intrinsic,
+        // or the fused nucleus fast path is skipped and the sample comes back empty.
+        let logits = if b == 1 {
+            reshape(intrinsics::output(0, "logits"), [b, vocab])
+        } else {
+            intrinsics::output(0, "logits")
+        }; // [B, vocab]
+        let scaled = &logits / temperature;
+        let probs = softmax(&scaled);
+        let keep = pivot_threshold(&probs, cummass_le(top_p));
+        let masked = mask_apply(&scaled, &keep);
+        let g = gumbel(&r, [b, vocab]);
+        let toks = reduce_argmax(&masked + &g); // [B] i32
+        let r_next = &r + iota(2);
 
-        let mut done = vec![false; num_candidates];
-        for (c, &t) in g0s.iter().enumerate().take(num_candidates) {
+        tok_in.put(&toks);
+        out.put(&toks);
+        rng.put(&r_next);
+    });
+    let mut done = vec![false; num_candidates];
+    run_ahead(&pipe, &fwd, max_tokens, async || {
+        let step: Vec<i32> = out.take_host::<Vec<i32>>().await?;
+        for (c, &t) in step.iter().enumerate().take(num_candidates) {
+            if done[c] {
+                continue; // lane keeps firing; its output is ignored
+            }
             let t = t as u32;
             if stop.contains(&t) {
                 done[c] = true;
@@ -152,69 +155,15 @@ async fn main(input: Input) -> Result<String> {
                 cand_tokens[c].push(t);
             }
         }
-
-        // ──────────────── 2. BATCHED DECODE (B lanes = candidates) ────────────
-        let tok_in = Channel::from(g0s.clone()); // [B] device loop-carried
-        let out = Channel::new([b], dtype::i32).capacity(channel_capacity() as u32);
-        let rng = Channel::from([0x9e37_u32, 0]);
-        let lanes = Channel::from((0..=b).collect::<Vec<u32>>());
-
-        let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, &lanes)?;
-        fwd.state(&lanes_ws, StateGeometry::folding())?;
-        fwd.epilogue(move || {
-            // TAKES + compute first, PUTS last (value-id discipline).
-            let r = rng.take();
-
-            // Per-lane top-p + temperature sample over [B, vocab] logits
-            // (row-wise nucleus, independent Gumbel noise per lane).
-            // B=1 arrives squeezed to `[vocab]`; B>=2 must stay the bare intrinsic,
-            // or the fused nucleus fast path is skipped and the sample comes back empty.
-            let logits = if b == 1 {
-                reshape(intrinsics::output(0, "logits"), [b, vocab])
-            } else {
-                intrinsics::output(0, "logits")
-            }; // [B, vocab]
-            let scaled = &logits / temperature;
-            let probs = softmax(&scaled);
-            let keep = pivot_threshold(&probs, cummass_le(top_p));
-            let masked = mask_apply(&scaled, &keep);
-            let g = gumbel(&r, [b, vocab]);
-            let toks = reduce_argmax(&masked + &g); // [B] i32
-            let r_next = &r + iota(2);
-
-            tok_in.put(&toks);
-            out.put(&toks);
-            rng.put(&r_next);
-        });
-        let budget = if done.iter().any(|d| !d) {
-            max_tokens.saturating_sub(1) // the prefill's g0s already emitted
-        } else {
-            0
-        };
-        run_ahead(&pipe, &fwd, budget, async || {
-            let step: Vec<i32> = out.take_host::<Vec<i32>>().await?;
-            for (c, &t) in step.iter().enumerate().take(num_candidates) {
-                if done[c] {
-                    continue; // lane keeps firing; its output is ignored
-                }
-                let t = t as u32;
-                if stop.contains(&t) {
-                    done[c] = true;
-                } else {
-                    cand_tokens[c].push(t);
-                }
-            }
-            if done.iter().all(|d| *d) {
-                return Ok(ControlFlow::Break(()));
-            }
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-        // Any fire still in flight after an early stop is left untaken; close
-        // releases the scheduler wait-set and reclaims them.
-        pipe.close();
-    }
+        if done.iter().all(|d| *d) {
+            return Ok(ControlFlow::Break(()));
+        }
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
+    // Any fire still in flight after an early stop is left untaken; close
+    // releases the scheduler wait-set and reclaims them.
+    pipe.close();
 
     let candidates: Vec<String> = cand_tokens
         .iter()
