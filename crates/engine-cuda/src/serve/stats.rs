@@ -139,10 +139,6 @@ impl Shell {
         self.cache.body_stats()
     }
 
-    pub fn keep_graphs(&mut self, keep: bool) {
-        self.cache.keep_graphs(keep);
-    }
-
     #[must_use]
     pub fn streams(&self) -> (u32, u32, usize, usize) {
         (

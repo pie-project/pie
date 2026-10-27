@@ -836,11 +836,6 @@ impl Shell {
         Ok(self.programs.instance_mut(instance_id))
     }
 
-    #[must_use]
-    pub fn channel_predictions(&self) -> Vec<(engine::InstanceId, Vec<crate::program::Cursor>)> {
-        self.programs.predictions()
-    }
-
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
         self.reap_landed_guests()?;
         self.programs.close_instance(instance_id)

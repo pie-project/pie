@@ -134,11 +134,6 @@ impl PhysicalPool {
     }
 
     #[must_use]
-    pub const fn utilization(&self) -> f64 {
-        self.utilization
-    }
-
-    #[must_use]
     pub const fn page_bytes(&self) -> u64 {
         LOGICAL_PAGE_BYTES
     }
@@ -189,11 +184,6 @@ impl PhysicalPool {
     #[must_use]
     pub const fn high_water_pages(&self) -> u64 {
         self.high_water_pages
-    }
-
-    #[must_use]
-    pub const fn handle_bytes(&self) -> u64 {
-        self.handle_bytes
     }
 
     /// What the pool can still take: the budget past what is committed and
