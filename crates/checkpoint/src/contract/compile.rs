@@ -154,10 +154,6 @@ pub struct CopyList {
 }
 
 impl CopyList {
-    pub fn pieces(&self) -> Vec<Piece> {
-        fold(self.runs.iter().map(seed).collect())
-    }
-
     pub fn cost(&self) -> usize {
         self.copy_pieces().len() + usize::from(self.needs_zero_fill())
     }
