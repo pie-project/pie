@@ -824,13 +824,13 @@ fn a_selection_reads_its_named_blocks_and_the_open_one() {
         .run(|ctx| {
             low::attend(
                 ctx,
-                attn::decode_selected(qt, &dplan, st, None, d as u32, scale, ratio, o1)?,
+                attn::decode_selected(qt, &dplan, st, None, d as u32, scale, ratio, false, o1)?,
                 kv,
             )?;
             low::attend(
                 ctx,
                 attn::prefill_selected(
-                    qr, &pplan, st, &kv, None, d as u32, kvh as u32, scale, ratio, o2,
+                    qr, &pplan, st, &kv, None, d as u32, kvh as u32, scale, ratio, false, o2,
                 )?,
                 kv,
             )
@@ -859,6 +859,98 @@ fn a_selection_reads_its_named_blocks_and_the_open_one() {
         &no_bias,
         &unit,
     );
+    check_rows(&b.read_f32(o1), &want, qh * d, rows - 1, 1e-3);
+    check_rows(&b.read_f32(o2), &want, qh * d, rows - 1, 1e-3);
+}
+
+#[test]
+fn a_per_head_selection_reads_each_kv_heads_own_blocks() {
+    let mut rng = Rng(22);
+    let (qh, kvh, d) = (4, 2, 64);
+    let pool = Pool::new(
+        &mut rng,
+        8,
+        kvh,
+        d,
+        8,
+        vec![vec![7, 2, 5], vec![1, 0, 3, 6]],
+        4,
+    );
+    let (top_k, ratio) = (2usize, 4u32);
+    let runs = [(0, 17, 3), (1, 5, 2), (1, 29, 1)];
+    let fire = Fire::plain(&prefill_rows(&runs, 1));
+    let rows = fire.positions.len();
+    // Per row, kv head 0's run, then kv head 1's (block_max's layout).
+    let sel: Vec<i32> = vec![
+        0, 3, 1, 4, //
+        2, -1, 0, 1, //
+        1, 4, 3, 4, //
+        0, -1, 1, -1, //
+        1, 7, 0, 2, //
+        5, 7, 2, 6, //
+        0, 0, 0, 0,
+    ];
+    let q = rng.bf16s(rows * qh * d, 1.0);
+    let scale = 0.125;
+    let mut b = Bench::new();
+    let kv = pool.bind(&mut b);
+    let dplan = fire.decode(&mut b);
+    let pplan = fire.prefill(&mut b);
+    let st = b.i32(rows as u32, (kvh * top_k) as u32, &sel);
+    let qt = b.bf16(rows as u32, (qh * d) as u32, &q);
+    let qr = ragged(&mut b, &runs, qt);
+    let o1 = b.zeros(Dtype::Bf16, rows as u32, (qh * d) as u32);
+    let o2 = b.zeros(Dtype::Bf16, rows as u32, (qh * d) as u32);
+    if !b
+        .run(|ctx| {
+            low::attend(
+                ctx,
+                attn::decode_selected(qt, &dplan, st, None, d as u32, scale, ratio, true, o1)?,
+                kv,
+            )?;
+            low::attend(
+                ctx,
+                attn::prefill_selected(
+                    qr, &pplan, st, &kv, None, d as u32, kvh as u32, scale, ratio, true, o2,
+                )?,
+                kv,
+            )
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let g = qh / kvh;
+    let mut want = vec![0.0f32; rows * qh * d];
+    for j in 0..kvh {
+        let run: Vec<i32> = (0..rows)
+            .flat_map(|r| sel[(r * kvh + j) * top_k..(r * kvh + j + 1) * top_k].to_vec())
+            .collect();
+        let (o, _) = sdpa(
+            &q,
+            rows,
+            qh,
+            kvh,
+            d,
+            d,
+            &pool.keys,
+            &pool.values,
+            f64::from(scale),
+            &|r| {
+                let lane = fire.req[r] as usize;
+                selected_kps(&fire, &run, top_k, ratio as i32, r)
+                    .into_iter()
+                    .map(|kp| pool.slot(lane, kp))
+                    .collect()
+            },
+            &no_bias,
+            &unit,
+        );
+        for r in 0..rows {
+            let at = (r * qh + j * g) * d;
+            want[at..at + g * d].copy_from_slice(&o[at..at + g * d]);
+        }
+    }
     check_rows(&b.read_f32(o1), &want, qh * d, rows - 1, 1e-3);
     check_rows(&b.read_f32(o2), &want, qh * d, rows - 1, 1e-3);
 }

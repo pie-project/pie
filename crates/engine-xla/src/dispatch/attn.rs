@@ -244,25 +244,6 @@ impl Run<'_> {
                 crate::lower::attn::attend(self.ctx(), call, pool)
             }
 
-            Attn::Decode {
-                selection: Some(_),
-                bias: None,
-                selected: Some(poem_ir::Blocks { per_head: true, .. }),
-                lse: None,
-                ..
-            }
-            | Attn::Prefill {
-                mask: None,
-                selection: Some(_),
-                bias: None,
-                selected: Some(poem_ir::Blocks { per_head: true, .. }),
-                lse: None,
-                ..
-            }
-            | Attn::IndexTopk {
-                score: IndexScore::BlockMax,
-                ..
-            } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
             Attn::ReplayFloor { .. } | Attn::KvEnds { .. } | Attn::WindowSink { .. } => {
                 Err(kernels_xla::Error::Unsupported { op: op.name() })
@@ -277,11 +258,7 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 bias: None,
-                selected:
-                    Some(poem_ir::Blocks {
-                        ratio,
-                        per_head: false,
-                    }),
+                selected: Some(poem_ir::Blocks { ratio, per_head }),
                 rel: None,
                 lse: None,
             } => {
@@ -294,6 +271,7 @@ impl Run<'_> {
                     *head_dim,
                     *sm_scale,
                     *ratio,
+                    *per_head,
                     self.tensor(*o),
                 )?;
                 crate::lower::attn::attend(self.ctx(), call, pool)
@@ -312,11 +290,7 @@ impl Run<'_> {
                 bias: None,
                 floor: None,
                 causal: true,
-                selected:
-                    Some(poem_ir::Blocks {
-                        ratio,
-                        per_head: false,
-                    }),
+                selected: Some(poem_ir::Blocks { ratio, per_head }),
                 rel: None,
                 lse: None,
             } => {
@@ -331,6 +305,7 @@ impl Run<'_> {
                     *kv_heads,
                     *sm_scale,
                     *ratio,
+                    *per_head,
                     self.tensor(*o),
                 )?;
                 crate::lower::attn::attend(self.ctx(), call, pool)
@@ -1019,6 +994,36 @@ impl Run<'_> {
                     self.tensor(*selection),
                 )
             }
+            Attn::IndexTopk {
+                q,
+                weights: None,
+                keys,
+                heads,
+                head_dim,
+                top_k,
+                ratio,
+                score: IndexScore::BlockMax,
+                selection,
+            } => {
+                let fire = self.bindings();
+                let (positions, request_of_token) = (fire.cache_rows, fire.tables.request_of_token);
+                crate::lower::attn::index::topk_block_max(
+                    self.ctx(),
+                    self.tensor(*q),
+                    self.pool(*keys),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
+                    *heads,
+                    *head_dim,
+                    *top_k,
+                    *ratio,
+                    self.tensor(*selection),
+                )
+            }
+            Attn::IndexTopk {
+                score: IndexScore::BlockMax,
+                ..
+            } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Attn::IndexKvAppend {
                 k,
                 keys,

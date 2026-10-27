@@ -357,3 +357,88 @@ fn pooled_tokens_read_the_top_blocks_back_as_their_tokens() {
         }
     }
 }
+
+#[test]
+fn block_max_keeps_each_heads_best_blocks_and_its_own() {
+    let (heads, d, top_k, block) = (2usize, 8usize, 2usize, 2usize);
+    let mut rng = Rng(9);
+    let keys0 = rng.bf16s(CELLS * d, 1.0);
+    let positions = [1i32, 11, 6, 7, 0, -1, 4];
+    let reqs = [0i32, 0, 1, 1, 1, 0, 0];
+    let rows = positions.len();
+    let q = rng.bf16s(rows * heads * d, 1.0);
+    let mut b = Bench::new();
+    let qt = b.bf16(rows as u32, (heads * d) as u32, &q);
+    let keys = b.bf16(CELLS as u32, d as u32, &keys0);
+    let pt = b.i32(rows as u32, 1, &positions);
+    let rt = b.i32(rows as u32, 1, &reqs);
+    let sel = b.zeros(Dtype::I32, rows as u32, (heads * top_k) as u32);
+    let pool = kv_pool(&mut b, keys);
+    if !b
+        .run(|ctx| {
+            index::topk_block_max(
+                ctx,
+                qt,
+                &pool,
+                pt,
+                rt,
+                heads as u32,
+                d as u32,
+                top_k as u32,
+                block as u32,
+                sel,
+            )
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let got = b.read_i32(sel);
+    let nbm = (3 * PS - 1) / block + 1;
+    for r in 0..rows {
+        let pos = positions[r];
+        let mut want = Vec::new();
+        for h in 0..heads {
+            let mut run = vec![-1i32; top_k];
+            if pos >= 0 {
+                let nb = (pos as usize / block + 1).min(nbm);
+                if nb <= top_k {
+                    for (at, slot) in run.iter_mut().enumerate().take(nb) {
+                        *slot = at as i32;
+                    }
+                } else {
+                    let qh = &q[(r * heads + h) * d..(r * heads + h + 1) * d];
+                    let score = |blk: usize| {
+                        (blk * block..(blk * block + block).min(pos as usize + 1))
+                            .map(|j| {
+                                let c = cell(reqs[r] as usize, j);
+                                qh.iter()
+                                    .zip(&keys0[c * d..(c + 1) * d])
+                                    .map(|(a, b)| a * b)
+                                    .sum::<f32>()
+                            })
+                            .fold(f32::NEG_INFINITY, f32::max)
+                    };
+                    let own = nb - 1;
+                    let mut others: Vec<(f32, usize)> =
+                        (0..own).map(|blk| (score(blk), blk)).collect();
+                    others.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+                    let mut picks: Vec<i32> = others
+                        .iter()
+                        .take(top_k - 1)
+                        .map(|&(_, blk)| blk as i32)
+                        .collect();
+                    picks.push(own as i32);
+                    picks.sort_unstable();
+                    run = picks;
+                }
+            }
+            want.extend(run);
+        }
+        assert_eq!(
+            &got[r * heads * top_k..(r + 1) * heads * top_k],
+            &want[..],
+            "row {r} at position {pos}"
+        );
+    }
+}
