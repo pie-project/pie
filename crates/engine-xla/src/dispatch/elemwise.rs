@@ -484,10 +484,30 @@ impl Run<'_> {
                 l.land(o_y, v)
             }),
 
-            // A scaleless gated norm runs on CUDA alone (Muse Spark's).
-            Elemwise::RmsnormGated { weight: None, .. } => {
-                Err(kernels_xla::Error::Unsupported { op: op.name() })
-            }
+            // A scaleless gated norm (Muse Spark's).
+            Elemwise::RmsnormGated {
+                x,
+                gate,
+                weight: None,
+                head_dim,
+                eps,
+                act,
+                y,
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let gate_v = l.read(self.tensor(*gate))?;
+                let o_y = self.tensor(*y);
+                let v = elemwise::norm::rmsnorm_gated_unscaled(
+                    l.f(),
+                    x_v,
+                    gate_v,
+                    *head_dim,
+                    *eps,
+                    matches!(act, poem_ir::GateActivation::Sigmoid),
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
             Elemwise::RmsnormGated {
                 x,
                 gate,
@@ -1011,9 +1031,6 @@ impl Run<'_> {
                 l.land(o_mixes, v)
             }),
             // The independent form (no combine) is landed on CUDA alone.
-            Elemwise::HcGates { comb: false, .. } => {
-                Err(kernels_xla::Error::Unsupported { op: op.name() })
-            }
             Elemwise::HcGates {
                 normed,
                 streams,
@@ -1023,7 +1040,7 @@ impl Run<'_> {
                 gate_eps,
                 alpha,
                 sinkhorn,
-                comb: true,
+                comb,
                 x,
                 post_mix,
                 comb_mix,
@@ -1035,7 +1052,7 @@ impl Run<'_> {
                 let o_x = self.tensor(*x);
                 let o_post_mix = self.tensor(*post_mix);
                 let o_comb_mix = self.tensor(*comb_mix);
-                let (v0, v1, v2) = elemwise::hc::gates(
+                let (v0, v1, v2) = elemwise::hc::gates_with(
                     l.f(),
                     normed_v,
                     streams_v,
@@ -1045,6 +1062,7 @@ impl Run<'_> {
                     *gate_eps,
                     *alpha,
                     *sinkhorn,
+                    *comb,
                     o_x.landing(),
                     o_post_mix.landing(),
                     o_comb_mix.landing(),

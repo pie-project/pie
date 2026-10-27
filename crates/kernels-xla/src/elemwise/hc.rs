@@ -109,8 +109,9 @@ pub fn project(
     }
     let mix_hc = hc_fn.rows;
     let layer_row = 2 * stream_count + stream_count * stream_count;
+    // without its combine (the independent form) a layer's row is 2M wide
     if mixes.width != mix_hc
-        || (mix_hc != layer_row && mix_hc != stream_count)
+        || (mix_hc != layer_row && mix_hc != 2 * stream_count && mix_hc != stream_count)
         || mixes.rows != normed.rows
     {
         return Err(refuse(
@@ -145,16 +146,51 @@ pub fn gates(
     post_mix: Landing,
     comb_mix: Landing,
 ) -> Result<(Val, Val, Val), Error> {
+    gates_with(
+        f,
+        normed,
+        streams,
+        scale,
+        base,
+        stream_count,
+        gate_eps,
+        alpha,
+        sinkhorn,
+        true,
+        x,
+        post_mix,
+        comb_mix,
+    )
+}
+
+/// [`gates`], or with `comb` false the independent form: the row is the pre
+/// and post logits alone, the post gate carries the eps the pre gate does,
+/// and the comb matrix is the identity.
+pub fn gates_with(
+    f: &mut Func,
+    normed: Operand,
+    streams: Operand,
+    scale: Operand,
+    base: Operand,
+    stream_count: u32,
+    gate_eps: f32,
+    alpha: f32,
+    sinkhorn: u32,
+    combined: bool,
+    x: Landing,
+    post_mix: Landing,
+    comb_mix: Landing,
+) -> Result<(Val, Val, Val), Error> {
     const OP: &str = "elemwise.hc_gates";
     expect(OP, streams, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, streams.width, x.width)?;
     stated_fan(OP, fan, stream_count)?;
     let m = i64::from(fan);
-    let mix_hc = 2 * m + m * m;
+    let mix_hc = if combined { 2 * m + m * m } else { 2 * m };
     if i64::from(normed.width) != mix_hc
         || post_mix.width != fan
         || comb_mix.width != fan * fan
-        || scale.elements() < 3
+        || scale.elements() < if combined { 3 } else { 2 }
         || base.elements() < mix_hc as u64
     {
         return Err(refuse(
@@ -165,7 +201,7 @@ pub fn gates(
     let rows = i64::from(x.rows);
     let h = i64::from(x.width);
     let mix = normed.f32(f);
-    let sc = flat(f, scale, 3)?;
+    let sc = flat(f, scale, if combined { 3 } else { 2 })?;
     let bs = flat(f, base, mix_hc)?;
     let part = |f: &mut Func, lo: i64, n: i64, k: i64| -> Result<Val, Error> {
         let v = f.slice_axis(mix, 1, lo, lo + n)?;
@@ -183,6 +219,18 @@ pub fn gates(
     let post = part(f, m, m, 1)?;
     let post = f.sigmoid(post);
     let post = f.scale(post, f64::from(alpha))?;
+    if !combined {
+        let post = f.offset(post, f64::from(gate_eps))?;
+        let i = f.iota(Elem::I32, &[rows, m, m], 1);
+        let j = f.iota(Elem::I32, &[rows, m, m], 2);
+        let on = f.compare(crate::hlo::Cmp::Eq, i, j)?;
+        let on = f.convert(on, Elem::F32);
+        let r = streams3(f, streams, fan)?;
+        let p = f.broadcast(pre, &[rows, m, h], &[0, 1])?;
+        let w = f.mul(r, p)?;
+        let li = f.reduce(w, &[1], Fold::Sum)?;
+        return Ok((post, on, li));
+    }
 
     let comb = part(f, 2 * m, m * m, 2)?;
     let comb = f.reshape(comb, &[rows, m, m])?;
