@@ -1,9 +1,9 @@
 <div align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://pie-project.org/img/pie-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="https://pie-project.org/img/pie-light.svg">
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/pie-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/pie-light.svg">
     <img alt="Pie: Programmable serving system for emerging LLM applications"
-         src="https://pie-project.org/img/pie-light.svg"
+         src=".github/assets/pie-light.svg"
          width="30%">
     <p></p>
   </picture>
