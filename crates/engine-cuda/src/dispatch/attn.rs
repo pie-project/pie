@@ -714,9 +714,9 @@ impl Run<'_> {
                 // one below `kernel.mla.expanded_from` rows, so it reads too.
                 let read = self.nodes().iter().any(|node| {
                     let op = match &node.op {
-                        Operation::Fused(poem_ir::Fused::MlaPrefillExpanded { prefill, .. }) => {
-                            &**prefill
-                        }
+                        Operation::Fused(poem_ir::Fused::MlaPrefillExpanded {
+                            prefill, ..
+                        }) => &**prefill,
                         Operation::Attn(op) => op,
                         _ => return false,
                     };
