@@ -28,7 +28,6 @@ export function main(input) {
   const maxSteps = Number(input.max_tokens ?? 16);
   const B = Number(input.beams ?? 2);
   if (B === 0) throw new Error('beams must be at least 1');
-  if (maxSteps === 0) return '';
 
   const v = model.outputVocabSize();
 
