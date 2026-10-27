@@ -170,7 +170,7 @@ impl RsScratch {
 
     #[must_use]
     pub fn need(rows_ext: u32, ext_row_bytes: u64) -> u64 {
-        u64::from(rows_ext.max(1)) * ext_row_bytes + 8 * 256 + 64 * 1024
+        u64::from(rows_ext.max(1) + 64) * ext_row_bytes + 4 * 1024 * 1024
     }
 
     fn take(&self, bytes: u64) -> crate::error::Result<u64> {

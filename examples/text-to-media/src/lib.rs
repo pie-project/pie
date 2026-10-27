@@ -20,6 +20,14 @@ struct Input {
     strength: Option<f32>,
     /// The region to repaint, `x0,y0,x1,y1` in pixels.
     mask_rect: Option<String>,
+    /// Solver: `"euler"` (default) or `"dpm2m"` (second-order DPM-Solver++ 2M).
+    solver: Option<String>,
+    /// Host-driven stepping: drain a `[1]` sync word after every denoise fire.
+    host_step: bool,
+    /// Skip the `vae.decode` stage and drain a `[1]` sync word after the last denoise fire.
+    skip_vae: bool,
+    /// Skip sending the encoded media over the session channel.
+    no_send: bool,
     format: Option<String>,
     out: Option<String>,
 }
@@ -281,6 +289,12 @@ async fn main(input: Input) -> Result<Output> {
         .transpose()?;
 
     let x = Channel::new(lat, dtype::f32).queued();
+    let use_dpm2m = input.solver.as_deref() == Some("dpm2m");
+    let x0_prev = use_dpm2m.then(|| Channel::new([n, c], dtype::f32).queued());
+    let dpm_tables = use_dpm2m.then(|| Dpm2m::of(&sched).channels());
+    let host_step = input.host_step;
+    let skip_vae = input.skip_vae;
+    let num_steps = sched.steps();
     let k = Channel::new([1], dtype::u32).queued();
     let t = Channel::new([1], dtype::f32).queued();
     let ts = Channel::from(ts);
@@ -297,41 +311,15 @@ async fn main(input: Input) -> Result<Output> {
             None => eps,
             Some(start) => &(&reshape(start.read(), lat) * (1.0 - sigma0)) + &(&eps * sigma0),
         });
+        if let Some(prev) = &x0_prev {
+            prev.put(broadcast(Tensor::constant([0f32]), [n, c]));
+        }
         k.put(&zero);
         t.put(at(&ts.read(), &zero));
     };
-    let epilogue = move || {
-        let step = k.take();
-        let next = &step + 1u32;
-        let v = intrinsics::output_rows(1, "velocity", n);
-        let v = if cfg {
-            cfg_combine(
-                &v,
-                &intrinsics::output_rows(3, "velocity", n),
-                &Tensor::constant([guidance]),
-            )
-        } else {
-            v
-        };
-        let sig = sigmas.read();
-        let mut x1 = euler_step(
-            &reshape(x.take(), [n, c]),
-            &v,
-            &(&at(&sig, &next) - &at(&sig, &step)),
-        );
-        if let (Some(m), Some(start)) = (mask, start) {
-            let to = broadcast(reshape(at(&sig, &next), [1, 1]), [n, c]);
-            let known = &(&start.read() * &(1.0f32 - &to)) + &(&normal(key(&next), [n, c]) * &to);
-            let m = broadcast(m.read(), [n, c]);
-            x1 = &(&m * &x1) + &(&(1.0f32 - &m) * &known);
-        }
-        x.put(reshape(&x1, lat));
-        t.take();
-        t.put(at(&ts.read(), &next));
-        k.put(&next);
-    };
-    let denoise = |first: bool| -> Result<ForwardPass> {
+    let denoise = |first: bool, with_sync: bool| -> Result<(ForwardPass, Option<Channel>)> {
         let pass = ForwardPass::new();
+        let step_sync = with_sync.then(|| Channel::new([1], dtype::u32));
         let groups = [Some(&cond), uncond.as_ref()].into_iter().flatten();
         for (g, (ctx, len)) in groups.enumerate() {
             for (s, (stream, lane)) in [("context", &context), ("latents", &latents)]
@@ -361,12 +349,89 @@ async fn main(input: Input) -> Result<Output> {
         if first {
             pass.prologue(prologue);
         }
-        pass.epilogue(epilogue);
-        Ok(pass)
+        let sync_ep = step_sync;
+        pass.epilogue(move || {
+            let step = k.take();
+            let next = &step + 1u32;
+            let v = intrinsics::output_rows(1, "velocity", n);
+            let v = if cfg {
+                cfg_combine(
+                    &v,
+                    &intrinsics::output_rows(3, "velocity", n),
+                    &Tensor::constant([guidance]),
+                )
+            } else {
+                v
+            };
+            let sig = sigmas.read();
+            let mut x1 = if let (Some(prev_ch), Some(tables)) = (&x0_prev, &dpm_tables) {
+                let current = reshape(x.take(), [n, c]);
+                let scalar = |table: &Channel, idx: &Tensor| {
+                    broadcast(reshape(at(&table.read(), idx), [1, 1]), [n, c])
+                };
+                let x0 = &current - &(&v * &scalar(&tables.sigma_s, &next));
+                let prev = prev_ch.take();
+                let mix = scalar(&tables.mix, &next);
+                let one = broadcast(Tensor::constant([1.0f32]), [n, c]);
+                let d = &(&x0 * &(&one + &mix)) - &(&prev * &mix);
+                let stepped = &(&current * &scalar(&tables.ratio, &next))
+                    + &(&d * &scalar(&tables.gain, &next));
+                prev_ch.put(&x0);
+                stepped
+            } else {
+                euler_step(
+                    &reshape(x.take(), [n, c]),
+                    &v,
+                    &(&at(&sig, &next) - &at(&sig, &step)),
+                )
+            };
+            if let (Some(m), Some(start)) = (mask, start) {
+                let to = broadcast(reshape(at(&sig, &next), [1, 1]), [n, c]);
+                let known =
+                    &(&start.read() * &(1.0f32 - &to)) + &(&normal(key(&next), [n, c]) * &to);
+                let m = broadcast(m.read(), [n, c]);
+                x1 = &(&m * &x1) + &(&(1.0f32 - &m) * &known);
+            }
+            x.put(reshape(&x1, lat));
+            if let Some(sync) = &sync_ep {
+                sync.put(&next);
+            }
+            t.take();
+            t.put(at(&ts.read(), &next));
+            k.put(&next);
+        });
+        Ok((pass, step_sync))
     };
-    let (head, rest) = (denoise(true)?, denoise(false)?);
-    for step in 0..sched.steps() {
-        (if step == 0 { &head } else { &rest }).submit(&pipe)?;
+    let head = denoise(true, host_step || (skip_vae && num_steps == 1))?;
+    let middle = denoise(false, host_step)?;
+    let tail = denoise(false, host_step || skip_vae)?;
+    for step in 0..num_steps {
+        let (pass, sync) = if step == 0 {
+            &head
+        } else if step + 1 < num_steps {
+            &middle
+        } else {
+            &tail
+        };
+        pass.submit(&pipe)?;
+        if host_step || (skip_vae && step + 1 == num_steps) {
+            if let Some(s) = sync {
+                let _ = s.take_host::<u32>().await?;
+            }
+        }
+    }
+
+    if skip_vae {
+        pipe.close();
+        return Ok(Output {
+            file: String::new(),
+            size: format!("{width}x{height}"),
+            frames,
+            steps: num_steps,
+            seed,
+            guidance,
+            cfg,
+        });
     }
 
     let vae = lane("vae.decode", "latents")?;
@@ -431,13 +496,15 @@ async fn main(input: Input) -> Result<Output> {
             }
         };
     let file = format!("{}.{ext}", input.out.as_deref().unwrap_or("out"));
-    let media = Frames::concat(&clips.iter().collect::<Vec<_>>())?;
-    inferlet::session::send_frames(&media, format, &file)?;
+    if !input.no_send {
+        let media = Frames::concat(&clips.iter().collect::<Vec<_>>())?;
+        inferlet::session::send_frames(&media, format, &file)?;
+    }
     Ok(Output {
         file,
         size: format!("{width}x{height}"),
         frames,
-        steps: sched.steps(),
+        steps: num_steps,
         seed,
         guidance,
         cfg,

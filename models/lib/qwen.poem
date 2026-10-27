@@ -6,6 +6,8 @@ load("//lib/reads.poem", "flattened")
 
 SMALL = struct(depth = 12, hidden = 768, heads = 12, inter = 3072)
 
+MEDIUM = struct(depth = 24, hidden = 1024, heads = 16, inter = 4096)
+
 LARGE = struct(depth = 27, hidden = 1152, heads = 16, inter = 4304)
 
 PATCH = 16
