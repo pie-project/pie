@@ -390,7 +390,7 @@ pub fn matmul(
         ],
     )?;
     let plan = plan.lock().expect("plan lock poisoned");
-    let slab = ctx.scratch_shared(op, LT_WORKSPACE, workspace)?;
+    let slab = ctx.scratch_stream(op, LT_WORKSPACE, workspace)?;
     use lt::cublasLtMatmulDescAttributes_t as A;
     let pointer = std::mem::size_of::<*const c_void>();
     let (a_scale, b_scale) = (
