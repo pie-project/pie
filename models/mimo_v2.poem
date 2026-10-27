@@ -141,7 +141,8 @@ def layout(id, deploy):
                 inter = iw,
                 router = weight([d.experts, hidden]),
                 bias = weight([d.experts], dtype.f32),
-                gate_up = weight([d.experts, 2 * iw, hidden], experts),
+                gate = weight([d.experts, iw, hidden], experts),
+                up = weight([d.experts, iw, hidden], experts),
                 down = weight([d.experts, hidden, iw], experts),
             )
         return struct(
@@ -273,11 +274,8 @@ def huggingface(m, reads):
         reads.read(f.router, n("mlp.gate.weight"))
         reads.read(f.bias, n("mlp.gate.e_score_correction_bias"))
         expert = lambda e, leg: n("mlp.experts.{}.{}_proj".format(e, leg))
-        gate_up = []
-        for e in range(f.experts):
-            gate_up += [expert(e, "gate"), expert(e, "up")]
-        packed_bank(reads, f.gate_up, gate_up)
-        packed_bank(reads, f.down, [expert(e, "down") for e in range(f.experts)])
+        for w, leg in [(f.gate, "gate"), (f.up, "up"), (f.down, "down")]:
+            packed_bank(reads, w, [expert(e, leg) for e in range(f.experts)])
 
 def readable(reads, w, name, rows = None, chunks = 0):
     """The tensor `name` (its `rows` = (start, count), if given) at `w`'s
@@ -340,27 +338,17 @@ def packed_bank(reads, w, stems):
     `*.weight_scale`, stacked on the leading axis and read as the bank's
     `[experts, ...]` rectangle."""
     rows, cols = w.shape[1], w.shape[2]
-    legs = len(stems)
-    per_leg = rows * w.shape[0] // legs
     codes = []
     scales = []
     for stem in stems:
         if stored(stem + ".weight") != raw(dtype.u8) or not has(stem + ".weight_scale"):
             fail("`{}`: `{}.weight` is read as MXFP4 codes beside their `{}.weight_scale` exponents".format(w.name, stem, stem))
-        codes.append(src(stem + ".weight").transmute([1, per_leg, cols], encoding(dtype.mxfp4)))
-        scales.append(src(stem + ".weight_scale").transmute([1, per_leg, cols // 32], encoding(dtype.e8m0)))
+        codes.append(src(stem + ".weight").transmute([1, rows, cols], encoding(dtype.mxfp4)))
+        scales.append(src(stem + ".weight_scale").transmute([1, rows, cols // 32], encoding(dtype.e8m0)))
     counted = scales_shape(w)
-    codes = concat(0, codes)
-    scales = concat(0, scales)
-
-    # Two legs per expert (gate, up) stack to `[2E, inter, cols]`, which is
-    # the declared `[E, 2*inter, cols]` rectangle byte for byte.
-    if [legs, per_leg, cols] != list(w.shape):
-        codes = codes.transmute(w.shape, encoding(dtype.mxfp4))
-        scales = scales.transmute(counted, encoding(dtype.e8m0))
     reads.extend([
-        tensor(w.name, codes, encoding(dtype.mxfp4)),
-        tensor(scales_name(w.name), scales, encoding(dtype.e8m0), shape = counted, scaling = w),
+        tensor(w.name, concat(0, codes), encoding(dtype.mxfp4)),
+        tensor(scales_name(w.name), concat(0, scales), encoding(dtype.e8m0), shape = counted, scaling = w),
     ])
 
 # The forward of MiMo-V2.6: attention over heads stored 256 wide, the first 64
@@ -431,6 +419,6 @@ def mlp(x, f):
         routing.sigmoid(renormalize = True, scaling = 1.0),
         bias = f.bias,
     )
-    packed = ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k)
-    act = ops.linear.glu(packed, gating.swiglu(), f.inter)
+    gate = ops.linear.moe_matmul_select(x, f.gate, routes, f.top_k)
+    act = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, f.up, routes, f.top_k))
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)

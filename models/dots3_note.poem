@@ -177,7 +177,8 @@ def layout(id, deploy):
                 routed = True,
                 router = weight([d.experts, hidden]),
                 bias = weight([d.experts], dtype.f32),
-                gate_up = weight([d.experts, 2 * iw, hidden], experts),
+                gate = weight([d.experts, iw, hidden], experts),
+                up = weight([d.experts, iw, hidden], experts),
                 down = weight([d.experts, hidden, iw], experts),
                 shared = struct(
                     gate = weight([sw, hidden], weights),
@@ -260,14 +261,8 @@ def huggingface(m, reads):
         reads.read(f.bias, at("mlp.gate.e_score_correction_bias"))
         leaf = lambda e, proj: at("mlp.experts.{}.{}.weight".format(e, proj))
         held = stored(leaf(0, "gate_proj"))
-        reads.read_expr(f.gate_up, concat(0, [
-            concat(0, [src(leaf(e, "gate_proj")), src(leaf(e, "up_proj"))]).transmute([1, -1, m.hidden], held)
-            for e in range(f.experts)
-        ]))
-        reads.read_expr(f.down, concat(0, [
-            src(leaf(e, "down_proj")).transmute([1, m.hidden, -1], held)
-            for e in range(f.experts)
-        ]))
+        for w, proj in [(f.gate, "gate_proj"), (f.up, "up_proj"), (f.down, "down_proj")]:
+            reads.read_expr(w, concat(0, [src(leaf(e, proj)).transmute([1] + w.shape[1:], held) for e in range(f.experts)]))
         reads.read(f.shared.gate, at("mlp.shared_experts.gate_proj.weight"))
         reads.read(f.shared.up, at("mlp.shared_experts.up_proj.weight"))
         reads.read(f.shared.down, at("mlp.shared_experts.down_proj.weight"))
@@ -357,7 +352,8 @@ def mlp(x, f):
         bias = f.bias,
     )
 
-    act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k), gating.swiglu(), f.inter)
+    gate = ops.linear.moe_matmul_select(x, f.gate, routes, f.top_k)
+    act = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, f.up, routes, f.top_k))
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     s = f.shared
     gate, up = ops.linear.matmul(x, s.gate), ops.linear.matmul(x, s.up)

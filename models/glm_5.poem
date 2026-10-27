@@ -251,7 +251,8 @@ def layout(id, deploy):
             routed = True,
             router = weight([d.experts, hidden], w),
             bias = weight([d.experts], dtype.f32) if d.router_bias else None,
-            gate_up = weight([d.experts, 2 * iw, hidden], banks_dtype),
+            gate = weight([d.experts, iw, hidden], banks_dtype),
+            up = weight([d.experts, iw, hidden], banks_dtype),
             down = weight([d.experts, hidden, iw], banks_dtype),
             shared = struct(
                 gate = weight([sw, hidden], proj),
@@ -396,25 +397,12 @@ def moe(reads, at, f):
     reads.read(f.router, at("mlp.gate.weight"))
     if f.bias != None:
         reads.read(f.bias, at("mlp.gate.e_score_correction_bias"))
-    hidden = f.down.shape[1]
-    if kept(f.gate_up):
-        name = lambda e, leaf: at("mlp.experts.{}.{}.weight".format(e, leaf))
-        bank(reads, f.gate_up, [[name(e, "gate_proj"), name(e, "up_proj")] for e in range(f.experts)])
-        bank(reads, f.down, [[name(e, "down_proj")] for e in range(f.experts)])
-        shared(reads, at, f)
-        return
-    expert = lambda e, leaf: dequantized(reads, at("mlp.experts.{}.{}.weight".format(e, leaf)))
-    land(reads, f.gate_up, concat(0, [
-        concat(0, [expert(e, "gate_proj"), expert(e, "up_proj")]).transmute([1, 2 * f.inter, hidden], BF16)
-        for e in range(f.experts)
-    ]))
-    land(reads, f.down, concat(0, [
-        expert(e, "down_proj").transmute([1, hidden, f.inter], BF16)
-        for e in range(f.experts)
-    ]))
-    shared(reads, at, f)
-
-def shared(reads, at, f):
+    for w, leaf in [(f.gate, "gate_proj"), (f.up, "up_proj"), (f.down, "down_proj")]:
+        names = [at("mlp.experts.{}.{}.weight".format(e, leaf)) for e in range(f.experts)]
+        if kept(w):
+            bank(reads, w, [[name] for name in names])
+        else:
+            land(reads, w, concat(0, [dequantized(reads, name).transmute([1] + w.shape[1:], BF16) for name in names]))
     read_weight(reads, f.shared.gate, at("mlp.shared_experts.gate_proj.weight"), quantized = "widen")
     read_weight(reads, f.shared.up, at("mlp.shared_experts.up_proj.weight"), quantized = "widen")
     read_weight(reads, f.shared.down, at("mlp.shared_experts.down_proj.weight"), quantized = "widen")
@@ -609,7 +597,8 @@ def mlp(x, f):
     gate, up = ops.linear.matmul(x, f.shared.gate), ops.linear.matmul(x, f.shared.up)
     act = ops.linear.glu(gate, gating.swiglu(), up = up)
     shared = ops.linear.matmul(act, f.shared.down)
-    act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k), gating.swiglu(), f.inter)
+    gate = ops.linear.moe_matmul_select(x, f.gate, routes, f.top_k)
+    act = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, f.up, routes, f.top_k))
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     return ops.elemwise.residual_add(shared, routed)
 
