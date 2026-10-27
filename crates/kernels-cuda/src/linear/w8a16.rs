@@ -117,8 +117,16 @@ pub fn matmul(
     } else {
         1
     };
-    if m > GEMM_UNTIL {
-        // A prefill's rows against the plane widened once, on cuBLAS.
+    // The tiled GEMM: 64-row CTAs while that keeps the grid wide, 128 past
+    // it, as many stages as the card seats. A wide K's block exponents eat
+    // the stages' room: MiniMax's 12288 dense down projection asks 112 KiB
+    // at four, past the 99 KiB an sm_86/89/120 block may opt into.
+    let (bm, most) = if m <= 128 { (64u32, 4u32) } else { (128, 3) };
+    let gemm_smem = |stages: u32| stages * (bm * 64 * 2 + 128 * 64) + 128 * (k / gran);
+    let stages = (2..=most).rev().find(|&s| ctx.smem_fits(gemm_smem(s)));
+    if m > GEMM_UNTIL || (tiled && !wgmma && stages.is_none()) {
+        // A prefill's rows against the plane widened once, on cuBLAS; also
+        // a tile no stage count of which the card seats.
         let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
         let tile = ctx.scratch_stream(op, DECODED_WEIGHT, bytes)? as usize as u64;
         widen(ctx, op, codes, atoms, gran, n, k, tile)?;
@@ -138,10 +146,9 @@ pub fn matmul(
         ctx.stage(),
     ];
     if tiled {
-        // The tiled GEMM: 64-row CTAs while that keeps the grid wide, 128 past it.
-        let (bm, stages) = if m <= 128 { (64u32, 4u32) } else { (128, 3) };
+        let stages = stages.unwrap_or(most);
         // The stages, and the CTA's block exponents laid beside them.
-        let smem = stages * (bm * 64 * 2 + 128 * 64) + 128 * (k / gran);
+        let smem = gemm_smem(stages);
         let part = if splits > 1 {
             let bytes = u64::from(splits) * u64::from(m) * u64::from(n) * 4;
             ctx.scratch_stream(
