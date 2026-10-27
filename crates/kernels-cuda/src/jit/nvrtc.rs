@@ -506,7 +506,7 @@ mod tests {
                 ],
             ),
             (
-                "linear/contract.cu",
+                "linear/skeleton.cu",
                 &[
                     "::pie::linear::gemv_skeleton<::pie::linear::Store, 4, 4, 1, 0, 1, true>",
                     "::pie::linear::gemv_splitk_skeleton<::pie::linear::Store, 8, 1, 1, 0, 1, true>",

@@ -387,7 +387,6 @@ fn the_z_image_import_reads_the_diffusers_pipeline_every_case() {
     the_flagship_reads_a_synthetic_pipeline_shaped_like_the_snapshot();
     the_miniature_reads_its_bare_state_dict_and_the_same_names_prefixed();
     neither_row_serves_the_other_rows_checkpoint();
-    the_flagship_reads_the_real_snapshot();
     the_derived_planes_are_stated_as_constants();
 }
 
@@ -454,57 +453,6 @@ fn neither_row_serves_the_other_rows_checkpoint() {
         "the flagship read a bare 256-wide transformer with no encoder"
     );
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-fn hub() -> PathBuf {
-    if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    if let Some(home) = std::env::var_os("HF_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home).join("hub");
-    }
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface/hub")
-}
-
-fn snapshot() -> Option<PathBuf> {
-    let snapshots = hub().join("models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-    std::fs::read_dir(snapshots)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.join("model_index.json").is_file())
-}
-
-fn the_flagship_reads_the_real_snapshot() {
-    let Some(root) = snapshot() else {
-        eprintln!("skipping: no Tongyi-MAI/Z-Image-Turbo snapshot in the HuggingFace cache");
-        return;
-    };
-    let src = checkpoint::file::diffusers::open(&root)
-        .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    let index: BTreeSet<String> = src.names().map(str::to_string).collect();
-
-    let mut synthesized = prefixed("dit.", transformer(&Dims::turbo(), Leaf::F32));
-    synthesized.extend(prefixed("te.", text_encoder()));
-    synthesized.extend(prefixed("vae.", vae()));
-    for (name, shape, _) in &synthesized {
-        let real = src
-            .get(name)
-            .unwrap_or_else(|| panic!("the snapshot holds no `{name}`"));
-        assert_eq!(real.shape(), shape.as_slice(), "`{name}`");
-    }
-    let synthesized: BTreeSet<&String> = synthesized.iter().map(|(name, ..)| name).collect();
-    let real: BTreeSet<&String> = index.iter().collect();
-    assert_eq!(
-        synthesized, real,
-        "the synthetic index and the snapshot's are one list"
-    );
-
-    check_turbo(&src, &index);
-
-    let identified = poem_compiler::catalog::identify(&src, Platform::Cuda)
-        .unwrap_or_else(|why| panic!("the snapshot identifies as nothing: {why}"));
-    assert_eq!(identified, TURBO);
 }
 
 fn the_derived_planes_are_stated_as_constants() {

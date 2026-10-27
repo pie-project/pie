@@ -10,20 +10,9 @@ pub const ROPE_THETA: f32 = 10_000.0;
 pub const TRAIN_STEPS: u32 = 1000;
 pub const SHIFT_TI2V: f32 = 5.0;
 
-pub const TE_HIDDEN: u32 = 4096;
-pub const TE_VOCAB: u32 = 256_384;
-pub const TE_HEADS: u32 = 64;
 pub const TE_HEAD_DIM: u32 = 64;
-pub const TE_INTER: u32 = 10_240;
 pub const TE_LAYERS: u32 = 24;
-pub const TE_BUCKETS: u32 = 32;
 pub const TE_MAX_TOKENS: u32 = 512;
-
-pub const VAE_Z: u32 = 48;
-pub const VAE_PIX_CHANNELS: u32 = 12;
-pub const VAE_DECODER_DIMS: [u32; 5] = [1024, 1024, 1024, 512, 256];
-pub const VAE_RESNETS: u32 = 3;
-pub const VAE_TEMPORAL_UP: [bool; 4] = [true, true, false, false];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dims {

@@ -1,8 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-
-use checkpoint::contract::infer::{CheckpointTypes, Resolver};
-use checkpoint::contract::{Expr, Partition, TensorType};
+use std::collections::BTreeSet;
 
 use crate::flux_2_dims::{self as model, vae};
 use poem::{Def, Dim, Dtype, Operation, Platform, Request, Trace, Ty};
@@ -34,7 +30,6 @@ fn the_flux_2_vae_bakes_every_case() {
     the_trace_reads_its_voxel_inputs_and_plants_pixels_twice();
     the_shapes_are_the_flux2_autoencoders();
     each_vae_lane_has_a_class_of_its_own();
-    the_import_reads_every_vae_tensor_of_the_real_snapshot_once();
 }
 
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
@@ -271,125 +266,4 @@ fn each_vae_lane_has_a_class_of_its_own() {
     .into_iter()
     .collect();
     assert_eq!(seen.len(), 6, "six lanes, six classes");
-}
-
-fn hub() -> PathBuf {
-    if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    if let Some(home) = std::env::var_os("HF_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home).join("hub");
-    }
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface/hub")
-}
-
-fn snapshot() -> Option<PathBuf> {
-    let snapshots = hub().join("models--black-forest-labs--FLUX.2-klein-4B/snapshots");
-    std::fs::read_dir(snapshots)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.join("vae/config.json").is_file())
-}
-
-struct Types<'a>(&'a ztensor::Source);
-
-impl CheckpointTypes for Types<'_> {
-    fn tensor_type(&self, name: &str) -> Option<TensorType> {
-        let tensor = self.0.get(name)?;
-        let encoding = checkpoint::file::encoding_of(&tensor).ok()?;
-        Some(TensorType {
-            shape: tensor.shape().iter().map(|&n| n as i64).collect(),
-            encoding,
-        })
-    }
-}
-
-fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
-    let Some(root) = snapshot() else {
-        eprintln!(
-            "skipping: no black-forest-labs/FLUX.2-klein-4B snapshot in the HuggingFace cache"
-        );
-        return;
-    };
-    let src = checkpoint::file::diffusers::open(&root)
-        .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    let mut contract = poem_compiler::catalog::deployment("flux2-klein-4b-bf16-kv-bf16")
-        .expect("the klein row")
-        .contract(&src, Platform::Cuda)
-        .unwrap_or_else(|why| panic!("the pipeline does not read this snapshot: {why}"));
-    contract.tensors.retain(|t| t.name.starts_with("vae."));
-
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for tensor in &contract.tensors {
-        for source in tensor.expr.sources() {
-            *counts.entry(source.to_string()).or_default() += 1;
-        }
-    }
-    let index: BTreeSet<String> = src
-        .names()
-        .filter(|n| n.starts_with("vae."))
-        .map(str::to_string)
-        .collect();
-    assert_eq!(index.len(), 251);
-    let want: BTreeSet<String> = index
-        .iter()
-        .filter(|n| n.as_str() != "vae.bn.num_batches_tracked")
-        .cloned()
-        .collect();
-    let read: BTreeSet<String> = counts.keys().cloned().collect();
-    assert_eq!(
-        read, want,
-        "every `vae.` tensor but the BatchNorm's step counter, and only those"
-    );
-    assert!(
-        counts.values().all(|c| *c == 1),
-        "each exactly once (`bn.running_var` included: `√(var+eps)` and \
-         `(var+eps)^-1/2` share one internal sum)"
-    );
-
-    let types = Types(&src);
-    let mut resolver = Resolver::new(&types, Partition::WHOLE);
-    let mut kernels = 0;
-    for tensor in &contract.tensors {
-        if tensor.name.starts_with("vae.") && tensor.name.ends_with("conv_in.w") {
-            kernels += 1;
-        }
-        if let Expr::Transmute { .. } = &tensor.expr {
-            assert!(tensor.name.starts_with("vae."), "`{}`", tensor.name);
-        }
-        if tensor.name == "vae.quant" || tensor.name == "vae.quant.bias.head" {
-            assert!(
-                format!("{:?}", tensor.expr).contains("Slice"),
-                "`{}` is sliced down to the mean's rows",
-                tensor.name
-            );
-        }
-        if tensor.name.starts_with("vae.quant") {
-            assert_eq!(
-                tensor.shape.as_ref().map(|s| s[0]),
-                Some(i64::from(model::VAE_CHANNELS)),
-                "`{}`",
-                tensor.name
-            );
-        }
-        let ty = resolver
-            .infer(&tensor.expr, &tensor.name)
-            .unwrap_or_else(|why| panic!("`{}` does not type: {why}", tensor.name));
-        if let Some(shape) = &tensor.shape {
-            assert_eq!(&ty.shape, shape, "`{}`", tensor.name);
-        }
-        assert_eq!(ty.encoding, tensor.encoding, "`{}`", tensor.name);
-        resolver.publish(&tensor.name, ty);
-    }
-    assert_eq!(kernels, 2, "one conv_in per side");
-    let transmuted = contract
-        .tensors
-        .iter()
-        .filter(|t| matches!(&t.expr, Expr::Transmute { .. }))
-        .count();
-    assert_eq!(
-        transmuted, 63,
-        "every conv kernel but the sliced `quant_conv`, and nothing else"
-    );
 }

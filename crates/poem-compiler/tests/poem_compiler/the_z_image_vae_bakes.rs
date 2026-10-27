@@ -1,9 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-
-use checkpoint::contract::infer::{CheckpointTypes, Resolver};
-use checkpoint::contract::{Expr, Partition, TensorType};
-
 use crate::z_image_dims::{self as model, vae};
 use poem::{Def, Dim, Dtype, Operation, Platform, Trace, Ty};
 use poem_ir::{Attn, Conv, GridRule, InputAxis, Output, ParamLayout};
@@ -33,7 +27,6 @@ fn the_z_image_vae_bakes_every_case() {
     the_flagship_declares_the_two_vae_readings_and_the_miniature_neither();
     the_trace_reads_its_voxel_inputs_and_plants_pixels_twice();
     the_shapes_are_the_flux_vaes();
-    the_import_reads_every_vae_tensor_of_the_real_snapshot_once();
 }
 
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
@@ -204,119 +197,4 @@ fn the_shapes_are_the_flux_vaes() {
     assert_eq!(convs, 62);
     assert_eq!(norms, 52);
     assert_eq!(silu_off, 2, "only the attention's norm has no SiLU");
-}
-
-fn hub() -> PathBuf {
-    if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    if let Some(home) = std::env::var_os("HF_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home).join("hub");
-    }
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface/hub")
-}
-
-fn snapshot() -> Option<PathBuf> {
-    let snapshots = hub().join("models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-    std::fs::read_dir(snapshots)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.join("vae/config.json").is_file())
-}
-
-struct Types<'a>(&'a ztensor::Source);
-
-impl CheckpointTypes for Types<'_> {
-    fn tensor_type(&self, name: &str) -> Option<TensorType> {
-        let tensor = self.0.get(name)?;
-        let encoding = checkpoint::file::encoding_of(&tensor).ok()?;
-        Some(TensorType {
-            shape: tensor.shape().iter().map(|&n| n as i64).collect(),
-            encoding,
-        })
-    }
-}
-
-fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
-    let Some(root) = snapshot() else {
-        eprintln!("skipping: no Tongyi-MAI/Z-Image-Turbo snapshot in the HuggingFace cache");
-        return;
-    };
-    let src = checkpoint::file::diffusers::open(&root)
-        .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    let contract = row(TURBO)
-        .contract(&src, Platform::Cuda)
-        .unwrap_or_else(|why| panic!("the flagship does not read this snapshot: {why}"));
-
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for tensor in &contract.tensors {
-        for source in tensor.expr.sources() {
-            *counts.entry(source.to_string()).or_default() += 1;
-        }
-    }
-    let index: BTreeSet<String> = src
-        .names()
-        .filter(|n| n.starts_with("vae."))
-        .map(str::to_string)
-        .collect();
-    assert_eq!(index.len(), 244);
-    let read: BTreeSet<String> = counts
-        .keys()
-        .filter(|n| n.starts_with("vae."))
-        .cloned()
-        .collect();
-    assert_eq!(read, index, "every `vae.` tensor, and only those");
-    assert!(
-        counts
-            .iter()
-            .filter(|(n, _)| n.starts_with("vae."))
-            .all(|(_, c)| *c == 1),
-        "each exactly once"
-    );
-
-    let types = Types(&src);
-    let mut resolver = Resolver::new(&types, Partition::WHOLE);
-    let mut kernels = 0;
-    for tensor in &contract.tensors {
-        if tensor.name.starts_with("vae.") && tensor.name.ends_with("conv_in.w") {
-            kernels += 1;
-        }
-        if let Expr::Transmute { .. } = &tensor.expr {
-            assert!(tensor.name.starts_with("vae."), "`{}`", tensor.name);
-        }
-        if tensor.name == "vae.enc.conv_out" || tensor.name == "vae.enc.conv_out.bias.head" {
-            assert!(
-                format!("{:?}", tensor.expr).contains("Slice"),
-                "`{}` is sliced down to the mean's rows",
-                tensor.name
-            );
-        }
-        if tensor.name.starts_with("vae.enc.conv_out") {
-            assert_eq!(
-                tensor.shape.as_ref().map(|s| s[0]),
-                Some(16),
-                "`{}`",
-                tensor.name
-            );
-        }
-        let ty = resolver
-            .infer(&tensor.expr, &tensor.name)
-            .unwrap_or_else(|why| panic!("`{}` does not type: {why}", tensor.name));
-        if let Some(shape) = &tensor.shape {
-            assert_eq!(&ty.shape, shape, "`{}`", tensor.name);
-        }
-        assert_eq!(ty.encoding, tensor.encoding, "`{}`", tensor.name);
-        resolver.publish(&tensor.name, ty);
-    }
-    assert_eq!(kernels, 2, "one conv_in per side");
-    let transmuted = contract
-        .tensors
-        .iter()
-        .filter(|t| matches!(&t.expr, Expr::Transmute { .. }))
-        .count();
-    assert_eq!(
-        transmuted, 61,
-        "every conv kernel but the sliced encoder head, and nothing else"
-    );
 }

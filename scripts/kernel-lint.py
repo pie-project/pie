@@ -348,8 +348,8 @@ def metal_misdirected_launches(crate):
     found = []
     for path in sorted(p for t in hosts for p in (REPO / t).rglob("*.rs")):
         text = path.read_text()
-        consts = dict(METAL_FILE.findall(text))
         for m in METAL_LAUNCH.finditer(text):
+            consts = dict(METAL_FILE.findall(text[: m.start()]))
             unit = m.group(1) or consts.get(m.group(2))
             if unit is None:
                 continue
@@ -464,12 +464,16 @@ def slang_pattern(literal):
 
 def slang_host(unit):
     """The host module that owns `unit`: its mirror, or, for a tier or
-    algorithm unit (`attn/dense_tiled`), its family's (`attn/dense.rs`)."""
+    algorithm unit (`attn/dense_tiled`), its family's (`attn/dense.rs`),
+    or a module in the same group that declares `"{unit}.slang"`."""
     head, _, stem = unit.rpartition("/")
     words = stem.split("_")
     for n in range(len(words), 0, -1):
         path = REPO / SLANG_SRC / head / ("_".join(words[:n]) + ".rs")
         if path.exists():
+            return path
+    for path in sorted((REPO / SLANG_SRC / head).glob("*.rs")):
+        if f'"{unit}.slang"' in path.read_text():
             return path
     return None
 

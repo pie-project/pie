@@ -381,8 +381,7 @@ async fn main(input: Input) -> Result<Output> {
         let hlen = hlen_p.take();
         let chist = chist_p.take();
         let logits = intrinsics::output(0, "logits");
-        let (token, hist_next, chist_next) =
-            step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
+        let (token, hist_next, chist_next) = step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
         chist_p.put(&chist_next);
@@ -425,8 +424,7 @@ async fn main(input: Input) -> Result<Output> {
             let hlen = hlen_c.take();
             let chist = chist_c.take();
             let logits = intrinsics::output(0, "logits");
-            let (token, hist_next, chist_next) =
-                step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
+            let (token, hist_next, chist_next) = step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
 
             let r_next = &r + iota(2);
 

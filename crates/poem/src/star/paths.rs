@@ -56,7 +56,8 @@ fn same(w: &crate::Weight, origin: u64) -> Same {
 pub(crate) fn named<'v>(heap: Heap<'v>, m: Star<'v>) -> anyhow::Result<Star<'v>> {
     let mut seen = HashMap::new();
     walk(heap, m, "", &mut |v, w, path| {
-        seen.entry(same(w, origin(v))).or_insert_with(|| path.to_string());
+        seen.entry(same(w, origin(v)))
+            .or_insert_with(|| path.to_string());
         v
     });
     let mut stray = None;
