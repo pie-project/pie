@@ -112,8 +112,7 @@ async fn fire(
     pipeline: &Pipeline,
     tokens: &[u32],
     base: u32,
-    fold: Option<u32>,
-    last_only: bool,
+    fold: u32,
 ) -> Result<Vec<u32>> {
     let rows = tokens.len() as u32;
     let total = base + rows;
@@ -121,14 +120,9 @@ async fn fire(
     let ids = Channel::from_iter(tokens.iter().map(|&t| t as i32));
     let embed_indptr = Channel::from([0u32, rows]);
     let slots = Channel::from_iter(base..total);
-    let read = if last_only { rows - 1 } else { 0 };
-    let readout = Channel::from_iter(read..rows);
-    let truth_out = Channel::new([rows - read], dtype::i32);
-    let fold_len = fold.map(|n| Channel::from([n]));
-    let fold = match &fold_len {
-        Some(count) => Fold::Count(count),
-        None => Fold::All,
-    };
+    let readout = Channel::from_iter(0..rows);
+    let truth_out = Channel::new([rows], dtype::i32);
+    let fold = Channel::from([fold]);
 
     let fwd = ForwardPass::new();
     fwd.embed(&ids, &embed_indptr)?;
@@ -137,7 +131,7 @@ async fn fire(
         &[ws],
         StateGeometry {
             slots: Some(&slots),
-            fold,
+            fold: Fold::Count(&fold),
             ..StateGeometry::default()
         },
     )?;
@@ -156,53 +150,32 @@ async fn fire(
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    let empty = || Output {
-        sampler: "cacheback-speculative",
-        text: String::new(),
-        tokens: Vec::new(),
-        prompt_tokens: 0,
-        count: 0,
-        draft_length: input.draft_length,
-        verification_steps: 0,
-        stopped: false,
-        drafted: 0,
-        accepted: 0,
-        acceptance_rate: 0.0,
-    };
-    if input.max_tokens == 0 {
-        return Ok(empty());
-    }
-
     let k = input.draft_length as u32;
     let w_max = k + 1;
 
-    let mut prompt = chat::system_user("Continue the requested text.", &input.prompt);
-    prompt.extend(chat::cue());
-    if prompt.is_empty() {
-        prompt.push(0);
-    }
-    let n = prompt.len() as u32;
+    let mut committed = chat::system_user("Continue the requested text.", &input.prompt);
+    committed.extend(chat::cue());
+    let prompt_tokens = committed.len();
+    let (&last, head) = committed.split_last().ok_or("empty prompt")?;
     let stop_tokens = chat::stop_tokens();
 
     let ws = WorkingSet::new();
     let pipeline = Pipeline::new();
-
-    let truth = fire(&ws, &pipeline, &prompt, 0, None, true).await?;
-    let first = *truth.last().expect("a prefill answers its last row");
-
-    let mut committed: Vec<u32> = prompt.clone();
-    let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
-    let (mut verification_steps, mut drafted, mut accepted) = (1usize, 0usize, 0usize);
-
-    // The seed token is the first thing the model said: nothing drafted it,
-    // so nothing can reject it.
-    let mut x = first;
-    let mut stopped = stop_tokens.contains(&x);
-    if !stopped {
-        committed.push(x);
-        generated.push(x);
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from_iter(head.iter().map(|&t| t as i32)),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipeline).context("prefill submit")?;
     }
-    let mut base = n;
+
+    let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
+    let (mut verification_steps, mut drafted, mut accepted) = (0usize, 0usize, 0usize);
+    let mut x = last;
+    let mut stopped = false;
+    let mut base = head.len() as u32;
     let mut survivors: u32 = 0;
 
     while !stopped && generated.len() < input.max_tokens {
@@ -212,7 +185,7 @@ async fn main(input: Input) -> Result<Output> {
         window.push(x);
         window.extend(drafts.iter().copied());
 
-        let truth = fire(&ws, &pipeline, &window, base, Some(survivors), false).await?;
+        let truth = fire(&ws, &pipeline, &window, base, survivors).await?;
         verification_steps += 1;
         let proposed = window.len() - 1;
         drafted += proposed;
@@ -266,7 +239,7 @@ async fn main(input: Input) -> Result<Output> {
         sampler: "cacheback-speculative",
         text: model::decode(&generated)?,
         tokens: generated.clone(),
-        prompt_tokens: prompt.len(),
+        prompt_tokens,
         count: generated.len(),
         draft_length: input.draft_length,
         verification_steps,

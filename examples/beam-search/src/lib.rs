@@ -62,9 +62,6 @@ async fn main(input: Input) -> Result<String> {
     if b == 0 {
         return Err("beams must be at least 1".into());
     }
-    if max_steps == 0 {
-        return Ok(String::new());
-    }
     let v = model::output_vocab_size();
 
     let scores = {

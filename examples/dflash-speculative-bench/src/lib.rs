@@ -533,7 +533,7 @@ async fn main(input: Input) -> Result<Output> {
     let widest = block + 1 - from.min(1) as u32;
     let pinned = (input.verify_rows != 0).then(|| input.verify_rows.clamp(2, widest));
     // The template `text-completion-bench` applies, so the two read the same prefill.
-    let mut prompt: Vec<u32> = match &input.prompt_tokens {
+    let prompt: Vec<u32> = match &input.prompt_tokens {
         Some(tokens) => tokens.clone(),
         None => {
             let mut p = chat::system_user(&input.system, &input.prompt);
@@ -541,9 +541,6 @@ async fn main(input: Input) -> Result<Output> {
             p
         }
     };
-    if prompt.is_empty() {
-        prompt.push(0);
-    }
     let stop_tokens: Vec<u32> = if input.ignore_eos {
         Vec::new()
     } else {
@@ -553,49 +550,35 @@ async fn main(input: Input) -> Result<Output> {
         session::send("ready");
         let _ = session::receive().await;
     }
-    let n = prompt.len() as u32;
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    let (&last, head) = prompt_i32.split_last().ok_or("empty prompt")?;
 
     let ws = WorkingSet::new();
 
     let pipe = Pipeline::new();
 
-    let mut anchor: i32 = 0;
     let max = model::lane_of(&[])?
         .outputs
         .iter()
         .find(|output| output.name == "logits")
         .map_or(1, |output| output.max_rows);
-    for &(base, end) in &readout_spans(n, max) {
-        let len = end - base;
-        let toks = Channel::from(&prompt_i32[base as usize..end as usize]);
-        let indptr = Channel::from([0u32, len]);
-        let readout = Channel::from([len - 1]);
-        let next = Channel::new([1], dtype::i32);
-
+    for &(base, end) in &readout_spans(head.len() as u32, max) {
         let fwd = ForwardPass::new();
-        fwd.embed(&toks, &indptr)?;
-        fwd.readout(&readout)?;
+        fwd.embed(
+            &Channel::from(&head[base as usize..end as usize]),
+            &Channel::from([0u32, end - base]),
+        )?;
         fwd.state(&[&ws], StateGeometry::folding())?;
-        fwd.epilogue(move || {
-            next.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
-        });
         fwd.submit(&pipe).context("prefill submit")?;
-        anchor = next
-            .take_host::<Vec<i32>>()
-            .await
-            .context("prefill readback")?[0];
-    }
-
-    if input.report_timing {
-        session::send("t0");
     }
 
     // ── THE LOOP ────────────────────────────────────────────────────────
     // Slots `0..held` are written; `anchor` is the token at slot `held`, not yet written.
-    let mut held = n;
-    let mut generated: Vec<u32> = vec![anchor as u32];
-    let mut emitted_ns: Vec<u64> = vec![monotonic_now_ns()];
+    let mut anchor = last;
+    let mut held = head.len() as u32;
+    let mut generated: Vec<u32> = Vec::new();
+    let mut emitted_ns: Vec<u64> = Vec::new();
+    let mut t0 = input.report_timing;
     let mut rounds = 0usize;
     let mut drafted = 0usize;
     let mut accepted = 0usize;
@@ -644,6 +627,10 @@ async fn main(input: Input) -> Result<Output> {
             held += 1;
             generated.push(anchor as u32);
             emitted_ns.push(monotonic_now_ns());
+            if t0 {
+                session::send("t0");
+                t0 = false;
+            }
             continue;
         }
 
@@ -864,6 +851,10 @@ async fn main(input: Input) -> Result<Output> {
         generated.push(anchor as u32);
         emitted_ns.push(round_ns);
         held += kept as u32 + 1;
+        if t0 {
+            session::send("t0");
+            t0 = false;
+        }
     }
 
     // A stop token ends the text; anything the last block committed past it

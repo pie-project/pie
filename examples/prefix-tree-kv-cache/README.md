@@ -36,8 +36,9 @@ for a in [" in a city", " in a forest"]:
     append(branch, a)
     for b in [" at dawn", " at night"]:
         leaf = fork(branch)
-        first = append(leaf, b)
-        generate(leaf, first, num_tokens)
+        append(leaf, b[:-1])
+
+generate(leaves, last tokens of their suffixes, num_tokens)
 ```
 
 ## Parameters
@@ -50,9 +51,10 @@ for a in [" in a city", " in a forest"]:
 
 Every append folds what it wrote (`StateGeometry::folding()`), so the prefix
 is frozen before it is forked and the branches share it rather than copy it.
-The tree is built on one pipeline, which orders each fork after the append it
-forks from; each leaf then decodes on its own pipeline with the usual
-device-carried greedy loop.
+Everything runs on one pipeline, which orders each fork after the append it
+forks from. Each leaf appends its suffix but the last token; one decode pass
+then carries the four leaves as four lanes, each seeded with its suffix's last
+token, in the usual device-carried greedy loop.
 
 ## Run
 

@@ -90,7 +90,7 @@ struct Output {
     num_prompt_tokens: usize,
     num_output_tokens: usize,
     token_ids: Vec<u32>,
-    /// Verify fires after the prefill.
+    /// Verify fires.
     rounds: usize,
     /// Proposals verified, `k` a round.
     drafted: usize,
@@ -118,7 +118,7 @@ async fn main(input: Input) -> Result<Output> {
     let w = k + 1;
     let noise = head.mask_token as i32;
 
-    let mut prompt: Vec<u32> = match &input.prompt_tokens {
+    let prompt: Vec<u32> = match &input.prompt_tokens {
         Some(tokens) => tokens.clone(),
         None => {
             let mut p = chat::system_user(&input.system, &input.prompt);
@@ -126,9 +126,12 @@ async fn main(input: Input) -> Result<Output> {
             p
         }
     };
-    if prompt.is_empty() {
-        prompt.push(0);
-    }
+    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    // The first round's layout is put by the fill: a prompt of one token has none.
+    let (&last, prefix) = prompt_i32
+        .split_last()
+        .filter(|(_, prefix)| !prefix.is_empty())
+        .ok_or("the prompt needs at least two tokens")?;
     let n = prompt.len() as u32;
     let stop_tokens: Vec<u32> = if input.ignore_eos {
         Vec::new()
@@ -153,7 +156,7 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
 
     // ── the draft's inputs: one lane of the block's rows, every one put by
-    //    a pass (the prefill's last chunk lays out the first block, each
+    //    a pass (the fill's last chunk lays out the first block, each
     //    verify the next) — a seeded channel attaches to one pass alone.
     let ring = (channel_capacity() + 7 * frame_size()) as u32;
     let lane = |len: u32, dt| Channel::new([len], dt).capacity(ring);
@@ -177,7 +180,7 @@ async fn main(input: Input) -> Result<Output> {
     };
 
     // The passes are built before anything is submitted: a channel's host
-    // role is read off every pass that claims it, and the prefill's last
+    // role is read off every pass that claims it, and the fill's last
     // chunk puts the draft's inputs that only the draft consumes.
     // ── the draft pass: one lane of the block's rows ─────────────────
     let indptr_d = Channel::from([0u32, block]);
@@ -190,13 +193,13 @@ async fn main(input: Input) -> Result<Output> {
     let readout_v = Channel::from_iter(0..w);
     let slots_v = Channel::new([w], dtype::u32).capacity(ring);
     let kv_len_v = Channel::new([1], dtype::u32).capacity(ring).queued();
-    // The fold: the prefill froze everything, so the first verify freezes
+    // The fold: the fill froze everything, so the first verify freezes
     // nothing more; every verify's epilogue puts what the next one freezes.
     let fold = Channel::from([0u32]);
     let out = Channel::new([w], dtype::i32).capacity(ring);
     // Lays out the verify of the block anchored at `b` (`[1]` u32): its
     // rows at b .. b + w, the lane reading b + w keys. Put a round ahead
-    // (by the prefill, then by each verify for the next), so a verify's
+    // (by the fill, then by each verify for the next), so a verify's
     // descriptors have landed by the time its host reads them, its tokens
     // the one thing the draft between them puts.
     let lay_verify = move |b: &Tensor| {
@@ -284,12 +287,10 @@ async fn main(input: Input) -> Result<Output> {
         lay_verify(&nb);
     });
 
-    // ── PREFILL: the prompt, a pass per readout span; the last one's pick
-    //    anchors, and its epilogue lays out the first block ──────────────
-    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let mut anchor: i32 = 0;
+    // ── FILL: the prompt but its last token, a pass per readout span; the last one lays
+    //    out the first block, anchored at the prompt's last token ─────────
     let spans = readout_spans(
-        n,
+        prefix.len() as u32,
         model::lane_of(&[])?
             .outputs
             .iter()
@@ -298,90 +299,77 @@ async fn main(input: Input) -> Result<Output> {
     );
     let last_span = spans.len() - 1;
     for (at, &(base, end)) in spans.iter().enumerate() {
-        let len = end - base;
-        let toks = Channel::from(&prompt_i32[base as usize..end as usize]);
-        let indptr = Channel::from([0u32, len]);
-        let readout = Channel::from([len - 1]);
-        let next = Channel::new([1], dtype::i32);
-
         let fwd = ForwardPass::new();
-        fwd.embed(&toks, &indptr)?;
-        fwd.readout(&readout)?;
+        fwd.embed(
+            &Channel::from(&prefix[base as usize..end as usize]),
+            &Channel::from([0u32, end - base]),
+        )?;
         fwd.state(&[&ws], StateGeometry::folding())?;
-        let last = at == last_span;
-        fwd.epilogue(move || {
-            let t = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
-            if last {
-                let b = broadcast(Tensor::constant(n), [1]);
-                lay_block(&t, &b);
+        if at == last_span {
+            fwd.epilogue(move || {
+                let b = broadcast(Tensor::constant(n - 1), [1]);
+                lay_block(&broadcast(Tensor::constant(last), [1]), &b);
                 lay_verify(&b);
-            }
-            next.put(&t);
-        });
+            });
+        }
         fwd.submit(&pipe).context("prefill submit")?;
-        anchor = next
-            .take_host::<Vec<i32>>()
-            .await
-            .context("prefill readback")?[0];
-    }
-    if input.report_timing {
-        session::send("t0");
     }
 
-    let mut generated: Vec<u32> = vec![anchor as u32];
+    let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
     let (mut rounds, mut accepted) = (0usize, 0usize);
-    let mut stopped = stop_tokens.contains(&(anchor as u32)) || generated.len() >= input.max_tokens;
+    let mut stopped = false;
 
-    if !stopped {
-        // ── the rounds: draft then verify, a window of them ahead ────────
-        // A round is ONE frame of the two passes: the scheduler's waves are
-        // a frame's slots, so every lane's draft lands in one fire and every
-        // lane's verify in the next — fires of one kind, which replay their
-        // recorded bodies, where lone passes from lanes out of step mix the
-        // two kinds and run eagerly. The draft freezes nothing, so the
-        // verify's fold is the frame's one.
-        let pair = frame_size() >= 2;
-        let rounds_ahead = input
-            .ahead
-            .unwrap_or_else(|| model::run_ahead_window() as usize / frame_size().max(1))
-            .max(1);
-        let budget = input.max_tokens;
-        let submit_round = || -> std::result::Result<(), String> {
-            if pair {
-                submit_frame(&pipe, &[Some(&draft), Some(&verify)])
-            } else {
-                submit_frame(&pipe, &[Some(&draft)])?;
-                submit_frame(&pipe, &[Some(&verify)])
+    // ── the rounds: draft then verify, a window of them ahead ────────────
+    // A round is ONE frame of the two passes: the scheduler's waves are a
+    // frame's slots, so every lane's draft lands in one fire and every
+    // lane's verify in the next — fires of one kind, which replay their
+    // recorded bodies, where lone passes from lanes out of step mix the two
+    // kinds and run eagerly. The draft freezes nothing, so the verify's fold
+    // is the frame's one.
+    let pair = frame_size() >= 2;
+    let rounds_ahead = input
+        .ahead
+        .unwrap_or_else(|| model::run_ahead_window() as usize / frame_size().max(1))
+        .max(1);
+    let budget = input.max_tokens;
+    let submit_round = || -> std::result::Result<(), String> {
+        if pair {
+            submit_frame(&pipe, &[Some(&draft), Some(&verify)])
+        } else {
+            submit_frame(&pipe, &[Some(&draft)])?;
+            submit_frame(&pipe, &[Some(&verify)])
+        }
+    };
+    let (mut submitted, mut consumed) = (0usize, 0usize);
+    while submitted < rounds_ahead.min(budget) {
+        submit_round()?;
+        submitted += 1;
+    }
+    while consumed < submitted && !stopped {
+        let committed = out.take_host::<Vec<i32>>().await?;
+        if consumed == 0 && input.report_timing {
+            session::send("t0");
+        }
+        consumed += 1;
+        rounds += 1;
+        let live: Vec<u32> = committed
+            .iter()
+            .filter(|&&t| t != NONE)
+            .map(|&t| t as u32)
+            .collect();
+        accepted += live.len().saturating_sub(1);
+        for t in live {
+            generated.push(t);
+            if stop_tokens.contains(&t) || generated.len() >= input.max_tokens {
+                stopped = true;
+                break;
             }
-        };
-        let (mut submitted, mut consumed) = (0usize, 0usize);
-        while submitted < rounds_ahead.min(budget) {
+        }
+        // A round commits at least one token: `budget` rounds always
+        // reach the stop.
+        if !stopped && submitted < budget {
             submit_round()?;
             submitted += 1;
-        }
-        while consumed < submitted && !stopped {
-            let committed = out.take_host::<Vec<i32>>().await?;
-            consumed += 1;
-            rounds += 1;
-            let live: Vec<u32> = committed
-                .iter()
-                .filter(|&&t| t != NONE)
-                .map(|&t| t as u32)
-                .collect();
-            accepted += live.len().saturating_sub(1);
-            for t in live {
-                generated.push(t);
-                if stop_tokens.contains(&t) || generated.len() >= input.max_tokens {
-                    stopped = true;
-                    break;
-                }
-            }
-            // A round commits at least one token: `budget` rounds always
-            // reach the stop.
-            if !stopped && submitted < budget {
-                submit_round()?;
-                submitted += 1;
-            }
         }
     }
     pipe.close();

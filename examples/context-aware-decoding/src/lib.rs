@@ -90,9 +90,6 @@ async fn main(input: Input) -> Result<String> {
     if !input.alpha.is_finite() || input.alpha < 0.0 {
         return Err("alpha must be finite and non-negative".into());
     }
-    if input.max_tokens == 0 {
-        return Ok(String::new());
-    }
 
     let vocab = model::output_vocab_size();
     let alpha = input.alpha;
@@ -108,52 +105,36 @@ async fn main(input: Input) -> Result<String> {
         &with_context_text,
     );
     cond_prompt.extend(chat::cue());
-    if cond_prompt.is_empty() {
-        cond_prompt.push(0);
-    }
     let mut uncond_prompt =
         chat::system_user("Answer using only the provided context.", &input.query);
     uncond_prompt.extend(chat::cue());
-    if uncond_prompt.is_empty() {
-        uncond_prompt.push(0);
-    }
 
-    let nc = u32::try_from(cond_prompt.len()).map_err(|_| "prompt is too long")?;
-    let nu = u32::try_from(uncond_prompt.len()).map_err(|_| "query is too long")?;
+    let cond_prompt: Vec<i32> = cond_prompt.into_iter().map(|t| t as i32).collect();
+    let uncond_prompt: Vec<i32> = uncond_prompt.into_iter().map(|t| t as i32).collect();
+    let (&cond_last, cond_head) = cond_prompt.split_last().ok_or("empty prompt")?;
+    let (&uncond_last, uncond_head) = uncond_prompt.split_last().ok_or("empty query")?;
 
     let uncond_ws = WorkingSet::new();
     let cond_ws = WorkingSet::new();
     let streams = [&uncond_ws, &cond_ws];
     let pipeline = Pipeline::new();
 
-    // Each prompt's last token is the first decode input, so both logit rows are born together.
-    if nu < 2 || nc < 2 {
-        return Err("each templated prompt must hold at least two tokens".into());
+    let (mut toks, mut indptr, mut states) = (Vec::new(), vec![0u32], Vec::new());
+    for (ws, head) in [(&uncond_ws, uncond_head), (&cond_ws, cond_head)] {
+        if !head.is_empty() {
+            toks.extend_from_slice(head);
+            indptr.push(toks.len() as u32);
+            states.push(ws);
+        }
     }
-    let (pu, pc) = (nu - 1, nc - 1);
-    let toks: Vec<i32> = uncond_prompt[..pu as usize]
-        .iter()
-        .chain(&cond_prompt[..pc as usize])
-        .map(|&t| t as i32)
-        .collect();
-    let pre_toks = Channel::from(toks);
-    let pre_indptr = Channel::from([0u32, pu, pu + pc]);
-    let drop = Channel::new([1], dtype::i32);
-    let prefill = ForwardPass::new();
-    prefill.embed(&pre_toks, &pre_indptr)?;
-    prefill.state(&streams, StateGeometry::folding())?;
-    // A pass needs an epilogue; this one's output is drained and dropped.
-    prefill.epilogue(move || {
-        let flat = reshape(intrinsics::output(0, "logits"), [2 * vocab]);
-        drop.put(reshape(cast(reduce_argmax(flat), dtype::i32), [1]));
-    });
-    prefill.submit(&pipeline).context("prefill")?;
-    drop.take_host::<i32>().await?;
+    if !states.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(&Channel::from(toks), &Channel::from(indptr))?;
+        fill.state(&states, StateGeometry::folding())?;
+        fill.submit(&pipeline).context("prefill")?;
+    }
 
-    let toks = Channel::from([
-        *uncond_prompt.last().unwrap() as i32,
-        *cond_prompt.last().unwrap() as i32,
-    ]);
+    let toks = Channel::from([uncond_last, cond_last]);
     let embed_indptr = Channel::from([0u32, 1, 2]);
     let out = Channel::new([3], dtype::f32).capacity(channel_capacity() as u32);
 

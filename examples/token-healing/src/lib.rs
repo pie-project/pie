@@ -142,63 +142,53 @@ async fn main(input: Input) -> Result<Output> {
     // healed run rolls it back and re-expands it under the prefix mask. Anything
     // else would compare healing against a *truncated* prompt rather than
     // against the artefact it exists to repair.
-    let (mut prompt, first_mask) = if input.heal {
-        (full[..split].to_vec(), prefix_mask)
+    let (prompt, first_mask) = if input.heal {
+        (&full[..split], prefix_mask)
     } else {
-        (full.clone(), vec![true; vocab as usize])
+        (&full[..], vec![true; vocab as usize])
     };
-    if prompt.is_empty() {
-        prompt.push(0);
+    let prompt: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
+
+    let pipeline = Pipeline::new();
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipeline).context("token-healing prefill")?;
     }
 
-    let n = prompt.len() as u32;
+    // The healing mask binds the first step only; every later step allows all.
+    let heal_mask = Channel::from(first_mask);
+    let token_in = Channel::from([last]);
+    let embed_indptr = Channel::from([0u32, 1]);
+    let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
 
-    let prompt_tokens = Channel::from_iter(prompt.iter().map(|&t| t as i32));
-    let prefill_indptr = Channel::from([0u32, n]);
-    let heal_mask = Channel::new([vocab], dtype::bool);
-    let first_out = Channel::new([1], dtype::i32);
-
-    let prefill = ForwardPass::new();
-    prefill.embed(&prompt_tokens, &prefill_indptr)?;
-    prefill.state(&[&ws], StateGeometry::folding())?;
-    prefill.epilogue(move || {
+    let decode = ForwardPass::new();
+    decode.embed(&token_in, &embed_indptr)?;
+    decode.state(&[&ws], StateGeometry::folding())?;
+    decode.epilogue(move || {
         let allowed = heal_mask.take();
-        first_out.put(reshape(
+        let token = reshape(
             masked_argmax(intrinsics::output(0, "logits"), &allowed),
             [1],
-        ));
+        );
+        heal_mask.put(broadcast(true, [vocab]));
+        token_in.put(&token);
+        token_out.put(&token);
     });
 
-    heal_mask.put(first_mask);
-    let pipeline = Pipeline::new();
-    prefill.submit(&pipeline).context("token-healing prefill")?;
-    let first = first_out.take_host::<i32>().await? as u32;
-
-    let mut generated = vec![first];
-
-    if generated.len() < input.max_tokens {
-        let token_in = Channel::from([first as i32]);
-        let embed_indptr = Channel::from([0u32, 1]);
-        let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-
-        let decode = ForwardPass::new();
-        decode.embed(&token_in, &embed_indptr)?;
-        decode.state(&[&ws], StateGeometry::folding())?;
-        decode.epilogue(move || {
-            let token = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
-            token_in.put(&token);
-            token_out.put(&token);
-        });
-
-        let budget = input.max_tokens - 1;
-        run_ahead(&pipeline, &decode, budget, async || {
-            let token = token_out.take_host::<i32>().await? as u32;
-            generated.push(token);
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    }
+    let mut generated = Vec::with_capacity(input.max_tokens);
+    run_ahead(&pipeline, &decode, input.max_tokens, async || {
+        generated.push(token_out.take_host::<i32>().await? as u32);
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipeline.close();
+    let first = generated[0];
 
     // One more host query at the size of the question: the bytes of the one
     // token the model chose, to check the prompt survived the healing.

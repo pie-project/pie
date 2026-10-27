@@ -143,7 +143,6 @@ async fn main(input: Input) -> Result<Output> {
     if input.side == 0 {
         return Err("side must be at least one pixel".into());
     }
-    let max_tokens = input.max_tokens.max(1);
 
     // ── THE PICTURES. Bytes in, and the host decides everything about them.
     let pictures: Vec<Vec<u8>> = match &input.image_b64 {
@@ -190,34 +189,18 @@ async fn main(input: Input) -> Result<Output> {
     //
     // The rows after an M-RoPE span, and the decode, rotate where the host says it leaves off.
     let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
-    let toks_p = Channel::from(&prompt_i32[..]);
-    let embed_indptr_p = Channel::from([0u32, n]);
-    let g0_ch = Channel::new([1], dtype::i32);
-
-    let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    // One span per token run, matched by order; the host checks it.
-    let spans: Vec<media::Span> = images.iter().map(media::Span::Image).collect();
-    fwd_p.media(0, &spans)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
-    fwd_p.epilogue(move || {
-        g0_ch.put(sample_token());
-    });
-    fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = g0_ch.take_host::<i32>().await?;
-
-    let chat_dec = chat::Decoder::new();
-    let mut text = String::new();
-    let mut done = stop.contains(&(g0 as u32));
-    if !done {
-        match chat_dec.feed(&[g0 as u32])? {
-            chat::Event::Delta(s) => text.push_str(&s),
-            chat::Event::Done(s) => {
-                text = s;
-                done = true;
-            }
-            _ => {}
-        }
+    let (&last, head) = prompt_i32.split_last().ok_or("empty prompt")?;
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        // One span per token run, matched by order; the host checks it.
+        let spans: Vec<media::Span> = images.iter().map(media::Span::Image).collect();
+        fill.media(0, &spans)?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe).context("prefill submit")?;
     }
 
     // ───────────────── 2. THE DECODE LOOP (TEXT ONLY, 1-WIDE) ───────────────
@@ -227,12 +210,7 @@ async fn main(input: Input) -> Result<Output> {
     // Its tokens are sampled ids, so the run scan finds nothing in them —
     // which is exactly the right answer for a fire that attached nothing. It
     // rotates where the working set says: behind its slot, past a span.
-    let budget = if done {
-        0
-    } else {
-        max_tokens.saturating_sub(1)
-    };
-    let tok_in = Channel::from([g0]);
+    let tok_in = Channel::from([last]);
     let out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
     let lane1 = Channel::from([0u32, 1u32]);
 
@@ -245,7 +223,9 @@ async fn main(input: Input) -> Result<Output> {
         out.put(&tok);
     });
 
-    run_ahead(&pipe, &fwd, budget, async || {
+    let chat_dec = chat::Decoder::new();
+    let mut text = String::new();
+    run_ahead(&pipe, &fwd, input.max_tokens, async || {
         let t = out.take_host::<Vec<i32>>().await?;
         let token = *t.first().unwrap_or(&0) as u32;
         if stop.contains(&token) {
