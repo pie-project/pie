@@ -1,0 +1,67 @@
+# Manifold hyper-connections: the residual stream carried as several streams,
+# each sublayer reading its input out of them through a mix and folding its
+# output back; and the experts a following router is predicted to take.
+
+def hyper(streams, norm_eps, gate_eps, alpha, sinkhorn, single_pass = False):
+    """The streams' shape and the constants their gates are computed with;
+    under `single_pass` each sublayer's input mix is the one the previous
+    sublayer predicted."""
+    return struct(
+        streams = streams,
+        norm_eps = norm_eps,
+        gate_eps = gate_eps,
+        alpha = alpha,
+        sinkhorn = sinkhorn,
+        single_pass = single_pass,
+    )
+
+def mix(n, name, streams, hidden, dynamic = True):
+    """A sublayer's mix `name` over `streams` streams `hidden` wide: a
+    static `base` and `scale`, and with `dynamic` a projection of the
+    normed streams added to it."""
+    width = 2 * streams + streams * streams
+    return struct(
+        scale = weight([3], dtype.f32),
+        base = weight([width], dtype.f32),
+        dynamic = weight([width, streams * hidden], dtype.f32) if dynamic else None,
+    )
+
+def mixes(normed, mix, hy):
+    """`mix`'s per-row mixes of the `normed` streams: its dynamic
+    projection, or with none the leading rows of the streams."""
+    if mix.dynamic != None:
+        return ops.elemwise.hc_project(normed, mix.dynamic, hy.streams)
+    head, _ = ops.gather.split_rows(normed, mix.base.shape[0])
+    return head
+
+def gate(streams, mix, hy):
+    """The sublayer input `mix` reads out of `streams`, and the post and
+    combine mixes its output is folded back with."""
+    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
+    return ops.elemwise.hc_gates(
+        mixes(normed, mix, hy),
+        streams,
+        mix.scale,
+        mix.base,
+        hy.streams,
+        hy.gate_eps,
+        hy.alpha,
+        hy.sinkhorn,
+    )
+
+def collapse(streams, head, hy):
+    """The streams collapsed into one row through the mix `head`."""
+    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
+    mixed = ops.elemwise.hc_project(normed, head.dynamic, hy.streams)
+    return ops.elemwise.hc_collapse(mixed, streams, head.scale, head.base, hy.streams, hy.gate_eps)
+
+# How many experts the next layer's router is predicted to take.
+PREDICT_K = 16
+
+def predict_route(streams, hy, mix, norm, norm_eps, router, bias, experts):
+    """The experts a following MLP's router is predicted to take: the
+    streams through its `mix` and `norm`, scored by its `router`."""
+    x, _, _ = gate(streams, mix, hy)
+    x = ops.elemwise.rmsnorm(x, norm, norm_eps)
+    logits = ops.linear.matmul(x, router)
+    return ops.linear.moe_route(logits, experts, PREDICT_K, routing.predict(), bias = bias)[0]

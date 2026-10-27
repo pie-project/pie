@@ -5,6 +5,7 @@
 
 load("//pie/codec.poem", "bank", "dequantized", "kept", "land", read_weight = "weight")
 load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/mla.poem", "attend", "fp8_rows", "cache")
 
 STOP = ["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"]
 CHATML = template("chatml", thinking = True, tools = True, stop = STOP)
@@ -412,23 +413,6 @@ def moe(reads, at, f):
 # or routed SwiGLU MLP; and the MTP head drafting from the trunk's last
 # hidden rows.
 
-# An e4m3 kv deployment keeps the latent rows as vLLM's standard fp8 rows: the
-# 512 latent and 64 rotated dims e4m3 under one scale of 1, 576 bytes a
-# position in a u8 plane. The index keys stay at bf16.
-FP8_ROW = 576
-
-def fp8_rows(m):
-    return m.kv == dtype.e4m3
-
-def cache(c, space, a, fp8 = False):
-    """`a`'s latent rows in the kv `space`."""
-    if fp8:
-        if a.kv_lora_rank != 512 or a.qk_rope_head_dim != 64:
-            fail("fp8 latent rows hold 512 latent and 64 rotated dims, and this attention's are {} and {}".format(a.kv_lora_rank, a.qk_rope_head_dim))
-        c.kv(space, a.kv, [FP8_ROW], a.qk_rope_head_dim, rows = "fp8")
-        return
-    c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
-
 def run_attention(x, inputs, a, positions = None, select = None, prefill_only = False):
     """Latent attention of the rows `x`, and the selection it read through.
     `select(q_a)`, if given, picks the keys each query reads; `positions`
@@ -487,20 +471,6 @@ def run_attention(x, inputs, a, positions = None, select = None, prefill_only = 
             rotary.partial(a.qk_rope_head_dim),
         )
     return attend(x, inputs, q_nope, q_pe, a, selection, prefill_only), selection
-
-def attend(x, inputs, q_nope, q_pe, a, selection = None, prefill_only = False):
-    """The split queries `q_nope`/`q_pe` of the rows `x` scored against the
-    latent kv (or the `selection` of it), through `a`'s output projection;
-    with `prefill_only` every lane through the prefill arm, as the draft
-    head's rows are."""
-    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
-                                 selection = selection, prefill_only = prefill_only)
-
-    o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    if a.gate != None:
-        o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
-    return ops.linear.matmul(o, a.o_proj)
 
 def caches(m, c):
     fp8 = fp8_rows(m)
