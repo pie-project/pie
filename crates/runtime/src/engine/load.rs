@@ -385,11 +385,11 @@ pub fn conversion_contract(
     source: &ztensor::Source,
     metadata: &Metadata,
     platform: Platform,
-) -> Option<(&'static str, ModelContract)> {
+) -> Option<(String, ModelContract)> {
     let target = convert_target();
     let trace = std::env::var_os("PIE_IMPORT_TRACE").is_some_and(|v| v != "0");
     let pinned = std::env::var("PIE_IMPORT_DEPLOYMENT").ok();
-    for deployment in catalog().candidates() {
+    for deployment in catalog().candidates_of(source, platform) {
         let read = deployment.contract(source, platform);
         if pinned
             .as_deref()
@@ -421,7 +421,7 @@ pub fn conversion_contract(
             continue;
         }
         match checkpoint::plan::compile(metadata, &contract, target.clone()) {
-            Ok(_) => return Some((&deployment.name, contract)),
+            Ok(_) => return Some((deployment.name, contract)),
             Err(why) => {
                 if trace {
                     eprintln!(

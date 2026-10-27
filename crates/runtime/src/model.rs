@@ -102,7 +102,7 @@ pub fn register(
         tokenizer,
         vocab: OnceLock::new(),
         vocab_size: deployment.model.vocab,
-        num_layers: deployment.model.layers,
+        num_layers: deployment.deploy.layers.unwrap_or(deployment.model.layers),
         generative,
         identity,
     });

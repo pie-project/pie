@@ -100,6 +100,8 @@ pub fn reads(dir: &Path, id: &str, w: poem::Dtype, kvs: &[(&str, Kv)]) -> Vec<St
         drafter: None,
         yarn: None,
         tap: None,
+        layers: None,
+        experts: None,
     };
     let mut names: Vec<String> = Vec::new();
     loop {

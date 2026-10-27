@@ -291,7 +291,7 @@ impl Model {
     }
 
     /// The name a deployment of this model is served under:
-    /// `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tap.{key}][-tp{n}][-ep{n}]`, its parts in
+    /// `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-l{n}][-e{n}][-yarn{f}][-tap.{key}][-tp{n}][-ep{n}]`, its parts in
     /// the order the model states them.
     #[must_use]
     pub fn name(&self, deploy: &Deploy) -> String {
@@ -310,6 +310,12 @@ impl Model {
         }
         name.push_str("-kv-");
         name.push_str(&word(deploy.kv));
+        if let Some(layers) = deploy.layers {
+            name.push_str(&format!("-l{layers}"));
+        }
+        if let Some(experts) = deploy.experts {
+            name.push_str(&format!("-e{experts}"));
+        }
         if let Some(factor) = deploy.yarn {
             name.push_str(&format!("-yarn{factor}"));
         }
@@ -350,6 +356,17 @@ impl Model {
             weights.push(precision_of(word)?);
         }
         let kv = dtype_of(words.next()?)?;
+        let mut count = |prefix: char| {
+            let n = words
+                .peek()
+                .and_then(|w| w.strip_prefix(prefix))
+                .and_then(|n| n.parse().ok())
+                .filter(|n| *n > 0)?;
+            words.next();
+            Some(n)
+        };
+        let layers = count('l');
+        let experts = count('e');
         let yarn = match words.peek().and_then(|w| w.strip_prefix("yarn")) {
             Some(factor) => {
                 let factor = factor.parse().ok().filter(|f| *f > 1)?;
@@ -388,6 +405,8 @@ impl Model {
             drafter,
             yarn,
             tap,
+            layers,
+            experts,
         })
     }
 }
@@ -541,6 +560,8 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
                 drafter: drafter.into_option(),
                 yarn: None,
                 tap: None,
+                layers: None,
+                experts: None,
             },
         })
     }

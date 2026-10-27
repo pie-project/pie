@@ -78,6 +78,10 @@ pub struct Deploy {
     /// The intermediate the forward ends at and reads out in place of its
     /// own result (`-tap.{key}` in its name), for a parity check.
     pub tap: Option<String>,
+    /// A miniature's depth and routed expert count where its checkpoint is
+    /// cut to others than its package's (`-l{n}`, `-e{n}` in its name).
+    pub layers: Option<u32>,
+    pub experts: Option<u32>,
 }
 
 impl Deploy {
@@ -113,6 +117,14 @@ impl Deploy {
                     Some(key) => heap.alloc(key.as_str()),
                     None => Star::new_none(),
                 },
+            ),
+            (
+                "layers",
+                self.layers.map_or(Star::new_none(), |n| heap.alloc(n)),
+            ),
+            (
+                "experts",
+                self.experts.map_or(Star::new_none(), |n| heap.alloc(n)),
             ),
         ]))
     }

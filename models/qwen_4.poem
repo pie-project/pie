@@ -385,13 +385,17 @@ def layout(id, deploy):
             fail(refused)
         return build(mix_of(deploy.weights[0]), deploy.kv, rope, MICRO, HASHES["micro"], False, False)
     if id == "qwen38-flash-next-mini":
+        mini = MINI
+        if deploy.layers or deploy.experts:
+            experts = deploy.experts or MINI.experts
+            mini = dims(layers = deploy.layers or MINI.layers, experts = experts, top_k = min(MINI.top_k, experts), ple = MINI.ple)
         if mixed:
-            return build(MIXED_2BIT, deploy.kv, rope, MINI, HASHES["mini"], False, False)
+            return build(MIXED_2BIT, deploy.kv, rope, mini, HASHES["mini"], False, False)
         if nvfp4 != None:
-            return build(nvfp4, deploy.kv, rope, MINI, HASHES["mini"], False, False)
+            return build(nvfp4, deploy.kv, rope, mini, HASHES["mini"], False, False)
         if len(deploy.weights) != 1:
             fail(refused)
-        return build(mix_of(deploy.weights[0]), deploy.kv, rope, MINI, HASHES["mini"], False, False)
+        return build(mix_of(deploy.weights[0]), deploy.kv, rope, mini, HASHES["mini"], False, False)
     if len(deploy.weights) == 1 and not vision and deploy.drafter == None:
         return build(mix_of(deploy.weights[0]), deploy.kv, rope, FLASH, HASHES["flash"], False, False)
     if mixed and (mtp or deploy.drafter == None):

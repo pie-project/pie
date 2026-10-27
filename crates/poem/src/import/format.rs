@@ -235,6 +235,15 @@ fn agrees(src: &ztensor::Source, states: &[Stated]) -> Result<(), String> {
     Ok(())
 }
 
+/// The number `src`'s configuration states at the dotted `path`, if it states one.
+#[must_use]
+pub fn stated(src: &ztensor::Source, path: &str) -> Option<f64> {
+    src.attributes()
+        .and_then(|a| a.get(CONFIG))
+        .and_then(|c| at_path(c, path))
+        .and_then(number)
+}
+
 fn at_path<'v>(value: &'v Value, path: &str) -> Option<&'v Value> {
     path.split('.').try_fold(value, |at, key| at.get(key))
 }

@@ -181,6 +181,8 @@ def ranks(d, l):
 
 def layout(id, deploy):
     d = DIMS[id]
+    if deploy.layers or deploy.experts:
+        d = glm53(layers = deploy.layers or d.layers, experts = deploy.experts or d.experts)
     mtp = deploy.drafter == "mtp"
     ws = deploy.weights
     if mtp and len(ws) == 3:

@@ -50,7 +50,7 @@ def dims(layers = 60, experts = 128):
         theta = 5000000.0,
         dense_inter = 12288,
         experts = experts,
-        top_k = 4,
+        top_k = min(4, experts),
         inter = 3072,
         shared_inter = 3072,
         routed_scaling = 2.0,
@@ -151,6 +151,8 @@ def layout(id, deploy):
     if not mixed and (len(deploy.weights) != 1 or deploy.weights[0] not in [dtype.bf16, dtype.u4g64, MX8]) or deploy.parts or deploy.drafter != None:
         fail("{} does not ship {}".format(id, deploy))
     d = DIMS[id]
+    if deploy.layers or deploy.experts:
+        d = dims(layers = deploy.layers or d.layers, experts = deploy.experts or d.experts)
     mix = mix_of(deploy.weights if mixed else deploy.weights[0])
     dense = compute(mix.proj)
 

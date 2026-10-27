@@ -70,7 +70,7 @@ def nano(layers, experts):
         state_dim = 128,
         conv_kernel = 4,
         experts = experts,
-        top_k = 6,
+        top_k = min(6, experts),
         latent = None,
         moe_inter = 1856,
         shared_inter = 3712,
@@ -96,7 +96,7 @@ def dims(layers, pattern = SUPER, wide = 1, experts = 512):
         state_dim = 128,
         conv_kernel = 4,
         experts = experts,
-        top_k = 22,
+        top_k = min(22, experts),
         latent = 1024 * wide,
         moe_inter = 2688 if wide == 1 else 5120,
         shared_inter = 5376 if wide == 1 else 10240,
@@ -136,6 +136,8 @@ def layout(id, deploy):
     if DIMS[id].latent == None:
         return nano_layout(id, deploy)
     d = DIMS[id]
+    if deploy.layers or deploy.experts:
+        d = dims(deploy.layers or d.layers, d.pattern, d.hidden // 4096, deploy.experts or d.experts)
     if deploy.drafter != None or deploy.parts:
         fail("{} has no draft head or parts here; not {}".format(id, deploy))
     plain = deploy.weights == [dtype.bf16]
@@ -238,6 +240,8 @@ def nano_layout(id, deploy):
     r = roles(deploy, "proj", "experts")
     proj, experts = r.proj, r.experts
     d = DIMS[id]
+    if deploy.layers or deploy.experts:
+        d = nano(deploy.layers or d.layers, deploy.experts or d.experts)
     hidden = d.hidden
     inner = d.mamba_heads * d.mamba_head_dim
     conv_dim = inner + 2 * d.groups * d.state_dim

@@ -40,6 +40,8 @@ fn deploy(weights: &[Dtype], tp: u32, parts: &[&str], drafter: Option<&str>) -> 
         drafter: drafter.map(str::to_string),
         yarn: None,
         tap: None,
+        layers: None,
+        experts: None,
     }
 }
 
