@@ -237,6 +237,71 @@ pub fn rmsnorm_gated_by(
     gated_rms(f, OP, x, gate, Some(weight), x.width / heads, eps, true, y)
 }
 
+/// Muse Spark's post-norm and residual gate (`elemwise.norm_gate`): `u = x *
+/// scale` rounded (`x` with no scale), `n = rmsnorm(u)` unscaled and rounded,
+/// and with a residual `y = alpha * res + beta * n` (`w = gate / temperature`
+/// a column, `beta = sigmoid(w)`, `alpha = sqrt(max(sigmoid(-w) * (1 + beta),
+/// 1e-3))`), else `y = n`. With `next` (its weight, eps, plus-one), also the
+/// next sublayer's input norm over the rounded `y`. Returns `(y, z)`.
+pub fn norm_gate(
+    f: &mut Func,
+    x: Operand,
+    scale: Option<Operand>,
+    res: Option<(Operand, Operand)>,
+    eps: f32,
+    temperature: f32,
+    next: Option<(Operand, f32, bool)>,
+    y: Landing,
+) -> Result<(Val, Option<Val>), Error> {
+    const OP: &str = "elemwise.norm_gate";
+    let elem = crate::check::elem_of(OP, x.dtype)?;
+    if y.rows != x.rows || y.width != x.width {
+        return Err(refuse(OP, "the gate lands the rectangle it norms"));
+    }
+    let round = |f: &mut Func, v: Val| {
+        let v = f.convert(v, elem);
+        f.convert(v, Elem::F32)
+    };
+    let (rows, width) = (x.rows, x.width);
+    let mut u = x.f32(f);
+    if let Some(scale) = scale {
+        let s = row_of(f, scale, rows, width)?;
+        let us = f.mul(u, s)?;
+        u = round(f, us);
+    }
+    let n = inv_rms_rows(f, OP, u, width, eps)?;
+    let n = round(f, n);
+    let out = match res {
+        None => n,
+        Some((res, gate)) => {
+            let g = row_of(f, gate, rows, width)?;
+            let w = f.scale(g, 1.0 / f64::from(temperature))?;
+            let beta = f.sigmoid(w);
+            let nw = f.scale(w, -1.0)?;
+            let sn = f.sigmoid(nw);
+            let one_b = f.offset(beta, 1.0)?;
+            let a2 = f.mul(sn, one_b)?;
+            let floor = f.const_f(Elem::F32, 1e-3, &[i64::from(rows), i64::from(width)]);
+            let a2 = f.max(a2, floor)?;
+            let alpha = f.sqrt(a2);
+            let r = res.f32(f);
+            let ar = f.mul(alpha, r)?;
+            let bn = f.mul(beta, n)?;
+            f.add(ar, bn)?
+        }
+    };
+    let z = match next {
+        None => None,
+        Some((weight, next_eps, plus_one)) => {
+            let o = round(f, out);
+            let zn = inv_rms_rows(f, OP, o, width, next_eps)?;
+            let g = gain(f, weight.val, i64::from(rows), i64::from(width), plus_one)?;
+            Some(f.mul(zn, g)?)
+        }
+    };
+    Ok((out, z))
+}
+
 /// `y + x`, the new `y`.
 pub fn residual_add(f: &mut Func, x: Operand, y: Operand) -> Result<Val, Error> {
     const OP: &str = "elemwise.residual_add";
