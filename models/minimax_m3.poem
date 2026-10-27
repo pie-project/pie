@@ -136,7 +136,8 @@ def routed(n, d, mix, dense):
     return struct(
         router = weight([d.experts, d.hidden]),
         bias = weight([d.experts], dtype.f32),
-        gate_up = weight([d.experts, 2 * d.inter, d.hidden], mix.experts),
+        gate = weight([d.experts, d.inter, d.hidden], mix.experts),
+        up = weight([d.experts, d.inter, d.hidden], mix.experts),
         down = weight([d.experts, d.hidden, d.inter], mix.experts),
         shared = mlp(d, d.shared_inter, mix.proj),
         experts = d.experts,
@@ -243,32 +244,18 @@ def read(m, reads):
         moe = lambda leaf: n("block_sparse_moe." + leaf)
         reads.read(f.router, moe("gate.weight"))
         reads.read(f.bias, moe("e_score_correction_bias"))
-        leg = lambda e, w: moe("experts.{}.{}.weight".format(e, w))
-        if f.gate_up.dtype in [dtype.nvfp4, dtype.nvfp4a4]:
-            # MiniMax-M3.1-Flash: its experts compressed-tensors NVFP4 beside MXFP8 projections
-            nvfp4_packed_bank(reads, f.gate_up, [[moe("experts.{}.w1".format(e)), moe("experts.{}.w3".format(e))] for e in range(f.experts)])
-            nvfp4_packed_bank(reads, f.down, [[moe("experts.{}.w2".format(e))] for e in range(f.experts)])
-        elif kept(f.gate_up):
-            bank(reads, f.gate_up, [[leg(e, "w1"), leg(e, "w3")] for e in range(f.experts)])
-            bank(reads, f.down, [[leg(e, "w2")] for e in range(f.experts)])
-        elif has(moe("experts.0.w1.weight_packed")):
-            # MiniMax-M3.1-Flash's NVFP4 experts read at this deployment's dtype: widened first
-            widened = lambda e, w: nvfp4_packed_widened(reads, moe("experts.{}.{}".format(e, w)))
-            hidden = f.down.shape[1]
-            land(reads, f.gate_up, concat(0, [
-                concat(0, [widened(e, "w1"), widened(e, "w3")]).transmute([1, 2 * f.inter, hidden], raw(dtype.bf16))
-                for e in range(f.experts)
-            ]))
-            land(reads, f.down, concat(0, [
-                widened(e, "w2").transmute([1, hidden, f.inter], raw(dtype.bf16))
-                for e in range(f.experts)
-            ]))
-        else:
-            gate_up = []
-            for e in range(f.experts):
-                gate_up += [leg(e, "w1"), leg(e, "w3")]
-            expert_bank(reads, f.gate_up, gate_up)
-            expert_bank(reads, f.down, [leg(e, "w2") for e in range(f.experts)])
+        for b, x in [(f.gate, "w1"), (f.up, "w3"), (f.down, "w2")]:
+            stems = [moe("experts.{}.{}".format(e, x)) for e in range(f.experts)]
+            if b.dtype in [dtype.nvfp4, dtype.nvfp4a4]:
+                # MiniMax-M3.1-Flash: its experts compressed-tensors NVFP4 beside MXFP8 projections
+                nvfp4_packed_bank(reads, b, [[stem] for stem in stems])
+            elif kept(b):
+                bank(reads, b, [[stem + ".weight"] for stem in stems])
+            elif has(stems[0] + ".weight_packed"):
+                # MiniMax-M3.1-Flash's NVFP4 experts read at this deployment's dtype: widened first
+                land(reads, b, concat(0, [nvfp4_packed_widened(reads, stem).transmute([1] + b.shape[1:], raw(dtype.bf16)) for stem in stems]))
+            else:
+                expert_bank(reads, b, [stem + ".weight" for stem in stems])
         read_mlp(reads, f.shared, lambda leaf: moe("shared_experts." + leaf))
 
 def read_mlp(reads, f, n):
@@ -323,7 +310,8 @@ def moe(x, f):
         bias = f.bias,
     )
 
-    act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, experts, f.top_k), gating.swiglu_alpha(f.alpha), f.inter, limit = f.limit)
+    gate = ops.linear.moe_matmul_select(x, f.gate, experts, f.top_k)
+    act = ops.linear.glu(gate, gating.swiglu_alpha(f.alpha), up = ops.linear.moe_matmul_select(x, f.up, experts, f.top_k), limit = f.limit)
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, experts, f.top_k), weights)
     return ops.elemwise.residual_add(swiglu_oai(x, f.shared), routed)
 
