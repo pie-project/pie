@@ -142,7 +142,7 @@ impl Package {
         let before = crate::star::layout::COMPUTE.with(|c| c.replace(compute));
         let m = eval.eval_function(layout, &[heap.alloc(id), deploy.alloc(heap)], &[]);
         crate::star::layout::COMPUTE.with(|c| c.set(before));
-        Ok(crate::star::paths::named(heap, m.map_err(error)?))
+        crate::star::paths::named(heap, m.map_err(error)?)
     }
 
     /// What `id`'s deployment `deploy` states of itself as a generative

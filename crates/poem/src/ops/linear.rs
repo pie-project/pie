@@ -9,6 +9,7 @@ pub fn matmul(act: &Value, w: &Weight) -> Value {
         "`{}` is stored block-fp8, which a W8A8 product reads; declare it at fp8b128a8, fp8b32a8g32 or mxfp8a8g32",
         w.name,
     );
+    let act = &turned(act, w);
     let r = act.rec();
     let y = r.fresh(tensor(act.rows(), w.dim(0), act.dtype()));
     match w.act {
@@ -46,6 +47,18 @@ pub fn matmul(act: &Value, w: &Weight) -> Value {
         ),
     }
     y
+}
+
+/// `act` as `w` reads it: turned by `w`'s `H·S` on a copy every product
+/// stored against the same turn shares, `act` itself kept for its others.
+fn turned(act: &Value, w: &Weight) -> Value {
+    let Some(t) = &w.turn else {
+        return act.clone();
+    };
+    let key = format!("turn {:?} {:?} {} {}", act.id(), act.cond(), t.signs.name, t.block);
+    act.rec().shared(key, || {
+        super::elemwise::hadamard_signed(&super::elemwise::copy(act), t.block, &t.signs)
+    })
 }
 
 /// The static global a format quantizes `w`'s activations under, the
@@ -89,6 +102,7 @@ pub fn matmul_f32(act: &Value, w: &Weight) -> Value {
 
 pub fn lm_head(act: &Value, w: &Weight) -> Value {
     unquantized(w, "a head");
+    let act = &turned(act, w);
     let r = act.rec();
     let y = r.fresh(tensor(act.rows(), w.dim(0), act.dtype()));
     r.push(

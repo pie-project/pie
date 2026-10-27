@@ -37,7 +37,16 @@ pub fn embed(ids: &Value, table: &Weight, vocab: u32) -> Value {
         },
         &[ids],
     );
-    y
+    // A table stored turned, `row·S·H`, turns its rows back by `S·H`:
+    // `H·(H·S·(H·y))`, as `H·H` is one.
+    match &table.turn {
+        Some(t) => {
+            let hy = super::elemwise::hadamard_plain(&y, t.block);
+            let hshy = super::elemwise::hadamard_signed(&hy, t.block, &t.signs);
+            super::elemwise::hadamard_plain(&hshy, t.block)
+        }
+        None => y,
+    }
 }
 
 pub fn embed_weighted(ids: &Value, weights: &Value, table: &Weight, vocab: u32) -> Value {
