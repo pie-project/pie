@@ -2,7 +2,7 @@
 # eight layers of the whole model's checkpoint.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 
 ATEM = template("atem")
 
@@ -190,8 +190,7 @@ def forward(m, inputs):
 
         gate = ops.linear.matmul(normed, w.gate)
         o = ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(a, gate), w.o_proj)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(normed.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(normed, o, w, routes)
 
         y = ops.elemwise.residual_add(
             ops.elemwise.rmsnorm_plus_one(o, w.post_attn_norm, w.post_attn_norm_eps),

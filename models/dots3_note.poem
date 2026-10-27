@@ -1,7 +1,7 @@
 # Dots3 NOTE: the text half of the released model, and its six-layer,
 # 16-expert miniature.
 
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 
 DOTS = template("dots")
 TOKENIZER = tokenizer(markers = [
@@ -334,8 +334,7 @@ def forward(m, inputs):
             o = run_attention(x, inputs, a, select = lambda q_a: index_select(x, q_a, inputs, a.indexer))
         else:
             o = run_attention(x, inputs, a)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(x, o, w, routes)
         y = ops.elemwise.residual_add(o, y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, w.mlp_norm_eps)

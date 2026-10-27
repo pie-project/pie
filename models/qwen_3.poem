@@ -5,7 +5,7 @@
 # it that tests trace and import by id.
 
 load("//pie/codec.poem", "bank", "kept", read_fused = "fused", read_weight = "weight")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", "markov", "selector", dflash_caches = "caches", dflash_declare = "declare", dflash_head = "head")
 load("//lib/media.poem", "smart_resize")
 load("//lib/rope.poem", "yarn")
@@ -1350,8 +1350,7 @@ def forward(m, inputs):
             o = attn_mixer(x, inputs, m, trunk_inputs, w.attn)
         else:
             o = gdn_mixer(x, inputs, w.gdn)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(x, o, w, routes)
         y = ops.elemwise.residual_add(o, y)
 
         x = ops.elemwise.rmsnorm_plus_one(y, w.mlp_norm, w.mlp_norm_eps)

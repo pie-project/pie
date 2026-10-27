@@ -3,7 +3,7 @@
 # miniature; V4-Pro and its five-layer, sixteen-expert miniature; and the
 # small V4 base.
 
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 
 R1 = template("deepseek")
 TOKENIZER = tokenizer(markers = [["<｜end▁of▁sentence｜>", "<|EOT|>"]])
@@ -1705,8 +1705,7 @@ def layer(m, rows, w, streams, trail, following = None, narrow = False, replays 
     else:
         o = ops.linear.matmul(o, at.o_down)
     o = ops.linear.matmul(o, at.o_up)
-    adapted = fact.has(fact.Adapter)
-    o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, rows.adapters, o.on(adapted))
+    o = corrected(x, o, w, rows.adapters)
     if replays:
         # The correction lands on every row it is read for: a replaying
         # layer's, the decoder's (a DSpark deployment's trunk's).

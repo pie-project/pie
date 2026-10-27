@@ -4,7 +4,7 @@
 # and its seven-layer miniature.
 
 load("//pie/codec.poem", "bank", "dequantized", "kept", "land", read_weight = "weight")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 
 STOP = ["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"]
 CHATML = template("chatml", thinking = True, tools = True, stop = STOP)
@@ -544,8 +544,7 @@ def forward(m, inputs):
             ranked = selection
             select = lambda q_a: ranked
         o, selection = run_attention(x, inputs, a, positions = positions, select = select)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(x, o, w, routes)
         y = ops.elemwise.residual_add(o, y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, w.mlp_norm_eps)

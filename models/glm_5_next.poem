@@ -2,7 +2,7 @@
 # without, and its eight-layer, 32-expert miniature.
 
 load("//pie/codec.poem", "bank", "dequantized", "kept", read_weight = "weight", landed = "land")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/media.poem", "smart_resize")
 
 GLM = template("glm")
@@ -926,8 +926,7 @@ def forward(m, inputs):
             o = mla_mixer(x, inputs, positions, m.act, w.mixer)
         else:
             o = run_kda(x, inputs, w.mixer)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(x, o, w, routes)
         streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
 
         x, post_mix, comb_mix = gate(streams, w.mlp_mix, hy)

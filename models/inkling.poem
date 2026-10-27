@@ -1,7 +1,7 @@
 # Inkling and Inkling-Small, each with its miniature of seven layers and
 # eight experts, which reads a prefix of the whole model's checkpoint.
 
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 
 INKLING = template("inkling")
 TOKENIZER = tokenizer(markers = [
@@ -329,8 +329,7 @@ def forward(m, inputs):
             ),
         ])
         o = ops.linear.matmul(a, w.o_proj)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(x, o, w, routes)
         o = conv(o, w.attn_conv, w.attn_state, inputs, m)
         y = ops.elemwise.residual_add(o, y)
 

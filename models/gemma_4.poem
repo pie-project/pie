@@ -4,7 +4,7 @@
 # as a block-diffusion text model.
 
 load("//pie/codec.poem", "nvfp4_bank", read_fused = "fused")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches", dflash_head = "head", dflash_declare = "declare")
 load("//lib/media.poem", "budget_resize")
 
@@ -946,8 +946,7 @@ def forward(m, inputs):
         else:
             normed, a, layer_routes = attend(l, w, y, all_rows)
         o = ops.linear.matmul(a, w.o_proj)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(normed.on(adapted), w.lora_a, w.lora_b, layer_routes, o.on(adapted))
+        o = corrected(normed, o, w, layer_routes)
 
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, w.post_attn_norm_eps), y)
         mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, w.pre_ffw_norm_eps)

@@ -4,7 +4,7 @@
 # does, NVFP4 ones.
 
 load("//pie/codec.poem", "stacked_bank")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 
 ATEM = template("atem")
 
@@ -289,8 +289,7 @@ def forward(m, inputs):
         # Each head normed, then gated, in one pass.
         a = ops.elemwise.rmsnorm_gated(a, gate, None, d, m.norm_eps, "sigmoid")
         o = ops.linear.matmul(a, w.o_proj)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(normed.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(normed, o, w, routes)
         y, x = ops.elemwise.norm_gate(o, None, y, w.attn_gate, m.post_norm_eps, m.gate_temperature, (w.pre_ffw_norm, m.norm_eps))
 
         f = moe(m, w, x)

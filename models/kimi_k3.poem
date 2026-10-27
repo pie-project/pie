@@ -4,7 +4,7 @@
 # experts).
 
 load("//pie/codec.poem", read_fused = "fused")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 
 KIMI = template("kimi")
 TOKENIZER = tokenizer(markers = [["<|im_end|>", "[EOS]"]])
@@ -722,8 +722,7 @@ def forward(m, inputs):
             o = mla_mixer(x, inputs, plan, w.mixer)
         else:
             o = run_kda(x, inputs, w.mixer)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(x, o, w, routes)
         y = o if fresh else ops.elemwise.residual_add(o, y)
 
         r = w.mlp_res
