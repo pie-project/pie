@@ -155,11 +155,6 @@ pub struct PrefillPlan {
 }
 
 impl PrefillPlan {
-    #[must_use]
-    pub const fn full_attention_variant(&self) -> bool {
-        self.window.is_none()
-    }
-
     pub fn accepts(
         &self,
         op: &'static str,

@@ -35,47 +35,30 @@ pub(crate) unsafe fn issue(
 
     let [gx, gy, gz] = launch.grid;
     let [bx, by, bz] = launch.block;
-    let (call, code) = if launch.cooperative {
-        // SAFETY: the caller guarantees `function`, `slots` and `stream` (this
-        // fn's contract); HIP copies the arguments out of `slots` before
-        // returning.
-        ("hipModuleLaunchCooperativeKernel", unsafe {
-            (api.hip.hipModuleLaunchCooperativeKernel)(
-                function,
-                gx,
-                gy,
-                gz,
-                bx,
-                by,
-                bz,
-                launch.smem,
-                stream,
-                slots.as_mut_ptr(),
-            )
-        })
-    } else {
-        // SAFETY: the caller guarantees `function`, `slots` and `stream` (this
-        // fn's contract); HIP copies the arguments out of `slots` before
-        // returning, and `extra` is null.
-        ("hipModuleLaunchKernel", unsafe {
-            (api.hip.hipModuleLaunchKernel)(
-                function,
-                gx,
-                gy,
-                gz,
-                bx,
-                by,
-                bz,
-                launch.smem,
-                stream,
-                slots.as_mut_ptr(),
-                core::ptr::null_mut(),
-            )
-        })
+    // SAFETY: the caller guarantees `function`, `slots` and `stream` (this
+    // fn's contract); HIP copies the arguments out of `slots` before
+    // returning, and `extra` is null.
+    let code = unsafe {
+        (api.hip.hipModuleLaunchKernel)(
+            function,
+            gx,
+            gy,
+            gz,
+            bx,
+            by,
+            bz,
+            launch.smem,
+            stream,
+            slots.as_mut_ptr(),
+            core::ptr::null_mut(),
+        )
     };
     if code == sys::HIP_SUCCESS {
         Ok(())
     } else {
-        Err(Fault::Device { call, code })
+        Err(Fault::Device {
+            call: "hipModuleLaunchKernel",
+            code,
+        })
     }
 }
