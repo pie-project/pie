@@ -284,7 +284,7 @@ pub(crate) fn act_x_wt(
 /// row skeleton where the row skeleton carries it. Where no skeleton covers the
 /// shape, or a capture meets it untimed, the unfused leg serves it untimed;
 /// false, landing nothing, only where the row skeleton does not carry that
-/// leg either: the caller's unfused ops then serve it.
+/// leg either, which the fold never forms.
 pub(crate) fn anchored(
     ctx: &Ctx,
     op: &'static str,

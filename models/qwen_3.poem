@@ -23,14 +23,6 @@ CHATML_NEXT = template("chatml", thinking = True, tools = True, stop = QWEN_STOP
 TOKENIZER = tokenizer(markers = [QWEN_STOP], parts = {"vision": [QWEN_VISION]})
 TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"vision": [QWEN_VISION]})
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the gated attention's q and gate, k and v by their heads, the GDN
-# mixer's projections, convolution and per-head parameters by its
-# heads, the gates and ups, dense, shared and routed, by their channels, the
-# output and down projections by their rows, the head and a tied table by
-# their vocabulary, and the vision tower's mlp as the trunk's.
-CUTS = "inferred"
-
 def qwen(id, layers, vocab = 248320, template = CHATML, tokenizer = TOKENIZER, **kwargs):
     return model(id, template = template, tokenizer = tokenizer, arch = "qwen3_5", layers = layers, vocab = vocab, **kwargs)
 
@@ -487,57 +479,48 @@ FIXED = {
     "qwen36-27b-bonsai": d27b(),
 }
 
+def d9b(**over):
+    d = dims(hidden = 4096, layers = 32, attn_every = 4, q_heads = 16, kv_heads = 4, head_dim = 256,
+             rotary_dim = 64, k_heads = 16, v_heads = 32, k_dim = 128, v_dim = 128,
+             mlp = dense(12288), vocab = 248320, tied = False)
+    d.update(over)
+    return d
+
+def drafting(id, draft):
+    return {"draft": draft, "dflash_head": HEADS["{}-{}".format(id, draft)]}
+
+# The models that draft or carry a tower, by id and drafter: the dims they
+# build, the tower a vision deployment adds, and what they override.
+DRAFTED = {
+    ("qwen36-27b", None): (d27b, LARGE, {}),
+    ("qwen38-27b", None): (d27b, LARGE, {}),
+    ("qwen36-27b", "mtp"): (d27b, LARGE, {"draft": "mtp"}),
+    ("qwen38-27b", "mtp"): (d27b, LARGE, {"draft": "mtp"}),
+    ("qwen36-27b", "dflash"): (d27b, None, drafting("qwen36-27b", "dflash")),
+    ("qwen38-27b", "dflash2"): (d27b, None, drafting("qwen38-27b", "dflash2")),
+    ("qwen38-27b", "dspark"): (d27b, None, drafting("qwen38-27b", "dspark")),
+    ("ornith15-397b", None): (a17b, LARGE, {}),
+    ("qwen35-397b-a17b", None): (a17b, LARGE, {}),
+    ("qwen35-d9b", None): (d9b, None, {}),
+    ("qwen35-d9b", "dflash"): (d9b, None, drafting("qwen35-d9b", "dflash")),
+    ("qwen36-35b-a3b", None): (a3b, None, {}),
+    ("qwen36-35b-a3b", "mtp"): (a3b, None, {"draft": "mtp"}),
+    ("qwen36-35b-a3b", "dflash"): (a3b, None, drafting("qwen36-35b-a3b", "dflash")),
+    ("qwen36-35b-a3b", "dflash2"): (a3b, None, drafting("qwen36-35b-a3b", "dflash2")),
+}
+
 def drafted(id, deploy):
-    """The dims `id` builds for `deploy`'s parts and drafter."""
+    """The dims `id` builds for `deploy`'s parts and drafter; a model
+    `DRAFTED` names none of drafts with nothing and has no tower."""
     vision = "vision" in deploy.parts
-    drafter = deploy.drafter
-
-    def refuse():
-        fail("{} does not ship {}".format(id, deploy))
-
-    if id in ["qwen36-27b", "qwen38-27b"]:
-        tower = LARGE if vision else None
-        if drafter == None:
-            return d27b(tower = tower)
-        if drafter == "mtp":
-            return d27b(tower = tower, draft = "mtp")
-        if vision:
-            refuse()
-        if id == "qwen36-27b" and drafter == "dflash":
-            return d27b(draft = "dflash", dflash_head = HEADS["qwen36-27b-dflash"])
-        if id == "qwen38-27b" and drafter == "dflash2":
-            return d27b(draft = "dflash2", dflash_head = HEADS["qwen38-27b-dflash2"])
-        if id == "qwen38-27b" and drafter == "dspark":
-            return d27b(draft = "dspark", dflash_head = HEADS["qwen38-27b-dspark"])
-        refuse()
     if id == "qwen35-d0.8b":
-        return d0_8b(tower = SMALL if vision else None, draft = drafter)
-    if id in ["ornith15-397b", "qwen35-397b-a17b"] and drafter == None:
-        return a17b(tower = LARGE if vision else None)
-    if vision:
-        refuse()
-    if id == "qwen35-d9b":
-        d = dims(hidden = 4096, layers = 32, attn_every = 4, q_heads = 16, kv_heads = 4, head_dim = 256,
-                 rotary_dim = 64, k_heads = 16, v_heads = 32, k_dim = 128, v_dim = 128,
-                 mlp = dense(12288), vocab = 248320, tied = False)
-        if drafter == "dflash":
-            d.update(draft = "dflash", dflash_head = HEADS["qwen35-d9b-dflash"])
-        elif drafter != None:
-            refuse()
-        return d
-    if id == "qwen36-35b-a3b":
-        if drafter == None:
-            return a3b()
-        if drafter == "mtp":
-            return a3b(draft = "mtp")
-        if drafter == "dflash":
-            return a3b(draft = "dflash", dflash_head = HEADS["qwen36-35b-a3b-dflash"])
-        if drafter == "dflash2":
-            return a3b(draft = "dflash2", dflash_head = HEADS["qwen36-35b-a3b-dflash2"])
-        refuse()
-    if drafter != None:
-        refuse()
-    return dict(FIXED[id])
+        return d0_8b(tower = SMALL if vision else None, draft = deploy.drafter)
+    build, tower, over = DRAFTED.get((id, deploy.drafter), (None, None, {}))
+    if vision and tower == None or build == None and deploy.drafter != None:
+        fail("{} does not ship {}".format(id, deploy))
+    if build == None:
+        return dict(FIXED[id])
+    return build(tower = tower if vision else None, **over)
 
 def dense_mlp(w, hidden, inter, prefix):
     n = lambda s: "{}.{}".format(prefix, s)
@@ -592,7 +575,7 @@ def layout(id, deploy):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, dim: weight([dim])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         attn = None
         delta = None
         if attn_at(l):
@@ -1340,13 +1323,6 @@ def forward(m, inputs):
     if dr != None:
         switch("block_draft", ["off", "on"])
     trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
-    ([input_m, input_d], input_p) = trunk_inputs.partition([fact.has(fact.Mask), fact.single_token()])
-    plans = struct(
-        m = ops.attn.plan_prefill(input_m, m.q_heads, m.kv_heads, m.head_dim, None),
-        d = ops.attn.plan_decode(input_d, m.q_heads, m.kv_heads, m.head_dim, None),
-        p = ops.attn.plan_prefill(input_p, m.q_heads, m.kv_heads, m.head_dim, None),
-    )
-    mask = inputs.mask()
 
     towered = run_tower(inputs, m.tower) if m.tower != None else None
 
@@ -1375,7 +1351,7 @@ def forward(m, inputs):
         y, fused = carried
         x = ops.elemwise.rmsnorm_plus_one(y, w.mixer_norm, w.mixer_norm_eps)
         if w.attn != None:
-            o = attn_mixer(x, inputs, m, plans, mask, w.attn)
+            o = attn_mixer(x, inputs, m, trunk_inputs, w.attn)
         else:
             o = gdn_mixer(x, inputs, w.gdn, m.bonsai)
         adapted = fact.has(fact.Adapter)
@@ -1448,7 +1424,7 @@ def rotate(q, k, inputs, m, a):
     vision = m.tower != None
     return rope(q, k, positions(inputs, vision), vision, a.rotary_dim, m.head_dim, a.theta, rope_scaling(m.rope))
 
-def attn_mixer(x, inputs, m, plans, mask, a):
+def attn_mixer(x, inputs, m, lanes, a):
     pages = inputs.kv(a.kv)
     write_page = inputs.write_page(a.kv)
     write_offset = inputs.write_offset(a.kv)
@@ -1470,21 +1446,8 @@ def attn_mixer(x, inputs, m, plans, mask, a):
         v = ops.elemwise.hadamard_plain(v, d)
     ops.attn.kv_append(k, v, pages, write_page, write_offset)
 
-    o = branch(q, [
-        (fact.has(fact.Mask), lambda q: ops.attn.prefill(
-            q,
-            plans.m,
-            pages,
-            None,
-            d,
-            m.kv_heads,
-            a.sm_scale,
-            mask = mask,
-        )),
-        (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, a.sm_scale)),
-    ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, a.sm_scale))
-    scores = ops.attn.score_capture(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, observe = 32, kv_max = 2048)
-    output("attn.scores", scores)
+    # Each lane by its kind; a lane capturing scores reads them out too.
+    o = ops.attn.attend(q, lanes, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, mask = True, scores = True)
     if m.rotate_kv:
         o = ops.elemwise.hadamard_plain(o, d)
     # Bonsai: the gated output rotates by the 6144-wide signs, as `ssm_out`'s.

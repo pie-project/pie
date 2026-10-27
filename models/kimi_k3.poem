@@ -11,14 +11,6 @@ TOKENIZER = tokenizer(markers = [["<|im_end|>", "[EOS]"]])
 XTML = template("kimi3")
 TOKENIZER3 = tokenizer(markers = [["<|end_of_msg|>", "[EOS]", "[EOT]"]])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the KDA mixer's packed q, k and v, its convolution, its forget
-# and output gates and its per-head parameters by their heads, the latent
-# attention's q and kv up-projections and gate by theirs, the dense, shared
-# and routed gates and ups by their channels, the output and down
-# projections by their rows, the head by its vocabulary.
-CUTS = "inferred"
-
 MODELS = [
     model("kimik3-2.8t", template = XTML, tokenizer = TOKENIZER3, arch = "kimi_k3", layers = 93, vocab = 163840),
     model("kimik3-mini", mini = True, template = XTML, tokenizer = TOKENIZER3, arch = "kimi_k3", layers = 8, vocab = 163840),
@@ -296,7 +288,7 @@ def layout(id, deploy):
                 beta = d.situ_beta,
                 up_cap = d.situ_cap,
             )
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, compute(weights))
+        lora_a, lora_b = banks(hidden)
         return struct(
             res_blend = blend(n, "res_norm", "res_proj") if blend_at(l) else None,
             mlp_res = blend(n, "mlp_res_norm", "mlp_res_proj") if d.attn_res == EVERY else None,

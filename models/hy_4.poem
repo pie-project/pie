@@ -6,12 +6,6 @@ load("//lib/adapters.poem", "banks")
 
 HY = template("hy", thinking = True)
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the latent attention's q and kv up-projections, its gate and its
-# sinks by their heads, the dense, shared and routed gates and ups by their
-# channels, the output and down projections by their rows, the head by its
-# vocabulary.
-CUTS = "inferred"
 TOKENIZER = tokenizer(
     markers = [
         ["<｜hy_end:opensource｜>"],
@@ -248,7 +242,7 @@ def layout(id, deploy):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s: weight([hidden])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         keys = "index.{}".format(l) if ranks(l) else None
         if l < d.dense_layers:
             iw = d.dense_inter

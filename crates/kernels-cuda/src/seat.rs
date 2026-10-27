@@ -93,7 +93,6 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("elemwise.rmsnorm_gated_by", Reads::Rows),
     entry("elemwise.rope", Reads::Rows),
     entry("elemwise.rope_axes", Reads::Rows),
-    entry("fused.rope_yarn_append", Reads::Rows),
     entry("elemwise.sinusoid", Reads::Rows),
     entry("gather.embed", Reads::Rows),
     entry("gather.pack_rows", Reads::Rows),

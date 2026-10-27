@@ -85,9 +85,8 @@ pub struct In {
     pub from: u32,
 }
 
-/// A value a chain writes, a row a row in its own dtype: the kernels' `Out`.
-/// One the trace computes in place (a residual's stream) is stored over
-/// its input's plane, as the trace's placement says.
+/// A value a chain writes, a row a row in its own dtype: the kernels' `Out`,
+/// on its own plane, never over an input's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Out {
     pub value: ValueId,

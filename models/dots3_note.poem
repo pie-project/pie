@@ -9,12 +9,6 @@ TOKENIZER = tokenizer(markers = [
     ["<|system|>", "<|endofsystem|>", "<|user|>", "<|endofuser|>", "<|assistant|>"],
 ])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the latent attention's q and kv up-projections and its gate by
-# their heads, the dense, shared and routed gates and ups by their channels,
-# the output and down projections by their rows, the head by its vocabulary.
-CUTS = "inferred"
-
 MODELS = [
     model("dots3-note", template = DOTS, tokenizer = TOKENIZER, arch = "dots3_note", layers = 46, vocab = 152064),
     model("dots3-note-mini", mini = True, template = DOTS, tokenizer = TOKENIZER, arch = "dots3_note", layers = 6, vocab = 152064),
@@ -130,7 +124,7 @@ def layout(id, deploy):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, width: weight([width])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         if l in d.full_layers:
             a = d.full
             attn = attention(

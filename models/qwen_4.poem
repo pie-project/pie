@@ -4,7 +4,8 @@
 # miniature; and a micro model of toy widths for engine tests, which lists no
 # deployment. NVIDIA's NVFP4 export serves its experts as stored, against
 # bf16 or (`nvfp4a4`) NVFP4 activations; those deployments come last, so a
-# bf16 checkpoint's import picks one it can write.
+# bf16 checkpoint's import picks one it can write. Its indexer's projection,
+# four heads scored as one selection, stays whole across tensor-parallel ranks.
 
 load("//pie/codec.poem", "nvfp4_bank", read_fused = "fused")
 load("//lib/media.poem", "smart_resize")
@@ -14,14 +15,6 @@ load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
 # Flash-Next ships Qwen3.8's template word for word.
 CHATML_QWEN38 = template("chatml", thinking = True, preserve_thinking = True, reasoning_effort = True, tools = True, xml_tools = True, generation_suffix = "<think>\n", stop = QWEN_STOP)
 TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"vision": [QWEN_VISION]})
-
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the attention's q and gate, k and v by their heads, the delta
-# nets' projections, convolutions and gates by their heads, the routed and
-# shared experts by their channels, the output and down projections by their
-# rows, and the n-gram table, which a host holds, by its rows. The indexer's
-# projection, four heads scored as one selection, stays whole.
-CUTS = "inferred"
 
 def flash(id, **kwargs):
     return model(id, template = CHATML_QWEN38, tokenizer = TOKENIZER_38, **kwargs)
@@ -1062,9 +1055,7 @@ def attn_mixer(x, inputs, m, a, ix):
     # Each lane by its kind; decode and prefill lanes read the key blocks
     # the selector picked.
     o = ops.attn.attend(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, mask = True,
-                        selection = qsa_select(x, inputs, m, a, ix), ratio = ix.ratio)
-    scores = ops.attn.score_capture(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, observe = 32, kv_max = 2048)
-    output("attn.scores", scores)
+                        selection = qsa_select(x, inputs, m, a, ix), ratio = ix.ratio, scores = True)
     return ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(o, gate), a.o_proj)
 
 def gdn_mixer(x, inputs, g):

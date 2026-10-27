@@ -6,12 +6,6 @@ load("//pie/codec.poem", "bank", "kept", "land", "nvfp4_packed_bank", "nvfp4_pac
 MINIMAX = template("minimax")
 TOKENIZER = tokenizer(markers = [["[e~[", "]~b]", "]~!b[", "]<]minimax[>[", "<mm:think>", "</mm:think>"]])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k and v by their heads, the dense and routed gates and ups by
-# their channels, the output and down projections by their rows, the head
-# by its vocabulary.
-CUTS = "inferred"
-
 def m3(id, **kwargs):
     return model(id, template = MINIMAX, tokenizer = TOKENIZER, arch = "minimax_m3_vl", vocab = 200064, **kwargs)
 
@@ -359,7 +353,5 @@ def attn_mixer(x, inputs, m, a, ix):
     # the key blocks the indexer picked, one pick a head.
     selection = select_blocks(x, inputs, a, ix) if ix != None else None
     o = ops.attn.attend(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, mask = True,
-                        selection = selection, ratio = ix.block if ix != None else None, per_head = True)
-    scores = ops.attn.score_capture(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, observe = 32, kv_max = 2048)
-    output("attn.scores", scores)
+                        selection = selection, ratio = ix.block if ix != None else None, per_head = True, scores = True)
     return ops.linear.matmul(o, a.o_proj)

@@ -7,7 +7,7 @@
 //! };
 //! ```
 //!
-//! fired as `::pie::elemwise::row_skeleton<Body, BLOCK, PER, IN, OUT, ...>`. The
+//! fired as `::pie::elemwise::row_skeleton<Body, BLOCK, LANES, VECS, IN, OUT, ...>`. The
 //! skeleton's primitives ([`kernels_ir::skeleton::Skeleton`]) are its hooks:
 //!
 //! | primitive | hook |

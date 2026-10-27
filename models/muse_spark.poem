@@ -8,11 +8,6 @@ load("//lib/adapters.poem", "banks")
 
 ATEM = template("atem")
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k, v and the output gate by their heads, each expert's
-# gate and up by its channels, the output and down projections by their
-# rows, the head by its vocabulary.
-CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|eot|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"]])
 
 MODELS = [
@@ -86,7 +81,6 @@ def layout(id, deploy):
         fail("{} stores its weights bf16 with NVFP4 or MXFP4 experts, not {}".format(id, deploy.weights))
     d = DIMS[id]
     w = dtype.bf16
-    dense = compute(w)
     routed = deploy.weights[1] if len(deploy.weights) > 1 else w
     hidden = d.hidden
     hd = d.head_dim
@@ -97,7 +91,7 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s, dim: weight([dim])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         bank = w if l in d.dense_experts else routed
         return struct(
             full = full(l),
@@ -290,10 +284,7 @@ def forward(m, inputs):
         ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
 
         # Each lane by its kind; a full layer's scores are read out.
-        a = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win, mask = True)
-        if w.full:
-            scores = ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
-            output("attn.scores", scores)
+        a = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win, mask = True, scores = w.full)
 
         # Each head normed, then gated, in one pass.
         a = ops.elemwise.rmsnorm_gated(a, gate, None, d, m.norm_eps, "sigmoid")

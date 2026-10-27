@@ -258,52 +258,6 @@ impl Package {
         })
     }
 
-    /// Whether the package leaves its weights' cuts to the compiler: its
-    /// `CUTS` is `"inferred"`, else it states them (`"stated"`, the default
-    /// of every package written before the compiler inferred them).
-    pub fn infers_cuts(&self) -> anyhow::Result<bool> {
-        let Some(cuts) = self.entry(CUTS)? else {
-            return Ok(false);
-        };
-        match cuts.value().unpack_str() {
-            Some(INFERRED) => Ok(true),
-            Some(STATED) => Ok(false),
-            _ => anyhow::bail!(
-                "the package `{}` states `{CUTS}` as {}; it is `\"{INFERRED}\"` or \
-                 `\"{STATED}\"`",
-                self.name(),
-                cuts.value()
-            ),
-        }
-    }
-
-    /// `trace`'s weights cut as the package says: a package that states its
-    /// cuts holds a weight that states none whole; one that leaves them to
-    /// the compiler states none but whole, its other weights left for the
-    /// compiler to infer.
-    fn cuts(&self, trace: &mut Trace) -> anyhow::Result<()> {
-        if !self.infers_cuts()? {
-            for param in &mut trace.params {
-                if param.shard == crate::Shard::Inferred {
-                    param.shard = crate::Shard::Replicated;
-                }
-            }
-            return Ok(());
-        }
-        if let Some(cut) = trace
-            .params
-            .iter()
-            .find(|p| matches!(p.shard, crate::Shard::Cut { .. }))
-        {
-            anyhow::bail!(
-                "the package `{}` leaves its cuts to the compiler and states `{}`'s",
-                self.name(),
-                cut.name
-            );
-        }
-        Ok(())
-    }
-
     /// The trace of `id`'s deployment `deploy`, named `name`, on `platform`.
     pub fn trace(
         &self,
@@ -351,8 +305,6 @@ impl Package {
                     crate::star::forward::panic_message(&*panic)
                 )
             })?;
-            let mut trace = trace;
-            self.cuts(&mut trace)?;
             if let Some(factor) = deploy.yarn
                 && !stretched(&trace)
             {
@@ -365,12 +317,6 @@ impl Package {
         })
     }
 }
-
-/// The package entry saying who cuts its weights, and the two things it
-/// says.
-const CUTS: &str = "CUTS";
-const INFERRED: &str = "inferred";
-const STATED: &str = "stated";
 
 /// Whether some rotation of `trace` turns at stated frequencies.
 fn stretched(trace: &Trace) -> bool {

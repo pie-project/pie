@@ -60,8 +60,6 @@ pub enum NormKind {
     Rmsnorm { head_dim: u32, eps: f32 },
 }
 
-/// Ops only the compiler forms, from the primitive ones a model writes; each
-/// is a kernel some backend ships.
 /// How a [`Fused::Region`] reads one of its inputs: row `r` reads row
 /// `ids[r]` of it where `by` names the ids (an index into the op's inputs,
 /// an i32 a row), else its own; and its columns from `from` on (one half of
@@ -72,6 +70,8 @@ pub struct RegionRead {
     pub from: u32,
 }
 
+/// Ops only the compiler forms, from the primitive ones a model writes; each
+/// is a kernel some backend ships.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Op)]
 #[op(group = "fused")]
 pub enum Fused {
@@ -678,15 +678,6 @@ pub enum Fused {
         sum: Box<Linear>,
         #[part]
         gate_add: Option<Box<Linear>>,
-    },
-    /// `qkv` (a `QkvFusedQknormRopeVnormWrite`) on the first columns of its
-    /// `packed` rows, the rest of each row (`rest`'s width) landing in
-    /// `rest`: a row split (Muse Spark's qkv|gate) read in place.
-    SplitQkvFused {
-        #[output]
-        rest: ValueId,
-        #[part]
-        qkv: Box<Fused>,
     },
     /// A packed qkv row split, q and k normed per head (under weights, or
     /// none) where `qk_norm`, v normed without a scale where `v_norm` and

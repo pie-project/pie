@@ -6,12 +6,6 @@ load("//lib/spoken.poem", "QWEN_STOP")
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the transformer's q, k and v and its gate and up by their heads
-# and channels, their output and down projections by their rows; the
-# timestep embedder and the text encoder's likewise.
-CUTS = "inferred"
-
 MODELS = [
     model("z-image-turbo", template = CHATML, tokenizer = TOKENIZER, arch = "z_image", layers = 35, vocab = 151936, taps = True),
     model("z-image-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "z_image", layers = 6, vocab = 0, taps = True),

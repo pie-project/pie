@@ -17,13 +17,6 @@ TOKENIZER = tokenizer(
     pinned = {"<boi>": 128000, "<eoi>": 128001, "<img>": 128006},
 )
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the packed q, k and v by their heads, each expert's and the shared
-# expert's gate and up by their channels, the output and down projections by
-# their rows, the head by its vocabulary, and the timestep embedders as an
-# mlp is.
-CUTS = "inferred"
-
 MODELS = [
     model("hunyuanimage3-80b-a13b", template = LINES, tokenizer = TOKENIZER, arch = "hunyuan_image_3_moe", layers = 32, vocab = 133120),
     model("hunyuanimage3-mini", mini = True, template = LINES, tokenizer = TOKENIZER, arch = "hunyuan_image_3_moe", layers = 2, vocab = 133120),

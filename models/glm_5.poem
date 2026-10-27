@@ -13,12 +13,6 @@ TOKENIZER = tokenizer(markers = [STOP])
 GLM = template("glm")
 GLM_TOKENIZER = tokenizer(markers = [["<|user|>", "<|observation|>", "<|endoftext|>"]])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the latent attention's q and kv up-projections and its gate by
-# their heads, the dense, shared and routed gates and ups by their channels,
-# the output and down projections by their rows, the head by its vocabulary.
-CUTS = "inferred"
-
 MODELS = [
     model("glm5-a12b", template = CHATML, tokenizer = TOKENIZER, arch = "glm_moe_dsa", layers = 46, vocab = 151552),
     model("glm53", template = GLM, tokenizer = GLM_TOKENIZER, drafters = ["mtp"], arch = "glm_moe_dsa", layers = 78, vocab = 154880),
@@ -274,7 +268,7 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s, width: weight([width], w)
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         keys = "index.{}".format(l) if ranks(d, l) else None
         attn = mla_at("layer.{}".format(l), "kv.{}".format(l), keys)
         if l < d.dense_layers:

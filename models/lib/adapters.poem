@@ -3,9 +3,8 @@
 
 ADAPTERS = struct(slots = 8, rank = 16)
 
-def banks(prefix, hidden, dense):
-    """The `lora_a` and `lora_b` banks under `prefix`, over a `hidden`-wide
-    residual, in `dense`."""
+def banks(hidden):
+    """The `lora_a` and `lora_b` banks over a `hidden`-wide residual."""
     return (
         weight([ADAPTERS.slots, ADAPTERS.rank, hidden]).registered(),
         weight([ADAPTERS.slots, hidden, ADAPTERS.rank]).registered(),

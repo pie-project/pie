@@ -154,10 +154,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     #[cfg(feature = "rocm")]
     let anchored = std::collections::BTreeMap::new();
     profile.synth_anchors = false;
-    // `compiler.synth_regions`: each chain of elementwise and row ops folded
-    // into one `fused.region`, its region kernels-ir's, by the fold
-    // `compile_axes` plans under the flag. Folded once, here, the trace is
-    // the one the load runs and every plan after is of it as it stands.
+    // `compiler.synth_regions`: each chain of elementwise and row ops the row
+    // skeleton serves folded into one `fused.region`, its region kernels-ir's.
+    // Folded once, here, the trace is the one the load runs and every plan
+    // after is of it as it stands.
     let regions = if profile.synth_regions {
         let (folded, regions) =
             poem_compiler::fuse::chain::fold(boot.trace.clone(), &crate::synth::serves_region);

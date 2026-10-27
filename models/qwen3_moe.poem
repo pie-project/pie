@@ -18,12 +18,6 @@ CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 CODER = template("qwen3_coder")
 TOKENIZER = tokenizer(markers = [QWEN_STOP, ["<|im_start|>"]])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k and v by their heads, each expert's gate and up by its
-# channels, the output and down projections by their rows, the head by its
-# vocabulary.
-CUTS = "inferred"
-
 def qwen3(id, layers, mini = False, spoken = CHATML):
     return model(id, mini = mini, template = spoken, tokenizer = TOKENIZER, arch = "qwen3_moe", layers = layers, vocab = 151936)
 
@@ -75,7 +69,7 @@ DEPLOYMENTS = (
 
 # The weights of Qwen 3 MoE: per layer an RMS norm, the q, k and v
 # projections with per-head q and k norms, the output projection, an RMS
-# norm, the router and the routed experts' banks (gate and up packed); the
+# norm, the router and the routed experts' gate, up and down banks; the
 # token embedding, a final norm and the head. The deployment's first dtype
 # stores the projections, its second (or the first) the expert banks; the
 # norms, the router, the embedding and the head stay bf16 under a release's
@@ -121,13 +115,12 @@ def layout(id, deploy):
     if deploy.drafter != None or deploy.parts:
         fail("{} ships no drafter and no parts".format(id))
     table = dtype.bf16 if proj in RELEASED else proj
-    dense = compute(table)
     d = DIMS[id]
     hidden, hd = d.hidden, d.head_dim
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
 
     def layer(l):
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         return struct(
             attn_norm = weight([hidden]),
             q = weight([q_width, hidden], proj),
@@ -138,7 +131,8 @@ def layout(id, deploy):
             k_norm = weight([hd]),
             mlp_norm = weight([hidden]),
             router = weight([d.experts, hidden]),
-            gate_up = weight([d.experts, 2 * d.inter, hidden], experts),
+            gate = weight([d.experts, d.inter, hidden], experts),
+            up = weight([d.experts, d.inter, hidden], experts),
             down = weight([d.experts, hidden, d.inter], experts),
             kv = "kv.{}".format(l),
             lora_a = lora_a,
@@ -209,7 +203,8 @@ TRANSFORMERS = [
     ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
     ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
     ("model.layers.{l}.mlp.gate.weight", "layers.{l}.router"),
-    (["model.layers.{l}.mlp.experts.{e}.gate_proj.weight", "model.layers.{l}.mlp.experts.{e}.up_proj.weight"], "layers.{l}.gate_up"),
+    ("model.layers.{l}.mlp.experts.{e}.gate_proj.weight", "layers.{l}.gate"),
+    ("model.layers.{l}.mlp.experts.{e}.up_proj.weight", "layers.{l}.up"),
     ("model.layers.{l}.mlp.experts.{e}.down_proj.weight", "layers.{l}.down"),
 ]
 
@@ -252,7 +247,8 @@ def moe(x, m, w):
         routing.softmax(),
     )
 
-    hidden = ops.linear.glu(ops.linear.moe_matmul_select(x, w.gate_up, experts, m.top_k), gating.swiglu(), m.inter)
+    gate = ops.linear.moe_matmul_select(x, w.gate, experts, m.top_k)
+    hidden = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, w.up, experts, m.top_k))
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, w.down, experts, m.top_k), weights)
 
 def attention(x, inputs, m, positions, w):
@@ -266,7 +262,5 @@ def attention(x, inputs, m, positions, w):
 
     # Each lane by its kind; a lane may bring its own mask. A lane capturing
     # scores reads them out too.
-    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True)
-    scores = ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
-    output("attn.scores", scores)
+    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
     return ops.linear.matmul(o, w.o)
