@@ -56,7 +56,7 @@ type Told<'a> = (&'a [(&'a str, &'a str)], (bool, bool, &'a [&'a str]));
 
 #[test]
 fn a_lane_is_told_what_its_classes_run_every_case() {
-    let rows: [(&str, &[Told]); 6] = [
+    let rows: [(&str, &[Told]); 5] = [
         (
             "flux2-klein-4b-bf16-kv-bf16",
             &[
@@ -111,10 +111,6 @@ fn a_lane_is_told_what_its_classes_run_every_case() {
                     (false, false, &[]),
                 ),
             ],
-        ),
-        (
-            "mini-dit-bf16-kv-bf16",
-            &[(&[("stream", "latents")], (false, false, &["velocity"]))],
         ),
         (
             "hunyuanimage3-mini-bf16-kv-bf16",

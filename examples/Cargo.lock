@@ -148,6 +148,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dflash-speculative-bench"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "diffusion-baseline"
 version = "0.1.0"
 dependencies = [
@@ -445,14 +453,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "naive-masked"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "pie-dtype"
 version = "0.6.0"
 
@@ -514,14 +514,6 @@ dependencies = [
 
 [[package]]
 name = "repetition-penalty"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "sampling-primitives"
 version = "0.1.0"
 dependencies = [
  "inferlet",
@@ -591,14 +583,6 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "snapkv-eviction"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "sort-probe"
 version = "0.1.0"
 dependencies = [
  "inferlet",
@@ -689,6 +673,14 @@ dependencies = [
 
 [[package]]
 name = "trackb-h2o"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
+name = "trackb-snapkv"
 version = "0.1.0"
 dependencies = [
  "inferlet",

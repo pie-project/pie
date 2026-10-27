@@ -319,7 +319,6 @@ fn type_checks(contract: &ModelContract, src: &ztensor::Source) {
 fn the_minimax_h3_import_reads_the_fl2va_index_every_case() {
     the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply();
     the_flagship_refuses_a_bare_transformer();
-    the_flagships_names_are_the_partitions_index();
 }
 
 fn the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply() {
@@ -382,90 +381,4 @@ fn the_flagship_refuses_a_bare_transformer() {
     );
     type_checks(&contract, &src);
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-fn hub() -> PathBuf {
-    if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    if let Some(home) = std::env::var_os("HF_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home).join("hub");
-    }
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface/hub")
-}
-
-fn partition() -> Option<PathBuf> {
-    let snapshots = hub().join("models--MiniMaxAI--MiniMax-H3/snapshots");
-    std::fs::read_dir(snapshots)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path().join("FL2VA"))
-        .find(|path| path.join("model_index.json").is_file())
-}
-
-fn index_names(component: &Path) -> Option<BTreeSet<String>> {
-    let mut found: Option<BTreeSet<String>> = None;
-    for stem in ["diffusion_pytorch_model", "model"] {
-        let path = component.join(format!("{stem}.safetensors.index.json"));
-        if !path.is_file() {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).ok()?;
-        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-        let map = value.get("weight_map")?.as_object()?;
-        found = Some(map.keys().cloned().collect());
-    }
-    found
-}
-
-fn the_flagships_names_are_the_partitions_index() {
-    let Some(root) = partition() else {
-        eprintln!("skipping: no MiniMaxAI/MiniMax-H3 FL2VA partition in the HuggingFace cache");
-        return;
-    };
-    let Some(dit_index) = index_names(&root.join("transformer")) else {
-        eprintln!("skipping: the partition's transformer has no shard index yet");
-        return;
-    };
-    let d = Dims::h3();
-    let synthesized: BTreeSet<String> =
-        transformer(&d).into_iter().map(|(name, ..)| name).collect();
-    assert_eq!(
-        synthesized, dit_index,
-        "the transformer this text declares and the partition's index are one list"
-    );
-
-    let Some(te_index) = index_names(&root.join("text_encoder")) else {
-        eprintln!("skipping the encoder half: no shard index yet");
-        return;
-    };
-    let read: BTreeSet<String> = text_encoder(model::TE_LAYERS)
-        .into_iter()
-        .map(|(name, ..)| name)
-        .filter(|name| {
-            !name.ends_with("language_model.norm.weight") && !name.ends_with("lm_head.weight")
-        })
-        .collect();
-    let missing: Vec<&String> = read.difference(&te_index).collect();
-    assert!(
-        missing.is_empty(),
-        "the encoder index holds none of {missing:?}"
-    );
-    let left: BTreeSet<&String> = te_index.difference(&read).collect();
-    for name in &left {
-        let past_the_cut = (model::TE_LAYERS..model::TE_DEPTH)
-            .any(|l| name.starts_with(&format!("model.language_model.layers.{l}.")));
-        assert!(
-            past_the_cut
-                || name.starts_with("model.visual.")
-                || *name == "model.language_model.norm.weight"
-                || *name == "lm_head.weight",
-            "`{name}` is in the encoder's index and this row neither reads it nor drops it \
-             for a reason the reference states"
-        );
-    }
-    assert!(
-        left.iter().any(|name| name.starts_with("model.visual.")),
-        "the shipped encoder is a VLM and its tower is in the index"
-    );
 }

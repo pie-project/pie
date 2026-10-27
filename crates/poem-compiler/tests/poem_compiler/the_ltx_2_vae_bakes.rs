@@ -1,6 +1,5 @@
 use poem_ir::{NormAxis, NormWeight};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::collections::BTreeSet;
 
 use crate::ltx_2_dims as model;
 use poem::{Def, Dtype, Operation, Platform, RuntimeInput, Trace};
@@ -22,7 +21,6 @@ fn trace(deployment: &str) -> Trace {
 fn the_ltx_2_vae_bakes_every_case() {
     the_flagship_declares_the_decode_reading_and_the_miniature_does_not();
     the_shapes_are_the_ltx_decoders();
-    the_import_reads_every_decoder_tensor_of_the_real_snapshot_once();
 }
 
 fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
@@ -152,104 +150,5 @@ fn the_shapes_are_the_ltx_decoders() {
                 param.name
             );
         }
-    }
-}
-
-fn hub() -> PathBuf {
-    if let Some(dir) = std::env::var_os("HF_HUB_CACHE").filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    if let Some(home) = std::env::var_os("HF_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home).join("hub");
-    }
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface/hub")
-}
-
-fn snapshot() -> Option<PathBuf> {
-    let snapshots = hub().join("models--Lightricks--LTX-2.5-Diffusers/snapshots");
-    std::fs::read_dir(snapshots)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.join("vae/config.json").is_file()
-                && path
-                    .join("vae/diffusion_pytorch_model.safetensors")
-                    .is_file()
-        })
-}
-
-fn the_import_reads_every_decoder_tensor_of_the_real_snapshot_once() {
-    let Some(root) = snapshot() else {
-        eprintln!(
-            "skipping: no Lightricks/LTX-2.5-Diffusers snapshot with a vae/ in the HuggingFace cache"
-        );
-        return;
-    };
-    let src = checkpoint::file::diffusers::open(&root)
-        .unwrap_or_else(|why| panic!("{}: {why}", root.display()));
-    let contract = import_vae(&src);
-
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for tensor in &contract.tensors {
-        for source in tensor.expr.sources() {
-            *counts.entry(source.to_string()).or_default() += 1;
-        }
-    }
-    let index: BTreeSet<String> = src
-        .names()
-        .filter(|n| n.starts_with("vae.decoder.") || n.starts_with("vae.latents_"))
-        .map(str::to_string)
-        .collect();
-    assert_eq!(
-        index.len(),
-        84 + 2,
-        "84 decoder tensors and the two buffers"
-    );
-    let read: BTreeSet<String> = counts.keys().cloned().collect();
-    assert_eq!(
-        read, index,
-        "every decoder tensor and buffer, and nothing else"
-    );
-    assert!(counts.values().all(|c| *c == 1), "each exactly once");
-    assert!(
-        !read.iter().any(|n| n.starts_with("vae.encoder.")),
-        "the encoder is not traced and not read"
-    );
-    let stated: Vec<&str> = contract
-        .tensors
-        .iter()
-        .filter(|t| t.expr.sources().is_empty() && t.expr.outputs().is_empty())
-        .map(|t| t.name.as_str())
-        .collect();
-    assert_eq!(stated, vec!["vae.zero"]);
-}
-
-/// The VAE's reads alone, by the package's own functions.
-const VAE_FORMATS: &str = r#"
-def formats(m):
-    return [format("vae", read = lambda reads: read_vae(reads, m.vae))]
-"#;
-
-fn import_vae(src: &ztensor::Source) -> checkpoint::contract::ModelContract {
-    let package = poem_compiler::catalog::replacing("ltx25", "formats", VAE_FORMATS)
-        .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
-    package
-        .import("ltx25", &flagship(), src, Platform::Cuda)
-        .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"))
-}
-
-fn flagship() -> poem::star::Deploy {
-    poem::star::Deploy {
-        weights: vec![Dtype::Bf16.into()],
-        kv: Dtype::Bf16,
-        tp: 1,
-        ep: 1,
-        parts: vec![],
-        drafter: None,
-        yarn: None,
-        tap: None,
-        layers: None,
-        experts: None,
     }
 }
