@@ -7,9 +7,6 @@ pub enum TransportError {
     #[error("transport path not available: {0}")]
     Unsupported(&'static str),
 
-    #[error("failed to register KV handle: {0}")]
-    Registration(String),
-
     #[error("KV transfer failed: {0}")]
     Transfer(String),
 
