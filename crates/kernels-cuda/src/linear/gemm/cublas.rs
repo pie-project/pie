@@ -201,7 +201,7 @@ pub(crate) fn act_x_wt(
             .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status));
         (plan, tactic, device.lt.handle, device.lt.workspace_bytes)
     });
-    let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want) {
+    let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want).map(|_| std::ptr::null_mut::<c_void>()) {
         Ok(ws) if !ws.is_null() => (ws, want),
         _ => (std::ptr::null_mut(), 0),
     };
@@ -447,7 +447,7 @@ pub(crate) fn anchored(
             ) else {
                 return unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k);
             };
-            let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want) {
+            let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want).map(|_| std::ptr::null_mut::<c_void>()) {
                 Ok(ws) if !ws.is_null() => (ws, want),
                 _ => (std::ptr::null_mut(), 0),
             };
@@ -549,7 +549,7 @@ pub(crate) fn on_lt(
     if lt_handle.is_null() {
         return Ok(false);
     }
-    let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want) {
+    let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want).map(|_| std::ptr::null_mut::<c_void>()) {
         Ok(ws) if !ws.is_null() => (ws, want),
         _ => (std::ptr::null_mut(), 0),
     };
