@@ -121,7 +121,8 @@ def layout(id, deploy):
                 router = weight([bank, hidden], w),
                 bias = weight([d.experts], dtype.f32),
                 scale = weight([1], dtype.f32),
-                gate_up = weight([bank, 2 * mi, hidden], w),
+                gate = weight([bank, mi, hidden], w),
+                up = weight([bank, mi, hidden], w),
                 down = weight([bank, hidden, mi], w),
                 experts = d.experts,
                 top_k = d.top_k,
@@ -237,14 +238,9 @@ def huggingface(m, reads):
         reads.read(f.router, n("mlp.gate.weight"))
         reads.read(f.bias, n("mlp.gate.bias"))
         reads.read(f.scale, n("mlp.gate.global_scale"))
-        combed = lambda name: concat(1, [
-            src(name).stride(1, 0, f.inter, 2),
-            src(name).stride(1, 1, f.inter, 2),
-        ])
-        reads.read_expr(f.gate_up, concat(0, [
-            combed(n("mlp.experts.w13_weight")),
-            combed(n("mlp.shared_experts.shared_w13_weight")),
-        ]))
+        w13 = [src(n("mlp.experts.w13_weight")), src(n("mlp.shared_experts.shared_w13_weight"))]
+        reads.read_expr(f.gate, concat(0, [x.stride(1, 0, f.inter, 2) for x in w13]))
+        reads.read_expr(f.up, concat(0, [x.stride(1, 1, f.inter, 2) for x in w13]))
         reads.read_expr(f.down, concat(0, [
             src(n("mlp.experts.w2_weight")),
             src(n("mlp.shared_experts.shared_w2_weight")),
@@ -357,7 +353,8 @@ def mlp(x, f):
         bias = f.bias,
         scale = f.scale,
     )
-    hidden = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, fan), gating.swiglu(), f.inter)
+    gate = ops.linear.moe_matmul_select(x, f.gate, routes, fan)
+    hidden = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, f.up, routes, fan))
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, f.down, routes, fan), weights)
 
 def conv(v, weight, state, inputs, m):
