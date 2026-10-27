@@ -9,6 +9,7 @@ and are left out of the TOML, so the Rust side supplies its own defaults.
 from __future__ import annotations
 
 import io
+import os
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Optional
 
@@ -100,6 +101,10 @@ class ModelConfig:
     # Keep the disk tier for the next run (cuda): a restart takes back the
     # sealed pages it holds as cache.
     disk_kv_persistent: Optional[bool] = None
+    max_patches: Optional[int] = None
+    max_images: Optional[int] = None
+    max_voxels: Optional[int] = None
+    max_clips: Optional[int] = None
 
 
 @dataclass
@@ -121,11 +126,35 @@ class Config:
                 table[key] = value
 
         m = self.model
-        model: dict = {"name": m.name, "source": m.source}
+        source = m.source
+        if source and "/models--" in source:
+            import re
+            match = re.search(r"/models--([^/]+)--([^/]+)/snapshots/", source)
+            if match:
+                repo_id = f"{match.group(1)}/{match.group(2)}"
+                pie_home = os.environ.get("PIE_HOME", os.path.expanduser("~/.pie"))
+                art_dir = os.path.join(pie_home, "artifacts", f"{match.group(1)}--{match.group(2)}")
+                if os.path.isdir(art_dir):
+                    source = repo_id
+        model: dict = {"name": m.name, "source": source}
         for name in ("weight_precision", "kv_dtype", "drafter", "weight_dtype", "device_weight_budget",
                      "host_weight_budget", "device_kv_budget", "device_memory_share", "host_kv_budget",
-                     "disk_kv_budget", "disk_kv_dir", "disk_kv_persistent"):
+                     "disk_kv_budget", "disk_kv_dir", "disk_kv_persistent",
+                     "max_patches", "max_images", "max_voxels", "max_clips"):
             put(model, name, getattr(m, name))
+        if "host_kv_budget" not in model:
+            env_hkv = os.environ.get("PIE_HOST_KV_BUDGET", "1GiB")
+            if env_hkv:
+                model["host_kv_budget"] = env_hkv
+        if "device_kv_budget" not in model:
+            max_conc = self.runtime.max_concurrent_processes
+            env_dkv = os.environ.get("PIE_DEVICE_KV_BUDGET")
+            if env_dkv:
+                model["device_kv_budget"] = env_dkv
+            elif max_conc is None or max_conc <= 64:
+                model["device_kv_budget"] = "32GiB"
+            else:
+                model["device_kv_budget"] = "64GiB"
         if m.skip_parts:
             model["skip_parts"] = list(m.skip_parts)
 
@@ -137,6 +166,10 @@ class Config:
             if key in engine:
                 raise ValueError(f"engine option {key!r} collides with a common [engine] key")
             engine[key] = value
+        if "max_model_len" not in engine:
+            env_mml = os.environ.get("PIE_MAX_MODEL_LEN", "4096")
+            if env_mml:
+                engine["max_model_len"] = int(env_mml)
 
         cluster: dict = {}
         if self.cluster.cluster_policies:

@@ -312,6 +312,7 @@ impl Dpm2m {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Dpm2mChannels {
     pub sigma_s: Channel,
     pub ratio: Channel,
