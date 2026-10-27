@@ -50,8 +50,9 @@ pub struct Recorder {
     at: Rc<Cell<Option<u32>>>,
 
     /// The values recorded once a trace, by what they are: the host plans
-    /// every layer's attention reads. Held as their parts, so no value
-    /// outlives the trace through this.
+    /// every layer's attention reads, the turned input sibling products
+    /// share. Held as their parts, so no value outlives the trace through
+    /// this.
     once: Rc<RefCell<std::collections::HashMap<String, Held>>>,
 }
 
@@ -79,6 +80,17 @@ impl Recorder {
     /// and outside any layer: a host plan, built once and read by every
     /// layer that asks for the same one.
     pub(crate) fn once(&self, key: String, make: impl FnOnce() -> Value) -> Value {
+        self.shared(key, || {
+            let at = self.at.replace(None);
+            let made = make();
+            self.at.set(at);
+            made
+        })
+    }
+
+    /// The value `make` records, recorded the first time `key` is asked for,
+    /// where it is: every reader asking for the same one reads it.
+    pub(crate) fn shared(&self, key: String, make: impl FnOnce() -> Value) -> Value {
         if let Some((id, over, ty)) = self.once.borrow().get(&key).cloned() {
             return Value {
                 rec: self.clone(),
@@ -87,9 +99,7 @@ impl Recorder {
                 ty,
             };
         }
-        let at = self.at.replace(None);
         let made = make();
-        self.at.set(at);
         self.once
             .borrow_mut()
             .insert(key, (made.id, made.over.clone(), made.ty.clone()));

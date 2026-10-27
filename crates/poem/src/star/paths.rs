@@ -9,7 +9,7 @@ use starlark::values::dict::{AllocDict, DictRef};
 use starlark::values::list::{AllocList, ListRef};
 use starlark::values::structs::{AllocStruct, StructRef};
 use starlark::values::tuple::{AllocTuple, TupleRef};
-use starlark::values::{Heap, Value as Star, ValueIdentity, ValueLike};
+use starlark::values::{Heap, Value as Star, ValueLike};
 
 use crate::star::values::WeightValue;
 
@@ -30,16 +30,60 @@ pub fn renamed<R>(f: impl FnOnce() -> R) -> (R, Vec<(String, String)>) {
 
 /// What makes two weights one: the object, or a name a Rust caller stated.
 #[derive(PartialEq, Eq, Hash)]
-enum Same<'v> {
-    Object(ValueIdentity<'v>),
+enum Same {
+    Object(u64),
     Stated(String),
+}
+
+/// Which layout value `v` is, as a weight turned by it holds it.
+pub(crate) fn origin(v: Star<'_>) -> u64 {
+    let mut h = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&v.identity(), &mut h);
+    std::hash::Hasher::finish(&h)
+}
+
+fn same(w: &crate::Weight, origin: u64) -> Same {
+    if w.name.is_empty() {
+        Same::Object(origin)
+    } else {
+        Same::Stated(w.name.clone())
+    }
 }
 
 /// The layout `m` with each weight named by its path in it. A weight met at
 /// two paths (a head tied to its embedding) is one weight: the first path
-/// names it.
-pub(crate) fn named<'v>(heap: Heap<'v>, m: Star<'v>) -> Star<'v> {
-    walk(heap, m, "", &mut HashMap::new())
+/// names it. A turned weight's signs go by the name their own path gives.
+pub(crate) fn named<'v>(heap: Heap<'v>, m: Star<'v>) -> anyhow::Result<Star<'v>> {
+    let mut seen = HashMap::new();
+    walk(heap, m, "", &mut |v, w, path| {
+        seen.entry(same(w, origin(v))).or_insert_with(|| path.to_string());
+        v
+    });
+    let mut stray = None;
+    let m = walk(heap, m, "", &mut |v, w, path| {
+        let name = seen[&same(w, origin(v))].clone();
+        RENAMED.with(|r| {
+            if let Some(log) = r.borrow_mut().as_mut() {
+                log.push((w.name.clone(), name.clone()));
+            }
+        });
+        if name == w.name && w.turn.is_none() {
+            return v;
+        }
+        let mut renamed = w.clone();
+        renamed.name = name;
+        if let Some(t) = renamed.turn.as_deref_mut() {
+            match seen.get(&same(&t.signs, t.origin)) {
+                Some(signs) => t.signs.name = signs.clone(),
+                None => stray = Some(path.to_string()),
+            }
+        }
+        heap.alloc(WeightValue(renamed))
+    });
+    match stray {
+        Some(path) => anyhow::bail!("`{path}` is turned by signs its layout does not hold"),
+        None => Ok(m),
+    }
 }
 
 fn at(path: &str, part: &str) -> String {
@@ -50,37 +94,22 @@ fn at(path: &str, part: &str) -> String {
     }
 }
 
+/// `v` with each weight in it what `weight` makes of it at its path.
 fn walk<'v>(
     heap: Heap<'v>,
     v: Star<'v>,
     path: &str,
-    seen: &mut HashMap<Same<'v>, String>,
+    weight: &mut dyn FnMut(Star<'v>, &crate::Weight, &str) -> Star<'v>,
 ) -> Star<'v> {
     if let Some(w) = v.downcast_ref::<WeightValue>() {
-        let same = if w.0.name.is_empty() {
-            Same::Object(v.identity())
-        } else {
-            Same::Stated(w.0.name.clone())
-        };
-        let name = seen.entry(same).or_insert_with(|| path.to_string()).clone();
-        RENAMED.with(|r| {
-            if let Some(log) = r.borrow_mut().as_mut() {
-                log.push((w.0.name.clone(), name.clone()));
-            }
-        });
-        if name == w.0.name {
-            return v;
-        }
-        let mut renamed = w.0.clone();
-        renamed.name = name;
-        return heap.alloc(WeightValue(renamed));
+        return weight(v, &w.0, path);
     }
     if let Some(s) = StructRef::from_value(v) {
         let fields: Vec<(String, Star<'v>)> = s
             .iter()
             .map(|(k, x)| {
                 let k = k.as_str().to_string();
-                let x = walk(heap, x, &at(path, &k), seen);
+                let x = walk(heap, x, &at(path, &k), weight);
                 (k, x)
             })
             .collect();
@@ -90,7 +119,7 @@ fn walk<'v>(
         let items: Vec<Star<'v>> = l
             .iter()
             .enumerate()
-            .map(|(i, x)| walk(heap, x, &at(path, &i.to_string()), seen))
+            .map(|(i, x)| walk(heap, x, &at(path, &i.to_string()), weight))
             .collect();
         return heap.alloc(AllocList(items));
     }
@@ -98,7 +127,7 @@ fn walk<'v>(
         let items: Vec<Star<'v>> = t
             .iter()
             .enumerate()
-            .map(|(i, x)| walk(heap, x, &at(path, &i.to_string()), seen))
+            .map(|(i, x)| walk(heap, x, &at(path, &i.to_string()), weight))
             .collect();
         return heap.alloc(AllocTuple(items));
     }
@@ -107,7 +136,7 @@ fn walk<'v>(
             .iter()
             .map(|(k, x)| {
                 let part = k.unpack_str().map_or_else(|| k.to_string(), str::to_string);
-                (k, walk(heap, x, &at(path, &part), seen))
+                (k, walk(heap, x, &at(path, &part), weight))
             })
             .collect();
         return heap.alloc(AllocDict(items));

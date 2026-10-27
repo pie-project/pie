@@ -21,6 +21,26 @@ pub struct Weight {
     /// importer lands them, whatever the checkpoint holds, and no format
     /// reads it.
     pub values: Option<Vec<f32>>,
+    /// The turn its columns are stored against, or `None` for a weight
+    /// stored as it reads.
+    pub turn: Option<Box<Turn>>,
+}
+
+/// A weight stored against turned inputs, `W·S·H`: a product turns its
+/// input by `H·S` first, the blockwise Hadamard `H` of `block` over the sign
+/// diagonal `signs`; a table's gathered rows turn back by `S·H`.
+#[derive(Clone)]
+pub struct Turn {
+    pub signs: Weight,
+    pub block: u32,
+    /// Which layout value `signs` is, so its name follows that one's path.
+    pub origin: u64,
+}
+
+impl std::fmt::Debug for Turn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Turn({:?}, block {})", self.signs.name, self.block)
+    }
 }
 
 /// Weights the compiler joins along their rows into one: `legs`, by name,
@@ -126,6 +146,7 @@ impl Weight {
             layout: ParamLayout::Natural,
             placement: ParamPlacement::Device,
             values: None,
+            turn: None,
         }
     }
 
@@ -772,6 +793,7 @@ impl Weight {
             layout: p.layout,
             placement: p.placement,
             values: None,
+            turn: None,
         }
     }
 }
