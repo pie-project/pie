@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 
 use crate::bitmask::{self, set_bit};
 use crate::compiled_grammar::CompiledGrammar;
-use crate::fsm::StateId;
 use tokenizer::Tokenizer;
 
 #[derive(Clone)]
@@ -51,33 +50,6 @@ impl SingleDfaEngine {
     pub(super) fn reset(&mut self, compiled: &CompiledGrammar) {
         self.state = compiled.rule_dfas[self.rule_idx].start.0 as u16;
         self.history.clear();
-    }
-
-    pub(super) fn find_jump_forward(&self, compiled: &CompiledGrammar) -> String {
-        let rule_dfa = &compiled.rule_dfas[self.rule_idx];
-        if rule_dfa.ends[self.state as usize] {
-            return String::new();
-        }
-        let mut result = Vec::new();
-        let mut state = self.state;
-        loop {
-            if rule_dfa.ends[state as usize] {
-                break;
-            }
-            let edges = rule_dfa.fsm.edges(StateId(state as u32));
-            let byte = match super::deterministic_byte(edges) {
-                Some(b) => b,
-                None => break,
-            };
-            let bt = rule_dfa.fsm.byte_table();
-            let next = bt[state as usize * 256 + byte as usize];
-            if next == 0xFFFF {
-                break;
-            }
-            result.push(byte);
-            state = next;
-        }
-        String::from_utf8(result).unwrap_or_default()
     }
 
     pub(super) fn fill_bitmask(

@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use crate::bitmask::{self, clear_bit, set_bit};
 use crate::compiled_grammar::CompiledGrammar;
-use crate::fsm::{FsmEdge, StateId};
 use crate::grammar::Grammar;
 use tokenizer::Tokenizer;
 
@@ -416,80 +415,6 @@ impl GrammarMatcher {
         }
     }
 
-    pub fn find_jump_forward_string(&mut self) -> String {
-        if self.terminated {
-            return String::new();
-        }
-
-        match &mut self.engine {
-            ParserEngine::SingleDfa(e) => e.find_jump_forward(&self.compiled),
-            ParserEngine::Stack(p) => {
-                if p.is_completed() {
-                    return String::new();
-                }
-
-                let mut result = Vec::new();
-                let start_pos = p.position();
-
-                loop {
-                    if p.is_completed() {
-                        break;
-                    }
-
-                    let states = p.current_states().to_vec();
-                    if states.is_empty() {
-                        break;
-                    }
-
-                    let mut next_byte: Option<u8> = None;
-                    let mut conflict = false;
-
-                    for state in &states {
-                        let flags = self.compiled.action(state.rule_id, state.dfa_state).flags;
-
-                        if flags.has_rule_ref() || flags.is_accepting() {
-                            conflict = true;
-                            break;
-                        }
-
-                        let dfa = &self.compiled.rule_dfas[state.rule_id as usize];
-                        let edges = dfa.fsm.edges(StateId(state.dfa_state as u32));
-                        let state_byte = deterministic_byte(edges);
-
-                        if state_byte.is_none() {
-                            conflict = true;
-                            break;
-                        }
-
-                        match next_byte {
-                            None => next_byte = state_byte,
-                            Some(b) if Some(b) == state_byte => {}
-                            _ => {
-                                conflict = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if conflict || next_byte.is_none() {
-                        break;
-                    }
-
-                    let byte = next_byte.unwrap();
-                    if !p.advance(byte) {
-                        break;
-                    }
-                    result.push(byte);
-                }
-
-                let advanced = p.position() - start_pos;
-                p.pop_last_states(advanced);
-
-                String::from_utf8_lossy(&result).to_string()
-            }
-        }
-    }
-
     pub fn is_terminated(&self) -> bool {
         self.terminated
     }
@@ -513,23 +438,6 @@ impl GrammarMatcher {
 
 fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
-
-fn deterministic_byte(edges: &[FsmEdge]) -> Option<u8> {
-    let mut result = None;
-    for edge in edges {
-        if let FsmEdge::CharRange { min, max, .. } = edge {
-            if min != max {
-                return None;
-            }
-            match result {
-                None => result = Some(*min),
-                Some(b) if b == *min => {}
-                _ => return None,
-            }
-        }
-    }
-    result
 }
 
 #[cfg(test)]
