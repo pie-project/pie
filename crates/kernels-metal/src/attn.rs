@@ -2157,6 +2157,105 @@ pub mod index {
         ratio: u32,
         selection: Tensor,
     ) -> Result<(), Error> {
+        ranked(
+            ctx,
+            q,
+            weights,
+            keys,
+            positions,
+            request_of_token,
+            scores,
+            heads,
+            head_dim,
+            top_k,
+            ratio,
+            selection,
+            top_k,
+        )
+    }
+
+    /// [`topk`]'s blocks read back as the tokens each stands for, then the
+    /// row's own open block's (`top_k * ratio + ratio - 1` a row, -1 unused):
+    /// `attn.index_topk` scored `pooled_tokens`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn topk_tokens(
+        ctx: &Ctx<'_>,
+        q: Tensor,
+        weights: Option<Tensor>,
+        keys: &KvPool,
+        positions: Tensor,
+        request_of_token: Tensor,
+        scores: Tensor,
+        heads: u32,
+        head_dim: u32,
+        top_k: u32,
+        ratio: u32,
+        selection: Tensor,
+    ) -> Result<(), Error> {
+        const OP: &str = "attn.index_topk";
+        let ratio = nonzero(OP, "the key stride this ranking states", ratio)?;
+        let width = top_k
+            .checked_mul(ratio)
+            .and_then(|w| w.checked_add(ratio - 1))
+            .ok_or_else(|| refuse(OP, "the token selection's width overflows"))?;
+        if selection.width != width {
+            return Err(refuse(
+                OP,
+                format!(
+                    "a {top_k}-block selection at ratio {ratio} reads back as {width} tokens, \
+                     not {}",
+                    selection.width
+                ),
+            ));
+        }
+        // The blocks land at the head of each token row, read back in place.
+        ranked(
+            ctx,
+            q,
+            weights,
+            keys,
+            positions,
+            request_of_token,
+            scores,
+            heads,
+            head_dim,
+            top_k,
+            ratio,
+            Tensor::new(selection.buf, selection.rows, top_k, Dtype::I32),
+            width,
+        )?;
+        let rows = nonzero(OP, "rows", selection.rows)?;
+        ctx.fire(
+            Fire::at(FILE, "index_pool_tokens").apply(Grid::of(
+                [rows.div_ceil(K_BLOCK) * K_BLOCK, 1, 1],
+                [K_BLOCK, 1, 1],
+            )),
+            &[
+                selection.arg_mut(),
+                positions.arg(),
+                stated(OP, rows)?.arg(),
+                stated(OP, top_k)?.arg(),
+                stated(OP, ratio)?.arg(),
+            ],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ranked(
+        ctx: &Ctx<'_>,
+        q: Tensor,
+        weights: Option<Tensor>,
+        keys: &KvPool,
+        positions: Tensor,
+        request_of_token: Tensor,
+        scores: Tensor,
+        heads: u32,
+        head_dim: u32,
+        top_k: u32,
+        ratio: u32,
+        selection: Tensor,
+        row_stride: u32,
+    ) -> Result<(), Error> {
         const OP: &str = "attn.index_topk";
         let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "index_topk_paged_bfloat16" });
         debug_assert_eq!(
@@ -2229,6 +2328,7 @@ pub mod index {
                 stated(OP, top_k)?.arg(),
                 stated(OP, ratio)?.arg(),
                 i32::from(weights.is_some()).arg(),
+                stated(OP, row_stride)?.arg(),
             ],
         )
     }

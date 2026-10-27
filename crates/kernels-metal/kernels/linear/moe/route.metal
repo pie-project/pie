@@ -210,8 +210,9 @@ inline float router_sigmoid(float x) {
   }
 }
 
-[[kernel]] void router_topk_sigmoid_biased(
-    const device bfloat* logits    [[buffer(0)]],
+template <typename L>
+[[kernel]] void router_topk_sigmoid_biased_t(
+    const device L* logits         [[buffer(0)]],
     const device float* correction [[buffer(1)]],
     device int* expert_ids         [[buffer(2)]],
     device float* expert_weights   [[buffer(3)]],
@@ -284,6 +285,17 @@ inline float router_sigmoid(float x) {
     for (uint r = 0; r < k; ++r) expert_weights[r] *= scale;
   }
 }
+
+// bf16 logits, and f32 ones (a release that routes at f32, GLM-5.3-Flash's).
+#define instantiate_router_sigmoid_biased(name, ltype)                       \
+  template [[host_name(#name)]]                                              \
+  [[kernel]] void router_topk_sigmoid_biased_t<ltype>(                       \
+      const device ltype*, const device float*, device int*, device float*,  \
+      const constant uint&, const constant uint&, const constant uint&,      \
+      const constant float&, uint3, uint, uint, uint3, uint3);
+
+instantiate_router_sigmoid_biased(router_topk_sigmoid_biased, bfloat)
+instantiate_router_sigmoid_biased(router_topk_sigmoid_biased_float32, float)
 
 inline float sqrt_softplus(float x) {
   const float sp = x > 20.0f ? x : metal::log(1.0f + metal::exp(x));

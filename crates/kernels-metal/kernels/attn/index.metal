@@ -167,13 +167,14 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
 
     const constant int& ratio          [[buffer(14)]],
     const constant int& has_weights    [[buffer(15)]],
+    const constant int& sel_stride     [[buffer(16)]],
     uint3 tgpos     [[threadgroup_position_in_grid]],
     uint3 lid       [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   const int t = int(tgpos.y);
   const int tid = int(lid.x);
-  device int* srow = selection + size_t(t) * size_t(topk);
+  device int* srow = selection + size_t(t) * size_t(sel_stride);
 
   threadgroup float partials[kIndexSimds];
   threadgroup float bcast[1];
@@ -355,5 +356,34 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
   }
   for (int m = min(total, topk) + tid; m < topk; m += kIndexBlock) {
     srow[m] = -1;
+  }
+}
+
+// A pooled ranking's blocks read back as the tokens each stands for, then the
+// row's own open block's (`topk * ratio + ratio - 1` a row, -1 unused), in
+// place: the row's blocks lead it, and one thread walks it from its end, so
+// each block is read before a token lands over it.
+[[kernel]] void index_pool_tokens(
+    device int* selection           [[buffer(0)]],
+    const device int* positions     [[buffer(1)]],
+    const constant int& rows        [[buffer(2)]],
+    const constant int& topk        [[buffer(3)]],
+    const constant int& ratio       [[buffer(4)]],
+    uint t [[thread_position_in_grid]]) {
+  if (int(t) >= rows) return;
+  const int width = topk * ratio + ratio - 1;
+  device int* row = selection + size_t(t) * size_t(width);
+  const int q = positions[t];
+  const int open_from = (q + 1) / ratio * ratio;
+  for (int n = width - 1; n >= 0; --n) {
+    int j = -1;
+    if (n < topk * ratio) {
+      const int b = row[n / ratio];
+      if (b >= 0) j = b * ratio + n % ratio;
+    } else {
+      const int at = open_from + (n - topk * ratio);
+      if (at <= q) j = at;
+    }
+    row[n] = j;
   }
 }
