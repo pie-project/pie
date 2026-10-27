@@ -8,7 +8,7 @@
 
 use dtype::Dtype;
 
-use super::pool::{Entries, cell_of, first, paging, put_cols, write_cell};
+use super::pool::{Entries, cell_of, compact_view, first, paging, put_cols, write_cell};
 use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
@@ -310,7 +310,7 @@ pub fn topk(
     if keys.page_size <= 0 {
         return Err(refuse(OP, "the index cache page size is zero"));
     }
-    if q.width != h * d || planes.keys.width < d {
+    if q.width != h * d || (planes.keys.width < d && planes.keys.width * ratio.max(1) != d) {
         return Err(refuse(OP, "the index query is not heads x key width"));
     }
     if weights.is_some_and(|w| w.width != h) {
@@ -349,7 +349,11 @@ pub fn topk(
         let w = weights.map(|w| w.f32(f));
         let pos = flat_i32(f, positions)?;
         let req = flat_i32(f, request_of_token)?;
-        let table = planes.keys.val;
+        let (table, ps, compact) =
+            match compact_view(f, OP, planes.keys.val, planes.keys.width, d, keys.page_size)? {
+                Some((t, ps)) => (t, ps, true),
+                None => (planes.keys.val, ps, false),
+            };
         let qv = f.slice_axis(qv, 0, 0, n)?;
         let qv = f.reshape(qv, &[n, hh, dd])?;
         let w = match w {
@@ -366,7 +370,9 @@ pub fn topk(
         let pos_t = cmp_i(f, Cmp::Gt, total, 0)?;
         let nkeys = f.select(pos_t, nkeys, zero)?;
         let nkeys = clamp_i(f, nkeys, 0, nk)?;
-        let scores = index_scores(f, qv, w, table, indices, indptr, req, nkeys, nk, stride, ps)?;
+        let scores = index_scores(
+            f, qv, w, table, indices, indptr, req, nkeys, nk, stride, ps, compact,
+        )?;
         Ok(bisect_select(f, scores, nkeys, kk)?)
     }
 }
@@ -467,6 +473,7 @@ fn index_scores(
     nk: i64,
     stride: i64,
     ps: i64,
+    compact: bool,
 ) -> Built<Val> {
     let qd = f.dims(q).to_vec();
     let (n, hh, dd) = (qd[0], qd[1], qd[2]);
@@ -493,11 +500,17 @@ fn index_scores(
             let j = f.iota(Elem::I32, &[n, kb], 1);
             let sb = f.broadcast(start, &[n, kb], &[])?;
             let j = f.add(j, sb)?;
-            let one = f.like_i(j, 1);
-            let sv = f.like_i(j, stride);
-            let p = f.add(j, one)?;
-            let p = f.mul(p, sv)?;
-            let p = f.sub(p, one)?;
+            // Key j at its block's last position, or a compact pool's
+            // view position j.
+            let p = if compact {
+                j
+            } else {
+                let one = f.like_i(j, 1);
+                let sv = f.like_i(j, stride);
+                let p = f.add(j, one)?;
+                let p = f.mul(p, sv)?;
+                f.sub(p, one)?
+            };
             let rq = f.broadcast(req, &[n, kb], &[0])?;
             let cell = cell_of(f, indices, indptr, rq, p, ps)?;
             let cell = f.reshape(cell, &[n * kb])?;

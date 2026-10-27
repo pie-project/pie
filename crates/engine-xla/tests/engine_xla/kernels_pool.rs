@@ -340,3 +340,92 @@ fn pooled_readers_attend_over_closed_blocks() {
         }
     }
 }
+
+/// A compact pool (DeepSeek-V4.1's: a position `1 / ratio` of an entry)
+/// files entry `c` at its index, `PS / ratio` a page, and its reader reads
+/// it there.
+#[test]
+fn a_compact_pool_files_and_reads_an_entry_a_row() {
+    let (hd, heads, ratio) = (8usize, 2usize, 2usize);
+    let per = PS / ratio;
+    let slot = |req: usize, c: usize| PAGES[req][c / per] as usize * per + c % per;
+    let mut rng = Rng(21);
+    let entries = rng.bf16s(3 * hd, 1.0);
+    let bpos = [1i32, 5, -1];
+    let breq = [0i32, 1, 0];
+    let plane0 = rng.bf16s(CELLS * hd / ratio, 1.0);
+    let positions = [3i32, 5];
+    let reqs = [0i32, 1];
+    let q = rng.bf16s(2 * heads * hd, 1.0);
+    let scale = 0.5f32;
+    let mut b = Bench::new();
+    let et = b.bf16(3, hd as u32, &entries);
+    let bp = b.i32(3, 1, &bpos);
+    let br = b.i32(3, 1, &breq);
+    let keys = b.bf16(CELLS as u32, (hd / ratio) as u32, &plane0);
+    let pages = kv_pool(&mut b, keys);
+    let qt = b.bf16(2, (heads * hd) as u32, &q);
+    let pt = b.i32(2, 1, &positions);
+    let rt = b.i32(2, 1, &reqs);
+    let o = b.zeros(Dtype::Bf16, 2, (heads * hd) as u32);
+    let lse = b.zeros(Dtype::F32, 2, heads as u32);
+    if !b
+        .run(|ctx| {
+            pool::kv_append(ctx, et, bp, br, &pages)?;
+            let c = kernels_xla::attn::pool::attention_lse(
+                qt,
+                pt,
+                rt,
+                &pages,
+                ratio as u32,
+                heads as u32,
+                hd as u32,
+                scale,
+                o,
+                lse,
+            )?;
+            pool::lse(ctx, c, pages)
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let mut view = plane0.clone();
+    for r in 0..3 {
+        if bpos[r] >= 0 {
+            let at = slot(breq[r] as usize, bpos[r] as usize / ratio);
+            view[at * hd..(at + 1) * hd].copy_from_slice(&entries[r * hd..(r + 1) * hd]);
+        }
+    }
+    assert_close(&b.read_f32(keys), &view, 0.0, 0.0);
+    let go = b.read_f32(o);
+    for r in 0..2 {
+        let visible = (positions[r] as usize + 1) / ratio;
+        let ks: Vec<&[f32]> = (0..visible)
+            .map(|c| {
+                let at = slot(reqs[r] as usize, c);
+                &view[at * hd..(at + 1) * hd]
+            })
+            .collect();
+        for h in 0..heads {
+            let qh = &q[(r * heads + h) * hd..(r * heads + h + 1) * hd];
+            let s: Vec<f32> = ks
+                .iter()
+                .map(|k| k.iter().zip(qh).map(|(a, b)| a * b).sum::<f32>() * scale)
+                .collect();
+            let m = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let z: f32 = s.iter().map(|v| (v - m).exp()).sum();
+            let want: Vec<f32> = (0..hd)
+                .map(|d| {
+                    s.iter()
+                        .zip(&ks)
+                        .map(|(v, k)| (v - m).exp() * k[d])
+                        .sum::<f32>()
+                        / z
+                })
+                .collect();
+            let at = (r * heads + h) * hd;
+            assert_close(&go[at..at + hd], &want, 1e-2, 1e-2);
+        }
+    }
+}
