@@ -943,7 +943,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 
     int kv_tile_idx =
         ceil_div(
-            (CAUSAL ? min(kv_end, kv_len - q_len + (packed_qo_start + cluster_tile_q) / num_heads)
+            (CAUSAL ? min(kv_end, kv_len - q_len + ceil_div(packed_qo_start + cluster_tile_q, num_heads))
                     : kv_end),
             CTA_TILE_KV) -
         1 - (kv_start / CTA_TILE_KV);
