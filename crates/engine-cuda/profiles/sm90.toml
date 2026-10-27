@@ -61,6 +61,7 @@ prefill_lattice_from = 256
 prefill_lattice_steps = 8
 
 [compiler]
+side_streams = 0
 # A taken conditional node costs about 12 us on an H100, past the launches it
 # skips at decode: priced out, every region launches (DeepSeek-V4.1-Flash's
 # miniature +5% at one request, MiMo-V2.6-Flash's +7% at 64, six others even).
