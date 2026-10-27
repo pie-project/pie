@@ -14,53 +14,36 @@ export function main(input) {
   const maxTokens = Number(input.max_tokens ?? 8);
 
   const ws = new WorkingSet();
-
-  if (maxTokens === 0) return { text: '', count: 0, tokens: [] };
+  const pipe = new Pipeline();
 
   // The model's opening (`<bos>` where it has one) before the raw text: a
   // gemma without it answers noise.
-  const prompt = [...chat.prefix(), ...model.encode(promptText)];
-  if (prompt.length === 0) throw new Error('empty prompt');
-  const n = prompt.length;
-
-  const pipe = new Pipeline();
-  const generated = [];
-
-  const toks = Channel.from(prompt, dtype.i32);
-  const embedIndptr = Channel.from([0, n], dtype.u32);
-  const tokOut = new Channel([1], dtype.i32);
-
-  const prefill = new ForwardPass();
-  prefill.embed(toks, embedIndptr);
-  prefill.state([ws], { fold: 'all' });
-  prefill.epilogue(() => {
-    tokOut.put(greedy(intrinsics.output(0, 'logits')));
-  });
-  pipe.submit(prefill);
-  const first = tokOut.takeScalar();
-  generated.push(first);
-
-  // ── DECODE (1-wide, device loop-carried token) ─────────────────────────
-  if (generated.length < maxTokens) {
-    const tokIn = Channel.from([first], dtype.i32);
-    const tokOut = new Channel([1], dtype.i32).capacity(channelCapacity());
-    const embedIndptr = Channel.from([0, 1], dtype.u32);
-
-    const fwd = new ForwardPass();
-    fwd.embed(tokIn, embedIndptr);
-    fwd.state([ws], { fold: 'all' });
-    fwd.epilogue(() => {
-      const token = greedy(intrinsics.output(0, 'logits'));
-      tokIn.put(token);
-      tokOut.put(token);
-    });
-
-    const budget = maxTokens - 1;
-    pipe.runAhead(fwd, budget, () => {
-      generated.push(tokOut.takeScalar());
-      return true;
-    });
+  const head = [...chat.prefix(), ...model.encode(promptText)];
+  const last = head.pop();
+  if (last === undefined) throw new Error('empty prompt');
+  if (head.length > 0) {
+    const fill = new ForwardPass();
+    fill.embed(Channel.from(head, dtype.i32), Channel.from([0, head.length], dtype.u32));
+    fill.state([ws], { fold: 'all' });
+    pipe.submit(fill);
   }
+
+  const tokIn = Channel.from([last], dtype.i32);
+  const tokOut = new Channel([1], dtype.i32).capacity(channelCapacity());
+  const fwd = new ForwardPass();
+  fwd.embed(tokIn, Channel.from([0, 1], dtype.u32));
+  fwd.state([ws], { fold: 'all' });
+  fwd.epilogue(() => {
+    const token = greedy(intrinsics.output(0, 'logits'));
+    tokIn.put(token);
+    tokOut.put(token);
+  });
+
+  const generated = [];
+  pipe.runAhead(fwd, maxTokens, () => {
+    generated.push(tokOut.takeScalar());
+    return true;
+  });
   pipe.close();
 
   return {
