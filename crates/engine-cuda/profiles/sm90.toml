@@ -57,7 +57,7 @@ gemm.fp8_gemv_until = 4
 # them (Qwen3.6-27B's prefill 30-35% faster on an H100, an A100 and an RTX
 # PRO 6000).
 [engine]
-graphs = "off"
+graphs = "shaped"
 prefill_lattice_from = 256
 prefill_lattice_steps = 8
 
