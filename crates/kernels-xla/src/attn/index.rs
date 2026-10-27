@@ -371,6 +371,89 @@ pub fn topk(
     }
 }
 
+/// [`topk`]'s blocks read back as the tokens each stands for (block `b`'s
+/// are `b · ratio ..= b · ratio + ratio − 1`), then the row's own open
+/// block's up to its position: `top_k · ratio + ratio − 1` token indices a
+/// row, unused -1 (`attn.index_topk` scored `pooled_tokens`).
+pub fn topk_tokens(
+    f: &mut Func,
+    q: Operand,
+    weights: Option<Operand>,
+    planes: Entries,
+    keys: &KvPool<impl Stored>,
+    positions: Operand,
+    request_of_token: Operand,
+    heads: u32,
+    head_dim: u32,
+    top_k: u32,
+    ratio: u32,
+    selection: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "attn.index_topk";
+    let r = ratio.max(1);
+    let width = top_k
+        .checked_mul(r)
+        .and_then(|w| w.checked_add(r - 1))
+        .ok_or_else(|| refuse(OP, "the token selection's width overflows"))?;
+    if selection.width != width {
+        return Err(refuse(
+            OP,
+            format!(
+                "a {top_k}-block selection at ratio {r} reads back as {width} tokens, not {}",
+                selection.width
+            ),
+        ));
+    }
+    let blocks = Landing {
+        width: top_k,
+        ..selection
+    };
+    let blocks = topk(
+        f,
+        q,
+        weights,
+        planes,
+        keys,
+        positions,
+        request_of_token,
+        heads,
+        head_dim,
+        top_k,
+        ratio,
+        blocks,
+    )?;
+    let (n, kk, rr) = (i64::from(selection.rows), i64::from(top_k), i64::from(r));
+    let pos = flat_i32(f, positions)?;
+    let pos = first(f, pos, n)?;
+    {
+        let b = f.broadcast(blocks, &[n, kk, rr], &[0, 1])?;
+        let i = f.iota(Elem::I32, &[n, kk, rr], 2);
+        let rv = f.like_i(b, rr);
+        let tok = f.mul(b, rv)?;
+        let tok = f.add(tok, i)?;
+        let live = cmp_i(f, Cmp::Ge, b, 0)?;
+        let none = f.like_i(b, -1);
+        let tok = f.select(live, tok, none)?;
+        let tok = f.reshape(tok, &[n, kk * rr])?;
+        if rr == 1 {
+            return Ok(tok);
+        }
+        let one = f.like_i(pos, 1);
+        let open = f.add(pos, one)?;
+        let rv = f.like_i(pos, rr);
+        let open = f.div(open, rv)?;
+        let open = f.mul(open, rv)?;
+        let open = f.broadcast(open, &[n, rr - 1], &[0])?;
+        let i = f.iota(Elem::I32, &[n, rr - 1], 1);
+        let at = f.add(open, i)?;
+        let q = f.broadcast(pos, &[n, rr - 1], &[0])?;
+        let seen = f.compare(Cmp::Le, at, q)?;
+        let none = f.like_i(at, -1);
+        let tail = f.select(seen, at, none)?;
+        Ok(f.concat(&[tok, tail], 1)?)
+    }
+}
+
 /// The `[n, nk]` score rows (entries past a row's `nkeys` are garbage).
 fn index_scores(
     f: &mut Func,

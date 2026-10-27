@@ -495,7 +495,9 @@ pub mod index {
         })
     }
 
-    /// Each row's `top_k` best-scoring index blocks, into `selection`.
+    /// Each row's `top_k` best-scoring index blocks, into `selection`; with
+    /// `tokens`, the blocks read back as their tokens and the row's open
+    /// block's (`pooled_tokens`).
     pub fn topk(
         ctx: &Ctx<'_>,
         q: Tensor,
@@ -507,6 +509,7 @@ pub mod index {
         head_dim: u32,
         top_k: u32,
         ratio: u32,
+        tokens: bool,
         selection: Tensor,
     ) -> Result<(), Error> {
         lower(ctx, |l| {
@@ -517,7 +520,12 @@ pub mod index {
                 let req = l.read(request_of_token)?;
                 Ok((qv, w, pos, req))
             })?;
-            let y = index::topk(
+            let topk = if tokens {
+                index::topk_tokens
+            } else {
+                index::topk
+            };
+            let y = topk(
                 l.f(),
                 qv,
                 w,
