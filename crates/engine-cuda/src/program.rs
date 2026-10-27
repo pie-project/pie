@@ -21,7 +21,7 @@ pub use endpoint::Endpoint;
 pub use launch::{
     ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes, scratch_offsets,
 };
-pub use session::{Fired, Launched, Session, seeds_of};
+pub use session::{Fired, Launched, Session};
 pub use wave::Wave;
 
 #[derive(Debug)]

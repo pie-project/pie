@@ -915,30 +915,6 @@ impl Session {
     }
 }
 
-#[must_use]
-pub fn seeds_of(interp: &eta_exec::InterpInstance, plan: &ExecPlan) -> Vec<(u32, Vec<u8>)> {
-    let mut seeds = Vec::new();
-    for (channel, ring) in interp.channels.iter().enumerate() {
-        let declared = match plan.package.channels.get(channel) {
-            Some(declared) => declared,
-            None => continue,
-        };
-        let dtype = eta_exec::concrete_dtype(declared.dtype);
-        let numel = declared
-            .shape
-            .iter()
-            .map(|&d| d as usize)
-            .product::<usize>()
-            .max(1);
-        for sequence in ring.head()..ring.tail() {
-            let mut wire = vec![0u8; eta_exec::wire_cell_bytes(dtype, numel)];
-            eta_exec::encode_wire(&ring.decode_sequence(sequence), &mut wire);
-            seeds.push((channel as u32, wire));
-        }
-    }
-    seeds
-}
-
 fn stages_and_plans_agree(compiled: &Compiled) -> Result<()> {
     stage_plans_are_parallel(
         &compiled
