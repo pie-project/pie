@@ -1,7 +1,7 @@
 use poem_ir::{Def, Operands, Operation, Trace, ValueId};
 
 use crate::budget::DeviceProfile;
-use crate::compiled::{EventId, Lowering, Region};
+use crate::compiled::{EventId, Lowering, Phase, Region};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamPlan {
@@ -17,6 +17,7 @@ pub struct StreamPlan {
 pub(crate) fn fork_with(
     trace: &Trace,
     regions: &mut [Region],
+    units_of: &[u32],
     profile: &DeviceProfile,
 ) -> StreamPlan {
     if profile.side_streams == 0 || regions.len() < 3 {
@@ -43,11 +44,14 @@ pub(crate) fn fork_with(
     };
     let mut at = 0usize;
     while at < regions.len() {
-        let Some(group) = group_at(regions, &ordered, at) else {
+        let Some(group) = group_at(regions, units_of, &ordered, at) else {
             at += 1;
             continue;
         };
-        if group.end < regions.len() {
+        if group.end < regions.len()
+            && regions[group.end].phase == Phase::Capture
+            && units_of.get(group.end) == units_of.get(group.start)
+        {
             seat(regions, &costs, profile, group.clone(), &mut forks);
         }
         at = group.end;
@@ -69,6 +73,7 @@ pub(crate) fn fork_with(
 pub(crate) fn fork_dag(
     trace: &Trace,
     regions: &mut [Region],
+    units_of: &[u32],
     profile: &DeviceProfile,
     fixed: Option<&[u32]>,
 ) -> StreamPlan {
@@ -104,10 +109,30 @@ pub(crate) fn fork_dag(
     let mut synced: Vec<Vec<Option<usize>>> = vec![vec![None; lanes]; lanes];
     // Each wait's source region, for the order below.
     let mut sources: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut unit_start = 0usize;
     for r in 0..n {
+        if regions[r].phase != Phase::Capture {
+            continue;
+        }
+        let unit = units_of.get(r).copied().unwrap_or(0);
+        let unit_first = r == 0
+            || regions[r - 1].phase != Phase::Capture
+            || units_of.get(r - 1).copied().unwrap_or(0) != unit;
+        if unit_first {
+            unit_start = r;
+            free.fill(0.0);
+            last.fill(None);
+            for row in &mut synced {
+                row.fill(None);
+            }
+        }
+        let unit_last = r + 1 == n
+            || regions[r + 1].phase != Phase::Capture
+            || units_of.get(r + 1).copied().unwrap_or(0) != unit;
+
         let mut ready = 0f32;
         let mut need: Vec<Option<usize>> = vec![None; lanes];
-        for a in 0..r {
+        for a in unit_start..r {
             if !ordered.path(a, r) {
                 continue;
             }
@@ -115,7 +140,7 @@ pub(crate) fn fork_dag(
             let l = lane_of[a];
             need[l] = Some(need[l].map_or(a, |held| held.max(a)));
         }
-        let barrier = !eligible[r] || r + 1 == n;
+        let barrier = !eligible[r] || unit_first || unit_last;
         let lane = if barrier {
             0
         } else if let Some(fixed) = fixed {
@@ -180,6 +205,16 @@ pub(crate) fn fork_dag(
     let mut before: Vec<Vec<u64>> = vec![vec![0u64; words]; n];
     let mut prev: Vec<Option<usize>> = vec![None; lanes];
     for r in 0..n {
+        if regions[r].phase != Phase::Capture {
+            continue;
+        }
+        let unit = units_of.get(r).copied().unwrap_or(0);
+        if r == 0
+            || regions[r - 1].phase != Phase::Capture
+            || units_of.get(r - 1).copied().unwrap_or(0) != unit
+        {
+            prev.fill(None);
+        }
         let mut set = vec![0u64; words];
         let add = |set: &mut Vec<u64>, a: usize, before: &Vec<Vec<u64>>| {
             set[a / 64] |= 1 << (a % 64);
@@ -196,7 +231,11 @@ pub(crate) fn fork_dag(
         before[r] = set;
         prev[lane_of[r]] = Some(r);
         for a in 0..r {
-            if lane_of[a] != lane_of[r] && before[r][a / 64] & (1 << (a % 64)) == 0 {
+            if regions[a].phase == Phase::Capture
+                && units_of.get(a).copied().unwrap_or(0) == unit
+                && lane_of[a] != lane_of[r]
+                && before[r][a / 64] & (1 << (a % 64)) == 0
+            {
                 plan.pairs.push((a as u32, r as u32));
             }
         }
@@ -208,9 +247,10 @@ pub(crate) fn fork_dag(
 pub(crate) fn dag_lanes(
     trace: &Trace,
     regions: &mut [Region],
+    units_of: &[u32],
     profile: &DeviceProfile,
 ) -> (Vec<u32>, std::collections::BTreeSet<u32>) {
-    fork_dag(trace, regions, profile, None);
+    fork_dag(trace, regions, units_of, profile, None);
     let mut lanes = vec![0u32; trace.nodes.len()];
     // Where a coarser region must still break: where the lane changes,
     // before a node that waits on another lane (a region waits at its start)
@@ -291,13 +331,20 @@ fn seat(
     }
 }
 
-fn group_at(regions: &[Region], ordered: &Ordered, at: usize) -> Option<core::ops::Range<usize>> {
+fn group_at(
+    regions: &[Region],
+    units_of: &[u32],
+    ordered: &Ordered,
+    at: usize,
+) -> Option<core::ops::Range<usize>> {
     if !forkable(&regions[at]) {
         return None;
     }
+    let unit = units_of.get(at);
     let mut end = at + 1;
     while end < regions.len()
         && forkable(&regions[end])
+        && units_of.get(end) == unit
         && (at..end).all(|held| candidates(regions, ordered, held, end))
     {
         end += 1;
