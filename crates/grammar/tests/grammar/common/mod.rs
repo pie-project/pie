@@ -1,10 +1,7 @@
-#![allow(dead_code)]
-
 use std::borrow::Borrow;
 use std::sync::Arc;
 
 use ::grammar::grammar::Grammar;
-use ::grammar::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
 use ::grammar::matcher::GrammarMatcher;
 use ::grammar::regex::regex_to_grammar;
 use tokenizer::Tokenizer;
@@ -30,18 +27,6 @@ pub fn regex_accepts(pattern: &str, input: &str) -> bool {
     regex_to_grammar(pattern)
         .map(|grammar| grammar_accepts(grammar, input))
         .unwrap_or(false)
-}
-
-pub fn schema_accepts(schema: &str, input: &str) -> bool {
-    let grammar = json_schema_to_grammar(schema, &no_whitespace_options()).unwrap();
-    grammar_accepts(grammar, input)
-}
-
-pub fn no_whitespace_options() -> JsonSchemaOptions {
-    JsonSchemaOptions {
-        any_whitespace: false,
-        ..JsonSchemaOptions::default()
-    }
 }
 
 pub fn matcher_from_ebnf(ebnf: &str, root: &str, vocab: &[&str]) -> GrammarMatcher {
