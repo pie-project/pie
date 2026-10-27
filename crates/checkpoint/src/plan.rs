@@ -390,5 +390,3 @@ impl LoadPlan {
             })
     }
 }
-
-pub const TIED_EMBEDDING_NAME: &str = "shared_embedding.weight";

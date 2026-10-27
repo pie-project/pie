@@ -286,19 +286,6 @@ impl ByteScale {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ByteRun {
-    pub source: ByteRunSource,
-    pub dst_offset: u64,
-    pub len: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ByteRunSource {
-    Leaf { leaf: usize, src_offset: u64 },
-    Zero,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Piece {
     pub source: RunSource,
