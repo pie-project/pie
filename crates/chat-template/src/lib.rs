@@ -24,7 +24,7 @@ pub mod qwen3_coder;
 pub mod raw;
 pub mod spec;
 
-pub use decode::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder, ThinkingDecoder};
+pub use decode::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 pub use spec::{FORMATS, Spec, build};
 
 pub struct ToolGrammar {
