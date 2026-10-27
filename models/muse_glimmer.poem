@@ -49,7 +49,6 @@ DIMS = {
 def layout(id, deploy):
     w = roles(deploy, "w", exact = True).w
     d = DIMS[id]
-    dense = compute(w)
     proj = w
     hidden = d.hidden
     hd = d.head_dim
@@ -59,7 +58,7 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s: weight([hidden])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         return struct(
             full = l % d.full_every == d.full_every - 1,
             q = weight([q_w, hidden], proj),

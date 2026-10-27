@@ -124,7 +124,7 @@ def layout(id, deploy):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, width: weight([width])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         if l in d.full_layers:
             a = d.full
             attn = attention(

@@ -266,7 +266,7 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s, width: weight([width], w)
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         keys = "index.{}".format(l) if ranks(d, l) else None
         attn = mla_at("layer.{}".format(l), "kv.{}".format(l), keys)
         if l < d.dense_layers:

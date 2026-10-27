@@ -81,7 +81,6 @@ def layout(id, deploy):
         fail("{} stores its weights bf16 with NVFP4 or MXFP4 experts, not {}".format(id, deploy.weights))
     d = DIMS[id]
     w = dtype.bf16
-    dense = compute(w)
     routed = deploy.weights[1] if len(deploy.weights) > 1 else w
     hidden = d.hidden
     hd = d.head_dim
@@ -92,7 +91,7 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s, dim: weight([dim])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         bank = w if l in d.dense_experts else routed
         return struct(
             full = full(l),

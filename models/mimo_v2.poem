@@ -118,7 +118,7 @@ def layout(id, deploy):
         kv_w = kv_heads * PADDED
         q_qk = d.q_heads * d.qk_head_dim
         kv_kv = kv_heads * (d.qk_head_dim + d.v_head_dim)
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         if l in d.dense:
             di = d.dense_inter
             mlp = struct(

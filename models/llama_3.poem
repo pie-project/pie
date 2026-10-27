@@ -86,13 +86,12 @@ def layout(id, deploy):
         fail("{} ships no drafter and no parts".format(id))
     proj = roles(deploy, "proj", exact = True).proj
     table = dtype.bf16 if proj in RELEASED else proj
-    dense = compute(table)
     d = DIMS[id]
     hidden, hd = d.hidden, d.head_dim
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
 
     def layer(l):
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         return struct(
             attn_norm = weight([hidden]),
             q = weight([q_width, hidden], proj),

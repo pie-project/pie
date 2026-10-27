@@ -234,7 +234,7 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s, length: weight([length])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         reading = GLOBAL if full_at(l) else SLIDING
         head_dim, row_heads = (sliding.head_dim, sliding.kv_heads) if reading == SLIDING else (glob.head_dim, glob.kv_heads)
         q_w = d.q_heads * head_dim

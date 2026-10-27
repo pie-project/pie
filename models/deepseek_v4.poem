@@ -142,7 +142,7 @@ def base(w, kv, d):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, dim: weight([dim], w)
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, compute(w))
+        lora_a, lora_b = banks(hidden)
         ratio = d.pool[l]
         if l < d.dense_layers:
             di = d.dense_inter
@@ -322,7 +322,7 @@ def flash(w, r, kv, d, quant = None):
         n = lambda s: "{}.{}".format(prefix, s)
         q = lin if lin != None else weights
         norm = lambda s, dim: weight([dim], sdense)
-        lora_a, lora_b = banks(prefix, hidden, sdense)
+        lora_a, lora_b = banks(hidden)
         has_indexer = ratio == 4
         pool = None
         if ratio != None:
@@ -564,7 +564,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
         prefix = "layer.{}".format(l)
         n = lambda s: "{}.{}".format(prefix, s)
         norm = lambda s, dim: weight([dim])
-        lora_a, lora_b = banks(prefix, hidden, dense)
+        lora_a, lora_b = banks(hidden)
         ratio = plan.ratios[l]
         csa = csa_of(plan, l)
         kv_of = None
@@ -646,7 +646,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
         many window positions ending at their lane's last."""
         n = lambda s: "{}.{}".format(prefix, s)
         norm = lambda s, dim: weight([dim])
-        lora_a, lora_b = banks(prefix, hidden, dense)
+        lora_a, lora_b = banks(hidden)
         return struct(
             attn_mix = mix(n, "attn_mix", streams, hidden),
             attn_norm = norm("attn_norm", hidden),

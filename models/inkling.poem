@@ -88,7 +88,6 @@ GLOBAL = 1
 def layout(id, deploy):
     d = DIMS[id]
     w = roles(deploy, "w", exact = True).w
-    dense = compute(w)
     hidden = d.hidden
     hd = d.head_dim
     q_w = d.heads * hd
@@ -97,7 +96,7 @@ def layout(id, deploy):
 
     def layer(l):
         vec = lambda s, length: weight([length])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         if (l + 1) % d.global_every == 0:
             reading, kv_heads, extent = GLOBAL, d.global_kv_heads, d.global_extent
         else:

@@ -288,7 +288,7 @@ def layout(id, deploy):
                 beta = d.situ_beta,
                 up_cap = d.situ_cap,
             )
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, compute(weights))
+        lora_a, lora_b = banks(hidden)
         return struct(
             res_blend = blend(n, "res_norm", "res_proj") if blend_at(l) else None,
             mlp_res = blend(n, "mlp_res_norm", "mlp_res_proj") if d.attn_res == EVERY else None,

@@ -242,7 +242,7 @@ def layout(id, deploy):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s: weight([hidden])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         keys = "index.{}".format(l) if ranks(l) else None
         if l < d.dense_layers:
             iw = d.dense_inter

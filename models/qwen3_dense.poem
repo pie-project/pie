@@ -98,7 +98,7 @@ def layout(id, deploy):
     hidden, hd = d.hidden, d.head_dim
 
     def layer(l):
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         return struct(
             attn_norm = weight([hidden]),
             q = weight([d.q_heads * hd, hidden], proj),

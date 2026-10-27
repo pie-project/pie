@@ -165,7 +165,7 @@ def layout(id, deploy):
         )
 
     def layer(l):
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         return struct(
             attn_norm = weight([hidden]),
             q = weight([q_width, hidden], proj),

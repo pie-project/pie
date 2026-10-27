@@ -109,7 +109,7 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s, cols: weight([cols])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         return struct(
             attn = struct(
                 reading = WINDOWED if l % 2 == 0 else FULL,
