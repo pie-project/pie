@@ -54,8 +54,8 @@ settings are a clean A/B on exactly one thing.
 
 **2.48 ms/token, 0.75× the [`naive-baseline`](../naive-baseline) control** on
 an L40S with Qwen3-0.6B. Faster than the baseline because it decodes greedily
-via `reduce_argmax` and never materializes a noise tensor — the healing mask
-itself is a one-time cost on the first step only, not a per-token one.
+via `masked_argmax` and never materializes a noise tensor — the healing mask
+binds the first step only; later steps carry an all-true mask.
 
 ## Run
 
