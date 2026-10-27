@@ -2296,11 +2296,18 @@ pub async fn submit_pass_stamped<C: FireContext>(
                                     .to_string(),
                             ));
                         }
-                        let attn_mask = match geometry::lower_attn_mask_evaluated(
-                            &bound.container,
-                            &geometry.qo_indptr,
-                            &evaluated,
-                        ) {
+                        // A mask the program computes on the device is the
+                        // engine's to resolve, even on a fire whose seeds let
+                        // the host evaluate it: one source a port.
+                        let attn_mask = match if device_resolved.contains(Port::AttnMask) {
+                            Ok(geometry::FireAttnMask::Device)
+                        } else {
+                            geometry::lower_attn_mask_evaluated(
+                                &bound.container,
+                                &geometry.qo_indptr,
+                                &evaluated,
+                            )
+                        } {
                             Ok(mask) => mask,
                             Err(error) => {
                                 return Ok(Err(format!("pipeline: fire attention mask: {error}")));

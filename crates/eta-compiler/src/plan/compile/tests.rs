@@ -195,3 +195,40 @@ fn top_k_has_one_canonical_signature_and_library_kind() {
         1
     );
 }
+
+/// `0 + -0` is `+0` in every float width: a one-element cumsum or an
+/// `x + 0` of a half-width float is not its element, as in f32; in integer
+/// arithmetic it is.
+#[test]
+fn no_float_width_folds_an_add_of_zero() {
+    use super::fold::simplify_alias;
+    use super::symbolic::{Dimension, SymbolicType};
+    let one = |dtype| SymbolicType {
+        dtype,
+        dims: vec![Dimension::Static(1)],
+    };
+    let literals = [None, Some(Literal::I32(0))];
+    for dtype in [Dtype::F32, Dtype::F16, Dtype::Bf16] {
+        assert_eq!(
+            simplify_alias(&Op::CumSum(0), &one(dtype), &literals),
+            None,
+            "{dtype:?}"
+        );
+        assert_eq!(
+            simplify_alias(&Op::Add(0, 1), &one(dtype), &literals),
+            None,
+            "{dtype:?}"
+        );
+    }
+    for dtype in [Dtype::I32, Dtype::U32] {
+        assert_eq!(
+            simplify_alias(&Op::CumSum(0), &one(dtype), &literals),
+            Some(0),
+            "{dtype:?}"
+        );
+    }
+    assert_eq!(
+        simplify_alias(&Op::Add(0, 1), &one(Dtype::I32), &literals),
+        Some(0)
+    );
+}

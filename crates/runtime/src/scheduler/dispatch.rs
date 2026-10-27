@@ -50,6 +50,7 @@ pub(crate) async fn register_channels_bind_classified(
     seed_values: Vec<ChannelValue>,
     geometry_class: GeometryClass,
     extents: BindExtents,
+    device_resolved: eta_ir::registry::PortMask,
 ) -> Result<(
     Vec<Arc<ChannelEndpoint>>,
     BoundInstance,
@@ -73,6 +74,7 @@ pub(crate) async fn register_channels_bind_classified(
         seeds,
         geometry_class,
         extents,
+        device_resolved,
     );
     match handle
         .register_channels_bind(pipeline_id, plans, program, bind)

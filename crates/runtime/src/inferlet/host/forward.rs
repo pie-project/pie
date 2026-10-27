@@ -1378,6 +1378,9 @@ impl ProcessCtx {
                         sampled_rows: pricing_rows.max(1),
                         ..::engine::BindExtents::default()
                     },
+                    // The ports the program computes on the device: the
+                    // engine's to resolve, and no others.
+                    decode_envelope.unwrap_or(PortMask::NONE),
                 )
                 .await
                 {

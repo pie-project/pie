@@ -198,6 +198,10 @@ pub struct Epilogue {
     stored: Vec<Dtype>,
     /// Each result's cache, where it lands in one ([`Paged`]).
     paged: Vec<Option<Paged>>,
+    /// What [`PartialEq`] compares, hashed once: the key the row leg's
+    /// table finds this epilogue's leg by ([`RowLeg::of`]).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    key: u64,
 }
 
 /// What cuBLASLt's own epilogues land over one dense bank's products: a
@@ -403,9 +407,19 @@ impl Epilogue {
         } else {
             None
         };
+        let results = region.results.len();
+        let stored = stored.to_vec();
+        let paged = anchored.paged.clone();
+        let key = kernels_ir::fnv1a64(
+            format!(
+                "{:016x}{parts}{inputs:?}{results}{round}{windows:?}{fixed:?}{stored:?}{paged:?}",
+                body.hash
+            )
+            .as_bytes(),
+        );
         Ok(Epilogue {
             lt,
-            results: region.results.len(),
+            results,
             region,
             body,
             root,
@@ -416,8 +430,9 @@ impl Epilogue {
             windows,
             span,
             fixed,
-            stored: stored.to_vec(),
-            paged: anchored.paged.clone(),
+            stored,
+            paged,
+            key,
         })
     }
 
@@ -1202,41 +1217,36 @@ impl RowLeg {
     /// current device, or `None` where the row skeleton does not carry it
     /// ([`Epilogue::leg`]).
     pub(crate) fn of(epi: &Epilogue, n: u32) -> Option<RowLeg> {
-        /// Each epilogue's leg by body, parts, the products' rounding, its
-        /// windows and inputs' storage, and the tile's columns.
+        /// Each epilogue's leg by the epilogue and the tile's columns, or
+        /// `None` where the row skeleton does not carry it: cut, printed and
+        /// loaded once, though an eager fire asks at every product.
         type Legs = HashMap<(u64, u32), Option<RowLeg>>;
         static LEGS: OnceLock<Mutex<Legs>> = OnceLock::new();
-        let shape = epi.leg(n)?;
         let mut legs = LEGS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .expect("row leg table lock poisoned");
-        let laid = kernels_ir::fnv1a64(format!("{:?}{:?}", epi.windows, epi.stored).as_bytes());
-        *legs
-            .entry((
-                epi.body.hash ^ u64::from(epi.parts) ^ (u64::from(epi.round) << 63) ^ laid,
-                n,
-            ))
-            .or_insert_with(|| {
-                let mut pieces = Vec::with_capacity(shape.pieces.len());
-                for piece in shape.pieces {
-                    let kernel =
-                        crate::synth::synth(&piece.region, &shape.ins, piece.outs.len()).ok()?;
-                    kernel.load().ok()?;
-                    pieces.push(Piece {
-                        kernel,
-                        from: piece.from,
-                        width: piece.width,
-                        outs: piece.outs,
-                    });
-                }
-                Some(RowLeg {
-                    pieces: Box::leak(pieces.into_boxed_slice()),
-                    slices: shape.slices,
-                    parts: epi.parts,
-                    product: if epi.round { Dtype::Bf16 } else { Dtype::F32 },
-                })
+        *legs.entry((epi.key, n)).or_insert_with(|| {
+            let shape = epi.leg(n)?;
+            let mut pieces = Vec::with_capacity(shape.pieces.len());
+            for piece in shape.pieces {
+                let kernel =
+                    crate::synth::synth(&piece.region, &shape.ins, piece.outs.len()).ok()?;
+                kernel.load().ok()?;
+                pieces.push(Piece {
+                    kernel,
+                    from: piece.from,
+                    width: piece.width,
+                    outs: piece.outs,
+                });
+            }
+            Some(RowLeg {
+                pieces: Box::leak(pieces.into_boxed_slice()),
+                slices: shape.slices,
+                parts: epi.parts,
+                product: if epi.round { Dtype::Bf16 } else { Dtype::F32 },
             })
+        })
     }
 
     /// The epilogue over `products` (`m x parts · n`, the plain product of

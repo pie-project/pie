@@ -33,6 +33,19 @@ fn wire_shape(shape: &Shape) -> Vec<u32> {
     shape.dims().to_vec()
 }
 
+/// Every value a wire op reads: its arguments, and a pivot's predicate
+/// operand, which the wire keeps beside them in `pred_payload`. The one rule
+/// for every form of a wire op (an [`OpWire`], a launch package's op).
+pub fn reads(
+    tag: u8,
+    args: &[ValueId],
+    pred_payload: ValueId,
+) -> impl Iterator<Item = ValueId> + '_ {
+    args.iter()
+        .copied()
+        .chain((tag == tags::PIVOT_THRESHOLD).then_some(pred_payload))
+}
+
 impl OpWire {
     pub fn of(op: &Op) -> Self {
         let mut wire = OpWire {
@@ -158,6 +171,11 @@ impl OpWire {
 
     pub fn channel(&self) -> Option<u32> {
         u32::try_from(self.chan).ok()
+    }
+
+    /// Every value the op reads: see [`reads`].
+    pub fn reads(&self) -> impl Iterator<Item = ValueId> + '_ {
+        reads(self.tag, &self.args, self.pred_payload)
     }
 
     fn shape(&self) -> Option<Shape> {

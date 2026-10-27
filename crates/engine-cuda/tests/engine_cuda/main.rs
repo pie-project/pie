@@ -29,6 +29,7 @@ mod common_two_axis;
 mod common_vae;
 
 mod a_bank_says_which_site_it_corrects;
+mod a_beam_reads_up_to_its_slot_what_its_mask_admits;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
 mod a_buffer_frees_after_another_context_closes;
 mod a_buffered_fold_is_the_fold_it_replaces;
@@ -38,6 +39,7 @@ mod a_cell_table_reads_each_rows_patch_and_group;
 mod a_channel_fed_voxel_input_lands_the_committed_cell;
 mod a_context_input_merged_into_the_stream_lands_its_rows;
 mod a_conv_decoder_fires_over_a_voxel_input;
+mod a_decode_envelope_packs_its_device_mask_into_each_lane;
 mod a_declined_mega_moe_answers_what_its_legs_answer;
 mod a_dit_plan_loads_at_a_sixty_four_k_row_ceiling;
 mod a_double_block_fires_two_streams_through_the_engine;
@@ -58,6 +60,7 @@ mod a_lane_sampler_draws_what_the_interpreter_draws;
 mod a_missing_or_misshapen_input_feed_is_refused_by_name;
 mod a_model_loaded_after_another_fits_as_in_a_fresh_process;
 mod a_nucleus_cut_agrees_with_the_host_interpreter;
+mod a_padded_row_writes_nothing;
 mod a_prefill_past_the_gemvs_grid_is_served;
 mod a_prologue_put_input_is_the_cell_the_forward_reads;
 mod a_prologue_put_port_is_the_cell_the_fire_resolves;
@@ -87,6 +90,10 @@ mod an_output_of_ids_reads_as_stored;
 mod every_armed_body_answers_its_eager_walk;
 mod every_catalog_deployment_dispatches;
 mod every_diagnostic_is_a_word_the_boot_states;
+#[cfg(feature = "device")]
+mod every_op_agrees_with_the_host_interpreter;
+#[cfg(feature = "device")]
+mod every_suite_step_agrees_with_the_host_interpreter;
 mod masked_axis;
 mod no_shell_reads_the_environment;
 mod routed_experts_stream;

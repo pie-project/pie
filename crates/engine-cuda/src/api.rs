@@ -992,6 +992,7 @@ impl Engine for Cuda {
                 &seeds,
                 extents(&binding.extents),
                 binding.geometry,
+                binding.device_resolved,
                 &adopted,
                 &binding.channels,
             )

@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use eta_ir::container::{encode_op, put_u32};
 use eta_ir::op::Op;
-use eta_ir::types::{Dtype, Literal};
+use eta_ir::types::{Dtype, DtypeClass, Literal, class_of};
 
 use super::canonical::canonical_symbolic_type;
 use super::symbolic::{Dimension, SymbolicType};
@@ -12,17 +12,21 @@ pub(crate) fn simplify_alias(
     result_type: &SymbolicType,
     literals: &[Option<Literal>],
 ) -> Option<u32> {
+    let exact = identities_hold(result_type.dtype);
+    // A one-element scan is its identity combined with the element: `1 * x`
+    // is `x` in every dtype, `0 + x` only where the identities hold.
     if result_type
         .dims
         .iter()
         .all(|dim| *dim == Dimension::Static(1))
     {
         match *op {
-            Op::CumSum(value) | Op::CumProd(value) => return Some(value),
+            Op::CumProd(value) => return Some(value),
+            Op::CumSum(value) if exact => return Some(value),
             _ => {}
         }
     }
-    if result_type.dtype == Dtype::F32 {
+    if !exact {
         return None;
     }
     let literal = |value: u32| literals.get(value as usize).copied().flatten();
@@ -39,6 +43,13 @@ pub(crate) fn simplify_alias(
         Op::Or(a, b) if literal(a) == Some(Literal::Bool(false)) => Some(b),
         _ => None,
     }
+}
+
+/// Whether `x + 0`, `x - 0`, `x * 1`, `x / 1` and the logical identities
+/// are `x` in `dtype`: in integer and logical arithmetic, never in a float
+/// one (`0 + -0` is `+0`), whatever its width.
+pub(crate) fn identities_hold(dtype: Dtype) -> bool {
+    matches!(class_of(dtype), Some(DtypeClass::Int | DtypeClass::Logical))
 }
 
 pub(crate) fn is_zero(literal: Option<Literal>) -> bool {

@@ -692,7 +692,10 @@ pub fn map_geometry_evaluated_with(
         }
         Err(error) => return Err(error),
     };
+    // A port the program computes on the device is the engine's to resolve,
+    // even where the seeds let the host evaluate it: one source a port.
     let positions = match optional_u32(Port::Positions) {
+        Ok(_) if device_resolved.contains(Port::Positions) => None,
         Ok(positions) => positions,
         Err(EvaluatedGeometryError::NotDerivable { .. })
             if device_resolved.contains(Port::Positions) =>
@@ -702,6 +705,7 @@ pub fn map_geometry_evaluated_with(
         Err(error) => return Err(error),
     };
     let fold = match optional_u32(Port::Fold) {
+        Ok(Some(_)) if device_resolved.contains(Port::Fold) => Fold::Device,
         Ok(Some(counts)) => Fold::Host(counts),
         Ok(None) => Fold::None,
         Err(EvaluatedGeometryError::NotDerivable { .. })
@@ -920,6 +924,7 @@ mod tests {
     #[test]
     fn geometry_every_case() {
         a_decode_that_states_nothing_rides_the_envelope();
+        a_port_the_device_computes_is_never_stated_by_the_host();
         a_device_mask_and_fold_ride_the_envelope();
         slots_computed_on_the_device_leave_the_envelope();
         a_read_extent_beside_a_mask_leaves_the_envelope();
@@ -960,6 +965,49 @@ mod tests {
             None,
             "a port the host writes is not"
         );
+    }
+
+    /// The seeds let the host evaluate a decode's first positions; when the
+    /// program computes them on the device they stay the engine's, so the
+    /// lanes state none. Host-derivable, the host states them.
+    fn a_port_the_device_computes_is_never_stated_by_the_host() {
+        use eta_compiler::eval::interp::Value;
+        use eta_ir::registry::EngineCaps;
+        let mut container = decode(
+            1,
+            &[
+                (Port::EmbedIndptr, Shape::vector(2), Dtype::U32),
+                (Port::Positions, Shape::vector(1), Dtype::U32),
+                (Port::Slots, Shape::vector(1), Dtype::U32),
+            ],
+        );
+        container.stages[0].ops = vec![Op::ChanTake(0), Op::ChanPut { chan: 0, value: 0 }];
+        let logits = eta_ir::registry::OutputDecl {
+            name: "logits".into(),
+            axis: eta_ir::registry::Axis::Row,
+            width: 16,
+            dtype: Dtype::F32,
+            layers: 0,
+            readout: true,
+        };
+        let bound = eta_ir::validate::bind(container, vec![vec![logits]], EngineCaps::default())
+        .expect("the decode binds");
+        let mut known = |channel: u32| {
+            Some(match channel {
+                0 => Value::I32(vec![7]),
+                1 => Value::U32(vec![0, 1]),
+                2 => Value::U32(vec![5]),
+                _ => Value::U32(vec![9]),
+            })
+        };
+        let device = PortMask::of(&[Port::EmbedTokens, Port::Positions]);
+        let (geometry, _) = map_geometry_evaluated_with(&bound, &mut known, device)
+            .expect("the geometry maps");
+        assert_eq!(geometry.positions, None, "the device's positions are not the lane's");
+        let (geometry, _) =
+            map_geometry_evaluated_with(&bound, &mut known, PortMask::of(&[Port::EmbedTokens]))
+                .expect("the geometry maps");
+        assert_eq!(geometry.positions, Some(vec![5]));
     }
 
     fn a_decode_that_states_nothing_rides_the_envelope() {

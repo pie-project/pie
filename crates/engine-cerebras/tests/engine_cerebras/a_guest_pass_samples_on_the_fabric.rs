@@ -263,6 +263,7 @@ fn a_guest_pass_samples_on_the_fabric_as_the_interpreter_does() {
                 .collect(),
             seeds: seeds.clone(),
             geometry: GeometryClass::Host,
+            device_resolved: Default::default(),
             extents: Default::default(),
         };
         let d = device_plane.bind(&bind(on_device)).expect("binds").id;
