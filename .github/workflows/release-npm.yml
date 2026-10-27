@@ -59,6 +59,7 @@ jobs:
       - uses: ./.github/actions/toolchain
         with:
           triple: wasm32-unknown-unknown
+          features: wgpu
           cache-key: ${{ runner.os }}-release-server-web
       - uses: actions/setup-node@v7
         with:
@@ -146,7 +147,7 @@ jobs:
       - if: inputs.package == 'inferlet'
         working-directory: packages/javascript/inferlet
         run: |
-          bash ../../scripts/check-inferlet-interfaces.sh
+          bash ../../../scripts/check-inferlet-interfaces.sh
           npm run generate-bindings
           git diff --exit-code -- src/bindings tsconfig.json
       # `server-web`'s build is the artifact above; `inferlet` compiles here.
