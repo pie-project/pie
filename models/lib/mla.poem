@@ -1,0 +1,60 @@
+# Latent attention: its weights' checkpoint names, its cached latent rows,
+# its absorbed attend, and the boundaries of a key pool compressed beside it.
+
+def named(a, at):
+    """`a`'s weights, each beside the name `at` gives its transformers leaf,
+    in the order a checkpoint lists them."""
+    out = [
+        (a.q_a_proj, at("self_attn.q_a_proj.weight")),
+        (a.q_a_norm, at("self_attn.q_a_layernorm.weight")),
+        (a.q_b_proj, at("self_attn.q_b_proj.weight")),
+        (a.kv_a_proj, at("self_attn.kv_a_proj_with_mqa.weight")),
+        (a.kv_a_norm, at("self_attn.kv_a_layernorm.weight")),
+        (a.kv_b_proj, at("self_attn.kv_b_proj.weight")),
+    ]
+    if a.gate != None:
+        out.append((a.gate, at("self_attn.g_proj.weight")))
+    out.append((a.o_proj, at("self_attn.o_proj.weight")))
+    return out
+
+def attend(x, inputs, q_nope, q_pe, a, selection = None, prefill_only = False):
+    """The split queries `q_nope`/`q_pe` of the rows `x` scored against the
+    latent kv (or the `selection` of it), through `a`'s output projection;
+    with `prefill_only` every lane through the prefill arm, as the draft
+    head's rows are."""
+    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
+                                 selection = selection, prefill_only = prefill_only)
+
+    o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    if a.gate != None:
+        o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
+    return ops.linear.matmul(o, a.o_proj)
+
+# An e4m3 kv deployment keeps the latent rows as vLLM's standard fp8 rows: the
+# 512 latent and 64 rotated dims e4m3 under one scale of 1, 576 bytes a
+# position in a u8 plane. The index keys stay at bf16.
+FP8_ROW = 576
+
+def fp8_rows(m):
+    return m.kv == dtype.e4m3
+
+def cache(c, space, a, fp8 = False):
+    """`a`'s latent rows in the kv `space`."""
+    if fp8:
+        if a.kv_lora_rank != 512 or a.qk_rope_head_dim != 64:
+            fail("fp8 latent rows hold 512 latent and 64 rotated dims, and this attention's are {} and {}".format(a.kv_lora_rank, a.qk_rope_head_dim))
+        c.kv(space, a.kv, [FP8_ROW], a.qk_rope_head_dim, rows = "fp8")
+        return
+    c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
+
+def boundaries(positions, row_valid, ratio, split = True):
+    """Where the rows close entries of a key pool that compresses `ratio`
+    rows into one: each boundary's position, request and rope position.
+    With `split` the decode and prefill arms find theirs apart."""
+    if not split:
+        return ops.attn.pool_boundary(positions, row_valid, ratio, decode = False)
+    one = fact.single_token()
+    dpos, dreq, drope = ops.attn.pool_boundary(positions.on(one), row_valid, ratio, decode = True)
+    ppos, preq, prope = ops.attn.pool_boundary(positions.on(~one), row_valid, ratio, decode = False)
+    return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])

@@ -1,7 +1,8 @@
 # Inkling and Inkling-Small, each with its miniature of seven layers and
 # eight experts, which reads a prefix of the whole model's checkpoint.
 
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/reads.poem", "flattened")
 
 INKLING = template("inkling")
 TOKENIZER = tokenizer(markers = [
@@ -121,7 +122,8 @@ def layout(id, deploy):
                 router = weight([bank, hidden], w),
                 bias = weight([d.experts], dtype.f32),
                 scale = weight([1], dtype.f32),
-                gate_up = weight([bank, 2 * mi, hidden], w),
+                gate = weight([bank, mi, hidden], w),
+                up = weight([bank, mi, hidden], w),
                 down = weight([bank, hidden, mi], w),
                 experts = d.experts,
                 top_k = d.top_k,
@@ -181,21 +183,6 @@ def layout(id, deploy):
 # How an Inkling checkpoint is laid out: the language model under
 # `model.llm.`, its MLPs' gate and up projections interleaved row by row.
 
-def product(xs):
-    out = 1
-    for x in xs:
-        out *= x
-    return out
-
-def flattened(name, want, broadcast = False):
-    """The tensor `name` as stored, its elements read as `want`; with
-    `broadcast`, a single stored value is read as any shape."""
-    held = shape(name)
-    if (not broadcast or product(held) > 1) and product(held) != product(want):
-        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
-            name, held, product(held), want, product(want)))
-    return src(name).transmute(want, stored(name))
-
 TRUNK = "model.llm."
 
 def formats(m):
@@ -237,14 +224,9 @@ def huggingface(m, reads):
         reads.read(f.router, n("mlp.gate.weight"))
         reads.read(f.bias, n("mlp.gate.bias"))
         reads.read(f.scale, n("mlp.gate.global_scale"))
-        combed = lambda name: concat(1, [
-            src(name).stride(1, 0, f.inter, 2),
-            src(name).stride(1, 1, f.inter, 2),
-        ])
-        reads.read_expr(f.gate_up, concat(0, [
-            combed(n("mlp.experts.w13_weight")),
-            combed(n("mlp.shared_experts.shared_w13_weight")),
-        ]))
+        w13 = [src(n("mlp.experts.w13_weight")), src(n("mlp.shared_experts.shared_w13_weight"))]
+        reads.read_expr(f.gate, concat(0, [x.stride(1, 0, f.inter, 2) for x in w13]))
+        reads.read_expr(f.up, concat(0, [x.stride(1, 1, f.inter, 2) for x in w13]))
         reads.read_expr(f.down, concat(0, [
             src(n("mlp.experts.w2_weight")),
             src(n("mlp.shared_experts.shared_w2_weight")),
@@ -329,8 +311,7 @@ def forward(m, inputs):
             ),
         ])
         o = ops.linear.matmul(a, w.o_proj)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(x, o, w, routes)
         o = conv(o, w.attn_conv, w.attn_state, inputs, m)
         y = ops.elemwise.residual_add(o, y)
 
@@ -357,7 +338,8 @@ def mlp(x, f):
         bias = f.bias,
         scale = f.scale,
     )
-    hidden = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, fan), gating.swiglu(), f.inter)
+    gate = ops.linear.moe_matmul_select(x, f.gate, routes, fan)
+    hidden = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, f.up, routes, fan))
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, f.down, routes, fan), weights)
 
 def conv(v, weight, state, inputs, m):

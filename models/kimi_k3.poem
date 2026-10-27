@@ -4,7 +4,10 @@
 # experts).
 
 load("//pie/codec.poem", read_fused = "fused")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/kda.poem", "kda", "kda_qkv", "kda_conv", "kda_gate", "kda_caches", "run_kda")
+load("//lib/mla.poem", "named")
+load("//lib/reads.poem", "product")
 
 KIMI = template("kimi")
 TOKENIZER = tokenizer(markers = [["<|im_end|>", "[EOS]"]])
@@ -32,42 +35,6 @@ DEPLOYMENTS = [
 # latent MoE), the residual stream carried as AttnRes blocks.
 
 # Where AttnRes blends the residual stream with its closed blocks.
-
-def kda(n, l, k, hidden, weights, conv, eps, gate_floor, gate_rank = None, **extra):
-    """The KDA mixer of layer `l` named by `n`, its projections in `weights`
-    and its convolution bank in `conv`. Its output gate is one projection,
-    or a pair through `gate_rank`. `extra` rides along."""
-    width = k.heads * k.head_dim
-    if gate_rank == None:
-        gate = [weight([width, hidden], weights)]
-    else:
-        gate = [
-            weight([gate_rank, hidden], weights),
-            weight([width, gate_rank], weights),
-        ]
-    return struct(
-        heads = k.heads,
-        head_dim = k.head_dim,
-        conv_kernel = k.conv_kernel,
-        norm_eps = eps,
-        gate_floor = gate_floor,
-        q = weight([width, hidden], weights),
-        k = weight([width, hidden], weights),
-        v = weight([width, hidden], weights),
-        conv = weight([3 * width, k.conv_kernel], conv),
-        f_a = weight([k.f_rank, hidden], weights),
-        f_b = weight([width, k.f_rank], weights),
-        gate = gate,
-        b = weight([k.heads, hidden], weights),
-        dt_bias = weight([k.heads, k.head_dim], dtype.f32),
-        a_log = weight([k.heads], dtype.f32),
-        o_norm = weight([k.head_dim], dtype.f32),
-        o_norm_eps = eps,
-        o_proj = weight([hidden, width], weights),
-        conv_state = "conv.{}".format(l),
-        delta_state = "delta.{}".format(l),
-        **extra
-    )
 
 def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False, **extra):
     """The latent attention named by `n`, its projections in `weights` and
@@ -326,54 +293,6 @@ def layout(id, deploy):
 # `language_model.`, or under `model.` as a text-only cut flattens them, or
 # llama.cpp's GGUF names.
 
-def product(xs):
-    out = 1
-    for x in xs:
-        out *= x
-    return out
-
-def squeezed(name):
-    """A depthwise convolution bank stored `[channels, 1, kernel]` or
-    `[channels, kernel, 1]`, read as `[channels, kernel]`."""
-    held = shape(name)
-    if len(held) == 3 and held[1] == 1:
-        channels, kernel = held[0], held[2]
-    elif len(held) == 3 and held[2] == 1:
-        channels, kernel = held[0], held[1]
-    else:
-        fail("`{}`: a depthwise convolution bank is stored [channels, 1, kernel] or [channels, kernel, 1] and this one is stored {}".format(name, held))
-    return src(name).transmute([channels, kernel], stored(name))
-
-def kda_qkv(at):
-    """The names of the q, k and v projections."""
-    return [at("self_attn.{}_proj.weight".format(p)) for p in ["q", "k", "v"]]
-
-def kda_conv(k, at):
-    """The packed `conv` bank, read from the q, k and v banks."""
-    return concat(k.conv.cut_axis, [squeezed(at("self_attn.{}_conv1d.weight".format(p))) for p in ["q", "k", "v"]])
-
-def kda_gate(k, at):
-    """The output gate's projections, each beside its name."""
-    if len(k.gate) == 1:
-        return [(k.gate[0], at("self_attn.g_proj.weight"))]
-    return [(k.gate[0], at("self_attn.g_a_proj.weight")), (k.gate[1], at("self_attn.g_b_proj.weight"))]
-
-def named(a, at):
-    """`a`'s weights, each beside the name `at` gives its transformers leaf,
-    in the order a checkpoint lists them."""
-    out = [
-        (a.q_a_proj, at("self_attn.q_a_proj.weight")),
-        (a.q_a_norm, at("self_attn.q_a_layernorm.weight")),
-        (a.q_b_proj, at("self_attn.q_b_proj.weight")),
-        (a.kv_a_proj, at("self_attn.kv_a_proj_with_mqa.weight")),
-        (a.kv_a_norm, at("self_attn.kv_a_layernorm.weight")),
-        (a.kv_b_proj, at("self_attn.kv_b_proj.weight")),
-    ]
-    if a.gate != None:
-        out.append((a.gate, at("self_attn.g_proj.weight")))
-    out.append((a.o_proj, at("self_attn.o_proj.weight")))
-    return out
-
 GGUF_EMBED = "token_embd.weight"
 
 LAYOUTS = [
@@ -588,53 +507,6 @@ def gguf(m, reads):
 # The forward of Kimi-K3: each layer's mixer (MLA or KDA) and MLP read a
 # blend of the residual stream's closed AttnRes blocks.
 
-def kda_caches(c, k):
-    """`k`'s convolution window and its f32 delta-rule state."""
-    width = k.heads * k.head_dim
-    c.state(k.conv_state, [k.conv_kernel, 3 * width], dtype.bf16, split = 1)
-    c.state(k.delta_state, [k.heads, k.head_dim, k.head_dim], dtype.f32, split = 0)
-
-def run_kda(x, inputs, k):
-    conv = inputs.state(k.conv_state)
-    delta = inputs.state(k.delta_state)
-    # The short convolution and the recurrence read q, k and v side by side.
-    qkv = ops.gather.concat_cols([ops.linear.matmul(x, k.q), ops.linear.matmul(x, k.k), ops.linear.matmul(x, k.v)])
-    f = ops.linear.matmul(ops.linear.matmul(x, k.f_a), k.f_b)
-    b = ops.linear.matmul(x, k.b)
-
-    one = fact.single_token()
-    step = ops.ssm.kda(
-        ops.ssm.causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
-        f.on(one),
-        b.on(one),
-        k.dt_bias,
-        k.a_log,
-        delta,
-        k.heads,
-        k.head_dim,
-        k.norm_eps,
-        k.gate_floor,
-    )
-    chunked = ops.ssm.kda_chunked(
-        ops.ssm.causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
-        f.on(~one),
-        b.on(~one),
-        k.dt_bias,
-        k.a_log,
-        delta,
-        k.heads,
-        k.head_dim,
-        k.norm_eps,
-        k.gate_floor,
-    )
-    core = merge([step, chunked])
-
-    g = x
-    for proj in k.gate:
-        g = ops.linear.matmul(g, proj)
-    o = ops.elemwise.rmsnorm_gated_by(core, g, k.o_norm, k.heads, k.o_norm_eps)
-    return ops.linear.matmul(o, k.o_proj)
-
 def cache(c, space, a):
     """`a`'s latent rows in the kv `space`."""
     c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
@@ -722,8 +594,7 @@ def forward(m, inputs):
             o = mla_mixer(x, inputs, plan, w.mixer)
         else:
             o = run_kda(x, inputs, w.mixer)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(x, o, w, routes)
         y = o if fresh else ops.elemwise.residual_add(o, y)
 
         r = w.mlp_res

@@ -1,7 +1,7 @@
 # gpt-oss 20B (with a DFlash drafter or without), its five-layer,
 # sixteen-expert miniature, and 120B.
 
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches", dflash_declare = "declare", dflash_head = "head")
 
 HARMONY = template("harmony")
@@ -377,8 +377,7 @@ def forward(m, inputs):
                             sinks = at.sinks, mask = True, scores = r == FULL)
 
         o = ops.elemwise.add_bias(at.o_bias, ops.linear.matmul(a, at.o_proj))
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(x, o, w, routes)
         y = ops.elemwise.residual_add(o, y)
 
         e = w.mlp

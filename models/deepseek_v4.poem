@@ -3,7 +3,9 @@
 # miniature; V4-Pro and its five-layer, sixteen-expert miniature; and the
 # small V4 base.
 
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/hyper.poem", "hyper", "mix", "mixes", "gate", "collapse", "predict_route")
+load("//lib/mla.poem", "fp8_rows", "boundaries")
 
 R1 = template("deepseek")
 TOKENIZER = tokenizer(markers = [["<｜end▁of▁sentence｜>", "<|EOT|>"]])
@@ -36,30 +38,6 @@ MX8 = [dtype.fp8b32a8g32, dtype.mxfp4a8g32]
 # sliding window and a pool of compressed entries, residual streams mixed by
 # manifold hyper-connections, DeepSeekMoE experts; V4.1-Flash adds Compressed Sparse
 # Attention 2 (cross-layer KV and index reuse), Single-Pass mHC and Engram.
-
-def hyper(streams, norm_eps, gate_eps, alpha, sinkhorn, single_pass = False):
-    """The streams' shape and the constants their gates are computed with;
-    under `single_pass` each sublayer's input mix is the one the previous
-    sublayer predicted."""
-    return struct(
-        streams = streams,
-        norm_eps = norm_eps,
-        gate_eps = gate_eps,
-        alpha = alpha,
-        sinkhorn = sinkhorn,
-        single_pass = single_pass,
-    )
-
-def mix(n, name, streams, hidden, dynamic = True):
-    """A sublayer's mix `name` over `streams` streams `hidden` wide: a
-    static `base` and `scale`, and with `dynamic` a projection of the
-    normed streams added to it."""
-    width = 2 * streams + streams * streams
-    return struct(
-        scale = weight([3], dtype.f32),
-        base = weight([width], dtype.f32),
-        dynamic = weight([width, streams * hidden], dtype.f32) if dynamic else None,
-    )
 
 def head(prefix, streams, hidden):
     """The mix `prefix` that collapses the streams into one row."""
@@ -1211,38 +1189,6 @@ def gguf(m, reads):
 # compressed (and on V4.1 sparsely selected) pool, and folds its outputs back;
 # V4.1's Engram writes n-gram memories into the streams before a layer.
 
-# How many experts the next layer's router is predicted to take.
-PREDICT_K = 16
-
-def mixes(normed, mix, hy):
-    """`mix`'s per-row mixes of the `normed` streams: its dynamic
-    projection, or with none the leading rows of the streams."""
-    if mix.dynamic != None:
-        return ops.elemwise.hc_project(normed, mix.dynamic, hy.streams)
-    head, _ = ops.gather.split_rows(normed, mix.base.shape[0])
-    return head
-
-def gate(streams, mix, hy):
-    """The sublayer input `mix` reads out of `streams`, and the post and
-    combine mixes its output is folded back with."""
-    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
-    return ops.elemwise.hc_gates(
-        mixes(normed, mix, hy),
-        streams,
-        mix.scale,
-        mix.base,
-        hy.streams,
-        hy.gate_eps,
-        hy.alpha,
-        hy.sinkhorn,
-    )
-
-def collapse(streams, head, hy):
-    """The streams collapsed into one row through the mix `head`."""
-    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
-    mixed = ops.elemwise.hc_project(normed, head.dynamic, hy.streams)
-    return ops.elemwise.hc_collapse(mixed, streams, head.scale, head.base, hy.streams, hy.gate_eps)
-
 def summed(streams, hidden, count):
     """The `count` streams, each `hidden` wide, added into one row."""
     y, rest = ops.gather.split_rows(streams, hidden)
@@ -1250,25 +1196,6 @@ def summed(streams, hidden, count):
         stream, rest = ops.gather.split_rows(rest, hidden)
         y = ops.elemwise.residual_add(stream, y)
     return ops.elemwise.residual_add(rest, y)
-
-def predict_route(streams, hy, mix, norm, norm_eps, router, bias, experts):
-    """The experts a following MLP's router is predicted to take: the
-    streams through its `mix` and `norm`, scored by its `router`."""
-    x, _, _ = gate(streams, mix, hy)
-    x = ops.elemwise.rmsnorm(x, norm, norm_eps)
-    logits = ops.linear.matmul(x, router)
-    return ops.linear.moe_route(logits, experts, PREDICT_K, routing.predict(), bias = bias)[0]
-
-def boundaries(positions, row_valid, ratio, split = True):
-    """Where the rows close entries of a key pool that compresses `ratio`
-    rows into one: each boundary's position, request and rope position.
-    With `split` the decode and prefill arms find theirs apart."""
-    if not split:
-        return ops.attn.pool_boundary(positions, row_valid, ratio, decode = False)
-    one = fact.single_token()
-    dpos, dreq, drope = ops.attn.pool_boundary(positions.on(one), row_valid, ratio, decode = True)
-    ppos, preq, prope = ops.attn.pool_boundary(positions.on(~one), row_valid, ratio, decode = False)
-    return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])
 
 # An e4m3 kv deployment keeps the window's plane and the compressed rows as
 # DeepSeek's fp8 rows (FlashMLA's fp8_ds_mla): 448 e4m3 codes and the 64
@@ -1289,9 +1216,6 @@ FP4_KEY_ROW = 68
 # The ratios whose pools pack their entries a row each: every page size a
 # deployment serves at is a multiple of them.
 COMPACT_RATIOS = [2, 4]
-
-def fp8_rows(m):
-    return m.kv == dtype.e4m3
 
 def fp4_rows(m):
     return m.kv == dtype.nvfp4
@@ -1705,8 +1629,7 @@ def layer(m, rows, w, streams, trail, following = None, narrow = False, replays 
     else:
         o = ops.linear.matmul(o, at.o_down)
     o = ops.linear.matmul(o, at.o_up)
-    adapted = fact.has(fact.Adapter)
-    o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, rows.adapters, o.on(adapted))
+    o = corrected(x, o, w, rows.adapters)
     if replays:
         # The correction lands on every row it is read for: a replaying
         # layer's, the decoder's (a DSpark deployment's trunk's).

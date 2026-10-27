@@ -9,3 +9,9 @@ def banks(hidden):
         weight([ADAPTERS.slots, ADAPTERS.rank, hidden]).registered(),
         weight([ADAPTERS.slots, hidden, ADAPTERS.rank]).registered(),
     )
+
+def corrected(x, o, w, routes):
+    """`o` with each adapted row's LoRA correction over `x` through `w`'s
+    banks, the adapter each row reads named by `routes`."""
+    adapted = fact.has(fact.Adapter)
+    return ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))

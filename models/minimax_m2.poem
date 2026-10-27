@@ -8,6 +8,7 @@
 # context their configuration does.
 
 load("//pie/codec.poem", "kept", "mapped")
+load("//lib/blocks.poem", "attention")
 
 def spoken(name):
     return template("minimax2", identity = "You are a helpful assistant. Your name is {} and is built by MiniMax.".format(name))
@@ -194,7 +195,8 @@ def forward(m, inputs):
 
     def block(l, w, y):
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        y = ops.elemwise.residual_add(attention(x, inputs, m, positions, w), y)
+        o = attention(x, inputs, m, w, positions, rotary_dim = m.rotary_dim, qk_norm = "width")
+        y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
         return ops.elemwise.residual_add(moe(x, m, w), y)
 
@@ -215,17 +217,3 @@ def moe(x, m, w):
     gate = ops.linear.moe_matmul_select(x, w.gate, routes, m.top_k)
     act = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, w.up, routes, m.top_k))
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, w.down, routes, m.top_k), weights)
-
-def attention(x, inputs, m, positions, w):
-    pages = inputs.kv(w.kv)
-    d = m.head_dim
-    q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
-    q = ops.elemwise.rmsnorm(q, w.q_norm, m.eps)
-    k = ops.elemwise.rmsnorm(k, w.k_norm, m.eps)
-    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.partial(m.rotary_dim), k = k)
-    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
-
-    # Each lane by its kind; a lane may bring its own mask. A lane capturing
-    # scores reads them out too.
-    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
-    return ops.linear.matmul(o, w.o)

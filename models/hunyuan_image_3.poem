@@ -5,6 +5,9 @@
 # The canvas rides the language model's KV lane, so the guest states its rows
 # and every row's `positions` itself; no token grid is read.
 
+load("//lib/dit.poem", "biased", "linear", "run_linear")
+load("//lib/vae.poem", "group_norm", "read_conv", "read_group_norm")
+
 STOP = ["<|endoftext|>", "</answer>"]
 LINES = template("lines", stop = STOP, bos = "<|startoftext|>", eos = "<|endoftext|>")
 TOKENIZER = tokenizer(
@@ -31,13 +34,6 @@ DEPLOYMENTS = [
 # The weights of HunyuanImage 3: the trunk's layers (GQA attention with a 2-D
 # rope, routed and shared experts), the timestep embedders, and the U-Net
 # blocks that take a latent clip into the trunk and its rows back out.
-
-def linear(out, in_, banks, bias = True):
-    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
-    return struct(
-        w = weight([out, in_], banks),
-        bias = weight([out]) if bias else None,
-    )
 
 TRAIN_STEPS = 1000
 FLOW_SHIFT = 3.0
@@ -84,12 +80,6 @@ def conv_weights(c_out, c_in, k, banks):
         w = weight([c_out, c_in * taps], banks),
         bias = weight([c_out], dtype.f32),
         k = k,
-    )
-
-def group_norm(c):
-    return struct(
-        weight = weight([c], dtype.f32),
-        bias = weight([c], dtype.f32),
     )
 
 def resblock(c_in, c_out, emb, banks):
@@ -193,20 +183,6 @@ def generative(m):
 # channels are interleaved, so both are gathered into the trunk's order; its
 # gate-and-up projections hold up before gate.
 
-def biased(reads, w, stem):
-    """The projection `w` from `stem.weight`, and its bias (if any) from
-    `stem.bias`."""
-    reads.read(w.w, stem + ".weight")
-    if w.bias != None:
-        reads.read(w.bias, stem + ".bias")
-
-def read_conv(reads, c, stem):
-    """The convolution `c` from `stem`, its kernel transmuted to the taps-major
-    plane the layout holds."""
-    name = stem + ".weight"
-    reads.read_expr(c.w, src(name).transmute(c.w.shape, stored(name)))
-    reads.read(c.bias, stem + ".bias")
-
 def formats(m):
     return [format("huggingface", read = lambda reads: read(m, reads))]
 
@@ -245,10 +221,6 @@ def doubled(e):
 def read_embedder(reads, e, prefix):
     biased(reads, e.mlp_in, prefix + ".mlp.0")
     biased(reads, e.mlp_out, prefix + ".mlp.2")
-
-def read_group_norm(reads, g, name):
-    reads.read(g.weight, name + ".weight")
-    reads.read(g.bias, name + ".bias")
 
 def read_resblock(reads, r, prefix):
     read_group_norm(reads, r.norm_in, prefix + ".in_layers.0")
@@ -316,13 +288,6 @@ def read(m, reads):
 # The forward of HunyuanImage 3. One trunk carries the text rows it encodes
 # and the canvas rows it denoises; the `image.in` and `image.out` readings
 # run its U-Net ends over a latent clip and the trunk's rows.
-
-def run_linear(w, x):
-    """`x` through the projection `w`, plus its bias if it has one."""
-    y = ops.linear.matmul(x, w.w)
-    if w.bias == None:
-        return y
-    return ops.elemwise.add_bias(w.bias, y)
 
 NORM_EPS = 1e-5
 ROPE_THETA = 10000.0

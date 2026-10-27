@@ -8,7 +8,8 @@
 # codes moved as they are.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/blocks.poem", "attention", "swiglu")
 load("//lib/rope.poem", "yarn")
 load("//lib/spoken.poem", "QWEN_STOP")
 
@@ -199,32 +200,12 @@ def forward(m, inputs):
 
     def block(l, w, y):
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, positions, w, scaling)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
-        y = ops.elemwise.residual_add(o, y)
+        o = attention(x, inputs, m, w, positions, scaling = scaling, qk_norm = "head")
+        y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
-        f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
-        return ops.elemwise.residual_add(f, y)
+        return ops.elemwise.residual_add(swiglu(x, w), y)
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
     output("logits", ops.linear.lm_head(x, m.embed if m.head == None else m.head))
-
-def attention(x, inputs, m, positions, w, scaling):
-    pages = inputs.kv(w.kv)
-    d = m.head_dim
-    q = ops.linear.matmul(x, w.q)
-    k = ops.linear.matmul(x, w.k)
-    v = ops.linear.matmul(x, w.v)
-    q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
-    k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
-    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k, scaling = scaling)
-    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
-
-    # Each lane by its kind; a lane may bring its own mask. A lane capturing
-    # scores reads them out too.
-    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
-    return ops.linear.matmul(o, w.o)

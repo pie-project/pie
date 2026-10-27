@@ -10,7 +10,8 @@
 # qwen3-coder-30b-a3b-...`.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/blocks.poem", "attention")
 load("//lib/spoken.poem", "QWEN_STOP")
 
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
@@ -226,10 +227,8 @@ def forward(m, inputs):
 
     def block(l, w, y):
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, positions, w)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
-        y = ops.elemwise.residual_add(o, y)
+        o = attention(x, inputs, m, w, positions, qk_norm = "head")
+        y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
         return ops.elemwise.residual_add(moe(x, m, w), y)
 
@@ -250,17 +249,3 @@ def moe(x, m, w):
     gate = ops.linear.moe_matmul_select(x, w.gate, experts, m.top_k)
     hidden = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, w.up, experts, m.top_k))
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, w.down, experts, m.top_k), weights)
-
-def attention(x, inputs, m, positions, w):
-    pages = inputs.kv(w.kv)
-    d = m.head_dim
-    q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
-    q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
-    k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
-    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k)
-    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
-
-    # Each lane by its kind; a lane may bring its own mask. A lane capturing
-    # scores reads them out too.
-    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
-    return ops.linear.matmul(o, w.o)

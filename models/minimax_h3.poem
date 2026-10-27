@@ -3,6 +3,8 @@
 # carries no text encoder.
 
 load("//lib/spoken.poem", "QWEN_STOP")
+load("//lib/dit.poem", "adaln_order", "attend", "biased", "chunks", "linear", "reordered", "run_linear")
+load("//lib/qwen3.poem", "encoder", "qwen3_caches", "qwen3_encode", "te_read")
 
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
@@ -20,48 +22,6 @@ DEPLOYMENTS = [
 # The weights of MiniMax H3: the denoiser's patch projections, timestep
 # embedder, caption refiner, blocks (each with an adaLN projection per
 # modality) and output heads; and the text encoder the full model carries.
-
-def linear(out, in_, banks, bias = True):
-    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
-    return struct(
-        w = weight([out, in_], banks),
-        bias = weight([out]) if bias else None,
-    )
-
-def encoder(c, layers, banks):
-    """The encoder of config `c` through its first `layers` layers."""
-    hidden, hd, inter = c.hidden, c.head_dim, c.inter
-
-    def layer(l):
-        n = lambda s: "te.layer.{}.{}".format(l, s)
-        return struct(
-            attn_norm = weight([hidden]),
-            q = weight([c.q_heads * hd, hidden], banks),
-            k = weight([c.kv_heads * hd, hidden], banks),
-            v = weight([c.kv_heads * hd, hidden], banks),
-            o = weight([hidden, c.q_heads * hd], banks),
-            q_norm = weight([hd]),
-            k_norm = weight([hd]),
-            mlp_norm = weight([hidden]),
-            gate = weight([inter, hidden], banks),
-            up = weight([inter, hidden], banks),
-            down = weight([hidden, inter], banks),
-            kv = "te.kv.{}".format(l),
-        )
-
-    return struct(
-        hidden = hidden,
-        vocab = c.vocab,
-        q_heads = c.q_heads,
-        kv_heads = c.kv_heads,
-        head_dim = hd,
-        inter = inter,
-        theta = c.theta,
-        eps = c.eps,
-        sm_scale = f32(1.0 / f32(sqrt(hd))),
-        embed = weight([c.vocab, hidden], banks),
-        layers = [layer(l) for l in range(layers)],
-    )
 
 LATENT_CHANNELS = 24
 AUDIO_CHANNELS = 32
@@ -222,44 +182,6 @@ def generative(m):
 # bare transformer state_dict. The fused qkv interleaves q, k and v head by
 # head, and the adaLN projections' slices come in another order.
 
-def biased(reads, w, stem):
-    """The projection `w` from `stem.weight`, and its bias (if any) from
-    `stem.bias`."""
-    reads.read(w.w, stem + ".weight")
-    if w.bias != None:
-        reads.read(w.bias, stem + ".bias")
-
-def adaln_order(slices):
-    """The order a layout takes an adaLN projection's `slices` slices in
-    from a checkpoint's: each (shift, scale) pair as (scale, shift), each
-    gate where it stands."""
-    return {
-        2: [1, 0],
-        3: [1, 0, 2],
-        6: [1, 0, 2, 4, 3, 5],
-        9: [1, 0, 2, 4, 3, 5, 7, 6, 8],
-    }[slices]
-
-def reordered(e, order, width, axis = 0):
-    """`e`'s `width`-wide slices along `axis`, taken in `order`."""
-    return concat(axis, [e.slice(axis, i * width, width) for i in order])
-
-def te_read(reads, te, prefix):
-    reads.read(te.embed, prefix + "embed_tokens.weight")
-    for l, w in enumerate(te.layers):
-        n = lambda s: "{}layers.{}.{}".format(prefix, l, s)
-        reads.read(w.attn_norm, n("input_layernorm.weight"))
-        reads.read(w.q, n("self_attn.q_proj.weight"))
-        reads.read(w.k, n("self_attn.k_proj.weight"))
-        reads.read(w.v, n("self_attn.v_proj.weight"))
-        reads.read(w.o, n("self_attn.o_proj.weight"))
-        reads.read(w.q_norm, n("self_attn.q_norm.weight"))
-        reads.read(w.k_norm, n("self_attn.k_norm.weight"))
-        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
-        reads.read(w.gate, n("mlp.gate_proj.weight"))
-        reads.read(w.up, n("mlp.up_proj.weight"))
-        reads.read(w.down, n("mlp.down_proj.weight"))
-
 PIPELINE = "a MiniMax H3 partition (`dit.`/`te.` prefixes)"
 BARE = "a bare transformer state_dict"
 
@@ -343,79 +265,6 @@ def read(m, reads, prefix):
 # `denoise` reading, which refines the caption, then attends it with the
 # video, audio and reference rows jointly, each stream modulated by its own
 # timestep through its modality's adaLN.
-
-def run_linear(w, x):
-    """`x` through the projection `w`, plus its bias if it has one."""
-    y = ops.linear.matmul(x, w.w)
-    if w.bias == None:
-        return y
-    return ops.elemwise.add_bias(w.bias, y)
-
-def chunks(x, widths):
-    """`x`'s rows cut into consecutive pieces of `widths`, the last one
-    whatever remains."""
-    out = []
-    for width in widths[:-1]:
-        head, x = ops.gather.split_rows(x, width)
-        out.append(head)
-    out.append(x)
-    return out
-
-def attend(q, k, v, rows, over, head_dim, sm_scale, mask):
-    """`q`'s rows attending `k` and `v`'s, each side grouped by its own
-    `perm` and `csr`."""
-    o = ops.attn.ragged(
-        ops.gather.pack_rows(q, rows.perm),
-        ops.gather.pack_rows(k, over.perm),
-        ops.gather.pack_rows(v, over.perm),
-        rows.csr,
-        over.csr,
-        head_dim,
-        sm_scale,
-        mask,
-    )
-    return ops.gather.unpack_rows(o, rows.perm)
-
-def qwen3_caches(te, c, kv):
-    space = c.kv_space(kv)
-    plane = te.kv_heads * te.head_dim
-    for layer in te.layers:
-        c.kv(space, layer.kv, [plane, plane], te.head_dim, heads = True)
-
-def qwen3_encode(arm, te, tap = None):
-    """The encoder over `arm`'s tokens. `tap(l, y)` sees each layer's output
-    rows and reads the encoder out; without one, the last layer's rows are
-    its readout."""
-    plan = ops.attn.plan_prefill(arm, te.q_heads, te.kv_heads, te.head_dim, None)
-    ids = arm.tokens()
-    positions = arm.positions()
-    y = ops.gather.embed(ids, te.embed, te.vocab)
-    last = len(te.layers) - 1
-
-    def layer(l, w, y):
-        pages = arm.kv(w.kv)
-        x = ops.elemwise.rmsnorm(y, w.attn_norm, te.eps)
-        q = ops.linear.matmul(x, w.q)
-        k = ops.linear.matmul(x, w.k)
-        v = ops.linear.matmul(x, w.v)
-        q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, te.head_dim, te.eps)
-        k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, te.head_dim, te.eps)
-        q, k = ops.elemwise.rope(q, positions, te.head_dim, te.theta, rotary.full(), k = k)
-        ops.attn.kv_append(k, v, pages, arm.write_page(w.kv), arm.write_offset(w.kv))
-        o = ops.attn.prefill(q, plan, pages, None, te.head_dim, te.kv_heads, te.sm_scale)
-        y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
-
-        x = ops.elemwise.rmsnorm(y, w.mlp_norm, te.eps)
-        gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
-        f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
-        y = ops.elemwise.residual_add(f, y)
-        if tap != None:
-            tap(l, y)
-        elif l == last:
-            output("hidden", y)
-        return y
-
-    arm.fold_layers(te.layers, y, layer)
 
 NORM_EPS = 1e-5
 T_MAX_PERIOD = 10000.0
