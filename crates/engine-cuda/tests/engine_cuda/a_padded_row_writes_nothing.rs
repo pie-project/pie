@@ -75,7 +75,10 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, Some(Recording::Shaped))),
+            chip: Some(engine_cuda::chip::pinned(
+                Graphs::Off,
+                Some(Recording::Shaped),
+            )),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,
@@ -91,7 +94,11 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
     shell
 }
 
-fn fire(shell: &mut Shell, trace: &poem::Trace, lanes: &[(u32, &[u32], &[u32], u32)]) -> Vec<Vec<f32>> {
+fn fire(
+    shell: &mut Shell,
+    trace: &poem::Trace,
+    lanes: &[(u32, &[u32], &[u32], u32)],
+) -> Vec<Vec<f32>> {
     let seated: Vec<Seated<'_>> = lanes
         .iter()
         .map(|&(slot, pages, tokens, held)| Seated {

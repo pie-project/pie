@@ -320,9 +320,7 @@ impl Plane {
     pub fn mask_device_source(&self, id: InstanceId) -> Option<(u64, u32)> {
         let bound = self.instances.get(&id)?;
         let program = self.programs.get(&bound.program_id)?;
-        bound
-            .session
-            .mask_device_source(&program.plan)
+        bound.session.mask_device_source(&program.plan)
     }
 
     /// Whether instance `id` resolves `port` ([`Session::resolves`]).

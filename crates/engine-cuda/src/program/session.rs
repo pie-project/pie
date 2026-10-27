@@ -603,7 +603,6 @@ impl Session {
         })
     }
 
-    
     fn host_resolved_channels(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<u32> {
         let tokens_on_device = self.token_device_source(plan, class).is_some();
         let mask_on_device = self.mask_device_source(plan).is_some();
@@ -617,7 +616,6 @@ impl Session {
             .collect()
     }
 
-    
     pub fn host_resolved_rings(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<usize> {
         self.host_resolved_channels(plan, class)
             .into_iter()

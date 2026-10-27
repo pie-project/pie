@@ -86,7 +86,9 @@ impl FrameShell for Shell {
         // The lanes an attachment's pass spans.
         let span = |attached: &super::Attached| {
             let first = (attached.lane as usize).min(lanes.len());
-            let end = first.saturating_add(attached.lanes as usize).min(lanes.len());
+            let end = first
+                .saturating_add(attached.lanes as usize)
+                .min(lanes.len());
             &lanes[first..end]
         };
         let can_runahead = self.runahead.runs_ahead()
@@ -520,12 +522,8 @@ impl FrameShell for Shell {
             .min()
             .unwrap_or_else(|| poem_compiler::arena::readouts_ceiling(&self.budget));
         let received = !self.compiled.expert.is_empty();
-        let launched = super::launched_rows(
-            self.pad,
-            received,
-            composition.rows(),
-            composition.bucket(),
-        );
+        let launched =
+            super::launched_rows(self.pad, received, composition.rows(), composition.bucket());
         let readout_extent = readout_extent(composition.rows(), launched, readout_rows.len());
         if readout_extent > readouts_ceiling {
             return Err(Fault::Ceiling {
@@ -827,8 +825,9 @@ impl FrameShell for Shell {
         let carried_masks: Vec<Option<Masking>> = mask_src_of
             .iter()
             .map(|carried| {
-                carried
-                    .map(|(_, keys)| Masking::Extent(engine::Mask::new(vec![keys], u64::from(keys))))
+                carried.map(|(_, keys)| {
+                    Masking::Extent(engine::Mask::new(vec![keys], u64::from(keys)))
+                })
             })
             .collect();
         // `(the lane's index in masks, its row of the device cell, keys)`.
