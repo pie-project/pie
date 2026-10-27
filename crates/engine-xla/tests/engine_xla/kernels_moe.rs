@@ -334,6 +334,56 @@ fn the_routers_answer_the_host() {
     assert_eq!(b.read_i32(groups), want_g);
 }
 
+/// GLM-5.3-Flash routes on f32 logits, never rounded to bf16.
+#[test]
+fn a_sigmoid_router_reads_f32_logits_unrounded() {
+    let (t, e, k) = (4usize, 12usize, 3usize);
+    // Logits a bf16 rounding would tie: distinct only past bf16's precision.
+    let lg: Vec<f32> = logits(t, e, 6).iter().map(|v| 1.0 + v * 1e-3).collect();
+    let corr: Vec<f32> = data(e, 8).iter().map(|v| v * 1e-6).collect();
+    let mut b = Bench::new();
+    let x = b.f32(t as u32, e as u32, &lg);
+    let c = b.f32(1, e as u32, &corr);
+    let routes = b.zeros(Dtype::I32, t as u32, k as u32);
+    let weights = b.zeros(Dtype::F32, t as u32, k as u32);
+    if !b
+        .run(|ctx| {
+            engine_xla::lower::lower(ctx, |l| {
+                let logits_v = l.read(x)?;
+                let bias_v = l.read(c)?;
+                let (v0, v1) = moe::topk_sigmoid_biased(
+                    l.f(),
+                    logits_v,
+                    bias_v,
+                    e as u32,
+                    k as u32,
+                    true,
+                    2.5,
+                    routes.landing(),
+                    weights.landing(),
+                )?;
+                l.land(routes, v0)?;
+                l.land(weights, v1)
+            })
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let (mut want_r, mut want_w) = (Vec::new(), Vec::new());
+    for r in 0..t {
+        let sig: Vec<f32> = lg[r * e..(r + 1) * e].iter().map(|&v| sigmoid(v)).collect();
+        let rank: Vec<f32> = (0..e).map(|i| sig[i] + corr[i]).collect();
+        let pick = topk(&rank, k);
+        let mut w: Vec<f32> = pick.iter().map(|&i| sig[i]).collect();
+        renorm(&mut w, true, 2.5);
+        want_r.extend(pick.iter().map(|&i| i as i32));
+        want_w.extend(w);
+    }
+    assert_eq!(b.read_i32(routes), want_r);
+    assert_close(&b.read_f32(weights), &want_w, 1e-6, 1e-4);
+}
+
 #[test]
 fn a_hash_route_reads_its_table_and_weighs_the_named_experts() {
     let (t, e, k, vocab) = (6usize, 9usize, 3usize, 7usize);
