@@ -88,17 +88,19 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
         };
 
         sink.region_begin(region);
-        for &event in &region.wait {
-            sink.join(event);
-        }
-        if let Some(event) = region.open {
-            sink.fork(event);
-        }
-        if open {
-            sink.cond_begin(&region.lowering);
-        }
-        if let Some(arm) = arm {
-            sink.cond_arm(arm);
+        if dispatches {
+            for &event in &region.wait {
+                sink.join(event);
+            }
+            if let Some(event) = region.open {
+                sink.fork(event);
+            }
+            if open {
+                sink.cond_begin(&region.lowering);
+            }
+            if let Some(arm) = arm {
+                sink.cond_arm(arm);
+            }
         }
 
         let copy = dispatches && !grouped && runs.len() > 1 && dispatch.copies(region);
@@ -184,11 +186,13 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
             dispatch.scatter(region)?;
         }
 
-        if close {
-            sink.cond_end();
-        }
-        if let Some(event) = region.close {
-            sink.fork(event);
+        if dispatches {
+            if close {
+                sink.cond_end();
+            }
+            if let Some(event) = region.close {
+                sink.fork(event);
+            }
         }
         sink.region_end(region);
     }
