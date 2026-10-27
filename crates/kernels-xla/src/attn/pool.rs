@@ -112,7 +112,7 @@ pub(crate) fn compact_view(
     let div = row / width;
     let ps = i64::from(page_size);
     let cells = f.dims(table)[0];
-    if row % width != 0 || ps % i64::from(div) != 0 || cells % i64::from(div) != 0 {
+    if !row.is_multiple_of(width) || ps % i64::from(div) != 0 || cells % i64::from(div) != 0 {
         return Err(refuse(
             op,
             format!(
