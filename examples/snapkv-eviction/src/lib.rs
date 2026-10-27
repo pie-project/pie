@@ -138,7 +138,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut prompt = model::encode(&haystack);
     prompt.extend(question.iter().copied());
     if prompt.is_empty() {
-        prompt.push(0);
+        return Err("empty prompt".into());
     }
     let n = prompt.len() as u32;
     // Where the question's rows begin — the rows the answering fire re-reads
@@ -170,7 +170,6 @@ async fn main(input: Input) -> Result<Output> {
     let toks_p = Channel::from(&prompt_i32[..]);
     let embed_indptr_p = Channel::from([0u32, n]);
     let fold_p = Channel::from([ask_at]);
-    let tok_out_p = Channel::new([1], dtype::i32);
     let page_mass_out = Channel::new([p_max], dtype::f32);
     let total_out = Channel::new([1], dtype::f32);
 
@@ -184,9 +183,6 @@ async fn main(input: Input) -> Result<Output> {
         },
     )?;
     fwd_p.epilogue(move || {
-        let logits = intrinsics::output(0, "logits");
-        tok_out_p.put(reduce_argmax(logits));
-
         // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
         let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
         let folded = gather(&(&reduce_sum(transpose(&rect)) / heads_f), iota(kv_max));
@@ -197,7 +193,6 @@ async fn main(input: Input) -> Result<Output> {
     });
     fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let _g0 = tok_out_p.take_host::<i32>().await?;
     let masses = page_mass_out.take_host::<Vec<f32>>().await?;
     let score_mass = total_out.take_host::<f32>().await?;
 

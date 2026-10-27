@@ -167,10 +167,7 @@ async fn main(input: Input) -> Result<String> {
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
 
-    let mut prompt = model::encode("The capital of France is");
-    if prompt.is_empty() {
-        prompt.push(0);
-    }
+    let prompt = model::encode("The capital of France is");
     let n = prompt.len() as u32;
 
     let toks = Channel::from_iter(prompt.iter().map(|&token| token as i32));
