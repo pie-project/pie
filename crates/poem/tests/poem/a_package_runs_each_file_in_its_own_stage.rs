@@ -28,6 +28,8 @@ fn deploy() -> Deploy {
         drafter: None,
         yarn: None,
         tap: None,
+        layers: None,
+        experts: None,
     }
 }
 
