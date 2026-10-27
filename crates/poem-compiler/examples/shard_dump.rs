@@ -7,7 +7,7 @@
 //! cargo run --release -p pie-poem-compiler --example shard_dump -- OUT
 //! ```
 //!
-//! `scripts/equivalence/README.md` is the procedure this is one part of.
+//! `scripts/equivalence/dump.sh` runs this across two trees and compares them.
 
 use poem::Platform;
 use poem_ir::{Operands, Operation};

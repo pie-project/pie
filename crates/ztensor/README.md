@@ -1,6 +1,6 @@
 # ztensor
 
-The `.zt` container format: reading, writing, and the whole of its validation.
+The `.zt` container format: aligned, verifiable tensor storage.
 
 ```rust
 use ztensor::{Leaf, Source, Term, Writer};
@@ -17,43 +17,18 @@ w.finish()?;
 
 let src = Source::open("model.zt")?;
 let t = src.tensor("q")?;
-let bytes = t.map()?;              // borrowed, or an error; never a copy
-for p in t.planes()? {             // code, gain, offset: each 256-byte aligned
+let bytes = t.map()?;              // zero-copy borrow, or error
+for p in t.planes()? {             // 256-byte aligned planes
     let _ = &bytes[p.range()];
 }
 # Ok::<(), ztensor::Error>(())
 ```
 
-An object is a shape, a type and one blob. The type is a term: a leaf
-(`bf16`, `u8`, `e4m3`) or a group form naming the code leaf, the group size
-and the scale and offset terms. The blob holds the term's planes at 256-byte
-boundaries, in an order derived from the type, unless a named `layout`
-(`gguf.q4_k/2`, `zt.sparse_csr/2`) says otherwise.
+Each tensor in a canonical `.zt` file is 64 KiB-aligned and carries an XXH3
+digest, with its planes aligned to 256-byte boundaries. Access tensor data via
+`map()` (zero-copy borrow), `bytes()` (borrow or copy), or `locate()` (raw byte
+range).
 
-Every tensor in a canonical file begins on a 64 KiB boundary and carries an
-XXH3 digest, so one weight can be mapped, verified, and evicted without
-touching its neighbours. Two canonical writes of the same tensors produce
-byte-identical files.
-
-Three ways to get at a tensor's bytes, one per intent:
-
-| | |
-| --- | --- |
-| `bytes()` | the best the file can do, saying whether it borrowed or copied |
-| `map()` | a borrow, or an error |
-| `locate()` | the exact byte range, for a caller doing its own I/O |
-
-`caps()` reports which will work, per tensor, and each of its fields is
-computed by the very precondition the matching method checks.
-
-- **Foreign formats** (safetensors, GGUF, `.npz`, `.pt`, HDF5, ONNX) are read
-  through [`ztensor-compat`](https://crates.io/crates/ztensor-compat), which
-  projects each into this same object model.
-- **Command line**: [`ztensor-cli`](https://crates.io/crates/ztensor-cli)
-  installs `zt`, for inspecting, verifying, converting and diffing.
-- **Specification**: the normative rules live in
-  [`spec/ztensor-v3-spec.md`](https://github.com/pie-project/ztensor/blob/main/spec/ztensor-v3-spec.md).
-
-Features: `zstd` enables the `zt.zstd-seekable/1` encoding profile.
-
-MIT licensed.
+- Foreign formats (`.safetensors`, `.gguf`, `.npz`, `.pt`, HDF5, ONNX): [`ztensor-compat`](../ztensor-compat)
+- Spec: [`ztensor-v3-spec.md`](https://github.com/pie-project/ztensor/blob/main/spec/ztensor-v3-spec.md)
+- License: MIT
