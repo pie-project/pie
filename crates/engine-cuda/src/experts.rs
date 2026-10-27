@@ -200,7 +200,6 @@ pub struct Plan {
 #[derive(Debug, Clone)]
 pub struct BankPlan {
     pub param: usize,
-    pub name: String,
     pub experts: u32,
     pub resident: u32,
     pub stride: u64,
@@ -723,7 +722,6 @@ fn routed(
             }
             banks.push(BankPlan {
                 param: at,
-                name: param.name.clone(),
                 experts,
                 resident: experts,
                 stride: plane / u64::from(experts),
