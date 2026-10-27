@@ -934,10 +934,7 @@ def forward(m, inputs):
         lanes = trunk_inputs.on(~read) if all_rows else trunk_inputs
         causal = ~switch_is("mode", "denoise") if m.self_cond != None else None
         a = ops.attn.attend(q, lanes, at.kv, m.q_heads, kv_heads, d, at.sm_scale, window = win,
-                            causal = causal, mask = True)
-        if at.reading != SLIDING:
-            scores = ops.attn.score_capture(q, lanes, at.kv, m.q_heads, kv_heads, d, at.sm_scale, observe = 32, kv_max = 2048)
-            output("attn.scores", scores)
+                            causal = causal, mask = True, scores = at.reading != SLIDING)
         return normed, a, routes
 
     def attend_readouts(l, w, y):

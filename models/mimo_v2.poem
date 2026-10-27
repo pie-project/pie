@@ -403,10 +403,7 @@ def forward(m, inputs):
         # Each lane by its kind; a layer with sinks folds them in, one
         # without reads its scores out.
         a = ops.attn.attend(q, inputs, at.kv, m.q_heads, kv_heads, d, m.sm_scale, window = win,
-                            sinks = at.sinks, mask = True)
-        if at.sinks == None:
-            scores = ops.attn.score_capture(q, inputs, at.kv, m.q_heads, kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
-            output("attn.scores", scores)
+                            sinks = at.sinks, mask = True, scores = at.sinks == None)
 
         # Each head's values are its first half; the padding after them is
         # cut off before the output projection reads them.

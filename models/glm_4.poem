@@ -338,7 +338,5 @@ def attention(x, inputs, m, positions, w):
 
     # Each lane by its kind; a lane may bring its own mask. A lane capturing
     # scores reads them out too.
-    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True)
-    scores = ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
-    output("attn.scores", scores)
+    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
     return ops.linear.matmul(o, w.o)

@@ -290,10 +290,7 @@ def forward(m, inputs):
         ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
 
         # Each lane by its kind; a full layer's scores are read out.
-        a = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win, mask = True)
-        if w.full:
-            scores = ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
-            output("attn.scores", scores)
+        a = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win, mask = True, scores = w.full)
 
         # Each head normed, then gated, in one pass.
         a = ops.elemwise.rmsnorm_gated(a, gate, None, d, m.norm_eps, "sigmoid")

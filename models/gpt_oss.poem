@@ -380,10 +380,7 @@ def forward(m, inputs):
         # Each lane by its kind, the sinks folded in; a full layer's scores
         # are read out.
         a = ops.attn.attend(q, trunk_inputs, at.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win,
-                            sinks = at.sinks, mask = True)
-        if r == FULL:
-            scores = ops.attn.score_capture(q, trunk_inputs, at.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
-            output("attn.scores", scores)
+                            sinks = at.sinks, mask = True, scores = r == FULL)
 
         o = ops.elemwise.add_bias(at.o_bias, ops.linear.matmul(a, at.o_proj))
         adapted = fact.has(fact.Adapter)

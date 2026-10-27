@@ -1058,9 +1058,7 @@ def attn_mixer(x, inputs, m, a, ix):
     # Each lane by its kind; decode and prefill lanes read the key blocks
     # the selector picked.
     o = ops.attn.attend(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, mask = True,
-                        selection = qsa_select(x, inputs, m, a, ix), ratio = ix.ratio)
-    scores = ops.attn.score_capture(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, observe = 32, kv_max = 2048)
-    output("attn.scores", scores)
+                        selection = qsa_select(x, inputs, m, a, ix), ratio = ix.ratio, scores = True)
     return ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(o, gate), a.o_proj)
 
 def gdn_mixer(x, inputs, g):
