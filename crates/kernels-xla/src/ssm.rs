@@ -1,8 +1,9 @@
 #![allow(clippy::too_many_arguments)]
 //! Recurrent state-space scans: the causal depthwise convs (Qwen3.5's
-//! `causal_conv1d`, LFM2's short conv), the gated delta rule (Qwen3.5 GDN)
-//! and Kimi's KDA, each in its decode (one row per lane), chunked (a query
-//! CSR of lanes) and committed (a rollback seat's extended window) form.
+//! `causal_conv1d`, LFM2's short conv), the gated delta rule (Qwen3.5 GDN),
+//! Kimi's KDA and Mamba-2's scan (the chunked form with no delta write),
+//! each in its decode (one row per lane), chunked (a query CSR of lanes) and
+//! committed (a rollback seat's extended window) form.
 //!
 //! State lives in a [`RecurrentPool`](crate::tensor::RecurrentPool): one slab row per slot. A fire gathers
 //! its lanes' rows, computes, and scatters the new rows back; a lane whose
@@ -55,6 +56,7 @@ fn conv_lanes(
     lanes: &Lanes,
     dil: i64,
     out: ConvOut,
+    bias: Option<Val>,
 ) -> Built<(Val, Val)> {
     let (t, c) = (f.dims(x)[0], f.dims(x)[1]);
     let taps = f.dims(w)[1];
@@ -118,6 +120,13 @@ fn conv_lanes(
         });
     }
     let acc = acc.unwrap_or_else(|| f.const_f(Elem::F32, 0.0, &[t, c]));
+    let acc = match bias {
+        Some(b) => {
+            let b = f.broadcast(b, &[t, c], &[1])?;
+            f.add(acc, b)?
+        }
+        None => acc,
+    };
     let y = match out {
         ConvOut::Silu => f.silu(acc)?,
         ConvOut::Residual => f.add(acc, x)?,
@@ -154,6 +163,7 @@ fn conv(
     x: Operand,
     lanes: LaneTables,
     weight: Operand,
+    bias: Option<Operand>,
     conv_state: Operand,
     conv_width: u32,
     dilation: u32,
@@ -177,6 +187,9 @@ fn conv(
             ),
         ));
     }
+    if bias.is_some_and(|b| b.elements() != u64::from(channels)) {
+        return Err(refuse(op, "the conv's bias is not one value per channel"));
+    }
     let hist = u64::from(taps - 1) * u64::from(dil) + 1;
     let per = slot_rows(
         op,
@@ -191,11 +204,12 @@ fn conv(
     let xv = x.f32(f);
     let w = weight.f32(f);
     let w = f.reshape(w, &[c, k])?;
+    let bias = bias.map(|b| flat_f32(f, b)).transpose()?;
     let slab = conv_state.val;
     let lanes = lanes.lanes(f, op, t)?;
     let past = take_slots(f, slab, lanes.slot, per)?;
     let past = f.convert(past, Elem::F32);
-    let (yv, next) = conv_lanes(f, xv, w, past, &lanes, i64::from(dil), out)?;
+    let (yv, next) = conv_lanes(f, xv, w, past, &lanes, i64::from(dil), out, bias)?;
     let slab = land_slots(f, slab, lanes.slot, lanes.write, next, per)?;
     Ok((yv, slab))
 }
@@ -206,6 +220,7 @@ pub fn causal_conv1d(
     f: &mut Func,
     x: Operand,
     weight: Operand,
+    bias: Option<Operand>,
     conv_state: Operand,
     slots: Operand,
     conv_width: u32,
@@ -218,6 +233,7 @@ pub fn causal_conv1d(
         x,
         LaneTables::Decode { slots },
         weight,
+        bias,
         conv_state,
         conv_width,
         dilation,
@@ -232,6 +248,7 @@ pub fn causal_conv1d_chunked(
     f: &mut Func,
     x: RaggedTensor<Operand>,
     weight: Operand,
+    bias: Option<Operand>,
     conv_state: Operand,
     slots: Operand,
     conv_width: u32,
@@ -247,6 +264,7 @@ pub fn causal_conv1d_chunked(
             slots,
         },
         weight,
+        bias,
         conv_state,
         conv_width,
         dilation,
@@ -263,6 +281,7 @@ pub fn causal_conv1d_committed(
     indptr: Operand,
     seat: Committed<Operand>,
     weight: Operand,
+    bias: Option<Operand>,
     conv_state: Operand,
     conv_width: u32,
     dilation: u32,
@@ -274,6 +293,7 @@ pub fn causal_conv1d_committed(
         x,
         LaneTables::Committed { indptr, seat },
         weight,
+        bias,
         conv_state,
         conv_width,
         dilation,
@@ -299,6 +319,7 @@ pub fn short_conv(
         x,
         LaneTables::Decode { slots },
         weight,
+        None,
         conv_state,
         conv_width,
         1,
@@ -327,6 +348,7 @@ pub fn short_conv_chunked(
             slots,
         },
         weight,
+        None,
         conv_state,
         conv_width,
         1,
@@ -508,6 +530,46 @@ fn kda_heads(
     Ok(Heads { q, k, v, g, beta })
 }
 
+/// Mamba-2's heads from the convolved `xbc` row (`x`, then the groups'
+/// `B`, then their `C`) and `dt`: `q = C`, `k = B` (a group's repeated over
+/// its heads), `v = x`, `beta = softplus(dt + dt_bias)` and the log decay
+/// `g = -exp(a_log) beta`.
+fn mamba2_heads(
+    f: &mut Func,
+    xbc: Val,
+    dt: Val,
+    a_log: Val,
+    dt_bias: Val,
+    heads: i64,
+    groups: i64,
+    n: i64,
+    p: i64,
+) -> Built<Heads> {
+    let t = f.dims(xbc)[0];
+    let inner = heads * p;
+    let x = f.slice_axis(xbc, 1, 0, inner)?;
+    let b = f.slice_axis(xbc, 1, inner, inner + groups * n)?;
+    let c = f.slice_axis(xbc, 1, inner + groups * n, inner + 2 * groups * n)?;
+    let per = heads / groups;
+    let spread = |f: &mut Func, x: Val| -> Built<Val> {
+        let x = f.reshape(x, &[t, groups, n])?;
+        let x = f.broadcast(x, &[t, groups, per, n], &[0, 1, 3])?;
+        f.reshape(x, &[t, heads, n])
+    };
+    let q = spread(f, c)?;
+    let k = spread(f, b)?;
+    let v = f.reshape(x, &[t, heads, p])?;
+    let db = f.broadcast(dt_bias, &[t, heads], &[1])?;
+    let z = f.add(dt, db)?;
+    let beta = softplus20(f, z)?;
+    let a = f.exp(a_log);
+    let a = f.broadcast(a, &[t, heads], &[1])?;
+    let g = f.mul(a, beta)?;
+    let g = f.neg(g);
+    let g = f.reshape(g, &[t, heads, 1])?;
+    Ok(Heads { q, k, v, g, beta })
+}
+
 /// `[.., gd]` → `[.., dk]` along the last axis (a scalar decay repeats).
 fn over_keys(f: &mut Func, x: Val, dk: i64) -> Built<Val> {
     let d = f.dims(x).to_vec();
@@ -522,9 +584,9 @@ fn over_keys(f: &mut Func, x: Val, dk: i64) -> Built<Val> {
     f.broadcast(lead, &to, &map)
 }
 
-/// One token per lane: `S ← S·diag(a)`, `δ = β(v − S k)`, `S ← S + δ kᵀ`,
-/// `y = S q`, over `S` `[R, H, dv, dk]`.
-fn delta_step(f: &mut Func, h: &Heads, s: Val) -> Built<(Val, Val)> {
+/// One token per lane: `S ← S·diag(a)`, `δ = β(v − S k)` (`β v` without
+/// the delta `rule`), `S ← S + δ kᵀ`, `y = S q`, over `S` `[R, H, dv, dk]`.
+fn delta_step(f: &mut Func, h: &Heads, s: Val, rule: bool) -> Built<(Val, Val)> {
     let d = f.dims(s).to_vec();
     let (r, hh, dv, dk) = (d[0], d[1], d[2], d[3]);
     let a = f.exp(h.g);
@@ -532,9 +594,13 @@ fn delta_step(f: &mut Func, h: &Heads, s: Val) -> Built<(Val, Val)> {
     let a = f.broadcast(a, &d, &[0, 1, 3])?;
     let s1 = f.mul(s, a)?;
     let kb = f.broadcast(h.k, &d, &[0, 1, 3])?;
-    let mem = f.mul(s1, kb)?;
-    let mem = f.reduce(mem, &[3], Fold::Sum)?;
-    let delta = f.sub(h.v, mem)?;
+    let delta = if rule {
+        let mem = f.mul(s1, kb)?;
+        let mem = f.reduce(mem, &[3], Fold::Sum)?;
+        f.sub(h.v, mem)?
+    } else {
+        h.v
+    };
     let beta = f.broadcast(h.beta, &[r, hh, dv], &[0, 1])?;
     let delta = f.mul(delta, beta)?;
     let db = f.broadcast(delta, &d, &[0, 1, 2])?;
@@ -612,6 +678,7 @@ fn delta_chunked(
     let t = f.dims(raw.rows[0])[0];
     let (hh, dk, dv) = input.dims();
     let gd = input.decay_width();
+    let rule = input.rule();
     let s = f.dims(segs.begin)[0];
     let nc = (t + c - 1) / c + s;
 
@@ -720,9 +787,14 @@ fn delta_chunked(
         let dlt = f.sub(gt4, gs4)?;
         let dlt = f.select(incl4, dlt, zero4)?;
         let ex = f.exp(dlt);
-        let kk = f.dot_general(k, k, &[0, 1], &[0, 1], &[3], &[3], Elem::F32)?;
         let qk = f.dot_general(q, k, &[0, 1], &[0, 1], &[3], &[3], Elem::F32)?;
-        (f.mul(kk, ex)?, f.mul(qk, ex)?)
+        let kk = if rule {
+            let kk = f.dot_general(k, k, &[0, 1], &[0, 1], &[3], &[3], Elem::F32)?;
+            f.mul(kk, ex)?
+        } else {
+            zero4
+        };
+        (kk, f.mul(qk, ex)?)
     } else {
         let five = [nc, hh, c, c, dk];
         let gt5 = f.broadcast(gcum, &five, &[0, 1, 2, 4])?;
@@ -742,23 +814,28 @@ fn delta_chunked(
         let qk = f.reduce(qk, &[4], Fold::Sum)?;
         (kk, qk)
     };
-    let bt = f.broadcast(beta, &sq, &[0, 1, 2])?;
-    let a = f.mul(bt, kk)?;
-    let a = f.select(strict4, a, zero4)?;
     let p = f.select(incl4, qk, zero4)?;
-    let eye = f.convert(diag, Elem::F32);
-    let eye = f.broadcast(eye, &sq, &[2, 3])?;
-    let lower = f.add(eye, a)?;
     let bv = f.broadcast(beta, &[nc, hh, c, dv], &[0, 1, 2])?;
-    let bk = f.broadcast(beta, &[nc, hh, c, dk], &[0, 1, 2])?;
     let rv = f.mul(v, bv)?;
-    let rk = f.mul(kg, bk)?;
-    let rhs = f.concat(&[rv, rk], 3)?;
-    let _ = lower;
-    let inv = unit_lower_inverse(f, a)?;
-    let x = f.dot_general(inv, rhs, &[0, 1], &[0, 1], &[3], &[2], Elem::F32)?;
-    let ut = f.slice_axis(x, 3, 0, dv)?;
-    let w = f.slice_axis(x, 3, dv, dv + dk)?;
+    // Without the delta rule `(I + A)⁻¹` is `I`, and there is no `w`.
+    let (ut, w) = if rule {
+        let bt = f.broadcast(beta, &sq, &[0, 1, 2])?;
+        let a = f.mul(bt, kk)?;
+        let a = f.select(strict4, a, zero4)?;
+        let eye = f.convert(diag, Elem::F32);
+        let eye = f.broadcast(eye, &sq, &[2, 3])?;
+        let lower = f.add(eye, a)?;
+        let bk = f.broadcast(beta, &[nc, hh, c, dk], &[0, 1, 2])?;
+        let rk = f.mul(kg, bk)?;
+        let rhs = f.concat(&[rv, rk], 3)?;
+        let _ = lower;
+        let inv = unit_lower_inverse(f, a)?;
+        let x = f.dot_general(inv, rhs, &[0, 1], &[0, 1], &[3], &[2], Elem::F32)?;
+        let ut = f.slice_axis(x, 3, 0, dv)?;
+        (ut, Some(f.slice_axis(x, 3, dv, dv + dk)?))
+    } else {
+        (rv, None)
+    };
 
     // The chunk-to-chunk carry: only the state walks sequentially; each
     // chunk's end state is kept, and the outputs are formed after the loop.
@@ -770,7 +847,7 @@ fn delta_chunked(
         f,
         total,
         &[s0, e0],
-        &[first_i, lane_n, w, ut, kt, gc, init],
+        &[first_i, lane_n, w.unwrap_or(ut), ut, kt, gc, init],
         |f, i, cr, inv| {
             let (st, ends) = (cr[0], cr[1]);
             let (first_i, lane_n, w, ut, kt, gc, init) =
@@ -780,12 +857,16 @@ fn delta_chunked(
             let lane = row_at(f, lane_n, i)?;
             let from = row_at(f, init, lane)?;
             let s0 = f.select(first, from, st)?;
-            let wn = row_at(f, w, i)?;
             let un = row_at(f, ut, i)?;
             let kn = row_at(f, kt, i)?;
             let gn = row_at(f, gc, i)?;
-            let ws = f.dot_general(wn, s0, &[0], &[0], &[2], &[2], Elem::F32)?;
-            let u = f.sub(un, ws)?;
+            let u = if rule {
+                let wn = row_at(f, w, i)?;
+                let ws = f.dot_general(wn, s0, &[0], &[0], &[2], &[2], Elem::F32)?;
+                f.sub(un, ws)?
+            } else {
+                un
+            };
             let gn = over_keys(f, gn, dk)?;
             let gn = f.broadcast(gn, &sz, &[0, 2])?;
             let decayed = f.mul(s0, gn)?;
@@ -809,8 +890,13 @@ fn delta_chunked(
     let from = f.reshape(from, &[nc, hh, dv, dk])?;
     let fb = f.broadcast(first_n, &[nc, hh, dv, dk], &[0])?;
     let starts = f.select(fb, from, prev)?;
-    let ws = f.dot_general(w, starts, &[0, 1], &[0, 1], &[3], &[3], Elem::F32)?;
-    let u = f.sub(ut, ws)?;
+    let u = match w {
+        Some(w) => {
+            let ws = f.dot_general(w, starts, &[0, 1], &[0, 1], &[3], &[3], Elem::F32)?;
+            f.sub(ut, ws)?
+        }
+        None => ut,
+    };
     let o1 = f.dot_general(qg, starts, &[0, 1], &[0, 1], &[3], &[3], Elem::F32)?;
     let o2 = f.dot_general(p, u, &[0, 1], &[0, 1], &[3], &[2], Elem::F32)?;
     let o = f.add(o1, o2)?;
@@ -961,6 +1047,16 @@ enum DeltaIn {
         eps: f32,
         floor: f32,
     },
+    Mamba2 {
+        xbc: Operand,
+        dt: Operand,
+        a_log: Operand,
+        dt_bias: Operand,
+        heads: i64,
+        groups: i64,
+        n: i64,
+        p: i64,
+    },
 }
 
 impl DeltaIn {
@@ -968,6 +1064,7 @@ impl DeltaIn {
         match *self {
             Self::Gdn { hv, dk, dv, .. } => (hv, dk, dv),
             Self::Kda { heads, d, .. } => (heads, d, d),
+            Self::Mamba2 { heads, n, p, .. } => (heads, n, p),
         }
     }
 
@@ -975,13 +1072,21 @@ impl DeltaIn {
         match *self {
             Self::Gdn { qkv, .. } => qkv.rows,
             Self::Kda { mixed, .. } => mixed.rows,
+            Self::Mamba2 { xbc, .. } => xbc.rows,
         }
+    }
+
+    /// The delta rule's `β(v − S k)` write; Mamba-2 writes `β v`.
+    fn rule(&self) -> bool {
+        !matches!(self, Self::Mamba2 { .. })
     }
 
     fn chunk(&self, rows: i64, lanes: i64, c: crate::tuning::SsmChunks) -> i64 {
         match self {
-            Self::Gdn { .. } if rows >= c.long_chunk * lanes.max(1) => c.long_chunk,
-            Self::Gdn { .. } => c.chunk,
+            Self::Gdn { .. } | Self::Mamba2 { .. } if rows >= c.long_chunk * lanes.max(1) => {
+                c.long_chunk
+            }
+            Self::Gdn { .. } | Self::Mamba2 { .. } => c.chunk,
             Self::Kda { .. } => c.kda_chunk,
         }
     }
@@ -989,7 +1094,7 @@ impl DeltaIn {
     /// 1 for a scalar decay per head, the key width for a per-channel one.
     fn decay_width(&self) -> i64 {
         match *self {
-            Self::Gdn { .. } => 1,
+            Self::Gdn { .. } | Self::Mamba2 { .. } => 1,
             Self::Kda { d, .. } => d,
         }
     }
@@ -1012,6 +1117,16 @@ impl DeltaIn {
                 rows: vec![mixed.val, f.val, b.val],
                 fixed: vec![flat_f32(fq, dt_bias)?, flat_f32(fq, a_log)?],
             },
+            Self::Mamba2 {
+                xbc,
+                dt,
+                a_log,
+                dt_bias,
+                ..
+            } => Raw {
+                rows: vec![xbc.val, dt.val],
+                fixed: vec![flat_f32(fq, a_log)?, flat_f32(fq, dt_bias)?],
+            },
         })
     }
 
@@ -1029,6 +1144,13 @@ impl DeltaIn {
             } => kda_heads(
                 f, rows[0], rows[1], rows[2], fixed[0], fixed[1], heads, d, eps, floor,
             ),
+            Self::Mamba2 {
+                heads,
+                groups,
+                n,
+                p,
+                ..
+            } => mamba2_heads(f, rows[0], rows[1], fixed[0], fixed[1], heads, groups, n, p),
         }
     }
 }
@@ -1114,7 +1236,7 @@ fn delta(
                 let s = take_slots(fq, slab, slot, per)?;
                 let s = fq.convert(s, Elem::F32);
                 let s = fq.reshape(s, &[hi - lo, hh, dv, dk])?;
-                let (yv, s) = delta_step(fq, &part, s)?;
+                let (yv, s) = delta_step(fq, &part, s, input.rule())?;
                 let s = fq.reshape(s, &[hi - lo, stride])?;
                 slab = land_slots(fq, slab, slot, write, s, per)?;
                 ys.push(yv);
@@ -1403,6 +1525,227 @@ pub fn kda_committed(
     )?;
     let lanes = LaneTables::Committed { indptr, seat };
     delta(f, OP, input, lanes, state, y, tuning)
+}
+
+// ------------------------------------------------------------------ mamba-2
+
+/// Mamba-2's per-head banks (`a_log`, `dt_bias`, `d`, one value a head) and
+/// its gated group norm's row-wide `norm` weight and `eps`.
+#[derive(Clone, Copy)]
+pub struct Mamba2 {
+    pub a_log: Operand,
+    pub dt_bias: Operand,
+    pub d: Operand,
+    pub norm: Operand,
+    pub eps: f32,
+    pub heads: u32,
+    pub groups: u32,
+    pub state_dim: u32,
+}
+
+/// The scan's operands: `xbc` (`x`, then each group's `B`, then its `C`),
+/// `dt` a value a head, `z` and the landing a head's width a head.
+fn mamba2_in(
+    op: &'static str,
+    xbc: Operand,
+    dt: Operand,
+    z: Operand,
+    m: &Mamba2,
+    y: Landing,
+) -> Result<DeltaIn, Error> {
+    for t in [xbc, dt, z] {
+        expect(op, t, &[Dtype::Bf16])?;
+    }
+    let heads = nonzero(op, "the Mamba-2 heads this statement states", m.heads)?;
+    let groups = nonzero(op, "the Mamba-2 groups this statement states", m.groups)?;
+    let n = nonzero(
+        op,
+        "the Mamba-2 state width this statement states",
+        m.state_dim,
+    )?;
+    if !heads.is_multiple_of(groups) || z.width == 0 || !z.width.is_multiple_of(heads) {
+        return Err(refuse(
+            op,
+            format!(
+                "{heads} heads in {groups} groups over a {}-wide z is no whole number of heads a group",
+                z.width
+            ),
+        ));
+    }
+    let (h, g, n, p) = (
+        i64::from(heads),
+        i64::from(groups),
+        i64::from(n),
+        i64::from(z.width / heads),
+    );
+    if i64::from(xbc.width) != h * p + 2 * g * n
+        || dt.width != heads
+        || dt.rows != xbc.rows
+        || z.rows != xbc.rows
+        || y.rows != xbc.rows
+        || y.width != z.width
+    {
+        return Err(refuse(
+            op,
+            format!(
+                "Mamba-2 reads `x` then each group's `B` and `C` and a dt a head, and lands z's \
+                 width; this fire states {heads} heads in {groups} groups of a {}-wide state \
+                 over a {}-wide xbc, a {}-wide dt, a {}-wide z and a {}-wide output",
+                m.state_dim, xbc.width, dt.width, z.width, y.width
+            ),
+        ));
+    }
+    for (what, t, want) in [
+        ("a_log", m.a_log, h),
+        ("dt_bias", m.dt_bias, h),
+        ("d", m.d, h),
+        ("norm", m.norm, h * p),
+    ] {
+        if t.elements() != want as u64 {
+            return Err(refuse(
+                op,
+                format!("the {what} bank holds {} values, not {want}", t.elements()),
+            ));
+        }
+    }
+    Ok(DeltaIn::Mamba2 {
+        xbc,
+        dt,
+        a_log: m.a_log,
+        dt_bias: m.dt_bias,
+        heads: h,
+        groups: g,
+        n,
+        p,
+    })
+}
+
+/// `(C S + D x) * silu(z)` from the scan's `C S` `[T, H, P]`, rounded to
+/// bf16 where the GPU lands it, then RMS-normed a group of heads and gained
+/// by the row-wide `norm`.
+fn mamba2_out(
+    f: &mut Func,
+    op: &'static str,
+    cs: Val,
+    xbc: Operand,
+    z: Operand,
+    m: &Mamba2,
+) -> Result<Val, Error> {
+    let (t, inner) = (i64::from(xbc.rows), i64::from(z.width));
+    let (h, p) = (i64::from(m.heads), inner / i64::from(m.heads));
+    let y = f.reshape(cs, &[t, inner])?;
+    let x = xbc.f32(f);
+    let x = f.slice_axis(x, 1, 0, inner)?;
+    let d = flat_f32(f, m.d)?;
+    let d = f.broadcast(d, &[t, h, p], &[1])?;
+    let d = f.reshape(d, &[t, inner])?;
+    let dx = f.mul(x, d)?;
+    let y = f.add(y, dx)?;
+    let zv = z.f32(f);
+    let gate = f.silu(zv)?;
+    let y = f.mul(y, gate)?;
+    let y = f.convert(y, Elem::Bf16);
+    let y = f.convert(y, Elem::F32);
+    let normed = crate::elemwise::norm::inv_rms_rows(f, op, y, z.width / m.groups, m.eps)?;
+    let w = flat_f32(f, m.norm)?;
+    let w = f.broadcast(w, &[t, inner], &[1])?;
+    Ok(f.mul(normed, w)?)
+}
+
+fn mamba2_run(
+    f: &mut Func,
+    op: &'static str,
+    xbc: Operand,
+    dt: Operand,
+    z: Operand,
+    m: Mamba2,
+    lanes: LaneTables,
+    state: Operand,
+    y: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<(Val, Val), Error> {
+    let input = mamba2_in(op, xbc, dt, z, &m, y)?;
+    let (cs, slab) = delta(f, op, input, lanes, state, y, tuning)?;
+    Ok((mamba2_out(f, op, cs, xbc, z, &m)?, slab))
+}
+
+/// One Mamba-2 step per lane over the convolved `xbc` rows: `dt =
+/// softplus(dt + dt_bias)`, `S ← exp(-exp(a_log) dt) S + dt x Bᵀ`, lands
+/// `(C S + D x) * silu(z)`, group-normed. Returns `(y, state)`.
+/// Reference: kernels-cuda `ssm::mamba2`.
+pub fn mamba2(
+    f: &mut Func,
+    xbc: Operand,
+    dt: Operand,
+    z: Operand,
+    m: Mamba2,
+    state: Operand,
+    slots: Operand,
+    y: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<(Val, Val), Error> {
+    let lanes = LaneTables::Decode { slots };
+    mamba2_run(f, "ssm.mamba2", xbc, dt, z, m, lanes, state, y, tuning)
+}
+
+/// Mamba-2 over a query CSR, chunked; `slots` is per row.
+/// Reference: kernels-cuda `ssm::mamba2_chunked`.
+pub fn mamba2_chunked(
+    f: &mut Func,
+    xbc: RaggedTensor<Operand>,
+    dt: Operand,
+    z: Operand,
+    m: Mamba2,
+    state: Operand,
+    slots: Operand,
+    y: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<(Val, Val), Error> {
+    let lanes = LaneTables::Ragged {
+        indptr: xbc.indptr,
+        slots,
+    };
+    mamba2_run(
+        f,
+        "ssm.mamba2_chunked",
+        xbc.data,
+        dt,
+        z,
+        m,
+        lanes,
+        state,
+        y,
+        tuning,
+    )
+}
+
+/// Mamba-2 over a rollback seat's extended rows: every row's `y`, and the
+/// state after each lane's committed prefix.
+pub fn mamba2_committed(
+    f: &mut Func,
+    xbc: Operand,
+    indptr: Operand,
+    seat: Committed<Operand>,
+    dt: Operand,
+    z: Operand,
+    m: Mamba2,
+    state: Operand,
+    y: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<(Val, Val), Error> {
+    let lanes = LaneTables::Committed { indptr, seat };
+    mamba2_run(
+        f,
+        "ssm.mamba2_committed",
+        xbc,
+        dt,
+        z,
+        m,
+        lanes,
+        state,
+        y,
+        tuning,
+    )
 }
 
 // ------------------------------------------------------------ dynamic conv

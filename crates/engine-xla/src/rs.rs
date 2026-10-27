@@ -22,6 +22,10 @@ pub enum Role {
     KdaF,
 
     KdaB,
+
+    M2Dt,
+
+    M2Z,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -228,6 +232,19 @@ impl Layout {
                     layout.work_elems = layout
                         .work_elems
                         .max(u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim));
+                }
+                Operation::Ssm(
+                    Ssm::Mamba2 {
+                        dt, z, state, y, ..
+                    }
+                    | Ssm::Mamba2Chunked {
+                        dt, z, state, y, ..
+                    },
+                ) => {
+                    let cache = cache_of(trace, *state)?;
+                    plane(&mut layout, cache, Role::M2Dt, *dt)?;
+                    plane(&mut layout, cache, Role::M2Z, *z)?;
+                    region(&mut layout, cache, "scan", *y)?;
                 }
                 Operation::Gather(
                     Gather::NgramIds {

@@ -123,8 +123,17 @@ mod ssm {
                 l.read(p.conv_state)?,
                 l.read(p.slots)?,
             );
-            let (yv, next) =
-                kernels_xla::ssm::causal_conv1d(l.f(), x, w, bank, slots, k, dil, y.landing())?;
+            let (yv, next) = kernels_xla::ssm::causal_conv1d(
+                l.f(),
+                x,
+                w,
+                None,
+                bank,
+                slots,
+                k,
+                dil,
+                y.landing(),
+            )?;
             l.land(y, yv)?;
             l.land(p.new_conv_state, next)
         })
@@ -149,6 +158,7 @@ mod ssm {
                 l.f(),
                 kernels_xla::tensor::RaggedTensor { data, indptr },
                 w,
+                None,
                 bank,
                 slots,
                 k,
@@ -183,6 +193,7 @@ mod ssm {
                 indptr,
                 s,
                 w,
+                None,
                 bank,
                 k,
                 dil,
@@ -450,6 +461,156 @@ mod ssm {
                 d,
                 eps,
                 floor,
+                y.landing(),
+                tuning,
+            )?;
+            l.land(y, yv)?;
+            l.land(p.state, next)
+        })
+    }
+
+    pub fn causal_conv1d_biased(
+        ctx: &Ctx<'_>,
+        x: Tensor,
+        w: Tensor,
+        bias: Tensor,
+        p: &RecurrentPool,
+        k: u32,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let (x, w, bias, bank, slots) = (
+                l.read(x)?,
+                l.read(w)?,
+                l.read(bias)?,
+                l.read(p.conv_state)?,
+                l.read(p.slots)?,
+            );
+            let (yv, next) = kernels_xla::ssm::causal_conv1d(
+                l.f(),
+                x,
+                w,
+                Some(bias),
+                bank,
+                slots,
+                k,
+                1,
+                y.landing(),
+            )?;
+            l.land(y, yv)?;
+            l.land(p.new_conv_state, next)
+        })
+    }
+
+    /// Mamba-2's per-head banks and group norm, as handles.
+    #[derive(Clone, Copy)]
+    pub struct Mamba2 {
+        pub a_log: Tensor,
+        pub dt_bias: Tensor,
+        pub d: Tensor,
+        pub norm: Tensor,
+        pub eps: f32,
+        pub heads: u32,
+        pub groups: u32,
+        pub state_dim: u32,
+    }
+
+    fn banks(l: &mut Lower<'_, '_>, m: &Mamba2) -> Result<kernels_xla::ssm::Mamba2, Error> {
+        Ok(kernels_xla::ssm::Mamba2 {
+            a_log: l.read(m.a_log)?,
+            dt_bias: l.read(m.dt_bias)?,
+            d: l.read(m.d)?,
+            norm: l.read(m.norm)?,
+            eps: m.eps,
+            heads: m.heads,
+            groups: m.groups,
+            state_dim: m.state_dim,
+        })
+    }
+
+    pub fn mamba2(
+        ctx: &Ctx<'_>,
+        xbc: Tensor,
+        dt: Tensor,
+        z: Tensor,
+        m: &Mamba2,
+        p: &RecurrentPool,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let (xbc, dt, z) = (l.read(xbc)?, l.read(dt)?, l.read(z)?);
+            let mb = banks(l, m)?;
+            let slab = l.read(p.state)?;
+            let slots = l.read(p.slots)?;
+            let tuning = l.tuning();
+            let (yv, next) =
+                kernels_xla::ssm::mamba2(l.f(), xbc, dt, z, mb, slab, slots, y.landing(), tuning)?;
+            l.land(y, yv)?;
+            l.land(p.state, next)
+        })
+    }
+
+    pub fn mamba2_chunked(
+        ctx: &Ctx<'_>,
+        xbc: RaggedTensor,
+        dt: Tensor,
+        z: Tensor,
+        m: &Mamba2,
+        p: &RecurrentPool,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let data = l.read(xbc.data)?;
+            let (dt, z) = (l.read(dt)?, l.read(z)?);
+            let mb = banks(l, m)?;
+            let slab = l.read(p.state)?;
+            let indptr = l.read(xbc.indptr)?;
+            let slots = l.read(p.slots)?;
+            let tuning = l.tuning();
+            let (yv, next) = kernels_xla::ssm::mamba2_chunked(
+                l.f(),
+                kernels_xla::tensor::RaggedTensor { data, indptr },
+                dt,
+                z,
+                mb,
+                slab,
+                slots,
+                y.landing(),
+                tuning,
+            )?;
+            l.land(y, yv)?;
+            l.land(p.state, next)
+        })
+    }
+
+    pub fn mamba2_committed(
+        ctx: &Ctx<'_>,
+        xbc: Tensor,
+        indptr: Tensor,
+        committed: &Committed,
+        dt: Tensor,
+        z: Tensor,
+        m: &Mamba2,
+        p: &RecurrentPool,
+        y: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let xbc = l.read(xbc)?;
+            let (dt, z) = (l.read(dt)?, l.read(z)?);
+            let mb = banks(l, m)?;
+            let slab = l.read(p.state)?;
+            let indptr = l.read(indptr)?;
+            let s = seat(l, committed)?;
+            let tuning = l.tuning();
+            let (yv, next) = kernels_xla::ssm::mamba2_committed(
+                l.f(),
+                xbc,
+                indptr,
+                s,
+                dt,
+                z,
+                mb,
+                slab,
                 y.landing(),
                 tuning,
             )?;
@@ -1638,4 +1799,329 @@ fn slot_blocked_banks_serve_the_chunked_rule_kda_and_the_conv() {
         assert_close(&got_y[r * c..(r + 1) * c], &yr, 2e-2, 1e-2);
     }
     assert_close(&b.read_f32(bank), &want_bank, 0.0, 0.0);
+}
+
+#[test]
+fn the_conv_bias_lands_ahead_of_the_activation() {
+    let (rows, c, k) = (3usize, 8usize, 4usize);
+    let mut rng = Rng(5);
+    let xs = rng.bf16s(rows * c, 1.0);
+    let ws = rng.bf16s(c * k, 0.5);
+    let bs = rng.bf16s(c, 0.5);
+    let bank0 = rng.f32s(rows * k * c, -1.0, 1.0);
+    let bank0: Vec<f32> = bank0.into_iter().map(round_bf16).collect();
+    let slot_of = [1i32, 0, 2];
+    let mut b = Bench::new();
+    let x = b.bf16(rows as u32, c as u32, &xs);
+    let w = b.bf16(c as u32, k as u32, &ws);
+    let bias = b.bf16(1, c as u32, &bs);
+    let bank = b.bf16((rows * k) as u32, c as u32, &bank0);
+    let sl = b.i32(rows as u32, 1, &slot_of);
+    let y = b.zeros(Dtype::Bf16, rows as u32, c as u32);
+    let p = pool(bank, sl);
+    if !b
+        .run(|ctx| ssm::causal_conv1d_biased(ctx, x, w, bias, &p, k as u32, y))
+        .unwrap()
+    {
+        return;
+    }
+    let got = b.read_f32(y);
+    for r in 0..rows {
+        let s = slot_of[r] as usize;
+        let past = &bank0[s * k * c..(s + 1) * k * c];
+        for ch in 0..c {
+            // The window: the last k − 1 kept rows, then this row.
+            let mut acc = bs[ch];
+            for tap in 0..k {
+                let v = if tap + 1 == k {
+                    xs[r * c + ch]
+                } else {
+                    past[(tap + 1) * c + ch]
+                };
+                acc += v * ws[ch * k + tap];
+            }
+            assert_close(&got[r * c + ch..r * c + ch + 1], &[silu(acc)], 2e-2, 1e-2);
+        }
+    }
+}
+
+// ------------------------------------------------------------------ Mamba-2
+
+struct M2 {
+    heads: usize,
+    groups: usize,
+    p: usize,
+    n: usize,
+}
+
+/// One fire's Mamba-2 operands, host side.
+struct M2In {
+    xbc: Vec<f32>,
+    dt: Vec<f32>,
+    z: Vec<f32>,
+    a_log: Vec<f32>,
+    dt_bias: Vec<f32>,
+    d: Vec<f32>,
+    norm: Vec<f32>,
+}
+
+const M2_EPS: f32 = 1e-5;
+
+impl M2 {
+    fn inner(&self) -> usize {
+        self.heads * self.p
+    }
+    fn width(&self) -> usize {
+        self.inner() + 2 * self.groups * self.n
+    }
+    fn stride(&self) -> usize {
+        self.heads * self.p * self.n
+    }
+    fn inputs(&self, rng: &mut Rng, rows: usize) -> M2In {
+        M2In {
+            xbc: rng.bf16s(rows * self.width(), 1.0),
+            dt: (0..rows * self.heads)
+                .map(|_| round_bf16(-3.0 + 2.0 * (rng.next() + 1.0)))
+                .collect(),
+            z: rng.bf16s(rows * self.inner(), 2.0),
+            a_log: rng.f32s(self.heads, -1.0, 1.0),
+            dt_bias: rng.f32s(self.heads, -0.5, 0.5),
+            d: rng.f32s(self.heads, 0.5, 1.5),
+            norm: (0..self.inner())
+                .map(|_| round_bf16(1.0 + 0.5 * rng.next()))
+                .collect(),
+        }
+    }
+    /// Row `t` through `state` (`[heads, p, n]`): `(C S + D x) * silu(z)`,
+    /// rounded to bf16, then the group norm.
+    fn token(&self, i: &M2In, t: usize, state: &mut [f32]) -> Vec<f32> {
+        let (h, g, p, n) = (self.heads, self.groups, self.p, self.n);
+        let inner = self.inner();
+        let row = &i.xbc[t * self.width()..(t + 1) * self.width()];
+        let mut y = vec![0.0f32; inner];
+        for hd in 0..h {
+            let grp = hd / (h / g);
+            let b = &row[inner + grp * n..inner + (grp + 1) * n];
+            let c = &row[inner + (g + grp) * n..inner + (g + grp + 1) * n];
+            let raw = i.dt[t * h + hd] + i.dt_bias[hd];
+            let step = if raw > 20.0 { raw } else { raw.exp().ln_1p() };
+            let decay = (-i.a_log[hd].exp() * step).exp();
+            for pp in 0..p {
+                let x = row[hd * p + pp];
+                let s = &mut state[(hd * p + pp) * n..(hd * p + pp + 1) * n];
+                let mut acc = 0.0;
+                for k in 0..n {
+                    s[k] = s[k] * decay + step * x * b[k];
+                    acc += s[k] * c[k];
+                }
+                let o = hd * p + pp;
+                y[o] = round_bf16((acc + i.d[hd] * x) * silu(i.z[t * inner + o]));
+            }
+        }
+        let gw = inner / g;
+        for grp in 0..g {
+            let run = &mut y[grp * gw..(grp + 1) * gw];
+            let ms: f32 = run.iter().map(|v| v * v).sum::<f32>() / gw as f32;
+            let inv = 1.0 / (ms + M2_EPS).sqrt();
+            for (e, v) in run.iter_mut().enumerate() {
+                *v *= inv * i.norm[grp * gw + e];
+            }
+        }
+        y
+    }
+    fn banks(&self, b: &mut Bench, i: &M2In) -> ssm::Mamba2 {
+        ssm::Mamba2 {
+            a_log: b.f32(self.heads as u32, 1, &i.a_log),
+            dt_bias: b.f32(self.heads as u32, 1, &i.dt_bias),
+            d: b.f32(self.heads as u32, 1, &i.d),
+            norm: b.bf16(1, self.inner() as u32, &i.norm),
+            eps: M2_EPS,
+            heads: self.heads as u32,
+            groups: self.groups as u32,
+            state_dim: self.n as u32,
+        }
+    }
+}
+
+#[test]
+fn the_mamba2_step_folds_one_token_per_lane() {
+    let m = M2 {
+        heads: 4,
+        groups: 2,
+        p: 8,
+        n: 16,
+    };
+    let (rows, slots) = (4usize, 5usize);
+    let mut rng = Rng(41);
+    let i = m.inputs(&mut rng, rows);
+    let bank0 = rng.f32s(slots * m.stride(), -0.5, 0.5);
+    let slot_of = [2i32, DROP, 0, 4];
+    let mut b = Bench::new();
+    let x = b.bf16(rows as u32, m.width() as u32, &i.xbc);
+    let dt = b.bf16(rows as u32, m.heads as u32, &i.dt);
+    let z = b.bf16(rows as u32, m.inner() as u32, &i.z);
+    let mb = m.banks(&mut b, &i);
+    let bank = b.f32(slots as u32, m.stride() as u32, &bank0);
+    let sl = b.i32(rows as u32, 1, &slot_of);
+    let y = b.zeros(Dtype::Bf16, rows as u32, m.inner() as u32);
+    let p = pool(bank, sl);
+    if !b.run(|ctx| ssm::mamba2(ctx, x, dt, z, &mb, &p, y)).unwrap() {
+        return;
+    }
+    let mut want = bank0.clone();
+    let got = b.read_f32(y);
+    let w = m.inner();
+    for t in 0..rows {
+        if slot_of[t] == DROP {
+            continue;
+        }
+        let s = slot_of[t] as usize;
+        let yr = m.token(&i, t, &mut want[s * m.stride()..(s + 1) * m.stride()]);
+        assert_close(&got[t * w..(t + 1) * w], &yr, 2e-2, 2e-2);
+    }
+    assert_close(&b.read_f32(bank), &want, 1e-5, 1e-4);
+}
+
+#[test]
+fn the_chunked_mamba2_matches_the_token_walk() {
+    // Small heads over lanes of 70, 0, 5, 1 and 130 rows and 3 padded rows;
+    // then Nemotron's 64-wide heads over a 128-wide state, lanes of 300 and
+    // 141 rows.
+    for (m, indptr, rows, lane_slot) in [
+        (
+            M2 {
+                heads: 4,
+                groups: 2,
+                p: 8,
+                n: 16,
+            },
+            vec![0i32, 70, 70, 75, 76, 206],
+            209usize,
+            vec![3i32, 0, 1, 4, 2],
+        ),
+        (
+            M2 {
+                heads: 2,
+                groups: 1,
+                p: 64,
+                n: 128,
+            },
+            vec![0i32, 300, 441],
+            443,
+            vec![5, 1],
+        ),
+    ] {
+        let lanes = indptr.len() - 1;
+        let slots = 6usize;
+        let mut slot_of_row = vec![DROP; rows];
+        for l in 0..lanes {
+            for t in indptr[l]..indptr[l + 1] {
+                slot_of_row[t as usize] = lane_slot[l];
+            }
+        }
+        let mut rng = Rng(43);
+        let i = m.inputs(&mut rng, rows);
+        let bank0 = rng.f32s(slots * m.stride(), -0.5, 0.5);
+        let mut b = Bench::new();
+        let x = b.bf16(rows as u32, m.width() as u32, &i.xbc);
+        let ip = b.i32(indptr.len() as u32, 1, &indptr);
+        let dt = b.bf16(rows as u32, m.heads as u32, &i.dt);
+        let z = b.bf16(rows as u32, m.inner() as u32, &i.z);
+        let mb = m.banks(&mut b, &i);
+        let bank = b.f32(slots as u32, m.stride() as u32, &bank0);
+        let sl = b.i32(rows as u32, 1, &slot_of_row);
+        let y = b.zeros(Dtype::Bf16, rows as u32, m.inner() as u32);
+        let p = pool(bank, sl);
+        let rt = RaggedTensor {
+            data: x,
+            indptr: ip,
+        };
+        if !b
+            .run(|ctx| ssm::mamba2_chunked(ctx, rt, dt, z, &mb, &p, y))
+            .unwrap()
+        {
+            return;
+        }
+        let mut want = bank0.clone();
+        let got = b.read_f32(y);
+        let w = m.inner();
+        for l in 0..lanes {
+            let s = lane_slot[l] as usize;
+            for t in indptr[l] as usize..indptr[l + 1] as usize {
+                let yr = m.token(&i, t, &mut want[s * m.stride()..(s + 1) * m.stride()]);
+                assert_close(&got[t * w..(t + 1) * w], &yr, 3e-2, 3e-2);
+            }
+        }
+        assert_close(&b.read_f32(bank), &want, 1e-3, 1e-3);
+    }
+}
+
+#[test]
+fn the_committed_mamba2_lands_the_state_after_the_commit() {
+    let m = M2 {
+        heads: 4,
+        groups: 2,
+        p: 8,
+        n: 16,
+    };
+    let indptr = [0i32, 3, 4, 4, 70];
+    let lane0 = 1u32;
+    let replay = [0i32, 2, 1, 3, 0];
+    let commit = [0i32, 4, 0, 2, 67];
+    let seat_slots = [0i32, 3, 1, -1, 0];
+    // Extended spans: 5, 2, 3, 66 → 76 rows, plus 4 padded.
+    let rows = 80usize;
+    let slots = 4usize;
+    let mut rng = Rng(47);
+    let i = m.inputs(&mut rng, rows);
+    let bank0 = rng.f32s(slots * m.stride(), -0.5, 0.5);
+    let mut b = Bench::new();
+    let x = b.bf16(rows as u32, m.width() as u32, &i.xbc);
+    let ip = b.i32(5, 1, &indptr);
+    let rp = b.i32(5, 1, &replay);
+    let cm = b.i32(5, 1, &commit);
+    let ss = b.i32(5, 1, &seat_slots);
+    let dt = b.bf16(rows as u32, m.heads as u32, &i.dt);
+    let z = b.bf16(rows as u32, m.inner() as u32, &i.z);
+    let mb = m.banks(&mut b, &i);
+    let bank = b.f32(slots as u32, m.stride() as u32, &bank0);
+    let sl = b.i32(rows as u32, 1, &vec![0; rows]);
+    let y = b.zeros(Dtype::Bf16, rows as u32, m.inner() as u32);
+    let p = pool(bank, sl);
+    let seat = Committed {
+        replay: rp,
+        commit: cm,
+        slots: ss,
+        lane0,
+    };
+    if !b
+        .run(|ctx| ssm::mamba2_committed(ctx, x, ip, &seat, dt, z, &mb, &p, y))
+        .unwrap()
+    {
+        return;
+    }
+    let mut want_bank = bank0.clone();
+    let got = b.read_f32(y);
+    let w = m.inner();
+    let mut begin = 0usize;
+    for r in 0..4 {
+        let gl = lane0 as usize + r;
+        let span = (indptr[r + 1] - indptr[r] + replay[gl]) as usize;
+        let slot = seat_slots[gl];
+        if slot >= 0 {
+            let s = slot as usize;
+            let mut st = bank0[s * m.stride()..(s + 1) * m.stride()].to_vec();
+            let keep = (commit[gl].max(0) as usize).min(span);
+            for t in 0..span {
+                let yr = m.token(&i, begin + t, &mut st);
+                let at = (begin + t) * w;
+                assert_close(&got[at..at + w], &yr, 3e-2, 3e-2);
+                if t + 1 == keep {
+                    want_bank[s * m.stride()..(s + 1) * m.stride()].copy_from_slice(&st);
+                }
+            }
+        }
+        begin += span;
+    }
+    assert_close(&b.read_f32(bank), &want_bank, 1e-4, 1e-3);
 }

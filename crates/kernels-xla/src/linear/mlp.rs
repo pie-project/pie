@@ -212,6 +212,23 @@ pub fn gelu_tanh(f: &mut Func, x: Operand, y: Landing) -> Result<Val, Error> {
     Ok(out)
 }
 
+/// `relu(x)²` (Nemotron-H's ungated experts), in f32.
+/// Reference: kernels-cuda `linear::glu::relu2`.
+pub fn relu2(f: &mut Func, x: Operand, y: Landing) -> Result<Val, Error> {
+    const OP: &str = "linear.relu2";
+    expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
+    if (y.rows, y.width) != (x.rows, x.width) {
+        return Err(refuse(
+            OP,
+            "the input and output planes are not one rectangle",
+        ));
+    }
+    let v = x.f32(f);
+    let zero = f.like_f(v, 0.0);
+    let r = f.max(v, zero)?;
+    Ok(f.mul(r, r)?)
+}
+
 pub fn geglu_tanh_packed(
     f: &mut Func,
     packed: Operand,
