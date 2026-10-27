@@ -4,11 +4,9 @@ pub mod cluster;
 pub mod directory;
 mod service;
 mod state;
-mod store;
 mod topology;
 
 pub use actuator::Slot;
-pub use store::{SoftState, StateStore};
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
