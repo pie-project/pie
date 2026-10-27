@@ -14,7 +14,12 @@ impl DispatchLinear for Run<'_> {
 impl Run<'_> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_xla::Error> {
         match op {
-            Linear::Relu2 { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
+            Linear::Relu2 { x, y } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = linear::mlp::relu2(l.f(), x_v, o_y.landing())?;
+                l.land(o_y, v)
+            }),
             // A product that quantizes its activations runs only on CUDA's
             // tcgen05 GEMMs.
             Linear::Matmul {
