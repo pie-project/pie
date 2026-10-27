@@ -45,6 +45,76 @@ pub fn sink(
     })
 }
 
+/// Each row's replay floor into `floor`; with `mark` each lane's state
+/// takes it too.
+pub fn replay_floor(
+    ctx: &Ctx<'_>,
+    positions: crate::handle::RaggedTensor,
+    state: crate::handle::RecurrentPool,
+    mark: bool,
+    floor: Tensor,
+) -> Result<(), Error> {
+    lower(ctx, |l| {
+        let pos = l.ragged(positions)?;
+        let slab = l.read(state.state)?;
+        let slots = l.read(state.slots)?;
+        let (v, next) =
+            kernels_xla::attn::replay::floor(l.f(), pos, slab, slots, mark, floor.landing())?;
+        l.land(floor, v)?;
+        match next {
+            Some(next) => l.land(state.state, next),
+            None => Ok(()),
+        }
+    })
+}
+
+/// Each row's lane's last key position in `pool` into `ends`.
+pub fn kv_ends(
+    ctx: &Ctx<'_>,
+    request_of_token: Tensor,
+    pool: &KvPool,
+    last_page_len: Tensor,
+    ends: Tensor,
+) -> Result<(), Error> {
+    lower(ctx, |l| {
+        let req = l.read(request_of_token)?;
+        let ip = l.read(pool.page_indptr)?;
+        let lp = l.read(last_page_len)?;
+        let v =
+            kernels_xla::attn::replay::kv_ends(l.f(), req, ip, lp, pool.page_size, ends.landing())?;
+        l.land(ends, v)
+    })
+}
+
+/// DeepSeek's window with its sinks: each row reads the `window` keys of
+/// `pool` that end at `positions`, `lse` its scratch.
+pub fn window_sink(
+    ctx: &Ctx<'_>,
+    q: Tensor,
+    positions: Tensor,
+    request_of_token: Tensor,
+    pool: KvPool,
+    sinks: Tensor,
+    window: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    o: Tensor,
+    lse: Tensor,
+) -> Result<(), Error> {
+    let call = paged::window_sink(
+        q,
+        positions,
+        request_of_token,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        lse,
+    )?;
+    attend(ctx, call, pool)?;
+    sink(ctx, o, lse, sinks, head_dim)
+}
+
 /// Caps `x`'s logits, in place.
 pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), Error> {
     lower(ctx, |l| {
@@ -235,6 +305,17 @@ pub mod mla {
             let tuning = l.tuning();
             let o = mla::flash(l.f(), call_v, pool_v, tuning)?;
             l.land(call.o, o)
+        })
+    }
+
+    /// [`flash`] that lands its base-2 log-sum-exp in `lse` too.
+    pub fn flash_lse(ctx: &Ctx<'_>, call: MlaCall, pool: KvPool, lse: Tensor) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let (call_v, pool_v) = call.try_map(&pool, |t| l.read(t))?;
+            let tuning = l.tuning();
+            let (o, lv) = mla::flash_with(l.f(), call_v, pool_v, tuning, true)?;
+            l.land(call.o, o)?;
+            l.land(lse, lv.expect("asked for"))
         })
     }
 
@@ -537,6 +618,41 @@ pub mod index {
                 head_dim,
                 top_k,
                 ratio,
+                selection.landing(),
+            )?;
+            l.land(selection, y)
+        })
+    }
+
+    /// Each row's `top_k` blocks per head, ranked by their best key, into
+    /// `selection` (`block_max`).
+    pub fn topk_block_max(
+        ctx: &Ctx<'_>,
+        q: Tensor,
+        keys: &KvPool,
+        positions: Tensor,
+        request_of_token: Tensor,
+        heads: u32,
+        head_dim: u32,
+        top_k: u32,
+        block: u32,
+        selection: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let (planes, (qv, pos, req)) = planes(l, keys, |l| {
+                Ok((l.read(q)?, l.read(positions)?, l.read(request_of_token)?))
+            })?;
+            let y = index::topk_block_max(
+                l.f(),
+                qv,
+                planes,
+                keys,
+                pos,
+                req,
+                heads,
+                head_dim,
+                top_k,
+                block,
                 selection.landing(),
             )?;
             l.land(selection, y)

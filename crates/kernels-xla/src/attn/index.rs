@@ -8,7 +8,8 @@
 
 use dtype::Dtype;
 
-use super::pool::{Entries, cell_of, first, paging, put_cols, write_cell};
+use super::paged::with_i;
+use super::pool::{Entries, cell_of, compact_view, first, paging, put_cols, write_cell};
 use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
@@ -310,7 +311,7 @@ pub fn topk(
     if keys.page_size <= 0 {
         return Err(refuse(OP, "the index cache page size is zero"));
     }
-    if q.width != h * d || planes.keys.width < d {
+    if q.width != h * d || (planes.keys.width < d && planes.keys.width * ratio.max(1) != d) {
         return Err(refuse(OP, "the index query is not heads x key width"));
     }
     if weights.is_some_and(|w| w.width != h) {
@@ -349,7 +350,11 @@ pub fn topk(
         let w = weights.map(|w| w.f32(f));
         let pos = flat_i32(f, positions)?;
         let req = flat_i32(f, request_of_token)?;
-        let table = planes.keys.val;
+        let (table, ps, compact) =
+            match compact_view(f, OP, planes.keys.val, planes.keys.width, d, keys.page_size)? {
+                Some((t, ps)) => (t, ps, true),
+                None => (planes.keys.val, ps, false),
+            };
         let qv = f.slice_axis(qv, 0, 0, n)?;
         let qv = f.reshape(qv, &[n, hh, dd])?;
         let w = match w {
@@ -366,7 +371,9 @@ pub fn topk(
         let pos_t = cmp_i(f, Cmp::Gt, total, 0)?;
         let nkeys = f.select(pos_t, nkeys, zero)?;
         let nkeys = clamp_i(f, nkeys, 0, nk)?;
-        let scores = index_scores(f, qv, w, table, indices, indptr, req, nkeys, nk, stride, ps)?;
+        let scores = index_scores(
+            f, qv, w, table, indices, indptr, req, nkeys, nk, stride, ps, compact,
+        )?;
         Ok(bisect_select(f, scores, nkeys, kk)?)
     }
 }
@@ -454,6 +461,194 @@ pub fn topk_tokens(
     }
 }
 
+/// Per query row and head `h`: each `block`-wide run of cached keys the row
+/// sees scored by its best `q_h · k` (keys past the row's position not
+/// counted), then `top_k` blocks per head: every visible block when they
+/// fit, else the row's own block and the `top_k − 1` best of the rest (ties
+/// to the lower block), ascending; unfilled slots -1 (`attn.index_topk`
+/// scored `block_max`, `heads · top_k` wide). The score row's bound is the
+/// pool's `max_pages · page_size` keys in blocks.
+pub fn topk_block_max(
+    f: &mut Func,
+    q: Operand,
+    planes: Entries,
+    keys: &KvPool<impl Stored>,
+    positions: Operand,
+    request_of_token: Operand,
+    heads: u32,
+    head_dim: u32,
+    top_k: u32,
+    block: u32,
+    selection: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "attn.index_topk";
+    expect(OP, q, &[Dtype::Bf16])?;
+    expect(OP, selection, &[Dtype::I32])?;
+    let h = nonzero(OP, "the head count this ranking states", heads)?;
+    let d = nonzero(OP, "the key width this ranking states", head_dim)?;
+    let k = nonzero(OP, "the selection budget this ranking states", top_k)?;
+    let bw = i64::from(nonzero(OP, "the block width this ranking scores", block)?);
+    if keys.page_size <= 0 {
+        return Err(refuse(OP, "the index cache page size is zero"));
+    }
+    if q.width != h * d || planes.keys.width < d {
+        return Err(refuse(OP, "the index query is not heads x key width"));
+    }
+    if u64::from(selection.width) != u64::from(h) * u64::from(k) {
+        return Err(refuse(OP, "the selection is not one budget per head"));
+    }
+    let rows = nonzero(OP, "rows", selection.rows)?;
+    if q.rows < rows
+        || positions.elements() < u64::from(rows)
+        || request_of_token.elements() < u64::from(rows)
+    {
+        return Err(refuse(
+            OP,
+            "q and the fire tables are shorter than the selection",
+        ));
+    }
+    let max_kv = i64::from(keys.max_pages) * i64::from(keys.page_size);
+    if max_kv == 0 {
+        return Err(refuse(OP, "the pool's page bound holds no key"));
+    }
+    let nbm = (max_kv - 1) / bw + 1;
+    let (n, hh, dd, kk) = (i64::from(rows), i64::from(h), i64::from(d), i64::from(k));
+    let (indices, indptr, ps) = paging(
+        f,
+        OP,
+        planes.page_indices,
+        planes.page_indptr,
+        keys.page_size,
+    )?;
+    let table = planes.keys.val;
+    let qv = f.slice_axis(q.val, 0, 0, n)?;
+    let qv = f.reshape(qv, &[n, hh, dd])?;
+    let pos = flat_i32(f, positions)?;
+    let pos = first(f, pos, n)?;
+    let req = flat_i32(f, request_of_token)?;
+    let req = first(f, req, n)?;
+    // The blocks each row sees, its own the last.
+    let bv = f.like_i(pos, bw);
+    let nb = f.div(pos, bv)?;
+    let nb = with_i(f, nb, 1, Func::add)?;
+    let nb = clamp_i(f, nb, 0, nbm)?;
+
+    // Block scores `[n, h, nbm]`, `m` blocks a step.
+    let m = (KEY_BLOCK / bw).clamp(1, nbm);
+    let steps = (nbm + m - 1) / m;
+    let kb = m * bw;
+    let mx = f.reduce(nb, &[0], Fold::Max)?;
+    let mx = with_i(f, mx, m - 1, Func::add)?;
+    let count = with_i(f, mx, m, Func::div)?;
+    let count = clamp_i(f, count, 0, steps)?;
+    let s0 = f.const_f(Elem::F32, f64::NEG_INFINITY, &[n, hh, steps * m]);
+    let out = loop_upto(
+        f,
+        count,
+        &[s0],
+        &[qv, table, indices, indptr, req, pos],
+        |f, b, cr, inv| {
+            let scores = cr[0];
+            let (q, table, indices, indptr, req, pos) =
+                (inv[0], inv[1], inv[2], inv[3], inv[4], inv[5]);
+            let mv = ci(f, m);
+            let start = f.mul(b, mv)?;
+            let kbv = ci(f, kb);
+            let first_key = f.mul(b, kbv)?;
+            let j = f.iota(Elem::I32, &[n, kb], 1);
+            let fk = f.broadcast(first_key, &[n, kb], &[])?;
+            let p = f.add(j, fk)?;
+            let rq = f.broadcast(req, &[n, kb], &[0])?;
+            let cell = cell_of(f, indices, indptr, rq, p, ps)?;
+            let cell = f.reshape(cell, &[n * kb])?;
+            let kr = f.take_rows(table, cell)?;
+            let kr = f.slice_axis(kr, 1, 0, dd)?;
+            let kr = f.convert(kr, Elem::F32);
+            let kr = f.reshape(kr, &[n, kb, dd])?;
+            let qf = f.convert(q, Elem::F32);
+            let dot = f.dot_general(qf, kr, &[0], &[0], &[2], &[2], Elem::F32)?;
+            let pb = f.broadcast(pos, &[n, kb], &[0])?;
+            let seen = f.compare(Cmp::Le, p, pb)?;
+            let seen = f.broadcast(seen, &[n, hh, kb], &[0, 2])?;
+            let ninf = f.like_f(dot, f64::NEG_INFINITY);
+            let dot = f.select(seen, dot, ninf)?;
+            let dot = f.reshape(dot, &[n, hh, m, bw])?;
+            let best = f.reduce(dot, &[3], Fold::Max)?;
+            let z = ci(f, 0);
+            let scores = f.dynamic_update_slice(scores, best, &[z, z, start])?;
+            Ok(vec![scores])
+        },
+    )?;
+    let scores = f.slice_axis(out[0], 2, 0, nbm)?;
+
+    // The ranking: the best `top_k − 1` blocks other than the row's own.
+    let dims = [n, hh, nbm];
+    let j = f.iota(Elem::I32, &dims, 2);
+    let nbb = f.broadcast(nb, &dims, &[0])?;
+    let own = with_i(f, nbb, -1, Func::add)?;
+    let visible = f.compare(Cmp::Lt, j, nbb)?;
+    let other = f.compare(Cmp::Ne, j, own)?;
+    let ranked = f.and(visible, other)?;
+    let ninf = f.like_f(scores, f64::NEG_INFINITY);
+    let rank = f.select(ranked, scores, ninf)?;
+    let nan = f.compare(Cmp::Ne, rank, rank)?;
+    let rank = f.select(nan, ninf, rank)?;
+    let rank = f.reshape(rank, &[n * hh, nbm])?;
+    let ids = f.iota(Elem::I32, &[n * hh, nbm], 1);
+    let sorted = f.sort(&[rank, ids], 1, true, |fq, a, b| {
+        let gt = fq.compare(Cmp::Gt, a[0], b[0])?;
+        let eq = fq.compare(Cmp::Eq, a[0], b[0])?;
+        let lt = fq.compare(Cmp::Lt, a[1], b[1])?;
+        let tie = fq.and(eq, lt)?;
+        fq.or(gt, tie)
+    })?;
+    let take = (kk - 1).min(nbm);
+    let big = i64::from(i32::MAX);
+    let mut runs = Vec::new();
+    if take > 0 {
+        let v = f.slice(sorted[0], &[0, 0], &[n * hh, take], &[1, 1])?;
+        let i = f.slice(sorted[1], &[0, 0], &[n * hh, take], &[1, 1])?;
+        let lo = f.like_f(v, f64::NEG_INFINITY);
+        let picked = f.compare(Cmp::Gt, v, lo)?;
+        let none = f.like_i(i, big);
+        runs.push(f.select(picked, i, none)?);
+    }
+    let own_id = f.broadcast(nb, &[n, hh], &[0])?;
+    let own_id = with_i(f, own_id, -1, Func::add)?;
+    runs.push(f.reshape(own_id, &[n * hh, 1])?);
+    let run = if runs.len() == 1 {
+        runs[0]
+    } else {
+        f.concat(&runs, 1)?
+    };
+    let width = f.dims(run)[1];
+    let run = f.sort(&[run], 1, true, |fq, a, b| fq.compare(Cmp::Lt, a[0], b[0]))?[0];
+    let run = if width < kk {
+        let pad = ci(f, big);
+        f.pad(run, pad, &[0, 0], &[0, kk - width], &[0, 0])?
+    } else {
+        run
+    };
+    let unset = cmp_i(f, Cmp::Eq, run, big)?;
+    let neg = f.like_i(run, -1);
+    let run = f.select(unset, neg, run)?;
+    let run = f.reshape(run, &[n, hh, kk])?;
+
+    // Every visible block when they fit; nothing before position 0.
+    let at = f.iota(Elem::I32, &[n, hh, kk], 2);
+    let nbk = f.broadcast(nb, &[n, hh, kk], &[0])?;
+    let fits = f.compare(Cmp::Lt, at, nbk)?;
+    let neg = f.like_i(at, -1);
+    let all = f.select(fits, at, neg)?;
+    let few = cmp_i(f, Cmp::Le, nb, kk)?;
+    let few = f.broadcast(few, &[n, hh, kk], &[0])?;
+    let out = f.select(few, all, run)?;
+    let live = cmp_i(f, Cmp::Ge, pos, 0)?;
+    let live = f.broadcast(live, &[n, hh, kk], &[0])?;
+    let out = f.select(live, out, neg)?;
+    Ok(f.reshape(out, &[n, hh * kk])?)
+}
+
 /// The `[n, nk]` score rows (entries past a row's `nkeys` are garbage).
 fn index_scores(
     f: &mut Func,
@@ -467,6 +662,7 @@ fn index_scores(
     nk: i64,
     stride: i64,
     ps: i64,
+    compact: bool,
 ) -> Built<Val> {
     let qd = f.dims(q).to_vec();
     let (n, hh, dd) = (qd[0], qd[1], qd[2]);
@@ -493,11 +689,17 @@ fn index_scores(
             let j = f.iota(Elem::I32, &[n, kb], 1);
             let sb = f.broadcast(start, &[n, kb], &[])?;
             let j = f.add(j, sb)?;
-            let one = f.like_i(j, 1);
-            let sv = f.like_i(j, stride);
-            let p = f.add(j, one)?;
-            let p = f.mul(p, sv)?;
-            let p = f.sub(p, one)?;
+            // Key j at its block's last position, or a compact pool's
+            // view position j.
+            let p = if compact {
+                j
+            } else {
+                let one = f.like_i(j, 1);
+                let sv = f.like_i(j, stride);
+                let p = f.add(j, one)?;
+                let p = f.mul(p, sv)?;
+                f.sub(p, one)?
+            };
             let rq = f.broadcast(req, &[n, kb], &[0])?;
             let cell = cell_of(f, indices, indptr, rq, p, ps)?;
             let cell = f.reshape(cell, &[n * kb])?;

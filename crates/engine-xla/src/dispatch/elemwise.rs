@@ -98,10 +98,56 @@ impl Run<'_> {
             Elemwise::SumSquares { .. } | Elemwise::RmsnormBy { .. } => {
                 Err(kernels_xla::Error::Unsupported { op: op.name() })
             }
-            // Muse Spark's post-norm gate is served on CUDA.
-            Elemwise::NormGate { .. } => Err(kernels_xla::Error::Unsupported {
-                op: "elemwise.norm_gate",
-            }),
+            // Muse Spark's post-norm gate.
+            Elemwise::NormGate {
+                x,
+                scale,
+                res,
+                gate,
+                eps,
+                temperature,
+                y,
+                next,
+            } => {
+                if res.is_some() != gate.is_some() {
+                    return Err(kernels_xla::Error::Unsupported {
+                        op: "elemwise.norm_gate",
+                    });
+                }
+                crate::lower::lower(self.ctx(), |l| {
+                    let x_v = l.read(self.tensor(*x))?;
+                    let scale_v = match scale {
+                        Some(s) => Some(l.read(self.tensor(*s))?),
+                        None => None,
+                    };
+                    let res_v = match (res, gate) {
+                        (Some(r), Some(g)) => {
+                            Some((l.read(self.tensor(*r))?, l.read(self.tensor(*g))?))
+                        }
+                        _ => None,
+                    };
+                    let next_v = match next {
+                        Some(n) => Some((l.read(self.tensor(n.weight))?, n.eps, n.plus_one)),
+                        None => None,
+                    };
+                    let o_y = self.tensor(*y);
+                    let (v, z) = elemwise::norm::norm_gate(
+                        l.f(),
+                        x_v,
+                        scale_v,
+                        res_v,
+                        *eps,
+                        *temperature,
+                        next_v,
+                        o_y.landing(),
+                    )?;
+                    l.land(o_y, v)?;
+                    if let (Some(n), Some(z)) = (next, z) {
+                        l.land(self.tensor(n.y), z)?;
+                    }
+                    Ok(())
+                })
+            }
             // A rotation at its own frequencies (a checkpoint's rope scaling) is
             // served on CUDA.
             Elemwise::Rope { freqs: Some(_), .. } => {

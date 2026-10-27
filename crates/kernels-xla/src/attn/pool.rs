@@ -94,6 +94,37 @@ pub(crate) fn first(f: &mut Func, v: Val, n: i64) -> Built<Val> {
     f.slice_axis(v, 0, 0, n)
 }
 
+/// A pool whose positions are `1 / div` of an entry `row` wide (a compact
+/// pool, engine-cuda's `compressed::pool::compact`): its plane viewed as an
+/// entry a row, `page_size / div` a page, entry `c` at view position `c`.
+/// `None` for a pool that keeps an entry a position's row.
+pub(crate) fn compact_view(
+    f: &mut Func,
+    op: &'static str,
+    table: Val,
+    width: u32,
+    row: u32,
+    page_size: i32,
+) -> Result<Option<(Val, i64)>, Error> {
+    if width == 0 || width >= row {
+        return Ok(None);
+    }
+    let div = row / width;
+    let ps = i64::from(page_size);
+    let cells = f.dims(table)[0];
+    if !row.is_multiple_of(width) || ps % i64::from(div) != 0 || cells % i64::from(div) != 0 {
+        return Err(refuse(
+            op,
+            format!(
+                "a {row}-wide entry does not pack into a pool {width} wide a position at {page_size} a page"
+            ),
+        ));
+    }
+    let div = i64::from(div);
+    let t = f.reshape(table, &[cells / div, i64::from(row)])?;
+    Ok(Some((t, ps / div)))
+}
+
 fn long_enough(op: &'static str, what: &str, t: impl Stored, n: u32) -> Result<(), Error> {
     if t.elements() < u64::from(n) {
         return Err(refuse(
@@ -462,18 +493,32 @@ pub fn kv_append(
     const OP: &str = "attn.pool_kv_append";
     expect(OP, entries, &[Dtype::Bf16])?;
     let rows = nonzero(OP, "rows", entries.rows)?;
-    if keys.width < entries.width {
-        return Err(refuse(
-            OP,
-            "the compressed pool's row is narrower than the entry",
-        ));
-    }
     long_enough(OP, "boundary position table", boundary_pos, rows)?;
     long_enough(OP, "boundary request table", boundary_req, rows)?;
     let n = i64::from(rows);
     let (indices, indptr, ps) = paging(f, OP, page_indices, page_indptr, pool.page_size)?;
     let bpos = flat_i32(f, boundary_pos)?;
     let breq = flat_i32(f, boundary_req)?;
+    // A compact pool files the entry at its index, `page_size / div` a page.
+    if let Some((table, ps)) =
+        compact_view(f, OP, keys.val, keys.width, entries.width, pool.page_size)?
+    {
+        let div = i64::from(entries.width / keys.width);
+        let dv = f.like_i(bpos, div);
+        let c = f.div(bpos, dv)?;
+        let neg = cmp_i(f, Cmp::Lt, bpos, 0)?;
+        let none = f.like_i(bpos, -1);
+        let c = f.select(neg, none, c)?;
+        let at = boundary_cell(f, indices, indptr, c, breq, n, ps)?;
+        let y = put_cols(f, table, at, entries.val)?;
+        return Ok(f.reshape(y, &[i64::from(keys.rows), i64::from(keys.width)])?);
+    }
+    if keys.width < entries.width {
+        return Err(refuse(
+            OP,
+            "the compressed pool's row is narrower than the entry",
+        ));
+    }
     let at = boundary_cell(f, indices, indptr, bpos, breq, n, ps)?;
     Ok(put_cols(f, keys.val, at, entries.val)?)
 }
@@ -522,6 +567,7 @@ fn pooled_flash(
     nk: i64,
     ratio: i64,
     ps: i64,
+    compact: bool,
     scale: f32,
 ) -> Built<(Val, Val)> {
     let qd = f.dims(q).to_vec();
@@ -573,11 +619,17 @@ fn pooled_flash(
             let a = cmp_i(f, Cmp::Ge, c, 0)?;
             let bb = f.compare(Cmp::Lt, c, vis)?;
             let valid = f.and(a, bb)?;
-            let one = f.like_i(c, 1);
-            let rv = f.like_i(c, ratio);
-            let pos = f.add(c, one)?;
-            let pos = f.mul(pos, rv)?;
-            let pos = f.sub(pos, one)?;
+            // Entry c sits at its block's last position, or a compact
+            // pool's view position c.
+            let pos = if compact {
+                c
+            } else {
+                let one = f.like_i(c, 1);
+                let rv = f.like_i(c, ratio);
+                let pos = f.add(c, one)?;
+                let pos = f.mul(pos, rv)?;
+                f.sub(pos, one)?
+            };
             let rq = f.broadcast(req, &[r, kb], &[0])?;
             let cell = cell_of(f, indices, indptr, rq, pos, ps)?;
             let cell = f.reshape(cell, &[r * kb])?;
@@ -763,7 +815,7 @@ fn reader<T: Stored>(
             "q, o and lse are not [rows, heads x head width] / [rows, heads]",
         ));
     }
-    if entries.keys.width() < d {
+    if entries.keys.width() < d && entries.keys.width() * ratio != d {
         return Err(refuse(
             op,
             "the compressed pool's row is narrower than a head",
@@ -817,7 +869,17 @@ pub fn lse(
     let qv = call.q.val;
     let pos = flat_i32(f, call.positions)?;
     let req = flat_i32(f, call.request_of_token)?;
-    let table = planes.keys.val;
+    let (table, ps, compact) = match compact_view(
+        f,
+        call.op,
+        planes.keys.val,
+        planes.keys.width,
+        call.head_dim,
+        entries.page_size,
+    )? {
+        Some((t, ps)) => (t, ps, true),
+        None => (planes.keys.val, ps, false),
+    };
     let sel = match call.selection {
         Some((s, _)) => {
             let v = f.convert(s.val, Elem::I32);
@@ -849,6 +911,7 @@ pub fn lse(
         nk,
         rt,
         ps,
+        compact,
         call.sm_scale,
     )?;
     Ok((ov, lv))

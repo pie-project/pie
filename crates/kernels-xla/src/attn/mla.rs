@@ -446,6 +446,18 @@ pub fn flash(
     pool: KvPool<Operand>,
     tuning: Tuning,
 ) -> Result<Val, Error> {
+    Ok(flash_with(f, call, pool, tuning, false)?.0)
+}
+
+/// [`flash`], and with `lse` the base-2 log-sum-exp `[rows, heads]` a sink
+/// rescales by.
+pub fn flash_with(
+    f: &mut Func,
+    call: MlaCall<Operand, Landing>,
+    pool: KvPool<Operand>,
+    tuning: Tuning,
+    lse: bool,
+) -> Result<(Val, Option<Val>), Error> {
     let MlaCall {
         op,
         q,
@@ -576,7 +588,8 @@ pub fn flash(
             ch,
         )?
     };
-    Ok(fl.o)
+    let l = if lse { Some(fl.lse2(f)?) } else { None };
+    Ok((fl.o, l))
 }
 
 pub fn attention_decode<T: Stored>(

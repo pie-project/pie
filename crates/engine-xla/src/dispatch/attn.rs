@@ -244,28 +244,67 @@ impl Run<'_> {
                 crate::lower::attn::attend(self.ctx(), call, pool)
             }
 
-            Attn::Decode {
-                selection: Some(_),
-                bias: None,
-                selected: Some(poem_ir::Blocks { per_head: true, .. }),
-                lse: None,
-                ..
+            Attn::ReplayFloor {
+                positions,
+                state,
+                mark,
+                floor,
+            } => crate::lower::attn::replay_floor(
+                self.ctx(),
+                self.ragged(*positions),
+                self.recurrent(*state),
+                *mark,
+                self.tensor(*floor),
+            ),
+            Attn::KvEnds {
+                request_of_token,
+                cache,
+                ends,
+            } => {
+                // The pool's last-page depths: the geometry its page table
+                // was staged with.
+                let pool = *self.pool(*cache);
+                let last_page_len = self
+                    .bindings()
+                    .geometry
+                    .iter()
+                    .find(|g| g.indptr == Some(pool.page_indptr))
+                    .and_then(|g| g.last_page_len)
+                    .ok_or(kernels_xla::Error::Unsupported { op: op.name() })?;
+                crate::lower::attn::kv_ends(
+                    self.ctx(),
+                    self.tensor(*request_of_token),
+                    &pool,
+                    last_page_len,
+                    self.tensor(*ends),
+                )
             }
-            | Attn::Prefill {
-                mask: None,
-                selection: Some(_),
-                bias: None,
-                selected: Some(poem_ir::Blocks { per_head: true, .. }),
-                lse: None,
-                ..
-            }
-            | Attn::IndexTopk {
-                score: IndexScore::BlockMax,
-                ..
-            } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
-            // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
-            Attn::ReplayFloor { .. } | Attn::KvEnds { .. } | Attn::WindowSink { .. } => {
-                Err(kernels_xla::Error::Unsupported { op: op.name() })
+            Attn::WindowSink {
+                q,
+                positions,
+                request_of_token,
+                cache,
+                sink,
+                window,
+                head_dim,
+                sm_scale,
+                o,
+            } => {
+                let o = self.tensor(*o);
+                let lse = self.temp(o.rows, o.width / (*head_dim).max(1), poem_ir::Dtype::F32);
+                crate::lower::attn::window_sink(
+                    self.ctx(),
+                    self.tensor(*q),
+                    self.tensor(*positions),
+                    self.tensor(*request_of_token),
+                    *self.pool(*cache),
+                    self.tensor(*sink),
+                    *window,
+                    *head_dim,
+                    *sm_scale,
+                    o,
+                    lse,
+                )
             }
             Attn::Decode {
                 q,
@@ -277,11 +316,7 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 bias: None,
-                selected:
-                    Some(poem_ir::Blocks {
-                        ratio,
-                        per_head: false,
-                    }),
+                selected: Some(poem_ir::Blocks { ratio, per_head }),
                 rel: None,
                 lse: None,
             } => {
@@ -294,6 +329,7 @@ impl Run<'_> {
                     *head_dim,
                     *sm_scale,
                     *ratio,
+                    *per_head,
                     self.tensor(*o),
                 )?;
                 crate::lower::attn::attend(self.ctx(), call, pool)
@@ -312,11 +348,7 @@ impl Run<'_> {
                 bias: None,
                 floor: None,
                 causal: true,
-                selected:
-                    Some(poem_ir::Blocks {
-                        ratio,
-                        per_head: false,
-                    }),
+                selected: Some(poem_ir::Blocks { ratio, per_head }),
                 rel: None,
                 lse: None,
             } => {
@@ -331,6 +363,7 @@ impl Run<'_> {
                     *kv_heads,
                     *sm_scale,
                     *ratio,
+                    *per_head,
                     self.tensor(*o),
                 )?;
                 crate::lower::attn::attend(self.ctx(), call, pool)
@@ -804,27 +837,6 @@ impl Run<'_> {
                 self.tensor(*write_offset),
             ),
 
-            // The per-head log-sum-exp a sink rescales by is landed on CUDA alone.
-            Attn::MlaDecode {
-                lse: Some(_),
-                selection: None,
-                ..
-            }
-            | Attn::MlaPrefill {
-                lse: Some(_),
-                selection: None,
-                ..
-            }
-            | Attn::MlaDecode {
-                lse: Some(_),
-                selection: Some(_),
-                ..
-            }
-            | Attn::MlaPrefill {
-                lse: Some(_),
-                selection: Some(_),
-                ..
-            } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Attn::MlaDecode {
                 window: Some(_),
                 selection: None,
@@ -845,7 +857,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-                lse: _,
+                lse,
                 selection: None,
             } => {
                 let (positions, request_of_token) = {
@@ -862,7 +874,16 @@ impl Run<'_> {
                     *sm_scale,
                     self.tensor(*o),
                 );
-                crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache))
+                // the per-head log-sum-exp a sink rescales by, where asked
+                match lse {
+                    Some(lse) => crate::lower::attn::mla::flash_lse(
+                        self.ctx(),
+                        call,
+                        *self.pool(*cache),
+                        self.tensor(*lse),
+                    ),
+                    None => crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache)),
+                }
             }
             Attn::MlaPrefill {
                 q,
@@ -874,7 +895,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-                lse: _,
+                lse,
                 selection: None,
             } => {
                 let (positions, request_of_token) = {
@@ -891,7 +912,16 @@ impl Run<'_> {
                     *sm_scale,
                     self.tensor(*o),
                 );
-                crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache))
+                // the per-head log-sum-exp a sink rescales by, where asked
+                match lse {
+                    Some(lse) => crate::lower::attn::mla::flash_lse(
+                        self.ctx(),
+                        call,
+                        *self.pool(*cache),
+                        self.tensor(*lse),
+                    ),
+                    None => crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache)),
+                }
             }
             Attn::MlaDecode {
                 q,
@@ -903,7 +933,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-                lse: _,
+                lse,
                 window: None,
             } => {
                 let (positions, request_of_token) = {
@@ -921,7 +951,16 @@ impl Run<'_> {
                     *sm_scale,
                     self.tensor(*o),
                 );
-                crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache))
+                // the per-head log-sum-exp a sink rescales by, where asked
+                match lse {
+                    Some(lse) => crate::lower::attn::mla::flash_lse(
+                        self.ctx(),
+                        call,
+                        *self.pool(*cache),
+                        self.tensor(*lse),
+                    ),
+                    None => crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache)),
+                }
             }
             Attn::MlaPrefill {
                 q,
@@ -933,7 +972,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-                lse: _,
+                lse,
                 window: None,
             } => {
                 let (positions, request_of_token) = {
@@ -951,7 +990,16 @@ impl Run<'_> {
                     *sm_scale,
                     self.tensor(*o),
                 );
-                crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache))
+                // the per-head log-sum-exp a sink rescales by, where asked
+                match lse {
+                    Some(lse) => crate::lower::attn::mla::flash_lse(
+                        self.ctx(),
+                        call,
+                        *self.pool(*cache),
+                        self.tensor(*lse),
+                    ),
+                    None => crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache)),
+                }
             }
 
             Attn::IndexLayernormRope {
@@ -1019,6 +1067,36 @@ impl Run<'_> {
                     self.tensor(*selection),
                 )
             }
+            Attn::IndexTopk {
+                q,
+                weights: None,
+                keys,
+                heads,
+                head_dim,
+                top_k,
+                ratio,
+                score: IndexScore::BlockMax,
+                selection,
+            } => {
+                let fire = self.bindings();
+                let (positions, request_of_token) = (fire.cache_rows, fire.tables.request_of_token);
+                crate::lower::attn::index::topk_block_max(
+                    self.ctx(),
+                    self.tensor(*q),
+                    self.pool(*keys),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
+                    *heads,
+                    *head_dim,
+                    *top_k,
+                    *ratio,
+                    self.tensor(*selection),
+                )
+            }
+            Attn::IndexTopk {
+                score: IndexScore::BlockMax,
+                ..
+            } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Attn::IndexKvAppend {
                 k,
                 keys,
