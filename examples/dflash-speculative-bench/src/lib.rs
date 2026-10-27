@@ -514,7 +514,12 @@ async fn main(input: Input) -> Result<Output> {
     let drafts = model::lane_of(&[])?
         .outputs
         .iter()
-        .any(|output| output.name == "mtp.drafts");
+        .any(|output| output.name == "mtp.drafts")
+        || model::lane_of(&[("block_draft", "on")]).is_ok_and(|lane| {
+            lane.outputs
+                .iter()
+                .any(|output| output.name == "mtp.drafts")
+        });
     if !drafts && input.drafter != "ngram" {
         return Err("this deployment ships no draft head".into());
     }

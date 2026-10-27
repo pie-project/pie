@@ -8,7 +8,7 @@ load("//pie/codec.poem", "bank", "kept", read_fused = "fused", read_weight = "we
 load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", "markov", "selector", dflash_caches = "caches", dflash_declare = "declare", dflash_head = "head")
 load("//lib/media.poem", "smart_resize")
-load("//lib/qwen.poem", "SMALL", "LARGE", "PATCH", "MERGE", "tower", "read_tower", "run_tower", "scatter", "positions", "rope", "routed", "draft_attn", "norm_of")
+load("//lib/qwen.poem", "SMALL", "MEDIUM", "LARGE", "PATCH", "MERGE", "tower", "read_tower", "run_tower", "scatter", "positions", "rope", "routed", "draft_attn", "norm_of")
 load("//lib/reads.poem", "squeezed")
 load("//lib/rope.poem", "yarn")
 load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
@@ -37,9 +37,9 @@ MODELS = [
     qwen("qwen35-d0.8b", parts = ["vision"], drafters = ["eagle"], layers = 24),
     qwen("qwen35-d2b", layers = 24),
     qwen("qwen35-d3b", layers = 24, vocab = 151936),
-    qwen("qwen35-d4b", layers = 32),
+    qwen("qwen35-d4b", parts = ["vision"], layers = 32),
     qwen("qwen35-a3b", layers = 40),
-    qwen("qwen35-d9b", drafters = ["dflash"], layers = 32),
+    qwen("qwen35-d9b", parts = ["vision"], drafters = ["dflash"], layers = 32),
     qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash", "dflash2"], layers = 40),
     qwen("qwen35-397b-a17b", parts = ["vision"], layers = 60),
     qwen("qwen35-122b-a10b", layers = 48),
@@ -98,8 +98,10 @@ DEPLOYMENTS = [
     deployment("qwen35-d0.8b", weights = U4, kv = BF),
     deployment("qwen35-d2b", weights = U4, kv = BF),
     deployment("qwen35-d4b", weights = U4, kv = BF),
+    deployment("qwen35-d4b", weights = BF, kv = BF, parts = ["vision"]),
     deployment("qwen35-d9b", weights = U4, kv = BF, drafter = "dflash"),
     deployment("qwen35-d9b", weights = U4, kv = BF),
+    deployment("qwen35-d9b", weights = BF, kv = BF, parts = ["vision"]),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "dflash"),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "dflash2"),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "mtp"),
@@ -368,9 +370,6 @@ FIXED = {
     "qwen35-d3b": dims(hidden = 2048, layers = 24, attn_every = 4, q_heads = 16, kv_heads = 2,
                        head_dim = 256, rotary_dim = 64, k_heads = 16, v_heads = 32, k_dim = 128,
                        v_dim = 128, mlp = dense(8192), vocab = 151936, tied = True),
-    "qwen35-d4b": dims(hidden = 2560, layers = 32, attn_every = 4, q_heads = 16, kv_heads = 4,
-                       head_dim = 256, rotary_dim = 64, k_heads = 16, v_heads = 32, k_dim = 128,
-                       v_dim = 128, mlp = dense(9216), vocab = 248320, tied = True),
     "qwen35-a3b": a3b(),
     "qwen35-tiny": dims(hidden = 256, layers = 4, attn_every = 4, q_heads = 4, kv_heads = 2,
                         head_dim = 64, rotary_dim = 32, k_heads = 4, v_heads = 8, k_dim = 128,
@@ -404,6 +403,13 @@ FIXED = {
     "qwen36-27b-bonsai": d27b(),
 }
 
+def d4b(**over):
+    d = dims(hidden = 2560, layers = 32, attn_every = 4, q_heads = 16, kv_heads = 4, head_dim = 256,
+             rotary_dim = 64, k_heads = 16, v_heads = 32, k_dim = 128, v_dim = 128,
+             mlp = dense(9216), vocab = 248320, tied = True)
+    d.update(over)
+    return d
+
 def d9b(**over):
     d = dims(hidden = 4096, layers = 32, attn_every = 4, q_heads = 16, kv_heads = 4, head_dim = 256,
              rotary_dim = 64, k_heads = 16, v_heads = 32, k_dim = 128, v_dim = 128,
@@ -426,7 +432,8 @@ DRAFTED = {
     ("qwen38-27b", "dspark"): (d27b, None, drafting("qwen38-27b", "dspark")),
     ("ornith15-397b", None): (a17b, LARGE, {}),
     ("qwen35-397b-a17b", None): (a17b, LARGE, {}),
-    ("qwen35-d9b", None): (d9b, None, {}),
+    ("qwen35-d4b", None): (d4b, MEDIUM, {}),
+    ("qwen35-d9b", None): (d9b, LARGE, {}),
     ("qwen35-d9b", "dflash"): (d9b, None, drafting("qwen35-d9b", "dflash")),
     ("qwen36-35b-a3b", None): (a3b, None, {}),
     ("qwen36-35b-a3b", "mtp"): (a3b, None, {"draft": "mtp"}),
