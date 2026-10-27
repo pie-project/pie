@@ -1232,7 +1232,7 @@ fn build_lt_plan(
             augmented.push(result);
         }
     }
-    heuristics.extend(augmented);
+    let _ = augmented;
     plan.heuristics = heuristics;
     Some(plan)
 }
