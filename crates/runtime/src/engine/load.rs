@@ -274,6 +274,15 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<String> {
 
     let mut misses: Vec<String> = Vec::new();
     for (deployment, read) in catalog().fits(&source, platform) {
+        // Metal multiplies activations as they are: a deployment that quantizes them is CUDA's.
+        if platform == Platform::Metal && deployment.deploy.weights.iter().any(|w| w.act.is_some())
+        {
+            misses.push(format!(
+                "{}: quantizes its activations, which Metal does not",
+                deployment.name
+            ));
+            continue;
+        }
         let contract = match read {
             Ok(contract) => contract,
             Err(why) => {

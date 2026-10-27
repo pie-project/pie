@@ -1,9 +1,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use engine::ports::{Envelope, resolves};
+use engine::ports::{Envelope, engine_resolves};
 use eta_exec::{ExecPlan, Value};
 use eta_ir::Dtype;
-use eta_ir::registry::{GeometryClass, Port};
+use eta_ir::registry::{GeometryClass, Port, PortMask};
 use eta_ir::types::name_or_unknown;
 
 use crate::error::{Fault, Result};
@@ -20,18 +20,21 @@ pub fn resolved() -> u64 {
 pub fn resolve(
     plan: &ExecPlan,
     class: GeometryClass,
+    device: PortMask,
     rings: &Rings,
     cursors: &[Cursor],
     shapes: &[ChannelShape],
+    mask_on_device: bool,
 ) -> Result<Envelope> {
     let mut out = Envelope::default();
     RESOLVED.fetch_add(1, Ordering::Relaxed);
     for binding in &plan.package.ports {
-        if !resolves(class, binding.port) {
+        if !engine_resolves(class, device, binding.port) {
             continue;
         }
         if binding.port == Port::AttnMask {
-            if binding.is_const {
+            // A mask the device carries is packed on the device, never read here.
+            if binding.is_const || mask_on_device {
                 continue;
             }
             out.mask = Some(read_bool_cell(

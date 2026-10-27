@@ -194,12 +194,8 @@ fn rebuild_stage_indexes(package: &LaunchPackage) -> Vec<StagePlan> {
 
         for op in &stage.ops {
             ids.insert(op.result_id);
-            for &arg in &op.args {
+            for arg in op.reads() {
                 mark(arg, &mut ids);
-            }
-
-            if op.tag == tags::PIVOT_THRESHOLD {
-                mark(op.pred_payload, &mut ids);
             }
         }
         for put in &stage.puts {

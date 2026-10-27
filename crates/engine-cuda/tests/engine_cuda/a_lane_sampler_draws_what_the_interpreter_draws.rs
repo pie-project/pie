@@ -195,6 +195,8 @@ fn draw_all(rank: bool, cases: &[(&str, Vec<f32>, f32, [u32; 2])]) -> (usize, us
                     ..Extents::default()
                 },
                 GeometryClass::Host,
+                eta_ir::registry::PortMask::NONE,
+                false,
                 &vec![None; count],
                 &ids,
                 context.stream(),

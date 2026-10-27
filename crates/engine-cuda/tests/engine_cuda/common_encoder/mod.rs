@@ -410,6 +410,7 @@ impl Rig {
                 channels: vec![latent, out],
                 seeds: Vec::new(),
                 geometry: GeometryClass::Host,
+                device_resolved: Default::default(),
                 extents: engine::program::BindExtents {
                     row_count: rows,
                     token_count: rows,

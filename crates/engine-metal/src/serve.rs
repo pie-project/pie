@@ -1303,10 +1303,11 @@ impl Shell {
         seeds: &[(u32, Vec<u8>)],
         extents: eta_exec::Extents,
         geometry: eta_ir::registry::GeometryClass,
+        device: eta_ir::registry::PortMask,
         channels: &[engine::ChannelId],
     ) -> Result<engine::InstanceId> {
         self.programs
-            .bind(&self.device, program_id, seeds, extents, geometry, channels)
+            .bind(&self.device, program_id, seeds, extents, geometry, device, channels)
     }
 
     pub fn register_shared_channel(

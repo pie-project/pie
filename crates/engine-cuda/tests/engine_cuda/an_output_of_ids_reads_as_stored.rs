@@ -86,6 +86,8 @@ fn an_output_of_ids_reads_as_stored() {
             &[],
             extents,
             GeometryClass::Host,
+            eta_ir::registry::PortMask::NONE,
+            false,
             &[None],
             &[ChannelId(1)],
             context.stream(),

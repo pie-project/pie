@@ -247,8 +247,13 @@ impl Session {
         self.rings.read_cell(channel as usize, sequence)
     }
 
-    pub fn envelope(&self, plan: &ExecPlan, class: GeometryClass) -> Result<Envelope> {
-        ports::resolve(plan, class, &self.rings, &self.cursors_now(), &self.shapes)
+    pub fn envelope(
+        &self,
+        plan: &ExecPlan,
+        class: GeometryClass,
+        device: eta_ir::registry::PortMask,
+    ) -> Result<Envelope> {
+        ports::resolve(plan, class, device, &self.rings, &self.cursors_now(), &self.shapes)
     }
 
     #[allow(clippy::too_many_arguments)]

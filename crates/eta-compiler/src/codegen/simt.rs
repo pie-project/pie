@@ -3,6 +3,7 @@
 //! says what differs between the compilers.
 
 pub mod fused;
+pub mod matmul;
 pub mod order;
 pub mod region_analysis;
 pub mod runtime;
@@ -14,6 +15,7 @@ pub use stream::spent_values;
 pub mod validate;
 
 pub use fused::emit_fused_region;
+pub use matmul::{emit_matmul_region, is_matmul_region};
 pub use order::{emit_order_region, is_order_region};
 pub use runtime::{Dialect, runtime_source};
 pub use scan::{emit_scan_region, is_scan_region};
@@ -35,6 +37,9 @@ pub fn emit_region(
     }
     if is_scan_region(stage, region) {
         return emit_scan_region(dialect, entry_name, stage, region);
+    }
+    if is_matmul_region(stage, region) {
+        return emit_matmul_region(dialect, entry_name, stage, region);
     }
     if sampler::is_sampler_region(stage, region) {
         return sampler::emit_sampler_region(dialect, entry_name, stage, region);

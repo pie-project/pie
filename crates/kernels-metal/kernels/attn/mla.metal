@@ -166,7 +166,8 @@ inline void mla_naive_paged_body(
     uint sg,
     threadgroup float* part_m,
     threadgroup float* part_l,
-    threadgroup float* part_acc) {
+    threadgroup float* part_acc,
+    device float* lse = nullptr) {
   const int h   = int(gid.x);
   const int row = int(gid.y);
   const int per  = ckv / 32;
@@ -245,6 +246,11 @@ inline void mla_naive_paged_body(
   const float inv = (L > 0.0f) ? (1.0f / L) : 0.0f;
   device bfloat* orow = o + (size_t(row) * heads + h) * size_t(ckv);
   for (int i = 0; i < per; ++i) orow[lane + i * 32] = bfloat(out[i] * inv);
+  // The log-sum-exp a sink rescales by, base 2 as the sink reads it.
+  if (lse != nullptr && lane == 0) {
+    lse[size_t(row) * size_t(heads) + size_t(h)] =
+        (L > 0.0f) ? (M + precise::log(L)) * 1.4426950408889634f : -INFINITY;
+  }
 }
 
 [[kernel]] void mla_naive_paged_bfloat16(
@@ -302,4 +308,34 @@ inline void mla_naive_paged_body(
                        req_of_token, kv_page_indices, kv_page_indptr, selection,
                        top_k, page_size, heads, ckv, kpe, sm_scale, gid, lane, sg,
                        part_m, part_l, part_acc);
+}
+
+[[kernel]] void mla_naive_paged_selected_lse_bfloat16(
+    const device bfloat* q_nope     [[buffer(0)]],
+    const device bfloat* q_pe       [[buffer(1)]],
+    const device bfloat* ckv_pages  [[buffer(2)]],
+    const device bfloat* kpe_pages  [[buffer(3)]],
+    device bfloat* o                [[buffer(4)]],
+    const device int* position_ids  [[buffer(5)]],
+    const device int* req_of_token  [[buffer(6)]],
+    const device uint* kv_page_indices [[buffer(7)]],
+    const device uint* kv_page_indptr  [[buffer(8)]],
+    const constant int& page_size   [[buffer(9)]],
+    const constant int& heads       [[buffer(10)]],
+    const constant int& ckv         [[buffer(11)]],
+    const constant int& kpe         [[buffer(12)]],
+    const constant float& sm_scale  [[buffer(13)]],
+    const device int* selection     [[buffer(14)]],
+    const constant int& top_k       [[buffer(15)]],
+    device float* lse               [[buffer(16)]],
+    uint2 gid   [[threadgroup_position_in_grid]],
+    uint lane   [[thread_index_in_simdgroup]],
+    uint sg     [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float part_m[kMlaSplit];
+  threadgroup float part_l[kMlaSplit];
+  threadgroup float part_acc[kMlaSplit * kMaxCkvPer * 32];
+  mla_naive_paged_body(q_nope, q_pe, ckv_pages, kpe_pages, o, position_ids,
+                       req_of_token, kv_page_indices, kv_page_indptr, selection,
+                       top_k, page_size, heads, ckv, kpe, sm_scale, gid, lane, sg,
+                       part_m, part_l, part_acc, lse);
 }

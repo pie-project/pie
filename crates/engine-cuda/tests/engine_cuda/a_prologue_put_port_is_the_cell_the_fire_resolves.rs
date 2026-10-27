@@ -13,7 +13,7 @@ use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
 use eta_ir::op::Op;
-use eta_ir::registry::{GeometryClass, Port, Stage};
+use eta_ir::registry::{GeometryClass, Port, PortMask, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Literal, Shape};
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Weight, ops};
 use poem_compiler::Budget;
@@ -166,6 +166,7 @@ fn bind(shell: &mut Shell) -> engine::InstanceId {
                 ..Extents::default()
             },
             GeometryClass::DecodeEnvelope,
+            PortMask::of(&[Port::EmbedTokens, Port::Positions]),
             &vec![None; count],
             &ids,
         )

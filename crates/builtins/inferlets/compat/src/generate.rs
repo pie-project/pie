@@ -412,7 +412,10 @@ async fn score_prompt(
         .outputs
         .iter()
         .find(|output| output.name == "logits")
-        .map_or(1, |output| output.max_rows);
+        .map_or(1, |output| output.max_rows)
+        // The epilogue holds several `[rows, vocab]` f32 planes: a pass reads at
+        // most 2^25 cells of each, so its scratch stays within one device buffer.
+        .min(((1u32 << 25) / vocab.max(1)).max(1));
     let mut scored = Vec::with_capacity(rows as usize);
     for &(base, end) in readout_spans(rows, max).iter() {
         let len = end - base;

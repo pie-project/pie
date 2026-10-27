@@ -83,6 +83,12 @@ impl FrameShell for Shell {
             }
         }
 
+        // The lanes an attachment's pass spans.
+        let span = |attached: &super::Attached| {
+            let first = (attached.lane as usize).min(lanes.len());
+            let end = first.saturating_add(attached.lanes as usize).min(lanes.len());
+            &lanes[first..end]
+        };
         let can_runahead = self.runahead.runs_ahead()
             && attachments.iter().all(|attached| {
                 match self.programs.geometry_of(attached.instance) {
@@ -91,6 +97,7 @@ impl FrameShell for Shell {
                         self.programs
                             .token_device_source(attached.instance)
                             .is_some()
+                            && !self.programs.reads_mask_on_host(attached.instance)
                             && lanes.get(attached.lane as usize).is_some_and(|seated| {
                                 seated.lane.tokens.len() == 1
                                     && !matches!(
@@ -139,32 +146,80 @@ impl FrameShell for Shell {
         let mut token_src_of: Vec<Option<(u64, u32)>> = vec![None; lanes.len()];
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
         let mut fold_at: Vec<Option<u64>> = vec![None; lanes.len()];
+        // A decode envelope's mask the device carries: each lane's rows of its
+        // cell, `(address, keys)` in bool bytes a row.
+        let mut mask_src_of: Vec<Option<(u64, u32)>> = vec![None; lanes.len()];
+        // The lanes whose positions the program computes on the device.
+        let mut positions_on_device = vec![false; lanes.len()];
         for attached in attachments {
             let first = attached.lane as usize;
             let src = self.programs.token_device_source(attached.instance);
-            if can_runahead
-                && self.programs.geometry_of(attached.instance)
-                    == Some(eta_ir::registry::GeometryClass::DecodeEnvelope)
+            let envelope_class = self.programs.geometry_of(attached.instance)
+                == Some(eta_ir::registry::GeometryClass::DecodeEnvelope);
+            let spanned = span(attached);
+            if self
+                .programs
+                .resolves(attached.instance, eta_ir::registry::Port::Positions)
             {
-                if let Some((src, native)) = src {
-                    let mut at = 0u32;
-                    let mut slices = Vec::new();
-                    for (lane, seated) in lanes.iter().enumerate().skip(first) {
-                        let bytes = seated.lane.tokens.len() as u32 * 4;
-                        if at >= native || at + bytes > native {
-                            break;
-                        }
-                        slices.push((lane, (src + u64::from(at), bytes)));
-                        at += bytes;
-                    }
-                    if at == native {
-                        for (lane, slice) in slices {
-                            token_src_of[lane] = Some(slice);
-                        }
-                    } else if first < lanes.len() {
-                        token_src_of[first] = Some((src, native));
-                    }
+                positions_on_device[first..first + spanned.len()].fill(true);
+            }
+            // A decode envelope's device-carried tokens span the lanes of its
+            // pass, a lane's rows each; a class that places its own lanes
+            // carries them whole, at its first.
+            if !envelope_class {
+                if first < lanes.len() {
+                    token_src_of[first] = src;
                 }
+            } else if let Some((src, native)) = src {
+                let rows: u32 = spanned
+                    .iter()
+                    .map(|seated| seated.lane.tokens.len() as u32)
+                    .sum();
+                if rows * 4 != native {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "instance {} carries {} token(s) on the device and its pass's {} \
+                             lane(s) carry {rows} row(s); a decode envelope's tokens span its \
+                             lanes' rows",
+                            attached.instance,
+                            native / 4,
+                            spanned.len()
+                        ),
+                    ));
+                }
+                let mut at = 0u32;
+                for (lane, seated) in spanned.iter().enumerate() {
+                    let bytes = seated.lane.tokens.len() as u32 * 4;
+                    token_src_of[first + lane] = Some((src + u64::from(at), bytes));
+                    at += bytes;
+                }
+            }
+            if let Some((mask_src, native)) = self.programs.mask_device_source(attached.instance) {
+                let rows: u32 = spanned
+                    .iter()
+                    .map(|seated| seated.lane.tokens.len() as u32)
+                    .sum();
+                if rows == 0 || native % rows != 0 {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "instance {} carries its attention mask on the device in a \
+                             {native}-byte cell and its {} lane(s) carry {rows} row(s); a \
+                             mask holds a row of keys a row",
+                            attached.instance,
+                            spanned.len()
+                        ),
+                    ));
+                }
+                let keys = native / rows;
+                let mut at = 0u32;
+                for (lane, seated) in spanned.iter().enumerate() {
+                    mask_src_of[first + lane] = Some((mask_src + u64::from(at * keys), keys));
+                    at += seated.lane.tokens.len() as u32;
+                }
+            }
+            if can_runahead && envelope_class {
                 if first < lanes.len() {
                     fold_at[first] = self
                         .programs
@@ -464,15 +519,14 @@ impl FrameShell for Shell {
             })
             .min()
             .unwrap_or_else(|| poem_compiler::arena::readouts_ceiling(&self.budget));
-        let readout_extent = readout_extent(
+        let received = !self.compiled.expert.is_empty();
+        let launched = super::launched_rows(
+            self.pad,
+            received,
             composition.rows(),
-            if self.pad {
-                composition.bucket()
-            } else {
-                composition.rows()
-            },
-            readout_rows.len(),
+            composition.bucket(),
         );
+        let readout_extent = readout_extent(composition.rows(), launched, readout_rows.len());
         if readout_extent > readouts_ceiling {
             return Err(Fault::Ceiling {
                 what: "rows one fire reads out through its readout plane",
@@ -682,21 +736,28 @@ impl FrameShell for Shell {
             )?
         };
 
+        // The patch rows the fire launches over, the padded ones inert.
+        let patch_rows = super::launched_rows(
+            self.pad,
+            false,
+            composition.patch_rows(),
+            composition.patch_bucket(),
+        ) as usize;
         let (patch_payload, patch_segments, patch_routes, patch_positions, patch_grids) =
             if composition.patch_rows() == 0 {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
             } else {
                 let stride = row_bytes as usize;
-                let mut payload = vec![0u8; composition.patch_rows() as usize * stride];
+                let mut payload = vec![0u8; patch_rows * stride];
                 let mut routes = vec![
                     if self.drops_patch_rows {
                         PATCH_ROUTE_DROP
                     } else {
                         0
                     };
-                    composition.patch_rows() as usize
+                    patch_rows
                 ];
-                let mut positions = vec![0i32; composition.patch_rows() as usize * MROPE_COORDS];
+                let mut positions = vec![0i32; patch_rows * MROPE_COORDS];
                 let fold = (self.patch_fold as usize).max(1);
                 let mut grids = vec![0i32; composition.images() as usize * MROPE_COORDS];
                 let mut per_image = vec![0u32; composition.images() as usize];
@@ -761,6 +822,17 @@ impl FrameShell for Shell {
         if any_adapter {
             adapter_routes.reserve(rows as usize);
         }
+        // A lane whose mask the device carries stages a cleared row of keys
+        // its cell's bits are packed over.
+        let carried_masks: Vec<Option<Masking>> = mask_src_of
+            .iter()
+            .map(|carried| {
+                carried
+                    .map(|(_, keys)| Masking::Extent(engine::Mask::new(vec![keys], u64::from(keys))))
+            })
+            .collect();
+        // `(the lane's index in masks, its row of the device cell, keys)`.
+        let mut pending_mask_injects: Vec<(usize, u64, u32)> = Vec::new();
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
@@ -840,8 +912,50 @@ impl FrameShell for Shell {
             let masking = if seated.kv_less {
                 None
             } else {
-                device_masks[source].as_ref().or(seated.mask)
+                device_masks[source]
+                    .as_ref()
+                    .or(seated.mask)
+                    .or(carried_masks[source].as_ref())
             };
+            // A port has one source: the runtime states a mask it resolved, and
+            // the engine resolves only one the program computes on the device.
+            if !seated.kv_less
+                && seated.mask.is_some()
+                && (device_masks[source].is_some() || carried_masks[source].is_some())
+            {
+                return Err(Fault::program(
+                    "serve::prepare",
+                    format!(
+                        "lane {source} states an attention mask and its program computes one \
+                         on the device; a port is resolved by one side"
+                    ),
+                ));
+            }
+            if positions_on_device[source] && !seated.positions.is_empty() {
+                return Err(Fault::program(
+                    "serve::prepare",
+                    format!(
+                        "lane {source} states positions and its program computes them on the \
+                         device; a port is resolved by one side"
+                    ),
+                ));
+            }
+            if !seated.kv_less
+                && let Some((src, _)) = mask_src_of[source]
+            {
+                if row.rows != 1 {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "lane {source} carries its attention mask on the device and {} \
+                             query rows; a row's keys are packed as its cell holds them, with \
+                             no causal bound, so only a lane's one row reads them",
+                            row.rows
+                        ),
+                    ));
+                }
+                pending_mask_injects.push((masks.len(), src, have.saturating_add(row.rows)));
+            }
             let runs_masked_arm = self.masked.contains(row.class as usize);
             if masking.is_some() && self.masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
@@ -1009,6 +1123,9 @@ impl FrameShell for Shell {
                     for &token in ports.tokens_for(rows_here)? {
                         tokens.push(token as i32);
                     }
+                    // One source a port: positions the runtime resolved ride the
+                    // lane (checked above), and the envelope carries only ones
+                    // the program computes on the device.
                     match ports.positions_for(have, rows_here)? {
                         Some(stated) => positions.extend(stated.iter().map(|&p| p as i32)),
                         None if !seated.positions.is_empty() => {
@@ -1302,6 +1419,17 @@ impl FrameShell for Shell {
         super::btrace::mark("windows_of");
 
         let staged = crate::mask::stage(&masks)?;
+        let mask_injects: Vec<crate::inputs::MaskInject> = match &staged {
+            Some(staged) => pending_mask_injects
+                .iter()
+                .map(|&(at, src, bits)| crate::inputs::MaskInject {
+                    dst_off: staged.indptr[at] as u64,
+                    src,
+                    bits,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         super::btrace::mark("mask");
 
         let totals = poem_ir::PerAxis::from_fn(|axis| composition.axis(axis).rows);
@@ -1350,17 +1478,18 @@ impl FrameShell for Shell {
         let readout_live = readout_rows.len() as u32;
         if bodied {
             readout_rows.resize(readout_ceiling as usize, 0);
+        } else {
+            // An eager fire's readout rows are carved to what its readout
+            // launches over (`readout_extent`), the padded ones row 0.
+            readout_rows.resize(readout_rows.len().max(readout_extent as usize), 0);
         }
 
         if arming {
             self.armed_body = bodied.then(|| key.clone());
         }
 
-        let carve_rows = if bodied || !self.compiled.expert.is_empty() {
-            composition.bucket().max(composition.rows())
-        } else {
-            composition.rows()
-        };
+        // Every per-row table is carved to the rows the fire launches over.
+        let carve_rows = launched;
         let mut lane_of_row: Vec<i32> = Vec::with_capacity(carve_rows as usize);
         for (fire_lane, row) in composition.lanes().iter().enumerate() {
             lane_of_row.extend(std::iter::repeat_n(fire_lane as i32, row.rows as usize));
@@ -1487,6 +1616,7 @@ impl FrameShell for Shell {
             slot: Some(slot),
             lengths: staged_lens,
             token_injects,
+            mask_injects,
             kv_reports,
             bodied,
             admits,

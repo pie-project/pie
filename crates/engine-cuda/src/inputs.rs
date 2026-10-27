@@ -360,6 +360,15 @@ pub struct TokenInject {
     pub bytes: usize,
 }
 
+/// A lane's device-carried attention mask: the `bits` bool bytes at `src`
+/// packed into its row of the staged mask, `dst_off` bytes in.
+#[derive(Clone, Copy, Debug)]
+pub struct MaskInject {
+    pub dst_off: u64,
+    pub src: u64,
+    pub bits: u32,
+}
+
 /// The fewest device-carried token runs one gather launch takes; under it
 /// each is copied on its own.
 const GATHERED_INJECTS: usize = 4;
@@ -429,6 +438,52 @@ fn gather_injects(
     Ok(())
 }
 
+/// Packs each lane's device-carried mask into its row of the staged mask at
+/// `mask`: past a few lanes in one gather launch over a staged run table,
+/// one launch each inside a stream capture.
+fn inject_masks(
+    device: &crate::device::Context,
+    runs: &mut Option<Buffer>,
+    mask: u64,
+    injects: &[MaskInject],
+) -> Result<()> {
+    let stream = device.stream();
+    if injects.len() < GATHERED_INJECTS || crate::device::alloc::is_capturing(stream) {
+        for inject in injects {
+            kernels_cuda::runtime::channel::gather_bits(
+                device.ctx(),
+                inject.src,
+                mask + inject.dst_off,
+                inject.bits,
+            )?;
+        }
+        return Ok(());
+    }
+    let table: Vec<kernels_cuda::runtime::channel::BitRun> = injects
+        .iter()
+        .map(|inject| kernels_cuda::runtime::channel::BitRun {
+            src: inject.src,
+            dst_byte: u32::try_from(inject.dst_off).unwrap_or(u32::MAX),
+            bits: inject.bits,
+        })
+        .collect();
+    let bytes = table.len() * size_of::<kernels_cuda::runtime::channel::BitRun>();
+    if runs.as_ref().is_none_or(|held| held.bytes() < bytes) {
+        *runs = Some(Buffer::zeroed(bytes.next_power_of_two())?);
+    }
+    let held = runs.as_mut().expect("sized just above");
+    // SAFETY: `BitRun` is plain `repr(C)` data, read as its bytes.
+    let raw = unsafe { core::slice::from_raw_parts(table.as_ptr().cast::<u8>(), bytes) };
+    held.stage(stream, 0, raw)?;
+    kernels_cuda::runtime::channel::gather_bit_runs(
+        device.ctx(),
+        held.ptr(),
+        mask,
+        u32::try_from(table.len()).unwrap_or(u32::MAX),
+    )?;
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Inputs {
     store: Buffer,
@@ -465,6 +520,8 @@ pub struct Inputs {
     plans: Vec<Option<Workspace>>,
     plan_values: usize,
     inject_runs: Option<Buffer>,
+    /// The staged run table of [`inject_masks`].
+    mask_runs: Option<Buffer>,
     /// Staged apart from the slab: their size is the groups', not the load's.
     group_masks: Option<Buffer>,
     /// Smaller ones it outgrew, kept: an earlier fire may still read them.
@@ -647,6 +704,7 @@ impl Inputs {
             max_lanes: crate::window::lane_capacity(budget.max_lanes),
             max_rows: budget.max_tokens,
             inject_runs: None,
+            mask_runs: None,
             group_masks: None,
             outgrown: Vec::new(),
             plan_values: grants.len(),
@@ -1107,6 +1165,7 @@ impl Inputs {
         slot: &SlotGuard,
         staged: &Staged,
         token_injects: &[TokenInject],
+        mask_injects: &[MaskInject],
     ) -> Result<Handles> {
         let Staged {
             rows,
@@ -1143,6 +1202,7 @@ impl Inputs {
             store,
             staging,
             inject_runs,
+            mask_runs,
             ..
         } = self;
         let host = staging[slot.at() as usize].host();
@@ -1210,6 +1270,15 @@ impl Inputs {
         unsafe { store.stage_batch_from(stream, &spans)? };
 
         inject_tokens(device, inject_runs, base + at_tokens, token_injects)?;
+        if !mask_injects.is_empty() && mask_bytes.is_none() {
+            return Err(crate::error::Fault::program(
+                "inputs::commit",
+                "a lane's attention mask is carried on the device and the fire stages no mask \
+                 to pack it into",
+            ));
+        }
+        // Over the cleared rows just staged, in stream order.
+        inject_masks(device, mask_runs, base + at_mask, mask_injects)?;
 
         Ok(Handles {
             tokens: i32s(base + at_tokens, rows),

@@ -146,6 +146,8 @@ fn a_verify_lands_what_the_point_rule_reads() {
                     ..Extents::default()
                 },
                 GeometryClass::Host,
+                eta_ir::registry::PortMask::NONE,
+                false,
                 &vec![None; count],
                 &ids,
                 context.stream(),

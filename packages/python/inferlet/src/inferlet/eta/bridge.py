@@ -356,14 +356,14 @@ class Pipeline:
         Returns the run count."""
         if budget == 0:
             return 0
-        # Live slots per frame. A pass that binds a dense device mask takes one;
-        # so does a pass on a model with recurrent state, whose frame's waves
-        # carry the same sequence's state one into the next (a frame of one
-        # live slot measured faster than a full one on Qwen3.5-0.8B), and a
-        # pass off its model's default path (a canvas redrawn whole), which
-        # redraws what the last wrote. Any other pass fills the frame.
-        single = fwd.binds_device_mask() or _rs_state_size() > 0 or fwd.switched()
-        r = 1 if single else frame_size()
+        # Every slot of a frame is its own fire: the runtime advances the
+        # pass's host shadow and its working sets' cursors (recurrent state
+        # included) fire by fire, so a mask or a recurrent state fills the
+        # frame like any decode. A pass off its model's default path (a canvas
+        # redrawn whole, a drafter block) posts one fire at a time: no model
+        # served here runs one under run-ahead, so its frame shape has never
+        # been measured.
+        r = 1 if fwd.switched() else frame_size()
         window_frames = max(_wit_model.run_ahead_window() // max(r, 1), 1)
         submitted = 0
         consumed = 0
@@ -457,11 +457,6 @@ def kv_page_size() -> int:
     return _wit_model.kv_page_size()
 
 
-@functools.cache
-def _rs_state_size() -> int:
-    return _wit_model.rs_state_size()
-
-
 def _even_spans(n: int, cap: int) -> list[tuple[int, int]]:
     if n == 0:
         return []
@@ -541,9 +536,6 @@ class ForwardPass:
         for p in ports:
             if p in bound:
                 raise InferletError(f"forward pass port {p.wire_name} is already bound")
-
-    def binds_device_mask(self) -> bool:
-        return any(p == Port.ATTN_MASK for p, _ in self._ports)
 
     def embed(self, tokens: Channel | Sequence[int], indptr: Channel | Sequence[int] | None = None) -> None:
         """Bind token ids and the CSR row indptr. A token list becomes an i32

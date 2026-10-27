@@ -494,6 +494,7 @@ fn selected(
     sm_scale: f32,
     ratio: u32,
     selection: Tensor,
+    per_head: bool,
     o: Tensor,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.dtype, { Bf16 => () });
@@ -518,6 +519,21 @@ fn selected(
     let shape = Paged::of(op, q, pool, None, true, head_dim)?;
     let ratio = nonzero(op, "the block width this reader expands", ratio)?;
     let top_k = nonzero(op, "the selection budget", selection.width)?;
+    // One run per kv head: each head's budget is its share of the row.
+    let top_k = if per_head {
+        if !top_k.is_multiple_of(shape.kv_heads) {
+            return Err(refuse(
+                op,
+                format!(
+                    "a {top_k}-wide selection is not one run per each of {} kv heads",
+                    shape.kv_heads
+                ),
+            ));
+        }
+        top_k / shape.kv_heads
+    } else {
+        top_k
+    };
     if selection.rows < shape.rows {
         return Err(refuse(
             op,
@@ -553,6 +569,7 @@ fn selected(
             selection.arg(),
             stated(op, top_k)?.arg(),
             stated(op, ratio)?.arg(),
+            i32::from(per_head).arg(),
         ],
     )
 }
@@ -568,6 +585,7 @@ pub fn decode_selected(
     head_dim: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
     o: Tensor,
 ) -> Result<(), Error> {
     selected(
@@ -585,6 +603,7 @@ pub fn decode_selected(
         sm_scale,
         ratio,
         selection,
+        per_head,
         o,
     )
 }
@@ -601,6 +620,7 @@ pub fn prefill_selected(
     kv_heads: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
     o: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.prefill";
@@ -620,6 +640,7 @@ pub fn prefill_selected(
         sm_scale,
         ratio,
         selection,
+        per_head,
         o,
     )
 }
@@ -870,8 +891,10 @@ pub fn sink(
     head_dim: u32,
 ) -> Result<(), Error> {
     const OP: &str = "attn.sink";
-    let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "attn_sink_rescale_bfloat16" });
-    if sink.dtype != o.dtype {
+    let mut entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "attn_sink_rescale_bfloat16" });
+    if sink.dtype == Dtype::F32 {
+        entry = "attn_sink_rescale_bfloat16_f32";
+    } else if sink.dtype != o.dtype {
         return Err(Error::DtypeUnsupported {
             op: OP,
             dtype: sink.dtype,
@@ -1192,6 +1215,7 @@ mod tests {
             HEAD_DIM,
             0.125,
             4,
+            false,
             bf16(12, 2, Q_HEADS * HEAD_DIM),
         )
         .expect_err("a window and a selection are two answers to one question");
@@ -1211,6 +1235,7 @@ mod tests {
             HEAD_DIM,
             0.125,
             0,
+            false,
             bf16(12, 2, Q_HEADS * HEAD_DIM),
         )
         .expect_err("a zero block width names no cells");
@@ -1230,6 +1255,7 @@ mod tests {
             HEAD_DIM,
             0.125,
             4,
+            false,
             bf16(12, 4, Q_HEADS * HEAD_DIM),
         )
         .expect_err("two selection rows do not seat four query rows");
@@ -1557,11 +1583,21 @@ pub mod mla {
         kv_lora_rank: u32,
         sm_scale: f32,
         o: Tensor,
+        lse: Option<Tensor>,
     ) -> Result<(), Error> {
-        let entry = match selection {
-            None => dtype_dispatch!(op, q.dtype, { Bf16 => "mla_naive_paged_bfloat16" }),
-            Some(_) => {
+        let entry = match (selection, lse) {
+            (None, None) => dtype_dispatch!(op, q.dtype, { Bf16 => "mla_naive_paged_bfloat16" }),
+            (Some(_), None) => {
                 dtype_dispatch!(op, q.dtype, { Bf16 => "mla_naive_paged_selected_bfloat16" })
+            }
+            (Some(_), Some(_)) => {
+                dtype_dispatch!(op, q.dtype, { Bf16 => "mla_naive_paged_selected_lse_bfloat16" })
+            }
+            (None, Some(_)) => {
+                return Err(refuse(
+                    op,
+                    "a log-sum-exp is landed for a selection's keys alone",
+                ));
             }
         };
         if pool.page_size <= 0 {
@@ -1622,6 +1658,13 @@ pub mod mla {
             args.push(selection.arg());
             args.push(stated(op, selection.width)?.arg());
         }
+        if let Some(lse) = lse {
+            debug_assert!(
+                lse.dtype == Dtype::F32 && lse.rows == o.rows && lse.width == heads,
+                "the log-sum-exp is f32, one per query row and head"
+            );
+            args.push(lse.arg_mut());
+        }
         ctx.fire(
             Fire::at(FILE, entry).apply(Grid::of(
                 [heads * SIMD * MLA_SPLIT, rows, 1],
@@ -1672,6 +1715,7 @@ pub mod mla {
             kv_lora_rank,
             sm_scale,
             o,
+            None,
         )
     }
 
@@ -1701,6 +1745,7 @@ pub mod mla {
             kv_lora_rank,
             sm_scale,
             o,
+            None,
         )
     }
 
@@ -1717,6 +1762,7 @@ pub mod mla {
         kv_lora_rank: u32,
         sm_scale: f32,
         o: Tensor,
+        lse: Option<Tensor>,
     ) -> Result<(), Error> {
         flash(
             ctx,
@@ -1731,6 +1777,7 @@ pub mod mla {
             kv_lora_rank,
             sm_scale,
             o,
+            lse,
         )
     }
 
@@ -1747,6 +1794,7 @@ pub mod mla {
         kv_lora_rank: u32,
         sm_scale: f32,
         o: Tensor,
+        lse: Option<Tensor>,
     ) -> Result<(), Error> {
         flash(
             ctx,
@@ -1761,6 +1809,7 @@ pub mod mla {
             kv_lora_rank,
             sm_scale,
             o,
+            lse,
         )
     }
 
@@ -1898,6 +1947,7 @@ pub mod mla {
                 RANK,
                 0.5,
                 bf16(3, 2, HEADS * RANK),
+                None,
             )
             .expect_err("one selection row does not serve two query rows");
             assert!(format!("{why}").contains("one row per query row"), "{why}");
@@ -1919,6 +1969,7 @@ pub mod mla {
                 500,
                 0.5,
                 bf16(3, 1, HEADS * 500),
+                None,
             )
             .expect_err("500 is not a multiple of 32");
             assert!(format!("{why}").contains("lane-split"), "{why}");
@@ -2130,6 +2181,193 @@ pub mod index {
         ratio: u32,
         selection: Tensor,
     ) -> Result<(), Error> {
+        ranked(
+            ctx,
+            q,
+            weights,
+            keys,
+            positions,
+            request_of_token,
+            scores,
+            heads,
+            head_dim,
+            top_k,
+            ratio,
+            selection,
+            top_k,
+        )
+    }
+
+    /// [`topk`]'s blocks read back as the tokens each stands for, then the
+    /// row's own open block's (`top_k * ratio + ratio - 1` a row, -1 unused):
+    /// `attn.index_topk` scored `pooled_tokens`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn topk_tokens(
+        ctx: &Ctx<'_>,
+        q: Tensor,
+        weights: Option<Tensor>,
+        keys: &KvPool,
+        positions: Tensor,
+        request_of_token: Tensor,
+        scores: Tensor,
+        heads: u32,
+        head_dim: u32,
+        top_k: u32,
+        ratio: u32,
+        selection: Tensor,
+    ) -> Result<(), Error> {
+        const OP: &str = "attn.index_topk";
+        let ratio = nonzero(OP, "the key stride this ranking states", ratio)?;
+        let width = top_k
+            .checked_mul(ratio)
+            .and_then(|w| w.checked_add(ratio - 1))
+            .ok_or_else(|| refuse(OP, "the token selection's width overflows"))?;
+        if selection.width != width {
+            return Err(refuse(
+                OP,
+                format!(
+                    "a {top_k}-block selection at ratio {ratio} reads back as {width} tokens, \
+                     not {}",
+                    selection.width
+                ),
+            ));
+        }
+        // The blocks land at the head of each token row, read back in place.
+        ranked(
+            ctx,
+            q,
+            weights,
+            keys,
+            positions,
+            request_of_token,
+            scores,
+            heads,
+            head_dim,
+            top_k,
+            ratio,
+            Tensor::new(selection.buf, selection.rows, top_k, Dtype::I32),
+            width,
+        )?;
+        let rows = nonzero(OP, "rows", selection.rows)?;
+        ctx.fire(
+            Fire::at(FILE, "index_pool_tokens").apply(Grid::of(
+                [rows.div_ceil(K_BLOCK) * K_BLOCK, 1, 1],
+                [K_BLOCK, 1, 1],
+            )),
+            &[
+                selection.arg_mut(),
+                positions.arg(),
+                stated(OP, rows)?.arg(),
+                stated(OP, top_k)?.arg(),
+                stated(OP, ratio)?.arg(),
+            ],
+        )
+    }
+
+    /// Each row's blocks, one run of `top_k` per head (`attn.index_topk`
+    /// scored `block_max`): a block scores the best `q_h.k` among its keys the
+    /// row sees, the row's own block always kept, ascending, -1 past the end.
+    #[allow(clippy::too_many_arguments)]
+    pub fn topk_block_max(
+        ctx: &Ctx<'_>,
+        q: Tensor,
+        keys: &KvPool,
+        positions: Tensor,
+        request_of_token: Tensor,
+        scores: Tensor,
+        heads: u32,
+        head_dim: u32,
+        top_k: u32,
+        block: u32,
+        selection: Tensor,
+    ) -> Result<(), Error> {
+        const OP: &str = "attn.index_topk";
+        let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "index_topk_block_max_bfloat16" });
+        let heads = nonzero(OP, "the head count this ranking states", heads)?;
+        let head_dim = nonzero(OP, "the key width this ranking states", head_dim)?;
+        let top_k = nonzero(OP, "the selection budget this ranking states", top_k)?;
+        let block = nonzero(OP, "the block width this ranking scores", block)?;
+        if heads > 8 || !head_dim.is_multiple_of(32) || head_dim / 32 > 8 {
+            return Err(refuse(
+                OP,
+                format!(
+                    "a block-max ranking holds at most 8 heads of a multiple of 32 up to 256 \
+                     wide, not {heads} of {head_dim}"
+                ),
+            ));
+        }
+        if keys.page_size <= 0 {
+            return Err(refuse(OP, "the index cache page size is zero"));
+        }
+        pool_pitch(OP, keys, head_dim)?;
+        if q.width != heads.saturating_mul(head_dim) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the {}-wide index query does not divide by the stated head count and \
+                     width",
+                    q.width
+                ),
+            ));
+        }
+        if selection.width != heads.saturating_mul(top_k) {
+            return Err(refuse(
+                OP,
+                "the selection this statement allocated is not one budget per head",
+            ));
+        }
+        let rows = nonzero(OP, "rows", selection.rows)?;
+        // Each head's block scores sit in the row's score slab, `blocks` apart.
+        let slab = nonzero(OP, "the score slab's key stride", scores.width)?;
+        let blocks = (slab - 1) / block + 1;
+        if scores.rows < rows || blocks.saturating_mul(heads) > slab {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the score slab seats {} rows of {slab} and this ranking launches {rows} \
+                     of {heads} x {blocks}",
+                    scores.rows
+                ),
+            ));
+        }
+        ctx.fire(
+            Fire::at(FILE, entry).apply(Grid::of([K_BLOCK, rows, 1], [K_BLOCK, 1, 1])),
+            &[
+                q.arg(),
+                keys.keys.arg(),
+                positions.arg(),
+                request_of_token.arg(),
+                keys.page_indices.arg(),
+                keys.page_indptr.arg(),
+                scores.arg_mut(),
+                selection.arg_mut(),
+                stated(OP, heads)?.arg(),
+                stated(OP, head_dim)?.arg(),
+                keys.page_size.arg(),
+                stated(OP, slab)?.arg(),
+                stated(OP, blocks)?.arg(),
+                stated(OP, top_k)?.arg(),
+                stated(OP, block)?.arg(),
+            ],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ranked(
+        ctx: &Ctx<'_>,
+        q: Tensor,
+        weights: Option<Tensor>,
+        keys: &KvPool,
+        positions: Tensor,
+        request_of_token: Tensor,
+        scores: Tensor,
+        heads: u32,
+        head_dim: u32,
+        top_k: u32,
+        ratio: u32,
+        selection: Tensor,
+        row_stride: u32,
+    ) -> Result<(), Error> {
         const OP: &str = "attn.index_topk";
         let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "index_topk_paged_bfloat16" });
         debug_assert_eq!(
@@ -2149,7 +2387,7 @@ pub mod index {
         if keys.page_size <= 0 {
             return Err(refuse(OP, "the index cache page size is zero"));
         }
-        pool_pitch(OP, keys, head_dim)?;
+        let pitch = super::pool::pitch(OP, keys, head_dim)?;
         if q.width != heads.saturating_mul(head_dim) {
             return Err(refuse(
                 OP,
@@ -2202,6 +2440,8 @@ pub mod index {
                 stated(OP, top_k)?.arg(),
                 stated(OP, ratio)?.arg(),
                 i32::from(weights.is_some()).arg(),
+                stated(OP, row_stride)?.arg(),
+                pitch.arg(),
             ],
         )
     }
@@ -2550,6 +2790,74 @@ pub mod pool {
 
     const META_BLOCK: u32 = 128;
 
+    /// The pool's width a position: `row` itself, or a compact pool's
+    /// `row / div` (`div` positions to an entry, whole within a page).
+    pub(crate) fn pitch(op: &'static str, pool: &KvPool, row: u32) -> Result<i32, Error> {
+        let pitch = pool.seq_stride;
+        let row = u64::from(row);
+        let div = if pitch == 0 { 0 } else { row / pitch };
+        if pitch == 0
+            || row % pitch != 0
+            || div == 0
+            || pool.page_size <= 0
+            || u64::from(pool.page_size.unsigned_abs()) % div != 0
+        {
+            return Err(refuse(
+                op,
+                format!(
+                    "the pool's token pitch {pitch} does not pack the {row}-wide entry at {} a page",
+                    pool.page_size
+                ),
+            ));
+        }
+        stated(op, u32::try_from(pitch).unwrap_or(u32::MAX))
+    }
+
+    /// Each row's replay floor into `floors` (i32 a row): with `mark` the
+    /// position past its lane's last row, written to the lane's state too;
+    /// without, the floor the lane's state holds (`attn.replay_floor`).
+    pub fn replay_floor(
+        ctx: &Ctx<'_>,
+        positions: RaggedTensor,
+        state: &crate::tensor::RecurrentPool,
+        mark: bool,
+        floors: Tensor,
+    ) -> Result<(), Error> {
+        const OP: &str = "attn.replay_floor";
+        debug_assert_eq!(
+            positions.data.dtype,
+            Dtype::I32,
+            "`{OP}` reads i32 positions"
+        );
+        debug_assert_eq!(floors.dtype, Dtype::I32, "`{OP}` lands i32 floors");
+        let rows = positions.data.rows.min(floors.rows);
+        if rows == 0 {
+            return Ok(());
+        }
+        let lanes = positions.indptr.rows.saturating_sub(1);
+        let threads = if mark { lanes } else { rows };
+        if threads == 0 {
+            return Ok(());
+        }
+        ctx.fire(
+            Fire::at(FILE, "replay_floor").apply(Grid::of(
+                [threads.div_ceil(META_BLOCK) * META_BLOCK, 1, 1],
+                [META_BLOCK, 1, 1],
+            )),
+            &[
+                positions.data.arg(),
+                state.state.arg_mut(),
+                state.slots.arg(),
+                positions.indptr.arg(),
+                floors.arg_mut(),
+                stated(OP, state.state.width)?.arg(),
+                stated(OP, rows)?.arg(),
+                stated(OP, lanes)?.arg(),
+                i32::from(mark).arg(),
+            ],
+        )
+    }
+
     const ATTN_BLOCK: u32 = 128;
 
     const POOL_HEAD_MAX: u32 = 512;
@@ -2893,6 +3201,7 @@ pub mod pool {
                 pool.page_indptr.arg(),
                 stated(OP, head_dim)?.arg(),
                 pool.page_size.arg(),
+                pitch(OP, pool, head_dim)?.arg(),
             ],
         )
     }
@@ -2957,6 +3266,7 @@ pub mod pool {
                 ratio.arg(),
                 entries.page_size.arg(),
                 sm_scale.arg(),
+                pitch(OP, entries, head_dim)?.arg(),
             ],
         )
     }
@@ -3049,6 +3359,7 @@ pub mod pool {
                 stated(OP, top_k)?.arg(),
                 entries.page_size.arg(),
                 sm_scale.arg(),
+                pitch(OP, entries, head_dim)?.arg(),
             ],
         )
     }

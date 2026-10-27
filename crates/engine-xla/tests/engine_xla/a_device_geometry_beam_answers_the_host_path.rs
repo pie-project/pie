@@ -211,6 +211,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
             channels,
             seeds: Vec::new(),
             geometry: GeometryClass::DeviceGeometry,
+            device_resolved: Default::default(),
             extents: engine::program::BindExtents {
                 row_count: BEAMS,
                 token_count: BEAMS,

@@ -116,6 +116,7 @@ impl Plane {
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
         geometry: GeometryClass,
+        device: eta_ir::registry::PortMask,
         channels: &[ChannelId],
     ) -> Result<InstanceId> {
         let program = self
@@ -145,6 +146,7 @@ impl Plane {
                 program_id,
                 session,
                 geometry,
+                device,
                 shared: adopted,
                 ids: channels.to_vec(),
             },
@@ -285,7 +287,7 @@ impl Plane {
         })?;
         bound
             .session
-            .envelope(&program.plan, bound.geometry)
+            .envelope(&program.plan, bound.geometry, bound.device)
             .map(Some)
     }
 
@@ -590,6 +592,9 @@ struct Bound {
     program_id: ProgramId,
     session: Session,
     geometry: GeometryClass,
+    /// The ports the program computes on the device
+    /// (`engine::InstanceBinding::device_resolved`).
+    device: eta_ir::registry::PortMask,
     shared: Vec<Option<Arc<SharedRing>>>,
     ids: Vec<ChannelId>,
 }

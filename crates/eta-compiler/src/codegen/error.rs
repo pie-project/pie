@@ -6,6 +6,7 @@ pub enum EmitterKind {
     CudaFused,
     CudaOrder,
     CudaScan,
+    CudaMatMul,
     MetalReadiness,
     MetalCommit,
     MetalFused,
@@ -18,6 +19,7 @@ impl EmitterKind {
             EmitterKind::CudaFused => "CUDA fused",
             EmitterKind::CudaOrder => "CUDA order",
             EmitterKind::CudaScan => "CUDA scan",
+            EmitterKind::CudaMatMul => "CUDA matmul",
             EmitterKind::MetalReadiness => "readiness kernel",
             EmitterKind::MetalCommit => "commit kernel",
             EmitterKind::MetalFused => "fused region",
@@ -70,6 +72,7 @@ pub enum RegionForm {
     GroupedTopK,
     CudaOrder,
     CudaScan,
+    CudaMatMul,
     Unnamed,
 }
 
@@ -116,6 +119,7 @@ impl fmt::Display for EmitError {
                 RegionForm::GroupedTopK => f.write_str("TopK library node is out of range"),
                 RegionForm::CudaOrder => f.write_str("CUDA order library node is out of range"),
                 RegionForm::CudaScan => f.write_str("CUDA scan library node is out of range"),
+                RegionForm::CudaMatMul => f.write_str("CUDA matmul library node is out of range"),
                 RegionForm::GroupedNucleus | RegionForm::Unnamed => {
                     f.write_str("region node out of range")
                 }
@@ -128,6 +132,7 @@ impl fmt::Display for EmitError {
                 RegionForm::GroupedTopK => f.write_str("TopK library node is invalid"),
                 RegionForm::CudaOrder => f.write_str("CUDA order library node is invalid"),
                 RegionForm::CudaScan => f.write_str("CUDA scan library node is invalid"),
+                RegionForm::CudaMatMul => f.write_str("CUDA matmul library node is invalid"),
                 RegionForm::GroupedNucleus | RegionForm::Unnamed => {
                     f.write_str("region node indices are not strictly ordered")
                 }
@@ -141,6 +146,7 @@ impl fmt::Display for EmitError {
                 RegionForm::GroupedTopK => f.write_str("invalid grouped TopK library region"),
                 RegionForm::CudaOrder => f.write_str("invalid CUDA order library region"),
                 RegionForm::CudaScan => f.write_str("invalid CUDA scan library region"),
+                RegionForm::CudaMatMul => f.write_str("invalid CUDA matmul library region"),
                 RegionForm::Fused | RegionForm::Unnamed => {
                     f.write_str("library region ABI is invalid")
                 }

@@ -909,7 +909,7 @@ pub fn emit_streamed_region(
             continue;
         }
         if let Some(op) = ops.get(node.index()) {
-            for &arg in &op.args {
+            for arg in op.reads() {
                 *consumers.entry(alias.resolve(arg)).or_insert(0) += 1;
             }
         }
@@ -969,10 +969,7 @@ pub fn emit_streamed_region(
             continue;
         }
         let mut slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
-        let mut reads: Vec<u32> = op.args.iter().map(|&a| alias.resolve(a)).collect();
-        if op.tag == tags::PIVOT_THRESHOLD {
-            reads.push(alias.resolve(op.pred_payload));
-        }
+        let reads: Vec<u32> = op.reads().map(|a| alias.resolve(a)).collect();
         if op.tag == tags::OUTPUT {
             let single_row = key_of(base).len() <= 1;
             let mut body = String::new();

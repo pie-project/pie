@@ -189,31 +189,20 @@ impl Run<'_> {
                 self.tuning(),
                 &|rows, width| self.partials(rows, width),
             ),
-            Attn::Decode {
-                selection: Some(_),
-                bias: None,
-                selected: Some(poem_ir::Blocks { per_head: true, .. }),
-                lse: None,
-                ..
-            }
-            | Attn::Prefill {
-                mask: None,
-                selection: Some(_),
-                bias: None,
-                selected: Some(poem_ir::Blocks { per_head: true, .. }),
-                lse: None,
-                ..
-            }
-            | Attn::IndexTopk {
-                score: IndexScore::BlockMax,
-                ..
-            }
-            | Attn::IndexTopk {
-                score: IndexScore::PooledTokens,
-                ..
-            } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
-            // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
-            Attn::KvEnds { .. } | Attn::WindowSink { .. } | Attn::ReplayFloor { .. } => {
+            Attn::ReplayFloor {
+                positions,
+                state,
+                mark,
+                floor,
+            } => attn::pool::replay_floor(
+                self.ctx(),
+                self.ragged(*positions),
+                &self.recurrent(*state),
+                *mark,
+                self.tensor(*floor),
+            ),
+            // A DSpark stage's windows are served on CUDA.
+            Attn::KvEnds { .. } | Attn::WindowSink { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
             Attn::Decode {
@@ -226,11 +215,7 @@ impl Run<'_> {
                 sm_scale,
                 o,
                 bias: None,
-                selected:
-                    Some(poem_ir::Blocks {
-                        ratio,
-                        per_head: false,
-                    }),
+                selected: Some(poem_ir::Blocks { ratio, per_head }),
                 rel: None,
                 lse: None,
             } => attn::decode_selected(
@@ -243,6 +228,7 @@ impl Run<'_> {
                 *head_dim,
                 *sm_scale,
                 *ratio,
+                *per_head,
                 self.tensor(*o),
             ),
             Attn::Prefill {
@@ -259,11 +245,7 @@ impl Run<'_> {
                 bias: None,
                 floor: None,
                 causal: true,
-                selected:
-                    Some(poem_ir::Blocks {
-                        ratio,
-                        per_head: false,
-                    }),
+                selected: Some(poem_ir::Blocks { ratio, per_head }),
                 rel: None,
                 lse: None,
             } => attn::prefill_selected(
@@ -277,6 +259,7 @@ impl Run<'_> {
                 *kv_heads,
                 *sm_scale,
                 *ratio,
+                *per_head,
                 self.tensor(*o),
             ),
             Attn::Dense {
@@ -602,7 +585,7 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            // The per-head log-sum-exp a sink rescales by is landed on CUDA alone.
+            // The per-head log-sum-exp a sink rescales by is landed for a selection alone.
             Attn::MlaDecode {
                 lse: Some(_),
                 selection: None,
@@ -611,16 +594,6 @@ impl Run<'_> {
             | Attn::MlaPrefill {
                 lse: Some(_),
                 selection: None,
-                ..
-            }
-            | Attn::MlaDecode {
-                lse: Some(_),
-                selection: Some(_),
-                ..
-            }
-            | Attn::MlaPrefill {
-                lse: Some(_),
-                selection: Some(_),
                 ..
             } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Attn::MlaDecode {
@@ -703,7 +676,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-                lse: _,
+                lse,
                 window: None,
             } => {
                 let (positions, request_of_token) = {
@@ -722,6 +695,7 @@ impl Run<'_> {
                     *kv_lora_rank,
                     *sm_scale,
                     self.tensor(*o),
+                    lse.map(|lse| self.tensor(lse)),
                 )
             }
             Attn::MlaPrefill {
@@ -734,7 +708,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-                lse: _,
+                lse,
                 window: None,
             } => {
                 let (positions, request_of_token) = {
@@ -753,6 +727,7 @@ impl Run<'_> {
                     *kv_lora_rank,
                     *sm_scale,
                     self.tensor(*o),
+                    lse.map(|lse| self.tensor(lse)),
                 )
             }
 
@@ -869,7 +844,7 @@ impl Run<'_> {
                 head_dim,
                 top_k,
                 ratio,
-                score: IndexScore::Pooled,
+                score: score @ (IndexScore::Pooled | IndexScore::PooledTokens),
                 selection,
             } => {
                 let Some(scores) = self.index_scores() else {
@@ -879,7 +854,12 @@ impl Run<'_> {
                 };
                 let fire = self.bindings();
                 let (positions, request_of_token) = (fire.positions, fire.tables.request_of_token);
-                attn::index::topk(
+                let topk = if *score == IndexScore::PooledTokens {
+                    attn::index::topk_tokens
+                } else {
+                    attn::index::topk
+                };
+                topk(
                     self.ctx(),
                     self.tensor(*q),
                     weights.map(|w| self.tensor(w)),
@@ -894,6 +874,42 @@ impl Run<'_> {
                     self.tensor(*selection),
                 )
             }
+            Attn::IndexTopk {
+                q,
+                weights: None,
+                keys,
+                heads,
+                head_dim,
+                top_k,
+                ratio,
+                score: IndexScore::BlockMax,
+                selection,
+            } => {
+                let Some(scores) = self.index_scores() else {
+                    return Err(kernels_metal::Error::Unsupported {
+                        op: "attn.index_topk",
+                    });
+                };
+                let fire = self.bindings();
+                let (positions, request_of_token) = (fire.positions, fire.tables.request_of_token);
+                attn::index::topk_block_max(
+                    self.ctx(),
+                    self.tensor(*q),
+                    self.pool(*keys),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
+                    scores,
+                    *heads,
+                    *head_dim,
+                    *top_k,
+                    *ratio,
+                    self.tensor(*selection),
+                )
+            }
+            Attn::IndexTopk {
+                score: IndexScore::BlockMax,
+                ..
+            } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Attn::IndexKvAppend {
                 k,
                 keys,

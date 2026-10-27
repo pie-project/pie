@@ -19,7 +19,7 @@ impl InstanceBindingPlan {
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
-        reason = "the contract's five fields plus the runtime's two; every one of \
+        reason = "the contract's six fields plus the runtime's two; every one of \
                   them is stated by a different party at the bind site and none \
                   has a group it obviously belongs to"
     )]
@@ -31,6 +31,7 @@ impl InstanceBindingPlan {
         seeds: Vec<ChannelSeed>,
         geometry: GeometryClass,
         extents: BindExtents,
+        device_resolved: eta_ir::registry::PortMask,
     ) -> Self {
         Self {
             engine_id,
@@ -41,6 +42,7 @@ impl InstanceBindingPlan {
                 seeds,
                 geometry,
                 extents,
+                device_resolved,
             },
         }
     }

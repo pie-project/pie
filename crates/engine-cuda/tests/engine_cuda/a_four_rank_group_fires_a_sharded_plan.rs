@@ -301,6 +301,7 @@ fn four_ranks_land_what_one_rank_lands() {
                 channels: vec![latent, out],
                 seeds: Vec::new(),
                 geometry: GeometryClass::Host,
+                device_resolved: Default::default(),
                 extents: BindExtents {
                     row_count: n,
                     token_count: n,

@@ -9,5 +9,5 @@ pub use compile::{
     compile_bound, compile_stage, compile_stage_at, debug_stage_plan, library_op_for_tag,
     stage_identity,
 };
-pub(crate) use compile::{StageIndex, direct_topk, readout_plane};
+pub(crate) use compile::{StageIndex, direct_topk, readout_plane, row_views};
 pub use lane_table::{LANE_TABLE_ABI_VERSION, LaneChannelSlot, LaneRecord, LaneTableHeader};

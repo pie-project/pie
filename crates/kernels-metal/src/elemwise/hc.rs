@@ -128,12 +128,16 @@ pub fn project(
     }
     let mix_hc = hc_fn.rows;
     let layer_row = 2 * stream_count + stream_count * stream_count;
-    if mixes.width != mix_hc || (mix_hc != layer_row && mix_hc != stream_count) {
+    let independent_row = 2 * stream_count;
+    if mixes.width != mix_hc
+        || (mix_hc != layer_row && mix_hc != independent_row && mix_hc != stream_count)
+    {
         return Err(refuse(
             OP,
             format!(
-                "a {stream_count}-stream mix row is {layer_row} wide and a trunk collapse row \
-                 is {stream_count}; the plane lands {} rows into a {}-wide row",
+                "a {stream_count}-stream mix row is {layer_row} wide ({independent_row} without \
+                 its combine) and a trunk collapse row is {stream_count}; the plane lands {} \
+                 rows into a {}-wide row",
                 hc_fn.rows, mixes.width
             ),
         ));
@@ -171,6 +175,7 @@ pub fn gates(
     gate_eps: f32,
     alpha: f32,
     sinkhorn: u32,
+    comb: bool,
     x: Tensor,
     post_mix: Tensor,
     comb_mix: Tensor,
@@ -224,6 +229,7 @@ pub fn gates(
             gate_eps.arg(),
             alpha.arg(),
             stated(OP, sinkhorn)?.arg(),
+            i32::from(comb).arg(),
         ],
     )
 }

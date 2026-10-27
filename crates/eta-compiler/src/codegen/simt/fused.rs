@@ -159,8 +159,8 @@ pub(crate) fn analyze_direct_argmax(
         for result in 0..op.results {
             producers[(bases[node] + result) as usize] = node as u32;
         }
-        for argument in &op.args {
-            consumers[*argument as usize].push(node as u32);
+        for argument in op.reads() {
+            consumers[argument as usize].push(node as u32);
         }
     }
     let mut analysis = ArgmaxScan {
@@ -341,31 +341,12 @@ pub(crate) fn row_geometry(stage: &CompiledStage, region: &Region) -> Option<(u6
         .filter(|&(fixed, extent)| !(fixed == 1 && extent == u32::MAX))
 }
 
+/// Each value's row kind in a row-parallel region, as the planner views it
+/// (`plan::row_views`): 1 a row, 2 an element, 0 whole.
 pub(crate) fn row_kinds(stage: &CompiledStage, region: &Region, geometry: (u64, u32)) -> Vec<u8> {
-    // Rows that are a role the stage also states as a count: the region was
-    // formed on the role, whichever form its witness takes, and reads values
-    // of either form as its rows.
-    let (fixed, extent) = match (geometry, region.row_alias) {
-        ((n, u32::MAX), Some((role, m))) if n == m => (1, role),
-        _ => geometry,
-    };
-    let alias = region.row_alias.map(|(_, count)| count);
-    stage
-        .normalized
-        .value_types
-        .iter()
-        .map(|ty| {
-            if ty.dims.len() >= 2
-                && crate::plan::value_rows(&ty.dims)
-                    .is_some_and(|shape| crate::plan::same_rows(shape, (fixed, extent), alias))
-            {
-                1
-            } else if crate::plan::is_row_vector(&ty.dims, fixed, extent, alias) {
-                2
-            } else {
-                0
-            }
-        })
+    crate::plan::row_views(&stage.normalized, region, geometry)
+        .into_iter()
+        .map(|view| view as u8)
         .collect()
 }
 
@@ -473,7 +454,15 @@ pub fn emit_fused_region(
     let row_parallel = stream_kinds.is_some();
     let row_kinds: Vec<u8> = stream_kinds.unwrap_or_default();
     if row_parallel {
-        let kinds: Vec<String> = row_kinds.iter().map(|k| format!("{k}u")).collect();
+        // Each block narrows the values of its own row. A single-row region's
+        // values already are its one row, at row 0: they keep the dims they
+        // declare, which the ops that are not streams (a transpose, a gather
+        // along axis 0) index by.
+        let narrowed = row_geometry(stage, region).is_some();
+        let kinds: Vec<String> = row_kinds
+            .iter()
+            .map(|&k| format!("{}u", if narrowed { k } else { 0 }))
+            .collect();
         let count = kinds.len().max(1);
         let _ = writeln!(
             source,

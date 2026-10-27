@@ -65,6 +65,12 @@ pub struct InstanceBinding {
     pub seeds: Vec<ChannelSeed>,
     pub geometry: GeometryClass,
     pub extents: BindExtents,
+    /// The descriptor ports the program computes on the device, which the
+    /// engine resolves for a decode envelope; the runtime resolves its other
+    /// ports on the host and states them on the lanes. Each port has one
+    /// source ([`crate::ports::engine_resolves`]).
+    #[serde(default)]
+    pub device_resolved: eta_ir::registry::PortMask,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

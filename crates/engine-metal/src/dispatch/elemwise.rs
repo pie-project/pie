@@ -610,13 +610,16 @@ impl Run<'_> {
                 for plane in &planes {
                     let at = self.handles().get(plane.buf).map(|row| row.offset());
                     if at != want || plane.rows != first.rows || plane.width != first.width {
-                        return Err(kernels_metal::Error::Backend {
-                            op: "elemwise.res_blend",
-                            detail: "the candidate blocks do not land as one stacked run; \
-                                     the kernel walks `blocks + (j · rows + t) · hidden` and \
-                                     cannot gather scattered slots"
-                                .to_string(),
-                        });
+                        // Blocks that lie apart are each bound where they lie.
+                        return elemwise::norm::res_blend_scattered(
+                            self.ctx(),
+                            self.tensor(*prefix),
+                            &planes,
+                            self.tensor(*weight),
+                            *eps,
+                            self.tensor(*proj),
+                            self.tensor(*y),
+                        );
                     }
                     want = want.map(|at| at + plane_bytes);
                 }
@@ -899,10 +902,6 @@ impl Run<'_> {
                 *stream_count,
                 self.tensor(*mixes),
             ),
-            // The independent form (no combine) is landed on CUDA alone.
-            Elemwise::HcGates { comb: false, .. } => {
-                Err(kernels_metal::Error::Unsupported { op: op.name() })
-            }
             Elemwise::HcGates {
                 normed,
                 streams,
@@ -912,7 +911,7 @@ impl Run<'_> {
                 gate_eps,
                 alpha,
                 sinkhorn,
-                comb: true,
+                comb,
                 x,
                 post_mix,
                 comb_mix,
@@ -926,6 +925,7 @@ impl Run<'_> {
                 *gate_eps,
                 *alpha,
                 *sinkhorn,
+                *comb,
                 self.tensor(*x),
                 self.tensor(*post_mix),
                 self.tensor(*comb_mix),

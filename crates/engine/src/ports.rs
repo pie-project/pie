@@ -1,4 +1,4 @@
-use eta_ir::registry::{GeometryClass, Port};
+use eta_ir::registry::{GeometryClass, Port, PortMask};
 
 use crate::fire::{Mask, Masking};
 
@@ -296,11 +296,23 @@ pub fn resolves(class: GeometryClass, port: Port) -> bool {
         return true;
     }
     match class {
-        // RoPE positions may come from the device beside slots the host placed.
-        GeometryClass::DecodeEnvelope => port == Port::Positions,
+        // RoPE positions may come from the device beside slots the host
+        // placed, and so may the mask that says what the rows see: one the
+        // device computes (beam ancestry) the runtime cannot resolve, for a
+        // fire staged ahead or not.
+        GeometryClass::DecodeEnvelope => matches!(port, Port::Positions | Port::AttnMask),
         GeometryClass::DeviceGeometry => matches!(port, Port::EmbedIndptr | Port::AttnMask),
         GeometryClass::Host => false,
     }
+}
+
+/// Whether the engine resolves `port` for an instance bound in `class`
+/// whose program computes `device` on the device. A decode envelope's other
+/// ports are resolved on the host and stated on the lanes, so each port has
+/// one source: the engine never reads a cell the runtime already resolved.
+#[must_use]
+pub fn engine_resolves(class: GeometryClass, device: PortMask, port: Port) -> bool {
+    resolves(class, port) && (class != GeometryClass::DecodeEnvelope || device.contains(port))
 }
 
 #[must_use]
@@ -345,6 +357,24 @@ mod tests {
         an_envelope_placing_no_slots_cuts_by_the_host_rows();
         a_row_is_roped_at_its_slot_unless_the_program_says_otherwise();
         a_decode_envelope_resolves_its_tokens_and_not_where_they_land();
+        an_engine_resolves_only_what_the_program_computes_on_the_device();
+    }
+
+    /// One source a port: what a decode envelope's program computes on the
+    /// device the engine resolves, and what the runtime resolved it never
+    /// reads; the wide class resolves every port it has.
+    fn an_engine_resolves_only_what_the_program_computes_on_the_device() {
+        use eta_ir::registry::{GeometryClass, PortMask};
+        let device = PortMask::of(&[Port::EmbedTokens, Port::AttnMask]);
+        let envelope = |port| super::engine_resolves(GeometryClass::DecodeEnvelope, device, port);
+        assert!(envelope(Port::EmbedTokens) && envelope(Port::AttnMask));
+        assert!(!envelope(Port::Positions), "positions the runtime resolved are the lane's");
+        assert!(!envelope(Port::Fold) && !envelope(Port::Slots));
+        assert!(super::engine_resolves(
+            GeometryClass::DeviceGeometry,
+            PortMask::NONE,
+            Port::Slots
+        ));
     }
 
     fn an_extent_that_disagrees_with_the_seat_is_refused_by_both_numbers() {
@@ -479,13 +509,16 @@ mod tests {
         assert_eq!(lane.reach(2).expect("a reach"), Some(42));
     }
 
+    /// A decode envelope resolves what its rows are and what they see (its
+    /// tokens, positions and a mask the device computes; a mask the runtime
+    /// resolved rides the lane and wins) and never where they land, which
+    /// stays the runtime's.
     fn a_decode_envelope_resolves_its_tokens_and_not_where_they_land() {
         use eta_ir::registry::GeometryClass;
-        assert!(super::resolves(
-            GeometryClass::DecodeEnvelope,
-            Port::EmbedTokens
-        ));
-        for port in [Port::Slots, Port::KvLen, Port::AttnMask, Port::EmbedIndptr] {
+        for port in [Port::EmbedTokens, Port::Positions, Port::AttnMask] {
+            assert!(super::resolves(GeometryClass::DecodeEnvelope, port));
+        }
+        for port in [Port::Slots, Port::KvLen, Port::EmbedIndptr] {
             assert!(
                 !super::resolves(GeometryClass::DecodeEnvelope, port),
                 "{}'s value is the RUNTIME's to resolve for a decode envelope",

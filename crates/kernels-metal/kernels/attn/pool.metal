@@ -185,14 +185,18 @@ template <typename T>
     const device uint* page_indptr [[buffer(5)]],
     const constant int& head_dim   [[buffer(6)]],
     const constant int& page_size  [[buffer(7)]],
+    const constant int& pitch      [[buffer(8)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int d = int(gid.x);
   const int c = int(gid.y);
   if (d >= head_dim) return;
   if (boundary_pos[c] < 0) return;
+  // A compact pool (`pitch` a position, `head_dim / pitch` positions an
+  // entry) holds an entry from its block's first position on.
+  const int div = head_dim / pitch;
   const size_t slot = pool_paged_slot(
-      page_indices, page_indptr, boundary_req[c], boundary_pos[c], page_size);
-  comp_kv_pages[slot * size_t(head_dim) + size_t(d)] =
+      page_indices, page_indptr, boundary_req[c], boundary_pos[c] - (div - 1), page_size);
+  comp_kv_pages[slot * size_t(pitch) + size_t(d)] =
       entries[size_t(c) * size_t(head_dim) + size_t(d)];
 }
 
@@ -201,7 +205,7 @@ template <typename T>
   [[kernel]] void pool_store_entries<itype>(                             \
       const device itype*, device itype*, const device int*,             \
       const device int*, const device uint*, const device uint*,         \
-      const constant int&, const constant int&, uint2);
+      const constant int&, const constant int&, const constant int&, uint2);
 
 instantiate_pool_store_entries(bfloat16, bfloat)
 
@@ -267,6 +271,7 @@ constant int POOL_HEAD_MAX = 512;
     const constant int& ratio         [[buffer(10)]],
     const constant int& page_size     [[buffer(11)]],
     const constant float& scale       [[buffer(12)]],
+    const constant int& pitch         [[buffer(13)]],
     uint3 tgpos    [[threadgroup_position_in_grid]],
     uint3 lid      [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -306,8 +311,8 @@ constant int POOL_HEAD_MAX = 512;
   float local_max = -INFINITY;
   for (int c = tid; c < num_visible; c += POOL_ATTN_BLOCK) {
     const size_t slot = pool_paged_slot(
-        page_indices, page_indptr, req, (c + 1) * ratio - 1, page_size);
-    const device bfloat* k_row = comp_kv_pages + slot * size_t(head_dim);
+        page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch, page_size);
+    const device bfloat* k_row = comp_kv_pages + slot * size_t(pitch);
     float dot = 0.0f;
     for (int d = 0; d < head_dim; ++d) {
       dot += q_smem[d] * float(k_row[d]);
@@ -334,8 +339,8 @@ constant int POOL_HEAD_MAX = 512;
 
   for (int c = 0; c < num_visible; ++c) {
     const size_t slot = pool_paged_slot(
-        page_indices, page_indptr, req, (c + 1) * ratio - 1, page_size);
-    const device bfloat* k_row = comp_kv_pages + slot * size_t(head_dim);
+        page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch, page_size);
+    const device bfloat* k_row = comp_kv_pages + slot * size_t(pitch);
     float dot = 0.0f;
     for (int d = tid; d < head_dim; d += POOL_ATTN_BLOCK) {
       dot += q_smem[d] * float(k_row[d]);
@@ -390,6 +395,7 @@ constant int POOL_HEAD_MAX = 512;
     const constant int& top_k         [[buffer(12)]],
     const constant int& page_size     [[buffer(13)]],
     const constant float& scale       [[buffer(14)]],
+    const constant int& pitch         [[buffer(15)]],
     uint3 tgpos    [[threadgroup_position_in_grid]],
     uint3 lid      [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -434,8 +440,8 @@ constant int POOL_HEAD_MAX = 512;
     if (c < 0) break;
     if (c >= num_visible) continue;
     const size_t slot = pool_paged_slot(
-        page_indices, page_indptr, req, (c + 1) * ratio - 1, page_size);
-    const device bfloat* k_row = comp_kv_pages + slot * size_t(head_dim);
+        page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch, page_size);
+    const device bfloat* k_row = comp_kv_pages + slot * size_t(pitch);
     float dot = 0.0f;
     for (int d = 0; d < head_dim; ++d) {
       dot += q_smem[d] * float(k_row[d]);
@@ -475,8 +481,8 @@ constant int POOL_HEAD_MAX = 512;
     if (c < 0) break;
     if (c >= num_visible) continue;
     const size_t slot = pool_paged_slot(
-        page_indices, page_indptr, req, (c + 1) * ratio - 1, page_size);
-    const device bfloat* k_row = comp_kv_pages + slot * size_t(head_dim);
+        page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch, page_size);
+    const device bfloat* k_row = comp_kv_pages + slot * size_t(pitch);
     float dot = 0.0f;
     for (int d = tid; d < head_dim; d += POOL_ATTN_BLOCK) {
       dot += q_smem[d] * float(k_row[d]);
@@ -513,4 +519,36 @@ constant int POOL_HEAD_MAX = 512;
       o_row[d] = bfloat(acc[i] * inv_z);
     }
   }
+}
+
+// Bounded replay's floors (DeepSeek-V4.1's Causal Encoder-Decoder): a lane's
+// least position whose window keys its decoder layers hold. With `mark` the
+// lanes' rows are a prompt's encoder-only ones (a thread a lane): its state
+// takes the position past its last row. Without, every row (a thread a row)
+// reads the floor its lane's state holds (0 for a lane with no slot).
+[[kernel]] void replay_floor(
+    const device int* positions   [[buffer(0)]],
+    device int* state             [[buffer(1)]],
+    const device int* slots       [[buffer(2)]],
+    const device uint* indptr     [[buffer(3)]],
+    device int* floors            [[buffer(4)]],
+    const constant int& stride    [[buffer(5)]],
+    const constant int& rows      [[buffer(6)]],
+    const constant int& lanes     [[buffer(7)]],
+    const constant int& mark      [[buffer(8)]],
+    uint t [[thread_position_in_grid]]) {
+  if (mark == 0) {
+    if (int(t) >= rows) return;
+    const int slot = slots[t];
+    floors[t] = slot >= 0 ? state[size_t(slot) * size_t(stride)] : 0;
+    return;
+  }
+  if (int(t) >= lanes) return;
+  const int t0 = int(indptr[t]);
+  const int n = int(indptr[t + 1]) - t0;
+  if (n <= 0) return;
+  const int floor = positions[t0 + n - 1] + 1;
+  for (int i = 0; i < n; ++i) floors[t0 + i] = floor;
+  const int slot = slots[t0];
+  if (slot >= 0) state[size_t(slot) * size_t(stride)] = floor;
 }
