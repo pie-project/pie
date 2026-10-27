@@ -48,6 +48,7 @@ __device__ __forceinline__ void ptir_parallel_copy(
     m1_u8* output,
     m1_u32 len,
     m1_u32 dtype) {
+  if (input == output) return;
   const m1_u32 bytes = dtype == 3u ? len : len * 4u;
   // Sixteen bytes a thread where both ends allow it (a vocabulary-wide
   // value moved a byte a thread is a block's whole pass), the tail bytewise.

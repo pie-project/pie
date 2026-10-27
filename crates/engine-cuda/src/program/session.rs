@@ -711,7 +711,14 @@ impl Session {
             }
             if puts {
                 flags |= Ticket::PUBLISH;
-                if matches!(endpoint.role(), HostRole::Reader | HostRole::None) {
+                let port_channel = plan
+                    .package
+                    .ports
+                    .iter()
+                    .any(|binding| !binding.is_const && binding.channel == slot);
+                if endpoint.role() == HostRole::Reader
+                    || (endpoint.role() == HostRole::None && port_channel)
+                {
                     flags |= Ticket::HOST_READER;
                 }
             }

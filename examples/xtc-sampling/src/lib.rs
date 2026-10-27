@@ -128,8 +128,11 @@ struct Cfg {
 /// Returns `(keep_mask, dropped_count, fired)` where `fired` is 1.0 on steps
 /// where the gate opened and 0.0 otherwise.
 fn xtc_mask(logits: &Tensor, vocab: u32, cfg: Cfg, rng_state: &Tensor) -> (Tensor, Tensor, Tensor) {
-    let probs = softmax(logits);
-    let p_max = reduce_max(&probs);
+    let max_l = reduce_max(logits);
+    let exps = exp(logits - broadcast(&max_l, [vocab]));
+    let sum_e = reduce_sum(&exps);
+    let probs = &exps / broadcast(&sum_e, [vocab]);
+    let p_max = recip(&sum_e);
 
     // Stage 1 — min-p floor. Inert when min_p == 0, since every probability is
     // >= 0.

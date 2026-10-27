@@ -213,16 +213,27 @@ fn host_counter(history: &[i32], hlen: usize, context_width: u32) -> u32 {
     h
 }
 
-/// Four `[1]` f32 values as one `[4]` cell.
-fn pack4(a: &Tensor, b: &Tensor, c: &Tensor, d: &Tensor) -> Tensor {
-    let lane = iota(4);
-    let cd = select(
-        eq(&lane, broadcast(2u32, [4])),
-        broadcast(c, [4]),
-        broadcast(d, [4]),
-    );
-    let bcd = select(eq(&lane, broadcast(1u32, [4])), broadcast(b, [4]), &cd);
-    select(eq(&lane, broadcast(0u32, [4])), broadcast(a, [4]), &bcd)
+fn splitmix64(mut x: u64) -> u64 {
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x3C79_AC49_2BA7_B653);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0x1C69_B3F7_4AC4_AE35);
+    x ^ (x >> 27)
+}
+
+fn host_mean_g(secret: u32, counter: u32, depth: u32, token: u32) -> f32 {
+    let mut total = 0.0f32;
+    for layer in 0..depth {
+        let key = secret ^ (G_SALT.wrapping_mul(layer + 1));
+        let seed = splitmix64(((key as u64) << 32) | (counter as u64));
+        let x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(token as u64 + 1));
+        let bits = (splitmix64(x) >> 40) as u32;
+        let raw = ((bits as f32) + 0.5) * (1.0 / 16777216.0);
+        if raw >= 0.5 {
+            total += 1.0;
+        }
+    }
+    total / depth as f32
 }
 
 /// Assembles the `[2]` u32 `[key, ctr]` rng state from two `[1]` parts.
@@ -231,21 +242,9 @@ fn rng_state(key: u32, counter: &Tensor) -> Tensor {
     select(&is_counter, broadcast(counter, [2]), broadcast(key, [2]))
 }
 
-/// The mean-score detector statistic: the emitted token's g-value averaged over
-/// the `depth` layers. Exactly `0.5` in expectation under H0.
-fn mean_g(gs: &[Tensor], token: &Tensor) -> Tensor {
-    let mut total = scalar_gather(&gs[0], token);
-    for g in &gs[1..] {
-        total += scalar_gather(g, token);
-    }
-    reshape(total / gs.len() as f32, [1])
-}
-
 /// One sampling step.
 ///
-/// Returns `(token, hist_next, chist_next, score, null_score, repeated)`;
-/// `repeated` is the `[1]` flag for a context the ring had already seen,
-/// which the detector masks out exactly as the generator did.
+/// Returns `(token, hist_next, chist_next)`.
 fn step(
     logits: Tensor,
     vocab: u32,
@@ -254,7 +253,7 @@ fn step(
     hlen: &Tensor,
     chist: &Tensor,
     free_state: &Tensor,
-) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
+) -> (Tensor, Tensor, Tensor) {
     let scaled = if cfg.temperature == 1.0 {
         logits
     } else {
@@ -273,18 +272,15 @@ fn step(
     );
 
     let base = softmax(&scaled);
-    let gs: Vec<Tensor> = (0..cfg.depth)
-        .map(|layer| g_layer(cfg.secret, &counter, layer, vocab))
-        .collect();
-
     // The closed form of the 2^depth tournament: one multiplicative reweighting
     // per layer. Each factor is `1 + g - E_p[g]`, which is non-negative because
     // `g ∈ {0,1}` and `E_p[g] ∈ [0,1]`, and preserves normalisation exactly.
     let mut watermarked = base.clone();
-    for g in &gs {
-        let mass = reduce_sum(&watermarked * g);
+    for layer in 0..cfg.depth {
+        let g = g_layer(cfg.secret, &counter, layer, vocab);
+        let mass = reduce_sum(&watermarked * &g);
         let offset = broadcast(1.0f32 - &mass, [vocab]);
-        watermarked = &watermarked * (&offset + g);
+        watermarked = &watermarked * (&offset + &g);
     }
 
     let effective = select(broadcast(&repeated, [vocab]), &base, &watermarked);
@@ -298,24 +294,9 @@ fn step(
         gumbel_max(&scaled, free_state)
     };
 
-    let score = mean_g(&gs, &token);
-    // The decoy shares the context counter and differs only in the secret, so
-    // the null is the *same* experiment with the wrong key.
-    let decoy_gs: Vec<Tensor> = (0..cfg.depth)
-        .map(|layer| g_layer(cfg.decoy ^ DECOY_SALT, &counter, layer, vocab))
-        .collect();
-    let null_score = mean_g(&decoy_gs, &token);
-
     let hist_next = scatter_set(hist, hlen, &token);
     let chist_next = scatter_set(chist, hlen % cfg.history_size, &counter);
-    (
-        token,
-        hist_next,
-        chist_next,
-        score,
-        null_score,
-        reshape(repeated, [1]),
-    )
+    (token, hist_next, chist_next)
 }
 
 #[inferlet::main]
@@ -390,8 +371,6 @@ async fn main(input: Input) -> Result<Output> {
     let hlen_p = Channel::from([n]);
     let chist_p = Channel::from(vec![u32::MAX; cfg.history_size as usize]);
     let tok_out_p = Channel::new([1], dtype::i32);
-    let score_out_p = Channel::new([1], dtype::f32);
-    let null_out_p = Channel::new([1], dtype::f32);
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -402,12 +381,9 @@ async fn main(input: Input) -> Result<Output> {
         let hlen = hlen_p.take();
         let chist = chist_p.take();
         let logits = intrinsics::output(0, "logits");
-        let (token, hist_next, chist_next, score, null, _repeated) =
-            step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
+        let (token, hist_next, chist_next) = step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
-        score_out_p.put(&score);
-        null_out_p.put(&null);
         chist_p.put(&chist_next);
         hist_p.put(&hist_next);
         hlen_p.put(&hlen + 1u32);
@@ -418,18 +394,7 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.submit(&pipe).context("prefill submit")?;
 
     let g0 = tok_out_p.take_host::<i32>().await?;
-    let s0 = score_out_p.take_host::<f32>().await?;
-    let n0 = null_out_p.take_host::<f32>().await?;
     generated.push(g0 as u32);
-    // The detector's sums accumulate on the device, masked by the same
-    // `repeated` flag the generator used (the reference masks a step whose
-    // context n-gram sat in the ring buffer), and ride out beside the token
-    // in one `[4]` cell: a token costs one host round trip, not three. The
-    // prefill's step is never a repeat: the ring was empty.
-    let kept_score = Channel::from([s0]);
-    let kept_null = Channel::from([n0]);
-    let kept_count = Channel::from([1.0f32]);
-    let mut totals = [s0, n0, 1.0f32];
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
     if generated.len() < max_tokens {
@@ -446,7 +411,7 @@ async fn main(input: Input) -> Result<Output> {
         ring_seed[(n % cfg.history_size) as usize] =
             host_counter(&history, n as usize, cfg.context_width);
         let chist_c = Channel::from(ring_seed);
-        let out = Channel::new([4], dtype::f32).capacity(channel_capacity() as u32);
+        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
         let lane1 = Channel::from([0u32, 1u32]);
 
         let fwd = ForwardPass::new();
@@ -458,30 +423,13 @@ async fn main(input: Input) -> Result<Output> {
             let hist = hist_c.take();
             let hlen = hlen_c.take();
             let chist = chist_c.take();
-            let score_so_far = kept_score.take();
-            let null_so_far = kept_null.take();
-            let count_so_far = kept_count.take();
             let logits = intrinsics::output(0, "logits");
-            let (token, hist_next, chist_next, score, null, repeated) =
-                step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
-            let zero = broadcast(0.0f32, [1]);
-            let kept_now = select(&repeated, &zero, broadcast(1.0f32, [1]));
+            let (token, hist_next, chist_next) = step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
 
             let r_next = &r + iota(2);
 
             tok_in.put(&token);
-            let score_next = &score_so_far + select(&repeated, &zero, &score);
-            let null_next = &null_so_far + select(&repeated, &zero, &null);
-            let count_next = &count_so_far + &kept_now;
-            out.put(pack4(
-                &cast(reshape(&token, [1]), dtype::f32),
-                &score_next,
-                &null_next,
-                &count_next,
-            ));
-            kept_score.put(&score_next);
-            kept_null.put(&null_next);
-            kept_count.put(&count_next);
+            tok_out.put(&token);
             chist_c.put(&chist_next);
             hist_c.put(&hist_next);
             hlen_c.put(&hlen + 1u32);
@@ -490,19 +438,35 @@ async fn main(input: Input) -> Result<Output> {
 
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget, async || {
-            let v = out
-                .take_host::<Vec<f32>>()
+            let t = tok_out
+                .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
-            generated.push(v[0] as u32);
-            totals = [v[1], v[2], v[3]];
+            generated.push(t as u32);
             Ok(ControlFlow::Continue(()))
         })
         .await?;
     }
     pipe.close();
-    let [kept_score, kept_null, kept_n] = totals;
-    let kept = kept_n as usize;
+
+    // Score the emitted sequence on the host using the exact ring-masked
+    // detector mirror (matching the generator's context hash and splitmix64 g-bits).
+    let mut det_ring = vec![u32::MAX; cfg.history_size as usize];
+    let mut kept_score = 0.0f32;
+    let mut kept_null = 0.0f32;
+    let mut kept = 0usize;
+    for (step_idx, &tok) in generated.iter().enumerate() {
+        let hlen = n as usize + step_idx;
+        let counter = host_counter(&history, hlen, cfg.context_width);
+        let repeated = det_ring.contains(&counter);
+        if !repeated {
+            kept_score += host_mean_g(cfg.secret, counter, cfg.depth, tok);
+            kept_null += host_mean_g(cfg.decoy ^ DECOY_SALT, counter, cfg.depth, tok);
+            kept += 1;
+        }
+        det_ring[hlen % (cfg.history_size as usize)] = counter;
+        history[hlen] = tok as i32;
+    }
 
     let denom = kept.max(1) as f32;
     let mean_score = kept_score / denom;

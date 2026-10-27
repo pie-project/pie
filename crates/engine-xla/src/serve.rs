@@ -479,8 +479,8 @@ impl Shell {
         } else {
             None
         };
-        let paging_at = |pages: u64| -> Result<Paging> {
-            Ok(Paging::of(boot.page_size, boot.context, boot.slots, pages)?
+        let paging_at = |pages: u64, slots: u32| -> Result<Paging> {
+            Ok(Paging::of(boot.page_size, boot.context, slots, pages)?
                 .windowed(window, boot.budget.max_tokens))
         };
         // The pool buffers are program parameters, so the pages are fixed
@@ -507,27 +507,28 @@ impl Shell {
             (None, None) => FILL_PAGES.max(least).min(cells),
             _ => cells,
         };
-        let demand = |pages: u64| {
+        let demand = |pages: u64, slots: u32| {
             if pages > ceiling {
                 return u64::MAX;
             }
-            paging_at(pages)
+            paging_at(pages, slots)
                 .and_then(|paging| crate::store::pool_demand(&boot.trace, paging))
                 .unwrap_or(u64::MAX)
         };
-        let fit = engine::fit::pages_for(boot.kv_budget, room, least, demand)
+        let (fit, slots) = engine::fit::pool_for(boot.kv_budget, boot.slots, least, room, demand)
             .map_err(|short| Fault::Residency(short.to_string()))?;
         tracing::info!(
             pages = fit,
-            pool_mib = demand(fit) >> 20,
+            slots,
+            pool_mib = demand(fit, slots) >> 20,
             weight_floor_mib = weight_floor >> 20,
             "xla kv pool sized"
         );
-        let paging = paging_at(fit)?;
+        let paging = paging_at(fit, slots)?;
         let handles = Handles::new();
         let device_cap = working.map_or(u64::MAX, |working| {
             working
-                .saturating_sub(demand(fit))
+                .saturating_sub(demand(fit, slots))
                 .saturating_sub(tpu.headroom())
         });
         let weights = if device.is_dry() {

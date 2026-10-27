@@ -102,13 +102,16 @@ fn a_dag_schedule_orders_every_wait_after_its_close() {
         }
     }
     for unit in 0..vlm_compiled.units.len() as u32 {
-        let span = vlm_compiled.unit_script(unit).expect("unit has capture regions");
+        let span = vlm_compiled
+            .unit_script(unit)
+            .expect("unit has capture regions");
         assert_eq!(
             vlm_compiled.regions[span.start as usize].stream, 0,
             "unit {unit} starts on stream 0"
         );
         assert_eq!(
-            vlm_compiled.regions[span.end as usize - 1].stream, 0,
+            vlm_compiled.regions[span.end as usize - 1].stream,
+            0,
             "unit {unit} ends on stream 0"
         );
     }

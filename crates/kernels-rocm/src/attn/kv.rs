@@ -5,6 +5,7 @@ use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel, refuse, stated};
 use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "attn/kv.hip";
+const ENVELOPE: &str = "attn/kv_envelope.hip";
 
 const BLOCK: u32 = 256;
 
@@ -151,11 +152,7 @@ fn envelope_update_appended(
 
     ctx.fire(
         op,
-        Fire::at(kernel(
-            "attn/kv_envelope.hip",
-            "::pie::layout::update_appended",
-        ))
-        .apply(Launch::grid(
+        Fire::at(kernel(ENVELOPE, "::pie::layout::update_appended")).apply(Launch::grid(
             [max_touched.unsigned_abs(), kv_heads.unsigned_abs(), 1],
             [threads_for(head_dim), 1, 1],
         )),

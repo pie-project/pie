@@ -221,18 +221,15 @@ fn dry_penalty(hist: &Tensor, hlen: &Tensor, vocab: u32, cfg: Cfg) -> (Tensor, T
     );
     let next_tok = max_elem(gather(hist, &next_idx), broadcast(0i32, [l]));
 
+    let neg_one = broadcast(-1i32, [l]);
     let vocab_zero = broadcast(0.0f32, [vocab]);
     let mut penalty = broadcast(0.0f32, [vocab]);
     // Ascending, so the longest match is written last and wins.
     for n in cfg.allowed_length..=cfg.max_ngram {
         let hit = ge(&m, broadcast(n as f32, [l]));
-        let votes = scatter_add(&vocab_zero, &next_tok, cast(&hit, dtype::f32));
+        let idx = select(&hit, &next_tok, &neg_one);
         let charge = cfg.multiplier * cfg.base.powi((n - cfg.allowed_length) as i32);
-        penalty = select(
-            gt(&votes, &vocab_zero),
-            broadcast(charge, [vocab]),
-            &penalty,
-        );
+        penalty = scatter_set(&penalty, &idx, charge);
     }
 
     let count = reshape(reduce_sum(cast(gt(&penalty, &vocab_zero), dtype::f32)), [1]);

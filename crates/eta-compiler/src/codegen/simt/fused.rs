@@ -387,7 +387,7 @@ fn single_row_kinds(stage: &CompiledStage, region: &Region) -> Option<Vec<u8>> {
         .iter()
         .enumerate()
         .map(|(value, ty)| {
-            if shaped.contains(&(value as u32)) {
+            if ty.dims.len() > 1 && shaped.contains(&(value as u32)) {
                 return 0;
             }
             let Some((last, leading)) = ty.dims.split_last() else {
@@ -589,6 +589,11 @@ pub fn emit_fused_region(
         {
             aliases.elide(base, op.args[0]);
             continue;
+        }
+        if matches!(op.tag, tags::SCATTER_ADD | tags::SCATTER_SET)
+            && can_elide_scatter_base(stage, region, &ops, &bases, node, base)
+        {
+            aliases.elide(base, op.args[0]);
         }
 
         let resolve = |value: u32| {
@@ -882,11 +887,13 @@ fn emit_body(
             "    ptir_parallel_gather({tag}u, {a0}, {a1}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.o0]);"
         );
     } else if matches!(tag, tags::SCATTER_ADD | tags::SCATTER_SET) {
-        let _ = writeln!(
-            source,
-            "    ptir_parallel_copy({a0}, {o0}, descriptors[p.a0].len, descriptors[p.a0].dtype);"
-        );
-        source.push_str("    __syncthreads();\n");
+        if a0 != o0 {
+            let _ = writeln!(
+                source,
+                "    ptir_parallel_copy({a0}, {o0}, descriptors[p.a0].len, descriptors[p.a0].dtype);"
+            );
+            source.push_str("    __syncthreads();\n");
+        }
         let _ = writeln!(
             source,
             "    if (threadIdx.x == 0u) ptir_scatter_updates({tag}u, {a1}, {a2}, {o0}, descriptors[p.a0], descriptors[p.a1], descriptors[p.a2]);"
@@ -943,6 +950,14 @@ fn emit_chan_put(source: &mut String, op: &OpView, a0: &str, o0: &str) {
     );
     source.push_str("      }\n");
     source.push_str(
+        "      if (lane_active && (lane_row_valid == nullptr || elements_per_validity_row == 0u) && logical_bytes == p.sink_bytes) {\n"
+    );
+    let _ = writeln!(
+        source,
+        "        ptir_parallel_copy({a0}, {o0}, input.len, input.dtype);"
+    );
+    source.push_str("      } else {\n");
+    source.push_str(
         "      for (m1_u32 byte = threadIdx.x; byte < p.sink_bytes; byte += blockDim.x) {\n",
     );
     source.push_str("        if (byte >= logical_bytes) {\n");
@@ -972,7 +987,50 @@ fn emit_chan_put(source: &mut String, op: &OpView, a0: &str, o0: &str) {
         "        else if (threadIdx.x == 0u) m1_fault(&status, {tag}u);"
     );
     source.push_str("      }\n");
+    source.push_str("      }\n");
     source.push_str("    }\n");
+}
+
+pub(super) fn can_elide_scatter_base(
+    stage: &CompiledStage,
+    region: &Region,
+    ops: &[OpView],
+    bases: &[u32],
+    node: usize,
+    base: u32,
+) -> bool {
+    if region.kind != crate::plan::RegionKind::Generated || row_geometry(stage, region).is_some() {
+        return false;
+    }
+    let op = &ops[node];
+    if !matches!(op.tag, tags::SCATTER_ADD | tags::SCATTER_SET) || op.args.len() != 3 {
+        return false;
+    }
+    let src = op.args[0];
+    if src == op.args[1] || src == op.args[2] {
+        return false;
+    }
+    if region.outputs.contains(&base)
+        || region.outputs.contains(&src)
+        || region.inputs.contains(&src)
+        || region.sinks.iter().any(|s| s.value == src)
+    {
+        return false;
+    }
+    if !crate::codegen::alias::covers(&stage.normalized.value_types, src, base) {
+        return false;
+    }
+    let produced_in_region = region.nodes.iter().any(|&n| {
+        let idx = n.index();
+        let b = bases[idx];
+        src >= b && src < b + ops[idx].results
+    });
+    if !produced_in_region {
+        return false;
+    }
+    ops.iter()
+        .enumerate()
+        .all(|(i, other)| i == node || !other.reads().any(|a| a == src))
 }
 
 #[cfg(test)]
