@@ -308,6 +308,17 @@ pub mod mla {
         })
     }
 
+    /// [`flash`] that lands its base-2 log-sum-exp in `lse` too.
+    pub fn flash_lse(ctx: &Ctx<'_>, call: MlaCall, pool: KvPool, lse: Tensor) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let (call_v, pool_v) = call.try_map(&pool, |t| l.read(t))?;
+            let tuning = l.tuning();
+            let (o, lv) = mla::flash_with(l.f(), call_v, pool_v, tuning, true)?;
+            l.land(call.o, o)?;
+            l.land(lse, lv.expect("asked for"))
+        })
+    }
+
     fn land_latents(
         l: &mut Lower<'_, '_>,
         kv_c: Tensor,

@@ -862,27 +862,6 @@ impl Run<'_> {
                 self.tensor(*write_offset),
             ),
 
-            // The per-head log-sum-exp a sink rescales by is landed on CUDA alone.
-            Attn::MlaDecode {
-                lse: Some(_),
-                selection: None,
-                ..
-            }
-            | Attn::MlaPrefill {
-                lse: Some(_),
-                selection: None,
-                ..
-            }
-            | Attn::MlaDecode {
-                lse: Some(_),
-                selection: Some(_),
-                ..
-            }
-            | Attn::MlaPrefill {
-                lse: Some(_),
-                selection: Some(_),
-                ..
-            } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Attn::MlaDecode {
                 window: Some(_),
                 selection: None,
@@ -903,7 +882,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-                lse: _,
+                lse,
                 selection: None,
             } => {
                 let (positions, request_of_token) = {
@@ -920,7 +899,16 @@ impl Run<'_> {
                     *sm_scale,
                     self.tensor(*o),
                 );
-                crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache))
+                // the per-head log-sum-exp a sink rescales by, where asked
+                match lse {
+                    Some(lse) => crate::lower::attn::mla::flash_lse(
+                        self.ctx(),
+                        call,
+                        *self.pool(*cache),
+                        self.tensor(*lse),
+                    ),
+                    None => crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache)),
+                }
             }
             Attn::MlaPrefill {
                 q,
@@ -932,7 +920,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-                lse: _,
+                lse,
                 selection: None,
             } => {
                 let (positions, request_of_token) = {
@@ -949,7 +937,16 @@ impl Run<'_> {
                     *sm_scale,
                     self.tensor(*o),
                 );
-                crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache))
+                // the per-head log-sum-exp a sink rescales by, where asked
+                match lse {
+                    Some(lse) => crate::lower::attn::mla::flash_lse(
+                        self.ctx(),
+                        call,
+                        *self.pool(*cache),
+                        self.tensor(*lse),
+                    ),
+                    None => crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache)),
+                }
             }
             Attn::MlaDecode {
                 q,
@@ -961,7 +958,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-                lse: _,
+                lse,
                 window: None,
             } => {
                 let (positions, request_of_token) = {
@@ -979,7 +976,16 @@ impl Run<'_> {
                     *sm_scale,
                     self.tensor(*o),
                 );
-                crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache))
+                // the per-head log-sum-exp a sink rescales by, where asked
+                match lse {
+                    Some(lse) => crate::lower::attn::mla::flash_lse(
+                        self.ctx(),
+                        call,
+                        *self.pool(*cache),
+                        self.tensor(*lse),
+                    ),
+                    None => crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache)),
+                }
             }
             Attn::MlaPrefill {
                 q,
@@ -991,7 +997,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-                lse: _,
+                lse,
                 window: None,
             } => {
                 let (positions, request_of_token) = {
@@ -1009,7 +1015,16 @@ impl Run<'_> {
                     *sm_scale,
                     self.tensor(*o),
                 );
-                crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache))
+                // the per-head log-sum-exp a sink rescales by, where asked
+                match lse {
+                    Some(lse) => crate::lower::attn::mla::flash_lse(
+                        self.ctx(),
+                        call,
+                        *self.pool(*cache),
+                        self.tensor(*lse),
+                    ),
+                    None => crate::lower::attn::mla::flash(self.ctx(), call, *self.pool(*cache)),
+                }
             }
 
             Attn::IndexLayernormRope {
