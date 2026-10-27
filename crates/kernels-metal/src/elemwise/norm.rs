@@ -725,6 +725,89 @@ pub fn res_blend(
     )
 }
 
+/// [`res_blend`] over candidate blocks that lie apart (residual snapshots
+/// taken layers apart), each bound where it lies: up to
+/// [`SCATTERED_BLOCKS`] of them.
+pub const SCATTERED_BLOCKS: usize = 24;
+
+#[allow(clippy::too_many_arguments)]
+pub fn res_blend_scattered(
+    ctx: &Ctx<'_>,
+    prefix: Tensor,
+    blocks: &[Tensor],
+    weight: Tensor,
+    eps: f32,
+    proj: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elemwise.res_blend";
+    let entry = dtype_dispatch!(OP, y.dtype, {
+        Bf16 => "res_blend_scattered_bfloat16",
+        F32 => "res_blend_scattered_float32",
+    });
+    let rows = nonzero(OP, "rows", y.rows)?;
+    let hidden = nonzero(OP, "the blended row's width", y.width)?;
+    let Some(&first) = blocks.first() else {
+        return Err(refuse(OP, "a blend of no candidate blocks"));
+    };
+    if blocks.len() > SCATTERED_BLOCKS {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} scattered candidate blocks exceed the {SCATTERED_BLOCKS} the kernel binds",
+                blocks.len()
+            ),
+        ));
+    }
+    for plane in std::iter::once(&prefix).chain(blocks) {
+        if plane.rows < rows || plane.width != hidden || plane.dtype != y.dtype {
+            return Err(refuse(
+                OP,
+                format!(
+                    "a candidate is {} x {} {:?} and this blend takes {rows} x {hidden} {:?}",
+                    plane.rows, plane.width, plane.dtype, y.dtype
+                ),
+            ));
+        }
+    }
+    for (what, plane) in [("norm weight", weight), ("projection", proj)] {
+        if plane.dtype != y.dtype || plane.rows.saturating_mul(plane.width) != hidden {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the {what} is {} x {} {:?} and this blend scores rows of {hidden} {:?}",
+                    plane.rows, plane.width, plane.dtype, y.dtype
+                ),
+            ));
+        }
+    }
+    let count = u32::try_from(blocks.len()).unwrap_or(u32::MAX);
+    let mut args = vec![
+        prefix.arg(),
+        weight.arg(),
+        proj.arg(),
+        y.arg_mut(),
+        count.arg(),
+        hidden.arg(),
+        eps.arg(),
+    ];
+    // The slots past the blocks are bound to the first and never read.
+    args.extend((0..SCATTERED_BLOCKS).map(|j| blocks.get(j).copied().unwrap_or(first).arg()));
+    ctx.fire(
+        Fire::at("elemwise/res_blend.metal", entry).apply(Grid::of(
+            [
+                rows.checked_mul(256).ok_or_else(|| {
+                    refuse(OP, format!("the grid will not launch: {rows} rows x 256"))
+                })?,
+                1,
+                1,
+            ],
+            [256, 1, 1],
+        )),
+        &args,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
