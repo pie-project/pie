@@ -26,6 +26,11 @@ def resolve_local_model(model: str) -> str:
     candidate = Path(model).expanduser()
     if candidate.exists():
         return str(candidate.resolve())
+    pie_home = Path(os.environ.get("PIE_HOME", "~/.pie")).expanduser()
+    for slug in (model, model.replace("/", "--")):
+        art_dir = pie_home / "artifacts" / slug
+        if art_dir.is_dir() and any(art_dir.glob("*.zt")):
+            return model
     encoded = f"models--{model.replace('/', '--')}"
     roots = []
     if cache := os.environ.get("HF_HUB_CACHE"):

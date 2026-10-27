@@ -156,6 +156,8 @@ DEPLOYMENTS = [
     deployment("qwen35-d3b", weights = BF, kv = BF),
     deployment("qwen35-d0.8b", weights = BF, kv = BF, drafter = "eagle"),
     deployment("qwen35-d0.8b", weights = BF, kv = BF),
+    deployment("qwen35-d4b", weights = BF, kv = BF),
+    deployment("qwen35-d9b", weights = BF, kv = BF),
     deployment("qwen35-d0.8b", weights = BF, kv = BF, drafter = "eagle", parts = ["vision"]),
     deployment("qwen36-27b", weights = U4, kv = BF, parts = ["vision"]),
     deployment("qwen36-27b", weights = BF, kv = BF, drafter = "mtp", parts = ["vision"]),
