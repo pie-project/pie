@@ -890,8 +890,5 @@ pub fn report_err(what: &str, got: &[f32], want: &[f32]) {
         abs = abs.max(e);
         rel = rel.max(e / w.abs().max(1e-6));
     }
-    println!(
-        "KERR {} max_abs={abs} max_rel={rel}",
-        what.replace(' ', "_")
-    );
+    println!("KERR {} max_abs={abs} max_rel={rel}", what.replace(' ', "_"));
 }
