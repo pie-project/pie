@@ -266,29 +266,26 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-
-    if max_tokens == 0 {
-        return Ok(Output {
-            sampler: "gumbel-watermark",
-            text: String::new(),
-            count: 0,
-            secret: input.secret,
-            context_width: input.context_width,
-            watermark: input.watermark,
-            mean_score: 0.0,
-            mean_null_score: 0.0,
-            z_score: 0.0,
-            unique_contexts: 0,
-        });
-    }
+    let pipe = Pipeline::new();
 
     // The model's opening (`<bos>` where it has one) before the raw text: a
     // gemma without it answers noise.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
-    if prompt.is_empty() {
-        prompt.push(0);
+    let prompt: Vec<i32> = inferlet::chat::prefix()
+        .into_iter()
+        .chain(model::encode(&input.prompt))
+        .map(|t| t as i32)
+        .collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe).context("prefill submit")?;
     }
+
     let n = prompt.len() as u32;
 
     let cfg = Cfg {
@@ -302,101 +299,54 @@ async fn main(input: Input) -> Result<Output> {
         capacity: n + max_tokens as u32,
     };
 
-    let mut history: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    let mut history = prompt.clone();
     history.resize(cfg.capacity as usize, -1);
+
+    let tok_in = Channel::from([last]);
+    let rng = Channel::from([input.seed, 0]);
+    let hist_c = Channel::from(history);
+    let hlen_c = Channel::from([n]);
+    let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+    let score_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
+    let null_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
+
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, &Channel::from([0u32, 1]))?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
+    fwd.epilogue(move || {
+        let r = rng.take();
+        let hist = hist_c.take();
+        let hlen = hlen_c.take();
+        let logits = intrinsics::output(0, "logits");
+        let (token, hist_next, score, null) = step(logits, vocab, cfg, &hist, &hlen, &r);
+
+        let r_next = &r + iota(2);
+
+        tok_in.put(&token);
+        tok_out.put(&token);
+        score_out.put(&score);
+        null_out.put(&null);
+        hist_c.put(&hist_next);
+        hlen_c.put(&hlen + 1u32);
+        rng.put(&r_next);
+    });
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut scores: Vec<f32> = Vec::with_capacity(max_tokens);
     let mut nulls: Vec<f32> = Vec::with_capacity(max_tokens);
-
-    // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
-    let toks_p = Channel::from_iter(history.iter().take(n as usize).copied());
-    let embed_indptr_p = Channel::from([0u32, n]);
-    let rng_p = Channel::from([input.seed, 0]);
-    let hist_p = Channel::from(history.clone());
-    let hlen_p = Channel::from([n]);
-    let tok_out_p = Channel::new([1], dtype::i32);
-    let score_out_p = Channel::new([1], dtype::f32);
-    let null_out_p = Channel::new([1], dtype::f32);
-
-    let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
-    fwd_p.epilogue(move || {
-        let r = rng_p.take();
-        let hist = hist_p.take();
-        let hlen = hlen_p.take();
-        let logits = intrinsics::output(0, "logits");
-        let (token, hist_next, score, null) = step(logits, vocab, cfg, &hist, &hlen, &r);
-        let r_next = &r + iota(2);
-        tok_out_p.put(&token);
-        score_out_p.put(&score);
-        null_out_p.put(&null);
-        hist_p.put(&hist_next);
-        hlen_p.put(&hlen + 1u32);
-        rng_p.put(&r_next);
-    });
-
-    let pipe = Pipeline::new();
-    fwd_p.submit(&pipe).context("prefill submit")?;
-
-    let g0 = tok_out_p.take_host::<i32>().await?;
-    let s0 = score_out_p.take_host::<f32>().await?;
-    let n0 = null_out_p.take_host::<f32>().await?;
-    generated.push(g0 as u32);
-    scores.push(s0);
-    nulls.push(n0);
-
-    // ── DECODE LOOP (1-wide, run-ahead). ──
-    if generated.len() < max_tokens {
-        history[n as usize] = g0;
-
-        let tok_in = Channel::from([g0]);
-        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
-        let hist_c = Channel::from(history.clone());
-        let hlen_c = Channel::from([n + 1]);
-        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-        let score_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
-        let null_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
-        let lane1 = Channel::from([0u32, 1u32]);
-
-        let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, &lane1)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
-        fwd.epilogue(move || {
-            // Takes and compute first, puts last (value-id discipline).
-            let r = rng.take();
-            let hist = hist_c.take();
-            let hlen = hlen_c.take();
-            let logits = intrinsics::output(0, "logits");
-            let (token, hist_next, score, null) = step(logits, vocab, cfg, &hist, &hlen, &r);
-
-            let r_next = &r + iota(2);
-
-            tok_in.put(&token);
-            tok_out.put(&token);
-            score_out.put(&score);
-            null_out.put(&null);
-            hist_c.put(&hist_next);
-            hlen_c.put(&hlen + 1u32);
-            rng.put(&r_next);
-        });
-
-        let budget = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget, async || {
-            let t = tok_out
-                .take_host::<i32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            let s = score_out.take_host::<f32>().await?;
-            let z = null_out.take_host::<f32>().await?;
-            generated.push(t as u32);
-            scores.push(s);
-            nulls.push(z);
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    }
+    run_ahead(&pipe, &fwd, max_tokens, async || {
+        let t = tok_out
+            .take_host::<i32>()
+            .await
+            .with_context(|| format!("@{}", generated.len()))?;
+        let s = score_out.take_host::<f32>().await?;
+        let z = null_out.take_host::<f32>().await?;
+        generated.push(t as u32);
+        scores.push(s);
+        nulls.push(z);
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipe.close();
 
     // A context-keyed watermark draws the *same* noise whenever the context
@@ -404,10 +354,9 @@ async fn main(input: Input) -> Result<Output> {
     // already counted. Averaging over it would inflate or deflate the score
     // purely as a function of how much the model looped, so score each distinct
     // context once — what published detectors do by skipping repeated n-grams.
-    let mut full = prompt.clone();
-    full.extend_from_slice(&generated);
-    let mut history_view: Vec<i32> = full.iter().map(|&t| t as i32).collect();
-    history_view.resize(cfg.capacity.max(full.len() as u32) as usize, -1);
+    let mut history_view = prompt.clone();
+    history_view.extend(generated.iter().map(|&t| t as i32));
+    history_view.resize(cfg.capacity.max(history_view.len() as u32) as usize, -1);
 
     let mut seen: HashSet<u32> = HashSet::new();
     let mut kept_score = 0.0f32;
