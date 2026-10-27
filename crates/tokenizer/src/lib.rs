@@ -207,14 +207,6 @@ impl Tokenizer {
         loader::from_file(path)
     }
 
-    pub fn from_tiktoken_file(path: &std::path::Path) -> anyhow::Result<Self> {
-        loader::tiktoken::from_file(path)
-    }
-
-    pub fn from_tiktoken_str(ranks: &str, config_json: &[u8], label: &str) -> anyhow::Result<Self> {
-        loader::tiktoken::from_str(ranks, config_json, label)
-    }
-
     pub fn decoder(self: &Arc<Self>, specials: Specials) -> TokenizerDecoder {
         TokenizerDecoder {
             tokenizer: self.clone(),
@@ -521,12 +513,6 @@ impl Tokenizer {
             .collect()
     }
 
-    pub fn id_to_token_str(&self, id: u32) -> Option<String> {
-        self.bpe
-            .id_to_bytes(id)
-            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-    }
-
     /// The pre-tokenizer's split regex, when it splits by exactly one.
     pub fn split_regex(&self) -> Option<&str> {
         match &self.pipeline {
@@ -534,15 +520,6 @@ impl Tokenizer {
                 Some(splitters[0].regex.as_str())
             }
             _ => None,
-        }
-    }
-
-    pub fn split_regexes(&self) -> Vec<&str> {
-        match &self.pipeline {
-            Pipeline::ByteLevelRegex { splitters, .. } => {
-                splitters.iter().map(|s| s.regex.as_str()).collect()
-            }
-            _ => Vec::new(),
         }
     }
 
