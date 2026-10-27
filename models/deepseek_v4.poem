@@ -723,6 +723,7 @@ SHIPS = [
     ("dsv41-flash", [BF, FP4], BF, None, v41(V41, BF, uniform(FP4))),
     ("dsv41-flash-mini", [BF, FP4], BF, None, v41(V41_MINI, BF, uniform(FP4))),
     ("dsv41-flash", MX8, BF, None, v41(V41, BF, uniform(MX8[1]), MX8[0])),
+    ("dsv41-flash-mini", MX8, dtype.e4m3, None, v41(V41_MINI, BF, uniform(MX8[1]), MX8[0])),
     ("dsv41-flash-mini", MX8, BF, None, v41(V41_MINI, BF, uniform(MX8[1]), MX8[0])),
     ("dsv41-flash-trunc8", MX8, BF, None, v41(V41_TRUNC8, BF, uniform(MX8[1]), MX8[0])),
     ("dsv41-flash", MX8, dtype.nvfp4, None, v41(V41, BF, uniform(MX8[1]), MX8[0])),
