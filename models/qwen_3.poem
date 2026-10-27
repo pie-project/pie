@@ -181,17 +181,28 @@ PUBLISHED = [
 
 # The Bonsai online-Hadamard rotation: a sign diagonal per rotated input width.
 
-def gated_attn(d, w, kv):
-    """Gated attention over `d`'s heads, its projections at `w`, caching in `kv`."""
+BONSAI_BLOCK = 1024
+
+def turns(signs):
+    """Each input's turn by its sign diagonal: the weights reading it are
+    stored against it."""
+    by = lambda s: lambda w: w.turned(s, block = BONSAI_BLOCK)
+    return struct(hidden = by(signs.hidden), ssm = by(signs.ssm), ffn_down = by(signs.ffn_down))
+
+UNTURNED = struct(hidden = lambda w: w, ssm = lambda w: w, ffn_down = lambda w: w)
+
+def gated_attn(d, w, kv, t = UNTURNED):
+    """Gated attention over `d`'s heads, its projections at `w` (stored
+    against `t`'s turns), caching in `kv`."""
     hd = d.head_dim
     return struct(
         rotary_dim = d.rotary_dim,
         theta = d.theta,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
-        qg_proj = weight([2 * d.q_heads * hd, d.hidden], w),
-        k_proj = weight([d.kv_heads * hd, d.hidden], w),
-        v_proj = weight([d.kv_heads * hd, d.hidden], w),
-        o_proj = weight([d.hidden, d.q_heads * hd], w),
+        qg_proj = t.hidden(weight([2 * d.q_heads * hd, d.hidden], w)),
+        k_proj = t.hidden(weight([d.kv_heads * hd, d.hidden], w)),
+        v_proj = t.hidden(weight([d.kv_heads * hd, d.hidden], w)),
+        o_proj = t.ssm(weight([d.hidden, d.q_heads * hd], w)),
         q_norm = weight([hd]),
         q_norm_eps = d.norm_eps,
         k_norm = weight([hd]),
@@ -199,9 +210,9 @@ def gated_attn(d, w, kv):
         kv = kv,
     )
 
-def gdn(d, proj, ba, dense, conv_state, delta_state):
-    """A GDN mixer: its projections at `proj`, beta/alpha's at `ba`, its
-    convolution and gate parameters at `dense`."""
+def gdn(d, proj, ba, dense, conv_state, delta_state, t):
+    """A GDN mixer: its projections at `proj` (stored against `t`'s turns),
+    beta/alpha's at `ba`, its convolution and gate parameters at `dense`."""
     k_w = d.k_heads * d.k_dim
     v_w = d.v_heads * d.v_dim
     qkv = 2 * k_w + v_w
@@ -212,8 +223,8 @@ def gdn(d, proj, ba, dense, conv_state, delta_state):
         v_dim = d.v_dim,
         qkv_width = qkv,
         conv_kernel = d.conv_kernel,
-        in_qkv = weight([qkv, d.hidden], proj),
-        in_z = weight([v_w, d.hidden], proj),
+        in_qkv = t.hidden(weight([qkv, d.hidden], proj)),
+        in_z = t.hidden(weight([v_w, d.hidden], proj)),
         in_b = weight([d.v_heads, d.hidden], ba),
         in_a = weight([d.v_heads, d.hidden], ba),
         conv = weight([qkv, d.conv_kernel]),
@@ -221,7 +232,7 @@ def gdn(d, proj, ba, dense, conv_state, delta_state):
         a_log = weight([d.v_heads], dtype.f32),
         norm = weight([d.v_dim], dtype.f32),
         norm_eps = d.norm_eps,
-        out_proj = weight([d.hidden, v_w], proj),
+        out_proj = t.ssm(weight([d.hidden, v_w], proj)),
         conv_state = conv_state,
         delta_state = delta_state,
     )
@@ -522,13 +533,13 @@ def drafted(id, deploy):
         return dict(FIXED[id])
     return build(tower = tower if vision else None, **over)
 
-def dense_mlp(w, hidden, inter, prefix):
+def dense_mlp(w, hidden, inter, prefix, t = UNTURNED):
     n = lambda s: "{}.{}".format(prefix, s)
     return struct(
         routed = False,
-        gate = weight([inter, hidden], w),
-        up = weight([inter, hidden], w),
-        down = weight([hidden, inter], w),
+        gate = t.hidden(weight([inter, hidden], w)),
+        up = t.hidden(weight([inter, hidden], w)),
+        down = t.ffn_down(weight([hidden, inter], w)),
         inter = inter,
     )
 
@@ -571,6 +582,17 @@ def layout(id, deploy):
         head_at = mix.mlp
     hidden = d.hidden
     attn_at = lambda l: l % d.attn_every == d.attn_every - 1
+    # Ternary-Bonsai stores its projections, table and head rotated against
+    # turned inputs, each input's turn by its width's sign diagonal.
+    signs = None
+    if bonsai:
+        sign = lambda width: weight([1, width])
+        signs = struct(
+            hidden = sign(BONSAI_WIDTHS.hidden),
+            ssm = sign(BONSAI_WIDTHS.ssm),
+            ffn_down = sign(BONSAI_WIDTHS.ffn_down),
+        )
+    t = turns(signs) if bonsai else UNTURNED
 
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
@@ -579,17 +601,17 @@ def layout(id, deploy):
         attn = None
         delta = None
         if attn_at(l):
-            attn = gated_attn(d, proj, "kv.{}".format(l))
+            attn = gated_attn(d, proj, "kv.{}".format(l), t)
         else:
             # Ternary-Bonsai stores the GDN beta/alpha projections in bf16,
             # not ternary: they are served as stored.
             # The FP8 release keeps them unquantized, as does its router.
             ba = dense if bonsai or fp8 or mix != None else proj
-            delta = gdn(d, proj, ba, dense, "conv.{}".format(l), "delta.{}".format(l))
+            delta = gdn(d, proj, ba, dense, "conv.{}".format(l), "delta.{}".format(l), t)
         if d.mlp.routed:
             mlp = routed(n, hidden, d.mlp, experts, mlp_at, gate)
         else:
-            mlp = dense_mlp(mlp_at, hidden, d.mlp.inter, "layer.{}".format(l))
+            mlp = dense_mlp(mlp_at, hidden, d.mlp.inter, "layer.{}".format(l), t)
         return struct(
             attn = attn,
             gdn = delta,
@@ -633,18 +655,10 @@ def layout(id, deploy):
 
     # Ternary-Bonsai's token embedding is gathered whole, which no ternary
     # kernel does: it is served decoded.
-    embed = weight([d.vocab, hidden], dense if bonsai else table)
+    embed = t.hidden(weight([d.vocab, hidden], dense if bonsai else table))
     head = None
     if not d.tied:
-        head = weight([d.vocab, hidden], head_at)
-    signs = None
-    if bonsai:
-        sign = lambda width: weight([1, width])
-        signs = struct(
-            hidden = sign(BONSAI_WIDTHS.hidden),
-            ssm = sign(BONSAI_WIDTHS.ssm),
-            ffn_down = sign(BONSAI_WIDTHS.ffn_down),
-        )
+        head = t.hidden(weight([d.vocab, hidden], head_at))
     return struct(
         hidden = hidden,
         vocab = d.vocab,
@@ -1293,16 +1307,6 @@ def scatter(y, towered, inputs):
     imaged = y.on(fact.has(fact.Media))
     return ops.gather.scatter_live_rows(towered, inputs.patch_routes(), imaged).everywhere()
 
-BONSAI_BLOCK = 1024
-
-def rot_copy(x, signs):
-    """`H·(S·x)` on a copy of `x`, which a sibling projection still reads."""
-    return ops.elemwise.hadamard_signed(ops.elemwise.copy(x), BONSAI_BLOCK, signs)
-
-def rot_take(x, signs):
-    """`H·(S·x)` over `x` itself, dead after its rotated matmul."""
-    return ops.elemwise.hadamard_signed(x, BONSAI_BLOCK, signs)
-
 def caches(m, c):
     kv = c.kv_space(m.kv)
     plane = m.kv_heads * m.head_dim
@@ -1329,14 +1333,6 @@ def forward(m, inputs):
     ids = inputs.tokens()
     y = ops.gather.embed(ids, m.embed, m.vocab)
 
-    # Bonsai's token embedding is stored rotated (`H·S·row`), and the residual
-    # stream wants `S·(H·row)`: three plain-or-signed Hadamards make that
-    # inverse order out of the one op.
-    if m.bonsai != None:
-        hy = ops.elemwise.hadamard_plain(y, BONSAI_BLOCK)
-        hshy = ops.elemwise.hadamard_signed(hy, BONSAI_BLOCK, m.bonsai.hidden)
-        y = ops.elemwise.hadamard_plain(hshy, BONSAI_BLOCK)
-
     if towered != None:
         y = scatter(y, towered, inputs)
 
@@ -1353,13 +1349,13 @@ def forward(m, inputs):
         if w.attn != None:
             o = attn_mixer(x, inputs, m, trunk_inputs, w.attn)
         else:
-            o = gdn_mixer(x, inputs, w.gdn, m.bonsai)
+            o = gdn_mixer(x, inputs, w.gdn)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         y = ops.elemwise.residual_add(o, y)
 
         x = ops.elemwise.rmsnorm_plus_one(y, w.mlp_norm, w.mlp_norm_eps)
-        y = ops.elemwise.residual_add(mlp(x, w.mlp, m.bonsai), y)
+        y = ops.elemwise.residual_add(mlp(x, w.mlp), y)
         if dr != None:
             fused = tap(dr, l, y, fused)
         return (y, fused)
@@ -1373,24 +1369,18 @@ def forward(m, inputs):
         hb = arm(dr, inputs, fused, h_block, block_rows(dr))
         x = merge([hb, x])
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    # Bonsai's output head is stored rotated: its input turns with it.
-    head_in = rot_copy(x, m.bonsai.hidden) if m.bonsai != None else x
-    logits = ops.linear.lm_head(head_in, head)
+    logits = ops.linear.lm_head(x, head)
     if dr != None:
         plant_readout(dr, logits, inputs, x, block_rows(dr))
     if m.mtp != None:
         draft(m, inputs, x, logits, head)
     output("logits", logits)
 
-def mlp(x, f, bonsai):
+def mlp(x, f):
     if not f.routed:
-        # Bonsai: the gate and up projections share the rotated residual;
-        # down rotates the swiglu intermediate.
-        gate_in = rot_copy(x, bonsai.hidden) if bonsai != None else x
-        gate, up = ops.linear.matmul(gate_in, f.gate), ops.linear.matmul(gate_in, f.up)
+        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
         h = ops.linear.glu(gate, gating.swiglu(), up = up)
-        down_in = rot_take(h, bonsai.ffn_down) if bonsai != None else h
-        return ops.linear.matmul(down_in, f.down)
+        return ops.linear.matmul(h, f.down)
     return run_moe(x, f)
 
 def draft(m, inputs, x, logits, head):
@@ -1429,12 +1419,9 @@ def attn_mixer(x, inputs, m, lanes, a):
     write_page = inputs.write_page(a.kv)
     write_offset = inputs.write_offset(a.kv)
     d = m.head_dim
-    # Bonsai: q (with its gate), k and v all read one rotated copy of the
-    # residual; the LoRA correction still reads it unrotated.
-    qkv_in = rot_copy(x, m.bonsai.hidden) if m.bonsai != None else x
-    q, gate = ops.gather.split_q_gate(ops.linear.matmul(qkv_in, a.qg_proj), d)
-    k = ops.linear.matmul(qkv_in, a.k_proj)
-    v = ops.linear.matmul(qkv_in, a.v_proj)
+    q, gate = ops.gather.split_q_gate(ops.linear.matmul(x, a.qg_proj), d)
+    k = ops.linear.matmul(x, a.k_proj)
+    v = ops.linear.matmul(x, a.v_proj)
     q = ops.elemwise.rmsnorm_per_head_plus_one(q, a.q_norm, d, a.q_norm_eps)
     k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, d, a.k_norm_eps)
     q, k = rotate(q, k, inputs, m, a)
@@ -1450,19 +1437,13 @@ def attn_mixer(x, inputs, m, lanes, a):
     o = ops.attn.attend(q, lanes, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, mask = True, scores = True)
     if m.rotate_kv:
         o = ops.elemwise.hadamard_plain(o, d)
-    # Bonsai: the gated output rotates by the 6144-wide signs, as `ssm_out`'s.
-    gated = ops.elemwise.gate_sigmoid_mul(o, gate)
-    o_in = rot_take(gated, m.bonsai.ssm) if m.bonsai != None else gated
-    return ops.linear.matmul(o_in, a.o_proj)
+    return ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(o, gate), a.o_proj)
 
-def gdn_mixer(x, inputs, g, bonsai):
+def gdn_mixer(x, inputs, g):
     conv_state = inputs.state(g.conv_state)
     delta_state = inputs.state(g.delta_state)
-    # Bonsai: q, k, v and z read the rotated residual; beta and alpha the
-    # unrotated one.
-    qkvz_in = rot_copy(x, bonsai.hidden) if bonsai != None else x
-    qkv = ops.linear.matmul(qkvz_in, g.in_qkv)
-    z = ops.linear.matmul(qkvz_in, g.in_z)
+    qkv = ops.linear.matmul(x, g.in_qkv)
+    z = ops.linear.matmul(x, g.in_z)
     # The gates read each v head's beta and alpha side by side.
     ba = ops.gather.concat_cols([ops.linear.matmul(x, g.in_b), ops.linear.matmul(x, g.in_a)])
 
@@ -1483,5 +1464,4 @@ def gdn_mixer(x, inputs, g, bonsai):
         return ops.elemwise.rmsnorm_gated(core, zc, g.norm, g.v_dim, g.norm_eps, "silu")
 
     o = branch(qkv, [(fact.single_token(), step)], otherwise = chunked)
-    o_in = rot_take(o, bonsai.ssm) if bonsai != None else o
-    return ops.linear.matmul(o_in, g.out_proj)
+    return ops.linear.matmul(o, g.out_proj)
