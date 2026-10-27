@@ -31,6 +31,7 @@ mod kernels_norm;
 mod kernels_norm_fused;
 mod kernels_pack;
 mod kernels_ple;
+mod kernels_replay;
 mod kernels_pool;
 mod kernels_quant;
 mod kernels_rope;
