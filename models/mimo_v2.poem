@@ -6,12 +6,6 @@ load("//lib/adapters.poem", "banks")
 MIMO = template("mimo")
 TOKENIZER = tokenizer(markers = [["<|im_end|>", "<|endoftext|>", "<think>", "</think>"]])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the packed q, k and v (laid out padded or as stored) and the sinks
-# by their heads, the dense and routed gates and ups by their channels, the
-# output and down projections by their rows, the head by its vocabulary.
-CUTS = "inferred"
-
 def mimo(id, layers, **kwargs):
     return model(id, template = MIMO, tokenizer = TOKENIZER, arch = "mimo_v2", layers = layers, vocab = 152576, **kwargs)
 
@@ -124,7 +118,7 @@ def layout(id, deploy):
         kv_w = kv_heads * PADDED
         q_qk = d.q_heads * d.qk_head_dim
         kv_kv = kv_heads * (d.qk_head_dim + d.v_head_dim)
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         if l in d.dense:
             di = d.dense_inter
             mlp = struct(

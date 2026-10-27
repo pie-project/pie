@@ -16,13 +16,6 @@ MODELS = [
     model("inkling-small-mini-l7-e8", mini = True, template = INKLING, tokenizer = TOKENIZER, arch = "inkling", layers = 7, vocab = 200058),
 ]
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k, v and the relative bias's projection by their heads (k's
-# and v's short convolutions and their states with them), the dense and
-# routed gates and ups by their channels, the output and down projections by
-# their rows; the convolutions after them read the summed rows whole.
-CUTS = "inferred"
-
 DEPLOYMENTS = [
     deployment("inkling", weights = dtype.bf16, kv = dtype.bf16),
     deployment("inkling-mini-l7-e8", weights = dtype.bf16, kv = dtype.bf16),
@@ -95,7 +88,6 @@ GLOBAL = 1
 def layout(id, deploy):
     d = DIMS[id]
     w = roles(deploy, "w", exact = True).w
-    dense = compute(w)
     hidden = d.hidden
     hd = d.head_dim
     q_w = d.heads * hd
@@ -104,7 +96,7 @@ def layout(id, deploy):
 
     def layer(l):
         vec = lambda s, length: weight([length])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         if (l + 1) % d.global_every == 0:
             reading, kv_heads, extent = GLOBAL, d.global_kv_heads, d.global_extent
         else:

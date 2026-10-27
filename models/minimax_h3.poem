@@ -7,12 +7,6 @@ load("//lib/spoken.poem", "QWEN_STOP")
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the denoiser's packed q, k and v and its packed fc1 by their
-# heads and channels, its output projection and fc2 by their rows; the text
-# encoder's and the timestep embedder's likewise.
-CUTS = "inferred"
-
 MODELS = [
     model("minimax-h3-fl2va", template = CHATML, tokenizer = TOKENIZER, arch = "minimax_h3", layers = 50, vocab = 151936),
     model("minimax-h3-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "minimax_h3", layers = 3, vocab = 0),
