@@ -6,7 +6,7 @@ use crate::tensor::{Bank, Tensor};
 
 const ROUTER_MAX_EXPERTS: u32 = 1024;
 
-const ROUTER_MAX_TOP_K: u32 = 16;
+const ROUTER_MAX_TOP_K: u32 = 32;
 
 const SELECT_GROUP: u32 = 128;
 
