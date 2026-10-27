@@ -120,8 +120,10 @@ impl<'a> Streams<'a> {
             return matches!(self.role(node, &mut None), Some(Role::Intrinsic));
         }
         match self.role(node, &mut None) {
+            Some(Role::Rng) => self.readers[value as usize].len() <= 1,
             Some(Role::Map | Role::Broadcast) => {
-                op.args.iter().all(|&a| self.remat_depth(a, depth + 1))
+                (depth == 0 || self.readers[value as usize].len() <= 1)
+                    && op.args.iter().all(|&a| self.remat_depth(a, depth + 1))
             }
             _ => false,
         }
@@ -583,6 +585,7 @@ struct Pass<'p> {
     hoisted: Vec<(u32, Dtype)>,
     loaded: Vec<(u32, Dtype)>,
     intrinsics: Vec<usize>,
+    rngs: Vec<usize>,
     prologue: String,
     body: Bodies,
     pointer: &'p mut dyn FnMut(u32) -> String,
@@ -631,6 +634,8 @@ fn rematerialize(streams: &Streams<'_>, value: u32, pass: &mut Pass<'_>) -> Stri
     let out = streams.bases[node];
     if op.tag == tags::OUTPUT {
         intrinsic_read(streams, node, out, pass);
+    } else if matches!(op.tag, tags::RNG | tags::RNG_KEYED) {
+        rng_read(streams, node, out, pass);
     } else {
         let out_dtype = streams.dtype(out);
         let expr = map_expr(streams, node, out_dtype, pass);
@@ -641,6 +646,46 @@ fn rematerialize(streams: &Streams<'_>, value: u32, pass: &mut Pass<'_>) -> Stri
         pass.registers.push((out, out_dtype));
     }
     format!("r{out}")
+}
+
+fn rng_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<'_>) {
+    let op = &streams.ops[node];
+    let tag = op.tag;
+    if !pass.rngs.contains(&node) {
+        pass.rngs.push(node);
+        let _ = writeln!(pass.prologue, "    M1OpParams p{node} = params[{node}u];");
+        let _ = writeln!(pass.prologue, "    p{node}.rng_seed = 0u;");
+        let _ = writeln!(
+            pass.prologue,
+            "    p{node}.imm3 = lane_row * descriptors[p{node}.o0].len;"
+        );
+        if tag == tags::RNG {
+            let _ = writeln!(
+                pass.prologue,
+                "    const m1_u64 seed{node} = ptir_rng_seed_eff_stream((m1_u32)p{node}.rng_seed, p{node}.imm);"
+            );
+        } else {
+            let state = op.args[0];
+            let sp = (pass.pointer)(state);
+            let _ = writeln!(
+                pass.prologue,
+                "    const m1_u64 seed{node} = ptir_rng_state_seed({sp}, descriptors[{state}u]);"
+            );
+        }
+    }
+    if op.kind == eta_ir::types::RngKind::Normal as u8 {
+        pass.body.both(&format!(
+            "      const float r{out} = ptir_rng_hash_normal(seed{node}, i + p{node}.imm3);"
+        ));
+    } else {
+        pass.body.both(&format!(
+            "      const float u{node} = ptir_rng_hash_uniform(seed{node}, i + p{node}.imm3);"
+        ));
+        pass.body.both(&format!(
+            "      const float r{out} = p{node}.kind == 0u ? u{node} : -logf(-logf(u{node}));"
+        ));
+    }
+    pass.registers.push((out, Dtype::F32));
 }
 
 fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<'_>) {
@@ -844,11 +889,32 @@ pub(super) fn emit_stream(
         "    const m1_u32 stream_width = descriptors[{witness}u].len;"
     );
 
+    let mut needed = vec![false; members.len()];
+    for idx in (0..members.len()).rev() {
+        let node = members[idx].node;
+        let out = bases[node];
+        if needed[idx]
+            || matches!(members[idx].role, Role::Reduce | Role::Argmax)
+            || streams.escapes(out, &members)
+        {
+            needed[idx] = true;
+            for arg in ops[node].reads() {
+                if let Some(p) = members.iter().position(|m| bases[m.node] == arg) {
+                    needed[p] = true;
+                }
+            }
+        }
+    }
+    if !needed.iter().any(|&b| b) {
+        return Some(members.len());
+    }
+
     let mut pass = Pass {
         registers: Vec::new(),
         hoisted: Vec::new(),
         loaded: Vec::new(),
         intrinsics: Vec::new(),
+        rngs: Vec::new(),
         prologue: String::new(),
         body: Bodies::default(),
         pointer,
@@ -857,7 +923,10 @@ pub(super) fn emit_stream(
     let mut float_reductions = 0u32;
     let mut argmaxes = 0u32;
 
-    for member in &members {
+    for (idx, member) in members.iter().enumerate() {
+        if !needed[idx] {
+            continue;
+        }
         let node = member.node;
         let op = &ops[node];
         let out = bases[node];
@@ -884,32 +953,7 @@ pub(super) fn emit_stream(
                 }
             }
             Role::Rng => {
-                let _ = writeln!(pass.prologue, "    M1OpParams p{node} = params[{node}u];");
-                let _ = writeln!(pass.prologue, "    p{node}.rng_seed = 0u;");
-                let _ = writeln!(
-                    pass.prologue,
-                    "    p{node}.imm3 = lane_row * descriptors[p{node}.o0].len;"
-                );
-                if tag == tags::RNG {
-                    let _ = writeln!(
-                        pass.prologue,
-                        "    const m1_u64 seed{node} = ptir_rng_seed_eff_stream((m1_u32)p{node}.rng_seed, p{node}.imm);"
-                    );
-                } else {
-                    let state = op.args[0];
-                    let sp = (pass.pointer)(state);
-                    let _ = writeln!(
-                        pass.prologue,
-                        "    const m1_u64 seed{node} = ptir_rng_state_seed({sp}, descriptors[{state}u]);"
-                    );
-                }
-                if op.kind == eta_ir::types::RngKind::Normal as u8 {
-                    pass.body.both(&format!("      const float r{out} = ptir_rng_hash_normal(seed{node}, i + p{node}.imm3);"));
-                } else {
-                    pass.body.both(&format!("      const float u{node} = ptir_rng_hash_uniform(seed{node}, i + p{node}.imm3);"));
-                    pass.body.both(&format!("      const float r{out} = p{node}.kind == 0u ? u{node} : -logf(-logf(u{node}));"));
-                }
-                pass.registers.push((out, Dtype::F32));
+                rng_read(streams, node, out, &mut pass);
                 if streams.escapes(out, &members) {
                     let ptr = (pass.pointer)(out);
                     pass.body.store(Dtype::F32, &ptr, &format!("r{out}"));
@@ -1121,6 +1165,15 @@ pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
         let node = streams.order[at];
         at += 1;
         if streams.skipped[node] != 0 {
+            continue;
+        }
+        let op = &ops[node];
+        let base = bases[node];
+        if matches!(op.tag, tags::SCATTER_ADD | tags::SCATTER_SET)
+            && super::fused::can_elide_scatter_base(stage, region, &ops, &bases, node, base)
+            && !region.sinks.iter().any(|s| s.value == base)
+        {
+            spent.push(base);
             continue;
         }
         let Some(members) = streams.plan(at - 1) else {
