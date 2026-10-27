@@ -720,6 +720,8 @@ def block_mods(side, s, prompt, dim):
     return struct(m = m, av = av, av_gate = av_gate, prompt_ss = prompt_ss)
 
 def run_block(xv, xa, b, d, mv, ma, ctx, actx, vg, ag, v_time, cg, acg):
+    c = modulate(ctx, mv.prompt_ss, cg.lanes)
+    ac = modulate(actx, ma.prompt_ss, acg.lanes)
     hv = norm_modulate(xv, mv.m.msa_ss, vg.lanes)
     ov = self_attention(hv, b.video.self_attn, d.rope_dims, vg)
     xv = ops.elemwise.gated_residual_add(xv, mv.m.msa_gate, ov, vg.lanes)
@@ -729,12 +731,10 @@ def run_block(xv, xa, b, d, mv, ma, ctx, actx, vg, ag, v_time, cg, acg):
     xa = ops.elemwise.gated_residual_add(xa, ma.m.msa_gate, oa, ag.lanes)
 
     hv = norm_modulate(xv, mv.m.q_ss, vg.lanes)
-    c = modulate(ctx, mv.prompt_ss, cg.lanes)
     ov = cross_attention(hv, c, b.video.cross, None, vg, cg)
     xv = ops.elemwise.gated_residual_add(xv, mv.m.q_gate, ov, vg.lanes)
 
     ha = norm_modulate(xa, ma.m.q_ss, ag.lanes)
-    ac = modulate(actx, ma.prompt_ss, acg.lanes)
     oa = cross_attention(ha, ac, b.audio.cross, None, ag, acg)
     xa = ops.elemwise.gated_residual_add(xa, ma.m.q_gate, oa, ag.lanes)
 
@@ -827,8 +827,9 @@ def denoise(arm, m):
 
     xv = run_linear(dit.video.patchify, patched(vid, d))
     xa = run_linear(dit.audio.patchify, patched(aud, d))
-    ctx_rows = connect(ctx, video_conn, 0, m)
-    actx_rows = connect(actx, audio_conn, 1, m)
+    ctx_rows, actx_rows = connect(ctx, video_conn, 0, m), connect(actx, audio_conn, 1, m)
+    # Normed last, so each norm lies near the first block's modulate of it.
+    ctx_rows, actx_rows = rms(ctx_rows), rms(actx_rows)
 
     def step(l, b, carried):
         xv, xa = carried
@@ -884,7 +885,7 @@ def connect(arm, conn, side, m):
         f = run_linear(b.ffn.down, ops.elemwise.gelu(run_linear(b.ffn.up, n), True))
         return ops.elemwise.residual_add(f, h)
 
-    return rms(arm.fold_layers(conn.blocks, h, step))
+    return arm.fold_layers(conn.blocks, h, step)
 
 def vconv(x, g, c):
     shape = conv3d(k = [3, 3, 3], stride = [1, 1, 1], pad = [1, 1, 1], pad_back = [1, 1, 1], time_pad = "replicate")
