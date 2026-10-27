@@ -84,7 +84,8 @@ export class Frames {
   */
   static fromChannel(ch: Channel, width: number, height: number, count: number, fps: number): Frames;
   /**
-  * **THE WAY IN**: decode an encoded still (PNG / JPEG / GIF / WebP)
+  * **THE WAY IN**: decode an encoded still (PNG / JPEG / GIF / WebP) or a
+  * y4m clip (4:2:0; an mp4 is refused with the ffmpeg line to convert it)
   * into a handle. The format is SNIFFED from the bytes — a caller
   * holding a file holds its magic too, and a stated format that
   * disagreed with the bytes would be one more thing to get wrong.
