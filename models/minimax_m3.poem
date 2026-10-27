@@ -37,6 +37,7 @@ DEPLOYMENTS = [
     deployment("minimax-m3-mini", weights = BF, kv = BF),
     deployment("minimax-m3-mini", weights = U4, kv = BF),
     deployment("minimax-m3-mini", weights = MX8, kv = BF),
+    deployment("minimax-m3-mini", weights = [MX8, dtype.nvfp4a4], kv = BF),
 ]
 
 # The weights of MiniMax-M3's language model: GQA with plus-one q/k norms and
