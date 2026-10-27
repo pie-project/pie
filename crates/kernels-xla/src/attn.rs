@@ -6,6 +6,7 @@ pub mod mla;
 pub mod paged;
 pub mod pool;
 pub mod ragged;
+pub mod replay;
 pub mod rel;
 pub mod score;
 pub mod voxel;

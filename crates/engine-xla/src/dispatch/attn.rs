@@ -267,9 +267,67 @@ impl Run<'_> {
                 score: IndexScore::PooledTokens,
                 ..
             } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
-            // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
-            Attn::ReplayFloor { .. } | Attn::KvEnds { .. } | Attn::WindowSink { .. } => {
-                Err(kernels_xla::Error::Unsupported { op: op.name() })
+            Attn::ReplayFloor {
+                positions,
+                state,
+                mark,
+                floor,
+            } => crate::lower::attn::replay_floor(
+                self.ctx(),
+                self.ragged(*positions),
+                self.recurrent(*state),
+                *mark,
+                self.tensor(*floor),
+            ),
+            Attn::KvEnds {
+                request_of_token,
+                cache,
+                ends,
+            } => {
+                // The pool's last-page depths: the geometry its page table
+                // was staged with.
+                let pool = *self.pool(*cache);
+                let last_page_len = self
+                    .bindings()
+                    .geometry
+                    .iter()
+                    .find(|g| g.indptr == Some(pool.page_indptr))
+                    .and_then(|g| g.last_page_len)
+                    .ok_or(kernels_xla::Error::Unsupported { op: op.name() })?;
+                crate::lower::attn::kv_ends(
+                    self.ctx(),
+                    self.tensor(*request_of_token),
+                    &pool,
+                    last_page_len,
+                    self.tensor(*ends),
+                )
+            }
+            Attn::WindowSink {
+                q,
+                positions,
+                request_of_token,
+                cache,
+                sink,
+                window,
+                head_dim,
+                sm_scale,
+                o,
+            } => {
+                let o = self.tensor(*o);
+                let lse = self.temp(o.rows, o.width / (*head_dim).max(1), poem_ir::Dtype::F32);
+                crate::lower::attn::window_sink(
+                    self.ctx(),
+                    self.tensor(*q),
+                    self.tensor(*positions),
+                    self.tensor(*request_of_token),
+                    *self.pool(*cache),
+                    self.tensor(*sink),
+                    *window,
+                    *head_dim,
+                    *sm_scale,
+                    o,
+                    lse,
+                )
             }
             Attn::Decode {
                 q,
