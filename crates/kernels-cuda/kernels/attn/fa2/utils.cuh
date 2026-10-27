@@ -336,11 +336,6 @@ __forceinline__ __device__ __host__ constexpr T1 ceil_div(const T1 x, const T2 y
   return (x + y - 1) / y;
 }
 
-template <typename T1, typename T2>
-__forceinline__ __device__ __host__ constexpr T1 round_up(const T1 x, const T2 y) noexcept {
-  return ceil_div(x, y) * y;
-}
-
 #define LOOP_SPLIT_MASK(iter, COND1, COND2, ...)       \
   {                                                    \
     _Pragma("unroll 1") for (; (COND1); (iter) -= 1) { \

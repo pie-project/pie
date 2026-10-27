@@ -160,27 +160,6 @@ struct Elem<float> {
     static __device__ __forceinline__ float from_f32(float v) { return v; }
 };
 
-__device__ __forceinline__ float block_sum(float local, float* smem) {
-    const unsigned int active = 0xffffffffu;
-    for (int off = 16; off > 0; off >>= 1) {
-        local += __shfl_down_sync(active, local, off);
-    }
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int warps = static_cast<int>((blockDim.x + 31) >> 5);
-    if (lane == 0) smem[warp] = local;
-    __syncthreads();
-    if (warp == 0) {
-        float v = (static_cast<int>(threadIdx.x) < warps) ? smem[threadIdx.x] : 0.f;
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_down_sync(active, v, off);
-        }
-        if (lane == 0) smem[0] = v;
-    }
-    __syncthreads();
-    return smem[0];
-}
-
 // Every lane's sum of `v` over its warp, offsets 16, 8, 4, 2, 1: the
 // butterfly the kernels walked by hand, so the result is bit for bit theirs.
 template <class T>
