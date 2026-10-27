@@ -220,10 +220,8 @@ async fn main(input: Input) -> Result<Output> {
         &input.prompt,
     );
     prompt.extend(chat::cue());
-    if prompt.is_empty() {
-        prompt.push(0);
-    }
-    let n = prompt.len() as u32;
+    let prompt: Vec<i32> = prompt.into_iter().map(|t| t as i32).collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
 
     let mut trie = Trie::new();
     let mut reports = Vec::with_capacity(input.rounds);
@@ -240,25 +238,35 @@ async fn main(input: Input) -> Result<Output> {
         // rounds share this inferlet's single pipeline.
         let ws = WorkingSet::new();
 
-        let prompt_tokens = Channel::from_iter(prompt.iter().map(|&t| t as i32));
-        let pre_indptr = Channel::from([0u32, n]);
-        let pre_mask = Channel::new([vocab], dtype::bool);
-        let pre_alpha_idx = Channel::new([pairs as u32], dtype::u32);
-        let pre_alpha_val = Channel::new([pairs as u32], dtype::f32);
-        let pre_rng = Channel::from([input.seed ^ (round as u32 * 0x9E37), 0]);
-        let pre_token = Channel::new([1], dtype::i32);
-        let pre_mass = Channel::new([1], dtype::f32);
-        let pre_prob = Channel::new([1], dtype::f32);
-        let pre_wmass = Channel::new([1], dtype::f32);
+        if !head.is_empty() {
+            let fill = ForwardPass::new();
+            fill.embed(
+                &Channel::from(head),
+                &Channel::from([0u32, head.len() as u32]),
+            )?;
+            fill.state(&[&ws], StateGeometry::folding())?;
+            fill.submit(&pipeline).context("ASAp prefill")?;
+        }
 
-        let prefill = ForwardPass::new();
-        prefill.embed(&prompt_tokens, &pre_indptr)?;
-        prefill.state(&[&ws], StateGeometry::folding())?;
-        prefill.epilogue(move || {
-            let allowed = pre_mask.take();
-            let idx = pre_alpha_idx.take();
-            let val = pre_alpha_val.take();
-            let r = pre_rng.take();
+        let token_in = Channel::from([last]);
+        let embed_indptr = Channel::from([0u32, 1]);
+        let mask_ch = Channel::new([vocab], dtype::bool);
+        let alpha_idx = Channel::new([pairs as u32], dtype::u32);
+        let alpha_val = Channel::new([pairs as u32], dtype::f32);
+        let rng = Channel::from([input.seed ^ (round as u32 * 0x9E37), 0]);
+        let token_out = Channel::new([1], dtype::i32);
+        let mass_out = Channel::new([1], dtype::f32);
+        let prob_out = Channel::new([1], dtype::f32);
+        let wmass_out = Channel::new([1], dtype::f32);
+
+        let decode = ForwardPass::new();
+        decode.embed(&token_in, &embed_indptr)?;
+        decode.state(&[&ws], StateGeometry::folding())?;
+        decode.epilogue(move || {
+            let allowed = mask_ch.take();
+            let idx = alpha_idx.take();
+            let val = alpha_val.take();
+            let r = rng.take();
             let (token, mass, prob, wmass) = asap_step(
                 intrinsics::output(0, "logits"),
                 vocab,
@@ -267,94 +275,47 @@ async fn main(input: Input) -> Result<Output> {
                 &val,
                 &r,
             );
-            pre_token.put(&token);
-            pre_mass.put(&mass);
-            pre_prob.put(&prob);
-            pre_wmass.put(&wmass);
+
+            token_in.put(&token);
+            rng.put(&r + iota(2));
+            token_out.put(&token);
+            mass_out.put(&mass);
+            prob_out.put(&prob);
+            wmass_out.put(&wmass);
         });
 
-        let (idx0, val0) = sparse_alpha(&trie, 0, vocab, pairs);
-        pre_mask.put(unpack_mask(&constraint.mask(), vocab));
-        pre_alpha_idx.put(idx0);
-        pre_alpha_val.put(val0);
-        prefill.submit(&pipeline).context("ASAp prefill")?;
-
-        let first = pre_token.take_host::<i32>().await?;
-        let mut path_nodes = vec![0usize];
-        let mut masses = vec![pre_mass.take_host::<f32>().await?];
-        let mut probs = vec![pre_prob.take_host::<f32>().await?];
-        let mut weighted_masses = vec![pre_wmass.take_host::<f32>().await?];
+        let mut node = 0usize;
+        let mut path_nodes = vec![node];
+        let mut masses = Vec::new();
+        let mut probs = Vec::new();
+        let mut weighted_masses = Vec::new();
         // The α the step actually used for the token it took.
-        let mut used_alpha = vec![alpha_of(&trie, 0, first as u32)];
+        let mut used_alpha = Vec::new();
+        let mut generated = Vec::new();
 
-        let mut generated = vec![first as u32];
-        constraint
-            .accept_tokens(&[first as u32])
-            .context("grammar rejected the prefill token")?;
-        let mut node = trie.child(0, first as u32);
-        path_nodes.push(node);
+        // Strictly sequential: each step's `α` depends on the trie node the
+        // previous token landed on, so nothing can be submitted ahead.
+        while !constraint.is_terminated() && generated.len() < input.max_tokens {
+            let (idx, val) = sparse_alpha(&trie, node, vocab, pairs);
+            mask_ch.put(unpack_mask(&constraint.mask(), vocab));
+            alpha_idx.put(idx);
+            alpha_val.put(val);
+            decode.submit(&pipeline).context("ASAp decode")?;
 
-        if !constraint.is_terminated() && generated.len() < input.max_tokens {
-            let token_in = Channel::from([first]);
-            let embed_indptr = Channel::from([0u32, 1]);
-            let mask_ch = Channel::new([vocab], dtype::bool);
-            let alpha_idx = Channel::new([pairs as u32], dtype::u32);
-            let alpha_val = Channel::new([pairs as u32], dtype::f32);
-            let rng = Channel::from([input.seed ^ (round as u32 * 0x9E37) ^ 0x5bd1, 0]);
-            let token_out = Channel::new([1], dtype::i32);
-            let mass_out = Channel::new([1], dtype::f32);
-            let prob_out = Channel::new([1], dtype::f32);
-            let wmass_out = Channel::new([1], dtype::f32);
-
-            let decode = ForwardPass::new();
-            decode.embed(&token_in, &embed_indptr)?;
-            decode.state(&[&ws], StateGeometry::folding())?;
-            decode.epilogue(move || {
-                let allowed = mask_ch.take();
-                let idx = alpha_idx.take();
-                let val = alpha_val.take();
-                let r = rng.take();
-                let (token, mass, prob, wmass) = asap_step(
-                    intrinsics::output(0, "logits"),
-                    vocab,
-                    &allowed,
-                    &idx,
-                    &val,
-                    &r,
-                );
-
-                token_in.put(&token);
-                rng.put(&r + iota(2));
-                token_out.put(&token);
-                mass_out.put(&mass);
-                prob_out.put(&prob);
-                wmass_out.put(&wmass);
-            });
-
-            // Strictly sequential: each step's `α` depends on the trie node the
-            // previous token landed on, so nothing can be submitted ahead.
-            while !constraint.is_terminated() && generated.len() < input.max_tokens {
-                let (idx, val) = sparse_alpha(&trie, node, vocab, pairs);
-                mask_ch.put(unpack_mask(&constraint.mask(), vocab));
-                alpha_idx.put(idx);
-                alpha_val.put(val);
-                decode.submit(&pipeline).context("ASAp decode")?;
-
-                let token = token_out.take_host::<i32>().await? as u32;
-                masses.push(mass_out.take_host::<f32>().await?);
-                probs.push(prob_out.take_host::<f32>().await?);
-                weighted_masses.push(wmass_out.take_host::<f32>().await?);
-                used_alpha.push(alpha_of(&trie, node, token));
-                generated.push(token);
-                constraint.accept_tokens(&[token]).map_err(|e| {
-                    format!(
-                        "round {round} step {}: grammar rejected token {token}: {e}",
-                        generated.len() - 1
-                    )
-                })?;
-                node = trie.child(node, token);
-                path_nodes.push(node);
-            }
+            let token = token_out.take_host::<i32>().await? as u32;
+            masses.push(mass_out.take_host::<f32>().await?);
+            probs.push(prob_out.take_host::<f32>().await?);
+            weighted_masses.push(wmass_out.take_host::<f32>().await?);
+            used_alpha.push(alpha_of(&trie, node, token));
+            generated.push(token);
+            constraint.accept_tokens(&[token]).map_err(|e| {
+                format!(
+                    "round {round} step {}: grammar rejected token {token}: {e}",
+                    generated.len() - 1
+                )
+            })?;
+            node = trie.child(node, token);
+            path_nodes.push(node);
         }
 
         // Fold the trajectory back into the trie. A path that reached an
