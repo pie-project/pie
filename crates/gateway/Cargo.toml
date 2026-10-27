@@ -41,7 +41,6 @@ tracing = "0.1"
 [dev-dependencies]
 builtins = { path = "../builtins", features = ["test-policies"] }
 controller = { path = "../controller" }
-tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [lints]

@@ -32,7 +32,6 @@ regex = "1"
 thiserror = "2.0"
 
 [dev-dependencies]
-anyhow = "1.0.104"
 
 [lints]
 workspace = true
