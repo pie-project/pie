@@ -2067,7 +2067,7 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.matmul";
         if !linear::gemm_sm100::supported() {
-            return self.matmul_a16(OP, act, w, block_scales, y);
+            return self.matmul_a16(OP, act, w, block_scales, y, Some(quant));
         }
         if let Some(block_scales) = block_scales {
             return self.fp8_block_matmul(act, w, quant, block_scales, y);
@@ -2222,6 +2222,7 @@ impl Run<'_> {
         w: ValueId,
         block_scales: Option<ValueId>,
         y: ValueId,
+        quant: Option<ActQuant>,
     ) -> Result<(), kernels_cuda::Error> {
         let Some(block_scales) = block_scales else {
             return self.row_major_matmul(&act, &w, &y);
@@ -2231,7 +2232,21 @@ impl Run<'_> {
         if atoms.dtype != Dtype::U8 {
             return Err(unlaid(op));
         }
-        let act = self.tensor(act);
+        let mut act = self.tensor(act);
+        // The rows as the deployment quantizes them, read back to bf16
+        // (exact), so the W8A16 product sees the W8A8 one's operands.
+        if let Some(ActQuant::E4m3 { gran }) = quant
+            && linear::moe::fp8_w8a8_capable()
+            && act.width.is_multiple_of(gran)
+        {
+            let fmt = act_quant::Format::E4m3 { gran };
+            let back = self.ctx().scratch_stream(
+                op,
+                READ_BACK,
+                act.rows as usize * act.width as usize * 2,
+            )? as u64;
+            act = act_quant::read_back(self.ctx(), op, fmt, act_quant::Source::rows(act, None), back)?;
+        }
         let mut out = self.tensor(y);
         // A batch's rows on the plane's bf16 copy (`kernel.gemm.fp8_shadow`).
         if act.rows > linear::w8a16::MMA_UNTIL
