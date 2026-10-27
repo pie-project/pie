@@ -92,8 +92,11 @@ struct Cfg {
 ///
 /// Returns `(keep_mask, kept_count, kept_mass)`.
 fn top_a_keep(logits: &Tensor, vocab: u32, a: f32) -> (Tensor, Tensor, Tensor) {
-    let probs = softmax(logits);
-    let p_max = reduce_max(&probs);
+    let max_l = reduce_max(logits);
+    let exps = exp(logits - broadcast(&max_l, [vocab]));
+    let sum_e = reduce_sum(&exps);
+    let probs = &exps / broadcast(&sum_e, [vocab]);
+    let p_max = recip(&sum_e);
     let threshold = a * (&p_max * &p_max);
     let keep = ge(&probs, broadcast(&threshold, [vocab]));
 

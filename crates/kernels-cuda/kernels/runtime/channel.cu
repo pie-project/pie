@@ -288,8 +288,20 @@ __global__ void scatter_publish(
                 destination[i] = packed;
             }
         } else {
-            for (u32 i = threadIdx.x; i < ticket.wire_bytes; i += blockDim.x) {
-                destination[i] = source[i];
+            const bool wide = ticket.wire_bytes % sizeof(uint4) == 0 &&
+                              reinterpret_cast<usize>(source) % sizeof(uint4) == 0 &&
+                              reinterpret_cast<usize>(destination) % sizeof(uint4) == 0;
+            if (wide) {
+                const uint4* in = reinterpret_cast<const uint4*>(source);
+                uint4* out = reinterpret_cast<uint4*>(destination);
+                const u32 quads = ticket.wire_bytes / sizeof(uint4);
+                for (u32 i = threadIdx.x; i < quads; i += blockDim.x) {
+                    out[i] = in[i];
+                }
+            } else {
+                for (u32 i = threadIdx.x; i < ticket.wire_bytes; i += blockDim.x) {
+                    destination[i] = source[i];
+                }
             }
         }
         __syncthreads();
