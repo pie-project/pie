@@ -363,18 +363,6 @@ impl Dtype {
         }
     }
 
-    /// The square block a DeepSeek block-FP8 weight scales by (one ue8m0
-    /// exponent a block), read by a W8A8 product: 128 for `fp8b128`, 32 for
-    /// `fp8b32`.
-    #[must_use]
-    pub const fn fp8_block(self) -> Option<u32> {
-        match self {
-            Self::Fp8b128 => Some(128),
-            Self::Fp8b32 => Some(32),
-            _ => None,
-        }
-    }
-
     #[must_use]
     pub const fn term(self) -> &'static str {
         let spelling = self.spelling();
@@ -443,11 +431,6 @@ impl Dtype {
             };
         }
         self.repr().bpw(k)
-    }
-
-    #[must_use]
-    pub fn plane_widths(self, k: u32) -> Option<PlaneWidths> {
-        self.repr().plane_widths(k)
     }
 
     #[must_use]

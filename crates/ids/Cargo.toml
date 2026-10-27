@@ -3,7 +3,7 @@ name = "ids"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "Deduplicated identity atoms (worker/gateway/node/session/req/request/tenant) shared across the pie interface crates — the dependency leaf, plain serde, no internal deps."
+description = "Deduplicated identity atoms (worker/gateway/node/session/req/tenant) shared across the pie interface crates — the dependency leaf, plain serde, no internal deps."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
