@@ -166,7 +166,7 @@ fn step(logits: Tensor, temperature: f32, rng_state: &Tensor) -> Tensor {
 /// `[layers, rank, hidden]`, `B` out-major `[layers, hidden, rank]`.
 ///
 /// A fresh pair PER PASS, because a channel's seed is consumed by the first
-/// pass that binds it — the prefill and the decode are two instances and each
+/// pass that binds it — the fill and the decode are two instances and each
 /// one lands its own copy.
 struct Weights {
     a: Vec<f32>,
@@ -268,93 +268,65 @@ async fn main(input: Input) -> Result<Output> {
         hidden,
     };
 
-    if max_tokens == 0 {
-        return Ok(report(String::new(), 0));
-    }
-
     // The model's opening (`<bos>` where it has one) before the raw text —
     // the SAME opening `naive-baseline` puts there. This probe's whole claim
     // is "naive-baseline plus one adapter and nothing else different", and
     // on gemma the two openings answer different text at a zero adapter
     // (" much like the…" against " of of of of"), which the A-1 gate then
     // reads as the adapter path writing where it must not.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(wit_model::encode(&input.prompt));
-    if prompt.is_empty() {
-        prompt.push(0);
-    }
-    let n = prompt.len() as u32;
-
-    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-
-    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    let prompt: Vec<i32> = inferlet::chat::prefix()
+        .into_iter()
+        .chain(wit_model::encode(&input.prompt))
+        .map(|t| t as i32)
+        .collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
     let pipe = Pipeline::new();
-
-    let toks_p = Channel::from(prompt_i32.clone());
-    let embed_indptr_p = Channel::from(vec![0u32, n]);
-    let rng_p = Channel::from(vec![input.seed, 0]);
-    let tok_out_p = Channel::new([1], dtype::i32);
-
-    let weights = Weights::build(layers, hidden, rank, adapter_scale);
-    let fwd_p = ForwardPass::new();
-    attach(&fwd_p, &weights, &surface, &form)?;
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
-    fwd_p.epilogue(move || {
-        let r = rng_p.take();
-        let logits = intrinsics::output(0, "logits");
-        let token = step(logits, temperature, &r);
-        let r_next = &r + iota(2);
-        tok_out_p.put(&token);
-        rng_p.put(&r_next);
-    });
-
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-
-    let g0 = tok_out_p
-        .take_host::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?;
-    generated.push(g0 as u32);
+    if !head.is_empty() {
+        let weights = Weights::build(layers, hidden, rank, adapter_scale);
+        let fill = ForwardPass::new();
+        attach(&fill, &weights, &surface, &form)?;
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe)
+            .map_err(|e| format!("prefill submit: {e}"))?;
+    }
 
     // ── DECODE LOOP (1-wide, run-ahead) — naive-baseline's shape, plus the
     //    adapter. ──
-    if generated.len() < max_tokens {
-        let tok_in = Channel::from(vec![g0; 1]);
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]);
-        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-        let lane1 = Channel::from(vec![0u32, 1u32]);
+    let tok_in = Channel::from([last]);
+    let rng = Channel::from([input.seed, 0]);
+    let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
 
-        let weights = Weights::build(layers, hidden, rank, adapter_scale);
-        let fwd = ForwardPass::new();
-        attach(&fwd, &weights, &surface, &form)?;
-        fwd.embed(&tok_in, &lane1)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
-        fwd.epilogue(move || {
-            let r = rng.take();
-            let logits = intrinsics::output(0, "logits");
-            let token = step(logits, temperature, &r);
+    let weights = Weights::build(layers, hidden, rank, adapter_scale);
+    let fwd = ForwardPass::new();
+    attach(&fwd, &weights, &surface, &form)?;
+    fwd.embed(&tok_in, &Channel::from([0u32, 1]))?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
+    fwd.epilogue(move || {
+        let r = rng.take();
+        let logits = intrinsics::output(0, "logits");
+        let token = step(logits, temperature, &r);
 
-            let r_next = &r + iota(2);
+        let r_next = &r + iota(2);
 
-            tok_in.put(&token);
-            tok_out.put(&token);
-            rng.put(&r_next);
-        });
+        tok_in.put(&token);
+        tok_out.put(&token);
+        rng.put(&r_next);
+    });
 
-        let budget = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget, async || {
-            let t = tok_out
-                .take_host::<i32>()
-                .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?;
-            generated.push(t as u32);
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    }
+    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+    run_ahead(&pipe, &fwd, max_tokens, async || {
+        let t = tok_out
+            .take_host::<i32>()
+            .await
+            .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?;
+        generated.push(t as u32);
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipe.close();
 
     let count = generated.len();
