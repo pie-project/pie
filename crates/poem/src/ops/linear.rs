@@ -55,7 +55,13 @@ fn turned(act: &Value, w: &Weight) -> Value {
     let Some(t) = &w.turn else {
         return act.clone();
     };
-    let key = format!("turn {:?} {:?} {} {}", act.id(), act.cond(), t.signs.name, t.block);
+    let key = format!(
+        "turn {:?} {:?} {} {}",
+        act.id(),
+        act.cond(),
+        t.signs.name,
+        t.block
+    );
     act.rec().shared(key, || {
         super::elemwise::hadamard_signed(&super::elemwise::copy(act), t.block, &t.signs)
     })

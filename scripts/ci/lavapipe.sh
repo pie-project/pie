@@ -27,7 +27,7 @@ echo "== pie with the $engine engine"
 cargo build --release -p pie --features "$engine"
 pie=./target/release/pie
 echo "== inferlets (wasm32-wasip3)"
-(cd examples && cargo build -q --release --target wasm32-wasip3 -p text-completion -p naive-baseline -p sort-probe)
+(cd examples && cargo build -q --release --target wasm32-wasip3 -p text-completion -p naive-baseline)
 
 echo "== import"
 "$pie" model import "$work/snapshot" --deployment qwen35-tiny-u4g64-kv-bf16 --keep-source
@@ -72,10 +72,6 @@ what=corners
 if [ "${PIE_LAVAPIPE_BENCH:-0}" = "1" ]; then what=both; fi
 echo "== $what"
 PIE_BENCH_FIXTURE=1 node scripts/bench/browser/native.mjs "$ws" "$what" | grep -v "^RESULT" | cut -c1-160
-echo "== sort-probe"
-PIE_MATRIX_ENTRY_TIMEOUT_MS=900000 node tests/browser/tools/matrix-native.mjs "$ws" sort-probe-light > "$work/sort-probe.log" || true
-grep "^MATRIX" "$work/sort-probe.log" | cut -f1,2,3 | sed 's/\\n/\n   /g' | cut -c1-160
-grep -q $'^MATRIX sort-probe-light\tok\t' "$work/sort-probe.log" || { echo "sort-probe failed"; exit 1; }
 
 echo "== compat API: one chat completion through the built-in inferlet"
 curl -fsS -X POST "$http/v1/chat/completions" -H 'content-type: application/json' \

@@ -1,4 +1,4 @@
-//! The skinny skeleton (`skinny_skeleton`, `linear/contract.cuh`): up to 64 rows
+//! Host-only: the skinny skeleton (`skinny_skeleton`, `linear/contract.cuh`): up to 64 rows
 //! on mma.sync, the weight streamed once past the activation's rows in
 //! shared memory, its products handed to an epilogue body 8 columns of one
 //! row at a time. A packed bank's parts (a GLU's `[gate | up]`) share a
