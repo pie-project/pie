@@ -1137,8 +1137,13 @@ impl Shell {
         // this fit, by about the activation arena again at a 16K-token
         // budget; held for them here, the cache rows leave the bodies the
         // room they were allowed (GLM's mini armed 11 of 49 compositions
-        // without it, its prefill buckets walking eagerly).
-        let scratch_growth = if cfg!(feature = "rocm") && shell.records_bodies() {
+        // without it, its prefill buckets walking eagerly). A hybrid's slots
+        // are cut at this fit for good, and on CUDA its chunked recurrence
+        // grows them the same way (Kimi-K3's mini: 3.1 GB of KDA planes at
+        // 8192 tokens left an RTX 5090's rows short of one sequence).
+        let scratch_growth = if (cfg!(feature = "rocm") || shell.pools.has_state())
+            && shell.records_bodies()
+        {
             shell.arena.bytes()
         } else {
             0

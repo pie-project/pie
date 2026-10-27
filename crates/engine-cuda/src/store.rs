@@ -1131,15 +1131,18 @@ impl Pools {
         let seats = u64::from(self.paging.slots);
         if fit / one < seats && fresh && self.has_state() && self.budget.is_none() {
             let one_sequence = self.declared_reshaped(one_slot, 0);
-            let floor = state_slots_within(self.paging.slots, room, one_sequence, |slots| {
+            // What the fires were asked and the uncut slab left no room to
+            // hold is held after the cut, so the slots leave it too.
+            let cut = room.saturating_sub(asked_programs.saturating_sub(programs));
+            let floor = state_slots_within(self.paging.slots, cut, one_sequence, |slots| {
                 self.declared_reshaped(0, slots)
             });
             let slots = balanced_state_slots(self.paging.slots, floor, one_slot, |slots| {
-                pages_within(self.ceiling, room, |pages| {
+                pages_within(self.ceiling, cut, |pages| {
                     self.declared_reshaped(pages, slots)
                 })
             });
-            let pages = pages_within(self.ceiling, room, |pages| {
+            let pages = pages_within(self.ceiling, cut, |pages| {
                 self.declared_reshaped(pages, slots)
             });
             if pages >= one_slot && slots < self.paging.slots {
