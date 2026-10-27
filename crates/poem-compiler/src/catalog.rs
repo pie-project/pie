@@ -95,6 +95,41 @@ impl Deployment {
             .unwrap_or_else(|why| panic!("`{}` states no generative facts: {why}", self.name))
     }
 
+    /// This miniature at the depth and routed expert count `src`'s
+    /// configuration states, where its package lays out other weights at
+    /// them than at its own: a checkpoint cut to other counts than listed.
+    #[must_use]
+    pub fn cut(&self, src: &ztensor::Source, platform: Platform) -> Option<Deployment> {
+        if !self.model.mini {
+            return None;
+        }
+        let count = |keys: &[&str]| {
+            keys.iter()
+                .flat_map(|key| [(*key).to_string(), format!("text_config.{key}")])
+                .find_map(|path| poem::import::format::stated(src, &path))
+                .filter(|n| n.fract() == 0.0 && *n >= 1.0 && *n <= f64::from(u32::MAX))
+                .map(|n| n as u32)
+        };
+        let deploy = Deploy {
+            layers: count(&["num_hidden_layers"]).filter(|n| *n != self.model.layers),
+            experts: count(&["n_routed_experts", "num_experts", "num_local_experts"]),
+            ..self.deploy.clone()
+        };
+        if deploy == self.deploy {
+            return None;
+        }
+        let cut = Deployment::of(Arc::clone(&self.package), &self.model, deploy);
+        let params = |d: &Deployment| {
+            d.package
+                .trace(&d.model.id, &d.deploy, &d.name, platform)
+                .ok()
+                .map(|trace| trace.params)
+        };
+        let own = params(self)?;
+        params(&cut).filter(|cut| *cut != own)?;
+        Some(cut)
+    }
+
     /// The marker groups the tokenizer must hold for the parts served.
     #[must_use]
     pub fn markers(&self) -> Vec<Vec<String>> {
@@ -340,15 +375,31 @@ impl Catalog {
         candidates
     }
 
+    /// [`Catalog::candidates`] as `src` is read: a miniature listed at
+    /// another depth or expert count than `src`'s configuration states is
+    /// tried cut to them instead, after every deployment read as listed.
+    #[must_use]
+    pub fn candidates_of(&self, src: &ztensor::Source, platform: Platform) -> Vec<Deployment> {
+        let (mut listed, mut cuts) = (Vec::new(), Vec::new());
+        for d in self.candidates() {
+            match d.cut(src, platform) {
+                Some(cut) => cuts.push(cut),
+                None => listed.push(d.clone()),
+            }
+        }
+        listed.append(&mut cuts);
+        listed
+    }
+
     pub fn fits<'a>(
         &'a self,
         src: &'a ztensor::Source,
         platform: Platform,
-    ) -> impl Iterator<Item = (&'a Deployment, Result<ModelContract, poem::import::Error>)> + 'a
-    {
-        self.candidates()
-            .into_iter()
-            .map(move |d| (d, d.contract(src, platform)))
+    ) -> impl Iterator<Item = (Deployment, Result<ModelContract, poem::import::Error>)> + 'a {
+        self.candidates_of(src, platform).into_iter().map(move |d| {
+            let read = d.contract(src, platform);
+            (d, read)
+        })
     }
 
     /// The listed deployment that reads `src` as stored.
@@ -534,6 +585,8 @@ pub fn one_rank(w: Dtype, kv: Dtype) -> Deploy {
         drafter: None,
         yarn: None,
         tap: None,
+        layers: None,
+        experts: None,
     }
 }
 
