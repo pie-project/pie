@@ -132,7 +132,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut prompt = inferlet::chat::prefix();
     prompt.extend(model::encode(&input.prompt));
     if prompt.is_empty() {
-        prompt.push(0);
+        return Err("empty prompt".into());
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
@@ -155,8 +155,8 @@ async fn main(input: Input) -> Result<Output> {
 
     let toks_p = Channel::from(&prompt_i32[..]);
     let embed_indptr_p = Channel::from([0u32, n]);
-    // `naive-baseline`'s salt, so the all-keep arm differs from it only by the mask.
-    let rng_p = Channel::from([input.seed ^ 0x5bd1, 0]);
+    // `naive-baseline`'s stream, so the all-keep arm differs from it only by the mask.
+    let rng_p = Channel::from([input.seed, 0]);
     let tok_out_p = Channel::new([1], dtype::i32);
 
     let scores_out = Channel::new([kv_max], dtype::f32);
@@ -213,57 +213,54 @@ async fn main(input: Input) -> Result<Output> {
     let served_kv = keep_row[..n as usize].iter().filter(|k| **k).count() as u32;
 
     // ── DECODE LOOP (1-wide, run-ahead), enforcing the fixed keep-set. ──
-    if generated.len() < max_tokens {
-        let tok_in = Channel::from([g0]);
-        let rng = Channel::from([input.seed ^ 0x5bd1, 2]);
-        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-        let lane1 = Channel::from([0u32, 1u32]);
-        let fill = Channel::from([n + 1]);
+    let tok_in = Channel::from([g0]);
+    let rng = Channel::from([input.seed, 1]);
+    let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+    let lane1 = Channel::from([0u32, 1u32]);
+    let fill = Channel::from([n + 1]);
 
-        // A bound mask replaces the causal bound: the keep-set alone would admit unwritten slots.
-        let keep = Channel::from_shaped([1, kv_max], keep_row.clone());
-        let mask = Channel::from_shaped(
-            [1, kv_max],
-            keep_row
-                .iter()
-                .enumerate()
-                .map(|(j, k)| *k && (j as u32) <= n)
-                .collect::<Vec<bool>>(),
-        );
+    // A bound mask replaces the causal bound: the keep-set alone would admit unwritten slots.
+    let keep = Channel::from_shaped([1, kv_max], keep_row.clone());
+    let mask = Channel::from_shaped(
+        [1, kv_max],
+        keep_row
+            .iter()
+            .enumerate()
+            .map(|(j, k)| *k && (j as u32) <= n)
+            .collect::<Vec<bool>>(),
+    );
 
-        let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, &lane1)?;
-        fwd.mask(&mask)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, &lane1)?;
+    fwd.mask(&mask)?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
 
-        fwd.epilogue(move || {
-            let length = fill.take();
-            let r = rng.take();
-            let logits = intrinsics::output(0, "logits");
-            let token = step(logits, temperature, &r);
+    fwd.epilogue(move || {
+        let length = fill.take();
+        let r = rng.take();
+        let logits = intrinsics::output(0, "logits");
+        let token = step(logits, temperature, &r);
 
-            tok_in.put(&token);
-            fill.put(&(&length + 1u32));
-            tok_out.put(&token);
-            rng.put(&(&r + iota(2)));
+        tok_in.put(&token);
+        fill.put(&(&length + 1u32));
+        tok_out.put(&token);
+        rng.put(&(&r + iota(2)));
 
-            // A loop-carried channel is `take`n before it is `put`.
-            let k = keep.take();
-            mask.put(and(causal_mask(&length, kv_max), &k));
-            keep.put(&k);
-        });
+        // A loop-carried channel is `take`n before it is `put`.
+        let k = keep.take();
+        mask.put(and(causal_mask(&length, kv_max), &k));
+        keep.put(&k);
+    });
 
-        let budget_n = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget_n, async || {
-            let t = tok_out
-                .take_host::<i32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            generated.push(t as u32);
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    }
+    run_ahead(&pipe, &fwd, max_tokens - 1, async || {
+        let t = tok_out
+            .take_host::<i32>()
+            .await
+            .with_context(|| format!("@{}", generated.len()))?;
+        generated.push(t as u32);
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipe.close();
 
     let live = (n as usize).min(prefill_scores.len());

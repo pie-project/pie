@@ -77,9 +77,9 @@ fn host_sink_window_mask(span: u32, query: u32, sink: u32, window: u32) -> Vec<b
 
 /// The report after `fires` decode fires over an `n`-token prompt.
 fn report(generated: &[u32], n: u32, sink: u32, window: u32, fires: u32) -> Result<Output> {
-    let kv_len = n + fires;
-    let visible_kv = if fires == 0 {
-        n
+    let kv_len = n - 1 + fires;
+    let visible_kv = if fires <= 1 {
+        kv_len
     } else {
         host_sink_window_mask(kv_len, kv_len - 1, sink, window)
             .iter()
@@ -105,67 +105,41 @@ async fn main(input: Input) -> Result<Output> {
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     prompt.extend(chat::cue());
-    if prompt.is_empty() {
-        prompt.push(0);
-    }
     let n = prompt.len() as u32;
-    if input.max_tokens == 0 {
-        return Ok(Output {
-            sampler: "attention-sink",
-            text: String::new(),
-            count: 0,
-            prompt_len: n,
-            sink_size: sink,
-            window_size: window,
-            kv_len: 0,
-            visible_kv: 0,
-        });
-    }
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
     let stop_tokens = chat::stop_tokens();
     let span = n + input.max_tokens as u32 + 1;
 
     let ws = WorkingSet::new();
-
     let pipeline = Pipeline::new();
-    let tokens = Channel::from_iter(prompt.iter().map(|&t| t as i32));
-    let embed_indptr = Channel::from([0u32, n]);
-    let causal = Channel::from_shaped(
-        [n, span],
-        (0..n)
-            .flat_map(|query| (0..span).map(move |key| key <= query))
-            .collect::<Vec<_>>(),
-    );
-    let first_out = Channel::new([1], dtype::i32);
-
-    let prefill = ForwardPass::new();
-    prefill.embed(&tokens, &embed_indptr)?;
-    prefill.mask(&causal)?;
-    prefill.state(&[&ws], StateGeometry::folding())?;
-    prefill.epilogue(move || {
-        first_out.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
-    });
-    prefill
-        .submit(&pipeline)
-        .context("attention-sink prefill")?;
-    let first = first_out.take_host::<i32>().await? as u32;
-
-    let mut generated = Vec::with_capacity(input.max_tokens);
-    if !stop_tokens.contains(&first) {
-        generated.push(first);
-    }
-    if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
-        pipeline.close();
-        return report(&generated, n, sink, window, 0);
+    if !head.is_empty() {
+        let h = head.len() as u32;
+        let causal = Channel::from_shaped(
+            [h, span],
+            (0..h)
+                .flat_map(|query| (0..span).map(move |key| key <= query))
+                .collect::<Vec<_>>(),
+        );
+        let prefill = ForwardPass::new();
+        prefill.embed(
+            &Channel::from_iter(head.iter().map(|&t| t as i32)),
+            &Channel::from([0u32, h]),
+        )?;
+        prefill.mask(&causal)?;
+        prefill.state(&[&ws], StateGeometry::folding())?;
+        prefill
+            .submit(&pipeline)
+            .context("attention-sink prefill")?;
     }
 
-    let token_in = Channel::from([first as i32]);
-    let fill = Channel::from([n + 1]);
-    let mask = Channel::from_shaped([1, span], host_sink_window_mask(span, n, sink, window));
+    // The prompt's last row is causal like the rest of the prompt.
+    let token_in = Channel::from([last as i32]);
+    let fill = Channel::from([n]);
+    let mask = Channel::from_shaped([1, span], (0..span).map(|key| key < n).collect::<Vec<_>>());
     let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
 
     let decode = ForwardPass::new();
-    let decode_indptr = Channel::from([0u32, 1]);
-    decode.embed(&token_in, &decode_indptr)?;
+    decode.embed(&token_in, &Channel::from([0u32, 1]))?;
     decode.mask(&mask)?;
     decode.state(&[&ws], StateGeometry::folding())?;
     decode.epilogue(move || {
@@ -179,11 +153,11 @@ async fn main(input: Input) -> Result<Output> {
         mask.put(&next_mask);
     });
 
-    let budget = input.max_tokens.saturating_sub(generated.len());
-    // Decode fires whose token came back — a stop token's fire wrote its KV
+    let mut generated = Vec::with_capacity(input.max_tokens);
+    // Fires whose token came back — a stop token's fire wrote its KV
     // position like any other, so it counts toward `kv_len`.
     let mut fires = 0u32;
-    run_ahead(&pipeline, &decode, budget, async || {
+    run_ahead(&pipeline, &decode, input.max_tokens, async || {
         let token = token_out.take_host::<i32>().await? as u32;
         fires += 1;
         if stop_tokens.contains(&token) {
