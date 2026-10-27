@@ -150,13 +150,13 @@ pub fn rmsnorm_no_scale(f: &mut Func, x: Operand, head_dim: u32, eps: f32) -> Re
 }
 
 /// `rms(x) * w * gate(z)` per `vd`-wide head of an f32 accumulator, with a
-/// `vd`-wide f32 weight; `gate` is `z·σ(z)` or `σ(z)`.
+/// `vd`-wide f32 weight (none: a scale of one); `gate` is `z·σ(z)` or `σ(z)`.
 fn gated_rms(
     f: &mut Func,
     op: &'static str,
     x: Operand,
     gate: Operand,
-    weight: Operand,
+    weight: Option<Operand>,
     vd: u32,
     eps: f32,
     sigmoid: bool,
@@ -171,8 +171,13 @@ fn gated_rms(
     }
     let xv = x.f32(f);
     let n = inv_rms_rows(f, op, xv, vd, eps)?;
-    let g = gain(f, weight.val, i64::from(x.rows), i64::from(x.width), false)?;
-    let n = f.mul(n, g)?;
+    let n = match weight {
+        Some(weight) => {
+            let g = gain(f, weight.val, i64::from(x.rows), i64::from(x.width), false)?;
+            f.mul(n, g)?
+        }
+        None => n,
+    };
     let z = gate.f32(f);
     let s = f.sigmoid(z);
     let gate = if sigmoid { s } else { f.mul(z, s)? };
@@ -191,7 +196,22 @@ pub fn rmsnorm_gated(
 ) -> Result<Val, Error> {
     const OP: &str = "elemwise.rmsnorm_gated";
     let vd = nonzero(OP, "the stated value-head width", head_dim)?;
-    gated_rms(f, OP, x, gate, weight, vd, eps, sigmoid_gate, y)
+    gated_rms(f, OP, x, gate, Some(weight), vd, eps, sigmoid_gate, y)
+}
+
+/// [`rmsnorm_gated`] with no learned scale (Muse Spark's).
+pub fn rmsnorm_gated_unscaled(
+    f: &mut Func,
+    x: Operand,
+    gate: Operand,
+    head_dim: u32,
+    eps: f32,
+    sigmoid_gate: bool,
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.rmsnorm_gated";
+    let vd = nonzero(OP, "the stated value-head width", head_dim)?;
+    gated_rms(f, OP, x, gate, None, vd, eps, sigmoid_gate, y)
 }
 
 pub fn rmsnorm_gated_by(
@@ -214,7 +234,7 @@ pub fn rmsnorm_gated_by(
             ),
         ));
     }
-    gated_rms(f, OP, x, gate, weight, x.width / heads, eps, true, y)
+    gated_rms(f, OP, x, gate, Some(weight), x.width / heads, eps, true, y)
 }
 
 /// `y + x`, the new `y`.
