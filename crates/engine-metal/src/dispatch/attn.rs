@@ -208,8 +208,20 @@ impl Run<'_> {
                 score: IndexScore::BlockMax,
                 ..
             } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
-            // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
-            Attn::KvEnds { .. } | Attn::WindowSink { .. } | Attn::ReplayFloor { .. } => {
+            Attn::ReplayFloor {
+                positions,
+                state,
+                mark,
+                floor,
+            } => attn::pool::replay_floor(
+                self.ctx(),
+                self.ragged(*positions),
+                &self.recurrent(*state),
+                *mark,
+                self.tensor(*floor),
+            ),
+            // A DSpark stage's windows are served on CUDA.
+            Attn::KvEnds { .. } | Attn::WindowSink { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
             Attn::Decode {

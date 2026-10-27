@@ -2275,7 +2275,7 @@ pub mod index {
         if keys.page_size <= 0 {
             return Err(refuse(OP, "the index cache page size is zero"));
         }
-        pool_pitch(OP, keys, head_dim)?;
+        let pitch = super::pool::pitch(OP, keys, head_dim)?;
         if q.width != heads.saturating_mul(head_dim) {
             return Err(refuse(
                 OP,
@@ -2329,6 +2329,7 @@ pub mod index {
                 stated(OP, ratio)?.arg(),
                 i32::from(weights.is_some()).arg(),
                 stated(OP, row_stride)?.arg(),
+                pitch.arg(),
             ],
         )
     }
@@ -2677,6 +2678,74 @@ pub mod pool {
 
     const META_BLOCK: u32 = 128;
 
+    /// The pool's width a position: `row` itself, or a compact pool's
+    /// `row / div` (`div` positions to an entry, whole within a page).
+    pub(crate) fn pitch(op: &'static str, pool: &KvPool, row: u32) -> Result<i32, Error> {
+        let pitch = pool.seq_stride;
+        let row = u64::from(row);
+        let div = if pitch == 0 { 0 } else { row / pitch };
+        if pitch == 0
+            || row % pitch != 0
+            || div == 0
+            || pool.page_size <= 0
+            || u64::from(pool.page_size.unsigned_abs()) % div != 0
+        {
+            return Err(refuse(
+                op,
+                format!(
+                    "the pool's token pitch {pitch} does not pack the {row}-wide entry at {} a page",
+                    pool.page_size
+                ),
+            ));
+        }
+        stated(op, u32::try_from(pitch).unwrap_or(u32::MAX))
+    }
+
+    /// Each row's replay floor into `floors` (i32 a row): with `mark` the
+    /// position past its lane's last row, written to the lane's state too;
+    /// without, the floor the lane's state holds (`attn.replay_floor`).
+    pub fn replay_floor(
+        ctx: &Ctx<'_>,
+        positions: RaggedTensor,
+        state: &crate::tensor::RecurrentPool,
+        mark: bool,
+        floors: Tensor,
+    ) -> Result<(), Error> {
+        const OP: &str = "attn.replay_floor";
+        debug_assert_eq!(
+            positions.data.dtype,
+            Dtype::I32,
+            "`{OP}` reads i32 positions"
+        );
+        debug_assert_eq!(floors.dtype, Dtype::I32, "`{OP}` lands i32 floors");
+        let rows = positions.data.rows.min(floors.rows);
+        if rows == 0 {
+            return Ok(());
+        }
+        let lanes = positions.indptr.rows.saturating_sub(1);
+        let threads = if mark { lanes } else { rows };
+        if threads == 0 {
+            return Ok(());
+        }
+        ctx.fire(
+            Fire::at(FILE, "replay_floor").apply(Grid::of(
+                [threads.div_ceil(META_BLOCK) * META_BLOCK, 1, 1],
+                [META_BLOCK, 1, 1],
+            )),
+            &[
+                positions.data.arg(),
+                state.state.arg_mut(),
+                state.slots.arg(),
+                positions.indptr.arg(),
+                floors.arg_mut(),
+                stated(OP, state.state.width)?.arg(),
+                stated(OP, rows)?.arg(),
+                stated(OP, lanes)?.arg(),
+                i32::from(mark).arg(),
+            ],
+        )
+    }
+
     const ATTN_BLOCK: u32 = 128;
 
     const POOL_HEAD_MAX: u32 = 512;
@@ -3020,6 +3089,7 @@ pub mod pool {
                 pool.page_indptr.arg(),
                 stated(OP, head_dim)?.arg(),
                 pool.page_size.arg(),
+                pitch(OP, pool, head_dim)?.arg(),
             ],
         )
     }
@@ -3084,6 +3154,7 @@ pub mod pool {
                 ratio.arg(),
                 entries.page_size.arg(),
                 sm_scale.arg(),
+                pitch(OP, entries, head_dim)?.arg(),
             ],
         )
     }
@@ -3176,6 +3247,7 @@ pub mod pool {
                 stated(OP, top_k)?.arg(),
                 entries.page_size.arg(),
                 sm_scale.arg(),
+                pitch(OP, entries, head_dim)?.arg(),
             ],
         )
     }

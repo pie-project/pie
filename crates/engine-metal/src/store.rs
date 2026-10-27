@@ -384,6 +384,13 @@ impl Pools {
                         .map(|seat| u64::from(seat.kv_heads))
                         .or(row_head_dim.map(|d| width / u64::from(d)))
                         .unwrap_or(1);
+                    // A compact pool's row (`ratio` positions to an entry) is
+                    // narrower than its head: one head its own width a position.
+                    let (head_dim, kv_heads) = if kv_heads == 0 {
+                        (width, 1)
+                    } else {
+                        (head_dim, kv_heads)
+                    };
                     let block = restated.map(|seat| seat.head_dim).or(row_head_dim);
                     let cells = paging.pages() * u64::from(paging.page_size);
                     let plane = cells * row_stride(name, *dtype, width, block)?;
