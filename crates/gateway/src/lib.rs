@@ -68,8 +68,6 @@ impl Config {
     }
 }
 
-pub type GatewayConfig = Config;
-
 #[derive(Clone)]
 pub struct GatewayState {
     pub sessions: Sessions,
