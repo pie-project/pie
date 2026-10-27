@@ -1,12 +1,12 @@
 #include <metal_stdlib>
 using namespace metal;
 
-template <typename T>
+template <typename T, typename S = T>
 [[kernel]] void attn_sink_rescale(
     const device T* o_in     [[buffer(0)]],
     device T* o_out          [[buffer(1)]],
     const device float* lse  [[buffer(2)]],
-    const device T* sinks    [[buffer(3)]],
+    const device S* sinks    [[buffer(3)]],
     uint3 tid  [[thread_position_in_grid]],
     uint3 grid [[threads_per_grid]]) {
   constexpr float kLn2 = 0.69314718055994530942f;
@@ -39,3 +39,9 @@ template <typename T>
       const device itype*, uint3, uint3);
 
 instantiate_attn_sink_rescale(bfloat16, bfloat)
+
+// f32 sinks (Hy4's) beside bf16 rows.
+template [[host_name("attn_sink_rescale_bfloat16_f32")]]
+[[kernel]] void attn_sink_rescale<bfloat, float>(
+    const device bfloat*, device bfloat*, const device float*,
+    const device float*, uint3, uint3);

@@ -150,6 +150,7 @@ template <typename T, int BLOCK>
     const constant float& hc_eps [[buffer(9)]],
     const constant float& hc_post_alpha [[buffer(10)]],
     const constant int& sinkhorn_iters  [[buffer(11)]],
+    const constant int& combined [[buffer(12)]],
     uint2 gid    [[threadgroup_position_in_grid]],
     uint2 lid2   [[thread_position_in_threadgroup]],
     uint2 tg2    [[threads_per_threadgroup]]) {
@@ -159,7 +160,10 @@ template <typename T, int BLOCK>
   const int n = int(gid.x);
   const int tid = int(lid);
 
-  const int mix_hc = M * 2 + M * M;
+  // Without a combine (the independent form) the row is the pre and post
+  // logits alone, the post gate carries the eps the pre gate does, and the
+  // combine is the identity.
+  const int mix_hc = combined ? M * 2 + M * M : M * 2;
   const device float* row = mixes + size_t(n) * size_t(mix_hc);
 
   threadgroup float pre[HC_MAX_MULT];
@@ -172,10 +176,28 @@ template <typename T, int BLOCK>
   }
   if (tid < M) {
     const float logit = row[M + tid] * scale[1] + base[M + tid];
-    post[tid] = 1.0f / (1.0f + precise::exp(-logit)) * hc_post_alpha;
+    post[tid] = 1.0f / (1.0f + precise::exp(-logit)) * hc_post_alpha + (combined ? 0.0f : hc_eps);
     if (gid.y == 0) post_mix[size_t(n) * size_t(M) + size_t(tid)] = post[tid];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (!combined) {
+    if (tid < M * M && gid.y == 0) {
+      comb_mix[size_t(n) * size_t(M) * size_t(M) + size_t(tid)] = (tid / M == tid % M) ? 1.0f : 0.0f;
+    }
+    const device T* res_n = residual + size_t(n) * size_t(M) * size_t(H);
+    device T* out = layer_input + size_t(n) * size_t(H);
+    const uint h_begin = gid.y * uint(HC_GATES_CHUNK);
+    const uint h_end = min(uint(H), h_begin + uint(HC_GATES_CHUNK));
+    for (uint h = h_begin + lid; h < h_end; h += tg_size) {
+      float acc = 0.0f;
+      for (int i = 0; i < M; ++i) {
+        acc += pre[i] * float(res_n[size_t(i) * size_t(H) + size_t(h)]);
+      }
+      out[h] = T(acc);
+    }
+    return;
+  }
 
   if (tid < M * M) {
     comb[tid] = row[2 * M + tid] * scale[2] + base[2 * M + tid];
@@ -245,7 +267,7 @@ template <typename T, int BLOCK>
       const device float*, const device float*, const device float*, \
       const device itype*, device float*, device float*, device itype*, \
       const constant int&, const constant int&, const constant float&, \
-      const constant float&, const constant int&,                 \
+      const constant float&, const constant int&, const constant int&, \
       uint2, uint2, uint2);
 
 instantiate_hc_gates(bfloat16, bfloat, 256)

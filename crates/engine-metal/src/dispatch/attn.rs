@@ -602,7 +602,7 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            // The per-head log-sum-exp a sink rescales by is landed on CUDA alone.
+            // The per-head log-sum-exp a sink rescales by is landed for a selection alone.
             Attn::MlaDecode {
                 lse: Some(_),
                 selection: None,
@@ -611,16 +611,6 @@ impl Run<'_> {
             | Attn::MlaPrefill {
                 lse: Some(_),
                 selection: None,
-                ..
-            }
-            | Attn::MlaDecode {
-                lse: Some(_),
-                selection: Some(_),
-                ..
-            }
-            | Attn::MlaPrefill {
-                lse: Some(_),
-                selection: Some(_),
                 ..
             } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Attn::MlaDecode {
@@ -703,7 +693,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-                lse: _,
+                lse,
                 window: None,
             } => {
                 let (positions, request_of_token) = {
@@ -722,6 +712,7 @@ impl Run<'_> {
                     *kv_lora_rank,
                     *sm_scale,
                     self.tensor(*o),
+                    lse.map(|lse| self.tensor(lse)),
                 )
             }
             Attn::MlaPrefill {
@@ -734,7 +725,7 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-                lse: _,
+                lse,
                 window: None,
             } => {
                 let (positions, request_of_token) = {
@@ -753,6 +744,7 @@ impl Run<'_> {
                     *kv_lora_rank,
                     *sm_scale,
                     self.tensor(*o),
+                    lse.map(|lse| self.tensor(lse)),
                 )
             }
 

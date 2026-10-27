@@ -870,8 +870,10 @@ pub fn sink(
     head_dim: u32,
 ) -> Result<(), Error> {
     const OP: &str = "attn.sink";
-    let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "attn_sink_rescale_bfloat16" });
-    if sink.dtype != o.dtype {
+    let mut entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "attn_sink_rescale_bfloat16" });
+    if sink.dtype == Dtype::F32 {
+        entry = "attn_sink_rescale_bfloat16_f32";
+    } else if sink.dtype != o.dtype {
         return Err(Error::DtypeUnsupported {
             op: OP,
             dtype: sink.dtype,
@@ -1557,11 +1559,21 @@ pub mod mla {
         kv_lora_rank: u32,
         sm_scale: f32,
         o: Tensor,
+        lse: Option<Tensor>,
     ) -> Result<(), Error> {
-        let entry = match selection {
-            None => dtype_dispatch!(op, q.dtype, { Bf16 => "mla_naive_paged_bfloat16" }),
-            Some(_) => {
+        let entry = match (selection, lse) {
+            (None, None) => dtype_dispatch!(op, q.dtype, { Bf16 => "mla_naive_paged_bfloat16" }),
+            (Some(_), None) => {
                 dtype_dispatch!(op, q.dtype, { Bf16 => "mla_naive_paged_selected_bfloat16" })
+            }
+            (Some(_), Some(_)) => {
+                dtype_dispatch!(op, q.dtype, { Bf16 => "mla_naive_paged_selected_lse_bfloat16" })
+            }
+            (None, Some(_)) => {
+                return Err(refuse(
+                    op,
+                    "a log-sum-exp is landed for a selection's keys alone",
+                ));
             }
         };
         if pool.page_size <= 0 {
@@ -1622,6 +1634,13 @@ pub mod mla {
             args.push(selection.arg());
             args.push(stated(op, selection.width)?.arg());
         }
+        if let Some(lse) = lse {
+            debug_assert!(
+                lse.dtype == Dtype::F32 && lse.rows == o.rows && lse.width == heads,
+                "the log-sum-exp is f32, one per query row and head"
+            );
+            args.push(lse.arg_mut());
+        }
         ctx.fire(
             Fire::at(FILE, entry).apply(Grid::of(
                 [heads * SIMD * MLA_SPLIT, rows, 1],
@@ -1672,6 +1691,7 @@ pub mod mla {
             kv_lora_rank,
             sm_scale,
             o,
+            None,
         )
     }
 
@@ -1701,6 +1721,7 @@ pub mod mla {
             kv_lora_rank,
             sm_scale,
             o,
+            None,
         )
     }
 
@@ -1717,6 +1738,7 @@ pub mod mla {
         kv_lora_rank: u32,
         sm_scale: f32,
         o: Tensor,
+        lse: Option<Tensor>,
     ) -> Result<(), Error> {
         flash(
             ctx,
@@ -1731,6 +1753,7 @@ pub mod mla {
             kv_lora_rank,
             sm_scale,
             o,
+            lse,
         )
     }
 
@@ -1747,6 +1770,7 @@ pub mod mla {
         kv_lora_rank: u32,
         sm_scale: f32,
         o: Tensor,
+        lse: Option<Tensor>,
     ) -> Result<(), Error> {
         flash(
             ctx,
@@ -1761,6 +1785,7 @@ pub mod mla {
             kv_lora_rank,
             sm_scale,
             o,
+            lse,
         )
     }
 
@@ -1898,6 +1923,7 @@ pub mod mla {
                 RANK,
                 0.5,
                 bf16(3, 2, HEADS * RANK),
+                None,
             )
             .expect_err("one selection row does not serve two query rows");
             assert!(format!("{why}").contains("one row per query row"), "{why}");
@@ -1919,6 +1945,7 @@ pub mod mla {
                 500,
                 0.5,
                 bf16(3, 1, HEADS * 500),
+                None,
             )
             .expect_err("500 is not a multiple of 32");
             assert!(format!("{why}").contains("lane-split"), "{why}");
