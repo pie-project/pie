@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -284,7 +283,6 @@ pub fn epilogue(rows: u32) -> TraceContainer {
 pub struct LaneHandles {
     pub instance: InstanceId,
     pub latent: ChannelId,
-    pub out: ChannelId,
     pub rows: u32,
 }
 
@@ -342,17 +340,6 @@ impl Rig {
             next_channel: 1,
             _dir: dir,
         }
-    }
-
-    pub fn reads_out(&self, name: &str) -> Option<u32> {
-        self.loaded
-            .caps
-            .classes
-            .classes
-            .iter()
-            .flat_map(|class| &class.outputs)
-            .find(|decl| decl.name == name)
-            .map(|decl| decl.width)
     }
 
     fn program(&mut self, rows: u32) -> ProgramId {
@@ -423,7 +410,6 @@ impl Rig {
         LaneHandles {
             instance: bound.id,
             latent,
-            out,
             rows,
         }
     }
