@@ -232,7 +232,10 @@ pub fn topk_sigmoid_biased(
     weights: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_route";
-    let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_sigmoid_biased" });
+    let entry = dtype_dispatch!(OP, logits.dtype, {
+        Bf16 => "router_topk_sigmoid_biased",
+        F32 => "router_topk_sigmoid_biased_float32",
+    });
     debug_assert_eq!(
         bias.dtype,
         Dtype::F32,
