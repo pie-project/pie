@@ -43,26 +43,131 @@ fn read_seat(
 impl Run<'_> {
     fn ssm(&mut self, op: &Ssm) -> Result<(), kernels_xla::Error> {
         match op {
-            Ssm::Mamba2 { .. } | Ssm::Mamba2Chunked { .. } => {
-                Err(kernels_xla::Error::Unsupported { op: op.name() })
+            Ssm::Mamba2 {
+                xbc,
+                dt,
+                z,
+                state,
+                y,
+                ..
+            }
+            | Ssm::Mamba2Chunked {
+                xbc,
+                dt,
+                z,
+                state,
+                y,
+                ..
+            } if self.rs_seat().is_some() => {
+                const OP: &str = "ssm.mamba2_committed";
+                let seat = self.rs_seat().expect("guarded");
+                let ext_xbc = self.rs_ext_of(OP, &seat, *xbc)?;
+                let ext_dt = self.rs_extend(OP, &seat, *dt)?;
+                let ext_z = self.rs_extend(OP, &seat, *z)?;
+                let ext_y = self.rs_out(OP, &seat, *y)?;
+                let pool = self.recurrent(*state);
+                let committed = self.rs_committed(&seat);
+                lower(self.ctx(), |l| {
+                    let xbc = l.read(ext_xbc)?;
+                    let dt = l.read(ext_dt)?;
+                    let z = l.read(ext_z)?;
+                    let m = self.mamba2_banks(l, op)?;
+                    let slab = l.read(pool.state)?;
+                    let indptr = l.read(self.qo_indptr())?;
+                    let seat = read_seat(l, &committed)?;
+                    let tuning = l.tuning();
+                    let (yv, next) = ssm::mamba2_committed(
+                        l.f(),
+                        xbc,
+                        indptr,
+                        seat,
+                        dt,
+                        z,
+                        m,
+                        slab,
+                        ext_y.landing(),
+                        tuning,
+                    )?;
+                    l.land(ext_y, yv)?;
+                    l.land(pool.state, next)
+                })?;
+                self.rs_land(OP, &seat, ext_y, *y)
+            }
+            Ssm::Mamba2 {
+                xbc,
+                dt,
+                z,
+                state,
+                y,
+                ..
+            } => {
+                let pool = self.recurrent(*state);
+                let y = self.tensor(*y);
+                lower(self.ctx(), |l| {
+                    let xbc = l.read(self.tensor(*xbc))?;
+                    let dt = l.read(self.tensor(*dt))?;
+                    let z = l.read(self.tensor(*z))?;
+                    let m = self.mamba2_banks(l, op)?;
+                    let slab = l.read(pool.state)?;
+                    let slots = l.read(pool.slots)?;
+                    let tuning = l.tuning();
+                    let (yv, next) =
+                        ssm::mamba2(l.f(), xbc, dt, z, m, slab, slots, y.landing(), tuning)?;
+                    l.land(y, yv)?;
+                    l.land(pool.state, next)
+                })
+            }
+            Ssm::Mamba2Chunked {
+                xbc,
+                dt,
+                z,
+                state,
+                y,
+                ..
+            } => {
+                let pool = self.recurrent(*state);
+                let (xbc, y) = (self.ragged(*xbc), self.tensor(*y));
+                lower(self.ctx(), |l| {
+                    let data = l.read(xbc.data)?;
+                    let dt = l.read(self.tensor(*dt))?;
+                    let z = l.read(self.tensor(*z))?;
+                    let m = self.mamba2_banks(l, op)?;
+                    let slab = l.read(pool.state)?;
+                    let indptr = l.read(xbc.indptr)?;
+                    let slots = l.read(pool.slots)?;
+                    let tuning = l.tuning();
+                    let (yv, next) = ssm::mamba2_chunked(
+                        l.f(),
+                        kernels_xla::tensor::RaggedTensor { data, indptr },
+                        dt,
+                        z,
+                        m,
+                        slab,
+                        slots,
+                        y.landing(),
+                        tuning,
+                    )?;
+                    l.land(y, yv)?;
+                    l.land(pool.state, next)
+                })
             }
             Ssm::CausalConv1d {
                 x,
                 weight,
                 state,
+                bias,
                 conv_width,
                 dilation,
                 y,
-                ..
             }
             | Ssm::CausalConv1dChunked {
                 x,
                 weight,
                 state,
+                bias,
                 conv_width,
                 dilation,
                 y,
-                ..
             } if self.rs_seat().is_some() => {
                 const OP: &str = "ssm.causal_conv1d_committed";
                 let seat = self.rs_seat().expect("guarded");
@@ -74,6 +179,7 @@ impl Run<'_> {
                 lower(self.ctx(), |l| {
                     let xv = l.read(ext_x)?;
                     let w = l.read(self.tensor(*weight))?;
+                    let bias = bias.map(|b| l.read(self.tensor(b))).transpose()?;
                     let bank = l.read(pool.conv_state)?;
                     let indptr = l.read(self.qo_indptr())?;
                     let seat = read_seat(l, &committed)?;
@@ -83,6 +189,7 @@ impl Run<'_> {
                         indptr,
                         seat,
                         w,
+                        bias,
                         bank,
                         *conv_width,
                         *dilation,
@@ -232,10 +339,10 @@ impl Run<'_> {
                 x,
                 weight,
                 state,
+                bias,
                 conv_width,
                 dilation,
                 y,
-                ..
             } => {
                 let pool = self.recurrent(*state);
                 conv_bank("ssm.causal_conv1d", &pool)?;
@@ -243,12 +350,14 @@ impl Run<'_> {
                 lower(self.ctx(), |l| {
                     let xv = l.read(self.tensor(*x))?;
                     let w = l.read(self.tensor(*weight))?;
+                    let bias = bias.map(|b| l.read(self.tensor(b))).transpose()?;
                     let bank = l.read(pool.conv_state)?;
                     let slots = l.read(pool.slots)?;
                     let (yv, next) = ssm::causal_conv1d(
                         l.f(),
                         xv,
                         w,
+                        bias,
                         bank,
                         slots,
                         *conv_width,
@@ -263,10 +372,10 @@ impl Run<'_> {
                 x,
                 weight,
                 state,
+                bias,
                 conv_width,
                 dilation,
                 y,
-                ..
             } => {
                 let pool = self.recurrent(*state);
                 conv_bank("ssm.causal_conv1d_chunked", &pool)?;
@@ -274,6 +383,7 @@ impl Run<'_> {
                 lower(self.ctx(), |l| {
                     let data = l.read(x.data)?;
                     let w = l.read(self.tensor(*weight))?;
+                    let bias = bias.map(|b| l.read(self.tensor(b))).transpose()?;
                     let bank = l.read(pool.conv_state)?;
                     let indptr = l.read(x.indptr)?;
                     let slots = l.read(pool.slots)?;
@@ -281,6 +391,7 @@ impl Run<'_> {
                         l.f(),
                         kernels_xla::tensor::RaggedTensor { data, indptr },
                         w,
+                        bias,
                         bank,
                         slots,
                         *conv_width,
@@ -535,6 +646,49 @@ impl Run<'_> {
                 l.land(o_y, v)
             }),
         }
+    }
+
+    /// A Mamba-2 statement's per-head banks and gated group norm, read.
+    fn mamba2_banks(
+        &self,
+        l: &mut Lower<'_, '_>,
+        op: &Ssm,
+    ) -> Result<ssm::Mamba2, kernels_xla::Error> {
+        let (Ssm::Mamba2 {
+            a_log,
+            dt_bias,
+            d,
+            norm,
+            eps,
+            heads,
+            groups,
+            state_dim,
+            ..
+        }
+        | Ssm::Mamba2Chunked {
+            a_log,
+            dt_bias,
+            d,
+            norm,
+            eps,
+            heads,
+            groups,
+            state_dim,
+            ..
+        }) = op
+        else {
+            return Err(kernels_xla::Error::Unsupported { op: op.name() });
+        };
+        Ok(ssm::Mamba2 {
+            a_log: l.read(self.tensor(*a_log))?,
+            dt_bias: l.read(self.tensor(*dt_bias))?,
+            d: l.read(self.tensor(*d))?,
+            norm: l.read(self.tensor(*norm))?,
+            eps: *eps,
+            heads: *heads,
+            groups: *groups,
+            state_dim: *state_dim,
+        })
     }
 
     /// `[b | a]` into `gates`.
