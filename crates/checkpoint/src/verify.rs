@@ -59,7 +59,13 @@ pub struct WriteView {
 
 impl WriteView {
     fn new(instr: u32, step: Option<usize>, buffer: u32, start: u64, end: u64) -> Self {
-        Self { instr, step, buffer, start, end }
+        Self {
+            instr,
+            step,
+            buffer,
+            start,
+            end,
+        }
     }
 }
 
@@ -335,8 +341,7 @@ fn check_byte_partition(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
     if plan.buffers.is_empty() && plan.finalized_buffers.is_empty() {
         return;
     }
-    let buffer_by_id: HashMap<u32, &BufferView> =
-        plan.buffers.iter().map(|b| (b.id, b)).collect();
+    let buffer_by_id: HashMap<u32, &BufferView> = plan.buffers.iter().map(|b| (b.id, b)).collect();
     let view_by_output: HashMap<u32, &SliceView> =
         plan.views.iter().map(|v| (v.output, v)).collect();
     let filled_buffers: HashSet<u32> = plan.fills.iter().map(|f| f.buffer).collect();
@@ -352,10 +357,11 @@ fn check_byte_partition(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
             )));
         }
         if write.end > write.start {
-            writes_by_buffer
-                .entry(write.buffer)
-                .or_default()
-                .push((write.start, write.end, write.instr));
+            writes_by_buffer.entry(write.buffer).or_default().push((
+                write.start,
+                write.end,
+                write.instr,
+            ));
         }
     }
 
@@ -443,8 +449,7 @@ fn check_byte_partition(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
 }
 
 fn check_arena_layout(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
-    let buffer_by_id: HashMap<u32, &BufferView> =
-        plan.buffers.iter().map(|b| (b.id, b)).collect();
+    let buffer_by_id: HashMap<u32, &BufferView> = plan.buffers.iter().map(|b| (b.id, b)).collect();
     let view_by_output: HashMap<u32, &SliceView> =
         plan.views.iter().map(|v| (v.output, v)).collect();
 
@@ -793,12 +798,18 @@ pub fn view_of(plan: &crate::plan::LoadPlan) -> PlanView<'_> {
 
     for instr in &plan.instrs {
         match instr {
-            StorageInstr::Finalize { id: _, tensor, name } => {
+            StorageInstr::Finalize {
+                id: _,
+                tensor,
+                name,
+            } => {
                 finalized.push(name.as_str());
                 finalized_buffers.push((name.as_str(), tensor.0));
             }
             StorageInstr::ExtentWrite { id, source, dest }
-            | StorageInstr::GatherWrite { id, source, dest, .. } => {
+            | StorageInstr::GatherWrite {
+                id, source, dest, ..
+            } => {
                 reads.push(ReadView::of(id.0, source));
                 let (start, end) = dest_span(dest);
                 writes.push(WriteView::new(
@@ -809,7 +820,11 @@ pub fn view_of(plan: &crate::plan::LoadPlan) -> PlanView<'_> {
                     end,
                 ));
             }
-            StorageInstr::BulkExtentWrite { id, source, dest_offset } => {
+            StorageInstr::BulkExtentWrite {
+                id,
+                source,
+                dest_offset,
+            } => {
                 reads.push(ReadView::of(id.0, source));
                 let w_start = *dest_offset;
                 let w_end = w_start.saturating_add(source.span_bytes);

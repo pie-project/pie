@@ -125,7 +125,7 @@ impl Run<'_> {
         let rows = landed.first().map_or(0, |t| t.rows);
         // A row cut into its heads: each part of it one of the kernel's rows.
         let row_width = landed.first().map_or(width, |t| t.width);
-        if width == 0 || row_width % width != 0 {
+        if width == 0 || !row_width.is_multiple_of(width) {
             return Err(broken(format!(
                 "the region's rows are {width} wide and it lands rows {row_width} wide"
             )));

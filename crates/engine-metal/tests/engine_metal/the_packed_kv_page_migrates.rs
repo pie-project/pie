@@ -188,6 +188,7 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
             head_dim: head_dim as u32,
             live: None,
             shard: Default::default(),
+            rows: None,
         }],
         values: Vec::new(),
         nodes: Vec::new(),

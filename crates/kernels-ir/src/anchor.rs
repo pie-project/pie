@@ -198,10 +198,9 @@ impl Window {
     /// The tile column the window's `j`th landed column is.
     #[must_use]
     pub const fn column(self, j: u32) -> u32 {
-        if self.head == 0 {
-            self.from + j
-        } else {
-            self.from + j / self.head * self.stride + j % self.head
+        match j.checked_div(self.head) {
+            Some(q) => self.from + q * self.stride + j % self.head,
+            None => self.from + j,
         }
     }
 
@@ -764,8 +763,7 @@ impl Anchored {
                 return Err(AnchorError::Window { result });
             }
             for (result, w) in (0u32..).zip(&self.windows) {
-                let strided = w.head == 0
-                    || (w.stride >= w.head && w.width.is_multiple_of(w.head));
+                let strided = w.head == 0 || (w.stride >= w.head && w.width.is_multiple_of(w.head));
                 let inside = w.from.checked_add(w.width).is_some()
                     && w.from.checked_add(w.stride).is_some()
                     && w.end() <= c.n;
@@ -780,7 +778,10 @@ impl Anchored {
     /// The window result `k` lands: its own, or every column.
     #[must_use]
     pub fn window(&self, k: usize) -> Window {
-        self.windows.get(k).copied().unwrap_or(Window::of(0, self.contraction.n))
+        self.windows
+            .get(k)
+            .copied()
+            .unwrap_or(Window::of(0, self.contraction.n))
     }
 
     /// The tiles it lands, each `m x n`: the epilogue's results, or each
@@ -1003,9 +1004,7 @@ fn windowed(anchored: &Anchored, tiles: Vec<Vec<f32>>, m: usize, n: usize) -> Ve
         .map(|(tile, w)| {
             let tile = &tile;
             (0..m)
-                .flat_map(|row| {
-                    (0..w.width).map(move |j| tile[row * n + w.column(j) as usize])
-                })
+                .flat_map(|row| (0..w.width).map(move |j| tile[row * n + w.column(j) as usize]))
                 .collect()
         })
         .collect()
@@ -1307,7 +1306,7 @@ mod tests {
             theta: 10000.0,
             inverse: false,
             ramp: None,
-        mscale: None,
+            mscale: None,
         };
         let rotated = b.rotate(normed, 1, &turn);
         let col = b.push(Op::Column);
@@ -1475,7 +1474,7 @@ mod tests {
             theta: 10000.0,
             inverse: false,
             ramp: None,
-        mscale: None,
+            mscale: None,
         };
         let turned = b.rotate(scaled, 3, &turn);
         let anchored = Anchored {
@@ -1548,8 +1547,8 @@ mod tests {
         for (x, want) in [
             (0.0, 0.0),
             (1.0, 1.0),
-            (1.0625, 1.0),   // a tie between 1 and 1.125: to even
-            (1.1875, 1.25),  // a tie between 1.125 and 1.25: to even
+            (1.0625, 1.0),  // a tie between 1 and 1.125: to even
+            (1.1875, 1.25), // a tie between 1.125 and 1.25: to even
             (1.2, 1.25),
             (-3.3, -3.25),
             (448.0, 448.0),
@@ -1558,7 +1557,7 @@ mod tests {
             (0.001_953_125, 0.001_953_125), // 2^-9, the least subnormal
             (0.0009, 0.0),                  // below half of it
             (0.0015, 0.001_953_125),
-            (0.017, 0.017_578_125),         // 9 · 2^-9
+            (0.017, 0.017_578_125), // 9 · 2^-9
         ] {
             assert_eq!(round_e4m3(x), want, "{x}");
         }
@@ -1604,7 +1603,10 @@ mod tests {
         ];
         let got = eval(&anchored, m, &a, &w, &[], &given).expect("runs");
         for (plain, cached) in got[0].iter().zip(&got[1]) {
-            assert_eq!(*cached, crate::skeleton::round_e4m3(round_bf16(*plain) / 0.5));
+            assert_eq!(
+                *cached,
+                crate::skeleton::round_e4m3(round_bf16(*plain) / 0.5)
+            );
         }
         assert_eq!(
             paged_rows(&anchored, 1, &given, 16),
@@ -1649,7 +1651,10 @@ mod tests {
         };
         assert_eq!(anchored.verify(), Ok(()));
         let w = Window::strided(4, 8, 4, 8);
-        assert_eq!((w.column(5), w.landed(13), w.landed(8), w.end()), (13, Some(5), None, 16));
+        assert_eq!(
+            (w.column(5), w.landed(13), w.landed(8), w.end()),
+            (13, Some(5), None, 16)
+        );
         let (a, wt) = (values(m * k, 1), values(n * k, 2));
         let got = eval(&anchored, m, &a, &wt, &[], &[]).expect("runs");
         let y = eval(&Anchored::plain(anchored.contraction), m, &a, &wt, &[], &[]).expect("runs");
@@ -1759,7 +1764,11 @@ mod tests {
             } else {
                 x[i] * c + x[i - 4] * s
             };
-            assert!((got[0][i] - want).abs() <= 1e-6, "{i}: {} vs {want}", got[0][i]);
+            assert!(
+                (got[0][i] - want).abs() <= 1e-6,
+                "{i}: {} vs {want}",
+                got[0][i]
+            );
         }
     }
 

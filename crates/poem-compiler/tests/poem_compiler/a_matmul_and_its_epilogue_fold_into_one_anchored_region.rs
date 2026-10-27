@@ -126,7 +126,11 @@ fn a_packed_glu_reads_the_banks_two_parts() {
     let anchor = the_one(&formed);
     let c = &anchor.anchored.contraction;
     assert_eq!((c.n, c.layout), (N as u32, Layout::Packed(2)));
-    assert_eq!(c.acc, Some(Dtype::Bf16), "its halves read as their projections land them");
+    assert_eq!(
+        c.acc,
+        Some(Dtype::Bf16),
+        "its halves read as their projections land them"
+    );
 
     let [m, n, k] = [2usize, N as usize, K as usize];
     let (a, w) = (values(m * k, 4), values(2 * n * k, 5));

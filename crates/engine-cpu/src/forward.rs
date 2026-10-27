@@ -853,7 +853,11 @@ impl Run<'_> {
                 // holds looks up zeros, the ranks' rows summed after.
                 let rank = self.group.as_ref().map_or(0, |g| g.rank);
                 let (ids, table) = (self.ints(ids)?, self.floats(table)?);
-                let first = if table.rows < vocab as usize { rank * table.rows } else { 0 };
+                let first = if table.rows < vocab as usize {
+                    rank * table.rows
+                } else {
+                    0
+                };
                 let mut out = Vec::with_capacity(ids.rows * table.width);
                 for &id in ids.v {
                     let id = usize::try_from(id).map_err(|_| "a negative token id")?;

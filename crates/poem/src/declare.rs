@@ -64,7 +64,11 @@ impl Join {
         // The path every leg ends in, past the common one, each leg keeping
         // a part of its own.
         let tail = (0..shortest.saturating_sub(common + 1))
-            .take_while(|&i| parts.iter().all(|p| p[p.len() - 1 - i] == parts[0][parts[0].len() - 1 - i]))
+            .take_while(|&i| {
+                parts
+                    .iter()
+                    .all(|p| p[p.len() - 1 - i] == parts[0][parts[0].len() - 1 - i])
+            })
             .count();
         let rests: Vec<String> = parts
             .iter()
@@ -952,10 +956,7 @@ mod join_tests {
             "blocks.0.gate_up.bank"
         );
         assert_eq!(Join::name_of(&["a.w", "b.w"]), "ab.w");
-        assert_eq!(
-            Join::name_of(&["gdn.in_qkv", "gdn.in_z"]),
-            "gdn.in_qkvz"
-        );
+        assert_eq!(Join::name_of(&["gdn.in_qkv", "gdn.in_z"]), "gdn.in_qkvz");
         assert_eq!(Join::name_of(&["gdn.in_b", "gdn.in_a"]), "gdn.in_ba");
         assert_eq!(
             Join::name_of(&["mlp.shared_gate", "mlp.shared_up"]),
@@ -994,7 +995,10 @@ mod join_tests {
         // Legs every rank holds whole join whole along the axis named.
         let whole = |name: &str| Weight::sym(name, [8, 32, 64], Dtype::Bf16);
         let bank = Weight::joined_along("gate_up", &[whole("gate"), whole("up")], Some(1)).unwrap();
-        assert_eq!((bank.shape, bank.shard), (vec![8, 64, 64], Shard::Replicated));
+        assert_eq!(
+            (bank.shape, bank.shard),
+            (vec![8, 64, 64], Shard::Replicated)
+        );
         assert!(Weight::joined("gate_up", &[whole("gate"), whole("up")]).is_err());
     }
 }

@@ -18,10 +18,10 @@ use cudarc::runtime::sys::{
     cudaError, cudaEvent_t, cudaEventCreate, cudaEventDestroy, cudaEventElapsedTime,
     cudaEventRecordExternal, cudaEventRecordWithFlags, cudaEventSynchronize, cudaFree,
     cudaGetDevice, cudaGetLastError, cudaGraph_t, cudaGraphDestroy, cudaGraphExec_t,
-    cudaGraphExecDestroy, cudaGraphInstantiateWithFlags, cudaGraphLaunch, cudaMalloc, cudaMemcpyAsync,
-    cudaMemcpyKind, cudaMemsetAsync, cudaStreamBeginCapture, cudaStreamCaptureMode, cudaStreamCaptureStatus,
-    cudaStreamCreateWithFlags, cudaStreamDestroy, cudaStreamEndCapture, cudaStreamNonBlocking,
-    cudaStreamSynchronize,
+    cudaGraphExecDestroy, cudaGraphInstantiateWithFlags, cudaGraphLaunch, cudaMalloc,
+    cudaMemcpyAsync, cudaMemcpyKind, cudaMemsetAsync, cudaStreamBeginCapture,
+    cudaStreamCaptureMode, cudaStreamCaptureStatus, cudaStreamCreateWithFlags, cudaStreamDestroy,
+    cudaStreamEndCapture, cudaStreamNonBlocking, cudaStreamSynchronize,
 };
 
 use crate::jit::device::capture_status;
@@ -490,7 +490,16 @@ pub(crate) fn anchored(
             let bytes = (m as usize) * (n as usize) * (parts as usize) * epi.product_bytes();
             let products = ctx.scratch_stream(op, ANCHOR_PRODUCTS, bytes)?.addr() as u64;
             product(ctx, op, epi, act, w, products, m, n * parts, k)?;
-            leg.fire(epi, ctx, products, ins, outs, paging, m.unsigned_abs(), n.unsigned_abs())?;
+            leg.fire(
+                epi,
+                ctx,
+                products,
+                ins,
+                outs,
+                paging,
+                m.unsigned_abs(),
+                n.unsigned_abs(),
+            )?;
             Ok(true)
         }
         _ => unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k),
@@ -605,7 +614,7 @@ fn unfused(
     while from < m as usize {
         let rows = run.min(m as usize - from);
         let at = |base: u64, width: usize| base + (from * width * 2) as u64;
-        let ins: Vec<In> = ins.iter().map(|input| input.from_row(from)).collect();
+        let ins: Vec<In> = ins.iter().map(|input| input.at_row(from)).collect();
         let outs: Vec<u64> = (0..outs.len())
             .zip(outs)
             .map(|(r, &out)| {
@@ -631,7 +640,11 @@ fn unfused(
         )?;
         // a paged result's live rows from the run's first
         let paging = paging.map(|p| Paging {
-            valid: if p.valid == 0 { 0 } else { p.valid + from as u64 },
+            valid: if p.valid == 0 {
+                0
+            } else {
+                p.valid + from as u64
+            },
             ..p
         });
         leg.fire(

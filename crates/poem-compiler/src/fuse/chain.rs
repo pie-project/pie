@@ -637,7 +637,7 @@ fn lowers(op: &Operation) -> bool {
 /// The rotation `turn` states of `head_dim`-wide heads of a row of `width`
 /// at `theta`, as kernels-ir's builder turns it; `None` for a turn it does not.
 pub(super) fn rotation(width: u32, head_dim: u32, theta: f32, turn: &Turn) -> Option<build::Turn> {
-    if head_dim == 0 || width % head_dim != 0 {
+    if head_dim == 0 || !width.is_multiple_of(head_dim) {
         return None;
     }
     let mut mscale = None;
@@ -992,7 +992,7 @@ fn part(trace: &Trace, run: &[u32], width: u32) -> Option<u32> {
             }
         }
     }
-    part.filter(|&head| head > 0 && head < width && width % head == 0)
+    part.filter(|&head| head > 0 && head < width && width.is_multiple_of(head))
 }
 
 /// Whether an op of `run` reads `v` as a part of a wider row (a

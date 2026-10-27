@@ -260,6 +260,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
                 query_len: rows,
                 ..engine::program::BindExtents::default()
             },
+            device_resolved: Default::default(),
         })
         .expect("the instance binds")
         .id;

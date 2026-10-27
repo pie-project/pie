@@ -69,7 +69,11 @@ fn every_row_traces_on_every_platform_holding_nothing_between_fires() {
             );
             assert_eq!(
                 plan.caches.len(),
-                if is_flagship(deployment) { model::TEXT_LAYERS } else { 0 },
+                if is_flagship(deployment) {
+                    model::TEXT_LAYERS
+                } else {
+                    0
+                },
                 "{deployment} {platform:?}: the text encoder's kv, and nothing else between fires"
             );
             let seams: BTreeMap<&str, usize> =
@@ -293,7 +297,11 @@ fn every_rope_is_one_ladder_across_the_row() {
             .count();
         assert_eq!(
             encoder,
-            if is_flagship(deployment) { model::TEXT_LAYERS } else { 0 },
+            if is_flagship(deployment) {
+                model::TEXT_LAYERS
+            } else {
+                0
+            },
             "{deployment}: the text encoder alone turns another rope, once a layer"
         );
     }

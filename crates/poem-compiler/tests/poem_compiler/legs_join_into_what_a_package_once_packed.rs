@@ -266,7 +266,12 @@ fn segmented_legs_and_a_concat_join_their_legs() {
     let w = |name: &str, rows: u64| weight(name, rows).columns();
     let apart = Gdn {
         embed: embed(),
-        legs: Some([w("qkv", QKV), w("z", Z), w("b", HEADS / 2), w("a", HEADS / 2)]),
+        legs: Some([
+            w("qkv", QKV),
+            w("z", Z),
+            w("b", HEADS / 2),
+            w("a", HEADS / 2),
+        ]),
         packed: None,
         head: head(),
     };
@@ -305,7 +310,9 @@ impl ForwardHybrid for Gated {
         use ops::linear::matmul;
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
         let (q, k, v, g) = match (&self.legs, &self.packed) {
-            (Some([q, k, v, g]), None) => (matmul(&x, q), matmul(&x, k), matmul(&x, v), matmul(&x, g)),
+            (Some([q, k, v, g]), None) => {
+                (matmul(&x, q), matmul(&x, k), matmul(&x, v), matmul(&x, g))
+            }
             (None, Some(qkvg)) => {
                 let (qkv, g) = ops::gather::split_rows(&matmul(&x, qkvg), (Q + 2 * KV) as u32);
                 let (q, k, v) = ops::gather::split_qkv(&qkv, Q as u32, KV as u32);
@@ -491,7 +498,12 @@ fn biased_routed_legs_join_with_their_biases() {
         head: head(),
     };
     let apart = micro(
-        Some([bank("gate", INTER), bias("gate_bias", INTER), bank("up", INTER), bias("up_bias", INTER)]),
+        Some([
+            bank("gate", INTER),
+            bias("gate_bias", INTER),
+            bank("up", INTER),
+            bias("up_bias", INTER),
+        ]),
         None,
     );
     let packed = micro(

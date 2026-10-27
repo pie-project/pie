@@ -226,7 +226,7 @@ pub fn schedule(region: &Region) -> Result<Kernel, Unscheduled> {
             _ => false,
         });
         if period > MAX_TABLE
-            || region.width % period != 0
+            || !region.width.is_multiple_of(period)
             || types[value as usize].1 != Elem::F32
             || results.contains(&value)
             || region.rounding(value).is_some()

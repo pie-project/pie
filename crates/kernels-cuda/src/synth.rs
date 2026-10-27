@@ -227,7 +227,7 @@ fn heads(region: &Region) -> Result<(), Refusal> {
             continue;
         };
         let seg = head / 8;
-        if !seg.is_power_of_two() || lanes % seg != 0 {
+        if !seg.is_power_of_two() || !lanes.is_multiple_of(seg) {
             return Err(refusal(format!(
                 "op {at} reduces heads {head} wide, which the {lanes} threads of a {}-wide row \
                  do not split evenly",

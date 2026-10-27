@@ -893,10 +893,12 @@ impl Default for ForwardPass {
     }
 }
 
+type Declared = (Vec<(String, String)>, Vec<OutputDecl>);
+
 /// Each lane's outputs, in lane order, by its switches.
 fn lane_outputs(inner: &ForwardInner) -> Result<Vec<Vec<OutputDecl>>, String> {
     thread_local! {
-        static DECLARED: RefCell<Vec<(Vec<(String, String)>, Vec<OutputDecl>)>> =
+        static DECLARED: RefCell<Vec<Declared>> =
             const { RefCell::new(Vec::new()) };
     }
     let lanes = inner

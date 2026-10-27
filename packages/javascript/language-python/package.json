@@ -1,6 +1,6 @@
 {
   "name": "@pie-project/language-python",
-  "version": "0.5.4",
+  "version": "0.6.0",
   "description": "The python language component of pie: import it, and python inferlets run on @pie-project/server.",
   "type": "module",
   "main": "index.mjs",
@@ -13,7 +13,7 @@
     "test": "node --test test/register.test.mjs"
   },
   "peerDependencies": {
-    "@pie-project/server": "^0.5.0"
+    "@pie-project/server": "^0.6.0"
   },
   "license": "Apache-2.0",
   "repository": {

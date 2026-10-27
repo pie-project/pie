@@ -115,7 +115,8 @@ fn a_beam_reads_up_to_its_slot_what_its_mask_admits() {
     let word = |rows: u32, masked: bool| trace.facts.word(&Request::new(rows, masked));
     let depth = [PROMPT];
     // `(seat, tokens, held, positions, mask)` a lane; every lane names the pool's pages.
-    let mut fire = |lanes: &[(u32, &[u32], u32, &[u32], Option<&Masking>)]| {
+    type Row<'a> = (u32, &'a [u32], u32, &'a [u32], Option<&'a Masking>);
+    let mut fire = |lanes: &[Row<'_>]| {
         let seated: Vec<Seated<'_>> = lanes
             .iter()
             .map(|&(slot, tokens, held, positions, mask)| Seated {

@@ -253,7 +253,14 @@ impl Session {
         class: GeometryClass,
         device: eta_ir::registry::PortMask,
     ) -> Result<Envelope> {
-        ports::resolve(plan, class, device, &self.rings, &self.cursors_now(), &self.shapes)
+        ports::resolve(
+            plan,
+            class,
+            device,
+            &self.rings,
+            &self.cursors_now(),
+            &self.shapes,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

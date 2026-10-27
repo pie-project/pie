@@ -228,7 +228,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
         let velocity = OutputDecl {
             name: "velocity".into(),
             axis: Axis::Voxel,
-            width: WIDTH as u32,
+            width: WIDTH,
             dtype: EtaDtype::F32,
             layers: 0,
             readout: false,
