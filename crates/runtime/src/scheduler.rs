@@ -185,10 +185,6 @@ pub(crate) async fn tap_groups(engine_id: usize) -> Option<::engine::TapGroups> 
     groups
 }
 
-pub async fn debug_dump(engine_id: usize) -> Result<String> {
-    scheduler_handle(engine_id)?.debug_dump().await
-}
-
 pub fn configured_submit_deadline() -> Duration {
     *SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(50_000))
 }

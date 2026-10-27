@@ -35,8 +35,6 @@ pub struct ProcessCtx {
     #[cfg(not(target_arch = "wasm32"))]
     http_hooks: PieHttpHooks,
 
-    network_allowed: bool,
-
     scratch_dir: Option<PathBuf>,
 
     /// Set when the component is a language component and this is the
@@ -209,7 +207,6 @@ impl ProcessCtx {
             http_hooks: PieHttpHooks {
                 network_allowed: policy.network.allow,
             },
-            network_allowed: policy.network.allow,
             scratch_dir,
             script,
             residency: {
@@ -309,10 +306,6 @@ impl ProcessCtx {
 
     pub fn get_username(&self) -> String {
         self.username.clone()
-    }
-
-    pub fn network_allowed(&self) -> bool {
-        self.network_allowed
     }
 
     pub(crate) fn residency_pipelines(&self) -> Vec<crate::pipeline::fire::PendingFires> {

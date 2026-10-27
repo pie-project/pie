@@ -270,9 +270,6 @@ enum SchedulerItem {
         lane: ProcessId,
         seq: u64,
     },
-    DebugDump {
-        response: tokio::sync::oneshot::Sender<String>,
-    },
     HostKv {
         op: HostKvOp,
         response: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
@@ -858,15 +855,6 @@ impl SchedulerHandle {
             .await?
     }
 
-    pub(crate) async fn debug_dump(&self) -> Result<String> {
-        crate::rt::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.request(|response| SchedulerItem::DebugDump { response }),
-        )
-        .await
-        .map_err(|_| anyhow!("scheduler did not answer the debug dump"))?
-    }
-
     pub fn close_instance(&self, id: ::engine::InstanceId, pacing_wait_id: u64) -> Result<()> {
         self.send(SchedulerItem::CloseInstance { id, pacing_wait_id })
     }
@@ -1006,7 +994,6 @@ impl BatchScheduler {
                 Self::enqueue_item(
                     &mut pending,
                     &mut terminated_processes,
-                    &in_flight_launches,
                     &mut in_flight_control,
                     &instances,
                     limits,
@@ -1272,7 +1259,6 @@ impl BatchScheduler {
                 Self::enqueue_item(
                     &mut pending,
                     &mut terminated_processes,
-                    &in_flight_launches,
                     &mut in_flight_control,
                     &instances,
                     limits,
@@ -1362,7 +1348,6 @@ impl BatchScheduler {
     fn enqueue_item(
         pending: &mut PendingQueue,
         terminated_processes: &mut HashSet<ProcessId>,
-        in_flight_launches: &VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut InFlightControls,
         instances: &HashMap<::engine::InstanceId, TrackedInstance>,
         limits: SchedulerLimits,
@@ -1374,15 +1359,6 @@ impl BatchScheduler {
         match item {
             SchedulerItem::Stop => {
                 *stopping = true;
-            }
-            SchedulerItem::DebugDump { response } => {
-                let _ = response.send(Self::render_debug_dump(
-                    pending,
-                    in_flight_launches,
-                    in_flight_control,
-                    instances,
-                    frame_policy,
-                ));
             }
             SchedulerItem::Nudge => {}
             SchedulerItem::ExecutionSlotReleased(pid) => {

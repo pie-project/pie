@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Poll;
 
 use crate::rt::SegQueue;
@@ -227,44 +227,8 @@ impl SubmissionCompletionState {
     }
 }
 
-#[derive(Default)]
-struct LiveRegistry {
-    entries: Vec<Weak<SubmissionCompletionState>>,
-    compact_at: usize,
-}
-
-impl LiveRegistry {
-    fn insert(&mut self, state: &Arc<SubmissionCompletionState>) {
-        if self.entries.len() >= self.compact_at {
-            self.entries.retain(|weak| weak.strong_count() > 0);
-            self.compact_at = (self.entries.len() * 2).max(64);
-        }
-        self.entries.push(Arc::downgrade(state));
-    }
-
-    fn drain_live(&mut self) -> Vec<Arc<SubmissionCompletionState>> {
-        std::mem::take(&mut self.entries)
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect()
-    }
-}
-
 struct BrokerInner {
     table: &'static WakerTable,
-    live: Mutex<LiveRegistry>,
-    closed: AtomicBool,
-    close_message: Mutex<Option<String>>,
-}
-
-impl BrokerInner {
-    fn close_message(&self) -> String {
-        self.close_message
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| "completion broker is closed".to_string())
-    }
 }
 
 #[derive(Clone)]
@@ -282,9 +246,6 @@ impl CompletionBroker {
     pub fn new() -> Self {
         let inner = Arc::new(BrokerInner {
             table: WakerTable::global(),
-            live: Mutex::new(LiveRegistry::default()),
-            closed: AtomicBool::new(false),
-            close_message: Mutex::new(None),
         });
         Self { inner }
     }
@@ -297,11 +258,6 @@ impl CompletionBroker {
         assert_valid_target_epoch(target_epoch);
         let slot = self.inner.table.alloc();
         let state = Arc::new(SubmissionCompletionState::new(slot, target_epoch, mode));
-        self.inner.live.lock().unwrap().insert(&state);
-
-        if self.inner.closed.load(Ordering::Acquire) {
-            state.close(self.inner.table, self.inner.close_message());
-        }
         SubmissionCompletion::pending(Arc::clone(&self.inner), state)
     }
 
@@ -314,20 +270,8 @@ impl CompletionBroker {
         )
     }
 
-    pub fn close_all(&self, message: impl Into<String>) {
-        let message = message.into();
-        *self.inner.close_message.lock().unwrap() = Some(message.clone());
-        self.inner.closed.store(true, Ordering::Release);
-        let states = self.inner.live.lock().unwrap().drain_live();
-        for state in states {
-            state.close(self.inner.table, message.clone());
-        }
-    }
-
     pub fn notify(&self, wait_id: u64, epoch: u64) {
-        if !self.inner.closed.load(Ordering::Acquire) {
-            let _ = self.inner.table.publish(wait_id, epoch);
-        }
+        let _ = self.inner.table.publish(wait_id, epoch);
     }
 }
 
@@ -975,12 +919,6 @@ impl FrameSettlements {
         for landing in landed {
             landing.publish(broker);
         }
-    }
-
-    pub fn forget(&self, frame: engine::FrameId) {
-        let mut book = self.inner.lock().unwrap();
-        book.frames.remove(&frame);
-        book.early.remove(&frame);
     }
 
     /// Step `step` of frame `frame` landed, as `outcome` says.
