@@ -171,7 +171,7 @@ pub fn matmul_select(
 /// wgmma: the routed W8A8 select's tensor-core GEMM there.
 #[cfg(feature = "cuda")]
 pub(crate) fn hopper_wgmma() -> bool {
-    crate::jit::cache::arch() == Some("sm_90")
+    false
 }
 
 /// Whether a bf16 select runs on the grouped tcgen05 GEMM: a resident bank
