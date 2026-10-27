@@ -20,24 +20,6 @@ use crate::{
 
 pub const STOP_TOKENS: &[&str] = &[END];
 
-pub const MARKERS: &[&str] = &[
-    START,
-    MIDDLE,
-    REASONING_MODE,
-    THINK_OPEN,
-    THINK_CLOSE,
-    TOOL_CALLS_OPEN,
-    TOOL_CALLS_CLOSE,
-    TOOL_CALL_OPEN,
-    TOOL_CALL_CLOSE,
-    ARG_KEY_OPEN,
-    ARG_KEY_CLOSE,
-    ARG_VALUE_OPEN,
-    ARG_VALUE_CLOSE,
-    TOOL_RESPONSE_OPEN,
-    TOOL_RESPONSE_CLOSE,
-];
-
 const START: &str = "<｜hy_start:opensource｜>";
 const MIDDLE: &str = "<｜hy_middle:opensource｜>";
 const END: &str = "<｜hy_end:opensource｜>";
