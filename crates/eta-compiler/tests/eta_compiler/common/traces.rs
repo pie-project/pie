@@ -1,4 +1,3 @@
-
 use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
@@ -33,7 +32,6 @@ pub fn chan(shape: Shape, dtype: Dtype, host_role: HostRole, seeded: bool) -> Ch
         seeded,
     }
 }
-
 
 pub fn const_port(port: Port, dtype: Dtype, shape: Shape, words: &[u32]) -> PortBinding {
     PortBinding {
@@ -109,7 +107,6 @@ pub fn section3_trace() -> TraceContainer {
         inputs: Vec::new(),
     }
 }
-
 
 pub const BB: u32 = 2;
 pub const V: u32 = 8;

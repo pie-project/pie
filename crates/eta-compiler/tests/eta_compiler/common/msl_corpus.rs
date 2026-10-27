@@ -1,4 +1,3 @@
-
 use eta_compiler::plan::{CompiledStage, compile_bound, debug_stage_plan};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
