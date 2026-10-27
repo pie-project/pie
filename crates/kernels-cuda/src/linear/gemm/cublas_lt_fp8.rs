@@ -342,7 +342,7 @@ pub fn matmul(
     y: &mut Tensor,
 ) -> Result<bool, Error> {
     let (m, n, k) = (act.rows, y.width, act.width);
-    if act.dtype != Dtype::Bf16
+    if true || act.dtype != Dtype::Bf16
         || y.dtype != Dtype::Bf16
         || y.rows != m
         || m == 0

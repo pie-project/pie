@@ -39,8 +39,8 @@ impl Device {
             Some(Self {
                 num_sm: crate::jit::device::multiprocessors()?.max(1),
                 cc_major: crate::jit::device::compute_capability_major()?,
-                max_smem_per_sm: crate::jit::device::max_shared_memory_per_sm()?,
-                max_smem_per_block_optin: crate::jit::device::max_shared_memory_per_block_optin()?,
+                max_smem_per_sm: crate::jit::device::max_shared_memory_per_sm()?.min(167_936),
+                max_smem_per_block_optin: crate::jit::device::max_shared_memory_per_block_optin()?.min(166_912),
             })
         }
         #[cfg(not(feature = "cuda"))]

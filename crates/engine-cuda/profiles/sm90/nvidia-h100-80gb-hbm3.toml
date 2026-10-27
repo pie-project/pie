@@ -4,22 +4,6 @@ api = 1
 device = "NVIDIA H100 80GB HBM3"
 
 # pie tune (quick) on a RunPod NVIDIA H100 80GB HBM3, each line's win end to end on gpt-oss-20b.
-[kernel]
-attn.qkv_rows_from = 48  # 1.8% faster end to end
-gemm.rows_m = 4  # 1.7% faster end to end
-mla.expanded_from = 49152  # 1.5% faster end to end
-qmm.split_warps_per_sm = 29  # 3.4% faster end to end
-sdpa.decode.split_small = true  # 1.7% faster end to end
-sdpa.decode.static_max_requests = 256  # 1.8% faster end to end
-sdpa.index_split_until = 512  # 4.3% faster end to end
-ssm.gdn_scan_until = 56  # 4.3% faster end to end
-
-[engine]
-working_set_percent = 90  # 1.9% faster end to end
-
-[compiler]
-synth_regions = false  # 1.2% faster end to end
-
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 26.9 -> 27.0 ms, 1-lane step 3.56 -> 3.48 ms, 4-lane step 5.79 -> 5.73 ms, 8-lane step 7.19 -> 7.16 ms, readout cosine 1.0000"
 measured = [
