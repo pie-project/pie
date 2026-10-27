@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use poem::Platform;
 use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, Error, PATCH_LATTICE_FLOOR, PatchLadder,

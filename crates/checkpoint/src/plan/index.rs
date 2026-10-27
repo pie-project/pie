@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 use crate::plan::{BufferDecl, LoadPlan, SourceTensorDecl, StorageInstr};
-use crate::types::{BufferId, InstrId, TensorDecl, TensorId};
+use crate::types::{BufferId, InstrId, TensorId};
 
 impl LoadPlan {
     pub fn buffer(&self, id: BufferId) -> Result<&BufferDecl> {
@@ -74,20 +74,14 @@ fn dense(found: u32, wanted: u32, what: &str) -> Result<()> {
 }
 
 pub struct PlanIndex {
-    tensor: HashMap<TensorId, u32>,
     source: HashMap<TensorId, u32>,
 }
 
 impl PlanIndex {
     pub fn new(plan: &LoadPlan) -> Self {
         Self {
-            tensor: position_by_id(plan.tensors.iter().map(|decl| decl.id)),
             source: position_by_id(plan.sources.iter().map(|decl| decl.id)),
         }
-    }
-
-    pub fn tensor<'a>(&self, plan: &'a LoadPlan, id: TensorId) -> Option<&'a TensorDecl> {
-        plan.tensors.get(*self.tensor.get(&id)? as usize)
     }
 
     pub fn source<'a>(&self, plan: &'a LoadPlan, id: TensorId) -> Option<&'a SourceTensorDecl> {

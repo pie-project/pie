@@ -8,13 +8,6 @@ use wasmtime_wasi::WasiView;
 
 pub enum FrameStore {
     Host(Vec<u8>),
-    #[allow(dead_code)]
-    Device(DevicePlane),
-}
-
-#[allow(dead_code)]
-pub struct DevicePlane {
-    _private: (),
 }
 
 pub struct Frames {
@@ -35,7 +28,6 @@ impl std::fmt::Debug for Frames {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let store = match &self.store {
             FrameStore::Host(v) => format!("host {} B", v.len()),
-            FrameStore::Device(_) => "device".to_string(),
         };
         write!(
             f,
@@ -69,9 +61,6 @@ impl Frames {
     pub fn rgb8(&self) -> Result<&[u8], String> {
         match &self.store {
             FrameStore::Host(v) => Ok(v),
-            FrameStore::Device(_) => Err("frames: this handle's pixels are on the device and the \
-                     device path is not built yet"
-                .to_string()),
         }
     }
 

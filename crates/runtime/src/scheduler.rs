@@ -185,10 +185,6 @@ pub(crate) async fn tap_groups(engine_id: usize) -> Option<::engine::TapGroups> 
     groups
 }
 
-pub async fn debug_dump(engine_id: usize) -> Result<String> {
-    scheduler_handle(engine_id)?.debug_dump().await
-}
-
 pub fn configured_submit_deadline() -> Duration {
     *SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(50_000))
 }
@@ -316,60 +312,6 @@ pub(crate) fn nudge(engine_idx: usize) {
     if let Ok(handle) = scheduler_handle(engine_idx) {
         let _ = handle.nudge();
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn submit_async_with_kv_copy(
-    request: crate::engine::FireRequest,
-    engine_idx: usize,
-    instance_id: ::engine::InstanceId,
-    pipeline_id: Option<ProcessId>,
-    completion: crate::engine::WorkItemCompletion,
-    copy_src: Vec<u32>,
-    copy_dst: Vec<u32>,
-) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
-        src: device_domain(engine_idx),
-        dst: device_domain(engine_idx),
-        src_page_ids: copy_src,
-        dst_page_ids: copy_dst,
-        moves: Vec::new(),
-        windowed: Vec::new(),
-    });
-    scheduler_handle(engine_idx)?.submit_with_identity_and_copy(
-        request,
-        instance_id,
-        completion,
-        pipeline_id,
-        prelaunch_copy,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn submit_prebuilt_async_with_kv_copy(
-    request: crate::engine::FireRequest,
-    engine_idx: usize,
-    instance_id: ::engine::InstanceId,
-    completion: crate::engine::WorkItemCompletion,
-    copy_src: Vec<u32>,
-    copy_dst: Vec<u32>,
-) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
-        src: device_domain(engine_idx),
-        dst: device_domain(engine_idx),
-        src_page_ids: copy_src,
-        dst_page_ids: copy_dst,
-        moves: Vec::new(),
-        windowed: Vec::new(),
-    });
-    scheduler_handle(engine_idx)?.submit_prebuilt_with_copy(
-        request,
-        instance_id,
-        completion,
-        prelaunch_copy,
-        None,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]

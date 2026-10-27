@@ -91,12 +91,6 @@ impl ConvShape {
     }
 
     #[must_use]
-    pub const fn replicate_time(mut self) -> ConvShape {
-        self.time_pad = TimePad::Replicate;
-        self
-    }
-
-    #[must_use]
     pub const fn taps(&self) -> u32 {
         self.k[0] * self.k[1] * self.k[2]
     }

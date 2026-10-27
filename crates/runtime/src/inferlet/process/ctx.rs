@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::ordered::OrderedPermit;
-use wasmtime::component::{ResourceAny, ResourceTable};
+use wasmtime::component::ResourceTable;
 #[cfg(not(target_arch = "wasm32"))]
 use wasmtime_wasi::FsPerms;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -35,15 +35,12 @@ pub struct ProcessCtx {
     #[cfg(not(target_arch = "wasm32"))]
     http_hooks: PieHttpHooks,
 
-    network_allowed: bool,
-
     scratch_dir: Option<PathBuf>,
 
     /// Set when the component is a language component and this is the
     /// script it runs.
     script: Option<Arc<Script>>,
 
-    guest_resource_map: Vec<(ResourceAny, u32)>,
     residency: Arc<Mutex<ProcessResidency>>,
     prewarm_permit: Option<OrderedPermit>,
     props: client_api::Props,
@@ -210,10 +207,8 @@ impl ProcessCtx {
             http_hooks: PieHttpHooks {
                 network_allowed: policy.network.allow,
             },
-            network_allowed: policy.network.allow,
             scratch_dir,
             script,
-            guest_resource_map: Vec::new(),
             residency: {
                 let residency = Arc::new(Mutex::new(ProcessResidency::default()));
                 super::residency::register_residency(id, Arc::downgrade(&residency));
@@ -313,10 +308,6 @@ impl ProcessCtx {
         self.username.clone()
     }
 
-    pub fn network_allowed(&self) -> bool {
-        self.network_allowed
-    }
-
     pub(crate) fn residency_pipelines(&self) -> Vec<crate::pipeline::fire::PendingFires> {
         self.residency.lock().unwrap().pipelines()
     }
@@ -390,12 +381,5 @@ impl ProcessCtx {
                 scope: scope.clone(),
                 fires: Arc::downgrade(fires),
             });
-    }
-
-    pub fn rep_for_guest_resource(&self, resource: ResourceAny) -> Option<u32> {
-        self.guest_resource_map
-            .iter()
-            .find(|(r, _)| *r == resource)
-            .map(|(_, rep)| *rep)
     }
 }

@@ -171,11 +171,6 @@ pub(crate) async fn receive_file(client_id: ClientId, process_id: ProcessId) -> 
     Ok(rx.await?)
 }
 
-#[allow(dead_code)]
-pub(crate) fn exists(client_id: ClientId) -> bool {
-    CLIENT_SERVICES.contains(&client_id)
-}
-
 struct ServerState {
     next_client_id: AtomicU32,
     pub(super) max_upload_bytes: usize,

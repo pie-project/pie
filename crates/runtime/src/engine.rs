@@ -9,19 +9,17 @@ pub mod profiles;
 
 pub use waker;
 
-#[cfg(feature = "engine-cuda")]
-pub use backend::envelopes_resolved;
 pub use backend::{
-    EngineBox, EngineSpec, RemoteDisconnectHandle, RemoteEngine, SchedulerLimits, get_spec, open,
-    register_engine_backend, take_engine_backend, unregister_engine,
+    EngineBox, EngineSpec, SchedulerLimits, get_spec, open, register_engine_backend,
+    take_engine_backend, unregister_engine,
 };
 pub use channel::{
     ChannelBinding, ChannelCloser, ChannelEndpoint, ChannelJoin, ChannelValue, RegisteredChannel,
 };
 
 pub use completion::{
-    CompletionBroker, CompletionLease, CompletionTarget, SubmissionCompletion, TerminalCell,
-    WorkItemAttemptOutcome, WorkItemCompletion,
+    CompletionBroker, CompletionLease, SubmissionCompletion, TerminalCell, WorkItemAttemptOutcome,
+    WorkItemCompletion,
 };
 pub use instance::{BoundInstance, BoundWaitSlots, InstanceBindingPlan, InstanceId, ProgramId};
 
@@ -29,15 +27,9 @@ pub use fire::{FireRequest, FrameFire, MaskWords, StepFire, bitmask_words};
 
 pub mod rs_flag {
     pub const RESET: u8 = 1 << 0;
-    pub const FOLD: u8 = 1 << 1;
-    pub const BUFFER_WRITE: u8 = 1 << 2;
-    pub const FOLD_LEN_DEVICE: u8 = 1 << 3;
 }
 
-pub use rs_flag::{
-    BUFFER_WRITE as RS_FLAG_BUFFER_WRITE, FOLD as RS_FLAG_FOLD,
-    FOLD_LEN_DEVICE as RS_FLAG_FOLD_LEN_DEVICE, RESET as RS_FLAG_RESET,
-};
+pub use rs_flag::RESET as RS_FLAG_RESET;
 
 pub type EngineId = usize;
 

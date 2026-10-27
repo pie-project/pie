@@ -146,11 +146,6 @@ impl BufferDecl {
     pub fn arena_offset(&self) -> Option<u64> {
         self.persistent_offset.or(self.scratch_offset)
     }
-
-    #[must_use]
-    pub fn dtype(&self) -> DType {
-        self.ty.encoding.dtype()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,5 +385,3 @@ impl LoadPlan {
             })
     }
 }
-
-pub const TIED_EMBEDDING_NAME: &str = "shared_embedding.weight";

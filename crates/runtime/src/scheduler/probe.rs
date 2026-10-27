@@ -8,10 +8,6 @@ pub struct FireProbes {
 
     pub recv_block_wait_us: AtomicU64,
 
-    pub last_fire_spawn_micros: AtomicU64,
-
-    pub last_dispatch_end_micros: AtomicU64,
-
     pub accumulate: AccumulateProbes,
     pub pre_dispatch: PreDispatchProbes,
     pub execute: ExecuteProbes,

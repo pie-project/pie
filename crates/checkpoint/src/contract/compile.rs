@@ -154,10 +154,6 @@ pub struct CopyList {
 }
 
 impl CopyList {
-    pub fn pieces(&self) -> Vec<Piece> {
-        fold(self.runs.iter().map(seed).collect())
-    }
-
     pub fn cost(&self) -> usize {
         self.copy_pieces().len() + usize::from(self.needs_zero_fill())
     }
@@ -284,19 +280,6 @@ impl ByteScale {
     fn stride(&self, elems: i64, what: &str) -> Result<i64, Error> {
         self.scaled(elems, what)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ByteRun {
-    pub source: ByteRunSource,
-    pub dst_offset: u64,
-    pub len: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ByteRunSource {
-    Leaf { leaf: usize, src_offset: u64 },
-    Zero,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
