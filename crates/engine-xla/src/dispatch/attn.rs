@@ -262,10 +262,6 @@ impl Run<'_> {
             | Attn::IndexTopk {
                 score: IndexScore::BlockMax,
                 ..
-            }
-            | Attn::IndexTopk {
-                score: IndexScore::PooledTokens,
-                ..
             } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             // Bounded replay's floors are DeepSeek-V4.1's, served on CUDA.
             Attn::ReplayFloor { .. } | Attn::KvEnds { .. } | Attn::WindowSink { .. } => {
@@ -1003,7 +999,7 @@ impl Run<'_> {
                 head_dim,
                 top_k,
                 ratio,
-                score: IndexScore::Pooled,
+                score: score @ (IndexScore::Pooled | IndexScore::PooledTokens),
                 selection,
             } => {
                 let fire = self.bindings();
@@ -1019,6 +1015,7 @@ impl Run<'_> {
                     *head_dim,
                     *top_k,
                     *ratio,
+                    *score == IndexScore::PooledTokens,
                     self.tensor(*selection),
                 )
             }

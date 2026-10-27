@@ -235,6 +235,7 @@ fn the_index_ranks_cached_keys_and_keeps_the_top_k() {
                     d as u32,
                     top_k as u32,
                     ratio as u32,
+                    false,
                     sel,
                 )
             })
@@ -264,6 +265,93 @@ fn the_index_ranks_cached_keys_and_keeps_the_top_k() {
             assert_eq!(
                 &got[r * top_k..(r + 1) * top_k],
                 &bisect_select(&scores, top_k)[..],
+                "ratio {ratio} row {r} scores {scores:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn pooled_tokens_read_the_top_blocks_back_as_their_tokens() {
+    let (heads, d) = (3usize, 8usize);
+    let mut rng = Rng(7);
+    let keys0 = rng.bf16s(CELLS * d, 1.0);
+    let rows = 5usize;
+    let positions = [1i32, 11, 6, 7, 0];
+    let reqs = [0i32, 0, 1, 1, 1];
+    let q = rng.bf16s(rows * heads * d, 1.0);
+    let w = rng.bf16s(rows * heads, 1.0);
+    for (ratio, top_k) in [(2usize, 2usize), (4, 1)] {
+        let width = top_k * ratio + ratio - 1;
+        let mut b = Bench::new();
+        let qt = b.bf16(rows as u32, (heads * d) as u32, &q);
+        let wt = b.bf16(rows as u32, heads as u32, &w);
+        let keys = b.bf16(CELLS as u32, d as u32, &keys0);
+        let pt = b.i32(rows as u32, 1, &positions);
+        let rt = b.i32(rows as u32, 1, &reqs);
+        let sel = b.zeros(Dtype::I32, rows as u32, width as u32);
+        let pool = kv_pool(&mut b, keys);
+        if !b
+            .run(|ctx| {
+                index::topk(
+                    ctx,
+                    qt,
+                    Some(wt),
+                    &pool,
+                    pt,
+                    rt,
+                    heads as u32,
+                    d as u32,
+                    top_k as u32,
+                    ratio as u32,
+                    true,
+                    sel,
+                )
+            })
+            .unwrap()
+        {
+            return;
+        }
+        let got = b.read_i32(sel);
+        for r in 0..rows {
+            let pos = positions[r];
+            let nkeys = ((pos + 1) as usize / ratio).min(3 * PS / ratio);
+            let scores: Vec<f32> = (0..nkeys)
+                .map(|j| {
+                    let c = cell(reqs[r] as usize, (j + 1) * ratio - 1);
+                    (0..heads)
+                        .map(|h| {
+                            let qh = &q[(r * heads + h) * d..(r * heads + h + 1) * d];
+                            let dot: f32 = qh
+                                .iter()
+                                .zip(&keys0[c * d..(c + 1) * d])
+                                .map(|(a, b)| a * b)
+                                .sum();
+                            dot.max(0.0) * w[r * heads + h]
+                        })
+                        .sum()
+                })
+                .collect();
+            let blocks = bisect_select(&scores, top_k);
+            let open = (pos + 1) / ratio as i32 * ratio as i32;
+            let want: Vec<i32> = (0..width)
+                .map(|n| {
+                    if n < top_k * ratio {
+                        let b = blocks[n / ratio];
+                        if b >= 0 {
+                            b * ratio as i32 + (n % ratio) as i32
+                        } else {
+                            -1
+                        }
+                    } else {
+                        let at = open + (n - top_k * ratio) as i32;
+                        if at <= pos { at } else { -1 }
+                    }
+                })
+                .collect();
+            assert_eq!(
+                &got[r * width..(r + 1) * width],
+                &want[..],
                 "ratio {ratio} row {r} scores {scores:?}"
             );
         }
