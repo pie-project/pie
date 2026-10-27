@@ -6,8 +6,8 @@ controls and to return exact token-count envelopes.
 
 ## Purpose
 
-The crate runs an N-wide prompt prefill followed by a device-carried decode loop
-with a frame-quantized run-ahead window. It is the reference implementation used
+The crate fills the prompt's head, then runs a device-carried decode loop from
+its last token with a frame-quantized run-ahead window. It is the reference implementation used
 when other inferlets need output-equivalence checks against a plain completion
 path, and it is also shaped for throughput benchmarks: optional batch inputs,
 token counts, first-token timing, inter-token timing, and per-token WASM delay.
@@ -48,9 +48,9 @@ The harness validates completion plumbing rather than a decoding paper:
 
 ## Implementation notes
 
-The prefill sample is already the first output token. Decode fires are submitted
-ahead of the host drain, and the same top-up rule is used for every frame size.
-When `ignore_eos = false`, already staged fires may still settle after a stop
+The first decode fire goes alone, so its token times the first output; the rest
+are submitted ahead of the host drain, and the same top-up rule is used for every
+frame size. When `ignore_eos = false`, already staged fires may still settle after a stop
 token is observed; their outputs are drained and ignored so counts remain exact.
 
 ## Run
