@@ -1141,13 +1141,12 @@ impl Shell {
         // are cut at this fit for good, and on CUDA its chunked recurrence
         // grows them the same way (Kimi-K3's mini: 3.1 GB of KDA planes at
         // 8192 tokens left an RTX 5090's rows short of one sequence).
-        let scratch_growth = if (cfg!(feature = "rocm") || shell.pools.has_state())
-            && shell.records_bodies()
-        {
-            shell.arena.bytes()
-        } else {
-            0
-        };
+        let scratch_growth =
+            if (cfg!(feature = "rocm") || shell.pools.has_state()) && shell.records_bodies() {
+                shell.arena.bytes()
+            } else {
+                0
+            };
         let fitted = shell.pools.fit_the_card(
             bodies,
             held_for_fires.saturating_add(scratch_growth),
