@@ -447,7 +447,7 @@ mod tests {
             (8, 6, "NVIDIA A10"),
             (8, 7, "Orin"),
             (8, 9, "NVIDIA L4"),
-            (9, 0, "NVIDIA H100 80GB HBM3"),
+            (9, 0, "NVIDIA H800"),
             (10, 0, "NVIDIA GB200"),
             (10, 3, "NVIDIA B300"),
             (11, 0, "NVIDIA Thor"),
@@ -1023,7 +1023,7 @@ mod tests {
             ]
         );
         assert!(!report.untuned());
-        let (rtx, report) = resolve("NVIDIA GeForce RTX 4090", &facts(8, 9, 128), None);
+        let (rtx, report) = resolve("NVIDIA RTX 6000 Ada Generation", &facts(8, 9, 142), None);
         assert_eq!(report.used, profile::Source::Seeded("sm89.toml".into()));
         assert!(report.untuned());
         for p in [&l40s, &rtx] {
