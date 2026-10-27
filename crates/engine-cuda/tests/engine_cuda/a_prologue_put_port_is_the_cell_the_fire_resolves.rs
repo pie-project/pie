@@ -56,7 +56,7 @@ impl ForwardHybrid for Micro {
         );
         let a = ops::attn::attend(
             &q, &inputs, KV_ROW, HEADS, HEADS, HEAD_DIM, SM_SCALE, None, None, None, false, None,
-            None, false,
+            None, false, false,
         );
         let h = ops::linear::matmul(&a, &w("o", WIDTH, plane));
         let logits = ops::linear::lm_head(&h, &table);

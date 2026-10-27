@@ -91,6 +91,7 @@ impl ForwardHybrid for Micro {
                 None,
                 None,
                 false,
+                false,
             )
         };
         let h = ops::linear::matmul(&a, &w("o", WIDTH, plane));
