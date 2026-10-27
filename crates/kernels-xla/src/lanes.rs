@@ -103,12 +103,6 @@ pub(crate) fn row_at(f: &mut Func, x: Val, i: Val) -> Built<Val> {
     f.reshape(s, &d[1..])
 }
 
-/// A rank-1 vector as a one-column matrix.
-pub(crate) fn f_reshape_col(f: &mut Func, v: Val) -> Built<Val> {
-    let n = f.dims(v)[0];
-    f.reshape(v, &[n, 1])
-}
-
 /// `x[i] = upd` along axis 0.
 pub(crate) fn put_at(f: &mut Func, x: Val, upd: Val, i: Val) -> Built<Val> {
     let d = f.dims(x).to_vec();
@@ -262,6 +256,7 @@ pub(crate) fn take_slots(f: &mut Func, slab: Val, slot: Val, per: i64) -> Built<
         },
         &[1, per, width],
     )?;
+    let got = f.convert(got, Elem::F32);
     f.reshape(got, &[l, per * width])
 }
 
@@ -282,12 +277,12 @@ pub(crate) fn land_slots(
     let drop = f.like_i(slot, DROP);
     let at = f.select(write, slot, drop)?;
     let elem = f.elem(slab);
-    let rows = f.convert(rows, elem);
     let (n, width) = (f.dims(slab)[0], f.dims(slab)[1]);
     let l = f.dims(slot)[0];
     let blocks = f.reshape(slab, &[n / per, per, width])?;
     let at = f.reshape(at, &[l, 1])?;
     let rows = f.reshape(rows, &[l, per, width])?;
+    let rows = f.convert(rows, elem);
     let out = f.scatter(
         blocks,
         at,
