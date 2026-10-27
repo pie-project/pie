@@ -309,7 +309,6 @@ pub const LT_SUCCESS: LtStatus = 0;
 pub const LT_COMPUTE_F32: c_int = 2;
 /// `hipDataType`.
 pub const LT_R_32F: c_int = 0;
-pub const LT_R_16F: c_int = 2;
 pub const LT_R_16BF: c_int = 14;
 /// `hipblasOperation_t`.
 pub const LT_OP_N: c_int = 111;
@@ -321,7 +320,6 @@ pub const LT_DESC_EPILOGUE: c_int = 2;
 pub const LT_DESC_BIAS_POINTER: c_int = 3;
 pub const LT_DESC_BIAS_DATA_TYPE: c_int = 4;
 /// `hipblasLtEpilogue_t`.
-pub const LT_EPILOGUE_DEFAULT: c_int = 1;
 pub const LT_EPILOGUE_BIAS: c_int = 4;
 /// `HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES`.
 pub const LT_PREF_MAX_WORKSPACE_BYTES: c_int = 1;

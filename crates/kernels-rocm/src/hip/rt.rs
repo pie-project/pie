@@ -32,57 +32,16 @@ pub type GraphExec = *mut c_void;
 pub type GraphNode = *mut c_void;
 pub type HostFn = unsafe extern "C" fn(*mut c_void);
 
-pub const hipSuccess: HipError = 0;
-pub const hipErrorInvalidValue: HipError = 1;
-pub const hipErrorOutOfMemory: HipError = 2;
 pub const hipErrorNotInitialized: HipError = 3;
-pub const hipErrorNotReady: HipError = 600;
 
 pub const hipMemcpyHostToDevice: c_int = 1;
-pub const hipMemcpyDeviceToHost: c_int = 2;
-pub const hipMemcpyDeviceToDevice: c_int = 3;
-pub const hipMemcpyDefault: c_int = 4;
 
-pub const hipStreamNonBlocking: c_uint = 1;
-pub const hipEventDefault: c_uint = 0;
 pub const hipEventDisableTiming: c_uint = 2;
 
-pub const hipStreamCaptureModeGlobal: c_int = 0;
 pub const hipStreamCaptureModeThreadLocal: c_int = 1;
-pub const hipStreamCaptureModeRelaxed: c_int = 2;
-pub const hipStreamCaptureStatusNone: c_int = 0;
-pub const hipStreamCaptureStatusActive: c_int = 1;
-pub const hipStreamCaptureStatusInvalidated: c_int = 2;
-pub const hipStreamAddCaptureDependencies: c_uint = 0;
-pub const hipStreamSetCaptureDependencies: c_uint = 1;
 
-pub const hipHostMallocDefault: c_uint = 0;
 pub const hipHostMallocPortable: c_uint = 1;
 pub const hipHostMallocMapped: c_uint = 2;
-pub const hipHostRegisterDefault: c_uint = 0;
-pub const hipHostRegisterPortable: c_uint = 1;
-pub const hipHostRegisterMapped: c_uint = 2;
-
-pub const hipDeviceAttributeComputeCapabilityMajor: c_int = 23;
-pub const hipDeviceAttributeMaxThreadsPerBlock: c_int = 56;
-pub const hipDeviceAttributeComputeCapabilityMinor: c_int = 61;
-pub const hipDeviceAttributeMultiprocessorCount: c_int = 63;
-pub const hipDeviceAttributePageableMemoryAccess: c_int = 65;
-pub const hipDeviceAttributeVirtualMemoryManagementSupported: c_int = 89;
-pub const hipDevP2PAttrAccessSupported: c_int = 1;
-pub const HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 0;
-
-pub const hipMemAllocationGranularityMinimum: c_int = 0;
-pub const hipMemLocationTypeDevice: c_int = 1;
-pub const hipMemLocationTypeHost: c_int = 2;
-pub const hipMemAllocationTypePinned: c_int = 1;
-pub const hipMemAccessFlagsProtReadWrite: c_int = 3;
-pub const hipMemoryTypeHost: c_int = 1;
-pub const hipMemoryTypeDevice: c_int = 2;
-pub const hipMemcpySrcAccessOrderStream: c_int = 1;
-
-pub const hipGraphInstantiateFlagAutoFreeOnLaunch: u64 = 1;
-pub const hipGraphInstantiateFlagUpload: u64 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -220,14 +179,6 @@ pub unsafe fn hipDeviceGetP2PAttribute(
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipDeviceGetP2PAttribute)(value, attr, src, dst) },
-        Err(_) => hipErrorNotInitialized,
-    }
-}
-
-pub unsafe fn hipDeviceEnablePeerAccess(peer: c_int, flags: c_uint) -> HipError {
-    match sys::api() {
-        // SAFETY: forwarded unchanged; the caller holds HIP's contract.
-        Ok(api) => unsafe { (api.hip.hipDeviceEnablePeerAccess)(peer, flags) },
         Err(_) => hipErrorNotInitialized,
     }
 }
@@ -453,23 +404,6 @@ pub unsafe fn hipStreamBeginCapture(stream: Stream, mode: c_int) -> HipError {
     }
 }
 
-pub unsafe fn hipStreamBeginCaptureToGraph(
-    stream: Stream,
-    graph: Graph,
-    deps: *const GraphNode,
-    edges: *const c_void,
-    count: usize,
-    mode: c_int,
-) -> HipError {
-    match sys::api() {
-        // SAFETY: forwarded unchanged; the caller holds HIP's contract.
-        Ok(api) => unsafe {
-            (api.hip.hipStreamBeginCaptureToGraph)(stream, graph, deps, edges, count, mode)
-        },
-        Err(_) => hipErrorNotInitialized,
-    }
-}
-
 pub unsafe fn hipStreamEndCapture(stream: Stream, graph: *mut Graph) -> HipError {
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
@@ -482,38 +416,6 @@ pub unsafe fn hipStreamIsCapturing(stream: Stream, status: *mut c_int) -> HipErr
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipStreamIsCapturing)(stream, status) },
-        Err(_) => hipErrorNotInitialized,
-    }
-}
-
-pub unsafe fn hipStreamGetCaptureInfo_v2(
-    stream: Stream,
-    status: *mut c_int,
-    id: *mut u64,
-    graph: *mut Graph,
-    deps: *mut *const GraphNode,
-    count: *mut usize,
-) -> HipError {
-    match sys::api() {
-        // SAFETY: forwarded unchanged; the caller holds HIP's contract.
-        Ok(api) => unsafe {
-            (api.hip.hipStreamGetCaptureInfo_v2)(stream, status, id, graph, deps, count)
-        },
-        Err(_) => hipErrorNotInitialized,
-    }
-}
-
-pub unsafe fn hipStreamUpdateCaptureDependencies(
-    stream: Stream,
-    deps: *mut GraphNode,
-    count: usize,
-    flags: c_uint,
-) -> HipError {
-    match sys::api() {
-        // SAFETY: forwarded unchanged; the caller holds HIP's contract.
-        Ok(api) => unsafe {
-            (api.hip.hipStreamUpdateCaptureDependencies)(stream, deps, count, flags)
-        },
         Err(_) => hipErrorNotInitialized,
     }
 }
@@ -562,14 +464,6 @@ pub unsafe fn hipEventQuery(event: Event) -> HipError {
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipEventQuery)(event) },
-        Err(_) => hipErrorNotInitialized,
-    }
-}
-
-pub unsafe fn hipEventElapsedTime(ms: *mut f32, start: Event, stop: Event) -> HipError {
-    match sys::api() {
-        // SAFETY: forwarded unchanged; the caller holds HIP's contract.
-        Ok(api) => unsafe { (api.hip.hipEventElapsedTime)(ms, start, stop) },
         Err(_) => hipErrorNotInitialized,
     }
 }

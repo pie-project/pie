@@ -92,12 +92,6 @@ pub struct Built<I> {
     pub float_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Sizes {
-    pub float_bytes: usize,
-    pub int_bytes: usize,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodePlan {
     pub info: DecodePlanInfo,

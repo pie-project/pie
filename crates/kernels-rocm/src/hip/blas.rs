@@ -276,25 +276,3 @@ impl Drop for Handle {
         }
     }
 }
-
-/// A rocBLAS handle whose lifetime the caller manages: [`destroy_raw`] it
-/// exactly once.
-pub fn create_raw() -> Result<Blas, Refused> {
-    const CALL: &str = "rocblas_create_handle";
-    let blas = blas(CALL)?;
-    let mut handle: Blas = core::ptr::null_mut();
-    // SAFETY: `handle` is a live local; rocBLAS writes the new handle there.
-    answered(CALL, unsafe {
-        (blas.rocblas_create_handle)(&raw mut handle)
-    })?;
-    Ok(handle)
-}
-
-/// # Safety
-/// `handle` came from [`create_raw`] and is not used again.
-pub unsafe fn destroy_raw(handle: Blas) {
-    if let Ok(blas) = sys::rocblas() {
-        // SAFETY: the caller hands over a live handle, once.
-        unsafe { (blas.rocblas_destroy_handle)(handle) };
-    }
-}
