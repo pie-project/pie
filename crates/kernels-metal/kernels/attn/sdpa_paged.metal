@@ -403,6 +403,7 @@ template <typename T, int D, int V = D>
     const device int* selection                [[buffer(17)]],
     const constant int& top_k                  [[buffer(18)]],
     const constant int& ratio                  [[buffer(19)]],
+    const constant int& per_head               [[buffer(20)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
@@ -413,6 +414,12 @@ template <typename T, int D, int V = D>
   threadgroup float sum_exp_scores[BN];
   threadgroup float factors[BN];
   threadgroup float final_sum[1];
+  // One run per kv head (`n_kv_heads` runs a row): the body walks
+  // `selection + row * top_k`, so the row's own head's run is moved there.
+  if (per_head != 0) {
+    selection += (size_t(tid.y) * size_t(n_kv_heads - 1) + size_t(int(tid.x) / gqa_factor)) *
+                 size_t(top_k);
+  }
   sdpa_paged_decode_body<T, D, V, false, false, 0, false, BN, true>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
       kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
@@ -1025,7 +1032,8 @@ instantiate_sdpa_paged(bfloat16, bfloat, 64, 64)
       const constant int&, const constant int&, const constant float&,     \
       const device uchar*, const device uint&, const device uchar*,        \
       const constant int&, const device itype*, const device int*,         \
-      const constant int&, const constant int&, uint3, uint3, uint, uint);
+      const constant int&, const constant int&, const constant int&,       \
+      uint3, uint3, uint, uint);
 
 instantiate_sdpa_paged_selected(bfloat16, bfloat, 256, 256)
 instantiate_sdpa_paged_selected(bfloat16, bfloat, 512, 512)

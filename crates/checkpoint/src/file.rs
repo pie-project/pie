@@ -182,7 +182,9 @@ impl<'a> Sources<'a> {
         if !matches!(raw.encoding, Encoding::Raw(DType::E4m3)) {
             return None;
         }
+        // MXFP8 exponents stored as bytes are read as e8m0 by the codec's own scale.
         self.by_name(&format!("{}_scale_inv", raw.name))
+            .filter(|scale| !matches!(scale.encoding, Encoding::Raw(DType::U8)))
             .or_else(|| {
                 let stem = raw.name.strip_suffix(".weight")?;
                 self.by_name(&format!("{stem}.scale"))

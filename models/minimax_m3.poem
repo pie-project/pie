@@ -1,7 +1,7 @@
 # MiniMax-M3, its language model, and a six-layer, eight-expert miniature
 # of it: three dense layers and three sparse.
 
-load("//pie/codec.poem", "bank", "kept", "nvfp4_packed_bank", read_weight = "weight")
+load("//pie/codec.poem", "bank", "kept", "land", "nvfp4_packed_bank", "nvfp4_packed_widened", read_weight = "weight")
 
 MINIMAX = template("minimax")
 TOKENIZER = tokenizer(markers = [["[e~[", "]~b]", "]~!b[", "]<]minimax[>[", "<mm:think>", "</mm:think>"]])
@@ -229,7 +229,7 @@ def read(m, reads):
             (a.q_norm, "q_norm"),
             (a.k_norm, "k_norm"),
         ]:
-            read_weight(reads, p, [n("self_attn.{}.weight".format(name))], quantized = "read")
+            read_weight(reads, p, [n("self_attn.{}.weight".format(name))], quantized = "widen")
         ix = w.indexer
         if ix != None:
             for p, name in [
@@ -238,7 +238,7 @@ def read(m, reads):
                 (ix.q_norm, "index_q_norm"),
                 (ix.k_norm, "index_k_norm"),
             ]:
-                read_weight(reads, p, [n("self_attn.{}.weight".format(name))], quantized = "read")
+                read_weight(reads, p, [n("self_attn.{}.weight".format(name))], quantized = "widen")
         if w.dense != None:
             read_mlp(reads, w.dense, lambda leaf: n("mlp." + leaf))
             continue
@@ -254,6 +254,18 @@ def read(m, reads):
         elif kept(f.gate_up):
             bank(reads, f.gate_up, [[leg(e, "w1"), leg(e, "w3")] for e in range(f.experts)])
             bank(reads, f.down, [[leg(e, "w2")] for e in range(f.experts)])
+        elif has(moe("experts.0.w1.weight_packed")):
+            # MiniMax-M3.1-Flash's NVFP4 experts read at this deployment's dtype: widened first
+            widened = lambda e, w: nvfp4_packed_widened(reads, moe("experts.{}.{}".format(e, w)))
+            hidden = f.down.shape[1]
+            land(reads, f.gate_up, concat(0, [
+                concat(0, [widened(e, "w1"), widened(e, "w3")]).transmute([1, 2 * f.inter, hidden], raw(dtype.bf16))
+                for e in range(f.experts)
+            ]))
+            land(reads, f.down, concat(0, [
+                widened(e, "w2").transmute([1, hidden, f.inter], raw(dtype.bf16))
+                for e in range(f.experts)
+            ]))
         else:
             gate_up = []
             for e in range(f.experts):
@@ -263,9 +275,9 @@ def read(m, reads):
         read_mlp(reads, f.shared, lambda leaf: moe("shared_experts." + leaf))
 
 def read_mlp(reads, f, n):
-    read_weight(reads, f.gate, [n("gate_proj.weight")], quantized = "read")
-    read_weight(reads, f.up, [n("up_proj.weight")], quantized = "read")
-    read_weight(reads, f.down, [n("down_proj.weight")], quantized = "read")
+    read_weight(reads, f.gate, [n("gate_proj.weight")], quantized = "widen")
+    read_weight(reads, f.up, [n("up_proj.weight")], quantized = "widen")
+    read_weight(reads, f.down, [n("down_proj.weight")], quantized = "widen")
 
 # The forward of MiniMax-M3: pre-norm layers of GQA attention and a clamped
 # SwiGLU-OAI MLP. A sparse layer's indexer ranks the 128-key blocks a row sees

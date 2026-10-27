@@ -467,6 +467,21 @@ def nvfp4_widened(reads, name):
     ])
     return out(name + ".blocked").scale_by(out(name + ".tensor"))
 
+def nvfp4_packed_widened(reads, stem):
+    """The compressed-tensors NVFP4 leg `stem` (MiniMax-M3.1-Flash's experts)
+    as bf16: its e2m1 codes (`.weight_packed`) times their e4m3 scale a 16,
+    divided by its `.weight_global_scale`."""
+    name = stem + ".weight_packed"
+    rows, half = shape(name)[0], shape(name)[1]
+    cols = 2 * half
+    reads.extend([
+        tensor(stem + ".scales", src(stem + ".weight_scale").cast(F32), F32, internal = True),
+        tensor(stem + ".blocked", src(name).transmute([rows, cols], encoding(dtype.nvfp4)).scale_by(out(stem + ".scales")), BF16, internal = True),
+    ])
+    tensor_scale = recip(reads, stem + ".weight_global_scale", src(stem + ".weight_global_scale").transmute([1, 1], F32), [1, 1])
+    reads.push(tensor(stem + ".bf16", out(stem + ".blocked").scale_by(tensor_scale), BF16, internal = True))
+    return out(stem + ".bf16")
+
 def block_widened(reads, name):
     """The block FP8 tensor `name` as bf16, dequantized by its block factors."""
     reads.push(tensor(name + ".bf16", src(name).cast(BF16), BF16, internal = True))

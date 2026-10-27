@@ -388,3 +388,126 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
     row[n] = j;
   }
 }
+
+// A row's ranking of the blocks it sees, one per head (`attn.index_topk`
+// scored `block_max`): a block scores the best `q_h.k` among its keys at or
+// before the row; the row's own block is always kept, the other `topk - 1`
+// are the best of the rest, and the run is written ascending, -1 past its end.
+// Simdgroups score the blocks (a lane holds `D / 32` of each head's query);
+// simdgroup `h` then ranks head `h`.
+constant constexpr int kBlockMaxHeads = 8;
+constant constexpr int kBlockMaxPer = 8;
+
+[[kernel]] void index_topk_block_max_bfloat16(
+    const device bfloat* idx_q         [[buffer(0)]],
+    const device bfloat* key_pages     [[buffer(1)]],
+    const device int* positions        [[buffer(2)]],
+    const device int* req_of_token     [[buffer(3)]],
+    const device uint* kv_page_indices [[buffer(4)]],
+    const device uint* kv_page_indptr  [[buffer(5)]],
+    device float* scores               [[buffer(6)]],
+    device int* selection              [[buffer(7)]],
+    const constant int& H              [[buffer(8)]],
+    const constant int& D              [[buffer(9)]],
+    const constant int& page_size      [[buffer(10)]],
+    const constant int& slab_stride    [[buffer(11)]],
+    const constant int& score_stride   [[buffer(12)]],
+    const constant int& topk           [[buffer(13)]],
+    const constant int& block          [[buffer(14)]],
+    uint3 tgpos     [[threadgroup_position_in_grid]],
+    uint3 lid       [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr float NEG_INF = -INFINITY;
+  const int t = int(tgpos.y);
+  const int tid = int(lid.x);
+  const int lane = int(simd_lane);
+  const int warp = int(simd_group);
+  device int* srow = selection + size_t(t) * size_t(H) * size_t(topk);
+
+  const int abs_q = positions[t];
+  if (abs_q < 0) {
+    for (int n = tid; n < H * topk; n += kIndexBlock) srow[n] = -1;
+    return;
+  }
+  int nb = abs_q / block + 1;
+  if (nb > score_stride) nb = score_stride;
+  if (nb <= topk) {
+    for (int n = tid; n < H * topk; n += kIndexBlock) {
+      const int at = n % topk;
+      srow[n] = (at < nb) ? at : -1;
+    }
+    return;
+  }
+
+  const int r = req_of_token[t];
+  const int pages_first = int(kv_page_indptr[r]);
+  const int per = D / 32;
+  float qreg[kBlockMaxHeads][kBlockMaxPer];
+  const device bfloat* qi = idx_q + size_t(t) * size_t(H) * size_t(D);
+  for (int h = 0; h < H; ++h) {
+    for (int i = 0; i < per; ++i) qreg[h][i] = float(qi[h * D + lane + i * 32]);
+  }
+
+  device float* frow = scores + size_t(t) * size_t(slab_stride);
+  for (int b = warp; b < nb; b += kIndexSimds) {
+    float best[kBlockMaxHeads];
+    for (int h = 0; h < H; ++h) best[h] = NEG_INF;
+    const int lo = b * block;
+    const int hi = min(lo + block, abs_q + 1);
+    for (int j = lo; j < hi; ++j) {
+      const int page = int(kv_page_indices[pages_first + j / page_size]);
+      const device bfloat* kj = key_pages + (size_t(page) * size_t(page_size) + size_t(j % page_size)) * size_t(D);
+      float kv[kBlockMaxPer];
+      for (int i = 0; i < per; ++i) kv[i] = float(kj[lane + i * 32]);
+      for (int h = 0; h < H; ++h) {
+        float pd = 0.0f;
+        for (int i = 0; i < per; ++i) pd += qreg[h][i] * kv[i];
+        best[h] = max(best[h], simd_sum(pd));
+      }
+    }
+    if (lane == 0) {
+      for (int h = 0; h < H; ++h) frow[h * score_stride + b] = best[h];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+
+  for (int h = warp; h < H; h += kIndexSimds) {
+    device float* hrow = frow + h * score_stride;
+    device int* out = srow + h * topk;
+    const int own = nb - 1;
+    if (lane == 0) hrow[own] = NEG_INF;
+    simdgroup_barrier(mem_flags::mem_device);
+    int picked = 0;
+    for (int n = 0; n < topk - 1; ++n) {
+      float v = NEG_INF;
+      int at = nb;
+      for (int b = lane; b < nb; b += 32) {
+        const float s = hrow[b];
+        if (s > v || (s == v && b < at && s > NEG_INF)) { v = s; at = b; }
+      }
+      for (ushort sh = 16; sh > 0; sh >>= 1) {
+        const float ov = simd_shuffle_xor(v, sh);
+        const int oa = simd_shuffle_xor(at, sh);
+        if (ov > v || (ov == v && oa < at)) { v = ov; at = oa; }
+      }
+      if (at >= nb) break;
+      if (lane == 0) {
+        out[picked] = at;
+        hrow[at] = NEG_INF;
+      }
+      ++picked;
+      simdgroup_barrier(mem_flags::mem_device);
+    }
+    if (lane == 0) {
+      out[picked++] = own;
+      for (int a = 1; a < picked; ++a) {
+        const int key = out[a];
+        int c = a - 1;
+        while (c >= 0 && out[c] > key) { out[c + 1] = out[c]; --c; }
+        out[c + 1] = key;
+      }
+      for (int n = picked; n < topk; ++n) out[n] = -1;
+    }
+  }
+}
