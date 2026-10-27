@@ -710,13 +710,21 @@ impl Run<'_> {
                 // Only the dense FA2 arms read the plan off the card; a trunk
                 // whose MLA reads are all selected (the sparse or naive
                 // kernels) leaves its upload (some 600 KB a fire) unstaged.
+                // A prefill fused for the expanded arm falls back to the FA2
+                // one below `kernel.mla.expanded_from` rows, so it reads too.
                 let read = self.nodes().iter().any(|node| {
+                    let op = match &node.op {
+                        Operation::Fused(poem_ir::Fused::MlaPrefillExpanded { prefill, .. }) => {
+                            &**prefill
+                        }
+                        Operation::Attn(op) => op,
+                        _ => return false,
+                    };
                     matches!(
-                        &node.op,
-                        Operation::Attn(
-                            Attn::MlaDecode { plan: read, selection: None, .. }
-                                | Attn::MlaPrefill { plan: read, selection: None, .. }
-                        ) if read == plan
+                        op,
+                        Attn::MlaDecode { plan: read, selection: None, .. }
+                            | Attn::MlaPrefill { plan: read, selection: None, .. }
+                        if read == plan
                     )
                 });
                 if read {
