@@ -190,6 +190,8 @@ fn the_conditioning_ops_answer_their_host_reference_every_case() {
     the_head_gate_scales_by_one_logit_a_head();
     a_pack_and_its_unpack_round_trip_the_rectangle();
     the_residual_blend_scores_normalized_and_blends_raw();
+    the_muse_spark_norms_answer_the_cuda_formula();
+    the_mamba2_walk_answers_the_recurrence();
 }
 
 fn the_pointwise_arms_answer_the_reference_at_both_elements() {
@@ -934,4 +936,239 @@ fn the_residual_blend_scores_normalized_and_blends_raw() {
             got[at]
         );
     }
+}
+
+fn the_muse_spark_norms_answer_the_cuda_formula() {
+    let Some(rig) = Rig::open() else {
+        eprintln!("not asked: no Metal device");
+        return;
+    };
+    let rms = |v: &[f32], eps: f32| {
+        1.0 / (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32 + eps).sqrt()
+    };
+    // The scaleless gated norm over bf16 rows, a sigmoid gate.
+    const HD: u32 = 64;
+    let width = 4 * HD;
+    let n = (ROWS * width) as usize;
+    let x: Vec<f32> = (0..n as u64)
+        .map(|at| bf16_round(unit(at ^ 0x5151)))
+        .collect();
+    let g: Vec<f32> = (0..n as u64)
+        .map(|at| bf16_round(3.0 * unit(at ^ 0x5252)))
+        .collect();
+    let (_xb, hx) = rig.plane(&x, Dtype::Bf16);
+    let (_gb, hg) = rig.plane(&g, Dtype::Bf16);
+    let (_yb, hy) = rig.empty(n, Dtype::Bf16);
+    rig.fire(|s| {
+        let t = |h| Tensor::new(h, ROWS, width, Dtype::Bf16);
+        norm::rmsnorm_gated(s, t(hx), t(hg), None, HD, 1e-5, true, t(hy)).expect("the launch")
+    });
+    let mut want = Vec::with_capacity(n);
+    for head in x.chunks(HD as usize).zip(g.chunks(HD as usize)) {
+        let inv = rms(head.0, 1e-5);
+        for (xv, gv) in head.0.iter().zip(head.1) {
+            want.push(bf16_round(xv * inv / (1.0 + (-gv).exp())));
+        }
+    }
+    within_a_bf16_ulp(
+        "rmsnorm_gated unscaled",
+        &want,
+        &rig.read(hy, n, Dtype::Bf16),
+    );
+
+    // The post-norm gate under a scale and a residual, with the next norm.
+    let width = 512u32;
+    let n = (ROWS * width) as usize;
+    let w = width as usize;
+    let x: Vec<f32> = (0..n as u64)
+        .map(|at| bf16_round(4.0 * unit(at ^ 0x6161)))
+        .collect();
+    let scale: Vec<f32> = (0..w as u64)
+        .map(|at| bf16_round(1.0 + 0.5 * unit(at ^ 0x6262)))
+        .collect();
+    let res: Vec<f32> = (0..n as u64)
+        .map(|at| bf16_round(unit(at ^ 0x6363)))
+        .collect();
+    let gate: Vec<f32> = (0..w as u64).map(|at| 2.0 * unit(at ^ 0x6464)).collect();
+    let next_w: Vec<f32> = (0..w as u64)
+        .map(|at| bf16_round(0.3 * unit(at ^ 0x6565)))
+        .collect();
+    let (temperature, eps, next_eps) = (0.3f32, 1e-8f32, 1e-5f32);
+    let (_a, hx) = rig.plane(&x, Dtype::Bf16);
+    let (_b, hs) = rig.plane(&scale, Dtype::Bf16);
+    let (_c, hr) = rig.plane(&res, Dtype::Bf16);
+    let (_d, hg) = rig.plane(&gate, Dtype::F32);
+    let (_e, hw) = rig.plane(&next_w, Dtype::Bf16);
+    let (_f, hy) = rig.empty(n, Dtype::Bf16);
+    let (_h, hz) = rig.empty(n, Dtype::Bf16);
+    rig.fire(|s| {
+        let t = |h, rows, dtype| Tensor::new(h, rows, width, dtype);
+        norm::norm_gate(
+            s,
+            t(hx, ROWS, Dtype::Bf16),
+            Some(t(hs, 1, Dtype::Bf16)),
+            Some(t(hr, ROWS, Dtype::Bf16)),
+            Some(t(hg, 1, Dtype::F32)),
+            eps,
+            temperature,
+            Some(norm::Next {
+                weight: t(hw, 1, Dtype::Bf16),
+                eps: next_eps,
+                plus_one: true,
+                y: t(hz, ROWS, Dtype::Bf16),
+            }),
+            t(hy, ROWS, Dtype::Bf16),
+        )
+        .expect("the launch")
+    });
+    let (mut want_y, mut want_z) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for row in 0..ROWS as usize {
+        let u: Vec<f32> = (0..w)
+            .map(|i| bf16_round(x[row * w + i] * scale[i]))
+            .collect();
+        let inv = rms(&u, eps);
+        let y: Vec<f32> = (0..w)
+            .map(|i| {
+                let nv = bf16_round(u[i] * inv);
+                let wv = gate[i] / temperature;
+                let beta = 1.0 / (1.0 + (-wv).exp());
+                let alpha = ((1.0 / (1.0 + wv.exp())) * (1.0 + beta)).max(1e-3).sqrt();
+                bf16_round(alpha * res[row * w + i] + beta * nv)
+            })
+            .collect();
+        let inv = rms(&y, next_eps);
+        want_z.extend((0..w).map(|i| bf16_round(y[i] * inv * (1.0 + next_w[i]))));
+        want_y.extend(y);
+    }
+    within_a_bf16_ulp("norm_gate y", &want_y, &rig.read(hy, n, Dtype::Bf16));
+    within_a_bf16_ulp("norm_gate next", &want_z, &rig.read(hz, n, Dtype::Bf16));
+}
+
+fn the_mamba2_walk_answers_the_recurrence() {
+    let Some(rig) = Rig::open() else {
+        eprintln!("not asked: no Metal device");
+        return;
+    };
+    use kernels_metal::ssm;
+    use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
+    const H: usize = 4;
+    const G: usize = 2;
+    const P: usize = 64;
+    const N: usize = 128;
+    const T: usize = 6;
+    let inner = H * P;
+    let width = inner + 2 * G * N;
+    let xbc: Vec<f32> = (0..(T * width) as u64)
+        .map(|at| bf16_round(unit(at ^ 0x7171)))
+        .collect();
+    let dt: Vec<f32> = (0..(T * H) as u64)
+        .map(|at| bf16_round(2.0 * unit(at ^ 0x7272)))
+        .collect();
+    let z: Vec<f32> = (0..(T * inner) as u64)
+        .map(|at| bf16_round(2.0 * unit(at ^ 0x7373)))
+        .collect();
+    let a_log: Vec<f32> = (0..H as u64).map(|at| unit(at ^ 0x7474)).collect();
+    let dt_bias: Vec<f32> = (0..H as u64).map(|at| unit(at ^ 0x7575)).collect();
+    let d: Vec<f32> = (0..H as u64).map(|at| unit(at ^ 0x7676)).collect();
+    let norm_w: Vec<f32> = (0..inner as u64)
+        .map(|at| bf16_round(1.0 + 0.5 * unit(at ^ 0x7777)))
+        .collect();
+    let s0: Vec<f32> = (0..(H * P * N) as u64)
+        .map(|at| 0.5 * unit(at ^ 0x7878))
+        .collect();
+    let eps = 1e-5f32;
+
+    // The host recurrence, then the group norm as the norm shader rounds it.
+    let mut s = s0.clone();
+    let mut want = vec![0.0f32; T * inner];
+    for t in 0..T {
+        let row = &xbc[t * width..(t + 1) * width];
+        for h in 0..H {
+            let g = h / (H / G);
+            let raw = dt[t * H + h] + dt_bias[h];
+            let step = if raw > 20.0 {
+                raw
+            } else {
+                (1.0 + raw.exp()).ln()
+            };
+            let decay = (-a_log[h].exp() * step).exp();
+            for p in 0..P {
+                let xp = row[h * P + p];
+                let mut acc = 0.0f32;
+                for n in 0..N {
+                    let c = &mut s[(h * P + p) * N + n];
+                    *c = *c * decay + step * xp * row[inner + g * N + n];
+                    acc += *c * row[inner + (G + g) * N + n];
+                }
+                let zv = z[t * inner + h * P + p];
+                want[t * inner + h * P + p] =
+                    bf16_round((acc + d[h] * xp) * zv / (1.0 + (-zv).exp()));
+            }
+        }
+        let group = inner / G;
+        for gi in 0..G {
+            let at = t * inner + gi * group;
+            let run = &mut want[at..at + group];
+            let inv = 1.0 / (run.iter().map(|v| v * v).sum::<f32>() / group as f32 + eps).sqrt();
+            for (i, v) in run.iter_mut().enumerate() {
+                *v = bf16_round(norm_w[gi * group + i] * bf16_round(*v * inv));
+            }
+        }
+    }
+
+    let (_a, hx) = rig.plane(&xbc, Dtype::Bf16);
+    let (_b, hd) = rig.plane(&dt, Dtype::Bf16);
+    let (_c, hz) = rig.plane(&z, Dtype::Bf16);
+    let (_d, ha) = rig.plane(&a_log, Dtype::F32);
+    let (_e, hb) = rig.plane(&dt_bias, Dtype::F32);
+    let (_f, hdd) = rig.plane(&d, Dtype::F32);
+    let (_g, hn) = rig.plane(&norm_w, Dtype::Bf16);
+    let (_h, hs) = rig.plane(&s0, Dtype::F32);
+    let (_i, hslots) = rig.i32_plane(&[0; T]);
+    let (_j, hptr) = rig.i32_plane(&[0, T as i32]);
+    let (_k, hy) = rig.empty(T * inner, Dtype::Bf16);
+    let state = Tensor::new(hs, 1, (H * P * N) as u32, Dtype::F32);
+    let pool = RecurrentPool {
+        state,
+        slots: Tensor::new(hslots, T as u32, 1, Dtype::U32),
+        conv_state: state,
+        new_conv_state: state,
+    };
+    let m = ssm::Mamba2 {
+        a_log: Tensor::new(ha, 1, H as u32, Dtype::F32),
+        dt_bias: Tensor::new(hb, 1, H as u32, Dtype::F32),
+        d: Tensor::new(hdd, 1, H as u32, Dtype::F32),
+        norm: Tensor::new(hn, 1, inner as u32, Dtype::Bf16),
+        eps,
+        heads: H as u32,
+        groups: G as u32,
+    };
+    rig.fire(|sink| {
+        ssm::mamba2_chunked(
+            sink,
+            RaggedTensor {
+                data: Tensor::new(hx, T as u32, width as u32, Dtype::Bf16),
+                indptr: Tensor::new(hptr, 2, 1, Dtype::I32),
+            },
+            Tensor::new(hd, T as u32, H as u32, Dtype::Bf16),
+            Tensor::new(hz, T as u32, inner as u32, Dtype::Bf16),
+            m,
+            &pool,
+            N as u32,
+            Tensor::new(hy, T as u32, inner as u32, Dtype::Bf16),
+            None,
+        )
+        .expect("the walk")
+    });
+    within_a_bf16_ulp(
+        "mamba2_chunked",
+        &want,
+        &rig.read(hy, T * inner, Dtype::Bf16),
+    );
+    within_relative(
+        "mamba2 state",
+        &s,
+        &rig.read(hs, H * P * N, Dtype::F32),
+        1e-3,
+    );
 }

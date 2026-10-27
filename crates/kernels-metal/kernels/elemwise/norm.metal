@@ -347,7 +347,7 @@ instantiate_rms_grouped_row(bfloat16, bfloat, 4)
       out + size_t(gid) * axis_size, table, axis_size, gid, rows, counters, lid, tg_size);
 }
 
-template <typename X, typename T, bool SILU>
+template <typename X, typename T, bool SILU, bool SCALED = true>
 METAL_FUNC void gated_rms_body(
     const device X* x, const device T* z, const device X* w, device T* out,
     float eps, uint vd, size_t idx, uint lid,
@@ -361,10 +361,10 @@ METAL_FUNC void gated_rms_body(
   const float sig = zr < 0.0f ? 1.0f - y : y;
   const float gate = SILU ? zr * sig : sig;
   const float outhat = xi * inv;
-  out[idx] = T((outhat * float(w[lid])) * gate);
+  out[idx] = T((outhat * (SCALED ? float(w[lid]) : 1.0f)) * gate);
 }
 
-template <typename X, typename T, bool SILU>
+template <typename X, typename T, bool SILU, bool SCALED = true>
 [[kernel]] void gated_rms(
     const device X* x        [[buffer(0)]],
     const device T* z        [[buffer(1)]],
@@ -381,7 +381,7 @@ template <typename X, typename T, bool SILU>
   const uint lid = lid3.x;
   const size_t idx =
       size_t(tgpos.z * tpg.y + tgpos.y) * vd + lid;
-  gated_rms_body<X, T, SILU>(
+  gated_rms_body<X, T, SILU, SCALED>(
       x, z, w, out, eps, vd, idx, lid,
       inv_rms, partials, simd_lane, simd_group);
 }
@@ -403,6 +403,20 @@ template <typename X, typename T, bool SILU>
 instantiate_gated_rms(f32_bfloat16, float, bfloat)
 
 instantiate_gated_rms_sigmoid(f32_bfloat16, float, bfloat)
+
+// The scaleless gated norm (no weight read), over an f32 accumulator or
+// bf16 rows (Muse Spark's).
+#define instantiate_gated_rms_unscaled(name, xtype, itype, silu)  \
+  template [[host_name(name)]]                                    \
+  [[kernel]] void gated_rms<xtype, itype, silu, false>(           \
+      const device xtype*, const device itype*, const device xtype*, \
+      device itype*, const constant float&, const constant uint&,    \
+      uint3, uint3, uint3, uint, uint);
+
+instantiate_gated_rms_unscaled("gated_rms_unscaled_f32_bfloat16", float, bfloat, true)
+instantiate_gated_rms_unscaled("gated_rms_unscaled_bfloat16_bfloat16", bfloat, bfloat, true)
+instantiate_gated_rms_unscaled("gated_rms_sigmoid_unscaled_f32_bfloat16", float, bfloat, false)
+instantiate_gated_rms_unscaled("gated_rms_sigmoid_unscaled_bfloat16_bfloat16", bfloat, bfloat, false)
 
 // gated_rms (f32 rows, bf16 gate and output, SiLU gate) that also lays the
 // register tile's input table of the rows it writes, so the out projection
@@ -637,3 +651,91 @@ template <typename T>
       const constant int&, uint2);
 
 instantiate_standardize(bfloat16, bfloat)
+
+// Muse Spark's post-norm and residual gate (`elemwise.norm_gate`), a
+// threadgroup a row: `u = x * scale` rounded to T (`x` with no scale), `n =
+// u / rms(u)` rounded to T, and with a residual `y = alpha * res + beta * n`
+// in f32 (`w = gate / temperature`, `beta = sigmoid(w)`, `alpha =
+// sqrt(max(sigmoid(-w) * (1 + beta), 1e-3))`), else `y = n`. Under `NEXT`
+// the next sublayer's input norm over `y` too: `z = rmsnorm(y) * w` (`1 + w`
+// where `plus_one`). CUDA's `norm_gate`, value for value.
+template <typename T>
+METAL_FUNC float norm_gate_u(
+    const device T* x, const device T* scale, uint has_scale, size_t at, uint i) {
+  const float v = float(x[at]);
+  return has_scale != 0 ? float(T(v * float(scale[i]))) : v;
+}
+
+template <typename T, bool NEXT>
+[[kernel]] void norm_gate(
+    const device T* x              [[buffer(0)]],
+    const device T* scale          [[buffer(1)]],
+    const device T* res            [[buffer(2)]],
+    const device float* gate       [[buffer(3)]],
+    device T* y                    [[buffer(4)]],
+    const constant float& eps      [[buffer(5)]],
+    const constant float& temperature [[buffer(6)]],
+    const constant uint& width     [[buffer(7)]],
+    const constant uint& has_scale [[buffer(8)]],
+    const constant uint& has_res   [[buffer(9)]],
+    const device T* next_w         [[buffer(10)]],
+    const constant float& next_eps [[buffer(11)]],
+    const constant uint& plus_one  [[buffer(12)]],
+    device T* z                    [[buffer(13)]],
+    uint gid                       [[threadgroup_position_in_grid]],
+    uint lid                       [[thread_position_in_threadgroup]],
+    uint simd_lane                 [[thread_index_in_simdgroup]],
+    uint simd_group                [[simdgroup_index_in_threadgroup]],
+    uint tg_size                   [[threads_per_threadgroup]]) {
+  threadgroup float inv_rms[1], partials[32];
+  const size_t base = size_t(gid) * width;
+  float acc = 0.0f;
+  for (uint i = lid; i < width; i += tg_size) {
+    const float u = norm_gate_u(x, scale, has_scale, base + i, i);
+    acc = fma(u, u, acc);
+  }
+  const float inv = rms_inv_from_lane_sum(
+      acc, width, eps, inv_rms, partials, simd_lane, simd_group);
+  float sq = 0.0f;
+  for (uint i = lid; i < width; i += tg_size) {
+    const float u = norm_gate_u(x, scale, has_scale, base + i, i);
+    T o;
+    if (has_res == 0) {
+      o = T(u * inv);
+    } else {
+      const float n = float(T(u * inv));
+      const float w = gate[i] / temperature;
+      const float beta = 1.0f / (1.0f + metal::exp(-w));
+      const float a2 = metal::max((1.0f / (1.0f + metal::exp(w))) * (1.0f + beta), 1e-3f);
+      const float alpha = a2 * metal::rsqrt(a2);
+      o = T(alpha * float(res[base + i]) + beta * n);
+    }
+    y[base + i] = o;
+    if (NEXT) {
+      const float of = float(o);
+      sq += of * of;
+    }
+  }
+  if (!NEXT)
+    return;
+  const float inv2 = rms_inv_from_lane_sum(
+      sq, width, next_eps, inv_rms, partials, simd_lane, simd_group);
+  for (uint i = lid; i < width; i += tg_size) {
+    float wv = float(next_w[i]);
+    if (plus_one != 0) wv += 1.0f;
+    z[base + i] = T(float(y[base + i]) * inv2 * wv);
+  }
+}
+
+#define instantiate_norm_gate(name, itype, next)                          \
+  template [[host_name(name)]] [[kernel]] void norm_gate<itype, next>(     \
+      const device itype*, const device itype*, const device itype*,       \
+      const device float*, device itype*, const constant float&,           \
+      const constant float&, const constant uint&, const constant uint&,   \
+      const constant uint&, const device itype*, const constant float&,    \
+      const constant uint&, device itype*, uint, uint, uint, uint, uint);
+
+instantiate_norm_gate("norm_gate_bfloat16", bfloat, false)
+instantiate_norm_gate("norm_gate_next_bfloat16", bfloat, true)
+instantiate_norm_gate("norm_gate_float16", half, false)
+instantiate_norm_gate("norm_gate_next_float16", half, true)

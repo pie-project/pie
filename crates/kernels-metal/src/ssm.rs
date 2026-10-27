@@ -287,6 +287,7 @@ pub fn causal_conv1d(
     ctx: &Ctx<'_>,
     x: Tensor,
     weight: Tensor,
+    bias: Option<Tensor>,
     state: &RecurrentPool,
     conv_width: u32,
     dilation: u32,
@@ -322,8 +323,18 @@ pub fn causal_conv1d(
             stated(OP, x.width)?.arg(),
             taps.arg(),
             stated(OP, dilation)?.arg(),
+            conv_bias(ctx, bias)?,
+            i32::from(bias.is_some()).arg(),
         ],
     )
+}
+
+/// A conv's per-channel bias (Mamba-2's), added before the activation.
+fn conv_bias(ctx: &Ctx<'_>, bias: Option<Tensor>) -> Result<crate::encode::ArgValue, Error> {
+    match bias {
+        Some(b) => Ok(b.arg()),
+        None => ctx.absent(),
+    }
 }
 
 /// The rows of one lane whose recurrent state a prompt's scans land in slots
@@ -359,7 +370,7 @@ pub fn causal_conv1d_chunked(
     dilation: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    causal_conv1d_chunked_landing(ctx, x, weight, state, conv_width, dilation, y, None)
+    causal_conv1d_chunked_landing(ctx, x, weight, None, state, conv_width, dilation, y, None)
 }
 
 /// [`causal_conv1d_chunked`], landing the window as of each of `snapshots`'
@@ -369,6 +380,7 @@ pub fn causal_conv1d_chunked_landing(
     ctx: &Ctx<'_>,
     x: RaggedTensor,
     weight: Tensor,
+    bias: Option<Tensor>,
     state: &RecurrentPool,
     conv_width: u32,
     dilation: u32,
@@ -422,6 +434,8 @@ pub fn causal_conv1d_chunked_landing(
             stated(OP, CONV_RUN_ROWS)?.arg(),
             snaps,
             lane0,
+            conv_bias(ctx, bias)?,
+            i32::from(bias.is_some()).arg(),
         ],
     )
 }
@@ -739,6 +753,156 @@ pub fn kda_committed(
             gate_floor.arg(),
         ],
     )
+}
+
+/// Mamba-2's per-head weights: `A_log`, `dt_bias` and `D` (f32 `[heads]`),
+/// and the gated group norm's bf16 `[heads * 64]` weight and epsilon.
+#[derive(Clone, Copy, Debug)]
+pub struct Mamba2 {
+    pub a_log: Tensor,
+    pub dt_bias: Tensor,
+    pub d: Tensor,
+    pub norm: Tensor,
+    pub eps: f32,
+    pub heads: u32,
+    pub groups: u32,
+}
+
+impl Mamba2 {
+    /// Refuses all but 64-wide heads over a 128-wide state, as CUDA does.
+    fn check(
+        &self,
+        op: &'static str,
+        xbc: Tensor,
+        dt: Tensor,
+        z: Tensor,
+        y: Tensor,
+        state_dim: u32,
+    ) -> Result<(), Error> {
+        let inner = self.heads * 64;
+        if state_dim != 128
+            || self.groups == 0
+            || !self.heads.is_multiple_of(self.groups)
+            || xbc.width != inner + 2 * self.groups * state_dim
+            || dt.width != self.heads
+            || z.width != inner
+            || y.width != inner
+        {
+            return Err(refuse(
+                op,
+                format!(
+                    "Mamba-2 runs 64-wide heads over a 128-wide state in whole groups; this \
+                     fire states {} heads in {} groups of a {}-wide state, a {}-wide xbc, \
+                     {}-wide dt, a {}-wide z and a {}-wide output",
+                    self.heads, self.groups, state_dim, xbc.width, dt.width, z.width, y.width
+                ),
+            ));
+        }
+        for (what, t) in [
+            ("xbc", xbc.dtype),
+            ("dt", dt.dtype),
+            ("z", z.dtype),
+            ("output", y.dtype),
+        ] {
+            if t != Dtype::Bf16 {
+                return Err(refuse(
+                    op,
+                    format!("Mamba-2 reads and lands bf16, and its {what} is {t:?}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The gated output's group norm, in place.
+    fn norm(&self, ctx: &Ctx<'_>, y: Tensor) -> Result<(), Error> {
+        crate::elemwise::norm::rmsnorm_grouped(
+            ctx,
+            y,
+            self.norm,
+            y.width / self.groups,
+            self.eps,
+            false,
+            y,
+        )
+    }
+}
+
+/// One Mamba-2 step a row over the convolved `xbc` rows: lands `(C S + D x)
+/// * silu(z)`, group-normed, in `y`.
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2(
+    ctx: &Ctx<'_>,
+    xbc: Tensor,
+    dt: Tensor,
+    z: Tensor,
+    m: Mamba2,
+    state: &RecurrentPool,
+    state_dim: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.mamba2";
+    m.check(OP, xbc, dt, z, y, state_dim)?;
+    let rows = nonzero(OP, "rows", xbc.rows)?;
+    ctx.fire(
+        Fire::at("ssm/mamba2.metal", "mamba2_step_bfloat16")
+            .apply(Grid::of([256, m.heads, rows], [256, 1, 1])),
+        &[
+            xbc.arg(),
+            dt.arg(),
+            z.arg(),
+            m.a_log.arg(),
+            m.dt_bias.arg(),
+            m.d.arg(),
+            state.state.arg_mut(),
+            state.slots.arg(),
+            y.arg_mut(),
+            stated(OP, m.heads)?.arg(),
+            stated(OP, m.groups)?.arg(),
+        ],
+    )?;
+    m.norm(ctx, y)
+}
+
+/// A prompt's Mamba-2 walk a request, landing the state as of each of
+/// `snapshots`' rows in its slot too; then the group norm.
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2_chunked(
+    ctx: &Ctx<'_>,
+    xbc: RaggedTensor,
+    dt: Tensor,
+    z: Tensor,
+    m: Mamba2,
+    state: &RecurrentPool,
+    state_dim: u32,
+    y: Tensor,
+    snapshots: Option<Snapshots>,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.mamba2_chunked";
+    m.check(OP, xbc.data, dt, z, y, state_dim)?;
+    let lanes = requests(OP, xbc)?;
+    let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
+    ctx.fire(
+        Fire::at("ssm/mamba2.metal", "mamba2_chunked_bfloat16")
+            .apply(Grid::of([256, m.heads, lanes], [256, 1, 1])),
+        &[
+            xbc.data.arg(),
+            xbc.indptr.arg(),
+            dt.arg(),
+            z.arg(),
+            m.a_log.arg(),
+            m.dt_bias.arg(),
+            m.d.arg(),
+            state.state.arg_mut(),
+            state.slots.arg(),
+            y.arg_mut(),
+            stated(OP, m.heads)?.arg(),
+            stated(OP, m.groups)?.arg(),
+            snaps,
+            lane0,
+        ],
+    )?;
+    m.norm(ctx, y)
 }
 
 #[cfg(test)]

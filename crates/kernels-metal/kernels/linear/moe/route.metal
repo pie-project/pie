@@ -2,7 +2,7 @@
 
 using namespace metal;
 
-constant constexpr uint kRouterMaxTopK = 16;
+constant constexpr uint kRouterMaxTopK = 32;
 constant constexpr uint kRouterMaxSimdgroups = 32;
 
 template <typename T, typename W, bool SCALED>

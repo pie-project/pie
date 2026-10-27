@@ -284,6 +284,7 @@ fn a_prompt_scan_lands_its_snapshots() {
                     indptr: gpu.ints(&[0, rows as i32], Dtype::I32),
                 },
                 weight,
+                None,
                 &conv_pool(slot, rows),
                 WIDTH,
                 1,

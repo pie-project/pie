@@ -173,10 +173,32 @@ impl Run<'_> {
             Elemwise::SumSquares { .. } | Elemwise::RmsnormBy { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
-            // Muse Spark's post-norm gate is served on CUDA.
-            Elemwise::NormGate { .. } => Err(kernels_metal::Error::Unsupported {
-                op: "elemwise.norm_gate",
-            }),
+            // Muse Spark's post-norm gate.
+            Elemwise::NormGate {
+                x,
+                scale,
+                res,
+                gate,
+                eps,
+                temperature,
+                next,
+                y,
+            } => elemwise::norm::norm_gate(
+                self.ctx(),
+                self.tensor(*x),
+                scale.map(|s| self.tensor(s)),
+                res.map(|r| self.tensor(r)),
+                gate.map(|g| self.tensor(g)),
+                *eps,
+                *temperature,
+                next.map(|n| elemwise::norm::Next {
+                    weight: self.tensor(n.weight),
+                    eps: n.eps,
+                    plus_one: n.plus_one,
+                    y: self.tensor(n.y),
+                }),
+                self.tensor(*y),
+            ),
             // A rotation at its own frequencies (a checkpoint's rope scaling) is
             // served on CUDA.
             Elemwise::Rope { freqs: Some(_), .. } => {
@@ -486,10 +508,25 @@ impl Run<'_> {
                 *streams,
                 self.tensor(*y),
             ),
-            // A scaleless gated norm runs on CUDA alone (Muse Spark's).
-            Elemwise::RmsnormGated { weight: None, .. } => {
-                Err(kernels_metal::Error::Unsupported { op: op.name() })
-            }
+            // A scaleless gated norm (Muse Spark's).
+            Elemwise::RmsnormGated {
+                x,
+                gate,
+                weight: None,
+                head_dim,
+                eps,
+                act,
+                y,
+            } => elemwise::norm::rmsnorm_gated(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*gate),
+                None,
+                *head_dim,
+                *eps,
+                matches!(act, poem_ir::GateActivation::Sigmoid),
+                self.tensor(*y),
+            ),
             Elemwise::RmsnormGated {
                 x,
                 gate,
@@ -524,7 +561,7 @@ impl Run<'_> {
                         self.ctx(),
                         self.tensor(*x),
                         self.tensor(*gate),
-                        self.tensor(*weight),
+                        Some(self.tensor(*weight)),
                         *head_dim,
                         *eps,
                         sigmoid,

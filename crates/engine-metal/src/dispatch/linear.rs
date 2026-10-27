@@ -579,7 +579,9 @@ impl Run<'_> {
             return Ok(());
         }
         match op {
-            Linear::Relu2 { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+            Linear::Relu2 { x, y } => {
+                linear::mlp::relu2(self.ctx(), self.tensor(*x), self.tensor(*y))
+            }
             Linear::Matmul {
                 act,
                 w,

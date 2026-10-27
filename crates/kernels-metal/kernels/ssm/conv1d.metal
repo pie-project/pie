@@ -26,6 +26,8 @@ template <typename T>
     const constant int& channels   [[buffer(6)]],
     const constant int& conv_width [[buffer(7)]],
     const constant int& dilation   [[buffer(8)]],
+    const device T* bias           [[buffer(9)]],
+    const constant int& has_bias   [[buffer(10)]],
     uint2 pos [[thread_position_in_grid]]) {
   const int c = int(pos.x);
   const int r = int(pos.y);
@@ -38,7 +40,7 @@ template <typename T>
 
   const float fresh = float(x[size_t(r) * chans + col]);
 
-  float acc = 0.0f;
+  float acc = has_bias != 0 ? float(bias[col]) : 0.0f;
   for (size_t k = 0; k + 1 < taps; ++k) {
     acc += conv_state[slab + (k * size_t(dilation) + 1) * chans + col] *
            float(weight[tap0 + k]);
@@ -68,6 +70,8 @@ template <typename T>
     const constant int& run_rows   [[buffer(10)]],
     const device int* snaps        [[buffer(11)]],
     const constant int& snap_lane0 [[buffer(12)]],
+    const device T* bias           [[buffer(13)]],
+    const constant int& has_bias   [[buffer(14)]],
     uint3 pos [[thread_position_in_grid]]) {
   // One thread a channel, a lane and a run of at least `run_rows` rows. Only
   // a run that starts before the history ends reads the carried state, and
@@ -99,8 +103,9 @@ template <typename T>
     return;
   }
   const int last = min(span, first + run);
+  const float bias_v = has_bias != 0 ? float(bias[col]) : 0.0f;
   for (int t = first; t < last; ++t) {
-    float acc = 0.0f;
+    float acc = bias_v;
     for (int k = 0; k < width; ++k) {
       const int src = t - (width - 1 - k) * dil;
       const float tap = (src < 0)
@@ -167,6 +172,8 @@ template <typename T>
     const constant int& run_rows   [[buffer(10)]],
     const device int* snaps        [[buffer(11)]],
     const constant int& snap_lane0 [[buffer(12)]],
+    const device T* bias           [[buffer(13)]],
+    const constant int& has_bias   [[buffer(14)]],
     uint3 pos [[thread_position_in_grid]]) {
   const int c = int(pos.x) * 4;
   const int r = int(pos.y);
@@ -196,8 +203,11 @@ template <typename T>
                   float(weight[(col + 2) * size_t(width) + size_t(k)]),
                   float(weight[(col + 3) * size_t(width) + size_t(k)]));
   }
+  const float4 bias_v = has_bias != 0
+      ? float4(*reinterpret_cast<const device vec<T, 4>*>(bias + col))
+      : float4(0.0f);
   for (int t = first; t < last; ++t) {
-    float4 acc = 0.0f;
+    float4 acc = bias_v;
     for (int k = 0; k < width; ++k) {
       const float4 tap = causal_conv1d_x4_tap<T>(x, conv_state, slab, chans, col, begin, hist, t - (width - 1 - k) * dil);
       acc.x += tap.x * w[k].x;
@@ -235,7 +245,8 @@ template <typename T>
       const device float*, device float*, const device uint*,           \
       device itype*, const constant int&, const constant int&,          \
       const constant int&, const constant int&, const device int*,      \
-      const constant int&, uint3);
+      const constant int&, const device itype*, const constant int&,    \
+      uint3);
 
 instantiate_causal_conv1d_chunked_x4(bfloat16, bfloat)
 
@@ -245,7 +256,7 @@ instantiate_causal_conv1d_chunked_x4(bfloat16, bfloat)
       const device itype*, const device itype*, const device float*,    \
       device float*, const device uint*, device itype*,                 \
       const constant int&, const constant int&, const constant int&,    \
-      uint2);
+      const device itype*, const constant int&, uint2);
 
 #define instantiate_causal_conv1d_chunked(name, itype)                  \
   template [[host_name("causal_conv1d_chunked_" #name)]]                \
@@ -254,7 +265,8 @@ instantiate_causal_conv1d_chunked_x4(bfloat16, bfloat)
       const device float*, device float*, const device uint*,           \
       device itype*, const constant int&, const constant int&,          \
       const constant int&, const constant int&, const device int*,      \
-      const constant int&, uint3);
+      const constant int&, const device itype*, const constant int&,    \
+      uint3);
 
 instantiate_causal_conv1d(bfloat16, bfloat)
 

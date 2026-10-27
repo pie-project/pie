@@ -21,6 +21,8 @@ const VECTOR_ENTRY: &str = "dense_gemv_t_bfloat16";
 
 const KSPLIT_ENTRY: &str = "dense_gemv_t_ksplit_bfloat16";
 
+const KSPLIT_F32_ENTRY: &str = "dense_gemv_t_ksplit_bfloat16_float32";
+
 const VECTOR_GROUP: u32 = 128;
 
 const KSPLIT_MAX_COLUMNS: u32 = 1024;
@@ -53,7 +55,10 @@ pub fn act_x_wt(
     if rows == 0 {
         return Ok(());
     }
-    let (entry, grid) = if rows < VECTOR_MAX_ROWS && columns <= KSPLIT_MAX_COLUMNS {
+    let (entry, grid) = if y.dtype == dtype::Dtype::F32 {
+        // f32 columns (`matmul_f32`), a threadgroup each.
+        (KSPLIT_F32_ENTRY, ksplit_grid(op, rows, columns)?)
+    } else if rows < VECTOR_MAX_ROWS && columns <= KSPLIT_MAX_COLUMNS {
         (KSPLIT_ENTRY, ksplit_grid(op, rows, columns)?)
     } else if rows < VECTOR_MAX_ROWS {
         (VECTOR_ENTRY, vector_grid(op, rows, columns)?)

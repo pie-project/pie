@@ -12,8 +12,79 @@ impl DispatchSsm for Run<'_> {
 impl Run<'_> {
     fn ssm(&mut self, op: &Ssm) -> Result<(), kernels_metal::Error> {
         match op {
-            Ssm::Mamba2 { .. } | Ssm::Mamba2Chunked { .. } => {
+            // The committed walk's conv takes no bias.
+            Ssm::CausalConv1d { bias: Some(_), .. }
+            | Ssm::CausalConv1dChunked { bias: Some(_), .. }
+                if self.rs_seat().is_some() =>
+            {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
+            }
+            Ssm::Mamba2 { .. } | Ssm::Mamba2Chunked { .. } if self.rs_seat().is_some() => {
+                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            }
+            Ssm::Mamba2 {
+                xbc,
+                dt,
+                z,
+                a_log,
+                dt_bias,
+                d,
+                norm,
+                eps,
+                state,
+                heads,
+                groups,
+                state_dim,
+                y,
+            }
+            | Ssm::Mamba2Chunked {
+                xbc,
+                dt,
+                z,
+                a_log,
+                dt_bias,
+                d,
+                norm,
+                eps,
+                state,
+                heads,
+                groups,
+                state_dim,
+                y,
+            } => {
+                let m = ssm::Mamba2 {
+                    a_log: self.tensor(*a_log),
+                    dt_bias: self.tensor(*dt_bias),
+                    d: self.tensor(*d),
+                    norm: self.tensor(*norm),
+                    eps: *eps,
+                    heads: *heads,
+                    groups: *groups,
+                };
+                let (dt, z, y) = (self.tensor(*dt), self.tensor(*z), self.tensor(*y));
+                if matches!(op, Ssm::Mamba2 { .. }) {
+                    return ssm::mamba2(
+                        self.ctx(),
+                        self.tensor(*xbc),
+                        dt,
+                        z,
+                        m,
+                        &self.recurrent(*state),
+                        *state_dim,
+                        y,
+                    );
+                }
+                ssm::mamba2_chunked(
+                    self.ctx(),
+                    self.ragged(*xbc),
+                    dt,
+                    z,
+                    m,
+                    &self.recurrent(*state),
+                    *state_dim,
+                    y,
+                    self.rs_snapshots(),
+                )
             }
             Ssm::CausalConv1d {
                 x,
@@ -146,11 +217,12 @@ impl Run<'_> {
                 conv_width,
                 dilation,
                 y,
-                ..
+                bias,
             } => ssm::causal_conv1d(
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*weight),
+                bias.map(|b| self.tensor(b)),
                 &self.recurrent(*state),
                 *conv_width,
                 *dilation,
@@ -163,11 +235,12 @@ impl Run<'_> {
                 conv_width,
                 dilation,
                 y,
-                ..
+                bias,
             } => ssm::causal_conv1d_chunked_landing(
                 self.ctx(),
                 self.ragged(*x),
                 self.tensor(*weight),
+                bias.map(|b| self.tensor(b)),
                 &self.recurrent(*state),
                 *conv_width,
                 *dilation,

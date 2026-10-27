@@ -197,11 +197,11 @@ instantiate_dense_gemv_t(bfloat16, bfloat)
 PIE_CONST int KSPLIT_GROUP = 128;
 PIE_CONST int KSPLIT_SIMDGROUPS = KSPLIT_GROUP / SIMD_SIZE;
 
-template <typename T>
+template <typename T, typename U = T>
 [[kernel]] void dense_gemv_t_ksplit(
     const device T* act      [[buffer(0)]],
     const device T* w        [[buffer(1)]],
-    device T* y              [[buffer(2)]],
+    device U* y              [[buffer(2)]],
     const constant int& M    [[buffer(3)]],
     const constant int& N    [[buffer(4)]],
     const constant int& K    [[buffer(5)]],
@@ -228,7 +228,7 @@ template <typename T>
     for (int i = 0; i < KSPLIT_SIMDGROUPS; ++i) {
       total += part[i];
     }
-    y[size_t(m) * size_t(N) + size_t(n)] = static_cast<T>(total);
+    y[size_t(m) * size_t(N) + size_t(n)] = static_cast<U>(total);
   }
 }
 
@@ -240,3 +240,10 @@ template <typename T>
       uint2, uint, uint, uint);
 
 instantiate_dense_gemv_t_ksplit(bfloat16, bfloat)
+
+// bf16 rows into f32 columns (`matmul_f32`: a router's logits, Nemotron-H's).
+template [[host_name("dense_gemv_t_ksplit_bfloat16_float32")]]
+[[kernel]] void dense_gemv_t_ksplit<bfloat, float>(
+    const device bfloat*, const device bfloat*, device float*,
+    const constant int&, const constant int&, const constant int&,
+    uint2, uint, uint, uint);

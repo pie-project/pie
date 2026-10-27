@@ -365,6 +365,20 @@ pub fn rmsnorm_grouped_plus_one(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
+    rmsnorm_grouped(ctx, x, weight, group, eps, true, y)
+}
+
+/// Each `group`-wide run of a row RMS-normed on its own and scaled by its
+/// own `weight`s (`1 + weight` under `plus_one`).
+pub fn rmsnorm_grouped(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    weight: Tensor,
+    group: u32,
+    eps: f32,
+    plus_one: bool,
+    y: Tensor,
+) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm";
     let axis = nonzero(OP, "the group width", group)?;
     if !x.width.is_multiple_of(axis) {
@@ -398,7 +412,7 @@ pub fn rmsnorm_grouped_plus_one(
             eps.arg(),
             stated(OP, axis)?.arg(),
             DENSE_BANK.arg(),
-            OFFSET_BANK.arg(),
+            if plus_one { OFFSET_BANK } else { ABSOLUTE_BANK }.arg(),
             UNIT_GAIN.arg(),
             stated(OP, groups)?.arg(),
         ],
@@ -426,19 +440,44 @@ pub fn rmsnorm_gated(
     ctx: &Ctx<'_>,
     x: Tensor,
     gate: Tensor,
-    weight: Tensor,
+    weight: Option<Tensor>,
     head_dim: u32,
     eps: f32,
     sigmoid_gate: bool,
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm_gated";
-    debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
-    debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
-    let entry = if sigmoid_gate {
-        dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_sigmoid_f32_bfloat16" })
-    } else {
-        dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_f32_bfloat16" })
+    debug_assert!(
+        weight.is_none_or(|w| w.dtype == Dtype::F32),
+        "`{OP}` scales by an f32 weight"
+    );
+    let entry = match (weight.is_some(), sigmoid_gate, x.dtype) {
+        (true, true, Dtype::F32) => {
+            dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_sigmoid_f32_bfloat16" })
+        }
+        (true, false, Dtype::F32) => {
+            dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_f32_bfloat16" })
+        }
+        // Scaleless (Muse Spark's): over an f32 accumulator or bf16 rows.
+        (false, true, Dtype::F32) => {
+            dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_sigmoid_unscaled_f32_bfloat16" })
+        }
+        (false, true, Dtype::Bf16) => dtype_dispatch!(OP, gate.dtype, {
+            Bf16 => "gated_rms_sigmoid_unscaled_bfloat16_bfloat16"
+        }),
+        (false, false, Dtype::F32) => {
+            dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_unscaled_f32_bfloat16" })
+        }
+        (false, false, Dtype::Bf16) => {
+            dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_unscaled_bfloat16_bfloat16" })
+        }
+        (_, _, dtype) => {
+            return Err(refuse(OP, format!("the normed rows are {dtype:?}")));
+        }
+    };
+    let w = match weight {
+        Some(w) => w.arg(),
+        None => ctx.absent()?,
     };
     let vd = head_width(OP, head_dim)?;
     if x.width == 0 || !x.width.is_multiple_of(vd) {
@@ -456,7 +495,7 @@ pub fn rmsnorm_gated(
         &[
             x.arg(),
             gate.arg(),
-            weight.arg(),
+            w,
             y.arg_mut(),
             eps.arg(),
             stated(OP, vd)?.arg(),
@@ -805,6 +844,98 @@ pub fn res_blend_scattered(
             [256, 1, 1],
         )),
         &args,
+    )
+}
+
+/// The next sublayer's input norm a [`norm_gate`] lands over its output:
+/// `y = rmsnorm(out) * weight` (`1 + weight` where `plus_one`).
+#[derive(Clone, Copy, Debug)]
+pub struct Next {
+    pub weight: Tensor,
+    pub eps: f32,
+    pub plus_one: bool,
+    pub y: Tensor,
+}
+
+/// Muse Spark's post-norm and residual gate (`elemwise.norm_gate`): a row's
+/// `x` times `scale` (rounded), RMS-normed unscaled (rounded), and with `res`
+/// and its f32 `gate` the residual's gated sum; with `next`, the next
+/// sublayer's input norm over it in the same pass.
+#[allow(clippy::too_many_arguments)]
+pub fn norm_gate(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    scale: Option<Tensor>,
+    res: Option<Tensor>,
+    gate: Option<Tensor>,
+    eps: f32,
+    temperature: f32,
+    next: Option<Next>,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elemwise.norm_gate";
+    let entry = match next {
+        None => {
+            dtype_dispatch!(OP, x.dtype, { Bf16 => "norm_gate_bfloat16", F16 => "norm_gate_float16" })
+        }
+        Some(_) => dtype_dispatch!(OP, x.dtype, {
+            Bf16 => "norm_gate_next_bfloat16",
+            F16 => "norm_gate_next_float16",
+        }),
+    };
+    if res.is_some() != gate.is_some() || gate.is_some_and(|g| g.dtype != Dtype::F32) {
+        return Err(refuse(OP, "a residual comes with its f32 gate"));
+    }
+    let planes = [
+        scale,
+        res,
+        Some(y),
+        next.map(|n| n.weight),
+        next.map(|n| n.y),
+    ];
+    if planes.into_iter().flatten().any(|t| t.dtype != x.dtype) {
+        return Err(refuse(
+            OP,
+            "the rows, scale, residual and norms share one dtype",
+        ));
+    }
+    let rows = nonzero(OP, "rows", y.rows)?;
+    let width = nonzero(OP, "width", y.width)?;
+    let threads = width.div_ceil(8).next_multiple_of(32).min(1024);
+    let lanes = threads.checked_mul(rows).ok_or_else(|| {
+        refuse(
+            OP,
+            format!("the grid will not launch: {threads} threads x {rows} rows"),
+        )
+    })?;
+    let opt = |t: Option<Tensor>| -> Result<_, Error> {
+        match t {
+            Some(t) => Ok(t.arg()),
+            None => ctx.absent(),
+        }
+    };
+    let z = match next {
+        Some(n) => n.y.arg_mut(),
+        None => ctx.absent()?,
+    };
+    ctx.fire(
+        Fire::at("elemwise/norm.metal", entry).apply(Grid::of([lanes, 1, 1], [threads, 1, 1])),
+        &[
+            x.arg(),
+            opt(scale)?,
+            opt(res)?,
+            opt(gate)?,
+            y.arg_mut(),
+            eps.arg(),
+            temperature.arg(),
+            stated(OP, width)?.arg(),
+            u32::from(scale.is_some()).arg(),
+            u32::from(res.is_some()).arg(),
+            opt(next.map(|n| n.weight))?,
+            next.map_or(0.0, |n| n.eps).arg(),
+            u32::from(next.is_some_and(|n| n.plus_one)).arg(),
+            z,
+        ],
     )
 }
 

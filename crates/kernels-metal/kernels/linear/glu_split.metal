@@ -113,3 +113,16 @@ template <typename T>
 
 instantiate_mlp_gelu_tanh(bfloat16, bfloat)
 
+// `relu(x)^2`, element for element (Nemotron-H's experts').
+template <typename T>
+[[kernel]] void mlp_relu2(
+    const device T* x         [[buffer(0)]],
+    device T* out             [[buffer(1)]],
+    uint gid                  [[thread_position_in_grid]]) {
+  const float r = metal::max(static_cast<float>(x[gid]), 0.0f);
+  out[gid] = static_cast<T>(r * r);
+}
+
+template [[host_name("mlp_relu2_bfloat16")]] [[kernel]] void mlp_relu2<bfloat>(
+    const device bfloat*, device bfloat*, uint);
+
