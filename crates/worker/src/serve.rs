@@ -74,17 +74,6 @@ impl ClusterControl {
 }
 
 impl RuntimeHandle {
-    pub async fn wait_then_shutdown(self) -> Result<()> {
-        let shutdown_reason = tokio::select! {
-            biased;
-            _ = tokio::signal::ctrl_c() => "SIGINT",
-            _ = wait_for_sigterm() => "SIGTERM",
-        };
-        eprintln!("\nshutting down ({shutdown_reason})...");
-        self.shutdown().await;
-        Ok(())
-    }
-
     pub async fn shutdown(mut self) {
         self.edge_server.abort();
         for task in &self.control_tasks {
@@ -396,25 +385,4 @@ async fn assemble_distributed<C: ControlLink>(
     let control_tasks = control::spawn_control_tasks(control, worker_id, info, manager);
 
     Ok((EdgeServer::GatewayLinks(dialed), control_tasks, worker_id))
-}
-
-async fn wait_for_sigterm() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut stream = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("could not install SIGTERM handler: {e}");
-                std::future::pending::<()>().await;
-                return;
-            }
-        };
-        stream.recv().await;
-    }
-
-    #[cfg(windows)]
-    {
-        std::future::pending::<()>().await;
-    }
 }
