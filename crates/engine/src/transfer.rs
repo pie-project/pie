@@ -33,11 +33,6 @@ impl MemoryDomain {
             | MemoryDomain::LocalDisk => None,
         }
     }
-
-    #[must_use]
-    pub const fn host_visible(self) -> bool {
-        matches!(self, MemoryDomain::HostPinned | MemoryDomain::MetalShared)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,10 +104,6 @@ impl KvHandle {
     pub fn page_bytes(&self) -> u64 {
         self.layout.page_bytes()
     }
-}
-
-pub trait KvExport {
-    fn export_kv_handle(&self) -> Option<KvHandle>;
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
