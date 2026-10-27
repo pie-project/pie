@@ -148,14 +148,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dflash-speculative-bench"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "diffusion-baseline"
 version = "0.1.0"
 dependencies = [
@@ -164,32 +156,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "diffusion-lab"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "diffusion-parity"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "dry-repetition-penalty"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "dspark-speculative-bench"
 version = "0.1.0"
 dependencies = [
  "inferlet",
@@ -225,34 +192,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
-name = "flux2-klein-parity"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "flux2-parity"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
-name = "frames-probe"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
 
 [[package]]
 name = "futures"
@@ -374,14 +317,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hy3-parity"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "id-arena"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -443,14 +378,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "latent-probe"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -477,14 +404,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
-name = "lora-probe"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "macro-string"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -500,14 +419,6 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "mini-dit-parity"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
 
 [[package]]
 name = "mirostat-v2-sampling"
@@ -564,14 +475,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "prefill-rows"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
 
 [[package]]
 name = "prefix-tree-kv-cache"
@@ -793,34 +696,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "trackb-snapkv"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
-
-[[package]]
-name = "wan2-parity"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "wan2-vae-parity"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
 
 [[package]]
 name = "wasm-encoder"
@@ -950,22 +829,6 @@ dependencies = [
 
 [[package]]
 name = "xtc-sampling"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "zimage-parity"
-version = "0.1.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "zimage-vae-parity"
 version = "0.1.0"
 dependencies = [
  "inferlet",

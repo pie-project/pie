@@ -25,8 +25,6 @@ mod common_dit;
 mod common_encoder;
 #[cfg(feature = "device")]
 mod common_two_axis;
-#[cfg(feature = "device")]
-mod common_vae;
 
 mod a_bank_says_which_site_it_corrects;
 mod a_beam_reads_up_to_its_slot_what_its_mask_admits;
@@ -97,10 +95,5 @@ mod every_suite_step_agrees_with_the_host_interpreter;
 mod masked_axis;
 mod no_shell_reads_the_environment;
 mod routed_experts_stream;
-mod the_flux_2_vae_answers_the_reference;
-mod the_ltx_2_vae_answers_the_reference;
 mod the_mini_dit_row_arms_its_bodies;
 mod the_operators_fraction_sizes_the_pool;
-mod the_wan_2_vae_answers_the_reference;
-mod the_wan_2_vae_encodes_the_reference;
-mod the_z_image_vae_answers_the_reference;
