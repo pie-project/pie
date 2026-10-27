@@ -292,7 +292,6 @@ fn numbered(part: &str) -> Option<u64> {
 
 #[derive(Debug)]
 pub struct Blob {
-    pub at: PathBuf,
     pub bytes: Vec<u8>,
     pub fingerprint: u64,
 }
@@ -350,7 +349,6 @@ impl Blobs {
         let out = match read {
             Ok(bytes) => {
                 let blob = Arc::new(Blob {
-                    at: at.to_path_buf(),
                     fingerprint: fingerprint(&bytes),
                     bytes,
                 });

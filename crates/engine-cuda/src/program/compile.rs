@@ -635,10 +635,6 @@ pub struct Compiled {
 }
 
 impl Compiled {
-    #[must_use]
-    pub fn stage_of_kind(&self, kind: Attach) -> Option<usize> {
-        self.kinds.iter().position(|&k| k == kind)
-    }
 }
 
 #[derive(Debug)]

@@ -484,16 +484,6 @@ impl Ladder {
     pub fn rungs(&self) -> &[(u32, u32)] {
         &self.0
     }
-
-    #[must_use]
-    pub fn contains(&self, class: usize) -> bool {
-        self.0.iter().any(|(held, _)| *held as usize == class)
-    }
-
-    #[must_use]
-    pub fn reach(&self) -> u32 {
-        self.0.iter().map(|(_, rung)| *rung).sum()
-    }
 }
 
 impl core::fmt::Display for BodyKey {

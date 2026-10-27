@@ -190,14 +190,6 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn predictions(&self) -> Vec<(InstanceId, Vec<Cursor>)> {
-        self.instances
-            .iter()
-            .map(|(id, bound)| (*id, bound.session.predictions()))
-            .collect()
-    }
-
-    #[must_use]
     pub const fn stats(&self) -> eta_exec::CacheStats {
         self.cache.stats()
     }

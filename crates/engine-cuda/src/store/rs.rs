@@ -378,16 +378,6 @@ impl Buffers {
     }
 
     #[must_use]
-    pub fn slots(&self) -> u32 {
-        self.slots
-    }
-
-    #[must_use]
-    pub fn layers(&self) -> u32 {
-        self.layers
-    }
-
-    #[must_use]
     pub fn bytes(&self) -> u64 {
         self.arena.committed_bytes()
     }

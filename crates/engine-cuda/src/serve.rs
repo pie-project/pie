@@ -45,7 +45,7 @@ use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::exports::Exports;
 use crate::inputs::Inputs;
-use crate::program::{Fired, Plane as ProgramPlane, Session as ProgramSession};
+use crate::program::{Plane as ProgramPlane, Session as ProgramSession};
 use crate::record::{self, Bodies as GraphCache};
 use crate::run::{RsMove, WeightRow};
 use crate::store::Pools;
@@ -787,14 +787,6 @@ impl Shell {
         self.programs.disagreeing_ticket(instance_id, tickets)
     }
 
-    pub fn program_ready(&self, instance_id: engine::InstanceId) -> Result<Option<u32>> {
-        self.programs.ready(instance_id)
-    }
-
-    pub fn reap_guests(&mut self) -> Result<()> {
-        self.reap_guests_at("shell.reap_guests")
-    }
-
     /// Settles the guest batches whose steps have landed: their channels'
     /// cells reach their readers then, and not at a later fire's enqueue,
     /// which a reader waiting on them may be what holds back.
@@ -839,11 +831,6 @@ impl Shell {
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
         self.reap_landed_guests()?;
         self.programs.close_instance(instance_id)
-    }
-
-    pub fn fire_program(&mut self, instance_id: engine::InstanceId) -> Result<Fired> {
-        self.reap_guests()?;
-        self.programs.fire(&self.device, instance_id)
     }
 
     fn keyable_units(compiled: &CompiledModel) -> bool {

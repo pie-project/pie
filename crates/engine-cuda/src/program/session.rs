@@ -201,11 +201,6 @@ impl Session {
         Some(self.merge(channel, prediction))
     }
 
-    #[must_use]
-    pub fn predictions(&self) -> Vec<Cursor> {
-        self.cursors_now()
-    }
-
     fn cursors_now(&self) -> Vec<Cursor> {
         (0..self.shapes.len())
             .map(|channel| {
@@ -340,12 +335,6 @@ impl Session {
         let native = self.rings.read_cell(channel as usize, head)?;
         self.advance_head(channel as usize);
         Ok(Some(native_to_wire(shape.dtype, shape.numel, &native)?))
-    }
-
-    pub fn peek(&self, channel: u32, sequence: u64) -> Result<Vec<u8>> {
-        let shape = self.shape_of(channel)?;
-        let native = self.rings.read_cell(channel as usize, sequence)?;
-        native_to_wire(shape.dtype, shape.numel, &native)
     }
 
     /// Fixes, once at bind, which ports this instance resolves under
