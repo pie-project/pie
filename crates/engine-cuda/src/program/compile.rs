@@ -634,9 +634,6 @@ pub struct Compiled {
     pub kinds: Arc<Vec<Attach>>,
 }
 
-impl Compiled {
-}
-
 #[derive(Debug)]
 pub struct Cache {
     programs: Bounded<u64, Compiled>,
