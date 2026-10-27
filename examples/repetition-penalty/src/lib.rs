@@ -37,8 +37,7 @@
 //!
 //! Two `[vocab]` f32 channels, so ~594 KiB each at this model's 151936-token
 //! vocabulary. Only `counts` is a feedback channel; `prompt_present` is written
-//! once and cycled unchanged, which keeps the graph shape identical between the
-//! prefill and decode passes.
+//! once and cycled unchanged.
 //!
 //! ## Source
 //!
@@ -203,33 +202,28 @@ async fn main(input: Input) -> Result<Output> {
         temperature: input.temperature,
     };
     let ws = WorkingSet::new();
-
-    if max_tokens == 0 {
-        return Ok(Output {
-            sampler: "repetition-penalty",
-            text: String::new(),
-            count: 0,
-            frequency_penalty: cfg.frequency_penalty,
-            presence_penalty: cfg.presence_penalty,
-            repetition_penalty: cfg.repetition_penalty,
-            mean_penalized: 0.0,
-            peak_repeat: 0.0,
-            unique_ratio: 0.0,
-        });
-    }
+    let pipe = Pipeline::new();
 
     // The model's opening (`<bos>` where it has one) before the raw text: a
     // gemma without it answers noise.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
-    if prompt.is_empty() {
-        prompt.push(0);
+    let prompt: Vec<i32> = inferlet::chat::prefix()
+        .into_iter()
+        .chain(model::encode(&input.prompt))
+        .map(|t| t as i32)
+        .collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe).context("prefill submit")?;
     }
-    let n = prompt.len() as u32;
 
     // The repetition penalty's scope includes the prompt, so seed the presence
-    // vector on the host — one pass over the prompt beats a device scatter that
-    // would have to run inside the prefill graph.
+    // vector on the host.
     let mut present = vec![0.0f32; vocab as usize];
     for &t in &prompt {
         if (t as usize) < present.len() {
@@ -237,104 +231,49 @@ async fn main(input: Input) -> Result<Output> {
         }
     }
 
-    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-    let mut penalized: Vec<f32> = Vec::with_capacity(max_tokens);
-    let mut peaks: Vec<f32> = Vec::with_capacity(max_tokens);
+    let tok_in = Channel::from([last]);
+    let rng = Channel::from([input.seed, 0]);
+    let counts_c = Channel::from(vec![0.0f32; vocab as usize]);
+    let present_c = Channel::from(present);
+    let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+    let pen_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
+    let peak_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
 
-    // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
-    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = Channel::from(prompt_i32);
-    let embed_indptr_p = Channel::from([0u32, n]);
-    let rng_p = Channel::from([input.seed, 0]);
-    let counts_p = Channel::from(vec![0.0f32; vocab as usize]);
-    let present_p = Channel::from(present.clone());
-    let tok_out_p = Channel::new([1], dtype::i32);
-    let pen_out_p = Channel::new([1], dtype::f32);
-    let peak_out_p = Channel::new([1], dtype::f32);
-
-    let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
-    fwd_p.epilogue(move || {
-        let r = rng_p.take();
-        let counts = counts_p.take();
-        let present = present_p.take();
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, &Channel::from([0u32, 1]))?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
+    fwd.epilogue(move || {
+        let r = rng.take();
+        let counts = counts_c.take();
+        let present = present_c.take();
         let logits = intrinsics::output(0, "logits");
         let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
         let r_next = &r + iota(2);
-        tok_out_p.put(&token);
-        pen_out_p.put(&n_pen);
-        peak_out_p.put(&peak);
-        counts_p.put(&counts_next);
-        present_p.put(&present);
-        rng_p.put(&r_next);
+        tok_in.put(&token);
+        tok_out.put(&token);
+        pen_out.put(&n_pen);
+        peak_out.put(&peak);
+        counts_c.put(&counts_next);
+        present_c.put(&present);
+        rng.put(&r_next);
     });
 
-    let pipe = Pipeline::new();
-    fwd_p.submit(&pipe).context("prefill submit")?;
-
-    let g0 = tok_out_p.take_host::<i32>().await?;
-    let p0 = pen_out_p.take_host::<f32>().await?;
-    let k0 = peak_out_p.take_host::<f32>().await?;
-    generated.push(g0 as u32);
-    penalized.push(p0);
-    peaks.push(k0);
-
-    // ── DECODE LOOP (1-wide, run-ahead). ──
-    if generated.len() < max_tokens {
-        // The decode pass owns fresh channels, so the histogram has to be
-        // handed over explicitly: it must already contain the prefill's token.
-        let mut counts0 = vec![0.0f32; vocab as usize];
-        if (g0 as usize) < counts0.len() {
-            counts0[g0 as usize] = 1.0;
-        }
-
-        let tok_in = Channel::from([g0]);
-        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
-        let counts_c = Channel::from(counts0);
-        let present_c = Channel::from(present);
-        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-        let pen_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
-        let peak_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
-        let lane1 = Channel::from([0u32, 1u32]);
-
-        let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, &lane1)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
-        fwd.epilogue(move || {
-            // Takes and compute first, puts last (value-id discipline).
-            let r = rng.take();
-            let counts = counts_c.take();
-            let present = present_c.take();
-            let logits = intrinsics::output(0, "logits");
-            let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
-
-            let r_next = &r + iota(2);
-
-            tok_in.put(&token);
-            tok_out.put(&token);
-            pen_out.put(&n_pen);
-            peak_out.put(&peak);
-            counts_c.put(&counts_next);
-            present_c.put(&present);
-            rng.put(&r_next);
-        });
-
-        let budget = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget, async || {
-            let t = tok_out
-                .take_host::<i32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            let p = pen_out.take_host::<f32>().await?;
-            let k = peak_out.take_host::<f32>().await?;
-            generated.push(t as u32);
-            penalized.push(p);
-            peaks.push(k);
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    }
+    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut penalized: Vec<f32> = Vec::with_capacity(max_tokens);
+    let mut peaks: Vec<f32> = Vec::with_capacity(max_tokens);
+    run_ahead(&pipe, &fwd, max_tokens, async || {
+        let t = tok_out
+            .take_host::<i32>()
+            .await
+            .with_context(|| format!("@{}", generated.len()))?;
+        let p = pen_out.take_host::<f32>().await?;
+        let k = peak_out.take_host::<f32>().await?;
+        generated.push(t as u32);
+        penalized.push(p);
+        peaks.push(k);
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipe.close();
 
     // The histogram is device state, so prove it actually advanced: a stuck
@@ -355,8 +294,8 @@ async fn main(input: Input) -> Result<Output> {
         frequency_penalty: cfg.frequency_penalty,
         presence_penalty: cfg.presence_penalty,
         repetition_penalty: cfg.repetition_penalty,
-        mean_penalized: penalized.iter().sum::<f32>() / penalized.len() as f32,
+        mean_penalized: penalized.iter().sum::<f32>() / penalized.len().max(1) as f32,
         peak_repeat: peaks.iter().fold(0.0f32, |a, &b| a.max(b)),
-        unique_ratio: unique.len() as f32 / generated.len() as f32,
+        unique_ratio: unique.len() as f32 / generated.len().max(1) as f32,
     })
 }
