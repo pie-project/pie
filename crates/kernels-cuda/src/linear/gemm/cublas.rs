@@ -198,7 +198,8 @@ pub(crate) fn act_x_wt(
         );
         let plan = device.plan_for(call);
         let tactic = capturing
-            .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status));
+            .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status))
+            .filter(|_| false);
         (plan, tactic, device.lt.handle, device.lt.workspace_bytes)
     });
     let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want) {
