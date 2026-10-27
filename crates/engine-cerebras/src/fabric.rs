@@ -160,10 +160,10 @@ fn round_writes(p: &mut phase::Phase) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fabric {
     /// The most data words one phase places on a PE altogether (its share
-    /// of every buffer plus scratch). A probe (`pe_memory_probe`) links
-    /// 10240 words of data beside the memcpy module alone; the rest of a
-    /// PE's memory is code, stack and the task tables, and the kernels'
-    /// code takes its share below that.
+    /// of every buffer plus scratch). A PE links 10240 words of data
+    /// beside the memcpy module alone; the rest of a PE's memory is code,
+    /// stack and the task tables, and the kernels' code takes its share
+    /// below that.
     pub pe_words: u64,
     /// The most elements of one buffer a PE holds before it is split (a
     /// small budget makes a small model take every split form).
