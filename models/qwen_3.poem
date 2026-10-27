@@ -8,6 +8,8 @@ load("//pie/codec.poem", "bank", "kept", read_fused = "fused", read_weight = "we
 load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", "markov", "selector", dflash_caches = "caches", dflash_declare = "declare", dflash_head = "head")
 load("//lib/media.poem", "smart_resize")
+load("//lib/qwen.poem", "SMALL", "LARGE", "PATCH", "MERGE", "tower", "read_tower", "run_tower", "scatter", "positions", "rope", "routed", "draft_attn", "norm_of")
+load("//lib/reads.poem", "squeezed")
 load("//lib/rope.poem", "yarn")
 load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
 
@@ -237,43 +239,6 @@ def gdn(d, proj, ba, dense, conv_state, delta_state, t):
         delta_state = delta_state,
     )
 
-def routed(n, hidden, m, experts, proj, gate):
-    """`m.experts` experts at `experts`, `m.top_k` routed to by a router at
-    `gate`, beside a shared expert at `proj` whose gate is at `gate`."""
-    return struct(
-        routed = True,
-        router = weight([m.experts, hidden], gate),
-        gate = weight([m.experts, m.inter, hidden], experts),
-        up = weight([m.experts, m.inter, hidden], experts),
-        down = weight([m.experts, hidden, m.inter], experts),
-        shared = struct(
-            gate = weight([m.shared_inter, hidden], proj),
-            up = weight([m.shared_inter, hidden], proj),
-        ),
-        shared_down = weight([hidden, m.shared_inter], proj),
-        shared_gate = weight([1, hidden], gate),
-        experts = m.experts,
-        top_k = m.top_k,
-        inter = m.inter,
-        shared_inter = m.shared_inter,
-    )
-
-SMALL = struct(depth = 12, hidden = 768, heads = 12, inter = 3072)
-
-LARGE = struct(depth = 27, hidden = 1152, heads = 16, inter = 4304)
-
-PATCH = 16
-
-TEMPORAL = 2
-
-PATCH_WIDTH = 3 * TEMPORAL * PATCH * PATCH
-
-MERGE = 2
-
-GRID_SIDE = 48
-
-POSITIONS = GRID_SIDE * GRID_SIDE
-
 def media(id, deploy):
     """How a still is spoken: framed by the processor's resize, cut into
     `PATCH` patches in `MERGE` blocks, its tokens placed by mrope."""
@@ -284,59 +249,6 @@ def media(id, deploy):
         prefix = "<|vision_start|>", placeholder = "<|image_pad|>", suffix = "<|vision_end|>",
         frame = lambda h, w, budget: smart_resize(h, w, PATCH * MERGE, 65536, 16777216),
     ))
-
-def tower(size, out, dt):
-    """`size`'s tower, merging into rows `out` wide, its weights at `dt`."""
-    th = size.hidden
-    ti = size.inter
-    merged = MERGE * MERGE * th
-    head_dim = th // size.heads
-    plane = lambda s, dims: weight(dims, dt)
-    vec = lambda s, length: weight([length], dt)
-
-    def block(l):
-        b = lambda s: "block.{}.{}".format(l, s)
-        return struct(
-            norm1 = vec(b("norm1"), th),
-            norm1_bias = vec(b("norm1_bias"), th),
-            qkv = plane(b("qkv"), [3 * th, th]),
-            qkv_bias = vec(b("qkv_bias"), 3 * th),
-            proj = plane(b("proj"), [th, th]),
-            proj_bias = vec(b("proj_bias"), th),
-            norm2 = vec(b("norm2"), th),
-            norm2_bias = vec(b("norm2_bias"), th),
-            fc1 = plane(b("fc1"), [ti, th]),
-            fc1_bias = vec(b("fc1_bias"), ti),
-            fc2 = plane(b("fc2"), [th, ti]),
-            fc2_bias = vec(b("fc2_bias"), th),
-        )
-
-    return struct(
-        hidden = th,
-        heads = size.heads,
-        head_dim = head_dim,
-        merge = MERGE,
-        patch = PATCH,
-        temporal = TEMPORAL,
-        patch_width = PATCH_WIDTH,
-        grid_side = GRID_SIDE,
-        positions = POSITIONS,
-        theta = 10000.0,
-        norm_eps = 1e-6,
-        sm_scale = f32(1.0 / f32(sqrt(head_dim))),
-        patch_embed = plane("patch_embed", [th, PATCH_WIDTH]),
-        patch_embed_bias = vec("patch_embed_bias", th),
-        pos_embed = plane("pos_embed", [POSITIONS, th]),
-        blocks = [block(l) for l in range(size.depth)],
-        merger = struct(
-            norm = vec("merger_norm", th),
-            norm_bias = vec("merger_norm_bias", th),
-            fc1 = plane("merger_fc1", [merged, merged]),
-            fc1_bias = vec("merger_fc1_bias", merged),
-            fc2 = plane("merger_fc2", [out, merged]),
-            fc2_bias = vec("merger_fc2_bias", out),
-        ),
-    )
 
 BONSAI_WIDTHS = struct(hidden = 5120, ssm = 6144, ffn_down = 17408)
 
@@ -688,33 +600,6 @@ def layout(id, deploy):
 
 # The Bonsai GGUF's rotation metadata.
 
-def product(xs):
-    out = 1
-    for x in xs:
-        out *= x
-    return out
-
-def flattened(name, want, broadcast = False):
-    """The tensor `name` as stored, its elements read as `want`; with
-    `broadcast`, a single stored value is read as any shape."""
-    held = shape(name)
-    if (not broadcast or product(held) > 1) and product(held) != product(want):
-        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
-            name, held, product(held), want, product(want)))
-    return src(name).transmute(want, stored(name))
-
-def squeezed(name):
-    """A depthwise convolution bank stored `[channels, 1, kernel]` or
-    `[channels, kernel, 1]`, read as `[channels, kernel]`."""
-    held = shape(name)
-    if len(held) == 3 and held[1] == 1:
-        channels, kernel = held[0], held[2]
-    elif len(held) == 3 and held[2] == 1:
-        channels, kernel = held[0], held[1]
-    else:
-        fail("`{}`: a depthwise convolution bank is stored [channels, 1, kernel] or [channels, kernel, 1] and this one is stored {}".format(name, held))
-    return src(name).transmute([channels, kernel], stored(name))
-
 LAYOUTS = [
     struct(
         name = "transformers",
@@ -756,12 +641,6 @@ def safetensors_format(layout, read, states = []):
         states = states,
     )
 
-def norm_of(layout):
-    """`norm(name)`: a norm as the layout stores it, read as the forward's."""
-    if layout.mlx:
-        return lambda name: src(name).bias(-1.0)
-    return lambda name: src(name)
-
 def read_attn(reads, a, n, norm):
     read_weight(reads, a.qg_proj, n("self_attn.q_proj.weight"), quantized = "read")
     read_weight(reads, a.k_proj, n("self_attn.k_proj.weight"), quantized = "read")
@@ -801,45 +680,6 @@ def read_routed(reads, f, n, layout):
     read_weight(reads, f.shared.up, n("mlp.shared_expert.up_proj.weight"), quantized = "read")
     read_weight(reads, f.shared_down, n("mlp.shared_expert.down_proj.weight"), quantized = "read")
     reads.read(f.shared_gate, n("mlp.shared_expert_gate.weight"))
-
-CHANNELS = 3
-
-def read_tower(reads, t, prefix, channels_last):
-    v = lambda s: prefix + s
-    flat = flattened(v("patch_embed.proj.weight"), t.patch_embed.shape, broadcast = True)
-    if channels_last:
-        per = t.patch_embed.shape[1] // CHANNELS
-        flat = flat.gather(1, [j * CHANNELS + c for c in range(CHANNELS) for j in range(per)])
-    reads.read_expr(t.patch_embed, flat)
-    reads.read(t.patch_embed_bias, v("patch_embed.proj.bias"))
-    reads.read(t.pos_embed, v("pos_embed.weight"))
-    for l, blk in enumerate(t.blocks):
-        n = lambda s: v("blocks.{}.{}".format(l, s))
-        for w, name in [
-            (blk.norm1, "norm1.weight"),
-            (blk.norm1_bias, "norm1.bias"),
-            (blk.qkv, "attn.qkv.weight"),
-            (blk.qkv_bias, "attn.qkv.bias"),
-            (blk.proj, "attn.proj.weight"),
-            (blk.proj_bias, "attn.proj.bias"),
-            (blk.norm2, "norm2.weight"),
-            (blk.norm2_bias, "norm2.bias"),
-            (blk.fc1, "mlp.linear_fc1.weight"),
-            (blk.fc1_bias, "mlp.linear_fc1.bias"),
-            (blk.fc2, "mlp.linear_fc2.weight"),
-            (blk.fc2_bias, "mlp.linear_fc2.bias"),
-        ]:
-            reads.read(w, n(name))
-    mg = t.merger
-    for w, name in [
-        (mg.norm, "merger.norm.weight"),
-        (mg.norm_bias, "merger.norm.bias"),
-        (mg.fc1, "merger.linear_fc1.weight"),
-        (mg.fc1_bias, "merger.linear_fc1.bias"),
-        (mg.fc2, "merger.linear_fc2.weight"),
-        (mg.fc2_bias, "merger.linear_fc2.bias"),
-    ]:
-        reads.read(w, v(name))
 
 BLOCK_SIZE_KEY = "prism.hadamard.block_size"
 SIGN_MODE_KEY = "prism.hadamard.sign_mode"
@@ -1210,24 +1050,6 @@ def decode_signs():
 # each rotated projection's input by the same Hadamard and signs; the KV-
 # rotated geometries turn their attention's q, k and v by a Hadamard.
 
-def draft_attn(x, inputs, plan, a, head_dim, kv_heads, rope, append = True):
-    """A draft head's gated attention over `plan`, rotating q and k by
-    `rope(q, k)`; `append` caches this step's k and v."""
-    d = head_dim
-    pages = inputs.kv(a.kv)
-    write_page = inputs.write_page(a.kv)
-    write_offset = inputs.write_offset(a.kv)
-    q, gate = ops.gather.split_q_gate(ops.linear.matmul(x, a.qg_proj), d)
-    k = ops.linear.matmul(x, a.k_proj)
-    v = ops.linear.matmul(x, a.v_proj)
-    q = ops.elemwise.rmsnorm_per_head_plus_one(q, a.q_norm, d, a.q_norm_eps)
-    k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, d, a.k_norm_eps)
-    q, k = rope(q, k)
-    if append:
-        ops.attn.kv_append(k, v, pages, write_page, write_offset)
-    o = ops.attn.prefill(q, plan, pages, None, d, kv_heads, a.sm_scale)
-    return ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(o, gate), a.o_proj)
-
 def run_moe(x, f):
     """The routed MLP: `f.top_k` of `f.experts`, plus the gated shared expert."""
     experts, weights = ops.linear.moe_route(
@@ -1243,69 +1065,6 @@ def run_moe(x, f):
     gate, up = ops.linear.matmul(x, f.shared.gate), ops.linear.matmul(x, f.shared.up)
     shared = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.shared_down)
     return ops.linear.moe_sigmoid_gate_add(routed, shared, ops.linear.matmul(x, f.shared_gate))
-
-MROPE_SECTIONS = [11, 11, 10]
-
-def positions(inputs, vision):
-    """The positions a trunk's attention rotates by: multimodal with a tower."""
-    return inputs.mrope_positions() if vision else inputs.positions()
-
-def rope(q, k, positions, vision, rotary_dim, head_dim, theta, scaling = None):
-    if not vision:
-        return ops.elemwise.rope(
-            q,
-            positions,
-            head_dim,
-            theta,
-            rotary.partial(rotary_dim),
-            k = k,
-            scaling = scaling,
-        )
-    return ops.elemwise.rope(
-        q,
-        positions,
-        head_dim,
-        theta,
-        rotary.mrope(MROPE_SECTIONS, "interleaved", rotary_dim),
-        k = k,
-        scaling = scaling,
-    )
-
-def run_tower(inputs, t):
-    """The tower's merged rows for the request's patches."""
-    d = t.head_dim
-    x = ops.gather.pixels(inputs.pixels(3 * t.patch * t.patch), [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], "chw", t.temporal)
-    segments = inputs.patch_segments()
-    grid = inputs.patch_positions()
-
-    y = ops.elemwise.add_bias(t.patch_embed_bias, ops.linear.matmul(x, t.patch_embed))
-    ids, weights = ops.gather.grid_taps(grid, inputs.image_grids(), segments, "bilinear", t.grid_side)
-    pos = ops.gather.embed_weighted(ids, weights, t.pos_embed, t.positions)
-    y = ops.elemwise.residual_add(pos, y)
-
-    for b in t.blocks:
-        n = ops.elemwise.layernorm(y, b.norm1, b.norm1_bias, t.norm_eps)
-        q, k, v = ops.gather.split_qkv(ops.elemwise.add_bias(b.qkv_bias, ops.linear.matmul(n, b.qkv)), t.hidden, t.hidden)
-        q, k = ops.elemwise.rope(q, grid, d, t.theta, rotary.mrope([0, d // 4, d // 4], "blocked", d), k = k)
-        o = ops.attn.dense(q, k, v, segments, d, t.sm_scale)
-        y = ops.elemwise.residual_add(ops.elemwise.add_bias(b.proj_bias, ops.linear.matmul(o, b.proj)), y)
-
-        n = ops.elemwise.layernorm(y, b.norm2, b.norm2_bias, t.norm_eps)
-        h = ops.elemwise.add_bias(b.fc1_bias, ops.linear.matmul(n, b.fc1))
-        a = ops.linear.gelu_tanh(h)
-        y = ops.elemwise.residual_add(ops.elemwise.add_bias(b.fc2_bias, ops.linear.matmul(a, b.fc2)), y)
-
-    mg = t.merger
-    n = ops.elemwise.layernorm(y, mg.norm, mg.norm_bias, t.norm_eps)
-    folded = ops.gather.merge_rows(n, t.merge)
-    h = ops.elemwise.add_bias(mg.fc1_bias, ops.linear.matmul(folded, mg.fc1))
-    a = ops.linear.gelu_tanh(h)
-    return ops.elemwise.add_bias(mg.fc2_bias, ops.linear.matmul(a, mg.fc2))
-
-def scatter(y, towered, inputs):
-    """`y` with the tower's rows in place of its media tokens' embeddings."""
-    imaged = y.on(fact.has(fact.Media))
-    return ops.gather.scatter_live_rows(towered, inputs.patch_routes(), imaged).everywhere()
 
 def caches(m, c):
     kv = c.kv_space(m.kv)

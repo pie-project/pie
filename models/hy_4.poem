@@ -3,6 +3,8 @@
 
 load("//pie/codec.poem", "kept", "stacked_bank", read_weight = "weight")
 load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/hyper.poem", "collapse")
+load("//lib/mla.poem", "fp8_rows", "cache")
 
 HY = template("hy", thinking = True)
 
@@ -437,30 +439,6 @@ def gate(streams, mix, hy):
         hy.gate_eps,
         hy.alpha,
     )
-
-def collapse(streams, head, hy):
-    """The streams collapsed into one row through the mix `head`."""
-    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
-    mixed = ops.elemwise.hc_project(normed, head.dynamic, hy.streams)
-    return ops.elemwise.hc_collapse(mixed, streams, head.scale, head.base, hy.streams, hy.gate_eps)
-
-# An e4m3 kv deployment keeps the latent rows as vLLM's standard fp8 rows, as
-# GLM-5's does: the 512 latent and 64 rotated dims e4m3 under one scale of 1,
-# 576 bytes a position in a u8 plane, read by the tcgen05 sparse pass alone.
-# The index keys stay at bf16.
-FP8_ROW = 576
-
-def fp8_rows(m):
-    return m.kv == dtype.e4m3
-
-def cache(c, space, a, fp8 = False):
-    """`a`'s latent rows in the kv `space`."""
-    if fp8:
-        if a.kv_lora_rank != 512 or a.qk_rope_head_dim != 64:
-            fail("fp8 latent rows hold 512 latent and 64 rotated dims, and this attention's are {} and {}".format(a.kv_lora_rank, a.qk_rope_head_dim))
-        c.kv(space, a.kv, [FP8_ROW], a.qk_rope_head_dim, rows = "fp8")
-        return
-    c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
 
 def run_attention(x, inputs, positions, a, selection, prefill_only = False):
     """Latent attention of the rows `x` over the keys `a`'s indexer ranks,
