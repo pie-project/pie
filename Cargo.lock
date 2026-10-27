@@ -454,7 +454,7 @@ checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
 
 [[package]]
 name = "builtins"
-version = "0.5.4"
+version = "0.6.0"
 
 [[package]]
 name = "bumpalo"
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "chat-template"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "checkpoint"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "half",
  "libc",
@@ -788,7 +788,7 @@ checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
 name = "controller"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "builtins",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "controller-api"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "ids",
  "serde",
@@ -1736,7 +1736,7 @@ checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
 
 [[package]]
 name = "engine"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "eta-compiler",
  "pie-eta-ir",
@@ -1750,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "engine-cerebras"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "checkpoint",
@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "engine-cpu"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "engine",
  "pie-poem",
@@ -1789,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "engine-cuda"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "checkpoint",
  "cudarc",
@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "engine-metal"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "block2",
  "checkpoint",
@@ -1850,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "engine-vulkan"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "ash",
  "checkpoint",
@@ -1875,7 +1875,7 @@ dependencies = [
 
 [[package]]
 name = "engine-wgpu"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "ash",
  "checkpoint",
@@ -1901,7 +1901,7 @@ dependencies = [
 
 [[package]]
 name = "engine-xla"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "checkpoint",
@@ -2021,7 +2021,7 @@ dependencies = [
 
 [[package]]
 name = "eta-compiler"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "naga",
  "pie-eta-ir",
@@ -2030,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "eta-exec"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "eta-compiler",
  "pie-eta-ir",
@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2418,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "grammar"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "lru",
@@ -2817,7 +2817,7 @@ dependencies = [
 
 [[package]]
 name = "ids"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "serde",
 ]
@@ -2883,7 +2883,7 @@ dependencies = [
 
 [[package]]
 name = "inferlet"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "eta-compiler",
@@ -2896,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "inferlet-macros"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "quote",
  "syn 3.0.6",
@@ -3041,14 +3041,14 @@ dependencies = [
 
 [[package]]
 name = "kernels-cerebras"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "pie-dtype",
 ]
 
 [[package]]
 name = "kernels-cuda"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "cudarc",
  "kernels-ir",
@@ -3060,14 +3060,14 @@ dependencies = [
 
 [[package]]
 name = "kernels-ir"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "pie-dtype",
 ]
 
 [[package]]
 name = "kernels-metal"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "block2",
  "cc",
@@ -3079,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "kernels-rocm"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "kernels-ir",
  "libloading 0.9.0",
@@ -3091,7 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "kernels-slang"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "ash",
  "pie-dtype",
@@ -3099,7 +3099,7 @@ dependencies = [
 
 [[package]]
 name = "kernels-xla"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "pie-dtype",
  "pie-profile",
@@ -3356,7 +3356,7 @@ checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
 name = "media"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "cudarc",
  "image",
@@ -4111,7 +4111,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pie"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "builtins",
@@ -4147,7 +4147,7 @@ dependencies = [
 
 [[package]]
 name = "pie-browser"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -4173,7 +4173,7 @@ dependencies = [
 
 [[package]]
 name = "pie-c"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -4183,7 +4183,7 @@ dependencies = [
 
 [[package]]
 name = "pie-client"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4209,7 +4209,7 @@ dependencies = [
 
 [[package]]
 name = "pie-client-api"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -4219,7 +4219,7 @@ dependencies = [
 
 [[package]]
 name = "pie-dtype"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4227,7 +4227,7 @@ dependencies = [
 
 [[package]]
 name = "pie-eta-dsl"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "eta-compiler",
  "pie-eta-ir",
@@ -4235,7 +4235,7 @@ dependencies = [
 
 [[package]]
 name = "pie-eta-ir"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "pie-dtype",
  "serde",
@@ -4243,7 +4243,7 @@ dependencies = [
 
 [[package]]
 name = "pie-kotlin-core"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "jni",
@@ -4254,7 +4254,7 @@ dependencies = [
 
 [[package]]
 name = "pie-poem"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "allocative",
  "anyhow",
@@ -4269,7 +4269,7 @@ dependencies = [
 
 [[package]]
 name = "pie-poem-compiler"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "chat-template",
  "checkpoint",
@@ -4287,7 +4287,7 @@ dependencies = [
 
 [[package]]
 name = "pie-poem-exec"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "pie-poem",
  "pie-poem-compiler",
@@ -4296,7 +4296,7 @@ dependencies = [
 
 [[package]]
 name = "pie-poem-ir"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "pie-dtype",
  "pie-poem-ir-macros",
@@ -4305,7 +4305,7 @@ dependencies = [
 
 [[package]]
 name = "pie-poem-ir-macros"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4314,7 +4314,7 @@ dependencies = [
 
 [[package]]
 name = "pie-profile"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "pie-profile-macros",
  "toml",
@@ -4322,7 +4322,7 @@ dependencies = [
 
 [[package]]
 name = "pie-profile-macros"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4331,7 +4331,7 @@ dependencies = [
 
 [[package]]
 name = "pie-server-node"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -4344,7 +4344,7 @@ dependencies = [
 
 [[package]]
 name = "pie-server-py"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "pyo3",
  "toml",
@@ -4430,7 +4430,7 @@ dependencies = [
 
 [[package]]
 name = "policy"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "wit-bindgen 0.62.0",
 ]
@@ -5065,7 +5065,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5890,7 +5890,7 @@ dependencies = [
 
 [[package]]
 name = "state"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "serde",
@@ -6204,7 +6204,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokenizer"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -6620,7 +6620,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "bindgen",
  "bytes",
@@ -6762,7 +6762,7 @@ checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
 
 [[package]]
 name = "units"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "serde",
 ]
@@ -6823,7 +6823,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waker"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "loom",
  "tokio",
@@ -7418,7 +7418,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-web"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "cranelift-codegen",
  "getrandom 0.3.4",
@@ -7450,7 +7450,7 @@ dependencies = [
 
 [[package]]
 name = "web-std"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "slab",
  "wasmtime-internal-fiber 48.0.1",
@@ -8127,7 +8127,7 @@ dependencies = [
 
 [[package]]
 name = "worker"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -8168,7 +8168,7 @@ dependencies = [
 
 [[package]]
 name = "worker-api"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "controller-api",
  "futures",

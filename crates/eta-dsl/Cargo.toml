@@ -19,7 +19,7 @@ default = ["std"]
 std = ["eta-ir/std"]
 
 [dependencies]
-eta-ir = { package = "pie-eta-ir", version = "0.5.2", path = "../eta-ir", default-features = false }
+eta-ir = { package = "pie-eta-ir", version = "0.6.0", path = "../eta-ir", default-features = false }
 
 [dev-dependencies]
 eta-compiler = { path = "../eta-compiler" }

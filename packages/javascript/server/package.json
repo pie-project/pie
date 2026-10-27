@@ -1,6 +1,6 @@
 {
   "name": "@pie-project/server",
-  "version": "0.5.4",
+  "version": "0.6.0",
   "description": "What `pie serve` boots, inside your process: on the native GPU engines under Node.js, on WebGPU under a bundler for the browser.",
   "type": "module",
   "main": "index.mjs",
@@ -39,8 +39,8 @@
     "win32"
   ],
   "dependencies": {
-    "@pie-project/client": "^0.5.0",
-    "@pie-project/server-web": "0.5.4",
+    "@pie-project/client": "^0.6.0",
+    "@pie-project/server-web": "0.6.0",
     "ws": "^8.22.0"
   },
   "license": "Apache-2.0",
