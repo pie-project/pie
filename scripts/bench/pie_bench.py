@@ -579,6 +579,7 @@ async def cli_pie_client(args: argparse.Namespace):
 
     cfg, engine_config = build_config(args)
     cfg.server.port = find_free_port()
+    cfg.server.listen = f"127.0.0.1:{cfg.server.port}"  # the port the client below dials
     cfg_path = ROOT / ".tmp" / "benches" / f"pie-{args.engine}-{cfg.server.port}.toml"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(cfg.to_toml())
