@@ -45,6 +45,76 @@ pub fn sink(
     })
 }
 
+/// Each row's replay floor into `floor`; with `mark` each lane's state
+/// takes it too.
+pub fn replay_floor(
+    ctx: &Ctx<'_>,
+    positions: crate::handle::RaggedTensor,
+    state: crate::handle::RecurrentPool,
+    mark: bool,
+    floor: Tensor,
+) -> Result<(), Error> {
+    lower(ctx, |l| {
+        let pos = l.ragged(positions)?;
+        let slab = l.read(state.state)?;
+        let slots = l.read(state.slots)?;
+        let (v, next) =
+            kernels_xla::attn::replay::floor(l.f(), pos, slab, slots, mark, floor.landing())?;
+        l.land(floor, v)?;
+        match next {
+            Some(next) => l.land(state.state, next),
+            None => Ok(()),
+        }
+    })
+}
+
+/// Each row's lane's last key position in `pool` into `ends`.
+pub fn kv_ends(
+    ctx: &Ctx<'_>,
+    request_of_token: Tensor,
+    pool: &KvPool,
+    last_page_len: Tensor,
+    ends: Tensor,
+) -> Result<(), Error> {
+    lower(ctx, |l| {
+        let req = l.read(request_of_token)?;
+        let ip = l.read(pool.page_indptr)?;
+        let lp = l.read(last_page_len)?;
+        let v =
+            kernels_xla::attn::replay::kv_ends(l.f(), req, ip, lp, pool.page_size, ends.landing())?;
+        l.land(ends, v)
+    })
+}
+
+/// DeepSeek's window with its sinks: each row reads the `window` keys of
+/// `pool` that end at `positions`, `lse` its scratch.
+pub fn window_sink(
+    ctx: &Ctx<'_>,
+    q: Tensor,
+    positions: Tensor,
+    request_of_token: Tensor,
+    pool: KvPool,
+    sinks: Tensor,
+    window: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    o: Tensor,
+    lse: Tensor,
+) -> Result<(), Error> {
+    let call = paged::window_sink(
+        q,
+        positions,
+        request_of_token,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        lse,
+    )?;
+    attend(ctx, call, pool)?;
+    sink(ctx, o, lse, sinks, head_dim)
+}
+
 /// Caps `x`'s logits, in place.
 pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), Error> {
     lower(ctx, |l| {

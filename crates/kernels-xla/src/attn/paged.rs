@@ -1940,6 +1940,42 @@ pub fn decode_lse<T: Stored>(
     Ok(call)
 }
 
+/// DeepSeek's window over a shared key/value plane (`attn.window_sink`,
+/// before its sinks fold in): each row reads the `window` positions of its
+/// request's keys that end at `positions` (not necessarily its own row's),
+/// its `lse` landed for the sinks.
+pub fn window_sink<T: Stored>(
+    q: T,
+    positions: T,
+    request_of_token: T,
+    window: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    o: T,
+    lse: T,
+) -> Result<Paged<T>, Error> {
+    let tables = Tables {
+        positions,
+        request_of_token,
+        mask: positions,
+        mask_enabled: positions,
+        mask_stride: 0,
+    };
+    let mut call = plain(
+        "attn.window_sink",
+        q,
+        tables,
+        Some(window),
+        head_dim,
+        sm_scale,
+        o,
+        Some(lse),
+        Walk::PerRow,
+    );
+    call.masked = false;
+    Ok(call)
+}
+
 pub fn prefill<T: Stored>(
     q: RaggedTensor<T>,
     plan: &PrefillPlan<T>,
