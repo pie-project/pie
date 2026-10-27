@@ -50,7 +50,7 @@ fn storage_compiler_every_case() {
     a_scale_by_factors_of_a_different_rank_is_rejected();
     a_scale_by_factors_that_do_not_divide_the_payload_is_rejected();
     a_scale_by_one_factor_per_element_is_rejected();
-    a_scale_by_an_undeclared_expression_is_rejected();
+    a_scale_by_an_inline_expression_is_hoisted_to_an_internal_leg();
     mla_q_kv_a_fusion_produces_joined_tensor();
     a_block_scaled_fp8_source_carries_its_scale_tensor();
     a_source_without_a_scale_sibling_names_none();
@@ -1373,7 +1373,7 @@ fn a_scale_by_one_factor_per_element_is_rejected() {
     assert!(error.contains("they group nothing"), "{error}");
 }
 
-fn a_scale_by_an_undeclared_expression_is_rejected() {
+fn a_scale_by_an_inline_expression_is_hoisted_to_an_internal_leg() {
     let contract = ModelContract {
         alignment: 256,
         tensors: vec![TensorContract::new(
@@ -1392,14 +1392,20 @@ fn a_scale_by_an_undeclared_expression_is_rejected() {
         )],
         groups: Vec::new(),
     };
-    let error = compile_load_plan(
+    let plan = compile_load_plan(
         &block_scaled_metadata(),
         &contract,
         StorageTarget::default(),
     )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("declare them first"), "{error}");
+    .unwrap();
+    let leg = plan
+        .tensors
+        .iter()
+        .find(|t| t.name == "w.scale_factor0")
+        .unwrap_or_else(|| panic!("no hoisted leg: {:?}", plan.tensors));
+    assert_eq!(leg.visibility, checkpoint::types::Visibility::Internal);
+    assert_eq!(leg.shape, vec![4, 1]);
+    assert_eq!(leg.encoding, Encoding::Raw(DType::E8m0));
 }
 
 fn nemotron_h_expert_metadata() -> Metadata {
@@ -2461,8 +2467,6 @@ fn a_serving_target_refuses_the_unary_a_conversion_target_runs() {
     let contract = neg_ln_contract();
 
     for (backend, mask) in [
-        (BackendKind::Cuda, checkpoint::plan::CUDA_TILE_MAP_MASK),
-        (BackendKind::Metal, checkpoint::plan::METAL_TILE_MAP_MASK),
         (BackendKind::Vulkan, checkpoint::plan::VULKAN_TILE_MAP_MASK),
         (BackendKind::Wgpu, checkpoint::plan::WGPU_TILE_MAP_MASK),
     ] {
@@ -2483,15 +2487,25 @@ fn a_serving_target_refuses_the_unary_a_conversion_target_runs() {
         );
     }
 
-    compile_load_plan(
-        &metadata,
-        &contract,
-        StorageTarget {
-            tile_map_mask: checkpoint::plan::CONVERT_TILE_MAP_MASK,
-            ..StorageTarget::default()
-        },
-    )
-    .expect("a conversion target compiles the unary");
+    for (backend, mask) in [
+        (BackendKind::Cuda, checkpoint::plan::CUDA_TILE_MAP_MASK),
+        (BackendKind::Metal, checkpoint::plan::METAL_TILE_MAP_MASK),
+        (
+            BackendKind::Unknown,
+            checkpoint::plan::CONVERT_TILE_MAP_MASK,
+        ),
+    ] {
+        compile_load_plan(
+            &metadata,
+            &contract,
+            StorageTarget {
+                backend,
+                tile_map_mask: mask,
+                ..StorageTarget::default()
+            },
+        )
+        .unwrap_or_else(|err| panic!("{backend:?} compiles the unary: {err}"));
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

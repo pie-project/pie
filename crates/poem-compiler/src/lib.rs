@@ -408,7 +408,7 @@ pub fn fit_voxels(
 ) -> Budgets {
     let Some(ladder) = budgets
         .voxels
-        .take()
+        .clone()
         .filter(|ladder| ladder.max_voxels == 0)
     else {
         return budgets;

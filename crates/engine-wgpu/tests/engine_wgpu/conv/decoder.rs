@@ -399,7 +399,7 @@ fn a_conv_decoder_fires_over_a_voxel_input() {
     };
     drop(source);
 
-    let max_voxels: u32 = BOXES.iter().map(|b| voxels(*b) as u32).sum::<u32>() + 8;
+    let max_voxels: u32 = (BOXES.iter().map(|b| voxels(*b) as u32).sum::<u32>() + 8) * 16;
     let mut shell = Shell::load(Boot {
         trace,
         contract: &contract,

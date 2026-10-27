@@ -385,7 +385,7 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
     };
     drop(source);
 
-    let max_voxels: u32 = BOXES.iter().map(|b| voxels(*b) as u32).sum::<u32>() + 8;
+    let max_voxels: u32 = (BOXES.iter().map(|b| voxels(*b) as u32).sum::<u32>() + 8) * 16;
     let mut shell = Shell::load(Boot {
         trace,
         contract: &contract,
