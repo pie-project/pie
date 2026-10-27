@@ -561,6 +561,15 @@ impl Ctx {
         if fire.launch.empty() {
             return Err(refuse(op, "the grid is empty"));
         }
+        {
+            static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+                std::sync::Mutex::new(None);
+            let key = format!("{op} {}", fire.kernel.name);
+            let mut seen = SEEN.lock().expect("seen lock poisoned");
+            if seen.get_or_insert_with(Default::default).insert(key.clone()) {
+                eprintln!("fire-once: {key}");
+            }
+        }
         if trace_fires() {
             let now = std::time::Instant::now();
             let gap = {
