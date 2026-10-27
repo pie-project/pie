@@ -190,6 +190,7 @@ fn the_conditioning_ops_answer_their_host_reference_every_case() {
     the_head_gate_scales_by_one_logit_a_head();
     a_pack_and_its_unpack_round_trip_the_rectangle();
     the_residual_blend_scores_normalized_and_blends_raw();
+    the_muse_spark_norms_answer_the_cuda_formula();
 }
 
 fn the_pointwise_arms_answer_the_reference_at_both_elements() {
@@ -934,4 +935,110 @@ fn the_residual_blend_scores_normalized_and_blends_raw() {
             got[at]
         );
     }
+}
+
+fn the_muse_spark_norms_answer_the_cuda_formula() {
+    let Some(rig) = Rig::open() else {
+        eprintln!("not asked: no Metal device");
+        return;
+    };
+    let rms = |v: &[f32], eps: f32| {
+        1.0 / (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32 + eps).sqrt()
+    };
+    // The scaleless gated norm over bf16 rows, a sigmoid gate.
+    const HD: u32 = 64;
+    let width = 4 * HD;
+    let n = (ROWS * width) as usize;
+    let x: Vec<f32> = (0..n as u64)
+        .map(|at| bf16_round(unit(at ^ 0x5151)))
+        .collect();
+    let g: Vec<f32> = (0..n as u64)
+        .map(|at| bf16_round(3.0 * unit(at ^ 0x5252)))
+        .collect();
+    let (_xb, hx) = rig.plane(&x, Dtype::Bf16);
+    let (_gb, hg) = rig.plane(&g, Dtype::Bf16);
+    let (_yb, hy) = rig.empty(n, Dtype::Bf16);
+    rig.fire(|s| {
+        let t = |h| Tensor::new(h, ROWS, width, Dtype::Bf16);
+        norm::rmsnorm_gated(s, t(hx), t(hg), None, HD, 1e-5, true, t(hy)).expect("the launch")
+    });
+    let mut want = Vec::with_capacity(n);
+    for head in x.chunks(HD as usize).zip(g.chunks(HD as usize)) {
+        let inv = rms(head.0, 1e-5);
+        for (xv, gv) in head.0.iter().zip(head.1) {
+            want.push(bf16_round(xv * inv / (1.0 + (-gv).exp())));
+        }
+    }
+    within_a_bf16_ulp(
+        "rmsnorm_gated unscaled",
+        &want,
+        &rig.read(hy, n, Dtype::Bf16),
+    );
+
+    // The post-norm gate under a scale and a residual, with the next norm.
+    let width = 512u32;
+    let n = (ROWS * width) as usize;
+    let w = width as usize;
+    let x: Vec<f32> = (0..n as u64)
+        .map(|at| bf16_round(4.0 * unit(at ^ 0x6161)))
+        .collect();
+    let scale: Vec<f32> = (0..w as u64)
+        .map(|at| bf16_round(1.0 + 0.5 * unit(at ^ 0x6262)))
+        .collect();
+    let res: Vec<f32> = (0..n as u64)
+        .map(|at| bf16_round(unit(at ^ 0x6363)))
+        .collect();
+    let gate: Vec<f32> = (0..w as u64).map(|at| 2.0 * unit(at ^ 0x6464)).collect();
+    let next_w: Vec<f32> = (0..w as u64)
+        .map(|at| bf16_round(0.3 * unit(at ^ 0x6565)))
+        .collect();
+    let (temperature, eps, next_eps) = (0.3f32, 1e-8f32, 1e-5f32);
+    let (_a, hx) = rig.plane(&x, Dtype::Bf16);
+    let (_b, hs) = rig.plane(&scale, Dtype::Bf16);
+    let (_c, hr) = rig.plane(&res, Dtype::Bf16);
+    let (_d, hg) = rig.plane(&gate, Dtype::F32);
+    let (_e, hw) = rig.plane(&next_w, Dtype::Bf16);
+    let (_f, hy) = rig.empty(n, Dtype::Bf16);
+    let (_h, hz) = rig.empty(n, Dtype::Bf16);
+    rig.fire(|s| {
+        let t = |h, rows, dtype| Tensor::new(h, rows, width, dtype);
+        norm::norm_gate(
+            s,
+            t(hx, ROWS, Dtype::Bf16),
+            Some(t(hs, 1, Dtype::Bf16)),
+            Some(t(hr, ROWS, Dtype::Bf16)),
+            Some(t(hg, 1, Dtype::F32)),
+            eps,
+            temperature,
+            Some(norm::Next {
+                weight: t(hw, 1, Dtype::Bf16),
+                eps: next_eps,
+                plus_one: true,
+                y: t(hz, ROWS, Dtype::Bf16),
+            }),
+            t(hy, ROWS, Dtype::Bf16),
+        )
+        .expect("the launch")
+    });
+    let (mut want_y, mut want_z) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for row in 0..ROWS as usize {
+        let u: Vec<f32> = (0..w)
+            .map(|i| bf16_round(x[row * w + i] * scale[i]))
+            .collect();
+        let inv = rms(&u, eps);
+        let y: Vec<f32> = (0..w)
+            .map(|i| {
+                let nv = bf16_round(u[i] * inv);
+                let wv = gate[i] / temperature;
+                let beta = 1.0 / (1.0 + (-wv).exp());
+                let alpha = ((1.0 / (1.0 + wv.exp())) * (1.0 + beta)).max(1e-3).sqrt();
+                bf16_round(alpha * res[row * w + i] + beta * nv)
+            })
+            .collect();
+        let inv = rms(&y, next_eps);
+        want_z.extend((0..w).map(|i| bf16_round(y[i] * inv * (1.0 + next_w[i]))));
+        want_y.extend(y);
+    }
+    within_a_bf16_ulp("norm_gate y", &want_y, &rig.read(hy, n, Dtype::Bf16));
+    within_a_bf16_ulp("norm_gate next", &want_z, &rig.read(hz, n, Dtype::Bf16));
 }
