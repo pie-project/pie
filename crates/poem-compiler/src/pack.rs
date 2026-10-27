@@ -265,7 +265,10 @@ fn subgroups(
     let mut out = Vec::new();
     // The legs `vs` are, if each is a leg not yet taken, once.
     let take = |left: &BTreeSet<usize>, vs: &[ValueId]| -> Option<Vec<usize>> {
-        let legs: Vec<usize> = vs.iter().map(|v| index.get(v).copied()).collect::<Option<_>>()?;
+        let legs: Vec<usize> = vs
+            .iter()
+            .map(|v| index.get(v).copied())
+            .collect::<Option<_>>()?;
         let distinct: BTreeSet<usize> = legs.iter().copied().collect();
         (legs.len() >= 2 && distinct.len() == legs.len() && legs.iter().all(|i| left.contains(i)))
             .then_some(legs)
@@ -503,9 +506,9 @@ fn groups(trace: &Trace, shape: &[Param]) -> Vec<Group> {
                 ),
                 _ => None,
             };
-            let bias_name = biases.as_ref().map_or_else(String::new, |b| {
-                bias_name_of(trace, &name, &names, b)
-            });
+            let bias_name = biases
+                .as_ref()
+                .map_or_else(String::new, |b| bias_name_of(trace, &name, &names, b));
             out.push(Group {
                 name,
                 biases,
@@ -555,14 +558,8 @@ fn groups(trace: &Trace, shape: &[Param]) -> Vec<Group> {
             .iter()
             .map(|p| trace.params[*p as usize].shape[0])
             .collect();
-        let single: Vec<bool> = all_params
-            .iter()
-            .map(|p| leg(cut_as(*p)))
-            .collect();
-        let heads: Vec<bool> = all_params
-            .iter()
-            .map(|p| headed(cut_as(*p)))
-            .collect();
+        let single: Vec<bool> = all_params.iter().map(|p| leg(cut_as(*p))).collect();
+        let heads: Vec<bool> = all_params.iter().map(|p| headed(cut_as(*p))).collect();
         for (legs, form) in subgroups(trace, &read, &ys, &single, &heads, &all_widths) {
             let params: Vec<u32> = legs.iter().map(|i| all_params[*i]).collect();
             let widths: Vec<u64> = legs.iter().map(|i| all_widths[*i]).collect();
@@ -578,9 +575,9 @@ fn groups(trace: &Trace, shape: &[Param]) -> Vec<Group> {
                 .map(|p| planes_of(trace, &trace.params[*p as usize].name))
                 .collect();
             let name = Join::name_of(&names);
-            let bias_name = biases.as_ref().map_or_else(String::new, |b| {
-                bias_name_of(trace, &name, &names, b)
-            });
+            let bias_name = biases
+                .as_ref()
+                .map_or_else(String::new, |b| bias_name_of(trace, &name, &names, b));
             out.push(Group {
                 axis: 0,
                 biases,
@@ -682,9 +679,8 @@ fn joined(name: String, legs: &[&Param], axis: usize, rank: usize, rows: &[u64])
     let first = legs[0];
     let Shard::Cut { .. } = first.shard else {
         let mut shape = first.shape.clone();
-        let along = |leg: &Param, i: usize| {
-            leg.shape.len() == rank || leg.shape.get(axis) == rows.get(i)
-        };
+        let along =
+            |leg: &Param, i: usize| leg.shape.len() == rank || leg.shape.get(axis) == rows.get(i);
         if legs.iter().enumerate().all(|(i, leg)| along(leg, i)) && shape.len() > axis {
             shape[axis] = legs.iter().map(|leg| leg.shape[axis]).sum();
         }
@@ -916,7 +912,9 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
             _ => None,
         };
         match &mut trace.nodes[first].op {
-            Operation::Linear(Linear::Matmul { w, scales, y: out, .. }) => {
+            Operation::Linear(Linear::Matmul {
+                w, scales, y: out, ..
+            }) => {
                 (*w, *scales, *out) = (legs[0].0, legs[0].1, y);
             }
             Operation::Linear(Linear::MoeSelect {

@@ -42,10 +42,7 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
         readings(MINI).iter().all(|r| r != "vae.decode"),
         "the miniature's checkpoint carries no VAE"
     );
-    for (deployment, want) in [
-        (FLAGSHIP, vec!["latents"]),
-        (MINI, vec!["latents"]),
-    ] {
+    for (deployment, want) in [(FLAGSHIP, vec!["latents"]), (MINI, vec!["latents"])] {
         let plan = trace(deployment);
         let voxels: BTreeSet<&str> = plan
             .values

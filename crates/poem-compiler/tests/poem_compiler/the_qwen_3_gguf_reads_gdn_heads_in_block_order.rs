@@ -26,13 +26,22 @@ fn in_ba_concatenates_beta_first() {
     let log = reads(&scratch.0, "qwen35-tiny", Dtype::Bf16, &[arch("qwen35")]);
     assert!(read_of(&log, "layers.0.gdn.in_b").contains("blk.0.ssm_beta.weight"));
     assert!(read_of(&log, "layers.0.gdn.in_a").contains("blk.0.ssm_alpha.weight"));
-    let trace = poem_compiler::catalog::trace_of("qwen35-tiny", Dtype::Bf16, Dtype::Bf16, poem::Platform::Metal);
+    let trace = poem_compiler::catalog::trace_of(
+        "qwen35-tiny",
+        Dtype::Bf16,
+        Dtype::Bf16,
+        poem::Platform::Metal,
+    );
     let joins = poem_compiler::catalog::lowering_of(&trace, 1).joins;
     let ba = joins
         .iter()
         .find(|j| j.name == "layers.0.gdn.in_ba")
         .expect("the compiler joins beta and alpha");
-    assert_eq!(ba.legs, ["layers.0.gdn.in_b", "layers.0.gdn.in_a"], "beta first");
+    assert_eq!(
+        ba.legs,
+        ["layers.0.gdn.in_b", "layers.0.gdn.in_a"],
+        "beta first"
+    );
 }
 
 #[test]

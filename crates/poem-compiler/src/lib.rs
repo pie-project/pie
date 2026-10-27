@@ -397,6 +397,34 @@ pub fn collectives_are_never_elided(compiled: &CompiledModel) -> bool {
         .all(|r| !r.collective || r.lowering == Lowering::AlwaysLaunch)
 }
 
+/// `budgets` with a voxel ceiling left to the load (`max_voxels` 0) fitted
+/// to `room`: the most rows of the widest voxel value whose arena it holds.
+#[must_use]
+pub fn fit_voxels(
+    trace: &Trace,
+    mut budgets: Budgets,
+    profile: &DeviceProfile,
+    room: u64,
+) -> Budgets {
+    let Some(ladder) = budgets
+        .voxels
+        .take()
+        .filter(|ladder| ladder.max_voxels == 0)
+    else {
+        return budgets;
+    };
+    let floor = ladder.max_clips;
+    let fitted = voxels_within(room, floor, |rows| {
+        let at = Budgets {
+            voxels: Some(ladder.clone().at(rows)),
+            ..budgets.clone()
+        };
+        compile_axes(trace, &at, profile).map_or(u64::MAX, |compiled| compiled.arena.bytes)
+    });
+    budgets.voxels = Some(ladder.at(fitted));
+    budgets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,32 +520,4 @@ mod tests {
             Err(Error::TooManyFacts { facts: 21 }),
         );
     }
-}
-
-/// `budgets` with a voxel ceiling left to the load (`max_voxels` 0) fitted
-/// to `room`: the most rows of the widest voxel value whose arena it holds.
-#[must_use]
-pub fn fit_voxels(
-    trace: &Trace,
-    mut budgets: Budgets,
-    profile: &DeviceProfile,
-    room: u64,
-) -> Budgets {
-    let Some(ladder) = budgets
-        .voxels
-        .take()
-        .filter(|ladder| ladder.max_voxels == 0)
-    else {
-        return budgets;
-    };
-    let floor = ladder.max_clips;
-    let fitted = voxels_within(room, floor, |rows| {
-        let at = Budgets {
-            voxels: Some(ladder.clone().at(rows)),
-            ..budgets.clone()
-        };
-        compile_axes(trace, &at, profile).map_or(u64::MAX, |compiled| compiled.arena.bytes)
-    });
-    budgets.voxels = Some(ladder.at(fitted));
-    budgets
 }

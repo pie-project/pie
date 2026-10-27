@@ -27,12 +27,15 @@ use kernels_cuda::linear::skeleton::Epilogue;
 #[cfg(not(feature = "rocm"))]
 use kernels_cuda::synth::{In, Out, Synthesized};
 
+#[cfg(not(feature = "rocm"))]
+type Variants = Vec<(Vec<In>, Synthesized)>;
+
 /// Each generated kernel of a load, by body hash and width, and by how
 /// its parameters are stored.
 #[derive(Debug, Default)]
 pub struct Regions {
     #[cfg(not(feature = "rocm"))]
-    kernels: BTreeMap<(u64, u32), Vec<(Vec<In>, Synthesized)>>,
+    kernels: BTreeMap<(u64, u32), Variants>,
     /// Each anchored region's epilogue, by the region's key.
     #[cfg(not(feature = "rocm"))]
     anchors: BTreeMap<u64, &'static Epilogue>,
@@ -227,7 +230,7 @@ impl Regions {
                     "the op states rows {width} wide and its region's are not"
                 )));
             }
-            let held: &mut Vec<(Vec<In>, Synthesized)> = kernels.entry((body, width)).or_default();
+            let held: &mut Variants = kernels.entry((body, width)).or_default();
             if !held.iter().any(|(stored, _)| *stored == forms) {
                 let kernel = kernels_cuda::synth::synth(region, &forms, outs.len())?;
                 kernel.load()?;

@@ -760,6 +760,7 @@ impl Shell {
         self.programs.register(&self.device, registration)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_program(
         &mut self,
         program_id: engine::ProgramId,

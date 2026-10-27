@@ -991,7 +991,7 @@ mod tests {
             readout: true,
         };
         let bound = eta_ir::validate::bind(container, vec![vec![logits]], EngineCaps::default())
-        .expect("the decode binds");
+            .expect("the decode binds");
         let mut known = |channel: u32| {
             Some(match channel {
                 0 => Value::I32(vec![7]),
@@ -1001,9 +1001,12 @@ mod tests {
             })
         };
         let device = PortMask::of(&[Port::EmbedTokens, Port::Positions]);
-        let (geometry, _) = map_geometry_evaluated_with(&bound, &mut known, device)
-            .expect("the geometry maps");
-        assert_eq!(geometry.positions, None, "the device's positions are not the lane's");
+        let (geometry, _) =
+            map_geometry_evaluated_with(&bound, &mut known, device).expect("the geometry maps");
+        assert_eq!(
+            geometry.positions, None,
+            "the device's positions are not the lane's"
+        );
         let (geometry, _) =
             map_geometry_evaluated_with(&bound, &mut known, PortMask::of(&[Port::EmbedTokens]))
                 .expect("the geometry maps");

@@ -2795,7 +2795,7 @@ pub mod pool {
     pub(crate) fn pitch(op: &'static str, pool: &KvPool, row: u32) -> Result<i32, Error> {
         let pitch = pool.seq_stride;
         let row = u64::from(row);
-        let div = if pitch == 0 { 0 } else { row / pitch };
+        let div = row.checked_div(pitch).unwrap_or(0);
         if pitch == 0
             || row % pitch != 0
             || div == 0
