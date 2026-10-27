@@ -166,6 +166,10 @@ class Config:
             if key in engine:
                 raise ValueError(f"engine option {key!r} collides with a common [engine] key")
             engine[key] = value
+        if "max_model_len" not in engine:
+            env_mml = os.environ.get("PIE_MAX_MODEL_LEN", "4096")
+            if env_mml:
+                engine["max_model_len"] = int(env_mml)
 
         cluster: dict = {}
         if self.cluster.cluster_policies:
