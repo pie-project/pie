@@ -53,10 +53,6 @@ impl Instant {
         Duration::from_nanos(self.0.saturating_sub(earlier.0))
     }
 
-    pub fn checked_duration_since(&self, earlier: Instant) -> Option<Duration> {
-        self.0.checked_sub(earlier.0).map(Duration::from_nanos)
-    }
-
     pub fn checked_add(&self, duration: Duration) -> Option<Instant> {
         u64::try_from(duration.as_nanos())
             .ok()

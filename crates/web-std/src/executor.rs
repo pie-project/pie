@@ -82,15 +82,6 @@ impl std::fmt::Display for JoinError {
 
 impl std::error::Error for JoinError {}
 
-impl JoinError {
-    pub fn is_panic(&self) -> bool {
-        false
-    }
-    pub fn is_cancelled(&self) -> bool {
-        true
-    }
-}
-
 struct JoinState<T> {
     result: Option<T>,
     waker: Option<Waker>,
@@ -258,8 +249,4 @@ pub fn tick(budget: usize) -> Option<Duration> {
         return Some(Duration::ZERO);
     }
     crate::time::next_deadline()
-}
-
-pub fn task_count() -> usize {
-    EXECUTOR.with(|e| e.borrow().slots.len())
 }
