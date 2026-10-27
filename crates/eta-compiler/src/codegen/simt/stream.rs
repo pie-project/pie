@@ -73,8 +73,7 @@ impl<'a> Streams<'a> {
                 }
             }
         }
-        let order = emission_order(ops, bases, region);
-        Self {
+        let mut streams = Self {
             stage,
             region,
             ops,
@@ -85,15 +84,18 @@ impl<'a> Streams<'a> {
             readers,
             producers,
             direct_topk,
-            order,
-        }
+            order: Vec::new(),
+        };
+        streams.order = streams.emission_order();
+        streams
     }
 
     fn rematerializable(&self, value: u32) -> bool {
-        self.remat_depth(value, 0)
+        let root_readers = self.readers.get(value as usize).map_or(0, Vec::len);
+        self.remat_depth(value, 0, root_readers)
     }
 
-    fn remat_depth(&self, value: u32, depth: u32) -> bool {
+    fn remat_depth(&self, value: u32, depth: u32, root_readers: usize) -> bool {
         if depth > 4 {
             return false;
         }
@@ -120,10 +122,12 @@ impl<'a> Streams<'a> {
             return matches!(self.role(node, &mut None), Some(Role::Intrinsic));
         }
         match self.role(node, &mut None) {
-            Some(Role::Rng) => self.readers[value as usize].len() <= 1,
+            Some(Role::Rng) => root_readers <= 1 && self.readers[value as usize].len() <= 1,
             Some(Role::Map | Role::Broadcast) => {
                 (depth == 0 || self.readers[value as usize].len() <= 1)
-                    && op.args.iter().all(|&a| self.remat_depth(a, depth + 1))
+                    && op
+                        .reads()
+                        .all(|a| self.remat_depth(a, depth + 1, root_readers))
             }
             _ => false,
         }
@@ -352,6 +356,24 @@ impl<'a> Streams<'a> {
                     Role::Reduce
                 })
             }
+            tags::PIVOT_THRESHOLD => {
+                if op.pred_tag != eta_ir::wire::predicate_tags::PROB_GE
+                    || op.args.len() != 1
+                    || out_dtype != Dtype::Bool
+                    || !scalar_dtypes(&[op.args[0], op.pred_payload])
+                {
+                    return None;
+                }
+                let mut w = *width;
+                if !full(out, &mut w)
+                    || !full(op.args[0], &mut w)
+                    || !indexed(op.pred_payload, &mut w)
+                {
+                    return None;
+                }
+                *width = w;
+                Some(Role::Map)
+            }
             _ => None,
         }
     }
@@ -400,65 +422,88 @@ impl<'a> Streams<'a> {
         }
         self.region.outputs.contains(&value) && outside.is_empty()
     }
-}
 
-fn emission_order(ops: &[OpView], bases: &[u32], region: &Region) -> Vec<usize> {
-    use eta_ir::op::tags;
-    let nodes: Vec<usize> = region.nodes.iter().map(|n| n.index()).collect();
-    let count = nodes.len();
-    let producer = |value: u32| -> Option<usize> {
-        nodes.iter().position(|&n| {
-            let base = bases[n];
-            value >= base && value < base + ops[n].results
-        })
-    };
-    let reduction = |tag: u8| {
-        matches!(
-            tag,
-            tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN | tags::REDUCE_ARGMAX
-        )
-    };
-    let channel = |tag: u8| matches!(tag, tags::CHAN_TAKE | tags::CHAN_READ | tags::CHAN_PUT);
-    let kind = |tag: u8| -> u32 {
-        match tag {
-            tags::CHAN_TAKE | tags::CHAN_READ => 0,
-            tags::CONST | tags::RESHAPE => 1,
-            tags::GATHER_ROW => 3,
-            tags::CHAN_PUT => 4,
-            _ => 2,
-        }
-    };
-    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); count];
-    let mut depth = vec![0u32; count];
-    let mut last_channel: Option<usize> = None;
-    for i in 0..count {
-        let op = &ops[nodes[i]];
-        for arg in op.reads() {
-            if let Some(p) = producer(arg) {
-                deps[i].push(p);
-                depth[i] = depth[i].max(depth[p] + u32::from(reduction(ops[nodes[p]].tag)));
-            }
-        }
-        if channel(op.tag) {
-            if let Some(previous) = last_channel {
-                deps[i].push(previous);
-            }
-            last_channel = Some(i);
-        }
-    }
-    let mut placed = vec![false; count];
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        let next = (0..count)
-            .filter(|&i| !placed[i] && deps[i].iter().all(|&d| placed[d]))
-            .min_by_key(|&i| (depth[i], kind(ops[nodes[i]].tag), i));
-        let Some(i) = next else {
-            return nodes;
+    fn emission_order(&self) -> Vec<usize> {
+        use eta_ir::op::tags;
+        let ops = self.ops;
+        let bases = self.bases;
+        let region = self.region;
+        let nodes: Vec<usize> = region.nodes.iter().map(|n| n.index()).collect();
+        let count = nodes.len();
+        let producer = |value: u32| -> Option<usize> {
+            nodes.iter().position(|&n| {
+                let base = bases[n];
+                value >= base && value < base + ops[n].results
+            })
         };
-        placed[i] = true;
-        out.push(nodes[i]);
+        let reduction = |tag: u8| {
+            matches!(
+                tag,
+                tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN | tags::REDUCE_ARGMAX
+            )
+        };
+        let channel = |tag: u8| matches!(tag, tags::CHAN_TAKE | tags::CHAN_READ | tags::CHAN_PUT);
+        let kind = |tag: u8| -> u32 {
+            match tag {
+                tags::CHAN_TAKE | tags::CHAN_READ => 0,
+                tags::CONST | tags::RESHAPE => 1,
+                tags::GATHER_ROW => 3,
+                tags::CHAN_PUT => 4,
+                _ => 2,
+            }
+        };
+        let mut deps: Vec<Vec<usize>> = vec![Vec::new(); count];
+        let mut depth = vec![0u32; count];
+        let mut last_channel: Option<usize> = None;
+        for i in 0..count {
+            let op = &ops[nodes[i]];
+            for arg in op.reads() {
+                if let Some(p) = producer(arg) {
+                    deps[i].push(p);
+                    depth[i] = depth[i].max(depth[p] + u32::from(reduction(ops[nodes[p]].tag)));
+                }
+            }
+            if channel(op.tag) {
+                if let Some(previous) = last_channel {
+                    deps[i].push(previous);
+                }
+                last_channel = Some(i);
+            }
+        }
+        for i in (0..count).rev() {
+            let node = nodes[i];
+            let value = bases[node];
+            if !matches!(
+                self.role(node, &mut None),
+                Some(Role::Map | Role::Broadcast | Role::Rng)
+            ) {
+                continue;
+            }
+            if region.outputs.contains(&value) || region.sinks.iter().any(|s| s.value == value) {
+                continue;
+            }
+            let min_consumer = (0..count)
+                .filter(|&c| deps[c].contains(&i))
+                .map(|c| depth[c])
+                .min();
+            if let Some(d) = min_consumer {
+                depth[i] = depth[i].max(d);
+            }
+        }
+        let mut placed = vec![false; count];
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let next = (0..count)
+                .filter(|&i| !placed[i] && deps[i].iter().all(|&d| placed[d]))
+                .min_by_key(|&i| (depth[i], kind(ops[nodes[i]].tag), i));
+            let Some(i) = next else {
+                return nodes;
+            };
+            placed[i] = true;
+            out.push(nodes[i]);
+        }
+        out
     }
-    out
 }
 
 fn c_type(dtype: Dtype) -> &'static str {
@@ -677,12 +722,16 @@ fn rng_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<'_>) {
         pass.body.both(&format!(
             "      const float r{out} = ptir_rng_hash_normal(seed{node}, i + p{node}.imm3);"
         ));
+    } else if op.kind == eta_ir::types::RngKind::Uniform as u8 {
+        pass.body.both(&format!(
+            "      const float r{out} = ptir_rng_hash_uniform(seed{node}, i + p{node}.imm3);"
+        ));
     } else {
         pass.body.both(&format!(
             "      const float u{node} = ptir_rng_hash_uniform(seed{node}, i + p{node}.imm3);"
         ));
         pass.body.both(&format!(
-            "      const float r{out} = p{node}.kind == 0u ? u{node} : -logf(-logf(u{node}));"
+            "      const float r{out} = -logf(-logf(u{node}));"
         ));
     }
     pass.registers.push((out, Dtype::F32));
@@ -745,7 +794,7 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
     );
     let _ = writeln!(
         pass.body.pre,
-        "        const float4 q_r{out} = m1_intrinsic_row_load4(ibase{node}, ifirst{node} + i4 / iwidth{node}, i4 % iwidth{node}, istride{node}, p{node}.intrinsic_dtype);"
+        "        const float4 q_r{out} = m1_intrinsic_row_load4(ibase{node}, ifirst{node}, i4, istride{node}, p{node}.intrinsic_dtype);"
     );
     let _ = writeln!(
         pass.body.v,
@@ -809,6 +858,10 @@ fn map_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pas
         } else {
             format!("({a} || {b})")
         }
+    } else if tag == tags::PIVOT_THRESHOLD {
+        let a = read(streams, op.args[0], Dtype::F32, pass);
+        let b = read(streams, op.pred_payload, Dtype::F32, pass);
+        format!("({a} >= {b})")
     } else {
         let path = streams.dtype(op.args[0]);
         let a = read(streams, op.args[0], path, pass);

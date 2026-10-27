@@ -1,5 +1,6 @@
 pub mod compile;
 pub mod endpoint;
+pub mod fan;
 pub mod launch;
 pub mod ports;
 pub mod session;
@@ -151,6 +152,8 @@ pub struct Plane {
     /// Instances closed while a fire of theirs was airborne: each closes
     /// when its last one settles, the device done reading its rings.
     closing: std::collections::BTreeSet<InstanceId>,
+    /// The streams a wave's program groups launch on, side by side.
+    fan: fan::Fan,
 }
 
 impl Default for Plane {
@@ -175,6 +178,7 @@ impl Plane {
             shadow: false,
             flight: u32::MAX,
             closing: std::collections::BTreeSet::new(),
+            fan: fan::Fan::default(),
         }
     }
 
@@ -536,13 +540,14 @@ impl Plane {
             return Ok(());
         }
         self.wave.fly(context)?;
-        let stream = context.stream();
+        let main = context.stream();
         let Plane {
             programs,
             instances,
             staged,
             flight,
             at,
+            fan,
             ..
         } = self;
         let at = *at;
@@ -558,49 +563,90 @@ impl Plane {
             }
         }
 
-        for (program_id, extents, members) in groups {
-            let mut from = 0;
-            let mut refused: Option<(usize, Fault)> = None;
-            while from < members.len() {
-                let program = programs.get_mut(&program_id).ok_or_else(|| {
-                    Fault::program(
-                        "program::plane",
-                        format!("a staged fire names program {program_id}, which is gone"),
-                    )
-                })?;
-                let ceiling = program
-                    .batch(extents, 1, stream)?
-                    .stages
+        let mut meet = Vec::with_capacity(groups.len());
+        for (program_id, extents, _) in &groups {
+            let program = programs.get_mut(program_id).ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("a staged fire names program {program_id}, which is gone"),
+                )
+            })?;
+            let runs: Vec<bool> = (0..program.compiled.stages.len())
+                .map(|index| program.plan.runs_at(index, at))
+                .collect();
+            let batch = program.batch(*extents, 1, main)?;
+            meet.push(
+                at_point(&mut batch.stages, &runs)
                     .iter()
-                    .flatten()
-                    .map(Prepared::lane_ceiling)
-                    .min()
-                    .unwrap_or(u32::MAX)
-                    .min(*flight)
-                    .max(1) as usize;
-                if let Some((width, fault)) = refused.take()
-                    && ceiling >= width
-                {
-                    return Err(fault);
+                    .any(|prepared| prepared.meets_across_blocks()),
+            );
+        }
+        let streams = fan.fork(&meet, main)?;
+        let flown = groups.into_iter().zip(streams).try_for_each(
+            |((program_id, extents, members), stream)| {
+                Plane::fly_group(
+                    programs, instances, program_id, extents, &members, *flight, at, stream,
+                )
+            },
+        );
+        fan.join(main)?;
+        flown
+    }
+
+    /// Flies one program's group at `extents` on `stream`, in flights as
+    /// wide as its scratch allows.
+    #[allow(clippy::too_many_arguments)]
+    fn fly_group(
+        programs: &mut BTreeMap<ProgramId, Program>,
+        instances: &mut BTreeMap<InstanceId, Bound>,
+        program_id: ProgramId,
+        extents: Extents,
+        members: &[InstanceId],
+        flight: u32,
+        at: Attach,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<()> {
+        let mut from = 0;
+        let mut refused: Option<(usize, Fault)> = None;
+        while from < members.len() {
+            let program = programs.get_mut(&program_id).ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("a staged fire names program {program_id}, which is gone"),
+                )
+            })?;
+            let ceiling = program
+                .batch(extents, 1, stream)?
+                .stages
+                .iter()
+                .flatten()
+                .map(Prepared::lane_ceiling)
+                .min()
+                .unwrap_or(u32::MAX)
+                .min(flight)
+                .max(1) as usize;
+            if let Some((width, fault)) = refused.take()
+                && ceiling >= width
+            {
+                return Err(fault);
+            }
+            let to = members.len().min(from + ceiling);
+            match Plane::fly_one(
+                programs,
+                instances,
+                program_id,
+                extents,
+                &members[from..to],
+                at,
+                stream,
+            ) {
+                Ok(()) => from = to,
+                // The scratch did not fit at this width and the stage capped
+                // its lanes under it: the same members fly again, narrower.
+                Err(fault @ Fault::OutOfMemory { .. }) if to - from > 1 => {
+                    refused = Some((to - from, fault));
                 }
-                let to = members.len().min(from + ceiling);
-                match Plane::fly_one(
-                    programs,
-                    instances,
-                    program_id,
-                    extents,
-                    &members[from..to],
-                    at,
-                    stream,
-                ) {
-                    Ok(()) => from = to,
-                    // The scratch did not fit at this width and the stage capped
-                    // its lanes under it: the same members fly again, narrower.
-                    Err(fault @ Fault::OutOfMemory { .. }) if to - from > 1 => {
-                        refused = Some((to - from, fault));
-                    }
-                    Err(fault) => return Err(fault),
-                }
+                Err(fault) => return Err(fault),
             }
         }
         Ok(())
