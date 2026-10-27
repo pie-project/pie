@@ -10,7 +10,6 @@ pub struct Launch {
     pub grid: [u32; 3],
     pub block: [u32; 3],
     pub smem: u32,
-    pub cooperative: bool,
 }
 
 impl Launch {
@@ -21,7 +20,6 @@ impl Launch {
             grid: [grid, 1, 1],
             block: [block, 1, 1],
             smem: 0,
-            cooperative: false,
         }
     }
 
@@ -31,7 +29,6 @@ impl Launch {
             grid: [rows, 1, 1],
             block: [block, 1, 1],
             smem: 0,
-            cooperative: false,
         }
     }
 
@@ -41,19 +38,12 @@ impl Launch {
             grid,
             block,
             smem: 0,
-            cooperative: false,
         }
     }
 
     #[must_use]
     pub const fn smem(mut self, bytes: u32) -> Self {
         self.smem = bytes;
-        self
-    }
-
-    #[must_use]
-    pub const fn cooperative(mut self) -> Self {
-        self.cooperative = true;
         self
     }
 

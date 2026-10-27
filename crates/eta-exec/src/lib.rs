@@ -13,10 +13,8 @@ mod channel;
 mod emitted;
 mod error;
 mod extent;
-mod group;
 mod identity;
 mod lane;
-mod meta;
 mod op;
 mod params;
 mod plan;
@@ -37,7 +35,6 @@ pub use cache::{
 pub use channel::{ChannelState, HostOp, InterpInstance, host_put, host_take, make_host_instance};
 pub use emitted::{Duplicate, Emitted, Slot};
 pub use extent::{Extents, Role, Unresolvable, ValueDesc, describe};
-pub use group::{GroupKey, MAX_CHANNELS, used_channel_slots};
 pub use identity::{
     Backend, COMPILER_VERSION, REGION_PLAN_VERSION, Versions, cache_identity, combined_signature,
 };
@@ -46,7 +43,6 @@ pub use lane::{
     HEADER_BYTES as LANE_HEADER_BYTES, Header as LaneHeader, RECORD_BYTES as LANE_RECORD_BYTES,
     Record as LaneRecord, SLOT_BYTES as LANE_SLOT_BYTES, Shape as LaneShape,
 };
-pub use meta::{Malformed, channel_effects};
 pub use op::eval_op;
 pub use params::OpParams;
 pub use plan::{Boundaries, ExecPlan, StagePlan, adopt_launch_package, adopt_launch_package_with};

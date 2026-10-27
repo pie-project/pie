@@ -29,8 +29,6 @@ pub const DS_ROW: u32 = 584;
 pub const DS_DATA: u32 = 576;
 /// The scale bytes of a position: seven ue8m0 exponents and a pad.
 pub const DS_SCALES: u32 = 8;
-/// The codes a scale covers.
-pub const DS_TILE: u32 = 64;
 /// The dims stored as e4m3 codes (the rest, the rotated ones, as bf16).
 pub const DS_NOPE: u32 = 448;
 

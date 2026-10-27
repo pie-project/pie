@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-use crate::attn::plan::{Built, DecodePlanInfo, Live, Sizes, Toggles};
+use crate::attn::plan::{Built, DecodePlanInfo, Live, Toggles};
 use crate::attn::sched::{AlignedAllocator, Staging, at, narrow, narrow_all, spans};
 use crate::jit::refuse;
 
@@ -274,26 +274,6 @@ pub fn plan(
         int_upload,
         int_bytes: laid.int_bytes,
         float_bytes: laid.float_bytes,
-    })
-}
-
-pub fn workspace_size(
-    op: &'static str,
-    req: &Request<'_>,
-    max_grid_size: u32,
-) -> Result<Sizes, Error> {
-    let sched = schedule(op, req, max_grid_size)?;
-    let laid = layout(
-        op,
-        req.num_qo_heads,
-        req.head_dim,
-        &sched,
-        usize::MAX,
-        usize::MAX,
-    )?;
-    Ok(Sizes {
-        float_bytes: laid.float_bytes,
-        int_bytes: laid.int_bytes,
     })
 }
 

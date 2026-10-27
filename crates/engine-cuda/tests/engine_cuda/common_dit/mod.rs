@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -416,7 +414,6 @@ pub struct LaneHandles {
     pub latent: ChannelId,
     pub timestep: ChannelId,
     pub positions: ChannelId,
-    pub out: ChannelId,
     pub rows: u32,
 }
 
@@ -595,7 +592,6 @@ impl Rig {
             latent,
             timestep,
             positions,
-            out,
             rows,
         }
     }

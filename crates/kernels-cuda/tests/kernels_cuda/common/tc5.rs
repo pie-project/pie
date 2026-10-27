@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::Lcg;
 use kernels_cuda::linear::gemm_sm100::{Elem, atom_bytes, atom_offset};
 

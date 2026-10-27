@@ -29,12 +29,6 @@ pub const M3_THREADS_EXCEEDED: u32 = 0xB3;
 
 pub const M4_REDUCE_TOO_WIDE: u32 = 0xB4;
 
-pub const TAG_ALIASES: &[(u32, Option<&str>)] = &[
-    (FUSED_GEOMETRY_MISMATCH, Some("intrinsic_val")),
-    (M3_THREADS_EXCEEDED, None),
-    (M4_REDUCE_TOO_WIDE, None),
-];
-
 const TABLE: &[(u32, &str, bool)] = &[
     (FUSED_GEOMETRY_MISMATCH, "FUSED_GEOMETRY_MISMATCH", false),
     (M3_THREADS_EXCEEDED, "M3_THREADS_EXCEEDED", false),

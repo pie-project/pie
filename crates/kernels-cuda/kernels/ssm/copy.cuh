@@ -4,23 +4,6 @@
 
 namespace pie::ssm {
 
-__device__ __forceinline__ void gdn_load8(
-    const __nv_bfloat16* __restrict__ p, float (&s)[8]) {
-    if ((reinterpret_cast<usize>(p) & 15) == 0) {
-        const uint4 raw = *reinterpret_cast<const uint4*>(p);
-        const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw);
-        #pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            const float2 f = __bfloat1622float2(pairs[u]);
-            s[2 * u] = f.x;
-            s[2 * u + 1] = f.y;
-        }
-    } else {
-        #pragma unroll
-        for (int u = 0; u < 8; ++u) s[u] = __bfloat162float(p[u]);
-    }
-}
-
 __device__ __forceinline__ void gdn_store8(
     __nv_bfloat16* __restrict__ p, const float (&s)[8]) {
     if ((reinterpret_cast<usize>(p) & 15) == 0) {

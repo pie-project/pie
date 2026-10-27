@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-
-use eta_compiler::eval::interp::Value;
 use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
@@ -34,19 +31,6 @@ pub fn chan(shape: Shape, dtype: Dtype, host_role: HostRole, seeded: bool) -> Ch
         host_role,
         seeded,
     }
-}
-
-pub fn u32s(v: &[u32]) -> Value {
-    Value::U32(v.to_vec())
-}
-pub fn i32s(v: &[i32]) -> Value {
-    Value::I32(v.to_vec())
-}
-pub fn f32s(v: &[f32]) -> Value {
-    Value::F32(v.to_vec())
-}
-pub fn bools(v: &[bool]) -> Value {
-    Value::Bool(v.to_vec())
 }
 
 pub fn const_port(port: Port, dtype: Dtype, shape: Shape, words: &[u32]) -> PortBinding {
@@ -122,22 +106,6 @@ pub fn section3_trace() -> TraceContainer {
         externs: Vec::new(),
         inputs: Vec::new(),
     }
-}
-
-pub fn allow_all() -> Value {
-    bools(&[true; VOCAB as usize])
-}
-pub fn allow_only(toks: &[usize]) -> Value {
-    let mut m = [false; VOCAB as usize];
-    for &t in toks {
-        m[t] = true;
-    }
-    bools(&m)
-}
-pub fn flat_logits(fav: usize, x: f32) -> Value {
-    let mut l = vec![0.0f32; VOCAB as usize];
-    l[fav] = x;
-    Value::F32(l)
 }
 
 pub const BB: u32 = 2;

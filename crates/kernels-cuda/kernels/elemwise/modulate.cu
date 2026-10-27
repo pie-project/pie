@@ -194,26 +194,6 @@ constexpr int kMaxBlocks = 32;
 
 constexpr int kThreads = 256;
 
-__device__ __forceinline__ float block_reduce_sum(float x, float* scratch) {
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        x += __shfl_down_sync(0xffffffffu, x, offset);
-    }
-    const int lane = threadIdx.x & (warpSize - 1);
-    const int warp = threadIdx.x / warpSize;
-    if (lane == 0) scratch[warp] = x;
-    __syncthreads();
-    const int warps = blockDim.x / warpSize;
-    float total = 0.f;
-    if (threadIdx.x == 0) {
-        for (int w = 0; w < warps; ++w) total += scratch[w];
-        scratch[0] = total;
-    }
-    __syncthreads();
-    total = scratch[0];
-    __syncthreads();
-    return total;
-}
-
 // The closed blocks a blend reads, each its own plane (`rows x H`), by value.
 struct ResBlocks {
     const void* at[kMaxBlocks];

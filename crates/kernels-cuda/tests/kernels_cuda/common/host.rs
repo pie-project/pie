@@ -1,5 +1,4 @@
 //! Host references and fixtures several kernel tests share.
-#![allow(dead_code)]
 #![allow(unsafe_code)]
 
 use super::from_bf16;

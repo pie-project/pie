@@ -84,17 +84,6 @@ __device__ __forceinline__ void tma_load_2d(void* dst, u64* bar, const TmaMap* m
         : "memory");
 }
 
-// The same box landed at the same offset in every CTA of `mask` in the
-// cluster, each completing its own barrier at that offset.
-__device__ __forceinline__ void tma_load_2d_multicast(void* dst, u64* bar, const TmaMap* map, int x,
-                                                      int y, unsigned short mask) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
-        ".multicast::cluster [%0], [%1, {%3, %4}], [%2], %5;" ::"r"(smem_addr(dst)),
-        "l"(reinterpret_cast<u64>(map)), "r"(smem_addr(bar)), "r"(x), "r"(y), "h"(mask)
-        : "memory");
-}
-
 // A 3D box at (x, y, z), completing `bar`.
 __device__ __forceinline__ void tma_load_3d(void* dst, u64* bar, const TmaMap* map, int x, int y,
                                             int z) {
@@ -267,18 +256,6 @@ __device__ __forceinline__ void bulk_wait_read() {
 // Until all of this thread's bulk groups have landed.
 __device__ __forceinline__ void bulk_wait_all() {
     asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
-}
-
-// An f32 add to global memory that returns nothing.
-__device__ __forceinline__ void red_add(float* at, float v) {
-    asm volatile("red.global.add.f32 [%0], %1;" ::"l"(at), "f"(v) : "memory");
-}
-
-// Four f32 adds to 16 aligned bytes of global memory (sm_90+).
-__device__ __forceinline__ void red_add4(float* at, float a, float b, float c, float d) {
-    asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" ::"l"(at), "f"(a), "f"(b),
-                 "f"(c), "f"(d)
-                 : "memory");
 }
 
 // Makes generic-proxy writes to shared memory visible to TMA.

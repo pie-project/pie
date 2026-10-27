@@ -201,11 +201,6 @@ impl Session {
         Some(self.merge(channel, prediction))
     }
 
-    #[must_use]
-    pub fn predictions(&self) -> Vec<Cursor> {
-        self.cursors_now()
-    }
-
     fn cursors_now(&self) -> Vec<Cursor> {
         (0..self.shapes.len())
             .map(|channel| {
@@ -340,12 +335,6 @@ impl Session {
         let native = self.rings.read_cell(channel as usize, head)?;
         self.advance_head(channel as usize);
         Ok(Some(native_to_wire(shape.dtype, shape.numel, &native)?))
-    }
-
-    pub fn peek(&self, channel: u32, sequence: u64) -> Result<Vec<u8>> {
-        let shape = self.shape_of(channel)?;
-        let native = self.rings.read_cell(channel as usize, sequence)?;
-        native_to_wire(shape.dtype, shape.numel, &native)
     }
 
     /// Fixes, once at bind, which ports this instance resolves under
@@ -924,30 +913,6 @@ impl Session {
             )
         })
     }
-}
-
-#[must_use]
-pub fn seeds_of(interp: &eta_exec::InterpInstance, plan: &ExecPlan) -> Vec<(u32, Vec<u8>)> {
-    let mut seeds = Vec::new();
-    for (channel, ring) in interp.channels.iter().enumerate() {
-        let declared = match plan.package.channels.get(channel) {
-            Some(declared) => declared,
-            None => continue,
-        };
-        let dtype = eta_exec::concrete_dtype(declared.dtype);
-        let numel = declared
-            .shape
-            .iter()
-            .map(|&d| d as usize)
-            .product::<usize>()
-            .max(1);
-        for sequence in ring.head()..ring.tail() {
-            let mut wire = vec![0u8; eta_exec::wire_cell_bytes(dtype, numel)];
-            eta_exec::encode_wire(&ring.decode_sequence(sequence), &mut wire);
-            seeds.push((channel as u32, wire));
-        }
-    }
-    seeds
 }
 
 fn stages_and_plans_agree(compiled: &Compiled) -> Result<()> {

@@ -137,11 +137,6 @@ impl Residency {
         }
     }
 
-    #[must_use]
-    pub const fn is_uncapped(&self) -> bool {
-        self.device_weight_budget.is_none() && self.host_weight_budget.is_none()
-    }
-
     pub fn admit(&self, device_demand: u64, host_demand: u64) -> crate::Result<()> {
         self.admit_tiers(Tiers {
             device: device_demand,

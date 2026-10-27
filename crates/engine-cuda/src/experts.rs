@@ -200,7 +200,6 @@ pub struct Plan {
 #[derive(Debug, Clone)]
 pub struct BankPlan {
     pub param: usize,
-    pub name: String,
     pub experts: u32,
     pub resident: u32,
     pub stride: u64,
@@ -723,7 +722,6 @@ fn routed(
             }
             banks.push(BankPlan {
                 param: at,
-                name: param.name.clone(),
                 experts,
                 resident: experts,
                 stride: plane / u64::from(experts),
@@ -791,7 +789,6 @@ fn weight_of(trace: &Trace, id: ValueId) -> Result<usize> {
 #[derive(Debug)]
 struct Seat {
     param: usize,
-    name: String,
     experts: u32,
     resident: u32,
     stride: u64,
@@ -822,7 +819,6 @@ struct Mapped {
 struct Group {
     param: usize,
     name: String,
-    experts: u32,
     planes: Vec<GroupPlane>,
     cell_at: usize,
     at: Vec<u64>,
@@ -864,16 +860,6 @@ pub struct Handles {
     pub counts: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BankResidency {
-    pub name: String,
-    pub experts: u32,
-    pub slots: u32,
-    pub in_slot: Vec<u32>,
-    pub hits: Vec<u32>,
-    pub held: Option<Held>,
-}
-
 #[derive(Debug)]
 pub enum Fill {
     Cold,
@@ -903,13 +889,6 @@ impl Refill {
             Err(TryRecvError::Empty) => Filled::Waiting,
             Err(TryRecvError::Disconnected) => Filled::Refused,
         }
-    }
-
-    fn settle(mut self) -> Option<Pinned> {
-        if let Some(filling) = self.filling.take() {
-            let _ = filling.join();
-        }
-        self.filled.try_recv().ok()
     }
 
     fn window_ms(&self) -> u64 {
@@ -945,17 +924,14 @@ pub struct Tier {
     berths: Vec<Berth>,
     swap: Option<Swap>,
     landed: Event,
-    ladder: (u64, u64, u64),
     ladder_open: bool,
     tick: u64,
-    source: Option<Spill>,
+    /// The spill `backing` points into, held mapped for the tier's life.
+    _source: Option<Spill>,
     mapped: Vec<Mapped>,
     drained: Event,
     ready: Event,
     moving: bool,
-    promotions: u64,
-    demotions: u64,
-    skipped: u64,
 }
 
 impl Tier {
@@ -971,7 +947,6 @@ impl Tier {
             );
             seats.push(Seat {
                 param: bank.param,
-                name: bank.name.clone(),
                 experts: bank.experts,
                 resident: bank.resident,
                 stride: bank.stride,
@@ -1116,7 +1091,6 @@ impl Tier {
             groups.push(Group {
                 param: group.param,
                 name: group.name.clone(),
-                experts: group.experts,
                 planes: group.planes.clone(),
                 cell_at,
                 at: Vec::new(),
@@ -1187,16 +1161,12 @@ impl Tier {
             berths: Vec::new(),
             swap: None,
             landed: Event::new()?,
-            ladder: (0, 0, 0),
             tick: 0,
-            source,
+            _source: source,
             mapped,
             drained: Event::new()?,
             ready: Event::new()?,
             moving: false,
-            promotions: 0,
-            demotions: 0,
-            skipped: 0,
         })
     }
 
@@ -1233,11 +1203,6 @@ impl Tier {
     #[must_use]
     pub fn offloaded_at(&self, param: usize) -> Option<u64> {
         self.pinned_at(param).or_else(|| self.mapped_at(param))
-    }
-
-    #[must_use]
-    pub fn source(&self) -> Option<&Spill> {
-        self.source.as_ref()
     }
 
     #[must_use]
@@ -1280,18 +1245,6 @@ impl Tier {
             filled,
             began: std::time::Instant::now(),
         });
-    }
-
-    pub fn settle_refill(&mut self, compute: *mut c_void, notify: *mut c_void) -> Result<bool> {
-        let Some(refill) = self.refill.take() else {
-            return Ok(false);
-        };
-        let window = refill.window_ms();
-        let Some(host) = refill.settle() else {
-            return Ok(false);
-        };
-        self.install(host, window, compute, notify)?;
-        Ok(true)
     }
 
     fn install(
@@ -1362,11 +1315,6 @@ impl Tier {
 
     pub fn zero_host(&self) {
         self.host.zero();
-    }
-
-    #[must_use]
-    pub fn image(&self) -> Vec<(u64, u64, u64, u64)> {
-        self.plan.host_layout()
     }
 
     pub fn land(
@@ -1550,12 +1498,9 @@ impl Tier {
             return Ok(0);
         }
         if self.moving && !self.ready.done()? {
-            self.skipped += 1;
             return Ok(0);
         }
         if self.swap.is_some() && !self.landed.done()? {
-            self.ladder.2 += 1;
-            self.skipped += 1;
             return Ok(0);
         }
         if self.swap.is_none() && self.refill.is_some() {
@@ -1595,7 +1540,6 @@ impl Tier {
                     self.shadow.device() + entry as u64 * ENTRY,
                     ENTRY as usize,
                 )?;
-                self.demotions += 1;
             }
             let seat = &self.seats[*at];
             let dst = seat.slab + u64::from(*slot) * seat.stride;
@@ -1617,7 +1561,6 @@ impl Tier {
             let seat = &mut self.seats[*at];
             seat.slot_of[*into as usize] = Some(*slot);
             seat.in_slot[*slot as usize] = *into;
-            self.promotions += 1;
         }
         let bulk = match step {
             Some(Step::Open(swap)) => {
@@ -1665,7 +1608,6 @@ impl Tier {
             self.groups[out].settled = self.tick;
             self.write_cell(out);
             self.copy_cell(out, notify)?;
-            self.ladder.1 += 1;
         }
         self.berths[swap.berth].holds = None;
         Ok(())
@@ -1686,7 +1628,6 @@ impl Tier {
         self.write_cell(swap.group);
         self.copy_cell(swap.group, notify)?;
         self.swap = None;
-        self.ladder.0 += 1;
         Ok(())
     }
 
@@ -1743,153 +1684,8 @@ impl Tier {
     }
 
     #[must_use]
-    pub fn residency(&self) -> Vec<BankResidency> {
-        let hits = self.mirror.read(0, self.mirror.bytes());
-        let dense = self.seats.iter().map(|seat| BankResidency {
-            name: seat.name.clone(),
-            experts: seat.experts,
-            slots: seat.resident,
-            held: None,
-            in_slot: seat.in_slot.clone(),
-            hits: (0..seat.experts)
-                .map(|expert| {
-                    let byte = (seat.counter_at + expert as usize) * COUNTER as usize;
-                    hits.get(byte..byte + COUNTER as usize)
-                        .and_then(|w| w.try_into().ok())
-                        .map_or(0, u32::from_ne_bytes)
-                })
-                .collect(),
-        });
-        let counts = self.group_mirror.read(0, self.group_mirror.bytes());
-        let packed = self.groups.iter().map(|group| {
-            let byte = group.cell_at * COUNTER as usize;
-            BankResidency {
-                name: group.name.clone(),
-                experts: group.experts,
-                slots: 0,
-                in_slot: Vec::new(),
-                hits: vec![
-                    counts
-                        .get(byte..byte + COUNTER as usize)
-                        .and_then(|word| word.try_into().ok())
-                        .map_or(0, u32::from_ne_bytes),
-                ],
-                held: Some(group.held),
-            }
-        });
-        let planes = self
-            .plan
-            .groups()
-            .iter()
-            .filter(|group| !group.routed)
-            .map(|group| BankResidency {
-                name: group.name.clone(),
-                experts: group.experts,
-                slots: 0,
-                in_slot: Vec::new(),
-                hits: Vec::new(),
-                held: Some(group.held),
-            });
-        dense.chain(packed).chain(planes).collect()
-    }
-
-    #[must_use]
-    pub fn ladder(&self) -> (u64, u64, u64) {
-        self.ladder
-    }
-
-    pub fn promote_now(
-        &mut self,
-        name: &str,
-        compute: *mut c_void,
-        notify: *mut c_void,
-    ) -> Result<Option<(Held, Held)>> {
-        let Some(group) = self.groups.iter().position(|group| group.name == name) else {
-            return Ok(None);
-        };
-        let shape: Vec<u64> = self.groups[group]
-            .planes
-            .iter()
-            .map(|plane| plane.reserved)
-            .collect();
-        let was = self.groups[group].held;
-        let hits = self.group_mirror.read(0, self.group_mirror.bytes());
-        let count = |at: usize| -> u32 {
-            let byte = at * COUNTER as usize;
-            hits.get(byte..byte + COUNTER as usize)
-                .and_then(|word| word.try_into().ok())
-                .map_or(0, u32::from_ne_bytes)
-        };
-        let Some(berth) = self
-            .berths
-            .iter()
-            .enumerate()
-            .filter(|(at, berth)| {
-                berth.tier.rung() < was.rung()
-                    && berth.shape == shape
-                    && self.groups[group].berth != Some(*at)
-                    && berth
-                        .holds
-                        .is_none_or(|out| !self.groups[out].backing.is_empty())
-            })
-            .min_by_key(|(_, berth)| match berth.holds {
-                None => (0u8, 0u32, 0u64),
-                Some(out) => (1, count(self.groups[out].cell_at), self.groups[out].settled),
-            })
-            .map(|(at, _)| at)
-        else {
-            return Ok(None);
-        };
-        let swap = Swap { berth, group };
-        self.drained.record(compute)?;
-        self.drained.wait(notify)?;
-        self.open_berth(swap, notify)?;
-        let into = self.berths[berth].at.clone();
-        let from: Vec<(u64, u64)> = self.groups[group]
-            .at
-            .iter()
-            .zip(&self.groups[group].planes)
-            .map(|(at, plane)| (*at, plane.bytes))
-            .collect();
-        for (dst, (src, bytes)) in into.into_iter().zip(from) {
-            copy_any(
-                notify,
-                dst,
-                src,
-                usize::try_from(bytes).unwrap_or(usize::MAX),
-            )?;
-        }
-        self.landed.record(notify)?;
-        self.landed.settle()?;
-        self.close_berth(swap, notify)?;
-        self.ready.record(notify)?;
-        self.ready.settle()?;
-        self.moving = false;
-        Ok(Some((was, self.groups[group].held)))
-    }
-
-    #[must_use]
-    pub fn motion(&self) -> (u64, u64, u64) {
-        (self.promotions, self.demotions, self.skipped)
-    }
-
-    #[must_use]
     pub fn plan(&self) -> &Plan {
         &self.plan
-    }
-
-    #[must_use]
-    pub fn bytes(&self) -> (u64, u64) {
-        let device = self.table.bytes() as u64
-            + self.counts.bytes() as u64
-            + self.cells.bytes() as u64
-            + self.group_counts.bytes() as u64;
-        let host = self.host.bytes() as u64
-            + self.shadow.bytes() as u64
-            + self.mirror.bytes() as u64
-            + self.cell_shadow.bytes() as u64
-            + self.group_mirror.bytes() as u64;
-        (device, host)
     }
 }
 

@@ -39,34 +39,6 @@ pub enum EngineOptions {
     Cerebras(CerebrasEngineOptions),
 }
 
-impl EngineOptions {
-    pub fn flavor(&self) -> Flavor {
-        match self {
-            #[cfg(feature = "engine-cuda")]
-            EngineOptions::Cuda(_) => Flavor::Cuda,
-            #[cfg(all(feature = "metal", target_vendor = "apple"))]
-            EngineOptions::Metal(_) => Flavor::Metal,
-            #[cfg(feature = "vulkan")]
-            EngineOptions::Vulkan(_) => Flavor::Vulkan,
-            #[cfg(feature = "wgpu")]
-            EngineOptions::Wgpu(_) => Flavor::Wgpu,
-            #[cfg(feature = "xla")]
-            EngineOptions::Xla(_) => Flavor::Xla,
-            #[cfg(feature = "cerebras")]
-            EngineOptions::Cerebras(_) => Flavor::Cerebras,
-            #[cfg(not(any(
-                feature = "engine-cuda",
-                feature = "vulkan",
-                feature = "wgpu",
-                feature = "xla",
-                feature = "cerebras",
-                all(feature = "metal", target_vendor = "apple")
-            )))]
-            _ => unreachable!("`EngineOptions` has no variants in this build"),
-        }
-    }
-}
-
 pub use engine::Capabilities as EngineCapabilities;
 
 /// An engine's own fire ceilings, where `[engine]` states none: the most

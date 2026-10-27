@@ -127,17 +127,6 @@ impl DeviceStruct {
         }
         end.next_multiple_of(alignment)
     }
-
-    pub fn offsets(&self) -> impl Iterator<Item = (&'static str, usize)> + '_ {
-        let mut offset = 0usize;
-        self.fields.iter().map(move |field| {
-            let size = field.ty.size();
-            offset = offset.next_multiple_of(size);
-            let at = offset;
-            offset += size;
-            (field.name, at)
-        })
-    }
 }
 
 pub const STATUS: DeviceStruct = DeviceStruct {

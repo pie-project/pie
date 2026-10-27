@@ -26,20 +26,6 @@ namespace pie::attn::fa2 {
 using cp_async::PrefetchMode;
 using cp_async::SharedMemFillMode;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 template <uint32_t bdx, uint32_t bdy, uint32_t vec_size, typename DTypeIn>
 __device__ __forceinline__ void threadblock_sync_state(state_t<vec_size>& st, DTypeIn* v_smem,
                                                        float* s_smem,
@@ -57,44 +43,6 @@ __device__ __forceinline__ void threadblock_sync_state(state_t<vec_size>& st, DT
     vec_t<float, vec_size> v;
     v.cast_load(v_smem + iter * head_dim + tx * vec_size);
     st.merge(v, s, 1);
-  }
-}
-
-template <uint32_t bdx, uint32_t bdy, uint32_t vec_size, typename DTypeIn>
-__device__ __forceinline__ void warp_sync_state(state_t<vec_size>& st, DTypeIn* v_smem,
-                                                float* s_smem, const uint32_t tx = threadIdx.x,
-                                                const uint32_t ty = threadIdx.y) {
-  constexpr uint32_t head_dim = vec_size * bdx;
-  st.o.cast_store(v_smem + ty * head_dim + tx * vec_size);
-  s_smem[ty] = st.get_lse();
-  st.init();
-  __syncwarp();
-
-#pragma unroll
-  for (uint32_t iter = 0; iter < bdy; ++iter) {
-    float s = s_smem[iter];
-    vec_t<float, vec_size> v;
-    v.cast_load(v_smem + iter * head_dim + tx * vec_size);
-    st.merge(v, s, 1);
-  }
-}
-
-template <uint32_t bdx, uint32_t bdy, uint32_t vec_size, typename DTypeIn>
-__device__ __forceinline__ void threadblock_sum(vec_t<float, vec_size>& v, DTypeIn* v_smem) {
-  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  constexpr uint32_t head_dim = vec_size * bdx;
-  v.cast_store(v_smem + ty * head_dim + tx * vec_size);
-  v.fill(DTypeIn(0.f));
-  __syncthreads();
-
-#pragma unroll
-  for (uint32_t iter = 0; iter < bdy; ++iter) {
-    vec_t<float, vec_size> v_iter;
-    v_iter.cast_load(v_smem + iter * head_dim + tx * vec_size);
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      v[i] += v_iter[i];
-    }
   }
 }
 

@@ -92,12 +92,6 @@ pub struct Built<I> {
     pub float_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Sizes {
-    pub float_bytes: usize,
-    pub int_bytes: usize,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodePlan {
     pub info: DecodePlanInfo,
@@ -161,11 +155,6 @@ pub struct PrefillPlan {
 }
 
 impl PrefillPlan {
-    #[must_use]
-    pub const fn full_attention_variant(&self) -> bool {
-        self.window.is_none()
-    }
-
     pub fn accepts(
         &self,
         op: &'static str,

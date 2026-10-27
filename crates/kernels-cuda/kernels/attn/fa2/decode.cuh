@@ -415,67 +415,6 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
   }
 }
 
-template <uint32_t vec_size_ckv, uint32_t vec_size_kpe, uint32_t bdx, uint32_t tile_size,
-          typename AttentionVariant, typename Params, typename T>
-__device__ __forceinline__ void compute_qk_and_update_local_stat_mla(
-    const Params& params, AttentionVariant variant, const uint32_t batch_idx, const T* ckv_smem,
-    const vec_t<float, vec_size_ckv>& q_nope_vec, const T* kpe_smem,
-    const vec_t<float, vec_size_kpe>& q_pe_vec, const vec_t<float, vec_size_kpe>& freq,
-    uint32_t kv_idx_base, uint32_t iter_base, uint32_t iter_bound, state_t<vec_size_ckv>& st) {
-  uint32_t tx = threadIdx.x, tz = threadIdx.z;
-  constexpr uint32_t head_dim_ckv = bdx * vec_size_ckv;
-  constexpr uint32_t head_dim_kpe = bdx * vec_size_kpe;
-  float s[tile_size];
-  float m_prev = st.m;
-#pragma unroll
-  for (uint32_t j = 0; j < tile_size; ++j) {
-    vec_t<float, vec_size_ckv> ckv_vec;
-    ckv_vec.cast_load(ckv_smem + j * head_dim_ckv + tx * vec_size_ckv);
-
-    vec_t<float, vec_size_kpe> kpe_vec;
-    kpe_vec.cast_load(kpe_smem + j * head_dim_kpe + tx * vec_size_kpe);
-
-    s[j] = 0.f;
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size_ckv; ++i) {
-      s[j] += q_nope_vec[i] * ckv_vec[i];
-    }
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size_kpe; ++i) {
-      s[j] += q_pe_vec[i] * kpe_vec[i];
-    }
-    s[j] *= params.sm_scale;
-#pragma unroll
-    for (uint32_t offset = bdx / 2; offset > 0; offset /= 2) {
-      s[j] += math::shfl_xor_sync(s[j], offset);
-    }
-    s[j] = (iter_base + tz * tile_size + j < iter_bound) ? s[j] : -math::inf;
-    st.m = max(st.m, s[j]);
-  }
-
-  float o_scale = math::ptx_exp2(m_prev - st.m);
-  st.d *= o_scale;
-#pragma unroll
-  for (uint32_t j = 0; j < tile_size; ++j) {
-    s[j] = math::ptx_exp2(s[j] - st.m);
-    st.d += s[j];
-  }
-#pragma unroll
-  for (uint32_t i = 0; i < vec_size_ckv; ++i) {
-    st.o[i] = st.o[i] * o_scale;
-  }
-
-#pragma unroll
-  for (uint32_t j = 0; j < tile_size; ++j) {
-    vec_t<float, vec_size_ckv> v_vec;
-    v_vec.cast_load(ckv_smem + j * head_dim_ckv + tx * vec_size_ckv);
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size_ckv; ++i) {
-      st.o[i] = st.o[i] + s[j] * v_vec[i];
-    }
-  }
-}
-
 }
 
 #endif

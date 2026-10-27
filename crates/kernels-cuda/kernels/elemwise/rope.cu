@@ -120,22 +120,6 @@ __global__ void rope_full(
     }
 }
 
-__device__ __forceinline__ float yarn_freq(
-    float base_freq, float factor,
-    float low_freq_factor, float high_freq_factor,
-    float orig_max_pos)
-{
-    constexpr float TWO_PI = 6.2831853071795864769f;
-    const float wavelen   = TWO_PI / base_freq;
-    const float low_wave  = orig_max_pos / low_freq_factor;
-    const float high_wave = orig_max_pos / high_freq_factor;
-    if (wavelen < high_wave) return base_freq;
-    if (wavelen > low_wave)  return base_freq / factor;
-    const float smooth = (orig_max_pos / wavelen - low_freq_factor) /
-                         (high_freq_factor - low_freq_factor);
-    return (1.f - smooth) * (base_freq / factor) + smooth * base_freq;
-}
-
 // YaRN over q and k in place.
 __global__ void rope_yarn(
     bf16* __restrict__ q,
