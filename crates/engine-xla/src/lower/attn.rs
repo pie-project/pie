@@ -624,6 +624,41 @@ pub mod index {
         })
     }
 
+    /// Each row's `top_k` blocks per head, ranked by their best key, into
+    /// `selection` (`block_max`).
+    pub fn topk_block_max(
+        ctx: &Ctx<'_>,
+        q: Tensor,
+        keys: &KvPool,
+        positions: Tensor,
+        request_of_token: Tensor,
+        heads: u32,
+        head_dim: u32,
+        top_k: u32,
+        block: u32,
+        selection: Tensor,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let (planes, (qv, pos, req)) = planes(l, keys, |l| {
+                Ok((l.read(q)?, l.read(positions)?, l.read(request_of_token)?))
+            })?;
+            let y = index::topk_block_max(
+                l.f(),
+                qv,
+                planes,
+                keys,
+                pos,
+                req,
+                heads,
+                head_dim,
+                top_k,
+                block,
+                selection.landing(),
+            )?;
+            l.land(selection, y)
+        })
+    }
+
     /// Files each row's index key in the index pool.
     pub fn kv_append(
         ctx: &Ctx<'_>,

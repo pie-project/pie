@@ -1526,8 +1526,9 @@ pub struct Paged<T, L = T> {
     pub o: L,
     pub lse: Option<L>,
     pub(crate) walk: Walk,
-    /// `(selection [rows, top_k] i32 block ids, ratio)`.
-    pub selection: Option<(T, u32)>,
+    /// `(selection [rows, top_k] i32 block ids, ratio, per_head)`; with
+    /// `per_head`, one run of `top_k / kv_heads` ids per kv head.
+    pub selection: Option<(T, u32, bool)>,
     /// `(bias [rows, qh · extent] f32, extent, log_floor, log_alpha)`.
     pub rel: Option<(T, u32, u32, f32)>,
 }
@@ -1561,7 +1562,7 @@ impl<T: Stored> Paged<T> {
             None => None,
         };
         let selection = match self.selection {
-            Some((s, ratio)) => Some((read(s)?, ratio)),
+            Some((s, ratio, per_head)) => Some((read(s)?, ratio, per_head)),
             None => None,
         };
         let (mask, mask_enabled) = masks.unwrap_or((positions, positions));
@@ -1669,7 +1670,7 @@ pub fn attend(
             ));
         }
     }
-    if let Some((sel, ratio)) = call.selection {
+    if let Some((sel, ratio, per_head)) = call.selection {
         if call.window.is_some() {
             return Err(refuse(
                 op,
@@ -1682,6 +1683,16 @@ pub fn attend(
             return Err(refuse(
                 op,
                 "the selection is one i32 block-id row per query row",
+            ));
+        }
+        if per_head && (!sel.width.is_multiple_of(kv_heads) || call.rel.is_some()) {
+            return Err(refuse(
+                op,
+                format!(
+                    "a {}-wide selection is not one run per each of {kv_heads} kv heads, \
+                     or a relative bias rides it",
+                    sel.width
+                ),
             ));
         }
     }
@@ -1791,16 +1802,51 @@ pub fn attend(
         rs.rel = Some(f.slice_axis(bias.val, 0, 0, r)?);
     }
     let sel = match selection {
-        Some((sel, ratio)) => {
+        Some((sel, ratio, per_head)) => {
             let s = f.slice_axis(sel.val, 0, 0, r)?;
-            Some((f.convert(s, Elem::I32), i64::from(ratio)))
+            Some((f.convert(s, Elem::I32), i64::from(ratio), per_head))
         }
         None => None,
     };
     let ch = tuning.chunks;
     let scale = f64::from(call.sm_scale);
     let flashed = match (walk, sel) {
-        (_, Some((sel, ratio))) => {
+        (_, Some((sel, ratio, true))) => {
+            // Each kv head walks its own run over its own key and value
+            // columns, its query heads beside it.
+            let run = f.dims(sel)[1] / heads.kvh;
+            let one = Heads { kvh: 1, ..heads };
+            let mut parts = Vec::new();
+            for j in 0..heads.kvh {
+                let s = f.slice_axis(sel, 1, j * run, (j + 1) * run)?;
+                let table = selected_positions(f, s, qpos, ratio)?;
+                let head = Planes::Paged {
+                    keys: f.slice_axis(keys, 1, j * heads.d, (j + 1) * heads.d)?,
+                    values: f.slice_axis(values, 1, j * heads.dv, (j + 1) * heads.dv)?,
+                    geom,
+                    latent: false,
+                };
+                let mut rj = rs;
+                rj.q = f.slice_axis(q4, 1, j, j + 1)?;
+                parts.push(per_row(
+                    f,
+                    &head,
+                    &one,
+                    &rule,
+                    &rj,
+                    KeyList::Table(table),
+                    scale,
+                    ch,
+                )?);
+            }
+            let cat = |f: &mut Func, v: Vec<Val>| f.concat(&v, 1);
+            Flashed {
+                o: cat(f, parts.iter().map(|p| p.o).collect())?,
+                m: cat(f, parts.iter().map(|p| p.m).collect())?,
+                l: cat(f, parts.iter().map(|p| p.l).collect())?,
+            }
+        }
+        (_, Some((sel, ratio, false))) => {
             let table = selected_positions(f, sel, qpos, ratio)?;
             per_row(
                 f,
@@ -2057,7 +2103,7 @@ pub fn masked<T: Stored>(
 }
 
 /// Selected-block decode (DeepSeek sparse attention): `selection` names
-/// `ratio`-wide key blocks per row.
+/// `ratio`-wide key blocks per row (with `per_head`, a run per kv head).
 pub fn decode_selected<T: Stored>(
     q: T,
     plan: &DecodePlan<T>,
@@ -2066,6 +2112,7 @@ pub fn decode_selected<T: Stored>(
     head_dim: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
     o: T,
 ) -> Result<Paged<T>, Error> {
     let mut call = plain(
@@ -2079,7 +2126,7 @@ pub fn decode_selected<T: Stored>(
         None,
         Walk::PerRow,
     );
-    call.selection = Some((selection, ratio));
+    call.selection = Some((selection, ratio, per_head));
     Ok(call)
 }
 
@@ -2093,6 +2140,7 @@ pub fn prefill_selected<T: Stored>(
     kv_heads: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
     o: T,
 ) -> Result<Paged<T>, Error> {
     const OP: &str = "attn.prefill";
@@ -2108,7 +2156,7 @@ pub fn prefill_selected<T: Stored>(
         None,
         Walk::PerRow,
     );
-    call.selection = Some((selection, ratio));
+    call.selection = Some((selection, ratio, per_head));
     Ok(call)
 }
 
