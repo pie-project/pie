@@ -9,6 +9,9 @@ and are left out of the TOML, so the Rust side supplies its own defaults.
 from __future__ import annotations
 
 import io
+import os
+
+os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "32")
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Optional
 
