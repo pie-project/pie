@@ -197,29 +197,45 @@ pub fn widen(compiled: &CompiledModel, admits: &[Admit]) -> Vec<Admit> {
     table
 }
 
+fn fork_open(template: &[poem_compiler::Region]) -> Vec<bool> {
+    let n = template.len();
+    let mut open = vec![false; n];
+    for (src, region) in template.iter().enumerate() {
+        for event in region.open.into_iter().chain(region.close) {
+            if let Some(last) = (src + 1..n).rfind(|&dst| template[dst].wait.contains(&event)) {
+                for slot in &mut open[src + 1..=last] {
+                    *slot = true;
+                }
+            }
+        }
+        if region.stream != 0
+            && region.close.is_none()
+            && let Some(next) = (src + 1..n).find(|&dst| template[dst].stream == region.stream)
+        {
+            for slot in &mut open[src + 1..=next] {
+                *slot = true;
+            }
+        }
+    }
+    open
+}
+
 fn welds(compiled: &CompiledModel) -> Vec<Vec<u32>> {
     let template = compiled.template();
     let mut welds: Vec<Vec<u32>> = Vec::new();
 
-    let mut pending: Vec<poem_compiler::EventId> = Vec::new();
-    let mut opened: Option<u32> = None;
-    for (index, region) in template.iter().enumerate() {
-        let at = index as u32;
-        let settled = pending.is_empty();
-        if settled && let Some(from) = opened.take() {
-            welds.push((from..at).collect());
+    let open_fork = fork_open(template);
+    let mut index = 1usize;
+    while index < template.len() {
+        if !open_fork[index] {
+            index += 1;
+            continue;
         }
-        for event in &region.wait {
-            pending.retain(|held| held != event);
+        let from = (index - 1) as u32;
+        while index < template.len() && open_fork[index] {
+            index += 1;
         }
-        pending.extend(region.open);
-        pending.extend(region.close);
-        if settled && !pending.is_empty() {
-            opened = Some(at);
-        }
-    }
-    if let Some(from) = opened {
-        welds.push((from..template.len() as u32).collect());
+        welds.push((from..index as u32).collect());
     }
 
     for (index, region) in template.iter().enumerate() {
@@ -267,29 +283,35 @@ pub fn cuts(
     let template = compiled.template();
     let table = widen(compiled, admits);
     if table.contains(&Admit::Island) {
-        let mut seen: Vec<(&poem_ir::ClassSet, Admit)> = Vec::new();
+        let mut seen: Vec<((&poem_ir::ClassSet, u32), Admit)> = Vec::new();
         for (index, region) in template.iter().enumerate() {
-            let planned = template.iter().any(|other| {
-                other.phase == poem_compiler::Phase::Prepare && other.mask == region.mask
+            let unit = compiled.unit_of(index);
+            let planned = template.iter().enumerate().any(|(other_at, other)| {
+                other.phase == poem_compiler::Phase::Prepare
+                    && other.mask == region.mask
+                    && compiled.unit_of(other_at) == unit
             });
             if !planned {
                 continue;
             }
             let admit = table.get(index).copied().unwrap_or(Admit::Island);
-            match seen.iter().find(|(mask, _)| **mask == region.mask) {
+            match seen
+                .iter()
+                .find(|((mask, held_unit), _)| **mask == region.mask && *held_unit == unit)
+            {
                 Some((_, held)) if *held != admit => {
                     return Err(Uncut::Plan {
                         region: index as u32,
                     });
                 }
                 Some(_) => {}
-                None => seen.push((&region.mask, admit)),
+                None => seen.push(((&region.mask, unit), admit)),
             }
         }
     }
 
+    let open_fork = fork_open(template);
     let mut cuts: Vec<Stretch> = Vec::new();
-    let mut pending: Vec<poem_compiler::EventId> = Vec::new();
     for (index, region) in template.iter().enumerate() {
         let at = index as u32;
         let unit = compiled.unit_of(index);
@@ -303,7 +325,7 @@ pub fn cuts(
             }
         } else {
             if !cuts.is_empty() {
-                if !pending.is_empty() {
+                if open_fork.get(index).copied().unwrap_or(false) {
                     return Err(Uncut::Fork { region: at });
                 }
                 if matches!(
@@ -320,11 +342,6 @@ pub fn cuts(
                 island,
             });
         }
-        for event in &region.wait {
-            pending.retain(|held| held != event);
-        }
-        pending.extend(region.open);
-        pending.extend(region.close);
     }
     if !cuts.iter().any(|cut| !cut.island) {
         return Err(Uncut::Eager {
