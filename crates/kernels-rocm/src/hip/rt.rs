@@ -33,13 +33,8 @@ pub type GraphNode = *mut c_void;
 pub type HostFn = unsafe extern "C" fn(*mut c_void);
 
 pub const hipErrorNotInitialized: HipError = 3;
-
 pub const hipMemcpyHostToDevice: c_int = 1;
-
 pub const hipEventDisableTiming: c_uint = 2;
-
-pub const hipStreamCaptureModeThreadLocal: c_int = 1;
-
 pub const hipHostMallocPortable: c_uint = 1;
 pub const hipHostMallocMapped: c_uint = 2;
 
