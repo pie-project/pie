@@ -1,6 +1,7 @@
 #include "prim/bf16.slang"
 #include "prim/params.slang"
 #include "prim/reduce.slang"
+#include "prim/ieee.slang"
 
 // The compressed KV pool, bf16 two a word. A row closes a block when its
 // position + 1 is a multiple of `ratio`; `PIE_BOUNDARY` lands each row's
@@ -13,10 +14,6 @@
 // kernel define, the attention over pooled entries, causal or over a
 // selection (`PIE_SELECTED`), landing the reading and its base-2 LSE; one
 // workgroup a (row, head), reductions through workgroup memory.
-
-float neg_inf() {
-    return asfloat(0xff800000u);
-}
 
 #if defined(PIE_BOUNDARY)
 

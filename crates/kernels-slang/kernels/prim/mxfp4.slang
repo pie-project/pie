@@ -1,5 +1,7 @@
 #pragma once
 
+#include "prim/ieee.slang"
+
 // MXFP4 (OCP microscaling): four-bit E2M1 codes, eight a word low first, and
 // an E8M0 exponent byte a block of `PIE_MXFP4_BLOCK` codes.
 
@@ -21,7 +23,7 @@ float mxfp4_code_of(uint word, uint i) {
 // An E8M0 block scale; 0xff is NaN.
 float mxfp4_block_scale(uint code) {
     if (code == 0xffu) {
-        return asfloat(0x7fc00000u);
+        return quiet_nan();
     }
     return ldexp(1.0, int(code) - 127);
 }

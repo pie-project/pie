@@ -1,6 +1,7 @@
 #include "prim/bf16.slang"
 #include "prim/params.slang"
 #include "prim/shuffle.slang"
+#include "prim/ieee.slang"
 
 // Paged attention over a KV cache, bf16 two a word, causal (an optional
 // sliding window, an optional per-row byte mask). Decode reads one query row
@@ -32,7 +33,7 @@ uint byte_at(StructuredBuffer<uint> buf, uint i) {
 }
 
 float lse_base2(float max_score, float sum_exp) {
-    return sum_exp > 0.0 ? max_score * 1.44269504088896340736 + log2(sum_exp) : asfloat(0xff800000u);
+    return sum_exp > 0.0 ? max_score * 1.44269504088896340736 + log2(sum_exp) : neg_inf();
 }
 
 void online_update(float score, inout float max_score, inout float sum_exp, out float history, out float weight) {
@@ -110,7 +111,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     o[(row * width + e) >> 1] = pack_bf16(v.x, v.y);
 #if defined(PIE_LSE)
     if (d == 0u) {
-        lse_out[row * heads + head] = finite_(top) ? top + log2(total) : asfloat(0xff800000u);
+        lse_out[row * heads + head] = finite_(top) ? top + log2(total) : neg_inf();
     }
 #endif
 }
@@ -505,7 +506,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint slice = (split * uint(params.n_rows) + row) * uint(params.n_q_heads) + q_head;
     if (int(split) >= usable) {
         if (tid == 0u) {
-            part_lse[slice] = asfloat(0xff800000u);
+            part_lse[slice] = neg_inf();
         }
         return;
     }
@@ -516,7 +517,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (usable == 1) {
         // One split covered the row: land it whole, and mark it done.
         if (tid == 0u) {
-            part_lse[slice] = asfloat(0x7f800000u);
+            part_lse[slice] = pos_inf();
 #if defined(PIE_SPLIT_LSE)
             lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
 #endif
@@ -712,7 +713,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     // Uniform across the workgroup: every lane of it reads the same row.
     if (int(split) >= usable) {
         if (tid == 0u) {
-            part_lse[slice] = asfloat(0xff800000u);
+            part_lse[slice] = neg_inf();
         }
         return;
     }
@@ -723,7 +724,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (usable == 1) {
         // One split covered the row: land it whole, and mark it done.
         if (tid == 0u) {
-            part_lse[slice] = asfloat(0x7f800000u);
+            part_lse[slice] = pos_inf();
 #if defined(PIE_SPLIT_LSE)
             lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
 #endif
