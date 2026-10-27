@@ -1,5 +1,4 @@
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, MeterProvider};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
@@ -7,102 +6,8 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::sync::OnceLock;
 
-static METRICS: OnceLock<Metrics> = OnceLock::new();
 static METER_PROVIDER: OnceLock<SdkMeterProvider> = OnceLock::new();
 static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
-
-#[allow(dead_code)]
-pub struct Metrics {
-    pub scheduler_arrival_rate: Gauge<f64>,
-    pub scheduler_estimated_latency_ms: Gauge<f64>,
-    pub scheduler_batch_wait_time_ms: Histogram<f64>,
-    pub scheduler_fire_decisions: Counter<u64>,
-
-    pub kv_pages_allocated: Gauge<u64>,
-    pub kv_pages_available: Gauge<u64>,
-    pub kv_pages_oom_kills: Counter<u64>,
-    pub instances_active: Gauge<u64>,
-
-    pub ffi_serialize_us: Histogram<u64>,
-    pub ffi_queue_push_us: Histogram<u64>,
-    pub ffi_response_wait_us: Histogram<u64>,
-    pub ffi_deserialize_us: Histogram<u64>,
-    pub ffi_total_us: Histogram<u64>,
-}
-
-impl Metrics {
-    fn new(meter: &Meter) -> Self {
-        Self {
-            scheduler_arrival_rate: meter
-                .f64_gauge("scheduler.arrival_rate")
-                .with_description("Requests per second (EMA-based)")
-                .with_unit("req/s")
-                .build(),
-            scheduler_estimated_latency_ms: meter
-                .f64_gauge("scheduler.estimated_latency_ms")
-                .with_description("Predicted batch latency")
-                .with_unit("ms")
-                .build(),
-            scheduler_batch_wait_time_ms: meter
-                .f64_histogram("scheduler.batch_wait_time_ms")
-                .with_description("Time waiting for batch to fill")
-                .with_unit("ms")
-                .build(),
-            scheduler_fire_decisions: meter
-                .u64_counter("scheduler.fire_decisions")
-                .with_description("Fire now vs wait decisions")
-                .build(),
-
-            kv_pages_allocated: meter
-                .u64_gauge("kv_pages.allocated")
-                .with_description("Currently allocated KV pages")
-                .build(),
-            kv_pages_available: meter
-                .u64_gauge("kv_pages.available")
-                .with_description("Free KV pages")
-                .build(),
-            kv_pages_oom_kills: meter
-                .u64_counter("kv_pages.oom_kills")
-                .with_description("OOM preemption events")
-                .build(),
-            instances_active: meter
-                .u64_gauge("instances.active")
-                .with_description("Active inference instances")
-                .build(),
-
-            ffi_serialize_us: meter
-                .u64_histogram("ffi.serialize_us")
-                .with_description("Rust→Python serialization time")
-                .with_unit("us")
-                .build(),
-            ffi_queue_push_us: meter
-                .u64_histogram("ffi.queue_push_us")
-                .with_description("Lock-free queue push time")
-                .with_unit("us")
-                .build(),
-            ffi_response_wait_us: meter
-                .u64_histogram("ffi.response_wait_us")
-                .with_description("Waiting for Python response")
-                .with_unit("us")
-                .build(),
-            ffi_deserialize_us: meter
-                .u64_histogram("ffi.deserialize_us")
-                .with_description("Python→Rust deserialization time")
-                .with_unit("us")
-                .build(),
-            ffi_total_us: meter
-                .u64_histogram("ffi.total_us")
-                .with_description("E2E FFI call latency")
-                .with_unit("us")
-                .build(),
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub fn metrics() -> Option<&'static Metrics> {
-    METRICS.get()
-}
 
 pub fn init_otel_layer<S>(
     endpoint: &str,
@@ -138,9 +43,6 @@ where
         .with_resource(resource.clone())
         .with_reader(reader)
         .build();
-
-    let meter = meter_provider.meter("pie-runtime");
-    let _ = METRICS.set(Metrics::new(&meter));
 
     let _ = METER_PROVIDER.set(meter_provider.clone());
     opentelemetry::global::set_meter_provider(meter_provider);
@@ -206,14 +108,4 @@ where
     opentelemetry::global::set_tracer_provider(provider);
 
     Some(tracing_opentelemetry::layer().with_tracer(tracer))
-}
-
-#[allow(dead_code)]
-pub fn shutdown() {
-    if let Some(provider) = TRACER_PROVIDER.get() {
-        let _ = provider.shutdown();
-    }
-    if let Some(provider) = METER_PROVIDER.get() {
-        let _ = provider.shutdown();
-    }
 }

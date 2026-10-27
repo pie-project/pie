@@ -53,19 +53,6 @@ unsafe impl Send for CellPtr {}
 // SAFETY: as `Send` — sharing the address shares only access to an atomic.
 unsafe impl Sync for CellPtr {}
 
-impl CellPtr {
-    pub const NULL: CellPtr = CellPtr(ptr::null_mut());
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct CompletionTarget {
-    pub wait_id: u64,
-
-    pub target_epoch: u64,
-
-    pub terminal_cell: CellPtr,
-}
-
 pub trait CompletionLease: Send + Sync {
     fn is_closed(&self) -> bool;
 }

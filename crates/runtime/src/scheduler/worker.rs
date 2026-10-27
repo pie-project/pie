@@ -758,59 +758,6 @@ impl SchedulerHandle {
         Arc::clone(&self.inner.stats)
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "a pass-through to `PendingRequest::direct`: every argument is \
-                  forwarded unchanged into that constructor, so the width is that \
-                  struct's field list arriving one call earlier"
-    )]
-    pub fn submit_with_identity_and_copy(
-        &self,
-        request: crate::engine::FireRequest,
-        instance_id: ::engine::InstanceId,
-        completion: WorkItemCompletion,
-        pipeline_id: Option<ProcessId>,
-        prelaunch_copy: Option<::engine::KvCopy>,
-        prelaunch_state_copy: Option<StateCopy>,
-    ) -> Result<()> {
-        self.send(SchedulerItem::Launch {
-            pending: PendingRequest::direct(
-                request,
-                instance_id,
-                completion,
-                pipeline_id,
-                pipeline_id,
-                prelaunch_copy,
-                prelaunch_state_copy,
-                None,
-                /*lora_program=*/ false,
-            ),
-        })
-    }
-
-    pub fn submit_prebuilt_with_copy(
-        &self,
-        request: crate::engine::FireRequest,
-        instance_id: ::engine::InstanceId,
-        completion: WorkItemCompletion,
-        prelaunch_copy: Option<::engine::KvCopy>,
-        prelaunch_state_copy: Option<StateCopy>,
-    ) -> Result<()> {
-        self.send(SchedulerItem::Launch {
-            pending: PendingRequest::direct(
-                request,
-                instance_id,
-                completion,
-                None,
-                None,
-                prelaunch_copy,
-                prelaunch_state_copy,
-                None,
-                /*lora_program=*/ false,
-            ),
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn submit_prebuilt_tracked_with_copy(
         &self,

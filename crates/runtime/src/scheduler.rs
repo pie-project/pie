@@ -319,60 +319,6 @@ pub(crate) fn nudge(engine_idx: usize) {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn submit_async_with_kv_copy(
-    request: crate::engine::FireRequest,
-    engine_idx: usize,
-    instance_id: ::engine::InstanceId,
-    pipeline_id: Option<ProcessId>,
-    completion: crate::engine::WorkItemCompletion,
-    copy_src: Vec<u32>,
-    copy_dst: Vec<u32>,
-) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
-        src: device_domain(engine_idx),
-        dst: device_domain(engine_idx),
-        src_page_ids: copy_src,
-        dst_page_ids: copy_dst,
-        moves: Vec::new(),
-        windowed: Vec::new(),
-    });
-    scheduler_handle(engine_idx)?.submit_with_identity_and_copy(
-        request,
-        instance_id,
-        completion,
-        pipeline_id,
-        prelaunch_copy,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn submit_prebuilt_async_with_kv_copy(
-    request: crate::engine::FireRequest,
-    engine_idx: usize,
-    instance_id: ::engine::InstanceId,
-    completion: crate::engine::WorkItemCompletion,
-    copy_src: Vec<u32>,
-    copy_dst: Vec<u32>,
-) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
-        src: device_domain(engine_idx),
-        dst: device_domain(engine_idx),
-        src_page_ids: copy_src,
-        dst_page_ids: copy_dst,
-        moves: Vec::new(),
-        windowed: Vec::new(),
-    });
-    scheduler_handle(engine_idx)?.submit_prebuilt_with_copy(
-        request,
-        instance_id,
-        completion,
-        prelaunch_copy,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     handle: &worker::SchedulerHandle,
     request: crate::engine::FireRequest,

@@ -55,8 +55,6 @@ impl Front {
 
 mod png {
 
-    #![allow(dead_code)]
-
     fn crc32(bytes: &[u8]) -> u32 {
         let mut crc = 0xffff_ffffu32;
         for &b in bytes {

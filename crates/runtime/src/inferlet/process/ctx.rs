@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::ordered::OrderedPermit;
-use wasmtime::component::{ResourceAny, ResourceTable};
+use wasmtime::component::ResourceTable;
 #[cfg(not(target_arch = "wasm32"))]
 use wasmtime_wasi::FsPerms;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -43,7 +43,6 @@ pub struct ProcessCtx {
     /// script it runs.
     script: Option<Arc<Script>>,
 
-    guest_resource_map: Vec<(ResourceAny, u32)>,
     residency: Arc<Mutex<ProcessResidency>>,
     prewarm_permit: Option<OrderedPermit>,
     props: client_api::Props,
@@ -213,7 +212,6 @@ impl ProcessCtx {
             network_allowed: policy.network.allow,
             scratch_dir,
             script,
-            guest_resource_map: Vec::new(),
             residency: {
                 let residency = Arc::new(Mutex::new(ProcessResidency::default()));
                 super::residency::register_residency(id, Arc::downgrade(&residency));
@@ -390,12 +388,5 @@ impl ProcessCtx {
                 scope: scope.clone(),
                 fires: Arc::downgrade(fires),
             });
-    }
-
-    pub fn rep_for_guest_resource(&self, resource: ResourceAny) -> Option<u32> {
-        self.guest_resource_map
-            .iter()
-            .find(|(r, _)| *r == resource)
-            .map(|(_, rep)| *rep)
     }
 }
