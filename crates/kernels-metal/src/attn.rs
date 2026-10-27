@@ -494,6 +494,7 @@ fn selected(
     sm_scale: f32,
     ratio: u32,
     selection: Tensor,
+    per_head: bool,
     o: Tensor,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, q.dtype, { Bf16 => () });
@@ -518,6 +519,21 @@ fn selected(
     let shape = Paged::of(op, q, pool, None, true, head_dim)?;
     let ratio = nonzero(op, "the block width this reader expands", ratio)?;
     let top_k = nonzero(op, "the selection budget", selection.width)?;
+    // One run per kv head: each head's budget is its share of the row.
+    let top_k = if per_head {
+        if !top_k.is_multiple_of(shape.kv_heads) {
+            return Err(refuse(
+                op,
+                format!(
+                    "a {top_k}-wide selection is not one run per each of {} kv heads",
+                    shape.kv_heads
+                ),
+            ));
+        }
+        top_k / shape.kv_heads
+    } else {
+        top_k
+    };
     if selection.rows < shape.rows {
         return Err(refuse(
             op,
@@ -553,6 +569,7 @@ fn selected(
             selection.arg(),
             stated(op, top_k)?.arg(),
             stated(op, ratio)?.arg(),
+            i32::from(per_head).arg(),
         ],
     )
 }
@@ -568,6 +585,7 @@ pub fn decode_selected(
     head_dim: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
     o: Tensor,
 ) -> Result<(), Error> {
     selected(
@@ -585,6 +603,7 @@ pub fn decode_selected(
         sm_scale,
         ratio,
         selection,
+        per_head,
         o,
     )
 }
@@ -601,6 +620,7 @@ pub fn prefill_selected(
     kv_heads: u32,
     sm_scale: f32,
     ratio: u32,
+    per_head: bool,
     o: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.prefill";
@@ -620,6 +640,7 @@ pub fn prefill_selected(
         sm_scale,
         ratio,
         selection,
+        per_head,
         o,
     )
 }
@@ -1194,6 +1215,7 @@ mod tests {
             HEAD_DIM,
             0.125,
             4,
+            false,
             bf16(12, 2, Q_HEADS * HEAD_DIM),
         )
         .expect_err("a window and a selection are two answers to one question");
@@ -1213,6 +1235,7 @@ mod tests {
             HEAD_DIM,
             0.125,
             0,
+            false,
             bf16(12, 2, Q_HEADS * HEAD_DIM),
         )
         .expect_err("a zero block width names no cells");
@@ -1232,6 +1255,7 @@ mod tests {
             HEAD_DIM,
             0.125,
             4,
+            false,
             bf16(12, 4, Q_HEADS * HEAD_DIM),
         )
         .expect_err("two selection rows do not seat four query rows");
@@ -2236,6 +2260,94 @@ pub mod index {
                 stated(OP, rows)?.arg(),
                 stated(OP, top_k)?.arg(),
                 stated(OP, ratio)?.arg(),
+            ],
+        )
+    }
+
+    /// Each row's blocks, one run of `top_k` per head (`attn.index_topk`
+    /// scored `block_max`): a block scores the best `q_h.k` among its keys the
+    /// row sees, the row's own block always kept, ascending, -1 past the end.
+    #[allow(clippy::too_many_arguments)]
+    pub fn topk_block_max(
+        ctx: &Ctx<'_>,
+        q: Tensor,
+        keys: &KvPool,
+        positions: Tensor,
+        request_of_token: Tensor,
+        scores: Tensor,
+        heads: u32,
+        head_dim: u32,
+        top_k: u32,
+        block: u32,
+        selection: Tensor,
+    ) -> Result<(), Error> {
+        const OP: &str = "attn.index_topk";
+        let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "index_topk_block_max_bfloat16" });
+        let heads = nonzero(OP, "the head count this ranking states", heads)?;
+        let head_dim = nonzero(OP, "the key width this ranking states", head_dim)?;
+        let top_k = nonzero(OP, "the selection budget this ranking states", top_k)?;
+        let block = nonzero(OP, "the block width this ranking scores", block)?;
+        if heads > 8 || !head_dim.is_multiple_of(32) || head_dim / 32 > 8 {
+            return Err(refuse(
+                OP,
+                format!(
+                    "a block-max ranking holds at most 8 heads of a multiple of 32 up to 256 \
+                     wide, not {heads} of {head_dim}"
+                ),
+            ));
+        }
+        if keys.page_size <= 0 {
+            return Err(refuse(OP, "the index cache page size is zero"));
+        }
+        pool_pitch(OP, keys, head_dim)?;
+        if q.width != heads.saturating_mul(head_dim) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the {}-wide index query does not divide by the stated head count and \
+                     width",
+                    q.width
+                ),
+            ));
+        }
+        if selection.width != heads.saturating_mul(top_k) {
+            return Err(refuse(
+                OP,
+                "the selection this statement allocated is not one budget per head",
+            ));
+        }
+        let rows = nonzero(OP, "rows", selection.rows)?;
+        // Each head's block scores sit in the row's score slab, `blocks` apart.
+        let slab = nonzero(OP, "the score slab's key stride", scores.width)?;
+        let blocks = (slab - 1) / block + 1;
+        if scores.rows < rows || blocks.saturating_mul(heads) > slab {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the score slab seats {} rows of {slab} and this ranking launches {rows} \
+                     of {heads} x {blocks}",
+                    scores.rows
+                ),
+            ));
+        }
+        ctx.fire(
+            Fire::at(FILE, entry).apply(Grid::of([K_BLOCK, rows, 1], [K_BLOCK, 1, 1])),
+            &[
+                q.arg(),
+                keys.keys.arg(),
+                positions.arg(),
+                request_of_token.arg(),
+                keys.page_indices.arg(),
+                keys.page_indptr.arg(),
+                scores.arg_mut(),
+                selection.arg_mut(),
+                stated(OP, heads)?.arg(),
+                stated(OP, head_dim)?.arg(),
+                keys.page_size.arg(),
+                stated(OP, slab)?.arg(),
+                stated(OP, blocks)?.arg(),
+                stated(OP, top_k)?.arg(),
+                stated(OP, block)?.arg(),
             ],
         )
     }
