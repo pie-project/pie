@@ -97,7 +97,7 @@ fn router(
     routes: impl Stored,
     weights: impl Stored,
 ) -> Result<(), Error> {
-    expect(op, logits, &[Dtype::Bf16])?;
+    expect(op, logits, &[Dtype::Bf16, Dtype::F32])?;
     nonzero(op, "the expert count", experts)?;
     nonzero(op, "the fan-out", top_k)?;
     if logits.width() != experts {
