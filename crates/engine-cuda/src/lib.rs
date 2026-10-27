@@ -309,7 +309,8 @@ mod tests {
                 let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
                 let (here, _) = formed(fused.clone());
                 let (anchored, _) = crate::synth::fold_anchors(fused);
-                let (folded, _) = poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
+                let (folded, _) =
+                    poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
                 let (left, thin) = formed(folded);
                 let held = census.entry(kernel).or_default();
                 held.0 += here;
@@ -377,7 +378,8 @@ mod tests {
             };
             let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
             let (anchored, _) = crate::synth::fold_anchors(fused);
-            let (folded, _) = poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
+            let (folded, _) =
+                poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
             let regions: Vec<(Vec<poem_ir::ValueId>, Vec<poem_ir::ValueId>)> = folded
                 .nodes
                 .iter()

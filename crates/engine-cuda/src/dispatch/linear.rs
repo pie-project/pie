@@ -432,7 +432,15 @@ impl Run<'_> {
             .anchor_epilogue(key)
             .ok_or_else(|| broken(format!("the load loaded no epilogue for {key:016x}")))?;
         let (planes, landed, paging) = self.anchor_planes(epi, ins, outs, cache)?;
-        if linear::gemm::epilogue(self.ctx(), OP, epi, self.tensor(y), &planes, &landed, paging)? {
+        if linear::gemm::epilogue(
+            self.ctx(),
+            OP,
+            epi,
+            self.tensor(y),
+            &planes,
+            &landed,
+            paging,
+        )? {
             Ok(())
         } else {
             Err(broken(

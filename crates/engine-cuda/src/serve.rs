@@ -511,15 +511,15 @@ impl Shell {
         })
     }
 
-    /// Pins this rank's host pool: one rs row per device slot, then kv
-    /// pages, then windowed pages, from `stated` bytes shared by `ranks`,
-    /// within the host memory the load left. Unstated, it holds `seats`
-    /// sequences at `context` tokens, and at least one device pool's worth
-    /// of each.
     /// Device pools' worth of host kv the unstated default seats at most
     /// ([`Self::seat_host_kv`]).
     pub const HOST_POOLS: u64 = 4;
 
+    /// Seats this rank's host pool, pinned as it is first used: one rs row
+    /// per device slot, then kv pages, then windowed pages, from `stated`
+    /// bytes shared by `ranks`, within the host memory the load left.
+    /// Unstated, it holds `seats` sequences at `context` tokens, and at least
+    /// one device pool's worth of each.
     pub fn seat_host_kv(
         &mut self,
         stated: Option<u64>,
