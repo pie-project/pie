@@ -21,8 +21,6 @@ pub const SELECT_WORDS: u32 = 10320;
 
 const BARRIER: &str = "  storageBarrier();\n";
 
-pub const WGSL_EMITTER_VERSION: u16 = 5;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
     EntryName(String),

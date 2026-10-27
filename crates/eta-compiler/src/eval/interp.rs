@@ -323,10 +323,6 @@ impl Instance {
             Chan::Shared(ext) => f(&mut ext.inner.lock().expect("lock poisoned")),
         }
     }
-    pub fn peek_front(&self, chan: u32) -> Option<Value> {
-        self.with_chan(chan as usize, |st| st.queue.front().cloned())
-    }
-
     pub fn poison(&mut self) {
         self.poisoned = true;
     }

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use eta_compiler::plan::{CompiledStage, compile_bound, debug_stage_plan};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -31,10 +30,6 @@ pub const GOLDEN_NAMES: &[&str] = &[
 
 pub fn golden_dir() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden").into()
-}
-
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn unhex(text: &str) -> Vec<u8> {
@@ -285,10 +280,6 @@ pub fn corpus_stages() -> Vec<CorpusStage> {
         push(name, container, served);
     }
     stages
-}
-
-pub fn op_tag(stage: &CompiledStage, node: u32) -> u8 {
-    eta_compiler::codegen::metal::OpView::of(&stage.normalized.ops[node as usize]).tag
 }
 
 pub fn is_library(region: &eta_compiler::plan::Region) -> bool {
