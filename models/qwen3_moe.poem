@@ -69,7 +69,7 @@ DEPLOYMENTS = (
 
 # The weights of Qwen 3 MoE: per layer an RMS norm, the q, k and v
 # projections with per-head q and k norms, the output projection, an RMS
-# norm, the router and the routed experts' banks (gate and up packed); the
+# norm, the router and the routed experts' gate, up and down banks; the
 # token embedding, a final norm and the head. The deployment's first dtype
 # stores the projections, its second (or the first) the expert banks; the
 # norms, the router, the embedding and the head stay bf16 under a release's
@@ -131,7 +131,8 @@ def layout(id, deploy):
             k_norm = weight([hd]),
             mlp_norm = weight([hidden]),
             router = weight([d.experts, hidden]),
-            gate_up = weight([d.experts, 2 * d.inter, hidden], experts),
+            gate = weight([d.experts, d.inter, hidden], experts),
+            up = weight([d.experts, d.inter, hidden], experts),
             down = weight([d.experts, hidden, d.inter], experts),
             kv = "kv.{}".format(l),
             lora_a = lora_a,
@@ -202,7 +203,8 @@ TRANSFORMERS = [
     ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
     ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
     ("model.layers.{l}.mlp.gate.weight", "layers.{l}.router"),
-    (["model.layers.{l}.mlp.experts.{e}.gate_proj.weight", "model.layers.{l}.mlp.experts.{e}.up_proj.weight"], "layers.{l}.gate_up"),
+    ("model.layers.{l}.mlp.experts.{e}.gate_proj.weight", "layers.{l}.gate"),
+    ("model.layers.{l}.mlp.experts.{e}.up_proj.weight", "layers.{l}.up"),
     ("model.layers.{l}.mlp.experts.{e}.down_proj.weight", "layers.{l}.down"),
 ]
 
@@ -245,7 +247,8 @@ def moe(x, m, w):
         routing.softmax(),
     )
 
-    hidden = ops.linear.glu(ops.linear.moe_matmul_select(x, w.gate_up, experts, m.top_k), gating.swiglu(), m.inter)
+    gate = ops.linear.moe_matmul_select(x, w.gate, experts, m.top_k)
+    hidden = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, w.up, experts, m.top_k))
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, w.down, experts, m.top_k), weights)
 
 def attention(x, inputs, m, positions, w):

@@ -61,14 +61,14 @@ DEPLOYMENTS = (
 )
 
 # The weights of GLM-4.5 / 4.6 / 4.7: per layer an RMS norm, q, k and v
-# packed into one biased projection (per-head q and k norms where the model
-# has them), the output projection and an RMS norm; then a SwiGLU MLP on the
-# first layers, routed experts (gate and up packed) behind a router and its
-# score bias beside a shared expert on the rest. The token embedding, a final
-# norm and the head. The deployment's first dtype stores the projections and
-# the shared and dense MLPs, its second (or the first) the routed banks; the
-# norms, biases, router, embedding and head stay bf16 under the FP8 release.
-# Each layer also has the LoRA banks the host registers.
+# projections and their biases (per-head q and k norms where the model has
+# them), the output projection and an RMS norm; then a SwiGLU MLP on the first
+# layers, routed experts behind a router and its score bias beside a shared
+# expert on the rest. The token embedding, a final norm and the head. The
+# deployment's first dtype stores the projections and the shared and dense
+# MLPs, its second (or the first) the routed banks; the norms, biases, router,
+# embedding and head stay bf16 under the FP8 release. Each layer also has the
+# LoRA banks the host registers.
 
 def dims(hidden, layers, experts, inter, dense_layers, dense_inter, qk_norm, scaling, max_position):
     return struct(
@@ -150,7 +150,8 @@ def layout(id, deploy):
             routed = True,
             router = weight([d.experts, hidden]),
             bias = weight([d.experts], dtype.f32),
-            gate_up = weight([d.experts, 2 * iw, hidden], experts),
+            gate = weight([d.experts, iw, hidden], experts),
+            up = weight([d.experts, iw, hidden], experts),
             down = weight([d.experts, hidden, iw], experts),
             shared = struct(
                 gate = weight([sw, hidden], mlp_w),
@@ -261,10 +262,8 @@ TRANSFORMERS = [
     ("model.layers.{l}.mlp.shared_experts.gate_proj.weight", "layers.{l}.mlp.shared.gate"),
     ("model.layers.{l}.mlp.shared_experts.up_proj.weight", "layers.{l}.mlp.shared.up"),
     ("model.layers.{l}.mlp.shared_experts.down_proj.weight", "layers.{l}.mlp.shared.down"),
-    ([
-        "model.layers.{l}.mlp.experts.{e}.gate_proj.weight",
-        "model.layers.{l}.mlp.experts.{e}.up_proj.weight",
-    ], "layers.{l}.mlp.gate_up"),
+    ("model.layers.{l}.mlp.experts.{e}.gate_proj.weight", "layers.{l}.mlp.gate"),
+    ("model.layers.{l}.mlp.experts.{e}.up_proj.weight", "layers.{l}.mlp.up"),
     ("model.layers.{l}.mlp.experts.{e}.down_proj.weight", "layers.{l}.mlp.down"),
 ]
 
@@ -315,7 +314,8 @@ def mlp(x, f):
     gate, up = ops.linear.matmul(x, f.shared.gate), ops.linear.matmul(x, f.shared.up)
     act = ops.linear.glu(gate, gating.swiglu(), up = up)
     shared = ops.linear.matmul(act, f.shared.down)
-    act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k), gating.swiglu(), f.inter)
+    gate = ops.linear.moe_matmul_select(x, f.gate, routes, f.top_k)
+    act = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, f.up, routes, f.top_k))
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     return ops.elemwise.residual_add(shared, routed)
 
