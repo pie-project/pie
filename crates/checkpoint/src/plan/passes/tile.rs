@@ -9,8 +9,12 @@ use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme};
 pub const CUDA_CAST_FP32_TO_BF16: &str = "cast::cast_fp32_to";
 pub const CUDA_SCALE_ROWS_BF16: &str = "cast::scale_rows";
 
-pub const CUDA_TILE_MAP_MASK: u32 =
-    TILE_MAP_CAST | TILE_MAP_SCALE | TILE_MAP_DECODE | TILE_MAP_BIAS;
+pub const CUDA_TILE_MAP_MASK: u32 = TILE_MAP_CAST
+    | TILE_MAP_REBLOCK
+    | TILE_MAP_SCALE
+    | TILE_MAP_DECODE
+    | TILE_MAP_BIAS
+    | TILE_MAP_UNARY;
 
 pub const METAL_TILE_MAP_MASK: u32 = TILE_MAP_CAST
     | TILE_MAP_REBLOCK
