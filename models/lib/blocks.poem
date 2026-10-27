@@ -1,0 +1,35 @@
+# The blocks dense decoders share: grouped-query attention over a paged KV
+# cache and a SwiGLU MLP. `m` carries the attention's shape (`q_heads`,
+# `kv_heads`, `head_dim`, `theta`, `sm_scale`, `eps`); `w` a layer's
+# weights under their usual names.
+
+def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_norm = None, biased = False):
+    """Grouped-query attention over `w.kv`, out through `w.o`. `biased` adds
+    `w.q_bias`, `w.k_bias` and `w.v_bias`; `qk_norm` norms q and k by
+    `w.q_norm` and `w.k_norm`, each head on its own ("head") or across its
+    full width ("width"); `rotary_dim` rotates only that many leading dims
+    of each head."""
+    pages = inputs.kv(w.kv)
+    d = m.head_dim
+    q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
+    if biased:
+        q, k, v = ops.elemwise.add_bias(w.q_bias, q), ops.elemwise.add_bias(w.k_bias, k), ops.elemwise.add_bias(w.v_bias, v)
+    if qk_norm == "head":
+        q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
+        k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
+    elif qk_norm == "width":
+        q = ops.elemwise.rmsnorm(q, w.q_norm, m.eps)
+        k = ops.elemwise.rmsnorm(k, w.k_norm, m.eps)
+    rotation = rotary.full() if rotary_dim == None else rotary.partial(rotary_dim)
+    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotation, k = k, scaling = scaling)
+    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
+
+    # Each lane by its kind; a lane may bring its own mask. A lane capturing
+    # scores reads them out too.
+    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
+    return ops.linear.matmul(o, w.o)
+
+def swiglu(x, w):
+    """The SwiGLU MLP through `w.gate`, `w.up` and `w.down`."""
+    gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
+    return ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)

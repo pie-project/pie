@@ -10,7 +10,8 @@
 # `--deployment glm46-…`.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/blocks.poem", "attention", "swiglu")
 
 GLM45 = template("glm45")
 GLM47 = template("glm47")
@@ -287,10 +288,9 @@ def forward(m, inputs):
 
     def block(l, w, y):
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, positions, w)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
-        y = ops.elemwise.residual_add(o, y)
+        qk_norm = None if w.q_norm == None else "head"
+        o = attention(x, inputs, m, w, positions, rotary_dim = m.rotary_dim, qk_norm = qk_norm, biased = True)
+        y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
         return ops.elemwise.residual_add(mlp(x, w.mlp), y)
 
@@ -301,8 +301,7 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
-        return ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.down)
+        return swiglu(x, f)
     routes, weights = ops.linear.moe_route(
         ops.linear.matmul(x, f.router),
         f.experts,
@@ -311,27 +310,8 @@ def mlp(x, f):
         bias = f.bias,
     )
 
-    gate, up = ops.linear.matmul(x, f.shared.gate), ops.linear.matmul(x, f.shared.up)
-    act = ops.linear.glu(gate, gating.swiglu(), up = up)
-    shared = ops.linear.matmul(act, f.shared.down)
+    shared = swiglu(x, f.shared)
     gate = ops.linear.moe_matmul_select(x, f.gate, routes, f.top_k)
     act = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, f.up, routes, f.top_k))
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     return ops.elemwise.residual_add(shared, routed)
-
-def attention(x, inputs, m, positions, w):
-    pages = inputs.kv(w.kv)
-    d = m.head_dim
-    q = ops.elemwise.add_bias(w.q_bias, ops.linear.matmul(x, w.q))
-    k = ops.elemwise.add_bias(w.k_bias, ops.linear.matmul(x, w.k))
-    v = ops.elemwise.add_bias(w.v_bias, ops.linear.matmul(x, w.v))
-    if w.q_norm != None:
-        q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
-        k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
-    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.partial(m.rotary_dim), k = k)
-    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
-
-    # Each lane by its kind; a lane may bring its own mask. A lane capturing
-    # scores reads them out too.
-    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
-    return ops.linear.matmul(o, w.o)
