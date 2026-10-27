@@ -156,7 +156,7 @@ fn apply_penalties(
     (&l - &freq - &pres, penalized, peak)
 }
 
-/// One sampling step. Returns `(token, counts_next, penalized_count, peak)`.
+/// One sampling step. Returns `(token, penalized_count, peak)`.
 fn step(
     logits: Tensor,
     vocab: u32,
@@ -164,7 +164,7 @@ fn step(
     counts: &Tensor,
     prompt_present: &Tensor,
     rng_state: &Tensor,
-) -> (Tensor, Tensor, Tensor, Tensor) {
+) -> (Tensor, Tensor, Tensor) {
     let (penalized, n_penalized, peak) =
         apply_penalties(&logits, vocab, cfg, counts, prompt_present);
     // Temperature last, matching vLLM's ordering: the penalties are defined on
@@ -175,11 +175,21 @@ fn step(
         &penalized / cfg.temperature
     };
     let token = gumbel_max(scaled, rng_state);
-    // `gumbel_max` reduces the row away, so the token index is rank-0. The
-    // scatter's `vals` must then be rank-0 too — a `[1]` vector would not match
-    // `idx.dims ++ base.dims[1..]`, which is empty here.
-    let counts_next = scatter_add(counts, &token, 1.0f32);
-    (token, counts_next, n_penalized, peak)
+    (token, n_penalized, peak)
+}
+
+/// Three `[1]` f32 values as one `[3]` cell.
+fn pack3(a: &Tensor, b: &Tensor, c: &Tensor) -> Tensor {
+    let lane = iota(3);
+    select(
+        eq(&lane, broadcast(0u32, [3])),
+        broadcast(a, [3]),
+        select(
+            eq(&lane, broadcast(1u32, [3])),
+            broadcast(b, [3]),
+            broadcast(c, [3]),
+        ),
+    )
 }
 
 #[inferlet::main]
@@ -227,27 +237,16 @@ async fn main(input: Input) -> Result<Output> {
     }
     let n = prompt.len() as u32;
 
-    // The repetition penalty's scope includes the prompt, so seed the presence
-    // vector on the host — one pass over the prompt beats a device scatter that
-    // would have to run inside the prefill graph.
-    let mut present = vec![0.0f32; vocab as usize];
-    for &t in &prompt {
-        if (t as usize) < present.len() {
-            present[t as usize] = 1.0;
-        }
-    }
-
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut penalized: Vec<f32> = Vec::with_capacity(max_tokens);
     let mut peaks: Vec<f32> = Vec::with_capacity(max_tokens);
 
     // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = Channel::from(prompt_i32);
+    let toks_p = Channel::from(prompt_i32.clone());
+    let prompt_p = Channel::from(prompt_i32.clone());
     let embed_indptr_p = Channel::from([0u32, n]);
     let rng_p = Channel::from([input.seed, 0]);
-    let counts_p = Channel::from(vec![0.0f32; vocab as usize]);
-    let present_p = Channel::from(present.clone());
     let tok_out_p = Channel::new([1], dtype::i32);
     let pen_out_p = Channel::new([1], dtype::f32);
     let peak_out_p = Channel::new([1], dtype::f32);
@@ -257,16 +256,15 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.state(&[&ws], StateGeometry::folding())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
-        let counts = counts_p.take();
-        let present = present_p.take();
+        let p_toks = prompt_p.read();
+        let counts = broadcast(0.0f32, [vocab]);
+        let present = scatter_set(broadcast(0.0f32, [vocab]), &p_toks, 1.0f32);
         let logits = intrinsics::output(0, "logits");
-        let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
+        let (token, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
         pen_out_p.put(&n_pen);
         peak_out_p.put(&peak);
-        counts_p.put(&counts_next);
-        present_p.put(&present);
         rng_p.put(&r_next);
     });
 
@@ -282,20 +280,15 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
     if generated.len() < max_tokens {
-        // The decode pass owns fresh channels, so the histogram has to be
-        // handed over explicitly: it must already contain the prefill's token.
-        let mut counts0 = vec![0.0f32; vocab as usize];
-        if (g0 as usize) < counts0.len() {
-            counts0[g0 as usize] = 1.0;
-        }
+        let mut hist0 = vec![-1i32; max_tokens];
+        hist0[0] = g0;
 
         let tok_in = Channel::from([g0]);
         let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
-        let counts_c = Channel::from(counts0);
-        let present_c = Channel::from(present);
-        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-        let pen_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
-        let peak_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
+        let hist_c = Channel::from(hist0);
+        let hlen_c = Channel::from([1u32]);
+        let prompt_c = Channel::from(prompt_i32);
+        let out = Channel::new([3], dtype::f32).capacity(channel_capacity() as u32);
         let lane1 = Channel::from([0u32, 1u32]);
 
         let fwd = ForwardPass::new();
@@ -304,33 +297,37 @@ async fn main(input: Input) -> Result<Output> {
         fwd.epilogue(move || {
             // Takes and compute first, puts last (value-id discipline).
             let r = rng.take();
-            let counts = counts_c.take();
-            let present = present_c.take();
+            let hist = hist_c.take();
+            let hlen = hlen_c.take();
+            let p_toks = prompt_c.read();
             let logits = intrinsics::output(0, "logits");
-            let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
+            let counts = scatter_add(broadcast(0.0f32, [vocab]), &hist, 1.0f32);
+            let present = scatter_set(broadcast(0.0f32, [vocab]), &p_toks, 1.0f32);
+            let (token, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
+            let hist_next = scatter_set(&hist, &hlen, &token);
 
             let r_next = &r + iota(2);
 
             tok_in.put(&token);
-            tok_out.put(&token);
-            pen_out.put(&n_pen);
-            peak_out.put(&peak);
-            counts_c.put(&counts_next);
-            present_c.put(&present);
+            out.put(pack3(
+                &cast(reshape(&token, [1]), dtype::f32),
+                &n_pen,
+                &peak,
+            ));
+            hist_c.put(&hist_next);
+            hlen_c.put(&hlen + 1u32);
             rng.put(&r_next);
         });
 
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget, async || {
-            let t = tok_out
-                .take_host::<i32>()
+            let v = out
+                .take_host::<Vec<f32>>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
-            let p = pen_out.take_host::<f32>().await?;
-            let k = peak_out.take_host::<f32>().await?;
-            generated.push(t as u32);
-            penalized.push(p);
-            peaks.push(k);
+            generated.push(v[0] as u32);
+            penalized.push(v[1]);
+            peaks.push(v[2]);
             Ok(ControlFlow::Continue(()))
         })
         .await?;
