@@ -68,4 +68,48 @@ fn a_dag_schedule_orders_every_wait_after_its_close() {
         Some(0),
         "a fire ends on the main stream"
     );
+
+    let vlm = poem_compiler::catalog::deployment("qwen35-d0.8b-vision-bf16-kv-bf16")
+        .expect("the vision row is in the catalog");
+    let vlm_compiled =
+        bake_with(&vlm.trace(poem::Platform::Cuda), &profile).expect("the vision trace bakes");
+    assert_eq!(vlm_compiled.units.len(), 2, "tower and trunk units");
+    let mut vlm_closed: BTreeMap<u32, usize> = BTreeMap::new();
+    for (at, region) in vlm_compiled.regions.iter().enumerate() {
+        if region.phase != poem_compiler::Phase::Capture {
+            assert_eq!(region.stream, 0, "prepare region {at} stays on stream 0");
+            assert!(
+                region.wait.is_empty() && region.open.is_none() && region.close.is_none(),
+                "prepare region {at} carries no stream events"
+            );
+            continue;
+        }
+        for event in &region.wait {
+            let Some(&by) = vlm_closed.get(&event.0) else {
+                panic!("region {at} waits on unclosed event {}", event.0);
+            };
+            assert_eq!(
+                vlm_compiled.unit_of(by),
+                vlm_compiled.unit_of(at),
+                "event {} crosses from unit {} (region {by}) to unit {} (region {at})",
+                event.0,
+                vlm_compiled.unit_of(by),
+                vlm_compiled.unit_of(at)
+            );
+        }
+        if let Some(event) = region.close {
+            vlm_closed.insert(event.0, at);
+        }
+    }
+    for unit in 0..vlm_compiled.units.len() as u32 {
+        let span = vlm_compiled.unit_script(unit).expect("unit has capture regions");
+        assert_eq!(
+            vlm_compiled.regions[span.start as usize].stream, 0,
+            "unit {unit} starts on stream 0"
+        );
+        assert_eq!(
+            vlm_compiled.regions[span.end as usize - 1].stream, 0,
+            "unit {unit} ends on stream 0"
+        );
+    }
 }

@@ -84,8 +84,9 @@ pub fn compile_axes(
         let every: std::collections::BTreeSet<u32> = (0..trace.nodes.len() as u32).collect();
         let mut fine = region::coalesce_breaking(trace, &classes, &every)?;
         region::hoist(trace, &mut fine)?;
+        let (_, fine_units_of) = unit::partition(&fine)?;
         lowering::lower(trace, &mut fine, &classes, budget, profile);
-        Some(stream::dag_lanes(trace, &mut fine, profile))
+        Some(stream::dag_lanes(trace, &mut fine, &fine_units_of, profile))
     } else {
         None
     };
@@ -102,9 +103,9 @@ pub fn compile_axes(
     lowering::lower(trace, &mut regions, &classes, budget, profile);
 
     let streams = if let Some((lanes, _)) = &lanes {
-        stream::fork_dag(trace, &mut regions, profile, Some(lanes))
+        stream::fork_dag(trace, &mut regions, &units_of, profile, Some(lanes))
     } else {
-        stream::fork_with(trace, &mut regions, profile)
+        stream::fork_with(trace, &mut regions, &units_of, profile)
     };
     let concurrency =
         Concurrency::with_pairs(&regions, trace.nodes.len(), streams.pairs.iter().copied());
