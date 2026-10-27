@@ -6,12 +6,6 @@ load("//lib/spoken.poem", "QWEN_STOP")
 NO_THINKING = template("chatml", thinking = True, generation_suffix = "<think>\n\n</think>\n\n", stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the transformer's q, k and v, packed or not, and its feed-forward
-# gate and up by their heads and channels, their output projections by
-# their rows; the text encoder's likewise.
-CUTS = "inferred"
-
 MODELS = [
     model("flux2-klein-4b", template = NO_THINKING, tokenizer = TOKENIZER, arch = "flux_2", layers = 27, vocab = 151936),
     model("flux2-mini", mini = True, template = NO_THINKING, tokenizer = TOKENIZER, arch = "flux_2", layers = 4, vocab = 0),

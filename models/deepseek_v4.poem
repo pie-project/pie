@@ -5,14 +5,6 @@
 
 load("//lib/adapters.poem", "banks")
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q's up projection and the attention's sinks by their heads, the
-# base model's per-head kv and its norm across all of them with them (each
-# rank's sum of squares summed across the ranks), the grouped output
-# projections, the dense, shared and routed experts by their channels, the
-# down projections by their rows.
-CUTS = "inferred"
-
 R1 = template("deepseek")
 TOKENIZER = tokenizer(markers = [["<｜end▁of▁sentence｜>", "<|EOT|>"]])
 

@@ -23,14 +23,6 @@ CHATML_NEXT = template("chatml", thinking = True, tools = True, stop = QWEN_STOP
 TOKENIZER = tokenizer(markers = [QWEN_STOP], parts = {"vision": [QWEN_VISION]})
 TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"vision": [QWEN_VISION]})
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the gated attention's q and gate, k and v by their heads, the GDN
-# mixer's projections, convolution and per-head parameters by its
-# heads, the gates and ups, dense, shared and routed, by their channels, the
-# output and down projections by their rows, the head and a tied table by
-# their vocabulary, and the vision tower's mlp as the trunk's.
-CUTS = "inferred"
-
 def qwen(id, layers, vocab = 248320, template = CHATML, tokenizer = TOKENIZER, **kwargs):
     return model(id, template = template, tokenizer = tokenizer, arch = "qwen3_5", layers = layers, vocab = vocab, **kwargs)
 

@@ -6,11 +6,6 @@ load("//lib/adapters.poem", "banks")
 
 ATEM = template("atem")
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k, v and the attention's gate by their heads, the MLP's gate
-# and up by their channels, the output and down projections by their rows,
-# the head by its vocabulary.
-CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|eot|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"]])
 
 MODELS = [

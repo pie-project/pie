@@ -15,11 +15,6 @@ load("//lib/adapters.poem", "banks")
 GLM45 = template("glm45")
 GLM47 = template("glm47")
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k, v and their biases by their heads, the gate and the up, the
-# shared expert's and each routed expert's gate and up by their channels, the
-# output and down projections by their rows, the head by its vocabulary.
-CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|user|>", "<|observation|>", "<|endoftext|>"], ["[gMASK]", "<sop>", "<|system|>", "<|assistant|>", "<think>", "</think>"]])
 
 def glm(id, layers, spoken, mini = False):

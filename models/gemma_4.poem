@@ -13,13 +13,6 @@ GEMMA = template("gemma")
 GEMMA_THOUGHT = template("gemma", thinking = True)
 TOKENIZER = tokenizer(markers = [["<turn|>", "<eos>"]], parts = {"vision": [["<|image>", "<|image|>", "<image|>"]]})
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k and v by their heads, the gates and ups, dense and routed, by
-# their channels, the output and down projections by their rows, the tied
-# table by its vocabulary; the vision tower's mlp and the MTP assistant as
-# the trunk's.
-CUTS = "inferred"
-
 MODELS = [
     model("gemma4-26b-a4b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["mtp", "dflash"], arch = "gemma4", layers = 30, vocab = 262144),
     model("gemma4-31b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["mtp"], arch = "gemma4", layers = 60, vocab = 262144),

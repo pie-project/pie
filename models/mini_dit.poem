@@ -6,12 +6,6 @@ load("//lib/spoken.poem", "QWEN_STOP")
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the packed q, k and v, the cross-attention's q and kv by their
-# heads, the gate and up by their channels, the output and down projections
-# by their rows.
-CUTS = "inferred"
-
 MODELS = [model("mini-dit", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "mini_dit", layers = 3, vocab = 0, taps = True)]
 
 DEPLOYMENTS = [deployment("mini-dit", weights = dtype.bf16, kv = dtype.bf16)]

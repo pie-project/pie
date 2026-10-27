@@ -15,12 +15,6 @@ load("//lib/spoken.poem", "QWEN_STOP")
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k and v by their heads, the gate and the up by their
-# channels, the output and down projections by their rows, the head by its
-# vocabulary, and the embedding a small model's head reads tied by it too.
-CUTS = "inferred"
-
 def qwen3(id, layers):
     return model(id, template = CHATML, tokenizer = TOKENIZER, arch = "qwen3", layers = layers, vocab = 151936)
 

@@ -42,13 +42,6 @@ def rows(id):
 
 DEPLOYMENTS = rows("minimax-m25") + rows("minimax-m27") + rows("minimax-m25-mini")
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k and v by their heads, the norms of q and k with them (each
-# rank's sum of squares summed across the ranks), the routed gates and ups
-# by their channels, the output and down projections by their rows, and the
-# head by its vocabulary.
-CUTS = "inferred"
-
 # The weights of MiniMax-M2: per layer an RMS norm, the q, k and v
 # projections, q's and k's norms across all their heads, the output
 # projection, an RMS norm, the router, its score bias and the routed experts'

@@ -6,12 +6,6 @@ load("//pie/codec.poem", "bank", "kept", "nvfp4_packed_bank", read_weight = "wei
 MINIMAX = template("minimax")
 TOKENIZER = tokenizer(markers = [["[e~[", "]~b]", "]~!b[", "]<]minimax[>[", "<mm:think>", "</mm:think>"]])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k and v by their heads, the dense and routed gates and ups by
-# their channels, the output and down projections by their rows, the head
-# by its vocabulary.
-CUTS = "inferred"
-
 def m3(id, **kwargs):
     return model(id, template = MINIMAX, tokenizer = TOKENIZER, arch = "minimax_m3_vl", vocab = 200064, **kwargs)
 

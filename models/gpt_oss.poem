@@ -7,12 +7,6 @@ load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap
 HARMONY = template("harmony")
 TOKENIZER = tokenizer(markers = [["<|endoftext|>", "<|return|>", "<|call|>"]])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k, v, their biases and the sinks by their heads, each expert's
-# gate and up and their biases by its channels, the output and down
-# projections by their rows, the head by its vocabulary.
-CUTS = "inferred"
-
 MODELS = [
     model("gptoss-20b", template = HARMONY, tokenizer = TOKENIZER, drafters = ["dflash"], arch = "gptoss", layers = 24, vocab = 201088),
     model("gptoss-20b-mini", mini = True, template = HARMONY, tokenizer = TOKENIZER, arch = "gptoss", layers = 5, vocab = 201088),

@@ -11,15 +11,6 @@ TOKENIZER = tokenizer(
     parts = {"vision": [["<|begin_of_image|>", "<|image|>", "<|end_of_image|>"]]},
 )
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the KDA mixer's packed q, k and v, its convolution, its forget
-# and output gates and its per-head parameters by their heads, the latent
-# attention's q and kv up-projections and gate by theirs, the dense, shared
-# and routed gates and ups by their channels, the output and down
-# projections by their rows, the head by its vocabulary, and the tower's
-# mlp and merger as the trunk's.
-CUTS = "inferred"
-
 MODELS = [
     model(
         "glm53-flash",

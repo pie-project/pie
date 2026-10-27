@@ -10,10 +10,6 @@ load("//lib/adapters.poem", "banks")
 
 LLAMA = template("llama")
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k, v, the gate and the up by their heads and channels, the
-# output and down projections by their rows, the head by its vocabulary.
-CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>"]])
 
 def llama(id, layers, mini = False):

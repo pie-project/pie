@@ -11,13 +11,6 @@ MODELS = [
     model("ltx25-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "ltx_2", layers = 2, vocab = 0),
 ]
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: each attention's q, k and v by their heads, the norms of q and k
-# across all of them with them (each rank's sum of squares summed across the
-# ranks), the FFNs' ups by their channels, and the attentions' and FFNs'
-# output projections by their rows.
-CUTS = "inferred"
-
 DEPLOYMENTS = [
     deployment("ltx25", weights = dtype.bf16, kv = dtype.bf16),
     deployment("ltx25", weights = dtype.u4g64, kv = dtype.bf16),

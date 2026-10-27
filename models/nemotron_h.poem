@@ -13,13 +13,6 @@ STOP = ["<|im_end|>"]
 CHATML = template("chatml", thinking = True, tools = True, generation_suffix = "<think>\n", stop = STOP)
 TOKENIZER = tokenizer(markers = [STOP])
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the Mamba-2 mixer's packed projection, convolution and per-head
-# parameters by its heads and groups, q, k and v by their heads, the routed
-# and shared experts' ups by their channels, the output and down
-# projections by their rows, the head by its vocabulary.
-CUTS = "inferred"
-
 MODELS = [
     model("nemotron3-super", template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 88, vocab = 131072),
     model("nemotron3-ultra", template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 108, vocab = 131072),
