@@ -17,18 +17,14 @@
 [Benchmarks]: https://benchmarks.pie-project.org/
 [Paper (SOSP'25)]: https://ingim.org/papers/gim2025pie.pdf
 
-Pie is a programmable inference engine that serves programs, not prompts. It
-runs small user-supplied WebAssembly programs, called *inferlets*, directly
-next to the model. An inferlet drives the forward pass and owns its state, so
-agent loops, speculative decoding, custom samplers, and KV-cache policies are
-written per application—in Python, JavaScript, or Rust—without modifying the
-engine.
+Pie runs WebAssembly programs—[*inferlets*](examples)—directly next to the
+model. An inferlet drives the forward pass, owns its state, and compiles custom
+epilogues to GPU kernels, so decoding, sampling, caching, and agent loops are
+written per application in Python, JavaScript, or Rust.
 
-Models themselves are programs written in [Poem](models), not hardcoded in
-Rust, so a single runtime serves language, multimodal, diffusion, image, and
-video models. The entire system ships as one ~60 MB binary with no Python or
-PyTorch runtime dependency, running on NVIDIA and AMD GPUs, Apple silicon,
-Google TPUs, Vulkan, and in the browser on WebGPU.
+Models are programs too, written in [Poem](models) across language, vision,
+image, and video. Everything ships as one ~60 MB binary with no Python or
+PyTorch runtime, running on CUDA, ROCm, Metal, Vulkan, XLA (TPUs), and WebGPU.
 
 ## Install
 
@@ -37,7 +33,7 @@ curl -fsSL https://pie-project.org/install.sh | bash        # Linux, macOS, WSL
 irm https://pie-project.org/install.ps1 | iex               # Windows PowerShell
 ```
 
-Then initialize a default configuration and import a model:
+Import a model from Hugging Face:
 
 ```bash
 pie config init
@@ -45,14 +41,13 @@ pie model import Qwen/Qwen3.5-0.8B
 ```
 
 See the [install guide](https://pie-project.org/docs/install) for manual
-archives and backend flavors (`cuda`, `metal`, `vulkan`, `wgpu`), or open the
-[Playground] to run Pie in a browser tab with no install.
+archives and GPU flavors, or run Pie in your browser on the [Playground].
 
 ## Write an inferlet
 
-An inferlet is one file; its extension selects the language. This one is greedy
-text completion ([`examples/quickstart-py`](examples/quickstart-py)), one
-forward pass per token:
+Greedy text completion in Python ([`examples/quickstart-py`](examples/quickstart-py)),
+one forward pass per token (also in [JavaScript](examples/quickstart-js) and
+[Rust](crates/inferlet)):
 
 ```python
 from inferlet import chat, model
@@ -79,31 +74,33 @@ async def main(input: dict) -> dict:
     return {"text": model.decode(tokens[-max_tokens:])}
 ```
 
-Every line describes device work. `embed` feeds the new tokens,
-`StateGeometry.folding()` appends them to the working set, and `epilogue` is
-traced once and compiled into a GPU kernel that runs after each forward pass;
-the host only sees the token it publishes.
-
-The same program in JavaScript is [`examples/quickstart-js`](examples/quickstart-js).
-Rust inferlets use the [`inferlet`](https://crates.io/crates/inferlet) crate
-and compile to `wasm32-wasip3` ([`examples/rust-toolchain.toml`](examples/rust-toolchain.toml)).
-[`examples/`](examples) goes on from here: device loop-carried decode, beam
-search, speculative decoding, KV eviction and sharing, constrained decoding,
-custom samplers, watermarking, and media generation.
+`epilogue` is traced once and compiled into a GPU kernel; the host only sees
+the token it publishes. More in [`examples/`](examples):
+[device loop-carried decode](examples/text-completion),
+[speculative decoding](examples/mtp-speculative-decoding),
+[beam search](examples/beam-search),
+[KV eviction](examples/snapkv-eviction) and
+[prefix sharing](examples/prefix-tree-kv-cache),
+[constrained decoding](examples/json-schema-constrained-decoding),
+[custom samplers](examples/top-a-sampling),
+[watermarking](examples/synthid-tournament-sampling), and
+[media generation](examples/text-to-media).
 
 ## Run & serve
 
-`pie run` runs an inferlet in a one-shot engine:
+Run an inferlet one-shot, or submit it to a running `pie serve` with
+[`pie-client`](https://pypi.org/project/pie-client/):
 
 ```bash
 pie run main.py -- --prompt "The capital of France is"
-# {"text": " Paris, and the capital of the United States is Washington,"}
+pie-client submit --path main.py -- --prompt "The capital of France is"
 ```
 
-`pie serve` keeps the engine running. You can submit inferlets to it with
-`pie-client` (`pip install pie-client`), or connect existing OpenAI, Anthropic,
-and Gemini clients to the same port with no API key—each compatibility API is
-itself a built-in inferlet:
+`pie serve` also speaks the
+[OpenAI](crates/builtins/inferlets/compat-openai),
+[Anthropic](crates/builtins/inferlets/compat-anthropic), and
+[Gemini](crates/builtins/inferlets/compat-gemini) APIs on the same port as
+[built-in inferlets](crates/builtins/inferlets):
 
 ```python
 from openai import OpenAI
@@ -111,22 +108,21 @@ client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
 print(client.chat.completions.create(model="default", messages=[{"role": "user", "content": "Hi"}]).choices[0].message.content)
 ```
 
-The same server embeds in a process via [`pie-server`](https://pypi.org/project/pie-server/)
-on PyPI and [`@pie-project/server`](https://www.npmjs.com/package/@pie-project/server)
-on npm (which also bundles for the browser on WebGPU).
+To embed in a process, use [`pie-server`](https://pypi.org/project/pie-server/)
+(Python) or [`@pie-project/server`](https://www.npmjs.com/package/@pie-project/server)
+(Node and WebGPU browsers).
 
-## Building from source
-
-Pick a backend feature (`cuda`, `metal`, `vulkan`, `wgpu`, `rocm`, or `xla`):
+## Build from source
 
 ```bash
-cargo build --release -p pie --bin pie --features metal
+cargo build --release -p pie --bin pie --features metal   # or: cuda, vulkan, wgpu, rocm, xla
 ```
 
 ## Community & License
 
-Join [Discord](https://discord.gg/R62Udyzum), open an
-[Issue](https://github.com/pie-project/pie/issues), or start a
-[Discussion](https://github.com/pie-project/pie/discussions).
+[Discord](https://discord.gg/R62Udyzum) ·
+[Issues](https://github.com/pie-project/pie/issues) ·
+[Discussions](https://github.com/pie-project/pie/discussions) ·
+[Contributing](CONTRIBUTING.md)
 
-Licensed under the [Apache License 2.0](LICENSE) ([NOTICE](NOTICE)).
+[Apache License 2.0](LICENSE) ([NOTICE](NOTICE)).

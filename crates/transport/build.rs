@@ -13,8 +13,7 @@ mod nixl {
 
         let prefix = std::env::var("NIXL_PREFIX").expect(
             "NIXL_PREFIX must point at an assembled NIXL install \
-             (lib/ with libnixl_capi.so + deps) when building --features nixl. \
-             See transport/README.md for the `pip download nixl-cu12` recipe.",
+             (lib/ with libnixl_capi.so + deps) when building --features nixl.",
         );
 
         println!("cargo:rustc-link-search=native={prefix}/lib");
