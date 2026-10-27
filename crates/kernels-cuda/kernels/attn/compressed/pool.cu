@@ -4,14 +4,6 @@ namespace pie::attn::compressed {
 
 constexpr int ATTN_BLOCK = 128;
 
-struct CompressedAttnParams {
-    int qo_lo;
-    int qo_hi;
-    int comp_offset;
-    int comp_len;
-    int comp_ratio;
-};
-
 template <class T>
 __global__ void pool_gather(
     const T* __restrict__ kv_proj,

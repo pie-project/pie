@@ -65,7 +65,6 @@ __device__ __forceinline__ float2 fma2(float2 a, float2 b, float2 c) {
 #endif
 }
 
-__device__ __forceinline__ unsigned short bf16_as_u16(bf16 v) { return v.raw; }
 __device__ __forceinline__ bf16 u16_as_bf16(unsigned short v) { return bf16{v}; }
 __device__ __forceinline__ unsigned int bf16x2_as_u32(bf16 lo, bf16 hi) {
     return (static_cast<unsigned int>(hi.raw) << 16) | lo.raw;
@@ -291,19 +290,6 @@ __device__ __forceinline__ float warp_max(float v) {
         v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
     }
     return __shfl_sync(0xffffffffu, v, 0);
-}
-
-__device__ __forceinline__ void warp_argmax(float& v, int& idx) {
-    for (int off = 16; off > 0; off >>= 1) {
-        const float other_v = __shfl_down_sync(0xffffffffu, v, off);
-        const int other_i = __shfl_down_sync(0xffffffffu, idx, off);
-        if (other_v > v || (other_v == v && other_i < idx)) {
-            v = other_v;
-            idx = other_i;
-        }
-    }
-    v = __shfl_sync(0xffffffffu, v, 0);
-    idx = __shfl_sync(0xffffffffu, idx, 0);
 }
 
 // Programmatic dependent launch (`kernel.pdl`). A kernel launched as the

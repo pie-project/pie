@@ -155,28 +155,4 @@ __global__ void dot(
 
 constexpr int kEnvelopeFuseMaxTokens = 128;
 
-__device__ inline void atomic_min(bf16* addr, float value) {
-    unsigned short* as_u16 = reinterpret_cast<unsigned short*>(addr);
-    const unsigned short want = bf16_as_u16(f32_to_bf16_rd(value));
-    unsigned short old = *as_u16;
-    unsigned short assumed;
-    do {
-        if (bf16_to_f32(u16_as_bf16(old)) <= value) return;
-        assumed = old;
-        old = atomicCAS(as_u16, assumed, want);
-    } while (assumed != old);
-}
-
-__device__ inline void atomic_max(bf16* addr, float value) {
-    unsigned short* as_u16 = reinterpret_cast<unsigned short*>(addr);
-    const unsigned short want = bf16_as_u16(f32_to_bf16_ru(value));
-    unsigned short old = *as_u16;
-    unsigned short assumed;
-    do {
-        if (bf16_to_f32(u16_as_bf16(old)) >= value) return;
-        assumed = old;
-        old = atomicCAS(as_u16, assumed, want);
-    } while (assumed != old);
-}
-
 }

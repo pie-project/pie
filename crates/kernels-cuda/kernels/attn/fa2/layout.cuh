@@ -18,10 +18,7 @@
 
 #include <cstdint>
 
-
 namespace pie::attn::fa2 {
-
-
 
 enum class QKVLayout {
 
@@ -29,13 +26,6 @@ enum class QKVLayout {
 
   kHND = 1U,
 };
-
-__host__ __device__ __forceinline__ size_t get_elem_offset_impl(size_t elem_idx, size_t head_idx,
-                                                                size_t feat_idx, size_t stride_n,
-                                                                size_t stride_h) {
-  return elem_idx * stride_n + head_idx * stride_h + feat_idx;
-}
-
 
 struct tensor_info_t {
   uint32_t qo_len;
@@ -76,32 +66,7 @@ struct tensor_info_t {
     kv_stride_h = (kv_layout == QKVLayout::kNHD) ? head_dim : kv_len * head_dim;
   }
 
-  __host__ __device__ __forceinline__ size_t get_q_elem_offset(uint32_t qo_idx,
-                                                               uint32_t qo_head_idx,
-                                                               uint32_t feat_idx) const {
-    return get_elem_offset_impl(qo_idx, qo_head_idx, feat_idx, q_stride_n, q_stride_h);
-  }
-
-  __host__ __device__ __forceinline__ size_t get_o_elem_offset(uint32_t qo_idx,
-                                                               uint32_t qo_head_idx,
-                                                               uint32_t feat_idx) const {
-    return get_elem_offset_impl(qo_idx, qo_head_idx, feat_idx, num_qo_heads * head_dim, head_dim);
-  }
-
-  __host__ __device__ __forceinline__ size_t get_kv_elem_offset(uint32_t kv_idx,
-                                                                uint32_t kv_head_idx,
-                                                                uint32_t feat_idx) const {
-    return get_elem_offset_impl(kv_idx, kv_head_idx, feat_idx, kv_stride_n, kv_stride_h);
-  }
-
-  __host__ __device__ __forceinline__ uint32_t get_group_size() const {
-    return num_qo_heads / num_kv_heads;
-  }
 };
-
-
-
-
 
 }
 #endif

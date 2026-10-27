@@ -21,10 +21,6 @@ __device__ __forceinline__ unsigned ld_acquire(const unsigned* p) {
     return v;
 }
 
-__device__ __forceinline__ void st_release(unsigned* p, unsigned v) {
-    asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
-}
-
 __device__ __forceinline__ void add_release(unsigned* p, unsigned v) {
     asm volatile("red.release.sys.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }

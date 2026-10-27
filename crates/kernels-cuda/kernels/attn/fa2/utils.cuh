@@ -25,8 +25,6 @@
 
 #include <type_traits>
 
-
-
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 
@@ -343,12 +341,6 @@ __forceinline__ __device__ __host__ constexpr T1 round_up(const T1 x, const T2 y
   return ceil_div(x, y) * y;
 }
 
-template <typename T1, typename T2>
-__forceinline__ __device__ __host__ constexpr T1 round_down(const T1 x, const T2 y) noexcept {
-  return (x / y) * y;
-}
-
-
 #define LOOP_SPLIT_MASK(iter, COND1, COND2, ...)       \
   {                                                    \
     _Pragma("unroll 1") for (; (COND1); (iter) -= 1) { \
@@ -361,92 +353,14 @@ __forceinline__ __device__ __host__ constexpr T1 round_down(const T1 x, const T2
     }                                                  \
   }
 
-
-
 __device__ __forceinline__ uint32_t sub_if_greater_or_zero(uint32_t x, uint32_t y) {
   return (x > y) ? x - y : 0U;
-}
-
-
-
-
-__forceinline__ __device__ int get_lane_id() {
-  int lane_id;
-  asm("mov.u32 %0, %%laneid;" : "=r"(lane_id));
-  return lane_id;
-}
-
-
-
-__forceinline__ __device__ short ld_na_global_s16(const short* addr) {
-  short val;
-  asm volatile("ld.global.cs.b16 %0, [%1];" : "=h"(val) : "l"(addr));
-  return val;
-}
-
-
-
-__forceinline__ __device__ void st_na_global_s16(short* addr, short val) {
-  asm volatile("st.global.cs.b16 [%0], %1;" ::"l"(addr), "h"(val));
-}
-
-
-
-__forceinline__ __device__ int ld_na_global_v1(const int* addr) {
-  int val;
-  asm volatile("ld.global.cs.b32 %0, [%1];" : "=r"(val) : "l"(addr));
-  return val;
-}
-
-
-
-__forceinline__ __device__ int2 ld_na_global_v2(const int2* addr) {
-  int2 val;
-  asm volatile("ld.global.cs.v2.b32 {%0, %1}, [%2];" : "=r"(val.x), "=r"(val.y) : "l"(addr));
-  return val;
-}
-
-
-
-__forceinline__ __device__ void st_na_global_v1(int* addr, int val) {
-  asm volatile("st.global.cs.b32 [%0], %1;" ::"l"(addr), "r"(val));
-}
-
-
-
-__forceinline__ __device__ void st_na_global_v2(int2* addr, int2 val) {
-  asm volatile("st.global.cs.v2.b32 [%0], {%1, %2};" ::"l"(addr), "r"(val.x), "r"(val.y));
-}
-
-
-
-template <typename T>
-__forceinline__ __device__ void prefetch_L2(const T* addr) {
-  asm volatile("prefetch.global.L2 [%0];" ::"l"(addr));
 }
 
 __device__ __forceinline__ void swap(uint32_t& a, uint32_t& b) {
   uint32_t tmp = a;
   a = b;
   b = tmp;
-}
-
-__device__ __forceinline__ uint32_t dim2_offset(const uint32_t& dim_a, const uint32_t& idx_b,
-                                                const uint32_t& idx_a) {
-  return idx_b * dim_a + idx_a;
-}
-
-__device__ __forceinline__ uint32_t dim3_offset(const uint32_t& dim_b, const uint32_t& dim_a,
-                                                const uint32_t& idx_c, const uint32_t& idx_b,
-                                                const uint32_t& idx_a) {
-  return (idx_c * dim_b + idx_b) * dim_a + idx_a;
-}
-
-__device__ __forceinline__ uint32_t dim4_offset(const uint32_t& dim_c, const uint32_t& dim_b,
-                                                const uint32_t& dim_a, const uint32_t& idx_d,
-                                                const uint32_t& idx_c, const uint32_t& idx_b,
-                                                const uint32_t& idx_a) {
-  return ((idx_d * dim_c + idx_c) * dim_b + idx_b) * dim_a + idx_a;
 }
 
 #define DEFINE_HAS_MEMBER(member)                                                              \

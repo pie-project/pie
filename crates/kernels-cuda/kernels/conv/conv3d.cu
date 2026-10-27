@@ -244,13 +244,6 @@ constexpr int kMmaStageElems = (kMmaTM + kMmaTN) * kMmaLd;
 
 constexpr int kMmaLdC = kMmaTN + 8;
 
-template <int kStages>
-__host__ __device__ constexpr int conv3d_mma_smem() {
-    constexpr int ring = kStages * kMmaStageElems * 2;
-    constexpr int tile = kMmaTM * kMmaLdC * 2;
-    return ring > tile ? ring : tile;
-}
-
 __device__ __forceinline__ void conv_cp_async16(void* dst, const void* src, int bytes) {
     const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
