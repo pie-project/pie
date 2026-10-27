@@ -43,9 +43,9 @@ MODELS = [
     qwen("qwen35-d0.8b", parts = ["vision"], drafters = ["eagle"], layers = 24),
     qwen("qwen35-d2b", layers = 24),
     qwen("qwen35-d3b", layers = 24, vocab = 151936),
-    qwen("qwen35-d4b", layers = 32),
+    qwen("qwen35-d4b", parts = ["vision"], layers = 32),
     qwen("qwen35-a3b", layers = 40),
-    qwen("qwen35-d9b", drafters = ["dflash"], layers = 32),
+    qwen("qwen35-d9b", parts = ["vision"], drafters = ["dflash"], layers = 32),
     qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash", "dflash2"], layers = 40),
     qwen("qwen35-397b-a17b", parts = ["vision"], layers = 60),
     qwen("qwen35-122b-a10b", layers = 48),
@@ -104,8 +104,12 @@ DEPLOYMENTS = [
     deployment("qwen35-d0.8b", weights = U4, kv = BF),
     deployment("qwen35-d2b", weights = U4, kv = BF),
     deployment("qwen35-d4b", weights = U4, kv = BF),
+    deployment("qwen35-d4b", weights = BF, kv = BF),
+    deployment("qwen35-d4b", weights = BF, kv = BF, parts = ["vision"]),
     deployment("qwen35-d9b", weights = U4, kv = BF, drafter = "dflash"),
     deployment("qwen35-d9b", weights = U4, kv = BF),
+    deployment("qwen35-d9b", weights = BF, kv = BF),
+    deployment("qwen35-d9b", weights = BF, kv = BF, parts = ["vision"]),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "dflash"),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "dflash2"),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "mtp"),
@@ -256,6 +260,8 @@ def routed(n, hidden, m, experts, proj, gate):
     )
 
 SMALL = struct(depth = 12, hidden = 768, heads = 12, inter = 3072)
+
+MEDIUM = struct(depth = 24, hidden = 1024, heads = 16, inter = 4096)
 
 LARGE = struct(depth = 27, hidden = 1152, heads = 16, inter = 4304)
 
@@ -512,19 +518,27 @@ def drafted(id, deploy):
         refuse()
     if id == "qwen35-d0.8b":
         return d0_8b(tower = SMALL if vision else None, draft = drafter)
+    if id == "qwen35-d4b" and drafter == None:
+        return dims(hidden = 2560, layers = 32, attn_every = 4, q_heads = 16, kv_heads = 4,
+                    head_dim = 256, rotary_dim = 64, k_heads = 16, v_heads = 32, k_dim = 128,
+                    v_dim = 128, mlp = dense(9216), vocab = 248320, tied = True,
+                    tower = MEDIUM if vision else None)
     if id in ["ornith15-397b", "qwen35-397b-a17b"] and drafter == None:
         return a17b(tower = LARGE if vision else None)
-    if vision:
-        refuse()
     if id == "qwen35-d9b":
         d = dims(hidden = 4096, layers = 32, attn_every = 4, q_heads = 16, kv_heads = 4, head_dim = 256,
                  rotary_dim = 64, k_heads = 16, v_heads = 32, k_dim = 128, v_dim = 128,
-                 mlp = dense(12288), vocab = 248320, tied = False)
+                 mlp = dense(12288), vocab = 248320, tied = False,
+                 tower = LARGE if vision else None)
         if drafter == "dflash":
+            if vision:
+                refuse()
             d.update(draft = "dflash", dflash_head = HEADS["qwen35-d9b-dflash"])
         elif drafter != None:
             refuse()
         return d
+    if vision:
+        refuse()
     if id == "qwen36-35b-a3b":
         if drafter == None:
             return a3b()
