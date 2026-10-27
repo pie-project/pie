@@ -14,7 +14,7 @@ import '@pie-project/language-python';           // Python inferlets run; one li
 const server = await Server.start({
   model: 'Qwen/Qwen3.5-0.8B',                    // Node: what `pie model import` fetched
   // model: '/models/qwen3.5-0.8b.wgpu.zt',      // browser: the artifact's URL, served with Range support
-  config: { server: { port: 0 } },               // the rest of `pie serve`'s config
+  config: { server: { listen: '127.0.0.1:0' } }, // the rest of `pie serve`'s config
 });
 
 await server.install('./beam_search.wasm');           // an inferlet of your own: a path or URL, or bytes with a file name
