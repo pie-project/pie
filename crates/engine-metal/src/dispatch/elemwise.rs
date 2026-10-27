@@ -899,10 +899,6 @@ impl Run<'_> {
                 *stream_count,
                 self.tensor(*mixes),
             ),
-            // The independent form (no combine) is landed on CUDA alone.
-            Elemwise::HcGates { comb: false, .. } => {
-                Err(kernels_metal::Error::Unsupported { op: op.name() })
-            }
             Elemwise::HcGates {
                 normed,
                 streams,
@@ -912,7 +908,7 @@ impl Run<'_> {
                 gate_eps,
                 alpha,
                 sinkhorn,
-                comb: true,
+                comb,
                 x,
                 post_mix,
                 comb_mix,
@@ -926,6 +922,7 @@ impl Run<'_> {
                 *gate_eps,
                 *alpha,
                 *sinkhorn,
+                *comb,
                 self.tensor(*x),
                 self.tensor(*post_mix),
                 self.tensor(*comb_mix),
