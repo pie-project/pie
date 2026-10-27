@@ -133,8 +133,7 @@ mask (`forward-pass.mask`) through four modes and checks its identities
 without a golden; `gates.py` runs that as `attn-classes`.
 
 On a card smaller than the roster assumes, `gates.py` takes `PIE_GATES_ROWS`,
-`PIE_GATES_MEM`, `PIE_GATES_VOXELS` (the VAE ladder asks 21 GiB at its 65 536
-default) and `PIE_GATES_T2I_BIG` / `PIE_GATES_T2I_SMALL` (the text-to-image gate's
+`PIE_GATES_MEM` and `PIE_GATES_T2I_BIG` / `PIE_GATES_T2I_SMALL` (the text-to-image gate's
 picture sizes). The mini-dit golden dir needs a `tokenizer.json` beside the weights
 before `pie model import` (any BPE tokenizer; the runtime insists on one).
 
@@ -604,7 +603,7 @@ CUDA_VISIBLE_DEVICES=3 python wan22_golden.py --vae     # needs `--full` to have
 `wan22_golden.py --vae-ref` decodes a seeded DiT-space latent (`torch.randn`,
 seed 0, 3×16×16×48; needs only the snapshot's `vae/*`) into
 `golden/wan22/wan22_vae_ref/`. `examples/wan2-vae-parity` decodes it through
-the runtime the way `text-to-video` does — one `vae.decode` fire per latent
+the runtime the way `text-to-media` does — one `vae.decode` fire per latent
 frame, one working set whose recurrent state is the conv caches (frame =
 token), one pipeline; the derived `fresh` switch picks the head branch where
 the state is empty — and the script scores each chunk at
@@ -850,7 +849,7 @@ file is the roster, the plumbing and the reaper.
 |---|---|---|---|
 | `mini-dit` | `mini_dit_parity.py all`, and `--euler` | cos ≥ 0.9999 (0.99996) | the M0 synthetic DiT, one step and the four-step Euler run, against the bf16-emulated reference (§3). The gate is the measured bf16 drift of a three-block trunk. |
 | `zimage-mini` | `zimage_parity.py --mode mini`, `--mode mini_pad` | ≥ 0.9999 (0.999985) | the random-init Z-Image miniature, once on exact rows and once on rows that NEED padding (48→64 image, 40→64 caption). |
-| `zimage-turbo` | `zimage_parity.py gate` | text 0.99999, turbo 0.9998, steps 0.9961–0.9972, PSNR 32.8–33.3 dB | the flagship: the `text` reading, the step-0 `denoise`, the whole text→refine→denoise `chain`, then the eight-step trajectory, then the VAE decode of both final latents. |
+| `zimage-turbo` | `zimage_parity.py gate` | text 0.99999, turbo 0.9998, steps 0.9961–0.9972, PSNR 32.8–33.3 dB | the flagship: the `text` reading, the step-0 `denoise`, the whole text→denoise `chain`, then the eight-step trajectory, then the VAE decode of both final latents. |
 | `flux2-mini` | `flux2_parity.py all` | 0.999991 | the FLUX.2 miniature's one denoise step over three lanes of one group (text, target, references). Re-measured 2026-09-06 after the guest gave each lane a pipeline of its own: the earlier 0.99999 was taken while all three passes rode ONE pipeline, so the group never formed and the image lane denoised alone — the miniature's random-init caption sat under the tolerance and the gate stayed green. `gates.py` caught it once the frame contract began refusing a group that cannot compose. |
 | `flux2-klein` | `flux2_klein_parity.py all` | per-step velocities ≥ 0.999, PSNR ≥ 34 dB | the real klein-4B row: `text.hidden`, `dit.step0.out` and `probe.step{0..3}.out` are gated; the four-step trajectory and the picture's PSNR are reported. |
 | `flux2-vae` | `cargo test -p engine-cuda --features cuda --test engine_cuda the_flux_2_vae_answers_the_reference` | decode 0.99999, encode 0.99995 | the autoencoder alone, host-fed, against the fp32 diffusers reference. |

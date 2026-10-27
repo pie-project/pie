@@ -40,15 +40,15 @@ async def main(input: dict) -> dict:
     # gemma without it answers noise.
     prompt = chat.prefix() + model.encode(prompt_text)
     if not prompt:
-        prompt = [0]
+        raise ValueError("empty prompt")
     n = len(prompt)
 
     pipe = Pipeline()
     generated: list[int] = []
 
-    toks = Channel.from_(prompt, dtype.i32).named("toks_p")
-    embed_indptr = Channel.from_([0, n], dtype.u32).named("embed_indptr_p")
-    tok_out = Channel([1], dtype.i32).named("tok_out_p")
+    toks = Channel.from_(prompt, dtype.i32)
+    embed_indptr = Channel.from_([0, n], dtype.u32)
+    tok_out = Channel([1], dtype.i32)
 
     fwd = ForwardPass()
     fwd.embed(toks, embed_indptr)
@@ -64,9 +64,9 @@ async def main(input: dict) -> dict:
 
     # ── DECODE (1-wide, device loop-carried token) ─────────────────────────
     if len(generated) < max_tokens:
-        tok_in = Channel.from_([first], dtype.i32).named("tok_in")
-        tok_out = Channel([1], dtype.i32).capacity(channel_capacity()).named("tok_out")
-        embed_indptr = Channel.from_([0, 1], dtype.u32).named("embed_indptr")
+        tok_in = Channel.from_([first], dtype.i32)
+        tok_out = Channel([1], dtype.i32).capacity(channel_capacity())
+        embed_indptr = Channel.from_([0, 1], dtype.u32)
 
         fwd = ForwardPass()
         fwd.embed(tok_in, embed_indptr)

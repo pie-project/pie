@@ -358,14 +358,14 @@ async fn main(input: Input) -> Result<Output> {
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
     // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
-    let toks_p = Channel::from_iter(history.iter().take(n as usize).copied()).named("toks_p");
-    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-    let rng_p = Channel::from([input.seed, 0]).named("rng_p");
-    let hist_p = Channel::from(history.clone()).named("hist_p");
-    let hlen_p = Channel::from([n]).named("hlen_p");
-    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
-    let cnt_out_p = Channel::new([1], dtype::f32).named("cnt_out_p");
-    let peak_out_p = Channel::new([1], dtype::f32).named("peak_out_p");
+    let toks_p = Channel::from_iter(history.iter().take(n as usize).copied());
+    let embed_indptr_p = Channel::from([0u32, n]);
+    let rng_p = Channel::from([input.seed, 0]);
+    let hist_p = Channel::from(history.clone());
+    let hlen_p = Channel::from([n]);
+    let tok_out_p = Channel::new([1], dtype::i32);
+    let cnt_out_p = Channel::new([1], dtype::f32);
+    let peak_out_p = Channel::new([1], dtype::f32);
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -395,8 +395,8 @@ async fn main(input: Input) -> Result<Output> {
     // The per-step statistics accumulate on the device — a running sum of
     // penalized counts and a running peak — and ride out beside the token in
     // one `[3]` cell, so a token costs one host round trip, not three.
-    let cnt_sum = Channel::from([c0]).named("cnt_sum");
-    let peak_max = Channel::from([k0]).named("peak_max");
+    let cnt_sum = Channel::from([c0]);
+    let peak_max = Channel::from([k0]);
     let mut total_penalized = c0;
     let mut peak = k0;
 
@@ -406,14 +406,12 @@ async fn main(input: Input) -> Result<Output> {
         // over explicitly, already carrying the prefill's token.
         history[n as usize] = g0;
 
-        let tok_in = Channel::from([g0]).named("tok_in");
-        let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
-        let hist_c = Channel::from(history.clone()).named("hist");
-        let hlen_c = Channel::from([n + 1]).named("hlen");
-        let out = Channel::new([3], dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named("out");
-        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let tok_in = Channel::from([g0]);
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
+        let hist_c = Channel::from(history.clone());
+        let hlen_c = Channel::from([n + 1]);
+        let out = Channel::new([3], dtype::f32).capacity(channel_capacity() as u32);
+        let lane1 = Channel::from([0u32, 1u32]);
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;

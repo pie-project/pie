@@ -117,8 +117,7 @@ fn fixture(model: &'static str) -> Fixture {
 }
 
 /// [`fixture`] of the trace packed as a deployment's is (`pack::pack_as`):
-/// q, k and v one product, a gate and an up one packed bank, so a norm
-/// before them is one product's operand alone and folds into its anchor.
+/// q, k and v one product, a gate and an up one packed bank.
 fn packed_fixture(model: &'static str) -> Fixture {
     packed_fixture_kv(model, Dtype::Bf16)
 }
@@ -396,12 +395,8 @@ fn a_synthesized_region_serves_the_logits_of_its_ops() {
 /// logits, and Qwen3's attention prologue (its packed qkv product split, q's
 /// and k's heads normed and turned, each piece landing its own plane: an
 /// epilogue of one head's span), its SwiGLU and the residual adds after its
-/// output and down projections. Each model packed as its deployment is, so
-/// an RMS norm before a product's epilogue (a packed gate and up's, q, k
-/// and v's where nothing else reads the normed row) folds into it
-/// (`compiler.fold_norms`): its gain folded into the bank at load, each
-/// row's scale the contraction's own. A prefill of a few rows (the contraction skeletons, as the tuner
-/// picks) and one past every skeleton's (cuBLASLt's bias, the unfused leg),
+/// output and down projections. Each model packed as its deployment is. A
+/// prefill of a few rows (the contraction skeletons, as the tuner picks) and one past every skeleton's (cuBLASLt's bias, the unfused leg),
 /// then the decode steps (the gemv), held as a routed model's logits are
 /// ([`close_past_routing`]).
 #[test]

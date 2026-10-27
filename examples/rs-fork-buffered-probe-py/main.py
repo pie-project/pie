@@ -32,9 +32,9 @@ from inferlet.eta import (
 async def fire(ws, pipe, tokens, fold):
     n = len(tokens)
     ids = Channel.from_(tokens, dtype.i32)
-    embed_indptr = Channel.from_([0, n], dtype.u32).named("embed_indptr")
-    out = Channel([1], dtype.i32).named("next_token")
-    fold = "all" if fold is None else Channel.from_([fold], dtype.u32).named("fold_len")
+    embed_indptr = Channel.from_([0, n], dtype.u32)
+    out = Channel([1], dtype.i32)
+    fold = "all" if fold is None else Channel.from_([fold], dtype.u32)
 
     fwd = ForwardPass()
     fwd.embed(ids, embed_indptr)

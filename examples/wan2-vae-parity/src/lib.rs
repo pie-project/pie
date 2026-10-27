@@ -1,5 +1,5 @@
 //! The pie half of `scripts/imagegen/wan22_vae_parity.py`: decodes a `T`-frame
-//! latent as `text-to-video` does, one pass per latent frame over one working
+//! latent as `text-to-media` does, one pass per latent frame over one working
 //! set, and sends the pixels back as one raw `[F*H*W, 3]` f32 file.
 
 use inferlet::latent::prelude::*;
@@ -63,9 +63,9 @@ struct Output {
     pixels_bytes: u32,
 }
 
-/// The `pixels` output a reading's video lane reads out, if any.
+/// The `pixels` output a reading's latents lane reads out, if any.
 fn pixels(reading: &str) -> Option<model::OutputDecl> {
-    model::lane_of(&[("reading", reading), ("stream", "video")])
+    model::lane_of(&[("reading", reading), ("stream", "latents")])
         .ok()?
         .outputs
         .into_iter()
@@ -82,7 +82,7 @@ fn decoder() -> Result<String> {
 }
 
 fn voxel_input(reading: &str) -> Result<model::InputDecl> {
-    match &model::lane_of(&[("reading", reading), ("stream", "video")])?.inputs[..] {
+    match &model::lane_of(&[("reading", reading), ("stream", "latents")])?.inputs[..] {
         [input] if input.axis == model::InputAxis::Voxel => Ok(input.clone()),
         other => Err(format!(
             "reading `{reading}` reads {} input(s), and a VAE arm reads one clip on the voxel axis",
@@ -107,15 +107,14 @@ async fn decode_frame(
     let rows = frames * pixel_h * pixel_w;
     let width = pixels(reading)
         .map(|pixels| pixels.width)
-        .ok_or_else(|| format!("reading `{reading}` reads no pixels out on its `video` lane"))?;
+        .ok_or_else(|| format!("reading `{reading}` reads no pixels out on its `latents` lane"))?;
     let pass = ForwardPass::new();
     pass.switch(0, "reading", reading)?;
-    pass.switch(0, "stream", "video")?;
+    pass.switch(0, "stream", "latents")?;
     pass.state(&[state], StateGeometry::default())?;
-    let cell =
-        Channel::from_shaped([clip_h, clip_w, input.width], clip.to_vec()).named("vae_latent");
+    let cell = Channel::from_shaped([clip_h, clip_w, input.width], clip.to_vec());
     pass.input(0, &input.name, &cell)?;
-    let out = Channel::new([rows, width], dtype::f32).named("vae_pixels");
+    let out = Channel::new([rows, width], dtype::f32);
     let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::output_rows(0, "pixels", rows));

@@ -43,7 +43,7 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
         "the miniature's checkpoint carries no VAE"
     );
     for (deployment, want) in [
-        (FLAGSHIP, vec!["latent", "latents"]),
+        (FLAGSHIP, vec!["latents"]),
         (MINI, vec!["latents"]),
     ] {
         let plan = trace(deployment);
@@ -71,7 +71,9 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
 fn the_shapes_are_the_ltx_decoders() {
     let plan = trace(FLAGSHIP);
     assert!(
-        plan.caches.is_empty(),
+        plan.caches.iter().all(
+            |row| matches!(row, poem_ir::CacheRow::Kv { name, .. } if name.starts_with("te.kv."))
+        ),
         "a non-causal decoder holds nothing between fires"
     );
 

@@ -7,8 +7,8 @@ const V: u32 = 8;
 
 #[test]
 fn the_name_table_is_sorted_and_indices_are_remapped() {
-    let mask = Channel::seeded([4], dtype::u32).named("mask");
-    let out = Channel::new([1], dtype::i32).named("out");
+    let mask = Channel::seeded([4], dtype::u32);
+    let out = Channel::new([1], dtype::i32);
     let mut b = Builder::new(V, 2);
     b.outputs(crate::outputs::logits(V));
     b.stage(Stage::Epilogue, move || {

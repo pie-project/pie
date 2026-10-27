@@ -47,6 +47,7 @@ pub struct ProcessCtx {
     residency: Arc<Mutex<ProcessResidency>>,
     prewarm_permit: Option<OrderedPermit>,
     props: client_api::Props,
+    files: Arc<client_api::Files>,
     bind_admitted: bool,
     execution_seated: bool,
     execution_admitted: bool,
@@ -220,6 +221,7 @@ impl ProcessCtx {
             },
             prewarm_permit: None,
             props: client_api::Props::new(),
+            files: Arc::default(),
             bind_admitted: false,
             execution_seated: false,
             execution_admitted: false,
@@ -258,6 +260,14 @@ impl ProcessCtx {
 
     pub(crate) fn props(&self) -> &client_api::Props {
         &self.props
+    }
+
+    pub(crate) fn file(&self, name: &str) -> Option<Vec<u8>> {
+        self.files.get(name).map(|bytes| bytes.to_vec())
+    }
+
+    pub(crate) fn set_files(&mut self, files: Arc<client_api::Files>) {
+        self.files = files;
     }
 
     pub(crate) fn set_props(&mut self, props: client_api::Props) {

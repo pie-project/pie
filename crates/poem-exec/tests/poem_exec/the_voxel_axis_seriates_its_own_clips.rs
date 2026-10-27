@@ -99,7 +99,7 @@ fn trunk_and_decoder() -> Trace {
         grid: None,
     });
     let h = b.op(latent, voxel(Dim::Voxels), Guard::Fact(0));
-    let pixels = b.op(h, voxel(Dim::VoxelsTimes(4)), Guard::Fact(0));
+    let pixels = b.op(h, voxel(Dim::VoxelsScaled(4, 1)), Guard::Fact(0));
     b.trace.outputs.push(poem_ir::Output {
         name: "pixels".to_string(),
         value: pixels,
@@ -135,18 +135,23 @@ fn a_class_with_rows_and_no_clips_has_a_token_window_and_no_voxel_window() {
     assert_eq!(compiled.units, vec![RowAxis::Tokens, RowAxis::Voxels]);
 
     let lanes = [
-        Lane::with_clips(1, 5, 2, 200),
+        Lane::with_clips(1, 5, 2, 100),
         Lane::new(0, 3),
-        Lane::with_clips(1, 4, 1, 64),
+        Lane::with_clips(1, 4, 1, 28),
         Lane::new(0, 1),
     ];
     let fire = compose_axes(&compiled, &budgets, &lanes).expect("the mixed fire composes");
     assert_eq!(fire.rows(), 13);
-    assert_eq!(fire.voxel_rows(), 264);
+    assert_eq!(fire.voxel_rows(), 128);
+    assert_eq!(
+        fire.voxel_widest(),
+        512,
+        "admitted at the ceiling over the class's growth"
+    );
     assert_eq!(fire.clips(), 3);
     assert_eq!(
         fire.voxel_bucket(),
-        512,
+        128,
         "the voxel ladder rounds on its own rungs"
     );
     assert_eq!(fire.patch_rows(), 0, "no patch axis was stated");
@@ -167,7 +172,7 @@ fn a_class_with_rows_and_no_clips_has_a_token_window_and_no_voxel_window() {
     let voxels = fire.voxel_classes();
     assert_eq!(tokens.class(with_clips).rows, 9);
     assert_eq!(tokens.class(text_class).rows, 4);
-    assert_eq!(voxels.class(with_clips).rows, 264);
+    assert_eq!(voxels.class(with_clips).rows, 128);
     assert_eq!(voxels.class(with_clips).lanes, 3, "clips, not lanes");
     assert_eq!(voxels.class(text_class).rows, 0);
     assert_eq!(voxels.class(text_class).lanes, 0);
@@ -185,8 +190,8 @@ fn a_class_with_rows_and_no_clips_has_a_token_window_and_no_voxel_window() {
             )
         })
         .collect();
-    assert!(placed.contains(&(0, 0, 200, 0, 2)));
-    assert!(placed.contains(&(2, 200, 64, 2, 1)));
+    assert!(placed.contains(&(0, 0, 100, 0, 2)));
+    assert!(placed.contains(&(2, 100, 28, 2, 1)));
     assert!(placed.contains(&(1, 0, 0, 0, 0)));
 }
 
@@ -199,15 +204,15 @@ fn a_fire_past_the_voxel_ceilings_is_refused_by_name() {
         &compiled,
         &budgets,
         &[
-            Lane::with_clips(1, 1, 1, 300),
-            Lane::with_clips(1, 1, 1, 300),
+            Lane::with_clips(1, 1, 1, 100),
+            Lane::with_clips(1, 1, 1, 29),
         ],
     )
-    .expect_err("600 voxel rows past a 512 ceiling");
+    .expect_err("129 voxel rows grown four times past a 512 ceiling");
     assert_eq!(
         rows,
         Fault::TooManyVoxels {
-            voxels: 600,
+            voxels: 516,
             max: 512
         }
         .into()

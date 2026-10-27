@@ -1,6 +1,4 @@
-use alloc::format;
 use alloc::rc::Rc;
-use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -19,10 +17,12 @@ pub struct Channel {
 }
 
 impl Channel {
+    #[track_caller]
     pub fn new(shape: impl IntoShape, dtype: Dtype) -> Channel {
         Channel::build(shape.into_shape(), dtype, 1, None)
     }
 
+    #[track_caller]
     pub fn from(v: impl IntoConst) -> Channel {
         let data = v.into_const();
         Channel::build(data.shape, data.dtype, 1, Some(data))
@@ -48,6 +48,7 @@ impl Channel {
         Channel::build(data.shape, data.dtype, 1, Some(data))
     }
 
+    #[track_caller]
     pub fn seeded(shape: impl IntoShape, dtype: Dtype) -> Channel {
         let ch = Channel::build(shape.into_shape(), dtype, 1, None);
         ch.state.borrow_mut().seeded = true;
@@ -66,12 +67,13 @@ impl Channel {
         self.state.borrow().seeded
     }
 
+    #[track_caller]
     fn build(shape: Shape, dtype: Dtype, capacity: u32, seed: Option<ConstData>) -> Channel {
         let gid = NEXT_GID.fetch_add(1, Ordering::Relaxed);
         let seeded = seed.is_some();
         let state = Rc::new(RefCell::new(ChannelState {
             gid,
-            name: format!("ch{gid}"),
+            site: Span::here(),
             shape,
             dtype,
             capacity,
@@ -96,11 +98,6 @@ impl Channel {
         self
     }
 
-    pub fn named(self, name: &str) -> Channel {
-        self.state.borrow_mut().name = String::from(name);
-        self
-    }
-
     /// A queue between passes: another pass consumes it, so a pass that
     /// only puts it is no terminal output; and a pass that peeks it as a
     /// port takes each value itself, so another pass's put appends rather
@@ -118,8 +115,8 @@ impl Channel {
         self.state.borrow().dtype
     }
 
-    pub fn name(&self) -> String {
-        self.state.borrow().name.clone()
+    pub fn site(&self) -> Span {
+        self.state.borrow().site
     }
     pub fn shape(&self) -> Shape {
         self.state.borrow().shape
@@ -205,7 +202,7 @@ fn host_take_poison(chan: &ChannelRef) -> Tensor {
         alloc::format!(
             "channel {} is a host channel: its take crosses the engine boundary and has no \
              in-program value",
-            st.name
+            st.site.at()
         ),
         ValueType::new(st.shape, st.dtype),
     )

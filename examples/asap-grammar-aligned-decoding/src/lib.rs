@@ -241,15 +241,15 @@ async fn main(input: Input) -> Result<Output> {
         let ws = WorkingSet::new();
 
         let prompt_tokens = Channel::from_iter(prompt.iter().map(|&t| t as i32));
-        let pre_indptr = Channel::from([0u32, n]).named("pre_indptr");
-        let pre_mask = Channel::new([vocab], dtype::bool).named("pre_mask");
-        let pre_alpha_idx = Channel::new([pairs as u32], dtype::u32).named("pre_alpha_idx");
-        let pre_alpha_val = Channel::new([pairs as u32], dtype::f32).named("pre_alpha_val");
-        let pre_rng = Channel::from([input.seed ^ (round as u32 * 0x9E37), 0]).named("pre_rng");
-        let pre_token = Channel::new([1], dtype::i32).named("pre_token");
-        let pre_mass = Channel::new([1], dtype::f32).named("pre_mass");
-        let pre_prob = Channel::new([1], dtype::f32).named("pre_prob");
-        let pre_wmass = Channel::new([1], dtype::f32).named("pre_wmass");
+        let pre_indptr = Channel::from([0u32, n]);
+        let pre_mask = Channel::new([vocab], dtype::bool);
+        let pre_alpha_idx = Channel::new([pairs as u32], dtype::u32);
+        let pre_alpha_val = Channel::new([pairs as u32], dtype::f32);
+        let pre_rng = Channel::from([input.seed ^ (round as u32 * 0x9E37), 0]);
+        let pre_token = Channel::new([1], dtype::i32);
+        let pre_mass = Channel::new([1], dtype::f32);
+        let pre_prob = Channel::new([1], dtype::f32);
+        let pre_wmass = Channel::new([1], dtype::f32);
 
         let prefill = ForwardPass::new();
         prefill.embed(&prompt_tokens, &pre_indptr)?;
@@ -295,17 +295,16 @@ async fn main(input: Input) -> Result<Output> {
         path_nodes.push(node);
 
         if !constraint.is_terminated() && generated.len() < input.max_tokens {
-            let token_in = Channel::from([first]).named("token_in");
-            let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
-            let mask_ch = Channel::new([vocab], dtype::bool).named("mask");
-            let alpha_idx = Channel::new([pairs as u32], dtype::u32).named("alpha_idx");
-            let alpha_val = Channel::new([pairs as u32], dtype::f32).named("alpha_val");
-            let rng =
-                Channel::from([input.seed ^ (round as u32 * 0x9E37) ^ 0x5bd1, 0]).named("rng");
-            let token_out = Channel::new([1], dtype::i32).named("token_out");
-            let mass_out = Channel::new([1], dtype::f32).named("mass_out");
-            let prob_out = Channel::new([1], dtype::f32).named("prob_out");
-            let wmass_out = Channel::new([1], dtype::f32).named("wmass_out");
+            let token_in = Channel::from([first]);
+            let embed_indptr = Channel::from([0u32, 1]);
+            let mask_ch = Channel::new([vocab], dtype::bool);
+            let alpha_idx = Channel::new([pairs as u32], dtype::u32);
+            let alpha_val = Channel::new([pairs as u32], dtype::f32);
+            let rng = Channel::from([input.seed ^ (round as u32 * 0x9E37) ^ 0x5bd1, 0]);
+            let token_out = Channel::new([1], dtype::i32);
+            let mass_out = Channel::new([1], dtype::f32);
+            let prob_out = Channel::new([1], dtype::f32);
+            let wmass_out = Channel::new([1], dtype::f32);
 
             let decode = ForwardPass::new();
             decode.embed(&token_in, &embed_indptr)?;

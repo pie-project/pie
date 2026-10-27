@@ -52,19 +52,20 @@ pub(crate) fn init(max_upload_bytes: usize) {
 }
 
 pub const DEFAULT_TENANT: &str = "default";
+pub const DEFAULT_USER: &str = "internal";
 
 pub fn open_session() -> Result<ClientId> {
-    open_session_for(DEFAULT_TENANT.to_string())
+    open_session_for(DEFAULT_TENANT.to_string(), DEFAULT_USER.to_string())
 }
 
-pub fn open_session_for(tenant: String) -> Result<ClientId> {
+pub fn open_session_for(tenant: String, username: String) -> Result<ClientId> {
     let state = get_state()?;
     let id = state.next_client_id.fetch_add(1, Ordering::Relaxed);
 
     let (out_tx, out_rx) = mpsc::channel(1000);
     SESSION_OUTBOX.insert(id, Arc::new(TokioMutex::new(out_rx)));
 
-    let session = Session::new_inproc(id, state, out_tx, tenant);
+    let session = Session::new_inproc(id, state, out_tx, tenant, username);
     CLIENT_SERVICES.spawn(id, || session)?;
     Ok(id)
 }
@@ -229,10 +230,11 @@ impl Session {
         state: Arc<ServerState>,
         out_tx: mpsc::Sender<WireServerMessage>,
         tenant: String,
+        username: String,
     ) -> Self {
         Session {
             id,
-            username: "internal".to_string(),
+            username,
             tenant,
             state,
             inflight_uploads: DashMap::new(),
@@ -384,6 +386,7 @@ impl Session {
                 capture_outputs,
                 props,
                 session,
+                files,
                 cluster_props,
                 executors,
             } => {
@@ -394,6 +397,7 @@ impl Session {
                     capture_outputs,
                     props,
                     session,
+                    files,
                     cluster_props,
                     executors,
                 )
@@ -451,6 +455,24 @@ mod tests {
     use crate::inferlet::process::probe::{self, Seen};
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_session_owns_only_its_own_tenant_and_users_processes() {
+        let session = Session::new_inproc(
+            8,
+            install_state(0),
+            mpsc::channel(1).0,
+            "acme".to_string(),
+            "alice".to_string(),
+        );
+        let owner = |tenant: &str, username: &str| process::Owner {
+            tenant: tenant.to_string(),
+            username: username.to_string(),
+        };
+        assert!(session.owns(&owner("acme", "alice")));
+        assert!(!session.owns(&owner("acme", "bob")));
+        assert!(!session.owns(&owner("other", "alice")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_closed_session_ends_what_it_launched_and_only_detaches_what_it_attached() {
         let launched = ProcessId::new_v4();
         let attached = ProcessId::new_v4();
@@ -464,6 +486,7 @@ mod tests {
             install_state(0),
             mpsc::channel(1).0,
             DEFAULT_TENANT.to_string(),
+            DEFAULT_USER.to_string(),
         );
         session.attached_processes = vec![launched, attached];
         session.launched_processes.insert(launched);

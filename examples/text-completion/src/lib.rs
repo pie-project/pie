@@ -25,7 +25,6 @@ struct Output {
     text: String,
     /// How many tokens it is.
     count: usize,
-    /// Last on purpose: `pie::sweep::fleet` reads a lane's answer from the last `[`.
     tokens: Vec<u32>,
 }
 
@@ -52,7 +51,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut prompt = inferlet::chat::prefix();
     prompt.extend(model::encode(&input.prompt));
     if prompt.is_empty() {
-        prompt.push(0);
+        return Err("empty prompt".into());
     }
     let n = prompt.len() as u32;
 
@@ -60,9 +59,9 @@ async fn main(input: Input) -> Result<Output> {
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks = Channel::from(&prompt_i32[..]).named("toks_p");
-    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr_p");
-    let tok_out = Channel::new([1], dtype::i32).named("tok_out_p");
+    let toks = Channel::from(&prompt_i32[..]);
+    let embed_indptr = Channel::from([0u32, n]);
+    let tok_out = Channel::new([1], dtype::i32);
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;
@@ -76,11 +75,9 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── DECODE (1-wide, device loop-carried token) ─────────────────────────
     if generated.len() < max_tokens {
-        let tok_in = Channel::from([first]).named("tok_in");
-        let tok_out = Channel::new([1], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("tok_out");
-        let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+        let tok_in = Channel::from([first]);
+        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+        let embed_indptr = Channel::from([0u32, 1]);
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &embed_indptr)?;

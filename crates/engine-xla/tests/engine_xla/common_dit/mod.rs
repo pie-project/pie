@@ -866,6 +866,7 @@ pub fn attach(lane: u32, instance: InstanceId) -> Attachment {
 
 pub fn assert_close(got: &[f32], want: &[f32], what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: length");
+    report_err(what, got, want);
     let mut worst = 0f32;
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
         worst = worst.max((g - w).abs());
@@ -875,4 +876,19 @@ pub fn assert_close(got: &[f32], want: &[f32], what: &str) {
         );
     }
     eprintln!("{what}: max |err| {worst:.4}");
+}
+
+/// With `PIE_KERNEL_ERR=1`, prints `KERR <what> max_abs=<x> max_rel=<y>`
+/// for `got` against `want`.
+pub fn report_err(what: &str, got: &[f32], want: &[f32]) {
+    if std::env::var("PIE_KERNEL_ERR").as_deref() != Ok("1") {
+        return;
+    }
+    let (mut abs, mut rel) = (0f32, 0f32);
+    for (g, w) in got.iter().zip(want) {
+        let e = (g - w).abs();
+        abs = abs.max(e);
+        rel = rel.max(e / w.abs().max(1e-6));
+    }
+    println!("KERR {} max_abs={abs} max_rel={rel}", what.replace(' ', "_"));
 }

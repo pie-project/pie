@@ -161,25 +161,24 @@ async fn main(input: Input) -> Result<Output> {
             input.seed ^ block.wrapping_mul(0x9e37_79b9),
             length,
             vocab,
-        ))
-        .named("canvas");
-        let embed_indptr = Channel::from([0u32, length]).named("embed_indptr");
-        let slots = Channel::from_iter(base..end).named("slots");
-        let readout = Channel::from_iter(0..length).named("readout");
+        ));
+        let embed_indptr = Channel::from([0u32, length]);
+        let slots = Channel::from_iter(base..end);
+        let readout = Channel::from_iter(0..length);
         // The step counter, device-carried: the temperature schedule is
         // computed from it in the epilogue (the same `linear_temperature`
         // arithmetic the host would do), so a step needs no host `set`.
-        let step_index = Channel::from([0u32]).named("step_index");
+        let step_index = Channel::from([0u32]);
         let max_steps = input.max_steps.max(1);
         let (t_max, t_min) = (input.t_max, input.t_min);
-        let rng_state = Channel::from([input.seed ^ block, 0]).named("rng");
+        let rng_state = Channel::from([input.seed ^ block, 0]);
         // The previous step's argmax canvas, device-carried; -1 means none.
-        let history = Channel::from(vec![-1i32; length as usize]).named("argmax_history");
+        let history = Channel::from(vec![-1i32; length as usize]);
         // The step's one word to the host: the argmax canvas, the stop
         // verdict and the mean entropy, packed into one f32 row so the
         // step costs one host read (each read is a scheduler round trip,
         // and three of them were most of the seam between steps).
-        let step_out = Channel::new([length + 2], dtype::f32).named("step_out");
+        let step_out = Channel::new([length + 2], dtype::f32);
         // The next step's self-conditioning taps: per row, the top ids of
         // this step's distribution and their probabilities. Loop-carried on
         // the device (the epilogue takes the previous step's and puts this
@@ -187,11 +186,9 @@ async fn main(input: Input) -> Result<Output> {
         // submit (the `self_cond_*` inputs); seeded with zeros, which is
         // the reference's "no signal" first step. The host never sees them.
         let tap_ids_out =
-            Channel::from_shaped([length, taps], vec![0i32; (length * taps) as usize])
-                .named("tap_ids");
+            Channel::from_shaped([length, taps], vec![0i32; (length * taps) as usize]);
         let tap_weights_out =
-            Channel::from_shaped([length, taps], vec![0f32; (length * taps) as usize])
-                .named("tap_weights");
+            Channel::from_shaped([length, taps], vec![0f32; (length * taps) as usize]);
 
         let fwd = ForwardPass::new();
         fwd.switch(0, "mode", "denoise")?;
@@ -357,11 +354,11 @@ fn self_cond_taps() -> Result<u32> {
 /// ring; a pass with nothing to say still says one word).
 async fn encode(ws: &WorkingSet, pipe: &Pipeline, tokens: &[i32], base: u32) -> Result<()> {
     let len = u32::try_from(tokens.len()).map_err(|_| "an encode span is too long")?;
-    let toks = Channel::from(tokens).named("toks_e");
-    let embed_indptr = Channel::from([0u32, len]).named("embed_indptr_e");
+    let toks = Channel::from(tokens);
+    let embed_indptr = Channel::from([0u32, len]);
     // Stated, not appended: a commit replaces the canvas scratch at `base..`.
-    let slots = Channel::from_iter(base..base + len).named("slots_e");
-    let last = Channel::new([1], dtype::i32).named("last_e");
+    let slots = Channel::from_iter(base..base + len);
+    let last = Channel::new([1], dtype::i32);
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;

@@ -522,15 +522,15 @@ mod tests {
         const ROWS: u32 = 3;
         let vocab = (logits.len() / ROWS as usize) as u32;
         let leak = |c: Channel| -> &'static Channel { Box::leak(Box::new(c)) };
-        let tok = leak(Channel::new([ROWS], dtype::i32).named("tok"));
-        let indptr = leak(Channel::from([0u32, ROWS]).named("indptr"));
-        let kv_len = leak(Channel::from([ROWS]).named("kv_len"));
-        let positions = leak(Channel::from([0u32, 1, 2]).named("positions"));
-        let readout = leak(Channel::from([0u32, 1, 2]).named("readout"));
-        let props = leak(Channel::from(proposals).named("props"));
-        let rng = leak(Channel::from([9u32, 0]).named("rng"));
-        let chances = leak(Channel::new([ROWS], dtype::f32).named("chances"));
-        let draws = leak(Channel::new([ROWS], dtype::i32).named("draws"));
+        let tok = leak(Channel::new([ROWS], dtype::i32));
+        let indptr = leak(Channel::from([0u32, ROWS]));
+        let kv_len = leak(Channel::from([ROWS]));
+        let positions = leak(Channel::from([0u32, 1, 2]));
+        let readout = leak(Channel::from([0u32, 1, 2]));
+        let props = leak(Channel::from(proposals));
+        let rng = leak(Channel::from([9u32, 0]));
+        let chances = leak(Channel::new([ROWS], dtype::f32));
+        let draws = leak(Channel::new([ROWS], dtype::i32));
         tok.put(proposals);
         let decl = OutputDecl {
             name: "logits".into(),
@@ -566,16 +566,16 @@ mod tests {
             EngineCaps::default(),
         )
         .expect("the trace binds");
-        let names = traced.channel_names();
-        let at = |name: &str| names.iter().position(|n| n == name).unwrap() as u32;
+        let order = traced.channel_order();
+        let at = |ch: &Channel| order.iter().position(|&gid| gid == ch.gid()).unwrap() as u32;
         let seeds = [
-            (at("tok"), Value::I32(proposals.to_vec())),
-            (at("indptr"), Value::U32(vec![0, ROWS])),
-            (at("kv_len"), Value::U32(vec![ROWS])),
-            (at("positions"), Value::U32(vec![0, 1, 2])),
-            (at("readout"), Value::U32(vec![0, 1, 2])),
-            (at("props"), Value::I32(proposals.to_vec())),
-            (at("rng"), Value::U32(vec![9, 0])),
+            (at(tok), Value::I32(proposals.to_vec())),
+            (at(indptr), Value::U32(vec![0, ROWS])),
+            (at(kv_len), Value::U32(vec![ROWS])),
+            (at(positions), Value::U32(vec![0, 1, 2])),
+            (at(readout), Value::U32(vec![0, 1, 2])),
+            (at(props), Value::I32(proposals.to_vec())),
+            (at(rng), Value::U32(vec![9, 0])),
         ];
         let mut instance = Instance::new(&bound, &seeds).expect("the trace instantiates");
         let inputs = PassInputs {
@@ -586,10 +586,10 @@ mod tests {
             instance
                 .step(&bound, &inputs, &mut NoKernels)
                 .expect("a step runs");
-            let Value::F32(c) = instance.host_take(&bound, at("chances")).unwrap() else {
+            let Value::F32(c) = instance.host_take(&bound, at(chances)).unwrap() else {
                 panic!("chances are f32");
             };
-            let Value::I32(d) = instance.host_take(&bound, at("draws")).unwrap() else {
+            let Value::I32(d) = instance.host_take(&bound, at(draws)).unwrap() else {
                 panic!("draws are i32");
             };
             if first.is_empty() {

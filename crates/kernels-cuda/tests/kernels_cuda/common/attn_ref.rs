@@ -98,6 +98,7 @@ pub fn wide(bits: &[u16]) -> Vec<f32> {
 /// Asserts `got` within `tol` of `want` relative to `want` (at least `floor`).
 pub fn near(got: &[f32], want: &[f32], tol: f32, floor: f32, what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: lengths");
+    super::report_err(what, got, want);
     let err = |(g, w): (&f32, &f32)| (g - w).abs() / w.abs().max(floor);
     let worst = got.iter().zip(want).map(err).fold(0.0, f32::max);
     assert!(worst <= tol, "{what}: off by {worst} relative");

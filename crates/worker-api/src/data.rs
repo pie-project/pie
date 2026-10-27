@@ -35,6 +35,8 @@ pub struct Request {
     /// first (`placement.executors`); empty leaves them to the worker plane.
     #[serde(default)]
     pub executors: Vec<WorkerId>,
+    #[serde(default)]
+    pub user: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -11,6 +11,9 @@ pub const AUDIO_ROPE_AXES: u8 = 1;
 
 pub const GATE_SCALE: f32 = 2.0;
 
+pub const TEXT_LAYERS: usize = 48;
+pub const TEXT_LEN: u32 = 1024;
+
 pub const TRAIN_STEPS: u32 = 1000;
 pub const DISTILLED_SIGMAS: [f32; 8] = [
     1.0, 0.993_75, 0.987_5, 0.981_25, 0.975, 0.909_375, 0.725, 0.421_875,
@@ -27,7 +30,6 @@ pub struct Dims {
     pub cross_dim: u32,
     pub audio_cross_dim: u32,
     pub ff_mult: u32,
-    pub caption: u32,
     pub conn_layers: u32,
 }
 
@@ -44,7 +46,6 @@ impl Dims {
             cross_dim: 4096,
             audio_cross_dim: 2048,
             ff_mult: 4,
-            caption: 3840,
             conn_layers: 8,
         }
     }
@@ -61,7 +62,6 @@ impl Dims {
             cross_dim: 256,
             audio_cross_dim: 128,
             ff_mult: 4,
-            caption: 16,
             conn_layers: 1,
         }
     }

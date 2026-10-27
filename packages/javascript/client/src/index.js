@@ -597,14 +597,16 @@ export class PieClient {
      * @param {string} inferlet The inferlet name (e.g., "text-completion@0.1.0").
      * @param {Object} [input={}] Input parameters object, serialized to JSON.
      * @param {boolean} [captureOutputs=true] Stream outputs to client.
+     * @param {Object<string, Uint8Array>} [files={}] Files the inferlet reads with `session.file(name)`.
      * @returns {Promise<Process>}
      */
-    async launchProcess(inferlet, input = {}, captureOutputs = true) {
+    async launchProcess(inferlet, input = {}, captureOutputs = true, files = {}) {
         const msg = {
             type: "launch_process",
             inferlet,
             input: JSON.stringify(input),
             capture_outputs: captureOutputs,
+            files,
         };
         const { ok, result } = await this._sendMsgAndWait(msg);
         if (!ok) {

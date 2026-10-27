@@ -23,14 +23,14 @@ fn lane(velocity: bool) -> Vec<Vec<OutputDecl>> {
 }
 
 fn float_lane() -> (Traced, [Channel; 4]) {
-    let x = Channel::from(vec![0f32; (ROWS * WIDTH) as usize]).named("latents");
-    let t = Channel::from([1000f32]).named("timestep");
-    let ctx = Channel::from(vec![0f32; 4 * WIDTH as usize]).named("context");
-    let out = Channel::new([ROWS, WIDTH], eta_dsl::dtype::f32).named("out");
-    let step = Channel::from([0u32]).named("step");
-    let rng = Channel::from([7u32, 0u32]).named("rng");
-    let dts = Channel::from(vec![0f32, -0.25, -0.25, -0.25, -0.25, 0.0]).named("dts");
-    let ts = Channel::from(vec![1000f32, 1000.0, 750.0, 500.0, 250.0, 0.0]).named("ts");
+    let x = Channel::from(vec![0f32; (ROWS * WIDTH) as usize]);
+    let t = Channel::from([1000f32]);
+    let ctx = Channel::from(vec![0f32; 4 * WIDTH as usize]);
+    let out = Channel::new([ROWS, WIDTH], eta_dsl::dtype::f32);
+    let step = Channel::from([0u32]);
+    let rng = Channel::from([7u32, 0u32]);
+    let dts = Channel::from(vec![0f32, -0.25, -0.25, -0.25, -0.25, 0.0]);
+    let ts = Channel::from(vec![1000f32, 1000.0, 750.0, 500.0, 250.0, 0.0]);
     let (px, pt, pc) = (x.clone(), t.clone(), ctx.clone());
     let (ex, et, eo) = (x.clone(), t.clone(), out.clone());
     let mut b = Builder::new(32, 2);

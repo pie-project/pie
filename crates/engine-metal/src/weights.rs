@@ -1348,6 +1348,7 @@ mod tests {
             scales: None,
             zero_points: None,
             visibility: Default::default(),
+            composite_axis: None,
         };
         let contract = ModelContract {
             alignment: 256,

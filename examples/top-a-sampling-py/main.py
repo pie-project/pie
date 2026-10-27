@@ -75,12 +75,12 @@ async def main(input: dict) -> dict:
     s2: list[float] = []
 
     # ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
-    toks_p = Channel.from_(prompt, dtype.i32).named("toks_p")
-    embed_indptr_p = Channel.from_([0, n], dtype.u32).named("embed_indptr_p")
-    rng_p = Channel.from_([seed, 0], dtype.u32).named("rng_p")
-    tok_out_p = Channel([1], dtype.i32).named("tok_out_p")
-    s1_out_p = Channel([1], dtype.f32).named("s1_out_p")
-    s2_out_p = Channel([1], dtype.f32).named("s2_out_p")
+    toks_p = Channel.from_(prompt, dtype.i32)
+    embed_indptr_p = Channel.from_([0, n], dtype.u32)
+    rng_p = Channel.from_([seed, 0], dtype.u32)
+    tok_out_p = Channel([1], dtype.i32)
+    s1_out_p = Channel([1], dtype.f32)
+    s2_out_p = Channel([1], dtype.f32)
 
     fwd_p = ForwardPass()
     fwd_p.embed(toks_p, embed_indptr_p)
@@ -106,12 +106,12 @@ async def main(input: dict) -> dict:
     # ── DECODE LOOP (1-wide, run-ahead). ──
     if len(generated) < max_tokens:
         cap = channel_capacity()
-        tok_in = Channel.from_([generated[0]], dtype.i32).named("tok_in")
-        rng = Channel.from_([seed ^ 0x5BD1, 0], dtype.u32).named("rng")
-        tok_out = Channel([1], dtype.i32).capacity(cap).named("tok_out")
-        s1_out = Channel([1], dtype.f32).capacity(cap).named("s1_out")
-        s2_out = Channel([1], dtype.f32).capacity(cap).named("s2_out")
-        lane1 = Channel.from_([0, 1], dtype.u32).named("embed_indptr")
+        tok_in = Channel.from_([generated[0]], dtype.i32)
+        rng = Channel.from_([seed ^ 0x5BD1, 0], dtype.u32)
+        tok_out = Channel([1], dtype.i32).capacity(cap)
+        s1_out = Channel([1], dtype.f32).capacity(cap)
+        s2_out = Channel([1], dtype.f32).capacity(cap)
+        lane1 = Channel.from_([0, 1], dtype.u32)
 
         fwd = ForwardPass()
         fwd.embed(tok_in, lane1)

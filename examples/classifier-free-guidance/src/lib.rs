@@ -149,9 +149,9 @@ async fn main(input: Input) -> Result<Output> {
         .chain(&cond_prompt[..pc as usize])
         .map(|&t| t as i32)
         .collect();
-    let pre_toks = Channel::from(toks).named("prefill_tokens");
-    let pre_indptr = Channel::from([0u32, pu, pu + pc]).named("prefill_embed_indptr");
-    let drop = Channel::new([1], dtype::i32).named("prefill_drop");
+    let pre_toks = Channel::from(toks);
+    let pre_indptr = Channel::from([0u32, pu, pu + pc]);
+    let drop = Channel::new([1], dtype::i32);
     let prefill = ForwardPass::new();
     prefill.embed(&pre_toks, &pre_indptr)?;
     prefill.state(&streams, StateGeometry::folding())?;
@@ -166,12 +166,9 @@ async fn main(input: Input) -> Result<Output> {
     let toks = Channel::from([
         *uncond_prompt.last().unwrap() as i32,
         *cond_prompt.last().unwrap() as i32,
-    ])
-    .named("toks");
-    let embed_indptr = Channel::from([0u32, 1, 2]).named("embed_indptr");
-    let out = Channel::new([3], dtype::f32)
-        .capacity(channel_capacity() as u32)
-        .named("out");
+    ]);
+    let embed_indptr = Channel::from([0u32, 1, 2]);
+    let out = Channel::new([3], dtype::f32).capacity(channel_capacity() as u32);
 
     let decode = ForwardPass::new();
     decode.embed(&toks, &embed_indptr)?;

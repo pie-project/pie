@@ -361,7 +361,8 @@ pub fn window_fire_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
 }
 
 /// One sequence's cache rows: its kv pages at the declared context and the
-/// recurrent slabs, the least `Pools::fit_the_card` seats before refusing.
+/// recurrent slabs of the least state slots, the least `Pools::fit_the_card`
+/// seats before refusing.
 pub fn least_sequence_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut state: u64 = 0;
     for row in &trace.caches {
@@ -373,7 +374,8 @@ pub fn least_sequence_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
             state = state.saturating_add(stride * elem_bytes(name, *dtype)?);
         }
     }
-    Ok(one_slot_bytes(trace, paging)?.saturating_add(state))
+    let slots = u64::from(engine::fit::least_state_slots(1));
+    Ok(one_slot_bytes(trace, paging)?.saturating_add(state.saturating_mul(slots)))
 }
 
 pub fn admit_the_card(
@@ -626,6 +628,7 @@ impl Pools {
                     space,
                     window,
                     live,
+                    rows: quantized,
                     ..
                 } => {
                     let element = elem_bytes(name, *dtype)?;
@@ -661,16 +664,19 @@ impl Pools {
                     if let Some(seat) = restated.filter(|seat| seat.kv_heads != 0) {
                         let heads = u64::from(seat.kv_heads) * u64::from(seat.head_dim);
                         // DeepSeek's quantized rows hold a 512-wide head in
-                        // a u8 plane of their format's width.
+                        // a u8 plane of the format the trace declares: its
+                        // width (a compact pool's share of it) the format's.
                         let ds_row = *dtype == Dtype::U8
                             && heads == 512
-                            && [
-                                kernels_cuda::attn::compressed::decode::Rows::Ds,
-                                kernels_cuda::attn::compressed::decode::Rows::Mx8,
-                                kernels_cuda::attn::compressed::decode::Rows::Nv4,
-                            ]
-                            .iter()
-                            .any(|r| keys_width == u64::from(r.bytes()))
+                            && quantized.is_some_and(|f| {
+                                matches!(
+                                    f,
+                                    poem_ir::KvRows::V4
+                                        | poem_ir::KvRows::Mx8
+                                        | poem_ir::KvRows::Nv4
+                                ) && keys_width != 0
+                                    && f.bytes() % keys_width == 0
+                            })
                             && values_width == keys_width;
                         if !ds_row && (heads != keys_width || heads != values_width) {
                             return Err(Fault::Unbound {

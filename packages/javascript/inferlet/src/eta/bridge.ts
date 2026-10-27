@@ -88,7 +88,7 @@ export function unpadTokens(window: ArrayLike<number>): number[] {
  */
 export class Channel {
   private dsl_: DslChannel | null;
-  private pending: { capacity?: number; name?: string } | null = null;
+  private pending: { capacity?: number } | null = null;
 
   constructor(shape: readonly number[], dtype: Dtype);
   /** @internal */
@@ -104,7 +104,7 @@ export class Channel {
 
   /** @internal An output channel declared by a stage body's return value:
    * its shape and dtype are the returned tensor's, known once the pass
-   * traces (at first submit). `capacity`/`named` before that are kept. */
+   * traces (at first submit). `capacity` before that is kept. */
   static lazy(): Channel {
     const ch = new Channel(DslChannel.new([1], Dtype.I32));
     ch.dsl_ = null;
@@ -122,7 +122,6 @@ export class Channel {
     const pending = this.pending ?? {};
     this.pending = null;
     if (pending.capacity !== undefined) this.dsl_.capacity(pending.capacity);
-    if (pending.name !== undefined) this.dsl_.named(pending.name);
     this.dsl_.putTensor(value);
   }
 
@@ -179,21 +178,12 @@ export class Channel {
     return this;
   }
 
-  named(name: string): this {
-    if (this.dsl_ === null) {
-      this.pending!.name = name;
-      return this;
-    }
-    this.dsl.named(name);
-    return this;
-  }
-
   /** Declaration order — the container keys channels by it. */
   get gid(): number {
     return this.dsl.gid;
   }
-  get name(): string {
-    return this.dsl.name;
+  get site(): string {
+    return this.dsl.site;
   }
   get dtype(): Dtype {
     return this.dsl.dtype;
@@ -220,7 +210,7 @@ export class Channel {
       return;
     }
     const data = constData(v, dtype ?? this.dtype);
-    if (data.dtype !== this.dtype) throw new TypeError(`channel ${this.name} holds dtype ${this.dtype}, put ${data.dtype}`);
+    if (data.dtype !== this.dtype) throw new TypeError(`channel ${this.site} holds dtype ${this.dtype}, put ${data.dtype}`);
     this.dsl.noteHostPut();
     try {
       this.wit().put(data.data);
@@ -232,7 +222,7 @@ export class Channel {
   /** Atomically replace the committed front cell (a host operation). */
   set(v: ConstLike, dtype?: Dtype): void {
     const data = constData(v, dtype ?? this.dtype);
-    wit(`${this.name} set`, () => this.wit().set(data.data));
+    wit(`channel ${this.site} set`, () => this.wit().set(data.data));
   }
 
   /** Consume a cell on the host, decoded to numbers (booleans for a bool
@@ -240,27 +230,27 @@ export class Channel {
    * throws `InferletError`. */
   takeHost(): number[] | boolean[] {
     this.dsl.noteHostTake();
-    const raw = wit(`${this.name} take`, () => this.wit().takeBlocking());
+    const raw = wit(`channel ${this.site} take`, () => this.wit().takeBlocking());
     return unpackElems(raw, this.dtype);
   }
 
   /** Peek a cell on the host (leaves it full). */
   readHost(): number[] | boolean[] {
     this.dsl.noteHostRead();
-    const raw = wit(`${this.name} read`, () => this.wit().readBlocking());
+    const raw = wit(`channel ${this.site} read`, () => this.wit().readBlocking());
     return unpackElems(raw, this.dtype);
   }
 
   /** `takeHost()` for a one-element cell. */
   takeScalar(): number {
     const v = this.takeHost();
-    if (!v.length) throw new InferletError(`${this.name} take: channel cell is empty`);
+    if (!v.length) throw new InferletError(`channel ${this.site} take: channel cell is empty`);
     return Number(v[0]);
   }
 
   readScalar(): number {
     const v = this.readHost();
-    if (!v.length) throw new InferletError(`${this.name} read: channel cell is empty`);
+    if (!v.length) throw new InferletError(`channel ${this.site} read: channel cell is empty`);
     return Number(v[0]);
   }
 }

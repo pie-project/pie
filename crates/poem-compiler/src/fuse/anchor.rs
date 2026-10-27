@@ -26,11 +26,12 @@
 //! vector a column ([`Input::Column`], a bias), a head's vector every head
 //! reads ([`Input::Head`], a head's norm weight), one element a row
 //! ([`Input::Row`], a position) or one value ([`Input::One`]). The product
-//! is no value (nothing past the run reads it, or the run is no anchor) and
-//! keeps its accumulator, f32, through the epilogue: a matmul's product and
-//! the bias or activation over it are one computation, as `nn.Linear` and
-//! every reference keep them, the bf16 the trace states of the product a
-//! store the fusion leaves out. Each value the epilogue's ops compute rounds to
+//! is no value (nothing past the run reads it, or the run is no anchor). A
+//! linear's output is bf16 and only its bias sits inside the sum, as
+//! `nn.Linear` (addmm) and every reference keep them: the product keeps its
+//! accumulator, f32, where every op reading it adds a bias to it, and any
+//! other epilogue reads it rounded to bf16 (`Contraction::acc`), as the
+//! program lands it. Each value the epilogue's ops compute rounds to
 //! its dtype where it is defined, as a chain's do; one anything past the
 //! run may read is a result.
 //!
@@ -40,25 +41,13 @@
 //! the row chains do, so a product's epilogue is the contraction's, and the
 //! chains form over what is left.
 //!
-//! **Norms** ([`anchors_with`], `compiler.fold_norms`): an anchor whose
-//! operand is a row's RMS norm, its normed row read by the product alone,
-//! takes the norm in, rewritten as a scale of each row's products
-//! (`rmsnorm(x, g) · wᵀ = r ⊙ (x · (g ⊙ w)ᵀ)`, kernels-ir's
-//! `Anchored::normed`): its operand the norm's input (the residual stream,
-//! still written for whatever else reads it), the scale the epilogue's
-//! `Input::Norm`, the contraction's own as it streams each row, and the
-//! gain folded into the bank once at load, in place, as `fold_bank`
-//! declares (the bank read by this product alone and held whole on the
-//! device, `Folds`). The fold's extra rounding of each weight is the
-//! rewrite's, held to the unfolded program within each side's rounding.
-//!
 //! Anchors are formed and folded only under `compiler.synth_anchors`.
 
 use std::collections::BTreeMap;
 
 use kernels_ir::{
-    Anchored, Binary, CacheDtype, CachePlane, Contraction, Gain, Input, Layout, Op, Paged,
-    Pointwise, Quant, Region, RowNorm, Shape, Window,
+    Anchored, Binary, CacheDtype, CachePlane, Contraction, Input, Layout, Op, Paged, Pointwise,
+    Quant, Region, Shape, Window,
 };
 use poem_ir::{
     Attn, CacheRow, Def, Dim, Dtype, Elemwise, Fused, Gather, Linear, NormAxis, NormWeight,
@@ -80,9 +69,6 @@ pub struct Anchor {
     /// `outs[k]` is the epilogue's result `k`.
     pub outs: Vec<ValueId>,
     pub anchored: Anchored,
-    /// Where the anchor norms its operand's rows: the norm's gain, which a
-    /// load folds into `w` (`act` then the norm's input).
-    pub gain: Option<ValueId>,
     /// Where it lands results in a paged cache (a KV append's k and v):
     /// that cache. Its paged results name no value of `outs`.
     pub cache: Option<ValueId>,
@@ -97,30 +83,14 @@ pub struct Anchor {
 /// anchored region states no storage).
 pub type Serves<'a> = &'a dyn Fn(&Anchored, &[Dtype], &[Dtype]) -> bool;
 
-/// Whether a load may fold a norm's gain into the bank `w` in place: a
-/// plane it holds whole on the device for the life of the load (not one
-/// streamed from the host, whose bytes it would serve unfolded).
-pub type Folds<'a> = &'a dyn Fn(ValueId) -> bool;
-
 /// `trace` with each anchor `serves` takes replaced by one `fused.anchored`
 /// op, and the anchored regions its ops name, by key
 /// ([`Anchored::key`]).
 #[must_use]
 pub fn fold(trace: Trace, serves: Serves<'_>) -> (Trace, BTreeMap<u64, Anchored>) {
-    fold_with(trace, serves, None)
-}
-
-/// [`fold`], and where `folds` is given, each anchor over an RMS-normed
-/// operand whose bank it takes folded with its norm ([`anchors_with`]).
-#[must_use]
-pub fn fold_with(
-    trace: Trace,
-    serves: Serves<'_>,
-    folds: Option<Folds<'_>>,
-) -> (Trace, BTreeMap<u64, Anchored>) {
     let mut anchored = BTreeMap::new();
     let mut folded: Vec<(Vec<u32>, Fused)> = Vec::new();
-    for anchor in anchors_with(&trace, serves, folds) {
+    for anchor in anchors(&trace, serves) {
         let key = anchor.anchored.key();
         if anchor.landed {
             // the product's own op stays; the epilogue reads what it lands
@@ -146,7 +116,6 @@ pub fn fold_with(
                 ins: anchor.ins,
                 key,
                 outs: anchor.outs,
-                gain: anchor.gain,
                 cache: anchor.cache,
             },
         ));
@@ -170,33 +139,7 @@ fn landed_y(trace: &Trace, at: u32) -> ValueId {
 /// outside them run as they are.
 #[must_use]
 pub fn anchors(trace: &Trace, serves: Serves<'_>) -> Vec<Anchor> {
-    anchors_with(trace, serves, None)
-}
-
-/// [`anchors`], and where `folds` is given, each one whose operand is an RMS norm's
-/// row the norm's too ([`normed_of`]): the norm rewritten as a scale of each
-/// row's products (`rmsnorm(x, g) · wᵀ = r ⊙ (x · (g ⊙ w)ᵀ)`), its gain
-/// folded into the bank at load, the norm's op gone. Only where the anchor
-/// has an epilogue already, the scale one more op of it: over a bare
-/// product, the unfused leg it would add outweighs the norm it saves at a
-/// prefill's rows (an L40S's 4096 x 4096 bank, 6 to 9% past 256 rows),
-/// while over an epilogue the fold ties or wins at every row (a qkv's, a
-/// SwiGLU's). The backend's tuner picks how the folded region runs at each
-/// shape; the fold itself is this rule's.
-#[must_use]
-pub fn anchors_with(trace: &Trace, serves: Serves<'_>, folds: Option<Folds<'_>>) -> Vec<Anchor> {
     let escapes = Escapes::of(trace);
-    let mut readers = vec![0u32; trace.values.len()];
-    if folds.is_some() {
-        let mut ins = Vec::new();
-        for node in &trace.nodes {
-            ins.clear();
-            node.op.inputs(&mut ins);
-            for v in &ins {
-                readers[v.0 as usize] += 1;
-            }
-        }
-    }
     let count = u32::try_from(trace.nodes.len()).unwrap_or(u32::MAX);
     let mut taken = vec![false; trace.nodes.len()];
     let mut out = Vec::new();
@@ -237,8 +180,6 @@ pub fn anchors_with(trace: &Trace, serves: Serves<'_>, folds: Option<Folds<'_>>)
                         &stored(&anchor.outs),
                     )
             };
-            // Its operand's norm too, where the norm is the anchor's and the
-            // backend serves it so; else the anchor over the normed rows.
             // A product landed apart is anchored only where its epilogue lands
             // a KV append: the rest is the row chains'.
             if product.landed && anchor.cache.is_none() {
@@ -255,16 +196,6 @@ pub fn anchors_with(trace: &Trace, serves: Serves<'_>, folds: Option<Folds<'_>>)
                 .is_some_and(|e| e.region.ops.iter().any(|op| matches!(op, Op::Reduce(..))));
             if reduces && anchor.cache.is_none() {
                 return None;
-            }
-            if let Some(folds) = folds
-                && !product.landed
-                && folds(product.w)
-                && let Some(normed) = normed_of(trace, at, &product, &readers, &escapes)
-                    .filter(|n| !taken[n.node as usize])
-                    .and_then(|n| with_norm(trace, &anchor, n))
-                && held(&normed)
-            {
-                return Some(normed);
             }
             held(&anchor).then_some(anchor)
         });
@@ -291,92 +222,6 @@ struct Product {
     /// Landed apart by its own op (a quantized bank's, a projection's half):
     /// its anchor is that op's epilogue alone (`fused.epilogue`).
     landed: bool,
-}
-
-/// An RMS norm whose normed row is a product's operand, as an anchor folds
-/// it ([`normed_of`]).
-#[derive(Debug, Clone, Copy)]
-struct Normed {
-    node: u32,
-    x: ValueId,
-    norm: RowNorm,
-    gain: Option<ValueId>,
-}
-
-/// The norm whose row the matmul `at` reads, where an anchor may fold it: a
-/// row's RMS norm under the matmul's guard, its normed row bf16 and read by
-/// this matmul alone (so it needs no plane), its input bf16 rows of the
-/// product's (still written where anything else reads it: the residual
-/// stream), its gain none or a vector a column (bf16 or f32); and the
-/// product's bank read by this matmul alone, a load folding the gain into
-/// it in place.
-fn normed_of(
-    trace: &Trace,
-    at: u32,
-    product: &Product,
-    readers: &[u32],
-    escapes: &Escapes,
-) -> Option<Normed> {
-    let Def::Op(node) = trace.values[product.act.0 as usize].def else {
-        return None;
-    };
-    let Operation::Elemwise(Elemwise::Rmsnorm {
-        x,
-        weight,
-        axis: NormAxis::Row,
-        eps,
-        y,
-    }) = trace.nodes[node as usize].op
-    else {
-        return None;
-    };
-    let alone = |v: ValueId| readers.get(v.0 as usize) == Some(&1);
-    if y != product.act
-        || !alone(y)
-        || escapes.leaves(y, &[at])
-        || !alone(product.w)
-        || trace.nodes[node as usize].guard != trace.nodes[at as usize].guard
-        || chain::dtype_of(trace, y) != Dtype::Bf16
-        || chain::dtype_of(trace, x) != Dtype::Bf16
-    {
-        return None;
-    }
-    let rows = matches!(chain::form(trace, x), Some(Form::Rows { dim, width })
-        if dim == product.dim && width == u64::from(product.k));
-    let (gain, g) = match weight {
-        NormWeight::None => (Gain::None, None),
-        NormWeight::Scale(g) => (Gain::Scale, Some(g)),
-        NormWeight::PlusOne(g) => (Gain::PlusOne, Some(g)),
-    };
-    let laid = g.is_none_or(|g| {
-        matches!(chain::form(trace, g), Some(Form::Shared { width }) if width == u64::from(product.k))
-            && matches!(chain::dtype_of(trace, g), Dtype::Bf16 | Dtype::F32)
-    });
-    (rows && laid).then_some(Normed {
-        node,
-        x,
-        norm: RowNorm { eps, gain },
-        gain: g,
-    })
-}
-
-/// `anchor` with its operand's norm folded in ([`Anchored::normed`]): its
-/// operand the norm's input, the norm's op its first, its gain the load's
-/// to fold into the bank.
-fn with_norm(trace: &Trace, anchor: &Anchor, normed: Normed) -> Option<Anchor> {
-    let anchored = anchor.anchored.normed(normed.norm)?;
-    let mut nodes = anchor.nodes.clone();
-    nodes.insert(0, normed.node);
-    if !chain::keeps_order(trace, &nodes) {
-        return None;
-    }
-    Some(Anchor {
-        nodes,
-        act: normed.x,
-        anchored,
-        gain: normed.gain,
-        ..anchor.clone()
-    })
 }
 
 /// The product node `at` lands, if it is a matmul an anchor holds: bf16
@@ -985,6 +830,23 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
         results,
         rounds,
     };
+    // A linear's output is bf16 and only its bias sits inside the sum: the
+    // product keeps its accumulator where every op reading it adds a bias (a
+    // vector a column) to it, and any other reads it rounded, as the
+    // program lands it.
+    let column = |v: u32| {
+        v >= parts
+            && ins
+                .get((v - parts) as usize)
+                .is_some_and(|(_, input)| *input == Input::Column)
+    };
+    let biased = region.results.iter().all(|&r| r >= parts)
+        && region.ops.iter().all(|op| match *op {
+            Op::Binary(Binary::Add, x, y) if x < parts || y < parts => {
+                (x < parts && column(y)) || (y < parts && column(x))
+            }
+            ref op => op.args().iter().all(|&a| a >= parts),
+        });
     // The op lands each result on a plane apart from every one it reads.
     let held = |v: ValueId| In {
         value: v,
@@ -1028,7 +890,6 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
             .collect()
     };
     let anchored = Anchored {
-        norm: None,
         paged,
         windows: cut,
         contraction: Contraction {
@@ -1036,10 +897,9 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
             k: product.k,
             layout,
             quant: Quant::Plain(Dtype::Bf16),
-            // The product keeps its accumulator through the epilogue, as a
-            // matmul and its bias are one sum: no op between them rounds it;
-            // one landed apart is read as its op stored it.
-            acc: product.landed.then_some(Dtype::Bf16),
+            // The product keeps its accumulator through a bias alone; one
+            // landed apart is read as its op stored it.
+            acc: (product.landed || !biased).then_some(Dtype::Bf16),
         },
         prologue: None,
         epilogue: Some(Pointwise {
@@ -1054,7 +914,6 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
         ins: ins.into_iter().map(|(v, _)| v).collect(),
         outs,
         anchored,
-        gain: None,
         cache: append.map(|a| a.cache),
         landed: product.landed,
     })

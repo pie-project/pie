@@ -219,7 +219,7 @@ def generative(m):
             shift = VIDEO_SHIFT,
             train_steps = TRAIN_STEPS,
             pinned_sigmas = shifted_sigmas(VIDEO_SHIFT, STEPS),
-            stream_shifts = [("video", VIDEO_SHIFT), ("audio", AUDIO_SHIFT), ("reference", 1.0)],
+            stream_shifts = [("latents", VIDEO_SHIFT), ("audio", AUDIO_SHIFT), ("reference", 1.0)],
         ),
     )
 
@@ -345,8 +345,8 @@ def read(m, reads, prefix):
     if m.te != None:
         te_read(reads, m.te, "te.model.language_model.")
 
-# The forward of MiniMax H3: the text encoder's `text` reading, the caption
-# refiner's `refine` reading, and the `denoise` reading, which attends text,
+# The forward of MiniMax H3: the text encoder's `text` reading and the
+# `denoise` reading, which refines the caption, then attends it with the
 # video, audio and reference rows jointly, each stream modulated by its own
 # timestep through its modality's adaLN.
 
@@ -428,21 +428,20 @@ T_MAX_PERIOD = 10000.0
 ROPE_THETA = 10000.0
 
 # The modality whose adaLN modulates a stream, and its timestep's slot.
-MODALITY = {"video": 0, "reference": 0, "image": 0, "audio": 2, "text": 1, "context": 1}
-SLOT = {"video": 0, "text": 0, "context": 0, "reference": 1, "image": 1, "audio": 2}
+MODALITY = {"latents": 0, "reference": 0, "audio": 2, "context": 1}
+SLOT = {"latents": 0, "context": 0, "reference": 1, "audio": 2}
 
 def caches(m, c):
     if m.te != None:
         qwen3_caches(m.te, c, m.kv)
 
 def forward(m, inputs):
-    switch("reading", (["text"] if m.te != None else []) + ["refine", "denoise"])
-    switch("stream", ["text", "video", "audio", "reference"])
+    switch("reading", (["text"] if m.te != None else []) + ["denoise"])
+    switch("stream", ["context", "latents", "audio", "reference"])
     switch("positions", ["computed", "given"])
     reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:
         qwen3_encode(reading("text"), m.te)
-    refine(reading("refine"), m)
     denoise(reading("denoise"), m)
 
 def run_attention(x, a, m, g, positions):
@@ -467,21 +466,16 @@ def run_mlp(x, f, d):
 
 def refine(arm, m):
     d = m.dims
-    x = run_linear(m.dit.condition, arm.input("caption", dtype.bf16, "row", d.text_dim))
+    x = run_linear(m.dit.condition, arm.input("context", dtype.bf16, "row", d.text_dim))
     geom = struct(perm = arm.row_permutation(), csr = arm.lane_indptr(), mask = unmasked())
-    last = len(m.dit.refine) - 1
 
     def block(l, b, x):
         h = ops.elemwise.rmsnorm(x, b.norm1, NORM_EPS)
         x = ops.elemwise.residual_add(run_attention(h, b.attn, m, geom, None), x)
         h = ops.elemwise.rmsnorm(x, b.norm2, NORM_EPS)
-        x = ops.elemwise.residual_add(run_mlp(h, b.mlp, d), x)
-        if l == last:
-            y = ops.elemwise.rmsnorm(x, m.dit.refine_norm, NORM_EPS)
-            output("hidden", y)
-        return x
+        return ops.elemwise.residual_add(run_mlp(h, b.mlp, d), x)
 
-    arm.fold_layers(m.dit.refine, x, block)
+    return ops.elemwise.rmsnorm(arm.fold_layers(m.dit.refine, x, block), m.dit.refine_norm, NORM_EPS)
 
 def column(v, slot, total):
     tail = v if slot == 0 else ops.gather.split_rows(v, slot)[1]
@@ -553,7 +547,7 @@ def turn_positions(arm, m, streams):
     audio_rows = ops.gather.concat_cols([ops.elemwise.add(text_rows, tick), zero, a_w])
 
     # Split as the denoise splits its streams, so the rows merge back whole.
-    t, v, a = [switch_is("stream", name) for name in ["text", "video", "audio"]]
+    t, v, a = [switch_is("stream", name) for name in ["context", "latents", "audio"]]
     computed = merge([
         cells.on(t),
         video_rows.on(~t).on(v),
@@ -566,8 +560,8 @@ def turn_positions(arm, m, streams):
 def denoise(arm, m):
     d = m.dims
     dit = m.dit
-    text, rest = arm.on(switch_is("stream", "text")), arm.on(~switch_is("stream", "text"))
-    video, rest = rest.on(switch_is("stream", "video")), rest.on(~switch_is("stream", "video"))
+    text, rest = arm.on(switch_is("stream", "context")), arm.on(~switch_is("stream", "context"))
+    video, rest = rest.on(switch_is("stream", "latents")), rest.on(~switch_is("stream", "latents"))
     audio, reference = rest.on(switch_is("stream", "audio")), rest.on(~switch_is("stream", "audio"))
 
     lanes = arm.request_of_token()
@@ -581,15 +575,13 @@ def denoise(arm, m):
         return struct(stream = stream, stemb = ops.elemwise.silu(e))
 
     sides = [
-        side(text, "text"),
-        side(video, "video"),
+        side(text, "context"),
+        side(video, "latents"),
         side(audio, "audio"),
         side(reference, "reference"),
     ]
 
-    ctx = text.input("context", dtype.bf16, "row", d.dim)
-    ctx_perm = text.row_permutation()
-    text_rows = ops.gather.unpack_rows(ops.gather.pack_rows(ctx, ctx_perm), ctx_perm)
+    text_rows = refine(text, m)
     video_grid, video_tgrid = video.grid(), video.token_grid(PATCH)
     video_rows = run_linear(dit.video_patch, patched(video, "latents", video_grid, video_tgrid))
     audio_rows = run_linear(dit.audio_patch, audio.input("audio", dtype.bf16, "row", m.audio_channels))
@@ -608,8 +600,8 @@ def denoise(arm, m):
 
     final_mod = merge([run_linear(dit.final_adaln, s.stemb) for s in sides])
     h = ops.elemwise.modulate(ops.elemwise.rmsnorm(x, dit.final_norm, NORM_EPS), final_mod, lanes, "scale_shift")
-    rest = h.on(~switch_is("stream", "text"))
-    h_video, rest = rest.on(switch_is("stream", "video")), rest.on(~switch_is("stream", "video"))
+    rest = h.on(~switch_is("stream", "context"))
+    h_video, rest = rest.on(switch_is("stream", "latents")), rest.on(~switch_is("stream", "latents"))
     h_audio = rest.on(switch_is("stream", "audio"))
     audio_velocity = run_linear(dit.audio_out, h_audio)
     output("audio.velocity", audio_velocity)

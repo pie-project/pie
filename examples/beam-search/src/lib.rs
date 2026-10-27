@@ -121,11 +121,11 @@ async fn main(input: Input) -> Result<String> {
     // Step 0: the prompt's own next-token distribution. Every beam is the
     // prompt, so the first `b` tokens are its top `b`.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = Channel::from(&prompt_i32[..]).named("toks_p");
-    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-    let out_p = Channel::new([b], dtype::i32).named("out_p");
-    let scr_p = Channel::new([b], dtype::f32).named("scr_p");
-    let greedy_p = Channel::new([1], dtype::i32).named("greedy_p");
+    let toks_p = Channel::from(&prompt_i32[..]);
+    let embed_indptr_p = Channel::from([0u32, n]);
+    let out_p = Channel::new([b], dtype::i32);
+    let scr_p = Channel::new([b], dtype::f32);
+    let greedy_p = Channel::new([1], dtype::i32);
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     fwd_p
@@ -155,21 +155,13 @@ async fn main(input: Input) -> Result<String> {
     let mut hypotheses: Vec<Vec<u32>> = first.iter().map(|&token| vec![token as u32]).collect();
 
     if decodes > 0 {
-        let scores = Channel::from(&final_scores[..]).named("scores");
-        let toks = Channel::from(&first[..]).named("toks");
-        let out = Channel::new([b], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("out");
-        let out_par = Channel::new([b], dtype::u32)
-            .capacity(channel_capacity() as u32)
-            .named("out_par");
-        let out_scr = Channel::new([b], dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named("out_scr");
-        let out_greedy = Channel::new([b], dtype::i32)
-            .capacity(channel_capacity() as u32)
-            .named("out_greedy");
-        let lanes_b = Channel::from_iter(0u32..=b).named("embed_indptr");
+        let scores = Channel::from(&final_scores[..]);
+        let toks = Channel::from(&first[..]);
+        let out = Channel::new([b], dtype::i32).capacity(channel_capacity() as u32);
+        let out_par = Channel::new([b], dtype::u32).capacity(channel_capacity() as u32);
+        let out_scr = Channel::new([b], dtype::f32).capacity(channel_capacity() as u32);
+        let out_greedy = Channel::new([b], dtype::i32).capacity(channel_capacity() as u32);
+        let lanes_b = Channel::from_iter(0u32..=b);
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &lanes_b)?;
@@ -180,12 +172,12 @@ async fn main(input: Input) -> Result<String> {
         let init_mask: Vec<bool> = (0..b)
             .flat_map(|lane| (0..pool_len).map(move |p| p < n || p == n + lane))
             .collect();
-        let mask = Channel::from_shaped([b, pool_len], init_mask).named("mask");
-        let slots = Channel::from_iter(n..n + b).named("slots");
+        let mask = Channel::from_shaped([b, pool_len], init_mask);
+        let slots = Channel::from_iter(n..n + b);
         // A beam's RoPE position is its depth in the sequence, not its pool slot.
-        let pos = Channel::from(vec![n; b as usize]).named("pos");
+        let pos = Channel::from(vec![n; b as usize]);
         // Where the fire after this one writes its first beam.
-        let fill = Channel::from([n + b]).named("fill");
+        let fill = Channel::from([n + b]);
         fwd.mask(&mask)?;
         fwd.state(
             &pool,

@@ -1485,6 +1485,35 @@ pub struct PendingFire {
     fwd_rep: u32,
     cells: BoundCells,
     failure: PipelineFailure,
+    /// A dropped pass whose last fire this is; it closes when the fire settles.
+    retired: Option<Box<crate::pipeline::instance::BoundForwardPass>>,
+}
+
+/// Hands a dropped pass to its last pending fire, or back if none is pending.
+pub(crate) fn retire_pass(
+    rep: u32,
+    bound: Box<crate::pipeline::instance::BoundForwardPass>,
+) -> Option<Box<crate::pipeline::instance::BoundForwardPass>> {
+    let Some(fires) = bound.fires.clone() else {
+        return Some(bound);
+    };
+    let mut queue = fires.lock().unwrap();
+    let mut last = None;
+    for op in queue.iter_mut() {
+        if let PendingOp::Fire(fire) = op
+            && fire.fwd_rep == rep
+        {
+            fire.fwd_rep = u32::MAX;
+            last = Some(fire);
+        }
+    }
+    match last {
+        Some(fire) => {
+            fire.retired = Some(bound);
+            None
+        }
+        None => Some(bound),
+    }
 }
 
 fn prepare_rs_reserved(
@@ -2874,6 +2903,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     fwd_rep,
                     cells: cells.clone(),
                     failure: pipeline_failure.clone(),
+                    retired: None,
                 }));
             // The next piece reads the KV this one writes: they run in
             // order on the device, so it is submitted now, as a decode's
@@ -3363,6 +3393,7 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         fwd_rep,
         cells,
         failure,
+        retired,
     } = fire;
     let prior_failure = failure.lock().unwrap().clone();
     let result = completion.await;
@@ -3435,6 +3466,10 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
 
     for planner in crate::planner::planners() {
         planner.pages_freed();
+    }
+
+    if let Some(mut pass) = retired {
+        pass.close_native();
     }
 
     let failure_reason = prior_failure.or_else(|| {
@@ -3891,6 +3926,7 @@ async fn fire_device_geometry<C: FireContext>(
             fwd_rep,
             cells,
             failure: pipeline_failure,
+            retired: None,
         }));
     Ok(Ok(()))
 }
@@ -3993,6 +4029,7 @@ pub(crate) mod lifecycle_tests {
                 fwd_rep: u32::MAX,
                 cells,
                 failure: failure.clone(),
+                retired: None,
             }));
         (fires, completion, ws, stores, failure)
     }

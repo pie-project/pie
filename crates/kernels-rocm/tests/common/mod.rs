@@ -351,6 +351,7 @@ pub fn e4m3_code(x: f32) -> u8 {
 /// Every `have[i]` is within `ulps` bf16 steps of `want[i]`.
 pub fn close_bf16(what: &str, have: &[f32], want: &[f32], ulps: f32) {
     assert_eq!(have.len(), want.len(), "{what}: lengths");
+    report_err(what, have, want);
     for (i, (h, w)) in have.iter().zip(want).enumerate() {
         let step = (w.abs().max(1e-30)).log2().floor().exp2() / 128.0;
         assert!(
@@ -364,7 +365,23 @@ pub fn close_bf16(what: &str, have: &[f32], want: &[f32], ulps: f32) {
 /// where the error is set by the inputs' scale and not the output's.
 pub fn close_abs(what: &str, have: &[f32], want: &[f32], tol: f32) {
     assert_eq!(have.len(), want.len(), "{what}: lengths");
+    report_err(what, have, want);
     for (i, (h, w)) in have.iter().zip(want).enumerate() {
         assert!((h - w).abs() <= tol, "{what}[{i}] = {h}, want {w} (±{tol})");
     }
+}
+
+/// With `PIE_KERNEL_ERR=1`, prints `KERR <what> max_abs=<x> max_rel=<y>`
+/// for `got` against `want`.
+pub fn report_err(what: &str, got: &[f32], want: &[f32]) {
+    if std::env::var("PIE_KERNEL_ERR").as_deref() != Ok("1") {
+        return;
+    }
+    let (mut abs, mut rel) = (0f32, 0f32);
+    for (g, w) in got.iter().zip(want) {
+        let e = (g - w).abs();
+        abs = abs.max(e);
+        rel = rel.max(e / w.abs().max(1e-6));
+    }
+    println!("KERR {} max_abs={abs} max_rel={rel}", what.replace(' ', "_"));
 }

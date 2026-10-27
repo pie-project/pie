@@ -26,6 +26,8 @@ pub struct CompiledModel {
     pub units_of: Vec<u32>,
     pub patches: Option<AxisPlan>,
     pub voxels: Option<AxisPlan>,
+    /// [`crate::arena::voxel_growth`], by class.
+    pub voxel_growth: Vec<(u32, u32)>,
     pub fold_refused: bool,
     /// [`crate::expert::held`]: the values an expert region makes, by id,
     /// empty where nothing dispatches.

@@ -39,7 +39,7 @@ fn the_z_image_vae_bakes_every_case() {
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     assert_eq!(
         readings(TURBO),
-        vec!["text", "refine", "denoise", "vae.decode", "vae.encode"]
+        vec!["text", "denoise", "vae.decode", "vae.encode"]
     );
     assert!(
         !readings(MINI).iter().any(|r| r.starts_with("vae.")),
@@ -78,7 +78,7 @@ fn the_trace_reads_its_voxel_inputs_and_plants_pixels_twice() {
     assert_eq!(
         named,
         vec![
-            ("latent", model::CHANNELS, Dtype::Bf16),
+            ("latents", model::CHANNELS, Dtype::Bf16),
             ("latents", model::CHANNELS, Dtype::Bf16),
             ("pixels", vae::RGB, Dtype::Bf16)
         ]
@@ -104,8 +104,8 @@ fn the_trace_reads_its_voxel_inputs_and_plants_pixels_twice() {
         dtype: Dtype::Bf16,
     };
     let mut want = vec![
-        plane(Dim::VoxelsTimes(64), u64::from(vae::RGB)),
-        plane(Dim::Voxels, u64::from(model::CHANNELS)),
+        plane(Dim::VoxelsScaled(64, 1), u64::from(vae::RGB)),
+        plane(Dim::VoxelsScaled(1, 64), u64::from(model::CHANNELS)),
     ];
     want.sort_by_key(|ty| format!("{ty:?}"));
     assert_eq!(planes, want);
@@ -124,13 +124,11 @@ fn the_shapes_are_the_flux_vaes() {
         match &node.op {
             Operation::Attn(Attn::Voxel { sm_scale, q, .. }) => {
                 attentions += 1;
-                assert_eq!(
-                    plan.values[q.0 as usize].ty.clone(),
-                    Ty::Tensor {
-                        shape: vec![Dim::Voxels, Dim::Const(512)],
-                        dtype: Dtype::Bf16
-                    }
-                );
+                let Ty::Tensor { shape, dtype } = &plan.values[q.0 as usize].ty else {
+                    panic!("a query is a tensor")
+                };
+                assert_eq!((shape[1], *dtype), (Dim::Const(512), Dtype::Bf16));
+                assert!(matches!(shape[0], Dim::Voxels | Dim::VoxelsScaled(1, 64)));
                 assert!((sm_scale - 512f32.sqrt().recip()).abs() < 1e-9);
             }
             Operation::Conv(Conv::Upsample {

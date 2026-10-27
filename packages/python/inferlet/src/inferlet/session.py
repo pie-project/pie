@@ -54,3 +54,9 @@ async def receive_file() -> bytes:
     if result is None:
         raise RuntimeError("Session receive_file failed")
     return result
+
+
+def file(name: str) -> bytes | None:
+    """The file the client attached to this run under `name`
+    (`pie run --file name=path`), or None."""
+    return _session.file(name)

@@ -25,7 +25,8 @@ export function vt(shape: Shape, dtype: Dtype): ValueType {
 
 export interface ChannelState {
   gid: number;
-  name: string;
+  /** Where the channel was made (`file:line`); errors name it by this. */
+  site: string;
   shape: Shape;
   dtype: Dtype;
   capacity: number;

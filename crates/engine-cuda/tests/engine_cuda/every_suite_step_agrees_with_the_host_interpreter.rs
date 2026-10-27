@@ -45,15 +45,37 @@ struct Suite {
     /// Seeded channels by name, each lane's key folded into `rng`-named ones.
     seeds: Vec<(&'static str, Value)>,
     outputs: Vec<(&'static str, Dtype, Check)>,
+    /// Each named channel's id ([`named`]).
+    names: Vec<(&'static str, u64)>,
 }
 
 fn leak(channel: Channel) -> &'static Channel {
     Box::leak(Box::new(channel))
 }
 
+thread_local! {
+    /// The channels the suite being built names, with their ids.
+    static NAMES: std::cell::RefCell<Vec<(&'static str, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `channel`, leaked, under `name` in the suite being built.
+fn named(name: &'static str, channel: Channel) -> &'static Channel {
+    NAMES.with(|names| names.borrow_mut().push((name, channel.gid())));
+    leak(channel)
+}
+
+/// The names the suite being built gave, taken.
+fn take_names() -> Vec<(&'static str, u64)> {
+    NAMES.with(|names| names.take())
+}
+
 /// A builder over `rows` logits rows: the embed indptr port says how many.
 fn builder(vocab: u32, rows: u32) -> Builder<'static> {
-    let indptr = leak(Channel::from((0u32..=rows).collect::<Vec<u32>>()).named("embed_indptr"));
+    let indptr = named(
+        "embed_indptr",
+        Channel::from((0u32..=rows).collect::<Vec<u32>>()),
+    );
     let mut b = Builder::new(vocab, 16);
     b.outputs(vec![vec![crate::bound::logits_decl(vocab)]]);
     b.bind_port(Port::EmbedIndptr, indptr);
@@ -69,17 +91,15 @@ fn port_seeds(rows: u32) -> Vec<(&'static str, Value)> {
 fn sampling_primitives() -> Suite {
     const TOP_P: f32 = 0.9;
     let vocab = QWEN_VOCAB;
-    let token_out = leak(Channel::new([1], dtype::i32).capacity(4).named("token"));
-    let entropy_out = leak(Channel::new([1], dtype::f32).capacity(4).named("entropy"));
-    let probs_out = leak(
-        Channel::new([vocab], dtype::f32)
-            .capacity(4)
-            .named("probabilities"),
+    let token_out = named("token", Channel::new([1], dtype::i32).capacity(4));
+    let entropy_out = named("entropy", Channel::new([1], dtype::f32).capacity(4));
+    let probs_out = named(
+        "probabilities",
+        Channel::new([vocab], dtype::f32).capacity(4),
     );
-    let keep_out = leak(
-        Channel::new([vocab], dtype::i32)
-            .capacity(4)
-            .named("nucleus_keep"),
+    let keep_out = named(
+        "nucleus_keep",
+        Channel::new([vocab], dtype::i32).capacity(4),
     );
     let mut b = builder(vocab, 1);
     b.stage(Stage::Epilogue, move || {
@@ -98,6 +118,7 @@ fn sampling_primitives() -> Suite {
         channel.note_host_take();
     }
     Suite {
+        names: take_names(),
         name: "sampling-primitives".into(),
         traced: b.build().expect("sampling-primitives traces"),
         rows: 1,
@@ -118,10 +139,10 @@ fn sampling_primitives() -> Suite {
 fn truncation(eta: bool) -> Suite {
     let vocab = 32_000u32;
     let (epsilon, temperature) = (0.0003f32, 0.8f32);
-    let rng = leak(Channel::from([0x3f17u32 ^ 0x5bd1, 0]).named("rng"));
-    let tok_out = leak(Channel::new([1], dtype::i32).capacity(4).named("tok_out"));
-    let kept_out = leak(Channel::new([1], dtype::f32).capacity(4).named("kept_out"));
-    let mass_out = leak(Channel::new([1], dtype::f32).capacity(4).named("mass_out"));
+    let rng = named("rng", Channel::from([0x3f17u32 ^ 0x5bd1, 0]));
+    let tok_out = named("tok_out", Channel::new([1], dtype::i32).capacity(4));
+    let kept_out = named("kept_out", Channel::new([1], dtype::f32).capacity(4));
+    let mass_out = named("mass_out", Channel::new([1], dtype::f32).capacity(4));
     let mut b = builder(vocab, 1);
     b.stage(Stage::Epilogue, move || {
         let r = rng.take();
@@ -153,6 +174,7 @@ fn truncation(eta: bool) -> Suite {
     let mut seeds = port_seeds(1);
     seeds.push(("rng", Value::U32(vec![0x3f17 ^ 0x5bd1, 0])));
     Suite {
+        names: take_names(),
         name: format!(
             "eta-epsilon-sampling ({})",
             if eta { "eta" } else { "epsilon" }
@@ -174,8 +196,8 @@ fn truncation(eta: bool) -> Suite {
 fn guidance(guided: bool) -> Suite {
     let vocab = 32_000u32;
     let weight = if guided { 1.5f32 } else { 0.5 };
-    let out = leak(Channel::new([3], dtype::f32).capacity(4).named("out"));
-    let next = leak(Channel::new([2], dtype::i32).capacity(4).named("next"));
+    let out = named("out", Channel::new([3], dtype::f32).capacity(4));
+    let next = named("next", Channel::new([2], dtype::i32).capacity(4));
     let mut b = builder(vocab, 2);
     b.stage(Stage::Epilogue, move || {
         let logits = reshape(intrinsics::output(0, "logits"), [2, vocab]);
@@ -206,6 +228,7 @@ fn guidance(guided: bool) -> Suite {
     out.note_host_take();
     next.note_host_take();
     Suite {
+        names: take_names(),
         name: if guided {
             "classifier-free-guidance".into()
         } else {
@@ -233,38 +256,24 @@ fn beam(beams: u32) -> Suite {
     let init_mask: Vec<bool> = (0..beams)
         .flat_map(|_| (0..pool_len).map(|p| p == 0))
         .collect();
-    let scores = leak(Channel::from(initial.clone()).named("scores"));
+    let scores = named("scores", Channel::from(initial.clone()));
     // What the next forward pass would consume (its tokens, slots and
     // lengths) the host takes here instead.
-    let toks = leak(
-        Channel::new([beams], dtype::i32)
-            .capacity(4)
-            .named("beam_toks"),
+    let toks = named("beam_toks", Channel::new([beams], dtype::i32).capacity(4));
+    let mask = named(
+        "mask",
+        Channel::from_shaped([beams, pool_len], init_mask.clone()),
     );
-    let mask = leak(Channel::from_shaped([beams, pool_len], init_mask.clone()).named("mask"));
-    let slots = leak(Channel::new([beams], dtype::u32).capacity(4).named("slots"));
-    let pos = leak(Channel::from(vec![0u32; beams as usize]).named("pos"));
-    let fill = leak(Channel::from([1u32]).named("fill"));
-    let kv_len = leak(
-        Channel::new([beams], dtype::u32)
-            .capacity(4)
-            .named("kv_len"),
-    );
-    let out = leak(Channel::new([beams], dtype::i32).capacity(4).named("out"));
-    let out_par = leak(
-        Channel::new([beams], dtype::u32)
-            .capacity(4)
-            .named("out_par"),
-    );
-    let out_scr = leak(
-        Channel::new([beams], dtype::f32)
-            .capacity(4)
-            .named("out_scr"),
-    );
-    let out_mask = leak(
-        Channel::new([beams, pool_len], dtype::bool)
-            .capacity(4)
-            .named("out_mask"),
+    let slots = named("slots", Channel::new([beams], dtype::u32).capacity(4));
+    let pos = named("pos", Channel::from(vec![0u32; beams as usize]));
+    let fill = named("fill", Channel::from([1u32]));
+    let kv_len = named("kv_len", Channel::new([beams], dtype::u32).capacity(4));
+    let out = named("out", Channel::new([beams], dtype::i32).capacity(4));
+    let out_par = named("out_par", Channel::new([beams], dtype::u32).capacity(4));
+    let out_scr = named("out_scr", Channel::new([beams], dtype::f32).capacity(4));
+    let out_mask = named(
+        "out_mask",
+        Channel::new([beams, pool_len], dtype::bool).capacity(4),
     );
     let (b, v) = (beams, vocab);
     let mut builder = builder(vocab, beams);
@@ -304,6 +313,7 @@ fn beam(beams: u32) -> Suite {
         ("fill", Value::U32(vec![1])),
     ]);
     Suite {
+        names: take_names(),
         name: format!("beam-search ({beams} beam(s))"),
         traced: builder.build().expect("the beam step traces"),
         rows: beams,
@@ -432,12 +442,20 @@ struct Lane {
 }
 
 fn run(context: &Context, suite: &Suite) -> Vec<String> {
-    let names = suite.traced.channel_names();
     let at = |name: &str| -> u32 {
-        names
+        let gid = suite
+            .names
             .iter()
-            .position(|n| n == name)
-            .unwrap_or_else(|| panic!("{}: no channel {name}", suite.name)) as u32
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("{}: no channel {name}", suite.name))
+            .1;
+        suite
+            .traced
+            .channel_order()
+            .iter()
+            .position(|&g| g == gid)
+            .unwrap_or_else(|| panic!("{}: channel {name} is not in the trace", suite.name))
+            as u32
     };
     let bound: BoundTrace = crate::bound::logits(suite.traced.container().clone(), suite.vocab)
         .unwrap_or_else(|e| panic!("{}: binds: {e:?}", suite.name));

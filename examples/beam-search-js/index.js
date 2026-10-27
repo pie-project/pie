@@ -59,11 +59,11 @@ export function main(input) {
   const pipeline = new Pipeline();
 
   // Step 0: the prompt's own next-token distribution; its top B are the first beams.
-  const toksP = Channel.from(prompt, dtype.i32).named('toks_p');
-  const embedIndptrP = Channel.from([0, n], dtype.u32).named('embed_indptr_p');
-  const outP = new Channel([B], dtype.i32).named('out_p');
-  const scrP = new Channel([B], dtype.f32).named('scr_p');
-  const greedyP = new Channel([1], dtype.i32).named('greedy_p');
+  const toksP = Channel.from(prompt, dtype.i32);
+  const embedIndptrP = Channel.from([0, n], dtype.u32);
+  const outP = new Channel([B], dtype.i32);
+  const scrP = new Channel([B], dtype.f32);
+  const greedyP = new Channel([1], dtype.i32);
   const fwdP = new ForwardPass();
   fwdP.embed(toksP, embedIndptrP);
   fwdP.state([ws], { fold: 'all' });
@@ -82,16 +82,16 @@ export function main(input) {
   let hypotheses = first.map((t) => [t]);
 
   if (decodes > 0) {
-    const scores = Channel.from(finalScores, dtype.f32).named('scores');
-    const toks = Channel.from(first, dtype.i32).named('toks');
+    const scores = Channel.from(finalScores, dtype.f32);
+    const toks = Channel.from(first, dtype.i32);
     const cap = channelCapacity();
-    const out = new Channel([B], dtype.i32).capacity(cap).named('out');
-    const outPar = new Channel([B], dtype.u32).capacity(cap).named('out_par');
-    const outScr = new Channel([B], dtype.f32).capacity(cap).named('out_scr');
+    const out = new Channel([B], dtype.i32).capacity(cap);
+    const outPar = new Channel([B], dtype.u32).capacity(cap);
+    const outScr = new Channel([B], dtype.f32).capacity(cap);
     // Independent per-lane greedy argmax over the RAW logits, beside the beam
     // pick: at `beams == 1` the two must agree on every step.
-    const outGreedy = new Channel([B], dtype.i32).capacity(cap).named('out_greedy');
-    const lanesB = Channel.from(range(0, B + 1), dtype.u32).named('embed_indptr');
+    const outGreedy = new Channel([B], dtype.i32).capacity(cap);
+    const lanesB = Channel.from(range(0, B + 1), dtype.u32);
 
     const step = () => {
       // `logits()` squeezes to `[v]` for a single read-out row, so reshape back.
@@ -116,12 +116,12 @@ export function main(input) {
     // The first decode writes beam i's token at slot n + i; it sees the prompt and its own cell.
     const initMask = [];
     for (let lane = 0; lane < B; lane++) for (let p = 0; p < poolLen; p++) initMask.push(p < n || p === n + lane);
-    const mask = Channel.fromShaped([B, poolLen], initMask).named('mask');
-    const slots = Channel.from(range(n, n + B), dtype.u32).named('slots');
+    const mask = Channel.fromShaped([B, poolLen], initMask);
+    const slots = Channel.from(range(n, n + B), dtype.u32);
     // A beam's RoPE position is its depth in the sequence, not its pool slot.
-    const pos = Channel.from(new Array(B).fill(n), dtype.u32).named('pos');
+    const pos = Channel.from(new Array(B).fill(n), dtype.u32);
     // Where the fire after this one writes its first beam.
-    const fill = Channel.from([n + B], dtype.u32).named('fill');
+    const fill = Channel.from([n + B], dtype.u32);
     fwd.state(pool, { positions: pos, slots });
     fwd.mask(mask);
     fwd.epilogue(() => {

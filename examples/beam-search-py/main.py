@@ -73,11 +73,11 @@ async def main(input: dict) -> str:
     pipeline = Pipeline()
 
     # Step 0: the prompt's own next-token distribution; its top B are the first beams.
-    toks_p = Channel.from_(prompt, dtype.i32).named("toks_p")
-    embed_indptr_p = Channel.from_([0, n], dtype.u32).named("embed_indptr_p")
-    out_p = Channel([B], dtype.i32).named("out_p")
-    scr_p = Channel([B], dtype.f32).named("scr_p")
-    greedy_p = Channel([1], dtype.i32).named("greedy_p")
+    toks_p = Channel.from_(prompt, dtype.i32)
+    embed_indptr_p = Channel.from_([0, n], dtype.u32)
+    out_p = Channel([B], dtype.i32)
+    scr_p = Channel([B], dtype.f32)
+    greedy_p = Channel([1], dtype.i32)
     fwd_p = ForwardPass()
     fwd_p.embed(toks_p, embed_indptr_p)
     fwd_p.state([ws], StateGeometry.folding())
@@ -98,16 +98,16 @@ async def main(input: dict) -> str:
     hypotheses: list[list[int]] = [[t] for t in first]
 
     if decodes > 0:
-        scores = Channel.from_(final_scores, dtype.f32).named("scores")
-        toks = Channel.from_(first, dtype.i32).named("toks")
+        scores = Channel.from_(final_scores, dtype.f32)
+        toks = Channel.from_(first, dtype.i32)
         cap = channel_capacity()
-        out = Channel([B], dtype.i32).capacity(cap).named("out")
-        out_par = Channel([B], dtype.u32).capacity(cap).named("out_par")
-        out_scr = Channel([B], dtype.f32).capacity(cap).named("out_scr")
+        out = Channel([B], dtype.i32).capacity(cap)
+        out_par = Channel([B], dtype.u32).capacity(cap)
+        out_scr = Channel([B], dtype.f32).capacity(cap)
         # Independent per-lane greedy argmax over the RAW logits, beside the beam
         # pick: at `beams == 1` the two must agree on every step.
-        out_greedy = Channel([B], dtype.i32).capacity(cap).named("out_greedy")
-        lanes_b = Channel.from_(range(B + 1), dtype.u32).named("embed_indptr")
+        out_greedy = Channel([B], dtype.i32).capacity(cap)
+        lanes_b = Channel.from_(range(B + 1), dtype.u32)
 
         def step():
             # `logits()` squeezes to `[v]` for a single read-out row, so reshape back.
@@ -130,12 +130,12 @@ async def main(input: dict) -> str:
 
         # The first decode writes beam i's token at slot n + i; it sees the prompt and its own cell.
         init_mask = [p < n or p == n + lane for lane in range(B) for p in range(pool_len)]
-        mask = Channel.from_shaped([B, pool_len], init_mask).named("mask")
-        slots = Channel.from_(range(n, n + B), dtype.u32).named("slots")
+        mask = Channel.from_shaped([B, pool_len], init_mask)
+        slots = Channel.from_(range(n, n + B), dtype.u32)
         # A beam's RoPE position is its depth in the sequence, not its pool slot.
-        pos = Channel.from_([n] * B, dtype.u32).named("pos")
+        pos = Channel.from_([n] * B, dtype.u32)
         # Where the fire after this one writes its first beam.
-        fill = Channel.from_([n + B], dtype.u32).named("fill")
+        fill = Channel.from_([n + B], dtype.u32)
         fwd.state(pool, StateGeometry(positions=pos, slots=slots))
         fwd.mask(mask)
 

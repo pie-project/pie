@@ -92,10 +92,10 @@ async fn main(input: Input) -> Result<String> {
     // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
     let g0 = {
         let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
-        let toks_p = Channel::from(prompt_i32).named("toks_p"); // [N] i32 (seeded)
-        let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-        let rng_p = Channel::from([0x51ed_u32, 0]).named("rng_p");
-        let g0_ch = Channel::new([1], dtype::i32).named("g0");
+        let toks_p = Channel::from(prompt_i32); // [N] i32 (seeded)
+        let embed_indptr_p = Channel::from([0u32, n]);
+        let rng_p = Channel::from([0x51ed_u32, 0]);
+        let g0_ch = Channel::new([1], dtype::i32);
 
         let fwd_p = ForwardPass::new();
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -130,13 +130,11 @@ async fn main(input: Input) -> Result<String> {
     }
 
     // ───────────────────────── 2. DECODE LOOP (1-wide) ──────────────────────
-    let tok_in = Channel::from([g0]).named("tok_in");
+    let tok_in = Channel::from([g0]);
     // No mask: causal is the default, and a bound mask costs the run-ahead (one fire per frame).
-    let out = Channel::new([1], dtype::i32)
-        .capacity(channel_capacity() as u32)
-        .named("out");
-    let rng = Channel::from([0x9e37_u32, 0]).named("rng");
-    let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+    let out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+    let rng = Channel::from([0x9e37_u32, 0]);
+    let lane1 = Channel::from([0u32, 1u32]);
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;

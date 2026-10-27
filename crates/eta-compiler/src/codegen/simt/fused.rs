@@ -5,7 +5,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 use eta_ir::Dtype;
-use eta_ir::op::tags;
+use eta_ir::op::{Op, tags};
 
 use crate::plan::{CompiledStage, Dimension, LANE_TABLE_ABI_VERSION, Region};
 
@@ -368,11 +368,28 @@ fn single_row_kinds(stage: &CompiledStage, region: &Region) -> Option<Vec<u8>> {
     {
         return None;
     }
+    // These index a value's leading axes, which a row's descriptor drops.
+    let shaped: Vec<u32> = stage
+        .normalized
+        .ops
+        .iter()
+        .flat_map(|op| match *op {
+            Op::Gather { src, .. } => vec![src],
+            Op::ScatterAdd { base, .. } | Op::ScatterSet { base, .. } => vec![base],
+            Op::Transpose(value) => vec![value],
+            Op::MatMul(a, b) => vec![a, b],
+            _ => Vec::new(),
+        })
+        .collect();
     let kinds: Vec<u8> = stage
         .normalized
         .value_types
         .iter()
-        .map(|ty| {
+        .enumerate()
+        .map(|(value, ty)| {
+            if shaped.contains(&(value as u32)) {
+                return 0;
+            }
             let Some((last, leading)) = ty.dims.split_last() else {
                 return 2;
             };

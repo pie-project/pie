@@ -196,10 +196,9 @@ async fn run_one(
     let run_start = std::time::Instant::now();
 
     let vocab = model::output_vocab_size();
-    let sampled_rng =
-        (input.temperature > 0.0).then(|| Channel::from([rng_seed, 0u32]).named("rng"));
-    let prefill_rng = (input.temperature > 0.0)
-        .then(|| Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]).named("rng_p"));
+    let sampled_rng = (input.temperature > 0.0).then(|| Channel::from([rng_seed, 0u32]));
+    let prefill_rng =
+        (input.temperature > 0.0).then(|| Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]));
     let temperature = input.temperature;
     let top_p = input.top_p;
 
@@ -211,14 +210,14 @@ async fn run_one(
 
     let prompt_i32: Vec<i32> = prompt_vec.iter().map(|&t| t as i32).collect();
 
-    let toks_p = Channel::from(&prompt_i32[..]).named("toks_p");
-    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let toks_p = Channel::from(&prompt_i32[..]);
+    let embed_indptr_p = Channel::from([0u32, n]);
     // Decode fires: the prefill sample already spends one of the
     // `max_tokens` sampler activations.
     let budget = input.max_tokens - 1;
     // A host-visible channel cannot attach to two passes, so this one is device-only.
-    let tok_in = (!input.host_first_token).then(|| Channel::new([1], dtype::i32).named("tok_in"));
-    let g0_ch = Channel::new([1], dtype::i32).named("g0");
+    let tok_in = (!input.host_first_token).then(|| Channel::new([1], dtype::i32));
+    let g0_ch = Channel::new([1], dtype::i32);
     let live_slots = frame_size();
 
     // A frame of margin above the window (`7 * live_slots` covers every frame size): the ticket
@@ -233,9 +232,7 @@ async fn run_one(
             (cap - 1, cap + 7 * live_slots)
         }
     };
-    let out = Channel::new([1], dtype::i32)
-        .capacity(out_capacity as u32)
-        .named("out");
+    let out = Channel::new([1], dtype::i32).capacity(out_capacity as u32);
     let pipe = Pipeline::new();
 
     let fwd_p = ForwardPass::new();
@@ -265,7 +262,7 @@ async fn run_one(
     let build_decode = move |tok_in: Channel| -> std::result::Result<Option<ForwardPass>, String> {
         Ok(if budget > 0 {
             let fwd = ForwardPass::new();
-            let embed_indptr = Channel::from([0u32, 1u32]).named("embed_indptr");
+            let embed_indptr = Channel::from([0u32, 1u32]);
             fwd.embed(&tok_in, &embed_indptr)?;
             fwd.state(&[ws_ref], StateGeometry::folding())
                 .context("bind decode state")?;
@@ -353,7 +350,7 @@ async fn run_one(
         submitted = submit_ahead(fwd, submitted, 0)?;
     }
     if let Some(build_decode) = build_decode.take() {
-        fwd_d = build_decode(Channel::from([g0]).named("tok_in"))?;
+        fwd_d = build_decode(Channel::from([g0]))?;
         if let Some(fwd) = fwd_d.as_ref() {
             submitted = submit_ahead(fwd, submitted, 0)?;
         }

@@ -30,6 +30,7 @@
 #include "prim/device.cuh"
 #include "prim/mma_sm80.cuh"
 #include "prim/smem.cuh"
+#include "prim/store.cuh"
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
 #include <cuda_fp8.h>
@@ -40,9 +41,7 @@ namespace pie::linear {
 // at `base[row * row_stride + (col % period) * col_stride]` (`period` 0: the
 // column as it is). A tile is `(ld, 1)`, a vector a column `(0, 1)`, a head's
 // vector `(0, 1)` every `size` columns, a vector a row `(1, 0)`, one value
-// `(0, 0)`; its elements bf16 (`dtype` 0) or i32 (1, a position). One of
-// `dtype` 3 is no plane: the operand row's norm scale, the contraction's own
-// (`f.one(k)` the hook's `scale`).
+// `(0, 0)`; its elements bf16 (`dtype` 0) or i32 (1, a position).
 // `kernels_cuda::linear::skeleton::In` mirrors it.
 struct EpiIn {
     const bf16* base;
@@ -59,41 +58,17 @@ __device__ __forceinline__ float epi_ld(const EpiIn& in, long long row, long lon
     return bf16_to_f32(in.base[at]);
 }
 
-// An epilogue's IN inputs and OUT results, result `k` the columns `from[k]`
-// to `to[k]` of the product tile (all of them, or a split's piece) in a bf16
-// plane `ld[k]` apart a row, its column `from[k]` the plane's first. One
-// input past IN, unread, so a body of none is a struct still.
+// An epilogue's IN inputs and OUT results, result `k` landing where
+// `store[k]` says (its window of the product tile's columns, or a paged
+// cache's row) in a plane `ld[k]` apart a row. One input past IN, unread, so
+// a body of none is a struct still.
 template <int IN, int OUT>
 struct Epi {
     EpiIn in[IN + 1];
     bf16* out[OUT];
     long long ld[OUT];
-    long long from[OUT];
-    long long to[OUT];
-    // A head-major window's head and stride (0: the window is whole): `head`
-    // columns of every `stride` from `from`, landed one head after another.
-    long long head[OUT];
-    long long stride[OUT];
-    // A normed operand's `eps` (an f32's bits): its row's scale
-    // `rsqrt(Σ a² / K + eps)`, where the skeleton norms (`NORM`).
-    long long eps;
-    // A paged result's page and slot inputs (-1: not paged): its rows land
-    // at the cache row `page * page_size + slot` (none where the slot lies
-    // past the page or `valid[row]` is 0), as e4m3 where `e4m3` (each
-    // element `e4m3(x / scale)`, the scale an f32's bits).
-    long long page[OUT];
-    long long slot[OUT];
-    long long e4m3[OUT];
-    long long scale[OUT];
-    const unsigned char* valid;
-    long long page_size;
+    Store store[OUT];
 };
-
-// The scale of an operand row whose squares sum to `ss` over `K`.
-template <int IN, int OUT>
-__device__ __forceinline__ float norm_scale(float ss, int K, const Epi<IN, OUT>& epi) {
-    return rsqrtf(ss / static_cast<float>(K) + __int_as_float(static_cast<int>(epi.eps)));
-}
 
 // `kN` consecutive elements of one row of the product tile, from column
 // `col`: each of the `P` parts' products, set by the skeleton (rounded to bf16
@@ -108,8 +83,6 @@ struct TileHook {
     long long row;
     int col_;
     int width;
-    // The operand row's norm scale, where the skeleton norms it.
-    float scale = 1.f;
     float acc[P][kN];
     __align__(16) bf16 res[OUT][kN];
 
@@ -135,10 +108,7 @@ struct TileHook {
         return epi_ld(epi.in[k - P], row, static_cast<long long>(col_ + e));
     }
 
-    __device__ __forceinline__ float one(int k) const {
-        if (epi.in[k - P].dtype == 3) return scale;
-        return epi_ld(epi.in[k - P], row, 0);
-    }
+    __device__ __forceinline__ float one(int k) const { return epi_ld(epi.in[k - P], row, 0); }
 
     // A late parameter's vectors: the tile hook reads each input where the
     // body asks for it, so there is nothing to issue ahead.
@@ -158,68 +128,31 @@ struct TileHook {
 
     __device__ __forceinline__ float round_bf16(float v) const { return bf16_to_f32(f32_to_bf16(v)); }
 
-    // Paged result `K`'s elements of its window to its cache row.
-    template <int K>
-    __device__ __forceinline__ void flush_paged() {
-        const long long from = epi.from[K];
-        const long long to = epi.to[K];
-        const int page = static_cast<int>(epi_ld(epi.in[epi.page[K]], row, 0));
-        const int slot = static_cast<int>(epi_ld(epi.in[epi.slot[K]], row, 0));
-        if (slot < 0 || slot >= epi.page_size || page < 0) return;
-        if (epi.valid != nullptr && epi.valid[row] == 0) return;
-        const long long cell = static_cast<long long>(page) * epi.page_size + slot;
-        const long long at = cell * epi.ld[K] + (col_ - from);
-        const bool fp8 = epi.e4m3[K] != 0;
-        const float scale = __int_as_float(static_cast<int>(epi.scale[K]));
-#pragma unroll
-        for (int e = 0; e < kN; ++e) {
-            const long long c = col_ + e;
-            if (!valid(e) || c < from || c >= to) continue;
-            if (fp8) {
-                reinterpret_cast<__nv_fp8_e4m3*>(epi.out[K])[at + e] =
-                    __nv_fp8_e4m3(bf16_to_f32(res[K][e]) / scale);
-            } else {
-                epi.out[K][at + e] = res[K][e];
-            }
-        }
-    }
-
-    // Result `K`'s elements of its window to memory: whole vectors of 8
-    // where the skeleton holds them (its columns, windows and `ld` whole
-    // eights, its planes 16-byte aligned), else one by one.
+    // Result `K`'s elements of its window to its plane's row or its cache
+    // row: whole vectors of 8 where the skeleton holds them (its columns,
+    // windows and `ld` whole eights, its planes 16-byte aligned), else one
+    // by one.
     template <int K>
     __device__ __forceinline__ void flush() {
-        const long long from = epi.from[K];
-        const long long to = epi.to[K];
-        if (epi.page[K] >= 0) {
-            flush_paged<K>();
-            return;
+        const Store& s = epi.store[K];
+        long long base = row;
+        if (s.page != nullptr) {
+            base = store_cell(s, row);
+            if (base < 0) return;
         }
-        bf16* plane = epi.out[K] + row * epi.ld[K];
-        const long long head = epi.head[K];
-        const long long stride = epi.stride[K];
-        // the plane column tile column `c` lands at, or -1: past its window
-        auto landed = [&](long long c) -> long long {
-            if (c < from || c >= to) return -1;
-            if (head == 0) return c - from;
-            const long long at = c - from;
-            const long long j = at % stride;
-            return j < head ? at / stride * head + j : -1;
-        };
+        base *= epi.ld[K];
         if constexpr (kN % 8 == 0) {
 #pragma unroll
             for (int v = 0; v < kN / 8; ++v) {
                 const long long c = col_ + v * 8;
-                const long long at = c < width ? landed(c) : -1;
-                if (at >= 0) {
-                    *reinterpret_cast<uint4*>(plane + at) = *reinterpret_cast<const uint4*>(&res[K][v * 8]);
-                }
+                const long long at = c < width ? store_at(s, c, s.to) : -1;
+                if (at >= 0) store8(epi.out[K], base + at, *reinterpret_cast<const uint4*>(&res[K][v * 8]), s);
             }
         } else {
 #pragma unroll
             for (int e = 0; e < kN; ++e) {
-                const long long at = valid(e) ? landed(col_ + e) : -1;
-                if (at >= 0) plane[at] = res[K][e];
+                const long long at = valid(e) ? store_at(s, col_ + e, s.to) : -1;
+                if (at >= 0) store1(epi.out[K], base + at, res[K][e], s);
             }
         }
     }
@@ -297,14 +230,11 @@ struct HeadHook : TileHook<P, 8, IN, OUT, ROUND> {
 };
 
 // A warp's dot of weight row `row` (K wide) with the activation `act`,
-// folded to lane 0; where `SS`, the activation's sum of squares too, folded
-// to lane 0 into `ss`.
-template <int kUnroll, bool SS = false>
+// folded to lane 0.
+template <int kUnroll>
 __device__ __forceinline__ float gemv_bf16_row(
-    const bf16* __restrict__ weight, const bf16* __restrict__ act, int row, int K,
-    float* ss = nullptr)
+    const bf16* __restrict__ weight, const bf16* __restrict__ act, int row, int K)
 {
-    float sq = 0.f;
     const float4* w4 =
         reinterpret_cast<const float4*>(weight + (long long)row * K);
     const float4* x4 = reinterpret_cast<const float4*>(act);
@@ -326,7 +256,6 @@ __device__ __forceinline__ float gemv_bf16_row(
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 acc += bf16_to_f32(wb[j]) * bf16_to_f32(xb[j]);
-                if constexpr (SS) sq += bf16_to_f32(xb[j]) * bf16_to_f32(xb[j]);
             }
         }
     }
@@ -338,21 +267,18 @@ __device__ __forceinline__ float gemv_bf16_row(
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
             acc += bf16_to_f32(wb[j]) * bf16_to_f32(xb[j]);
-            if constexpr (SS) sq += bf16_to_f32(xb[j]) * bf16_to_f32(xb[j]);
         }
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
-        if constexpr (SS) sq += __shfl_down_sync(0xffffffffu, sq, off);
     }
-    if constexpr (SS) *ss = sq;
     return acc;
 }
 
 // One row: a warp a column, `kWarps` columns a block, each part's weight
 // row `col + p * N` in turn. Lane 0 hands the column's products to the body.
-template <class Body, int kWarps, int kUnroll, int P, int IN, int OUT, bool ROUND, bool NORM>
+template <class Body, int kWarps, int kUnroll, int P, int IN, int OUT, bool ROUND>
 __global__ void gemv_skeleton(
     const bf16* __restrict__ weight,
     const bf16* __restrict__ act,
@@ -367,15 +293,10 @@ __global__ void gemv_skeleton(
     const int col = blockIdx.x * kWarps + threadIdx.y;
     if (col >= N) return;
     float acc[P];
-    float ss = 0.f;
 #pragma unroll
-    for (int p = 0; p < P; ++p) {
-        acc[p] = p == 0 ? gemv_bf16_row<kUnroll, NORM>(weight, act, col, K, &ss)
-                        : gemv_bf16_row<kUnroll>(weight, act, col + p * N, K);
-    }
+    for (int p = 0; p < P; ++p) acc[p] = gemv_bf16_row<kUnroll>(weight, act, col + p * N, K);
     if (threadIdx.x == 0) {
         TileHook<P, 1, IN, OUT, ROUND> f(epi, 0, col, N);
-        if constexpr (NORM) f.scale = norm_scale(ss, K, epi);
 #pragma unroll
         for (int p = 0; p < P; ++p) f.set(p, 0, acc[p]);
         body(f);
@@ -384,7 +305,7 @@ __global__ void gemv_skeleton(
 
 // One row, a block a column split over K across its `kWarps` warps: each
 // warp's slice folds across its lanes, and the slices add in warp order.
-template <class Body, int kWarps, int kUnrollP, int P, int IN, int OUT, bool ROUND, bool NORM>
+template <class Body, int kWarps, int kUnrollP, int P, int IN, int OUT, bool ROUND>
 __global__ void gemv_splitk_skeleton(
     const bf16* __restrict__ weight,
     const bf16* __restrict__ act,
@@ -404,15 +325,12 @@ __global__ void gemv_splitk_skeleton(
     constexpr int kU = kUnrollP;
     const int stride = kWarps * 32;
     __shared__ float partial[P][kWarps];
-    __shared__ float squares[kWarps];
 
 #pragma unroll
     for (int p = 0; p < P; ++p) {
         const float4* w4 =
             reinterpret_cast<const float4*>(weight + (long long)(col + p * N) * K);
         float acc = 0.f;
-        float sq = 0.f;
-        constexpr bool kSq = NORM;
         int i = warp * 32 + threadIdx.x;
         for (; i + stride * (kU - 1) < vectors; i += stride * kU) {
             float4 wv[kU];
@@ -429,7 +347,6 @@ __global__ void gemv_splitk_skeleton(
                 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
                     acc += bf16_to_f32(wb[j]) * bf16_to_f32(xb[j]);
-                    if (kSq && p == 0) sq += bf16_to_f32(xb[j]) * bf16_to_f32(xb[j]);
                 }
             }
         }
@@ -441,26 +358,17 @@ __global__ void gemv_splitk_skeleton(
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 acc += bf16_to_f32(wb[j]) * bf16_to_f32(xb[j]);
-                if (kSq && p == 0) sq += bf16_to_f32(xb[j]) * bf16_to_f32(xb[j]);
             }
         }
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_down_sync(0xffffffffu, acc, off);
-            if (kSq && p == 0) sq += __shfl_down_sync(0xffffffffu, sq, off);
         }
         if (threadIdx.x == 0) partial[p][warp] = acc;
-        if (kSq && p == 0 && threadIdx.x == 0) squares[warp] = sq;
     }
     __syncthreads();
     if (warp != 0 || threadIdx.x != 0) return;
     TileHook<P, 1, IN, OUT, ROUND> f(epi, 0, col, N);
-    if constexpr (NORM) {
-        float ss = 0.f;
-#pragma unroll
-        for (int w = 0; w < kWarps; ++w) ss += squares[w];
-        f.scale = norm_scale(ss, K, epi);
-    }
 #pragma unroll
     for (int p = 0; p < P; ++p) {
         float total = 0.f;
@@ -481,7 +389,7 @@ __global__ void gemv_splitk_skeleton(
 // columns, too few blocks to keep the loads in flight), each block takes a
 // slice of K and the first adds the blocks' sums in rank order. Each
 // product goes to the body alone: one dense bank.
-template <class Body, int kM, int kSplit, int kCl, int P, int IN, int OUT, bool ROUND, bool NORM>
+template <class Body, int kM, int kSplit, int kCl, int P, int IN, int OUT, bool ROUND>
 __global__ void __launch_bounds__(256) rows_skeleton(
     const bf16* __restrict__ weight,
     const bf16* __restrict__ act,
@@ -500,10 +408,6 @@ __global__ void __launch_bounds__(256) rows_skeleton(
     constexpr int kRows = 8 / kSplit * kR;    // weight rows a block
     __shared__ float red[8][kR][kM];
     __shared__ float sum[kRows * kM];
-    // A normed operand's rows' squares: each slice's (the first warp group's
-    // warps), then the block's, in slice order.
-    __shared__ float red_sq[kSplit][kM];
-    __shared__ float sq_sum[kM];
     const int warp = static_cast<int>(threadIdx.x) / 32;
     const int lane = static_cast<int>(threadIdx.x) % 32;
     const int block = static_cast<int>(blockIdx.x) / kCl;
@@ -513,15 +417,11 @@ __global__ void __launch_bounds__(256) rows_skeleton(
     const int vectors = K / 8;
     const int per = vectors / (kSplit * kCl);
     float acc[kR][kM];
-    float sq[kM];
 #pragma unroll
     for (int q = 0; q < kR; ++q) {
 #pragma unroll
         for (int r = 0; r < kM; ++r) acc[q][r] = 0.f;
     }
-#pragma unroll
-    for (int r = 0; r < kM; ++r) sq[r] = 0.f;
-    const bool squares = NORM && warp < kSplit;
     const uint4* x4 = reinterpret_cast<const uint4*>(act) + part * per;
     const uint4* w4[kR];
 #pragma unroll
@@ -539,17 +439,6 @@ __global__ void __launch_bounds__(256) rows_skeleton(
         for (int r = 0; r < kM; ++r) {
             const uint4 xv = __ldg(x4 + static_cast<long long>(r) * vectors + i);
             const unsigned xw[4] = {xv.x, xv.y, xv.z, xv.w};
-            if constexpr (NORM) {
-                if (squares) {
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        const float lo = __uint_as_float(xw[j] << 16);
-                        const float hi = __uint_as_float(xw[j] & 0xffff0000u);
-                        sq[r] = fmaf(lo, lo, sq[r]);
-                        sq[r] = fmaf(hi, hi, sq[r]);
-                    }
-                }
-            }
 #pragma unroll
             for (int q = 0; q < kR; ++q) {
                 const unsigned ww[4] = {wv[q].x, wv[q].y, wv[q].z, wv[q].w};
@@ -570,14 +459,6 @@ __global__ void __launch_bounds__(256) rows_skeleton(
             acc[q][r] = ::pie::warp_sum(acc[q][r]);
         }
     }
-    if constexpr (NORM) {
-#pragma unroll
-        for (int r = 0; r < kM; ++r) sq[r] = ::pie::warp_sum(sq[r]);
-        if (squares && lane == 0) {
-#pragma unroll
-            for (int r = 0; r < kM; ++r) red_sq[warp][r] = sq[r];
-        }
-    }
     if (lane == 0) {
 #pragma unroll
         for (int q = 0; q < kR; ++q) {
@@ -586,14 +467,6 @@ __global__ void __launch_bounds__(256) rows_skeleton(
         }
     }
     __syncthreads();
-    if constexpr (NORM) {
-        if (static_cast<int>(threadIdx.x) < kM) {
-            float s2 = red_sq[0][threadIdx.x];
-#pragma unroll
-            for (int p = 1; p < kSplit; ++p) s2 += red_sq[p][threadIdx.x];
-            sq_sum[threadIdx.x] = s2;
-        }
-    }
     // Thread t sums block row t / kM's column for activation row t % kM.
     for (int t = static_cast<int>(threadIdx.x); t < kRows * kM; t += 256) {
         const int local = t / kM;
@@ -608,46 +481,31 @@ __global__ void __launch_bounds__(256) rows_skeleton(
     if constexpr (kCl > 1) {
         asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
     } else {
-        __syncthreads();
-    }
-    if (rank == 0) {
-        for (int t = static_cast<int>(threadIdx.x); t < kRows * kM; t += 256) {
-            const int n = block * kRows + t / kM;
-            float s = sum[t];
+            __syncthreads();
+        }
+        if (rank == 0) {
+            for (int t = static_cast<int>(threadIdx.x); t < kRows * kM; t += 256) {
+                const int n = block * kRows + t / kM;
+                float s = sum[t];
 #pragma unroll
-            for (int c = 1; c < kCl; ++c) {
-                const unsigned local = static_cast<unsigned>(__cvta_generic_to_shared(sum + t));
-                unsigned remote;
-                float v;
-                asm("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(local), "r"(c));
-                asm("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote));
-                s += v;
-            }
-            if (n < N) {
-                TileHook<1, 1, IN, OUT, ROUND> f(epi, t % kM, n, N);
-                if constexpr (NORM) {
-                    // The row's squares, the cluster's blocks in rank order.
-                    float s2 = sq_sum[t % kM];
-#pragma unroll
-                    for (int c = 1; c < kCl; ++c) {
-                        const unsigned local =
-                            static_cast<unsigned>(__cvta_generic_to_shared(sq_sum + t % kM));
-                        unsigned remote;
-                        float v;
-                        asm("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(local), "r"(c));
-                        asm("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote));
-                        s2 += v;
-                    }
-                    f.scale = norm_scale(s2, K, epi);
+                for (int c = 1; c < kCl; ++c) {
+                    const unsigned local = static_cast<unsigned>(__cvta_generic_to_shared(sum + t));
+                    unsigned remote;
+                    float v;
+                    asm("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(local), "r"(c));
+                    asm("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote));
+                    s += v;
                 }
-                f.set(0, 0, s);
-                body(f);
+                if (n < N) {
+                    TileHook<1, 1, IN, OUT, ROUND> f(epi, t % kM, n, N);
+                    f.set(0, 0, s);
+                    body(f);
+                }
             }
         }
-    }
-    if constexpr (kCl > 1) {
-        // No block retires while the first may read its sums.
-        asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
+        if constexpr (kCl > 1) {
+            // No block retires while the first may read its sums.
+            asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
     }
 }
 
@@ -690,7 +548,7 @@ template <> struct SkinnyTile<true> { using T = bf16; };
 // The products land in a tile over the ring; each thread then hands the body
 // 8 columns of one row, every part's product at each.
 template <class Body, int kWarps, int kStages, int kBK, int kSpan, int kTable, int P, int IN, int OUT,
-          bool ROUND, bool NORM>
+          bool ROUND>
 __global__ __launch_bounds__(kWarps * 32) void skinny_skeleton(
     const bf16* __restrict__ w,
     const bf16* __restrict__ act,
@@ -788,15 +646,6 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_skeleton(
 #pragma unroll
         for (int i = 0; i < 4; ++i) acc[s][i] = 0.f;
     }
-    // A normed operand's squares: each thread's over the chunks of the
-    // activation it stages (the same chunks each step), then each row's
-    // chunks in column order.
-    constexpr int kSqChunks = kAChunks / kThreads;
-    float sq[kSqChunks];
-#pragma unroll
-    for (int i = 0; i < kSqChunks; ++i) sq[i] = 0.f;
-    __shared__ float sq_part[NORM ? kSkinnyM * kChunksPerRow : 1];
-    __shared__ float row_scale[NORM ? kSkinnyM : 1];
 
 #pragma unroll
     for (int s = 0; s < kStages - 1; ++s) {
@@ -820,24 +669,6 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_skeleton(
         }
         __pipeline_wait_prior(kStages - 1);
         __syncthreads();
-        if constexpr (NORM) {
-            const bf16* astage = ring + (step % kStages) * kStageElems + kWStage;
-#pragma unroll
-            for (int i = 0; i < kSqChunks; ++i) {
-                const int chunk = tid + i * kThreads;
-                const int r = chunk / kChunksPerRow;
-                const int c = (chunk % kChunksPerRow) * 8;
-                const uint4 v = *reinterpret_cast<const uint4*>(astage + r * kSkinnyLd + c);
-                const unsigned xw[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float lo = __uint_as_float(xw[j] << 16);
-                    const float hi = __uint_as_float(xw[j] & 0xffff0000u);
-                    sq[i] = fmaf(lo, lo, sq[i]);
-                    sq[i] = fmaf(hi, hi, sq[i]);
-                }
-            }
-        }
 
         const bf16* wsrc = ring + (step % kStages) * kStageElems + warp * 16 * kSkinnyLd;
         const bf16* asrc = ring + (step % kStages) * kStageElems + kWStage;
@@ -860,17 +691,6 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_skeleton(
 
     __pipeline_wait_prior(0);
     __syncthreads();
-    if constexpr (NORM) {
-#pragma unroll
-        for (int i = 0; i < kSqChunks; ++i) sq_part[tid + i * kThreads] = sq[i];
-        __syncthreads();
-        for (int r = tid; r < kSkinnyM; r += kThreads) {
-            float s2 = 0.f;
-            for (int c = 0; c < kChunksPerRow; ++c) s2 += sq_part[r * kChunksPerRow + c];
-            row_scale[r] = norm_scale(s2, k, epi);
-        }
-        // read in the drain, past the product tile's barrier below
-    }
     T* c_tile = reinterpret_cast<T*>(skinny_smem);
     {
         const int g = lane >> 2;
@@ -912,7 +732,6 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_skeleton(
             const int c = (chunk % kChunksOfRow) * 8;
             const bool live = chunk < kDrain && r < m;
             HeadHook<P, IN, OUT, ROUND, kThreads> f(epi, r, n0 + c, n, live, row_of, n0, tab);
-            if constexpr (NORM) f.scale = row_scale[r];
 #pragma unroll
             for (int p = 0; p < P; ++p) {
 #pragma unroll
@@ -924,60 +743,24 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_skeleton(
         }
     } else {
 #pragma unroll
-        for (int i = 0; i < (kDrain + kThreads - 1) / kThreads; ++i) {
-            const int chunk = tid + i * kThreads;
-            if (chunk < kDrain) {
-                const int r = chunk / kChunksOfRow;
-                const int c = (chunk % kChunksOfRow) * 8;
-                if (r < m) {
-                    TileHook<P, 8, IN, OUT, ROUND> f(epi, r, n0 + c, n);
-                    if constexpr (NORM) f.scale = row_scale[r];
+    for (int i = 0; i < (kDrain + kThreads - 1) / kThreads; ++i) {
+        const int chunk = tid + i * kThreads;
+        if (chunk < kDrain) {
+            const int r = chunk / kChunksOfRow;
+            const int c = (chunk % kChunksOfRow) * 8;
+            if (r < m) {
+                TileHook<P, 8, IN, OUT, ROUND> f(epi, r, n0 + c, n);
 #pragma unroll
-                    for (int p = 0; p < P; ++p) {
+                for (int p = 0; p < P; ++p) {
 #pragma unroll
-                        for (int e = 0; e < 8; ++e) {
-                            f.set(p, e, static_cast<float>(c_tile[r * kLdC + p * kCols + c + e]));
-                        }
+                    for (int e = 0; e < 8; ++e) {
+                        f.set(p, e, static_cast<float>(c_tile[r * kLdC + p * kCols + c + e]));
                     }
-                    body(f);
                 }
+                body(f);
             }
         }
     }
-}
-
-// Each operand row's norm scale `rsqrt(Σ a² / K + eps)` into `out` (f32, one
-// a row): what a normed epilogue's unfused leg reads, the contraction's own
-// where a skeleton norms. A block a row, its threads striding K by vectors of
-// 8, their squares folded over the warp and then the warps in order.
-template <int BLOCK>
-__global__ void __launch_bounds__(BLOCK) norm_scales(
-    const bf16* __restrict__ act, float* __restrict__ out, int K, float eps)
-{
-    pdl_wait();
-    pdl_launch();
-    const uint4* x4 = reinterpret_cast<const uint4*>(act + static_cast<long long>(blockIdx.x) * K);
-    float s2 = 0.f;
-    for (int i = static_cast<int>(threadIdx.x); i < K / 8; i += BLOCK) {
-        const uint4 v = __ldg(x4 + i);
-        const unsigned xw[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float lo = __uint_as_float(xw[j] << 16);
-            const float hi = __uint_as_float(xw[j] & 0xffff0000u);
-            s2 = fmaf(lo, lo, s2);
-            s2 = fmaf(hi, hi, s2);
-        }
-    }
-    s2 = ::pie::warp_sum(s2);
-    __shared__ float warps[BLOCK / 32];
-    if (threadIdx.x % 32 == 0) warps[threadIdx.x / 32] = s2;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float total = 0.f;
-#pragma unroll
-        for (int w = 0; w < BLOCK / 32; ++w) total += warps[w];
-        out[blockIdx.x] = rsqrtf(total / static_cast<float>(K) + eps);
     }
 }
 

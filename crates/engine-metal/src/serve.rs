@@ -3220,7 +3220,7 @@ impl Shell {
                 lanes: u64::from(lane_count),
                 patches: u64::from(composition.patch_rows()),
                 images: u64::from(composition.images()),
-                voxels: u64::from(composition.voxel_rows()),
+                voxels: u64::from(composition.voxel_widest()),
                 clips: u64::from(composition.clips()),
                 readouts: readout_rows.len() as u64,
             },

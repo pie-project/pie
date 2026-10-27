@@ -101,6 +101,16 @@ async fn main(input: Input) -> Result<String> {
     let pcm = Pcm::from_f32(&tone(24_000, 250), 24_000, 1)?;
     session::send_pcm(&pcm, AudioFormat::Wav, "tone.wav")?;
 
+    // The way in: a file attached to the run (`--file in=PATH`), sent back.
+    let input_size = match session::file("in") {
+        Some(bytes) => {
+            let image = Frames::decode(&bytes)?;
+            session::send_frames(&image, ImageFormat::Png, "in.png")?;
+            format!("[{},{}]", image.width(), image.height())
+        }
+        None => "null".to_string(),
+    };
+
     // The one place the guest DOES take the bytes: `encode` is the other door,
     // and a probe should prove both exist. Only the length is reported.
     let png_len = still.encode(ImageFormat::Png)?.len();
@@ -108,7 +118,7 @@ async fn main(input: Input) -> Result<String> {
     Ok(format!(
         "{{\"width\":{width},\"height\":{height},\"frames\":{},\"fps\":{fps},\
           \"files\":[\"gradient.png\",\"{video_name}\",\"tone.wav\"],\
-          \"png_bytes\":{png_len},\"video_fallback\":{}}}",
+          \"png_bytes\":{png_len},\"in\":{input_size},\"video_fallback\":{}}}",
         clip.count(),
         inferlet::serde_json::to_string(&video_note).unwrap_or_else(|_| "\"\"".to_string()),
     ))

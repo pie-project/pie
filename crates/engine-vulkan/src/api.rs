@@ -177,6 +177,8 @@ fn fault(fault: Fault) -> Error {
     }
 }
 
+const DEFAULT_STATE_SLOTS: u32 = 256;
+
 fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
@@ -228,27 +230,6 @@ fn patch_bytes(
         poem_ir::Dtype::U8 => Ok(patches.to_vec()),
         _ => Err("a media submission against a plan whose pixel rows are not u8 bytes"),
     }
-}
-
-#[must_use]
-pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<poem_compiler::VoxelLadder> {
-    const DERIVED_VOXEL_CEILING: u32 = 65_536;
-    let declares_voxels = trace.values.iter().any(|decl| {
-        matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
-            if shape.first().and_then(|dim| dim.axis()) == Some(poem_ir::RowAxis::Voxels))
-    });
-    if !declares_voxels {
-        return None;
-    }
-    let max_voxels = budgets.max_voxels.unwrap_or(DERIVED_VOXEL_CEILING).max(1);
-    Some(poem_compiler::VoxelLadder {
-        max_voxels,
-        buckets: Vec::new(),
-        max_clips: budgets
-            .max_clips
-            .unwrap_or(budgets.max_lanes)
-            .clamp(1, max_voxels),
-    })
 }
 
 fn voxel_bytes(
@@ -358,7 +339,13 @@ impl Engine for Vulkan {
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
         let patches = patch_ladder(&trace, &budgets);
-        let voxels = voxel_ladder(&trace, &budgets);
+        let voxels = poem_compiler::VoxelLadder::of(
+            &trace,
+            budgets.max_voxels,
+            budgets.max_clips,
+            budgets.max_lanes,
+        );
+        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let (disk_kv_budget, disk_kv_dir, seats) = (
             residency.disk_kv_budget,
             residency.disk_kv_dir.clone(),
@@ -374,7 +361,7 @@ impl Engine for Vulkan {
             profile: None::<DeviceProfile>,
             page_size: budgets.page_size,
             context: budgets.max_context,
-            slots: budgets.slots,
+            slots,
 
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             voxels,

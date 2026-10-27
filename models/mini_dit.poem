@@ -308,7 +308,7 @@ def turn_positions(arm):
 
 def forward(m, inputs):
     switch("reading", ["denoise"])
-    switch("stream", ["text", "image", "context"])
+    switch("stream", ["text", "latents", "context"])
     switch("positions", ["computed", "given"])
     ctx, joint = inputs.on(switch_is("stream", "context")), inputs.on(~switch_is("stream", "context"))
     txt_in, img_in = joint.on(switch_is("stream", "text")), joint.on(~switch_is("stream", "text"))

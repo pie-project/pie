@@ -441,7 +441,7 @@ def cache(c, space, a, fp8 = False):
     if fp8:
         if a.kv_lora_rank != 512 or a.qk_rope_head_dim != 64:
             fail("fp8 latent rows hold 512 latent and 64 rotated dims, and this attention's are {} and {}".format(a.kv_lora_rank, a.qk_rope_head_dim))
-        c.kv(space, a.kv, [FP8_ROW], a.qk_rope_head_dim)
+        c.kv(space, a.kv, [FP8_ROW], a.qk_rope_head_dim, rows = "fp8")
         return
     c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
 

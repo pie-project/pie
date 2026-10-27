@@ -119,12 +119,12 @@ async fn fire(
     let total = base + rows;
 
     let ids = Channel::from_iter(tokens.iter().map(|&t| t as i32));
-    let embed_indptr = Channel::from([0u32, rows]).named("embed_indptr");
-    let slots = Channel::from_iter(base..total).named("slots");
+    let embed_indptr = Channel::from([0u32, rows]);
+    let slots = Channel::from_iter(base..total);
     let read = if last_only { rows - 1 } else { 0 };
-    let readout = Channel::from_iter(read..rows).named("readout");
-    let truth_out = Channel::new([rows - read], dtype::i32).named("truth");
-    let fold_len = fold.map(|n| Channel::from([n]).named("fold_len"));
+    let readout = Channel::from_iter(read..rows);
+    let truth_out = Channel::new([rows - read], dtype::i32);
+    let fold_len = fold.map(|n| Channel::from([n]));
     let fold = match &fold_len {
         Some(count) => Fold::Count(count),
         None => Fold::All,

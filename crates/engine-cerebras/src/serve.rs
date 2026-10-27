@@ -396,7 +396,7 @@ impl Shell {
     }
 
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
-        let voxels = crate::dit::voxel_ladder(&boot.trace, None, None, boot.budget.max_lanes);
+        let voxels = poem_compiler::VoxelLadder::of(&boot.trace, None, None, boot.budget.max_lanes);
         Shell::load_with(boot, voxels)
     }
 
@@ -419,7 +419,7 @@ impl Shell {
     }
 
     fn load_on(
-        boot: Boot<'_>,
+        mut boot: Boot<'_>,
         voxels: Option<poem_compiler::VoxelLadder>,
         device: Device,
     ) -> Result<Shell> {
@@ -452,6 +452,26 @@ impl Shell {
             None => budgets,
             Some(ladder) => budgets.with_voxels(ladder),
         };
+        let weight_floor = boot.trace.params.iter().try_fold(0u64, |sum, p| {
+            crate::weights::plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
+        })?;
+        let room = device.memory().map_or(u64::MAX, |bytes| {
+            ((bytes as f64 * boot.memory_share) as u64)
+                .saturating_sub(weight_floor)
+                .saturating_sub(DEVICE_HEADROOM)
+                / 2
+        });
+        let mut budgets =
+            poem_compiler::fit_voxels(&boot.trace, budgets, &DeviceProfile::default(), room);
+        if boot.slots == 0 {
+            boot.slots = poem_compiler::fit_frame_slots(
+                &boot.trace,
+                budgets.voxels.as_mut(),
+                room,
+                engine::fit::least_state_slots(1),
+                1,
+            );
+        }
         let compiled = compile_axes(&boot.trace, &budgets, &DeviceProfile::default())?;
         let facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
@@ -1694,7 +1714,7 @@ impl Shell {
             lanes: u64::from(lane_count),
             patches: u64::from(composition.patch_rows()),
             images: u64::from(composition.images()),
-            voxels: u64::from(composition.voxel_rows()),
+            voxels: u64::from(composition.voxel_widest()),
             clips: u64::from(composition.clips()),
             readouts,
         };

@@ -19,7 +19,7 @@ Two modes, one per row:
                        not exercised here)
     --text             the flagship's `text` reading alone: the golden's prompt
                        through the family template -> `prompt_embeds.0`
-    --chain            the flagship end to end, text -> refine -> denoise,
+    --chain            the flagship end to end, text -> denoise,
                        against the same `dit.step0.out.0` (and the embeds)
     --trajectory       the flagship's whole eight-step Euler run from the
                        golden's `noise.init` (the family's pinned sigmas, the
@@ -107,12 +107,11 @@ TOLERANCES = {
 }
 PROMPT_KEY = "prompt_embeds.0"
 
-def keyed(file: str, prefix: str, out: str, deployment: str, refined: str | None = None) -> dict:
+def keyed(file: str, prefix: str, out: str, deployment: str) -> dict:
     """A mode: the golden file, its input keys (`<prefix>x.0`, `<prefix>cap.0`,
-    `<prefix>t`), the output key the velocity lands under, the row's deployment and —
-    for a tapped golden — the key the refined caption lands under."""
+    `<prefix>t`), the output key the velocity lands under and the row's deployment."""
     return dict(file=file, x=f"{prefix}x.0", cap=f"{prefix}cap.0", t=f"{prefix}t",
-                out=out, deployment=deployment, refined=refined)
+                out=out, deployment=deployment)
 
 MINI_DEPLOYMENT = "z-image-mini-bf16-kv-bf16"
 TURBO_DEPLOYMENT = "z-image-turbo-bf16-kv-bf16"
@@ -122,12 +121,9 @@ MODES = {
     "turbo": keyed("zimage_golden.npz", "dit.step0.in.", "dit.step0.out.0", TURBO_DEPLOYMENT),
     "text": keyed("zimage_golden.npz", "dit.step0.in.", PROMPT_KEY, TURBO_DEPLOYMENT),
     "chain": keyed("zimage_golden.npz", "dit.step0.in.", "dit.step0.out.0", TURBO_DEPLOYMENT),
-    "full": keyed("zimage_taps.npz", "taps.full.in.", "taps.full.out.0", TURBO_DEPLOYMENT,
-                  refined="taps.full.cap.refined"),
-    "crop": keyed("zimage_taps.npz", "taps.crop.in.", "taps.crop.out.0", TURBO_DEPLOYMENT,
-                  refined="taps.crop.cap.refined"),
-    "tiny": keyed("zimage_taps.npz", "taps.tiny.in.", "taps.tiny.out.0", TURBO_DEPLOYMENT,
-                  refined="taps.tiny.cap.refined"),
+    "full": keyed("zimage_taps.npz", "taps.full.in.", "taps.full.out.0", TURBO_DEPLOYMENT),
+    "crop": keyed("zimage_taps.npz", "taps.crop.in.", "taps.crop.out.0", TURBO_DEPLOYMENT),
+    "tiny": keyed("zimage_taps.npz", "taps.tiny.in.", "taps.tiny.out.0", TURBO_DEPLOYMENT),
 }
 MODES["steps"] = keyed("zimage_golden.npz", "dit.step0.in.", "latent.final", TURBO_DEPLOYMENT)
 for _mode in ("turbo", "text", "chain", "steps"):
@@ -285,8 +281,6 @@ def run(args) -> None:
                 cmd += [f"--case_{i}", piece]
         if mode == "chain":
             cmd += ["--prompt", prompt_of(args)]
-        if args.refine_only:
-            cmd += ["--refine_only", "true"]
         if args.ctx_tap:
             cmd += ["--ctx_tap", "true"]
         if mode == "steps":
@@ -331,10 +325,6 @@ def collect(args) -> str:
     out: dict[str, np.ndarray] = {}
     if doc.get("text"):
         out[PROMPT_KEY] = np.asarray(doc["text"], np.float32).reshape(doc["text_rows"], doc["text_width"])
-    if doc["refined"]:
-        out["refined"] = np.asarray(doc["refined"], np.float32).reshape(doc["caption_rows"], doc["dim"])
-        if keys["refined"] and dump[keys["refined"]].shape[-2] == doc["caption_rows"]:
-            out[keys["refined"]] = out["refined"]
     if doc["velocity"]:
         rows = np.asarray(doc["velocity"], np.float32).reshape(-1, doc["readout"])
         out["velocity.rows"] = rows
@@ -367,11 +357,8 @@ def compare(args) -> int:
     default = MODES[mode]["out"] if not (mode == "steps" and args.stop is not None) \
         else f"sched.x{args.stop}"
     keys = args.keys or [default]
-    if not args.keys:
-        if mode == "chain":
-            keys.append(PROMPT_KEY)
-        if MODES[mode]["refined"]:
-            keys.append(MODES[mode]["refined"])
+    if not args.keys and mode == "chain":
+        keys.append(PROMPT_KEY)
     for glob in keys:
         cmd += ["--keys", glob]
     print(f"[compare] {' '.join(cmd)}")
@@ -433,7 +420,7 @@ GATE = [
              "template -> prompt_embeds.0"),
     ("turbo", "the `denoise` reading's step 0 against dit.step0.out.0 (the "
               "golden's own embeds feed the context lane)"),
-    ("chain", "text -> refine -> denoise, end to end, against both"),
+    ("chain", "text -> denoise, end to end, against both"),
     ("steps", "the whole eight-step Euler trajectory from noise.init against "
               "latent.final"),
 ]
@@ -473,7 +460,7 @@ def main() -> int:
     ap.add_argument("--text", action="store_true",
                     help="the Turbo row's text reading alone, against prompt_embeds.0")
     ap.add_argument("--chain", action="store_true",
-                    help="the Turbo row end to end: text -> refine -> denoise against dit.step0.out.0")
+                    help="the Turbo row end to end: text -> denoise against dit.step0.out.0")
     ap.add_argument("--steps", type=int, default=8,
                     help="the trajectory mode's step count (--mode steps); the family pins eight")
     ap.add_argument("--stop", type=int, default=None,
@@ -484,7 +471,6 @@ def main() -> int:
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")
     ap.add_argument("--case_file", action="store_true",
                     help="pass the case as a scratch file even when it fits argv")
-    ap.add_argument("--refine_only", action="store_true", help="stop after the refine reading")
     ap.add_argument("--ctx_tap", action="store_true",
                     help="read the denoise readout off the context lane too (bisect); "
                          "lands as `ctx.rows` in the npz")

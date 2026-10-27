@@ -24,21 +24,11 @@ pub(super) fn expect_voxels(what: &str, x: &Value) {
     );
 }
 
-fn grown(rows: Dim, k: u32) -> Dim {
-    match (rows, k) {
-        (rows, 1) => rows,
-        (Dim::Voxels, k) => Dim::VoxelsTimes(k),
-        (Dim::VoxelsTimes(j), k) => Dim::VoxelsTimes(j * k),
-        (other, _) => panic!("{other:?} is not a voxel row count"),
-    }
-}
-
-fn shrunk(rows: Dim, k: u32) -> Dim {
-    match rows {
-        Dim::VoxelsTimes(j) if k > 1 && j % k == 0 && j / k > 1 => Dim::VoxelsTimes(j / k),
-        Dim::VoxelsTimes(j) if k > 1 && j % k == 0 => Dim::Voxels,
-        other => other,
-    }
+fn scaled(rows: Dim, (num, den): (u32, u32)) -> Dim {
+    let (n, d) = rows
+        .voxel_scale()
+        .unwrap_or_else(|| panic!("{rows:?} is not a voxel row count"));
+    Dim::voxels_scaled(n * num, d * den)
 }
 
 fn volume(r: [u32; 3]) -> u32 {
@@ -191,7 +181,11 @@ pub fn conv3d(
     );
     let r = x.rec();
     let y_grid = self::grid(grid, conv.rule());
-    let y = r.fresh(tensor(x.rows(), w.dim(0), x.dtype()));
+    let y = r.fresh(tensor(
+        scaled(x.rows(), conv.rule().row_scale()),
+        w.dim(0),
+        x.dtype(),
+    ));
     r.push(
         Conv::Conv3d {
             x: x.id(),
@@ -277,7 +271,11 @@ pub fn upsample_nearest(
     };
     let r = x.rec();
     let y_grid = self::grid(grid, rule);
-    let y = r.fresh(tensor(grown(x.rows(), rule.growth()), x.width(), x.dtype()));
+    let y = r.fresh(tensor(
+        scaled(x.rows(), rule.row_scale()),
+        x.width(),
+        x.dtype(),
+    ));
     r.push(
         Conv::Upsample {
             x: x.id(),
@@ -311,7 +309,7 @@ pub fn pixel_shuffle_trimming(x: &Value, grid: &Value, r: [u32; 3], trim_t: u32)
     let rec = x.rec();
     let y_grid = self::grid(grid, rule);
     let y = rec.fresh(tensor(
-        grown(x.rows(), vol),
+        scaled(x.rows(), rule.row_scale()),
         x.width() / u64::from(vol),
         x.dtype(),
     ));
@@ -339,7 +337,7 @@ pub fn pixel_unshuffle(x: &Value, grid: &Value, r: [u32; 3]) -> (Value, Value) {
     let rec = x.rec();
     let y_grid = self::grid(grid, rule);
     let y = rec.fresh(tensor(
-        shrunk(x.rows(), vol),
+        scaled(x.rows(), rule.row_scale()),
         x.width() * u64::from(vol),
         x.dtype(),
     ));
@@ -370,7 +368,11 @@ pub fn avg_down(x: &Value, grid: &Value, factor: [u32; 3], group: u32) -> (Value
     let rule = GridRule::AvgDown { factor };
     let rec = x.rec();
     let y_grid = self::grid(grid, rule);
-    let y = rec.fresh(tensor(x.rows(), widened / u64::from(group), x.dtype()));
+    let y = rec.fresh(tensor(
+        scaled(x.rows(), rule.row_scale()),
+        widened / u64::from(group),
+        x.dtype(),
+    ));
     rec.push(
         Conv::AvgDown {
             x: x.id(),

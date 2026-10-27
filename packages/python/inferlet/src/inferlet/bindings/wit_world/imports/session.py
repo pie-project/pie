@@ -62,6 +62,12 @@ async def receive_file() -> Optional[bytes]:
     Receives an incoming file from the remote user client
     """
     raise NotImplementedError
+def file(name: str) -> Optional[bytes]:
+    """
+    The file the client attached to this run under `name`
+    (`pie run --file name=path`), or none.
+    """
+    raise NotImplementedError
 def send_frames(f: frames.Frames, format: frames.ImageFormat, name: str) -> None:
     """
     Encodes `f` and streams the bytes to the client under `name`, WITHOUT

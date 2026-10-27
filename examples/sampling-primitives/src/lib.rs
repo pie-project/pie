@@ -43,13 +43,13 @@ async fn main(_input: Input) -> Result<String> {
     let n = prompt.len() as u32;
 
     let toks = Channel::from_iter(prompt.iter().map(|&token| token as i32));
-    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
-    let token_out = Channel::new([1], dtype::i32).named("token");
-    let logits_out = Channel::new([vocab], dtype::f32).named("logits");
-    let entropy_out = Channel::new([1], dtype::f32).named("entropy");
-    let probs_out = Channel::new([vocab], dtype::f32).named("probabilities");
-    let logprobs_out = Channel::new([vocab], dtype::f32).named("log_probabilities");
-    let keep_out = Channel::new([vocab], dtype::i32).named("nucleus_keep");
+    let embed_indptr = Channel::from([0u32, n]);
+    let token_out = Channel::new([1], dtype::i32);
+    let logits_out = Channel::new([vocab], dtype::f32);
+    let entropy_out = Channel::new([1], dtype::f32);
+    let probs_out = Channel::new([vocab], dtype::f32);
+    let logprobs_out = Channel::new([vocab], dtype::f32);
+    let keep_out = Channel::new([vocab], dtype::i32);
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;

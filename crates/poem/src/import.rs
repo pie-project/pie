@@ -599,6 +599,7 @@ pub fn join_read(
                 s
             }),
             zero_points: lead.zero_points.as_deref().map(rename),
+            composite_axis: None,
             visibility: lead.visibility,
         });
     }

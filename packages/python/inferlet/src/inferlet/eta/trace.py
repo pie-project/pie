@@ -32,7 +32,7 @@ class ChannelState:
     the endpoint claims the host-role derivation + lints read."""
 
     gid: int
-    name: str
+    site: str  # where the channel was made (`file:line`); errors name it by this
     shape: Shape
     dtype: Dtype
     capacity: int

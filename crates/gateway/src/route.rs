@@ -376,6 +376,7 @@ mod tests {
             req_id: ReqId(7),
             session: SessionId(1),
             tenant: TenantId("t".to_string()),
+            user: "u".to_string(),
             priority: Priority::Normal,
             blobs: Vec::new(),
             cluster_props: Default::default(),
@@ -441,6 +442,7 @@ mod tests {
                 capture_outputs: false,
                 props: Default::default(),
                 session: None,
+                files: Default::default(),
                 cluster_props: Default::default(),
                 executors: Vec::new(),
             };
@@ -464,6 +466,7 @@ mod tests {
             capture_outputs: false,
             props: Default::default(),
             session: None,
+            files: Default::default(),
             cluster_props: Default::default(),
             executors: Vec::new(),
         };

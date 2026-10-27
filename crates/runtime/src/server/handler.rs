@@ -345,7 +345,7 @@ impl Session {
         let mut processes = Vec::new();
         for id in process::list() {
             if let Ok(stats) = process::get_stats(id).await
-                && stats.username == self.username
+                && self.owns(&stats.owner)
             {
                 processes.push(stats);
             }
@@ -430,6 +430,21 @@ impl Session {
                     return;
                 }
 
+                if let Ok(identity) = program::identify(&file, version.as_deref(), &buffer)
+                    && program::is_builtin_name(&identity.name.name).await
+                {
+                    self.send_response(
+                        corr_id,
+                        false,
+                        format!(
+                            "'{}' is the name of a built-in program; upload under another name",
+                            identity.name.name
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+
                 match program::add(buffer, &file, version.as_deref(), force_overwrite).await {
                     Ok(program_name) => {
                         if force_overwrite {
@@ -469,6 +484,7 @@ impl Session {
         capture_outputs: bool,
         mut props: client_api::Props,
         session: Option<String>,
+        files: client_api::Files,
         cluster_props: client_api::Props,
         executors: Vec<String>,
     ) {
@@ -537,6 +553,7 @@ impl Session {
             self.username.clone(),
             program_name,
             input,
+            std::sync::Arc::new(files),
             client_id,
             capture_outputs,
             None,
@@ -569,6 +586,10 @@ impl Session {
         uuid_str.parse().ok()
     }
 
+    pub(super) fn owns(&self, owner: &process::Owner) -> bool {
+        owner.tenant == self.tenant && owner.username == self.username
+    }
+
     pub(super) async fn handle_attach_process(&mut self, corr_id: u32, process_id_str: String) {
         let process_id = match Self::parse_process_id(&process_id_str) {
             Some(id) => id,
@@ -579,8 +600,8 @@ impl Session {
             }
         };
 
-        match process::get_username(process_id).await {
-            Ok(owner) if owner != self.username => {
+        match process::get_owner(process_id).await {
+            Ok(owner) if !self.owns(&owner) => {
                 self.send_response(corr_id, false, "Permission denied".to_string())
                     .await;
                 return;
@@ -640,8 +661,8 @@ impl Session {
             }
         };
 
-        match process::get_username(process_id).await {
-            Ok(owner) if owner != self.username => {
+        match process::get_owner(process_id).await {
+            Ok(owner) if !self.owns(&owner) => {
                 self.send_response(corr_id, false, "Permission denied".to_string())
                     .await;
                 return;

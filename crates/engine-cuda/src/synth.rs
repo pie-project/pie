@@ -48,21 +48,51 @@ pub(crate) static NONE: Regions = Regions {
 
 /// `trace` with each matmul and the pointwise ops over its product folded
 /// into one `fused.anchored` op where the contraction skeletons serve it
-/// (`compiler.synth_anchors`), and the anchored regions by key. Where `folds`
-/// is given (`compiler.fold_norms`), an anchor over an RMS norm's row whose
-/// bank it takes folds the norm in, its gain folded into the bank at load
-/// ([`crate::weights::Weights::fold_gains`]).
+/// (`compiler.synth_anchors`), and the anchored regions by key.
 #[cfg(not(feature = "rocm"))]
 #[must_use]
-pub fn fold_anchors(
-    trace: Trace,
-    folds: Option<poem_compiler::fuse::anchor::Folds<'_>>,
-) -> (Trace, BTreeMap<u64, Anchored>) {
-    poem_compiler::fuse::anchor::fold_with(
-        trace,
-        &|anchored, ins, outs| kernels_cuda::linear::skeleton::serves(anchored, ins, outs).is_ok(),
-        folds,
-    )
+pub fn fold_anchors(trace: Trace) -> (Trace, BTreeMap<u64, Anchored>) {
+    poem_compiler::fuse::anchor::fold(trace, &|anchored, ins, outs| {
+        kernels_cuda::linear::skeleton::serves(anchored, ins, outs).is_ok()
+    })
+}
+
+/// Whether this backend's row kernels serve `region` over a chain's planes
+/// as it stores them (`chain::fold`'s `serves`): the row skeleton's own
+/// contract ([`kernels_cuda::synth::supports`]). ROCm's build generates no
+/// row kernel.
+#[must_use]
+pub fn serves_region(
+    region: &Region,
+    ins: &[poem_compiler::fuse::chain::In],
+    outs: &[poem_compiler::fuse::chain::Out],
+) -> bool {
+    #[cfg(not(feature = "rocm"))]
+    {
+        let forms: Vec<In> = ins
+            .iter()
+            .map(|input| {
+                if input.by.is_some() {
+                    In::Gathered(input.dtype)
+                } else if input.one {
+                    In::One(input.dtype)
+                } else if input.shared {
+                    In::Shared(input.dtype)
+                } else if input.each {
+                    In::Each(input.dtype)
+                } else {
+                    In::Rows(input.dtype)
+                }
+            })
+            .collect();
+        let results: Vec<Out> = outs.iter().map(|out| Out::Rows(out.dtype)).collect();
+        kernels_cuda::synth::supports(region, &forms, &results).is_ok()
+    }
+    #[cfg(feature = "rocm")]
+    {
+        let _ = (region, ins, outs);
+        false
+    }
 }
 
 /// Every `fused.anchored` (and `fused.epilogue`, over a product landed

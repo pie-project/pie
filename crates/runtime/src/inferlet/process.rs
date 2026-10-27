@@ -414,6 +414,7 @@ pub fn spawn(
     username: String,
     program_name: ProgramName,
     input: String,
+    files: Arc<client_api::Files>,
     client_id: Option<ClientId>,
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
@@ -424,6 +425,7 @@ pub fn spawn(
         username,
         program_name,
         input,
+        files,
         client_id,
         capture_outputs,
         Arc::new(Mutex::new(result_tx)),
@@ -442,6 +444,7 @@ fn spawn_inner(
     username: String,
     program_name: ProgramName,
     input: String,
+    files: Arc<client_api::Files>,
     client_id: Option<ClientId>,
     capture_outputs: bool,
     result_tx: SharedResultTx,
@@ -468,6 +471,7 @@ fn spawn_inner(
         username,
         program_name,
         input,
+        files,
         client_id,
         capture_outputs,
         result_tx,
@@ -550,9 +554,15 @@ pub fn stderr(process_id: ProcessId, content: String) {
     let _ = SERVICES.send(&process_id, Message::Stderr { content });
 }
 
-pub async fn get_username(process_id: ProcessId) -> Result<String> {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Owner {
+    pub tenant: String,
+    pub username: String,
+}
+
+pub async fn get_owner(process_id: ProcessId) -> Result<Owner> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(&process_id, Message::GetUsername { response: tx })?;
+    SERVICES.send(&process_id, Message::GetOwner { response: tx })?;
     rx.await?
 }
 
@@ -575,7 +585,8 @@ pub fn list() -> Vec<ProcessId> {
 #[derive(Debug, serde::Serialize)]
 pub struct ProcessStats {
     pub id: String,
-    pub username: String,
+    #[serde(flatten)]
+    pub owner: Owner,
     pub program: String,
     pub input: String,
     pub elapsed_secs: u64,
@@ -597,8 +608,8 @@ enum Message {
     Stdout {
         content: String,
     },
-    GetUsername {
-        response: oneshot::Sender<Result<String>>,
+    GetOwner {
+        response: oneshot::Sender<Result<Owner>>,
     },
     Stderr {
         content: String,
@@ -619,6 +630,7 @@ struct Process {
     username: String,
     program: ProgramName,
     input: String,
+    files: Arc<client_api::Files>,
     start_time: Instant,
     handle: JoinHandle<()>,
     client_id: Option<ClientId>,
@@ -631,6 +643,13 @@ struct Process {
 }
 
 impl Process {
+    fn owner(&self) -> Owner {
+        Owner {
+            tenant: self.arrival.tenant.clone(),
+            username: self.username.clone(),
+        }
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "`spawn_inner`'s arguments, with both process ids known"
@@ -641,6 +660,7 @@ impl Process {
         username: String,
         program: ProgramName,
         input: String,
+        files: Arc<client_api::Files>,
         client_id: Option<ClientId>,
         capture_outputs: bool,
         result_tx: SharedResultTx,
@@ -652,6 +672,7 @@ impl Process {
             username.clone(),
             program.clone(),
             input.clone(),
+            files.clone(),
             capture_outputs,
             result_tx.clone(),
             arrival.clone(),
@@ -664,6 +685,7 @@ impl Process {
             username,
             program,
             input,
+            files,
             start_time: Instant::now(),
             handle,
             client_id,
@@ -711,6 +733,7 @@ impl Process {
         username: String,
         program: ProgramName,
         input: String,
+        files: Arc<client_api::Files>,
         capture_outputs: bool,
         result_tx: SharedResultTx,
         arrival: Arrival,
@@ -745,6 +768,7 @@ impl Process {
             instantiate_us = duration_us(instantiate_start.elapsed());
             store.data_mut().install_prewarm_permit(prewarm_permit);
             store.data_mut().set_props(props);
+            store.data_mut().set_files(files);
 
             let run_interface = RUN_INTERFACE;
 
@@ -827,6 +851,7 @@ impl Process {
             self.username.clone(),
             self.program.clone(),
             self.input.clone(),
+            self.files.clone(),
             self.client_id,
             self.capture_outputs,
             self.result_tx.clone(),
@@ -946,8 +971,8 @@ impl ServiceHandler for Process {
             Message::Stdout { content } => self.deliver_event(ProcessEvent::Stdout(content)),
             Message::Stderr { content } => self.deliver_event(ProcessEvent::Stderr(content)),
 
-            Message::GetUsername { response } => {
-                let _ = response.send(Ok(self.username.clone()));
+            Message::GetOwner { response } => {
+                let _ = response.send(Ok(self.owner()));
             }
 
             Message::GetClientId { response } => {
@@ -957,7 +982,7 @@ impl ServiceHandler for Process {
             Message::GetStats { response } => {
                 let _ = response.send(Ok(ProcessStats {
                     id: self.process_id.to_string(),
-                    username: self.username.clone(),
+                    owner: self.owner(),
                     program: self.program.to_string(),
                     input: self.input.clone(),
                     elapsed_secs: self.start_time.elapsed().as_secs(),
@@ -1029,6 +1054,7 @@ mod tests {
                 version: "0.0.0".to_string(),
             },
             input: String::new(),
+            files: Arc::default(),
             start_time: Instant::now(),
             handle: crate::rt::spawn(std::future::pending::<()>()),
             client_id: None,
@@ -1059,6 +1085,25 @@ mod tests {
         RESTART_ALIAS.write().unwrap().remove(&client_pid);
         assert!(matches!(seen, Ok(Ok(probe::Seen::Terminate(Err(_))))));
         assert!(superseded.output_buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_process_is_owned_by_its_tenant_and_user() {
+        let pid = ProcessId::new_v4();
+        let mut process = idle(pid, pid, Default::default());
+        process.arrival.tenant = "acme".to_string();
+        let owner = Owner {
+            tenant: "acme".to_string(),
+            username: "test".to_string(),
+        };
+
+        let (tx, rx) = oneshot::channel();
+        process.handle(Message::GetOwner { response: tx }).await;
+        assert_eq!(rx.await.unwrap().unwrap(), owner);
+
+        let (tx, rx) = oneshot::channel();
+        process.handle(Message::GetStats { response: tx }).await;
+        assert_eq!(rx.await.unwrap().unwrap().owner, owner);
     }
 
     #[tokio::test]

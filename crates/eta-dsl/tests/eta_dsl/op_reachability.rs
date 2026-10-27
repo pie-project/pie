@@ -104,7 +104,7 @@ fn arithmetic() -> Traced {
 }
 
 fn masking() -> Traced {
-    let state = Channel::from([7u32, 0]).named("rng");
+    let state = Channel::from([7u32, 0]);
     let positions = Channel::seeded([4], dtype::u32);
     let out = Channel::new([4, 8], dtype::f32);
 

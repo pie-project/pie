@@ -126,6 +126,34 @@ impl VoxelLadder {
         }
     }
 
+    /// The ladder `trace` loads at when it reads a voxel axis: `max_voxels`
+    /// as stated, or 0, which the load fits to its memory ([`voxels_within`]).
+    #[must_use]
+    pub fn of(
+        trace: &poem_ir::Trace,
+        max_voxels: Option<u32>,
+        max_clips: Option<u32>,
+        max_lanes: u32,
+    ) -> Option<VoxelLadder> {
+        let reads = trace.values.iter().any(|decl| {
+            matches!(&decl.ty, poem_ir::Ty::Tensor { shape, .. }
+                if shape.first().and_then(|dim| dim.axis()) == Some(crate::RowAxis::Voxels))
+        });
+        reads.then(|| {
+            VoxelLadder::new(0, max_clips.unwrap_or(max_lanes).max(1)).at(max_voxels.unwrap_or(0))
+        })
+    }
+
+    /// This ladder at `max_voxels`, its clips no more than its rows.
+    #[must_use]
+    pub fn at(mut self, max_voxels: u32) -> VoxelLadder {
+        self.max_voxels = max_voxels;
+        if max_voxels > 0 {
+            self.max_clips = self.max_clips.clamp(1, max_voxels);
+        }
+        self
+    }
+
     #[must_use]
     pub fn ladder(&self) -> Ladder<'_> {
         Ladder {
@@ -206,10 +234,6 @@ pub struct DeviceProfile {
     /// lowered to kernels-ir anchored regions and folded into
     /// `fused.anchored` ops (`fuse::anchor`, `compiler.synth_anchors`).
     pub synth_anchors: bool,
-
-    /// Whether an anchored region over an RMS norm's row folds the norm in
-    /// (`fuse::anchor::anchors_with`, `compiler.fold_norms`).
-    pub fold_norms: bool,
 
     pub family_us: FamilyCosts,
 
@@ -325,10 +349,107 @@ impl Default for DeviceProfile {
             dag_streams_until: 0,
             synth_regions: false,
             synth_anchors: false,
-            fold_norms: false,
             family_us: FamilyCosts::default(),
             exclusive: Vec::new(),
             grouped: Vec::new(),
         }
     }
+}
+
+/// The most voxel rows whose working set `bytes_at` keeps within `room`, the
+/// voxel ceiling a load derives where none is stated. Past the rows the
+/// tokens' working set hides, it grows about linearly in the ceiling: two
+/// probes aim, and a few steps settle.
+pub fn voxels_within(room: u64, floor: u32, bytes_at: impl Fn(u32) -> u64) -> u32 {
+    let floor = floor.max(1);
+    let mut probe = floor.max(1 << 12);
+    let mut voxels = loop {
+        let (low, high) = (bytes_at(probe), bytes_at(probe.saturating_mul(2)));
+        if high > room || probe >= 1 << 30 {
+            break match high.checked_sub(low) {
+                Some(slope) if slope > 0 && room > low => {
+                    let more = ((room - low) / slope).saturating_mul(u64::from(probe));
+                    u32::try_from(u64::from(probe).saturating_add(more)).unwrap_or(u32::MAX)
+                }
+                _ => probe,
+            };
+        }
+        if high > low {
+            let more = ((room - high) / (high - low)).saturating_mul(u64::from(probe));
+            break u32::try_from((u64::from(probe) * 2).saturating_add(more)).unwrap_or(u32::MAX);
+        }
+        probe *= 2;
+    };
+    while voxels > floor && bytes_at(voxels) > room {
+        voxels = (voxels - voxels / 8).max(floor);
+    }
+    voxels
+}
+
+/// The state slots a load asks for: `stated`; else 0 where the model's only
+/// state is voxel frame caches, which [`fit_frame_slots`] fits to memory;
+/// else `otherwise`.
+#[must_use]
+pub fn state_slots(stated: u32, trace: &poem_ir::Trace, otherwise: u32) -> u32 {
+    match stated {
+        0 if frame_caches_only(trace) => 0,
+        0 => otherwise,
+        stated => stated,
+    }
+}
+
+/// The frame-cache slots `room` holds, never under `least`; a fire then
+/// carries no more clips than they seat `frames_in_flight` fires deep.
+pub fn fit_frame_slots(
+    trace: &poem_ir::Trace,
+    voxels: Option<&mut VoxelLadder>,
+    room: u64,
+    least: u32,
+    frames_in_flight: u8,
+) -> u32 {
+    let slot: u64 = trace
+        .caches
+        .iter()
+        .filter_map(|row| match row {
+            poem_ir::CacheRow::State { slab, dtype, .. } => {
+                Some(slab.iter().product::<u64>() * crate::arena::elem_bytes(*dtype).unwrap_or(2))
+            }
+            poem_ir::CacheRow::Kv { .. } => None,
+        })
+        .sum();
+    let slots = u32::try_from(room / slot.max(1))
+        .unwrap_or(u32::MAX)
+        .max(least);
+    if let Some(ladder) = voxels {
+        let clips = (slots / u32::from(frames_in_flight.max(1))).max(1);
+        ladder.max_clips = ladder.max_clips.min(clips);
+    }
+    slots
+}
+
+fn frame_caches_only(trace: &poem_ir::Trace) -> bool {
+    use poem_ir::{CacheRow, Conv, Def, Operation};
+    let mut framed = vec![false; trace.caches.len()];
+    for node in &trace.nodes {
+        let cache = match &node.op {
+            Operation::Conv(Conv::Conv3d { cache, .. }) => *cache,
+            Operation::Conv(Conv::CacheStore { cache, .. }) => Some(*cache),
+            _ => None,
+        };
+        if let Some(Def::Cache(row)) = cache
+            .and_then(|v| trace.values.get(v.0 as usize))
+            .map(|d| &d.def)
+            && let Some(seen) = framed.get_mut(*row as usize)
+        {
+            *seen = true;
+        }
+    }
+    let states: Vec<bool> = trace
+        .caches
+        .iter()
+        .zip(&framed)
+        .filter(|(row, _)| matches!(row, CacheRow::State { .. }))
+        .map(|(_, framed)| *framed)
+        .collect();
+    !states.is_empty() && states.iter().all(|framed| *framed)
 }
