@@ -318,15 +318,17 @@ impl Pools {
                     let stride: u64 = slab.iter().product();
                     let dtype = state_dtype(*dtype);
                     let slots = paging.slots + 1;
-                    planes.push(vec![device.zeros_or_dry(dtype, slots, narrow(stride))?]);
+                    let (per, width) = state_block(slab);
+                    let rows = slots.saturating_mul(narrow(per));
+                    planes.push(vec![device.zeros_or_dry(dtype, rows, narrow(width))?]);
                     roots.push(vec![handles.root(Root {
                         source: Source::Pool {
                             row: index as u32,
                             plane: 0,
                         },
                         dtype,
-                        rows: slots,
-                        width: narrow(stride),
+                        rows,
+                        width: narrow(width),
                     })]);
                     shapes.push(Shape::State { stride, dtype });
                 }
@@ -573,13 +575,15 @@ impl Pools {
         }
         let (inputs, at) = indices(handles, &[i64::from(slot)]);
         let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
+        let slots = i64::from(self.paging.slots) + 1;
         let rows: Vec<Tensor> = self.state_rows().map(|r| r.1).collect();
         for &t in &rows {
+            let span = (i64::from(t.rows) / slots).max(1);
             tracer.emit(&mut |cx| {
                 let whole = cx.read(t)?;
                 let elem = cx.elem(whole);
-                let zero = cx.const_i(elem, 0, &[1, i64::from(t.width)]);
-                let at = index_at(cx, at, 0, 1)?;
+                let zero = cx.const_i(elem, 0, &[span, i64::from(t.width)]);
+                let at = index_at(cx, at, 0, span)?;
                 let col = cx.const_i(Elem::I32, 0, &[]);
                 let next = cx.dynamic_update_slice(whole, zero, &[at, col])?;
                 cx.write(t, next)
@@ -604,9 +608,10 @@ impl Pools {
         // `slot * page ..` of each buffer plane): a copy that left the page
         // behind would hand the next fold whatever `dst` last held.
         let page = i64::from(self.paging.page_size.max(1));
+        let slots = i64::from(self.paging.slots) + 1;
         let rows = self
             .state_rows()
-            .map(|r| (r.1, 1))
+            .map(|r| (r.1, (i64::from(r.1.rows) / slots).max(1)))
             .chain(self.rs_buffers.iter().map(|&t| (t, page)));
         for (t, span) in rows.collect::<Vec<_>>() {
             tracer.emit(&mut |cx| {
@@ -919,6 +924,15 @@ fn elem_bytes(name: &str, dtype: Dtype) -> Result<u64> {
     poem_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Unbound {
         what: format!("cache `{name}` in {dtype:?}, which has no element size"),
     })
+}
+
+fn state_block(slab: &[u64]) -> (u64, u64) {
+    let stride: u64 = slab.iter().product();
+    match *slab {
+        [h, d1, d2] if (h * d1).is_multiple_of(8) && d2.is_multiple_of(128) => (h * d1, d2),
+        [_, _] if stride.is_multiple_of(8 * 128) => (8, stride / 8),
+        _ => (1, stride),
+    }
 }
 
 fn narrow(n: u64) -> u32 {

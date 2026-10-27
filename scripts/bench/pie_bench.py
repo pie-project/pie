@@ -249,11 +249,17 @@ def build_config(args: argparse.Namespace):
     # worker serves one replica — so `--dp-size` spawns workers (see
     # `run_data_parallel`) and never widens this list. An explicit
     # `--device` still wins.
-    if args.device == PIE_BENCH_DEFAULT_DEVICE and args.tp_size > 1:
+    if args.engine == "xla" and args.device == PIE_BENCH_DEFAULT_DEVICE:
+        args.device = (
+            ",".join(f"tpu:{i}" for i in range(args.tp_size))
+            if args.tp_size > 1
+            else "tpu:0"
+        )
+    elif args.device == PIE_BENCH_DEFAULT_DEVICE and args.tp_size > 1:
         args.device = ",".join(f"cuda:{i}" for i in range(args.tp_size))
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
     engine_options: dict[str, Any]
-    if args.engine == "cuda":
+    if args.engine in ("cuda", "xla"):
         engine_options = {}
         # Eight `engine_options` writes STOOD HERE (`memory_profile`,
         # `kv_cache_dtype`, `runtime_quant`, `mxfp4_moe`,
@@ -290,7 +296,7 @@ def build_config(args: argparse.Namespace):
             engine_options[key] = parsed
         if args.max_forward_requests != PIE_MAX_FORWARD_REQUESTS_DEFAULT:
             engine_options["max_forward_requests"] = args.max_forward_requests
-        if getattr(args, "swap_pool_size", 0):
+        if args.engine == "cuda" and getattr(args, "swap_pool_size", 0):
             engine_options["swap_pool_size"] = args.swap_pool_size
         # `--max-model-len` is ONE REQUEST's context ceiling, the knob every
         # engine bench forwards (llama.cpp as `--ctx-size`, vLLM and SGLang
@@ -585,7 +591,7 @@ async def cli_pie_client(args: argparse.Namespace):
 
     pie_bin = Path(args.pie_bin)
     if not pie_bin.exists():
-        feature = {"metal": "metal"}.get(args.engine, "cuda")
+        feature = {"metal": "metal", "xla": "xla"}.get(args.engine, "cuda")
         raise FileNotFoundError(
             f"missing {pie_bin}; build with: cargo build --release -p pie "
             f"--no-default-features --features {feature}"
@@ -1153,7 +1159,12 @@ async def run(args: argparse.Namespace):
 
             async def warmup_pass() -> None:
                 if args.mode == "tput":
-                    await many(range(args.warmup), max_tokens=warmup_max_tokens)
+                    w_n = (
+                        max(args.warmup, min(len(prompts), args.concurrency + 8))
+                        if args.engine == "xla" and args.concurrency > 0
+                        else args.warmup
+                    )
+                    await many(range(w_n), max_tokens=warmup_max_tokens)
                 else:
                     for i in range(args.warmup):
                         await one(i, max_tokens=warmup_max_tokens)
@@ -1504,7 +1515,7 @@ def build_parser() -> argparse.ArgumentParser:
         # `EMBEDDED_CLI_ENGINES` above has named it the whole time. `vulkan`
         # and `wgpu` are still absent because no build of pie hosts them.
         sp.add_argument("--engine", default="cuda",
-                        choices=["cuda", "metal", "vllm", "sglang",
+                        choices=["cuda", "metal", "xla", "vllm", "sglang",
                                  "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
