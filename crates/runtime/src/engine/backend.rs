@@ -139,12 +139,6 @@ mod remote;
 
 pub use remote::{RemoteDisconnectHandle, RemoteEngine};
 
-#[cfg(feature = "engine-cuda")]
-#[must_use]
-pub fn envelopes_resolved() -> u64 {
-    engine_cuda::Shell::envelopes_resolved()
-}
-
 struct EngineRegistration {
     spec: EngineSpec,
     backend: Option<EngineBox>,

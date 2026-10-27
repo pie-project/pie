@@ -73,7 +73,6 @@ pub struct CudaArena {
     stream: rt::cudaStream_t,
     staging: Vec<StagingSlot>,
     next_slot: usize,
-    device_transforms: bool,
 }
 
 impl CudaArena {
@@ -106,14 +105,7 @@ impl CudaArena {
             stream: stream.cast(),
             staging,
             next_slot: 0,
-            device_transforms: true,
         })
-    }
-
-    #[must_use]
-    pub const fn host_transforms_only(mut self) -> Self {
-        self.device_transforms = false;
-        self
     }
 
     fn at(&self, offset: usize) -> *mut c_void {
@@ -235,7 +227,7 @@ impl ArenaBacking for CudaArena {
     }
 
     fn runs_named_kernels(&self) -> bool {
-        self.device_transforms
+        true
     }
 
     fn run_tile_map(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {

@@ -905,13 +905,6 @@ impl Refill {
         }
     }
 
-    fn settle(mut self) -> Option<Pinned> {
-        if let Some(filling) = self.filling.take() {
-            let _ = filling.join();
-        }
-        self.filled.try_recv().ok()
-    }
-
     fn window_ms(&self) -> u64 {
         u64::try_from(self.began.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -1280,18 +1273,6 @@ impl Tier {
             filled,
             began: std::time::Instant::now(),
         });
-    }
-
-    pub fn settle_refill(&mut self, compute: *mut c_void, notify: *mut c_void) -> Result<bool> {
-        let Some(refill) = self.refill.take() else {
-            return Ok(false);
-        };
-        let window = refill.window_ms();
-        let Some(host) = refill.settle() else {
-            return Ok(false);
-        };
-        self.install(host, window, compute, notify)?;
-        Ok(true)
     }
 
     fn install(
@@ -1796,76 +1777,6 @@ impl Tier {
     #[must_use]
     pub fn ladder(&self) -> (u64, u64, u64) {
         self.ladder
-    }
-
-    pub fn promote_now(
-        &mut self,
-        name: &str,
-        compute: *mut c_void,
-        notify: *mut c_void,
-    ) -> Result<Option<(Held, Held)>> {
-        let Some(group) = self.groups.iter().position(|group| group.name == name) else {
-            return Ok(None);
-        };
-        let shape: Vec<u64> = self.groups[group]
-            .planes
-            .iter()
-            .map(|plane| plane.reserved)
-            .collect();
-        let was = self.groups[group].held;
-        let hits = self.group_mirror.read(0, self.group_mirror.bytes());
-        let count = |at: usize| -> u32 {
-            let byte = at * COUNTER as usize;
-            hits.get(byte..byte + COUNTER as usize)
-                .and_then(|word| word.try_into().ok())
-                .map_or(0, u32::from_ne_bytes)
-        };
-        let Some(berth) = self
-            .berths
-            .iter()
-            .enumerate()
-            .filter(|(at, berth)| {
-                berth.tier.rung() < was.rung()
-                    && berth.shape == shape
-                    && self.groups[group].berth != Some(*at)
-                    && berth
-                        .holds
-                        .is_none_or(|out| !self.groups[out].backing.is_empty())
-            })
-            .min_by_key(|(_, berth)| match berth.holds {
-                None => (0u8, 0u32, 0u64),
-                Some(out) => (1, count(self.groups[out].cell_at), self.groups[out].settled),
-            })
-            .map(|(at, _)| at)
-        else {
-            return Ok(None);
-        };
-        let swap = Swap { berth, group };
-        self.drained.record(compute)?;
-        self.drained.wait(notify)?;
-        self.open_berth(swap, notify)?;
-        let into = self.berths[berth].at.clone();
-        let from: Vec<(u64, u64)> = self.groups[group]
-            .at
-            .iter()
-            .zip(&self.groups[group].planes)
-            .map(|(at, plane)| (*at, plane.bytes))
-            .collect();
-        for (dst, (src, bytes)) in into.into_iter().zip(from) {
-            copy_any(
-                notify,
-                dst,
-                src,
-                usize::try_from(bytes).unwrap_or(usize::MAX),
-            )?;
-        }
-        self.landed.record(notify)?;
-        self.landed.settle()?;
-        self.close_berth(swap, notify)?;
-        self.ready.record(notify)?;
-        self.ready.settle()?;
-        self.moving = false;
-        Ok(Some((was, self.groups[group].held)))
     }
 
     #[must_use]

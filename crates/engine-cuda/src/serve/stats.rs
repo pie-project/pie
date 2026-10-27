@@ -191,9 +191,4 @@ impl Shell {
     pub fn weights_from_cache(&self) -> bool {
         self.weights.from_cache()
     }
-
-    #[must_use]
-    pub fn envelopes_resolved() -> u64 {
-        crate::program::ports::resolved()
-    }
 }

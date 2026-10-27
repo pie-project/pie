@@ -9,8 +9,6 @@ pub mod profiles;
 
 pub use waker;
 
-#[cfg(feature = "engine-cuda")]
-pub use backend::envelopes_resolved;
 pub use backend::{
     EngineBox, EngineSpec, RemoteDisconnectHandle, RemoteEngine, SchedulerLimits, get_spec, open,
     register_engine_backend, take_engine_backend, unregister_engine,

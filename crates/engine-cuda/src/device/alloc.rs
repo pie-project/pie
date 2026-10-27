@@ -1333,16 +1333,3 @@ pub fn raw_alloc(bytes: usize) -> Option<u64> {
         None
     }
 }
-
-pub fn raw_free(at: u64) {
-    #[cfg(feature = "device")]
-    {
-        use crate::device::rt;
-        // SAFETY: an address `raw_alloc` returned and nobody else freed.
-        let _ = unsafe { rt::cudaFree(at as *mut core::ffi::c_void) };
-    }
-    #[cfg(not(feature = "device"))]
-    {
-        let _ = at;
-    }
-}

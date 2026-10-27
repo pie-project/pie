@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use engine::ports::{Envelope, engine_resolves};
 use eta_exec::{ExecPlan, Value};
 use eta_ir::Dtype;
@@ -9,13 +7,6 @@ use eta_ir::types::name_or_unknown;
 use crate::error::{Fault, Result};
 
 use super::launch::{ChannelShape, Cursor, Rings};
-
-static RESOLVED: AtomicU64 = AtomicU64::new(0);
-
-#[must_use]
-pub fn resolved() -> u64 {
-    RESOLVED.load(Ordering::Relaxed)
-}
 
 pub fn resolve(
     plan: &ExecPlan,
@@ -27,7 +18,6 @@ pub fn resolve(
     mask_on_device: bool,
 ) -> Result<Envelope> {
     let mut out = Envelope::default();
-    RESOLVED.fetch_add(1, Ordering::Relaxed);
     for binding in &plan.package.ports {
         if !engine_resolves(class, device, binding.port) {
             continue;
