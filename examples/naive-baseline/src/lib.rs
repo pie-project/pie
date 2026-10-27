@@ -1,9 +1,10 @@
 //! Naive text completion — the performance control for the algorithm inferlets.
 //!
 //! Structurally identical to every truncation/penalty inferlet in this
-//! directory: one N-wide prefill fire, then a device-carried decode loop
-//! driven by `eta::run_ahead`, which keeps the runtime's run-ahead window
-//! (`model.channel-capacity()`) full ahead of the host drain. The only
+//! directory: an epilogue-free fill of the prompt head, then a device-carried
+//! decode loop from the prompt's last token, driven by `eta::run_ahead`, which
+//! keeps the runtime's run-ahead window (`model.channel-capacity()`) full ahead
+//! of the host drain. The only
 //! difference is the epilogue, which does nothing but temperature-scale the
 //! logits and draw a Gumbel-max sample. Whatever an algorithm inferlet costs
 //! above this number is the algorithm.
@@ -76,118 +77,65 @@ async fn main(input: Input) -> Result<Output> {
     let temperature = input.temperature;
     let want_stats = input.stats;
     let ws = WorkingSet::new();
-
-    if max_tokens == 0 {
-        return Ok(Output {
-            sampler: "naive-baseline",
-            text: String::new(),
-            tokens: Vec::new(),
-            count: 0,
-            stats: want_stats,
-        });
-    }
+    let pipe = Pipeline::new();
 
     // The model's opening (`<bos>` where it has one) before the raw text: a
     // gemma without it answers noise, and no sampler can be read against that.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
-    if prompt.is_empty() {
-        prompt.push(0);
-    }
-    let n = prompt.len() as u32;
-
-    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-
+    let prompt: Vec<i32> = inferlet::chat::prefix()
+        .into_iter()
+        .chain(model::encode(&input.prompt))
+        .map(|t| t as i32)
+        .collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
     // The runtime cuts every program's prompt at the same rows (`PIE_FIRE_ROWS` pins them).
-    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let pipe = Pipeline::new();
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe).context("prefill submit")?;
+    }
 
-    let toks_p = Channel::from(&prompt_i32[..]);
-    let embed_indptr_p = Channel::from([0u32, n]);
-    let rng_p = Channel::from([input.seed, 0]);
-    let tok_out_p = Channel::new([1], dtype::i32);
-    let s1_out_p = Channel::new([1], dtype::f32);
-    let s2_out_p = Channel::new([1], dtype::f32);
+    let tok_in = Channel::from([last]);
+    let rng = Channel::from([input.seed, 0]);
+    let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+    let s1_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
+    let s2_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
 
-    let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
-    fwd_p.epilogue(move || {
-        let r = rng_p.take();
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, &Channel::from([0u32, 1]))?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
+    fwd.epilogue(move || {
+        let r = rng.take();
         let logits = intrinsics::output(0, "logits");
         let token = step(logits, temperature, &r);
         let r_next = &r + iota(2);
-        tok_out_p.put(&token);
+        tok_in.put(&token);
+        tok_out.put(&token);
         if want_stats {
             let mirror = reshape(cast(&token, dtype::f32), [1]);
-            s1_out_p.put(&mirror);
-            s2_out_p.put(&mirror);
+            s1_out.put(&mirror);
+            s2_out.put(&mirror);
         }
-        rng_p.put(&r_next);
+        rng.put(&r_next);
     });
 
-    fwd_p.submit(&pipe).context("prefill submit")?;
-
-    let g0 = tok_out_p
-        .take_host::<i32>()
-        .await
-        .context("prefill drain")?;
-    if want_stats {
-        s1_out_p
-            .take_host::<Vec<f32>>()
+    let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+    run_ahead(&pipe, &fwd, max_tokens, async || {
+        let t = tok_out
+            .take_host::<i32>()
             .await
-            .context("prefill drain")?;
-        s2_out_p
-            .take_host::<Vec<f32>>()
-            .await
-            .context("prefill drain")?;
-    }
-    generated.push(g0 as u32);
-
-    // ── DECODE LOOP (1-wide, run-ahead). ──
-    if generated.len() < max_tokens {
-        let tok_in = Channel::from([g0]);
-        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
-        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-        let s1_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
-        let s2_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
-        let lane1 = Channel::from([0u32, 1u32]);
-
-        let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, &lane1)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
-        fwd.epilogue(move || {
-            let r = rng.take();
-            let logits = intrinsics::output(0, "logits");
-            let token = step(logits, temperature, &r);
-
-            let r_next = &r + iota(2);
-
-            tok_in.put(&token);
-            tok_out.put(&token);
-            if want_stats {
-                let mirror = reshape(cast(&token, dtype::f32), [1]);
-                s1_out.put(&mirror);
-                s2_out.put(&mirror);
-            }
-            rng.put(&r_next);
-        });
-
-        let budget = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget, async || {
-            let t = tok_out
-                .take_host::<i32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            if want_stats {
-                s1_out.take_host::<Vec<f32>>().await?;
-                s2_out.take_host::<Vec<f32>>().await?;
-            }
-            generated.push(t as u32);
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    }
+            .with_context(|| format!("@{}", generated.len()))?;
+        if want_stats {
+            s1_out.take_host::<Vec<f32>>().await?;
+            s2_out.take_host::<Vec<f32>>().await?;
+        }
+        generated.push(t as u32);
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipe.close();
 
     Ok(Output {
