@@ -168,6 +168,7 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
     const constant int& ratio          [[buffer(14)]],
     const constant int& has_weights    [[buffer(15)]],
     const constant int& sel_stride     [[buffer(16)]],
+    const constant int& pitch          [[buffer(17)]],
     uint3 tgpos     [[threadgroup_position_in_grid]],
     uint3 lid       [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
@@ -226,13 +227,13 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
       float part[kSmallHeads];
       for (int h = 0; h < kSmallHeads; ++h) part[h] = 0.0f;
       if (j < nkeys) {
-        const int cell = (j + 1) * stride - 1;
+        const int cell = (j + 1) * stride - D / pitch;
         const int page = int(kv_page_indices[pages_first + cell / page_size]);
         const int off = cell % page_size;
         // Two bf16 a word: `dpl` is even and the row is D-aligned, so the
         // slice starts on a 4-byte boundary.
         const device uint* kw = (const device uint*)(
-            key_pages + (size_t(page) * size_t(page_size) + size_t(off)) * size_t(D) +
+            key_pages + (size_t(page) * size_t(page_size) + size_t(off)) * size_t(pitch) +
             size_t(sub * dpl));
         for (int i = 0; i < kSlice; i += 2) {
           if (i < dpl) {
@@ -270,11 +271,11 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
       const int j = j0 + slot;
       float acc = 0.0f;
       if (j < nkeys) {
-        const int cell = (j + 1) * stride - 1;
+        const int cell = (j + 1) * stride - D / pitch;
         const int page = int(kv_page_indices[pages_first + cell / page_size]);
         const int off = cell % page_size;
         const device bfloat* kj =
-            key_pages + (size_t(page) * size_t(page_size) + size_t(off)) * size_t(D);
+            key_pages + (size_t(page) * size_t(page_size) + size_t(off)) * size_t(pitch);
         for (int h = hh; h < H; h += kLanesPerKey) {
           const device bfloat* qh = qi + size_t(h) * size_t(D);
           float dot = 0.0f;
