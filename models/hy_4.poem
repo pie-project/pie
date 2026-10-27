@@ -5,6 +5,7 @@ load("//pie/codec.poem", "kept", "stacked_bank", read_weight = "weight")
 load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/hyper.poem", "collapse")
 load("//lib/mla.poem", "fp8_rows", "cache")
+load("//lib/mtp.poem", "draft")
 
 HY = template("hy", thinking = True)
 
@@ -566,31 +567,13 @@ def forward(m, inputs):
     logits = ops.linear.lm_head(x, m.head)
 
     if m.mtp != None:
-        draft(m, inputs, x, positions, logits)
+        draft(m, inputs, x, positions, logits, draft_layer)
     output("logits", logits)
 
-def draft(m, inputs, hidden, positions, logits):
-    """The MTP head's drafted token, from the trunk's last normed rows
-    `hidden` and the token its logits pick: one plain residual layer, no
-    streams."""
+def draft_layer(m, fused, drafted, positions):
     mtp = m.mtp
-    drafted = inputs.on(fact.drafts())
-    hidden = hidden.on(fact.drafts())
-    positions = positions.on(fact.drafts())
-    token = ops.sampling.argmax([logits.on(fact.drafts())])
-
-    e = ops.gather.embed(token, m.embed, m.vocab)
-    e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
-    h = ops.elemwise.rmsnorm(hidden, mtp.hnorm, mtp.norm_eps)
-    fused = ops.elemwise.residual_add(
-        ops.linear.matmul(e, mtp.e_proj),
-        ops.linear.matmul(h, mtp.h_proj),
-    )
     x = ops.elemwise.rmsnorm(fused, mtp.attn_norm, mtp.norm_eps)
     o, _ = run_attention(x, drafted, positions, mtp.attn, None, prefill_only = True)
     r = ops.elemwise.residual_add(o, fused)
     x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.norm_eps)
-    r = ops.elemwise.residual_add(mlp(x, mtp.mlp), r)
-    proposal = ops.linear.lm_head(ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps), m.head)
-    output("mtp.logits", proposal)
-    output("mtp.drafts", ops.sampling.argmax([proposal]))
+    return ops.elemwise.residual_add(mlp(x, mtp.mlp), r)
