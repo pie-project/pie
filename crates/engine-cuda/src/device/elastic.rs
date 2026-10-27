@@ -79,6 +79,7 @@ pub struct PhysicalPool {
     held_pages: u64,
     committed_pages: u64,
     high_water_pages: u64,
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
     utilization: f64,
 }
 

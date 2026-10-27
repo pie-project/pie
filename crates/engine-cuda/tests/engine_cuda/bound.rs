@@ -18,6 +18,7 @@ pub fn logits_decl(vocab: u32) -> OutputDecl {
 }
 
 /// A loaded class's output as a program reads it.
+#[allow(dead_code)]
 pub fn eta_decl(decl: &poem_ir::OutputDecl) -> OutputDecl {
     OutputDecl {
         name: decl.name.clone(),
@@ -37,6 +38,7 @@ pub fn eta_decl(decl: &poem_ir::OutputDecl) -> OutputDecl {
 }
 
 /// Every output the loaded classes write, as one lane reads them.
+#[allow(dead_code)]
 pub fn loaded_decls(loaded: &engine::Capabilities) -> Vec<OutputDecl> {
     let mut decls: Vec<OutputDecl> = Vec::new();
     for decl in loaded
@@ -52,11 +54,13 @@ pub fn loaded_decls(loaded: &engine::Capabilities) -> Vec<OutputDecl> {
     decls
 }
 
+#[allow(dead_code)]
 pub fn logits(container: TraceContainer, vocab: u32) -> Result<BoundTrace, ValidateError> {
     bind(container, vec![vec![logits_decl(vocab)]], caps())
 }
 
 /// One lane per lane `container` reads outputs of, reading what the loaded classes read out.
+#[allow(dead_code)]
 pub fn loaded(
     container: TraceContainer,
     loaded: &engine::Capabilities,
