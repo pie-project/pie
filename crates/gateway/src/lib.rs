@@ -71,9 +71,7 @@ impl Config {
 #[derive(Clone)]
 pub struct GatewayState {
     pub sessions: Sessions,
-    pub routing: RoutingHandle,
     pub workers: WorkerRegistry,
-    pub blobs: Arc<dyn BlobStore>,
     pub router: Arc<policy::Cluster>,
 }
 
@@ -304,7 +302,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
         workers.clone(),
     );
     let sessions = Sessions::new(Arc::new(RouteBackend {
-        routing: routing.clone(),
+        routing,
         workers: workers.clone(),
         located: Mutex::default(),
         router: router.clone(),
@@ -330,9 +328,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
         Arc::new(GatewayOriginStore::new(format!("http://{}", config.listen)));
     let state = GatewayState {
         sessions: sessions.clone(),
-        routing,
         workers: workers.clone(),
-        blobs: blobs.clone(),
         router,
     };
 
