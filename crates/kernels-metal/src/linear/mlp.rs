@@ -345,6 +345,16 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
     )
 }
 
+pub fn relu2(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
+    const OP: &str = "linear.relu2";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "mlp_relu2_bfloat16" });
+    ctx.fire(
+        Fire::at("linear/glu_split.metal", entry)
+            .apply(Grid::of(elementwise(OP, x.width, x.rows)?, [GROUP, 1, 1])),
+        &[x.arg(), y.arg_mut()],
+    )
+}
+
 pub fn geglu_tanh_packed(
     ctx: &Ctx<'_>,
     packed: Tensor,

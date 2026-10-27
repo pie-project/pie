@@ -365,6 +365,20 @@ pub fn rmsnorm_grouped_plus_one(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
+    rmsnorm_grouped(ctx, x, weight, group, eps, true, y)
+}
+
+/// Each `group`-wide run of a row RMS-normed on its own and scaled by its
+/// own `weight`s (`1 + weight` under `plus_one`).
+pub fn rmsnorm_grouped(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    weight: Tensor,
+    group: u32,
+    eps: f32,
+    plus_one: bool,
+    y: Tensor,
+) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm";
     let axis = nonzero(OP, "the group width", group)?;
     if !x.width.is_multiple_of(axis) {
@@ -398,7 +412,7 @@ pub fn rmsnorm_grouped_plus_one(
             eps.arg(),
             stated(OP, axis)?.arg(),
             DENSE_BANK.arg(),
-            OFFSET_BANK.arg(),
+            if plus_one { OFFSET_BANK } else { ABSOLUTE_BANK }.arg(),
             UNIT_GAIN.arg(),
             stated(OP, groups)?.arg(),
         ],

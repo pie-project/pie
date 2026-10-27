@@ -328,6 +328,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         "ssm/kda.metal",
         include_str!(concat!(source_root!(), "/ssm/kda.metal")),
     ),
+    (
+        "ssm/mamba2.metal",
+        include_str!(concat!(source_root!(), "/ssm/mamba2.metal")),
+    ),
 ];
 
 #[must_use]
