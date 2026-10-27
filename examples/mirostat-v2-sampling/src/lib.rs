@@ -137,108 +137,66 @@ async fn main(input: Input) -> Result<Output> {
 
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-
-    let mut mu = input.mu0.unwrap_or_else(|| (vocab as f32).ln() + 1.0);
-    if max_tokens == 0 {
-        return Ok(Output {
-            sampler: "mirostat-v2",
-            text: String::new(),
-            count: 0,
-            tau,
-            final_mu: mu,
-            mean_surprise: 0.0,
-            tail_mean_surprise: 0.0,
-        });
-    }
+    let pipe = Pipeline::new();
 
     // The model's opening (`<bos>` where it has one) before the raw text: a
     // gemma without it answers noise.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
-    if prompt.is_empty() {
-        prompt.push(0);
+    let prompt: Vec<i32> = inferlet::chat::prefix()
+        .into_iter()
+        .chain(model::encode(&input.prompt))
+        .map(|t| t as i32)
+        .collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe).context("prefill submit")?;
     }
-    let n = prompt.len() as u32;
+
+    let mut mu = input.mu0.unwrap_or_else(|| (vocab as f32).ln() + 1.0);
+    let tok_in = Channel::from([last]);
+    let mu_state = Channel::from([mu]);
+    let rng = Channel::from([0x9e37_u32, 0]);
+    let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+    let s_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
+
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, &Channel::from([0u32, 1]))?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
+    fwd.epilogue(move || {
+        let mu_v = mu_state.take(); // [1] f32, device loop-carried
+        let r = rng.take(); // [2] u32 rng state
+        let logits = intrinsics::output(0, "logits"); // [vocab] f32
+        let (token, surprise) = mirostat_step(floor, logits, vocab, &mu_v, &r);
+
+        let r_next = &r + iota(2);
+        let mu_next = &mu_v - (&surprise - tau) * lr;
+
+        tok_in.put(&token);
+        tok_out.put(&token);
+        s_out.put(&surprise);
+        rng.put(&r_next);
+        mu_state.put(&mu_next);
+    });
 
     let mut surprises: Vec<f32> = Vec::with_capacity(max_tokens);
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-
-    // ── PREFILL FIRE (N-wide) — first mirostat step over the prompt. ──
-    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = Channel::from(prompt_i32);
-    let embed_indptr_p = Channel::from([0u32, n]);
-    let mu_p = Channel::new([1], dtype::f32);
-    let rng_p = Channel::from([0x9e37_u32, 0]);
-    let tok_out_p = Channel::new([1], dtype::i32);
-    let s_out_p = Channel::new([1], dtype::f32);
-
-    let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
-    fwd_p.epilogue(move || {
-        let mu_v = mu_p.take();
-        let r = rng_p.take(); // [2] u32 rng state (key, ctr)
-        let logits = intrinsics::output(0, "logits"); // [vocab] f32 (single read-out row)
-        let (token, surprise) = mirostat_step(floor, logits, vocab, &mu_v, &r);
-        let r_next = &r + iota(2);
-        tok_out_p.put(&token);
-        s_out_p.put(&surprise);
-        rng_p.put(&r_next);
-    });
-
-    mu_p.put(vec![mu]);
-    let pipe = Pipeline::new();
-    fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = tok_out_p.take_host::<i32>().await?;
-    let s0 = s_out_p.take_host::<f32>().await?;
-
-    generated.push(g0 as u32);
-    surprises.push(s0);
-    mu -= lr * (s0 - tau);
-
-    // ── DECODE LOOP (1-wide) ──
-    if generated.len() < max_tokens {
-        let tok_in = Channel::from([g0]);
-        let mu_state = Channel::from([mu]);
-        let rng = Channel::from([0x51ed_u32, 0]);
-        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-        let s_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
-        let lane1 = Channel::from([0u32, 1u32]);
-
-        let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, &lane1)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
-        fwd.epilogue(move || {
-            // Takes + compute first, PUTS last (value-id discipline).
-            let mu_v = mu_state.take(); // [1] f32, device loop-carried
-            let r = rng.take(); // [2] u32 rng state
-            let logits = intrinsics::output(0, "logits"); // [vocab] f32
-            let (token, surprise) = mirostat_step(floor, logits, vocab, &mu_v, &r);
-
-            let r_next = &r + iota(2);
-            let mu_next = &mu_v - (&surprise - tau) * lr;
-
-            tok_in.put(&token);
-            tok_out.put(&token);
-            s_out.put(&surprise);
-            rng.put(&r_next);
-            mu_state.put(&mu_next);
-        });
-
-        let budget = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget, async || {
-            let t = tok_out
-                .take_host::<i32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            let s = s_out.take_host::<f32>().await?;
-            generated.push(t as u32);
-            surprises.push(s);
-            mu -= lr * (s - tau);
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    }
+    run_ahead(&pipe, &fwd, max_tokens, async || {
+        let t = tok_out
+            .take_host::<i32>()
+            .await
+            .with_context(|| format!("@{}", generated.len()))?;
+        let s = s_out.take_host::<f32>().await?;
+        generated.push(t as u32);
+        surprises.push(s);
+        mu -= lr * (s - tau);
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipe.close();
 
     let mean_s = if surprises.is_empty() {

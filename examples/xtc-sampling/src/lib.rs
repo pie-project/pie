@@ -195,114 +195,70 @@ async fn main(input: Input) -> Result<Output> {
         temperature: input.temperature,
     };
     let ws = WorkingSet::new();
-
-    if max_tokens == 0 {
-        return Ok(Output {
-            sampler: "xtc",
-            text: String::new(),
-            count: 0,
-            threshold: cfg.threshold,
-            min_p: cfg.min_p,
-            probability: cfg.probability,
-            mean_dropped: 0.0,
-            min_dropped: 0,
-            fire_rate: 0.0,
-        });
-    }
+    let pipe = Pipeline::new();
 
     // The model's opening (`<bos>` where it has one) before the raw text: a
     // gemma without it answers noise.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
-    if prompt.is_empty() {
-        prompt.push(0);
+    let prompt: Vec<i32> = inferlet::chat::prefix()
+        .into_iter()
+        .chain(model::encode(&input.prompt))
+        .map(|t| t as i32)
+        .collect();
+    let (&last, head) = prompt.split_last().ok_or("empty prompt")?;
+    if !head.is_empty() {
+        let fill = ForwardPass::new();
+        fill.embed(
+            &Channel::from(head),
+            &Channel::from([0u32, head.len() as u32]),
+        )?;
+        fill.state(&[&ws], StateGeometry::folding())?;
+        fill.submit(&pipe).context("prefill submit")?;
     }
-    let n = prompt.len() as u32;
+
+    let tok_in = Channel::from([last]);
+    let rng = Channel::from([input.seed, 0]);
+    let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+    let s1_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
+    let s2_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
+
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, &Channel::from([0u32, 1]))?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
+    fwd.epilogue(move || {
+        let r = rng.take();
+        let logits = intrinsics::output(0, "logits");
+        let (token, a, b) = step(logits, vocab, cfg, &r);
+
+        let r_next = &r + iota(2);
+
+        tok_in.put(&token);
+        tok_out.put(&token);
+        s1_out.put(&a);
+        s2_out.put(&b);
+        rng.put(&r_next);
+    });
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut s1: Vec<f32> = Vec::with_capacity(max_tokens);
     let mut s2: Vec<f32> = Vec::with_capacity(max_tokens);
-
-    // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
-    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = Channel::from(prompt_i32);
-    let embed_indptr_p = Channel::from([0u32, n]);
-    let rng_p = Channel::from([input.seed, 0]);
-    let tok_out_p = Channel::new([1], dtype::i32);
-    let s1_out_p = Channel::new([1], dtype::f32);
-    let s2_out_p = Channel::new([1], dtype::f32);
-
-    let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
-    fwd_p.epilogue(move || {
-        let r = rng_p.take();
-        let logits = intrinsics::output(0, "logits");
-        let (token, a, b) = step(logits, vocab, cfg, &r);
-        let r_next = &r + iota(2);
-        tok_out_p.put(&token);
-        s1_out_p.put(&a);
-        s2_out_p.put(&b);
-        rng_p.put(&r_next);
-    });
-
-    let pipe = Pipeline::new();
-    fwd_p.submit(&pipe).context("prefill submit")?;
-
-    let g0 = tok_out_p.take_host::<i32>().await?;
-    let a0 = s1_out_p.take_host::<f32>().await?;
-    let b0 = s2_out_p.take_host::<f32>().await?;
-    generated.push(g0 as u32);
-    s1.push(a0);
-    s2.push(b0);
-
-    // ── DECODE LOOP (1-wide, run-ahead). ──
-    if generated.len() < max_tokens {
-        let tok_in = Channel::from([g0]);
-        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
-        let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-        let s1_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
-        let s2_out = Channel::new([1], dtype::f32).capacity(channel_capacity() as u32);
-        let lane1 = Channel::from([0u32, 1u32]);
-
-        let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, &lane1)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
-        fwd.epilogue(move || {
-            // Takes and compute first, puts last (value-id discipline).
-            let r = rng.take();
-            let logits = intrinsics::output(0, "logits");
-            let (token, a, b) = step(logits, vocab, cfg, &r);
-
-            let r_next = &r + iota(2);
-
-            tok_in.put(&token);
-            tok_out.put(&token);
-            s1_out.put(&a);
-            s2_out.put(&b);
-            rng.put(&r_next);
-        });
-
-        let budget = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget, async || {
-            let t = tok_out
-                .take_host::<i32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            let a = s1_out.take_host::<f32>().await?;
-            let b = s2_out.take_host::<f32>().await?;
-            generated.push(t as u32);
-            s1.push(a);
-            s2.push(b);
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
-    }
+    run_ahead(&pipe, &fwd, max_tokens, async || {
+        let t = tok_out
+            .take_host::<i32>()
+            .await
+            .with_context(|| format!("@{}", generated.len()))?;
+        let a = s1_out.take_host::<f32>().await?;
+        let b = s2_out.take_host::<f32>().await?;
+        generated.push(t as u32);
+        s1.push(a);
+        s2.push(b);
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
     pipe.close();
 
-    let mean_s1 = s1.iter().sum::<f32>() / s1.len() as f32;
-    let mean_s2 = s2.iter().sum::<f32>() / s2.len() as f32;
-    let min_s1 = s1.iter().fold(f32::INFINITY, |a, &b| a.min(b)).max(0.0);
+    let mean_s1 = s1.iter().sum::<f32>() / s1.len().max(1) as f32;
+    let mean_s2 = s2.iter().sum::<f32>() / s2.len().max(1) as f32;
+    let min_s1 = s1.iter().copied().reduce(f32::min).unwrap_or(0.0).max(0.0);
 
     Ok(Output {
         sampler: "xtc",
