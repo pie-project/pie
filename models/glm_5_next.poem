@@ -2,23 +2,18 @@
 # without, and its eight-layer, 32-expert miniature.
 
 load("//pie/codec.poem", "bank", "dequantized", "kept", read_weight = "weight", landed = "land")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/hyper.poem", "hyper", "mix", "gate", "predict_route")
+load("//lib/kda.poem", "kda", "kda_qkv", "kda_conv", "kda_gate", "kda_caches", "run_kda")
 load("//lib/media.poem", "smart_resize")
+load("//lib/mla.poem", "named", "attend", "boundaries")
+load("//lib/reads.poem", "product", "flattened")
 
 GLM = template("glm")
 TOKENIZER = tokenizer(
     markers = [["<|user|>", "<|observation|>", "<|endoftext|>"]],
     parts = {"vision": [["<|begin_of_image|>", "<|image|>", "<|end_of_image|>"]]},
 )
-
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the KDA mixer's packed q, k and v, its convolution, its forget
-# and output gates and its per-head parameters by their heads, the latent
-# attention's q and kv up-projections and gate by theirs, the dense, shared
-# and routed gates and ups by their channels, the output and down
-# projections by their rows, the head by its vocabulary, and the tower's
-# mlp and merger as the trunk's.
-CUTS = "inferred"
 
 MODELS = [
     model(
@@ -68,66 +63,6 @@ DEPLOYMENTS = [
 # attention over the keys a pooling indexer picks) every fourth, three dense
 # layers and then routed experts, the residual stream carried as four
 # hyper-connected streams; an optional vision tower and MTP draft head.
-
-def hyper(streams, norm_eps, gate_eps, alpha, sinkhorn, single_pass = False):
-    """The streams' shape and the constants their gates are computed with;
-    under `single_pass` each sublayer's input mix is the one the previous
-    sublayer predicted."""
-    return struct(
-        streams = streams,
-        norm_eps = norm_eps,
-        gate_eps = gate_eps,
-        alpha = alpha,
-        sinkhorn = sinkhorn,
-        single_pass = single_pass,
-    )
-
-def mix(n, name, streams, hidden, dynamic = True):
-    """A sublayer's mix `name` over `streams` streams `hidden` wide: a
-    static `base` and `scale`, and with `dynamic` a projection of the
-    normed streams added to it."""
-    width = 2 * streams + streams * streams
-    return struct(
-        scale = weight([3], dtype.f32),
-        base = weight([width], dtype.f32),
-        dynamic = weight([width, streams * hidden], dtype.f32) if dynamic else None,
-    )
-
-def kda(n, l, k, hidden, weights, conv, eps, gate_floor, gate_rank = None, **extra):
-    """The KDA mixer of layer `l` named by `n`, its projections in `weights`
-    and its convolution bank in `conv`. Its output gate is one projection,
-    or a pair through `gate_rank`. `extra` rides along."""
-    width = k.heads * k.head_dim
-    if gate_rank == None:
-        gate = [weight([width, hidden], weights)]
-    else:
-        gate = [
-            weight([gate_rank, hidden], weights),
-            weight([width, gate_rank], weights),
-        ]
-    return struct(
-        heads = k.heads,
-        head_dim = k.head_dim,
-        conv_kernel = k.conv_kernel,
-        norm_eps = eps,
-        gate_floor = gate_floor,
-        q = weight([width, hidden], weights),
-        k = weight([width, hidden], weights),
-        v = weight([width, hidden], weights),
-        conv = weight([3 * width, k.conv_kernel], conv),
-        f_a = weight([k.f_rank, hidden], weights),
-        f_b = weight([width, k.f_rank], weights),
-        gate = gate,
-        b = weight([k.heads, hidden], weights),
-        dt_bias = weight([k.heads, k.head_dim], dtype.f32),
-        a_log = weight([k.heads], dtype.f32),
-        o_norm = weight([k.head_dim], dtype.f32),
-        o_norm_eps = eps,
-        o_proj = weight([hidden, width], weights),
-        conv_state = "conv.{}".format(l),
-        delta_state = "delta.{}".format(l),
-        **extra
-    )
 
 def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False, side = None, **extra):
     """The latent attention named by `n`, its projections in `weights` (its
@@ -294,7 +229,7 @@ def layout(id, deploy):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, width: weight([width])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         if (l + 1) % d.full_attn_every == 0:
             mixer = mla_at("layer.{}".format(l), "kv.{}".format(l), "index.{}".format(l))
             mixer_kind = "mla"
@@ -445,63 +380,6 @@ def tower(d):
 # tower overlaid under `aux.` (`pie model import --aux`).
 
 BF = raw(dtype.bf16)
-
-def product(xs):
-    out = 1
-    for x in xs:
-        out *= x
-    return out
-
-def flattened(name, want, broadcast = False):
-    """The tensor `name` as stored, its elements read as `want`; with
-    `broadcast`, a single stored value is read as any shape."""
-    held = shape(name)
-    if (not broadcast or product(held) > 1) and product(held) != product(want):
-        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
-            name, held, product(held), want, product(want)))
-    return src(name).transmute(want, stored(name))
-
-def squeezed(name):
-    """A depthwise convolution bank stored `[channels, 1, kernel]` or
-    `[channels, kernel, 1]`, read as `[channels, kernel]`."""
-    held = shape(name)
-    if len(held) == 3 and held[1] == 1:
-        channels, kernel = held[0], held[2]
-    elif len(held) == 3 and held[2] == 1:
-        channels, kernel = held[0], held[1]
-    else:
-        fail("`{}`: a depthwise convolution bank is stored [channels, 1, kernel] or [channels, kernel, 1] and this one is stored {}".format(name, held))
-    return src(name).transmute([channels, kernel], stored(name))
-
-def kda_qkv(at):
-    """The names of the q, k and v projections."""
-    return [at("self_attn.{}_proj.weight".format(p)) for p in ["q", "k", "v"]]
-
-def kda_conv(k, at):
-    """The packed `conv` bank, read from the q, k and v banks."""
-    return concat(k.conv.cut_axis, [squeezed(at("self_attn.{}_conv1d.weight".format(p))) for p in ["q", "k", "v"]])
-
-def kda_gate(k, at):
-    """The output gate's projections, each beside its name."""
-    if len(k.gate) == 1:
-        return [(k.gate[0], at("self_attn.g_proj.weight"))]
-    return [(k.gate[0], at("self_attn.g_a_proj.weight")), (k.gate[1], at("self_attn.g_b_proj.weight"))]
-
-def named(a, at):
-    """`a`'s weights, each beside the name `at` gives its transformers leaf,
-    in the order a checkpoint lists them."""
-    out = [
-        (a.q_a_proj, at("self_attn.q_a_proj.weight")),
-        (a.q_a_norm, at("self_attn.q_a_layernorm.weight")),
-        (a.q_b_proj, at("self_attn.q_b_proj.weight")),
-        (a.kv_a_proj, at("self_attn.kv_a_proj_with_mqa.weight")),
-        (a.kv_a_norm, at("self_attn.kv_a_layernorm.weight")),
-        (a.kv_b_proj, at("self_attn.kv_b_proj.weight")),
-    ]
-    if a.gate != None:
-        out.append((a.gate, at("self_attn.g_proj.weight")))
-    out.append((a.o_proj, at("self_attn.o_proj.weight")))
-    return out
 
 HEAD = "model.language_model.layers.45."
 VISUAL = "model.visual."
@@ -733,32 +611,6 @@ def read_kda(reads, own, n, k, hf = False):
 # vision tower's patches scattered into the embedded rows; and the MTP head
 # drafting from the trunk's last hidden rows.
 
-# How many experts the next layer's router is predicted to take.
-PREDICT_K = 16
-
-def mixes(normed, mix, hy):
-    """`mix`'s per-row mixes of the `normed` streams: its dynamic
-    projection, or with none the leading rows of the streams."""
-    if mix.dynamic != None:
-        return ops.elemwise.hc_project(normed, mix.dynamic, hy.streams)
-    head, _ = ops.gather.split_rows(normed, mix.base.shape[0])
-    return head
-
-def gate(streams, mix, hy):
-    """The sublayer input `mix` reads out of `streams`, and the post and
-    combine mixes its output is folded back with."""
-    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
-    return ops.elemwise.hc_gates(
-        mixes(normed, mix, hy),
-        streams,
-        mix.scale,
-        mix.base,
-        hy.streams,
-        hy.gate_eps,
-        hy.alpha,
-        hy.sinkhorn,
-    )
-
 def summed(streams, hidden, count):
     """The mean of the `count` streams, each `hidden` wide: the unweighted
     collapse the head reads (a sum would read the final norm's epsilon a
@@ -768,61 +620,6 @@ def summed(streams, hidden, count):
         stream, rest = ops.gather.split_rows(rest, hidden)
         y = ops.elemwise.residual_add(stream, y)
     return ops.elemwise.residual_add(rest, y) * f32(1.0 / count)
-
-def predict_route(streams, hy, mix, norm, norm_eps, router, bias, experts):
-    """The experts a following MLP's router is predicted to take: the
-    streams through its `mix` and `norm`, scored by its `router`."""
-    x, _, _ = gate(streams, mix, hy)
-    x = ops.elemwise.rmsnorm(x, norm, norm_eps)
-    logits = ops.linear.matmul(x, router)
-    return ops.linear.moe_route(logits, experts, PREDICT_K, routing.predict(), bias = bias)[0]
-
-def kda_caches(c, k):
-    """`k`'s convolution window and its f32 delta-rule state."""
-    width = k.heads * k.head_dim
-    c.state(k.conv_state, [k.conv_kernel, 3 * width], dtype.bf16, split = 1)
-    c.state(k.delta_state, [k.heads, k.head_dim, k.head_dim], dtype.f32, split = 0)
-
-def run_kda(x, inputs, k):
-    conv = inputs.state(k.conv_state)
-    delta = inputs.state(k.delta_state)
-    # The short convolution and the recurrence read q, k and v side by side.
-    qkv = ops.gather.concat_cols([ops.linear.matmul(x, k.q), ops.linear.matmul(x, k.k), ops.linear.matmul(x, k.v)])
-    f = ops.linear.matmul(ops.linear.matmul(x, k.f_a), k.f_b)
-    b = ops.linear.matmul(x, k.b)
-
-    one = fact.single_token()
-    step = ops.ssm.kda(
-        ops.ssm.causal_conv1d(qkv.on(one), k.conv, conv, k.conv_kernel),
-        f.on(one),
-        b.on(one),
-        k.dt_bias,
-        k.a_log,
-        delta,
-        k.heads,
-        k.head_dim,
-        k.norm_eps,
-        k.gate_floor,
-    )
-    chunked = ops.ssm.kda_chunked(
-        ops.ssm.causal_conv1d_chunked(qkv.on(~one), k.conv, conv, k.conv_kernel),
-        f.on(~one),
-        b.on(~one),
-        k.dt_bias,
-        k.a_log,
-        delta,
-        k.heads,
-        k.head_dim,
-        k.norm_eps,
-        k.gate_floor,
-    )
-    core = merge([step, chunked])
-
-    g = x
-    for proj in k.gate:
-        g = ops.linear.matmul(g, proj)
-    o = ops.elemwise.rmsnorm_gated_by(core, g, k.o_norm, k.heads, k.o_norm_eps)
-    return ops.linear.matmul(o, k.o_proj)
 
 def cache(c, space, a, fp8):
     """`a`'s latent rows in the kv `space`: an e4m3 kv deployment's as vLLM's
@@ -874,31 +671,6 @@ def run_attention(x, inputs, a, positions = None, select = None, prefill_only = 
         )
     return attend(x, inputs, q_nope, q_pe, a, selection, prefill_only)
 
-def attend(x, inputs, q_nope, q_pe, a, selection = None, prefill_only = False):
-    """The split queries `q_nope`/`q_pe` of the rows `x` scored against the
-    latent kv (or the `selection` of it), through `a`'s output projection;
-    with `prefill_only` every lane through the prefill arm, as the draft
-    head's rows are."""
-    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
-                                 selection = selection, prefill_only = prefill_only)
-
-    o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    if a.gate != None:
-        o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
-    return ops.linear.matmul(o, a.o_proj)
-
-def boundaries(positions, row_valid, ratio, split = True):
-    """Where the rows close entries of a key pool that compresses `ratio`
-    rows into one: each boundary's position, request and rope position.
-    With `split` the decode and prefill arms find theirs apart."""
-    if not split:
-        return ops.attn.pool_boundary(positions, row_valid, ratio, decode = False)
-    one = fact.single_token()
-    dpos, dreq, drope = ops.attn.pool_boundary(positions.on(one), row_valid, ratio, decode = True)
-    ppos, preq, prope = ops.attn.pool_boundary(positions.on(~one), row_valid, ratio, decode = False)
-    return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])
-
 def caches(m, c):
     fp8 = m.kv == dtype.e4m3
     kv = c.kv_space(dtype.u8 if fp8 else m.kv)
@@ -935,8 +707,7 @@ def forward(m, inputs):
             o = mla_mixer(x, inputs, positions, m.act, w.mixer)
         else:
             o = run_kda(x, inputs, w.mixer)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(x, o, w, routes)
         streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
 
         x, post_mix, comb_mix = gate(streams, w.mlp_mix, hy)

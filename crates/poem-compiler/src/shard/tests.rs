@@ -57,20 +57,13 @@ fn a_split_row_reduces_each_projection_once() {
     assert_eq!(trace.nodes.len(), whole.nodes.len() + 48 + 2 + scores);
 }
 
-/// A package that leaves its cuts to the compiler splits as Megatron does:
+/// A package's inferred cuts split as Megatron does:
 /// each layer's attention and MLP reduced once, after their row-cut
 /// projections, and the vocab-split head gathered once.
 #[test]
 fn an_inferred_package_reduces_each_projection_once() {
     let deployment = crate::catalog::deployment("llama31-8b-bf16-kv-bf16-tp2")
         .expect("the catalog ships the row");
-    assert!(
-        deployment
-            .package
-            .infers_cuts()
-            .expect("a package that says"),
-        "llama 3 leaves its cuts to the compiler"
-    );
     let trace = deployment.trace(Platform::Cuda);
     let count = |op: &str| {
         trace

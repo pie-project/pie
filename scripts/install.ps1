@@ -1,7 +1,7 @@
 # pie installer - served at https://pie-project.org/install.ps1
 #
 #   irm https://pie-project.org/install.ps1 | iex
-#   $env:PIE_VERSION = "0.5.2"; irm https://pie-project.org/install.ps1 | iex
+#   $env:PIE_VERSION = "0.6.0"; irm https://pie-project.org/install.ps1 | iex
 #
 # Environment overrides:
 #   PIE_VERSION       Release tag (default: the latest release).

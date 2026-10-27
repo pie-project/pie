@@ -465,7 +465,7 @@ pub fn matmul(
 }
 
 /// Where a producer lands `rows x k` of DeepSeek's fp8 1x128 activations
-/// itself (`e4m3_block_store` in act_quant.cuh, row `o` at row `o`,
+/// itself (`E4m3Block::store` in act_quant.cuh, row `o` at row `o`,
 /// `m_max` 0) for [`matmul_held`]: the codes and their atoms, apart from
 /// the quantizer's own planes so a quantize between the producer and its
 /// consumer leaves them be. The atoms are zeroed when fresh, and every

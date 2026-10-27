@@ -312,7 +312,7 @@ impl Region {
                         || size == 0
                         || size % 8 != 0
                         || !(size / 8).is_power_of_two()
-                        || self.width % size != 0
+                        || !self.width.is_multiple_of(size)
                     {
                         return Err(mistyped);
                     }

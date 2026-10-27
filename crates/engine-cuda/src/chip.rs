@@ -447,7 +447,7 @@ mod tests {
             (8, 6, "NVIDIA A10"),
             (8, 7, "Orin"),
             (8, 9, "NVIDIA L4"),
-            (9, 0, "NVIDIA H100 80GB HBM3"),
+            (9, 0, "NVIDIA H800"),
             (10, 0, "NVIDIA GB200"),
             (10, 3, "NVIDIA B300"),
             (11, 0, "NVIDIA Thor"),
@@ -511,7 +511,6 @@ mod tests {
                 assert_eq!(tuning.hc_tile, b200, "{gpu}");
                 assert_eq!(tuning.ssm_conv_vec4, b200, "{gpu}");
                 assert_eq!(tuning.ssm_gdn_out_bf16, b200, "{gpu}");
-                assert_eq!(tuning.qg_prologue_until, if b200 { 64 } else { 0 }, "{gpu}");
                 assert_eq!(tuning.merge_warp, b200, "{gpu}");
                 assert_eq!(tuning.decode_gqa, b200, "{gpu}");
                 assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
@@ -586,7 +585,6 @@ mod tests {
                         hc_mega_until: 0,
                         ssm_conv_vec4: false,
                         ssm_gdn_out_bf16: false,
-                        qg_prologue_until: 0,
                         compressed_decode_until: 0,
                         merge_warp: false,
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
@@ -656,7 +654,6 @@ mod tests {
                         rows_vec: false,
                         hc_tile: false,
                         hc_mma: false,
-                        qg_prologue_until: 0,
                         merge_warp: false,
                         pool_mma: false,
                         compressed_decode_until: 0,
@@ -749,7 +746,7 @@ mod tests {
                 prefill_lattice_steps: 4,
             }
         );
-        // The compiler's prices as before, but that CUDA folds each chain
+        // The compiler's prices, but that CUDA folds each chain
         // into a generated row kernel and each product's epilogue into its
         // contraction skeleton: its rules hold no residual norm, bias or soft
         // cap.
@@ -1026,7 +1023,7 @@ mod tests {
             ]
         );
         assert!(!report.untuned());
-        let (rtx, report) = resolve("NVIDIA GeForce RTX 4090", &facts(8, 9, 128), None);
+        let (rtx, report) = resolve("NVIDIA RTX 6000 Ada Generation", &facts(8, 9, 142), None);
         assert_eq!(report.used, profile::Source::Seeded("sm89.toml".into()));
         assert!(report.untuned());
         for p in [&l40s, &rtx] {

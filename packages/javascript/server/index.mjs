@@ -1,7 +1,7 @@
 // `@pie-project/server`: what `pie serve` boots, inside a Node process.
 //
 //   import { Server } from '@pie-project/server';
-//   const server = await Server.start({ server: { port: 0 }, model: { model: 'Qwen/Qwen3.5-0.8B' } });
+//   const server = await Server.start({ server: { listen: '127.0.0.1:0' }, model: { source: 'Qwen/Qwen3.5-0.8B' } });
 //   const client = await server.connect();
 //   ...
 //   await server.shutdown();

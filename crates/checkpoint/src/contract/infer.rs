@@ -319,6 +319,10 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
                 let mut any_sharded = false;
                 for part in parts {
                     any_sharded |= part.is_sharded();
+                    // A leg that reads nothing pads the axis; it is no leg of its own.
+                    if part.sources().is_empty() && part.outputs().is_empty() {
+                        continue;
+                    }
                     let p_ty = infer(part, scope)?;
                     let idx = axis_index(*axis, p_ty.rank(), &scope.what)?;
                     part_extents.push(p_ty.shape[idx]);

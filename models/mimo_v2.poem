@@ -1,16 +1,10 @@
 # MiMo-V2.6: Flash (311B) and Pro (1.02T), each with an eight-expert
 # miniature; and Flash's first six layers with every expert kept.
 
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 
 MIMO = template("mimo")
 TOKENIZER = tokenizer(markers = [["<|im_end|>", "<|endoftext|>", "<think>", "</think>"]])
-
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the packed q, k and v (laid out padded or as stored) and the sinks
-# by their heads, the dense and routed gates and ups by their channels, the
-# output and down projections by their rows, the head by its vocabulary.
-CUTS = "inferred"
 
 def mimo(id, layers, **kwargs):
     return model(id, template = MIMO, tokenizer = TOKENIZER, arch = "mimo_v2", layers = layers, vocab = 152576, **kwargs)
@@ -75,7 +69,7 @@ def dims(hidden, layers, full, dense, q_heads, full_kv_heads, window_kv_heads, e
         window = 128,
         value_scale = value_scale,
         experts = experts,
-        top_k = 8,
+        top_k = min(8, experts),
         inter = 2048,
         dense_inter = 16384,
         vocab = 152576,
@@ -106,6 +100,10 @@ def layout(id, deploy):
     if deploy.drafter != None:
         fail("{} drafts with nothing, not {}".format(id, deploy.drafter))
     d = DIMS[id]
+    if deploy.layers or deploy.experts:
+        whole = DIMS[id.replace("-mini", "").replace("-l6", "")]
+        full = [l for l in whole.full if l < deploy.layers] if deploy.layers else d.full
+        d = dims(d.hidden, deploy.layers or d.layers, full, d.dense, d.q_heads, d.full_kv_heads, d.window_kv_heads, deploy.experts or d.experts, d.norm_eps, d.value_scale, d.shards)
     if PADDED != 2 * d.v_head_dim:
         fail("the output projection reads a padded head's first half, its values")
     r = roles(deploy, "weights", "experts", exact = True)
@@ -124,7 +122,7 @@ def layout(id, deploy):
         kv_w = kv_heads * PADDED
         q_qk = d.q_heads * d.qk_head_dim
         kv_kv = kv_heads * (d.qk_head_dim + d.v_head_dim)
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         if l in d.dense:
             di = d.dense_inter
             mlp = struct(
@@ -143,7 +141,8 @@ def layout(id, deploy):
                 inter = iw,
                 router = weight([d.experts, hidden]),
                 bias = weight([d.experts], dtype.f32),
-                gate_up = weight([d.experts, 2 * iw, hidden], experts),
+                gate = weight([d.experts, iw, hidden], experts),
+                up = weight([d.experts, iw, hidden], experts),
                 down = weight([d.experts, hidden, iw], experts),
             )
         return struct(
@@ -275,11 +274,8 @@ def huggingface(m, reads):
         reads.read(f.router, n("mlp.gate.weight"))
         reads.read(f.bias, n("mlp.gate.e_score_correction_bias"))
         expert = lambda e, leg: n("mlp.experts.{}.{}_proj".format(e, leg))
-        gate_up = []
-        for e in range(f.experts):
-            gate_up += [expert(e, "gate"), expert(e, "up")]
-        packed_bank(reads, f.gate_up, gate_up)
-        packed_bank(reads, f.down, [expert(e, "down") for e in range(f.experts)])
+        for w, leg in [(f.gate, "gate"), (f.up, "up"), (f.down, "down")]:
+            packed_bank(reads, w, [expert(e, leg) for e in range(f.experts)])
 
 def readable(reads, w, name, rows = None, chunks = 0):
     """The tensor `name` (its `rows` = (start, count), if given) at `w`'s
@@ -342,27 +338,17 @@ def packed_bank(reads, w, stems):
     `*.weight_scale`, stacked on the leading axis and read as the bank's
     `[experts, ...]` rectangle."""
     rows, cols = w.shape[1], w.shape[2]
-    legs = len(stems)
-    per_leg = rows * w.shape[0] // legs
     codes = []
     scales = []
     for stem in stems:
         if stored(stem + ".weight") != raw(dtype.u8) or not has(stem + ".weight_scale"):
             fail("`{}`: `{}.weight` is read as MXFP4 codes beside their `{}.weight_scale` exponents".format(w.name, stem, stem))
-        codes.append(src(stem + ".weight").transmute([1, per_leg, cols], encoding(dtype.mxfp4)))
-        scales.append(src(stem + ".weight_scale").transmute([1, per_leg, cols // 32], encoding(dtype.e8m0)))
+        codes.append(src(stem + ".weight").transmute([1, rows, cols], encoding(dtype.mxfp4)))
+        scales.append(src(stem + ".weight_scale").transmute([1, rows, cols // 32], encoding(dtype.e8m0)))
     counted = scales_shape(w)
-    codes = concat(0, codes)
-    scales = concat(0, scales)
-
-    # Two legs per expert (gate, up) stack to `[2E, inter, cols]`, which is
-    # the declared `[E, 2*inter, cols]` rectangle byte for byte.
-    if [legs, per_leg, cols] != list(w.shape):
-        codes = codes.transmute(w.shape, encoding(dtype.mxfp4))
-        scales = scales.transmute(counted, encoding(dtype.e8m0))
     reads.extend([
-        tensor(w.name, codes, encoding(dtype.mxfp4)),
-        tensor(scales_name(w.name), scales, encoding(dtype.e8m0), shape = counted, scaling = w),
+        tensor(w.name, concat(0, codes), encoding(dtype.mxfp4)),
+        tensor(scales_name(w.name), concat(0, scales), encoding(dtype.e8m0), shape = counted, scaling = w),
     ])
 
 # The forward of MiMo-V2.6: attention over heads stored 256 wide, the first 64
@@ -403,17 +389,13 @@ def forward(m, inputs):
         # Each lane by its kind; a layer with sinks folds them in, one
         # without reads its scores out.
         a = ops.attn.attend(q, inputs, at.kv, m.q_heads, kv_heads, d, m.sm_scale, window = win,
-                            sinks = at.sinks, mask = True)
-        if at.sinks == None:
-            scores = ops.attn.score_capture(q, inputs, at.kv, m.q_heads, kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
-            output("attn.scores", scores)
+                            sinks = at.sinks, mask = True, scores = at.sinks == None)
 
         # Each head's values are its first half; the padding after them is
         # cut off before the output projection reads them.
         a, _ = ops.gather.split_q_gate(a, m.v_head_dim)
         o = ops.linear.matmul(a, at.o_proj)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(x, o, w, routes)
         y = ops.elemwise.residual_add(o, y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, w.mlp_norm_eps)
@@ -437,6 +419,6 @@ def mlp(x, f):
         routing.sigmoid(renormalize = True, scaling = 1.0),
         bias = f.bias,
     )
-    packed = ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k)
-    act = ops.linear.glu(packed, gating.swiglu(), f.inter)
+    gate = ops.linear.moe_matmul_select(x, f.gate, routes, f.top_k)
+    act = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, f.up, routes, f.top_k))
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)

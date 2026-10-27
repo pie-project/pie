@@ -1,17 +1,11 @@
 # gpt-oss 20B (with a DFlash drafter or without), its five-layer,
 # sixteen-expert miniature, and 120B.
 
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches", dflash_declare = "declare", dflash_head = "head")
 
 HARMONY = template("harmony")
 TOKENIZER = tokenizer(markers = [["<|endoftext|>", "<|return|>", "<|call|>"]])
-
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k, v, their biases and the sinks by their heads, each expert's
-# gate and up and their biases by its channels, the output and down
-# projections by their rows, the head by its vocabulary.
-CUTS = "inferred"
 
 MODELS = [
     model("gptoss-20b", template = HARMONY, tokenizer = TOKENIZER, drafters = ["dflash"], arch = "gptoss", layers = 24, vocab = 201088),
@@ -115,7 +109,7 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s, cols: weight([cols])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         return struct(
             attn = struct(
                 reading = WINDOWED if l % 2 == 0 else FULL,
@@ -380,14 +374,10 @@ def forward(m, inputs):
         # Each lane by its kind, the sinks folded in; a full layer's scores
         # are read out.
         a = ops.attn.attend(q, trunk_inputs, at.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win,
-                            sinks = at.sinks, mask = True)
-        if r == FULL:
-            scores = ops.attn.score_capture(q, trunk_inputs, at.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
-            output("attn.scores", scores)
+                            sinks = at.sinks, mask = True, scores = r == FULL)
 
         o = ops.elemwise.add_bias(at.o_bias, ops.linear.matmul(a, at.o_proj))
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(x, o, w, routes)
         y = ops.elemwise.residual_add(o, y)
 
         e = w.mlp

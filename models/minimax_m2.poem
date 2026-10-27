@@ -8,6 +8,7 @@
 # context their configuration does.
 
 load("//pie/codec.poem", "kept", "mapped")
+load("//lib/blocks.poem", "attention")
 
 def spoken(name):
     return template("minimax2", identity = "You are a helpful assistant. Your name is {} and is built by MiniMax.".format(name))
@@ -42,17 +43,10 @@ def rows(id):
 
 DEPLOYMENTS = rows("minimax-m25") + rows("minimax-m27") + rows("minimax-m25-mini")
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k and v by their heads, the norms of q and k with them (each
-# rank's sum of squares summed across the ranks), the routed gates and ups
-# by their channels, the output and down projections by their rows, and the
-# head by its vocabulary.
-CUTS = "inferred"
-
 # The weights of MiniMax-M2: per layer an RMS norm, the q, k and v
 # projections, q's and k's norms across all their heads, the output
 # projection, an RMS norm, the router, its score bias and the routed experts'
-# banks (gate and up packed); the token embedding, a final norm and the head.
+# gate, up and down banks; the token embedding, a final norm and the head.
 # The deployment's first dtype stores the attention's projections, its second
 # (or the first) the expert banks; the norms, router, embedding and head stay
 # bf16.
@@ -101,7 +95,8 @@ def layout(id, deploy):
             mlp_norm = weight([hidden]),
             router = weight([d.experts, hidden]),
             bias = weight([d.experts], dtype.f32),
-            gate_up = weight([d.experts, 2 * d.inter, hidden], experts),
+            gate = weight([d.experts, d.inter, hidden], experts),
+            up = weight([d.experts, d.inter, hidden], experts),
             down = weight([d.experts, hidden, d.inter], experts),
             kv = "kv.{}".format(l),
         )
@@ -173,17 +168,15 @@ TRANSFORMERS = [
     ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
     ("model.layers.{l}.block_sparse_moe.gate.weight", "layers.{l}.router"),
     ("model.layers.{l}.block_sparse_moe.e_score_correction_bias", "layers.{l}.bias"),
-    ([
-        "model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight",
-        "model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight",
-    ], "layers.{l}.gate_up"),
+    ("model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight", "layers.{l}.gate"),
+    ("model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight", "layers.{l}.up"),
     ("model.layers.{l}.block_sparse_moe.experts.{e}.w2.weight", "layers.{l}.down"),
 ]
 
 def read(m, reads):
     for w in m.layers:
-        if not kept(w.gate_up):
-            fail("`{}`: MiniMax-M2 is released FP8 and exported NVFP4; this deployment reads its experts as {}".format(w.gate_up.name, w.gate_up.dtype))
+        if not kept(w.gate):
+            fail("`{}`: MiniMax-M2 is released FP8 and exported NVFP4; this deployment reads its experts as {}".format(w.gate.name, w.gate.dtype))
     mapped(reads, m, TRANSFORMERS)
 
 # The forward of MiniMax-M2: pre-norm layers of grouped-query attention, q
@@ -202,7 +195,8 @@ def forward(m, inputs):
 
     def block(l, w, y):
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        y = ops.elemwise.residual_add(attention(x, inputs, m, positions, w), y)
+        o = attention(x, inputs, m, w, positions, rotary_dim = m.rotary_dim, qk_norm = "width")
+        y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
         return ops.elemwise.residual_add(moe(x, m, w), y)
 
@@ -220,21 +214,6 @@ def moe(x, m, w):
         bias = w.bias,
     )
 
-    act = ops.linear.glu(ops.linear.moe_matmul_select(x, w.gate_up, routes, m.top_k), gating.swiglu(), m.inter)
+    gate = ops.linear.moe_matmul_select(x, w.gate, routes, m.top_k)
+    act = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, w.up, routes, m.top_k))
     return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, w.down, routes, m.top_k), weights)
-
-def attention(x, inputs, m, positions, w):
-    pages = inputs.kv(w.kv)
-    d = m.head_dim
-    q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
-    q = ops.elemwise.rmsnorm(q, w.q_norm, m.eps)
-    k = ops.elemwise.rmsnorm(k, w.k_norm, m.eps)
-    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.partial(m.rotary_dim), k = k)
-    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
-
-    # Each lane by its kind; a lane may bring its own mask. A lane capturing
-    # scores reads them out too.
-    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True)
-    scores = ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
-    output("attn.scores", scores)
-    return ops.linear.matmul(o, w.o)

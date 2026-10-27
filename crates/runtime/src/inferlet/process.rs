@@ -728,6 +728,7 @@ impl Process {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         process_id: ProcessId,
         username: String,

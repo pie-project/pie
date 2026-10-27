@@ -552,22 +552,93 @@ struct DiskKv {
 /// moves in one copy; the host rs rows follow them.
 #[derive(Debug)]
 struct HostKv {
-    buffer: crate::device::Pinned,
-    pages: u32,
-    window_pages: u32,
-    rows: u32,
-    row_bytes: u64,
+    paged: Shelf,
+    windowed: Shelf,
+    rows: Shelf,
+}
+
+/// The bytes a host shelf pins at a time.
+const SHELF_CHUNK: u64 = 256 << 20;
+
+/// One kind of host slot, pinned a chunk of slots at a time as a copy first
+/// touches it. A chunk lays its slots out plane by plane, so a run of slots
+/// within one chunk is one span a plane.
+#[derive(Debug, Default)]
+struct Shelf {
+    planes: Vec<u64>,
+    slots: u32,
+    per_chunk: u32,
+    chunks: Vec<Option<crate::device::Pinned>>,
+}
+
+impl Shelf {
+    fn new(planes: Vec<u64>, slots: u32) -> Shelf {
+        let slot: u64 = planes.iter().sum();
+        let per_chunk = (SHELF_CHUNK / slot.max(1)).clamp(1, u64::from(slots.max(1)));
+        let per_chunk = u32::try_from(per_chunk).unwrap_or(u32::MAX);
+        Shelf {
+            planes,
+            slots,
+            per_chunk,
+            chunks: (0..slots.div_ceil(per_chunk)).map(|_| None).collect(),
+        }
+    }
+
+    fn same_chunk(&self, a: u32, b: u32) -> bool {
+        a / self.per_chunk == b / self.per_chunk
+    }
+
+    /// Pins the chunks that hold `slots`.
+    fn back(&mut self, slots: impl IntoIterator<Item = u32>, what: &'static str) -> Result<()> {
+        let slot_bytes: u64 = self.planes.iter().sum();
+        for slot in slots {
+            if slot >= self.slots {
+                return Err(Fault::Ceiling {
+                    what,
+                    need: u64::from(slot) + 1,
+                    have: u64::from(self.slots),
+                });
+            }
+            let chunk = slot / self.per_chunk;
+            if self.chunks[chunk as usize].is_none() {
+                let held = (self.slots - chunk * self.per_chunk).min(self.per_chunk);
+                let bytes = usize::try_from(u64::from(held) * slot_bytes).unwrap_or(usize::MAX);
+                let pinned = huge_tier(bytes)
+                    .map_or_else(|| crate::device::Pinned::mapped_uninit(bytes), Ok)?;
+                self.chunks[chunk as usize] = Some(pinned);
+            }
+        }
+        Ok(())
+    }
+
+    /// The pinned chunk holding `slot`, and where its `plane` starts in it;
+    /// `None` until [`Self::back`] pins it.
+    fn place(&self, slot: u32, plane: usize) -> Option<(&crate::device::Pinned, u64)> {
+        let chunk = slot / self.per_chunk;
+        let pinned = self.chunks.get(chunk as usize)?.as_ref()?;
+        let held = (self.slots - chunk * self.per_chunk).min(self.per_chunk);
+        let before: u64 = self.planes[..plane].iter().sum();
+        Some((
+            pinned,
+            before * u64::from(held) + u64::from(slot % self.per_chunk) * self.planes[plane],
+        ))
+    }
+
+    fn at(&self, slot: u32, plane: usize) -> Result<u64> {
+        self.place(slot, plane)
+            .map(|(pinned, offset)| pinned.host() as u64 + offset)
+            .ok_or(Fault::Ceiling {
+                what: "pinned host slots",
+                need: u64::from(slot) + 1,
+                have: 0,
+            })
+    }
 }
 
 /// `bytes` pinned on reserved huge pages, where the host's pool holds them.
 #[cfg(target_os = "linux")]
 fn huge_tier(bytes: usize) -> Option<crate::device::Pinned> {
-    let pinned = crate::device::Pinning::huge(bytes)?.lock().ok()?;
-    eprintln!(
-        "engine-cuda: the host kv tier ({} MiB) is pinned on reserved huge pages",
-        bytes >> 20
-    );
-    Some(pinned)
+    crate::device::Pinning::huge(bytes)?.lock().ok()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1060,15 +1131,18 @@ impl Pools {
         let seats = u64::from(self.paging.slots);
         if fit / one < seats && fresh && self.has_state() && self.budget.is_none() {
             let one_sequence = self.declared_reshaped(one_slot, 0);
-            let floor = state_slots_within(self.paging.slots, room, one_sequence, |slots| {
+            // What the fires were asked and the uncut slab left no room to
+            // hold is held after the cut, so the slots leave it too.
+            let cut = room.saturating_sub(asked_programs.saturating_sub(programs));
+            let floor = state_slots_within(self.paging.slots, cut, one_sequence, |slots| {
                 self.declared_reshaped(0, slots)
             });
             let slots = balanced_state_slots(self.paging.slots, floor, one_slot, |slots| {
-                pages_within(self.ceiling, room, |pages| {
+                pages_within(self.ceiling, cut, |pages| {
                     self.declared_reshaped(pages, slots)
                 })
             });
-            let pages = pages_within(self.ceiling, room, |pages| {
+            let pages = pages_within(self.ceiling, cut, |pages| {
                 self.declared_reshaped(pages, slots)
             });
             if pages >= one_slot && slots < self.paging.slots {
@@ -1690,13 +1764,14 @@ impl Pools {
         self.paged_planes().iter().map(|&(_, bytes)| bytes).sum()
     }
 
-    /// Pins `pages` host kv pages, `window_pages` host windowed pages and
-    /// `rows` host rs rows of `row_bytes`, in that order: on reserved huge
-    /// pages where the host keeps a pool that holds them. The tier is most
-    /// of what a worker pins, and when a process dies the driver unpins its
-    /// memory under a lock every process on the host waits on for any
-    /// allocation, about 0.17 s a GiB of 4 KiB pages and a fifth of that of
-    /// huge ones.
+    /// Seats `pages` host kv pages, `window_pages` host windowed pages and
+    /// `rows` host rs rows of `row_bytes`, each pinned a chunk at a time as a
+    /// copy first touches it ([`Shelf`]), on reserved huge pages where the
+    /// host keeps a pool that holds them. Pinning at once would hold boot for
+    /// as long as the driver takes to pin it all, and when a process dies the
+    /// driver unpins its memory under a lock every process on the host waits
+    /// on for any allocation, about 0.17 s a GiB of 4 KiB pages and a fifth
+    /// of that of huge ones.
     pub fn seat_host(
         &mut self,
         pages: u32,
@@ -1705,29 +1780,19 @@ impl Pools {
         row_bytes: u64,
     ) -> Result<()> {
         let rows = if row_bytes == 0 { 0 } else { rows };
-        let bytes = u64::from(pages) * self.paged_page_bytes()
-            + u64::from(window_pages) * self.window_page_bytes()
-            + u64::from(rows) * row_bytes;
-        self.host = (bytes > 0)
-            .then(|| {
-                let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
-                huge_tier(bytes)
-                    .map_or_else(|| crate::device::Pinned::mapped_uninit(bytes), Ok)
-                    .map(|buffer| HostKv {
-                        buffer,
-                        pages,
-                        window_pages,
-                        rows,
-                        row_bytes,
-                    })
-            })
-            .transpose()?;
+        let planes = |planes: Vec<(&Arena, u64)>| planes.into_iter().map(|(_, b)| b).collect();
+        let host = HostKv {
+            paged: Shelf::new(planes(self.paged_planes()), pages),
+            windowed: Shelf::new(planes(self.windowed_planes()), window_pages),
+            rows: Shelf::new(vec![row_bytes], rows),
+        };
+        self.host = (pages > 0 || window_pages > 0 || rows > 0).then_some(host);
         Ok(())
     }
 
     #[must_use]
     pub fn host_window_pages(&self) -> u32 {
-        self.host.as_ref().map_or(0, |host| host.window_pages)
+        self.host.as_ref().map_or(0, |host| host.windowed.slots)
     }
 
     /// The host rs rows seated and the bytes of one.
@@ -1735,28 +1800,25 @@ impl Pools {
     pub fn host_rows(&self) -> (u32, u64) {
         self.host
             .as_ref()
-            .map_or((0, 0), |host| (host.rows, host.row_bytes))
+            .map_or((0, 0), |host| (host.rows.slots, host.rows.planes[0]))
     }
 
     /// The host address of rs row `row`.
-    pub fn host_row(&self, row: u32) -> Result<u64> {
-        let (rows, row_bytes) = self.host_rows();
-        match self.host.as_ref() {
-            Some(host) if row < rows => Ok(host.buffer.host() as u64
-                + u64::from(host.pages) * self.paged_page_bytes()
-                + u64::from(host.window_pages) * self.window_page_bytes()
-                + u64::from(row) * row_bytes),
-            _ => Err(Fault::Ceiling {
+    pub fn host_row(&mut self, row: u32) -> Result<u64> {
+        let Some(host) = self.host.as_mut() else {
+            return Err(Fault::Ceiling {
                 what: "host rs rows",
                 need: u64::from(row) + 1,
-                have: u64::from(rows),
-            }),
-        }
+                have: 0,
+            });
+        };
+        host.rows.back([row], "host rs rows")?;
+        host.rows.at(row, 0)
     }
 
     #[must_use]
     pub fn host_pages(&self) -> u32 {
-        self.host.as_ref().map_or(0, |host| host.pages)
+        self.host.as_ref().map_or(0, |host| host.paged.slots)
     }
 
     /// Opens `dir`'s slot file for this rank with `budget` bytes of kv pages;
@@ -1903,45 +1965,51 @@ impl Pools {
         host: &[u32],
         windowed: &[(u32, u32)],
     ) -> Result<()> {
-        let have = [self.host_pages(), self.host_window_pages()].map(u64::from);
         let paged: Vec<(u32, u32)> = device.iter().copied().zip(host.iter().copied()).collect();
-        for (pairs, have, what) in [
-            (&paged[..], have[0], "host kv pages"),
-            (windowed, have[1], "host windowed pages"),
-        ] {
-            if let Some(&(_, page)) = pairs.iter().find(|&&(_, page)| u64::from(page) >= have) {
-                return Err(Fault::Ceiling {
-                    what,
-                    need: u64::from(page) + 1,
-                    have,
-                });
-            }
-        }
         let highest = device.iter().map(|&page| page + 1).max().unwrap_or(0);
         self.ensure_kv(highest)?;
         self.ensure_windowed(windowed.iter().map(|&(page, _)| u64::from(page)))?;
-        let Some(buffer) = self.host.as_ref().map(|host| host.buffer.host() as u64) else {
-            return Ok(());
+        let Some(tier) = self.host.as_mut() else {
+            return match (host.first(), windowed.first()) {
+                (None, None) => Ok(()),
+                (paged, _) => Err(Fault::Ceiling {
+                    what: if paged.is_some() {
+                        "host kv pages"
+                    } else {
+                        "host windowed pages"
+                    },
+                    need: 1,
+                    have: 0,
+                }),
+            };
         };
-        let mut base = 0u64;
+        tier.paged.back(host.iter().copied(), "host kv pages")?;
+        tier.windowed.back(
+            windowed.iter().map(|&(_, slot)| slot),
+            "host windowed pages",
+        )?;
+        let tier = self.host.as_ref().expect("seated above");
         let mut spans: Vec<(u64, u64, usize)> = Vec::new();
-        let spaces = [
-            (self.paged_planes(), &paged[..], have[0]),
-            (self.windowed_planes(), windowed, have[1]),
-        ];
-        for (planes, pairs, have) in spaces {
+        for (planes, pairs, shelf) in [
+            (self.paged_planes(), &paged[..], &tier.paged),
+            (self.windowed_planes(), windowed, &tier.windowed),
+        ] {
             let mut runs: Vec<(u32, u32, u32)> = Vec::new();
             for &(d, h) in pairs {
                 match runs.last_mut() {
-                    Some((d0, h0, n)) if *d0 + *n == d && *h0 + *n == h => *n += 1,
+                    Some((d0, h0, n))
+                        if *d0 + *n == d && *h0 + *n == h && shelf.same_chunk(*h0, h) =>
+                    {
+                        *n += 1;
+                    }
                     _ => runs.push((d, h, 1)),
                 }
             }
-            for (arena, page_bytes) in planes {
+            for (plane, (arena, page_bytes)) in planes.into_iter().enumerate() {
                 for &(d, h, n) in &runs {
                     let bytes = u64::from(n) * page_bytes;
                     let on_device = arena.span(u64::from(d) * page_bytes, bytes)?;
-                    let on_host = buffer + base + u64::from(h) * page_bytes;
+                    let on_host = shelf.at(h, plane)?;
                     let (dst, src) = if to_host {
                         (on_host, on_device)
                     } else {
@@ -1949,7 +2017,6 @@ impl Pools {
                     };
                     spans.push((dst, src, usize::try_from(bytes).unwrap_or(0)));
                 }
-                base += have * page_bytes;
             }
         }
         if spans.is_empty() {
@@ -2096,30 +2163,6 @@ impl Pools {
         self.paged_planes().iter().map(|&(_, bytes)| bytes).sum()
     }
 
-    /// Where each paged plane keeps host slot `slot`, and the bytes it holds
-    /// there: the planes keep their host pages side by side.
-    fn host_kv_spans(&self, slot: u32) -> Result<Vec<(usize, usize)>> {
-        let have = self.host_pages();
-        if slot >= have {
-            return Err(Fault::Ceiling {
-                what: "host kv pages",
-                need: u64::from(slot) + 1,
-                have: u64::from(have),
-            });
-        }
-        let mut base = 0u64;
-        let mut spans = Vec::new();
-        for (_, page_bytes) in self.paged_planes() {
-            let at = base + u64::from(slot) * page_bytes;
-            spans.push((
-                usize::try_from(at).unwrap_or(usize::MAX),
-                usize::try_from(page_bytes).unwrap_or(0),
-            ));
-            base += u64::from(have) * page_bytes;
-        }
-        Ok(spans)
-    }
-
     /// The cache row of each paged plane, in a host slot's order.
     fn paged_plane_rows(&self) -> Vec<usize> {
         let mut rows = Vec::new();
@@ -2180,35 +2223,23 @@ impl Pools {
         device: &[u32],
         host: &[u32],
     ) -> Result<TapSpans> {
-        let have = self.host_pages();
-        if let Some(&slot) = host.iter().find(|&&slot| slot >= have) {
-            return Err(Fault::Ceiling {
-                what: "host kv pages",
-                need: u64::from(slot) + 1,
-                have: u64::from(have),
-            });
-        }
         self.ensure_kv(device.iter().map(|&page| page + 1).max().unwrap_or(0))?;
-        let Some(buffer) = self.host.as_ref().map(|host| host.buffer.host() as u64) else {
+        let Some(tier) = self.host.as_mut() else {
             return Err(Fault::Ceiling {
                 what: "host kv pages",
                 need: 1,
                 have: 0,
             });
         };
+        tier.paged.back(host.iter().copied(), "host kv pages")?;
+        let shelf = &self.host.as_ref().expect("seated above").paged;
         let all = self.paged_planes();
-        let mut bases = Vec::with_capacity(all.len());
-        let mut base = 0u64;
-        for &(_, bytes) in &all {
-            bases.push(base);
-            base += u64::from(have) * bytes;
-        }
         let mut copies = Vec::with_capacity(planes.len() * device.len());
         let mut lands = Vec::with_capacity(planes.len() * device.len());
         for (&d, &h) in device.iter().zip(host) {
             for &plane in planes {
                 let (arena, bytes) = all[plane];
-                let on_host = buffer + bases[plane] + u64::from(h) * bytes;
+                let on_host = shelf.at(h, plane)?;
                 let on_device = arena.span(u64::from(d) * bytes, bytes)?;
                 let len = usize::try_from(bytes).unwrap_or(0);
                 copies.push((on_host, on_device, len));
@@ -2220,27 +2251,13 @@ impl Pools {
 
     /// Host kv slots `slots`, one after another, each its planes in order.
     /// The caller has synchronized every copy into them.
-    pub fn read_host_kv(&self, slots: &[u32]) -> Result<Vec<u8>> {
-        let Some(host) = self.host.as_ref() else {
-            return Err(Fault::Ceiling {
-                what: "host kv pages",
-                need: 1,
-                have: 0,
-            });
-        };
-        let slot_bytes = usize::try_from(self.host_kv_slot_bytes()).unwrap_or(0);
-        let mut out = Vec::with_capacity(slots.len() * slot_bytes);
+    pub fn read_host_kv(&mut self, slots: &[u32]) -> Result<Vec<u8>> {
+        let shelf = self.paged_shelf(slots)?;
+        let mut out = Vec::new();
         for &slot in slots {
-            for (at, len) in self.host_kv_spans(slot)? {
-                let span = host
-                    .buffer
-                    .view(at as u64, len as u64)
-                    .ok_or(Fault::Ceiling {
-                        what: "bytes of the host kv buffer",
-                        need: (at + len) as u64,
-                        have: host.buffer.bytes() as u64,
-                    })?;
-                out.extend_from_slice(span);
+            for (plane, &bytes) in shelf.planes.iter().enumerate() {
+                let (pinned, at) = shelf.place(slot, plane).expect("backed above");
+                out.extend_from_slice(pinned.view(at, bytes).expect("inside its chunk"));
             }
         }
         Ok(out)
@@ -2248,7 +2265,7 @@ impl Pools {
 
     /// Writes `bytes`, as [`Self::read_host_kv`] lays them out, into host kv
     /// slots `slots`.
-    pub fn write_host_kv(&self, slots: &[u32], bytes: &[u8]) -> Result<()> {
+    pub fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()> {
         let slot_bytes = usize::try_from(self.host_kv_slot_bytes()).unwrap_or(0);
         if bytes.len() != slots.len() * slot_bytes {
             return Err(Fault::Ceiling {
@@ -2257,27 +2274,34 @@ impl Pools {
                 have: bytes.len() as u64,
             });
         }
-        let Some(host) = self.host.as_ref() else {
+        let shelf = self.paged_shelf(slots)?;
+        let mut from = 0;
+        for &slot in slots {
+            for (plane, &len) in shelf.planes.iter().enumerate() {
+                let (pinned, at) = shelf.place(slot, plane).expect("backed above");
+                let len = usize::try_from(len).unwrap_or(0);
+                let at = usize::try_from(at).unwrap_or(usize::MAX);
+                assert!(
+                    pinned.write(at, &bytes[from..from + len]),
+                    "inside its chunk"
+                );
+                from += len;
+            }
+        }
+        Ok(())
+    }
+
+    /// The host kv shelf, with the chunks holding `slots` pinned.
+    fn paged_shelf(&mut self, slots: &[u32]) -> Result<&Shelf> {
+        let Some(host) = self.host.as_mut() else {
             return Err(Fault::Ceiling {
                 what: "host kv pages",
                 need: 1,
                 have: 0,
             });
         };
-        let mut from = 0;
-        for &slot in slots {
-            for (at, len) in self.host_kv_spans(slot)? {
-                if !host.buffer.write(at, &bytes[from..from + len]) {
-                    return Err(Fault::Ceiling {
-                        what: "bytes into the host kv buffer",
-                        need: (at + len) as u64,
-                        have: host.buffer.bytes() as u64,
-                    });
-                }
-                from += len;
-            }
-        }
-        Ok(())
+        host.paged.back(slots.iter().copied(), "host kv pages")?;
+        Ok(&host.paged)
     }
 
     /// `slot`'s recurrent state, read on `stream` behind the fires that

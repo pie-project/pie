@@ -1121,7 +1121,9 @@ pub fn voxel_over(
 /// its log-sum-exp and the sink logits folded in. With a `selection` (the
 /// key blocks an indexer picked a row, `ratio` keys a block, one pick a head
 /// when `per_head`), decode and prefill lanes read only those blocks; a
-/// masked lane reads every key.
+/// masked lane reads every key. With `scores`, the lanes capturing scores
+/// read theirs out as `attn.scores` ([`score_capture`]'s, over their last 32
+/// query rows and first 2048 keys).
 ///
 /// The host plans are the compiler's: each kind's is built once a trace,
 /// over the lanes of that kind and outside any layer, and every layer asking
@@ -1142,6 +1144,7 @@ pub fn attend(
     selection: Option<&Value>,
     ratio: Option<u32>,
     per_head: bool,
+    scores: bool,
 ) -> Value {
     let selected = selection.map(|selection| {
         assert!(
@@ -1325,10 +1328,18 @@ pub fn attend(
             None => o,
         });
     }
-    if arms.len() == 1 {
-        return arms.remove(0);
+    let o = if arms.len() == 1 {
+        arms.remove(0)
+    } else {
+        Value::merge(arms)
+    };
+    if scores {
+        let captured = score_capture(
+            q, inputs, kv, q_heads, kv_heads, head_dim, sm_scale, 32, 2048,
+        );
+        crate::output("attn.scores", &captured, None);
     }
-    Value::merge(arms)
+    o
 }
 
 /// The attention mass of each lane capturing scores (`fact::scores`) over

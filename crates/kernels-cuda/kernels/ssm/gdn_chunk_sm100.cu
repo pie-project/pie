@@ -456,7 +456,7 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                     const float gt = G[i128];
                     const float gl = G[L - 1];
                     const float et = ex2(gt);
-                    FK[i128] = -et * RK[i128];
+                    FK[i128] = i128 < L ? -et * RK[i128] : 0.f;
                     FQ[i128] = et * RQ[i128];
                     FD[i128] = i128 < L ? RK[i128] * ex2(gl - gt) : 0.f;
                     if (i128 == 0) FD[CH] = ex2(gl);
@@ -739,6 +739,20 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                     tmem_st32(tb + kColSI + hq * 32, pk);
                 }
                 tmem_wait_st();
+                if (L < CH) {
+                    // A partial chunk's rows past it are the plane's stale
+                    // padding, and a zero factor keeps no NaN out of a product.
+                    bar_wait(&kq_full[s], ph);
+                    bar_wait(&v_full[s], ph);
+                    unsigned char* kqs = smem + kKQ + s * kKQStage;
+                    unsigned char* vs = smem + kV + s * kVStage;
+                    for (int e = v; e < (CH - L) * 16; e += 128) {
+                        const int t = L + e / 16, a = (e / 8) & 1, q = e & 7;
+                        *reinterpret_cast<uint4*>(kqs + a * 16384 + t * 128 + q * 16) = make_uint4(0, 0, 0, 0);
+                        *reinterpret_cast<uint4*>(vs + a * 8192 + t * 128 + q * 16) = make_uint4(0, 0, 0, 0);
+                    }
+                    fence_async_shared();
+                }
                 tc_fence_before();
                 named_sync(5, 128);
                 if (v == 0) {

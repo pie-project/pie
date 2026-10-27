@@ -109,6 +109,7 @@ impl Plane {
         self.programs.get(&id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn bind(
         &mut self,
         context: &Context,

@@ -980,12 +980,20 @@ impl Shell {
                         && self.tiers.plain.contains(*class)
                 })
                 .collect(),
-            media: self.media.iter().collect(),
+            media: self
+                .media
+                .iter()
+                .filter(|class| self.tiers.plain.contains(*class))
+                .collect(),
             wide: self
                 .decoding
                 .iter()
                 .chain((0..classes).filter(|class| !self.decoding.contains(*class)))
-                .filter(|class| textual(*class) && !self.landing[*class].is_empty())
+                .filter(|class| {
+                    textual(*class)
+                        && !self.landing[*class].is_empty()
+                        && self.tiers.plain.contains(*class)
+                })
                 .collect(),
             decoding: self.decoding.clone(),
             seats,

@@ -21,9 +21,9 @@ extern "C" {
 #endif
 
 #define PIE_VERSION_MAJOR 0
-#define PIE_VERSION_MINOR 5
-#define PIE_VERSION_PATCH 4
-#define PIE_VERSION_STRING "0.5.4"
+#define PIE_VERSION_MINOR 6
+#define PIE_VERSION_PATCH 0
+#define PIE_VERSION_STRING "0.6.0"
 
 typedef enum pie_status {
     PIE_OK = 0,

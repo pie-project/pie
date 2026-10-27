@@ -173,6 +173,23 @@ fn weight_methods(builder: &mut MethodsBuilder) {
         Ok(WeightValue(this.0.clone().registered()))
     }
 
+    /// The weight is stored against inputs turned by `H·S`, the blockwise
+    /// Hadamard of `block` over the layout's `[1, width]` sign diagonal
+    /// `signs`: a product turns its input so first, a table's rows back.
+    fn turned<'v>(
+        this: &WeightValue,
+        #[starlark(require = pos)] signs: Value<'v>,
+        #[starlark(require = named)] block: u32,
+    ) -> anyhow::Result<WeightValue> {
+        let mut w = this.0.clone();
+        w.turn = Some(Box::new(crate::Turn {
+            signs: weight(signs)?,
+            block,
+            origin: crate::star::paths::origin(signs),
+        }));
+        Ok(WeightValue(w))
+    }
+
     #[starlark(attribute)]
     fn name(this: &WeightValue) -> anyhow::Result<String> {
         Ok(this.0.name.clone())

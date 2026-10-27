@@ -1,77 +1,75 @@
 <div align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://pie-project.org/img/pie-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="https://pie-project.org/img/pie-light.svg">
-    <img alt="Pie: Programmable serving system for emerging LLM applications"
-         src="https://pie-project.org/img/pie-light.svg"
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/pie-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/pie-light.svg">
+    <img alt="Pie: Programmable inference engine"
+         src=".github/assets/pie-light.svg"
          width="30%">
     <p></p>
   </picture>
 
-[Website] | [Guide] | [Reference] | [Paper (SOSP'25)]
+[Website] | [Docs] | [Playground] | [Benchmarks] | [Paper (SOSP'25)]
 </div>
 
 [Website]: https://pie-project.org/
-[Guide]: https://pie-project.org/docs/guide/install
-[Reference]: https://pie-project.org/docs/reference/sdk-rust
+[Docs]: https://pie-project.org/docs
+[Playground]: https://pie-project.org/playground
+[Benchmarks]: https://benchmarks.pie-project.org/
 [Paper (SOSP'25)]: https://ingim.org/papers/gim2025pie.pdf
 
-Pie runs small user-supplied WebAssembly programs, called *inferlets*, directly
-next to the model. An inferlet drives the forward pass and owns its KV cache,
-so agent loops, tool calls, custom samplers and cache policies are written per
-application, in Python, JavaScript or Rust, without modifying the engine.
+Pie is a programmable inference engine that serves programs, not prompts. It
+runs small user-supplied WebAssembly programs, called *inferlets*, directly
+next to the model. An inferlet drives the forward pass and owns its state, so
+agent loops, speculative decoding, custom samplers, and KV-cache policies are
+written per application—in Python, JavaScript, or Rust—without modifying the
+engine.
 
-> **Note**
-> Pie is pre-release software under active development.
+Models themselves are programs written in [Poem](models), not hardcoded in
+Rust, so a single runtime serves language, multimodal, diffusion, image, and
+video models. The entire system ships as one ~60 MB binary with no Python or
+PyTorch runtime dependency, running on NVIDIA and AMD GPUs, Apple silicon,
+Google TPUs, Vulkan, and in the browser on WebGPU.
 
 ## Install
-
-Pie is one binary plus a language component per scripting language, all on the
-[latest release](https://github.com/pie-project/pie/releases/latest). Pick the
-archive for your platform and GPU (`cuda`, `metal`, `vulkan` or `wgpu`):
-
-```bash
-tar -xzf pie-x86_64-linux-cuda13.0.tar.gz
-install pie ~/.local/bin/                             # anywhere on PATH
-pie language install pie-language-python.tar.gz       # Python inferlets
-pie language install pie-language-javascript.tar.gz   # JavaScript inferlets
-```
-
-The installer does the same four steps, choosing the archive for you:
 
 ```bash
 curl -fsSL https://pie-project.org/install.sh | bash        # Linux, macOS, WSL
 irm https://pie-project.org/install.ps1 | iex               # Windows PowerShell
 ```
 
-Then a model:
+Then initialize a default configuration and import a model:
 
 ```bash
 pie config init
 pie model import Qwen/Qwen3.5-0.8B
 ```
 
+See the [install guide](https://pie-project.org/docs/install) for manual
+archives and backend flavors (`cuda`, `metal`, `vulkan`, `wgpu`), or open the
+[Playground] to run Pie in a browser tab with no install.
+
 ## Write an inferlet
 
-A program is one file; its extension says the language. This one is greedy
-text completion, one forward pass per token:
+An inferlet is one file; its extension selects the language. This one is greedy
+text completion ([`examples/quickstart-py`](examples/quickstart-py)), one
+forward pass per token:
 
 ```python
 from inferlet import chat, model
-from inferlet.eta import ForwardPass, Pipeline, WorkingSet, intrinsics, reduce_argmax
+from inferlet.eta import ForwardPass, Pipeline, StateGeometry, WorkingSet, intrinsics, reduce_argmax
 
 
 async def main(input: dict) -> dict:
     tokens = chat.prefix() + model.encode(input.get("prompt", "The capital of France is"))
     max_tokens = int(input.get("max_tokens", 8))
-    ws = WorkingSet(tokens=len(tokens) + max_tokens)  # KV pages (and recurrent state on a hybrid model)
+    ws = WorkingSet()  # the sequence's state, whatever the model keeps
     pipe = Pipeline()
 
-    done = 0  # tokens already in the KV cache
+    done = 0  # tokens already in the working set
     for _ in range(max_tokens):
         fwd = ForwardPass()
         fwd.embed(tokens[done:])                        # the new tokens
-        fwd.bind_state(ws, ws.geometry(done, len(tokens)))
+        fwd.state([ws], StateGeometry.folding())        # appended, and final
         out = fwd.epilogue(lambda: reduce_argmax(intrinsics.output(0, "logits")))  # runs on the device
         pipe.submit(fwd)
         done = len(tokens)
@@ -81,45 +79,31 @@ async def main(input: dict) -> dict:
     return {"text": model.decode(tokens[-max_tokens:])}
 ```
 
-Every line stands for device state. `embed` seeds the token channel,
-`ws.geometry` derives the KV geometry of the span, and the `epilogue` is
-traced once and runs on the GPU after each forward pass; the host only sees
-the token it publishes. The same program in JavaScript is
-[`examples/quickstart-js`](examples/quickstart-js); Rust inferlets use the
-[`inferlet`](https://crates.io/crates/inferlet) crate and compile to
-`wasm32-wasip3`, a nightly target ([`examples/rust-toolchain.toml`](examples/rust-toolchain.toml)
-pins one). [`examples/`](examples) goes on from here: a one-pass prefill
-with a device loop-carried decode, beam search, speculative decoding,
-constrained decoding, KV-cache sharing, diffusion.
+Every line describes device work. `embed` feeds the new tokens,
+`StateGeometry.folding()` appends them to the working set, and `epilogue` is
+traced once and compiled into a GPU kernel that runs after each forward pass;
+the host only sees the token it publishes.
 
-## Run it
+The same program in JavaScript is [`examples/quickstart-js`](examples/quickstart-js).
+Rust inferlets use the [`inferlet`](https://crates.io/crates/inferlet) crate
+and compile to `wasm32-wasip3` ([`examples/rust-toolchain.toml`](examples/rust-toolchain.toml)).
+[`examples/`](examples) goes on from here: device loop-carried decode, beam
+search, speculative decoding, KV eviction and sharing, constrained decoding,
+custom samplers, watermarking, and media generation.
+
+## Run & serve
+
+`pie run` runs an inferlet in a one-shot engine:
 
 ```bash
 pie run main.py -- --prompt "The capital of France is"
+# {"text": " Paris, and the capital of the United States is Washington,"}
 ```
 
-```
-{"text": " Paris, and the capital of the United States is Washington,"}
-```
-
-`pie run` boots a one-shot engine for the program. To keep one running, `pie
-serve` holds the terminal, and the Python client (`pip install pie-client`)
-submits the same file from another shell:
-
-```bash
-pie-client submit --path main.py -- --prompt "The capital of France is"
-```
-
-## Compatible APIs
-
-`pie serve` also speaks the APIs existing clients already use, on the same
-port, with no API key:
-
-| Route | Client |
-|---|---|
-| `POST /v1/chat/completions`, `/v1/completions`, `/v1/responses`, `GET /v1/models` | `openai` |
-| `POST /v1/messages` | `anthropic` |
-| `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent?alt=sse` | `google-genai` |
+`pie serve` keeps the engine running. You can submit inferlets to it with
+`pie-client` (`pip install pie-client`), or connect existing OpenAI, Anthropic,
+and Gemini clients to the same port with no API key—each compatibility API is
+itself a built-in inferlet:
 
 ```python
 from openai import OpenAI
@@ -127,29 +111,22 @@ client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
 print(client.chat.completions.create(model="default", messages=[{"role": "user", "content": "Hi"}]).choices[0].message.content)
 ```
 
-Each API is itself a built-in inferlet, with tool calling, JSON-schema output,
-streaming and reasoning. The same server embeds in a process as
-[`pie-server`](https://pypi.org/project/pie-server/) on PyPI and
-[`@pie-project/server`](https://www.npmjs.com/package/@pie-project/server) on
-npm; under a bundler the npm package is pie compiled for the browser, on
-WebGPU.
+The same server embeds in a process via [`pie-server`](https://pypi.org/project/pie-server/)
+on PyPI and [`@pie-project/server`](https://www.npmjs.com/package/@pie-project/server)
+on npm (which also bundles for the browser on WebGPU).
 
 ## Building from source
 
-Four engines, each a compile-time feature:
+Pick a backend feature (`cuda`, `metal`, `vulkan`, `wgpu`, `rocm`, or `xla`):
 
 ```bash
-cargo build --release -p pie --bin pie --features cuda    # NVIDIA, Linux/Windows
-cargo build --release -p pie --bin pie --features metal   # Apple silicon, macOS
-cargo build --release -p pie --bin pie --features vulkan  # any Vulkan 1.2 device (slangc on PATH)
-cargo build --release -p pie --bin pie --features wgpu    # WebGPU: Vulkan, Metal or D3D12
+cargo build --release -p pie --bin pie --features metal
 ```
 
-## Getting Help
+## Community & License
 
-[GitHub Issues](https://github.com/pie-project/pie/issues) and
-[GitHub Discussions](https://github.com/pie-project/pie/discussions).
+Join [Discord](https://discord.gg/R62Udyzum), open an
+[Issue](https://github.com/pie-project/pie/issues), or start a
+[Discussion](https://github.com/pie-project/pie/discussions).
 
-## License
-
-[Apache License 2.0](LICENSE). Third-party attributions: [NOTICE](NOTICE).
+Licensed under the [Apache License 2.0](LICENSE) ([NOTICE](NOTICE)).

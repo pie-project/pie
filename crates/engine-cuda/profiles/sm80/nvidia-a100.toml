@@ -37,7 +37,6 @@ sdpa.pool_mma = true
 sdpa.selected_mma = true
 elemwise.hc_tile = true
 elemwise.hc_mma = true
-elemwise.qg_prologue_until = 64
 elemwise.norm_emit = true
 sdpa.compressed_decode_until = 64
 gemm.rows_m = 8
@@ -112,7 +111,6 @@ measured = [
   "compiler.dag_streams",
   "kernel.elemwise.hc_tile",
   "kernel.elemwise.hc_mma",
-  "kernel.elemwise.qg_prologue_until",
   "kernel.elemwise.norm_emit",
   "kernel.sdpa.compressed_decode_until",
   "kernel.gemm.rows_m",

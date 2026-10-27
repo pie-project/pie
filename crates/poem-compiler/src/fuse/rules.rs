@@ -52,7 +52,6 @@ pub fn forming(labels: &[&str]) -> Vec<Rule> {
 #[must_use]
 pub fn all() -> Vec<Rule> {
     vec![
-        split_qkv_fused(),
         qkv_fused_qknorm_rope_vnorm_write(),
         qkv_fused_padded(),
         rmsnorm_residual_add(),
@@ -738,8 +737,8 @@ fn plus_one(op: &Operation) -> bool {
 pub fn qkv_fused_qknorm_rope_vnorm_write() -> Rule {
     Rule::new(
         "fused.qkv_fused_qknorm_rope_vnorm_write",
-        qkv_patterns(false),
-        |m| qkv_fused(m, m.value("packed")),
+        qkv_patterns(),
+        qkv_fused,
     )
     .when(qkv_admits)
 }
@@ -751,47 +750,22 @@ pub fn qkv_fused_qknorm_rope_vnorm_write() -> Rule {
 /// past a piece's widths is one no window of the product addresses.
 #[must_use]
 pub fn qkv_fused_padded() -> Rule {
-    let patterns: Vec<Template> = qkv_patterns(false).into_iter().skip(4).collect();
+    let patterns: Vec<Template> = qkv_patterns().into_iter().skip(4).collect();
     Rule::new(
         "fused.qkv_fused_qknorm_rope_vnorm_write",
         patterns,
-        |m| qkv_fused(m, m.value("packed")),
+        qkv_fused,
     )
     .when(qkv_admits)
     .form("padded")
 }
 
-/// The fused qkv write on the first columns of a row split, the rest of each
-/// row landing as the split's second half (Muse Spark's qkv|gate): the split
-/// read in place, not copied out first.
-#[must_use]
-pub fn split_qkv_fused() -> Rule {
-    Rule::new("fused.split_qkv_fused", qkv_patterns(true), |m| {
-        Fused::SplitQkvFused {
-            rest: m.value("rest"),
-            qkv: Box::new(qkv_fused(m, m.value("full"))),
-        }
-    })
-    .when(qkv_admits)
-}
-
-/// The qkv write's forms (each read off a row split where `split`): Gemma's
-/// (the rotation: 0 none, 1 full, 2 partial), MiMo's (no norms, v scaled, a
-/// partial rotation).
-fn qkv_patterns(split: bool) -> Vec<Template> {
+/// The qkv write's forms: Gemma's (the rotation: 0 none, 1 full, 2
+/// partial), MiMo's (no norms, v scaled, a partial rotation).
+fn qkv_patterns() -> Vec<Template> {
     let pattern = |gemma: bool, rope: u8| {
         template(move |p| {
-            let packed = if split {
-                // Any cut matches: the replacement reads the trace's own.
-                let full = p.rows("full", 4 * W);
-                let (packed, rest) = gather::split_rows(&full, W as u32 / 2);
-                p.free("width");
-                p.name("packed", &packed);
-                p.export("rest", &rest);
-                packed
-            } else {
-                p.rows("packed", 3 * W)
-            };
+            let packed = p.rows("packed", 3 * W);
             let positions = p.indices("positions");
             let d = p.u32("d");
             let (q, k, v) = if rope == 4 {
@@ -879,13 +853,13 @@ fn qkv_patterns(split: bool) -> Vec<Template> {
     ]
 }
 
-/// The fused qkv write a match states, its rows read off `packed`.
-fn qkv_fused(m: &Match, packed: poem_ir::ValueId) -> Fused {
+/// The fused qkv write a match states.
+fn qkv_fused(m: &Match) -> Fused {
     let d = m.u32("d");
     let rotated = m.get_f32("theta").is_some();
     let normed = m.get_f32("eps").is_some();
     Fused::QkvFusedQknormRopeVnormWrite {
-        packed,
+        packed: m.value("packed"),
         positions: m.get("positions").filter(|_| rotated),
         q_norm_weight: m.get("q_norm"),
         k_norm_weight: m.get("k_norm"),

@@ -6,14 +6,11 @@
 # model's checkpoint at its full width.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/blocks.poem", "attention", "swiglu")
 
 LLAMA = template("llama")
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k, v, the gate and the up by their heads and channels, the
-# output and down projections by their rows, the head by its vocabulary.
-CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>"]])
 
 def llama(id, layers, mini = False):
@@ -50,13 +47,13 @@ DEPLOYMENTS = [
     deployment("llama33-70b-mini-l4", weights = F8, kv = E4M3),
 ]
 
-# The weights of Llama 3.1 / 3.3: per layer an RMS norm, q, k and v packed
-# into one projection and the output projection, an RMS norm and a SwiGLU MLP;
-# the token embedding, a final norm and the head. The projections are stored
-# at the deployment's one dtype; the norms, the embedding and the head stay
-# bf16 under a release's FP8 or NVFP4 (modelopt leaves the head bf16), or take
-# the projections' u4 where the deployment quantizes a bf16 release. Each
-# layer also has the LoRA banks the host registers.
+# The weights of Llama 3.1 / 3.3: per layer an RMS norm, the q, k, v and
+# output projections, an RMS norm and a SwiGLU MLP; the token embedding, a
+# final norm and the head. The projections are stored at the deployment's one
+# dtype; the norms, the embedding and the head stay bf16 under a release's FP8
+# or NVFP4 (modelopt leaves the head bf16), or take the projections' u4 where
+# the deployment quantizes a bf16 release. Each layer also has the LoRA banks
+# the host registers.
 
 def dims(hidden, layers, q_heads, inter):
     return struct(
@@ -90,13 +87,12 @@ def layout(id, deploy):
         fail("{} ships no drafter and no parts".format(id))
     proj = roles(deploy, "proj", exact = True).proj
     table = dtype.bf16 if proj in RELEASED else proj
-    dense = compute(table)
     d = DIMS[id]
     hidden, hd = d.hidden, d.head_dim
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
 
     def layer(l):
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         return struct(
             attn_norm = weight([hidden]),
             q = weight([q_width, hidden], proj),
@@ -205,30 +201,12 @@ def forward(m, inputs):
 
     def block(l, w, y):
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, positions, scaling, w)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
-        y = ops.elemwise.residual_add(o, y)
+        o = attention(x, inputs, m, w, positions, scaling = scaling)
+        y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
-        f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
-        return ops.elemwise.residual_add(f, y)
+        return ops.elemwise.residual_add(swiglu(x, w), y)
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
     output("logits", ops.linear.lm_head(x, m.head))
-
-def attention(x, inputs, m, positions, scaling, w):
-    pages = inputs.kv(w.kv)
-    d = m.head_dim
-    q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
-    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k, scaling = scaling)
-    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
-
-    # Each lane by its kind; a lane may bring its own mask. A lane capturing
-    # scores reads them out too.
-    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True)
-    scores = ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
-    output("attn.scores", scores)
-    return ops.linear.matmul(o, w.o)

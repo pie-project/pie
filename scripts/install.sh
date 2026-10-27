@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://pie-project.org/install.sh | bash
 #   curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda13.0 bash
-#   curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.5.2 bash
+#   curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.6.0 bash
 #
 # Environment overrides:
 #   PIE_VERSION       Release tag (default: the latest release).

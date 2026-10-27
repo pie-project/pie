@@ -283,7 +283,6 @@ impl FamilyCosts {
                 | poem_ir::Fused::MoeExperts { .. }
                 | poem_ir::Fused::MoeMega { .. } => self.linear,
                 poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. }
-                | poem_ir::Fused::SplitQkvFused { .. }
                 | poem_ir::Fused::Epilogue { .. } => self.custom,
                 poem_ir::Fused::GdnStep { .. } => self.attn,
                 poem_ir::Fused::QGateNormRopeAppend {

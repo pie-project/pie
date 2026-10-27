@@ -62,7 +62,10 @@ fn a_result_lands_its_window_or_its_cache_row() {
         e4m3,
     };
     let scale = 0.5f32;
-    let ins = [Plane::rows(&t(x, rows, width)), Plane::rows(&t(s, rows, width))];
+    let ins = [
+        Plane::rows(&t(x, rows, width)),
+        Plane::rows(&t(s, rows, width)),
+    ];
     let outs = [
         Plane::window(&t(window, rows, 128), 64, 128),
         Plane::paged(cache(bf16_cache, None), 0, width as u32),
@@ -78,11 +81,17 @@ fn a_result_lands_its_window_or_its_cache_row() {
     let windowed: Vec<u16> = gpu.down(window, rows * 128);
     for r in 0..rows {
         for c in 0..128 {
-            assert_eq!(from_bf16(windowed[r * 128 + c]), product[r * width + 64 + c], "window");
+            assert_eq!(
+                from_bf16(windowed[r * 128 + c]),
+                product[r * width + 64 + c],
+                "window"
+            );
         }
     }
-    let (bf16_rows, fp8_rows): (Vec<u16>, Vec<u8>) =
-        (gpu.down(bf16_cache, cells * width), gpu.down(fp8_cache, cells * width));
+    let (bf16_rows, fp8_rows): (Vec<u16>, Vec<u8>) = (
+        gpu.down(bf16_cache, cells * width),
+        gpu.down(fp8_cache, cells * width),
+    );
     let fp8 = CacheDtype::E4m3 { scale };
     for cell in 0..cells {
         // the row landing at this cell, if one does

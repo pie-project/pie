@@ -428,9 +428,8 @@ fn rewrite_scale_expr(
     declared: &mut HashMap<String, TensorContract>,
     legs: &mut Vec<TensorContract>,
 ) -> Result<Expr, Error> {
-    let expr = expr.map_children(|child| {
-        rewrite_scale_expr(child, name, target, resolver, declared, legs)
-    })?;
+    let expr = expr
+        .map_children(|child| rewrite_scale_expr(child, name, target, resolver, declared, legs))?;
 
     if let Expr::Scale {
         src,
@@ -465,11 +464,7 @@ fn rewrite_scale_expr(
             start,
             len,
         } if matches!(src.as_ref(), Expr::Scale { .. }) => {
-            let Expr::Scale {
-                src: q_src,
-                factor,
-            } = *src
-            else {
+            let Expr::Scale { src: q_src, factor } = *src else {
                 unreachable!()
             };
             push_one_affine(
@@ -489,11 +484,7 @@ fn rewrite_scale_expr(
             axis,
             replicas,
         } if matches!(src.as_ref(), Expr::Scale { .. }) => {
-            let Expr::Scale {
-                src: q_src,
-                factor,
-            } = *src
-            else {
+            let Expr::Scale { src: q_src, factor } = *src else {
                 unreachable!()
             };
             push_one_affine(
@@ -515,11 +506,7 @@ fn rewrite_scale_expr(
             len,
             step,
         } if matches!(src.as_ref(), Expr::Scale { .. }) => {
-            let Expr::Scale {
-                src: q_src,
-                factor,
-            } = *src
-            else {
+            let Expr::Scale { src: q_src, factor } = *src else {
                 unreachable!()
             };
             push_one_affine(
@@ -535,11 +522,7 @@ fn rewrite_scale_expr(
             )
         }
         Expr::Gather { src, axis, indices } if matches!(src.as_ref(), Expr::Scale { .. }) => {
-            let Expr::Scale {
-                src: q_src,
-                factor,
-            } = *src
-            else {
+            let Expr::Scale { src: q_src, factor } = *src else {
                 unreachable!()
             };
             push_one_affine(
@@ -718,7 +701,8 @@ fn push_one_affine(
 
     let leg_name = format!("{name}.scale_factor{}", legs.len());
     let new_s_ty = resolver.infer_whole(&new_s, &leg_name)?;
-    let leg = TensorContract::inferred(leg_name.clone(), new_s, new_s_ty.encoding.clone()).internal();
+    let leg =
+        TensorContract::inferred(leg_name.clone(), new_s, new_s_ty.encoding.clone()).internal();
     resolver.publish(&leg_name, new_s_ty);
     declared.insert(leg_name.clone(), leg.clone());
     legs.push(leg);
@@ -744,7 +728,12 @@ fn simplify_index_selection(base: Expr, axis: u8, indices: &[i64], full_extent: 
         return base.slice(axis, first, 1);
     }
     let step = rest[0] - first;
-    if step >= 1 && rest.iter().zip(indices).all(|(next, prev)| next - prev == step) {
+    if step >= 1
+        && rest
+            .iter()
+            .zip(indices)
+            .all(|(next, prev)| next - prev == step)
+    {
         if step == 1 {
             return base.slice(axis, first, indices.len() as i64);
         }
@@ -967,7 +956,8 @@ pub fn compose_bridge(
     let trainer_sources = crate::file::Sources::new(&trainer_metadata);
     let mut bridge_tensors = Vec::with_capacity(infer_contract.tensors.len());
     for tensor in &infer_contract.tensors {
-        let substituted = substitute_sources(tensor.expr.clone(), &inverse_exprs, &trainer_sources)?;
+        let substituted =
+            substitute_sources(tensor.expr.clone(), &inverse_exprs, &trainer_sources)?;
         bridge_tensors.push(TensorContract {
             expr: substituted,
             ..tensor.clone()
@@ -988,7 +978,8 @@ fn substitute_sources(
     inverse_exprs: &HashMap<String, Expr>,
     trainer_sources: &crate::file::Sources<'_>,
 ) -> Result<Expr, Error> {
-    let expr = expr.map_children(|child| substitute_sources(child, inverse_exprs, trainer_sources))?;
+    let expr =
+        expr.map_children(|child| substitute_sources(child, inverse_exprs, trainer_sources))?;
     match expr {
         Expr::Src(name) => inverse_exprs.get(&name).cloned().ok_or_else(|| {
             Error::Contract(format!(
@@ -1048,13 +1039,7 @@ mod tests {
     use crate::types::{BufferId, DType, InstrId, QuantScheme, QuantSpec};
     use crate::verify::{ContractView, verify_plan};
 
-    fn raw_tensor(
-        id: u32,
-        name: &str,
-        offset: u64,
-        shape: &[i64],
-        dtype: DType,
-    ) -> RawTensor {
+    fn raw_tensor(id: u32, name: &str, offset: u64, shape: &[i64], dtype: DType) -> RawTensor {
         let elems: u64 = shape.iter().map(|&d| d as u64).product();
         RawTensor {
             id: TensorId(id),
@@ -1097,7 +1082,8 @@ mod tests {
             tensors: vec![
                 TensorContract::new(
                     "scales",
-                    Expr::src("s").transmute(TensorType::new(vec![4, 1], Encoding::Raw(DType::E8m0))),
+                    Expr::src("s")
+                        .transmute(TensorType::new(vec![4, 1], Encoding::Raw(DType::E8m0))),
                     vec![4, 1],
                     Encoding::Raw(DType::E8m0),
                 )
@@ -1119,7 +1105,8 @@ mod tests {
             tp_rank: 1,
             ..StorageTarget::default()
         };
-        let plan = compile(&metadata, &contract_ok, target_tp2).expect("congruent Shard(Scale) should compile");
+        let plan = compile(&metadata, &contract_ok, target_tp2)
+            .expect("congruent Shard(Scale) should compile");
         verify_plan(&plan, Some(&ContractView::of(&contract_ok))).expect("plan should verify");
 
         // 2. Invalid Slice splitting a 2-row scale block on axis 0 (start = 1, len = 4)
@@ -1128,7 +1115,8 @@ mod tests {
             tensors: vec![
                 TensorContract::new(
                     "scales",
-                    Expr::src("s").transmute(TensorType::new(vec![4, 1], Encoding::Raw(DType::E8m0))),
+                    Expr::src("s")
+                        .transmute(TensorType::new(vec![4, 1], Encoding::Raw(DType::E8m0))),
                     vec![4, 1],
                     Encoding::Raw(DType::E8m0),
                 )
@@ -1146,7 +1134,10 @@ mod tests {
             groups: Vec::new(),
         };
         let err = compile(&metadata, &contract_bad_slice, StorageTarget::default()).unwrap_err();
-        assert!(err.to_string().contains("splits 2-element scale blocks"), "{err}");
+        assert!(
+            err.to_string().contains("splits 2-element scale blocks"),
+            "{err}"
+        );
 
         // 3. Valid block-congruent Gather on axis 0 (swapping 2-row blocks: [2, 3, 0, 1, 6, 7, 4, 5])
         let contract_good_gather = ModelContract {
@@ -1154,7 +1145,8 @@ mod tests {
             tensors: vec![
                 TensorContract::new(
                     "scales",
-                    Expr::src("s").transmute(TensorType::new(vec![4, 1], Encoding::Raw(DType::E8m0))),
+                    Expr::src("s")
+                        .transmute(TensorType::new(vec![4, 1], Encoding::Raw(DType::E8m0))),
                     vec![4, 1],
                     Encoding::Raw(DType::E8m0),
                 )
@@ -1173,7 +1165,8 @@ mod tests {
         };
         let plan_g = compile(&metadata, &contract_good_gather, StorageTarget::default())
             .expect("block-congruent Gather(Scale) should compile");
-        verify_plan(&plan_g, Some(&ContractView::of(&contract_good_gather))).expect("plan should verify");
+        verify_plan(&plan_g, Some(&ContractView::of(&contract_good_gather)))
+            .expect("plan should verify");
 
         // 4. Invalid interleaved Gather on axis 0 ([0, 2, 4, 6, 1, 3, 5, 7]) scrambling 2-row scale blocks
         let contract_bad_gather = ModelContract {
@@ -1181,7 +1174,8 @@ mod tests {
             tensors: vec![
                 TensorContract::new(
                     "scales",
-                    Expr::src("s").transmute(TensorType::new(vec![4, 1], Encoding::Raw(DType::E8m0))),
+                    Expr::src("s")
+                        .transmute(TensorType::new(vec![4, 1], Encoding::Raw(DType::E8m0))),
                     vec![4, 1],
                     Encoding::Raw(DType::E8m0),
                 )
@@ -1199,7 +1193,12 @@ mod tests {
             groups: Vec::new(),
         };
         let err_g = compile(&metadata, &contract_bad_gather, StorageTarget::default()).unwrap_err();
-        assert!(err_g.to_string().contains("scrambles elements across 2-element scale blocks"), "{err_g}");
+        assert!(
+            err_g
+                .to_string()
+                .contains("scrambles elements across 2-element scale blocks"),
+            "{err_g}"
+        );
     }
 
     #[test]
@@ -1253,17 +1252,16 @@ mod tests {
                 )
                 .with_composite_axis(
                     0,
-                    vec![
-                        AxisLeg::new(16, 1),
-                        AxisLeg::new(4, 2),
-                        AxisLeg::new(4, 2),
-                    ],
+                    vec![AxisLeg::new(16, 1), AxisLeg::new(4, 2), AxisLeg::new(4, 2)],
                 ),
             ],
             groups: Vec::new(),
         };
         let err2 = compile(&metadata, &bad_prefused, target).unwrap_err();
-        assert!(err2.to_string().contains("composite sum-axis type"), "{err2}");
+        assert!(
+            err2.to_string().contains("composite sum-axis type"),
+            "{err2}"
+        );
     }
 
     #[test]
@@ -1297,11 +1295,36 @@ mod tests {
         let train_contract = ModelContract {
             alignment: 256,
             tensors: vec![
-                TensorContract::new("train_q", Expr::src("q").shard(0), vec![16, 4], f32_enc.clone()),
-                TensorContract::new("train_k", Expr::src("k").shard(0), vec![8, 4], f32_enc.clone()),
-                TensorContract::new("train_v", Expr::src("v").shard(0), vec![8, 4], f32_enc.clone()),
-                TensorContract::new("train_gate", Expr::src("gate").shard(0), vec![16, 4], f32_enc.clone()),
-                TensorContract::new("train_up", Expr::src("up").shard(0), vec![16, 4], f32_enc.clone()),
+                TensorContract::new(
+                    "train_q",
+                    Expr::src("q").shard(0),
+                    vec![16, 4],
+                    f32_enc.clone(),
+                ),
+                TensorContract::new(
+                    "train_k",
+                    Expr::src("k").shard(0),
+                    vec![8, 4],
+                    f32_enc.clone(),
+                ),
+                TensorContract::new(
+                    "train_v",
+                    Expr::src("v").shard(0),
+                    vec![8, 4],
+                    f32_enc.clone(),
+                ),
+                TensorContract::new(
+                    "train_gate",
+                    Expr::src("gate").shard(0),
+                    vec![16, 4],
+                    f32_enc.clone(),
+                ),
+                TensorContract::new(
+                    "train_up",
+                    Expr::src("up").shard(0),
+                    vec![16, 4],
+                    f32_enc.clone(),
+                ),
             ],
             groups: Vec::new(),
         };
@@ -1415,9 +1438,19 @@ mod tests {
         let violations = verify_plan(&hole_plan, Some(&ContractView::of(&bridge_contract)))
             .expect_err("validator must reject sub-tensor byte hole");
         assert!(
-            violations.iter().any(|v| v.message.contains("unwritten byte hole")),
+            violations
+                .iter()
+                .any(|v| v.message.contains("unwritten byte hole")),
             "expected unwritten byte hole violation, got: {violations:#?}"
         );
-        let _ = (BufferId(0), InstrId(0), DestExtent { buffer: BufferId(0), offset: 0, stride: Extent::byte_run(0) });
+        let _ = (
+            BufferId(0),
+            InstrId(0),
+            DestExtent {
+                buffer: BufferId(0),
+                offset: 0,
+                stride: Extent::byte_run(0),
+            },
+        );
     }
 }

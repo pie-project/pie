@@ -1,6 +1,8 @@
 # Wan 2.2 TI2V 5B (its UMT5 text encoder and its VAE with it), and two
 # miniatures of its denoiser alone.
 
+load("//lib/dit.poem", "adaln_order", "attend", "biased", "chunks", "embedder", "linear", "norm_modulate", "reordered", "run_linear")
+
 RAW = template("raw", stop = ["</s>"])
 TOKENIZER = tokenizer(markers = [["</s>", "<pad>", "<unk>"]], pinned = {"<pad>": 0, "</s>": 1, "<unk>": 3})
 
@@ -9,13 +11,6 @@ MODELS = [
     model("wan22-mini-d128", mini = True, template = RAW, tokenizer = TOKENIZER, arch = "wan_2", layers = 2, vocab = 0),
     model("wan22-mini-nano", mini = True, template = RAW, tokenizer = TOKENIZER, arch = "wan_2", layers = 2, vocab = 0),
 ]
-
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the denoiser's q, k and v by their heads, the norms of q and k
-# across all of them with them (each rank's sum of squares summed across the
-# ranks), the FFN's up by its channels, and the attention's and FFN's output
-# projections by their rows.
-CUTS = "inferred"
 
 DEPLOYMENTS = [
     deployment("wan22-ti2v-5b", weights = dtype.bf16, kv = dtype.bf16),
@@ -26,20 +21,6 @@ DEPLOYMENTS = [
 
 # The weights of Wan 2.2: a diffusion transformer over video latents with
 # cross-attention to text, its UMT5-XXL text encoder, and its causal 3D VAE.
-
-def linear(out, in_, banks, bias = True):
-    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
-    return struct(
-        w = weight([out, in_], banks),
-        bias = weight([out]) if bias else None,
-    )
-
-def embedder(prefix, in_, dim, banks):
-    """A two-layer timestep (or caption) embedder from `in_` to `dim`."""
-    return struct(
-        linear_1 = linear(dim, in_, banks),
-        linear_2 = linear(dim, dim, banks),
-    )
 
 PATCH_T = 1
 PATCH_H = 2
@@ -341,34 +322,6 @@ def generative(m):
 # components under `dit.`, `te.` and `vae.`; or, for a denoiser alone, a bare
 # transformer state_dict.
 
-def biased(reads, w, stem):
-    """The projection `w` from `stem.weight`, and its bias (if any) from
-    `stem.bias`."""
-    reads.read(w.w, stem + ".weight")
-    if w.bias != None:
-        reads.read(w.bias, stem + ".bias")
-
-def adaln_order(slices):
-    """The order a layout takes an adaLN projection's `slices` slices in
-    from a checkpoint's: each (shift, scale) pair as (scale, shift), each
-    gate where it stands."""
-    return {
-        2: [1, 0],
-        3: [1, 0, 2],
-        6: [1, 0, 2, 4, 3, 5],
-        9: [1, 0, 2, 4, 3, 5, 7, 6, 8],
-    }[slices]
-
-def reordered(e, order, width, axis = 0):
-    """`e`'s `width`-wide slices along `axis`, taken in `order`."""
-    return concat(axis, [e.slice(axis, i * width, width) for i in order])
-
-def product(xs):
-    out = 1
-    for x in xs:
-        out *= x
-    return out
-
 DIFFUSERS = "a diffusers pipeline (`dit.`/`te.`/`vae.` prefixes)"
 BARE = "a bare transformer state_dict"
 
@@ -576,42 +529,6 @@ def encoder(reads, v):
 
 # The forward of Wan 2.2: the text encoder's reading, the denoiser's, and
 # the VAE's decode and encode, the first chunk (`fact.fresh()`) in the head form.
-
-def run_linear(w, x):
-    """`x` through the projection `w`, plus its bias if it has one."""
-    y = ops.linear.matmul(x, w.w)
-    if w.bias == None:
-        return y
-    return ops.elemwise.add_bias(w.bias, y)
-
-def chunks(x, widths):
-    """`x`'s rows cut into consecutive pieces of `widths`, the last one
-    whatever remains."""
-    out = []
-    for width in widths[:-1]:
-        head, x = ops.gather.split_rows(x, width)
-        out.append(head)
-    out.append(x)
-    return out
-
-def norm_modulate(x, scale_shift, lanes, eps):
-    """`x` layer-normed without a gain, then scaled and shifted per lane."""
-    return ops.elemwise.modulate(ops.elemwise.layernorm_no_scale(x, eps), scale_shift, lanes, "scale_shift")
-
-def attend(q, k, v, rows, over, head_dim, sm_scale, mask):
-    """`q`'s rows attending `k` and `v`'s, each side grouped by its own
-    `perm` and `csr`."""
-    o = ops.attn.ragged(
-        ops.gather.pack_rows(q, rows.perm),
-        ops.gather.pack_rows(k, over.perm),
-        ops.gather.pack_rows(v, over.perm),
-        rows.csr,
-        over.csr,
-        head_dim,
-        sm_scale,
-        mask,
-    )
-    return ops.gather.unpack_rows(o, rows.perm)
 
 NORM_EPS = 1e-6
 ROPE_THETA = 10000.0

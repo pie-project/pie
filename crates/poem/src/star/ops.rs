@@ -985,6 +985,7 @@ pub(crate) static OPS: &[Op] = &[
             "selection",
             "ratio",
             "per_head",
+            "scores",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -1001,6 +1002,7 @@ pub(crate) static OPS: &[Op] = &[
             let selection: Option<Value> = a.next()?;
             let ratio: Option<u32> = a.next()?;
             let per_head: Option<bool> = a.next()?;
+            let scores: Option<bool> = a.next()?;
             result(
                 heap,
                 dsl("attn.attend", || {
@@ -1019,6 +1021,7 @@ pub(crate) static OPS: &[Op] = &[
                         selection.as_ref(),
                         ratio,
                         per_head.unwrap_or(false),
+                        scores.unwrap_or(false),
                     )
                 })?,
             )

@@ -152,7 +152,7 @@ impl Ops {
                 // column no pair turns takes some index, never read), so
                 // a table of the frequencies holds the pairs alone
                 let d = self.bin(Binary::Rem, i, span);
-                let d = if (rotary / 2) > 0 && turn_span(&turn.pairs) % (rotary / 2) == 0 {
+                let d = if (rotary / 2) > 0 && turn_span(&turn.pairs).is_multiple_of(rotary / 2) {
                     self.bin(Binary::Rem, d, half)
                 } else {
                     d

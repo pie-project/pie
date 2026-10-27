@@ -4,21 +4,15 @@
 # as a block-diffusion text model.
 
 load("//pie/codec.poem", "nvfp4_bank", read_fused = "fused")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches", dflash_head = "head", dflash_declare = "declare")
 load("//lib/media.poem", "budget_resize")
+load("//lib/reads.poem", "flattened")
 
 GEMMA = template("gemma")
 # 26B-A4B and 31B: an unthinking turn's cue closes an empty thought channel
 GEMMA_THOUGHT = template("gemma", thinking = True)
 TOKENIZER = tokenizer(markers = [["<turn|>", "<eos>"]], parts = {"vision": [["<|image>", "<|image|>", "<image|>"]]})
-
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k and v by their heads, the gates and ups, dense and routed, by
-# their channels, the output and down projections by their rows, the tied
-# table by its vocabulary; the vision tower's mlp and the MTP assistant as
-# the trunk's.
-CUTS = "inferred"
 
 MODELS = [
     model("gemma4-26b-a4b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["mtp", "dflash"], arch = "gemma4", layers = 30, vocab = 262144),
@@ -241,7 +235,7 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s, length: weight([length])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         reading = GLOBAL if full_at(l) else SLIDING
         head_dim, row_heads = (sliding.head_dim, sliding.kv_heads) if reading == SLIDING else (glob.head_dim, glob.kv_heads)
         q_w = d.q_heads * head_dim
@@ -503,21 +497,6 @@ def layout(id, deploy):
 
 # How a Gemma 4 checkpoint is laid out: transformers', mlx_lm's and GGUF's
 # spellings, and DiffusionGemma's own.
-
-def product(xs):
-    out = 1
-    for x in xs:
-        out *= x
-    return out
-
-def flattened(name, want, broadcast = False):
-    """The tensor `name` as stored, its elements read as `want`; with
-    `broadcast`, a single stored value is read as any shape."""
-    held = shape(name)
-    if (not broadcast or product(held) > 1) and product(held) != product(want):
-        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
-            name, held, product(held), want, product(want)))
-    return src(name).transmute(want, stored(name))
 
 LAYOUTS = {
     "transformers": struct(
@@ -934,10 +913,7 @@ def forward(m, inputs):
         lanes = trunk_inputs.on(~read) if all_rows else trunk_inputs
         causal = ~switch_is("mode", "denoise") if m.self_cond != None else None
         a = ops.attn.attend(q, lanes, at.kv, m.q_heads, kv_heads, d, at.sm_scale, window = win,
-                            causal = causal, mask = True)
-        if at.reading != SLIDING:
-            scores = ops.attn.score_capture(q, lanes, at.kv, m.q_heads, kv_heads, d, at.sm_scale, observe = 32, kv_max = 2048)
-            output("attn.scores", scores)
+                            causal = causal, mask = True, scores = at.reading != SLIDING)
         return normed, a, routes
 
     def attend_readouts(l, w, y):
@@ -956,8 +932,7 @@ def forward(m, inputs):
         else:
             normed, a, layer_routes = attend(l, w, y, all_rows)
         o = ops.linear.matmul(a, w.o_proj)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(normed.on(adapted), w.lora_a, w.lora_b, layer_routes, o.on(adapted))
+        o = corrected(normed, o, w, layer_routes)
 
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, w.post_attn_norm_eps), y)
         mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, w.pre_ffw_norm_eps)

@@ -4,7 +4,7 @@ use poem_exec::fire::{ClassWindow, WindowTable};
 use poem_exec::store::kv::Geometry;
 use poem_ir::{ClassSet, Platform, Trace};
 
-const SERVED: &str = "qwen35-d0.8b";
+const SERVED: &str = "qwen3-0.6b";
 
 const PAGE: i32 = 4;
 

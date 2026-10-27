@@ -18,10 +18,10 @@ use cudarc::runtime::sys::{
     cudaError, cudaEvent_t, cudaEventCreate, cudaEventDestroy, cudaEventElapsedTime,
     cudaEventRecordExternal, cudaEventRecordWithFlags, cudaEventSynchronize, cudaFree,
     cudaGetDevice, cudaGetLastError, cudaGraph_t, cudaGraphDestroy, cudaGraphExec_t,
-    cudaGraphExecDestroy, cudaGraphInstantiateWithFlags, cudaGraphLaunch, cudaMalloc, cudaMemcpyAsync,
-    cudaMemcpyKind, cudaMemsetAsync, cudaStreamBeginCapture, cudaStreamCaptureMode, cudaStreamCaptureStatus,
-    cudaStreamCreateWithFlags, cudaStreamDestroy, cudaStreamEndCapture, cudaStreamNonBlocking,
-    cudaStreamSynchronize,
+    cudaGraphExecDestroy, cudaGraphInstantiateWithFlags, cudaGraphLaunch, cudaMalloc,
+    cudaMemcpyAsync, cudaMemcpyKind, cudaMemsetAsync, cudaStreamBeginCapture,
+    cudaStreamCaptureMode, cudaStreamCaptureStatus, cudaStreamCreateWithFlags, cudaStreamDestroy,
+    cudaStreamEndCapture, cudaStreamNonBlocking, cudaStreamSynchronize,
 };
 
 use crate::jit::device::capture_status;
@@ -201,7 +201,7 @@ pub(crate) fn act_x_wt(
             .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status));
         (plan, tactic, device.lt.handle, device.lt.workspace_bytes)
     });
-    let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want) {
+    let (ws, ws_bytes) = match ctx.scratch_stream(op, LT_WORKSPACE, want) {
         Ok(ws) if !ws.is_null() => (ws, want),
         _ => (std::ptr::null_mut(), 0),
     };
@@ -284,7 +284,7 @@ pub(crate) fn act_x_wt(
 /// row skeleton where the row skeleton carries it. Where no skeleton covers the
 /// shape, or a capture meets it untimed, the unfused leg serves it untimed;
 /// false, landing nothing, only where the row skeleton does not carry that
-/// leg either: the caller's unfused ops then serve it.
+/// leg either, which the fold never forms.
 pub(crate) fn anchored(
     ctx: &Ctx,
     op: &'static str,
@@ -447,7 +447,7 @@ pub(crate) fn anchored(
             ) else {
                 return unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k);
             };
-            let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want) {
+            let (ws, ws_bytes) = match ctx.scratch_stream(op, LT_WORKSPACE, want) {
                 Ok(ws) if !ws.is_null() => (ws, want),
                 _ => (std::ptr::null_mut(), 0),
             };
@@ -490,7 +490,16 @@ pub(crate) fn anchored(
             let bytes = (m as usize) * (n as usize) * (parts as usize) * epi.product_bytes();
             let products = ctx.scratch_stream(op, ANCHOR_PRODUCTS, bytes)?.addr() as u64;
             product(ctx, op, epi, act, w, products, m, n * parts, k)?;
-            leg.fire(epi, ctx, products, ins, outs, paging, m.unsigned_abs(), n.unsigned_abs())?;
+            leg.fire(
+                epi,
+                ctx,
+                products,
+                ins,
+                outs,
+                paging,
+                m.unsigned_abs(),
+                n.unsigned_abs(),
+            )?;
             Ok(true)
         }
         _ => unfused(ctx, op, epi, act, w, ins, outs, paging, m, n, k),
@@ -549,7 +558,7 @@ pub(crate) fn on_lt(
     if lt_handle.is_null() {
         return Ok(false);
     }
-    let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want) {
+    let (ws, ws_bytes) = match ctx.scratch_stream(op, LT_WORKSPACE, want) {
         Ok(ws) if !ws.is_null() => (ws, want),
         _ => (std::ptr::null_mut(), 0),
     };
@@ -605,7 +614,7 @@ fn unfused(
     while from < m as usize {
         let rows = run.min(m as usize - from);
         let at = |base: u64, width: usize| base + (from * width * 2) as u64;
-        let ins: Vec<In> = ins.iter().map(|input| input.from_row(from)).collect();
+        let ins: Vec<In> = ins.iter().map(|input| input.at_row(from)).collect();
         let outs: Vec<u64> = (0..outs.len())
             .zip(outs)
             .map(|(r, &out)| {
@@ -631,7 +640,11 @@ fn unfused(
         )?;
         // a paged result's live rows from the run's first
         let paging = paging.map(|p| Paging {
-            valid: if p.valid == 0 { 0 } else { p.valid + from as u64 },
+            valid: if p.valid == 0 {
+                0
+            } else {
+                p.valid + from as u64
+            },
             ..p
         });
         leg.fire(

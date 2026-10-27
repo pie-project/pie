@@ -2,15 +2,10 @@
 # eight layers of the whole model's checkpoint.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks")
+load("//lib/adapters.poem", "banks", "corrected")
 
 ATEM = template("atem")
 
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q, k, v and the attention's gate by their heads, the MLP's gate
-# and up by their channels, the output and down projections by their rows,
-# the head by its vocabulary.
-CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|eot|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"]])
 
 MODELS = [
@@ -54,7 +49,6 @@ DIMS = {
 def layout(id, deploy):
     w = roles(deploy, "w", exact = True).w
     d = DIMS[id]
-    dense = compute(w)
     proj = w
     hidden = d.hidden
     hd = d.head_dim
@@ -64,7 +58,7 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s: weight([hidden])
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        lora_a, lora_b = banks(hidden)
         return struct(
             full = l % d.full_every == d.full_every - 1,
             q = weight([q_w, hidden], proj),
@@ -192,15 +186,11 @@ def forward(m, inputs):
         ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
 
         # Each lane by its kind; a full layer's scores are read out.
-        a = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win, mask = True)
-        if w.full:
-            scores = ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
-            output("attn.scores", scores)
+        a = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win, mask = True, scores = w.full)
 
         gate = ops.linear.matmul(normed, w.gate)
         o = ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(a, gate), w.o_proj)
-        adapted = fact.has(fact.Adapter)
-        o = ops.linear.lora_correct(normed.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = corrected(normed, o, w, routes)
 
         y = ops.elemwise.residual_add(
             ops.elemwise.rmsnorm_plus_one(o, w.post_attn_norm, w.post_attn_norm_eps),

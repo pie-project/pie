@@ -154,12 +154,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     #[cfg(feature = "rocm")]
     let anchored = std::collections::BTreeMap::new();
     profile.synth_anchors = false;
-    // `compiler.synth_regions`: each chain of elementwise and row ops folded
-    // into one `fused.region`, its region kernels-ir's, by the fold
-    // `compile_axes` plans under the flag. Folded once, here, the trace is
-    // the one the load runs and every plan after is of it as it stands.
+    // `compiler.synth_regions`: each chain of elementwise and row ops the row
+    // skeleton serves folded into one `fused.region`, its region kernels-ir's.
+    // Folded once, here, the trace is the one the load runs and every plan
+    // after is of it as it stands.
     let regions = if profile.synth_regions {
-        let (folded, regions) = poem_compiler::fuse::chain::fold(boot.trace.clone(), &crate::synth::serves_region);
+        let (folded, regions) =
+            poem_compiler::fuse::chain::fold(boot.trace.clone(), &crate::synth::serves_region);
         boot.trace = folded;
         profile.synth_regions = false;
         regions
@@ -1136,8 +1137,13 @@ impl Shell {
         // this fit, by about the activation arena again at a 16K-token
         // budget; held for them here, the cache rows leave the bodies the
         // room they were allowed (GLM's mini armed 11 of 49 compositions
-        // without it, its prefill buckets walking eagerly).
-        let scratch_growth = if cfg!(feature = "rocm") && shell.records_bodies() {
+        // without it, its prefill buckets walking eagerly). A hybrid's slots
+        // are cut at this fit for good, and on CUDA its chunked recurrence
+        // grows them the same way (Kimi-K3's mini: 3.1 GB of KDA planes at
+        // 8192 tokens left an RTX 5090's rows short of one sequence).
+        let scratch_growth = if (cfg!(feature = "rocm") || shell.pools.has_state())
+            && shell.records_bodies()
+        {
             shell.arena.bytes()
         } else {
             0

@@ -103,7 +103,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
         ]
     });
 
-/// The hand rules CUDA no longer holds: every site one forms folds into a
+/// The hand rules CUDA does not hold: every site one forms folds into a
 /// generated row kernel or an anchored region instead.
 #[cfg(not(feature = "rocm"))]
 #[must_use]
@@ -230,7 +230,7 @@ mod tests {
         assert!(stale.is_empty(), "named by no op: {stale:?}");
     }
 
-    /// The hand rules CUDA no longer holds, their chains generated row
+    /// The hand rules CUDA does not hold, their chains generated row
     /// kernels and their products' epilogues anchored regions: on every
     /// catalog deployment, fused by this backend's rules and folded (the
     /// anchors, then the chains), none of them finds a match left that it
@@ -309,7 +309,8 @@ mod tests {
                 let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
                 let (here, _) = formed(fused.clone());
                 let (anchored, _) = crate::synth::fold_anchors(fused);
-                let (folded, _) = poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
+                let (folded, _) =
+                    poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
                 let (left, thin) = formed(folded);
                 let held = census.entry(kernel).or_default();
                 held.0 += here;
@@ -377,7 +378,8 @@ mod tests {
             };
             let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
             let (anchored, _) = crate::synth::fold_anchors(fused);
-            let (folded, _) = poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
+            let (folded, _) =
+                poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
             let regions: Vec<(Vec<poem_ir::ValueId>, Vec<poem_ir::ValueId>)> = folded
                 .nodes
                 .iter()

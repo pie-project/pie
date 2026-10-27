@@ -24,7 +24,10 @@ fn micro() -> Package {
             "\"qwen3-0.6b\": dims(hidden = 1024, layers = 28, q_heads = 16, kv_heads = 8, inter = 3072, tied = True),",
             "\"qwen3-0.6b\": dims(hidden = 256, layers = 2, q_heads = 8, kv_heads = 2, inter = 64, tied = True),",
         ),
-        ("qwen3(\"qwen3-0.6b\", layers = 28),", "qwen3(\"qwen3-0.6b\", layers = 2),"),
+        (
+            "qwen3(\"qwen3-0.6b\", layers = 28),",
+            "qwen3(\"qwen3-0.6b\", layers = 2),",
+        ),
         ("head_dim = 128,", "head_dim = 32,"),
         ("151936", "512"),
     ];

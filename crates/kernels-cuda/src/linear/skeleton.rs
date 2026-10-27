@@ -22,8 +22,8 @@
 //!   shape class (warps, rows, splits) and the body's planes. The disk cache
 //!   keys the unit's text, the headers and the instantiation, as it does a
 //!   carried unit's.
-//! - **Loading.** A kernel loads on its first fire, as the carried kernels
-//!   these skeletons replace did: the plain store's body is fixed, and the
+//! - **Loading.** A kernel loads on its first fire, as a carried kernel
+//!   does: the plain store's body is fixed, and the
 //!   tuner fires it before a capture. An anchored region a load forms
 //!   loads with the model, every kernel a fire of it may take
 //!   ([`Epilogue::load_every`]).
@@ -34,8 +34,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::elemwise::skeleton::{Cache, Store};
 use dtype::Dtype;
 pub use kernels_ir::anchor::{
-    Anchored, CacheDtype, CachePlane, Contraction, Input, Layout, Paged, Pointwise, Quant,
-    Window,
+    Anchored, CacheDtype, CachePlane, Contraction, Input, Layout, Paged, Pointwise, Quant, Window,
 };
 
 /// Where a paged epilogue's cache rows live, past each result's own plane
@@ -141,7 +140,7 @@ impl In {
     /// served apart.
     #[cfg(feature = "cuda")]
     #[must_use]
-    pub(crate) const fn from_row(self, row: usize) -> In {
+    pub(crate) const fn at_row(self, row: usize) -> In {
         let size = if self.dtype == 1 { 4 } else { 2 };
         In {
             base: self.base + (row as i64 * self.row_stride * size) as u64,
@@ -383,7 +382,10 @@ impl Epilogue {
         let root = unit(&body)?;
         let windows = anchored.windows.clone();
         let eights = |w: &Window| {
-            w.from % 8 == 0 && w.width % 8 == 0 && w.head % 8 == 0 && w.stride % 8 == 0
+            w.from.is_multiple_of(8)
+                && w.width.is_multiple_of(8)
+                && w.head.is_multiple_of(8)
+                && w.stride.is_multiple_of(8)
         };
         let strided_paged = windows
             .iter()
@@ -531,10 +533,7 @@ impl Epilogue {
     /// The window of the tile result `k` lands at `n` columns.
     #[must_use]
     pub fn window(&self, k: usize, n: u32) -> Window {
-        self.windows
-            .get(k)
-            .copied()
-            .unwrap_or(Window::of(0, n))
+        self.windows.get(k).copied().unwrap_or(Window::of(0, n))
     }
 
     /// Whether it serves a tile of `n` columns: any, or the one its body is
@@ -649,7 +648,11 @@ impl Epilogue {
                 slot: ins[p.slot as usize].base,
                 valid: paging.valid,
                 page_size: paging.page_size,
-                e4m3: if let CacheDtype::E4m3 { scale } = p.dtype { Some(scale) } else { None },
+                e4m3: if let CacheDtype::E4m3 { scale } = p.dtype {
+                    Some(scale)
+                } else {
+                    None
+                },
             });
             words.extend(Store::of(*w, cache.as_ref()).words());
         }
@@ -1324,7 +1327,12 @@ impl RowLeg {
                         )
                     }
                     None => Plane::window(
-                        &Tensor::new(outs[land.k] + u64::from(land.at) * 2, m, land.ld, Dtype::Bf16),
+                        &Tensor::new(
+                            outs[land.k] + u64::from(land.at) * 2,
+                            m,
+                            land.ld,
+                            Dtype::Bf16,
+                        ),
                         land.from,
                         width,
                     ),
@@ -1429,17 +1437,42 @@ mod tests {
         );
         assert!(bias.planes(&[In::row(64)], &[128], 8, None).is_err());
         assert!(bias.planes(&[], &[128], 8, None).is_err());
-        let words = bias.planes(&[In::column(64)], &[128], 8, None).expect("a bias");
+        let words = bias
+            .planes(&[In::column(64)], &[128], 8, None)
+            .expect("a bias");
         // One input (its base, strides, dtype and period), one unread, one
         // result, its row's stride, then its store: no cache row, its
         // window's columns 0..8, a unit scale.
-        assert_eq!(words, vec![
-                64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0,
-                0, 0, 8 << 32, 0, 0x3f80_0000, 0
-            ]);
+        assert_eq!(
+            words,
+            vec![
+                64,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                128,
+                8,
+                0,
+                0,
+                0,
+                8 << 32,
+                0,
+                0x3f80_0000,
+                0
+            ]
+        );
         // A head's weight and a row's i32 position, each of its kind.
         assert_eq!(In::head(64, 32).kind(), Input::Head(32));
         assert_eq!(In::row(64).i32().dtype(), Dtype::I32);
-        assert!(bias.planes(&[In::column(64).i32()], &[128], 8, None).is_err());
+        assert!(
+            bias.planes(&[In::column(64).i32()], &[128], 8, None)
+                .is_err()
+        );
     }
 }

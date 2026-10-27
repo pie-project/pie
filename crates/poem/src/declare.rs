@@ -21,6 +21,26 @@ pub struct Weight {
     /// importer lands them, whatever the checkpoint holds, and no format
     /// reads it.
     pub values: Option<Vec<f32>>,
+    /// The turn its columns are stored against, or `None` for a weight
+    /// stored as it reads.
+    pub turn: Option<Box<Turn>>,
+}
+
+/// A weight stored against turned inputs, `W·S·H`: a product turns its
+/// input by `H·S` first, the blockwise Hadamard `H` of `block` over the sign
+/// diagonal `signs`; a table's gathered rows turn back by `S·H`.
+#[derive(Clone)]
+pub struct Turn {
+    pub signs: Weight,
+    pub block: u32,
+    /// Which layout value `signs` is, so its name follows that one's path.
+    pub origin: u64,
+}
+
+impl std::fmt::Debug for Turn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Turn({:?}, block {})", self.signs.name, self.block)
+    }
 }
 
 /// Weights the compiler joins along their rows into one: `legs`, by name,
@@ -64,7 +84,11 @@ impl Join {
         // The path every leg ends in, past the common one, each leg keeping
         // a part of its own.
         let tail = (0..shortest.saturating_sub(common + 1))
-            .take_while(|&i| parts.iter().all(|p| p[p.len() - 1 - i] == parts[0][parts[0].len() - 1 - i]))
+            .take_while(|&i| {
+                parts
+                    .iter()
+                    .all(|p| p[p.len() - 1 - i] == parts[0][parts[0].len() - 1 - i])
+            })
             .count();
         let rests: Vec<String> = parts
             .iter()
@@ -126,6 +150,7 @@ impl Weight {
             layout: ParamLayout::Natural,
             placement: ParamPlacement::Device,
             values: None,
+            turn: None,
         }
     }
 
@@ -772,6 +797,7 @@ impl Weight {
             layout: p.layout,
             placement: p.placement,
             values: None,
+            turn: None,
         }
     }
 }
@@ -952,10 +978,7 @@ mod join_tests {
             "blocks.0.gate_up.bank"
         );
         assert_eq!(Join::name_of(&["a.w", "b.w"]), "ab.w");
-        assert_eq!(
-            Join::name_of(&["gdn.in_qkv", "gdn.in_z"]),
-            "gdn.in_qkvz"
-        );
+        assert_eq!(Join::name_of(&["gdn.in_qkv", "gdn.in_z"]), "gdn.in_qkvz");
         assert_eq!(Join::name_of(&["gdn.in_b", "gdn.in_a"]), "gdn.in_ba");
         assert_eq!(
             Join::name_of(&["mlp.shared_gate", "mlp.shared_up"]),
@@ -994,7 +1017,10 @@ mod join_tests {
         // Legs every rank holds whole join whole along the axis named.
         let whole = |name: &str| Weight::sym(name, [8, 32, 64], Dtype::Bf16);
         let bank = Weight::joined_along("gate_up", &[whole("gate"), whole("up")], Some(1)).unwrap();
-        assert_eq!((bank.shape, bank.shard), (vec![8, 64, 64], Shard::Replicated));
+        assert_eq!(
+            (bank.shape, bank.shard),
+            (vec![8, 64, 64], Shard::Replicated)
+        );
         assert!(Weight::joined("gate_up", &[whole("gate"), whole("up")]).is_err());
     }
 }

@@ -79,7 +79,9 @@ impl Store {
     /// Window `w`'s columns (a head-major one's heads, one after another),
     /// at the row `cache`'s page and slot name where it lands in one.
     pub(crate) fn of(w: kernels_ir::Window, cache: Option<&Cache>) -> Store {
-        let c = cache.map_or((0, 0, 0, 0, None), |c| (c.page, c.slot, c.valid, c.page_size, c.e4m3));
+        let c = cache.map_or((0, 0, 0, 0, None), |c| {
+            (c.page, c.slot, c.valid, c.page_size, c.e4m3)
+        });
         Store {
             page: c.0,
             slot: c.1,

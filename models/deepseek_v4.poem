@@ -3,15 +3,9 @@
 # miniature; V4-Pro and its five-layer, sixteen-expert miniature; and the
 # small V4 base.
 
-load("//lib/adapters.poem", "banks")
-
-# The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: q's up projection and the attention's sinks by their heads, the
-# base model's per-head kv and its norm across all of them with them (each
-# rank's sum of squares summed across the ranks), the grouped output
-# projections, the dense, shared and routed experts by their channels, the
-# down projections by their rows.
-CUTS = "inferred"
+load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/hyper.poem", "hyper", "mix", "mixes", "gate", "collapse", "predict_route")
+load("//lib/mla.poem", "fp8_rows", "boundaries")
 
 R1 = template("deepseek")
 TOKENIZER = tokenizer(markers = [["<｜end▁of▁sentence｜>", "<|EOT|>"]])
@@ -40,65 +34,10 @@ W8A8 = [dtype.fp8b128a8, dtype.mxfp4a8]
 # and MXFP4 experts, each against e4m3 activations in 1x32 blocks.
 MX8 = [dtype.fp8b32a8g32, dtype.mxfp4a8g32]
 
-DEPLOYMENTS = [
-    deployment("dsv41-flash", weights = U4, kv = BF),
-    deployment("dsv41-flash", weights = [BF, FP4], kv = BF),
-    deployment("dsv41-flash-mini", weights = [BF, FP4], kv = BF),
-    deployment("dsv41-flash", weights = MX8, kv = BF),
-    deployment("dsv41-flash-mini", weights = MX8, kv = BF),
-    deployment("dsv41-flash-trunc8", weights = MX8, kv = BF),
-    deployment("dsv41-flash", weights = MX8, kv = dtype.nvfp4),
-    deployment("dsv41-flash-mini", weights = MX8, kv = dtype.nvfp4),
-    # DSpark, DeepSeek's draft head, beside the release's own serving format.
-    deployment("dsv41-flash", weights = MX8, kv = dtype.nvfp4, drafter = "dspark"),
-    deployment("dsv41-flash-mini", weights = MX8, kv = dtype.nvfp4, drafter = "dspark"),
-    deployment("dsv4-flash", weights = [BF, FP4], kv = BF, drafter = "mtp"),
-    deployment("dsv4-flash", weights = [BF, FP4], kv = BF),
-    deployment("dsv4-flash", weights = W8A8, kv = BF),
-    deployment("dsv4-flash", weights = [U4, U2, FP4], kv = BF, drafter = "mtp"),
-    deployment("dsv4-flash-mini", weights = [U4, U2, FP4], kv = BF, drafter = "mtp"),
-    deployment("dsv4-flash", weights = [U4, U2], kv = BF),
-    deployment("dsv4-flash-mini", weights = [U4, U2], kv = BF),
-    deployment("dsv4-flash-mini", weights = BF, kv = BF),
-    deployment("dsv4-flash-mini", weights = [BF, FP4], kv = BF),
-    deployment("dsv4-flash-mini", weights = W8A8, kv = BF),
-    # DeepSeek's fp8 rows (FlashMLA's fp8_ds_mla), the kv vLLM serves V4 at.
-    deployment("dsv4-flash", weights = W8A8, kv = dtype.e4m3),
-    deployment("dsv4-flash-mini", weights = W8A8, kv = dtype.e4m3),
-    deployment("dsv4-pro",weights = [BF, FP4], kv = BF),
-    deployment("dsv4-pro-mini", weights = [BF, FP4], kv = BF),
-    deployment("dsv4-base", weights = BF, kv = BF),
-    deployment("dsv4-flash", weights = BF, kv = BF),
-]
-
 # The weights of DeepSeek-V4 (Flash and Pro): multi-latent attention over a
 # sliding window and a pool of compressed entries, residual streams mixed by
 # manifold hyper-connections, DeepSeekMoE experts; V4.1-Flash adds Compressed Sparse
 # Attention 2 (cross-layer KV and index reuse), Single-Pass mHC and Engram.
-
-def hyper(streams, norm_eps, gate_eps, alpha, sinkhorn, single_pass = False):
-    """The streams' shape and the constants their gates are computed with;
-    under `single_pass` each sublayer's input mix is the one the previous
-    sublayer predicted."""
-    return struct(
-        streams = streams,
-        norm_eps = norm_eps,
-        gate_eps = gate_eps,
-        alpha = alpha,
-        sinkhorn = sinkhorn,
-        single_pass = single_pass,
-    )
-
-def mix(n, name, streams, hidden, dynamic = True):
-    """A sublayer's mix `name` over `streams` streams `hidden` wide: a
-    static `base` and `scale`, and with `dynamic` a projection of the
-    normed streams added to it."""
-    width = 2 * streams + streams * streams
-    return struct(
-        scale = weight([3], dtype.f32),
-        base = weight([width], dtype.f32),
-        dynamic = weight([width, streams * hidden], dtype.f32) if dynamic else None,
-    )
 
 def head(prefix, streams, hidden):
     """The mix `prefix` that collapses the streams into one row."""
@@ -150,7 +89,7 @@ def base(w, kv, d):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, dim: weight([dim], w)
-        lora_a, lora_b = banks("layer.{}".format(l), hidden, compute(w))
+        lora_a, lora_b = banks(hidden)
         ratio = d.pool[l]
         if l < d.dense_layers:
             di = d.dense_inter
@@ -330,7 +269,7 @@ def flash(w, r, kv, d, quant = None):
         n = lambda s: "{}.{}".format(prefix, s)
         q = lin if lin != None else weights
         norm = lambda s, dim: weight([dim], sdense)
-        lora_a, lora_b = banks(prefix, hidden, sdense)
+        lora_a, lora_b = banks(hidden)
         has_indexer = ratio == 4
         pool = None
         if ratio != None:
@@ -572,7 +511,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
         prefix = "layer.{}".format(l)
         n = lambda s: "{}.{}".format(prefix, s)
         norm = lambda s, dim: weight([dim])
-        lora_a, lora_b = banks(prefix, hidden, dense)
+        lora_a, lora_b = banks(hidden)
         ratio = plan.ratios[l]
         csa = csa_of(plan, l)
         kv_of = None
@@ -654,7 +593,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
         many window positions ending at their lane's last."""
         n = lambda s: "{}.{}".format(prefix, s)
         norm = lambda s, dim: weight([dim])
-        lora_a, lora_b = banks(prefix, hidden, dense)
+        lora_a, lora_b = banks(hidden)
         return struct(
             attn_mix = mix(n, "attn_mix", streams, hidden),
             attn_norm = norm("attn_norm", hidden),
@@ -741,59 +680,59 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
         dspark = draft_head() if dspark else None,
     )
 
+V41 = lambda: dims41(V41_PLAN)
+V41_MINI = lambda: dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000)
+V41_TRUNC8 = lambda: dims41(V41_TRUNC8_PLAN)
+V4 = lambda draft: flash_dims(43, flash_ratios(), 3, draft = draft)
+V4_MINI = lambda draft: flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16, draft = draft)
+PRO = lambda draft: pro_dims(61, pro_ratios(), 3)
+PRO_MINI = lambda draft: pro_dims(5, PRO_MINI_RATIOS, 3, experts = 16)
+
+def v41(dims, w, r, quant = None):
+    return lambda kv, drafter: flash41(w, r, kv, dims(), quant = quant, dspark = drafter == "dspark")
+
+def v4(dims, w, r, quant = None):
+    return lambda kv, drafter: flash(w, r, kv, dims(drafter == "mtp"), quant = quant)
+
+# Each deployment, and how it lays its weights out from its kv and drafter;
+# an import tries them in this order.
+SHIPS = [
+    ("dsv41-flash", U4, BF, None, v41(V41, U4, uniform(U4))),
+    ("dsv41-flash", [BF, FP4], BF, None, v41(V41, BF, uniform(FP4))),
+    ("dsv41-flash-mini", [BF, FP4], BF, None, v41(V41_MINI, BF, uniform(FP4))),
+    ("dsv41-flash", MX8, BF, None, v41(V41, BF, uniform(MX8[1]), MX8[0])),
+    ("dsv41-flash-mini", MX8, BF, None, v41(V41_MINI, BF, uniform(MX8[1]), MX8[0])),
+    ("dsv41-flash-trunc8", MX8, BF, None, v41(V41_TRUNC8, BF, uniform(MX8[1]), MX8[0])),
+    ("dsv41-flash", MX8, dtype.nvfp4, None, v41(V41, BF, uniform(MX8[1]), MX8[0])),
+    ("dsv41-flash-mini", MX8, dtype.nvfp4, None, v41(V41_MINI, BF, uniform(MX8[1]), MX8[0])),
+    # DSpark, DeepSeek's draft head, beside the release's own serving format.
+    ("dsv41-flash", MX8, dtype.nvfp4, "dspark", v41(V41, BF, uniform(MX8[1]), MX8[0])),
+    ("dsv41-flash-mini", MX8, dtype.nvfp4, "dspark", v41(V41_MINI, BF, uniform(MX8[1]), MX8[0])),
+    ("dsv4-flash", [BF, FP4], BF, "mtp", v4(V4, BF, uniform(FP4))),
+    ("dsv4-flash", [BF, FP4], BF, None, v4(V4, BF, uniform(FP4))),
+    ("dsv4-flash", W8A8, BF, None, v4(V4, BF, uniform(W8A8[1]), W8A8[0])),
+    ("dsv4-flash", [U4, U2, FP4], BF, "mtp", v4(V4, U4, DQ_2BIT_FULL)),
+    ("dsv4-flash-mini", [U4, U2, FP4], BF, "mtp", v4(V4_MINI, U4, DQ_2BIT)),
+    ("dsv4-flash", [U4, U2], BF, None, v4(V4, U4, DQ_2BIT_FULL)),
+    ("dsv4-flash-mini", [U4, U2], BF, None, v4(V4_MINI, U4, DQ_2BIT)),
+    ("dsv4-flash-mini", BF, BF, None, v4(V4_MINI, BF, uniform(BF))),
+    ("dsv4-flash-mini", [BF, FP4], BF, None, v4(V4_MINI, BF, uniform(FP4))),
+    ("dsv4-flash-mini", W8A8, BF, None, v4(V4_MINI, BF, uniform(W8A8[1]), W8A8[0])),
+    # DeepSeek's fp8 rows (FlashMLA's fp8_ds_mla), the kv vLLM serves V4 at.
+    ("dsv4-flash", W8A8, dtype.e4m3, None, v4(V4, BF, uniform(W8A8[1]), W8A8[0])),
+    ("dsv4-flash-mini", W8A8, dtype.e4m3, None, v4(V4_MINI, BF, uniform(W8A8[1]), W8A8[0])),
+    ("dsv4-pro", [BF, FP4], BF, None, v4(PRO, BF, uniform(FP4))),
+    ("dsv4-pro-mini", [BF, FP4], BF, None, v4(PRO_MINI, BF, uniform(FP4))),
+    ("dsv4-base", BF, BF, None, lambda kv, drafter: base(BF, kv, BASE)),
+    ("dsv4-flash", BF, BF, None, v4(V4, BF, uniform(BF))),
+]
+
+DEPLOYMENTS = [deployment(id, weights = w, kv = kv, drafter = drafter) for id, w, kv, drafter, _ in SHIPS]
+
 def layout(id, deploy):
-    ws = deploy.weights
-    bf = dtype.bf16
-    u4 = dtype.u4g64
-    mx = dtype.mxfp4
-    fp8 = dtype.fp8b128a8
-    mxa8 = dtype.mxfp4a8
-    fp8b32 = dtype.fp8b32a8g32
-    mxg32 = dtype.mxfp4a8g32
-    kv = deploy.kv
-    mtp = deploy.drafter == "mtp"
-    dspark = deploy.drafter == "dspark"
-    if id == "dsv41-flash" and ws == [u4]:
-        return flash41(u4, uniform(u4), kv, dims41(V41_PLAN))
-    if id == "dsv41-flash" and ws == [bf, mx]:
-        return flash41(bf, uniform(mx), kv, dims41(V41_PLAN))
-    if id == "dsv41-flash-mini" and ws == [bf, mx]:
-        return flash41(bf, uniform(mx), kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000))
-    if id == "dsv41-flash" and ws == [fp8b32, mxg32]:
-        return flash41(bf, uniform(mxg32), kv, dims41(V41_PLAN), quant = fp8b32, dspark = dspark)
-    if id == "dsv41-flash-mini" and ws == [fp8b32, mxg32]:
-        return flash41(bf, uniform(mxg32), kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000),
-                       quant = fp8b32, dspark = dspark)
-    if id == "dsv41-flash-trunc8" and ws == [fp8b32, mxg32] and not dspark:
-        return flash41(bf, uniform(mxg32), kv, dims41(V41_TRUNC8_PLAN), quant = fp8b32)
-    if id == "dsv4-flash":
-        if ws == [bf] and not mtp:
-            return flash(bf, uniform(bf), kv, flash_dims(43, flash_ratios(), 3))
-        if ws == [u4, dtype.u2g64] and not mtp:
-            return flash(u4, DQ_2BIT_FULL, kv, flash_dims(43, flash_ratios(), 3))
-        if ws == [u4, dtype.u2g64, mx] and mtp:
-            return flash(u4, DQ_2BIT_FULL, kv, flash_dims(43, flash_ratios(), 3, draft = True))
-        if ws == [bf, mx]:
-            return flash(bf, uniform(mx), kv, flash_dims(43, flash_ratios(), 3, draft = mtp))
-        if ws == [fp8, mxa8] and not mtp:
-            return flash(bf, uniform(mxa8), kv, flash_dims(43, flash_ratios(), 3), quant = fp8)
-    if id == "dsv4-flash-mini":
-        if ws == [bf] and not mtp:
-            return flash(bf, uniform(bf), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
-        if ws == [u4, dtype.u2g64] and not mtp:
-            return flash(u4, DQ_2BIT, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
-        if ws == [u4, dtype.u2g64, mx] and mtp:
-            return flash(u4, DQ_2BIT, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16, draft = True))
-        if ws == [bf, mx] and not mtp:
-            return flash(bf, uniform(mx), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
-        if ws == [fp8, mxa8] and not mtp:
-            return flash(bf, uniform(mxa8), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16), quant = fp8)
-    if id == "dsv4-pro" and ws == [bf, mx] and not mtp:
-        return flash(bf, uniform(mx), kv, pro_dims(61, pro_ratios(), 3))
-    if id == "dsv4-pro-mini" and ws == [bf, mx] and not mtp:
-        return flash(bf, uniform(mx), kv, pro_dims(5, PRO_MINI_RATIOS, 3, experts = 16))
-    if id == "dsv4-base" and ws == [bf] and not mtp:
-        return base(bf, kv, BASE)
+    for at, w, _, drafter, build in SHIPS:
+        if at == id and (w if type(w) == "list" else [w]) == deploy.weights and drafter == deploy.drafter:
+            return build(deploy.kv, drafter)
     fail("{} does not ship {}".format(id, deploy))
 
 # How a DeepSeek-V4 checkpoint is laid out. V4.1-Flash: its per-expert
@@ -1250,38 +1189,6 @@ def gguf(m, reads):
 # compressed (and on V4.1 sparsely selected) pool, and folds its outputs back;
 # V4.1's Engram writes n-gram memories into the streams before a layer.
 
-# How many experts the next layer's router is predicted to take.
-PREDICT_K = 16
-
-def mixes(normed, mix, hy):
-    """`mix`'s per-row mixes of the `normed` streams: its dynamic
-    projection, or with none the leading rows of the streams."""
-    if mix.dynamic != None:
-        return ops.elemwise.hc_project(normed, mix.dynamic, hy.streams)
-    head, _ = ops.gather.split_rows(normed, mix.base.shape[0])
-    return head
-
-def gate(streams, mix, hy):
-    """The sublayer input `mix` reads out of `streams`, and the post and
-    combine mixes its output is folded back with."""
-    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
-    return ops.elemwise.hc_gates(
-        mixes(normed, mix, hy),
-        streams,
-        mix.scale,
-        mix.base,
-        hy.streams,
-        hy.gate_eps,
-        hy.alpha,
-        hy.sinkhorn,
-    )
-
-def collapse(streams, head, hy):
-    """The streams collapsed into one row through the mix `head`."""
-    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
-    mixed = ops.elemwise.hc_project(normed, head.dynamic, hy.streams)
-    return ops.elemwise.hc_collapse(mixed, streams, head.scale, head.base, hy.streams, hy.gate_eps)
-
 def summed(streams, hidden, count):
     """The `count` streams, each `hidden` wide, added into one row."""
     y, rest = ops.gather.split_rows(streams, hidden)
@@ -1289,25 +1196,6 @@ def summed(streams, hidden, count):
         stream, rest = ops.gather.split_rows(rest, hidden)
         y = ops.elemwise.residual_add(stream, y)
     return ops.elemwise.residual_add(rest, y)
-
-def predict_route(streams, hy, mix, norm, norm_eps, router, bias, experts):
-    """The experts a following MLP's router is predicted to take: the
-    streams through its `mix` and `norm`, scored by its `router`."""
-    x, _, _ = gate(streams, mix, hy)
-    x = ops.elemwise.rmsnorm(x, norm, norm_eps)
-    logits = ops.linear.matmul(x, router)
-    return ops.linear.moe_route(logits, experts, PREDICT_K, routing.predict(), bias = bias)[0]
-
-def boundaries(positions, row_valid, ratio, split = True):
-    """Where the rows close entries of a key pool that compresses `ratio`
-    rows into one: each boundary's position, request and rope position.
-    With `split` the decode and prefill arms find theirs apart."""
-    if not split:
-        return ops.attn.pool_boundary(positions, row_valid, ratio, decode = False)
-    one = fact.single_token()
-    dpos, dreq, drope = ops.attn.pool_boundary(positions.on(one), row_valid, ratio, decode = True)
-    ppos, preq, prope = ops.attn.pool_boundary(positions.on(~one), row_valid, ratio, decode = False)
-    return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])
 
 # An e4m3 kv deployment keeps the window's plane and the compressed rows as
 # DeepSeek's fp8 rows (FlashMLA's fp8_ds_mla): 448 e4m3 codes and the 64
@@ -1328,9 +1216,6 @@ FP4_KEY_ROW = 68
 # The ratios whose pools pack their entries a row each: every page size a
 # deployment serves at is a multiple of them.
 COMPACT_RATIOS = [2, 4]
-
-def fp8_rows(m):
-    return m.kv == dtype.e4m3
 
 def fp4_rows(m):
     return m.kv == dtype.nvfp4
@@ -1744,8 +1629,7 @@ def layer(m, rows, w, streams, trail, following = None, narrow = False, replays 
     else:
         o = ops.linear.matmul(o, at.o_down)
     o = ops.linear.matmul(o, at.o_up)
-    adapted = fact.has(fact.Adapter)
-    o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, rows.adapters, o.on(adapted))
+    o = corrected(x, o, w, rows.adapters)
     if replays:
         # The correction lands on every row it is read for: a replaying
         # layer's, the decoder's (a DSpark deployment's trunk's).

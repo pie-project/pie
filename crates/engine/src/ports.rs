@@ -368,7 +368,10 @@ mod tests {
         let device = PortMask::of(&[Port::EmbedTokens, Port::AttnMask]);
         let envelope = |port| super::engine_resolves(GeometryClass::DecodeEnvelope, device, port);
         assert!(envelope(Port::EmbedTokens) && envelope(Port::AttnMask));
-        assert!(!envelope(Port::Positions), "positions the runtime resolved are the lane's");
+        assert!(
+            !envelope(Port::Positions),
+            "positions the runtime resolved are the lane's"
+        );
         assert!(!envelope(Port::Fold) && !envelope(Port::Slots));
         assert!(super::engine_resolves(
             GeometryClass::DeviceGeometry,

@@ -21,7 +21,7 @@ std = []
 serde = ["dep:serde", "dtype/serde"]
 
 [dependencies]
-dtype = { package = "pie-dtype", version = "0.5.2", path = "../dtype", default-features = false }
+dtype = { package = "pie-dtype", version = "0.6.0", path = "../dtype", default-features = false }
 
 serde = { version = "1.0", default-features = false, features = [
     "alloc",

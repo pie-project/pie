@@ -57,8 +57,7 @@ fn compile_through(
     let (metadata, contract) = constant::mounted(metadata, contract)?;
     let (metadata, contract) = (metadata.as_ref(), contract.as_ref());
     let contract = &crate::contract::rewrite::cast_block_scaled_fp8_legs_apart(contract, metadata)?;
-    let contract =
-        &crate::contract::rewrite::push_affine_into_scale(contract, metadata, &target)?;
+    let contract = &crate::contract::rewrite::push_affine_into_scale(contract, metadata, &target)?;
     let rewritten =
         crate::contract::rewrite::coalesce_direct_row_shards(contract, metadata, &target)?;
     let mut plan = build::build(metadata, &rewritten, target.clone())?;

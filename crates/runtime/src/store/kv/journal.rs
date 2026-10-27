@@ -112,6 +112,7 @@ impl Journal {
 
     /// Removes the journal, so that the next run trusts none of the slots:
     /// what follows a write that failed.
+    #[allow(clippy::drop_non_drop)]
     pub fn abandon(self) -> io::Result<()> {
         drop(self.file);
         std::fs::remove_file(&self.path)

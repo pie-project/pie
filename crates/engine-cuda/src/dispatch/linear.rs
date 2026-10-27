@@ -148,34 +148,6 @@ impl Run<'_> {
                     gate_add: gate_add.clone(),
                 })
             }
-            Fused::MatmulGlu {
-                act,
-                w,
-                intermediate,
-                glu: poem_ir::GluAct::Swiglu,
-                packed,
-                y,
-            } => {
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *w,
-                    y: *packed,
-                    input_scales: None,
-                    scales: None,
-                    quant: None,
-                    logits: false,
-                })?;
-                self.linear(&Linear::Glu {
-                    packed: Some(*packed),
-                    intermediate: *intermediate,
-                    y: *y,
-                    gate: None,
-                    weights: None,
-                    limit: None,
-                    act: poem_ir::GluAct::Swiglu,
-                    up: None,
-                })
-            }
             // Not in `FUSIONS`, so never formed here; whole, it is its three
             // primitives.
             Fused::MatmulSwigluMatmul {
@@ -432,7 +404,15 @@ impl Run<'_> {
             .anchor_epilogue(key)
             .ok_or_else(|| broken(format!("the load loaded no epilogue for {key:016x}")))?;
         let (planes, landed, paging) = self.anchor_planes(epi, ins, outs, cache)?;
-        if linear::gemm::epilogue(self.ctx(), OP, epi, self.tensor(y), &planes, &landed, paging)? {
+        if linear::gemm::epilogue(
+            self.ctx(),
+            OP,
+            epi,
+            self.tensor(y),
+            &planes,
+            &landed,
+            paging,
+        )? {
             Ok(())
         } else {
             Err(broken(
@@ -441,8 +421,7 @@ impl Run<'_> {
         }
     }
 
-    /// An anchored region's input planes (the op's values in order, a
-    /// normed operand's row scale the contraction's own), its results'
+    /// An anchored region's input planes (the op's values in order), its results'
     /// (the op's values in order, a paged result its cache's keys or values:
     /// a bf16 or unit-scaled e4m3 pool of rows a cell, every row live where
     /// its `row_valid` says) and where its cache rows live.
