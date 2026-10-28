@@ -54,7 +54,7 @@
 use inferlet::chat;
 use inferlet::eta::prelude::*;
 use inferlet::grammar::{Grammar, Matcher};
-use inferlet::mask::unpack_mask;
+use inferlet::mask::bit_allowed;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -189,8 +189,9 @@ impl Target {
         &mut self,
         committed: &[u32],
         draft: &[u32],
-        masks: &[Vec<bool>],
+        masks: &[Vec<u32>],
         vocab: u32,
+        words: u32,
     ) -> Result<Vec<u32>> {
         if committed.is_empty() {
             return Err("cannot verify from an empty committed sequence".into());
@@ -213,12 +214,8 @@ impl Target {
         let readout = Channel::from_iter(len - rows..len);
         let slots = Channel::from_iter(start..start + len);
         let fold = Channel::from([start - self.folded]);
-        // A one-row `logits` is `[vocab]`, and `masked_argmax` needs the mask at the same rank.
-        let allowed = if rows == 1 {
-            Channel::new([vocab], dtype::bool)
-        } else {
-            Channel::new([rows, vocab], dtype::bool)
-        };
+        let allowed = Channel::new([rows * words], dtype::u32);
+        let pow2 = Channel::from_iter((0..32u32).map(|b| 1u32 << b));
         let target_out = Channel::new([rows], dtype::i32);
 
         let fwd = ForwardPass::new();
@@ -233,9 +230,23 @@ impl Target {
             },
         )?;
         fwd.epilogue(move || {
+            let packed = allowed.take();
+            let idx = iota(rows * vocab);
+            let r = &idx / Tensor::constant(vocab);
+            let c = &idx % Tensor::constant(vocab);
+            let w_idx = &r * Tensor::constant(words) + (&c / Tensor::constant(32u32));
+            let word = gather(&packed, &w_idx);
+            let p2 = gather(pow2.read(), &c % Tensor::constant(32u32));
+            let bit = (&word / &p2) % Tensor::constant(2u32);
+            let mask_bool = ne(&bit, Tensor::constant(0u32));
+            let mask_shaped = if rows == 1 {
+                mask_bool
+            } else {
+                reshape(&mask_bool, [rows, vocab])
+            };
             target_out.put(masked_argmax(
                 intrinsics::output(0, "logits"),
-                allowed.take(),
+                &mask_shaped,
             ));
         });
 
@@ -259,6 +270,12 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let vocab = model::output_vocab_size();
+    let words = vocab.div_ceil(32);
+    let pack_mask = |mut m: Vec<u32>| -> Vec<u32> {
+        let fill = if m.is_empty() { u32::MAX } else { 0 };
+        m.resize(words as usize, fill);
+        m
+    };
     let constraint = Matcher::new(&Grammar::from_json_schema(&input.schema)?);
 
     let mut committed = chat::system_user(
@@ -287,11 +304,10 @@ async fn main(input: Input) -> Result<Output> {
 
         // Walk the grammar forward over the proposal, collecting one mask per
         // readout row, and truncate at the first token the grammar forbids.
-        let checkpoint = constraint.fork();
-        let mut masks = vec![unpack_mask(&constraint.mask(), vocab)];
+        let mut masks = vec![pack_mask(constraint.mask())];
         let mut draft: Vec<u32> = Vec::with_capacity(proposal.len());
         for &token in &proposal {
-            if !masks[draft.len()][token as usize] {
+            if !bit_allowed(&masks[draft.len()], token as usize) {
                 grammar_pruned += 1;
                 break;
             }
@@ -304,7 +320,7 @@ async fn main(input: Input) -> Result<Output> {
                 // be predicting past the end of the grammar.
                 break;
             }
-            masks.push(unpack_mask(&constraint.mask(), vocab));
+            masks.push(pack_mask(constraint.mask()));
         }
         // Every draft walked the grammar; the bonus row exists only while it is still open.
         let walked = draft.len() as u32;
@@ -312,25 +328,27 @@ async fn main(input: Input) -> Result<Output> {
 
         // Wind the speculative walk all the way back, then prove it landed
         // exactly where it started before committing anything.
-        if walked > constraint.rollback_capacity() {
-            return Err(format!(
-                "draft of {walked} exceeds rollback capacity {}",
-                constraint.rollback_capacity()
-            ));
-        }
-        constraint.rollback(walked);
-        if constraint.mask() != checkpoint.mask() {
-            return Err(format!(
-                "rollback({walked}) did not restore the grammar state; \
-                 the constraint would now be silently wrong"
-            ));
+        if walked > 0 {
+            if walked > constraint.rollback_capacity() {
+                return Err(format!(
+                    "draft of {walked} exceeds rollback capacity {}",
+                    constraint.rollback_capacity()
+                ));
+            }
+            constraint.rollback(walked);
+            if pack_mask(constraint.mask()) != masks[0] {
+                return Err(format!(
+                    "rollback({walked}) did not restore the grammar state; \
+                     the constraint would now be silently wrong"
+                ));
+            }
         }
         rollback_checks += 1;
 
         total_drafted += draft.len();
         verification_steps += 1;
         let target = target_model
-            .verify(&committed, &draft, &masks, vocab)
+            .verify(&committed, &draft, &masks, vocab, words)
             .await?;
         if target.len() != draft.len() + 1 {
             return Err(format!(

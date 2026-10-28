@@ -101,6 +101,10 @@ struct Input {
     max_tokens: usize,
     #[serde(default = "default_seed")]
     seed: u32,
+    #[serde(default)]
+    prompt_tokens: Option<Vec<u32>>,
+    #[serde(default)]
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -331,12 +335,18 @@ async fn main(input: Input) -> Result<Output> {
 
     // The model's opening (`<bos>` where it has one) before the raw text: a
     // gemma without it answers noise.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
+    let mut prompt = if let Some(toks) = input.prompt_tokens {
+        toks
+    } else {
+        let mut p = inferlet::chat::prefix();
+        p.extend(model::encode(&input.prompt));
+        p
+    };
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
+    let stream = input.stream;
 
     let cfg = Cfg {
         multiplier: input.multiplier,
@@ -386,6 +396,9 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.submit(&pipe).context("prefill submit")?;
 
     let g0 = tok_out_p.take_host::<i32>().await?;
+    if stream {
+        inferlet::session::send("t:1");
+    }
     let c0 = cnt_out_p.take_host::<f32>().await?;
     let k0 = peak_out_p.take_host::<f32>().await?;
     generated.push(g0 as u32);
@@ -446,6 +459,9 @@ async fn main(input: Input) -> Result<Output> {
                 .take_host::<Vec<f32>>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
+            if stream {
+                inferlet::session::send("t:1");
+            }
             generated.push(v[0] as u32);
             total_penalized = v[1];
             peak = v[2];

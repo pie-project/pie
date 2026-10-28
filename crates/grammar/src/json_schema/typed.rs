@@ -47,7 +47,7 @@ impl<'a> Converter<'a> {
                         (b' ' as u32, b' ' as u32),
                     ],
                 )
-                .repeat(0, None),
+                .repeat(0, Some(8)),
             )?;
         }
         Ok(FrontendGrammar {

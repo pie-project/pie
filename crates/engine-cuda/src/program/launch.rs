@@ -1320,6 +1320,13 @@ impl Prepared {
         )
     }
 
+    /// Whether a region of this stage is a lane sampler, whose blocks wait
+    /// for one another and so need their grid resident at once.
+    #[must_use]
+    pub fn meets_across_blocks(&self) -> bool {
+        self.samplers.iter().any(|&sampler| sampler)
+    }
+
     #[must_use]
     pub fn lane_ceiling(&self) -> u32 {
         if self.scratch_stride == 0 {

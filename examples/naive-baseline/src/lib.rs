@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 struct Input {
     #[serde(default = "default_prompt")]
     prompt: String,
+    #[serde(default)]
+    prompt_tokens: Option<Vec<u32>>,
     #[serde(default = "default_temperature")]
     temperature: f32,
     #[serde(default = "default_max_tokens")]
@@ -29,6 +31,14 @@ struct Input {
     /// Drain the two instrumentation channels the algorithm inferlets carry.
     #[serde(default)]
     stats: bool,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    park_every: usize,
+    #[serde(default)]
+    park_ms: u64,
+    #[serde(default)]
+    use_park: bool,
 }
 
 fn default_prompt() -> String {
@@ -87,10 +97,14 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    // The model's opening (`<bos>` where it has one) before the raw text: a
-    // gemma without it answers noise, and no sampler can be read against that.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
+    let mut prompt = match &input.prompt_tokens {
+        Some(pt) => pt.clone(),
+        None => {
+            let mut p = inferlet::chat::prefix();
+            p.extend(model::encode(&input.prompt));
+            p
+        }
+    };
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -142,6 +156,9 @@ async fn main(input: Input) -> Result<Output> {
             .await
             .context("prefill drain")?;
     }
+    if input.stream {
+        inferlet::session::send("t:1");
+    }
     generated.push(g0 as u32);
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
@@ -174,19 +191,75 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget, async || {
-            let t = tok_out
-                .take_host::<i32>()
-                .await
-                .with_context(|| format!("@{}", generated.len()))?;
-            if want_stats {
-                s1_out.take_host::<Vec<f32>>().await?;
-                s2_out.take_host::<Vec<f32>>().await?;
+        if input.park_every > 0 && input.park_ms > 0 {
+            let r = frame_size().max(1);
+            let window_fires = inferlet::model::run_ahead_window() as usize;
+            let window_frames = (window_fires / r).max(1);
+            let mut total_done = 0usize;
+            while total_done < budget {
+                let chunk = input.park_every.min(budget - total_done);
+                let mut sub = 0usize;
+                let mut con = 0usize;
+                let submit_one = |sub: &mut usize| -> std::result::Result<(), String> {
+                    let live = r.min(chunk - *sub);
+                    if live == 0 {
+                        return Ok(());
+                    }
+                    let slots: Vec<Option<&ForwardPass>> = vec![Some(&fwd); live];
+                    submit_frame(&pipe, &slots)?;
+                    *sub += live;
+                    Ok(())
+                };
+                for _ in 0..window_frames {
+                    if sub >= chunk {
+                        break;
+                    }
+                    submit_one(&mut sub)?;
+                }
+                while con < sub {
+                    let t = tok_out
+                        .take_host::<i32>()
+                        .await
+                        .with_context(|| format!("@{}", generated.len()))?;
+                    if want_stats {
+                        s1_out.take_host::<Vec<f32>>().await?;
+                        s2_out.take_host::<Vec<f32>>().await?;
+                    }
+                    if input.stream {
+                        inferlet::session::send("t:1");
+                    }
+                    generated.push(t as u32);
+                    con += 1;
+                    if sub < chunk && sub - con <= (window_frames - 1) * r {
+                        submit_one(&mut sub)?;
+                    }
+                }
+                total_done += chunk;
+                if total_done < budget {
+                    if input.use_park {
+                        pipe.park();
+                    }
+                    inferlet::sleep(std::time::Duration::from_millis(input.park_ms)).await;
+                }
             }
-            generated.push(t as u32);
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
+        } else {
+            run_ahead(&pipe, &fwd, budget, async || {
+                let t = tok_out
+                    .take_host::<i32>()
+                    .await
+                    .with_context(|| format!("@{}", generated.len()))?;
+                if want_stats {
+                    s1_out.take_host::<Vec<f32>>().await?;
+                    s2_out.take_host::<Vec<f32>>().await?;
+                }
+                if input.stream {
+                    inferlet::session::send("t:1");
+                }
+                generated.push(t as u32);
+                Ok(ControlFlow::Continue(()))
+            })
+            .await?;
+        }
     }
     pipe.close();
 

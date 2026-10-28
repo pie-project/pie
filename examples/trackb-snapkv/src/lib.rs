@@ -23,6 +23,10 @@ struct Input {
     page_budget: u32,
     #[serde(default = "default_heads")]
     heads: u32,
+    #[serde(default)]
+    prompt_tokens: Option<Vec<u32>>,
+    #[serde(default)]
+    stream: bool,
 }
 
 fn default_prompt() -> String {
@@ -129,12 +133,18 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     // As `naive-baseline` opens, since the all-keep arm is compared against it.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
+    let mut prompt = if let Some(toks) = input.prompt_tokens {
+        toks
+    } else {
+        let mut p = inferlet::chat::prefix();
+        p.extend(model::encode(&input.prompt));
+        p
+    };
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
+    let stream = input.stream;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
     let kv_max = max_pages * page_size;
     if kv_max > score_kv {
@@ -185,6 +195,9 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.submit(&pipe).context("prefill submit")?;
 
     let g0 = tok_out_p.take_host::<i32>().await?;
+    if stream {
+        inferlet::session::send("t:1");
+    }
     generated.push(g0 as u32);
 
     let prefill_scores = scores_out.take_host::<Vec<f32>>().await?;
@@ -259,6 +272,9 @@ async fn main(input: Input) -> Result<Output> {
                 .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
+            if stream {
+                inferlet::session::send("t:1");
+            }
             generated.push(t as u32);
             Ok(ControlFlow::Continue(()))
         })

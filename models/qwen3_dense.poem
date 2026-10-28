@@ -16,12 +16,12 @@ load("//lib/spoken.poem", "QWEN_STOP")
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
-def qwen3(id, layers):
-    return model(id, template = CHATML, tokenizer = TOKENIZER, arch = "qwen3", layers = layers, vocab = 151936)
+def qwen3(id, layers, **kwargs):
+    return model(id, template = CHATML, tokenizer = TOKENIZER, arch = "qwen3", layers = layers, vocab = 151936, **kwargs)
 
 MODELS = [
     qwen3("qwen3-0.6b", layers = 28),
-    qwen3("qwen3-8b", layers = 36),
+    qwen3("qwen3-8b", layers = 36, drafters = ["mtp"]),
     qwen3("qwen3-14b", layers = 40),
     qwen3("qwen3-32b", layers = 64),
 ]
@@ -30,6 +30,7 @@ F8 = dtype.e4m3tile128a8
 
 DEPLOYMENTS = [
     deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16, drafter = "mtp"),
     deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-8b", weights = dtype.u4g64, kv = dtype.bf16),
     deployment("qwen3-14b", weights = dtype.bf16, kv = dtype.bf16),
@@ -90,7 +91,7 @@ DIMS = {
 RELEASED = [dtype.e4m3tile128a8, dtype.e4m3g128, dtype.e4m3g128a8, dtype.nvfp4]
 
 def layout(id, deploy):
-    if deploy.drafter != None or deploy.parts:
+    if deploy.parts or (deploy.drafter != None and (id != "qwen3-8b" or deploy.drafter != "mtp")):
         fail("{} ships no drafter and no parts".format(id))
     proj = roles(deploy, "proj", exact = True).proj
     w = dtype.bf16 if proj in RELEASED else proj
@@ -117,6 +118,31 @@ def layout(id, deploy):
             lora_b = lora_b,
         )
 
+    mtp = None
+    if deploy.drafter == "mtp":
+        mtp = struct(
+            depth = 4,
+            taps = [1, 17, 32],
+            embed = weight([d.vocab, hidden]),
+            fc = [weight([hidden, hidden], w) for _ in range(3)],
+            input_norm = weight([hidden]),
+            hidden_norm = weight([hidden]),
+            q_embed = weight([d.q_heads * hd, hidden], w),
+            q_hidden = weight([d.q_heads * hd, hidden], w),
+            k_embed = weight([d.kv_heads * hd, hidden], w),
+            k_hidden = weight([d.kv_heads * hd, hidden], w),
+            v_embed = weight([d.kv_heads * hd, hidden], w),
+            v_hidden = weight([d.kv_heads * hd, hidden], w),
+            o = weight([hidden, d.q_heads * hd], w),
+            mlp_norm = weight([hidden]),
+            gate = weight([d.inter, hidden], w),
+            up = weight([d.inter, hidden], w),
+            down = weight([hidden, d.inter], w),
+            norm = weight([hidden]),
+            head = weight([d.vocab, hidden]),
+            kv = "kv.mtp",
+        )
+
     return struct(
         hidden = hidden,
         vocab = d.vocab,
@@ -135,6 +161,7 @@ def layout(id, deploy):
         head = None if d.tied else weight([d.vocab, hidden]),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
+        mtp = mtp,
     )
 
 # How a Qwen 3 (dense) checkpoint is read: transformers' safetensors, under
@@ -156,11 +183,34 @@ def configured(m):
         config("rope_theta", m.theta),
     ]
 
+def read_checkpoint(reads, m):
+    mapped(reads, m, TRANSFORMERS)
+    if m.mtp != None:
+        mtp = m.mtp
+        reads.read(mtp.embed, "mtp.embed.weight")
+        for i in range(3):
+            reads.read(mtp.fc[i], "mtp.fc.{}.weight".format(i))
+        reads.read(mtp.input_norm, "mtp.input_norm.weight")
+        reads.read(mtp.hidden_norm, "mtp.hidden_norm.weight")
+        reads.read(mtp.q_embed, "mtp.q_embed.weight")
+        reads.read(mtp.q_hidden, "mtp.q_hidden.weight")
+        reads.read(mtp.k_embed, "mtp.k_embed.weight")
+        reads.read(mtp.k_hidden, "mtp.k_hidden.weight")
+        reads.read(mtp.v_embed, "mtp.v_embed.weight")
+        reads.read(mtp.v_hidden, "mtp.v_hidden.weight")
+        reads.read(mtp.o, "mtp.o.weight")
+        reads.read(mtp.mlp_norm, "mtp.mlp_norm.weight")
+        reads.read(mtp.gate, "mtp.gate.weight")
+        reads.read(mtp.up, "mtp.up.weight")
+        reads.read(mtp.down, "mtp.down.weight")
+        reads.read(mtp.norm, "mtp.norm.weight")
+        reads.read(mtp.head, "mtp.head.weight")
+
 def formats(m):
     return [format(
         "transformers",
         recognizes = lambda checkpoint: has("model.embed_tokens.weight") and has("model.layers.0.self_attn.q_norm.weight") and not has("model.layers.0.mlp.experts.0.down_proj.weight"),
-        read = lambda reads: mapped(reads, m, TRANSFORMERS),
+        read = lambda reads: read_checkpoint(reads, m),
         states = configured(m),
     )]
 
@@ -191,6 +241,16 @@ def caches(m, c):
     plane = m.kv_heads * m.head_dim
     for w in m.layers:
         c.kv(kv, w.kv, [plane, plane], m.head_dim, heads = True)
+    if m.mtp != None:
+        c.kv(kv, m.mtp.kv, [plane, plane], m.head_dim, heads = True)
+
+def tap(mtp, layer, y, fused):
+    if mtp == None or layer not in mtp.taps:
+        return fused
+    part = ops.linear.matmul(y.on(fact.drafts()), mtp.fc[mtp.taps.index(layer)])
+    if fused == None:
+        return part
+    return ops.elemwise.residual_add(part, fused)
 
 def forward(m, inputs):
     positions = inputs.positions()
@@ -198,14 +258,60 @@ def forward(m, inputs):
     routes = inputs.adapter_routes()
     scaling = rope_scaling(m.rope)
 
-    def block(l, w, y):
+    def block(l, w, carried):
+        y, fused = carried
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
         o = attention(x, inputs, m, w, positions, scaling = scaling, qk_norm = "head")
         y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        return ops.elemwise.residual_add(swiglu(x, w), y)
+        y = ops.elemwise.residual_add(swiglu(x, w), y)
+        return (y, tap(m.mtp, l, y, fused))
 
-    y = inputs.fold_layers(m.layers, y, block)
+    y, fused = inputs.fold_layers(m.layers, (y, None), block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    output("logits", ops.linear.lm_head(x, m.embed if m.head == None else m.head))
+    logits = ops.linear.lm_head(x, m.embed if m.head == None else m.head)
+    if m.mtp != None:
+        draft(m, inputs, fused, logits, scaling)
+    output("logits", logits)
+
+def draft(m, inputs, fused, logits, scaling):
+    mtp = m.mtp
+    input_mtp = inputs.on(fact.drafts())
+    plan_mtp = ops.attn.plan_prefill(input_mtp, m.q_heads, m.kv_heads, m.head_dim, None)
+    dpos = inputs.positions().on(fact.drafts())
+    dlogits = logits.on(fact.drafts())
+    pages = inputs.kv(mtp.kv)
+    write_page = inputs.write_page(mtp.kv)
+    write_offset = inputs.write_offset(mtp.kv)
+
+    token = ops.sampling.argmax([dlogits])
+    hidden = fused
+    chain = []
+    k0 = None
+    v0 = None
+    for step in range(mtp.depth):
+        e = ops.gather.embed(token, mtp.embed, m.vocab)
+        e = ops.elemwise.rmsnorm(e, mtp.input_norm, m.eps)
+        h = ops.elemwise.rmsnorm(hidden, mtp.hidden_norm, m.eps)
+        q = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.q_embed), ops.linear.matmul(h, mtp.q_hidden))
+        k = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.k_embed), ops.linear.matmul(h, mtp.k_hidden))
+        v = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.v_embed), ops.linear.matmul(h, mtp.v_hidden))
+        q, k = ops.elemwise.rope(q, dpos, m.head_dim, m.theta, rotary.full(), k = k, scaling = scaling)
+        if step == 0:
+            k0 = k
+            v0 = v
+        ops.attn.kv_append(k, v, pages, write_page, write_offset)
+        o = ops.attn.prefill(q, plan_mtp, pages, None, m.head_dim, m.kv_heads, m.sm_scale)
+        r1 = ops.elemwise.residual_add(ops.linear.matmul(o, mtp.o), h)
+        mlp_in = ops.elemwise.rmsnorm(r1, mtp.mlp_norm, m.eps)
+        r2 = ops.elemwise.residual_add(swiglu(mlp_in, mtp), r1)
+        normed = ops.elemwise.rmsnorm(r2, mtp.norm, m.eps)
+        proposal = ops.linear.lm_head(ops.gather.gather_rows(normed, input_mtp.readout_rows()), mtp.head)
+        if step == 0:
+            output("mtp.logits", proposal)
+        token = ops.sampling.argmax([proposal])
+        hidden = r2
+        chain.append(proposal)
+    ops.attn.kv_append(k0, v0, pages, write_page, write_offset)
+    output("mtp.drafts", ops.sampling.argmax(chain))

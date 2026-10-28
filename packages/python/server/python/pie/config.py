@@ -13,6 +13,8 @@ import os
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Optional
 
+os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "32")
+
 
 @dataclass
 class ServerConfig:
@@ -105,6 +107,50 @@ class ModelConfig:
     max_images: Optional[int] = None
     max_voxels: Optional[int] = None
     max_clips: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.host_kv_budget is None and os.environ.get("PIE_HOST_KV_BUDGET_DEFAULT", "1") == "1":
+            self.host_kv_budget = "1GiB"
+        if self.source and not self.source.startswith(("/", "./", "../")):
+            from pathlib import Path
+
+            pie_home = Path(os.environ.get("PIE_HOME", "~/.pie")).expanduser()
+            has_art = any(
+                (pie_home / "artifacts" / slug).is_dir()
+                and any((pie_home / "artifacts" / slug).glob("*.zt"))
+                for slug in (self.source, self.source.replace("/", "--"))
+            )
+            if not has_art:
+                encoded = f"models--{self.source.replace('/', '--')}"
+                roots = []
+                if cache := os.environ.get("HF_HUB_CACHE"):
+                    roots.append(Path(cache).expanduser())
+                if home := os.environ.get("HF_HOME"):
+                    roots.append(Path(home).expanduser() / "hub")
+                roots.extend(
+                    (
+                        Path("/workspace/.cache/huggingface/hub"),
+                        Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
+                        / "huggingface"
+                        / "hub",
+                    )
+                )
+                for root in roots:
+                    repo = root / encoded
+                    for ref_name in ("main", "master"):
+                        ref = repo / "refs" / ref_name
+                        if ref.is_file():
+                            rev = ref.read_text().strip()
+                            snap = repo / "snapshots" / rev
+                            if snap.is_dir():
+                                self.source = str(snap.resolve())
+                                return
+                    snaps_dir = repo / "snapshots"
+                    if snaps_dir.is_dir():
+                        snaps = sorted(p for p in snaps_dir.iterdir() if p.is_dir())
+                        if snaps:
+                            self.source = str(snaps[-1].resolve())
+                            return
 
 
 @dataclass
