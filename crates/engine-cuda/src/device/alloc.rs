@@ -596,6 +596,12 @@ impl Pinned {
         Pinned::alloc(bytes, false)
     }
 
+    /// Whether the span is a mapping registered with the driver.
+    #[must_use]
+    pub fn registered(&self) -> bool {
+        matches!(self.origin, Origin::Registered)
+    }
+
     pub fn zero(&self) {
         if self.host.is_null() || self.bytes == 0 {
             return;

@@ -603,9 +603,7 @@ impl Shelf {
             if self.chunks[chunk as usize].is_none() {
                 let held = (self.slots - chunk * self.per_chunk).min(self.per_chunk);
                 let bytes = usize::try_from(u64::from(held) * slot_bytes).unwrap_or(usize::MAX);
-                let pinned = huge_tier(bytes)
-                    .map_or_else(|| crate::device::Pinned::mapped_uninit(bytes), Ok)?;
-                self.chunks[chunk as usize] = Some(pinned);
+                self.chunks[chunk as usize] = Some(pin_chunk(bytes)?);
             }
         }
         Ok(())
@@ -636,6 +634,15 @@ impl Shelf {
 }
 
 /// `bytes` pinned on reserved huge pages, where the host's pool holds them.
+/// A shelf chunk, pinned as a copy first touches it, on the request's
+/// path: huge pages where the host reserves them, else an anonymous
+/// mapping (transparent huge pages) registered with the driver, which
+/// pins a chunk several times faster than `cudaHostAlloc` faults and
+/// locks its small pages, so a demotion waits on it that much less.
+fn pin_chunk(bytes: usize) -> Result<crate::device::Pinned> {
+    huge_tier(bytes).map_or_else(|| crate::device::Pinning::uninit(bytes)?.lock(), Ok)
+}
+
 #[cfg(target_os = "linux")]
 fn huge_tier(bytes: usize) -> Option<crate::device::Pinned> {
     crate::device::Pinning::huge(bytes)?.lock().ok()
@@ -2689,6 +2696,22 @@ impl engine::frame::Supply for Pools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chunk is the driver's registration of a mapping, not a
+    /// `cudaHostAlloc`: a chunk a demotion first touches pinned there held
+    /// the next prefill, which waits on the demotion, for the whole pin.
+    #[cfg(feature = "device")]
+    #[test]
+    fn a_shelf_chunk_is_a_registered_mapping() {
+        let mut shelf = Shelf::new(vec![1 << 20, 1 << 20], 256);
+        shelf.back([0], "host kv pages").expect("the chunk pins");
+        let chunk = shelf.chunks[0].as_ref().expect("backed");
+        assert!(chunk.registered(), "a shelf chunk registers its mapping");
+        assert_ne!(chunk.device(), 0, "and maps it for the device");
+        let at = shelf.at(127, 1).expect("the chunk's last slot's last plane");
+        // SAFETY: inside the chunk just pinned, 1 MiB a plane a slot.
+        unsafe { core::ptr::write_bytes(at as *mut u8, 7, 1 << 20) };
+    }
 
     #[test]
     fn store_every_case() {
