@@ -146,15 +146,9 @@ class Config:
             env_hkv = os.environ.get("PIE_HOST_KV_BUDGET", "1GiB")
             if env_hkv:
                 model["host_kv_budget"] = env_hkv
-        if "device_kv_budget" not in model:
-            max_conc = self.runtime.max_concurrent_processes
-            env_dkv = os.environ.get("PIE_DEVICE_KV_BUDGET")
-            if env_dkv:
-                model["device_kv_budget"] = env_dkv
-            elif max_conc is None or max_conc <= 64:
-                model["device_kv_budget"] = "32GiB"
-            else:
-                model["device_kv_budget"] = "64GiB"
+        # Unstated, the engine fills what `device_memory_share` leaves.
+        if "device_kv_budget" not in model and (env_dkv := os.environ.get("PIE_DEVICE_KV_BUDGET")):
+            model["device_kv_budget"] = env_dkv
         if m.skip_parts:
             model["skip_parts"] = list(m.skip_parts)
 

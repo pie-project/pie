@@ -71,3 +71,20 @@ def test_the_context_rides_beside_the_other_engine_knobs(tmp_path):
     assert _table(
         _tput(tmp_path, "cuda", "--max-model-len", "16384"), "model"
     )["device_memory_share"] == 0.9
+
+
+def test_an_unstated_kv_budget_is_left_to_the_engine(tmp_path, monkeypatch):
+    # Omitted, the engine fills what `device_memory_share` leaves. A fixed
+    # 32 GiB written in its place refused Qwen3-8B on a 46 GB L40S: 16 GB
+    # of weights left 26 GB under the share for a pool stated at 32.
+    monkeypatch.delenv("PIE_DEVICE_KV_BUDGET", raising=False)
+    model = _table(_tput(tmp_path, "cuda"), "model")
+    assert "device_kv_budget" not in model
+
+
+def test_a_stated_kv_budget_reaches_the_engine(tmp_path, monkeypatch):
+    monkeypatch.delenv("PIE_DEVICE_KV_BUDGET", raising=False)
+    model = _table(_tput(tmp_path, "cuda", "--device-kv-budget", "18GiB"), "model")
+    assert model["device_kv_budget"] == "18GiB"
+    monkeypatch.setenv("PIE_DEVICE_KV_BUDGET", "20GiB")
+    assert _table(_tput(tmp_path, "cuda"), "model")["device_kv_budget"] == "20GiB"
