@@ -5,8 +5,8 @@ use poem_exec::fire::{Lane, compose};
 
 use poem_ir::Trace;
 
-fn test_slots() -> engine_cuda::window::Slots {
-    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 2, 512)
+fn test_slots(compiled: &poem_compiler::CompiledModel) -> engine_cuda::window::Slots {
+    engine_cuda::window::Slots::new(engine_cuda::window::slot_bases(compiled).1, 512, 8, 1, 4096, 2, 512)
 }
 
 const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -79,7 +79,8 @@ fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
         poem_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
         &indptr(&rows),
         Copies::off(),
-        test_slots(),
+        test_slots(&grouped),
+        &[],
     )
     .expect("the windows");
 

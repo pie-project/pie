@@ -19,6 +19,13 @@ pub trait Sink {
 
     fn tail(&mut self, _in_tail: bool) {}
 
+    /// Whether this walk records its launches into a graph rather than runs
+    /// them: a gated region's ops are dispatched with no row seated only
+    /// then, for the backend to leave out of each replay that seats none.
+    fn records(&self) -> bool {
+        false
+    }
+
     fn fork(&mut self, event: EventId);
 
     fn join(&mut self, event: EventId);

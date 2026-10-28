@@ -31,6 +31,20 @@ pub enum WindowShape {
 }
 
 impl Window {
+    /// A slot no region of this fire cuts: no rows, no tables.
+    #[must_use]
+    pub fn empty() -> Window {
+        Window {
+            spans: poem_ir::PerAxis::default(),
+            indptr_host: Vec::new(),
+            indptr: Tensor::new(0, 0, 1, Dtype::I32),
+            segments_host: Vec::new(),
+            segments: Tensor::new(0, 0, 2, Dtype::I32),
+            segment_cap: 0,
+            gathered: None,
+        }
+    }
+
     #[must_use]
     pub fn on(&self, axis: poem_ir::RowAxis) -> MaskSpan {
         self.spans[axis]
@@ -55,6 +69,14 @@ impl Window {
     #[must_use]
     pub fn is_interval(&self) -> bool {
         matches!(self.shape(), WindowShape::Interval)
+    }
+
+    /// Whether its ops launch over one span of rows: an interval, or a
+    /// grouped window's union, which a grouped op walks whole
+    /// ([`crate::GROUPED`]), the runs' own rows read off its segments.
+    #[must_use]
+    pub fn launches_one_span(&self) -> bool {
+        matches!(self.shape(), WindowShape::Interval | WindowShape::Grouped)
     }
 
     #[must_use]
@@ -133,8 +155,9 @@ pub const fn lane_capacity(max_lanes: u32) -> u32 {
 
 impl Slots {
     #[must_use]
+    /// `windows` slots ([`slot_bases`]) of `lanes` lanes and `segs` segments.
     pub fn new(
-        classes: usize,
+        windows: usize,
         lanes: u64,
         segs: u32,
         gathered: usize,
@@ -144,7 +167,7 @@ impl Slots {
     ) -> Slots {
         Slots {
             stride: lanes + 1 + 2 * u64::from(segs.max(1)),
-            slots: (classes * (classes + 1) / 2 + 1 + gathered) as u64,
+            slots: (windows + gathered) as u64,
             gathered: gathered as u64,
             gathered_stride: rows + spaces as u64 * (3 * lanes + 1 + pages),
         }
@@ -273,6 +296,43 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
     })
 }
 
+/// Each template region's first window slot, and how many slots the
+/// template takes. A region's slots follow from its class mask alone (one a
+/// run it may cut into, regions of one mask sharing them), never from which
+/// windows a fire's composition happens to hold: a body reads each window's
+/// tables where it was recorded whichever of its key's classes a fire seats.
+#[must_use]
+pub fn slot_bases(compiled: &CompiledModel) -> (Vec<u32>, usize) {
+    bases_of(compiled.template().iter().enumerate().map(|(at, region)| {
+        let axis = compiled.axis_of(at);
+        (
+            axis,
+            &region.mask,
+            fallback::bound(compiled, axis, &region.mask),
+        )
+    }))
+}
+
+/// [`slot_bases`] over each region's axis, mask and run bound.
+fn bases_of<'a>(
+    regions: impl Iterator<Item = (poem_ir::RowAxis, &'a poem_ir::ClassSet, u32)>,
+) -> (Vec<u32>, usize) {
+    let mut held: Vec<(poem_ir::RowAxis, &poem_ir::ClassSet, u32)> = Vec::new();
+    let mut next = 0u32;
+    let bases = regions
+        .map(|(axis, mask, bound)| {
+            if let Some(&(_, _, base)) = held.iter().find(|(a, m, _)| *a == axis && *m == mask) {
+                return base;
+            }
+            let base = next;
+            next += bound.max(1);
+            held.push((axis, mask, base));
+            base
+        })
+        .collect();
+    (bases, next as usize)
+}
+
 impl Windows {
     pub fn of(
         trace: &Trace,
@@ -281,8 +341,10 @@ impl Windows {
         indptr_host: &[i32],
         copies: Copies<'_>,
         slots: Slots,
+        order: &[u8],
     ) -> Result<Windows> {
-        let mut windows: Vec<Window> = Vec::new();
+        let (bases, count) = slot_bases(compiled);
+        let mut windows: Vec<Window> = vec![Window::empty(); count];
         let mut runs: Vec<u32> = Vec::with_capacity(compiled.template().len());
         let mut of_region: Vec<(u32, u32)> = Vec::with_capacity(compiled.template().len());
         let mut axes: Vec<poem_ir::RowAxis> = Vec::with_capacity(compiled.template().len());
@@ -292,7 +354,14 @@ impl Windows {
         for (at, region) in compiled.template().iter().enumerate() {
             let axis = compiled.axis_of(at);
             axes.push(axis);
-            tables[axis].spans_into(&region.mask, &mut spans);
+            // A wide key cuts each token-axis region into the runs its classes
+            // form in the tier's order (`FireDescriptor::order`), as the walk
+            // does.
+            if axis == poem_ir::RowAxis::Tokens && !order.is_empty() {
+                tables[axis].spans_by_order_into(&region.mask, order, &mut spans);
+            } else {
+                tables[axis].spans_into(&region.mask, &mut spans);
+            }
             let patch = match tables[poem_ir::RowAxis::Patches].span(&region.mask) {
                 Ok(span) => span.unwrap_or_default(),
                 Err(runs) => {
@@ -324,6 +393,9 @@ impl Windows {
                     });
                 }
                 if fallback::grouped(compiled, axis, region.nodes.clone()) {
+                    // A run a wide key cuts that the fire seats no row of
+                    // (`spans_by_order_into`) is no segment of the union.
+                    spans.retain(|span| span.rows > 0);
                     let union = union_of(&spans);
                     segments_host = spans
                         .iter()
@@ -352,12 +424,12 @@ impl Windows {
                 gathered.spans[poem_ir::RowAxis::Voxels] = voxel;
                 seats(slots, &gathered)?;
                 of_region.push((runs.len() as u32, 1));
-                runs.push(insert(&mut windows, gathered));
+                runs.push(place(&mut windows, bases[at], gathered));
                 continue;
             }
 
             of_region.push((runs.len() as u32, spans.len() as u32));
-            for &span in &spans {
+            for (run, &span) in spans.iter().enumerate() {
                 let window = Window {
                     spans: poem_ir::PerAxis::new([span, patch, voxel]),
                     indptr_host: match axis {
@@ -371,7 +443,7 @@ impl Windows {
                     segment_cap,
                 };
                 seats(slots, &window)?;
-                runs.push(insert(&mut windows, window));
+                runs.push(place(&mut windows, bases[at] + run as u32, window));
             }
         }
 
@@ -680,7 +752,7 @@ impl Windows {
             let window = self.at(region, run);
             let span = window.span();
             let admitted = span.rows == 0
-                || (window.is_interval()
+                || (window.launches_one_span()
                     && (moves || (span.row_offset == 0 && span.rows >= total))
                     && (span.lane_offset == 0 || finds_its_lane));
             if !admitted && crate::serve::diag::on().arm_trace {
@@ -773,20 +845,13 @@ fn seats(slots: Slots, window: &Window) -> Result<()> {
     Ok(())
 }
 
-fn insert(windows: &mut Vec<Window>, window: Window) -> u32 {
-    let same = |held: &Window| {
-        held.spans == window.spans
-            && held.segments_host == window.segments_host
-            && held.gathered.as_ref().map(|g| &g.runs) == window.gathered.as_ref().map(|g| &g.runs)
-    };
-    let index = match windows.iter().position(same) {
-        Some(index) => index,
-        None => {
-            windows.push(window);
-            windows.len() - 1
-        }
-    };
-    index as u32
+/// Seats `window` at `slot` ([`slot_bases`]): regions of one mask cut one
+/// window, so a second lands where the first did.
+fn place(windows: &mut [Window], slot: u32, window: Window) -> u32 {
+    if let Some(held) = windows.get_mut(slot as usize) {
+        *held = window;
+    }
+    slot
 }
 
 fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], spaces: &[Geometry]) -> Window {
@@ -909,7 +974,42 @@ pub struct Cursor<'a> {
     cond: Option<Conditionals<'a>>,
     open: Option<(crate::device::conditional::Conditional, u32, bool)>,
     pump: Option<Pump<'a>>,
+    marks: Option<Marks<'a>>,
     fault: Option<Fault>,
+}
+
+/// While a body records: the nodes each gated region added to the capture
+/// (`FireDescriptor::gated`). The walk adds one region at a time, so what
+/// the capture holds after a region and did not before is that region's.
+struct Marks<'a> {
+    gated: &'a [bool],
+    stream: *mut core::ffi::c_void,
+    begin: Option<(u32, std::collections::HashSet<usize>)>,
+    regions: Vec<RegionMark>,
+}
+
+impl Marks<'_> {
+    /// Closes the run under way, the capture's nodes since it began its own,
+    /// and opens `next` where one follows.
+    fn close(&mut self, region: u32, next: Option<u32>) -> Result<()> {
+        let Some((run, begin)) = self.begin.take() else {
+            return Ok(());
+        };
+        let after = crate::device::conditional::captured_nodes(self.stream)?;
+        let nodes: Vec<usize> = after.iter().copied().filter(|node| !begin.contains(node)).collect();
+        self.regions.push(RegionMark { region, run, nodes });
+        if let Some(next) = next {
+            self.begin = Some((next, after.into_iter().collect()));
+        }
+        Ok(())
+    }
+}
+
+/// A run of a gated region and the nodes it added to a capture ([`Marks`]).
+pub struct RegionMark {
+    pub region: u32,
+    pub run: u32,
+    pub nodes: Vec<usize>,
 }
 
 impl core::fmt::Debug for Cursor<'_> {
@@ -939,6 +1039,7 @@ impl<'a> Cursor<'a> {
             cond: None,
             open: None,
             pump: None,
+            marks: None,
             fault: None,
         }
     }
@@ -965,6 +1066,7 @@ impl<'a> Cursor<'a> {
             cond: None,
             open: None,
             pump: None,
+            marks: None,
             fault: None,
         }
     }
@@ -983,6 +1085,28 @@ impl<'a> Cursor<'a> {
             pump: Some(pump),
             ..self
         }
+    }
+
+    /// Records the nodes each region `gated` holds adds to the capture
+    /// under way on `stream` ([`Cursor::settle_marked`]).
+    #[must_use]
+    pub fn marking(self, stream: *mut core::ffi::c_void, gated: &'a [bool]) -> Cursor<'a> {
+        Cursor {
+            marks: Some(Marks {
+                gated,
+                stream,
+                begin: None,
+                regions: Vec::new(),
+            }),
+            ..self
+        }
+    }
+
+    /// [`Cursor::settle`], answering the nodes each gated region added.
+    pub fn settle_marked(mut self) -> Result<Vec<RegionMark>> {
+        let marks = self.marks.take().map(|marks| marks.regions);
+        self.settle()?;
+        Ok(marks.unwrap_or_default())
     }
 
     pub fn settle(mut self) -> Result<()> {
@@ -1100,6 +1224,19 @@ impl<'a> Cursor<'a> {
 
 impl Sink for Cursor<'_> {
     fn region_begin(&mut self, region: &Region) {
+        if self.recording
+            && let Some(marks) = self.marks.as_mut()
+            && marks.gated.get(self.at as usize).copied().unwrap_or(false)
+        {
+            match crate::device::conditional::captured_nodes(marks.stream) {
+                Ok(nodes) => marks.begin = Some((0, nodes.into_iter().collect())),
+                Err(fault) => {
+                    if self.fault.is_none() {
+                        self.fault = Some(fault);
+                    }
+                }
+            }
+        }
         self.place.region.set(self.at);
         self.place.run.set(0);
         // The lane keys a region's shared scratch: a fire walked without lanes runs
@@ -1127,10 +1264,31 @@ impl Sink for Cursor<'_> {
             cond.at.set(0);
         }
     }
-    fn region_end(&mut self, _region: &Region) {}
+    fn region_end(&mut self, _region: &Region) {
+        let region = self.at.saturating_sub(1);
+        if let Some(marks) = self.marks.as_mut()
+            && let Err(fault) = marks.close(region, None)
+            && self.fault.is_none()
+        {
+            self.fault = Some(fault);
+        }
+    }
 
     fn run(&mut self, run: u32, _runs: u32) {
         self.place.run.set(run);
+        let region = self.at.saturating_sub(1);
+        if run > 0
+            && let Some(marks) = self.marks.as_mut()
+            && marks.begin.is_some()
+            && let Err(fault) = marks.close(region, Some(run))
+            && self.fault.is_none()
+        {
+            self.fault = Some(fault);
+        }
+    }
+
+    fn records(&self) -> bool {
+        self.recording
     }
 
     fn cond_begin(&mut self, lowering: &Lowering) {
@@ -1273,7 +1431,7 @@ mod tests {
     fn window_every_case() {
         a_recording_cursor_with_nowhere_to_put_a_conditional_still_refuses_it();
         the_live_seat_is_every_windows_own_rows_and_offset_at_a_fixed_stride();
-        two_masks_share_a_slot_in_every_fire_of_a_key_or_in_none_of_them();
+        a_regions_slot_is_its_masks_whatever_the_fire_seats();
     }
 
     fn a_recording_cursor_with_nowhere_to_put_a_conditional_still_refuses_it() {
@@ -1378,77 +1536,24 @@ mod tests {
         assert_eq!(&table.live()[4..8], &[0, 0, 0, 0]);
     }
 
-    fn bounded(span: MaskSpan) -> Window {
-        Window {
-            spans: poem_ir::PerAxis::new([span, MaskSpan::default(), MaskSpan::default()]),
-            indptr_host: (0..=span.lanes as i32).collect(),
-            ..plain(0, 0)
-        }
-    }
-
-    fn resolved(a: (u32, u32), b: (u32, u32)) -> [MaskSpan; 3] {
-        let one = |(rows, lanes): (u32, u32), row_offset, lane_offset| MaskSpan {
-            row_offset,
-            rows,
-            lane_offset,
-            lanes,
-        };
-        let first = if a.0 == 0 {
-            MaskSpan::default()
-        } else {
-            one(a, 0, 0)
-        };
-        let second = if b.0 == 0 {
-            MaskSpan::default()
-        } else {
-            one(b, a.0, a.1)
-        };
-        let both = match (a.0 == 0, b.0 == 0) {
-            (false, false) => one((a.0 + b.0, a.1 + b.1), 0, 0),
-            (false, true) => first,
-            (true, false) => second,
-            (true, true) => MaskSpan::default(),
-        };
-        [first, both, second]
-    }
-
-    fn two_masks_share_a_slot_in_every_fire_of_a_key_or_in_none_of_them() {
-        let seated = |a, b| {
-            let [first, both, second] = resolved(a, b);
-            let mut held: Vec<Window> = Vec::new();
-            let map: Vec<u32> = [first, both, first, second]
-                .into_iter()
-                .map(|span| insert(&mut held, bounded(span)))
-                .collect();
-            (map, held.len())
-        };
-
-        let wide = seated((10, 2), (3, 3));
-        assert_eq!(
-            wide.0,
-            vec![0, 1, 0, 2],
-            "three distinct masks, three slots"
+    fn a_regions_slot_is_its_masks_whatever_the_fire_seats() {
+        use poem_ir::RowAxis::Tokens;
+        let (a, both, b) = (
+            poem_ir::ClassSet::of([0usize]),
+            poem_ir::ClassSet::of([0usize, 1]),
+            poem_ir::ClassSet::of([1usize]),
         );
-        assert_eq!(
-            seated((4, 1), (6, 6)),
-            wide,
-            "the lane split moved every span and no slot",
+        // Regions over A, A and B (cut into at most two runs), A again, B.
+        let (bases, count) = bases_of(
+            [
+                (Tokens, &a, 1),
+                (Tokens, &both, 2),
+                (Tokens, &a, 1),
+                (Tokens, &b, 1),
+            ]
+            .into_iter(),
         );
-        assert_eq!(
-            seated((1, 1), (1, 1)),
-            wide,
-            "nor does the row split, down to one row a class",
-        );
-
-        let absent = seated((10, 2), (0, 0));
-        assert_eq!(
-            absent.0,
-            vec![0, 0, 0, 1],
-            "the both-classes mask is the A mask when B has no rows",
-        );
-        assert_ne!(
-            absent.0, wide.0,
-            "and that is a different key, so a different body"
-        );
+        assert_eq!(bases, vec![0, 1, 0, 3], "a mask's regions share its slots");
+        assert_eq!(count, 4, "one slot a run each mask may cut into");
     }
 }

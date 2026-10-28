@@ -34,6 +34,8 @@ struct Input {
     draft_length: usize,
     #[serde(default = "default_max_ngram")]
     max_ngram: usize,
+    #[serde(default)]
+    ckpt_sync: bool,
 }
 
 fn default_prompt() -> String {
@@ -212,6 +214,11 @@ async fn main(input: Input) -> Result<Output> {
         window.push(x);
         window.extend(drafts.iter().copied());
 
+        let _ckpt = if input.ckpt_sync {
+            Some(ws.fork(&pipeline).context("ckpt_sync fork before verify")?)
+        } else {
+            None
+        };
         let truth = fire(&ws, &pipeline, &window, base, Some(survivors), false).await?;
         verification_steps += 1;
         let proposed = window.len() - 1;
@@ -223,6 +230,9 @@ async fn main(input: Input) -> Result<Output> {
             m += 1;
         }
         accepted += m;
+        if input.ckpt_sync && m < proposed {
+            let _restore = ws.fork(&pipeline).context("ckpt_sync restore on reject")?;
+        }
 
         // No explicit rollback: the next fire overwrites the rejected tail's slots.
 

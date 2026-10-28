@@ -41,6 +41,8 @@ struct Input {
     /// Beam width. `1` degenerates to greedy decoding (the beam identity).
     #[serde(default = "default_beams")]
     beams: u32,
+    #[serde(default)]
+    ckpt_sync: bool,
 }
 
 fn default_prompt() -> String {
@@ -224,11 +226,22 @@ async fn main(input: Input) -> Result<String> {
         });
 
         let mut step = 0usize;
+        let ckpt_sync = input.ckpt_sync;
+        let mut held_ckpt = if ckpt_sync {
+            ws.fork(&pipeline).ok()
+        } else {
+            None
+        };
         run_ahead(&pipeline, &fwd, decodes, async || {
             let picked = out
                 .take_host::<Vec<i32>>()
                 .await
                 .with_context(|| format!("@{step}"))?;
+            if ckpt_sync {
+                if let Ok(c) = ws.fork(&pipeline) {
+                    held_ckpt = Some(c);
+                }
+            }
             let parents = out_par
                 .take_host::<Vec<u32>>()
                 .await

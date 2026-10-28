@@ -19,11 +19,19 @@ __global__ void score_capture(
     float sm_scale,
     int observe,
     int lane_offset,
-    int kv_max)
+    int kv_max,
+    const u32* __restrict__ win)
 {
     constexpr int VPT = HEAD_DIM_MAX / 32;
 
+    // Under a captured window (`win`: rows, row offset, lanes, lane offset)
+    // the region's lanes are read off the device, and every table (rows,
+    // pages, score rows) is the whole fire's.
     const int request = static_cast<int>(blockIdx.x);
+    if (win != nullptr && request >= static_cast<int>(win[2])) {
+        return;
+    }
+    const int fire_lane = win != nullptr ? request + static_cast<int>(win[3]) : request;
     const int head = static_cast<int>(blockIdx.y);
     const int threads = static_cast<int>(blockDim.x);
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -35,7 +43,7 @@ __global__ void score_capture(
     float* wl = wm + WARPS;
 
     const long long out_row =
-        (static_cast<long long>(lane_offset + request) * num_q_heads + head) *
+        (static_cast<long long>(lane_offset + fire_lane) * num_q_heads + head) *
         static_cast<long long>(kv_max);
     float* out = scores + out_row;
 
@@ -43,13 +51,13 @@ __global__ void score_capture(
         out[i] = 0.f;
     }
 
-    const int page_first = static_cast<int>(kv_page_indptr[request]);
-    const int pages = static_cast<int>(kv_page_indptr[request + 1]) - page_first;
+    const int page_first = static_cast<int>(kv_page_indptr[fire_lane]);
+    const int pages = static_cast<int>(kv_page_indptr[fire_lane + 1]) - page_first;
     const int kv_len =
-        pages > 0 ? (pages - 1) * page_size + static_cast<int>(kv_last_page_lens[request])
+        pages > 0 ? (pages - 1) * page_size + static_cast<int>(kv_last_page_lens[fire_lane])
                   : 0;
-    const int qo_lo = static_cast<int>(qo_indptr[request]);
-    const int qo_hi = static_cast<int>(qo_indptr[request + 1]);
+    const int qo_lo = static_cast<int>(qo_indptr[fire_lane]);
+    const int qo_hi = static_cast<int>(qo_indptr[fire_lane + 1]);
     const int qo_len = qo_hi - qo_lo;
     const int rows = observe < qo_len ? observe : qo_len;
 

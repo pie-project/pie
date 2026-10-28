@@ -985,6 +985,31 @@ impl FireCtx<'_> {
             }
             lane_planes[lane] = Some((out.decl.name.clone(), plane));
         }
+        // A golden holds a body to every lane output a lane's class writes
+        // (its captured scores among them), not only to what it reads back.
+        let mut observed: Vec<kernels_cuda::Tensor> = Vec::new();
+        if self.arming {
+            for lane in 0..lane_count {
+                for out in self.exports.of_class(lane_class[lane]) {
+                    if out.decl.axis != poem_ir::InputAxis::Lane {
+                        continue;
+                    }
+                    for &value in &out.values {
+                        let plane = plane_of(value, &out.decl.name)?;
+                        let elem = poem_compiler::arena::elem_bytes(plane.dtype).unwrap_or(0);
+                        if !matches!(plane.dtype, Dtype::F32 | Dtype::Bf16) {
+                            continue;
+                        }
+                        observed.push(kernels_cuda::Tensor::new(
+                            plane.ptr + u64::from(lane_row[lane]) * u64::from(plane.width) * elem,
+                            1,
+                            plane.width,
+                            plane.dtype,
+                        ));
+                    }
+                }
+            }
+        }
 
         let storage_of = |dtype: Dtype| match dtype {
             Dtype::F32 => Ok(crate::program::launch::INTRINSIC_STORAGE_F32),
@@ -1086,6 +1111,7 @@ impl FireCtx<'_> {
             first_row,
             lane_rows,
             pixels,
+            observed,
         }))
     }
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import io
 import os
+
+os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "32")
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Optional
 
@@ -147,14 +149,9 @@ class Config:
             if env_hkv:
                 model["host_kv_budget"] = env_hkv
         if "device_kv_budget" not in model:
-            max_conc = self.runtime.max_concurrent_processes
             env_dkv = os.environ.get("PIE_DEVICE_KV_BUDGET")
             if env_dkv:
                 model["device_kv_budget"] = env_dkv
-            elif max_conc is None or max_conc <= 64:
-                model["device_kv_budget"] = "32GiB"
-            else:
-                model["device_kv_budget"] = "64GiB"
         if m.skip_parts:
             model["skip_parts"] = list(m.skip_parts)
 
@@ -166,6 +163,10 @@ class Config:
             if key in engine:
                 raise ValueError(f"engine option {key!r} collides with a common [engine] key")
             engine[key] = value
+        if e.type == "cuda" and "max_model_len" not in engine:
+            env_mml = os.environ.get("PIE_MAX_MODEL_LEN", "4096")
+            if env_mml:
+                engine["max_model_len"] = int(env_mml)
 
         cluster: dict = {}
         if self.cluster.cluster_policies:

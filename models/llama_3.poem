@@ -190,6 +190,7 @@ def caches(m, c):
     kv = c.kv_space(m.kv)
     for w in m.layers:
         c.kv(kv, w.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
+    c.kv(kv, "kv.draft", [m.kv_width, m.kv_width], m.head_dim, heads = True)
 
 def forward(m, inputs):
     positions = inputs.positions()
@@ -217,7 +218,39 @@ def forward(m, inputs):
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    output("logits", ops.linear.lm_head(x, m.head))
+    logits = ops.linear.lm_head(x, m.head)
+    draft(m, inputs, positions, scaling, x, logits)
+    output("logits", logits)
+
+def draft(m, inputs, positions, scaling, x, logits):
+    input_draft = inputs.on(fact.drafts())
+    dpos = positions.on(fact.drafts())
+    plan = ops.attn.plan_prefill(input_draft, m.q_heads, m.kv_heads, m.head_dim, None)
+    w = m.layers[-1]
+    pages = input_draft.kv(w.kv)
+    draft_pages = input_draft.kv("kv.draft")
+    write_page = input_draft.write_page("kv.draft")
+    write_offset = input_draft.write_offset("kv.draft")
+    d = m.head_dim
+    hidden = x.on(fact.drafts())
+    chosen = ops.sampling.argmax([logits.on(fact.drafts())])
+    e = ops.gather.embed(chosen, m.embed, m.vocab)
+    dy = ops.elemwise.residual_add(e, hidden)
+    nx = ops.elemwise.rmsnorm(dy, w.attn_norm, m.eps)
+    q, k, v = ops.linear.matmul(nx, w.q), ops.linear.matmul(nx, w.k), ops.linear.matmul(nx, w.v)
+    q, k = ops.elemwise.rope(q, dpos, d, m.theta, rotary.full(), k = k, scaling = scaling)
+    ops.attn.kv_append(k, v, draft_pages, write_page, write_offset)
+    o = ops.attn.prefill(q, plan, pages, None, d, m.kv_heads, m.sm_scale)
+    o = ops.linear.matmul(o, w.o)
+    dy = ops.elemwise.residual_add(o, dy)
+    nx = ops.elemwise.rmsnorm(dy, w.mlp_norm, m.eps)
+    gate, up = ops.linear.matmul(nx, w.gate), ops.linear.matmul(nx, w.up)
+    f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
+    dy = ops.elemwise.residual_add(f, dy)
+    read = ops.elemwise.rmsnorm(dy, m.final_norm, m.eps)
+    proposal = ops.linear.lm_head(read, m.head)
+    output("mtp.logits", proposal)
+    output("mtp.drafts", ops.sampling.argmax([proposal, proposal, proposal, proposal]))
 
 def attention(x, inputs, m, positions, scaling, w):
     pages = inputs.kv(w.kv)

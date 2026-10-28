@@ -4,8 +4,8 @@ use poem_compiler::{Budget, CompiledModel, DeviceProfile, compile};
 use poem_exec::fire::{WindowTable, fallback};
 use poem_ir::Trace;
 
-fn test_slots() -> engine_cuda::window::Slots {
-    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 2, 512)
+fn test_slots(compiled: &poem_compiler::CompiledModel) -> engine_cuda::window::Slots {
+    engine_cuda::window::Slots::new(engine_cuda::window::slot_bases(compiled).1, 512, 8, 1, 4096, 2, 512)
 }
 
 const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -78,7 +78,8 @@ fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
         poem_ir::PerAxis::new([&ascending, &WindowTable::default(), &WindowTable::default()]),
         &indptr(&vec![1; count]),
         engine_cuda::window::Copies::off(),
-        test_slots(),
+        test_slots(&compiled),
+        &[],
     )
     .expect_err("a promise P4 made and this table broke");
     let said = refusal.to_string();

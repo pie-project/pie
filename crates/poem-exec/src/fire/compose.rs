@@ -188,6 +188,39 @@ impl WindowTable {
         out
     }
 
+    /// One span for each run `mask`'s classes form in `order` (a wide key's
+    /// classes, in the order a fire lays their rows out): the union of the
+    /// rows this fire seats of that run's classes, empty where it seats none.
+    /// A region's runs are then the same for every fire of the key, whichever
+    /// of its classes a fire seats.
+    pub fn spans_by_order_into(&self, mask: &ClassSet, order: &[u8], out: &mut Vec<MaskSpan>) {
+        out.clear();
+        let mut open = false;
+        for &class in order {
+            if !mask.contains(usize::from(class)) {
+                open = false;
+                continue;
+            }
+            if !open {
+                out.push(MaskSpan::default());
+                open = true;
+            }
+            let window = self.class(usize::from(class));
+            if window.rows == 0 {
+                continue;
+            }
+            let Some(span) = out.last_mut() else {
+                continue;
+            };
+            if span.rows == 0 {
+                *span = window;
+            } else {
+                span.rows += window.rows;
+                span.lanes += window.lanes;
+            }
+        }
+    }
+
     pub fn spans_into(&self, mask: &ClassSet, out: &mut Vec<MaskSpan>) {
         out.clear();
         for class in mask.iter() {

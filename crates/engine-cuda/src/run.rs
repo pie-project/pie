@@ -154,16 +154,20 @@ pub struct RsScratch {
     ptr: u64,
     bytes: u64,
     cursor: Cell<u64>,
+    csr: Cell<Option<(u32, Tensor)>>,
     ext: std::cell::RefCell<std::collections::HashMap<u32, Tensor>>,
 }
 
 impl RsScratch {
+    const CSR_HEADROOM: u64 = 256;
+
     #[must_use]
     pub fn new(ptr: u64, bytes: u64) -> Self {
         Self {
             ptr,
             bytes,
-            cursor: Cell::new(0),
+            cursor: Cell::new(Self::CSR_HEADROOM.min(bytes)),
+            csr: Cell::new(None),
             ext: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
@@ -188,7 +192,7 @@ impl RsScratch {
     }
 
     fn reset(&self) {
-        self.cursor.set(0);
+        self.cursor.set(Self::CSR_HEADROOM.min(self.bytes));
         self.ext.borrow_mut().clear();
     }
 }
@@ -266,19 +270,17 @@ impl RsSeat<'_> {
         Ok(())
     }
 
-    fn pages_to_rows(
+    fn push_page_runs(
         &self,
-        stream: *mut core::ffi::c_void,
         plane: crate::store::rs::Plane,
         pages: &[u32],
         from: u32,
         count: u32,
-        dst: u64,
+        dst_word_base: u32,
+        row_words: u32,
+        runs: &mut Vec<kernels_cuda::runtime::channel::WordRun>,
     ) -> crate::error::Result<()> {
         let page_tokens = self.buffers.page_tokens();
-        let elem = poem_compiler::arena::elem_bytes(crate::store::rs::PLANE_DTYPE)
-            .expect("the buffered planes are bf16, which has an element size");
-        let row_bytes = plane.width * elem;
         let mut done = 0u32;
         while done < count {
             let token = from + done;
@@ -293,8 +295,11 @@ impl RsSeat<'_> {
                     have: pages.len() as u64,
                 })?;
             let slab = self.buffers.row(plane, page_slot, in_page)?;
-            let bytes = usize::try_from(u64::from(take) * row_bytes).unwrap_or(usize::MAX);
-            crate::device::copy_d2d(stream, dst + u64::from(done) * row_bytes, slab, bytes)?;
+            runs.push(kernels_cuda::runtime::channel::WordRun {
+                src: slab,
+                dst_word: dst_word_base + done * row_words,
+                words: take * row_words,
+            });
             done += take;
         }
         Ok(())
@@ -422,17 +427,18 @@ impl Standing {
         captured: bool,
         moves: bool,
         carve: Option<Carve<'_>>,
+        mask: Option<&poem_ir::ClassSet>,
     ) -> Self {
         let held = if captured {
             let span = window.span();
             Held::Captured {
-                plane: moves && window.is_interval(),
+                plane: moves && window.launches_one_span(),
                 ceiling: carve
                     .and_then(|carve| carve.on(axis))
-                    .and_then(|carve| carve.ceiling(span)),
+                    .and_then(|carve| carve.ceiling(span, mask)),
                 lanes: carve
                     .and_then(|carve| carve.on(axis))
-                    .and_then(|carve| carve.lanes(span)),
+                    .and_then(|carve| carve.lanes(span, mask)),
             }
         } else {
             Held::Eager
@@ -871,6 +877,19 @@ impl<'c> Run<'c> {
 
     pub(crate) fn standing_as(&self, region: u32, run: u32, captured: bool) -> Standing {
         let axis = self.windows.axis_of(region);
+        let mask = self
+            .ceilings
+            .regions
+            .get(region as usize)
+            .map(|region| &region.mask);
+        // A region a wide key cuts into runs takes each run's ceiling off
+        // that run's classes (`FireDescriptor::order`).
+        let run_mask = (self.windows.runs(region) > 1)
+            .then(|| {
+                let carve = self.ceilings.carve?.on(axis)?;
+                Some(carve.run_mask(mask?, run))
+            })
+            .flatten();
         Standing::of(
             self.windows.at(region, run),
             axis,
@@ -882,6 +901,7 @@ impl<'c> Run<'c> {
                 .copied()
                 .unwrap_or(false),
             self.ceilings.carve,
+            run_mask.as_ref().or(mask),
         )
     }
 
@@ -994,14 +1014,29 @@ impl<'c> Run<'c> {
 
     pub(crate) fn rs_ext_csr(&self, op: &'static str) -> Result<Tensor, kernels_cuda::Error> {
         let (seat, scratch) = self.rs_seat_and_scratch(op)?;
+        let lane0 = self.window().span().lane_offset;
+        if let Some((cached_lane0, tensor)) = scratch.csr.get()
+            && cached_lane0 == lane0
+        {
+            return Ok(tensor);
+        }
         let (_, csr) = self.rs_ext_layout(seat);
         let bytes: Vec<u8> = csr.iter().flat_map(|n| n.to_le_bytes()).collect();
-        let at = scratch
-            .take(bytes.len() as u64)
-            .map_err(|f| Self::rs_fault(op, f))?;
+        let can_cache = (bytes.len() as u64) <= RsScratch::CSR_HEADROOM && scratch.bytes >= RsScratch::CSR_HEADROOM;
+        let at = if can_cache {
+            scratch.ptr
+        } else {
+            scratch
+                .take(bytes.len() as u64)
+                .map_err(|f| Self::rs_fault(op, f))?
+        };
         crate::device::stage_raw(self.ctx.stream(), at, &bytes)
             .map_err(|f| Self::rs_fault(op, f))?;
-        Ok(Tensor::new(at, csr.len() as u32, 1, poem_ir::Dtype::I32))
+        let tensor = Tensor::new(at, csr.len() as u32, 1, poem_ir::Dtype::I32);
+        if can_cache {
+            scratch.csr.set(Some((lane0, tensor)));
+        }
+        Ok(tensor)
     }
 
     pub(crate) fn rs_extend(
@@ -1041,6 +1076,8 @@ impl<'c> Run<'c> {
         let lane0 = self.window().span().lane_offset as usize;
         let bounds = self.qo_indptr_host();
         let stream = self.ctx.stream();
+        let row_words = u32::try_from(row_bytes / 4).unwrap_or(0);
+        let mut runs: Vec<kernels_cuda::runtime::channel::WordRun> = Vec::new();
         for (r, &(begin, replay, rows)) in lanes.iter().enumerate() {
             if replay > 0
                 && let Some(plane) = plane
@@ -1058,13 +1095,14 @@ impl<'c> Run<'c> {
                 let mut done = 0u32;
                 for span in seat.reads.get(lane0 + r).map_or(&[][..], Vec::as_slice) {
                     let count = span.end - span.start;
-                    seat.pages_to_rows(
-                        stream,
+                    seat.push_page_runs(
                         plane,
                         pages,
                         span.start,
                         count,
-                        at + u64::from(begin + done) * row_bytes,
+                        (begin + done) * row_words,
+                        row_words,
+                        &mut runs,
                     )
                     .map_err(|f| Self::rs_fault(op, f))?;
                     done += count;
@@ -1072,15 +1110,41 @@ impl<'c> Run<'c> {
             }
             if rows > 0 {
                 let src = own.ptr + u64::from(bounds[r].max(0) as u32) * row_bytes;
-                let dst = at + u64::from(begin + replay) * row_bytes;
+                runs.push(kernels_cuda::runtime::channel::WordRun {
+                    src,
+                    dst_word: (begin + replay) * row_words,
+                    words: rows * row_words,
+                });
+            }
+        }
+        if runs.len() <= 4 || row_bytes % 4 != 0 {
+            for run in &runs {
                 crate::device::copy_d2d(
                     stream,
-                    dst,
-                    src,
-                    usize::try_from(u64::from(rows) * row_bytes).unwrap_or(usize::MAX),
+                    at + u64::from(run.dst_word) * 4,
+                    run.src,
+                    run.words as usize * 4,
                 )
                 .map_err(|f| Self::rs_fault(op, f))?;
             }
+        } else {
+            let mut raw = Vec::with_capacity(runs.len() * 16);
+            for run in &runs {
+                raw.extend_from_slice(&run.src.to_ne_bytes());
+                raw.extend_from_slice(&run.dst_word.to_ne_bytes());
+                raw.extend_from_slice(&run.words.to_ne_bytes());
+            }
+            let runs_at = scratch
+                .take(raw.len() as u64)
+                .map_err(|f| Self::rs_fault(op, f))?;
+            crate::device::stage_raw(stream, runs_at, &raw)
+                .map_err(|f| Self::rs_fault(op, f))?;
+            kernels_cuda::runtime::channel::gather_words(
+                &self.ctx,
+                runs_at,
+                at,
+                runs.len() as u32,
+            )?;
         }
         Ok(ext)
     }
@@ -1278,7 +1342,7 @@ impl<'c> Run<'c> {
         if standing.whole { pad } else { Pad::default() }
     }
 
-    fn plane_base(&self) -> bool {
+    pub(crate) fn plane_base(&self) -> bool {
         self.standing().plane()
     }
 
@@ -1309,6 +1373,12 @@ impl<'c> Run<'c> {
     /// them per token) one token takes. An expert region's value is laid
     /// over every rank's tokens at the bucket.
     pub(crate) fn plane_fan(&self, plane: ValueId) -> u32 {
+        if let Some(decl) = self.values.get(plane.0 as usize)
+            && let Ty::Tensor { shape, .. } = &decl.ty
+            && !matches!(shape.first(), Some(Dim::Tokens | Dim::TokensTimes(_)))
+        {
+            return 1;
+        }
         let plane_rows = self.tensor(plane).rows;
         let tokens = if self.expert.get(plane.0 as usize).copied().unwrap_or(false) {
             self.bucket() * self.ep_rank().map_or(1, |ep| ep.wires.len() as u32)
@@ -1340,7 +1410,10 @@ impl<'c> Run<'c> {
     pub(crate) fn segments(&self) -> Option<Segments> {
         let window = self.window();
         let count = window.segs();
-        if count == 0 {
+        // A captured launch walks the window's union at its ceiling, the
+        // live rows read off the device: a grouped op passes the rows of
+        // other classes through by their routes ([`crate::GROUPED`]).
+        if count == 0 || self.standing().armed() {
             return None;
         }
         Some(Segments {

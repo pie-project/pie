@@ -106,6 +106,8 @@ pub struct Shell {
     /// prefill's width.
     staging: Vec<bool>,
     schedule_readers: Vec<Option<u32>>,
+    /// `exports::plan_readers`: the regions reading each region's plans.
+    plan_readers: Vec<Vec<u32>>,
     adapter_fact: Option<u32>,
     adapters: crate::blob::Adapters,
     held: Vec<u32>,
@@ -123,6 +125,8 @@ pub struct Shell {
     decoded_tiles: Vec<u64>,
     arming: bool,
     golden_arm: Golden,
+    /// The lane outputs the last golden fire read out ([`settle::Readback::observed`]).
+    observed: Vec<Vec<f32>>,
     armed_body: Option<record::BodyKey>,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,

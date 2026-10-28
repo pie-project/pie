@@ -197,6 +197,7 @@ struct Deployment {
     prefilling: Vec<usize>,
     media: Vec<usize>,
     wide: Vec<usize>,
+    plain: poem_ir::ClassSet,
     decoding: poem_ir::ClassSet,
     seats: u32,
     context: u32,
@@ -318,42 +319,57 @@ fn tower_keys(deployment: &Deployment, into: &mut Targets) {
     }
 }
 
+/// `seats` lanes, the classes of `order` taking turns.
+fn turns(order: &[usize], seats: usize) -> Vec<usize> {
+    order.iter().copied().cycle().take(seats).collect()
+}
+
+/// One wide body a bucket. A wide key names the whole tier
+/// ([`record::Tiers::whole`]), and its body launches every region of it at
+/// the ladder's ceilings whichever classes a fire seats, so one body
+/// answers every subset of the tier; its lanes are as many as the bucket
+/// seats, since a region every class runs launches over the fire's lanes.
+/// The classes off the plain tier lead, so a one-lane bucket still keys
+/// wide.
 fn wide_keys(deployment: &Deployment, into: &mut Targets) {
+    let (wide, plain): (Vec<usize>, Vec<usize>) = deployment
+        .wide
+        .iter()
+        .copied()
+        .partition(|class| !deployment.plain.contains(*class));
+    if wide.is_empty() {
+        return;
+    }
+    let order: Vec<usize> = wide.into_iter().chain(plain).collect();
+    let decodes = |class: &usize| deployment.decoding.contains(*class);
     for point in deployment.buckets.iter().copied() {
         let seats = deployment.seats.min(deployment.max_lanes).min(point) as usize;
-        let decoders: Vec<usize> = deployment
-            .wide
-            .iter()
-            .copied()
-            .filter(|class| deployment.decoding.contains(*class))
-            .take(seats)
-            .collect();
-        let prefilling: Vec<usize> = deployment
-            .wide
-            .iter()
-            .copied()
-            .filter(|class| !deployment.decoding.contains(*class))
-            .take(seats.saturating_sub(decoders.len()))
-            .collect();
-        let rows_left = point - decoders.len() as u32;
-        let spread = if prefilling.is_empty() {
-            Some(Vec::new())
+        let classes = turns(&order, seats);
+        let (decoders, prefilling): (Vec<usize>, Vec<usize>) =
+            classes.iter().copied().partition(decodes);
+        let spread = if classes
+            .first()
+            .is_none_or(|class| deployment.plain.contains(*class))
+        {
+            None
+        } else if prefilling.is_empty() {
+            (decoders.len() as u32 == point).then(Vec::new)
         } else {
-            Shell::spread(rows_left, prefilling.len() as u32, deployment.context)
+            Shell::spread(
+                point - decoders.len() as u32,
+                prefilling.len() as u32,
+                deployment.context,
+            )
+            .filter(|rows| rows.len() == prefilling.len())
         };
         match spread {
-            Some(rows) if decoders.len() + prefilling.len() > 1 => {
-                let mut lanes: Vec<(usize, u32)> =
+            Some(rows) => {
+                let mut lanes: Vec<LaneRows> =
                     decoders.iter().map(|class| (*class, 1u32)).collect();
-                lanes.extend(
-                    prefilling
-                        .iter()
-                        .zip(rows)
-                        .map(|(class, rows)| (*class, rows)),
-                );
+                lanes.extend(prefilling.iter().copied().zip(rows));
                 into.targets.push((point, BodySynth::Wide { lanes }));
             }
-            _ => into.unfireable.push(unfireable_line(
+            None => into.unfireable.push(unfireable_line(
                 deployment,
                 "wide",
                 &format!("bucket {point}"),
@@ -586,6 +602,13 @@ impl Shell {
         armed
     }
 
+    /// The lane outputs (captured scores among them) the fire just landed
+    /// holds, after its readouts: a golden compares what a body writes there
+    /// too.
+    fn observed_into(&mut self, out: &mut Vec<Vec<f32>>) {
+        out.append(&mut self.observed);
+    }
+
     fn golden(&mut self, key: &record::BodyKey, owned: &[Synthetic]) -> Result<()> {
         use crate::serve::Golden;
 
@@ -605,8 +628,9 @@ impl Shell {
             for &slot in &slots {
                 shell.open(slot)?;
             }
-            let out = shell.fire_synthetic_as(owned, arm)?;
+            let mut out = shell.fire_synthetic_as(owned, arm)?;
             shell.device.synchronize()?;
+            shell.observed_into(&mut out);
             Ok(out)
         };
         if crate::record::ptr_traced(key) {
@@ -847,8 +871,9 @@ impl Shell {
                 shell.open(slot)?;
             }
             shell.fire_synthetic_as(owned, Golden::Eager)?;
-            let out = shell.fire_synthetic_as(&real, arm)?;
+            let mut out = shell.fire_synthetic_as(&real, arm)?;
             shell.device.synchronize()?;
+            shell.observed_into(&mut out);
             Ok(out)
         };
         let Ok(walked) = fire(self, Golden::Eager) else {
@@ -860,6 +885,28 @@ impl Shell {
             None => Ok(()),
             Some(why) => Err(refused(why)),
         }
+    }
+
+    /// Each class of the whole tier off the plain tier alone at `bucket`'s
+    /// rows, so the fire keys the same wide body with every other class
+    /// absent: a decoding class one lane a row where the bucket seats that
+    /// many, any other one lane of the bucket's rows.
+    fn wide_alone(&self, bucket: u32) -> Vec<Vec<LaneRows>> {
+        let seats = (self.held.len() as u32).min(self.budget.max_lanes);
+        let context = self.pools.paging().context();
+        self.tiers
+            .whole
+            .iter()
+            .map(|&class| class as usize)
+            .filter(|class| !self.tiers.plain.contains(*class))
+            .filter_map(|class| {
+                if self.decoding.contains(class) {
+                    (bucket <= seats).then(|| vec![(class, 1u32); bucket as usize])
+                } else {
+                    (bucket <= context).then(|| vec![(class, bucket)])
+                }
+            })
+            .collect()
     }
 
     pub(super) fn arm_bodies(&mut self) -> Result<()> {
@@ -985,8 +1032,9 @@ impl Shell {
                 .decoding
                 .iter()
                 .chain((0..classes).filter(|class| !self.decoding.contains(*class)))
-                .filter(|class| textual(*class) && !self.landing[*class].is_empty())
+                .filter(|class| self.tiers.whole.contains(&(*class as u32)))
                 .collect(),
+            plain: self.tiers.plain.clone(),
             decoding: self.decoding.clone(),
             seats,
             context,
@@ -1103,6 +1151,15 @@ impl Shell {
                 let clock = std::time::Instant::now();
                 self.golden_real(key, &owned)?;
                 golden_ms.1 = clock.elapsed().as_secs_f64() * 1000.0;
+                // The wide body answers each class of its key alone, every
+                // other class's regions launching empty.
+                if let BodySynth::Wide { .. } = &target {
+                    for alone in self.wide_alone(bucket) {
+                        let owned = self.synthetic_lanes(&alone);
+                        self.golden(key, &owned)?;
+                        self.golden_real(key, &owned)?;
+                    }
+                }
             }
             if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
                 armed += 1;
@@ -1307,7 +1364,7 @@ impl Shell {
                     .join(" ")
             );
         }
-        if !verify && !matches!(seal, Seal::Open) {
+        if !verify && self.ep.is_some() && !matches!(seal, Seal::Open) {
             self.cache.seal_bodies();
         }
         self.armed = Some(report);

@@ -109,17 +109,49 @@ pub fn compile_stage(bound: &BoundTrace, stage: Stage) -> Option<CompiledStage> 
 pub fn compile_stage_at(bound: &BoundTrace, stage_index: usize) -> CompiledStage {
     let mut normalized = normalize_stage(bound, stage_index);
     localize_stage(bound, &mut normalized);
-    let signature = stage_signature(bound, &normalized);
+    let mut signature = stage_signature(bound, &normalized);
     let index = StageIndex::of(&normalized);
     let singleton = singleton_partition(&normalized, &index);
-    let matches = recognize_library_dataflows(&normalized, &index);
-    let fused = fused_partition(&normalized, &index, &matches);
-    CompiledStage {
+    let no_idiom = std::env::var_os("PIE_ETA_NO_IDIOM").is_some();
+    let no_fusion = std::env::var_os("PIE_ETA_NO_FUSION").is_some();
+    if no_idiom {
+        signature.hash ^= 0x9e37_79b9_7f4a_7c15;
+    }
+    if no_fusion {
+        signature.hash ^= 0xbf58_476d_1ce4_e5b9;
+    }
+    let matches = if no_idiom {
+        Vec::new()
+    } else {
+        recognize_library_dataflows(&normalized, &index)
+    };
+    let fused = if no_fusion {
+        singleton.clone()
+    } else {
+        fused_partition(&normalized, &index, &matches)
+    };
+    let stage = CompiledStage {
         normalized,
         signature,
         singleton,
         fused,
+    };
+    if std::env::var_os("PIE_ETA_METRICS").is_some() {
+        let m = stage.metrics();
+        eprintln!(
+            "PIE_ETA_METRICS stage={} sig={:016x} source_ops={} normalized_ops={} singleton_regions={} fused_regions={} library_regions={} static_scratch_bytes={} direct_channel_sink_bytes={}",
+            stage.normalized.stage.name(),
+            stage.signature.hash,
+            m.source_ops,
+            m.normalized_ops,
+            m.singleton_regions,
+            m.fused_regions,
+            m.library_regions,
+            m.static_scratch_bytes,
+            m.direct_channel_sink_bytes,
+        );
     }
+    stage
 }
 
 pub fn debug_stage_plan(stage: &CompiledStage) -> String {

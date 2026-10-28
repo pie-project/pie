@@ -4,21 +4,25 @@ use engine_cuda::{Boot, Shell};
 use poem::Platform;
 use poem_compiler::Budget;
 
-const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";
+/// A hybrid deployment and a plain-attention one, whose masked, adapted
+/// and score-capturing classes each arm one wide body a bucket.
+const HYBRID: (&str, &str) = ("qwen35-d0.8b-bf16-kv-bf16", "Qwen3.5-0.8B");
+const ATTENTION: (&str, &str) = ("qwen3-0.6b-bf16-kv-bf16", "Qwen3-0.6B");
 
 const PAGE: u32 = 16;
 
 const LANES: u32 = 16;
 const TOKENS: u32 = 512;
 
-fn snapshot() -> Option<PathBuf> {
-    if let Ok(stated) = std::env::var("PIE_SMOKE_SNAPSHOT") {
+fn snapshot(model: &str, stated: &str) -> Option<PathBuf> {
+    if let Ok(stated) = std::env::var(stated) {
         let path = PathBuf::from(stated);
         return path.is_dir().then_some(path);
     }
     let home = std::env::var("HOME").ok()?;
-    let snapshots =
-        Path::new(&home).join(".cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots");
+    let snapshots = Path::new(&home).join(format!(
+        ".cache/huggingface/hub/models--Qwen--{model}/snapshots"
+    ));
     std::fs::read_dir(snapshots)
         .ok()?
         .filter_map(|entry| Some(entry.ok()?.path()))
@@ -38,15 +42,15 @@ fn container(snapshot: &Path) -> Option<PathBuf> {
     found.into_iter().next()
 }
 
-fn ready(what: &str) -> Option<Shell> {
+fn ready(what: &str, (row, model): (&str, &str), stated: &str) -> Option<Shell> {
     if !engine_cuda::device::present() {
         eprintln!("skipping {what}: no CUDA device on this machine");
         return None;
     }
-    let Some(checkpoint) = snapshot() else {
+    let Some(checkpoint) = snapshot(model, stated) else {
         eprintln!(
-            "skipping {what}: no Qwen3.5-0.8B snapshot in the hugging face cache \
-             (set PIE_SMOKE_SNAPSHOT)"
+            "skipping {what}: no {model} snapshot in the hugging face cache \
+             (set {stated})"
         );
         return None;
     };
@@ -55,7 +59,7 @@ fn ready(what: &str) -> Option<Shell> {
         return None;
     };
     let deployment =
-        poem_compiler::catalog::deployment(DEPLOYMENT).expect("the catalog ships the deployment");
+        poem_compiler::catalog::deployment(row).expect("the catalog ships the deployment");
     let trace = deployment.trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = deployment
@@ -89,11 +93,7 @@ fn ready(what: &str) -> Option<Shell> {
     Some(shell)
 }
 
-#[test]
-fn every_armed_body_answers_its_eager_walk() {
-    let Some(mut shell) = ready("every_armed_body_answers_its_eager_walk") else {
-        return;
-    };
+fn answers(shell: &mut Shell) {
     let armed = shell.armed().map_or(0, |armed| armed.armed);
     assert!(
         armed > 0,
@@ -106,4 +106,32 @@ fn every_armed_body_answers_its_eager_walk() {
         verified, armed,
         "the golden walked {verified} bodies where the arming pass captured {armed}"
     );
+}
+
+#[test]
+fn every_armed_body_answers_its_eager_walk() {
+    let what = "every_armed_body_answers_its_eager_walk";
+    if let Some(mut shell) = ready(what, HYBRID, "PIE_SMOKE_SNAPSHOT") {
+        let wide = shell.armed().map_or(0, |armed| {
+            armed.kinds[engine_cuda::serve::Kind::Wide.at()].0
+        });
+        assert!(wide > 0, "the hybrid lattice armed no wide body");
+        answers(&mut shell);
+    }
+}
+
+/// A wide body is keyed by every class of its tier and replays for any
+/// subset of them: the golden walks it at full width and with each class
+/// off the plain tier alone.
+#[test]
+fn every_armed_wide_body_answers_its_eager_walk() {
+    let what = "every_armed_wide_body_answers_its_eager_walk";
+    let Some(mut shell) = ready(what, ATTENTION, "PIE_QWEN3_SNAPSHOT") else {
+        return;
+    };
+    let wide = shell.armed().map_or(0, |armed| {
+        armed.kinds[engine_cuda::serve::Kind::Wide.at()].0
+    });
+    assert!(wide > 0, "the lattice armed no wide body");
+    answers(&mut shell);
 }

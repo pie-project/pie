@@ -534,7 +534,7 @@ impl FrameShell for Shell {
                 have: readouts_ceiling,
             });
         }
-        let descriptor = FireDescriptor::of(&composition);
+        let mut descriptor = FireDescriptor::of(&composition);
 
         let lane_facts: Vec<poem_exec::fire::LaneFacts> = lanes
             .iter()
@@ -891,7 +891,9 @@ impl FrameShell for Shell {
                 RsReset::Held => false,
             };
             if begins {
-                fresh.push(seated.rs_slot.unwrap_or(lane.slot));
+                let slot = seated.rs_slot.unwrap_or(lane.slot);
+                fresh.push(slot);
+                self.rs_ahead.remove(&slot);
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -999,7 +1001,11 @@ impl FrameShell for Shell {
                     rs_pages_named.max(pages.iter().copied().max().map_or(0, |page| page + 1));
             }
             let (verb, folded) = match &seated.rs {
-                RsVerb::Fold => (RsMove::None, row.rows),
+                RsVerb::Fold => {
+                    let slot = seated.rs_slot.unwrap_or(lane.slot);
+                    self.rs_ahead.remove(&slot);
+                    (RsMove::None, row.rows)
+                }
                 RsVerb::Buffer {
                     pages,
                     base,
@@ -1010,7 +1016,7 @@ impl FrameShell for Shell {
                     // past the runtime's length.
                     let slot = seated.rs_slot.unwrap_or(lane.slot);
                     let folded = &match self.rs_ahead.get(&slot) {
-                        Some(&at) if at > *folded && seated.rs_reset != RsReset::Fresh => at,
+                        Some(&at) if at > *folded && !begins => at,
                         _ => {
                             self.rs_ahead.remove(&slot);
                             *folded
@@ -1354,6 +1360,11 @@ impl FrameShell for Shell {
             &self.tiers,
             self.towered.then_some((&patches.classes, patches.bucket)),
         );
+        // A wide key cuts its regions into the runs their classes form in the
+        // tier's order, for the walk and the windows alike.
+        if self.tiers.keys_whole(&key.classes) {
+            descriptor.order = self.tiers.whole.iter().map(|class| *class as u8).collect();
+        }
         let copies_here = copies
             && key.classes.rungs().iter().all(|(class, _)| {
                 !self.masked.contains(*class as usize) && !self.wide.contains(*class as usize)
@@ -1388,6 +1399,7 @@ impl FrameShell for Shell {
                         spaces: &geometries,
                     },
                     self.inputs.window_slots(),
+                    &descriptor.order,
                 )?;
                 let packed = windows.packed();
                 if windows.copied() == 0 {
@@ -1475,6 +1487,15 @@ impl FrameShell for Shell {
                 });
         let readout_ceiling = last_rows.min(self.budget.max_lanes) + every_row;
         let bodied = bodied && readout_rows.len() <= readout_ceiling as usize;
+        if bodied {
+            descriptor.gated = self.tiers.gates(
+                &key.classes,
+                self.compiled.template(),
+                &self.shifted,
+                admits.as_ref(),
+                &self.plan_readers,
+            );
+        }
         let readout_live = readout_rows.len() as u32;
         if bodied {
             readout_rows.resize(readout_ceiling as usize, 0);
@@ -1553,6 +1574,7 @@ impl FrameShell for Shell {
                 lane_of_row: &lane_of_row,
                 group_of_lane: &group_of_lane,
                 packings: &packing_fires,
+                seated: bodied,
             },
         )?;
 

@@ -47,6 +47,41 @@ impl Kind {
     }
 }
 
+/// Every node the capture under way on `stream` holds so far, as raw
+/// handles.
+#[cfg(feature = "cuda")]
+pub(crate) fn captured_nodes(stream: *mut c_void) -> Result<Vec<usize>> {
+    use crate::device::dr;
+
+    let (graph, _) = capture_info(stream)?;
+    let mut count: usize = 0;
+    // SAFETY: a null array and a live count asks for the count alone, on the
+    // graph the capture builds.
+    said("cuGraphGetNodes", unsafe {
+        dr::cuGraphGetNodes(graph, core::ptr::null_mut(), &raw mut count)
+    })?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut nodes: Vec<dr::CUgraphNode> = vec![core::ptr::null_mut(); count];
+    // SAFETY: `nodes` holds `count` live slots, the count just asked.
+    said("cuGraphGetNodes", unsafe {
+        dr::cuGraphGetNodes(graph, nodes.as_mut_ptr(), &raw mut count)
+    })?;
+    nodes.truncate(count);
+    Ok(nodes.into_iter().map(|node| node as usize).collect())
+}
+
+/// No node lists without CUDA's driver: wide bodies are not armed there.
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn captured_nodes(stream: *mut c_void) -> Result<Vec<usize>> {
+    let _ = stream;
+    Err(Fault::Device {
+        call: "a capture's node list (this backend keeps no per-node enabling)",
+        code: 0,
+    })
+}
+
 #[cfg(feature = "cuda")]
 fn capture_info(
     stream: *mut c_void,

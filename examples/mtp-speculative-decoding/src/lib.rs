@@ -59,6 +59,8 @@ struct Input {
     /// vocabulary in the epilogue.
     #[serde(default)]
     margin: bool,
+    #[serde(default)]
+    ckpt_sync: bool,
 }
 
 fn default_prompt() -> String {
@@ -337,8 +339,19 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let budget = input.max_tokens;
+        let ckpt_sync = input.ckpt_sync;
+        let mut held_ckpt = if ckpt_sync {
+            ws.fork(&pipe).ok()
+        } else {
+            None
+        };
         run_ahead(&pipe, &fwd, budget, async || {
             let committed = out.take_host::<Vec<i32>>().await?;
+            if ckpt_sync {
+                if let Ok(c) = ws.fork(&pipe) {
+                    held_ckpt = Some(c);
+                }
+            }
             if tracing {
                 let traced = aux.take_host::<Vec<f32>>().await?;
                 if proposed_trace.len() < 12 {

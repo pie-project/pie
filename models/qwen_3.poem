@@ -40,12 +40,12 @@ def fixture(id, **kwargs):
 MODELS = [
     qwen("qwen36-27b", parts = ["vision"], drafters = ["mtp", "dflash"], layers = 64),
     qwen("qwen38-27b", template = CHATML_QWEN38, tokenizer = TOKENIZER_38, parts = ["vision"], drafters = ["mtp", "dflash2", "dspark"], layers = 64),
-    qwen("qwen35-d0.8b", parts = ["vision"], drafters = ["eagle"], layers = 24),
+    qwen("qwen35-d0.8b", parts = ["vision"], drafters = ["eagle", "mtp"], layers = 24),
     qwen("qwen35-d2b", layers = 24),
     qwen("qwen35-d3b", layers = 24, vocab = 151936),
-    qwen("qwen35-d4b", parts = ["vision"], layers = 32),
+    qwen("qwen35-d4b", parts = ["vision"], drafters = ["mtp"], layers = 32),
     qwen("qwen35-a3b", layers = 40),
-    qwen("qwen35-d9b", parts = ["vision"], drafters = ["dflash"], layers = 32),
+    qwen("qwen35-d9b", parts = ["vision"], drafters = ["dflash", "mtp"], layers = 32),
     qwen("qwen36-35b-a3b", drafters = ["mtp", "dflash", "dflash2"], layers = 40),
     qwen("qwen35-397b-a17b", parts = ["vision"], layers = 60),
     qwen("qwen35-122b-a10b", layers = 48),
@@ -104,10 +104,14 @@ DEPLOYMENTS = [
     deployment("qwen35-d0.8b", weights = U4, kv = BF),
     deployment("qwen35-d2b", weights = U4, kv = BF),
     deployment("qwen35-d4b", weights = U4, kv = BF),
+    deployment("qwen35-d4b", weights = BF, kv = BF, drafter = "mtp"),
+    deployment("qwen35-d4b", weights = BF, kv = BF, drafter = "mtp", parts = ["vision"]),
     deployment("qwen35-d4b", weights = BF, kv = BF),
     deployment("qwen35-d4b", weights = BF, kv = BF, parts = ["vision"]),
     deployment("qwen35-d9b", weights = U4, kv = BF, drafter = "dflash"),
     deployment("qwen35-d9b", weights = U4, kv = BF),
+    deployment("qwen35-d9b", weights = BF, kv = BF, drafter = "mtp"),
+    deployment("qwen35-d9b", weights = BF, kv = BF, drafter = "mtp", parts = ["vision"]),
     deployment("qwen35-d9b", weights = BF, kv = BF),
     deployment("qwen35-d9b", weights = BF, kv = BF, parts = ["vision"]),
     deployment("qwen36-35b-a3b", weights = U4, kv = BF, drafter = "dflash"),
@@ -165,8 +169,10 @@ DEPLOYMENTS = [
     deployment("qwen36-27b", weights = MODELOPT, kv = BF),
     deployment("qwen35-d3b", weights = BF, kv = BF),
     deployment("qwen35-d0.8b", weights = BF, kv = BF, drafter = "eagle"),
+    deployment("qwen35-d0.8b", weights = BF, kv = BF, drafter = "mtp"),
     deployment("qwen35-d0.8b", weights = BF, kv = BF),
     deployment("qwen35-d0.8b", weights = BF, kv = BF, drafter = "eagle", parts = ["vision"]),
+    deployment("qwen35-d0.8b", weights = BF, kv = BF, drafter = "mtp", parts = ["vision"]),
     deployment("qwen36-27b", weights = U4, kv = BF, parts = ["vision"]),
     deployment("qwen36-27b", weights = BF, kv = BF, drafter = "mtp", parts = ["vision"]),
     deployment("qwen38-27b", weights = U4, kv = BF, parts = ["vision"]),
@@ -517,23 +523,25 @@ def drafted(id, deploy):
             return d27b(draft = "dspark", dflash_head = HEADS["qwen38-27b-dspark"])
         refuse()
     if id == "qwen35-d0.8b":
-        return d0_8b(tower = SMALL if vision else None, draft = drafter)
-    if id == "qwen35-d4b" and drafter == None:
+        return d0_8b(tower = SMALL if (vision and drafter == None) else None, draft = drafter)
+    if id == "qwen35-d4b" and drafter in [None, "mtp"]:
         return dims(hidden = 2560, layers = 32, attn_every = 4, q_heads = 16, kv_heads = 4,
                     head_dim = 256, rotary_dim = 64, k_heads = 16, v_heads = 32, k_dim = 128,
                     v_dim = 128, mlp = dense(9216), vocab = 248320, tied = True,
-                    tower = MEDIUM if vision else None)
+                    tower = MEDIUM if (vision and drafter == None) else None, draft = drafter)
     if id in ["ornith15-397b", "qwen35-397b-a17b"] and drafter == None:
         return a17b(tower = LARGE if vision else None)
     if id == "qwen35-d9b":
         d = dims(hidden = 4096, layers = 32, attn_every = 4, q_heads = 16, kv_heads = 4, head_dim = 256,
                  rotary_dim = 64, k_heads = 16, v_heads = 32, k_dim = 128, v_dim = 128,
                  mlp = dense(12288), vocab = 248320, tied = False,
-                 tower = LARGE if vision else None)
+                 tower = LARGE if (vision and drafter == None) else None)
         if drafter == "dflash":
             if vision:
                 refuse()
             d.update(draft = "dflash", dflash_head = HEADS["qwen35-d9b-dflash"])
+        elif drafter == "mtp":
+            d.update(draft = "mtp")
         elif drafter != None:
             refuse()
         return d
@@ -1433,7 +1441,9 @@ def mlp(x, f, bonsai):
 
 def draft(m, inputs, x, logits, head):
     mtp = m.mtp
-    plan = ops.attn.plan_prefill(inputs.on(fact.drafts()), m.q_heads, m.kv_heads, m.head_dim, None)
+    input_draft = inputs.on(fact.drafts())
+    dpos = input_draft.positions()
+    plan = ops.attn.plan_prefill(input_draft, m.q_heads, m.kv_heads, m.head_dim, None)
     hidden = x.on(fact.drafts())
     chosen = ops.sampling.argmax([logits.on(fact.drafts())])
     e = ops.gather.embed(chosen, m.embed, m.vocab)
@@ -1445,7 +1455,7 @@ def draft(m, inputs, x, logits, head):
 
     nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mixer_norm, mtp.mixer_norm_eps)
     a = mtp.attn
-    o = draft_attn(nx, inputs, plan, a, m.head_dim, m.kv_heads, lambda q, k: rotate(q, k, inputs, m, a))
+    o = draft_attn(nx, input_draft, plan, a, m.head_dim, m.kv_heads, lambda q, k: rope(q, k, dpos, False, a.rotary_dim, m.head_dim, a.theta, rope_scaling(m.rope)))
     dy = ops.elemwise.residual_add(o, dy)
 
     nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mlp_norm, mtp.mlp_norm_eps)
@@ -1456,7 +1466,7 @@ def draft(m, inputs, x, logits, head):
     read = ops.elemwise.rmsnorm_plus_one(dy, mtp.norm, mtp.norm_eps) if mtp.norm != None else dy
     proposal = ops.linear.lm_head(read, head)
     output("mtp.logits", proposal)
-    output("mtp.drafts", ops.sampling.argmax([proposal]))
+    output("mtp.drafts", ops.sampling.argmax([proposal, proposal, proposal, proposal]))
 
 def rotate(q, k, inputs, m, a):
     vision = m.tower != None

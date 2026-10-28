@@ -167,6 +167,43 @@ pub(crate) fn plain_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
     )
 }
 
+/// The classes one body per bucket lays out whole ([`crate::record::Tiers::whole`]),
+/// in the order a fire lays their rows out: each a request lands in, that
+/// stages no media and reads no guest input, so a synthetic lane stands in
+/// for it when the body is armed. A wide body gates each region some of its
+/// classes run on the device ([`crate::record::Tiers::gates`]), and HIP
+/// graphs have no conditional node: there the tier is empty.
+#[must_use]
+pub(crate) fn whole_of(
+    landing: &[Vec<poem_ir::Request>],
+    compiled: &CompiledModel,
+    feeds: &poem_exec::feeds::Feeds,
+    media: &poem_ir::ClassSet,
+) -> Box<[u32]> {
+    if cfg!(feature = "rocm") {
+        return Box::new([]);
+    }
+    let every = poem_ir::ClassSet::of(
+        landing
+            .iter()
+            .enumerate()
+            .filter(|(class, requests)| {
+                !requests.is_empty()
+                    && !media.contains(*class)
+                    && !feeds
+                        .inputs
+                        .iter()
+                        .any(|(_, readers)| readers.contains(*class))
+            })
+            .map(|(class, _)| class),
+    );
+    let order = compiled.order_for(poem_ir::RowAxis::Tokens).map_or_else(
+        || every.iter().map(|class| class as u8).collect(),
+        |order| order.class_order(&every),
+    );
+    order.into_iter().map(u32::from).collect()
+}
+
 #[must_use]
 pub(crate) fn decoding_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
     poem_ir::ClassSet::of(
@@ -356,6 +393,39 @@ pub(crate) fn schedule_streams(trace: &Trace, compiled: &CompiledModel) -> Vec<O
         .map(|readers| match readers.as_deref() {
             Some([stream]) => Some(*stream),
             _ => None,
+        })
+        .collect()
+}
+
+/// Per template region, the regions that read the plans it makes (none for
+/// a region that makes none), by [`regions_launching_schedules`].
+#[must_use]
+pub(crate) fn plan_readers(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    schedule_readers: &[Option<u32>],
+) -> Vec<Vec<u32>> {
+    let mut outputs: Vec<ValueId> = Vec::new();
+    compiled
+        .template()
+        .iter()
+        .map(|region| {
+            let mut readers: Vec<u32> = Vec::new();
+            for node in region.nodes.clone() {
+                let Some(node) = trace.nodes.get(node as usize) else {
+                    continue;
+                };
+                outputs.clear();
+                node.op.outputs(&mut outputs);
+                for id in &outputs {
+                    if let Some(Some(reader)) = schedule_readers.get(id.0 as usize)
+                        && !readers.contains(reader)
+                    {
+                        readers.push(*reader);
+                    }
+                }
+            }
+            readers
         })
         .collect()
 }

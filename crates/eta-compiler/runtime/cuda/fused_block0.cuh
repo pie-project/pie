@@ -74,6 +74,32 @@ __device__ __forceinline__ void ptir_parallel_intrinsic(
       p.intrinsic_row_stride == 0u ? width : p.intrinsic_row_stride;
   const m1_u64 first_row =
       (m1_u64)p.intrinsic_row_offset + (m1_u64)p.imm2;
+  if (width != 0u && (output_desc.len % width) == 0u) {
+    const m1_u32 rows = output_desc.len / width;
+    const bool vec = (width & 3u) == 0u && m1_aligned16(output) &&
+                     m1_intrinsic_row_vectorable(
+                         input, first_row, stride, p.intrinsic_dtype);
+    for (m1_u32 row = 0u; row < rows; ++row) {
+      m1_u8* row_out = output + (m1_u64)row * (m1_u64)width * 4ull;
+      if (vec) {
+        const m1_u32 quads = width >> 2u;
+        for (m1_u32 q = threadIdx.x; q < quads; q += blockDim.x) {
+          const float4 v = m1_intrinsic_row_load4(
+              input, first_row + row, q << 2u, stride, p.intrinsic_dtype);
+          m1_store4_f(row_out, q, v);
+        }
+      } else {
+        for (m1_u32 col = threadIdx.x; col < width; col += blockDim.x) {
+          m1_store_f(
+              row_out,
+              col,
+              m1_intrinsic_row_load(
+                  input, first_row + row, col, stride, p.intrinsic_dtype));
+        }
+      }
+    }
+    return;
+  }
   if (output_desc.len <= width) {
     // One row: its columns, no division an element.
     for (m1_u32 index = threadIdx.x; index < output_desc.len; index += blockDim.x)
@@ -511,6 +537,23 @@ __device__ __forceinline__ void ptir_parallel_gather(
   if (input_desc.rank != 0u) {
     rows = input_desc.dims[0];
     rest = rows == 0u ? 1u : input_desc.len / rows;
+  }
+  if (rest >= blockDim.x) {
+    const m1_u64 elem = output_desc.dtype == 3u ? 1ull : 4ull;
+    for (m1_u32 k = 0u; k < index_desc.len; ++k) {
+      const long long row =
+          m1_load_index(indices, k, index_desc.dtype);
+      const bool valid = row >= 0 && (m1_u64)row < rows;
+      m1_u8* dst = output + (m1_u64)k * (m1_u64)rest * elem;
+      if (valid) {
+        const m1_u8* src = input + (m1_u64)row * (m1_u64)rest * elem;
+        ptir_parallel_copy(src, dst, rest, output_desc.dtype);
+      } else {
+        for (m1_u32 r = threadIdx.x; r < rest; r += blockDim.x)
+          ptir_zero_element(dst, r, output_desc.dtype);
+      }
+    }
+    return;
   }
   const m1_u32 total = index_desc.len * rest;
   for (m1_u32 output_index = threadIdx.x;

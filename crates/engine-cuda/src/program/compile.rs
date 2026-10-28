@@ -207,19 +207,20 @@ fn compile_into(
     let Ok(arch) = CString::new(architecture) else {
         return Err(retryable("the architecture flag contains a NUL".into()));
     };
-    let options: [*const std::ffi::c_char; 5] = [
+    let options: [*const std::ffi::c_char; 6] = [
         arch.as_ptr(),
         c"--std=c++17".as_ptr(),
         c"--fmad=false".as_ptr(),
         c"--prec-div=true".as_ptr(),
         c"--prec-sqrt=true".as_ptr(),
+        c"--maxrregcount=64".as_ptr(),
     ];
-    // SAFETY: `program` is live; `options` is a five-element array of pointers
+    // SAFETY: `program` is live; `options` is a six-element array of pointers
     // to C strings that outlive the call.
     let status = unsafe {
         nvrtc::nvrtcCompileProgram(
             program,
-            i32::try_from(options.len()).expect("five fits an i32"),
+            i32::try_from(options.len()).expect("six fits an i32"),
             options.as_ptr(),
         )
     };

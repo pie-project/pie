@@ -381,6 +381,75 @@ pub const MAX_BODIES: usize = 1024;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tiers {
     pub plain: poem_ir::ClassSet,
+    /// The classes one body per bucket lays out whole, in the order a fire
+    /// lays their rows out: a composition holding a class off the plain
+    /// tier keys this list whichever of its classes are present, and its
+    /// body launches every class's regions at their rungs, an absent
+    /// class's with no live row ([`crate::run::Run::launches_at_ceiling`]).
+    /// So one body answers every subset, where a key per subset would
+    /// multiply with the classes a mix of programs seats.
+    pub whole: Box<[u32]>,
+}
+
+impl Tiers {
+    /// Whether `ladder` is the whole tier's: a wide key, whichever of its
+    /// classes the fire seats.
+    #[must_use]
+    pub fn keys_whole(&self, ladder: &Ladder) -> bool {
+        !self.whole.is_empty()
+            && ladder.rungs().len() == self.whole.len()
+            && ladder
+                .rungs()
+                .iter()
+                .zip(self.whole.iter())
+                .all(|((class, _), held)| class == held)
+    }
+
+    /// The regions a fire keyed by `ladder` gates on the device
+    /// ([`poem_exec::fire::FireDescriptor::gated`]): under a wide key, each
+    /// captured, shifting region that runs some of the tier's classes but
+    /// not all, so the one body holds it whichever of them a fire seats,
+    /// and each region planning only for gated regions (`readers`: the
+    /// regions reading a region's plans), so a plan is made at its reader's
+    /// ceiling exactly when its reader is held.
+    #[must_use]
+    pub fn gates(
+        &self,
+        ladder: &Ladder,
+        template: &[poem_compiler::Region],
+        shifted: &[bool],
+        admits: &[Admit],
+        readers: &[Vec<u32>],
+    ) -> Vec<bool> {
+        if !self.keys_whole(ladder) {
+            return Vec::new();
+        }
+        let mut gated: Vec<bool> = template
+            .iter()
+            .enumerate()
+            .map(|(at, region)| {
+                let held = self
+                    .whole
+                    .iter()
+                    .filter(|class| region.mask.contains(**class as usize))
+                    .count();
+                region.phase == poem_compiler::Phase::Capture
+                    && held > 0
+                    && held < self.whole.len()
+                    && shifted.get(at).copied().unwrap_or(false)
+                    && admits.get(at) == Some(&Admit::Captured)
+            })
+            .collect();
+        for (at, region) in template.iter().enumerate() {
+            let reads = readers.get(at).map_or(&[][..], Vec::as_slice);
+            if region.phase == poem_compiler::Phase::Prepare && !reads.is_empty() {
+                gated[at] = reads
+                    .iter()
+                    .all(|reader| gated.get(*reader as usize).copied().unwrap_or(false));
+            }
+        }
+        gated
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -478,8 +547,13 @@ impl Ladder {
         let plain = classes
             .present_in_order()
             .all(|class| tiers.plain.contains(class as usize));
+        let whole = classes
+            .present_in_order()
+            .all(|class| tiers.whole.contains(&class));
         let listed: Vec<u32> = if plain {
             classes.present_in_order().collect()
+        } else if whole {
+            tiers.whole.to_vec()
         } else {
             Vec::new()
         };
@@ -604,16 +678,67 @@ impl<'a> Carve<'a> {
 }
 
 impl AxisCarve<'_> {
+    /// The rows before a region's classes and its own, by the region's
+    /// class mask where that answers ([`AxisCarve::of_mask`]), else by
+    /// where the fire's rows sit.
     #[must_use]
-    pub fn ceiling(&self, span: MaskSpan) -> Option<(u32, u32)> {
-        self.prefix(span, u32::MAX)
+    pub fn ceiling(&self, span: MaskSpan, mask: Option<&poem_ir::ClassSet>) -> Option<(u32, u32)> {
+        mask.and_then(|mask| self.of_mask(mask, u32::MAX))
+            .or_else(|| self.prefix(span, u32::MAX))
     }
 
     #[must_use]
-    pub fn lanes(&self, span: MaskSpan) -> Option<(u32, u32)> {
+    pub fn lanes(&self, span: MaskSpan, mask: Option<&poem_ir::ClassSet>) -> Option<(u32, u32)> {
         let cap = self.lane_ceiling?;
-        let (_, own) = self.prefix(span, cap)?;
+        let (_, own) = mask
+            .and_then(|mask| self.of_mask(mask, cap))
+            .or_else(|| self.prefix(span, cap))?;
         Some((span.lane_offset, own.min(cap)))
+    }
+
+    /// The rungs before a region's classes and its own, read off the
+    /// ladder (which lists its classes in the order a fire lays them out)
+    /// by the region's mask: the same for every fire of the key, whichever
+    /// of its classes are present. Its own rungs run from the mask's first
+    /// ladder class to its last, the classes between included: a launch
+    /// there walks whatever of that hull a fire seats (a grouped op its
+    /// union, [`crate::GROUPED`]). `None` where the ladder holds none of
+    /// the mask's classes.
+    /// The classes of `mask`'s `run`th run on the ladder (consecutive rungs
+    /// of its classes): the run a wide key cuts a region into
+    /// (`FireDescriptor::order`), whose rows its `run`th window holds.
+    #[must_use]
+    pub fn run_mask(&self, mask: &poem_ir::ClassSet, run: u32) -> poem_ir::ClassSet {
+        let mut at = 0u32;
+        let mut open = false;
+        let mut held: Vec<usize> = Vec::new();
+        for &(class, _) in self.ladder.rungs() {
+            let class = class as usize;
+            if !mask.contains(class) {
+                if open {
+                    at += 1;
+                }
+                open = false;
+                continue;
+            }
+            open = true;
+            if at == run {
+                held.push(class);
+            }
+        }
+        poem_ir::ClassSet::of(held)
+    }
+
+    fn of_mask(&self, mask: &poem_ir::ClassSet, cap: u32) -> Option<(u32, u32)> {
+        let rungs = self.ladder.rungs();
+        let first = rungs
+            .iter()
+            .position(|(class, _)| mask.contains(*class as usize))?;
+        let last = rungs
+            .iter()
+            .rposition(|(class, _)| mask.contains(*class as usize))?;
+        let sum = |held: &[(u32, u32)]| held.iter().map(|(_, rung)| (*rung).min(cap)).sum();
+        Some((sum(&rungs[..first]), sum(&rungs[first..=last])))
     }
 
     fn prefix(&self, span: MaskSpan, cap: u32) -> Option<(u32, u32)> {
@@ -649,8 +774,59 @@ pub fn ptr_traced(key: &BodyKey) -> bool {
 }
 
 enum Step {
-    Exec { exec: GraphExec, cut: Stretch },
+    Exec {
+        exec: GraphExec,
+        cut: Stretch,
+        gated: Option<Gated>,
+    },
     Island(Stretch),
+}
+
+/// A stretch holding gated regions (`FireDescriptor::gated`): the graph it
+/// was captured into, each gated region's nodes, and an instantiation for
+/// each set of them a replay has left out, made the first time a fire seats
+/// none of those regions' rows. A fire launches the one for the regions it
+/// seats no row of, so nothing runs a launch with no row, and no exec in
+/// flight is ever changed.
+struct Gated {
+    #[allow(dead_code)]
+    graph: Graph,
+    runs: Box<[((u32, u32), Box<[usize]>)]>,
+    left_out: Box<[(u32, u32)]>,
+}
+
+impl Gated {
+    /// The exec for a fire whose windows are `run`'s: updates `whole` in-place
+    /// via `cuGraphNodeSetEnabled` whenever the set of zero-row gated runs
+    /// changes, avoiding a second `cudaGraphInstantiateWithFlags` on graphs
+    /// that hold conditional nodes.
+    fn exec<'b>(
+        &'b mut self,
+        whole: &'b GraphExec,
+        run: &Run<'_>,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<&'b GraphExec> {
+        let windows = run.windows();
+        let absent: Box<[(u32, u32)]> = self
+            .runs
+            .iter()
+            .map(|(at, _)| *at)
+            .filter(|&(region, at)| windows.at(region, at).span().rows == 0)
+            .collect();
+        if absent != self.left_out {
+            #[cfg(feature = "device")]
+            crate::device::ctx::sync(stream)?;
+            for (at, nodes) in self.runs.iter() {
+                let was_absent = self.left_out.contains(at);
+                let now_absent = absent.contains(at);
+                if was_absent != now_absent {
+                    whole.set_enabled(nodes, !now_absent)?;
+                }
+            }
+            self.left_out = absent;
+        }
+        Ok(whole)
+    }
 }
 
 struct Body {
@@ -916,14 +1092,17 @@ impl Bodies {
             let upto = REPLAY_UPTO.load(std::sync::atomic::Ordering::Relaxed);
             let from = REPLAY_FROM.load(std::sync::atomic::Ordering::Relaxed);
             let mut nth = 0usize;
-            for step in body.script.iter() {
+            for step in body.script.iter_mut() {
                 match step {
-                    Step::Exec { exec, cut } => {
+                    Step::Exec { exec, cut, gated } => {
                         let launch = !at.eager_twin && nth >= from && nth < upto;
                         nth += 1;
                         if launch {
                             crate::serve::btrace::mark("pre_launch");
-                            exec.launch(at.stream)?;
+                            match gated {
+                                Some(gated) => gated.exec(exec, run, at.stream)?.launch(at.stream)?,
+                                None => exec.launch(at.stream)?,
+                            }
                             crate::serve::btrace::mark("launch");
                         } else {
                             walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
@@ -1009,12 +1188,14 @@ impl Bodies {
                 steps.push(Step::Island(cut));
                 continue;
             }
+            let mut marked: Vec<crate::window::RegionMark> = Vec::new();
             let graph = {
                 if ptr_traced(&key) {
                     PTR_TAG.store(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 let captured = Graph::capture(at.stream, || {
-                    walk_capture_cut(at, run, place, Streams::Forked, cut)
+                    marked = capture_cut(at, run, place, cut)?;
+                    Ok(())
                 });
                 PTR_TAG.store(0, std::sync::atomic::Ordering::Relaxed);
                 captured?
@@ -1050,7 +1231,11 @@ impl Bodies {
                 continue;
             }
             let per_node = Recorder::node_price(&graph);
-            let exec = graph.instantiate(at.stream)?;
+            let Ok(exec) = graph.instantiate(at.stream) else {
+                islands += 1;
+                steps.push(Step::Island(cut));
+                continue;
+            };
             let took = exec.nodes();
             bytes = match (bytes, per_node) {
                 (Some(held), Some(price)) => Some(held + took * price),
@@ -1058,9 +1243,33 @@ impl Bodies {
             };
             nodes += took;
             edges += graph.edges().unwrap_or(0);
-            steps.push(Step::Exec { exec, cut });
-            if self.recorder.keep {
-                self.recorder.kept.push((key.clone(), graph));
+            let mut regions: Vec<((u32, u32), Box<[usize]>)> = Vec::with_capacity(marked.len());
+            for mark in marked {
+                let nodes = graph.disableable(&mark.nodes)?;
+                if !nodes.is_empty() {
+                    regions.push(((mark.region, mark.run), nodes.into_boxed_slice()));
+                }
+            }
+            let regions = regions.into_boxed_slice();
+            if regions.is_empty() {
+                steps.push(Step::Exec {
+                    exec,
+                    cut,
+                    gated: None,
+                });
+                if self.recorder.keep {
+                    self.recorder.kept.push((key.clone(), graph));
+                }
+            } else {
+                steps.push(Step::Exec {
+                    exec,
+                    cut,
+                    gated: Some(Gated {
+                        graph,
+                        runs: regions,
+                        left_out: Box::new([]),
+                    }),
+                });
             }
         }
         // Every rank instantiated before any launches what it captured.
@@ -1109,8 +1318,13 @@ impl Bodies {
             },
         );
         if seated && let Some(body) = self.map.bodies.get_mut(&key) {
-            for step in body.script.iter() {
+            for step in body.script.iter_mut() {
                 match step {
+                    Step::Exec {
+                        exec,
+                        gated: Some(gated),
+                        ..
+                    } => gated.exec(exec, run, at.stream)?.launch(at.stream)?,
                     Step::Exec { exec, .. } => exec.launch(at.stream)?,
                     Step::Island(cut) => {
                         walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
@@ -1306,7 +1520,7 @@ impl<'a> Fire<'a> {
 }
 
 fn walk_capture(at: &Fire<'_>, run: &mut Run<'_>, place: &At, streams: Streams) -> Result<()> {
-    walk_capture_units(at, run, place, streams, Units::All, Regions::All)
+    walk_capture_units(at, run, place, streams, Units::All, Regions::All).map(|_| ())
 }
 
 fn walk_capture_cut(
@@ -1327,6 +1541,28 @@ fn walk_capture_cut(
             upto: cut.upto,
         },
     )
+    .map(|_| ())
+}
+
+/// [`walk_capture_cut`] under a capture, answering the nodes each gated
+/// region (`FireDescriptor::gated`) added to it.
+fn capture_cut(
+    at: &Fire<'_>,
+    run: &mut Run<'_>,
+    place: &At,
+    cut: Stretch,
+) -> Result<Vec<crate::window::RegionMark>> {
+    walk_capture_units(
+        at,
+        run,
+        place,
+        Streams::Forked,
+        Units::One(cut.unit),
+        Regions::Span {
+            from: cut.from,
+            upto: cut.upto,
+        },
+    )
 }
 
 fn walk_capture_units(
@@ -1336,7 +1572,7 @@ fn walk_capture_units(
     streams: Streams,
     units: Units,
     regions: Regions,
-) -> Result<()> {
+) -> Result<Vec<crate::window::RegionMark>> {
     // Each pass launches its own quantizations: a capture that reused the
     // warm pass's rows would replay their codes, not the fire's.
     #[cfg(feature = "rocm")]
@@ -1353,6 +1589,9 @@ fn walk_capture_units(
         if let Some(cond) = at.conditionals {
             cursor = cursor.conditionals(cond);
         }
+        if at.descriptor.gated.contains(&true) {
+            cursor = cursor.marking(at.stream, &at.descriptor.gated);
+        }
     }
     let walked = walk_regions(
         at.trace,
@@ -1364,10 +1603,9 @@ fn walk_capture_units(
         units,
         regions,
     );
-    let settled = cursor.settle();
+    let settled = cursor.settle_marked();
     walked?;
-    settled?;
-    Ok(())
+    settled
 }
 
 impl core::fmt::Debug for Bodies {
@@ -1394,6 +1632,7 @@ mod tests {
     fn plain_tiers() -> Tiers {
         Tiers {
             plain: poem_ir::ClassSet::of(0..8usize),
+            whole: Box::new([]),
         }
     }
 
@@ -1422,6 +1661,109 @@ mod tests {
         what_a_load_has_spent_is_what_its_resident_bodies_weigh();
         the_map_never_inserts_a_body_whose_script_is_empty();
         a_sealed_decline_is_reported_once_a_shape_and_then_at_each_doubling();
+        a_carve_reads_a_regions_ceiling_off_its_mask_whatever_is_present();
+        a_composition_off_the_plain_tier_keys_the_whole_tier();
+        a_wide_key_gates_its_partial_regions_and_no_other_key_gates();
+    }
+
+    fn a_carve_reads_a_regions_ceiling_off_its_mask_whatever_is_present() {
+        // Three classes of the whole tier, laid out c2, c0, c1; the region runs c0 and c1.
+        let ladder = Ladder(vec![(2, 4), (0, 8), (1, 8)].into_boxed_slice());
+        let mask = poem_ir::ClassSet::of([0usize, 1]);
+        let carve = |classes: &WindowTable| {
+            let carve = AxisCarve {
+                classes,
+                ladder: &ladder,
+                lane_ceiling: Some(LANES),
+            };
+            (
+                carve.ceiling(MaskSpan::default(), Some(&mask)),
+                carve.lanes(MaskSpan::default(), Some(&mask)),
+            )
+        };
+        let every = table(&[(3, 3), (2, 2), (1, 1)]);
+        let none = table(&[(0, 0), (0, 0), (5, 5)]);
+        assert_eq!(carve(&every), (Some((4, 16)), Some((0, LANES))));
+        assert_eq!(
+            carve(&none),
+            carve(&every),
+            "a fire seating none of the region's classes launches it at the same ceiling"
+        );
+        let split = poem_ir::ClassSet::of([2usize, 1]);
+        let apart = AxisCarve {
+            classes: &none,
+            ladder: &ladder,
+            lane_ceiling: None,
+        };
+        assert_eq!(
+            apart.ceiling(MaskSpan::default(), Some(&split)),
+            Some((0, 20)),
+            "a mask apart on the ladder launches over its hull, whatever is present"
+        );
+    }
+
+    fn a_wide_key_gates_its_partial_regions_and_no_other_key_gates() {
+        let tiers = Tiers {
+            plain: poem_ir::ClassSet::of([0usize]),
+            whole: Box::new([0, 1]),
+        };
+        let region = |mask: &[usize]| poem_compiler::Region {
+            nodes: 0..1,
+            mask: poem_ir::ClassSet::of(mask.iter().copied()),
+            phase: poem_compiler::Phase::Capture,
+            axis: None,
+            lowering: poem_compiler::Lowering::AlwaysLaunch,
+            stream: 0,
+            wait: Vec::new(),
+            open: None,
+            close: None,
+            collective: false,
+        };
+        // Every class, class 1 alone shifting, class 1 alone in place.
+        let template = [region(&[0, 1]), region(&[1]), region(&[1])];
+        let shifted = [true, true, false];
+        let admits = [Admit::Captured; 3];
+        let wide = Ladder(vec![(0, 8), (1, 8)].into_boxed_slice());
+        assert_eq!(
+            tiers.gates(&wide, &template, &shifted, &admits, &[]),
+            vec![false, true, false],
+            "a wide key gates each shifting region some of its classes run"
+        );
+        let plain = Ladder(vec![(0, 8)].into_boxed_slice());
+        assert!(tiers.gates(&plain, &template, &shifted, &admits, &[]).is_empty());
+        assert!(
+            tiers
+                .gates(&Ladder::default(), &template, &shifted, &admits, &[])
+                .is_empty(),
+            "an idle step (no lanes, no rungs) gates nothing, so launches nothing"
+        );
+    }
+
+    fn a_composition_off_the_plain_tier_keys_the_whole_tier() {
+        let tiers = Tiers {
+            plain: poem_ir::ClassSet::of([0usize]),
+            whole: Box::new([1, 0]),
+        };
+        let decoding = prefill_only();
+        let key = |classes: &[(u32, u32)]| {
+            BodyKey::of(&table(classes), 8, &decoding, LANES, &tiers).to_string()
+        };
+        assert_eq!(
+            key(&[(8, 1)]),
+            "b8[c0:8]",
+            "a plain composition keys its own classes"
+        );
+        assert_eq!(key(&[(0, 0), (8, 1)]), "b8[c1:8 c0:8]");
+        assert_eq!(
+            key(&[(4, 1), (4, 1)]),
+            key(&[(0, 0), (8, 1)]),
+            "every subset holding a class off the plain tier keys one body"
+        );
+        assert_eq!(
+            key(&[(4, 1), (2, 1), (2, 1)]),
+            "b8[]",
+            "a class outside the whole tier keys none"
+        );
     }
 
     fn a_sealed_decline_is_reported_once_a_shape_and_then_at_each_doubling() {

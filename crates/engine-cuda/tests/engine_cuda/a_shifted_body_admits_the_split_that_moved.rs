@@ -4,8 +4,8 @@ use poem_compiler::{Budget, CompiledModel, DeviceProfile, compile};
 use poem_exec::fire::{Composition, Lane, compose};
 use poem_ir::ops::Elemwise;
 
-fn test_slots() -> engine_cuda::window::Slots {
-    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
+fn test_slots(compiled: &poem_compiler::CompiledModel) -> engine_cuda::window::Slots {
+    engine_cuda::window::Slots::new(engine_cuda::window::slot_bases(compiled).1, 512, 8, 1, 4096, 4, 4096)
 }
 use poem_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId,
@@ -148,7 +148,8 @@ fn windows(trace: &Trace, compiled: &CompiledModel, fire: &Composition) -> Windo
         poem_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
         &boundaries(fire),
         Copies::off(),
-        test_slots(),
+        test_slots(compiled),
+        &[],
     )
     .expect("every region seats a window")
 }
@@ -269,6 +270,7 @@ fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
 fn plain() -> Tiers {
     Tiers {
         plain: poem_ir::ClassSet::of(0..8usize),
+        whole: Box::new([]),
     }
 }
 

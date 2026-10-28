@@ -15,6 +15,9 @@ pub(crate) struct Readback {
     pub(crate) first_row: Vec<u32>,
     pub(crate) lane_rows: Vec<u32>,
     pub(crate) pixels: Option<PixelsReadback>,
+    /// A golden fire's lane outputs, one row each, lane by lane
+    /// ([`super::Shell::observed`]).
+    pub(crate) observed: Vec<kernels_cuda::Tensor>,
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +333,28 @@ impl Shell {
                 }
                 *answer = (values, boxes);
             }
+        }
+
+        self.observed.clear();
+        for row in &readback.observed {
+            let element = poem_compiler::arena::elem_bytes(row.dtype).unwrap_or(0) as usize;
+            raw.clear();
+            raw.resize(row.width as usize * element, 0);
+            self.arena.read(stream, row.ptr, &mut raw)?;
+            self.observed.push(match row.dtype {
+                poem_ir::Dtype::F32 => raw
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|w| f32::from_le_bytes(*w))
+                    .collect(),
+                _ => raw
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| bf16(u16::from_le_bytes(*pair)))
+                    .collect(),
+            });
         }
 
         settled.logits = taken;

@@ -157,7 +157,54 @@ impl Graph {
         Ok(before.saturating_sub(after) as f64 / copies as f64)
     }
 
+    /// Of `nodes` (this graph's), those a launch may pass over: kernels,
+    /// copies and fills, not the nodes that only order them.
+    pub fn disableable(&self, nodes: &[usize]) -> Result<Vec<usize>> {
+        #[cfg(feature = "cuda")]
+        {
+            use crate::device::dr;
+
+            let mut out = Vec::with_capacity(nodes.len());
+            for &node in nodes {
+                let mut kind = dr::CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY;
+                // SAFETY: `node` is this graph's, and `kind` a live local.
+                said("cuGraphNodeGetType", unsafe {
+                    dr::cuGraphNodeGetType(node as dr::CUgraphNode, &raw mut kind)
+                })?;
+                if matches!(
+                    kind,
+                    dr::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL
+                        | dr::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMCPY
+                        | dr::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMSET
+                ) {
+                    out.push(node);
+                }
+            }
+            Ok(out)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = nodes;
+            Err(Fault::Device {
+                call: "a graph's node kinds (this backend keeps no per-node enabling)",
+                code: 0,
+            })
+        }
+    }
+
     pub fn instantiate(&self, stream: *mut c_void) -> Result<GraphExec> {
+        self.instantiate_without(stream, &[])
+    }
+
+    /// An instantiation with `left_out` (nodes of this graph, from
+    /// [`crate::window::Cursor::settle_marked`]) disabled: each launch of it runs every other node
+    /// and passes over those, their edges kept. Disabled before the exec is
+    /// uploaded, so no launch of it ever ran them.
+    pub fn instantiate_without(
+        &self,
+        stream: *mut c_void,
+        left_out: &[usize],
+    ) -> Result<GraphExec> {
         #[cfg(feature = "device")]
         {
             use crate::device::rt;
@@ -177,6 +224,7 @@ impl Graph {
                 raw: raw.cast(),
                 nodes: self.nodes().unwrap_or(0),
             };
+            exec.leave_out(left_out)?;
             // SAFETY: the exec was just created and the stream is the shell's.
             unsafe {
                 crate::device::ctx::check(
@@ -188,13 +236,57 @@ impl Graph {
         }
         #[cfg(not(feature = "device"))]
         {
-            let _ = stream;
+            let _ = (stream, left_out);
             Err(Fault::Runtimeless)
         }
     }
 }
 
+#[cfg(feature = "cuda")]
+fn said(call: &'static str, code: crate::device::dr::CUresult) -> Result<()> {
+    if code == crate::device::dr::CUresult::CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(Fault::Device {
+            call,
+            code: code as i32,
+        })
+    }
+}
+
 impl GraphExec {
+    /// Sets whether `nodes` (of the graph this exec came from) run (`enabled`)
+    /// or are passed over (`!enabled`) at every subsequent launch.
+    pub fn set_enabled(&self, nodes: &[usize], enabled: bool) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        for &node in nodes {
+            // SAFETY: the exec is this handle's, and `node` a node of the
+            // graph it was instantiated from (`Graph::disableable`).
+            let code = unsafe {
+                crate::device::dr::cuGraphNodeSetEnabled(
+                    self.raw.cast(),
+                    node as _,
+                    u32::from(enabled),
+                )
+            };
+            said("cuGraphNodeSetEnabled", code)?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        if !nodes.is_empty() {
+            let _ = enabled;
+            return Err(Fault::Device {
+                call: "cuGraphNodeSetEnabled (this backend keeps no per-node enabling)",
+                code: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Passes over `nodes` (of the graph this exec came from) at every launch.
+    fn leave_out(&self, nodes: &[usize]) -> Result<()> {
+        self.set_enabled(nodes, false)
+    }
+
     pub fn launch(&self, stream: *mut c_void) -> Result<()> {
         #[cfg(feature = "device")]
         {

@@ -6,8 +6,8 @@ use poem_exec::fire::{FireDescriptor, Lane, compose_axes};
 use poem_ir::ops::Elemwise;
 use poem_ir::{NormAxis, NormWeight};
 
-fn test_slots() -> engine_cuda::window::Slots {
-    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
+fn test_slots(compiled: &poem_compiler::CompiledModel) -> engine_cuda::window::Slots {
+    engine_cuda::window::Slots::new(engine_cuda::window::slot_bases(compiled).1, 512, 8, 1, 4096, 4, 4096)
 }
 use poem_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId,
@@ -163,7 +163,8 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
         poem_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
         &indptr(&[5, 3, 4]),
         Copies::off(),
-        test_slots(),
+        test_slots(&compiled),
+        &[],
     )
     .expect("every region seats a window");
 
@@ -248,7 +249,8 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
             poem_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
             &boundaries,
             Copies::off(),
-            test_slots(),
+            test_slots(&compiled),
+            &[],
         )
         .expect("every region seats a window")
     };

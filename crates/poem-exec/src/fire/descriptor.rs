@@ -34,6 +34,17 @@ pub struct FireDescriptor {
     pub clips: u32,
     pub voxel_bucket: u32,
     pub voxel_classes: WindowTable,
+    /// Per template region, whether the fire gates it: its ops are
+    /// dispatched while a body records whether or not this fire seats a row
+    /// of it, so one recorded body holds every region its key may seat, and
+    /// the backend runs only those a replay seats. Empty: none gated.
+    pub gated: Vec<bool>,
+    /// A wide key's classes in the order a fire lays their rows out, by
+    /// which a token-axis region's runs are cut, one a run its classes form
+    /// in that order whether or not the fire seats them
+    /// ([`super::compose::WindowTable::spans_by_order_into`]). Empty: runs
+    /// are the fire's own.
+    pub order: Vec<u8>,
 }
 
 impl FireDescriptor {
@@ -54,6 +65,8 @@ impl FireDescriptor {
             voxel_classes: composition.voxel_classes().clone(),
             run_caps: Vec::new(),
             run_passes: Vec::new(),
+            gated: Vec::new(),
+            order: Vec::new(),
         }
     }
 
@@ -337,6 +350,8 @@ impl FireDescriptor {
             voxel_classes: WindowTable::new(voxel_table),
             run_caps: Vec::new(),
             run_passes: Vec::new(),
+            gated: Vec::new(),
+            order: Vec::new(),
         })
     }
 }

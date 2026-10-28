@@ -35,6 +35,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("attn.decode", Reads::RowsAndLanes),
     entry("attn.prefill", Reads::RowsAndLanes),
     entry("attn.ragged", Reads::RowsAndLanes),
+    entry("attn.score_capture", Reads::RowsAndLanes),
     entry("attn.plan_decode", Reads::Nothing),
     entry("attn.plan_prefill", Reads::Nothing),
     entry("attn.index_layernorm_rope", Reads::Rows),

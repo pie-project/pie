@@ -58,7 +58,13 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
                 runs.extend_from_slice(spans);
             }
             None => {
-                descriptor.table(axis).spans_into(&region.mask, &mut runs);
+                if axis == poem_ir::RowAxis::Tokens && !descriptor.order.is_empty() {
+                    descriptor
+                        .table(axis)
+                        .spans_by_order_into(&region.mask, &descriptor.order, &mut runs);
+                } else {
+                    descriptor.table(axis).spans_into(&region.mask, &mut runs);
+                }
                 cut.push((axis, &region.mask, runs.clone()));
             }
         }
@@ -81,6 +87,7 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
         }
         let grouped = runs.len() > 1 && grouped_fallback(compiled, axis, region.nodes.clone());
 
+        let gated = descriptor.gated.get(index).copied().unwrap_or(false);
         let (open, arm, close) = match region.lowering {
             Lowering::AlwaysLaunch => (false, None, false),
             Lowering::If => (true, None, true),
@@ -152,6 +159,12 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
             region.nodes.end
         };
         let launches = if once { 1 } else { runs.len().max(1) };
+        // A gated region's ops are recorded for a run with no row seated, and
+        // the backend leaves them out of each replay that seats none; its
+        // plans (prepare phase) are made on the host every fire, at the run's
+        // ceiling. Run, never: no op meets a launch with no row.
+        let empty_launches =
+            dispatches && gated && (region.phase == Phase::Prepare || sink.records());
         for launch in 0..launches {
             sink.run(launch as u32, launches as u32);
             let rows = if once {
@@ -175,7 +188,11 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
                 if passes > 1 {
                     sink.tail(node_at >= tail_start);
                 }
-                if rows == 0 && !runs_bare(node) && !received(compiled, node, &mut outs) {
+                if rows == 0
+                    && !runs_bare(node)
+                    && !empty_launches
+                    && !received(compiled, node, &mut outs)
+                {
                     continue;
                 }
                 dispatch.exec(node)?;

@@ -266,6 +266,11 @@ pub struct Fire<'a> {
     pub lane_reach: u32,
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
+    /// A fire a recorded body serves: its mask and adapter-route seats are
+    /// bound whether or not a lane stages them, at the extents every fire of
+    /// the body binds, since a region of an absent class still launches (at
+    /// zero live rows) and its plan names the same tables.
+    pub seated: bool,
 }
 
 #[derive(Debug)]
@@ -351,6 +356,7 @@ pub struct Staged {
     space_indices: Vec<u32>,
     space_lanes: u32,
     packed: bool,
+    seated: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -543,7 +549,7 @@ impl Inputs {
         paging: Paging,
         spaces: usize,
         facts: &Facts,
-        classes: usize,
+        windows: usize,
         regions: usize,
         runs: u32,
         gathered: usize,
@@ -561,7 +567,7 @@ impl Inputs {
         let lanes = u64::from(crate::window::lane_capacity(budget.max_lanes));
         let pages = lanes * u64::from(paging.pages_per_slot);
         let window_slots =
-            crate::window::Slots::new(classes, lanes, runs, gathered, rows, spaces, pages);
+            crate::window::Slots::new(windows, lanes, runs, gathered, rows, spaces, pages);
         let window_ints = window_slots.words();
 
         let mut at = 0u64;
@@ -917,6 +923,16 @@ impl Inputs {
         };
 
         let adapter_rows = match fire.adapter_routes {
+            // A seated fire binds the routes whether or not a lane routes: none
+            // does here, so every row passes through.
+            None if fire.seated => {
+                put(
+                    self.adapter_routes,
+                    bytes_of(&vec![-1i32; rows as usize]),
+                    "staged adapter routes",
+                )?;
+                Some(rows)
+            }
             None => None,
             Some(routes) => {
                 put(
@@ -940,6 +956,16 @@ impl Inputs {
         )?;
 
         let mask_bytes = match fire.mask {
+            // A seated fire binds the mask seat whether or not a lane masks:
+            // none does here, so every lane's span is empty.
+            None if fire.seated && self.mask_bytes > 0 => {
+                put(
+                    self.mask_indptr,
+                    bytes_of(&vec![0i32; space_lanes as usize + 1]),
+                    "staged mask indptr",
+                )?;
+                Some(0)
+            }
             None => None,
             Some(staged) => {
                 put(self.mask_bits, &staged.bits, "staged mask bits")?;
@@ -948,6 +974,18 @@ impl Inputs {
                     bytes_of(&staged.indptr),
                     "staged mask indptr",
                 )?;
+                // A seated fire binds the indptr over every lane it seats:
+                // the lanes past the fire's hold no bit.
+                let held = staged.indptr.len().saturating_sub(1) as u32;
+                if fire.seated && space_lanes > held {
+                    let last = staged.indptr.last().copied().unwrap_or(0);
+                    let inert = vec![last; (space_lanes - held) as usize];
+                    put(
+                        self.mask_indptr + u64::from(held + 1) * 4,
+                        bytes_of(&inert),
+                        "staged mask indptr padding",
+                    )?;
+                }
                 Some(u32::try_from(staged.bits.len()).unwrap_or(u32::MAX))
             }
         };
@@ -1034,6 +1072,7 @@ impl Inputs {
             space_indices,
             space_lanes,
             packed,
+            seated: fire.seated,
         })
     }
 
@@ -1179,7 +1218,12 @@ impl Inputs {
             space_indices,
             space_lanes,
             packed,
+            seated,
         } = staged;
+        let seated = *seated;
+        // A seated fire binds the whole mask seat (none where the load stages
+        // no mask).
+        let mask_seat = u32::try_from(self.mask_bytes).unwrap_or(u32::MAX);
         let readouts = *readouts;
         let (rows, lanes) = (*rows, *lanes);
         let packed = *packed;
@@ -1232,7 +1276,8 @@ impl Inputs {
         }
         if let Some(bytes) = mask_bytes {
             copy(at_mask, *bytes as usize)?;
-            copy(at_mask_indptr, (lanes as usize + 1) * 4)?;
+            let indptr = if seated { space_lanes } else { lanes };
+            copy(at_mask_indptr, (indptr as usize + 1) * 4)?;
         }
         let mut packings = Vec::with_capacity(packing_places.len());
         if packed {
@@ -1292,8 +1337,16 @@ impl Inputs {
             readout_rows: i32s(base + at_readouts, readouts),
             readout_live: base + at_readout_live,
             row_valid: Tensor::new(base + at_row_valid, rows, 1, Dtype::U8),
-            mask: mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8)),
-            mask_indptr: mask_bytes.map(|_| i32s(base + at_mask_indptr, lanes + 1)),
+            mask: if seated && mask_seat > 0 {
+                Some(Tensor::new(base + at_mask, mask_seat, 1, Dtype::U8))
+            } else {
+                mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8))
+            },
+            mask_indptr: if seated && mask_seat > 0 {
+                Some(i32s(base + at_mask_indptr, space_lanes + 1))
+            } else {
+                mask_bytes.map(|_| i32s(base + at_mask_indptr, lanes + 1))
+            },
             group_of_lane: packed.then(|| i32s(base + at_group_of_lane, space_lanes)),
             packings,
             lane_of_row: i32s(base + at_lane_of_row, rows),
