@@ -341,7 +341,7 @@ pub(crate) fn fetch_pages(
 /// pages + np]`, each row its lane's pages) or flat (`[lanes · pages +
 /// np]`), padded by one chunk so a chunk's window never clamps.
 #[derive(Clone, Copy, Debug)]
-struct PageWalk {
+pub(crate) struct PageWalk {
     table: Val,
     np: i64,
     ps: i64,
@@ -350,7 +350,12 @@ struct PageWalk {
 impl PageWalk {
     /// For a chunk of `c` keys when it covers whole pages of a paged pool:
     /// per row when `lane` (`[r]` i32) is given, else flat.
-    fn of(f: &mut Func, planes: &Planes, lane: Option<Val>, c: i64) -> Built<Option<Self>> {
+    pub(crate) fn of(
+        f: &mut Func,
+        planes: &Planes,
+        lane: Option<Val>,
+        c: i64,
+    ) -> Built<Option<Self>> {
         let Planes::Paged { geom, .. } = *planes else {
             return Ok(None);
         };
@@ -377,7 +382,7 @@ impl PageWalk {
 
     /// The pool pages of the chunk at key `base` (an i32 scalar, a multiple
     /// of the chunk): `[r · np]` or `[np]`, in key order.
-    fn chunk(&self, f: &mut Func, base: Val) -> Built<Val> {
+    pub(crate) fn chunk(&self, f: &mut Func, base: Val) -> Built<Val> {
         let p0 = with_i(f, base, self.ps, Func::div)?;
         let dims = f.dims(self.table).to_vec();
         if dims.len() == 2 {
@@ -642,7 +647,7 @@ fn pv(f: &mut Func, lay: Layout, p: Val, v: Val) -> Built<Val> {
 /// Whether the per-row walk reads kv heads as 128-aligned column slices of
 /// `[r, c, kvh · d]` (no relayout of the gathered keys) rather than as a
 /// `[r, c, kvh, d]` batch axis.
-fn heads_by_slice(h: &Heads) -> bool {
+pub(crate) fn heads_by_slice(h: &Heads) -> bool {
     h.kvh > 1 && (h.d % 128 == 0 && h.dv % 128 == 0 || heads_by_pair(h.kvh, h.d, h.dv))
 }
 
@@ -659,7 +664,7 @@ fn heads_by_pair(kvh: i64, d: i64, dv: i64) -> bool {
 /// and `b` `[r, c, kvh · w]`: with `contract` 2 (`x = w = d`, scores) the
 /// result is `[r, kvh, g, c]`; with `contract` 1 (`x = c`, `w = dv`, the
 /// value reduction) it is `[r, kvh, g, dv]`. f32 out.
-fn by_head(f: &mut Func, a: Val, b: Val, contract: i64) -> Built<Val> {
+pub(crate) fn by_head(f: &mut Func, a: Val, b: Val, contract: i64) -> Built<Val> {
     let ad = f.dims(a).to_vec();
     let bd = f.dims(b).to_vec();
     let (r, kvh, g, x) = (ad[0], ad[1], ad[2], ad[3]);

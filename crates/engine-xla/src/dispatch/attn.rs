@@ -45,8 +45,20 @@ impl Run<'_> {
                 let positions = self.prefill_plan(*plan).positions;
                 let scores = self.tensor(*scores);
                 let requests = self.requests();
-                let (head_dim, kv_heads, sm_scale, observe, kv_max) =
-                    (*head_dim, *kv_heads, *sm_scale, *observe, *kv_max);
+                let max_q = self
+                    .qo_indptr_host()
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]).max(0) as u32)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                let (head_dim, kv_heads, sm_scale, observe, kv_max) = (
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    (*observe).min(max_q),
+                    *kv_max,
+                );
                 crate::lower::lower(self.ctx(), |l| {
                     let page_indptr = l.read(page_indptr)?;
                     let page_indices = l.read(pool.page_indices)?;
@@ -54,17 +66,26 @@ impl Run<'_> {
                     let positions = l.read(positions)?;
                     let data = l.read(q.data)?;
                     let keys = l.read(pool.keys)?;
-                    let slab = l.read(scores)?;
                     let heads = data.width / head_dim.max(1);
-                    // The slab as a `kv_max` row per lane and head.
-                    let slab = kernels_xla::tensor::Operand {
-                        val: l.f().reshape(
-                            slab.val,
-                            &[i64::from(scores.rows * heads), i64::from(kv_max)],
-                        )?,
-                        rows: scores.rows * heads,
-                        width: kv_max,
-                        dtype: slab.dtype,
+                    let slab = if requests == scores.rows {
+                        kernels_xla::tensor::Operand {
+                            val: l.f().const_f(kernels_xla::hlo::Elem::F32, 0.0, &[]),
+                            rows: scores.rows * heads,
+                            width: kv_max,
+                            dtype: scores.dtype,
+                        }
+                    } else {
+                        let slab = l.read(scores)?;
+                        // The slab as a `kv_max` row per lane and head.
+                        kernels_xla::tensor::Operand {
+                            val: l.f().reshape(
+                                slab.val,
+                                &[i64::from(scores.rows * heads), i64::from(kv_max)],
+                            )?,
+                            rows: scores.rows * heads,
+                            width: kv_max,
+                            dtype: slab.dtype,
+                        }
                     };
                     let tuning = l.tuning();
                     let v = attn::score::capture(
