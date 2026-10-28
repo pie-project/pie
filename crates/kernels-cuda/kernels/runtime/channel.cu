@@ -417,8 +417,20 @@ __global__ void gather_words(
     const u32 run = blockIdx.x;
     if (run >= run_count) return;
     const WordRun r = runs[run];
+    u32* out = dst + r.dst_word;
+    if ((r.words & 3u) == 0u &&
+        (reinterpret_cast<usize>(r.src) & 15u) == 0u &&
+        (reinterpret_cast<usize>(out) & 15u) == 0u) {
+        const uint4* in4 = reinterpret_cast<const uint4*>(r.src);
+        uint4* out4 = reinterpret_cast<uint4*>(out);
+        const u32 quads = r.words >> 2;
+        for (u32 q = threadIdx.x; q < quads; q += blockDim.x) {
+            out4[q] = in4[q];
+        }
+        return;
+    }
     for (u32 word = threadIdx.x; word < r.words; word += blockDim.x) {
-        dst[r.dst_word + word] = r.src[word];
+        out[word] = r.src[word];
     }
 }
 
