@@ -55,6 +55,10 @@ struct Input {
     k_max: u32,
     #[serde(default = "default_seed")]
     seed: u32,
+    #[serde(default)]
+    prompt_tokens: Option<Vec<u32>>,
+    #[serde(default)]
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -185,12 +189,18 @@ async fn main(input: Input) -> Result<Output> {
 
     // The model's opening (`<bos>` where it has one) before the raw text: a
     // gemma without it answers noise.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
+    let mut prompt = if let Some(toks) = input.prompt_tokens {
+        toks
+    } else {
+        let mut p = inferlet::chat::prefix();
+        p.extend(model::encode(&input.prompt));
+        p
+    };
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
+    let stream = input.stream;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut kept_sizes: Vec<f32> = Vec::with_capacity(max_tokens);
@@ -214,8 +224,10 @@ async fn main(input: Input) -> Result<Output> {
         let (token, kept, kmass) = typical_step(logits, vocab, k_max, temperature, mass, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
-        kept_out_p.put(&kept);
-        mass_out_p.put(&kmass);
+        if !stream {
+            kept_out_p.put(&kept);
+            mass_out_p.put(&kmass);
+        }
         rng_p.put(&r_next);
     });
 
@@ -223,11 +235,15 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.submit(&pipe).context("prefill submit")?;
 
     let g0 = tok_out_p.take_host::<i32>().await?;
-    let k0 = kept_out_p.take_host::<f32>().await?;
-    let m0 = mass_out_p.take_host::<f32>().await?;
+    if stream {
+        inferlet::session::send("t:1");
+    } else {
+        let k0 = kept_out_p.take_host::<f32>().await?;
+        let m0 = mass_out_p.take_host::<f32>().await?;
+        kept_sizes.push(k0);
+        kept_mass.push(m0);
+    }
     generated.push(g0 as u32);
-    kept_sizes.push(k0);
-    kept_mass.push(m0);
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
     if generated.len() < max_tokens {
@@ -251,8 +267,10 @@ async fn main(input: Input) -> Result<Output> {
 
             tok_in.put(&token);
             tok_out.put(&token);
-            kept_out.put(&kept);
-            mass_out.put(&kmass);
+            if !stream {
+                kept_out.put(&kept);
+                mass_out.put(&kmass);
+            }
             rng.put(&r_next);
         });
 
@@ -262,34 +280,51 @@ async fn main(input: Input) -> Result<Output> {
                 .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
-            let k = kept_out.take_host::<f32>().await?;
-            let m = mass_out.take_host::<f32>().await?;
+            if stream {
+                inferlet::session::send("t:1");
+            } else {
+                let k = kept_out.take_host::<f32>().await?;
+                let m = mass_out.take_host::<f32>().await?;
+                kept_sizes.push(k);
+                kept_mass.push(m);
+            }
             generated.push(t as u32);
-            kept_sizes.push(k);
-            kept_mass.push(m);
             Ok(ControlFlow::Continue(()))
         })
         .await?;
     }
     pipe.close();
 
-    let mean_kept = kept_sizes.iter().sum::<f32>() / kept_sizes.len() as f32;
-    let min_kept = kept_sizes
-        .iter()
-        .fold(f32::INFINITY, |a, &b| a.min(b))
-        .max(0.0) as u32;
-    if min_kept == 0 {
-        return Err("typical keep-set was empty — the mask lost its floor".into());
-    }
+    let (mean_kept, min_kept, mean_mass_val) = if kept_sizes.is_empty() {
+        (1.0, 1u32, 1.0)
+    } else {
+        let mk = kept_sizes.iter().sum::<f32>() / kept_sizes.len() as f32;
+        let mn = kept_sizes
+            .iter()
+            .fold(f32::INFINITY, |a, &b| a.min(b))
+            .max(0.0) as u32;
+        if mn == 0 {
+            return Err("typical keep-set was empty — the mask lost its floor".into());
+        }
+        (
+            mk,
+            mn,
+            kept_mass.iter().sum::<f32>() / kept_mass.len() as f32,
+        )
+    };
 
     Ok(Output {
         sampler: "locally-typical",
-        text: model::decode(&generated)?,
+        text: if stream {
+            String::new()
+        } else {
+            model::decode(&generated)?
+        },
         count: generated.len(),
         mass,
         k_max,
         mean_kept,
         min_kept,
-        mean_mass: kept_mass.iter().sum::<f32>() / kept_mass.len() as f32,
+        mean_mass: mean_mass_val,
     })
 }

@@ -33,6 +33,8 @@ struct Input {
     stats: bool,
     #[serde(default)]
     stream: bool,
+    #[serde(default = "default_stream_every")]
+    stream_every: usize,
     #[serde(default)]
     park_every: usize,
     #[serde(default)]
@@ -55,6 +57,10 @@ fn default_max_tokens() -> usize {
 
 fn default_seed() -> u32 {
     0x7ce1
+}
+
+fn default_stream_every() -> usize {
+    1
 }
 
 #[derive(Serialize)]
@@ -243,6 +249,8 @@ async fn main(input: Input) -> Result<Output> {
                 }
             }
         } else {
+            let step_emit = input.stream_every.max(1);
+            let mut stream_acc = 0usize;
             run_ahead(&pipe, &fwd, budget, async || {
                 let t = tok_out
                     .take_host::<i32>()
@@ -253,21 +261,32 @@ async fn main(input: Input) -> Result<Output> {
                     s2_out.take_host::<Vec<f32>>().await?;
                 }
                 if input.stream {
-                    inferlet::session::send("t:1");
+                    stream_acc += 1;
+                    if stream_acc >= step_emit {
+                        inferlet::session::send(&format!("t:{stream_acc}"));
+                        stream_acc = 0;
+                    }
                 }
                 generated.push(t as u32);
                 Ok(ControlFlow::Continue(()))
             })
             .await?;
+            if input.stream && stream_acc > 0 {
+                inferlet::session::send(&format!("t:{stream_acc}"));
+            }
         }
     }
     pipe.close();
 
     Ok(Output {
         sampler: "naive-baseline",
-        text: model::decode(&generated)?,
+        text: if input.stream {
+            String::new()
+        } else {
+            model::decode(&generated)?
+        },
         count: generated.len(),
-        tokens: generated,
+        tokens: if input.stream { Vec::new() } else { generated },
         stats: want_stats,
     })
 }

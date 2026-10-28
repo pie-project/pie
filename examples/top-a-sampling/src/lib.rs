@@ -46,6 +46,10 @@ struct Input {
     max_tokens: usize,
     #[serde(default = "default_seed")]
     seed: u32,
+    #[serde(default)]
+    prompt_tokens: Option<Vec<u32>>,
+    #[serde(default)]
+    stream: bool,
 }
 
 fn default_prompt() -> String {
@@ -151,12 +155,18 @@ async fn main(input: Input) -> Result<Output> {
 
     // The model's opening (`<bos>` where it has one) before the raw text: a
     // gemma without it answers noise.
-    let mut prompt = inferlet::chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
+    let mut prompt = if let Some(toks) = input.prompt_tokens {
+        toks
+    } else {
+        let mut p = inferlet::chat::prefix();
+        p.extend(model::encode(&input.prompt));
+        p
+    };
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
+    let stream = input.stream;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut s1: Vec<f32> = Vec::with_capacity(max_tokens);
@@ -180,8 +190,10 @@ async fn main(input: Input) -> Result<Output> {
         let (token, a, b) = step(logits, vocab, cfg, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
-        s1_out_p.put(&a);
-        s2_out_p.put(&b);
+        if !stream {
+            s1_out_p.put(&a);
+            s2_out_p.put(&b);
+        }
         rng_p.put(&r_next);
     });
 
@@ -189,11 +201,15 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.submit(&pipe).context("prefill submit")?;
 
     let g0 = tok_out_p.take_host::<i32>().await?;
-    let a0 = s1_out_p.take_host::<f32>().await?;
-    let b0 = s2_out_p.take_host::<f32>().await?;
+    if stream {
+        inferlet::session::send("t:1");
+    } else {
+        let a0 = s1_out_p.take_host::<f32>().await?;
+        let b0 = s2_out_p.take_host::<f32>().await?;
+        s1.push(a0);
+        s2.push(b0);
+    }
     generated.push(g0 as u32);
-    s1.push(a0);
-    s2.push(b0);
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
     if generated.len() < max_tokens {
@@ -217,8 +233,10 @@ async fn main(input: Input) -> Result<Output> {
 
             tok_in.put(&token);
             tok_out.put(&token);
-            s1_out.put(&a);
-            s2_out.put(&b);
+            if !stream {
+                s1_out.put(&a);
+                s2_out.put(&b);
+            }
             rng.put(&r_next);
         });
 
@@ -228,27 +246,40 @@ async fn main(input: Input) -> Result<Output> {
                 .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
-            let a = s1_out.take_host::<f32>().await?;
-            let b = s2_out.take_host::<f32>().await?;
+            if stream {
+                inferlet::session::send("t:1");
+            } else {
+                let a = s1_out.take_host::<f32>().await?;
+                let b = s2_out.take_host::<f32>().await?;
+                s1.push(a);
+                s2.push(b);
+            }
             generated.push(t as u32);
-            s1.push(a);
-            s2.push(b);
             Ok(ControlFlow::Continue(()))
         })
         .await?;
     }
     pipe.close();
 
-    let mean_s1 = s1.iter().sum::<f32>() / s1.len() as f32;
-    let mean_s2 = s2.iter().sum::<f32>() / s2.len() as f32;
-    let min_s1 = s1.iter().fold(f32::INFINITY, |a, &b| a.min(b)).max(0.0);
-    if min_s1 == 0.0 {
-        return Err("top-a keep-set was empty — the peak token was masked out".into());
-    }
+    let (mean_s1, mean_s2, min_s1) = if s1.is_empty() {
+        (1.0, 1.0, 1.0)
+    } else {
+        let m1 = s1.iter().sum::<f32>() / s1.len() as f32;
+        let m2 = s2.iter().sum::<f32>() / s2.len() as f32;
+        let mn = s1.iter().fold(f32::INFINITY, |a, &b| a.min(b)).max(0.0);
+        if mn == 0.0 {
+            return Err("top-a keep-set was empty — the peak token was masked out".into());
+        }
+        (m1, m2, mn)
+    };
 
     Ok(Output {
         sampler: "top-a",
-        text: model::decode(&generated)?,
+        text: if stream {
+            String::new()
+        } else {
+            model::decode(&generated)?
+        },
         count: generated.len(),
         a: cfg.a,
         mean_kept: mean_s1,

@@ -168,6 +168,10 @@ async fn main(input: Input) -> Result<String> {
     }
     pipeline.close();
 
+    if input.stream {
+        return Ok(model::decode(&generated).unwrap_or_default());
+    }
+
     // A budget too small for the schema is the common way here: say so
     // WITH the partial value, so a sweep reading this error does not mistake
     // a bounded, finished loop for a hang.
