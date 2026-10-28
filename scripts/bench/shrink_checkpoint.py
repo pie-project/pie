@@ -614,6 +614,16 @@ def _rewrite_muse_glimmer(cfg: dict, plan: Plan) -> None:
             tc[key] = _slice_list(tc[key], plan.src_layers)
 
 
+def _rewrite_gemma4(cfg: dict, plan: Plan) -> None:
+    _rewrite_common(cfg, plan)
+    # `layer_types` says sliding vs full (period 6); `top_k_experts` is gemma-4's own name for the top-k.
+    tc = _text_cfg(cfg, plan)
+    if isinstance(tc.get("layer_types"), list):
+        tc["layer_types"] = _slice_list(tc["layer_types"], plan.src_layers)
+    if plan.experts is not None and isinstance(tc.get("top_k_experts"), int):
+        tc["top_k_experts"] = min(tc["top_k_experts"], plan.experts)
+
+
 def _rewrite_inkling(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
     tc = _text_cfg(cfg, plan)
@@ -1457,6 +1467,22 @@ FAMILIES: dict[str, dict[str, Any]] = {
         config_rewrite=_rewrite_kimi_k3,
         text_cfg_key="text_config",
         keep_res=(re.compile(r"^vision_tower\."), re.compile(r"^mm_projector\.")),
+    ),
+    # Gemma-4 MoE (26B-A4B): the routed bank is stacked on dim 0 (`experts.gate_up_proj`, `experts.down_proj`)
+    # beside a dense MLP, and the router carries a per-expert scale, so `router_suffixes` slices all four.
+    "gemma4": dict(
+        layer_prefix="model.language_model.layers.",
+        expert_re=None,
+        router_suffixes=("router.proj.weight", "router.per_expert_scale",
+                         "experts.gate_up_proj", "experts.down_proj"),
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "model.language_model.norm.weight"),
+        # Period 6: five sliding layers, then one full.
+        default_layers="0-5",
+        config_rewrite=_rewrite_gemma4,
+        text_cfg_key="text_config",
+        # The towers are kept so the miniature loads unmodified as `Gemma4ForConditionalGeneration`.
+        keep_res=(re.compile(r"^model\.(vision_tower|embed_vision)\."),),
     ),
     "muse_glimmer": dict(
         layer_prefix="model.language_model.layers.",
