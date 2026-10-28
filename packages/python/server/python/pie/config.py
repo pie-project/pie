@@ -193,14 +193,11 @@ class Config:
             if env_hkv:
                 model["host_kv_budget"] = env_hkv
         if "device_kv_budget" not in model:
-            max_conc = self.runtime.max_concurrent_processes
+            # unstated, the engine fits the pool to what the weights leave under device_memory_share;
+            # a fixed 32 GiB does not fit beside the weights on a 48 GB card
             env_dkv = os.environ.get("PIE_DEVICE_KV_BUDGET")
             if env_dkv:
                 model["device_kv_budget"] = env_dkv
-            elif max_conc is None or max_conc <= 64:
-                model["device_kv_budget"] = "32GiB"
-            else:
-                model["device_kv_budget"] = "64GiB"
         if m.skip_parts:
             model["skip_parts"] = list(m.skip_parts)
 
