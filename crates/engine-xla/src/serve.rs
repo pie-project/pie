@@ -672,7 +672,7 @@ impl Shell {
             adapter_fact,
             adapters,
             blobs: crate::blob::Store::new(),
-            held: vec![0; boot.slots as usize],
+            held: vec![0; slots as usize],
             states_mrope,
             patch_seat,
             patch_fold,

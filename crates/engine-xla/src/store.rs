@@ -54,6 +54,7 @@ const STATE_DTYPE: Dtype = Dtype::F32;
 fn state_dtype(declared: Dtype) -> Dtype {
     match declared {
         Dtype::I32 => Dtype::I32,
+        Dtype::Bf16 => Dtype::Bf16,
         _ => STATE_DTYPE,
     }
 }

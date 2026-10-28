@@ -1160,12 +1160,12 @@ async def run(args: argparse.Namespace):
 
             async def warmup_pass() -> None:
                 if args.mode == "tput":
-                    w_n = (
-                        max(args.warmup, min(len(prompts), args.concurrency + 8))
-                        if args.engine == "xla" and args.concurrency > 0
-                        else args.warmup
-                    )
-                    await many(range(w_n), max_tokens=warmup_max_tokens)
+                    if args.engine == "xla" and args.concurrency > 0:
+                        w_n = max(args.warmup, min(len(prompts), args.concurrency))
+                        await many(range(w_n), max_tokens=warmup_max_tokens)
+                        await many(range(w_n), max_tokens=warmup_max_tokens)
+                    else:
+                        await many(range(args.warmup), max_tokens=warmup_max_tokens)
                 else:
                     for i in range(args.warmup):
                         await one(i, max_tokens=warmup_max_tokens)
