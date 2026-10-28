@@ -763,11 +763,6 @@ impl Inputs {
     }
 
     #[must_use]
-    pub fn in_flight(&self) -> u32 {
-        self.free.in_flight()
-    }
-
-    #[must_use]
     pub fn window_slots(&self) -> crate::window::Slots {
         self.window_slots
     }

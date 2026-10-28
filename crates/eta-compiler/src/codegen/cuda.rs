@@ -77,10 +77,6 @@ pub fn emit_singleton_region(entry_name: &str, op_tag: u8) -> Result<String, Emi
     simt::emit_singleton_region(DIALECT, entry_name, op_tag)
 }
 
-pub fn singleton_runtime_source() -> String {
-    simt::runtime_source(DIALECT)
-}
-
 #[cfg(test)]
 mod tests {
     #[test]

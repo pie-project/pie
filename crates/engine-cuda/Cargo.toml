@@ -16,7 +16,6 @@ state = { path = "../state" }
 memmap2 = "0.9"
 toml = "1.1"
 libc = "0.2"
-serde_json = "1"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 kernels-cuda = { path = "../kernels-cuda", optional = true }
 kernels-ir = { path = "../kernels-ir" }
@@ -68,7 +67,6 @@ windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
 eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
 inferlet = { path = "../inferlet" }
 poem = { package = "pie-poem", path = "../poem" }
-tokenizer = { path = "../tokenizer" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
 tempfile = "3"

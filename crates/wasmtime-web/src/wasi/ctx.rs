@@ -45,15 +45,6 @@ impl WasiWebCtxBuilder {
         self
     }
 
-    pub fn envs(
-        mut self,
-        vars: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
-    ) -> Self {
-        self.env
-            .extend(vars.into_iter().map(|(k, v)| (k.into(), v.into())));
-        self
-    }
-
     pub fn stdout(mut self, sink: impl FnMut(&[u8]) + Send + 'static) -> Self {
         self.stdout = Some(Box::new(sink));
         self

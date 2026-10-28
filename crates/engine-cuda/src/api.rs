@@ -155,12 +155,6 @@ impl Cuda {
         })
     }
 
-    pub fn channel_predictions(
-        &mut self,
-    ) -> EngineResult<Vec<(InstanceId, Vec<crate::program::Cursor>)>> {
-        Ok(self.loaded_mut()?.channel_predictions())
-    }
-
     fn instance(&mut self, id: InstanceId) -> EngineResult<&mut ProgramSession> {
         self.loaded_mut()?
             .program_instance(id)

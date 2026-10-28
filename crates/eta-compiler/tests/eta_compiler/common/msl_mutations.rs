@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use eta_compiler::plan::{
     ChannelSink, ChannelSlot, CompiledStage, Dimension, LibraryOp, NodeIndex, PartitionKind,
     RegionKind, SymbolicType,

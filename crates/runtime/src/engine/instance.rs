@@ -51,11 +51,6 @@ impl InstanceBindingPlan {
     pub fn program_id(&self) -> ProgramId {
         self.binding.program
     }
-
-    #[must_use]
-    pub fn geometry_class(&self) -> GeometryClass {
-        self.binding.geometry
-    }
 }
 
 #[derive(Debug)]
@@ -209,9 +204,5 @@ impl BoundInstance {
 
     pub fn wait_slots(&self) -> Arc<BoundWaitSlots> {
         Arc::clone(&self.wait_slots)
-    }
-
-    pub fn close_wait_slots(&self) {
-        self.wait_slots.close();
     }
 }

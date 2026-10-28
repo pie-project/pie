@@ -949,12 +949,4 @@ pub mod blas {
             Err(_) => cublasStatus_t::CUBLAS_STATUS_INTERNAL_ERROR,
         }
     }
-    pub unsafe fn cublasDestroy_v2(handle: cublasHandle_t) -> cublasStatus_t {
-        match sys::rocblas() {
-            // SAFETY: the caller's live-handle contract, forwarded to rocBLAS's
-            // entry of the same signature.
-            Ok(blas) => cublasStatus_t::of(unsafe { (blas.rocblas_destroy_handle)(handle) }),
-            Err(_) => cublasStatus_t::CUBLAS_STATUS_INTERNAL_ERROR,
-        }
-    }
 }

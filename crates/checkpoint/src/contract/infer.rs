@@ -162,10 +162,6 @@ impl<'a> Resolver<'a> {
     pub fn checked(&self) -> &Checked {
         &self.scope.resolved
     }
-
-    pub fn into_checked(self) -> Checked {
-        self.scope.resolved
-    }
 }
 
 fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {

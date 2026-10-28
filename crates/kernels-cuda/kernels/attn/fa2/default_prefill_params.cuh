@@ -24,49 +24,6 @@
 
 namespace pie::attn::fa2 {
 
-template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_>
-struct SinglePrefillParams {
-  using DTypeQ = DTypeQ_;
-  using DTypeKV = DTypeKV_;
-  using DTypeO = DTypeO_;
-  using IdType = int32_t;
-  DTypeQ* q;
-  DTypeKV* k;
-  DTypeKV* v;
-  uint8_t* maybe_custom_mask;
-  DTypeO* o;
-  float* lse;
-  float* maybe_alibi_slopes;
-  uint_fastdiv group_size;
-  uint32_t qo_len;
-  uint32_t kv_len;
-  uint32_t num_qo_heads;
-  uint32_t num_kv_heads;
-  uint32_t q_stride_n;
-  uint32_t q_stride_h;
-  uint32_t k_stride_n;
-  uint32_t k_stride_h;
-  uint32_t v_stride_n;
-  uint32_t v_stride_h;
-  uint32_t head_dim;
-  int32_t window_left;
-  float logits_soft_cap;
-  float sm_scale;
-  float rope_rcp_scale;
-  float rope_rcp_theta;
-
-  uint32_t partition_kv;
-
-
-  __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
-    return qo_len;
-  }
-
-  __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
-    return kv_len;
-  }
-};
-
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
 struct BatchPrefillRaggedParams {
   using DTypeQ = DTypeQ_;
@@ -122,7 +79,6 @@ struct BatchPrefillRaggedParams {
   uint16_t* maybe_token_pos_in_items_ptr;
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
-
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
@@ -180,7 +136,6 @@ struct BatchPrefillPagedParams {
   uint16_t* maybe_token_pos_in_items_ptr;
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
-
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];

@@ -107,24 +107,9 @@ table!(Hip from "libamdhip64.so" {
         params: *mut *mut c_void,
         extra: *mut *mut c_void,
     ) -> HipError;
-    fn hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
-        blocks: *mut c_int,
-        function: Function,
-        block_size: c_int,
-        dynamic_shared_bytes: usize,
-    ) -> HipError;
-    fn hipModuleLaunchCooperativeKernel(
-        function: Function,
-        grid_x: c_uint, grid_y: c_uint, grid_z: c_uint,
-        block_x: c_uint, block_y: c_uint, block_z: c_uint,
-        shared_bytes: c_uint,
-        stream: Stream,
-        params: *mut *mut c_void,
-    ) -> HipError;
     fn hipDeviceSynchronize() -> HipError;
     fn hipDeviceCanAccessPeer(can: *mut c_int, device: c_int, peer: c_int) -> HipError;
     fn hipDeviceGetP2PAttribute(value: *mut c_int, attr: c_int, src: c_int, dst: c_int) -> HipError;
-    fn hipDeviceEnablePeerAccess(peer: c_int, flags: c_uint) -> HipError;
     fn hipMemset(dst: *mut c_void, value: c_int, bytes: usize) -> HipError;
     fn hipMemsetAsync(dst: *mut c_void, value: c_int, bytes: usize, stream: Stream) -> HipError;
     fn hipMemset2DAsync(dst: *mut c_void, pitch: usize, value: c_int, width: usize, height: usize, stream: Stream) -> HipError;
@@ -139,10 +124,7 @@ table!(Hip from "libamdhip64.so" {
     fn hipStreamWaitEvent(stream: Stream, event: Event, flags: c_uint) -> HipError;
     fn hipLaunchHostFunc(stream: Stream, func: HostFn, data: *mut c_void) -> HipError;
     fn hipStreamBeginCapture(stream: Stream, mode: c_int) -> HipError;
-    fn hipStreamBeginCaptureToGraph(stream: Stream, graph: Graph, deps: *const GraphNode, edges: *const c_void, count: usize, mode: c_int) -> HipError;
     fn hipStreamEndCapture(stream: Stream, graph: *mut Graph) -> HipError;
-    fn hipStreamGetCaptureInfo_v2(stream: Stream, status: *mut c_int, id: *mut u64, graph: *mut Graph, deps: *mut *const GraphNode, count: *mut usize) -> HipError;
-    fn hipStreamUpdateCaptureDependencies(stream: Stream, deps: *mut GraphNode, count: usize, flags: c_uint) -> HipError;
     fn hipEventCreate(event: *mut Event) -> HipError;
     fn hipEventCreateWithFlags(event: *mut Event, flags: c_uint) -> HipError;
     fn hipEventDestroy(event: Event) -> HipError;
@@ -209,7 +191,6 @@ pub struct UniqueId {
 }
 
 table!(Rccl from "librccl.so" {
-    fn ncclGetErrorString(code: NcclResult) -> *const c_char;
     fn ncclGetUniqueId(id: *mut UniqueId) -> NcclResult;
     fn ncclCommInitRank(comm: *mut Comm, ranks: c_int, id: UniqueId, rank: c_int) -> NcclResult;
     fn ncclCommAbort(comm: Comm) -> NcclResult;
@@ -309,7 +290,6 @@ pub const LT_SUCCESS: LtStatus = 0;
 pub const LT_COMPUTE_F32: c_int = 2;
 /// `hipDataType`.
 pub const LT_R_32F: c_int = 0;
-pub const LT_R_16F: c_int = 2;
 pub const LT_R_16BF: c_int = 14;
 /// `hipblasOperation_t`.
 pub const LT_OP_N: c_int = 111;
@@ -321,7 +301,6 @@ pub const LT_DESC_EPILOGUE: c_int = 2;
 pub const LT_DESC_BIAS_POINTER: c_int = 3;
 pub const LT_DESC_BIAS_DATA_TYPE: c_int = 4;
 /// `hipblasLtEpilogue_t`.
-pub const LT_EPILOGUE_DEFAULT: c_int = 1;
 pub const LT_EPILOGUE_BIAS: c_int = 4;
 /// `HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES`.
 pub const LT_PREF_MAX_WORKSPACE_BYTES: c_int = 1;

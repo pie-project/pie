@@ -179,30 +179,6 @@ pub fn lm_head(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn matmul_with(
-    ctx: &Ctx,
-    act: Tensor,
-    codes: Tensor,
-    scales: Tensor,
-    biases: Tensor,
-    y: &mut Tensor,
-    seat: GroupSeat,
-    tuple: Tuple,
-) -> Result<(), Error> {
-    tiled_launch(
-        ctx,
-        "linear.matmul",
-        act,
-        codes,
-        scales,
-        biases,
-        y,
-        seat,
-        tuple,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 fn tiled_launch(
     ctx: &Ctx,
     op: &'static str,

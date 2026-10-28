@@ -16,88 +16,6 @@ using f32 = float;
 
 namespace fa2 {
 
-template <typename Base, typename IdT>
-struct PieScoreParams : Base {
-    float* score_out = nullptr;
-    const IdT* score_indptr = nullptr;
-};
-
-template <typename Base, typename IdT>
-struct PieScoreWindowParams : PieScoreParams<Base, IdT> {
-    std::uint32_t score_window = 0;
-};
-
-template <class Base>
-struct PieScoreCapture : Base {
-    // A capture lands every key's score, the masked ones too.
-    static constexpr bool skips_decode_window = false;
-
-    float* score_row = nullptr;
-
-    template <typename Params>
-    __device__ __host__ PieScoreCapture(
-        const Params& params, uint32_t batch_idx, uint8_t* smem_ptr)
-        : Base(params, batch_idx, smem_ptr) {
-        if (params.score_out != nullptr && params.score_indptr != nullptr) {
-            score_row = params.score_out +
-                        static_cast<std::size_t>(params.score_indptr[batch_idx]);
-        }
-    }
-
-    REGISTER_LOGITS_TRANSFORM(
-        params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
-            const T out = this->Base::template LogitsTransform<Params, T>(
-                params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx,
-                kv_head_idx);
-            const uint32_t len = this->kv_len;
-            if (threadIdx.x == 0 && kv_idx < len && this->score_row != nullptr) {
-
-                this->score_row[qo_head_idx * len + kv_idx] =
-                    static_cast<float>(out) * params.sm_scale;
-            }
-            return out;
-        })
-};
-
-template <class Base>
-struct PieScoreCaptureWindow : Base {
-    float* score_row = nullptr;
-
-    std::uint32_t first_qo = 0;
-    std::uint32_t window = 0;
-
-    template <typename Params>
-    __device__ __host__ PieScoreCaptureWindow(
-        const Params& params, uint32_t batch_idx, uint8_t* smem_ptr)
-        : Base(params, batch_idx, smem_ptr) {
-        if (params.score_out != nullptr && params.score_indptr != nullptr) {
-            score_row = params.score_out +
-                        static_cast<std::size_t>(params.score_indptr[batch_idx]);
-        }
-        window = params.score_window;
-        first_qo = (this->qo_len > window) ? (this->qo_len - window) : 0u;
-    }
-
-    REGISTER_LOGITS_TRANSFORM(
-        params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
-            const T out = this->Base::template LogitsTransform<Params, T>(
-                params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx,
-                kv_head_idx);
-            const uint32_t len = this->kv_len;
-            if (kv_idx < len && qo_idx < this->qo_len &&
-                qo_idx >= this->first_qo && this->score_row != nullptr) {
-                const std::size_t w = qo_idx - this->first_qo;
-                const std::size_t row =
-                    (static_cast<std::size_t>(qo_head_idx) * this->window + w) *
-                    len;
-
-                this->score_row[row + kv_idx] =
-                    static_cast<float>(out) * params.sm_scale;
-            }
-            return out;
-        })
-};
-
 using DTypeQ = __nv_bfloat16;
 using DTypeKV = __nv_bfloat16;
 using DTypeO = __nv_bfloat16;
@@ -125,15 +43,6 @@ using PrefillParams = ::pie::attn::fa2::BatchPrefillPagedParams<DTypeQ, DTypeKV,
 using DTypeKV8 = __nv_fp8_e4m3;
 using DecodeParams8 = ::pie::attn::fa2::BatchDecodeParams<DTypeQ, DTypeKV8, DTypeO, IdType>;
 using PrefillParams8 = ::pie::attn::fa2::BatchPrefillPagedParams<DTypeQ, DTypeKV8, DTypeO, IdType>;
-
-using CaptureWindow = PieScoreCapture<VariantWindow>;
-using CaptureFull = PieScoreCapture<VariantFull>;
-using CapturePrefill = PieScoreCaptureWindow<VariantFull>;
-
-using DecodeCaptureParams = PieScoreParams<DecodeParams, IdType>;
-using PrefillCaptureParams = PieScoreWindowParams<PrefillParams, IdType>;
-using DecodeCaptureParams8 = PieScoreParams<DecodeParams8, IdType>;
-using PrefillCaptureParams8 = PieScoreWindowParams<PrefillParams8, IdType>;
 
 template <typename Base>
 struct RelBiasParams : Base {
@@ -212,7 +121,6 @@ template <class KTraits>
 __device__ unsigned smem_bytes_paged =
     static_cast<unsigned>(sizeof(typename KTraits::SharedStoragePaged));
 
-
 using RaggedParams = ::pie::attn::fa2::BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 
 static_assert(sizeof(RaggedParams) == 312,
@@ -261,6 +169,5 @@ struct RelativeBias : VariantFull {
 };
 
 }
-
 
 }

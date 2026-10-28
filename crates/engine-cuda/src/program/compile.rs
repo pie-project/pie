@@ -634,13 +634,6 @@ pub struct Compiled {
     pub kinds: Arc<Vec<Attach>>,
 }
 
-impl Compiled {
-    #[must_use]
-    pub fn stage_of_kind(&self, kind: Attach) -> Option<usize> {
-        self.kinds.iter().position(|&k| k == kind)
-    }
-}
-
 #[derive(Debug)]
 pub struct Cache {
     programs: Bounded<u64, Compiled>,

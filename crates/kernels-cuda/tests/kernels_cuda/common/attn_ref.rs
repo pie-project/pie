@@ -1,5 +1,4 @@
 //! Host references and fixtures the attention, rotation and norm tests share.
-#![allow(dead_code)]
 
 use super::host::{to_e2m1, to_e4m3};
 use super::tc5::{e2m1, e4m3};

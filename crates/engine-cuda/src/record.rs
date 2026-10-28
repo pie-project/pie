@@ -46,8 +46,6 @@ pub struct BodyMap {
 
 #[derive(Default)]
 pub struct Recorder {
-    keep: bool,
-    kept: Vec<(BodyKey, Graph)>,
     airborne: crate::settle::Airborne,
     at_seq: u64,
     bstats: BodyTally,
@@ -95,15 +93,6 @@ impl Bodies {
     pub fn eager_copy_world(&mut self) {
         self.recorder.eager_copy_world();
     }
-
-    pub fn keep_graphs(&mut self, keep: bool) {
-        self.recorder.keep_graphs(keep);
-    }
-
-    #[must_use]
-    pub fn kept(&self) -> &[(BodyKey, Graph)] {
-        self.recorder.kept()
-    }
 }
 
 impl Recorder {
@@ -126,18 +115,6 @@ impl Recorder {
 
     pub fn eager_copy_world(&mut self) {
         self.bstats.eager_copy_world += 1;
-    }
-
-    pub fn keep_graphs(&mut self, keep: bool) {
-        self.keep = keep;
-        if !keep {
-            self.kept.clear();
-        }
-    }
-
-    #[must_use]
-    pub fn kept(&self) -> &[(BodyKey, Graph)] {
-        &self.kept
     }
 }
 
@@ -523,24 +500,6 @@ impl Ladder {
     #[must_use]
     pub fn rungs(&self) -> &[(u32, u32)] {
         &self.0
-    }
-
-    #[must_use]
-    pub fn contains(&self, class: usize) -> bool {
-        self.0.iter().any(|(held, _)| *held as usize == class)
-    }
-
-    #[must_use]
-    pub fn reach(&self) -> u32 {
-        self.0.iter().map(|(_, rung)| *rung).sum()
-    }
-
-    #[must_use]
-    pub fn lane_reach(&self, lane_ceiling: u32) -> u32 {
-        self.0
-            .iter()
-            .map(|(_, rung)| (*rung).min(lane_ceiling))
-            .sum()
     }
 }
 
@@ -1059,9 +1018,6 @@ impl Bodies {
             nodes += took;
             edges += graph.edges().unwrap_or(0);
             steps.push(Step::Exec { exec, cut });
-            if self.recorder.keep {
-                self.recorder.kept.push((key.clone(), graph));
-            }
         }
         // Every rank instantiated before any launches what it captured.
         fence(run)?;

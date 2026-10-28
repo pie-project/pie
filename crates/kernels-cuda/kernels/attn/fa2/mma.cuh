@@ -59,12 +59,6 @@ enum class MMAMode {
   kInplaceUpdate = 1U,
 };
 
-
-
-
-
-
-
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 #ifdef PIE_FA2_LDMATRIX_M8N8X4_ENABLED
@@ -76,12 +70,6 @@ __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
   PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
 }
-
-
-
-
-
-
 
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_left_half(uint32_t* R, T* smem_ptr) {
@@ -95,12 +83,6 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_left_half(uint32_t* R, T* smem_p
 #endif
 }
 
-
-
-
-
-
-
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_right_half(uint32_t* R, T* smem_ptr) {
 #ifdef PIE_FA2_LDMATRIX_M8N8X4_ENABLED
@@ -112,12 +94,6 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_right_half(uint32_t* R, T* smem_
   PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
 }
-
-
-
-
-
-
 
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) {
@@ -131,12 +107,6 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) 
 #endif
 }
 
-
-
-
-
-
-
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans_left_half(uint32_t* R, T* smem_ptr) {
 #ifdef PIE_FA2_LDMATRIX_M8N8X4_ENABLED
@@ -149,12 +119,6 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans_left_half(uint32_t* R, T* 
 #endif
 }
 
-
-
-
-
-
-
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans_right_half(uint32_t* R, T* smem_ptr) {
 #ifdef PIE_FA2_LDMATRIX_M8N8X4_ENABLED
@@ -166,12 +130,6 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans_right_half(uint32_t* R, T*
   PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
 }
-
-
-
-
-
-
 
 template <typename T>
 __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
@@ -196,114 +154,6 @@ __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
   }
 #endif
 }
-
-
-
-
-
-
-
-
-
-template <typename T, MMAMode mma_mode = MMAMode::kInplaceUpdate>
-__device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uint32_t* A,
-                                                                   uint32_t* B) {
-  static_assert(sizeof(T) == 1, "DType must be 8bit floating data type");
-#if defined(PIE_FA2_MMA_F8F8F32_M16N8K32_ENABLED)
-  if constexpr (mma_mode == MMAMode::kInit) {
-    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-      asm volatile(
-          "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-          "{%0,  %1,  %2,  %3},"
-          "{%4,  %5,  %6,  %7},"
-          "{%8,  %9},"
-          "{%10, %11, %12, %13};\n"
-          : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
-          : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "f"(0.f), "f"(0.f),
-            "f"(0.f), "f"(0.f));
-      asm volatile(
-          "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-          "{%0,  %1,  %2,  %3},"
-          "{%4,  %5,  %6,  %7},"
-          "{%8,  %9},"
-          "{%10, %11, %12, %13};\n"
-          : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
-          : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2]), "r"(B[3]), "f"(0.f), "f"(0.f),
-            "f"(0.f), "f"(0.f));
-    } else {
-      asm volatile(
-          "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 "
-          "{%0,  %1,  %2,  %3},"
-          "{%4,  %5,  %6,  %7},"
-          "{%8,  %9},"
-          "{%10, %11, %12, %13};\n"
-          : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
-          : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "f"(0.f), "f"(0.f),
-            "f"(0.f), "f"(0.f));
-      asm volatile(
-          "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 "
-          "{%0,  %1,  %2,  %3},"
-          "{%4,  %5,  %6,  %7},"
-          "{%8,  %9},"
-          "{%10, %11, %12, %13};\n"
-          : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
-          : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2]), "r"(B[3]), "f"(0.f), "f"(0.f),
-            "f"(0.f), "f"(0.f));
-    }
-  } else {
-    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-      asm volatile(
-          "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-          "{%0,  %1,  %2,  %3},"
-          "{%4,  %5,  %6,  %7},"
-          "{%8,  %9},"
-          "{%10, %11, %12, %13};\n"
-          : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
-          : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "f"(C[0]), "f"(C[1]),
-            "f"(C[2]), "f"(C[3]));
-      asm volatile(
-          "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-          "{%0,  %1,  %2,  %3},"
-          "{%4,  %5,  %6,  %7},"
-          "{%8,  %9},"
-          "{%10, %11, %12, %13};\n"
-          : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
-          : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2]), "r"(B[3]), "f"(C[4]), "f"(C[5]),
-            "f"(C[6]), "f"(C[7]));
-    } else {
-      asm volatile(
-          "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 "
-          "{%0,  %1,  %2,  %3},"
-          "{%4,  %5,  %6,  %7},"
-          "{%8,  %9},"
-          "{%10, %11, %12, %13};\n"
-          : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
-          : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "f"(C[0]), "f"(C[1]),
-            "f"(C[2]), "f"(C[3]));
-      asm volatile(
-          "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 "
-          "{%0,  %1,  %2,  %3},"
-          "{%4,  %5,  %6,  %7},"
-          "{%8,  %9},"
-          "{%10, %11, %12, %13};\n"
-          : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
-          : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2]), "r"(B[3]), "f"(C[4]), "f"(C[5]),
-            "f"(C[6]), "f"(C[7]));
-    }
-  }
-#else
-  PIE_FA2_RUNTIME_ASSERT(
-      "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
-#endif
-}
-
-
-
-
-
-
-
-
 
 template <typename T, MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, uint32_t* A,
@@ -467,46 +317,6 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
 #endif
 }
 
-
-
-template <typename DType>
-__device__ __forceinline__ void m16k32_rowsum_f8f8f32(float* d, DType* s) {
-  static_assert(sizeof(DType) == 1, "DType must be 8bit floating data type");
-  uint32_t* s_u32 = (uint32_t*)(s);
-#if defined(PIE_FA2_MMA_F8F8F32_M16N8K32_ENABLED)
-  if constexpr (std::is_same_v<DType, __nv_fp8_e4m3>) {
-    asm volatile(
-        "{\n"
-        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-        "{%0,  _,  %1,  _},"
-        "{%2,  %3,  %4,  %5},"
-        "{%6,  %7},"
-        "{%8,  0.,  %9,  0.};\n"
-        "}\n"
-        : "=f"(d[0]), "=f"(d[1])
-        : "r"(s_u32[0]), "r"(s_u32[1]), "r"(s_u32[2]), "r"(s_u32[3]), "r"(943208504),
-          "r"(943208504), "f"(d[0]), "f"(d[1]));
-  } else {
-    asm volatile(
-        "{\n"
-        "mma.sync.aligned.m16n8k16.row.col.f32.e5m2.e5m2.f32 "
-        "{%0,  _,  %1,  _},"
-        "{%2,  %3,  %4,  %5},"
-        "{%6,  %7},"
-        "{%8,  0.,  %9,  0.};\n"
-        "}\n"
-        : "=f"(d[0]), "=f"(d[1])
-        : "r"(s_u32[0]), "r"(s_u32[1]), "r"(s_u32[2]), "r"(s_u32[3]), "r"(1010580540),
-          "r"(1010580540), "f"(d[0]), "f"(d[1]));
-  }
-#else
-  PIE_FA2_RUNTIME_ASSERT(
-      "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
-#endif
-}
-
-
-
 template <typename DType>
 __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s) {
   static_assert(sizeof(DType) == 2, "DType must be 16bit floating data type");
@@ -566,13 +376,6 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s) {
   PIE_FA2_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
 #endif
 }
-
-
-
-
-
-
-
 
 template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C, uint32_t* A,

@@ -133,17 +133,7 @@ pub mod open {
 #[cfg(feature = "engine-cuda")]
 pub use engine_cuda::comm::Transport;
 #[cfg(feature = "engine-cuda")]
-pub use engine_cuda::{DeviceBoot, Diagnostics, Graphs, Knobs, Recording, World, ordinal_of};
-
-mod remote;
-
-pub use remote::{RemoteDisconnectHandle, RemoteEngine};
-
-#[cfg(feature = "engine-cuda")]
-#[must_use]
-pub fn envelopes_resolved() -> u64 {
-    engine_cuda::Shell::envelopes_resolved()
-}
+pub use engine_cuda::{DeviceBoot, Diagnostics, Knobs, World, ordinal_of};
 
 struct EngineRegistration {
     spec: EngineSpec,

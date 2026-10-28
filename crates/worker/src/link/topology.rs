@@ -46,13 +46,6 @@ impl Coordinator {
             TopologyMode::Distributed { role, .. } => Some(*role),
         }
     }
-
-    pub fn controller_addr(&self) -> Option<&str> {
-        match &self.mode {
-            TopologyMode::SingleNode => None,
-            TopologyMode::Distributed { controller, .. } => Some(controller),
-        }
-    }
 }
 
 pub fn connect(mode: &TopologyMode, control_addr: String) -> Result<Coordinator> {

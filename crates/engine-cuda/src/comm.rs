@@ -137,11 +137,6 @@ impl Comm {
     pub fn rank(&self) -> u32 {
         self.rank
     }
-
-    #[must_use]
-    pub fn size(&self) -> u32 {
-        self.size
-    }
 }
 
 impl Drop for Comm {

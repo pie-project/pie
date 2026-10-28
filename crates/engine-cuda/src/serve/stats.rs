@@ -1,4 +1,4 @@
-use poem_compiler::{Budget, CompiledModel};
+use poem_compiler::Budget;
 use poem_ir::Trace;
 
 use super::{Graphs, Shell};
@@ -11,11 +11,6 @@ impl Shell {
     #[must_use]
     pub fn trace(&self) -> &Trace {
         &self.trace
-    }
-
-    #[must_use]
-    pub fn compiled_model(&self) -> &CompiledModel {
-        &self.compiled
     }
 
     /// The inputs this load's guest binds, and the lane words reading each.
@@ -101,20 +96,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn expert_residency(&self) -> Vec<crate::experts::BankResidency> {
-        self.weights
-            .experts()
-            .map_or_else(Vec::new, crate::experts::Tier::residency)
-    }
-
-    #[must_use]
-    pub fn expert_motion(&self) -> (u64, u64, u64) {
-        self.weights
-            .experts()
-            .map_or((0, 0, 0), crate::experts::Tier::motion)
-    }
-
-    #[must_use]
     pub fn buffer_bytes(&self) -> u64 {
         self.buffers.as_ref().map_or(0, Buffers::bytes)
     }
@@ -137,10 +118,6 @@ impl Shell {
     #[must_use]
     pub fn body_stats(&self) -> record::BodyStats {
         self.cache.body_stats()
-    }
-
-    pub fn keep_graphs(&mut self, keep: bool) {
-        self.cache.keep_graphs(keep);
     }
 
     #[must_use]
@@ -190,10 +167,5 @@ impl Shell {
     #[must_use]
     pub fn weights_from_cache(&self) -> bool {
         self.weights.from_cache()
-    }
-
-    #[must_use]
-    pub fn envelopes_resolved() -> u64 {
-        crate::program::ports::resolved()
     }
 }

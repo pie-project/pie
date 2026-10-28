@@ -7,8 +7,6 @@ use crate::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, special, speci
 
 pub const STOP_TOKENS: &[&str] = &["<|eot|>", "<|end_of_text|>"];
 
-pub const MARKERS: &[&str] = &["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"];
-
 pub struct Atem {
     tokenizer: Arc<Tokenizer>,
     bos: u32,

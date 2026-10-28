@@ -31,7 +31,6 @@ pub struct Rotation {
     tenants: Vec<Tenant>,
     slots: u32,
     slot_bytes: Vec<u64>,
-    declined: Vec<usize>,
     acquire: Vec<Vec<u32>>,
     release: Vec<Vec<u32>>,
     issue: Vec<Vec<u32>>,
@@ -88,11 +87,8 @@ impl Rotation {
         }
 
         let mut kept: Vec<(usize, u64)> = Vec::new();
-        let mut declined: Vec<usize> = Vec::new();
         for (param, bytes) in candidates {
-            if *bytes > cap || *bytes == 0 || !region_of.contains_key(param) {
-                declined.push(*param);
-            } else {
+            if *bytes <= cap && *bytes != 0 && region_of.contains_key(param) {
                 kept.push((*param, *bytes));
             }
         }
@@ -187,7 +183,6 @@ impl Rotation {
             tenants,
             slots,
             slot_bytes,
-            declined,
             acquire,
             release,
             issue,
@@ -212,11 +207,6 @@ impl Rotation {
     #[must_use]
     pub fn rotating(&self) -> u64 {
         self.tenants.iter().map(|tenant| tenant.bytes).sum()
-    }
-
-    #[must_use]
-    pub fn declined(&self) -> &[usize] {
-        &self.declined
     }
 }
 

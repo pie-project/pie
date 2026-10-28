@@ -7,16 +7,6 @@ use crate::{ChatDecoder, Effort, Instruct, ReasoningDecoder, ToolDecoder, specia
 
 pub const STOP_TOKENS: &[&str] = &["<|content_model_end_sampling|>", "<|endoftext|>"];
 
-pub const MARKERS: &[&str] = &[
-    "<|message_user|>",
-    "<|message_model|>",
-    "<|message_system|>",
-    "<|message_tool|>",
-    "<|content_text|>",
-    "<|content_thinking|>",
-    "<|end_message|>",
-];
-
 const THINKING_EFFORT: &str = "0.9";
 
 pub struct Inkling {

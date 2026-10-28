@@ -173,16 +173,6 @@ impl Slotting {
     pub fn order(&self) -> &[usize] {
         &self.order
     }
-
-    #[must_use]
-    pub fn slot_bytes(&self, slot: u32, plane: impl Fn(usize) -> u64) -> u64 {
-        self.of
-            .iter()
-            .filter(|(_, which)| **which == slot)
-            .map(|(param, _)| plane(*param))
-            .max()
-            .unwrap_or(0)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -34,7 +34,6 @@ pub enum Completion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
-    Local,
     Nixl,
 }
 

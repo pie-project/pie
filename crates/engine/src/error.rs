@@ -61,11 +61,6 @@ impl Error {
     }
 
     #[must_use]
-    pub const fn is_scheduling(&self) -> bool {
-        matches!(self, Error::Exhausted { .. } | Error::Impossible(_))
-    }
-
-    #[must_use]
     pub const fn is_retryable(&self) -> bool {
         matches!(self, Error::Exhausted { .. })
     }

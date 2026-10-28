@@ -51,46 +51,6 @@ impl Gpu {
         f64::from(stop.since(&start).unwrap()) * 1e3 / f64::from(reps)
     }
 
-    /// Mean device microseconds per call of `f`, with `reps` calls captured
-    /// into one HIP graph and replayed: no host launch cost between them,
-    /// as the engine runs a step. The first call (outside the capture)
-    /// compiles what it fires.
-    pub fn time_graph(&self, reps: u32, mut f: impl FnMut()) -> f64 {
-        use kernels_rocm::hip::rt;
-        f();
-        self.sync();
-        let s = self.stream.raw();
-        let mut graph: rt::Graph = core::ptr::null_mut();
-        let mut exec: rt::GraphExec = core::ptr::null_mut();
-        // SAFETY: the stream is live and captured only here; the graph and
-        // its instance are destroyed before returning.
-        unsafe {
-            assert_eq!(
-                rt::hipStreamBeginCapture(s, rt::hipStreamCaptureModeThreadLocal),
-                0
-            );
-            for _ in 0..reps {
-                f();
-            }
-            assert_eq!(rt::hipStreamEndCapture(s, &raw mut graph), 0);
-            assert_eq!(rt::hipGraphInstantiateWithFlags(&raw mut exec, graph, 0), 0);
-            assert_eq!(rt::hipGraphLaunch(exec, s), 0);
-        }
-        self.sync();
-        let (start, stop) = (hip::Event::new().unwrap(), hip::Event::new().unwrap());
-        start.record(&self.stream).unwrap();
-        // SAFETY: as above.
-        unsafe { assert_eq!(rt::hipGraphLaunch(exec, s), 0) };
-        stop.record(&self.stream).unwrap();
-        let us = f64::from(stop.since(&start).unwrap()) * 1e3 / f64::from(reps);
-        // SAFETY: as above.
-        unsafe {
-            rt::hipGraphExecDestroy(exec);
-            rt::hipGraphDestroy(graph);
-        }
-        us
-    }
-
     pub fn sync(&self) {
         self.stream.synchronize().unwrap();
     }

@@ -116,34 +116,6 @@ __device__ __forceinline__ u32 tf32(float x) {
     return r;
 }
 
-__device__ __forceinline__ void mma_tf32(float (&d)[4], const u32 (&a)[4], u32 b0, u32 b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
-        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-// D (16 x 8) += X[r0.., xk0..] . Y[yk0.., n0..] over `ks` steps of eight,
-// both f32 row-major, in tf32.
-__device__ __forceinline__ void tile_mm(float (&d)[4], const float* X, int ldx, int r0, int xk0,
-                                        const float* Y, int ldy, int yk0, int n0, int ks, int l) {
-    const int g = l >> 2;
-    const int t = l & 3;
-    for (int k = 0; k < ks; ++k) {
-        const int xk = xk0 + 8 * k;
-        const int yk = yk0 + 8 * k;
-        u32 a[4];
-        a[0] = tf32(X[(r0 + g) * ldx + xk + t]);
-        a[1] = tf32(X[(r0 + g + 8) * ldx + xk + t]);
-        a[2] = tf32(X[(r0 + g) * ldx + xk + t + 4]);
-        a[3] = tf32(X[(r0 + g + 8) * ldx + xk + t + 4]);
-        const u32 b0 = tf32(Y[(yk + t) * ldy + n0 + g]);
-        const u32 b1 = tf32(Y[(yk + t + 4) * ldy + n0 + g]);
-        mma_tf32(d, a, b0, b1);
-    }
-}
-
 // f16 pairs and the f16 tensor-core product the inverse runs on: its
 // operands keep a tf32's ten mantissa bits, and ldmatrix lands them.
 constexpr int LDH = 72;  // an f16 64-wide row padded so ldmatrix's eight rows miss each other's banks
@@ -191,17 +163,6 @@ __device__ __forceinline__ void put_h(const float (&d)[4], unsigned short* Z, in
     const int t = l & 3;
     *reinterpret_cast<u32*>(Z + (r0 + g) * ld + n0 + 2 * t) = h2(d[0] * sc, d[1] * sc);
     *reinterpret_cast<u32*>(Z + (r0 + g + 8) * ld + n0 + 2 * t) = h2(d[2] * sc, d[3] * sc);
-}
-
-// Lands a 16 x 8 accumulator tile, scaled, at Z[r0.., n0..].
-__device__ __forceinline__ void tile_put(const float (&d)[4], float* Z, int ldz, int r0, int n0,
-                                         float scale, int l) {
-    const int g = l >> 2;
-    const int t = l & 3;
-    Z[(r0 + g) * ldz + n0 + 2 * t] = d[0] * scale;
-    Z[(r0 + g) * ldz + n0 + 2 * t + 1] = d[1] * scale;
-    Z[(r0 + g + 8) * ldz + n0 + 2 * t] = d[2] * scale;
-    Z[(r0 + g + 8) * ldz + n0 + 2 * t + 1] = d[3] * scale;
 }
 
 // The walk every role takes: the block's (request, value head) tiles, each

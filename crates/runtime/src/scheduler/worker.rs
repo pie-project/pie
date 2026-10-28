@@ -270,9 +270,6 @@ enum SchedulerItem {
         lane: ProcessId,
         seq: u64,
     },
-    DebugDump {
-        response: tokio::sync::oneshot::Sender<String>,
-    },
     HostKv {
         op: HostKvOp,
         response: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
@@ -758,59 +755,6 @@ impl SchedulerHandle {
         Arc::clone(&self.inner.stats)
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "a pass-through to `PendingRequest::direct`: every argument is \
-                  forwarded unchanged into that constructor, so the width is that \
-                  struct's field list arriving one call earlier"
-    )]
-    pub fn submit_with_identity_and_copy(
-        &self,
-        request: crate::engine::FireRequest,
-        instance_id: ::engine::InstanceId,
-        completion: WorkItemCompletion,
-        pipeline_id: Option<ProcessId>,
-        prelaunch_copy: Option<::engine::KvCopy>,
-        prelaunch_state_copy: Option<StateCopy>,
-    ) -> Result<()> {
-        self.send(SchedulerItem::Launch {
-            pending: PendingRequest::direct(
-                request,
-                instance_id,
-                completion,
-                pipeline_id,
-                pipeline_id,
-                prelaunch_copy,
-                prelaunch_state_copy,
-                None,
-                /*lora_program=*/ false,
-            ),
-        })
-    }
-
-    pub fn submit_prebuilt_with_copy(
-        &self,
-        request: crate::engine::FireRequest,
-        instance_id: ::engine::InstanceId,
-        completion: WorkItemCompletion,
-        prelaunch_copy: Option<::engine::KvCopy>,
-        prelaunch_state_copy: Option<StateCopy>,
-    ) -> Result<()> {
-        self.send(SchedulerItem::Launch {
-            pending: PendingRequest::direct(
-                request,
-                instance_id,
-                completion,
-                None,
-                None,
-                prelaunch_copy,
-                prelaunch_state_copy,
-                None,
-                /*lora_program=*/ false,
-            ),
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn submit_prebuilt_tracked_with_copy(
         &self,
@@ -909,15 +853,6 @@ impl SchedulerHandle {
     pub(crate) async fn host_kv(&self, op: HostKvOp) -> Result<Vec<u8>> {
         self.request(|response| SchedulerItem::HostKv { op, response })
             .await?
-    }
-
-    pub(crate) async fn debug_dump(&self) -> Result<String> {
-        crate::rt::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.request(|response| SchedulerItem::DebugDump { response }),
-        )
-        .await
-        .map_err(|_| anyhow!("scheduler did not answer the debug dump"))?
     }
 
     pub fn close_instance(&self, id: ::engine::InstanceId, pacing_wait_id: u64) -> Result<()> {
@@ -1059,7 +994,6 @@ impl BatchScheduler {
                 Self::enqueue_item(
                     &mut pending,
                     &mut terminated_processes,
-                    &in_flight_launches,
                     &mut in_flight_control,
                     &instances,
                     limits,
@@ -1325,7 +1259,6 @@ impl BatchScheduler {
                 Self::enqueue_item(
                     &mut pending,
                     &mut terminated_processes,
-                    &in_flight_launches,
                     &mut in_flight_control,
                     &instances,
                     limits,
@@ -1415,7 +1348,6 @@ impl BatchScheduler {
     fn enqueue_item(
         pending: &mut PendingQueue,
         terminated_processes: &mut HashSet<ProcessId>,
-        in_flight_launches: &VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut InFlightControls,
         instances: &HashMap<::engine::InstanceId, TrackedInstance>,
         limits: SchedulerLimits,
@@ -1427,15 +1359,6 @@ impl BatchScheduler {
         match item {
             SchedulerItem::Stop => {
                 *stopping = true;
-            }
-            SchedulerItem::DebugDump { response } => {
-                let _ = response.send(Self::render_debug_dump(
-                    pending,
-                    in_flight_launches,
-                    in_flight_control,
-                    instances,
-                    frame_policy,
-                ));
             }
             SchedulerItem::Nudge => {}
             SchedulerItem::ExecutionSlotReleased(pid) => {

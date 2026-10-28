@@ -1,6 +1,5 @@
 //! Host references the GEMM, select, quantizer and router tests share: one
 //! dot over decoded operands, one GLU, one quantizer, one routed MLP.
-#![allow(dead_code)]
 
 use super::host::{to_e2m1, to_e4m3};
 use super::tc5::{Side, e4m3, side, ue8m0};

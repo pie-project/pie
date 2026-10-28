@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use kernels_cuda::conv::{Conv3d, TimePad};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

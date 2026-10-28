@@ -34,9 +34,6 @@ __forceinline__ __device__ half2 uint32_as_half2(uint32_t x) { return *(half2*)&
 
 __forceinline__ __device__ uint32_t half2_as_uint32(half2 x) { return *(uint32_t*)&x; }
 
-
-
-
 __forceinline__ __device__ float ptx_exp2(float x) {
   float y;
   asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
@@ -55,11 +52,6 @@ struct MaxOp<float> {
   }
 };
 
-template <typename T>
-struct SumOp {
-  __device__ __forceinline__ T operator()(T const& x, T const& y) { return x + y; }
-};
-
 __forceinline__ __device__ void add(float2& c, float2 const& a, float2 const& b) {
   c.x = a.x + b.x;
   c.y = a.y + b.y;
@@ -73,18 +65,6 @@ __forceinline__ __device__ void mul(float2& c, float2 const& a, float2 const& b)
 __forceinline__ __device__ void fma(float2& d, float2 const& a, float2 const& b, float2 const& c) {
   d.x = fmaf(a.x, b.x, c.x);
   d.y = fmaf(a.y, b.y, c.y);
-}
-
-__forceinline__ __device__ float exp2_fma_poly(float x) {
-  float n = rintf(x);
-  float f = x - n;
-
-  float poly = ((0.0771f * f + 0.2276f) * f + 0.6951f) * f + 1.0f;
-
-  int n_int = __float2int_rn(n);
-  uint32_t poly_bits = __float_as_uint(poly);
-  poly_bits += static_cast<uint32_t>(n_int) << 23;
-  return __uint_as_float(poly_bits);
 }
 
 __forceinline__ __device__ uint32_t fp32_vec_to_e4m3(float const& f0, float const& f1,
@@ -158,17 +138,11 @@ __forceinline__ __device__ uint32_t fp32_vec_to_e2m1(float2 const* array) {
                           array[3].x, array[3].y);
 }
 
-
-
-
 __forceinline__ __device__ float ptx_log2(float x) {
   float y;
   asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
 }
-
-
-
 
 __forceinline__ __device__ half2 ptx_exp2(half2 x) {
   uint32_t y_u32;
@@ -177,28 +151,17 @@ __forceinline__ __device__ half2 ptx_exp2(half2 x) {
   return uint32_as_half2(y_u32);
 }
 
-
-
-
 __forceinline__ __device__ half ptx_exp2(half x) {
   ushort y_u16;
   asm volatile("ex2.approx.f16 %0, %1;" : "=h"(y_u16) : "h"(__half_as_ushort(x)));
   return __ushort_as_half(y_u16);
 }
 
-
-
-
 __forceinline__ __device__ float ptx_rcp(float x) {
   float y;
   asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
 }
-
-
-
-
-
 
 __forceinline__ __device__ float shfl_xor_sync(float x, int lane_mask) {
   float y;
@@ -208,17 +171,9 @@ __forceinline__ __device__ float shfl_xor_sync(float x, int lane_mask) {
   return y;
 }
 
-
-
-
-
-
 __forceinline__ __device__ half2 shfl_xor_sync(half2 x, int lane_mask) {
   return __shfl_xor_sync(0xffffffff, x, lane_mask);
 }
-
-
-
 
 __forceinline__ __device__ float rsqrt(float x) {
   float y;
@@ -226,17 +181,11 @@ __forceinline__ __device__ float rsqrt(float x) {
   return y;
 }
 
-
-
-
 __forceinline__ __device__ float tanh(float x) {
   float y;
   asm volatile("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
 }
-
-
-
 
 __forceinline__ __device__ half2 tanh(half2 x) {
   uint32_t y_u32;
@@ -244,9 +193,6 @@ __forceinline__ __device__ half2 tanh(half2 x) {
   asm volatile("tanh.approx.f16x2 %0, %1;" : "=r"(y_u32) : "r"(x_u32));
   return uint32_as_half2(y_u32);
 }
-
-
-
 
 __forceinline__ __device__ half tanh(half x) {
   ushort y_u16;

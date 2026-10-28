@@ -207,14 +207,6 @@ pub async fn bootstrap(config: Config) -> Result<BootstrapHandle> {
     bootstrap_inner(config).await
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub async fn bootstrap_with_listener(
-    config: Config,
-    _listener: tokio::net::TcpListener,
-) -> Result<BootstrapHandle> {
-    bootstrap_inner(config).await
-}
-
 async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     verify_config(&config)?;
     let mut active_guard = ActiveRuntimeGuard::acquire()?;

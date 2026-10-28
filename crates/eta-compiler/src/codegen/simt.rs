@@ -17,7 +17,7 @@ pub mod validate;
 pub use fused::emit_fused_region;
 pub use matmul::{emit_matmul_region, is_matmul_region};
 pub use order::{emit_order_region, is_order_region};
-pub use runtime::{Dialect, runtime_source};
+pub use runtime::Dialect;
 pub use scan::{emit_scan_region, is_scan_region};
 pub use singleton::emit_singleton_region;
 pub use validate::{second_party_region_supported, validate_generated_region};

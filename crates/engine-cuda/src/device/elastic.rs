@@ -79,6 +79,7 @@ pub struct PhysicalPool {
     held_pages: u64,
     committed_pages: u64,
     high_water_pages: u64,
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
     utilization: f64,
 }
 
@@ -134,11 +135,6 @@ impl PhysicalPool {
     }
 
     #[must_use]
-    pub const fn utilization(&self) -> f64 {
-        self.utilization
-    }
-
-    #[must_use]
     pub const fn page_bytes(&self) -> u64 {
         LOGICAL_PAGE_BYTES
     }
@@ -191,11 +187,6 @@ impl PhysicalPool {
         self.high_water_pages
     }
 
-    #[must_use]
-    pub const fn handle_bytes(&self) -> u64 {
-        self.handle_bytes
-    }
-
     /// What the pool can still take: the budget past what is committed and
     /// what is promised.
     #[must_use]
@@ -221,10 +212,6 @@ impl PhysicalPool {
         self.held_pages -= promised;
         self.committed_pages += pages;
         self.high_water_pages = self.high_water_pages.max(self.committed_pages);
-    }
-
-    pub fn mark_uncommitted(&mut self, pages: u64) {
-        self.committed_pages -= self.committed_pages.min(pages);
     }
 
     /// Pledges the pool `pages` whatever the device reports free from here
@@ -646,44 +633,6 @@ impl Arena {
                 pool.release_handle(handle);
             }
         }
-    }
-    pub fn release_outside(&mut self, pool: &mut PhysicalPool, want: &Want) -> u64 {
-        if self.flat {
-            // One allocation backs every unit: none goes back before the arena.
-            let _ = (pool, want);
-            return 0;
-        }
-        let keep = self.units_of(want);
-        let cache_goal = usize::from(keep.len() >= 2);
-        let mut released = 0u64;
-        for unit in 0..self.units.len() {
-            if keep.binary_search(&unit).is_ok() {
-                continue;
-            }
-            let Some(handle) = self.units[unit].take() else {
-                continue;
-            };
-            self.mapped = self.mapped.saturating_sub(1);
-            self.unmap(self.base + unit as u64 * self.map_unit);
-            if self.cached.len() < cache_goal {
-                self.cached.push(handle);
-            } else {
-                pool.release_handle(handle);
-                released += self.map_unit;
-            }
-        }
-        while self.cached.len() > cache_goal {
-            if let Some(handle) = self.cached.pop() {
-                pool.release_handle(handle);
-                released += self.map_unit;
-            }
-        }
-        let pages = pages_for_bytes(released);
-        pool.mark_uncommitted(pages);
-        pages
-    }
-    pub fn release_tail(&mut self, pool: &mut PhysicalPool, bytes: u64) -> u64 {
-        self.release_outside(pool, &Want::Prefix(bytes))
     }
     fn unmap(&self, at: u64) {
         #[cfg(feature = "device")]

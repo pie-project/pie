@@ -1,5 +1,3 @@
-#[path = "common/device_text.rs"]
-mod device_text;
 use crate::msl_corpus;
 #[path = "common/provenance.rs"]
 mod provenance;

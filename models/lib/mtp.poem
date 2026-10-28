@@ -1,0 +1,26 @@
+# A DeepSeek-V3-style MTP draft head: the token the trunk's logits pick,
+# embedded and normed beside the trunk's last rows, both projected and
+# summed, one of the package's own layers over the sum, and the trunk's
+# lm_head over its norm.
+
+def draft(m, inputs, hidden, positions, logits, layer):
+    """The MTP head's drafted token, from the trunk's last rows `hidden` and
+    the token its logits pick; `layer(m, fused, drafted, positions)` is the
+    package's own attention and MLP block over the fused rows."""
+    mtp = m.mtp
+    drafted = inputs.on(fact.drafts())
+    hidden = hidden.on(fact.drafts())
+    positions = positions.on(fact.drafts())
+    token = ops.sampling.argmax([logits.on(fact.drafts())])
+
+    e = ops.gather.embed(token, m.embed, m.vocab)
+    e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
+    h = ops.elemwise.rmsnorm(hidden, mtp.hnorm, mtp.norm_eps)
+    fused = ops.elemwise.residual_add(
+        ops.linear.matmul(e, mtp.e_proj),
+        ops.linear.matmul(h, mtp.h_proj),
+    )
+    r = layer(m, fused, drafted, positions)
+    proposal = ops.linear.lm_head(ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps), m.head)
+    output("mtp.logits", proposal)
+    output("mtp.drafts", ops.sampling.argmax([proposal]))

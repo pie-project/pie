@@ -21,7 +21,7 @@ pub use endpoint::Endpoint;
 pub use launch::{
     ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes, scratch_offsets,
 };
-pub use session::{Fired, Launched, Session, seeds_of};
+pub use session::{Fired, Launched, Session};
 pub use wave::Wave;
 
 #[derive(Debug)]
@@ -187,14 +187,6 @@ impl Plane {
 
     pub fn set_shadow(&mut self, shadow: bool) {
         self.shadow = shadow;
-    }
-
-    #[must_use]
-    pub fn predictions(&self) -> Vec<(InstanceId, Vec<Cursor>)> {
-        self.instances
-            .iter()
-            .map(|(id, bound)| (*id, bound.session.predictions()))
-            .collect()
     }
 
     #[must_use]

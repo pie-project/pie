@@ -36,7 +36,6 @@ fn run_handler<H: ServiceHandler>(
 
 struct SingletonState<Msg: Send + 'static> {
     tx: UnboundedSender<Msg>,
-    handle: task::JoinHandle<()>,
 }
 
 pub struct Service<Msg: Send + 'static> {
@@ -57,11 +56,11 @@ impl<Msg: Send + 'static> Service<Msg> {
     {
         let handler = factory();
         let (tx, rx) = unbounded_channel();
-        let handle = run_handler(handler, rx);
+        run_handler(handler, rx);
 
         let mut state = self.state.lock().unwrap();
         ensure!(state.is_none(), "Service already spawned");
-        *state = Some(SingletonState { tx, handle });
+        *state = Some(SingletonState { tx });
         Ok(())
     }
 
@@ -74,17 +73,6 @@ impl<Msg: Send + 'static> Service<Msg> {
             .map(|state| state.tx.clone())
             .ok_or_else(|| anyhow!("Service not spawned"))?;
         tx.send(msg).map_err(|_| anyhow!("Service channel closed"))
-    }
-
-    #[allow(dead_code)]
-    pub async fn shutdown(&self) -> Result<()> {
-        let Some(SingletonState { tx, handle }) = self.state.lock().unwrap().take() else {
-            return Ok(());
-        };
-        drop(tx);
-        handle
-            .await
-            .map_err(|e| anyhow!("Service task panicked: {}", e))
     }
 
     pub fn is_spawned(&self) -> bool {
@@ -151,28 +139,10 @@ where
         self.map.remove(key).is_some()
     }
 
-    #[allow(dead_code)]
-    pub async fn join(&self, key: &K) -> Result<()> {
-        self.map.remove(key);
-        let (_, handle) = self
-            .handles
-            .remove(key)
-            .ok_or_else(|| anyhow!("Service not found"))?;
-        handle
-            .await
-            .map_err(|e| anyhow!("Service task panicked: {}", e))
-    }
-
-    #[allow(dead_code)]
-    pub fn contains(&self, key: &K) -> bool {
-        self.map.contains_key(key)
-    }
-
     pub fn keys(&self) -> Vec<K> {
         self.map.iter().map(|r| r.key().clone()).collect()
     }
 
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()
     }

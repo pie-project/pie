@@ -1,6 +1,4 @@
 #![allow(unsafe_code)]
-#[cfg(feature = "device")]
-pub mod arena;
 #[cfg(feature = "rocm")]
 mod hip;
 
@@ -151,7 +149,6 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
 
 #[derive(Debug, Clone)]
 pub struct Prospect {
-    pub planes: Attachments,
     pub ranking: crate::experts::Ranking,
 }
 
@@ -175,7 +172,7 @@ pub fn prospect(
         .collect();
     let planes = attachments(&landing, trace, &index)?;
     let ranking = crate::experts::Ranking::of(trace, &planes)?;
-    Ok(Prospect { ranking, planes })
+    Ok(Prospect { ranking })
 }
 
 fn attachments(

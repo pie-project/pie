@@ -89,10 +89,6 @@ impl WorkerRegistry {
         self.inner.connected_tx.subscribe()
     }
 
-    pub fn is_connected(&self, id: WorkerId) -> bool {
-        self.inner.clients.read().unwrap().contains_key(&id)
-    }
-
     pub fn client(&self, id: WorkerId) -> Option<WorkerControlClient> {
         self.inner.clients.read().unwrap().get(&id).cloned()
     }
