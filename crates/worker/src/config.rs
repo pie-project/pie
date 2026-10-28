@@ -269,12 +269,12 @@ fn default_true() -> bool {
 }
 // Half the CPUs leave the rest to the engine's own threads (its serve loop,
 // the tokenizer and lane pools); a box whose quota the workers alone fill
-// (24 of an H100 node's) settles a decode fleet into lockstep, its guests
-// trailing every frame: 7.5k tok/s against 18.7k at 12 on DeepSeek-V4's
-// miniature, 64 lanes.
+// (24 of an H100 node's, or 48 of a dual-socket B200 NUMA node's) settles a
+// decode fleet into lockstep, its guests trailing every frame: 7.5k tok/s
+// against 18.7k at 12 on DeepSeek-V4's miniature, 64 lanes.
 fn default_worker_threads() -> usize {
     std::thread::available_parallelism()
-        .map(|n| (n.get() / 2).clamp(1, 64))
+        .map(|n| (n.get() / 2).clamp(1, 16))
         .unwrap_or(4)
 }
 fn default_max_upload() -> ByteSize {
@@ -338,7 +338,7 @@ pub struct SandboxConfig {
     /// Linear memory kept resident when an instance is returned to the pool,
     /// rather than decommitted. Trades RSS for a cheaper next start; `0B`
     /// keeps none.
-    #[serde(default)]
+    #[serde(default = "default_warm_memory")]
     pub warm_memory: ByteSize,
     /// Unused pool slots kept warm rather than torn down.
     #[serde(default = "default_warm_slots")]
@@ -354,7 +354,7 @@ impl Default for SandboxConfig {
             network_allowed_hosts: default_network_allowed_hosts(),
             max_instances: default_max_instances(),
             max_memory: default_max_memory(),
-            warm_memory: ByteSize::from_mib(0),
+            warm_memory: default_warm_memory(),
             warm_slots: default_warm_slots(),
         }
     }
@@ -372,13 +372,16 @@ impl SandboxConfig {
 }
 
 fn default_max_instances() -> u32 {
-    1000
+    2048
 }
 fn default_max_memory() -> ByteSize {
     ByteSize::from_mib(4096)
 }
+fn default_warm_memory() -> ByteSize {
+    ByteSize::from_mib(16)
+}
 fn default_warm_slots() -> u32 {
-    100
+    1024
 }
 fn default_scratch_dir() -> PathBuf {
     // wasm32 has no temp dir to ask for (`temp_dir` panics); the browser's

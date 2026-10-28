@@ -222,9 +222,16 @@ async fn run_one(
 
     // A frame of margin above the window (`7 * live_slots` covers every frame size): the ticket
     // check silently skips a continuation that lands inside the staging margin.
+    // When `ignore_eos` is active and per-token host work is zero, keep a
+    // deeper window (`16` frames) so 256-lane high-concurrency waves do not
+    // serialize on host-side frame-seal wakes between fast 2-step GPU batches.
     let (window_fires, out_capacity) = match input.run_ahead_frames {
         Some(r) => {
             let w = r.max(1) * live_slots;
+            (w, w + 1 + 7 * live_slots)
+        }
+        None if input.ignore_eos && input.wasm_delay_us == 0 => {
+            let w = (12 * live_slots).max(channel_capacity() - 1);
             (w, w + 1 + 7 * live_slots)
         }
         None => {
@@ -319,7 +326,13 @@ async fn run_one(
                         mut submitted: usize,
                         drained: usize|
      -> std::result::Result<usize, String> {
-        while submitted < budget {
+        let burst_limit = if drained == 0 {
+            (5 * live_slots).min(window_fires)
+        } else {
+            (2 * live_slots).min(window_fires)
+        };
+        let mut burst = 0usize;
+        while submitted < budget && burst < burst_limit {
             let s = (budget - submitted).min(live_slots);
             if submitted - drained + s > window_fires {
                 break;
@@ -327,6 +340,7 @@ async fn run_one(
             let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(fwd)).collect();
             submit_frame(&pipe, &slots).context("decode frame submit")?;
             submitted += s;
+            burst += s;
         }
         Ok(submitted)
     };
@@ -373,7 +387,8 @@ async fn run_one(
         }
     }
 
-    // Close early: the other lanes' frame seals stop waiting on this one.
+    // Close as soon as all `budget` fires are submitted so the other lanes'
+    // last frame seals do not wait on this lane's final host take.
     let mut closed = false;
     if submitted >= budget {
         pipe.close();
@@ -416,14 +431,16 @@ async fn run_one(
         }
         // Refill the window after draining an accepted token. A stopped lane
         // `continue`s above and never reaches here, so it never submits more.
-        submitted = submit_ahead(
-            fwd_d.as_ref().expect("decode pass exists while budget > 0"),
-            submitted,
-            taken,
-        )?;
-        if !closed && submitted >= budget {
-            pipe.close();
-            closed = true;
+        if submitted < budget && submitted - taken + live_slots <= window_fires {
+            submitted = submit_ahead(
+                fwd_d.as_ref().expect("decode pass exists while budget > 0"),
+                submitted,
+                taken,
+            )?;
+            if !closed && submitted >= budget {
+                pipe.close();
+                closed = true;
+            }
         }
     }
     if !closed {

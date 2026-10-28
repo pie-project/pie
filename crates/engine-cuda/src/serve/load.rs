@@ -145,7 +145,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // a product's epilogue is its contraction skeleton's.
     #[cfg(not(feature = "rocm"))]
     let anchored = if profile.synth_anchors {
-        let (folded, anchored) = crate::synth::fold_anchors(boot.trace.clone());
+        let skinny = !profile.synth_regions
+            || kernels_cuda::tuning::Tuning::of(&chip).gemm_skinny_rows > 0;
+        let (folded, anchored) = crate::synth::fold_anchors_with(boot.trace.clone(), skinny);
         boot.trace = folded;
         anchored
     } else {

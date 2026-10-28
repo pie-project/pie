@@ -55,8 +55,22 @@ pub(crate) static NONE: Regions = Regions {
 #[cfg(not(feature = "rocm"))]
 #[must_use]
 pub fn fold_anchors(trace: Trace) -> (Trace, BTreeMap<u64, Anchored>) {
+    fold_anchors_with(trace, true)
+}
+
+/// [`fold_anchors`], keeping plain dense rounded epilogues for [`chain::fold`]
+/// where `skinny` is `false` (no skinny contraction skeleton is active, and
+/// `compiler.synth_regions` will fuse a trailing residual add with its norm).
+#[cfg(not(feature = "rocm"))]
+#[must_use]
+pub fn fold_anchors_with(trace: Trace, skinny: bool) -> (Trace, BTreeMap<u64, Anchored>) {
     poem_compiler::fuse::anchor::fold(trace, &|anchored, ins, outs| {
-        kernels_cuda::linear::skeleton::serves(anchored, ins, outs).is_ok()
+        let worth = skinny
+            || !anchored.paged.is_empty()
+            || !anchored.windows.is_empty()
+            || anchored.contraction.layout != kernels_ir::Layout::Dense
+            || anchored.contraction.acc.is_none();
+        worth && kernels_cuda::linear::skeleton::serves(anchored, ins, outs).is_ok()
     })
 }
 
