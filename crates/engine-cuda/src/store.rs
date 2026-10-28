@@ -2708,7 +2708,9 @@ mod tests {
         let chunk = shelf.chunks[0].as_ref().expect("backed");
         assert!(chunk.registered(), "a shelf chunk registers its mapping");
         assert_ne!(chunk.device(), 0, "and maps it for the device");
-        let at = shelf.at(127, 1).expect("the chunk's last slot's last plane");
+        let at = shelf
+            .at(127, 1)
+            .expect("the chunk's last slot's last plane");
         // SAFETY: inside the chunk just pinned, 1 MiB a plane a slot.
         unsafe { core::ptr::write_bytes(at as *mut u8, 7, 1 << 20) };
     }
