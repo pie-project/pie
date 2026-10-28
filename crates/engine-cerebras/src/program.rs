@@ -843,6 +843,66 @@ impl Plane {
     }
 
     #[must_use]
+    /// The outputs `instance`'s program reads from a fire: (name, the pass's
+    /// lane). An engine running guests in the interpreter feeds these.
+    pub fn outputs_of(&self, instance: InstanceId) -> Vec<(String, u32)> {
+        self.instances.get(&instance).map_or_else(Vec::new, |seat| {
+            seat.plan
+                .outputs()
+                .into_iter()
+                .map(|(name, k)| (name.to_string(), k))
+                .collect()
+        })
+    }
+
+    /// Whether `instance`'s program reads output `name` only through
+    /// `reduce_argmax` (reshapes between allowed): its passes then answer the
+    /// same over any row with the same argmax, so the logits themselves need
+    /// not come back. Every other output it reads makes it `false`.
+    pub fn greedy_reads(&self, instance: InstanceId, name: &str) -> bool {
+        use eta_compiler::codegen::launch::ValueOrigin;
+        use eta_ir::op::tags;
+        let Some(seat) = self.instances.get(&instance) else {
+            return false;
+        };
+        let package = &seat.plan.package;
+        let mut rows: Vec<u32> = Vec::new();
+        for value in &package.values {
+            if value.source == ValueOrigin::Output {
+                if value.output.as_deref() != Some(name) {
+                    return false;
+                }
+                rows.push(value.id);
+            }
+        }
+        if rows.is_empty() {
+            return false;
+        }
+        let ops: Vec<&eta_compiler::codegen::launch::LaunchOp> =
+            package.stages.iter().flat_map(|stage| &stage.ops).collect();
+        // Follow the logits through reshapes; any other reader is a no.
+        while let Some(value) = rows.pop() {
+            if package
+                .stages
+                .iter()
+                .any(|stage| stage.puts.iter().any(|put| put.value == value))
+            {
+                return false;
+            }
+            for op in &ops {
+                if !op.reads().any(|read| read == value) {
+                    continue;
+                }
+                match op.tag {
+                    tags::REDUCE_ARGMAX => {}
+                    tags::RESHAPE => rows.push(op.result_id),
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
     pub fn prologue_runs(&self, instance: InstanceId) -> bool {
         self.instances
             .get(&instance)

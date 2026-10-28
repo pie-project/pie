@@ -1,0 +1,464 @@
+param memcpy_params;
+param Ht: u16;
+param Vr: u16;
+param hidden: u16;
+param iters: u16;
+param vocab: u32;   // real vocabulary; rows past it are padding
+// Uniform over the program: the strip geometry (serve28s: a PE derives its
+// place, roles and colors from its coordinates at the init launch, so all
+// PEs of a kind share one image).
+param W: u16;
+param HA: u16;          // attention rows a layer
+param HM: u16;          // MLP rows a layer
+param lps: u16;         // layers a strip
+param NS: u16;          // layer strips (the head's strip is NS)
+param band_rows: u16;
+param seg_rows: u16;
+param HH: u16;          // the head's rows
+const LH: u16 = HA + HM;
+const BODY: u16 = lps * LH;
+const C = @import_module("colors.csl");
+const rt = @import_module("rt.csl");
+
+// This PE's strip and logical row (0 = the strip's entry side), and the
+// router codes of the strip's logical north and south.
+var strip: u16 = 0;
+var flip: bool = false;
+var ly: u16 = 0;
+var rx_up: u16 = 0;
+var tx_up: u16 = 0;
+var rx_dn: u16 = 0;
+var tx_dn: u16 = 0;
+fn place() void {
+  const gx = rt.x_coord();
+  const gy = rt.y_coord();
+  strip = gx / W;
+  px = gx % W;
+  flip = strip % 2 == 1;
+  ly = if (flip) BODY - gy else gy - 1;
+  rx_up = if (flip) rt.RX_S else rt.RX_N;
+  tx_up = if (flip) rt.TX_S else rt.TX_N;
+  rx_dn = if (flip) rt.RX_N else rt.RX_S;
+  tx_dn = if (flip) rt.TX_N else rt.TX_S;
+}
+
+var px: u16 = 0;
+var py: u16 = 0;    // the head's row
+// Structural roles (they select the code's async ops, so they stay comptime:
+// a few row and column classes a kind).
+param west: bool;
+param east: bool;
+param top: bool;
+param bottom: bool;
+const x_color = C.KX;
+const tw_color = C.KTW;
+const tb_color = C.KTB;
+
+
+// Queues 0 and 1 are memcpy's; an async op runs on its queue id's
+// microthread, shared by input and output queue N. No PE receives its own
+// multicast (the top row its x, the east column its TW, the bottom east PE
+// its TB), so no id has a send and a receive pending together.
+const x_oq: output_queue = @get_output_queue(2);
+const x_iq: input_queue = @get_input_queue(2);
+const e_oq: output_queue = @get_output_queue(3);
+const e_iq: input_queue = @get_input_queue(3);
+const tw_oq: output_queue = @get_output_queue(4);
+const tw_iq: input_queue = @get_input_queue(4);
+const v_oq: output_queue = @get_output_queue(5);
+const v_iq: input_queue = @get_input_queue(5);
+const tb_oq: output_queue = @get_output_queue(6);
+const tb_iq: input_queue = @get_input_queue(6);
+const emb_oq: output_queue = @get_output_queue(7);
+const emb_iq: input_queue = @get_input_queue(7);
+
+const EXIT: local_task_id = @get_local_task_id(8);
+const NORM_BC: local_task_id = @get_local_task_id(9);
+const NORM_DONE: local_task_id = @get_local_task_id(10);
+const LOGITS: local_task_id = @get_local_task_id(11);
+const ARG1: local_task_id = @get_local_task_id(12);
+const ARG_BC: local_task_id = @get_local_task_id(13);
+const ARG_GOT: local_task_id = @get_local_task_id(14);
+const TOKEN: local_task_id = @get_local_task_id(15);
+const NEXT: local_task_id = @get_local_task_id(16);
+const STEP: local_task_id = @get_local_task_id(17);
+const NORM_START: local_task_id = @get_local_task_id(18);
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+const math = @import_module("<math>");
+
+// x and 1/rms (the top row's; elsewhere the multicast's); gamma; the E block
+// (Vr vocabulary rows x this column's Ht dims), column-major.
+var x = @zeros([Ht + 1]f32);
+var x_ptr: [*]f32 = &x;
+const x_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht} -> x[i] });
+const x_ext = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht + 1} -> x[i] });
+var gamma = @zeros([Ht]f32);
+var gamma_ptr: [*]f32 = &gamma;
+const gamma_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht} -> gamma[i] });
+var xn = @zeros([Ht]f32);
+const xn_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht} -> xn[i] });
+// Host-filled buffers live outside the program image (serve28s3), from a fixed
+// address above the image's end (check_elf.py checks it) and well below the
+// top of memory: loading the program does not write them; init points their
+// pointers and DSDs there, and the host's transfers go through the pointers.
+const BUF_BASE: u16 = 0x3800;
+const EMB_ADDR: u16 = BUF_BASE;
+var emb_ptr: [*]f32 = &dummy;
+var emb_col0 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> dummy[i] });
+
+var logits = @zeros([Vr]f32);
+var logits_ptr: [*]f32 = &logits;
+const logits_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> logits[i] });
+var tmp = @zeros([Vr]f32);
+const tmp_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> tmp[i] });
+var one = @zeros([1]f32);   // the value a fold or broadcast carries
+const one_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> one[i] });
+var local_max: f32 = 0.0;
+var local_idx: f32 = 0.0;
+var arg_pass: u16 = 0;
+var token: u32 = 0;
+var row_out = @zeros([Ht]f32);
+const row_out_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht} -> row_out[i] });
+
+// The request: [steps, start position], written by the host before each
+// launch (a launch serves one request; positions carry on across launches,
+// so the KV cache persists).
+var run_cfg = @zeros([2]u32);
+var run_cfg_ptr: [*]u32 = &run_cfg;
+// The bottom-east PE: tokens to force (SAMPLE = take the argmax), by head
+// iteration, and every iteration's argmax but the bootstrap's (iteration i's
+// at i - 1). `iters` is their capacity.
+const SAMPLE: u32 = 0xFFFFFFFF;
+var in_tokens = @zeros([iters]u32);
+var in_tokens_ptr: [*]u32 = &in_tokens;
+var out_tokens = @zeros([iters]f32);
+var out_tokens_ptr: [*]f32 = &out_tokens;
+var tokens = @zeros([iters]f32);   // the top-left PE's record
+var tokens_ptr: [*]f32 = &tokens;
+var t_start = @zeros([timestamp.tsc_size_words]u16);
+var t_end = @zeros([timestamp.tsc_size_words]u16);
+var cycles = @zeros([2]u32);
+var cycles_ptr: [*]u32 = &cycles;
+var iter: u16 = 0;
+var dummy = @zeros([1]f32);
+var dummy_ptr: [*]f32 = &dummy;
+var dummy_u = @zeros([1]u32);
+var dummy_u_ptr: [*]u32 = &dummy_u;
+var norm_mode: bool = true;   // TW carries the norm's total, then the token
+
+fn tsc(t: *[timestamp.tsc_size_words]u16) u64 {
+  return @as(u64, t.*[0]) | (@as(u64, t.*[1]) << 16) | (@as(u64, t.*[2]) << 32);
+}
+fn fab_out(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fab_in(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+
+// buf (+) the west's, eastward.
+fn fold_east(buf: mem1d_dsd, n: u16, then_mid: local_task_id, then_east: local_task_id) void {
+  if (west) {
+    @fmovs(fab_out(e_oq, n), buf, .{ .async = true, .activate = then_mid });
+  } else if (east) {
+    @fadds(buf, buf, fab_in(e_iq, n), .{ .async = true, .activate = then_east });
+  } else {
+    @fadds(fab_out(e_oq, n), buf, fab_in(e_iq, n), .{ .async = true, .activate = then_mid });
+  }
+}
+
+// The east PE sends one word west; the others take it.
+fn west_word(then: local_task_id) void {
+  if (east) {
+    @fmovs(fab_out(tw_oq, 1), one_dsd, .{ .async = true, .activate = then });
+  } else {
+    @fmovs(one_dsd, fab_in(tw_iq, 1), .{ .async = true, .activate = then });
+  }
+}
+
+fn begin() void {
+  if (top and iter == 0) {
+    // The bootstrap: no layer output yet; its logits are discarded and its
+    // token forced (the request's first).
+    @fmovs(x_dsd, 0.0);
+    @activate(NORM_START);
+  } else if (top) {
+    // The last layer's output is this step's x.
+    @fmovs(x_dsd, fab_in(x_iq, Ht), .{ .async = true, .activate = NORM_START });
+  } else {
+    @fmovs(x_ext, fab_in(x_iq, Ht + 1), .{ .async = true, .activate = LOGITS });
+  }
+}
+
+task norm_start() void {
+  {
+    var acc: f32 = 0.0;
+    for (@range(u16, Ht)) |i| { acc += x[i] * x[i]; }
+    one[0] = acc;
+    norm_mode = true;
+    fold_east(one_dsd, 1, NORM_BC, NORM_BC);
+  }
+}
+
+// A request: [steps, start position] as the launch's arguments (serve28s2;
+// run_cfg stays exported for the old path).
+fn compute(steps: u32, start_pos_arg: u32) void {
+  run_cfg[0] = steps;
+  run_cfg[1] = start_pos_arg;
+  timestamp.enable_tsc();
+  timestamp.get_timestamp(&t_start);
+  iter = 0;
+  begin();
+}
+
+task norm_bc() void {
+  west_word(NORM_DONE);
+}
+
+task norm_done() void {
+  x[Ht] = 1.0 / math.sqrt_f32(one[0] / @as(f32, hidden) + 1.0e-6);
+  // LOGITS once the send is out: ut2 takes the next step's x after it.
+  @fmovs(fab_out(x_oq, Ht + 1), x_ext, .{ .async = true, .activate = LOGITS });
+}
+
+// Partial logits of this PE's vocabulary rows, folded east.
+task logits_task() void {
+  @fmuls(xn_dsd, x_dsd, x[Ht]);
+  @fmuls(xn_dsd, xn_dsd, gamma_dsd);
+  @fmovs(logits_dsd, 0.0);
+  for (@range(u16, Ht)) |j| {
+    @fmacs(logits_dsd, logits_dsd, @increment_dsd_offset(emb_col0, @as(i16, j * Vr), f32), xn[j]);
+  }
+  fold_east(logits_dsd, Vr, TOKEN, ARG1);
+}
+
+// A south fold (max) of `one` along the east column; the bottom PE sends the
+// result north; every east PE continues at ARG_GOT with it.
+fn fold_south_max() void {
+  if (top) {
+    @fmovs(fab_out(v_oq, 1), one_dsd, .{ .async = true, .activate = ARG_BC });
+  } else if (bottom) {
+    @fmaxs(one_dsd, one_dsd, fab_in(v_iq, 1), .{ .async = true, .activate = ARG_BC });
+  } else {
+    @fmaxs(fab_out(v_oq, 1), one_dsd, fab_in(v_iq, 1), .{ .async = true, .activate = ARG_BC });
+  }
+}
+
+// The east column: this row's max and its first index, then the column folds.
+task arg1() void {
+  // Padding rows past the vocabulary never win.
+  for (@range(u16, Vr)) |i| {
+    if (@as(u32, py) * @as(u32, Vr) + @as(u32, i) >= vocab) { logits[i] = -1.0e30; }
+  }
+  @fmovs(tmp_dsd, logits_dsd);
+  var n: u16 = Vr;
+  while (n > 1) {
+    const half = (n + 1) / 2;
+    const lo = @set_dsd_length(tmp_dsd, n / 2);
+    const hi = @increment_dsd_offset(lo, @as(i16, half), f32);
+    @fmaxs(lo, lo, hi);
+    n = half;
+  }
+  local_max = tmp[0];
+  var i: u16 = 0;
+  while (i < Vr and logits[i] != local_max) : (i += 1) {}
+  local_idx = @as(f32, @as(u32, py) * @as(u32, Vr) + @as(u32, i));
+  one[0] = local_max;
+  arg_pass = 1;
+  fold_south_max();
+}
+
+task arg_bc() void {
+  if (bottom and arg_pass == 2) {
+    // one = -argmax. Record it (the bootstrap's is meaningless), then force
+    // the request's token if it names one.
+    if (iter > 0) { out_tokens[iter - 1] = -one[0]; }
+    if (in_tokens[iter] != SAMPLE) { one[0] = -@as(f32, in_tokens[iter]); }
+  }
+  if (bottom) {
+    @fmovs(fab_out(tb_oq, 1), one_dsd, .{ .async = true, .activate = ARG_GOT });
+  } else {
+    @fmovs(one_dsd, fab_in(tb_iq, 1), .{ .async = true, .activate = ARG_GOT });
+  }
+}
+
+task arg_got() void {
+  if (arg_pass == 1) {
+    arg_pass = 2;
+    one[0] = if (local_max == one[0]) -local_idx else -3.0e38;
+    fold_south_max();
+    return;
+  }
+  // one = -token: west along every row.
+  one[0] = -one[0];
+  norm_mode = false;
+  west_word(TOKEN);
+}
+
+// Every PE knows the token (non-east PEs reach here after their logits fold
+// via the TW receive): the token's E row folds north, the others adding zeros.
+var waiting_token: bool = false;
+task token_task() void {
+  if (!east and !waiting_token) {
+    // After the logits fold: now wait for the token from the east.
+    waiting_token = true;
+    west_word(TOKEN);
+    return;
+  }
+  waiting_token = false;
+  token = @as(u32, one[0]);
+  if (@as(u32, iter) == run_cfg[0]) {
+    // The last iteration: its argmax is the answer; nothing goes to layer 0.
+    @activate(STEP);
+    return;
+  }
+  @fmovs(row_out_dsd, 0.0);
+  if (token / @as(u32, Vr) == @as(u32, py)) {
+    const r = @as(u16, token - @as(u32, py) * @as(u32, Vr));
+    for (@range(u16, Ht)) |j| { row_out[j] = emb_ptr[j * Vr + r]; }
+  }
+  if (bottom) {
+    @fmovs(fab_out(emb_oq, Ht), row_out_dsd, .{ .async = true, .activate = STEP });
+  } else if (top) {
+    @fadds(x_dsd, row_out_dsd, fab_in(emb_iq, Ht), .{ .async = true, .activate = NEXT });
+  } else {
+    @fadds(fab_out(emb_oq, Ht), row_out_dsd, fab_in(emb_iq, Ht), .{ .async = true, .activate = STEP });
+  }
+}
+
+// The top row has the token's embedding: up to layer 0 as the next x.
+task next_task() void {
+  if (west) { tokens[iter] = one[0]; }
+  @fmovs(fab_out(emb_oq, Ht), x_dsd, .{ .async = true, .activate = STEP });
+}
+
+task step_task() void {
+  iter += 1;
+  if (@as(u32, iter) <= run_cfg[0]) {
+    begin();
+  } else {
+    timestamp.get_timestamp(&t_end);
+    const dt: u64 = tsc(&t_end) - tsc(&t_start);
+    cycles[0] = @as(u32, dt & 0xffffffff);
+    cycles[1] = @as(u32, dt >> 32);
+    @activate(EXIT);
+  }
+}
+
+task f_exit() void {
+  sys_mod.unblock_cmd_stream();
+}
+
+// The init launch: this PE's place, queue colors and routes.
+fn init() void {
+  emb_ptr = @bitcast([*]f32, EMB_ADDR);
+  emb_col0 = @set_dsd_base_addr(emb_col0, emb_ptr);
+  place();
+  py = ly;
+  const xp = px % 2 == 0;
+  const hp = py % 2 == 0;
+  // The top row takes no x multicast and sends no EMB: its x input is the
+  // last layer's output (VOUT), its EMB output the next x (VIN).
+  rt.iq_color(2, if (top) rt.cn(C.VOUT) else rt.cn(C.KX));
+  rt.oq_color(3, if (xp) rt.cn(C.KA) else rt.cn(C.KB));
+  rt.iq_color(3, if (xp) rt.cn(C.KB) else rt.cn(C.KA));
+  rt.oq_color(5, if (hp) rt.cn(C.KV0) else rt.cn(C.KV1));
+  rt.iq_color(5, if (hp) rt.cn(C.KV1) else rt.cn(C.KV0));
+  rt.oq_color(7, if (top) rt.cn(C.VIN) else (if (hp) rt.cn(C.KEMB0) else rt.cn(C.KEMB1)));
+  rt.iq_color(7, if (hp) rt.cn(C.KEMB1) else rt.cn(C.KEMB0));
+
+  if (top) {
+    rt.route(C.KX, rt.RX_R, tx_dn);
+    rt.route(C.VOUT, rx_up, rt.TX_R);
+    rt.route(C.VIN, rt.RX_R, tx_up);
+  } else if (bottom) {
+    rt.route(C.KX, rx_up, rt.TX_R);
+  } else {
+    rt.route(C.KX, rx_up, rt.TX_R | tx_dn);
+  }
+  if (!east) { rt.route2(C.KA, C.KB, xp, rt.RX_R, rt.TX_E); }
+  if (!west) { rt.route2(C.KB, C.KA, xp, rt.RX_W, rt.TX_R); }
+  if (east) {
+    rt.route(C.KTW, rt.RX_R, rt.TX_W);
+  } else if (west) {
+    rt.route(C.KTW, rt.RX_E, rt.TX_R);
+  } else {
+    rt.route(C.KTW, rt.RX_E, rt.TX_R | rt.TX_W);
+  }
+  if (east) {
+    if (!bottom) { rt.route2(C.KV0, C.KV1, hp, rt.RX_R, tx_dn); }
+    if (!top) { rt.route2(C.KV1, C.KV0, hp, rx_up, rt.TX_R); }
+    if (bottom) {
+      rt.route(C.KTB, rt.RX_R, tx_up);
+    } else if (top) {
+      rt.route(C.KTB, rx_dn, rt.TX_R);
+    } else {
+      rt.route(C.KTB, rx_dn, rt.TX_R | tx_up);
+    }
+  }
+  if (!top) { rt.route2(C.KEMB0, C.KEMB1, hp, rt.RX_R, tx_up); }
+  if (!bottom) { rt.route2(C.KEMB1, C.KEMB0, hp, rx_dn, rt.TX_R); }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @bind_local_task(norm_bc, NORM_BC);
+  @bind_local_task(norm_done, NORM_DONE);
+  @bind_local_task(logits_task, LOGITS);
+  @bind_local_task(arg1, ARG1);
+  @bind_local_task(arg_bc, ARG_BC);
+  @bind_local_task(arg_got, ARG_GOT);
+  @bind_local_task(token_task, TOKEN);
+  @bind_local_task(next_task, NEXT);
+  @bind_local_task(step_task, STEP);
+  @bind_local_task(norm_start, NORM_START);
+  @bind_local_task(f_exit, EXIT);
+
+  @initialize_queue(x_oq, .{ .color = x_color });
+  // The top row takes no x multicast and sends no EMB: its x input is the
+  // last layer's output, its EMB output the YUP to layer 0.
+  @initialize_queue(x_iq, .{ .color = x_color });   // defaults; init sets each PE's own
+  @initialize_queue(e_oq, .{ .color = C.KA });
+  @initialize_queue(e_iq, .{ .color = C.KB });
+  @initialize_queue(tw_oq, .{ .color = tw_color });
+  @initialize_queue(tw_iq, .{ .color = tw_color });
+  @initialize_queue(v_oq, .{ .color = C.KV0 });
+  @initialize_queue(v_iq, .{ .color = C.KV1 });
+  @initialize_queue(tb_oq, .{ .color = tb_color });
+  @initialize_queue(tb_iq, .{ .color = tb_color });
+  @initialize_queue(emb_oq, .{ .color = C.KEMB0 });
+  @initialize_queue(emb_iq, .{ .color = C.KEMB1 });
+
+  @export_symbol(emb_ptr, "emb");
+  @export_symbol(gamma_ptr, "hgamma");
+  @export_symbol(tokens_ptr, "tokens");
+  @export_symbol(cycles_ptr, "hcycles");
+  // The layers' symbols, so every PE has every exported name.
+  @export_symbol(dummy_ptr, "x");
+  @export_symbol(dummy_ptr, "gamma");
+  @export_symbol(dummy_ptr, "inv_freq");
+  @export_symbol(dummy_ptr, "qkn_w");
+  @export_symbol(dummy_ptr, "prompt");
+  @export_symbol(dummy_u_ptr, "prompt_len");
+  @export_symbol(run_cfg_ptr, "run_cfg");
+  @export_symbol(in_tokens_ptr, "in_tokens");
+  @export_symbol(out_tokens_ptr, "out_tokens");
+  @export_symbol(logits_ptr, "hlogits");
+  @export_symbol(dummy_ptr, "wqkv");
+  @export_symbol(dummy_ptr, "wo");
+  @export_symbol(dummy_ptr, "k");
+  @export_symbol(dummy_ptr, "v");
+  @export_symbol(dummy_ptr, "y");
+  @export_symbol(dummy_u_ptr, "cycles");
+  @export_symbol(dummy_ptr, "gu");
+  @export_symbol(dummy_ptr, "down");
+  @export_symbol(dummy_ptr, "gamma2");
+  @export_symbol(dummy_ptr, "out");
+  @export_symbol(dummy_u_ptr, "prof");
+  @export_symbol(dummy_u_ptr, "mprof");
+  @export_symbol(dummy_ptr, "out_hist");
+  @export_symbol(compute);
+  @export_symbol(init);
+}

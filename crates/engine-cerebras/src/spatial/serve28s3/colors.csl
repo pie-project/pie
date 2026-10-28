@@ -1,0 +1,42 @@
+// serve28s: every color, shared by the layout and the PE programs (routes and
+// queue colors are set by each PE at its init launch; see rt.csl).
+// Attention.
+const X: color = @get_color(0);
+const A: color = @get_color(1);
+const B: color = @get_color(2);
+const Q: color = @get_color(3);
+const S0: color = @get_color(4);
+const S1: color = @get_color(5);
+const P: color = @get_color(6);
+const O0: color = @get_color(7);
+const O1: color = @get_color(8);
+// MLP (reused numbers: other routers).
+const MX: color = @get_color(0);
+const MA: color = @get_color(1);
+const MB: color = @get_color(2);
+const MH: color = @get_color(3);
+const MC: color = @get_color(4);
+const MD: color = @get_color(5);
+const ME: color = @get_color(6);
+const MF: color = @get_color(7);
+// Crossing both.
+const YUP: color = @get_color(9);
+const HANDOFF: color = @get_color(10);
+const LHANDOFF: color = @get_color(11);
+// Strips <-> relay rows, and the relay conveyors.
+const VIN: color = @get_color(12);
+const VOUT: color = @get_color(13);
+const E0: color = @get_color(14);
+const E1: color = @get_color(15);
+const RW0: color = @get_color(16);
+const RW1: color = @get_color(17);
+// Head.
+const KX: color = @get_color(0);
+const KA: color = @get_color(1);
+const KB: color = @get_color(2);
+const KTW: color = @get_color(3);
+const KV0: color = @get_color(4);
+const KV1: color = @get_color(5);
+const KTB: color = @get_color(6);
+const KEMB0: color = @get_color(7);
+const KEMB1: color = @get_color(8);

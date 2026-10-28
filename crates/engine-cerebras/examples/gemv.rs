@@ -1,11 +1,15 @@
 //! Runs the SDK tutorial `gemv-03-memcpy` (y = A x + b on one PE) through the
-//! pure-Rust SDK binding on the fabric simulator.
+//! pure-Rust SDK binding on the fabric simulator or a CS system.
 //!
 //! ```text
 //! cd $CEREBRAS_SDK_ROOT/examples/tutorials/gemv-03-memcpy
 //! cslc --arch=wse3 ./layout.csl --fabric-dims=8,3 --fabric-offsets=4,1 -o out --memcpy --channels 1
 //! cargo run -p engine-cerebras --example gemv -- out [wse2|wse3]
 //! ```
+//!
+//! For hardware, compile for the system's full fabric dimensions and pass
+//! its `cmaddr` as the third argument. In appliance mode, run the binary
+//! through `SdkLauncher` and let it substitute `%CMADDR%` for the allocation.
 
 use engine_cerebras::sdk::{
     DataType, Order, Platform, Rect, Runtime, Sdk, Simulator, Target, f32_words, words_f32,
@@ -19,15 +23,13 @@ fn main() {
         Some("wse2") => Target::Wse2,
         _ => Target::Wse3,
     };
+    let platform = match args.next() {
+        Some(cmaddr) => Platform::System { cmaddr },
+        None => Platform::Simulator(Simulator::new(target)),
+    };
 
     let sdk = Sdk::open().expect("open Cerebras SDK");
-    let mut rt = Runtime::new(
-        sdk,
-        Path::new(&out),
-        Platform::Simulator(Simulator::new(target)),
-        "WARNING",
-    )
-    .expect("runtime");
+    let mut rt = Runtime::new(sdk, Path::new(&out), platform, "WARNING").expect("runtime");
     println!(
         "rpc symbols: {:?}",
         rt.rpc().symbols().keys().collect::<Vec<_>>()

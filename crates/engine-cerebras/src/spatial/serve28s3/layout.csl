@@ -1,0 +1,171 @@
+// serve28s3: serve28s2 with the host-filled buffers (weights, KV, the
+// embedding) outside the program image, so loading writes less.
+//
+// serve28s2: serve28s with the request as launch arguments and every async
+// send's completion tracked.
+//
+// serve28s: serve28 with shared program images. A PE's code depends only on
+// its kind (attention, MLP, head, relay, filler); everything positional (its
+// strip, row, column, band and segment roles, the flip of up strips) it
+// derives from its own coordinates at the init launch, which also sets its
+// queue colors and routes (rt.csl). So the program has a handful of distinct
+// images (kinds x memcpy's column classes) instead of one per PE.
+//
+// serve28: model28's placement running serve/'s request API (run_cfg
+// [steps, start position] on every PE, the head's bootstrap iteration and
+// forced tokens, KV kept across launches). Each relay round runs the return
+// conveyor first (the head's embedding of the step's input), then the east
+// conveyor (the step's layers).
+//
+// model28: the model of model/ spread over vertical strips of W columns,
+// lps layers a strip, strips alternating down and up (an up strip is the same
+// code with north and south swapped and its rows mirrored), then the head in a
+// strip of its own (up: the strip count is odd). Between strips a relay row
+// (row 0 at the top, row BODY + 1 at the bottom) carries a strip's output W
+// columns east as a conveyor; the head's next x goes back west along the
+// bottom relay row to strip 0's columns, then up strip 0 (YUP) to layer 0.
+//
+// From model/: a whole decoder model on one wafer program (docs/cerebras-spatial-design.md
+// §4c, §4d): a stack of `layers` qwen3-style layers (as in stack/) over the
+// head (as in head/: final norm, tied LM head, greedy argmax, embedding).
+// Every layer's output goes south into the next one's top row (LHANDOFF), the
+// last layer's into the head's top row; the head's top row sends the argmax's
+// embedding north through every layer to layer 0's top row (YUP), which takes
+// it as the next step's x once the prompt (held there) is used up. The host
+// is not in the loop. Each layer as in layer/: two stacked rectangles of one width: attention (attn_rows: bands of band_rows,
+// one a kv group) above the MLP (mlp_rows, south folds in segments of
+// seg_rows). The attention rectangle's bottom row hands h = x + attention
+// south to the MLP's top row (HANDOFF); the MLP's bottom row sends the
+// layer's output north through both rectangles to the attention top row
+// (YUP), the next step's x. Inside each rectangle colors are its own (their
+// routers are separate); HANDOFF and YUP cross both and use colors neither
+// uses inside.
+
+param kernel_cols: u16;   // W
+param attn_rows: u16;
+param mlp_rows: u16;
+param band_rows: u16;
+param seg_rows: u16;
+param hidden: u16;
+param heads: u16;         // query heads a kv group
+param head_dim: u16;
+param positions: u16;     // KV capacity a kv group
+param start_pos: u16;
+param inter: u16;
+param iters: u16;
+param layers: u16;
+param lps: u16;          // layers a strip
+param head_rows: u16;     // Hh: the head's rows
+param vocab_rows: u16;    // Vr: vocabulary rows a head row
+param prompt_max: u16;
+param vocab: u32;
+
+const NS: u16 = layers / lps;                       // layer strips (odd)
+const BODY: u16 = lps * (attn_rows + mlp_rows);     // rows a strip
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width = (NS + 1) * kernel_cols,
+  .height = BODY + 2
+});
+
+fn prow(flip: bool, ly: u16) u16 {
+  return if (flip) BODY - ly else 1 + ly;
+}
+
+layout {
+  const W = kernel_cols;
+  const HA = attn_rows;
+  const HM = mlp_rows;
+  const LH = HA + HM;   // rows a layer
+  const HH = head_rows;
+  @set_rectangle((NS + 1) * W, BODY + 2);
+  @comptime_assert(layers % lps == 0 and NS % 2 == 1);
+  @comptime_assert(HH <= BODY);
+  @comptime_assert(W > 1 and HA % band_rows == 0 and band_rows > 1);
+  @comptime_assert(HM % seg_rows == 0 and seg_rows > 1);
+  @comptime_assert(hidden % W == 0 and head_dim % band_rows == 0 and positions % W == 0);
+  @comptime_assert(inter % HM == 0);
+
+  for (@range(u16, (NS + 1) * W)) |gx| {
+    const memcpy_params = memcpy.get_params(gx);
+    const s = gx / W;
+    const px = gx % W;
+    const west = px == 0;
+    const east = px == W - 1;
+    for (@range(u16, BODY)) |ly| {
+      const py = prow(s % 2 == 1, ly);
+      if (s == NS) {
+        if (ly < HH) {
+          @set_tile_code(gx, py, "head_pe.csl", .{ .W = W, .HA = HA, .HM = HM, .lps = lps, .NS = NS, .band_rows = band_rows, .seg_rows = seg_rows, .HH = HH,
+            .memcpy_params = memcpy_params,
+            .Ht = hidden / W, .Vr = vocab_rows, .hidden = hidden, .iters = iters,
+            .vocab = vocab,
+            .west = west, .east = east, .top = ly == 0, .bottom = ly == HH - 1 });
+        } else {
+          @set_tile_code(gx, py, "filler_pe.csl", .{ .memcpy_params = memcpy_params });
+        }
+      } else if (ly % LH < HA) {
+        @set_tile_code(gx, py, "attn_pe.csl", .{ .W = W, .HA = HA, .HM = HM, .lps = lps, .NS = NS, .band_rows = band_rows, .seg_rows = seg_rows, .HH = HH,
+          .memcpy_params = memcpy_params,
+          .Ht = hidden / W, .G = heads, .Dr = head_dim / band_rows, .Tc = positions / W,
+          .iters = iters, .start_pos = start_pos, .hidden = hidden,
+          .band_rows_f = band_rows, .prompt_max = prompt_max,
+          .west = west, .east = east, .top = ly % LH == 0, .bottom = ly % LH == HA - 1,
+          .btop = (ly % LH) % band_rows == 0, .bbottom = (ly % LH) % band_rows == band_rows - 1 });
+      } else {
+        const m = ly % LH - HA;
+        const r = m % seg_rows;
+        const seg = m / seg_rows;
+        const head = r == seg_rows - 1;
+        @set_tile_code(gx, py, "mlp_pe.csl", .{ .W = W, .HA = HA, .HM = HM, .lps = lps, .NS = NS, .band_rows = band_rows, .seg_rows = seg_rows, .HH = HH,
+          .memcpy_params = memcpy_params,
+          .Ht = hidden / W, .It = inter / HM, .iters = iters, .hidden = hidden,
+          .west = west, .east = east, .top = m == 0, .head = head, .seg_first = r == 0,
+          .l2_first = head and seg == 0, .l2_last = head and seg + 1 == HM / seg_rows });
+      }
+    }
+    // Relay rows: a relay PE where a conveyor passes (every bottom-row PE
+    // carries the return; the east conveyors alternate rows), else a filler.
+    for (@range(u16, 2)) |which| {
+      const bottom_row = which == 1;
+      const py: u16 = if (bottom_row) BODY + 1 else 0;
+      const c = if ((s % 2 == 0) == bottom_row) s else (if (s == 0) 9999 else s - 1);
+      if (c < NS or bottom_row) {
+        @set_tile_code(gx, py, "relay_pe.csl", .{
+          .memcpy_params = memcpy_params, .Ht = hidden / W, .W = W, .NS = NS,
+          .HA = HA, .HM = HM, .lps = lps });
+      } else {
+        @set_tile_code(gx, py, "filler_pe.csl", .{ .memcpy_params = memcpy_params });
+      }
+    }
+  }
+
+  @export_name("x", [*]f32, true);
+  @export_name("gamma", [*]f32, true);
+  @export_name("inv_freq", [*]f32, true);
+  @export_name("qkn_w", [*]f32, true);
+  @export_name("prompt", [*]f32, true);
+  @export_name("prompt_len", [*]u32, true);
+  @export_name("emb", [*]f32, true);
+  @export_name("hgamma", [*]f32, true);
+  @export_name("tokens", [*]f32, true);
+  @export_name("hcycles", [*]u32, true);
+  @export_name("wqkv", [*]f32, true);
+  @export_name("wo", [*]f32, true);
+  @export_name("k", [*]f32, true);
+  @export_name("v", [*]f32, true);
+  @export_name("y", [*]f32, true);
+  @export_name("cycles", [*]u32, true);
+  @export_name("gu", [*]f32, true);
+  @export_name("down", [*]f32, true);
+  @export_name("gamma2", [*]f32, true);
+  @export_name("out", [*]f32, true);
+  @export_name("out_hist", [*]f32, true);
+  @export_name("prof", [*]u32, true);
+  @export_name("mprof", [*]u32, true);
+  @export_name("run_cfg", [*]u32, true);
+  @export_name("in_tokens", [*]u32, true);
+  @export_name("out_tokens", [*]f32, true);
+  @export_name("hlogits", [*]f32, true);
+  @export_name("compute", fn(u32, u32)void);
+  @export_name("init", fn()void);
+}

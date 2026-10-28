@@ -395,9 +395,22 @@ impl std::fmt::Debug for Device {
     }
 }
 
-fn disk_cache() -> PathBuf {
+/// The compile cache the boot config names (`[cerebras] cache_dir`: the
+/// worker's `$PIE_HOME/cache/cerebras`), set once when an engine opens.
+static CACHE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Sets the compile cache's default directory (the first call wins).
+pub fn set_cache_dir(dir: PathBuf) {
+    let _ = CACHE_DIR.set(dir);
+}
+
+/// Where compiled programs are cached: `PIE_CEREBRAS_CACHE`, else the boot
+/// config's `cache_dir`, else (no PIE home known: tests, examples)
+/// `$XDG_CACHE_HOME/pie/cerebras` or `~/.cache/pie/cerebras`.
+pub(crate) fn disk_cache() -> PathBuf {
     match std::env::var_os("PIE_CEREBRAS_CACHE") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ if CACHE_DIR.get().is_some() => CACHE_DIR.get().cloned().unwrap_or_default(),
         _ => std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
@@ -571,9 +584,14 @@ impl Device {
                 continue;
             }
             let hex = blake3::hash(phase.as_bytes()).to_hex().to_string();
-            let dir = self
-                .disk
-                .join(format!("{hex}-{}", target_name(self.platform.target())));
+            // A system's programs are laid out on the whole wafer, so they
+            // are cached apart from the simulator's.
+            let system = matches!(self.platform, Platform::System { .. });
+            let dir = self.disk.join(format!(
+                "{hex}-{}{}",
+                target_name(self.platform.target()),
+                if system { "-system" } else { "" }
+            ));
             let out = dir.join("out");
             // A finished compile leaves the RPC manifest and the PE binary;
             // a failed one (the linker out of PE memory) may leave the
@@ -590,13 +608,16 @@ impl Device {
                 std::fs::write(dir.join("pe.csl"), &rendered.pe).map_err(|e| io_fault(&dir, e))?;
                 let started = std::time::Instant::now();
                 let (w, h) = rendered.manifest.rect;
-                let compile = Compile::memcpy(
+                let mut compile = Compile::memcpy(
                     Arch::from(self.platform.target()),
                     dir.join("gather.csl"),
                     w,
                     h,
                     &out,
                 );
+                if system {
+                    compile.fabric_dims = wafer_dims(self.platform.target());
+                }
                 if let Err(e) = Cslc::find().and_then(|cslc| cslc.compile(&compile)) {
                     let _ = std::fs::remove_dir_all(&out);
                     return Err(Fault::Compile { why: e.to_string() });
@@ -4061,6 +4082,14 @@ fn target_name(target: Target) -> &'static str {
     match target {
         Target::Wse2 => "wse2",
         Target::Wse3 => "wse3",
+    }
+}
+
+/// The fabric a system program is compiled against: the whole wafer.
+pub(crate) fn wafer_dims(target: Target) -> (u32, u32) {
+    match target {
+        Target::Wse2 => (757, 996),
+        Target::Wse3 => (762, 1172),
     }
 }
 

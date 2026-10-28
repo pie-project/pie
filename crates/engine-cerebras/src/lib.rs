@@ -29,13 +29,14 @@ pub mod run;
 pub mod sdk;
 pub mod serve;
 pub mod settle;
+pub mod spatial;
 pub mod store;
 pub mod trace;
 pub mod weights;
 pub mod window;
 
 pub use api::{Cerebras, ContractFor, DeviceBoot};
-pub use boot::open;
+pub use boot::{open, open_engine};
 pub use error::{Fault, Result, kernel};
 pub use serve::{Boot, FireCost, Fired, Lane, Media, Seated, Shell};
 

@@ -286,6 +286,8 @@ pub struct RpcSymbol {
     pub id: u16,
     pub kind: RpcKind,
     pub ty: String,
+    /// A function's parameter count (`inputs`), 0 for variables.
+    pub inputs: usize,
 }
 
 /// The exported symbols of a compiled program, keyed by exported name.
@@ -318,12 +320,14 @@ impl Rpc {
                 other => return Err(Error::Rpc(format!("symbol {name} has kind {other:?}"))),
             };
             let ty = s["type"].as_str().unwrap_or_default().to_string();
+            let inputs = s["inputs"].as_array().map_or(0, Vec::len);
             symbols.insert(
                 name.to_string(),
                 RpcSymbol {
                     id: id as u16,
                     kind,
                     ty,
+                    inputs,
                 },
             );
         }
@@ -375,6 +379,9 @@ pub struct Runtime {
     _artifacts: Box<ArtifactsMem>,
     _platform: PlatformMem,
     running: bool,
+    /// Nonblocking calls not yet waited on, each with the host words it
+    /// reads (kept alive until its task is done).
+    pending: Vec<(Task, Vec<u32>)>,
 }
 
 impl Runtime {
@@ -443,6 +450,7 @@ impl Runtime {
             _artifacts: artifacts,
             _platform: platform,
             running: false,
+            pending: Vec::new(),
         })
     }
 
@@ -473,6 +481,7 @@ impl Runtime {
 
     /// Stops the program. Idempotent.
     pub fn stop(&mut self) {
+        self.wait_pending();
         if self.running {
             // SAFETY: constructed, running runtime.
             unsafe { (self.api().stop)(self.this()) }
@@ -571,6 +580,64 @@ impl Runtime {
         };
         self.finish(&mut task);
         Ok(())
+    }
+
+    /// Copies `data` into `symbol` like [`Runtime::memcpy_h2d`] without
+    /// waiting: the copy is queued ahead of later calls, and
+    /// [`Runtime::wait_pending`] (or any later blocking call's caller) ends it.
+    pub fn memcpy_h2d_nonblock(
+        &mut self,
+        symbol: &str,
+        data: Vec<u32>,
+        rect: Rect,
+        elems_per_pe: usize,
+        order: Order,
+        data_type: DataType,
+    ) -> Result<()> {
+        let id = self.rpc.id(symbol, RpcKind::Var)?;
+        self.check_size(symbol, rect, elems_per_pe, data.len())?;
+        let opts = MemcpyOptions::new(false, data_type as i32, order as i32, true);
+        let mut task = Task::empty();
+        // SAFETY: data moves into `pending` and lives until the task is waited on.
+        unsafe {
+            (self.api().memcpy_h2d)(
+                &mut task,
+                self.this(),
+                id,
+                data.as_ptr() as *mut c_void,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                elems_per_pe as i32,
+                &opts,
+            )
+        };
+        self.pending.push((task, data));
+        Ok(())
+    }
+
+    /// Launches `name` with `args` without waiting (see
+    /// [`Runtime::memcpy_h2d_nonblock`]).
+    pub fn launch_nonblock(&mut self, name: &str, args: &[u32]) -> Result<()> {
+        self.rpc.id(name, RpcKind::Func)?;
+        let name_s = CxxString::new(name);
+        let args = args.to_vec();
+        let vec = CxxVecU32::borrow(&args);
+        let opts = MemcpyOptions::new(false, 0, 0, true);
+        let mut task = Task::empty();
+        // SAFETY: mirrors are live for the call; the arguments stay alive in
+        // `pending` until the task is waited on.
+        unsafe { (self.api().call)(&mut task, self.this(), &*name_s, &vec, &opts) };
+        self.pending.push((task, args));
+        Ok(())
+    }
+
+    /// Waits for and releases every nonblocking call made so far.
+    pub fn wait_pending(&mut self) {
+        for (mut task, _words) in std::mem::take(&mut self.pending) {
+            self.finish(&mut task);
+        }
     }
 
     /// Launches the exported function `name` with `args` and waits for it.

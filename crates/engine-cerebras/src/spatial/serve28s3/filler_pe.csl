@@ -1,0 +1,57 @@
+// A PE with no part in the model (the head strip's unused rows, idle relay
+// PEs): it answers each launch and carries the exported names (run_cfg is
+// real: the host writes it on every PE).
+param memcpy_params;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+var dummy = @zeros([1]f32);
+var dummy_ptr: [*]f32 = &dummy;
+var dummy_u = @zeros([1]u32);
+var dummy_u_ptr: [*]u32 = &dummy_u;
+var run_cfg = @zeros([2]u32);
+var run_cfg_ptr: [*]u32 = &run_cfg;
+
+fn init() void {
+  sys_mod.unblock_cmd_stream();
+}
+
+// A request: [steps, start position] as the launch's arguments (serve28s2;
+// run_cfg stays exported for the old path).
+fn compute(steps: u32, start_pos_arg: u32) void {
+  run_cfg[0] = steps;
+  run_cfg[1] = start_pos_arg;
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @export_symbol(dummy_ptr, "x");
+  @export_symbol(dummy_ptr, "gamma");
+  @export_symbol(dummy_ptr, "inv_freq");
+  @export_symbol(dummy_ptr, "qkn_w");
+  @export_symbol(dummy_ptr, "prompt");
+  @export_symbol(dummy_u_ptr, "prompt_len");
+  @export_symbol(dummy_ptr, "emb");
+  @export_symbol(dummy_ptr, "hgamma");
+  @export_symbol(dummy_ptr, "tokens");
+  @export_symbol(dummy_u_ptr, "hcycles");
+  @export_symbol(dummy_ptr, "wqkv");
+  @export_symbol(dummy_ptr, "wo");
+  @export_symbol(dummy_ptr, "k");
+  @export_symbol(dummy_ptr, "v");
+  @export_symbol(dummy_ptr, "y");
+  @export_symbol(dummy_u_ptr, "cycles");
+  @export_symbol(dummy_ptr, "gu");
+  @export_symbol(dummy_ptr, "down");
+  @export_symbol(dummy_ptr, "gamma2");
+  @export_symbol(dummy_ptr, "out");
+  @export_symbol(dummy_ptr, "out_hist");
+  @export_symbol(dummy_u_ptr, "prof");
+  @export_symbol(dummy_u_ptr, "mprof");
+  @export_symbol(dummy_u_ptr, "in_tokens");
+  @export_symbol(dummy_ptr, "out_tokens");
+  @export_symbol(dummy_ptr, "hlogits");
+  @export_symbol(run_cfg_ptr, "run_cfg");
+  @export_symbol(compute);
+  @export_symbol(init);
+}

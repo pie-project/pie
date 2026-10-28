@@ -759,6 +759,15 @@ impl Shell {
         &self.device
     }
 
+    /// The name and width of the float output read at the readout rows, when
+    /// the plan reads one.
+    #[must_use]
+    pub fn readout_output(&self) -> Option<(String, u32)> {
+        (self.exports.iter())
+            .find(|out| out.decl.readout && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32))
+            .map(|out| (out.decl.name.clone(), out.decl.width))
+    }
+
     /// The width of the float output read at the readout rows, when the plan
     /// reads one.
     #[must_use]

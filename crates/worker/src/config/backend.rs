@@ -189,6 +189,28 @@ pub struct CerebrasEngineOptions {
     pub max_model_len: Option<u32>,
     /// Trace and compile the first fire shapes at load.
     pub prewarm: bool,
+    /// The spatial engine: the model forward in this daemon command (run
+    /// with `sh -c`, JSON lines; `spatial/serve` in the bring-up tree)
+    /// instead of the phase programs. Omit for the cerebras shell.
+    pub spatial_daemon: Option<String>,
+    /// The spatial engine with the wafer program in process instead of a
+    /// daemon: the compiled `serve28` program's output directory, run on
+    /// `cmaddr` (else the simulator).
+    pub spatial_program: Option<String>,
+    /// The spatial engine's wafer program compiled (and cached) from these
+    /// serve28 `--params` (`kernel_cols:64,hidden:1024,...`);
+    /// `spatial_program` overrides it.
+    pub spatial_params: Option<String>,
+    /// How requests reach the wafer program: `"args"` (serve28s3) or
+    /// `"run_cfg"`; omit to decide from the program.
+    pub spatial_launch: Option<String>,
+    /// Steps a greedy lane's token loop runs past its row in one wafer
+    /// launch (0: off); omit for the engine's default.
+    pub spatial_lookahead: Option<u32>,
+    /// The checkpoint the daemon loads; omit for the model's.
+    pub spatial_ckpt: Option<String>,
+    /// The daemon runs only the first this many layers; omit for all.
+    pub spatial_layers: Option<u32>,
 }
 
 impl Default for CerebrasEngineOptions {
@@ -202,6 +224,13 @@ impl Default for CerebrasEngineOptions {
             max_state_slots: None,
             max_model_len: None,
             prewarm: false,
+            spatial_daemon: None,
+            spatial_program: None,
+            spatial_params: None,
+            spatial_launch: None,
+            spatial_lookahead: None,
+            spatial_ckpt: None,
+            spatial_layers: None,
         }
     }
 }

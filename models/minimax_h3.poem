@@ -4,7 +4,7 @@
 
 load("//lib/spoken.poem", "QWEN_STOP")
 load("//lib/dit.poem", "adaln_order", "attend", "biased", "chunks", "linear", "reordered", "run_linear")
-load("//lib/qwen3.poem", "encoder", "qwen3_caches", "qwen3_encode", "te_read")
+load("//lib/qwen3_encoder.poem", "encoder", "qwen3_caches", "qwen3_encode", "te_read")
 
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])

@@ -174,14 +174,14 @@ impl Cerebras {
     }
 }
 
-fn refusal(refusal: crate::program::Refusal) -> Error {
+pub(crate) fn refusal(refusal: crate::program::Refusal) -> Error {
     match refusal {
         crate::program::Refusal::Closed { what, id } => Error::Closed { what, id },
         crate::program::Refusal::Program(why) => Error::Program(why),
     }
 }
 
-fn port_error(error: engine::ports::PortError) -> Error {
+pub(crate) fn port_error(error: engine::ports::PortError) -> Error {
     fault(Fault::Program {
         at: "program::ports",
         why: error.0,
@@ -223,9 +223,9 @@ pub(crate) fn fault(fault: Fault) -> Error {
     }
 }
 
-const DEFAULT_STATE_SLOTS: u32 = 4;
+pub(crate) const DEFAULT_STATE_SLOTS: u32 = 4;
 
-fn bake_budgets(budgets: &LoadBudgets) -> Budget {
+pub(crate) fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,

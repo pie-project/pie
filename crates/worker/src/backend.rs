@@ -818,11 +818,53 @@ pub(crate) fn create_engine_backend(
                 "[cerebras]\ntarget = {:?}\nnum_threads = {}\nprewarm = {}\n",
                 opts.target, opts.num_threads, opts.prewarm,
             );
+            // Compiled programs cache under the PIE home, as wasmtime's do.
+            boot_doc.push_str(&format!(
+                "cache_dir = {}\n",
+                toml::Value::String(home.join("cache").join("cerebras").display().to_string())
+            ));
             if let Some(cmaddr) = &opts.cmaddr {
                 boot_doc.push_str(&format!(
                     "cmaddr = {}\n",
                     toml::Value::String(cmaddr.clone())
                 ));
+            }
+            if opts.spatial_daemon.is_some()
+                || opts.spatial_program.is_some()
+                || opts.spatial_params.is_some()
+            {
+                boot_doc.push_str("[cerebras.spatial]\n");
+                if let Some(daemon) = &opts.spatial_daemon {
+                    boot_doc
+                        .push_str(&format!("daemon = {}\n", toml::Value::String(daemon.clone())));
+                }
+                if let Some(program) = &opts.spatial_program {
+                    boot_doc.push_str(&format!(
+                        "program = {}\n",
+                        toml::Value::String(program.clone())
+                    ));
+                }
+                if let Some(lookahead) = opts.spatial_lookahead {
+                    boot_doc.push_str(&format!("lookahead = {lookahead}\n"));
+                }
+                if let Some(launch) = &opts.spatial_launch {
+                    boot_doc.push_str(&format!(
+                        "launch = {}\n",
+                        toml::Value::String(launch.clone())
+                    ));
+                }
+                if let Some(params) = &opts.spatial_params {
+                    boot_doc.push_str(&format!(
+                        "params = {}\n",
+                        toml::Value::String(params.clone())
+                    ));
+                }
+                if let Some(ckpt) = &opts.spatial_ckpt {
+                    boot_doc.push_str(&format!("ckpt = {}\n", toml::Value::String(ckpt.clone())));
+                }
+                if let Some(layers) = opts.spatial_layers {
+                    boot_doc.push_str(&format!("layers = {layers}\n"));
+                }
             }
             let backend = runtime::engine::backend::open::cerebras(boot_doc.as_bytes())?;
             let defaults = engine::Budgets::default();

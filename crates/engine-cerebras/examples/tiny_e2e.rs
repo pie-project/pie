@@ -15,6 +15,7 @@
 //!
 //! The checkpoint goes to `/dev/shm/pie-cerebras-e2e/<model>.zt` (removed unless
 //! `--keep`). The device lock is held only while the shell is up.
+//! `PIE_E2E_CMADDR=<IP:port>` runs on a CS system instead of the simulator.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -110,7 +111,14 @@ fn run(
     let patches = engine_cerebras::api::patch_ladder(&trace, &budgets);
     let voxels = poem_compiler::VoxelLadder::of(&trace, Some(4096), Some(4), budgets.max_lanes);
     let t0 = Instant::now();
-    let device_boot = DeviceBoot::default();
+    // `PIE_E2E_CMADDR` (a CS system's `IP:port`) runs on that system
+    // instead of the simulator.
+    let device_boot = DeviceBoot {
+        cmaddr: std::env::var("PIE_E2E_CMADDR")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+        ..DeviceBoot::default()
+    };
     let boot = |trace: Trace| Boot {
         trace,
         contract,

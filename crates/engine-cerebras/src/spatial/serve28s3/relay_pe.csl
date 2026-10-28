@@ -1,0 +1,259 @@
+// A relay-row PE (serve28): it serves an east conveyor (a strip's output to
+// the next strip, W columns east), the return conveyor (the head's embedding
+// of the step's token, west to strip 0), or both, once a step of a launch
+// (run_cfg[0] steps): the return first (it brings the step's input), then
+// east (the step's layers).
+//
+// A conveyor at travel position t (t = 0 upstream): chunks from sources
+// [max(0, t - dist), min(t - 1, W - 1)] arrive in source order (nin of
+// them). A destination (t >= dist) keeps the first (its own: source t - dist)
+// and hands it into its strip (VOUT, or YUP at strip 0); every PE streams the
+// rest straight on, and a source (t < W) appends its own chunk, taken from
+// its strip (VIN). Each chunk is Ht words.
+
+param memcpy_params;
+param Ht: u16;
+param W: u16;
+param NS: u16;          // layer strips (the head's strip is NS)
+param HA: u16;
+param HM: u16;
+param lps: u16;
+const BODY: u16 = lps * (HA + HM);
+const C = @import_module("colors.csl");
+const rt = @import_module("rt.csl");
+
+// This PE's conveyor roles, from its coordinates at the init launch (serve28s:
+// every relay PE shares one image).
+var e_role: bool = false;
+var e_src: bool = false;
+var e_dst: bool = false;
+var e_nin: u16 = 0;
+var w_role: bool = false;
+var w_src: bool = false;
+var w_dst: bool = false;
+var w_nin: u16 = 0;
+
+// Queues 0 and 1 are memcpy's; ids are paired so no microthread has a send
+// and a receive pending together (each conveyor's in and out are one op).
+const e_iq: input_queue = @get_input_queue(2);
+const e_oq: output_queue = @get_output_queue(3);
+const w_iq: input_queue = @get_input_queue(4);
+const w_oq: output_queue = @get_output_queue(5);
+const vin_iq: input_queue = @get_input_queue(6);
+const vout_oq: output_queue = @get_output_queue(7);
+
+const EXIT: local_task_id = @get_local_task_id(8);
+const KEEP: local_task_id = @get_local_task_id(9);
+const FWD: local_task_id = @get_local_task_id(10);
+const OWN: local_task_id = @get_local_task_id(11);
+const OUT: local_task_id = @get_local_task_id(12);
+const DONE: local_task_id = @get_local_task_id(13);
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+var own = @zeros([Ht]f32);
+const own_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht} -> own[i] });
+var keep = @zeros([Ht]f32);
+const keep_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht} -> keep[i] });
+var dummy = @zeros([1]f32);
+var dummy_ptr: [*]f32 = &dummy;
+var dummy_u = @zeros([1]u32);
+var dummy_u_ptr: [*]u32 = &dummy_u;
+
+var iter: u16 = 0;
+// The request: [steps, start position], written by the host before a launch.
+var run_cfg = @zeros([2]u32);
+var run_cfg_ptr: [*]u32 = &run_cfg;
+var west_phase: bool = false;   // the conveyor in progress
+
+fn fab_out(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fab_in(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+
+fn src() bool { return if (west_phase) w_src else e_src; }
+fn dst() bool { return if (west_phase) w_dst else e_dst; }
+fn nin() u16 { return if (west_phase) w_nin else e_nin; }
+
+// A conveyor's turn: the source's own chunk first (from its strip).
+fn start_conveyor() void {
+  if (src()) {
+    @fmovs(own_dsd, fab_in(vin_iq, Ht), .{ .async = true, .activate = KEEP });
+  } else {
+    @activate(KEEP);
+  }
+}
+
+task keep_task() void {
+  if (dst() and nin() > 0) {
+    if (west_phase) {
+      @fmovs(keep_dsd, fab_in(w_iq, Ht), .{ .async = true, .activate = FWD });
+    } else {
+      @fmovs(keep_dsd, fab_in(e_iq, Ht), .{ .async = true, .activate = FWD });
+    }
+  } else {
+    @activate(FWD);
+  }
+}
+
+task fwd_task() void {
+  const n = nin() - (if (dst()) @as(u16, 1) else 0);
+  if (n > 0) {
+    if (west_phase) {
+      @fmovs(fab_out(w_oq, n * Ht), fab_in(w_iq, n * Ht), .{ .async = true, .activate = OWN });
+    } else {
+      @fmovs(fab_out(e_oq, n * Ht), fab_in(e_iq, n * Ht), .{ .async = true, .activate = OWN });
+    }
+  } else {
+    @activate(OWN);
+  }
+}
+
+task own_task() void {
+  if (src()) {
+    if (west_phase) {
+      @fmovs(fab_out(w_oq, Ht), own_dsd, .{ .async = true, .activate = OUT });
+    } else {
+      @fmovs(fab_out(e_oq, Ht), own_dsd, .{ .async = true, .activate = OUT });
+    }
+  } else {
+    @activate(OUT);
+  }
+}
+
+task out_task() void {
+  if (dst()) {
+    @fmovs(fab_out(vout_oq, Ht), keep_dsd, .{ .async = true, .activate = DONE });
+  } else {
+    @activate(DONE);
+  }
+}
+
+fn start_step() void {
+  if (@as(u32, iter) >= run_cfg[0]) {
+    @activate(EXIT);
+    return;
+  }
+  west_phase = w_role;
+  start_conveyor();
+}
+
+task done_task() void {
+  if (west_phase and e_role) {
+    west_phase = false;
+    start_conveyor();
+    return;
+  }
+  iter += 1;
+  start_step();
+}
+
+// A request: [steps, start position] as the launch's arguments (serve28s2;
+// run_cfg stays exported for the old path).
+fn compute(steps: u32, start_pos_arg: u32) void {
+  run_cfg[0] = steps;
+  run_cfg[1] = start_pos_arg;
+  iter = 0;
+  start_step();
+}
+
+task f_exit() void {
+  sys_mod.unblock_cmd_stream();
+}
+
+// The init launch. East conveyors: strip s's output to strip s + 1, on the
+// bottom row when s is even (it ran down), the top row when odd; the return
+// conveyor: the head's next x, west along the bottom row from strip NS to
+// strip 0. A conveyor's travel position t: chunks reaching it come from
+// sources [max(0, t - dist), min(t - 1, W - 1)].
+fn init() void {
+  const gx = rt.x_coord();
+  const bottom_row = rt.y_coord() != 0;
+  const s = gx / W;
+  const rx_tow = if (bottom_row) rt.RX_N else rt.RX_S;   // into the strips
+  const tx_tow = if (bottom_row) rt.TX_N else rt.TX_S;
+  const RD = NS * W;   // the return's distance
+  const c: u16 = if ((s % 2 == 0) == bottom_row) s else (if (s == 0) 9999 else s - 1);
+  e_role = c < NS;
+  const e_t: u16 = if (e_role) gx - c * W else 0;
+  const e_hi: u16 = if (e_t > W) W - 1 else (if (e_t > 0) e_t - 1 else 0);
+  const e_lo: u16 = if (e_t > W) e_t - W else 0;
+  e_nin = if (e_role and e_t > 0) e_hi - e_lo + 1 else 0;
+  w_role = bottom_row;
+  const w_t: u16 = if (w_role) (RD + W - 1) - gx else 0;
+  const w_hi: u16 = if (w_t > W) W - 1 else (if (w_t > 0) w_t - 1 else 0);
+  const w_lo: u16 = if (w_t > RD) w_t - RD else 0;
+  w_nin = if (w_role and w_t > 0) w_hi - w_lo + 1 else 0;
+  e_src = e_role and e_t < W;
+  e_dst = e_role and e_t >= W;
+  w_src = w_role and w_t < W;
+  w_dst = w_role and w_t >= RD;
+  const ep = e_t % 2 == 0;
+  const wp = w_t % 2 == 0;
+  rt.iq_color(2, if (ep) rt.cn(C.E1) else rt.cn(C.E0));
+  rt.oq_color(3, if (ep) rt.cn(C.E0) else rt.cn(C.E1));
+  rt.iq_color(4, if (wp) rt.cn(C.RW1) else rt.cn(C.RW0));
+  rt.oq_color(5, if (wp) rt.cn(C.RW0) else rt.cn(C.RW1));
+  rt.oq_color(7, if (w_dst) rt.cn(C.YUP) else rt.cn(C.VOUT));
+  if (e_role) {
+    if (e_t < 2 * W - 1) { rt.route2(C.E0, C.E1, ep, rt.RX_R, rt.TX_E); }
+    if (e_t > 0) { rt.route2(C.E1, C.E0, ep, rt.RX_W, rt.TX_R); }
+  }
+  if (w_role) {
+    if (w_t < RD + W - 1) { rt.route2(C.RW0, C.RW1, wp, rt.RX_R, rt.TX_W); }
+    if (w_t > 0) { rt.route2(C.RW1, C.RW0, wp, rt.RX_E, rt.TX_R); }
+  }
+  if (e_src or w_src) { rt.route(C.VIN, rx_tow, rt.TX_R); }
+  if (e_dst) { rt.route(C.VOUT, rt.RX_R, tx_tow); }
+  if (w_dst) { rt.route(C.YUP, rt.RX_R, tx_tow); }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @bind_local_task(keep_task, KEEP);
+  @bind_local_task(fwd_task, FWD);
+  @bind_local_task(own_task, OWN);
+  @bind_local_task(out_task, OUT);
+  @bind_local_task(done_task, DONE);
+  @bind_local_task(f_exit, EXIT);
+
+  // Defaults; init sets each PE's own.
+  @initialize_queue(e_iq, .{ .color = C.E1 });
+  @initialize_queue(e_oq, .{ .color = C.E0 });
+  @initialize_queue(w_iq, .{ .color = C.RW1 });
+  @initialize_queue(w_oq, .{ .color = C.RW0 });
+  @initialize_queue(vin_iq, .{ .color = C.VIN });
+  @initialize_queue(vout_oq, .{ .color = C.VOUT });
+
+  @export_symbol(dummy_ptr, "x");
+  @export_symbol(dummy_ptr, "gamma");
+  @export_symbol(dummy_ptr, "inv_freq");
+  @export_symbol(dummy_ptr, "qkn_w");
+  @export_symbol(dummy_ptr, "prompt");
+  @export_symbol(dummy_u_ptr, "prompt_len");
+  @export_symbol(dummy_ptr, "emb");
+  @export_symbol(dummy_ptr, "hgamma");
+  @export_symbol(dummy_ptr, "tokens");
+  @export_symbol(dummy_u_ptr, "hcycles");
+  @export_symbol(dummy_ptr, "wqkv");
+  @export_symbol(dummy_ptr, "wo");
+  @export_symbol(dummy_ptr, "k");
+  @export_symbol(dummy_ptr, "v");
+  @export_symbol(dummy_ptr, "y");
+  @export_symbol(dummy_u_ptr, "cycles");
+  @export_symbol(dummy_ptr, "gu");
+  @export_symbol(dummy_ptr, "down");
+  @export_symbol(dummy_ptr, "gamma2");
+  @export_symbol(dummy_ptr, "out");
+  @export_symbol(dummy_ptr, "out_hist");
+  @export_symbol(dummy_u_ptr, "prof");
+  @export_symbol(dummy_u_ptr, "mprof");
+  @export_symbol(dummy_u_ptr, "in_tokens");
+  @export_symbol(dummy_ptr, "out_tokens");
+  @export_symbol(dummy_ptr, "hlogits");
+  @export_symbol(run_cfg_ptr, "run_cfg");
+  @export_symbol(compute);
+  @export_symbol(init);
+}

@@ -3,7 +3,7 @@
 
 load("//lib/spoken.poem", "QWEN_STOP")
 load("//lib/dit.poem", "adaln_order", "attend", "chunks", "linear", "norm_modulate", "reordered")
-load("//lib/qwen3.poem", "QWEN3_4B", "encoder", "qwen3_caches", "qwen3_encode", "te_read")
+load("//lib/qwen3_encoder.poem", "QWEN3_4B", "encoder", "qwen3_caches", "qwen3_encode", "te_read")
 load("//lib/vae.poem", "conv_head", "convolve", "flux_vae", "read_conv", "vae_conv", "vae_decode", "vae_encode", "vae_read")
 
 NO_THINKING = template("chatml", thinking = True, generation_suffix = "<think>\n\n</think>\n\n", stop = QWEN_STOP)

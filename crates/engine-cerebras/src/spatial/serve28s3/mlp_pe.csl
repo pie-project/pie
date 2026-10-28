@@ -1,0 +1,496 @@
+// The MLP rectangle of a decoder layer (docs/cerebras-spatial-design.md §4c):
+// h arrives from the attention rectangle above on the top row; the top row
+// RMS-normalizes it (sum of squares folded east, the total back west) and
+// multicasts [h | 1/rms] down; every PE multiplies its [gate; up] block, the
+// partials fold east; the east column forms silu(g) * u and multicasts it
+// west; the down partials fold south, two-level (segments of seg_rows, then
+// their heads); the bottom row adds the residual h and sends the layer's
+// output up (YUP) to the attention rectangle's top row: the next step's x.
+
+param memcpy_params;
+param Ht: u16;
+param It: u16;
+param iters: u16;
+param hidden: u16;
+// Uniform over the program: the strip geometry (serve28s: a PE derives its
+// place, roles and colors from its coordinates at the init launch, so all
+// PEs of a kind share one image).
+param W: u16;
+param HA: u16;          // attention rows a layer
+param HM: u16;          // MLP rows a layer
+param lps: u16;         // layers a strip
+param NS: u16;          // layer strips (the head's strip is NS)
+param band_rows: u16;
+param seg_rows: u16;
+param HH: u16;          // the head's rows
+const LH: u16 = HA + HM;
+const BODY: u16 = lps * LH;
+const C = @import_module("colors.csl");
+const rt = @import_module("rt.csl");
+
+// This PE's strip and logical row (0 = the strip's entry side), and the
+// router codes of the strip's logical north and south.
+var strip: u16 = 0;
+var flip: bool = false;
+var ly: u16 = 0;
+var rx_up: u16 = 0;
+var tx_up: u16 = 0;
+var rx_dn: u16 = 0;
+var tx_dn: u16 = 0;
+fn place() void {
+  const gx = rt.x_coord();
+  const gy = rt.y_coord();
+  strip = gx / W;
+  px = gx % W;
+  flip = strip % 2 == 1;
+  ly = if (flip) BODY - gy else gy - 1;
+  rx_up = if (flip) rt.RX_S else rt.RX_N;
+  tx_up = if (flip) rt.TX_S else rt.TX_N;
+  rx_dn = if (flip) rt.RX_N else rt.RX_S;
+  tx_dn = if (flip) rt.TX_N else rt.TX_S;
+}
+
+var px: u16 = 0;
+// Structural roles (they select the code's async ops, so they stay comptime:
+// a few row and column classes a kind).
+param west: bool;
+param east: bool;
+param top: bool;
+param head: bool;       // the bottom PE of its row segment
+param seg_first: bool;  // the top PE of its row segment
+param l2_first: bool;   // a head: of the first segment
+param l2_last: bool;    // a head: of the last segment (the bottom row)
+var bottom: bool = false;
+var seg: u16 = 0;
+const nseg: u16 = HM / seg_rows;
+const x_color = C.MX;
+const h_color = C.MH;
+const handoff_color = C.HANDOFF;
+
+
+// Queues 0 and 1 are memcpy's; an async op runs on its queue id's
+// microthread, shared by input and output queue N; ids are paired so that no
+// two ops that can be pending together share one (handoff in and x out on 4
+// at the top row, one after the other; YUP out on 7 at the bottom row long
+// after its h came in on 7; the gate/up and down folds never overlap).
+const gu_oq: output_queue = @get_output_queue(2);
+const y_iq: input_queue = @get_input_queue(2);
+const y_oq: output_queue = @get_output_queue(3);   // heads: level 2
+const gu_iq: input_queue = @get_input_queue(3);
+const x_oq: output_queue = @get_output_queue(4);
+const hand_iq: input_queue = @get_input_queue(4);
+const h_oq: output_queue = @get_output_queue(5);
+const l2_iq: input_queue = @get_input_queue(5);
+const x_iq: input_queue = @get_input_queue(6);
+const yup_oq: output_queue = @get_output_queue(7);
+const h_iq: input_queue = @get_input_queue(7);
+
+const EXIT: local_task_id = @get_local_task_id(8);
+const NORM: local_task_id = @get_local_task_id(9);
+const NORM_BC: local_task_id = @get_local_task_id(10);
+const NORM_DONE: local_task_id = @get_local_task_id(11);
+const COMPUTE_X: local_task_id = @get_local_task_id(12);
+const AFTER_GU: local_task_id = @get_local_task_id(13);
+const COMPUTE_H: local_task_id = @get_local_task_id(14);
+const LEVEL2: local_task_id = @get_local_task_id(15);
+const RESID: local_task_id = @get_local_task_id(16);
+const END: local_task_id = @get_local_task_id(17);
+const SENT: local_task_id = @get_local_task_id(18);
+const GOT: local_task_id = @get_local_task_id(19);
+
+// A send whose own copy comes back (the route turns into the ramp too): the
+// next task runs once both the send and the receive are done, so no send is
+// still pending on its microthread when that id is used again.
+var join_left: u16 = 0;
+var join_next: local_task_id = END;
+fn join_start(next: local_task_id) void {
+  join_left = 2;
+  join_next = next;
+}
+task sent_task() void {
+  join_left -= 1;
+  if (join_left == 0) { @activate(join_next); }
+}
+task got_task() void {
+  join_left -= 1;
+  if (join_left == 0) { @activate(join_next); }
+}
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const math = @import_module("<math>");
+const timestamp = @import_module("<time>");
+
+const It2: u16 = 2 * It;
+
+// [gate; up] column-major (column j: gate rows then up rows, 2 It); down
+// column-major (column k: Ht).
+// Host-filled buffers live outside the program image (serve28s3), from a fixed
+// address above the image's end (check_elf.py checks it) and well below the
+// top of memory: loading the program does not write them; init points their
+// pointers and DSDs there, and the host's transfers go through the pointers.
+const BUF_BASE: u16 = 0x3000;
+const GU_ADDR: u16 = BUF_BASE;
+const DOWN_ADDR: u16 = GU_ADDR + 4 * It2 * Ht;
+var gu_ptr: [*]f32 = &dummy;
+var down_ptr: [*]f32 = &dummy;
+var gu_col0 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{It2} -> dummy[i] });
+var down_col0 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht} -> dummy[i] });
+var gamma = @zeros([Ht]f32);
+var gamma_ptr: [*]f32 = &gamma;
+const gamma_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht} -> gamma[i] });
+
+// [h | 1/rms] (the top row's from the handoff; elsewhere from the multicast).
+var hx = @zeros([Ht + 1]f32);
+const hx_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht + 1} -> hx[i] });
+const h_raw = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht} -> hx[i] });
+var xn = @zeros([Ht]f32);
+const xn_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht} -> xn[i] });
+var stat = @zeros([1]f32);
+const stat_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> stat[i] });
+
+var gu = @zeros([It2]f32);
+const gu_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{It2} -> gu[i] });
+const g_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{It} -> gu[i] });
+const u_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{It} -> gu[@as(i16, It) + i] });
+var hs = @zeros([It]f32);      // silu(g) * u: the east column's, elsewhere received
+const hs_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{It} -> hs[i] });
+var yp = @zeros([Ht]f32);
+const yp_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht} -> yp[i] });
+var out = @zeros([Ht]f32);
+var out_ptr: [*]f32 = &out;
+// Every step's output (the bottom row's), for checking a layer step by step.
+// (out_hist, a debug record, is dropped in serve28s3: the name stays.)
+const out_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ht} -> out[i] });
+
+// SiLU scratch.
+var sa = @zeros([It]f32);
+var se = @zeros([It]f32);
+var sd = @zeros([It]f32);
+var srec = @zeros([It]f32);
+var st = @zeros([It]f32);
+const dsd_a = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{It} -> sa[i] });
+const dsd_e = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{It} -> se[i] });
+const dsd_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{It} -> sd[i] });
+const dsd_r = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{It} -> srec[i] });
+const dsd_t = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{It} -> st[i] });
+
+// The request: [steps, start position], written by the host before each
+// launch (a launch serves one request; positions carry on across launches,
+// so the KV cache persists).
+var run_cfg = @zeros([2]u32);
+var run_cfg_ptr: [*]u32 = &run_cfg;
+var iter: u16 = 0;
+// Profile, summed over steps: 0 waiting for h (top) or [h | 1/rms] (others),
+// 1 the top row's norm, 2 gate/up + fold, 3 SiLU + hs multicast, 4 down +
+// folds (+ residual and YUP at the bottom).
+var prof = @zeros([6]u32);
+var prof_ptr: [*]u32 = &prof;
+var t_mark = @zeros([timestamp.tsc_size_words]u16);
+var t_now = @zeros([timestamp.tsc_size_words]u16);
+fn tsc(t: *[timestamp.tsc_size_words]u16) u64 {
+  return @as(u64, t.*[0]) | (@as(u64, t.*[1]) << 16) | (@as(u64, t.*[2]) << 32);
+}
+fn mark(slot: u16) void {
+  timestamp.get_timestamp(&t_now);
+  prof[slot] += @as(u32, (tsc(&t_now) - tsc(&t_mark)) & 0xffffffff);
+  t_mark = t_now;
+}
+var dummy = @zeros([1]f32);
+var dummy_ptr: [*]f32 = &dummy;
+var dummy_u = @zeros([1]u32);
+var dummy_u_ptr: [*]u32 = &dummy_u;
+
+// hs = silu(g) * u with vector ops only (see mlp/pe.csl).
+fn silu_mul() void {
+  @fabss(dsd_a, g_dsd);
+  @fnegs(dsd_t, dsd_a);
+  @fmaxs(dsd_t, dsd_t, -88.0);
+  @fmuls(dsd_t, dsd_t, 0.00390625);
+  @fmovs(dsd_e, 1.0 / 5040.0);
+  const coeffs = [7]f32 { 1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0 };
+  for (@range(u16, 7)) |c| {
+    @fmuls(dsd_e, dsd_e, dsd_t);
+    @fadds(dsd_e, dsd_e, coeffs[c]);
+  }
+  for (@range(u16, 8)) |_| {
+    @fmuls(dsd_e, dsd_e, dsd_e);
+  }
+  @fadds(dsd_d, dsd_e, 1.0);
+  @fmuls(dsd_r, dsd_d, -0.47058823529411764);
+  @fadds(dsd_r, dsd_r, 1.411764705882353);
+  for (@range(u16, 3)) |_| {
+    @fmuls(dsd_t, dsd_d, dsd_r);
+    @fnegs(dsd_t, dsd_t);
+    @fadds(dsd_t, dsd_t, 2.0);
+    @fmuls(dsd_r, dsd_r, dsd_t);
+  }
+  @fnegs(dsd_t, dsd_e);
+  @fadds(dsd_t, dsd_t, 1.0);
+  @fmuls(dsd_t, dsd_t, dsd_r);
+  @fmuls(dsd_t, dsd_t, dsd_a);
+  @fadds(dsd_t, dsd_t, g_dsd);
+  @fmuls(dsd_t, dsd_t, 0.5);
+  @fmuls(hs_dsd, dsd_t, u_dsd);
+}
+
+fn fab_out(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fab_in(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+
+// out <- buf (+) the west's, along the row eastward.
+fn fold_east(buf: mem1d_dsd, n: u16, then_mid: local_task_id, then_east: local_task_id) void {
+  if (west) {
+    @fmovs(fab_out(gu_oq, n), buf, .{ .async = true, .activate = then_mid });
+  } else if (east) {
+    @fadds(buf, buf, fab_in(gu_iq, n), .{ .async = true, .activate = then_east });
+  } else {
+    @fadds(fab_out(gu_oq, n), buf, fab_in(gu_iq, n), .{ .async = true, .activate = then_mid });
+  }
+}
+
+fn begin() void {
+  if (top) {
+    @fmovs(h_raw, fab_in(hand_iq, Ht), .{ .async = true, .activate = NORM });
+  } else {
+    @fmovs(hx_dsd, fab_in(x_iq, Ht + 1), .{ .async = true, .activate = COMPUTE_X });
+  }
+}
+
+// A request: [steps, start position] as the launch's arguments (serve28s2;
+// run_cfg stays exported for the old path).
+fn compute(steps: u32, start_pos_arg: u32) void {
+  run_cfg[0] = steps;
+  run_cfg[1] = start_pos_arg;
+  timestamp.enable_tsc();
+  timestamp.get_timestamp(&t_mark);
+  iter = 0;
+  begin();
+}
+
+// The top row: h's sum of squares, folded east.
+task norm() void {
+  mark(0);
+  var acc: f32 = 0.0;
+  for (@range(u16, Ht)) |i| { acc += hx[i] * hx[i]; }
+  stat[0] = acc;
+  fold_east(stat_dsd, 1, NORM_BC, NORM_BC);
+}
+
+// The total back west along the top row (the east PE takes its own copy too:
+// the h route turns back into its ramp).
+task norm_bc() void {
+  if (east) {
+    join_start(NORM_DONE);
+    @fmovs(fab_out(h_oq, 1), stat_dsd, .{ .async = true, .activate = SENT });
+    @fmovs(stat_dsd, fab_in(h_iq, 1), .{ .async = true, .activate = GOT });
+  } else {
+    @fmovs(stat_dsd, fab_in(h_iq, 1), .{ .async = true, .activate = NORM_DONE });
+  }
+}
+
+task norm_done() void {
+  hx[Ht] = 1.0 / math.sqrt_f32(stat[0] / @as(f32, hidden) + 1.0e-6);
+  join_start(COMPUTE_X);
+  @fmovs(fab_out(x_oq, Ht + 1), hx_dsd, .{ .async = true, .activate = SENT });
+  // The top row takes its own copy back like every row (the x route turns
+  // into its ramp), keeping one code path.
+  @fmovs(hx_dsd, fab_in(x_iq, Ht + 1), .{ .async = true, .activate = GOT });
+}
+
+task compute_x() void {
+  mark(if (top) 1 else 0);
+  @fmuls(xn_dsd, h_raw, hx[Ht]);
+  @fmuls(xn_dsd, xn_dsd, gamma_dsd);
+  @fmovs(gu_dsd, 0.0);
+  for (@range(u16, Ht)) |j| {
+    @fmacs(gu_dsd, gu_dsd, @increment_dsd_offset(gu_col0, @as(i16, j * It2), f32), xn[j]);
+  }
+  fold_east(gu_dsd, It2, AFTER_GU, AFTER_GU);
+}
+
+// The east column forms and sends hs (taking its own copy back, as above);
+// every PE takes hs.
+task after_gu() void {
+  mark(2);
+  if (east) {
+    silu_mul();
+    join_start(COMPUTE_H);
+    @fmovs(fab_out(h_oq, It), hs_dsd, .{ .async = true, .activate = SENT });
+    @fmovs(hs_dsd, fab_in(h_iq, It), .{ .async = true, .activate = GOT });
+  } else {
+    @fmovs(hs_dsd, fab_in(h_iq, It), .{ .async = true, .activate = COMPUTE_H });
+  }
+}
+
+task compute_h() void {
+  mark(3);
+  @fmovs(yp_dsd, 0.0);
+  for (@range(u16, It)) |k| {
+    @fmacs(yp_dsd, yp_dsd, @increment_dsd_offset(down_col0, @as(i16, k * Ht), f32), hs[k]);
+  }
+  if (seg_first) {
+    @fmovs(fab_out(y_oq, Ht), yp_dsd, .{ .async = true, .activate = END });
+  } else if (head) {
+    @fadds(yp_dsd, yp_dsd, fab_in(y_iq, Ht), .{ .async = true, .activate = LEVEL2 });
+  } else {
+    @fadds(fab_out(y_oq, Ht), yp_dsd, fab_in(y_iq, Ht), .{ .async = true, .activate = END });
+  }
+}
+
+task level2() void {
+  if (l2_first) {
+    @fmovs(fab_out(y_oq, Ht), yp_dsd, .{ .async = true, .activate = END });
+  } else if (!l2_last) {
+    @fadds(fab_out(y_oq, Ht), yp_dsd, fab_in(l2_iq, Ht), .{ .async = true, .activate = END });
+  } else {
+    @fadds(yp_dsd, yp_dsd, fab_in(l2_iq, Ht), .{ .async = true, .activate = RESID });
+  }
+}
+
+// The bottom row: the layer's output, to the next layer's top row (the last
+// layer's up to the first's: the next step's x).
+task resid() void {
+  @fadds(out_dsd, yp_dsd, h_raw);
+  @fmovs(fab_out(yup_oq, Ht), out_dsd, .{ .async = true, .activate = END });
+}
+
+task end_task() void {
+  mark(4);
+  if (iter == 1) {
+    timestamp.get_timestamp(&t_mark);
+    for (@range(u16, 6)) |i| { prof[i] = 0; }
+  }
+  iter += 1;
+  if (@as(u32, iter) < run_cfg[0]) {
+    begin();
+  } else {
+    @activate(EXIT);
+  }
+}
+
+task f_exit() void {
+  sys_mod.unblock_cmd_stream();
+}
+
+// The init launch: this PE's place, queue colors and routes.
+fn init() void {
+  gu_ptr = @bitcast([*]f32, GU_ADDR);
+  down_ptr = @bitcast([*]f32, DOWN_ADDR);
+  gu_col0 = @set_dsd_base_addr(gu_col0, gu_ptr);
+  down_col0 = @set_dsd_base_addr(down_col0, down_ptr);
+  place();
+  const k = ly / LH;
+  const m = ly % LH - HA;
+  bottom = m == HM - 1;
+  const r = m % seg_rows;
+  seg = m / seg_rows;
+  const xp = px % 2 == 0;
+  const mp = m % 2 == 0;
+  const sp = seg % 2 == 0;
+  const last_in_strip = k == lps - 1;
+  rt.oq_color(2, if (xp) rt.cn(C.MA) else rt.cn(C.MB));
+  rt.iq_color(3, if (xp) rt.cn(C.MB) else rt.cn(C.MA));
+  rt.oq_color(3, if (head) (if (sp) rt.cn(C.ME) else rt.cn(C.MF)) else (if (mp) rt.cn(C.MC) else rt.cn(C.MD)));
+  rt.iq_color(2, if (mp) rt.cn(C.MD) else rt.cn(C.MC));
+  rt.iq_color(5, if (sp) rt.cn(C.MF) else rt.cn(C.ME));
+  rt.oq_color(7, if (last_in_strip) rt.cn(C.VIN) else rt.cn(C.LHANDOFF));
+
+  // [h | 1/rms] down each column from the top row, its own copy included.
+  if (top) {
+    rt.route(C.MX, rt.RX_R, rt.TX_R | tx_dn);
+  } else if (bottom) {
+    rt.route(C.MX, rx_up, rt.TX_R);
+  } else {
+    rt.route(C.MX, rx_up, rt.TX_R | tx_dn);
+  }
+  // Folds east.
+  if (!east) { rt.route2(C.MA, C.MB, xp, rt.RX_R, rt.TX_E); }
+  if (!west) { rt.route2(C.MB, C.MA, xp, rt.RX_W, rt.TX_R); }
+  // West multicasts from the east column, its own copy included.
+  if (east) {
+    rt.route(C.MH, rt.RX_R, rt.TX_R | rt.TX_W);
+  } else if (west) {
+    rt.route(C.MH, rt.RX_E, rt.TX_R);
+  } else {
+    rt.route(C.MH, rt.RX_E, rt.TX_R | rt.TX_W);
+  }
+  // Down partials south: level 1 in a segment, level 2 between heads.
+  if (r != seg_rows - 1) { rt.route2(C.MC, C.MD, mp, rt.RX_R, tx_dn); }
+  if (r != 0) { rt.route2(C.MD, C.MC, mp, rx_up, rt.TX_R); }
+  if (head and seg + 1 < nseg) { rt.route2(C.ME, C.MF, sp, rt.RX_R, tx_dn); }
+  if (seg > 0) {
+    if (head) {
+      rt.route2(C.MF, C.ME, sp, rx_up, rt.TX_R);
+    } else {
+      rt.route2(C.MF, C.ME, sp, rx_up, tx_dn);
+    }
+  }
+  // HANDOFF arrives at the top row; YUP passes north through strip 0.
+  if (top) { rt.route(C.HANDOFF, rx_up, rt.TX_R); }
+  if (strip == 0) { rt.route(C.YUP, rx_dn, tx_up); }
+  // A layer's output south into the next layer's top row (or the relay row).
+  if (bottom) { rt.route2(C.VIN, C.LHANDOFF, last_in_strip, rt.RX_R, tx_dn); }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @bind_local_task(norm, NORM);
+  @bind_local_task(norm_bc, NORM_BC);
+  @bind_local_task(norm_done, NORM_DONE);
+  @bind_local_task(compute_x, COMPUTE_X);
+  @bind_local_task(after_gu, AFTER_GU);
+  @bind_local_task(compute_h, COMPUTE_H);
+  @bind_local_task(level2, LEVEL2);
+  @bind_local_task(resid, RESID);
+  @bind_local_task(end_task, END);
+  @bind_local_task(sent_task, SENT);
+  @bind_local_task(got_task, GOT);
+  @bind_local_task(f_exit, EXIT);
+
+  // Defaults; init sets each PE's own.
+  @initialize_queue(gu_oq, .{ .color = C.MA });
+  @initialize_queue(gu_iq, .{ .color = C.MB });
+  @initialize_queue(y_oq, .{ .color = C.MC });
+  @initialize_queue(y_iq, .{ .color = C.MD });
+  @initialize_queue(x_oq, .{ .color = x_color });
+  @initialize_queue(hand_iq, .{ .color = handoff_color });
+  @initialize_queue(h_oq, .{ .color = h_color });
+  @initialize_queue(l2_iq, .{ .color = C.MF });
+  @initialize_queue(x_iq, .{ .color = x_color });
+  @initialize_queue(yup_oq, .{ .color = C.LHANDOFF });
+  @initialize_queue(h_iq, .{ .color = h_color });
+
+  @export_symbol(gu_ptr, "gu");
+  @export_symbol(down_ptr, "down");
+  @export_symbol(gamma_ptr, "gamma2");
+  @export_symbol(out_ptr, "out");
+  @export_symbol(dummy_ptr, "out_hist");
+  // The attention rectangle's symbols, so every PE has every exported name.
+  @export_symbol(prof_ptr, "mprof");
+  @export_symbol(dummy_u_ptr, "prof");
+  @export_symbol(dummy_ptr, "x");
+  @export_symbol(dummy_ptr, "gamma");
+  @export_symbol(dummy_ptr, "inv_freq");
+  @export_symbol(dummy_ptr, "qkn_w");
+  @export_symbol(dummy_ptr, "prompt");
+  @export_symbol(dummy_u_ptr, "prompt_len");
+  @export_symbol(run_cfg_ptr, "run_cfg");
+  @export_symbol(dummy_u_ptr, "in_tokens");
+  @export_symbol(dummy_ptr, "out_tokens");
+  @export_symbol(dummy_ptr, "hlogits");
+  @export_symbol(dummy_ptr, "emb");
+  @export_symbol(dummy_ptr, "hgamma");
+  @export_symbol(dummy_ptr, "tokens");
+  @export_symbol(dummy_u_ptr, "hcycles");
+  @export_symbol(dummy_ptr, "wqkv");
+  @export_symbol(dummy_ptr, "wo");
+  @export_symbol(dummy_ptr, "k");
+  @export_symbol(dummy_ptr, "v");
+  @export_symbol(dummy_ptr, "y");
+  @export_symbol(dummy_u_ptr, "cycles");
+  @export_symbol(compute);
+  @export_symbol(init);
+}

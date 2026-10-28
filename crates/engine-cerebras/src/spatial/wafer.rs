@@ -1,0 +1,815 @@
+//! The resident wafer model in process: the compiled `serve28s` (or
+//! `serve28`) program
+//! (model28's layer strips running serve's request API) loaded through the
+//! SDK runtime binding, its weights placed from the checkpoint, requests
+//! answered by launches. The Rust form of the bring-up's `serve_lib28.py`.
+//!
+//! Layers sit in strips of `kernel_cols` columns (`lps` a strip, alternating
+//! down and up), the head in the strip after them (up when the layer strips
+//! are odd in number), relay rows above and below. A request is one launch:
+//! `run_cfg` = [steps, start position] on every PE, the tokens to force on
+//! the head's bottom-east PE (`in_tokens`, `SAMPLE` for its own argmax),
+//! `compute`, then every step's argmax (`out_tokens`, as `f32`) and, when
+//! asked, the last step's logits (`hlogits`, the head's east column).
+//! Positions carry on across requests: the KV cache persists until a request
+//! starts at 0.
+//!
+//! The SDK wants every runtime call on the thread that made the first
+//! runtime, so the model lives on a thread of its own ([`Wafer`]).
+
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Instant;
+
+use super::ckpt::{Ckpt, Tensor};
+use crate::sdk::{DataType, Order, Platform, Rect, Runtime, Sdk};
+
+/// `in_tokens`: take the step's own argmax.
+pub const SAMPLE: u32 = 0xFFFF_FFFF;
+
+type R<T> = std::result::Result<T, String>;
+
+/// The program's shape, from the compiler's `out.json` params.
+#[derive(Debug, Clone)]
+pub struct Layout {
+    pub pw: usize,
+    pub ph: usize,
+    pub hm: usize,
+    pub layers: usize,
+    pub hh: usize,
+    pub lps: usize,
+    pub hidden: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub positions: usize,
+    pub rb: usize,
+    pub inter: usize,
+    pub vr: usize,
+    pub vocab: usize,
+    pub cap: usize,
+    /// Layer strips; the head is strip `ns`.
+    pub ns: usize,
+    /// Rows a strip; relay rows 0 and `body + 1`.
+    pub body: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl Layout {
+    /// The shape the compiler recorded in the program's `out.json`.
+    pub fn read(program: &Path) -> R<Layout> {
+        let path = program.join("out.json");
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?,
+        )
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+        Layout::of(|k| {
+            let x = &v["params"][k];
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.trim().parse().ok()))
+                .map(|n| n as usize)
+        })
+        .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// The shape a `--params` string (`name:value,...`) asks for.
+    pub fn parse(params: &str) -> R<Layout> {
+        let map: std::collections::HashMap<&str, &str> = params
+            .split(',')
+            .filter_map(|kv| kv.split_once(':'))
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .collect();
+        Layout::of(|k| map.get(k).and_then(|v| v.parse().ok()))
+    }
+
+    fn of(get: impl Fn(&str) -> Option<usize>) -> R<Layout> {
+        let p = |k: &str| -> R<usize> { get(k).ok_or_else(|| format!("no param {k}")) };
+        let (pw, ph, hm) = (p("kernel_cols")?, p("attn_rows")?, p("mlp_rows")?);
+        let (layers, lps) = (p("layers")?, p("lps")?);
+        let ns = layers / lps;
+        let body = lps * (ph + hm);
+        let hh = p("head_rows")?;
+        if lps == 0 || layers % lps != 0 || hh == 0 || hh > body {
+            return Err(format!(
+                "{layers} layers at {lps} a strip with a head of {hh} rows do not make a \
+                 serve28 layout ({body} rows a strip)"
+            ));
+        }
+        Ok(Layout {
+            pw,
+            ph,
+            hm,
+            layers,
+            hh,
+            lps,
+            hidden: p("hidden")?,
+            heads: p("heads")?,
+            head_dim: p("head_dim")?,
+            positions: p("positions")?,
+            rb: p("band_rows")?,
+            inter: p("inter")?,
+            vr: p("vocab_rows")?,
+            vocab: p("vocab")?,
+            cap: p("iters")?,
+            ns,
+            body,
+            width: (ns + 1) * pw,
+            height: body + 2,
+        })
+    }
+
+    /// A strip's logical row on the fabric: even strips down from row 1,
+    /// odd ones up from row `body`.
+    pub fn prow(&self, flip: bool, ly: usize) -> usize {
+        if flip { self.body - ly } else { 1 + ly }
+    }
+
+    fn hflip(&self) -> bool {
+        self.ns % 2 == 1
+    }
+
+    /// The head's bottom-east PE (`in_tokens`, `out_tokens`).
+    pub fn hbe(&self) -> (usize, usize) {
+        (self.ns * self.pw + self.pw - 1, self.prow(self.hflip(), self.hh - 1))
+    }
+
+    /// The top row of the head's east column (`hlogits`).
+    fn hcol_y0(&self) -> usize {
+        self.prow(self.hflip(), 0).min(self.prow(self.hflip(), self.hh - 1))
+    }
+}
+
+/// Where placed weights go: the runtime, or a recorder for checking.
+pub trait Sink {
+    fn h2d(&mut self, symbol: &str, rect: Rect, elems_per_pe: usize, words: &[u32]) -> R<()>;
+}
+
+impl Sink for Runtime {
+    fn h2d(&mut self, symbol: &str, rect: Rect, elems_per_pe: usize, words: &[u32]) -> R<()> {
+        self.memcpy_h2d(symbol, words, rect, elems_per_pe, Order::RowMajor, DataType::Bits32)
+            .map_err(|e| format!("placing {symbol}: {e}"))
+    }
+}
+
+/// `data`: `rows` logical rows from logical row `ly0` of `strip`, each `pw`
+/// PEs of `n` elements, in logical order.
+fn put_strip(
+    lay: &Layout,
+    sink: &mut dyn Sink,
+    symbol: &str,
+    data: &[f32],
+    strip: usize,
+    ly0: usize,
+    rows: usize,
+    n: usize,
+) -> R<()> {
+    let row = lay.pw * n;
+    debug_assert_eq!(data.len(), rows * row);
+    let flip = strip % 2 == 1;
+    let (words, y0): (Vec<u32>, usize) = if flip {
+        // Logical rows run up the fabric: send them bottom-up, reversed.
+        (
+            data.chunks_exact(row).rev().flatten().map(|x| x.to_bits()).collect(),
+            lay.prow(true, ly0 + rows - 1),
+        )
+    } else {
+        (data.iter().map(|x| x.to_bits()).collect(), lay.prow(false, ly0))
+    };
+    let rect = Rect {
+        x: (strip * lay.pw) as i32,
+        y: y0 as i32,
+        w: lay.pw as i32,
+        h: rows as i32,
+    };
+    sink.h2d(symbol, rect, n, &words)
+}
+
+fn expect(t: &Tensor, name: &str, shape: &[usize]) -> R<()> {
+    if t.shape == shape {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} is {:?}; the compiled program wants {shape:?}",
+            t.shape
+        ))
+    }
+}
+
+/// Logical head rows a copy of the embedding carries (bounds host memory).
+const EMB_CHUNK_ROWS: usize = 64;
+
+/// Places every weight of `ckpt` (and zeroed KV) for `lay`.
+#[allow(clippy::too_many_lines)]
+pub fn place(lay: &Layout, ckpt: &Ckpt, rope_theta: f64, sink: &mut dyn Sink) -> R<()> {
+    let (pw, ph, hm, rb) = (lay.pw, lay.ph, lay.hm, lay.rb);
+    let (hid, g, d) = (lay.hidden, lay.heads, lay.head_dim);
+    let nb = ph / rb;
+    let (ht, dr, tc, it) = (hid / pw, d / rb, lay.positions / pw, lay.inter / hm);
+    let lh = ph + hm;
+    let qr = (g + 2) * dr;
+    let qdim = nb * g * d;
+    // Each band row holds dr of a head's dims, RoPE pairs together: dr/2 from
+    // the first half and their partners from the second.
+    let perm: Vec<Vec<usize>> = (0..rb)
+        .map(|r| {
+            (r * dr / 2..(r + 1) * dr / 2)
+                .chain(d / 2 + r * dr / 2..d / 2 + (r + 1) * dr / 2)
+                .collect()
+        })
+        .collect();
+    let inv_freq: Vec<f32> = (0..d / 2)
+        .map(|i| rope_theta.powf(-((2 * i) as f64) / d as f64) as f32)
+        .collect();
+    let sqrt_d = (d as f64).sqrt() as f32;
+    let get = |name: &str, shape: &[usize]| -> R<Tensor> {
+        let t = ckpt.get(name)?;
+        expect(&t, name, shape)?;
+        Ok(t)
+    };
+    for li in 0..lay.layers {
+        let started = Instant::now();
+        let p = format!("model.layers.{li}.");
+        let (strip, k) = (li / lay.lps, li % lay.lps);
+        let base = k * lh;
+        let wq = get(&format!("{p}self_attn.q_proj.weight"), &[qdim, hid])?;
+        let wk = get(&format!("{p}self_attn.k_proj.weight"), &[nb * d, hid])?;
+        let wv = get(&format!("{p}self_attn.v_proj.weight"), &[nb * d, hid])?;
+        let wo = get(&format!("{p}self_attn.o_proj.weight"), &[hid, qdim])?;
+        let qn = get(&format!("{p}self_attn.q_norm.weight"), &[d])?;
+        let kn = get(&format!("{p}self_attn.k_norm.weight"), &[d])?;
+        let ln = get(&format!("{p}input_layernorm.weight"), &[hid])?;
+        let mut wqkv = vec![0f32; ph * pw * ht * qr];
+        let mut wob = vec![0f32; ph * pw * g * dr * ht];
+        let mut freq = vec![0f32; ph * pw * dr / 2];
+        let mut qknw = vec![0f32; ph * pw * 2 * dr];
+        let mut gamma = vec![0f32; ph * pw * ht];
+        for py in 0..ph {
+            let (b, rr) = (py / rb, py % rb);
+            let dims = &perm[rr];
+            let qrows: Vec<usize> = (0..g)
+                .flat_map(|h| dims.iter().map(move |&j| (b * g + h) * d + j))
+                .collect();
+            // The band row's q, k, v rows of the projection.
+            let blk: Vec<&[f32]> = qrows
+                .iter()
+                .map(|&r| &wq.data[r * hid..(r + 1) * hid])
+                .chain(dims.iter().map(|&j| &wk.data[(b * d + j) * hid..(b * d + j + 1) * hid]))
+                .chain(dims.iter().map(|&j| &wv.data[(b * d + j) * hid..(b * d + j + 1) * hid]))
+                .collect();
+            for px in 0..pw {
+                let pe = py * pw + px;
+                for c in 0..ht {
+                    for (r, src) in blk.iter().enumerate() {
+                        wqkv[(pe * ht + c) * qr + r] = src[px * ht + c];
+                    }
+                }
+                for (q, &qrow) in qrows.iter().enumerate() {
+                    for c in 0..ht {
+                        wob[(pe * g * dr + q) * ht + c] = wo.data[(px * ht + c) * qdim + qrow];
+                    }
+                }
+                for i in 0..dr / 2 {
+                    freq[pe * dr / 2 + i] = inv_freq[dims[i]];
+                }
+                // q_norm follows the q projection and would cancel a scale
+                // folded into Wq: 1/sqrt(D) goes into q_norm's weights.
+                for (i, &j) in dims.iter().enumerate() {
+                    qknw[pe * 2 * dr + i] = qn.data[j] / sqrt_d;
+                    qknw[pe * 2 * dr + dr + i] = kn.data[j];
+                }
+                gamma[pe * ht..(pe + 1) * ht].copy_from_slice(&ln.data[px * ht..(px + 1) * ht]);
+            }
+        }
+        let zeros_kv = vec![0f32; ph * pw * dr * tc];
+        for (sym, arr, n) in [
+            ("wqkv", &wqkv, qr * ht),
+            ("wo", &wob, g * dr * ht),
+            ("k", &zeros_kv, dr * tc),
+            ("v", &zeros_kv, dr * tc),
+            ("inv_freq", &freq, dr / 2),
+            ("qkn_w", &qknw, 2 * dr),
+            ("gamma", &gamma, ht),
+        ] {
+            put_strip(lay, sink, sym, arr, strip, base, ph, n)?;
+        }
+        drop((wq, wk, wv, wo, wqkv, wob));
+
+        let gate = get(&format!("{p}mlp.gate_proj.weight"), &[lay.inter, hid])?;
+        let up = get(&format!("{p}mlp.up_proj.weight"), &[lay.inter, hid])?;
+        let down = get(&format!("{p}mlp.down_proj.weight"), &[hid, lay.inter])?;
+        let ln2 = get(&format!("{p}post_attention_layernorm.weight"), &[hid])?;
+        let mut gu = vec![0f32; hm * pw * ht * 2 * it];
+        let mut dn = vec![0f32; hm * pw * it * ht];
+        let mut gamma2 = vec![0f32; hm * pw * ht];
+        for y in 0..hm {
+            for px in 0..pw {
+                let pe = y * pw + px;
+                for c in 0..ht {
+                    let col = px * ht + c;
+                    for i in 0..it {
+                        let row = y * it + i;
+                        gu[(pe * ht + c) * 2 * it + i] = gate.data[row * hid + col];
+                        gu[(pe * ht + c) * 2 * it + it + i] = up.data[row * hid + col];
+                        dn[(pe * it + i) * ht + c] = down.data[col * lay.inter + row];
+                    }
+                }
+                gamma2[pe * ht..(pe + 1) * ht].copy_from_slice(&ln2.data[px * ht..(px + 1) * ht]);
+            }
+        }
+        for (sym, arr, n) in [
+            ("gu", &gu, 2 * it * ht),
+            ("down", &dn, ht * it),
+            ("gamma2", &gamma2, ht),
+        ] {
+            put_strip(lay, sink, sym, arr, strip, base + ph, hm, n)?;
+        }
+        tracing::info!(
+            layer = li,
+            ms = started.elapsed().as_millis() as u64,
+            "spatial wafer: layer placed"
+        );
+    }
+
+    // The head: the (tied) embedding as the vocabulary's rows, padded.
+    let emb = ckpt.get("model.embed_tokens.weight")?;
+    if emb.shape.len() != 2 || emb.shape[1] != hid {
+        return Err(format!("model.embed_tokens.weight is {:?}", emb.shape));
+    }
+    let rows_have = emb.shape[0].min(lay.vocab);
+    let (vr, hh) = (lay.vr, lay.hh);
+    let mut y0 = 0;
+    while y0 < hh {
+        let rows = EMB_CHUNK_ROWS.min(hh - y0);
+        let mut chunk = vec![0f32; rows * pw * ht * vr];
+        for yl in 0..rows {
+            for px in 0..pw {
+                let pe = yl * pw + px;
+                for v in 0..vr {
+                    let tok = (y0 + yl) * vr + v;
+                    if tok >= rows_have {
+                        continue;
+                    }
+                    let src = &emb.data[tok * hid + px * ht..tok * hid + (px + 1) * ht];
+                    for (c, &x) in src.iter().enumerate() {
+                        chunk[(pe * ht + c) * vr + v] = x;
+                    }
+                }
+            }
+        }
+        put_strip(lay, sink, "emb", &chunk, lay.ns, y0, rows, vr * ht)?;
+        y0 += rows;
+    }
+    drop(emb);
+    let norm = get("model.norm.weight", &[hid])?;
+    let hgamma: Vec<f32> = (0..hh * pw)
+        .flat_map(|pe| norm.data[(pe % pw) * ht..(pe % pw + 1) * ht].iter().copied())
+        .collect();
+    put_strip(lay, sink, "hgamma", &hgamma, lay.ns, 0, hh, ht)
+}
+
+/// The program's sources, shipped with the engine: serve28s (serve28 with
+/// shared program images: PEs derive their place, colors and routes from
+/// their coordinates in an `init` launch, so the wafer takes a few hundred
+/// ELF files instead of thousands).
+const SOURCES: [(&str, &str); 8] = [
+    ("layout.csl", include_str!("serve28s3/layout.csl")),
+    ("attn_pe.csl", include_str!("serve28s3/attn_pe.csl")),
+    ("mlp_pe.csl", include_str!("serve28s3/mlp_pe.csl")),
+    ("head_pe.csl", include_str!("serve28s3/head_pe.csl")),
+    ("relay_pe.csl", include_str!("serve28s3/relay_pe.csl")),
+    ("filler_pe.csl", include_str!("serve28s3/filler_pe.csl")),
+    ("colors.csl", include_str!("serve28s3/colors.csl")),
+    ("rt.csl", include_str!("serve28s3/rt.csl")),
+];
+
+/// The serve28s program for `params` (`name:value,...`, `kernel_cols`
+/// included), from PIE's program cache (`PIE_CEREBRAS_CACHE`) or compiled
+/// into it: keyed by the sources, the parameters and the fabric, finished
+/// when the RPC manifest and a PE binary are there, as the phase programs'.
+/// A system's program is laid out on the whole wafer.
+pub fn compile(params: &str, target: crate::sdk::Target, system: bool) -> R<PathBuf> {
+    use crate::sdk::{Arch, Compile, Cslc};
+    let lay = Layout::parse(params)?;
+    let fabric_dims = if system {
+        crate::device::wafer_dims(target)
+    } else {
+        ((lay.width + 7) as u32, (lay.height + 2) as u32)
+    };
+    let fabric_offsets = (4, 1);
+    let mut key = blake3::Hasher::new();
+    for (name, text) in SOURCES {
+        key.update(name.as_bytes()).update(&[0]).update(text.as_bytes()).update(&[0]);
+    }
+    key.update(format!("{params}|{fabric_dims:?}|{fabric_offsets:?}|{target:?}|{system}").as_bytes());
+    let hex = key.finalize().to_hex().to_string();
+    let target_name = match target {
+        crate::sdk::Target::Wse2 => "wse2",
+        crate::sdk::Target::Wse3 => "wse3",
+    };
+    let dir = crate::device::disk_cache().join(format!(
+        "{hex}-{target_name}{}",
+        if system { "-system" } else { "" }
+    ));
+    let out = dir.join("out");
+    let bin = out.join("bin");
+    if bin.join("out_rpc.json").is_file() && bin.join("out_0_0.elf").is_file() {
+        tracing::info!(dir = %out.display(), "spatial wafer: program cached");
+        return Ok(out);
+    }
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for (name, text) in SOURCES {
+        std::fs::write(dir.join(name), text).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let compile = Compile {
+        arch: Arch::from(target),
+        layout: dir.join("layout.csl"),
+        fabric_dims,
+        fabric_offsets,
+        params: params
+            .split(',')
+            .filter_map(|kv| kv.split_once(':'))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect(),
+        memcpy: true,
+        channels: 1,
+        import_paths: Vec::new(),
+        out: out.clone(),
+    };
+    let started = Instant::now();
+    tracing::info!(dir = %out.display(), "spatial wafer: compiling the program");
+    if let Err(e) = Cslc::find().and_then(|cslc| cslc.compile(&compile)) {
+        let _ = std::fs::remove_dir_all(&out);
+        return Err(format!("compiling the serve28s program: {e}"));
+    }
+    tracing::info!(
+        s = started.elapsed().as_secs_f32(),
+        "spatial wafer: program compiled"
+    );
+    Ok(out)
+}
+
+/// Which logits a forward hands back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Logits {
+    None,
+    Last,
+    All,
+}
+
+/// The program on the fabric, weights placed.
+pub struct WaferModel {
+    rt: Runtime,
+    lay: Layout,
+    launch: Launch,
+}
+
+/// How a request reaches the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Launch {
+    /// serve28s3: `in_tokens` and `compute(steps, start_pos)` queued without
+    /// waiting; only reading the answer blocks.
+    Args,
+    /// serve28, serve28s: `run_cfg` written on every PE, then `compute()`.
+    RunCfg,
+}
+
+impl Launch {
+    /// `"args"`, `"run_cfg"`; anything else (or nothing) is decided from
+    /// the program.
+    pub fn named(name: Option<&str>) -> Option<Launch> {
+        match name {
+            Some("args") => Some(Launch::Args),
+            Some("run_cfg") => Some(Launch::RunCfg),
+            _ => None,
+        }
+    }
+
+    /// From the RPC manifest: a `compute` that takes arguments.
+    fn of(rt: &Runtime) -> Launch {
+        if rt.rpc().get("compute").is_ok_and(|s| s.inputs >= 2) {
+            Launch::Args
+        } else {
+            Launch::RunCfg
+        }
+    }
+}
+
+fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
+    Rect {
+        x: x as i32,
+        y: y as i32,
+        w: w as i32,
+        h: h as i32,
+    }
+}
+
+impl WaferModel {
+    pub fn open(
+        program: &Path,
+        ckpt_dir: &Path,
+        platform: Platform,
+        launch: Option<Launch>,
+    ) -> R<WaferModel> {
+        let lay = Layout::read(program)?;
+        let ckpt = Ckpt::open(ckpt_dir)?;
+        let rope_theta = ckpt.config()["rope_theta"].as_f64().unwrap_or(1.0e6);
+        let sdk = Sdk::open().map_err(|e| e.to_string())?;
+        let started = Instant::now();
+        let mut rt = Runtime::new(sdk, program, platform, "WARNING").map_err(|e| e.to_string())?;
+        rt.load();
+        rt.run();
+        // serve28s: every PE takes its place, queue colors and routes before
+        // any traffic (a serve28 program has no `init`).
+        if rt.rpc().get("init").is_ok() {
+            rt.launch("init", &[]).map_err(|e| e.to_string())?;
+        }
+        tracing::info!(
+            s = started.elapsed().as_secs_f32(),
+            width = lay.width,
+            height = lay.height,
+            "spatial wafer: program loaded"
+        );
+        let started = Instant::now();
+        place(&lay, &ckpt, rope_theta, &mut rt)?;
+        tracing::info!(
+            s = started.elapsed().as_secs_f32(),
+            "spatial wafer: weights placed"
+        );
+        let launch = launch.unwrap_or_else(|| Launch::of(&rt));
+        let mut model = WaferModel { rt, lay, launch };
+        // One request (position 0; later requests overwrite its KV) so the
+        // first real one does not pay first-launch costs.
+        let started = Instant::now();
+        model.run(&[0], 1, 0, false)?;
+        tracing::info!(
+            ?launch,
+            s = started.elapsed().as_secs_f32(),
+            "spatial wafer: warm-up request"
+        );
+        Ok(model)
+    }
+
+    pub fn layout(&self) -> &Layout {
+        &self.lay
+    }
+
+    /// One launch: head iterations 0..=steps, iteration i forcing forced[i]
+    /// (past its end, the argmax). The argmax after each step; the last
+    /// step's logits when asked.
+    fn run(
+        &mut self,
+        forced: &[u32],
+        steps: usize,
+        start: usize,
+        want_logits: bool,
+    ) -> R<(Vec<u32>, Option<Vec<f32>>)> {
+        let lay = &self.lay;
+        if steps + 1 > lay.cap || start + steps > lay.positions || forced.len() > lay.cap {
+            return Err(format!(
+                "a launch of {steps} steps at position {start} does not fit the program \
+                 ({} iterations, {} positions)",
+                lay.cap, lay.positions
+            ));
+        }
+        let mut inn = vec![SAMPLE; lay.cap];
+        inn[..forced.len()].copy_from_slice(forced);
+        let (hx, hy) = lay.hbe();
+        let one = rect(hx, hy, 1, 1);
+        let (cap, hh, vr, vocab, hflip, y0) =
+            (lay.cap, lay.hh, lay.vr, lay.vocab, lay.hflip(), lay.hcol_y0());
+        let e = |e: crate::sdk::Error| e.to_string();
+        let rt = &mut self.rt;
+        if self.launch == Launch::Args {
+            // Queued in order; the answer's read waits for both.
+            rt.memcpy_h2d_nonblock("in_tokens", inn, one, cap, Order::RowMajor, DataType::Bits32)
+                .map_err(e)?;
+            rt.launch_nonblock("compute", &[steps as u32, start as u32])
+                .map_err(e)?;
+        } else {
+            let cfg: Vec<u32> =
+                std::iter::repeat_n([steps as u32, start as u32], lay.width * lay.height)
+                    .flatten()
+                    .collect();
+            let whole = rect(0, 0, lay.width, lay.height);
+            rt.memcpy_h2d("run_cfg", &cfg, whole, 2, Order::RowMajor, DataType::Bits32)
+                .map_err(e)?;
+            rt.memcpy_h2d("in_tokens", &inn, one, cap, Order::RowMajor, DataType::Bits32)
+                .map_err(e)?;
+            rt.launch("compute", &[]).map_err(e)?;
+        }
+        let mut out = vec![0u32; cap];
+        let read = rt.memcpy_d2h("out_tokens", &mut out, one, cap, Order::RowMajor, DataType::Bits32);
+        rt.wait_pending();
+        read.map_err(e)?;
+        // The head writes each argmax as an f32 value.
+        let argmax = out[..steps]
+            .iter()
+            .map(|&w| f32::from_bits(w) as u32)
+            .collect();
+        let logits = if want_logits {
+            let mut col = vec![0u32; hh * vr];
+            rt.memcpy_d2h(
+                "hlogits",
+                &mut col,
+                rect(hx, y0, 1, hh),
+                vr,
+                Order::RowMajor,
+                DataType::Bits32,
+            )
+            .map_err(e)?;
+            // Physical rows ascending are logical rows descending.
+            let rows: Vec<&[u32]> = if hflip {
+                col.chunks_exact(vr).rev().collect()
+            } else {
+                col.chunks_exact(vr).collect()
+            };
+            Some(
+                rows.into_iter()
+                    .flatten()
+                    .take(vocab)
+                    .map(|&w| f32::from_bits(w))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        Ok((argmax, logits))
+    }
+
+    /// The wafer's token loop: `tokens` at positions `start..`, then `extra`
+    /// more steps each fed the step before's argmax, in one launch where it
+    /// fits (a long feed goes first in pieces). The argmax after every step:
+    /// `tokens.len() + extra` of them, the last `extra + 1` the greedy
+    /// continuation. Nothing but the argmaxes comes back.
+    pub fn greedy(&mut self, tokens: &[u32], start: usize, extra: usize) -> R<Vec<u32>> {
+        let piece = self.lay.cap - 1;
+        let room = self.lay.positions.saturating_sub(start + tokens.len());
+        let extra = extra.min(piece.saturating_sub(1)).min(room);
+        // The feed's head in pieces that leave the tail and the loop one launch.
+        let tail = tokens.len().min(piece - extra).max(1);
+        let head = tokens.len() - tail;
+        let mut argmax = Vec::with_capacity(tokens.len() + extra);
+        if head > 0 {
+            let (a, _) = self.forward(&tokens[..head], start, Logits::None)?;
+            argmax.extend(a);
+        }
+        let (a, _) = self.run(&tokens[head..], tail + extra, start + head, false)?;
+        argmax.extend(a);
+        Ok(argmax)
+    }
+
+    /// The tokens at positions `start..`: the argmax after each, and the
+    /// logits `which` asks for. A launch takes at most `iters - 1` tokens;
+    /// longer runs go in pieces (the cache carries on between them), and
+    /// every row's logits take a launch a token.
+    pub fn forward(
+        &mut self,
+        tokens: &[u32],
+        start: usize,
+        which: Logits,
+    ) -> R<(Vec<u32>, Vec<Vec<f32>>)> {
+        let mut argmax = Vec::with_capacity(tokens.len());
+        let mut logits = Vec::new();
+        if which == Logits::All {
+            for (i, &tok) in tokens.iter().enumerate() {
+                let (a, l) = self.run(&[tok], 1, start + i, true)?;
+                argmax.extend(a);
+                logits.extend(l);
+            }
+            return Ok((argmax, logits));
+        }
+        let piece = self.lay.cap - 1;
+        let pieces = tokens.len().div_ceil(piece);
+        for (i, chunk) in tokens.chunks(piece).enumerate() {
+            let want = which == Logits::Last && i + 1 == pieces;
+            let (a, l) = self.run(chunk, chunk.len(), start + i * piece, want)?;
+            argmax.extend(a);
+            logits.extend(l);
+        }
+        Ok((argmax, logits))
+    }
+}
+
+enum Job {
+    Forward {
+        tokens: Vec<u32>,
+        start: usize,
+        which: Logits,
+    },
+    Greedy {
+        tokens: Vec<u32>,
+        start: usize,
+        extra: usize,
+    },
+}
+
+type Answer = R<(Vec<u32>, Vec<Vec<f32>>)>;
+
+/// A [`WaferModel`] on its own thread.
+pub struct Wafer {
+    jobs: Option<mpsc::Sender<Job>>,
+    answers: mpsc::Receiver<Answer>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    pub vocab: usize,
+    pub hidden: usize,
+}
+
+impl Wafer {
+    /// Loads `program` (the compiler's output directory) on `platform` and
+    /// places `ckpt`; returns once the model answers.
+    pub fn open(
+        program: PathBuf,
+        ckpt: PathBuf,
+        platform: Platform,
+        launch: Option<Launch>,
+    ) -> R<Wafer> {
+        let (job_tx, job_rx) = mpsc::channel::<Job>();
+        let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
+        let (ready_tx, ready_rx) = mpsc::channel::<R<(usize, usize)>>();
+        let thread = std::thread::Builder::new()
+            .name("spatial-wafer".into())
+            .spawn(move || {
+                let mut model = match WaferModel::open(&program, &ckpt, platform, launch) {
+                    Ok(m) => {
+                        let _ = ready_tx.send(Ok((m.lay.vocab, m.lay.hidden)));
+                        m
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                for job in job_rx {
+                    let answer = match job {
+                        Job::Forward {
+                            tokens,
+                            start,
+                            which,
+                        } => model.forward(&tokens, start, which),
+                        Job::Greedy {
+                            tokens,
+                            start,
+                            extra,
+                        } => model.greedy(&tokens, start, extra).map(|a| (a, Vec::new())),
+                    };
+                    if ans_tx.send(answer).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| format!("spawning the wafer thread: {e}"))?;
+        let (vocab, hidden) = ready_rx
+            .recv()
+            .map_err(|_| "the wafer thread died while loading".to_string())??;
+        Ok(Wafer {
+            jobs: Some(job_tx),
+            answers: ans_rx,
+            thread: Some(thread),
+            vocab,
+            hidden,
+        })
+    }
+
+    /// [`WaferModel::greedy`] on the wafer's thread.
+    pub fn greedy(&mut self, tokens: &[u32], start: usize, extra: usize) -> R<Vec<u32>> {
+        self.jobs
+            .as_ref()
+            .ok_or("the wafer is closed")?
+            .send(Job::Greedy {
+                tokens: tokens.to_vec(),
+                start,
+                extra,
+            })
+            .map_err(|_| "the wafer thread went away".to_string())?;
+        self.answers
+            .recv()
+            .map_err(|_| "the wafer thread went away".to_string())?
+            .map(|(argmax, _)| argmax)
+    }
+
+    pub fn forward(&mut self, tokens: &[u32], start: usize, which: Logits) -> Answer {
+        self.jobs
+            .as_ref()
+            .ok_or("the wafer is closed")?
+            .send(Job::Forward {
+                tokens: tokens.to_vec(),
+                start,
+                which,
+            })
+            .map_err(|_| "the wafer thread went away".to_string())?;
+        self.answers
+            .recv()
+            .map_err(|_| "the wafer thread went away".to_string())?
+    }
+}
+
+impl Drop for Wafer {
+    fn drop(&mut self) {
+        // Closing the job channel ends the thread, which stops the program.
+        self.jobs = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}

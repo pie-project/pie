@@ -112,8 +112,14 @@ impl Program {
     /// the table carries, or a row does not fit a PE.
     pub(super) fn render_whole(&self, exports: &[Export]) -> Option<Rendered> {
         let all_phases: Vec<&Phase> = self.phases.iter().collect();
-        if all_phases.is_empty() || all_phases.iter().any(|p| p.host.is_some()) {
-            trace_fusion("whole fire refused: a host phase");
+        if all_phases.is_empty() {
+            trace_fusion("whole fire refused: no phases");
+            return None;
+        }
+        if let Some(host) = all_phases.iter().find_map(|p| p.host.as_ref()) {
+            let op = format!("{:?}", host.op);
+            let name = op.split([' ', '{']).next().unwrap_or("?");
+            trace_fusion(&format!("whole fire refused: a host phase ({name})"));
             return None;
         }
         let pes = all_phases[0].pes;
@@ -132,8 +138,13 @@ impl Program {
         }
         let texts = texts_of(&all_phases);
         let all: String = texts.concat();
-        if self.views.iter().any(|v| mentions(&all, &v.name)) {
-            trace_fusion("whole fire refused: a view");
+        if let Some(v) = self.views.iter().find(|v| mentions(&all, &v.name)) {
+            let at = all_phases
+                .iter()
+                .zip(&texts)
+                .find(|(_, t)| mentions(t, &v.name))
+                .map_or("?", |(p, _)| p.func.name.as_str());
+            trace_fusion(&format!("whole fire refused: a view ({v:?} in {at})"));
             return None;
         }
         // A buffer two lane plans lay out must be laid out alike (strided).
