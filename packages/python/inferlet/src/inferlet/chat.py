@@ -186,7 +186,7 @@ class Decoder:
     __slots__ = ("_inner",)
 
     def __init__(self) -> None:
-        self._inner = _chat.create_decoder()
+        self._inner = _chat.Decoder()
 
     def feed(self, tokens: list[int]) -> AnyEvent:
         """Feed a token batch and get back the event that fired (one per

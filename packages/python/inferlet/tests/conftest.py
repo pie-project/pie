@@ -283,7 +283,6 @@ def _make_chat() -> types.ModuleType:
     m.system_thinking = lambda message, effort: [1, effort.value, *(ord(c) for c in message or "")]
     m.seal = lambda: [7]
     m.stop_tokens = lambda: [8, 9]
-    m.create_decoder = ChatDecoderStub
     return m
 
 
@@ -322,7 +321,6 @@ def _make_reasoning() -> types.ModuleType:
     m.Event_Delta = ReasoningDelta
     m.Event_Complete = ReasoningComplete
     m.Decoder = ReasoningDecoderStub
-    m.create_decoder = ReasoningDecoderStub
     return m
 
 
