@@ -38,7 +38,7 @@ impl Stamp {
     #[must_use]
     pub const fn of(head_dim: u32) -> Option<Self> {
         let (mt, warps, stages) = match head_dim {
-            64 => (1, 4, 2),
+            64 | 128 => (1, 4, 2),
             256 => (1, 3, 2),
             _ => return None,
         };
