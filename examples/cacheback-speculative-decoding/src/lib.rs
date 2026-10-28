@@ -28,12 +28,18 @@ use serde::{Deserialize, Serialize};
 struct Input {
     #[serde(default = "default_prompt")]
     prompt: String,
+    #[serde(default)]
+    prompt_tokens: Option<Vec<u32>>,
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
     #[serde(default = "default_draft_length")]
     draft_length: usize,
     #[serde(default = "default_max_ngram")]
     max_ngram: usize,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    ignore_eos: bool,
 }
 
 fn default_prompt() -> String {
@@ -176,13 +182,23 @@ async fn main(input: Input) -> Result<Output> {
     let k = input.draft_length as u32;
     let w_max = k + 1;
 
-    let mut prompt = chat::system_user("Continue the requested text.", &input.prompt);
-    prompt.extend(chat::cue());
+    let mut prompt = if let Some(toks) = input.prompt_tokens {
+        toks
+    } else {
+        let mut p = chat::system_user("Continue the requested text.", &input.prompt);
+        p.extend(chat::cue_without_thinking());
+        p
+    };
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
-    let stop_tokens = chat::stop_tokens();
+    let stop_tokens = if input.ignore_eos {
+        Vec::new()
+    } else {
+        chat::stop_tokens()
+    };
+    let stream = input.stream;
 
     let ws = WorkingSet::new();
     let pipeline = Pipeline::new();
@@ -201,11 +217,15 @@ async fn main(input: Input) -> Result<Output> {
     if !stopped {
         committed.push(x);
         generated.push(x);
+        if stream {
+            inferlet::session::send("t:1");
+        }
     }
     let mut base = n;
     let mut survivors: u32 = 0;
 
     while !stopped && generated.len() < input.max_tokens {
+        let prev_len = generated.len();
         // ── The window: the pending correct token, then the drafts.
         let drafts = draft_from_cache(&committed, input.draft_length, input.max_ngram);
         let mut window = Vec::with_capacity(w_max as usize);
@@ -240,15 +260,27 @@ async fn main(input: Input) -> Result<Output> {
             }
         }
         if stopped || generated.len() == input.max_tokens {
+            let emitted = generated.len() - prev_len;
+            if stream && emitted > 0 {
+                inferlet::session::send(&format!("t:{emitted}"));
+            }
             break;
         }
         let correction = truth[m];
         if stop_tokens.contains(&correction) {
             stopped = true;
+            let emitted = generated.len() - prev_len;
+            if stream && emitted > 0 {
+                inferlet::session::send(&format!("t:{emitted}"));
+            }
             break;
         }
         committed.push(correction);
         generated.push(correction);
+        let emitted = generated.len() - prev_len;
+        if stream && emitted > 0 {
+            inferlet::session::send(&format!("t:{emitted}"));
+        }
 
         // Only the accepted run advances the sequence and survives in the
         // buffer; the next fire folds it ahead of its own rows.

@@ -88,6 +88,10 @@ struct Input {
     max_tokens: usize,
     #[serde(default = "default_seed")]
     seed: u32,
+    #[serde(default)]
+    prompt_tokens: Option<Vec<u32>>,
+    #[serde(default)]
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -338,12 +342,18 @@ async fn main(input: Input) -> Result<Output> {
     // entropy the sampler has to work with, and a raw completion prompt on an
     // instruction-tuned model degenerates into a low-entropy loop that no
     // reweighting scheme can mark.
-    let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
-    prompt.extend(chat::cue());
+    let mut prompt = if let Some(toks) = input.prompt_tokens {
+        toks
+    } else {
+        let mut p = chat::system_user("You are a helpful assistant.", &input.prompt);
+        p.extend(chat::cue());
+        p
+    };
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
+    let stream = input.stream;
 
     let cfg = Cfg {
         secret: input.secret,
@@ -394,6 +404,9 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.submit(&pipe).context("prefill submit")?;
 
     let g0 = tok_out_p.take_host::<i32>().await?;
+    if stream {
+        inferlet::session::send("t:1");
+    }
     generated.push(g0 as u32);
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
@@ -442,6 +455,9 @@ async fn main(input: Input) -> Result<Output> {
                 .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
+            if stream {
+                inferlet::session::send("t:1");
+            }
             generated.push(t as u32);
             Ok(ControlFlow::Continue(()))
         })

@@ -453,6 +453,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "naive-masked"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "pie-dtype"
 version = "0.6.0"
 
