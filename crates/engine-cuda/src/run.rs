@@ -270,6 +270,7 @@ impl RsSeat<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_page_runs(
         &self,
         plane: crate::store::rs::Plane,
@@ -1124,12 +1125,7 @@ impl<'c> Run<'c> {
                 .take(raw.len() as u64)
                 .map_err(|f| Self::rs_fault(op, f))?;
             crate::device::stage_raw(stream, runs_at, &raw).map_err(|f| Self::rs_fault(op, f))?;
-            kernels_cuda::runtime::channel::gather_words(
-                &self.ctx,
-                runs_at,
-                at,
-                runs.len() as u32,
-            )?;
+            kernels_cuda::runtime::channel::gather_words(self.ctx, runs_at, at, runs.len() as u32)?;
         }
         Ok(ext)
     }
