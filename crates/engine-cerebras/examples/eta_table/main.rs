@@ -30,7 +30,8 @@ use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Literal, RngKind, Shape};
 use serde_json::{Value as Json, json};
 
-use engine_cerebras::spatial::guest3::*;
+mod guest3;
+use guest3::*;
 
 // ------------------------------------------------------------------ programs
 

@@ -51,7 +51,7 @@
 //! `program = "dir"` names an already compiled output directory instead.
 
 pub mod ckpt;
-pub mod guest3;
+pub mod guest4;
 pub mod wafer;
 
 use std::collections::BTreeMap;
@@ -84,6 +84,9 @@ pub struct SpatialBoot {
     /// `"args"` or `"run_cfg"`: how requests reach the wafer program
     /// (default: decided from the program).
     pub launch: Option<String>,
+    /// Who runs translatable epilogues: `"off"`, `"check"` or `"wafer"`
+    /// (`Spatial::guest_mode`).
+    pub guest: Option<String>,
     /// The most steps a greedy lane's token loop runs past its row (0: off;
     /// loops start at 8 and double while a sequence uses them up).
     pub lookahead: Option<usize>,
@@ -108,6 +111,7 @@ impl SpatialBoot {
             program,
             params,
             launch: text("launch"),
+            guest: text("guest"),
             lookahead: t
                 .get("lookahead")
                 .and_then(toml::Value::as_integer)
@@ -444,6 +448,11 @@ struct Cached {
     next_loop: usize,
 }
 
+/// The guest VM's limits a table must fit (guest4's simulator build: wide
+/// registers, pool words).
+const GUEST_REGS: u32 = 12;
+const GUEST_POOL: u32 = 4096;
+
 /// Steps a sequence's first token loop runs past its row.
 const FIRST_LOOP: usize = 8;
 
@@ -480,6 +489,14 @@ pub struct Spatial {
     readout: Option<(String, u32)>,
     daemon: Option<Model>,
     kv: Kv,
+    /// Programs whose guest translation was told, and those the guest VM
+    /// can run, by program id.
+    guest_probed: std::collections::HashSet<u64>,
+    guest_programs: std::collections::HashMap<u64, std::sync::Arc<guest4::lane::Program>>,
+    /// The guest VM a lane's instance runs on, while it does.
+    guest_vms: std::collections::HashMap<InstanceId, guest4::lane::CheckVm>,
+    /// Epilogue steps the guest VM ran.
+    guest_steps: u64,
     /// Greedy rows a token loop answered, and the loops run.
     ahead_hits: u64,
     ahead_runs: u64,
@@ -502,6 +519,10 @@ impl Spatial {
             readout: None,
             daemon: None,
             kv: Kv::default(),
+            guest_probed: std::collections::HashSet::new(),
+            guest_programs: std::collections::HashMap::new(),
+            guest_vms: std::collections::HashMap::new(),
+            guest_steps: 0,
             ahead_hits: 0,
             ahead_runs: 0,
             next_fire: 0,
@@ -670,6 +691,114 @@ impl Spatial {
             .and_then(|v| v.parse().ok())
             .or(self.spatial.lookahead)
             .unwrap_or(default)
+    }
+
+    /// Whether the wafer's guest VM could run `instance`'s epilogue
+    /// (`guest::translate` at the VM's limits), told once a program: the
+    /// engine still runs every epilogue on the host; this says which would
+    /// move to the wafer (`spatial/eta/CONTRACT.md`).
+    fn probe_guest(&mut self, instance: InstanceId, program: ProgramId) {
+        if !self.guest_probed.insert(program.0) {
+            return;
+        }
+        let Some(plan) = self.programs.plan_of(instance) else {
+            return;
+        };
+        let vocab = self.readout.as_ref().map_or(0, |(_, w)| *w);
+        let host_takes: Vec<u32> = plan
+            .package
+            .channels
+            .iter()
+            .filter(|c| c.host_role == eta_ir::container::HostRole::Reader)
+            .map(|c| c.id)
+            .collect();
+        let name = self.readout.as_ref().map_or("", |(n, _)| n.as_str());
+        let built = guest4::translate(&plan, vocab, &host_takes, GUEST_REGS, GUEST_POOL)
+            .and_then(|table| guest4::lane::Program::of(&plan, table, name));
+        match built {
+            Ok(guest) => {
+                tracing::info!(
+                    program = program.0,
+                    instructions = guest.table.ins.len(),
+                    pre = guest.table.pre_len,
+                    registers = guest.table.nreg,
+                    pool = guest.table.pool_words,
+                    homes = guest.table.homes.len(),
+                    "spatial guest: the epilogue would run on the wafer"
+                );
+                self.guest_programs.insert(program.0, std::sync::Arc::new(guest));
+            }
+            Err(why) => tracing::info!(
+                program = program.0,
+                %why,
+                "spatial guest: the epilogue stays on the host"
+            ),
+        }
+    }
+
+    /// Who runs translatable epilogues: `PIE_SPATIAL_GUEST`, else the
+    /// config's `guest`: `"off"` (the host interpreter, the default),
+    /// `"check"` (the contract played on the host: [`guest4::lane::CheckVm`])
+    /// or `"wafer"` (the VM on the serving head, once the program has one;
+    /// until then the host).
+    fn guest_mode(&self) -> String {
+        std::env::var("PIE_SPATIAL_GUEST")
+            .ok()
+            .or_else(|| self.spatial.guest.clone())
+            .unwrap_or_else(|| "off".to_string())
+    }
+
+    /// `instance`'s epilogue through the guest contract, if its program has
+    /// a table and the mode runs one; `false` when the host interpreter
+    /// should run it as usual.
+    fn fire_guest(
+        &mut self,
+        instance: InstanceId,
+        outputs: &[(String, u32, Value)],
+    ) -> EngineResult<bool> {
+        if self.guest_mode() != "check" {
+            return Ok(false);
+        }
+        let Some((program, plan, inst)) = self.programs.instance_view(instance) else {
+            return Ok(false);
+        };
+        let Some(guest) = self.guest_programs.get(&program.0).cloned() else {
+            return Ok(false);
+        };
+        let vm = self
+            .guest_vms
+            .entry(instance)
+            .or_insert_with(|| guest4::lane::CheckVm::load(&plan, inst));
+        let (out, wide) = vm
+            .step(&plan, &guest, inst, outputs)
+            .map_err(|why| Error::Device(format!("the guest VM: {why}")))?;
+        self.guest_steps += 1;
+        if self.guest_steps.is_power_of_two() {
+            tracing::info!(
+                steps = self.guest_steps,
+                program = program.0,
+                "spatial guest: epilogue steps run through the VM contract"
+            );
+        }
+        self.programs
+            .fire_with(
+                instance,
+                outputs,
+                Stage::Epilogue,
+                &mut guest4::lane::VmStage {
+                    program: &guest,
+                    out: &out,
+                    wide: &wide,
+                },
+            )
+            .map_err(refusal)?;
+        if let (Some(vm), Some((_, _, inst))) = (
+            self.guest_vms.get(&instance),
+            self.programs.instance_view(instance),
+        ) {
+            vm.read_back(&guest, inst);
+        }
+        Ok(true)
     }
 
     /// Refuses a lane whose attention is not causal over its own history:
@@ -919,9 +1048,11 @@ impl Spatial {
                     }
                 }
             }
-            self.programs
-                .fire_interpreted(attachment.instance, &outputs, Stage::Epilogue)
-                .map_err(refusal)?;
+            if !self.fire_guest(attachment.instance, &outputs)? {
+                self.programs
+                    .fire_interpreted(attachment.instance, &outputs, Stage::Epilogue)
+                    .map_err(refusal)?;
+            }
         }
         Ok(lanes
             .iter()
@@ -1198,10 +1329,13 @@ impl Engine for Spatial {
                 caps.geometry, binding.geometry
             )));
         }
-        self.programs.bind(binding).map_err(refusal)
+        let bound = self.programs.bind(binding).map_err(refusal)?;
+        self.probe_guest(bound.id, bound.program);
+        Ok(bound)
     }
 
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
+        self.guest_vms.remove(&id);
         self.programs.close_instance(id).map_err(refusal)
     }
 

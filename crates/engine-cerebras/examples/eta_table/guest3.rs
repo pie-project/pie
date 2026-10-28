@@ -1,3 +1,5 @@
+//! (The eta_table example's guest3 translator; the engine uses guest4.)
+//!
 //! eta epilogues as op tables for the wafer's guest region (the `guest3`
 //! interpreter, docs/cerebras-spatial-design.md §4a; spatial/eta/README.md in
 //! the bring-up tree): five-word instructions over wide registers (one a
@@ -211,8 +213,11 @@ pub fn translate(
                     other => return Err(format!("unsupported channel input {c}: {other:?}")),
                 }
             }
-            Op::Broadcast { value, .. } => match get(*value)? {
+            Op::Broadcast { value, shape } => match get(*value)? {
                 Loc::Scalar(s) => Some(Loc::Bcast(s)),
+                // A vocabulary row broadcast to a vocabulary row's shape
+                // ([V] to [1, V]) is the row.
+                Loc::Wide(r) if numel(shape) == vocab => Some(Loc::Wide(r)),
                 other => return Err(format!("broadcast of {other:?}")),
             },
             Op::Iota { len } => Some(Loc::Host((0..*len).collect())),
@@ -271,6 +276,32 @@ pub fn translate(
                 let (ra, rb) = (t.as_wide(&get(*a)?)?, t.as_wide(&get(*b)?)?);
                 let d = t.wide()?;
                 t.emit(WMIN, d, ra, rb, 0);
+                Some(Loc::Wide(d))
+            }
+            // a >= b is 1 - (a < b), a <= b is 1 - (a > b) (0/1 rows).
+            Op::Ge(a, b) | Op::Le(a, b) => {
+                let ge = matches!(op, Op::Ge(..));
+                let (la, lb) = (get(*a)?, get(*b)?);
+                let lt = t.wide()?;
+                match (&la, &lb) {
+                    (Loc::Wide(ra), Loc::Wide(rb)) => {
+                        t.emit(if ge { WLT } else { WGT }, lt, *ra, *rb, 0)
+                    }
+                    (Loc::Wide(ra), Loc::Bcast(s) | Loc::Scalar(s)) => {
+                        t.emit(if ge { WLTS } else { WGTS }, lt, *ra, *s, 0)
+                    }
+                    (Loc::Bcast(s) | Loc::Scalar(s), Loc::Wide(rb)) => {
+                        t.emit(if ge { WGTS } else { WLTS }, lt, *rb, *s, 0)
+                    }
+                    other => return Err(format!("comparison of {other:?}")),
+                }
+                let one = t.sconst(1.0)?;
+                let neg = t.wide()?;
+                t.emit(WNEG, neg, lt, 0, 0);
+                t.free.push(lt);
+                let d = t.wide()?;
+                t.emit(WADDS, d, neg, one, 0);
+                t.free.push(neg);
                 Some(Loc::Wide(d))
             }
             Op::Gt(a, b) | Op::Lt(a, b) => {
@@ -418,6 +449,8 @@ fn operands(op: &Op) -> Vec<u32> {
         | Op::And(a, b)
         | Op::Gt(a, b)
         | Op::Lt(a, b)
+        | Op::Ge(a, b)
+        | Op::Le(a, b)
         | Op::Eq(a, b) => vec![*a, *b],
         Op::Select { cond, a, b } => vec![*cond, *a, *b],
         Op::RngKeyed { state, .. } => vec![*state],

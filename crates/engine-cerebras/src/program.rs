@@ -903,6 +903,49 @@ impl Plane {
         true
     }
 
+    /// The program `instance` runs, its plan and its channels.
+    #[must_use]
+    pub fn instance_view(
+        &self,
+        instance: InstanceId,
+    ) -> Option<(ProgramId, Arc<ExecPlan>, &InterpInstance)> {
+        self.instances
+            .get(&instance)
+            .map(|seat| (seat.program, Arc::clone(&seat.plan), &seat.inst))
+    }
+
+    /// [`Plane::fire_interpreted`] with the stages run by `runner`.
+    pub fn fire_with(
+        &mut self,
+        instance: InstanceId,
+        outputs: &[(String, u32, Value)],
+        at: Stage,
+        runner: &mut dyn eta_exec::StageRunner,
+    ) -> Result<(), Refusal> {
+        let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        let inputs = PassInputs { outputs };
+        let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, runner, at);
+        let program = seat.program;
+        match outcome {
+            StepOutcome::Committed => Ok(()),
+            StepOutcome::Blocked(channel) => Err(Refusal::Program(format!(
+                "instance {instance} (program {program}) blocked on channel {channel}"
+            ))),
+            StepOutcome::Faulted(why) => Err(Refusal::Program(format!(
+                "instance {instance} (program {program}) faulted: {why}"
+            ))),
+        }
+    }
+
+    /// The plan `instance` runs.
+    #[must_use]
+    pub fn plan_of(&self, instance: InstanceId) -> Option<Arc<ExecPlan>> {
+        self.instances.get(&instance).map(|seat| Arc::clone(&seat.plan))
+    }
+
     pub fn prologue_runs(&self, instance: InstanceId) -> bool {
         self.instances
             .get(&instance)

@@ -207,6 +207,9 @@ pub struct CerebrasEngineOptions {
     /// Steps a greedy lane's token loop runs past its row in one wafer
     /// launch (0: off); omit for the engine's default.
     pub spatial_lookahead: Option<u32>,
+    /// Who runs epilogues the wafer's guest VM can: `"off"` (the host, the
+    /// default), `"check"` (the VM contract played on the host) or `"wafer"`.
+    pub spatial_guest: Option<String>,
     /// The checkpoint the daemon loads; omit for the model's.
     pub spatial_ckpt: Option<String>,
     /// The daemon runs only the first this many layers; omit for all.
@@ -229,6 +232,7 @@ impl Default for CerebrasEngineOptions {
             spatial_params: None,
             spatial_launch: None,
             spatial_lookahead: None,
+            spatial_guest: None,
             spatial_ckpt: None,
             spatial_layers: None,
         }

@@ -844,6 +844,9 @@ pub(crate) fn create_engine_backend(
                         toml::Value::String(program.clone())
                     ));
                 }
+                if let Some(guest) = &opts.spatial_guest {
+                    boot_doc.push_str(&format!("guest = {}\n", toml::Value::String(guest.clone())));
+                }
                 if let Some(lookahead) = opts.spatial_lookahead {
                     boot_doc.push_str(&format!("lookahead = {lookahead}\n"));
                 }
