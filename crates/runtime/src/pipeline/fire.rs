@@ -2685,7 +2685,33 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 stamp_lane_words(&mut rows, &switched, &kept, false, None);
                 rows
             };
-            let spans: Vec<(std::ops::Range<u64>, std::ops::Range<u64>)> = groups
+            // A piece's request keeps only the lanes with rows in it,
+            // renumbered; `groups` holds the pass's lane indices. What reads
+            // the piece's request (its written spans, its page tables) needs
+            // the piece's.
+            let kept_lanes: Vec<usize> = if cuts.len() == 1 {
+                (0..full.lanes.len()).collect()
+            } else {
+                piece
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cut)| cut.is_some())
+                    .map(|(lane, _)| lane)
+                    .collect()
+            };
+            let piece_groups: LaneGroups = groups
+                .iter()
+                .map(|(ws, lanes)| {
+                    (
+                        *ws,
+                        lanes
+                            .iter()
+                            .filter_map(|lane| kept_lanes.iter().position(|kept| kept == lane))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let spans: Vec<(std::ops::Range<u64>, std::ops::Range<u64>)> = piece_groups
                 .iter()
                 .map(|(_, lanes)| written_span_of(&req, lanes, page_size))
                 .collect();
@@ -2831,7 +2857,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 });
             }
             settles.extend(settling(&parts));
-            if let Err(refusal) = map_lane_pages(&mut req, &stores, &groups) {
+            if let Err(refusal) = map_lane_pages(&mut req, &stores, &piece_groups) {
                 return Ok(Err(refusal));
             }
             crate::offload::stream::tap(pid, &stores, &mut req);
