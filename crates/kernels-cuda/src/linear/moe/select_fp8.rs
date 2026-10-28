@@ -61,12 +61,12 @@ pub(super) fn quantize_rows_e4m3b128(
 }
 
 /// Whether the mma.sync fp8 kernels take a product of `x` against a
-/// 128x128-block FP8 plane `n` rows wide: bf16 rows, K in whole 512s (as the
-/// load lays the exponents), N in whole 128-row blocks.
+/// 128x128-block FP8 plane `n` rows wide: bf16 rows, K in whole 128-wide
+/// blocks (a K step each), N in whole 128-row blocks.
 #[cfg(feature = "cuda")]
 #[must_use]
 pub fn fp8_w8a8_takes(x: Tensor, n: u32) -> bool {
-    x.dtype == Dtype::Bf16 && x.width > 0 && x.width.is_multiple_of(512) && n.is_multiple_of(128)
+    x.dtype == Dtype::Bf16 && x.width > 0 && x.width.is_multiple_of(128) && n.is_multiple_of(128)
 }
 
 /// `y[route] = q(x[route or its token]) . W[routes[route]]^T` for a
@@ -90,7 +90,7 @@ pub fn select_fp8_w8a8(
     if !fp8_w8a8_takes(x, y.width) || experts == 0 {
         return Err(refuse(
             OP,
-            "the fp8 select takes bf16 rows, K in 512s and N in 128s",
+            "the fp8 select takes bf16 rows, K and N in 128s",
         ));
     }
     let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
@@ -214,7 +214,7 @@ pub fn matmul_fp8_w8a8(
     if !fp8_w8a8_takes(x, y.width) || y.rows != x.rows || y.dtype != Dtype::Bf16 {
         return Err(refuse(
             OP,
-            "the fp8 matmul takes bf16 rows, K in 512s and N in 128s",
+            "the fp8 matmul takes bf16 rows, K and N in 128s",
         ));
     }
     if x.rows == 0 {
