@@ -582,6 +582,48 @@ impl Runtime {
         Ok(())
     }
 
+    /// Copies row `r` of `data` (`elems_per_pe` elements a row) into the
+    /// exported variable `symbol` on every PE of row `r` of `rect`: one
+    /// copy whose data is the rectangle's height, not its area (a per-row
+    /// table every column reads).
+    pub fn memcpy_h2d_rowbcast(
+        &mut self,
+        symbol: &str,
+        data: &[u32],
+        rect: Rect,
+        elems_per_pe: usize,
+        data_type: DataType,
+    ) -> Result<()> {
+        let id = self.rpc.id(symbol, RpcKind::Var)?;
+        let expected = (rect.h.max(0) as usize) * elems_per_pe;
+        if data.len() != expected {
+            return Err(Error::Size {
+                symbol: symbol.into(),
+                expected,
+                actual: data.len(),
+            });
+        }
+        let opts = MemcpyOptions::new(false, data_type as i32, Order::RowMajor as i32, false);
+        let mut task = Task::empty();
+        // SAFETY: data outlives the blocking copy; the SDK only reads it.
+        unsafe {
+            (self.api().memcpy_h2d_rowbcast)(
+                &mut task,
+                self.this(),
+                id,
+                data.as_ptr() as *mut c_void,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                elems_per_pe as i32,
+                &opts,
+            )
+        };
+        self.finish(&mut task);
+        Ok(())
+    }
+
     /// Copies `data` into `symbol` like [`Runtime::memcpy_h2d`] without
     /// waiting: the copy is queued ahead of later calls, and
     /// [`Runtime::wait_pending`] (or any later blocking call's caller) ends it.

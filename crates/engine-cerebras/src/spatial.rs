@@ -26,6 +26,14 @@
 //! whose mask says otherwise is refused, as is a program reading attention
 //! scores.
 //!
+//! A model that owns the KV cache as PIE's pages (its load answer says
+//! `paged`: `fire` / `copy` in the protocol) runs a fire's lanes together,
+//! each with its KV write slots, RoPE positions, pages and mask, and needs no
+//! replay: `copy_kv` is a page copy, a truncate a smaller slot. A lane whose
+//! pages the model never got (a fire that named another lane's pages) is
+//! re-prefilled into them from its own tokens first; the replay above stays
+//! the fallback for a model of single-sequence caches.
+//!
 //! Selected by `[cerebras.spatial]` in the engine config:
 //!
 //! ```toml
@@ -52,6 +60,8 @@
 
 pub mod ckpt;
 pub mod guest4;
+pub mod paged;
+pub mod serve2d;
 pub mod wafer;
 
 use std::collections::BTreeMap;
@@ -132,6 +142,8 @@ impl SpatialBoot {
 struct Daemon {
     /// Sequences' caches it holds (its load answer's `caches`, else 1).
     caches: usize,
+    /// It owns the KV cache as PIE's pages (its load answer's `paged`).
+    paged: bool,
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -157,6 +169,7 @@ impl Daemon {
             .ok_or_else(|| Error::Load("daemon stdout".into()))?;
         Ok(Daemon {
             caches: 1,
+            paged: false,
             child,
             stdin,
             stdout: BufReader::new(stdout),
@@ -206,6 +219,70 @@ enum Model {
 
 impl Model {
     /// Sequences' caches the model holds at once.
+    /// Whether the model owns the KV cache as PIE's pages: a fire's lanes
+    /// run with their page tables, no history replayed.
+    fn paged(&self) -> bool {
+        matches!(self, Model::Daemon(d) if d.paged)
+    }
+
+    /// One fire's lanes on the paged cache: each lane's tokens at positions
+    /// `start..` through its pages; the logits `which` asks for, per lane.
+    fn fire_paged(&mut self, lanes: &[&PagedLane]) -> EngineResult<Vec<Vec<Vec<f32>>>> {
+        let Model::Daemon(d) = self else {
+            return Err(Error::Device("the wafer program owns no paged KV yet".into()));
+        };
+        let request: Vec<serde_json::Value> = lanes
+            .iter()
+            .map(|lane| {
+                serde_json::json!({
+                    "tokens": lane.tokens, "slots": lane.slots, "positions": lane.positions,
+                    "pages": lane.pages, "visible": lane.visible,
+                    "logits": match lane.which {
+                        wafer::Logits::None => "none",
+                        wafer::Logits::Last => "last",
+                        wafer::Logits::All => "all",
+                    },
+                })
+            })
+            .collect();
+        let answer = d.call(&serde_json::json!({"op": "fire", "lanes": request}))?;
+        let rows = |v: &serde_json::Value| -> Vec<Vec<f32>> {
+            v.get("logits")
+                .and_then(serde_json::Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| {
+                            row.as_array()
+                                .map(|v| {
+                                    v.iter()
+                                        .map(|x| x.as_f64().unwrap_or(f64::NAN) as f32)
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Ok(answer
+            .get("lanes")
+            .and_then(serde_json::Value::as_array)
+            .map(|lanes| lanes.iter().map(rows).collect())
+            .unwrap_or_default())
+    }
+
+    /// `copy_kv`'s token runs on the paged cache.
+    fn copy_paged(&mut self, runs: &[engine::transfer::KvRun]) -> EngineResult<()> {
+        let Model::Daemon(d) = self else {
+            return Err(Error::Device("the wafer program owns no paged KV yet".into()));
+        };
+        let runs: Vec<[u32; 5]> = runs
+            .iter()
+            .map(|r| [r.src_page, r.src_token, r.dst_page, r.dst_token, r.tokens])
+            .collect();
+        d.call(&serde_json::json!({"op": "copy", "runs": runs})).map(drop)
+    }
+
     fn caches(&self) -> usize {
         match self {
             Model::Daemon(d) => d.caches.max(1),
@@ -331,6 +408,70 @@ impl Model {
     }
 }
 
+/// One lane of a fire on a paged model.
+struct PagedLane {
+    tokens: Vec<u32>,
+    /// The KV slot each row appends at.
+    slots: Vec<u32>,
+    /// The RoPE position each row rotates by.
+    positions: Vec<u32>,
+    pages: Vec<u32>,
+    /// Per row, the slots it attends as `[start, end)` runs; `None`: every
+    /// slot up to its own.
+    visible: Option<Vec<Vec<[u32; 2]>>>,
+    which: wafer::Logits,
+}
+
+/// Per row of a lane's `rows` rows, the KV slots its mask admits, as runs: a
+/// device geometry instance's dense mask, else `masking` (the fire's, or its
+/// instance's port), else `None` (causal).
+fn visible_runs(
+    masking: Option<&engine::fire::Masking>,
+    rows: usize,
+    dense: Option<&(Vec<bool>, usize)>,
+) -> Option<Vec<Vec<[u32; 2]>>> {
+    let runs_of = |cells: &[bool]| -> Vec<[u32; 2]> {
+        let mut runs = Vec::new();
+        let mut at = 0;
+        while at < cells.len() {
+            if cells[at] {
+                let start = at;
+                while at < cells.len() && cells[at] {
+                    at += 1;
+                }
+                runs.push([start as u32, at as u32]);
+            } else {
+                at += 1;
+            }
+        }
+        runs
+    };
+    if let Some((cells, stride)) = dense {
+        return Some(
+            (0..rows)
+                .map(|r| runs_of(&cells[r * stride..(r + 1) * stride]))
+                .collect(),
+        );
+    }
+    let masking = masking?;
+    Some(
+        (0..rows)
+            .map(|r| {
+                let mask = match masking {
+                    engine::fire::Masking::Extent(mask) => mask,
+                    engine::fire::Masking::Rows(masks) => match masks.get(r) {
+                        Some(mask) => mask,
+                        None => return Vec::new(),
+                    },
+                };
+                mask.admitted(0..mask.len())
+                    .map(|span| [span.start as u32, span.end as u32])
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
 /// `request` for cache `cache` (named only past the first, so a daemon of
 /// one cache never sees the key).
 fn with_cache(mut request: serde_json::Value, cache: usize) -> serde_json::Value {
@@ -360,6 +501,12 @@ struct Kv {
     slots: std::collections::HashMap<u32, Vec<u32>>,
     /// Pages a copy wrote since a lane last fired on them.
     copied: std::collections::HashSet<u32>,
+    /// On a paged model: page cells record what the model's pages hold, so
+    /// only paged fires (and copies) write them; slots whose pages the
+    /// model never got (a fire that named another lane's pages) replay
+    /// from their own tokens until they start over.
+    paged: bool,
+    tainted: std::collections::HashSet<u32>,
     /// Each of the model's caches: the tokens it holds, position by
     /// position, the argmax after each where a token loop told it, and when
     /// it last ran (to give the least recent away).
@@ -402,6 +549,57 @@ impl Kv {
             .collect()
     }
 
+    /// Whether the cells of `pages` below slot `upto` all hold a token, or
+    /// are in `planned` (written earlier in the same fire).
+    fn known(
+        &self,
+        pages: &[u32],
+        upto: u32,
+        planned: &std::collections::HashSet<(u32, u32)>,
+    ) -> bool {
+        let size = self.page_size.max(1);
+        (0..upto).all(|q| {
+            let Some(&page) = pages.get((q / size) as usize) else {
+                return false;
+            };
+            planned.contains(&(page, q % size))
+                || self
+                    .pages
+                    .get(&page)
+                    .and_then(|cells| cells.get((q % size) as usize).copied().flatten())
+                    .is_some()
+        })
+    }
+
+    /// A paged fire's rows: `tokens` at KV `slots` of `pages`, and the
+    /// slot's own tokens where the rows continue them.
+    fn write_paged(&mut self, slot: u32, pages: &[u32], slots: &[u32], tokens: &[u32]) {
+        let size = self.page_size.max(1);
+        for (&q, &tok) in slots.iter().zip(tokens) {
+            if let Some(&page) = pages.get((q / size) as usize) {
+                let cells = self.pages.entry(page).or_insert_with(|| vec![None; size as usize]);
+                cells[(q % size) as usize] = Some(tok);
+            }
+        }
+        for page in pages {
+            self.copied.remove(page);
+        }
+        let first = slots.first().copied().unwrap_or(0);
+        let contiguous = slots.iter().enumerate().all(|(i, &q)| q == first + i as u32);
+        match self.slots.get_mut(&slot) {
+            Some(have) if contiguous && have.len() >= first as usize => {
+                have.truncate(first as usize);
+                have.extend_from_slice(tokens);
+            }
+            _ if contiguous && first == 0 => {
+                self.slots.insert(slot, tokens.to_vec());
+            }
+            _ => {
+                self.slots.remove(&slot);
+            }
+        }
+    }
+
     /// `tokens` written at positions `start..` of the lane.
     fn write(
         &mut self,
@@ -417,7 +615,7 @@ impl Kv {
         for page in pages {
             self.copied.remove(page);
         }
-        if pages.is_empty() {
+        if pages.is_empty() || self.paged {
             return Ok(());
         }
         let size = self.page_size.max(1);
@@ -497,6 +695,12 @@ pub struct Spatial {
     guest_vms: std::collections::HashMap<InstanceId, guest4::lane::CheckVm>,
     /// Epilogue steps the guest VM ran.
     guest_steps: u64,
+    /// Rows of history replayed into the model's cache (the fallback for a
+    /// model that owns no paged KV), and fires run on paged KV.
+    replayed: u64,
+    paged_fires: u64,
+    /// Rows re-prefilled into a lane's own pages.
+    refilled: u64,
     /// Greedy rows a token loop answered, and the loops run.
     ahead_hits: u64,
     ahead_runs: u64,
@@ -523,6 +727,9 @@ impl Spatial {
             guest_programs: std::collections::HashMap::new(),
             guest_vms: std::collections::HashMap::new(),
             guest_steps: 0,
+            replayed: 0,
+            paged_fires: 0,
+            refilled: 0,
             ahead_hits: 0,
             ahead_runs: 0,
             next_fire: 0,
@@ -628,6 +835,12 @@ impl Spatial {
             self.kv.cached[cache].truncate(agree);
         }
         if agree < history.len() {
+            self.replayed += (history.len() - agree) as u64;
+            tracing::info!(
+                rows = history.len() - agree,
+                total = self.replayed,
+                "spatial: history replayed"
+            );
             self.daemon()?
                 .forward(cache, &history[agree..], agree as u32, wafer::Logits::None)?;
             self.kv.cached[cache].extend(&history[agree..]);
@@ -896,6 +1109,10 @@ impl Spatial {
         let mut tokens: Vec<Vec<u32>> = lanes.iter().map(|l| l.tokens.clone()).collect();
         // Masks a device geometry instance states on its port, by lane.
         let mut dense_masks: BTreeMap<usize, (Vec<bool>, usize)> = BTreeMap::new();
+        // The KV slots a device geometry instance places a lane's rows at.
+        let mut port_slots: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+        // Masks an instance's port states for a lane the host places.
+        let mut host_masks: BTreeMap<usize, engine::fire::Masking> = BTreeMap::new();
         let mut positions: Vec<Vec<u32>> = lanes.iter().map(|l| l.positions.clone()).collect();
         for attachment in &step.attachments {
             if attachment.adapter_only {
@@ -945,7 +1162,23 @@ impl Spatial {
                         (!lane.kv.pages.is_empty()).then_some(lane.kv.held)
                     };
                     tokens[source] = ports.tokens_for(rows).map_err(port_error)?.to_vec();
+                    if let Some(slots) = ports.slots(rows).map_err(port_error)? {
+                        port_slots.insert(source, slots.to_vec());
+                    }
                     if let Some((cells, stride)) = ports.mask(rows).map_err(port_error)? {
+                        if std::env::var_os("PIE_SPATIAL_TRACE").is_some() {
+                            let seen: Vec<usize> = cells[..stride]
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, c)| **c)
+                                .map(|(i, _)| i)
+                                .collect();
+                            eprintln!(
+                                "spatial-trace mask: lane {source} rows {rows} stride {stride} row0 \
+                                 sees {seen:?} slots {:?}",
+                                ports.slots(rows).ok().flatten()
+                            );
+                        }
                         dense_masks.insert(source, (cells.to_vec(), stride));
                     }
                     if let Some(have) = have {
@@ -968,6 +1201,16 @@ impl Spatial {
                     {
                         tokens[source] = ids;
                     }
+                    // The mask its `attn_mask` port states, when the fire
+                    // carries none.
+                    if lane.mask.is_none()
+                        && let Some(mask) = self
+                            .programs
+                            .envelope_mask(instance, lane.tokens.len(), at)
+                            .map_err(refusal)?
+                    {
+                        host_masks.insert(source, mask);
+                    }
                 }
             }
         }
@@ -987,6 +1230,12 @@ impl Spatial {
         let mut read_rows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         // Lanes a token loop answered (their row a one-hot of the argmax).
         let mut fast: Vec<bool> = Vec::with_capacity(lanes.len());
+        // A paged model runs the fire's lanes together, each through its own
+        // pages: (lane index, tokens, start, pages, logits asked, rows read).
+        let paged = self.daemon.as_ref().is_some_and(Model::paged);
+        let mut paged_lanes: Vec<(usize, PagedLane, Vec<u32>)> = Vec::new();
+        // Cells the fire's paged lanes so far will have written.
+        let mut planned: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         for (at, lane) in lanes.iter().enumerate() {
             let n = tokens[at].len() as u32;
             let rows: Vec<u32> = match &lane.readout {
@@ -1016,7 +1265,6 @@ impl Spatial {
                         positions[at]
                     )));
                 }
-                self.check_masks(lane, at, start, tokens[at].len(), dense_masks.get(&at))?;
                 // Greedy: the lane's one reader takes only the argmax of the
                 // logits.
                 let greedy = attached
@@ -1024,11 +1272,135 @@ impl Spatial {
                     .is_some_and(|&instance| self.programs.greedy_reads(instance, &name))
                     && step.attachments.iter().filter(|a| !a.adapter_only).count() == 1;
                 let ahead = engine::ahead::take(lane.slot, lane.kv.held);
-                self.forward(lane.slot, &lane.kv.pages, &tokens[at], start, &rows, greedy, ahead)?
+                let first_slot = port_slots
+                    .get(&at)
+                    .and_then(|s| s.first().copied())
+                    .unwrap_or(if positions[at].is_empty() { start } else { lane.kv.held });
+                if first_slot == 0 {
+                    self.kv.tainted.remove(&lane.slot);
+                }
+                // The model's pages must hold what the lane's rows will read;
+                // a lane continuing on pages the model never got (a fire
+                // that named another lane's pages) is re-prefilled into them
+                // from its own tokens first.
+                let mut on_pages = paged
+                    && !lane.kv.pages.is_empty()
+                    && !self.kv.tainted.contains(&lane.slot)
+                    && self.kv.known(&lane.kv.pages, first_slot, &planned);
+                if paged && !on_pages && !lane.kv.pages.is_empty() && first_slot > 0 {
+                    let history = self
+                        .kv
+                        .slots
+                        .get(&lane.slot)
+                        .filter(|h| h.len() >= first_slot as usize)
+                        .map(|h| h[..first_slot as usize].to_vec());
+                    if let Some(history) = history {
+                        let slots: Vec<u32> = (0..first_slot).collect();
+                        let refill = PagedLane {
+                            tokens: history.clone(),
+                            slots: slots.clone(),
+                            positions: slots.clone(),
+                            pages: lane.kv.pages.clone(),
+                            visible: None,
+                            which: wafer::Logits::None,
+                        };
+                        self.daemon()?.fire_paged(&[&refill])?;
+                        self.kv.write_paged(lane.slot, &lane.kv.pages, &slots, &history);
+                        self.kv.tainted.remove(&lane.slot);
+                        self.refilled += u64::from(first_slot);
+                        tracing::info!(
+                            slot = lane.slot,
+                            rows = first_slot,
+                            total = self.refilled,
+                            "spatial: lane re-prefilled into its own pages"
+                        );
+                        on_pages = self.kv.known(&lane.kv.pages, first_slot, &planned);
+                    }
+                }
+                if paged && !on_pages {
+                    if self.kv.tainted.insert(lane.slot) {
+                        tracing::info!(
+                            slot = lane.slot,
+                            first_slot,
+                            "spatial: the model's pages do not hold this lane's cache; it \
+                             replays from its own tokens until it starts over"
+                        );
+                    }
+                }
+                if on_pages {
+                    let last_only = rows.len() == 1 && rows[0] as usize + 1 == tokens[at].len();
+                    let which = if rows.is_empty() {
+                        wafer::Logits::None
+                    } else if last_only {
+                        wafer::Logits::Last
+                    } else {
+                        wafer::Logits::All
+                    };
+                    let n = tokens[at].len();
+                    // Where the rows' K/V go (the instance's slots, else after
+                    // what the lane holds), how they rotate (their positions,
+                    // else their slots), and what each sees (its mask, else
+                    // every slot up to its own).
+                    let slots: Vec<u32> = port_slots.get(&at).cloned().unwrap_or_else(|| {
+                        let held = if positions[at].is_empty() { start } else { lane.kv.held };
+                        (held..held + n as u32).collect()
+                    });
+                    let rope = if positions[at].is_empty() {
+                        slots.clone()
+                    } else {
+                        positions[at].clone()
+                    };
+                    let visible = visible_runs(
+                        lane.mask.as_ref().or(host_masks.get(&at)),
+                        n,
+                        dense_masks.get(&at),
+                    );
+                    let size = self.kv.page_size.max(1);
+                    for &q in &slots {
+                        if let Some(&page) = lane.kv.pages.get((q / size) as usize) {
+                            planned.insert((page, q % size));
+                        }
+                    }
+                    paged_lanes.push((
+                        at,
+                        PagedLane {
+                            tokens: tokens[at].clone(),
+                            slots,
+                            positions: rope,
+                            pages: lane.kv.pages.clone(),
+                            visible,
+                            which,
+                        },
+                        rows.clone(),
+                    ));
+                    (Vec::new(), false)
+                } else {
+                    // A model of one sequence a cache runs causal attention
+                    // only (a paged model attends what each row's mask says).
+                    self.check_masks(lane, at, start, tokens[at].len(), dense_masks.get(&at))?;
+                    self.forward(lane.slot, &lane.kv.pages, &tokens[at], start, &rows, greedy, ahead)?
+                }
             };
             logits.push(out);
             fast.push(ran_ahead);
             read_rows.push(rows);
+        }
+        if !paged_lanes.is_empty() {
+            let request: Vec<&PagedLane> = paged_lanes.iter().map(|(_, lane, _)| lane).collect();
+            let answers = self.daemon()?.fire_paged(&request)?;
+            self.paged_fires += 1;
+            for ((at, lane, rows), lane_logits) in paged_lanes.into_iter().zip(answers) {
+                self.kv
+                    .write_paged(lanes[at].slot, &lane.pages, &lane.slots, &lane.tokens);
+                logits[at] = match lane.which {
+                    wafer::Logits::None => Vec::new(),
+                    wafer::Logits::Last => lane_logits,
+                    wafer::Logits::All => rows
+                        .iter()
+                        .map(|&r| lane_logits.get(r as usize).cloned().unwrap_or_default())
+                        .collect(),
+                };
+            }
         }
         // Guest passes in the interpreter, each output it reads from this fire.
         let mut guest_read = vec![false; lanes.len()];
@@ -1173,6 +1545,7 @@ impl Engine for Spatial {
             ),
             (None, None) => None,
         };
+        let mut paged_model = false;
         let model = if let Some(program) = &program {
             let platform = match &self.boot.cmaddr {
                 Some(cmaddr) => crate::sdk::Platform::System {
@@ -1190,7 +1563,10 @@ impl Engine for Spatial {
         } else {
             let cmd = self.spatial.daemon.clone().unwrap_or_default();
             let mut daemon = Daemon::spawn(&cmd)?;
-            let mut load = serde_json::json!({"op": "load", "ckpt": ckpt});
+            let mut load = serde_json::json!({
+                "op": "load", "ckpt": ckpt,
+                "paged": {"page_size": shell.paging().page_size},
+            });
             if let Some(layers) = self.spatial.layers {
                 load["layers"] = serde_json::json!(layers);
             }
@@ -1199,11 +1575,16 @@ impl Engine for Spatial {
                 .get("caches")
                 .and_then(serde_json::Value::as_u64)
                 .map_or(1, |n| n.max(1) as usize);
+            daemon.paged = answer.get("paged").and_then(serde_json::Value::as_bool) == Some(true);
+            paged_model = daemon.paged;
             tracing::info!(?answer, "spatial model daemon loaded");
             Model::Daemon(daemon)
         };
         self.daemon = Some(model);
-        self.kv = Kv::default();
+        self.kv = Kv {
+            paged: paged_model,
+            ..Kv::default()
+        };
 
         let trace_name = shell.trace().name.clone();
         let paging = shell.paging();
@@ -1297,6 +1678,10 @@ impl Engine for Spatial {
             });
         }
         let size = self.kv.page_size.max(1);
+        if self.daemon.as_ref().is_some_and(Model::paged) {
+            let runs = copy.runs(size)?;
+            self.daemon()?.copy_paged(&runs)?;
+        }
         for run in copy.runs(size)? {
             let src: Vec<Option<u32>> = self
                 .kv

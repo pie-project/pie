@@ -139,6 +139,64 @@ impl Layout {
     }
 }
 
+/// Which wafer program a compiled output directory holds.
+pub enum Design {
+    /// serve28 / serve28s*: layer strips and the strip head.
+    Strips(Layout),
+    /// serve2d: qwen2d grids and head2d.
+    Grid(super::serve2d::Layout2d),
+}
+
+impl Design {
+    pub fn read(program: &Path) -> R<Design> {
+        let path = program.join("out.json");
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?,
+        )
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+        let get = |k: &str| {
+            let x = &v["params"][k];
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.trim().parse().ok()))
+                .map(|n| n as usize)
+        };
+        match super::serve2d::Layout2d::of(get) {
+            Some(grid) => grid
+                .map(Design::Grid)
+                .map_err(|e| format!("{}: {e}", path.display())),
+            None => Layout::read(program).map(Design::Strips),
+        }
+    }
+
+    pub fn cap(&self) -> usize {
+        match self {
+            Design::Strips(l) => l.cap,
+            Design::Grid(g) => g.cap,
+        }
+    }
+
+    pub fn positions(&self) -> usize {
+        match self {
+            Design::Strips(l) => l.positions,
+            Design::Grid(g) => g.positions(),
+        }
+    }
+
+    pub fn vocab(&self) -> usize {
+        match self {
+            Design::Strips(l) => l.vocab,
+            Design::Grid(g) => g.vocab,
+        }
+    }
+
+    pub fn hidden(&self) -> usize {
+        match self {
+            Design::Strips(l) => l.hidden,
+            Design::Grid(g) => g.hidden,
+        }
+    }
+}
+
 /// Where placed weights go: the runtime, or a recorder for checking.
 pub trait Sink {
     fn h2d(&mut self, symbol: &str, rect: Rect, elems_per_pe: usize, words: &[u32]) -> R<()>;
@@ -460,7 +518,7 @@ pub enum Logits {
 /// The program on the fabric, weights placed.
 pub struct WaferModel {
     rt: Runtime,
-    lay: Layout,
+    design: Design,
     launch: Launch,
     /// Launches and layer steps run so far (the warm-up's included).
     launches: u64,
@@ -514,7 +572,7 @@ impl WaferModel {
         platform: Platform,
         launch: Option<Launch>,
     ) -> R<WaferModel> {
-        let lay = Layout::read(program)?;
+        let design = Design::read(program)?;
         let ckpt = Ckpt::open(ckpt_dir)?;
         let rope_theta = ckpt.config()["rope_theta"].as_f64().unwrap_or(1.0e6);
         let sdk = Sdk::open().map_err(|e| e.to_string())?;
@@ -529,12 +587,14 @@ impl WaferModel {
         }
         tracing::info!(
             s = started.elapsed().as_secs_f32(),
-            width = lay.width,
-            height = lay.height,
+            grid = matches!(design, Design::Grid(_)),
             "spatial wafer: program loaded"
         );
         let started = Instant::now();
-        place(&lay, &ckpt, rope_theta, &mut rt)?;
+        match &design {
+            Design::Strips(lay) => place(lay, &ckpt, rope_theta, &mut rt)?,
+            Design::Grid(grid) => super::serve2d::place(grid, &ckpt, rope_theta, &mut rt)?,
+        }
         tracing::info!(
             s = started.elapsed().as_secs_f32(),
             "spatial wafer: weights placed"
@@ -542,7 +602,7 @@ impl WaferModel {
         let launch = launch.unwrap_or_else(|| Launch::of(&rt));
         let mut model = WaferModel {
             rt,
-            lay,
+            design,
             launch,
             launches: 0,
             steps: 0,
@@ -559,8 +619,8 @@ impl WaferModel {
         Ok(model)
     }
 
-    pub fn layout(&self) -> &Layout {
-        &self.lay
+    pub fn design(&self) -> &Design {
+        &self.design
     }
 
     /// One launch: head iterations 0..=steps, iteration i forcing forced[i]
@@ -575,7 +635,12 @@ impl WaferModel {
     ) -> R<(Vec<u32>, Option<Vec<f32>>)> {
         self.launches += 1;
         self.steps += steps as u64;
-        let lay = &self.lay;
+        let lay = match &self.design {
+            Design::Strips(lay) => lay,
+            Design::Grid(grid) => {
+                return super::serve2d::run(grid, &mut self.rt, forced, steps, start, want_logits);
+            }
+        };
         if steps + 1 > lay.cap || start + steps > lay.positions || forced.len() > lay.cap {
             return Err(format!(
                 "a launch of {steps} steps at position {start} does not fit the program \
@@ -654,8 +719,8 @@ impl WaferModel {
     /// `tokens.len() + extra` of them, the last `extra + 1` the greedy
     /// continuation. Nothing but the argmaxes comes back.
     pub fn greedy(&mut self, tokens: &[u32], start: usize, extra: usize) -> R<Vec<u32>> {
-        let piece = self.lay.cap - 1;
-        let room = self.lay.positions.saturating_sub(start + tokens.len());
+        let piece = self.design.cap() - 1;
+        let room = self.design.positions().saturating_sub(start + tokens.len());
         let extra = extra.min(piece.saturating_sub(1)).min(room);
         // The feed's head in pieces that leave the tail and the loop one launch.
         let tail = tokens.len().min(piece - extra).max(1);
@@ -690,7 +755,7 @@ impl WaferModel {
             }
             return Ok((argmax, logits));
         }
-        let piece = self.lay.cap - 1;
+        let piece = self.design.cap() - 1;
         let pieces = tokens.len().div_ceil(piece);
         for (i, chunk) in tokens.chunks(piece).enumerate() {
             let want = which == Logits::Last && i + 1 == pieces;
@@ -743,7 +808,7 @@ impl Wafer {
             .spawn(move || {
                 let mut model = match WaferModel::open(&program, &ckpt, platform, launch) {
                     Ok(m) => {
-                        let _ = ready_tx.send(Ok((m.lay.vocab, m.lay.hidden)));
+                        let _ = ready_tx.send(Ok((m.design.vocab(), m.design.hidden())));
                         m
                     }
                     Err(e) => {

@@ -8,7 +8,7 @@ use std::path::Path;
 
 use engine_cerebras::sdk::Rect;
 use engine_cerebras::spatial::ckpt::Ckpt;
-use engine_cerebras::spatial::wafer::{Layout, Sink, place};
+use engine_cerebras::spatial::wafer::{Design, Sink, place};
 
 struct Recorder {
     index: std::fs::File,
@@ -30,7 +30,7 @@ impl Sink for Recorder {
 
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    let lay = Layout::read(Path::new(&args[1]))?;
+    let design = Design::read(Path::new(&args[1]))?;
     let ckpt = Ckpt::open(Path::new(&args[2]))?;
     let theta = ckpt.config()["rope_theta"].as_f64().unwrap_or(1.0e6);
     let out = Path::new(&args[3]);
@@ -39,7 +39,15 @@ fn main() -> Result<(), String> {
         index: std::fs::File::create(out.join("calls.jsonl")).map_err(|e| e.to_string())?,
         words: std::fs::File::create(out.join("calls.bin")).map_err(|e| e.to_string())?,
     };
-    place(&lay, &ckpt, theta, &mut rec)?;
-    println!("hbe {:?} width {} height {}", lay.hbe(), lay.width, lay.height);
+    match &design {
+        Design::Strips(lay) => {
+            place(lay, &ckpt, theta, &mut rec)?;
+            println!("hbe {:?} width {} height {}", lay.hbe(), lay.width, lay.height);
+        }
+        Design::Grid(grid) => {
+            engine_cerebras::spatial::serve2d::place(grid, &ckpt, theta, &mut rec)?;
+            println!("root {:?}", grid.root());
+        }
+    }
     Ok(())
 }

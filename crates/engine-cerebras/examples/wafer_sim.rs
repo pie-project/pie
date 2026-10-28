@@ -1,6 +1,7 @@
 //! The spatial wafer model on the fabric simulator, in process:
-//! `wafer_sim <serve28 params> <ckpt dir> <prompt ids,..> <new>` compiles
-//! (or reuses from the cache) the serve28 program for `params`, places the
+//! `wafer_sim <serve28s3 params | compiled program dir> <ckpt dir> <prompt ids,..> <new>`
+//! compiles (or reuses from the cache) the serve28s3 program for `params`, or
+//! runs a compiled one (serve28*, serve2d), places the
 //! checkpoint, runs the prompt then greedy on the wafer, and continues the
 //! cache with a second request; prints the tokens as JSON.
 
@@ -11,14 +12,25 @@ use engine_cerebras::spatial::wafer::{Logits, WaferModel, compile};
 
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    let program = compile(&args[1], Target::Wse3, false)?;
+    // A compiled program's directory, or serve28s3 params to compile.
+    let program = if std::path::Path::new(&args[1]).join("out.json").is_file() {
+        PathBuf::from(&args[1])
+    } else {
+        compile(&args[1], Target::Wse3, false)?
+    };
     let prompt: Vec<u32> = args[3].split(',').map(|t| t.parse().expect("token id")).collect();
     let new: usize = args[4].parse().expect("count");
     let started = std::time::Instant::now();
     let mut m = WaferModel::open(
         &program,
         &PathBuf::from(&args[2]),
-        Platform::Simulator(Simulator::new(Target::Wse3)),
+        Platform::Simulator(Simulator {
+            num_threads: std::env::var("PIE_SIM_THREADS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16),
+            ..Simulator::new(Target::Wse3)
+        }),
         None,
     )?;
     let load_s = started.elapsed().as_secs_f32();
