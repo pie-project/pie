@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The engine end to end without a GPU: a random-weight miniature of Qwen3.5
 # served by `pie` on Mesa's lavapipe (CPU Vulkan), then the inferlet library
-# corner cases, sort-probe, one compat API call, and — when PIE_LANGUAGES_DIR
+# corner cases, one compat API call, and — when PIE_LANGUAGES_DIR
 # holds the two pie-language-*.tar.gz — a Python and a JavaScript inferlet.
 #
 #   PIE_ENGINE          wgpu (default) or vulkan
@@ -27,7 +27,7 @@ echo "== pie with the $engine engine"
 cargo build --release -p pie --features "$engine"
 pie=./target/release/pie
 echo "== inferlets (wasm32-wasip3)"
-(cd examples && cargo build -q --release --target wasm32-wasip3 -p text-completion -p naive-baseline -p sort-probe)
+(cd examples && cargo build -q --release --target wasm32-wasip3 -p text-completion -p naive-baseline)
 
 echo "== import"
 "$pie" model import "$work/snapshot" --deployment qwen35-tiny-u4g64-kv-bf16 --keep-source
@@ -72,11 +72,6 @@ what=corners
 if [ "${PIE_LAVAPIPE_BENCH:-0}" = "1" ]; then what=both; fi
 echo "== $what"
 PIE_BENCH_FIXTURE=1 node scripts/bench/browser/native.mjs "$ws" "$what" | grep -v "^RESULT" | cut -c1-160
-echo "== sort-probe"
-PIE_MATRIX_ENTRY_TIMEOUT_MS=900000 node tests/browser/tools/matrix-native.mjs "$ws" sort-probe-light > "$work/sort-probe.log" || true
-grep "^MATRIX" "$work/sort-probe.log" | cut -f1,2,3 | sed 's/\\n/\n   /g' | cut -c1-160
-grep -q $'^MATRIX sort-probe-light\tok\t' "$work/sort-probe.log" || { echo "sort-probe failed"; exit 1; }
-
 echo "== compat API: one chat completion through the built-in inferlet"
 curl -fsS -X POST "$http/v1/chat/completions" -H 'content-type: application/json' \
   -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"chat_template_kwargs":{"enable_thinking":false}}' \

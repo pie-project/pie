@@ -86,7 +86,7 @@ class Decoder:
     __slots__ = ("_inner",)
 
     def __init__(self) -> None:
-        self._inner = _reasoning.create_decoder()
+        self._inner = _reasoning.Decoder()
 
     @classmethod
     def for_cue(cls, cue: list[int]) -> Decoder:
