@@ -1007,7 +1007,8 @@ impl<'c> Run<'c> {
         }
         let (_, csr) = self.rs_ext_layout(seat);
         let bytes: Vec<u8> = csr.iter().flat_map(|n| n.to_le_bytes()).collect();
-        let can_cache = (bytes.len() as u64) <= RsScratch::CSR_HEADROOM && scratch.bytes >= RsScratch::CSR_HEADROOM;
+        let can_cache = (bytes.len() as u64) <= RsScratch::CSR_HEADROOM
+            && scratch.bytes >= RsScratch::CSR_HEADROOM;
         let at = if can_cache {
             scratch.ptr
         } else {
@@ -1122,8 +1123,7 @@ impl<'c> Run<'c> {
             let runs_at = scratch
                 .take(raw.len() as u64)
                 .map_err(|f| Self::rs_fault(op, f))?;
-            crate::device::stage_raw(stream, runs_at, &raw)
-                .map_err(|f| Self::rs_fault(op, f))?;
+            crate::device::stage_raw(stream, runs_at, &raw).map_err(|f| Self::rs_fault(op, f))?;
             kernels_cuda::runtime::channel::gather_words(
                 &self.ctx,
                 runs_at,
