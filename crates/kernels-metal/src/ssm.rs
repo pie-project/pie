@@ -283,6 +283,7 @@ fn conv_history(op: &'static str, conv_width: u32, dilation: u32) -> Result<u32,
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn causal_conv1d(
     ctx: &Ctx<'_>,
     x: Tensor,
