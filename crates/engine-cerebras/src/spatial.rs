@@ -51,6 +51,7 @@
 //! `program = "dir"` names an already compiled output directory instead.
 
 pub mod ckpt;
+pub mod guest3;
 pub mod wafer;
 
 use std::collections::BTreeMap;
@@ -83,7 +84,8 @@ pub struct SpatialBoot {
     /// `"args"` or `"run_cfg"`: how requests reach the wafer program
     /// (default: decided from the program).
     pub launch: Option<String>,
-    /// Steps a greedy lane's token loop runs past its row (0: off).
+    /// The most steps a greedy lane's token loop runs past its row (0: off;
+    /// loops start at 8 and double while a sequence uses them up).
     pub lookahead: Option<usize>,
     pub ckpt: Option<String>,
     pub layers: Option<u32>,
@@ -435,7 +437,15 @@ struct Cached {
     tokens: Vec<u32>,
     argmax: Vec<Option<u32>>,
     used: u64,
+    /// Steps the next token loop on this cache runs past its row: it
+    /// doubles while loops are used to their end and starts over at
+    /// [`FIRST_LOOP`] otherwise, so a sequence that ends wastes at most
+    /// about what it used.
+    next_loop: usize,
 }
+
+/// Steps a sequence's first token loop runs past its row.
+const FIRST_LOOP: usize = 8;
 
 impl Cached {
     fn truncate(&mut self, n: usize) {
@@ -577,6 +587,15 @@ impl Spatial {
             .unwrap_or((0, 0));
         self.kv.clock += 1;
         self.kv.cached[cache].used = self.kv.clock;
+        // This greedy row picks up where the cache's last token loop ended
+        // (fed its last argmax): the loop was used to its end.
+        let continues = {
+            let c = &self.kv.cached[cache];
+            agree == c.tokens.len()
+                && agree == history.len()
+                && agree > 0
+                && c.argmax.last().copied().flatten() == tokens.first().copied()
+        };
         if agree < self.kv.cached[cache].tokens.len() {
             // Another sequence, a rewind or rejected rows: keep what agrees.
             if agree == 0 {
@@ -592,7 +611,16 @@ impl Spatial {
             self.kv.cached[cache].extend(&history[agree..]);
         }
         if greedy {
-            let (ran, argmax) = self.daemon()?.greedy(cache, tokens, start, lookahead)?;
+            let steps = {
+                let c = &mut self.kv.cached[cache];
+                c.next_loop = if continues && c.next_loop > 0 {
+                    (c.next_loop * 2).min(lookahead)
+                } else {
+                    FIRST_LOOP.min(lookahead)
+                };
+                c.next_loop
+            };
+            let (ran, argmax) = self.daemon()?.greedy(cache, tokens, start, steps)?;
             self.ahead_runs += 1;
             if std::env::var_os("PIE_SPATIAL_TRACE").is_some() {
                 eprintln!(
@@ -628,14 +656,20 @@ impl Spatial {
         })
     }
 
-    /// Steps a greedy lane's token loop runs past its row (0: none):
-    /// `PIE_SPATIAL_LOOKAHEAD`, else the config's `lookahead`, else 16.
+    /// The most steps a greedy lane's token loop runs past its row (0: none):
+    /// `PIE_SPATIAL_LOOKAHEAD`, else the config's `lookahead`, else 32 on the
+    /// wafer and 0 on a daemon (a CPU reference pays for every step it runs
+    /// ahead).
     fn lookahead(&self) -> usize {
+        let default = match &self.daemon {
+            Some(Model::Wafer(_)) => 32,
+            _ => 0,
+        };
         std::env::var("PIE_SPATIAL_LOOKAHEAD")
             .ok()
             .and_then(|v| v.parse().ok())
             .or(self.spatial.lookahead)
-            .unwrap_or(16)
+            .unwrap_or(default)
     }
 
     /// Refuses a lane whose attention is not causal over its own history:
@@ -1133,6 +1167,14 @@ impl Engine for Spatial {
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+        // The guest program as registered, for studying what the wafer's
+        // guest region would have to run (`examples/eta_coverage.rs`).
+        if let Some(dir) = std::env::var_os("PIE_SPATIAL_DUMP_PTIR") {
+            let path = std::path::Path::new(&dir)
+                .join(format!("{:016x}.ptir", registration.program_hash));
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(path, &registration.reference_ptir);
+        }
         self.programs.register(registration).map_err(refusal)
     }
 

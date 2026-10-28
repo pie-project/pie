@@ -462,6 +462,9 @@ pub struct WaferModel {
     rt: Runtime,
     lay: Layout,
     launch: Launch,
+    /// Launches and layer steps run so far (the warm-up's included).
+    launches: u64,
+    steps: u64,
 }
 
 /// How a request reaches the program.
@@ -537,7 +540,13 @@ impl WaferModel {
             "spatial wafer: weights placed"
         );
         let launch = launch.unwrap_or_else(|| Launch::of(&rt));
-        let mut model = WaferModel { rt, lay, launch };
+        let mut model = WaferModel {
+            rt,
+            lay,
+            launch,
+            launches: 0,
+            steps: 0,
+        };
         // One request (position 0; later requests overwrite its KV) so the
         // first real one does not pay first-launch costs.
         let started = Instant::now();
@@ -564,6 +573,8 @@ impl WaferModel {
         start: usize,
         want_logits: bool,
     ) -> R<(Vec<u32>, Option<Vec<f32>>)> {
+        self.launches += 1;
+        self.steps += steps as u64;
         let lay = &self.lay;
         if steps + 1 > lay.cap || start + steps > lay.positions || forced.len() > lay.cap {
             return Err(format!(
@@ -753,6 +764,11 @@ impl Wafer {
                             extra,
                         } => model.greedy(&tokens, start, extra).map(|a| (a, Vec::new())),
                     };
+                    tracing::info!(
+                        launches = model.launches,
+                        steps = model.steps,
+                        "spatial wafer: totals"
+                    );
                     if ans_tx.send(answer).is_err() {
                         break;
                     }
