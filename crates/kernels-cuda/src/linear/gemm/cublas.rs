@@ -683,8 +683,9 @@ fn product(
     }
 }
 
-/// The most scratch the untimed unfused leg's products take at once.
-const UNFUSED_BYTES: usize = 64 << 20;
+/// The most scratch the untimed unfused leg's products take at once: a
+/// 2048-row prefill's gate and up (24576 columns) in one product.
+const UNFUSED_BYTES: usize = 128 << 20;
 
 /// The plane an anchored region's unfused leg lands its products in.
 const ANCHOR_PRODUCTS: &str = "linear.anchor_products";
