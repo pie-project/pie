@@ -712,7 +712,9 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
             .by_index_raw(zip_index)
             .map_err(|e| bad(format!("storage entry {entry_name:?}: {e}")))?;
         let loc = if entry.compression() == zip::CompressionMethod::Stored {
-            let start = entry.data_start();
+            // zip 7.4 returns `Option<u64>` here, earlier 7.x a `u64`; `into` takes both.
+            let start: Option<u64> = entry.data_start().into();
+            let start = start.ok_or_else(|| bad(format!("storage {entry_name:?} has no data offset")))?;
             let size = entry.size();
             if crate::safe::add("pt storage", start, size)? > store.len() {
                 return Err(bad(format!("storage {entry_name:?} extends past file")));
