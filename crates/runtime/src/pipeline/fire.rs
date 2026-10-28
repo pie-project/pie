@@ -3009,6 +3009,7 @@ pub async fn submit_frame<C: FireContext>(
         (pipeline.scope.scheduler_id(), pipeline.next_frame_seq())
     };
     let fires = fired.len() as u32;
+    ::engine::ahead::posted(lane.as_u128(), seq, fires);
     for (index, &(slot, rep)) in fired.iter().enumerate() {
         let stamp = crate::scheduler::FrameStamp {
             lane,
@@ -3186,6 +3187,7 @@ async fn pipeline_close_inner<C: FireContext>(
     });
     if let Some((first_close, pipeline_id, fires)) = state {
         if first_close {
+            ::engine::ahead::closed(pipeline_id.as_u128());
             crate::scheduler::worker::notify_lane_close(pipeline_id, None);
         }
         drain_settled(ctx, Some(&fires)).await?;
@@ -3199,6 +3201,9 @@ pub async fn pipeline_close<C: FireContext>(ctx: &mut C, this: Resource<Pipeline
 
 pub async fn pipeline_drop<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
     pipeline_close_inner(ctx, &this).await?;
+    if let Ok(pipeline) = ctx.resources().get(&this) {
+        ::engine::ahead::gone(pipeline.scope.scheduler_id().as_u128());
+    }
     ctx.resources().delete(this)?;
     Ok(())
 }
@@ -4703,3 +4708,4 @@ mod fold_tests {
         assert!(!now.folded_exact && now.unsettled == 1);
     }
 }
+

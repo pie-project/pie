@@ -146,6 +146,19 @@ pub(crate) fn build_batch_request(
         // Group ids renumber past earlier members', so two passes' groups never merge.
         let mut groups = 0u32;
         for req in requests {
+            // How far this fire's pipeline runs past it, for an engine that
+            // runs ahead (a device token loop).
+            if let Some(stamp) = &req.frame {
+                let place = ::engine::ahead::Place {
+                    pipeline: stamp.lane.as_u128(),
+                    seq: stamp.seq,
+                    slot: stamp.slot,
+                    fires: stamp.fires,
+                };
+                for lane in &req.request.lanes {
+                    ::engine::ahead::note(lane.slot, lane.kv.held, place);
+                }
+            }
             boundary_programs.push(req.request.boundary_program);
             instance_ids.push(req.instance_id);
             terminal_cells.push(req.completion.terminal_cell_ptr());

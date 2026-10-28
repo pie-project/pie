@@ -555,7 +555,8 @@ impl Spatial {
         start: u32,
         rows: &[u32],
         greedy: bool,
-    ) -> EngineResult<Vec<Vec<f32>>> {
+        ahead: Option<u32>,
+    ) -> EngineResult<(Vec<Vec<f32>>, bool)> {
         let history = self.kv.history(slot, pages, start)?;
         let caches = self.daemon()?.caches();
         self.kv.cached.resize_with(caches, Default::default);
@@ -585,7 +586,7 @@ impl Spatial {
                 let token = self.kv.cached[cache].argmax[last].unwrap_or_default();
                 self.ahead_hits += 1;
                 self.kv.write(slot, pages, history, tokens)?;
-                return Ok(one_hot(token));
+                return Ok((one_hot(token), true));
             }
         }
         // The cache that agrees with the lane longest; of equals, the least
@@ -639,8 +640,15 @@ impl Spatial {
                 } else {
                     FIRST_LOOP.min(lookahead)
                 };
-                c.next_loop
+                // No further than the lane's pipeline will fire.
+                ahead.map_or(c.next_loop, |fires| c.next_loop.min(fires as usize))
             };
+            tracing::info!(
+                rows = tokens.len(),
+                steps,
+                fires_after = ?ahead,
+                "spatial: token loop"
+            );
             let (ran, argmax) = self.daemon()?.greedy(cache, tokens, start, steps)?;
             self.ahead_runs += 1;
             if std::env::var_os("PIE_SPATIAL_TRACE").is_some() {
@@ -655,7 +663,7 @@ impl Spatial {
             cached.argmax.resize(cached.tokens.len(), None);
             let token = cached.argmax[fed.len() - 1].unwrap_or_default();
             self.kv.write(slot, pages, history, tokens)?;
-            return Ok(one_hot(token));
+            return Ok((one_hot(token), true));
         }
         let which = if rows.is_empty() {
             wafer::Logits::None
@@ -667,14 +675,17 @@ impl Spatial {
         let logits = self.daemon()?.forward(cache, tokens, start, which)?;
         self.kv.cached[cache].extend(tokens);
         self.kv.write(slot, pages, history, tokens)?;
-        Ok(match which {
-            wafer::Logits::None => Vec::new(),
-            wafer::Logits::Last => logits,
-            wafer::Logits::All => rows
-                .iter()
-                .map(|&r| logits.get(r as usize).cloned().unwrap_or_default())
-                .collect(),
-        })
+        Ok((
+            match which {
+                wafer::Logits::None => Vec::new(),
+                wafer::Logits::Last => logits,
+                wafer::Logits::All => rows
+                    .iter()
+                    .map(|&r| logits.get(r as usize).cloned().unwrap_or_default())
+                    .collect(),
+            },
+            false,
+        ))
     }
 
     /// The most steps a greedy lane's token loop runs past its row (0: none):
@@ -974,6 +985,8 @@ impl Spatial {
         })?;
         let mut logits: Vec<Vec<Vec<f32>>> = Vec::with_capacity(lanes.len());
         let mut read_rows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
+        // Lanes a token loop answered (their row a one-hot of the argmax).
+        let mut fast: Vec<bool> = Vec::with_capacity(lanes.len());
         for (at, lane) in lanes.iter().enumerate() {
             let n = tokens[at].len() as u32;
             let rows: Vec<u32> = match &lane.readout {
@@ -982,8 +995,8 @@ impl Spatial {
                 Readout::None if attached.contains_key(&at) && n > 0 => vec![n - 1],
                 _ => Vec::new(),
             };
-            let out = if tokens[at].is_empty() {
-                Vec::new()
+            let (out, ran_ahead) = if tokens[at].is_empty() {
+                (Vec::new(), false)
             } else {
                 // The rows' positions: stated (consecutive), else after what
                 // the lane holds.
@@ -1010,9 +1023,11 @@ impl Spatial {
                     .get(&at)
                     .is_some_and(|&instance| self.programs.greedy_reads(instance, &name))
                     && step.attachments.iter().filter(|a| !a.adapter_only).count() == 1;
-                self.forward(lane.slot, &lane.kv.pages, &tokens[at], start, &rows, greedy)?
+                let ahead = engine::ahead::take(lane.slot, lane.kv.held);
+                self.forward(lane.slot, &lane.kv.pages, &tokens[at], start, &rows, greedy, ahead)?
             };
             logits.push(out);
+            fast.push(ran_ahead);
             read_rows.push(rows);
         }
         // Guest passes in the interpreter, each output it reads from this fire.
@@ -1038,10 +1053,18 @@ impl Spatial {
                 // lane's, then the pass's later lanes'.
                 let end = attachment.lane as usize + attachment.lanes.max(1) as usize;
                 if logits.get(lane).is_some() {
-                    let flat: Vec<f32> = (lane..end.max(lane + 1))
-                        .filter_map(|l| logits.get(l))
-                        .flat_map(|rows| rows.iter().flatten().copied())
-                        .collect();
+                    let flat: Vec<f32> = if fast.get(lane) == Some(&true)
+                        && end <= lane + 1
+                        && logits[lane].len() == 1
+                    {
+                        // Its one row, handed over: nothing reads it again.
+                        std::mem::take(&mut logits[lane][0])
+                    } else {
+                        (lane..end.max(lane + 1))
+                            .filter_map(|l| logits.get(l))
+                            .flat_map(|rows| rows.iter().flatten().copied())
+                            .collect()
+                    };
                     outputs.push((out_name.clone(), k, Value::F32(flat)));
                     if let Some(read) = guest_read.get_mut(lane) {
                         *read = true;
@@ -1058,7 +1081,9 @@ impl Spatial {
             .iter()
             .enumerate()
             .map(|(at, lane)| {
-                if matches!(lane.readout, Readout::None) || logits[at].is_empty() {
+                // A token loop's row is a stand-in for its argmax: the lane's
+                // answer is in its program's channels, as a device guest's.
+                if matches!(lane.readout, Readout::None) || logits[at].is_empty() || fast[at] {
                     return LaneReadout::default();
                 }
                 let values: Vec<f32> = logits[at].iter().flatten().copied().collect();
