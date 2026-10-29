@@ -149,23 +149,24 @@ pub enum Design {
 }
 
 impl Design {
+    /// The program's design and shape: from `pie_manifest.json` when PIE built
+    /// it ([`super::build`]); otherwise (a directory compiled outside PIE)
+    /// inferred from `out.json`'s params, with a warning.
     pub fn read(program: &Path) -> R<Design> {
         let path = program.join("out.json");
-        let v: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?,
-        )
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+        let (built, params) = super::manifest::program_params(program)?;
         let get = |k: &str| {
-            let x = &v["params"][k];
-            x.as_u64()
-                .or_else(|| x.as_str().and_then(|s| s.trim().parse().ok()))
-                .map(|n| n as usize)
+            params
+                .iter()
+                .find(|(n, _)| n == k)
+                .and_then(|(_, v)| v.trim().parse().ok())
         };
-        match super::serve2d::Layout2d::of(get) {
-            Some(grid) => grid
+        match (built.as_deref(), super::serve2d::Layout2d::of(get)) {
+            (Some("serve2d" | "serve2d_pipe") | None, Some(grid)) => grid
                 .map(Design::Grid)
                 .map_err(|e| format!("{}: {e}", path.display())),
-            None => Layout::read(program).map(Design::Strips),
+            (Some(d), _) => Err(format!("{}: PIE built a `{d}` program, which this engine does not serve", program.display())),
+            (None, None) => Layout::read(program).map(Design::Strips),
         }
     }
 

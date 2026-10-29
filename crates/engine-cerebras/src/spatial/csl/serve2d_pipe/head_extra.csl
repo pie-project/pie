@@ -1,0 +1,785 @@
+// ---------------------------------------------------------------- serve2d_pipe
+// (appended to head2d's pe.csl by serve2d_pipe/sync.py) The head as a stage of
+// the ring (the layer grids are qwen2d_pring stages), with its lanes batched.
+// Micro-batches of SB lanes: what a micro-batch carries is
+// [x (SB·Hc) | tab (S2D_NTAB)] a chunk.
+// - compute(laps, nmb): head iterations i = 0..laps, each over micro-batches
+//   m = 0..nmb-1 in order (the ring keeps them in order), each over the lane
+//   groups of HB lanes (SB / HB head steps a micro-batch). Iteration 0
+//   bootstraps every micro-batch (x = 0, a forced token): it sends
+//   [embeddings | the host's table `mtab[m]`] to layer 0. Iteration i >= 1
+//   takes [x | tab] of lap i - 1 from the last grid (whose stage has advanced
+//   tab a step) and, unless i = laps, sends [embeddings | tab] on.
+// - Tokens are per virtual lane v = m·SB + b: in_tokens/out_tokens
+//   [MMAX·SB][CAP] (CAP >= laps + 1), yscale [MMAX·SB], hlogits rows of v < HLB.
+// - The layer grids hold every micro-batch in flight; the head is blocking
+//   (receive, lanes, send): a grid holds two (the one it works on, the one its
+//   posted receive took), so nmb < 2·NL never fills the ring.
+//
+// A head step (HB lanes; head2d v9's step with every fabric message carrying
+// the HB lanes, MODE 0, gmode 0, one block):
+// - x: the feeder multicasts HB normed chunks (HB·Hc), then the HB chunks'
+//   sums of h^2, down its column;
+// - a region PE: one GEMV a lane into y [HB][YS] (YS = Vr + 1 rounded up to 4
+//   words, so every lane's row keeps the weights' bank offset), word Vr of a
+//   lane its sum of h^2; one row sum of all HB·YS words into the root column;
+// - the root column: a local argmax a lane, then the (value, index) pairs of
+//   all HB lanes down each half in one chain (2·HB words a hop);
+// - the final root decides HB tokens (forced or the argmax) and multicasts
+//   them (HB words) to every head PE;
+// - the embedding rows back to the feeders: the PEs holding lane b's winner
+//   row inject their chunks on EU (color 11), up or down their columns
+//   toward the feeder row. Two chunks in the same half of a column must not
+//   be in flight together: one would pass through the other's router while
+//   it is set to inject (or switches to it). Chunks from opposite halves
+//   never meet. So the lanes go in rounds of at most one upper-half and one
+//   lower-half winner (hb_schedule: every PE computes the same rounds from
+//   the winners). Before each round but the first, the feeder multicasts
+//   one word ("go", on c_x, once the round before has fully arrived) and an
+//   injecting PE restores its pass-through route on it. The last round's
+//   injectors restore when the next head step's x arrives (as serve2d's head
+//   did).
+// The cross-block queues 3/4 (unused with one block) carry the feeder's
+// serve2d traffic: input 4 = S, input 3 = EU, output 4 = E.
+const s2d_rt = @import_module("rt.csl");
+const s2d_paths = @import_module("paths.csl", .{ .GWD = GPX, .GHT = GPY, .GW = GW, .GH = GH,
+                                                 .NL = GW * GH, .XH = GW * GPX, .F = F, .C = C, .VMC = VMC,
+                                                 .VMAT = R2X + 1 });
+// The winner row's chunk to the feeder: color 11, the grids' R0, which no head
+// router otherwise carries (routers are per PE).
+const C_EU: color = @get_color(11);
+comptime {
+  @comptime_assert(NB == 1);           // the feeder's queues 3/4 and the staircases (one chunk a column)
+  @comptime_assert(C == GPY);          // a feeder column a grid row (x's chunk)
+  @comptime_assert(SB % HB == 0);
+  @comptime_assert(SPEC == 0 or (HB == SB and SB >= 2 and (SPEC_T & (SPEC_T - 1)) == 0));
+  @comptime_assert(MODE == 0 and WF32 == 1 and !CERTIFY);
+}
+
+const S2D_NTAB: u16 = 2 * SB + 3 * SB * GE;   // pring's table
+const S2D_NIO: u16 = SB * Hc + S2D_NTAB;
+const NGRP: u16 = SB / HB;                    // head steps a micro-batch
+const YL: u16 = ((Vr + 1 + 3) / 4) * 4;       // a lane's logits and sum of h^2, padded
+// SMP 1: a lane's Gumbel noise rides in the row sum after them (Vr words).
+const YS: u16 = YL + (if (SMP == 1) ((Vr + 3) / 4) * 4 else 0);   // a lane's words in y
+const SAMPLE: u32 = 0xffffffff;
+// Memory by role (layout.csl's S2D_REG, S2D_ROOTC, S2D_FINAL; 1 word where unused).
+const TOKN: u16 = if (S2D_FINAL == 1) MMAX * SB * CAP else 1;
+const FEEDN: u16 = if (S2D_REG == 0) S2D_NIO else 1;
+const MTABN: u16 = if (S2D_REG == 0) MMAX * S2D_NTAB else 1;
+const YN: u16 = if (S2D_REG == 1) HB * YS else 1;
+const HLN: u16 = if (S2D_ROOTC == 1) HLB * Vr else 1;
+const YSN: u16 = if (S2D_ROOTC == 1) MMAX * SB else 1;
+
+var s2d_iter: u32 = 0;
+var s2d_steps: u32 = 0;
+var s2d_mb: u16 = 0;
+var s2d_grp: u16 = 0;
+var s2d_injected: bool = false;
+
+// The feeders' tables of the micro-batches, from the host (as f32 words): a
+// feeder of chunk j holds row j's.
+var mtab = @zeros([MTABN]f32);
+var mtab_ptr: [*]f32 = &mtab;
+const s2d_mtab_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{S2D_NTAB} -> mtab[i] });
+var in_tokens = @zeros([TOKN]u32);       // the final root's: forced tokens [v][i] (SAMPLE: the argmax)
+var in_tokens_ptr: [*]u32 = &in_tokens;
+var out_tokens = @zeros([TOKN]u32);      // the final root's: iteration i's argmax at [v][i - 1]
+var out_tokens_ptr: [*]u32 = &out_tokens;
+// 1/rms of each virtual lane's hidden state (root PEs), for reading logits:
+// y * yscale.
+var s2d_yscale = @zeros([YSN]f32);
+var s2d_yscale_ptr: [*]f32 = &s2d_yscale;
+// A root PE's logits rows (its Vr vocab rows), before 1/rms: lanes v < HLB.
+var s2d_hl = @zeros([HLN]f32);
+var s2d_hl_ptr: [*]f32 = &s2d_hl;
+const s2d_hl_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> s2d_hl[i] });
+
+// The feeder's micro-batch: x in (from S), embedding chunks out (to E).
+var s2d_xb = @zeros([FEEDN]f32);
+const s2d_xb_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{S2D_NIO} -> s2d_xb[i] });
+const s2d_xtab_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{S2D_NTAB} -> s2d_xb[i + @as(i16, SB * Hc)] });
+const s2d_xb1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> s2d_xb[i] });
+var s2d_eb = @zeros([FEEDN]f32);
+const s2d_eb_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{S2D_NIO} -> s2d_eb[i] });
+const s2d_etab_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{S2D_NTAB} -> s2d_eb[i + @as(i16, SB * Hc)] });
+const s2d_eb1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> s2d_eb[i] });
+
+// A head step's lanes: normed chunks then their sums of h^2; logits a lane;
+// the pairs; the winners.
+var hb_xs: [HB * Hc + HB]f32 align(16) = @zeros([HB * Hc + HB]f32);
+const hb_xs_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HB * Hc} -> hb_xs[i] });
+const hb_xs1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> hb_xs[i] });
+const hb_ss_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HB} -> hb_xs[i + @as(i16, HB * Hc)] });
+var hb_y: [YN]f32 align(16) = @zeros([YN]f32);
+const hb_y_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HB * YS} -> hb_y[i] });
+const hb_y1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> hb_y[i] });
+var hb_best = @zeros([2 * HB]f32);
+const hb_best_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * HB} -> hb_best[i] });
+var hb_other = @zeros([2 * HB]f32);
+const hb_other_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * HB} -> hb_other[i] });
+// The winners (the tokens embedded next), then the speculative shift: -1, or
+// the accepted count a (the feeders move the lanes' table on by a; the last
+// grid has already moved it by 1).
+var hb_ib = @zeros([HB + 1]f32);
+const hb_ib_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HB + 1} -> hb_ib[i] });
+var hb_emb = @zeros([Hc]f32);
+const hb_emb_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> hb_emb[i] });
+var hb_ord = @zeros([HB]u16);    // the lanes in round order
+var hb_rnd = @zeros([HB]u16);    // their rounds
+var hb_go = @zeros([1]f32);
+const hb_go_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> hb_go[i] });
+
+fn s2d_head_init() void {
+  s2d_paths.routes(px + GW * GPX, py);
+  if (vm) { return; }
+  if (py == F) {
+    color_config.reset_routes(C_EU, .{ .rx = NORTH, .tx = RAMP });
+    s2d_rt.iq_color(3, s2d_rt.cn(C_EU));
+    s2d_rt.iq_color(4, s2d_rt.cn(s2d_paths.C_S));
+    s2d_rt.oq_color(4, s2d_rt.cn(s2d_paths.C_E));
+  } else {
+    s2d_pass();
+  }
+}
+
+// A region PE's EU route: passing the column on toward the feeder. Routes that
+// change while the head runs go through <tile_config>'s reset_routes (as
+// head2d's own runtime switches do).
+fn s2d_pass() void {
+  if (py < F) { color_config.reset_routes(C_EU, .{ .rx = NORTH, .tx = SOUTH }); }
+  else { color_config.reset_routes(C_EU, .{ .rx = SOUTH, .tx = NORTH }); }
+}
+
+// A region PE whose chunk has fully reached the feeder (the feeder's next
+// word on c_x proves it): back to passing the column through, queue 3's output
+// back to the row chain.
+fn s2d_restore() void {
+  if (s2d_injected) {
+    s2d_pass();
+    s2d_rt.oq_color(3, s2d_rt.cn(c_r1_0));
+    s2d_injected = false;
+  }
+}
+
+// Whether this step sends embeddings on (not a launch's last iteration).
+fn hb_sends() bool { return s2d_iter < s2d_steps; }
+
+// The final root: virtual lane vl's token this iteration from the argmax v.
+fn s2d_decide(vl: u16, v: f32) f32 {
+  const i = s2d_iter;
+  const row = @as(u32, vl) * @as(u32, CAP);
+  if (i >= 1 and i <= CAP) { out_tokens[row + i - 1] = @as(u32, v); }
+  if (i < CAP and in_tokens[row + i] != SAMPLE) { return @as(f32, in_tokens[row + i]); }
+  return v;
+}
+
+// ---------------------------------------------------------------- pairs, HB lanes
+fn hb_take(comptime q: input_queue) void {
+  @fmovs(hb_other_dsd, fin(q, 2 * HB));
+  var b: u16 = 0;
+  while (b < HB) : (b += 1) {
+    const o = hb_other[2 * b];
+    const ob = hb_best[2 * b];
+    if (o > ob or (o == ob and hb_other[2 * b + 1] < hb_best[2 * b + 1])) {
+      hb_best[2 * b] = o;
+      hb_best[2 * b + 1] = hb_other[2 * b + 1];
+    }
+  }
+}
+fn hb_give(comptime q: output_queue) void {
+  @fmovs(fout(q, 2 * HB), hb_best_dsd);
+}
+fn hb_take_c(k: u16) void {
+  if (k == 0) { hb_take(q_r2_0_in); } else if (k == 1) { hb_take(q_r2_1_in); }
+  else if (k == 2) { hb_take(q_r1_0_in); } else { hb_take(q_r1_1_in); }
+}
+fn hb_give_c(k: u16) void {
+  if (k == 0) { hb_give(q_r2_0_out); } else if (k == 1) { hb_give(q_r2_1_out); }
+  else if (k == 2) { hb_give(q_r1_0_out); } else { hb_give(q_r1_1_out); }
+}
+// The VM takes part in this step (VM columns, gmode 1, not the bootstrap).
+fn hb_vm() bool { return VMC >= 1 and gmode[0] == 1 and s2d_iter >= 1; }
+// Per virtual lane, host-written on every head PE: [gmode_l (1: the VM
+// samples the lane), nforce (the lane's forced prompt prefix: iterations
+// i < nforce are forced)]. VM mode wants forced tokens as a prefix.
+const VLN: u16 = MMAX * SB * 2;
+var vmlane = @zeros([VLN]u32);
+var vmlane_ptr: [*]u32 = &vmlane;
+// The VM samples lane vl at this iteration (else its turn is skipped: ctl 1).
+fn hb_vm_lane(vl: u16) bool { return vmlane[2 * vl] == 1 and s2d_iter >= vmlane[2 * vl + 1]; }
+// The head's argmax chain runs this step: no VM, or some lane of the step
+// takes the argmax (gmode_l 0, not forced).
+fn hb_argmax_step() bool {
+  if (!hb_vm()) { return true; }
+  var b: u16 = 0;
+  while (b < HB) : (b += 1) {
+    const vl = s2d_mb * SB + s2d_grp * HB + b;
+    if (vmlane[2 * vl] == 0 and s2d_iter >= vmlane[2 * vl + 1]) { return true; }
+  }
+  return false;
+}
+var hb_vt = @zeros([1]f32);
+const hb_vt_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> hb_vt[i] });
+
+fn hb_best_init() void {
+  var b: u16 = 0;
+  while (b < HB) : (b += 1) {
+    hb_best[2 * b] = NEG;
+    hb_best[2 * b + 1] = 1.0e9;
+  }
+}
+
+// head2d's reduce_half with HB pairs a message.
+fn hb_reduce_half() void {
+  const r = kk % Gy;
+  const g = kk / Gy;
+  if (r == R1Y) {
+    if (R1Y < Gy - 1) { hb_take(q_r1_0_in); }
+    hb_take(q_r1_1_in);
+  } else if (r > R1Y) {
+    if (r % 2 == 0) {
+      if (r == Gy - 1) { hb_give(q_r1_0_out); } else { hb_take(q_r1_1_in); hb_give(q_r1_0_out); }
+    } else {
+      if (r == Gy - 1) { hb_give(q_r1_1_out); } else { hb_take(q_r1_0_in); hb_give(q_r1_1_out); }
+    }
+  } else {
+    if (r % 2 == 0) {
+      if (r == 0) { hb_give(q_r1_1_out); } else { hb_take(q_r1_0_in); hb_give(q_r1_1_out); }
+    } else {
+      hb_take(q_r1_1_in);
+      hb_give(q_r1_0_out);
+    }
+  }
+  if (r == R1Y) {
+    if (upper) {
+      if (g > 0) { hb_take_c(cu(g - 1)); }
+      hb_give_c(cu(g));
+    } else {
+      if (g > 0) { hb_take_c(cl(g - 1)); }
+      hb_give_c(cl(g));
+    }
+  }
+}
+
+// Lane b's local argmax into hb_best (head2d's local_argmax on lane b's row).
+fn hb_argmax(b: u16) void {
+  const yl = @increment_dsd_offset(hb_y1_dsd, @as(i16, b * YS), f32);
+  if (nvalid < Vr) {
+    @fmovs(@increment_dsd_offset(@set_dsd_length(yl, Vr - nvalid), @as(i16, nvalid), f32), NEG);
+  }
+  const m = max_of(yl);
+  @fsubs(score_dsd, yl, m);
+  @fmacs(score_dsd, negiv_dsd, score_dsd, 1.0e20);
+  const j = -max_of(score_dsd);
+  hb_best[2 * b] = m;
+  hb_best[2 * b + 1] = @as(f32, base) + j;
+}
+
+// The embedding rounds from the winners (the same at every PE): round k takes
+// the k-th upper-half and the k-th lower-half winner, upper first.
+fn hb_upper(b: u16) bool {
+  const v = @as(u32, hb_ib[b]);
+  return (v / @as(u32, Vr)) % @as(u32, H) < @as(u32, F);
+}
+fn hb_schedule() void {
+  var nu: u16 = 0;
+  var nl: u16 = 0;
+  var b: u16 = 0;
+  while (b < HB) : (b += 1) { if (hb_upper(b)) { nu += 1; } else { nl += 1; } }
+  // Upper winners in lane order at even slots of a round pair, lower at odd.
+  var k: u16 = 0;
+  var iu: u16 = 0;
+  var il: u16 = 0;
+  var r: u16 = 0;
+  while (k < HB) : (r += 1) {
+    if (iu < nu) {
+      var c: u16 = 0;
+      b = 0;
+      while (b < HB) : (b += 1) {
+        if (hb_upper(b)) {
+          if (c == iu) { hb_ord[k] = b; hb_rnd[k] = r; k += 1; }
+          c += 1;
+        }
+      }
+      iu += 1;
+    }
+    if (il < nl) {
+      var c: u16 = 0;
+      b = 0;
+      while (b < HB) : (b += 1) {
+        if (!hb_upper(b)) {
+          if (c == il) { hb_ord[k] = b; hb_rnd[k] = r; k += 1; }
+          c += 1;
+        }
+      }
+      il += 1;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- fused naive sampler (SMP)
+// eta's naive sampler, argmax(logits / T + Gumbel(RngKeyed(state))), for every
+// lane, in the head's own argmax (docs/cerebras-batched-sampling.md, option
+// c). Bit-exact with eta: the RNG is the VM's (splitmix64, draw, logf, keyed
+// as its WRNG: vocab row v takes splitmix64(key << 32 | ctr) + STRIDE (v + 1)),
+// the scale y · 1/rms and the divide are the VM's f32 sequence, and the
+// argmax takes the lowest index on a tie.
+// - The noise does not depend on the logits: each of a row's C head columns
+//   draws it for its share of the row's Vr vocab rows (r ≡ col mod C) into
+//   the lane's noise words (zero elsewhere), and the row sum carries it to
+//   the root column exactly (x + 0 = x).
+// - The root column: p = (y · 1/rms) / T + g, then the usual argmax.
+// - Per virtual lane v, on every head PE, `smp` [MMAX·SB][4] (host): kind (0
+//   argmax, 1 naive), T (f32 bits), key, ctr. Each head iteration i >= 1 a
+//   naive lane's ctr goes up by 1 (eta's state + iota(2)).
+const SMPN: u16 = if (SMP == 1) MMAX * SB * 4 else 1;
+var smp = @zeros([SMPN]u32);
+var smp_ptr: [*]u32 = &smp;
+const SMP_STRIDE: u64 = 0x9E3779B97F4A7C15;
+const SMP_QNAN: f32 = @bitcast(f32, @as(u32, 0x7fc00000));
+const SMP_NEG_INF: f32 = @bitcast(f32, @as(u32, 0xff800000));
+
+fn smp_logf(v: f32) f32 {
+  if (!(v > 0.0)) { return if (v == 0.0) SMP_NEG_INF else SMP_QNAN; }
+  var ix: u32 = @bitcast(u32, v);
+  var k: i32 = 0;
+  if (ix < 0x00800000) { k = -25; ix = @bitcast(u32, v * 33554432.0); }
+  ix = ix + (0x3f800000 - 0x3f3504f3);
+  k = k + @as(i32, ix >> 23) - 0x7f;
+  ix = (ix & 0x007fffff) + 0x3f3504f3;
+  const f = @bitcast(f32, ix) - 1.0;
+  const s = f / (2.0 + f);
+  const z = s * s;
+  const w = z * z;
+  const t1 = w * (0.40000972152 + w * 0.24279078841);
+  const t2 = z * (0.66666662693 + w * 0.28498786688);
+  const r = t2 + t1;
+  const hfsq = 0.5 * f * f;
+  const dk = @as(f32, k);
+  return s * (hfsq + r) + dk * 9.0580006145e-06 - hfsq + f + dk * 6.9313812256e-01;
+}
+fn smp_splitmix64(v: u64) u64 {
+  var z: u64 = v;
+  z ^= z >> 27;
+  z = z * 0x3C79AC492BA7B653;
+  z ^= z >> 33;
+  z = z * 0x1C69B3F74AC4AE35;
+  z ^= z >> 27;
+  return z;
+}
+fn smp_gumbel(z: u64) f32 {
+  const bits = @as(u32, smp_splitmix64(z) >> 40);
+  const raw = (@as(f32, bits) + 0.5) * (1.0 / 16777216.0);
+  const u = if (raw < 0.99999994) raw else 0.99999994;
+  return -smp_logf(-smp_logf(u));
+}
+fn smp_normal(v: f32) bool {
+  const m = if (v < 0.0) -v else v;
+  return m >= 1.1754944e-38 and m <= 3.4028235e38;
+}
+fn smp_lane(b: u16) u16 { return (s2d_mb * SB + s2d_grp * HB + b) * 4; }
+
+// A region PE: the noise of its share of the row's vocab rows, a naive lane.
+fn smp_noise() void {
+  var b: u16 = 0;
+  while (b < HB) : (b += 1) {
+    const o = smp_lane(b);
+    if (smp[o] != 1) { continue; }
+    const z0 = smp_splitmix64((@as(u64, smp[o + 2]) << 32) | @as(u64, smp[o + 3]));
+    var r: u16 = col;
+    while (r < nvalid) : (r += C) {
+      const v = @as(u64, base) + @as(u64, r) + 1;
+      hb_y[b * YS + YL + r] = smp_gumbel(z0 + SMP_STRIDE * v);
+    }
+  }
+}
+
+// The root column: a naive lane's row becomes (y · 1/rms) / T + g (the VM's
+// divide: reciprocal, one correction, a scalar redo where the exponent is 0
+// or 255).
+fn smp_perturb() void {
+  var b: u16 = 0;
+  while (b < HB) : (b += 1) {
+    const o = smp_lane(b);
+    if (smp[o] != 1) { continue; }
+    const vl = s2d_mb * SB + s2d_grp * HB + b;
+    const ys = s2d_yscale[vl];
+    const t = @bitcast(f32, smp[o + 1]);
+    const r = 1.0 / t;
+    const yl = @increment_dsd_offset(hb_y1_dsd, @as(i16, b * YS), f32);
+    const gl = @increment_dsd_offset(hb_y1_dsd, @as(i16, b * YS + YL), f32);
+    const xk = @set_dsd_length(sc_all, Vr);   // x, kept for the redo
+    @fmuls(yl, yl, ys);                        // the VM's W0: y · 1/rms
+    if (!smp_normal(t) or !smp_normal(r)) {
+      var i: u16 = 0;
+      while (i < Vr) : (i += 1) { hb_y[b * YS + i] = hb_y[b * YS + i] / t; }
+    } else {
+      @fmovs(xk, yl);
+      @fmovs(score_dsd, yl);                   // x
+      @fmuls(yl, yl, r);                       // D = x r
+      @fmacs(score_dsd, score_dsd, yl, -t);    // x - D t
+      @fmacs(yl, yl, score_dsd, r);            // D + (x - D t) r
+      var i: u16 = 0;
+      while (i < Vr) : (i += 1) {
+        // exponent 0 (zero, subnormal) or 255 (inf, NaN): redo as a scalar
+        const e = (@bitcast(u32, hb_y[b * YS + i]) >> 23) & 0xff;
+        if (e == 0 or e == 255) {
+          hb_y[b * YS + i] = if (sc[i] == 0.0) sc[i] * r else sc[i] / t;   // the zero's sign
+        }
+      }
+    }
+    @fadds(yl, yl, gl);
+  }
+}
+
+// Every head PE: a naive lane's RNG counter after a sampled step.
+fn smp_advance() void {
+  if (s2d_iter == 0) { return; }
+  var b: u16 = 0;
+  while (b < HB) : (b += 1) {
+    const o = smp_lane(b);
+    if (smp[o] == 1) { smp[o + 3] += 1; }
+  }
+}
+
+// ---------------------------------------------------------------- a head step
+fn hb_step_region() void {
+  // 0: the HB normed chunks arrive (the last step's injector may restore);
+  // 1: the GEMVs, then the sums of h^2.
+  @fmovs(hb_xs_dsd, fin(q_x_in, HB * Hc));
+  s2d_restore();
+  mark(0);
+  @fmovs(hb_y_dsd, 0.0);
+  var b: u16 = 0;
+  while (b < HB) : (b += 1) {
+    const yl = @increment_dsd_offset(hb_y1_dsd, @as(i16, b * YS), f32);
+    @load_to_dsr(mv_dest, yl, .{ .save_address = false });
+    @load_to_dsr(mv_src0, yl, .{ .save_address = false });
+    @load_to_dsr(mv_src1, wt32_dsd, .{ .save_address = true });
+    @map(mv32_step, @increment_dsd_offset(hb_xs1_dsd, @as(i16, b * Hc), f32));
+  }
+  @fmovs(hb_ss_dsd, fin(q_x_in, HB));
+  b = 0;
+  while (b < HB) : (b += 1) { hb_y[b * YS + Vr] = hb_xs[HB * Hc + b]; }
+  if (SMP == 1) { smp_noise(); }
+  mark(1);
+  // 2: the row sum of every lane at once.
+  reduce(false, C, Gx, col, hb_y_dsd, HB * YS);
+  mark(2);
+  // 3: the root column's argmax a lane, the pairs down its halves; the winners.
+  if (root_col) {
+    b = 0;
+    while (b < HB) : (b += 1) {
+      const vl = s2d_mb * SB + s2d_grp * HB + b;
+      s2d_yscale[vl] = rsqrt_f(hb_y[b * YS + Vr] / @as(f32, C * Hc) + 1.0e-6);
+      if (vl < HLB) {
+        @fmovs(@increment_dsd_offset(s2d_hl_dsd, @as(i16, vl * Vr), f32),
+               @increment_dsd_offset(hb_y1_dsd, @as(i16, b * YS), f32));
+      }
+    }
+    if (hb_vm()) {
+      // The VM: each lane's row, 1/rms and ctl (Vr + 2 words) east to the VM
+      // columns, in lane order (ctl 1: the VM skips the lane's turn: a forced
+      // row or an argmax lane); the tokens come back through the final root.
+      b = 0;
+      while (b < HB) : (b += 1) {
+        const vl = s2d_mb * SB + s2d_grp * HB + b;
+        hb_y[b * YS + Vr] = s2d_yscale[vl];
+        hb_y[b * YS + Vr + 1] = if (hb_vm_lane(vl)) 0.0 else 1.0;
+        @fmovs(fout(q_x_out, Vr + 2),
+               @set_dsd_length(@increment_dsd_offset(hb_y1_dsd, @as(i16, b * YS), f32), Vr + 2));
+      }
+    }
+    if (hb_argmax_step()) {
+      if (SMP == 1) { smp_perturb(); }
+      routes_y();
+      b = 0;
+      while (b < HB) : (b += 1) { hb_argmax(b); }
+      hb_reduce_half();
+      @fmovs(hb_ib_dsd, fin(q_ib_in, HB + 1));
+      routes_x();
+    } else {
+      @fmovs(hb_ib_dsd, fin(q_ib_in, HB + 1));
+    }
+  } else {
+    @fmovs(hb_ib_dsd, fin(q_ib_in, HB + 1));
+  }
+  if (SMP == 1) { smp_advance(); }
+  mark(3);
+  // 4: the winners' chunks to the feeder, in rounds.
+  if (!hb_sends()) { return; }
+  hb_schedule();
+  var k: u16 = 0;
+  while (k < HB) : (k += 1) {
+    if (k > 0 and hb_rnd[k] != hb_rnd[k - 1]) {
+      @fmovs(hb_go_dsd, fin(q_x_in, 1));
+      s2d_restore();
+    }
+    const v = @as(u32, hb_ib[hb_ord[k]]);
+    if (v >= base and v < base + @as(u32, nvalid)) {
+      const j = @as(u16, v - base);
+      for (@range(u16, Hc)) |h| { hb_emb[h] = wt32[1 + h * Vr + j]; }
+      if (py < F) { color_config.reset_routes(C_EU, .{ .rx = RAMP, .tx = SOUTH }); }
+      else { color_config.reset_routes(C_EU, .{ .rx = RAMP, .tx = NORTH }); }
+      s2d_rt.oq_color(3, s2d_rt.cn(C_EU));
+      s2d_injected = true;
+      @fmovs(fout(q_r1_0_out, Hc), hb_emb_dsd);
+    }
+  }
+  mark(4);
+}
+
+fn hb_step_feeder() void {
+  // 0: this group's lanes' x (zeros at the bootstrap iteration), normed, down
+  // the column; then their sums of h^2.
+  if (s2d_iter > 0 and s2d_grp == 0) { @fmovs(s2d_xb_dsd, fin(q_r1_1_in, S2D_NIO)); }
+  var b: u16 = 0;
+  while (b < HB) : (b += 1) {
+    const lane = s2d_grp * HB + b;
+    const xl = @increment_dsd_offset(hb_xs1_dsd, @as(i16, b * Hc), f32);
+    var ss: f32 = 0.0;
+    if (s2d_iter == 0) {
+      @fmovs(xl, 0.0);
+    } else {
+      const xi = @increment_dsd_offset(s2d_xb1_dsd, @as(i16, lane * Hc), f32);
+      @fmuls(xl, xi, gam_dsd);
+      for (@range(u16, Hc)) |h| {
+        const v = s2d_xb[lane * Hc + h];
+        ss += v * v;
+      }
+    }
+    hb_xs[HB * Hc + b] = ss;
+  }
+  @fmovs(fout(q_x_out, HB * Hc), hb_xs_dsd);
+  @fmovs(fout(q_x_out, HB), hb_ss_dsd);
+  mark(0);
+  // 1: the pairs from both halves at the root's feeder; HB tokens decided at
+  // the final root and multicast.
+  if (col == R2X and hb_vm()) {
+    // The argmax pairs if any lane of the step takes the argmax; the VM's
+    // tokens, one a lane in lane order (token 0 for a skipped turn), at the
+    // final root (its input queue 2 is bound to the VM's token color at init).
+    const am = hb_argmax_step();
+    if (am) {
+      hb_best_init();
+      hb_take_c(cu(NGH - 1));
+      hb_take_c(cl(NGH - 1));
+      routes_feeder_x2();
+    }
+    b = 0;
+    while (b < HB) : (b += 1) {
+      const vl = s2d_mb * SB + s2d_grp * HB + b;
+      @fmovs(hb_vt_dsd, fin(q_x_in, 1));
+      const v = if (vmlane[2 * vl] == 1) hb_vt[0] else hb_best[2 * b + 1];
+      hb_ib[b] = s2d_decide(vl, v);
+    }
+    hb_ib[HB] = -1.0;
+    @fmovs(fout(q_ib_out, HB + 1), hb_ib_dsd);
+    if (am) { routes_feeder_y(); }
+  } else if (col == R2X) {
+    hb_best_init();
+    hb_take_c(cu(NGH - 1));
+    hb_take_c(cl(NGH - 1));
+    routes_feeder_x2();
+    if (px == RC) {
+      if (SPEC == 1 and spec_ctl[1] != 0) {
+        spec_round();
+      } else {
+        b = 0;
+        while (b < HB) : (b += 1) {
+          hb_ib[b] = s2d_decide(s2d_mb * SB + s2d_grp * HB + b, hb_best[2 * b + 1]);
+        }
+        hb_ib[HB] = -1.0;
+      }
+      @fmovs(fout(q_ib_out, HB + 1), hb_ib_dsd);
+    } else {
+      @fmovs(hb_ib_dsd, fin(q_ib_in, HB + 1));
+    }
+    routes_feeder_y();
+  } else {
+    @fmovs(hb_ib_dsd, fin(q_ib_in, HB + 1));
+  }
+  mark(1);
+  // 2: the winners' chunks in rounds (a go word before each but the first);
+  // after the last group, the micro-batch on to layer 0.
+  if (!hb_sends()) { return; }
+  hb_schedule();
+  var k: u16 = 0;
+  while (k < HB) : (k += 1) {
+    if (k > 0 and hb_rnd[k] != hb_rnd[k - 1]) { @fmovs(fout(q_x_out, 1), hb_go_dsd); }
+    const lb = hb_ord[k];
+    if (hb_upper(lb)) { color_config.reset_routes(C_EU, .{ .rx = NORTH, .tx = RAMP }); }
+    else { color_config.reset_routes(C_EU, .{ .rx = SOUTH, .tx = RAMP }); }
+    const lane = s2d_grp * HB + lb;
+    @fmovs(@increment_dsd_offset(s2d_eb1_dsd, @as(i16, lane * Hc), f32), fin(q_r1_0_in, Hc));
+  }
+  if (s2d_grp == NGRP - 1) {
+    // The micro-batch's table: the host's at the bootstrap, else as it came.
+    if (s2d_iter == 0) {
+      @fmovs(s2d_etab_dsd, @increment_dsd_offset(s2d_mtab_dsd, @as(i16, s2d_mb * S2D_NTAB), f32));
+    } else {
+      if (SPEC == 1 and hb_ib[HB] >= 0.0) { spec_shift(@as(u32, hb_ib[HB])); }
+      @fmovs(s2d_etab_dsd, s2d_xtab_dsd);
+    }
+    @fmovs(fout(q_r1_1_out, S2D_NIO), s2d_eb_dsd);
+  }
+  mark(2);
+}
+
+// ---------------------------------------------------------------- speculative decode (SPEC)
+// One sequence as the SB = K + 1 lanes of one micro-batch (HB = SB, nmb = 1):
+// lane b holds position p + b, lane 0 the pending token (committed, not yet
+// in the cache), lanes 1..K the drafts. With spec_ctl[1] = 1 the final root,
+// each head iteration:
+// - i = 0: the next K + 1 tokens are [hist[L - 1], K drafts] (the host's
+//   table puts lane b at p + b);
+// - i >= 1: g_b = lane b's argmax; a = the drafts matched in order
+//   (g_j == draft_{j+1} for j < a); it commits g_0..g_a (the a drafts and the
+//   correction, or the bonus when a = K), appends them to the history, and,
+//   unless i = laps, sends [g_a, K new drafts] with the shift a (every
+//   feeder moves its row of the table on by a: pos and wslot, and each page
+//   entry's bitmap rebuilt as the causal prefix 0..wslot).
+// Drafts: prompt lookup (Cacheback's rule, reduced): spec_tab maps the last
+// two tokens to the index after their last earlier occurrence in the
+// history; the drafts copy the history from there. A wrong draft only costs
+// acceptance: every committed token is the target's own argmax.
+// The host's words: spec_ctl [0] the history length L (the device appends),
+// [1] 1 = speculative rounds, [2] tokens committed this launch (out), [3]
+// lookups that found an entry (out); spec_hist [SPEC_H] the history;
+// spec_out [SPEC_O] the committed tokens of this launch, spec_acc [laps] a
+// per round (out).
+const SPN_H: u16 = if (SPEC == 1 and S2D_FINAL == 1) SPEC_H else 1;
+const SPN_T: u16 = if (SPEC == 1 and S2D_FINAL == 1) SPEC_T else 1;
+const SPN_O: u16 = if (SPEC == 1 and S2D_FINAL == 1) SPEC_O else 1;
+var spec_ctl = @zeros([4]u32);
+var spec_ctl_ptr: [*]u32 = &spec_ctl;
+var spec_hist = @zeros([SPN_H]u32);
+var spec_hist_ptr: [*]u32 = &spec_hist;
+var spec_out = @zeros([SPN_O]u32);
+var spec_out_ptr: [*]u32 = &spec_out;
+var spec_acc = @zeros([SPN_O]u32);
+var spec_acc_ptr: [*]u32 = &spec_acc;
+var spec_tab = @zeros([SPN_T]u16);      // index + 1 after the pair's last occurrence (0: none)
+var spec_draft = @zeros([HB]u32);       // this round's drafts: spec_draft[j] at lane j + 1
+
+fn spec_hash(t1: u32, t2: u32) u16 {
+  const h = (t1 * 0x9e3779b1) ^ (t2 * 0x85ebca6b);
+  return @as(u16, (h >> 16) & @as(u32, SPEC_T - 1));
+}
+// Append a committed token (and record the pair before it).
+fn spec_push(t: u32) void {
+  const n = spec_ctl[0];
+  if (n >= @as(u32, SPEC_H)) { return; }
+  spec_hist[n] = t;
+  if (n >= 2) { spec_tab[spec_hash(spec_hist[n - 2], spec_hist[n - 1])] = @as(u16, n + 1); }
+  spec_ctl[0] = n + 1;
+}
+// K drafts after the history's end into spec_draft[0..K-1].
+fn spec_drafts() void {
+  const n = spec_ctl[0];
+  var j: u32 = 0;
+  if (n >= 2) { j = @as(u32, spec_tab[spec_hash(spec_hist[n - 2], spec_hist[n - 1])]); }
+  if (j > 0) { spec_ctl[3] += 1; }
+  var k: u16 = 0;
+  while (k < HB - 1) : (k += 1) {
+    var d: u32 = spec_hist[n - 1];
+    if (j > 0 and j - 1 + @as(u32, k) < n) { d = spec_hist[j - 1 + @as(u32, k)]; }
+    else if (k > 0) { d = spec_draft[k - 1]; }
+    spec_draft[k] = d;
+  }
+}
+fn spec_next(first: u32) void {
+  spec_drafts();
+  hb_ib[0] = @as(f32, first);
+  var k: u16 = 0;
+  while (k < HB - 1) : (k += 1) { hb_ib[k + 1] = @as(f32, spec_draft[k]); }
+}
+fn spec_round() void {
+  const i = s2d_iter;
+  if (i == 0) {
+    // The table from the history (the host may have rewritten it).
+    var e: u16 = 0;
+    while (e < SPN_T) : (e += 1) { spec_tab[e] = 0; }
+    var n: u32 = 2;
+    while (n < spec_ctl[0]) : (n += 1) {
+      spec_tab[spec_hash(spec_hist[n - 2], spec_hist[n - 1])] = @as(u16, n + 1);
+    }
+    spec_ctl[2] = 0;
+    spec_ctl[3] = 0;
+    spec_next(spec_hist[spec_ctl[0] - 1]);
+    hb_ib[HB] = -1.0;
+    return;
+  }
+  var a: u16 = 0;
+  while (a < HB - 1 and @as(u32, hb_best[2 * a + 1]) == spec_draft[a]) : (a += 1) {}
+  var j: u16 = 0;
+  while (j <= a) : (j += 1) {
+    const g = @as(u32, hb_best[2 * j + 1]);
+    spec_push(g);
+    if (spec_ctl[2] < @as(u32, SPEC_O)) { spec_out[spec_ctl[2]] = g; }
+    spec_ctl[2] += 1;
+  }
+  if (i - 1 < @as(u32, SPEC_O)) { spec_acc[i - 1] = @as(u32, a); }
+  spec_next(@as(u32, hb_best[2 * a + 1]));
+  hb_ib[HB] = @as(f32, a);
+}
+
+// A feeder: its row of the micro-batch's table moved on by a (see above).
+fn spec_tw(k: u16) u32 { return @bitcast(u32, s2d_xb[SB * Hc + k]); }
+fn spec_ts(k: u16, v: u32) void { s2d_xb[SB * Hc + k] = @bitcast(f32, v); }
+fn spec_shift(a: u32) void {
+  var b: u16 = 0;
+  while (b < SB) : (b += 1) {
+    spec_ts(b, spec_tw(b) + a);
+    const ws = spec_tw(SB + b) + a;
+    spec_ts(SB + b, ws);
+    var e: u16 = 0;
+    while (e < GE) : (e += 1) {
+      if (spec_tw(2 * SB + b * GE + e) == 0xffffffff) { continue; }
+      const lo = spec_tw(2 * SB + SB * GE + b * GE + e) * @as(u32, GPS);
+      var bits: u32 = 0;
+      if (ws >= lo + @as(u32, GPS) - 1) { bits = if (GPS >= 32) 0xffffffff else (@as(u32, 1) << @as(u16, GPS)) - 1; }
+      else if (ws >= lo) { bits = (@as(u32, 1) << @as(u16, ws - lo + 1)) - 1; }
+      spec_ts(2 * SB + 2 * SB * GE + b * GE + e, bits);
+    }
+  }
+}
+
+// `laps` laps of `nmb` micro-batches (see above). The final root's prof:
+// cycles of its steps after the first lap, [0..2] by phase, [8] the steps.
+fn compute(laps: u32, nmb: u32) void {
+  timestamp.enable_tsc();
+  s2d_steps = laps;
+  var i: u32 = 0;
+  while (i <= laps) : (i += 1) {
+    s2d_iter = i;
+    var m: u16 = 0;
+    while (m < @as(u16, nmb)) : (m += 1) {
+      s2d_mb = m;
+      var g: u16 = 0;
+      while (g < NGRP) : (g += 1) {
+        s2d_grp = g;
+        timing = i >= 1 and i < laps;
+        if (timing) { prof[8] += 1; }
+        timestamp.get_timestamp(&t_mark);
+        if (vm) { step_vm(); } else if (py == F) { hb_step_feeder(); } else { hb_step_region(); }
+      }
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @export_symbol(in_tokens_ptr, "in_tokens");
+  @export_symbol(out_tokens_ptr, "out_tokens");
+  @export_symbol(s2d_yscale_ptr, "yscale");
+  @export_symbol(s2d_hl_ptr, "hlogits");
+  @export_symbol(mtab_ptr, "mtab");
+  @export_symbol(smp_ptr, "smp");
+  @export_symbol(vmlane_ptr, "vmlane");
+  @export_symbol(spec_ctl_ptr, "spec_ctl");
+  @export_symbol(spec_hist_ptr, "spec_hist");
+  @export_symbol(spec_out_ptr, "spec_out");
+  @export_symbol(spec_acc_ptr, "spec_acc");
+}

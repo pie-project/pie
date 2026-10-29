@@ -82,13 +82,24 @@ impl Ring {
     }
 }
 
-/// Words of `gring` in the compiled program at `program_dir`: the size of
+/// Words of `gring` in the compiled program at `program_dir`. A program PIE
+/// built ([`crate::spatial::build`]) says it in its manifest. Otherwise (a
+/// program compiled outside PIE) it is the size of
 /// its `gring` object in the PE images' symbol tables (`bin/*.elf`). One
 /// word (guest4h, guest4h2: the depth, width 16) or two (guest4h3 on: depth
 /// and width). The RPC metadata types the symbol as a bare pointer, and a
 /// read past a one-word symbol returns whatever follows it, so the image's
 /// own symbol is the only reliable account.
 pub fn ring_words(program_dir: &std::path::Path) -> Result<usize, String> {
+    // A program PIE built names its VM image: guest4hm (serve2d) has a
+    // [depth, width] ring, guest4hs (serve2d_pipe) [depth, width, lanes].
+    if let Some(m) = crate::spatial::manifest::Manifest::read(program_dir) {
+        match m.design.as_str() {
+            "serve2d" => return Ok(2),
+            "serve2d_pipe" => return Ok(3),
+            _ => {}
+        }
+    }
     let bin = program_dir.join("bin");
     let entries = std::fs::read_dir(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
     let mut words = None;

@@ -1,0 +1,202 @@
+// serve2d_pipe: serve2d with the layers pipelined. NL = GW x GH grids of
+// Fork 8's qwen2d_pring stage (the paged layer, B lanes; grid_pe.csl from
+// sync.py), placed as serve2d's (serpentine, layer 0 top-right), and head2d
+// east of them (head_pe.csl), together a ring: up to MMAX micro-batches of B
+// lanes go round it, each lap a token for each lane. compute(laps, nmb).
+// Parameters as serve2d's (the ones the paged grid ignores are kept so its
+// host library reads the same out.json); GRID must be 1 and HEADMODE 2.
+param PX: u16;
+param PY: u16;
+param Hc: u16;
+param HR: u16;
+param Dc: u16;
+param Gs: u16;
+param Qh: u16;
+param Ic: u16;
+param Tc: u16;         // unused
+param W16: u16;        // 0
+param KV16: u16;       // 0
+param GRID: u16;       // 1
+param HEADMODE: u16;   // 2
+param B: u16;          // lanes a micro-batch
+param PS: u16;
+param NB: u16;
+param E: u16;
+param MC: u16;
+param MMAX: u16;       // micro-batches a launch, at most (the head's token buffers)
+param HB: u16;         // lanes a head step (B % HB == 0): the head batches them
+param GW: u16;
+param GH: u16;
+param F: u16;          // the head's feeder row (HH / 2)
+param HH: u16;
+param Vr: u16;
+param Gx: u16;
+param Gy: u16;
+param Gb: u16;
+param vocab: u32;
+param PASSES: u16;
+param UNTIED: u16;
+param CERT: u16;
+param MODE: u16;
+param OVL: u16;
+param VMC: u16;
+param WF32: u16;
+param CAP: u16;        // laps a launch + 1, at most
+param DBG: u16;        // unused
+// Speculative decode (one sequence as the B = K + 1 lanes; head_extra.csl):
+// SPEC 1 builds it in (HB = B); the final root's history, lookup table (a power
+// of two) and committed-token capacities.
+param SPEC: u16;
+// The fused naive sampler in the head (every lane; head_extra.csl, SMP 1), and
+// the lanes whose last logits rows the head keeps (min(MMAX·B, HLM)).
+param SMP: u16 = 0;
+// The eta VM on the head's VMC = Vr / 32 VM columns (Fork 3's banked
+// multi-column VM): its image, out ring and MMAX·B lane banks. VM 0: none.
+param VM: u16 = 0;
+param max_ops: u16 = 1;
+param nreg: u16 = 1;
+param pool_words: u16 = 1;
+param feat: u32 = 0;
+param ring_w: u16 = 1;
+param ring_d: u16 = 32;
+param vm_prof: u16 = 1;
+// Per-step host input words a turn (gsin/gsdesc; 0: none) and the opcodes the
+// image keeps (bit o of lo: 0..31, of hi: 32..63; default all).
+param vm_sin: u16 = 0;
+param opmask_lo: u32 = 0xffffffff;
+param opmask_hi: u32 = 0xffffffff;
+param HLM: u16 = 4;
+param SPEC_H: u16;
+param SPEC_T: u16;
+param SPEC_O: u16;
+param iters: u16;      // unused
+
+const C_R1_0: color = @get_color(8);
+const C_R1_1: color = @get_color(7);
+const C_R2_0: color = @get_color(6);
+const C_R2_1: color = @get_color(5);
+const C_BC: color = @get_color(9);
+const C_GB: color = @get_color(10);
+const C_Q2: color = @get_color(16);   // queue 2's color until init sets the handoff's
+const P: u16 = PX;
+const HLB: u16 = if (B * MMAX < HLM) B * MMAX else HLM;
+const HW: u16 = PY + VMC;
+const GHGT: u16 = GH * PY;
+const HR2X: u16 = (PY / Gx / 2) * Gx + Gx / 2;
+const RH: u16 = if (HH + 1 > GHGT) HH + 1 else GHGT;
+const memcpy = @import_module("<memcpy/get_params>", .{ .width = GW * PX + HW, .height = RH });
+
+layout {
+  @comptime_assert(GW >= 2);
+  @comptime_assert(PX == PY and GRID == 1 and HEADMODE == 2 and W16 == 0 and KV16 == 0);
+  @comptime_assert(F > 2 * PY - 1 and F < (GH - 1) * PY);
+  @comptime_assert(F == HH / 2);
+  @comptime_assert(VM == 0 or (VMC >= 1 and Vr == 32 * VMC));
+  @set_rectangle(GW * PX + HW, RH);
+  for (@range(u16, GW * PX + HW)) |x| {
+    const mp = memcpy.get_params(x);
+    for (@range(u16, RH)) |y| {
+      if (VM == 1 and x > GW * PX + HR2X and x <= GW * PX + HR2X + VMC and y <= HH) {
+        @set_tile_code(x, y, "vm_pe.csl", .{
+          .memcpy_params = mp,
+          .W = HW, .H = HH, .F = HH / 2, .C = PY, .Vr = Vr, .NVC = VMC, .VJ = x - (GW * PX + HR2X + 1),
+          .Gx = Gx, .Gb = Gb, .vocab = vocab,
+          .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
+          .c_x = C_BC, .c_ib = C_GB,
+          .max_ops = max_ops, .nreg = nreg, .pool_words = pool_words, .feat = feat, .ring = ring_d,
+          .ring_w = ring_w, .vm_prof = vm_prof, .vm_lanes = MMAX * B, .vm_rows = 1,
+          .vm_sin = vm_sin, .opmask_lo = opmask_lo, .opmask_hi = opmask_hi,
+          .GPX = PX, .GPY = PY, .GW = GW, .GH = GH, .S2D_SB = B,
+        });
+      } else if (x >= GW * PX and y <= HH) {
+        @set_tile_code(x, y, "head_pe.csl", .{
+          .memcpy_params = mp,
+          .W = HW, .H = HH, .F = HH / 2, .C = PY, .Hc = Hc, .Vr = Vr, .Gx = Gx, .Gy = Gy, .Gb = Gb,
+          .vocab = vocab, .PASSES = PASSES, .UNTIED = UNTIED, .CERT = CERT, .MODE = MODE, .OVL = OVL,
+          .VMC = VMC, .WF32 = WF32,
+          .GPX = PX, .GPY = PY, .GW = GW, .GH = GH, .CAP = CAP, .SB = B, .HB = HB, .HLB = HLB, .MMAX = MMAX,
+          .GE = E, .S2D_DBG = 0,
+          .SMP = SMP, .SPEC = SPEC, .GPS = PS, .SPEC_H = SPEC_H, .SPEC_T = SPEC_T, .SPEC_O = SPEC_O,
+          .S2D_REG = if (y == HH / 2) 0 else 1,
+          .S2D_ROOTC = if (x - GW * PX == HR2X and y != HH / 2) 1 else 0,
+          .S2D_FINAL = if (x - GW * PX == HR2X and y == HH / 2) 1 else 0,
+          .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
+          .c_x = C_BC, .c_ib = C_GB,
+        });
+      } else if (x >= GW * PX or y >= GHGT) {
+        @set_tile_code(x, y, "filler.csl", .{
+          .memcpy_params = mp, .PX = PX, .PY = PY, .GW = GW, .GH = GH, .F = F,
+          .C = PY, .VMC = VMC, .VMAT = HR2X + 1, .WS = f32, .KS = f32,
+        });
+      } else {
+        @set_tile_code(x, y, "grid_pe.csl", .{
+          .memcpy_params = mp,
+          .P = P, .Hc = Hc, .Dc = Dc, .Gs = Gs, .Ic = Ic, .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC,
+          .GW = GW, .GH = GH, .NL = GW * GH, .F = F, .S2D_VMC = VMC, .S2D_VMAT = HR2X + 1,
+          .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
+          .c_bc = C_BC, .c_gb = C_GB, .c_cp = C_Q2,
+          .K = 1, .stage = 0, .c_in = C_Q2, .c_out = C_Q2, .c_ret = C_Q2,
+        });
+      }
+    }
+  }
+  @export_name("x", [*]f32, true);
+  @export_name("gamma1", [*]f32, true);
+  @export_name("gamma2", [*]f32, true);
+  @export_name("wqa", [*]f32, true);
+  @export_name("wqv", [*]f32, true);
+  @export_name("wv", [*]f32, true);
+  @export_name("qkn_w", [*]f32, true);
+  @export_name("rot_c", [*]f32, true);
+  @export_name("rot_s", [*]f32, true);
+  @export_name("kc", [*]f32, true);
+  @export_name("vc", [*]f32, true);
+  @export_name("wo", [*]f32, true);
+  @export_name("wgu", [*]f32, true);
+  @export_name("wd", [*]f32, true);
+  @export_name("prof", [*]u32, true);
+  @export_name("dims", [*]u16, true);
+  @export_name("fallbacks", [*]u32, true);
+  @export_name("wt", [*]u32, true);
+  @export_name("et", [*]u32, true);
+  @export_name("l2", [*]f32, true);
+  @export_name("force", [*]u32, true);
+  @export_name("lmax", [*]f32, true);
+  @export_name("gmode", [*]u32, true);
+  @export_name("vm_tok", [*]f32, true);
+  @export_name("vin", [*]f32, true);
+  @export_name("xin", [*]f32, true);
+  @export_name("gam", [*]f32, true);
+  @export_name("y", [*]f32, true);
+  @export_name("emb", [*]f32, true);
+  @export_name("tok", [*]f32, true);
+  @export_name("in_tokens", [*]u32, true);
+  @export_name("out_tokens", [*]u32, true);
+  @export_name("yscale", [*]f32, true);
+  @export_name("hlogits", [*]f32, true);
+  @export_name("mtab", [*]f32, true);
+  @export_name("smp", [*]u32, true);
+  @export_name("vmlane", [*]u32, true);
+  @export_name("vm_ctl", [*]u32, true);
+  @export_name("gsin", [*]u32, true);
+  @export_name("gsdesc", [*]u32, true);
+  @export_name("gwide", [*]f32, true);
+  @export_name("gpool", [*]u32, true);
+  @export_name("gops", [*]u32, true);
+  @export_name("gout", [*]u32, true);
+  @export_name("gprof", [*]u32, true);
+  @export_name("gostep", [*]u32, true);
+  @export_name("gring", [*]u32, true);
+  @export_name("gcycles", [*]u32, true);
+  @export_name("gvalid", [*]u32, true);
+  @export_name("gtok_home", [*]u32, true);
+  @export_name("gbank", [*]u32, true);
+  @export_name("spec_acc", [*]u32, true);
+  @export_name("spec_out", [*]u32, true);
+  @export_name("spec_hist", [*]u32, true);
+  @export_name("spec_ctl", [*]u32, true);
+  @export_name("init", fn()void);
+  @export_name("compute", fn(u32, u32)void);
+  @export_name("copy_page", fn(u32, u32)void);
+  @export_name("copy_move", fn(u32, u32)void);
+}

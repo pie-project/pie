@@ -64,6 +64,10 @@ pub mod paged;
 pub mod plan;
 pub mod serve2d;
 pub mod wafer;
+// In-tree wafer programs: sources, generation, build, manifest (audit item 5).
+pub mod build;
+pub mod codegen;
+pub mod manifest;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
