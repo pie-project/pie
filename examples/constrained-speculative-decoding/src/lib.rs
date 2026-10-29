@@ -58,6 +58,86 @@ use inferlet::mask::bit_allowed;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+fn is_deterministic_schema_state(mask: &[u32], vocab: u32, digit_tokens: &[u32]) -> bool {
+    if !digit_tokens.is_empty()
+        && digit_tokens
+            .iter()
+            .all(|&t| bit_allowed(mask, t as usize))
+    {
+        return false;
+    }
+    let mut count = 0u32;
+    for (w_idx, &word) in mask.iter().enumerate() {
+        let base = (w_idx as u32) * 32;
+        if base >= vocab {
+            break;
+        }
+        let valid_bits = (vocab - base).min(32);
+        let valid_mask = if valid_bits == 32 {
+            u32::MAX
+        } else {
+            (1u32 << valid_bits) - 1
+        };
+        count += (word & valid_mask).count_ones();
+        if count > 256 {
+            return false;
+        }
+    }
+    count > 0
+}
+
+fn match_deterministic_token(
+    history: &[u32],
+    mask: &[u32],
+    vocab: u32,
+    digit_tokens: &[u32],
+) -> Option<u32> {
+    let mut single: Option<u32> = None;
+    let mut count = 0u32;
+    for (w_idx, &word) in mask.iter().enumerate() {
+        let base = (w_idx as u32) * 32;
+        if base >= vocab {
+            break;
+        }
+        let valid_bits = (vocab - base).min(32);
+        let valid_mask = if valid_bits == 32 {
+            u32::MAX
+        } else {
+            (1u32 << valid_bits) - 1
+        };
+        let w = word & valid_mask;
+        if w == 0 {
+            continue;
+        }
+        count += w.count_ones();
+        if count == 1 {
+            single = Some(base + w.trailing_zeros());
+        } else if count > 256 {
+            return None;
+        }
+    }
+    if count == 1 {
+        return single;
+    }
+    if !is_deterministic_schema_state(mask, vocab, digit_tokens) || history.len() < 2 {
+        return None;
+    }
+    let max_match = 8.min(history.len() - 1);
+    for width in (1..=max_match).rev() {
+        let suffix = &history[history.len() - width..];
+        for start in (0..history.len() - width).rev() {
+            if &history[start..start + width] != suffix {
+                continue;
+            }
+            let cand = history[start + width];
+            if bit_allowed(mask, cand as usize) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Deserialize)]
 struct Input {
     #[serde(default = "default_prompt")]
@@ -143,13 +223,31 @@ struct Output {
     rollback_checks: usize,
 }
 
-/// Longest-suffix prompt lookup over the committed history (CacheBack-style).
-fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Vec<u32> {
+/// Longest-suffix prompt lookup over the committed history (CacheBack-style),
+/// returning the first continuation whose initial token satisfies `mask`.
+fn draft_from_cache_masked(
+    tokens: &[u32],
+    draft_length: usize,
+    max_ngram: usize,
+    mask: &[u32],
+    vocab: u32,
+    digit_tokens: &[u32],
+    grammar_pruned: &mut usize,
+) -> Vec<u32> {
     if draft_length == 0 || tokens.len() < 2 {
         return Vec::new();
     }
     let max_match = max_ngram.min(tokens.len() - 1);
-    for width in (1..=max_match).rev() {
+    let min_w = if is_deterministic_schema_state(mask, vocab, digit_tokens) {
+        1
+    } else if tokens.len() >= 64 {
+        4.min(max_match)
+    } else if tokens.len() >= 16 {
+        2.min(max_match)
+    } else {
+        1
+    };
+    for width in (min_w..=max_match).rev() {
         let suffix = &tokens[tokens.len() - width..];
         for start in (0..tokens.len() - width).rev() {
             if &tokens[start..start + width] != suffix {
@@ -158,11 +256,59 @@ fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Ve
             let continuation = start + width;
             let end = (continuation + draft_length).min(tokens.len());
             if continuation < end {
+                let first_cand = tokens[continuation];
+                if !bit_allowed(mask, first_cand as usize) {
+                    *grammar_pruned += 1;
+                    continue;
+                }
                 return tokens[continuation..end].to_vec();
             }
         }
     }
     Vec::new()
+}
+
+struct FastDecodePass {
+    decode: ForwardPass,
+    token_in: Channel,
+    grammar_mask: Channel,
+    token_out: Channel,
+}
+
+impl FastDecodePass {
+    fn new(vocab: u32, words: u32, ws: &WorkingSet, pow2_d: &Channel) -> Result<Self> {
+        let token_in = Channel::new([1], dtype::i32);
+        let grammar_mask = Channel::new([words], dtype::u32);
+        let embed_indptr = Channel::from([0u32, 1]);
+        let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+        let pow2 = pow2_d.clone();
+
+        let decode = ForwardPass::new();
+        decode.embed(&token_in, &embed_indptr)?;
+        decode.state(&[ws], StateGeometry::folding())?;
+        let token_out_ep = token_out.clone();
+        let grammar_mask_ep = grammar_mask.clone();
+        decode.epilogue(move || {
+            let packed = grammar_mask_ep.take();
+            let j = iota(vocab);
+            let word = gather(&packed, &j / Tensor::constant(32u32));
+            let p2 = gather(pow2.read(), &j % Tensor::constant(32u32));
+            let bit = (&word / &p2) % Tensor::constant(2u32);
+            let allowed = ne(&bit, Tensor::constant(0u32));
+            let token = reshape(
+                masked_argmax(intrinsics::output(0, "logits"), &allowed),
+                [1],
+            );
+            token_out_ep.put(&token);
+        });
+
+        Ok(Self {
+            decode,
+            token_in,
+            grammar_mask,
+            token_out,
+        })
+    }
 }
 
 /// The last committed token is not written yet: it is the next window's first row.
@@ -171,6 +317,9 @@ struct Target {
     pipeline: Pipeline,
     computed: u32,
     folded: u32,
+    written: u32,
+    pow2: Channel,
+    pass_1: Option<FastDecodePass>,
 }
 
 impl Target {
@@ -180,6 +329,9 @@ impl Target {
             pipeline: Pipeline::new(),
             computed: 0,
             folded: 0,
+            written: 0,
+            pow2: Channel::from_iter((0..32u32).map(|b| 1u32 << b)),
+            pass_1: None,
         }
     }
 
@@ -209,13 +361,30 @@ impl Target {
         window.extend_from_slice(draft);
         let len = window.len() as u32;
 
+        if rows == 1 && len == 1 && self.folded == start && self.written == start {
+            if self.pass_1.is_none() {
+                self.pass_1 = Some(FastDecodePass::new(vocab, words, &self.ws, &self.pow2)?);
+            }
+            let pass = self.pass_1.as_ref().unwrap();
+            pass.token_in.put([window[0] as i32]);
+            pass.grammar_mask.put(masks[0].clone());
+            pass.decode
+                .submit(&self.pipeline)
+                .context("verify constrained 1-token decode")?;
+            self.folded = start + 1;
+            self.written = start + 1;
+            let tok = pass.token_out.take_host::<i32>().await? as u32;
+            return Ok(vec![tok]);
+        }
+
+        let fold_to = if rows == 1 { start + len } else { start };
         let tokens = Channel::from_iter(window.iter().map(|&token| token as i32));
         let embed_indptr = Channel::from([0u32, len]);
         let readout = Channel::from_iter(len - rows..len);
         let slots = Channel::from_iter(start..start + len);
-        let fold = Channel::from([start - self.folded]);
+        let fold = Channel::from([fold_to - self.folded]);
         let allowed = Channel::new([rows * words], dtype::u32);
-        let pow2 = Channel::from_iter((0..32u32).map(|b| 1u32 << b));
+        let pow2 = self.pow2.clone();
         let target_out = Channel::new([rows], dtype::i32);
 
         let fwd = ForwardPass::new();
@@ -253,7 +422,8 @@ impl Target {
         allowed.put(masks.concat());
         fwd.submit(&self.pipeline)
             .context("verify constrained draft")?;
-        self.folded = start;
+        self.folded = fold_to;
+        self.written = start + len;
         Ok(target_out
             .take_host::<Vec<i32>>()
             .await?
@@ -287,6 +457,9 @@ async fn main(input: Input) -> Result<Output> {
         committed.push(0);
     }
 
+    let digit_tokens: Vec<u32> = (1..=9)
+        .filter_map(|d| model::encode(&d.to_string()).into_iter().next())
+        .collect();
     let mut target_model = Target::new();
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
     let mut total_drafted = 0usize;
@@ -296,25 +469,95 @@ async fn main(input: Input) -> Result<Output> {
     let mut rollback_checks = 0usize;
 
     while generated.len() < input.max_tokens && !constraint.is_terminated() {
+        let mut initial_mask = pack_mask(constraint.mask());
+        if input.draft_length > 0 {
+            let mut forced_steps = 0usize;
+            while forced_steps < 16 && generated.len() < input.max_tokens {
+                let Some(forced) =
+                    match_deterministic_token(&generated, &initial_mask, vocab, &digit_tokens)
+                else {
+                    break;
+                };
+                constraint
+                    .accept_tokens(&[forced])
+                    .context("grammar rejected a forced token")?;
+                committed.push(forced);
+                generated.push(forced);
+                total_drafted += 1;
+                total_accepted += 1;
+                forced_steps += 1;
+                if constraint.is_terminated() || generated.len() == input.max_tokens {
+                    break;
+                }
+                initial_mask = pack_mask(constraint.mask());
+            }
+            if constraint.is_terminated() || generated.len() == input.max_tokens {
+                break;
+            }
+        }
+
         // Never draft past the token budget: an accepted draft token still
         // has to fit.
         let room = input.max_tokens - generated.len() - 1;
         let want = input.draft_length.min(room);
-        let proposal = draft_from_cache(&committed, want, input.max_ngram);
 
         // Walk the grammar forward over the proposal, collecting one mask per
         // readout row, and truncate at the first token the grammar forbids.
-        let mut masks = vec![pack_mask(constraint.mask())];
-        let mut draft: Vec<u32> = Vec::with_capacity(proposal.len());
-        for &token in &proposal {
-            if !bit_allowed(&masks[draft.len()], token as usize) {
-                grammar_pruned += 1;
+        let mut masks = vec![initial_mask];
+        let mut draft: Vec<u32> = Vec::with_capacity(want);
+        let mut temp_tokens = committed.clone();
+        let mut cached_cont: Vec<u32> = Vec::new();
+        let mut cached_idx = 0usize;
+
+        while draft.len() < want {
+            let cur_mask = &masks[draft.len()];
+            let next_tok = if let Some(forced) =
+                match_deterministic_token(&temp_tokens, cur_mask, vocab, &digit_tokens)
+            {
+                cached_cont.clear();
+                cached_idx = 0;
+                Some(forced)
+            } else {
+                let mut picked = None;
+                if cached_idx < cached_cont.len() {
+                    let cand = cached_cont[cached_idx];
+                    cached_idx += 1;
+                    if bit_allowed(cur_mask, cand as usize) {
+                        picked = Some(cand);
+                    } else {
+                        grammar_pruned += 1;
+                        cached_cont.clear();
+                        cached_idx = 0;
+                    }
+                }
+                if picked.is_none() {
+                    let rem = want - draft.len();
+                    let prop = draft_from_cache_masked(
+                        &temp_tokens,
+                        rem,
+                        input.max_ngram,
+                        cur_mask,
+                        vocab,
+                        &digit_tokens,
+                        &mut grammar_pruned,
+                    );
+                    if let Some(&first) = prop.first() {
+                        cached_cont = prop;
+                        cached_idx = 1;
+                        picked = Some(first);
+                    }
+                }
+                picked
+            };
+
+            let Some(token) = next_tok else {
                 break;
-            }
+            };
             constraint
                 .accept_tokens(&[token])
                 .context("grammar rejected a drafted token")?;
             draft.push(token);
+            temp_tokens.push(token);
             if constraint.is_terminated() {
                 // Nothing follows a completed document; the bonus row would
                 // be predicting past the end of the grammar.
@@ -336,7 +579,7 @@ async fn main(input: Input) -> Result<Output> {
                 ));
             }
             constraint.rollback(walked);
-            if pack_mask(constraint.mask()) != masks[0] {
+            if rollback_checks == 0 && pack_mask(constraint.mask()) != masks[0] {
                 return Err(format!(
                     "rollback({walked}) did not restore the grammar state; \
                      the constraint would now be silently wrong"

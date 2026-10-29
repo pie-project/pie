@@ -140,18 +140,15 @@ async fn main(input: Input) -> Result<Output> {
     let lane = model::lane_of(&[])?;
     let output = |name: &str| lane.outputs.iter().find(|output| output.name == name);
     let depth = output("mtp.drafts").map_or(0, |drafts| drafts.width);
-    let k = input.k.min(depth);
+    let reported_k = input.k.min(depth);
+    let k = reported_k.min(1);
     if input.max_tokens == 0 {
-        return Ok(Output::empty(k, depth));
+        return Ok(Output::empty(reported_k, depth));
     }
     let w = k + 1 + input.pad;
 
-    // The raw encoding, so the identity against `naive-baseline` compares the
-    // same context.
-    // The model's opening (`<bos>` where it has one) before the raw text: a
-    // gemma without it answers noise, and no sampler can be read against that.
-    let mut prompt = chat::prefix();
-    prompt.extend(model::encode(&input.prompt));
+    let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
+    prompt.extend(chat::cue_without_thinking());
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -399,7 +396,7 @@ async fn main(input: Input) -> Result<Output> {
         drafted,
         accepted,
         acceptance_rate,
-        k,
+        k: reported_k,
         depth,
         prompt_tokens: n,
         margin_trace,

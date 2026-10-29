@@ -13,11 +13,11 @@ LLAMA = template("llama")
 
 TOKENIZER = tokenizer(markers = [["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>"]])
 
-def llama(id, layers, mini = False):
-    return model(id, mini = mini, template = LLAMA, tokenizer = TOKENIZER, arch = "llama", layers = layers, vocab = 128256)
+def llama(id, layers, mini = False, **kwargs):
+    return model(id, mini = mini, template = LLAMA, tokenizer = TOKENIZER, arch = "llama", layers = layers, vocab = 128256, **kwargs)
 
 MODELS = [
-    llama("llama31-8b", layers = 32),
+    llama("llama31-8b", layers = 32, drafters = ["mtp"]),
     llama("llama33-70b", layers = 80),
     llama("llama33-70b-mini-l4", layers = 4, mini = True),
 ]
@@ -29,6 +29,7 @@ NV4W = dtype.nvfp4
 E4M3 = dtype.e4m3
 
 DEPLOYMENTS = [
+    deployment("llama31-8b", weights = BF, kv = BF, drafter = "mtp"),
     deployment("llama31-8b", weights = BF, kv = BF),
     deployment("llama31-8b", weights = BF, kv = E4M3),
     # modelopt's FP8 export (`nvidia/Llama-3.1-8B-Instruct-FP8`), its one
@@ -83,7 +84,7 @@ DIMS = {
 RELEASED = [dtype.e4m3tile128a8, dtype.nvfp4]
 
 def layout(id, deploy):
-    if deploy.drafter != None or deploy.parts:
+    if deploy.parts or (deploy.drafter != None and (id != "llama31-8b" or deploy.drafter != "mtp")):
         fail("{} ships no drafter and no parts".format(id))
     proj = roles(deploy, "proj", exact = True).proj
     table = dtype.bf16 if proj in RELEASED else proj
@@ -106,6 +107,31 @@ def layout(id, deploy):
             kv = "kv.{}".format(l),
             lora_a = lora_a,
             lora_b = lora_b,
+        )
+
+    mtp = None
+    if deploy.drafter == "mtp":
+        mtp = struct(
+            depth = 4,
+            taps = [1, 15, 28],
+            embed = weight([d.vocab, hidden], table),
+            fc = [weight([hidden, hidden], table) for _ in range(3)],
+            input_norm = weight([hidden]),
+            hidden_norm = weight([hidden]),
+            q_embed = weight([q_width, hidden], table),
+            q_hidden = weight([q_width, hidden], table),
+            k_embed = weight([kv_width, hidden], table),
+            k_hidden = weight([kv_width, hidden], table),
+            v_embed = weight([kv_width, hidden], table),
+            v_hidden = weight([kv_width, hidden], table),
+            o = weight([hidden, q_width], table),
+            mlp_norm = weight([hidden]),
+            gate = weight([d.inter, hidden], table),
+            up = weight([d.inter, hidden], table),
+            down = weight([hidden, d.inter], table),
+            norm = weight([hidden]),
+            head = weight([d.vocab, hidden], table),
+            kv = "kv.mtp",
         )
 
     return struct(
@@ -131,6 +157,7 @@ def layout(id, deploy):
         head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
+        mtp = mtp,
     )
 
 # How a Llama 3.1 / 3.3 checkpoint is read: transformers' safetensors under
@@ -154,11 +181,34 @@ def configured(m):
         config("rope_scaling.original_max_position_embeddings", m.rope.original_max_position),
     ]
 
+def read_checkpoint(reads, m):
+    mapped(reads, m, TRANSFORMERS)
+    if m.mtp != None:
+        mtp = m.mtp
+        reads.read(mtp.embed, "mtp.embed.weight")
+        for i in range(3):
+            reads.read(mtp.fc[i], "mtp.fc.{}.weight".format(i))
+        reads.read(mtp.input_norm, "mtp.input_norm.weight")
+        reads.read(mtp.hidden_norm, "mtp.hidden_norm.weight")
+        reads.read(mtp.q_embed, "mtp.q_embed.weight")
+        reads.read(mtp.q_hidden, "mtp.q_hidden.weight")
+        reads.read(mtp.k_embed, "mtp.k_embed.weight")
+        reads.read(mtp.k_hidden, "mtp.k_hidden.weight")
+        reads.read(mtp.v_embed, "mtp.v_embed.weight")
+        reads.read(mtp.v_hidden, "mtp.v_hidden.weight")
+        reads.read(mtp.o, "mtp.o.weight")
+        reads.read(mtp.mlp_norm, "mtp.mlp_norm.weight")
+        reads.read(mtp.gate, "mtp.gate.weight")
+        reads.read(mtp.up, "mtp.up.weight")
+        reads.read(mtp.down, "mtp.down.weight")
+        reads.read(mtp.norm, "mtp.norm.weight")
+        reads.read(mtp.head, "mtp.head.weight")
+
 def formats(m):
     return [format(
         "transformers",
         recognizes = lambda checkpoint: has("model.embed_tokens.weight") and has("model.layers.0.self_attn.q_proj.weight") and not has("model.layers.0.self_attn.q_norm.weight"),
-        read = lambda reads: mapped(reads, m, TRANSFORMERS),
+        read = lambda reads: read_checkpoint(reads, m),
         states = configured(m),
     )]
 
@@ -186,6 +236,16 @@ def caches(m, c):
     kv = c.kv_space(m.kv)
     for w in m.layers:
         c.kv(kv, w.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
+    if m.mtp != None:
+        c.kv(kv, m.mtp.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
+
+def tap(mtp, layer, y, fused):
+    if mtp == None or layer not in mtp.taps:
+        return fused
+    part = ops.linear.matmul(y.on(fact.drafts()), mtp.fc[mtp.taps.index(layer)])
+    if fused == None:
+        return part
+    return ops.elemwise.residual_add(part, fused)
 
 def forward(m, inputs):
     positions = inputs.positions()
@@ -199,14 +259,47 @@ def forward(m, inputs):
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
 
-    def block(l, w, y):
+    def block(l, w, carried):
+        y, fused = carried
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
         o = attention(x, inputs, m, w, positions, scaling = scaling)
         y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        return ops.elemwise.residual_add(swiglu(x, w), y)
+        y = ops.elemwise.residual_add(swiglu(x, w), y)
+        return (y, tap(m.mtp, l, y, fused))
 
-    y = inputs.fold_layers(m.layers, y, block)
+    y, fused = inputs.fold_layers(m.layers, (y, None), block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    output("logits", ops.linear.lm_head(x, m.head))
+    logits = ops.linear.lm_head(x, m.head)
+    if m.mtp != None:
+        draft(m, inputs, fused, logits, scaling)
+    output("logits", logits)
+
+def draft(m, inputs, fused, logits, scaling):
+    mtp = m.mtp
+    input_mtp = inputs.on(fact.drafts())
+    plan_mtp = ops.attn.plan_prefill(input_mtp, m.q_heads, m.kv_heads, m.head_dim, None)
+    dpos = inputs.positions().on(fact.drafts())
+    dlogits = logits.on(fact.drafts())
+    pages = inputs.kv(mtp.kv)
+    write_page = inputs.write_page(mtp.kv)
+    write_offset = inputs.write_offset(mtp.kv)
+
+    token = ops.sampling.argmax([dlogits])
+    e = ops.gather.embed(token, mtp.embed, m.vocab)
+    e = ops.elemwise.rmsnorm(e, mtp.input_norm, m.eps)
+    h = ops.elemwise.rmsnorm(fused, mtp.hidden_norm, m.eps)
+    q = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.q_embed), ops.linear.matmul(h, mtp.q_hidden))
+    k = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.k_embed), ops.linear.matmul(h, mtp.k_hidden))
+    v = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.v_embed), ops.linear.matmul(h, mtp.v_hidden))
+    q, k = ops.elemwise.rope(q, dpos, m.head_dim, 10000.0, rotary.full(), k = k)
+    ops.attn.kv_append(k, v, pages, write_page, write_offset)
+    o = ops.attn.prefill(q, plan_mtp, pages, None, m.head_dim, m.kv_heads, m.sm_scale)
+    r1 = ops.elemwise.residual_add(ops.linear.matmul(o, mtp.o), fused)
+    mlp_in = ops.elemwise.rmsnorm(r1, mtp.mlp_norm, m.eps)
+    r2 = ops.elemwise.residual_add(swiglu(mlp_in, mtp), r1)
+    normed = ops.elemwise.rmsnorm(r2, mtp.norm, m.eps)
+    proposal = ops.linear.lm_head(ops.gather.gather_rows(normed, input_mtp.readout_rows()), mtp.head)
+    output("mtp.logits", proposal)
+    output("mtp.drafts", ops.sampling.argmax([proposal] * mtp.depth))

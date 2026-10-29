@@ -15,8 +15,8 @@ use crate::grammar::Grammar;
 use crate::grammar::normalize::normalize_grammar;
 use tokenizer::Tokenizer;
 
-const BITMASK_CACHE_BUDGET_BYTES: usize = 1024 * 1024;
-const BITMASK_CACHE_MAX_ENTRIES: usize = 256;
+const BITMASK_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+const BITMASK_CACHE_MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StateFlags(pub(crate) u8);

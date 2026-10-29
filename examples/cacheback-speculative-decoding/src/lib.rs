@@ -97,7 +97,12 @@ fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Ve
     }
 
     let max_match = max_ngram.min(tokens.len() - 1);
-    for width in (1..=max_match).rev() {
+    let min_w = if tokens.len() >= 16 {
+        2.min(max_match)
+    } else {
+        1
+    };
+    for width in (min_w..=max_match).rev() {
         let suffix = &tokens[tokens.len() - width..];
         for start in (0..tokens.len() - width).rev() {
             if &tokens[start..start + width] != suffix {

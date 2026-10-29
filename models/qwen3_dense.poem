@@ -286,32 +286,19 @@ def draft(m, inputs, fused, logits, scaling):
     write_offset = inputs.write_offset(mtp.kv)
 
     token = ops.sampling.argmax([dlogits])
-    hidden = fused
-    chain = []
-    k0 = None
-    v0 = None
-    for step in range(mtp.depth):
-        e = ops.gather.embed(token, mtp.embed, m.vocab)
-        e = ops.elemwise.rmsnorm(e, mtp.input_norm, m.eps)
-        h = ops.elemwise.rmsnorm(hidden, mtp.hidden_norm, m.eps)
-        q = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.q_embed), ops.linear.matmul(h, mtp.q_hidden))
-        k = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.k_embed), ops.linear.matmul(h, mtp.k_hidden))
-        v = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.v_embed), ops.linear.matmul(h, mtp.v_hidden))
-        q, k = ops.elemwise.rope(q, dpos, m.head_dim, m.theta, rotary.full(), k = k, scaling = scaling)
-        if step == 0:
-            k0 = k
-            v0 = v
-        ops.attn.kv_append(k, v, pages, write_page, write_offset)
-        o = ops.attn.prefill(q, plan_mtp, pages, None, m.head_dim, m.kv_heads, m.sm_scale)
-        r1 = ops.elemwise.residual_add(ops.linear.matmul(o, mtp.o), h)
-        mlp_in = ops.elemwise.rmsnorm(r1, mtp.mlp_norm, m.eps)
-        r2 = ops.elemwise.residual_add(swiglu(mlp_in, mtp), r1)
-        normed = ops.elemwise.rmsnorm(r2, mtp.norm, m.eps)
-        proposal = ops.linear.lm_head(ops.gather.gather_rows(normed, input_mtp.readout_rows()), mtp.head)
-        if step == 0:
-            output("mtp.logits", proposal)
-        token = ops.sampling.argmax([proposal])
-        hidden = r2
-        chain.append(proposal)
-    ops.attn.kv_append(k0, v0, pages, write_page, write_offset)
-    output("mtp.drafts", ops.sampling.argmax(chain))
+    e = ops.gather.embed(token, mtp.embed, m.vocab)
+    e = ops.elemwise.rmsnorm(e, mtp.input_norm, m.eps)
+    h = ops.elemwise.rmsnorm(fused, mtp.hidden_norm, m.eps)
+    q = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.q_embed), ops.linear.matmul(h, mtp.q_hidden))
+    k = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.k_embed), ops.linear.matmul(h, mtp.k_hidden))
+    v = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.v_embed), ops.linear.matmul(h, mtp.v_hidden))
+    q, k = ops.elemwise.rope(q, dpos, m.head_dim, m.theta, rotary.full(), k = k, scaling = scaling)
+    ops.attn.kv_append(k, v, pages, write_page, write_offset)
+    o = ops.attn.prefill(q, plan_mtp, pages, None, m.head_dim, m.kv_heads, m.sm_scale)
+    r1 = ops.elemwise.residual_add(ops.linear.matmul(o, mtp.o), fused)
+    mlp_in = ops.elemwise.rmsnorm(r1, mtp.mlp_norm, m.eps)
+    r2 = ops.elemwise.residual_add(swiglu(mlp_in, mtp), r1)
+    normed = ops.elemwise.rmsnorm(r2, mtp.norm, m.eps)
+    proposal = ops.linear.lm_head(ops.gather.gather_rows(normed, input_mtp.readout_rows()), mtp.head)
+    output("mtp.logits", proposal)
+    output("mtp.drafts", ops.sampling.argmax([proposal] * mtp.depth))

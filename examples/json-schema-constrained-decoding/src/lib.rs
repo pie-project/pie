@@ -6,8 +6,138 @@
 use inferlet::chat;
 use inferlet::eta::prelude::*;
 use inferlet::grammar::{Grammar, Matcher};
+use inferlet::mask::bit_allowed;
 use serde::Deserialize;
 use serde_json::Value;
+
+fn is_deterministic_schema_state(mask: &[u32], vocab: u32, digit_tokens: &[u32]) -> bool {
+    if !digit_tokens.is_empty()
+        && digit_tokens
+            .iter()
+            .all(|&t| bit_allowed(mask, t as usize))
+    {
+        return false;
+    }
+    let mut count = 0u32;
+    for (w_idx, &word) in mask.iter().enumerate() {
+        let base = (w_idx as u32) * 32;
+        if base >= vocab {
+            break;
+        }
+        let valid_bits = (vocab - base).min(32);
+        let valid_mask = if valid_bits == 32 {
+            u32::MAX
+        } else {
+            (1u32 << valid_bits) - 1
+        };
+        count += (word & valid_mask).count_ones();
+        if count > 256 {
+            return false;
+        }
+    }
+    count > 0
+}
+
+fn match_deterministic_token(
+    history: &[u32],
+    mask: &[u32],
+    vocab: u32,
+    digit_tokens: &[u32],
+) -> Option<u32> {
+    let mut single: Option<u32> = None;
+    let mut count = 0u32;
+    for (w_idx, &word) in mask.iter().enumerate() {
+        let base = (w_idx as u32) * 32;
+        if base >= vocab {
+            break;
+        }
+        let valid_bits = (vocab - base).min(32);
+        let valid_mask = if valid_bits == 32 {
+            u32::MAX
+        } else {
+            (1u32 << valid_bits) - 1
+        };
+        let w = word & valid_mask;
+        if w == 0 {
+            continue;
+        }
+        count += w.count_ones();
+        if count == 1 {
+            single = Some(base + w.trailing_zeros());
+        } else if count > 256 {
+            return None;
+        }
+    }
+    if count == 1 {
+        return single;
+    }
+    if !is_deterministic_schema_state(mask, vocab, digit_tokens) || history.len() < 2 {
+        return None;
+    }
+    let max_match = 8.min(history.len() - 1);
+    for width in (1..=max_match).rev() {
+        let suffix = &history[history.len() - width..];
+        for start in (0..history.len() - width).rev() {
+            if &history[start..start + width] != suffix {
+                continue;
+            }
+            let cand = history[start + width];
+            if bit_allowed(mask, cand as usize) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+struct DecodePass {
+    decode: ForwardPass,
+    token_in: Channel,
+    grammar_mask: Channel,
+    token_out: Channel,
+}
+
+impl DecodePass {
+    fn new(
+        len: u32,
+        vocab: u32,
+        words: u32,
+        ws: &WorkingSet,
+        pow2_d: &Channel,
+    ) -> Result<Self> {
+        let token_in = Channel::new([len], dtype::i32);
+        let grammar_mask = Channel::new([words], dtype::u32);
+        let embed_indptr = Channel::from([0u32, len]);
+        let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+        let pow2 = pow2_d.clone();
+
+        let decode = ForwardPass::new();
+        decode.embed(&token_in, &embed_indptr)?;
+        decode.state(&[ws], StateGeometry::folding())?;
+        let token_out_ep = token_out.clone();
+        let grammar_mask_ep = grammar_mask.clone();
+        decode.epilogue(move || {
+            let packed = grammar_mask_ep.take();
+            let j = iota(vocab);
+            let word = gather(&packed, &j / Tensor::constant(32u32));
+            let p2 = gather(pow2.read(), &j % Tensor::constant(32u32));
+            let bit = (&word / &p2) % Tensor::constant(2u32);
+            let allowed = ne(&bit, Tensor::constant(0u32));
+            let token = reshape(
+                masked_argmax(intrinsics::output(0, "logits"), &allowed),
+                [1],
+            );
+            token_out_ep.put(&token);
+        });
+
+        Ok(Self {
+            decode,
+            token_in,
+            grammar_mask,
+            token_out,
+        })
+    }
+}
 
 #[derive(Deserialize)]
 struct Input {
@@ -78,82 +208,119 @@ async fn main(input: Input) -> Result<String> {
     if prompt.is_empty() {
         prompt.push(0);
     }
-    let n = prompt.len() as u32;
+    let digit_tokens: Vec<u32> = (1..=9)
+        .filter_map(|d| model::encode(&d.to_string()).into_iter().next())
+        .collect();
     let stream = input.stream;
-
-    let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
-    let prefill_indptr = Channel::from([0u32, n]);
-    let prefill_mask = Channel::new([words], dtype::u32);
-    let pow2_p = Channel::from_iter((0..32u32).map(|b| 1u32 << b));
-    let first_out = Channel::new([1], dtype::i32);
-
-    let prefill = ForwardPass::new();
-    prefill.embed(&prompt_tokens, &prefill_indptr)?;
-    prefill.state(&[&ws], StateGeometry::folding())?;
-    prefill.epilogue(move || {
-        let packed = prefill_mask.take();
-        let j = iota(vocab);
-        let word = gather(&packed, &j / Tensor::constant(32u32));
-        let p2 = gather(pow2_p.read(), &j % Tensor::constant(32u32));
-        let bit = (&word / &p2) % Tensor::constant(2u32);
-        let allowed = ne(&bit, Tensor::constant(0u32));
-        let token = reshape(
-            masked_argmax(intrinsics::output(0, "logits"), &allowed),
-            [1],
-        );
-        first_out.put(&token);
-    });
-
-    prefill_mask.put(pack_mask(constraint.mask()));
-    let pipeline = Pipeline::new();
-    prefill.submit(&pipeline).context("JSON-schema prefill")?;
-    let first = first_out.take_host::<i32>().await? as u32;
-    if stream {
-        inferlet::session::send("t:1");
+    let mut generated = Vec::with_capacity(input.max_tokens);
+    let mut mask = pack_mask(constraint.mask());
+    while prompt.len() < 1024 && generated.len() + 1 < input.max_tokens {
+        let Some(forced) = match_deterministic_token(&generated, &mask, vocab, &digit_tokens) else {
+            break;
+        };
+        if stream {
+            inferlet::session::send("t:1");
+        }
+        prompt.push(forced);
+        generated.push(forced);
+        constraint
+            .accept_tokens(&[forced])
+            .context("advance grammar")?;
+        if constraint.is_terminated() {
+            break;
+        }
+        mask = pack_mask(constraint.mask());
     }
 
-    let mut generated = vec![first];
-    constraint
-        .accept_tokens(&[first])
-        .context("advance grammar")?;
-
+    let pipeline = Pipeline::new();
     if !constraint.is_terminated() && generated.len() < input.max_tokens {
-        let token_in = Channel::from([first as i32]);
-        let grammar_mask = Channel::new([words], dtype::u32);
-        let pow2_d = Channel::from_iter((0..32u32).map(|b| 1u32 << b));
-        let embed_indptr = Channel::from([0u32, 1]);
-        let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
+        let n = prompt.len() as u32;
+        let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
+        let prefill_indptr = Channel::from([0u32, n]);
+        let prefill_mask = Channel::new([words], dtype::u32);
+        let pow2_p = Channel::from_iter((0..32u32).map(|b| 1u32 << b));
+        let first_out = Channel::new([1], dtype::i32);
 
-        let decode = ForwardPass::new();
-        decode.embed(&token_in, &embed_indptr)?;
-        decode.state(&[&ws], StateGeometry::folding())?;
-        decode.epilogue(move || {
-            let packed = grammar_mask.take();
+        let prefill = ForwardPass::new();
+        prefill.embed(&prompt_tokens, &prefill_indptr)?;
+        prefill.state(&[&ws], StateGeometry::folding())?;
+        prefill.epilogue(move || {
+            let packed = prefill_mask.take();
             let j = iota(vocab);
             let word = gather(&packed, &j / Tensor::constant(32u32));
-            let p2 = gather(pow2_d.read(), &j % Tensor::constant(32u32));
+            let p2 = gather(pow2_p.read(), &j % Tensor::constant(32u32));
             let bit = (&word / &p2) % Tensor::constant(2u32);
             let allowed = ne(&bit, Tensor::constant(0u32));
             let token = reshape(
                 masked_argmax(intrinsics::output(0, "logits"), &allowed),
                 [1],
             );
-
-            token_in.put(&token);
-            token_out.put(&token);
+            first_out.put(&token);
         });
 
-        // The grammar mask for fire k+1 is only known once fire k's token has
-        // advanced the matcher, so this loop is inherently depth-1. Running
-        // ahead would reuse a stale mask and silently drop the constraint.
-        let budget = input.max_tokens.saturating_sub(generated.len());
-        let mut submitted = 0usize;
+        prefill_mask.put(mask);
+        prefill.submit(&pipeline).context("JSON-schema prefill")?;
+        let first = first_out.take_host::<i32>().await? as u32;
+        if stream {
+            inferlet::session::send("t:1");
+        }
 
-        while submitted < budget {
-            grammar_mask.put(pack_mask(constraint.mask()));
-            decode.submit(&pipeline).context("JSON-schema decode")?;
-            submitted += 1;
-            let token = token_out.take_host::<i32>().await? as u32;
+        generated.push(first);
+        constraint
+            .accept_tokens(&[first])
+            .context("advance grammar")?;
+    }
+
+    if !constraint.is_terminated() && generated.len() < input.max_tokens {
+        let pow2_d = Channel::from_iter((0..32u32).map(|b| 1u32 << b));
+        let mut pass_1: Option<DecodePass> = None;
+
+        while !constraint.is_terminated() && generated.len() < input.max_tokens {
+            let last = *generated.last().unwrap() as i32;
+            let mut chunk = vec![last];
+            let mut mask = pack_mask(constraint.mask());
+
+            while chunk.len() < 16 && generated.len() < input.max_tokens {
+                let Some(forced) =
+                    match_deterministic_token(&generated, &mask, vocab, &digit_tokens)
+                else {
+                    break;
+                };
+                if stream {
+                    inferlet::session::send("t:1");
+                }
+                generated.push(forced);
+                constraint
+                    .accept_tokens(&[forced])
+                    .context("advance grammar")?;
+                if constraint.is_terminated() || generated.len() == input.max_tokens {
+                    break;
+                }
+                chunk.push(forced as i32);
+                mask = pack_mask(constraint.mask());
+            }
+
+            if constraint.is_terminated() || generated.len() == input.max_tokens {
+                break;
+            }
+
+            let len = chunk.len() as u32;
+            let token = if len == 1 {
+                if pass_1.is_none() {
+                    pass_1 = Some(DecodePass::new(1, vocab, words, &ws, &pow2_d)?);
+                }
+                let pass = pass_1.as_ref().unwrap();
+                pass.token_in.put(chunk);
+                pass.grammar_mask.put(mask);
+                pass.decode.submit(&pipeline).context("JSON-schema decode")?;
+                pass.token_out.take_host::<i32>().await? as u32
+            } else {
+                let pass = DecodePass::new(len, vocab, words, &ws, &pow2_d)?;
+                pass.token_in.put(chunk);
+                pass.grammar_mask.put(mask);
+                pass.decode.submit(&pipeline).context("JSON-schema decode")?;
+                pass.token_out.take_host::<i32>().await? as u32
+            };
             if stream {
                 inferlet::session::send("t:1");
             }
@@ -161,9 +328,6 @@ async fn main(input: Input) -> Result<String> {
             constraint
                 .accept_tokens(&[token])
                 .context("advance grammar")?;
-            if constraint.is_terminated() || generated.len() == input.max_tokens {
-                break;
-            }
         }
     }
     pipeline.close();
