@@ -508,8 +508,10 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_bf16_gemm(
     constexpr int kACopies = kBM * 8 / kThreads;
     constexpr int kBCopies = kBN * 8 / kThreads;
 
-    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
-    const int item = work[blockIdx.x];
+    const int cta = static_cast<int>(blockIdx.y * gridDim.x + blockIdx.x);
+    const int bx = cta / static_cast<int>(gridDim.y);
+    if (bx >= offsets[num_experts + 1]) return;
+    const int item = work[bx];
     const int expert = item >> 16;
     const int slice = item & 0xFFFF;
     const int begin = offsets[expert] + slice * kBM;
@@ -524,7 +526,7 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_bf16_gemm(
     const int g = lane >> 2;
     const int t = lane & 3;
     // The CTA's first output column: 64 GLU columns, else 128 rows.
-    const int c0 = static_cast<int>(blockIdx.y) * (kGlu != 0 ? 64 : kBN);
+    const int c0 = cta % static_cast<int>(gridDim.y) * (kGlu != 0 ? 64 : kBN);
     // Local B row -> bank row: a GLU warp's half-tile of gate columns, then
     // their up.
     auto bank_row = [&](int rr) {
