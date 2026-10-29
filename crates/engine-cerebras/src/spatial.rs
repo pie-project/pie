@@ -61,6 +61,7 @@
 pub mod ckpt;
 pub mod guest4;
 pub mod paged;
+pub mod plan;
 pub mod serve2d;
 pub mod wafer;
 
@@ -222,14 +223,20 @@ impl Model {
     /// Whether the model owns the KV cache as PIE's pages: a fire's lanes
     /// run with their page tables, no history replayed.
     fn paged(&self) -> bool {
-        matches!(self, Model::Daemon(d) if d.paged)
+        match self {
+            Model::Daemon(d) => d.paged,
+            Model::Wafer(w) => w.paged.is_some(),
+        }
     }
 
     /// One fire's lanes on the paged cache: each lane's tokens at positions
     /// `start..` through its pages; the logits `which` asks for, per lane.
-    fn fire_paged(&mut self, lanes: &[&PagedLane]) -> EngineResult<Vec<Vec<Vec<f32>>>> {
-        let Model::Daemon(d) = self else {
-            return Err(Error::Device("the wafer program owns no paged KV yet".into()));
+    /// Each lane's logits rows (as `which` asks) and, for an `argmax_only`
+    /// lane, its last row's argmax instead.
+    fn fire_paged(&mut self, lanes: &[&PagedLane]) -> EngineResult<Vec<PagedAnswer>> {
+        let d = match self {
+            Model::Wafer(w) => return fire_batched(w, lanes),
+            Model::Daemon(d) => d,
         };
         let request: Vec<serde_json::Value> = lanes
             .iter()
@@ -264,17 +271,46 @@ impl Model {
                 })
                 .unwrap_or_default()
         };
-        Ok(answer
+        let answers: Vec<Vec<Vec<f32>>> = answer
             .get("lanes")
             .and_then(serde_json::Value::as_array)
             .map(|lanes| lanes.iter().map(rows).collect())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        // The daemon answers logits only: an argmax-only lane's is taken here.
+        Ok(answers
+            .into_iter()
+            .zip(lanes)
+            .map(|(rows, lane)| {
+                if lane.argmax_only {
+                    let token = rows.last().map(|row| argmax(row));
+                    (Vec::new(), token)
+                } else {
+                    (rows, None)
+                }
+            })
+            .collect())
     }
 
     /// `copy_kv`'s token runs on the paged cache.
     fn copy_paged(&mut self, runs: &[engine::transfer::KvRun]) -> EngineResult<()> {
-        let Model::Daemon(d) = self else {
-            return Err(Error::Device("the wafer program owns no paged KV yet".into()));
+        let d = match self {
+            Model::Wafer(w) => {
+                let size = w.paged.map_or(0, |s| s.page_size) as u32;
+                let mut pairs = Vec::new();
+                for run in runs {
+                    if run.src_token != 0 || run.dst_token != 0 || run.tokens != size {
+                        return Err(Error::Unsupported {
+                            verb: "`copy_kv` of part of a page on the wafer (whole pages only)",
+                            engine: "cerebras-spatial",
+                        });
+                    }
+                    pairs.push((run.src_page, run.dst_page));
+                }
+                return w
+                    .copy_pages(pairs)
+                    .map_err(|e| Error::Device(format!("the wafer model: {e}")));
+            }
+            Model::Daemon(d) => d,
         };
         let runs: Vec<[u32; 5]> = runs
             .iter()
@@ -408,6 +444,118 @@ impl Model {
     }
 }
 
+/// A fire's paged lanes on the batched wafer build: each lane's rows as
+/// launches of consecutive slots and positions (a prefill chunk, at most a
+/// launch's iterations; a lane with a mask a row at a time; every row's
+/// logits a row at a time), the lanes' n-th pieces together, in launches of
+/// lanes of the same length: up to a launch's lanes (B, or MMAX
+/// micro-batches of B on a ring) when no logits come back, the head's few
+/// logit lanes when they do.
+fn fire_batched(w: &mut wafer::Wafer, lanes: &[&PagedLane]) -> EngineResult<Vec<PagedAnswer>> {
+    if w.paged.is_none() {
+        return Err(Error::Device("a batched fire on a one-sequence build".into()));
+    }
+    let cap = w.cap.saturating_sub(1).max(1);
+    // Each lane's pieces: (first row, rows, logits wanted).
+    let mut pieces: Vec<Vec<(usize, usize, bool)>> = Vec::with_capacity(lanes.len());
+    for lane in lanes {
+        let n = lane.tokens.len();
+        let consecutive = |v: &[u32]| v.windows(2).all(|p| p[1] == p[0] + 1);
+        let row_by_row = lane.visible.is_some()
+            || lane.which == wafer::Logits::All
+            || !consecutive(&lane.slots)
+            || !consecutive(&lane.positions);
+        let mut mine = Vec::new();
+        let mut at = 0;
+        while at < n {
+            let rows = if row_by_row { 1 } else { (n - at).min(cap) };
+            let last = at + rows == n;
+            let want = match lane.which {
+                _ if lane.argmax_only => false,
+                wafer::Logits::None => false,
+                wafer::Logits::Last => last,
+                wafer::Logits::All => true,
+            };
+            mine.push((at, rows, want));
+            at += rows;
+        }
+        pieces.push(mine);
+    }
+    let mut logits: Vec<Vec<Vec<f32>>> = vec![Vec::new(); lanes.len()];
+    let mut last_argmax: Vec<Option<u32>> = vec![None; lanes.len()];
+    let waves = pieces.iter().map(Vec::len).max().unwrap_or(0);
+    for wave in 0..waves {
+        // The lanes with an n-th piece, by (rows, logits wanted).
+        let mut groups: BTreeMap<(usize, bool), Vec<usize>> = BTreeMap::new();
+        for (li, mine) in pieces.iter().enumerate() {
+            if let Some(&(_, rows, want)) = mine.get(wave) {
+                groups.entry((rows, want)).or_default().push(li);
+            }
+        }
+        for ((rows, want), members) in groups {
+            // A launch's lanes (MMAX micro-batches of B on a ring); the head
+            // keeps logits rows for the first few only.
+            let most = if want { w.logit_lanes } else { w.launch_lanes };
+            for chunk in members.chunks(most.max(1)) {
+                let batch: Vec<crate::spatial::serve2d::BatchLane> = chunk
+                    .iter()
+                    .map(|&li| {
+                        let lane = lanes[li];
+                        let (first, _, _) = pieces[li][wave];
+                        crate::spatial::serve2d::BatchLane {
+                            pos: lane.positions[first],
+                            slot: lane.slots[first],
+                            pages: lane.pages.clone(),
+                            visible: lane.visible.as_ref().map(|rows| {
+                                rows[first]
+                                    .iter()
+                                    .flat_map(|&[a, b]| a..b)
+                                    .collect()
+                            }),
+                            forced: lane.tokens[first..first + rows].to_vec(),
+                        }
+                    })
+                    .collect();
+                let (argmax_out, rows_out) = w
+                    .fire_batch(batch, rows, want)
+                    .map_err(|e| Error::Device(format!("the wafer model: {e}")))?;
+                for (k, &li) in chunk.iter().enumerate() {
+                    if let Some(&token) = argmax_out.get(k).and_then(|t| t.get(rows - 1)) {
+                        last_argmax[li] = Some(token);
+                    }
+                }
+                if want {
+                    for (k, &li) in chunk.iter().enumerate() {
+                        if let Some(row) = rows_out.get(k) {
+                            logits[li].push(row.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(logits
+        .into_iter()
+        .zip(last_argmax)
+        .zip(lanes)
+        .map(|((rows, token), lane)| if lane.argmax_only { (Vec::new(), token) } else { (rows, None) })
+        .collect())
+}
+
+/// A paged lane's answer: its logits rows, or (argmax only) its last row's
+/// argmax.
+type PagedAnswer = (Vec<Vec<f32>>, Option<u32>);
+
+fn argmax(row: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, &x) in row.iter().enumerate() {
+        if x > row[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
 /// One lane of a fire on a paged model.
 struct PagedLane {
     tokens: Vec<u32>,
@@ -420,6 +568,10 @@ struct PagedLane {
     /// slot up to its own.
     visible: Option<Vec<Vec<[u32; 2]>>>,
     which: wafer::Logits,
+    /// The lane's one reader takes only its last row's argmax: none of its
+    /// logits come back (a launch carries more such lanes than lanes with
+    /// logits).
+    argmax_only: bool,
 }
 
 /// Per row of a lane's `rows` rows, the KV slots its mask admits, as runs: a
@@ -1303,6 +1455,7 @@ impl Spatial {
                             pages: lane.kv.pages.clone(),
                             visible: None,
                             which: wafer::Logits::None,
+                            argmax_only: false,
                         };
                         self.daemon()?.fire_paged(&[&refill])?;
                         self.kv.write_paged(lane.slot, &lane.kv.pages, &slots, &history);
@@ -1370,6 +1523,7 @@ impl Spatial {
                             pages: lane.kv.pages.clone(),
                             visible,
                             which,
+                            argmax_only: greedy && last_only,
                         },
                         rows.clone(),
                     ));
@@ -1389,9 +1543,19 @@ impl Spatial {
             let request: Vec<&PagedLane> = paged_lanes.iter().map(|(_, lane, _)| lane).collect();
             let answers = self.daemon()?.fire_paged(&request)?;
             self.paged_fires += 1;
-            for ((at, lane, rows), lane_logits) in paged_lanes.into_iter().zip(answers) {
+            for ((at, lane, rows), (lane_logits, token)) in paged_lanes.into_iter().zip(answers) {
                 self.kv
                     .write_paged(lanes[at].slot, &lane.pages, &lane.slots, &lane.tokens);
+                if lane.argmax_only {
+                    // Its row a one-hot of the argmax, as a token loop's.
+                    let mut row = vec![0f32; width as usize];
+                    if let Some(cell) = token.and_then(|t| row.get_mut(t as usize)) {
+                        *cell = 1.0;
+                    }
+                    logits[at] = vec![row];
+                    fast[at] = true;
+                    continue;
+                }
                 logits[at] = match lane.which {
                     wafer::Logits::None => Vec::new(),
                     wafer::Logits::Last => lane_logits,
@@ -1510,6 +1674,9 @@ impl Engine for Spatial {
         );
         let slots =
             poem_compiler::state_slots(budgets.slots, &trace, crate::api::DEFAULT_STATE_SLOTS);
+        // The model as the spatial kernels see it: refused here unless its
+        // structure is one they implement (spatial/plan.rs).
+        let spec = plan::ModelSpec::read(&trace).map_err(|e| Error::Load(e.to_string()))?;
         let shell = Shell::load_dry(
             Boot {
                 patches,
@@ -1545,6 +1712,17 @@ impl Engine for Spatial {
             ),
             (None, None) => None,
         };
+        // A compiled program must be the model's: dims, layers, vocabulary,
+        // and what the placement assumes (tied head, eps, q/k norms, theta).
+        if let Some(program) = &program {
+            let path = Path::new(program).join("out.json");
+            let json: serde_json::Value = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .ok_or_else(|| Error::Load(format!("{}: no readable out.json", path.display())))?;
+            spec.check_program(plan::out_json_params(&json))
+                .map_err(|e| Error::Load(e.to_string()))?;
+        }
         let mut paged_model = false;
         let model = if let Some(program) = &program {
             let platform = match &self.boot.cmaddr {
@@ -1556,7 +1734,8 @@ impl Engine for Spatial {
                 )),
             };
             let launch = wafer::Launch::named(self.spatial.launch.as_deref());
-            let w = wafer::Wafer::open(program.into(), ckpt.clone().into(), platform, launch)
+            let theta = Some(f64::from(spec.rope_theta));
+            let w = wafer::Wafer::open(program.into(), ckpt.clone().into(), platform, launch, theta)
                 .map_err(|e| Error::Load(format!("the spatial wafer model: {e}")))?;
             tracing::info!(program, ckpt, vocab = w.vocab, hidden = w.hidden, "spatial wafer model loaded");
             Model::Wafer(w)
@@ -1589,7 +1768,27 @@ impl Engine for Spatial {
         let trace_name = shell.trace().name.clone();
         let paging = shell.paging();
         self.kv.page_size = paging.page_size;
+        // A batched wafer build's pool is PIE's: the same page size, and at
+        // least the pages PIE hands out.
+        if let Some(Model::Wafer(w)) = &self.daemon
+            && let Some(shape) = w.paged
+        {
+            if paging.page_size as usize != shape.page_size || paging.pages() > shape.pages() as u64 {
+                return Err(Error::Load(format!(
+                    "the wafer program's KV pool is {} pages of {}; this load pages {} of {} \
+                     (set the page size and the KV budget to fit it)",
+                    shape.pages(),
+                    shape.page_size,
+                    paging.pages(),
+                    paging.page_size
+                )));
+            }
+        }
         let state_rows = shell.has_state();
+        let wafer_pool = match &self.daemon {
+            Some(Model::Wafer(w)) => w.paged,
+            _ => None,
+        };
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cerebras".to_string(),
@@ -1603,7 +1802,12 @@ impl Engine for Spatial {
                 codegen_backend: None,
             },
             pools: PoolFacts {
-                kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
+                // A batched wafer build reads at most E of a lane's pages on a
+                // row: pages below rows x E fill every row E times over, so no
+                // lane can name more.
+                kv_pages: u32::try_from(paging.pages())
+                    .unwrap_or(u32::MAX)
+                    .min(wafer_pool.map_or(u32::MAX, |s| (s.rows * s.entries) as u32)),
                 kv_page_size: paging.page_size,
                 state_slots: if state_rows { paging.slots } else { 0 },
                 buffer_pages: shell.buffer_pages(),
@@ -1616,7 +1820,9 @@ impl Engine for Spatial {
                 // after another, each cache brought back from its tokens.
                 max_lanes: budgets.max_lanes.max(1),
                 max_tokens: budgets.max_tokens,
-                max_page_refs: paging.pages_per_slot,
+                max_page_refs: paging
+                    .pages_per_slot
+                    .min(wafer_pool.map_or(u32::MAX, |s| s.max_page_refs() as u32)),
                 max_context: paging.context(),
                 prefill_rows: 0,
                 max_readouts: budgets.max_tokens,

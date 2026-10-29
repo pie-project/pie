@@ -81,6 +81,9 @@ pub struct Table {
     /// reads that the host writes and nobody seeds (an amateur's logits, a
     /// grammar mask).
     pub per_step: Vec<u32>,
+    /// The pool word holding the token after `run`: the home of the channel
+    /// bound to `Port::EmbedTokens` (the next pass embeds it).
+    pub tok_home: Option<u32>,
     pub nreg: u32,
     pub pool_words: u32,
     /// The guest4 op groups the table uses (pe.csl's F_* bits).
@@ -226,12 +229,23 @@ impl Tr<'_> {
         Ok(Loc { dtype: l.dtype, ..d })
     }
     /// A wide operand: a register, or a pool scalar flagged as broadcast.
-    fn wide_operand(&self, l: &Loc) -> Result<(u32, bool), String> {
+    /// A wide operand: a register, or a pool scalar flagged as broadcast. Wide
+    /// ops read pool scalars as f32: an integer or bool is cast first (its
+    /// bits would read as a denormal).
+    fn wide_operand(&mut self, l: &Loc) -> Result<(u32, bool), String> {
         match l.kind {
             Kind::Wide(r) => Ok((r, false)),
-            Kind::Pool(o) if l.n == 1 => Ok((o, true)),
+            Kind::Pool(_) if l.n == 1 => {
+                let f = self.pool_f32(*l)?;
+                Ok((self.at(&f), true))
+            }
             _ => Err(format!("a {}-word value against a vocabulary row", l.n)),
         }
+    }
+    /// A pool scalar's offset as f32 (for WFILL).
+    fn fill_src(&mut self, l: Loc) -> Result<u32, String> {
+        let f = self.pool_f32(l)?;
+        Ok(self.at(&f))
     }
     fn fl(t: u32, n: u32, ab: bool, bb: bool, cb: bool) -> u32 {
         t | (u32::from(ab) << 2) | (u32::from(bb) << 3) | (u32::from(cb) << 4) | (n << 8)
@@ -496,7 +510,10 @@ fn translate_with(
             }
             match (h.kind, l.kind) {
                 (Kind::Wide(hr), Kind::Wide(r)) => t.emit(WMOV, 0, hr, r, 0, 0),
-                (Kind::Wide(hr), Kind::Pool(o)) if l.n == 1 => t.emit(WFILL, 0, hr, o, 0, 0),
+                (Kind::Wide(hr), Kind::Pool(_)) if l.n == 1 => {
+                    let o = t.fill_src(l)?;
+                    t.emit(WFILL, 0, hr, o, 0, 0)
+                }
                 (Kind::Pool(ho), Kind::Pool(o)) => {
                     let ab = l.n == 1 && h.n > 1;
                     t.emit(QMOV, Tr::fl(0, h.n, ab, false, false), ho, o, 0, 0)
@@ -506,7 +523,14 @@ fn translate_with(
         }
     }
     t.emit(HALT, 0, 0, 0, 0, 0);
+    scalar_operands(&mut t.ins);
     let feat = t.ins.iter().fold(0, |f, i| f | feat_of(i[0]));
+    let tok_home = pkg
+        .ports
+        .iter()
+        .find(|p| !p.is_const && p.port == eta_ir::registry::Port::EmbedTokens)
+        .and_then(|p| homes.iter().find(|h| h.chan == p.channel && h.kind == "pool"))
+        .map(|h| h.at);
     let per_step = homes
         .iter()
         .filter(|h| {
@@ -522,11 +546,33 @@ fn translate_with(
         outputs,
         wide_outputs,
         per_step,
+        tok_home,
         nreg: t.nreg_used,
         pool_words: t.pool_top,
         feat,
         remat,
     })
+}
+
+/// A WBIN right after the WFILL of one of its operands takes the filled pool
+/// scalar instead (the VM's register-by-scalar paths are vector ops, the
+/// divide included); the fill stays for later readers.
+fn scalar_operands(ins: &mut [[u32; 6]]) {
+    for i in 1..ins.len() {
+        let [fop, _, r, p, _, _] = ins[i - 1];
+        let [op, fl, _, a, b, c] = ins[i];
+        if fop != WFILL || op != WBIN || fl & 12 != 0 || c > 3 || (a == r && b == r) {
+            continue;
+        }
+        if b == r {
+            ins[i][1] = fl | 8;
+            ins[i][4] = p;
+        } else if a == r && (c == 0 || c == 2) {
+            ins[i][1] = fl | 8;
+            ins[i][3] = b;
+            ins[i][4] = p;
+        }
+    }
 }
 
 /// pe.csl's op groups: F_RNG 1, F_RED 2, F_GS 4, F_LIST 8, F_RANK 16,
@@ -680,10 +726,11 @@ fn multi(t: &mut Tr, op: &LaunchOp, args: &[Loc], rows: u32) -> Result<Vec<Loc>,
                     out.push(t.row(&a, r));
                     continue;
                 }
-                let off = t.at(&a) + if a.n == rows { r as u32 } else { 0 };
                 if a.n != 1 && a.n != rows {
                     return Err(format!("broadcast of {} values to {rows} rows", a.n));
                 }
+                let af = t.pool_f32(a)?;
+                let off = t.at(&af) + if a.n == rows { r as u32 } else { 0 };
                 let d = t.wide(rdt)?;
                 let dd = t.at(&d);
                 t.emit(WFILL, 0, dd, off, 0, 0);
@@ -879,6 +926,7 @@ fn single(t: &mut Tr, op: &LaunchOp, args: Vec<Loc>, rdt: Dtype, rn: u32) -> Res
         }
         let at = t.at(&a);
         if wide_result {
+            let at = t.fill_src(a)?;
             let d = t.wide(rdt)?;
             let dd = t.at(&d);
             t.emit(WFILL, 0, dd, at, 0, 0);
@@ -979,8 +1027,9 @@ fn single(t: &mut Tr, op: &LaunchOp, args: Vec<Loc>, rdt: Dtype, rn: u32) -> Res
                 let cw = if Tr::is_wide(&c) {
                     t.at(&c)
                 } else {
+                    let cc = t.fill_src(c)?;
                     let w = t.wide(Dtype::Bool)?;
-                    let (ww, cc) = (t.at(&w), t.at(&c));
+                    let ww = t.at(&w);
                     t.emit(WFILL, 0, ww, cc, 0, 0);
                     ww
                 };
@@ -1203,6 +1252,7 @@ pub fn json_of(t: &Table) -> Json {
         "nreg": t.nreg,
         "pool_words": t.pool_words,
         "feat": t.feat,
+        "tok_home": t.tok_home,
         "remat": t.remat,
         "homes": t.homes.iter().map(|h| json!({"chan": h.chan, "kind": h.kind, "at": h.at, "n": h.n, "dtype": format!("{:?}", h.dtype)})).collect::<Vec<_>>(),
         "outputs": t.outputs.iter().map(|(c, s, n, d)| json!({"chan": c, "slot": s, "n": n, "dtype": format!("{d:?}")})).collect::<Vec<_>>(),

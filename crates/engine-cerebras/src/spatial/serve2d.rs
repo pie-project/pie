@@ -42,6 +42,17 @@ pub struct Layout2d {
     pub vmc: usize,
     pub vocab: usize,
     pub cap: usize,
+    /// `GRID` 1: the batched, paged build (Fork 8's qwen2d_paged grids):
+    /// `B` lanes a launch over a pool of `NB` blocks a row of `PS`-slot
+    /// pages, at most `E` of a lane's pages a row. `None`: one sequence.
+    pub paged: Option<super::paged::Shape>,
+    /// `serve2d_pipe`: up to `MMAX` micro-batches of B lanes go round the
+    /// ring of grids and the head a launch (`mtab` at the head's feeders,
+    /// no `tab`). `None`: one batch a launch.
+    pub mmax: Option<usize>,
+    /// `KVCP` 0: the build has no page-copy kernels; the host copies pages
+    /// by reading, patching and writing back each row's `kc`/`vc`.
+    pub host_copy: bool,
 }
 
 fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
@@ -85,7 +96,29 @@ impl Layout2d {
                 vmc: p("VMC")?,
                 vocab: p("vocab")?,
                 cap: p("CAP")?,
+                paged: None,
+                mmax: None,
+                host_copy: get("KVCP").unwrap_or(1) == 0,
             };
+            let mut lay = lay;
+            if get("GRID").unwrap_or(0) == 1 {
+                if lay.px != lay.py || lay.qh != 2 || lay.hidden != lay.py * lay.hc {
+                    return Err(format!(
+                        "a batched serve2d build wants square grids, Qh 2 and no hidden \
+                         padding: {lay:?}"
+                    ));
+                }
+                lay.paged = Some(super::paged::Shape {
+                    lanes: p("B")?,
+                    rows: lay.py,
+                    page_size: p("PS")?,
+                    blocks: p("NB")?,
+                    entries: p("E")?,
+                });
+                lay.mmax = get("MMAX").filter(|&m| m > 0);
+            } else if get("MMAX").is_some() || lay.host_copy {
+                return Err("MMAX and KVCP 0 are batched (GRID 1) builds' params".into());
+            }
             if lay.py * lay.hc < lay.hidden || lay.gs == 0 || lay.gx == 0 || lay.vmc > 1 {
                 return Err(format!("serve2d params do not make a layout: {lay:?}"));
             }
@@ -104,7 +137,22 @@ impl Layout2d {
     }
 
     pub fn positions(&self) -> usize {
-        self.py * self.tc
+        match &self.paged {
+            // A lane's slots: E pages on every row.
+            Some(shape) => shape.max_page_refs() * shape.page_size,
+            None => self.py * self.tc,
+        }
+    }
+
+    /// Lanes one launch carries: B, or MMAX micro-batches of B.
+    pub fn launch_lanes(&self) -> usize {
+        self.paged.map_or(1, |s| s.lanes * self.mmax.unwrap_or(1))
+    }
+
+    /// Lanes whose last logits rows the head keeps (`HLB`: the first
+    /// micro-batch's first four).
+    pub fn logit_lanes(&self) -> usize {
+        self.paged.map_or(1, |s| s.lanes.min(4))
     }
 
     /// The feeder row.
@@ -192,6 +240,12 @@ pub fn place(lay: &Layout2d, ckpt: &Ckpt, rope_theta: f64, sink: &mut dyn Sink) 
         if col < cols { t.data[r * cols + col] } else { 0.0 }
     };
     let pes = py_n * px_n;
+    if lay.paged.is_some() {
+        for l in 0..lay.layers() {
+            place_paged_layer(lay, ckpt, &inv_freq, l, sink)?;
+        }
+        return head(lay, ckpt, sink);
+    }
     for l in 0..lay.layers() {
         let p = format!("model.layers.{l}.");
         let wq = get(&format!("{p}self_attn.q_proj.weight"), &[qdim, hid])?;
@@ -299,6 +353,140 @@ pub fn place(lay: &Layout2d, ckpt: &Ckpt, rope_theta: f64, sink: &mut dyn Sink) 
         tracing::info!(layer = l, "spatial wafer: serve2d layer placed");
     }
     head(lay, ckpt, sink)
+}
+
+/// One layer grid of the batched build, as `serve_lib2d._layer_paged` (=
+/// `qwen2d_paged/run.py`) lays it out: per column its kv head's dims `dl`,
+/// the two query heads and k split in halves (`wqa`: dims [0, Dc/2), `wqv`:
+/// the rest), v, the q/k norm weights (q's carrying 1/sqrt(head_dim)), the
+/// RoPE tables cos/sin(p·f) for p = 256a, 16b, c, o, the MLP, the empty pool.
+#[allow(clippy::too_many_lines)]
+fn place_paged_layer(
+    lay: &Layout2d,
+    ckpt: &Ckpt,
+    inv_freq: &[f32],
+    l: usize,
+    sink: &mut dyn Sink,
+) -> R<()> {
+    let shape = lay.paged.expect("a batched build");
+    let (p_n, hc, dc, gs, ic) = (lay.py, lay.hc, lay.dc, lay.gs, lay.ic);
+    let d = lay.head_dim();
+    let dh = dc / 2;
+    let nkv = p_n / gs;
+    let hid = lay.hidden;
+    let qdim = nkv * 2 * d;
+    let inter = p_n * ic;
+    let pes = p_n * p_n;
+    let p = format!("model.layers.{l}.");
+    let get = |name: &str, shape: &[usize]| -> R<Tensor> {
+        let t = ckpt.get(name)?;
+        expect(&t, name, shape)?;
+        Ok(t)
+    };
+    let wq = get(&format!("{p}self_attn.q_proj.weight"), &[qdim, hid])?;
+    let wk = get(&format!("{p}self_attn.k_proj.weight"), &[nkv * d, hid])?;
+    let wv = get(&format!("{p}self_attn.v_proj.weight"), &[nkv * d, hid])?;
+    let wo = get(&format!("{p}self_attn.o_proj.weight"), &[hid, qdim])?;
+    let wg = get(&format!("{p}mlp.gate_proj.weight"), &[inter, hid])?;
+    let wu = get(&format!("{p}mlp.up_proj.weight"), &[inter, hid])?;
+    let wd = get(&format!("{p}mlp.down_proj.weight"), &[hid, inter])?;
+    let qn = get(&format!("{p}self_attn.q_norm.weight"), &[d])?;
+    let kn = get(&format!("{p}self_attn.k_norm.weight"), &[d])?;
+    let sqrt_d = (d as f64).sqrt() as f32;
+    let mut wqa = vec![0f32; pes * hc * 3 * dh];
+    let mut wqv = vec![0f32; pes * hc * 3 * dh];
+    let mut wvb = vec![0f32; pes * hc * dc];
+    let mut qkn = vec![0f32; pes * 2 * 3 * dh];
+    let mut rot_c = vec![0f32; pes * 3 * 16 * dh];
+    let mut rot_s = vec![0f32; pes * 3 * 16 * dh];
+    let mut wob = vec![0f32; pes * 2 * dc * hc];
+    let mut wgu = vec![0f32; pes * hc * 2 * ic];
+    let mut wdb = vec![0f32; pes * ic * hc];
+    for px in 0..p_n {
+        let (g, j) = (px / gs, px % gs);
+        let lo: Vec<usize> = (j * dc / 2..(j + 1) * dc / 2).collect();
+        let dl: Vec<usize> = lo.iter().copied().chain(lo.iter().map(|&i| d / 2 + i)).collect();
+        let qa: Vec<usize> = dl.iter().map(|&dd| 2 * g * d + dd).collect();
+        let qb: Vec<usize> = dl.iter().map(|&dd| (2 * g + 1) * d + dd).collect();
+        let kvr: Vec<usize> = dl.iter().map(|&dd| g * d + dd).collect();
+        // The three heads' rows (q a, q b, k) and their norm weights.
+        let heads: [(&Tensor, &[usize]); 3] = [(&wq, &qa), (&wq, &qb), (&wk, &kvr)];
+        let norm = |h: usize, i: usize| -> f32 {
+            if h < 2 { qn.data[dl[i]] / sqrt_d } else { kn.data[dl[i]] }
+        };
+        for py in 0..p_n {
+            let pe = py * p_n + px;
+            for c in 0..hc {
+                let col = py * hc + c;
+                for (h, (t, rows)) in heads.iter().enumerate() {
+                    for k in 0..dh {
+                        // wqa/wqv: [Hc][3][DH], the first and second halves of dl.
+                        wqa[((pe * hc + c) * 3 + h) * dh + k] = t.data[rows[k] * hid + col];
+                        wqv[((pe * hc + c) * 3 + h) * dh + k] = t.data[rows[dh + k] * hid + col];
+                    }
+                }
+                for (k, &r) in kvr.iter().enumerate() {
+                    wvb[(pe * hc + c) * dc + k] = wv.data[r * hid + col];
+                }
+                for i in 0..ic {
+                    let row = px * ic + i;
+                    wgu[(pe * hc + c) * 2 * ic + i] = wg.data[row * hid + col];
+                    wgu[(pe * hc + c) * 2 * ic + ic + i] = wu.data[row * hid + col];
+                    wdb[(pe * ic + i) * hc + c] = wd.data[col * inter + row];
+                }
+                for (q, &r) in qa.iter().chain(&qb).enumerate() {
+                    wob[(pe * 2 * dc + q) * hc + c] = wo.data[col * qdim + r];
+                }
+            }
+            for h in 0..3 {
+                for k in 0..dh {
+                    qkn[((pe * 2) * 3 + h) * dh + k] = norm(h, k);
+                    qkn[((pe * 2 + 1) * 3 + h) * dh + k] = norm(h, dh + k);
+                }
+            }
+            for (lv, unit) in [256.0f64, 16.0, 1.0].into_iter().enumerate() {
+                for a in 0..16 {
+                    for (k, &f) in lo.iter().enumerate() {
+                        let ang = a as f64 * unit * f64::from(inv_freq[f]);
+                        rot_c[((pe * 3 + lv) * 16 + a) * dh + k] = ang.cos() as f32;
+                        rot_s[((pe * 3 + lv) * 16 + a) * dh + k] = ang.sin() as f32;
+                    }
+                }
+            }
+        }
+    }
+    let origin = lay.origin(l);
+    for (sym, arr, pad) in [
+        ("wqa", &wqa, true),
+        ("wqv", &wqv, true),
+        ("wv", &wvb, true),
+        ("qkn_w", &qkn, false),
+        ("rot_c", &rot_c, false),
+        ("rot_s", &rot_s, false),
+        ("wo", &wob, true),
+        ("wgu", &wgu, true),
+        ("wd", &wdb, true),
+    ] {
+        put(sink, sym, arr, origin, p_n, p_n, pad)?;
+    }
+    let pool = vec![0f32; pes * (shape.blocks * dc * shape.page_size + 1)];
+    put(sink, "kc", &pool, origin, p_n, p_n, false)?;
+    put(sink, "vc", &pool, origin, p_n, p_n, false)?;
+    for (sym, name) in [
+        ("gamma1", "input_layernorm.weight"),
+        ("gamma2", "post_attention_layernorm.weight"),
+    ] {
+        let v = get(&format!("{p}{name}"), &[hid])?;
+        let col: Vec<f32> = (0..pes)
+            .flat_map(|pe| {
+                let py = pe / p_n;
+                v.data[py * hc..(py + 1) * hc].iter().copied()
+            })
+            .collect();
+        put(sink, sym, &col, origin, p_n, p_n, false)?;
+    }
+    tracing::info!(layer = l, "spatial wafer: batched serve2d layer placed");
+    Ok(())
 }
 
 /// head2d's f32 tiles (one block): region PE (c, ry) holds dims c*Hc.. of
@@ -433,4 +621,216 @@ pub fn run(
         None
     };
     Ok((out[..steps].to_vec(), y))
+}
+
+/// One lane of a batched launch: its first pass's RoPE position and KV
+/// write slot, its pages (covering every slot the launch writes or it
+/// sees), the slots its first pass attends (`None`: every slot up to its
+/// write slot), and the tokens forced at passes 0, 1, ... (at least one; a
+/// later pass takes the lane's own argmax).
+#[derive(Debug, Clone)]
+pub struct BatchLane {
+    pub pos: u32,
+    pub slot: u32,
+    pub pages: Vec<u32>,
+    pub visible: Option<Vec<u32>>,
+    pub forced: Vec<u32>,
+}
+
+/// One launch of `steps` passes over `lanes` (at most
+/// [`Layout2d::launch_lanes`]; on a pipelined build each B of them is a
+/// micro-batch, and a short batch repeats its first lane, the repeats'
+/// answers dropped): every lane's argmax after each pass, and with
+/// `want_logits` the last pass's logits rows (`hlogits` x `yscale`) of the
+/// first [`Layout2d::logit_lanes`] lanes (the head keeps no more).
+pub fn fire(
+    lay: &Layout2d,
+    rt: &mut Runtime,
+    lanes: &[BatchLane],
+    steps: usize,
+    want_logits: bool,
+) -> R<(Vec<Vec<u32>>, Vec<Vec<f32>>)> {
+    let shape = lay.paged.ok_or("a batched launch on a one-sequence build")?;
+    let b_n = shape.lanes;
+    let most = lay.launch_lanes();
+    if lanes.is_empty() || lanes.len() > most || steps == 0 || steps + 1 > lay.cap {
+        return Err(format!(
+            "{} lane(s) of {steps} pass(es) for a build of {most} lanes and {} iterations",
+            lanes.len(),
+            lay.cap
+        ));
+    }
+    if let Some(lane) = lanes.iter().find(|l| l.forced.is_empty() || l.forced.len() > lay.cap) {
+        return Err(format!("a lane forces {} token(s)", lane.forced.len()));
+    }
+    let table_of = |batch: &[BatchLane]| -> R<Vec<u32>> {
+        let table_lanes: Vec<super::paged::Lane> = batch
+            .iter()
+            .map(|l| super::paged::Lane {
+                pos: l.pos,
+                slot: l.slot,
+                pages: l.pages.clone(),
+                visible: l.visible.clone(),
+            })
+            .collect();
+        super::paged::table(&shape, &table_lanes, steps as u32)
+    };
+    let e = |e: crate::sdk::Error| e.to_string();
+    // Micro-batches (one on a build without a ring).
+    let mbs: Vec<&[BatchLane]> = lanes.chunks(b_n).collect();
+    let slots = lay.mmax.unwrap_or(1);
+    match lay.mmax {
+        None => {
+            let tab = table_of(lanes)?;
+            // Every fabric row of the grids: its grid row's table row.
+            let all: Vec<u32> = (0..lay.gh).flat_map(|_| tab.iter().copied()).collect();
+            let grids = rect(0, 0, lay.gw * lay.px, lay.gh * lay.py);
+            rt.memcpy_h2d_rowbcast("tab", &all, grids, shape.row_words(), DataType::Bits32)
+                .map_err(e)?;
+        }
+        Some(_) => {
+            let mtab = pipe_tables(lay, &mbs.iter().map(|mb| table_of(mb)).collect::<R<Vec<_>>>()?);
+            let n = slots * shape.row_words();
+            let feeders = rect(lay.head_x(), lay.feeder(), lay.py + lay.vmc, 1);
+            rt.memcpy_h2d("mtab", &mtab, feeders, n, Order::RowMajor, DataType::Bits32)
+                .map_err(e)?;
+        }
+    }
+    let mut inn = vec![SAMPLE; slots * b_n * lay.cap];
+    for (m, mb) in mbs.iter().enumerate() {
+        for b in 0..b_n {
+            let lane = mb.get(b).unwrap_or(&mb[0]);
+            let at = (m * b_n + b) * lay.cap;
+            inn[at..at + lane.forced.len()].copy_from_slice(&lane.forced);
+        }
+    }
+    let (rx, ry) = lay.root();
+    let one = rect(rx, ry, 1, 1);
+    let words = inn.len();
+    rt.memcpy_h2d_nonblock("in_tokens", inn, one, words, Order::RowMajor, DataType::Bits32)
+        .map_err(e)?;
+    // The batched build ignores the second argument; the ring bootstraps
+    // that many micro-batches.
+    let second = if lay.mmax.is_some() { mbs.len() as u32 } else { 0 };
+    rt.launch_nonblock("compute", &[steps as u32, second]).map_err(e)?;
+    let mut out = vec![0u32; words];
+    let read = rt.memcpy_d2h("out_tokens", &mut out, one, words, Order::RowMajor, DataType::Bits32);
+    rt.wait_pending();
+    read.map_err(e)?;
+    // Lane i is micro-batch i / B's lane i % B: [i][CAP] either way.
+    let tokens: Vec<Vec<u32>> = (0..lanes.len())
+        .map(|i| out[i * lay.cap..i * lay.cap + steps].to_vec())
+        .collect();
+    let logits = if want_logits {
+        logits_rows(lay, rt, lanes.len())?
+    } else {
+        Vec::new()
+    };
+    Ok((tokens, logits))
+}
+
+/// The ring's `mtab` over the head's feeder row: feeder of chunk j (column
+/// j, the VM column after the root zero) holds per micro-batch slot m
+/// row j of micro-batch m's table (`tables[m]`, unused slots zero).
+fn pipe_tables(lay: &Layout2d, tables: &[Vec<u32>]) -> Vec<u32> {
+    let w = lay.paged.map_or(0, |s| s.row_words());
+    let slots = lay.mmax.unwrap_or(1);
+    let mut mtab = Vec::with_capacity((lay.py + lay.vmc) * slots * w);
+    for c in 0..lay.py {
+        for m in 0..slots {
+            match tables.get(m) {
+                Some(t) => mtab.extend_from_slice(&t[c * w..(c + 1) * w]),
+                None => mtab.extend(std::iter::repeat_n(0, w)),
+            }
+        }
+        if c == lay.r2x() && lay.vmc > 0 {
+            mtab.extend(std::iter::repeat_n(0, slots * w));
+        }
+    }
+    mtab
+}
+
+/// The last pass's logits rows of lanes `0..lanes` (at most HLB): the root
+/// column's `hlogits` (region row r, lane b at words `(r * HLB + b) * Vr`,
+/// rows in vocab order) x `yscale[b]`.
+fn logits_rows(lay: &Layout2d, rt: &mut Runtime, lanes: usize) -> R<Vec<Vec<f32>>> {
+    let e = |e: crate::sdk::Error| e.to_string();
+    let (rx, _) = lay.root();
+    let (f, hh, vr, hlb) = (lay.feeder(), lay.hh, lay.vr, lay.logit_lanes());
+    let mut a = vec![0u32; f * hlb * vr];
+    rt.memcpy_d2h("hlogits", &mut a, rect(rx, 0, 1, f), hlb * vr, Order::RowMajor, DataType::Bits32)
+        .map_err(e)?;
+    let mut c = vec![0u32; (hh - f) * hlb * vr];
+    rt.memcpy_d2h("hlogits", &mut c, rect(rx, f + 1, 1, hh - f), hlb * vr, Order::RowMajor, DataType::Bits32)
+        .map_err(e)?;
+    let mut scale = vec![0u32; hlb];
+    rt.memcpy_d2h("yscale", &mut scale, rect(rx, 0, 1, 1), hlb, Order::RowMajor, DataType::Bits32)
+        .map_err(e)?;
+    let rows: Vec<u32> = a.into_iter().chain(c).collect();
+    Ok((0..lanes.min(hlb))
+        .map(|b| {
+            let ys = f32::from_bits(scale[b]);
+            (0..hh)
+                .flat_map(|r| rows[(r * hlb + b) * vr..(r * hlb + b + 1) * vr].iter())
+                .take(lay.vocab)
+                .map(|&w| f32::from_bits(w) * ys)
+                .collect()
+        })
+        .collect())
+}
+
+/// `copy_kv`'s whole pages on every layer's pool: two launches a pair, or
+/// on a `KVCP` 0 build the host's read-patch-write of each grid's rows.
+pub fn copy_pages(lay: &Layout2d, rt: &mut Runtime, pairs: &[(u32, u32)]) -> R<()> {
+    let Some(shape) = lay.paged else {
+        return Err("page copies on a one-sequence build".into());
+    };
+    if !lay.host_copy {
+        return super::paged::copy_pages(rt, &super::paged::Symbols::default(), pairs);
+    }
+    let pool = super::paged::HostPool {
+        grids: (0..lay.layers()).map(|l| lay.origin(l)).collect(),
+        cols: lay.px,
+        shape,
+        cells: lay.dc * shape.page_size,
+        data_type: DataType::Bits32,
+    };
+    super::paged::copy_pages_host(rt, &pool, pairs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fork 5's simulator pipe build (`hb2`): 8 feeders, the VM column
+    /// after the root (column 6), MMAX 3 slots of B 2 lanes.
+    fn pipe() -> Layout2d {
+        let params = [
+            ("PX", 8), ("PY", 8), ("Hc", 16), ("HR", 128), ("Dc", 8), ("Gs", 4), ("Qh", 2),
+            ("Ic", 24), ("Tc", 1), ("W16", 0), ("KV16", 0), ("WF32", 1), ("GRID", 1),
+            ("HEADMODE", 2), ("B", 2), ("PS", 4), ("NB", 4), ("E", 2), ("MMAX", 3), ("GW", 2),
+            ("GH", 4), ("HH", 32), ("Vr", 32), ("Gx", 4), ("VMC", 1), ("vocab", 1024), ("CAP", 4),
+        ];
+        Layout2d::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1))
+            .expect("serve2d params")
+            .expect("a layout")
+    }
+
+    #[test]
+    fn ring_lanes_and_feeder_tables() {
+        let lay = pipe();
+        assert_eq!((lay.launch_lanes(), lay.logit_lanes(), lay.r2x()), (6, 2, 6));
+        let w = lay.paged.unwrap().row_words();
+        // Micro-batch m's table: word i of row r is 1000 m + 100 r + i.
+        let tables: Vec<Vec<u32>> = (0..2)
+            .map(|m| (0..8 * w).map(|k| (1000 * m + 100 * (k / w) + k % w) as u32).collect())
+            .collect();
+        let mtab = pipe_tables(&lay, &tables);
+        let pe = 3 * w;
+        assert_eq!(mtab.len(), 9 * pe);
+        let at = |col: usize, m: usize, i: usize| mtab[col * pe + m * w + i];
+        assert_eq!((at(0, 0, 0), at(0, 1, 5), at(0, 2, 5)), (0, 1005, 0));
+        assert_eq!((at(6, 1, 1), at(7, 0, 3), at(7, 1, 0)), (1601, 0, 0));
+        assert_eq!((at(8, 0, 2), at(8, 1, 2)), (702, 1702));
+    }
 }

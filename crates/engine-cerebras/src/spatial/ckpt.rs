@@ -72,6 +72,12 @@ fn read_at(file: &mut File, offset: u64, len: usize) -> R<Vec<u8>> {
     Ok(buf)
 }
 
+/// A tied head: as declared, else an `lm_head.weight` (if any) the same as
+/// the embedding.
+fn tied(flag: Option<bool>, lm_head_same: Option<bool>) -> bool {
+    flag.unwrap_or(lm_head_same != Some(false))
+}
+
 impl Ckpt {
     pub fn open(dir: &Path) -> R<Ckpt> {
         let config_path = dir.join("config.json");
@@ -98,6 +104,21 @@ impl Ckpt {
 
     pub fn config(&self) -> &serde_json::Value {
         &self.config
+    }
+
+    /// Whether the logits read the embedding (a tied LM head), which is all
+    /// the wafer programs compute: `tie_word_embeddings` says (true ties
+    /// whatever `lm_head.weight` holds, as Hugging Face loads it); without
+    /// it, an `lm_head.weight` that differs from `embed_tokens` is untied.
+    pub fn tied_head(&self) -> R<bool> {
+        let flag = self.config["tie_word_embeddings"].as_bool();
+        let same = if self.entries.contains_key("lm_head.weight") && flag.is_none() {
+            let (head, emb) = (self.get("lm_head.weight")?, self.get("model.embed_tokens.weight")?);
+            Some(head.shape == emb.shape && head.data == emb.data)
+        } else {
+            None
+        };
+        Ok(tied(flag, same))
     }
 
     pub fn get(&self, name: &str) -> R<Tensor> {
@@ -306,4 +327,16 @@ fn npy_header(b: &[u8]) -> R<(Dtype, Vec<usize>, u64)> {
         .map(|s| s.parse::<usize>().map_err(|e| e.to_string()))
         .collect::<R<Vec<_>>>()?;
     Ok((dtype, shape, (start + len) as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn untied_heads_are_seen() {
+        assert!(super::tied(None, None));
+        assert!(super::tied(Some(true), None));
+        assert!(super::tied(None, Some(true)));
+        assert!(!super::tied(Some(false), None));
+        assert!(!super::tied(None, Some(false)));
+    }
 }

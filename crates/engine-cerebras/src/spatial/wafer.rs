@@ -86,15 +86,15 @@ impl Layout {
         let p = |k: &str| -> R<usize> { get(k).ok_or_else(|| format!("no param {k}")) };
         let (pw, ph, hm) = (p("kernel_cols")?, p("attn_rows")?, p("mlp_rows")?);
         let (layers, lps) = (p("layers")?, p("lps")?);
-        let ns = layers / lps;
-        let body = lps * (ph + hm);
         let hh = p("head_rows")?;
-        if lps == 0 || layers % lps != 0 || hh == 0 || hh > body {
+        if lps == 0 || layers % lps != 0 || hh == 0 || hh > lps * (ph + hm) {
             return Err(format!(
                 "{layers} layers at {lps} a strip with a head of {hh} rows do not make a \
-                 serve28 layout ({body} rows a strip)"
+                 serve28 layout ({} rows a strip)",
+                lps * (ph + hm)
             ));
         }
+        let (ns, body) = (layers / lps, lps * (ph + hm));
         Ok(Layout {
             pw,
             ph,
@@ -523,6 +523,8 @@ pub struct WaferModel {
     /// Launches and layer steps run so far (the warm-up's included).
     launches: u64,
     steps: u64,
+    /// Batched launches' lane-passes (tokens through the model).
+    lane_steps: u64,
 }
 
 /// How a request reaches the program.
@@ -566,15 +568,42 @@ fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
 }
 
 impl WaferModel {
+    /// [`WaferModel::open_with`], RoPE's theta from the checkpoint's config.
     pub fn open(
         program: &Path,
         ckpt_dir: &Path,
         platform: Platform,
         launch: Option<Launch>,
     ) -> R<WaferModel> {
+        WaferModel::open_with(program, ckpt_dir, platform, launch, None)
+    }
+
+    /// Loads `program` and places `ckpt_dir`'s weights; RoPE's theta is
+    /// `rope_theta` (the model's, from its trace), else the checkpoint
+    /// config's (else 1e6).
+    pub fn open_with(
+        program: &Path,
+        ckpt_dir: &Path,
+        platform: Platform,
+        launch: Option<Launch>,
+        rope_theta: Option<f64>,
+    ) -> R<WaferModel> {
         let design = Design::read(program)?;
         let ckpt = Ckpt::open(ckpt_dir)?;
-        let rope_theta = ckpt.config()["rope_theta"].as_f64().unwrap_or(1.0e6);
+        if !ckpt.tied_head()? {
+            return Err(format!(
+                "{}: an untied LM head (lm_head.weight apart from embed_tokens); the wafer \
+                 programs compute the logits from the embedding and cannot place lm_head yet",
+                ckpt_dir.display()
+            ));
+        }
+        let config_theta = ckpt.config()["rope_theta"].as_f64();
+        if let (Some(theta), Some(config)) = (rope_theta, config_theta)
+            && (theta - config).abs() > 1e-6 * config.abs()
+        {
+            tracing::warn!(theta, config, "spatial wafer: the checkpoint config's rope_theta differs from the model's");
+        }
+        let rope_theta = rope_theta.or(config_theta).unwrap_or(1.0e6);
         let sdk = Sdk::open().map_err(|e| e.to_string())?;
         let started = Instant::now();
         let mut rt = Runtime::new(sdk, program, platform, "WARNING").map_err(|e| e.to_string())?;
@@ -605,12 +634,30 @@ impl WaferModel {
             design,
             launch,
             launches: 0,
+            lane_steps: 0,
             steps: 0,
         };
         // One request (position 0; later requests overwrite its KV) so the
         // first real one does not pay first-launch costs.
         let started = Instant::now();
-        model.run(&[0], 1, 0, false)?;
+        let paged = match &model.design {
+            Design::Grid(g) => g.paged,
+            Design::Strips(_) => None,
+        };
+        if paged.is_some() {
+            // Every lane one step at slot 0 of pool page 0 (later fires write
+            // over it), as serve_lib2d's warm-up.
+            let warm = super::serve2d::BatchLane {
+                pos: 0,
+                slot: 0,
+                pages: vec![0],
+                visible: None,
+                forced: vec![0],
+            };
+            model.fire_batch(&[warm], 1, false)?;
+        } else {
+            model.run(&[0], 1, 0, false)?;
+        }
         tracing::info!(
             ?launch,
             s = started.elapsed().as_secs_f32(),
@@ -621,6 +668,39 @@ impl WaferModel {
 
     pub fn design(&self) -> &Design {
         &self.design
+    }
+
+    /// A batched build's launch ([`super::serve2d::fire`]).
+    pub fn fire_batch(
+        &mut self,
+        lanes: &[super::serve2d::BatchLane],
+        steps: usize,
+        want_logits: bool,
+    ) -> R<(Vec<Vec<u32>>, Vec<Vec<f32>>)> {
+        let Design::Grid(grid) = &self.design else {
+            return Err("a batched launch on a strip program".into());
+        };
+        self.launches += 1;
+        self.steps += steps as u64;
+        self.lane_steps += (lanes.len() * steps) as u64;
+        if self.launches % 256 == 0 {
+            tracing::info!(
+                launches = self.launches,
+                steps = self.steps,
+                lane_steps = self.lane_steps,
+                lanes = lanes.len(),
+                "spatial wafer: batch totals"
+            );
+        }
+        super::serve2d::fire(grid, &mut self.rt, lanes, steps, want_logits)
+    }
+
+    /// A batched build's whole-page copies (every layer's pool).
+    pub fn copy_pages(&mut self, pairs: &[(u32, u32)]) -> R<()> {
+        let Design::Grid(grid) = &self.design else {
+            return Err("page copies on a strip program".into());
+        };
+        super::serve2d::copy_pages(grid, &mut self.rt, pairs)
     }
 
     /// One launch: head iterations 0..=steps, iteration i forcing forced[i]
@@ -778,14 +858,33 @@ enum Job {
         start: usize,
         extra: usize,
     },
+    /// A batched build's launch (answered on the batch channel).
+    Batch {
+        lanes: Vec<super::serve2d::BatchLane>,
+        steps: usize,
+        logits: bool,
+    },
+    /// A batched build's whole-page copies (answered on the batch channel).
+    Copy { pairs: Vec<(u32, u32)> },
 }
 
 type Answer = R<(Vec<u32>, Vec<Vec<f32>>)>;
+/// Each lane's tokens and logits rows.
+type BatchAnswer = R<(Vec<Vec<u32>>, Vec<Vec<f32>>)>;
 
 /// A [`WaferModel`] on its own thread.
 pub struct Wafer {
     jobs: Option<mpsc::Sender<Job>>,
     answers: mpsc::Receiver<Answer>,
+    batch_answers: mpsc::Receiver<BatchAnswer>,
+    /// The batched build's paging (`None`: one sequence), and its
+    /// iterations a launch.
+    pub paged: Option<super::paged::Shape>,
+    pub cap: usize,
+    /// Lanes a batched launch carries (MMAX micro-batches of B on a ring),
+    /// and how many of them may want logits.
+    pub launch_lanes: usize,
+    pub logit_lanes: usize,
     thread: Option<std::thread::JoinHandle<()>>,
     pub vocab: usize,
     pub hidden: usize,
@@ -793,22 +892,36 @@ pub struct Wafer {
 
 impl Wafer {
     /// Loads `program` (the compiler's output directory) on `platform` and
-    /// places `ckpt`; returns once the model answers.
+    /// places `ckpt` (RoPE's theta `rope_theta`, else the checkpoint
+    /// config's); returns once the model answers.
     pub fn open(
         program: PathBuf,
         ckpt: PathBuf,
         platform: Platform,
         launch: Option<Launch>,
+        rope_theta: Option<f64>,
     ) -> R<Wafer> {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
-        let (ready_tx, ready_rx) = mpsc::channel::<R<(usize, usize)>>();
+        let (batch_tx, batch_rx) = mpsc::channel::<BatchAnswer>();
+        let (ready_tx, ready_rx) =
+            mpsc::channel::<R<(usize, usize, Option<super::paged::Shape>, usize, (usize, usize))>>();
         let thread = std::thread::Builder::new()
             .name("spatial-wafer".into())
             .spawn(move || {
-                let mut model = match WaferModel::open(&program, &ckpt, platform, launch) {
+                let mut model = match WaferModel::open_with(&program, &ckpt, platform, launch, rope_theta) {
                     Ok(m) => {
-                        let _ = ready_tx.send(Ok((m.design.vocab(), m.design.hidden())));
+                        let (paged, lanes) = match &m.design {
+                            Design::Grid(g) => (g.paged, (g.launch_lanes(), g.logit_lanes())),
+                            Design::Strips(_) => (None, (1, 1)),
+                        };
+                        let _ = ready_tx.send(Ok((
+                            m.design.vocab(),
+                            m.design.hidden(),
+                            paged,
+                            m.design.cap(),
+                            lanes,
+                        )));
                         m
                     }
                     Err(e) => {
@@ -818,6 +931,24 @@ impl Wafer {
                 };
                 for job in job_rx {
                     let answer = match job {
+                        Job::Batch {
+                            lanes,
+                            steps,
+                            logits,
+                        } => {
+                            let reply = model.fire_batch(&lanes, steps, logits);
+                            if batch_tx.send(reply).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Job::Copy { pairs } => {
+                            let reply = model.copy_pages(&pairs).map(|()| (Vec::new(), Vec::new()));
+                            if batch_tx.send(reply).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                         Job::Forward {
                             tokens,
                             start,
@@ -840,16 +971,55 @@ impl Wafer {
                 }
             })
             .map_err(|e| format!("spawning the wafer thread: {e}"))?;
-        let (vocab, hidden) = ready_rx
+        let (vocab, hidden, paged, cap, (launch_lanes, logit_lanes)) = ready_rx
             .recv()
             .map_err(|_| "the wafer thread died while loading".to_string())??;
         Ok(Wafer {
             jobs: Some(job_tx),
             answers: ans_rx,
+            batch_answers: batch_rx,
+            paged,
+            cap,
+            launch_lanes,
+            logit_lanes,
             thread: Some(thread),
             vocab,
             hidden,
         })
+    }
+
+    /// [`WaferModel::fire_batch`] on the wafer's thread.
+    pub fn fire_batch(
+        &mut self,
+        lanes: Vec<super::serve2d::BatchLane>,
+        steps: usize,
+        logits: bool,
+    ) -> BatchAnswer {
+        self.jobs
+            .as_ref()
+            .ok_or("the wafer is closed")?
+            .send(Job::Batch {
+                lanes,
+                steps,
+                logits,
+            })
+            .map_err(|_| "the wafer thread went away".to_string())?;
+        self.batch_answers
+            .recv()
+            .map_err(|_| "the wafer thread went away".to_string())?
+    }
+
+    /// [`WaferModel::copy_pages`] on the wafer's thread.
+    pub fn copy_pages(&mut self, pairs: Vec<(u32, u32)>) -> R<()> {
+        self.jobs
+            .as_ref()
+            .ok_or("the wafer is closed")?
+            .send(Job::Copy { pairs })
+            .map_err(|_| "the wafer thread went away".to_string())?;
+        self.batch_answers
+            .recv()
+            .map_err(|_| "the wafer thread went away".to_string())?
+            .map(drop)
     }
 
     /// [`WaferModel::greedy`] on the wafer's thread.

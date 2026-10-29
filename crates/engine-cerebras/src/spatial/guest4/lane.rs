@@ -23,6 +23,127 @@ use super::Table;
 /// Words of `out` a step fills (the VM's out block).
 pub const OUT_WORDS: u32 = 16;
 
+/// The VM's out ring (CONTRACT.md section 6, "out ring"): `gout` holds
+/// `depth` rows of `width` words, step s's host-taken words at row s % D,
+/// word `slot`; a launch runs at most D steps before the host reads it. A
+/// property of the compiled image, read once after the program loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ring {
+    pub depth: u32,
+    pub width: u32,
+}
+
+impl Ring {
+    /// `gout`'s word for step `step`'s output word `slot`.
+    #[must_use]
+    pub fn index(&self, step: u64, slot: u32) -> usize {
+        (step % u64::from(self.depth)) as usize * self.width as usize + slot as usize
+    }
+
+    /// Why `program` cannot run on this image, if it cannot: an output
+    /// reaching past a step's `width` words.
+    #[must_use]
+    pub fn refuses(&self, program: &Program) -> Option<String> {
+        program
+            .table
+            .outputs
+            .iter()
+            .find(|&&(_, slot, n, _)| slot + n > self.width)
+            .map(|&(chan, slot, n, _)| {
+                format!(
+                    "channel {chan} takes out words {slot}..{}; the VM image's ring holds {} a step",
+                    slot + n,
+                    self.width
+                )
+            })
+    }
+}
+
+/// Words of `gring` in the compiled program at `program_dir`: the size of
+/// its `gring` object in the PE images' symbol tables (`bin/*.elf`). One
+/// word (guest4h, guest4h2: the depth, width 16) or two (guest4h3 on: depth
+/// and width). The RPC metadata types the symbol as a bare pointer, and a
+/// read past a one-word symbol returns whatever follows it, so the image's
+/// own symbol is the only reliable account.
+pub fn ring_words(program_dir: &std::path::Path) -> Result<usize, String> {
+    let bin = program_dir.join("bin");
+    let entries = std::fs::read_dir(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
+    let mut words = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|x| x == "elf") {
+            let image = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            if let Some(size) = elf_symbol_size(&image, "gring") {
+                words = words.max(Some(size as usize / 4));
+            }
+        }
+    }
+    match words {
+        Some(n @ (1 | 2)) => Ok(n),
+        Some(n) => Err(format!("`gring` is {n} words; the engine reads [depth] or [depth, width]")),
+        None => Err(format!("no PE image in {} defines `gring`", bin.display())),
+    }
+}
+
+/// The size of the object `name` in a little-endian ELF64 image's symbol
+/// table.
+fn elf_symbol_size(image: &[u8], name: &str) -> Option<u64> {
+    let u16_at = |o: usize| image.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u32_at = |o: usize| image.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let u64_at = |o: usize| image.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    if image.get(..6)? != b"\x7fELF\x02\x01" {
+        return None;
+    }
+    let (shoff, shentsize, shnum) = (u64_at(0x28)? as usize, u16_at(0x3a)? as usize, u16_at(0x3c)? as usize);
+    let section = |i: usize| shoff + i * shentsize;
+    for i in 0..shnum {
+        let sh = section(i);
+        // SHT_SYMTAB, its string table at sh_link.
+        if u32_at(sh + 4)? != 2 {
+            continue;
+        }
+        let (off, size, entsize) = (u64_at(sh + 0x18)? as usize, u64_at(sh + 0x20)? as usize, u64_at(sh + 0x38)? as usize);
+        let strtab = u64_at(section(u32_at(sh + 0x28)? as usize) + 0x18)? as usize;
+        for at in (off..off + size).step_by(entsize.max(24)) {
+            let start = strtab + u32_at(at)? as usize;
+            let end = start + image.get(start..)?.iter().position(|&b| b == 0)?;
+            if &image[start..end] == name.as_bytes() {
+                return u64_at(at + 16);
+            }
+        }
+    }
+    None
+}
+
+/// `gring` read from a VM PE (`hub`: block 0's, (R2X + 1, F)), `words` long
+/// ([`ring_words`]); a one-word ring is 16 words wide.
+pub fn read_ring(rt: &mut crate::sdk::Runtime, hub: (usize, usize), words: usize) -> Result<Ring, String> {
+    let mut ring = vec![0u32; words];
+    let at = crate::sdk::Rect {
+        x: hub.0 as i32,
+        y: hub.1 as i32,
+        w: 1,
+        h: 1,
+    };
+    rt.memcpy_d2h("gring", &mut ring, at, words, crate::sdk::Order::RowMajor, crate::sdk::DataType::Bits32)
+        .map_err(|e| format!("reading the VM's ring (`gring`): {e}"))?;
+    let ring = Ring {
+        depth: ring[0],
+        width: ring.get(1).copied().unwrap_or(OUT_WORDS),
+    };
+    if ring.depth == 0 || ring.width == 0 {
+        return Err(format!("the VM's `gring` reads {ring:?}"));
+    }
+    Ok(ring)
+}
+
+/// The steps one VM launch may run: what the token loop asks, capped at the
+/// ring depth (the steps past it would overwrite rows the host has not read).
+#[must_use]
+pub fn steps_per_launch(wanted: usize, ring: Ring) -> usize {
+    wanted.min(ring.depth as usize).max(1)
+}
+
 /// A value as VM words: f32 as bits, ints as their two's complement, bool
 /// 0/1.
 #[must_use]
@@ -269,3 +390,23 @@ impl CheckVm {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ring_words_of_a_guest4h3_image() {
+        // A compiled guest4h3-era image (ring_w 1), where `gring` is
+        // [depth, width]; set PIE_TEST_GUEST4H3_IMAGE to its out directory.
+        let Some(dir) = std::env::var_os("PIE_TEST_GUEST4H3_IMAGE") else {
+            return;
+        };
+        assert_eq!(super::ring_words(std::path::Path::new(&dir)), Ok(2));
+    }
+
+    #[test]
+    fn ring_index_wraps_by_depth() {
+        let ring = super::Ring { depth: 16, width: 1 };
+        assert_eq!((ring.index(3, 0), ring.index(17, 0)), (3, 1));
+    }
+}
+

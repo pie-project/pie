@@ -16,7 +16,7 @@
 //! E): their block, logical page index and the bitmap of the page's slots
 //! the lane attends (PS <= 32).
 
-use crate::sdk::{DataType, Rect, Runtime};
+use crate::sdk::{DataType, Order, Rect, Runtime};
 
 type R<T> = std::result::Result<T, String>;
 
@@ -193,6 +193,81 @@ pub fn copy_pages(rt: &mut Runtime, sym: &Symbols, pairs: &[(u32, u32)]) -> R<()
     Ok(())
 }
 
+/// A pool the host copies pages of (`KVCP` 0 builds export no copy
+/// kernels): every layer grid's `kc`/`vc`, `NB` blocks of `cells` elements a
+/// PE after one leading pad, block g / P of pool page g on grid row g % P.
+pub struct HostPool {
+    /// Each layer grid's top-left PE.
+    pub grids: Vec<(usize, usize)>,
+    /// Columns a grid row (PX); each holds its kv head's dims of a page.
+    pub cols: usize,
+    pub shape: Shape,
+    /// Elements of one page on one PE (Dc · PS).
+    pub cells: usize,
+    /// 16-bit for bf16 KV (one element a u32), else 32-bit.
+    pub data_type: DataType,
+}
+
+impl HostPool {
+    /// Elements of `kc`/`vc` a PE.
+    fn len(&self) -> usize {
+        self.shape.blocks * self.cells + 1
+    }
+}
+
+/// Block `bs` of every column of `src` into block `bd` of `dst` (rows of
+/// `len` elements a PE, one leading pad).
+pub fn patch_block(src: &[u32], dst: &mut [u32], len: usize, cells: usize, bs: usize, bd: usize) {
+    for (a, d) in src.chunks_exact(len).zip(dst.chunks_exact_mut(len)) {
+        d[1 + bd * cells..1 + (bd + 1) * cells].copy_from_slice(&a[1 + bs * cells..1 + (bs + 1) * cells]);
+    }
+}
+
+/// `copy_kv`'s whole pages by the host, pair by pair in order: for each
+/// grid and each of `kc`, `vc`, read the source row's array (and the
+/// destination's, on another row), patch the block, write the destination
+/// row back (memcpy takes no offset into a symbol). Only between launches:
+/// a running launch appends to the same rows.
+pub fn copy_pages_host(rt: &mut Runtime, pool: &HostPool, pairs: &[(u32, u32)]) -> R<()> {
+    let (rows, len) = (pool.shape.rows, pool.len());
+    let e = |e: crate::sdk::Error| e.to_string();
+    for &(src, dst) in pairs {
+        let (src, dst) = (src as usize, dst as usize);
+        if src >= pool.shape.pages() || dst >= pool.shape.pages() {
+            return Err(format!("page copy {src} -> {dst} outside a pool of {}", pool.shape.pages()));
+        }
+        if src == dst {
+            continue;
+        }
+        let (rs, bs, rd, bd) = (src % rows, src / rows, dst % rows, dst / rows);
+        for &(x0, y0) in &pool.grids {
+            let row = |r: usize| Rect {
+                x: x0 as i32,
+                y: (y0 + r) as i32,
+                w: pool.cols as i32,
+                h: 1,
+            };
+            for sym in ["kc", "vc"] {
+                let mut a = vec![0u32; pool.cols * len];
+                rt.memcpy_d2h(sym, &mut a, row(rs), len, Order::RowMajor, pool.data_type)
+                    .map_err(e)?;
+                let mut d = if rd == rs {
+                    a.clone()
+                } else {
+                    let mut d = vec![0u32; pool.cols * len];
+                    rt.memcpy_d2h(sym, &mut d, row(rd), len, Order::RowMajor, pool.data_type)
+                        .map_err(e)?;
+                    d
+                };
+                patch_block(&a, &mut d, len, pool.cells, bs, bd);
+                rt.memcpy_h2d(sym, &d, row(rd), len, Order::RowMajor, pool.data_type)
+                    .map_err(e)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +361,16 @@ mod tests {
     #[test]
     fn a_lane_short_of_pages_is_refused() {
         assert!(table(&SHAPE, &[lane(4, vec![1])], 1).is_err());
+    }
+
+    #[test]
+    fn patch_moves_one_block_of_every_column() {
+        // Two columns, NB 3 blocks of 2 cells after a pad: block 2 of the
+        // source into block 0 of the destination.
+        let len = 7;
+        let src: Vec<u32> = (0..2 * len as u32).collect();
+        let mut dst = vec![100u32; 2 * len];
+        patch_block(&src, &mut dst, len, 2, 2, 0);
+        assert_eq!(dst, [100, 5, 6, 100, 100, 100, 100, 100, 12, 13, 100, 100, 100, 100]);
     }
 }
