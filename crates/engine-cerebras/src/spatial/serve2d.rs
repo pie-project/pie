@@ -54,6 +54,9 @@ pub struct Layout2d {
     /// `KVCP` 0: the build has no page-copy kernels; the host copies pages
     /// by reading, patching and writing back each row's `kc`/`vc`.
     pub host_copy: bool,
+    /// The eta VM on the head's VM column (a GRID 0 build with guest4h3's
+    /// VM, its limits among the params): sampled iterations take its token.
+    pub vm: Option<super::guest4::wafer::VmLayout>,
 }
 
 fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
@@ -100,6 +103,7 @@ impl Layout2d {
                 paged: None,
                 mmax: None,
                 host_copy: get("KVCP").unwrap_or(1) == 0,
+                vm: None,
             };
             let mut lay = lay;
             if get("GRID").unwrap_or(0) == 1 {
@@ -119,6 +123,9 @@ impl Layout2d {
                 lay.mmax = get("MMAX").filter(|&m| m > 0);
             } else if get("MMAX").is_some() || lay.host_copy {
                 return Err("MMAX and KVCP 0 are batched (GRID 1) builds' params".into());
+            }
+            if lay.paged.is_none() {
+                lay.vm = super::guest4::wafer::VmLayout::serve2d(lay.head_x(), &get);
             }
             if lay.py * lay.hc < lay.hidden || lay.gs == 0 || lay.gx == 0 || lay.vmc > 1 {
                 return Err(format!("serve2d params do not make a layout: {lay:?}"));

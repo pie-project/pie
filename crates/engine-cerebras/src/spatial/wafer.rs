@@ -526,7 +526,24 @@ pub struct WaferModel {
     steps: u64,
     /// Batched launches' lane-passes (tokens through the model).
     lane_steps: u64,
+    /// The head's eta VM, when the build has one.
+    vm: Option<Vm>,
 }
+
+/// The head VM's state on the host: its shape and ring, the `gmode` the
+/// head PEs hold, and the steps run since the loaded program's homes were
+/// seeded (the ring's position).
+struct Vm {
+    lay: super::guest4::wafer::VmLayout,
+    ring: super::guest4::lane::Ring,
+    gmode: u32,
+    steps: u64,
+    loaded: bool,
+}
+
+/// One VM step's answer: the token the VM sampled (the head embedded it),
+/// the step's `out` words, the pool after it.
+pub type VmStep = (u32, Vec<u32>, Vec<u32>);
 
 /// How a request reaches the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,8 +653,24 @@ impl WaferModel {
             launch,
             launches: 0,
             lane_steps: 0,
+            vm: None,
             steps: 0,
         };
+        if let Design::Grid(grid) = &model.design
+            && let Some(lay) = grid.vm
+        {
+            let words = super::guest4::lane::ring_words(program)?;
+            let ring = super::guest4::lane::read_ring(&mut model.rt, lay.hub(), words)?;
+            super::guest4::wafer::set_gmode(&mut model.rt, &lay, 0)?;
+            tracing::info!(?ring, ops = lay.max_ops, registers = lay.nreg, pool = lay.pool_words, "spatial wafer: the head has the eta VM");
+            model.vm = Some(Vm {
+                lay,
+                ring,
+                gmode: 0,
+                steps: 0,
+                loaded: false,
+            });
+        }
         // One request (position 0; later requests overwrite its KV) so the
         // first real one does not pay first-launch costs.
         let started = Instant::now();
@@ -669,6 +702,58 @@ impl WaferModel {
 
     pub fn design(&self) -> &Design {
         &self.design
+    }
+
+    /// Why the head's VM cannot take `table` (no VM, or a table past its
+    /// limits or its ring's width), if it cannot.
+    pub fn vm_refuses(&self, table: &super::guest4::Table) -> Option<String> {
+        let Some(vm) = &self.vm else {
+            return Some("the wafer program has no VM".into());
+        };
+        if !table.per_step.is_empty() {
+            return Some("the host writes some of its homes every step".into());
+        }
+        vm.lay.refuses(table).or_else(|| vm.ring.refuses_outputs(&table.outputs))
+    }
+
+    /// Loads `table` on the head's VM, its homes seeded with `seeds` (a
+    /// lane's carried state): the VM's ring starts over.
+    pub fn vm_load(&mut self, table: &super::guest4::Table, seeds: &[super::guest4::wafer::Seed]) -> R<()> {
+        if let Some(why) = self.vm_refuses(table) {
+            return Err(why);
+        }
+        let vm = self.vm.as_mut().ok_or("the wafer program has no VM")?;
+        super::guest4::wafer::load(&mut self.rt, &vm.lay, table, seeds)?;
+        vm.gmode = 1;
+        vm.steps = 0;
+        vm.loaded = true;
+        Ok(())
+    }
+
+    /// `token` at position `start` with the VM picking the next one: one
+    /// launch of one iteration with `gmode` 1 (the VM runs the loaded
+    /// program on that row's logits and the head embeds its token), then
+    /// the step's `out` words and the VM's pool.
+    pub fn vm_step(&mut self, token: u32, start: usize) -> R<VmStep> {
+        let Design::Grid(grid) = &self.design else {
+            return Err("a VM step on a strip program".into());
+        };
+        let vm = self.vm.as_mut().ok_or("the wafer program has no VM")?;
+        if !vm.loaded {
+            return Err("no program is loaded on the VM".into());
+        }
+        if vm.gmode != 1 {
+            super::guest4::wafer::set_gmode(&mut self.rt, &vm.lay, 1)?;
+            vm.gmode = 1;
+        }
+        self.launches += 1;
+        self.steps += 1;
+        let (sampled, _) = super::serve2d::run(grid, &mut self.rt, &[token], 1, start, false)?;
+        let mut rows = super::guest4::wafer::read_out(&mut self.rt, &vm.lay, vm.ring, vm.steps, 1)?;
+        vm.steps += 1;
+        let pool = super::guest4::wafer::read_pool(&mut self.rt, &vm.lay)?;
+        let token = sampled.first().copied().ok_or("the launch answered no token")?;
+        Ok((token, rows.pop().unwrap_or_default(), pool))
     }
 
     /// A batched build's launch ([`super::serve2d::fire`]).
@@ -719,6 +804,13 @@ impl WaferModel {
         let lay = match &self.design {
             Design::Strips(lay) => lay,
             Design::Grid(grid) => {
+                // The head's own argmax: the VM idles.
+                if let Some(vm) = self.vm.as_mut()
+                    && vm.gmode != 0
+                {
+                    super::guest4::wafer::set_gmode(&mut self.rt, &vm.lay, 0)?;
+                    vm.gmode = 0;
+                }
                 return super::serve2d::run(grid, &mut self.rt, forced, steps, start, want_logits);
             }
         };
@@ -867,6 +959,12 @@ enum Job {
     },
     /// A batched build's whole-page copies (answered on the batch channel).
     Copy { pairs: Vec<(u32, u32)> },
+    /// A program onto the head's VM, and one VM step (the VM channel).
+    VmLoad {
+        program: std::sync::Arc<super::guest4::lane::Program>,
+        seeds: Vec<super::guest4::wafer::Seed>,
+    },
+    VmStep { token: u32, start: usize },
 }
 
 type Answer = R<(Vec<u32>, Vec<Vec<f32>>)>;
@@ -889,6 +987,9 @@ pub struct Wafer {
     /// The KV positions one sequence may hold (a lane's pages on a batched
     /// build).
     pub positions: usize,
+    /// The head's eta VM (its shape and out ring), when the build has one.
+    pub vm: Option<(super::guest4::wafer::VmLayout, super::guest4::lane::Ring)>,
+    vm_answers: mpsc::Receiver<R<Option<VmStep>>>,
     thread: Option<std::thread::JoinHandle<()>>,
     pub vocab: usize,
     pub hidden: usize,
@@ -908,25 +1009,33 @@ impl Wafer {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
         let (batch_tx, batch_rx) = mpsc::channel::<BatchAnswer>();
-        let (ready_tx, ready_rx) =
-            mpsc::channel::<R<(usize, usize, Option<super::paged::Shape>, usize, (usize, usize), usize)>>();
+        let (vm_tx, vm_rx) = mpsc::channel::<R<Option<VmStep>>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<R<Wafer>>();
         let thread = std::thread::Builder::new()
             .name("spatial-wafer".into())
             .spawn(move || {
                 let mut model = match WaferModel::open_with(&program, &ckpt, platform, launch, rope_theta) {
                     Ok(m) => {
-                        let (paged, lanes) = match &m.design {
+                        let (paged, (launch_lanes, logit_lanes)) = match &m.design {
                             Design::Grid(g) => (g.paged, (g.launch_lanes(), g.logit_lanes())),
                             Design::Strips(_) => (None, (1, 1)),
                         };
-                        let _ = ready_tx.send(Ok((
-                            m.design.vocab(),
-                            m.design.hidden(),
+                        // The facts the engine reads; the channels are filled in below.
+                        let _ = ready_tx.send(Ok(Wafer {
+                            jobs: None,
+                            answers: mpsc::channel().1,
+                            batch_answers: mpsc::channel().1,
+                            vm_answers: mpsc::channel().1,
                             paged,
-                            m.design.cap(),
-                            lanes,
-                            m.design.positions(),
-                        )));
+                            cap: m.design.cap(),
+                            launch_lanes,
+                            logit_lanes,
+                            positions: m.design.positions(),
+                            vm: m.vm.as_ref().map(|vm| (vm.lay, vm.ring)),
+                            thread: None,
+                            vocab: m.design.vocab(),
+                            hidden: m.design.hidden(),
+                        }));
                         m
                     }
                     Err(e) => {
@@ -943,6 +1052,20 @@ impl Wafer {
                         } => {
                             let reply = model.fire_batch(&lanes, steps, logits);
                             if batch_tx.send(reply).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Job::VmLoad { program, seeds } => {
+                            let reply = model.vm_load(&program.table, &seeds).map(|()| None);
+                            if vm_tx.send(reply).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Job::VmStep { token, start } => {
+                            let reply = model.vm_step(token, start).map(Some);
+                            if vm_tx.send(reply).is_err() {
                                 break;
                             }
                             continue;
@@ -976,21 +1099,16 @@ impl Wafer {
                 }
             })
             .map_err(|e| format!("spawning the wafer thread: {e}"))?;
-        let (vocab, hidden, paged, cap, (launch_lanes, logit_lanes), positions) = ready_rx
+        let facts = ready_rx
             .recv()
             .map_err(|_| "the wafer thread died while loading".to_string())??;
         Ok(Wafer {
             jobs: Some(job_tx),
             answers: ans_rx,
             batch_answers: batch_rx,
-            paged,
-            cap,
-            launch_lanes,
-            logit_lanes,
-            positions,
+            vm_answers: vm_rx,
             thread: Some(thread),
-            vocab,
-            hidden,
+            ..facts
         })
     }
 
@@ -1001,6 +1119,7 @@ impl Wafer {
         steps: usize,
         logits: bool,
     ) -> BatchAnswer {
+        let _busy = super::Busy::start();
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?
@@ -1015,8 +1134,53 @@ impl Wafer {
             .map_err(|_| "the wafer thread went away".to_string())?
     }
 
+    /// Why the head's VM cannot take `table`, if it cannot (as
+    /// [`WaferModel::vm_refuses`]).
+    pub fn vm_refuses(&self, table: &super::guest4::Table) -> Option<String> {
+        let Some((lay, ring)) = &self.vm else {
+            return Some("the wafer program has no VM".into());
+        };
+        if !table.per_step.is_empty() {
+            return Some("the host writes some of its homes every step".into());
+        }
+        lay.refuses(table).or_else(|| ring.refuses_outputs(&table.outputs))
+    }
+
+    /// [`WaferModel::vm_load`] on the wafer's thread.
+    pub fn vm_load(
+        &mut self,
+        program: std::sync::Arc<super::guest4::lane::Program>,
+        seeds: Vec<super::guest4::wafer::Seed>,
+    ) -> R<()> {
+        let _busy = super::Busy::start();
+        self.jobs
+            .as_ref()
+            .ok_or("the wafer is closed")?
+            .send(Job::VmLoad { program, seeds })
+            .map_err(|_| "the wafer thread went away".to_string())?;
+        self.vm_answers
+            .recv()
+            .map_err(|_| "the wafer thread went away".to_string())?
+            .map(drop)
+    }
+
+    /// [`WaferModel::vm_step`] on the wafer's thread.
+    pub fn vm_step(&mut self, token: u32, start: usize) -> R<VmStep> {
+        let _busy = super::Busy::start();
+        self.jobs
+            .as_ref()
+            .ok_or("the wafer is closed")?
+            .send(Job::VmStep { token, start })
+            .map_err(|_| "the wafer thread went away".to_string())?;
+        self.vm_answers
+            .recv()
+            .map_err(|_| "the wafer thread went away".to_string())??
+            .ok_or_else(|| "the VM answered no step".to_string())
+    }
+
     /// [`WaferModel::copy_pages`] on the wafer's thread.
     pub fn copy_pages(&mut self, pairs: Vec<(u32, u32)>) -> R<()> {
+        let _busy = super::Busy::start();
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?
@@ -1030,6 +1194,7 @@ impl Wafer {
 
     /// [`WaferModel::greedy`] on the wafer's thread.
     pub fn greedy(&mut self, tokens: &[u32], start: usize, extra: usize) -> R<Vec<u32>> {
+        let _busy = super::Busy::start();
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?
@@ -1046,6 +1211,7 @@ impl Wafer {
     }
 
     pub fn forward(&mut self, tokens: &[u32], start: usize, which: Logits) -> Answer {
+        let _busy = super::Busy::start();
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?

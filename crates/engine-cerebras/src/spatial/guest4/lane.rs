@@ -44,9 +44,14 @@ impl Ring {
     /// reaching past a step's `width` words.
     #[must_use]
     pub fn refuses(&self, program: &Program) -> Option<String> {
-        program
-            .table
-            .outputs
+        self.refuses_outputs(&program.table.outputs)
+    }
+
+    /// [`Ring::refuses`] for a table's `outputs` (channel, slot, words,
+    /// dtype).
+    #[must_use]
+    pub fn refuses_outputs(&self, outputs: &[(u32, u32, u32, Dtype)]) -> Option<String> {
+        outputs
             .iter()
             .find(|&&(_, slot, n, _)| slot + n > self.width)
             .map(|&(chan, slot, n, _)| {

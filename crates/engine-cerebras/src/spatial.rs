@@ -179,6 +179,7 @@ impl Daemon {
 
     /// One request, its answer; an answer without `"ok": true` is an error.
     fn call(&mut self, request: &serde_json::Value) -> EngineResult<serde_json::Value> {
+        let _busy = Busy::start();
         let line = serde_json::to_string(request).expect("a JSON value serializes");
         writeln!(self.stdin, "{line}")
             .and_then(|()| self.stdin.flush())
@@ -209,6 +210,27 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Time spent waiting on the model (the daemon's answers, the wafer
+/// thread's launches), all fires together: the host's share of a token is
+/// the rest of its wall time.
+pub(crate) static MODEL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Adds its lifetime to [`MODEL_NS`].
+pub(crate) struct Busy(std::time::Instant);
+
+impl Busy {
+    pub(crate) fn start() -> Busy {
+        Busy(std::time::Instant::now())
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        let ns = u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        MODEL_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -845,6 +867,11 @@ pub struct Spatial {
     guest_programs: std::collections::HashMap<u64, std::sync::Arc<guest4::lane::Program>>,
     /// The guest VM a lane's instance runs on, while it does.
     guest_vms: std::collections::HashMap<InstanceId, guest4::lane::CheckVm>,
+    /// The instance whose program the wafer head's VM holds (`guest`
+    /// "wafer"): its homes live there while it does.
+    vm_owner: Option<InstanceId>,
+    /// Fires run (the model-time log's count).
+    fires: u64,
     /// Epilogue steps the guest VM ran.
     guest_steps: u64,
     /// Rows of history replayed into the model's cache (the fallback for a
@@ -878,6 +905,8 @@ impl Spatial {
             guest_probed: std::collections::HashSet::new(),
             guest_programs: std::collections::HashMap::new(),
             guest_vms: std::collections::HashMap::new(),
+            vm_owner: None,
+            fires: 0,
             guest_steps: 0,
             replayed: 0,
             paged_fires: 0,
@@ -1130,6 +1159,165 @@ impl Spatial {
             tracing::warn!(mode, "spatial guest: not off, check or wafer; epilogues stay on the host");
             "off".to_string()
         }
+    }
+
+    /// Whether the wafer head's VM runs `instance`'s epilogue (`guest`
+    /// "wafer"): a one-sequence program with a VM, the instance's program
+    /// translated and within the VM's limits, and the VM free or already
+    /// its.
+    fn vm_takes(&self, instance: InstanceId) -> bool {
+        if self.guest_mode() != "wafer" {
+            return false;
+        }
+        let Some(Model::Wafer(w)) = &self.daemon else {
+            return false;
+        };
+        if w.vm.is_none() || w.paged.is_some() {
+            return false;
+        }
+        let Some((program, _, _)) = self.programs.instance_view(instance) else {
+            return false;
+        };
+        let Some(guest) = self.guest_programs.get(&program.0) else {
+            return false;
+        };
+        if let Some(why) = w.vm_refuses(&guest.table) {
+            tracing::debug!(program = program.0, %why, "spatial guest: the VM cannot take it");
+            return false;
+        }
+        // One lane's homes at a time; another instance's stay on the host
+        // until the VM's owner is gone.
+        self.vm_owner.is_none_or(|owner| {
+            owner == instance || self.programs.instance_view(owner).is_none()
+        })
+    }
+
+    /// `tokens` at `start` for the lane (`slot`, its `pages`) with the
+    /// head's VM running `instance`'s epilogue on the last row: the model's
+    /// cache brought to the lane's history, every row but the last run
+    /// (the head's argmax mode), then the last as a VM step. The step's
+    /// `out` words and the VM's pool after it.
+    fn forward_vm(
+        &mut self,
+        instance: InstanceId,
+        slot: u32,
+        pages: &[u32],
+        tokens: &[u32],
+        start: u32,
+    ) -> EngineResult<(Vec<u32>, Vec<u32>)> {
+        let device = |e: String| Error::Device(format!("the wafer model's VM: {e}"));
+        if self.vm_owner != Some(instance) {
+            let (program, _, inst) = self
+                .programs
+                .instance_view(instance)
+                .ok_or_else(|| Error::Invalid(format!("instance {instance:?} is gone")))?;
+            let guest = self
+                .guest_programs
+                .get(&program.0)
+                .cloned()
+                .ok_or_else(|| Error::Invalid("the program has no guest table".into()))?;
+            // Its carried state: every home's value as it stands.
+            let seeds: Vec<guest4::wafer::Seed> = guest
+                .table
+                .homes
+                .iter()
+                .map(|h| guest4::wafer::Seed::of(h, guest4::lane::words_of(&inst.channels[h.chan as usize].current())))
+                .collect();
+            let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
+                return Err(Error::Device("the VM path without a wafer model".into()));
+            };
+            w.vm_load(guest, seeds).map_err(device)?;
+            self.vm_owner = Some(instance);
+            tracing::info!(?instance, program = program.0, "spatial guest: the program runs on the wafer's VM");
+        }
+        let history = self.kv.history(slot, pages, start)?;
+        let caches = self.daemon()?.caches();
+        self.kv.cached.resize_with(caches, Default::default);
+        let agree_of = |cached: &[u32]| cached.iter().zip(&history).take_while(|(a, b)| a == b).count();
+        let (cache, agree) = self
+            .kv
+            .cached
+            .iter()
+            .enumerate()
+            .map(|(c, cached)| (c, agree_of(&cached.tokens), cached.used))
+            .max_by_key(|&(_, agree, used)| (agree, std::cmp::Reverse(used)))
+            .map(|(c, agree, _)| (c, agree))
+            .unwrap_or((0, 0));
+        self.kv.clock += 1;
+        self.kv.cached[cache].used = self.kv.clock;
+        if agree < self.kv.cached[cache].tokens.len() {
+            if agree == 0 {
+                self.daemon()?.reset(cache)?;
+            } else {
+                self.daemon()?.truncate(cache, agree)?;
+            }
+            self.kv.cached[cache].truncate(agree);
+        }
+        if agree < history.len() {
+            self.replayed += (history.len() - agree) as u64;
+            self.daemon()?
+                .forward(cache, &history[agree..], agree as u32, wafer::Logits::None)?;
+            self.kv.cached[cache].extend(&history[agree..]);
+        }
+        let n = tokens.len();
+        if n > 1 {
+            self.daemon()?
+                .forward(cache, &tokens[..n - 1], start, wafer::Logits::None)?;
+        }
+        let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
+            return Err(Error::Device("the VM path without a wafer model".into()));
+        };
+        let (_, row, pool) = w.vm_step(tokens[n - 1], (start as usize) + n - 1).map_err(device)?;
+        self.kv.cached[cache].extend(tokens);
+        self.kv.write(slot, pages, history, tokens)?;
+        Ok((row, pool))
+    }
+
+    /// `instance`'s epilogue as the head's VM ran it: eta-exec steps the
+    /// instance through [`guest4::lane::VmStage`] on the step's `out` words,
+    /// and the pool homes (the next token's among them) come back from the
+    /// VM's pool; wide homes stay on the wafer.
+    fn fire_vm(&mut self, instance: InstanceId, row: &[u32], pool: &[u32]) -> EngineResult<()> {
+        let Some((program, _, _)) = self.programs.instance_view(instance) else {
+            return Ok(());
+        };
+        let guest = self
+            .guest_programs
+            .get(&program.0)
+            .cloned()
+            .ok_or_else(|| Error::Invalid("the program has no guest table".into()))?;
+        self.programs
+            .fire_with(
+                instance,
+                &[],
+                Stage::Epilogue,
+                &mut guest4::lane::VmStage {
+                    program: &guest,
+                    out: row,
+                    wide: &[],
+                },
+            )
+            .map_err(refusal)?;
+        if let Some((_, _, inst)) = self.programs.instance_view(instance) {
+            for h in guest.table.homes.iter().filter(|h| h.kind == "pool") {
+                let (at, n) = (h.at as usize, h.n as usize);
+                let Some(words) = pool.get(at..at + n) else {
+                    continue;
+                };
+                let ring = &inst.channels[h.chan as usize];
+                let value = guest4::lane::value_of(words, h.dtype);
+                if ring.is_empty() {
+                    ring.push(&value);
+                } else {
+                    ring.encode_sequence(ring.head(), &value);
+                }
+            }
+        }
+        self.guest_steps += 1;
+        if self.guest_steps.is_power_of_two() {
+            tracing::info!(steps = self.guest_steps, program = program.0, "spatial guest: epilogue steps run on the wafer's VM");
+        }
+        Ok(())
     }
 
     /// `instance`'s epilogue through the guest contract, if its program has
@@ -1394,6 +1582,10 @@ impl Spatial {
         // pages: (lane index, tokens, start, pages, logits asked, rows read).
         let paged = self.daemon.as_ref().is_some_and(Model::paged);
         let mut paged_lanes: Vec<(usize, PagedLane, Vec<u32>)> = Vec::new();
+        // Lanes whose epilogue the wafer head's VM ran: (instance, the
+        // step's `out` words, the VM's pool after it).
+        let mut vm_out: std::collections::HashMap<usize, (InstanceId, Vec<u32>, Vec<u32>)> =
+            std::collections::HashMap::new();
         // Cells the fire's paged lanes so far will have written.
         let mut planned: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         for (at, lane) in lanes.iter().enumerate() {
@@ -1540,7 +1732,29 @@ impl Spatial {
                     // A model of one sequence a cache runs causal attention
                     // only (a paged model attends what each row's mask says).
                     self.check_masks(lane, at, start, tokens[at].len(), dense_masks.get(&at))?;
-                    self.forward(lane.slot, &lane.kv.pages, &tokens[at], start, &rows, greedy, ahead)?
+                    let vm = attached.get(&at).copied().filter(|&instance| {
+                        rows.len() == 1
+                            && rows[0] as usize + 1 == tokens[at].len()
+                            && step.attachments.iter().filter(|a| !a.adapter_only).count() == 1
+                            && self.vm_takes(instance)
+                    });
+                    match vm {
+                        Some(instance) => {
+                            let (row, pool) =
+                                self.forward_vm(instance, lane.slot, &lane.kv.pages, &tokens[at], start)?;
+                            vm_out.insert(at, (instance, row, pool));
+                            (Vec::new(), true)
+                        }
+                        None => self.forward(
+                            lane.slot,
+                            &lane.kv.pages,
+                            &tokens[at],
+                            start,
+                            &rows,
+                            greedy,
+                            ahead,
+                        )?,
+                    }
                 }
             };
             logits.push(out);
@@ -1578,6 +1792,16 @@ impl Spatial {
         let mut guest_read = vec![false; lanes.len()];
         for attachment in &step.attachments {
             if attachment.adapter_only {
+                continue;
+            }
+            let at = attachment.lane as usize;
+            if let Some((instance, row, pool)) = vm_out.remove(&at)
+                && instance == attachment.instance
+            {
+                self.fire_vm(instance, &row, &pool)?;
+                if let Some(read) = guest_read.get_mut(at) {
+                    *read = true;
+                }
                 continue;
             }
             let mut outputs: Vec<(String, u32, Value)> = Vec::new();
@@ -1621,6 +1845,12 @@ impl Spatial {
                     .map_err(refusal)?;
             }
         }
+        self.fires += 1;
+        tracing::info!(
+            fires = self.fires,
+            model_ms = MODEL_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+            "spatial: model time"
+        );
         Ok(lanes
             .iter()
             .enumerate()

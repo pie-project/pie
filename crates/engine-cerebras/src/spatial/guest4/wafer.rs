@@ -1,0 +1,308 @@
+//! The VM on the head's VM columns (`spatial/eta/CONTRACT.md` section 6,
+//! `payload/guest4h*`): one VM column after each head block's root column,
+//! the lane the NB·H VM PEs (block b's row ry: vocabulary rows
+//! `(b·H + ry)·Vr ..`), the feeder row F a hub that holds none.
+//!
+//! The host's side, as `guest4h3/run.py` drives it: a program's table
+//! (packed four words an instruction), its pool and wide homes' seeds, the
+//! token's home and `gvalid` on every VM PE; `gmode` 1 on every head PE so
+//! sampled iterations take the VM's token; the head's `compute(steps)` runs
+//! `run` and `run_pre` itself; after it, `gout` (D rows of W words, step s at
+//! row s % D) on any VM PE holds each step's host-taken words.
+
+use crate::sdk::{DataType, Order, Rect, Runtime};
+
+use super::lane::{OUT_WORDS, Ring};
+use super::{Home, Table};
+
+type R<T> = std::result::Result<T, String>;
+
+/// The VM's shape, from the compiled program's params (`out.json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmLayout {
+    /// The head's first column (0 on a head-only image; serve2d's head sits
+    /// east of the layer grids).
+    pub x0: usize,
+    /// Head blocks (the head's width over C + 1).
+    pub blocks: usize,
+    /// Region rows a block (H); the VM column is H + 1 high (the hub at F).
+    pub rows: usize,
+    /// Vocabulary rows a lane PE (Vr): a wide register's length.
+    pub vr: usize,
+    /// A block's columns (C + VMC) and its root column (R2X).
+    pub block_cols: usize,
+    pub root: usize,
+    /// The feeder row (H / 2).
+    pub feeder: usize,
+    /// The image's VM limits: instructions, wide registers, pool words.
+    pub max_ops: usize,
+    pub nreg: usize,
+    pub pool_words: usize,
+    pub vocab: usize,
+}
+
+fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
+    Rect {
+        x: x as i32,
+        y: y as i32,
+        w: w as i32,
+        h: h as i32,
+    }
+}
+
+impl VmLayout {
+    /// The VM of a guest4h* head image (`VMC` 1 and the VM limits among its
+    /// params); `None` for a program without one.
+    pub fn of(get: impl Fn(&str) -> Option<usize>) -> Option<VmLayout> {
+        if get("VMC")? != 1 {
+            return None;
+        }
+        let (w, c, gx) = (get("W")?, get("C")?, get("Gx")?);
+        let ngx = c / gx;
+        Some(VmLayout {
+            x0: 0,
+            blocks: w / (c + 1),
+            rows: get("H")?,
+            vr: get("Vr")?,
+            block_cols: c + 1,
+            root: (ngx / 2) * gx + gx / 2,
+            feeder: get("H")? / 2,
+            max_ops: get("max_ops")?,
+            nreg: get("nreg")?,
+            pool_words: get("pool_words")?,
+            vocab: get("vocab")?,
+        })
+    }
+
+    /// serve2d's head (one block of `C` = PY columns at `x0`, `HH` region
+    /// rows) when its build carries the VM (`VMC` 1 and the VM limits among
+    /// its params).
+    pub fn serve2d(x0: usize, get: impl Fn(&str) -> Option<usize>) -> Option<VmLayout> {
+        if get("VMC")? != 1 {
+            return None;
+        }
+        let (c, gx, hh) = (get("PY")?, get("Gx")?, get("HH")?);
+        let ngx = c / gx;
+        Some(VmLayout {
+            x0,
+            blocks: 1,
+            rows: hh,
+            vr: get("Vr")?,
+            block_cols: c + 1,
+            root: (ngx / 2) * gx + gx / 2,
+            feeder: hh / 2,
+            max_ops: get("max_ops")?,
+            nreg: get("nreg")?,
+            pool_words: get("pool_words")?,
+            vocab: get("vocab")?,
+        })
+    }
+
+    /// Block b's VM column.
+    pub fn column(&self, b: usize) -> usize {
+        self.x0 + b * self.block_cols + self.root + 1
+    }
+
+    /// The head's PEs (every block's columns, its region rows and the
+    /// feeder row): where `gmode` lives.
+    pub fn head(&self) -> Rect {
+        rect(self.x0, 0, self.blocks * self.block_cols, self.rows + 1)
+    }
+
+    /// Block 0's hub (its VM column's feeder-row PE): the ring and the pool
+    /// are read there.
+    pub fn hub(&self) -> (usize, usize) {
+        (self.column(0), self.feeder)
+    }
+
+    /// Why `table` cannot load on this image, if it cannot.
+    pub fn refuses(&self, table: &Table) -> Option<String> {
+        if table.ins.len() > self.max_ops {
+            return Some(format!("{} instructions; the image holds {}", table.ins.len(), self.max_ops));
+        }
+        if table.nreg as usize > self.nreg {
+            return Some(format!("{} wide registers; the image has {}", table.nreg, self.nreg));
+        }
+        if table.pool_words as usize > self.pool_words {
+            return Some(format!("{} pool words; the image has {}", table.pool_words, self.pool_words));
+        }
+        if !table.wide_outputs.is_empty() {
+            return Some("vocabulary-wide host outputs (read from the VM's registers)".into());
+        }
+        if table.tok_home.is_none() {
+            return Some("no token home (the head embeds the EmbedTokens channel's word)".into());
+        }
+        None
+    }
+}
+
+/// etagen's six-word instructions `[op, fl, d, a, b, c]` as the VM's four
+/// words `[op | fl << 8, d | a << 16, b, c]`, padded to `max_ops`.
+pub fn pack_ops(ins: &[[u32; 6]], max_ops: usize) -> R<Vec<u32>> {
+    if ins.len() > max_ops {
+        return Err(format!("{} instructions for a table of {max_ops}", ins.len()));
+    }
+    let mut out = vec![0u32; max_ops * 4];
+    for (i, &[op, fl, d, a, b, c]) in ins.iter().enumerate() {
+        if op >= 256 || fl >= 1 << 24 || d >= 1 << 16 || a >= 1 << 16 {
+            return Err(format!("instruction {i} {:?} does not pack", [op, fl, d, a, b, c]));
+        }
+        out[i * 4..i * 4 + 4].copy_from_slice(&[op | fl << 8, d | a << 16, b, c]);
+    }
+    Ok(out)
+}
+
+/// A home's seed words (pool: u32 words; wide: the whole vocabulary row, f32
+/// bits of the value, ints converted as eta reads them).
+pub struct Seed {
+    pub kind: &'static str,
+    pub at: u32,
+    pub n: u32,
+    pub dtype: eta_ir::Dtype,
+    pub words: Vec<u32>,
+}
+
+impl Seed {
+    #[must_use]
+    pub fn of(home: &Home, words: Vec<u32>) -> Seed {
+        Seed {
+            kind: home.kind,
+            at: home.at,
+            n: home.n,
+            dtype: home.dtype,
+            words,
+        }
+    }
+}
+
+/// The pool block and the wide rows (lane position x register x Vr, f32) the
+/// seeds make.
+fn seed_images(lay: &VmLayout, seeds: &[Seed]) -> R<(Vec<u32>, Vec<f32>)> {
+    use eta_ir::Dtype;
+    let lanes = lay.blocks * lay.rows;
+    let mut pool = vec![0u32; lay.pool_words];
+    let mut wide = vec![0f32; lanes * lay.nreg * lay.vr];
+    for seed in seeds {
+        let (at, n) = (seed.at as usize, seed.n as usize);
+        if seed.kind == "pool" {
+            let dst = pool
+                .get_mut(at..at + n.min(seed.words.len()))
+                .ok_or_else(|| format!("pool home {at}+{n} past {} words", lay.pool_words))?;
+            dst.copy_from_slice(&seed.words[..dst.len()]);
+        } else {
+            if at >= lay.nreg {
+                return Err(format!("wide home {at} past {} registers", lay.nreg));
+            }
+            for (v, &w) in seed.words.iter().enumerate().take(lanes * lay.vr) {
+                let x = match seed.dtype {
+                    Dtype::F32 => f32::from_bits(w),
+                    Dtype::I32 => w as i32 as f32,
+                    _ => w as f32,
+                };
+                let (lane, j) = (v / lay.vr, v % lay.vr);
+                wide[(lane * lay.nreg + at) * lay.vr + j] = x;
+            }
+        }
+    }
+    Ok((pool, wide))
+}
+
+/// Loads `table` with its homes' `seeds` on every VM PE and sets `gmode`
+/// (1: the VM picks sampled tokens) on every head PE; resets the step count.
+pub fn load(rt: &mut Runtime, lay: &VmLayout, table: &Table, seeds: &[Seed]) -> R<()> {
+    if let Some(why) = lay.refuses(table) {
+        return Err(format!("the VM image cannot run this program: {why}"));
+    }
+    let e = |e: crate::sdk::Error| e.to_string();
+    let ops = pack_ops(&table.ins, lay.max_ops)?;
+    let (pool, wide) = seed_images(lay, seeds)?;
+    let tok_home = table.tok_home.unwrap_or_default();
+    let nv = lay.rows + 1;
+    let tile = |words: &[u32]| -> Vec<u32> { (0..nv).flat_map(|_| words.iter().copied()).collect() };
+    let b32 = DataType::Bits32;
+    for b in 0..lay.blocks {
+        let col = rect(lay.column(b), 0, 1, nv);
+        rt.memcpy_h2d("gops", &tile(&ops), col, ops.len(), Order::RowMajor, b32).map_err(e)?;
+        rt.memcpy_h2d("gpool", &tile(&pool), col, pool.len(), Order::RowMajor, b32).map_err(e)?;
+        rt.memcpy_h2d("gvalid", &vec![lay.vocab as u32; nv], col, 1, Order::RowMajor, b32).map_err(e)?;
+        rt.memcpy_h2d("gtok_home", &vec![tok_home; nv], col, 1, Order::RowMajor, b32).map_err(e)?;
+        rt.memcpy_h2d("gostep", &vec![0; nv], col, 1, Order::RowMajor, b32).map_err(e)?;
+        // Region rows are lane positions b·H + ry; the hub (row F) holds none.
+        let per = lay.nreg * lay.vr;
+        let mut w = vec![0u32; nv * per];
+        for ry in 0..lay.rows {
+            let pe = if ry < lay.feeder { ry } else { ry + 1 };
+            let lane = b * lay.rows + ry;
+            for k in 0..per {
+                w[pe * per + k] = wide[lane * per + k].to_bits();
+            }
+        }
+        rt.memcpy_h2d("gwide", &w, col, per, Order::RowMajor, b32).map_err(e)?;
+    }
+    set_gmode(rt, lay, 1)
+}
+
+/// `gmode` on every head PE: 1, the VM picks the sampled iterations'
+/// tokens (and runs every iteration); 0, the head's argmax (the VM idles).
+pub fn set_gmode(rt: &mut Runtime, lay: &VmLayout, mode: u32) -> R<()> {
+    let head = lay.head();
+    let n = (head.w * head.h) as usize;
+    rt.memcpy_h2d("gmode", &vec![mode; n], head, 1, Order::RowMajor, DataType::Bits32)
+        .map_err(|e| e.to_string())
+}
+
+/// The VM's pool (every VM PE holds the same words): the pool homes' values
+/// after its last step, the token's home among them.
+pub fn read_pool(rt: &mut Runtime, lay: &VmLayout) -> R<Vec<u32>> {
+    let mut pool = vec![0u32; lay.pool_words];
+    let (x, y) = lay.hub();
+    rt.memcpy_d2h("gpool", &mut pool, rect(x, y, 1, 1), lay.pool_words, Order::RowMajor, DataType::Bits32)
+        .map_err(|e| e.to_string())?;
+    Ok(pool)
+}
+
+/// The out ring after a launch of `steps` steps (at most its depth) that
+/// followed `first` steps since the program loaded: each step's words (W,
+/// padded to the 16 a step's `out` has), read from block 0's hub.
+pub fn read_out(rt: &mut Runtime, lay: &VmLayout, ring: Ring, first: u64, steps: usize) -> R<Vec<Vec<u32>>> {
+    if steps > ring.depth as usize {
+        return Err(format!("{steps} steps a launch; the VM's ring holds {}", ring.depth));
+    }
+    let n = (ring.depth * ring.width) as usize;
+    let mut words = vec![0u32; n];
+    let (x, y) = lay.hub();
+    rt.memcpy_d2h("gout", &mut words, rect(x, y, 1, 1), n, Order::RowMajor, DataType::Bits32)
+        .map_err(|e| e.to_string())?;
+    Ok((first..first + steps as u64)
+        .map(|s| {
+            let at = ring.index(s, 0);
+            let mut row = words[at..at + ring.width as usize].to_vec();
+            row.resize(OUT_WORDS as usize, 0);
+            row
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ops_pack_as_run_py() {
+        let packed = pack_ops(&[[7, 3, 2, 5, 9, 11]], 2).unwrap();
+        assert_eq!(packed, [7 | 3 << 8, 2 | 5 << 16, 9, 11, 0, 0, 0, 0]);
+        assert!(pack_ops(&[[300, 0, 0, 0, 0, 0]], 1).is_err());
+    }
+
+    #[test]
+    fn layout_of_the_0112_image() {
+        let params = [
+            ("W", 528), ("VMC", 1), ("H", 300), ("C", 32), ("Vr", 32), ("Gx", 8),
+            ("max_ops", 48), ("nreg", 6), ("pool_words", 64), ("vocab", 151_936),
+        ];
+        let lay = VmLayout::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1)).unwrap();
+        // 16 blocks of 33 columns, the root at 20 (run.py's R2X), the VM after it.
+        assert_eq!((lay.blocks, lay.root, lay.column(1), lay.feeder), (16, 20, 54, 150));
+        assert!(lay.blocks * lay.rows * lay.vr >= lay.vocab);
+    }
+}

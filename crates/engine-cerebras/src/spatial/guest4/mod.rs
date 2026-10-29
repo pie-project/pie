@@ -26,6 +26,7 @@ use serde_json::{Value as Json, json};
 
 pub mod isa;
 pub mod lane;
+pub mod wafer;
 use isa::*;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -186,9 +187,29 @@ impl Tr<'_> {
             Kind::Wide(r) => self.free_regs.push(r),
             Kind::Pool(o) => {
                 let n = s.n;
-                self.free_pool.push((o, n));
+                self.free_pool_range(o, n);
             }
             Kind::Remat(..) | Kind::Group(_) => {}
+        }
+    }
+    /// Return pool words [o, o + n): merged with free neighbours, and given
+    /// back to the top when they end there (the image's pool is the high-water
+    /// mark, so fragments would cost PE memory).
+    fn free_pool_range(&mut self, o: u32, n: u32) {
+        let (mut lo, mut hi) = (o, o + n);
+        loop {
+            if let Some(i) = self.free_pool.iter().position(|&(fo, fw)| fo + fw == lo) {
+                lo = self.free_pool.remove(i).0;
+            } else if let Some(i) = self.free_pool.iter().position(|&(fo, _)| fo == hi) {
+                hi += self.free_pool.remove(i).1;
+            } else {
+                break;
+            }
+        }
+        if hi == self.pool_top {
+            self.pool_top = lo;
+        } else {
+            self.free_pool.push((lo, hi - lo));
         }
     }
     fn at(&self, l: &Loc) -> u32 {
