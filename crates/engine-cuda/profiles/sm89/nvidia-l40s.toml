@@ -18,6 +18,7 @@ elemwise.hc_mma = true
 elemwise.norm_emit = true
 elemwise.rows_vec = true
 sdpa.merge_warp = true
+gemm.fp8_shadow = true
 
 [provenance]
 measured = [
