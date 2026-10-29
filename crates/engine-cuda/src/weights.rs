@@ -1232,9 +1232,37 @@ impl Weights {
     ) -> Result<u32> {
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        // Only banks whose selects quantize their rows in 1x128 blocks, the copy's.
+        use poem_ir::{ActQuant, Def, Fused, Linear, Operation};
+        let w128 = |op: &Linear| match op {
+            Linear::MoeSelect {
+                bank,
+                quant: Some(ActQuant::E4m3 { gran: 128 }),
+                ..
+            } => Some(*bank),
+            _ => None,
+        };
+        let mut at128 = std::collections::BTreeSet::new();
+        for node in &trace.nodes {
+            let ws: Vec<_> = match &node.op {
+                Operation::Linear(op) => w128(op).into_iter().collect(),
+                Operation::Fused(
+                    Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
+                ) => [w128(select), w128(down)].into_iter().flatten().collect(),
+                Operation::Fused(Fused::MoeSelectGlu { select, .. }) => {
+                    w128(select).into_iter().collect()
+                }
+                _ => continue,
+            };
+            for w in ws {
+                if let Some(Def::Weight(at)) = trace.values.get(w.0 as usize).map(|v| &v.def) {
+                    at128.insert(*at as usize);
+                }
+            }
+        }
         let mut done = 0;
         for (at, gran) in act_quant_banks(trace) {
-            if gran != 32 || trace.params[at].dtype != Dtype::Mxfp4 {
+            if gran != 32 || trace.params[at].dtype != Dtype::Mxfp4 || !at128.contains(&at) {
                 continue;
             }
             let Some(Some(WeightRow::Planes {
