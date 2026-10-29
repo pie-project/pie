@@ -8,9 +8,14 @@ device = "NVIDIA L40S"
 # catalog's dense models 2-8% faster on it where the tuner picks it.
 [kernel]
 gemm.rows_m = 16
-sdpa.pool_mma = true
 sdpa.index_mma = true
 sdpa.index_radix = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+elemwise.norm_emit = true
+elemwise.rows_vec = true
+sdpa.merge_warp = true
+sdpa.pool_mma = true
 sdpa.selected_mma = true
 [engine]
 forward_tokens = 2048
