@@ -53,6 +53,7 @@ pub struct FrameStamp {
 const STRICT_WATCHDOG_US: u64 = 1_000_000;
 
 const GATHER_POLL_US: u64 = 500;
+const JOIN_HOLD_US: u64 = 2_000;
 
 struct ArrivedFire {
     slot: u32,
@@ -195,6 +196,7 @@ pub(super) struct FramePolicy {
     suspended: BTreeSet<ProcessId>,
     truncated_seqs: BTreeMap<ProcessId, u64>,
     strict_watchdog_deadline: Option<Instant>,
+    join_hold: Option<Instant>,
     gather_seq: u64,
     quiesce_mark: Option<u64>,
     in_flight_lanes: BTreeSet<ProcessId>,
@@ -247,6 +249,7 @@ impl FramePolicy {
             suspended: BTreeSet::new(),
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
+            join_hold: None,
             gather_seq: 0,
             quiesce_mark: None,
             in_flight_lanes: BTreeSet::new(),
@@ -1158,6 +1161,13 @@ ready_age_newest={}us",
             self.strict_watchdog_deadline = None;
             self.idle_dumped = false;
             self.quiesce_mark = None;
+            if !executing && self.is_joining() && self.have_seal_candidate() {
+                let until = *self.join_hold.get_or_insert(now + Duration::from_micros(JOIN_HOLD_US));
+                if now < until {
+                    return FramePlan::Hold(until.saturating_duration_since(now).min(Duration::from_micros(GATHER_POLL_US)));
+                }
+            }
+            self.join_hold = None;
             match self.seal() {
                 Some(FramePlan::Dispatch(_)) => continue,
                 Some(plan) => return plan,

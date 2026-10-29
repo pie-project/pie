@@ -8,9 +8,28 @@ device = "NVIDIA L40S"
 # catalog's dense models 2-8% faster on it where the tuner picks it.
 [kernel]
 gemm.rows_m = 16
+moe.nvfp4_mma_from = 17
+moe.nvfp4_mma_until = 65536
+gemm.fp8_shadow = true
+# A single-token row of a 16-query-head group (Muse Glimmer) reads the cache
+# through the prefill kernel: c256 decode 3118 to 3173 tok/s.
+sdpa.decode.grouped_prefill_from = 16
+sdpa.index_mma = true
+sdpa.index_radix = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+elemwise.norm_emit = true
+elemwise.rows_vec = true
+sdpa.merge_warp = true
+sdpa.pool_mma = true
+sdpa.selected_mma = true
+
+[engine]
+forward_tokens = 2048
 
 [provenance]
 measured = [
+  "kernel.gemm.fp8_shadow",
   "kernel.gemm.heuristics",
   "kernel.gemm.rows_m",
   "kernel.gemm.skinny_rows",
@@ -26,17 +45,25 @@ measured = [
   "kernel.moe.mxfp4_grouped",
   "kernel.moe.mxfp4_grouped_reuse",
   "kernel.moe.mxfp4_wmma",
+  "kernel.moe.nvfp4_mma_from",
+  "kernel.moe.nvfp4_mma_until",
   "kernel.qmm.gemm_from",
   "kernel.qmm.long_rows",
   "kernel.qmm.split_thin_max",
   "kernel.qmm.split_warps_per_sm",
   "kernel.qmm.split_wide_max",
   "kernel.sdpa.decode.chunk_floor_128",
+  "kernel.sdpa.decode.grouped_prefill_from",
   "kernel.sdpa.decode.split_small",
   "kernel.sdpa.decode.split_window",
   "kernel.sdpa.decode.static_max_requests",
+  "kernel.sdpa.pool_mma",
+  "kernel.sdpa.index_mma",
+  "kernel.sdpa.index_radix",
   "kernel.sdpa.prefill.ctas_per_sm",
+  "kernel.sdpa.selected_mma",
   "engine.copies",
+  "engine.forward_tokens",
   "engine.graphs",
   "engine.lattice_steps",
   "engine.recording",

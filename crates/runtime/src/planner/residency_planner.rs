@@ -499,8 +499,6 @@ impl ResidencyPlanner {
         self.re_arm_idle_reclaim();
         if self.waiters.load(Ordering::Acquire) != 0 {
             self.poke();
-        } else {
-            self.demote_idle();
         }
     }
 
