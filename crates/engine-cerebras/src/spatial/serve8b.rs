@@ -660,6 +660,119 @@ pub fn copy_pages(lay: &Layout2d, rt: &mut crate::sdk::Runtime, pairs: &[(u32, u
     Ok(())
 }
 
+/// The 16-bit `kc`/`vc` rows a host page copy reads and writes.
+pub trait KvRows {
+    fn read16(&mut self, sym: &str, rect: Rect, n: usize) -> R<Vec<u32>>;
+    fn write16(&mut self, sym: &str, rect: Rect, n: usize, words: &[u32]) -> R<()>;
+}
+
+impl KvRows for crate::sdk::Runtime {
+    fn read16(&mut self, sym: &str, rect: Rect, n: usize) -> R<Vec<u32>> {
+        let mut out = vec![0u32; rect.w as usize * rect.h as usize * n];
+        self.memcpy_d2h(sym, &mut out, rect, n, crate::sdk::Order::RowMajor, crate::sdk::DataType::Bits16)
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    }
+
+    fn write16(&mut self, sym: &str, rect: Rect, n: usize, words: &[u32]) -> R<()> {
+        self.memcpy_h2d(sym, words, rect, n, crate::sdk::Order::RowMajor, crate::sdk::DataType::Bits16)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// One unit's share of the pool: its corner, `px` x `py` PEs, `nl` layers,
+/// `n` cells a page on a PE (PS Dc), `kcn` a layer's cells (NB n).
+struct PoolUnit {
+    x0: usize,
+    y0: usize,
+    px: usize,
+    py: usize,
+    nl: usize,
+    n: usize,
+    kcn: usize,
+}
+
+fn pool_units(lay: &Layout2d) -> R<Vec<PoolUnit>> {
+    let shape = lay.paged.ok_or("host page copies on a one-sequence build")?;
+    let of = |x0, y0, k: Kernel, nl| {
+        let n = shape.page_size * k.dc;
+        PoolUnit { x0, y0, px: k.px, py: k.py, nl, n, kcn: shape.blocks * n }
+    };
+    Ok(match lay.s8b {
+        Some(S8b::Units(u)) => u.units(lay).into_iter().map(|v| of(v.x0, v.y0, v.k, v.layers.len())).collect(),
+        Some(S8b::Strips { .. }) => {
+            let k = Kernel { px: lay.px, py: lay.py, hc: lay.hc, dc: lay.dc, gs: lay.gs, ic: lay.ic };
+            (0..lay.layers()).map(|l| lay.origin(l)).map(|(x, y)| of(x, y, k, 1)).collect()
+        }
+        None => return Err("host page copies here are serve8b's (bf16 KV)".into()),
+    })
+}
+
+/// Elements (u32 words, a bf16 each) of one pool page's host copy ([`page_out`]).
+pub fn page_words(lay: &Layout2d) -> R<usize> {
+    Ok(pool_units(lay)?.iter().map(|u| 2 * u.nl * u.px * u.n).sum())
+}
+
+/// Pool page `page`'s row and block in a unit of `py` rows, checked.
+fn page_at(lay: &Layout2d, page: u32, py: usize) -> R<(usize, usize)> {
+    let pages = lay.paged.map_or(0, |s| s.pages());
+    let g = page as usize;
+    if g >= pages {
+        return Err(format!("page {page} outside a pool of {pages}"));
+    }
+    Ok((g % py, g / py))
+}
+
+/// kv_copy device -> host (`serve_lib8b.py`'s `page_out`): pool page
+/// `page`'s K and V, every layer of every unit: for each unit in layer
+/// order, `kc` then `vc`, [layer][column][PS Dc] bf16 bits, one a word (as
+/// the 16-bit memcpy moves them). Between launches only; the device page is
+/// left as it is.
+pub fn page_out(lay: &Layout2d, dev: &mut dyn KvRows, page: u32) -> R<Vec<u32>> {
+    let mut out = Vec::with_capacity(page_words(lay)?);
+    for u in pool_units(lay)? {
+        let (row, blk) = page_at(lay, page, u.py)?;
+        let len = u.nl * u.kcn + 1;
+        for sym in ["kc", "vc"] {
+            let a = dev.read16(sym, rect(u.x0, u.y0 + row, u.px, 1), len)?;
+            for l in 0..u.nl {
+                let o = 1 + l * u.kcn + blk * u.n;
+                for c in a.chunks_exact(len) {
+                    out.extend_from_slice(&c[o..o + u.n]);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// kv_copy host -> device (`page_in`): [`page_out`]'s `data` into pool page
+/// `page` (any page: a suspended page may come back elsewhere).
+pub fn page_in(lay: &Layout2d, dev: &mut dyn KvRows, page: u32, data: &[u32]) -> R<()> {
+    let want = page_words(lay)?;
+    if data.len() != want {
+        return Err(format!("a host page of {} elements; this build's is {want}", data.len()));
+    }
+    let mut at = 0;
+    for u in pool_units(lay)? {
+        let (row, blk) = page_at(lay, page, u.py)?;
+        let len = u.nl * u.kcn + 1;
+        let row_rect = rect(u.x0, u.y0 + row, u.px, 1);
+        for sym in ["kc", "vc"] {
+            let mut a = dev.read16(sym, row_rect, len)?;
+            for l in 0..u.nl {
+                let o = 1 + l * u.kcn + blk * u.n;
+                for c in a.chunks_exact_mut(len) {
+                    c[o..o + u.n].copy_from_slice(&data[at..at + u.n]);
+                    at += u.n;
+                }
+            }
+            dev.write16(sym, row_rect, len, &a)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +809,47 @@ mod tests {
             pe(&t4, 7, 1),
             vec![C_R0, NONE_C, C_S[1], 4, C_R0, D_W, D_RAMP, D_RAMP, C_CV, D_N, D_S, D_S, C_CV2, D_N, D_S, D_S, C_S[1], D_RAMP, D_E, D_E]
         );
+    }
+
+    /// A device of `kc`/`vc` rows in memory.
+    #[derive(Default)]
+    struct Rows(std::collections::HashMap<(String, i32, i32), Vec<u32>>);
+
+    impl KvRows for Rows {
+        fn read16(&mut self, sym: &str, r: Rect, n: usize) -> R<Vec<u32>> {
+            let mut out = Vec::new();
+            for x in r.x..r.x + r.w {
+                let v = self.0.entry((sym.into(), x, r.y)).or_insert_with(|| {
+                    (0..n as i32).map(|i| ((x * 131 + r.y * 7 + i + i32::from(sym == "vc") * 5) & 0xffff) as u32).collect()
+                });
+                out.extend_from_slice(v);
+            }
+            Ok(out)
+        }
+
+        fn write16(&mut self, sym: &str, r: Rect, n: usize, words: &[u32]) -> R<()> {
+            for (j, x) in (r.x..r.x + r.w).enumerate() {
+                self.0.insert((sym.into(), x, r.y), words[j * n..(j + 1) * n].to_vec());
+            }
+            Ok(())
+        }
+    }
+
+    /// A page out and in elsewhere reads back the same; the page it came
+    /// from and the other pages on the destination rows stay as they were.
+    #[test]
+    fn host_pages_round_trip() {
+        let lay = sim();
+        let mut dev = Rows::default();
+        assert_eq!(page_words(&lay).unwrap(), 5 * 2 * 8 * 4 * 8);
+        let a = page_out(&lay, &mut dev, 3).unwrap();
+        let other = page_out(&lay, &mut dev, 21).unwrap();
+        page_in(&lay, &mut dev, 5, &a).unwrap();
+        assert_eq!(page_out(&lay, &mut dev, 5).unwrap(), a);
+        assert_eq!(page_out(&lay, &mut dev, 3).unwrap(), a);
+        assert_eq!(page_out(&lay, &mut dev, 21).unwrap(), other);
+        assert!(page_in(&lay, &mut dev, 32, &a).is_err());
+        assert!(page_in(&lay, &mut dev, 1, &a[1..]).is_err());
     }
 
     /// 0115's Qwen3-8B build: every grid's table is built (36 grids, strips
