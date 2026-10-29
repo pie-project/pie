@@ -699,9 +699,9 @@ def v4(dims, w, r, quant = None):
 SHIPS = [
     ("dsv41-flash", U4, BF, None, v41(V41, U4, uniform(U4))),
     ("dsv41-flash", [BF, FP4], BF, None, v41(V41, BF, uniform(FP4))),
+    ("dsv41-flash-mini", MX8, BF, None, v41(V41_MINI, BF, uniform(MX8[1]), MX8[0])),
     ("dsv41-flash-mini", [BF, FP4], BF, None, v41(V41_MINI, BF, uniform(FP4))),
     ("dsv41-flash", MX8, BF, None, v41(V41, BF, uniform(MX8[1]), MX8[0])),
-    ("dsv41-flash-mini", MX8, BF, None, v41(V41_MINI, BF, uniform(MX8[1]), MX8[0])),
     ("dsv41-flash-trunc8", MX8, BF, None, v41(V41_TRUNC8, BF, uniform(MX8[1]), MX8[0])),
     ("dsv41-flash", MX8, dtype.nvfp4, None, v41(V41, BF, uniform(MX8[1]), MX8[0])),
     ("dsv41-flash-mini", MX8, dtype.nvfp4, None, v41(V41_MINI, BF, uniform(MX8[1]), MX8[0])),
@@ -716,8 +716,8 @@ SHIPS = [
     ("dsv4-flash", [U4, U2], BF, None, v4(V4, U4, DQ_2BIT_FULL)),
     ("dsv4-flash-mini", [U4, U2], BF, None, v4(V4_MINI, U4, DQ_2BIT)),
     ("dsv4-flash-mini", BF, BF, None, v4(V4_MINI, BF, uniform(BF))),
-    ("dsv4-flash-mini", [BF, FP4], BF, None, v4(V4_MINI, BF, uniform(FP4))),
     ("dsv4-flash-mini", W8A8, BF, None, v4(V4_MINI, BF, uniform(W8A8[1]), W8A8[0])),
+    ("dsv4-flash-mini", [BF, FP4], BF, None, v4(V4_MINI, BF, uniform(FP4))),
     # DeepSeek's fp8 rows (FlashMLA's fp8_ds_mla), the kv vLLM serves V4 at.
     ("dsv4-flash", W8A8, dtype.e4m3, None, v4(V4, BF, uniform(W8A8[1]), W8A8[0])),
     ("dsv4-flash-mini", W8A8, dtype.e4m3, None, v4(V4_MINI, BF, uniform(W8A8[1]), W8A8[0])),
