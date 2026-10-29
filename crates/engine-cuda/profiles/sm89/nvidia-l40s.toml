@@ -10,6 +10,7 @@ device = "NVIDIA L40S"
 gemm.rows_m = 16
 sdpa.pool_mma = true
 sdpa.selected_mma = true
+ssm.kda_chunked = true
 
 [provenance]
 measured = [
@@ -40,6 +41,7 @@ measured = [
   "kernel.sdpa.pool_mma",
   "kernel.sdpa.prefill.ctas_per_sm",
   "kernel.sdpa.selected_mma",
+  "kernel.ssm.kda_chunked",
   "engine.copies",
   "engine.graphs",
   "engine.lattice_steps",
