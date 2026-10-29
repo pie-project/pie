@@ -30,6 +30,11 @@ checkpoint = { path = "../checkpoint" }
 tracing = "0.1"
 blake3 = "1"
 
+[features]
+# The spatial engine's model daemon (`[cerebras.spatial] daemon`, e.g. the
+# Python reference): a test reference, not a serving path; off by default.
+spatial-daemon = []
+
 [dev-dependencies]
 sha2 = "0.10"
 poem = { package = "pie-poem", path = "../poem" }

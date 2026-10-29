@@ -3,104 +3,104 @@
 //! will post is posted. An engine that runs ahead of the fires it is given
 //! (a device token loop) asks so it stops where the pipeline will.
 //!
-//! The runtime tells this table which frames each pipeline posted and when
-//! it closed, and notes each fire it hands an engine by the lane's KV slot
-//! and the rows it held before the fire (which name one fire of one
-//! sequence). The answer is worked out when the engine asks, not when the
+//! The runtime's pipeline keeps its [`Posts`] (the frames it posted, whether
+//! it closed) and every fire it hands an engine carries an [`Ahead`] on its
+//! lanes ([`crate::fire::Lane::ahead`]): a share of those posts and the
+//! fire's place. The answer is worked out when the engine asks, not when the
 //! fire was handed over: a fire is often handed over before its pipeline
-//! has closed. Notes are taken when read; the tables are bounded (the oldest
-//! go first).
+//! has closed. Nothing is global; an engine in another process sees `None`.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::{LazyLock, Mutex};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
-const CAP: usize = 4096;
-
-/// A fire's place: its pipeline, its frame's sequence number, its slot in
-/// the frame and the frame's fires.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Place {
-    pub pipeline: u128,
-    pub seq: u64,
-    pub slot: u32,
-    pub fires: u32,
+/// A pipeline's posted frames and whether it has closed: the runtime's
+/// pipeline holds it and every fire it hands an engine carries a share of
+/// it ([`Ahead`], on the fire's lanes), so the answer comes from the fire
+/// itself and reflects a close that happens after the hand-over.
+#[derive(Debug, Default)]
+pub struct Posts {
+    inner: Mutex<PostsInner>,
 }
 
-#[derive(Default)]
-struct Posted {
+#[derive(Debug, Default)]
+struct PostsInner {
     /// Fires of each frame, by its sequence number.
     frames: BTreeMap<u64, u32>,
     closed: bool,
 }
 
-#[derive(Default)]
-struct Notes {
-    pipelines: HashMap<u128, Posted>,
-    fires: HashMap<(u32, u32), Place>,
-    order: VecDeque<(u32, u32)>,
+impl Posts {
+    fn with<T>(&self, f: impl FnOnce(&mut PostsInner) -> T) -> T {
+        f(&mut self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
+    /// Frame `seq` of `fires` fires was posted.
+    pub fn posted(&self, seq: u64, fires: u32) {
+        self.with(|p| {
+            p.frames.insert(seq, fires);
+        });
+    }
+
+    /// The pipeline posts no more.
+    pub fn closed(&self) {
+        self.with(|p| p.closed = true);
+    }
 }
 
-static NOTES: LazyLock<Mutex<Notes>> = LazyLock::new(Default::default);
-
-fn with<T>(f: impl FnOnce(&mut Notes) -> T) -> T {
-    f(&mut NOTES.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+/// One fire's place in its pipeline, on each of its lanes
+/// ([`crate::fire::Lane::ahead`]): the pipeline's [`Posts`], its frame's
+/// sequence number, its slot in the frame and the frame's fires. Not sent
+/// across a process boundary (an engine there sees `None`).
+#[derive(Clone, Debug)]
+pub struct Ahead {
+    pub posts: Arc<Posts>,
+    pub seq: u64,
+    pub slot: u32,
+    pub fires: u32,
 }
 
-/// `pipeline` posted frame `seq` of `fires` fires.
-pub fn posted(pipeline: u128, seq: u64, fires: u32) {
-    with(|n| {
-        n.pipelines.entry(pipeline).or_default().frames.insert(seq, fires);
-    });
+impl PartialEq for Ahead {
+    fn eq(&self, other: &Ahead) -> bool {
+        Arc::ptr_eq(&self.posts, &other.posts)
+            && (self.seq, self.slot, self.fires) == (other.seq, other.slot, other.fires)
+    }
 }
 
-/// `pipeline` posts no more.
-pub fn closed(pipeline: u128) {
-    with(|n| {
-        if let Some(p) = n.pipelines.get_mut(&pipeline) {
-            p.closed = true;
-        }
-    });
-}
+impl Eq for Ahead {}
 
-/// `pipeline` is gone.
-pub fn gone(pipeline: u128) {
-    with(|n| {
-        n.pipelines.remove(&pipeline);
-    });
-}
-
-/// The fire of `slot` at `held` rows is the one at `place`.
-pub fn note(slot: u32, held: u32, place: Place) {
-    with(|n| {
-        if n.fires.insert((slot, held), place).is_none() {
-            n.order.push_back((slot, held));
-        }
-        while n.order.len() > CAP {
-            if let Some(old) = n.order.pop_front() {
-                n.fires.remove(&old);
+impl Ahead {
+    /// The fires known to follow this one, once its pipeline has closed
+    /// (until then, `None`): the rest of its frame and every later frame.
+    #[must_use]
+    pub fn fires_left(&self) -> Option<u32> {
+        self.posts.with(|p| {
+            // Frames before this one have been run.
+            p.frames = p.frames.split_off(&self.seq);
+            if !p.closed {
+                return None;
             }
-        }
-    });
+            let later: u32 = p.frames.range(self.seq + 1..).map(|(_, &fires)| fires).sum();
+            Some(later + self.fires.saturating_sub(self.slot + 1))
+        })
+    }
 }
 
-/// The fires known to follow the fire of `slot` at `held` rows (its
-/// pipeline closed), if it was noted.
-#[must_use]
-pub fn take(slot: u32, held: u32) -> Option<u32> {
-    with(|n| {
-        let place = n.fires.remove(&(slot, held))?;
-        n.order.retain(|key| *key != (slot, held));
-        let posted = n.pipelines.get_mut(&place.pipeline)?;
-        // Frames before this one have been run.
-        posted.frames = posted.frames.split_off(&place.seq);
-        if !posted.closed {
-            return None;
-        }
-        let later: u32 = posted
-            .frames
-            .range(place.seq + 1..)
-            .map(|(_, &fires)| fires)
-            .sum();
-        Some(later + place.fires.saturating_sub(place.slot + 1))
-    })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fires_left_counts_once_the_pipeline_closes() {
+        let posts = Arc::new(Posts::default());
+        posts.posted(0, 2);
+        let a = Ahead { posts: posts.clone(), seq: 0, slot: 0, fires: 2 };
+        assert_eq!(a.fires_left(), None);
+        posts.posted(1, 3);
+        posts.closed();
+        assert_eq!(a.fires_left(), Some(1 + 3));
+        let b = Ahead { posts: posts.clone(), seq: 1, slot: 2, fires: 3 };
+        assert_eq!(b.fires_left(), Some(0));
+        assert_eq!(a.clone(), a);
+        assert_ne!(a, Ahead { posts: Arc::new(Posts::default()), seq: 0, slot: 0, fires: 2 });
+    }
 }

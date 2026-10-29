@@ -42,12 +42,32 @@ pub(super) fn idle_dump_threshold_us() -> u64 {
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Equal by place (the posts are the pipeline's, not part of the stamp's
+/// identity).
+#[derive(Clone, Debug)]
 pub struct FrameStamp {
     pub lane: ProcessId,
     pub seq: u64,
     pub slot: u32,
     pub fires: u32,
+    /// Its pipeline's posts (`engine::ahead`).
+    pub posts: std::sync::Arc<::engine::ahead::Posts>,
+}
+
+impl PartialEq for FrameStamp {
+    fn eq(&self, other: &FrameStamp) -> bool {
+        (self.lane, self.seq, self.slot, self.fires) == (other.lane, other.seq, other.slot, other.fires)
+    }
+}
+
+impl Eq for FrameStamp {}
+
+impl FrameStamp {
+    /// This fire's place, as its lanes carry it to the engine.
+    #[must_use]
+    pub fn ahead(&self) -> ::engine::ahead::Ahead {
+        ::engine::ahead::Ahead { posts: self.posts.clone(), seq: self.seq, slot: self.slot, fires: self.fires }
+    }
 }
 
 const STRICT_WATCHDOG_US: u64 = 1_000_000;
@@ -285,11 +305,12 @@ impl FramePolicy {
         readouts: usize,
     ) {
         let accept_began = self.stats.is_some().then(Instant::now);
+        let slot = stamp.slot;
         self.record_arrival(
             stamp,
             owner,
             ArrivedFire {
-                slot: stamp.slot,
+                slot,
                 fire_id: Some(fire_id),
                 tokens,
                 rows,
@@ -308,11 +329,12 @@ impl FramePolicy {
     }
 
     pub fn on_fire_rejected_at_admission(&mut self, stamp: FrameStamp, owner: Option<ProcessId>) {
+        let slot = stamp.slot;
         self.record_arrival(
             stamp,
             owner,
             ArrivedFire {
-                slot: stamp.slot,
+                slot,
                 fire_id: None,
                 tokens: 0,
                 rows: 0,
@@ -1204,6 +1226,7 @@ mod tests {
             seq,
             slot,
             fires,
+            posts: std::sync::Arc::default(),
         }
     }
 

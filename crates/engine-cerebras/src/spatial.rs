@@ -3,7 +3,9 @@
 //! protocol — and everything else stays as the cerebras engine has it: guest
 //! (eta) programs in the host interpreter, channels, the runtime's frames.
 //!
-//! The daemon is a child process speaking JSON lines on stdin/stdout
+//! The daemon (a test reference, e.g. the Python model; only a build with
+//! the `spatial-daemon` feature runs one) is a child process speaking JSON
+//! lines on stdin/stdout
 //! (`spatial/serve/README.md` in the bring-up tree):
 //!
 //! ```text
@@ -2093,7 +2095,7 @@ impl Spatial {
                     .get(&at)
                     .is_some_and(|&instance| self.programs.greedy_reads(instance, &name))
                     && step.attachments.iter().filter(|a| !a.adapter_only).count() == 1;
-                let ahead = engine::ahead::take(lane.slot, lane.kv.held);
+                let ahead = lane.ahead.as_ref().and_then(engine::ahead::Ahead::fires_left);
                 let first_slot = port_slots
                     .get(&at)
                     .and_then(|s| s.first().copied())
@@ -2515,6 +2517,15 @@ impl Engine for Spatial {
             paged_model = w.paged.is_some();
             Model::Wafer(w)
         } else {
+            // The daemon is a test reference (the Python model), not a
+            // serving path: only a build with `spatial-daemon` runs one.
+            if !cfg!(feature = "spatial-daemon") {
+                return Err(Error::Load(
+                    "[cerebras.spatial] names no wafer program (`program`, `params` or `serve`); a model \
+                     `daemon` is a test reference, run only by a build with the `spatial-daemon` feature"
+                        .into(),
+                ));
+            }
             let cmd = self.spatial.daemon.clone().unwrap_or_default();
             let mut daemon = Daemon::spawn(&cmd)?;
             let mut load = serde_json::json!({

@@ -1529,6 +1529,9 @@ impl BatchScheduler {
                             seq: launch.logical_fire_id,
                             slot: 0,
                             fires: 1,
+                            // A frame of its own the pipeline never posted:
+                            // no fires known past it.
+                            posts: std::sync::Arc::default(),
                         });
                     }
                     if wave_trace() {
@@ -1543,7 +1546,7 @@ impl BatchScheduler {
                             launch.pipeline_id.is_some()
                         ));
                     }
-                    if let Some(stamp) = launch.frame {
+                    if let Some(stamp) = launch.frame.clone() {
                         frame_policy.on_fire_reading(
                             stamp,
                             launch.process_id,

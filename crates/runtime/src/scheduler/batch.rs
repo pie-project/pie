@@ -146,19 +146,9 @@ pub(crate) fn build_batch_request(
         // Group ids renumber past earlier members', so two passes' groups never merge.
         let mut groups = 0u32;
         for req in requests {
-            // How far this fire's pipeline runs past it, for an engine that
-            // runs ahead (a device token loop).
-            if let Some(stamp) = &req.frame {
-                let place = ::engine::ahead::Place {
-                    pipeline: stamp.lane.as_u128(),
-                    seq: stamp.seq,
-                    slot: stamp.slot,
-                    fires: stamp.fires,
-                };
-                for lane in &req.request.lanes {
-                    ::engine::ahead::note(lane.slot, lane.kv.held, place);
-                }
-            }
+            // Where this fire sits in its pipeline, on each of its lanes, for
+            // an engine that runs ahead (a device token loop).
+            let ahead = req.frame.as_ref().map(crate::scheduler::FrameStamp::ahead);
             boundary_programs.push(req.request.boundary_program);
             instance_ids.push(req.instance_id);
             terminal_cells.push(req.completion.terminal_cell_ptr());
@@ -167,6 +157,7 @@ pub(crate) fn build_batch_request(
             let base = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
             let mut own: Vec<u32> = Vec::new();
             lanes.extend(req.request.lanes.iter().cloned().map(|mut lane| {
+                lane.ahead.clone_from(&ahead);
                 lane.group = lane.group.map(|id| {
                     let local = own.iter().position(|&seen| seen == id).unwrap_or_else(|| {
                         own.push(id);

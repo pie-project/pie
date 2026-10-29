@@ -2894,7 +2894,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     copy_src,
                     copy_dst,
                     rs_copy,
-                    piece_frames[at],
+                    piece_frames[at].clone(),
                     adapted,
                 )
                 .err()
@@ -2970,13 +2970,13 @@ pub(crate) fn piece_frames(
                         seq,
                         slot: (at % k) as u32,
                         fires: (pieces - first).min(k) as u32,
-                        ..stamp
+                        ..stamp.clone()
                     })
                 })
                 .collect()
         }
         frame => (0..pieces)
-            .map(|at| if at + 1 == pieces { frame } else { None })
+            .map(|at| if at + 1 == pieces { frame.clone() } else { None })
             .collect(),
     }
 }
@@ -3027,21 +3027,22 @@ pub async fn submit_frame<C: FireContext>(
             return Ok(Err(error));
         }
     }
-    let (lane, seq) = {
+    let (lane, seq, posts) = {
         let pipeline = ctx.resources().get(&this)?;
         if pipeline.scope.is_closed() {
             return Ok(Err("pipeline: pipeline is closed".to_string()));
         }
-        (pipeline.scope.scheduler_id(), pipeline.next_frame_seq())
+        (pipeline.scope.scheduler_id(), pipeline.next_frame_seq(), pipeline.posts.clone())
     };
     let fires = fired.len() as u32;
-    ::engine::ahead::posted(lane.as_u128(), seq, fires);
+    posts.posted(seq, fires);
     for (index, &(slot, rep)) in fired.iter().enumerate() {
         let stamp = crate::scheduler::FrameStamp {
             lane,
             seq,
             slot,
             fires,
+            posts: posts.clone(),
         };
         let pipeline: Resource<Pipeline> = Resource::new_borrow(this.rep());
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
@@ -3205,6 +3206,9 @@ async fn pipeline_close_inner<C: FireContext>(
 ) -> Anyhow<()> {
     let state = ctx.resources().get(this).ok().map(|pipeline| {
         let first_close = pipeline.scope.close();
+        if first_close {
+            pipeline.posts.closed();
+        }
         (
             first_close,
             pipeline.scope.scheduler_id(),
@@ -3213,7 +3217,6 @@ async fn pipeline_close_inner<C: FireContext>(
     });
     if let Some((first_close, pipeline_id, fires)) = state {
         if first_close {
-            ::engine::ahead::closed(pipeline_id.as_u128());
             crate::scheduler::worker::notify_lane_close(pipeline_id, None);
         }
         drain_settled(ctx, Some(&fires)).await?;
@@ -3227,9 +3230,6 @@ pub async fn pipeline_close<C: FireContext>(ctx: &mut C, this: Resource<Pipeline
 
 pub async fn pipeline_drop<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
     pipeline_close_inner(ctx, &this).await?;
-    if let Ok(pipeline) = ctx.resources().get(&this) {
-        ::engine::ahead::gone(pipeline.scope.scheduler_id().as_u128());
-    }
     ctx.resources().delete(this)?;
     Ok(())
 }

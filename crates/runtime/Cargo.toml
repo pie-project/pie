@@ -143,6 +143,7 @@ vulkan = ["dep:engine-vulkan", "engine-vulkan/vulkan"]
 wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu", "dep:wgpu"]
 xla = ["dep:engine-xla"]
 cerebras = ["dep:engine-cerebras"]
+spatial-daemon = ["cerebras", "engine-cerebras/spatial-daemon"]
 profile-fire = []
 
 [dev-dependencies]
