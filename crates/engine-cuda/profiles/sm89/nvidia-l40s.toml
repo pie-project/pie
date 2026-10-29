@@ -27,7 +27,7 @@ moe.bf16_mma_from = 16
 moe.bf16_mma_until = 65536
 
 [engine]
-forward_tokens = 2048
+forward_tokens = 8192
 
 [provenance]
 measured = [
