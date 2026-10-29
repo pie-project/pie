@@ -684,7 +684,7 @@ fn product(
 }
 
 /// The most scratch the untimed unfused leg's products take at once.
-const UNFUSED_BYTES: usize = 64 << 20;
+const UNFUSED_BYTES: usize = 128 << 20;
 
 /// The plane an anchored region's unfused leg lands its products in.
 const ANCHOR_PRODUCTS: &str = "linear.anchor_products";
