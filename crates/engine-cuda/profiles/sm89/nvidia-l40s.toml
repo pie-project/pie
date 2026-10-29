@@ -9,6 +9,9 @@ device = "NVIDIA L40S"
 [kernel]
 gemm.rows_m = 16
 
+[engine]
+forward_tokens = 2048
+
 [provenance]
 measured = [
   "kernel.gemm.heuristics",
@@ -37,6 +40,7 @@ measured = [
   "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.prefill.ctas_per_sm",
   "engine.copies",
+  "engine.forward_tokens",
   "engine.graphs",
   "engine.lattice_steps",
   "engine.recording",
