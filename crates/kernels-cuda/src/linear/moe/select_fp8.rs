@@ -153,6 +153,7 @@ pub fn select_fp8_w8a8(
         17..=40 => 4,
         _ => 8,
     };
+    let wn: u32 = if nb == 8 { 2 } else { 1 };
     let RouteOrder {
         order,
         offsets,
@@ -176,10 +177,10 @@ pub fn select_fp8_w8a8(
         OP,
         Fire::at(kernel(
             SELECT_SM80,
-            &format!("::pie::linear::moe_select_fp8a8_mma<{nb}, false>"),
+            &format!("::pie::linear::moe_select_fp8a8_mma<{nb}, false, {wn}>"),
         ))
         .apply(
-            Launch::grid([work_cap, y.width.div_ceil(128), 1], [128, 1, 1]).smem(fp8_mma_smem(nb)),
+            Launch::grid([work_cap, y.width.div_ceil(128), 1], [128 * wn, 1, 1]).smem(fp8_mma_smem(nb)),
         ),
         &[
             ArgValue::Ptr(xq),
