@@ -481,8 +481,8 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_fp8_mma(
 /// 16-byte chunks turned by its low three bits so a quarter-warp's reads
 /// span the banks. Each lane reads K 16c..16c+15 of its rows a stage, the
 /// order inside the 64 permuted alike for both operands.
-template <int kStages, int kGlu, int kWN>
-__global__ void __launch_bounds__(64 * kWN) moe_select_bf16_gemm(
+template <int kStages, int kGlu, int kWN, int kBM = 64>
+__global__ void __launch_bounds__(kBM * kWN) moe_select_bf16_gemm(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
     const i32* __restrict__ offsets,
@@ -497,12 +497,11 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_bf16_gemm(
     float limit,
     float galpha)
 {
-    constexpr int kBM = 64;
     constexpr int kBN = 128;
     constexpr int kABytes = kBM * 128;
     constexpr int kStageBytes = kABytes + kBN * 128;
     // `kWN` warps along the rows, a warp's rows `kNT` n8 tiles.
-    constexpr int kThreads = 64 * kWN;
+    constexpr int kThreads = kBM * kWN;
     constexpr int kNT = kBN / (8 * kWN);
     constexpr int kWRows = 8 * kNT;
     constexpr int kACopies = kBM * 8 / kThreads;
