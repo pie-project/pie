@@ -8,6 +8,9 @@ device = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 attn.qkv_rows_from = 88  # 1.4% faster end to end
 moe.mxfp4_mma_from = 49  # 2.9% faster end to end
 moe.mxfp4_select_lean = true  # 1.7% faster end to end
+# bf16 MoE routes past one token on the grouped mma.sync kernel: Qwen3.6-35B-A3B c128 1,489 -> 3,590 tok/s
+moe.bf16_mma_from = 16
+moe.bf16_mma_until = 65536
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"
