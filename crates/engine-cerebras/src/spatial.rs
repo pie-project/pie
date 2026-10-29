@@ -279,7 +279,10 @@ impl Model {
                 serde_json::json!({
                     "tokens": lane.tokens, "slots": lane.slots, "positions": lane.positions,
                     "pages": lane.pages, "visible": lane.visible,
+                    // An argmax-only lane takes the daemon's argmax: no row
+                    // of the vocabulary crosses the pipe.
                     "logits": match lane.which {
+                        _ if lane.argmax_only => "none",
                         wafer::Logits::None => "none",
                         wafer::Logits::Last => "last",
                         wafer::Logits::All => "all",
@@ -288,6 +291,10 @@ impl Model {
             })
             .collect();
         let answer = d.call(&serde_json::json!({"op": "fire", "lanes": request}))?;
+        let lane_answers: &[serde_json::Value] = answer
+            .get("lanes")
+            .and_then(serde_json::Value::as_array)
+            .map_or(&[], Vec::as_slice);
         let rows = |v: &serde_json::Value| -> Vec<Vec<f32>> {
             v.get("logits")
                 .and_then(serde_json::Value::as_array)
@@ -306,21 +313,21 @@ impl Model {
                 })
                 .unwrap_or_default()
         };
-        let answers: Vec<Vec<Vec<f32>>> = answer
-            .get("lanes")
-            .and_then(serde_json::Value::as_array)
-            .map(|lanes| lanes.iter().map(rows).collect())
-            .unwrap_or_default();
-        // The daemon answers logits only: an argmax-only lane's is taken here.
-        Ok(answers
-            .into_iter()
+        Ok(lane_answers
+            .iter()
             .zip(lanes)
-            .map(|(rows, lane)| {
+            .map(|(answer, lane)| {
                 if lane.argmax_only {
-                    let token = rows.last().map(|row| argmax(row));
+                    // The last row's argmax, as the daemon took it.
+                    let token = answer
+                        .get("argmax")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|a| a.last())
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|t| t as u32);
                     (Vec::new(), token)
                 } else {
-                    (rows, None)
+                    (rows(answer), None)
                 }
             })
             .collect())
@@ -580,16 +587,6 @@ fn fire_batched(w: &mut wafer::Wafer, lanes: &[&PagedLane]) -> EngineResult<Vec<
 /// A paged lane's answer: its logits rows, or (argmax only) its last row's
 /// argmax.
 type PagedAnswer = (Vec<Vec<f32>>, Option<u32>);
-
-fn argmax(row: &[f32]) -> u32 {
-    let mut best = 0;
-    for (i, &x) in row.iter().enumerate() {
-        if x > row[best] {
-            best = i;
-        }
-    }
-    best as u32
-}
 
 /// One lane of a fire on a paged model.
 struct PagedLane {
