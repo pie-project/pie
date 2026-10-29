@@ -201,7 +201,10 @@ impl Shell {
                 continue;
             };
             let planes = match table.0.get(at).copied().flatten() {
-                _ if table.1.contains_key(&at) || table.2.contains_key(&at) => {
+                _ if table.1.contains_key(&at)
+                    || table.2.contains_key(&at)
+                    || table.3.contains_key(&at) =>
+                {
                     Err(format!("`{}` is requantized at load", param.name))
                 }
                 Some(WeightRow::Dense(t)) => Ok(vec![t]),

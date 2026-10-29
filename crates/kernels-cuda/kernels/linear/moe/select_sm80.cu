@@ -958,7 +958,7 @@ __global__ void __launch_bounds__(128 * kWN) moe_select_fp8a8_mma(
     constexpr int kSlice = 8 * kNb;           // routes a slice (B of the GEMM)
     constexpr int kBK = 128;                  // K a step: one block's codes
     constexpr int kPad = kBK + 16;            // smem row stride in bytes (ldmatrix)
-    constexpr int kStages = kFp8a8Stages;
+    constexpr int kStages = kNb == 16 ? 2 : kFp8a8Stages;
     constexpr int kChunks = kBK / 16;
     constexpr int kStage = (kRowsCta + kSlice) * kPad;
 
