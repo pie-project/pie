@@ -6,7 +6,7 @@
 load("//pie/codec.poem", "stacked_bank", read_fused = "fused")
 load("//lib/adapters.poem", "banks", "corrected")
 
-ATEM = template("atem")
+ATEM = template("atem_open")
 
 TOKENIZER = tokenizer(markers = [["<|eot|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"]])
 

@@ -481,8 +481,8 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_fp8_mma(
 /// 16-byte chunks turned by its low three bits so a quarter-warp's reads
 /// span the banks. Each lane reads K 16c..16c+15 of its rows a stage, the
 /// order inside the 64 permuted alike for both operands.
-template <int kStages, int kGlu, int kWN>
-__global__ void __launch_bounds__(64 * kWN) moe_select_bf16_gemm(
+template <int kStages, int kGlu, int kWN, int kBM = 64>
+__global__ void __launch_bounds__(kBM * kWN) moe_select_bf16_gemm(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
     const i32* __restrict__ offsets,
@@ -497,19 +497,20 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_bf16_gemm(
     float limit,
     float galpha)
 {
-    constexpr int kBM = 64;
     constexpr int kBN = 128;
     constexpr int kABytes = kBM * 128;
     constexpr int kStageBytes = kABytes + kBN * 128;
     // `kWN` warps along the rows, a warp's rows `kNT` n8 tiles.
-    constexpr int kThreads = 64 * kWN;
+    constexpr int kThreads = kBM * kWN;
     constexpr int kNT = kBN / (8 * kWN);
     constexpr int kWRows = 8 * kNT;
     constexpr int kACopies = kBM * 8 / kThreads;
     constexpr int kBCopies = kBN * 8 / kThreads;
 
-    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
-    const int item = work[blockIdx.x];
+    const int cta = static_cast<int>(blockIdx.y * gridDim.x + blockIdx.x);
+    const int bx = cta / static_cast<int>(gridDim.y);
+    if (bx >= offsets[num_experts + 1]) return;
+    const int item = work[bx];
     const int expert = item >> 16;
     const int slice = item & 0xFFFF;
     const int begin = offsets[expert] + slice * kBM;
@@ -524,7 +525,7 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_bf16_gemm(
     const int g = lane >> 2;
     const int t = lane & 3;
     // The CTA's first output column: 64 GLU columns, else 128 rows.
-    const int c0 = static_cast<int>(blockIdx.y) * (kGlu != 0 ? 64 : kBN);
+    const int c0 = cta % static_cast<int>(gridDim.y) * (kGlu != 0 ? 64 : kBN);
     // Local B row -> bank row: a GLU warp's half-tile of gate columns, then
     // their up.
     auto bank_row = [&](int rr) {
@@ -938,8 +939,8 @@ constexpr int kFp8a8Stages = 3;
 /// `offsets`, `work` unread, a CTA the `kSlice` rows at `blockIdx.x`), K
 /// split `gridDim.z` ways: each split's f32 sums into `part`
 /// (`[splits][rows][n]`) for `fp8a8_fold`, or one split's straight out.
-template <int kNb, bool kDense>
-__global__ void __launch_bounds__(128) moe_select_fp8a8_mma(
+template <int kNb, bool kDense, int kWN = 1>
+__global__ void __launch_bounds__(128 * kWN) moe_select_fp8a8_mma(
     const u8* __restrict__ xq,
     const u8* __restrict__ xe,
     const i32* __restrict__ order,
@@ -979,7 +980,9 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_mma(
     };
 
     const int tid = static_cast<int>(threadIdx.x);
-    const int warp = tid >> 5;
+    const int warp = (tid >> 5) & 3;
+    const int wb = tid >> 7;
+    constexpr int kNbW = kNb / kWN;
     const int lane = tid & 31;
     const int g = lane >> 2;
     const int c = lane & 3;
@@ -1002,7 +1005,7 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_mma(
         u8* sX = sW + kRowsCta * kPad;
         const int k0 = step * kBK;
 #pragma unroll
-        for (int i = tid; i < kRowsCta * kChunks; i += 128) {
+        for (int i = tid; i < kRowsCta * kChunks; i += 128 * kWN) {
             const int row = i / kChunks;
             const int ch = (i % kChunks) * 16;
             u8* dst = sW + row * kPad + ch;
@@ -1013,7 +1016,7 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_mma(
                 *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
             }
         }
-        for (int i = tid; i < kSlice * kChunks; i += 128) {
+        for (int i = tid; i < kSlice * kChunks; i += 128 * kWN) {
             const int tok = i / kChunks;
             const int ch = (i % kChunks) * 16;
             u8* dst = sX + tok * kPad + ch;
@@ -1028,20 +1031,20 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_mma(
 
     // The activation rows of this lane's two columns in each 8-route block
     // (C's columns 2c and 2c + 1), -1 past the slice.
-    int xrow[kNb][2];
+    int xrow[kNbW][2];
 #pragma unroll
-    for (int b = 0; b < kNb; ++b)
+    for (int b = 0; b < kNbW; ++b)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const int tok = 8 * b + 2 * c + h;
+            const int tok = 8 * (b + wb * kNbW) + 2 * c + h;
             xrow[b][h] = tok < count ? act_row(tok) : -1;
         }
 
-    float acc[kTiles][kNb][4];
+    float acc[kTiles][kNbW][4];
 #pragma unroll
     for (int t = 0; t < kTiles; ++t)
 #pragma unroll
-        for (int b = 0; b < kNb; ++b)
+        for (int b = 0; b < kNbW; ++b)
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
 
@@ -1059,11 +1062,11 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_mma(
 
         const u8* sW = smem + ((s - s_lo) % kStages) * kStage;
         const u8* sX = sW + kRowsCta * kPad;
-        float blk[kTiles][kNb][4];
+        float blk[kTiles][kNbW][4];
 #pragma unroll
         for (int t = 0; t < kTiles; ++t)
 #pragma unroll
-            for (int b = 0; b < kNb; ++b)
+            for (int b = 0; b < kNbW; ++b)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) blk[t][b][e] = 0.f;
         // The bf16 ldmatrix loads read e4m3 fragments: a 16-byte row of an
@@ -1071,10 +1074,10 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_mma(
         // m16n8k32's A and B fragments take.
 #pragma unroll
         for (int kk = 0; kk < kBK; kk += 32) {
-            unsigned bk[kNb][2];
+            unsigned bk[kNbW][2];
 #pragma unroll
-            for (int b = 0; b < kNb; ++b) {
-                ld_b(bk[b], reinterpret_cast<const bf16*>(sX + 8 * b * kPad + kk), kPad / 2, lane);
+            for (int b = 0; b < kNbW; ++b) {
+                ld_b(bk[b], reinterpret_cast<const bf16*>(sX + 8 * (b + wb * kNbW) * kPad + kk), kPad / 2, lane);
             }
 #pragma unroll
             for (int t = 0; t < kTiles; ++t) {
@@ -1082,7 +1085,7 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_mma(
                 ld_a(a, reinterpret_cast<const bf16*>(sW + (warp * kRowsWarp + 16 * t) * kPad + kk),
                      kPad / 2, lane);
 #pragma unroll
-                for (int b = 0; b < kNb; ++b) {
+                for (int b = 0; b < kNbW; ++b) {
                     gfp8::mma(blk[t][b], a[0], a[1], a[2], a[3], bk[b][0], bk[b][1]);
                 }
             }
@@ -1090,7 +1093,7 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_mma(
         // The CTA's 128 rows are one block's: one weight exponent a step.
         const float sw = gfp8::exp2_biased(atoms_at[(s / 4) * 512 + s % 4]);
 #pragma unroll
-        for (int b = 0; b < kNb; ++b) {
+        for (int b = 0; b < kNbW; ++b) {
             const float s0 = xrow[b][0] >= 0 ? sw * gfp8::exp2_biased(xe[xrow[b][0] * blocks + s]) : 0.f;
             const float s1 = xrow[b][1] >= 0 ? sw * gfp8::exp2_biased(xe[xrow[b][1] * blocks + s]) : 0.f;
 #pragma unroll
@@ -1108,10 +1111,10 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_mma(
 #pragma unroll
         for (int t = 0; t < kTiles; ++t)
 #pragma unroll
-            for (int b = 0; b < kNb; ++b)
+            for (int b = 0; b < kNbW; ++b)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    const int tok = 8 * b + 2 * c + (e & 1);
+                    const int tok = 8 * (b + wb * kNbW) + 2 * c + (e & 1);
                     const int row = row_base + 16 * t + g + (e >= 2 ? 8 : 0);
                     if (tok < count && row < n) {
                         const long long at = static_cast<long long>(begin + tok) * n + row;
@@ -1124,7 +1127,7 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_mma(
                 }
     } else {
         auto factor = [&](int) { return 1.f; };
-        w4mma::w4_land<0, kTiles, kNb>(acc, factor, nullptr, order, begin, count, out, n, n,
+        w4mma::w4_land<0, kTiles, kNbW>(acc, factor, nullptr, order, begin + 8 * kNbW * wb, count - 8 * kNbW * wb, out, n, n,
                                        row_base, g, c, 0.f, 1.f);
     }
 }

@@ -9,6 +9,7 @@ assumes = { cc = 89 }
 # 57% less GPU time than on the three wmma launches.
 [kernel]
 ssm.gdn_fused_scan = true
+ssm.kda_chunked = true
 
 # MXFP4 selects on the register-dequant mma.sync from 28 routes up: a
 # prefill's 2,200 routes (gpt-oss-20b, 541 rows) ran the grouped wmma kernel

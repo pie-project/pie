@@ -180,14 +180,22 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         })
         .collect();
 
-    let (split_kv, kv_chunk_size_in_pages) = search_kv_chunk_size(
-        req.enable_cuda_graph,
-        max_batch_size_if_split,
-        &packed_qo_lens,
-        &effective_kv_lens,
-        cta_tile_q,
-        min_kv_chunk_size,
-    );
+    let (split_kv, kv_chunk_size_in_pages) =
+        if req.enable_cuda_graph
+            && (u64::from(req.total_num_rows) * group).div_ceil(u64::from(cta_tile_q))
+                >= u64::from(max_batch_size_if_split)
+        {
+            (false, effective_kv_lens.iter().copied().max().unwrap_or(0).max(1))
+        } else {
+            search_kv_chunk_size(
+                req.enable_cuda_graph,
+                max_batch_size_if_split,
+                &packed_qo_lens,
+                &effective_kv_lens,
+                cta_tile_q,
+                min_kv_chunk_size,
+            )
+        };
 
     let mut request_indices = Vec::new();
     let mut qo_tile_indices = Vec::new();
@@ -331,6 +339,8 @@ fn layout(
             16,
             "batch_prefill_merge_indptr",
         )?);
+    }
+    if sched.split_kv || req.enable_cuda_graph {
         info.block_valid_mask_offset =
             Some(ints.alloc(padded, 16, "batch_prefill_block_valid_mask")?);
     }
@@ -405,6 +415,8 @@ fn stage(
             &sched.merge_indptr,
             "batch_prefill_merge_indptr",
         )?;
+    }
+    if sched.split_kv || req.enable_cuda_graph {
         staging.put_bools(
             at(info.block_valid_mask_offset),
             (0..sched.padded_batch_size).map(|i| i < sched.new_batch_size as usize),
