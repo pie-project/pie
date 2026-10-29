@@ -63,7 +63,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
     if boot.budget.max_tokens == 0 {
-        let params: u64 = boot.trace.params.iter().map(|p| p.shape.iter().product::<u64>()).sum();
+        let params: u64 = boot
+            .trace
+            .params
+            .iter()
+            .map(|p| p.shape.iter().product::<u64>())
+            .sum();
         boot.budget.max_tokens = match engine.forward_tokens {
             0 => crate::api::DEFAULT_FORWARD_TOKENS,
             tokens if params < 2 << 30 => tokens.max(crate::api::DEFAULT_FORWARD_TOKENS),
@@ -1145,17 +1150,19 @@ impl Shell {
         // are cut at this fit for good, and on CUDA its chunked recurrence
         // grows them the same way (Kimi-K3's mini: 3.1 GB of KDA planes at
         // 8192 tokens left an RTX 5090's rows short of one sequence).
-        let scratch_growth =
-            if (cfg!(feature = "rocm")
-                || shell.trace.nodes.iter().any(|node| {
-                    matches!(node.op, poem_ir::Operation::Ssm(poem_ir::Ssm::KdaChunked { .. }))
-                }))
-                && shell.records_bodies()
-            {
-                shell.arena.bytes()
-            } else {
-                0
-            };
+        let scratch_growth = if (cfg!(feature = "rocm")
+            || shell.trace.nodes.iter().any(|node| {
+                matches!(
+                    node.op,
+                    poem_ir::Operation::Ssm(poem_ir::Ssm::KdaChunked { .. })
+                )
+            }))
+            && shell.records_bodies()
+        {
+            shell.arena.bytes()
+        } else {
+            0
+        };
         let fitted = shell.pools.fit_the_card(
             bodies,
             held_for_fires.saturating_add(scratch_growth),

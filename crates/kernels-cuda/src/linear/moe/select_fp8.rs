@@ -180,7 +180,8 @@ pub fn select_fp8_w8a8(
             &format!("::pie::linear::moe_select_fp8a8_mma<{nb}, false, {wn}>"),
         ))
         .apply(
-            Launch::grid([work_cap, y.width.div_ceil(128), 1], [128 * wn, 1, 1]).smem(fp8_mma_smem(nb)),
+            Launch::grid([work_cap, y.width.div_ceil(128), 1], [128 * wn, 1, 1])
+                .smem(fp8_mma_smem(nb)),
         ),
         &[
             ArgValue::Ptr(xq),

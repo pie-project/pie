@@ -113,7 +113,9 @@ impl Spec {
             "minimax2" => &["identity"],
             "raw" => &["stop"],
             "harmony" | "deepseek" | "dots" | "glm" | "glm47" | "glm45" | "kimi" | "kimi3"
-            | "inkling" | "atem" | "atem_open" | "mimo" | "minimax" | "llama" | "qwen3_coder" => &[],
+            | "inkling" | "atem" | "atem_open" | "mimo" | "minimax" | "llama" | "qwen3_coder" => {
+                &[]
+            }
             other => {
                 return Err(format!(
                     "`{other}` names no template format; this build ships {}",
