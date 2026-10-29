@@ -22,6 +22,7 @@ pub const FORMATS: &[&str] = &[
     "kimi3",
     "inkling",
     "atem",
+    "atem_open",
     "mimo",
     "minimax",
     "minimax2",
@@ -112,7 +113,7 @@ impl Spec {
             "minimax2" => &["identity"],
             "raw" => &["stop"],
             "harmony" | "deepseek" | "dots" | "glm" | "glm47" | "glm45" | "kimi" | "kimi3"
-            | "inkling" | "atem" | "mimo" | "minimax" | "llama" | "qwen3_coder" => &[],
+            | "inkling" | "atem" | "atem_open" | "mimo" | "minimax" | "llama" | "qwen3_coder" => &[],
             other => {
                 return Err(format!(
                     "`{other}` names no template format; this build ships {}",
@@ -174,6 +175,7 @@ pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>
         "kimi3" => Arc::new(crate::kimi3::Kimi3::try_new(tokenizer)?),
         "inkling" => Arc::new(crate::inkling::Inkling::try_new(tokenizer)?),
         "atem" => Arc::new(crate::atem::Atem::try_new(tokenizer)?),
+        "atem_open" => Arc::new(crate::atem::Atem::try_with(tokenizer, true)?),
         "mimo" => Arc::new(crate::mimo::Mimo::try_new(tokenizer)?),
         "minimax" => Arc::new(crate::minimax::MiniMax::try_new(tokenizer)?),
         "minimax2" => Arc::new(crate::minimax2::MiniMax2::try_new(

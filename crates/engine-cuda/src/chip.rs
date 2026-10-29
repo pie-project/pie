@@ -1045,6 +1045,7 @@ mod tests {
                     mxfp4_mma_until: defaults.mxfp4_mma_until,
                     mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
                     gemm_fp8_shadow: defaults.gemm_fp8_shadow,
+                    selected_mma: defaults.selected_mma,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
                 defaults,
@@ -1055,6 +1056,7 @@ mod tests {
                 if spec.id == "kernel.ssm.gdn_fused_scan"
                     || (spec.id == "kernel.gemm.rows_m" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.gemm.fp8_shadow" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.sdpa.selected_mma" && std::ptr::eq(p, &l40s))
                     || spec.id.starts_with("kernel.moe.mxfp4_mma_")
                     || spec.id.starts_with("engine.prefill_lattice_")
                 {

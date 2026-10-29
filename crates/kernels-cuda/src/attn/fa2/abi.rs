@@ -464,9 +464,9 @@ pub fn make_prefill_params(
         partials.seq_len = p.total_num_rows;
         partials.num_heads = shape.num_q_heads;
         partials.head_dim = shape.head_dim;
-        if info.enable_cuda_graph {
-            p.block_valid_mask = resolve(int_buf, info.block_valid_mask_offset);
-        }
+    }
+    if info.enable_cuda_graph {
+        p.block_valid_mask = resolve(int_buf, info.block_valid_mask_offset);
     }
     (p, partials)
 }
