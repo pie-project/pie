@@ -312,7 +312,7 @@ pub fn select_fp8_w8a16(
     glu: Option<crate::linear::gemm_sm100::Glu>,
 ) -> Result<(), Error> {
     const THREADS: u32 = 128;
-    const DEPTH: u32 = 2;
+    const DEPTH: u32 = 4;
     let fan = selected(op, x, routes, y)?;
     if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
         return Err(refuse(op, "a W8A16 select reads and lands bf16 rows"));
