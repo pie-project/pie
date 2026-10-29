@@ -2,9 +2,9 @@
 //! warp is the 32-lane chunk.
 
 pub use super::simt::{
-    fused, is_matmul_region, is_order_region, is_scan_region, matmul, order, region_analysis,
-    runtime, sampler, scan, second_party_region_supported, singleton, spent_values, validate,
-    validate_generated_region,
+    emitted_order, fused, is_matmul_region, is_order_region, is_scan_region, matmul, order,
+    region_analysis, runtime, sampler, scan, second_party_region_supported, singleton,
+    spent_values, validate, validate_generated_region,
 };
 
 use super::simt::{self, Dialect};

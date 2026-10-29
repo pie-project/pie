@@ -22,7 +22,7 @@ pub use signature::*;
 pub use symbolic::*;
 
 pub const COMPILER_VERSION: u16 = 3;
-pub const REGION_PLAN_VERSION: u16 = 8;
+pub const REGION_PLAN_VERSION: u16 = 9;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompiledStage {

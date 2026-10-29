@@ -26,6 +26,8 @@ pub struct Conv3d {
     pub pad_back: [u32; 3],
     pub causal_t: bool,
     pub time_pad: TimePad,
+    pub dilation: [u32; 3],
+    pub depthwise: bool,
 }
 
 impl Conv3d {
@@ -68,7 +70,16 @@ pub fn conv3d(
         ));
     }
     let taps = conv.taps();
-    if w.rows != c_out || w.width != taps * c_in {
+    if conv.depthwise && c_in != c_out {
+        return Err(refuse(
+            OP,
+            format!(
+                "a depthwise convolution keeps its channels, and this one maps {c_in} into {c_out}"
+            ),
+        ));
+    }
+    let per = if conv.depthwise { 1 } else { c_in };
+    if w.rows != c_out || w.width != taps * per {
         return Err(refuse(
             OP,
             format!(
@@ -150,6 +161,10 @@ pub fn conv3d(
             u32::from(bias.is_some()).arg(),
             stated(OP, bases[0])?.arg(),
             stated(OP, bases[1])?.arg(),
+            stated(OP, conv.dilation[0])?.arg(),
+            stated(OP, conv.dilation[1])?.arg(),
+            stated(OP, conv.dilation[2])?.arg(),
+            i32::from(conv.depthwise).arg(),
         ],
     )
 }

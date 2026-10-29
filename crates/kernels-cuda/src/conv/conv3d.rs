@@ -36,6 +36,8 @@ pub struct Conv3d {
     pub pad_back: [u32; 3],
     pub causal_t: bool,
     pub time_pad: TimePad,
+    pub dilation: [u32; 3],
+    pub depthwise: bool,
 }
 
 impl Conv3d {
@@ -48,6 +50,8 @@ impl Conv3d {
             pad_back: [0, pad[0], pad[1]],
             causal_t: false,
             time_pad: TimePad::Zero,
+            dilation: [1, 1, 1],
+            depthwise: false,
         }
     }
 
@@ -64,10 +68,12 @@ impl Conv3d {
                 .map(|span| span / s.max(1) + 1)
         };
         let back_t = if self.causal_t { 0 } else { self.pad_back[0] };
+        // The taps spread `dilation` apart span `(k - 1) · dilation + 1`.
+        let spread = |a: usize| (self.k[a] - 1) * self.dilation[a] + 1;
         Some([
-            axis(t, self.k[0], self.stride[0], self.pad[0], back_t)?,
-            axis(h, self.k[1], self.stride[1], self.pad[1], self.pad_back[1])?,
-            axis(w, self.k[2], self.stride[2], self.pad[2], self.pad_back[2])?,
+            axis(t, spread(0), self.stride[0], self.pad[0], back_t)?,
+            axis(h, spread(1), self.stride[1], self.pad[1], self.pad_back[1])?,
+            axis(w, spread(2), self.stride[2], self.pad[2], self.pad_back[2])?,
         ])
     }
 }
@@ -99,6 +105,9 @@ struct Geom {
     rows_out: i32,
     x_base: i32,
     o_base: i32,
+    dt: i32,
+    dh: i32,
+    dw: i32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -157,7 +166,17 @@ pub fn conv3d_on(
         count(OP, axis, v)?;
     }
     let taps = conv.taps();
-    if w.rows != o.width || w.width != taps.saturating_mul(x.width) {
+    if conv.depthwise && x.width != o.width {
+        return Err(refuse(
+            OP,
+            format!(
+                "a depthwise convolution keeps its channels, and this one maps {} into {}",
+                x.width, o.width
+            ),
+        ));
+    }
+    let per = if conv.depthwise { 1 } else { x.width };
+    if w.rows != o.width || w.width != taps.saturating_mul(per) {
         return Err(refuse(
             OP,
             format!(
@@ -165,7 +184,7 @@ pub fn conv3d_on(
                 w.rows,
                 w.width,
                 o.width,
-                taps.saturating_mul(x.width)
+                taps.saturating_mul(per)
             ),
         ));
     }
@@ -216,7 +235,37 @@ pub fn conv3d_on(
         rows_out,
         x_base: stated(OP, bases[0])?,
         o_base: stated(OP, bases[1])?,
+        dt: stated(OP, conv.dilation[0])?,
+        dh: stated(OP, conv.dilation[1])?,
+        dw: stated(OP, conv.dilation[2])?,
     };
+    let args = |o: &Tensor| {
+        [
+            x.arg(),
+            grid.arg(),
+            w.arg(),
+            bias.map_or(ArgValue::ABSENT, |b| b.arg()),
+            cache.map_or(ArgValue::ABSENT, |c| c.arg()),
+            o.arg(),
+            o_grid.arg(),
+            ArgValue::of(&geom),
+        ]
+    };
+    if conv.depthwise {
+        let elements = u64::from(o.rows) * u64::from(o.width);
+        let lanes = u32::try_from(elements).map_err(|_| {
+            refuse(
+                OP,
+                format!("{elements} outputs do not fit a 32-bit launch extent"),
+            )
+        })?;
+        return ctx.fire(
+            OP,
+            Fire::at(kernel(FILE, "::pie::conv::conv3d_depthwise"))
+                .apply(Launch::flat(lanes, DIRECT_BLOCK)),
+            &args(o),
+        );
+    }
 
     let vectorised = x.width.is_multiple_of(8)
         && aligned16(x.ptr)
@@ -262,20 +311,7 @@ pub fn conv3d_on(
         [block, 1, 1],
     )
     .smem(smem);
-    ctx.fire(
-        OP,
-        Fire::at(kernel(FILE, &entry)).apply(launch),
-        &[
-            x.arg(),
-            grid.arg(),
-            w.arg(),
-            bias.map_or(ArgValue::ABSENT, |b| b.arg()),
-            cache.map_or(ArgValue::ABSENT, |c| c.arg()),
-            o.arg(),
-            o_grid.arg(),
-            ArgValue::of(&geom),
-        ],
-    )
+    ctx.fire(OP, Fire::at(kernel(FILE, &entry)).apply(launch), &args(o))
 }
 
 pub fn conv_weight_taps_major(

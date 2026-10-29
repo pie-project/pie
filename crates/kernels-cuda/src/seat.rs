@@ -70,6 +70,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("elemwise.binary", Reads::Rows),
     entry("elemwise.add_bias", Reads::Rows),
     entry("elemwise.clamp", Reads::Rows),
+    entry("elemwise.snake", Reads::Rows),
     entry("elemwise.gate_sigmoid_mul", Reads::Rows),
     entry("elemwise.hc_expand", Reads::Rows),
     entry("elemwise.hc_fold", Reads::Rows),

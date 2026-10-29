@@ -27,6 +27,8 @@ members = [
     "diffusion-baseline",
     "dflash-speculative-bench",
     "text-to-media",
+    "qwen3-asr",
+    "qwen3-tts",
     "context-aware-decoding",
     "snapkv-eviction",
     "tail-free-sampling",

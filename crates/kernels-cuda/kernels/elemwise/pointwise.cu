@@ -158,6 +158,7 @@ __global__ void binary(
 constexpr int kActSilu = 0;
 constexpr int kActTanh = 1;
 constexpr int kActSqrt = 2;
+constexpr int kActGelu = 3;
 
 template <class T, int ACT>
 __global__ void activation(
@@ -176,8 +177,32 @@ __global__ void activation(
 
     const float v = Elem<T>::to_f32(x[at]);
 
-    o[at] = Elem<T>::from_f32(ACT == kActSilu ? v / (1.f + __expf(-v))
-                              : ACT == kActTanh ? tanhf(v) : sqrtf(v));
+    o[at] = Elem<T>::from_f32(
+        ACT == kActSilu   ? v / (1.f + __expf(-v))
+        : ACT == kActTanh ? tanhf(v)
+        : ACT == kActGelu ? 0.5f * v * (1.f + erff(v * 0.70710678118654752f))
+                          : sqrtf(v));
+}
+
+// SnakeBeta in place, `x + sin²(x·e^alpha) / (e^beta + 1e-9)`; `alpha` and
+// `beta` are f32 logs, one a channel of the `width`-wide rows.
+template <class T>
+__global__ void snake(T* __restrict__ x, const float* __restrict__ alpha,
+                      const float* __restrict__ beta, usize n, int width,
+                      const u32* __restrict__ win) {
+    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    if (win != nullptr &&
+        i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
+    const usize at = win != nullptr
+        ? i + static_cast<usize>(win[1]) * static_cast<usize>(width)
+        : i;
+
+    const int c = static_cast<int>(at % static_cast<usize>(width));
+    const float v = Elem<T>::to_f32(x[at]);
+    const float s = sinf(v * expf(alpha[c]));
+    x[at] = Elem<T>::from_f32(v + s * s / (expf(beta[c]) + 1e-9f));
 }
 
 template <class T>

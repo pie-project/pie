@@ -197,6 +197,10 @@ pub struct LaunchRegion {
     pub spent: Vec<u32>,
     #[serde(default)]
     pub row_alias: Option<u64>,
+    /// The order the CUDA emitter runs `nodes` in, which its scratch is laid
+    /// out over.
+    #[serde(default)]
+    pub order: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -632,6 +636,7 @@ fn lower_partition(stage: &CompiledStage, partition: &RegionPartition) -> Vec<La
 fn lower_region(stage: &CompiledStage, region: &Region) -> LaunchRegion {
     LaunchRegion {
         spent: crate::codegen::cuda::spent_values(stage, region),
+        order: crate::codegen::cuda::emitted_order(stage, region),
         kind: region.kind,
         schedule: region.schedule as u8,
         nodes: region.nodes.iter().copied().map(NodeIndex::get).collect(),
