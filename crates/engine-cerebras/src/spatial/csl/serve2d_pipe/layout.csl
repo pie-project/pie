@@ -67,6 +67,12 @@ param vm_sin: u16 = 0;
 // bank arena's words (vm_lprog 1 only).
 param vm_lprog: u16 = 0;
 param bank_words: u16 = 1;
+// The VM's lanes (turns a lap; 0: MMAX·B, one row each) and the most head rows
+// a turn takes (a multi-row program, e.g. CFG's 2).
+param vm_lanes: u16 = 0;
+param vm_rows: u16 = 1;
+// Top-p by an entry walk of folds (1, Fork 3's default: no list engine in the image).
+param vm_pwalk: u16 = 1;
 param opmask_lo: u32 = 0xffffffff;
 param opmask_hi: u32 = 0xffffffff;
 param HLM: u16 = 4;
@@ -108,9 +114,10 @@ layout {
           .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
           .c_x = C_BC, .c_ib = C_GB,
           .max_ops = max_ops, .nreg = nreg, .pool_words = pool_words, .feat = feat, .ring = ring_d,
-          .ring_w = ring_w, .vm_prof = vm_prof, .vm_lanes = MMAX * B, .vm_rows = 1,
+          .ring_w = ring_w, .vm_prof = vm_prof, .vm_lanes = if (vm_lanes > 0) vm_lanes else MMAX * B, .vm_rows = vm_rows,
           .vm_sin = vm_sin, .opmask_lo = opmask_lo, .opmask_hi = opmask_hi,
           .vm_lprog = vm_lprog, .bank_words = bank_words,
+          .vm_pwalk = vm_pwalk,
           .GPX = PX, .GPY = PY, .GW = GW, .GH = GH, .S2D_SB = B,
         });
       } else if (x >= GW * PX and y <= HH) {

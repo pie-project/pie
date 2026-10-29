@@ -202,12 +202,16 @@ fn hb_give_c(k: u16) void {
 fn hb_vm() bool { return VMC >= 1 and gmode[0] == 1 and s2d_iter >= 1; }
 // Per virtual lane, host-written on every head PE: [gmode_l (1: the VM
 // samples the lane), nforce (the lane's forced prompt prefix: iterations
-// i < nforce are forced)]. VM mode wants forced tokens as a prefix.
-const VLN: u16 = MMAX * SB * 2;
+// i < nforce are forced), last (lanes from this one to its VM turn's last
+// row: a multi-row turn's lanes all take the last row's token; 0 for a
+// one-row turn)]. VM mode wants forced tokens as a prefix; a turn's rows sit
+// in one head step (consecutive lanes of one group).
+const VLW: u16 = 3;
+const VLN: u16 = MMAX * SB * VLW;
 var vmlane = @zeros([VLN]u32);
 var vmlane_ptr: [*]u32 = &vmlane;
 // The VM samples lane vl at this iteration (else its turn is skipped: ctl 1).
-fn hb_vm_lane(vl: u16) bool { return vmlane[2 * vl] == 1 and s2d_iter >= vmlane[2 * vl + 1]; }
+fn hb_vm_lane(vl: u16) bool { return vmlane[VLW * vl] == 1 and s2d_iter >= vmlane[VLW * vl + 1]; }
 // The head's argmax chain runs this step: no VM, or some lane of the step
 // takes the argmax (gmode_l 0, not forced).
 fn hb_argmax_step() bool {
@@ -215,11 +219,12 @@ fn hb_argmax_step() bool {
   var b: u16 = 0;
   while (b < HB) : (b += 1) {
     const vl = s2d_mb * SB + s2d_grp * HB + b;
-    if (vmlane[2 * vl] == 0 and s2d_iter >= vmlane[2 * vl + 1]) { return true; }
+    if (vmlane[VLW * vl] == 0 and s2d_iter >= vmlane[VLW * vl + 1]) { return true; }
   }
   return false;
 }
 var hb_vt = @zeros([1]f32);
+var hb_vts = @zeros([HB]f32);
 const hb_vt_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> hb_vt[i] });
 
 fn hb_best_init() void {
@@ -567,11 +572,18 @@ fn hb_step_feeder() void {
       hb_take_c(cl(NGH - 1));
       routes_feeder_x2();
     }
+    // One token a row (a multi-row turn's earlier rows get 0 at once, its
+    // last row the program's), all of the step's first; then each lane.
+    b = 0;
+    while (b < HB) : (b += 1) {
+      @fmovs(hb_vt_dsd, fin(q_x_in, 1));
+      hb_vts[b] = hb_vt[0];
+    }
     b = 0;
     while (b < HB) : (b += 1) {
       const vl = s2d_mb * SB + s2d_grp * HB + b;
-      @fmovs(hb_vt_dsd, fin(q_x_in, 1));
-      const v = if (vmlane[2 * vl] == 1) hb_vt[0] else hb_best[2 * b + 1];
+      const last = @as(u16, vmlane[VLW * vl + 2]);
+      const v = if (vmlane[VLW * vl] == 1) hb_vts[b + last] else hb_best[2 * b + 1];
       hb_ib[b] = s2d_decide(vl, v);
     }
     hb_ib[HB] = -1.0;

@@ -25,6 +25,9 @@ pub struct Manifest {
     pub fabric_dims: (u32, u32),
     pub fabric_offsets: (u32, u32),
     pub system: bool,
+    /// The eta VM image the design's sources carry (`guest4hm`,
+    /// `guest4hz`), whether or not the params enable it; `None`: no VM.
+    pub vm: Option<String>,
 }
 
 impl Manifest {
@@ -40,6 +43,7 @@ impl Manifest {
             "fabric_dims": [self.fabric_dims.0, self.fabric_dims.1],
             "fabric_offsets": [self.fabric_offsets.0, self.fabric_offsets.1],
             "system": self.system,
+            "vm": self.vm,
         })
     }
 
@@ -73,6 +77,7 @@ impl Manifest {
             fabric_dims: pair("fabric_dims")?,
             fabric_offsets: pair("fabric_offsets")?,
             system: v["system"].as_bool().unwrap_or(false),
+            vm: v["vm"].as_str().map(String::from),
         })
     }
 
@@ -140,6 +145,7 @@ mod tests {
             fabric_dims: (24, 19),
             fabric_offsets: (4, 1),
             system: false,
+            vm: Some("guest4hz".into()),
         };
         let back = Manifest::from_json(&m.to_json()).unwrap();
         assert_eq!(back, m);
@@ -156,6 +162,7 @@ mod tests {
             fabric_dims: (1, 1),
             fabric_offsets: (4, 1),
             system: false,
+            vm: None,
         }
         .to_json();
         v["version"] = serde_json::json!(2);
@@ -179,6 +186,7 @@ mod tests {
             fabric_dims: (1, 1),
             fabric_offsets: (4, 1),
             system: false,
+            vm: None,
         }
         .write(dir.path())
         .unwrap();

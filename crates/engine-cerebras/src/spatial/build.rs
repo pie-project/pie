@@ -39,6 +39,11 @@ pub struct VmImage {
     pub lane_programs: Option<usize>,
     /// The opcodes the image compiles (`opmask_lo`, `opmask_hi`); `None`: all.
     pub opmask: Option<(u32, u32)>,
+    /// Lanes the VM holds (`vm_lanes`; `None`: MMAX x B).
+    pub lanes: Option<usize>,
+    /// Top-p walks eta's order in rounds (`vm_pwalk`, the layout's default
+    /// 1); `Some(false)`: the list engine.
+    pub pwalk: Option<bool>,
 }
 
 impl VmImage {
@@ -67,6 +72,12 @@ impl VmImage {
         }
         if let Some((lo, hi)) = self.opmask {
             out.extend([("opmask_lo", lo as usize), ("opmask_hi", hi as usize)]);
+        }
+        if let Some(lanes) = self.lanes {
+            out.push(("vm_lanes", lanes));
+        }
+        if let Some(pwalk) = self.pwalk {
+            out.push(("vm_pwalk", usize::from(pwalk)));
         }
         out
     }
@@ -122,7 +133,8 @@ impl ServeConfig {
     /// - `region`: a paged8b (8B) plan as serve8b_region's units;
     /// - `[vm]`: `max_ops`, `nreg`, `pool_words`, `feat`, `ring_w` (default
     ///   1), `ring_d` (32), `prof`, `step_input`, `rows`, `bank_words`
-    ///   (per-lane programs), `opmask_lo`/`opmask_hi`;
+    ///   (per-lane programs), `opmask_lo`/`opmask_hi`, `lanes` (`vm_lanes`),
+    ///   `pwalk` (`vm_pwalk`);
     /// - `[pins]`: layout parameters by name, for shapes the plan does not
     ///   place (simulator-sized models); checked against the layout.
     pub fn from_toml(t: &toml::Table, page_size: usize) -> R<ServeConfig> {
@@ -193,6 +205,8 @@ impl ServeConfig {
                     lane_programs: int(m, "bank_words")?,
                     opmask: (lo.is_some() || hi.is_some())
                         .then(|| (lo.unwrap_or(0xffff_ffff) as u32, hi.unwrap_or(0xffff_ffff) as u32)),
+                    lanes: int(m, "lanes")?,
+                    pwalk: m.get("pwalk").map(|_| flag(m, "pwalk")).transpose()?,
                 })
             }
         };
@@ -544,6 +558,7 @@ pub fn compile(design: Design, params: &[(String, String)], target: crate::sdk::
         fabric_dims,
         fabric_offsets,
         system,
+        vm: design.vm_image().map(String::from),
     };
     m.write(&out)?;
     tracing::info!(s = started.elapsed().as_secs_f32(), "spatial build: compiled");
@@ -622,6 +637,8 @@ pub mod presets {
                 rows: 1,
                 lane_programs: None,
                 opmask: None,
+                lanes: None,
+                pwalk: None,
             }),
             pins: vec![
                 ("Tc", 1), ("E", 2), ("GW", 2), ("GH", 4), ("F", 8), ("HH", 16), ("Vr", 32),
