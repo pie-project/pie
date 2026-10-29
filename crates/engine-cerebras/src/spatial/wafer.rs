@@ -295,16 +295,16 @@ pub fn place(lay: &Layout, ckpt: &Ckpt, rope_theta: f64, sink: &mut dyn Sink) ->
     };
     for li in 0..lay.layers {
         let started = Instant::now();
-        let p = format!("model.layers.{li}.");
+        let p = format!("layers.{li}.");
         let (strip, k) = (li / lay.lps, li % lay.lps);
         let base = k * lh;
-        let wq = get(&format!("{p}self_attn.q_proj.weight"), &[qdim, hid])?;
-        let wk = get(&format!("{p}self_attn.k_proj.weight"), &[nb * d, hid])?;
-        let wv = get(&format!("{p}self_attn.v_proj.weight"), &[nb * d, hid])?;
-        let wo = get(&format!("{p}self_attn.o_proj.weight"), &[hid, qdim])?;
-        let qn = get(&format!("{p}self_attn.q_norm.weight"), &[d])?;
-        let kn = get(&format!("{p}self_attn.k_norm.weight"), &[d])?;
-        let ln = get(&format!("{p}input_layernorm.weight"), &[hid])?;
+        let wq = get(&format!("{p}q"), &[qdim, hid])?;
+        let wk = get(&format!("{p}k"), &[nb * d, hid])?;
+        let wv = get(&format!("{p}v"), &[nb * d, hid])?;
+        let wo = get(&format!("{p}o"), &[hid, qdim])?;
+        let qn = get(&format!("{p}q_norm"), &[d])?;
+        let kn = get(&format!("{p}k_norm"), &[d])?;
+        let ln = get(&format!("{p}attn_norm"), &[hid])?;
         let mut wqkv = vec![0f32; ph * pw * ht * qr];
         let mut wob = vec![0f32; ph * pw * g * dr * ht];
         let mut freq = vec![0f32; ph * pw * dr / 2];
@@ -361,10 +361,10 @@ pub fn place(lay: &Layout, ckpt: &Ckpt, rope_theta: f64, sink: &mut dyn Sink) ->
         }
         drop((wq, wk, wv, wo, wqkv, wob));
 
-        let gate = get(&format!("{p}mlp.gate_proj.weight"), &[lay.inter, hid])?;
-        let up = get(&format!("{p}mlp.up_proj.weight"), &[lay.inter, hid])?;
-        let down = get(&format!("{p}mlp.down_proj.weight"), &[hid, lay.inter])?;
-        let ln2 = get(&format!("{p}post_attention_layernorm.weight"), &[hid])?;
+        let gate = get(&format!("{p}gate"), &[lay.inter, hid])?;
+        let up = get(&format!("{p}up"), &[lay.inter, hid])?;
+        let down = get(&format!("{p}down"), &[hid, lay.inter])?;
+        let ln2 = get(&format!("{p}mlp_norm"), &[hid])?;
         let mut gu = vec![0f32; hm * pw * ht * 2 * it];
         let mut dn = vec![0f32; hm * pw * it * ht];
         let mut gamma2 = vec![0f32; hm * pw * ht];
@@ -398,9 +398,9 @@ pub fn place(lay: &Layout, ckpt: &Ckpt, rope_theta: f64, sink: &mut dyn Sink) ->
     }
 
     // The head: the (tied) embedding as the vocabulary's rows, padded.
-    let emb = ckpt.get("model.embed_tokens.weight")?;
+    let emb = ckpt.get("embed")?;
     if emb.shape.len() != 2 || emb.shape[1] != hid {
-        return Err(format!("model.embed_tokens.weight is {:?}", emb.shape));
+        return Err(format!("embed is {:?}", emb.shape));
     }
     let rows_have = emb.shape[0].min(lay.vocab);
     let (vr, hh) = (lay.vr, lay.hh);
@@ -427,7 +427,7 @@ pub fn place(lay: &Layout, ckpt: &Ckpt, rope_theta: f64, sink: &mut dyn Sink) ->
         y0 += rows;
     }
     drop(emb);
-    let norm = get("model.norm.weight", &[hid])?;
+    let norm = get("final_norm", &[hid])?;
     let hgamma: Vec<f32> = (0..hh * pw)
         .flat_map(|pe| norm.data[(pe % pw) * ht..(pe % pw + 1) * ht].iter().copied())
         .collect();
@@ -594,44 +594,40 @@ fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
 }
 
 impl WaferModel {
-    /// [`WaferModel::open_with`], RoPE's theta from the checkpoint's config.
+    /// [`WaferModel::open_with`] on a Hugging Face directory, RoPE's theta
+    /// from its config.
     pub fn open(
         program: &Path,
         ckpt_dir: &Path,
         platform: Platform,
         launch: Option<Launch>,
     ) -> R<WaferModel> {
-        WaferModel::open_with(program, ckpt_dir, platform, launch, None)
+        WaferModel::open_with(program, Ckpt::open(ckpt_dir)?, platform, launch, None)
     }
 
-    /// Loads `program` and places `ckpt_dir`'s weights; RoPE's theta is
+    /// Loads `program` and places `ckpt`'s weights; RoPE's theta is
     /// `rope_theta` (the model's, from its trace), else the checkpoint
     /// config's (else 1e6).
     pub fn open_with(
         program: &Path,
-        ckpt_dir: &Path,
+        ckpt: Ckpt,
         platform: Platform,
         launch: Option<Launch>,
         rope_theta: Option<f64>,
     ) -> R<WaferModel> {
         let design = Design::read(program)?;
-        let ckpt = Ckpt::open(ckpt_dir)?;
         let s8b = matches!(&design, Design::Grid(g) if g.s8b.is_some());
         if s8b {
             // serve8b holds lm_head itself (and the embedding apart).
-            if !ckpt.has("lm_head.weight") {
-                return Err(format!(
-                    "{}: no lm_head.weight; serve8b serves untied checkpoints (a tied one would need \
-                     the embedding as the head)",
-                    ckpt_dir.display()
-                ));
+            if !ckpt.has("head") {
+                return Err("the checkpoint has no `head`; serve8b serves untied models (a tied one \
+                            would need the embedding as the head)"
+                    .into());
             }
         } else if !ckpt.tied_head()? {
-            return Err(format!(
-                "{}: an untied LM head (lm_head.weight apart from embed_tokens); the wafer \
-                 programs compute the logits from the embedding and cannot place lm_head yet",
-                ckpt_dir.display()
-            ));
+            return Err("an untied LM head (`head` apart from `embed`); this wafer program computes \
+                        the logits from the embedding (serve8b places a head)"
+                .into());
         }
         let config_theta = ckpt.config()["rope_theta"].as_f64();
         if let (Some(theta), Some(config)) = (rope_theta, config_theta)
@@ -1164,7 +1160,7 @@ impl Wafer {
     /// config's); returns once the model answers.
     pub fn open(
         program: PathBuf,
-        ckpt: PathBuf,
+        ckpt: Ckpt,
         platform: Platform,
         launch: Option<Launch>,
         rope_theta: Option<f64>,
@@ -1177,7 +1173,7 @@ impl Wafer {
         let thread = std::thread::Builder::new()
             .name("spatial-wafer".into())
             .spawn(move || {
-                let mut model = match WaferModel::open_with(&program, &ckpt, platform, launch, rope_theta) {
+                let mut model = match WaferModel::open_with(&program, ckpt, platform, launch, rope_theta) {
                     Ok(m) => {
                         let (paged, (launch_lanes, logit_lanes)) = match &m.design {
                             Design::Grid(g) => (g.paged, (g.launch_lanes(), g.logit_lanes())),

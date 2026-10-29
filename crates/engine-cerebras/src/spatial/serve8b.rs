@@ -389,7 +389,7 @@ pub(crate) fn unit(
     let (d, dh, nh) = (gs * dc, dc / 2, qh + 1);
     let nkv = pxn / gs;
     let (nq, inter) = (nkv * qh, pxn * ic);
-    let name = |l: usize, w: &str| format!("model.layers.{l}.{w}");
+    let name = |l: usize, w: &str| format!("layers.{l}.{w}");
     let mats = |w: &str, rows: usize, cols: usize| -> R<Vec<Vec<u16>>> {
         layers.iter().map(|&l| matrix(ckpt, &name(l, w), rows, cols)).collect()
     };
@@ -401,8 +401,8 @@ pub(crate) fn unit(
     };
     // Hidden dim (py, hc), or None in the padding past HR.
     let dim = |py: usize, kk: usize| Some(py * hc + kk).filter(|&x| x < hid);
-    let wq = mats("self_attn.q_proj.weight", nq * d, hid)?;
-    let wk = mats("self_attn.k_proj.weight", nkv * d, hid)?;
+    let wq = mats("q", nq * d, hid)?;
+    let wk = mats("k", nkv * d, hid)?;
     // Layer li's head h's (Qh: k's) row of dim dd of kv head g.
     let qk = |li: usize, g: usize, h: usize, dd: usize, col: usize| -> u32 {
         if h < qh {
@@ -426,7 +426,7 @@ pub(crate) fn unit(
         })?;
     }
     drop((wq, wk));
-    let wv = mats("self_attn.v_proj.weight", nkv * d, hid)?;
+    let wv = mats("v", nkv * d, hid)?;
     put_pe16(k, sink, "wv", at, nl * hc * dc, |py, px, out| {
         let (g, dl) = (px / gs, dl(px));
         for w in &wv {
@@ -438,7 +438,7 @@ pub(crate) fn unit(
         }
     })?;
     drop(wv);
-    let wo = mats("self_attn.o_proj.weight", hid, nq * d)?;
+    let wo = mats("o", hid, nq * d)?;
     put_pe16(k, sink, "wo", at, nl * qh * dc * hc, |py, px, out| {
         let (g, dl) = (px / gs, dl(px));
         for w in &wo {
@@ -453,8 +453,8 @@ pub(crate) fn unit(
         }
     })?;
     drop(wo);
-    let wg = mats("mlp.gate_proj.weight", inter, hid)?;
-    let wu = mats("mlp.up_proj.weight", inter, hid)?;
+    let wg = mats("gate", inter, hid)?;
+    let wu = mats("up", inter, hid)?;
     put_pe16(k, sink, "wgu", at, nl * hc * 2 * ic, |py, px, out| {
         for li in 0..nl {
             for kk in 0..hc {
@@ -465,7 +465,7 @@ pub(crate) fn unit(
         }
     })?;
     drop((wg, wu));
-    let wd = mats("mlp.down_proj.weight", hid, inter)?;
+    let wd = mats("down", hid, inter)?;
     put_pe16(k, sink, "wd", at, nl * ic * hc, |py, px, out| {
         for w in &wd {
             for i in 0..ic {
@@ -476,8 +476,8 @@ pub(crate) fn unit(
         }
     })?;
     drop(wd);
-    let qn = vecs("self_attn.q_norm.weight", d)?;
-    let kn = vecs("self_attn.k_norm.weight", d)?;
+    let qn = vecs("q_norm", d)?;
+    let kn = vecs("k_norm", d)?;
     let scale = (d as f64).sqrt() as f32;
     put_pe32(k, sink, "qkn_w", at, nl * 2 * nh * dh, |_, px, out| {
         let dl = dl(px);
@@ -516,7 +516,7 @@ pub(crate) fn unit(
     if kv_first {
         put_kv(sink)?;
     }
-    for (sym, w) in [("gamma1", "input_layernorm.weight"), ("gamma2", "post_attention_layernorm.weight")] {
+    for (sym, w) in [("gamma1", "attn_norm"), ("gamma2", "mlp_norm")] {
         let g = vecs(w, hid)?;
         put_pe32(k, sink, sym, at, nl * hc, |py, _, out| {
             for g in &g {
@@ -567,11 +567,11 @@ fn pack(lo: u16, hi: u16) -> u32 {
 pub(crate) fn head(lay: &Layout2d, ckpt: &Ckpt, sink: &mut dyn Sink) -> R<()> {
     let (vr, c_n, hid, vmc) = (lay.vr, lay.chunk_cols(), lay.hidden, lay.vmc);
     let hh2 = 2 * lay.hc;
-    let (shape, lm) = ckpt.bits("lm_head.weight")?;
+    let (shape, lm) = ckpt.bits("head")?;
     let v = shape[0];
     if shape.len() != 2 || shape[1] != hid || v > lay.vocab || lay.vocab > lay.hh * vr {
         return Err(format!(
-            "lm_head.weight is {shape:?}; the head holds {} rows of {hid} ({} words)",
+            "head is {shape:?}; the head holds {} rows of {hid} ({} words)",
             lay.vocab,
             lay.hh * vr
         ));
@@ -603,7 +603,7 @@ pub(crate) fn head(lay: &Layout2d, ckpt: &Ckpt, sink: &mut dyn Sink) -> R<()> {
         t
     })?;
     drop(lm);
-    let g = vector(ckpt, "model.norm.weight", hid)?;
+    let g = vector(ckpt, "final_norm", hid)?;
     let gam: Vec<u32> = cols
         .iter()
         .flat_map(|c| (0..hh2).map(move |k| c.map(|c| c * hh2 + k)))
@@ -618,10 +618,10 @@ pub(crate) fn head(lay: &Layout2d, ckpt: &Ckpt, sink: &mut dyn Sink) -> R<()> {
 pub(crate) fn embed(lay: &Layout2d, ckpt: &Ckpt, sink: &mut dyn Sink) -> R<()> {
     let (ve, hid) = (lay.vr, lay.hidden);
     let (ec, he) = (lay.py / 4, 4 * lay.hc);
-    let (shape, em) = ckpt.bits("model.embed_tokens.weight")?;
+    let (shape, em) = ckpt.bits("embed")?;
     let v = shape[0];
     if shape.len() != 2 || shape[1] != hid || v > lay.hh * ve {
-        return Err(format!("model.embed_tokens.weight is {shape:?}; the strip holds {} rows of {hid}", lay.hh * ve));
+        return Err(format!("embed is {shape:?}; the strip holds {} rows of {hid}", lay.hh * ve));
     }
     let n = ve * he / 2;
     let el = |row: usize, c: usize, j: usize| -> u16 {

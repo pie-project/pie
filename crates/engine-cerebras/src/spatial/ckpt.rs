@@ -1,8 +1,14 @@
-//! The checkpoint the wafer model places: a directory with `config.json` and
-//! either `model.safetensors` (a Hugging Face export, or its shards named by
-//! `model.safetensors.index.json`) or `weights.npz` (the
-//! bring-up's bf16 bits as `uint16` arrays, stored uncompressed). Tensors are
-//! read one at a time and widened to `f32`; nothing else is kept in memory.
+//! The weights the wafer model places, by the model's (poem) parameter names
+//! (`embed`, `head`, `final_norm`, `layers.{l}.q`, `.k`, `.v`, `.o`,
+//! `.q_norm`, `.k_norm`, `.attn_norm`, `.mlp_norm`, `.gate`, `.up`, `.down`).
+//!
+//! Serving reads them through PIE's checkpoint path ([`Ckpt::landed`]): the
+//! load's contract run over its checkpoint, every plane landed on the host
+//! as the trace declares it (packed `qkv` and `gate_up` planes are read in
+//! their parts). A Hugging Face directory ([`Ckpt::open`]: `config.json` and
+//! `model.safetensors`, its shards by `model.safetensors.index.json`, or the
+//! bring-up's `weights.npz` of bf16 bits) is read by the transformers names
+//! the poem maps (`TRANSFORMERS`), for checks against the Python hosts.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -48,9 +54,63 @@ pub struct Tensor {
 }
 
 pub struct Ckpt {
-    paths: Vec<PathBuf>,
-    entries: HashMap<String, Entry>,
+    inner: Inner,
     config: serde_json::Value,
+}
+
+enum Inner {
+    /// A Hugging Face directory, read lazily by transformers name.
+    Files { paths: Vec<PathBuf>, entries: HashMap<String, Entry> },
+    /// The planes PIE's checkpoint executor landed, by plan param name.
+    Landed { planes: HashMap<String, Plane>, parts: Parts },
+}
+
+/// One landed plane: its trace dtype, shape and bytes.
+struct Plane {
+    dtype: Dtype,
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+/// The row spans of the packed planes' parts: `qkv` = q | k | v, `gate_up`
+/// = gate | up.
+#[derive(Debug, Clone, Copy)]
+struct Parts {
+    q: usize,
+    kv: usize,
+    inter: usize,
+}
+
+/// How the poem names Qwen 3's transformers tensors (models/qwen3_dense.poem's
+/// `TRANSFORMERS`).
+const TRANSFORMERS: &[(&str, &str)] = &[
+    ("embed", "model.embed_tokens.weight"),
+    ("final_norm", "model.norm.weight"),
+    ("head", "lm_head.weight"),
+    ("attn_norm", "input_layernorm.weight"),
+    ("q", "self_attn.q_proj.weight"),
+    ("k", "self_attn.k_proj.weight"),
+    ("v", "self_attn.v_proj.weight"),
+    ("o", "self_attn.o_proj.weight"),
+    ("q_norm", "self_attn.q_norm.weight"),
+    ("k_norm", "self_attn.k_norm.weight"),
+    ("mlp_norm", "post_attention_layernorm.weight"),
+    ("gate", "mlp.gate_proj.weight"),
+    ("up", "mlp.up_proj.weight"),
+    ("down", "mlp.down_proj.weight"),
+];
+
+/// A poem parameter name's transformers tensor.
+fn transformers_name(name: &str) -> Option<String> {
+    let find = |k: &str| TRANSFORMERS.iter().find(|e| e.0 == k).map(|e| e.1);
+    match name.strip_prefix("layers.") {
+        Some(rest) => {
+            let (l, part) = rest.split_once('.')?;
+            l.parse::<usize>().ok()?;
+            Some(format!("model.layers.{l}.{}", find(part)?))
+        }
+        None => find(name).map(String::from),
+    }
 }
 
 type R<T> = std::result::Result<T, String>;
@@ -119,9 +179,47 @@ impl Ckpt {
             (vec![path], entries)
         };
         Ok(Ckpt {
-            paths,
-            entries,
+            inner: Inner::Files { paths, entries },
             config,
+        })
+    }
+
+    /// The load's checkpoint through PIE's checkpoint path: `contract`
+    /// (the runtime's for `trace`) run over `path` (an imported artifact or
+    /// a checkpoint directory), every `Checkpoint` param of `trace` landed
+    /// on the host as the trace declares it.
+    pub fn landed(trace: &poem_ir::Trace, contract: &checkpoint::contract::ModelContract, path: &Path) -> R<Ckpt> {
+        use checkpoint::executor::Execution;
+        use checkpoint::plan::{StorageTarget, compile_streaming};
+        use checkpoint::types::BackendKind;
+        let spec = super::plan::ModelSpec::read(trace).map_err(|e| e.to_string())?;
+        // The metadata names files under the path: one the executor can
+        // open from anywhere.
+        let path: &Path = &std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let (metadata, snapshot) = if path.is_dir() {
+            (checkpoint::file::read::parse_metadata(path).map_err(|e| e.to_string())?, path)
+        } else {
+            (
+                checkpoint::file::zt::parse(path).map_err(|e| e.to_string())?,
+                path.parent().unwrap_or(Path::new(".")),
+            )
+        };
+        let target = StorageTarget::for_backend(BackendKind::Cerebras, 0, 1);
+        let streaming = compile_streaming(&metadata, contract, target).map_err(|e| e.to_string())?;
+        let mut sink = Collect { trace, planes: HashMap::new() };
+        Execution::new(&streaming, snapshot)
+            .streaming()
+            .sink(&mut sink)
+            .run()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let parts = Parts {
+            q: spec.q_heads * spec.head_dim,
+            kv: spec.kv_heads * spec.head_dim,
+            inter: spec.inter,
+        };
+        Ok(Ckpt {
+            inner: Inner::Landed { planes: sink.planes, parts },
+            config: serde_json::Value::Null,
         })
     }
 
@@ -133,10 +231,14 @@ impl Ckpt {
     /// the wafer programs compute: `tie_word_embeddings` says (true ties
     /// whatever `lm_head.weight` holds, as Hugging Face loads it); without
     /// it, an `lm_head.weight` that differs from `embed_tokens` is untied.
+    /// A landed checkpoint states it by whether the trace has a `head`.
     pub fn tied_head(&self) -> R<bool> {
+        if let Inner::Landed { .. } = self.inner {
+            return Ok(!self.has("head"));
+        }
         let flag = self.config["tie_word_embeddings"].as_bool();
-        let same = if self.entries.contains_key("lm_head.weight") && flag.is_none() {
-            let (head, emb) = (self.get("lm_head.weight")?, self.get("model.embed_tokens.weight")?);
+        let same = if self.has("head") && flag.is_none() {
+            let (head, emb) = (self.get("head")?, self.get("embed")?);
             Some(head.shape == emb.shape && head.data == emb.data)
         } else {
             None
@@ -144,55 +246,123 @@ impl Ckpt {
         Ok(tied(flag, same))
     }
 
+    /// Whether the checkpoint holds the (poem) param `name`.
     pub fn has(&self, name: &str) -> bool {
-        self.entries.contains_key(name)
+        self.raw(name).is_ok_and(|r| r.is_some())
     }
 
-    fn raw(&self, name: &str) -> R<(&Entry, Vec<u8>)> {
-        let e = self
-            .entries
-            .get(name)
-            .ok_or_else(|| format!("{} has no tensor {name}", self.paths[0].display()))?;
-        let path = &self.paths[e.file];
-        let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let raw = read_at(&mut file, e.offset, e.elems() * e.dtype.bytes())?;
-        Ok((e, raw))
+    /// `name`'s dtype, shape and bytes (`None`: no such param).
+    fn raw(&self, name: &str) -> R<Option<(Dtype, Vec<usize>, Vec<u8>)>> {
+        match &self.inner {
+            Inner::Files { paths, entries } => {
+                let Some(e) = transformers_name(name).and_then(|n| entries.get(&n)) else {
+                    return Ok(None);
+                };
+                let path = &paths[e.file];
+                let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+                let raw = read_at(&mut file, e.offset, e.elems() * e.dtype.bytes())?;
+                Ok(Some((e.dtype, e.shape.clone(), raw)))
+            }
+            Inner::Landed { planes, parts } => {
+                if let Some(p) = planes.get(name) {
+                    return Ok(Some((p.dtype, p.shape.clone(), p.bytes.clone())));
+                }
+                // A part of a packed plane: rows [lo, hi) of `packed`.
+                let (layer, part) = match name.rsplit_once('.') {
+                    Some(x) => x,
+                    None => return Ok(None),
+                };
+                let (packed, lo, hi) = match part {
+                    "q" => ("qkv", 0, parts.q),
+                    "k" => ("qkv", parts.q, parts.q + parts.kv),
+                    "v" => ("qkv", parts.q + parts.kv, parts.q + 2 * parts.kv),
+                    "gate" => ("gate_up", 0, parts.inter),
+                    "up" => ("gate_up", parts.inter, 2 * parts.inter),
+                    _ => return Ok(None),
+                };
+                let Some(p) = planes.get(&format!("{layer}.{packed}")) else {
+                    return Ok(None);
+                };
+                let rows = p.shape.first().copied().unwrap_or(0);
+                if hi > rows {
+                    return Err(format!("{layer}.{packed} has {rows} rows; its {part} is rows {lo}..{hi}"));
+                }
+                let row = p.bytes.len() / rows.max(1);
+                let mut shape = p.shape.clone();
+                shape[0] = hi - lo;
+                Ok(Some((p.dtype, shape, p.bytes[lo * row..hi * row].to_vec())))
+            }
+        }
+    }
+
+    fn need(&self, name: &str) -> R<(Dtype, Vec<usize>, Vec<u8>)> {
+        self.raw(name)?.ok_or_else(|| format!("the checkpoint has no param {name}"))
     }
 
     /// A tensor's bf16 bits, row-major, and its shape: a bf16 tensor's
     /// untouched, a wider one's rounded to nearest even.
     pub fn bits(&self, name: &str) -> R<(Vec<usize>, Vec<u16>)> {
-        let (e, raw) = self.raw(name)?;
-        let bits = match e.dtype {
+        let (dtype, shape, raw) = self.need(name)?;
+        let bits = match dtype {
             Dtype::Bf16 => raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect(),
-            _ => {
-                let t = self.get(name)?;
-                t.data.iter().map(|&x| bf16_bits(x)).collect()
-            }
+            _ => widen(dtype, &raw).iter().map(|&x| bf16_bits(x)).collect(),
         };
-        Ok((e.shape.clone(), bits))
+        Ok((shape, bits))
     }
 
     pub fn get(&self, name: &str) -> R<Tensor> {
-        let (e, raw) = self.raw(name)?;
-        let data = match e.dtype {
-            Dtype::Bf16 => raw
-                .chunks_exact(2)
-                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
-                .collect(),
-            Dtype::F16 => raw
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect(),
-            Dtype::F32 => raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
+        let (dtype, shape, raw) = self.need(name)?;
+        Ok(Tensor { shape, data: widen(dtype, &raw) })
+    }
+}
+
+/// Collects the executor's planes by plan param name.
+struct Collect<'a> {
+    trace: &'a poem_ir::Trace,
+    planes: HashMap<String, Plane>,
+}
+
+impl checkpoint::executor::sink::TensorSink for Collect<'_> {
+    fn publish(&mut self, name: &str, bytes: &[u8]) -> std::result::Result<(), checkpoint::error::Error> {
+        let param = self.trace.params.iter().find(|p| p.name == name).ok_or_else(|| {
+            checkpoint::error::Error::Contract(format!("the load contract publishes `{name}`, which the trace does not name"))
+        })?;
+        let dtype = match param.dtype {
+            poem_ir::Dtype::Bf16 => Dtype::Bf16,
+            poem_ir::Dtype::F16 => Dtype::F16,
+            poem_ir::Dtype::F32 => Dtype::F32,
+            other => {
+                return Err(checkpoint::error::Error::Contract(format!(
+                    "`{name}` lands as {other:?}; the wafer places bf16, f16 or f32 weights"
+                )));
+            }
         };
-        Ok(Tensor {
-            shape: e.shape.clone(),
-            data,
-        })
+        let shape: Vec<usize> = param.shape.iter().map(|&d| d as usize).collect();
+        if bytes.len() != shape.iter().product::<usize>() * dtype.bytes() {
+            return Err(checkpoint::error::Error::Contract(format!(
+                "`{name}` lands {} bytes for {shape:?} {dtype:?}",
+                bytes.len()
+            )));
+        }
+        self.planes.insert(name.to_string(), Plane { dtype, shape, bytes: bytes.to_vec() });
+        Ok(())
+    }
+}
+
+fn widen(dtype: Dtype, raw: &[u8]) -> Vec<f32> {
+    match dtype {
+        Dtype::Bf16 => raw
+            .chunks_exact(2)
+            .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+            .collect(),
+        Dtype::F16 => raw
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        Dtype::F32 => raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
     }
 }
 
@@ -386,6 +556,36 @@ fn npy_header(b: &[u8]) -> R<(Dtype, Vec<usize>, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn poem_names_map_to_transformers() {
+        assert_eq!(transformers_name("embed").as_deref(), Some("model.embed_tokens.weight"));
+        assert_eq!(transformers_name("layers.7.gate").as_deref(), Some("model.layers.7.mlp.gate_proj.weight"));
+        assert_eq!(transformers_name("layers.0.attn_norm").as_deref(), Some("model.layers.0.input_layernorm.weight"));
+        assert_eq!(transformers_name("layers.x.q"), None);
+        assert_eq!(transformers_name("layers.0.qkv"), None);
+    }
+
+    /// Packed planes read in parts: `qkv` = q | k | v rows, `gate_up` = gate
+    /// | up.
+    #[test]
+    fn packed_planes_read_in_parts() {
+        let plane = |rows: usize, cols: usize| Plane {
+            dtype: Dtype::Bf16,
+            shape: vec![rows, cols],
+            bytes: (0..rows * cols).flat_map(|i| (i as u16).to_le_bytes()).collect(),
+        };
+        let planes = HashMap::from([("layers.0.qkv".to_string(), plane(8, 2)), ("layers.0.gate_up".to_string(), plane(6, 2))]);
+        let c = Ckpt { inner: Inner::Landed { planes, parts: Parts { q: 4, kv: 2, inter: 3 } }, config: serde_json::Value::Null };
+        assert_eq!(c.bits("layers.0.q").unwrap(), (vec![4, 2], (0..8).collect()));
+        assert_eq!(c.bits("layers.0.k").unwrap(), (vec![2, 2], (8..12).collect()));
+        assert_eq!(c.bits("layers.0.v").unwrap(), (vec![2, 2], (12..16).collect()));
+        assert_eq!(c.bits("layers.0.up").unwrap(), (vec![3, 2], (6..12).collect()));
+        assert!(c.has("layers.0.gate") && !c.has("layers.1.q") && !c.has("head"));
+        assert!(c.tied_head().unwrap());
+    }
+
     #[test]
     fn untied_heads_are_seen() {
         assert!(super::tied(None, None));

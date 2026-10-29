@@ -322,16 +322,16 @@ pub fn place(lay: &Layout2d, ckpt: &Ckpt, rope_theta: f64, sink: &mut dyn Sink) 
         return head(lay, ckpt, sink);
     }
     for l in 0..lay.layers() {
-        let p = format!("model.layers.{l}.");
-        let wq = get(&format!("{p}self_attn.q_proj.weight"), &[qdim, hid])?;
-        let wk = get(&format!("{p}self_attn.k_proj.weight"), &[nkv * d, hid])?;
-        let wv = get(&format!("{p}self_attn.v_proj.weight"), &[nkv * d, hid])?;
-        let wo = get(&format!("{p}self_attn.o_proj.weight"), &[hid, qdim])?;
-        let wg = get(&format!("{p}mlp.gate_proj.weight"), &[inter, hid])?;
-        let wu = get(&format!("{p}mlp.up_proj.weight"), &[inter, hid])?;
-        let wd = get(&format!("{p}mlp.down_proj.weight"), &[hid, inter])?;
-        let qn = get(&format!("{p}self_attn.q_norm.weight"), &[d])?;
-        let kn = get(&format!("{p}self_attn.k_norm.weight"), &[d])?;
+        let p = format!("layers.{l}.");
+        let wq = get(&format!("{p}q"), &[qdim, hid])?;
+        let wk = get(&format!("{p}k"), &[nkv * d, hid])?;
+        let wv = get(&format!("{p}v"), &[nkv * d, hid])?;
+        let wo = get(&format!("{p}o"), &[hid, qdim])?;
+        let wg = get(&format!("{p}gate"), &[inter, hid])?;
+        let wu = get(&format!("{p}up"), &[inter, hid])?;
+        let wd = get(&format!("{p}down"), &[hid, inter])?;
+        let qn = get(&format!("{p}q_norm"), &[d])?;
+        let kn = get(&format!("{p}k_norm"), &[d])?;
         let qkv_rows = (qh + 2) * dc;
         let mut wqkv = vec![0f32; pes * hc * qkv_rows];
         let mut qkn = vec![0f32; pes * 2 * dc];
@@ -412,8 +412,8 @@ pub fn place(lay: &Layout2d, ckpt: &Ckpt, rope_theta: f64, sink: &mut dyn Sink) 
         put(sink, "kc", &zeros_kv, origin, px_n, py_n, false)?;
         put(sink, "vc", &zeros_kv, origin, px_n, py_n, false)?;
         for (sym, name) in [
-            ("gamma1", "input_layernorm.weight"),
-            ("gamma2", "post_attention_layernorm.weight"),
+            ("gamma1", "attn_norm"),
+            ("gamma2", "mlp_norm"),
         ] {
             let v = get(&format!("{p}{name}"), &[hid])?;
             let col: Vec<f32> = (0..pes)
@@ -452,21 +452,21 @@ fn place_paged_layer(
     let qdim = nkv * 2 * d;
     let inter = p_n * ic;
     let pes = p_n * p_n;
-    let p = format!("model.layers.{l}.");
+    let p = format!("layers.{l}.");
     let get = |name: &str, shape: &[usize]| -> R<Tensor> {
         let t = ckpt.get(name)?;
         expect(&t, name, shape)?;
         Ok(t)
     };
-    let wq = get(&format!("{p}self_attn.q_proj.weight"), &[qdim, hid])?;
-    let wk = get(&format!("{p}self_attn.k_proj.weight"), &[nkv * d, hid])?;
-    let wv = get(&format!("{p}self_attn.v_proj.weight"), &[nkv * d, hid])?;
-    let wo = get(&format!("{p}self_attn.o_proj.weight"), &[hid, qdim])?;
-    let wg = get(&format!("{p}mlp.gate_proj.weight"), &[inter, hid])?;
-    let wu = get(&format!("{p}mlp.up_proj.weight"), &[inter, hid])?;
-    let wd = get(&format!("{p}mlp.down_proj.weight"), &[hid, inter])?;
-    let qn = get(&format!("{p}self_attn.q_norm.weight"), &[d])?;
-    let kn = get(&format!("{p}self_attn.k_norm.weight"), &[d])?;
+    let wq = get(&format!("{p}q"), &[qdim, hid])?;
+    let wk = get(&format!("{p}k"), &[nkv * d, hid])?;
+    let wv = get(&format!("{p}v"), &[nkv * d, hid])?;
+    let wo = get(&format!("{p}o"), &[hid, qdim])?;
+    let wg = get(&format!("{p}gate"), &[inter, hid])?;
+    let wu = get(&format!("{p}up"), &[inter, hid])?;
+    let wd = get(&format!("{p}down"), &[hid, inter])?;
+    let qn = get(&format!("{p}q_norm"), &[d])?;
+    let kn = get(&format!("{p}k_norm"), &[d])?;
     let sqrt_d = (d as f64).sqrt() as f32;
     let mut wqa = vec![0f32; pes * hc * 3 * dh];
     let mut wqv = vec![0f32; pes * hc * 3 * dh];
@@ -548,8 +548,8 @@ fn place_paged_layer(
     put(sink, "kc", &pool, origin, p_n, p_n, false)?;
     put(sink, "vc", &pool, origin, p_n, p_n, false)?;
     for (sym, name) in [
-        ("gamma1", "input_layernorm.weight"),
-        ("gamma2", "post_attention_layernorm.weight"),
+        ("gamma1", "attn_norm"),
+        ("gamma2", "mlp_norm"),
     ] {
         let v = get(&format!("{p}{name}"), &[hid])?;
         let col: Vec<f32> = (0..pes)
@@ -570,9 +570,9 @@ fn place_paged_layer(
 /// the final norm's gamma.
 fn head(lay: &Layout2d, ckpt: &Ckpt, sink: &mut dyn Sink) -> R<()> {
     let (hh, vr, hc, f) = (lay.hh, lay.vr, lay.hc, lay.feeder());
-    let emb = ckpt.get("model.embed_tokens.weight")?;
+    let emb = ckpt.get("embed")?;
     if emb.shape.len() != 2 || emb.shape[1] != lay.hidden {
-        return Err(format!("model.embed_tokens.weight is {:?}", emb.shape));
+        return Err(format!("embed is {:?}", emb.shape));
     }
     let hid = lay.hidden;
     let have = emb.shape[0].min(lay.vocab);
@@ -633,8 +633,8 @@ fn head(lay: &Layout2d, ckpt: &Ckpt, sink: &mut dyn Sink) -> R<()> {
             }
         }
     }
-    let norm = ckpt.get("model.norm.weight")?;
-    expect(&norm, "model.norm.weight", &[hid])?;
+    let norm = ckpt.get("final_norm")?;
+    expect(&norm, "final_norm", &[hid])?;
     for qs in &segments {
         let gam: Vec<f32> = qs
             .clone()

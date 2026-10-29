@@ -5,7 +5,11 @@
 //! copy's words as little-endian u32. Nothing runs on a device: for a
 //! byte-level comparison with `serve_lib8b.py` under a recording runtime.
 //!
-//! `serve8b_h2d <K:V,... params> <checkpoint dir> [rope_theta]`
+//! `serve8b_h2d <K:V,... params> <checkpoint dir> [rope_theta]`: the
+//! checkpoint read by transformers names (as the Python hosts read it);
+//! `serve8b_h2d <params> <checkpoint> --landed <deployment>`: through PIE's
+//! checkpoint path (the deployment's contract, poem names), as serving
+//! reads it. The two must list the same copies.
 
 use engine_cerebras::sdk::Rect;
 use engine_cerebras::spatial::ckpt::Ckpt;
@@ -51,10 +55,23 @@ fn main() -> Result<(), String> {
         .map(|(k, v)| (k.to_string(), v.parse().unwrap_or(0)))
         .collect();
     let lay = Layout2d::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1)).ok_or("not a serve8b build")??;
-    let ckpt = Ckpt::open(std::path::Path::new(args.get(2).ok_or("a checkpoint dir")?))?;
-    let theta = match args.get(3) {
-        Some(t) => t.parse().map_err(|e| format!("{e}"))?,
-        None => ckpt.config()["rope_theta"].as_f64().unwrap_or(1.0e6),
+    let dir = std::path::Path::new(args.get(2).ok_or("a checkpoint dir")?);
+    let (ckpt, theta) = if args.get(3).is_some_and(|a| a == "--landed") {
+        let name = args.get(4).ok_or("a deployment")?;
+        let deployment = poem_compiler::catalog::repository().parse(name).ok_or("no such deployment")?;
+        let platform = poem_ir::Platform::Cerebras;
+        let trace = deployment.trace(platform);
+        let source = checkpoint::file::snapshot::open(dir).map_err(|e| e.to_string())?;
+        let contract = deployment.contract(&source, platform).map_err(|e| e.to_string())?;
+        let spec = engine_cerebras::spatial::plan::ModelSpec::read(&trace).map_err(|e| e.to_string())?;
+        (Ckpt::landed(&trace, &contract, dir)?, f64::from(spec.rope_theta))
+    } else {
+        let ckpt = Ckpt::open(dir)?;
+        let theta = match args.get(3) {
+            Some(t) => t.parse().map_err(|e| format!("{e}"))?,
+            None => ckpt.config()["rope_theta"].as_f64().unwrap_or(1.0e6),
+        };
+        (ckpt, theta)
     };
     let mut rec = Record;
     // serve8b_region with HROUTE: a stand-in for the program's route

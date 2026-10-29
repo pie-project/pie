@@ -45,8 +45,10 @@
 //!
 //! Or, with no daemon, the wafer program in this process ([`wafer`]): the
 //! compiled `serve28s` program's output directory, run on the `[cerebras]`
-//! platform (`cmaddr`, else the simulator), its weights placed from `ckpt`
-//! (`model.safetensors` or `weights.npz`, with `config.json`):
+//! platform (`cmaddr`, else the simulator), its weights read through PIE's
+//! checkpoint path (the load's contract over its checkpoint, by the model's
+//! parameter names); `ckpt` names a Hugging Face directory to read instead
+//! (`model.safetensors`, its shards, or `weights.npz`, with `config.json`):
 //!
 //! ```toml
 //! [cerebras.spatial]
@@ -2261,6 +2263,8 @@ impl Engine for Spatial {
         // The model as the spatial kernels see it: refused here unless its
         // structure is one they implement (spatial/plan.rs).
         let spec = plan::ModelSpec::read(&trace).map_err(|e| Error::Load(e.to_string()))?;
+        // The weights land by the trace's params (the shell takes the trace).
+        let weights_trace = trace.clone();
         self.params = {
             let (h, hd) = (spec.hidden as f64, spec.head_dim as f64);
             let attn = h * hd * (2 * spec.q_heads + 2 * spec.kv_heads) as f64;
@@ -2339,7 +2343,15 @@ impl Engine for Spatial {
             };
             let launch = wafer::Launch::named(self.spatial.launch.as_deref());
             let theta = Some(f64::from(spec.rope_theta));
-            let w = wafer::Wafer::open(program.into(), ckpt.clone().into(), platform, launch, theta)
+            // The weights through PIE's checkpoint path (the load's contract
+            // over its checkpoint); `ckpt` names a Hugging Face directory
+            // instead (checks against the Python hosts).
+            let weights = match &self.spatial.ckpt {
+                Some(dir) => ckpt::Ckpt::open(Path::new(dir)),
+                None => ckpt::Ckpt::landed(&weights_trace, &contract, Path::new(&path)),
+            }
+            .map_err(|e| Error::Load(format!("the spatial wafer model's weights: {e}")))?;
+            let w = wafer::Wafer::open(program.into(), weights, platform, launch, theta)
                 .map_err(|e| Error::Load(format!("the spatial wafer model: {e}")))?;
             tracing::info!(program, ckpt, vocab = w.vocab, hidden = w.hidden, "spatial wafer model loaded");
             // A batched build owns the KV as PIE's pages, as a paged daemon.
