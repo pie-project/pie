@@ -1252,7 +1252,8 @@ fn build_lt_plan(
     // 256x128 and 128x128 too, whole or split in two or three, a split's
     // partials summed in f32 as above.
     if retiled(m) {
-        let fresh = |algo: &lt::cublasLtMatmulAlgo_t, have: &[lt::cublasLtMatmulHeuristicResult_t]| {
+        let fresh = |algo: &lt::cublasLtMatmulAlgo_t,
+                     have: &[lt::cublasLtMatmulHeuristicResult_t]| {
             !have.iter().any(|h| h.algo.data == algo.data)
         };
         let mut retiles: Vec<lt::cublasLtMatmulHeuristicResult_t> = Vec::new();
@@ -1327,7 +1328,8 @@ fn build_lt_plan(
                             &raw mut result,
                         )
                     };
-                    if checked != ok || result.state != ok || result.workspaceSize > workspace_bytes {
+                    if checked != ok || result.state != ok || result.workspaceSize > workspace_bytes
+                    {
                         clear_error();
                         continue;
                     }
