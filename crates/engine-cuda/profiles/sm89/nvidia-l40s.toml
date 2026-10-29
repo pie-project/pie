@@ -13,7 +13,10 @@ moe.nvfp4_mma_until = 65536
 gemm.fp8_shadow = true
 # A single-token row of a 16-query-head group (Muse Glimmer) reads the cache
 # through the prefill kernel: c256 decode 3118 to 3173 tok/s.
-sdpa.decode.grouped_prefill_from = 16
+sdpa.decode.grouped_prefill_from = 8
+sdpa.decode.grouped_prefill_lse = true
+sdpa.decode.grouped_prefill_window = true
+sdpa.fa2_live = true
 sdpa.index_mma = true
 sdpa.index_radix = true
 elemwise.hc_tile = true
