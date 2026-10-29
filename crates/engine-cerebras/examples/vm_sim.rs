@@ -94,6 +94,8 @@ fn main() -> Result<(), String> {
         pool_words: u(&case["pool_words"]),
         feat: u(&case["feat"]),
         remat: false,
+        bank_regs: Vec::new(),
+        bank_pool: Vec::new(),
     };
     let seeds: Vec<Seed> = table
         .homes

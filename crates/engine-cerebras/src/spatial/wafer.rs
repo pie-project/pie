@@ -163,7 +163,17 @@ impl Design {
         };
         match (built.as_deref(), super::serve2d::Layout2d::of(get)) {
             (Some("serve2d" | "serve2d_pipe" | "serve8b" | "serve8b_region") | None, Some(grid)) => grid
-                .map(Design::Grid)
+                .map(|mut g| {
+                    // guest4hz's vmlane is 3 words a virtual lane (its size
+                    // on the head's chunk PEs tells).
+                    if let (Some(_), Some(m), Some(shape)) = (g.vm, g.mmax, g.paged) {
+                        let hz = super::guest4::lane::symbol_words(program, "vmlane") == Some(m * shape.lanes * 3);
+                        if hz {
+                            g.vmlane_words = 3;
+                        }
+                    }
+                    Design::Grid(g)
+                })
                 .map_err(|e| format!("{}: {e}", path.display())),
             (Some(d), _) => Err(format!("{}: PIE built a `{d}` program, which this engine does not serve", program.display())),
             (None, None) => Layout::read(program).map(Design::Strips),
@@ -543,7 +553,13 @@ struct Vm {
     gmode: u32,
     steps: u64,
     loaded: bool,
+    /// A per-lane-program image's arena and windows as placed.
+    slots: super::guest4::slots::Slots,
 }
+
+/// A lane's step input for one launch: its entries and their channels'
+/// words (`None`: a lane without).
+pub type StepInput = Option<(Vec<super::guest4::slots::StepEntry>, Vec<Vec<u32>>)>;
 
 /// One VM step's answer: the token the VM sampled (the head embedded it),
 /// the step's `out` words, the pool after it.
@@ -695,6 +711,7 @@ impl WaferModel {
                 gmode: 0,
                 steps: 0,
                 loaded: false,
+                slots: super::guest4::slots::Slots::default(),
             });
         }
         // One request (position 0; later requests overwrite its KV) so the
@@ -737,12 +754,12 @@ impl WaferModel {
             return Some("the wafer program has no VM".into());
         };
         if !table.per_step.is_empty() {
-            return Some("the host writes some of its homes every step".into());
+            return Some("the host writes some of its homes every step; this path writes no step input".into());
         }
         if vm.ring.lanes != 1 {
             return Some(format!("the VM time-multiplexes {} lanes; this path drives one", vm.ring.lanes));
         }
-        vm.lay.refuses(table).or_else(|| vm.ring.refuses_outputs(&table.outputs))
+        vm.lay.refuses_head(table).or_else(|| vm.ring.refuses_outputs(&table.outputs))
     }
 
     /// Loads `table` on the head's VM, its homes seeded with `seeds` (a
@@ -771,6 +788,15 @@ impl WaferModel {
         let lanes = vm.ring.lanes as usize;
         let empty: Vec<Vec<super::guest4::wafer::Seed>> = (0..lanes).map(|_| Vec::new()).collect();
         super::guest4::wafer::write_banks(&mut self.rt, &vm.lay, &empty)?;
+        if vm.lay.sin > 0 {
+            let entries = if table.per_step.is_empty() {
+                Vec::new()
+            } else {
+                super::guest4::slots::step_entries(&vm.lay, table)?
+            };
+            let words = super::guest4::slots::gsdesc(&vec![entries; lanes]);
+            super::guest4::wafer::write_gsdesc(&mut self.rt, &vm.lay, &words)?;
+        }
         vm.gmode = 1;
         vm.steps = 0;
         vm.loaded = true;
@@ -800,13 +826,57 @@ impl WaferModel {
         wafer::write_bank_images(&mut self.rt, &vm.lay, &images)
     }
 
+    /// The head's VM, if the program has one: its layout and out ring.
+    pub fn vm_shape(&self) -> Option<(super::guest4::wafer::VmLayout, super::guest4::lane::Ring)> {
+        self.vm.as_ref().map(|vm| (vm.lay, vm.ring))
+    }
+
+    /// A per-lane-program image's lanes: each its program (`None`: idle),
+    /// the arena and windows compacted again, a lane on the same program
+    /// keeping its window's state, a lane in `seeds` starting from them.
+    pub fn vm_place_lanes(
+        &mut self,
+        programs: &[Option<super::guest4::slots::LaneProgram>],
+        seeds: &[Option<Vec<super::guest4::wafer::Seed>>],
+    ) -> R<()> {
+        use super::guest4::{slots::Slots, wafer};
+        let vm = self.vm.as_mut().ok_or("the wafer program has no VM")?;
+        if !vm.lay.lprog {
+            return Err("the VM image runs one program for every lane (no vm_lprog)".into());
+        }
+        if programs.len() != vm.ring.lanes as usize {
+            return Err(format!("{} lanes for a VM of {}", programs.len(), vm.ring.lanes));
+        }
+        let slots = Slots::plan(&vm.lay, programs)?;
+        let banks = if vm.loaded {
+            wafer::read_bank_words(&mut self.rt, &vm.lay, vm.lay.bank_words)?
+        } else {
+            Vec::new()
+        };
+        let old = if vm.loaded { vm.slots.clone() } else { Slots::default() };
+        let images = slots.rebank(&vm.lay, &old, &banks, seeds)?;
+        wafer::load_slots(&mut self.rt, &vm.lay, &slots, &images, !vm.loaded)?;
+        if !vm.loaded {
+            vm.steps = 0;
+        }
+        vm.gmode = 1;
+        vm.loaded = true;
+        vm.slots = slots;
+        Ok(())
+    }
+
     /// One lap of a multi-lane VM launch: `lanes` (one per VM lane, in lane
     /// order m·B + b; idle lanes repeat a live one) each forced its token,
     /// the VM sampling every lane's next one from its bank. The banks of
     /// `keep` (lanes whose requests sat this launch out) come back as they
     /// were: an idle lane's turn runs on its bank. Per lane: the token the VM
     /// sampled, the turn's `out` words, its pool after it.
-    pub fn vm_fire(&mut self, lanes: &[super::serve2d::BatchLane], keep: &[usize]) -> R<Vec<VmStep>> {
+    pub fn vm_fire(
+        &mut self,
+        lanes: &[super::serve2d::BatchLane],
+        keep: &[usize],
+        inputs: &[StepInput],
+    ) -> R<Vec<VmStep>> {
         use super::guest4::wafer;
         let Design::Grid(grid) = &self.design else {
             return Err("a VM launch on a strip program".into());
@@ -821,11 +891,28 @@ impl WaferModel {
                 vm.loaded
             ));
         }
+        // The step-input ring has `ring_d` slots: a launch's turns, skips
+        // included, must fit it.
+        if n > vm.ring.depth as usize {
+            return Err(format!("a launch of {n} turns on a VM ring of {}", vm.ring.depth));
+        }
         if vm.gmode != 1 {
             wafer::set_gmode(&mut self.rt, &vm.lay, 1)?;
             vm.gmode = 1;
         }
-        let saved = if keep.is_empty() { None } else { Some(wafer::read_banks(&mut self.rt, &vm.lay, n)?) };
+        if vm.lay.sin > 0 {
+            let mut inputs = inputs.to_vec();
+            inputs.resize(n, None);
+            let images = super::guest4::slots::step_images(&vm.lay, vm.ring.depth as usize, &inputs);
+            wafer::write_step(&mut self.rt, &vm.lay, &images)?;
+        } else if inputs.iter().any(Option::is_some) {
+            return Err("step input for a VM image without it".into());
+        }
+        let lp = vm.lay.lprog;
+        let read_all = |rt: &mut crate::sdk::Runtime, lay: &wafer::VmLayout| {
+            if lp { wafer::read_bank_words(rt, lay, lay.bank_words) } else { wafer::read_banks(rt, lay, n) }
+        };
+        let saved = if keep.is_empty() { None } else { Some(read_all(&mut self.rt, &vm.lay)?) };
         self.launches += 1;
         self.steps += 1;
         self.lane_steps += n as u64;
@@ -833,11 +920,20 @@ impl WaferModel {
         let (tokens, _) = super::serve2d::fire_lanes(grid, &mut self.rt, lanes, 1, false, Some(&sampled))?;
         let rows = wafer::read_out_lanes(&mut self.rt, &vm.lay, vm.ring, vm.steps)?;
         vm.steps += 1;
-        let pools = wafer::read_bank_pools(&mut self.rt, &vm.lay, n)?;
+        let pools = if lp {
+            let hub = wafer::read_hub_bank(&mut self.rt, &vm.lay)?;
+            vm.slots.pools(&vm.lay, &hub)
+        } else {
+            wafer::read_bank_pools(&mut self.rt, &vm.lay, n)?
+        };
         if let Some(saved) = saved {
-            let mut now = wafer::read_banks(&mut self.rt, &vm.lay, n)?;
+            let mut now = read_all(&mut self.rt, &vm.lay)?;
             for &lane in keep {
-                wafer::copy_bank(&vm.lay, n, lane, &saved, &mut now);
+                if lp {
+                    vm.slots.copy_window(&vm.lay, lane, &saved, &mut now);
+                } else {
+                    wafer::copy_bank(&vm.lay, n, lane, &saved, &mut now);
+                }
             }
             wafer::write_bank_images(&mut self.rt, &vm.lay, &now)?;
         }
@@ -929,6 +1025,35 @@ impl WaferModel {
             return Err("page copies on a strip program".into());
         };
         super::serve2d::copy_pages(grid, &mut self.rt, pairs)
+    }
+
+    /// Words of one page's host copy, if the host can keep this program's
+    /// pages (the host tier).
+    pub fn page_words(&self) -> Option<usize> {
+        match &self.design {
+            Design::Grid(grid) => super::serve2d::page_words(grid),
+            Design::Strips(_) => None,
+        }
+    }
+
+    /// `pages`' cells off the device, a page each (the host tier's
+    /// suspension). Only between launches.
+    pub fn page_out(&mut self, pages: &[u32]) -> R<Vec<Vec<u32>>> {
+        let Design::Grid(grid) = &self.design else {
+            return Err("host pages on a strip program".into());
+        };
+        pages.iter().map(|&p| super::serve2d::read_page(grid, &mut self.rt, p)).collect()
+    }
+
+    /// Host copies back into device pages (a resumed lane's).
+    pub fn page_in(&mut self, pages: &[(u32, Vec<u32>)]) -> R<()> {
+        let Design::Grid(grid) = &self.design else {
+            return Err("host pages on a strip program".into());
+        };
+        for (page, words) in pages {
+            super::serve2d::write_page(grid, &mut self.rt, *page, words)?;
+        }
+        Ok(())
     }
 
     /// One launch: head iterations 0..=steps, iteration i forcing forced[i]
@@ -1101,6 +1226,10 @@ enum Job {
     },
     /// A batched build's whole-page copies (answered on the batch channel).
     Copy { pairs: Vec<(u32, u32)> },
+    /// Pages to and from the host tier (the batch channel: the pages'
+    /// words as the answer's rows).
+    PageOut { pages: Vec<u32> },
+    PageIn { pages: Vec<(u32, Vec<u32>)> },
     /// A program onto the head's VM, and one VM step (the VM channel).
     VmLoad {
         program: std::sync::Arc<super::guest4::lane::Program>,
@@ -1119,6 +1248,12 @@ enum Job {
     VmFire {
         lanes: Vec<super::serve2d::BatchLane>,
         keep: Vec<usize>,
+        inputs: Vec<StepInput>,
+    },
+    /// A per-lane-program image's lanes placed.
+    VmPlaceLanes {
+        programs: Vec<Option<super::guest4::slots::LaneProgram>>,
+        seeds: Vec<Option<Vec<super::guest4::wafer::Seed>>>,
     },
 }
 
@@ -1144,6 +1279,9 @@ pub struct Wafer {
     pub positions: usize,
     /// The head's eta VM (its shape and out ring), when the build has one.
     pub vm: Option<(super::guest4::wafer::VmLayout, super::guest4::lane::Ring)>,
+    /// Words of one page's host copy (`None`: the host keeps no pages of
+    /// this build).
+    pub page_words: Option<usize>,
     vm_answers: mpsc::Receiver<R<Vec<VmStep>>>,
     thread: Option<std::thread::JoinHandle<()>>,
     pub vocab: usize,
@@ -1187,6 +1325,7 @@ impl Wafer {
                             logit_lanes,
                             positions: m.design.positions(),
                             vm: m.vm.as_ref().map(|vm| (vm.lay, vm.ring)),
+                            page_words: m.page_words(),
                             thread: None,
                             vocab: m.design.vocab(),
                             hidden: m.design.hidden(),
@@ -1232,8 +1371,15 @@ impl Wafer {
                             }
                             continue;
                         }
-                        Job::VmFire { lanes, keep } => {
-                            let reply = model.vm_fire(&lanes, &keep);
+                        Job::VmPlaceLanes { programs, seeds } => {
+                            let reply = model.vm_place_lanes(&programs, &seeds).map(|()| Vec::new());
+                            if vm_tx.send(reply).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Job::VmFire { lanes, keep, inputs } => {
+                            let reply = model.vm_fire(&lanes, &keep, &inputs);
                             if vm_tx.send(reply).is_err() {
                                 break;
                             }
@@ -1242,6 +1388,20 @@ impl Wafer {
                         Job::VmStep { token, start } => {
                             let reply = model.vm_step(token, start).map(|step| vec![step]);
                             if vm_tx.send(reply).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Job::PageOut { pages } => {
+                            let reply = model.page_out(&pages).map(|words| (words, Vec::new()));
+                            if batch_tx.send(reply).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Job::PageIn { pages } => {
+                            let reply = model.page_in(&pages).map(|()| (Vec::new(), Vec::new()));
+                            if batch_tx.send(reply).is_err() {
                                 break;
                             }
                             continue;
@@ -1317,12 +1477,12 @@ impl Wafer {
             return Some("the wafer program has no VM".into());
         };
         if !table.per_step.is_empty() {
-            return Some("the host writes some of its homes every step".into());
+            return Some("the host writes some of its homes every step; this path writes no step input".into());
         }
         if ring.lanes != 1 {
             return Some(format!("the VM time-multiplexes {} lanes; this path drives one", ring.lanes));
         }
-        lay.refuses(table).or_else(|| ring.refuses_outputs(&table.outputs))
+        lay.refuses_head(table).or_else(|| ring.refuses_outputs(&table.outputs))
     }
 
     /// [`WaferModel::vm_load`] on the wafer's thread.
@@ -1356,9 +1516,24 @@ impl Wafer {
     }
 
     /// [`WaferModel::vm_fire`] on the wafer's thread.
-    pub fn vm_fire(&mut self, lanes: Vec<super::serve2d::BatchLane>, keep: Vec<usize>) -> R<Vec<VmStep>> {
+    pub fn vm_fire(
+        &mut self,
+        lanes: Vec<super::serve2d::BatchLane>,
+        keep: Vec<usize>,
+        inputs: Vec<StepInput>,
+    ) -> R<Vec<VmStep>> {
         let _busy = super::Busy::start();
-        self.vm_job(Job::VmFire { lanes, keep })
+        self.vm_job(Job::VmFire { lanes, keep, inputs })
+    }
+
+    /// [`WaferModel::vm_place_lanes`] on the wafer's thread.
+    pub fn vm_place_lanes(
+        &mut self,
+        programs: Vec<Option<super::guest4::slots::LaneProgram>>,
+        seeds: Vec<Option<Vec<super::guest4::wafer::Seed>>>,
+    ) -> R<()> {
+        let _busy = super::Busy::start();
+        self.vm_job(Job::VmPlaceLanes { programs, seeds }).map(drop)
     }
 
     fn vm_job(&mut self, job: Job) -> R<Vec<VmStep>> {
@@ -1388,6 +1563,34 @@ impl Wafer {
     }
 
     /// [`WaferModel::copy_pages`] on the wafer's thread.
+    /// [`WaferModel::page_out`] on the wafer's thread.
+    pub fn page_out(&mut self, pages: Vec<u32>) -> R<Vec<Vec<u32>>> {
+        let _busy = super::Busy::start();
+        self.jobs
+            .as_ref()
+            .ok_or("the wafer is closed")?
+            .send(Job::PageOut { pages })
+            .map_err(|_| "the wafer thread went away".to_string())?;
+        self.batch_answers
+            .recv()
+            .map_err(|_| "the wafer thread went away".to_string())?
+            .map(|(words, _)| words)
+    }
+
+    /// [`WaferModel::page_in`] on the wafer's thread.
+    pub fn page_in(&mut self, pages: Vec<(u32, Vec<u32>)>) -> R<()> {
+        let _busy = super::Busy::start();
+        self.jobs
+            .as_ref()
+            .ok_or("the wafer is closed")?
+            .send(Job::PageIn { pages })
+            .map_err(|_| "the wafer thread went away".to_string())?;
+        self.batch_answers
+            .recv()
+            .map_err(|_| "the wafer thread went away".to_string())?
+            .map(drop)
+    }
+
     pub fn copy_pages(&mut self, pairs: Vec<(u32, u32)>) -> R<()> {
         let _busy = super::Busy::start();
         self.jobs

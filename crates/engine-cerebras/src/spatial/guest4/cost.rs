@@ -144,6 +144,8 @@ mod tests {
             pool_words: 1,
             feat: 0,
             remat: false,
+            bank_regs: Vec::new(),
+            bank_pool: Vec::new(),
         }
     }
 

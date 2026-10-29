@@ -293,6 +293,76 @@ pub fn copy_pages_host(rt: &mut Runtime, pool: &HostPool, pairs: &[(u32, u32)]) 
     Ok(())
 }
 
+/// Words of one page's host copy: every grid's `kc` then `vc`, each
+/// column's `cells` of it.
+pub fn page_words(pool: &HostPool) -> usize {
+    pool.grids.len() * 2 * pool.cols * pool.cells
+}
+
+/// Block `b` of every column of a row (`len` elements a PE, one leading
+/// pad), the columns' cells back to back.
+pub fn take_block(row: &[u32], len: usize, cells: usize, b: usize) -> Vec<u32> {
+    row.chunks_exact(len).flat_map(|c| c[1 + b * cells..1 + (b + 1) * cells].iter().copied()).collect()
+}
+
+/// [`take_block`]'s words back into block `b` of every column of `row`.
+pub fn put_block(row: &mut [u32], len: usize, cells: usize, b: usize, words: &[u32]) {
+    for (c, w) in row.chunks_exact_mut(len).zip(words.chunks_exact(cells)) {
+        c[1 + b * cells..1 + (b + 1) * cells].copy_from_slice(w);
+    }
+}
+
+/// Page `page`'s cells off the device ([`page_words`] of them, as the
+/// pool's memcpy gives them): what the host keeps while its lane is
+/// suspended. Only between launches.
+pub fn read_page_host(rt: &mut Runtime, pool: &HostPool, page: u32) -> R<Vec<u32>> {
+    let (rows, len) = (pool.shape.rows, pool.len());
+    let page = page as usize;
+    if page >= pool.shape.pages() {
+        return Err(format!("page {page} outside a pool of {}", pool.shape.pages()));
+    }
+    let (r, b) = (page % rows, page / rows);
+    let mut out = Vec::with_capacity(page_words(pool));
+    for &(x0, y0) in &pool.grids {
+        let rect = Rect { x: x0 as i32, y: (y0 + r) as i32, w: pool.cols as i32, h: 1 };
+        for sym in [SYMBOLS.kc, SYMBOLS.vc] {
+            let mut row = vec![0u32; pool.cols * len];
+            rt.memcpy_d2h(sym, &mut row, rect, len, Order::RowMajor, pool.data_type)
+                .map_err(|e| e.to_string())?;
+            out.extend(take_block(&row, len, pool.cells, b));
+        }
+    }
+    Ok(out)
+}
+
+/// [`read_page_host`]'s words written into page `page` (any page: a
+/// resumed lane's pages come back where the pool has room).
+pub fn write_page_host(rt: &mut Runtime, pool: &HostPool, page: u32, words: &[u32]) -> R<()> {
+    let (rows, len) = (pool.shape.rows, pool.len());
+    let page = page as usize;
+    if page >= pool.shape.pages() {
+        return Err(format!("page {page} outside a pool of {}", pool.shape.pages()));
+    }
+    if words.len() != page_words(pool) {
+        return Err(format!("a page of {} words for pages of {}", words.len(), page_words(pool)));
+    }
+    let (r, b) = (page % rows, page / rows);
+    let part = pool.cols * pool.cells;
+    let mut parts = words.chunks_exact(part);
+    for &(x0, y0) in &pool.grids {
+        let rect = Rect { x: x0 as i32, y: (y0 + r) as i32, w: pool.cols as i32, h: 1 };
+        for sym in [SYMBOLS.kc, SYMBOLS.vc] {
+            let mut row = vec![0u32; pool.cols * len];
+            rt.memcpy_d2h(sym, &mut row, rect, len, Order::RowMajor, pool.data_type)
+                .map_err(|e| e.to_string())?;
+            put_block(&mut row, len, pool.cells, b, parts.next().ok_or("short page")?);
+            rt.memcpy_h2d(sym, &row, rect, len, Order::RowMajor, pool.data_type)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +374,22 @@ mod tests {
         blocks: 4,
         entries: 2,
     };
+
+    #[test]
+    fn a_page_s_block_round_trips_word_for_word() {
+        // Three columns of 2 blocks of 4 cells (one pad each): block 1 out of
+        // one row, into block 0 of another, and back out the same.
+        let (len, cells) = (1 + 2 * 4, 4);
+        let row: Vec<u32> = (0..3 * len as u32).map(|i| 0x1000 + i).collect();
+        let words = take_block(&row, len, cells, 1);
+        assert_eq!(words.len(), 12);
+        assert_eq!(&words[..4], &row[5..9]);
+        let mut other = vec![0u32; 3 * len];
+        put_block(&mut other, len, cells, 0, &words);
+        assert_eq!(take_block(&other, len, cells, 0), words);
+        // Nothing else moved: pads and block 1 stay zero.
+        assert!(other.chunks_exact(len).all(|c| c[0] == 0 && c[5..].iter().all(|&w| w == 0)));
+    }
 
     fn row(tab: &[u32], r: usize) -> &[u32] {
         let w = SHAPE.row_words();

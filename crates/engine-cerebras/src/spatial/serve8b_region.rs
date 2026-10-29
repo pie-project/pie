@@ -167,6 +167,8 @@ pub fn layout(get: &dyn Fn(&str) -> Option<usize>) -> R<Layout2d> {
         host_copy: true,
         vm: None,
         hlm: None,
+        hlbn: get("HLBN"),
+        vmlane_words: 2,
         s8b: Some(S8b::Units(u)),
     };
     let c = lay.chunk_cols();

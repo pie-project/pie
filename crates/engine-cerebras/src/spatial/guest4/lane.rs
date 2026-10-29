@@ -121,6 +121,20 @@ pub fn ring_words(program_dir: &std::path::Path) -> Result<usize, String> {
     }
 }
 
+/// The words of the largest object `name` any PE image in `program_dir`
+/// defines (`None`: none does).
+pub fn symbol_words(program_dir: &std::path::Path, name: &str) -> Option<usize> {
+    let entries = std::fs::read_dir(program_dir.join("bin")).ok()?;
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "elf"))
+        .filter_map(|p| std::fs::read(&p).ok())
+        .filter_map(|image| elf_symbol_size(&image, name))
+        .map(|size| size as usize / 4)
+        .max()
+}
+
 /// The size of the object `name` in a little-endian ELF64 image's symbol
 /// table.
 fn elf_symbol_size(image: &[u8], name: &str) -> Option<u64> {
@@ -490,6 +504,8 @@ mod tests {
                 pool_words: 1,
                 feat: 0,
                 remat: false,
+                bank_regs: Vec::new(),
+                bank_pool: Vec::new(),
             },
             epilogue: 0,
             homes: [0, 3].into(),

@@ -104,6 +104,8 @@ pub fn layout(get: &dyn Fn(&str) -> Option<usize>) -> R<Layout2d> {
         host_copy: get("KVCP").unwrap_or(1) == 0,
         vm: None,
         hlm: None,
+        hlbn: get("HLBN"),
+        vmlane_words: 2,
         s8b: Some(S8b::Strips { full }),
     };
     let c = lay.chunk_cols();

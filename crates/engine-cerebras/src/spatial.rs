@@ -729,6 +729,10 @@ struct Kv {
     /// it last ran (to give the least recent away).
     cached: Vec<Cached>,
     clock: u64,
+    /// The host tier: suspended pages by host page id, the device page's
+    /// words and its cells' tokens; at most `host_pages` of them.
+    host: std::collections::HashMap<u32, (Vec<u32>, Option<Vec<Option<u32>>>)>,
+    host_pages: u32,
 }
 
 impl Kv {
@@ -921,6 +925,9 @@ pub struct Spatial {
     /// A multi-lane VM: the program it holds and each lane's request.
     vm_program: Option<u64>,
     vm_banks: Vec<Option<InstanceId>>,
+    /// A per-lane-program VM: each lane's program as placed (empty until
+    /// the first placement).
+    vm_bank_progs: Vec<Option<u64>>,
     /// Fires run (the model-time log's count).
     fires: u64,
     /// Epilogue steps the guest VM ran.
@@ -961,6 +968,7 @@ impl Spatial {
             vm_owner: None,
             vm_program: None,
             vm_banks: Vec::new(),
+            vm_bank_progs: Vec::new(),
             fires: 0,
             guest_steps: 0,
             replayed: 0,
@@ -1261,31 +1269,14 @@ impl Spatial {
     }
 
     /// When a table the VM can take runs there: the config's
-    /// `token_cycles`, `pre_margin` and `main_fraction`, else
-    /// `PIE_SPATIAL_TOKEN_CYCLES`, `PIE_SPATIAL_PRE_MARGIN` and
-    /// `PIE_SPATIAL_MAIN_FRACTION`, else the token from the model's size and
-    /// `COVERAGE.md`'s thresholds.
+    /// `token_cycles`, `pre_margin` and `main_fraction`, else the token from
+    /// the model's size and `COVERAGE.md`'s thresholds.
     fn placement(&self) -> guest4::cost::Placement {
-        fn env<T: std::str::FromStr>(name: &str) -> Option<T> {
-            std::env::var(name).ok().and_then(|v| v.parse().ok())
-        }
         use guest4::cost::{Placement, token_cycles};
         Placement {
-            token_cycles: self
-                .spatial
-                .token_cycles
-                .or_else(|| env("PIE_SPATIAL_TOKEN_CYCLES"))
-                .unwrap_or_else(|| token_cycles(self.params)),
-            pre_margin: self
-                .spatial
-                .pre_margin
-                .or_else(|| env("PIE_SPATIAL_PRE_MARGIN"))
-                .unwrap_or(Placement::PRE_MARGIN),
-            main_fraction: self
-                .spatial
-                .main_fraction
-                .or_else(|| env("PIE_SPATIAL_MAIN_FRACTION"))
-                .unwrap_or(Placement::MAIN_FRACTION),
+            token_cycles: self.spatial.token_cycles.unwrap_or_else(|| token_cycles(self.params)),
+            pre_margin: self.spatial.pre_margin.unwrap_or(Placement::PRE_MARGIN),
+            main_fraction: self.spatial.main_fraction.unwrap_or(Placement::MAIN_FRACTION),
         }
     }
 
@@ -1446,14 +1437,14 @@ impl Spatial {
         let Some(guest) = self.guest_programs.get(&program.0) else {
             return false;
         };
-        if !guest.table.per_step.is_empty()
-            || self.guest_costly.contains_key(&program.0)
+        if self.guest_costly.contains_key(&program.0)
             || lay.refuses(&guest.table).or_else(|| ring.refuses_outputs(&guest.table.outputs)).is_some()
         {
             return false;
         }
         let live = |owner: &Option<InstanceId>| owner.is_some_and(|o| self.programs.instance_view(o).is_some());
-        if self.vm_program.is_some_and(|p| p != program.0) && self.vm_banks.iter().any(live) {
+        // One program for every lane, unless the image runs a program a lane.
+        if !lay.lprog && self.vm_program.is_some_and(|p| p != program.0) && self.vm_banks.iter().any(live) {
             return false;
         }
         self.vm_banks.iter().any(|o| *o == Some(instance))
@@ -1474,23 +1465,11 @@ impl Spatial {
         lanes: &[(InstanceId, &PagedLane)],
     ) -> EngineResult<Vec<Option<(InstanceId, Vec<u32>, Vec<u32>)>>> {
         let device = |e: String| Error::Device(format!("the wafer model's VM: {e}"));
-        let first = lanes.first().map(|(i, _)| *i).ok_or_else(|| Error::Invalid("no VM lanes".into()))?;
-        let (program, guest) = {
-            let (program, _, _) = self
-                .programs
-                .instance_view(first)
-                .ok_or_else(|| Error::Invalid(format!("instance {first:?} is gone")))?;
-            let guest = self
-                .guest_programs
-                .get(&program.0)
-                .cloned()
-                .ok_or_else(|| Error::Invalid("the program has no guest table".into()))?;
-            (program.0, guest)
+        let Some(Model::Wafer(w)) = &self.daemon else {
+            return Err(Error::Device("the VM path without a wafer model".into()));
         };
-        let n = match &self.daemon {
-            Some(Model::Wafer(w)) => w.vm.map_or(0, |(_, ring)| ring.lanes as usize),
-            _ => 0,
-        };
+        let (lay, ring) = w.vm.ok_or_else(|| Error::Device("the wafer program has no VM".into()))?;
+        let n = ring.lanes as usize;
         // Banks of requests that are gone are free.
         let alive: Vec<bool> = self
             .vm_banks
@@ -1502,46 +1481,11 @@ impl Spatial {
                 *owner = None;
             }
         }
-        if self.vm_program != Some(program) {
-            let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
-                return Err(Error::Device("the VM path without a wafer model".into()));
-            };
-            w.vm_load_lanes(std::sync::Arc::clone(&guest)).map_err(device)?;
-            self.vm_program = Some(program);
-            self.vm_banks = vec![None; n];
-            tracing::info!(program, lanes = n, "spatial guest: the program runs on the wafer's multi-lane VM");
-        }
-        self.vm_banks.resize(n, None);
-        // Each lane's bank: its own, else a free one seeded from its channels.
-        let mut placed: Vec<Option<usize>> = Vec::with_capacity(lanes.len());
-        for &(instance, _) in lanes {
-            let bank = if let Some(bank) = self.vm_banks.iter().position(|o| *o == Some(instance)) {
-                bank
-            } else {
-                let Some(bank) = self.vm_banks.iter().position(Option::is_none) else {
-                    placed.push(None);
-                    continue;
-                };
-                let (_, _, inst) = self
-                    .programs
-                    .instance_view(instance)
-                    .ok_or_else(|| Error::Invalid(format!("instance {instance:?} is gone")))?;
-                let seeds: Vec<guest4::wafer::Seed> = guest
-                    .table
-                    .homes
-                    .iter()
-                    .map(|h| guest4::wafer::Seed::of(h, guest4::lane::words_of(&inst.channels[h.chan as usize].current())))
-                    .collect();
-                let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
-                    return Err(Error::Device("the VM path without a wafer model".into()));
-                };
-                w.vm_seed_bank(bank, seeds).map_err(device)?;
-                self.vm_banks[bank] = Some(instance);
-                tracing::info!(?instance, bank, "spatial guest: a request takes a VM lane");
-                bank
-            };
-            placed.push(Some(bank));
-        }
+        let placed = if lay.lprog {
+            self.place_vm_lanes(lanes, n)?
+        } else {
+            self.seed_vm_lanes(lanes, n)?
+        };
         let Some(lead) = lanes.iter().zip(&placed).find(|(_, b)| b.is_some()).map(|(l, _)| l.1) else {
             return Ok(vec![None; lanes.len()]);
         };
@@ -1562,10 +1506,16 @@ impl Spatial {
         let keep: Vec<usize> = (0..n)
             .filter(|b| !placed.contains(&Some(*b)) && self.vm_banks[*b].is_some())
             .collect();
+        let mut inputs: Vec<wafer::StepInput> = vec![None; n];
+        for (&(instance, _), bank) in lanes.iter().zip(&placed) {
+            if let Some(bank) = *bank {
+                inputs[bank] = self.step_input(instance, &lay)?;
+            }
+        }
         let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
             return Err(Error::Device("the VM path without a wafer model".into()));
         };
-        let steps = w.vm_fire(launch, keep).map_err(device)?;
+        let steps = w.vm_fire(launch, keep, inputs).map_err(device)?;
         self.paged_fires += 1;
         Ok(lanes
             .iter()
@@ -1577,6 +1527,213 @@ impl Spatial {
                 })
             })
             .collect())
+    }
+
+    /// A suspension's pages to the host tier: whole pages only (the host
+    /// never attends a page; a lane parks and resumes whole).
+    fn page_out(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<()> {
+        if !copy.moves.is_empty() || !copy.windowed.is_empty() {
+            return Err(Error::Unsupported { verb: "`copy_kv` of part of a page to the host", engine: "cerebras-spatial" });
+        }
+        if let Some(&page) = copy.dst_page_ids.iter().find(|&&p| p >= self.kv.host_pages) {
+            return Err(Error::Invalid(format!("host page {page} of a host tier of {}", self.kv.host_pages)));
+        }
+        let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
+            return Err(Error::Device("the host tier without a wafer model".into()));
+        };
+        let t0 = std::time::Instant::now();
+        let words = w
+            .page_out(copy.src_page_ids.clone())
+            .map_err(|e| Error::Device(format!("pages to the host: {e}")))?;
+        for ((&src, &dst), words) in copy.src_page_ids.iter().zip(&copy.dst_page_ids).zip(words) {
+            let cells = self.kv.pages.get(&src).cloned();
+            self.kv.host.insert(dst, (words, cells));
+        }
+        tracing::debug!(pages = copy.src_page_ids.len(), ms = t0.elapsed().as_secs_f64() * 1e3, "spatial: kv pages to the host");
+        Ok(())
+    }
+
+    /// A resumption's pages back from the host tier.
+    fn page_in(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<()> {
+        if !copy.moves.is_empty() || !copy.windowed.is_empty() {
+            return Err(Error::Unsupported { verb: "`copy_kv` of part of a page from the host", engine: "cerebras-spatial" });
+        }
+        let mut pages = Vec::with_capacity(copy.src_page_ids.len());
+        for (&src, &dst) in copy.src_page_ids.iter().zip(&copy.dst_page_ids) {
+            let (words, _) = self
+                .kv
+                .host
+                .get(&src)
+                .ok_or_else(|| Error::Invalid(format!("host page {src} holds nothing")))?;
+            pages.push((dst, words.clone()));
+        }
+        let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
+            return Err(Error::Device("the host tier without a wafer model".into()));
+        };
+        let t0 = std::time::Instant::now();
+        w.page_in(pages).map_err(|e| Error::Device(format!("pages from the host: {e}")))?;
+        let size = self.kv.page_size.max(1) as usize;
+        for (&src, &dst) in copy.src_page_ids.iter().zip(&copy.dst_page_ids) {
+            let cells = self.kv.host.get(&src).and_then(|(_, c)| c.clone()).unwrap_or_else(|| vec![None; size]);
+            self.kv.pages.insert(dst, cells);
+            self.kv.copied.insert(dst);
+        }
+        tracing::debug!(pages = copy.src_page_ids.len(), ms = t0.elapsed().as_secs_f64() * 1e3, "spatial: kv pages from the host");
+        Ok(())
+    }
+
+    /// A single-program multi-lane VM's banks for `lanes`: the program
+    /// (the first lane's) loaded if the VM holds another, each lane its own
+    /// bank, else a free one seeded from its channels; `None` for a lane no
+    /// bank was free for.
+    fn seed_vm_lanes(&mut self, lanes: &[(InstanceId, &PagedLane)], n: usize) -> EngineResult<Vec<Option<usize>>> {
+        let device = |e: String| Error::Device(format!("the wafer model's VM: {e}"));
+        let first = lanes.first().map(|(i, _)| *i).ok_or_else(|| Error::Invalid("no VM lanes".into()))?;
+        let (program, guest) = self.guest_of(first)?;
+        if self.vm_program != Some(program) {
+            let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
+                return Err(Error::Device("the VM path without a wafer model".into()));
+            };
+            w.vm_load_lanes(std::sync::Arc::clone(&guest)).map_err(device)?;
+            self.vm_program = Some(program);
+            self.vm_banks = vec![None; n];
+            tracing::info!(program, lanes = n, "spatial guest: the program runs on the wafer's multi-lane VM");
+        }
+        self.vm_banks.resize(n, None);
+        let mut placed: Vec<Option<usize>> = Vec::with_capacity(lanes.len());
+        for &(instance, _) in lanes {
+            let bank = if let Some(bank) = self.vm_banks.iter().position(|o| *o == Some(instance)) {
+                bank
+            } else {
+                let Some(bank) = self.vm_banks.iter().position(Option::is_none) else {
+                    placed.push(None);
+                    continue;
+                };
+                let seeds = self.seeds_of(instance, &guest)?;
+                let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
+                    return Err(Error::Device("the VM path without a wafer model".into()));
+                };
+                w.vm_seed_bank(bank, seeds).map_err(device)?;
+                self.vm_banks[bank] = Some(instance);
+                tracing::info!(?instance, bank, "spatial guest: a request takes a VM lane");
+                bank
+            };
+            placed.push(Some(bank));
+        }
+        Ok(placed)
+    }
+
+    /// A per-lane-program VM's banks for `lanes`: each lane its own bank,
+    /// else a free one; when a lane comes in, every live lane's program
+    /// placed again (the arena and windows compacted, the newcomers seeded
+    /// from their channels). A newcomer the image has no room for stays on
+    /// the host (`None`).
+    fn place_vm_lanes(&mut self, lanes: &[(InstanceId, &PagedLane)], n: usize) -> EngineResult<Vec<Option<usize>>> {
+        let device = |e: String| Error::Device(format!("the wafer model's VM: {e}"));
+        self.vm_banks.resize(n, None);
+        let mut placed: Vec<Option<usize>> = Vec::with_capacity(lanes.len());
+        let mut fresh: Vec<usize> = Vec::new();
+        for &(instance, _) in lanes {
+            let bank = self.vm_banks.iter().position(|o| *o == Some(instance)).or_else(|| {
+                let bank = self.vm_banks.iter().position(Option::is_none)?;
+                self.vm_banks[bank] = Some(instance);
+                fresh.push(bank);
+                Some(bank)
+            });
+            placed.push(bank);
+        }
+        if fresh.is_empty() && !self.vm_bank_progs.is_empty() {
+            return Ok(placed);
+        }
+        let mut programs: Vec<Option<guest4::slots::LaneProgram>> = vec![None; n];
+        let mut seeds: Vec<Option<Vec<guest4::wafer::Seed>>> = (0..n).map(|_| None).collect();
+        for bank in 0..n {
+            let Some(owner) = self.vm_banks[bank] else {
+                continue;
+            };
+            let (key, program) = self.guest_of(owner)?;
+            if fresh.contains(&bank) {
+                seeds[bank] = Some(self.seeds_of(owner, &program)?);
+            }
+            programs[bank] = Some(guest4::slots::LaneProgram { key, program });
+        }
+        let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
+            return Err(Error::Device("the VM path without a wafer model".into()));
+        };
+        if let Err(why) = w.vm_place_lanes(programs.clone(), seeds) {
+            // The newcomers stay on the host; the lanes already placed run on.
+            tracing::info!(%why, lanes = fresh.len(), "spatial guest: no room on the VM for new lanes");
+            for &bank in &fresh {
+                self.vm_banks[bank] = None;
+                programs[bank] = None;
+            }
+            for slot in &mut placed {
+                if slot.is_some_and(|b| fresh.contains(&b)) {
+                    *slot = None;
+                }
+            }
+            if self.vm_bank_progs.is_empty() {
+                return Ok(placed);
+            }
+            let seeds = (0..n).map(|_| None).collect();
+            let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
+                return Err(Error::Device("the VM path without a wafer model".into()));
+            };
+            w.vm_place_lanes(programs.clone(), seeds).map_err(device)?;
+        } else {
+            for &bank in &fresh {
+                tracing::info!(instance = ?self.vm_banks[bank], bank, "spatial guest: a request takes a VM lane");
+            }
+        }
+        self.vm_bank_progs = programs.iter().map(|p| p.as_ref().map(|p| p.key)).collect();
+        Ok(placed)
+    }
+
+    /// `instance`'s program id and guest table.
+    fn guest_of(&self, instance: InstanceId) -> EngineResult<(u64, std::sync::Arc<guest4::lane::Program>)> {
+        let (program, _, _) = self
+            .programs
+            .instance_view(instance)
+            .ok_or_else(|| Error::Invalid(format!("instance {instance:?} is gone")))?;
+        let guest = self
+            .guest_programs
+            .get(&program.0)
+            .cloned()
+            .ok_or_else(|| Error::Invalid("the program has no guest table".into()))?;
+        Ok((program.0, guest))
+    }
+
+    /// `instance`'s homes' seeds: its channels as they stand.
+    fn seeds_of(&self, instance: InstanceId, guest: &guest4::lane::Program) -> EngineResult<Vec<guest4::wafer::Seed>> {
+        let (_, _, inst) = self
+            .programs
+            .instance_view(instance)
+            .ok_or_else(|| Error::Invalid(format!("instance {instance:?} is gone")))?;
+        Ok(guest
+            .table
+            .homes
+            .iter()
+            .map(|h| guest4::wafer::Seed::of(h, guest4::lane::words_of(&inst.channels[h.chan as usize].current())))
+            .collect())
+    }
+
+    /// `instance`'s step input this launch: the homes its program has the
+    /// host write each step, from their channels (what the inferlet put).
+    fn step_input(&self, instance: InstanceId, lay: &guest4::wafer::VmLayout) -> EngineResult<wafer::StepInput> {
+        let (_, guest) = self.guest_of(instance)?;
+        if guest.table.per_step.is_empty() {
+            return Ok(None);
+        }
+        let entries = guest4::slots::step_entries(lay, &guest.table).map_err(Error::Device)?;
+        let (_, _, inst) = self
+            .programs
+            .instance_view(instance)
+            .ok_or_else(|| Error::Invalid(format!("instance {instance:?} is gone")))?;
+        let values = entries
+            .iter()
+            .map(|e| guest4::lane::words_of(&inst.channels[e.chan as usize].current()))
+            .collect();
+        Ok(Some((entries, values)))
     }
 
     /// `instance`'s epilogue as the head's VM ran it: eta-exec steps the
@@ -2402,6 +2559,20 @@ impl Engine for Spatial {
                 )));
             }
         }
+        // The host tier: `host_kv_budget` of whole pages, on a wafer build
+        // whose pages the host can read and write.
+        self.kv.host_pages = match &self.daemon {
+            Some(Model::Wafer(w)) => match (w.paged, w.page_words, residency.host_kv_budget) {
+                (Some(_), Some(words), Some(budget)) if words > 0 => {
+                    u32::try_from(budget / (words as u64 * 4)).unwrap_or(u32::MAX)
+                }
+                _ => 0,
+            },
+            _ => 0,
+        };
+        if self.kv.host_pages > 0 {
+            tracing::info!(pages = self.kv.host_pages, "spatial: the host keeps suspended lanes' kv pages");
+        }
         let state_rows = shell.has_state();
         let wafer_pool = match &self.daemon {
             Some(Model::Wafer(w)) => w.paged,
@@ -2437,6 +2608,7 @@ impl Engine for Spatial {
                 buffer_pages: shell.buffer_pages(),
                 state_slot_bytes: shell.state_slot_bytes(),
                 adapter_banks: 0,
+                host_kv_pages: self.kv.host_pages,
                 ..PoolFacts::default()
             },
             limits: FireLimits {
@@ -2466,10 +2638,12 @@ impl Engine for Spatial {
             },
             geometry: GeometryClass::DeviceGeometry,
             kv_copy: KvCopyDomains {
-                // Pages are tokens here: a copy copies them.
+                // Pages are tokens here: a copy copies them. A wafer build
+                // whose pages the host can read parks a suspended lane's
+                // pages on the host (never attended there).
                 device_to_device: true,
-                device_to_host: false,
-                host_to_device: false,
+                device_to_host: self.kv.host_pages > 0,
+                host_to_device: self.kv.host_pages > 0,
                 host_to_host: false,
             },
             kv_handle: None,
@@ -2504,9 +2678,16 @@ impl Engine for Spatial {
     fn copy_kv(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<()> {
         copy.validate()?;
         if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
-            tracing::debug!(target: "spatial_trace","spatial-trace copy_kv: {copy:?}");
+            tracing::debug!(target: "spatial_trace", "spatial-trace copy_kv: {copy:?}");
         }
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
+        let host = engine::transfer::MemoryDomain::HostPinned;
+        if self.kv.host_pages > 0 && Some(copy.src) == device && copy.dst == host {
+            return self.page_out(copy);
+        }
+        if self.kv.host_pages > 0 && copy.src == host && Some(copy.dst) == device {
+            return self.page_in(copy);
+        }
         if Some(copy.src) != device || Some(copy.dst) != device {
             return Err(Error::Unsupported {
                 verb: "`copy_kv` between domains other than this load's device",

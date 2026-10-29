@@ -220,6 +220,12 @@ pub struct CerebrasEngineOptions {
     /// Used when neither `spatial_program` nor `spatial_params` is set; the
     /// compile is cached, so later starts reuse it.
     pub spatial_serve: Option<toml::Table>,
+    /// The guest placement's forecast: the model's token in cycles (omit:
+    /// from its size), the share of it a table's `pre` may take and `main`
+    /// may add before the epilogue stays on the host.
+    pub spatial_token_cycles: Option<u64>,
+    pub spatial_pre_margin: Option<f64>,
+    pub spatial_main_fraction: Option<f64>,
     /// The engine's switches (`[cerebras.switches]`: placement, serving,
     /// toolchain; `engine-cerebras` `switches`), each winning over its old
     /// `PIE_CEREBRAS_*` variable.
@@ -246,6 +252,9 @@ impl Default for CerebrasEngineOptions {
             spatial_ckpt: None,
             spatial_layers: None,
             spatial_serve: None,
+            spatial_token_cycles: None,
+            spatial_pre_margin: None,
+            spatial_main_fraction: None,
             switches: None,
         }
     }

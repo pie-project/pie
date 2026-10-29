@@ -9,6 +9,7 @@ mod an_epilogue_agrees_with_the_host_interpreter;
 mod csl_bf16_probe;
 mod csl_integer_probe;
 mod csl_semantics_probe;
+mod guest4_translation_is_pinned;
 mod kernels_act;
 mod kernels_attn;
 mod kernels_attn_dense;

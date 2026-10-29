@@ -45,6 +45,23 @@ pub struct VmLayout {
     /// bits): a table using a group the image left out would run wrong.
     pub feat: u32,
     pub vocab: usize,
+    /// The opcodes the image runs (bit o: opcode o; `opmask_lo` /
+    /// `opmask_hi`, all ones by default).
+    pub opmask: u64,
+    /// Step input words a turn (`vm_sin`; 0: the host cannot write homes
+    /// each step).
+    pub sin: usize,
+    /// Per-lane programs (`vm_lprog`): an op arena of `max_ops`
+    /// instructions and a bank arena of `bank_words` words.
+    pub lprog: bool,
+    pub bank_words: usize,
+}
+
+/// `opmask_lo` / `opmask_hi` as one mask (all ones where the build says
+/// nothing).
+fn opmask(get: &impl Fn(&str) -> Option<usize>) -> u64 {
+    let half = |k: &str| get(k).map_or(0xffff_ffff, |v| v as u64 & 0xffff_ffff);
+    half("opmask_lo") | half("opmask_hi") << 32
 }
 
 fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
@@ -79,6 +96,10 @@ impl VmLayout {
             pool_words: get("pool_words")?,
             feat: get("feat")? as u32,
             vocab: get("vocab")?,
+            opmask: opmask(&get),
+            sin: get("vm_sin").unwrap_or(0),
+            lprog: get("vm_lprog").unwrap_or(0) != 0,
+            bank_words: get("bank_words").unwrap_or(0),
         })
     }
 
@@ -108,6 +129,10 @@ impl VmLayout {
             pool_words: get("pool_words")?,
             feat: get("feat")? as u32,
             vocab: get("vocab")?,
+            opmask: opmask(&get),
+            sin: get("vm_sin").unwrap_or(0),
+            lprog: get("vm_lprog").unwrap_or(0) != 0,
+            bank_words: get("bank_words").unwrap_or(0),
         })
     }
 
@@ -171,13 +196,35 @@ impl VmLayout {
                 table.feat, self.feat
             ));
         }
+        let ops = super::slots::opcodes(table);
+        if ops & !self.opmask != 0 {
+            return Some(format!("opcodes {:#x} the image was built without", ops & !self.opmask));
+        }
+        if !table.per_step.is_empty() {
+            if self.sin == 0 {
+                return Some("the host writes some of its homes every step; the image has no step input".into());
+            }
+            if let Err(why) = super::slots::step_entries(self, table) {
+                return Some(why);
+            }
+        }
         if !table.wide_outputs.is_empty() {
             return Some("vocabulary-wide host outputs (read from the VM's registers)".into());
         }
-        if table.tok_home.is_none() {
-            return Some("no token home (the head embeds the EmbedTokens channel's word)".into());
-        }
         None
+    }
+
+    /// Why `table` cannot run where the head embeds the VM's token (one
+    /// sequence, several steps a launch): [`VmLayout::refuses`], and a table
+    /// without a token home. A multi-lane launch forces every lane's token
+    /// and takes the sampled one from the out ring.
+    pub fn refuses_head(&self, table: &Table) -> Option<String> {
+        self.refuses(table).or_else(|| {
+            table
+                .tok_home
+                .is_none()
+                .then(|| "no token home (the head embeds the EmbedTokens channel's word)".into())
+        })
     }
 }
 
@@ -222,7 +269,7 @@ impl Seed {
 
 /// The pool block and the wide rows (lane position x register x Vr, f32) the
 /// seeds make.
-fn seed_images(lay: &VmLayout, seeds: &[Seed]) -> R<(Vec<u32>, Vec<f32>)> {
+pub(crate) fn seed_images(lay: &VmLayout, seeds: &[Seed]) -> R<(Vec<u32>, Vec<f32>)> {
     use eta_ir::Dtype;
     let lanes = lay.positions();
     let mut pool = vec![0u32; lay.pool_words];
@@ -255,7 +302,7 @@ fn seed_images(lay: &VmLayout, seeds: &[Seed]) -> R<(Vec<u32>, Vec<f32>)> {
 /// Loads `table` with its homes' `seeds` on every VM PE and sets `gmode`
 /// (1: the VM picks sampled tokens) on every head PE; resets the step count.
 pub fn load(rt: &mut Runtime, lay: &VmLayout, table: &Table, seeds: &[Seed]) -> R<()> {
-    if let Some(why) = lay.refuses(table) {
+    if let Some(why) = lay.refuses_head(table) {
         return Err(format!("the VM image cannot run this program: {why}"));
     }
     let e = |e: crate::sdk::Error| e.to_string();
@@ -448,6 +495,92 @@ pub fn read_bank_pools(rt: &mut Runtime, lay: &VmLayout, lanes: usize) -> R<Vec<
     Ok(words.chunks(bank).map(|b| b[..lay.pool_words].to_vec()).collect())
 }
 
+/// `gbank` as `per` words a row on every VM column (a per-lane-program
+/// image's whole bank arena: `bank_words`).
+pub fn read_bank_words(rt: &mut Runtime, lay: &VmLayout, per: usize) -> R<Vec<Vec<u32>>> {
+    let nv = lay.rows + 1;
+    lay.columns()
+        .map(|(_, _, x)| {
+            let mut words = vec![0u32; nv * per];
+            rt.memcpy_d2h("gbank", &mut words, rect(x, 0, 1, nv), per, Order::RowMajor, DataType::Bits32)
+                .map_err(|e| e.to_string())?;
+            Ok(words)
+        })
+        .collect()
+}
+
+/// The bank arena's words at block 0's hub (the pool parts of every
+/// lane's window).
+pub fn read_hub_bank(rt: &mut Runtime, lay: &VmLayout) -> R<Vec<u32>> {
+    let mut words = vec![0u32; lay.bank_words];
+    let (x, y) = lay.hub();
+    rt.memcpy_d2h("gbank", &mut words, rect(x, y, 1, 1), lay.bank_words, Order::RowMajor, DataType::Bits32)
+        .map_err(|e| e.to_string())?;
+    Ok(words)
+}
+
+/// A per-lane-program image's lanes as `slots` places them: the op arena,
+/// `glane`, `gbdesc`, `gsdesc` (with step input) and the bank arena
+/// `banks` on every VM PE; `fresh` also the vocabulary, the step count
+/// and a zero pool (the image's first load).
+pub fn load_slots(
+    rt: &mut Runtime,
+    lay: &VmLayout,
+    slots: &super::slots::Slots,
+    banks: &[Vec<u32>],
+    fresh: bool,
+) -> R<()> {
+    let e = |e: crate::sdk::Error| e.to_string();
+    let ops = slots.ops(lay)?;
+    let (glane, gbdesc) = slots.glane_gbdesc();
+    let gsdesc = slots.gsdesc();
+    let nv = lay.rows + 1;
+    let tile = |words: &[u32]| -> Vec<u32> { (0..nv).flat_map(|_| words.iter().copied()).collect() };
+    let b32 = DataType::Bits32;
+    for ((_, _, x), bank) in lay.columns().zip(banks) {
+        let col = rect(x, 0, 1, nv);
+        rt.memcpy_h2d("gops", &tile(&ops), col, ops.len(), Order::RowMajor, b32).map_err(e)?;
+        rt.memcpy_h2d("glane", &tile(&glane), col, glane.len(), Order::RowMajor, b32).map_err(e)?;
+        rt.memcpy_h2d("gbdesc", &tile(&gbdesc), col, gbdesc.len(), Order::RowMajor, b32).map_err(e)?;
+        if lay.sin > 0 {
+            rt.memcpy_h2d("gsdesc", &tile(&gsdesc), col, gsdesc.len(), Order::RowMajor, b32).map_err(e)?;
+        }
+        rt.memcpy_h2d("gbank", bank, col, lay.bank_words, Order::RowMajor, b32).map_err(e)?;
+        if fresh {
+            rt.memcpy_h2d("gpool", &vec![0; nv * lay.pool_words], col, lay.pool_words, Order::RowMajor, b32)
+                .map_err(e)?;
+            rt.memcpy_h2d("gvalid", &vec![lay.vocab as u32; nv], col, 1, Order::RowMajor, b32).map_err(e)?;
+            rt.memcpy_h2d("gostep", &vec![0; nv], col, 1, Order::RowMajor, b32).map_err(e)?;
+        }
+    }
+    if fresh {
+        set_gmode(rt, lay, 1)?;
+    }
+    Ok(())
+}
+
+/// The launch's step input ([`super::slots::step_images`]) to `gsin`.
+pub fn write_step(rt: &mut Runtime, lay: &VmLayout, images: &[Vec<u32>]) -> R<()> {
+    let nv = lay.rows + 1;
+    for (image, (_, _, x)) in images.iter().zip(lay.columns()) {
+        rt.memcpy_h2d("gsin", image, rect(x, 0, 1, nv), image.len() / nv, Order::RowMajor, DataType::Bits32)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// The step descriptors of a single-program multi-lane VM (every lane the
+/// same entries) to `gsdesc`.
+pub fn write_gsdesc(rt: &mut Runtime, lay: &VmLayout, words: &[u32]) -> R<()> {
+    let nv = lay.rows + 1;
+    let tile: Vec<u32> = (0..nv).flat_map(|_| words.iter().copied()).collect();
+    for (_, _, x) in lay.columns() {
+        rt.memcpy_h2d("gsdesc", &tile, rect(x, 0, 1, nv), words.len(), Order::RowMajor, DataType::Bits32)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Each lane's out-ring row for lap `lap` of a multi-lane VM (lane l's step
 /// s at row (s·L + l) % D), padded to the 16 words a step's `out` has.
 pub fn read_out_lanes(rt: &mut Runtime, lay: &VmLayout, ring: Ring, lap: u64) -> R<Vec<Vec<u32>>> {
@@ -519,12 +652,20 @@ pub fn case_table(case: &serde_json::Value) -> R<(Table, Vec<Seed>)> {
             .map(|o| (u(&o["chan"]), u(&o["slot"]), u(&o["n"]), dtype_of(o["dtype"].as_str().unwrap_or("U32"))))
             .collect(),
         wide_outputs: Vec::new(),
-        per_step: Vec::new(),
+        per_step: case["per_step"]
+            .as_array()
+            .map(|p| p.iter().map(|e| u(&e["chan"])).collect())
+            .unwrap_or_default(),
         tok_home: case["tok_home"].as_u64().map(|t| t as u32),
         nreg: u(&case["nreg"]),
         pool_words: u(&case["pool_words"]),
         feat: u(&case["feat"]),
         remat: false,
+        bank_regs: case["bank_regs"].as_array().map(|r| r.iter().map(u).collect()).unwrap_or_default(),
+        bank_pool: case["bank_pool"]
+            .as_array()
+            .map(|r| r.iter().map(|p| (u(&p[0]), u(&p[1]))).collect())
+            .unwrap_or_default(),
     };
     Ok((table, seeds))
 }

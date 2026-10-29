@@ -60,6 +60,13 @@ pub struct Layout2d {
     /// serve2d_pipe's `HLM`: the most virtual lanes whose logits rows the
     /// head keeps.
     pub hlm: Option<usize>,
+    /// `HLBN`: the most lanes whose logits rows the head keeps, where the
+    /// build caps it below HLM (serve8b_region at B 4 keeps one).
+    pub hlbn: Option<usize>,
+    /// Words of a virtual lane's VM control (`vmlane`): 2 (gmode, forced
+    /// prefix) on guest4hs, 3 on guest4hz (and the offset to the lane's
+    /// turn's last row).
+    pub vmlane_words: usize,
     /// serve8b ([`super::serve8b`]): bf16 grids in strips that skip a slot
     /// (or serve8b_region's grids and regions), a head of `PY / 2` chunk
     /// columns, the embedding strip east of it.
@@ -116,6 +123,8 @@ impl Layout2d {
                 host_copy: get("KVCP").unwrap_or(1) == 0,
                 vm: None,
                 hlm: get("HLM"),
+                hlbn: get("HLBN"),
+                vmlane_words: 2,
                 s8b: None,
             };
             let mut lay = lay;
@@ -202,11 +211,16 @@ impl Layout2d {
     /// Lanes whose last logits rows the head keeps (`HLB`: the first
     /// micro-batch's first four).
     pub fn logit_lanes(&self) -> usize {
-        self.paged.map_or(1, |s| match self.mmax {
-            // serve2d_pipe: HLB = min(MMAX·B, HLM) virtual lanes (HLM 4
-            // before the build had it, then only micro-batch 0's B).
-            Some(m) => self.hlm.map_or(s.lanes.min(4), |h| (m * s.lanes).min(h)),
-            None => s.lanes.min(4),
+        self.paged.map_or(1, |s| {
+            let kept = match self.mmax {
+                // serve2d_pipe: HLB = min(MMAX·B, HLM) virtual lanes (HLM 4
+                // before the build had it, then only micro-batch 0's B).
+                Some(m) => self.hlm.map_or(s.lanes.min(4), |h| (m * s.lanes).min(h)),
+                None => s.lanes.min(4),
+            };
+            // A launch takes host-sampled lanes up to this; more go in the
+            // next launch.
+            self.hlbn.map_or(kept, |n| kept.min(n.max(1)))
         })
     }
 
@@ -810,14 +824,18 @@ pub fn fire_lanes(
             head_h2d(lay, rt, SYM.ring_table, &mtab, lay.feeder(), 1, n)?;
             if lay.vm.is_some() {
                 // The VM's per-lane control, every launch: (gmode_l, the
-                // lane's forced prefix) a virtual lane m·B + b.
-                let mut control = vec![0u32; slots * b_n * 2];
+                // lane's forced prefix[, the offset to its turn's last row])
+                // a virtual lane m·B + b.
+                // guest4hz adds the offset to the lane's turn's last row: 0, a
+                // turn being one row.
+                let w = lay.vmlane_words;
+                let mut control = vec![0u32; slots * b_n * w];
                 for (m, mb) in mbs.iter().enumerate() {
                     for b in 0..b_n {
                         let lane = mb.get(b).unwrap_or(&mb[0]);
                         let v = m * b_n + b;
-                        control[v * 2] = vm_lanes.and_then(|g| g.get(v).copied()).unwrap_or(0);
-                        control[v * 2 + 1] = lane.forced.len() as u32;
+                        control[v * w] = vm_lanes.and_then(|g| g.get(v).copied()).unwrap_or(0);
+                        control[v * w + 1] = lane.forced.len() as u32;
                     }
                 }
                 let per_row: Vec<u32> = (0..lay.py + lay.vmc).flat_map(|_| control.iter().copied()).collect();
@@ -970,14 +988,55 @@ pub fn copy_pages(lay: &Layout2d, rt: &mut Runtime, pairs: &[(u32, u32)]) -> R<(
         }
         return super::paged::copy_pages(rt, &super::paged::Symbols::default(), pairs);
     }
-    let pool = super::paged::HostPool {
+    super::paged::copy_pages_host(rt, &host_pool(lay, shape), pairs)
+}
+
+/// The pool as the host reads and writes its pages: every layer's grid.
+fn host_pool(lay: &Layout2d, shape: super::paged::Shape) -> super::paged::HostPool {
+    super::paged::HostPool {
         grids: (0..lay.layers()).map(|l| lay.origin(l)).collect(),
         cols: lay.px,
         shape,
         cells: lay.dc * shape.page_size,
         data_type: if lay.s8b.is_some() { DataType::Bits16 } else { DataType::Bits32 },
-    };
-    super::paged::copy_pages_host(rt, &pool, pairs)
+    }
+}
+
+/// The host pool of a serve2d build whose pages the host reads and writes
+/// (the host tier's suspended pages); `None` for serve8b's (its own
+/// layout) and a one-sequence build.
+fn page_pool(lay: &Layout2d) -> R<super::paged::HostPool> {
+    let shape = lay.paged.ok_or("host pages on a one-sequence build")?;
+    if lay.s8b.is_some() {
+        return Err("host pages on a serve8b build (serve8b's page_out / page_in)".into());
+    }
+    Ok(host_pool(lay, shape))
+}
+
+/// Words of one page's host copy, if the host can keep this build's pages
+/// (serve8b's: [`super::serve8b::page_words`]).
+pub fn page_words(lay: &Layout2d) -> Option<usize> {
+    if lay.s8b.is_some() {
+        return super::serve8b::page_words(lay).ok();
+    }
+    page_pool(lay).ok().map(|pool| super::paged::page_words(&pool))
+}
+
+/// Page `page`'s cells off the device ([`super::paged::read_page_host`],
+/// serve8b's [`super::serve8b::page_out`]).
+pub fn read_page(lay: &Layout2d, rt: &mut Runtime, page: u32) -> R<Vec<u32>> {
+    if lay.s8b.is_some() {
+        return super::serve8b::page_out(lay, rt, page);
+    }
+    super::paged::read_page_host(rt, &page_pool(lay)?, page)
+}
+
+/// A page's host copy back into page `page`.
+pub fn write_page(lay: &Layout2d, rt: &mut Runtime, page: u32, words: &[u32]) -> R<()> {
+    if lay.s8b.is_some() {
+        return super::serve8b::page_in(lay, rt, page, words);
+    }
+    super::paged::write_page_host(rt, &page_pool(lay)?, page, words)
 }
 
 #[cfg(test)]
@@ -996,6 +1055,14 @@ mod tests {
         Layout2d::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1))
             .expect("serve2d params")
             .expect("a layout")
+    }
+
+    #[test]
+    fn hlbn_caps_the_lanes_a_launch_samples_on_the_host() {
+        assert_eq!(pipe().logit_lanes(), 2);
+        let lay = Layout2d { hlbn: Some(1), ..pipe() };
+        assert_eq!(lay.logit_lanes(), 1);
+        assert_eq!(Layout2d { hlbn: Some(8), ..pipe() }.logit_lanes(), 2);
     }
 
     #[test]

@@ -27,6 +27,7 @@ use serde_json::{Value as Json, json};
 pub mod cost;
 pub mod isa;
 pub mod lane;
+pub mod slots;
 pub mod wafer;
 use isa::*;
 
@@ -92,6 +93,10 @@ pub struct Table {
     pub feat: u32,
     /// Whether keyed draws are re-made at their readers (register pressure).
     pub remat: bool,
+    /// What a lane carries between its turns (live at the start of main):
+    /// wide registers past W0, and pool ranges (offset, words).
+    pub bank_regs: Vec<u32>,
+    pub bank_pool: Vec<(u32, u32)>,
 }
 
 pub fn tcode(d: Dtype) -> u32 {
@@ -129,6 +134,8 @@ struct Tr<'a> {
     remat: bool,
     /// Integer values known at translation time (constants, iotas, sums).
     known: BTreeMap<u32, Vec<u32>>,
+    /// Values that are the vocabulary iota (a wide 0..V).
+    iota: BTreeSet<u32>,
     groups: Vec<Vec<Loc>>,
 }
 
@@ -430,6 +437,16 @@ fn translate_with(
         }
     }
     let ordered: Vec<&LaunchOp> = order_pre.iter().chain(order_main.iter()).copied().collect();
+    if std::env::var_os("ETAGEN_OPS").is_some() {
+        let sh = |id: &u32| pkg.values[*id as usize].shape.clone();
+        for op in &ordered {
+            eprintln!("ALL {} -> {} {:?} args {:?} imm {} imm2 {} imm3 {}", tag_name(op.tag), op.result_id, sh(&op.result_id),
+                      op.args.iter().map(|a| (*a, sh(a))).collect::<Vec<_>>(), op.imm, op.imm2, op.imm3);
+        }
+        for p in &stage.puts {
+            eprintln!("PUT value {} -> chan {}", p.value, p.channel);
+        }
+    }
     // Last use of every value, in emission order; puts read at the end.
     let end = ordered.len();
     let mut last: BTreeMap<u32, usize> = BTreeMap::new();
@@ -461,6 +478,7 @@ fn translate_with(
         nreg_used: 1,
         remat,
         known: BTreeMap::new(),
+        iota: BTreeSet::new(),
         groups: Vec::new(),
     };
     let mut homes: Vec<Home> = Vec::new();
@@ -494,12 +512,29 @@ fn translate_with(
             eta_ir::container::ChanDType::Concrete(d) => d,
             _ => return Err(format!("channel {c}: a generic dtype")),
         };
-        let l = if n == vocab { t.wide(dtype)? } else { t.pool(n, dtype)? };
+        // [rows, vocab] (a mask a candidate row, say): consecutive registers.
+        let crows = if n > vocab && n % vocab == 0 && n / vocab <= 8 { n / vocab } else { 1 };
+        let (l, at) = if crows > 1 {
+            let mut members = Vec::new();
+            for _ in 0..crows {
+                let m = t.wide(dtype)?;
+                t.st[m.sid].pinned = true;
+                members.push(m);
+            }
+            let first = t.at(&members[0]);
+            if members.iter().enumerate().any(|(r, m)| t.at(m) != first + r as u32) {
+                return Err(format!("channel {c}: its rows' registers are not consecutive"));
+            }
+            (t.group(members, dtype), first)
+        } else {
+            let l = if n == vocab { t.wide(dtype)? } else { t.pool(n, dtype)? };
+            (l, t.at(&l))
+        };
         t.st[l.sid].pinned = true;
         homes.push(Home {
             chan: c,
-            kind: if n == vocab { "wide" } else { "pool" },
-            at: t.at(&l),
+            kind: if n % vocab == 0 { "wide" } else { "pool" },
+            at,
             n,
             dtype,
         });
@@ -548,10 +583,17 @@ fn translate_with(
         t.emit(QCONST, Tr::fl(tcode(l.dtype), l.n, false, false, false), at, 0, 0, bits);
     }
     let mut pre_len = 0;
+    let mut bank: Option<(Vec<u32>, Vec<(u32, u32)>)> = None;
     for (i, op) in ordered.iter().enumerate() {
         if i == order_pre.len() {
             t.emit(HALT, 0, 0, 0, 0, 0);
             pre_len = t.ins.len();
+            bank = Some(live_now(&t));
+        }
+        if std::env::var_os("ETAGEN_OPS").is_some() {
+            let sh = |id: &u32| pkg.values[*id as usize].shape.clone();
+            eprintln!("OP {} -> {} {:?} args {:?} imm {} imm2 {} imm3 {}", tag_name(op.tag), op.result_id, sh(&op.result_id),
+                      op.args.iter().map(|a| (*a, sh(a))).collect::<Vec<_>>(), op.imm, op.imm2, op.imm3);
         }
         let results = one(&mut t, op).map_err(|e| format!("{} ({}, {:?}): {e}", tag_name(op.tag), op.result_id, pkg.values[op.result_id as usize].shape))?;
         for (k, l) in results.into_iter().enumerate() {
@@ -595,8 +637,9 @@ fn translate_with(
                 wide_outputs.push((p.channel, regs, l.dtype));
                 continue;
             }
-            if slot + l.n > 16 {
-                return Err("more than 16 output words".into());
+            // The image's ring_w must cover them (ring_d x ring_w words of PE memory).
+            if slot + l.n > 128 {
+                return Err("more than 128 output words".into());
             }
             let at = t.at(&l);
             t.emit(OUT, Tr::fl(0, l.n, false, false, false), slot, at, 0, 0);
@@ -645,6 +688,7 @@ fn translate_with(
         })
         .map(|h| h.chan)
         .collect();
+    let (bank_regs, bank_pool) = bank.unwrap_or_else(|| live_now(&t));
     let pool_log = t.pool_log;
     Ok((Table {
         ins: t.ins,
@@ -658,7 +702,40 @@ fn translate_with(
         pool_words: t.pool_hi,
         feat,
         remat,
+        bank_regs,
+        bank_pool,
     }, pool_log))
+}
+
+/// The storage live now (allocated, not freed): wide registers past W0 and
+/// merged pool ranges.
+fn live_now(t: &Tr) -> (Vec<u32>, Vec<(u32, u32)>) {
+    let mut regs = BTreeSet::new();
+    let mut words = BTreeSet::new();
+    for s in &t.st {
+        if s.freed {
+            continue;
+        }
+        match s.kind {
+            Kind::Wide(r) if r > 0 => {
+                regs.insert(r);
+            }
+            Kind::Pool(o) => {
+                for w in o..o + s.n {
+                    words.insert(w);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for w in words {
+        match ranges.last_mut() {
+            Some((o, n)) if *o + *n == w => *n += 1,
+            _ => ranges.push((w, 1)),
+        }
+    }
+    (regs.into_iter().collect(), ranges)
 }
 
 /// A WBIN right after the WFILL of one of its operands takes the filled pool
@@ -796,7 +873,18 @@ fn one(t: &mut Tr, op: &LaunchOp) -> Result<Vec<Loc>, String> {
 
 fn one_args(t: &mut Tr, op: &LaunchOp, args: &[Loc]) -> Result<Vec<Loc>, String> {
     let rows_in = args.iter().map(|a| a.rows).max().unwrap_or(1);
-    let rn = t.numel(op.result_id);
+    let mut rn = t.numel(op.result_id);
+    // A vocabulary row with one sentinel slot past it ([V + 1]: a scatter's
+    // "no token" index V): a wide register; the sentinel is dropped (no VM PE
+    // owns index V, so a scatter there writes nothing).
+    if rn == t.vocab + 1 && (op.tag == tags::BROADCAST && args.iter().all(|a| !Tr::is_wide(a) && a.n == 1)
+        || args.first().is_some_and(Tr::is_wide)) {
+        rn = t.vocab;
+    }
+    // gather(row, iota over the vocabulary) is the row itself (its first V).
+    if op.tag == tags::GATHER && rn == t.vocab && args.len() == 2 && Tr::is_wide(&args[0]) && t.iota.contains(&op.args[1]) {
+        return Ok(vec![Loc { dtype: t.dtype(op.result_id), ..args[0] }]);
+    }
     let rows_out = if rn > t.vocab && rn % t.vocab == 0 { rn / t.vocab } else { 1 };
     if rows_in > 1 || rows_out > 1 {
         return multi(t, op, args, rows_in.max(rows_out));
@@ -933,6 +1021,19 @@ fn multi(t: &mut Tr, op: &LaunchOp, args: &[Loc], rows: u32) -> Result<Vec<Loc>,
             let dd = t.at(&d);
             t.emit(QBIN, Tr::fl(T_U32, 1, false, false, false), dd, ba, aa, B_ADD);
             return Ok(vec![d]);
+        }
+        tags::TOP_K if rn == rows * op.imm && op.imm > 0 && a.rows == rows => {
+            // Each row's own top k ([rows, k], indices within the row).
+            let k = op.imm;
+            let ov = t.pool(rows * k, Dtype::F32)?;
+            let oi = t.pool(rows * k, Dtype::U32)?;
+            let (ova, oia) = (t.at(&ov), t.at(&oi));
+            for r in 0..rows {
+                let ra = t.row(&a, r as usize);
+                let rr = t.at(&ra);
+                t.emit(TOPK, 0, ova + r * k, rr, oia + r * k, k);
+            }
+            return Ok(vec![ov, oi]);
         }
         tags::TOP_K if rn == op.imm && op.imm > 0 => {
             // Top-k of the whole value: each row's top k, then k picks of the
@@ -1159,6 +1260,7 @@ fn single(t: &mut Tr, op: &LaunchOp, args: Vec<Loc>, rdt: Dtype, rn: u32) -> Res
                 let d = t.wide(rdt)?;
                 let dd = t.at(&d);
                 t.emit(WIOTA, 0, dd, 0, 0, 0);
+                t.iota.insert(op.result_id);
                 return Ok(vec![d]);
             }
             let d = t.pool(rn, rdt)?;
@@ -1309,6 +1411,58 @@ fn single(t: &mut Tr, op: &LaunchOp, args: Vec<Loc>, rdt: Dtype, rn: u32) -> Res
             t.emit(QSCATTER, Tr::fl(it, idx.n, scalar_val, add, rdt == Dtype::F32), dd, ia, va, dst.n);
             Ok(vec![d])
         }
+        tags::CAUSAL_MASK | tags::SLIDING_WINDOW_MASK | tags::SINK_WINDOW_MASK => {
+            // [positions, keys] bools: key <= pos, and (sliding) key + w > pos,
+            // or (sink) key < sinks or key + w > pos. Short ops on one iota
+            // shifted by w (key <= pos as key + w <= pos + w).
+            let pos = args[0];
+            if Tr::is_wide(&pos) || rn != pos.n * op.imm {
+                return Err("a window mask over the vocabulary".into());
+            }
+            let kc = op.imm;
+            let w = if tag == tags::SLIDING_WINDOW_MASK { op.imm2 } else { op.imm3 };
+            let fu = |n| Tr::fl(T_U32, n, false, true, false);
+            let one = |t: &mut Tr, v: u32| -> Result<u32, String> {
+                let c = t.pool(1, Dtype::U32)?;
+                let ca = t.at(&c);
+                t.emit(QCONST, Tr::fl(T_U32, 1, false, false, false), ca, 0, 0, v);
+                Ok(ca)
+            };
+            let kw = t.pool(kc, Dtype::U32)?;
+            let ka = t.at(&kw);
+            t.emit(QIOTA, Tr::fl(T_U32, kc, false, false, false), ka, 0, 0, 0);
+            let sink = t.pool(kc, Dtype::Bool)?;
+            let sa = t.at(&sink);
+            let csa = one(t, op.imm2)?;
+            t.emit(QCMP, fu(kc), sa, ka, csa, 2);
+            let cwa = one(t, w)?;
+            t.emit(QBIN, fu(kc), ka, ka, cwa, B_ADD);
+            let pw = t.pool(1, Dtype::U32)?;
+            let pwa = t.at(&pw);
+            let tmp = t.pool(kc, Dtype::Bool)?;
+            let ta = t.at(&tmp);
+            let d = t.pool(rn, Dtype::Bool)?;
+            let dd = t.at(&d);
+            let pa = t.at(&pos);
+            for p in 0..pos.n {
+                let o = dd + p * kc;
+                // key + w <= pos + w
+                t.emit(QBIN, Tr::fl(T_U32, 1, false, false, false), pwa, pa + p, cwa, B_ADD);
+                t.emit(QCMP, fu(kc), o, ka, pwa, 3);
+                if tag != tags::CAUSAL_MASK {
+                    // key + w > pos (recent)
+                    t.emit(QCMP, fu(kc), ta, ka, pa + p, 0);
+                    if tag == tags::SINK_WINDOW_MASK {
+                        t.emit(QBIN, Tr::fl(T_U32, kc, false, false, false), ta, ta, sa, B_MAX);
+                    }
+                    t.emit(QBIN, Tr::fl(T_U32, kc, false, false, false), o, o, ta, B_MIN);
+                }
+            }
+            for l in [kw, sink, pw, tmp] {
+                t.release(l.sid);
+            }
+            Ok(vec![d])
+        }
         tags::TOP_K => {
             let a = args[0];
             if !Tr::is_wide(&a) {
@@ -1363,6 +1517,8 @@ pub fn json_of(t: &Table) -> Json {
         "feat": t.feat,
         "tok_home": t.tok_home,
         "remat": t.remat,
+        "bank_regs": t.bank_regs,
+        "bank_pool": t.bank_pool,
         "homes": t.homes.iter().map(|h| json!({"chan": h.chan, "kind": h.kind, "at": h.at, "n": h.n, "dtype": format!("{:?}", h.dtype)})).collect::<Vec<_>>(),
         "outputs": t.outputs.iter().map(|(c, s, n, d)| json!({"chan": c, "slot": s, "n": n, "dtype": format!("{d:?}")})).collect::<Vec<_>>(),
         "wide_outputs": t.wide_outputs.iter().map(|(c, r, d)| json!({"chan": c, "regs": r, "dtype": format!("{d:?}")})).collect::<Vec<_>>(),

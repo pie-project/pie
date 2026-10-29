@@ -871,6 +871,15 @@ pub(crate) fn create_engine_backend(
                 if let Some(layers) = opts.spatial_layers {
                     boot_doc.push_str(&format!("layers = {layers}\n"));
                 }
+                if let Some(cycles) = opts.spatial_token_cycles {
+                    boot_doc.push_str(&format!("token_cycles = {cycles}\n"));
+                }
+                if let Some(margin) = opts.spatial_pre_margin {
+                    boot_doc.push_str(&format!("pre_margin = {}\n", toml::Value::Float(margin)));
+                }
+                if let Some(fraction) = opts.spatial_main_fraction {
+                    boot_doc.push_str(&format!("main_fraction = {}\n", toml::Value::Float(fraction)));
+                }
             }
             if let Some(switches) = &opts.switches {
                 let mut cerebras = toml::Table::new();
