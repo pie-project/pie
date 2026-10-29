@@ -119,7 +119,7 @@ def run(args: argparse.Namespace):
     cpu_affinity = maybe_set_cpu_affinity(args, visible_cuda_devices(args.tp_size))
     n = args.requests if args.mode == "latency" else args.num_requests
     prompts, prompt_counts = hf_chat_prompts_and_counts(
-        args.model, args.system, make_prompts(args, n + args.warmup)
+        args.model, args.system, make_prompts(args, n + args.warmup), getattr(args, "think", None)
     )
     # Concurrency 0 means "no batch cap" — match pie's --concurrency 0 path.
     if args.mode == "latency":
@@ -366,7 +366,7 @@ def run_streaming(args: argparse.Namespace):
     cpu_affinity = maybe_set_cpu_affinity(args, visible_cuda_devices(args.tp_size))
     n = args.num_requests
     prompts, prompt_counts = hf_chat_prompts_and_counts(
-        args.model, args.system, make_prompts(args, n + args.warmup)
+        args.model, args.system, make_prompts(args, n + args.warmup), getattr(args, "think", None)
     )
     if args.concurrency == 0:
         max_num_seqs = max(1, args.num_requests)

@@ -128,7 +128,7 @@ def run(args: argparse.Namespace):
     cpu_affinity = maybe_set_cpu_affinity(args, visible_cuda_devices(args.tp_size))
     n = args.requests if args.mode == "latency" else args.num_requests
     prompts, prompt_counts = hf_chat_prompts_and_counts(
-        args.model, args.system, make_prompts(args, n + args.warmup)
+        args.model, args.system, make_prompts(args, n + args.warmup), getattr(args, "think", None)
     )
     if args.mode == "latency":
         max_running_requests = 1
