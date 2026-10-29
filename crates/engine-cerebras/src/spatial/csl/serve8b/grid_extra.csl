@@ -1,0 +1,94 @@
+// ---------------------------------------------------------------- serve8b
+// (appended to qwen2d_paged8b's pe.csl by serve8b/sync.py) The layer-to-layer
+// handoff of x (B lanes of Hc a row, lane-major). A grid's x leaves as it came
+// in: row py holds chunk py on every column.
+//
+// Placement and chaining are the host's (serve_lib8b.WaferModel.route_table):
+// before `init` it writes each grid PE's `rtab`, which init applies and the
+// passes follow. So the grid shape, the slot of each layer, and how grids
+// chain are host parameters (one program image for every grid); the device
+// code is only "take x on color c_in, (relay it on c_relay), run the layer,
+// send x on c_out". The host's tables implement:
+// - within a strip: the edge column's row py sends its chunk across (R0/R1
+//   by layer parity), multicast along row py of the next grid;
+// - between strips (taller than wide, PX <= PY <= 2 PX): the PE (py mod PX,
+//   py) sends chunk py down column py mod PX on CV (rows < PX) or CV2 (rows
+//   past PX; the two column legs overlap); the next grid's (py mod PX, py)
+//   takes it and multicasts it along row py;
+// - HEADMODE 2: layer 0 takes row py's chunk from the east on E[py % 4] (the
+//   embedding strip, paths.csl); the last layer's east column sends row py's
+//   chunk east on S[py % 2] (to the head).
+// The handoffs use queue 2 (free in qwen2d_paged8b).
+//
+// rtab (u16, written with a 16-bit memcpy): [c_in, c_relay, c_out, n, (color, rx, tx1, tx2) x n (n <= 4)], colors by
+// number (NONE: none), directions as the kernel's D_* (0 ramp, 1 N, 2 S, 3 E,
+// 4 W). Routes are read-modify-written (only the route bits change).
+const rt = @import_module("rt.csl");
+const RTN: u16 = 4 + 4 * 4;
+const RNONE: u16 = 0xff;
+var rtab = @zeros([RTN]u16);
+var rtab_ptr: [*]u16 = &rtab;
+
+fn s2d_place() void {
+  px = layout_mod.get_x_coord() % PX;
+  py = layout_mod.get_y_coord() % PY;
+}
+
+fn s2d_routes() void {
+  const cc0 = color_config.get_color_config_addr(@get_color(0));
+  var k: u16 = 0;
+  while (k < rtab[3]) : (k += 1) {
+    const e = 4 + 4 * k;
+    const addr = cc0 + rtab[e];
+    var r = @get_config(addr, tgt.color_addr_range);
+    r = r & @get_int(tgt.fabric_io.CLEAR_MASK);
+    r = r | rxw(rtab[e + 1]) | txw(rtab[e + 2]) | txw(rtab[e + 3]);
+    @set_config(addr, r, tgt.color_addr_range);
+  }
+  if (rtab[0] != RNONE) { rt.iq_color(2, rtab[0]); }
+}
+
+
+// Queue 2's output color is set for each send (a relay PE may also be its
+// row's sender, on another color); its input color once, at init (nothing but
+// this PE's own handoff is routed to its ramp on that color).
+fn q2_send(c: u16) void {
+  rt.oq_color(2, c);
+  @fmovs(fout(q_gb_out, S2D_XN), x_all);
+}
+
+fn recv_x() void {
+  if (rtab[0] != RNONE) { @fmovs(x_all, fin(q_gb_in, S2D_XN)); }
+  if (rtab[1] != RNONE) { q2_send(rtab[1]); }   // the relay: on along the row
+}
+
+fn send_x() void {
+  if (rtab[2] != RNONE) { q2_send(rtab[2]); }
+}
+
+// `steps` passes, each through this grid once: x in from the layer before
+// (layer 0: the host's or the embedding strip's), the layer, x out. start_pos
+// is unused (positions come from `tab`). S2D_TIME 1 (PROF 0): prof[0] sums the
+// passes' layer cycles after the first (the kernel's pass counter; ~0.3 KB of
+// code, so off by default).
+fn compute(steps: u32, start_pos: u32) void {
+  if (S2D_TIME == 1) { timestamp.enable_tsc(); }
+  var i: u32 = 0;
+  while (i < steps) : (i += 1) {
+    s2d_pass_start(i, start_pos);   // the kernel's per-pass prologue (sync.py)
+    recv_x();
+    if (S2D_TIME == 1) {
+      timing = i > 0;
+      pass_start();
+      timestamp.get_timestamp(&t_mark);
+    }
+    layer();
+    if (S2D_TIME == 1) { pass_end(); }
+    send_x();
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @export_symbol(rtab_ptr, "rtab");
+}

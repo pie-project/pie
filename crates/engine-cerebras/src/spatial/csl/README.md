@@ -10,13 +10,16 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
   - `qwen2d_paged.csl`: the batched paged layer.
   - `qwen2d_pring.csl`: the paged layer as a pipeline-ring stage.
   - `head2d_v9.csl`: the 2-D LM head.
+  - `qwen2d_paged8b.csl`: the bf16 8B layer (the version serve8b's 0115
+    build ran, before the HROUTE/ROT8/GY params).
+  - `head2d_v10.csl`: the bf16 8B head.
 - `vm/`: eta VM images, snapshots of the VM generator's output (`gen_vm.py`
   over the shared VM core).
   - `guest4hm_vm.csl`: serve2d's multi-column VM.
   - `guest4hs_vm.csl`: serve2d_pipe's banked VM: per-row ctl, per-step host
     input, op masks, multi-row (Fork 3's guest4hs; snapshot of 2026-10-29
     14:35, per-lane programs).
-- `serve2d/`, `serve2d_pipe/`: each design's layout, routing helpers,
+- `serve2d/`, `serve2d_pipe/`, `serve8b/`: each design's layout, routing helpers,
   `*_extra.csl` (what it appends to each kernel) and base programs.
 
 The generated `*_pe.csl` are byte-identical to the bench payload's `sync.py`

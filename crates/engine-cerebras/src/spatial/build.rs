@@ -328,9 +328,18 @@ fn rectangle(design: Design, params: &[(String, String)]) -> R<(u32, u32)> {
             .ok_or_else(|| format!("{}: no `{k}`", design.name()))
     };
     let (px, py, gw, gh, hh, vmc) = (get("PX")?, get("PY")?, get("GW")?, get("GH")?, get("HH")?, get("VMC")?);
-    // layout.csl: the grids then the head's PY + VMC columns; down GH grids
-    // or the head's HH rows and its feeder row (HEADMODE 2).
-    Ok((gw * px + py + vmc, (gh * py).max(hh + 1)))
+    match design {
+        // layout.csl: the grids then the head's PY + VMC columns; down GH
+        // grids or the head's HH rows and its feeder row (HEADMODE 2).
+        Design::Serve2d | Design::Serve2dPipe => Ok((gw * px + py + vmc, (gh * py).max(hh + 1))),
+        // serve8b's layout.csl: the grids, the head's PY/2 + VMC columns and
+        // the PY/4-wide embedding strip (HEADMODE 2; neither in mode 0).
+        Design::Serve8b => {
+            let head = get("HEADMODE")? == 2;
+            let (hw, ew) = if head { (py / 2 + vmc, py / 4) } else { (0, 0) };
+            Ok((gw * px + hw + ew, if head { (gh * py).max(hh + 1) } else { gh * py }))
+        }
+    }
 }
 
 /// `design` with `params`, from the compile cache or compiled into it

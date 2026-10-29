@@ -18,6 +18,8 @@ mod src {
     pub const QWEN2D_PAGED: &str = include_str!("csl/kernels/qwen2d_paged.csl");
     pub const QWEN2D_PRING: &str = include_str!("csl/kernels/qwen2d_pring.csl");
     pub const HEAD2D_V9: &str = include_str!("csl/kernels/head2d_v9.csl");
+    pub const QWEN2D_PAGED8B: &str = include_str!("csl/kernels/qwen2d_paged8b.csl");
+    pub const HEAD2D_V10: &str = include_str!("csl/kernels/head2d_v10.csl");
     pub const VM_HM: &str = include_str!("csl/vm/guest4hm_vm.csl");
     pub const VM_HS: &str = include_str!("csl/vm/guest4hs_vm.csl");
 
@@ -30,6 +32,16 @@ mod src {
         pub const VM_EXTRA: &str = include_str!("csl/serve2d/vm_extra.csl");
         pub const STUB_BASE: &str = include_str!("csl/serve2d/stub_base.csl");
         pub const FILLER_BASE: &str = include_str!("csl/serve2d/filler_base.csl");
+    }
+
+    pub mod s8b {
+        pub const LAYOUT: &str = include_str!("csl/serve8b/layout.csl");
+        pub const PATHS: &str = include_str!("csl/serve8b/paths.csl");
+        pub const RT: &str = include_str!("csl/serve8b/rt.csl");
+        pub const GRID_EXTRA: &str = include_str!("csl/serve8b/grid_extra.csl");
+        pub const HEAD_EXTRA: &str = include_str!("csl/serve8b/head_extra.csl");
+        pub const EMBED_BASE: &str = include_str!("csl/serve8b/embed_base.csl");
+        pub const FILLER_BASE: &str = include_str!("csl/serve8b/filler_base.csl");
     }
 
     pub mod pipe {
@@ -50,6 +62,9 @@ pub enum Design {
     Serve2d,
     /// The paged layer as a pipeline ring with the head as its stage 0 (serve2d_pipe).
     Serve2dPipe,
+    /// Qwen3-8B: qwen2d_paged8b layer grids in strips, head2d v10 and the
+    /// embedding strip (serve8b).
+    Serve8b,
 }
 
 impl Design {
@@ -57,6 +72,7 @@ impl Design {
         match self {
             Design::Serve2d => "serve2d",
             Design::Serve2dPipe => "serve2d_pipe",
+            Design::Serve8b => "serve8b",
         }
     }
 
@@ -64,6 +80,7 @@ impl Design {
         match name {
             "serve2d" => Some(Design::Serve2d),
             "serve2d_pipe" => Some(Design::Serve2dPipe),
+            "serve8b" => Some(Design::Serve8b),
             _ => None,
         }
     }
@@ -73,6 +90,7 @@ impl Design {
         match self {
             Design::Serve2d => serve2d(),
             Design::Serve2dPipe => serve2d_pipe(),
+            Design::Serve8b => serve8b(),
         }
     }
 }
@@ -705,6 +723,147 @@ pub fn serve2d_pipe() -> R<Vec<File>> {
     ])
 }
 
+// ---------------------------------------------------------------- serve8b
+
+const S8B_GRID_NAMES: &[(&str, &str)] = &[
+    ("x", "f32"), ("tab", "u32"), ("gamma1", "f32"), ("gamma2", "f32"), ("wqa", "WS"), ("wqv", "WS"),
+    ("wv", "WS"), ("qkn_w", "f32"), ("rot_c", "f32"), ("rot_s", "f32"), ("kc", "KS"), ("vc", "KS"),
+    ("wo", "WS"), ("wgu", "WS"), ("wd", "WS"), ("prof", "u32"), ("dims", "u16"), ("rtab", "u16"),
+];
+const S8B_HEAD_NAMES: &[(&str, &str)] = &[
+    ("wt", "u32"), ("et", "u32"), ("l2", "f32"), ("force", "u32"), ("lmax", "f32"), ("gmode", "u32"),
+    ("vm_tok", "f32"), ("vin", "f32"), ("xin", "f32"), ("gam", "f32"), ("y", "f32"), ("emb", "f32"),
+    ("tok", "f32"), ("prof", "u32"), ("in_tokens", "u32"), ("out_tokens", "u32"), ("yscale", "f32"),
+    ("hlogits", "f32"),
+];
+const S8B_EMBED_NAMES: &[(&str, &str)] = &[("etab", "u32")];
+
+fn s8b_dummies(own: &[String]) -> String {
+    let all = Names::of(S8B_GRID_NAMES).with(S8B_HEAD_NAMES).with(S8B_EMBED_NAMES);
+    pipe_dummies(&all, own).replacen("// serve2d_pipe:", "// serve8b:", 1)
+}
+
+const S8B_GRID_VARIANT: &str = "// serve8b: queue 2 (free in qwen2d_paged8b) carries the handoffs; it rests on\n\
+// C_Q2, which nothing routes to a ramp.\n\
+const C_Q2: color = @get_color(16);\n\
+const q_gb_in = @get_input_queue(2);\n\
+const q_gb_out = @get_output_queue(2);\n\
+comptime {\n  @initialize_queue(q_gb_in, .{ .color = C_Q2 });\n  @initialize_queue(q_gb_out, .{ .color = C_Q2 });\n}\n\
+const S2D_XN: u16 = B * Hc;       // x's words a PE: B lanes of Hc, lane-major\n";
+
+fn s8b_grid() -> R<String> {
+    let tag = "qwen2d_paged8b/pe.csl";
+    let mut s = patch(
+        src::QWEN2D_PAGED8B,
+        "param c_r1_0: color;\n",
+        "// serve8b: 1 times each pass (prof[0]).\nparam S2D_TIME: u16;\nparam c_r1_0: color;\n",
+        "params",
+    )?;
+    s = patch(&s, "  px = layout_mod.get_x_coord();\n  py = layout_mod.get_y_coord();\n", "  s2d_place();\n", "init coordinates")?;
+    s = patch(
+        &s,
+        "  route_gbcast();\n  axis_y();\n  sys_mod.unblock_cmd_stream();\n}\n",
+        "  route_gbcast();\n  axis_y();\n  s2d_routes();\n  sys_mod.unblock_cmd_stream();\n}\n",
+        "init routes",
+    )?;
+    let (start, end) = fn_block(&s, "fn compute(steps: u32) void {\n").ok_or_else(|| format!("gen: {tag} changed: compute() not found"))?;
+    let body_at = start + s[start..].find("fn compute(steps: u32) void {\n").unwrap_or(0) + "fn compute(steps: u32) void {\n".len();
+    let body = &s[body_at..end - 3];
+    let open = "  while (i < steps) : (i += 1) {\n";
+    let close = "\n    timing = i > 0;\n    pass_start();\n    timestamp.get_timestamp(&t_mark);\n    layer();\n    pass_end();\n  }\n";
+    let lo = body.find(open).ok_or_else(|| format!("gen: {tag} changed: compute()'s pass loop not as expected"))? + open.len();
+    let hi = lo + body[lo..].find(close).ok_or_else(|| format!("gen: {tag} changed: compute()'s pass loop not as expected"))?;
+    let prologue: Vec<&str> = body[lo..hi].split('\n').map(|l| l.strip_prefix("  ").unwrap_or(l)).collect();
+    let prologue = prologue.join("\n");
+    s = format!("{}\n{}", &s[..start], &s[end..]);
+    let pass_fn = format!(
+        "// The kernel's per-pass prologue (lanes advance), lifted by sync.py.\n\
+fn s2d_pass_start(i: u32, start_pos: u32) void {{\n{prologue}\n}}\n"
+    );
+    let mut own = exports(&s);
+    own.extend(exports(src::s8b::GRID_EXTRA));
+    let extra = format!("{S8B_GRID_VARIANT}\n{pass_fn}\n{}\n{}", src::s8b::GRID_EXTRA, s8b_dummies(&own));
+    s = patch(
+        &s,
+        "\ncomptime {\n  @initialize_queue(q_r1_0_in",
+        &format!("\n{extra}\ncomptime {{\n  @initialize_queue(q_r1_0_in"),
+        "comptime block",
+    )?;
+    Ok(format!(
+        "// GENERATED by serve8b/sync.py from {tag} + serve8b/grid_extra.csl.\n\
+// Do not edit: change grid_extra.csl or sync.py and rerun.\n{s}"
+    ))
+}
+
+fn s8b_head() -> R<String> {
+    let tag = "head2d_v10/pe.csl";
+    let mut s = patch(
+        src::HEAD2D_V10,
+        "param WF32: u16;\n",
+        concat!(
+            "param WF32: u16;\n// serve8b: the grids beside the head (x0 = GW * GPX, y0 = 0; GHc dims a grid\n",
+            "// row), the tokens' capacity, the lanes, the copy kernel, the grids' element\n",
+            "// types (their exports).\nparam GPX: u16;\nparam GPY: u16;\nparam GHc: u16;\nparam GW: u16;\n",
+            "param GH: u16;\nparam GS: u16;\nparam NL: u16;\nparam CAP: u16;\nparam SB: u16;\nparam HLB: u16;\n",
+            "param KVCP: u16;\nparam WS: type;\nparam KS: type;\n"
+        ),
+        "params",
+    )?;
+    s = patch(&s, HEAD_XY_OLD, HEAD_XY_NEW, "init coordinates")?;
+    if !s.contains("if (NB == 1) { return; }") {
+        s = patch(
+            &s,
+            "fn row_pairs() void {\n  const r = blk % Gb;\n",
+            "fn row_pairs() void {\n  if (NB == 1) { return; }\n  const r = blk % Gb;\n",
+            "row_pairs",
+        )?;
+    }
+    s = patch(
+        &s,
+        "    if (px == W - 1) { color_config.reset_routes(c_ib, .{ .rx = WEST, .tx = RAMP }); }\n",
+        "    if (px == W - 1) { color_config.reset_routes(c_ib, .{ .rx = WEST, .tx = [2]direction{ EAST, RAMP } }); }\n",
+        "winner multicast east end",
+    )?;
+    s = head_init(&s, "s2d_head_init();")?;
+    s = patch(&s, "  @fmovs(xs_dsd, fin(q_x_in, Hc));\n  mark(0);\n",
+        "  @fmovs(xs_dsd, fin(q_x_in, Hc));\n  s2d_after_x();\n  mark(0);\n", "region x arrival")?;
+    s = patch(&s, "  @fmuls(xs_dsd, xin_dsd, gam_dsd);\n",
+        "  s2d_feeder_in();\n  @fmuls(xs_dsd, xin_dsd, gam_dsd);\n", "feeder input")?;
+    s = patch(&s, "      ib[0] = if (ok) best[1] else -1.0;\n",
+        "      ib[0] = s2d_decide(if (ok) best[1] else -1.0);\n", "final root decision")?;
+    s = patch(&s, "      tok[1] = ib[0];\n", "      ib[0] = s2d_decide(ib[0]);\n      tok[1] = ib[0];\n",
+        "final root decision (gmode)")?;
+    let (t, n) = after_each_call(&s, "emb_copy();", "s2d_emb_out();");
+    if n != 2 {
+        return Err(format!("gen: {tag} changed: emb_copy() called {n} times"));
+    }
+    s = drop_head_compute(&t)?;
+    let mut own = exports(&s);
+    own.extend(["in_tokens", "out_tokens", "yscale", "hlogits"].map(String::from));
+    s = format!("{}\n\n{}\n{}", s.trim_end_matches('\n'), src::s8b::HEAD_EXTRA, s8b_dummies(&own));
+    Ok(format!(
+        "// GENERATED by serve8b/sync.py from {tag} (Fork 7) + serve8b/head_extra.csl.\n\
+// Do not edit: change head_extra.csl or sync.py and rerun.\n{s}"
+    ))
+}
+
+fn s8b_plain(base: &str, base_name: &str, what: &str) -> String {
+    format!("// GENERATED by serve8b/sync.py from {base_name} ({what}).\n{base}\n{}", s8b_dummies(&exports(base)))
+}
+
+/// serve8b's build directory.
+pub fn serve8b() -> R<Vec<File>> {
+    Ok(vec![
+        ("layout.csl", src::s8b::LAYOUT.to_string()),
+        ("paths.csl", src::s8b::PATHS.to_string()),
+        ("rt.csl", src::s8b::RT.to_string()),
+        ("grid_pe.csl", s8b_grid()?),
+        ("head_pe.csl", s8b_head()?),
+        ("embed_pe.csl", s8b_plain(src::s8b::EMBED_BASE, "embed_base.csl", "the embedding strip")),
+        ("filler.csl", s8b_plain(src::s8b::FILLER_BASE, "filler_base.csl", "the filler")),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,12 +882,16 @@ mod tests {
         ("serve2d_pipe", "head_pe.csl", "4db3bc7f18fd9ef32f420f8ad4881cbb3477d74bcf71045ff5eb1559e5c26ee5"),
         ("serve2d_pipe", "filler.csl", "79788748a6a34253d18ba364f05033129db41342f7bc4c86687436fcfaab0e61"),
         ("serve2d_pipe", "vm_pe.csl", "4753a16de7cc6036f7890df4f8e286b8934b5edc1d7baf094b77dc636851b723"),
+        ("serve8b", "grid_pe.csl", "9d6e67f1ed0c88c1c852248296fb7be7bfc0ac7ecc24a8456e1d45ec2dab0f76"),
+        ("serve8b", "head_pe.csl", "b08dbbaef37c00d3b0a6f91888766eda3ec77cfddb868b1780f7b59c85f27256"),
+        ("serve8b", "embed_pe.csl", "0c17e992957bce93e17360b590ad8148641f6e02f42c87d29006370b6fc44a18"),
+        ("serve8b", "filler.csl", "ba91cf083cc4235ea8da24076a75668549432601fb80e0e3cac8ee545fb8f5db"),
     ];
 
     #[test]
     fn generators_match_their_pins() {
         if std::env::var_os("PIE_CEREBRAS_PRINT_PINS").is_some() {
-            for d in [Design::Serve2d, Design::Serve2dPipe] {
+            for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b] {
                 for (name, text) in d.files().unwrap() {
                     println!("PIN (\"{}\", \"{name}\", \"{}\"),", d.name(), blake3::hash(text.as_bytes()).to_hex());
                 }
@@ -748,7 +911,7 @@ mod tests {
     fn generators_match_payload() {
         let Some(root) = std::env::var_os("PIE_CEREBRAS_PAYLOAD") else { return };
         let root = std::path::PathBuf::from(root);
-        for d in [Design::Serve2d, Design::Serve2dPipe] {
+        for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b] {
             for (name, text) in d.files().unwrap() {
                 let want = std::fs::read_to_string(root.join(d.name()).join(name)).unwrap();
                 if want != text {

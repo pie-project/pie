@@ -1,0 +1,40 @@
+// Runtime fabric configuration: routes of a color and the colors of queues,
+// set by a PE itself, so PEs that differ only in routes and colors share one
+// program image.
+const tc = @import_module("<tile_config>");
+
+const RX_W: u16 = 0x00;
+const RX_E: u16 = 0x20;
+const RX_S: u16 = 0x40;
+const RX_N: u16 = 0x60;
+const RX_R: u16 = 0x80;
+const TX_W: u16 = 0x01;
+const TX_E: u16 = 0x02;
+const TX_S: u16 = 0x04;
+const TX_N: u16 = 0x08;
+const TX_R: u16 = 0x10;
+
+// Color c's routes: one input (RX_*) and a set of outputs (TX_* or'ed).
+fn route(comptime c: color, rx: u16, tx: u16) void {
+  const addr = tc.color_config.get_color_config_addr(c);
+  var r: u16 = @get_config(addr, tc.target.color_addr_range);
+  r = (r & 0xff00) | rx | tx;
+  @set_config(addr, r, tc.target.color_addr_range);
+}
+
+fn iq_color(comptime qid: u16, c: u16) void {
+  const addr = tc.input_queue_config.get_input_queue_config_addr(qid);
+  var v: u16 = @get_config(addr, tc.input_queue_config.in_queue_addr_range);
+  v = (v & 0xffe0) | c;
+  @set_config(addr, v, tc.input_queue_config.in_queue_addr_range);
+}
+
+fn oq_color(comptime qid: u16, c: u16) void {
+  const addr = tc.output_queue_config.get_output_queue_config_addr(qid);
+  var v: u16 = @get_config(addr, tc.output_queue_config.out_queue_addr_range);
+  v = (v & 0xfe0f) | (c << 4);
+  @set_config(addr, v, tc.output_queue_config.out_queue_addr_range);
+}
+
+// A color's number, for the queue setters.
+fn cn(comptime c: color) u16 { return @get_int(c); }
