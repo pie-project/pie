@@ -180,7 +180,13 @@ impl Daemon {
     /// One request, its answer; an answer without `"ok": true` is an error.
     fn call(&mut self, request: &serde_json::Value) -> EngineResult<serde_json::Value> {
         let _busy = Busy::start();
+        let json_ns = |t: std::time::Instant| {
+            let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            JSON_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+        };
+        let t = std::time::Instant::now();
         let line = serde_json::to_string(request).expect("a JSON value serializes");
+        json_ns(t);
         writeln!(self.stdin, "{line}")
             .and_then(|()| self.stdin.flush())
             .map_err(|e| Error::Device(format!("the model daemon went away: {e}")))?;
@@ -192,7 +198,10 @@ impl Daemon {
         if read == 0 {
             return Err(Error::Device("the model daemon closed its output".into()));
         }
-        let value: serde_json::Value = serde_json::from_str(answer.trim()).map_err(|e| {
+        let t = std::time::Instant::now();
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(answer.trim());
+        json_ns(t);
+        let value: serde_json::Value = parsed.map_err(|e| {
             Error::Device(format!(
                 "the model daemon answered non-JSON ({e}): {answer}"
             ))
@@ -217,6 +226,10 @@ impl Drop for Daemon {
 /// thread's launches), all fires together: the host's share of a token is
 /// the rest of its wall time.
 pub(crate) static MODEL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Of [`MODEL_NS`], the host's own JSON work on a daemon's requests and
+/// answers (serializing, parsing).
+pub(crate) static JSON_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Adds its lifetime to [`MODEL_NS`].
 pub(crate) struct Busy(std::time::Instant);
@@ -1130,6 +1143,14 @@ impl Spatial {
                     homes = guest.table.homes.len(),
                     "spatial guest: the epilogue would run on the wafer"
                 );
+                if let Some(Model::Wafer(w)) = &self.daemon
+                    && w.vm.is_some()
+                {
+                    match w.vm_refuses(&guest.table) {
+                        Some(why) => tracing::info!(program = program.0, %why, "spatial guest: the VM cannot take it"),
+                        None => tracing::info!(program = program.0, "spatial guest: the VM can take it"),
+                    }
+                }
                 self.guest_programs.insert(program.0, std::sync::Arc::new(guest));
             }
             Err(why) => tracing::info!(
@@ -1849,6 +1870,7 @@ impl Spatial {
         tracing::info!(
             fires = self.fires,
             model_ms = MODEL_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+            json_ms = JSON_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
             "spatial: model time"
         );
         Ok(lanes

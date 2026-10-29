@@ -115,6 +115,8 @@ struct Tr<'a> {
     /// Free pool blocks (offset, words).
     free_pool: Vec<(u32, u32)>,
     pool_top: u32,
+    /// The most pool words ever in use (pool_top falls as the top is freed).
+    pool_hi: u32,
     nreg_used: u32,
     remat: bool,
     /// Integer values known at translation time (constants, iotas, sums).
@@ -165,6 +167,7 @@ impl Tr<'_> {
                 return Err(format!("more than {} pool words", self.max_pool));
             }
             self.pool_top += n;
+            self.pool_hi = self.pool_hi.max(self.pool_top);
             self.pool_top - n
         };
         let sid = self.new_storage(Kind::Pool(at), n, false);
@@ -373,6 +376,7 @@ fn translate_with(
         next_reg: 1,
         free_pool: Vec::new(),
         pool_top: 0,
+        pool_hi: 0,
         nreg_used: 1,
         remat,
         known: BTreeMap::new(),
@@ -569,7 +573,7 @@ fn translate_with(
         per_step,
         tok_home,
         nreg: t.nreg_used,
-        pool_words: t.pool_top,
+        pool_words: t.pool_hi,
         feat,
         remat,
     })

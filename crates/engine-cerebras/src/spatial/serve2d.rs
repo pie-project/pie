@@ -522,12 +522,21 @@ fn head(lay: &Layout2d, ckpt: &Ckpt, sink: &mut dyn Sink) -> R<()> {
             Some(q)
         }
     };
-    let tile_rows = |rows: std::ops::Range<usize>| -> Vec<f32> {
-        let mut t = vec![0f32; rows.len() * cw * n];
+    // The fabric column runs the head's tiles go to: on a VM build not its
+    // VM column (the VM's program exports 1-word `wt`/`gam` dummies a tile
+    // would run over), so the chunk columns either side of it.
+    let segments: Vec<std::ops::Range<usize>> = if lay.vm.is_some() {
+        vec![0..r2x + 1, r2x + 2..cw]
+    } else {
+        vec![0..cw]
+    };
+    let tile_rows = |rows: std::ops::Range<usize>, qs: std::ops::Range<usize>| -> Vec<f32> {
+        let w = qs.len();
+        let mut t = vec![0f32; rows.len() * w * n];
         for (yi, ry) in rows.enumerate() {
-            for q in 0..cw {
+            for (qi, q) in qs.clone().enumerate() {
                 let Some(c) = chunk(q) else { continue };
-                let base = (yi * cw + q) * n + 1;
+                let base = (yi * w + qi) * n + 1;
                 for h in 0..hc {
                     let dim = c * hc + h;
                     if dim >= hid {
@@ -547,25 +556,31 @@ fn head(lay: &Layout2d, ckpt: &Ckpt, sink: &mut dyn Sink) -> R<()> {
     let words = |t: &[f32]| -> Vec<u32> { t.iter().map(|x| x.to_bits()).collect() };
     let hx = lay.head_x();
     // The regions above and below the feeder row, a band at a time.
-    for (lo, hi, y0) in [(0, f, 0), (f, hh, f + 1)] {
-        let mut y = lo;
-        while y < hi {
-            let rows = (hi - y).min(64);
-            let t = tile_rows(y..y + rows);
-            sink.h2d("wt", rect(hx, y0 + (y - lo), cw, rows), n, &words(&t))?;
-            y += rows;
+    for qs in &segments {
+        for (lo, hi, y0) in [(0, f, 0), (f, hh, f + 1)] {
+            let mut y = lo;
+            while y < hi {
+                let rows = (hi - y).min(64);
+                let t = tile_rows(y..y + rows, qs.clone());
+                sink.h2d("wt", rect(hx + qs.start, y0 + (y - lo), qs.len(), rows), n, &words(&t))?;
+                y += rows;
+            }
         }
     }
     let norm = ckpt.get("model.norm.weight")?;
     expect(&norm, "model.norm.weight", &[hid])?;
-    let gam: Vec<f32> = (0..cw)
-        .flat_map(|q| {
-            let c = chunk(q);
-            (0..hc).map(move |h| c.map(|c| c * hc + h))
-        })
-        .map(|dim| dim.and_then(|d| norm.data.get(d).copied()).unwrap_or(0.0))
-        .collect();
-    sink.h2d("gam", rect(hx, f, cw, 1), hc, &words(&gam))
+    for qs in &segments {
+        let gam: Vec<f32> = qs
+            .clone()
+            .flat_map(|q| {
+                let c = chunk(q);
+                (0..hc).map(move |h| c.map(|c| c * hc + h))
+            })
+            .map(|dim| dim.and_then(|d| norm.data.get(d).copied()).unwrap_or(0.0))
+            .collect();
+        sink.h2d("gam", rect(hx + qs.start, f, qs.len(), 1), hc, &words(&gam))?;
+    }
+    Ok(())
 }
 
 /// One launch: the forced tokens, `steps` head iterations from `start`;

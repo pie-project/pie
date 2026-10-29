@@ -75,10 +75,12 @@ impl VmLayout {
     }
 
     /// serve2d's head (one block of `C` = PY columns at `x0`, `HH` region
-    /// rows) when its build carries the VM (`VMC` 1 and the VM limits among
-    /// its params).
+    /// rows) when its build carries the VM (`VM` 1, `VMC` 1 and the VM
+    /// limits among its params).
     pub fn serve2d(x0: usize, get: impl Fn(&str) -> Option<usize>) -> Option<VmLayout> {
-        if get("VMC")? != 1 {
+        // `VM` 1: the VM's program on the VM column (`VMC` alone leaves it
+        // a filler).
+        if get("VM")? != 1 || get("VMC")? != 1 {
             return None;
         }
         let (c, gx, hh) = (get("PY")?, get("Gx")?, get("HH")?);
@@ -281,6 +283,88 @@ pub fn read_out(rt: &mut Runtime, lay: &VmLayout, ring: Ring, first: u64, steps:
             row
         })
         .collect())
+}
+
+/// What a VM PE received for the last sampled step: the logits row x 1/rms
+/// (block by block, region rows in order, the hub skipped), vocabulary order.
+pub fn read_plane(rt: &mut Runtime, lay: &VmLayout) -> R<Vec<f32>> {
+    let (nv, w) = (lay.rows + 1, lay.vr + 1);
+    let mut plane = Vec::with_capacity(lay.blocks * lay.rows * lay.vr);
+    for b in 0..lay.blocks {
+        let mut vin = vec![0u32; nv * w];
+        rt.memcpy_d2h("vin", &mut vin, rect(lay.column(b), 0, 1, nv), w, Order::RowMajor, DataType::Bits32)
+            .map_err(|e| e.to_string())?;
+        for pe in (0..nv).filter(|&pe| pe != lay.feeder) {
+            let row = &vin[pe * w..(pe + 1) * w];
+            let scale = f32::from_bits(row[lay.vr]);
+            plane.extend(row[..lay.vr].iter().map(|&v| f32::from_bits(v) * scale));
+        }
+    }
+    plane.truncate(lay.vocab);
+    Ok(plane)
+}
+
+fn dtype_of(s: &str) -> eta_ir::Dtype {
+    match s {
+        "F32" => eta_ir::Dtype::F32,
+        "I32" => eta_ir::Dtype::I32,
+        "Bool" => eta_ir::Dtype::Bool,
+        _ => eta_ir::Dtype::U32,
+    }
+}
+
+/// An etagen case (`etagen cases`: the translator's table, homes, outputs,
+/// token home and the homes' seeds) as a table and its seeds: the checks'
+/// way to load a program without an instance.
+pub fn case_table(case: &serde_json::Value) -> R<(Table, Vec<Seed>)> {
+    let u = |v: &serde_json::Value| v.as_u64().unwrap_or(0) as u32;
+    let flat: Vec<u32> = case["table"]
+        .as_array()
+        .ok_or("the case has no table")?
+        .iter()
+        .flat_map(|i| match i.as_array() {
+            Some(words) => words.iter().map(u).collect(),
+            None => vec![u(i)],
+        })
+        .collect();
+    let homes: Vec<Home> = case["homes"]
+        .as_array()
+        .ok_or("the case has no homes")?
+        .iter()
+        .map(|h| Home {
+            chan: u(&h["chan"]),
+            kind: if h["kind"] == "pool" { "pool" } else { "wide" },
+            at: u(&h["at"]),
+            n: u(&h["n"]),
+            dtype: dtype_of(h["dtype"].as_str().unwrap_or("U32")),
+        })
+        .collect();
+    let seeds = homes
+        .iter()
+        .filter_map(|h| {
+            let words = case["seeds"][h.chan.to_string()].as_array()?;
+            Some(Seed::of(h, words.iter().map(u).collect()))
+        })
+        .collect();
+    let table = Table {
+        ins: flat.chunks_exact(6).map(|w| [w[0], w[1], w[2], w[3], w[4], w[5]]).collect(),
+        pre_len: case["pre_len"].as_u64().unwrap_or(0) as usize,
+        homes,
+        outputs: case["outputs"]
+            .as_array()
+            .ok_or("the case has no outputs")?
+            .iter()
+            .map(|o| (u(&o["chan"]), u(&o["slot"]), u(&o["n"]), dtype_of(o["dtype"].as_str().unwrap_or("U32"))))
+            .collect(),
+        wide_outputs: Vec::new(),
+        per_step: Vec::new(),
+        tok_home: case["tok_home"].as_u64().map(|t| t as u32),
+        nreg: u(&case["nreg"]),
+        pool_words: u(&case["pool_words"]),
+        feat: u(&case["feat"]),
+        remat: false,
+    };
+    Ok((table, seeds))
 }
 
 #[cfg(test)]

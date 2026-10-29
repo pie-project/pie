@@ -730,6 +730,13 @@ impl WaferModel {
         Ok(())
     }
 
+    /// The logits row the VM sampled its last step from
+    /// ([`super::guest4::wafer::read_plane`]): for checks.
+    pub fn vm_plane(&mut self) -> R<Vec<f32>> {
+        let vm = self.vm.as_ref().ok_or("the wafer program has no VM")?;
+        super::guest4::wafer::read_plane(&mut self.rt, &vm.lay)
+    }
+
     /// `token` at position `start` with the VM picking the next one: one
     /// launch of one iteration with `gmode` 1 (the VM runs the loaded
     /// program on that row's logits and the head embeds its token), then
