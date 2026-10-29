@@ -1513,8 +1513,9 @@ fn delta(
             };
             let fq = &mut *f;
             let l = lanes.count(fq);
-            let s = fq.dims(segs.begin)[0];
-            if t <= chunk || (l == s && s > 1 && t / s <= chunk) {
+            // every lane fits one chunk only when the whole fire does: an average under `chunk` lets a
+            // prompt beside decodes (or a padding lane) lose its rows past the first chunk
+            if t <= chunk {
                 delta_single_chunk(fq, &input, &raw, &lanes, slab, per, stride, chunk)?
             } else {
                 let init = take_slots(fq, slab, lanes.slot, per)?;
