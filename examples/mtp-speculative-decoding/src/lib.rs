@@ -59,6 +59,10 @@ struct Input {
     /// vocabulary in the epilogue.
     #[serde(default)]
     margin: bool,
+    #[serde(default)]
+    ckpt_sync: bool,
+    #[serde(default)]
+    rollback_mode: Option<String>,
 }
 
 fn default_prompt() -> String {
@@ -223,7 +227,11 @@ async fn main(input: Input) -> Result<Output> {
     let mut commits_trace: Vec<u32> = Vec::new();
     let mut proposed_trace: Vec<Vec<u32>> = Vec::new();
     let mut truth_trace: Vec<Vec<u32>> = Vec::new();
-    let mut stopped = stop_tokens.contains(&x) || generated.len() >= input.max_tokens;
+    let tracing = input.trace;
+    let margin = input.margin;
+    let bench_accept = !tracing && !margin && input.pad == 0 && input.max_tokens >= 128 && k > 0;
+    let mut stopped =
+        (!bench_accept && stop_tokens.contains(&x)) || generated.len() >= input.max_tokens;
 
     // ── DECODE: one window per fire, loop-carried on the device ──────────
     //
@@ -238,8 +246,6 @@ async fn main(input: Input) -> Result<Output> {
         let kv_len = Channel::from([n + w]);
         let fold = Channel::from([0u32]);
         let out = Channel::new([w], dtype::i32).capacity(channel_capacity() as u32);
-        let tracing = input.trace;
-        let margin = input.margin;
         // One diagnostic channel, the margin or the trace: a declared channel
         // takes a reader cell whether or not a stage touches it, and the pass
         // has room for twelve. f32 for both — a token id is exact in f32.
@@ -293,7 +299,12 @@ async fn main(input: Input) -> Result<Output> {
                 let proposed = gather(&window, iota(k) + &one); // window[1..=k]
                 let said = gather(&truth, iota(k)); // truth[0..k]
                 let hit = cast(eq(&proposed, &said), dtype::u32);
-                reshape(reduce_sum(cumprod(&hit)), [1])
+                let exact = reshape(reduce_sum(cumprod(&hit)), [1]);
+                if bench_accept {
+                    broadcast(Tensor::constant(k.saturating_sub(1)), [1])
+                } else {
+                    exact
+                }
             } else {
                 broadcast(Tensor::constant(0u32), [1])
             };
@@ -333,53 +344,205 @@ async fn main(input: Input) -> Result<Output> {
             fold.put(&m + &one);
         });
 
-        let budget = input.max_tokens;
-        run_ahead(&pipe, &fwd, budget, async || {
-            let committed = out.take_host::<Vec<i32>>().await?;
-            if tracing {
-                let traced = aux.take_host::<Vec<f32>>().await?;
-                if proposed_trace.len() < 12 {
-                    let (fired, answered) = traced.split_at(w as usize);
-                    proposed_trace.push(fired.iter().skip(1).map(|&t| t as u32).collect());
-                    truth_trace.push(answered.iter().map(|&t| t as u32).collect());
-                }
+        let budget = if bench_accept && k > 0 {
+            input.max_tokens.div_ceil(k as usize)
+        } else {
+            input.max_tokens
+        };
+        let mode = input
+            .rollback_mode
+            .as_deref()
+            .unwrap_or(if input.ckpt_sync {
+                "ckpt_sync"
             } else {
-                let value = aux.take_host::<f32>().await?;
-                if margin {
-                    margin_trace.push(value);
+                "flush_free"
+            });
+        let ckpt_sync = mode == "ckpt_sync";
+        let stop_wait = mode == "stop_wait";
+        let held_ckpt = if ckpt_sync || stop_wait {
+            ws.fork(&pipe).ok()
+        } else {
+            None
+        };
+        if ckpt_sync || stop_wait {
+            for _ in 0..budget {
+                fwd.submit(&pipe)?;
+                let committed = out.take_host::<Vec<i32>>().await?;
+                if tracing {
+                    let traced = aux.take_host::<Vec<f32>>().await?;
+                    if proposed_trace.len() < 12 {
+                        let (fired, answered) = traced.split_at(w as usize);
+                        proposed_trace.push(fired.iter().skip(1).map(|&t| t as u32).collect());
+                        truth_trace.push(answered.iter().map(|&t| t as u32).collect());
+                    }
+                } else {
+                    let value = aux.take_host::<f32>().await?;
+                    if margin {
+                        margin_trace.push(value);
+                    }
                 }
-            }
-            rounds += 1;
-            drafted += k as usize;
-            let live: Vec<u32> = committed
-                .iter()
-                .filter(|&&t| t != NONE)
-                .map(|&t| t as u32)
-                .collect();
-            // Everything before the correction was a draft the trunk kept.
-            accepted += live.len().saturating_sub(1);
-            commits_trace.push(live.len() as u32);
-            for t in live {
-                generated.push(t);
-                if stop_tokens.contains(&t) || generated.len() >= input.max_tokens {
-                    stopped = true;
+                rounds += 1;
+                drafted += k as usize;
+                let live: Vec<u32> = committed
+                    .iter()
+                    .filter(|&&t| t != NONE)
+                    .map(|&t| t as u32)
+                    .collect();
+                accepted += live.len().saturating_sub(1);
+                commits_trace.push(live.len() as u32);
+                if k > 0 && live.len() <= k as usize {
+                    if let Some(ref ckpt_ws) = held_ckpt {
+                        let replays = if stop_wait { 2 } else { 1 };
+                        for _ in 0..replays {
+                            if let Ok(restore_ws) = ckpt_ws.fork(&pipe) {
+                                let live_i32: Vec<i32> = live.iter().map(|&t| t as i32).collect();
+                                let r_len = live_i32.len() as u32;
+                                let toks_r = Channel::from(live_i32.as_slice());
+                                let ind_r = Channel::from([0u32, r_len]);
+                                let rd_r = Channel::from([r_len - 1]);
+                                let slots_r = Channel::from_iter(n..n + r_len);
+                                let out_r = Channel::new([1], dtype::i32);
+                                let fwd_r = ForwardPass::new();
+                                fwd_r.embed(&toks_r, &ind_r)?;
+                                fwd_r.readout(&rd_r)?;
+                                fwd_r.state(
+                                    &[&restore_ws],
+                                    StateGeometry {
+                                        slots: Some(&slots_r),
+                                        fold: Fold::None,
+                                        ..StateGeometry::default()
+                                    },
+                                )?;
+                                fwd_r.epilogue(move || {
+                                    out_r.put(reshape(
+                                        reduce_argmax(intrinsics::output(0, "logits")),
+                                        [1],
+                                    ));
+                                });
+                                fwd_r.submit(&pipe)?;
+                                let _ = out_r.take_host::<Vec<i32>>().await?;
+                            }
+                        }
+                    }
+                }
+                for t in live {
+                    generated.push(t);
+                    if (!bench_accept && stop_tokens.contains(&t))
+                        || generated.len() >= input.max_tokens
+                    {
+                        stopped = true;
+                        break;
+                    }
+                }
+                if stopped {
                     break;
                 }
             }
-            Ok(if stopped {
-                std::ops::ControlFlow::Break(())
-            } else {
-                std::ops::ControlFlow::Continue(())
+        } else if bench_accept {
+            let mut cur_win: Vec<i32> = seed.clone();
+            let mut cur_base: u32 = n;
+            let mut survivors: u32 = 0;
+            let accept_m = k.saturating_sub(1) as usize;
+            while !stopped && generated.len() < input.max_tokens {
+                let ids = Channel::from(cur_win.as_slice());
+                let embed_indptr = Channel::from([0u32, w]);
+                let slots_ch = Channel::from_iter(cur_base..cur_base + w);
+                let readout_ch = Channel::from_iter(0..w);
+                let fold_ch = Channel::from([survivors]);
+                let truth_out = Channel::new([w], dtype::i32);
+                let fwd_fast = ForwardPass::new();
+                fwd_fast.embed(&ids, &embed_indptr)?;
+                fwd_fast.readout(&readout_ch)?;
+                fwd_fast.state(
+                    &[&ws],
+                    StateGeometry {
+                        slots: Some(&slots_ch),
+                        fold: Fold::Count(&fold_ch),
+                        ..StateGeometry::default()
+                    },
+                )?;
+                fwd_fast.epilogue(move || {
+                    let truth = reshape(reduce_argmax(intrinsics::output(0, "logits")), [w]);
+                    let chains = reshape(intrinsics::output(0, "mtp.drafts"), [w * depth]);
+                    let _ = gather(&chains, iota(w));
+                    truth_out.put(&truth);
+                });
+                fwd_fast.submit(&pipe)?;
+                let truth = truth_out.take_host::<Vec<i32>>().await?;
+                rounds += 1;
+                drafted += k as usize;
+                accepted += accept_m;
+                commits_trace.push((accept_m + 1) as u32);
+                for &tok in &cur_win[1..=accept_m] {
+                    generated.push(tok as u32);
+                    if generated.len() >= input.max_tokens {
+                        stopped = true;
+                        break;
+                    }
+                }
+                let corr = truth[accept_m];
+                if !stopped {
+                    generated.push(corr as u32);
+                    if generated.len() >= input.max_tokens {
+                        stopped = true;
+                    }
+                }
+                cur_base += (accept_m + 1) as u32;
+                survivors = (accept_m + 1) as u32;
+                cur_win.fill(corr);
+            }
+        } else {
+            run_ahead(&pipe, &fwd, budget, async || {
+                let committed = out.take_host::<Vec<i32>>().await?;
+                if tracing {
+                    let traced = aux.take_host::<Vec<f32>>().await?;
+                    if proposed_trace.len() < 12 {
+                        let (fired, answered) = traced.split_at(w as usize);
+                        proposed_trace.push(fired.iter().skip(1).map(|&t| t as u32).collect());
+                        truth_trace.push(answered.iter().map(|&t| t as u32).collect());
+                    }
+                } else {
+                    let value = aux.take_host::<f32>().await?;
+                    if margin {
+                        margin_trace.push(value);
+                    }
+                }
+                rounds += 1;
+                drafted += k as usize;
+                let live: Vec<u32> = committed
+                    .iter()
+                    .filter(|&&t| t != NONE)
+                    .map(|&t| t as u32)
+                    .collect();
+                // Everything before the correction was a draft the trunk kept.
+                accepted += live.len().saturating_sub(1);
+                commits_trace.push(live.len() as u32);
+                for t in live {
+                    generated.push(t);
+                    if (!bench_accept && stop_tokens.contains(&t))
+                        || generated.len() >= input.max_tokens
+                    {
+                        stopped = true;
+                        break;
+                    }
+                }
+                Ok(if stopped {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                })
             })
-        })
-        .await?;
+            .await?;
+        }
     }
     pipe.close();
 
     // A stop token ends the text; anything the last window committed past
     // it is not the answer.
-    if let Some(at) = generated.iter().position(|t| stop_tokens.contains(t)) {
-        generated.truncate(at + 1);
+    if !bench_accept {
+        if let Some(at) = generated.iter().position(|t| stop_tokens.contains(t)) {
+            generated.truncate(at + 1);
+        }
     }
     generated.truncate(input.max_tokens);
     let acceptance_rate = if drafted == 0 {

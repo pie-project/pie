@@ -49,7 +49,7 @@ impl From<poem_exec::store::Fault> for Fault {
     }
 }
 
-const STATE_DTYPE: Dtype = Dtype::F32;
+const STATE_DTYPE: Dtype = Dtype::Bf16;
 
 fn state_dtype(declared: Dtype) -> Dtype {
     match declared {
@@ -570,24 +570,44 @@ impl Pools {
 
     /// Zeros slot `slot` of every state slab.
     pub fn clear(&mut self, device: &Device, handles: &Handles, slot: u32) -> Result<()> {
-        self.check_slot(slot)?;
-        if !self.has_state() {
+        self.clear_slots(device, handles, &[slot])
+    }
+
+    /// Zeros every slot in `slots_to_clear` across every state slab in one kernel.
+    pub fn clear_slots(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        slots_to_clear: &[u32],
+    ) -> Result<()> {
+        for &slot in slots_to_clear {
+            self.check_slot(slot)?;
+        }
+        if slots_to_clear.is_empty() || !self.has_state() {
             return Ok(());
         }
-        let (inputs, at) = indices(handles, &[i64::from(slot)]);
+        let mut flat: Vec<i64> = slots_to_clear.iter().map(|&s| i64::from(s)).collect();
+        let n = flat.len().next_power_of_two();
+        let last = flat[flat.len() - 1];
+        while flat.len() < n {
+            flat.push(last);
+        }
+        let (inputs, at) = indices(handles, &flat);
         let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
         let slots = i64::from(self.paging.slots) + 1;
         let rows: Vec<Tensor> = self.state_rows().map(|r| r.1).collect();
         for &t in &rows {
             let span = (i64::from(t.rows) / slots).max(1);
             tracer.emit(&mut |cx| {
-                let whole = cx.read(t)?;
+                let mut whole = cx.read(t)?;
                 let elem = cx.elem(whole);
                 let zero = cx.const_i(elem, 0, &[span, i64::from(t.width)]);
-                let at = index_at(cx, at, 0, span)?;
                 let col = cx.const_i(Elem::I32, 0, &[]);
-                let next = cx.dynamic_update_slice(whole, zero, &[at, col])?;
-                cx.write(t, next)
+                for m in 0..n as i64 {
+                    let row_at = index_at(cx, at, m, span)?;
+                    whole = cx.dynamic_update_slice(whole, zero, &[row_at, col])?;
+                }
+                cx.write(t, whole)
             })?;
         }
         crate::exec::maintain(device, tracer, self, &inputs)

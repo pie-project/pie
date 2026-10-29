@@ -119,7 +119,13 @@ impl Registry {
         lanes: Vec<Vec<OutputDecl>>,
         caps: EngineCaps,
     ) -> Result<Arc<RegisteredProgram>, RegisterError> {
-        let hash = container_hash(&bytes);
+        let mut hash = container_hash(&bytes);
+        if std::env::var_os("PIE_ETA_NO_IDIOM").is_some() {
+            hash ^= 0x9e37_79b9_7f4a_7c15;
+        }
+        if std::env::var_os("PIE_ETA_NO_FUSION").is_some() {
+            hash ^= 0xbf58_476d_1ce4_e5b9;
+        }
         if let Some(hit) = self.inner.get(&hash) {
             if hit.bytes != bytes {
                 return Err(RegisterError::HashCollision(hash));

@@ -100,7 +100,7 @@ const WGPU_FIRE: Fire = Fire {
 #[cfg(feature = "xla")]
 const XLA_FIRE: Fire = Fire {
     lanes: 64,
-    tokens: 2048,
+    tokens: 2608,
 };
 #[cfg(feature = "cerebras")]
 const CEREBRAS_FIRE: Fire = Fire {

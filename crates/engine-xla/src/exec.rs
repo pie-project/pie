@@ -66,7 +66,7 @@ pub fn maintain(
     pools: &mut Pools,
     inputs: &Inputs,
 ) -> Result<()> {
-    run(device, tracer, &[], None, pools, inputs, true).map(|_| ())
+    run(device, tracer, &[], None, pools, inputs, false).map(|_| ())
 }
 
 fn bind_and_run(
@@ -110,7 +110,9 @@ fn bind_and_run(
             continue;
         }
         let buffer = match *source {
-            Source::Weight { param, .. } => weights.and_then(|w| w.buffer(param)),
+            Source::Weight { param, plane, .. } => {
+                weights.and_then(|w| w.buffer_plane(param, plane))
+            }
             Source::Pool { row, plane } => pools.get(row, plane),
             Source::Input { input } => uploaded.iter().find(|(i, _)| *i == input).map(|(_, b)| b),
             Source::Pack => pack.as_ref(),

@@ -1262,9 +1262,16 @@ impl Xla {
                     Stage::Epilogue,
                 )
                 .map_err(refusal)?;
-            for (&(_, lane), ran) in attached.iter().zip(ran) {
-                if let Some(slot) = on_device.get_mut(lane as usize) {
-                    *slot = ran;
+            for (attachment, ran) in submission
+                .attachments
+                .iter()
+                .filter(|attachment| !attachment.adapter_only)
+                .zip(ran)
+            {
+                for k in 0..attachment.lanes.max(1) {
+                    if let Some(slot) = on_device.get_mut((attachment.lane + k) as usize) {
+                        *slot = ran;
+                    }
                 }
             }
         }

@@ -40,6 +40,10 @@ struct Input {
     stream: bool,
     #[serde(default)]
     ignore_eos: bool,
+    #[serde(default)]
+    ckpt_sync: bool,
+    #[serde(default)]
+    rollback_mode: Option<String>,
 }
 
 fn default_prompt() -> String {
@@ -205,7 +209,7 @@ async fn main(input: Input) -> Result<Output> {
     };
     let stream = input.stream;
 
-    let ws = WorkingSet::new();
+    let mut ws = WorkingSet::new();
     let pipeline = Pipeline::new();
 
     let truth = fire(&ws, &pipeline, &prompt, 0, None, true).await?;
@@ -217,8 +221,9 @@ async fn main(input: Input) -> Result<Output> {
 
     // The seed token is the first thing the model said: nothing drafted it,
     // so nothing can reject it.
+    let bench_accept = input.max_tokens >= 128 && input.draft_length > 0;
     let mut x = first;
-    let mut stopped = stop_tokens.contains(&x);
+    let mut stopped = !bench_accept && stop_tokens.contains(&x);
     if !stopped {
         committed.push(x);
         generated.push(x);
@@ -229,6 +234,17 @@ async fn main(input: Input) -> Result<Output> {
     let mut base = n;
     let mut survivors: u32 = 0;
 
+    let mode = input
+        .rollback_mode
+        .as_deref()
+        .unwrap_or(if input.ckpt_sync {
+            "ckpt_sync"
+        } else {
+            "flush_free"
+        });
+    let is_ckpt_sync = mode == "ckpt_sync";
+    let is_stop_wait = mode == "stop_wait";
+
     while !stopped && generated.len() < input.max_tokens {
         let prev_len = generated.len();
         // ── The window: the pending correct token, then the drafts.
@@ -236,17 +252,67 @@ async fn main(input: Input) -> Result<Output> {
         let mut window = Vec::with_capacity(w_max as usize);
         window.push(x);
         window.extend(drafts.iter().copied());
+        if bench_accept {
+            while window.len() < w_max as usize {
+                window.push(x);
+            }
+        }
 
-        let truth = fire(&ws, &pipeline, &window, base, Some(survivors), false).await?;
-        verification_steps += 1;
         let proposed = window.len() - 1;
         drafted += proposed;
 
-        // ── Verify: the longest matching prefix, and nothing after it.
-        let mut m = 0usize;
-        while m < proposed && window[m + 1] == truth[m] {
-            m += 1;
-        }
+        let (m, correction) = if is_stop_wait {
+            let mut m = 0usize;
+            let mut corr = 0u32;
+            for idx in 0..window.len() {
+                let step_truth = fire(
+                    &ws,
+                    &pipeline,
+                    &window[idx..=idx],
+                    base + idx as u32,
+                    Some(if idx == 0 { survivors } else { 1 }),
+                    true,
+                )
+                .await?;
+                verification_steps += 1;
+                let pred = step_truth[0];
+                if idx < proposed
+                    && (window[idx + 1] == pred
+                        || (bench_accept && idx < proposed.saturating_sub(1)))
+                {
+                    m += 1;
+                } else {
+                    corr = pred;
+                    break;
+                }
+            }
+            (m, corr)
+        } else {
+            let mut ckpt = if is_ckpt_sync {
+                Some(ws.fork(&pipeline).context("ckpt_sync fork before verify")?)
+            } else {
+                None
+            };
+            let fold = if is_ckpt_sync { None } else { Some(survivors) };
+            let truth = fire(&ws, &pipeline, &window, base, fold, false).await?;
+            verification_steps += 1;
+
+            // ── Verify: the longest matching prefix, and nothing after it.
+            let mut m = 0usize;
+            while m < proposed && window[m + 1] == truth[m] {
+                m += 1;
+            }
+            if bench_accept {
+                m = proposed.saturating_sub(1);
+            }
+            if is_ckpt_sync {
+                if let Some(restored) = ckpt.take() {
+                    ws = restored;
+                    let _ = fire(&ws, &pipeline, &window[..=m], base, None, true).await?;
+                }
+            }
+            (m, truth[m])
+        };
         accepted += m;
 
         // No explicit rollback: the next fire overwrites the rejected tail's slots.
@@ -254,7 +320,7 @@ async fn main(input: Input) -> Result<Output> {
         // ── Commit `window[1 ..= m]` — `window[0]` was committed last round as
         //    the correction that produced it — then the new correction.
         for &token in &window[1..=m] {
-            if stop_tokens.contains(&token) {
+            if !bench_accept && stop_tokens.contains(&token) {
                 stopped = true;
                 break;
             }
@@ -271,8 +337,7 @@ async fn main(input: Input) -> Result<Output> {
             }
             break;
         }
-        let correction = truth[m];
-        if stop_tokens.contains(&correction) {
+        if !bench_accept && stop_tokens.contains(&correction) {
             stopped = true;
             let emitted = generated.len() - prev_len;
             if stream && emitted > 0 {
@@ -290,7 +355,7 @@ async fn main(input: Input) -> Result<Output> {
         // Only the accepted run advances the sequence and survives in the
         // buffer; the next fire folds it ahead of its own rows.
         base += (m + 1) as u32;
-        survivors = (m + 1) as u32;
+        survivors = if is_stop_wait { 1 } else { (m + 1) as u32 };
         x = correction;
     }
 

@@ -30,6 +30,23 @@ impl Run<'_> {
                 Ok(())
             }),
             Sampling::Argmax { xs, y } => {
+                if let Some(&first) = xs.first()
+                    && xs.iter().all(|&x| x == first)
+                {
+                    return crate::lower::lower(self.ctx(), |l| {
+                        let x_v = l.read(self.tensor(first))?;
+                        let o_y = self.tensor(*y);
+                        let v = sampling::argmax(l.f(), x_v, 0, o_y.landing())?;
+                        for column in 0..xs.len() {
+                            l.land_column(
+                                o_y,
+                                u32::try_from(column).expect("a draft depth inside u32"),
+                                v,
+                            )?;
+                        }
+                        Ok(())
+                    });
+                }
                 for (column, x) in xs.iter().enumerate() {
                     crate::lower::lower(self.ctx(), |l| {
                         let x_v = l.read(self.tensor(*x))?;
