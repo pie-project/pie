@@ -11,6 +11,13 @@ gemm.rows_m = 16
 sdpa.pool_mma = true
 sdpa.selected_mma = true
 ssm.kda_chunked = true
+sdpa.index_mma = true
+sdpa.index_radix = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+elemwise.norm_emit = true
+elemwise.rows_vec = true
+sdpa.merge_warp = true
 
 [provenance]
 measured = [
