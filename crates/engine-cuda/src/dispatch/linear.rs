@@ -1324,6 +1324,27 @@ impl Run<'_> {
     #[cfg(feature = "cuda")]
     fn select_glu(&mut self, select: &Linear, glu: &Linear) -> Result<bool, kernels_cuda::Error> {
         use linear::gemm_sm100::Glu;
+        if let Linear::Relu2 { x: packed, y } = *glu {
+            let Some((x, routes, sy, linear::moe::GluBank::Bf16(bank), experts)) =
+                self.routed_bank(select)
+            else {
+                return Ok(false);
+            };
+            if sy != packed || experts.streams() || bank.dtype != Dtype::Bf16 {
+                return Ok(false);
+            }
+            let (x, routes, mut out) = (self.tensor(x), self.tensor(routes), self.tensor(y));
+            return linear::moe::select_bf16_held(
+                self.ctx(),
+                "fused.moe_select_glu",
+                x,
+                bank.ptr,
+                bank.rows,
+                routes,
+                &mut out,
+                Some(Glu::Relu2),
+            );
+        }
         // The device and the profile first: nothing resolved off tcgen05.
         if !self.ctx().tuning().moe_tc5 || !linear::gemm_sm100::supported() {
             return Ok(false);

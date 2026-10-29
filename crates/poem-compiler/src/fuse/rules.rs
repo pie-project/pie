@@ -1392,7 +1392,7 @@ pub fn moe_experts() -> Rule {
 pub fn moe_select_glu() -> Rule {
     let mut alternatives = Vec::new();
     for select in 0..3 {
-        for glu in 0..4 {
+        for glu in 0..5 {
             alternatives.push(template(|p| {
                 let x = p.rows("x", W);
                 let bank = p.weight("bank", [W, W, W]);
@@ -1412,12 +1412,12 @@ pub fn moe_select_glu() -> Rule {
                     _ => linear::select::quantized(&x, &bank, &routes, top_k),
                 };
                 p.name("packed", &packed);
-                let intermediate = p.u32("intermediate");
                 let y = match glu {
+                    4 => linear::relu2(&packed),
                     0 => linear::glu(
                         &packed,
                         GluAct::Swiglu,
-                        Some(intermediate),
+                        Some(p.u32("intermediate")),
                         None,
                         None,
                         None,
@@ -1425,7 +1425,7 @@ pub fn moe_select_glu() -> Rule {
                     1 => linear::glu(
                         &packed,
                         GluAct::Swiglu,
-                        Some(intermediate),
+                        Some(p.u32("intermediate")),
                         None,
                         None,
                         Some(p.f32("limit")),
@@ -1433,7 +1433,7 @@ pub fn moe_select_glu() -> Rule {
                     3 => linear::glu(
                         &packed,
                         GluAct::GegluTanh,
-                        Some(intermediate),
+                        Some(p.u32("intermediate")),
                         None,
                         None,
                         None,
@@ -1443,7 +1443,7 @@ pub fn moe_select_glu() -> Rule {
                         GluAct::SwigluAlpha {
                             alpha: p.f32("alpha"),
                         },
-                        Some(intermediate),
+                        Some(p.u32("intermediate")),
                         None,
                         None,
                         Some(p.f32("limit")),
