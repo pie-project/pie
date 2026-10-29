@@ -81,6 +81,30 @@ impl VmImage {
         }
         out
     }
+
+    /// As the second VM set (guest4h2s's set B, `cols` VMB columns): the
+    /// layout's `b_*` parameters, every one passed.
+    fn params_b(&self, cols: usize) -> Vec<(&'static str, usize)> {
+        let (lo, hi) = self.opmask.unwrap_or((0xffff_ffff, 0xffff_ffff));
+        vec![
+            ("VMB", cols),
+            ("b_max_ops", self.max_ops),
+            ("b_nreg", self.nreg),
+            ("b_pool_words", self.pool_words),
+            ("b_feat", self.feat),
+            ("b_ring_w", self.ring_w),
+            ("b_ring_d", self.ring_d),
+            ("b_vm_prof", usize::from(self.prof)),
+            ("b_vm_lanes", self.lanes.unwrap_or(1)),
+            ("b_vm_rows", self.rows),
+            ("b_vm_lprog", usize::from(self.lane_programs.is_some())),
+            ("b_bank_words", self.lane_programs.unwrap_or(1)),
+            ("b_vm_pwalk", usize::from(self.pwalk.unwrap_or(true))),
+            ("b_vm_sin", self.step_input),
+            ("b_opmask_lo", lo as usize),
+            ("b_opmask_hi", hi as usize),
+        ]
+    }
 }
 
 /// Speculative decode on the head (serve2d_pipe): history, lookup table and
@@ -105,6 +129,9 @@ pub struct ServeConfig {
     pub hb: Option<usize>,
     /// The eta VM image; `None`: no VM.
     pub vm: Option<VmImage>,
+    /// guest4h2s's second resident VM set (serve2d_pipe): its image and its
+    /// columns (`VMB`), east of the first set's.
+    pub vm_b: Option<(VmImage, usize)>,
     /// Virtual logits lanes a launch (`HLM`, serve2d_pipe).
     pub hlm: Option<usize>,
     pub spec: Option<Spec>,
@@ -118,7 +145,7 @@ pub struct ServeConfig {
 
 impl ServeConfig {
     pub fn new(goals: Goals) -> ServeConfig {
-        ServeConfig { goals, mmax: None, hb: None, vm: None, hlm: None, spec: None, smp: false, region: false, pins: Vec::new() }
+        ServeConfig { goals, mmax: None, hb: None, vm: None, vm_b: None, hlm: None, spec: None, smp: false, region: false, pins: Vec::new() }
     }
 }
 
@@ -135,6 +162,8 @@ impl ServeConfig {
     ///   1), `ring_d` (32), `prof`, `step_input`, `rows`, `bank_words`
     ///   (per-lane programs), `opmask_lo`/`opmask_hi`, `lanes` (`vm_lanes`),
     ///   `pwalk` (`vm_pwalk`);
+    /// - `[vm_b]` (serve2d_pipe's second VM set, guest4h2s): the same keys
+    ///   for its image (the layout's `b_*`) and `cols` (`VMB`);
     /// - `[pins]`: layout parameters by name, for shapes the plan does not
     ///   place (simulator-sized models); checked against the layout.
     pub fn from_toml(t: &toml::Table, page_size: usize) -> R<ServeConfig> {
@@ -156,7 +185,7 @@ impl ServeConfig {
         }
         let known = [
             "lanes", "grid_lanes", "page_size", "blocks", "max_blocks", "mlp_chunk", "cap", "pipeline",
-            "host_copy", "mmax", "hb", "hlm", "smp", "spec", "vm", "pins", "region",
+            "host_copy", "mmax", "hb", "hlm", "smp", "spec", "vm", "vm_b", "pins", "region",
         ];
         if let Some(k) = t.keys().find(|k| !known.contains(&k.as_str())) {
             return Err(format!("[cerebras.spatial.serve]: unknown key `{k}`"));
@@ -185,14 +214,14 @@ impl ServeConfig {
                 })
             }
         };
-        let vm = match t.get("vm") {
-            None => None,
-            Some(v) => {
-                let m = v.as_table().ok_or("[cerebras.spatial.serve] `vm` is not a table")?;
-                let need = |k: &str| int(m, k)?.ok_or_else(|| format!("[cerebras.spatial.serve.vm] needs `{k}`"));
+        let image = |key: &str| -> R<Option<(VmImage, Option<usize>)>> {
+            let Some(v) = t.get(key) else { return Ok(None) };
+            {
+                let m = v.as_table().ok_or_else(|| format!("[cerebras.spatial.serve] `{key}` is not a table"))?;
+                let need = |k: &str| int(m, k)?.ok_or_else(|| format!("[cerebras.spatial.serve.{key}] needs `{k}`"));
                 let lo = int(m, "opmask_lo")?;
                 let hi = int(m, "opmask_hi")?;
-                Some(VmImage {
+                Ok(VmImage {
                     max_ops: need("max_ops")?,
                     nreg: need("nreg")?,
                     pool_words: need("pool_words")?,
@@ -208,13 +237,21 @@ impl ServeConfig {
                     lanes: int(m, "lanes")?,
                     pwalk: m.get("pwalk").map(|_| flag(m, "pwalk")).transpose()?,
                 })
+                .map(|img| Some((img, int(m, "cols").ok().flatten())))
             }
+        };
+        let vm = image("vm")?.map(|(img, _)| img);
+        let vm_b = match image("vm_b")? {
+            Some((img, Some(cols))) if cols > 0 => Some((img, cols)),
+            Some(_) => return Err("[cerebras.spatial.serve.vm_b] needs `cols` (VMB, its VM columns)".into()),
+            None => None,
         };
         Ok(ServeConfig {
             goals,
             mmax: int(t, "mmax")?,
             hb: int(t, "hb")?,
             vm,
+            vm_b,
             hlm: int(t, "hlm")?,
             spec,
             smp: flag(t, "smp")?,
@@ -432,11 +469,25 @@ pub fn params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<(Design, Vec<(String, 
     } else if !matches!(d, Design::Serve8b | Design::Serve8bRegion) && (cfg.spec.is_some() || cfg.smp || cfg.mmax.is_some()) {
         return Err("speculative decode, the fused sampler and MMAX are serve2d_pipe's".into());
     }
-    let vm_keys: Vec<&'static str> = cfg.vm.map(|vm| vm.params()).unwrap_or_default().iter().map(|p| p.0).collect();
+    let vm_b: Vec<(&'static str, usize)> = cfg.vm_b.map(|(img, cols)| img.params_b(cols)).unwrap_or_default();
+    if cfg.vm_b.is_some() && d != Design::Serve2dPipe {
+        return Err("a second VM set (`vm_b`) is serve2d_pipe's".into());
+    }
+    let vm_keys: Vec<&'static str> = cfg
+        .vm
+        .map(|vm| vm.params())
+        .unwrap_or_default()
+        .iter()
+        .chain(&vm_b)
+        .map(|p| p.0)
+        .collect();
     if let Some(vm) = cfg.vm {
         for (k, v) in vm.params() {
             put(&mut set, k, v);
         }
+    }
+    for &(k, v) in &vm_b {
+        put(&mut set, k, v);
     }
     for &(k, v) in &cfg.pins {
         put(&mut set, k, v);
@@ -499,7 +550,12 @@ fn rectangle(design: Design, params: &[(String, String)]) -> R<(u32, u32)> {
     match design {
         // layout.csl: the grids then the head's PY + VMC columns; down GH
         // grids or the head's HH rows and its feeder row (HEADMODE 2).
-        Design::Serve2d | Design::Serve2dPipe => Ok((gw * px + py + vmc, (gh * py).max(hh + 1))),
+        Design::Serve2d => Ok((gw * px + py + vmc, (gh * py).max(hh + 1))),
+        // serve2d_pipe: VMT = VMC + VMB VM columns (guest4h2s's two sets).
+        Design::Serve2dPipe => {
+            let vmb = get("VMB").unwrap_or(0);
+            Ok((gw * px + py + vmc + vmb, (gh * py).max(hh + 1)))
+        }
         // serve8b's layout.csl: the grids, the head's PY/2 + VMC columns and
         // the PY/4-wide embedding strip (HEADMODE 2; neither in mode 0).
         Design::Serve8b => {
@@ -708,6 +764,27 @@ mod tiny {
         assert_eq!((vm.max_ops, vm.ring_w, vm.ring_d, vm.opmask), (48, 1, 32, Some((0xffff_ffff, 0))));
         let bad: toml::Table = toml::from_str("lanse = 2\n").unwrap();
         assert!(ServeConfig::from_toml(&bad, 16).unwrap_err().contains("lanse"));
+    }
+
+    /// guest4h2s's second VM set: `[vm_b]` with its columns, as the layout's
+    /// VMB and `b_*` params, the program one VMB wider.
+    #[test]
+    fn a_second_vm_set_reaches_the_layout() {
+        let (plan, mut cfg) = pipe_config();
+        let t: toml::Table = toml::from_str(
+            "[vm_b]\ncols = 1\nmax_ops = 64\nnreg = 8\npool_words = 128\nfeat = 7\nlanes = 2\nbank_words = 900\n",
+        )
+        .unwrap();
+        let (img, cols) = ServeConfig::from_toml(&t, 16).unwrap().vm_b.unwrap();
+        assert_eq!((img.max_ops, img.lane_programs, cols), (64, Some(900), 1));
+        let one = rectangle(Design::Serve2dPipe, &params(&plan, &cfg).unwrap().1).unwrap();
+        cfg.vm_b = Some((img, cols));
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!((get("VMB"), get("b_max_ops"), get("b_vm_lprog"), get("b_bank_words")), (Some("1".into()), Some("64".into()), Some("1".into()), Some("900".into())));
+        assert_eq!(rectangle(Design::Serve2dPipe, &p).unwrap(), (one.0 + 1, one.1));
+        let no_cols: toml::Table = toml::from_str("[vm_b]\nmax_ops = 64\nnreg = 8\npool_words = 128\nfeat = 7\n").unwrap();
+        assert!(ServeConfig::from_toml(&no_cols, 16).unwrap_err().contains("cols"));
     }
 
     #[test]

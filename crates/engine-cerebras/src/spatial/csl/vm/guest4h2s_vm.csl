@@ -39,11 +39,16 @@ param vm_rows: u16;    // logits rows a turn (a multi-row program: W0..W(rows-1)
 param vm_lprog: u16;   // 1: per-lane programs (an op arena, glane: a lane's table base, token home, bank window)
 param bank_words: u16;  // vm_lprog: the bank arena's words
 param vm_pwalk: u16;   // 1: top-p by an entry walk of folds (no list engine)
+param CBW: u16;        // block width: C + all VM columns
+param VSET: u16;       // this PE's VM set (0: A, 1: B)
+param VSET2: u16;      // 1: two VM sets in the block
+param VLAST: u16;      // 1: the block's last VM column (the row stops here)
 param opmask_lo: u32;  // opcodes 0..31 the image runs (bit o)
 param opmask_hi: u32;  // opcodes 32..63
 param vm_sin: u16;     // per-step host input words a turn (0: no step-input path)
 const Vt: u16 = Vr / NVC;
-const CB: u16 = C + NVC;
+const CB: u16 = CBW;   // fabric columns a block (head + both VM sets)
+const TWO: bool = VSET2 != 0;
 const NB: u16 = W / CB;
 const R1X: u16 = Gx / 2;
 const NGX: u16 = C / Gx;
@@ -132,7 +137,7 @@ const OPK_QRED: bool = ((if (QRED < 32) opmask_lo >> QRED else opmask_hi >> (QRE
 const OPK_QRNG: bool = ((if (QRNG < 32) opmask_lo >> QRNG else opmask_hi >> (QRNG - 32)) & 1) != 0;
 const OPK_OUT: bool = ((if (OUT < 32) opmask_lo >> OUT else opmask_hi >> (OUT - 32)) & 1) != 0;
 const PWALK: bool = vm_pwalk != 0;
-const OPK_LISTS: bool = OPK_TOPK or OPK_PIVRANK or (OPK_PIVMASS and !PWALK);
+const OPK_LISTS: bool = (OPK_TOPK and !PWALK) or OPK_PIVRANK or (OPK_PIVMASS and !PWALK);
 
 const NEG_INF: f32 = @bitcast(f32, @as(u32, 0xff800000));
 const POS_INF: f32 = @bitcast(f32, @as(u32, 0x7f800000));
@@ -152,15 +157,29 @@ const q4_in = @get_input_queue(4);
 const q5_in = @get_input_queue(5);
 const q6_in = @get_input_queue(6);
 const q7_in = @get_input_queue(7);
-const C_A: u16 = 0;
-const C_B: u16 = 1;
-const C_E: u16 = 18;
-const C_G: u16 = 19;
-const C_K: u16 = 4;
-const C_VL: u16 = 2;
-const C_VT: u16 = 3;
-const C_PARK0: u16 = 17;   // never routed on VM PEs
-const C_PARK1: u16 = 16;
+// The VM's colors (layout params; defaults: head2d / serve2d's).
+param vm_outside: u16 = 0;  // 1: the VM block outside the head (no head colors routed; one block)
+param vm_x0: u16 = 0;       // vm_outside: the block's first fabric column (layout x)
+const OUTSIDE: bool = vm_outside != 0;
+param vm_c_a: u16 = 0;      // column chain, rows of one parity
+param vm_c_b: u16 = 1;      // column chain, the other parity
+param vm_c_e: u16 = 18;     // hub row chain, even hubs
+param vm_c_g: u16 = 19;     // hub row chain, odd hubs
+param vm_c_k: u16 = 4;      // the fold result, back from the last hub
+param vm_c_vl: u16 = 2;     // the logits row in
+param vm_c_vt: u16 = 3;     // the token out
+param vm_c_park0: u16 = 17; // parked input queues: colors never routed at VM PEs
+param vm_c_park1: u16 = 16;
+const C_A: u16 = vm_c_a;
+const C_B: u16 = vm_c_b;
+const C_E: u16 = vm_c_e;
+const C_G: u16 = vm_c_g;
+const C_K: u16 = vm_c_k;
+const C_VL: u16 = vm_c_vl;
+const C_VT: u16 = vm_c_vt;
+const C_PARK0: u16 = vm_c_park0;
+const C_PARK1: u16 = vm_c_park1;
+const C_BT: u16 = 12;      // two VM sets: set B's token, west to set A's sender
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
@@ -1061,19 +1080,15 @@ noinline fn kfold(mine: bool) void {
   }
   if (!hub or !hub_last) { @fmovs(red_dsd(n2), fab_in(q7_in, n2)); }
 }
-noinline fn pivmass_walk(d: u32, a: u32, p: f32) void {
-  const m = nloc();
-  const lo = lane_base();
-  const od = @as(u16, d) * Vt;
-  const oa = @as(u16, a) * Vt;
-  @fmovs(reg(d), 0.0);
-  if (!(p > 0.0)) { return; }
-  var neg: f32 = 0.0;
-  // own entries in eta's order (NaN left out), by insertion
+// This PE's entries of register a in eta's order (NaN left out) into kord;
+// their count. kneg: whether any is negative.
+var kneg: f32 = 0.0;
+noinline fn ksort(oa: u16, m: u16) u16 {
+  kneg = 0.0;
   var n: u16 = 0;
   { var i: u16 = 0; while (i < m) : (i += 1) {
     const x = wide[oa + i];
-    if (x < 0.0) { neg = 1.0; }
+    if (x < 0.0) { kneg = 1.0; }
     if (x == x) {
       var j: u16 = n;
       while (j > 0 and x > wide[oa + kord[j - 1]]) : (j -= 1) { kord[j] = kord[j - 1]; }
@@ -1081,27 +1096,67 @@ noinline fn pivmass_walk(d: u32, a: u32, p: f32) void {
       n += 1;
     }
   } }
-  var mono = true;
+  return n;
+}
+// One round: the next KB entries in eta's order into red (values | indices,
+// padding index 3e38) on every PE. `first` also folds kneg into red[KB + 1]
+// ... returned as kmono.
+var kmono = true;
+noinline fn kround(oa: u16, lo: u32, pos: u16, n: u16, first: bool) void {
+  { var k: u16 = 0; while (k < KB) : (k += 1) { red[k] = if (pos + k < n) wide[oa + kord[pos + k]] else NEG_INF; } }
+  red[KB] = kneg;
+  lane_fold(K_MAX, if (first) KB + 1 else KB);
+  if (first) { kmono = red[KB] == 0.0; }
+  const t = red[KB - 1];
+  { var k: u16 = 0; while (k < KB) : (k += 1) {
+    if (pos + k < n) {
+      red[k] = wide[oa + kord[pos + k]];
+      red[KB + k] = @as(f32, lo + @as(u32, kord[pos + k]));
+    } else {
+      red[k] = NEG_INF;
+      red[KB + k] = 3.0e38;
+    }
+  } }
+  kfold(pos < n and red[0] >= t);
+}
+// eta's top_k: the k first entries in eta's order (NaN left out, as before),
+// values (f32) at pool[dv..], indices at pool[di..].
+noinline fn topk_rounds(dv: u32, a: u32, di: u32, k: u32) void {
+  const m = nloc();
+  const lo = lane_base();
+  const oa = @as(u16, a) * Vt;
+  const n = ksort(oa, m);
+  var pos: u16 = 0;
+  var got: u32 = 0;
+  var first = true;
+  while (got < k) {
+    kround(oa, lo, pos, n, first);
+    first = false;
+    { var j: u16 = 0; while (j < KB and got < k) : (j += 1) {
+      if (red[KB + j] >= 3.0e38) { break; }
+      setf(dv + got, red[j]);
+      pool[@as(u16, di + got)] = @as(u32, red[KB + j]);
+      const at = @as(u32, red[KB + j]);
+      if (at >= lo and at < lo + @as(u32, m)) { pos += 1; }
+      got += 1;
+    } }
+    if (red[2 * KB - 1] >= 3.0e38) { break; }
+  }
+}
+noinline fn pivmass_walk(d: u32, a: u32, p: f32) void {
+  const m = nloc();
+  const lo = lane_base();
+  const od = @as(u16, d) * Vt;
+  const oa = @as(u16, a) * Vt;
+  @fmovs(reg(d), 0.0);
+  if (!(p > 0.0)) { return; }
+  const n = ksort(oa, m);
   var first = true;
   var excl: f32 = 0.0;
   var pos: u16 = 0;
   while (true) {
-    // the floor (the first round also folds whether any entry is negative)
-    { var k: u16 = 0; while (k < KB) : (k += 1) { red[k] = if (pos + k < n) wide[oa + kord[pos + k]] else NEG_INF; } }
-    red[KB] = neg;
-    lane_fold(K_MAX, if (first) KB + 1 else KB);
-    if (first) { mono = red[KB] == 0.0; first = false; }
-    const t = red[KB - 1];
-    { var k: u16 = 0; while (k < KB) : (k += 1) {
-      if (pos + k < n) {
-        red[k] = wide[oa + kord[pos + k]];
-        red[KB + k] = @as(f32, lo + @as(u32, kord[pos + k]));
-      } else {
-        red[k] = NEG_INF;
-        red[KB + k] = 3.0e38;
-      }
-    } }
-    kfold(pos < n and red[0] >= t);
+    kround(oa, lo, pos, n, first);
+    first = false;
     if (red[KB] >= 3.0e38) { break; }
     { var k: u16 = 0; while (k < KB) : (k += 1) {
       if (red[KB + k] >= 3.0e38) { break; }
@@ -1112,7 +1167,7 @@ noinline fn pivmass_walk(d: u32, a: u32, p: f32) void {
         pos += 1;
       }
       excl = excl + v;
-      if (mono and !(excl < p)) { return; }
+      if (kmono and !(excl < p)) { return; }
     } }
     if (red[2 * KB - 1] >= 3.0e38) { break; }
   }
@@ -1341,7 +1396,9 @@ fn exec() void {
           mass_hist(a);
       while (!resume_body()) {}
       continue;
-    } else if ((feat & F_LIST) != 0 and (OPK_TOPK and op == TOPK)) {
+    } else if ((feat & F_LIST) != 0 and PWALK and OPK_TOPK and op == TOPK) {
+      if (c > 0) { topk_rounds(d, a, b, c); }
+    } else if ((feat & F_LIST) != 0 and !PWALK and (OPK_TOPK and op == TOPK)) {
       // The k largest in eta's order: two rounds of a 256-bin count
       // histogram give a key floor with at least k entries above it, then
       // list rounds over those (most PEs hold none).
@@ -1578,7 +1635,7 @@ fn resume_body() bool {
       }
     } }
     }
-  } else if ((feat & F_LIST) != 0 and (OPK_TOPK and pend == TOPK) and tk_phase == 0) {
+  } else if ((feat & F_LIST) != 0 and !PWALK and (OPK_TOPK and pend == TOPK) and tk_phase == 0) {
     var floor: u32 = 1;   // fewer than k: every non-NaN entry
     if (count_pick()) {
       if (rx_round < 2) {
@@ -1591,7 +1648,7 @@ fn resume_body() bool {
     sort_cand(floor);
     known_fold(pend_a);
     return false;
-  } else if ((feat & F_LIST) != 0 and (OPK_TOPK and pend == TOPK)) {
+  } else if ((feat & F_LIST) != 0 and !PWALK and (OPK_TOPK and pend == TOPK)) {
     // The next LB in order: take what the k still wants.
     var k: u16 = 0;
     while (k < lb and got < pend_c) : (k += 1) {
@@ -1743,7 +1800,9 @@ fn init() void {
   gring[0] = ring;
   gring[1] = ring_w;
   gring[2] = vm_lanes;
-  vx = layout_mod.get_x_coord();
+  // vm_outside: the VM block sits outside the head (its first column at
+  // fabric x vm_x0, one block): positions as if at R2X + 1 + VJ.
+  vx = if (OUTSIDE) layout_mod.get_x_coord() - vm_x0 + R2X + 1 else layout_mod.get_x_coord();
   vy = layout_mod.get_y_coord();
   vblk = vx / CB;
   hub = vy == F;
@@ -1755,27 +1814,44 @@ fn init() void {
   // its VM PEs): on region rows its row chains west into the root (our west
   // neighbor) and the root's logits in from the west; on the feeder row the
   // blocks' pair chains through; the winner tree straight through.
+  // (vm_outside: none of the head's colors cross the block.)
   if (!hub) {
-    color_config.reset_routes(c_r1_0, .{ .rx = EAST, .tx = WEST });
-    color_config.reset_routes(c_r1_1, .{ .rx = EAST, .tx = WEST });
-    color_config.reset_routes(c_r2_0, .{ .rx = EAST, .tx = WEST });
-    color_config.reset_routes(c_r2_1, .{ .rx = EAST, .tx = WEST });
+    if (!OUTSIDE) {
+      color_config.reset_routes(c_r1_0, .{ .rx = EAST, .tx = WEST });
+      color_config.reset_routes(c_r1_1, .{ .rx = EAST, .tx = WEST });
+      color_config.reset_routes(c_r2_0, .{ .rx = EAST, .tx = WEST });
+      color_config.reset_routes(c_r2_1, .{ .rx = EAST, .tx = WEST });
+    }
     // The root's row (Vr + 1 words) passes every VM column of the block.
-    if (VJ + 1 < NVC) {
+    if (VLAST == 0) {
       color_config.reset_routes(col_of(C_VL), .{ .rx = WEST, .tx = [2]direction{ RAMP, EAST } });
     } else {
       color_config.reset_routes(col_of(C_VL), .{ .rx = WEST, .tx = RAMP });
     }
     iq_color(2, C_VL);
   } else {
-    hub_feeder_routes();
-    if (vblk == BM and VJ == 0) {
+    if (!OUTSIDE) { hub_feeder_routes(); }
+    // Two sets (one block): set B's tokens go west on C_BT through set A's
+    // hubs to A's token sender, which relays each on C_VT (a color takes
+    // one input direction on wse3).
+    if (TWO and VSET == 0 and vblk == BM and VJ != 0) {
+      color_config.reset_routes(col_of(C_BT), .{ .rx = EAST, .tx = WEST });
+    }
+    if (TWO and VSET == 0 and vblk == BM and VJ == 0) {
+      color_config.reset_routes(col_of(C_BT), .{ .rx = EAST, .tx = RAMP });
+    }
+    if (TWO and VSET == 1 and vblk == BM and VJ == 0) {
+      color_config.reset_routes(col_of(C_BT), .{ .rx = RAMP, .tx = WEST });
+      oq_color(2, C_BT);
+    } else if (vblk == BM and VJ == 0) {
       color_config.reset_routes(col_of(C_VT), .{ .rx = RAMP, .tx = WEST });
       oq_color(2, C_VT);
     }
   }
-  if (vx < RC) { color_config.reset_routes(c_ib, .{ .rx = EAST, .tx = WEST }); }
-  else { color_config.reset_routes(c_ib, .{ .rx = WEST, .tx = EAST }); }
+  if (!OUTSIDE) {
+    if (vx < RC) { color_config.reset_routes(c_ib, .{ .rx = EAST, .tx = WEST }); }
+    else { color_config.reset_routes(c_ib, .{ .rx = WEST, .tx = EAST }); }
+  }
   // Our folds. Upper half (row r < F): chain south on A/B by row parity;
   // lower half (r > F): chain north on the flipped parity; the hub takes
   // both (their colors differ), then the hubs chain east on E/G by block
@@ -1834,6 +1910,7 @@ fn init() void {
   // this PE does not read on colors nothing routes here.
   if (!hub) { iq_color(5, C_PARK0); iq_color(6, C_PARK1); }
   if (hub and hub_first) { iq_color(6, C_PARK1); }
+  if (TWO and VSET == 0 and hub and vblk == BM and VJ == 0) { iq_color(6, C_BT); }
   timestamp.enable_tsc();
   sys_mod.unblock_cmd_stream();
 }
@@ -1991,17 +2068,32 @@ fn compute(steps: u32) void {
         NR = @as(u16, glane[lane * 4] >> 16);
         if (NR == 0) { NR = 1; }
       }
-      i += @as(u32, NR);
       // Row 0: Vr logits, 1/rms, ctl (0: sample; else skip the turn: no
       // bank swap, no sections, no ring row, token 0). The hub has no row:
-      // the PE above it hands it ctl on its fold color.
+      // the PE above it hands it ctl on its fold color. Two VM sets (TWO):
+      // ctl 0 / 1 is set A's turn (sample / skip), 2 / 3 set B's; a row that
+      // is the other set's is read and left (no token, no lane step).
       take_row();
       if (!hub) {
         if (vy + 1 == F) { @fmovs(fab_out(q3_out, 1), @set_dsd_length(@increment_dsd_offset(vin_dsd, @as(i16, Vt + 1), f32), 1)); }
       } else {
         @fmovs(@set_dsd_length(@increment_dsd_offset(vin_dsd, @as(i16, Vt + 1), f32), 1), fab_in(q4_in, 1));
       }
-      const skip = vin[Vt + 1] != 0.0;
+      const cv = vin[Vt + 1];
+      if (TWO) {
+        const mine = if (VSET == 0) (cv == 0.0 or cv == 1.0) else (cv == 2.0 or cv == 3.0);
+        if (!mine) {
+          // set A's token sender relays set B's token for this row
+          if (VSET == 0 and hub and vblk == BM and VJ == 0) {
+            @fmovs(tokv_dsd, fab_in(q6_in, 1));
+            @fmovs(fab_out(q2_out, 1), tokv_dsd);
+          }
+          i += 1;
+          continue;
+        }
+      }
+      i += @as(u32, NR);
+      const skip = if (TWO) (cv == 1.0 or cv == 3.0) else cv != 0.0;
       if (!skip) {
         swap_in(lane);
         if (!hub) { @fmuls(wide0, vin_dsd, vin[Vt]); }

@@ -20,10 +20,11 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
 - `vm/`: eta VM images, snapshots of the VM generator's output (`gen_vm.py`
   over the shared VM core).
   - `guest4hm_vm.csl`: serve2d's multi-column VM.
-  - `guest4hz_vm.csl`: serve2d_pipe's VM (Fork 3's guest4hz, the code-size
-    VM; snapshot of 2026-10-29 17:55): banked lanes, per-row ctl, per-step
-    host input, op masks, per-lane programs, each lane's rows per turn
-    (`glane` word 0's high half), top-p by rounds (`vm_pwalk`).
+  - `guest4h2s_vm.csl`: serve2d_pipe's VM (Fork 3's guest4h2s, a superset
+    of guest4hz; snapshot of 2026-10-29 19:33): banked lanes, per-row ctl,
+    per-step host input, op masks, per-lane programs, rows per turn, top-p
+    by rounds, and a second resident set (VMB columns east of the first,
+    its own `b_*` image) for the heavy samplers.
 - `serve2d/`, `serve2d_pipe/`, `serve8b/`, `serve8b_region/`: each design's layout, routing helpers,
   `*_extra.csl` (what it appends to each kernel) and base programs.
 

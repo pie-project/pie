@@ -204,9 +204,10 @@ fn hb_vm() bool { return VMC >= 1 and gmode[0] == 1 and s2d_iter >= 1; }
 // samples the lane), nforce (the lane's forced prompt prefix: iterations
 // i < nforce are forced), last (lanes from this one to its VM turn's last
 // row: a multi-row turn's lanes all take the last row's token; 0 for a
-// one-row turn)]. VM mode wants forced tokens as a prefix; a turn's rows sit
-// in one head step (consecutive lanes of one group).
-const VLW: u16 = 3;
+// one-row turn), set (the VM set that owns the lane's turns: 0 A, 1 B)].
+// VM mode wants forced tokens as a prefix; a turn's rows sit in one head step
+// (consecutive lanes of one group).
+const VLW: u16 = 4;
 const VLN: u16 = MMAX * SB * VLW;
 var vmlane = @zeros([VLN]u32);
 var vmlane_ptr: [*]u32 = &vmlane;
@@ -491,7 +492,8 @@ fn hb_step_region() void {
       while (b < HB) : (b += 1) {
         const vl = s2d_mb * SB + s2d_grp * HB + b;
         hb_y[b * YS + Vr] = s2d_yscale[vl];
-        hb_y[b * YS + Vr + 1] = if (hb_vm_lane(vl)) 0.0 else 1.0;
+        // ctl: 2·set + (1: skip the turn), set 0 = A, 1 = B (two VM sets).
+        hb_y[b * YS + Vr + 1] = @as(f32, 2 * vmlane[VLW * vl + 3] + (if (hb_vm_lane(vl)) @as(u32, 0) else 1));
         @fmovs(fout(q_x_out, Vr + 2),
                @set_dsd_length(@increment_dsd_offset(hb_y1_dsd, @as(i16, b * YS), f32), Vr + 2));
       }

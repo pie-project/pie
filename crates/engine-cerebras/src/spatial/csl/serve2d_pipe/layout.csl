@@ -73,6 +73,26 @@ param vm_lanes: u16 = 0;
 param vm_rows: u16 = 1;
 // Top-p by an entry walk of folds (1, Fork 3's default: no list engine in the image).
 param vm_pwalk: u16 = 1;
+// A second resident VM set (Fork 3's guest4h2s): VMB columns after the first
+// set's VMC, its own image (the b_ params). Set B's tokens relay through set
+// A's sender on color 12 (C_BT in the VM; on the head strip only VM PEs route
+// it: the grids' 12 stays on grid PEs).
+param VMB: u16 = 0;
+param b_max_ops: u16 = 1;
+param b_nreg: u16 = 1;
+param b_pool_words: u16 = 1;
+param b_feat: u32 = 0;
+param b_ring_w: u16 = 1;
+param b_vm_prof: u16 = 0;
+param b_vm_lanes: u16 = 1;
+param b_vm_rows: u16 = 1;
+param b_vm_lprog: u16 = 0;
+param b_bank_words: u16 = 1;
+param b_vm_pwalk: u16 = 1;
+param b_vm_sin: u16 = 0;
+param b_opmask_lo: u32 = 0xffffffff;
+param b_opmask_hi: u32 = 0xffffffff;
+param b_ring_d: u16 = 32;
 param opmask_lo: u32 = 0xffffffff;
 param opmask_hi: u32 = 0xffffffff;
 param HLM: u16 = 4;
@@ -90,7 +110,9 @@ const C_GB: color = @get_color(10);
 const C_Q2: color = @get_color(16);   // queue 2's color until init sets the handoff's
 const P: u16 = PX;
 const HLB: u16 = if (B * MMAX < HLM) B * MMAX else HLM;
-const HW: u16 = PY + VMC;
+// All VM columns (both sets): the head treats them alike.
+const VMT: u16 = VMC + VMB;
+const HW: u16 = PY + VMT;
 const GHGT: u16 = GH * PY;
 const HR2X: u16 = (PY / Gx / 2) * Gx + Gx / 2;
 const RH: u16 = if (HH + 1 > GHGT) HH + 1 else GHGT;
@@ -101,15 +123,18 @@ layout {
   @comptime_assert(PX == PY and GRID == 1 and HEADMODE == 2 and W16 == 0 and KV16 == 0);
   @comptime_assert(F > 2 * PY - 1 and F < (GH - 1) * PY);
   @comptime_assert(F == HH / 2);
-  @comptime_assert(VM == 0 or (VMC >= 1 and Vr == 32 * VMC));
+  @comptime_assert(VM == 0 or (VMC >= 1 and Vr == 32 * VMC and (VMB == 0 or Vr == 32 * VMB)));
   @set_rectangle(GW * PX + HW, RH);
   for (@range(u16, GW * PX + HW)) |x| {
     const mp = memcpy.get_params(x);
     for (@range(u16, RH)) |y| {
       if (VM == 1 and x > GW * PX + HR2X and x <= GW * PX + HR2X + VMC and y <= HH) {
+        // Set A (the serving image).
         @set_tile_code(x, y, "vm_pe.csl", .{
           .memcpy_params = mp,
           .W = HW, .H = HH, .F = HH / 2, .C = PY, .Vr = Vr, .NVC = VMC, .VJ = x - (GW * PX + HR2X + 1),
+          .CBW = HW, .VSET = 0, .VSET2 = if (VMB > 0) 1 else 0,
+          .VLAST = if (VMB == 0 and x == GW * PX + HR2X + VMC) 1 else 0,
           .Gx = Gx, .Gb = Gb, .vocab = vocab,
           .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
           .c_x = C_BC, .c_ib = C_GB,
@@ -120,12 +145,29 @@ layout {
           .vm_pwalk = vm_pwalk,
           .GPX = PX, .GPY = PY, .GW = GW, .GH = GH, .S2D_SB = B,
         });
+      } else if (VM == 1 and VMB > 0 and x > GW * PX + HR2X + VMC and x <= GW * PX + HR2X + VMT and y <= HH) {
+        // Set B (the heavy image), east of set A.
+        @set_tile_code(x, y, "vm_pe.csl", .{
+          .memcpy_params = mp,
+          .W = HW, .H = HH, .F = HH / 2, .C = PY, .Vr = Vr, .NVC = VMB, .VJ = x - (GW * PX + HR2X + VMC + 1),
+          .CBW = HW, .VSET = 1, .VSET2 = 1,
+          .VLAST = if (x == GW * PX + HR2X + VMT) 1 else 0,
+          .Gx = Gx, .Gb = Gb, .vocab = vocab,
+          .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
+          .c_x = C_BC, .c_ib = C_GB,
+          .max_ops = b_max_ops, .nreg = b_nreg, .pool_words = b_pool_words, .feat = b_feat, .ring = b_ring_d,
+          .ring_w = b_ring_w, .vm_prof = b_vm_prof, .vm_lanes = b_vm_lanes, .vm_rows = b_vm_rows,
+          .vm_sin = b_vm_sin, .opmask_lo = b_opmask_lo, .opmask_hi = b_opmask_hi,
+          .vm_lprog = b_vm_lprog, .bank_words = b_bank_words,
+          .vm_pwalk = b_vm_pwalk,
+          .GPX = PX, .GPY = PY, .GW = GW, .GH = GH, .S2D_SB = B,
+        });
       } else if (x >= GW * PX and y <= HH) {
         @set_tile_code(x, y, "head_pe.csl", .{
           .memcpy_params = mp,
           .W = HW, .H = HH, .F = HH / 2, .C = PY, .Hc = Hc, .Vr = Vr, .Gx = Gx, .Gy = Gy, .Gb = Gb,
           .vocab = vocab, .PASSES = PASSES, .UNTIED = UNTIED, .CERT = CERT, .MODE = MODE, .OVL = OVL,
-          .VMC = VMC, .WF32 = WF32,
+          .VMC = VMT, .WF32 = WF32,
           .GPX = PX, .GPY = PY, .GW = GW, .GH = GH, .CAP = CAP, .SB = B, .HB = HB, .HLB = HLB, .MMAX = MMAX,
           .GE = E, .S2D_DBG = 0,
           .SMP = SMP, .SPEC = SPEC, .GPS = PS, .SPEC_H = SPEC_H, .SPEC_T = SPEC_T, .SPEC_O = SPEC_O,
@@ -138,13 +180,13 @@ layout {
       } else if (x >= GW * PX or y >= GHGT) {
         @set_tile_code(x, y, "filler.csl", .{
           .memcpy_params = mp, .PX = PX, .PY = PY, .GW = GW, .GH = GH, .F = F,
-          .C = PY, .VMC = VMC, .VMAT = HR2X + 1, .WS = f32, .KS = f32,
+          .C = PY, .VMC = VMT, .VMAT = HR2X + 1, .WS = f32, .KS = f32,
         });
       } else {
         @set_tile_code(x, y, "grid_pe.csl", .{
           .memcpy_params = mp,
           .P = P, .Hc = Hc, .Dc = Dc, .Gs = Gs, .Ic = Ic, .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC,
-          .GW = GW, .GH = GH, .NL = GW * GH, .F = F, .S2D_VMC = VMC, .S2D_VMAT = HR2X + 1,
+          .GW = GW, .GH = GH, .NL = GW * GH, .F = F, .S2D_VMC = VMT, .S2D_VMAT = HR2X + 1,
           .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
           .c_bc = C_BC, .c_gb = C_GB, .c_cp = C_Q2,
           .K = 1, .stage = 0, .c_in = C_Q2, .c_out = C_Q2, .c_ret = C_Q2,
