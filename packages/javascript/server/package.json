@@ -40,7 +40,7 @@
   ],
   "dependencies": {
     "@pie-project/client": "^0.6.0",
-    "@pie-project/server-web": "0.6.1",
+    "@pie-project/server-web": "0.6.2",
     "ws": "^8.22.0"
   },
   "license": "Apache-2.0",
