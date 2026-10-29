@@ -28,6 +28,7 @@ moe.bf16_mma_until = 65536
 
 [engine]
 forward_tokens = 2048
+prefill_lattice_steps = 8
 
 [provenance]
 measured = [
@@ -66,6 +67,7 @@ measured = [
   "kernel.sdpa.selected_mma",
   "engine.copies",
   "engine.forward_tokens",
+  "engine.prefill_lattice_steps",
   "engine.graphs",
   "engine.lattice_steps",
   "engine.recording",
