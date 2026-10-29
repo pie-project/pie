@@ -27,8 +27,8 @@ W8A8 = [dtype.e4m3g128a8, dtype.mxfp4a8]
 DEPLOYMENTS = [
     deployment("mimo26-flash", weights = [BF, FP4], kv = BF),
     deployment("mimo26-flash", weights = W8A8, kv = BF),
-    deployment("mimo26-flash-mini", weights = [BF, FP4], kv = BF),
     deployment("mimo26-flash-mini", weights = W8A8, kv = BF),
+    deployment("mimo26-flash-mini", weights = [BF, FP4], kv = BF),
     deployment("mimo26-flash-mini", weights = [BF, dtype.mxfp4a8], kv = BF),
     deployment("mimo26-flash-l6", weights = [BF, FP4], kv = BF),
     deployment("mimo26-flash-l6", weights = W8A8, kv = BF),
