@@ -190,6 +190,7 @@ mod tests {
     // One test owns the process-wide schedule, so the cases run in order.
     #[tokio::test]
     async fn grants_follow_the_schedule() {
+        let _schedule = schedule::TEST_LOCK.write().await;
         let pids = [pid(1), pid(2), pid(3), pid(4)];
         let keys = HashMap::from([(pid(3), 10), (pid(2), 5)]);
         schedule::install(Some(Table::new(keys, None)));
