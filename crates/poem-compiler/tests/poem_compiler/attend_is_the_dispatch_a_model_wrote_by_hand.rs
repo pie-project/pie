@@ -40,7 +40,9 @@ def forward(m, inputs):
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    output("logits", ops.linear.lm_head(x, m.head))
+    logits = ops.linear.lm_head(x, m.head)
+    draft_self(logits)
+    output("logits", logits)
 
 def attention_by_hand(x, inputs, m, plans, mask, positions, scaling, w):
     pages = inputs.kv(w.kv)

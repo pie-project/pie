@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use tokio::sync::Notify;
@@ -31,7 +31,6 @@ pub struct ResidencyPlanner {
     pub(super) sweeping: AtomicBool,
     sweep_exhausted: AtomicBool,
     pub(super) demoting: AtomicBool,
-    demote_after: AtomicU64,
     pub(super) port: Arc<dyn PoolPort>,
     pub(super) stats: PlannerStats,
     /// `PoolFacts::seated_first`: a seated lane's growth before a prompt
@@ -55,7 +54,6 @@ impl ResidencyPlanner {
             sweeping: AtomicBool::new(false),
             sweep_exhausted: AtomicBool::new(false),
             demoting: AtomicBool::new(false),
-            demote_after: AtomicU64::new(0),
             port,
             stats: PlannerStats::default(),
             seated_first: false,
@@ -498,40 +496,6 @@ impl ResidencyPlanner {
     pub fn pages_freed(self: &Arc<Self>) {
         self.re_arm_idle_reclaim();
         if self.waiters.load(Ordering::Acquire) != 0 {
-            self.poke();
-        }
-    }
-
-    fn demote_idle(self: &Arc<Self>) {
-        const BACKOFF_MS: u64 = 100;
-        static START: std::sync::OnceLock<crate::rt::Instant> = std::sync::OnceLock::new();
-        let now = START
-            .get_or_init(crate::rt::Instant::now)
-            .elapsed()
-            .as_millis() as u64;
-        if now < self.demote_after.load(Ordering::Acquire)
-            || self.demoting.swap(true, Ordering::AcqRel)
-        {
-            return;
-        }
-        let (device_free, device_total) = self.port.device_stats();
-        let (host_free, host_total) = self.port.host_stats();
-        let room = host_free.saturating_sub(host_total / HOST_RESERVE_DIVISOR) as usize;
-        let txn = (device_free.saturating_mul(HOST_RESERVE_DIVISOR) < device_total && room > 0)
-            .then(|| self.port.prepare_demote(room))
-            .flatten();
-        let Some(txn) = txn else {
-            self.demoting.store(false, Ordering::Release);
-            self.demote_after.store(now + BACKOFF_MS, Ordering::Release);
-            return;
-        };
-        exec::spawn_move_out(self.clone(), txn, "demote", Self::demote_done);
-    }
-
-    fn demote_done(self: &Arc<Self>, moved: bool) {
-        self.demoting.store(false, Ordering::Release);
-        if moved {
-            self.re_arm_idle_reclaim();
             self.poke();
         }
     }
