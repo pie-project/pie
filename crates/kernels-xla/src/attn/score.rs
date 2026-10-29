@@ -338,10 +338,7 @@ pub fn capture(
     } else {
         mean
     };
-    if lane_offset == 0
-        && plane == 0
-        && plane_stride == qh
-        && nr * h.qh() == i64::from(scores.rows)
+    if lane_offset == 0 && plane == 0 && plane_stride == qh && nr * h.qh() == i64::from(scores.rows)
     {
         return Ok(mean);
     }

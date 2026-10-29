@@ -87,6 +87,10 @@ pub(crate) async fn notify_pipeline_close(pid: ProcessId) {
     await_terminate_fences(broadcast_leave_fenced(pid, LeaveKind::Close)).await;
 }
 
+pub(crate) fn notify_lane_open(lane: ProcessId, owner: ProcessId) {
+    broadcast(|| SchedulerItem::LaneOpen { lane, owner });
+}
+
 pub(crate) fn notify_lane_park(pid: ProcessId, seq: u64) {
     broadcast(|| SchedulerItem::LanePark { lane: pid, seq });
 }
@@ -265,6 +269,10 @@ enum SchedulerItem {
         lane: ProcessId,
         seq: u64,
         submitted: u32,
+    },
+    LaneOpen {
+        lane: ProcessId,
+        owner: ProcessId,
     },
     LanePark {
         lane: ProcessId,
@@ -1489,6 +1497,11 @@ impl BatchScheduler {
                 submitted,
             } => {
                 frame_policy.on_frame_truncated(lane, seq, submitted);
+            }
+            SchedulerItem::LaneOpen { lane, owner } => {
+                if !terminated_processes.contains(&owner) && !terminated_processes.contains(&lane) {
+                    frame_policy.on_lane_open(lane, owner);
+                }
             }
             SchedulerItem::LanePark { lane, seq } => {
                 frame_policy.on_lane_park(lane, seq);

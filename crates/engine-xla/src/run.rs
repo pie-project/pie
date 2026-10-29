@@ -398,6 +398,16 @@ impl<'c> Run<'c> {
         self.cut(id, self.whole(id))
     }
 
+    pub(crate) fn gemm_tensor(&self, id: ValueId) -> Tensor {
+        let at = id.0 as usize;
+        if let Def::Weight(w) = &self.values[at].def
+            && let Some(handle) = self.weights.1.get(*w as usize).copied().flatten()
+        {
+            return self.cut(id, handle);
+        }
+        self.tensor(id)
+    }
+
     /// The row `grid` addresses `rows`' row 0 at: the window's first row for the fire's
     /// fire-wide grids, 0 for a grid an op derived.
     pub(crate) fn grid_base(&self, grid: ValueId, rows: ValueId) -> u32 {

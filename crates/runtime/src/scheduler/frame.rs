@@ -403,6 +403,22 @@ impl FramePolicy {
         }
     }
 
+    pub fn on_lane_open(&mut self, lane: ProcessId, owner: ProcessId) {
+        let suspended = self.suspended.contains(&owner);
+        self.lanes.entry(lane).or_insert_with(|| LaneState {
+            owner: Some(owner),
+            awaited: !suspended,
+            served: false,
+            retired_at: None,
+            parked: suspended,
+            leashed: false,
+            clock_from: None,
+            frames: VecDeque::new(),
+            fired_this_boundary: true,
+            prompting: false,
+        });
+    }
+
     pub fn on_lane_park(&mut self, lane: ProcessId, seq: u64) {
         let Some(state) = self.lanes.get_mut(&lane) else {
             return;
@@ -457,8 +473,15 @@ impl FramePolicy {
     pub fn on_bind_enqueued(&mut self, pid: Option<ProcessId>) {
         if let Some(pid) = pid {
             *self.pending_binds.entry(pid).or_default() += 1;
-            if !self.lanes.values().any(|lane| lane.owner == Some(pid)) {
+            if !self
+                .lanes
+                .values()
+                .any(|lane| lane.owner == Some(pid) && !lane.frames.is_empty())
+            {
                 self.staged.insert(pid);
+                if self.slotted.contains(&pid) {
+                    self.joins_in_flight.insert(pid);
+                }
             }
         }
     }
@@ -689,7 +712,9 @@ impl FramePolicy {
                     continue;
                 }
                 if mid_boundary && lane.fired_this_boundary {
-                    continuing.push(*lane_id);
+                    if !lane.prompting {
+                        continuing.push(*lane_id);
+                    }
                 } else {
                     fresh.push(*lane_id);
                 }
@@ -766,7 +791,9 @@ impl FramePolicy {
                 }
                 let prompting = live.iter().any(|fire| fire.tokens > fire.rows);
                 if (self.prompts_only && !prompting)
-                    || (prompting && prompting_in_flight.iter().any(|lane| lane != lane_id))
+                    || (prompting
+                        && !mid_boundary
+                        && prompting_in_flight.iter().any(|lane| lane != lane_id))
                 {
                     continue;
                 }
@@ -1056,7 +1083,7 @@ ready_age_newest={}us",
                     lane.clock_from = None;
                     continue;
                 }
-                if owes && !owes_forever {
+                if (owes || executing) && !owes_forever {
                     lane.clock_from = None;
                 } else {
                     if owes_forever {
@@ -1100,7 +1127,11 @@ ready_age_newest={}us",
                     self.lanes.len()
                 ));
             }
-            if missing > 0 && missing_decoders == 0 {
+            if missing > 0
+                && missing_decoders == 0
+                && !self.has_pending_binds()
+                && !self.is_joining()
+            {
                 self.prompts_only = true;
                 let sealed = self.seal();
                 self.prompts_only = false;

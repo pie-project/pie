@@ -413,10 +413,7 @@ impl Target {
             } else {
                 reshape(&mask_bool, [rows, vocab])
             };
-            target_out.put(masked_argmax(
-                intrinsics::output(0, "logits"),
-                &mask_shaped,
-            ));
+            target_out.put(masked_argmax(intrinsics::output(0, "logits"), &mask_shaped));
         });
 
         allowed.put(masks.concat());

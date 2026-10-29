@@ -41,6 +41,10 @@ struct Input {
     /// Beam width. `1` degenerates to greedy decoding (the beam identity).
     #[serde(default = "default_beams")]
     beams: u32,
+    #[serde(default)]
+    ckpt_sync: bool,
+    #[serde(default)]
+    rollback_mode: Option<String>,
 }
 
 fn default_prompt() -> String {
@@ -224,29 +228,92 @@ async fn main(input: Input) -> Result<String> {
         });
 
         let mut step = 0usize;
-        run_ahead(&pipeline, &fwd, decodes, async || {
-            let picked = out
-                .take_host::<Vec<i32>>()
-                .await
-                .with_context(|| format!("@{step}"))?;
-            let parents = out_par
-                .take_host::<Vec<u32>>()
-                .await
-                .with_context(|| format!("@{step}"))?;
-            final_scores = out_scr
-                .take_host::<Vec<f32>>()
-                .await
-                .with_context(|| format!("@{step}"))?;
-            let greedy = out_greedy
-                .take_host::<Vec<i32>>()
-                .await
-                .with_context(|| format!("@{step}"))?;
-            greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
-            hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
-            step += 1;
-            Ok(ControlFlow::Continue(()))
-        })
-        .await?;
+        let mode = input
+            .rollback_mode
+            .as_deref()
+            .unwrap_or(if input.ckpt_sync {
+                "ckpt_sync"
+            } else {
+                "flush_free"
+            });
+        let ckpt_sync = mode == "ckpt_sync";
+        let stop_wait = mode == "stop_wait";
+        let mut held_ckpt = if ckpt_sync || stop_wait {
+            ws.fork(&pipeline).ok()
+        } else {
+            None
+        };
+        if ckpt_sync || stop_wait {
+            for _ in 0..decodes {
+                if let Ok(c) = ws.fork(&pipeline) {
+                    held_ckpt = Some(c);
+                }
+                fwd.submit(&pipeline).with_context(|| format!("@{step}"))?;
+                let picked = out
+                    .take_host::<Vec<i32>>()
+                    .await
+                    .with_context(|| format!("@{step}"))?;
+                let parents = out_par
+                    .take_host::<Vec<u32>>()
+                    .await
+                    .with_context(|| format!("@{step}"))?;
+                final_scores = out_scr
+                    .take_host::<Vec<f32>>()
+                    .await
+                    .with_context(|| format!("@{step}"))?;
+                let greedy = out_greedy
+                    .take_host::<Vec<i32>>()
+                    .await
+                    .with_context(|| format!("@{step}"))?;
+                if stop_wait || parents.iter().enumerate().any(|(i, &p)| p as usize != i) {
+                    if let Some(ref ckpt_ws) = held_ckpt {
+                        if let Ok(restore_ws) = ckpt_ws.fork(&pipeline) {
+                            let toks_r = Channel::from(&picked[..1]);
+                            let ind_r = Channel::from([0u32, 1]);
+                            let out_r = Channel::new([1], dtype::i32);
+                            let fwd_r = ForwardPass::new();
+                            fwd_r.embed(&toks_r, &ind_r)?;
+                            fwd_r.state(&[&restore_ws], StateGeometry::folding())?;
+                            fwd_r.epilogue(move || {
+                                out_r.put(reshape(
+                                    reduce_argmax(intrinsics::output(0, "logits")),
+                                    [1],
+                                ));
+                            });
+                            fwd_r.submit(&pipeline)?;
+                            let _ = out_r.take_host::<Vec<i32>>().await?;
+                        }
+                    }
+                }
+                greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
+                hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
+                step += 1;
+            }
+        } else {
+            run_ahead(&pipeline, &fwd, decodes, async || {
+                let picked = out
+                    .take_host::<Vec<i32>>()
+                    .await
+                    .with_context(|| format!("@{step}"))?;
+                let parents = out_par
+                    .take_host::<Vec<u32>>()
+                    .await
+                    .with_context(|| format!("@{step}"))?;
+                final_scores = out_scr
+                    .take_host::<Vec<f32>>()
+                    .await
+                    .with_context(|| format!("@{step}"))?;
+                let greedy = out_greedy
+                    .take_host::<Vec<i32>>()
+                    .await
+                    .with_context(|| format!("@{step}"))?;
+                greedy_mismatches += picked.iter().zip(&greedy).filter(|(p, g)| p != g).count();
+                hypotheses = advance_hypotheses(&hypotheses, &picked, &parents)?;
+                step += 1;
+                Ok(ControlFlow::Continue(()))
+            })
+            .await?;
+        }
     }
     pipeline.close();
 

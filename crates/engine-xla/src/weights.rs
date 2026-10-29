@@ -31,7 +31,7 @@ pub enum WeightRow {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct WeightTable(pub Vec<Option<WeightRow>>);
+pub struct WeightTable(pub Vec<Option<WeightRow>>, pub Vec<Option<Tensor>>);
 
 #[derive(Debug, Clone, Copy)]
 pub struct AdapterPlane<'a> {
@@ -67,6 +67,7 @@ struct AdapterBank {
 
 pub struct Weights {
     buffers: Vec<Option<Buffer>>,
+    gemm_buffers: BTreeMap<u32, Buffer>,
     table: WeightTable,
     banks: BTreeMap<String, AdapterBank>,
     bytes: u64,
@@ -225,7 +226,11 @@ impl Weights {
             }
         };
 
-        let transposed = gemm_only(trace, &bank_planes, engine);
+        let (transposed, mut tied_gemm) = gemm_only(trace, &bank_planes, engine);
+        let tied_extra: u64 = tied_gemm.iter().map(|&at| sizes[at]).sum();
+        if total + extra + tied_extra > device_cap {
+            tied_gemm.clear();
+        }
         let codes_planes: std::collections::BTreeSet<usize> =
             pairings.keys().map(|name| index[name]).collect();
         // A gather-only table lands folded, `[V/128, 128·row]` (codes as
@@ -252,12 +257,14 @@ impl Weights {
             index: &index,
             sizes: &sizes,
             buffers: (0..trace.params.len()).map(|_| None).collect(),
+            gemm_buffers: BTreeMap::new(),
             stored: trace.params.iter().map(|p| p.dtype).collect(),
             prescale: &prescale,
             scales_of: &scales_of,
             held: BTreeMap::new(),
             shape_of: &shape_of,
             transposed: &transposed,
+            tied_gemm: &tied_gemm,
             folded: &folded,
         };
         Execution::new(&streaming, snapshot)
@@ -276,8 +283,10 @@ impl Weights {
             + (0..stored.len())
                 .filter(|&at| stored[at] == Dtype::E5m2 && trace.params[at].dtype != Dtype::E5m2)
                 .map(|at| sizes[at])
-                .sum::<u64>();
+                .sum::<u64>()
+            + tied_gemm.iter().map(|&at| sizes[at]).sum::<u64>();
         let mut buffers = sink.buffers;
+        let gemm_buffers = sink.gemm_buffers;
 
         let mut banks = BTreeMap::new();
         for (&at, &(adapters, slot, rows, cols, elem)) in &banks_of {
@@ -305,6 +314,7 @@ impl Weights {
         }
 
         let mut table = Vec::with_capacity(trace.params.len());
+        let mut gemm_table = Vec::with_capacity(trace.params.len());
         for (at, param) in trace.params.iter().enumerate() {
             if buffers[at].is_none() {
                 return Err(Fault::Param {
@@ -354,10 +364,26 @@ impl Weights {
                 }),
                 None => WeightRow::Dense(dense(at)),
             }));
+            gemm_table.push(if tied_gemm.contains(&at) {
+                let (rows, width) = shape_of(at);
+                Some(handles.root(Root {
+                    source: Source::Weight {
+                        param: at as u32,
+                        plane: 1,
+                        transposed: true,
+                    },
+                    dtype: stored[at],
+                    rows: u32::try_from(rows).unwrap_or(u32::MAX),
+                    width: u32::try_from(width).unwrap_or(u32::MAX),
+                }))
+            } else {
+                None
+            });
         }
         Ok(Weights {
             buffers,
-            table: WeightTable(table),
+            gemm_buffers,
+            table: WeightTable(table, gemm_table),
             banks,
             bytes: total,
         })
@@ -371,6 +397,14 @@ impl Weights {
     #[must_use]
     pub fn buffer(&self, param: u32) -> Option<&Buffer> {
         self.buffers.get(param as usize)?.as_ref()
+    }
+
+    #[must_use]
+    pub fn buffer_plane(&self, param: u32, plane: u8) -> Option<&Buffer> {
+        if plane == 1 {
+            return self.gemm_buffers.get(&param);
+        }
+        self.buffer(param)
     }
 
     #[must_use]
@@ -586,15 +620,28 @@ pub(crate) fn serves_this_deployment(path: &Path, backend: &str, deployment: &st
 /// sub-byte codes planes of quantized gemm weights the TPU would otherwise
 /// lay out K-minor (below). A param read any other way (an embedding
 /// gather, a norm, a routed bank) lands as declared.
+pub(crate) fn tied_gemm_bytes(trace: &Trace, engine: &Engine) -> Result<u64> {
+    let empty = std::collections::BTreeSet::new();
+    let (_, tied) = gemm_only(trace, &empty, engine);
+    tied.into_iter().try_fold(0u64, |sum, at| {
+        let p = &trace.params[at];
+        plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
+    })
+}
+
 fn gemm_only(
     trace: &Trace,
     banks: &std::collections::BTreeSet<usize>,
     engine: &Engine,
-) -> std::collections::BTreeSet<usize> {
+) -> (
+    std::collections::BTreeSet<usize>,
+    std::collections::BTreeSet<usize>,
+) {
     use poem_ir::{Def, Linear, Operands, Operation};
     let mut out = std::collections::BTreeSet::new();
+    let mut tied = std::collections::BTreeSet::new();
     if !engine.gemm_transpose {
-        return out;
+        return (out, tied);
     }
     let param_of = |v: poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
         Some(Def::Weight(p)) => Some(*p as usize),
@@ -640,7 +687,13 @@ fn gemm_only(
     }
     out.retain(|&p| {
         let param = &trace.params[p];
-        if other.contains(&p) || param.source == ParamSource::Registered {
+        if param.source == ParamSource::Registered {
+            return false;
+        }
+        if other.contains(&p) {
+            if !banks.contains(&p) && param.dtype == Dtype::Bf16 && param.shape.len() == 2 {
+                tied.insert(p);
+            }
             return false;
         }
         if banks.contains(&p) {
@@ -658,7 +711,7 @@ fn gemm_only(
         }
         param.dtype == Dtype::Bf16 && param.shape.len() == 2
     });
-    out
+    (out, tied)
 }
 
 /// Rows a transposed sub-byte codes plane pads its output axis to.
@@ -790,6 +843,7 @@ struct Landing<'a> {
     index: &'a BTreeMap<&'a str, usize>,
     sizes: &'a [u64],
     buffers: Vec<Option<Buffer>>,
+    gemm_buffers: BTreeMap<u32, Buffer>,
     /// The dtype each param landed as (its declared one, or `E5m2` for a
     /// pre-scaled mxfp4 bank's codes).
     stored: Vec<Dtype>,
@@ -804,6 +858,8 @@ struct Landing<'a> {
     shape_of: &'a dyn Fn(usize) -> (u64, u64),
     /// The params that land transposed (`gemm_only`).
     transposed: &'a std::collections::BTreeSet<usize>,
+    /// Tied embedding params that also land a transposed copy for GEMM.
+    tied_gemm: &'a std::collections::BTreeSet<usize>,
     /// The planes of gather-only tables: the `[rows, width]` each lands
     /// folded as (`gather_only`).
     folded: &'a BTreeMap<usize, (u64, u64)>,
@@ -827,6 +883,18 @@ impl Landing<'_> {
     fn plain(&mut self, at: usize, bytes: &[u8]) -> Result<()> {
         let dtype = self.trace.params[at].dtype;
         let (rows, width) = (self.shape_of)(at);
+        if self.tied_gemm.contains(&at) {
+            let t = transpose_2byte(bytes, rows as usize, width as usize);
+            self.gemm_buffers.insert(
+                at as u32,
+                self.device.upload(
+                    dtype,
+                    u32::try_from(width).unwrap_or(u32::MAX),
+                    u32::try_from(rows).unwrap_or(u32::MAX),
+                    &t,
+                )?,
+            );
+        }
         if self.transposed.contains(&at)
             && let Some(codes) = crate::pack::land(dtype, bytes)
         {
@@ -1006,7 +1074,10 @@ impl Weights {
                 rectangle(&p.shape)
             }
         };
-        let transposed = gemm_only(trace, &bank_planes, engine);
+        let (transposed, mut tied_gemm) = gemm_only(trace, &bank_planes, engine);
+        if !prescale {
+            tied_gemm.clear();
+        }
         let codes_planes: std::collections::BTreeSet<usize> = pairings.keys().copied().collect();
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
         for at in gather_only(trace, &codes_planes, engine) {
@@ -1034,6 +1105,7 @@ impl Weights {
         }
         let mut banks = BTreeMap::new();
         let mut table = Vec::with_capacity(trace.params.len());
+        let mut gemm_table = Vec::with_capacity(trace.params.len());
         for (at, param) in trace.params.iter().enumerate() {
             if param.source == ParamSource::Registered {
                 let adapters =
@@ -1091,10 +1163,26 @@ impl Weights {
                 }),
                 None => WeightRow::Dense(dense(at)),
             }));
+            gemm_table.push(if tied_gemm.contains(&at) {
+                let (rows, width) = shape_of(at);
+                Some(handles.root(Root {
+                    source: Source::Weight {
+                        param: at as u32,
+                        plane: 1,
+                        transposed: true,
+                    },
+                    dtype: stored[at],
+                    rows: u32::try_from(rows).unwrap_or(u32::MAX),
+                    width: u32::try_from(width).unwrap_or(u32::MAX),
+                }))
+            } else {
+                None
+            });
         }
         Ok(Weights {
             buffers: (0..trace.params.len()).map(|_| None).collect(),
-            table: WeightTable(table),
+            gemm_buffers: BTreeMap::new(),
+            table: WeightTable(table, gemm_table),
             banks,
             bytes: sizes.iter().sum(),
         })

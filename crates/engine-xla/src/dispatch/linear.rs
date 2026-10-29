@@ -80,7 +80,7 @@ impl Run<'_> {
                     ),
                     None => crate::lower::lower(self.ctx(), |l| {
                         let act_v = l.read(self.tensor(*act))?;
-                        let w_v = l.read(self.tensor(*w))?;
+                        let w_v = l.read(self.gemm_tensor(*w))?;
                         let o_y = self.tensor(*y);
                         if let Some(v) = linear::gemm::matmul(l.f(), act_v, w_v, o_y.landing())? {
                             l.land(o_y, v)?;
@@ -115,7 +115,7 @@ impl Run<'_> {
                     ),
                     None => crate::lower::lower(self.ctx(), |l| {
                         let act_v = l.read(self.tensor(*act))?;
-                        let w_v = l.read(self.tensor(*w))?;
+                        let w_v = l.read(self.gemm_tensor(*w))?;
                         let o_y = self.tensor(*y);
                         if let Some(v) = linear::gemm::lm_head(l.f(), act_v, w_v, o_y.landing())? {
                             l.land(o_y, v)?;

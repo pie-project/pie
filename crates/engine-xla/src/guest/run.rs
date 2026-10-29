@@ -92,6 +92,11 @@ impl Stages {
             return Ok(Arc::clone(hit));
         }
         let lowered = lower::lower(package, at, batch, carried).map_err(|why| why.to_string())?;
+        if !lowered.text.is_empty()
+            && let Some(path) = std::env::var_os("PIE_XLA_DUMP_GUEST")
+        {
+            let _ = std::fs::write(path, &lowered.text);
+        }
         let program = if !lowered.layout.runs() {
             None
         } else {

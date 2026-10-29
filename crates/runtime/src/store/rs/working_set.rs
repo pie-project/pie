@@ -19,9 +19,17 @@ impl RsLifecycle {
             return;
         }
         let stores = crate::store::registry::get(self.model, self.engine);
-        let mut rs = stores.rs.lock().unwrap();
-        rs.release_working_set(self.id);
-        rs.retire_idle();
+        let freed = {
+            let mut rs = stores.rs.lock().unwrap();
+            let freed = rs.release_working_set(self.id);
+            rs.retire_idle();
+            freed
+        };
+        if freed > 0
+            && let Some(planner) = crate::planner::planner_for(self.model, self.engine)
+        {
+            planner.pages_freed();
+        }
     }
 }
 

@@ -632,13 +632,17 @@ pub(crate) fn split_bf16(f: &mut Func, x: Val) -> Built<(Val, Val)> {
 
 /// `p · v` in f32 from bf16 values: `p` split as `hi + lo`, two bf16 passes.
 fn pv(f: &mut Func, lay: Layout, p: Val, v: Val) -> Built<Val> {
-    let (hi, lo) = split_bf16(f, p)?;
     let split = f.ty(v).rank() == 3;
     let dot = |f: &mut Func, x: Val| match lay {
         Layout::PerRow if split => by_head(f, x, v, 1),
         Layout::PerRow => f.dot_general_at(x, v, &[0, 1], &[0, 2], &[3], &[1], Elem::F32, false),
         Layout::Blocked => f.dot_general_at(x, v, &[0], &[1], &[3], &[0], Elem::F32, false),
     };
+    if lay == Layout::PerRow {
+        let pb = f.convert(p, Elem::Bf16);
+        return dot(f, pb);
+    }
+    let (hi, lo) = split_bf16(f, p)?;
     let a = dot(f, hi)?;
     let b = dot(f, lo)?;
     f.add(a, b)
@@ -2251,7 +2255,9 @@ pub(crate) fn scatter_slots(
         let ok = f.and(ok, d)?;
         let s = with_i(f, page, ps, Func::mul)?;
         let s = f.add(s, off)?;
-        let far = f.like_i(s, slots);
+        let f0 = f.like_i(s, slots);
+        let io = f.iota(Elem::I32, &[i64::from(n)], 0);
+        let far = f.add(f0, io)?;
         let slot = f.select(ok, s, far)?;
         let rows = src.val;
         let table = match at.checked_sub(1) {
@@ -2260,7 +2266,7 @@ pub(crate) fn scatter_slots(
         };
         let elem = f.elem(table);
         let rows = f.convert(rows, elem);
-        out.push(f.put_rows(table, slot, rows, crate::hlo::Combine::Set)?);
+        out.push(f.put_rows_hinted(table, slot, rows, crate::hlo::Combine::Set, true)?);
     }
     Ok(out)
 }
