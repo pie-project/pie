@@ -71,7 +71,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             .sum();
         boot.budget.max_tokens = match engine.forward_tokens {
             0 => crate::api::DEFAULT_FORWARD_TOKENS,
-            tokens if params < 2 << 30 => tokens.max(crate::api::DEFAULT_FORWARD_TOKENS),
+            tokens if params < 2 << 30 || sparse_experts(&boot.trace) => {
+                tokens.max(crate::api::DEFAULT_FORWARD_TOKENS)
+            }
             tokens => tokens,
         };
         if let Some(fit) = walk_fire_fit(&boot.trace, engine.walk_fire_rows, device.device().num_sm)
@@ -1267,6 +1269,23 @@ impl Staged {
         })?;
         Ok(shell)
     }
+}
+
+fn sparse_experts(trace: &poem_ir::Trace) -> bool {
+    let dims = |v: poem_ir::ValueId| match &trace.values[v.0 as usize].ty {
+        poem_ir::Ty::Tensor { shape, .. } => shape.clone(),
+        poem_ir::Ty::Struct(_) => Vec::new(),
+    };
+    trace.nodes.iter().any(|node| match node.op {
+        poem_ir::Operation::Linear(poem_ir::Linear::MoeSelect { bank, routes, .. }) => {
+            matches!(
+                (dims(bank).first(), dims(routes).last()),
+                (Some(poem_ir::Dim::Const(experts)), Some(poem_ir::Dim::Const(top_k)))
+                    if *experts > 2 * *top_k
+            )
+        }
+        _ => false,
+    })
 }
 
 fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
