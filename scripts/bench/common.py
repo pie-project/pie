@@ -933,7 +933,7 @@ def hf_chat_prompts_and_counts(
 ) -> tuple[list[str], list[int]]:
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(str(Path(model).parent) if Path(model).is_file() else model, trust_remote_code=True)
     rendered = _render_chat(tok, system, prompts, enable_thinking)
     counts = [len(tok.encode(p, add_special_tokens=False)) for p in rendered]
     return rendered, counts
