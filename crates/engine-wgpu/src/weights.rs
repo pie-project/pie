@@ -444,7 +444,9 @@ impl Weights {
         handles: &Handles,
         trace: &Trace,
     ) -> Result<()> {
-        for at in crate::decoded::absorbed_weights(trace) {
+        let mut wanted = crate::decoded::absorbed_weights(trace);
+        wanted.extend(crate::decoded::lane_axis_weights(trace));
+        for at in wanted {
             let Some(Some(WeightRow::Planes(bank))) = self.table.0.get(at).copied() else {
                 continue;
             };

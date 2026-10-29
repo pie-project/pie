@@ -4,7 +4,7 @@
 // Ragged dense attention, tiled: 32 query rows of one head a workgroup, four
 // lanes a row each holding a quarter of the head, keys streamed four at a
 // time through workgroup memory. Query row `r` of segment `s` attends keys
-// `kv_segments[s]..kv_segments[s + 1]`; with `PIE_CUSTOM`, only where bit
+// `kv_seg(s)..kv_seg(s + 1)`; with `PIE_CUSTOM`, only where bit
 // `qo * kv_len + kv` (each within the segment) of `mask_bits`, from byte
 // `mask_indptr[s]`, is set. bf16 rows; a lane's quarter is an even number of
 // columns, so it lands whole words.
@@ -38,8 +38,15 @@ struct Params {
     int num_kv_heads;
     int head_dim;
     float sm_scale;
+    // The key CSR is the query's (self-attention): `kv_segments` is a stand-in.
+    int self_kv;
 };
 PIE_PARAMS(PIE_PARAMS_AT, Params, params);
+
+// Boundary `i` of the key CSR.
+int kv_seg(uint i) {
+    return params.self_kv != 0 ? segments[i] : kv_segments[i];
+}
 
 groupshared float kt[PIE_BKEY * PIE_D];
 groupshared float vt[PIE_BKEY * PIE_D];
@@ -69,8 +76,8 @@ int segment_of(int row) {
 #ifdef PIE_CUSTOM
 bool mask_keeps(int seg, int row, int j) {
     uint qo = uint(row - segments[uint(seg)]);
-    uint kv = uint(j - kv_segments[uint(seg)]);
-    uint kv_len = uint(kv_segments[uint(seg) + 1u] - kv_segments[uint(seg)]);
+    uint kv = uint(j - kv_seg(uint(seg)));
+    uint kv_len = uint(kv_seg(uint(seg) + 1u) - kv_seg(uint(seg)));
     uint bit = uint(mask_indptr[uint(seg)]) * 8u + qo * kv_len + kv;
     return ((mask_bits[bit >> 5u] >> (bit & 31u)) & 1u) != 0u;
 }
@@ -92,7 +99,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         int seg = segment_of(row);
         segs[qi] = seg;
         spans[qi] = seg < 0 ? int2(0, 0)
-                            : int2(kv_segments[uint(seg)], kv_segments[uint(seg + 1)]);
+                            : int2(kv_seg(uint(seg)), kv_seg(uint(seg + 1)));
     }
     GroupMemoryBarrierWithGroupSync();
     // The keys any row of the tile reads, folded once and read uniformly:

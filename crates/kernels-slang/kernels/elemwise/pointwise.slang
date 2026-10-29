@@ -4,6 +4,10 @@
 // Elementwise kernels with no algorithm of their own, a pair of elements a
 // lane (`prim/pair.slang`): sums, a bias, scalars, activations, the f32 to
 // bf16 cast, clamps and the sigmoid gate. `PIE_<KERNEL>` picks the kernel.
+// A whole-tensor kernel's lanes past `PIE_FLAT_SPAN` ride the y axis.
+
+#define PIE_FLAT_SPAN 8388608u
+#define PIE_FLAT_LANE(gid) ((gid).x + (gid).y * PIE_FLAT_SPAN)
 
 #if defined(PIE_ADD)
 
@@ -37,7 +41,7 @@ PIE_PARAMS(3, Params, params);
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
-    uint i = 2u * gid.x;
+    uint i = 2u * PIE_FLAT_LANE(gid);
     if (i >= params.n) {
         return;
     }
@@ -60,7 +64,7 @@ PIE_PARAMS(2, Params, params);
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
-    uint i = 2u * gid.x;
+    uint i = 2u * PIE_FLAT_LANE(gid);
     if (i >= params.n) {
         return;
     }
@@ -139,7 +143,7 @@ float scalar() {
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
-    uint i = 2u * gid.x;
+    uint i = 2u * PIE_FLAT_LANE(gid);
     if (i >= params.n) {
         return;
     }
@@ -162,7 +166,7 @@ PIE_PARAMS(1, Params, params);
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
-    uint i = 2u * gid.x;
+    uint i = 2u * PIE_FLAT_LANE(gid);
     if (i >= params.n) {
         return;
     }
@@ -192,7 +196,7 @@ float2 stable_tanh(float2 v) {
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
-    uint i = 2u * gid.x;
+    uint i = 2u * PIE_FLAT_LANE(gid);
     if (i >= params.n) {
         return;
     }
@@ -213,7 +217,7 @@ PIE_PARAMS(1, Params, params);
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
-    uint i = 2u * gid.x;
+    uint i = 2u * PIE_FLAT_LANE(gid);
     if (i >= params.n) {
         return;
     }
@@ -236,7 +240,7 @@ PIE_PARAMS(2, Params, params);
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
-    uint i = 2u * gid.x;
+    uint i = 2u * PIE_FLAT_LANE(gid);
     if (i >= params.n) {
         return;
     }
@@ -279,7 +283,7 @@ float2 bounds() {
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
-    uint i = 2u * gid.x;
+    uint i = 2u * PIE_FLAT_LANE(gid);
     if (i >= params.n) {
         return;
     }
@@ -309,7 +313,7 @@ float2 sigmoid(float2 g) {
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
-    uint i = 2u * gid.x;
+    uint i = 2u * PIE_FLAT_LANE(gid);
     if (i >= params.n) {
         return;
     }

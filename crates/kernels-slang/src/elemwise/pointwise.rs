@@ -20,11 +20,23 @@ const POINTWISE: &str = "elemwise/pointwise.slang";
 /// The workgroup width every instantiation is built at.
 const GROUP: u32 = 256;
 
+/// Lanes the x axis carries before the grid spills into y: `PIE_FLAT_SPAN`
+/// in `pointwise.slang`, 32768 workgroups of `GROUP`, under the 65535 a
+/// dimension may launch.
+const FLAT_SPAN: u32 = 32_768 * GROUP;
+
 /// The `x.rows * x.width` elements of `x`, and the grid that walks them a
 /// pair a lane.
 fn flat(op: &'static str, x: Tensor) -> Result<(u32, Grid), Error> {
     let [n, _, _] = elementwise(op, x.width, x.rows)?;
-    Ok((n, Grid::of([n.div_ceil(2), 1, 1], [GROUP, 1, 1])))
+    let lanes = n.div_ceil(2);
+    if lanes <= 65_535 * GROUP {
+        return Ok((n, Grid::of([lanes, 1, 1], [GROUP, 1, 1])));
+    }
+    Ok((
+        n,
+        Grid::of([FLAT_SPAN, lanes.div_ceil(FLAT_SPAN), 1], [GROUP, 1, 1]),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

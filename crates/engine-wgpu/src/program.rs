@@ -890,18 +890,18 @@ impl Plane {
     pub(crate) fn deferred(
         &self,
         device: &crate::device::Context,
-        attachments: impl IntoIterator<Item = (InstanceId, u32)>,
+        attachments: impl IntoIterator<Item = (InstanceId, u32, u32)>,
         names: Vec<String>,
     ) -> Result<Guests, Refusal> {
         let mut attached = Vec::new();
-        for (instance, lane) in attachments {
+        for (instance, lane, lanes) in attachments {
             let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
                 what: "instance",
                 id: instance.0,
             })?;
             attached.push(Attached {
                 lane,
-                lanes: self.embed_indptr(seat).len().saturating_sub(1).max(1),
+                lanes: (lanes as usize).max(1),
                 half: Arc::clone(&seat.half),
                 held: seat.gate.enter(),
             });

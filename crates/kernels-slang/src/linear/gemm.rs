@@ -127,7 +127,7 @@ pub fn act_x_wt(
     )
 }
 
-/// `y = act * w^T` for an f32 activation, an invocation an output (SPIR-V):
+/// `y = act * w^T` for an f32 activation, an invocation an output:
 /// a bf16 or f32 weight, an f32 or bf16 result.
 pub fn lane(
     ctx: &Ctx<'_>,

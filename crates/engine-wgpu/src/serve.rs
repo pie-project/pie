@@ -370,6 +370,10 @@ pub struct Shell {
 
     masked: poem_ir::ClassSet,
 
+    /// The lane classes that read a token grid: the voxel seat's token
+    /// patch packs their clips, and no other lane's.
+    token_gridded: poem_ir::ClassSet,
+
     corrected: poem_ir::ClassSet,
 
     adapter_fact: Option<u32>,
@@ -510,6 +514,10 @@ impl Shell {
                 }
             }
         }
+
+        let token_gridded = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
+            matches!(def, poem_ir::Def::Input(RuntimeInput::TokenGrid { .. }))
+        });
 
         let mut corrected = poem_ir::ClassSet::default();
         for region in compiled.template() {
@@ -925,6 +933,7 @@ impl Shell {
             copies: false,
             last: FireCost::default(),
             masked,
+            token_gridded,
             corrected,
             adapter_fact,
             adapters: adapter_slots,
@@ -2126,6 +2135,9 @@ impl Shell {
                 };
                 let mut offset = row.voxel_offset;
                 let mut token_row = row.row_offset;
+                let patch = seat
+                    .token_patch
+                    .filter(|_| self.token_gridded.contains(row.class as usize));
                 for boxed in tile.boxes {
                     voxel_grid.extend_from_slice(&[
                         narrow(u64::from(boxed[0])),
@@ -2137,12 +2149,12 @@ impl Shell {
                     voxel_slots.push(seated.rs_slot.unwrap_or(seated.lane.slot) as i32);
                     offset = offset
                         .saturating_add(boxed[0].saturating_mul(boxed[1]).saturating_mul(boxed[2]));
-                    if let Some(p) = seat.token_patch {
+                    if let Some(p) = patch {
                         token_row = token_cell(&mut voxel_token_grid, *boxed, p, token_row)
                             .ok_or_else(|| token_refusal(row.source))?;
                     }
                 }
-                if seat.token_patch.is_some() && token_row > row.row_offset + row.rows {
+                if patch.is_some() && token_row > row.row_offset + row.rows {
                     return Err(token_refusal(row.source));
                 }
                 if !tile.payload.is_empty() {
@@ -2997,6 +3009,9 @@ impl Shell {
                 .copied()
                 .flatten()
                 .map(|clips| clips.boxes);
+            // A lane outside the token grid reads its rows as they are.
+            let gridded = self.token_gridded.contains(row.class as usize);
+            let clips = clips.filter(|_| gridded);
             guests[row.source as usize] =
                 poem_exec::fire::guest_rows(row, clips, patch).map_err(fire)?;
         }

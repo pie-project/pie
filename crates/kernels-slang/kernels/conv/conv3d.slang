@@ -12,7 +12,10 @@
 // lands zero.
 //
 // The weight is `[c_out, taps * c_in]`, taps-major in `(t, h, w)` order;
-// the bias, when there is one, an f32 per output channel. `c_out` is even.
+// the bias, when there is one, an f32 per output channel. `c_out` is even,
+// except under `PIE_FLAT`: there a workgroup's strips are four consecutive
+// outputs of the flattened `[rows_out, c_out]`, so an odd `c_out`'s words,
+// which straddle rows, land whole from one workgroup.
 
 #define STRIPS 4
 #define LANES 32
@@ -50,6 +53,10 @@ struct Params {
 PIE_PARAMS(6, Params, params);
 
 groupshared float conv_fold[STRIPS][LANES];
+#if defined(PIE_FLAT)
+groupshared int flat_n[STRIPS];
+groupshared int flat_l[STRIPS];
+#endif
 
 // The input row tap `(it, ih, iw)` of output voxel `v` reads, or -1 for a
 // padded one.
@@ -78,19 +85,31 @@ int tap_row(Clip in_, Voxel v, int it, int ih, int iw) {
 [shader("compute")]
 [numthreads(THREADS, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    int tid = int(local.x);
+    int strip = tid / LANES;
+    int lane = tid % LANES;
+#if defined(PIE_FLAT)
+    uint first = clip_row(group, params.row_span) * uint(STRIPS);
+    uint outputs = uint(params.rows_out) * uint(params.c_out);
+    if (first >= outputs) {
+        return;
+    }
+    uint slot = first + uint(strip);
+    int row = int(slot / uint(params.c_out));
+    int n = int(slot % uint(params.c_out));
+    bool live = slot < outputs;
+#else
     int row = int(clip_row(group, params.row_span));
     if (row >= params.rows_out) {
         return;
     }
-    int tid = int(local.x);
-    int strip = tid / LANES;
-    int lane = tid % LANES;
     int n = int(group.x) * STRIPS + strip;
     bool live = n < params.c_out;
+#endif
 
     Clip og;
     int fire_row = row + params.o_base;
-    int l = clip_of(o_grid, params.clips, fire_row, og);
+    int l = live ? clip_of(o_grid, params.clips, fire_row, og) : -1;
     float acc = 0.0;
     if (l >= 0 && live) {
         Clip in_ = clip_at(grid, l);
@@ -116,6 +135,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         }
     }
     conv_fold[strip][lane] = acc;
+#if defined(PIE_FLAT)
+    if (lane == 0) {
+        flat_n[strip] = n;
+        flat_l[strip] = live ? l : -1;
+    }
+#endif
     GroupMemoryBarrierWithGroupSync();
     for (int half_ = LANES >> 1; half_ > 0; half_ >>= 1) {
         if (lane < half_) {
@@ -123,6 +148,20 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         }
         GroupMemoryBarrierWithGroupSync();
     }
+#if defined(PIE_FLAT)
+    // Strips 0 and 2 land their output and the next one's as a word, the
+    // next one zero past the end.
+    if (lane == 0 && (strip & 1) == 0 && live) {
+        float2 sum = float2(0.0);
+        if (flat_l[strip] >= 0) {
+            sum.x = conv_fold[strip][0] + (params.has_bias != 0u ? bias[flat_n[strip]] : 0.0);
+        }
+        if (flat_l[strip + 1] >= 0) {
+            sum.y = conv_fold[strip + 1][0] + (params.has_bias != 0u ? bias[flat_n[strip + 1]] : 0.0);
+        }
+        o[slot >> 1] = pack_bf16(sum.x, sum.y);
+    }
+#else
     // Strips 0 and 2 land their channel and the next one's as a word.
     if (lane == 0 && (strip & 1) == 0 && live) {
         float2 sum = float2(conv_fold[strip][0], conv_fold[strip + 1][0]);
@@ -133,6 +172,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         }
         o[(uint(row) * uint(params.c_out) + uint(n)) >> 1] = pack_bf16(sum.x, sum.y);
     }
+#endif
 }
 
 // pie:instantiate conv_conv3d_bf16
+// pie:instantiate conv_conv3d_flat_bf16 PIE_FLAT=1

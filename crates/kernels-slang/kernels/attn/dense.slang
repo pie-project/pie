@@ -43,8 +43,17 @@ struct Params {
     int num_kv_heads;
     int head_dim;
     float sm_scale;
+    // The key CSR is the query's (self-attention): `kv_segments` is a stand-in.
+    int self_kv;
 };
 PIE_PARAMS(PIE_PARAMS_AT, Params, params);
+
+#ifdef PIE_RAGGED
+// Boundary `i` of the key CSR.
+int kv_seg(uint i) {
+    return params.self_kv != 0 ? segments[i] : kv_segments[i];
+}
+#endif
 
 groupshared float dense_q[PIE_HEAD_DIM_MAX];
 groupshared float dense_fold[PIE_STRIPS][PIE_LANES];
@@ -58,8 +67,8 @@ groupshared int dense_segment;
 #ifdef PIE_CUSTOM
 bool mask_keeps(int seg, int row, int j) {
     uint qo = uint(row - segments[uint(seg)]);
-    uint kv = uint(j - kv_segments[uint(seg)]);
-    uint kv_len = uint(kv_segments[uint(seg) + 1u] - kv_segments[uint(seg)]);
+    uint kv = uint(j - kv_seg(uint(seg)));
+    uint kv_len = uint(kv_seg(uint(seg) + 1u) - kv_seg(uint(seg)));
     uint bit = uint(mask_indptr[uint(seg)]) * 8u + qo * kv_len + kv;
     return ((mask_bits[bit >> 5u] >> (bit & 31u)) & 1u) != 0u;
 }
@@ -93,8 +102,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             }
             seg = lo;
 #ifdef PIE_RAGGED
-            begin = kv_segments[uint(lo)];
-            end = kv_segments[uint(lo + 1)];
+            begin = kv_seg(uint(lo));
+            end = kv_seg(uint(lo + 1));
 #else
             begin = segments[uint(lo)];
             end = segments[uint(lo + 1)];
