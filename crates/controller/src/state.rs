@@ -154,11 +154,12 @@ impl Cluster {
         }
     }
 
-    /// Answers whether the routing table changes: the kv bucket crossed, or
-    /// the worker began or stopped draining.
+    /// Answers whether the routing table changes: the kv bucket crossed, the
+    /// inflight count moved, or the worker began or stopped draining.
     pub fn report(&mut self, id: WorkerId, status: WorkerStatus, now: Instant) -> Option<bool> {
         let w = self.workers.get_mut(&id)?;
-        let bucket_crossed = w.load.kv_pressure_bucket != status.kv_pressure_bucket;
+        let bucket_crossed = w.load.kv_pressure_bucket != status.kv_pressure_bucket
+            || w.load.inflight != status.inflight;
         let drain_changed = w.load.draining != status.draining;
         w.load = status;
         w.last_hb = now;
