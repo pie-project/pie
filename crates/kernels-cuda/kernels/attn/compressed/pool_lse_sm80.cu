@@ -32,7 +32,7 @@ struct PoolShape {
     static constexpr int kKBytes = kPoolKeys * kLd * 2;
     // Q, two key buffers, each warp's partial scores (16 x 16 f32).
     static constexpr int kSBytes = kPoolWarps * kPoolHeads * kPoolKeys * 4;
-    static constexpr int kBytes = kQBytes + 2 * kKBytes + kSBytes;
+    static constexpr int kBytes = 2 * kKBytes + kSBytes;
 };
 
 // `kSelected`: the row's `top_k` ids in `selection`, ended early by a negative
@@ -76,8 +76,8 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
 
     extern __shared__ __align__(16) char smem_raw[];
     bf16* sQ = reinterpret_cast<bf16*>(smem_raw);
-    bf16* sK0 = reinterpret_cast<bf16*>(smem_raw + S::kQBytes);
-    float* sS = reinterpret_cast<float*>(smem_raw + S::kQBytes + 2 * S::kKBytes);
+    bf16* sK0 = reinterpret_cast<bf16*>(smem_raw);
+    float* sS = reinterpret_cast<float*>(smem_raw + 2 * S::kKBytes);
     __shared__ long long s_slot[2][kPoolKeys];
     __shared__ int s_end;
 
@@ -105,6 +105,10 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
         }
         *reinterpret_cast<int4*>(sQ + row * kLd + d) = v;
     }
+    __syncthreads();
+    std::uint32_t qa[kWarpDims / 16][4];
+#pragma unroll
+    for (int i = 0; i < kWarpDims / 16; ++i) ld_a(qa[i], sQ + warp * kWarpDims + i * 16, kLd, lane);
     __syncthreads();
     const int end = num_visible > 0 ? s_end : 0;
 
@@ -159,13 +163,11 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
         float sacc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
 #pragma unroll
         for (int k0 = warp * kWarpDims; k0 < (warp + 1) * kWarpDims; k0 += 16) {
-            std::uint32_t a[4];
-            ld_a(a, sQ + k0, kLd, lane);
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt) {
                 std::uint32_t b[2];
                 ld_b(b, sK + nt * 8 * kLd + k0, kLd, lane);
-                mma_m16n8k16(sacc[nt], a, b);
+                mma_m16n8k16(sacc[nt], qa[(k0 - warp * kWarpDims) / 16], b);
             }
         }
         float* mine = sS + warp * kPoolHeads * kPoolKeys;
