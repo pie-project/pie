@@ -57,6 +57,9 @@ pub struct Layout2d {
     /// The eta VM on the head's VM column (a GRID 0 build with guest4h3's
     /// VM, its limits among the params): sampled iterations take its token.
     pub vm: Option<super::guest4::wafer::VmLayout>,
+    /// serve2d_pipe's `HLM`: the most virtual lanes whose logits rows the
+    /// head keeps.
+    pub hlm: Option<usize>,
 }
 
 fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
@@ -104,6 +107,7 @@ impl Layout2d {
                 mmax: None,
                 host_copy: get("KVCP").unwrap_or(1) == 0,
                 vm: None,
+                hlm: get("HLM"),
             };
             let mut lay = lay;
             if get("GRID").unwrap_or(0) == 1 {
@@ -124,10 +128,12 @@ impl Layout2d {
             } else if get("MMAX").is_some() || lay.host_copy {
                 return Err("MMAX and KVCP 0 are batched (GRID 1) builds' params".into());
             }
-            if lay.paged.is_none() {
+            // The eta VM: a one-sequence build, or serve2d_pipe's (MMAX 1 is
+            // plain batching), whose lanes the VM time-multiplexes.
+            if lay.paged.is_none() || lay.mmax.is_some() {
                 lay.vm = super::guest4::wafer::VmLayout::serve2d(lay.head_x(), &get);
             }
-            if lay.py * lay.hc < lay.hidden || lay.gs == 0 || lay.gx == 0 || lay.vmc > 1 {
+            if lay.py * lay.hc < lay.hidden || lay.gs == 0 || lay.gx == 0 || (lay.vmc > 1 && lay.vm.is_none()) {
                 return Err(format!("serve2d params do not make a layout: {lay:?}"));
             }
             Ok(lay)
@@ -160,7 +166,12 @@ impl Layout2d {
     /// Lanes whose last logits rows the head keeps (`HLB`: the first
     /// micro-batch's first four).
     pub fn logit_lanes(&self) -> usize {
-        self.paged.map_or(1, |s| s.lanes.min(4))
+        self.paged.map_or(1, |s| match self.mmax {
+            // serve2d_pipe: HLB = min(MMAX·B, HLM) virtual lanes (HLM 4
+            // before the build had it, then only micro-batch 0's B).
+            Some(m) => self.hlm.map_or(s.lanes.min(4), |h| (m * s.lanes).min(h)),
+            None => s.lanes.min(4),
+        })
     }
 
     /// The feeder row.
@@ -502,22 +513,22 @@ fn place_paged_layer(
 /// column (if any) after the root column gets zeros; the feeder row holds
 /// the final norm's gamma.
 fn head(lay: &Layout2d, ckpt: &Ckpt, sink: &mut dyn Sink) -> R<()> {
-    let (hh, vr, c_n, hc, f) = (lay.hh, lay.vr, lay.py, lay.hc, lay.feeder());
+    let (hh, vr, hc, f) = (lay.hh, lay.vr, lay.hc, lay.feeder());
     let emb = ckpt.get("model.embed_tokens.weight")?;
     if emb.shape.len() != 2 || emb.shape[1] != lay.hidden {
         return Err(format!("model.embed_tokens.weight is {:?}", emb.shape));
     }
     let hid = lay.hidden;
     let have = emb.shape[0].min(lay.vocab);
-    let cw = c_n + lay.vmc;
     let n = hc * vr + 1;
     let r2x = lay.r2x();
     // Fabric column q of the block -> chunk column (None: the VM column).
+    let vmc = lay.vmc;
     let chunk = |q: usize| -> Option<usize> {
-        if lay.vmc == 1 && q == r2x + 1 {
+        if q > r2x && q <= r2x + vmc {
             None
-        } else if lay.vmc == 1 && q > r2x + 1 {
-            Some(q - 1)
+        } else if q > r2x + vmc {
+            Some(q - vmc)
         } else {
             Some(q)
         }
@@ -525,11 +536,10 @@ fn head(lay: &Layout2d, ckpt: &Ckpt, sink: &mut dyn Sink) -> R<()> {
     // The fabric column runs the head's tiles go to: on a VM build not its
     // VM column (the VM's program exports 1-word `wt`/`gam` dummies a tile
     // would run over), so the chunk columns either side of it.
-    let segments: Vec<std::ops::Range<usize>> = if lay.vm.is_some() {
-        vec![0..r2x + 1, r2x + 2..cw]
-    } else {
-        vec![0..cw]
-    };
+    let segments = head_runs(lay);
+    for qs in &segments {
+        check_head_columns(lay, "wt", qs.clone())?;
+    }
     let tile_rows = |rows: std::ops::Range<usize>, qs: std::ops::Range<usize>| -> Vec<f32> {
         let w = qs.len();
         let mut t = vec![0f32; rows.len() * w * n];
@@ -673,6 +683,19 @@ pub fn fire(
     steps: usize,
     want_logits: bool,
 ) -> R<(Vec<Vec<u32>>, Vec<Vec<f32>>)> {
+    fire_lanes(lay, rt, lanes, steps, want_logits, None)
+}
+
+/// [`fire`] on a VM build, `vm_lanes[v]` 1 for each virtual lane the VM
+/// samples (`None`: none; the head's argmax every lane).
+pub fn fire_lanes(
+    lay: &Layout2d,
+    rt: &mut Runtime,
+    lanes: &[BatchLane],
+    steps: usize,
+    want_logits: bool,
+    vm_lanes: Option<&[u32]>,
+) -> R<(Vec<Vec<u32>>, Vec<Vec<f32>>)> {
     let shape = lay.paged.ok_or("a batched launch on a one-sequence build")?;
     let b_n = shape.lanes;
     let most = lay.launch_lanes();
@@ -714,9 +737,23 @@ pub fn fire(
         Some(_) => {
             let mtab = pipe_tables(lay, &mbs.iter().map(|mb| table_of(mb)).collect::<R<Vec<_>>>()?);
             let n = slots * shape.row_words();
-            let feeders = rect(lay.head_x(), lay.feeder(), lay.py + lay.vmc, 1);
-            rt.memcpy_h2d(SYM.ring_table, &mtab, feeders, n, Order::RowMajor, DataType::Bits32)
-                .map_err(e)?;
+            head_h2d(lay, rt, SYM.ring_table, &mtab, lay.feeder(), 1, n)?;
+            if lay.vm.is_some() {
+                // The VM's per-lane control, every launch: (gmode_l, the
+                // lane's forced prefix) a virtual lane m·B + b.
+                let mut control = vec![0u32; slots * b_n * 2];
+                for (m, mb) in mbs.iter().enumerate() {
+                    for b in 0..b_n {
+                        let lane = mb.get(b).unwrap_or(&mb[0]);
+                        let v = m * b_n + b;
+                        control[v * 2] = vm_lanes.and_then(|g| g.get(v).copied()).unwrap_or(0);
+                        control[v * 2 + 1] = lane.forced.len() as u32;
+                    }
+                }
+                let per_row: Vec<u32> = (0..lay.py + lay.vmc).flat_map(|_| control.iter().copied()).collect();
+                let all: Vec<u32> = (0..=lay.hh).flat_map(|_| per_row.iter().copied()).collect();
+                head_h2d(lay, rt, SYM.vm_lanes, &all, 0, lay.hh + 1, control.len())?;
+            }
         }
     }
     let mut inn = vec![SAMPLE; slots * b_n * lay.cap];
@@ -752,6 +789,52 @@ pub fn fire(
     Ok((tokens, logits))
 }
 
+/// The head's chunk columns as runs of head columns (fabric x - head_x):
+/// a VM build's VM columns R2X+1 .. R2X+VMC run the VM's program, where the
+/// head's names (`mtab`, `vmlane`, `wt`, `gam`, ...) are one-word dummies an
+/// n-word write would run over, so the runs either side of them.
+pub fn head_runs(lay: &Layout2d) -> Vec<std::ops::Range<usize>> {
+    let cw = lay.py + lay.vmc;
+    let runs = if lay.vm.is_some() {
+        vec![0..lay.r2x() + 1, lay.r2x() + 1 + lay.vmc..cw]
+    } else {
+        vec![0..cw]
+    };
+    runs.into_iter().filter(|r| !r.is_empty()).collect()
+}
+
+/// Refuses a write of head-only `symbol` whose rectangle (head columns
+/// `cols`) covers a VM column: the bug class that overran the VM PEs (head
+/// weights, `mtab`) on the simulator.
+pub fn check_head_columns(lay: &Layout2d, symbol: &str, cols: std::ops::Range<usize>) -> R<()> {
+    if lay.vm.is_some() {
+        let vm = lay.r2x() + 1..lay.r2x() + 1 + lay.vmc;
+        if cols.start < vm.end && vm.start < cols.end {
+            return Err(format!(
+                "`{symbol}` is a head symbol: head columns {cols:?} cover the VM columns {vm:?}, where it is a \
+                 one-word dummy"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `data` (`per_col` words for each head column c of rows `y0..y0+h`, laid
+/// out row by row over all C + VMC head columns, n words a PE) written to
+/// the head's chunk columns only ([`head_runs`]).
+fn head_h2d(lay: &Layout2d, rt: &mut Runtime, symbol: &str, data: &[u32], y0: usize, h: usize, n: usize) -> R<()> {
+    let cw = lay.py + lay.vmc;
+    for cols in head_runs(lay) {
+        check_head_columns(lay, symbol, cols.clone())?;
+        let words: Vec<u32> = (0..h)
+            .flat_map(|row| data[(row * cw + cols.start) * n..(row * cw + cols.end) * n].iter().copied())
+            .collect();
+        rt.memcpy_h2d(symbol, &words, rect(lay.head_x() + cols.start, y0, cols.len(), h), n, Order::RowMajor, DataType::Bits32)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// The ring's `mtab` over the head's feeder row: feeder of chunk j (column
 /// j, the VM column after the root zero) holds per micro-batch slot m
 /// row j of micro-batch m's table (`tables[m]`, unused slots zero).
@@ -766,8 +849,8 @@ fn pipe_tables(lay: &Layout2d, tables: &[Vec<u32>]) -> Vec<u32> {
                 None => mtab.extend(std::iter::repeat_n(0, w)),
             }
         }
-        if c == lay.r2x() && lay.vmc > 0 {
-            mtab.extend(std::iter::repeat_n(0, slots * w));
+        if c == lay.r2x() {
+            mtab.extend(std::iter::repeat_n(0, lay.vmc * slots * w));
         }
     }
     mtab
@@ -776,7 +859,7 @@ fn pipe_tables(lay: &Layout2d, tables: &[Vec<u32>]) -> Vec<u32> {
 /// The last pass's logits rows of lanes `0..lanes` (at most HLB): the root
 /// column's `hlogits` (region row r, lane b at words `(r * HLB + b) * Vr`,
 /// rows in vocab order) x `yscale[b]`.
-fn logits_rows(lay: &Layout2d, rt: &mut Runtime, lanes: usize) -> R<Vec<Vec<f32>>> {
+pub fn logits_rows(lay: &Layout2d, rt: &mut Runtime, lanes: usize) -> R<Vec<Vec<f32>>> {
     let e = |e: crate::sdk::Error| e.to_string();
     let (rx, _) = lay.root();
     let (f, hh, vr, hlb) = (lay.feeder(), lay.hh, lay.vr, lay.logit_lanes());
@@ -837,6 +920,24 @@ mod tests {
         Layout2d::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1))
             .expect("serve2d params")
             .expect("a layout")
+    }
+
+    #[test]
+    fn head_writes_stay_off_the_vm_columns() {
+        let params = [
+            ("PX", 4), ("PY", 4), ("Hc", 16), ("HR", 64), ("Dc", 8), ("Gs", 4), ("Qh", 2),
+            ("Ic", 16), ("Tc", 1), ("W16", 0), ("KV16", 0), ("WF32", 1), ("GRID", 1),
+            ("HEADMODE", 2), ("B", 2), ("PS", 16), ("NB", 2), ("E", 2), ("MMAX", 2), ("GW", 2),
+            ("GH", 4), ("HH", 16), ("Vr", 32), ("Gx", 4), ("VMC", 1), ("vocab", 250), ("CAP", 8),
+            ("VM", 1), ("max_ops", 48), ("nreg", 6), ("pool_words", 64), ("feat", 99),
+        ];
+        let lay = Layout2d::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1)).unwrap().unwrap();
+        assert!(lay.vm.is_some());
+        // The old `mtab` rectangle, every head column: it covers the VM column 3.
+        assert!(check_head_columns(&lay, "mtab", 0..lay.py + lay.vmc).unwrap_err().contains("VM columns"));
+        // The chunk columns either side of it.
+        assert_eq!(head_runs(&lay), vec![0..3, 4..5]);
+        assert!(head_runs(&lay).into_iter().all(|r| check_head_columns(&lay, "mtab", r).is_ok()));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! The VM on the head's VM columns (`spatial/eta/CONTRACT.md` section 6,
-//! `payload/guest4h*`): one VM column after each head block's root column,
-//! the lane the NB·H VM PEs (block b's row ry: vocabulary rows
-//! `(b·H + ry)·Vr ..`), the feeder row F a hub that holds none.
+//! `payload/guest4h*`, serve2d's `VM` 1): `cols` VM columns after each head
+//! block's root column, the lane the VM PEs (block b's row ry, column j:
+//! lane position `(b·H + ry)·cols + j`, vocabulary rows `position·Vt ..`),
+//! the feeder row F a hub that holds none.
 //!
 //! The host's side, as `guest4h3/run.py` drives it: a program's table
 //! (packed four words an instruction), its pool and wide homes' seeds, the
@@ -25,11 +26,13 @@ pub struct VmLayout {
     pub x0: usize,
     /// Head blocks (the head's width over C + 1).
     pub blocks: usize,
-    /// Region rows a block (H); the VM column is H + 1 high (the hub at F).
+    /// Region rows a block (H); a VM column is H + 1 high (the hub at F).
     pub rows: usize,
-    /// Vocabulary rows a lane PE (Vr): a wide register's length.
+    /// VM columns a block (`VMC`): the head's Vr rows split `cols` ways.
+    pub cols: usize,
+    /// Vocabulary rows a VM PE (Vt = Vr / cols): a wide register's length.
     pub vr: usize,
-    /// A block's columns (C + VMC) and its root column (R2X).
+    /// A block's columns (C + cols) and its root column (R2X).
     pub block_cols: usize,
     pub root: usize,
     /// The feeder row (H / 2).
@@ -66,6 +69,7 @@ impl VmLayout {
             x0: 0,
             blocks: w / (c + 1),
             rows: get("H")?,
+            cols: 1,
             vr: get("Vr")?,
             block_cols: c + 1,
             root: (ngx / 2) * gx + gx / 2,
@@ -78,13 +82,14 @@ impl VmLayout {
         })
     }
 
-    /// serve2d's head (one block of `C` = PY columns at `x0`, `HH` region
-    /// rows) when its build carries the VM (`VM` 1, `VMC` 1 and the VM
-    /// limits among its params).
+    /// serve2d's (or serve2d_pipe's) head (one block of `C` = PY columns at
+    /// `x0`, `HH` region rows) when its build carries the VM (`VM` 1 and the
+    /// VM limits among its params) on its `VMC` = Vr / 32 VM columns.
     pub fn serve2d(x0: usize, get: impl Fn(&str) -> Option<usize>) -> Option<VmLayout> {
-        // `VM` 1: the VM's program on the VM column (`VMC` alone leaves it
-        // a filler).
-        if get("VM")? != 1 || get("VMC")? != 1 {
+        // `VM` 1: the VM's program on the VM columns (`VMC` alone leaves
+        // them fillers).
+        let cols = get("VMC")?;
+        if get("VM")? != 1 || cols == 0 || get("Vr")? % cols != 0 {
             return None;
         }
         let (c, gx, hh) = (get("PY")?, get("Gx")?, get("HH")?);
@@ -93,8 +98,9 @@ impl VmLayout {
             x0,
             blocks: 1,
             rows: hh,
-            vr: get("Vr")?,
-            block_cols: c + 1,
+            cols,
+            vr: get("Vr")? / cols,
+            block_cols: c + cols,
             root: (ngx / 2) * gx + gx / 2,
             feeder: hh / 2,
             max_ops: get("max_ops")?,
@@ -105,9 +111,34 @@ impl VmLayout {
         })
     }
 
-    /// Block b's VM column.
+    /// Block b's VM column j.
+    pub fn column_j(&self, b: usize, j: usize) -> usize {
+        self.x0 + b * self.block_cols + self.root + 1 + j
+    }
+
+    /// Block b's first VM column.
     pub fn column(&self, b: usize) -> usize {
-        self.x0 + b * self.block_cols + self.root + 1
+        self.column_j(b, 0)
+    }
+
+    /// Every VM column, with its block and its index in the block.
+    pub fn columns(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        (0..self.blocks).flat_map(move |b| (0..self.cols).map(move |j| (b, j, self.column_j(b, j))))
+    }
+
+    /// The lane position (a vocabulary slice of Vt rows) of VM PE row `pe`
+    /// of block b's VM column j; `None` on the hub.
+    pub fn position(&self, b: usize, j: usize, pe: usize) -> Option<usize> {
+        if pe == self.feeder {
+            return None;
+        }
+        let ry = if pe < self.feeder { pe } else { pe - 1 };
+        Some((b * self.rows + ry) * self.cols + j)
+    }
+
+    /// Lane positions in all (Vt vocabulary rows each).
+    pub fn positions(&self) -> usize {
+        self.blocks * self.rows * self.cols
     }
 
     /// The head's PEs (every block's columns, its region rows and the
@@ -193,7 +224,7 @@ impl Seed {
 /// seeds make.
 fn seed_images(lay: &VmLayout, seeds: &[Seed]) -> R<(Vec<u32>, Vec<f32>)> {
     use eta_ir::Dtype;
-    let lanes = lay.blocks * lay.rows;
+    let lanes = lay.positions();
     let mut pool = vec![0u32; lay.pool_words];
     let mut wide = vec![0f32; lanes * lay.nreg * lay.vr];
     for seed in seeds {
@@ -234,21 +265,21 @@ pub fn load(rt: &mut Runtime, lay: &VmLayout, table: &Table, seeds: &[Seed]) -> 
     let nv = lay.rows + 1;
     let tile = |words: &[u32]| -> Vec<u32> { (0..nv).flat_map(|_| words.iter().copied()).collect() };
     let b32 = DataType::Bits32;
-    for b in 0..lay.blocks {
-        let col = rect(lay.column(b), 0, 1, nv);
+    for (b, j, x) in lay.columns() {
+        let col = rect(x, 0, 1, nv);
         rt.memcpy_h2d("gops", &tile(&ops), col, ops.len(), Order::RowMajor, b32).map_err(e)?;
         rt.memcpy_h2d("gpool", &tile(&pool), col, pool.len(), Order::RowMajor, b32).map_err(e)?;
         rt.memcpy_h2d("gvalid", &vec![lay.vocab as u32; nv], col, 1, Order::RowMajor, b32).map_err(e)?;
         rt.memcpy_h2d("gtok_home", &vec![tok_home; nv], col, 1, Order::RowMajor, b32).map_err(e)?;
         rt.memcpy_h2d("gostep", &vec![0; nv], col, 1, Order::RowMajor, b32).map_err(e)?;
-        // Region rows are lane positions b·H + ry; the hub (row F) holds none.
+        // Region rows hold lane positions; the hub (row F) holds none.
         let per = lay.nreg * lay.vr;
         let mut w = vec![0u32; nv * per];
-        for ry in 0..lay.rows {
-            let pe = if ry < lay.feeder { ry } else { ry + 1 };
-            let lane = b * lay.rows + ry;
-            for k in 0..per {
-                w[pe * per + k] = wide[lane * per + k].to_bits();
+        for pe in 0..nv {
+            if let Some(lane) = lay.position(b, j, pe) {
+                for k in 0..per {
+                    w[pe * per + k] = wide[lane * per + k].to_bits();
+                }
             }
         }
         rt.memcpy_h2d("gwide", &w, col, per, Order::RowMajor, b32).map_err(e)?;
@@ -306,18 +337,17 @@ pub fn read_out(rt: &mut Runtime, lay: &VmLayout, ring: Ring, first: u64, steps:
 pub fn bank_images(lay: &VmLayout, seeds: &[Vec<Seed>]) -> R<Vec<Vec<u32>>> {
     let (nv, wide_n) = (lay.rows + 1, (lay.nreg - 1) * lay.vr);
     let bank = lay.pool_words + wide_n;
-    let mut columns = vec![vec![0u32; nv * seeds.len() * bank]; lay.blocks];
+    let cols: Vec<(usize, usize, usize)> = lay.columns().collect();
+    let mut columns = vec![vec![0u32; nv * seeds.len() * bank]; cols.len()];
     for (l, lane_seeds) in seeds.iter().enumerate() {
         let (pool, wide) = seed_images(lay, lane_seeds)?;
-        for (b, column) in columns.iter_mut().enumerate() {
+        for (column, &(b, j, _)) in columns.iter_mut().zip(&cols) {
             for pe in 0..nv {
                 let at = (pe * seeds.len() + l) * bank;
                 column[at..at + lay.pool_words].copy_from_slice(&pool);
-                if pe == lay.feeder {
+                let Some(lane) = lay.position(b, j, pe) else {
                     continue;
-                }
-                let ry = if pe < lay.feeder { pe } else { pe - 1 };
-                let lane = b * lay.rows + ry;
+                };
                 // W0 holds the logits; the bank keeps W1 on.
                 for r in 1..lay.nreg {
                     for j in 0..lay.vr {
@@ -335,19 +365,105 @@ pub fn bank_images(lay: &VmLayout, seeds: &[Vec<Seed>]) -> R<Vec<Vec<u32>>> {
 /// (block by block, region rows in order, the hub skipped), vocabulary order.
 pub fn read_plane(rt: &mut Runtime, lay: &VmLayout) -> R<Vec<f32>> {
     let (nv, w) = (lay.rows + 1, lay.vr + 1);
-    let mut plane = Vec::with_capacity(lay.blocks * lay.rows * lay.vr);
-    for b in 0..lay.blocks {
+    let mut plane = vec![0f32; lay.positions() * lay.vr];
+    for (b, j, x) in lay.columns() {
         let mut vin = vec![0u32; nv * w];
-        rt.memcpy_d2h("vin", &mut vin, rect(lay.column(b), 0, 1, nv), w, Order::RowMajor, DataType::Bits32)
+        rt.memcpy_d2h("vin", &mut vin, rect(x, 0, 1, nv), w, Order::RowMajor, DataType::Bits32)
             .map_err(|e| e.to_string())?;
-        for pe in (0..nv).filter(|&pe| pe != lay.feeder) {
+        for pe in 0..nv {
+            let Some(lane) = lay.position(b, j, pe) else {
+                continue;
+            };
             let row = &vin[pe * w..(pe + 1) * w];
             let scale = f32::from_bits(row[lay.vr]);
-            plane.extend(row[..lay.vr].iter().map(|&v| f32::from_bits(v) * scale));
+            for (k, &v) in row[..lay.vr].iter().enumerate() {
+                plane[lane * lay.vr + k] = f32::from_bits(v) * scale;
+            }
         }
     }
     plane.truncate(lay.vocab);
     Ok(plane)
+}
+
+/// Writes every lane's bank ([`bank_images`]) to `gbank` on every VM PE:
+/// the lanes' carried state before a launch (a request starting in lane l,
+/// or all lanes at once).
+pub fn write_banks(rt: &mut Runtime, lay: &VmLayout, seeds: &[Vec<Seed>]) -> R<()> {
+    let images = bank_images(lay, seeds)?;
+    let nv = lay.rows + 1;
+    let per = images.first().map_or(0, |c| c.len() / nv);
+    for (image, (_, _, x)) in images.iter().zip(lay.columns()) {
+        rt.memcpy_h2d("gbank", image, rect(x, 0, 1, nv), per, Order::RowMajor, DataType::Bits32)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// `gbank` as it stands on every VM column (rows 0..=H, each row's `lanes`
+/// banks), for a read-modify-write of some lanes' banks.
+pub fn read_banks(rt: &mut Runtime, lay: &VmLayout, lanes: usize) -> R<Vec<Vec<u32>>> {
+    let nv = lay.rows + 1;
+    let per = lanes * (lay.pool_words + (lay.nreg - 1) * lay.vr);
+    lay.columns()
+        .map(|(_, _, x)| {
+            let mut words = vec![0u32; nv * per];
+            rt.memcpy_d2h("gbank", &mut words, rect(x, 0, 1, nv), per, Order::RowMajor, DataType::Bits32)
+                .map_err(|e| e.to_string())?;
+            Ok(words)
+        })
+        .collect()
+}
+
+/// [`read_banks`]' images back to `gbank`.
+pub fn write_bank_images(rt: &mut Runtime, lay: &VmLayout, images: &[Vec<u32>]) -> R<()> {
+    let nv = lay.rows + 1;
+    for (image, (_, _, x)) in images.iter().zip(lay.columns()) {
+        rt.memcpy_h2d("gbank", image, rect(x, 0, 1, nv), image.len() / nv, Order::RowMajor, DataType::Bits32)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Copies lane `lane`'s bank (of `lanes`) from `from` into `into`, column
+/// by column ([`read_banks`]' layout).
+pub fn copy_bank(lay: &VmLayout, lanes: usize, lane: usize, from: &[Vec<u32>], into: &mut [Vec<u32>]) {
+    let bank = lay.pool_words + (lay.nreg - 1) * lay.vr;
+    for (src, dst) in from.iter().zip(into.iter_mut()) {
+        for pe in 0..=lay.rows {
+            let at = (pe * lanes + lane) * bank;
+            dst[at..at + bank].copy_from_slice(&src[at..at + bank]);
+        }
+    }
+}
+
+/// Every lane's pool part of its bank (`lanes` banks), read at block 0's
+/// hub: after a launch, each lane's pool homes (its next token's among
+/// them) as its last turn left them.
+pub fn read_bank_pools(rt: &mut Runtime, lay: &VmLayout, lanes: usize) -> R<Vec<Vec<u32>>> {
+    let bank = lay.pool_words + (lay.nreg - 1) * lay.vr;
+    let mut words = vec![0u32; lanes * bank];
+    let (x, y) = lay.hub();
+    rt.memcpy_d2h("gbank", &mut words, rect(x, y, 1, 1), lanes * bank, Order::RowMajor, DataType::Bits32)
+        .map_err(|e| e.to_string())?;
+    Ok(words.chunks(bank).map(|b| b[..lay.pool_words].to_vec()).collect())
+}
+
+/// Each lane's out-ring row for lap `lap` of a multi-lane VM (lane l's step
+/// s at row (s·L + l) % D), padded to the 16 words a step's `out` has.
+pub fn read_out_lanes(rt: &mut Runtime, lay: &VmLayout, ring: Ring, lap: u64) -> R<Vec<Vec<u32>>> {
+    let n = (ring.depth * ring.width) as usize;
+    let mut words = vec![0u32; n];
+    let (x, y) = lay.hub();
+    rt.memcpy_d2h("gout", &mut words, rect(x, y, 1, 1), n, Order::RowMajor, DataType::Bits32)
+        .map_err(|e| e.to_string())?;
+    Ok((0..ring.lanes)
+        .map(|l| {
+            let at = ring.index_lane(lap, l, 0);
+            let mut row = words[at..at + ring.width as usize].to_vec();
+            row.resize(OUT_WORDS as usize, 0);
+            row
+        })
+        .collect())
 }
 
 fn dtype_of(s: &str) -> eta_ir::Dtype {
@@ -433,7 +549,7 @@ mod tests {
         let lay = VmLayout::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1)).unwrap();
         // 16 blocks of 33 columns, the root at 20 (run.py's R2X), the VM after it.
         assert_eq!((lay.blocks, lay.root, lay.column(1), lay.feeder), (16, 20, 54, 150));
-        assert!(lay.blocks * lay.rows * lay.vr >= lay.vocab);
+        assert!(lay.positions() * lay.vr >= lay.vocab);
     }
 
     #[test]
@@ -456,6 +572,21 @@ mod tests {
         assert_eq!(bank(0, 1), [0, 11, 0, 0, f(1), f(2)]);
         assert_eq!(bank(1, 0), [0, 10, 0, 0, 0, 0]);
         assert_eq!(bank(2, 0), [0, 10, 0, 0, f(2), f(3)]);
+    }
+
+    #[test]
+    fn serve2d_vm_columns_split_the_head_s_rows() {
+        // serve2d_pipe's VM at full size: Vr 192 over VMC 6 columns of 32.
+        let params = [
+            ("VM", 1), ("VMC", 6), ("PY", 128), ("Gx", 16), ("HH", 792), ("Vr", 192),
+            ("max_ops", 48), ("nreg", 6), ("pool_words", 64), ("feat", 99), ("vocab", 151_936),
+        ];
+        let lay = VmLayout::serve2d(512, |k| params.iter().find(|p| p.0 == k).map(|p| p.1)).unwrap();
+        // R2X 72: the VM columns 512 + 73 .. 512 + 78; the head 128 + 6 wide.
+        assert_eq!((lay.vr, lay.column_j(0, 5), lay.head().w), (32, 590, 134));
+        // Region row 2's column 3 holds vocabulary rows (2·6 + 3)·32 ..; the hub none.
+        assert_eq!((lay.position(0, 3, 2), lay.position(0, 0, 396)), (Some(15), None));
+        assert!(lay.positions() * lay.vr >= lay.vocab);
     }
 
     #[test]

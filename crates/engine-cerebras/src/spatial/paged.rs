@@ -141,6 +141,9 @@ pub struct Symbols {
     pub table: &'static str,
     /// The ring's per-micro-batch tables at the head's feeders (serve2d_pipe).
     pub ring_table: &'static str,
+    /// The VM's per-lane control (serve2d_pipe `VM` 1): (gmode_l, forced
+    /// prefix) a virtual lane.
+    pub vm_lanes: &'static str,
     /// Forced tokens `[B][CAP]` and every step's token `[B][CAP]`, at the
     /// head's final root.
     pub in_tokens: &'static str,
@@ -165,6 +168,7 @@ pub struct Symbols {
 pub const SYMBOLS: Symbols = Symbols {
     table: "tab",
     ring_table: "mtab",
+    vm_lanes: "vmlane",
     in_tokens: "in_tokens",
     out_tokens: "out_tokens",
     compute: "compute",
