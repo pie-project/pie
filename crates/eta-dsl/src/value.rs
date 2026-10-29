@@ -333,15 +333,15 @@ macro_rules! num_const {
                 ConstData {
                     shape: Shape::SCALAR,
                     dtype: $dt,
-                    bytes: scalar_bytes_of(self as f64, $dt),
+                    bytes: self.to_le_bytes().to_vec(),
                 }
             }
         }
         impl IntoConst for &[$t] {
             fn into_const(self) -> ConstData {
-                let mut bytes = Vec::new();
+                let mut bytes = Vec::with_capacity(self.len() * core::mem::size_of::<$t>());
                 for &x in self {
-                    bytes.extend_from_slice(&scalar_bytes_of(x as f64, $dt));
+                    bytes.extend_from_slice(&x.to_le_bytes());
                 }
                 ConstData {
                     shape: Shape::vector(self.len() as u32),
