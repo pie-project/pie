@@ -263,7 +263,7 @@ pub fn select_bf16_held(
         tiled,
         tiles,
         ksplit,
-        order,
+        mut order,
     } = select_plan(
         ctx,
         op,
@@ -284,14 +284,18 @@ pub fn select_bf16_held(
         const WN: u32 = 2;
         let cols = if glu.is_some() { 64 } else { 128 };
         let cols_fast = u64::from(x.rows) * u64::from(x.width) * 2 > COLS_FAST_FROM;
+        let bm: u32 = if fan.route_count.div_ceil(experts) >= 128 { 128 } else { 64 };
+        if bm != 64 {
+            order = route_order_sliced(ctx, op, routes, &fan, experts, bm, true, Share::No)?;
+        }
         let (gx, gy) = (order.work_cap, y.width.div_ceil(cols));
         Fire::at(kernel(
             SELECT_SM80,
-            &format!("::pie::linear::moe_select_bf16_gemm<{STAGES}, {code}, {WN}, {cols_fast}>"),
+            &format!("::pie::linear::moe_select_bf16_gemm<{STAGES}, {code}, {WN}, {cols_fast}, {bm}>"),
         ))
         .apply(
-            Launch::grid(if cols_fast { [gy, gx, 1] } else { [gx, gy, 1] }, [64 * WN, 1, 1])
-                .smem(STAGES * (64 + 128) * 128),
+            Launch::grid(if cols_fast { [gy, gx, 1] } else { [gx, gy, 1] }, [bm * WN, 1, 1])
+                .smem(STAGES * (bm + 128) * 128),
         )
     } else {
         let cols = if glu.is_some() { 64 } else { 64 * tiles };
