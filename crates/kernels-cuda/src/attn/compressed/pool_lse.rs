@@ -40,7 +40,7 @@ pub(crate) fn pool_mma(
     const WARPS: u32 = 4;
     let d = head_dim.unsigned_abs();
     let ld = d + 8;
-    let smem = HEADS * ld * 2 + 2 * KEYS * ld * 2 + WARPS * HEADS * KEYS * 4;
+    let smem = 2 * KEYS * ld * 2 + WARPS * HEADS * KEYS * 4;
     let selected = selection.is_some();
     ctx.fire(
         op,
