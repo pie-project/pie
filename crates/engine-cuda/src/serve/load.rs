@@ -1061,7 +1061,7 @@ impl Shell {
         // A guest program's epilogue launches a block a lane, so a flight
         // past the card's SMs runs in waves anyway: a wider group flies in
         // several, and its scratch is held at this width, not at the lanes.
-        let flight = shell.device.device().num_sm;
+        let flight = 1 << shell.device.device().num_sm.max(1).ilog2();
         shell.programs.set_flight(flight);
         let programs = crate::store::program_scratch_reserve(
             boot.budget.max_lanes.min(flight),
