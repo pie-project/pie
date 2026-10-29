@@ -139,6 +139,8 @@ pub fn table(shape: &Shape, lanes: &[Lane], steps: u32) -> R<Vec<u32>> {
 pub struct Symbols {
     /// The per-pass table, on every PE of a grid (rows broadcast).
     pub table: &'static str,
+    /// The ring's per-micro-batch tables at the head's feeders (serve2d_pipe).
+    pub ring_table: &'static str,
     /// Forced tokens `[B][CAP]` and every step's token `[B][CAP]`, at the
     /// head's final root.
     pub in_tokens: &'static str,
@@ -147,18 +149,37 @@ pub struct Symbols {
     pub compute: &'static str,
     pub copy_page: &'static str,
     pub copy_move: &'static str,
+    /// The head's last logits rows, before 1/rms: serve2d's one sequence
+    /// (`logits`), and the strip head's or a batched head's lanes
+    /// (`logit_lanes`); each lane's 1/rms (`yscale`).
+    pub logits: &'static str,
+    pub logit_lanes: &'static str,
+    pub yscale: &'static str,
+    /// Every layer grid's K and V pools.
+    pub kc: &'static str,
+    pub vc: &'static str,
 }
+
+/// The wafer programs' runtime symbols (their placement symbols stay with
+/// the placement that writes them).
+pub const SYMBOLS: Symbols = Symbols {
+    table: "tab",
+    ring_table: "mtab",
+    in_tokens: "in_tokens",
+    out_tokens: "out_tokens",
+    compute: "compute",
+    copy_page: "copy_page",
+    copy_move: "copy_move",
+    logits: "y",
+    logit_lanes: "hlogits",
+    yscale: "yscale",
+    kc: "kc",
+    vc: "vc",
+};
 
 impl Default for Symbols {
     fn default() -> Symbols {
-        Symbols {
-            table: "tab",
-            in_tokens: "in_tokens",
-            out_tokens: "out_tokens",
-            compute: "compute",
-            copy_page: "copy_page",
-            copy_move: "copy_move",
-        }
+        SYMBOLS
     }
 }
 
@@ -247,7 +268,7 @@ pub fn copy_pages_host(rt: &mut Runtime, pool: &HostPool, pairs: &[(u32, u32)]) 
                 w: pool.cols as i32,
                 h: 1,
             };
-            for sym in ["kc", "vc"] {
+            for sym in [SYMBOLS.kc, SYMBOLS.vc] {
                 let mut a = vec![0u32; pool.cols * len];
                 rt.memcpy_d2h(sym, &mut a, row(rs), len, Order::RowMajor, pool.data_type)
                     .map_err(e)?;

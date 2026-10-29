@@ -603,11 +603,17 @@ impl Runtime {
                 actual: data.len(),
             });
         }
+        let rowbcast = self.api().memcpy_h2d_rowbcast.ok_or_else(|| {
+            Error::MissingSymbol(
+                "cerebras::SdkRuntime::memcpy_h2d_rowbcast".into(),
+                "this SDK has no row-broadcast copy (the batched builds' tables need it)".into(),
+            )
+        })?;
         let opts = MemcpyOptions::new(false, data_type as i32, Order::RowMajor as i32, false);
         let mut task = Task::empty();
         // SAFETY: data outlives the blocking copy; the SDK only reads it.
         unsafe {
-            (self.api().memcpy_h2d_rowbcast)(
+            (rowbcast)(
                 &mut task,
                 self.this(),
                 id,

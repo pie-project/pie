@@ -17,6 +17,7 @@
 //! feeder row skipped) times `yscale`, the final RMSNorm's 1/rms of the step.
 
 use super::ckpt::{Ckpt, Tensor};
+use super::paged::SYMBOLS as SYM;
 use super::wafer::{SAMPLE, Sink};
 use crate::sdk::{DataType, Order, Rect, Runtime};
 
@@ -583,16 +584,16 @@ pub fn run(
     let one = rect(rx, ry, 1, 1);
     let mut inn = vec![SAMPLE; lay.cap];
     inn[..forced.len()].copy_from_slice(forced);
-    rt.memcpy_h2d_nonblock("in_tokens", inn, one, lay.cap, Order::RowMajor, DataType::Bits32)
+    rt.memcpy_h2d_nonblock(SYM.in_tokens, inn, one, lay.cap, Order::RowMajor, DataType::Bits32)
         .map_err(e)?;
-    rt.launch_nonblock("compute", &[steps as u32, start as u32])
+    rt.launch_nonblock(SYM.compute, &[steps as u32, start as u32])
         .map_err(e)?;
     let mut out = vec![0u32; lay.cap];
-    let read = rt.memcpy_d2h("out_tokens", &mut out, one, lay.cap, Order::RowMajor, DataType::Bits32);
+    let read = rt.memcpy_d2h(SYM.out_tokens, &mut out, one, lay.cap, Order::RowMajor, DataType::Bits32);
     rt.wait_pending();
     read.map_err(e)?;
     let y = if want_logits {
-        if rt.rpc().get("yscale").is_err() {
+        if rt.rpc().get(SYM.yscale).is_err() {
             return Err(
                 "this serve2d build exports no `yscale` (the final norm's 1/rms): its `y` \
                  is not the logits; it serves greedy (token-loop) epilogues only"
@@ -600,15 +601,15 @@ pub fn run(
             );
         }
         let mut scale = [0u32; 1];
-        rt.memcpy_d2h("yscale", &mut scale, rect(rx, 0, 1, 1), 1, Order::RowMajor, DataType::Bits32)
+        rt.memcpy_d2h(SYM.yscale, &mut scale, rect(rx, 0, 1, 1), 1, Order::RowMajor, DataType::Bits32)
             .map_err(e)?;
         let scale = f32::from_bits(scale[0]);
         let (f, hh, vr) = (lay.feeder(), lay.hh, lay.vr);
         let mut a = vec![0u32; f * vr];
-        rt.memcpy_d2h("y", &mut a, rect(rx, 0, 1, f), vr, Order::RowMajor, DataType::Bits32)
+        rt.memcpy_d2h(SYM.logits, &mut a, rect(rx, 0, 1, f), vr, Order::RowMajor, DataType::Bits32)
             .map_err(e)?;
         let mut b = vec![0u32; (hh - f) * vr];
-        rt.memcpy_d2h("y", &mut b, rect(rx, f + 1, 1, hh - f), vr, Order::RowMajor, DataType::Bits32)
+        rt.memcpy_d2h(SYM.logits, &mut b, rect(rx, f + 1, 1, hh - f), vr, Order::RowMajor, DataType::Bits32)
             .map_err(e)?;
         Some(
             a.into_iter()
@@ -685,14 +686,14 @@ pub fn fire(
             // Every fabric row of the grids: its grid row's table row.
             let all: Vec<u32> = (0..lay.gh).flat_map(|_| tab.iter().copied()).collect();
             let grids = rect(0, 0, lay.gw * lay.px, lay.gh * lay.py);
-            rt.memcpy_h2d_rowbcast("tab", &all, grids, shape.row_words(), DataType::Bits32)
+            rt.memcpy_h2d_rowbcast(SYM.table, &all, grids, shape.row_words(), DataType::Bits32)
                 .map_err(e)?;
         }
         Some(_) => {
             let mtab = pipe_tables(lay, &mbs.iter().map(|mb| table_of(mb)).collect::<R<Vec<_>>>()?);
             let n = slots * shape.row_words();
             let feeders = rect(lay.head_x(), lay.feeder(), lay.py + lay.vmc, 1);
-            rt.memcpy_h2d("mtab", &mtab, feeders, n, Order::RowMajor, DataType::Bits32)
+            rt.memcpy_h2d(SYM.ring_table, &mtab, feeders, n, Order::RowMajor, DataType::Bits32)
                 .map_err(e)?;
         }
     }
@@ -707,14 +708,14 @@ pub fn fire(
     let (rx, ry) = lay.root();
     let one = rect(rx, ry, 1, 1);
     let words = inn.len();
-    rt.memcpy_h2d_nonblock("in_tokens", inn, one, words, Order::RowMajor, DataType::Bits32)
+    rt.memcpy_h2d_nonblock(SYM.in_tokens, inn, one, words, Order::RowMajor, DataType::Bits32)
         .map_err(e)?;
     // The batched build ignores the second argument; the ring bootstraps
     // that many micro-batches.
     let second = if lay.mmax.is_some() { mbs.len() as u32 } else { 0 };
-    rt.launch_nonblock("compute", &[steps as u32, second]).map_err(e)?;
+    rt.launch_nonblock(SYM.compute, &[steps as u32, second]).map_err(e)?;
     let mut out = vec![0u32; words];
-    let read = rt.memcpy_d2h("out_tokens", &mut out, one, words, Order::RowMajor, DataType::Bits32);
+    let read = rt.memcpy_d2h(SYM.out_tokens, &mut out, one, words, Order::RowMajor, DataType::Bits32);
     rt.wait_pending();
     read.map_err(e)?;
     // Lane i is micro-batch i / B's lane i % B: [i][CAP] either way.
@@ -758,13 +759,13 @@ fn logits_rows(lay: &Layout2d, rt: &mut Runtime, lanes: usize) -> R<Vec<Vec<f32>
     let (rx, _) = lay.root();
     let (f, hh, vr, hlb) = (lay.feeder(), lay.hh, lay.vr, lay.logit_lanes());
     let mut a = vec![0u32; f * hlb * vr];
-    rt.memcpy_d2h("hlogits", &mut a, rect(rx, 0, 1, f), hlb * vr, Order::RowMajor, DataType::Bits32)
+    rt.memcpy_d2h(SYM.logit_lanes, &mut a, rect(rx, 0, 1, f), hlb * vr, Order::RowMajor, DataType::Bits32)
         .map_err(e)?;
     let mut c = vec![0u32; (hh - f) * hlb * vr];
-    rt.memcpy_d2h("hlogits", &mut c, rect(rx, f + 1, 1, hh - f), hlb * vr, Order::RowMajor, DataType::Bits32)
+    rt.memcpy_d2h(SYM.logit_lanes, &mut c, rect(rx, f + 1, 1, hh - f), hlb * vr, Order::RowMajor, DataType::Bits32)
         .map_err(e)?;
     let mut scale = vec![0u32; hlb];
-    rt.memcpy_d2h("yscale", &mut scale, rect(rx, 0, 1, 1), hlb, Order::RowMajor, DataType::Bits32)
+    rt.memcpy_d2h(SYM.yscale, &mut scale, rect(rx, 0, 1, 1), hlb, Order::RowMajor, DataType::Bits32)
         .map_err(e)?;
     let rows: Vec<u32> = a.into_iter().chain(c).collect();
     Ok((0..lanes.min(hlb))

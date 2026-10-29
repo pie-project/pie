@@ -1054,18 +1054,17 @@ impl Spatial {
     }
 
     /// The most steps a greedy lane's token loop runs past its row (0: none):
-    /// `PIE_SPATIAL_LOOKAHEAD`, else the config's `lookahead`, else 32 on the
-    /// wafer and 0 on a daemon (a CPU reference pays for every step it runs
-    /// ahead).
+    /// the config's `lookahead`, else `PIE_SPATIAL_LOOKAHEAD` (a development
+    /// override where the config says nothing), else 32 on the wafer and 0
+    /// on a daemon (a CPU reference pays for every step it runs ahead).
     fn lookahead(&self) -> usize {
         let default = match &self.daemon {
             Some(Model::Wafer(_)) => 32,
             _ => 0,
         };
-        std::env::var("PIE_SPATIAL_LOOKAHEAD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or(self.spatial.lookahead)
+        self.spatial
+            .lookahead
+            .or_else(|| std::env::var("PIE_SPATIAL_LOOKAHEAD").ok().and_then(|v| v.parse().ok()))
             .unwrap_or(default)
     }
 
@@ -1112,16 +1111,25 @@ impl Spatial {
         }
     }
 
-    /// Who runs translatable epilogues: `PIE_SPATIAL_GUEST`, else the
-    /// config's `guest`: `"off"` (the host interpreter, the default),
+    /// Who runs translatable epilogues: the config's `guest`, else
+    /// `PIE_SPATIAL_GUEST` (a development override where the config says
+    /// nothing): `"off"` (the host interpreter, the default),
     /// `"check"` (the contract played on the host: [`guest4::lane::CheckVm`])
     /// or `"wafer"` (the VM on the serving head, once the program has one;
     /// until then the host).
     fn guest_mode(&self) -> String {
-        std::env::var("PIE_SPATIAL_GUEST")
-            .ok()
-            .or_else(|| self.spatial.guest.clone())
-            .unwrap_or_else(|| "off".to_string())
+        let mode = self
+            .spatial
+            .guest
+            .clone()
+            .or_else(|| std::env::var("PIE_SPATIAL_GUEST").ok())
+            .unwrap_or_else(|| "off".to_string());
+        if matches!(mode.as_str(), "off" | "check" | "wafer") {
+            mode
+        } else {
+            tracing::warn!(mode, "spatial guest: not off, check or wafer; epilogues stay on the host");
+            "off".to_string()
+        }
     }
 
     /// `instance`'s epilogue through the guest contract, if its program has
@@ -1723,21 +1731,24 @@ impl Engine for Spatial {
             spec.check_program(plan::out_json_params(&json))
                 .map_err(|e| Error::Load(e.to_string()))?;
         }
-        let mut paged_model = false;
+        let paged_model;
         let model = if let Some(program) = &program {
             let platform = match &self.boot.cmaddr {
                 Some(cmaddr) => crate::sdk::Platform::System {
                     cmaddr: cmaddr.clone(),
                 },
-                None => crate::sdk::Platform::Simulator(crate::sdk::Simulator::new(
-                    self.boot.target,
-                )),
+                None => crate::sdk::Platform::Simulator(crate::sdk::Simulator {
+                    num_threads: self.boot.num_threads,
+                    ..crate::sdk::Simulator::new(self.boot.target)
+                }),
             };
             let launch = wafer::Launch::named(self.spatial.launch.as_deref());
             let theta = Some(f64::from(spec.rope_theta));
             let w = wafer::Wafer::open(program.into(), ckpt.clone().into(), platform, launch, theta)
                 .map_err(|e| Error::Load(format!("the spatial wafer model: {e}")))?;
             tracing::info!(program, ckpt, vocab = w.vocab, hidden = w.hidden, "spatial wafer model loaded");
+            // A batched build owns the KV as PIE's pages, as a paged daemon.
+            paged_model = w.paged.is_some();
             Model::Wafer(w)
         } else {
             let cmd = self.spatial.daemon.clone().unwrap_or_default();
@@ -1789,6 +1800,12 @@ impl Engine for Spatial {
             Some(Model::Wafer(w)) => w.paged,
             _ => None,
         };
+        // The context the model holds: the wafer program's positions (a
+        // lane's pages on a batched build); a daemon's is its own.
+        let model_context = match &self.daemon {
+            Some(Model::Wafer(w)) => u32::try_from(w.positions).unwrap_or(u32::MAX),
+            _ => u32::MAX,
+        };
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cerebras".to_string(),
@@ -1823,7 +1840,7 @@ impl Engine for Spatial {
                 max_page_refs: paging
                     .pages_per_slot
                     .min(wafer_pool.map_or(u32::MAX, |s| s.max_page_refs() as u32)),
-                max_context: paging.context(),
+                max_context: paging.context().min(model_context),
                 prefill_rows: 0,
                 max_readouts: budgets.max_tokens,
             },
@@ -1832,8 +1849,14 @@ impl Engine for Spatial {
             draft_block: 0,
             draft_mask_token: 0,
             draft_proposals_from: 1,
-            // A mask on its port is read (and refused unless causal).
-            ports: PortMask::DEVICE_GEOMETRY.with(eta_ir::registry::Port::AttnMask),
+            // A paged model attends what each row's mask says; a model of
+            // one sequence a cache runs causal attention only, so it takes
+            // no mask port.
+            ports: if paged_model {
+                PortMask::DEVICE_GEOMETRY.with(eta_ir::registry::Port::AttnMask)
+            } else {
+                PortMask::DEVICE_GEOMETRY
+            },
             geometry: GeometryClass::DeviceGeometry,
             kv_copy: KvCopyDomains {
                 // Pages are tokens here: a copy copies them.

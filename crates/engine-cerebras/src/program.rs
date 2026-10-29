@@ -842,9 +842,9 @@ impl Plane {
         (self.stages.runs, self.stages.lanes)
     }
 
-    #[must_use]
     /// The outputs `instance`'s program reads from a fire: (name, the pass's
     /// lane). An engine running guests in the interpreter feeds these.
+    #[must_use]
     pub fn outputs_of(&self, instance: InstanceId) -> Vec<(String, u32)> {
         self.instances.get(&instance).map_or_else(Vec::new, |seat| {
             seat.plan
@@ -946,6 +946,7 @@ impl Plane {
         self.instances.get(&instance).map(|seat| Arc::clone(&seat.plan))
     }
 
+    #[must_use]
     pub fn prologue_runs(&self, instance: InstanceId) -> bool {
         self.instances
             .get(&instance)

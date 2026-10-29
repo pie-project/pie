@@ -821,7 +821,9 @@ pub(crate) fn create_engine_backend(
             // Compiled programs cache under the PIE home, as wasmtime's do.
             boot_doc.push_str(&format!(
                 "cache_dir = {}\n",
-                toml::Value::String(home.join("cache").join("cerebras").display().to_string())
+                toml::Value::String(
+                    crate::disk::engine_cache_dir(home).join("cerebras").display().to_string()
+                )
             ));
             if let Some(cmaddr) = &opts.cmaddr {
                 boot_doc.push_str(&format!(

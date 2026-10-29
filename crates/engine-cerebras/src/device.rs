@@ -237,8 +237,7 @@ pub struct Device {
     cache: Mutex<HashMap<[u8; 32], Arc<Program>>>,
     platform: Platform,
     kind: String,
-    /// Compiled artifacts live here (`PIE_CEREBRAS_CACHE`, default
-    /// `$XDG_CACHE_HOME/pie/cerebras` or `~/.cache/pie/cerebras`).
+    /// Compiled artifacts live here ([`disk_cache`]).
     disk: PathBuf,
     /// Where each program's sources are also written, for inspection
     /// (`PIE_CEREBRAS_DUMP`).
@@ -404,13 +403,16 @@ pub fn set_cache_dir(dir: PathBuf) {
     let _ = CACHE_DIR.set(dir);
 }
 
-/// Where compiled programs are cached: `PIE_CEREBRAS_CACHE`, else the boot
-/// config's `cache_dir`, else (no PIE home known: tests, examples)
-/// `$XDG_CACHE_HOME/pie/cerebras` or `~/.cache/pie/cerebras`.
+/// Where compiled programs are cached: the boot config's `cache_dir`, else
+/// `PIE_CEREBRAS_CACHE` (a development override where no config set one:
+/// tests, examples), else `$XDG_CACHE_HOME/pie/cerebras` or
+/// `~/.cache/pie/cerebras`.
 pub(crate) fn disk_cache() -> PathBuf {
+    if let Some(dir) = CACHE_DIR.get() {
+        return dir.clone();
+    }
     match std::env::var_os("PIE_CEREBRAS_CACHE") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ if CACHE_DIR.get().is_some() => CACHE_DIR.get().cloned().unwrap_or_default(),
         _ => std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))

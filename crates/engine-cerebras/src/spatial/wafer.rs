@@ -17,6 +17,7 @@
 //! The SDK wants every runtime call on the thread that made the first
 //! runtime, so the model lives on a thread of its own ([`Wafer`]).
 
+use super::paged::SYMBOLS as SYM;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -550,7 +551,7 @@ impl Launch {
 
     /// From the RPC manifest: a `compute` that takes arguments.
     fn of(rt: &Runtime) -> Launch {
-        if rt.rpc().get("compute").is_ok_and(|s| s.inputs >= 2) {
+        if rt.rpc().get(SYM.compute).is_ok_and(|s| s.inputs >= 2) {
             Launch::Args
         } else {
             Launch::RunCfg
@@ -738,9 +739,9 @@ impl WaferModel {
         let rt = &mut self.rt;
         if self.launch == Launch::Args {
             // Queued in order; the answer's read waits for both.
-            rt.memcpy_h2d_nonblock("in_tokens", inn, one, cap, Order::RowMajor, DataType::Bits32)
+            rt.memcpy_h2d_nonblock(SYM.in_tokens, inn, one, cap, Order::RowMajor, DataType::Bits32)
                 .map_err(e)?;
-            rt.launch_nonblock("compute", &[steps as u32, start as u32])
+            rt.launch_nonblock(SYM.compute, &[steps as u32, start as u32])
                 .map_err(e)?;
         } else {
             let cfg: Vec<u32> =
@@ -750,12 +751,12 @@ impl WaferModel {
             let whole = rect(0, 0, lay.width, lay.height);
             rt.memcpy_h2d("run_cfg", &cfg, whole, 2, Order::RowMajor, DataType::Bits32)
                 .map_err(e)?;
-            rt.memcpy_h2d("in_tokens", &inn, one, cap, Order::RowMajor, DataType::Bits32)
+            rt.memcpy_h2d(SYM.in_tokens, &inn, one, cap, Order::RowMajor, DataType::Bits32)
                 .map_err(e)?;
-            rt.launch("compute", &[]).map_err(e)?;
+            rt.launch(SYM.compute, &[]).map_err(e)?;
         }
         let mut out = vec![0u32; cap];
-        let read = rt.memcpy_d2h("out_tokens", &mut out, one, cap, Order::RowMajor, DataType::Bits32);
+        let read = rt.memcpy_d2h(SYM.out_tokens, &mut out, one, cap, Order::RowMajor, DataType::Bits32);
         rt.wait_pending();
         read.map_err(e)?;
         // The head writes each argmax as an f32 value.
@@ -766,7 +767,7 @@ impl WaferModel {
         let logits = if want_logits {
             let mut col = vec![0u32; hh * vr];
             rt.memcpy_d2h(
-                "hlogits",
+                SYM.logit_lanes,
                 &mut col,
                 rect(hx, y0, 1, hh),
                 vr,
@@ -885,6 +886,9 @@ pub struct Wafer {
     /// and how many of them may want logits.
     pub launch_lanes: usize,
     pub logit_lanes: usize,
+    /// The KV positions one sequence may hold (a lane's pages on a batched
+    /// build).
+    pub positions: usize,
     thread: Option<std::thread::JoinHandle<()>>,
     pub vocab: usize,
     pub hidden: usize,
@@ -905,7 +909,7 @@ impl Wafer {
         let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
         let (batch_tx, batch_rx) = mpsc::channel::<BatchAnswer>();
         let (ready_tx, ready_rx) =
-            mpsc::channel::<R<(usize, usize, Option<super::paged::Shape>, usize, (usize, usize))>>();
+            mpsc::channel::<R<(usize, usize, Option<super::paged::Shape>, usize, (usize, usize), usize)>>();
         let thread = std::thread::Builder::new()
             .name("spatial-wafer".into())
             .spawn(move || {
@@ -921,6 +925,7 @@ impl Wafer {
                             paged,
                             m.design.cap(),
                             lanes,
+                            m.design.positions(),
                         )));
                         m
                     }
@@ -971,7 +976,7 @@ impl Wafer {
                 }
             })
             .map_err(|e| format!("spawning the wafer thread: {e}"))?;
-        let (vocab, hidden, paged, cap, (launch_lanes, logit_lanes)) = ready_rx
+        let (vocab, hidden, paged, cap, (launch_lanes, logit_lanes), positions) = ready_rx
             .recv()
             .map_err(|_| "the wafer thread died while loading".to_string())??;
         Ok(Wafer {
@@ -982,6 +987,7 @@ impl Wafer {
             cap,
             launch_lanes,
             logit_lanes,
+            positions,
             thread: Some(thread),
             vocab,
             hidden,
