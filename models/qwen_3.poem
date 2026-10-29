@@ -489,7 +489,12 @@ def layout(id, deploy):
     if len(deploy.weights) != 1 and mix == None:
         fail("{} stores its weights at one dtype, or as modelopt's mix [bf16, nvfp4, e4m3tile128a8], not {}".format(id, deploy.weights))
     w = deploy.weights[0]
-    d = struct(**drafted(id, deploy))
+    d = drafted(id, deploy)
+    if deploy.layers:
+        d["layers"] = deploy.layers
+    if deploy.experts:
+        d["mlp"] = moe(deploy.experts, min(d["mlp"].top_k, deploy.experts), d["mlp"].inter, d["mlp"].shared_inter)
+    d = struct(**d)
     if mix != None and d.draft != None:
         fail("{}: modelopt's export ships no draft head".format(id))
     bonsai = id == "qwen36-27b-bonsai"

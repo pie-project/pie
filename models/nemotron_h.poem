@@ -143,7 +143,7 @@ def layout(id, deploy):
     plain = deploy.weights == [dtype.bf16]
     if d.pattern == ULTRA and not plain:
         fail("{} ships as released: every weight bf16; not {}".format(id, deploy))
-    if d.pattern == SUPER and deploy.weights != [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8]:
+    if d.pattern == SUPER and not plain and deploy.weights != [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8]:
         fail("{} ships as released: bf16, NVFP4 experts against NVFP4 activations and its FP8 projections; not {}".format(id, deploy))
     w, experts, f8 = (dtype.bf16, dtype.bf16, dtype.bf16) if plain else deploy.weights
     hidden = d.hidden
