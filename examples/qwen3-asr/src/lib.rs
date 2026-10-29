@@ -288,12 +288,14 @@ impl Lane {
             .ok_or_else(|| format!("the `{}` lane takes no {axis:?} input", self.reading))
     }
 
-    fn width(&self) -> Result<u32> {
+    /// The width of its output `name`.
+    fn width(&self, name: &str) -> Result<u32> {
         self.decl
-            .readout
-            .as_ref()
-            .map(|r| r.width)
-            .ok_or_else(|| format!("the `{}` lane reads nothing out", self.reading))
+            .outputs
+            .iter()
+            .find(|o| o.name == name)
+            .map(|o| o.width)
+            .ok_or_else(|| format!("the `{}` lane writes no `{name}`", self.reading))
     }
 
     fn pass(&self) -> Result<ForwardPass> {
@@ -307,12 +309,12 @@ impl Lane {
 }
 
 /// One pass of a voxel reading over the clip `x`, `rows` rows read out.
-async fn voxels(lane: &Lane, x: Channel, rows: u32, pipe: &Pipeline, tag: &str) -> Result<Vec<f32>> {
-    let width = lane.width()?;
+async fn voxels(lane: &Lane, output: &'static str, x: Channel, rows: u32, pipe: &Pipeline) -> Result<Vec<f32>> {
+    let width = lane.width(output)?;
     let pass = lane.pass()?;
     pass.input(0, &lane.input(model::InputAxis::Voxel)?.name, &x)?;
-    let out = Channel::new([rows, width], dtype::f32).named(&format!("{tag}_out"));
-    pass.epilogue(move || out.put(intrinsics::pixels(0, rows, width)));
+    let out = Channel::new([rows, width], dtype::f32);
+    pass.epilogue(move || out.put(intrinsics::output_rows(0, output, rows)));
     pass.submit(pipe)
         .with_context(|| format!("the `{}` pass", lane.reading))?;
     out.take_host::<Vec<f32>>().await
@@ -322,7 +324,7 @@ async fn voxels(lane: &Lane, x: Channel, rows: u32, pipe: &Pipeline, tag: &str) 
 async fn hear(mel: &[f32], frames: usize, pipe: &Pipeline) -> Result<(Vec<f32>, usize)> {
     let conv = Lane::of("audio.conv", None)?;
     let encode = Lane::of("audio.encode", None)?;
-    let width = conv.width()? as usize;
+    let width = conv.width("features")? as usize;
 
     // The convolutions: whole chunks as one clip, a chunk a frame, then the
     // short last chunk alone.
@@ -338,7 +340,7 @@ async fn hear(mel: &[f32], frames: usize, pipe: &Pipeline) -> Result<(Vec<f32>, 
     // Each chunk's rows, its positions added.
     let mut rows: Vec<f32> = Vec::new();
     let mut start = 0;
-    for (k, &(count, len)) in pieces.iter().enumerate() {
+    for &(count, len) in &pieces {
         let mut clip = Vec::with_capacity(count * MELS * len);
         for c in 0..count {
             for m in 0..MELS {
@@ -352,8 +354,7 @@ async fn hear(mel: &[f32], frames: usize, pipe: &Pipeline) -> Result<(Vec<f32>, 
             Channel::from_shaped([MELS as u32, len as u32, 1], clip.as_slice())
         };
         let steps = after_convs(len);
-        let tag = format!("conv{k}");
-        let out = voxels(&conv, x.named(&tag), (count * steps) as u32, pipe, &tag).await?;
+        let out = voxels(&conv, "features", x, (count * steps) as u32, pipe).await?;
         for (i, step) in out.chunks_exact(width).enumerate() {
             rows.extend(
                 step.iter()
@@ -371,7 +372,7 @@ async fn hear(mel: &[f32], frames: usize, pipe: &Pipeline) -> Result<(Vec<f32>, 
     let window = after_convs(CHUNK) * WINDOW_CHUNKS;
     let whole = total / window;
     let rest = total % window;
-    let out_width = encode.width()? as usize;
+    let out_width = encode.width("hidden")? as usize;
     let mut heard = Vec::with_capacity(total * out_width);
     if whole > 0 {
         let n = whole * window;
@@ -379,12 +380,12 @@ async fn hear(mel: &[f32], frames: usize, pipe: &Pipeline) -> Result<(Vec<f32>, 
             [whole as u32, window as u32, 1, row as u32],
             &rows[..n * row],
         );
-        heard.extend(voxels(&encode, x.named("encode0"), n as u32, pipe, "encode0").await?);
+        heard.extend(voxels(&encode, "hidden", x, n as u32, pipe).await?);
     }
     if rest > 0 {
         let from = whole * window * row;
         let x = Channel::from_shaped([rest as u32, 1, row as u32], &rows[from..]);
-        heard.extend(voxels(&encode, x.named("encode1"), rest as u32, pipe, "encode1").await?);
+        heard.extend(voxels(&encode, "hidden", x, rest as u32, pipe).await?);
     }
     Ok((heard, total))
 }
@@ -409,21 +410,21 @@ impl Kv {
         sample: bool,
     ) -> Result<Option<Channel>> {
         let to = from + tokens.len() as u32;
-        let kv_len = Channel::from([to]).named(&format!("{tag}_kv_len"));
-        let slots = Channel::from_iter(from..to).named(&format!("{tag}_slots"));
+        let kv_len = Channel::from([to]);
+        let slots = Channel::from_iter(from..to);
         let lane = if audio.is_some() { &self.heard } else { &self.text };
         let pass = lane.pass()?;
         if lane.decl.embeds {
             let toks = Channel::from_iter(tokens.iter().map(|&t| t as i32))
-                .named(&format!("{tag}_tokens"));
+                ;
             let indptr =
-                Channel::from([0u32, tokens.len() as u32]).named(&format!("{tag}_indptr"));
+                Channel::from([0u32, tokens.len() as u32]);
             pass.embed(&toks, &indptr)?;
         }
         if let Some(rows) = audio {
             let input = lane.input(model::InputAxis::Row)?;
             let x = Channel::from_shaped([tokens.len() as u32, input.width], rows)
-                .named(&format!("{tag}_audio"));
+                ;
             pass.input(0, &input.name, &x)?;
         }
         pass.state(
@@ -435,14 +436,14 @@ impl Kv {
                 fold: Fold::All,
             },
         )?;
-        let next = sample.then(|| Channel::new([1], dtype::i32).named(&format!("{tag}_next")));
+        let next = sample.then(|| Channel::new([1], dtype::i32));
         match next {
             Some(out) => {
-                pass.epilogue(move || out.put(reshape(reduce_argmax(intrinsics::logits()), [1])))
+                pass.epilogue(move || out.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1])))
             }
             // A fire with nothing to sample still runs a stage.
             None => {
-                let done = Channel::new([1], dtype::u32).named(&format!("{tag}_done"));
+                let done = Channel::new([1], dtype::u32);
                 pass.epilogue(move || done.put(iota(1)));
             }
         }

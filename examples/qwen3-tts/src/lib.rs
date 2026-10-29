@@ -191,7 +191,7 @@ impl Voice {
         let from = self.frames();
         let t = frames.len();
         // A fire reads out a few hundred rows at most; 32 frames is 512.
-        let width = self.quantize.width()? as usize;
+        let width = self.quantize.width("hidden")? as usize;
         let mut rows = Vec::with_capacity(t * BOOKS * width);
         for part in frames.chunks(32) {
             let codes: Vec<u32> = part
@@ -253,10 +253,10 @@ impl Voice {
             &Channel::from_shaped([t, 1, 1, self.width], &self.hidden[from * w..to * w]),
         )?;
         // The audio is the decoder's first channel.
-        let channels = self.decode.width()?;
+        let channels = self.decode.width("audio")?;
         let out = Channel::new([samples, 1], dtype::f32);
         pass.epilogue(move || {
-            let all = reshape(intrinsics::pixels(0, samples, channels), [samples * channels]);
+            let all = reshape(intrinsics::output_rows(0, "audio", samples), [samples * channels]);
             out.put(reshape(gather(&all, iota(samples) * channels), [samples, 1]));
         });
         pass.submit(pipe).context("the codec decode")?;
@@ -328,12 +328,14 @@ impl Lane {
             .ok_or_else(|| format!("the `{}` lane takes no input `{name}`", self.reading))
     }
 
-    fn width(&self) -> Result<u32> {
+    /// The width of its output `name`.
+    fn width(&self, name: &str) -> Result<u32> {
         self.decl
-            .readout
-            .as_ref()
-            .map(|r| r.width)
-            .ok_or_else(|| format!("the `{}` lane reads nothing out", self.reading))
+            .outputs
+            .iter()
+            .find(|o| o.name == name)
+            .map(|o| o.width)
+            .ok_or_else(|| format!("the `{}` lane writes no `{name}`", self.reading))
     }
 
     fn pass(&self) -> Result<ForwardPass> {
@@ -420,9 +422,9 @@ impl Kv {
         let count = tokens.len() as u32;
         let toks = Channel::from_iter(tokens.iter().map(|&t| t as i32));
         let pass = self.pass(&toks, count, from, inputs)?;
-        let width = self.lane.width()?;
+        let width = self.lane.width("hidden")?;
         let out = Channel::new([count, width], dtype::f32);
-        pass.epilogue(move || out.put(intrinsics::hidden(0, count, width)));
+        pass.epilogue(move || out.put(reshape(intrinsics::output(0, "hidden"), [count, width])));
         pass.submit(pipe)
             .with_context(|| format!("the `{}` fire", self.lane.reading))?;
         Ok(Fired { out })
@@ -442,7 +444,7 @@ impl Fired {
 
 /// The rows `lane` reads out for `codes`, one a code.
 async fn embed(lane: &Lane, codes: &[u32], pipe: &Pipeline) -> Result<Vec<f32>> {
-    let width = lane.width()?;
+    let width = lane.width("hidden")?;
     let n = codes.len() as u32;
     let pass = lane.pass()?;
     pass.embed(
@@ -451,7 +453,7 @@ async fn embed(lane: &Lane, codes: &[u32], pipe: &Pipeline) -> Result<Vec<f32>> 
     )?;
     pass.readout(&Channel::from_iter(0..n))?;
     let out = Channel::new([n, width], dtype::f32);
-    pass.epilogue(move || out.put(intrinsics::hidden(0, n, width)));
+    pass.epilogue(move || out.put(reshape(intrinsics::output(0, "hidden"), [n, width])));
     pass.submit(pipe)
         .with_context(|| format!("the `{}` fire", lane.reading))?;
     out.take_host::<Vec<f32>>().await
@@ -545,7 +547,7 @@ impl Talk {
         let (seen, rng) = (self.seen, self.rng);
         let (token, seed, joined, first) = (links.token, links.seed, links.joined, links.first);
         pass.epilogue(move || {
-            let all = reshape(intrinsics::hidden(0, rows, width), [rows * width]);
+            let all = reshape(intrinsics::output(0, "hidden"), [rows * width]);
             let last = gather(&all, iota(width) + (rows - 1) * width);
             let logits = gather(&last, iota(TALKER_CODES));
             let state = gather(&last, iota(hidden) + TALKER_CODES);
@@ -606,10 +608,10 @@ fn draw_books(
 ) -> Result<(ForwardPass, ForwardPass)> {
     let first = kv.pass(&Channel::from([ZERO as i32]), 1, 0, &[("seed", &links.seed)])?;
     let settled = Channel::new([1], dtype::f32).queued();
-    let books = kv.lane.width()?;
+    let books = kv.lane.width("logits")?;
     first.epilogue(move || {
         settled.put(gather(
-            reshape(intrinsics::hidden(0, 1, books), [books]),
+            reshape(intrinsics::output_rows(0, "logits", 1), [books]),
             broadcast(0u32, [1]),
         ))
     });
@@ -641,7 +643,7 @@ fn draw_books(
         let r = rng.take();
         let here = pos.take();
         let codes = reshape(joined.take(), [BOOKS as u32]);
-        let book = reshape(intrinsics::hidden(0, 1, books), [books]);
+        let book = reshape(intrinsics::output_rows(0, "logits", 1), [books]);
         let drawn = draw(&book, greedy, &r);
         let drawn = reshape(drawn, [1]);
         out.put(&drawn);
@@ -758,7 +760,7 @@ async fn main(input: Input) -> Result<Output> {
     // before it left on the device; the host only collects the codes, a
     // few frames behind, and stops at the end of speech.
     let talk_out = Talk {
-        width: talk.lane.width()?,
+        width: talk.lane.width("hidden")?,
         hidden: predictor.input("seed")?.width,
         greedy: input.greedy,
         seen: Channel::new([TALKER_CODES], dtype::f32).queued(),
