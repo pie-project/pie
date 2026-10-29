@@ -9,6 +9,7 @@ device = "NVIDIA L40S"
 [kernel]
 gemm.rows_m = 16
 sdpa.pool_mma = true
+sdpa.selected_mma = true
 
 [provenance]
 measured = [
@@ -38,6 +39,7 @@ measured = [
   "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.pool_mma",
   "kernel.sdpa.prefill.ctas_per_sm",
+  "kernel.sdpa.selected_mma",
   "engine.copies",
   "engine.graphs",
   "engine.lattice_steps",
