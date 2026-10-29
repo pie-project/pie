@@ -43,6 +43,9 @@ impl Table {
 
 static CURRENT: RwLock<Option<Arc<Table>>> = RwLock::new(None);
 
+#[cfg(test)]
+pub(crate) static TEST_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 pub fn current() -> Option<Arc<Table>> {
     CURRENT.read().clone()
 }

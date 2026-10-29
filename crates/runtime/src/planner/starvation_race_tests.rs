@@ -153,6 +153,7 @@ impl PoolPort for RacePool {
 
 #[test]
 fn a_younger_process_is_not_admitted_while_an_older_one_is_preempted() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
     use futures::FutureExt;
     let planner = Arc::new(ResidencyPlanner::new(
         Arc::new(RacePool::new(8)) as Arc<dyn PoolPort>
@@ -182,6 +183,7 @@ fn a_younger_process_is_not_admitted_while_an_older_one_is_preempted() {
 
 #[test]
 fn a_head_short_of_state_beside_free_pages_is_funded_by_eviction() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
     // The head lacks a state slot while the device has kv pages to
     // spare: the pages a queued decode step asks for are supply, not a
     // deficit the eviction planner should defer on.
@@ -228,6 +230,7 @@ fn a_head_short_of_state_beside_free_pages_is_funded_by_eviction() {
 
 #[test]
 fn a_wedged_head_short_of_state_alone_still_reclaims_by_restart() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
     // The head asks for a state slot and no pages: the pages it has
     // do not cover it, so a stalled fleet with nothing to evict reclaims
     // the youngest ask rather than waiting on a serve that cannot come.
@@ -277,6 +280,7 @@ fn a_wedged_head_short_of_state_alone_still_reclaims_by_restart() {
 
 #[test]
 fn a_burst_serves_exactly_the_fundable_prefix_in_one_pass() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
     let pool = Arc::new(RacePool::new(64));
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
 
@@ -360,6 +364,7 @@ fn a_burst_serves_exactly_the_fundable_prefix_in_one_pass() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_host_swap_full_victim_is_parked_until_host_room_returns() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let pool = Arc::new(RacePool::new(4));
     let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
 
@@ -422,6 +427,7 @@ async fn a_host_swap_full_victim_is_parked_until_host_room_returns() {
 
 #[test]
 fn a_wake_restores_a_parked_process_that_stays_idle() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
     let planner = Arc::new(ResidencyPlanner::new(
         Arc::new(RacePool::new(4)) as Arc<dyn PoolPort>
     ));
@@ -465,6 +471,7 @@ fn a_wake_restores_a_parked_process_that_stays_idle() {
 
 #[test]
 fn an_idle_eviction_asks_for_its_pages_back_only_on_waking() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
     let planner = Arc::new(ResidencyPlanner::new(
         Arc::new(RacePool::new(4)) as Arc<dyn PoolPort>
     ));
@@ -502,6 +509,7 @@ fn an_idle_eviction_asks_for_its_pages_back_only_on_waking() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn an_exhausted_pool_evicts_even_while_the_fleet_still_runs() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let pool = Arc::new(RacePool::with_swap(4, 64));
     let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
 
@@ -580,6 +588,7 @@ async fn an_exhausted_pool_evicts_even_while_the_fleet_still_runs() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_lane_holding_the_whole_state_pool_is_told_so() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     use crate::inferlet::process::residency::{ProcessResidency, register_residency};
     use crate::store::rs::RsGeometry;
 
@@ -713,6 +722,7 @@ fn ring_write(
 // and the pages behind it retire, which the fire that read them settles.
 #[tokio::test(flavor = "current_thread")]
 async fn a_fire_short_of_windowed_pages_waits_for_a_window_to_move_on() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let model = ring_model();
     let stores = crate::store::registry::get(model, 0);
     let geom = crate::store::rs::RsGeometry {
@@ -783,6 +793,7 @@ async fn a_fire_short_of_windowed_pages_waits_for_a_window_to_move_on() {
 // fit beside what it holds is refused rather than restarted forever.
 #[tokio::test(flavor = "current_thread")]
 async fn a_lone_window_is_served_by_what_it_moved_past_or_told_it_never_fits() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     use crate::inferlet::process::residency::{ProcessResidency, register_residency};
 
     let model = ring_model();
@@ -840,6 +851,7 @@ async fn a_lone_window_is_served_by_what_it_moved_past_or_told_it_never_fits() {
 
 #[test]
 fn a_seated_lane_grows_before_a_prompt_waiting_to_be_seated() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
     let planner = Arc::new(
         ResidencyPlanner::new(Arc::new(RacePool::new(8)) as Arc<dyn PoolPort>).seated_first(true),
     );
@@ -995,6 +1007,7 @@ impl PoolPort for RingPool {
 /// the seated lanes' growth however many arrive together.
 #[test]
 fn prompts_seated_at_once_leave_the_seated_lanes_their_growth() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
     const PROMPT: u32 = 64;
     const RING: u32 = 6400;
     let pool = Arc::new(RingPool {
