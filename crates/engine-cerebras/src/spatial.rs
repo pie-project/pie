@@ -1127,28 +1127,29 @@ impl Spatial {
             .map(|c| c.id)
             .collect();
         let name = self.readout.as_ref().map_or("", |(n, _)| n.as_str());
+        // Translated to the wafer VM's registers and pool when the model has
+        // one (the translator re-makes draws at their readers to fit fewer
+        // registers), else to the host's limits. A table whose pool overruns
+        // is translated again with the big logits-free arrays sunk into
+        // main, whose words are then live only while main runs.
+        let (regs, pool) = match &self.daemon {
+            Some(Model::Wafer(w)) => w
+                .vm
+                .map_or((GUEST_REGS, GUEST_POOL), |(lay, _)| (lay.nreg as u32, lay.pool_words as u32)),
+            _ => (GUEST_REGS, GUEST_POOL),
+        };
+        // Translated without a pool bound, so a table's size is known when
+        // it overruns; the bound is applied below.
         let build = |sink: bool| {
-            guest4::translate_sinking(&plan, vocab, &host_takes, GUEST_REGS, GUEST_POOL, sink)
+            guest4::translate_sinking(&plan, vocab, &host_takes, regs, u32::MAX, sink)
                 .and_then(|table| guest4::lane::Program::of(&plan, table, name))
         };
-        // The wafer VM's pool, when the model has one: a table whose pool
-        // overruns it (or any pool limit) is translated again with the big
-        // logits-free arrays sunk into main, whose words are then live only
-        // while main runs.
-        let vm_pool = match &self.daemon {
-            Some(Model::Wafer(w)) => w.vm.map(|(lay, _)| lay.pool_words as u32),
-            _ => None,
-        };
         let mut built = build(false);
-        let over = match &built {
-            Ok(guest) => vm_pool.is_some_and(|words| guest.table.pool_words > words),
-            Err(why) => why.contains("pool words"),
-        };
+        let over = built.as_ref().is_ok_and(|guest| guest.table.pool_words > pool);
         if over {
             let sunk = build(true);
             let better = match (&sunk, &built) {
                 (Ok(s), Ok(b)) => s.table.pool_words < b.table.pool_words,
-                (Ok(_), Err(_)) => true,
                 _ => false,
             };
             tracing::info!(
@@ -1162,6 +1163,13 @@ impl Spatial {
                 built = sunk;
             }
         }
+        let built = built.and_then(|guest| {
+            if guest.table.pool_words > pool {
+                Err(format!("{} pool words, more than {pool}", guest.table.pool_words))
+            } else {
+                Ok(guest)
+            }
+        });
         match built {
             Ok(guest) => {
                 tracing::info!(

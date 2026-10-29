@@ -713,6 +713,9 @@ impl WaferModel {
         if !table.per_step.is_empty() {
             return Some("the host writes some of its homes every step".into());
         }
+        if vm.ring.lanes != 1 {
+            return Some(format!("the VM time-multiplexes {} lanes; this path drives one", vm.ring.lanes));
+        }
         vm.lay.refuses(table).or_else(|| vm.ring.refuses_outputs(&table.outputs))
     }
 
@@ -1149,6 +1152,9 @@ impl Wafer {
         };
         if !table.per_step.is_empty() {
             return Some("the host writes some of its homes every step".into());
+        }
+        if ring.lanes != 1 {
+            return Some(format!("the VM time-multiplexes {} lanes; this path drives one", ring.lanes));
         }
         lay.refuses(table).or_else(|| ring.refuses_outputs(&table.outputs))
     }

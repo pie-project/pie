@@ -31,13 +31,31 @@ pub const OUT_WORDS: u32 = 16;
 pub struct Ring {
     pub depth: u32,
     pub width: u32,
+    /// Lanes the VM time-multiplexes (`gring` word 2; 1 on older images):
+    /// turn t of a launch is lane t % L, each lane with its own bank.
+    pub lanes: u32,
 }
 
 impl Ring {
-    /// `gout`'s word for step `step`'s output word `slot`.
+    /// `gout`'s word for step `step`'s output word `slot` (lane 0).
     #[must_use]
     pub fn index(&self, step: u64, slot: u32) -> usize {
-        (step % u64::from(self.depth)) as usize * self.width as usize + slot as usize
+        self.index_lane(step, 0, slot)
+    }
+
+    /// `gout`'s word for lane `lane`'s step `step`, output word `slot`: its
+    /// row is (s·L + l) % D.
+    #[must_use]
+    pub fn index_lane(&self, step: u64, lane: u32, slot: u32) -> usize {
+        let row = (step * u64::from(self.lanes) + u64::from(lane)) % u64::from(self.depth);
+        row as usize * self.width as usize + slot as usize
+    }
+
+    /// Steps every lane may run in one launch before the host reads the
+    /// ring: ⌊D / L⌋.
+    #[must_use]
+    pub fn steps_cap(&self) -> u32 {
+        (self.depth / self.lanes.max(1)).max(1)
     }
 
     /// Why `program` cannot run on this image, if it cannot: an output
@@ -84,8 +102,10 @@ pub fn ring_words(program_dir: &std::path::Path) -> Result<usize, String> {
         }
     }
     match words {
-        Some(n @ (1 | 2)) => Ok(n),
-        Some(n) => Err(format!("`gring` is {n} words; the engine reads [depth] or [depth, width]")),
+        Some(n @ (1..=3)) => Ok(n),
+        Some(n) => Err(format!(
+            "`gring` is {n} words; the engine reads [depth], [depth, width] or [depth, width, lanes]"
+        )),
         None => Err(format!("no PE image in {} defines `gring`", bin.display())),
     }
 }
@@ -135,8 +155,9 @@ pub fn read_ring(rt: &mut crate::sdk::Runtime, hub: (usize, usize), words: usize
     let ring = Ring {
         depth: ring[0],
         width: ring.get(1).copied().unwrap_or(OUT_WORDS),
+        lanes: ring.get(2).copied().unwrap_or(1),
     };
-    if ring.depth == 0 || ring.width == 0 {
+    if ring.depth == 0 || ring.width == 0 || ring.lanes == 0 || ring.lanes > ring.depth {
         return Err(format!("the VM's `gring` reads {ring:?}"));
     }
     Ok(ring)
@@ -146,7 +167,7 @@ pub fn read_ring(rt: &mut crate::sdk::Runtime, hub: (usize, usize), words: usize
 /// ring depth (the steps past it would overwrite rows the host has not read).
 #[must_use]
 pub fn steps_per_launch(wanted: usize, ring: Ring) -> usize {
-    wanted.min(ring.depth as usize).max(1)
+    wanted.min(ring.steps_cap() as usize).max(1)
 }
 
 /// A value as VM words: f32 as bits, ints as their two's complement, bool
@@ -410,8 +431,12 @@ mod tests {
 
     #[test]
     fn ring_index_wraps_by_depth() {
-        let ring = super::Ring { depth: 16, width: 1 };
+        let ring = super::Ring { depth: 16, width: 1, lanes: 1 };
         assert_eq!((ring.index(3, 0), ring.index(17, 0)), (3, 1));
+        // Three lanes: lane l's step s at row (3s + l) % 16; 5 steps a launch.
+        let ring = super::Ring { depth: 16, width: 2, lanes: 3 };
+        assert_eq!((ring.index_lane(0, 2, 1), ring.index_lane(5, 1, 0)), (2 * 2 + 1, 0));
+        assert_eq!(ring.steps_cap(), 5);
     }
 }
 

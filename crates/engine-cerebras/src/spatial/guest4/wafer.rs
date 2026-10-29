@@ -38,6 +38,9 @@ pub struct VmLayout {
     pub max_ops: usize,
     pub nreg: usize,
     pub pool_words: usize,
+    /// The VM op groups the image was built with (`feat`, pe.csl's F_*
+    /// bits): a table using a group the image left out would run wrong.
+    pub feat: u32,
     pub vocab: usize,
 }
 
@@ -70,6 +73,7 @@ impl VmLayout {
             max_ops: get("max_ops")?,
             nreg: get("nreg")?,
             pool_words: get("pool_words")?,
+            feat: get("feat")? as u32,
             vocab: get("vocab")?,
         })
     }
@@ -96,6 +100,7 @@ impl VmLayout {
             max_ops: get("max_ops")?,
             nreg: get("nreg")?,
             pool_words: get("pool_words")?,
+            feat: get("feat")? as u32,
             vocab: get("vocab")?,
         })
     }
@@ -127,6 +132,13 @@ impl VmLayout {
         }
         if table.pool_words as usize > self.pool_words {
             return Some(format!("{} pool words; the image has {}", table.pool_words, self.pool_words));
+        }
+        let missing = table.feat & !self.feat;
+        if missing != 0 {
+            return Some(format!(
+                "op groups {missing:#x} (feat {:#x}) the image was built without (feat {:#x})",
+                table.feat, self.feat
+            ));
         }
         if !table.wide_outputs.is_empty() {
             return Some("vocabulary-wide host outputs (read from the VM's registers)".into());
@@ -285,6 +297,40 @@ pub fn read_out(rt: &mut Runtime, lay: &VmLayout, ring: Ring, first: u64, steps:
         .collect())
 }
 
+/// The VM's per-lane banks (a time-multiplexed VM, `gring` lanes L > 1):
+/// on every VM PE, L banks of `pool_words + (nreg - 1)·Vr` words, bank l
+/// the lane's pool (its pool homes seeded) then its wide registers
+/// W1..W(nreg-1) for that PE's lane position (zeros on the hub). `seeds[l]`
+/// are lane l's homes' seeds. Laid out a VM column at a time: rows 0..=H,
+/// each row's L banks.
+pub fn bank_images(lay: &VmLayout, seeds: &[Vec<Seed>]) -> R<Vec<Vec<u32>>> {
+    let (nv, wide_n) = (lay.rows + 1, (lay.nreg - 1) * lay.vr);
+    let bank = lay.pool_words + wide_n;
+    let mut columns = vec![vec![0u32; nv * seeds.len() * bank]; lay.blocks];
+    for (l, lane_seeds) in seeds.iter().enumerate() {
+        let (pool, wide) = seed_images(lay, lane_seeds)?;
+        for (b, column) in columns.iter_mut().enumerate() {
+            for pe in 0..nv {
+                let at = (pe * seeds.len() + l) * bank;
+                column[at..at + lay.pool_words].copy_from_slice(&pool);
+                if pe == lay.feeder {
+                    continue;
+                }
+                let ry = if pe < lay.feeder { pe } else { pe - 1 };
+                let lane = b * lay.rows + ry;
+                // W0 holds the logits; the bank keeps W1 on.
+                for r in 1..lay.nreg {
+                    for j in 0..lay.vr {
+                        column[at + lay.pool_words + (r - 1) * lay.vr + j] =
+                            wide[(lane * lay.nreg + r) * lay.vr + j].to_bits();
+                    }
+                }
+            }
+        }
+    }
+    Ok(columns)
+}
+
 /// What a VM PE received for the last sampled step: the logits row x 1/rms
 /// (block by block, region rows in order, the hub skipped), vocabulary order.
 pub fn read_plane(rt: &mut Runtime, lay: &VmLayout) -> R<Vec<f32>> {
@@ -382,11 +428,51 @@ mod tests {
     fn layout_of_the_0112_image() {
         let params = [
             ("W", 528), ("VMC", 1), ("H", 300), ("C", 32), ("Vr", 32), ("Gx", 8),
-            ("max_ops", 48), ("nreg", 6), ("pool_words", 64), ("vocab", 151_936),
+            ("max_ops", 48), ("nreg", 6), ("pool_words", 64), ("feat", 99), ("vocab", 151_936),
         ];
         let lay = VmLayout::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1)).unwrap();
         // 16 blocks of 33 columns, the root at 20 (run.py's R2X), the VM after it.
         assert_eq!((lay.blocks, lay.root, lay.column(1), lay.feeder), (16, 20, 54, 150));
         assert!(lay.blocks * lay.rows * lay.vr >= lay.vocab);
+    }
+
+    #[test]
+    fn banks_hold_each_lane_s_pool_then_its_wide_registers() {
+        let params = [
+            ("W", 9), ("VMC", 1), ("H", 2), ("C", 8), ("Vr", 2), ("Gx", 2),
+            ("max_ops", 8), ("nreg", 3), ("pool_words", 2), ("feat", 99), ("vocab", 4),
+        ];
+        let lay = VmLayout::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1)).unwrap();
+        let home = |kind: &'static str, at: u32| Home { chan: 0, kind, at, n: 1, dtype: eta_ir::Dtype::U32 };
+        let (pool, wide) = (home("pool", 1), home("wide", 2));
+        // Lane l: pool word 1 = 10 + l; register W2 = [l, l+1, l+2, l+3] over the vocabulary.
+        let seeds: Vec<Vec<Seed>> = (0..2u32)
+            .map(|l| vec![Seed::of(&pool, vec![10 + l]), Seed::of(&wide, (l..l + 4).collect())])
+            .collect();
+        let cols = bank_images(&lay, &seeds).unwrap();
+        // One block, rows 0 (lane position 0), 1 (the hub), 2 (position 1); banks of 2 + 2·2 words.
+        let bank = |pe: usize, l: usize| &cols[0][(pe * 2 + l) * 6..(pe * 2 + l + 1) * 6];
+        let f = |x: u32| (x as f32).to_bits();
+        assert_eq!(bank(0, 1), [0, 11, 0, 0, f(1), f(2)]);
+        assert_eq!(bank(1, 0), [0, 10, 0, 0, 0, 0]);
+        assert_eq!(bank(2, 0), [0, 10, 0, 0, f(2), f(3)]);
+    }
+
+    #[test]
+    fn a_table_needs_every_op_group_it_uses() {
+        let params = [
+            ("W", 18), ("VMC", 1), ("H", 4), ("C", 8), ("Vr", 32), ("Gx", 2),
+            ("max_ops", 64), ("nreg", 8), ("pool_words", 256), ("feat", 511), ("vocab", 250),
+        ];
+        let lay = VmLayout::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1)).unwrap();
+        let case = |feat: u32| {
+            serde_json::json!({"table": [[0, 0, 0, 0, 0, 0]], "homes": [], "outputs": [], "seeds": {},
+                               "tok_home": 0, "nreg": 1, "pool_words": 1, "feat": feat})
+        };
+        let (fits, _) = case_table(&case(8 | 3)).unwrap();
+        assert_eq!(lay.refuses(&fits), None);
+        // Top-p's mass pivot (F_PMASS, 512) on an image built at 511.
+        let (pmass, _) = case_table(&case(8 | 512)).unwrap();
+        assert!(lay.refuses(&pmass).unwrap().contains("0x200"));
     }
 }

@@ -682,13 +682,15 @@ fn scalar_operands(ins: &mut [[u32; 6]]) {
 }
 
 /// pe.csl's op groups: F_RNG 1, F_RED 2, F_GS 4, F_LIST 8, F_RANK 16,
-/// F_QARITH 32, F_QMEM 64, F_QRED 128, F_WMATH 256.
+/// F_QARITH 32, F_QMEM 64, F_QRED 128, F_WMATH 256, F_PMASS 512 (top-p's
+/// mass pivot, beside F_LIST).
 pub fn feat_of(op: u32) -> u32 {
     match op {
         WRNG | QRNG => 1,
         RRED => 2,
         WGATHER | WSCATTER => 4,
-        TOPK | PIVMASS => 8,
+        TOPK => 8,
+        PIVMASS => 8 | 512,
         PIVRANK => 16,
         QBIN | QCMP | QUN | QSEL => 32,
         QIOTA | QCONST | QMOV | QGATHER | QSCATTER | QCUM => 64,
