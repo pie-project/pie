@@ -1245,6 +1245,101 @@ fn build_lt_plan(
             augmented.push(result);
         }
     }
+    // At a few hundred to a thousand rows cuBLASLt's ranking leaves out the
+    // tiles such a product runs fastest on: a 559-row 6656x19968 product
+    // takes 1129 us on its best and 922 us on one of its algorithms at
+    // 256x128 split in two (L40S). Each heuristic's algorithm is offered at
+    // 256x128 and 128x128 too, whole or split in two or three, a split's
+    // partials summed in f32 as above.
+    if retiled(m) {
+        let fresh = |algo: &lt::cublasLtMatmulAlgo_t,
+                     have: &[lt::cublasLtMatmulHeuristicResult_t]| {
+            !have.iter().any(|h| h.algo.data == algo.data)
+        };
+        let mut retiles: Vec<lt::cublasLtMatmulHeuristicResult_t> = Vec::new();
+        for heuristic in &heuristics {
+            for (tile, stages) in [
+                (
+                    lt::cublasLtMatmulTile_t::CUBLASLT_MATMUL_TILE_256x128,
+                    lt::cublasLtMatmulStages_t::CUBLASLT_MATMUL_STAGES_32x3,
+                ),
+                (
+                    lt::cublasLtMatmulTile_t::CUBLASLT_MATMUL_TILE_128x128,
+                    lt::cublasLtMatmulStages_t::CUBLASLT_MATMUL_STAGES_32x6,
+                ),
+            ] {
+                for split in [1i32, 2, 3] {
+                    let scheme = if split == 1 {
+                        lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_NONE
+                    } else {
+                        lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE
+                    };
+                    let mut algo = heuristic.algo;
+                    // SAFETY: `algo` is a local copy of a returned algorithm;
+                    // each value is a local of the attribute's size.
+                    let set = unsafe {
+                        [
+                            lt::cublasLtMatmulAlgoConfigSetAttribute(
+                                &raw mut algo,
+                                lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_TILE_ID,
+                                std::ptr::from_ref(&tile).cast(),
+                                std::mem::size_of::<lt::cublasLtMatmulTile_t>(),
+                            ),
+                            lt::cublasLtMatmulAlgoConfigSetAttribute(
+                                &raw mut algo,
+                                lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_STAGES_ID,
+                                std::ptr::from_ref(&stages).cast(),
+                                std::mem::size_of::<lt::cublasLtMatmulStages_t>(),
+                            ),
+                            lt::cublasLtMatmulAlgoConfigSetAttribute(
+                                &raw mut algo,
+                                lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                                std::ptr::from_ref(&split).cast(),
+                                std::mem::size_of::<i32>(),
+                            ),
+                            lt::cublasLtMatmulAlgoConfigSetAttribute(
+                                &raw mut algo,
+                                lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+                                std::ptr::from_ref(&scheme).cast(),
+                                std::mem::size_of::<lt::cublasLtReductionScheme_t>(),
+                            ),
+                        ]
+                    };
+                    if set.iter().any(|status| *status != ok)
+                        || !fresh(&algo, &heuristics)
+                        || !fresh(&algo, &augmented)
+                        || !fresh(&algo, &retiles)
+                    {
+                        continue;
+                    }
+                    // SAFETY: as for `heuristics` above: all-zero bytes are a valid value.
+                    let mut result: lt::cublasLtMatmulHeuristicResult_t =
+                        unsafe { core::mem::zeroed() };
+                    // SAFETY: as for the splits above.
+                    let checked = unsafe {
+                        lt::cublasLtMatmulAlgoCheck(
+                            lt_handle,
+                            plan.op_desc,
+                            plan.a_desc,
+                            plan.b_desc,
+                            plan.c_desc,
+                            plan.c_desc,
+                            &raw const algo,
+                            &raw mut result,
+                        )
+                    };
+                    if checked != ok || result.state != ok || result.workspaceSize > workspace_bytes
+                    {
+                        clear_error();
+                        continue;
+                    }
+                    result.algo = algo;
+                    retiles.push(result);
+                }
+            }
+        }
+        augmented.extend(retiles);
+    }
     heuristics.extend(augmented);
     plan.heuristics = heuristics;
     Some(plan)
@@ -1554,6 +1649,13 @@ impl Device {
         } else {
             key
         };
+        // And one whose plan offers the heuristics retiled apart from the
+        // one tuned before it did.
+        let key = if retiled(call.m) {
+            key ^ 0x7469_6c65_0000_0000
+        } else {
+            key
+        };
         if let Some(tactic) = self.chosen.get(&key) {
             return Some(*tactic);
         }
@@ -1609,6 +1711,12 @@ fn rows_tried(call: Call, rows_m: u32) -> bool {
 /// covers the shape.
 fn skinny_tried(call: Call, skinny_rows: u32) -> bool {
     call.m >= 2 && skinny::covers(call.m, call.n, call.k, 1, skinny_rows)
+}
+
+/// Whether `m` rows' plan offers its heuristics at other tiles too: past a
+/// decode's skinny rows and short of the prefills cuBLASLt ranks well.
+fn retiled(m: i32) -> bool {
+    (128..=1024).contains(&m)
 }
 
 fn shape_key(
