@@ -118,7 +118,9 @@ impl ServeConfig {
     ///   `table`, `out`);
     /// - `[vm]`: `max_ops`, `nreg`, `pool_words`, `feat`, `ring_w` (default
     ///   1), `ring_d` (32), `prof`, `step_input`, `rows`, `bank_words`
-    ///   (per-lane programs), `opmask_lo`/`opmask_hi`.
+    ///   (per-lane programs), `opmask_lo`/`opmask_hi`;
+    /// - `[pins]`: layout parameters by name, for shapes the plan does not
+    ///   place (simulator-sized models); checked against the layout.
     pub fn from_toml(t: &toml::Table, page_size: usize) -> R<ServeConfig> {
         fn int(t: &toml::Table, k: &str) -> R<Option<usize>> {
             match t.get(k) {
@@ -138,7 +140,7 @@ impl ServeConfig {
         }
         let known = [
             "lanes", "grid_lanes", "page_size", "blocks", "max_blocks", "mlp_chunk", "cap", "pipeline",
-            "host_copy", "mmax", "hb", "hlm", "smp", "spec", "vm",
+            "host_copy", "mmax", "hb", "hlm", "smp", "spec", "vm", "pins",
         ];
         if let Some(k) = t.keys().find(|k| !known.contains(&k.as_str())) {
             return Err(format!("[cerebras.spatial.serve]: unknown key `{k}`"));
@@ -198,7 +200,19 @@ impl ServeConfig {
             hlm: int(t, "hlm")?,
             spec,
             smp: flag(t, "smp")?,
-            pins: Vec::new(),
+            pins: match t.get("pins") {
+                None => Vec::new(),
+                Some(v) => {
+                    let m = v.as_table().ok_or("[cerebras.spatial.serve] `pins` is not a table")?;
+                    let mut out = Vec::new();
+                    for k in m.keys() {
+                        let v = int(m, k)?.unwrap_or(0);
+                        // Pins name layout parameters; the names live as long as the program.
+                        out.push((&*Box::leak(k.clone().into_boxed_str()), v));
+                    }
+                    out
+                }
+            },
         })
     }
 }
@@ -217,17 +231,86 @@ pub fn build_for(
     compile(design, &params, target, system)
 }
 
-/// The design a plan's family builds.
+/// The design a plan's family builds: paged8b grids go into serve8b.
 pub fn design(plan: &SpatialPlan) -> R<Design> {
     match plan.family {
         Family::Serve2d => Ok(Design::Serve2d),
         Family::Serve2dPipe => Ok(Design::Serve2dPipe),
-        Family::Paged8b => Err(format!(
-            "{}: the plan picks qwen2d_paged8b layer grids, and no full program places them yet ({})",
-            plan.spec.name,
-            plan.blockers.join("; ")
-        )),
+        Family::Paged8b => Ok(Design::Serve8b),
     }
+}
+
+/// serve8b's placement of a paged8b plan on `wafer`: `GW` grids across, `GH`
+/// strips down, the first `GS` strips full and the rest one grid short
+/// (layers = GH (GW - 1) + GS); beside them the head (PY / 2 columns + its VM
+/// column, HH = GH * PY rows, Vr = ceil(vocab / HH) vocab rows a PE) and the
+/// PY / 4-wide embedding strip. The fewest strips, then the fewest grids
+/// across, that fit (serve8b/layout.csl's asserts included).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Serve8bPlace {
+    pub gw: usize,
+    pub gh: usize,
+    pub gs: usize,
+    pub hh: usize,
+    pub vr: usize,
+    pub gx: usize,
+    pub gy: usize,
+}
+
+pub fn place_serve8b(plan: &SpatialPlan, wafer: super::plan::WaferDims) -> R<Serve8bPlace> {
+    let (px, py, layers, vocab) = (plan.grid.px, plan.grid.py, plan.layers, plan.vocab);
+    if py % 4 != 0 || py < px || py > 2 * px {
+        return Err(format!("serve8b wants PY a multiple of 4 in [PX, 2 PX]; the plan's grid is {px} x {py}"));
+    }
+    let vmc = 1;
+    for gh in 1..=wafer.height / py {
+        for gw in 2..=wafer.width / px {
+            let width = gw * px + py / 2 + vmc + py / 4;
+            let hh = gh * py;
+            if width > wafer.width || hh + 1 > wafer.height || gh * (gw - 1) + gh < layers {
+                continue;
+            }
+            let gs = layers.saturating_sub(gh * (gw - 1)).max(1);
+            let gs = if gs % 2 == 1 && gs != gh { gs + 1 } else { gs };
+            if gs > gh || !(gw >= 3 || gh - gs <= 1) {
+                continue;
+            }
+            let f = hh / 2;
+            if f < py || f >= (gh - 1) * py {
+                continue;
+            }
+            let c = py / 2;
+            let gx = [16, 8, 4, 2].into_iter().find(|g| c % g == 0 && c / g >= 2).unwrap_or(1);
+            let gx = gx.min(8);
+            let gy = (2..=24).rev().step_by(2).find(|g| f % g == 0).unwrap_or(2);
+            return Ok(Serve8bPlace { gw, gh, gs, hh, vr: vocab.div_ceil(hh), gx, gy });
+        }
+    }
+    Err(format!("{}: {layers} grids of {px} x {py} and serve8b's head do not fit {} x {}", plan.spec.name, wafer.width, wafer.height))
+}
+
+/// serve8b's compile parameters, in the requests' order.
+fn serve8b_params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Vec<(&'static str, usize)>> {
+    if cfg.vm.is_some() || cfg.spec.is_some() || cfg.smp || cfg.goals.pipeline {
+        return Err("serve8b has no eta VM, speculative decode, fused sampler or pipeline".into());
+    }
+    let g = &plan.grid;
+    let p = place_serve8b(plan, super::plan::WaferDims::CS3)?;
+    let cap = cfg.goals.cap.unwrap_or_else(|| {
+        let mut c = 64;
+        while g.lanes * c > 512 && c > 1 {
+            c /= 2;
+        }
+        c
+    });
+    Ok(vec![
+        ("PX", g.px), ("PY", g.py), ("Hc", g.hc), ("HR", g.hidden), ("Dc", g.dc), ("Gs", g.gs), ("Qh", g.qh),
+        ("Ic", g.ic), ("PS", g.page_size), ("E", g.entries), ("MC", g.mlp_chunk), ("W16", usize::from(g.w16)),
+        ("NP", 3), ("KV16", usize::from(g.kv16)), ("PROF", 0), ("TIME", 0), ("GW", p.gw), ("GH", p.gh),
+        ("GS", p.gs), ("HEADMODE", 2), ("HH", p.hh), ("Vr", p.vr), ("Gx", p.gx), ("Gy", p.gy),
+        ("vocab", plan.vocab), ("PASSES", 3), ("MODE", 0), ("OVL", 0), ("VMC", 1), ("CAP", cap), ("iters", 1),
+        ("B", g.lanes), ("NB", g.blocks), ("KVCP", usize::from(!g.host_copy)),
+    ])
 }
 
 /// The layout's parameters: (name, has a default), in declaration order.
@@ -248,10 +331,10 @@ pub fn layout_params(layout: &str) -> Vec<(String, bool)> {
 /// and nothing unknown is passed.
 pub fn params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<(Design, Vec<(String, String)>)> {
     let d = design(plan)?;
-    if plan.program.is_none() && !cfg.pins.iter().any(|p| p.0 == "GW") {
+    if d != Design::Serve8b && plan.program.is_none() && !cfg.pins.iter().any(|p| p.0 == "GW") {
         return Err(format!("{}: no full program places the model: {}", plan.spec.name, plan.blockers.join("; ")));
     }
-    let mut set: Vec<(&'static str, usize)> = plan.params();
+    let mut set: Vec<(&'static str, usize)> = if d == Design::Serve8b { serve8b_params(plan, cfg)? } else { plan.params() };
     let put = |set: &mut Vec<(&'static str, usize)>, k: &'static str, v: usize| match set.iter_mut().find(|e| e.0 == k) {
         Some(e) => e.1 = v,
         None => set.push((k, v)),
@@ -272,7 +355,7 @@ pub fn params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<(Design, Vec<(String, 
         if let Some(h) = cfg.hlm {
             put(&mut set, "HLM", h);
         }
-    } else if cfg.spec.is_some() || cfg.smp || cfg.mmax.is_some() {
+    } else if d != Design::Serve8b && (cfg.spec.is_some() || cfg.smp || cfg.mmax.is_some()) {
         return Err("speculative decode, the fused sampler and MMAX are serve2d_pipe's".into());
     }
     let vm_keys: Vec<&'static str> = cfg.vm.map(|vm| vm.params()).unwrap_or_default().iter().map(|p| p.0).collect();
@@ -543,5 +626,49 @@ mod tiny {
         let goals = Goals { pipeline: true, ..Goals::lanes(2) };
         let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).unwrap();
         assert!(params(&plan, &ServeConfig::new(goals)).unwrap_err().contains("no full program"));
+    }
+}
+
+
+#[cfg(test)]
+mod qwen3_8b {
+    use super::*;
+    use crate::spatial::plan::{ModelSpec, WaferDims};
+
+    fn spec() -> ModelSpec {
+        let catalog = poem_compiler::catalog::repository();
+        let d = catalog.parse("qwen3-8b-bf16-kv-bf16").expect("qwen3-8b parses");
+        ModelSpec::read(&d.trace(poem_ir::Platform::Cerebras)).expect("qwen3-8b reads")
+    }
+
+    fn sorted(extra: &str) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = extra
+            .split(',')
+            .map(|kv| kv.split_once(':').map(|(k, v)| (k.to_string(), v.to_string())).unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// 0115_serve8b_real's two builds come out of the plan and a config.
+    #[test]
+    fn the_plan_places_qwen3_8b_as_0115() {
+        let base = "PX:128,PY:144,Hc:29,HR:4096,Dc:8,Gs:16,Qh:4,Ic:96,PS:16,E:1,MC:1,W16:1,NP:3,KV16:1,PROF:0,TIME:0,\
+                    GW:5,GH:8,GS:4,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,PASSES:3,MODE:0,OVL:0,VMC:1,\
+                    CAP:64,iters:1";
+        for (b, nb, host, np) in [(1, 1, false, 3), (4, 1, true, 1)] {
+            let goals = Goals { blocks: Some(nb), host_copy: host, grid_lanes: b, ..Goals::lanes(b) };
+            let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+            let mut cfg = ServeConfig::new(goals);
+            if np != 3 {
+                cfg.pins.push(("NP", np));
+            }
+            let (d, p) = params(&plan, &cfg).unwrap();
+            assert_eq!(d, Design::Serve8b);
+            let mut got = p.clone();
+            got.sort();
+            let want = format!("{base},B:{b},NB:{nb},KVCP:{}", usize::from(!host)).replace("NP:3", &format!("NP:{np}"));
+            assert_eq!(got, sorted(&want), "B {b}");
+        }
     }
 }

@@ -214,6 +214,12 @@ pub struct CerebrasEngineOptions {
     pub spatial_ckpt: Option<String>,
     /// The daemon runs only the first this many layers; omit for all.
     pub spatial_layers: Option<u32>,
+    /// The spatial engine's program built by PIE from the model's plan: the
+    /// lanes, page size, pipeline, eta VM image, ... (the engine's
+    /// `[cerebras.spatial.serve]`; `engine-cerebras` `spatial::build`).
+    /// Used when neither `spatial_program` nor `spatial_params` is set; the
+    /// compile is cached, so later starts reuse it.
+    pub spatial_serve: Option<toml::Table>,
 }
 
 impl Default for CerebrasEngineOptions {
@@ -235,6 +241,7 @@ impl Default for CerebrasEngineOptions {
             spatial_guest: None,
             spatial_ckpt: None,
             spatial_layers: None,
+            spatial_serve: None,
         }
     }
 }

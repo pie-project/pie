@@ -834,6 +834,7 @@ pub(crate) fn create_engine_backend(
             if opts.spatial_daemon.is_some()
                 || opts.spatial_program.is_some()
                 || opts.spatial_params.is_some()
+                || opts.spatial_serve.is_some()
             {
                 boot_doc.push_str("[cerebras.spatial]\n");
                 if let Some(daemon) = &opts.spatial_daemon {
@@ -870,6 +871,17 @@ pub(crate) fn create_engine_backend(
                 if let Some(layers) = opts.spatial_layers {
                     boot_doc.push_str(&format!("layers = {layers}\n"));
                 }
+            }
+            if let Some(serve) = &opts.spatial_serve {
+                // Nested under [cerebras.spatial.serve], its own sub-tables too.
+                let mut spatial = toml::Table::new();
+                spatial.insert("serve".into(), toml::Value::Table(serve.clone()));
+                let mut cerebras = toml::Table::new();
+                cerebras.insert("spatial".into(), toml::Value::Table(spatial));
+                let mut doc = toml::Table::new();
+                doc.insert("cerebras".into(), toml::Value::Table(cerebras));
+                boot_doc.push('\n');
+                boot_doc.push_str(&toml::to_string(&doc)?);
             }
             let backend = runtime::engine::backend::open::cerebras(boot_doc.as_bytes())?;
             let defaults = engine::Budgets::default();
