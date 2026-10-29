@@ -15,6 +15,10 @@ elemwise.hc_mma = true
 elemwise.norm_emit = true
 elemwise.rows_vec = true
 sdpa.merge_warp = true
+sdpa.pool_mma = true
+sdpa.selected_mma = true
+[engine]
+forward_tokens = 2048
 
 [provenance]
 measured = [
@@ -42,8 +46,13 @@ measured = [
   "kernel.sdpa.decode.split_small",
   "kernel.sdpa.decode.split_window",
   "kernel.sdpa.decode.static_max_requests",
+  "kernel.sdpa.pool_mma",
+  "kernel.sdpa.index_mma",
+  "kernel.sdpa.index_radix",
   "kernel.sdpa.prefill.ctas_per_sm",
+  "kernel.sdpa.selected_mma",
   "engine.copies",
+  "engine.forward_tokens",
   "engine.graphs",
   "engine.lattice_steps",
   "engine.recording",

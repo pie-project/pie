@@ -18,10 +18,17 @@ pub struct Atem {
     stop_ids: Vec<u32>,
     reasoning_open: Vec<u32>,
     generation_prefix: Vec<u32>,
+    open: bool,
 }
 
 impl Atem {
     pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
+        Self::try_with(tokenizer, false)
+    }
+
+    /// `open`: the Muse Spark release's system turn, its preamble, date and
+    /// recipients stated whether a system message is given or not.
+    pub fn try_with(tokenizer: Arc<Tokenizer>, open: bool) -> Result<Self, String> {
         let stop_ids = specials(&tokenizer, STOP_TOKENS)?;
 
         let start = special(&tokenizer, "<|start|>")?;
@@ -53,6 +60,7 @@ impl Atem {
             reasoning_open,
             generation_prefix,
             tokenizer,
+            open,
         })
     }
 
@@ -76,6 +84,9 @@ impl Instruct for Atem {
     }
 
     fn system(&self, msg: &str) -> Vec<u32> {
+        if self.open {
+            return self.opening(&self.system_prefix, &open_system(msg));
+        }
         let mut body = msg.to_string();
         if !msg.to_ascii_lowercase().contains("reasoning strength") {
             body.push_str("\n\nReasoning strength: high.");
@@ -85,6 +96,11 @@ impl Instruct for Atem {
     }
 
     fn first_user(&self, msg: &str) -> Vec<u32> {
+        if self.open {
+            let mut tokens = self.opening(&self.system_prefix, &open_system(""));
+            tokens.extend(self.turn(&self.user_prefix, msg));
+            return tokens;
+        }
         self.opening(&self.user_prefix, msg)
     }
 
@@ -133,4 +149,43 @@ impl Instruct for Atem {
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(NoopToolDecoder)
     }
+}
+
+/// The Muse Spark release's system turn around `msg` (its chat template's
+/// defaults: the 2026-01-04 cutoff, today's UTC date, strength 512).
+fn open_system(msg: &str) -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() / 86_400)
+        .cast_signed();
+    // Days since 1970-01-01 as a civil date (Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let mut parts = vec![
+        "You are a helpful AI assistant.".to_string(),
+        "Knowledge cutoff: 2026-01-04.".to_string(),
+        format!("Current date: {year:04}-{month:02}-{day:02}."),
+    ];
+    if !msg.is_empty() {
+        parts.push(msg.to_string());
+    }
+    if !msg.to_ascii_lowercase().contains("reasoning strength:") {
+        parts.push("Reasoning strength: 512.".to_string());
+    }
+    parts.push(
+        "Use the appropriate recipient for each message:\n\n\
+         - \"self\": private reasoning and tool planning.\n\
+         - \"commentary\": user-visible intermediate updates while the assistant will continue working, including messages sent to the user before or between tool calls.\n\
+         - \"user\": messages that end the assistant turn, such as a completed response or clarification question that waits for the user's reply; do not use for pre-tool updates or partial responses.\n\n\
+         # Valid recipients: \"self\", \"commentary\", \"user\"."
+            .to_string(),
+    );
+    parts.join("\n\n")
 }
