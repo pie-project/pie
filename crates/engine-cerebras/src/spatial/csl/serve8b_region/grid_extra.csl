@@ -1,0 +1,124 @@
+// ---------------------------------------------------------------- serve8b_region
+// (appended to qwen2d_paged8b's and qwen2d_region's pe.csl by sync.py) The
+// handoff of x (B lanes of Hc a row, lane-major) between layer units: 128 x
+// 144 grids of one layer and 256 x 240 regions of NL layers (x stays in place
+// between a region's layers). Row py of a unit holds hidden dims
+// [py Hc, (py + 1) Hc) on every column.
+//
+// Placement and chaining are the host's (serve_lib8b.WaferModel.route_table):
+// before `init` it writes each PE's `rtab`, which init applies and every pass
+// follows. The device only moves *pieces*: a piece is (color, off, n), the
+// words [off, off + n) of every lane's Hc, B x n words lane-major on the wire.
+// - A plain handoff is one piece (c, 0, Hc) in and one out.
+// - A re-chunk (a unit of another Hc) delivers a row's dims in 2-3 pieces from
+//   the rows of the unit before, each on its own path and color; the row's
+//   assembling PE takes them in turn, then multicasts the row (`relay`).
+//
+// rtab (u16, 16-bit memcpy): [nr, nrecv, nsend, relay, fwd_in, px, py,
+//   (color, rx, tx1, tx2) x RT_R, (color, off, n) x RT_I, (color, off, n) x RT_O]
+// colors by number (NONE 0xff), directions as the kernel's D_* (0 ramp, 1 N,
+// 2 S, 3 E, 4 W). Routes are read-modify-written (only the route bits change).
+// - recv pieces arrive on one color, in order; each is B lanes of n words.
+// - send entries all use one color (an output queue's color is never changed
+//   while wavelets may still sit in it); off = FWD forwards n words (pieces
+//   from another source PE, which reach this PE on fwd_in) without staging.
+// Queue 2 (free in both kernels) carries every piece. Its input color is set
+// at a receive's start (the unit is idle-waiting by then: every token passes
+// the units in order) and to fwd_in after it (a forward's pieces come after
+// this unit's layer).
+const rt = @import_module("rt.csl");
+const RT_R: u16 = S2D_RTR;
+const RT_I: u16 = 3;
+const RT_O: u16 = 3;
+const RTN: u16 = 7 + 4 * RT_R + 3 * RT_I + 3 * RT_O;
+const RNONE: u16 = 0xff;
+const FWD: u16 = 0xffff;
+const OFF_R: u16 = 7;
+const OFF_I: u16 = OFF_R + 4 * RT_R;
+const OFF_O: u16 = OFF_I + 3 * RT_I;
+var rtab = @zeros([RTN]u16);
+var rtab_ptr: [*]u16 = &rtab;
+const s2d_x1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> x[i] });
+
+// The PE's place in its unit, from the host (units need not sit on multiples
+// of their size: the regions start below the band).
+fn s2d_place() void {
+  px = rtab[5];
+  py = rtab[6];
+}
+
+fn s2d_routes() void {
+  const cc0 = color_config.get_color_config_addr(@get_color(0));
+  var k: u16 = 0;
+  while (k < rtab[0]) : (k += 1) {
+    const e = OFF_R + 4 * k;
+    const addr = cc0 + rtab[e];
+    var r = @get_config(addr, tgt.color_addr_range);
+    r = r & @get_int(tgt.fabric_io.CLEAR_MASK);
+    r = r | rxw(rtab[e + 1]) | txw(rtab[e + 2]) | txw(rtab[e + 3]);
+    @set_config(addr, r, tgt.color_addr_range);
+  }
+}
+
+// Lane b's words [off, off + n) of x.
+fn s2d_lane(b: u16, off: u16, n: u16) mem1d_dsd {
+  return @set_dsd_length(@increment_dsd_offset(s2d_x1, @as(i16, b * Hc + off), f32), n);
+}
+
+fn recv_x() void {
+  if (rtab[1] > 0) { rt.iq_color(2, rtab[OFF_I]); }
+  var k: u16 = 0;
+  while (k < rtab[1]) : (k += 1) {
+    const e = OFF_I + 3 * k;
+    var b: u16 = 0;
+    while (b < B) : (b += 1) { @fmovs(s2d_lane(b, rtab[e + 1], rtab[e + 2]), fin(q_gb_in, rtab[e + 2])); }
+  }
+  if (rtab[3] != RNONE) {
+    // The row's assembling PE multicasts the whole row on.
+    rt.oq_color(2, rtab[3]);
+    @fmovs(fout(q_gb_out, S2D_XN), x_all);
+  }
+  if (rtab[4] != RNONE) { rt.iq_color(2, rtab[4]); }
+}
+
+fn send_x() void {
+  if (rtab[2] > 0) { rt.oq_color(2, rtab[OFF_O]); }
+  var k: u16 = 0;
+  while (k < rtab[2]) : (k += 1) {
+    const e = OFF_O + 3 * k;
+    const n = rtab[e + 2];
+    if (rtab[e + 1] == FWD) {
+      @fmovs(fout(q_gb_out, n), fin(q_gb_in, n));
+    } else {
+      var b: u16 = 0;
+      while (b < B) : (b += 1) { @fmovs(fout(q_gb_out, n), s2d_lane(b, rtab[e + 1], n)); }
+    }
+  }
+}
+
+// `steps` passes, each through this unit once: x in from the unit before
+// (layer 0: the host's or the embedding strip's), the unit's layer(s), x out.
+// start_pos is unused (positions come from `tab`). S2D_TIME 1 (PROF 0): prof[0]
+// sums the passes' cycles after the first (~0.3 KB of code, off by default).
+// S2D_NOLAYER 1 (checking the handoffs alone): x passes every unit unchanged.
+fn compute(steps: u32, start_pos: u32) void {
+  if (S2D_TIME == 1) { timestamp.enable_tsc(); }
+  var i: u32 = 0;
+  while (i < steps) : (i += 1) {
+    s2d_pass_start(i, start_pos);   // the kernel's per-pass prologue (sync.py)
+    recv_x();
+    if (S2D_TIME == 1) {
+      timing = i > 0;
+      pass_start();
+      timestamp.get_timestamp(&t_mark);
+    }
+    if (S2D_NOLAYER == 0) { s2d_layers(); }   // the kernel's layer(s) (sync.py)
+    if (S2D_TIME == 1) { pass_end(); }
+    send_x();
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @export_symbol(rtab_ptr, "rtab");
+}

@@ -162,7 +162,7 @@ impl Design {
                 .and_then(|(_, v)| v.trim().parse().ok())
         };
         match (built.as_deref(), super::serve2d::Layout2d::of(get)) {
-            (Some("serve2d" | "serve2d_pipe") | None, Some(grid)) => grid
+            (Some("serve2d" | "serve2d_pipe" | "serve8b" | "serve8b_region") | None, Some(grid)) => grid
                 .map(Design::Grid)
                 .map_err(|e| format!("{}: {e}", path.display())),
             (Some(d), _) => Err(format!("{}: PIE built a `{d}` program, which this engine does not serve", program.display())),
@@ -202,11 +202,18 @@ impl Design {
 /// Where placed weights go: the runtime, or a recorder for checking.
 pub trait Sink {
     fn h2d(&mut self, symbol: &str, rect: Rect, elems_per_pe: usize, words: &[u32]) -> R<()>;
+    /// A 16-bit copy: each word's low half is one element (bf16 bits).
+    fn h2d16(&mut self, symbol: &str, rect: Rect, elems_per_pe: usize, words: &[u32]) -> R<()>;
 }
 
 impl Sink for Runtime {
     fn h2d(&mut self, symbol: &str, rect: Rect, elems_per_pe: usize, words: &[u32]) -> R<()> {
         self.memcpy_h2d(symbol, words, rect, elems_per_pe, Order::RowMajor, DataType::Bits32)
+            .map_err(|e| format!("placing {symbol}: {e}"))
+    }
+
+    fn h2d16(&mut self, symbol: &str, rect: Rect, elems_per_pe: usize, words: &[u32]) -> R<()> {
+        self.memcpy_h2d(symbol, words, rect, elems_per_pe, Order::RowMajor, DataType::Bits16)
             .map_err(|e| format!("placing {symbol}: {e}"))
     }
 }
@@ -609,7 +616,17 @@ impl WaferModel {
     ) -> R<WaferModel> {
         let design = Design::read(program)?;
         let ckpt = Ckpt::open(ckpt_dir)?;
-        if !ckpt.tied_head()? {
+        let s8b = matches!(&design, Design::Grid(g) if g.s8b.is_some());
+        if s8b {
+            // serve8b holds lm_head itself (and the embedding apart).
+            if !ckpt.has("lm_head.weight") {
+                return Err(format!(
+                    "{}: no lm_head.weight; serve8b serves untied checkpoints (a tied one would need \
+                     the embedding as the head)",
+                    ckpt_dir.display()
+                ));
+            }
+        } else if !ckpt.tied_head()? {
             return Err(format!(
                 "{}: an untied LM head (lm_head.weight apart from embed_tokens); the wafer \
                  programs compute the logits from the embedding and cannot place lm_head yet",
@@ -628,6 +645,22 @@ impl WaferModel {
         let mut rt = Runtime::new(sdk, program, platform, "WARNING").map_err(|e| e.to_string())?;
         rt.load();
         rt.run();
+        // serve8b: the grids' handoff routes, which `init` applies.
+        if let Design::Grid(grid) = &design
+            && grid.s8b.is_some()
+        {
+            // serve8b_region with HROUTE: the program's route encoding first.
+            let rbits = match super::serve8b::rbits_at(grid) {
+                Some((x, y)) => {
+                    let mut b = vec![0u32; 10];
+                    rt.memcpy_d2h("rbits", &mut b, rect(x, y, 1, 1), 10, Order::RowMajor, DataType::Bits32)
+                        .map_err(|e| format!("reading rbits: {e}"))?;
+                    Some(b)
+                }
+                None => None,
+            };
+            super::serve8b::put_routes(grid, &mut rt, rbits.as_deref())?;
+        }
         // serve28s: every PE takes its place, queue colors and routes before
         // any traffic (a serve28 program has no `init`).
         if rt.rpc().get("init").is_ok() {

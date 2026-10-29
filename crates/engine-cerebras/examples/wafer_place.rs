@@ -1,6 +1,6 @@
 //! Records the spatial wafer model's weight placement without a device:
 //! `wafer_place <program dir with out.json> <ckpt dir> <out dir>` writes
-//! every copy as `calls.jsonl` (symbol, rect, elements a PE) and the words
+//! every copy as `calls.jsonl` (symbol, rect, elements a PE, 16- or 32-bit) and the words
 //! as `calls.bin`, for checking against the bring-up's serve_lib28.py.
 
 use std::io::Write;
@@ -15,16 +15,27 @@ struct Recorder {
     words: std::fs::File,
 }
 
-impl Sink for Recorder {
-    fn h2d(&mut self, symbol: &str, rect: Rect, n: usize, words: &[u32]) -> Result<(), String> {
+impl Recorder {
+    fn record(&mut self, symbol: &str, rect: Rect, n: usize, bits: u32, words: &[u32]) -> Result<(), String> {
         writeln!(
             self.index,
             "{}",
-            serde_json::json!({"sym": symbol, "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h, "n": n})
+            serde_json::json!({"sym": symbol, "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h, "n": n, "bits": bits})
         )
         .map_err(|e| e.to_string())?;
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         self.words.write_all(&bytes).map_err(|e| e.to_string())
+    }
+}
+
+impl Sink for Recorder {
+    fn h2d(&mut self, symbol: &str, rect: Rect, n: usize, words: &[u32]) -> Result<(), String> {
+        self.record(symbol, rect, n, 32, words)
+    }
+
+    /// A 16-bit copy (serve8b's bf16 blocks): still a u32 word an element.
+    fn h2d16(&mut self, symbol: &str, rect: Rect, n: usize, words: &[u32]) -> Result<(), String> {
+        self.record(symbol, rect, n, 16, words)
     }
 }
 

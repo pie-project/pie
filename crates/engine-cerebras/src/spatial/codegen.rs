@@ -20,6 +20,8 @@ mod src {
     pub const HEAD2D_V9: &str = include_str!("csl/kernels/head2d_v9.csl");
     pub const QWEN2D_PAGED8B: &str = include_str!("csl/kernels/qwen2d_paged8b.csl");
     pub const HEAD2D_V10: &str = include_str!("csl/kernels/head2d_v10.csl");
+    pub const QWEN2D_PAGED8B_HR: &str = include_str!("csl/kernels/qwen2d_paged8b_hr.csl");
+    pub const QWEN2D_REGION: &str = include_str!("csl/kernels/qwen2d_region.csl");
     pub const VM_HM: &str = include_str!("csl/vm/guest4hm_vm.csl");
     pub const VM_HS: &str = include_str!("csl/vm/guest4hs_vm.csl");
 
@@ -44,6 +46,16 @@ mod src {
         pub const FILLER_BASE: &str = include_str!("csl/serve8b/filler_base.csl");
     }
 
+    pub mod s8br {
+        pub const LAYOUT: &str = include_str!("csl/serve8b_region/layout.csl");
+        pub const PATHS: &str = include_str!("csl/serve8b_region/paths.csl");
+        pub const RT: &str = include_str!("csl/serve8b_region/rt.csl");
+        pub const GRID_EXTRA: &str = include_str!("csl/serve8b_region/grid_extra.csl");
+        pub const HEAD_EXTRA: &str = include_str!("csl/serve8b_region/head_extra.csl");
+        pub const EMBED_BASE: &str = include_str!("csl/serve8b_region/embed_base.csl");
+        pub const FILLER_BASE: &str = include_str!("csl/serve8b_region/filler_base.csl");
+    }
+
     pub mod pipe {
         pub const LAYOUT: &str = include_str!("csl/serve2d_pipe/layout.csl");
         pub const PATHS: &str = include_str!("csl/serve2d_pipe/paths.csl");
@@ -65,6 +77,9 @@ pub enum Design {
     /// Qwen3-8B: qwen2d_paged8b layer grids in strips, head2d v10 and the
     /// embedding strip (serve8b).
     Serve8b,
+    /// Qwen3-8B as layer units: qwen2d_paged8b grids and qwen2d_region
+    /// regions of several layers, chained by host tables (serve8b_region).
+    Serve8bRegion,
 }
 
 impl Design {
@@ -73,6 +88,7 @@ impl Design {
             Design::Serve2d => "serve2d",
             Design::Serve2dPipe => "serve2d_pipe",
             Design::Serve8b => "serve8b",
+            Design::Serve8bRegion => "serve8b_region",
         }
     }
 
@@ -81,6 +97,7 @@ impl Design {
             "serve2d" => Some(Design::Serve2d),
             "serve2d_pipe" => Some(Design::Serve2dPipe),
             "serve8b" => Some(Design::Serve8b),
+            "serve8b_region" => Some(Design::Serve8bRegion),
             _ => None,
         }
     }
@@ -91,6 +108,7 @@ impl Design {
             Design::Serve2d => serve2d(),
             Design::Serve2dPipe => serve2d_pipe(),
             Design::Serve8b => serve8b(),
+            Design::Serve8bRegion => serve8b_region(),
         }
     }
 }
@@ -864,6 +882,174 @@ pub fn serve8b() -> R<Vec<File>> {
     ])
 }
 
+// ---------------------------------------------------------------- serve8b_region
+
+/// The grid kernels' HROUTE exports (their own under `HROUTE` 1).
+const S8BR_HROUTE_NAMES: &[(&str, &str)] = &[("rcfg", "u32"), ("rbits", "u32")];
+
+fn s8br_dummies(own: &[String]) -> String {
+    let all = Names::of(S8B_GRID_NAMES).with(S8B_HEAD_NAMES).with(S8B_EMBED_NAMES).with(S8BR_HROUTE_NAMES);
+    let mut lines = Vec::new();
+    let mut decls = Vec::new();
+    for &(n, ty) in &all.0 {
+        if own.iter().any(|o| o == n) {
+            continue;
+        }
+        decls.push(format!("var s2d_d_{n} = @zeros([1]{ty});\nvar s2d_d_{n}_ptr: [*]{ty} = &s2d_d_{n};"));
+        if S8BR_HROUTE_NAMES.iter().any(|h| h.0 == n) {
+            lines.push(format!("  if (HROUTE == 1) {{ @export_symbol(s2d_d_{n}_ptr, \"{n}\"); }}"));
+        } else {
+            lines.push(format!("  @export_symbol(s2d_d_{n}_ptr, \"{n}\");"));
+        }
+    }
+    format!(
+        "// serve8b: the other programs' exported names.\n{}\ncomptime {{\n{}\n}}\n",
+        decls.join("\n"),
+        lines.join("\n")
+    )
+}
+
+/// A unit kernel (qwen2d_paged8b or qwen2d_region) with serve8b_region's
+/// grid_extra: the host's placement and handoffs, its pass prologue and its
+/// layer(s) lifted out of `compute`.
+fn s8br_unit(kernel: &str, src: &str) -> R<String> {
+    let tag = format!("{kernel}/pe.csl");
+    let mut s = patch(
+        src,
+        "param c_r1_0: color;\n",
+        concat!(
+            "// serve8b: 1 times each pass (prof[0]); the route table's route capacity.\n",
+            "param S2D_TIME: u16;\nparam S2D_RTR: u16;\nparam S2D_NOLAYER: u16;\nparam c_r1_0: color;\n"
+        ),
+        "params",
+    )?;
+    s = patch(&s, "  px = layout_mod.get_x_coord();\n  py = layout_mod.get_y_coord();\n", "  s2d_place();\n", "init coordinates")?;
+    s = patch(
+        &s,
+        "  axis_y();\n  sys_mod.unblock_cmd_stream();\n}\n",
+        "  axis_y();\n  s2d_routes();\n  sys_mod.unblock_cmd_stream();\n}\n",
+        "init routes",
+    )?;
+    let head = "fn compute(steps: u32) void {\n";
+    let (start, end) = fn_block(&s, head).ok_or_else(|| format!("gen: {tag} changed: compute() not found"))?;
+    let body_at = start + s[start..].find(head).unwrap_or(0) + head.len();
+    let body = &s[body_at..end - 3];
+    let open = "  while (i < steps) : (i += 1) {\n";
+    let mid = "\n    timing = i > 0;\n    pass_start();\n    timestamp.get_timestamp(&t_mark);\n";
+    let close = "\n    pass_end();\n  }\n";
+    let bad = || format!("gen: {tag} changed: compute()'s pass loop not as expected");
+    let lo = body.find(open).ok_or_else(bad)? + open.len();
+    let m = lo + body[lo..].find(mid).ok_or_else(bad)?;
+    let hi = m + mid.len() + body[m + mid.len()..].find(close).ok_or_else(bad)?;
+    let dedent = |t: &str| t.split('\n').map(|l| l.strip_prefix("  ").unwrap_or(l)).collect::<Vec<_>>().join("\n");
+    let pass_fn = format!(
+        "// The kernel's per-pass prologue (lanes advance) and its layer(s), lifted by sync.py.\n\
+fn s2d_pass_start(i: u32, start_pos: u32) void {{\n{}\n}}\nfn s2d_layers() void {{\n{}\n}}\n",
+        dedent(&body[lo..m]),
+        dedent(&body[m + mid.len()..hi])
+    );
+    s = format!("{}\n{}", &s[..start], &s[end..]);
+    let mut own = exports(&s);
+    own.extend(exports(src::s8br::GRID_EXTRA));
+    let extra = format!("{S8B_GRID_VARIANT}\n{pass_fn}\n{}\n{}", src::s8br::GRID_EXTRA, s8br_dummies(&own));
+    // `\ncomptime {\n(  if (NL > 1)...\n)?  @initialize_queue(q_r1_0_in`
+    let mut at = None;
+    let mut from = 0;
+    while let Some(i) = s[from..].find("\ncomptime {\n") {
+        let c = from + i;
+        let mut rest = &s[c + "\ncomptime {\n".len()..];
+        if rest.starts_with("  if (NL > 1)") {
+            rest = rest.find('\n').map_or("", |k| &rest[k + 1..]);
+        }
+        if rest.starts_with("  @initialize_queue(q_r1_0_in") {
+            at = Some(c);
+            break;
+        }
+        from = c + 1;
+    }
+    let at = at.ok_or_else(|| format!("gen: {tag} changed: the queues' comptime block not found"))?;
+    s = format!("{}\n{extra}{}", &s[..at], &s[at..]);
+    Ok(format!(
+        "// GENERATED by serve8b/sync.py from {tag} + serve8b/grid_extra.csl.\n\
+// Do not edit: change grid_extra.csl or sync.py and rerun.\n{s}"
+    ))
+}
+
+fn s8br_head() -> R<String> {
+    let tag = "head2d_v10/pe.csl";
+    let mut s = patch(
+        src::HEAD2D_V10,
+        "param WF32: u16;\n",
+        concat!(
+            "param WF32: u16;\n// serve8b: the end grids (GPX x GPY, GHc dims a row; the last at XL, YL), the head's first column XH0,\n",
+            "// row), the tokens' capacity, the lanes, the copy kernel, the grids' element\n",
+            "// types (their exports).\nparam GPX: u16;\nparam GPY: u16;\nparam GHc: u16;\nparam XH0: u16;\n",
+            "param XL: u16;\nparam YL: u16;\nparam CAP: u16;\nparam SB: u16;\nparam HLB: u16;\n",
+            "param KVCP: u16;\nparam HROUTE: u16;\nparam WS: type;\nparam KS: type;\n"
+        ),
+        "params",
+    )?;
+    s = patch(
+        &s,
+        HEAD_XY_OLD,
+        "  px = layout_mod.get_x_coord() - XH0;\n  py = layout_mod.get_y_coord();\n  ry = ",
+        "init coordinates",
+    )?;
+    if !s.contains("if (NB == 1) { return; }") {
+        s = patch(
+            &s,
+            "fn row_pairs() void {\n  const r = blk % Gb;\n",
+            "fn row_pairs() void {\n  if (NB == 1) { return; }\n  const r = blk % Gb;\n",
+            "row_pairs",
+        )?;
+    }
+    s = patch(
+        &s,
+        "    if (px == W - 1) { color_config.reset_routes(c_ib, .{ .rx = WEST, .tx = RAMP }); }\n",
+        "    if (px == W - 1) { color_config.reset_routes(c_ib, .{ .rx = WEST, .tx = [2]direction{ EAST, RAMP } }); }\n",
+        "winner multicast east end",
+    )?;
+    s = head_init(&s, "s2d_head_init();")?;
+    s = patch(&s, "  @fmovs(xs_dsd, fin(q_x_in, Hc));\n  mark(0);\n",
+        "  @fmovs(xs_dsd, fin(q_x_in, Hc));\n  s2d_after_x();\n  mark(0);\n", "region x arrival")?;
+    s = patch(&s, "  @fmuls(xs_dsd, xin_dsd, gam_dsd);\n",
+        "  s2d_feeder_in();\n  @fmuls(xs_dsd, xin_dsd, gam_dsd);\n", "feeder input")?;
+    s = patch(&s, "      ib[0] = if (ok) best[1] else -1.0;\n",
+        "      ib[0] = s2d_decide(if (ok) best[1] else -1.0);\n", "final root decision")?;
+    s = patch(&s, "      tok[1] = ib[0];\n", "      ib[0] = s2d_decide(ib[0]);\n      tok[1] = ib[0];\n",
+        "final root decision (gmode)")?;
+    let (t, n) = after_each_call(&s, "emb_copy();", "s2d_emb_out();");
+    if n != 2 {
+        return Err(format!("gen: {tag} changed: emb_copy() called {n} times"));
+    }
+    s = drop_head_compute(&t)?;
+    let mut own = exports(&s);
+    own.extend(["in_tokens", "out_tokens", "yscale", "hlogits"].map(String::from));
+    s = format!("{}\n\n{}\n{}", s.trim_end_matches('\n'), src::s8br::HEAD_EXTRA, s8br_dummies(&own));
+    Ok(format!(
+        "// GENERATED by serve8b/sync.py from {tag} (Fork 7) + serve8b/head_extra.csl.\n\
+// Do not edit: change head_extra.csl or sync.py and rerun.\n{s}"
+    ))
+}
+
+fn s8br_plain(base: &str, base_name: &str, what: &str) -> String {
+    format!("// GENERATED by serve8b/sync.py from {base_name} ({what}).\n{base}\n{}", s8br_dummies(&exports(base)))
+}
+
+/// serve8b_region's build directory.
+pub fn serve8b_region() -> R<Vec<File>> {
+    Ok(vec![
+        ("layout.csl", src::s8br::LAYOUT.to_string()),
+        ("paths.csl", src::s8br::PATHS.to_string()),
+        ("rt.csl", src::s8br::RT.to_string()),
+        ("grid_pe.csl", s8br_unit("qwen2d_paged8b", src::QWEN2D_PAGED8B_HR)?),
+        ("region_pe.csl", s8br_unit("qwen2d_region", src::QWEN2D_REGION)?),
+        ("head_pe.csl", s8br_head()?),
+        ("embed_pe.csl", s8br_plain(src::s8br::EMBED_BASE, "embed_base.csl", "the embedding strip")),
+        ("filler.csl", s8br_plain(src::s8br::FILLER_BASE, "filler_base.csl", "the filler")),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,12 +1072,17 @@ mod tests {
         ("serve8b", "head_pe.csl", "b08dbbaef37c00d3b0a6f91888766eda3ec77cfddb868b1780f7b59c85f27256"),
         ("serve8b", "embed_pe.csl", "0c17e992957bce93e17360b590ad8148641f6e02f42c87d29006370b6fc44a18"),
         ("serve8b", "filler.csl", "ba91cf083cc4235ea8da24076a75668549432601fb80e0e3cac8ee545fb8f5db"),
+        ("serve8b_region", "grid_pe.csl", "4f4ab43669a8f18836f9b2fd1b76ce4d6fea5c91ce9a637b28454a703e1222d7"),
+        ("serve8b_region", "region_pe.csl", "d78b100ddc4f317b7feecab8dbbf20e49d3d0fad9f924a27a2a9d23f0f3930f7"),
+        ("serve8b_region", "head_pe.csl", "623a8264b5d362b6b32bf13355b0bd8809ade1f257801685b5a62e52c92bf3f8"),
+        ("serve8b_region", "embed_pe.csl", "b652fc2083797a4951c1e84d82eb95b3a763e6a40856881bd43c50b6d36255ec"),
+        ("serve8b_region", "filler.csl", "7c14a22898f071d5d8143c1a7786fe88b3f5885976aac2c1b5078242b7d516cb"),
     ];
 
     #[test]
     fn generators_match_their_pins() {
         if std::env::var_os("PIE_CEREBRAS_PRINT_PINS").is_some() {
-            for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b] {
+            for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b, Design::Serve8bRegion] {
                 for (name, text) in d.files().unwrap() {
                     println!("PIN (\"{}\", \"{name}\", \"{}\"),", d.name(), blake3::hash(text.as_bytes()).to_hex());
                 }
@@ -906,12 +1097,17 @@ mod tests {
     }
 
     /// With `PIE_CEREBRAS_PAYLOAD` set to the bench payload directory, every
-    /// generated file must equal its sync.py output there byte for byte.
+    /// generated file must equal its sync.py output there byte for byte
+    /// (`PIE_CEREBRAS_PAYLOAD_ONLY`: just that design).
     #[test]
     fn generators_match_payload() {
         let Some(root) = std::env::var_os("PIE_CEREBRAS_PAYLOAD") else { return };
         let root = std::path::PathBuf::from(root);
-        for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b] {
+        let only = std::env::var("PIE_CEREBRAS_PAYLOAD_ONLY").ok();
+        for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b, Design::Serve8bRegion] {
+            if only.as_deref().is_some_and(|o| o != d.name()) {
+                continue;
+            }
             for (name, text) in d.files().unwrap() {
                 let want = std::fs::read_to_string(root.join(d.name()).join(name)).unwrap();
                 if want != text {

@@ -1,0 +1,101 @@
+// serve8b_region: the two staircases between the layer units, the head and
+// the embedding strip, as routes for whichever PE (head, strip or filler)
+// they cross; the grids' own ends come from the host's route table. Every
+// chunk travels on its own path; the paths of one color never share a router.
+// The first and the last layer are 128 x 144-type grids (Hc chunks): layer 0
+// at the head's west edge (rows 0..GHT-1), the last at (XL, YL), YL > F.
+//
+// S (last layer -> head): chunk j (Hc dims; GHT of them) leaves the last
+//   grid's east column on its row j, runs east to the head column of its pair
+//   k = j / 2, then north up that column to the feeder row F. Even chunks on
+//   C_S0, odd on C_S1 (the pair's two paths share a column). Pair k's column
+//   increases with k, so a row's leg only crosses columns of lower pairs, whose
+//   legs end above it.
+// E (embedding strip -> layer 0): the strip column of group c holds hidden
+//   dims of grid chunks 4c..4c+3; its collector (row F) sends chunk j = 4c + k
+//   north on C_E[k] up to row j, then west along row j into layer 0's east
+//   column, which multicasts it along the row. Group c's column decreases
+//   with c (xe), so a row's westward leg only crosses columns of higher groups,
+//   whose legs end below it.
+param GWD: u16;        // the end grids' width (columns)
+param GHT: u16;        // their height (rows = x's chunks)
+param XL: u16;         // the last layer's grid corner
+param YL: u16;
+param XH: u16;         // the head's first column
+param F: u16;          // the feeder row (fabric row)
+param C: u16;          // the head's chunk-pair columns (GHT / 2)
+param VMC: u16;        // the VM column (0/1) at chunk column VMAT
+param VMAT: u16;
+param XE: u16;         // the embedding strip's first column
+param EC: u16;         // its columns (GHT / 4)
+
+const rt = @import_module("rt.csl");
+const C_S0: color = @get_color(14);
+const C_S1: color = @get_color(15);
+const C_E0: color = @get_color(0);
+const C_E1: color = @get_color(1);
+const C_E2: color = @get_color(4);
+const C_E3: color = @get_color(13);
+
+// Head column of chunk pair k; the pair at column gx (C: none).
+fn hcol(k: u16) u16 { return XH + k + (if (VMC == 1 and k >= VMAT) 1 else 0); }
+fn pair_at(gx: u16) u16 {
+  if (gx < XH or gx >= XH + C + VMC) { return C; }
+  const off = gx - XH;
+  if (VMC == 1 and off == VMAT) { return C; }
+  return if (VMC == 1 and off > VMAT) off - 1 else off;
+}
+// Strip column of embedding group c; the group at column gx (EC: none).
+fn xe(c: u16) u16 { return XE + EC - 1 - c; }
+fn group_at(gx: u16) u16 {
+  if (gx < XE or gx >= XE + EC) { return EC; }
+  return EC - 1 - (gx - XE);
+}
+
+// S: one color's leg in pair column kc (chunk j), at fabric row gy.
+fn s_col(comptime c: color, j: u16, gy: u16, yl: u16) void {
+  if (gy > F and gy < yl + j) { rt.route(c, rt.RX_S, rt.TX_N); }
+  else if (gy == F) { rt.route(c, rt.RX_S, rt.TX_R); }
+}
+// S: chunk j's row leg at column gx.
+fn s_row(comptime c: color, j: u16, gx: u16, xl: u16) void {
+  const k = j / 2;
+  if (gx == xl + GWD - 1) { rt.route(c, rt.RX_R, rt.TX_E); }
+  else if (gx > xl + GWD - 1 and gx < hcol(k)) { rt.route(c, rt.RX_W, rt.TX_E); }
+  else if (gx == hcol(k)) { rt.route(c, rt.RX_W, rt.TX_N); }
+}
+// E: one color's leg in group column (chunk j), at fabric row gy.
+fn e_col(comptime c: color, j: u16, gy: u16) void {
+  if (gy == F) { rt.route(c, rt.RX_R, rt.TX_N); }
+  else if (gy > j and gy < F) { rt.route(c, rt.RX_S, rt.TX_N); }
+  else if (gy == j) { rt.route(c, rt.RX_S, rt.TX_W); }
+}
+fn e_pass(comptime c: color) void { rt.route(c, rt.RX_E, rt.TX_W); }
+
+// Routes of both staircases at fabric (gx, gy), east of the grids or in the
+// last grid (S's first PE). Layer 0's own end of E is the grid's (grid_extra).
+fn routes(gx: u16, gy: u16) void {
+  const xl = XL;
+  const yl = YL;
+  if (gy >= yl and gy < yl + GHT) {
+    const j = gy - yl;
+    if (j % 2 == 0) { s_row(C_S0, j, gx, xl); } else { s_row(C_S1, j, gx, xl); }
+  }
+  const kc = pair_at(gx);
+  if (kc < C) {
+    s_col(C_S0, 2 * kc, gy, yl);
+    s_col(C_S1, 2 * kc + 1, gy, yl);
+  }
+  const c = group_at(gx);
+  if (c < EC) {
+    e_col(C_E0, 4 * c, gy);
+    e_col(C_E1, 4 * c + 1, gy);
+    e_col(C_E2, 4 * c + 2, gy);
+    e_col(C_E3, 4 * c + 3, gy);
+  }
+  if (gy < GHT and gx >= XH and gx < xe(gy / 4)) {
+    const k = gy % 4;
+    if (k == 0) { e_pass(C_E0); } else if (k == 1) { e_pass(C_E1); }
+    else if (k == 2) { e_pass(C_E2); } else { e_pass(C_E3); }
+  }
+}

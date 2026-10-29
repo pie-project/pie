@@ -99,12 +99,15 @@ pub struct ServeConfig {
     pub spec: Option<Spec>,
     /// The fused naive sampler on the head.
     pub smp: bool,
+    /// A paged8b plan as serve8b_region's units (grids and several-layer
+    /// regions) instead of serve8b's strips.
+    pub region: bool,
     pub pins: Vec<(&'static str, usize)>,
 }
 
 impl ServeConfig {
     pub fn new(goals: Goals) -> ServeConfig {
-        ServeConfig { goals, mmax: None, hb: None, vm: None, hlm: None, spec: None, smp: false, pins: Vec::new() }
+        ServeConfig { goals, mmax: None, hb: None, vm: None, hlm: None, spec: None, smp: false, region: false, pins: Vec::new() }
     }
 }
 
@@ -116,6 +119,7 @@ impl ServeConfig {
     ///   `pipeline`, `host_copy`;
     /// - serve2d_pipe: `mmax`, `hb`, `hlm`, `smp`, and `[spec]` (`history`,
     ///   `table`, `out`);
+    /// - `region`: a paged8b (8B) plan as serve8b_region's units;
     /// - `[vm]`: `max_ops`, `nreg`, `pool_words`, `feat`, `ring_w` (default
     ///   1), `ring_d` (32), `prof`, `step_input`, `rows`, `bank_words`
     ///   (per-lane programs), `opmask_lo`/`opmask_hi`;
@@ -140,7 +144,7 @@ impl ServeConfig {
         }
         let known = [
             "lanes", "grid_lanes", "page_size", "blocks", "max_blocks", "mlp_chunk", "cap", "pipeline",
-            "host_copy", "mmax", "hb", "hlm", "smp", "spec", "vm", "pins",
+            "host_copy", "mmax", "hb", "hlm", "smp", "spec", "vm", "pins", "region",
         ];
         if let Some(k) = t.keys().find(|k| !known.contains(&k.as_str())) {
             return Err(format!("[cerebras.spatial.serve]: unknown key `{k}`"));
@@ -200,6 +204,7 @@ impl ServeConfig {
             hlm: int(t, "hlm")?,
             spec,
             smp: flag(t, "smp")?,
+            region: flag(t, "region")?,
             pins: match t.get("pins") {
                 None => Vec::new(),
                 Some(v) => {
@@ -313,6 +318,53 @@ fn serve8b_params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Vec<(&'static str,
     ])
 }
 
+/// serve8b_region's placement of a paged8b plan (DESIGN.md's option A): the
+/// plan's grid for the first and last layers (a top band of `RC RPX / PX
+/// + 1` grids, `NCOL` grids down the column beside the head) and between
+/// them `RC` x `RR` regions of `RNL` layers, twice the grid's width (`RGs`
+/// 2 Gs columns a kv head of `RDc` Dc / 2 dims, `RIc` Ic / 2) and `RPY` 240
+/// rows (`RHc` = ceil(hidden / RPY)). RC 2, RNL 3, RR 4 as built; `NCOL`
+/// the layers left. The head as serve8b's, `HH` = the grid column's rows.
+fn serve8b_region_params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Vec<(&'static str, usize)>> {
+    if cfg.vm.is_some() || cfg.spec.is_some() || cfg.smp || cfg.goals.pipeline {
+        return Err("serve8b_region has no eta VM, speculative decode, fused sampler or pipeline".into());
+    }
+    let g = &plan.grid;
+    let wafer = super::plan::WaferDims::CS3;
+    let (rc, rnl, rr, rpy, rgy) = (2, 3, 4, 240, 16);
+    let (rpx, band) = (2 * g.px, 2 * 2 * g.px / g.px + 1);
+    if g.dc % 4 != 0 || g.ic % 2 != 0 || plan.layers < band + rc * rr * rnl + 1 {
+        return Err(format!("{}: serve8b_region's option A does not take this grid ({g:?})", plan.spec.name));
+    }
+    let ncol = plan.layers - band - rc * rr * rnl;
+    let hh = g.py * (1 + ncol);
+    let (c, vmc) = (g.py / 2, 1);
+    let width = rc * rpx + g.px + c + vmc + g.py / 4;
+    if width > wafer.width || hh + 1 > wafer.height || g.py + rr * rpy > wafer.height {
+        return Err(format!("{}: serve8b_region's {width} x {} does not fit the wafer", plan.spec.name, hh + 1));
+    }
+    let f = hh / 2;
+    let gx = [16, 8, 4, 2].into_iter().find(|x| c % x == 0 && c / x >= 2).unwrap_or(1).min(8);
+    let gy = (2..=24).rev().step_by(2).find(|x| f % x == 0).unwrap_or(2);
+    let cap = cfg.goals.cap.unwrap_or_else(|| {
+        let mut c = 64;
+        while g.lanes * c > 512 && c > 1 {
+            c /= 2;
+        }
+        c
+    });
+    Ok(vec![
+        ("PX", g.px), ("PY", g.py), ("Hc", g.hc), ("Dc", g.dc), ("Gs", g.gs), ("Ic", g.ic), ("RPX", rpx),
+        ("RPY", rpy), ("RHc", g.hidden.div_ceil(rpy)), ("RDc", g.dc / 2), ("RGs", 2 * g.gs), ("RIc", g.ic / 2),
+        ("RNL", rnl), ("RGY", rgy), ("RC", rc), ("RR", rr), ("NCOL", ncol), ("RTR", 4), ("HR", g.hidden),
+        ("Qh", g.qh), ("PS", g.page_size), ("NB", g.blocks), ("E", g.entries), ("MC", g.mlp_chunk),
+        ("W16", usize::from(g.w16)), ("KV16", usize::from(g.kv16)), ("KVCP", 0), ("PROF", 0), ("TIME", 0),
+        ("HROUTE", 1), ("ROT8", 1), ("NOLAYER", 0), ("HEADMODE", 2), ("HH", hh), ("Vr", plan.vocab.div_ceil(hh)),
+        ("Gx", gx), ("Gy", gy), ("vocab", plan.vocab), ("PASSES", 3), ("MODE", 0), ("OVL", 0), ("VMC", vmc),
+        ("CAP", cap), ("iters", 1), ("B", g.lanes), ("NP", 3),
+    ])
+}
+
 /// The layout's parameters: (name, has a default), in declaration order.
 pub fn layout_params(layout: &str) -> Vec<(String, bool)> {
     layout
@@ -330,11 +382,19 @@ pub fn layout_params(layout: &str) -> Vec<(String, bool)> {
 /// checked against the layout: every parameter without a default is set,
 /// and nothing unknown is passed.
 pub fn params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<(Design, Vec<(String, String)>)> {
-    let d = design(plan)?;
-    if d != Design::Serve8b && plan.program.is_none() && !cfg.pins.iter().any(|p| p.0 == "GW") {
+    let d = match design(plan)? {
+        Design::Serve8b if cfg.region => Design::Serve8bRegion,
+        _ if cfg.region => return Err(format!("{}: `region` places paged8b (8B) plans only", plan.spec.name)),
+        d => d,
+    };
+    if !matches!(d, Design::Serve8b | Design::Serve8bRegion) && plan.program.is_none() && !cfg.pins.iter().any(|p| p.0 == "GW") {
         return Err(format!("{}: no full program places the model: {}", plan.spec.name, plan.blockers.join("; ")));
     }
-    let mut set: Vec<(&'static str, usize)> = if d == Design::Serve8b { serve8b_params(plan, cfg)? } else { plan.params() };
+    let mut set: Vec<(&'static str, usize)> = match d {
+        Design::Serve8b => serve8b_params(plan, cfg)?,
+        Design::Serve8bRegion => serve8b_region_params(plan, cfg)?,
+        _ => plan.params(),
+    };
     let put = |set: &mut Vec<(&'static str, usize)>, k: &'static str, v: usize| match set.iter_mut().find(|e| e.0 == k) {
         Some(e) => e.1 = v,
         None => set.push((k, v)),
@@ -355,7 +415,7 @@ pub fn params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<(Design, Vec<(String, 
         if let Some(h) = cfg.hlm {
             put(&mut set, "HLM", h);
         }
-    } else if d != Design::Serve8b && (cfg.spec.is_some() || cfg.smp || cfg.mmax.is_some()) {
+    } else if !matches!(d, Design::Serve8b | Design::Serve8bRegion) && (cfg.spec.is_some() || cfg.smp || cfg.mmax.is_some()) {
         return Err("speculative decode, the fused sampler and MMAX are serve2d_pipe's".into());
     }
     let vm_keys: Vec<&'static str> = cfg.vm.map(|vm| vm.params()).unwrap_or_default().iter().map(|p| p.0).collect();
@@ -410,6 +470,17 @@ fn rectangle(design: Design, params: &[(String, String)]) -> R<(u32, u32)> {
             .and_then(|(_, v)| v.parse().ok())
             .ok_or_else(|| format!("{}: no `{k}`", design.name()))
     };
+    if design == Design::Serve8bRegion {
+        // serve8b_region's layout.csl: the band and regions (RC RPX), the grid
+        // column (PX), the head and the strip; down the regions, the grid
+        // column or the head's rows and its feeder row.
+        let (px, py, hh, vmc) = (get("PX")?, get("PY")?, get("HH")?, get("VMC")?);
+        let head = get("HEADMODE")? == 2;
+        let (hw, ew) = if head { (py / 2 + vmc, py / 4) } else { (0, 0) };
+        let lh = (py + get("RR")? * get("RPY")?).max(py * (1 + get("NCOL")?));
+        let rh = if head { lh.max(hh + 1) } else { lh };
+        return Ok((get("RC")? * get("RPX")? + px + hw + ew, rh));
+    }
     let (px, py, gw, gh, hh, vmc) = (get("PX")?, get("PY")?, get("GW")?, get("GH")?, get("HH")?, get("VMC")?);
     match design {
         // layout.csl: the grids then the head's PY + VMC columns; down GH
@@ -422,6 +493,7 @@ fn rectangle(design: Design, params: &[(String, String)]) -> R<(u32, u32)> {
             let (hw, ew) = if head { (py / 2 + vmc, py / 4) } else { (0, 0) };
             Ok((gw * px + hw + ew, if head { (gh * py).max(hh + 1) } else { gh * py }))
         }
+        Design::Serve8bRegion => unreachable!("handled above"),
     }
 }
 
@@ -669,6 +741,45 @@ mod qwen3_8b {
             got.sort();
             let want = format!("{base},B:{b},NB:{nb},KVCP:{}", usize::from(!host)).replace("NP:3", &format!("NP:{np}"));
             assert_eq!(got, sorted(&want), "B {b}");
+            // The model accepts the program (untied, 36 layers in strips of 5
+            // and 4), and the engine reads it as serve8b's layout.
+            let get = |k: &str| p.iter().find(|e| e.0 == k).and_then(|e| e.1.parse().ok());
+            plan.spec.check_program(get).expect("the model takes serve8b");
+            let lay = crate::spatial::serve2d::Layout2d::of(get).expect("a layout").expect("serve8b");
+            assert_eq!((lay.layers(), lay.chunk_cols(), lay.root()), (36, 72, (640 + 36, 576)));
+            assert_eq!(lay.paged.map(|s| (s.lanes, s.pages())), Some((b, 144)));
+            assert_eq!(lay.host_copy, host);
+        }
+    }
+
+    /// 0125_serve8b_region's two builds come out of the plan with `region`.
+    #[test]
+    fn the_plan_places_qwen3_8b_regions_as_0125() {
+        let base = "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:240,RHc:18,RDc:4,RGs:32,RIc:48,RNL:3,RGY:16,\
+                    RC:2,RR:4,NCOL:7,RTR:4,HR:4096,Qh:4,PS:16,NB:1,E:1,MC:1,W16:1,KV16:1,KVCP:0,PROF:0,TIME:0,\
+                    HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,PASSES:3,MODE:0,\
+                    OVL:0,VMC:1,CAP:64,iters:1";
+        // The grids of 0115's builds (serve8b's B 1 plans for page-copy
+        // kernels; serve8b_region copies by the host either way).
+        for (b, np, host) in [(1, 3, false), (4, 1, true)] {
+            let goals = Goals { blocks: Some(1), host_copy: host, grid_lanes: b, ..Goals::lanes(b) };
+            let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+            let mut cfg = ServeConfig::new(goals);
+            cfg.region = true;
+            if np != 3 {
+                cfg.pins.push(("NP", np));
+            }
+            let (d, p) = params(&plan, &cfg).unwrap();
+            assert_eq!(d, Design::Serve8bRegion);
+            let mut got = p.clone();
+            got.sort();
+            assert_eq!(got, sorted(&format!("{base},B:{b},NP:{np}")), "B {b}");
+            let get = |k: &str| p.iter().find(|e| e.0 == k).and_then(|e| e.1.parse().ok());
+            plan.spec.check_program(get).expect("the model takes serve8b_region");
+            let lay = crate::spatial::serve2d::Layout2d::of(get).expect("a layout").expect("serve8b_region");
+            assert_eq!((lay.layers(), lay.root()), (36, (676, 576)));
+            let p2: Vec<(String, String)> = p.clone();
+            assert_eq!(rectangle(d, &p2).unwrap(), (749, 1153));
         }
     }
 }

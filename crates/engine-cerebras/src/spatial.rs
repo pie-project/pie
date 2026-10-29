@@ -68,6 +68,8 @@ pub mod wafer;
 pub mod build;
 pub mod codegen;
 pub mod manifest;
+pub mod serve8b;
+pub mod serve8b_region;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};

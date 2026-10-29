@@ -88,8 +88,9 @@ pub enum Need {
     /// An untied lm_head (Qwen3-8B and up). The kernels' heads hold a
     /// separate embedding table (head2d `UNTIED` 1), but the engine's
     /// placement (`wafer::place`, `serve2d::place`) reads
-    /// `model.embed_tokens.weight` for the logits: until it places
-    /// `lm_head.weight`, [`ModelSpec::check_program`] refuses the model.
+    /// `model.embed_tokens.weight` for the logits: [`ModelSpec::check_program`]
+    /// refuses the model on those programs. serve8b places `lm_head.weight`
+    /// (`serve8b::place`).
     LmHeadPlacement,
 }
 
@@ -996,7 +997,8 @@ impl SpatialPlan {
             program: None,
             grid_bytes: bytes,
             pe_bytes: wafer.pe_bytes,
-            needs: spec.needs(),
+            // serve8b places lm_head itself.
+            needs: spec.needs().into_iter().filter(|n| *n != Need::LmHeadPlacement).collect(),
             blockers,
         })
     }
@@ -1211,13 +1213,19 @@ impl ModelSpec {
                 self.sm_scale
             ));
         }
-        if !self.tied {
+        // serve8b (`GS` among its params) places lm_head apart from the
+        // embedding; the other programs read the embedding for the logits.
+        let s8b = get("GS").or(get("RPX"));
+        if !self.tied && s8b.is_none() {
             return no(
                 name,
                 "an untied lm_head (the placement reads embed_tokens for the logits and would \
                  give wrong ones; Need::LmHeadPlacement)"
                     .into(),
             );
+        }
+        if self.tied && s8b.is_some() {
+            return no(name, "a tied head on serve8b, which places lm_head.weight (untied models only)".into());
         }
         let p = |k: &str| get(k).ok_or_else(|| Refused(format!("{name}: the wafer program has no param {k}")));
         let eq = |what: &str, have: usize, want: usize| {
@@ -1241,7 +1249,19 @@ impl ModelSpec {
             eq("Dc x Gs (head_dim)", dc * gs, self.head_dim)?;
             eq("Qh (q heads a kv head)", p("Qh")?, self.group())?;
             eq("vocab", p("vocab")?, self.vocab)?;
-            eq("GW x GH (layers)", p("GW")? * p("GH")?, self.layers)?;
+            let region = get("RPX").is_some();
+            let (gw, gh) = if region { (0, 0) } else { (p("GW")?, p("GH")?) };
+            match s8b {
+                // serve8b_region: the band, the regions' layers, the grid column.
+                Some(_) if region => {
+                    let band = p("RC")? * p("RPX")? / px + 1;
+                    eq("the units' layers", band + p("RC")? * p("RR")? * p("RNL")? + p("NCOL")?, self.layers)?;
+                }
+                // Strips past the first GS skip a slot.
+                Some(gs) if gs <= gh && gw > 0 => eq("GS GW + (GH - GS)(GW - 1) (layers)", gs * gw + (gh - gs) * (gw - 1), self.layers)?,
+                Some(gs) => return no(name, format!("GS {gs} full strips of GH {gh}")),
+                None => eq("GW x GH (layers)", gw * gh, self.layers)?,
+            }
             let kv_cols = divides("PX over a kv head's Gs columns", px, gs)?;
             if kv_cols < self.kv_heads {
                 return no(name, format!("{kv_cols} kv heads' columns for the model's {}", self.kv_heads));
@@ -1461,7 +1481,7 @@ mod tests {
         assert!(!s.qk_norm && !s.tied);
         assert_eq!((s.hidden, s.inter, s.vocab, s.rope_theta), (4096, 14336, 128_256, 500_000.0));
         let p = plan(&s, Goals::lanes(4));
-        assert_eq!(p.needs, vec![Need::IdentityQkNorm, Need::RopeTable, Need::LmHeadPlacement]);
+        assert_eq!(p.needs, vec![Need::IdentityQkNorm, Need::RopeTable]);
         assert_eq!((p.family, p.grid.ic, p.grid.qh), (Family::Paged8b, 112, 4));
     }
 

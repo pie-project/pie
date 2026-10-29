@@ -1,5 +1,6 @@
 //! The checkpoint the wafer model places: a directory with `config.json` and
-//! either `model.safetensors` (a Hugging Face export) or `weights.npz` (the
+//! either `model.safetensors` (a Hugging Face export, or its shards named by
+//! `model.safetensors.index.json`) or `weights.npz` (the
 //! bring-up's bf16 bits as `uint16` arrays, stored uncompressed). Tensors are
 //! read one at a time and widened to `f32`; nothing else is kept in memory.
 
@@ -26,6 +27,8 @@ impl Dtype {
 
 #[derive(Debug, Clone)]
 struct Entry {
+    /// Which of the checkpoint's files (shards) holds it.
+    file: usize,
     dtype: Dtype,
     shape: Vec<usize>,
     offset: u64,
@@ -45,7 +48,7 @@ pub struct Tensor {
 }
 
 pub struct Ckpt {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     entries: HashMap<String, Entry>,
     config: serde_json::Value,
 }
@@ -86,17 +89,37 @@ impl Ckpt {
                 .map_err(|e| format!("{}: {e}", config_path.display()))?,
         )
         .map_err(|e| format!("{}: {e}", config_path.display()))?;
-        let (path, entries) = if dir.join("model.safetensors").exists() {
+        let index = dir.join("model.safetensors.index.json");
+        let (paths, entries) = if dir.join("model.safetensors").exists() {
             let path = dir.join("model.safetensors");
-            let entries = safetensors(&path)?;
-            (path, entries)
+            let entries = safetensors(&path, 0)?;
+            (vec![path], entries)
+        } else if index.exists() {
+            let map: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&index).map_err(|e| format!("{}: {e}", index.display()))?,
+            )
+            .map_err(|e| format!("{}: {e}", index.display()))?;
+            let mut files: Vec<&str> = map["weight_map"]
+                .as_object()
+                .ok_or_else(|| format!("{}: no weight_map", index.display()))?
+                .values()
+                .filter_map(|v| v.as_str())
+                .collect();
+            files.sort_unstable();
+            files.dedup();
+            let mut entries = HashMap::new();
+            let paths: Vec<PathBuf> = files.iter().map(|f| dir.join(f)).collect();
+            for (i, path) in paths.iter().enumerate() {
+                entries.extend(safetensors(path, i)?);
+            }
+            (paths, entries)
         } else {
             let path = dir.join("weights.npz");
             let entries = npz(&path)?;
-            (path, entries)
+            (vec![path], entries)
         };
         Ok(Ckpt {
-            path,
+            paths,
             entries,
             config,
         })
@@ -121,13 +144,37 @@ impl Ckpt {
         Ok(tied(flag, same))
     }
 
-    pub fn get(&self, name: &str) -> R<Tensor> {
+    pub fn has(&self, name: &str) -> bool {
+        self.entries.contains_key(name)
+    }
+
+    fn raw(&self, name: &str) -> R<(&Entry, Vec<u8>)> {
         let e = self
             .entries
             .get(name)
-            .ok_or_else(|| format!("{} has no tensor {name}", self.path.display()))?;
-        let mut file = File::open(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
+            .ok_or_else(|| format!("{} has no tensor {name}", self.paths[0].display()))?;
+        let path = &self.paths[e.file];
+        let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let raw = read_at(&mut file, e.offset, e.elems() * e.dtype.bytes())?;
+        Ok((e, raw))
+    }
+
+    /// A tensor's bf16 bits, row-major, and its shape: a bf16 tensor's
+    /// untouched, a wider one's rounded to nearest even.
+    pub fn bits(&self, name: &str) -> R<(Vec<usize>, Vec<u16>)> {
+        let (e, raw) = self.raw(name)?;
+        let bits = match e.dtype {
+            Dtype::Bf16 => raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect(),
+            _ => {
+                let t = self.get(name)?;
+                t.data.iter().map(|&x| bf16_bits(x)).collect()
+            }
+        };
+        Ok((e.shape.clone(), bits))
+    }
+
+    pub fn get(&self, name: &str) -> R<Tensor> {
+        let (e, raw) = self.raw(name)?;
         let data = match e.dtype {
             Dtype::Bf16 => raw
                 .chunks_exact(2)
@@ -149,6 +196,12 @@ impl Ckpt {
     }
 }
 
+/// f32 to bf16 bits, round to nearest even (numpy's `(u + 0x7FFF + lsb) >> 16`).
+pub fn bf16_bits(x: f32) -> u16 {
+    let u = x.to_bits();
+    (u.wrapping_add(0x7fff + ((u >> 16) & 1)) >> 16) as u16
+}
+
 fn f16_to_f32(h: u16) -> f32 {
     let sign = u32::from(h >> 15) << 31;
     let exp = u32::from((h >> 10) & 0x1f);
@@ -166,7 +219,7 @@ fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-fn safetensors(path: &Path) -> R<HashMap<String, Entry>> {
+fn safetensors(path: &Path, shard: usize) -> R<HashMap<String, Entry>> {
     let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let n = u64_at(&read_at(&mut file, 0, 8)?, 0);
     let header: serde_json::Value = serde_json::from_slice(&read_at(&mut file, 8, n as usize)?)
@@ -193,6 +246,7 @@ fn safetensors(path: &Path) -> R<HashMap<String, Entry>> {
         entries.insert(
             name.clone(),
             Entry {
+                file: shard,
                 dtype,
                 shape,
                 offset: base + start,
@@ -279,6 +333,7 @@ fn npz(path: &Path) -> R<HashMap<String, Entry>> {
         entries.insert(
             key,
             Entry {
+                file: 0,
                 dtype,
                 shape,
                 offset: data + header_len,

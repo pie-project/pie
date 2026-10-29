@@ -31,6 +31,7 @@ tracing = "0.1"
 blake3 = "1"
 
 [dev-dependencies]
+sha2 = "0.10"
 poem = { package = "pie-poem", path = "../poem" }
 ztensor-compat = { workspace = true }
 ztensor = { workspace = true }

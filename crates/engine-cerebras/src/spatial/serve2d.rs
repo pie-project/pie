@@ -60,6 +60,10 @@ pub struct Layout2d {
     /// serve2d_pipe's `HLM`: the most virtual lanes whose logits rows the
     /// head keeps.
     pub hlm: Option<usize>,
+    /// serve8b ([`super::serve8b`]): bf16 grids in strips that skip a slot
+    /// (or serve8b_region's grids and regions), a head of `PY / 2` chunk
+    /// columns, the embedding strip east of it.
+    pub s8b: Option<super::serve8b::S8b>,
 }
 
 fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
@@ -72,8 +76,12 @@ fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
 }
 
 impl Layout2d {
-    /// The serve2d shape when `get` names one (`HEADMODE` 2, f32 weights).
+    /// The serve2d shape when `get` names one (`HEADMODE` 2, f32 weights),
+    /// or serve8b's (`GS` among the params).
     pub fn of(get: impl Fn(&str) -> Option<usize>) -> Option<R<Layout2d>> {
+        if get("GS").is_some() || get("RPX").is_some() {
+            return Some(super::serve8b::layout(&get));
+        }
         let mode = get("HEADMODE")?;
         let p = |k: &str| -> R<usize> { get(k).ok_or_else(|| format!("no param {k}")) };
         let lay = (|| -> R<Layout2d> {
@@ -108,6 +116,7 @@ impl Layout2d {
                 host_copy: get("KVCP").unwrap_or(1) == 0,
                 vm: None,
                 hlm: get("HLM"),
+                s8b: None,
             };
             let mut lay = lay;
             if get("GRID").unwrap_or(0) == 1 {
@@ -142,7 +151,34 @@ impl Layout2d {
     }
 
     pub fn layers(&self) -> usize {
-        self.gw * self.gh
+        use super::serve8b::S8b;
+        match self.s8b {
+            Some(S8b::Strips { full }) => full * self.gw + (self.gh - full) * (self.gw - 1),
+            Some(S8b::Units(u)) => u.layers(),
+            None => self.gw * self.gh,
+        }
+    }
+
+    /// The head's chunk columns (C; the VM columns not counted).
+    pub fn chunk_cols(&self) -> usize {
+        if self.s8b.is_some() { self.py / 2 } else { self.py }
+    }
+
+    /// The grids' area as rectangles that skip serve8b's free slots
+    /// (serve8b_region: each unit's).
+    pub fn grid_areas(&self) -> Vec<Rect> {
+        use super::serve8b::S8b;
+        match self.s8b {
+            Some(S8b::Units(u)) => u.units(self).iter().map(|u| rect(u.x0, u.y0, u.k.px, u.k.py)).collect(),
+            Some(S8b::Strips { full }) => {
+                let mut a = vec![rect(0, 0, self.gw * self.px, full * self.py)];
+                if self.gh > full {
+                    a.push(rect(self.px, full * self.py, (self.gw - 1) * self.px, (self.gh - full) * self.py));
+                }
+                a
+            }
+            None => vec![rect(0, 0, self.gw * self.px, self.gh * self.py)],
+        }
     }
 
     /// Head dim (a kv group's `Gs` slices of `Dc`).
@@ -181,12 +217,16 @@ impl Layout2d {
 
     /// The head's first column.
     pub fn head_x(&self) -> usize {
-        self.gw * self.px
+        match self.s8b {
+            // serve8b_region: the regions' columns, then the grid column.
+            Some(super::serve8b::S8b::Units(u)) => u.rc * u.rpx + self.px,
+            _ => self.gw * self.px,
+        }
     }
 
     /// The root column inside the head block.
-    fn r2x(&self) -> usize {
-        let ngx = self.py / self.gx;
+    pub(crate) fn r2x(&self) -> usize {
+        let ngx = self.chunk_cols() / self.gx;
         (ngx / 2) * self.gx + self.gx / 2
     }
 
@@ -195,10 +235,23 @@ impl Layout2d {
         (self.head_x() + self.r2x(), self.feeder())
     }
 
-    /// Layer `l`'s grid's top-left PE.
+    /// Layer `l`'s grid's top-left PE (serve8b_region: its unit's).
     pub fn origin(&self, l: usize) -> (usize, usize) {
-        let (sy, k) = (l / self.gw, l % self.gw);
-        let sx = if sy % 2 == 0 { self.gw - 1 - k } else { k };
+        use super::serve8b::S8b;
+        let (sy, k, sxmin) = match self.s8b {
+            Some(S8b::Units(u)) => {
+                let units = u.units(self);
+                let unit = units.iter().find(|v| v.layers.contains(&l)).unwrap_or(&units[0]);
+                return (unit.x0, unit.y0);
+            }
+            // serve8b: strips past the full ones skip their westmost slot.
+            Some(S8b::Strips { full }) if l >= full * self.gw => {
+                let m = l - full * self.gw;
+                (full + m / (self.gw - 1), m % (self.gw - 1), 1)
+            }
+            _ => (l / self.gw, l % self.gw, 0),
+        };
+        let sx = if sy % 2 == 0 { self.gw - 1 - k } else { sxmin + k };
         (sx * self.px, sy * self.py)
     }
 }
@@ -237,6 +290,9 @@ fn put(
 /// lays them out.
 #[allow(clippy::too_many_lines)]
 pub fn place(lay: &Layout2d, ckpt: &Ckpt, rope_theta: f64, sink: &mut dyn Sink) -> R<()> {
+    if lay.s8b.is_some() {
+        return super::serve8b::place(lay, ckpt, rope_theta, sink);
+    }
     let (px_n, py_n, hc, dc, gs, qh, ic, tc) =
         (lay.px, lay.py, lay.hc, lay.dc, lay.gs, lay.qh, lay.ic, lay.tc);
     let d = lay.head_dim();
@@ -709,7 +765,12 @@ pub fn fire_lanes(
     if let Some(lane) = lanes.iter().find(|l| l.forced.is_empty() || l.forced.len() > lay.cap) {
         return Err(format!("a lane forces {} token(s)", lane.forced.len()));
     }
-    let table_of = |batch: &[BatchLane]| -> R<Vec<u32>> {
+    // A table for pool rows `rows` (serve8b_region's units differ; a page id
+    // is still one of the pool's `shape.pages()`).
+    let table_rows = |batch: &[BatchLane], rows: usize| -> R<Vec<u32>> {
+        if let Some(g) = batch.iter().flat_map(|l| &l.pages).find(|&&g| g as usize >= shape.pages()) {
+            return Err(format!("a lane names page {g} of a pool of {}", shape.pages()));
+        }
         let table_lanes: Vec<super::paged::Lane> = batch
             .iter()
             .map(|l| super::paged::Lane {
@@ -719,20 +780,29 @@ pub fn fire_lanes(
                 visible: l.visible.clone(),
             })
             .collect();
-        super::paged::table(&shape, &table_lanes, steps as u32)
+        super::paged::table(&super::paged::Shape { rows, ..shape }, &table_lanes, steps as u32)
     };
+    let table_of = |batch: &[BatchLane]| table_rows(batch, shape.rows);
     let e = |e: crate::sdk::Error| e.to_string();
     // Micro-batches (one on a build without a ring).
     let mbs: Vec<&[BatchLane]> = lanes.chunks(b_n).collect();
     let slots = lay.mmax.unwrap_or(1);
     match lay.mmax {
         None => {
-            let tab = table_of(lanes)?;
-            // Every fabric row of the grids: its grid row's table row.
-            let all: Vec<u32> = (0..lay.gh).flat_map(|_| tab.iter().copied()).collect();
-            let grids = rect(0, 0, lay.gw * lay.px, lay.gh * lay.py);
-            rt.memcpy_h2d_rowbcast(SYM.table, &all, grids, shape.row_words(), DataType::Bits32)
-                .map_err(e)?;
+            // Every fabric row of the grids: its grid row's table row (a
+            // serve8b_region unit's: its own rows').
+            let units = matches!(lay.s8b, Some(super::serve8b::S8b::Units(_)));
+            let mut tabs: Vec<(usize, Vec<u32>)> = Vec::new();
+            for grids in lay.grid_areas() {
+                let rows = if units { grids.h as usize } else { lay.py };
+                if !tabs.iter().any(|t| t.0 == rows) {
+                    tabs.push((rows, table_rows(lanes, rows)?));
+                }
+                let tab = &tabs.iter().find(|t| t.0 == rows).expect("built above").1;
+                let all: Vec<u32> = (0..grids.h as usize / rows).flat_map(|_| tab.iter().copied()).collect();
+                rt.memcpy_h2d_rowbcast(SYM.table, &all, grids, shape.row_words(), DataType::Bits32)
+                    .map_err(e)?;
+            }
         }
         Some(_) => {
             let mtab = pipe_tables(lay, &mbs.iter().map(|mb| table_of(mb)).collect::<R<Vec<_>>>()?);
@@ -794,7 +864,7 @@ pub fn fire_lanes(
 /// head's names (`mtab`, `vmlane`, `wt`, `gam`, ...) are one-word dummies an
 /// n-word write would run over, so the runs either side of them.
 pub fn head_runs(lay: &Layout2d) -> Vec<std::ops::Range<usize>> {
-    let cw = lay.py + lay.vmc;
+    let cw = lay.chunk_cols() + lay.vmc;
     let runs = if lay.vm.is_some() {
         vec![0..lay.r2x() + 1, lay.r2x() + 1 + lay.vmc..cw]
     } else {
@@ -823,7 +893,7 @@ pub fn check_head_columns(lay: &Layout2d, symbol: &str, cols: std::ops::Range<us
 /// out row by row over all C + VMC head columns, n words a PE) written to
 /// the head's chunk columns only ([`head_runs`]).
 fn head_h2d(lay: &Layout2d, rt: &mut Runtime, symbol: &str, data: &[u32], y0: usize, h: usize, n: usize) -> R<()> {
-    let cw = lay.py + lay.vmc;
+    let cw = lay.chunk_cols() + lay.vmc;
     for cols in head_runs(lay) {
         check_head_columns(lay, symbol, cols.clone())?;
         let words: Vec<u32> = (0..h)
@@ -891,7 +961,13 @@ pub fn copy_pages(lay: &Layout2d, rt: &mut Runtime, pairs: &[(u32, u32)]) -> R<(
     let Some(shape) = lay.paged else {
         return Err("page copies on a one-sequence build".into());
     };
+    if let Some(super::serve8b::S8b::Units(u)) = lay.s8b {
+        return super::serve8b_region::copy_pages(lay, &u, rt, pairs);
+    }
     if !lay.host_copy {
+        if lay.s8b.is_some() {
+            return super::serve8b::copy_pages(lay, rt, pairs);
+        }
         return super::paged::copy_pages(rt, &super::paged::Symbols::default(), pairs);
     }
     let pool = super::paged::HostPool {
@@ -899,7 +975,7 @@ pub fn copy_pages(lay: &Layout2d, rt: &mut Runtime, pairs: &[(u32, u32)]) -> R<(
         cols: lay.px,
         shape,
         cells: lay.dc * shape.page_size,
-        data_type: DataType::Bits32,
+        data_type: if lay.s8b.is_some() { DataType::Bits16 } else { DataType::Bits32 },
     };
     super::paged::copy_pages_host(rt, &pool, pairs)
 }
