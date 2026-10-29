@@ -28,6 +28,8 @@ moe.bf16_mma_until = 65536
 moe.mxfp4_fp8_from = 256
 
 [engine]
+seated_first = true
+recording = { use = "bodies", mem_mb = 1024 }
 forward_tokens = 2048
 prefill_lattice_steps = 8
 
