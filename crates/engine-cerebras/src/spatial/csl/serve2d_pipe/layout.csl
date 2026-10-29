@@ -63,6 +63,10 @@ param vm_prof: u16 = 1;
 // Per-step host input words a turn (gsin/gsdesc; 0: none) and the opcodes the
 // image keeps (bit o of lo: 0..31, of hi: 32..63; default all).
 param vm_sin: u16 = 0;
+// Per-lane programs (an op arena of max_ops; glane / gbdesc per lane) and the
+// bank arena's words (vm_lprog 1 only).
+param vm_lprog: u16 = 0;
+param bank_words: u16 = 1;
 param opmask_lo: u32 = 0xffffffff;
 param opmask_hi: u32 = 0xffffffff;
 param HLM: u16 = 4;
@@ -106,6 +110,7 @@ layout {
           .max_ops = max_ops, .nreg = nreg, .pool_words = pool_words, .feat = feat, .ring = ring_d,
           .ring_w = ring_w, .vm_prof = vm_prof, .vm_lanes = MMAX * B, .vm_rows = 1,
           .vm_sin = vm_sin, .opmask_lo = opmask_lo, .opmask_hi = opmask_hi,
+          .vm_lprog = vm_lprog, .bank_words = bank_words,
           .GPX = PX, .GPY = PY, .GW = GW, .GH = GH, .S2D_SB = B,
         });
       } else if (x >= GW * PX and y <= HH) {
@@ -180,6 +185,8 @@ layout {
   @export_name("vm_ctl", [*]u32, true);
   @export_name("gsin", [*]u32, true);
   @export_name("gsdesc", [*]u32, true);
+  @export_name("glane", [*]u32, true);
+  @export_name("gbdesc", [*]u32, true);
   @export_name("gwide", [*]f32, true);
   @export_name("gpool", [*]u32, true);
   @export_name("gops", [*]u32, true);

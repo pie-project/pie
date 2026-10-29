@@ -113,6 +113,10 @@ pub struct SpatialBoot {
     pub token_cycles: Option<u64>,
     pub pre_margin: Option<f64>,
     pub main_fraction: Option<f64>,
+    /// `[cerebras.spatial.serve]`: with no `program` (and no serve28
+    /// `params`), PIE builds the plan's program for the model itself
+    /// ([`build::ServeConfig::from_toml`]; compiled once, then cached).
+    pub serve: Option<toml::Table>,
 }
 
 impl SpatialBoot {
@@ -128,7 +132,8 @@ impl SpatialBoot {
                 .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
         };
         let (daemon, program, params) = (text("daemon"), text("program"), text("params"));
-        if daemon.is_none() && program.is_none() && params.is_none() {
+        let serve = t.get("serve").and_then(toml::Value::as_table).cloned();
+        if daemon.is_none() && program.is_none() && params.is_none() && serve.is_none() {
             return None;
         }
         Some(SpatialBoot {
@@ -155,6 +160,7 @@ impl SpatialBoot {
                 .and_then(|v| u64::try_from(v).ok()),
             pre_margin: number("pre_margin"),
             main_fraction: number("main_fraction"),
+            serve,
         })
     }
 }
@@ -2292,7 +2298,20 @@ impl Engine for Spatial {
                     .display()
                     .to_string(),
             ),
-            (None, None) => None,
+            (None, None) => match &self.spatial.serve {
+                // PIE builds the program from the model's plan.
+                Some(t) => {
+                    let cfg = build::ServeConfig::from_toml(t, budgets.page_size as usize)
+                        .map_err(|e| Error::Load(e.to_string()))?;
+                    Some(
+                        build::build_for(&spec, &cfg, self.boot.target, self.boot.cmaddr.is_some())
+                            .map_err(|e| Error::Load(format!("building the spatial program: {e}")))?
+                            .display()
+                            .to_string(),
+                    )
+                }
+                None => None,
+            },
         };
         // A compiled program must be the model's: dims, layers, vocabulary,
         // and what the placement assumes (tied head, eps, q/k norms, theta).

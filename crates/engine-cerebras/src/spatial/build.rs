@@ -31,6 +31,45 @@ pub struct VmImage {
     pub ring_d: usize,
     /// Per-op profile counters.
     pub prof: bool,
+    /// Per-step host input words a turn (`vm_sin`; 0: none).
+    pub step_input: usize,
+    /// Logits rows a turn (`vm_rows`; multi-row programs).
+    pub rows: usize,
+    /// Per-lane programs: the bank arena's words (`vm_lprog` 1, `bank_words`).
+    pub lane_programs: Option<usize>,
+    /// The opcodes the image compiles (`opmask_lo`, `opmask_hi`); `None`: all.
+    pub opmask: Option<(u32, u32)>,
+}
+
+impl VmImage {
+    /// The image's layout parameters. Ones left at their defaults are not
+    /// passed, so they don't appear in the manifest either; readers take
+    /// absent as the default.
+    fn params(&self) -> Vec<(&'static str, usize)> {
+        let mut out = vec![
+            ("VM", 1),
+            ("max_ops", self.max_ops),
+            ("nreg", self.nreg),
+            ("pool_words", self.pool_words),
+            ("feat", self.feat),
+            ("ring_w", self.ring_w),
+            ("ring_d", self.ring_d),
+            ("vm_prof", usize::from(self.prof)),
+        ];
+        if self.step_input > 0 {
+            out.push(("vm_sin", self.step_input));
+        }
+        if self.rows > 1 {
+            out.push(("vm_rows", self.rows));
+        }
+        if let Some(words) = self.lane_programs {
+            out.extend([("vm_lprog", 1), ("bank_words", words)]);
+        }
+        if let Some((lo, hi)) = self.opmask {
+            out.extend([("opmask_lo", lo as usize), ("opmask_hi", hi as usize)]);
+        }
+        out
+    }
 }
 
 /// Speculative decode on the head (serve2d_pipe): history, lookup table and
@@ -67,6 +106,115 @@ impl ServeConfig {
     pub fn new(goals: Goals) -> ServeConfig {
         ServeConfig { goals, mmax: None, hb: None, vm: None, hlm: None, spec: None, smp: false, pins: Vec::new() }
     }
+}
+
+impl ServeConfig {
+    /// `[cerebras.spatial.serve]`: the build PIE compiles when no `program`
+    /// directory is configured. Keys (all optional):
+    /// - the plan's goals: `lanes`, `grid_lanes`, `page_size` (default
+    ///   `page_size`, PIE's), `blocks`, `max_blocks`, `mlp_chunk`, `cap`,
+    ///   `pipeline`, `host_copy`;
+    /// - serve2d_pipe: `mmax`, `hb`, `hlm`, `smp`, and `[spec]` (`history`,
+    ///   `table`, `out`);
+    /// - `[vm]`: `max_ops`, `nreg`, `pool_words`, `feat`, `ring_w` (default
+    ///   1), `ring_d` (32), `prof`, `step_input`, `rows`, `bank_words`
+    ///   (per-lane programs), `opmask_lo`/`opmask_hi`.
+    pub fn from_toml(t: &toml::Table, page_size: usize) -> R<ServeConfig> {
+        fn int(t: &toml::Table, k: &str) -> R<Option<usize>> {
+            match t.get(k) {
+                None => Ok(None),
+                Some(v) => v
+                    .as_integer()
+                    .and_then(|i| usize::try_from(i).ok())
+                    .map(Some)
+                    .ok_or_else(|| format!("[cerebras.spatial.serve] `{k}` is not a non-negative integer")),
+            }
+        }
+        fn flag(t: &toml::Table, k: &str) -> R<bool> {
+            match t.get(k) {
+                None => Ok(false),
+                Some(v) => v.as_bool().ok_or_else(|| format!("[cerebras.spatial.serve] `{k}` is not a boolean")),
+            }
+        }
+        let known = [
+            "lanes", "grid_lanes", "page_size", "blocks", "max_blocks", "mlp_chunk", "cap", "pipeline",
+            "host_copy", "mmax", "hb", "hlm", "smp", "spec", "vm",
+        ];
+        if let Some(k) = t.keys().find(|k| !known.contains(&k.as_str())) {
+            return Err(format!("[cerebras.spatial.serve]: unknown key `{k}`"));
+        }
+        let lanes = int(t, "lanes")?.unwrap_or(Goals::default().lanes);
+        let base = Goals::lanes(lanes);
+        let goals = Goals {
+            lanes,
+            grid_lanes: int(t, "grid_lanes")?.unwrap_or(base.grid_lanes),
+            page_size: int(t, "page_size")?.unwrap_or(page_size),
+            blocks: int(t, "blocks")?,
+            max_blocks: int(t, "max_blocks")?.unwrap_or(base.max_blocks),
+            mlp_chunk: int(t, "mlp_chunk")?,
+            cap: int(t, "cap")?,
+            pipeline: flag(t, "pipeline")?,
+            host_copy: flag(t, "host_copy")?,
+        };
+        let spec = match t.get("spec") {
+            None => None,
+            Some(v) => {
+                let s = v.as_table().ok_or("[cerebras.spatial.serve] `spec` is not a table")?;
+                Some(Spec {
+                    history: int(s, "history")?.unwrap_or(1),
+                    table: int(s, "table")?.unwrap_or(1),
+                    out: int(s, "out")?.unwrap_or(1),
+                })
+            }
+        };
+        let vm = match t.get("vm") {
+            None => None,
+            Some(v) => {
+                let m = v.as_table().ok_or("[cerebras.spatial.serve] `vm` is not a table")?;
+                let need = |k: &str| int(m, k)?.ok_or_else(|| format!("[cerebras.spatial.serve.vm] needs `{k}`"));
+                let lo = int(m, "opmask_lo")?;
+                let hi = int(m, "opmask_hi")?;
+                Some(VmImage {
+                    max_ops: need("max_ops")?,
+                    nreg: need("nreg")?,
+                    pool_words: need("pool_words")?,
+                    feat: need("feat")?,
+                    ring_w: int(m, "ring_w")?.unwrap_or(1),
+                    ring_d: int(m, "ring_d")?.unwrap_or(32),
+                    prof: flag(m, "prof")?,
+                    step_input: int(m, "step_input")?.unwrap_or(0),
+                    rows: int(m, "rows")?.unwrap_or(1),
+                    lane_programs: int(m, "bank_words")?,
+                    opmask: (lo.is_some() || hi.is_some())
+                        .then(|| (lo.unwrap_or(0xffff_ffff) as u32, hi.unwrap_or(0xffff_ffff) as u32)),
+                })
+            }
+        };
+        Ok(ServeConfig {
+            goals,
+            mmax: int(t, "mmax")?,
+            hb: int(t, "hb")?,
+            vm,
+            hlm: int(t, "hlm")?,
+            spec,
+            smp: flag(t, "smp")?,
+            pins: Vec::new(),
+        })
+    }
+}
+
+/// The program PIE builds for `spec` under `cfg` on `target`: the plan,
+/// its parameters, the compile (cached). Returns the output directory.
+pub fn build_for(
+    spec: &super::plan::ModelSpec,
+    cfg: &ServeConfig,
+    target: crate::sdk::Target,
+    system: bool,
+) -> R<PathBuf> {
+    let plan = SpatialPlan::derive(spec, super::plan::WaferDims::CS3, cfg.goals).map_err(|e| e.to_string())?;
+    let (design, params) = params(&plan, cfg)?;
+    tracing::info!(design = design.name(), model = %spec.name, "spatial build: the plan's program");
+    compile(design, &params, target, system)
 }
 
 /// The design a plan's family builds.
@@ -127,17 +275,9 @@ pub fn params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<(Design, Vec<(String, 
     } else if cfg.spec.is_some() || cfg.smp || cfg.mmax.is_some() {
         return Err("speculative decode, the fused sampler and MMAX are serve2d_pipe's".into());
     }
+    let vm_keys: Vec<&'static str> = cfg.vm.map(|vm| vm.params()).unwrap_or_default().iter().map(|p| p.0).collect();
     if let Some(vm) = cfg.vm {
-        for (k, v) in [
-            ("VM", 1),
-            ("max_ops", vm.max_ops),
-            ("nreg", vm.nreg),
-            ("pool_words", vm.pool_words),
-            ("feat", vm.feat),
-            ("ring_w", vm.ring_w),
-            ("ring_d", vm.ring_d),
-            ("vm_prof", usize::from(vm.prof)),
-        ] {
+        for (k, v) in vm.params() {
             put(&mut set, k, v);
         }
     }
@@ -158,7 +298,7 @@ pub fn params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<(Design, Vec<(String, 
     let unknown: Vec<&str> = set.iter().map(|(k, _)| *k).filter(|k| !decl.iter().any(|(n, _)| n == k)).collect();
     // Plan keys the other 2-D layout takes (NP, PROF on serve2d) are dropped silently;
     // pins and config keys must exist.
-    let config_keys: Vec<&str> = cfg.pins.iter().map(|p| p.0).collect();
+    let config_keys: Vec<&str> = cfg.pins.iter().map(|p| p.0).chain(vm_keys.iter().copied()).collect();
     if let Some(bad) = unknown.iter().find(|k| config_keys.contains(k)) {
         return Err(format!("{}: no layout parameter `{bad}`", d.name()));
     }
@@ -306,7 +446,19 @@ pub mod presets {
             mmax: Some(2),
             hb: Some(2),
             hlm: Some(4),
-            vm: Some(VmImage { max_ops: 48, nreg: 6, pool_words: 64, feat: 99, ring_w: 1, ring_d: 32, prof: false }),
+            vm: Some(VmImage {
+                max_ops: 48,
+                nreg: 6,
+                pool_words: 64,
+                feat: 99,
+                ring_w: 1,
+                ring_d: 32,
+                prof: false,
+                step_input: 0,
+                rows: 1,
+                lane_programs: None,
+                opmask: None,
+            }),
             pins: vec![
                 ("Tc", 1), ("E", 2), ("GW", 2), ("GH", 4), ("F", 8), ("HH", 16), ("Vr", 32),
                 ("Gx", 4), ("Gy", 4), ("CAP", 8),
@@ -342,6 +494,39 @@ mod tiny {
         want.sort();
         got.sort();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn vm_options_reach_the_params_and_the_layout_is_checked() {
+        let (plan, mut cfg) = pipe_config();
+        let vm = cfg.vm.as_mut().unwrap();
+        vm.step_input = 4;
+        vm.opmask = Some((0x0000_ffff, 0));
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!((get("vm_sin"), get("opmask_lo"), get("opmask_hi")), (Some("4".into()), Some("65535".into()), Some("0".into())));
+        assert_eq!(get("vm_rows"), None);
+        // vm_lprog is not in this layout's snapshot yet: refused, not dropped.
+        cfg.vm.as_mut().unwrap().lane_programs = Some(256);
+        let declared = layout_params(&Design::Serve2dPipe.files().unwrap()[0].1);
+        if !declared.iter().any(|(n, _)| n == "vm_lprog") {
+            assert!(params(&plan, &cfg).unwrap_err().contains("vm_lprog"));
+        }
+    }
+
+    #[test]
+    fn serve_config_reads_its_table() {
+        let t: toml::Table = toml::from_str(
+            "lanes = 2\npipeline = true\ncap = 8\nmmax = 2\nhb = 2\n[vm]\nmax_ops = 48\nnreg = 6\npool_words = 64\nfeat = 99\nopmask_hi = 0\n",
+        )
+        .unwrap();
+        let c = ServeConfig::from_toml(&t, 16).unwrap();
+        assert_eq!((c.goals.lanes, c.goals.page_size, c.goals.pipeline, c.goals.cap), (2, 16, true, Some(8)));
+        assert_eq!((c.mmax, c.hb), (Some(2), Some(2)));
+        let vm = c.vm.unwrap();
+        assert_eq!((vm.max_ops, vm.ring_w, vm.ring_d, vm.opmask), (48, 1, 32, Some((0xffff_ffff, 0))));
+        let bad: toml::Table = toml::from_str("lanse = 2\n").unwrap();
+        assert!(ServeConfig::from_toml(&bad, 16).unwrap_err().contains("lanse"));
     }
 
     #[test]

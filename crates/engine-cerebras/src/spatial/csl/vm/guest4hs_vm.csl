@@ -36,6 +36,8 @@ param ring_w: u16;
 param vm_prof: u16;
 param vm_lanes: u16;
 param vm_rows: u16;    // logits rows a turn (a multi-row program: W0..W(rows-1))   // lanes time-multiplexed on this VM (per-lane state banks)
+param vm_lprog: u16;   // 1: per-lane programs (an op arena, glane: a lane's table base, token home, bank window)
+param bank_words: u16;  // vm_lprog: the bank arena's words
 param opmask_lo: u32;  // opcodes 0..31 the image runs (bit o)
 param opmask_hi: u32;  // opcodes 32..63
 param vm_sin: u16;     // per-step host input words a turn (0: no step-input path)
@@ -863,7 +865,7 @@ var keep_any: bool = false;
 fn run_section(s: u16) void {
   timestamp.get_timestamp(&t_start);
   section = s;
-  pc = 0;
+  pc = obase;
   if (s == 1) {
     // Skip the prefix to its HALT.
     while (@bitcast(i32, ops[pc * 4] & 0xff) != HALT) : (pc += 1) {}
@@ -1720,21 +1722,71 @@ fn init() void {
 // by step: a launch of `steps` runs lane i % vm_lanes at its turn i.
 const NL: u16 = vm_lanes;
 const BW: u16 = POOL + (NREG - 1) * Vt;
-var bank = @zeros([if (NL > 1) NL * BW else 1]u32);
+// Per-lane programs (vm_lprog 1): every lane runs its own table out of one op
+// arena (gops, max_ops instructions; lanes on the same program share it).
+// glane, 4 words a lane: [table base (instructions), token home (pool word),
+// bank offset (words), wide register mask]; gbdesc its pool ranges: the
+// lane's own window of the bank arena (bank_words), swapped at its turns.
+const LP: bool = vm_lprog != 0;
+const BANKN: u16 = if (LP) bank_words else if (NL > 1) NL * BW else 1;
+var bank = @zeros([BANKN]u32);
 var bank_ptr: [*]u32 = &bank;
+var glane = @zeros([if (LP) NL * 4 else 1]u32);
+var glane_ptr: [*]u32 = &glane;
+var obase: u16 = 0;
+var otok: u16 = 0;
 const pool_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{POOL} -> pool[i] });
 const WREST: u16 = if (NREG > 1) (NREG - 1) * Vt else 1;
 const wide_rest = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{WREST} -> wide[i] }), @as(i16, Vt), f32);
-fn bank_dsd(l: u16, off: u16, n: u16) mem1d_dsd {
-  return @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (NL > 1) NL * BW else 1} -> bank[i] }), @as(i16, l * BW + off), u32), n);
+fn bank_at(at: u16, n: u16) mem1d_dsd {
+  return @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{BANKN} -> bank[i] }), @as(i16, at), u32), n);
+}
+fn bank_dsd(l: u16, off: u16, n: u16) mem1d_dsd { return bank_at(l * BW + off, n); }
+// A lane's window (vm_lprog): only what it carries between turns (what is
+// live at the start of its main section, etagen's bank_regs / bank_pool):
+// gbdesc's up to 8 pool ranges [offset | words << 16] (0: the end), then the
+// wide registers in glane word 3's mask (bit r: W r), packed from glane
+// word 2 in that order.
+var gbdesc = @zeros([if (LP) NL * 8 else 1]u32);
+var gbdesc_ptr: [*]u32 = &gbdesc;
+const wide_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NREG * Vt} -> wide[i] });
+fn bank_move(l: u16, into: bool) void {
+  var at = @as(u16, glane[l * 4 + 2]);
+  { var k: u16 = 0; while (k < 8) : (k += 1) {
+    const e = gbdesc[l * 8 + k];
+    const n = @as(u16, e >> 16);
+    if (n == 0) { break; }
+    const p = @set_dsd_length(@increment_dsd_offset(pool_all, @as(i16, @as(u16, e & 0xffff)), u32), n);
+    if (into) { @mov32(p, bank_at(at, n)); } else { @mov32(bank_at(at, n), p); }
+    at += n;
+  } }
+  const m = glane[l * 4 + 3];
+  { var r: u16 = 1; while (r < NREG) : (r += 1) {
+    if (((m >> r) & 1) != 0) {
+      const w = @set_dsd_length(@increment_dsd_offset(wide_all, @as(i16, r * Vt), f32), Vt);
+      if (into) { @mov32(w, bank_at(at, Vt)); } else { @mov32(bank_at(at, Vt), w); }
+      at += Vt;
+    }
+  } }
 }
 fn swap_in(l: u16) void {
+  if (LP) {
+    obase = @as(u16, glane[l * 4]);
+    otok = @as(u16, glane[l * 4 + 1]);
+    if (NL < 2) { return; }
+    bank_move(l, true);
+    return;
+  }
   if (NL < 2) { return; }
   @mov32(pool_all, bank_dsd(l, 0, POOL));
   if (NREG > 1) { @mov32(wide_rest, bank_dsd(l, POOL, (NREG - 1) * Vt)); }
 }
 fn swap_out(l: u16) void {
   if (NL < 2) { return; }
+  if (LP) {
+    bank_move(l, false);
+    return;
+  }
   @mov32(bank_dsd(l, 0, POOL), pool_all);
   if (NREG > 1) { @mov32(bank_dsd(l, POOL, (NREG - 1) * Vt), wide_rest); }
 }
@@ -1834,7 +1886,7 @@ fn compute(steps: u32) void {
         answer(0.0);
       } else {
       run_section(1);
-      answer(@as(f32, @bitcast(i32, pool[@as(u16, tok_home[0])])));
+      answer(@as(f32, @bitcast(i32, pool[if (LP) otok else @as(u16, tok_home[0])])));
       if (SIN > 0) { step_in(lane, turn + @as(u32, NL)); }
       run_section(0);
       swap_out(lane);
@@ -1869,6 +1921,8 @@ comptime {
   @export_symbol(valid_ptr, "gvalid");
   @export_symbol(tok_home_ptr, "gtok_home");
   @export_symbol(gsin_ptr, "gsin");
+  @export_symbol(glane_ptr, "glane");
+  @export_symbol(gbdesc_ptr, "gbdesc");
   @export_symbol(gsdesc_ptr, "gsdesc");
   @export_symbol(gmode_ptr, "gmode");
   // The head's symbols, so every PE has every exported name.

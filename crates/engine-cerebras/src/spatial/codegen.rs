@@ -519,7 +519,7 @@ const PIPE_HEAD_NAMES: &[(&str, &str)] = &[
 const PIPE_VM_NAMES: &[(&str, &str)] = &[
     ("gwide", "f32"), ("gpool", "u32"), ("gops", "u32"), ("gout", "u32"), ("gprof", "u32"),
     ("gostep", "u32"), ("gring", "u32"), ("gcycles", "u32"), ("gvalid", "u32"), ("gtok_home", "u32"),
-    ("gbank", "u32"), ("vm_ctl", "u32"), ("gsin", "u32"), ("gsdesc", "u32"),
+    ("gbank", "u32"), ("vm_ctl", "u32"), ("gsin", "u32"), ("gsdesc", "u32"), ("glane", "u32"), ("gbdesc", "u32"),
 ];
 
 /// serve2d_pipe's dummies: a 1-word array per missing name.
@@ -719,10 +719,10 @@ mod tests {
         ("serve2d", "head_stub.csl", "e2e5c74bdc834d404dd312a2862bd94def494d2d654b11317628dce43e005bdd"),
         ("serve2d", "filler.csl", "d4e6a8c03eb2184f4afb5a516bfe38307b7472f99c36b8c223d235266def48d3"),
         ("serve2d", "vm_pe.csl", "43b3a8f0ebe4def64ef4c3137d557008c45f9493b6f7c11d691374a7b442f6be"),
-        ("serve2d_pipe", "grid_pe.csl", "d1b08beeae699a6c96c5fb284f15691f56abe8255547fe343f0ba914f59da8b5"),
-        ("serve2d_pipe", "head_pe.csl", "daa08ae4d6f60c30905e8e46a0274ab4ab6c256ed35d25bdf86333d2f12e20c1"),
-        ("serve2d_pipe", "filler.csl", "a647a8db6896f3494ecb18bc1a2ef536396041785656d8b540c7a8b33f5c512f"),
-        ("serve2d_pipe", "vm_pe.csl", "fcc3a5a2d3fc5ac246bb861e34a9dcfc6328cf745cbdf0d514b3b80fcf6d30ca"),
+        ("serve2d_pipe", "grid_pe.csl", "b53a58e0819723e17fcb900aa3b3a9c46b3084d10e78245e88fbcc81e788afc9"),
+        ("serve2d_pipe", "head_pe.csl", "4db3bc7f18fd9ef32f420f8ad4881cbb3477d74bcf71045ff5eb1559e5c26ee5"),
+        ("serve2d_pipe", "filler.csl", "79788748a6a34253d18ba364f05033129db41342f7bc4c86687436fcfaab0e61"),
+        ("serve2d_pipe", "vm_pe.csl", "4753a16de7cc6036f7890df4f8e286b8934b5edc1d7baf094b77dc636851b723"),
     ];
 
     #[test]
