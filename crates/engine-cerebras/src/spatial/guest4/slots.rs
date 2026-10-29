@@ -412,6 +412,7 @@ mod tests {
             sin: 4,
             lprog: true,
             bank_words: 200,
+            set_b_cols: 0,
         }
     }
 

@@ -55,6 +55,9 @@ pub struct VmLayout {
     /// instructions and a bank arena of `bank_words` words.
     pub lprog: bool,
     pub bank_words: usize,
+    /// A second VM set's columns after this one's (guest4h2s `VMB`): the
+    /// head's `gmode` covers them too.
+    pub set_b_cols: usize,
 }
 
 /// `opmask_lo` / `opmask_hi` as one mask (all ones where the build says
@@ -100,6 +103,7 @@ impl VmLayout {
             sin: get("vm_sin").unwrap_or(0),
             lprog: get("vm_lprog").unwrap_or(0) != 0,
             bank_words: get("bank_words").unwrap_or(0),
+            set_b_cols: get("VMB").unwrap_or(0),
         })
     }
 
@@ -133,6 +137,7 @@ impl VmLayout {
             sin: get("vm_sin").unwrap_or(0),
             lprog: get("vm_lprog").unwrap_or(0) != 0,
             bank_words: get("bank_words").unwrap_or(0),
+            set_b_cols: get("VMB").unwrap_or(0),
         })
     }
 
@@ -169,7 +174,7 @@ impl VmLayout {
     /// The head's PEs (every block's columns, its region rows and the
     /// feeder row): where `gmode` lives.
     pub fn head(&self) -> Rect {
-        rect(self.x0, 0, self.blocks * self.block_cols, self.rows + 1)
+        rect(self.x0, 0, self.blocks * self.block_cols + self.set_b_cols, self.rows + 1)
     }
 
     /// Block 0's hub (its VM column's feeder-row PE): the ring and the pool

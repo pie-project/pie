@@ -65,7 +65,8 @@ pub struct Layout2d {
     pub hlbn: Option<usize>,
     /// Words of a virtual lane's VM control (`vmlane`): 2 (gmode, forced
     /// prefix) on guest4hs, 3 on guest4hz (and the offset to the lane's
-    /// turn's last row).
+    /// turn's last row), 4 on guest4h2s (and the lane's VM set: 0, set A,
+    /// the only one the engine drives yet).
     pub vmlane_words: usize,
     /// serve8b ([`super::serve8b`]): bf16 grids in strips that skip a slot
     /// (or serve8b_region's grids and regions), a head of `PY / 2` chunk
@@ -115,7 +116,9 @@ impl Layout2d {
                 hh: p("HH")?,
                 vr: p("Vr")?,
                 gx: p("Gx")?,
-                vmc: p("VMC")?,
+                // Every VM column the head steps over: set A's VMC and a
+                // second VM set's VMB (guest4h2s).
+                vmc: p("VMC")? + get("VMB").unwrap_or(0),
                 vocab: p("vocab")?,
                 cap: p("CAP")?,
                 paged: None,

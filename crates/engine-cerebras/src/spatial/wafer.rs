@@ -164,18 +164,18 @@ impl Design {
         match (built.as_deref(), super::serve2d::Layout2d::of(get)) {
             (Some("serve2d" | "serve2d_pipe" | "serve8b" | "serve8b_region") | None, Some(grid)) => grid
                 .map(|mut g| {
-                    // guest4hz's vmlane is 3 words a virtual lane: the
-                    // manifest names the VM; a program built elsewhere, the
-                    // symbol's size on the head's chunk PEs tells.
+                    // guest4hz's vmlane is 3 words a virtual lane, guest4h2s's
+                    // 4: the manifest names the VM; a program built
+                    // elsewhere, the symbol's size on the head's chunk PEs
+                    // tells.
                     if let (Some(_), Some(m), Some(shape)) = (g.vm, g.mmax, g.paged) {
-                        let hz = match super::manifest::Manifest::read(program).and_then(|m| m.vm) {
-                            Some(vm) => vm == "guest4hz",
-                            None => {
-                                super::guest4::lane::symbol_words(program, "vmlane") == Some(m * shape.lanes * 3)
-                            }
+                        let words = match super::manifest::Manifest::read(program).and_then(|m| m.vm).as_deref() {
+                            Some("guest4hz") => 3,
+                            Some("guest4h2s") => 4,
+                            _ => super::guest4::lane::symbol_words(program, "vmlane").unwrap_or(0) / (m * shape.lanes).max(1),
                         };
-                        if hz {
-                            g.vmlane_words = 3;
+                        if (3..=4).contains(&words) {
+                            g.vmlane_words = words;
                         }
                     }
                     Design::Grid(g)
