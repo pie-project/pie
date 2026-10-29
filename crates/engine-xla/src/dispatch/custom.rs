@@ -147,10 +147,17 @@ impl Run<'_> {
                 pad_back,
                 causal_t,
                 time_pad,
+                dilation,
+                depthwise,
                 cache,
                 y_grid,
                 y,
             } => {
+                if *dilation != [1, 1, 1] || *depthwise {
+                    return Err(kernels_xla::Error::Unsupported {
+                        op: "conv.conv3d (dilated or depthwise)",
+                    });
+                }
                 let conv = conv::Conv3d {
                     k: *k,
                     stride: *stride,

@@ -533,3 +533,5 @@ instantiate_qmv_codec(mxfp4_qmv_routed, qmv_routed, Mxfp4, bfloat16, bfloat, 32,
 instantiate_qmv_codec(affine_qmv_tail_bias, qmv_tail_bias, AffineU8, bfloat16, bfloat, 64, 8)
 
 instantiate_qmv_codec(affine_qmv_tail, qmv_tail, AffineU8, bfloat16, bfloat, 64, 8)
+instantiate_qmv_codec(affine_qmv_routed_bias, qmv_routed_bias_p2, AffineU8, bfloat16, bfloat, 64, 8)
+instantiate_qmv_codec(affine_qmv_routed, qmv_routed_p2, AffineU8, bfloat16, bfloat, 64, 8)

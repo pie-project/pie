@@ -2,7 +2,7 @@
 #include "prim/params.slang"
 
 // Elementwise kernels with no algorithm of their own, a pair of elements a
-// lane (`prim/pair.slang`): sums, a bias, scalars, activations, the f32 to
+// lane (`prim/pair.slang`): sums, a bias, scalars, activations, snake, the f32 to
 // bf16 cast, clamps and the sigmoid gate. `PIE_<KERNEL>` picks the kernel.
 // A whole-tensor kernel's lanes past `PIE_FLAT_SPAN` ride the y axis.
 
@@ -225,6 +225,73 @@ void main(uint3 gid : SV_DispatchThreadID) {
     pair_put(x, i, both, sqrt(pair_at(x, i, both)));
 }
 
+#elif defined(PIE_GELU)
+
+// `x = gelu(x)` in place over a whole tensor, a pair of elements a lane:
+// exact through erf, or with `PIE_TANH_APPROX` tanh's approximation.
+
+[[vk::binding(0)]] RWStructuredBuffer<PIE_ACT> x;
+
+struct Params {
+    uint n;
+};
+PIE_PARAMS(1, Params, params);
+
+// erf to 1.5e-7 (Abramowitz & Stegun 7.1.26).
+float2 erf2(float2 v) {
+    float2 t = 1.0 / (1.0 + 0.3275911 * abs(v));
+    float2 y = 1.0 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-v * v);
+    return float2(v.x < 0.0 ? -y.x : y.x, v.y < 0.0 ? -y.y : y.y);
+}
+
+[shader("compute")]
+[numthreads(PIE_GROUP_X, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    uint i = 2u * gid.x;
+    if (i >= params.n) {
+        return;
+    }
+    bool both = i + 1u < params.n;
+    float2 v = pair_at(x, i, both);
+#ifdef PIE_TANH_APPROX
+    pair_put(x, i, both, 0.5 * v * (1.0 + tanh(0.7978845608028654 * (v + 0.044715 * v * v * v))));
+#else
+    pair_put(x, i, both, 0.5 * v * (1.0 + erf2(v * 0.70710678118654752)));
+#endif
+}
+
+#elif defined(PIE_SNAKE)
+
+// SnakeBeta in place, `x + sin²(x·e^alpha) / (e^beta + 1e-9)`, a pair of
+// elements a lane; `alpha` and `beta` are f32 logs, one a channel.
+
+[[vk::binding(0)]] RWStructuredBuffer<PIE_ACT> x;
+[[vk::binding(1)]] StructuredBuffer<float> alpha;
+[[vk::binding(2)]] StructuredBuffer<float> beta;
+
+struct Params {
+    uint n;
+    uint width;
+};
+PIE_PARAMS(3, Params, params);
+
+float snake(float v, uint c) {
+    float s = sin(v * exp(alpha[c]));
+    return v + s * s / (exp(beta[c]) + 1e-9);
+}
+
+[shader("compute")]
+[numthreads(PIE_GROUP_X, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    uint i = 2u * gid.x;
+    if (i >= params.n) {
+        return;
+    }
+    bool both = i + 1u < params.n;
+    float2 v = pair_at(x, i, both);
+    pair_put(x, i, both, float2(snake(v.x, i % params.width), both ? snake(v.y, (i + 1u) % params.width) : 0.0));
+}
+
 #elif defined(PIE_CAST)
 
 // f32 values rounded into bf16 ones, a pair a lane.
@@ -347,6 +414,12 @@ void main(uint3 gid : SV_DispatchThreadID) {
 // pie:instantiate elemwise_pointwise_tanh_f32 PIE_TANH=1 PIE_GROUP_X=256 PIE_ACT_F32=1
 // pie:instantiate elemwise_pointwise_sqrt_bf16 PIE_SQRT=1 PIE_GROUP_X=256
 // pie:instantiate elemwise_pointwise_sqrt_f32 PIE_SQRT=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_gelu_bf16 PIE_GELU=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_gelu_f32 PIE_GELU=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_gelu_tanh_bf16 PIE_GELU=1 PIE_TANH_APPROX=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_gelu_tanh_f32 PIE_GELU=1 PIE_TANH_APPROX=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_snake_bf16 PIE_SNAKE=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_snake_f32 PIE_SNAKE=1 PIE_GROUP_X=256 PIE_ACT_F32=1
 // pie:instantiate elemwise_pointwise_cast_f32_to_bf16 PIE_CAST=1 PIE_GROUP_X=256
 // pie:instantiate elemwise_pointwise_clamp_bf16 PIE_CLAMP=1 PIE_GROUP_X=256
 // pie:instantiate elemwise_pointwise_clamp_learned_bf16 PIE_CLAMP=1 PIE_GROUP_X=256 PIE_LEARNED=1

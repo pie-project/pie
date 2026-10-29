@@ -642,6 +642,8 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
         pad_back: starlark::values::none::NoneOr<Star<'v>>,
         #[starlark(require = named, default = starlark::values::none::NoneOr::None)]
         causal: starlark::values::none::NoneOr<&str>,
+        #[starlark(require = named, default = 1)] dilation: u32,
+        #[starlark(require = named, default = false)] depthwise: bool,
     ) -> anyhow::Result<Whole> {
         let two = Vec::<u32>::arg(Some(k))?.len() == 2;
         let (k, stride, pad) = (
@@ -663,6 +665,13 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
             Some("replicate") => conv.causal(poem_ir::ops::conv::TimePad::Replicate),
             Some(other) => anyhow::bail!("a causal conv pads with zero or replicate, not {other}"),
         };
+        // Spaced taps along time, the one axis a dilated conv here spreads.
+        if dilation != 1 {
+            conv = conv.dilated([dilation, 1, 1]);
+        }
+        if depthwise {
+            conv = conv.depthwise();
+        }
         Ok(Whole(Held::ConvShape(conv)))
     }
 
@@ -704,6 +713,8 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
                 "replicate" => poem_ir::ops::conv::TimePad::Replicate,
                 other => anyhow::bail!("a conv pads time with zero or replicate, not {other}"),
             },
+            dilation: [1, 1, 1],
+            depthwise: false,
         })))
     }
 

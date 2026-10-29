@@ -1797,7 +1797,9 @@ impl Shell {
                     * u64::try_from(clip[2]).unwrap_or(0)
             })
             .sum();
-        if out_voxels != u64::from(rows) {
+        // The carve sizes a plane past a downsampling rule at the port's
+        // rows, its voxels at their head.
+        if out_voxels > u64::from(rows) {
             return Err(Fault::Program {
                 at: "serve::enqueue",
                 why: format!(
@@ -1860,10 +1862,9 @@ impl Shell {
             }
         }
 
+        // The epilogues read the forward's planes through their addresses.
         #[cfg(target_vendor = "apple")]
-        {
-            let _ = frame.next_pass()?;
-        }
+        frame.barrier(&self.device)?;
 
         let mut owed = Vec::with_capacity(prepared.attachments.len());
         match self.stage_epilogues(frame, prepared, &first_row, &lane_rows, &mut owed) {

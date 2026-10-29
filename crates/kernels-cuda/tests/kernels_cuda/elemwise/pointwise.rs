@@ -18,6 +18,21 @@ fn gelu_tanh(v: f32) -> f32 {
     0.5 * v * (1.0 + (C * v.mul_add(0.044_715 * v * v, v)).tanh())
 }
 
+/// erf by its Maclaurin series, near-exact over the test's inputs.
+fn erf(x: f64) -> f64 {
+    let (mut term, mut sum) = (x, x);
+    for n in 1..200 {
+        term *= -x * x / f64::from(n);
+        sum += term / f64::from(2 * n + 1);
+    }
+    sum * 2.0 / std::f64::consts::PI.sqrt()
+}
+
+fn gelu(v: f32) -> f32 {
+    let v = f64::from(v);
+    (0.5 * v * (1.0 + erf(v / std::f64::consts::SQRT_2))) as f32
+}
+
 fn close(got: f32, want: f32, what: &str, at: usize) {
     assert!(
         (got - want).abs() <= 1e-6 + want.abs() / 128.0,
@@ -30,6 +45,39 @@ fn the_bare_binary_and_activation_ops_answer_the_reference_every_case() {
     the_bare_ops_answer_the_reference();
     each_may_write_the_rectangle_it_read();
     div_mod_and_sqrt_answer_the_reference_in_f32();
+    the_exact_gelu_and_snake_answer_the_reference();
+}
+
+/// GELU through erf, and SnakeBeta in place with per-channel logs.
+fn the_exact_gelu_and_snake_answer_the_reference() {
+    let mut lcg = Lcg::seeded(0x5ae4);
+    let (x_raw, x) = lcg.row(N);
+    let alpha: Vec<f32> = (0..WIDTH).map(|_| 0.5 * lcg.unit()).collect();
+    let beta: Vec<f32> = (0..WIDTH).map(|_| 0.5 * lcg.unit()).collect();
+
+    let mut gpu = Gpu::open();
+    let x_at = gpu.up(&x_raw);
+    let out = gpu.zeros(N * 2);
+    let snaked = gpu.up(&x_raw);
+    let (a_at, b_at) = (gpu.up(&alpha), gpu.up(&beta));
+    let ctx = gpu.ctx();
+    let rect = |at: u64| Tensor::new(at, ROWS as u32, WIDTH as u32, Dtype::Bf16);
+    let channel = |at: u64| Tensor::new(at, 1, WIDTH as u32, Dtype::F32);
+
+    pointwise::gelu(&ctx, rect(x_at), &mut rect(out)).expect("fires");
+    pointwise::snake(&ctx, channel(a_at), channel(b_at), &mut rect(snaked)).expect("fires");
+    gpu.sync();
+
+    let gelued: Vec<u16> = gpu.down(out, N);
+    let snaked: Vec<u16> = gpu.down(snaked, N);
+    for at in 0..N {
+        close(from_bf16(gelued[at]), gelu(x[at]), "gelu (erf)", at);
+        let c = at % WIDTH;
+        let v = f64::from(x[at]);
+        let s = (v * f64::from(alpha[c]).exp()).sin();
+        let want = (v + s * s / (f64::from(beta[c]).exp() + 1e-9)) as f32;
+        close(from_bf16(snaked[at]), want, "snake", at);
+    }
 }
 
 fn the_bare_ops_answer_the_reference() {

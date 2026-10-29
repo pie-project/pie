@@ -1,9 +1,9 @@
 //! Elementwise kernels with no algorithm of their own (`elemwise.binary`,
 //! `residual_add`, `add_bias`, `mul_scalar`, `scale`, `silu`, `silu_scaled`,
-//! `tanh`, `sqrt`, `cast`, `clamp`, `clamp_learned`, `gate_sigmoid_mul`) from
-//! `kernels/elemwise/pointwise.slang`, a pair of elements a lane. A
-//! whole-tensor kernel takes an odd count; an in-place one binds its tensor
-//! once, writable, as WebGPU asks.
+//! `tanh`, `sqrt`, `gelu`, `snake`, `cast`, `clamp`, `clamp_learned`,
+//! `gate_sigmoid_mul`) from `kernels/elemwise/pointwise.slang`, a pair of
+//! elements a lane. A whole-tensor kernel takes an odd count; an in-place one
+//! binds its tensor once, writable, as WebGPU asks.
 
 use std::cmp::Ordering;
 
@@ -195,6 +195,54 @@ pub fn tanh(ctx: &Ctx<'_>, x: Tensor) -> Result<(), Error> {
     ctx.fire(
         Fire::at(POINTWISE, entry).apply(grid),
         &[x.arg_mut(), n.arg()],
+    )
+}
+
+/// `x = gelu(x)`, exact (erf) or with `tanh`'s approximation.
+pub fn gelu(ctx: &Ctx<'_>, x: Tensor, tanh: bool) -> Result<(), Error> {
+    const OP: &str = "elemwise.act";
+    let entry = if tanh {
+        dtype_dispatch!(OP, x.dtype, {
+            Bf16 => "elemwise_pointwise_gelu_tanh_bf16",
+            F32 => "elemwise_pointwise_gelu_tanh_f32",
+        })
+    } else {
+        dtype_dispatch!(OP, x.dtype, {
+            Bf16 => "elemwise_pointwise_gelu_bf16",
+            F32 => "elemwise_pointwise_gelu_f32",
+        })
+    };
+    let (n, grid) = flat(OP, x)?;
+    ctx.fire(
+        Fire::at(POINTWISE, entry).apply(grid),
+        &[x.arg_mut(), n.arg()],
+    )
+}
+
+/// SnakeBeta over `x` in place, `alpha` and `beta` (f32 logs) a channel each.
+pub fn snake(ctx: &Ctx<'_>, x: Tensor, alpha: Tensor, beta: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.snake";
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "elemwise_pointwise_snake_bf16",
+        F32 => "elemwise_pointwise_snake_f32",
+    });
+    for p in [alpha, beta] {
+        if p.dtype != Dtype::F32 || u64::from(p.rows) * u64::from(p.width) < u64::from(x.width) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "a parameter of {} {:?} for {} channels",
+                    p.rows * p.width,
+                    p.dtype,
+                    x.width
+                ),
+            ));
+        }
+    }
+    let (n, grid) = flat(OP, x)?;
+    ctx.fire(
+        Fire::at(POINTWISE, entry).apply(grid),
+        &[x.arg_mut(), alpha.arg(), beta.arg(), n.arg(), x.width.arg()],
     )
 }
 

@@ -118,6 +118,42 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
     activation(ctx, OP, entry, x, o)
 }
 
+/// GELU through erf.
+pub fn gelu(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.act";
+    let entry = dtype_dispatch!(OP, o.dtype, {
+        Bf16 => "act_gelu_bfloat16",
+        F32 => "act_gelu_float32",
+    });
+    activation(ctx, OP, entry, x, o)
+}
+
+/// SnakeBeta over `x` in place, `alpha` and `beta` (f32 logs) a channel each.
+pub fn snake(ctx: &Ctx<'_>, x: Tensor, alpha: Tensor, beta: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.snake";
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "act_snake_bfloat16",
+        F32 => "act_snake_float32",
+    });
+    for p in [alpha, beta] {
+        if p.dtype != Dtype::F32 || u64::from(p.rows) * u64::from(p.width) < u64::from(x.width) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "a parameter of {} {:?} for {} channels",
+                    p.rows * p.width,
+                    p.dtype,
+                    x.width
+                ),
+            ));
+        }
+    }
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of(elementwise(OP, x.width, x.rows)?, GROUP)),
+        &[x.arg_mut(), alpha.arg(), beta.arg(), x.width.arg()],
+    )
+}
+
 /// The entrypoint and threads-per-block for a butterfly FWHT of a given block
 /// size and element type. Blocks up to 256 ride one simdgroup (32 threads);
 /// 512 and 1024 ride a 256-thread threadgroup.

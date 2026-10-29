@@ -1,12 +1,13 @@
 //! The 3-D convolution over clip tables (`conv.conv3d`), from
 //! `kernels/conv/conv3d.slang` (a strip a channel) and
 //! `kernels/conv/conv3d_tiled.slang` (register-tiled, when `c_in` is a
-//! multiple of 16).
+//! multiple of 16 and the channels are not convolved alone; on SPIR-V from
+//! 16 channels out, its 8-row lanes).
 
 use dtype::Dtype;
 
 use super::{clip_pair, row_grid};
-use crate::encode::{Arg, ArgValue, Ctx, Fire, Grid, refuse, stated};
+use crate::encode::{Arg, ArgValue, Ctx, Fire, Grid, Target, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
@@ -21,8 +22,8 @@ const THREADS: u32 = 128;
 
 const STRIPS: u32 = THREADS / 32;
 
-/// The tiled kernel's tile, rows by channels.
-const TILE: u32 = 64;
+/// The tiled kernel's lanes.
+const TILED_THREADS: u32 = 256;
 
 /// The tiled kernel's contraction step; a step stays inside one tap.
 const STEP: u32 = 16;
@@ -41,6 +42,8 @@ pub struct Conv3d {
     pub pad_back: [u32; 3],
     pub causal_t: bool,
     pub time_pad: TimePad,
+    pub dilation: [u32; 3],
+    pub depthwise: bool,
 }
 
 impl Conv3d {
@@ -108,7 +111,16 @@ pub fn conv3d(
     // An odd output row's words straddle rows: the flat arm lands them.
     let flat = !c_out.is_multiple_of(2);
     let taps = conv.taps();
-    if w.rows != c_out || w.width != taps * c_in {
+    if conv.depthwise && c_in != c_out {
+        return Err(refuse(
+            OP,
+            format!(
+                "a depthwise convolution keeps its channels, and this one maps {c_in} into {c_out}"
+            ),
+        ));
+    }
+    let per = if conv.depthwise { 1 } else { c_in };
+    if w.rows != c_out || w.width != taps * per {
         return Err(refuse(
             OP,
             format!(
@@ -148,7 +160,47 @@ pub fn conv3d(
     ];
     args.extend(conv.scalars(c_in, c_out, clips, rows_out)?);
     args.push(u32::from(bias.is_some()).arg());
+    let dilation = conv
+        .dilation
+        .iter()
+        .map(|&d| stated(OP, d).map(Arg::arg))
+        .collect::<Result<Vec<_>, _>>()?;
     let bases = [stated(OP, bases[0])?.arg(), stated(OP, bases[1])?.arg()];
+    if !flat && !conv.depthwise && c_in.is_multiple_of(STEP) {
+        // `(entry, channels a tile, channels a lane, rows a lane)`. On SPIR-V,
+        // sixty-four channels a tile at eight a lane, or thirty-two at four
+        // when that leaves none idle; fewer than sixteen channels leave most
+        // of either idle, and WGSL's workgroup memory holds only the 4 x 4
+        // lane.
+        let (entry, cols, per, lane_rows) = if ctx.target() == Target::Spirv && c_out >= 16 {
+            if c_out.is_multiple_of(32) && !c_out.is_multiple_of(64) {
+                ("conv_conv3d_tiled_bm_256_bn_32_bf16", 32, 4, 8)
+            } else {
+                ("conv_conv3d_tiled_bm_256_bf16", 64, 8, 8)
+            }
+        } else {
+            ("conv_conv3d_tiled_bf16", 64, 4, 4)
+        };
+        let tx = cols / per;
+        let ty = TILED_THREADS / tx;
+        let rows = ty * lane_rows;
+        let tiles = rows_out.div_ceil(rows);
+        if tiles > 65_535 {
+            return Err(refuse(
+                OP,
+                format!("the grid will not launch: {rows_out} output rows"),
+            ));
+        }
+        args.extend(bases);
+        args.extend(dilation);
+        return ctx.fire(
+            Fire::at(CONV3D_TILED, entry).apply(Grid::of(
+                [c_out.div_ceil(cols) * tx, tiles * ty, 1],
+                [tx, ty, 1],
+            )),
+            &args,
+        );
+    }
     if flat {
         let groups = (u64::from(rows_out) * u64::from(c_out)).div_ceil(u64::from(STRIPS));
         let groups = u32::try_from(groups).map_err(|_| {
@@ -160,25 +212,10 @@ pub fn conv3d(
         let (shape, span) = row_grid(THREADS, groups, THREADS);
         args.push(span.arg());
         args.extend(bases);
+        args.extend(dilation);
+        args.push(i32::from(conv.depthwise).arg());
         return ctx.fire(
             Fire::at(CONV3D, "conv_conv3d_flat_bf16").apply(shape),
-            &args,
-        );
-    }
-    if c_in.is_multiple_of(STEP) {
-        args.extend(bases);
-        let tiles = rows_out.div_ceil(TILE);
-        if tiles > 65_535 {
-            return Err(refuse(
-                OP,
-                format!("the grid will not launch: {rows_out} output rows"),
-            ));
-        }
-        return ctx.fire(
-            Fire::at(CONV3D_TILED, "conv_conv3d_tiled_bf16").apply(Grid::of(
-                [c_out.div_ceil(TILE) * (TILE / 4), tiles * (TILE / 4), 1],
-                [TILE / 4, TILE / 4, 1],
-            )),
             &args,
         );
     }
@@ -192,5 +229,7 @@ pub fn conv3d(
     let (shape, span) = row_grid(lanes, rows_out, THREADS);
     args.push(span.arg());
     args.extend(bases);
+    args.extend(dilation);
+    args.push(i32::from(conv.depthwise).arg());
     ctx.fire(Fire::at(CONV3D, "conv_conv3d_bf16").apply(shape), &args)
 }

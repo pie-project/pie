@@ -69,6 +69,9 @@ pub struct Plane {
     #[cfg(feature = "vulkan")]
     built: crate::guest::session::BuiltStages,
 
+    #[cfg(feature = "vulkan")]
+    kept: crate::guest::session::Kept,
+
     /// Passes run on the device.
     tally: u64,
 }
@@ -133,6 +136,11 @@ impl Plane {
     }
 
     pub fn close_channel(&mut self, id: ChannelId) -> Result<(), Refusal> {
+        #[cfg(feature = "vulkan")]
+        self.kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
         self.channels
             .remove(&id)
             .map(|_| ())
@@ -266,10 +274,7 @@ impl Plane {
         if ring.size() <= 1
             && let Some(cell) = seat.session.kept_cell(dense as u32)
         {
-            return Ok(InputCell::Device {
-                cell: cell.clone(),
-                dtype,
-            });
+            return Ok(InputCell::Device { cell, dtype });
         }
         if ring.is_empty() {
             return Err(Refusal::Program(format!(
@@ -557,7 +562,7 @@ impl Plane {
             .ports
             .iter()
             .find(|binding| binding.port == Port::EmbedTokens && !binding.is_const)?;
-        seat.session.kept_cell(binding.channel).cloned()
+        seat.session.kept_cell(binding.channel)
     }
 
     /// Whether `instance`'s pass can be recorded to land later: one stage,
@@ -758,6 +763,8 @@ impl Plane {
             compiled.all(),
             &extents,
             &mut self.built,
+            Arc::clone(&self.kept),
+            binding.channels.clone(),
         )
         .map_err(|why| format!("its device half did not build: {why}"))
     }

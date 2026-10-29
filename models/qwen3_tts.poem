@@ -1,0 +1,578 @@
+# Qwen3-TTS (12 Hz): a Qwen3 talker that speaks a frame's first codebook,
+# a small predictor for the other fifteen, and the codec decoder that turns
+# the frames into 24 kHz audio. A deployment's second dtype, if it states
+# one, is the predictor's: it runs fifteen times a frame, the talker once.
+
+load("//pie/codec.poem", "mapped")
+load("//lib/spoken.poem", "QWEN_STOP")
+
+CHATML = template("chatml", stop = QWEN_STOP)
+TOKENIZER = tokenizer(markers = [QWEN_STOP, ["<tts_pad>", "<tts_text_bos>", "<tts_text_eod>"]])
+
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward; the codec decoder it holds whole.
+CUTS = "inferred"
+
+MODELS = [
+    model("qwen3-tts-0.6b", template = CHATML, tokenizer = TOKENIZER, arch = "qwen3_tts", layers = 28, vocab = 151936),
+]
+
+DEPLOYMENTS = [
+    deployment("qwen3-tts-0.6b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-tts-0.6b", weights = dtype.u8g64, kv = dtype.bf16),
+    deployment("qwen3-tts-0.6b", weights = [dtype.u8g64, dtype.u4g64], kv = dtype.bf16),
+]
+
+# The weights of Qwen3-TTS: the talker (a dense Qwen3 over projected text and
+# codec embeddings), the code predictor, and their codec table: the talker's
+# 3072 codes, each of the predictor's fifteen 2048-code books, then a zero
+# row a seed row embeds as.
+
+def linear(out, in_, banks, bias = True):
+    return struct(
+        w = weight([out, in_], banks),
+        bias = weight([out]) if bias else None,
+    )
+
+TALKER = struct(hidden = 1024, q_heads = 16, kv_heads = 8, head_dim = 128, inter = 3072, theta = 1000000.0, eps = 1e-6, layers = 28)
+PREDICTOR = struct(hidden = 1024, q_heads = 16, kv_heads = 8, head_dim = 128, inter = 3072, theta = 1000000.0, eps = 1e-6, layers = 5)
+TEXT = struct(vocab = 151936, width = 2048)
+
+# The codec decoder: sixteen 2048-code books of 256, a causal conv, a sliding
+# window transformer, two 2x upsamplers each with a ConvNeXt block, then four
+# snake / transposed conv / residual blocks to 24 kHz.
+CODEC = struct(
+    books = 16,
+    book = 2048,
+    dim = 256,
+    latent = 512,
+    pre = 1024,
+    hidden = 512,
+    heads = 16,
+    head_dim = 64,
+    inter = 1024,
+    layers = 8,
+    window = 72,
+    theta = 10000.0,
+    eps = 1e-5,
+    up = [2, 2],
+    width = 1536,
+    rates = [8, 5, 4, 3],
+)
+CODES = struct(talker = 3072, books = 15, book = 2048)
+
+# The predictor's heads, one a book and a last none routes to: a route row
+# is even, as a bf16 row lands in whole words on Vulkan.
+HEADS = 16
+
+def stack(c, banks, kv):
+    """A dense Qwen3 stack of config `c`, its caches named under `kv`:
+    pre-norm attention with q and k normed per head, a SwiGLU MLP, and the
+    stack's final norm."""
+    hidden, hd, inter = c.hidden, c.head_dim, c.inter
+
+    def layer(l):
+        return struct(
+            attn_norm = weight([hidden]),
+            q = weight([c.q_heads * hd, hidden], banks),
+            k = weight([c.kv_heads * hd, hidden], banks),
+            v = weight([c.kv_heads * hd, hidden], banks),
+            o = weight([hidden, c.q_heads * hd], banks),
+            q_norm = weight([hd]),
+            k_norm = weight([hd]),
+            mlp_norm = weight([hidden]),
+            gate = weight([inter, hidden], banks),
+            up = weight([inter, hidden], banks),
+            down = weight([hidden, inter], banks),
+            kv = "{}.kv.{}".format(kv, l),
+        )
+
+    return struct(
+        hidden = hidden,
+        q_heads = c.q_heads,
+        kv_heads = c.kv_heads,
+        head_dim = hd,
+        inter = inter,
+        theta = c.theta,
+        eps = c.eps,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        layers = [layer(l) for l in range(c.layers)],
+        norm = weight([hidden]),
+    )
+
+def causal_conv(c_out, c_in, taps, depthwise = False):
+    per = 1 if depthwise else c_in
+    return struct(
+        w = weight([c_out, per * taps], dtype.bf16),
+        bias = weight([c_out], dtype.f32),
+    )
+
+def snake(c):
+    return struct(alpha = weight([c], dtype.f32), beta = weight([c], dtype.f32))
+
+def codec_decoder():
+    c = CODEC
+    dense = dtype.bf16
+    hd = c.head_dim
+
+    def layer(l):
+        return struct(
+            attn_norm = weight([c.hidden], dense),
+            q = weight([c.heads * hd, c.hidden], dense),
+            k = weight([c.heads * hd, c.hidden], dense),
+            v = weight([c.heads * hd, c.hidden], dense),
+            o = weight([c.hidden, c.heads * hd], dense),
+            mlp_norm = weight([c.hidden], dense),
+            gate = weight([c.inter, c.hidden], dense),
+            up = weight([c.inter, c.hidden], dense),
+            down = weight([c.hidden, c.inter], dense),
+            kv = "codec.kv.{}".format(l),
+        )
+
+    def upsampler(u):
+        return struct(
+            r = c.up[u],
+            w = weight([c.up[u] * c.pre, c.pre], dense),
+            bias = weight([c.up[u] * c.pre], dense),
+            dw = causal_conv(c.pre, c.pre, 7, depthwise = True),
+            norm = weight([c.pre], dense),
+            norm_bias = weight([c.pre], dense),
+            fc1 = weight([4 * c.pre, c.pre], dense),
+            fc1_bias = weight([4 * c.pre], dense),
+            fc2 = weight([c.pre, 4 * c.pre], dense),
+            # The bias negated, which the layer scale standardizes against.
+            fc2_bias = weight([c.pre], dense),
+            gamma = weight([c.pre], dense),
+        )
+
+    def block(i):
+        c_in = c.width // [1, 2, 4, 8][i]
+        c_out = c_in // 2
+        r = c.rates[i]
+        return struct(
+            r = r,
+            snake = snake(c_in),
+            up = causal_conv(r * c_out, c_in, 2),
+            units = [
+                struct(
+                    dilation = d,
+                    snake1 = snake(c_out),
+                    conv1 = causal_conv(c_out, c_out, 7),
+                    snake2 = snake(c_out),
+                    conv2 = weight([c_out, c_out], dense),
+                    conv2_bias = weight([c_out], dense),
+                )
+                for d in [1, 3, 9]
+            ],
+        )
+
+    last = c.width // 16
+    return struct(
+        books = c.books,
+        book = c.book,
+        codes = weight([c.books * c.book, c.dim], dense),
+        project = weight([2 * c.latent, c.dim], dense),
+        pre = weight([c.pre, 3 * c.latent], dense),
+        pre_bias = weight([c.pre], dense),
+        input = weight([c.hidden, c.pre], dense),
+        input_bias = weight([c.hidden], dense),
+        layers = [layer(l) for l in range(c.layers)],
+        norm = weight([c.hidden], dense),
+        output = weight([c.pre, c.hidden], dense),
+        output_bias = weight([c.pre], dense),
+        upsamplers = [upsampler(u) for u in range(len(c.up))],
+        first = causal_conv(c.width, c.pre, 7),
+        blocks = [block(i) for i in range(len(c.rates))],
+        snake = snake(last),
+        # The audio and a zero channel beside it: a bf16 row lands in whole
+        # words on Vulkan.
+        last = causal_conv(2, last, 7),
+        heads = c.heads,
+        head_dim = hd,
+        hidden = c.hidden,
+        inter = c.inter,
+        window = c.window,
+        theta = c.theta,
+        eps = c.eps,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        latent = c.latent,
+        dim = c.dim,
+        width = c.pre,
+    )
+
+def route(codes):
+    """Each code's row of the head that reads out the book after its own, a
+    one-hot over the heads: the talker's codes the first, book b's the
+    (b+1)th, the zero row the first."""
+    books = CODES.books
+    book_of = [0] * CODES.talker
+    for b in range(1, books):
+        book_of += [b] * CODES.book
+    book_of += [0] * (codes - len(book_of))
+    values = []
+    for b in book_of:
+        values += [1.0 if j == b else 0.0 for j in range(HEADS)]
+    return values
+
+def layout(id, deploy):
+    w = roles(deploy, "talker", "predictor")
+    banks, per_book = w.talker, w.predictor
+    codes = CODES.talker + CODES.books * CODES.book + 1
+    return struct(
+        kv = dtype.bf16,
+        text_vocab = TEXT.vocab,
+        text_embed = weight([TEXT.vocab, TEXT.width], banks),
+        text_fc1 = linear(TEXT.width, TEXT.width, banks),
+        text_fc2 = linear(TALKER.hidden, TEXT.width, banks),
+        codes = codes,
+        talker_codes = CODES.talker,
+        book = CODES.book,
+        # Dense: the talker sums a frame's codes off it by their weights.
+        codec_embed = weight([codes, TALKER.hidden]),
+        talker = stack(TALKER, banks, "talker"),
+        predictor = stack(PREDICTOR, per_book, "predictor"),
+        talker_head = weight([CODES.talker, TALKER.hidden]),
+        books_head = weight([HEADS, CODES.book, PREDICTOR.hidden], per_book),
+        route = weight([codes, HEADS], values = route(codes)),
+        codec = codec_decoder(),
+    )
+
+# How a Qwen3-TTS checkpoint is laid out: transformers' state_dict, all under
+# `talker.`, and the speech tokenizer's decoder under `decoder.` in its own
+# safetensors.
+
+BOOKS = 15
+
+DEC = "decoder."
+
+def read_linear(reads, w, stem):
+    reads.read(w.w, stem + ".weight")
+    if w.bias != None:
+        reads.read(w.bias, stem + ".bias")
+
+# A dense Qwen3 stack's layers and final norm, under its prefix.
+STACK = [
+    ("norm.weight", "norm"),
+    ("layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
+    ("layers.{l}.self_attn.q_proj.weight", "layers.{l}.q"),
+    ("layers.{l}.self_attn.k_proj.weight", "layers.{l}.k"),
+    ("layers.{l}.self_attn.v_proj.weight", "layers.{l}.v"),
+    ("layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
+    ("layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
+    ("layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
+    ("layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
+    ("layers.{l}.mlp.gate_proj.weight", "layers.{l}.gate"),
+    ("layers.{l}.mlp.up_proj.weight", "layers.{l}.up"),
+    ("layers.{l}.mlp.down_proj.weight", "layers.{l}.down"),
+]
+
+def under(prefix, rows):
+    """`rows` with each checkpoint name under `prefix`."""
+    out = []
+    for names, path in rows:
+        names = [prefix + n for n in names] if type(names) == "list" else prefix + names
+        out.append((names, path))
+    return out
+
+def formats(m):
+    return [format(
+        "transformers",
+        recognizes = lambda checkpoint: has("talker.code_predictor.lm_head.0.weight"),
+        read = lambda reads: read(m, reads),
+    )]
+
+def read(m, reads):
+    reads.read(m.text_embed, "talker.model.text_embedding.weight")
+    read_linear(reads, m.text_fc1, "talker.text_projection.linear_fc1")
+    read_linear(reads, m.text_fc2, "talker.text_projection.linear_fc2")
+    table = ["talker.model.codec_embedding.weight"]
+    table += ["talker.code_predictor.model.codec_embedding.{}.weight".format(j) for j in range(BOOKS)]
+    held = stored(table[0])
+    hidden = m.talker.hidden
+    reads.read_expr(m.codec_embed, concat(0, [src(name) for name in table] + [fill(0.0, [1, hidden], held)]))
+    reads.read(m.talker_head, "talker.codec_head.weight")
+    heads = ["talker.code_predictor.lm_head.{}.weight".format(j) for j in range(BOOKS)]
+    planes = [as_plane(name, [1, m.book, hidden]) for name in heads]
+    planes.append(fill(0.0, [1, m.book, hidden], stored(heads[0])))
+    reads.read_expr(m.books_head, concat(0, planes))
+    mapped(reads, m.talker, under("talker.model.", STACK))
+    mapped(reads, m.predictor, under("talker.code_predictor.model.", STACK))
+    read_codec(reads, m.codec)
+
+def read_causal_conv(reads, c, stem, shape):
+    reads.read_expr(c.w, as_plane(stem + ".weight", shape))
+    reads.read(c.bias, stem + ".bias")
+
+def read_snake(reads, s, stem):
+    reads.read(s.alpha, stem + ".alpha")
+    reads.read(s.beta, stem + ".beta")
+
+def as_plane(name, shape):
+    return src(name).transmute(shape, stored(name))
+
+def scaled(reads, w, name, by):
+    """`w` the checkpoint tensor `name` times the declared factor `by`."""
+    reads.push(tensor(w.name + ".scaled", src(name).scale_by(by), stored(name), shape = w.shape, internal = True))
+    want = encoding(w.dtype)
+    reads.push(tensor(w.name, out(w.name + ".scaled").cast(want), want, shape = w.shape))
+
+def negated(reads, w, name):
+    """`w` the checkpoint tensor `name` negated."""
+    reads.push(tensor(w.name + ".negated", src(name).scale(-1.0), stored(name), shape = w.shape, internal = True))
+    want = encoding(w.dtype)
+    reads.push(tensor(w.name, out(w.name + ".negated").cast(want), want, shape = w.shape))
+
+def factor(reads, name, shape):
+    """The checkpoint tensor `name` read as `shape`, declared to scale by."""
+    reads.push(tensor(name + ".factor", as_plane(name, shape), stored(name), shape = shape, internal = True))
+    return out(name + ".factor")
+
+# The codec's prenet transformer, but for the two projections its layer
+# scales fold into.
+PRENET = [
+    ("input_proj.weight", "input"),
+    ("input_proj.bias", "input_bias"),
+    ("norm.weight", "norm"),
+    ("output_proj.weight", "output"),
+    ("output_proj.bias", "output_bias"),
+    ("layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
+    ("layers.{l}.self_attn.q_proj.weight", "layers.{l}.q"),
+    ("layers.{l}.self_attn.k_proj.weight", "layers.{l}.k"),
+    ("layers.{l}.self_attn.v_proj.weight", "layers.{l}.v"),
+    ("layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
+    ("layers.{l}.mlp.gate_proj.weight", "layers.{l}.gate"),
+    ("layers.{l}.mlp.up_proj.weight", "layers.{l}.up"),
+]
+
+def read_codec(reads, d):
+    """The speech tokenizer's decoder (`decoder.` in its own safetensors)."""
+    books = [DEC + "quantizer.rvq_first.vq.layers.0._codebook"]
+    books += [DEC + "quantizer.rvq_rest.vq.layers.{}._codebook".format(q) for q in range(15)]
+    parts = []
+    for k, stem in enumerate(books):
+        # A book's codes are its embedding sums over its usage counts.
+        usage = stem + ".cluster_usage"
+        reads.push(tensor("codec.usage.{}".format(k), src(usage).transmute([d.book, 1], stored(usage)).unary("rsqrt"), stored(usage), shape = [d.book, 1], internal = True))
+        inv = out("codec.usage.{}".format(k))
+        name = "codec.codes.{}".format(k)
+        reads.push(tensor(name + ".half", src(stem + ".embedding_sum").scale_by(inv), stored(usage), shape = [d.book, d.dim], internal = True))
+        reads.push(tensor(name, out(name + ".half").scale_by(inv), stored(usage), shape = [d.book, d.dim], internal = True))
+        parts.append(out(name))
+    want = encoding(d.codes.dtype)
+    reads.push(tensor(d.codes.name, concat(0, parts).cast(want), want, shape = d.codes.shape))
+    first = DEC + "quantizer.rvq_first.output_proj.weight"
+    rest = DEC + "quantizer.rvq_rest.output_proj.weight"
+    reads.read_expr(d.project, concat(0, [as_plane(first, [d.latent, d.dim]), as_plane(rest, [d.latent, d.dim])]))
+
+    pre = DEC + "pre_conv.conv.weight"
+    reads.read_expr(d.pre, src(pre).permute([d.width, d.latent, 3], [0, 2, 1], stored(pre)).transmute([d.width, 3 * d.latent], stored(pre)))
+    reads.read(d.pre_bias, DEC + "pre_conv.conv.bias")
+    t = DEC + "pre_transformer."
+    mapped(reads, d, under(t, PRENET))
+    for l, w in enumerate(d.layers):
+        n = lambda s: "{}layers.{}.{}".format(t, l, s)
+        # Each layer scale folds into the projection it scales.
+        scale = n("self_attn_layer_scale.scale")
+        scaled(reads, w.o, n("self_attn.o_proj.weight"), factor(reads, scale, [d.hidden, 1]))
+        scale = n("mlp_layer_scale.scale")
+        scaled(reads, w.down, n("mlp.down_proj.weight"), factor(reads, scale, [d.hidden, 1]))
+
+    for i, u in enumerate(d.upsamplers):
+        n = lambda s: "{}upsample.{}.{}".format(DEC, i, s)
+        w = n("0.conv.weight")
+        reads.read_expr(u.w, src(w).permute([d.width, d.width, u.r], [1, 2, 0], stored(w)).transmute([u.r * d.width, d.width], stored(w)))
+        reads.read_expr(u.bias, src(n("0.conv.bias")).gather(0, [o // u.r for o in range(u.r * d.width)]))
+        reads.read_expr(u.dw.w, as_plane(n("1.dwconv.conv.weight"), [d.width, 7]))
+        reads.read(u.dw.bias, n("1.dwconv.conv.bias"))
+        reads.read(u.norm, n("1.norm.weight"))
+        reads.read(u.norm_bias, n("1.norm.bias"))
+        reads.read(u.fc1, n("1.pwconv1.weight"))
+        reads.read(u.fc1_bias, n("1.pwconv1.bias"))
+        reads.read(u.fc2, n("1.pwconv2.weight"))
+        negated(reads, u.fc2_bias, n("1.pwconv2.bias"))
+        reads.read(u.gamma, n("1.gamma"))
+
+    read_causal_conv(reads, d.first, DEC + "decoder.0.conv", [1536, 1024 * 7])
+    c_in = 1536
+    for i, b in enumerate(d.blocks):
+        n = lambda s: "{}decoder.{}.block.{}".format(DEC, i + 1, s)
+        c_out = c_in // 2
+        read_snake(reads, b.snake, n("0"))
+        up = n("1.conv.weight")
+        # The transposed conv as a causal conv of two taps (the frame before,
+        # then the frame) into `r` phases a channel.
+        reads.read_expr(b.up.w, src(up).permute([c_in, c_out, 2, b.r], [1, 3, 0, 2], stored(up), flip = [3]).transmute([c_out * b.r, 2 * c_in], stored(up)))
+        reads.read_expr(b.up.bias, src(n("1.conv.bias")).gather(0, [o // b.r for o in range(b.r * c_out)]))
+        for j, unit in enumerate(b.units):
+            at = lambda s: n("{}.{}".format(2 + j, s))
+            read_snake(reads, unit.snake1, at("act1"))
+            read_causal_conv(reads, unit.conv1, at("conv1.conv"), [c_out, c_out * 7])
+            read_snake(reads, unit.snake2, at("act2"))
+            reads.read_expr(unit.conv2, as_plane(at("conv2.conv.weight"), [c_out, c_out]))
+            reads.read(unit.conv2_bias, at("conv2.conv.bias"))
+        c_in = c_out
+    read_snake(reads, d.snake, DEC + "decoder.5")
+    last = DEC + "decoder.6.conv"
+    held = stored(last + ".weight")
+    reads.read_expr(d.last.w, concat(0, [as_plane(last + ".weight", [1, c_in * 7]), fill(0.0, [1, c_in * 7], held)]))
+    reads.read_expr(d.last.bias, concat(0, [src(last + ".bias"), fill(0.0, [1], stored(last + ".bias"))]))
+
+# The forward of Qwen3-TTS: the talker, the code predictor, the codec's
+# quantizer, prenet and decoder, each its own reading.
+
+def run_linear(w, x):
+    y = ops.linear.matmul(x, w.w)
+    if w.bias == None:
+        return y
+    return ops.elemwise.add_bias(w.bias, y)
+
+def caches(m, c):
+    space = c.kv_space(m.kv)
+    for s in [m.talker, m.predictor]:
+        plane = s.kv_heads * s.head_dim
+        for layer in s.layers:
+            c.kv(space, layer.kv, [plane, plane], s.head_dim, heads = True)
+    d = m.codec
+    for layer in d.layers:
+        c.kv(space, layer.kv, [d.heads * d.head_dim, d.heads * d.head_dim], d.head_dim, heads = True)
+
+def forward(m, inputs):
+    switch("reading", ["talker", "predictor", "codec.quantize", "codec.prenet", "codec.decode"])
+    reading = lambda name: inputs.on(switch_is("reading", name))
+    decode(reading("codec.decode"), m.codec)
+    predict(reading("predictor"), m)
+    quantize(reading("codec.quantize"), m.codec)
+    prenet(reading("codec.prenet"), m.codec)
+    return talk(reading("talker"), m)
+
+def run_stack(arm, s, y):
+    """`y` through the dense Qwen3 stack `s`, attending over `arm`'s KV, then
+    its final norm."""
+    hd = s.head_dim
+    positions = arm.positions()
+
+    def layer(l, w, y):
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, s.eps)
+        q = ops.elemwise.rmsnorm_per_head(ops.linear.matmul(x, w.q), w.q_norm, hd, s.eps)
+        k = ops.elemwise.rmsnorm_per_head(ops.linear.matmul(x, w.k), w.k_norm, hd, s.eps)
+        v = ops.linear.matmul(x, w.v)
+        q, k = ops.elemwise.rope(q, positions, hd, s.theta, rotary.full(), k = k)
+        ops.attn.kv_append(k, v, arm.kv(w.kv), arm.write_page(w.kv), arm.write_offset(w.kv))
+        o = ops.attn.attend(q, arm, w.kv, s.q_heads, s.kv_heads, hd, s.sm_scale)
+        y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, s.eps)
+        gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
+        f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
+        return ops.elemwise.residual_add(f, y)
+
+    y = arm.fold_layers(s.layers, y, layer)
+    return ops.elemwise.rmsnorm(y, s.norm, s.eps)
+
+def talk(arm, m):
+    """The talker: each row a projected text token plus its codec part, the
+    codes it states summed off the codec table by their weights; read out as
+    the first codebook's logits beside the normed hidden itself."""
+    t = m.talker
+    text = ops.gather.embed(arm.tokens(), m.text_embed, m.text_vocab)
+    text = run_linear(m.text_fc2, ops.elemwise.silu(run_linear(m.text_fc1, text)))
+    codes = arm.input("codes", dtype.i32, "row", CODEC.books)
+    weights = arm.input("code_weights", dtype.f32, "row", CODEC.books)
+    y = ops.elemwise.add(text, ops.gather.embed_weighted(codes, weights, m.codec_embed, m.codes))
+    y = run_stack(arm, t, y)
+    y = ops.gather.gather_rows(y, arm.readout_rows())
+    said = ops.gather.concat_cols([ops.linear.matmul(y, m.talker_head), y])
+    seam.at(seam.HIDDEN, [said])
+    return said
+
+def predict(arm, m):
+    """The code predictor over a frame: its seed row the talker's hidden on
+    the table's zero row, then a code a row, each read out by the next
+    book's head."""
+    p = m.predictor
+    y = ops.gather.embed(arm.tokens(), m.codec_embed, m.codes)
+    y = ops.elemwise.add(y, arm.input("seed", dtype.bf16, "row", p.hidden))
+    route = ops.gather.embed(arm.tokens(), m.route, m.codes)
+    y = run_stack(arm, p, y)
+    rows = arm.readout_rows()
+    y = ops.gather.gather_rows(y, rows)
+    head, _ = ops.linear.moe_route(ops.gather.gather_rows(route, rows), m.route.shape[1], 1, routing.softmax())
+    logits = ops.linear.moe_matmul_select(y, m.books_head, head, 1)
+    seam.at(seam.HIDDEN, [logits])
+    return logits
+
+def quantize(arm, d):
+    """Each code's row of its book, projected both ways: the first book's
+    projection, then the other books'. A frame's latent is its first code's
+    first half plus the sum of the other codes' second halves."""
+    y = ops.gather.embed(arm.tokens(), d.codes, d.books * d.book)
+    y = ops.linear.matmul(y, d.project)
+    y = ops.gather.gather_rows(y, arm.readout_rows())
+    seam.at(seam.HIDDEN, [y])
+    return y
+
+def prenet(arm, d):
+    """A frame a row, each beside the two before it (the causal conv's
+    taps), through the input projection and the sliding window transformer."""
+    hd = d.head_dim
+    positions = arm.positions()
+    y = ops.elemwise.add_bias(d.pre_bias, ops.linear.matmul(arm.input("taps", dtype.bf16, "row", 3 * d.latent), d.pre))
+    y = ops.elemwise.add_bias(d.input_bias, ops.linear.matmul(y, d.input))
+
+    def layer(l, w, y):
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, d.eps)
+        q = ops.linear.matmul(x, w.q)
+        k = ops.linear.matmul(x, w.k)
+        v = ops.linear.matmul(x, w.v)
+        q, k = ops.elemwise.rope(q, positions, hd, d.theta, rotary.full(), k = k)
+        ops.attn.kv_append(k, v, arm.kv(w.kv), arm.write_page(w.kv), arm.write_offset(w.kv))
+        o = ops.attn.attend(q, arm, w.kv, d.heads, d.heads, hd, d.sm_scale, window = d.window)
+        y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, d.eps)
+        gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
+        f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
+        return ops.elemwise.residual_add(f, y)
+
+    y = arm.fold_layers(d.layers, y, layer)
+    y = ops.elemwise.rmsnorm(y, d.norm, d.eps)
+    y = ops.elemwise.add_bias(d.output_bias, ops.linear.matmul(y, d.output))
+    y = ops.gather.gather_rows(y, arm.readout_rows())
+    seam.at(seam.HIDDEN, [y])
+    return y
+
+def run_causal_conv(x, grid, c, taps, dilation = 1, depthwise = False):
+    shape = conv([taps, 1, 1], [1, 1, 1], [0, 0, 0], causal = "zero", dilation = dilation, depthwise = depthwise)
+    return ops.conv.conv3d(x, grid, c.w, c.bias, shape, None)[0]
+
+def run_snake(x, s):
+    return ops.elemwise.snake(x, s.alpha, s.beta)
+
+def decode(arm, d):
+    """A clip of the transformer's frames, time along its frames, up to
+    24 kHz: each transposed conv a causal conv into the rate's phases, then
+    shuffled out along time."""
+    grid = arm.grid()
+    x = arm.input("frames", dtype.bf16, "voxel", d.width)
+    for u in d.upsamplers:
+        x = ops.elemwise.add_bias(u.bias, ops.linear.matmul(x, u.w))
+        x, grid = ops.conv.pixel_shuffle(x, grid, [u.r, 1, 1])
+        h = run_causal_conv(x, grid, u.dw, 7, depthwise = True)
+        h = ops.elemwise.layernorm(h, u.norm, u.norm_bias, 1e-6)
+        h = ops.elemwise.add_bias(u.fc1_bias, ops.linear.matmul(h, u.fc1))
+        h = ops.elemwise.gelu(h, False)
+        h = ops.elemwise.standardize(ops.linear.matmul(h, u.fc2), u.fc2_bias, u.gamma)
+        x = ops.elemwise.add(x, h)
+    x = run_causal_conv(x, grid, d.first, 7)
+    for b in d.blocks:
+        x = run_snake(x, b.snake)
+        x = run_causal_conv(x, grid, b.up, 2)
+        x, grid = ops.conv.pixel_shuffle(x, grid, [b.r, 1, 1])
+        for unit in b.units:
+            h = run_snake(ops.elemwise.copy(x), unit.snake1)
+            h = run_causal_conv(h, grid, unit.conv1, 7, dilation = unit.dilation)
+            h = run_snake(h, unit.snake2)
+            h = ops.elemwise.add_bias(unit.conv2_bias, ops.linear.matmul(h, unit.conv2))
+            x = ops.elemwise.add(x, h)
+    x = run_snake(x, d.snake)
+    x = run_causal_conv(x, grid, d.last, 7)
+    seam.at(seam.PIXELS, [x, grid])
+    return x

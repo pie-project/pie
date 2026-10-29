@@ -1579,10 +1579,16 @@ impl<'c> Run<'c> {
                     )
                 })
             }
+            // The seat is as wide as the widest voxel input; each is fed at
+            // its own width.
             Def::Input(RuntimeInput::Guest {
                 axis: poem_ir::InputAxis::Voxel,
+                width,
                 ..
-            }) => self.voxel_seat(at).payload,
+            }) => Tensor {
+                width: *width,
+                ..self.voxel_seat(at).payload
+            },
             Def::Input(RuntimeInput::Guest { id, .. }) => self.guest(at, *id),
             Def::Input(RuntimeInput::Geometry {
                 kind: GeomKind::GroupOfLane,

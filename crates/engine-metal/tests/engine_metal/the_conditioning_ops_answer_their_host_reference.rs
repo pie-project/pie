@@ -273,6 +273,64 @@ fn the_pointwise_arms_answer_the_reference_at_both_elements() {
             dtype,
         );
 
+        rig.fire(|s| pointwise::gelu(s, xt, zt).expect("gelu"));
+        let want: Vec<f32> = x
+            .iter()
+            .map(|&v| {
+                let v = f64::from(v);
+                round((0.5 * v * (1.0 + erf(v / std::f64::consts::SQRT_2))) as f32)
+            })
+            .collect();
+        check(
+            &format!("gelu (erf) {dtype:?}"),
+            &want,
+            &rig.read(hz, n, dtype),
+            dtype,
+        );
+
+        let alpha: Vec<f32> = (0..u64::from(WIDTH))
+            .map(|at| 0.5 * unit(at ^ 0x51))
+            .collect();
+        let beta: Vec<f32> = (0..u64::from(WIDTH))
+            .map(|at| 0.5 * unit(at ^ 0x52))
+            .collect();
+        let (_ab, ha) = rig.plane(&alpha, Dtype::F32);
+        let (_bb, hb) = rig.plane(&beta, Dtype::F32);
+        let (_sb, hs) = rig.plane(&x, dtype);
+        rig.fire(|s| {
+            pointwise::snake(
+                s,
+                Tensor::new(hs, ROWS, WIDTH, dtype),
+                Tensor::new(ha, 1, WIDTH, Dtype::F32),
+                Tensor::new(hb, 1, WIDTH, Dtype::F32),
+            )
+            .expect("snake")
+        });
+        let want: Vec<f32> = x
+            .iter()
+            .enumerate()
+            .map(|(at, &v)| {
+                let c = at % WIDTH as usize;
+                let (v, a, b) = (f64::from(v), f64::from(alpha[c]), f64::from(beta[c]));
+                let s = (v * a.exp()).sin();
+                round((v + s * s / (b.exp() + 1e-9)) as f32)
+            })
+            .collect();
+        let got = rig.read(hs, n, dtype);
+        if dtype == Dtype::Bf16 {
+            within_a_bf16_ulp("snake Bf16", &want, &got);
+        } else {
+            // `x` and the sine's square cancel near zero: an f32 rounding of
+            // either term bounds the error, not the sum's size.
+            for (at, (&w, &g)) in want.iter().zip(&got).enumerate() {
+                let scale = x[at].abs().max(1.0);
+                assert!(
+                    (w - g).abs() <= 5e-6 * scale,
+                    "snake F32 parts from the reference at {at} (want {w}, got {g})"
+                );
+            }
+        }
+
         let (_cb, hc) = rig.plane(&x, dtype);
         let ct = Tensor::new(hc, ROWS, WIDTH, dtype);
         rig.fire(|s| pointwise::clamp(s, -0.5, 0.75, ct).expect("clamp"));
@@ -308,6 +366,16 @@ fn the_pointwise_arms_answer_the_reference_at_both_elements() {
             dtype,
         );
     }
+}
+
+/// erf by its Maclaurin series, near-exact over the test's inputs.
+fn erf(x: f64) -> f64 {
+    let (mut term, mut sum) = (x, x);
+    for n in 1..200 {
+        term *= -x * x / f64::from(n);
+        sum += term / f64::from(2 * n + 1);
+    }
+    sum * 2.0 / std::f64::consts::PI.sqrt()
 }
 
 fn check(what: &str, want: &[f32], got: &[f32], dtype: Dtype) {
