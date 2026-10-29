@@ -59,6 +59,7 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
         }
         widest = widest.max(kv);
     }
+    let widest = widest.max(256).next_power_of_two();
     let stride = u32::try_from(widest).map_err(|_| Fault::Ceiling {
         what: "key positions in one mask row",
         need: widest,

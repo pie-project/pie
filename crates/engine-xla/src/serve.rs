@@ -399,6 +399,12 @@ impl Shell {
         let weight_floor = boot.trace.params.iter().try_fold(0u64, |sum, p| {
             crate::weights::plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
         })?;
+        let tied_extra = crate::weights::tied_gemm_bytes(&boot.trace, &engine)?;
+        let weight_floor = if weight_floor + tied_extra < tpu.hbm_bytes() / 8 * 5 {
+            weight_floor + tied_extra
+        } else {
+            weight_floor
+        };
         let room = device.memory().map_or(u64::MAX, |bytes| {
             ((bytes as f64 * boot.memory_share) as u64)
                 .saturating_sub(device.held())
@@ -494,6 +500,12 @@ impl Shell {
         let weight_floor = boot.trace.params.iter().try_fold(0u64, |sum, p| {
             crate::weights::plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
         })?;
+        let tied_extra = crate::weights::tied_gemm_bytes(&boot.trace, &engine)?;
+        let weight_floor = if weight_floor + tied_extra < tpu.hbm_bytes() / 8 * 5 {
+            weight_floor + tied_extra
+        } else {
+            weight_floor
+        };
         let room = working.map_or(u64::MAX, |working| {
             working
                 .saturating_sub(weight_floor)
@@ -1028,7 +1040,7 @@ impl Shell {
                 || seated.mask.is_some()
                 || seated.adapter.is_some()
                 || seated.kv_less
-                || seated.readout.is_some()
+                || seated.readout.is_some_and(|r| r.len() != 1)
                 || !seated.inputs.is_empty()
                 || seated.writes.is_some()
             {
@@ -1058,39 +1070,65 @@ impl Shell {
         // A fire that decodes beside its prefill: the prefill's lanes at
         // the mixed host rung at least, and always a rest lane.
         let mixed = by.len() > 1;
-        // Every count at its rung already fills a rung of rows: no rest lane.
-        let ones: Vec<(u32, u64)> = by
-            .iter()
-            .flat_map(|&(_, word, n, _)| {
-                std::iter::repeat_n((1u32, word), (pad.rung(n) - n) as usize)
-            })
-            .collect();
-        let exact = real_rows + ones.len() as u32;
-        if !mixed
-            && exact >= pad.prefill_floor
-            && buckets.contains(&exact)
-            && lanes.len() + ones.len() <= self.budgets.tokens.max_lanes as usize
-        {
-            return Some(ones);
+        let top = *buckets.last()?;
+        let row_lanes = if real_rows + 64 > 1024 {
+            64
+        } else if real_rows + 32 > 512 {
+            32
+        } else {
+            pad.mixed_host_rung
+        };
+        let want_host = pad.rung(by[host].2 + 1).max(row_lanes);
+        let can_wide = !mixed
+            && top >= 64
+            && self.budgets.tokens.max_lanes >= want_host
+            && real_rows + (want_host - by[host].2) <= top;
+        if !can_wide {
+            // Every count at its rung already fills a rung of rows: no rest lane.
+            let ones: Vec<(u32, u64)> = by
+                .iter()
+                .flat_map(|&(_, word, n, _)| {
+                    std::iter::repeat_n((1u32, word), (pad.rung(n) - n) as usize)
+                })
+                .collect();
+            let exact = real_rows + ones.len() as u32;
+            if !mixed
+                && exact >= pad.prefill_floor
+                && buckets.contains(&exact)
+                && lanes.len() + ones.len() <= self.budgets.tokens.max_lanes as usize
+            {
+                return Some(ones);
+            }
         }
+        let raw_bucket = poem_exec::fire::rung_of(buckets, (real_rows + 1).max(pad.prefill_floor));
+        let host_floor = if can_wide {
+            want_host
+        } else if mixed || real_rows + pad.mixed_host_rung.saturating_sub(by[host].2) <= raw_bucket
+        {
+            pad.mixed_host_rung
+        } else {
+            2
+        };
         let mut pads: Vec<(u32, u64)> = Vec::new();
         for (at, &(_, word, n, _)) in by.iter().enumerate() {
             let want = if at != host {
                 pad.rung(n)
-            } else if mixed {
-                pad.rung(n + 1).max(pad.mixed_host_rung) - 1
             } else {
-                pad.rung(n + 1) - 1
+                pad.rung(n + 1).max(host_floor) - 1
             };
             pads.extend(std::iter::repeat_n((1u32, word), (want - n) as usize));
         }
         let ones = pads.len() as u32;
-        let top = *buckets.last()?;
         let need = real_rows + ones + 1;
         if need > top {
             return None;
         }
-        let bucket = poem_exec::fire::rung_of(buckets, need.max(pad.prefill_floor));
+        let floor = if can_wide {
+            pad.prefill_floor.max(64)
+        } else {
+            pad.prefill_floor
+        };
+        let bucket = poem_exec::fire::rung_of(buckets, need.max(floor));
         pads.push((bucket - real_rows - ones, by[host].1));
         if lanes.len() + pads.len() > self.budgets.tokens.max_lanes as usize {
             return None;
@@ -1190,12 +1228,20 @@ impl Shell {
                     wide: false,
                 });
                 slot_ids.push(sink_slot as i32);
+                let pad_slot = if row.rows == 1
+                    && real > 0
+                    && lanes.iter().all(|s| s.lane.tokens.len() == 1)
+                {
+                    sink_slot as i32
+                } else {
+                    -(sink_slot as i32) - 1
+                };
                 for at in 0..row.rows {
                     tokens.push(0);
                     positions.push(at as i32);
-                    cache_rows.push(at as i32);
+                    cache_rows.push(-1);
                     request_of_token.push(at_lane);
-                    slot_of_row.push(sink_slot as i32);
+                    slot_of_row.push(pad_slot);
                 }
                 if any_adapter {
                     adapter_routes.extend(std::iter::repeat_n(-1, row.rows as usize));
@@ -1304,19 +1350,39 @@ impl Shell {
                 }
                 rs_active = true;
             }
-            rs_plans.push(
-                engine::rs::LanePlan::of(
-                    seated.rs,
-                    row.rows,
-                    seated.first.unwrap_or(have),
-                    kv_mask,
-                    None,
-                )
-                .map_err(|error| Fault::Program {
-                    at: "serve::rs",
-                    why: format!("lane {}: {error}", row.source),
-                })?,
-            );
+            let mut rs_plan = engine::rs::LanePlan::of(
+                seated.rs,
+                row.rows,
+                seated.first.unwrap_or(have),
+                kv_mask,
+                None,
+            )
+            .map_err(|error| Fault::Program {
+                at: "serve::rs",
+                why: format!("lane {}: {error}", row.source),
+            })?;
+            if rs_plan.commit == 0 && rs_plan.replay > 2 {
+                let mut rem = 2u32;
+                let mut trimmed = Vec::new();
+                for run in rs_plan.gathers.into_iter().rev() {
+                    if rem == 0 {
+                        break;
+                    }
+                    let take = run.count.min(rem);
+                    let skip = run.count - take;
+                    trimmed.push(engine::rs::Run {
+                        pages: run.pages,
+                        from: run.from + skip,
+                        count: take,
+                    });
+                    rem -= take;
+                }
+                trimmed.reverse();
+                rs_plan.replay = 2 - rem;
+                rs_plan.gather = trimmed.first().cloned();
+                rs_plan.gathers = trimmed;
+            }
+            rs_plans.push(rs_plan);
             slot_ids.push(state_slot as i32);
             if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
                 return Err(Fault::Positions {
@@ -1345,9 +1411,8 @@ impl Shell {
                 workspace: 0,
             },
         )?;
-        for slot in beginning {
-            self.pools.clear(&self.device, &self.handles, slot)?;
-        }
+        self.pools
+            .clear_slots(&self.device, &self.handles, &beginning)?;
         // The windowed pages the runtime copies before this fire (a fork's
         // window), whole pages in the windowed pool's own ids.
         let window_copies: Vec<engine::transfer::KvRun> = lanes
@@ -1447,10 +1512,8 @@ impl Shell {
                     .unwrap_or(1)
             })
             .max(pad.page_floor);
+        let _ = canonical;
         let max_pages = pad.rung(max_pages).min(cap);
-        // A canonical prefill fire lays every table at the page cap, so its
-        // program does not vary with how long its lanes are.
-        let max_pages = if canonical { cap } else { max_pages };
 
         let mut windows = Windows::of(
             &self.compiled,
@@ -1709,8 +1772,7 @@ impl Shell {
         // A plain fire (no recurrent-state maps, media, clips or probes) is
         // also keyed by its shape alone, so lanes cut differently skip the
         // walk too.
-        let plain = !rs_active
-            && dit_key.is_empty()
+        let plain = dit_key.is_empty()
             && composition.patch_rows() == 0
             && composition.voxel_rows() == 0
             && self.probes.is_empty();
@@ -1719,7 +1781,7 @@ impl Shell {
                 descriptor.lanes.iter().map(|l| (l.class, l.word)).collect();
             *blake3::hash(
                 format!(
-                    "{:?}|{}|{}|{lanes:?}|{}|{}|{max_pages}|{}|{}",
+                    "{:?}|{}|{}|{lanes:?}|{}|{}|{max_pages}|{}|{}|{rs_active}",
                     descriptor.classes,
                     descriptor.rows,
                     descriptor.bucket,

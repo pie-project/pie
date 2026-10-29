@@ -123,15 +123,34 @@ impl std::fmt::Debug for Kept {
 }
 
 impl Kept {
-    /// The plane lane `lane` reads output `name` from, and its seat there.
+    /// The plane lane `lane` reads output `name` from, and its seat there
+    /// (coalescing consecutive lanes whose rows form one contiguous run).
     #[must_use]
     pub fn bound(&self, lane: usize, name: &str) -> Option<(usize, Seat)> {
         let seats = self.seats.get(lane)?;
-        self.planes
+        let (at, first_seat) = self
+            .planes
             .iter()
             .zip(seats)
             .enumerate()
-            .find_map(|(at, (plane, seat))| (plane.name == name).then_some((at, (*seat)?)))
+            .find_map(|(at, (plane, seat))| (plane.name == name).then_some((at, (*seat)?)))?;
+        let mut count = first_seat.count;
+        for next_seats in &self.seats[lane + 1..] {
+            let Some(next) = next_seats.get(at).copied().flatten() else {
+                break;
+            };
+            if next.first != first_seat.first + count {
+                break;
+            }
+            count += next.count;
+        }
+        Some((
+            at,
+            Seat {
+                first: first_seat.first,
+                count,
+            },
+        ))
     }
 
     /// Lane `lane`'s rows of output `name` on the host, every layer's.

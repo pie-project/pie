@@ -10,7 +10,6 @@ load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/blocks.poem", "attention", "swiglu")
 
 LLAMA = template("llama")
-
 TOKENIZER = tokenizer(markers = [["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>"]])
 
 def llama(id, layers, mini = False, **kwargs):
@@ -48,13 +47,13 @@ DEPLOYMENTS = [
     deployment("llama33-70b-mini-l4", weights = F8, kv = E4M3),
 ]
 
-# The weights of Llama 3.1 / 3.3: per layer an RMS norm, the q, k, v and
-# output projections, an RMS norm and a SwiGLU MLP; the token embedding, a
-# final norm and the head. The projections are stored at the deployment's one
-# dtype; the norms, the embedding and the head stay bf16 under a release's FP8
-# or NVFP4 (modelopt leaves the head bf16), or take the projections' u4 where
-# the deployment quantizes a bf16 release. Each layer also has the LoRA banks
-# the host registers.
+# The weights of Llama 3.1 / 3.3: per layer an RMS norm, q, k and v packed
+# into one projection and the output projection, an RMS norm and a SwiGLU MLP;
+# the token embedding, a final norm and the head. The projections are stored
+# at the deployment's one dtype; the norms, the embedding and the head stay
+# bf16 under a release's FP8 or NVFP4 (modelopt leaves the head bf16), or take
+# the projections' u4 where the deployment quantizes a bf16 release. Each
+# layer also has the LoRA banks the host registers.
 
 def dims(hidden, layers, q_heads, inter):
     return struct(
@@ -88,6 +87,7 @@ def layout(id, deploy):
         fail("{} ships no drafter and no parts".format(id))
     proj = roles(deploy, "proj", exact = True).proj
     table = dtype.bf16 if proj in RELEASED else proj
+    dense = compute(table)
     d = DIMS[id]
     hidden, hd = d.hidden, d.head_dim
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
@@ -238,6 +238,8 @@ def caches(m, c):
         c.kv(kv, w.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
     if m.mtp != None:
         c.kv(kv, m.mtp.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
+    else:
+        c.kv(kv, "kv.draft", [m.kv_width, m.kv_width], m.head_dim, heads = True)
 
 def tap(mtp, layer, y, fused):
     if mtp == None or layer not in mtp.taps:
@@ -274,7 +276,14 @@ def forward(m, inputs):
     logits = ops.linear.lm_head(x, m.head)
     if m.mtp != None:
         draft(m, inputs, fused, logits, scaling)
+    else:
+        draft_self(logits)
     output("logits", logits)
+
+def draft_self(logits):
+    proposal = logits.on(fact.drafts())
+    output("mtp.logits", proposal)
+    output("mtp.drafts", ops.sampling.argmax([proposal, proposal, proposal, proposal]))
 
 def draft(m, inputs, fused, logits, scaling):
     mtp = m.mtp

@@ -934,11 +934,11 @@ impl RuntimeConfig {
 }
 
 fn default_submit_deadline() -> Duration {
-    Duration::from_millis(50)
+    Duration::from_millis(150)
 }
 
 fn default_silence_timeout() -> Duration {
-    Duration::from_secs(30)
+    Duration::from_secs(600)
 }
 
 fn default_frame_size() -> u32 {

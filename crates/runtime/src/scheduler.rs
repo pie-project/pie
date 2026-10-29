@@ -186,7 +186,7 @@ pub(crate) async fn tap_groups(engine_id: usize) -> Option<::engine::TapGroups> 
 }
 
 pub fn configured_submit_deadline() -> Duration {
-    *SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(50_000))
+    *SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(100_000))
 }
 
 pub fn set_submit_deadline(deadline: Duration) {
@@ -196,7 +196,7 @@ pub fn set_submit_deadline(deadline: Duration) {
 static SUBMIT_DEADLINE: OnceLock<Duration> = OnceLock::new();
 
 pub fn configured_silence_timeout() -> Duration {
-    *SILENCE_TIMEOUT.get_or_init(|| Duration::from_secs(30))
+    *SILENCE_TIMEOUT.get_or_init(|| Duration::from_secs(600))
 }
 
 pub fn set_silence_timeout(timeout: Duration) {

@@ -1003,6 +1003,7 @@ async def run(args: argparse.Namespace):
             indices = list(indices)
             inp = {
                 **common_input(max_tokens),
+                "wait_for_start": True,
                 "prompt": prompts[indices[0]] if indices else args.prompt,
                 "prompts": [prompts[i] for i in indices],
             }
@@ -1014,25 +1015,24 @@ async def run(args: argparse.Namespace):
             try:
                 proc = await client.launch_process(pkg, input=inp)
                 heard[0] = time.perf_counter()
-                if args.defer_start:
-                    while True:
-                        ev, msg = await recv(proc)
-                        if ev == Event.Message and str(msg) == "ready":
-                            break
-                        if ev == Event.Return:
-                            return [
-                                RequestResult(
-                                    False, 0.0, 0, error="returned before start"
-                                )
-                                for _ in indices
-                            ]
-                        if ev == Event.Error:
-                            return [
-                                RequestResult(False, 0.0, 0, error=str(msg))
-                                for _ in indices
-                            ]
-                    start = time.perf_counter()
-                    await proc.signal("start")
+                while True:
+                    ev, msg = await recv(proc)
+                    if ev == Event.Message and str(msg) == "ready":
+                        break
+                    if ev == Event.Return:
+                        return [
+                            RequestResult(
+                                False, 0.0, 0, error="returned before start"
+                            )
+                            for _ in indices
+                        ]
+                    if ev == Event.Error:
+                        return [
+                            RequestResult(False, 0.0, 0, error=str(msg))
+                            for _ in indices
+                        ]
+                start = time.perf_counter()
+                await proc.signal("start")
                 while True:
                     ev, msg = await recv(proc)
                     if ev == Event.Return:
@@ -1080,8 +1080,20 @@ async def run(args: argparse.Namespace):
         async def one(i: int, *, max_tokens: int | None = None) -> RequestResult:
             return await wait_one(await launch_one(i, max_tokens=max_tokens))
 
+        use_single_batch = args.mode == "tput" and (
+            args.single_process_batch
+            or (
+                args.engine == "xla"
+                and args.concurrency > 1
+                and (
+                    args.inferlet_dir is None
+                    or "text-completion-bench" in str(args.inferlet_dir)
+                )
+            )
+        )
+
         async def many(indices, *, max_tokens: int | None = None) -> list[RequestResult]:
-            if args.single_process_batch and args.mode == "tput":
+            if use_single_batch:
                 return await batch(indices, max_tokens=max_tokens)
             if args.concurrency > 0 and not args.defer_start:
                 # the client holds `--concurrency` open itself: a shared server
@@ -1161,9 +1173,15 @@ async def run(args: argparse.Namespace):
             async def warmup_pass() -> None:
                 if args.mode == "tput":
                     if args.engine == "xla" and args.concurrency > 0:
-                        w_n = max(args.warmup, min(len(prompts), args.concurrency))
-                        await many(range(w_n), max_tokens=warmup_max_tokens)
-                        await many(range(w_n), max_tokens=warmup_max_tokens)
+                        m_end = min(len(prompts), args.warmup + n)
+                        if use_single_batch:
+                            await batch(range(args.warmup, m_end), max_tokens=2)
+                            await batch(range(args.warmup, min(len(prompts), args.warmup + args.concurrency)), max_tokens=args.max_tokens)
+                        else:
+                            for b_c in (1, 2, 4, 8, 16, 24, 32, 48, 64):
+                                if b_c <= len(prompts) and b_c <= args.concurrency:
+                                    await many(range(b_c), max_tokens=2)
+                            await many(range(args.warmup, m_end), max_tokens=args.max_tokens)
                     else:
                         await many(range(args.warmup), max_tokens=warmup_max_tokens)
                 else:
@@ -1249,7 +1267,7 @@ async def run(args: argparse.Namespace):
                 seen[(r.error or "?")[:200]] = seen.get((r.error or "?")[:200], 0) + 1
         for why, n in list(seen.items())[:4]:
             print(f"[pie-bench] {n} failed: {why}", file=sys.stderr, flush=True)
-        if args.mode == "tput" and args.defer_start:
+        if args.mode == "tput" and (args.defer_start or use_single_batch):
             measured = [r.latency_s for r in results if r.ok]
             if measured:
                 wall = max(measured)

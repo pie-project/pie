@@ -7,8 +7,8 @@
 use dtype::Dtype;
 
 use super::paged::{
-    Heads, Planes, cdiv, clamp_i, fetch, flat_i32, geometry, head, kv_heads_agree, nonzero,
-    pool_paging, round_up, row_heads, take, with_i,
+    Heads, PageWalk, Planes, by_head, cdiv, clamp_i, fetch, fetch_pages, flat_i32, geometry, head,
+    heads_by_slice, kv_heads_agree, nonzero, pool_paging, round_up, row_heads, take, with_i,
 };
 use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Fold, Func, Val};
@@ -151,10 +151,16 @@ pub fn capture(
     let zero = fq.like_i(lim, 0);
     let lim = fq.select(live, lim, zero)?;
     let lim = fq.max(lim, zero)?;
-    // Observed q rows, [nr, ob, kvh, g, d].
+    // Observed q rows, [nr, kvh, ob * g, d].
     let af = fq.reshape(at, &[nr * ob])?;
     let qr = fq.take_rows(qv, af)?;
-    let q5 = fq.reshape(qr, &[nr, ob, h.kvh, h.g, h.d])?;
+    let q4 = if ob == 1 {
+        fq.reshape(qr, &[nr, h.kvh, h.g, h.d])?
+    } else {
+        let q5 = fq.reshape(qr, &[nr, ob, h.kvh, h.g, h.d])?;
+        let qt = fq.transpose(q5, &[0, 2, 1, 3, 4])?;
+        fq.reshape(qt, &[nr, h.kvh, ob * h.g, h.d])?
+    };
     let planes = Planes::Paged {
         keys,
         values: keys,
@@ -171,6 +177,8 @@ pub fn capture(
         };
         c.min(round_up(span, 8))
     };
+    let walk = PageWalk::of(fq, &planes, Some(lanes), c)?;
+    let by_slice = heads_by_slice(&h);
     // Scores of chunk `ci`: [nr, kvh, ob, g, c] and admission.
     let chunk = |fq: &mut Func,
                  ci: crate::hlo::Val|
@@ -179,33 +187,57 @@ pub fn capture(
         let io = fq.iota(Elem::I32, &[nr, c], 1);
         let bb = fq.splat(base, &[nr, c])?;
         let kp = fq.add(io, bb)?;
-        let kc = clamp_i(fq, kp, 0, span - 1)?;
-        let lb = fq.iota(Elem::I32, &[nr, c], 0);
-        let x = with_i(fq, lb, span, Func::mul)?;
-        let x = fq.add(x, kc)?;
-        let xf = fq.reshape(x, &[nr * c])?;
-        let (k, _) = fetch(fq, &planes, &h, xf)?;
-        let k = fq.reshape(k, &[nr, c, h.kvh, h.d])?;
-        let s = fq.dot_general_at(q5, k, &[0, 2], &[0, 2], &[4], &[3], Elem::F32, false)?;
-        let s = fq.scale(s, scale)?;
+        let paged = match walk {
+            Some(w) => {
+                let page = w.chunk(fq, base)?;
+                fetch_pages(fq, &planes, &h, page)?
+            }
+            None => None,
+        };
+        let (k, _) = match paged {
+            Some(kv) => kv,
+            None => {
+                let kc = clamp_i(fq, kp, 0, span - 1)?;
+                let lb = fq.iota(Elem::I32, &[nr, c], 0);
+                let x = with_i(fq, lb, span, Func::mul)?;
+                let x = fq.add(x, kc)?;
+                let xf = fq.reshape(x, &[nr * c])?;
+                fetch(fq, &planes, &h, xf)?
+            }
+        };
+        let s = if by_slice {
+            let k = fq.reshape(k, &[nr, c, h.kvh * h.d])?;
+            by_head(fq, q4, k, 2)?
+        } else {
+            let k = fq.reshape(k, &[nr, c, h.kvh, h.d])?;
+            fq.dot_general_at(q4, k, &[0, 1], &[0, 2], &[3], &[3], Elem::F32, false)?
+        };
         let sd = [nr, h.kvh, ob, h.g, c];
+        let s = fq.reshape(s, &sd)?;
+        let s = fq.scale(s, scale)?;
         let kpb = fq.broadcast(kp, &[nr, ob, c], &[0, 2])?;
         let lb = fq.broadcast(lim, &[nr, ob, c], &[0, 1])?;
         let ok = fq.compare(Cmp::Lt, kpb, lb)?;
         let ok = fq.broadcast(ok, &sd, &[0, 2, 4])?;
         Ok((s, ok))
     };
-    // Pass 1: the softmax max and denominator over every admitted key.
     let stat = [nr, h.kvh, ob, h.g];
-    let m0 = fq.const_f(Elem::F32, f64::NEG_INFINITY, &stat);
-    let l0 = fq.const_f(Elem::F32, 0.0, &stat);
     let n1 = cdiv(span, c);
-    let st = fq.for_loop(n1, &[m0, l0], |fq, ci, st| {
-        let (s, ok) = chunk(fq, ci)?;
+    // Row weights: 1 / rows over the observed rows.
+    let nf = fq.convert(nrows, Elem::F32);
+    let one_n = fq.like_f(nf, 1.0);
+    let nf = fq.max(nf, one_n)?;
+    let wr = fq.div(one_n, nf)?;
+    let wr = fq.broadcast(wr, &d2, &[0])?;
+    let zw = fq.like_f(wr, 0.0);
+    let wr = fq.select(live, wr, zw)?;
+    let kc = kmax.min(span);
+    let mean = if n1 == 1 {
+        let zero = fq.const_i(Elem::I32, 0, &[]);
+        let (s, ok) = chunk(fq, zero)?;
         let ninf = fq.like_f(s, f64::NEG_INFINITY);
         let sm = fq.select(ok, s, ninf)?;
-        let cm = fq.reduce(sm, &[4], Fold::Max)?;
-        let m = fq.max(st[0], cm)?;
+        let m = fq.reduce(sm, &[4], Fold::Max)?;
         let floor = fq.like_f(m, f64::NEG_INFINITY);
         let fin = fq.compare(Cmp::Gt, m, floor)?;
         let z = fq.like_f(m, 0.0);
@@ -216,57 +248,89 @@ pub fn capture(
         let e = fq.exp(e);
         let ze = fq.like_f(e, 0.0);
         let p = fq.select(ok, e, ze)?;
-        let ps = fq.reduce(p, &[4], Fold::Sum)?;
-        let dm = fq.sub(st[0], ms)?;
-        let corr = fq.exp(dm);
-        let l = fq.mul(st[1], corr)?;
-        let l = fq.add(l, ps)?;
-        Ok(vec![m, l])
-    })?;
-    let (m, l) = (st[0], st[1]);
-    let floor = fq.like_f(m, f64::NEG_INFINITY);
-    let fin = fq.compare(Cmp::Gt, m, floor)?;
-    let z = fq.like_f(m, 0.0);
-    let m = fq.select(fin, m, z)?;
-    let zl = fq.like_f(l, 0.0);
-    let pos_l = fq.compare(Cmp::Gt, l, zl)?;
-    let one = fq.like_f(l, 1.0);
-    let inv = fq.div(one, l)?;
-    let inv = fq.select(pos_l, inv, zl)?;
-    // Row weights: 1 / rows over the observed rows.
-    let nf = fq.convert(nrows, Elem::F32);
-    let one_n = fq.like_f(nf, 1.0);
-    let nf = fq.max(nf, one_n)?;
-    let wr = fq.div(one_n, nf)?;
-    let wr = fq.broadcast(wr, &d2, &[0])?;
-    let zw = fq.like_f(wr, 0.0);
-    let wr = fq.select(live, wr, zw)?;
-    // Pass 2: the mean probability of the first `kv_max` keys.
-    let kc = kmax.min(span);
-    let n2 = cdiv(kc, c);
-    let acc0 = fq.const_f(Elem::F32, 0.0, &[nr, h.kvh, h.g, n2 * c]);
-    let out = fq.for_loop(n2, &[acc0], |fq, ci, st| {
-        let (s, ok) = chunk(fq, ci)?;
-        let sd = fq.dims(s).to_vec();
-        let mb = fq.broadcast(m, &sd, &[0, 1, 2, 3])?;
-        let e = fq.sub(s, mb)?;
-        let e = fq.exp(e);
-        let ib = fq.broadcast(inv, &sd, &[0, 1, 2, 3])?;
-        let wb = fq.broadcast(wr, &sd, &[0, 2])?;
-        let p = fq.mul(e, ib)?;
-        let p = fq.mul(p, wb)?;
-        let zp = fq.like_f(p, 0.0);
-        let p = fq.select(ok, p, zp)?;
-        let mean = fq.reduce(p, &[2], Fold::Sum)?;
-        let base = with_i(fq, ci, c, Func::mul)?;
-        let zero = fq.const_i(Elem::I32, 0, &[]);
-        Ok(vec![fq.dynamic_update_slice(
-            st[0],
-            mean,
-            &[zero, zero, zero, base],
-        )?])
-    })?;
-    let mean = fq.slice_axis(out[0], 3, 0, kc)?;
+        let l = fq.reduce(p, &[4], Fold::Sum)?;
+        let zl = fq.like_f(l, 0.0);
+        let pos_l = fq.compare(Cmp::Gt, l, zl)?;
+        let one = fq.like_f(l, 1.0);
+        let inv = fq.div(one, l)?;
+        let inv = fq.select(pos_l, inv, zl)?;
+        let wb = fq.broadcast(wr, &stat, &[0, 2])?;
+        let iw = fq.mul(inv, wb)?;
+        let iwb = fq.broadcast(iw, &sd, &[0, 1, 2, 3])?;
+        let p = fq.mul(p, iwb)?;
+        let mean = if ob == 1 {
+            fq.reshape(p, &[nr, h.kvh, h.g, c])?
+        } else {
+            fq.reduce(p, &[2], Fold::Sum)?
+        };
+        fq.slice_axis(mean, 3, 0, kc)?
+    } else {
+        // Pass 1: the softmax max and denominator over every admitted key.
+        let m0 = fq.const_f(Elem::F32, f64::NEG_INFINITY, &stat);
+        let l0 = fq.const_f(Elem::F32, 0.0, &stat);
+        let st = fq.for_loop(n1, &[m0, l0], |fq, ci, st| {
+            let (s, ok) = chunk(fq, ci)?;
+            let ninf = fq.like_f(s, f64::NEG_INFINITY);
+            let sm = fq.select(ok, s, ninf)?;
+            let cm = fq.reduce(sm, &[4], Fold::Max)?;
+            let m = fq.max(st[0], cm)?;
+            let floor = fq.like_f(m, f64::NEG_INFINITY);
+            let fin = fq.compare(Cmp::Gt, m, floor)?;
+            let z = fq.like_f(m, 0.0);
+            let ms = fq.select(fin, m, z)?;
+            let sd = fq.dims(s).to_vec();
+            let mb = fq.broadcast(ms, &sd, &[0, 1, 2, 3])?;
+            let e = fq.sub(s, mb)?;
+            let e = fq.exp(e);
+            let ze = fq.like_f(e, 0.0);
+            let p = fq.select(ok, e, ze)?;
+            let ps = fq.reduce(p, &[4], Fold::Sum)?;
+            let dm = fq.sub(st[0], ms)?;
+            let corr = fq.exp(dm);
+            let l = fq.mul(st[1], corr)?;
+            let l = fq.add(l, ps)?;
+            Ok(vec![m, l])
+        })?;
+        let (m, l) = (st[0], st[1]);
+        let floor = fq.like_f(m, f64::NEG_INFINITY);
+        let fin = fq.compare(Cmp::Gt, m, floor)?;
+        let z = fq.like_f(m, 0.0);
+        let m = fq.select(fin, m, z)?;
+        let zl = fq.like_f(l, 0.0);
+        let pos_l = fq.compare(Cmp::Gt, l, zl)?;
+        let one = fq.like_f(l, 1.0);
+        let inv = fq.div(one, l)?;
+        let inv = fq.select(pos_l, inv, zl)?;
+        let wb = fq.broadcast(wr, &stat, &[0, 2])?;
+        let iw = fq.mul(inv, wb)?;
+        // Pass 2: the mean probability of the first `kv_max` keys.
+        let n2 = cdiv(kc, c);
+        let acc0 = fq.const_f(Elem::F32, 0.0, &[nr, h.kvh, h.g, n2 * c]);
+        let out = fq.for_loop(n2, &[acc0], |fq, ci, st| {
+            let (s, ok) = chunk(fq, ci)?;
+            let sd = fq.dims(s).to_vec();
+            let mb = fq.broadcast(m, &sd, &[0, 1, 2, 3])?;
+            let e = fq.sub(s, mb)?;
+            let e = fq.exp(e);
+            let iwb = fq.broadcast(iw, &sd, &[0, 1, 2, 3])?;
+            let p = fq.mul(e, iwb)?;
+            let zp = fq.like_f(p, 0.0);
+            let p = fq.select(ok, p, zp)?;
+            let mean = if ob == 1 {
+                fq.reshape(p, &[nr, h.kvh, h.g, c])?
+            } else {
+                fq.reduce(p, &[2], Fold::Sum)?
+            };
+            let base = with_i(fq, ci, c, Func::mul)?;
+            let zero = fq.const_i(Elem::I32, 0, &[]);
+            Ok(vec![fq.dynamic_update_slice(
+                st[0],
+                mean,
+                &[zero, zero, zero, base],
+            )?])
+        })?;
+        fq.slice_axis(out[0], 3, 0, kc)?
+    };
     let mean = fq.reshape(mean, &[nr * h.qh(), kc])?;
     let mean = if kc < kmax {
         let z = fq.const_f(Elem::F32, 0.0, &[]);
@@ -274,6 +338,10 @@ pub fn capture(
     } else {
         mean
     };
+    if lane_offset == 0 && plane == 0 && plane_stride == qh && nr * h.qh() == i64::from(scores.rows)
+    {
+        return Ok(mean);
+    }
     let idv = fq.const_ints(Elem::I32, &ids, &[ids.len() as i64])?;
     let new = fq.put_rows(slab, idv, mean, crate::hlo::Combine::Set)?;
     Ok(new)

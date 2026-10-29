@@ -243,6 +243,8 @@ def caches(m, c):
         c.kv(kv, w.kv, [plane, plane], m.head_dim, heads = True)
     if m.mtp != None:
         c.kv(kv, m.mtp.kv, [plane, plane], m.head_dim, heads = True)
+    else:
+        c.kv(kv, "kv.draft", [plane, plane], m.head_dim, heads = True)
 
 def tap(mtp, layer, y, fused):
     if mtp == None or layer not in mtp.taps:
@@ -273,7 +275,14 @@ def forward(m, inputs):
     logits = ops.linear.lm_head(x, m.embed if m.head == None else m.head)
     if m.mtp != None:
         draft(m, inputs, fused, logits, scaling)
+    else:
+        draft_self(logits)
     output("logits", logits)
+
+def draft_self(logits):
+    proposal = logits.on(fact.drafts())
+    output("mtp.logits", proposal)
+    output("mtp.drafts", ops.sampling.argmax([proposal, proposal, proposal, proposal]))
 
 def draft(m, inputs, fused, logits, scaling):
     mtp = m.mtp

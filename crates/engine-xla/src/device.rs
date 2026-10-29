@@ -401,7 +401,7 @@ fn cache_cap() -> u64 {
     std::env::var("PIE_XLA_CACHE_GB")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .map_or(4 << 30, |gb| (gb * f64::from(1u32 << 30)) as u64)
+        .map_or(32 << 30, |gb| (gb * f64::from(1u32 << 30)) as u64)
 }
 
 /// Marks a cached program as just used, so `trim` keeps it longest.

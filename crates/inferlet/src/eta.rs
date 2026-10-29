@@ -850,6 +850,10 @@ impl ForwardPass {
         submit_frame(on, &[Some(self)])
     }
 
+    pub fn bind(&self) -> Result<(), String> {
+        self.attach_program()
+    }
+
     fn attach_program(&self) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Ok(());
