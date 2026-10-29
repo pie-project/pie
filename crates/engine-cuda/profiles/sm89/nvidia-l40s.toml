@@ -8,9 +8,11 @@ device = "NVIDIA L40S"
 # catalog's dense models 2-8% faster on it where the tuner picks it.
 [kernel]
 gemm.rows_m = 16
+gemm.fp8_shadow = true
 
 [provenance]
 measured = [
+  "kernel.gemm.fp8_shadow",
   "kernel.gemm.heuristics",
   "kernel.gemm.rows_m",
   "kernel.gemm.skinny_rows",
