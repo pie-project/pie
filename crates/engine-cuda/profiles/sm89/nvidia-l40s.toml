@@ -8,6 +8,7 @@ device = "NVIDIA L40S"
 # catalog's dense models 2-8% faster on it where the tuner picks it.
 [kernel]
 gemm.rows_m = 16
+sdpa.pool_mma = true
 
 [provenance]
 measured = [
@@ -35,6 +36,7 @@ measured = [
   "kernel.sdpa.decode.split_small",
   "kernel.sdpa.decode.split_window",
   "kernel.sdpa.decode.static_max_requests",
+  "kernel.sdpa.pool_mma",
   "kernel.sdpa.prefill.ctas_per_sm",
   "engine.copies",
   "engine.graphs",
