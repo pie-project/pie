@@ -1144,7 +1144,12 @@ impl Shell {
         // grows them the same way (Kimi-K3's mini: 3.1 GB of KDA planes at
         // 8192 tokens left an RTX 5090's rows short of one sequence).
         let scratch_growth =
-            if (cfg!(feature = "rocm") || shell.pools.has_state()) && shell.records_bodies() {
+            if (cfg!(feature = "rocm")
+                || shell.trace.nodes.iter().any(|node| {
+                    matches!(node.op, poem_ir::Operation::Ssm(poem_ir::Ssm::KdaChunked { .. }))
+                }))
+                && shell.records_bodies()
+            {
                 shell.arena.bytes()
             } else {
                 0
