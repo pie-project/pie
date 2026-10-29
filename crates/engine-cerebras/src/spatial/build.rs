@@ -607,6 +607,7 @@ pub fn compile(design: Design, params: &[(String, String)], target: crate::sdk::
         let _ = std::fs::remove_dir_all(&out);
         return Err(format!("compiling {}: {e}", design.name()));
     }
+    let kvst = params.iter().find(|(k, _)| k == "KVST").and_then(|(_, v)| v.parse::<usize>().ok());
     let m = Manifest {
         design: design.name().to_string(),
         params: params.to_vec(),
@@ -615,6 +616,9 @@ pub fn compile(design: Design, params: &[(String, String)], target: crate::sdk::
         fabric_offsets,
         system,
         vm: design.vm_image().map(String::from),
+        kvst: kvst.filter(|&s| s > 0),
+        kvst_pack: kvst.filter(|&s| s > 0).map(|_| design.kv_staging().0.to_string()),
+        kvst_aliased: kvst.filter(|&s| s > 0).map(|_| design.kv_staging().1),
     };
     m.write(&out)?;
     tracing::info!(s = started.elapsed().as_secs_f32(), "spatial build: compiled");

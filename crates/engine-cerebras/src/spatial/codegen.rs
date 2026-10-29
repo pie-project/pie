@@ -111,6 +111,17 @@ impl Design {
         }
     }
 
+    /// How a KV-staging build's slots hold their elements (`kvst_pack`):
+    /// f32 words on serve2d*, bf16 one a word on serve8b_region, bf16 pairs
+    /// in serve8b's aliased scratch; and whether they alias it.
+    pub fn kv_staging(self) -> (&'static str, bool) {
+        match self {
+            Design::Serve2d | Design::Serve2dPipe => ("f32", false),
+            Design::Serve8b => ("bf16x2", true),
+            Design::Serve8bRegion => ("bf16", false),
+        }
+    }
+
     /// Every file of the program's build directory, `layout.csl` first.
     pub fn files(self) -> R<Vec<File>> {
         match self {

@@ -28,6 +28,13 @@ pub struct Manifest {
     /// The eta VM image the design's sources carry (`guest4hm`,
     /// `guest4hz`), whether or not the params enable it; `None`: no VM.
     pub vm: Option<String>,
+    /// KV page staging (scratch/fork4/kv-staging-interface.md): slots a PE
+    /// (`KVST`; `None`: no staging), how the slots pack their elements
+    /// (`f32`, `bf16` one a word, `bf16x2` two a word) and whether they
+    /// alias a scratch buffer (serve8b's `s`/`act`).
+    pub kvst: Option<usize>,
+    pub kvst_pack: Option<String>,
+    pub kvst_aliased: Option<bool>,
 }
 
 impl Manifest {
@@ -44,6 +51,9 @@ impl Manifest {
             "fabric_offsets": [self.fabric_offsets.0, self.fabric_offsets.1],
             "system": self.system,
             "vm": self.vm,
+            "kvst": self.kvst,
+            "kvst_pack": self.kvst_pack,
+            "kvst_aliased": self.kvst_aliased,
         })
     }
 
@@ -78,6 +88,9 @@ impl Manifest {
             fabric_offsets: pair("fabric_offsets")?,
             system: v["system"].as_bool().unwrap_or(false),
             vm: v["vm"].as_str().map(String::from),
+            kvst: v["kvst"].as_u64().map(|n| n as usize),
+            kvst_pack: v["kvst_pack"].as_str().map(String::from),
+            kvst_aliased: v["kvst_aliased"].as_bool(),
         })
     }
 
@@ -146,6 +159,9 @@ mod tests {
             fabric_offsets: (4, 1),
             system: false,
             vm: Some("guest4hz".into()),
+            kvst: Some(1),
+            kvst_pack: Some("bf16x2".into()),
+            kvst_aliased: Some(true),
         };
         let back = Manifest::from_json(&m.to_json()).unwrap();
         assert_eq!(back, m);
@@ -163,6 +179,9 @@ mod tests {
             fabric_offsets: (4, 1),
             system: false,
             vm: None,
+            kvst: None,
+            kvst_pack: None,
+            kvst_aliased: None,
         }
         .to_json();
         v["version"] = serde_json::json!(2);
@@ -187,6 +206,9 @@ mod tests {
             fabric_offsets: (4, 1),
             system: false,
             vm: None,
+            kvst: None,
+            kvst_pack: None,
+            kvst_aliased: None,
         }
         .write(dir.path())
         .unwrap();
