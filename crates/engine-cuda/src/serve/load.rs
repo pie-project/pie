@@ -63,8 +63,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
     if boot.budget.max_tokens == 0 {
+        let params: u64 = boot.trace.params.iter().map(|p| p.shape.iter().product::<u64>()).sum();
         boot.budget.max_tokens = match engine.forward_tokens {
             0 => crate::api::DEFAULT_FORWARD_TOKENS,
+            tokens if params < 2 << 30 => tokens.max(crate::api::DEFAULT_FORWARD_TOKENS),
             tokens => tokens,
         };
         if let Some(fit) = walk_fire_fit(&boot.trace, engine.walk_fire_rows, device.device().num_sm)
