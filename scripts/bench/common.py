@@ -943,7 +943,7 @@ def hf_chat_token_ids_and_counts(
     model: str, system: str, prompts: list[str], enable_thinking: bool | None = None
 ) -> tuple[list[list[int]], list[int]]:
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(str(Path(model).parent) if Path(model).is_file() else model, trust_remote_code=True)
     rendered = _render_chat(tok, system, prompts, enable_thinking)
     token_ids = [tok.encode(p, add_special_tokens=False) for p in rendered]
     return token_ids, [len(ids) for ids in token_ids]
