@@ -280,7 +280,7 @@ def convolve(arm, a):
         x = ops.elemwise.gelu(x, False)
     x, grid = ops.conv.pixel_unshuffle(x, grid, [1, a.bands, 1])
     y = ops.linear.matmul(x, a.conv_out)
-    seam.at(seam.PIXELS, [y, grid])
+    output("features", y, grid = grid)
     return y
 
 def encode(arm, a):
@@ -303,7 +303,7 @@ def encode(arm, a):
         y = ops.elemwise.add(f, y)
     y = run_norm(y, a.norm_out, a.eps)
     y = run_linear(a.proj2, ops.elemwise.gelu(run_linear(a.proj1, y), False))
-    seam.at(seam.PIXELS, [y, grid])
+    output("hidden", y, grid = grid)
     return y
 
 def text(arm, m):
@@ -334,5 +334,5 @@ def text(arm, m):
     x = ops.elemwise.rmsnorm(y, t.norm, t.eps)
     x = ops.gather.gather_rows(x, arm.readout_rows())
     logits = ops.linear.lm_head(x, t.head)
-    seam.at(seam.OUT, [logits])
+    output("logits", logits)
     return logits

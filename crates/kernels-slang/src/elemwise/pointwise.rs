@@ -81,9 +81,18 @@ pub fn binary(ctx: &Ctx<'_>, op: BinaryOp, x: Tensor, y: Tensor, z: Tensor) -> R
         }),
     };
     let (n, grid) = flat(OP, z)?;
+    // `x op x` binds `x` once: WebGPU refuses two writable bindings over one
+    // range, and a WGSL kernel's are all writable.
+    let same = x == y;
     ctx.fire(
         Fire::at(POINTWISE, entry).apply(grid),
-        &[x.arg(), y.arg(), z.arg_mut(), n.arg()],
+        &[
+            x.arg(),
+            if same { ctx.absent()? } else { y.arg() },
+            z.arg_mut(),
+            n.arg(),
+            u32::from(same).arg(),
+        ],
     )
 }
 
