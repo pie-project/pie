@@ -60,6 +60,8 @@ def build_engine(args: argparse.Namespace, max_running_requests: int):
         engine_kwargs["disable_piecewise_cuda_graph"] = (
             args.sglang_disable_piecewise_cuda_graph
         )
+    elif args.sglang_disable_piecewise_cuda_graph and "cuda_graph_backend_prefill" in supported:
+        engine_kwargs["cuda_graph_backend_prefill"] = "disabled"
     elif args.sglang_disable_piecewise_cuda_graph:
         raise SystemExit(
             "--sglang-disable-piecewise-cuda-graph: installed SGLang has no "
