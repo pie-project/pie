@@ -164,10 +164,16 @@ impl Design {
         match (built.as_deref(), super::serve2d::Layout2d::of(get)) {
             (Some("serve2d" | "serve2d_pipe" | "serve8b" | "serve8b_region") | None, Some(grid)) => grid
                 .map(|mut g| {
-                    // guest4hz's vmlane is 3 words a virtual lane (its size
-                    // on the head's chunk PEs tells).
+                    // guest4hz's vmlane is 3 words a virtual lane: the
+                    // manifest names the VM; a program built elsewhere, the
+                    // symbol's size on the head's chunk PEs tells.
                     if let (Some(_), Some(m), Some(shape)) = (g.vm, g.mmax, g.paged) {
-                        let hz = super::guest4::lane::symbol_words(program, "vmlane") == Some(m * shape.lanes * 3);
+                        let hz = match super::manifest::Manifest::read(program).and_then(|m| m.vm) {
+                            Some(vm) => vm == "guest4hz",
+                            None => {
+                                super::guest4::lane::symbol_words(program, "vmlane") == Some(m * shape.lanes * 3)
+                            }
+                        };
                         if hz {
                             g.vmlane_words = 3;
                         }
