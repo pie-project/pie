@@ -149,6 +149,7 @@ pub fn matmul_select(
         // re-reads each expert once a route. The grouped mma.sync kernel reads
         // it once a slice.
         if bf16_mma_spans(ctx, fan.route_count)
+            && fan.route_count > fan.top_k.unsigned_abs()
             && x.dtype == Dtype::Bf16
             && bank.dtype == Dtype::Bf16
             && !experts.streams()
