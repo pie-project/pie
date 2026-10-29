@@ -151,9 +151,10 @@ pub fn select_fp8_w8a8(
         0..=8 => 1,
         9..=16 => 2,
         17..=40 => 4,
-        _ => 8,
+        41..=64 => 8,
+        _ => 16,
     };
-    let wn: u32 = if nb == 8 { 2 } else { 1 };
+    let wn: u32 = if nb >= 8 { 2 } else { 1 };
     let RouteOrder {
         order,
         offsets,
@@ -291,7 +292,7 @@ pub fn matmul_fp8_w8a8(
 /// step padded by 16 bytes (`kFp8a8Stages`).
 #[cfg(feature = "cuda")]
 pub(super) const fn fp8_mma_smem(nb: u32) -> u32 {
-    3 * (128 + 8 * nb) * (128 + 16)
+    (if nb == 16 { 2 } else { 3 }) * (128 + 8 * nb) * (128 + 16)
 }
 
 /// A routed select over a block-FP8 bank (`experts x n x k` e4m3 codes at
@@ -570,6 +571,40 @@ pub fn quantize_fp8b128(ctx: &Ctx, src: Tensor, codes: u64, atoms: u64) -> Resul
             stated(OP, src.width)?.arg(),
         ],
     )
+}
+
+/// An MXFP4 bank (`rows` rows of `k` codes, an e8m0 scale a 32) as fp8b128
+/// at `codes` and `atoms` ([`quantize_fp8b128`]) through bf16 at `wide`
+/// (`rows * k * 2` bytes): each value exactly where its block's scales lie
+/// within 2^14 of each other.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn mxfp4_to_fp8b128(
+    ctx: &Ctx,
+    src_codes: u64,
+    src_scales: u64,
+    rows: u32,
+    k: u32,
+    wide: u64,
+    codes: u64,
+    atoms: u64,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mxfp4_to_fp8b128";
+    let count = u64::from(rows) * u64::from(k);
+    let threads = u32::try_from(count.div_ceil(8))
+        .map_err(|_| refuse(OP, "the bank's 8-code runs pass a 32-bit launch"))?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(DEQUANT, "::pie::linear::dequantize_mxfp4"))
+            .apply(Launch::flat(threads, 256)),
+        &[
+            ArgValue::Ptr(src_codes),
+            ArgValue::Ptr(src_scales),
+            ArgValue::Ptr(wide),
+            (count as i64).arg(),
+        ],
+    )?;
+    quantize_fp8b128(ctx, Tensor::new(wide, rows, k, Dtype::Bf16), codes, atoms)
 }
 
 /// An fp8b128 plane (`codes` `[rows, k]`, each 128x128 block's exponent

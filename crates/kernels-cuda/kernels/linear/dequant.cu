@@ -30,6 +30,25 @@ __global__ void __launch_bounds__(256) dequantize_fp8b128(const u8* __restrict__
     *reinterpret_cast<uint4*>(out + at + 8) = make_uint4(w[4], w[5], w[6], w[7]);
 }
 
+/// An MXFP4 plane (codes `[rows, k / 2]`, an e8m0 scale a 32 codes) as
+/// bf16, each value exactly. 8 codes a thread; `count` whole 32s.
+__global__ void __launch_bounds__(256) dequantize_mxfp4(const u8* __restrict__ codes,
+                                                        const u8* __restrict__ scales,
+                                                        bf16* __restrict__ out, long long count) {
+    const long long at = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) * 8;
+    if (at >= count) return;
+    const float s = mxfp4_block_scale(scales[at / 32]);
+    __half2 qd[4];
+    mxfp4_unpack8(reinterpret_cast<const unsigned*>(codes)[at / 8], qd);
+    unsigned w[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 f = __half22float2(qd[j]);
+        w[j] = pack_bf16x2(f.x * s, f.y * s);
+    }
+    *reinterpret_cast<uint4*>(out + at) = make_uint4(w[0], w[1], w[2], w[3]);
+}
+
 template <class T>
 __global__ void dequant_nvfp4(
     const u8* __restrict__ codes,

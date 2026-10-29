@@ -1021,7 +1021,7 @@ impl Weights {
         }
         Ok(Weights {
             store,
-            table: WeightTable(table, BTreeMap::new(), BTreeMap::new()),
+            table: WeightTable(table, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
             banks: banks(trace, &places),
             experts,
             from_cache,
@@ -1217,6 +1217,84 @@ impl Weights {
                 "cudaStreamSynchronize",
                 cudarc::runtime::sys::cudaStreamSynchronize(stream.cast()),
             )?;
+        }
+        Ok(done)
+    }
+
+    /// `kernel.moe.mxfp4_fp8_from`: each resident MXFP4 bank a W4A8 select
+    /// reads keeps an fp8b128 copy, widened once here, that wide selects
+    /// read on the FP8 MMA. Returns the banks it widened.
+    #[cfg(feature = "cuda")]
+    pub fn shadow_mxfp4_banks(
+        &mut self,
+        trace: &Trace,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<u32> {
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        let mut done = 0;
+        for (at, gran) in act_quant_banks(trace) {
+            if gran != 32 || trace.params[at].dtype != Dtype::Mxfp4 {
+                continue;
+            }
+            let Some(Some(WeightRow::Planes {
+                codes,
+                scales,
+                seat,
+                atoms: false,
+                lanes: false,
+                ..
+            })) = self.table.0.get(at).copied()
+            else {
+                continue;
+            };
+            // An MXFP4 plane is `[.., rows, blocks, 16]` bytes.
+            let shape = &trace.params[at].shape;
+            if shape.len() < 3 {
+                continue;
+            }
+            let rows: u64 = shape[..shape.len() - 2].iter().product();
+            let k = shape[shape.len() - 2] * 32;
+            if seat.streams()
+                || crate::device::alloc::is_host_pointer(codes.ptr)
+                || crate::device::alloc::is_host_pointer(scales.ptr)
+                || rows == 0
+                || !rows.is_multiple_of(128)
+                || !k.is_multiple_of(512)
+            {
+                continue;
+            }
+            let (r, kk) = (rows as usize, k as usize);
+            let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+            let atom_bytes = kernels_cuda::linear::gemm_sm100::atom_bytes(r, kk, 128);
+            let buffer = Buffer::zeroed_on(stream, r * kk + atom_bytes)?;
+            let wide = Buffer::zeroed_on(stream, r * kk * 2)?;
+            kernels_cuda::linear::moe::mxfp4_to_fp8b128(
+                &ctx,
+                codes.ptr,
+                scales.ptr,
+                to32(rows),
+                to32(k),
+                wide.ptr(),
+                buffer.ptr(),
+                buffer.ptr() + (r * kk) as u64,
+            )?;
+            crate::device::ctx::sync(stream)?;
+            drop(wide);
+            self.table.3.insert(
+                at,
+                (
+                    Tensor::new(buffer.ptr(), to32(rows), to32(k), Dtype::E4m3),
+                    Tensor::new(
+                        buffer.ptr() + (r * kk) as u64,
+                        to32(rows),
+                        to32(k / 128),
+                        Dtype::U8,
+                    ),
+                ),
+            );
+            self.decoded.push(buffer);
+            done += 1;
         }
         Ok(done)
     }

@@ -53,6 +53,9 @@ pub struct WeightTable(
     /// A block-FP8 dense row's bf16 copy widened at load beside its codes
     /// (`kernel.gemm.fp8_shadow`), which a batch's rows read on cuBLAS.
     pub std::collections::BTreeMap<usize, Tensor>,
+    /// An MXFP4 bank's fp8b128 copy (codes, atoms) widened at load beside
+    /// it (`kernel.moe.mxfp4_fp8_from`), which wide selects read W8A8.
+    pub std::collections::BTreeMap<usize, (Tensor, Tensor)>,
 );
 
 #[derive(Clone, Debug, Default)]
@@ -1973,6 +1976,15 @@ impl<'c> Run<'c> {
             return None;
         };
         self.weights.2.get(&(*w as usize)).copied()
+    }
+
+    /// The fp8b128 copy an MXFP4 bank keeps (`kernel.moe.mxfp4_fp8_from`).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn mxfp4_fp8_bank(&self, id: ValueId) -> Option<(Tensor, Tensor)> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        self.weights.3.get(&(*w as usize)).copied()
     }
 
     pub(crate) fn maybe_tiled_planes(

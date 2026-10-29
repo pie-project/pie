@@ -310,6 +310,13 @@ pub struct MoeMxfp4A8Until(pub u32);
 #[decision(id = "kernel.moe.mxfp4_a8_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4A8From(pub u32);
 
+/// The fewest routes a W4A8 select runs, where there are no tcgen05 GEMMs,
+/// on a block-FP8 copy of its MXFP4 bank widened at load, W8A8 on the FP8
+/// MMA (as SGLang reads MXFP4 experts there). 0: never, and no copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_fp8_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4Fp8From(pub u32);
+
 /// The fewest rows a projection cut into two row halves (Qwen3.5's qkv|z)
 /// lands as two GEMMs off the weight's two slices, where
 /// `kernel.elemwise.rows_vec` is on; fewer run the GEMM and the cut.
@@ -823,6 +830,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmFp8ODown>()
         .add::<MoeMxfp4A8Until>()
         .add::<MoeMxfp4A8From>()
+        .add::<MoeMxfp4Fp8From>()
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
         .add::<MoeMegaUntil>()
@@ -960,6 +968,7 @@ tuning! {
     fp8_o_down: bool = false, on GemmFp8ODown;
     mxfp4_a8_until: u32 = 0, get MoeMxfp4A8Until;
     mxfp4_a8_from: u32 = 0, get MoeMxfp4A8From;
+    mxfp4_fp8_from: u32 = 0, get MoeMxfp4Fp8From;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
     moe_mega_until: u32 = 0, get MoeMegaUntil;

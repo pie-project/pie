@@ -2170,6 +2170,24 @@ impl Run<'_> {
         match codes.dtype {
             Dtype::Nvfp4 | Dtype::Mxfp4 | Dtype::U8 => {
                 let x = self.tensor(x);
+                // A wide fire on the bank's fp8b128 copy, W8A8 (`kernel.moe.mxfp4_fp8_from`).
+                if let Some((fp8, atoms)) = self.mxfp4_fp8_bank(bank) {
+                    let route_t = self.tensor(routes);
+                    let mut out = self.tensor(y);
+                    if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from
+                        && linear::moe::fp8_w8a8_takes(x, out.width)
+                    {
+                        return linear::moe::select_fp8_w8a8(
+                            self.ctx(),
+                            x,
+                            fp8.ptr,
+                            atoms.ptr,
+                            codes.rows,
+                            route_t,
+                            &mut out,
+                        );
+                    }
+                }
                 self.select_quant(x, bank, routes, y)
             }
             // A block-FP8 release's experts, their factors laid as ue8m0

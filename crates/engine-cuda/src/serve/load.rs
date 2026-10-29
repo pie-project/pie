@@ -684,6 +684,14 @@ impl Shell {
         if device.ctx().tuning().gemm_fp8_shadow && !kernels_cuda::linear::gemm_sm100::supported() {
             weights.shadow_fp8_dense(&boot.trace, device.stream())?;
         }
+        // `kernel.moe.mxfp4_fp8_from`: MXFP4 banks keep a block-FP8 copy.
+        #[cfg(feature = "cuda")]
+        if device.ctx().tuning().mxfp4_fp8_from > 0
+            && !kernels_cuda::linear::gemm_sm100::supported()
+            && kernels_cuda::linear::moe::fp8_w8a8_capable()
+        {
+            weights.shadow_mxfp4_banks(&boot.trace, device.stream())?;
+        }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after weights resident",

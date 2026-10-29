@@ -25,6 +25,7 @@ sdpa.pool_mma = true
 sdpa.selected_mma = true
 moe.bf16_mma_from = 16
 moe.bf16_mma_until = 65536
+moe.mxfp4_fp8_from = 256
 
 [engine]
 forward_tokens = 2048
