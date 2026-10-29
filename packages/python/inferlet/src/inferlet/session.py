@@ -1,7 +1,8 @@
 """
 Session — ``pie:inferlet/session``.
 
-Client communication: send/receive text and files.
+Client communication: send/receive text and files, and send pictures and
+sound encoded on the host (``frames``).
 """
 
 from __future__ import annotations
@@ -10,6 +11,9 @@ import json as _json
 from typing import Any
 
 import wit_world.imports.session as _session
+from componentize_py_types import Err as _WitErr
+
+from .frames import AudioFormat, Frames, FramesError, ImageFormat, Pcm
 
 
 def send(message: Any) -> None:
@@ -43,9 +47,32 @@ async def receive() -> str:
     return result
 
 
-def send_file(data: bytes) -> None:
-    """Send binary file data to the client."""
-    _session.send_file(data)
+def send_file(data: bytes, name: str | None = None) -> None:
+    """Send binary file data to the client, under a suggested file ``name``
+    if given (a name, not a path: the client keeps its last part)."""
+    if name is None:
+        _session.send_file(data)
+    else:
+        _session.send_file_as(data, name)
+
+
+def send_frames(
+    frames: Frames, format: ImageFormat = ImageFormat.PNG, name: str = "picture.png"
+) -> None:
+    """Send pictures to the client, encoded on the host: the bytes never pass
+    through the inferlet's memory."""
+    try:
+        _session.send_frames(frames.handle, format, name)
+    except _WitErr as e:
+        raise FramesError(f"send_frames: {e.value}") from None
+
+
+def send_pcm(pcm: Pcm, format: AudioFormat = AudioFormat.WAV, name: str = "audio.wav") -> None:
+    """Send sound to the client, encoded on the host."""
+    try:
+        _session.send_pcm(pcm.handle, format, name)
+    except _WitErr as e:
+        raise FramesError(f"send_pcm: {e.value}") from None
 
 
 async def receive_file() -> bytes:
