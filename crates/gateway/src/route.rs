@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn process_control_survives_resource_saturation_but_launches_do_not() {
-        for (kv, inflight) in [(255, 0), (0, 256)] {
+        for (kv, inflight) in [(255, 0), (0, 1024)] {
             let h = handle_with(
                 table(vec![worker(1, "m", Health::Healthy, kv, inflight)]),
                 &[1],
