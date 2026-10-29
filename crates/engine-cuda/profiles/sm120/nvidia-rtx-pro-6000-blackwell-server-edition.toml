@@ -11,6 +11,24 @@ moe.mxfp4_select_lean = true  # 1.7% faster end to end
 # bf16 MoE routes past one token on the grouped mma.sync kernel: Qwen3.6-35B-A3B c128 1,489 -> 3,590 tok/s
 moe.bf16_mma_from = 16
 moe.bf16_mma_until = 65536
+# the tensor-core attention, hyper-connection and KDA kernels A100, H100 and L40S run: DeepSeek-V4.1 mini
+# raw decode 106 -> 239 tok/s, pf16-512 5.2k -> 33.6k; DeepSeek-V4 mini pf16 32k -> 72k; Qwen3.8-Flash-Next
+# mini raw decode 455 -> 501, pf16 108k -> 140k; Kimi-K3 mini raw prefill 8.4k -> 13.4k
+elemwise.rows_vec = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+elemwise.norm_emit = true
+sdpa.merge_warp = true
+sdpa.selected_mma = true
+sdpa.pool_mma = true
+sdpa.index_mma = true
+sdpa.index_radix = true
+ssm.kda_chunked = true
+ssm.kda_step_fused = true
+ssm.conv_vec4 = true
+ssm.gdn_out_bf16 = true
+attn_res.fused_norm = true
+gemm.fp8_shadow = true
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"
