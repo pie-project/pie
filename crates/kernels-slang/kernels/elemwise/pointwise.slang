@@ -35,6 +35,9 @@ float2 combine(float2 a, float2 b) {
 
 struct Params {
     uint n;
+    // `y` is `x` (`x op x`): its binding is a stand-in, since WebGPU refuses
+    // two writable bindings over one range and a WGSL kernel's are all so.
+    uint same;
 };
 PIE_PARAMS(3, Params, params);
 
@@ -46,7 +49,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
         return;
     }
     bool both = i + 1u < params.n;
-    pair_put(z, i, both, combine(pair_at(x, i, both), pair_at(y, i, both)));
+    float2 a = pair_at(x, i, both);
+    float2 b = params.same != 0u ? a : pair_at(y, i, both);
+    pair_put(z, i, both, combine(a, b));
 }
 
 #elif defined(PIE_RESIDUAL_ADD)

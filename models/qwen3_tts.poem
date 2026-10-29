@@ -481,7 +481,7 @@ def talk(arm, m):
     y = run_stack(arm, t, y)
     y = ops.gather.gather_rows(y, arm.readout_rows())
     said = ops.gather.concat_cols([ops.linear.matmul(y, m.talker_head), y])
-    seam.at(seam.HIDDEN, [said])
+    output("hidden", said)
     return said
 
 def predict(arm, m):
@@ -497,7 +497,7 @@ def predict(arm, m):
     y = ops.gather.gather_rows(y, rows)
     head, _ = ops.linear.moe_route(ops.gather.gather_rows(route, rows), m.route.shape[1], 1, routing.softmax())
     logits = ops.linear.moe_matmul_select(y, m.books_head, head, 1)
-    seam.at(seam.HIDDEN, [logits])
+    output("logits", logits)
     return logits
 
 def quantize(arm, d):
@@ -507,7 +507,7 @@ def quantize(arm, d):
     y = ops.gather.embed(arm.tokens(), d.codes, d.books * d.book)
     y = ops.linear.matmul(y, d.project)
     y = ops.gather.gather_rows(y, arm.readout_rows())
-    seam.at(seam.HIDDEN, [y])
+    output("hidden", y)
     return y
 
 def prenet(arm, d):
@@ -536,7 +536,7 @@ def prenet(arm, d):
     y = ops.elemwise.rmsnorm(y, d.norm, d.eps)
     y = ops.elemwise.add_bias(d.output_bias, ops.linear.matmul(y, d.output))
     y = ops.gather.gather_rows(y, arm.readout_rows())
-    seam.at(seam.HIDDEN, [y])
+    output("hidden", y)
     return y
 
 def run_causal_conv(x, grid, c, taps, dilation = 1, depthwise = False):
@@ -574,5 +574,5 @@ def decode(arm, d):
             x = ops.elemwise.add(x, h)
     x = run_snake(x, d.snake)
     x = run_causal_conv(x, grid, d.last, 7)
-    seam.at(seam.PIXELS, [x, grid])
+    output("audio", x, grid = grid)
     return x

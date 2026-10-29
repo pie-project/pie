@@ -129,8 +129,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
     GroupMemoryBarrierWithGroupSync();
     // A tile past the grid's last clip computes nothing; a strided stack is
-    // carved at its input's rows and leaves most of its tiles so.
-    if (live == 0) {
+    // carved at its input's rows and leaves most of its tiles so. Read
+    // uniformly: WGSL lets a barrier follow only workgroup-uniform control flow.
+    if (workgroupUniformLoad(live) == 0) {
         return;
     }
 
