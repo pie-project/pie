@@ -5,7 +5,7 @@
 
 use dtype::Dtype;
 
-use super::{clip_pair, even_row, row_grid};
+use super::{clip_pair, row_grid};
 use crate::encode::{Arg, ArgValue, Ctx, Fire, Grid, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
@@ -105,7 +105,8 @@ pub fn conv3d(
             format!("a convolution from {c_in} channels into {c_out} computes nothing"),
         ));
     }
-    even_row(OP, "output row", c_out)?;
+    // An odd output row's words straddle rows: the flat arm lands them.
+    let flat = !c_out.is_multiple_of(2);
     let taps = conv.taps();
     if w.rows != c_out || w.width != taps * c_in {
         return Err(refuse(
@@ -148,6 +149,22 @@ pub fn conv3d(
     args.extend(conv.scalars(c_in, c_out, clips, rows_out)?);
     args.push(u32::from(bias.is_some()).arg());
     let bases = [stated(OP, bases[0])?.arg(), stated(OP, bases[1])?.arg()];
+    if flat {
+        let groups = (u64::from(rows_out) * u64::from(c_out)).div_ceil(u64::from(STRIPS));
+        let groups = u32::try_from(groups).map_err(|_| {
+            refuse(
+                OP,
+                format!("the grid will not launch: {rows_out} rows of {c_out} channels"),
+            )
+        })?;
+        let (shape, span) = row_grid(THREADS, groups, THREADS);
+        args.push(span.arg());
+        args.extend(bases);
+        return ctx.fire(
+            Fire::at(CONV3D, "conv_conv3d_flat_bf16").apply(shape),
+            &args,
+        );
+    }
     if c_in.is_multiple_of(STEP) {
         args.extend(bases);
         let tiles = rows_out.div_ceil(TILE);

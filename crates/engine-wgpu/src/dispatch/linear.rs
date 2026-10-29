@@ -26,6 +26,22 @@ impl Run<'_> {
                 quant: None,
                 logits: false,
                 ..
+            } if self.tensor(*act).dtype == poem_ir::Dtype::F32 && self.banked(*w).is_none() => {
+                kernels_slang::linear::gemm::lane(
+                    self.ctx,
+                    "linear.matmul",
+                    self.tensor(*act),
+                    self.tensor(*w),
+                    self.tensor(*y),
+                )
+            }
+            Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: false,
+                ..
             } => match self.banked(*w) {
                 Some(bank) => {
                     let capacity = self.capacity(*act).min(self.capacity(*y));

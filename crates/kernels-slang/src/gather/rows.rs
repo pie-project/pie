@@ -373,7 +373,7 @@ pub fn split_rows(
     right: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "gather.split_rows";
-    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    dtype_dispatch!(OP, x.dtype, { Bf16 => (), F32 => () });
     nonzero(OP, "the left half of this cut", left.width)?;
     nonzero(OP, "the right half of this cut", right.width)?;
     debug_assert_eq!(

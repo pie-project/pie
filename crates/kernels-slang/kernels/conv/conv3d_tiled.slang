@@ -47,8 +47,10 @@ struct Params {
 };
 PIE_PARAMS(6, Params, params);
 
-groupshared float4 xs[BK * TY];
-groupshared float4 ws[BK * TX];
+// A step's operands as scalars, four a lane's float4: a lane writing one
+// component of a shared vector would race its neighbours on WGSL.
+groupshared float xs[BK * TY * 4];
+groupshared float ws[BK * TX * 4];
 // A tile row's first tap corner (t, h, w) and its clip index (-1: none).
 groupshared int4 corner[BM];
 // A tile row's input clip (t, h, w, off).
@@ -127,19 +129,21 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             uint r = e / uint(BK);
             int from = src[r];
             float v = from >= 0 ? bf16_at(x, uint(from) * uint(params.c_in) + uint(c0) + kk) : 0.0;
-            xs[kk * uint(TY) + r / 4u][r % 4u] = v;
+            xs[(kk * uint(TY) + r / 4u) * 4u + r % 4u] = v;
         }
         for (uint e = flat; e < uint(BK * BN); e += uint(THREADS)) {
             uint kk = e % uint(BK);
             uint c = e / uint(BK);
             int col = col0 + int(c);
             float v = col < params.c_out ? bf16_at(w, uint(col) * uint(k) + uint(k0) + kk) : 0.0;
-            ws[kk * uint(TX) + c / 4u][c % 4u] = v;
+            ws[(kk * uint(TX) + c / 4u) * 4u + c % 4u] = v;
         }
         GroupMemoryBarrierWithGroupSync();
         [ForceUnroll] for (uint kk = 0u; kk < uint(BK); kk++) {
-            float4 a = xs[kk * uint(TY) + local.y];
-            float4 b = ws[kk * uint(TX) + local.x];
+            uint ai = (kk * uint(TY) + local.y) * 4u;
+            uint bi = (kk * uint(TX) + local.x) * 4u;
+            float4 a = float4(xs[ai], xs[ai + 1u], xs[ai + 2u], xs[ai + 3u]);
+            float4 b = float4(ws[bi], ws[bi + 1u], ws[bi + 2u], ws[bi + 3u]);
             acc[0] += a.x * b;
             acc[1] += a.y * b;
             acc[2] += a.z * b;

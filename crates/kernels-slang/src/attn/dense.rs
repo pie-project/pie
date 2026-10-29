@@ -118,6 +118,7 @@ pub fn bidirectional(
             stated(OP, num_kv_heads)?.arg(),
             stated(OP, head_dim)?.arg(),
             sm_scale.arg(),
+            0u32.arg(),
         ],
     )
 }
@@ -240,13 +241,20 @@ pub fn ragged(
             )
         }
     };
+    // One CSR for both (self-attention) binds once: WebGPU refuses two
+    // writable bindings over one range, and a WGSL kernel's are all writable.
+    let self_kv = q_indptr == kv_indptr;
     let mut args = vec![
         q.arg(),
         k.arg(),
         v.arg(),
         o.arg_mut(),
         q_indptr.arg(),
-        kv_indptr.arg(),
+        if self_kv {
+            ctx.absent()?
+        } else {
+            kv_indptr.arg()
+        },
     ];
     if let Some(mask) = mask {
         args.extend([mask.bits.arg(), mask.indptr.arg()]);
@@ -257,6 +265,7 @@ pub fn ragged(
         stated(OP, kv_heads)?.arg(),
         stated(OP, head_dim)?.arg(),
         sm_scale.arg(),
+        u32::from(self_kv).arg(),
     ]);
     ctx.fire(Fire::at(file, entry).apply(grid), &args)
 }

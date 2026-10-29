@@ -814,7 +814,7 @@ impl Wgpu {
             .deferred(
                 &device,
                 program_attachments(submission)
-                    .map(|attachment| (attachment.instance, attachment.lane)),
+                    .map(|attachment| (attachment.instance, attachment.lane, attachment.lanes)),
                 self.loaded()?.output_names(),
             )
             .map(Some)
