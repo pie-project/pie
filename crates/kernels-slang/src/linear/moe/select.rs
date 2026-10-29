@@ -158,6 +158,8 @@ pub fn matmul_select(
 /// The instantiated shape a quantized bank runs at.
 pub(crate) fn point(op: &'static str, bank: Bank, biased: bool) -> Result<&'static str, Error> {
     match (bank.biases.is_some(), bank.group, bank.bits) {
+        (true, 64, 8) if biased => Ok("linear_moe_select_affine_bias_bf16_gs_64_b_8"),
+        (true, 64, 8) => Ok("linear_moe_select_affine_bf16_gs_64_b_8"),
         (true, 64, 4) if biased => Ok("linear_moe_select_affine_bias_bf16_gs_64_b_4"),
         (true, 64, 4) => Ok("linear_moe_select_affine_bf16_gs_64_b_4"),
         (true, 64, 2) if biased => Ok("linear_moe_select_affine_bias_bf16_gs_64_b_2"),
@@ -172,7 +174,7 @@ pub(crate) fn point(op: &'static str, bank: Bank, biased: bool) -> Result<&'stat
             op,
             format!(
                 "the bank is {} at {bits} bits in groups of {group}, and `linear/moe/select.slang` \
-                 instantiates the routed shapes at affine/{{32,64,128}}/2, affine/64/4 and \
+                 instantiates the routed shapes at affine/{{32,64,128}}/2, affine/64/{{4,8}} and \
                  mxfp4/32/4 only",
                 if affine { "affine" } else { "symmetric" }
             ),

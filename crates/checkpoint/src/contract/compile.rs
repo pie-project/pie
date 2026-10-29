@@ -663,6 +663,11 @@ impl Builder<'_> {
     }
 
     fn gather(&mut self, root: usize) -> Result<Option<Lowering>, Error> {
+        // A gather read back at another shape is the same elements in order.
+        let mut root = root;
+        while let Kind::Transmute { src } = self.nodes[root].kind {
+            root = src;
+        }
         let Kind::Gather { src, axis, indices } = &self.nodes[root].kind else {
             return Ok(None);
         };

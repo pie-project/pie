@@ -564,3 +564,76 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
         "the tiles' combine is {combine_off:.2e} off f64, the per-route gated add {sum_off:.2e}"
     );
 }
+
+/// The per-route matmul over an 8-bit, 64-group affine bank (a code
+/// predictor's heads, a route a row) against f64.
+#[test]
+fn the_eight_bit_routed_select_answers_f64() {
+    let Ok(device) = Context::bind() else {
+        eprintln!("not asked: no Metal device");
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    const EXPERTS: u32 = 5;
+    const K: u32 = 256;
+    const N: u32 = 96;
+    const TOKENS: u32 = 7;
+    let (bank, _planes, host) = bits_bank_of(&device, &handles, K, EXPERTS * N, 0x31, 8);
+    let bank = Bank {
+        codes: Tensor::new(bank.codes.buf, EXPERTS, N * K, bank.codes.dtype),
+        ld: N * K,
+        ..bank
+    };
+    let upload = |bytes: &[u8]| {
+        let mut buffer = Buffer::zeroed(&device, bytes.len().max(4) as u64).expect("a plane");
+        buffer.write(0, bytes).expect("upload");
+        buffer
+    };
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
+    let x: Vec<u8> = (0..TOKENS * K)
+        .flat_map(|at| bf16((f32::from(noise(u64::from(at) ^ 0x23)) - 127.0) / 64.0))
+        .collect();
+    let routes: Vec<i32> = (0..TOKENS).map(|t| (t * 3 % EXPERTS) as i32).collect();
+    let xb = upload(&x);
+    let rb = upload(
+        &routes
+            .iter()
+            .flat_map(|e| e.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    let yb = upload(&vec![0u8; (TOKENS * N * 2) as usize]);
+    let frame = device.frame().expect("frame");
+    let sink = Sink::new(&device, &frame, &pipelines, &handles);
+    moe::matmul_select_quant(
+        &sink,
+        Tensor::new(bind(&xb), TOKENS, K, Dtype::Bf16),
+        bank,
+        Tensor::new(bind(&rb), TOKENS, 1, Dtype::I32),
+        Tensor::new(bind(&yb), TOKENS, N, Dtype::Bf16),
+    )
+    .expect("the select");
+    drop(sink);
+    frame.commit().expect("commit");
+    let mut raw = vec![0u8; (TOKENS * N * 2) as usize];
+    yb.read(0, &mut raw).expect("read");
+    let got = floats(&raw);
+    let xs = floats(&x);
+    let mut worst = 0f64;
+    for t in 0..TOKENS as usize {
+        let row: Vec<f64> = xs[t * K as usize..(t + 1) * K as usize]
+            .iter()
+            .map(|v| f64::from(*v))
+            .collect();
+        let e = routes[t] as usize;
+        let want: Vec<f64> = (0..N as usize)
+            .map(|c| host.dot(e * N as usize + c, &row))
+            .collect();
+        worst = worst.max(spread64(&want, &got[t * N as usize..(t + 1) * N as usize]));
+    }
+    eprintln!("routed select at 8 bits: worst spread {worst:.2e}");
+    assert!(
+        worst < 1e-2,
+        "the 8-bit routed select parts from f64 by {worst:.2e}"
+    );
+}

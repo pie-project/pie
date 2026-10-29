@@ -138,6 +138,43 @@ pub fn gelu_tanh(ctx: &Ctx, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
     crate::linear::glu::gelu_tanh(ctx, x, 1, o)
 }
 
+/// GELU through erf.
+pub fn gelu(ctx: &Ctx, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
+    fire_unary(ctx, "elemwise.act", "3", x, o)
+}
+
+/// SnakeBeta over `x` in place, `alpha` and `beta` (f32 logs) a channel each.
+pub fn snake(ctx: &Ctx, alpha: Tensor, beta: Tensor, x: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.snake";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
+    for p in [alpha, beta] {
+        if p.dtype != Dtype::F32 || p.elements() < u64::from(x.width) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "a parameter of {} {:?} for {} channels",
+                    p.elements(),
+                    p.dtype,
+                    x.width
+                ),
+            ));
+        }
+    }
+    let (launch, n) = elementwise(OP, *x)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(POINTWISE, &format!("::pie::elemwise::snake<{t}>"))).apply(launch),
+        &[
+            x.arg(),
+            alpha.arg(),
+            beta.arg(),
+            n.arg(),
+            stated(OP, x.width)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 fn fire_unary(
     ctx: &Ctx,
     op: &'static str,

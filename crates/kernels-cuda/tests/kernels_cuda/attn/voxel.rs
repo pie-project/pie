@@ -64,7 +64,7 @@ fn check(c: usize) {
 
 #[test]
 fn the_spatial_attention_answers_the_cpu_reference_every_case() {
-    for c in [256, 512, 640, 1024] {
+    for c in [64, 128, 256, 512, 640, 1024] {
         check(c);
     }
 }

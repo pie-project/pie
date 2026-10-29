@@ -63,10 +63,18 @@ impl Run<'_> {
                 pad_back,
                 causal_t,
                 time_pad,
+                dilation,
+                depthwise,
                 cache,
                 y_grid,
                 y,
             } => {
+                #[cfg(feature = "rocm")]
+                if *dilation != [1, 1, 1] || *depthwise {
+                    return Err(kernels_cuda::Error::Unsupported {
+                        op: "conv.conv3d (dilated or depthwise)",
+                    });
+                }
                 let conv = conv::Conv3d {
                     k: *k,
                     stride: *stride,
@@ -77,6 +85,10 @@ impl Run<'_> {
                         TimePad::Zero => conv::TimePad::Zero,
                         TimePad::Replicate => conv::TimePad::Replicate,
                     },
+                    #[cfg(not(feature = "rocm"))]
+                    dilation: *dilation,
+                    #[cfg(not(feature = "rocm"))]
+                    depthwise: *depthwise,
                 };
                 let bases = [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)];
                 let x = self.tensor(*x);

@@ -440,7 +440,9 @@ pub fn lane_classes(
                 words: landed.words.clone(),
                 reads_kv: kv.contains(class),
                 reads_state: state.contains(class),
-                embeds: embeds.contains(class),
+                // A kv lane's rows are its tokens, though its class may read
+                // others in their place (a speech prompt's encoder rows).
+                embeds: embeds.contains(class) || kv.contains(class),
                 wide: wide.contains(class),
                 outputs: outputs
                     .iter()

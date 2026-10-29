@@ -233,6 +233,18 @@ pub enum Elemwise {
         #[output(alias = x)]
         x_out: ValueId,
     },
+    /// SnakeBeta: `x + sin²(x·e^alpha) / (e^beta + 1e-9)`, `alpha` and
+    /// `beta` per channel and stored as their logs.
+    Snake {
+        #[input]
+        x: ValueId,
+        #[input]
+        alpha: ValueId,
+        #[input]
+        beta: ValueId,
+        #[output(alias = x)]
+        x_out: ValueId,
+    },
     /// `act(x · k)`, in place: `k` the f32 `scale`, the first element of the
     /// device scalar `s`, or 1.
     Act {

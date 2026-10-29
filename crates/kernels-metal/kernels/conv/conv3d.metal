@@ -17,6 +17,8 @@ struct ConvGeom {
     int rows_out;
 
     int has_cache;
+
+    int dt, dh, dw;
 };
 
 inline int conv_tap_row(
@@ -27,10 +29,10 @@ inline int conv_tap_row(
     int it, int ih, int iw,
     thread bool& from_cache) {
   from_cache = false;
-  const int hi = o.h * g.sh - g.ph + ih;
-  const int wi = o.w * g.sw - g.pw + iw;
+  const int hi = o.h * g.sh - g.ph + ih * g.dh;
+  const int wi = o.w * g.sw - g.pw + iw * g.dw;
   if (hi < 0 || hi >= in.h || wi < 0 || wi >= in.w) return -1;
-  int ti = o.t * g.st - g.pt + it;
+  int ti = o.t * g.st - g.pt + it * g.dt;
   if (ti < 0) {
     if (g.causal != 0 && g.has_cache != 0) {
       from_cache = true;
@@ -75,6 +77,10 @@ template <typename T>
     const constant uint& has_bias     [[buffer(23)]],
     const constant int& x_base        [[buffer(24)]],
     const constant int& o_base        [[buffer(25)]],
+    const constant int& dt            [[buffer(26)]],
+    const constant int& dh            [[buffer(27)]],
+    const constant int& dw            [[buffer(28)]],
+    const constant int& depthwise     [[buffer(29)]],
     uint2 tgid                        [[threadgroup_position_in_grid]],
     uint simd_gid                     [[simdgroup_index_in_threadgroup]],
     uint simd_lid                     [[thread_index_in_simdgroup]],
@@ -86,6 +92,7 @@ template <typename T>
   g.pt = pt; g.ph = ph; g.pw = pw;
   g.causal = causal; g.replicate = replicate;
   g.clips = clips; g.rows_out = rows_out; g.has_cache = has_cache;
+  g.dt = dt; g.dh = dh; g.dw = dw;
   const int row = int(tgid.y);
   const int n = int(tgid.x * simds + simd_gid);
   if (row >= g.rows_out || n >= g.c_out) return;
@@ -108,8 +115,29 @@ template <typename T>
   const int cache_base = planes * g.pt;
 
   const int taps = g.kt * g.kh * g.kw;
-  const device T* wrow = w + size_t(n) * size_t(taps) * size_t(g.c_in);
   float acc = 0.0f;
+  if (depthwise != 0) {
+    // Each output channel reads its own input channel alone, the lanes
+    // across its taps.
+    const device T* wrow = w + size_t(n) * size_t(taps);
+    const int plane = g.kh * g.kw;
+    for (int tap = int(simd_lid); tap < taps; tap += 32) {
+      const int it = tap / plane;
+      const int rest = tap - it * plane;
+      const int ih = rest / g.kw;
+      bool from_cache = false;
+      const int src = conv_tap_row(g, in, v, cache_base, it, ih, rest - ih * g.kw, from_cache);
+      if (src < 0) continue;
+      const device T* xr = (from_cache ? cache : x) + size_t(src) * size_t(g.c_in);
+      acc = fma(float(xr[n]), float(wrow[tap]), acc);
+    }
+    acc = simd_sum(acc);
+    if (simd_lid == 0) {
+      *out = static_cast<T>(has_bias != 0 ? acc + bias[n] : acc);
+    }
+    return;
+  }
+  const device T* wrow = w + size_t(n) * size_t(taps) * size_t(g.c_in);
   for (int tap = 0; tap < taps; ++tap) {
     const int plane = g.kh * g.kw;
     const int it = tap / plane;
@@ -144,7 +172,8 @@ template <typename T>
       const constant int&, const constant int&, const constant int&,       \
       const constant int&, const constant int&, const constant int&,       \
       const constant int&, const constant uint&,                           \
-      const constant int&, const constant int&,                            \
+      const constant int&, const constant int&, const constant int&,       \
+      const constant int&, const constant int&, const constant int&,       \
       uint2, uint, uint, uint);
 
 instantiate_conv3d(bfloat16, bfloat)

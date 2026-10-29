@@ -275,13 +275,26 @@ impl Run<'_> {
                 *rotary_dim,
                 *head_dim,
             ),
-            Elemwise::RelativeBucketBias { .. }
-            | Elemwise::Act {
+            Elemwise::Act {
+                x,
+                x_out: _,
                 s: None,
                 scale: None,
-                act: poem_ir::ActFn::Gelu { .. },
+                act: poem_ir::ActFn::Gelu { tanh },
                 ..
-            }
+            } => kernels_slang::elemwise::pointwise::gelu(self.ctx, self.tensor(*x), *tanh),
+            Elemwise::Snake {
+                x,
+                alpha,
+                beta,
+                x_out: _,
+            } => kernels_slang::elemwise::pointwise::snake(
+                self.ctx,
+                self.tensor(*x),
+                self.tensor(*alpha),
+                self.tensor(*beta),
+            ),
+            Elemwise::RelativeBucketBias { .. }
             | Elemwise::Hadamard { .. }
             | Elemwise::GateSigmoidMul { heads: Some(_), .. } => {
                 Err(kernels_slang::Error::Unsupported { op: op.name() })

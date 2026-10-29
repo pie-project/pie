@@ -1,6 +1,6 @@
-//! The pointwise kernels (`elemwise.binary`, `silu`, `tanh`, `cast`) on the
-//! first Vulkan device against an f64 host reference, over even and odd
-//! counts.
+//! The pointwise kernels (`elemwise.binary`, `silu`, `tanh`, `gelu`,
+//! `snake`, `cast`) on the first Vulkan device against an f64 host
+//! reference, over even and odd counts.
 
 use crate::gpu::{Gpu, bf16, close, noise, widen};
 use kernels_slang::Tensor;
@@ -89,6 +89,105 @@ fn the_pointwise_kernels_answer_the_reference() {
                 .zip(&xr)
                 .all(|(g, w)| g.to_bits() == w.to_bits()),
             "the cast lands on the host's bf16 rounding"
+        );
+    }
+}
+
+/// erf by its Maclaurin series, near-exact over the test's inputs.
+fn erf(x: f64) -> f64 {
+    if x.abs() > 6.0 {
+        return x.signum();
+    }
+    let (mut term, mut sum) = (x, x);
+    for n in 1..200 {
+        term *= -x * x / f64::from(n);
+        sum += term / f64::from(2 * n + 1);
+    }
+    sum * 2.0 / std::f64::consts::PI.sqrt()
+}
+
+/// GELU exact and tanh-approximated, and SnakeBeta with per-channel logs, in
+/// place over a tensor, a sentinel past it left alone.
+#[test]
+fn the_gelus_and_snake_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let exact = |v: f64| 0.5 * v * (1.0 + erf(v / std::f64::consts::SQRT_2));
+    let approx = |v: f64| {
+        let c = (2.0 / std::f64::consts::PI).sqrt();
+        0.5 * v * (1.0 + (c * (v + 0.044715 * v * v * v)).tanh())
+    };
+    for (rows, width) in [(3usize, 64usize), (5, 1000), (3, 7)] {
+        let n = rows * width;
+        let bt = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16);
+        let ft = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::F32);
+        let shape = format!("{rows} x {width}");
+        let mut xv: Vec<f32> = noise(width as u64 + 50, n)
+            .iter()
+            .map(|v| v * 3.0)
+            .collect();
+        xv.push(7.0);
+        let (_, xr) = gpu.up(&xv);
+        let keep = |mut v: Vec<f64>| {
+            v[n] = 7.0;
+            v
+        };
+        for (tanh, f) in [(false, &exact as &dyn Fn(f64) -> f64), (true, &approx)] {
+            let (x, _) = gpu.up(&xv);
+            gpu.run(|k| kernels_slang::elemwise::pointwise::gelu(k, bt(x), tanh));
+            let want = keep(xr.iter().map(|v| f(f64::from(*v))).collect());
+            close(
+                &gpu.down(x, n + 1),
+                &want,
+                &format!("gelu (tanh {tanh}) bf16 {shape}"),
+            );
+            let x = gpu.up_f32(&xv);
+            gpu.run(|k| kernels_slang::elemwise::pointwise::gelu(k, ft(x), tanh));
+            let want = keep(xv.iter().map(|v| f(f64::from(*v))).collect());
+            close(
+                &gpu.down_f32(x, n + 1),
+                &want,
+                &format!("gelu (tanh {tanh}) f32 {shape}"),
+            );
+        }
+
+        let alpha: Vec<f32> = noise(width as u64 + 51, width)
+            .iter()
+            .map(|v| v * 0.5)
+            .collect();
+        let beta: Vec<f32> = noise(width as u64 + 52, width)
+            .iter()
+            .map(|v| v * 0.5)
+            .collect();
+        let (a, b) = (gpu.up_f32(&alpha), gpu.up_f32(&beta));
+        let at = |buf: u32| Tensor::new(buf, 1, width as u32, Dtype::F32);
+        let snake = |v: f64, c: usize| {
+            let s = (v * f64::from(alpha[c]).exp()).sin();
+            v + s * s / (f64::from(beta[c]).exp() + 1e-9)
+        };
+        let (x, _) = gpu.up(&xv);
+        gpu.run(|k| kernels_slang::elemwise::pointwise::snake(k, bt(x), at(a), at(b)));
+        let want = keep(
+            xr.iter()
+                .enumerate()
+                .map(|(i, v)| snake(f64::from(*v), i % width))
+                .collect(),
+        );
+        close(&gpu.down(x, n + 1), &want, &format!("snake bf16 {shape}"));
+        let x = gpu.up_f32(&xv);
+        gpu.run(|k| kernels_slang::elemwise::pointwise::snake(k, ft(x), at(a), at(b)));
+        let want = keep(
+            xv.iter()
+                .enumerate()
+                .map(|(i, v)| snake(f64::from(*v), i % width))
+                .collect(),
+        );
+        close(
+            &gpu.down_f32(x, n + 1),
+            &want,
+            &format!("snake f32 {shape}"),
         );
     }
 }

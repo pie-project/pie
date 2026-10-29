@@ -1,7 +1,8 @@
 //! Dense matmuls (`linear.matmul`, `linear.matmul` over a bf16 weight, and
 //! an f32 activation's lane form). SPIR-V fires `kernels/linear/gemm.slang`
 //! (the vector kernels below four rows, the tiled kernel or its
-//! cooperative-matrix tier above) and `gemm_lane.slang` for f32
+//! cooperative-matrix tier above; `gemm_register.slang`'s from 96 rows
+//! without one) and `gemm_lane.slang` for f32
 //! activations; WGSL fires `gemm_pairs.slang`, which lands column pairs as
 //! words (its vector kernel at the subgroup tier where the device has one).
 
@@ -19,6 +20,12 @@ const LANE: &str = "linear/gemm_lane.slang";
 
 /// Rows below this take the vector kernels.
 const VECTOR_MAX_ROWS: u32 = 4;
+
+const REGISTER: &str = "linear/gemm_register.slang";
+
+/// Fewer rows leave most of a register tile idle; SPIR-V's 32 x 32 tile
+/// serves them.
+const RT_MIN_ROWS: u32 = 96;
 
 /// Rows below this take WGSL's 16-row tile.
 const NARROW_MAX_ROWS: u32 = 48;
@@ -80,6 +87,23 @@ pub fn act_x_wt(
                 .tier(Tier::Coopmat)
                 .groups([n.div_ceil(64), m.div_ceil(64), 1])
                 .group([32, 4, 1])
+        }
+        // Sixty-four columns a tile at eight a lane, or thirty-two at four
+        // when that leaves none idle.
+        Target::Spirv if m >= RT_MIN_ROWS && k.is_multiple_of(16) => {
+            let (entry, cols, per) = if n.is_multiple_of(32) && !n.is_multiple_of(64) {
+                ("linear_gemm_register_bn_32_bf16", 32, 4)
+            } else {
+                ("linear_gemm_register_bf16", 64, 8)
+            };
+            let (tx, ty) = (cols / per, 256 / (cols / per));
+            let tiles = m.div_ceil(ty * 8);
+            if tiles > 65_535 {
+                return Err(refuse(op, format!("the grid will not launch: {m} rows")));
+            }
+            Fire::at(REGISTER, entry)
+                .groups([n.div_ceil(cols) * tx, tiles * ty, 1])
+                .group([tx, ty, 1])
         }
         Target::Spirv => Fire::at(GEMM, "linear_gemm_tiled_bf16")
             .groups([n.div_ceil(32), m.div_ceil(32), 1])

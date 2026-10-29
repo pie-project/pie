@@ -43,6 +43,8 @@ pub struct ConvShape {
     pub pad_back: [u32; 3],
     pub causal_t: bool,
     pub time_pad: TimePad,
+    pub dilation: [u32; 3],
+    pub depthwise: bool,
 }
 
 impl ConvShape {
@@ -55,6 +57,8 @@ impl ConvShape {
             pad_back: [0, pad[0], pad[1]],
             causal_t: false,
             time_pad: TimePad::Zero,
+            dilation: [1, 1, 1],
+            depthwise: false,
         }
     }
 
@@ -67,6 +71,8 @@ impl ConvShape {
             pad_back: pad,
             causal_t: false,
             time_pad: TimePad::Zero,
+            dilation: [1, 1, 1],
+            depthwise: false,
         }
     }
 
@@ -81,10 +87,37 @@ impl ConvShape {
         ConvShape::conv3d([3, 3, 3], [1, 1, 1], [1, 1, 1])
     }
 
+    /// The taps spaced `dilation` apart; a causal conv's front pad follows.
+    #[must_use]
+    pub const fn dilated(mut self, dilation: [u32; 3]) -> ConvShape {
+        self.dilation = dilation;
+        if self.causal_t {
+            self.pad[0] = (self.k[0] - 1) * dilation[0];
+        }
+        self
+    }
+
+    /// Each channel convolved alone.
+    #[must_use]
+    pub const fn depthwise(mut self) -> ConvShape {
+        self.depthwise = true;
+        self
+    }
+
+    /// The kernel's extent along each axis, its taps spread by `dilation`.
+    #[must_use]
+    pub const fn spread(&self) -> [u32; 3] {
+        [
+            (self.k[0] - 1) * self.dilation[0] + 1,
+            (self.k[1] - 1) * self.dilation[1] + 1,
+            (self.k[2] - 1) * self.dilation[2] + 1,
+        ]
+    }
+
     #[must_use]
     pub const fn causal(mut self, time_pad: TimePad) -> ConvShape {
         self.causal_t = true;
-        self.pad[0] = self.k[0] - 1;
+        self.pad[0] = (self.k[0] - 1) * self.dilation[0];
         self.pad_back[0] = 0;
         self.time_pad = time_pad;
         self
@@ -98,7 +131,7 @@ impl ConvShape {
     #[must_use]
     pub const fn rule(&self) -> GridRule {
         GridRule::Conv {
-            k: self.k,
+            k: self.spread(),
             stride: self.stride,
             pad: self.pad,
             pad_back: self.pad_back,
@@ -136,12 +169,19 @@ pub fn conv3d(
     expect_grid("`conv::conv3d`'s grid", grid);
     assert_eq!(x.dtype(), Dtype::Bf16, "`conv::conv3d` reads bf16 rows");
     let taps = conv.taps();
-    // A convolution reads its weight taps major, `c_in` channels minor: the
-    // order its kernels walk, which a package need not state.
-    let laid = ParamLayout::ConvTapsMajor {
-        c_in: x.width() as u32,
-        taps,
-    };
+    // A convolution reads its weight taps major, `c_in` channels minor (one
+    // channel a row for a depthwise one): the order its kernels walk, which a
+    // package need not state.
+    let c_in = if conv.depthwise { 1 } else { x.width() as u32 };
+    assert!(
+        !conv.depthwise || w.dim(0) == x.width(),
+        "`{}` convolves {} channels each alone and `{}` holds {} rows",
+        "conv::conv3d",
+        x.width(),
+        w.name,
+        w.dim(0)
+    );
+    let laid = ParamLayout::ConvTapsMajor { c_in, taps };
     assert!(
         w.layout == ParamLayout::Natural || w.layout == laid,
         "`{}` is laid {:?}; this convolution reads it {laid:?}",
@@ -153,12 +193,12 @@ pub fn conv3d(
         ..w.clone()
     };
     assert!(
-        w.shape.len() == 2 && w.shape[1] == x.width() * u64::from(taps),
+        w.shape.len() == 2 && w.shape[1] == u64::from(c_in) * u64::from(taps),
         "`{}` is {:?}; `[C_out, {}·{taps}]` is what {} input channels convolve through",
         w.name,
         w.shape,
-        x.width(),
-        x.width()
+        c_in,
+        c_in
     );
     if let Some(b) = bias {
         assert!(
@@ -192,6 +232,8 @@ pub fn conv3d(
             pad_back: conv.pad_back,
             causal_t: conv.causal_t,
             time_pad: conv.time_pad,
+            dilation: conv.dilation,
+            depthwise: conv.depthwise,
             cache,
             y_grid: y_grid.id(),
             y: y.id(),

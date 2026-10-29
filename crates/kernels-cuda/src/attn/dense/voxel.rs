@@ -11,7 +11,9 @@ const OP: &str = "attn.voxel";
 
 const BLOCK: u32 = 128;
 
-const WIDTHS: [(u32, u32); 4] = [(256, 4), (512, 2), (640, 1), (1024, 1)];
+/// The row widths a unit is stamped at, and the queries a warp holds: an
+/// audio encoder's heads (64, 128) beside a VAE's and a vision tower's.
+const WIDTHS: [(u32, u32); 6] = [(64, 8), (128, 4), (256, 4), (512, 2), (640, 1), (1024, 1)];
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Segment {

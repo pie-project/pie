@@ -1095,17 +1095,30 @@ impl Run<'_> {
                 scale: None,
                 act: poem_ir::ActFn::Gelu { tanh, .. },
                 ..
-            } => {
-                if !*tanh {
-                    return Err(kernels_cuda::Error::Backend {
-                        op: "elemwise.act",
-                        detail: "the erf gelu has no CUDA entry; the tanh approximation \
-                                 (`gelu(x, tanh = true)`) is what every DiT under study runs"
-                            .to_string(),
-                    });
-                }
+            } if *tanh => {
                 elemwise::pointwise::gelu_tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*x))
             }
+            #[cfg(not(feature = "rocm"))]
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Gelu { .. },
+                ..
+            } => elemwise::pointwise::gelu(self.ctx(), self.tensor(*x), &mut self.tensor(*x)),
+            #[cfg(not(feature = "rocm"))]
+            Elemwise::Snake {
+                x,
+                alpha,
+                beta,
+                x_out: _,
+            } => elemwise::pointwise::snake(
+                self.ctx(),
+                self.tensor(*alpha),
+                self.tensor(*beta),
+                &mut self.tensor(*x),
+            ),
             Elemwise::Act {
                 x,
                 x_out: _,
@@ -1124,6 +1137,8 @@ impl Run<'_> {
             } => elemwise::pointwise::sqrt(self.ctx(), self.tensor(*x), &mut self.tensor(*x)),
             // The forms no builder makes.
             Elemwise::Act { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            #[cfg(feature = "rocm")]
+            Elemwise::Snake { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Elemwise::Hadamard { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Elemwise::Binary {
                 x,

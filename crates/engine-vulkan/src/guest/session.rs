@@ -114,6 +114,11 @@ struct Stage {
     dirty: Vec<(u64, u64)>,
 }
 
+/// The cells of channels the device keeps between fires, by channel: one
+/// set for the engine, so a pass reads what another program's pass kept.
+pub type Kept =
+    Arc<std::sync::Mutex<std::collections::HashMap<engine::channel::ChannelId, Buffer>>>;
+
 pub struct Session {
     core: Arc<Core>,
 
@@ -121,8 +126,9 @@ pub struct Session {
     stages: Vec<Stage>,
     pool: vk::DescriptorPool,
 
-    /// The cells of channels the device keeps between fires, by channel.
-    kept: std::collections::HashMap<u32, Buffer>,
+    kept: Kept,
+    /// The engine's channel behind each of the program's.
+    channels: Vec<engine::channel::ChannelId>,
 
     /// Passes submitted and not yet waited on, oldest first.
     airborne: std::collections::VecDeque<Pending>,
@@ -150,6 +156,8 @@ impl Session {
         code: &[crate::guest::Lowered],
         extents: &Extents,
         built: &mut BuiltStages,
+        kept: Kept,
+        channels: Vec<engine::channel::ChannelId>,
     ) -> Result<Session> {
         if code.len() != plans.len() {
             return Err(Fault::Program {
@@ -210,7 +218,8 @@ impl Session {
             status,
             stages,
             pool,
-            kept: std::collections::HashMap::new(),
+            kept,
+            channels,
             airborne: std::collections::VecDeque::new(),
             landings: Arc::default(),
         };
@@ -375,14 +384,15 @@ impl Session {
             at: "guest::session",
             why: format!("value {value} is not stage {stage}'s"),
         })?;
-        if self
+        let id = self.channel(channel)?;
+        let mut kept = self
             .kept
-            .get(&channel)
-            .is_none_or(|cell| cell.bytes() < len)
-        {
-            self.kept.insert(channel, Buffer::zeroed(device, len)?);
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kept.get(&id).is_none_or(|cell| cell.bytes() < len) {
+            kept.insert(id, Buffer::zeroed(device, len)?);
         }
-        frame.copy(&self.stages[stage].heap, at, &self.kept[&channel], 0, len)
+        frame.copy(&self.stages[stage].heap, at, &kept[&id], 0, len)
     }
 
     /// A read-back buffer of its own for a pass that lands after the next
@@ -422,10 +432,29 @@ impl Session {
         self.status.clone()
     }
 
+    /// The engine's id of the program's `channel`.
+    fn channel(&self, channel: u32) -> Result<engine::channel::ChannelId> {
+        self.channels
+            .get(channel as usize)
+            .copied()
+            .ok_or_else(|| Fault::Program {
+                at: "guest::session",
+                why: format!(
+                    "channel {channel} is past the {} this instance binds",
+                    self.channels.len()
+                ),
+            })
+    }
+
     /// The device cell a kept channel holds.
     #[must_use]
-    pub fn kept_cell(&self, channel: u32) -> Option<&Buffer> {
-        self.kept.get(&channel)
+    pub fn kept_cell(&self, channel: u32) -> Option<Buffer> {
+        let id = self.channels.get(channel as usize)?;
+        self.kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
     }
 
     pub fn depart(&mut self, pending: Pending) {
@@ -445,13 +474,18 @@ impl Session {
 
     #[must_use]
     pub fn keeps(&self, channel: u32) -> bool {
-        self.kept.contains_key(&channel)
+        self.kept_cell(channel).is_some()
     }
 
     /// Drops the device's cell for `channel`, so the next take reads the
     /// ring, which the host has written.
     pub fn forget(&mut self, channel: u32) {
-        self.kept.remove(&channel);
+        if let Some(id) = self.channels.get(channel as usize) {
+            self.kept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(id);
+        }
     }
 
     /// Copies `channel`'s kept cell into `value`; false when the device keeps
@@ -463,14 +497,14 @@ impl Session {
         value: u32,
         channel: u32,
     ) -> Result<bool> {
-        let Some(cell) = self.kept.get(&channel) else {
+        let Some(cell) = self.kept_cell(channel) else {
             return Ok(false);
         };
         let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
             at: "guest::session",
             why: format!("value {value} is not stage {stage}'s"),
         })?;
-        frame.copy(cell, 0, &self.stages[stage].heap, at, len.min(cell.bytes()))?;
+        frame.copy(&cell, 0, &self.stages[stage].heap, at, len.min(cell.bytes()))?;
         Ok(true)
     }
 
