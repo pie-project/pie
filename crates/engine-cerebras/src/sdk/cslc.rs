@@ -12,7 +12,11 @@
 //!   `/cb/toolchains/cslang/rel-sdk-*/*/bin/cslc`);
 //! - the `python` switch: the interpreter (default
 //!   `/python/python-x86_64/bin/python3`);
-//! - the `sdk_lib` switch: shared with [`super::Sdk`] (default `/cbcore/lib`).
+//! - the `sdk_lib` switch: shared with [`super::Sdk`] (default `/cbcore/lib`;
+//!   its parent is the image's `/cbcore`);
+//! - the `cslang_root` switch: where the default `cslc` is looked for.
+//!
+//! A memcpy program's fabric is [`memcpy_fabric`]'s halo around it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -76,11 +80,12 @@ impl Compile {
         h: u32,
         out: impl Into<PathBuf>,
     ) -> Self {
+        let (fabric_dims, fabric_offsets) = memcpy_fabric(w, h);
         Compile {
             arch,
             layout: layout.into(),
-            fabric_dims: (w + 7, h + 2),
-            fabric_offsets: (4, 1),
+            fabric_dims,
+            fabric_offsets,
             params: Vec::new(),
             memcpy: true,
             // One channel a row: host copies stream in parallel down the rows.
@@ -288,8 +293,17 @@ impl Cslc {
     }
 }
 
+/// The smallest fabric a memcpy program of `w` x `h` PEs fits, and its
+/// offset: the memcpy layouts take 7 extra columns and 2 extra rows, the
+/// program placed at (4, 1).
+#[must_use]
+pub fn memcpy_fabric(w: u32, h: u32) -> ((u32, u32), (u32, u32)) {
+    ((w + 7, h + 2), (4, 1))
+}
+
 fn default_frontend() -> Result<PathBuf, Error> {
-    let root = Path::new("/cb/toolchains/cslang");
+    let root = crate::switches::get("cslang_root").map_or_else(|| PathBuf::from("/cb/toolchains/cslang"), PathBuf::from);
+    let root = root.as_path();
     let mut found = Vec::new();
     for release in read_dirs(root) {
         for build in read_dirs(&release) {

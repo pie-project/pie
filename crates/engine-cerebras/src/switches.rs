@@ -60,7 +60,12 @@ pub const SWITCHES: &[Switch] = &[
     switch("cslc", "PIE_CEREBRAS_CSLC", "the cslc front-end script"),
     switch("python", "PIE_CEREBRAS_PYTHON", "the python cslc runs under"),
     switch("compile_timeout", "PIE_CEREBRAS_COMPILE_TIMEOUT", "seconds a cslc compile may take"),
-    switch("fabric_run", "PIE_CEREBRAS_FABRIC_RUN", "a wrapper the fabric runner runs through (the SDK loader)"),
+    switch("fabric_run", "PIE_CEREBRAS_FABRIC_RUN", "the fabric-run binary (default: next to the executable)"),
+    switch("loader", "PIE_CEREBRAS_LOADER", "a program the fabric runner is started through (the SDK's glibc loader wrapper)"),
+    switch("cslang_root", "PIE_CEREBRAS_CSLANG_ROOT", "where cslc releases are found (default /cb/toolchains/cslang)"),
+    // Device facts no SDK call reports (the runtime has no query for them).
+    switch("wafer_dims", "PIE_CEREBRAS_WAFER_DIMS", "a system's whole fabric, `WxH` (default by target)"),
+    switch("pe_bytes", "PIE_CEREBRAS_PE_BYTES", "one PE's memory in bytes (default 48 KiB)"),
 ];
 
 /// Environment-only debug output: dumps and traces, none of which changes a

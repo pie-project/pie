@@ -307,7 +307,7 @@ pub struct Served {
 
 impl Served {
     fn spawn(runner: &Path, dir: &Path, target: &str) -> Result<Served> {
-        let mut child = std::process::Command::new(runner)
+        let mut child = runner_command(runner)
             .arg("--serve")
             .arg(dir)
             .arg(target)
@@ -498,10 +498,11 @@ impl Device {
         &self.platform
     }
 
-    /// Device memory: one PE's 48 KB, until placement spans a rectangle.
+    /// Device memory: one PE's (48 KiB, or the `pe_bytes` switch), until
+    /// placement spans a rectangle.
     #[must_use]
     pub fn memory(&self) -> Option<u64> {
-        Some(48 << 10)
+        Some(crate::switches::parse("pe_bytes").unwrap_or(48 << 10))
     }
 
     /// Lands `bytes` (the dtype's host storage form) as a `[rows, width]`
@@ -1535,7 +1536,7 @@ fn run_once(runner: &Path, dir: &Path, spec_path: &Path, scratch: &Path, at: usi
     loop {
         attempt += 1;
         let _ = std::fs::remove_file(&sim_log);
-        let mut child = std::process::Command::new(runner)
+        let mut child = runner_command(runner)
             .arg(dir)
             .arg(spec_path)
             .stdout(std::process::Stdio::null())
@@ -4080,11 +4081,32 @@ fn target_name(target: Target) -> &'static str {
     }
 }
 
-/// The fabric a system program is compiled against: the whole wafer.
+/// The fabric a system program is compiled against: the whole wafer (the
+/// `wafer_dims` switch, `WxH`, else the target's; the SDK runtime reports
+/// no fabric size).
 pub(crate) fn wafer_dims(target: Target) -> (u32, u32) {
+    if let Some((w, h)) = crate::switches::get("wafer_dims").and_then(|v| {
+        let (w, h) = v.split_once(['x', 'X'])?;
+        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+    }) {
+        return (w, h);
+    }
     match target {
         Target::Wse2 => (757, 996),
         Target::Wse3 => (762, 1172),
+    }
+}
+
+/// The fabric runner's command: through the `loader` switch's program when
+/// set (the SDK's glibc loader wrapper), else the runner itself.
+fn runner_command(runner: &Path) -> std::process::Command {
+    match crate::switches::get("loader") {
+        Some(loader) => {
+            let mut cmd = std::process::Command::new(loader);
+            cmd.arg(runner);
+            cmd
+        }
+        None => std::process::Command::new(runner),
     }
 }
 

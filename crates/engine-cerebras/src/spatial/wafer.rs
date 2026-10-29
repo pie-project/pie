@@ -457,12 +457,8 @@ const SOURCES: [(&str, &str); 8] = [
 pub fn compile(params: &str, target: crate::sdk::Target, system: bool) -> R<PathBuf> {
     use crate::sdk::{Arch, Compile, Cslc};
     let lay = Layout::parse(params)?;
-    let fabric_dims = if system {
-        crate::device::wafer_dims(target)
-    } else {
-        ((lay.width + 7) as u32, (lay.height + 2) as u32)
-    };
-    let fabric_offsets = (4, 1);
+    let (fabric_dims, fabric_offsets) = crate::sdk::cslc::memcpy_fabric(lay.width as u32, lay.height as u32);
+    let fabric_dims = if system { crate::device::wafer_dims(target) } else { fabric_dims };
     let mut key = blake3::Hasher::new();
     for (name, text) in SOURCES {
         key.update(name.as_bytes()).update(&[0]).update(text.as_bytes()).update(&[0]);

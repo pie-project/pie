@@ -504,8 +504,8 @@ pub fn compile(design: Design, params: &[(String, String)], target: crate::sdk::
     use crate::sdk::{Arch, Compile, Cslc};
     let files = design.files()?;
     let (w, h) = rectangle(design, params)?;
-    let fabric_dims = if system { crate::device::wafer_dims(target) } else { (w + 7, h + 2) };
-    let fabric_offsets = (4, 1);
+    let (fabric_dims, fabric_offsets) = crate::sdk::cslc::memcpy_fabric(w, h);
+    let fabric_dims = if system { crate::device::wafer_dims(target) } else { fabric_dims };
     let fabric = format!("{fabric_dims:?}|{fabric_offsets:?}|{target:?}|{system}");
     let hex = key(&files, params, &fabric);
     let dir = crate::device::disk_cache().join(format!("{}-{}", design.name(), &hex[..32]));
