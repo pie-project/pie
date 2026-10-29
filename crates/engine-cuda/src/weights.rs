@@ -1154,6 +1154,7 @@ impl Weights {
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
         let mut done = 0;
+        let mut budget = crate::device::free_bytes().unwrap_or(0) / 8;
         for node in &trace.nodes {
             let Operation::Linear(Linear::Matmul {
                 w,
@@ -1182,6 +1183,11 @@ impl Weights {
             }
             let (n, k) = (codes.rows, codes.width);
             let gran = k.div_ceil(atoms.width);
+            let bytes = u64::from(n) * u64::from(k) * 2;
+            if bytes > budget {
+                continue;
+            }
+            budget -= bytes;
             let buffer = Buffer::zeroed_on(stream, n as usize * k as usize * 2)?;
             // A plane the widen does not read (K not whole blocks) keeps no
             // copy: its rows stay on the W8A16 kernels.
