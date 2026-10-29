@@ -17,6 +17,8 @@ TOKENIZER = tokenizer(markers = [["<turn|>", "<eos>"]], parts = {"vision": [["<|
 MODELS = [
     model("gemma4-26b-a4b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["mtp", "dflash"], arch = "gemma4", layers = 30, vocab = 262144),
     model("gemma4-31b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["mtp"], arch = "gemma4", layers = 60, vocab = 262144),
+    model("gemma4-26b-a4b-mini-e64", mini = True, template = GEMMA_THOUGHT, tokenizer = TOKENIZER, arch = "gemma4", layers = 30, vocab = 262144),
+    model("gemma4-31b-mini-l30", mini = True, template = GEMMA_THOUGHT, tokenizer = TOKENIZER, arch = "gemma4", layers = 30, vocab = 262144),
     model("gemma4-12b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, arch = "gemma4", layers = 48, vocab = 262144),
     model("gemma4-e2b", template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 35, vocab = 262144),
     model("gemma4-e4b", template = GEMMA, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["eagle"], arch = "gemma4", layers = 42, vocab = 262144),
@@ -46,6 +48,8 @@ DEPLOYMENTS = [
     deployment("gemma4-e4b", weights = BF, kv = BF, drafter = "eagle"),
     deployment("gemma4-e4b", weights = BF, kv = BF),
     deployment("gemma4-31b", weights = BF, kv = BF),
+    deployment("gemma4-26b-a4b-mini-e64", weights = BF, kv = BF),
+    deployment("gemma4-31b-mini-l30", weights = BF, kv = BF),
     deployment("gemma4-e4b-mini-l1", weights = BF, kv = BF),
     deployment("gemma4-e4b-mini-l6", weights = BF, kv = BF),
     deployment("gemma4-e4b-mini-l24", weights = BF, kv = BF),
@@ -119,13 +123,21 @@ def e4b(layers):
 E2B = trunk(hidden = 1536, layers = 35, q_heads = 8, kv_heads = 1, global_kv_heads = 1, inter = 6144,
             window = 512, shared_tail = 20, ple_dim = 256, full_every = 5, wide_tail = True)
 
-A4B = trunk(hidden = 2816, layers = 30, q_heads = 16, kv_heads = 8, global_kv_heads = 2, inter = 2112,
-            window = 1024, moe = struct(experts = 128, top_k = 8, inter = 704))
+def a4b(experts):
+    return trunk(hidden = 2816, layers = 30, q_heads = 16, kv_heads = 8, global_kv_heads = 2, inter = 2112,
+                 window = 1024, moe = struct(experts = experts, top_k = 8, inter = 704))
+
+A4B = a4b(128)
+
+def g31b(layers):
+    return trunk(hidden = 5376, layers = layers, q_heads = 32, kv_heads = 16, global_kv_heads = 4,
+                 inter = 21504, window = 1024)
 
 TRUNKS = {
     "gemma4-26b-a4b": A4B,
-    "gemma4-31b": trunk(hidden = 5376, layers = 60, q_heads = 32, kv_heads = 16, global_kv_heads = 4,
-                        inter = 21504, window = 1024),
+    "gemma4-26b-a4b-mini-e64": a4b(64),
+    "gemma4-31b": g31b(60),
+    "gemma4-31b-mini-l30": g31b(30),
     "gemma4-12b": trunk(hidden = 3840, layers = 48, q_heads = 16, kv_heads = 8, global_kv_heads = 1,
                         inter = 15360, window = 1024),
     "gemma4-e2b": E2B,
