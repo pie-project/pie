@@ -554,15 +554,16 @@ impl KvStore {
         self.split_persisted();
         let mut freed = 0;
         for (key, ids) in self.reclaim_order(&keys) {
+            let before = freed;
             freed += self.settle_on_disk(&ids, key, &keys, epoch);
-            if freed == 0 {
+            if freed == before {
                 let ids = ids
                     .into_iter()
                     .filter(|id| !self.cache.get(id).is_some_and(|e| self.persisted_whole(e)))
                     .collect();
                 freed += self.drop_entries(ids, By::Host, epoch);
             }
-            if freed > 0 {
+            if freed >= (self.pool.capacity() as usize / 64).max(1) {
                 break;
             }
         }
