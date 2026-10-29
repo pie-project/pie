@@ -1127,8 +1127,41 @@ impl Spatial {
             .map(|c| c.id)
             .collect();
         let name = self.readout.as_ref().map_or("", |(n, _)| n.as_str());
-        let built = guest4::translate(&plan, vocab, &host_takes, GUEST_REGS, GUEST_POOL)
-            .and_then(|table| guest4::lane::Program::of(&plan, table, name));
+        let build = |sink: bool| {
+            guest4::translate_sinking(&plan, vocab, &host_takes, GUEST_REGS, GUEST_POOL, sink)
+                .and_then(|table| guest4::lane::Program::of(&plan, table, name))
+        };
+        // The wafer VM's pool, when the model has one: a table whose pool
+        // overruns it (or any pool limit) is translated again with the big
+        // logits-free arrays sunk into main, whose words are then live only
+        // while main runs.
+        let vm_pool = match &self.daemon {
+            Some(Model::Wafer(w)) => w.vm.map(|(lay, _)| lay.pool_words as u32),
+            _ => None,
+        };
+        let mut built = build(false);
+        let over = match &built {
+            Ok(guest) => vm_pool.is_some_and(|words| guest.table.pool_words > words),
+            Err(why) => why.contains("pool words"),
+        };
+        if over {
+            let sunk = build(true);
+            let better = match (&sunk, &built) {
+                (Ok(s), Ok(b)) => s.table.pool_words < b.table.pool_words,
+                (Ok(_), Err(_)) => true,
+                _ => false,
+            };
+            tracing::info!(
+                program = program.0,
+                pool = built.as_ref().map_or(0, |g| g.table.pool_words),
+                sunk_pool = sunk.as_ref().map_or(0, |g| g.table.pool_words),
+                taken = better,
+                "spatial guest: the pool overruns; translated again with logits-free arrays sunk into main"
+            );
+            if better {
+                built = sunk;
+            }
+        }
         match built {
             Ok(guest) => {
                 tracing::info!(

@@ -117,6 +117,13 @@ struct Tr<'a> {
     pool_top: u32,
     /// The most pool words ever in use (pool_top falls as the top is freed).
     pool_hi: u32,
+    /// A second pass's pool offsets, one per allocation in order (planned
+    /// offline from the first pass's lifetimes).
+    plan_at: Option<Vec<u32>>,
+    /// Every pool allocation: [words, first instruction, release instruction
+    /// (u32::MAX: never)], in order.
+    pool_log: Vec<[u32; 3]>,
+    sid_alloc: BTreeMap<usize, usize>,
     nreg_used: u32,
     remat: bool,
     /// Integer values known at translation time (constants, iotas, sums).
@@ -154,7 +161,12 @@ impl Tr<'_> {
         Ok(Loc { kind: Kind::Wide(r), n: 1, dtype, sid, rows: 1 })
     }
     fn pool(&mut self, n: u32, dtype: Dtype) -> Result<Loc, String> {
-        let at = if let Some(i) = self.free_pool.iter().position(|&(_, w)| w >= n) {
+        let idx = self.pool_log.len();
+        let planned = self.plan_at.as_ref().map(|p| p[idx]);
+        let at = if let Some(o) = planned {
+            self.pool_hi = self.pool_hi.max(o + n);
+            o
+        } else if let Some(i) = self.free_pool.iter().position(|&(_, w)| w >= n) {
             let (o, w) = self.free_pool[i];
             if w == n {
                 self.free_pool.remove(i);
@@ -171,6 +183,8 @@ impl Tr<'_> {
             self.pool_top - n
         };
         let sid = self.new_storage(Kind::Pool(at), n, false);
+        self.pool_log.push([n, self.ins.len() as u32, u32::MAX]);
+        self.sid_alloc.insert(sid, idx);
         Ok(Loc { kind: Kind::Pool(at), n, dtype, sid, rows: 1 })
     }
     fn release(&mut self, sid: usize) {
@@ -190,7 +204,12 @@ impl Tr<'_> {
             Kind::Wide(r) => self.free_regs.push(r),
             Kind::Pool(o) => {
                 let n = s.n;
-                self.free_pool_range(o, n);
+                if let Some(&i) = self.sid_alloc.get(&sid) {
+                    self.pool_log[i][2] = self.ins.len() as u32;
+                }
+                if self.plan_at.is_none() {
+                    self.free_pool_range(o, n);
+                }
             }
             Kind::Remat(..) | Kind::Group(_) => {}
         }
@@ -287,7 +306,8 @@ impl Tr<'_> {
 }
 
 /// Eta's epilogue stage of `plan` as a guest4 table. `host_takes`: the
-/// channels the host takes each step.
+/// channels the host takes each step. Sinks big logits-free pool arrays into
+/// main when `ETAGEN_SINK` is set ([`translate_sinking`]).
 pub fn translate(
     plan: &ExecPlan,
     vocab: u32,
@@ -295,13 +315,66 @@ pub fn translate(
     max_reg: u32,
     max_pool: u32,
 ) -> Result<Table, String> {
-    match translate_with(plan, vocab, host_takes, max_reg, max_pool, false) {
-        Err(e) if e.contains("live wide values") => {
-            translate_with(plan, vocab, host_takes, max_reg, max_pool, true)
-                .map_err(|e2| format!("{e2} (also with draws re-made at their readers)"))
-        }
-        other => other,
+    translate_sinking(plan, vocab, host_takes, max_reg, max_pool, std::env::var("ETAGEN_SINK").is_ok())
+}
+
+/// [`translate`] with `sink` chosen by the caller: logits-free pool arrays
+/// of 64+ words move from the pre section into main (their pool words are
+/// then live only while main runs).
+pub fn translate_sinking(
+    plan: &ExecPlan,
+    vocab: u32,
+    host_takes: &[u32],
+    max_reg: u32,
+    max_pool: u32,
+    sink: bool,
+) -> Result<Table, String> {
+    let first = |remat: bool, cap: u32| translate_with(plan, vocab, host_takes, max_reg, cap, remat, None, sink);
+    // Pass 1 places the pool first-fit as it goes (unbounded, to learn every
+    // value's lifetime); pass 2 places it from those lifetimes offline.
+    let (remat, (t1, log)) = match first(false, u32::MAX) {
+        Err(e) if e.contains("live wide values") => (true, first(true, u32::MAX)
+            .map_err(|e2| format!("{e2} (also with draws re-made at their readers)"))?),
+        Err(e) => return Err(e),
+        Ok(r) => (false, r),
+    };
+    let plan_at = plan_pool(&log);
+    let best = match translate_with(plan, vocab, host_takes, max_reg, u32::MAX, remat, Some(plan_at), sink) {
+        Ok((t2, _)) if t2.pool_words <= t1.pool_words => t2,
+        _ => t1,
+    };
+    if best.pool_words > max_pool {
+        return Err(format!("more than {max_pool} pool words"));
     }
+    Ok(best)
+}
+
+/// Offline pool placement: values in order of size (largest first), each at
+/// the lowest offset free of every placed value whose lifetime overlaps.
+fn plan_pool(log: &[[u32; 3]]) -> Vec<u32> {
+    let mut order: Vec<usize> = (0..log.len()).collect();
+    order.sort_by_key(|&i| (std::cmp::Reverse(log[i][0]), log[i][1]));
+    let mut at = vec![0u32; log.len()];
+    let mut placed: Vec<usize> = Vec::new();
+    for &i in &order {
+        let [n, s, e] = log[i];
+        let mut busy: Vec<(u32, u32)> = placed
+            .iter()
+            .filter(|&&j| s < log[j][2] && log[j][1] < e)
+            .map(|&j| (at[j], at[j] + log[j][0]))
+            .collect();
+        busy.sort();
+        let mut o = 0;
+        for (lo, hi) in busy {
+            if o + n <= lo {
+                break;
+            }
+            o = o.max(hi);
+        }
+        at[i] = o;
+        placed.push(i);
+    }
+    at
 }
 
 fn translate_with(
@@ -311,7 +384,9 @@ fn translate_with(
     max_reg: u32,
     max_pool: u32,
     remat: bool,
-) -> Result<Table, String> {
+    plan_at: Option<Vec<u32>>,
+    sink: bool,
+) -> Result<(Table, Vec<[u32; 3]>), String> {
     let pkg = &plan.package;
     let sp = plan
         .stages
@@ -340,8 +415,10 @@ fn translate_with(
     let mut order_pre = Vec::new();
     let mut order_main = Vec::new();
     for op in &ops {
+        let big = |id: u32| sink && pkg.values[id as usize].shape.iter().product::<u32>().max(1) >= 64;
         let dep = op.reads().any(|a| main.contains(&a))
-            || (wide_of(op.result_id) && op.tag != tags::RNG_KEYED);
+            || (wide_of(op.result_id) && op.tag != tags::RNG_KEYED)
+            || (big(op.result_id) && !wide_of(op.result_id));
         if dep {
             for k in 0..op.result_count.max(1) as u32 {
                 main.insert(op.result_id + k);
@@ -377,6 +454,9 @@ fn translate_with(
         free_pool: Vec::new(),
         pool_top: 0,
         pool_hi: 0,
+        plan_at: plan_at.clone(),
+        pool_log: Vec::new(),
+        sid_alloc: BTreeMap::new(),
         nreg_used: 1,
         remat,
         known: BTreeMap::new(),
@@ -564,7 +644,8 @@ fn translate_with(
         })
         .map(|h| h.chan)
         .collect();
-    Ok(Table {
+    let pool_log = t.pool_log;
+    Ok((Table {
         ins: t.ins,
         pre_len,
         homes,
@@ -576,7 +657,7 @@ fn translate_with(
         pool_words: t.pool_hi,
         feat,
         remat,
-    })
+    }, pool_log))
 }
 
 /// A WBIN right after the WFILL of one of its operands takes the filled pool
