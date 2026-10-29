@@ -188,8 +188,9 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
     constexpr int kPasses = kSlice / kRowStep;
     static_assert(kPasses * kRowStep == kSlice, "the slice stages in whole passes");
 
-    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
-    const int item = work[blockIdx.x];
+    const int at = static_cast<int>(act_div == 1 ? blockIdx.y : blockIdx.x);
+    if (at >= offsets[num_experts + 1]) return;
+    const int item = work[at];
     const int expert = item >> 16;
     const int slice = item & 0xFFFF;
     const int begin = offsets[expert] + slice * kSlice;
@@ -201,7 +202,7 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
     const int lane = tid & 31;
     const int g = lane >> 2;
     const int c = lane & 3;
-    const int row_base = static_cast<int>(blockIdx.y) * kRowsCta + warp * kRowsWarp;
+    const int row_base = static_cast<int>(act_div == 1 ? blockIdx.x : blockIdx.y) * kRowsCta + warp * kRowsWarp;
     const int span = kGlu != 0 ? inter : n;
     auto tile_row = [&](int t) { return kGlu != 0 ? row_base + t * inter : row_base + 16 * t; };
     // A warp past the bank's rows still stages its share of the routes.

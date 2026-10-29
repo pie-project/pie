@@ -261,7 +261,17 @@ pub(super) fn select_mxfp4_mma(
             SELECT_FP4_SM80,
             &format!("::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}>"),
         ))
-        .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(STAGES * 8 * nb * 16 * 16))
+        .apply(
+            Launch::grid(
+                if act_div == 1 {
+                    [grid[1], grid[0], 1]
+                } else {
+                    grid
+                },
+                [THREADS, 1, 1],
+            )
+            .smem(STAGES * 8 * nb * 16 * 16),
+        )
     } else {
         let depth = MMA_DEPTH;
         // A fire of few CTAs (a decode's routes) splits K across groups of
