@@ -153,6 +153,7 @@ pub fn select_fp8_w8a8(
         17..=40 => 4,
         _ => 8,
     };
+    let wn: u32 = if nb == 8 { 2 } else { 1 };
     let RouteOrder {
         order,
         offsets,
@@ -176,10 +177,10 @@ pub fn select_fp8_w8a8(
         OP,
         Fire::at(kernel(
             SELECT_SM80,
-            &format!("::pie::linear::moe_select_fp8a8_mma<{nb}, false>"),
+            &format!("::pie::linear::moe_select_fp8a8_mma<{nb}, false, {wn}>"),
         ))
         .apply(
-            Launch::grid([work_cap, y.width.div_ceil(128), 1], [128, 1, 1]).smem(fp8_mma_smem(nb)),
+            Launch::grid([work_cap, y.width.div_ceil(128), 1], [128 * wn, 1, 1]).smem(fp8_mma_smem(nb)),
         ),
         &[
             ArgValue::Ptr(xq),
@@ -312,7 +313,7 @@ pub fn select_fp8_w8a16(
     glu: Option<crate::linear::gemm_sm100::Glu>,
 ) -> Result<(), Error> {
     const THREADS: u32 = 128;
-    const DEPTH: u32 = 2;
+    const DEPTH: u32 = 4;
     let fan = selected(op, x, routes, y)?;
     if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
         return Err(refuse(op, "a W8A16 select reads and lands bf16 rows"));
