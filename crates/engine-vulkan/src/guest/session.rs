@@ -385,10 +385,7 @@ impl Session {
             why: format!("value {value} is not stage {stage}'s"),
         })?;
         let id = self.channel(channel)?;
-        let mut kept = self
-            .kept
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut kept = self.kept.lock().expect("kept cells lock poisoned");
         if kept.get(&id).is_none_or(|cell| cell.bytes() < len) {
             kept.insert(id, Buffer::zeroed(device, len)?);
         }
@@ -452,7 +449,7 @@ impl Session {
         let id = self.channels.get(channel as usize)?;
         self.kept
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("kept cells lock poisoned")
             .get(id)
             .cloned()
     }
@@ -483,7 +480,7 @@ impl Session {
         if let Some(id) = self.channels.get(channel as usize) {
             self.kept
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("kept cells lock poisoned")
                 .remove(id);
         }
     }
@@ -504,7 +501,13 @@ impl Session {
             at: "guest::session",
             why: format!("value {value} is not stage {stage}'s"),
         })?;
-        frame.copy(&cell, 0, &self.stages[stage].heap, at, len.min(cell.bytes()))?;
+        frame.copy(
+            &cell,
+            0,
+            &self.stages[stage].heap,
+            at,
+            len.min(cell.bytes()),
+        )?;
         Ok(true)
     }
 

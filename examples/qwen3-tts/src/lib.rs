@@ -256,8 +256,14 @@ impl Voice {
         let channels = self.decode.width("audio")?;
         let out = Channel::new([samples, 1], dtype::f32);
         pass.epilogue(move || {
-            let all = reshape(intrinsics::output_rows(0, "audio", samples), [samples * channels]);
-            out.put(reshape(gather(&all, iota(samples) * channels), [samples, 1]));
+            let all = reshape(
+                intrinsics::output_rows(0, "audio", samples),
+                [samples * channels],
+            );
+            out.put(reshape(
+                gather(&all, iota(samples) * channels),
+                [samples, 1],
+            ));
         });
         pass.submit(pipe).context("the codec decode")?;
         let wave: Vec<f32> = out.take_host::<Vec<f32>>().await?;
@@ -606,7 +612,12 @@ fn draw_books(
     greedy: bool,
     seed: u32,
 ) -> Result<(ForwardPass, ForwardPass)> {
-    let first = kv.pass(&Channel::from([ZERO as i32]), 1, 0, &[("seed", &links.seed)])?;
+    let first = kv.pass(
+        &Channel::from([ZERO as i32]),
+        1,
+        0,
+        &[("seed", &links.seed)],
+    )?;
     let settled = Channel::new([1], dtype::f32).queued();
     let books = kv.lane.width("logits")?;
     first.epilogue(move || {

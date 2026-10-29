@@ -309,7 +309,13 @@ impl Lane {
 }
 
 /// One pass of a voxel reading over the clip `x`, `rows` rows read out.
-async fn voxels(lane: &Lane, output: &'static str, x: Channel, rows: u32, pipe: &Pipeline) -> Result<Vec<f32>> {
+async fn voxels(
+    lane: &Lane,
+    output: &'static str,
+    x: Channel,
+    rows: u32,
+    pipe: &Pipeline,
+) -> Result<Vec<f32>> {
     let width = lane.width(output)?;
     let pass = lane.pass()?;
     pass.input(0, &lane.input(model::InputAxis::Voxel)?.name, &x)?;
@@ -412,19 +418,20 @@ impl Kv {
         let to = from + tokens.len() as u32;
         let kv_len = Channel::from([to]);
         let slots = Channel::from_iter(from..to);
-        let lane = if audio.is_some() { &self.heard } else { &self.text };
+        let lane = if audio.is_some() {
+            &self.heard
+        } else {
+            &self.text
+        };
         let pass = lane.pass()?;
         if lane.decl.embeds {
-            let toks = Channel::from_iter(tokens.iter().map(|&t| t as i32))
-                ;
-            let indptr =
-                Channel::from([0u32, tokens.len() as u32]);
+            let toks = Channel::from_iter(tokens.iter().map(|&t| t as i32));
+            let indptr = Channel::from([0u32, tokens.len() as u32]);
             pass.embed(&toks, &indptr)?;
         }
         if let Some(rows) = audio {
             let input = lane.input(model::InputAxis::Row)?;
-            let x = Channel::from_shaped([tokens.len() as u32, input.width], rows)
-                ;
+            let x = Channel::from_shaped([tokens.len() as u32, input.width], rows);
             pass.input(0, &input.name, &x)?;
         }
         pass.state(
@@ -438,9 +445,9 @@ impl Kv {
         )?;
         let next = sample.then(|| Channel::new([1], dtype::i32));
         match next {
-            Some(out) => {
-                pass.epilogue(move || out.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1])))
-            }
+            Some(out) => pass.epilogue(move || {
+                out.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]))
+            }),
             // A fire with nothing to sample still runs a stage.
             None => {
                 let done = Channel::new([1], dtype::u32);
@@ -459,7 +466,6 @@ fn one(text: &str) -> Result<u32> {
         ids => Err(format!("`{text}` encodes to {ids:?}, not one marker")),
     }
 }
-
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {

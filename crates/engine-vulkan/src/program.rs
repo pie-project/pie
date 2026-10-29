@@ -139,7 +139,7 @@ impl Plane {
         #[cfg(feature = "vulkan")]
         self.kept
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("kept cells lock poisoned")
             .remove(&id);
         self.channels
             .remove(&id)
