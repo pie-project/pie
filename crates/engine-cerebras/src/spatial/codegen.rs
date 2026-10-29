@@ -264,6 +264,15 @@ fn after_each_call(s: &str, call: &str, extra: &str) -> (String, usize) {
     (out, n)
 }
 
+/// The names a layout exports (`@export_name("n", ...)`), in order.
+fn layout_exports(layout: &str) -> Vec<String> {
+    layout
+        .split("@export_name(")
+        .skip(1)
+        .filter_map(|rest| rest.trim_start().strip_prefix('"')?.split_once('"').map(|(n, _)| n.to_string()))
+        .collect()
+}
+
 // ---------------------------------------------------------------- serve2d
 
 const COPY_FNS: &str = "fn copy_page(src: u32, dst: u32) void { sys_mod.unblock_cmd_stream(); }\n\
@@ -1143,6 +1152,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every data `@export_name` of a layout before its first function one
+    /// (`init`, `compute`, the copy and staging launches): memcpy's symbol
+    /// lookup then stays data; a data name declared after a function turns it
+    /// into code (~0.8 KB a PE, as measured on serve8b_region). The programs'
+    /// own export order does not matter.
+    #[test]
+    fn layouts_declare_data_before_functions() {
+        let late = |layout: &str| -> Vec<String> {
+            let mut seen_fn = false;
+            let mut late = Vec::new();
+            for rest in layout.split("@export_name(").skip(1) {
+                let Some((name, after)) = rest.trim_start().strip_prefix('"').and_then(|r| r.split_once('"')) else {
+                    continue;
+                };
+                if after.trim_start_matches([',', ' ']).starts_with("fn(") {
+                    seen_fn = true;
+                } else if seen_fn {
+                    late.push(name.to_string());
+                }
+            }
+            late
+        };
+        for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b, Design::Serve8bRegion] {
+            let files = d.files().unwrap();
+            let layout = &files.iter().find(|f| f.0 == "layout.csl").unwrap().1;
+            assert!(!layout_exports(layout).is_empty(), "{}", d.name());
+            assert_eq!(late(layout), Vec::<String>::new(), "{}: data exports after a function", d.name());
+        }
+        assert_eq!(late("@export_name(\"init\", fn()void);\n@export_name(\"x\", [*]f32, true);"), ["x"]);
     }
 
     #[test]
