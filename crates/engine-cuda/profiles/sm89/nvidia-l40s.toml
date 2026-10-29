@@ -17,6 +17,8 @@ elemwise.rows_vec = true
 sdpa.merge_warp = true
 sdpa.pool_mma = true
 sdpa.selected_mma = true
+moe.bf16_mma_from = 16
+moe.bf16_mma_until = 65536
 [engine]
 forward_tokens = 2048
 
