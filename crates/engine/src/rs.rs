@@ -13,7 +13,6 @@ pub struct LanePlan {
     pub replay: u32,
     pub commit: u32,
     pub gather: Option<Run>,
-    pub gathers: Vec<Run>,
     pub scatter: Option<Run>,
 }
 
@@ -44,11 +43,15 @@ impl LanePlan {
                  into its buffer"
             )));
         }
+        let replay = first - folded;
         let reads = buffered_reads(mask, *folded, first, rows)?;
-        let replay: u32 = reads
-            .iter()
-            .map(|r| u32::try_from(r.len()).unwrap_or(0))
-            .sum();
+        if reads.iter().map(ExactSizeIterator::len).sum::<usize>() != replay as usize {
+            return Err(Error::Invalid(
+                "its mask hides buffered slots its recurrent layers would replay; this \
+                 engine replays the buffer whole"
+                    .into(),
+            ));
+        }
         let fold = match fold {
             FoldLen::Host(n) => *n,
             FoldLen::Device => device_fold.ok_or_else(|| {
@@ -59,27 +62,15 @@ impl LanePlan {
                 )
             })?,
         };
-        let to = folded.saturating_add(fold).min(first + rows);
-        let below: u32 = reads
-            .iter()
-            .map(|span| span.end.min(to).saturating_sub(span.start))
-            .sum();
-        let commit = below + to.saturating_sub(first).min(rows);
         let at = first - base;
-        let gathers: Vec<Run> = reads
-            .into_iter()
-            .filter(|span| !span.is_empty())
-            .map(|span| Run {
-                pages: pages.clone(),
-                from: span.start - base,
-                count: span.end - span.start,
-            })
-            .collect();
         Ok(LanePlan {
             replay,
-            commit,
-            gather: gathers.first().cloned(),
-            gathers,
+            commit: fold.min(replay.saturating_add(rows)),
+            gather: (replay > 0).then(|| Run {
+                pages: pages.clone(),
+                from: at - replay,
+                count: replay,
+            }),
             scatter: (rows > 0).then(|| Run {
                 pages: pages.clone(),
                 from: at,

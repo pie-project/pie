@@ -344,7 +344,7 @@ impl WindowMap {
                 continue;
             };
             let begin = map.from_buffer.len() as i32;
-            for run in &plan.gathers {
+            if let Some(run) = &plan.gather {
                 for t in 0..run.count {
                     map.from_buffer.push(1);
                     map.buffer_row.push(locate(run, run.from + t)?);
@@ -364,11 +364,7 @@ impl WindowMap {
                 }
             }
         }
-        let ext = map.from_buffer.len().max(16).next_power_of_two();
-        map.from_buffer.resize(ext, 0);
-        map.buffer_row.resize(ext, 0);
-        map.own_row.resize(ext, 0);
-        map.rows_ext = ext as u32;
+        map.rows_ext = map.from_buffer.len() as u32;
         Ok(map)
     }
 }

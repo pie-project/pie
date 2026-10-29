@@ -1350,7 +1350,7 @@ impl Shell {
                 }
                 rs_active = true;
             }
-            let mut rs_plan = engine::rs::LanePlan::of(
+            let rs_plan = engine::rs::LanePlan::of(
                 seated.rs,
                 row.rows,
                 seated.first.unwrap_or(have),
@@ -1361,27 +1361,6 @@ impl Shell {
                 at: "serve::rs",
                 why: format!("lane {}: {error}", row.source),
             })?;
-            if rs_plan.commit == 0 && rs_plan.replay > 2 {
-                let mut rem = 2u32;
-                let mut trimmed = Vec::new();
-                for run in rs_plan.gathers.into_iter().rev() {
-                    if rem == 0 {
-                        break;
-                    }
-                    let take = run.count.min(rem);
-                    let skip = run.count - take;
-                    trimmed.push(engine::rs::Run {
-                        pages: run.pages,
-                        from: run.from + skip,
-                        count: take,
-                    });
-                    rem -= take;
-                }
-                trimmed.reverse();
-                rs_plan.replay = 2 - rem;
-                rs_plan.gather = trimmed.first().cloned();
-                rs_plan.gathers = trimmed;
-            }
             rs_plans.push(rs_plan);
             slot_ids.push(state_slot as i32);
             if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
