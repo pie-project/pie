@@ -111,7 +111,7 @@ def layout(id, deploy):
     dense = compute(weights)
     # The release's FP8 qkv kept as stored, its heads 192 (values 128) wide:
     # the attention prologue lays them 256 wide.
-    unpadded = weights == dtype.e4m3g128a8
+    unpadded = weights in [dtype.e4m3g128a8, dtype.bf16]
     hidden = d.hidden
     q_w = d.q_heads * PADDED
 
@@ -329,7 +329,7 @@ def qkv(m, reads, at, name):
     head = lambda start, rows: readable(reads, at.qkv, name, (start, rows), chunks = m.shards)
     parts = []
     for start, rows in starts:
-        parts += [head(start, rows), pad(d - rows)]
+        parts += [head(start, rows)] if m.unpadded else [head(start, rows), pad(d - rows)]
     reads.push(tensor(at.qkv.name, concat(0, parts), encoding(at.qkv.dtype), shape = at.qkv.shape))
 
 def packed_bank(reads, w, stems):
