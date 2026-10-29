@@ -9,6 +9,11 @@ device = "NVIDIA L40S"
 [kernel]
 gemm.rows_m = 16
 sdpa.pool_mma = true
+sdpa.index_mma = true
+sdpa.index_radix = true
+sdpa.selected_mma = true
+[engine]
+forward_tokens = 2048
 
 [provenance]
 measured = [
@@ -37,8 +42,12 @@ measured = [
   "kernel.sdpa.decode.split_window",
   "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.pool_mma",
+  "kernel.sdpa.index_mma",
+  "kernel.sdpa.index_radix",
   "kernel.sdpa.prefill.ctas_per_sm",
+  "kernel.sdpa.selected_mma",
   "engine.copies",
+  "engine.forward_tokens",
   "engine.graphs",
   "engine.lattice_steps",
   "engine.recording",
