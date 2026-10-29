@@ -1162,9 +1162,15 @@ ready_age_newest={}us",
             self.idle_dumped = false;
             self.quiesce_mark = None;
             if !executing && self.is_joining() && self.have_seal_candidate() {
-                let until = *self.join_hold.get_or_insert(now + Duration::from_micros(JOIN_HOLD_US));
+                let until = *self
+                    .join_hold
+                    .get_or_insert(now + Duration::from_micros(JOIN_HOLD_US));
                 if now < until {
-                    return FramePlan::Hold(until.saturating_duration_since(now).min(Duration::from_micros(GATHER_POLL_US)));
+                    return FramePlan::Hold(
+                        until
+                            .saturating_duration_since(now)
+                            .min(Duration::from_micros(GATHER_POLL_US)),
+                    );
                 }
             }
             self.join_hold = None;

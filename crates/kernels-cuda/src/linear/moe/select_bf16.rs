@@ -281,7 +281,11 @@ pub fn select_bf16_held(
         const STAGES: u32 = 3;
         const WN: u32 = 2;
         let cols = if glu.is_some() { 64 } else { 128 };
-        let bm: u32 = if fan.route_count.div_ceil(experts) >= 128 { 128 } else { 64 };
+        let bm: u32 = if fan.route_count.div_ceil(experts) >= 128 {
+            128
+        } else {
+            64
+        };
         if bm != 64 {
             order = route_order_sliced(ctx, op, routes, &fan, experts, bm, true, Share::No)?;
         }
