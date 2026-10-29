@@ -481,7 +481,7 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_fp8_mma(
 /// 16-byte chunks turned by its low three bits so a quarter-warp's reads
 /// span the banks. Each lane reads K 16c..16c+15 of its rows a stage, the
 /// order inside the 64 permuted alike for both operands.
-template <int kStages, int kGlu, int kWN>
+template <int kStages, int kGlu, int kWN, bool kColsFast = false>
 __global__ void __launch_bounds__(64 * kWN) moe_select_bf16_gemm(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
@@ -508,8 +508,9 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_bf16_gemm(
     constexpr int kACopies = kBM * 8 / kThreads;
     constexpr int kBCopies = kBN * 8 / kThreads;
 
-    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
-    const int item = work[blockIdx.x];
+    const int cta = kColsFast ? static_cast<int>(blockIdx.y) : static_cast<int>(blockIdx.x);
+    if (cta >= offsets[num_experts + 1]) return;
+    const int item = work[cta];
     const int expert = item >> 16;
     const int slice = item & 0xFFFF;
     const int begin = offsets[expert] + slice * kBM;
@@ -524,7 +525,7 @@ __global__ void __launch_bounds__(64 * kWN) moe_select_bf16_gemm(
     const int g = lane >> 2;
     const int t = lane & 3;
     // The CTA's first output column: 64 GLU columns, else 128 rows.
-    const int c0 = static_cast<int>(blockIdx.y) * (kGlu != 0 ? 64 : kBN);
+    const int c0 = static_cast<int>(kColsFast ? blockIdx.x : blockIdx.y) * (kGlu != 0 ? 64 : kBN);
     // Local B row -> bank row: a GLU warp's half-tile of gate columns, then
     // their up.
     auto bank_row = [&](int rr) {
