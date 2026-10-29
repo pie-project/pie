@@ -15,7 +15,7 @@
 //! the pass it waits on. A fire whose `embed_tokens` cell is still in
 //! flight reads it on the device, straight out of the pass's output (a
 //! scatter into its input pack); any other port that reads an in-flight
-//! cell waits for it to land. `PIE_CEREBRAS_SYNC=1` settles every frame inside
+//! cell waits for it to land. The `sync` switch (1) settles every frame inside
 //! `submit`, for an A/B.
 #![allow(unsafe_code)]
 
@@ -121,10 +121,10 @@ struct StepSettle {
     policies: Vec<Readout>,
 }
 
-/// `PIE_CEREBRAS_SYNC=1`: every frame settles inside `submit`.
+/// The `sync` switch (1): every frame settles inside `submit`.
 fn synchronous() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_CEREBRAS_SYNC").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| crate::switches::on("sync"))
 }
 
 impl Cerebras {

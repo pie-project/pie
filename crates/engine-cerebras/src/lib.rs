@@ -31,6 +31,7 @@ pub mod serve;
 pub mod settle;
 pub mod spatial;
 pub mod store;
+pub mod switches;
 pub mod trace;
 pub mod weights;
 pub mod window;

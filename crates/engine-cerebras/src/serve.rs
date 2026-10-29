@@ -2516,15 +2516,15 @@ pub struct TokenFeed {
     pub words: Vec<u32>,
 }
 
-/// `PIE_CEREBRAS_TIMING=1` prints where each fire's host time goes.
-/// `PIE_CEREBRAS_SHAPE_CHECK=1`: trace every fire a shape key would skip and
+/// The `timing` switch (1) prints where each fire's host time goes.
+/// The `shape_check` switch (1): trace every fire a shape key would skip and
 /// log when the two programs differ.
 fn shape_check() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PIE_CEREBRAS_SHAPE_CHECK").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::switches::get("shape_check").is_some_and(|v| v == "1"))
 }
 
-/// When `PIE_CEREBRAS_TIMING` lines count their `at` from.
+/// When the `timing` switch's lines count their `at` from.
 fn timing_epoch() -> &'static std::time::Instant {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     EPOCH.get_or_init(std::time::Instant::now)
@@ -2532,5 +2532,5 @@ fn timing_epoch() -> &'static std::time::Instant {
 
 pub(crate) fn timing() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_CEREBRAS_TIMING").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| crate::switches::on("timing"))
 }

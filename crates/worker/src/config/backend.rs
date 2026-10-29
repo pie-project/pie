@@ -220,6 +220,10 @@ pub struct CerebrasEngineOptions {
     /// Used when neither `spatial_program` nor `spatial_params` is set; the
     /// compile is cached, so later starts reuse it.
     pub spatial_serve: Option<toml::Table>,
+    /// The engine's switches (`[cerebras.switches]`: placement, serving,
+    /// toolchain; `engine-cerebras` `switches`), each winning over its old
+    /// `PIE_CEREBRAS_*` variable.
+    pub switches: Option<toml::Table>,
 }
 
 impl Default for CerebrasEngineOptions {
@@ -242,6 +246,7 @@ impl Default for CerebrasEngineOptions {
             spatial_ckpt: None,
             spatial_layers: None,
             spatial_serve: None,
+            switches: None,
         }
     }
 }

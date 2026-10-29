@@ -872,6 +872,14 @@ pub(crate) fn create_engine_backend(
                     boot_doc.push_str(&format!("layers = {layers}\n"));
                 }
             }
+            if let Some(switches) = &opts.switches {
+                let mut cerebras = toml::Table::new();
+                cerebras.insert("switches".into(), toml::Value::Table(switches.clone()));
+                let mut doc = toml::Table::new();
+                doc.insert("cerebras".into(), toml::Value::Table(cerebras));
+                boot_doc.push('\n');
+                boot_doc.push_str(&toml::to_string(&doc)?);
+            }
             if let Some(serve) = &opts.spatial_serve {
                 // Nested under [cerebras.spatial.serve], its own sub-tables too.
                 let mut spatial = toml::Table::new();

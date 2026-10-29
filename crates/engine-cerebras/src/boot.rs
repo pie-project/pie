@@ -34,6 +34,7 @@ fn parse(config_bytes: &[u8]) -> Result<toml::Table, String> {
     {
         crate::device::set_cache_dir(dir.into());
     }
+    crate::switches::init(table(&doc).and_then(|t| t.get("switches")).and_then(toml::Value::as_table))?;
     Ok(doc)
 }
 

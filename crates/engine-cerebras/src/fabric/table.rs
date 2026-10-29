@@ -421,7 +421,7 @@ impl Program {
             .sum::<u64>()
             + u64::from(tables.iter().map(|t| t.ops_words).max().unwrap_or(1));
         let fixed = lines_of(kernels_cerebras::library::prelude()) + 60;
-        let forced = std::env::var("PIE_CEREBRAS_WHOLE_FIRE").is_ok_and(|v| v == "force");
+        let forced = crate::switches::get("whole_fire").is_some_and(|v| v == "force");
         for (g, row) in rows.iter().enumerate() {
             let helpers: u64 = self
                 .helpers_for(&row.body)

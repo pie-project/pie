@@ -20,7 +20,7 @@
 //! ```
 //!
 //! No container, PRoot or environment variables are needed after that.
-//! [`Sdk::open`] looks for the libraries in `$PIE_CEREBRAS_SDK_LIB`, then
+//! [`Sdk::open`] looks for the libraries in the `sdk_lib` switch, then
 //! `/cbcore/lib`, and prepends the sibling `bin/` directory to `PATH` because
 //! the runtime shells out to helpers such as `cself_default`.
 //!
@@ -134,9 +134,9 @@ pub struct Sdk {
 }
 
 impl Sdk {
-    /// Default library directory: `$PIE_CEREBRAS_SDK_LIB` or `/cbcore/lib`.
+    /// Default library directory: the `sdk_lib` switch, or `/cbcore/lib`.
     pub fn default_lib_dir() -> PathBuf {
-        std::env::var_os("PIE_CEREBRAS_SDK_LIB")
+        crate::switches::get("sdk_lib")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/cbcore/lib"))
     }

@@ -8,11 +8,11 @@
 //!
 //! Locations come from the environment when set, otherwise from the
 //! standard image layout:
-//! - `PIE_CEREBRAS_CSLC`: the front-end script (default: the single
+//! - the `cslc` switch: the front-end script (default: the single
 //!   `/cb/toolchains/cslang/rel-sdk-*/*/bin/cslc`);
-//! - `PIE_CEREBRAS_PYTHON`: the interpreter (default
+//! - the `python` switch: the interpreter (default
 //!   `/python/python-x86_64/bin/python3`);
-//! - `PIE_CEREBRAS_SDK_LIB`: shared with [`super::Sdk`] (default `/cbcore/lib`).
+//! - the `sdk_lib` switch: shared with [`super::Sdk`] (default `/cbcore/lib`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -132,10 +132,10 @@ pub struct Cslc {
 impl Cslc {
     /// Finds the compiler from the environment or the standard image layout.
     pub fn find() -> Result<Self, Error> {
-        let python = std::env::var_os("PIE_CEREBRAS_PYTHON")
+        let python = crate::switches::get("python")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/python/python-x86_64/bin/python3"));
-        let frontend = match std::env::var_os("PIE_CEREBRAS_CSLC") {
+        let frontend = match crate::switches::get("cslc") {
             Some(p) => PathBuf::from(p),
             None => default_frontend()?,
         };
@@ -233,14 +233,11 @@ impl Cslc {
         }
         cmd.env_remove("PYTHONHOME").env_remove("VIRTUAL_ENV");
 
-        // The compiler is bounded (`PIE_CEREBRAS_COMPILE_TIMEOUT` seconds,
+        // The compiler is bounded (the `compile_timeout` switch, seconds;
         // 1800 by default): a hung front end or linker must not hold a
         // fire forever.
         let timeout = std::time::Duration::from_secs(
-            std::env::var("PIE_CEREBRAS_COMPILE_TIMEOUT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1800),
+            crate::switches::parse("compile_timeout").unwrap_or(1800),
         );
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());

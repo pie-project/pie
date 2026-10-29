@@ -255,7 +255,7 @@ pub struct Device {
 
 /// The resident servers, at most `most` at a time: a simulator that sits
 /// idle still spins, so many of them starve the one at work (on the
-/// simulator; `PIE_CEREBRAS_SERVERS` sets the cap, 4 by default). The least
+/// simulator; the `servers` switch sets the cap, 4 by default). The least
 /// recently used goes when one more is needed.
 #[derive(Default)]
 pub struct Servers {
@@ -265,9 +265,7 @@ pub struct Servers {
 
 impl Servers {
     fn most() -> usize {
-        std::env::var("PIE_CEREBRAS_SERVERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+        crate::switches::parse::<usize>("servers")
             .filter(|v| *v > 0)
             .unwrap_or(4)
     }
@@ -378,11 +376,9 @@ impl Drop for Served {
 }
 
 /// Whether compiled programs stay resident between runs
-/// (`PIE_CEREBRAS_SERVE=0` turns it off).
+/// (the `serve` switch at 0 turns it off).
 fn serving() -> bool {
-    std::env::var("PIE_CEREBRAS_SERVE")
-        .ok()
-        .is_none_or(|v| v != "0")
+    crate::switches::get("serve").is_none_or(|v| v != "0" && v != "false")
 }
 
 impl std::fmt::Debug for Device {
@@ -723,7 +719,7 @@ impl Device {
         // `PIE_CEREBRAS_SERVE_ALL=1` keeps every program resident, the
         // model's phases included (an experiment: a phase must then leave
         // its scratch as it found it).
-        let all = std::env::var("PIE_CEREBRAS_SERVE_ALL").is_ok_and(|v| v != "0");
+        let all = crate::switches::on("serve_all");
         let servers = ((resident || all) && cmaddr.is_none() && serving()).then_some(&self.servers);
         let persistent: std::collections::HashSet<String> = sig
             .params
@@ -747,7 +743,7 @@ impl Device {
         );
         if let Err(e) = ran {
             // A failed fire's scratch (specs, inputs) is the replay material.
-            if std::env::var_os("PIE_CEREBRAS_KEEP").is_some() {
+            if crate::switches::get("keep").is_some() {
                 let kept = scratch.keep();
                 eprintln!("kept the failed fire's scratch at {}", kept.display());
             }
@@ -769,7 +765,7 @@ impl Device {
                 })?,
             );
         }
-        if std::env::var_os("PIE_CEREBRAS_KEEP").is_some() {
+        if crate::switches::get("keep").is_some() {
             let kept = scratch.keep();
             tracing::info!(dir = %kept.display(), "kept a fire's scratch directory");
         }
@@ -3719,13 +3715,10 @@ fn simulator_fatal(log: &Path) -> Option<String> {
         .map(|l| l.trim().to_string())
 }
 
-/// How long one phase program may run (`PIE_CEREBRAS_PHASE_TIMEOUT` seconds,
+/// How long one phase program may run (the `phase_timeout` switch, seconds;
 /// default 1800).
 fn phase_timeout() -> std::time::Duration {
-    let secs = std::env::var("PIE_CEREBRAS_PHASE_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(1800);
+    let secs = crate::switches::parse::<u64>("phase_timeout").unwrap_or(1800);
     std::time::Duration::from_secs(secs.max(1))
 }
 
@@ -4101,10 +4094,10 @@ fn io_fault(dir: &Path, e: std::io::Error) -> Fault {
     }
 }
 
-/// The `fabric-run` binary: `$PIE_CEREBRAS_FABRIC_RUN`, or the one next to
+/// The `fabric-run` binary: the `fabric_run` switch, or the one next to
 /// the current executable.
 pub fn fabric_run() -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("PIE_CEREBRAS_FABRIC_RUN") {
+    if let Some(p) = crate::switches::get("fabric_run") {
         return Ok(PathBuf::from(p));
     }
     let exe = std::env::current_exe().map_err(|e| Fault::Unbound {

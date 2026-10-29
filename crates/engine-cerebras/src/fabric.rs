@@ -207,51 +207,39 @@ impl Default for Fabric {
     }
 }
 
-/// The fabric's terms as this process sets them: each from its
-/// environment variable, else the default.
+/// The fabric's terms as this process sets them: each from its switch
+/// ([`crate::switches`]: `[cerebras.switches]`, else the old variable),
+/// else the default.
 ///
-/// - `PIE_CEREBRAS_PE_WORDS`: the data words one phase places on a PE.
-/// - `PIE_CEREBRAS_SHARD_WORDS`: the elements of one buffer a PE holds
+/// - `pe_words`: the data words one phase places on a PE.
+/// - `shard_words`: the elements of one buffer a PE holds
 ///   before it is split (a small budget makes a small model take every
 ///   split form).
-/// - `PIE_CEREBRAS_MAX_PES`: the PEs one phase spreads over (a wafer takes
+/// - `max_pes`: the PEs one phase spreads over (a wafer takes
 ///   hundreds of thousands).
-/// - `PIE_CEREBRAS_RESIDENT_PES=N` (N > 1): the resident placement, every
+/// - `resident_pes=N` (N > 1): the resident placement, every
 ///   phase of a fire on one row of N PEs.
-/// - `PIE_CEREBRAS_FABRIC_SUM=0`: partials add on the host, not the fabric.
-/// - `PIE_CEREBRAS_HALF_WEIGHTS=1`, `PIE_CEREBRAS_HALF_POOL=1`: bf16
+/// - `fabric_sum=0`: partials add on the host, not the fabric.
+/// - `half_weights=1`, `half_pool=1`: bf16
 ///   weights, kv pools, packed two halves a word on the device.
-/// - `PIE_CEREBRAS_ATTN_ROWS`: the most rows one attention phase takes.
+/// - `attn_rows`: the most rows one attention phase takes.
 #[must_use]
 pub fn terms() -> Fabric {
-    let number = |var: &str| {
-        std::env::var(var)
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-    };
-    let on = |var: &str| std::env::var(var).is_ok_and(|v| v != "0");
+    let number = |name: &str| crate::switches::parse::<u64>(name).filter(|v| *v > 0);
+    let on = crate::switches::on;
     let default = Fabric::default();
     Fabric {
-        pe_words: number("PIE_CEREBRAS_PE_WORDS").unwrap_or(default.pe_words),
-        shard_words: number("PIE_CEREBRAS_SHARD_WORDS").unwrap_or(default.shard_words),
-        max_pes: std::env::var("PIE_CEREBRAS_MAX_PES")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
+        pe_words: number("pe_words").unwrap_or(default.pe_words),
+        shard_words: number("shard_words").unwrap_or(default.shard_words),
+        max_pes: crate::switches::parse::<u32>("max_pes")
             .filter(|v| *v > 0)
             .unwrap_or(default.max_pes),
-        resident_pes: std::env::var("PIE_CEREBRAS_RESIDENT_PES")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
+        resident_pes: crate::switches::parse::<u32>("resident_pes")
             .filter(|v| *v > 1),
-        fabric_sum: std::env::var("PIE_CEREBRAS_FABRIC_SUM")
-            .ok()
-            .is_none_or(|v| v != "0"),
-        half_weights: on("PIE_CEREBRAS_HALF_WEIGHTS"),
-        half_pool: on("PIE_CEREBRAS_HALF_POOL"),
-        attn_rows: std::env::var("PIE_CEREBRAS_ATTN_ROWS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
+        fabric_sum: crate::switches::get("fabric_sum").is_none_or(|v| v != "0" && v != "false"),
+        half_weights: on("half_weights"),
+        half_pool: on("half_pool"),
+        attn_rows: crate::switches::parse::<u32>("attn_rows")
             .filter(|v| *v > 0),
     }
 }
@@ -554,28 +542,28 @@ pub struct Manifest {
     pub tables: Vec<Table>,
 }
 
-/// Whether fused programs render table-driven (`PIE_CEREBRAS_TABLE=1`):
+/// Whether fused programs render table-driven (the `table` switch at 1):
 /// one interpreter over the kernels the program uses, the buffers in an
 /// arena at fixed offsets, the phases a table of kernel calls and
 /// collectives the host uploads as data.
 pub fn table_mode() -> bool {
-    std::env::var("PIE_CEREBRAS_TABLE").is_ok_and(|v| v != "0")
+    crate::switches::on("table")
 }
 
 /// Whether a fire renders as one table-driven program over every phase
-/// (`PIE_CEREBRAS_WHOLE_FIRE=1`, with `table_mode` and the resident
+/// (the `whole_fire` switch at 1, with `table_mode` and the resident
 /// placement): the buffers keep one layout across phases, the arena is
 /// allotted by liveness, and the host moves only inputs and outputs.
 pub fn whole_fire() -> bool {
-    table_mode() && std::env::var("PIE_CEREBRAS_WHOLE_FIRE").is_ok_and(|v| v != "0")
+    table_mode() && crate::switches::on("whole_fire")
 }
 
 /// Whether kv pools stay on the device between fires
-/// (`PIE_CEREBRAS_KEEP_POOLS=1`, with a whole-fire program of one unified
+/// (the `keep_pools` switch at 1, with a whole-fire program of one unified
 /// shape on a resident server): kept like the weights, their page moves
 /// becoming table rows the host fills per fire.
 pub fn keep_pools() -> bool {
-    whole_fire() && std::env::var("PIE_CEREBRAS_KEEP_POOLS").is_ok_and(|v| v != "0")
+    whole_fire() && crate::switches::on("keep_pools")
 }
 
 /// Rows a kept-pool program reserves at the table's start for the fire's
@@ -1349,7 +1337,7 @@ impl Program {
     /// the same way, carry no lane plan, and fit a PE together: a fused
     /// group runs its functions in sequence, so a buffer one writes and
     /// the next reads stays on the PE instead of crossing the host twice
-    /// (`PIE_CEREBRAS_FUSE=0` keeps every phase apart).
+    /// (the `fuse` switch at 0 keeps every phase apart).
     fn fused_phases(&self) -> Vec<Vec<&Phase>> {
         self.fused_phases_with(0)
     }
@@ -1357,9 +1345,7 @@ impl Program {
     /// The fused groups when every group also carries `extra` data words
     /// (a whole fire's kept slots, the same on every row).
     pub(crate) fn fused_phases_with(&self, extra: u64) -> Vec<Vec<&Phase>> {
-        let fuse = std::env::var("PIE_CEREBRAS_FUSE")
-            .ok()
-            .is_none_or(|v| v != "0");
+        let fuse = crate::switches::get("fuse").is_none_or(|v| v != "0" && v != "false");
         let exports = self.exports();
         let mut groups: Vec<Vec<&Phase>> = Vec::new();
         let words_of = |group: &[&Phase]| -> u64 {

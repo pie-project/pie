@@ -1100,8 +1100,8 @@ impl Spatial {
             );
             let (ran, argmax) = self.daemon()?.greedy(cache, tokens, start, steps)?;
             self.ahead_runs += 1;
-            if std::env::var_os("PIE_SPATIAL_TRACE").is_some() {
-                eprintln!(
+            if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
+                tracing::debug!(target: "spatial_trace",
                     "spatial-trace token loop: {} run(s), {} row(s) answered from them",
                     self.ahead_runs, self.ahead_hits
                 );
@@ -1749,9 +1749,9 @@ impl Spatial {
             }
         }
         let lanes = &step.lanes;
-        if std::env::var_os("PIE_SPATIAL_TRACE").is_some() {
+        if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
             for lane in lanes {
-                eprintln!(
+                tracing::debug!(target: "spatial_trace",
                     "spatial-trace lane: slot {} tokens {:?} positions {:?} kv {:?} kv_less {} group {:?} \
                      mask {} readout {:?} rs {:?}",
                     lane.slot,
@@ -1787,8 +1787,8 @@ impl Spatial {
                 else {
                     continue;
                 };
-                if std::env::var_os("PIE_SPATIAL_TRACE").is_some() {
-                    eprintln!(
+                if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
+                    tracing::debug!(target: "spatial_trace",
                         "spatial-trace envelope: slots {:?} positions {:?} kv_len {:?} fold {:?} \
                          qo {:?} mask {}",
                         envelope.slots,
@@ -1827,14 +1827,14 @@ impl Spatial {
                         port_slots.insert(source, slots.to_vec());
                     }
                     if let Some((cells, stride)) = ports.mask(rows).map_err(port_error)? {
-                        if std::env::var_os("PIE_SPATIAL_TRACE").is_some() {
+                        if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
                             let seen: Vec<usize> = cells[..stride]
                                 .iter()
                                 .enumerate()
                                 .filter(|(_, c)| **c)
                                 .map(|(i, _)| i)
                                 .collect();
-                            eprintln!(
+                            tracing::debug!(target: "spatial_trace",
                                 "spatial-trace mask: lane {source} rows {rows} stride {stride} row0 \
                                  sees {seen:?} slots {:?}",
                                 ports.slots(rows).ok().flatten()
@@ -2503,8 +2503,8 @@ impl Engine for Spatial {
 
     fn copy_kv(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<()> {
         copy.validate()?;
-        if std::env::var_os("PIE_SPATIAL_TRACE").is_some() {
-            eprintln!("spatial-trace copy_kv: {copy:?}");
+        if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
+            tracing::debug!(target: "spatial_trace","spatial-trace copy_kv: {copy:?}");
         }
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         if Some(copy.src) != device || Some(copy.dst) != device {
@@ -2620,8 +2620,8 @@ impl Engine for Spatial {
         )?;
         let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
-        if std::env::var_os("PIE_SPATIAL_TRACE").is_some() {
-            eprintln!(
+        if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
+            tracing::debug!(target: "spatial_trace",
                 "spatial-trace frame: {} step(s), attachments {:?}",
                 frame.steps.len(),
                 frame.steps.first().map(|s| s.attachments.len())

@@ -212,12 +212,10 @@ pub struct Lowered {
 /// The data words one PE gives a guest stage: well under the 48 KB a PE
 /// holds, since the stage's code (one function per segment), the
 /// collectives library and the task table share it
-/// (`PIE_CEREBRAS_GUEST_WORDS` overrides it).
+/// (the `guest_words` switch overrides it).
 #[must_use]
 pub fn guest_words() -> u64 {
-    std::env::var("PIE_CEREBRAS_GUEST_WORDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+    crate::switches::parse::<u64>("guest_words")
         .filter(|v| *v > 0)
         .unwrap_or(6200)
 }
