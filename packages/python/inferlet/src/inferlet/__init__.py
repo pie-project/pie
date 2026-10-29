@@ -28,11 +28,12 @@ A Python inferlet is run as source by the Python language component
 
 from __future__ import annotations
 
-from . import chat, eta, grammar, mask, media, model, reasoning, session, tokenizer, tools
+from . import chat, eta, frames, grammar, mask, media, model, reasoning, session, tokenizer, tools
 
 __all__ = [
     "chat",
     "eta",
+    "frames",
     "grammar",
     "mask",
     "media",

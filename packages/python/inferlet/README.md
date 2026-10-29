@@ -34,7 +34,8 @@ async def main(input: dict) -> dict:
 - `inferlet.grammar` / `inferlet.mask`: JSON Schema, regex, and EBNF constraints.
 - `inferlet.chat` / `inferlet.reasoning` / `inferlet.tools`: chat templates, thinking blocks, and tool calls.
 - `inferlet.media`: multimodal image, video, and audio spans.
-- `inferlet.session`: client streaming and messaging.
+- `inferlet.frames`: pictures and sound the host encodes (PNG, WAV, ...).
+- `inferlet.session`: client streaming and messaging, files, and `send_frames` / `send_pcm`.
 
 ## Run & test
 
