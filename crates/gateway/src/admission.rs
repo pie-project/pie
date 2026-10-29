@@ -11,7 +11,7 @@ impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
             kv_saturate_bucket: 240,
-            max_inflight_per_worker: 256,
+            max_inflight_per_worker: 1024,
             max_queued_launches: 4096,
         }
     }
