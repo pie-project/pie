@@ -196,7 +196,18 @@ pub fn select_bf16_held(
     {
         return Ok(false);
     }
+    let relu2 = glu == Some(crate::linear::gemm_sm100::Glu::Relu2);
+    let glu = glu.filter(|_| !relu2);
     let (code, limit, alpha) = glu_code(op, glu)?;
+    let code = if relu2 { 6 } else { code };
+    if relu2
+        && (crate::linear::gemm_sm100::supported()
+            || hopper_wgmma()
+            || fan.route_count < BF16_GEMM_FROM
+            || !x.width.is_multiple_of(64))
+    {
+        return Ok(false);
+    }
     let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
     let experts = experts.clamp(1, EXPERT_CAP);
     let k = stated(op, x.width)?;
@@ -275,6 +286,9 @@ pub fn select_bf16_held(
         // more of them in flight (Hy4's decode +2%).
         8,
     )?;
+    if relu2 && !tiled {
+        return Ok(false);
+    }
     let fire = if tiled {
         // Three stages of 64 routes' and 128 rows' 64 of K, four warps a
         // CTA each 32 routes by 64 rows: two CTAs an SM.

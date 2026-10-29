@@ -525,11 +525,11 @@ __global__ void __launch_bounds__(kBM * kWN) moe_select_bf16_gemm(
     const int g = lane >> 2;
     const int t = lane & 3;
     // The CTA's first output column: 64 GLU columns, else 128 rows.
-    const int c0 = cta % static_cast<int>(gridDim.y) * (kGlu != 0 ? 64 : kBN);
+    const int c0 = cta % static_cast<int>(gridDim.y) * (kGlu != 0 && kGlu != 6 ? 64 : kBN);
     // Local B row -> bank row: a GLU warp's half-tile of gate columns, then
     // their up.
     auto bank_row = [&](int rr) {
-        if constexpr (kGlu != 0) {
+        if constexpr (kGlu != 0 && kGlu != 6) {
             const int w = rr % kWRows;
             const int col = min(c0 + (kWRows / 2) * (rr / kWRows) + (w % (kWRows / 2)), inter - 1);
             return w < kWRows / 2 ? col : inter + col;
@@ -670,7 +670,7 @@ __global__ void __launch_bounds__(kBM * kWN) moe_select_bf16_gemm(
             const int tok = wm * 32 + mt * 16 + g + 8 * hh;
             if (tok >= count) continue;
             const long long route = order[begin + tok];
-            if constexpr (kGlu != 0) {
+            if constexpr (kGlu != 0 && kGlu != 6) {
 #pragma unroll
                 for (int j = 0; j < kNT / 2; ++j)
 #pragma unroll
@@ -686,7 +686,7 @@ __global__ void __launch_bounds__(kBM * kWN) moe_select_bf16_gemm(
 #pragma unroll
                     for (int e = 0; e < 2; ++e) {
                         const int row = c0 + kWRows * wn + 8 * j + 2 * t + e;
-                        if (row < n) out[route * n + row] = f32_to_bf16(acc[mt][j][2 * hh + e]);
+                        if (row < n) out[route * n + row] = f32_to_bf16(kGlu == 6 ? fmaxf(acc[mt][j][2 * hh + e], 0.f) * fmaxf(acc[mt][j][2 * hh + e], 0.f) : acc[mt][j][2 * hh + e]);
                     }
             }
         }
