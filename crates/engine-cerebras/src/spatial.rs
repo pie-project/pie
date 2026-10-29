@@ -103,6 +103,12 @@ pub struct SpatialBoot {
     pub lookahead: Option<usize>,
     pub ckpt: Option<String>,
     pub layers: Option<u32>,
+    /// The guest placement's forecast ([`guest4::cost::Placement`]): the
+    /// model's token in cycles (default: from its parameter count), how
+    /// much of it a table's `pre` may take and `main` may add.
+    pub token_cycles: Option<u64>,
+    pub pre_margin: Option<f64>,
+    pub main_fraction: Option<f64>,
 }
 
 impl SpatialBoot {
@@ -113,6 +119,10 @@ impl SpatialBoot {
             .get("spatial")
             .and_then(toml::Value::as_table)?;
         let text = |k: &str| t.get(k).and_then(toml::Value::as_str).map(str::to_string);
+        let number = |k: &str| {
+            t.get(k)
+                .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+        };
         let (daemon, program, params) = (text("daemon"), text("program"), text("params"));
         if daemon.is_none() && program.is_none() && params.is_none() {
             return None;
@@ -135,6 +145,12 @@ impl SpatialBoot {
                 .get("layers")
                 .and_then(toml::Value::as_integer)
                 .and_then(|v| u32::try_from(v).ok()),
+            token_cycles: t
+                .get("token_cycles")
+                .and_then(toml::Value::as_integer)
+                .and_then(|v| u64::try_from(v).ok()),
+            pre_margin: number("pre_margin"),
+            main_fraction: number("main_fraction"),
         })
     }
 }
@@ -878,6 +894,11 @@ pub struct Spatial {
     /// can run, by program id.
     guest_probed: std::collections::HashSet<u64>,
     guest_programs: std::collections::HashMap<u64, std::sync::Arc<guest4::lane::Program>>,
+    /// Programs the VM could take that the cost forecast keeps on the host,
+    /// and why.
+    guest_costly: std::collections::HashMap<u64, String>,
+    /// The model's parameter count (the forecast's default token time).
+    params: f64,
     /// The guest VM a lane's instance runs on, while it does.
     guest_vms: std::collections::HashMap<InstanceId, guest4::lane::CheckVm>,
     /// The instance whose program the wafer head's VM holds (`guest`
@@ -920,6 +941,8 @@ impl Spatial {
             kv: Kv::default(),
             guest_probed: std::collections::HashSet::new(),
             guest_programs: std::collections::HashMap::new(),
+            guest_costly: std::collections::HashMap::new(),
+            params: 0.0,
             guest_vms: std::collections::HashMap::new(),
             vm_owner: None,
             vm_program: None,
@@ -1200,7 +1223,17 @@ impl Spatial {
                     };
                     match refused {
                         Some(why) => tracing::info!(program = program.0, %why, "spatial guest: the VM cannot take it"),
-                        None => tracing::info!(program = program.0, "spatial guest: the VM can take it"),
+                        None => {
+                            let placement = self.placement();
+                            let f = guest4::cost::forecast(&guest.table, lay.vr as u32);
+                            match placement.refuses(f) {
+                                Some(why) => {
+                                    tracing::info!(program = program.0, %why, pre = f.pre, main = f.main, token = placement.token_cycles, "spatial guest: the VM could take it; the forecast keeps it on the host");
+                                    self.guest_costly.insert(program.0, why);
+                                }
+                                None => tracing::info!(program = program.0, pre = f.pre, main = f.main, token = placement.token_cycles, "spatial guest: the VM can take it"),
+                            }
+                        }
                     }
                 }
                 self.guest_programs.insert(program.0, std::sync::Arc::new(guest));
@@ -1210,6 +1243,35 @@ impl Spatial {
                 %why,
                 "spatial guest: the epilogue stays on the host"
             ),
+        }
+    }
+
+    /// When a table the VM can take runs there: the config's
+    /// `token_cycles`, `pre_margin` and `main_fraction`, else
+    /// `PIE_SPATIAL_TOKEN_CYCLES`, `PIE_SPATIAL_PRE_MARGIN` and
+    /// `PIE_SPATIAL_MAIN_FRACTION`, else the token from the model's size and
+    /// `COVERAGE.md`'s thresholds.
+    fn placement(&self) -> guest4::cost::Placement {
+        fn env<T: std::str::FromStr>(name: &str) -> Option<T> {
+            std::env::var(name).ok().and_then(|v| v.parse().ok())
+        }
+        use guest4::cost::{Placement, token_cycles};
+        Placement {
+            token_cycles: self
+                .spatial
+                .token_cycles
+                .or_else(|| env("PIE_SPATIAL_TOKEN_CYCLES"))
+                .unwrap_or_else(|| token_cycles(self.params)),
+            pre_margin: self
+                .spatial
+                .pre_margin
+                .or_else(|| env("PIE_SPATIAL_PRE_MARGIN"))
+                .unwrap_or(Placement::PRE_MARGIN),
+            main_fraction: self
+                .spatial
+                .main_fraction
+                .or_else(|| env("PIE_SPATIAL_MAIN_FRACTION"))
+                .unwrap_or(Placement::MAIN_FRACTION),
         }
     }
 
@@ -1254,7 +1316,7 @@ impl Spatial {
         let Some(guest) = self.guest_programs.get(&program.0) else {
             return false;
         };
-        if let Some(why) = w.vm_refuses(&guest.table) {
+        if let Some(why) = w.vm_refuses(&guest.table).or_else(|| self.guest_costly.get(&program.0).cloned()) {
             tracing::debug!(program = program.0, %why, "spatial guest: the VM cannot take it");
             return false;
         }
@@ -1371,6 +1433,7 @@ impl Spatial {
             return false;
         };
         if !guest.table.per_step.is_empty()
+            || self.guest_costly.contains_key(&program.0)
             || lay.refuses(&guest.table).or_else(|| ring.refuses_outputs(&guest.table.outputs)).is_some()
         {
             return false;
@@ -1515,6 +1578,26 @@ impl Spatial {
             .get(&program.0)
             .cloned()
             .ok_or_else(|| Error::Invalid("the program has no guest table".into()))?;
+        // The pool homes the step put (the next token's among them), as the
+        // VM's pool holds them: put on the instance; wide homes stay on the
+        // wafer.
+        let homes = {
+            let Some((_, plan, _)) = self.programs.instance_view(instance) else {
+                return Ok(());
+            };
+            let puts: std::collections::BTreeSet<u32> =
+                plan.package.stages[guest.epilogue].puts.iter().map(|p| p.channel).collect();
+            guest
+                .table
+                .homes
+                .iter()
+                .filter(|h| h.kind == "pool" && puts.contains(&h.chan))
+                .filter_map(|h| {
+                    let (at, n) = (h.at as usize, h.n as usize);
+                    pool.get(at..at + n).map(|words| (h.chan, guest4::lane::value_of(words, h.dtype)))
+                })
+                .collect::<Vec<_>>()
+        };
         self.programs
             .fire_with(
                 instance,
@@ -1524,24 +1607,10 @@ impl Spatial {
                     program: &guest,
                     out: row,
                     wide: &[],
+                    homes: &homes,
                 },
             )
             .map_err(refusal)?;
-        if let Some((_, _, inst)) = self.programs.instance_view(instance) {
-            for h in guest.table.homes.iter().filter(|h| h.kind == "pool") {
-                let (at, n) = (h.at as usize, h.n as usize);
-                let Some(words) = pool.get(at..at + n) else {
-                    continue;
-                };
-                let ring = &inst.channels[h.chan as usize];
-                let value = guest4::lane::value_of(words, h.dtype);
-                if ring.is_empty() {
-                    ring.push(&value);
-                } else {
-                    ring.encode_sequence(ring.head(), &value);
-                }
-            }
-        }
         self.guest_steps += 1;
         if self.guest_steps.is_power_of_two() {
             tracing::info!(steps = self.guest_steps, program = program.0, "spatial guest: epilogue steps run on the wafer's VM");
@@ -1570,7 +1639,7 @@ impl Spatial {
             .guest_vms
             .entry(instance)
             .or_insert_with(|| guest4::lane::CheckVm::load(&plan, inst));
-        let (out, wide) = vm
+        let (out, wide, homes) = vm
             .step(&plan, &guest, inst, outputs)
             .map_err(|why| Error::Device(format!("the guest VM: {why}")))?;
         self.guest_steps += 1;
@@ -1590,6 +1659,7 @@ impl Spatial {
                     program: &guest,
                     out: &out,
                     wide: &wide,
+                    homes: &homes,
                 },
             )
             .map_err(refusal)?;
@@ -2179,6 +2249,12 @@ impl Engine for Spatial {
         // The model as the spatial kernels see it: refused here unless its
         // structure is one they implement (spatial/plan.rs).
         let spec = plan::ModelSpec::read(&trace).map_err(|e| Error::Load(e.to_string()))?;
+        self.params = {
+            let (h, hd) = (spec.hidden as f64, spec.head_dim as f64);
+            let attn = h * hd * (2 * spec.q_heads + 2 * spec.kv_heads) as f64;
+            let heads = if spec.tied { 1.0 } else { 2.0 };
+            spec.layers as f64 * (attn + 3.0 * h * spec.inter as f64) + heads * spec.vocab as f64 * h
+        };
         let shell = Shell::load_dry(
             Boot {
                 patches,

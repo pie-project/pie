@@ -24,6 +24,7 @@ use eta_ir::registry::Stage;
 use eta_ir::types::RngKind;
 use serde_json::{Value as Json, json};
 
+pub mod cost;
 pub mod isa;
 pub mod lane;
 pub mod wafer;

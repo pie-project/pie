@@ -268,6 +268,11 @@ pub struct VmStage<'a> {
     pub program: &'a Program,
     pub out: &'a [u32],
     pub wide: &'a [(u32, Value)],
+    /// The values the step put to homes the host knows (the check VM's, or
+    /// a pool home read back from the VM): put on the instance as eta puts
+    /// them, so whatever watches a put (the next pass's token) sees it.
+    /// Other homes stay as they are (kept).
+    pub homes: &'a [(u32, Value)],
 }
 
 impl StageRunner for VmStage<'_> {
@@ -306,8 +311,13 @@ impl StageRunner for VmStage<'_> {
                         })?;
                     value_of(words, dtype)
                 }
-                // A home: the VM wrote it in place; the ring stays as it is.
-                (None, None) => Value::F32(Vec::new()),
+                // A home: its value when the host knows it, else the VM
+                // wrote it in place and the ring stays as it is.
+                (None, None) => self
+                    .homes
+                    .iter()
+                    .find(|(chan, _)| *chan == put.channel)
+                    .map_or_else(|| Value::F32(Vec::new()), |(_, value)| value.clone()),
             };
         }
         Ok(())
@@ -318,7 +328,7 @@ impl StageRunner for VmStage<'_> {
     }
 
     fn keeps(&self, channel: u32) -> bool {
-        self.program.homes.contains(&channel)
+        self.program.homes.contains(&channel) && !self.homes.iter().any(|(chan, _)| *chan == channel)
     }
 }
 
@@ -381,7 +391,7 @@ impl CheckVm {
         program: &Program,
         inst: &eta_exec::InterpInstance,
         outputs: &[(String, u32, Value)],
-    ) -> Result<(Vec<u32>, Vec<(u32, Value)>), String> {
+    ) -> Result<(Vec<u32>, Vec<(u32, Value)>, Vec<(u32, Value)>), String> {
         for &chan in &program.table.per_step {
             copy_ring(&self.shadow.channels[chan as usize], &inst.channels[chan as usize]);
         }
@@ -405,7 +415,19 @@ impl CheckVm {
             let value = ring.pop().ok_or_else(|| format!("channel {chan} got no put"))?;
             wide.push((*chan, value));
         }
-        Ok((out, wide))
+        // What the step put to each home: the copy's last put.
+        let puts: BTreeSet<u32> = plan.package.stages[program.epilogue].puts.iter().map(|p| p.channel).collect();
+        let homes = program
+            .homes
+            .iter()
+            .filter(|chan| puts.contains(chan))
+            .filter_map(|&chan| {
+                let ring = &self.shadow.channels[chan as usize];
+                let tail = ring.tail();
+                (tail > 0).then(|| (chan, ring.decode_sequence(tail - 1)))
+            })
+            .collect();
+        Ok((out, wide, homes))
     }
 
     /// The homes back into `inst` (what a read-back of the VM's pool and wide
@@ -437,6 +459,36 @@ mod tests {
         let ring = super::Ring { depth: 16, width: 2, lanes: 3 };
         assert_eq!((ring.index_lane(0, 2, 1), ring.index_lane(5, 1, 0)), (2 * 2 + 1, 0));
         assert_eq!(ring.steps_cap(), 5);
+    }
+
+    #[test]
+    fn a_home_whose_value_is_known_is_put_not_kept() {
+        // A prompt pass's token channel is a pool home with no token home:
+        // kept, the instance never sees its put (the first token read 0).
+        use eta_exec::StageRunner;
+        let program = super::Program {
+            table: super::Table {
+                ins: Vec::new(),
+                pre_len: 0,
+                homes: Vec::new(),
+                outputs: Vec::new(),
+                wide_outputs: Vec::new(),
+                per_step: Vec::new(),
+                tok_home: None,
+                nreg: 1,
+                pool_words: 1,
+                feat: 0,
+                remat: false,
+            },
+            epilogue: 0,
+            homes: [0, 3].into(),
+            logits: "logits".into(),
+        };
+        let homes = [(0, super::Value::U32(vec![7]))];
+        let stage = super::VmStage { program: &program, out: &[], wide: &[], homes: &homes };
+        assert!(!stage.keeps(0));
+        assert!(stage.keeps(3));
+        assert!(!stage.keeps(5));
     }
 }
 
