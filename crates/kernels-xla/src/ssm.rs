@@ -154,39 +154,25 @@ fn conv_lanes(
     Ok((y, next))
 }
 
-/// One row per lane: rolls `past` (`[T, per, width]` when `per >= hist`, else
-/// `[T, hist * C]`) by one row with `x` `[T, C]` and convolves the `taps` taps
-/// at `dil`.
+/// One row per lane: rolls `past` `[T, hist * C]` by one row with `x` `[T, C]`
+/// and convolves the `taps` taps at `dil`.
 fn conv_step(
     f: &mut Func,
-    x_bf16: Val,
     x: Val,
     w: Val,
     past: Val,
-    hist: i64,
-    per: i64,
     dil: i64,
     out: ConvOut,
     bias: Option<Val>,
 ) -> Built<(Val, Val)> {
     let (t, c) = (f.dims(x)[0], f.dims(x)[1]);
     let taps = f.dims(w)[1];
-    let blocked = f.dims(past).len() == 3 && per >= hist && per % hist == 0;
-    let per_tap = if blocked { per / hist } else { c };
+    let hist = f.dims(past)[1] / c;
     let next = if hist > 1 {
-        let kept = f.slice_axis(past, 1, per_tap, hist * per_tap)?;
-        let x_part = if blocked {
-            let width = f.dims(past)[2];
-            f.reshape(x_bf16, &[t, per_tap, width])?
-        } else {
-            x_bf16
-        };
-        f.concat(&[kept, x_part], 1)?
-    } else if blocked {
-        let width = f.dims(past)[2];
-        f.reshape(x_bf16, &[t, per_tap, width])?
+        let kept = f.slice_axis(past, 1, c, hist * c)?;
+        f.concat(&[kept, x], 1)?
     } else {
-        x_bf16
+        x
     };
     let mut acc: Option<Val> = None;
     for k in 0..taps {
@@ -194,9 +180,7 @@ fn conv_step(
         let tap = if pos + 1 == hist {
             x
         } else {
-            let s = f.slice_axis(past, 1, (pos + 1) * per_tap, (pos + 2) * per_tap)?;
-            let s = if blocked { f.reshape(s, &[t, c])? } else { s };
-            f.convert(s, Elem::F32)
+            f.slice_axis(past, 1, (pos + 1) * c, (pos + 2) * c)?
         };
         let wk = f.slice_axis(w, 1, k, k + 1)?;
         let wk = f.reshape(wk, &[c])?;
@@ -277,21 +261,10 @@ fn conv(
     let slab = conv_state.val;
     let lanes = lanes.lanes(f, op, t)?;
     let past = take_slots(f, slab, lanes.slot, per)?;
+    let past = f.convert(past, Elem::F32);
     let (yv, next) = if is_decode {
-        conv_step(
-            f,
-            x.val,
-            xv,
-            w,
-            past,
-            hist as i64,
-            1,
-            i64::from(dil),
-            out,
-            bias,
-        )?
+        conv_step(f, xv, w, past, i64::from(dil), out, bias)?
     } else {
-        let past = f.convert(past, Elem::F32);
         conv_lanes(f, xv, w, past, &lanes, i64::from(dil), out, bias)?
     };
     let slab = land_slots(f, slab, lanes.slot, lanes.write, next, per)?;
@@ -549,13 +522,13 @@ fn gdn_heads(
 ) -> Built<Heads> {
     let t = f.dims(qkv)[0];
     let keys = hk * dk;
-    let qk = f.slice_axis(qkv, 1, 0, 2 * keys)?;
+    let q = f.slice_axis(qkv, 1, 0, keys)?;
+    let k = f.slice_axis(qkv, 1, keys, 2 * keys)?;
     let v = f.slice_axis(qkv, 1, 2 * keys, 2 * keys + hv * dv)?;
-    let qk = f.reshape(qk, &[t, 2 * hk, dk])?;
-    let qk = l2norm(f, qk, GDN_EPS, 1.0)?;
-    let q = f.slice_axis(qk, 1, 0, hk)?;
-    let q = f.scale(q, 1.0 / (dk as f64).sqrt())?;
-    let k = f.slice_axis(qk, 1, hk, 2 * hk)?;
+    let q = f.reshape(q, &[t, hk, dk])?;
+    let k = f.reshape(k, &[t, hk, dk])?;
+    let q = l2norm(f, q, GDN_EPS, 1.0 / (dk as f64).sqrt())?;
+    let k = l2norm(f, k, GDN_EPS, 1.0)?;
     let group = hv / hk;
     let spread = |f: &mut Func, x: Val| -> Built<Val> {
         let x = f.broadcast(x, &[t, hk, group, dk], &[0, 1, 3])?;
@@ -668,68 +641,57 @@ fn over_keys(f: &mut Func, x: Val, dk: i64) -> Built<Val> {
     f.broadcast(lead, &to, &map)
 }
 
-/// One token per lane: `S ← diag(a)·S`, `δ = β(v − Sᵀ k)` (`β v` without
-/// the delta `rule`), `S ← S + k δᵀ`, `y = Sᵀ q`, over `S` `[R, H, dk, dv]`.
+/// One token per lane: `S ← S·diag(a)`, `δ = β(v − S k)` (`β v` without
+/// the delta `rule`), `S ← S + δ kᵀ`, `y = S q`, over `S` `[R, H, dv, dk]`.
 fn delta_step(f: &mut Func, h: &Heads, s: Val, rule: bool) -> Built<(Val, Val)> {
     let d = f.dims(s).to_vec();
-    let (r, hh, dk, dv) = (d[0], d[1], d[2], d[3]);
-    let s_elem = f.elem(s);
+    let (r, hh, dv, dk) = (d[0], d[1], d[2], d[3]);
     let a = f.exp(h.g);
     let scalar_a = f.dims(a)[2] == 1;
-    let (sq, delta, s1_opt) = if scalar_a && rule {
-        let q1 = f.reshape(h.q, &[r, hh, 1, dk])?;
-        let k1 = f.reshape(h.k, &[r, hh, 1, dk])?;
-        let qk = f.concat(&[q1, k1], 2)?;
-        let qk = f.convert(qk, s_elem);
-        let qks = f.dot_general_at(qk, s, &[0, 1], &[0, 1], &[3], &[2], Elem::F32, false)?;
-        let a_qks = f.broadcast(a, &[r, hh, 2, dv], &[0, 1, 2])?;
-        let qks = f.mul(qks, a_qks)?;
-        let sq0 = f.slice_axis(qks, 2, 0, 1)?;
-        let sk0 = f.slice_axis(qks, 2, 1, 2)?;
-        let sq = f.reshape(sq0, &[r, hh, dv])?;
-        let mem = f.reshape(sk0, &[r, hh, dv])?;
-        let delta = f.sub(h.v, mem)?;
-        (sq, delta, None)
-    } else {
-        let s_f = f.convert(s, Elem::F32);
-        let kb = f.broadcast(h.k, &d, &[0, 1, 2])?;
-        let qb = f.broadcast(h.q, &d, &[0, 1, 2])?;
-        let a_dk = over_keys(f, a, dk)?;
-        let a_b = f.broadcast(a_dk, &d, &[0, 1, 2])?;
-        let s1 = f.mul(s_f, a_b)?;
-        let sq = f.mul(s1, qb)?;
-        let sq = f.reduce(sq, &[2], Fold::Sum)?;
+    let kb = f.broadcast(h.k, &d, &[0, 1, 3])?;
+    let qb = f.broadcast(h.q, &d, &[0, 1, 3])?;
+    let (sq, delta, a_b) = if scalar_a {
+        let a2 = f.reshape(a, &[r, hh])?;
+        let a_v = f.broadcast(a2, &[r, hh, dv], &[0, 1])?;
+        let sq = f.mul(s, qb)?;
+        let sq = f.reduce(sq, &[3], Fold::Sum)?;
+        let sq = f.mul(sq, a_v)?;
         let delta = if rule {
-            let mem = f.mul(s1, kb)?;
-            let mem = f.reduce(mem, &[2], Fold::Sum)?;
+            let mem = f.mul(s, kb)?;
+            let mem = f.reduce(mem, &[3], Fold::Sum)?;
+            let mem = f.mul(mem, a_v)?;
             f.sub(h.v, mem)?
         } else {
             h.v
         };
-        let s1 = f.convert(s1, s_elem);
-        (sq, delta, Some(s1))
+        let a_b = f.broadcast(a2, &d, &[0, 1])?;
+        (sq, delta, a_b)
+    } else {
+        let a_dk = over_keys(f, a, dk)?;
+        let a_b = f.broadcast(a_dk, &d, &[0, 1, 3])?;
+        let s1 = f.mul(s, a_b)?;
+        let sq = f.mul(s1, qb)?;
+        let sq = f.reduce(sq, &[3], Fold::Sum)?;
+        let delta = if rule {
+            let mem = f.mul(s1, kb)?;
+            let mem = f.reduce(mem, &[3], Fold::Sum)?;
+            f.sub(h.v, mem)?
+        } else {
+            h.v
+        };
+        (sq, delta, a_b)
     };
     let beta = f.broadcast(h.beta, &[r, hh, dv], &[0, 1])?;
     let delta = f.mul(delta, beta)?;
+    let s1 = f.mul(s, a_b)?;
+    let db = f.broadcast(delta, &d, &[0, 1, 2])?;
+    let upd = f.mul(db, kb)?;
+    let s2 = f.add(s1, upd)?;
     let kq = f.mul(h.k, h.q)?;
     let kq = f.reduce(kq, &[2], Fold::Sum)?;
     let kq = f.broadcast(kq, &[r, hh, dv], &[0, 1])?;
     let dy = f.mul(delta, kq)?;
     let y = f.add(sq, dy)?;
-    let s1 = match s1_opt {
-        Some(s1) => f.convert(s1, Elem::F32),
-        None => {
-            let a2 = f.reshape(a, &[r, hh])?;
-            let a_b = f.broadcast(a2, &d, &[0, 1])?;
-            let s_f = f.convert(s, Elem::F32);
-            f.mul(s_f, a_b)?
-        }
-    };
-    let db = f.broadcast(delta, &d, &[0, 1, 3])?;
-    let kb = f.broadcast(h.k, &d, &[0, 1, 2])?;
-    let upd = f.mul(db, kb)?;
-    let s2 = f.add(s1, upd)?;
-    let s2 = f.convert(s2, s_elem);
     Ok((y, s2))
 }
 
@@ -785,38 +747,84 @@ fn committed_segs(f: &mut Func, lanes: &Lanes) -> Built<Segs> {
     })
 }
 
-struct IntraChunk {
-    ut: Val,
-    w: Option<Val>,
-    kt: Val,
-    gc: Val,
-    qg: Val,
-    p: Val,
-}
-
-fn delta_intra_chunk(
+/// The chunked delta rule over `segs`, from the lanes' states `init`
+/// `[L, H, dv, dk]`. Returns `y` `[T, H, dv]` and the lanes' captured states
+/// `[L, H, dv, dk]` (`init` where nothing was captured).
+fn delta_chunked(
     f: &mut Func,
     input: &DeltaIn,
-    h_raw: &Heads,
-    row: Val,
-    valid: Val,
-    keep_valid: Option<Val>,
-    nc: i64,
+    raw: &Raw,
+    segs: &Segs,
+    init: Val,
     c: i64,
-) -> Built<IntraChunk> {
-    let t = f.dims(h_raw.q)[0];
+) -> Built<(Val, Val)> {
+    let t = f.dims(raw.rows[0])[0];
     let (hh, dk, dv) = input.dims();
     let gd = input.decay_width();
     let rule = input.rule();
-    let blank_with = |f: &mut Func, x: Val, vmask: Val, lead: &[i64], perm: &[i64]| -> Built<Val> {
-        let d_raw = f.dims(x).to_vec();
-        let flat_w: i64 = d_raw[1..].iter().product();
-        let x_flat = f.reshape(x, &[t, flat_w])?;
-        let x_got = f.take_rows(x_flat, row)?;
-        let mut d = vec![nc * c];
-        d.extend_from_slice(&d_raw[1..]);
-        let x = f.reshape(x_got, &d)?;
-        let vb = f.broadcast(vmask, &d, &[0])?;
+    let s = f.dims(segs.begin)[0];
+    let nc = (t + c - 1) / c + s;
+
+    // Chunk table: segment s owns chunks [cstart, cend).
+    let cm1 = full_i(f, c - 1, s);
+    let cv = full_i(f, c, s);
+    let nch = f.add(segs.len, cm1)?;
+    let nch = f.div(nch, cv)?;
+    let cend = f.scan(nch, 0, Fold::Sum)?;
+    let cstart = f.sub(cend, nch)?;
+    let total = f.reduce(nch, &[0], Fold::Sum)?;
+    let ncv = ci(f, nc);
+    let total = f.min(total, ncv)?;
+
+    let n = iota(f, nc);
+    let seg = count_le(f, cend, n)?;
+    let seg = clamp_i(f, seg, 0, s - 1)?;
+    let cst = take(f, cstart, seg)?;
+    let j = f.sub(n, cst)?;
+    let nch_n = take(f, nch, seg)?;
+    let len_n = take(f, segs.len, seg)?;
+    let beg_n = take(f, segs.begin, seg)?;
+    let lane_n = take(f, segs.lane, seg)?;
+    let reset = f.convert(segs.reset, Elem::I32);
+    let reset_n = take(f, reset, seg)?;
+    let capture = f.convert(segs.capture, Elem::I32);
+    let cap_n = take(f, capture, seg)?;
+    let j0 = cmp_i(f, Cmp::Eq, j, 0)?;
+    let r0 = cmp_i(f, Cmp::Ne, reset_n, 0)?;
+    let first_n = f.and(j0, r0)?;
+    let one = f.like_i(nch_n, 1);
+    let lastj = f.sub(nch_n, one)?;
+    let jl = f.compare(Cmp::Eq, j, lastj)?;
+    let c0 = cmp_i(f, Cmp::Ne, cap_n, 0)?;
+    let last_n = f.and(jl, c0)?;
+
+    // Token rows of every chunk position.
+    let ic = f.iota(Elem::I32, &[nc, c], 1);
+    let jb = f.broadcast(j, &[nc, c], &[0])?;
+    let cc = f.const_i(Elem::I32, c, &[nc, c]);
+    let local = f.mul(jb, cc)?;
+    let local = f.add(local, ic)?;
+    let lenb = f.broadcast(len_n, &[nc, c], &[0])?;
+    let inside = f.compare(Cmp::Lt, local, lenb)?;
+    let tb = f.broadcast(total, &[nc], &[])?;
+    let live = f.compare(Cmp::Lt, n, tb)?;
+    let live = f.broadcast(live, &[nc, c], &[0])?;
+    let valid = f.and(inside, live)?;
+    let begb = f.broadcast(beg_n, &[nc, c], &[0])?;
+    let row = f.add(begb, local)?;
+    let row = clamp_i(f, row, 0, t - 1)?;
+    let row = f.reshape(row, &[nc * c])?;
+
+    // Gather the raw rows (bf16 where they arrive so), then form the heads.
+    let mut got = Vec::with_capacity(raw.rows.len());
+    for &r in &raw.rows {
+        got.push(f.take_rows(r, row)?);
+    }
+    let h = input.heads_from(f, &got, &raw.fixed)?;
+    let valid = f.reshape(valid, &[nc * c])?;
+    let blank = |f: &mut Func, x: Val, lead: &[i64], perm: &[i64]| -> Built<Val> {
+        let d = f.dims(x).to_vec();
+        let vb = f.broadcast(valid, &d, &[0])?;
         let zero = f.like_f(x, 0.0);
         let x = f.select(vb, x, zero)?;
         let mut to = lead.to_vec();
@@ -824,35 +832,25 @@ fn delta_intra_chunk(
         let x = f.reshape(x, &to)?;
         f.transpose(x, perm)
     };
-    let blank = |f: &mut Func, x: Val, lead: &[i64], perm: &[i64]| -> Built<Val> {
-        blank_with(f, x, valid, lead, perm)
-    };
-    let q = blank(f, h_raw.q, &[nc, c], &[0, 2, 1, 3])?;
-    let k = blank(f, h_raw.k, &[nc, c], &[0, 2, 1, 3])?;
-    let v = blank(f, h_raw.v, &[nc, c], &[0, 2, 1, 3])?;
-    let g = blank(f, h_raw.g, &[nc, c], &[0, 2, 1, 3])?;
-    let beta = blank(f, h_raw.beta, &[nc, c], &[0, 2, 1])?;
+    let q = blank(f, h.q, &[nc, c], &[0, 2, 1, 3])?;
+    let k = blank(f, h.k, &[nc, c], &[0, 2, 1, 3])?;
+    let v = blank(f, h.v, &[nc, c], &[0, 2, 1, 3])?;
+    let g = blank(f, h.g, &[nc, c], &[0, 2, 1, 3])?;
+    let beta = blank(f, h.beta, &[nc, c], &[0, 2, 1])?;
 
     // Cumulative decay inside each chunk.
     let gcum = f.scan_steps(g, 2, Fold::Sum)?;
+    let glast = f.slice_axis(gcum, 2, c - 1, c)?;
+    let glast = f.reshape(glast, &[nc, hh, gd])?;
     let e = f.exp(gcum);
     let e = over_keys(f, e, dk)?;
     let qg = f.mul(q, e)?;
     let kg = f.mul(k, e)?;
-    let (gcum_k, k_keep) = if let Some(kv) = keep_valid {
-        let gk = blank_with(f, h_raw.g, kv, &[nc, c], &[0, 2, 1, 3])?;
-        let kk = blank_with(f, h_raw.k, kv, &[nc, c], &[0, 2, 1, 3])?;
-        (f.scan_steps(gk, 2, Fold::Sum)?, kk)
-    } else {
-        (gcum, k)
-    };
-    let glast = f.slice_axis(gcum_k, 2, c - 1, c)?;
-    let glast = f.reshape(glast, &[nc, hh, gd])?;
     let gl = f.broadcast(glast, &[nc, hh, c, gd], &[0, 1, 3])?;
-    let tail = f.sub(gl, gcum_k)?;
+    let tail = f.sub(gl, gcum)?;
     let tail = f.exp(tail);
     let tail = over_keys(f, tail, dk)?;
-    let kt = f.mul(k_keep, tail)?;
+    let kt = f.mul(k, tail)?;
     let gc = f.exp(glast);
 
     // Intra-chunk pair terms.
@@ -860,6 +858,7 @@ fn delta_intra_chunk(
     let si = f.iota(Elem::I32, &[c, c], 1);
     let strict = f.compare(Cmp::Gt, ti, si)?;
     let incl = f.compare(Cmp::Ge, ti, si)?;
+    let diag = f.compare(Cmp::Eq, ti, si)?;
     let sq = [nc, hh, c, c];
     let strict4 = f.broadcast(strict, &sq, &[2, 3])?;
     let incl4 = f.broadcast(incl, &sq, &[2, 3])?;
@@ -871,9 +870,9 @@ fn delta_intra_chunk(
         let dlt = f.sub(gt4, gs4)?;
         let dlt = f.select(incl4, dlt, zero4)?;
         let ex = f.exp(dlt);
-        let qk = f.dot_general_at(q, k, &[0, 1], &[0, 1], &[3], &[3], Elem::F32, false)?;
+        let qk = f.dot_general(q, k, &[0, 1], &[0, 1], &[3], &[3], Elem::F32)?;
         let kk = if rule {
-            let kk = f.dot_general_at(k, k, &[0, 1], &[0, 1], &[3], &[3], Elem::F32, false)?;
+            let kk = f.dot_general(k, k, &[0, 1], &[0, 1], &[3], &[3], Elem::F32)?;
             f.mul(kk, ex)?
         } else {
             zero4
@@ -901,276 +900,100 @@ fn delta_intra_chunk(
     let p = f.select(incl4, qk, zero4)?;
     let bv = f.broadcast(beta, &[nc, hh, c, dv], &[0, 1, 2])?;
     let rv = f.mul(v, bv)?;
+    // Without the delta rule `(I + A)⁻¹` is `I`, and there is no `w`.
     let (ut, w) = if rule {
         let bt = f.broadcast(beta, &sq, &[0, 1, 2])?;
         let a = f.mul(bt, kk)?;
         let a = f.select(strict4, a, zero4)?;
+        let eye = f.convert(diag, Elem::F32);
+        let eye = f.broadcast(eye, &sq, &[2, 3])?;
+        let lower = f.add(eye, a)?;
         let bk = f.broadcast(beta, &[nc, hh, c, dk], &[0, 1, 2])?;
         let rk = f.mul(kg, bk)?;
         let rhs = f.concat(&[rv, rk], 3)?;
+        let _ = lower;
         let inv = unit_lower_inverse(f, a)?;
-        let x = f.dot_general_at(inv, rhs, &[0, 1], &[0, 1], &[3], &[2], Elem::F32, false)?;
+        let x = f.dot_general(inv, rhs, &[0, 1], &[0, 1], &[3], &[2], Elem::F32)?;
         let ut = f.slice_axis(x, 3, 0, dv)?;
         (ut, Some(f.slice_axis(x, 3, dv, dv + dk)?))
     } else {
         (rv, None)
     };
-    Ok(IntraChunk {
-        ut,
-        w,
-        kt,
-        gc,
-        qg,
-        p,
-    })
-}
 
-/// Fast path for a ragged fire where every lane has at most one chunk (`<= c`
-/// tokens): computes all `s` lanes in parallel without a `while_loop` carry,
-/// keeping `init` in `bf16` and contracting `w` and `qg` against `init` in a
-/// single `dot_general_at(..., false)` pass.
-fn delta_single_chunk(
-    f: &mut Func,
-    input: &DeltaIn,
-    raw: &Raw,
-    lanes: &Lanes,
-    slab: Val,
-    per: i64,
-    stride: i64,
-    c: i64,
-) -> Built<(Val, Val)> {
-    let t = f.dims(raw.rows[0])[0];
-    let (hh, dk, dv) = input.dims();
-    let s = lanes.count(f);
-    let h_raw = input.heads_from(f, &raw.rows, &raw.fixed)?;
+    // The chunk-to-chunk carry: only the live chunks (`0..total`) walk
+    // sequentially; each chunk forms its output and lands its lane's captured
+    // state on its last chunk while `s0` and `u` are on chip.
+    let sz = [hh, dv, dk];
+    let s0 = f.const_f(Elem::F32, 0.0, &sz);
+    let o0 = f.const_f(Elem::F32, 0.0, &[nc, hh, c, dv]);
+    let first_i = f.convert(first_n, Elem::I32);
+    let last_i = f.convert(last_n, Elem::I32);
+    let out = loop_upto(
+        f,
+        total,
+        &[s0, init, o0],
+        &[first_i, last_i, lane_n, w.unwrap_or(ut), ut, kt, gc, qg, p],
+        |f, i, cr, inv| {
+            let (st, fin, o) = (cr[0], cr[1], cr[2]);
+            let (first_i, last_i, lane_n, w, ut, kt, gc, qg, p) = (
+                inv[0], inv[1], inv[2], inv[3], inv[4], inv[5], inv[6], inv[7], inv[8],
+            );
+            let first = row_at(f, first_i, i)?;
+            let first = cmp_i(f, Cmp::Ne, first, 0)?;
+            let last = row_at(f, last_i, i)?;
+            let last = cmp_i(f, Cmp::Ne, last, 0)?;
+            let lane = row_at(f, lane_n, i)?;
+            let from = row_at(f, fin, lane)?;
+            let s0 = f.select(first, from, st)?;
+            let un = row_at(f, ut, i)?;
+            let kn = row_at(f, kt, i)?;
+            let gn = row_at(f, gc, i)?;
+            let u = if rule {
+                let wn = row_at(f, w, i)?;
+                let ws = f.dot_general(wn, s0, &[0], &[0], &[2], &[2], Elem::F32)?;
+                f.sub(un, ws)?
+            } else {
+                un
+            };
+            let qgn = row_at(f, qg, i)?;
+            let pn = row_at(f, p, i)?;
+            let o1 = f.dot_general(qgn, s0, &[0], &[0], &[2], &[2], Elem::F32)?;
+            let o2 = f.dot_general(pn, u, &[0], &[0], &[2], &[1], Elem::F32)?;
+            let on = f.add(o1, o2)?;
+            let o = put_at(f, o, on, i)?;
+            let gn = over_keys(f, gn, dk)?;
+            let gn = f.broadcast(gn, &sz, &[0, 2])?;
+            let decayed = f.mul(s0, gn)?;
+            let upd = f.dot_general(u, kn, &[0], &[0], &[1], &[1], Elem::F32)?;
+            let s1 = f.add(decayed, upd)?;
+            let kept = f.select(last, s1, from)?;
+            let fin = put_at(f, fin, kept, lane)?;
+            Ok(vec![s1, fin, o])
+        },
+    )?;
+    let (fin, o) = (out[1], out[2]);
 
-    let has_ch = cmp_i(f, Cmp::Gt, lanes.keep, 0)?;
-    let do_cap = f.and(has_ch, lanes.write)?;
-
-    let init = take_slots(f, slab, lanes.slot, per)?;
-    let init = f.reshape(init, &[s, hh, dk, dv])?;
-
-    let ic = f.iota(Elem::I32, &[s, c], 1);
-    let lenb = f.broadcast(lanes.span, &[s, c], &[0])?;
-    let valid = f.compare(Cmp::Lt, ic, lenb)?;
-    let keepb = f.broadcast(lanes.keep, &[s, c], &[0])?;
-    let keep_valid = f.compare(Cmp::Lt, ic, keepb)?;
-    let begb = f.broadcast(lanes.begin, &[s, c], &[0])?;
-    let row = f.add(begb, ic)?;
-    let row = clamp_i(f, row, 0, t - 1)?;
-    let row = f.reshape(row, &[s * c])?;
-    let valid = f.reshape(valid, &[s * c])?;
-    let keep_valid = f.reshape(keep_valid, &[s * c])?;
-
-    let ic_res = delta_intra_chunk(f, input, &h_raw, row, valid, Some(keep_valid), s, c)?;
-    let (u, o1) = if let Some(w_val) = ic_res.w {
-        let wqg = f.concat(&[w_val, ic_res.qg], 2)?;
-        let ws_o1 = f.dot_general_at(wqg, init, &[0, 1], &[0, 1], &[3], &[2], Elem::F32, false)?;
-        let ws = f.slice_axis(ws_o1, 2, 0, c)?;
-        let o1 = f.slice_axis(ws_o1, 2, c, 2 * c)?;
-        (f.sub(ic_res.ut, ws)?, o1)
-    } else {
-        let o1 = f.dot_general_at(
-            ic_res.qg,
-            init,
-            &[0, 1],
-            &[0, 1],
-            &[3],
-            &[2],
-            Elem::F32,
-            false,
-        )?;
-        (ic_res.ut, o1)
-    };
-    let o2 = f.dot_general_at(ic_res.p, u, &[0, 1], &[0, 1], &[3], &[2], Elem::F32, false)?;
-    let o = f.add(o1, o2)?;
-    let gn = over_keys(f, ic_res.gc, dk)?;
-    let gn = f.broadcast(gn, &[s, hh, dk, dv], &[0, 1, 2])?;
-    let init_f = f.convert(init, Elem::F32);
-    let decayed = f.mul(init_f, gn)?;
-    let upd = f.dot_general_at(ic_res.kt, u, &[0, 1], &[0, 1], &[2], &[2], Elem::F32, false)?;
-    let s1 = f.add(decayed, upd)?;
-    let s1 = f.reshape(s1, &[s, stride])?;
-    let slab = land_slots(f, slab, lanes.slot, do_cap, s1, per)?;
-
-    let ti = iota(f, t);
-    let sg = count_le(f, lanes.begin, ti)?;
-    let one_sg = f.like_i(sg, 1);
-    let sg = f.sub(sg, one_sg)?;
-    let sg = clamp_i(f, sg, 0, s - 1)?;
-    let b_tok = take(f, lanes.begin, sg)?;
-    let local_tok = f.sub(ti, b_tok)?;
-    let cvt = f.like_i(local_tok, c);
-    let within = clamp_i(f, local_tok, 0, c - 1)?;
-    let pos = f.mul(sg, cvt)?;
-    let pos = f.add(pos, within)?;
-    let pos = clamp_i(f, pos, 0, s * c - 1)?;
-    let o = f.transpose(o, &[0, 2, 1, 3])?;
-    let o = f.reshape(o, &[s * c, hh * dv])?;
-    let y = f.take_rows(o, pos)?;
-    let y = f.reshape(y, &[t, hh, dv])?;
-    Ok((y, slab))
-}
-
-/// The chunked delta rule over `segs`, from the lanes' states `init`
-/// `[L, H, dv, dk]`. Returns `y` `[T, H, dv]` and the lanes' captured states
-/// `[L, H, dv, dk]` (`init` where nothing was captured).
-fn delta_chunked(
-    f: &mut Func,
-    input: &DeltaIn,
-    raw: &Raw,
-    segs: &Segs,
-    init: Val,
-    c: i64,
-) -> Built<(Val, Val)> {
-    let t = f.dims(raw.rows[0])[0];
-    let (hh, dk, dv) = input.dims();
-    let rule = input.rule();
-    let s = f.dims(segs.begin)[0];
-
-    // Form the heads on the `t` raw rows first.
-    let h_raw = input.heads_from(f, &raw.rows, &raw.fixed)?;
-
-    // Chunk counts per segment and token-to-segment mapping.
-    let cm1 = full_i(f, c - 1, s);
-    let cv = full_i(f, c, s);
-    let nch = f.add(segs.len, cm1)?;
-    let nch = f.div(nch, cv)?;
-    let capture = f.convert(segs.capture, Elem::I32);
-
+    // Back to token rows.
     let ti = iota(f, t);
     let sg = count_le(f, segs.begin, ti)?;
-    let one_sg = f.like_i(sg, 1);
-    let sg = f.sub(sg, one_sg)?;
+    let one = f.like_i(sg, 1);
+    let sg = f.sub(sg, one)?;
     let sg = clamp_i(f, sg, 0, s - 1)?;
-    let b_tok = take(f, segs.begin, sg)?;
-    let local_tok = f.sub(ti, b_tok)?;
-    let cvt = f.like_i(local_tok, c);
-
-    let general_branch = |f: &mut Func| -> Built<(Val, Val)> {
-        let nc = (t + c - 1) / c + s;
-        let cend = f.scan(nch, 0, Fold::Sum)?;
-        let cstart = f.sub(cend, nch)?;
-        let total = f.reduce(nch, &[0], Fold::Sum)?;
-        let ncv = ci(f, nc);
-        let total = f.min(total, ncv)?;
-
-        let n = iota(f, nc);
-        let seg = count_le(f, cend, n)?;
-        let seg = clamp_i(f, seg, 0, s - 1)?;
-        let cst = take(f, cstart, seg)?;
-        let j = f.sub(n, cst)?;
-        let nch_n = take(f, nch, seg)?;
-        let len_n = take(f, segs.len, seg)?;
-        let beg_n = take(f, segs.begin, seg)?;
-        let lane_n = take(f, segs.lane, seg)?;
-        let reset = f.convert(segs.reset, Elem::I32);
-        let reset_n = take(f, reset, seg)?;
-        let cap_n = take(f, capture, seg)?;
-        let j0 = cmp_i(f, Cmp::Eq, j, 0)?;
-        let r0 = cmp_i(f, Cmp::Ne, reset_n, 0)?;
-        let first_n = f.and(j0, r0)?;
-        let one = f.like_i(nch_n, 1);
-        let lastj = f.sub(nch_n, one)?;
-        let jl = f.compare(Cmp::Eq, j, lastj)?;
-        let c0 = cmp_i(f, Cmp::Ne, cap_n, 0)?;
-        let last_n = f.and(jl, c0)?;
-
-        let ic = f.iota(Elem::I32, &[nc, c], 1);
-        let jb = f.broadcast(j, &[nc, c], &[0])?;
-        let cc = f.const_i(Elem::I32, c, &[nc, c]);
-        let local = f.mul(jb, cc)?;
-        let local = f.add(local, ic)?;
-        let lenb = f.broadcast(len_n, &[nc, c], &[0])?;
-        let inside = f.compare(Cmp::Lt, local, lenb)?;
-        let tb = f.broadcast(total, &[nc], &[])?;
-        let live = f.compare(Cmp::Lt, n, tb)?;
-        let live = f.broadcast(live, &[nc, c], &[0])?;
-        let valid = f.and(inside, live)?;
-        let begb = f.broadcast(beg_n, &[nc, c], &[0])?;
-        let row = f.add(begb, local)?;
-        let row = clamp_i(f, row, 0, t - 1)?;
-        let row = f.reshape(row, &[nc * c])?;
-        let valid = f.reshape(valid, &[nc * c])?;
-
-        let ic_res = delta_intra_chunk(f, input, &h_raw, row, valid, None, nc, c)?;
-
-        // The chunk-to-chunk carry over live chunks (`0..total`).
-        let sz = [hh, dk, dv];
-        let s0 = f.const_f(Elem::F32, 0.0, &sz);
-        let o0 = f.const_f(Elem::F32, 0.0, &[nc, hh, c, dv]);
-        let first_i = f.convert(first_n, Elem::I32);
-        let last_i = f.convert(last_n, Elem::I32);
-        let out = loop_upto(
-            f,
-            total,
-            &[s0, init, o0],
-            &[
-                first_i,
-                last_i,
-                lane_n,
-                ic_res.w.unwrap_or(ic_res.ut),
-                ic_res.ut,
-                ic_res.kt,
-                ic_res.gc,
-                ic_res.qg,
-                ic_res.p,
-            ],
-            |f, i, cr, inv| {
-                let (st, fin, o) = (cr[0], cr[1], cr[2]);
-                let (first_i, last_i, lane_n, w, ut, kt, gc, qg, p) = (
-                    inv[0], inv[1], inv[2], inv[3], inv[4], inv[5], inv[6], inv[7], inv[8],
-                );
-                let first = row_at(f, first_i, i)?;
-                let first = cmp_i(f, Cmp::Ne, first, 0)?;
-                let last = row_at(f, last_i, i)?;
-                let last = cmp_i(f, Cmp::Ne, last, 0)?;
-                let lane = row_at(f, lane_n, i)?;
-                let from = row_at(f, fin, lane)?;
-                let s0 = f.select(first, from, st)?;
-                let un = row_at(f, ut, i)?;
-                let kn = row_at(f, kt, i)?;
-                let gn = row_at(f, gc, i)?;
-                let u = if rule {
-                    let wn = row_at(f, w, i)?;
-                    let ws = f.dot_general_at(wn, s0, &[0], &[0], &[2], &[1], Elem::F32, false)?;
-                    f.sub(un, ws)?
-                } else {
-                    un
-                };
-                let qgn = row_at(f, qg, i)?;
-                let pn = row_at(f, p, i)?;
-                let o1 = f.dot_general_at(qgn, s0, &[0], &[0], &[2], &[1], Elem::F32, false)?;
-                let o2 = f.dot_general_at(pn, u, &[0], &[0], &[2], &[1], Elem::F32, false)?;
-                let on = f.add(o1, o2)?;
-                let o = put_at(f, o, on, i)?;
-                let gn = over_keys(f, gn, dk)?;
-                let gn = f.broadcast(gn, &sz, &[0, 1])?;
-                let decayed = f.mul(s0, gn)?;
-                let upd = f.dot_general_at(kn, u, &[0], &[0], &[1], &[1], Elem::F32, false)?;
-                let s1 = f.add(decayed, upd)?;
-                let kept = f.select(last, s1, from)?;
-                let fin = put_at(f, fin, kept, lane)?;
-                Ok(vec![s1, fin, o])
-            },
-        )?;
-        let (fin, o) = (out[1], out[2]);
-
-        let ch = f.div(local_tok, cvt)?;
-        let within = f.rem(local_tok, cvt)?;
-        let cs = take(f, cstart, sg)?;
-        let ch = f.add(cs, ch)?;
-        let pos = f.mul(ch, cvt)?;
-        let pos = f.add(pos, within)?;
-        let pos = clamp_i(f, pos, 0, nc * c - 1)?;
-        let o = f.transpose(o, &[0, 2, 1, 3])?;
-        let o = f.reshape(o, &[nc * c, hh * dv])?;
-        let y = f.take_rows(o, pos)?;
-        let y = f.reshape(y, &[t, hh, dv])?;
-        Ok((y, fin))
-    };
-
-    general_branch(f)
+    let b = take(f, segs.begin, sg)?;
+    let local = f.sub(ti, b)?;
+    let cvt = f.like_i(local, c);
+    let ch = f.div(local, cvt)?;
+    let within = f.rem(local, cvt)?;
+    let cs = take(f, cstart, sg)?;
+    let ch = f.add(cs, ch)?;
+    let pos = f.mul(ch, cvt)?;
+    let pos = f.add(pos, within)?;
+    let pos = clamp_i(f, pos, 0, nc * c - 1)?;
+    let o = f.transpose(o, &[0, 2, 1, 3])?;
+    let o = f.reshape(o, &[nc * c, hh * dv])?;
+    let y = f.take_rows(o, pos)?;
+    let y = f.reshape(y, &[t, hh, dv])?;
+    Ok((y, fin))
 }
 
 /// `(I + A)⁻¹` for a strictly lower-triangular `A` `[n0, n1, C, C]`:
@@ -1245,17 +1068,8 @@ fn unit_lower_inverse(f: &mut Func, a: Val) -> Built<Val> {
             a21s.push(f.reshape(blk, &[n0, n1, 1, b, b])?);
         }
         let a21 = f.concat(&a21s, 2)?;
-        let t = f.dot_general_at(
-            a21,
-            x11,
-            &[0, 1, 2],
-            &[0, 1, 2],
-            &[4],
-            &[3],
-            Elem::F32,
-            false,
-        )?;
-        let t = f.dot_general_at(x22, t, &[0, 1, 2], &[0, 1, 2], &[4], &[3], Elem::F32, false)?;
+        let t = f.dot_general(a21, x11, &[0, 1, 2], &[0, 1, 2], &[4], &[3], Elem::F32)?;
+        let t = f.dot_general(x22, t, &[0, 1, 2], &[0, 1, 2], &[4], &[3], Elem::F32)?;
         let x21 = f.neg(t);
         let zero = f.like_f(x11, 0.0);
         let top = f.concat(&[x11, zero], 4)?;
@@ -1447,39 +1261,39 @@ fn delta(
             let fq = &mut *f;
             let lanes = decode_lanes(fq, slots, t)?;
             let heads = input.heads_from(fq, &raw.rows, &raw.fixed)?;
-            // One round of `t` lanes holds `[t, H, dk, dv]` in VMEM (32 MiB at
-            // t = 64 for a 32×128×128 bf16 state). When a slot is blocked over
-            // multiple rows, gather/step 8 lanes at a time so the gather
-            // window stays in VMEM, then scatter all `t` slots once at the end.
             let round = if per == 1 {
                 t
             } else {
-                (4_194_304 / stride).clamp(1, t)
+                let step_bytes = stride * 4;
+                let budget = if step_bytes > (1 << 20) {
+                    tuning.decode_round_bytes() / 4
+                } else {
+                    tuning.decode_round_bytes() / 2
+                };
+                (budget / step_bytes).clamp(1, t)
             };
-            let orig_slab = slab;
             let mut slab = slab;
             let mut ys = Vec::new();
             let mut lo = 0;
             while lo < t {
                 let hi = (lo + round).min(t);
                 let cut = |fq: &mut Func, x: Val| fq.slice_axis(x, 0, lo, hi);
-                let (part, slot, write) = if lo == 0 && hi == t {
-                    (heads, lanes.slot, lanes.write)
+                let part = if lo == 0 && hi == t {
+                    heads
                 } else {
-                    (
-                        Heads {
-                            q: cut(fq, heads.q)?,
-                            k: cut(fq, heads.k)?,
-                            v: cut(fq, heads.v)?,
-                            g: cut(fq, heads.g)?,
-                            beta: cut(fq, heads.beta)?,
-                        },
-                        cut(fq, lanes.slot)?,
-                        cut(fq, lanes.write)?,
-                    )
+                    Heads {
+                        q: cut(fq, heads.q)?,
+                        k: cut(fq, heads.k)?,
+                        v: cut(fq, heads.v)?,
+                        g: cut(fq, heads.g)?,
+                        beta: cut(fq, heads.beta)?,
+                    }
                 };
-                let s = take_slots(fq, orig_slab, slot, per)?;
-                let s = fq.reshape(s, &[hi - lo, hh, dk, dv])?;
+                let slot = cut(fq, lanes.slot)?;
+                let write = cut(fq, lanes.write)?;
+                let s = take_slots(fq, slab, slot, per)?;
+                let s = fq.convert(s, Elem::F32);
+                let s = fq.reshape(s, &[hi - lo, hh, dv, dk])?;
                 let (yv, s) = delta_step(fq, &part, s, input.rule())?;
                 let s = fq.reshape(s, &[hi - lo, stride])?;
                 slab = land_slots(fq, slab, slot, write, s, per)?;
@@ -1513,17 +1327,12 @@ fn delta(
             };
             let fq = &mut *f;
             let l = lanes.count(fq);
-            let s = fq.dims(segs.begin)[0];
-            if t <= chunk || (l == s && s > 1 && t / s <= chunk) {
-                delta_single_chunk(fq, &input, &raw, &lanes, slab, per, stride, chunk)?
-            } else {
-                let init = take_slots(fq, slab, lanes.slot, per)?;
-                let init = fq.convert(init, Elem::F32);
-                let init = fq.reshape(init, &[l, hh, dk, dv])?;
-                let (yv, fin) = delta_chunked(fq, &input, &raw, &segs, init, chunk)?;
-                let fin = fq.reshape(fin, &[l, stride])?;
-                (yv, land_slots(fq, slab, lanes.slot, lanes.write, fin, per)?)
-            }
+            let init = take_slots(fq, slab, lanes.slot, per)?;
+            let init = fq.convert(init, Elem::F32);
+            let init = fq.reshape(init, &[l, hh, dv, dk])?;
+            let (yv, fin) = delta_chunked(fq, &input, &raw, &segs, init, chunk)?;
+            let fin = fq.reshape(fin, &[l, stride])?;
+            (yv, land_slots(fq, slab, lanes.slot, lanes.write, fin, per)?)
         }
     };
     Ok((yv, slab))

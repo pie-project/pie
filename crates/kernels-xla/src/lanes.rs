@@ -170,14 +170,11 @@ pub(crate) fn loop_upto(
 /// Scatters `rows` (`[lanes, stride]`) over the slab at `slot`, dropping the
 /// lanes `write` is false for.
 pub(crate) fn land_rows(f: &mut Func, slab: Val, slot: Val, write: Val, rows: Val) -> Built<Val> {
-    let l = f.dims(slot)[0];
-    let d0 = f.like_i(slot, DROP);
-    let io = iota(f, l);
-    let drop = f.sub(d0, io)?;
+    let drop = f.like_i(slot, DROP);
     let at = f.select(write, slot, drop)?;
     let elem = f.elem(slab);
     let rows = f.convert(rows, elem);
-    f.put_rows_hinted(slab, at, rows, crate::hlo::Combine::Set, true)
+    f.put_rows(slab, at, rows, crate::hlo::Combine::Set)
 }
 
 /// How many rows of its bank one slot of `stride` elements holds: 1 for a
@@ -219,7 +216,7 @@ pub(crate) fn slot_rows(
 /// row. A TPU gathers rows as wide as a GDN state (a megabyte) by cutting the
 /// whole bank into column blocks first: a copy of every slot, per layer, per
 /// fire.
-const SLICED_LANES: i64 = 16;
+const SLICED_LANES: i64 = 8;
 
 /// Each slot's state as one row, `[L, per · width]`, from a bank of `per`
 /// rows per slot; out-of-range slots clamp (they read garbage, harmlessly).
@@ -245,23 +242,6 @@ pub(crate) fn take_slots(f: &mut Func, slab: Val, slot: Val, per: i64) -> Built<
     }
     let (rows, width) = (f.dims(slab)[0], f.dims(slab)[1]);
     let l = f.dims(slot)[0];
-    if l <= SLICED_LANES || per >= 512 {
-        let zero = ci(f, 0);
-        let p = ci(f, per);
-        let mut out = Vec::with_capacity(l as usize);
-        for i in 0..l {
-            let at = f.slice_axis(slot, 0, i, i + 1)?;
-            let at = f.reshape(at, &[])?;
-            let row_at = f.mul(at, p)?;
-            let blk = f.dynamic_slice(slab, &[row_at, zero], &[per, width])?;
-            out.push(f.reshape(blk, &[1, per * width])?);
-        }
-        return if l == 1 {
-            Ok(out[0])
-        } else {
-            f.concat(&out, 0)
-        };
-    }
     let blocks = f.reshape(slab, &[rows / per, per, width])?;
     let at = f.reshape(slot, &[l, 1])?;
     let got = f.gather(
@@ -276,6 +256,7 @@ pub(crate) fn take_slots(f: &mut Func, slab: Val, slot: Val, per: i64) -> Built<
         },
         &[1, per, width],
     )?;
+    let got = f.convert(got, Elem::F32);
     f.reshape(got, &[l, per * width])
 }
 
@@ -293,34 +274,16 @@ pub(crate) fn land_slots(
     if per == 1 {
         return land_rows(f, slab, slot, write, rows);
     }
-    let l = f.dims(slot)[0];
+    let drop = f.like_i(slot, DROP);
+    let at = f.select(write, slot, drop)?;
     let elem = f.elem(slab);
     let (n, width) = (f.dims(slab)[0], f.dims(slab)[1]);
-    if l <= SLICED_LANES || per >= 512 {
-        let rows = f.convert(rows, elem);
-        let rows = f.reshape(rows, &[l, per, width])?;
-        let zero = ci(f, 0);
-        let p = ci(f, per);
-        let mut out = slab;
-        for i in 0..l {
-            let at = f.slice_axis(slot, 0, i, i + 1)?;
-            let at = f.reshape(at, &[])?;
-            let row_at = f.mul(at, p)?;
-            let r_i = f.slice_axis(rows, 0, i, i + 1)?;
-            let r_i = f.reshape(r_i, &[per, width])?;
-            out = f.dynamic_update_slice(out, r_i, &[row_at, zero])?;
-        }
-        return Ok(out);
-    }
-    let d0 = f.like_i(slot, DROP);
-    let io = iota(f, l);
-    let drop = f.sub(d0, io)?;
-    let at = f.select(write, slot, drop)?;
+    let l = f.dims(slot)[0];
     let blocks = f.reshape(slab, &[n / per, per, width])?;
     let at = f.reshape(at, &[l, 1])?;
     let rows = f.reshape(rows, &[l, per, width])?;
     let rows = f.convert(rows, elem);
-    let out = f.scatter_hinted(
+    let out = f.scatter(
         blocks,
         at,
         rows,
@@ -332,7 +295,6 @@ pub(crate) fn land_slots(
             ..ScatterDims::default()
         },
         Combine::Set,
-        true,
     )?;
     f.reshape(out, &[n, width])
 }
@@ -437,12 +399,7 @@ pub(crate) fn ragged_lanes(f: &mut Func, indptr: Val, slots: Val) -> Built<Lanes
     let span = f.max(span, zero)?;
     let n = f.dims(slots)[0];
     let at = clamp_i(f, lo, 0, n - 1)?;
-    let raw_slot = take(f, slots, at)?;
-    let real = cmp_i(f, Cmp::Ge, raw_slot, 0)?;
-    let neg_one = f.like_i(raw_slot, -1);
-    let sink = f.sub(neg_one, raw_slot)?;
-    let slot = f.select(real, raw_slot, sink)?;
-    let span = f.select(real, span, zero)?;
+    let slot = take(f, slots, at)?;
     let write = cmp_i(f, Cmp::Gt, span, 0)?;
     Ok(Lanes {
         begin: lo,
