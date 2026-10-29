@@ -1044,6 +1044,8 @@ mod tests {
                     mxfp4_mma_from: defaults.mxfp4_mma_from,
                     mxfp4_mma_until: defaults.mxfp4_mma_until,
                     mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
+                    nvfp4_mma_from: defaults.nvfp4_mma_from,
+                    nvfp4_mma_until: defaults.nvfp4_mma_until,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
                 defaults,
@@ -1053,6 +1055,7 @@ mod tests {
             for (spec, rungs, _) in p.entries() {
                 if spec.id == "kernel.ssm.gdn_fused_scan"
                     || (spec.id == "kernel.gemm.rows_m" && std::ptr::eq(p, &l40s))
+                    || (spec.id.starts_with("kernel.moe.nvfp4_mma_") && std::ptr::eq(p, &l40s))
                     || spec.id.starts_with("kernel.moe.mxfp4_mma_")
                     || spec.id.starts_with("engine.prefill_lattice_")
                 {

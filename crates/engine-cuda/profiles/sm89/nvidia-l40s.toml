@@ -8,6 +8,8 @@ device = "NVIDIA L40S"
 # catalog's dense models 2-8% faster on it where the tuner picks it.
 [kernel]
 gemm.rows_m = 16
+moe.nvfp4_mma_from = 17
+moe.nvfp4_mma_until = 65536
 
 [provenance]
 measured = [
@@ -26,6 +28,8 @@ measured = [
   "kernel.moe.mxfp4_grouped",
   "kernel.moe.mxfp4_grouped_reuse",
   "kernel.moe.mxfp4_wmma",
+  "kernel.moe.nvfp4_mma_from",
+  "kernel.moe.nvfp4_mma_until",
   "kernel.qmm.gemm_from",
   "kernel.qmm.long_rows",
   "kernel.qmm.split_thin_max",
