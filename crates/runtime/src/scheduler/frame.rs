@@ -796,6 +796,7 @@ impl FramePolicy {
                 if (self.prompts_only && !prompting)
                     || (prompting
                         && !mid_boundary
+                        && !self.prompts_only
                         && prompting_in_flight.iter().any(|lane| lane != lane_id))
                 {
                     continue;
