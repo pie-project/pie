@@ -264,11 +264,11 @@ pub fn kda(
         Fire::at(kernel(KDA, "::pie::ssm::kda_step")).apply(
             Launch::grid(
                 [
+                    shape.heads * kda_step_splits(ctx, shape.n, shape.heads),
                     shape.n,
-                    shape.heads,
-                    kda_step_splits(ctx, shape.n, shape.heads),
+                    1,
                 ],
-                [STEP_BLOCK, 1, 1],
+                [STEP_BLOCK / 2, 1, 1],
             )
             .smem(kda_shmem(shape.head_dim))
             .programmatic(ctx.tuning().pdl),
@@ -293,12 +293,13 @@ pub fn kda(
     )
 }
 
-/// The blocks a decode step's head splits its value rows over: as many as
+/// The blocks a decode step's head splits its value rows over: four at least
+/// (a quarter of the state a block, as vLLM's decode reads it), as many as
 /// keep two blocks a multiprocessor where the rows and heads alone do not, at
 /// most eight.
 fn kda_step_splits(ctx: &Ctx, n: u32, heads: u32) -> u32 {
     let sms = ctx.multiprocessors().unwrap_or(132);
-    (2 * sms / (n * heads).max(1)).clamp(1, 8)
+    (2 * sms / (n * heads).max(1)).clamp(4, 8)
 }
 
 /// The raw decay and beta rows the tensor-core prep forms its gates from.

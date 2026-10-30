@@ -1329,6 +1329,212 @@ __global__ void __launch_bounds__(128 * kWN) moe_select_fp8a8_mma(
     }
 }
 
+/// `moe_select_fp8a8_mma`'s routed select on a 256x128 tile: 256 weight rows
+/// (two blocks) by a 128-route slice, eight warps each a 64x64 sub-tile, two
+/// unpadded swizzled stages. A warp holds half its rows' A fragments for a
+/// whole 128-code step and runs each 8-route block's four K chunks before
+/// scaling it, so a block's sums stay a few registers, not the tile's; the
+/// sums leave through the stages, a route's 256 rows a run. `kGlu`: the
+/// gate-up bank's 128 gate rows and their 128 up rows a CTA (`n` both
+/// halves), each route's 128 GLU values out in `n / 2` columns.
+template <int kGlu>
+__global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
+    const u8* __restrict__ xq,
+    const u8* __restrict__ xe,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const i32* __restrict__ work,
+    const u8* __restrict__ weight,
+    const u8* __restrict__ atoms,
+    bf16* __restrict__ out,
+    int act_div, int n, int k, int num_experts, float limit, float galpha)
+{
+    constexpr int kRowsCta = 256;
+    constexpr int kSlice = 128;
+    constexpr int kBK = 128;
+    constexpr int kChunks = kBK / 16;
+    constexpr int kStage = (kRowsCta + kSlice) * kBK;
+    constexpr int kNbW = 8;  // 8-route blocks a warp
+
+    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
+    const int item = work[blockIdx.x];
+    const int expert = item >> 16;
+    const int begin = offsets[expert] + (item & 0xFFFF) * kSlice;
+    const int count = min(offsets[expert + 1] - begin, kSlice);
+    if (count <= 0) return;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int wm = (tid >> 5) & 3;
+    const int wn = tid >> 7;
+    const int g = lane >> 2;
+    const int c = lane & 3;
+    const int cta_row0 = static_cast<int>(blockIdx.y) * kRowsCta;
+    const int blocks = k / kBK;
+    // A staged row's bank row: under a GLU the first 128 gate rows, then their up rows.
+    const int c0 = static_cast<int>(blockIdx.y) * (kRowsCta / 2);
+    auto wrow = [&](int row) {
+        if constexpr (kGlu != 0) return row < kRowsCta / 2 ? c0 + row : n / 2 + c0 + row - kRowsCta / 2;
+        else return cta_row0 + row;
+    };
+    const int row_base = wrow(wm * 64);
+
+    const u8* w_e = weight + static_cast<long long>(expert) * n * k;
+    const u8* atoms_at = atoms + atom_offset(expert * n + (row_base & ~127), 0, blocks);
+
+    auto off = [](int row, int chunk) { return row * kBK + (chunk ^ (row & 7)) * 16; };
+
+    extern __shared__ uint4 fp8a8_smem[];
+    u8* smem = reinterpret_cast<u8*>(fp8a8_smem);
+
+    auto load = [&](int step, int st) {
+        u8* sW = smem + st * kStage;
+        u8* sX = sW + kRowsCta * kBK;
+        const int k0 = step * kBK;
+#pragma unroll
+        for (int i = tid; i < kRowsCta * kChunks; i += 256) {
+            const int row = i / kChunks;
+            const int ch = i % kChunks;
+            u8* dst = sW + off(row, ch);
+            if (wrow(row) < n) {
+                __pipeline_memcpy_async(
+                    dst, w_e + static_cast<long long>(wrow(row)) * k + k0 + ch * 16, 16);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+#pragma unroll
+        for (int i = tid; i < kSlice * kChunks; i += 256) {
+            const int tok = i / kChunks;
+            const int ch = i % kChunks;
+            u8* dst = sX + off(tok, ch);
+            if (tok < count) {
+                __pipeline_memcpy_async(
+                    dst, xq + static_cast<long long>(order[begin + tok] / act_div) * k + k0 + ch * 16, 16);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+
+    // The activation rows of this lane's two columns in each 8-route block, -1 past the slice.
+    int xrow[kNbW][2];
+#pragma unroll
+    for (int b = 0; b < kNbW; ++b)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int tok = 64 * wn + 8 * b + 2 * c + h;
+            xrow[b][h] = tok < count ? order[begin + tok] / act_div : -1;
+        }
+
+    float acc[4][kNbW][4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+#pragma unroll
+        for (int b = 0; b < kNbW; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
+
+    load(0, 0);
+    __pipeline_commit();
+    for (int s = 0; s < blocks; ++s) {
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        if (s + 1 < blocks) load(s + 1, (s + 1) & 1);
+        __pipeline_commit();
+
+        const float sw = gfp8::exp2_biased(atoms_at[(s / 4) * 512 + s % 4]);
+        float sc[kNbW][2];
+#pragma unroll
+        for (int b = 0; b < kNbW; ++b)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+                sc[b][h] = xrow[b][h] >= 0 ? sw * gfp8::exp2_biased(xe[xrow[b][h] * blocks + s]) : 0.f;
+
+        const u8* sW = smem + (s & 1) * kStage;
+        const u8* sX = sW + kRowsCta * kBK;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            unsigned a[2][4][4];
+#pragma unroll
+            for (int tt = 0; tt < 2; ++tt)
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk)
+                    ldmatrix_x4(a[tt][kk], sW + off(wm * 64 + 16 * (2 * half + tt) + (lane & 15),
+                                                    2 * kk + (lane >> 4)));
+#pragma unroll
+            for (int b = 0; b < kNbW; ++b) {
+                unsigned bk[2][4];
+#pragma unroll
+                for (int p = 0; p < 2; ++p)
+                    ldmatrix_x4(bk[p], sX + off(64 * wn + 8 * b + (lane & 7), 4 * p + (lane >> 3)));
+                float blk[2][4] = {};
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk)
+#pragma unroll
+                    for (int tt = 0; tt < 2; ++tt)
+                        gfp8::mma(blk[tt], a[tt][kk][0], a[tt][kk][1], a[tt][kk][2], a[tt][kk][3],
+                                  bk[kk >> 1][2 * (kk & 1)], bk[kk >> 1][2 * (kk & 1) + 1]);
+#pragma unroll
+                for (int tt = 0; tt < 2; ++tt) {
+                    float* o = acc[2 * half + tt][b];
+                    o[0] = fmaf(blk[tt][0], sc[b][0], o[0]);
+                    o[1] = fmaf(blk[tt][1], sc[b][1], o[1]);
+                    o[2] = fmaf(blk[tt][2], sc[b][0], o[2]);
+                    o[3] = fmaf(blk[tt][3], sc[b][1], o[3]);
+                }
+            }
+        }
+    }
+
+    // The tile's sums through the stages, route by route, then each route's
+    // 256 rows out in 16-byte runs.
+    constexpr int kOut = kRowsCta + 8;  // a route's staged rows, padded (bf16)
+    bf16* sOut = reinterpret_cast<bf16*>(smem);
+    __pipeline_wait_prior(0);
+    __syncthreads();
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+#pragma unroll
+        for (int b = 0; b < kNbW; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                sOut[(64 * wn + 8 * b + 2 * c + (e & 1)) * kOut + wm * 64 + 16 * t + g + (e >= 2 ? 8 : 0)] =
+                    f32_to_bf16(acc[t][b][e] + 0.f);
+    __syncthreads();
+    if constexpr (kGlu != 0) {
+        // Eight GLU values a run: a gate run and its up run, as `swiglu_vec8` lands SwiGLU.
+        const int inter = n / 2;
+#pragma unroll 4
+        for (int i = tid; i < kSlice * (kRowsCta / 16); i += 256) {
+            const int tok = i / (kRowsCta / 16);
+            const int ch = i % (kRowsCta / 16);
+            if (tok >= count) continue;
+            const bf16* gs = sOut + tok * kOut + 8 * ch;
+            uint4 packed;
+            bf16* o8 = reinterpret_cast<bf16*>(&packed);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float gv = bf16_to_f32(gs[j]);
+                const float uv = bf16_to_f32(gs[kRowsCta / 2 + j]);
+                if constexpr (kGlu == 1) o8[j] = f32_to_bf16(gv / (1.f + __expf(-gv)) * uv);
+                else o8[j] = f32_to_bf16(act::glu<kGlu>(gv, uv, limit, galpha));
+            }
+            *reinterpret_cast<uint4*>(out + static_cast<long long>(order[begin + tok]) * inter + c0 + 8 * ch) =
+                packed;
+        }
+        return;
+    }
+#pragma unroll 4
+    for (int i = tid; i < kSlice * (kRowsCta / 8); i += 256) {
+        const int tok = i / (kRowsCta / 8);
+        const int ch = i % (kRowsCta / 8);
+        if (tok < count)
+            *reinterpret_cast<uint4*>(out + static_cast<long long>(order[begin + tok]) * n + cta_row0 + 8 * ch) =
+                *reinterpret_cast<const uint4*>(sOut + tok * kOut + 8 * ch);
+    }
+}
+
 /// A split `moe_select_fp8a8_mma` dense fire's `splits` f32 partials
 /// (`[splits][count]`) summed in split order into bf16 `out`. Four a thread.
 __global__ void __launch_bounds__(256) fp8a8_fold(

@@ -1324,6 +1324,50 @@ impl Run<'_> {
     #[cfg(feature = "cuda")]
     fn select_glu(&mut self, select: &Linear, glu: &Linear) -> Result<bool, kernels_cuda::Error> {
         use linear::gemm_sm100::Glu;
+        // A wide W8A8 fire on an MXFP4 bank's fp8b128 copy (`kernel.moe.mxfp4_fp8_from`)
+        // off tcgen05: its SwiGLU in the select's epilogue.
+        if let (
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y: sy,
+                bias: None,
+                quantized: true,
+                quant: Some(ActQuant::E4m3 { gran: 128 }),
+                ..
+            },
+            Linear::Glu {
+                packed: Some(packed),
+                y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            },
+        ) = (select, glu)
+            && sy == packed
+            && !linear::gemm_sm100::supported()
+            && let Some((fp8, atoms)) = self.mxfp4_fp8_bank(*bank)
+        {
+            let route_t = self.tensor(*routes);
+            if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from {
+                let experts = self.planes(*bank).0.rows;
+                let x = self.tensor(*x);
+                let mut out = self.tensor(*y);
+                return linear::moe::select_fp8_w8a8_glu(
+                    self.ctx(),
+                    x,
+                    fp8.ptr,
+                    atoms.ptr,
+                    experts,
+                    route_t,
+                    &mut out,
+                    Glu::Swiglu,
+                );
+            }
+        }
         if let Linear::Relu2 { x: packed, y } = *glu {
             let Some((x, routes, sy, linear::moe::GluBank::Bf16(bank), experts)) =
                 self.routed_bank(select)
@@ -1953,6 +1997,26 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.moe_select";
         if !linear::gemm_sm100::supported() {
+            // An MXFP4 bank against e4m3 rows, as the release asks, on the
+            // consumer Blackwells' block-scaled mma.sync (`kernel.moe.mxfp4_w4a8_from`).
+            let (codes, scales, biases, seat) = self.planes(bank);
+            if let ActQuant::E4m3 { gran } = quant
+                && matches!(codes.dtype, Dtype::Mxfp4 | Dtype::U8)
+                && biases.is_none()
+                && !seat.streams()
+                && !crate::device::alloc::is_host_pointer(codes.ptr)
+                && linear::moe::select_mxfp4_w4a8(
+                    self.ctx(),
+                    self.tensor(x),
+                    codes,
+                    scales,
+                    self.tensor(routes),
+                    &mut self.tensor(y),
+                    gran,
+                )?
+            {
+                return Ok(());
+            }
             return self.select_a16(OP, x, bank, routes, y);
         }
         let (codes, scales, biases, seat) = self.planes(bank);

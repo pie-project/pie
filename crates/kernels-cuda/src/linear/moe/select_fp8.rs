@@ -174,6 +174,35 @@ pub fn select_fp8_w8a8(
             Share::Take
         },
     )?;
+    // A busy expert's 128-route slices on 256-row tiles where N is whole 256s.
+    if nb == 16 && y.width.is_multiple_of(256) {
+        return ctx.fire(
+            OP,
+            Fire::at(kernel(
+                SELECT_SM80,
+                "::pie::linear::moe_select_fp8a8_wide<0>",
+            ))
+            .apply(
+                Launch::grid([work_cap, y.width / 256, 1], [256, 1, 1]).smem(2 * (256 + 128) * 128),
+            ),
+            &[
+                ArgValue::Ptr(xq),
+                ArgValue::Ptr(xe),
+                ArgValue::Ptr(order),
+                ArgValue::Ptr(offsets),
+                ArgValue::Ptr(work),
+                ArgValue::Ptr(codes),
+                ArgValue::Ptr(atoms),
+                y.arg(),
+                act_div.arg(),
+                n.arg(),
+                stated(OP, x.width)?.arg(),
+                stated(OP, experts)?.arg(),
+                0f32.arg(),
+                1f32.arg(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(kernel(
@@ -260,6 +289,81 @@ pub fn matmul_fp8_scaled(
             stated(OP, x.rows)?.arg(),
             stated(OP, y.width)?.arg(),
             stated(OP, x.width)?.arg(),
+        ],
+    )?;
+    Ok(true)
+}
+
+/// [`select_fp8_w8a8`] over a gate-up bank (`2 y.width` rows, the gate
+/// half first) with its GLU landed in the epilogue, where a busy expert's
+/// fire takes the 256x128 tiles off wgmma; `false`, nothing fired, elsewhere.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn select_fp8_w8a8_glu(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: u64,
+    atoms: u64,
+    experts: u32,
+    routes: Tensor,
+    y: &mut Tensor,
+    glu: crate::linear::gemm_sm100::Glu,
+) -> Result<bool, Error> {
+    const OP: &str = "fused.moe_select_fp8_w8a8_glu";
+    let fan = selected(OP, x, routes, y)?;
+    let n = 2 * nonzero(OP, "the GLU's width", y.width)?;
+    if hopper_wgmma()
+        || experts == 0
+        || !fp8_w8a8_takes(x, n)
+        || !n.is_multiple_of(256)
+        || fan.route_count.div_ceil(experts) <= 64
+    {
+        return Ok(false);
+    }
+    let (code, limit, alpha) = glu_code(OP, Some(glu))?;
+    let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        OP,
+        routes,
+        &fan,
+        experts,
+        128,
+        true,
+        if KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            SELECT_SM80,
+            &format!("::pie::linear::moe_select_fp8a8_wide<{code}>"),
+        ))
+        .apply(Launch::grid([work_cap, n / 256, 1], [256, 1, 1]).smem(2 * (256 + 128) * 128)),
+        &[
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xe),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            y.arg(),
+            act_div.arg(),
+            stated(OP, n)?.arg(),
+            stated(OP, x.width)?.arg(),
+            stated(OP, experts)?.arg(),
+            limit.arg(),
+            alpha.arg(),
         ],
     )?;
     Ok(true)

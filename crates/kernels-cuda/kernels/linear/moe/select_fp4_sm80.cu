@@ -256,7 +256,7 @@ __global__ void __launch_bounds__(32 * kWarps) moe_select_mxfp4_mma_staged(
         for (int t = 0; t < kTiles; ++t)
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                cw[t][h] = live ? w4mma::ld_stream(wrow[t][h] + ch * 64) : make_uint4(0, 0, 0, 0);
+                cw[t][h] = live ? w4mma::ld_stream_l2(wrow[t][h] + ch * 64) : make_uint4(0, 0, 0, 0);
                 if constexpr (kNv) {
                     cs[t][h] = live ? w4mma::ld_scale2(srow[t][h] + ch * 8) : 0u;
                 } else {

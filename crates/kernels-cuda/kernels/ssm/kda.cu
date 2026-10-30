@@ -444,12 +444,13 @@ __global__ void kda_step(
     // producer is done; its own dependents may launch from here.
     pdl_wait();
     pdl_launch();
-    const int r = blockIdx.x;
+    const int r = blockIdx.y;
 
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
 
     const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
-    const int h = blockIdx.y;
+    const int splits = static_cast<int>(gridDim.x) / H;
+    const int h = static_cast<int>(blockIdx.x) / splits;
 
     const long long rh = (long long)r * H + h;
     const float* q_h = q_norm + rh * D;
@@ -460,11 +461,11 @@ __global__ void kda_step(
 
     const int slot = slot_ids[r];
     if (slot < 0) return;
-    // `gridDim.z` blocks share the head's value rows (a decode's few rows):
+    // `splits` adjacent blocks share the head's value rows:
     // this block's run of them, and only those copied where the row does not
     // fold.
-    const int per = (D + static_cast<int>(gridDim.z) - 1) / static_cast<int>(gridDim.z);
-    const int v_lo = static_cast<int>(blockIdx.z) * per;
+    const int per = (D + splits - 1) / splits;
+    const int v_lo = static_cast<int>(blockIdx.x) % splits * per;
     const int v_hi = min(D, v_lo + per);
     float* st = state_base + (long long)slot * slot_stride_elems + (long long)h * D * D;
     if (!folds(write_state, write_state_mask, r)) {
@@ -473,6 +474,8 @@ __global__ void kda_step(
         st = copy;
     }
     float* out_h = out + ((long long)r_row * H + h) * D;
+    for (int i = v_lo * D + static_cast<int>(threadIdx.x) * 32; i < v_hi * D; i += static_cast<int>(blockDim.x) * 32)
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(st + i));
 
     extern __shared__ float smem[];
     float* sq = smem;
