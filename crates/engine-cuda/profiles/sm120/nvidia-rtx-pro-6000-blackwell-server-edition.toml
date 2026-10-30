@@ -36,6 +36,15 @@ gemm.fp8_shadow = true
 # kernels launch as programmatic dependents, as on the RTX 5090: Qwen3-0.6B single-request decode
 # 1.58 -> 1.50 ms a token, greedy tokens unchanged
 pdl = true
+# MiMo's wide-group decode rows (and its sink layers' windowed ones) read the cache through the
+# prefill kernel at their live head widths, as on the A100 and L40S
+sdpa.decode.grouped_prefill_from = 8
+sdpa.decode.grouped_prefill_lse = true
+sdpa.decode.grouped_prefill_window = true
+sdpa.fa2_live = true
+# wide MXFP4 selects of a release that asks for e4m3 activations (MiMo) run W8A8 on a block-FP8
+# copy of the bank, as SGLang reads them
+moe.mxfp4_fp8_from = 256
 
 # independent chains (shared expert beside the routed ones) on side streams, as sm100 runs them:
 # Qwen3.6-35B-A3B single-request decode 170 -> 179 tok/s, greedy tokens unchanged, c128 unchanged

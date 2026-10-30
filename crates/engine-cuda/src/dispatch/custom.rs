@@ -835,9 +835,63 @@ impl Run<'_> {
                 .map(|()| turn.is_some());
         }
         self.attention(window)?;
+        if self.pool_sinked(pool, merge, *sink, *o_out)? {
+            return Ok(false);
+        }
         self.attention(pool)?;
         self.attention(merge)?;
         self.attention(sinked).map(|()| false)
+    }
+
+    /// The pool's tensor-core walk with the window's partial folded in and
+    /// the sinks applied in its epilogue (the merge and the sinks of
+    /// `pool_attention` in one launch with the pool), where it takes them.
+    fn pool_sinked(
+        &mut self,
+        pool: &poem_ir::Attn,
+        merge: &poem_ir::Attn,
+        sink: poem_ir::ValueId,
+        o_out: poem_ir::ValueId,
+    ) -> Result<bool, kernels_cuda::Error> {
+        let (
+            poem_ir::Attn::PoolLse {
+                q,
+                positions,
+                request_of_token,
+                selection,
+                entries,
+                ratio,
+                top_k,
+                heads,
+                head_dim,
+                sm_scale,
+                ..
+            },
+            poem_ir::Attn::MergeLse { o1, lse1, .. },
+        ) = (pool, merge)
+        else {
+            return Ok(false);
+        };
+        let selection = match (selection, top_k) {
+            (Some(selection), Some(top_k)) => Some((self.tensor(*selection), *top_k)),
+            (None, None) => None,
+            _ => return Ok(false),
+        };
+        kernels_cuda::attn::compressed::pool_lse::pool_merge_sink(
+            self.ctx(),
+            self.tensor(*q),
+            self.tensor(*positions),
+            self.tensor(*request_of_token),
+            selection,
+            &self.pool(*entries),
+            *ratio,
+            *heads,
+            *head_dim,
+            *sm_scale,
+            (self.tensor(*o1), self.tensor(*lse1)),
+            self.tensor(sink),
+            &mut self.tensor(o_out),
+        )
     }
 
     /// Whether `window` reads V4.1's FP4 cache at `rows` the profile sends

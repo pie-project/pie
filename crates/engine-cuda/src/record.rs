@@ -163,7 +163,7 @@ impl core::fmt::Display for Uncut {
 }
 
 #[must_use]
-pub fn widen(compiled: &CompiledModel, admits: &[Admit]) -> Vec<Admit> {
+pub fn widen(compiled: &CompiledModel, admits: &[Admit], bucket: u32) -> Vec<Admit> {
     let template = compiled.template();
     let mut table: Vec<Admit> = (0..template.len())
         .map(|at| admits.get(at).copied().unwrap_or(Admit::Island))
@@ -171,7 +171,7 @@ pub fn widen(compiled: &CompiledModel, admits: &[Admit]) -> Vec<Admit> {
     if !table.contains(&Admit::Island) {
         return table;
     }
-    let welded = welds(compiled);
+    let welded = welds(compiled, bucket);
     loop {
         let mut grew = false;
         for weld in &welded {
@@ -197,9 +197,16 @@ pub fn widen(compiled: &CompiledModel, admits: &[Admit]) -> Vec<Admit> {
     table
 }
 
-fn fork_open(template: &[poem_compiler::Region]) -> Vec<bool> {
+fn fork_open(compiled: &CompiledModel, bucket: u32) -> Vec<bool> {
+    let template = compiled.template();
     let n = template.len();
     let mut open = vec![false; n];
+    // A fire wider than `compiler.dag_streams_until` runs in order on the
+    // main stream, so it has no fork to keep whole.
+    let until = compiled.streams.forked_until;
+    if until != 0 && bucket > until {
+        return open;
+    }
     for (src, region) in template.iter().enumerate() {
         for event in region.open.into_iter().chain(region.close) {
             if let Some(last) = (src + 1..n).rfind(|&dst| template[dst].wait.contains(&event)) {
@@ -220,11 +227,11 @@ fn fork_open(template: &[poem_compiler::Region]) -> Vec<bool> {
     open
 }
 
-fn welds(compiled: &CompiledModel) -> Vec<Vec<u32>> {
+fn welds(compiled: &CompiledModel, bucket: u32) -> Vec<Vec<u32>> {
     let template = compiled.template();
     let mut welds: Vec<Vec<u32>> = Vec::new();
 
-    let open_fork = fork_open(template);
+    let open_fork = fork_open(compiled, bucket);
     let mut index = 1usize;
     while index < template.len() {
         if !open_fork[index] {
@@ -279,9 +286,10 @@ fn welds(compiled: &CompiledModel) -> Vec<Vec<u32>> {
 pub fn cuts(
     compiled: &CompiledModel,
     admits: &[Admit],
+    bucket: u32,
 ) -> core::result::Result<Vec<Stretch>, Uncut> {
     let template = compiled.template();
-    let table = widen(compiled, admits);
+    let table = widen(compiled, admits, bucket);
     if table.contains(&Admit::Island) {
         let mut seen: Vec<((&poem_ir::ClassSet, u32), Admit)> = Vec::new();
         for (index, region) in template.iter().enumerate() {
@@ -310,7 +318,7 @@ pub fn cuts(
         }
     }
 
-    let open_fork = fork_open(template);
+    let open_fork = fork_open(compiled, bucket);
     let mut cuts: Vec<Stretch> = Vec::new();
     for (index, region) in template.iter().enumerate() {
         let at = index as u32;
@@ -849,7 +857,7 @@ impl Bodies {
         if replays && let Some(body) = self.map.bodies.get_mut(&key) {
             debug_assert!(
                 {
-                    let asked = cuts(at.compiled, at.ceilings.admits);
+                    let asked = cuts(at.compiled, at.ceilings.admits, at.descriptor.bucket);
                     let asked = asked.as_deref().unwrap_or(&[]);
                     let mut at_cut = asked.iter();
                     body.script
@@ -948,7 +956,7 @@ impl Bodies {
             return Ok(());
         }
 
-        let Ok(script) = cuts(at.compiled, at.ceilings.admits) else {
+        let Ok(script) = cuts(at.compiled, at.ceilings.admits, at.descriptor.bucket) else {
             return Ok(());
         };
         // An arming expert-parallel group captures and instantiates its
