@@ -115,13 +115,27 @@ pub(crate) fn mxfp4_mma_worth(
 /// The most routes an expert averages that the register-held mxfp4
 /// select takes; past it, the shared-memory-staged one.
 #[cfg(feature = "cuda")]
-pub(super) const STAGED_FROM: u32 = 32;
+pub(super) const STAGED_FROM: u32 = 16;
 
 /// The fewest routes an expert averages that Hopper's staged wgmma select
 /// takes from the register-held one (DeepSeek-V4-Flash's miniature at 24 a
 /// 64-row decode: 11% less time a fire).
 #[cfg(feature = "cuda")]
 pub(super) const WGMMA_FROM: u32 = 13;
+
+/// The fewest routes an expert averages that the staged slice takes on
+/// `moe_select_mxfp4_mma_pipe`: below it the fire's 256-row CTAs fill the
+/// card too thinly (DeepSeek-V4.1's miniature at 128 tokens: 7-30% slower,
+/// at 512 even; 9-27% faster from 1024).
+#[cfg(feature = "cuda")]
+const PIPE_FROM: u32 = 192;
+
+/// The stages of `moe_select_mxfp4_mma_pipe`'s ring, and a stage's bytes:
+/// 64 routes' 128-code runs, 256 rows' codes and their scales.
+#[cfg(feature = "cuda")]
+const PIPE_STAGES: u32 = 3;
+#[cfg(feature = "cuda")]
+const PIPE_STAGE: u32 = 64 * 256 + 256 * 64 + 256 * 4;
 
 /// The 128-code chunks a warp of the register-held mxfp4 select keeps in
 /// flight: one, five CTAs an SM; a decode's few CTAs take more warps from
@@ -189,6 +203,14 @@ pub(super) fn select_mxfp4_mma(
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
     let inter = stated(op, y.width)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
+    // A wide fire of a K of whole 128s takes the staged slice's eight-warp
+    // ring of codes and routes (`moe_select_mxfp4_mma_pipe`), mxfp4 alone.
+    let pipe = staged
+        && per >= PIPE_FROM
+        && !hopper_wgmma()
+        && tensor_scales.is_none()
+        && k % 128 == 0
+        && ctx.smem_fits(PIPE_STAGES * PIPE_STAGE);
     let RouteOrder {
         order,
         offsets,
@@ -254,12 +276,34 @@ pub(super) fn select_mxfp4_mma(
             &format!("::pie::linear::moe_select_fp4_wgmma<{code}, {nv}, {stages}>"),
         ))
         .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(smem))
-    } else if staged {
-        const STAGES: u32 = 3;
-        let nv = tensor_scales.is_some();
+    } else if pipe {
+        let cols = if glu.is_some() { 128 } else { 256 };
+        let tiles = y.width.div_ceil(cols);
         Fire::at(kernel(
             SELECT_FP4_SM80,
-            &format!("::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}>"),
+            &format!("::pie::linear::moe_select_mxfp4_mma_pipe<{code}, {PIPE_STAGES}>"),
+        ))
+        .apply(
+            Launch::grid(
+                if act_div == 1 {
+                    [tiles, grid[0], 1]
+                } else {
+                    [grid[0], tiles, 1]
+                },
+                [256, 1, 1],
+            )
+            .smem(PIPE_STAGES * PIPE_STAGE),
+        )
+    } else if staged {
+        const STAGES: u32 = 3;
+        const WARPS: u32 = 8;
+        let nv = tensor_scales.is_some();
+        let grid = [grid[0], y.width.div_ceil(cols * WARPS / 4), 1];
+        Fire::at(kernel(
+            SELECT_FP4_SM80,
+            &format!(
+                "::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}, {WARPS}>"
+            ),
         ))
         .apply(
             Launch::grid(
@@ -268,7 +312,7 @@ pub(super) fn select_mxfp4_mma(
                 } else {
                     grid
                 },
-                [THREADS, 1, 1],
+                [32 * WARPS, 1, 1],
             )
             .smem(STAGES * 8 * nb * 16 * 16),
         )

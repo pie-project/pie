@@ -42,6 +42,7 @@ class TestPackageSurface:
         assert set(inferlet.__all__) == {
             "chat",
             "eta",
+            "frames",
             "grammar",
             "mask",
             "media",

@@ -278,6 +278,16 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let working_at = |tokens: u32| working(tokens, &voxels);
     let share = after_weights / 100 * u64::from(engine.working_set_percent);
     let tokens = crate::store::tokens_within(asked_tokens, floor, share, working_at);
+    // The halving can land a whole step short: the widest bucket of the asked
+    // lattice past it that still fits serves more rows a fire.
+    let tokens = budget_at(asked_tokens)
+        .buckets
+        .iter()
+        .copied()
+        .filter(|&rows| rows > tokens && rows < asked_tokens)
+        .rev()
+        .find(|&rows| working_at(rows) <= share)
+        .unwrap_or(tokens);
     let voxels = match voxels.clone() {
         Some(ladder) if derive_voxels => {
             let floor = ladder.max_clips;

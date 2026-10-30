@@ -690,6 +690,7 @@ mod tests {
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         ssm_gdn_fused_scan: false,
+                        ssm_kda_chunked: false,
                         mxfp4_mma_from: defaults.mxfp4_mma_from,
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
                         mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
@@ -699,6 +700,7 @@ mod tests {
                     "{gpu}"
                 );
                 assert_eq!(tuning.ssm_gdn_fused_scan, minor != 7, "{gpu}");
+                assert_eq!(tuning.ssm_kda_chunked, minor == 9, "{gpu}");
                 assert_eq!(
                     tuning.mxfp4_mma_until,
                     if minor == 7 { 0 } else { 16_777_216 },
@@ -1032,6 +1034,7 @@ mod tests {
                 Engine {
                     prefill_lattice_from: 256,
                     prefill_lattice_steps: 8,
+                    forward_tokens: if std::ptr::eq(p, &l40s) { 2048 } else { 0 },
                     ..Engine::of(&registry().defaults())
                 }
             );
@@ -1048,6 +1051,19 @@ mod tests {
                     nvfp4_mma_until: defaults.nvfp4_mma_until,
                     gemm_fp8_shadow: defaults.gemm_fp8_shadow,
                     selected_mma: defaults.selected_mma,
+                    rows_vec: defaults.rows_vec,
+                    hc_tile: defaults.hc_tile,
+                    hc_mma: defaults.hc_mma,
+                    merge_warp: defaults.merge_warp,
+                    norm_emit: defaults.norm_emit,
+                    pool_mma: defaults.pool_mma,
+                    index_mma: defaults.index_mma,
+                    index_radix: defaults.index_radix,
+                    decode_grouped_prefill_from: defaults.decode_grouped_prefill_from,
+                    bf16_mma_from: defaults.bf16_mma_from,
+                    bf16_mma_until: defaults.bf16_mma_until,
+                    mxfp4_fp8_from: defaults.mxfp4_fp8_from,
+                    ssm_kda_chunked: defaults.ssm_kda_chunked,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
                 defaults,
@@ -1062,6 +1078,21 @@ mod tests {
                     || (spec.id == "kernel.sdpa.selected_mma" && std::ptr::eq(p, &l40s))
                     || spec.id.starts_with("kernel.moe.mxfp4_mma_")
                     || spec.id.starts_with("engine.prefill_lattice_")
+                    || (spec.id == "engine.forward_tokens" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.sdpa.decode.grouped_prefill_from"
+                        && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.sdpa.index_mma" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.sdpa.index_radix" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.elemwise.hc_tile" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.elemwise.hc_mma" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.elemwise.norm_emit" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.elemwise.rows_vec" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.sdpa.merge_warp" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.sdpa.pool_mma" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.moe.bf16_mma_from" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.moe.bf16_mma_until" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.moe.mxfp4_fp8_from" && std::ptr::eq(p, &l40s))
+                    || spec.id == "kernel.ssm.kda_chunked"
                 {
                     continue;
                 }

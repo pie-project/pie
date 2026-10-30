@@ -155,8 +155,8 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_mxfp4_mma(
 /// 64: the slice's activations staged a 128-code chunk at a time in shared
 /// memory through a `kStages` cp.async ring the CTA's warps share, so a
 /// wide fire streams each expert's codes once a 64 routes, not a 32.
-template <int kNb, int kStages, int kGlu, bool kNv = false>
-__global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
+template <int kNb, int kStages, int kGlu, bool kNv = false, int kWarps = 4>
+__global__ void __launch_bounds__(32 * kWarps) moe_select_mxfp4_mma_staged(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
     const i32* __restrict__ offsets,
@@ -177,7 +177,6 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
     // Four warps a CTA, each two m16 tiles of weight rows (a GLU's gate tile
     // and its up tile).
     constexpr int kTiles = 2;
-    constexpr int kWarps = 4;
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
     constexpr int kRowsCta = kWarps * kRowsWarp;
     constexpr int kSlice = 8 * kNb;
@@ -319,6 +318,165 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
     const float* t_e = kNv ? tscale + static_cast<long long>(expert) * n : nullptr;
     auto factor = [&](int row) { return kNv ? t_e[row] * 256.f : 1.f; };
+    w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,
+                                      row_base, g, c, limit, galpha);
+}
+
+/// `moe_select_mxfp4_mma_staged` for a wide fire, `k` whole 128s: eight
+/// warps a CTA (256 rows, or 128 GLU columns), each 128-code chunk's codes
+/// and scales staged with the slice's 64 routes through one `kStages`
+/// cp.async ring, so a chunk's reads land stages ahead of its MMAs and the
+/// routes' runs stage once a 256 rows.
+template <int kGlu, int kStages>
+__global__ void __launch_bounds__(256, 1) moe_select_mxfp4_mma_pipe(
+    const bf16* __restrict__ act,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const i32* __restrict__ work,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const bf16* __restrict__ bias,
+    bf16* __restrict__ out,
+    int act_div,
+    int n,
+    int k,
+    int num_experts,
+    int inter,
+    float limit,
+    float galpha,
+    const float* __restrict__ tscale)
+{
+    constexpr int kNb = 8;
+    constexpr int kTiles = 2;
+    constexpr int kWarps = 8;
+    constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
+    constexpr int kRowsCta = kWarps * kRowsWarp;
+    constexpr int kSlice = 8 * kNb;
+    constexpr int kThreads = 32 * kWarps;
+    constexpr int kRowStep = kThreads / 16;
+    constexpr int kPasses = kSlice / kRowStep;
+    // A stage: the routes' runs, then a lane's 16-byte code run of each of
+    // its four rows (`[warp][t][h][lane]`), then each row's four scales.
+    constexpr int kXRuns = kSlice * 16;
+    constexpr int kWRuns = kWarps * kTiles * 2 * 32;
+    constexpr int kStage = kXRuns + kWRuns + kWRuns / 16;
+
+    const int at = static_cast<int>(act_div == 1 ? blockIdx.y : blockIdx.x);
+    if (at >= offsets[num_experts + 1]) return;
+    const int item = work[at];
+    const int expert = item >> 16;
+    const int slice = item & 0xFFFF;
+    const int begin = offsets[expert] + slice * kSlice;
+    const int count = min(offsets[expert + 1] - begin, kSlice);
+    if (count <= 0) return;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int g = lane >> 2;
+    const int c = lane & 3;
+    const int row_base = static_cast<int>(act_div == 1 ? blockIdx.x : blockIdx.y) * kRowsCta + warp * kRowsWarp;
+    const int span = kGlu != 0 ? inter : n;
+    auto tile_row = [&](int t) { return kGlu != 0 ? row_base + t * inter : row_base + 16 * t; };
+    const bool rows_live = row_base < span;
+
+    const int chunks = k >> 7;
+    const long long row_bytes = k >> 1;
+    const int sf_row = k >> 5;
+    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
+    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+
+    // This lane's rows: its code runs (group `c` a chunk) and, at `c` 0,
+    // their four scales a chunk, kept as bank rows (not pointers).
+    int wr[kTiles][2];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) wr[t][h] = min(max(tile_row(t), 0) + 8 * h + g, n - 1);
+
+    const int run = tid & 15;
+    int src[kPasses];
+#pragma unroll
+    for (int j = 0; j < kPasses; ++j) {
+        const int tok = (tid >> 4) + kRowStep * j;
+        src[j] = tok < count ? order[begin + tok] / act_div : -1;
+    }
+    extern __shared__ __align__(16) uint4 pipe_smem[];
+    auto cp16 = [](const void* dst, const void* from, int live) {
+        const unsigned saddr = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(saddr), "l"(from), "r"(live));
+    };
+    auto stage = [&](int ch) {
+        if (ch < chunks) {
+            uint4* st = pipe_smem + (ch % kStages) * kStage;
+#pragma unroll
+            for (int j = 0; j < kPasses; ++j) {
+                const int row = (tid >> 4) + kRowStep * j;
+                const bool live = src[j] >= 0;
+                const bf16* from = act + static_cast<long long>(live ? src[j] : 0) * k + ch * 128 + run * 8;
+                cp16(st + w4mma::x_slot(row, run), from, live ? 16 : 0);
+            }
+            uint4* ws = st + kXRuns + warp * (kTiles * 2 * 32);
+            unsigned* ss = reinterpret_cast<unsigned*>(st + kXRuns + kWRuns) + warp * (kTiles * 2 * 8);
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    cp16(ws + (t * 2 + h) * 32 + lane, w_e + wr[t][h] * row_bytes + ch * 64 + c * 16, 16);
+                    if (c == 0) {
+                        const unsigned saddr = static_cast<unsigned>(__cvta_generic_to_shared(ss + (t * 2 + h) * 8 + g));
+                        asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(saddr), "l"(s_e + wr[t][h] * sf_row + ch * 4));
+                    }
+                }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+
+    float acc[kTiles][kNb][4];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int b = 0; b < kNb; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) stage(s);
+
+    for (int ch = 0; ch < chunks; ++ch) {
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 2));
+        uint4* st = pipe_smem + (ch % kStages) * kStage;
+#pragma unroll
+        for (int j = 0; j < kPasses; ++j) w4mma::lay_staged(st + w4mma::x_slot((tid >> 4) + kRowStep * j, run));
+        __syncthreads();
+        // The ring's oldest stage, every warp past its MMAs.
+        stage(ch + kStages - 1);
+        if (rows_live) {
+            const uint4* ws = st + kXRuns + warp * (kTiles * 2 * 32);
+            const unsigned* ss = reinterpret_cast<const unsigned*>(st + kXRuns + kWRuns) + warp * (kTiles * 2 * 8);
+            uint4 cw[kTiles][2];
+            unsigned cs[kTiles][2];
+            bool wide = false;
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    cw[t][h] = ws[(t * 2 + h) * 32 + lane];
+                    cs[t][h] = (ss[(t * 2 + h) * 8 + g] >> (8 * c)) & 0xFFu;
+                    wide |= cs[t][h] > 128u;
+                }
+            if (__any_sync(0xffffffffu, wide)) {
+                w4mma::compute_staged<true, false>(cw, cs, st, g, c, acc);
+            } else {
+                w4mma::compute_staged<false, false>(cw, cs, st, g, c, acc);
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    if (!rows_live) return;
+
+    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    auto factor = [](int) { return 1.f; };
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,
                                       row_base, g, c, limit, galpha);
 }
