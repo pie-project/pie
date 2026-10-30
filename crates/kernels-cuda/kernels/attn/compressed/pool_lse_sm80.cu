@@ -37,7 +37,7 @@ struct PoolShape {
 
 // `kSelected`: the row's `top_k` ids in `selection`, ended early by a negative
 // one; otherwise every compressed row the query sees.
-template <int D, bool kSelected>
+template <int D, bool kSelected, class SinkT = bf16>
 __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
     const bf16* __restrict__ q,
     const bf16* __restrict__ comp_kv_pages,
@@ -54,6 +54,9 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
     int page_size,
     float scale,
     int compact,
+    const bf16* __restrict__ win_o,
+    const float* __restrict__ win_lse,
+    const SinkT* __restrict__ sinks,
     const u32* __restrict__ win)
 {
     using S = PoolShape<D>;
@@ -250,6 +253,66 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
 
     const float inv_lo = l_lo > 0.f ? 1.f / l_lo : 0.f;
     const float inv_hi = l_hi > 0.f ? 1.f / l_hi : 0.f;
+    if (win_o != nullptr) {
+        // The window's partial folded in as `merge_lse_combine` folds it and
+        // the sinks applied as `sink_rescale` applies them, into `o`, each
+        // rounded to bf16 where the three launches rounded it.
+        struct Fold {
+            int mode;  // 0: the window alone, 1: the pool alone, 2: both
+            float w1, w2, inv_total, r;
+        };
+        auto fold = [&](int h, float l, float m) {
+            constexpr float kLog2e = 1.44269504088896340736f;
+            constexpr float kLn2 = 0.69314718055994530942f;
+            const float lp = l > 0.f ? (logf(l) + m) * kLog2e : -CUDART_INF_F;
+            const float lw = win_lse[qi_row * num_q_heads + head0 + h];
+            Fold f{0, 0.f, 0.f, 0.f, 1.f};
+            float lse = lw;
+            if (isfinite(lp)) {
+                if (!isfinite(lw)) {
+                    f.mode = 1;
+                    lse = lp;
+                } else {
+                    f.mode = 2;
+                    const float lse_max = fmaxf(lw, lp);
+                    f.w1 = exp2f(lw - lse_max);
+                    f.w2 = exp2f(lp - lse_max);
+                    f.inv_total = 1.0f / (f.w1 + f.w2);
+                    lse = lse_max + log2f(f.w1 + f.w2);
+                }
+            }
+            if (isfinite(lse)) {
+                const float diff = lse * kLn2 - Elem<SinkT>::to_f32(sinks[head0 + h]);
+                f.r = 1.0f / (1.0f + __expf(-diff));
+            }
+            return f;
+        };
+        auto land = [&](const Fold& f, long long at, float acc) {
+            const float v1 = Elem<bf16>::to_f32(win_o[at]);
+            const float v2 = Elem<bf16>::to_f32(f32_to_bf16(acc));
+            const float merged = f.mode == 0 ? v1
+                : f.mode == 1 ? v2
+                : Elem<bf16>::to_f32(f32_to_bf16((v1 * f.w1 + v2 * f.w2) * f.inv_total));
+            o[at] = f32_to_bf16(merged * f.r);
+        };
+        const Fold lo = g < heads ? fold(g, l_lo, m_lo) : Fold{};
+        const Fold hi = g + 8 < heads ? fold(g + 8, l_hi, m_hi) : Fold{};
+#pragma unroll
+        for (int n = 0; n < kWarpTiles; ++n) {
+            const int d = warp * kWarpDims + n * 8 + p;
+            if (g < heads) {
+                const long long at = (static_cast<long long>(qi_row) * num_q_heads + head0 + g) * D + d;
+                land(lo, at, oacc[n][0] * inv_lo);
+                land(lo, at + 1, oacc[n][1] * inv_lo);
+            }
+            if (g + 8 < heads) {
+                const long long at = (static_cast<long long>(qi_row) * num_q_heads + head0 + g + 8) * D + d;
+                land(hi, at, oacc[n][2] * inv_hi);
+                land(hi, at + 1, oacc[n][3] * inv_hi);
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int n = 0; n < kWarpTiles; ++n) {
         const int d = warp * kWarpDims + n * 8 + p;
