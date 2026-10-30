@@ -201,6 +201,8 @@ struct Deployment {
     seats: u32,
     context: u32,
     max_lanes: u32,
+    /// `engine.prefill_lanes`: the most lanes a fire of prompts alone pads to.
+    prefill_lanes: u32,
     patch_fold: u32,
     /// Whether the load is an expert-parallel rank's, which fires a step
     /// with no lanes of its own at every bucket its group fires.
@@ -238,7 +240,10 @@ fn prefill_keys(deployment: &Deployment, into: &mut Targets) {
         for class in deployment.prefilling.iter().copied() {
             match Shell::spread(
                 point,
-                deployment.seats.min(deployment.max_lanes),
+                deployment.seats.min(match deployment.prefill_lanes {
+                    0 => deployment.max_lanes,
+                    cap => deployment.max_lanes.min(cap),
+                }),
                 deployment.context,
             ) {
                 Some(rows) => into
@@ -999,6 +1004,7 @@ impl Shell {
             seats,
             context,
             max_lanes,
+            prefill_lanes: self.prefill_lanes,
             patch_fold: self.patch_fold,
             idle: self.ep.is_some(),
         };

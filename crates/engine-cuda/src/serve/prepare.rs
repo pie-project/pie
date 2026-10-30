@@ -1342,8 +1342,20 @@ impl FrameShell for Shell {
             .iter()
             .position(|&rows| rows == composition.bucket())
             .unwrap_or(0) as u32;
-        let lane_ceiling = self.lane_ceiling();
         let token_axis = composition.axis(poem_ir::RowAxis::Tokens);
+        // A fire of prompts alone pads to `engine.prefill_lanes`, not every lane the load seats.
+        let max_lanes = match self.prefill_lanes {
+            cap if cap > 0
+                && token_axis
+                    .classes
+                    .present_in_order()
+                    .all(|class| !self.decoding.contains(class as usize)) =>
+            {
+                self.budget.max_lanes.min(cap)
+            }
+            _ => self.budget.max_lanes,
+        };
+        let lane_ceiling = self.lane_ceiling().min(max_lanes);
         let patches = composition.axis(poem_ir::RowAxis::Patches);
         let key = record::BodyKey::of_axes(
             &token_axis.classes,
@@ -1473,8 +1485,10 @@ impl FrameShell for Shell {
                         _ => (last + rung.min(lane_ceiling), every),
                     }
                 });
-        let readout_ceiling = last_rows.min(self.budget.max_lanes) + every_row;
-        let bodied = bodied && readout_rows.len() <= readout_ceiling as usize;
+        let readout_ceiling = last_rows.min(max_lanes) + every_row;
+        let bodied = bodied
+            && readout_rows.len() <= readout_ceiling as usize
+            && composition.lane_count() <= crate::window::lane_capacity(max_lanes);
         let readout_live = readout_rows.len() as u32;
         if bodied {
             readout_rows.resize(readout_ceiling as usize, 0);
@@ -1513,7 +1527,7 @@ impl FrameShell for Shell {
         let mut qo_absolute: Vec<i32> = Vec::new();
         let mut lane_carve = composition.lane_count();
         if bodied {
-            let capacity = crate::window::lane_capacity(self.budget.max_lanes);
+            let capacity = crate::window::lane_capacity(max_lanes);
             lane_carve = lane_carve.max(capacity);
             for geometry in &mut geometries {
                 geometry.pad_to(capacity as usize);

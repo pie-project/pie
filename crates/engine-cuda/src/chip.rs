@@ -111,6 +111,13 @@ pub struct ForwardTokens(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.walk_fire_rows", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct WalkFireRows(pub u32);
+/// The most lanes a fire of prompts alone (no decoding lane) carries and pads
+/// its graph to, its lanes' state walk and readout rows with them, so a load
+/// seating many decoding lanes does not pad its prompt fires to all of them;
+/// a prompt fire of more lanes walks eagerly. 0: every lane the load seats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.prefill_lanes", constant(range(0..=65536)), default = 0, tune = engine)]
+pub struct PrefillLanes(pub u32);
 /// Whether a plane declared `host` (read only by row gathers) lives in pinned,
 /// device-mapped host memory, leaving device bytes to KV pages and state slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -147,6 +154,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<SeatedFirst>()
         .add::<ForwardTokens>()
         .add::<WalkFireRows>()
+        .add::<PrefillLanes>()
         .add::<HostPlanes>()
         .add::<PrefillLatticeFrom>()
         .add::<PrefillLatticeSteps>();
@@ -236,6 +244,7 @@ pub struct Engine {
     pub seated_first: bool,
     pub forward_tokens: u32,
     pub walk_fire_rows: u32,
+    pub prefill_lanes: u32,
     pub host_planes: bool,
     pub prefill_lattice_from: u32,
     pub prefill_lattice_steps: u32,
@@ -266,6 +275,7 @@ impl Engine {
             seated_first: profile.on::<SeatedFirst>(&Anywhere),
             forward_tokens: profile.get::<ForwardTokens>().0,
             walk_fire_rows: profile.get::<WalkFireRows>().0,
+            prefill_lanes: profile.get::<PrefillLanes>().0,
             host_planes: profile.on::<HostPlanes>(&Anywhere),
             prefill_lattice_from: profile.get::<PrefillLatticeFrom>().0,
             prefill_lattice_steps: profile.get::<PrefillLatticeSteps>().0,
@@ -743,6 +753,7 @@ mod tests {
                 seated_first: false,
                 forward_tokens: 0,
                 walk_fire_rows: 0,
+                prefill_lanes: 0,
                 host_planes: false,
                 prefill_lattice_from: 256,
                 prefill_lattice_steps: 4,
@@ -819,6 +830,7 @@ mod tests {
                 seated_first: false,
                 forward_tokens: 0,
                 walk_fire_rows: 0,
+                prefill_lanes: 0,
                 host_planes: false,
                 ..Engine::of(&b200)
             },

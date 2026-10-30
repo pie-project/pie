@@ -63,6 +63,9 @@ walk_fire_rows = 1024
 # two recurrent-state slots a lane, so a hybrid trunk seats past the fixed 256: Nemotron-3-Super mini
 # c512 4,749 -> 5,028 tok/s (slots cut to fit the card), greedy tokens unchanged
 state_slots_per_lane = 2
+# prompt fires pad to the 256 lanes the fixed slots seated, not the 512 decoding lanes two slots seat:
+# Qwen3.8-Flash-Next mini raw prefill and pf16-512 back where they were, c512 kept
+prefill_lanes = 256
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"
