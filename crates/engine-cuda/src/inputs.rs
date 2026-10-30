@@ -526,6 +526,7 @@ pub struct Inputs {
     group_masks: Option<Buffer>,
     /// Smaller ones it outgrew, kept: an earlier fire may still read them.
     outgrown: Vec<Buffer>,
+    staged_windows: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -707,6 +708,7 @@ impl Inputs {
             mask_runs: None,
             group_masks: None,
             outgrown: Vec::new(),
+            staged_windows: Vec::new(),
             plan_values: grants.len(),
             plans: (0..runs as usize)
                 .flat_map(|run| {
@@ -1198,6 +1200,7 @@ impl Inputs {
             staging,
             inject_runs,
             mask_runs,
+            staged_windows,
             ..
         } = self;
         let host = staging[slot.at() as usize].host();
@@ -1210,7 +1213,17 @@ impl Inputs {
 
         copy(at_tokens, rows as usize * 4)?;
         copy(at_positions, rows as usize * 4)?;
-        copy(at_windows, windows * 4)?;
+        // SAFETY: the slot's pinned bytes, written for this fire by write_host.
+        let window_bytes =
+            unsafe { std::slice::from_raw_parts(host.add(at_windows as usize), windows * 4) };
+        if crate::device::alloc::is_capturing(stream) {
+            staged_windows.clear();
+            copy(at_windows, windows * 4)?;
+        } else if staged_windows.as_slice() != window_bytes {
+            copy(at_windows, windows * 4)?;
+            staged_windows.clear();
+            staged_windows.extend_from_slice(window_bytes);
+        }
         if let Some(bounds) = qo_absolute {
             copy(at_qo_absolute, *bounds * 4)?;
         }
