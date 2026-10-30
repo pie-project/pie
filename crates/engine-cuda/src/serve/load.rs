@@ -71,7 +71,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             .sum();
         boot.budget.max_tokens = match engine.forward_tokens {
             0 => crate::api::DEFAULT_FORWARD_TOKENS,
-            tokens if params < 2 << 30 || sparse_experts(&boot.trace) => {
+            tokens
+                if params < 2 << 30 || sparse_experts(&boot.trace) || !recurrent(&boot.trace) =>
+            {
                 tokens.max(crate::api::DEFAULT_FORWARD_TOKENS)
             }
             tokens => tokens,
@@ -1277,6 +1279,16 @@ impl Staged {
         })?;
         Ok(shell)
     }
+}
+
+/// Whether `trace` carries a recurrent state (a gated delta or Mamba
+/// mixer): the narrower profile fire serves those; a dense attention model's
+/// prefill GEMMs are compute-bound and run best at the full 8192 rows.
+fn recurrent(trace: &poem_ir::Trace) -> bool {
+    trace
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, poem_ir::Operation::Ssm(_)))
 }
 
 fn sparse_experts(trace: &poem_ir::Trace) -> bool {
