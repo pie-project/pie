@@ -70,7 +70,10 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
         let gran = pick(flags & 16 != 0, 128, 32);
         for block in a.chunks_mut(gran) {
             let (q, s) = quant_e4m3(&tab(gran, |i| block[i] as f32));
-            block.iter_mut().zip(q).for_each(|(v, q)| *v = f64::from(e4m3(q) * ue8m0(s)));
+            block
+                .iter_mut()
+                .zip(q)
+                .for_each(|(v, q)| *v = f64::from(e4m3(q) * ue8m0(s)));
         }
     }
     // The bank: `rows` rows an expert, NVFP4's tensor scale a row (an
@@ -132,7 +135,8 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
         }
         (K::Mx, _) if tuning.mxfp4_w4a8_from > 0 => {
             let gran = pick(flags & 16 != 0, 128, 32);
-            moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, gran).map(|took| assert_eq!(took, w4a8_here(), "the arm takes the fire"))
+            moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, gran)
+                .map(|took| assert_eq!(took, w4a8_here(), "the arm takes the fire"))
         }
         (K::Mx, _) => moe::matmul_select_quant(&ctx, x, mx, sc, None, r, &mut y, SEAT),
         (K::MxBias, _) => {
@@ -589,7 +593,10 @@ fn the_bf16_prefill_selects_answer_the_routed_dot() {
 #[ignore = "timing only"]
 fn w4a8_select_timing() {
     let mut b = Bench::new(7);
-    let ctx = b.ctx().with_tuning(Tuning { mxfp4_w4a8_from: 1, ..Tuning::DEFAULT });
+    let ctx = b.ctx().with_tuning(Tuning {
+        mxfp4_w4a8_from: 1,
+        ..Tuning::DEFAULT
+    });
     let (ex, tokens, top) = (16usize, 8192usize, 6usize);
     for (n, k, by_token) in [(4096usize, 4096usize, true), (4096, 2048, false)] {
         let rows_x = if by_token { tokens } else { tokens * top };
@@ -597,7 +604,10 @@ fn w4a8_select_timing() {
         let x = t(b.up(&raw), rows_x, k, Bf16);
         let codes = tab(ex * n * k / 2, |i| (i * 2_654_435_761 >> 7) as u8);
         let scales = tab(ex * n * k / 32, |i| 120 + (i % 7) as u8);
-        let (mx, sc) = (t(b.up(&codes), ex, n * k / 2, U8), t(b.up(&scales), ex, n * k / 32, U8));
+        let (mx, sc) = (
+            t(b.up(&codes), ex, n * k / 2, U8),
+            t(b.up(&scales), ex, n * k / 32, U8),
+        );
         let routes = tab(tokens * top, |r| ((r / top * 3 + r % top * 5) % ex) as i32);
         let r = t(b.up(&routes), tokens, top, I32);
         let mut y = b.out(tokens * top, n);
