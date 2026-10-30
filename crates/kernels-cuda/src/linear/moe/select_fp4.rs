@@ -178,6 +178,12 @@ pub(super) fn select_mxfp4_mma(
         ));
     }
     let (code, limit, alpha) = glu_code(op, glu)?;
+    if !cvt
+        && tensor_scales.is_none()
+        && w4a8_takes(ctx, x, fan)
+    {
+        return select_mxfp4_w4a8(ctx, op, x, codes, scales, bias, routes, y, fan, glu.is_some(), (code, limit, alpha));
+    }
     let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
     let experts = codes.rows.clamp(1, EXPERT_CAP);
     // An expert's slice is 8, 16 or 32 routes: as few 8-route blocks as the
@@ -362,6 +368,101 @@ pub(super) fn select_mxfp4_mma(
     } else {
         args.push(tensor_scales.map_or(ArgValue::ABSENT, |t| t.arg()));
     }
+    ctx.fire(op, fire, &args)
+}
+
+/// Whether the W4A8 select on sm_120a's block-scaled mma.sync takes a fire
+/// (`kernel.moe.mxfp4_w4a8_from`): bf16 rows, `k` whole 128s.
+#[cfg(feature = "cuda")]
+fn w4a8_takes(ctx: &Ctx, x: Tensor, fan: &Selected) -> bool {
+    let from = ctx.tuning().mxfp4_w4a8_from;
+    from > 0
+        && fan.route_count >= from
+        && x.dtype == Dtype::Bf16
+        && x.width > 0
+        && x.width.is_multiple_of(128)
+        && crate::jit::cache::features().warp_block_scale
+        && ctx.smem_fits(W4A8_STAGES * W4A8_STAGE)
+}
+
+/// The stages of `moe_select_mxfp4_w4a8`'s ring, and a stage's bytes: 64
+/// routes' 128 codes (144 apart) and scales, 256 rows' 64 code bytes (80
+/// apart) and scales.
+#[cfg(feature = "cuda")]
+const W4A8_STAGES: u32 = 3;
+#[cfg(feature = "cuda")]
+const W4A8_STAGE: u32 = 64 * 144 + 64 * 4 + 256 * 80 + 256 * 4;
+
+/// The routed mxfp4 select W4A8: `x`'s rows as MXFP8 in stream scratch,
+/// then `moe_select_mxfp4_w4a8` over each expert's 64-route slices.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn select_mxfp4_w4a8(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    bias: Option<Tensor>,
+    routes: Tensor,
+    y: &mut Tensor,
+    fan: &Selected,
+    glu: bool,
+    (code, limit, alpha): (i32, f32, f32),
+) -> Result<(), Error> {
+    let (rows, kw) = (x.rows as usize, x.width as usize);
+    let xq = ctx.scratch_stream(op, "linear.mxfp4_w4a8_x", rows * kw)? as u64;
+    let xe = ctx.scratch_stream(op, "linear.mxfp4_w4a8_xe", rows * (kw / 32))? as u64;
+    let lanes = u32::try_from(rows * (kw / 32) * 4).map_err(|_| refuse(op, "too many rows"))?;
+    ctx.fire(
+        op,
+        Fire::at(kernel(SELECT_FP4_SM120, "::pie::linear::quantize_rows_mxfp8"))
+            .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
+        &[x.arg(), ArgValue::Ptr(xq), ArgValue::Ptr(xe), stated(op, x.rows)?.arg(), stated(op, x.width)?.arg()],
+    )?;
+    let experts = codes.rows.clamp(1, EXPERT_CAP);
+    let bank_rows = if glu { 2 * y.width } else { y.width };
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
+    let inter = stated(op, y.width)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let RouteOrder { order, offsets, work, work_cap } = route_order_sliced(
+        ctx,
+        op,
+        routes,
+        fan,
+        experts,
+        64,
+        true,
+        if glu || KEEP_NEXT.with(core::cell::Cell::get) { Share::Keep } else { Share::Take },
+    )?;
+    let tiles = y.width.div_ceil(if glu { 128 } else { 256 });
+    let fire = Fire::at(kernel(
+        SELECT_FP4_SM120,
+        &format!("::pie::linear::moe_select_mxfp4_w4a8<{code}, {W4A8_STAGES}>"),
+    ))
+    .apply(
+        Launch::grid(if act_div == 1 { [tiles, work_cap, 1] } else { [work_cap, tiles, 1] }, [256, 1, 1])
+            .smem(W4A8_STAGES * W4A8_STAGE),
+    );
+    let args = [
+        ArgValue::Ptr(xq),
+        ArgValue::Ptr(xe),
+        ArgValue::Ptr(order),
+        ArgValue::Ptr(offsets),
+        ArgValue::Ptr(work),
+        codes.arg(),
+        scales.arg(),
+        bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
+        y.arg(),
+        act_div.arg(),
+        n.arg(),
+        k.arg(),
+        stated(op, experts)?.arg(),
+        inter.arg(),
+        limit.arg(),
+        alpha.arg(),
+    ];
     ctx.fire(op, fire, &args)
 }
 

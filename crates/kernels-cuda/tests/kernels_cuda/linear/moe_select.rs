@@ -2,9 +2,9 @@
 //! ones that quantize their rows) and the routed MLP kept by expert,
 //! against the host's dot of each route's rows and its expert's weight.
 
-use crate::common::linear_ref::{Bench, TOL, affine, check, distance, dot, fp8_bank};
+use crate::common::linear_ref::{Bench, TOL, affine, check, distance, dot, fp8_bank, quant_e4m3};
 use crate::common::linear_ref::{glu_want, mlp, pick, t, tab, values};
-use crate::common::tc5::ue8m0;
+use crate::common::tc5::{e4m3, ue8m0};
 use crate::common::{SM100, TC5, from_bf16, to_bf16};
 use dtype::Dtype::{Bf16, E4m3, F32, I32, Nvfp4, U8};
 use kernels_cuda::linear::act_quant::{AlphaFrom, Bank, Format, Source, read_back, select};
@@ -60,6 +60,13 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
     let big = |i: usize| flags & 4 != 0 && i % 97 == 5;
     let raw = tab(raw.len(), |i| pick(big(i), to_bf16(65536.0), raw[i]));
     let mut a = tab(raw.len(), |i| f64::from(from_bf16(raw[i])));
+    // The W4A8 select reads its rows as MXFP8.
+    if tuning.mxfp4_w4a8_from > 0 && kernels_cuda::jit::cache::features().warp_block_scale {
+        for block in a.chunks_mut(32) {
+            let (q, s) = quant_e4m3(&tab(32, |i| block[i] as f32));
+            block.iter_mut().zip(q).for_each(|(v, q)| *v = f64::from(e4m3(q) * ue8m0(s)));
+        }
+    }
     // The bank: `rows` rows an expert, NVFP4's tensor scale a row (an
     // expert's), W4A4's input scale an expert.
     let (rows, nv) = (n << u8::from(f.is_some()), matches!(kind, K::Nv | K::A4));
@@ -181,6 +188,8 @@ fn the_routed_selects_answer_the_routed_dot() {
     let (gemv, fp32) = (Tuning { moe_grouped: false, ..d }, Tuning { mxfp4_wmma: false, ..d });
     #[rustfmt::skip]
     let mma = Tuning { mxfp4_mma_until: 65_536, mxfp4_mma_from: 1, ..d };
+    #[rustfmt::skip]
+    let w4a8 = Tuning { mxfp4_w4a8_from: 1, ..mma };
     let lean = Tuning {
         mxfp4_select_lean: true,
         ..d
@@ -252,6 +261,13 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::MxBias, mma, [8, 400, 4, 192, 2048], t, alpha, 2),
         // Hopper's wgmma slice below the staged kernel's 32 routes an expert.
         (K::Mx, mma, [8, 48, 4, 384, 1024], t, None, 0),
+        // W4A8 on sm_120a's block-scaled mma.sync (elsewhere the bf16 arms):
+        // by route over a partial 256-row tile, its GLU under scales past
+        // f16's range, V4-Flash's leg, a few routes under a live window.
+        (K::Mx, w4a8, [8, 400, 4, 320, 1024], f, None, 0),
+        (K::MxBias, w4a8, [8, 400, 4, 192, 2048], t, alpha, 2),
+        (K::Mx, w4a8, [16, 300, 6, 512, 4096], t, None, 0),
+        (K::Mx, w4a8, [8, 5, 4, 256, 512], t, None, 1),
         (K::MxBias, mma, [8, 32, 4, 192, 2048], t, alpha, 0),
         // A K of whole 64s on Hopper's wgmma slice (gpt-oss's 2880): a
         // prefill's routes, its GLU, NVFP4's.

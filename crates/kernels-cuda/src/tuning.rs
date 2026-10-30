@@ -317,6 +317,13 @@ pub struct MoeMxfp4A8From(pub u32);
 #[decision(id = "kernel.moe.mxfp4_fp8_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4Fp8From(pub u32);
 
+/// The fewest routes an MXFP4 select runs W4A8 on sm_120a's block-scaled
+/// mma.sync, its rows quantized as MXFP8 (as SGLang reads MXFP4 experts on
+/// the consumer Blackwells). 0: never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_w4a8_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4W4a8From(pub u32);
+
 /// The fewest rows a projection cut into two row halves (Qwen3.5's qkv|z)
 /// lands as two GEMMs off the weight's two slices, where
 /// `kernel.elemwise.rows_vec` is on; fewer run the GEMM and the cut.
@@ -831,6 +838,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4A8Until>()
         .add::<MoeMxfp4A8From>()
         .add::<MoeMxfp4Fp8From>()
+        .add::<MoeMxfp4W4a8From>()
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
         .add::<MoeMegaUntil>()
@@ -969,6 +977,7 @@ tuning! {
     mxfp4_a8_until: u32 = 0, get MoeMxfp4A8Until;
     mxfp4_a8_from: u32 = 0, get MoeMxfp4A8From;
     mxfp4_fp8_from: u32 = 0, get MoeMxfp4Fp8From;
+    mxfp4_w4a8_from: u32 = 0, get MoeMxfp4W4a8From;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
     moe_mega_until: u32 = 0, get MoeMegaUntil;
