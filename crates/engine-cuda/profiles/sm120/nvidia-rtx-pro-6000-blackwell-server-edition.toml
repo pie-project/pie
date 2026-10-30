@@ -38,7 +38,7 @@ pdl = true
 [compiler]
 branches = true
 dag_streams = true
-dag_streams_until = 4096
+dag_streams_until = 256
 
 # fires of three lanes' 1024 prompt rows over a gated delta trunk (5 of a batch's 556-token prompts) keep
 # the card fed while the next prompts arrive: Qwen3.8-Flash-Next mini pf16-512 142k -> 160k tok/s
