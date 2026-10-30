@@ -976,7 +976,7 @@ fn what_a_decode_folds_seals() {
     let ws = decoded(&mut store, &tokens, 20, 40);
     assert_eq!(store.sealed_in(ws, 0..3).unwrap(), [0]);
     assert_eq!(
-        store.fold(ws, 40, true).unwrap(),
+        store.fold(ws, 40, true, None).unwrap(),
         1,
         "the partial page stays open"
     );
@@ -997,7 +997,7 @@ fn a_fire_that_never_settled_leaves_the_log_cut() {
     let tokens: Vec<u32> = (0..48).map(|t| 1000 + t).collect();
     let ws = decoded(&mut store, &tokens, 20, 40);
     store.log_begin(ws, 16).unwrap();
-    assert_eq!(store.fold(ws, 40, true).unwrap(), 0);
+    assert_eq!(store.fold(ws, 40, true, None).unwrap(), 0);
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
     let reader = store.create_working_set();
@@ -1019,7 +1019,7 @@ fn a_hit_refreshes_only_the_entries_it_used_whole() {
     commit_opaque(&mut store, ws, 1);
     store.set_page_size(16);
     store.log_rows(ws, 0, &tokens).unwrap();
-    assert_eq!(store.fold(ws, 48, false).unwrap(), 1);
+    assert_eq!(store.fold(ws, 48, false, None).unwrap(), 1);
     store.release_working_set(ws, store.current_epoch());
     let last_use = |store: &KvStore, owner| {
         store
@@ -1044,7 +1044,7 @@ fn what_decode_wrote_is_reclaimed_before_the_prompt() {
     let mut store = KvStore::new(16, h(28));
     let tokens: Vec<u32> = (0..48).map(|t| 1200 + t).collect();
     let ws = decoded(&mut store, &tokens, 20, 40);
-    store.fold(ws, 40, true).unwrap();
+    store.fold(ws, 40, true, None).unwrap();
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
     assert_eq!(store.cached_working_sets()[0].entries, 2);
@@ -1183,7 +1183,7 @@ fn an_answer_goes_before_an_older_prompt() {
     store.release_working_set(ws, store.current_epoch());
     let tokens: Vec<u32> = (0..48).map(|t| 1500 + t).collect();
     let ws = decoded(&mut store, &tokens, 20, 40);
-    store.fold(ws, 40, true).unwrap();
+    store.fold(ws, 40, true, None).unwrap();
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
     assert_eq!(store.reclaim_cache(store.current_epoch(), |_| 0), 1);
