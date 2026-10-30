@@ -1898,6 +1898,7 @@ impl Spatial {
     /// passes over its logits, and the lanes' readouts.
     #[allow(clippy::too_many_lines)]
     fn fire_step(&mut self, step: &engine::fire::Step) -> EngineResult<Vec<LaneReadout>> {
+        let fire_t0 = std::time::Instant::now();
         let _ = FireId(self.next_fire);
         self.next_fire = self.next_fire.wrapping_add(1);
         for attachment in &step.attachments {
@@ -2354,6 +2355,9 @@ impl Spatial {
         self.fires += 1;
         tracing::info!(
             fires = self.fires,
+            lanes = step.lanes.len(),
+            rows = step.lanes.iter().map(|l| l.tokens.len()).sum::<usize>(),
+            fire_ms = fire_t0.elapsed().as_secs_f64() * 1e3,
             model_ms = MODEL_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
             json_ms = JSON_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
             "spatial: model time"

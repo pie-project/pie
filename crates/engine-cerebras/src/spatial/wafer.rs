@@ -1013,12 +1013,13 @@ impl WaferModel {
         self.launches += 1;
         self.steps += steps as u64;
         self.lane_steps += (lanes.len() * steps) as u64;
-        if self.launches % 256 == 0 {
+        if self.launches % 64 == 0 {
             tracing::info!(
                 launches = self.launches,
                 steps = self.steps,
                 lane_steps = self.lane_steps,
                 lanes = lanes.len(),
+                io = %self.rt.io,
                 "spatial wafer: batch totals"
             );
         }

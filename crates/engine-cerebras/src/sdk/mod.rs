@@ -382,6 +382,43 @@ pub struct Runtime {
     /// Nonblocking calls not yet waited on, each with the host words it
     /// reads (kept alive until its task is done).
     pending: Vec<(Task, Vec<u32>)>,
+    /// Blocking copies and launches so far: calls, time, words.
+    pub io: IoStats,
+}
+
+/// A runtime's blocking calls by kind: how many, how long they took, how
+/// many words they moved (the per-token cost the host pays the device).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IoStats {
+    pub h2d: (u64, u64, u64),
+    pub d2h: (u64, u64, u64),
+    pub launch: (u64, u64),
+}
+
+impl IoStats {
+    fn add(slot: &mut (u64, u64, u64), t0: std::time::Instant, words: usize) {
+        slot.0 += 1;
+        slot.1 += t0.elapsed().as_nanos() as u64;
+        slot.2 += words as u64;
+    }
+}
+
+impl std::fmt::Display for IoStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ms = |ns: u64| ns as f64 / 1e6;
+        write!(
+            f,
+            "h2d {} calls {:.1} ms {} words; d2h {} calls {:.1} ms {} words; launch {} calls {:.1} ms",
+            self.h2d.0,
+            ms(self.h2d.1),
+            self.h2d.2,
+            self.d2h.0,
+            ms(self.d2h.1),
+            self.d2h.2,
+            self.launch.0,
+            ms(self.launch.1)
+        )
+    }
 }
 
 impl Runtime {
@@ -451,6 +488,7 @@ impl Runtime {
             _platform: platform,
             running: false,
             pending: Vec::new(),
+            io: IoStats::default(),
         })
     }
 
@@ -528,6 +566,7 @@ impl Runtime {
     ) -> Result<()> {
         let id = self.rpc.id(symbol, RpcKind::Var)?;
         self.check_size(symbol, rect, elems_per_pe, data.len())?;
+        let t0 = std::time::Instant::now();
         let opts = MemcpyOptions::new(false, data_type as i32, order as i32, false);
         let mut task = Task::empty();
         // SAFETY: data outlives the blocking copy; the SDK only reads it.
@@ -546,6 +585,7 @@ impl Runtime {
             )
         };
         self.finish(&mut task);
+        IoStats::add(&mut self.io.h2d, t0, data.len());
         Ok(())
     }
 
@@ -561,6 +601,7 @@ impl Runtime {
     ) -> Result<()> {
         let id = self.rpc.id(symbol, RpcKind::Var)?;
         self.check_size(symbol, rect, elems_per_pe, out.len())?;
+        let t0 = std::time::Instant::now();
         let opts = MemcpyOptions::new(false, data_type as i32, order as i32, false);
         let mut task = Task::empty();
         // SAFETY: out outlives the blocking copy and holds exactly the words checked above.
@@ -579,6 +620,7 @@ impl Runtime {
             )
         };
         self.finish(&mut task);
+        IoStats::add(&mut self.io.d2h, t0, out.len());
         Ok(())
     }
 
@@ -609,6 +651,7 @@ impl Runtime {
                 "this SDK has no row-broadcast copy (the batched builds' tables need it)".into(),
             )
         })?;
+        let t0 = std::time::Instant::now();
         let opts = MemcpyOptions::new(false, data_type as i32, Order::RowMajor as i32, false);
         let mut task = Task::empty();
         // SAFETY: data outlives the blocking copy; the SDK only reads it.
@@ -627,6 +670,7 @@ impl Runtime {
             )
         };
         self.finish(&mut task);
+        IoStats::add(&mut self.io.h2d, t0, data.len());
         Ok(())
     }
 
@@ -691,6 +735,7 @@ impl Runtime {
     /// Launches the exported function `name` with `args` and waits for it.
     pub fn launch(&mut self, name: &str, args: &[u32]) -> Result<()> {
         self.rpc.id(name, RpcKind::Func)?;
+        let t0 = std::time::Instant::now();
         let name_s = CxxString::new(name);
         let vec = CxxVecU32::borrow(args);
         let opts = MemcpyOptions::new(false, 0, 0, false);
@@ -698,6 +743,8 @@ impl Runtime {
         // SAFETY: mirrors are live for the duration of the call.
         unsafe { (self.api().call)(&mut task, self.this(), &*name_s, &vec, &opts) };
         self.finish(&mut task);
+        self.io.launch.0 += 1;
+        self.io.launch.1 += t0.elapsed().as_nanos() as u64;
         Ok(())
     }
 }
