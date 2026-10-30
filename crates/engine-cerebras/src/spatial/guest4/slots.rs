@@ -196,6 +196,15 @@ pub struct LaneProgram {
     pub program: Arc<super::lane::Program>,
 }
 
+/// A lane's window off the VM (evicted): its program, its window and the
+/// words every VM PE held for it, a VM column each.
+#[derive(Clone, Debug)]
+pub struct Parked {
+    pub key: u64,
+    pub window: Window,
+    pub words: Vec<Vec<u32>>,
+}
+
 /// Where each lane's program and state sit: the op arena (each distinct
 /// table once) and each lane's table base and window offset.
 #[derive(Clone, Default)]
@@ -293,16 +302,30 @@ impl Slots {
         gsdesc(&self.lanes.iter().map(|s| s.as_ref().map_or_else(Vec::new, |s| s.steps.clone())).collect::<Vec<_>>())
     }
 
+    /// Lane `l`'s window as the bank images `banks` hold it: what it needs
+    /// to come back exactly ([`Slots::rebank`]'s `parked`) after it leaves.
+    pub fn park(&self, lay: &VmLayout, l: usize, banks: &[Vec<u32>]) -> Option<Parked> {
+        let s = self.lanes.get(l)?.as_ref()?;
+        let (n, bw) = (s.window.words(lay.vr), lay.bank_words);
+        let words = banks
+            .iter()
+            .map(|bank| (0..=lay.rows).flat_map(|pe| bank[pe * bw + s.off..pe * bw + s.off + n].iter().copied()).collect())
+            .collect();
+        Some(Parked { key: s.key, window: s.window.clone(), words })
+    }
+
     /// The bank arena after a change from `old` (its images `banks`, a VM
-    /// column each, `bank_words` a row): a lane on the same program keeps
-    /// its window's words, a lane in `seeds` starts from them, any other
-    /// is zero.
+    /// column each, `bank_words` a row): a lane in `parked` on the program
+    /// and window it left gets its words back, a lane in `seeds` starts
+    /// from them, a lane on the same program keeps its window's words, any
+    /// other is zero.
     pub fn rebank(
         &self,
         lay: &VmLayout,
         old: &Slots,
         banks: &[Vec<u32>],
         seeds: &[Option<Vec<Seed>>],
+        parked: &[Option<Parked>],
     ) -> R<Vec<Vec<u32>>> {
         let (nv, bw) = (lay.rows + 1, lay.bank_words);
         let cols: Vec<(usize, usize, usize)> = lay.columns().collect();
@@ -312,7 +335,17 @@ impl Slots {
                 continue;
             };
             let n = s.window.words(lay.vr);
-            if let Some(Some(seeds)) = seeds.get(l) {
+            if let Some(Some(p)) = parked.get(l)
+                && p.key == s.key
+                && p.window == s.window
+                && p.words.len() == out.len()
+            {
+                for (column, words) in out.iter_mut().zip(&p.words) {
+                    for pe in 0..nv {
+                        column[pe * bw + s.off..pe * bw + s.off + n].copy_from_slice(&words[pe * n..(pe + 1) * n]);
+                    }
+                }
+            } else if let Some(Some(seeds)) = seeds.get(l) {
                 let (pool, wide) = super::wafer::seed_images(lay, seeds)?;
                 for (column, &(b, j, _)) in out.iter_mut().zip(&cols) {
                     for pe in 0..nv {
@@ -538,9 +571,32 @@ mod tests {
         }
         // Lane 0 leaves: lane 1's window moves to 0 with its words.
         let new = Slots::plan(&lay, &[None, prog(1, &a)]).unwrap();
-        let out = new.rebank(&lay, &old, &[bank], &[None, None]).unwrap();
+        let out = new.rebank(&lay, &old, &[bank], &[None, None], &[]).unwrap();
         assert_eq!(out[0][bw..bw + 3], [100, 101, 102]);
         let pools = new.pools(&lay, &out[0][bw..2 * bw]);
         assert_eq!(pools[1][2..4], [100, 101]);
+    }
+
+    #[test]
+    fn a_parked_window_comes_back_word_for_word_in_another_bank() {
+        let lay = lay();
+        let a = Arc::new(table(3, vec![home(0, "pool", 0, 1, Dtype::U32)], Vec::new()));
+        let b = Arc::new(table(5, Vec::new(), Vec::new()));
+        let old = Slots::plan(&lay, &[prog(1, &a), prog(2, &b)]).unwrap();
+        let (nv, bw) = (lay.rows + 1, lay.bank_words);
+        let bank: Vec<u32> = (0..nv * bw).map(|w| 1000 + w as u32).collect();
+        let n = old.lanes[0].as_ref().unwrap().window.words(lay.vr);
+        let parked = old.park(&lay, 0, std::slice::from_ref(&bank)).unwrap();
+        // Lane 0 leaves; it comes back in bank 1, the other program in 0.
+        let new = Slots::plan(&lay, &[prog(2, &b), prog(1, &a)]).unwrap();
+        let off = new.lanes[1].as_ref().unwrap().off;
+        let out = new.rebank(&lay, &old, &[bank.clone()], &[None, Some(Vec::new())], &[None, Some(parked.clone())]).unwrap();
+        for pe in 0..nv {
+            assert_eq!(out[0][pe * bw + off..pe * bw + off + n], bank[pe * bw..pe * bw + n]);
+        }
+        // Another program in that bank does not take the parked words.
+        let other = Slots::plan(&lay, &[prog(2, &b), prog(3, &a)]).unwrap();
+        let out = other.rebank(&lay, &old, &[bank], &[None, None], &[None, Some(parked)]).unwrap();
+        assert!(out[0][off..off + n].iter().all(|&w| w == 0));
     }
 }

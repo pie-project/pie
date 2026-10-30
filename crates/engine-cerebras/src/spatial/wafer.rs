@@ -875,12 +875,16 @@ impl WaferModel {
 
     /// A per-lane-program image's lanes: each its program (`None`: idle),
     /// the arena and windows compacted again, a lane on the same program
-    /// keeping its window's state, a lane in `seeds` starting from them.
+    /// keeping its window's state, a lane in `parked` getting the window it
+    /// left back, a lane in `seeds` starting from them. The windows of the
+    /// lanes that leave (their program gone or changed, or their bank
+    /// seeded for another), by lane.
     pub fn vm_place_lanes(
         &mut self,
         programs: &[Option<super::guest4::slots::LaneProgram>],
         seeds: &[Option<Vec<super::guest4::wafer::Seed>>],
-    ) -> R<()> {
+        parked: &[Option<super::guest4::slots::Parked>],
+    ) -> R<Vec<Option<super::guest4::slots::Parked>>> {
         use super::guest4::{slots::Slots, wafer};
         let vm = self.vm.as_mut().ok_or("the wafer program has no VM")?;
         if !vm.lay.lprog {
@@ -896,7 +900,16 @@ impl WaferModel {
             Vec::new()
         };
         let old = if vm.loaded { vm.slots.clone() } else { Slots::default() };
-        let images = slots.rebank(&vm.lay, &old, &banks, seeds)?;
+        let images = slots.rebank(&vm.lay, &old, &banks, seeds, parked)?;
+        let left = (0..programs.len())
+            .map(|l| {
+                let was = old.lanes.get(l)?.as_ref()?;
+                let stays = slots.lanes[l].as_ref().is_some_and(|s| s.key == was.key)
+                    && !matches!(seeds.get(l), Some(Some(_)))
+                    && !matches!(parked.get(l), Some(Some(_)));
+                if stays { None } else { old.park(&vm.lay, l, &banks) }
+            })
+            .collect();
         wafer::load_slots(&mut self.rt, &vm.lay, &slots, &images, !vm.loaded)?;
         // A first load writes gmode 1 (load_slots); a later placement leaves
         // gmode as the device has it (0 after argmax launches), for vm_fire
@@ -907,7 +920,7 @@ impl WaferModel {
         }
         vm.loaded = true;
         vm.slots = slots;
-        Ok(())
+        Ok(left)
     }
 
     /// One lap of a multi-lane VM launch: `lanes` (one per VM lane, in lane
@@ -1329,6 +1342,8 @@ enum Job {
     VmPlaceLanes {
         programs: Vec<Option<super::guest4::slots::LaneProgram>>,
         seeds: Vec<Option<Vec<super::guest4::wafer::Seed>>>,
+        parked: Vec<Option<super::guest4::slots::Parked>>,
+        left: mpsc::Sender<Vec<Option<super::guest4::slots::Parked>>>,
     },
 }
 
@@ -1446,8 +1461,11 @@ impl Wafer {
                             }
                             continue;
                         }
-                        Job::VmPlaceLanes { programs, seeds } => {
-                            let reply = model.vm_place_lanes(&programs, &seeds).map(|()| Vec::new());
+                        Job::VmPlaceLanes { programs, seeds, parked, left } => {
+                            let reply = model.vm_place_lanes(&programs, &seeds, &parked).map(|out| {
+                                let _ = left.send(out);
+                                Vec::new()
+                            });
                             if vm_tx.send(reply).is_err() {
                                 break;
                             }
@@ -1606,9 +1624,12 @@ impl Wafer {
         &mut self,
         programs: Vec<Option<super::guest4::slots::LaneProgram>>,
         seeds: Vec<Option<Vec<super::guest4::wafer::Seed>>>,
-    ) -> R<()> {
+        parked: Vec<Option<super::guest4::slots::Parked>>,
+    ) -> R<Vec<Option<super::guest4::slots::Parked>>> {
         let _busy = super::Busy::start();
-        self.vm_job(Job::VmPlaceLanes { programs, seeds }).map(drop)
+        let (tx, rx) = mpsc::channel();
+        self.vm_job(Job::VmPlaceLanes { programs, seeds, parked, left: tx })?;
+        rx.recv().map_err(|_| "the wafer thread went away".to_string())
     }
 
     fn vm_job(&mut self, job: Job) -> R<Vec<VmStep>> {

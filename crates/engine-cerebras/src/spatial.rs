@@ -1008,6 +1008,11 @@ pub struct Spatial {
     /// A per-lane-program VM: each lane's program as placed (empty until
     /// the first placement).
     vm_bank_progs: Vec<Option<u64>>,
+    /// Each bank's last fire (`paged_fires`): who an eviction takes first.
+    vm_bank_used: Vec<u64>,
+    /// Evicted instances' bank windows, word for word, until they place
+    /// again (or are gone).
+    vm_parked: std::collections::HashMap<InstanceId, guest4::slots::Parked>,
     /// Fires run (the model-time log's count).
     fires: u64,
     /// Epilogue steps the guest VM ran.
@@ -1053,6 +1058,8 @@ impl Spatial {
             vm_program: None,
             vm_banks: Vec::new(),
             vm_bank_progs: Vec::new(),
+            vm_bank_used: Vec::new(),
+            vm_parked: std::collections::HashMap::new(),
             fires: 0,
             guest_steps: 0,
             replayed: 0,
@@ -1566,6 +1573,8 @@ impl Spatial {
                 *owner = None;
             }
         }
+        let programs = &self.programs;
+        self.vm_parked.retain(|i, _| programs.instance_view(*i).is_some());
         let placed = if lay.lprog {
             self.place_vm_lanes(lanes, n)?
         } else {
@@ -1607,6 +1616,10 @@ impl Spatial {
             return Err(Error::Device("the VM path without a wafer model".into()));
         };
         let steps = w.vm_fire(launch, sampled.clone(), inputs).map_err(device)?;
+        self.vm_bank_used.resize(n, 0);
+        for bank in placed.iter().flatten() {
+            self.vm_bank_used[*bank] = self.paged_fires + 1;
+        }
         for (bank, (token, row, _)) in steps.iter().enumerate().filter(|(b, _)| sampled[*b]) {
             tracing::debug!(
                 bank,
@@ -1731,11 +1744,27 @@ impl Spatial {
     fn place_vm_lanes(&mut self, lanes: &[(InstanceId, &PagedLane)], n: usize) -> EngineResult<Vec<Option<usize>>> {
         let device = |e: String| Error::Device(format!("the wafer model's VM: {e}"));
         self.vm_banks.resize(n, None);
+        self.vm_bank_used.resize(n, 0);
+        let before = self.vm_banks.clone();
         let mut placed: Vec<Option<usize>> = Vec::with_capacity(lanes.len());
         let mut fresh: Vec<usize> = Vec::new();
+        // Lanes this fire leaves out, least recently fired first: a newcomer
+        // the banks or the image have no room for takes theirs (their windows
+        // parked word for word; they place again on their next fire).
+        let mut victims = {
+            let current: Vec<InstanceId> = lanes.iter().map(|(i, _)| *i).collect();
+            let owners: Vec<Option<InstanceId>> =
+                self.vm_banks.iter().map(|o| o.filter(|o| !current.contains(o))).collect();
+            std::collections::VecDeque::from(eviction_order(&owners, &self.vm_bank_used))
+        };
+        let mut evicted: Vec<(usize, InstanceId)> = Vec::new();
         for &(instance, _) in lanes {
             let bank = self.vm_banks.iter().position(|o| *o == Some(instance)).or_else(|| {
-                let bank = self.vm_banks.iter().position(Option::is_none)?;
+                let bank = self.vm_banks.iter().position(Option::is_none).or_else(|| {
+                    let bank = victims.pop_front()?;
+                    evicted.extend(self.vm_banks[bank].map(|o| (bank, o)));
+                    Some(bank)
+                })?;
                 self.vm_banks[bank] = Some(instance);
                 fresh.push(bank);
                 Some(bank)
@@ -1747,43 +1776,78 @@ impl Spatial {
         }
         let mut programs: Vec<Option<guest4::slots::LaneProgram>> = vec![None; n];
         let mut seeds: Vec<Option<Vec<guest4::wafer::Seed>>> = (0..n).map(|_| None).collect();
+        let mut parked: Vec<Option<guest4::slots::Parked>> = vec![None; n];
         for bank in 0..n {
             let Some(owner) = self.vm_banks[bank] else {
                 continue;
             };
             let (key, program) = self.guest_of(owner)?;
             if fresh.contains(&bank) {
+                // An evicted lane gets its window back; its channels seed it
+                // if the window no longer fits its program.
+                parked[bank] = self.vm_parked.get(&owner).cloned();
                 seeds[bank] = Some(self.seeds_of(owner, &program)?);
             }
             programs[bank] = Some(guest4::slots::LaneProgram { key, program });
         }
-        let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
-            return Err(Error::Device("the VM path without a wafer model".into()));
-        };
-        if let Err(why) = w.vm_place_lanes(programs.clone(), seeds) {
-            // The newcomers stay on the host; the lanes already placed run on.
-            tracing::info!(%why, lanes = fresh.len(), "spatial guest: no room on the VM for new lanes");
-            for &bank in &fresh {
+        // The image's arena and bank: evict until the newcomers fit, or no
+        // one is left to.
+        if let Some(Model::Wafer(w)) = &self.daemon
+            && let Some((lay, _)) = w.vm
+        {
+            while guest4::slots::Slots::plan(&lay, &programs).is_err() {
+                let Some(bank) = victims.pop_front() else { break };
+                evicted.extend(self.vm_banks[bank].map(|o| (bank, o)));
                 self.vm_banks[bank] = None;
                 programs[bank] = None;
             }
-            for slot in &mut placed {
-                if slot.is_some_and(|b| fresh.contains(&b)) {
-                    *slot = None;
+        }
+        for (bank, instance) in &evicted {
+            tracing::info!(?instance, bank, "spatial guest: an idle lane leaves the VM for a newcomer");
+        }
+        let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
+            return Err(Error::Device("the VM path without a wafer model".into()));
+        };
+        let left = match w.vm_place_lanes(programs.clone(), seeds, parked.clone()) {
+            Ok(left) => {
+                for &bank in &fresh {
+                    tracing::info!(instance = ?self.vm_banks[bank], bank, "spatial guest: a request takes a VM lane");
+                }
+                left
+            }
+            Err(why) => {
+                // The newcomers stay on the host; the lanes already placed run on.
+                tracing::info!(%why, lanes = fresh.len(), "spatial guest: no room on the VM for new lanes");
+                for &bank in &fresh {
+                    self.vm_banks[bank] = None;
+                    programs[bank] = None;
+                }
+                for slot in &mut placed {
+                    if slot.is_some_and(|b| fresh.contains(&b)) {
+                        *slot = None;
+                    }
+                }
+                if self.vm_bank_progs.is_empty() {
+                    return Ok(placed);
+                }
+                let seeds = (0..n).map(|_| None).collect();
+                let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
+                    return Err(Error::Device("the VM path without a wafer model".into()));
+                };
+                w.vm_place_lanes(programs.clone(), seeds, vec![None; n]).map_err(device)?
+            }
+        };
+        // The windows of the lanes that left: an evicted instance's kept for
+        // its next fire; one placed again gets a fresh entry when it leaves.
+        for (bank, window) in left.into_iter().enumerate() {
+            if let (Some(window), Some(Some(owner))) = (window, before.get(bank)) {
+                if self.vm_banks.get(bank) != Some(&Some(*owner)) {
+                    self.vm_parked.insert(*owner, window);
                 }
             }
-            if self.vm_bank_progs.is_empty() {
-                return Ok(placed);
-            }
-            let seeds = (0..n).map(|_| None).collect();
-            let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
-                return Err(Error::Device("the VM path without a wafer model".into()));
-            };
-            w.vm_place_lanes(programs.clone(), seeds).map_err(device)?;
-        } else {
-            for &bank in &fresh {
-                tracing::info!(instance = ?self.vm_banks[bank], bank, "spatial guest: a request takes a VM lane");
-            }
+        }
+        for owner in self.vm_banks.iter().flatten() {
+            self.vm_parked.remove(owner);
         }
         self.vm_bank_progs = programs.iter().map(|p| p.as_ref().map(|p| p.key)).collect();
         Ok(placed)
@@ -3020,6 +3084,14 @@ impl Engine for Spatial {
     }
 }
 
+/// The banks an eviction may take (`owners`: a bank's owner if it may go),
+/// least recently fired (`used`) first.
+fn eviction_order(owners: &[Option<InstanceId>], used: &[u64]) -> Vec<usize> {
+    let mut banks: Vec<usize> = (0..owners.len()).filter(|&b| owners[b].is_some()).collect();
+    banks.sort_by_key(|&b| (used.get(b).copied().unwrap_or(0), b));
+    banks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3036,6 +3108,17 @@ mod tests {
         assert_eq!(ahead_steps(Some(2), 32, 16, 4, 16, 0), 2);
         assert_eq!(ahead_steps(Some(0), 32, 16, 4, 16, 0), 0);
         assert_eq!(ahead_steps(None, 32, 2, 4, 16, 0), 0);
+    }
+
+    #[test]
+    fn an_eviction_takes_the_least_recently_fired_bank_that_may_go() {
+        let (a, b, c) = (Some(InstanceId(1)), Some(InstanceId(2)), Some(InstanceId(3)));
+        // Bank 1 fired longest ago; bank 2 has no owner that may go (idle,
+        // or its request is in the fire).
+        assert_eq!(eviction_order(&[a, b, None, c], &[7, 3, 1, 5]), vec![1, 3, 0]);
+        assert_eq!(eviction_order(&[None, None], &[0, 0]), Vec::<usize>::new());
+        // Ties: the lower bank first.
+        assert_eq!(eviction_order(&[a, b], &[4, 4]), vec![0, 1]);
     }
 
     #[test]
