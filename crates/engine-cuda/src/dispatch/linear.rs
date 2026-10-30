@@ -2174,6 +2174,7 @@ impl Run<'_> {
             || atoms.width == 0
             || act.width.div_ceil(atoms.width) != 128
             || act.rows < 128
+            || act.rows >= 2048
             || crate::device::alloc::is_host_pointer(codes.ptr)
         {
             return Ok(false);
