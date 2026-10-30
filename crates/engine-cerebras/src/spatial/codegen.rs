@@ -265,6 +265,7 @@ fn after_each_call(s: &str, call: &str, extra: &str) -> (String, usize) {
 }
 
 /// The names a layout exports (`@export_name("n", ...)`), in order.
+#[cfg(test)]
 fn layout_exports(layout: &str) -> Vec<String> {
     layout
         .split("@export_name(")
