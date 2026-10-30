@@ -363,6 +363,149 @@ pub fn write_page_host(rt: &mut Runtime, pool: &HostPool, page: u32, words: &[u3
     Ok(())
 }
 
+/// [`read_page_host`] through the staging slots (`slots` a PE): one
+/// `page_stage(page, 0)` launch copies the page's block into `kstage` /
+/// `vstage` on its grid row, then each grid's row of them is read. Only
+/// the page crosses. The caller keeps fires out until it returns.
+pub fn read_page_staged(rt: &mut Runtime, pool: &HostPool, slots: usize, page: u32) -> R<Vec<u32>> {
+    let rows = pool.shape.rows;
+    if page as usize >= pool.shape.pages() {
+        return Err(format!("page {page} outside a pool of {}", pool.shape.pages()));
+    }
+    let e = |e: crate::sdk::Error| e.to_string();
+    rt.launch("page_stage", &[page, 0]).map_err(e)?;
+    let (r, per) = (page as usize % rows, slots * pool.cells);
+    let mut out = Vec::with_capacity(page_words(pool));
+    for &(x0, y0) in &pool.grids {
+        let rect = Rect { x: x0 as i32, y: (y0 + r) as i32, w: pool.cols as i32, h: 1 };
+        for sym in ["kstage", "vstage"] {
+            let mut row = vec![0u32; pool.cols * per];
+            rt.memcpy_d2h(sym, &mut row, rect, per, Order::RowMajor, pool.data_type).map_err(e)?;
+            out.extend(row.chunks_exact(per).flat_map(|c| c[..pool.cells].iter().copied()));
+        }
+    }
+    Ok(out)
+}
+
+/// [`write_page_host`] through the staging slots: each grid's row of
+/// `kstage` / `vstage` written, then one `page_unstage(page, 0)` launch.
+pub fn write_page_staged(rt: &mut Runtime, pool: &HostPool, slots: usize, page: u32, words: &[u32]) -> R<()> {
+    let rows = pool.shape.rows;
+    if page as usize >= pool.shape.pages() {
+        return Err(format!("page {page} outside a pool of {}", pool.shape.pages()));
+    }
+    if words.len() != page_words(pool) {
+        return Err(format!("a page of {} words for pages of {}", words.len(), page_words(pool)));
+    }
+    let e = |e: crate::sdk::Error| e.to_string();
+    let (r, per) = (page as usize % rows, slots * pool.cells);
+    let mut parts = words.chunks_exact(pool.cols * pool.cells);
+    for &(x0, y0) in &pool.grids {
+        let rect = Rect { x: x0 as i32, y: (y0 + r) as i32, w: pool.cols as i32, h: 1 };
+        for sym in ["kstage", "vstage"] {
+            let part = parts.next().ok_or("short page")?;
+            let mut row = vec![0u32; pool.cols * per];
+            for (dst, src) in row.chunks_exact_mut(per).zip(part.chunks_exact(pool.cells)) {
+                dst[..pool.cells].copy_from_slice(src);
+            }
+            rt.memcpy_h2d(sym, &row, rect, per, Order::RowMajor, pool.data_type).map_err(e)?;
+        }
+    }
+    rt.launch("page_unstage", &[page, 0]).map_err(e)
+}
+
+/// `pages` assigned to staging rounds: each page its grid row's next slot
+/// (`slots` a PE), a round holding at most `slots` pages of a row. Per
+/// round, each page's (index in `pages`, row, slot).
+pub fn staging_rounds(rows: usize, slots: usize, pages: &[u32]) -> Vec<Vec<(usize, usize, usize)>> {
+    let mut rounds: Vec<Vec<(usize, usize, usize)>> = Vec::new();
+    let mut used: Vec<Vec<usize>> = Vec::new();
+    for (i, &p) in pages.iter().enumerate() {
+        let r = p as usize % rows;
+        let k = (0..).find(|&k| used.get(k).is_none_or(|u| u[r] < slots)).unwrap_or(0);
+        if k == rounds.len() {
+            rounds.push(Vec::new());
+            used.push(vec![0; rows]);
+        }
+        rounds[k].push((i, r, used[k][r]));
+        used[k][r] += 1;
+    }
+    rounds
+}
+
+/// [`read_page_staged`] for several pages at once: a round stages every
+/// page it holds (its row's slots), then one memcpy per grid and symbol
+/// over the rows they span reads them all; a round trip a round, not a
+/// page (hardware's d2h is latency bound).
+pub fn read_pages_staged(rt: &mut Runtime, pool: &HostPool, slots: usize, pages: &[u32]) -> R<Vec<Vec<u32>>> {
+    let (rows, cells, cols) = (pool.shape.rows, pool.cells, pool.cols);
+    if let Some(&p) = pages.iter().find(|&&p| p as usize >= pool.shape.pages()) {
+        return Err(format!("page {p} outside a pool of {}", pool.shape.pages()));
+    }
+    let e = |e: crate::sdk::Error| e.to_string();
+    let per = slots * cells;
+    let mut out = vec![Vec::with_capacity(page_words(pool)); pages.len()];
+    for round in staging_rounds(rows, slots, pages) {
+        for &(i, _, slot) in &round {
+            rt.launch("page_stage", &[pages[i], slot as u32]).map_err(e)?;
+        }
+        let (lo, hi) = (round.iter().map(|t| t.1).min().unwrap_or(0), round.iter().map(|t| t.1).max().unwrap_or(0));
+        let h = hi - lo + 1;
+        for &(x0, y0) in &pool.grids {
+            let rect = Rect { x: x0 as i32, y: (y0 + lo) as i32, w: cols as i32, h: h as i32 };
+            for sym in ["kstage", "vstage"] {
+                let mut words = vec![0u32; h * cols * per];
+                rt.memcpy_d2h(sym, &mut words, rect, per, Order::RowMajor, pool.data_type).map_err(e)?;
+                for &(i, r, slot) in &round {
+                    for c in 0..cols {
+                        let at = ((r - lo) * cols + c) * per + slot * cells;
+                        out[i].extend_from_slice(&words[at..at + cells]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// [`write_page_staged`] for several pages: a round's staging rows written
+/// with one memcpy per grid and symbol, then each page unstaged.
+pub fn write_pages_staged(rt: &mut Runtime, pool: &HostPool, slots: usize, pages: &[(u32, Vec<u32>)]) -> R<()> {
+    let (rows, cells, cols) = (pool.shape.rows, pool.cells, pool.cols);
+    let ids: Vec<u32> = pages.iter().map(|(p, _)| *p).collect();
+    if let Some(&p) = ids.iter().find(|&&p| p as usize >= pool.shape.pages()) {
+        return Err(format!("page {p} outside a pool of {}", pool.shape.pages()));
+    }
+    if let Some((p, w)) = pages.iter().find(|(_, w)| w.len() != page_words(pool)) {
+        return Err(format!("page {p}: {} words for pages of {}", w.len(), page_words(pool)));
+    }
+    let e = |e: crate::sdk::Error| e.to_string();
+    let per = slots * cells;
+    let part = cols * cells;
+    for round in staging_rounds(rows, slots, &ids) {
+        let (lo, hi) = (round.iter().map(|t| t.1).min().unwrap_or(0), round.iter().map(|t| t.1).max().unwrap_or(0));
+        let h = hi - lo + 1;
+        for (g, &(x0, y0)) in pool.grids.iter().enumerate() {
+            let rect = Rect { x: x0 as i32, y: (y0 + lo) as i32, w: cols as i32, h: h as i32 };
+            for (k, sym) in ["kstage", "vstage"].into_iter().enumerate() {
+                let mut words = vec![0u32; h * cols * per];
+                for &(i, r, slot) in &round {
+                    let src = &pages[i].1[(g * 2 + k) * part..(g * 2 + k + 1) * part];
+                    for c in 0..cols {
+                        let at = ((r - lo) * cols + c) * per + slot * cells;
+                        words[at..at + cells].copy_from_slice(&src[c * cells..(c + 1) * cells]);
+                    }
+                }
+                rt.memcpy_h2d(sym, &words, rect, per, Order::RowMajor, pool.data_type).map_err(e)?;
+            }
+        }
+        for &(i, _, slot) in &round {
+            rt.launch("page_unstage", &[ids[i], slot as u32]).map_err(e)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +517,15 @@ mod tests {
         blocks: 4,
         entries: 2,
     };
+
+    #[test]
+    fn pages_share_a_round_while_their_rows_have_slots() {
+        // 4 rows, 1 slot: pages 1 and 5 share row 1, so 5 waits a round.
+        let r = staging_rounds(4, 1, &[1, 2, 5, 3]);
+        assert_eq!(r, vec![vec![(0, 1, 0), (1, 2, 0), (3, 3, 0)], vec![(2, 1, 0)]]);
+        // 2 slots: one round, page 5 in row 1's second slot.
+        assert_eq!(staging_rounds(4, 2, &[1, 2, 5, 3]), vec![vec![(0, 1, 0), (1, 2, 0), (2, 1, 1), (3, 3, 0)]]);
+    }
 
     #[test]
     fn a_page_s_block_round_trips_word_for_word() {

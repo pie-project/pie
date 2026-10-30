@@ -267,10 +267,11 @@ impl Slots {
         pack_ops(&self.arena, lay.max_ops)
     }
 
-    /// `glane` (4 words a lane: table base, token home, window offset,
-    /// register mask) and `gbdesc` (8 a lane: pool ranges `offset | words <<
-    /// 16`); a lane without a program runs nothing it keeps.
-    pub fn glane_gbdesc(&self) -> (Vec<u32>, Vec<u32>) {
+    /// `glane` (4 words a lane: table base, with its rows a turn above bit 16
+    /// where the VM reads them, token home, window offset, register mask)
+    /// and `gbdesc` (8 a lane: pool ranges `offset | words << 16`); a lane
+    /// without a program is all zeros (the VM's empty lane).
+    pub fn glane_gbdesc(&self, lay: &VmLayout) -> (Vec<u32>, Vec<u32>) {
         let n = self.lanes.len();
         let (mut glane, mut gbdesc) = (vec![0u32; n * 4], vec![0u32; n * WINDOW_RANGES]);
         for (l, slot) in self.lanes.iter().enumerate() {
@@ -278,7 +279,8 @@ impl Slots {
                 continue;
             };
             let mask = s.window.regs.iter().fold(0u32, |m, &r| m | 1 << r);
-            glane[l * 4..l * 4 + 4].copy_from_slice(&[s.base, s.tok, s.off as u32, mask]);
+            let rows = if lay.lane_rows { 1 << 16 } else { 0 };
+            glane[l * 4..l * 4 + 4].copy_from_slice(&[s.base | rows, s.tok, s.off as u32, mask]);
             for (k, &(o, w)) in s.window.pool.iter().enumerate() {
                 gbdesc[l * WINDOW_RANGES + k] = o | w << 16;
             }
@@ -413,6 +415,7 @@ mod tests {
             lprog: true,
             bank_words: 200,
             set_b_cols: 0,
+            lane_rows: false,
         }
     }
 
@@ -502,8 +505,13 @@ mod tests {
         let s = Slots::plan(&lay, &lanes).unwrap();
         assert_eq!(s.arena.len(), 8);
         // a: pool [0,1) and [2,4), W1: 3 + 32 words; b: [2,4), W1: 34.
-        let (glane, gbdesc) = s.glane_gbdesc();
+        let (glane, gbdesc) = s.glane_gbdesc(&lay);
         assert_eq!(glane, [0, 0, 0, 2, 0, 0, 0, 0, 3, 0, 35, 2, 0, 0, 69, 2]);
+        // guest4hz on: a live lane's one row a turn above the base; the
+        // idle lane stays all zeros (empty).
+        let (hz, _) = s.glane_gbdesc(&VmLayout { lane_rows: true, ..lay });
+        assert_eq!(hz[..8], [1 << 16, 0, 0, 2, 0, 0, 0, 0]);
+        assert_eq!(hz[8], 3 | 1 << 16);
         assert_eq!(gbdesc[..2], [1 << 16, 2 | 2 << 16]);
         assert_eq!(gbdesc[16], 2 | 2 << 16);
         // Too small a bank, too small an arena.

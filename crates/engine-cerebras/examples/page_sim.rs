@@ -24,7 +24,8 @@ fn main() -> Result<(), String> {
     )?;
     let Design::Grid(grid) = m.design() else { return Err("not a serve2d build".into()) };
     let shape = grid.paged.ok_or("not a batched build")?;
-    let words = m.page_words().ok_or("the host keeps no pages of this build")?;
+    // The host copy's words: its cells at the KV's width (bf16 two a word).
+    let words = m.page_bytes().ok_or("the host keeps no pages of this build")? / 4;
     let pages: Vec<u32> = (0..shape.pages() as u32).collect();
     let before = m.page_out(&pages)?;
     // A made-up image (distinct words) into page `dst`; its neighbours on

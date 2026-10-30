@@ -58,6 +58,10 @@ pub struct VmLayout {
     /// A second VM set's columns after this one's (guest4h2s `VMB`): the
     /// head's `gmode` covers them too.
     pub set_b_cols: usize,
+    /// glane word 0 carries a live lane's rows a turn (`base | rows << 16`,
+    /// rows 0 an empty lane: guest4hz on); guest4hs reads the word as the
+    /// base alone.
+    pub lane_rows: bool,
 }
 
 /// `opmask_lo` / `opmask_hi` as one mask (all ones where the build says
@@ -104,6 +108,7 @@ impl VmLayout {
             lprog: get("vm_lprog").unwrap_or(0) != 0,
             bank_words: get("bank_words").unwrap_or(0),
             set_b_cols: get("VMB").unwrap_or(0),
+            lane_rows: false,
         })
     }
 
@@ -138,6 +143,7 @@ impl VmLayout {
             lprog: get("vm_lprog").unwrap_or(0) != 0,
             bank_words: get("bank_words").unwrap_or(0),
             set_b_cols: get("VMB").unwrap_or(0),
+            lane_rows: false,
         })
     }
 
@@ -537,7 +543,7 @@ pub fn load_slots(
 ) -> R<()> {
     let e = |e: crate::sdk::Error| e.to_string();
     let ops = slots.ops(lay)?;
-    let (glane, gbdesc) = slots.glane_gbdesc();
+    let (glane, gbdesc) = slots.glane_gbdesc(lay);
     let gsdesc = slots.gsdesc();
     let nv = lay.rows + 1;
     let tile = |words: &[u32]| -> Vec<u32> { (0..nv).flat_map(|_| words.iter().copied()).collect() };
@@ -584,6 +590,39 @@ pub fn write_gsdesc(rt: &mut Runtime, lay: &VmLayout, words: &[u32]) -> R<()> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// The VM's sampled-turn count (`gostep`, at block 0's hub): where its next
+/// out-ring row goes.
+pub fn read_ostep(rt: &mut Runtime, lay: &VmLayout) -> R<u64> {
+    let mut word = [0u32; 1];
+    let (x, y) = lay.hub();
+    rt.memcpy_d2h("gostep", &mut word, rect(x, y, 1, 1), 1, Order::RowMajor, DataType::Bits32)
+        .map_err(|e| e.to_string())?;
+    Ok(u64::from(word[0]))
+}
+
+/// `count` out-ring rows of a multi-lane VM from row `first` on: the VM
+/// writes a row each sampled turn (its `ostep`, every lane's turns in turn
+/// order), at `ostep % D`; padded to the 16 words a step's `out` has.
+pub fn read_out_rows(rt: &mut Runtime, lay: &VmLayout, ring: Ring, first: u64, count: usize) -> R<Vec<Vec<u32>>> {
+    if count > ring.depth as usize {
+        return Err(format!("{count} sampled turns a launch; the VM's ring holds {}", ring.depth));
+    }
+    let n = (ring.depth * ring.width) as usize;
+    let mut words = vec![0u32; n];
+    let (x, y) = lay.hub();
+    rt.memcpy_d2h("gout", &mut words, rect(x, y, 1, 1), n, Order::RowMajor, DataType::Bits32)
+        .map_err(|e| e.to_string())?;
+    let w = ring.width as usize;
+    Ok((first..first + count as u64)
+        .map(|r| {
+            let at = (r % u64::from(ring.depth)) as usize * w;
+            let mut row = words[at..at + w].to_vec();
+            row.resize(OUT_WORDS as usize, 0);
+            row
+        })
+        .collect())
 }
 
 /// Each lane's out-ring row for lap `lap` of a multi-lane VM (lane l's step

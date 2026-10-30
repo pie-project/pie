@@ -45,14 +45,40 @@ fn main() -> Result<(), String> {
     let ps = shape.page_size as u32;
     let (lay, _) = m.vm_shape().ok_or("the build has no VM")?;
     let case_of = |lane: usize| lane.min(cases.len() - 1);
+    // IDLE_LANES=1,2: lanes without a program (a per-lane-program image's
+    // idle banks, as the engine leaves them).
+    let idle: Vec<usize> = std::env::var("IDLE_LANES")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
     let copy = |seeds: &[wafer::Seed]| -> Vec<wafer::Seed> {
         seeds.iter().map(|s| wafer::Seed { words: s.words.clone(), ..*s }).collect()
     };
+    // REPLACE=<step>:<case json>: at that step lane 0 takes that case's
+    // program, its own seeds, the other lanes kept (a request coming into a
+    // bank another left): lane 0's steps from then on are that case's.
+    let replace: Option<(usize, serde_json::Value)> = match std::env::var("REPLACE") {
+        Ok(v) => {
+            let (at, path) = v.split_once(':').ok_or("REPLACE=<step>:<case>")?;
+            let json = serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            Some((at.parse().map_err(|_| "REPLACE step")?, json))
+        }
+        Err(_) => None,
+    };
+    let mut lane0: (serde_json::Value, usize) = (jsons[0].clone(), 0);
+    let mut placed: Vec<Option<slots::LaneProgram>> = Vec::new();
     if lay.lprog {
         // Each lane its case's program (a program per distinct case file).
         let mut programs = Vec::new();
         let mut seeds = Vec::new();
         for lane in 0..n {
+            if idle.contains(&lane) {
+                programs.push(None);
+                seeds.push(None);
+                continue;
+            }
             let c = case_of(lane);
             let (table, s) = wafer::case_table(&jsons[c])?;
             let program = engine_cerebras::spatial::guest4::lane::Program {
@@ -65,6 +91,7 @@ fn main() -> Result<(), String> {
             seeds.push(Some(copy(&s)));
         }
         m.vm_place_lanes(&programs, &seeds)?;
+        placed = programs;
     } else {
         m.vm_load_lanes(&cases[0].0)?;
         for lane in 0..n {
@@ -78,6 +105,39 @@ fn main() -> Result<(), String> {
     let mut rows: Vec<Vec<Vec<u32>>> = vec![Vec::new(); n];
     let npg = (steps as u32).div_ceil(ps) + 1;
     for s in 0..steps {
+        if let Some((at, _)) = replace.as_ref().filter(|(at, _)| *at == s) {
+            // ARGMAX_BEFORE=n: n head-argmax launches (gmode 0) first, as a
+            // new request's prefill runs before it takes a VM lane.
+            let n_argmax: usize = std::env::var("ARGMAX_BEFORE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            for k in 0..n_argmax {
+                let lanes: Vec<BatchLane> = (0..n)
+                    .map(|v| BatchLane {
+                        pos: (s + k) as u32,
+                        slot: (s + k) as u32,
+                        pages: (0..npg).map(|i| v as u32 * npg + i).collect(),
+                        visible: None,
+                        forced: vec![3, 7],
+                    })
+                    .collect();
+                m.fire_batch(&lanes, 2, false)?;
+            }
+            eprintln!("{n_argmax} argmax launches before the re-placement at step {at}");
+        }
+        if let Some((at, json)) = replace.as_ref().filter(|(at, _)| *at == s) {
+            let (table, seeds) = wafer::case_table(json)?;
+            let program = engine_cerebras::spatial::guest4::lane::Program {
+                table,
+                epilogue: 0,
+                homes: Default::default(),
+                logits: String::new(),
+            };
+            placed[0] = Some(slots::LaneProgram { key: 1000, program: std::sync::Arc::new(program) });
+            let mut fresh: Vec<Option<Vec<wafer::Seed>>> = (0..n).map(|_| None).collect();
+            fresh[0] = Some(seeds);
+            m.vm_place_lanes(&placed, &fresh)?;
+            lane0 = (json.clone(), *at);
+            eprintln!("lane 0 re-placed at step {at}");
+        }
         let lanes: Vec<BatchLane> = (0..n)
             .map(|v| BatchLane {
                 pos: s as u32,
@@ -90,12 +150,13 @@ fn main() -> Result<(), String> {
         // Each lane's step input at step s (its case's `per_step_words`).
         let inputs: Vec<StepInput> = (0..n)
             .map(|v| {
-                let (table, _) = &cases[case_of(v)];
-                if table.per_step.is_empty() {
+                let (json, step) = if v == 0 { (&lane0.0, s - lane0.1) } else { (&jsons[case_of(v)], s) };
+                let (table, _) = wafer::case_table(json)?;
+                if table.per_step.is_empty() || idle.contains(&v) {
                     return Ok(None);
                 }
-                let entries = slots::step_entries(&lay, table)?;
-                let words = &jsons[case_of(v)]["per_step_words"][s];
+                let entries = slots::step_entries(&lay, &table)?;
+                let words = &json["per_step_words"][step];
                 let values = entries
                     .iter()
                     .map(|e| {
@@ -108,7 +169,10 @@ fn main() -> Result<(), String> {
                 Ok(Some((entries, values)))
             })
             .collect::<Result<_, String>>()?;
-        let answers = m.vm_fire(&lanes, &[], &inputs)?;
+        // FIX_IDLE=0 runs the idle lanes' turns too (the bug the engine had).
+        let skip_idle = std::env::var("FIX_IDLE").map_or(true, |v| v != "0");
+        let sampled: Vec<bool> = (0..n).map(|v| !(skip_idle && idle.contains(&v))).collect();
+        let answers = m.vm_fire(&lanes, &sampled, &inputs)?;
         for (v, plane) in m.lane_planes()?.into_iter().enumerate() {
             planes[v].extend(plane);
         }

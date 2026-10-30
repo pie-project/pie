@@ -314,7 +314,7 @@ impl Model {
                     // An argmax-only lane takes the daemon's argmax: no row
                     // of the vocabulary crosses the pipe.
                     "logits": match lane.which {
-                        _ if lane.argmax_only => "none",
+                        _ if lane.argmax_only || lane.argmax_rows => "none",
                         wafer::Logits::None => "none",
                         wafer::Logits::Last => "last",
                         wafer::Logits::All => "all",
@@ -349,17 +349,19 @@ impl Model {
             .iter()
             .zip(lanes)
             .map(|(answer, lane)| {
+                // The rows' argmax, as the daemon took it: the last row's for
+                // an argmax-only lane, every row's for a verify.
+                let argmax: Vec<u32> = answer
+                    .get("argmax")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|a| a.iter().filter_map(serde_json::Value::as_u64).map(|t| t as u32).collect())
+                    .unwrap_or_default();
                 if lane.argmax_only {
-                    // The last row's argmax, as the daemon took it.
-                    let token = answer
-                        .get("argmax")
-                        .and_then(serde_json::Value::as_array)
-                        .and_then(|a| a.last())
-                        .and_then(serde_json::Value::as_u64)
-                        .map(|t| t as u32);
-                    (Vec::new(), token)
+                    (Vec::new(), argmax.last().copied().into_iter().collect())
+                } else if lane.argmax_rows {
+                    (Vec::new(), argmax)
                 } else {
-                    (rows(answer), None)
+                    (rows(answer), Vec::new())
                 }
             })
             .collect())
@@ -530,13 +532,15 @@ fn fire_batched(w: &mut wafer::Wafer, lanes: &[&PagedLane]) -> EngineResult<Vec<
         return Err(Error::Device("a batched fire on a one-sequence build".into()));
     }
     let cap = w.cap.saturating_sub(1).max(1);
-    // Each lane's pieces: (first row, rows, logits wanted).
-    let mut pieces: Vec<Vec<(usize, usize, bool)>> = Vec::with_capacity(lanes.len());
+    // Each lane's pieces: (first row, rows, logits wanted, iterations).
+    let mut pieces: Vec<Vec<(usize, usize, bool, usize)>> = Vec::with_capacity(lanes.len());
     for lane in lanes {
         let n = lane.tokens.len();
         let consecutive = |v: &[u32]| v.windows(2).all(|p| p[1] == p[0] + 1);
+        // A verify (every row's argmax) runs as a prefill chunk: the head's
+        // argmax comes back for each row.
         let row_by_row = lane.visible.is_some()
-            || lane.which == wafer::Logits::All
+            || (lane.which == wafer::Logits::All && !lane.argmax_rows)
             || !consecutive(&lane.slots)
             || !consecutive(&lane.positions);
         let mut mine = Vec::new();
@@ -545,37 +549,51 @@ fn fire_batched(w: &mut wafer::Wafer, lanes: &[&PagedLane]) -> EngineResult<Vec<
             let rows = if row_by_row { 1 } else { (n - at).min(cap) };
             let last = at + rows == n;
             let want = match lane.which {
-                _ if lane.argmax_only => false,
+                _ if lane.argmax_only || lane.argmax_rows => false,
                 wafer::Logits::None => false,
                 wafer::Logits::Last => last,
                 wafer::Logits::All => true,
             };
-            mine.push((at, rows, want));
+            // A token loop row runs its iterations past the one forced.
+            let iters = if lane.ahead > 0 { 1 + lane.ahead } else { rows };
+            mine.push((at, rows, want, iters));
             at += rows;
         }
+        tracing::debug!(
+            rows = n,
+            pieces = mine.len(),
+            argmax_only = lane.argmax_only,
+            argmax_rows = lane.argmax_rows,
+            which = ?lane.which,
+            masked = lane.visible.is_some(),
+            "spatial: a paged lane's launches"
+        );
         pieces.push(mine);
     }
     let mut logits: Vec<Vec<Vec<f32>>> = vec![Vec::new(); lanes.len()];
-    let mut last_argmax: Vec<Option<u32>> = vec![None; lanes.len()];
+    let mut argmax: Vec<Vec<u32>> = vec![Vec::new(); lanes.len()];
     let waves = pieces.iter().map(Vec::len).max().unwrap_or(0);
     for wave in 0..waves {
-        // The lanes with an n-th piece, by (rows, logits wanted).
-        let mut groups: BTreeMap<(usize, bool), Vec<usize>> = BTreeMap::new();
+        // The lanes with an n-th piece, by (rows, logits wanted, token
+        // loop): a launch's lanes run the same iterations, so token loop
+        // lanes share one launch at the fewest any of them may run.
+        let mut groups: BTreeMap<(usize, bool, bool), Vec<usize>> = BTreeMap::new();
         for (li, mine) in pieces.iter().enumerate() {
-            if let Some(&(_, rows, want)) = mine.get(wave) {
-                groups.entry((rows, want)).or_default().push(li);
+            if let Some(&(_, rows, want, iters)) = mine.get(wave) {
+                groups.entry((rows, want, iters > rows)).or_default().push(li);
             }
         }
-        for ((rows, want), members) in groups {
+        for ((rows, want, _), members) in groups {
             // A launch's lanes (MMAX micro-batches of B on a ring); the head
             // keeps logits rows for the first few only.
             let most = if want { w.logit_lanes } else { w.launch_lanes };
             for chunk in members.chunks(most.max(1)) {
+                let iters = chunk.iter().map(|&li| pieces[li][wave].3).min().unwrap_or(rows);
                 let batch: Vec<crate::spatial::serve2d::BatchLane> = chunk
                     .iter()
                     .map(|&li| {
                         let lane = lanes[li];
-                        let (first, _, _) = pieces[li][wave];
+                        let (first, _, _, _) = pieces[li][wave];
                         crate::spatial::serve2d::BatchLane {
                             pos: lane.positions[first],
                             slot: lane.slots[first],
@@ -591,11 +609,11 @@ fn fire_batched(w: &mut wafer::Wafer, lanes: &[&PagedLane]) -> EngineResult<Vec<
                     })
                     .collect();
                 let (argmax_out, rows_out) = w
-                    .fire_batch(batch, rows, want)
+                    .fire_batch(batch, iters, want)
                     .map_err(|e| Error::Device(format!("the wafer model: {e}")))?;
                 for (k, &li) in chunk.iter().enumerate() {
-                    if let Some(&token) = argmax_out.get(k).and_then(|t| t.get(rows - 1)) {
-                        last_argmax[li] = Some(token);
+                    if let Some(tokens) = argmax_out.get(k) {
+                        argmax[li].extend(tokens.iter().take(iters));
                     }
                 }
                 if want {
@@ -610,15 +628,69 @@ fn fire_batched(w: &mut wafer::Wafer, lanes: &[&PagedLane]) -> EngineResult<Vec<
     }
     Ok(logits
         .into_iter()
-        .zip(last_argmax)
+        .zip(argmax)
         .zip(lanes)
-        .map(|((rows, token), lane)| if lane.argmax_only { (Vec::new(), token) } else { (rows, None) })
+        .map(|((rows, argmax), lane)| {
+            if lane.argmax_only && lane.ahead > 0 {
+                (Vec::new(), argmax)
+            } else if lane.argmax_only {
+                (Vec::new(), argmax.last().copied().into_iter().collect())
+            } else if lane.argmax_rows {
+                (Vec::new(), argmax)
+            } else {
+                (rows, Vec::new())
+            }
+        })
         .collect())
 }
 
+/// Whether lane `at` of `step` has one reader: one attachment that runs
+/// stages covers it (others in the step read their own lanes).
+fn one_reader(step: &engine::fire::Step, at: usize) -> bool {
+    let at = at as u32;
+    step.attachments
+        .iter()
+        .filter(|a| !a.adapter_only && (a.lane..a.lane + a.lanes.max(1)).contains(&at))
+        .count()
+        == 1
+}
+
+/// A paged lane's token loop past its row ([`Spatial::paged_ahead`]).
+struct PagedAhead {
+    next: u32,
+    pages: Vec<u32>,
+    run: std::collections::VecDeque<(u32, u32)>,
+}
+
+impl PagedAhead {
+    /// The argmax the loop already has for a row at `slot` on `pages` whose
+    /// input is `token`, popped; `None` unless the row is exactly the one it
+    /// ran (any other row leaves it to be dropped). Rows past the end of a
+    /// stream are never asked for, so never answered.
+    fn answer(&mut self, slot: u32, pages: &[u32], token: u32) -> Option<u32> {
+        if self.next != slot || !pages.starts_with(&self.pages) || self.run.front().is_none_or(|&(input, _)| input != token) {
+            return None;
+        }
+        self.next += 1;
+        self.run.pop_front().map(|(_, answer)| answer)
+    }
+}
+
+/// How far a greedy decode row's launch runs past it: the fires its
+/// pipeline has left once known (else the lookahead), at most CAP − 2 and
+/// never past the lane's own pages (`pages` of `size` slots, the row at
+/// `slot`).
+fn ahead_steps(fires_left: Option<u32>, lookahead: usize, cap: usize, pages: usize, size: u32, slot: u32) -> usize {
+    if cap <= 2 {
+        return 0;
+    }
+    let room = (pages as u32 * size).saturating_sub(slot + 1) as usize;
+    fires_left.map_or(lookahead, |f| f as usize).min(lookahead).min(cap - 2).min(room)
+}
+
 /// A paged lane's answer: its logits rows, or (argmax only) its last row's
-/// argmax.
-type PagedAnswer = (Vec<Vec<f32>>, Option<u32>);
+/// argmax, or (a verify) every row's.
+type PagedAnswer = (Vec<Vec<f32>>, Vec<u32>);
 
 /// One lane of a fire on a paged model.
 struct PagedLane {
@@ -636,6 +708,12 @@ struct PagedLane {
     /// logits come back (a launch carries more such lanes than lanes with
     /// logits).
     argmax_only: bool,
+    /// Its one reader takes every row's argmax (a speculative verify): the
+    /// rows run as one prefill chunk and only their argmax come back.
+    argmax_rows: bool,
+    /// An argmax-only decode row run `ahead` steps further in its launch
+    /// (the head embedding its own argmax), within the lane's pages.
+    ahead: usize,
     /// The instance whose epilogue the wafer head's multi-lane VM samples
     /// for this lane (its one row, in its VM lane's bank).
     vm: Option<InstanceId>,
@@ -943,6 +1021,10 @@ pub struct Spatial {
     /// Greedy rows a token loop answered, and the loops run.
     ahead_hits: u64,
     ahead_runs: u64,
+    /// A paged lane's token loop run ahead on the wafer, by sequence slot:
+    /// the slot its next row writes, then each row's expected token and the
+    /// argmax it already has (its K/V written on the lane's own pages).
+    paged_ahead: std::collections::HashMap<u32, PagedAhead>,
     next_fire: u64,
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
@@ -978,6 +1060,7 @@ impl Spatial {
             refilled: 0,
             ahead_hits: 0,
             ahead_runs: 0,
+            paged_ahead: std::collections::HashMap::new(),
             next_fire: 0,
             next_frame: 0,
             sink: None,
@@ -1499,15 +1582,21 @@ impl Spatial {
             visible: None,
             forced: lane.tokens.clone(),
         };
-        let mut launch: Vec<serve2d::BatchLane> = vec![batch_of(lead); n];
+        // Every head lane of the launch: the VM's are the first `n`; the
+        // rest (another VM set's turns) repeat a live lane, skipped.
+        let width = match &self.daemon {
+            Some(Model::Wafer(w)) => w.launch_lanes.max(n),
+            _ => n,
+        };
+        let mut launch: Vec<serve2d::BatchLane> = vec![batch_of(lead); width];
         for (&(_, lane), bank) in lanes.iter().zip(&placed) {
             if let Some(bank) = *bank {
                 launch[bank] = batch_of(lane);
             }
         }
-        let keep: Vec<usize> = (0..n)
-            .filter(|b| !placed.contains(&Some(*b)) && self.vm_banks[*b].is_some())
-            .collect();
+        // Only this launch's lanes run a turn: an idle bank, or one whose
+        // request sat this launch out, is skipped and its state untouched.
+        let sampled: Vec<bool> = (0..n).map(|b| placed.contains(&Some(b))).collect();
         let mut inputs: Vec<wafer::StepInput> = vec![None; n];
         for (&(instance, _), bank) in lanes.iter().zip(&placed) {
             if let Some(bank) = *bank {
@@ -1517,7 +1606,16 @@ impl Spatial {
         let Some(Model::Wafer(w)) = self.daemon.as_mut() else {
             return Err(Error::Device("the VM path without a wafer model".into()));
         };
-        let steps = w.vm_fire(launch, keep, inputs).map_err(device)?;
+        let steps = w.vm_fire(launch, sampled.clone(), inputs).map_err(device)?;
+        for (bank, (token, row, _)) in steps.iter().enumerate().filter(|(b, _)| sampled[*b]) {
+            tracing::debug!(
+                bank,
+                owner = ?self.vm_banks.get(bank).copied().flatten(),
+                token,
+                row = ?&row[..row.len().min(4)],
+                "spatial guest: a VM lane's turn"
+            );
+        }
         self.paged_fires += 1;
         Ok(lanes
             .iter()
@@ -2095,7 +2193,7 @@ impl Spatial {
                 let greedy = attached
                     .get(&at)
                     .is_some_and(|&instance| self.programs.greedy_reads(instance, &name))
-                    && step.attachments.iter().filter(|a| !a.adapter_only).count() == 1;
+                    && one_reader(step, at);
                 let ahead = lane.ahead.as_ref().and_then(engine::ahead::Ahead::fires_left);
                 let first_slot = port_slots
                     .get(&at)
@@ -2129,6 +2227,8 @@ impl Spatial {
                             visible: None,
                             which: wafer::Logits::None,
                             argmax_only: false,
+                            argmax_rows: false,
+                            ahead: 0,
                             vm: None,
                         };
                         self.daemon()?.fire_paged(&[&refill])?;
@@ -2194,9 +2294,40 @@ impl Spatial {
                         n == 1
                             && last_only
                             && visible.is_none()
-                            && step.attachments.iter().filter(|a| !a.adapter_only).count() == 1
+                            && one_reader(step, at)
                             && self.vm_lanes_take(instance)
                     });
+                    // A greedy decode row: answered by a token loop that
+                    // already ran it, else run ahead within its pages.
+                    let loop_row = greedy && last_only && vm.is_none() && n == 1 && visible.is_none();
+                    let cap = match &self.daemon {
+                        Some(Model::Wafer(w)) => w.cap,
+                        _ => 0,
+                    };
+                    if loop_row
+                        && let Some(run) = self.paged_ahead.get_mut(&lane.slot)
+                        && let Some(token) = run.answer(slots[0], &lane.kv.pages, tokens[at][0])
+                    {
+                        if run.run.is_empty() {
+                            self.paged_ahead.remove(&lane.slot);
+                        }
+                        self.ahead_hits += 1;
+                        self.kv.write_paged(lane.slot, &lane.kv.pages, &slots, &tokens[at]);
+                        let mut row = vec![0f32; width as usize];
+                        if let Some(cell) = row.get_mut(token as usize) {
+                            *cell = 1.0;
+                        }
+                        logits.push(vec![row]);
+                        fast.push(true);
+                        read_rows.push(rows);
+                        continue;
+                    }
+                    self.paged_ahead.remove(&lane.slot);
+                    let ahead = if loop_row {
+                        ahead_steps(ahead, self.lookahead(), cap, lane.kv.pages.len(), size, slots[0])
+                    } else {
+                        0
+                    };
                     paged_lanes.push((
                         at,
                         PagedLane {
@@ -2206,7 +2337,9 @@ impl Spatial {
                             pages: lane.kv.pages.clone(),
                             visible,
                             which,
+                            ahead,
                             argmax_only: greedy && last_only && vm.is_none(),
+                            argmax_rows: greedy && !last_only && which == wafer::Logits::All && vm.is_none(),
                             vm,
                         },
                         rows.clone(),
@@ -2219,7 +2352,7 @@ impl Spatial {
                     let vm = attached.get(&at).copied().filter(|&instance| {
                         rows.len() == 1
                             && rows[0] as usize + 1 == tokens[at].len()
-                            && step.attachments.iter().filter(|a| !a.adapter_only).count() == 1
+                            && one_reader(step, at)
                             && self.vm_takes(instance)
                     });
                     match vm {
@@ -2275,13 +2408,42 @@ impl Spatial {
             for ((at, lane, rows), (lane_logits, token)) in paged_lanes.into_iter().zip(answers) {
                 self.kv
                     .write_paged(lanes[at].slot, &lane.pages, &lane.slots, &lane.tokens);
-                if lane.argmax_only {
-                    // Its row a one-hot of the argmax, as a token loop's.
+                let one_hot = |t: Option<u32>| {
                     let mut row = vec![0f32; width as usize];
-                    if let Some(cell) = token.and_then(|t| row.get_mut(t as usize)) {
+                    if let Some(cell) = t.and_then(|t| row.get_mut(t as usize)) {
                         *cell = 1.0;
                     }
-                    logits[at] = vec![row];
+                    row
+                };
+                if lane.argmax_only && lane.ahead > 0 && token.len() > 1 {
+                    // Its row the first iteration's argmax; the rest ran ahead
+                    // (each the next row's argmax, its input the one before).
+                    let k = token.len() - 1;
+                    let next = lane.slots[0] + 1;
+                    let extra: Vec<u32> = (next..next + k as u32).collect();
+                    self.kv.write_paged(lanes[at].slot, &lane.pages, &extra, &token[..k]);
+                    self.paged_ahead.insert(
+                        lanes[at].slot,
+                        PagedAhead {
+                            next,
+                            pages: lane.pages.clone(),
+                            run: token[..k].iter().copied().zip(token[1..].iter().copied()).collect(),
+                        },
+                    );
+                    self.ahead_runs += 1;
+                    logits[at] = vec![one_hot(token.first().copied())];
+                    fast[at] = true;
+                    continue;
+                }
+                if lane.argmax_only {
+                    // Its row a one-hot of the argmax, as a token loop's.
+                    logits[at] = vec![one_hot(token.last().copied())];
+                    fast[at] = true;
+                    continue;
+                }
+                if lane.argmax_rows {
+                    // Each asked row a one-hot of its argmax.
+                    logits[at] = rows.iter().map(|&r| one_hot(token.get(r as usize).copied())).collect();
                     fast[at] = true;
                     continue;
                 }
@@ -2577,9 +2739,9 @@ impl Engine for Spatial {
         // The host tier: `host_kv_budget` of whole pages, on a wafer build
         // whose pages the host can read and write.
         self.kv.host_pages = match &self.daemon {
-            Some(Model::Wafer(w)) => match (w.paged, w.page_words, residency.host_kv_budget) {
-                (Some(_), Some(words), Some(budget)) if words > 0 => {
-                    u32::try_from(budget / (words as u64 * 4)).unwrap_or(u32::MAX)
+            Some(Model::Wafer(w)) => match (w.paged, w.page_bytes, residency.host_kv_budget) {
+                (Some(_), Some(bytes), Some(budget)) if bytes > 0 => {
+                    u32::try_from(budget / bytes as u64).unwrap_or(u32::MAX)
                 }
                 _ => 0,
             },
@@ -2855,5 +3017,44 @@ impl Engine for Spatial {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_token_loop_never_runs_past_the_lane_s_pages() {
+        // Two pages of 16: a row at slot 28 has 3 slots left after it.
+        assert_eq!(ahead_steps(None, 32, 16, 2, 16, 28), 3);
+        // The last slot of the last page: nothing past it.
+        assert_eq!(ahead_steps(None, 32, 16, 2, 16, 31), 0);
+        // CAP bounds it (two iterations of the launch are the row and its
+        // first follower), and so do the fires left once known.
+        assert_eq!(ahead_steps(None, 32, 8, 4, 16, 0), 6);
+        assert_eq!(ahead_steps(Some(2), 32, 16, 4, 16, 0), 2);
+        assert_eq!(ahead_steps(Some(0), 32, 16, 4, 16, 0), 0);
+        assert_eq!(ahead_steps(None, 32, 2, 4, 16, 0), 0);
+    }
+
+    #[test]
+    fn a_token_loop_answers_only_the_rows_it_ran() {
+        // Rows from slot 10 on: inputs 5, 6, 7 with argmax 6, 7, 8.
+        let mut run = PagedAhead {
+            next: 10,
+            pages: vec![3],
+            run: [(5, 6), (6, 7), (7, 8)].into_iter().collect(),
+        };
+        // A row the stream did not send (another input, slot or page) gets
+        // nothing: a stop or the token limit leaves the rest unanswered.
+        assert_eq!(run.answer(10, &[3], 9), None);
+        assert_eq!(run.answer(11, &[3], 5), None);
+        assert_eq!(run.answer(10, &[4], 5), None);
+        // The rows it ran, in order; a grown page list still matches.
+        assert_eq!(run.answer(10, &[3], 5), Some(6));
+        assert_eq!(run.answer(11, &[3, 4], 6), Some(7));
+        assert_eq!(run.answer(12, &[3, 4], 7), Some(8));
+        assert_eq!(run.answer(13, &[3, 4], 8), None);
     }
 }

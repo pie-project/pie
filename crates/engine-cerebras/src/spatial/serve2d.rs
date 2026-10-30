@@ -68,6 +68,9 @@ pub struct Layout2d {
     /// turn's last row), 4 on guest4h2s (and the lane's VM set: 0, set A,
     /// the only one the engine drives yet).
     pub vmlane_words: usize,
+    /// Set A's VM lanes (`vm_lanes`; 0 or absent: every head lane): head
+    /// lanes past them are set B's turns (vmlane word 3).
+    pub vm_set_a_lanes: Option<usize>,
     /// `KVST`: KV staging slots a grid PE (`kstage`/`vstage`, `page_stage`
     /// / `page_unstage`; scratch/fork4/kv-staging-interface.md); 0: the
     /// host reads and patches whole kc/vc rows.
@@ -132,6 +135,7 @@ impl Layout2d {
                 hlm: get("HLM"),
                 hlbn: get("HLBN"),
                 vmlane_words: 2,
+                vm_set_a_lanes: get("vm_lanes").filter(|&n| n > 0),
                 kvst: get("KVST").unwrap_or(0),
                 s8b: None,
             };
@@ -760,8 +764,9 @@ pub fn fire(
     lanes: &[BatchLane],
     steps: usize,
     want_logits: bool,
+    vm_written: &mut Vec<u32>,
 ) -> R<(Vec<Vec<u32>>, Vec<Vec<f32>>)> {
-    fire_lanes(lay, rt, lanes, steps, want_logits, None)
+    fire_lanes(lay, rt, lanes, steps, want_logits, None, vm_written)
 }
 
 /// [`fire`] on a VM build, `vm_lanes[v]` 1 for each virtual lane the VM
@@ -773,6 +778,7 @@ pub fn fire_lanes(
     steps: usize,
     want_logits: bool,
     vm_lanes: Option<&[u32]>,
+    vm_written: &mut Vec<u32>,
 ) -> R<(Vec<Vec<u32>>, Vec<Vec<f32>>)> {
     let shape = lay.paged.ok_or("a batched launch on a one-sequence build")?;
     let b_n = shape.lanes;
@@ -844,11 +850,27 @@ pub fn fire_lanes(
                         let v = m * b_n + b;
                         control[v * w] = vm_lanes.and_then(|g| g.get(v).copied()).unwrap_or(0);
                         control[v * w + 1] = lane.forced.len() as u32;
+                        // guest4h2s: a head lane past set A's VM lanes is a
+                        // set B turn, so set A counts only its own.
+                        if w >= 4 && lay.vm_set_a_lanes.is_some_and(|a| v >= a) {
+                            control[v * w + 3] = 1;
+                        }
                     }
                 }
-                let per_row: Vec<u32> = (0..lay.py + lay.vmc).flat_map(|_| control.iter().copied()).collect();
-                let all: Vec<u32> = (0..=lay.hh).flat_map(|_| per_row.iter().copied()).collect();
-                head_h2d(lay, rt, SYM.vm_lanes, &all, 0, lay.hh + 1, control.len())?;
+                // Every head PE holds it (MB words of copy a launch at full
+                // size): written only when it changes (`vm_written`, the
+                // control last written; a launch with the VM off, all
+                // zeros, writes it once).
+                // Only the root column reads it (its region PEs put each row's
+                // ctl, its feeder decides): one column, not the head's
+                // width.
+                if *vm_written != control {
+                    let all: Vec<u32> = (0..=lay.hh).flat_map(|_| control.iter().copied()).collect();
+                    check_head_columns(lay, SYM.vm_lanes, lay.r2x()..lay.r2x() + 1)?;
+                    let col = rect(lay.head_x() + lay.r2x(), 0, 1, lay.hh + 1);
+                    rt.memcpy_h2d(SYM.vm_lanes, &all, col, control.len(), Order::RowMajor, DataType::Bits32).map_err(e)?;
+                    *vm_written = control;
+                }
             }
         }
     }
@@ -891,7 +913,9 @@ pub fn fire_lanes(
 /// n-word write would run over, so the runs either side of them.
 pub fn head_runs(lay: &Layout2d) -> Vec<std::ops::Range<usize>> {
     let cw = lay.chunk_cols() + lay.vmc;
-    let runs = if lay.vm.is_some() {
+    // The VM columns (or, VM 0, their stand-ins) hold head symbols as
+    // one-word dummies: head writes go either side of them.
+    let runs = if lay.vmc > 0 {
         vec![0..lay.r2x() + 1, lay.r2x() + 1 + lay.vmc..cw]
     } else {
         vec![0..cw]
@@ -903,7 +927,7 @@ pub fn head_runs(lay: &Layout2d) -> Vec<std::ops::Range<usize>> {
 /// `cols`) covers a VM column: the bug class that overran the VM PEs (head
 /// weights, `mtab`) on the simulator.
 pub fn check_head_columns(lay: &Layout2d, symbol: &str, cols: std::ops::Range<usize>) -> R<()> {
-    if lay.vm.is_some() {
+    if lay.vmc > 0 {
         let vm = lay.r2x() + 1..lay.r2x() + 1 + lay.vmc;
         if cols.start < vm.end && vm.start < cols.end {
             return Err(format!(
@@ -1030,13 +1054,42 @@ pub fn page_words(lay: &Layout2d) -> Option<usize> {
     page_pool(lay).ok().map(|pool| super::paged::page_words(&pool))
 }
 
-/// Page `page`'s cells off the device ([`super::paged::read_page_host`],
-/// serve8b's [`super::serve8b::page_out`]).
+/// Page `page`'s cells off the device: through the staging slots on a build
+/// with them ([`super::paged::read_page_staged`]), else whole rows
+/// ([`super::paged::read_page_host`]); serve8b's [`super::serve8b::page_out`].
 pub fn read_page(lay: &Layout2d, rt: &mut Runtime, page: u32) -> R<Vec<u32>> {
     if lay.s8b.is_some() {
         return super::serve8b::page_out(lay, rt, page);
     }
-    super::paged::read_page_host(rt, &page_pool(lay)?, page)
+    let pool = page_pool(lay)?;
+    if lay.kvst > 0 {
+        return super::paged::read_page_staged(rt, &pool, lay.kvst, page);
+    }
+    super::paged::read_page_host(rt, &pool, page)
+}
+
+/// Several pages' cells off the device: through the staging slots on a
+/// build with them, a round of pages a memcpy per grid and symbol
+/// ([`super::paged::read_pages_staged`]); otherwise a page at a time.
+pub fn read_pages(lay: &Layout2d, rt: &mut Runtime, pages: &[u32]) -> R<Vec<Vec<u32>>> {
+    if lay.s8b.is_some() {
+        return super::serve8b::page_out_many(lay, rt, pages);
+    }
+    if lay.kvst > 0 {
+        return super::paged::read_pages_staged(rt, &page_pool(lay)?, lay.kvst, pages);
+    }
+    pages.iter().map(|&p| read_page(lay, rt, p)).collect()
+}
+
+/// [`read_pages`]' reverse: host copies back into their device pages.
+pub fn write_pages(lay: &Layout2d, rt: &mut Runtime, pages: &[(u32, Vec<u32>)]) -> R<()> {
+    if lay.s8b.is_some() {
+        return super::serve8b::page_in_many(lay, rt, pages);
+    }
+    if lay.kvst > 0 {
+        return super::paged::write_pages_staged(rt, &page_pool(lay)?, lay.kvst, pages);
+    }
+    pages.iter().try_for_each(|(p, w)| write_page(lay, rt, *p, w))
 }
 
 /// A page's host copy back into page `page`.
@@ -1044,7 +1097,11 @@ pub fn write_page(lay: &Layout2d, rt: &mut Runtime, page: u32, words: &[u32]) ->
     if lay.s8b.is_some() {
         return super::serve8b::page_in(lay, rt, page, words);
     }
-    super::paged::write_page_host(rt, &page_pool(lay)?, page, words)
+    let pool = page_pool(lay)?;
+    if lay.kvst > 0 {
+        return super::paged::write_page_staged(rt, &pool, lay.kvst, page, words);
+    }
+    super::paged::write_page_host(rt, &pool, page, words)
 }
 
 #[cfg(test)]
@@ -1071,6 +1128,22 @@ mod tests {
         let lay = Layout2d { hlbn: Some(1), ..pipe() };
         assert_eq!(lay.logit_lanes(), 1);
         assert_eq!(Layout2d { hlbn: Some(8), ..pipe() }.logit_lanes(), 2);
+    }
+
+    #[test]
+    fn head_writes_stay_off_stand_in_vm_columns_with_the_vm_off() {
+        // VMC 1, VM 0: the VM column is a stand-in, and head symbols there
+        // are still one-word dummies (0108's wrong tokens on the host).
+        let params = [
+            ("PX", 4), ("PY", 4), ("Hc", 16), ("HR", 64), ("Dc", 8), ("Gs", 4), ("Qh", 2),
+            ("Ic", 16), ("Tc", 1), ("W16", 0), ("KV16", 0), ("WF32", 1), ("GRID", 1),
+            ("HEADMODE", 2), ("B", 2), ("PS", 16), ("NB", 2), ("E", 2), ("MMAX", 2), ("GW", 2),
+            ("GH", 4), ("HH", 16), ("Vr", 32), ("Gx", 4), ("VMC", 1), ("vocab", 250), ("CAP", 8),
+        ];
+        let lay = Layout2d::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1)).unwrap().unwrap();
+        assert!(lay.vm.is_none());
+        assert!(check_head_columns(&lay, "mtab", 0..lay.py + lay.vmc).unwrap_err().contains("VM columns"));
+        assert_eq!(head_runs(&lay), vec![0..3, 4..5]);
     }
 
     #[test]
