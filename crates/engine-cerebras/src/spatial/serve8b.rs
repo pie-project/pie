@@ -753,6 +753,9 @@ fn page_at(lay: &Layout2d, page: u32, py: usize) -> R<(usize, usize)> {
 /// the 16-bit memcpy moves them). Between launches only; the device page is
 /// left as it is.
 pub fn page_out(lay: &Layout2d, dev: &mut dyn KvRows, page: u32) -> R<Vec<u32>> {
+    if lay.kvst > 0 && matches!(lay.s8b, Some(S8b::Units(_))) {
+        return page_out_slots16(lay, dev, page);
+    }
     if lay.kvst > 0 {
         return page_out_staged(lay, dev, page);
     }
@@ -776,6 +779,9 @@ pub fn page_out(lay: &Layout2d, dev: &mut dyn KvRows, page: u32) -> R<Vec<u32>> 
 /// kv_copy host -> device (`page_in`): [`page_out`]'s `data` into pool page
 /// `page` (any page: a suspended page may come back elsewhere).
 pub fn page_in(lay: &Layout2d, dev: &mut dyn KvRows, page: u32, data: &[u32]) -> R<()> {
+    if lay.kvst > 0 && matches!(lay.s8b, Some(S8b::Units(_))) {
+        return page_in_slots16(lay, dev, page, data);
+    }
     if lay.kvst > 0 {
         return page_in_staged(lay, dev, page, data);
     }
@@ -807,7 +813,7 @@ pub fn page_in(lay: &Layout2d, dev: &mut dyn KvRows, page: u32, data: &[u32]) ->
 /// slot (PS Dc), the slots' cells (KVST n) and words (two cells a word).
 fn staging(lay: &Layout2d, page: u32) -> R<(Vec<PoolUnit>, usize, usize, usize, usize)> {
     if !matches!(lay.s8b, Some(S8b::Strips { .. })) {
-        return Err("KV page staging here is serve8b's (serve8b_region's slots are not ported)".into());
+        return Err("serve8b's packed staging slots on another design".into());
     }
     let units = pool_units(lay)?;
     let (row, _) = page_at(lay, page, lay.py)?;
@@ -856,6 +862,59 @@ fn page_in_staged(lay: &Layout2d, dev: &mut dyn KvRows, page: u32, data: &[u32])
                 at += n;
             }
             dev.write32(sym, rect(u.x0, u.y0 + row, u.px, 1), sw, &words)?;
+        }
+    }
+    dev.launch("page_unstage", &[page, 0])
+}
+
+/// [`page_out`] through serve8b_region's dedicated 16-bit slots
+/// (`serve_lib8b.py`'s `pages_out` of one page, slot 0): `page_stage(page,
+/// 0)`, then one 16-bit read a unit and symbol of the page's row on that
+/// unit (`KVST` x layers x PS Dc cells a PE, slot-major).
+fn page_out_slots16(lay: &Layout2d, dev: &mut dyn KvRows, page: u32) -> R<Vec<u32>> {
+    let units = pool_units(lay)?;
+    for u in &units {
+        page_at(lay, page, u.py)?;
+    }
+    let mut out = Vec::with_capacity(page_words(lay)?);
+    dev.launch("page_stage", &[page, 0])?;
+    for u in &units {
+        let (row, _) = page_at(lay, page, u.py)?;
+        let sn = lay.kvst * u.nl * u.n;
+        for sym in ["kstage", "vstage"] {
+            let a = dev.read16(sym, rect(u.x0, u.y0 + row, u.px, 1), sn)?;
+            for l in 0..u.nl {
+                for pe in a.chunks_exact(sn) {
+                    out.extend_from_slice(&pe[l * u.n..(l + 1) * u.n]);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// [`page_in`] through serve8b_region's 16-bit slots: the page's cells into
+/// slot 0 on its row of every unit (the rest zero: scratch), then
+/// `page_unstage(page, 0)`.
+fn page_in_slots16(lay: &Layout2d, dev: &mut dyn KvRows, page: u32, data: &[u32]) -> R<()> {
+    let want = page_words(lay)?;
+    if data.len() != want {
+        return Err(format!("a host page of {} elements; this build's is {want}", data.len()));
+    }
+    let units = pool_units(lay)?;
+    let mut at = 0;
+    for u in &units {
+        let (row, _) = page_at(lay, page, u.py)?;
+        let sn = lay.kvst * u.nl * u.n;
+        for sym in ["kstage", "vstage"] {
+            let mut words = vec![0u32; u.px * sn];
+            for l in 0..u.nl {
+                for pe in words.chunks_exact_mut(sn) {
+                    pe[l * u.n..(l + 1) * u.n].copy_from_slice(&data[at..at + u.n]);
+                    at += u.n;
+                }
+            }
+            dev.write16(sym, rect(u.x0, u.y0 + row, u.px, 1), sn, &words)?;
         }
     }
     dev.launch("page_unstage", &[page, 0])

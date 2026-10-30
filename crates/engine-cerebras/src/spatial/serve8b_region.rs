@@ -79,7 +79,23 @@ pub struct Units {
     pub nolayer: bool,
     /// Grids in the top band, layer 0's included (XC / PX + 1).
     pub band: usize,
+    /// Fork 3's eta VM as the block east of the strip (`VMX`, `VMREAL`).
+    pub vm: Option<VmBlock>,
 }
+
+/// The VM block's image (VM5.md): ops, registers, pool and bank words, and
+/// one VM lane a head lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmBlock {
+    pub max_ops: usize,
+    pub nreg: usize,
+    pub pool_words: usize,
+    pub bank_words: usize,
+    pub lanes: usize,
+}
+
+/// The VM block's columns (its hub on the first, at the feeder row).
+pub const NVC: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -137,6 +153,17 @@ pub fn layout(get: &dyn Fn(&str) -> Option<usize>) -> R<Layout2d> {
         rot8: get("ROT8").unwrap_or(0) == 1,
         nolayer: get("NOLAYER").unwrap_or(0) == 1,
         band: rc * rpx / px + 1,
+        vm: match (get("VMX"), get("VMREAL")) {
+            (Some(1), Some(1)) => Some(VmBlock {
+                max_ops: p("max_ops")?,
+                nreg: p("nreg")?,
+                pool_words: p("pool_words")?,
+                bank_words: p("bank_words")?,
+                lanes: p("vm_lanes")?,
+            }),
+            (Some(1), _) => return Err("VMX 1 with the stand-in VM (VMREAL 0): a check build, not served".into()),
+            _ => None,
+        },
     };
     let lay = Layout2d {
         px,
@@ -765,6 +792,210 @@ pub fn copy_pages(lay: &Layout2d, u: &Units, rt: &mut Runtime, pairs: &[(u32, u3
     Ok(())
 }
 
+/// One VM lane's program: its table and its homes' seeds, the logits rows
+/// it reads a turn.
+pub struct VmLane<'a> {
+    pub table: &'a super::guest4::Table,
+    pub seeds: &'a [super::guest4::wafer::Seed],
+    pub rows: u32,
+}
+
+/// The VM block's first column (XV: east of the strip).
+pub fn vm_x(lay: &Layout2d) -> usize {
+    lay.head_x() + lay.chunk_cols() + lay.vmc + lay.py / 4
+}
+
+/// A lane's pool block and wide rows (region row x column x register x Vt,
+/// f32) from its seeds (`vmhost.seeded`).
+fn seeded(lay: &Layout2d, vm: &VmBlock, seeds: &[super::guest4::wafer::Seed]) -> (Vec<u32>, Vec<f32>) {
+    let (hh, vr) = (lay.hh, lay.vr);
+    let vt = vr / NVC;
+    let mut pool = vec![0u32; vm.pool_words];
+    let mut wide = vec![0f32; hh * NVC * vm.nreg * vt];
+    for s in seeds {
+        let (at, n) = (s.at as usize, s.n as usize);
+        if s.kind == "pool" {
+            for (k, &w) in s.words.iter().take(n).enumerate() {
+                if let Some(d) = pool.get_mut(at + k) {
+                    *d = w;
+                }
+            }
+        } else {
+            for (v, &w) in s.words.iter().take(hh * vr).enumerate() {
+                let x = match s.dtype {
+                    eta_ir::Dtype::F32 => f32::from_bits(w),
+                    eta_ir::Dtype::I32 => w as i32 as f32,
+                    _ => w as f32,
+                };
+                let (q, t) = (v / vt, v % vt);
+                wide[(q * vm.nreg + at) * vt + t] = x;
+            }
+        }
+    }
+    (pool, wide)
+}
+
+/// Column `j`'s wide rows over the VM rows (the region rows around the
+/// feeder row F, which stays zero): (HH + 1) x register x Vt f32 bits.
+fn wide_column(lay: &Layout2d, vm: &VmBlock, wide: &[f32], j: usize) -> Vec<u32> {
+    let (hh, f, vt) = (lay.hh, lay.feeder(), lay.vr / NVC);
+    let per = vm.nreg * vt;
+    let mut out = vec![0u32; (hh + 1) * per];
+    for ry in 0..hh {
+        let y = if ry < f { ry } else { ry + 1 };
+        let q = ry * NVC + j;
+        for (k, x) in wide[q * per..(q + 1) * per].iter().enumerate() {
+            out[y * per + k] = x.to_bits();
+        }
+    }
+    out
+}
+
+/// Writes lane b's program `lanes[b]` (`None`: an empty lane, its `glane`
+/// zeroed, the VM skips its turns) to every VM PE and sets `gmode` 1 over
+/// the VM block and the head (`vmhost.load_tables`): one shared op arena
+/// (each distinct table once), lane 0's seeds as the live pool and wide
+/// registers, each lane's bank window (its live pool ranges, at most 8,
+/// and wide registers) in `gbank` when there are several lanes.
+#[allow(clippy::too_many_lines)]
+pub fn vm_load(lay: &Layout2d, sink: &mut dyn Sink, lanes: &[Option<VmLane>]) -> R<()> {
+    let Some(S8b::Units(Units { vm: Some(vm), .. })) = lay.s8b else {
+        return Err("this serve8b_region build has no eta VM (VMX 1, VMREAL 1)".into());
+    };
+    let (hh, vt) = (lay.hh, lay.vr / NVC);
+    let nv = hh + 1;
+    let n_lanes = lanes.len();
+    if n_lanes != vm.lanes {
+        return Err(format!("{n_lanes} VM lanes for an image of {}", vm.lanes));
+    }
+    let live: Vec<&VmLane> = lanes.iter().flatten().collect();
+    let first = live.first().ok_or("no live VM lane")?;
+    let mut arena: Vec<[u32; 6]> = Vec::new();
+    let mut bases: Vec<(&[[u32; 6]], u32)> = Vec::new();
+    for l in &live {
+        if !bases.iter().any(|b| b.0 == l.table.ins.as_slice()) {
+            bases.push((&l.table.ins, arena.len() as u32));
+            arena.extend_from_slice(&l.table.ins);
+        }
+        if l.table.nreg as usize > vm.nreg || l.table.pool_words as usize > vm.pool_words {
+            return Err(format!(
+                "a program of {} registers and {} pool words for an image of {} and {}",
+                l.table.nreg, l.table.pool_words, vm.nreg, vm.pool_words
+            ));
+        }
+    }
+    let ops = super::guest4::wafer::pack_ops(&arena, vm.max_ops)?;
+    let base_of = |l: &VmLane| bases.iter().find(|b| b.0 == l.table.ins.as_slice()).map_or(0, |b| b.1);
+    let mut glane = vec![0u32; n_lanes * 4];
+    let mut gbdesc = vec![0u32; n_lanes * 8];
+    let mut windows: Vec<Option<(usize, Vec<(u32, u32)>, Vec<u32>)>> = Vec::new();
+    let mut boff = 0usize;
+    for (l, lane) in lanes.iter().enumerate() {
+        let Some(lane) = lane else {
+            windows.push(None);
+            continue;
+        };
+        let t = lane.table;
+        let mut rg: Vec<(u32, u32)> = t.bank_pool.iter().copied().filter(|r| r.1 > 0).collect();
+        while rg.len() > 8 {
+            let k = (0..rg.len() - 1)
+                .min_by_key(|&i| rg[i + 1].0 as i64 - rg[i].0 as i64 - rg[i].1 as i64)
+                .unwrap_or(0);
+            let merged = (rg[k].0, rg[k + 1].0 + rg[k + 1].1 - rg[k].0);
+            rg.splice(k..k + 2, [merged]);
+        }
+        for (k, &(o, n)) in rg.iter().enumerate() {
+            gbdesc[l * 8 + k] = o | n << 16;
+        }
+        let rows = lane.rows.max(1);
+        let mask = t.bank_regs.iter().fold(0u32, |m, &x| m | 1 << x);
+        glane[l * 4..l * 4 + 4].copy_from_slice(&[base_of(lane) | rows << 16, t.tok_home.unwrap_or(0), boff as u32, mask]);
+        let words = rg.iter().map(|r| r.1 as usize).sum::<usize>() + t.bank_regs.len() * vt;
+        windows.push(Some((boff, rg, t.bank_regs.clone())));
+        boff += words;
+    }
+    if n_lanes > 1 && boff > vm.bank_words {
+        return Err(format!("the lanes' bank windows take {boff} words of {}", vm.bank_words));
+    }
+    let states: Vec<Option<(Vec<u32>, Vec<f32>)>> =
+        lanes.iter().map(|l| l.as_ref().map(|l| seeded(lay, &vm, l.seeds))).collect();
+    let (pool0, wide0) = seeded(lay, &vm, first.seeds);
+    let th = first.table.tok_home.unwrap_or(0);
+    let tile = |w: &[u32]| -> Vec<u32> { (0..nv).flat_map(|_| w.iter().copied()).collect() };
+    let xv = vm_x(lay);
+    for j in 0..NVC {
+        let col = rect(xv + j, 0, 1, nv);
+        sink.h2d("gops", col, vm.max_ops * 4, &tile(&ops))?;
+        sink.h2d("gpool", col, vm.pool_words, &tile(&pool0))?;
+        sink.h2d("gvalid", col, 1, &vec![lay.vocab as u32; nv])?;
+        sink.h2d("gtok_home", col, 1, &vec![th; nv])?;
+        sink.h2d("gostep", col, 1, &vec![0; nv])?;
+        sink.h2d("gwide", col, vm.nreg * vt, &wide_column(lay, &vm, &wide0, j))?;
+        sink.h2d("glane", col, n_lanes * 4, &tile(&glane))?;
+        sink.h2d("gbdesc", col, n_lanes * 8, &tile(&gbdesc))?;
+        if n_lanes > 1 {
+            let mut bank = vec![0u32; nv * vm.bank_words];
+            for (st, w) in states.iter().zip(&windows) {
+                let (Some((pool, wide)), Some((bo, rg, regs))) = (st, w) else {
+                    continue;
+                };
+                let lc = wide_column(lay, &vm, wide, j);
+                let per = vm.nreg * vt;
+                for y in 0..nv {
+                    let row = &mut bank[y * vm.bank_words..(y + 1) * vm.bank_words];
+                    let mut at = *bo;
+                    for &(o, n) in rg {
+                        row[at..at + n as usize].copy_from_slice(&pool[o as usize..(o + n) as usize]);
+                        at += n as usize;
+                    }
+                    for &x in regs {
+                        let from = y * per + x as usize * vt;
+                        row[at..at + vt].copy_from_slice(&lc[from..from + vt]);
+                        at += vt;
+                    }
+                }
+            }
+            sink.h2d("gbank", col, vm.bank_words, &bank)?;
+        }
+    }
+    sink.h2d("gmode", rect(xv, 0, NVC, nv), 1, &vec![1; NVC * nv])?;
+    let hw = lay.chunk_cols() + lay.vmc;
+    sink.h2d("gmode", rect(lay.head_x(), 0, hw, nv), 1, &vec![1; hw * nv])
+}
+
+/// The external VM's per-fire control (`vmctl`, on the root column): bit
+/// lane CAP + iteration set where `skip(lane, iteration)` (the VM skips that
+/// turn and answers token 0: a forced token, an idle lane).
+pub fn put_vmctl(lay: &Layout2d, sink: &mut dyn Sink, skip: impl Fn(usize, usize) -> bool) -> R<()> {
+    let b_n = lay.paged.map_or(1, |s| s.lanes);
+    let cap = lay.cap;
+    let mut words = vec![0u32; (b_n * cap).div_ceil(32)];
+    for b in 0..b_n {
+        for i in 0..cap {
+            if skip(b, i) {
+                let k = b * cap + i;
+                words[k / 32] |= 1 << (k % 32);
+            }
+        }
+    }
+    let nv = lay.hh + 1;
+    let all: Vec<u32> = (0..nv).flat_map(|_| words.iter().copied()).collect();
+    sink.h2d("vmctl", rect(lay.root().0, 0, 1, nv), words.len(), &all)
+}
+
+/// The VM's out ring (`vmhost.ring`): RING rows of RW words from the block's
+/// hub (its first column, the feeder row).
+pub fn vm_ring(lay: &Layout2d, rt: &mut Runtime) -> R<Vec<Vec<u32>>> {
+    let e = |e: crate::sdk::Error| e.to_string();
+    let hub = rect(vm_x(lay), lay.feeder(), 1, 1);
+    let mut g = [0u32; 3];
+    rt.memcpy_d2h("gring", &mut g, hub, 3, Order::RowMajor, DataType::Bits32).map_err(e)?;
+    let (ring, rw) = (g[0] as usize, g[1] as usize);
+    let mut out = vec![0u32; ring * rw];
+    rt.memcpy_d2h("gout", &mut out, hub, ring * rw, Order::RowMajor, DataType::Bits32).map_err(e)?;
+    Ok(out.chunks(rw.max(1)).map(<[u32]>::to_vec).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,6 +1013,35 @@ mod tests {
         RNL:3,RGY:16,RC:2,RR:4,NCOL:7,RTR:4,HR:4096,Qh:4,PS:16,NB:1,E:1,MC:1,W16:1,KV16:1,KVCP:0,PROF:0,TIME:0,\
         HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,PASSES:3,MODE:0,OVL:0,VMC:1,\
         CAP:64,iters:1,B:1,NP:3";
+
+    /// The VM's per-fire control: bit lane CAP + iteration, every VM row.
+    #[test]
+    fn vmctl_marks_the_skipped_turns() {
+        use crate::sdk::Rect;
+        struct Rec(Vec<(String, Rect, usize, Vec<u32>)>);
+        impl Sink for Rec {
+            fn h2d(&mut self, s: &str, r: Rect, n: usize, w: &[u32]) -> R<()> {
+                self.0.push((s.into(), r, n, w.to_vec()));
+                Ok(())
+            }
+            fn h2d16(&mut self, s: &str, r: Rect, n: usize, w: &[u32]) -> R<()> {
+                self.h2d(s, r, n, w)
+            }
+        }
+        let params = "PX:8,PY:16,Hc:3,Dc:8,Gs:8,Ic:24,RPX:16,RPY:24,RHc:2,RDc:4,RGs:16,RIc:12,RNL:2,RGY:8,RC:2,RR:2,\
+            NCOL:2,RTR:5,HR:40,Qh:4,PS:4,NB:2,E:2,B:2,MC:1,W16:1,NP:3,KV16:1,KVCP:0,HROUTE:1,ROT8:1,HEADMODE:2,HH:32,\
+            Vr:160,Gx:4,Gy:8,vocab:1000,VMC:0,CAP:16,VMX:1,VMREAL:1,max_ops:104,nreg:12,pool_words:211,\
+            bank_words:768,vm_lanes:2";
+        let lay = lay_of(params);
+        assert_eq!((vm_x(&lay), lay.root()), (52, (46, 16)));
+        let mut rec = Rec(Vec::new());
+        put_vmctl(&lay, &mut rec, |_, i| i == 0).unwrap();
+        let (sym, r, n, w) = &rec.0[0];
+        assert_eq!((sym.as_str(), r.x, r.h, *n), ("vmctl", 46, 33, 1));
+        assert!(w.iter().all(|&x| x == (1 | 1 << 16)));
+        assert!(vm_load(&lay, &mut rec, &[None, None]).unwrap_err().contains("no live"));
+        assert!(vm_load(&lay, &mut rec, &[None]).unwrap_err().contains("lanes"));
+    }
 
     #[test]
     fn qwen3_8b_units_and_tables() {

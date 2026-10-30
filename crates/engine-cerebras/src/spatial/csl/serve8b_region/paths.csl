@@ -28,6 +28,12 @@ param VMC: u16;        // the VM column (0/1) at chunk column VMAT
 param VMAT: u16;
 param XE: u16;         // the embedding strip's first column
 param EC: u16;         // its columns (GHT / 4)
+// The VM block east of the strip (VM5.md; XV 0: none) and the final root's
+// column: a root-column PE's logits row runs east to the block on c_vl (2) on
+// every row but F; the VM's token runs west along row F to the final root on
+// c_vt (3).
+param XV: u16;
+param RCX: u16;
 
 const rt = @import_module("rt.csl");
 const C_S0: color = @get_color(14);
@@ -36,6 +42,8 @@ const C_E0: color = @get_color(0);
 const C_E1: color = @get_color(1);
 const C_E2: color = @get_color(4);
 const C_E3: color = @get_color(13);
+const C_VL: color = @get_color(2);
+const C_VT: color = @get_color(3);
 
 // Head column of chunk pair k; the pair at column gx (C: none).
 fn hcol(k: u16) u16 { return XH + k + (if (VMC == 1 and k >= VMAT) 1 else 0); }
@@ -92,6 +100,9 @@ fn routes(gx: u16, gy: u16) void {
     e_col(C_E1, 4 * c + 1, gy);
     e_col(C_E2, 4 * c + 2, gy);
     e_col(C_E3, 4 * c + 3, gy);
+  }
+  if (XV > 0 and gx > RCX and gx < XV) {
+    if (gy == F) { rt.route(C_VT, rt.RX_E, rt.TX_W); } else { rt.route(C_VL, rt.RX_W, rt.TX_E); }
   }
   if (gy < GHT and gx >= XH and gx < xe(gy / 4)) {
     const k = gy % 4;

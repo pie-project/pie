@@ -14,6 +14,8 @@ param VMAT: u16;
 param HEADMODE: u16;
 param KVCP: u16;
 param HROUTE: u16;     // the layout's HROUTE (the dummies' exports)
+param XV: u16;         // the VM block's first column (0: none) and the final root's (paths.csl)
+param RCX: u16;
 param WS: type;        // the grids' weight and KV element types (their exports)
 param KS: type;
 
@@ -21,7 +23,7 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
 const paths = @import_module("paths.csl", .{ .GWD = PX, .GHT = PY, .XL = XL, .YL = YL, .XH = XH0, .F = F,
                                              .C = PY / 2, .VMC = VMC, .VMAT = VMAT, .XE = XH0 + PY / 2 + VMC,
-                                             .EC = PY / 4 });
+                                             .EC = PY / 4, .XV = XV, .RCX = RCX });
 
 fn init() void {
   if (HEADMODE == 2) { paths.routes(layout_mod.get_x_coord(), layout_mod.get_y_coord()); }

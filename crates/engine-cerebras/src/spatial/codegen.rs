@@ -54,6 +54,8 @@ mod src {
         pub const HEAD_EXTRA: &str = include_str!("csl/serve8b_region/head_extra.csl");
         pub const EMBED_BASE: &str = include_str!("csl/serve8b_region/embed_base.csl");
         pub const FILLER_BASE: &str = include_str!("csl/serve8b_region/filler_base.csl");
+        pub const VM_BASE: &str = include_str!("csl/serve8b_region/vm_base.csl");
+        pub const VM_STUB_BASE: &str = include_str!("csl/serve8b_region/vm_stub_base.csl");
     }
 
     pub mod pipe {
@@ -108,7 +110,9 @@ impl Design {
         match self {
             Design::Serve2d => Some("guest4hm"),
             Design::Serve2dPipe => Some("guest4h2s"),
-            Design::Serve8b | Design::Serve8bRegion => None,
+            Design::Serve8b => None,
+            // Fork 3's guest4hz as the block east of the strip (with VMX).
+            Design::Serve8bRegion => Some("guest4hz"),
         }
     }
 
@@ -974,8 +978,32 @@ pub fn serve8b() -> R<Vec<File>> {
 /// The grid kernels' HROUTE exports (their own under `HROUTE` 1).
 const S8BR_HROUTE_NAMES: &[(&str, &str)] = &[("rcfg", "u32"), ("rbits", "u32")];
 
+/// The head's names on serve8b_region: serve8b's plus the external VM's
+/// per-lane control (`vmctl`), in sync.py's order.
+const S8BR_HEAD_NAMES: &[(&str, &str)] = &[
+    ("wt", "u32"), ("et", "u32"), ("l2", "f32"), ("force", "u32"), ("lmax", "f32"), ("gmode", "u32"),
+    ("vm_tok", "f32"), ("vin", "f32"), ("xin", "f32"), ("gam", "f32"), ("y", "f32"), ("emb", "f32"),
+    ("tok", "f32"), ("prof", "u32"), ("in_tokens", "u32"), ("out_tokens", "u32"), ("yscale", "f32"),
+    ("vmctl", "u32"), ("hlogits", "f32"),
+];
+/// Fork 3's eta VM's exports (vm_base.csl, the block east of the strip).
+const S8BR_VM_NAMES: &[(&str, &str)] = &[
+    ("gwide", "f32"), ("gpool", "u32"), ("gops", "u32"), ("gout", "u32"), ("gprof", "u32"), ("gostep", "u32"),
+    ("gring", "u32"), ("vm_ctl", "u32"), ("gbank", "u32"), ("gcycles", "u32"), ("gvalid", "u32"),
+    ("gtok_home", "u32"), ("gsin", "u32"), ("glane", "u32"), ("gbdesc", "u32"), ("gsdesc", "u32"), ("gdbg", "u32"),
+];
+/// KV page staging (the unit kernels' own, under KVST > 0): bf16 slots.
+const S8BR_KVST_NAMES: &[(&str, &str)] = &[("kstage", "KS"), ("vstage", "KS")];
+
+/// serve8b_region's dummies: a 1-word array per missing name (the HROUTE
+/// and staging ones conditional), and no-op staging launches off the units.
 fn s8br_dummies(own: &[String]) -> String {
-    let all = Names::of(S8B_GRID_NAMES).with(S8B_HEAD_NAMES).with(S8B_EMBED_NAMES).with(S8BR_HROUTE_NAMES);
+    let all = Names::of(S8B_GRID_NAMES)
+        .with(S8BR_KVST_NAMES)
+        .with(S8BR_HEAD_NAMES)
+        .with(S8B_EMBED_NAMES)
+        .with(S8BR_VM_NAMES)
+        .with(S8BR_HROUTE_NAMES);
     let mut lines = Vec::new();
     let mut decls = Vec::new();
     for &(n, ty) in &all.0 {
@@ -985,12 +1013,23 @@ fn s8br_dummies(own: &[String]) -> String {
         decls.push(format!("var s2d_d_{n} = @zeros([1]{ty});\nvar s2d_d_{n}_ptr: [*]{ty} = &s2d_d_{n};"));
         if S8BR_HROUTE_NAMES.iter().any(|h| h.0 == n) {
             lines.push(format!("  if (HROUTE == 1) {{ @export_symbol(s2d_d_{n}_ptr, \"{n}\"); }}"));
+        } else if S8BR_KVST_NAMES.iter().any(|h| h.0 == n) {
+            lines.push(format!("  if (KVST > 0) {{ @export_symbol(s2d_d_{n}_ptr, \"{n}\"); }}"));
         } else {
             lines.push(format!("  @export_symbol(s2d_d_{n}_ptr, \"{n}\");"));
         }
     }
+    if !own.iter().any(|o| o == "kstage") {
+        // The staging launches (KVST > 0) exist on every program: no-ops off the units.
+        decls.push(
+            "fn page_stage(page: u32, slot: u32) void { sys_mod.unblock_cmd_stream(); }\n\
+fn page_unstage(page: u32, slot: u32) void { sys_mod.unblock_cmd_stream(); }"
+                .to_string(),
+        );
+        lines.push("  if (KVST > 0) { @export_symbol(page_stage); @export_symbol(page_unstage); }".to_string());
+    }
     format!(
-        "// serve8b: the other programs' exported names.\n{}\ncomptime {{\n{}\n}}\n",
+        "// serve8b: the other programs' exported names.\nparam KVST: u16;   // KV staging slots (0: none)\n{}\ncomptime {{\n{}\n}}\n",
         decls.join("\n"),
         lines.join("\n")
     )
@@ -1038,7 +1077,12 @@ fn s2d_pass_start(i: u32, start_pos: u32) void {{\n{}\n}}\nfn s2d_layers() void 
     s = format!("{}\n{}", &s[..start], &s[end..]);
     let mut own = exports(&s);
     own.extend(exports(src::s8br::GRID_EXTRA));
-    let extra = format!("{S8B_GRID_VARIANT}\n{pass_fn}\n{}\n{}", src::s8br::GRID_EXTRA, s8br_dummies(&own));
+    let nlk = if kernel == "qwen2d_region" { "NL" } else { "1" };
+    let extra = format!(
+        "{S8B_GRID_VARIANT}const S2D_KL: u16 = {nlk};       // layers a unit (KV staging)\n\n{pass_fn}\n{}\n{}",
+        src::s8br::GRID_EXTRA,
+        s8br_dummies(&own)
+    );
     // `\ncomptime {\n(  if (NL > 1)...\n)?  @initialize_queue(q_r1_0_in`
     let mut at = None;
     let mut from = 0;
@@ -1072,7 +1116,8 @@ fn s8br_head() -> R<String> {
             "// row), the tokens' capacity, the lanes, the copy kernel, the grids' element\n",
             "// types (their exports).\nparam GPX: u16;\nparam GPY: u16;\nparam GHc: u16;\nparam XH0: u16;\n",
             "param XL: u16;\nparam YL: u16;\nparam CAP: u16;\nparam SB: u16;\nparam HLB: u16;\n",
-            "param KVCP: u16;\nparam HROUTE: u16;\nparam WS: type;\nparam KS: type;\n"
+            "param KVCP: u16;\nparam HROUTE: u16;\n// 1: the VM is the block east of the strip (VM5.md), not a head column.\n",
+            "param S2D_VMX: u16;\nparam WS: type;\nparam KS: type;\n"
         ),
         "params",
     )?;
@@ -1096,6 +1141,30 @@ fn s8br_head() -> R<String> {
         "    if (px == W - 1) { color_config.reset_routes(c_ib, .{ .rx = WEST, .tx = [2]direction{ EAST, RAMP } }); }\n",
         "winner multicast east end",
     )?;
+    // An external VM block (S2D_VMX, VM5.md): the VM's branches run with no
+    // VM column in the head (VMC 0): the root column sends its logits row
+    // east on c_vl, the final root takes the VM's token from the east on c_vt.
+    let n = s.matches("VMC == 1 and gmode[0] == 1").count();
+    if n != 2 {
+        return Err(format!("gen: {tag} changed: the VM's gmode branches found {n} times"));
+    }
+    s = s.replace("VMC == 1 and gmode[0] == 1", "(VMC == 1 or S2D_VMX == 1) and gmode[0] == 1");
+    s = patch(
+        &s,
+        "  if (VMC == 1) {\n    if (root_col) {",
+        "  if (VMC == 1 or S2D_VMX == 1) {\n    if (root_col) {",
+        "init's VM routes",
+    )?;
+    s = patch(
+        &s,
+        "      y[Vr] = yscale;\n      @fmovs(fout(q_x_out, Vr + 1), yv_dsd);\n",
+        concat!(
+            "      y[Vr] = yscale;\n      if (S2D_VMX == 1) {\n        // The external VM's row: Vr logits, 1/rms, the lane step's ctl word.\n",
+            "        y[Vr + 1] = s2d_ctl();\n        @fmovs(fout(q_x_out, Vr + 2), yx_dsd);\n",
+            "      } else {\n        @fmovs(fout(q_x_out, Vr + 1), yv_dsd);\n      }\n"
+        ),
+        "the VM's logits row",
+    )?;
     s = head_init(&s, "s2d_head_init();")?;
     s = patch(&s, "  @fmovs(xs_dsd, fin(q_x_in, Hc));\n  mark(0);\n",
         "  @fmovs(xs_dsd, fin(q_x_in, Hc));\n  s2d_after_x();\n  mark(0);\n", "region x arrival")?;
@@ -1111,7 +1180,7 @@ fn s8br_head() -> R<String> {
     }
     s = drop_head_compute(&t)?;
     let mut own = exports(&s);
-    own.extend(["in_tokens", "out_tokens", "yscale", "hlogits"].map(String::from));
+    own.extend(["in_tokens", "out_tokens", "yscale", "hlogits", "vmctl"].map(String::from));
     s = format!("{}\n\n{}\n{}", s.trim_end_matches('\n'), src::s8br::HEAD_EXTRA, s8br_dummies(&own));
     Ok(format!(
         "// GENERATED by serve8b/sync.py from {tag} (Fork 7) + serve8b/head_extra.csl.\n\
@@ -1121,6 +1190,39 @@ fn s8br_head() -> R<String> {
 
 fn s8br_plain(base: &str, base_name: &str, what: &str) -> String {
     format!("// GENERATED by serve8b/sync.py from {base_name} ({what}).\n{base}\n{}", s8br_dummies(&exports(base)))
+}
+
+/// vm_pe.csl: Fork 3's VM (vm_base.csl) for the block east of the strip; its
+/// compute takes the grids' (steps, start_pos) and runs a row each of the
+/// head's steps + 1 iterations x S2D_SB lanes.
+fn s8br_vm() -> R<String> {
+    let mut s = patch(
+        src::s8br::VM_BASE,
+        "param memcpy_params;\n",
+        concat!(
+            "param memcpy_params;\n// serve8b_region: the head's lanes a step, the copy kernel, routes by host,\n",
+            "// the grids' element types (the dummies' exports).\nparam S2D_SB: u16;\nparam KVCP: u16;\n",
+            "param HROUTE: u16;\nparam WS: type;\nparam KS: type;\n"
+        ),
+        "params",
+    )?;
+    s = patch(
+        &s,
+        "fn compute(steps: u32) void {\n",
+        concat!(
+            "fn compute(steps_: u32, start_pos: u32) void {\n",
+            "  // serve8b_region: a head row each lane step of steps + 1 iterations.\n",
+            "  const steps = (steps_ + 1) * @as(u32, S2D_SB);\n"
+        ),
+        "compute",
+    )?;
+    let own = exports(&s);
+    Ok(format!(
+        "// GENERATED by serve8b_region/sync.py from vm_base.csl (Fork 3's eta VM).\n{s}\n\
+fn copy_kv(src: u32, dst: u32, phase: u32) void {{ sys_mod.unblock_cmd_stream(); }}\n\
+comptime {{\n  if (KVCP == 1) {{ @export_symbol(copy_kv); }}\n}}\n{}",
+        s8br_dummies(&own)
+    ))
 }
 
 /// serve8b_region's build directory.
@@ -1134,6 +1236,8 @@ pub fn serve8b_region() -> R<Vec<File>> {
         ("head_pe.csl", s8br_head()?),
         ("embed_pe.csl", s8br_plain(src::s8br::EMBED_BASE, "embed_base.csl", "the embedding strip")),
         ("filler.csl", s8br_plain(src::s8br::FILLER_BASE, "filler_base.csl", "the filler")),
+        ("vm_stub.csl", s8br_plain(src::s8br::VM_STUB_BASE, "vm_stub_base.csl", "a stand-in for the VM block")),
+        ("vm_pe.csl", s8br_vm()?),
     ])
 }
 
@@ -1159,11 +1263,13 @@ mod tests {
         ("serve8b", "head_pe.csl", "c9d5b14ad454fd62eae6c592fd2c2e21b484c59b29c160a1c363e6307bfd054d"),
         ("serve8b", "embed_pe.csl", "991c1ce046039415a39f9afb0c6e2e8673a91ff3e7057637abd6477fc99f39e9"),
         ("serve8b", "filler.csl", "bf9e83043319a16c8bac8d11f9d552c22249cfe16dbfb1f8c4a23316e2dbe843"),
-        ("serve8b_region", "grid_pe.csl", "4f4ab43669a8f18836f9b2fd1b76ce4d6fea5c91ce9a637b28454a703e1222d7"),
-        ("serve8b_region", "region_pe.csl", "d78b100ddc4f317b7feecab8dbbf20e49d3d0fad9f924a27a2a9d23f0f3930f7"),
-        ("serve8b_region", "head_pe.csl", "623a8264b5d362b6b32bf13355b0bd8809ade1f257801685b5a62e52c92bf3f8"),
-        ("serve8b_region", "embed_pe.csl", "b652fc2083797a4951c1e84d82eb95b3a763e6a40856881bd43c50b6d36255ec"),
-        ("serve8b_region", "filler.csl", "7c14a22898f071d5d8143c1a7786fe88b3f5885976aac2c1b5078242b7d516cb"),
+        ("serve8b_region", "grid_pe.csl", "1aa7ef357ae869c410f554533de054d01cdfe1412833d10cac1ec09027918e3b"),
+        ("serve8b_region", "region_pe.csl", "d8b3f505a1ea28723791bd8b1e9a8e7e69cd1c73860e5380be495a29243b50a3"),
+        ("serve8b_region", "head_pe.csl", "ec8349abdb11aabd454cd6113a60f9da5614f374519ab14ea162684c4148fcfe"),
+        ("serve8b_region", "embed_pe.csl", "8e2769143d5e799f25483d53fb9b8aeae108b1f3e4a95ebecc65a9d967cdf65b"),
+        ("serve8b_region", "filler.csl", "0f8106389be8053db738c6bb2189987e0a5716a31372b537f33dcd5aaa54fff5"),
+        ("serve8b_region", "vm_pe.csl", "70504a46ff28cc70ba62a5bcbc3e626a8dafc72869ff9721f546e565d084052e"),
+        ("serve8b_region", "vm_stub.csl", "de0cae945badccacc9b9583cf74c1e47bb14fd82b8287d1b47a0defca4243dbb"),
     ];
 
     #[test]

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use engine_cerebras::sdk::Rect;
 use engine_cerebras::spatial::serve2d::Layout2d;
-use engine_cerebras::spatial::serve8b::{self, KvRows};
+use engine_cerebras::spatial::serve8b::{self, KvRows, S8b};
 use sha2::{Digest, Sha256};
 
 fn sha(words: &[u32]) -> String {
@@ -35,13 +35,14 @@ struct Mock {
     stage: Option<Stage>,
 }
 
+/// The staging kernels' units: (corner, px, py, layers, cells a page), the
+/// pool's blocks and slots, and whether a slot word packs two cells
+/// (serve8b) or holds one (serve8b_region).
 struct Stage {
-    grids: Vec<(usize, usize)>,
-    px: usize,
-    py: usize,
-    n: usize,
-    kvlen: usize,
-    sw: usize,
+    units: Vec<((usize, usize), usize, usize, usize, usize)>,
+    blocks: usize,
+    slots: usize,
+    packed: bool,
 }
 
 impl Mock {
@@ -51,21 +52,31 @@ impl Mock {
 
     fn copy(&mut self, page: u32, slot: usize, back: bool) {
         let st = self.stage.as_ref().expect("a staging device");
-        let (row, blk) = (page as usize % st.py, page as usize / st.py);
-        let (grids, px, n, kvlen, sw) = (st.grids.clone(), st.px, st.n, st.kvlen, st.sw);
-        for (x0, y0) in grids {
+        let (units, blocks, slots_n, packed) = (st.units.clone(), st.blocks, st.slots, st.packed);
+        for ((x0, y0), px, py, nl, n) in units {
+            let (row, blk) = (page as usize % py, page as usize / py);
+            let kcn = blocks * n;
+            let kvlen = nl * kcn + 1;
+            let sn = slots_n * nl * n;
+            let sw = if packed { sn.div_ceil(2) } else { sn };
             for x in x0..x0 + px {
                 for (pool, slots) in [("kc", "kstage"), ("vc", "vstage")] {
                     let y = y0 + row;
                     let mut kv = self.pe(pool, x, y, kvlen).clone();
                     let mut sl = self.pe(slots, x, y, sw).clone();
-                    for i in 0..n {
-                        let (c, k) = (slot * n + i, 1 + blk * n + i);
-                        let shift = 16 * (c % 2);
-                        if back {
-                            kv[k] = (sl[c / 2] >> shift) & 0xffff;
-                        } else {
-                            sl[c / 2] = (sl[c / 2] & !(0xffff << shift)) | ((kv[k] & 0xffff) << shift);
+                    for l in 0..nl {
+                        for i in 0..n {
+                            let (c, k) = ((slot * nl + l) * n + i, 1 + l * kcn + blk * n + i);
+                            if !packed {
+                                if back { kv[k] = sl[c] & 0xffff } else { sl[c] = kv[k] & 0xffff }
+                                continue;
+                            }
+                            let shift = 16 * (c % 2);
+                            if back {
+                                kv[k] = (sl[c / 2] >> shift) & 0xffff;
+                            } else {
+                                sl[c / 2] = (sl[c / 2] & !(0xffff << shift)) | ((kv[k] & 0xffff) << shift);
+                            }
                         }
                     }
                     self.mem.insert((pool.into(), x, y), kv);
@@ -126,15 +137,15 @@ fn main() -> Result<(), String> {
     let mut dev = Mock::default();
     if lay.kvst > 0 {
         let shape = lay.paged.ok_or("not a paged build")?;
-        let n = shape.page_size * lay.dc;
-        dev.stage = Some(Stage {
-            grids: (0..lay.layers()).map(|l| lay.origin(l)).collect(),
-            px: lay.px,
-            py: lay.py,
-            n,
-            kvlen: shape.blocks * n + 1,
-            sw: (lay.kvst * n).div_ceil(2),
-        });
+        let ps = shape.page_size;
+        let (units, packed) = match lay.s8b {
+            Some(S8b::Units(u)) => (
+                u.units(&lay).iter().map(|v| ((v.x0, v.y0), v.k.px, v.k.py, v.layers.len(), ps * v.k.dc)).collect(),
+                false,
+            ),
+            _ => ((0..lay.layers()).map(|l| (lay.origin(l), lay.px, lay.py, 1, ps * lay.dc)).collect(), true),
+        };
+        dev.stage = Some(Stage { units, blocks: shape.blocks, slots: lay.kvst, packed });
     }
     let out = serve8b::page_out(&lay, &mut dev, a)?;
     println!("page_out {a} {} {}", out.len(), sha(&out));

@@ -31,6 +31,8 @@ param vocab: u32;
 param B: u16;          // lanes a pass
 param KVCP: u16;
 param HROUTE: u16;     // the layout's HROUTE (the dummies' exports)
+param XV: u16;         // the VM block's first column (0: none) and the final root's (paths.csl)
+param RCX: u16;
 param WS: type;        // the grids' weight and KV element types (their exports)
 param KS: type;
 
@@ -41,7 +43,8 @@ const EC: u16 = PY / 4;
 const He: u16 = 4 * Hc;
 const XE: u16 = XH0 + PY / 2 + VMC;
 const paths = @import_module("paths.csl", .{ .GWD = PX, .GHT = PY, .XL = XL, .YL = YL, .XH = XH0, .F = F,
-                                             .C = PY / 2, .VMC = VMC, .VMAT = VMAT, .XE = XE, .EC = EC });
+                                             .C = PY / 2, .VMC = VMC, .VMAT = VMAT, .XE = XE, .EC = EC,
+                                             .XV = XV, .RCX = RCX });
 const C_IB: color = @get_color(10);   // head2d's winner multicast (c_ib)
 const C_EI: color = @get_color(11);   // a strip column, to its collector
 

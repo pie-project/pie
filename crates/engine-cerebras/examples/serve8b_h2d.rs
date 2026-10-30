@@ -15,6 +15,7 @@ use engine_cerebras::sdk::Rect;
 use engine_cerebras::spatial::ckpt::Ckpt;
 use engine_cerebras::spatial::serve2d::{self, Layout2d};
 use engine_cerebras::spatial::serve8b;
+use engine_cerebras::spatial::serve8b_region;
 use engine_cerebras::spatial::wafer::Sink;
 use sha2::{Digest, Sha256};
 
@@ -78,5 +79,27 @@ fn main() -> Result<(), String> {
     // encoding (bit i), as the Python recorder's.
     let rbits: Vec<u32> = (0..10).map(|i| 1 << i).collect();
     serve8b::put_routes(&lay, &mut rec, Some(&rbits))?;
-    serve2d::place(&lay, &ckpt, theta, &mut rec)
+    serve2d::place(&lay, &ckpt, theta, &mut rec)?;
+    // serve8b_region with the eta VM: SERVE8B_VM_CASES (etagen case JSONs, a
+    // lane each, `-` an empty lane) loaded as `vmhost.load_tables` does.
+    if let Ok(list) = std::env::var("SERVE8B_VM_CASES") {
+        let mut owned = Vec::new();
+        for f in list.split(',') {
+            owned.push(if f == "-" {
+                None
+            } else {
+                let text = std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?;
+                let case: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{f}: {e}"))?;
+                let rows = case["rows"].as_u64().unwrap_or(1) as u32;
+                let (table, seeds) = engine_cerebras::spatial::guest4::wafer::case_table(&case)?;
+                Some((table, seeds, rows))
+            });
+        }
+        let lanes: Vec<Option<serve8b_region::VmLane>> = owned
+            .iter()
+            .map(|o| o.as_ref().map(|(table, seeds, rows)| serve8b_region::VmLane { table, seeds, rows: *rows }))
+            .collect();
+        serve8b_region::vm_load(&lay, &mut rec, &lanes)?;
+    }
+    Ok(())
 }
