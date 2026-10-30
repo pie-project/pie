@@ -171,7 +171,7 @@ pub fn widen(compiled: &CompiledModel, admits: &[Admit], bucket: u32) -> Vec<Adm
     if !table.contains(&Admit::Island) {
         return table;
     }
-    let welded = welds(compiled, bucket);
+    let welded = welds(compiled);
     loop {
         let mut grew = false;
         for weld in &welded {
@@ -197,16 +197,43 @@ pub fn widen(compiled: &CompiledModel, admits: &[Admit], bucket: u32) -> Vec<Adm
     table
 }
 
-fn fork_open(compiled: &CompiledModel, bucket: u32) -> Vec<bool> {
+/// Whether a fire of `bucket` rows runs its side streams: one wider than
+/// `compiler.dag_streams_until`, or with an island inside a fork group, runs
+/// in order on the main stream, so a graph holds all but its islands.
+fn forks_by(compiled: &CompiledModel, bucket: u32, island: impl Fn(usize) -> bool) -> bool {
+    let until = compiled.streams.forked_until;
+    if until != 0 && bucket > until {
+        return false;
+    }
+    let n = compiled.template().len();
+    if !(0..n).any(&island) {
+        return true;
+    }
+    let open = fork_groups(compiled);
+    !(0..n).any(|at| island(at) && (open[at] || open.get(at + 1) == Some(&true)))
+}
+
+/// [`forks_by`] for a fire whose islands are [`BodyKey::islands`] bits.
+#[must_use]
+pub fn forks(compiled: &CompiledModel, bucket: u32, islands: &[u8]) -> bool {
+    forks_by(compiled, bucket, |at| {
+        islands
+            .get(at / 8)
+            .is_some_and(|bits| bits >> (at % 8) & 1 == 1)
+    })
+}
+
+fn fork_open(compiled: &CompiledModel, bucket: u32, table: &[Admit]) -> Vec<bool> {
+    if !forks_by(compiled, bucket, |at| table.get(at) == Some(&Admit::Island)) {
+        return vec![false; compiled.template().len()];
+    }
+    fork_groups(compiled)
+}
+
+fn fork_groups(compiled: &CompiledModel) -> Vec<bool> {
     let template = compiled.template();
     let n = template.len();
     let mut open = vec![false; n];
-    // A fire wider than `compiler.dag_streams_until` runs in order on the
-    // main stream, so it has no fork to keep whole.
-    let until = compiled.streams.forked_until;
-    if until != 0 && bucket > until {
-        return open;
-    }
     for (src, region) in template.iter().enumerate() {
         for event in region.open.into_iter().chain(region.close) {
             if let Some(last) = (src + 1..n).rfind(|&dst| template[dst].wait.contains(&event)) {
@@ -227,23 +254,9 @@ fn fork_open(compiled: &CompiledModel, bucket: u32) -> Vec<bool> {
     open
 }
 
-fn welds(compiled: &CompiledModel, bucket: u32) -> Vec<Vec<u32>> {
+fn welds(compiled: &CompiledModel) -> Vec<Vec<u32>> {
     let template = compiled.template();
     let mut welds: Vec<Vec<u32>> = Vec::new();
-
-    let open_fork = fork_open(compiled, bucket);
-    let mut index = 1usize;
-    while index < template.len() {
-        if !open_fork[index] {
-            index += 1;
-            continue;
-        }
-        let from = (index - 1) as u32;
-        while index < template.len() && open_fork[index] {
-            index += 1;
-        }
-        welds.push((from..index as u32).collect());
-    }
 
     for (index, region) in template.iter().enumerate() {
         if let poem_compiler::Lowering::Switch { arm: 0, arms, .. } = region.lowering {
@@ -318,7 +331,7 @@ pub fn cuts(
         }
     }
 
-    let open_fork = fork_open(compiled, bucket);
+    let open_fork = fork_open(compiled, bucket, &table);
     let mut cuts: Vec<Stretch> = Vec::new();
     for (index, region) in template.iter().enumerate() {
         let at = index as u32;
