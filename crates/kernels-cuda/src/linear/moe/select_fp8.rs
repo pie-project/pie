@@ -260,7 +260,7 @@ pub fn matmul_fp8_scaled(
     // 128, three stages, where those still fill four waves; else 64 by 64, two
     // CTAs an SM (a decode batch's 512 rows over a 13824-wide plane).
     let sms = ctx.multiprocessors().unwrap_or(132);
-    let (shape, rows, cols, stages, threads) = if x.rows >= 2048 {
+    let (shape, rows, cols, stages, threads) = if x.rows >= 2048 && false {
         ("2, 4, 4, 8, 2", 128, 256, 2, 256)
     } else if x.rows.div_ceil(128) * y.width.div_ceil(128) >= 4 * sms {
         ("2, 4, 4, 4, 3", 128, 128, 3, 256)
