@@ -154,11 +154,12 @@ pub fn tokens_within(max_tokens: u32, floor: u32, room: u64, working: impl Fn(u3
     tokens
 }
 
-/// The rows a guest program's epilogue holds per lane, each as wide as the
-/// readout rows: the logits it reads, and the scaled, probability, mask, noise
+/// The rows a guest program's epilogue is held per lane, each as wide as the
+/// readout rows: the logits it reads. The scaled, probability, mask, noise
 /// and Gumbel rows a top-p sampling program derives from them (6292224
-/// bytes a lane at a 262144 vocabulary, measured).
-pub const PROGRAM_ROWS_A_LANE: u64 = 6;
+/// bytes a lane at a 262144 vocabulary, measured) fly it narrower where the
+/// card has no room for them.
+pub const PROGRAM_ROWS_A_LANE: u64 = 1;
 
 /// What one guest program's scratch takes at the admitted lane count. A
 /// program is registered after the load, so its stride is not known when
@@ -217,10 +218,16 @@ pub fn host_pool(
     let clamp = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
     let rows = u64::from(rows).min(budget.checked_div(row_bytes).unwrap_or(0));
     let left = budget - rows * row_bytes;
-    let pages = pages.min(left.checked_div(page_bytes).unwrap_or(0));
-    let left = left - pages * page_bytes;
-    let window_pages = window_pages.min(left.checked_div(window_page_bytes).unwrap_or(0));
-    let left = left - window_pages * window_page_bytes;
+    let pairs = pages.min(window_pages).min(
+        left.checked_div(page_bytes + window_page_bytes)
+            .unwrap_or(0),
+    );
+    let left = left - pairs * (page_bytes + window_page_bytes);
+    let pages = pairs + (pages - pairs).min(left.checked_div(page_bytes).unwrap_or(0));
+    let left = left - (pages - pairs) * page_bytes;
+    let window_pages =
+        pairs + (window_pages - pairs).min(left.checked_div(window_page_bytes).unwrap_or(0));
+    let left = left - (window_pages - pairs) * window_page_bytes;
     let pages = pages + left.checked_div(page_bytes).unwrap_or(0);
     (clamp(rows), clamp(pages), clamp(window_pages))
 }
@@ -2704,7 +2711,7 @@ mod tests {
         );
         assert_eq!(
             host_pool(20 * mib, 8, mib, 1000, mib / 16, 100, mib / 16),
-            (8, 192, 0)
+            (8, 96, 96)
         );
         assert_eq!(
             host_pool(30 * mib, 8, mib, 100, mib / 16, 100, mib / 16),

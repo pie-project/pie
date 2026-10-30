@@ -15,6 +15,9 @@ moe.bf16_mma_until = 65536
 # MiniMax-M3.1-Flash mini pf32-512 70.8k -> 94.3k, c512 23.4k -> 28.2k tok/s
 moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
+# a single-row block-FP8 projection as the GEMV over bf16 rows, the codes streamed once, as sm_90/sm_100:
+# MiniMax-M3.1-Flash mini raw decode 285 -> 304 tok/s, greedy tokens unchanged
+gemm.fp8_gemv_until = 1
 # the tensor-core attention, hyper-connection and KDA kernels A100, H100 and L40S run: DeepSeek-V4.1 mini
 # raw decode 106 -> 239 tok/s, pf16-512 5.2k -> 33.6k; DeepSeek-V4 mini pf16 32k -> 72k; Qwen3.8-Flash-Next
 # mini raw decode 455 -> 501, pf16 108k -> 140k; Kimi-K3 mini raw prefill 8.4k -> 13.4k
@@ -60,6 +63,9 @@ walk_fire_rows = 1024
 # two recurrent-state slots a lane, so a hybrid trunk seats past the fixed 256: Nemotron-3-Super mini
 # c512 4,749 -> 5,028 tok/s (slots cut to fit the card), greedy tokens unchanged
 state_slots_per_lane = 2
+# prompt fires pad to 64 lanes, not the 512 decoding lanes two slots seat: Qwen3.8-Flash-Next mini
+# raw prefill 58.9k -> 68.7k, pf16-512 150.1k -> 160.5k tok/s, c512 unchanged, greedy parity unchanged
+prefill_lanes = 64
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"

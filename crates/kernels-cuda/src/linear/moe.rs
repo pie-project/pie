@@ -37,6 +37,8 @@ const SELECT_FP4_SM80: &str = "linear/moe/select_fp4_sm80.cu";
 const SELECT_SM80: &str = "linear/moe/select_sm80.cu";
 #[cfg(feature = "cuda")]
 const SELECT_SM90: &str = "linear/moe/select_sm90.cu";
+#[cfg(feature = "cuda")]
+const DENSE_SM120: &str = "linear/fp8_dense_sm120.cu";
 
 const BLOCK: u32 = 256;
 

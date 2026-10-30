@@ -203,6 +203,68 @@ pub fn select_fp8_w8a8(
     )
 }
 
+/// `y = q(x) . W^T` for one 128x128-block FP8 plane (W8A8) on sm_120a's
+/// block-scaled mma.sync, the rows' and the plane's exponents applied in the
+/// MMA (`linear/fp8_dense_sm120.cu`). `Ok(false)` off sm_120a, or for a shape
+/// it does not take.
+#[cfg(feature = "cuda")]
+pub fn matmul_fp8_scaled(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: u64,
+    atoms: u64,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.matmul_fp8_scaled";
+    if !crate::jit::cache::features().warp_block_scale
+        || x.dtype != Dtype::Bf16
+        || y.dtype != Dtype::Bf16
+        || x.rows == 0
+        || y.rows != x.rows
+        || !x.width.is_multiple_of(128)
+        || !y.width.is_multiple_of(8)
+    {
+        return Ok(false);
+    }
+    let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
+    // 128 rows by 256 columns a CTA, two stages, for a prefill's rows; 128 by
+    // 128, three stages, where those still fill four waves; else 64 by 64, two
+    // CTAs an SM (a decode batch's 512 rows over a 13824-wide plane).
+    let sms = ctx.multiprocessors().unwrap_or(132);
+    let (shape, rows, cols, stages, threads) = if x.rows >= 2048 {
+        ("2, 4, 4, 8, 2", 128, 256, 2, 256)
+    } else if x.rows.div_ceil(128) * y.width.div_ceil(128) >= 4 * sms {
+        ("2, 4, 4, 4, 3", 128, 128, 3, 256)
+    } else {
+        ("2, 2, 2, 4, 3", 64, 64, 3, 128)
+    };
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            DENSE_SM120,
+            &format!("::pie::linear::fp8_dense_scaled<{shape}>"),
+        ))
+        .apply(
+            Launch::grid(
+                [y.width.div_ceil(cols), x.rows.div_ceil(rows), 1],
+                [threads, 1, 1],
+            )
+            .smem(stages * (rows + cols) * 128),
+        ),
+        &[
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xe),
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            y.arg(),
+            stated(OP, x.rows)?.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, x.width)?.arg(),
+        ],
+    )?;
+    Ok(true)
+}
+
 /// `y = q(x) . W^T` for one 128x128-block FP8 plane (W8A8) on mma.sync, off
 /// tcgen05: [`select_fp8_w8a8`]'s kernel over the rows in order.
 #[cfg(feature = "cuda")]
