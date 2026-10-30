@@ -957,8 +957,8 @@ __global__ void __launch_bounds__(128 * kWN) moe_select_fp8a8_mma(
     constexpr int kRowsCta = 4 * kRowsWarp;   // 128 weight rows a CTA: one block's
     constexpr int kSlice = 8 * kNb;           // routes a slice (B of the GEMM)
     constexpr int kBK = 128;                  // K a step: one block's codes
-    constexpr int kPad = kBK + 16;            // smem row stride in bytes (ldmatrix)
-    constexpr int kStages = kNb == 16 ? 2 : kFp8a8Stages;
+    constexpr int kPad = kBK;                 // smem row stride in bytes, its 16-byte runs XOR-swizzled
+    constexpr int kStages = kFp8a8Stages;
     constexpr int kChunks = kBK / 16;
     constexpr int kStage = (kRowsCta + kSlice) * kPad;
 
@@ -1008,7 +1008,7 @@ __global__ void __launch_bounds__(128 * kWN) moe_select_fp8a8_mma(
         for (int i = tid; i < kRowsCta * kChunks; i += 128 * kWN) {
             const int row = i / kChunks;
             const int ch = (i % kChunks) * 16;
-            u8* dst = sW + row * kPad + ch;
+            u8* dst = sW + row * kPad + (ch ^ ((row & 7) << 4));
             if (cta_row0 + row < n) {
                 __pipeline_memcpy_async(
                     dst, w_e + static_cast<long long>(cta_row0 + row) * k + k0 + ch, 16);
@@ -1019,7 +1019,7 @@ __global__ void __launch_bounds__(128 * kWN) moe_select_fp8a8_mma(
         for (int i = tid; i < kSlice * kChunks; i += 128 * kWN) {
             const int tok = i / kChunks;
             const int ch = (i % kChunks) * 16;
-            u8* dst = sX + tok * kPad + ch;
+            u8* dst = sX + tok * kPad + (ch ^ ((tok & 7) << 4));
             if (tok < count) {
                 __pipeline_memcpy_async(
                     dst, xq + static_cast<long long>(act_row(tok)) * k + k0 + ch, 16);
@@ -1077,13 +1077,16 @@ __global__ void __launch_bounds__(128 * kWN) moe_select_fp8a8_mma(
             unsigned bk[kNbW][2];
 #pragma unroll
             for (int b = 0; b < kNbW; ++b) {
-                ld_b(bk[b], reinterpret_cast<const bf16*>(sX + 8 * (b + wb * kNbW) * kPad + kk), kPad / 2, lane);
+                const int row = 8 * (b + wb * kNbW) + (lane & 7);
+                ldmatrix_x2(bk[b], reinterpret_cast<const bf16*>(
+                    sX + row * kPad + ((kk + ((lane & 8) << 1)) ^ ((row & 7) << 4))));
             }
 #pragma unroll
             for (int t = 0; t < kTiles; ++t) {
                 unsigned a[4];
-                ld_a(a, reinterpret_cast<const bf16*>(sW + (warp * kRowsWarp + 16 * t) * kPad + kk),
-                     kPad / 2, lane);
+                const int row = warp * kRowsWarp + 16 * t + (lane & 15);
+                ldmatrix_x4(a, reinterpret_cast<const bf16*>(
+                    sW + row * kPad + ((kk + (lane & 16)) ^ ((row & 7) << 4))));
 #pragma unroll
                 for (int b = 0; b < kNbW; ++b) {
                     gfp8::mma(blk[t][b], a[0], a[1], a[2], a[3], bk[b][0], bk[b][1]);

@@ -289,10 +289,10 @@ pub fn matmul_fp8_w8a8(
 }
 
 /// Three stages of 128 weight rows and 8 nb route rows, each a 128-code K
-/// step padded by 16 bytes (`kFp8a8Stages`).
+/// step, its 16-byte runs swizzled (`kFp8a8Stages`).
 #[cfg(feature = "cuda")]
 pub(super) const fn fp8_mma_smem(nb: u32) -> u32 {
-    (if nb == 16 { 2 } else { 3 }) * (128 + 8 * nb) * (128 + 16)
+    3 * (128 + 8 * nb) * 128
 }
 
 /// A routed select over a block-FP8 bank (`experts x n x k` e4m3 codes at
