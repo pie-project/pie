@@ -10,11 +10,10 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
   - `qwen2d_paged.csl`: the batched paged layer.
   - `qwen2d_pring.csl`: the paged layer as a pipeline-ring stage.
   - `head2d_v9.csl`: the 2-D LM head.
-  - `qwen2d_paged8b.csl`: the bf16 8B layer (the version serve8b's 0115
-    build ran, before the HROUTE/ROT8/GY params).
   - `head2d_v10.csl`: the bf16 8B head.
   - `qwen2d_paged8b_hr.csl`: the bf16 8B layer with the HROUTE (host-written
-    collective routes), ROT8 and GY params: serve8b_region's grids.
+    collective routes), ROT8 and GY params: serve8b's and serve8b_region's
+    grids.
   - `qwen2d_region.csl`: several bf16 layers on one region (x stays in
     place between them): serve8b_region's regions.
 - `vm/`: eta VM images, snapshots of the VM generator's output (`gen_vm.py`
@@ -25,7 +24,9 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
     per-step host input, op masks, per-lane programs, rows per turn, top-p
     by rounds, and a second resident set (VMB columns east of the first,
     its own `b_*` image) for the heavy samplers.
-- `serve2d/`, `serve2d_pipe/`, `serve8b/`, `serve8b_region/`: each design's layout, routing helpers,
+- `serve2d/`, `serve2d_pipe/`, `serve8b/`, `serve8b_region/`: each design's
+  (`kvstage.csl`: serve2d*'s KV page staging, `KVST` slots a paged-grid PE;
+  serve8b's is in its `grid_extra.csl`), layout, routing helpers,
   `*_extra.csl` (what it appends to each kernel) and base programs.
 
 The generated `*_pe.csl` are byte-identical to the bench payload's `sync.py`

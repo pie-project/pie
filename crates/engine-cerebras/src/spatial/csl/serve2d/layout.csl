@@ -54,6 +54,8 @@ param iters: u16;      // unused (the step count is a launch argument)
 // PE memory, where the VM source has the switch). VM 0: the column is head2d's
 // stand-in.
 param VM: u16 = 0;
+// KV page staging slots a paged layer-grid PE (Fork 4's host KV tier; 0: none).
+param KVST: u16 = 0;
 param max_ops: u16 = 1;
 param nreg: u16 = 1;
 param pool_words: u16 = 1;
@@ -131,7 +133,7 @@ layout {
           .memcpy_params = mp,
           .P = PX, .Hc = Hc, .Dc = Dc, .Gs = Gs, .Ic = Ic, .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC,
           .GW = GW, .GH = GH, .NL = GW * GH, .F = F, .HEADMODE = HEADMODE,
-          .S2D_VMC = HVMC, .S2D_VMAT = HR2X + 1, .S2D_DBG = DBG,
+          .S2D_VMC = HVMC, .S2D_VMAT = HR2X + 1, .S2D_DBG = DBG, .KVST = KVST,
           .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
           .c_bc = C_BC, .c_gb = C_GB, .c_cp = C_CP,
         });
@@ -141,7 +143,7 @@ layout {
           .PX = PX, .PY = PY, .Hc = Hc, .HR = HR, .Dc = Dc, .Gs = Gs, .Qh = Qh, .Ic = Ic, .Tc = Tc,
           .W16 = W16, .NP = NP, .KV16 = KV16, .PROF = PROF,
           .GW = GW, .GH = GH, .NL = GW * GH, .F = F, .HEADMODE = HEADMODE,
-          .S2D_VMC = HVMC, .S2D_VMAT = HR2X + 1, .S2D_DBG = DBG,
+          .S2D_VMC = HVMC, .S2D_VMAT = HR2X + 1, .S2D_DBG = DBG, .KVST = KVST,
           .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
           .c_bc = C_BC, .c_gb = C_GB,
         });
@@ -196,8 +198,12 @@ layout {
   @export_name("rot_c", [*]f32, true);
   @export_name("rot_s", [*]f32, true);
   @export_name("dims", [*]u16, true);
+  @export_name("kstage", [*]f32, true);
+  @export_name("vstage", [*]f32, true);
   @export_name("init", fn()void);
   @export_name("compute", fn(u32, u32)void);
   @export_name("copy_page", fn(u32, u32)void);
   @export_name("copy_move", fn(u32, u32)void);
+  @export_name("page_stage", fn(u32, u32)void);
+  @export_name("page_unstage", fn(u32, u32)void);
 }

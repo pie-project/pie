@@ -106,6 +106,7 @@ pub fn layout(get: &dyn Fn(&str) -> Option<usize>) -> R<Layout2d> {
         hlm: None,
         hlbn: get("HLBN"),
         vmlane_words: 2,
+        kvst: get("KVST").unwrap_or(0),
         s8b: Some(S8b::Strips { full }),
     };
     let c = lay.chunk_cols();
@@ -666,6 +667,11 @@ pub fn copy_pages(lay: &Layout2d, rt: &mut crate::sdk::Runtime, pairs: &[(u32, u
 pub trait KvRows {
     fn read16(&mut self, sym: &str, rect: Rect, n: usize) -> R<Vec<u32>>;
     fn write16(&mut self, sym: &str, rect: Rect, n: usize, words: &[u32]) -> R<()>;
+    /// 32-bit copies (serve8b's staging slots: two bf16 cells a word).
+    fn read32(&mut self, sym: &str, rect: Rect, n: usize) -> R<Vec<u32>>;
+    fn write32(&mut self, sym: &str, rect: Rect, n: usize, words: &[u32]) -> R<()>;
+    /// A blocking launch (`page_stage`, `page_unstage`).
+    fn launch(&mut self, name: &str, args: &[u32]) -> R<()>;
 }
 
 impl KvRows for crate::sdk::Runtime {
@@ -679,6 +685,22 @@ impl KvRows for crate::sdk::Runtime {
     fn write16(&mut self, sym: &str, rect: Rect, n: usize, words: &[u32]) -> R<()> {
         self.memcpy_h2d(sym, words, rect, n, crate::sdk::Order::RowMajor, crate::sdk::DataType::Bits16)
             .map_err(|e| e.to_string())
+    }
+
+    fn read32(&mut self, sym: &str, rect: Rect, n: usize) -> R<Vec<u32>> {
+        let mut out = vec![0u32; rect.w as usize * rect.h as usize * n];
+        self.memcpy_d2h(sym, &mut out, rect, n, crate::sdk::Order::RowMajor, crate::sdk::DataType::Bits32)
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    }
+
+    fn write32(&mut self, sym: &str, rect: Rect, n: usize, words: &[u32]) -> R<()> {
+        self.memcpy_h2d(sym, words, rect, n, crate::sdk::Order::RowMajor, crate::sdk::DataType::Bits32)
+            .map_err(|e| e.to_string())
+    }
+
+    fn launch(&mut self, name: &str, args: &[u32]) -> R<()> {
+        crate::sdk::Runtime::launch(self, name, args).map_err(|e| e.to_string())
     }
 }
 
@@ -731,6 +753,9 @@ fn page_at(lay: &Layout2d, page: u32, py: usize) -> R<(usize, usize)> {
 /// the 16-bit memcpy moves them). Between launches only; the device page is
 /// left as it is.
 pub fn page_out(lay: &Layout2d, dev: &mut dyn KvRows, page: u32) -> R<Vec<u32>> {
+    if lay.kvst > 0 {
+        return page_out_staged(lay, dev, page);
+    }
     let mut out = Vec::with_capacity(page_words(lay)?);
     for u in pool_units(lay)? {
         let (row, blk) = page_at(lay, page, u.py)?;
@@ -751,6 +776,9 @@ pub fn page_out(lay: &Layout2d, dev: &mut dyn KvRows, page: u32) -> R<Vec<u32>> 
 /// kv_copy host -> device (`page_in`): [`page_out`]'s `data` into pool page
 /// `page` (any page: a suspended page may come back elsewhere).
 pub fn page_in(lay: &Layout2d, dev: &mut dyn KvRows, page: u32, data: &[u32]) -> R<()> {
+    if lay.kvst > 0 {
+        return page_in_staged(lay, dev, page, data);
+    }
     let want = page_words(lay)?;
     if data.len() != want {
         return Err(format!("a host page of {} elements; this build's is {want}", data.len()));
@@ -773,6 +801,64 @@ pub fn page_in(lay: &Layout2d, dev: &mut dyn KvRows, page: u32, data: &[u32]) ->
         }
     }
     Ok(())
+}
+
+/// serve8b's staging slots for one page: its row on every grid, its cells a
+/// slot (PS Dc), the slots' cells (KVST n) and words (two cells a word).
+fn staging(lay: &Layout2d, page: u32) -> R<(Vec<PoolUnit>, usize, usize, usize, usize)> {
+    if !matches!(lay.s8b, Some(S8b::Strips { .. })) {
+        return Err("KV page staging here is serve8b's (serve8b_region's slots are not ported)".into());
+    }
+    let units = pool_units(lay)?;
+    let (row, _) = page_at(lay, page, lay.py)?;
+    let n = units.first().map_or(0, |u| u.n);
+    let sn = lay.kvst * n;
+    Ok((units, row, n, sn, sn.div_ceil(2)))
+}
+
+/// [`page_out`] through serve8b's staging slots (`serve_lib8b.py`'s
+/// `pages_out` of one page, slot 0): `page_stage(page, 0)` copies the
+/// page's block of `kc`/`vc` into `kstage`/`vstage` (aliasing the grids'
+/// `s`/`act`, two bf16 cells a 32-bit word, the even cell low); one 32-bit
+/// read a grid and symbol of the page's row. Only the page moves.
+fn page_out_staged(lay: &Layout2d, dev: &mut dyn KvRows, page: u32) -> R<Vec<u32>> {
+    let (units, row, n, _, sw) = staging(lay, page)?;
+    let mut out = Vec::with_capacity(page_words(lay)?);
+    dev.launch("page_stage", &[page, 0])?;
+    for u in &units {
+        for sym in ["kstage", "vstage"] {
+            let a = dev.read32(sym, rect(u.x0, u.y0 + row, u.px, 1), sw)?;
+            for pe in a.chunks_exact(sw) {
+                out.extend((0..n).map(|i| (pe[i / 2] >> (16 * (i % 2))) & 0xffff));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// [`page_in`] through the staging slots: the page's cells into slot 0 of
+/// `kstage`/`vstage` on its row (the rest of the slots zero: scratch), one
+/// 32-bit write a grid and symbol, then `page_unstage(page, 0)`.
+fn page_in_staged(lay: &Layout2d, dev: &mut dyn KvRows, page: u32, data: &[u32]) -> R<()> {
+    let want = page_words(lay)?;
+    if data.len() != want {
+        return Err(format!("a host page of {} elements; this build's is {want}", data.len()));
+    }
+    let (units, row, n, _, sw) = staging(lay, page)?;
+    let mut at = 0;
+    for u in &units {
+        for sym in ["kstage", "vstage"] {
+            let mut words = vec![0u32; u.px * sw];
+            for pe in words.chunks_exact_mut(sw) {
+                for (i, &v) in data[at..at + n].iter().enumerate() {
+                    pe[i / 2] |= (v & 0xffff) << (16 * (i % 2));
+                }
+                at += n;
+            }
+            dev.write32(sym, rect(u.x0, u.y0 + row, u.px, 1), sw, &words)?;
+        }
+    }
+    dev.launch("page_unstage", &[page, 0])
 }
 
 #[cfg(test)]
@@ -834,6 +920,18 @@ mod tests {
                 self.0.insert((sym.into(), x, r.y), words[j * n..(j + 1) * n].to_vec());
             }
             Ok(())
+        }
+
+        fn read32(&mut self, sym: &str, r: Rect, n: usize) -> R<Vec<u32>> {
+            self.read16(sym, r, n)
+        }
+
+        fn write32(&mut self, sym: &str, r: Rect, n: usize, words: &[u32]) -> R<()> {
+            self.write16(sym, r, n, words)
+        }
+
+        fn launch(&mut self, name: &str, _: &[u32]) -> R<()> {
+            Err(format!("no kernels here ({name})"))
         }
     }
 

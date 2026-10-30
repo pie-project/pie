@@ -366,6 +366,9 @@ fn serve8b_params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Vec<(&'static str,
         ("GS", p.gs), ("HEADMODE", 2), ("HH", p.hh), ("Vr", p.vr), ("Gx", p.gx), ("Gy", p.gy),
         ("vocab", plan.vocab), ("PASSES", 3), ("MODE", 0), ("OVL", 0), ("VMC", 1), ("CAP", cap), ("iters", 1),
         ("B", g.lanes), ("NB", g.blocks), ("KVCP", usize::from(!g.host_copy)),
+        // KV page staging: a slot a PE where it fits (B 1; at B 4 the grid
+        // has no room for it).
+        ("KVST", usize::from(g.lanes == 1)),
     ])
 }
 
@@ -837,7 +840,8 @@ mod qwen3_8b {
             assert_eq!(d, Design::Serve8b);
             let mut got = p.clone();
             got.sort();
-            let want = format!("{base},B:{b},NB:{nb},KVCP:{}", usize::from(!host)).replace("NP:3", &format!("NP:{np}"));
+            let want = format!("{base},B:{b},NB:{nb},KVCP:{},KVST:{}", usize::from(!host), usize::from(b == 1))
+                .replace("NP:3", &format!("NP:{np}"));
             assert_eq!(got, sorted(&want), "B {b}");
             // The model accepts the program (untied, 36 layers in strips of 5
             // and 4), and the engine reads it as serve8b's layout.

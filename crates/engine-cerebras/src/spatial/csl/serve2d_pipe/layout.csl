@@ -50,6 +50,8 @@ param SPEC: u16;
 // The fused naive sampler in the head (every lane; head_extra.csl, SMP 1), and
 // the lanes whose last logits rows the head keeps (min(MMAX·B, HLM)).
 param SMP: u16 = 0;
+// KV page staging slots a layer-grid PE (Fork 4's host KV tier; 0: none).
+param KVST: u16 = 0;
 // The eta VM on the head's VMC = Vr / 32 VM columns (Fork 3's banked
 // multi-column VM): its image, out ring and MMAX·B lane banks. VM 0: none.
 param VM: u16 = 0;
@@ -186,7 +188,7 @@ layout {
         @set_tile_code(x, y, "grid_pe.csl", .{
           .memcpy_params = mp,
           .P = P, .Hc = Hc, .Dc = Dc, .Gs = Gs, .Ic = Ic, .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC,
-          .GW = GW, .GH = GH, .NL = GW * GH, .F = F, .S2D_VMC = VMT, .S2D_VMAT = HR2X + 1,
+          .GW = GW, .GH = GH, .NL = GW * GH, .F = F, .S2D_VMC = VMT, .S2D_VMAT = HR2X + 1, .KVST = KVST,
           .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
           .c_bc = C_BC, .c_gb = C_GB, .c_cp = C_Q2,
           .K = 1, .stage = 0, .c_in = C_Q2, .c_out = C_Q2, .c_ret = C_Q2,
@@ -251,8 +253,12 @@ layout {
   @export_name("spec_out", [*]u32, true);
   @export_name("spec_hist", [*]u32, true);
   @export_name("spec_ctl", [*]u32, true);
+  @export_name("kstage", [*]f32, true);
+  @export_name("vstage", [*]f32, true);
   @export_name("init", fn()void);
   @export_name("compute", fn(u32, u32)void);
   @export_name("copy_page", fn(u32, u32)void);
   @export_name("copy_move", fn(u32, u32)void);
+  @export_name("page_stage", fn(u32, u32)void);
+  @export_name("page_unstage", fn(u32, u32)void);
 }

@@ -23,6 +23,7 @@ param MC: u16;         // lanes an MLP chunk (B % MC == 0)
 param W16: u16;
 param NP: u16;
 param KV16: u16;
+param KVST: u16 = 0;       // KV page staging slots a grid PE (Fork 4's interface; 0: none)
 param KVCP: u16;       // 1: copy_kv on the wafer, 0: the host copies pages
 param PROF: u16;
 param TIME: u16;       // 1: the grids time each pass (prof[0], with PROF 0); ~0.3 KB a grid PE
@@ -86,7 +87,7 @@ layout {
       const free_slot = y / PY >= GS and x / PX == 0;
       if (x >= XH and x < XE and y <= HH and HEADMODE == 2) {
         @set_tile_code(x, y, "head_pe.csl", .{
-          .memcpy_params = mp,
+          .memcpy_params = mp, .KVST = KVST,
           .W = HW, .H = HH, .F = F, .C = C, .Hc = 2 * Hc, .Vr = Vr, .Gx = Gx, .Gy = Gy, .Gb = 1,
           .vocab = vocab, .PASSES = PASSES, .UNTIED = 0, .CERT = 0, .MODE = MODE, .OVL = OVL,
           .VMC = VMC, .WF32 = 0, .SCHAIN = 0,
@@ -97,18 +98,18 @@ layout {
         });
       } else if (x >= XE and y <= HH and HEADMODE == 2) {
         @set_tile_code(x, y, "embed_pe.csl", .{
-          .memcpy_params = mp, .PX = PX, .PY = PY, .Hc = Hc, .GW = GW, .GH = GH, .GS = GS, .NL = NL,
+          .memcpy_params = mp, .KVST = KVST, .PX = PX, .PY = PY, .Hc = Hc, .GW = GW, .GH = GH, .GS = GS, .NL = NL,
           .F = F, .VMC = VMC, .VMAT = HR2X + 1, .Ve = Vr, .vocab = vocab, .B = B, .KVCP = KVCP,
           .WS = WS, .KS = KS,
         });
       } else if (x >= XH or y >= GHGT or free_slot) {
         @set_tile_code(x, y, "filler.csl", .{
-          .memcpy_params = mp, .PX = PX, .PY = PY, .GW = GW, .GH = GH, .GS = GS, .NL = NL, .F = F,
+          .memcpy_params = mp, .KVST = KVST, .PX = PX, .PY = PY, .GW = GW, .GH = GH, .GS = GS, .NL = NL, .F = F,
           .VMC = HVMC, .VMAT = HR2X + 1, .HEADMODE = HEADMODE, .KVCP = KVCP, .WS = WS, .KS = KS,
         });
       } else {
         @set_tile_code(x, y, "grid_pe.csl", .{
-          .memcpy_params = mp,
+          .memcpy_params = mp, .KVST = KVST,
           .PX = PX, .PY = PY, .Hc = Hc, .HR = HR, .Dc = Dc, .Gs = Gs, .Qh = Qh, .Ic = Ic,
           .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC, .W16 = W16, .NP = NP, .KV16 = KV16,
           .KVCP = KVCP, .PROF = PROF, .S2D_TIME = TIME,
@@ -136,6 +137,13 @@ layout {
   @export_name("prof", [*]u32, true);
   @export_name("dims", [*]u16, true);
   @export_name("rtab", [*]u16, true);
+  // (every data name before the first function name: memcpy keeps its symbol
+  // table as data only then; a data name after init/compute costs ~0.8 KB of
+  // code a PE)
+  if (KVST > 0) {
+    @export_name("kstage", [*]f32, true);   // f32 words: two bf16 cells a word (KV16)
+    @export_name("vstage", [*]f32, true);
+  }
   @export_name("wt", [*]u32, true);
   @export_name("et", [*]u32, true);
   @export_name("l2", [*]f32, true);
@@ -156,6 +164,10 @@ layout {
   @export_name("etab", [*]u32, true);
   @export_name("init", fn()void);
   @export_name("compute", fn(u32, u32)void);
+  if (KVST > 0) {
+    @export_name("page_stage", fn(u32, u32)void);
+    @export_name("page_unstage", fn(u32, u32)void);
+  }
   if (KVCP == 1) {
     @export_name("copy_kv", fn(u32, u32, u32)void);
   }

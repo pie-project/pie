@@ -68,6 +68,10 @@ pub struct Layout2d {
     /// turn's last row), 4 on guest4h2s (and the lane's VM set: 0, set A,
     /// the only one the engine drives yet).
     pub vmlane_words: usize,
+    /// `KVST`: KV staging slots a grid PE (`kstage`/`vstage`, `page_stage`
+    /// / `page_unstage`; scratch/fork4/kv-staging-interface.md); 0: the
+    /// host reads and patches whole kc/vc rows.
+    pub kvst: usize,
     /// serve8b ([`super::serve8b`]): bf16 grids in strips that skip a slot
     /// (or serve8b_region's grids and regions), a head of `PY / 2` chunk
     /// columns, the embedding strip east of it.
@@ -128,6 +132,7 @@ impl Layout2d {
                 hlm: get("HLM"),
                 hlbn: get("HLBN"),
                 vmlane_words: 2,
+                kvst: get("KVST").unwrap_or(0),
                 s8b: None,
             };
             let mut lay = lay;
