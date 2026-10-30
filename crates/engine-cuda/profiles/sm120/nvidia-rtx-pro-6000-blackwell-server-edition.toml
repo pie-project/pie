@@ -33,6 +33,11 @@ gemm.fp8_shadow = true
 # 1.58 -> 1.50 ms a token, greedy tokens unchanged
 pdl = true
 
+# a prefill's fire on sixteen buckets a doubling: gemma-4-31b pf16-512's 14-lane fire (7742 rows) ran
+# the 8192 bucket's GEMMs, now 7845's; pf16 5,845 -> 6,244 tok/s, pf8 5,941 -> 6,092, greedy tokens unchanged
+[engine]
+prefill_lattice_steps = 16
+
 # independent chains (shared expert beside the routed ones) on side streams, as sm100 runs them:
 # Qwen3.6-35B-A3B single-request decode 170 -> 179 tok/s, greedy tokens unchanged, c128 unchanged
 [compiler]
