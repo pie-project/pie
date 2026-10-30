@@ -140,7 +140,8 @@ pub(crate) fn fork_dag(
             let l = lane_of[a];
             need[l] = Some(need[l].map_or(a, |held| held.max(a)));
         }
-        let barrier = !eligible[r] || unit_first || unit_last;
+        // as `seat` does: work under the fork floor stays on the main lane
+        let barrier = !eligible[r] || unit_first || unit_last || costs[r] < profile.fork_floor_us;
         let lane = if barrier {
             0
         } else if let Some(fixed) = fixed {
