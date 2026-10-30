@@ -24,6 +24,9 @@ mod src {
     /// Fork 11's p8fast softmax levers S1-S3 as (old, new) text pairs on
     /// qwen2d_paged8b's or qwen2d_region's pe.csl (softmax_s123.py's REPS).
     pub const SOFTMAX_S123: &str = include_str!("csl/kernels/softmax_s123.json");
+    /// Their S1 and S3 on the 0.6B layer, qwen2d_paged's or qwen2d_pring's
+    /// pe.csl (serve2d/softmax_s13_06b.py's REPS).
+    pub const SOFTMAX_S13_06B: &str = include_str!("csl/kernels/softmax_s13_06b.json");
     pub const VM_HM: &str = include_str!("csl/vm/guest4hm_vm.csl");
     pub const VM_HZ: &str = include_str!("csl/vm/guest4hz_vm.csl");
 
@@ -369,7 +372,10 @@ const KS = f32;\n"
 }
 
 fn s2d_grid(kernel: &str, src: &str) -> R<String> {
-    let mut s = patch(src, "param c_r1_0: color;\n", &format!("{S2D_GRID_PARAMS}param c_r1_0: color;\n"), "params")?;
+    // Fork 11's softmax levers S1 + S3 on the paged layer (0157: exact on
+    // hardware); the kernel sources stay as their owners keep them.
+    let src = if kernel == "qwen2d_paged" { softmax_s13_06b(src, "qwen2d_paged/pe.csl")? } else { src.to_string() };
+    let mut s = patch(&src, "param c_r1_0: color;\n", &format!("{S2D_GRID_PARAMS}param c_r1_0: color;\n"), "params")?;
     s = patch(&s, "  px = layout_mod.get_x_coord();\n  py = layout_mod.get_y_coord();\n", "  s2d_place();\n", "init coordinates")?;
     s = patch(
         &s,
@@ -642,8 +648,10 @@ fn pipe_all() -> Names {
 }
 
 fn pipe_grid() -> R<String> {
+    // Fork 11's softmax levers S1 + S3 (0157: exact on hardware).
+    let src = softmax_s13_06b(src::QWEN2D_PRING, "qwen2d_pring/pe.csl")?;
     let mut s = patch(
-        src::QWEN2D_PRING,
+        &src,
         "param c_r1_0: color;\n",
         "// serve2d_pipe: the grids' arrangement, the head's feeder row and VM column.\n\
 param GW: u16;\nparam GH: u16;\nparam NL: u16;\nparam F: u16;\n\
@@ -814,14 +822,24 @@ pub fn serve2d_pipe() -> R<Vec<File>> {
 /// max and sum folds as a halving tree; S3: the exp sums ride the values
 /// all-reduce) on an 8B unit kernel's text, each anchor found once.
 fn softmax_s123(text: &str, tag: &str) -> R<String> {
-    let reps: serde_json::Value =
-        serde_json::from_str(src::SOFTMAX_S123).map_err(|e| format!("softmax_s123.json: {e}"))?;
+    apply_reps("softmax_s123", src::SOFTMAX_S123, text, tag)
+}
+
+/// softmax_s13_06b.py's `apply`: S1 and S3 on the 0.6B paged layer
+/// (qwen2d_paged / qwen2d_pring; S2 is already there).
+fn softmax_s13_06b(text: &str, tag: &str) -> R<String> {
+    apply_reps("softmax_s13_06b", src::SOFTMAX_S13_06B, text, tag)
+}
+
+/// A JSON list of {old, new} text pairs applied in order, each anchor found once.
+fn apply_reps(name: &str, json: &str, text: &str, tag: &str) -> R<String> {
+    let reps: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("{name}.json: {e}"))?;
     let mut s = text.to_string();
-    for r in reps.as_array().ok_or("softmax_s123.json: not a list")? {
+    for r in reps.as_array().ok_or(format!("{name}.json: not a list"))? {
         let (old, new) = (r["old"].as_str().unwrap_or(""), r["new"].as_str().unwrap_or(""));
         let n = s.matches(old).count();
         if old.is_empty() || n != 1 {
-            return Err(format!("softmax_s123: {tag} changed: anchor found {n} times"));
+            return Err(format!("{name}: {tag} changed: anchor found {n} times"));
         }
         s = s.replacen(old, new, 1);
     }
@@ -1282,12 +1300,12 @@ mod tests {
     /// sync.py, diff (`PIE_CEREBRAS_PAYLOAD` below), then update.
     const PINNED: &[(&str, &str, &str)] = &[
         ("serve2d", "grid_pe.csl", "b591b05358b5bdde516e3f65e5eb361402c4f0eef41f74521b52b86e89d604ec"),
-        ("serve2d", "grid_paged_pe.csl", "e9b85b9f807ec3ddf12c600006159fed22b42ea26f7cbe9fcd0ed75805608352"),
+        ("serve2d", "grid_paged_pe.csl", "d813715d243315a8cbddbd65a223c87d5911ac99bb9447de51e64383e6970ed0"),
         ("serve2d", "head_pe.csl", "bdc1e087f3066c21efcf2ae9d75acb489e80d3a9d12630220f623faa86095ffc"),
         ("serve2d", "head_stub.csl", "572f7e7c6f8065a29970ea1785b55023d77d313daf0b2f6051254be096235a1f"),
         ("serve2d", "filler.csl", "9f435cfd600f91915db70d1bd947c202a90a21fe3f72decd974173f977f09211"),
         ("serve2d", "vm_pe.csl", "ac1e9110a0d4e1253d48df48477ddcaf53aad7cf007969b6077eec53f2a88c42"),
-        ("serve2d_pipe", "grid_pe.csl", "50f936ad027b6789bf3e307546b3e9a1189bbb938f6b4546f1b0b555485a3e26"),
+        ("serve2d_pipe", "grid_pe.csl", "37bb4a86878b05fede651b072293f28fcf9b69e05786111b976bfe909ca22991"),
         ("serve2d_pipe", "head_pe.csl", "dbad3ea4babb668918bf15b15cf79eb1889a067c33836931af3119b8fd42ce59"),
         ("serve2d_pipe", "filler.csl", "9d5a34b90889efbb80c0f5bff82fc6e0723f50143729cf57d4edf05156e38f71"),
         ("serve2d_pipe", "vm_pe.csl", "b19266d1bea6b2692e17265bb7a1be88298aa18a32c7aa19120c59b9eeb9bd9c"),
