@@ -30,6 +30,12 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
   (`kvstage.csl`: serve2d*'s KV page staging, `KVST` slots a paged-grid PE;
   serve8b's is in its `grid_extra.csl`), layout, routing helpers,
   `*_extra.csl` (what it appends to each kernel) and base programs.
+- `serve8b_region_pipe/`: serve8b_region as a pipeline ring (`PIPE`, up to
+  `MMAX` micro-batches a lap): its layout, the units' `grid_extra.csl`
+  (per-micro-batch tables `mtab`, the index word after x to the head), the
+  head's `head_extra.csl` (virtual lanes, the micro-batch check `perr`) and
+  the embedding strip; the rest is serve8b_region's. The plan offers only
+  0148's hardware shapes (B 4 x 4 at CAP 16, B 2 x 8 at CAP 32).
 
 The generated `*_pe.csl` are byte-identical to the bench payload's `sync.py`
 outputs. `codegen.rs` pins their hashes; with `PIE_CEREBRAS_PAYLOAD` set, its

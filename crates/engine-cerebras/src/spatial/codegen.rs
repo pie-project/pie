@@ -64,6 +64,15 @@ mod src {
         pub const VM_STUB_BASE: &str = include_str!("csl/serve8b_region/vm_stub_base.csl");
     }
 
+    /// serve8b_region_pipe: serve8b_region's own files where the ring's
+    /// micro-batches change them (the rest are serve8b_region's).
+    pub mod s8brp {
+        pub const LAYOUT: &str = include_str!("csl/serve8b_region_pipe/layout.csl");
+        pub const GRID_EXTRA: &str = include_str!("csl/serve8b_region_pipe/grid_extra.csl");
+        pub const HEAD_EXTRA: &str = include_str!("csl/serve8b_region_pipe/head_extra.csl");
+        pub const EMBED_BASE: &str = include_str!("csl/serve8b_region_pipe/embed_base.csl");
+    }
+
     pub mod pipe {
         pub const LAYOUT: &str = include_str!("csl/serve2d_pipe/layout.csl");
         pub const PATHS: &str = include_str!("csl/serve2d_pipe/paths.csl");
@@ -89,6 +98,9 @@ pub enum Design {
     /// Qwen3-8B as layer units: qwen2d_paged8b grids and qwen2d_region
     /// regions of several layers, chained by host tables (serve8b_region).
     Serve8bRegion,
+    /// serve8b_region's units as a pipeline ring: micro-batches round the
+    /// units and the head each lap (serve8b_region_pipe).
+    Serve8bRegionPipe,
 }
 
 impl Design {
@@ -98,6 +110,7 @@ impl Design {
             Design::Serve2dPipe => "serve2d_pipe",
             Design::Serve8b => "serve8b",
             Design::Serve8bRegion => "serve8b_region",
+            Design::Serve8bRegionPipe => "serve8b_region_pipe",
         }
     }
 
@@ -107,6 +120,7 @@ impl Design {
             "serve2d_pipe" => Some(Design::Serve2dPipe),
             "serve8b" => Some(Design::Serve8b),
             "serve8b_region" => Some(Design::Serve8bRegion),
+            "serve8b_region_pipe" => Some(Design::Serve8bRegionPipe),
             _ => None,
         }
     }
@@ -119,7 +133,7 @@ impl Design {
             Design::Serve2dPipe => Some("guest4hz"),
             Design::Serve8b => None,
             // Fork 3's guest4hz as the block east of the strip (with VMX).
-            Design::Serve8bRegion => Some("guest4hz"),
+            Design::Serve8bRegion | Design::Serve8bRegionPipe => Some("guest4hz"),
         }
     }
 
@@ -130,7 +144,7 @@ impl Design {
         match self {
             Design::Serve2d | Design::Serve2dPipe => ("f32", false),
             Design::Serve8b => ("bf16x2", true),
-            Design::Serve8bRegion => ("bf16", false),
+            Design::Serve8bRegion | Design::Serve8bRegionPipe => ("bf16", false),
         }
     }
 
@@ -140,7 +154,8 @@ impl Design {
             Design::Serve2d => serve2d(),
             Design::Serve2dPipe => serve2d_pipe(),
             Design::Serve8b => serve8b(),
-            Design::Serve8bRegion => serve8b_region(),
+            Design::Serve8bRegion => serve8b_region(false),
+            Design::Serve8bRegionPipe => serve8b_region(true),
         }
     }
 }
@@ -1045,12 +1060,22 @@ const S8BR_VM_NAMES: &[(&str, &str)] = &[
 /// KV page staging (the unit kernels' own, under KVST > 0): bf16 slots.
 const S8BR_KVST_NAMES: &[(&str, &str)] = &[("kstage", "KS"), ("vstage", "KS")];
 
+/// serve8b_region_pipe's names past serve8b_region's: the units' micro-batch
+/// tables, and the head's micro-batch check (before `hlogits`).
+const S8BRP_GRID_NAMES: &[(&str, &str)] = &[("mtab", "u32")];
+const S8BRP_HEAD_NAMES: &[(&str, &str)] = &[("perr", "u32")];
+
 /// serve8b_region's dummies: a 1-word array per missing name (the HROUTE
 /// and staging ones conditional), and no-op staging launches off the units.
-fn s8br_dummies(own: &[String]) -> String {
+fn s8br_dummies(own: &[String], pipe: bool) -> String {
+    let (grid, head): (&[_], &[_]) = if pipe { (S8BRP_GRID_NAMES, S8BRP_HEAD_NAMES) } else { (&[], &[]) };
+    let (hlogits, rest) = S8BR_HEAD_NAMES.split_last().unwrap();
     let all = Names::of(S8B_GRID_NAMES)
+        .with(grid)
         .with(S8BR_KVST_NAMES)
-        .with(S8BR_HEAD_NAMES)
+        .with(rest)
+        .with(head)
+        .with(&[*hlogits])
         .with(S8B_EMBED_NAMES)
         .with(S8BR_VM_NAMES)
         .with(S8BR_HROUTE_NAMES);
@@ -1088,14 +1113,15 @@ fn page_unstage(page: u32, slot: u32) void { sys_mod.unblock_cmd_stream(); }"
 /// A unit kernel (qwen2d_paged8b or qwen2d_region) with serve8b_region's
 /// grid_extra: the host's placement and handoffs, its pass prologue and its
 /// layer(s) lifted out of `compute`.
-fn s8br_unit(kernel: &str, src: &str) -> R<String> {
+fn s8br_unit(kernel: &str, src: &str, pipe: bool) -> R<String> {
     let tag = format!("{kernel}/pe.csl");
     let mut s = patch(
         &softmax_s123(src, &tag)?,
         "param c_r1_0: color;\n",
-        concat!(
-            "// serve8b: 1 times each pass (prof[0]); the route table's route capacity.\n",
-            "param S2D_TIME: u16;\nparam S2D_RTR: u16;\nparam S2D_NOLAYER: u16;\nparam c_r1_0: color;\n"
+        &format!(
+            "// serve8b: 1 times each pass (prof[0]); the route table's route capacity.\n\
+param S2D_TIME: u16;\nparam S2D_RTR: u16;\nparam S2D_NOLAYER: u16;\n{}param c_r1_0: color;\n",
+            if pipe { "param S2D_PIPE: u16 = 0;\nparam S2D_MMAX: u16 = 1;   // serve8b_region_pipe\n" } else { "" }
         ),
         "params",
     )?;
@@ -1125,13 +1151,13 @@ fn s2d_pass_start(i: u32, start_pos: u32) void {{\n{}\n}}\nfn s2d_layers() void 
         dedent(&body[m + mid.len()..hi])
     );
     s = format!("{}\n{}", &s[..start], &s[end..]);
+    let grid_extra = if pipe { src::s8brp::GRID_EXTRA } else { src::s8br::GRID_EXTRA };
     let mut own = exports(&s);
-    own.extend(exports(src::s8br::GRID_EXTRA));
+    own.extend(exports(grid_extra));
     let nlk = if kernel == "qwen2d_region" { "NL" } else { "1" };
     let extra = format!(
-        "{S8B_GRID_VARIANT}const S2D_KL: u16 = {nlk};       // layers a unit (KV staging)\n\n{pass_fn}\n{}\n{}",
-        src::s8br::GRID_EXTRA,
-        s8br_dummies(&own)
+        "{S8B_GRID_VARIANT}const S2D_KL: u16 = {nlk};       // layers a unit (KV staging)\n\n{pass_fn}\n{grid_extra}\n{}",
+        s8br_dummies(&own, pipe)
     );
     // `\ncomptime {\n(  if (NL > 1)...\n)?  @initialize_queue(q_r1_0_in`
     let mut at = None;
@@ -1156,18 +1182,19 @@ fn s2d_pass_start(i: u32, start_pos: u32) void {{\n{}\n}}\nfn s2d_layers() void 
     ))
 }
 
-fn s8br_head() -> R<String> {
+fn s8br_head(pipe: bool) -> R<String> {
     let tag = "head2d_v10/pe.csl";
     let mut s = patch(
         src::HEAD2D_V10,
         "param WF32: u16;\n",
-        concat!(
-            "param WF32: u16;\n// serve8b: the end grids (GPX x GPY, GHc dims a row; the last at XL, YL), the head's first column XH0,\n",
-            "// row), the tokens' capacity, the lanes, the copy kernel, the grids' element\n",
-            "// types (their exports).\nparam GPX: u16;\nparam GPY: u16;\nparam GHc: u16;\nparam XH0: u16;\n",
-            "param XL: u16;\nparam YL: u16;\nparam CAP: u16;\nparam SB: u16;\nparam HLB: u16;\n",
-            "param KVCP: u16;\nparam HROUTE: u16;\n// 1: the VM is the block east of the strip (VM5.md), not a head column.\n",
-            "param S2D_VMX: u16;\nparam WS: type;\nparam KS: type;\n"
+        &format!(
+            "param WF32: u16;\n// serve8b: the end grids (GPX x GPY, GHc dims a row; the last at XL, YL), the head's first column XH0,\n\
+// row), the tokens' capacity, the lanes, the copy kernel, the grids' element\n\
+// types (their exports).\nparam GPX: u16;\nparam GPY: u16;\nparam GHc: u16;\nparam XH0: u16;\n\
+param XL: u16;\nparam YL: u16;\nparam CAP: u16;\nparam SB: u16;\nparam HLB: u16;\n\
+param KVCP: u16;\nparam HROUTE: u16;\n// 1: the VM is the block east of the strip (VM5.md), not a head column.\n\
+param S2D_VMX: u16;\n{}param WS: type;\nparam KS: type;\n",
+            if pipe { "param S2D_PIPE: u16 = 0;\nparam S2D_MMAX: u16 = 1;\nparam S2D_FINAL: u16 = 1;\n" } else { "" }
         ),
         "params",
     )?;
@@ -1231,21 +1258,27 @@ fn s8br_head() -> R<String> {
     s = drop_head_compute(&t)?;
     let mut own = exports(&s);
     own.extend(["in_tokens", "out_tokens", "yscale", "hlogits", "vmctl"].map(String::from));
-    s = format!("{}\n\n{}\n{}", s.trim_end_matches('\n'), src::s8br::HEAD_EXTRA, s8br_dummies(&own));
+    let head_extra = if pipe {
+        own.push("perr".into());
+        src::s8brp::HEAD_EXTRA
+    } else {
+        src::s8br::HEAD_EXTRA
+    };
+    s = format!("{}\n\n{}\n{}", s.trim_end_matches('\n'), head_extra, s8br_dummies(&own, pipe));
     Ok(format!(
         "// GENERATED by serve8b/sync.py from {tag} (Fork 7) + serve8b/head_extra.csl.\n\
 // Do not edit: change head_extra.csl or sync.py and rerun.\n{s}"
     ))
 }
 
-fn s8br_plain(base: &str, base_name: &str, what: &str) -> String {
-    format!("// GENERATED by serve8b/sync.py from {base_name} ({what}).\n{base}\n{}", s8br_dummies(&exports(base)))
+fn s8br_plain(base: &str, base_name: &str, what: &str, pipe: bool) -> String {
+    format!("// GENERATED by serve8b/sync.py from {base_name} ({what}).\n{base}\n{}", s8br_dummies(&exports(base), pipe))
 }
 
 /// vm_pe.csl: Fork 3's VM (vm_base.csl) for the block east of the strip; its
 /// compute takes the grids' (steps, start_pos) and runs a row each of the
 /// head's steps + 1 iterations x S2D_SB lanes.
-fn s8br_vm() -> R<String> {
+fn s8br_vm(pipe: bool) -> R<String> {
     let mut s = patch(
         src::s8br::VM_BASE,
         "param memcpy_params;\n",
@@ -1271,23 +1304,24 @@ fn s8br_vm() -> R<String> {
         "// GENERATED by serve8b_region/sync.py from vm_base.csl (Fork 3's eta VM).\n{s}\n\
 fn copy_kv(src: u32, dst: u32, phase: u32) void {{ sys_mod.unblock_cmd_stream(); }}\n\
 comptime {{\n  if (KVCP == 1) {{ @export_symbol(copy_kv); }}\n}}\n{}",
-        s8br_dummies(&own)
+        s8br_dummies(&own, pipe)
     ))
 }
 
-/// serve8b_region's build directory.
-pub fn serve8b_region() -> R<Vec<File>> {
+/// serve8b_region's build directory, or serve8b_region_pipe's (`pipe`).
+pub fn serve8b_region(pipe: bool) -> R<Vec<File>> {
+    let (layout, embed) = if pipe { (src::s8brp::LAYOUT, src::s8brp::EMBED_BASE) } else { (src::s8br::LAYOUT, src::s8br::EMBED_BASE) };
     Ok(vec![
-        ("layout.csl", src::s8br::LAYOUT.to_string()),
+        ("layout.csl", layout.to_string()),
         ("paths.csl", src::s8br::PATHS.to_string()),
         ("rt.csl", src::s8br::RT.to_string()),
-        ("grid_pe.csl", s8br_unit("qwen2d_paged8b", src::QWEN2D_PAGED8B_HR)?),
-        ("region_pe.csl", s8br_unit("qwen2d_region", src::QWEN2D_REGION)?),
-        ("head_pe.csl", s8br_head()?),
-        ("embed_pe.csl", s8br_plain(src::s8br::EMBED_BASE, "embed_base.csl", "the embedding strip")),
-        ("filler.csl", s8br_plain(src::s8br::FILLER_BASE, "filler_base.csl", "the filler")),
-        ("vm_stub.csl", s8br_plain(src::s8br::VM_STUB_BASE, "vm_stub_base.csl", "a stand-in for the VM block")),
-        ("vm_pe.csl", s8br_vm()?),
+        ("grid_pe.csl", s8br_unit("qwen2d_paged8b", src::QWEN2D_PAGED8B_HR, pipe)?),
+        ("region_pe.csl", s8br_unit("qwen2d_region", src::QWEN2D_REGION, pipe)?),
+        ("head_pe.csl", s8br_head(pipe)?),
+        ("embed_pe.csl", s8br_plain(embed, "embed_base.csl", "the embedding strip", pipe)),
+        ("filler.csl", s8br_plain(src::s8br::FILLER_BASE, "filler_base.csl", "the filler", pipe)),
+        ("vm_stub.csl", s8br_plain(src::s8br::VM_STUB_BASE, "vm_stub_base.csl", "a stand-in for the VM block", pipe)),
+        ("vm_pe.csl", s8br_vm(pipe)?),
     ])
 }
 
@@ -1320,12 +1354,19 @@ mod tests {
         ("serve8b_region", "filler.csl", "0f8106389be8053db738c6bb2189987e0a5716a31372b537f33dcd5aaa54fff5"),
         ("serve8b_region", "vm_pe.csl", "31fa54184438f17f0666961f60c3f46b4e34ec73b95c4f0dbf3b287ab5549f54"),
         ("serve8b_region", "vm_stub.csl", "de0cae945badccacc9b9583cf74c1e47bb14fd82b8287d1b47a0defca4243dbb"),
+        ("serve8b_region_pipe", "grid_pe.csl", "c539475448ca675deee75253df85500798d636e20676c70b2078a38004341e3c"),
+        ("serve8b_region_pipe", "region_pe.csl", "c232fb63aad7e5e017503f128b53a1cc7b45ddd0b7a3a5f295aa6464335caee7"),
+        ("serve8b_region_pipe", "head_pe.csl", "99548cc08c74fd71dbf90bf6bfbe249b30bafcba4e1011887355b8b71e4ac116"),
+        ("serve8b_region_pipe", "embed_pe.csl", "8ce07d934b7a506849e9a949a9fef782def232f0224b7bd25bb607e66665e273"),
+        ("serve8b_region_pipe", "filler.csl", "98033013e29a7ca11a09f2242d253c79a69867c6e7d115d55e85eb6dc69181a2"),
+        ("serve8b_region_pipe", "vm_stub.csl", "30699f5aa05a06b41bc77f1e0344239ce82506104ee1424d57c6127be7b1c067"),
+        ("serve8b_region_pipe", "vm_pe.csl", "d098decfc668200e89eb43c17d3e450b993129f26a65a2f052425a7536abe125"),
     ];
 
     #[test]
     fn generators_match_their_pins() {
         if std::env::var_os("PIE_CEREBRAS_PRINT_PINS").is_some() {
-            for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b, Design::Serve8bRegion] {
+            for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b, Design::Serve8bRegion, Design::Serve8bRegionPipe] {
                 for (name, text) in d.files().unwrap() {
                     println!("PIN (\"{}\", \"{name}\", \"{}\"),", d.name(), blake3::hash(text.as_bytes()).to_hex());
                 }
@@ -1347,7 +1388,7 @@ mod tests {
         let Some(root) = std::env::var_os("PIE_CEREBRAS_PAYLOAD") else { return };
         let root = std::path::PathBuf::from(root);
         let only = std::env::var("PIE_CEREBRAS_PAYLOAD_ONLY").ok();
-        for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b, Design::Serve8bRegion] {
+        for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b, Design::Serve8bRegion, Design::Serve8bRegionPipe] {
             if only.as_deref().is_some_and(|o| o != d.name()) {
                 continue;
             }
@@ -1385,7 +1426,7 @@ mod tests {
             }
             late
         };
-        for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b, Design::Serve8bRegion] {
+        for d in [Design::Serve2d, Design::Serve2dPipe, Design::Serve8b, Design::Serve8bRegion, Design::Serve8bRegionPipe] {
             let files = d.files().unwrap();
             let layout = &files.iter().find(|f| f.0 == "layout.csl").unwrap().1;
             assert!(!layout_exports(layout).is_empty(), "{}", d.name());

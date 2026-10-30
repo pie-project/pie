@@ -149,7 +149,8 @@ pub struct ServeConfig {
     /// The fused naive sampler on the head.
     pub smp: bool,
     /// A paged8b plan as serve8b_region's units (grids and several-layer
-    /// regions) instead of serve8b's strips.
+    /// regions) instead of serve8b's strips; with the `pipeline` goal, as
+    /// serve8b_region_pipe's ring (`mmax` micro-batches).
     pub region: bool,
     pub pins: Vec<(&'static str, usize)>,
 }
@@ -396,9 +397,12 @@ fn serve8b_params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Vec<(&'static str,
 /// rows (`RHc` = ceil(hidden / RPY)). RC 2, RNL 3, RR 4 as built; `NCOL`
 /// the layers left. The head as serve8b's, `HH` = the grid column's rows.
 fn serve8b_region_params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Vec<(&'static str, usize)>> {
-    if cfg.spec.is_some() || cfg.smp || cfg.goals.pipeline || cfg.vm_b.is_some() {
-        return Err("serve8b_region has no speculative decode, fused sampler, pipeline or second VM set".into());
+    if cfg.spec.is_some() || cfg.smp || cfg.vm_b.is_some() {
+        return Err("serve8b_region has no speculative decode, fused sampler or second VM set".into());
     }
+    // serve8b_region_pipe (`pipeline`): micro-batches round the units, as
+    // 0148 ran them on hardware; nothing else (see `refused`).
+    let pipe = cfg.goals.pipeline.then(|| pipe_shape(plan.grid.lanes, cfg)).transpose()?;
     let g = &plan.grid;
     let wafer = super::plan::WaferDims::CS3;
     let (rc, rnl, rr, rpy, rgy) = (2, 3, 4, 240, 16);
@@ -448,8 +452,18 @@ fn serve8b_region_params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Vec<(&'stat
         }
         c
     });
+    let cap = match pipe {
+        Some((_, pcap)) if cap > pcap && cfg.goals.cap.is_some() => {
+            return Err(format!("serve8b_region_pipe at B {} holds CAP {pcap} at most (0148's fit), not {cap}", g.lanes));
+        }
+        Some((_, pcap)) => cap.min(pcap),
+        None => cap,
+    };
     // KV page staging at B 1 (at B 4 the units have no room for it).
-    let mut out = vec![("KVST", usize::from(g.lanes == 1))];
+    let mut out = vec![("KVST", usize::from(g.lanes == 1 && pipe.is_none()))];
+    if let Some((mmax, _)) = pipe {
+        out.extend([("PIPE", 1), ("MMAX", mmax)]);
+    }
     if let Some(vm) = cfg.vm {
         // Fork 3's VM image on the block; one VM lane a head lane, and the
         // head keeps one lane's logits rows at B > 1 (room on its PEs).
@@ -483,18 +497,56 @@ fn serve8b_region_params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Vec<(&'stat
         ("W16", usize::from(g.w16)), ("KV16", usize::from(g.kv16)), ("KVCP", 0), ("PROF", 0), ("TIME", 0),
         ("HROUTE", 1), ("ROT8", 1), ("NOLAYER", 0), ("HEADMODE", 2), ("HH", hh), ("Vr", vr),
         ("Gx", gx), ("Gy", gy), ("vocab", plan.vocab), ("PASSES", 3), ("MODE", 0), ("OVL", 0), ("VMC", vmc),
-        ("CAP", cap), ("iters", 1), ("B", g.lanes), ("NP", 3),
+        ("CAP", cap), ("iters", 1), ("B", g.lanes), ("NP", if pipe.is_some() { 1 } else { 3 }),
     ]);
     Ok(out)
+}
+
+/// serve8b_region_pipe's hardware-run shapes (0148, real Qwen3-8B, every
+/// lane exact): (lanes, micro-batches at most, CAP).
+const S8BRP_RUN: &[(usize, usize, usize)] = &[(4, 4, 16), (2, 8, 32)];
+
+/// serve8b_region_pipe's micro-batches (`mmax`, or the most 0148 ran) and
+/// CAP for `lanes`: only 0148's shapes. B 1 (12 micro-batches) hung in its
+/// second launch (0149 is bisecting it); the rest are unrun.
+fn pipe_shape(lanes: usize, cfg: &ServeConfig) -> R<(usize, usize)> {
+    if cfg.vm.is_some() {
+        return Err("serve8b_region_pipe has no eta VM yet (VMX unrun on the ring)".into());
+    }
+    let &(_, most, cap) = S8BRP_RUN.iter().find(|r| r.0 == lanes).ok_or_else(|| {
+        format!("serve8b_region_pipe runs B 4 or B 2 (0148); B {lanes} is unsupported (B 1 hung on hardware, 0149)")
+    })?;
+    match cfg.mmax.unwrap_or(most) {
+        m if (1..=most).contains(&m) => Ok((m, cap)),
+        m => Err(format!("serve8b_region_pipe at B {lanes} runs 1 to {most} micro-batches (0148), not {m}")),
+    }
 }
 
 /// Builds PIE refuses to compile: serve2d's one-sequence qwen2d grids
 /// (`GRID` 0) loaded and then hung on hardware (0150), and nothing has
 /// checked them since the paged and ring work.
+/// So are serve8b_region_pipe's builds outside 0148's shapes (pins
+/// included): B 1 hung on hardware (0149), and more micro-batches, a larger
+/// CAP, the VM block or KV staging are unrun on the ring.
 fn refused(design: Design, params: &[(String, String)]) -> R<()> {
-    let grid = params.iter().find(|(k, _)| k == "GRID").map(|(_, v)| v.trim());
-    if design == Design::Serve2d && grid == Some("0") {
+    let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.trim());
+    let num = |k: &str| get(k).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    if design == Design::Serve2d && get("GRID") == Some("0") {
         return Err("serve2d GRID:0 is unsupported (hung on hardware, 0150); use GRID:1 with B:1 for one sequence".into());
+    }
+    if design == Design::Serve8bRegionPipe && num("PIPE") == 1 {
+        let (b, m, cap) = (num("B"), num("MMAX"), num("CAP"));
+        let ran = S8BRP_RUN.iter().any(|&(rb, rm, rcap)| b == rb && (1..=rm).contains(&m) && cap <= rcap);
+        if !ran || num("VMX") != 0 || num("KVST") != 0 || num("PY") != 144 {
+            return Err(format!(
+                "serve8b_region_pipe B:{b} MMAX:{m} CAP:{cap} VMX:{} KVST:{} PY:{} is unsupported: only B:4 MMAX<=4 CAP<=16 and \
+B:2 MMAX<=8 CAP<=32 on B 4's grids (PY 144, grid_lanes 4) without the VM block or staging ran on hardware \
+(0148; B:1 hung, 0149)",
+                num("VMX"),
+                num("KVST"),
+                num("PY")
+            ));
+        }
     }
     Ok(())
 }
@@ -517,16 +569,17 @@ pub fn layout_params(layout: &str) -> Vec<(String, bool)> {
 /// and nothing unknown is passed.
 pub fn params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<(Design, Vec<(String, String)>)> {
     let d = match design(plan)? {
+        Design::Serve8b if cfg.region && cfg.goals.pipeline => Design::Serve8bRegionPipe,
         Design::Serve8b if cfg.region => Design::Serve8bRegion,
         _ if cfg.region => return Err(format!("{}: `region` places paged8b (8B) plans only", plan.spec.name)),
         d => d,
     };
-    if !matches!(d, Design::Serve8b | Design::Serve8bRegion) && plan.program.is_none() && !cfg.pins.iter().any(|p| p.0 == "GW") {
+    if !matches!(d, Design::Serve8b | Design::Serve8bRegion | Design::Serve8bRegionPipe) && plan.program.is_none() && !cfg.pins.iter().any(|p| p.0 == "GW") {
         return Err(format!("{}: no full program places the model: {}", plan.spec.name, plan.blockers.join("; ")));
     }
     let mut set: Vec<(&'static str, usize)> = match d {
         Design::Serve8b => serve8b_params(plan, cfg)?,
-        Design::Serve8bRegion => serve8b_region_params(plan, cfg)?,
+        Design::Serve8bRegion | Design::Serve8bRegionPipe => serve8b_region_params(plan, cfg)?,
         _ => plan.params(),
     };
     let put = |set: &mut Vec<(&'static str, usize)>, k: &'static str, v: usize| match set.iter_mut().find(|e| e.0 == k) {
@@ -549,7 +602,7 @@ pub fn params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<(Design, Vec<(String, 
         if let Some(h) = cfg.hlm {
             put(&mut set, "HLM", h);
         }
-    } else if !matches!(d, Design::Serve8b | Design::Serve8bRegion) && (cfg.spec.is_some() || cfg.smp || cfg.mmax.is_some()) {
+    } else if !matches!(d, Design::Serve8b | Design::Serve8bRegion | Design::Serve8bRegionPipe) && (cfg.spec.is_some() || cfg.smp || cfg.mmax.is_some()) {
         return Err("speculative decode, the fused sampler and MMAX are serve2d_pipe's".into());
     }
     let vm_b: Vec<(&'static str, usize)> = cfg.vm_b.map(|(img, cols)| img.params_b(cols)).unwrap_or_default();
@@ -557,7 +610,7 @@ pub fn params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<(Design, Vec<(String, 
         return Err("a second VM set (`vm_b`) is serve2d_pipe's".into());
     }
     // serve8b_region names its VM image's params itself (serve8b_region_params).
-    let vm = cfg.vm.filter(|_| d != Design::Serve8bRegion);
+    let vm = cfg.vm.filter(|_| !matches!(d, Design::Serve8bRegion | Design::Serve8bRegionPipe));
     let vm_keys: Vec<&'static str> = vm
         .map(|vm| vm.params())
         .unwrap_or_default()
@@ -620,7 +673,7 @@ fn rectangle(design: Design, params: &[(String, String)]) -> R<(u32, u32)> {
             .and_then(|(_, v)| v.parse().ok())
             .ok_or_else(|| format!("{}: no `{k}`", design.name()))
     };
-    if design == Design::Serve8bRegion {
+    if matches!(design, Design::Serve8bRegion | Design::Serve8bRegionPipe) {
         // serve8b_region's layout.csl: the band and regions (RC RPX), the grid
         // column (PX), the head and the strip; down the regions, the grid
         // column or the head's rows and its feeder row.
@@ -650,7 +703,7 @@ fn rectangle(design: Design, params: &[(String, String)]) -> R<(u32, u32)> {
             let (hw, ew) = if head { (py / 2 + vmc, py / 4) } else { (0, 0) };
             Ok((gw * px + hw + ew, if head { (gh * py).max(hh + 1) } else { gh * py }))
         }
-        Design::Serve8bRegion => unreachable!("handled above"),
+        Design::Serve8bRegion | Design::Serve8bRegionPipe => unreachable!("handled above"),
     }
 }
 
@@ -994,6 +1047,59 @@ mod qwen3_8b {
             let p2: Vec<(String, String)> = p.clone();
             assert_eq!(rectangle(d, &p2).unwrap(), (749, 1153));
         }
+    }
+
+    /// `region` with `pipeline` is 0148's serve8b_region_pipe builds (B 4 x 4
+    /// micro-batches at CAP 16, B 2 x 8 at CAP 32); B 1, more micro-batches,
+    /// a larger CAP, the VM or staging are refused, by the plan and by pins.
+    #[test]
+    fn the_plan_places_qwen3_8b_pipe_as_0148_and_refuses_the_rest() {
+        let base = "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:240,RHc:18,RDc:4,RGs:32,RIc:48,RNL:3,RGY:16,\
+                    RC:2,RR:4,NCOL:7,RTR:4,HR:4096,Qh:4,PS:16,NB:1,E:1,MC:1,W16:1,KV16:1,KVCP:0,PROF:0,TIME:0,\
+                    HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,PASSES:3,MODE:0,\
+                    OVL:0,VMC:1,iters:1,NP:1,PIPE:1,KVST:0";
+        let cfg_for = |b: usize, mmax: Option<usize>| {
+            // 0148's grids are B 4's (0115's) at every B.
+            let goals = Goals { blocks: Some(1), host_copy: true, grid_lanes: 4, pipeline: true, ..Goals::lanes(b) };
+            let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+            let mut cfg = ServeConfig::new(goals);
+            cfg.region = true;
+            cfg.mmax = mmax;
+            (plan, cfg)
+        };
+        for (b, m, cap) in [(4, 4, 16), (2, 8, 32)] {
+            let (plan, cfg) = cfg_for(b, None);
+            let (d, p) = params(&plan, &cfg).unwrap();
+            assert_eq!(d, Design::Serve8bRegionPipe);
+            let mut got = p.clone();
+            got.sort();
+            assert_eq!(got, sorted(&format!("{base},B:{b},MMAX:{m},CAP:{cap}")), "B {b}");
+            assert_eq!(rectangle(d, &p).unwrap(), (749, 1153));
+            // Fewer micro-batches are the same program's.
+            let (plan, cfg) = cfg_for(b, Some(2));
+            assert!(params(&plan, &cfg).is_ok());
+            // More are not.
+            let (plan, cfg) = cfg_for(b, Some(m + 1));
+            assert!(params(&plan, &cfg).unwrap_err().contains("micro-batches"));
+            // Nor are pins past 0148's shapes.
+            for pin in [("MMAX", m + 1), ("CAP", 2 * cap), ("KVST", 1)] {
+                let (plan, mut cfg) = cfg_for(b, None);
+                cfg.pins.push(pin);
+                assert!(params(&plan, &cfg).unwrap_err().contains("unsupported"), "{pin:?}");
+            }
+        }
+        // B 1 hung on hardware (0149).
+        let (plan, cfg) = cfg_for(1, None);
+        assert!(params(&plan, &cfg).unwrap_err().contains("B 1"));
+        let p = sorted(&format!("{base},B:1,MMAX:12,CAP:32"));
+        assert!(refused(Design::Serve8bRegionPipe, &p).is_err());
+        assert!(refused(Design::Serve8bRegionPipe, &sorted(&format!("{base},B:4,MMAX:4,CAP:16"))).is_ok());
+        // B 2 on B 2's own grid (PY 128) is unrun.
+        let goals = Goals { blocks: Some(1), host_copy: true, grid_lanes: 2, pipeline: true, ..Goals::lanes(2) };
+        let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+        let mut cfg = ServeConfig::new(goals);
+        cfg.region = true;
+        assert!(params(&plan, &cfg).unwrap_err().contains("PY"));
     }
 
     /// With Fork 3's VM image the region plan is Fork 11's real-VM builds
