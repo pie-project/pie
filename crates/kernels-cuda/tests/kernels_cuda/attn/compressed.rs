@@ -11,7 +11,7 @@ use crate::common::host::rows_read;
 use crate::common::{Gpu, Lcg, captured, forget, host::upload_to, replay};
 use dtype::Dtype::{Bf16, F32, I32, U8, U32};
 use kernels_cuda::attn::compressed::decode::{self, Pooled, Rows, Turn};
-use kernels_cuda::attn::compressed::{kv_fp8, pool as pools, prefill as pre};
+use kernels_cuda::attn::compressed::{kv_fp8, pool as pools, pool_lse, prefill as pre};
 use kernels_cuda::tensor::{KvPool, RaggedTensor, Tensor};
 
 const PAGE: usize = 64;
@@ -324,6 +324,47 @@ fn the_pool_attention_answers_the_reference() {
         let lse_got: Vec<f32> = gpu.down(lse_at, n * heads);
         let close = |(g, w): (&f32, &f32)| g == w || (g - w).abs() <= 2e-2 * w.abs().max(1.0);
         assert!(lse_got.iter().zip(&want_lse).all(close), "{what}: lse");
+        if !mma {
+            continue;
+        }
+        // A window's partial folded in and the sinks applied in the walk's
+        // epilogue, as `merge_lse` and `sink` land them.
+        let (win_raw, win) = lcg.row(n * heads * d);
+        let win_lse: Vec<f32> = (0..n * heads)
+            .map(|i| (i as f32 * 0.71).sin() * 4.0 + 2.0)
+            .collect();
+        let sinks: Vec<f32> = (0..heads).map(|h| (h as f32 * 0.37).cos() * 3.0).collect();
+        let mut folded = vec![0f32; n * heads * d];
+        for i in 0..n * heads {
+            let (lw, lp) = (win_lse[i], want_lse[i]);
+            let (a, b, l) = if lp.is_finite() {
+                let m = lw.max(lp);
+                let (x, y) = ((lw - m).exp2(), (lp - m).exp2());
+                (x / (x + y), y / (x + y), m + (x + y).log2())
+            } else {
+                (1.0, 0.0, lw)
+            };
+            let r = 1.0 / (1.0 + (sinks[i % heads] - l * std::f32::consts::LN_2).exp());
+            for j in i * d..(i + 1) * d {
+                folded[j] = (win[j] * a + want[j] * b) * r;
+            }
+        }
+        let window = (
+            ten(gpu.up(&win_raw), n, heads * d, Bf16),
+            col(&mut gpu, &win_lse, F32),
+        );
+        let sink_t = col(&mut gpu, &sinks, F32);
+        let sel_t = (top_k > 0).then(|| (ten(gpu.up(&sel), n, top_k, I32), k));
+        let f_at = gpu.zeros(n * heads * d * 2);
+        let f = &mut ten(f_at, n, heads * d, Bf16);
+        let fired = pool_lse::pool_merge_sink(
+            &ctx, qt, pos_t, req_t, sel_t, &ent, ratio, h, w, s, window, sink_t, f,
+        );
+        assert!(
+            fired.expect("the folded walk fires"),
+            "{what}: the folded walk takes it"
+        );
+        landed(&gpu, f_at, &folded, 3e-2, 0.05, &format!("{what}: folded"));
     }
 }
 

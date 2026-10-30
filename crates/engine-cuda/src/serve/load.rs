@@ -78,8 +78,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             }
             tokens => tokens,
         };
+        // only where it at least halves the fire: a trunk of few value heads seats enough lanes that the
+        // wide fire feeds its experts better (Qwen3.6-35B-A3B pf64 lost 4% at 5120 rows of 8192)
         if let Some(fit) = walk_fire_fit(&boot.trace, engine.walk_fire_rows, device.device().num_sm)
-            && fit < boot.budget.max_tokens
+            && fit * 2 <= boot.budget.max_tokens
         {
             eprintln!(
                 "engine-cuda: fires of {fit} rows where {} were asked: the chunked gated delta \
@@ -845,7 +847,13 @@ impl Shell {
             .map_or(0, |forked| forked.bytes);
         let arena_bytes = compiled.arena.bytes.max(forked_bytes);
         let mut arena = Arena::reserve(arena_bytes, &pools)?;
-        arena.ensure(&mut pools, arena_bytes)?;
+        let unscored = compiled.arena.scores_from(&boot.trace).max(
+            compiled
+                .arena_forked
+                .as_ref()
+                .map_or(0, |forked| forked.scores_from(&boot.trace)),
+        );
+        arena.ensure(&mut pools, unscored)?;
         let predicate = crate::store::rs::Predicate::reserve(
             boot.budget.max_lanes,
             crate::store::rs::snapshots(&boot.trace, |k_dim| {
@@ -1022,6 +1030,7 @@ impl Shell {
             copies: engine.copies,
             one_frame_when_short: engine.one_frame_when_short,
             seated_first: engine.seated_first,
+            prefill_lanes: engine.prefill_lanes,
             pad: engine.recording.pad(),
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),
