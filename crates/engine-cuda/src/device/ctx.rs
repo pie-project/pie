@@ -315,11 +315,17 @@ impl Context {
             Ok(Side {
                 stream,
                 cublas,
+                // a side stream's kernels launch plainly: a programmatic
+                // dependent there waits beside the main stream's kernels on
+                // the SMs they need (gpt-oss-20b decode 276 -> 236 tok/s)
                 #[cfg(not(feature = "rocm"))]
                 ctx: Ctx::on(stream)
                     .with_cublas(cublas)
                     .with_slabs(self.slabs)
-                    .with_tuning(self.ctx.tuning())
+                    .with_tuning(kernels_cuda::tuning::Tuning {
+                        pdl: false,
+                        ..self.ctx.tuning()
+                    })
                     .with_rank(self.ctx.rank()),
                 #[cfg(feature = "rocm")]
                 ctx: Ctx::on(stream)
