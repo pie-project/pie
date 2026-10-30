@@ -17,6 +17,7 @@ TOKENIZER3 = tokenizer(markers = [["<|end_of_msg|>", "[EOS]", "[EOT]"]])
 MODELS = [
     model("kimik3-2.8t", template = XTML, tokenizer = TOKENIZER3, arch = "kimi_k3", layers = 93, vocab = 163840),
     model("kimik3-mini", mini = True, template = XTML, tokenizer = TOKENIZER3, arch = "kimi_k3", layers = 8, vocab = 163840),
+    model("kimik3-l32", mini = True, template = XTML, tokenizer = TOKENIZER3, arch = "kimi_k3", layers = 32, vocab = 163840),
     model("kimik3-l4", mini = True, template = XTML, tokenizer = TOKENIZER3, arch = "kimi_k3", layers = 4, vocab = 163840),
     model("kimik3", template = KIMI, tokenizer = TOKENIZER, arch = "kimi_k3", layers = 8, vocab = 163840),
 ]
@@ -25,6 +26,7 @@ DEPLOYMENTS = [
     deployment("kimik3-2.8t", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
     deployment("kimik3-mini", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
     deployment("kimik3-mini", weights = [dtype.bf16, dtype.mxfp4a8], kv = dtype.bf16),
+    deployment("kimik3-l32", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
     deployment("kimik3-l4", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
     deployment("kimik3-l4", weights = [dtype.bf16, dtype.mxfp4a8], kv = dtype.bf16),
     deployment("kimik3", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
@@ -150,6 +152,8 @@ def released(layers, experts, res_block):
 DIMS = {
     "kimik3-2.8t": released(93, 896, 12),
     "kimik3-mini": released(8, 32, 4),
+    # 32 layers, 32 experts: deep enough that parity logits are not near-flat
+    "kimik3-l32": released(32, 32, 4),
     # The release's first four layers with every expert: the dense layer,
     # two KDA layers and an MLA one, in AttnRes blocks of two (as
     # shrink_checkpoint.py rewrites the block for four layers).
