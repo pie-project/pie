@@ -59,6 +59,19 @@ pub(crate) fn compute_capability_major() -> Option<u32> {
     }
 }
 
+/// The shared memory a block may opt into, `None` without the device half.
+#[must_use]
+pub(crate) fn max_shared_memory_per_block_optin() -> Option<u32> {
+    #[cfg(feature = "cuda")]
+    {
+        device::max_shared_memory_per_block_optin()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
+    }
+}
+
 #[must_use]
 pub const fn aligned16(addr: u64) -> bool {
     addr & 15 == 0

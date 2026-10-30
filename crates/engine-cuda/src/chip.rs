@@ -1087,6 +1087,7 @@ mod tests {
                     decode_grouped_prefill_lse: defaults.decode_grouped_prefill_lse,
                     decode_grouped_prefill_window: defaults.decode_grouped_prefill_window,
                     fa2_live: defaults.fa2_live,
+                    compressed_replay: defaults.compressed_replay,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
                 defaults,
@@ -1123,6 +1124,7 @@ mod tests {
                     || (spec.id == "kernel.sdpa.decode.grouped_prefill_window"
                         && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.fa2_live" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.sdpa.compressed_replay" && std::ptr::eq(p, &l40s))
                 {
                     continue;
                 }

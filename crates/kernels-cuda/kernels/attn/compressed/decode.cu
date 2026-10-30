@@ -55,8 +55,11 @@ struct Shape {
     static constexpr int kSLd = kKeys + 8;         // a partial score row, padded
     static constexpr int kOLd = D + 8;             // the fold's f32 row, padded
     // Tiles in flight: fp8 rows are smaller, so more of them (five below
-    // sm_90, whose 163 KiB a block six overrun by 256 bytes).
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    // sm_90, whose 163 KiB a block six overrun by 256 bytes); two bf16
+    // tiles on sm_86 and sm_89, whose opt-in tops at 99 KiB.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890)
+    static constexpr int kStages = kFp8 ? 5 : 2;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
     static constexpr int kStages = kFp8 ? 5 : 4;
 #else
     static constexpr int kStages = kFp8 ? 6 : 4;
