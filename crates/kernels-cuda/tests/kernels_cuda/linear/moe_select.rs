@@ -2,9 +2,9 @@
 //! ones that quantize their rows) and the routed MLP kept by expert,
 //! against the host's dot of each route's rows and its expert's weight.
 
-use crate::common::linear_ref::{Bench, TOL, affine, check, distance, dot, fp8_bank};
+use crate::common::linear_ref::{Bench, TOL, affine, check, distance, dot, fp8_bank, quant_e4m3};
 use crate::common::linear_ref::{glu_want, mlp, pick, t, tab, values};
-use crate::common::tc5::ue8m0;
+use crate::common::tc5::{e4m3, ue8m0};
 use crate::common::{SM100, TC5, from_bf16, to_bf16};
 use dtype::Dtype::{Bf16, E4m3, F32, I32, Nvfp4, U8};
 use kernels_cuda::linear::act_quant::{AlphaFrom, Bank, Format, Source, read_back, select};
@@ -43,6 +43,11 @@ fn bank(codes: u64, atoms: u64, [e, n, k]: [usize; 3], alpha: Option<[u64; 3]>) 
 /// for a select after.
 type Case = (K, Tuning, [usize; 5], bool, Option<Glu>, u8);
 
+/// Whether the W4A8 select's block-scaled mma.sync is this card's.
+fn w4a8_here() -> bool {
+    kernels_cuda::jit::cache::features().warp_block_scale
+}
+
 fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
     let even = tuning.moe_even_waves_from > 0;
     let what = format!("{kind:?} {ex}x{tokens}x{top} {by_token} {n}x{k} {f:?} {flags} even {even}");
@@ -60,6 +65,14 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
     let big = |i: usize| flags & 4 != 0 && i % 97 == 5;
     let raw = tab(raw.len(), |i| pick(big(i), to_bf16(65536.0), raw[i]));
     let mut a = tab(raw.len(), |i| f64::from(from_bf16(raw[i])));
+    // The W4A8 select reads its rows as MXFP8.
+    if tuning.mxfp4_w4a8_from > 0 && w4a8_here() {
+        let gran = pick(flags & 16 != 0, 128, 32);
+        for block in a.chunks_mut(gran) {
+            let (q, s) = quant_e4m3(&tab(gran, |i| block[i] as f32));
+            block.iter_mut().zip(q).for_each(|(v, q)| *v = f64::from(e4m3(q) * ue8m0(s)));
+        }
+    }
     // The bank: `rows` rows an expert, NVFP4's tensor scale a row (an
     // expert's), W4A4's input scale an expert.
     let (rows, nv) = (n << u8::from(f.is_some()), matches!(kind, K::Nv | K::A4));
@@ -116,6 +129,10 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
         (K::Affine, _) => {
             let (fs, zs) = (t(fz.0, ex, n * k / 32, U8), t(fz.1, ex, n * k / 32, U8));
             moe::matmul_select_quant(&ctx, x, mx, fs, Some(zs), r, &mut y, SEAT)
+        }
+        (K::Mx, _) if tuning.mxfp4_w4a8_from > 0 => {
+            let gran = pick(flags & 16 != 0, 128, 32);
+            moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, gran).map(|took| assert_eq!(took, w4a8_here(), "the arm takes the fire"))
         }
         (K::Mx, _) => moe::matmul_select_quant(&ctx, x, mx, sc, None, r, &mut y, SEAT),
         (K::MxBias, _) => {
@@ -181,6 +198,8 @@ fn the_routed_selects_answer_the_routed_dot() {
     let (gemv, fp32) = (Tuning { moe_grouped: false, ..d }, Tuning { mxfp4_wmma: false, ..d });
     #[rustfmt::skip]
     let mma = Tuning { mxfp4_mma_until: 65_536, mxfp4_mma_from: 1, ..d };
+    #[rustfmt::skip]
+    let w4a8 = Tuning { mxfp4_w4a8_from: 1, ..mma };
     let lean = Tuning {
         mxfp4_select_lean: true,
         ..d
@@ -252,6 +271,13 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::MxBias, mma, [8, 400, 4, 192, 2048], t, alpha, 2),
         // Hopper's wgmma slice below the staged kernel's 32 routes an expert.
         (K::Mx, mma, [8, 48, 4, 384, 1024], t, None, 0),
+        // W4A8 on sm_120a's block-scaled mma.sync (elsewhere the bf16 arms):
+        // by route over a partial 256-row tile, its GLU under scales past
+        // f16's range, V4-Flash's leg, a few routes under a live window.
+        (K::Mx, w4a8, [8, 400, 4, 320, 1024], f, None, 0),
+        (K::Mx, w4a8, [8, 400, 4, 192, 2048], t, None, 18),
+        (K::Mx, w4a8, [16, 300, 6, 512, 4096], t, None, 16),
+        (K::Mx, w4a8, [8, 5, 4, 256, 512], t, None, 1),
         (K::MxBias, mma, [8, 32, 4, 192, 2048], t, alpha, 0),
         // A K of whole 64s on Hopper's wgmma slice (gpt-oss's 2880): a
         // prefill's routes, its GLU, NVFP4's.
@@ -554,5 +580,30 @@ fn the_bf16_prefill_selects_answer_the_routed_dot() {
             }
         };
         b.check(y.ptr, &want, TOL, &what);
+    }
+}
+
+/// DeepSeek-V4-Flash's gate-up and down legs at a prefill's 8192 tokens on
+/// the W4A8 select, fired for a profiler (no host dot).
+#[test]
+#[ignore = "timing only"]
+fn w4a8_select_timing() {
+    let mut b = Bench::new(7);
+    let ctx = b.ctx().with_tuning(Tuning { mxfp4_w4a8_from: 1, ..Tuning::DEFAULT });
+    let (ex, tokens, top) = (16usize, 8192usize, 6usize);
+    for (n, k, by_token) in [(4096usize, 4096usize, true), (4096, 2048, false)] {
+        let rows_x = if by_token { tokens } else { tokens * top };
+        let (raw, _) = b.lcg.row(rows_x * k);
+        let x = t(b.up(&raw), rows_x, k, Bf16);
+        let codes = tab(ex * n * k / 2, |i| (i * 2_654_435_761 >> 7) as u8);
+        let scales = tab(ex * n * k / 32, |i| 120 + (i % 7) as u8);
+        let (mx, sc) = (t(b.up(&codes), ex, n * k / 2, U8), t(b.up(&scales), ex, n * k / 32, U8));
+        let routes = tab(tokens * top, |r| ((r / top * 3 + r % top * 5) % ex) as i32);
+        let r = t(b.up(&routes), tokens, top, I32);
+        let mut y = b.out(tokens * top, n);
+        for _ in 0..5 {
+            assert!(moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, 128).expect("fires"));
+        }
+        b.sync();
     }
 }

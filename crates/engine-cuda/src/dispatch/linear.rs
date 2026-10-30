@@ -1953,6 +1953,26 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.moe_select";
         if !linear::gemm_sm100::supported() {
+            // An MXFP4 bank against e4m3 rows, as the release asks, on the
+            // consumer Blackwells' block-scaled mma.sync (`kernel.moe.mxfp4_w4a8_from`).
+            let (codes, scales, biases, seat) = self.planes(bank);
+            if let ActQuant::E4m3 { gran } = quant
+                && matches!(codes.dtype, Dtype::Mxfp4 | Dtype::U8)
+                && biases.is_none()
+                && !seat.streams()
+                && !crate::device::alloc::is_host_pointer(codes.ptr)
+                && linear::moe::select_mxfp4_w4a8(
+                    self.ctx(),
+                    self.tensor(x),
+                    codes,
+                    scales,
+                    self.tensor(routes),
+                    &mut self.tensor(y),
+                    gran,
+                )?
+            {
+                return Ok(());
+            }
             return self.select_a16(OP, x, bank, routes, y);
         }
         let (codes, scales, biases, seat) = self.planes(bank);
