@@ -13,6 +13,7 @@ use crate::store::Pools;
 pub struct Arena {
     store: elastic::Arena,
     committed: u64,
+    reserved: u64,
 }
 
 impl Arena {
@@ -21,7 +22,21 @@ impl Arena {
         Ok(Arena {
             store: pools.reserve_arena(bytes, "activation arena")?,
             committed: 0,
+            reserved: bytes,
         })
+    }
+
+    /// Backs the whole reservation: the `attn.scores` planes over the prefix
+    /// a load commits, once a program reads them.
+    pub fn ensure_whole(&mut self, pools: &mut Pools) -> Result<()> {
+        if self.committed >= self.reserved {
+            return Ok(());
+        }
+        if pools.commit_arena(&mut self.store, self.reserved).is_err() {
+            pools.commit_beside(&mut self.store, self.reserved)?;
+        }
+        self.committed = self.reserved;
+        Ok(())
     }
 
     pub fn ensure(&mut self, pools: &mut Pools, bytes: u64) -> Result<()> {

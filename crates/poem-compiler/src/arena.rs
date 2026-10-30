@@ -393,6 +393,23 @@ impl ArenaMap {
         root(&self.placements, value)
     }
 
+    /// Where the `attn.scores` planes start: every other slot lies under it.
+    #[must_use]
+    pub fn scores_from(&self, trace: &Trace) -> u64 {
+        trace
+            .outputs
+            .iter()
+            .filter(|output| output.name == SCORES)
+            .filter_map(
+                |output| match self.placements.get(self.root(output.value).0 as usize) {
+                    Some(Placement::Arena { offset, .. }) => Some(*offset),
+                    _ => None,
+                },
+            )
+            .min()
+            .unwrap_or(self.bytes)
+    }
+
     #[must_use]
     pub fn window(&self, value: ValueId, fire: FireRows) -> Option<Extent> {
         let root = self.root(value);
@@ -634,11 +651,12 @@ pub(crate) fn carve(
         conc,
         Columns::Shared,
     );
-    let (placements, bytes) = if shared < blind {
+    let (mut placements, bytes) = if shared < blind {
         (placements, shared)
     } else {
         (conservative, blind)
     };
+    let bytes = lift_scores(trace, &mut placements, bytes);
 
     Ok(ArenaMap {
         placements,
@@ -1097,6 +1115,40 @@ fn widen(set: &mut ClassSet, by: &ClassSet) {
 }
 
 const BIND_ALIGN: u64 = 256;
+
+/// Each layer's `attn.scores` plane on top of every other slot, so a load no
+/// program reads scores from backs the arena only up to [`ArenaMap::scores_from`].
+fn lift_scores(trace: &Trace, placements: &mut [Placement], bytes: u64) -> u64 {
+    let mut lifted: Vec<usize> = Vec::new();
+    for output in trace.outputs.iter().filter(|output| output.name == SCORES) {
+        let id = root(placements, output.value).0 as usize;
+        if placements.get(id).is_some_and(Placement::is_arena) && !lifted.contains(&id) {
+            lifted.push(id);
+        }
+    }
+    if lifted.is_empty() {
+        return bytes;
+    }
+    let mut at = placements
+        .iter()
+        .enumerate()
+        .filter(|(id, _)| !lifted.contains(id))
+        .filter_map(|(_, slot)| match slot {
+            Placement::Arena { offset, bytes, .. } => Some(offset + align(*bytes)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    for id in lifted {
+        if let Placement::Arena { offset, bytes, .. } = &mut placements[id] {
+            *offset = at;
+            at += align(*bytes);
+        }
+    }
+    at
+}
+
+const SCORES: &str = "attn.scores";
 
 fn align(bytes: u64) -> u64 {
     bytes.div_ceil(BIND_ALIGN) * BIND_ALIGN
