@@ -352,6 +352,7 @@ pub fn select_fp8_w8a16(
         glu.is_some(),
         fan.route_count >= FP8_GEMM_FROM,
         4,
+        None,
     )?;
     let fire = if tiled {
         // Three stages of 64 routes' activations and 128 rows' codes, 64 of

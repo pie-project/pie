@@ -272,7 +272,7 @@ pub fn select_bf16_held(
         tiled,
         tiles,
         ksplit,
-        mut order,
+        order,
     } = select_plan(
         ctx,
         op,
@@ -280,11 +280,17 @@ pub fn select_bf16_held(
         &fan,
         experts,
         y,
-        glu.is_some(),
+        // a relu2 up select keeps its order for the down select, as a GLU's does
+        glu.is_some() || relu2,
         fan.route_count >= BF16_GEMM_FROM && x.width.is_multiple_of(64),
         // bf16 codes stream twice an fp8 bank's bytes: deeper K splits keep
         // more of them in flight (Hy4's decode +2%).
         8,
+        // the wide tile's 128-route slices laid once, not a 64-route order first
+        (fan.route_count >= BF16_GEMM_FROM
+            && x.width.is_multiple_of(64)
+            && fan.route_count.div_ceil(experts) >= 128)
+            .then_some(128),
     )?;
     if relu2 && !tiled {
         return Ok(false);
@@ -300,9 +306,6 @@ pub fn select_bf16_held(
         } else {
             64
         };
-        if bm != 64 {
-            order = route_order_sliced(ctx, op, routes, &fan, experts, bm, true, Share::No)?;
-        }
         if bm == 128 {
             let cols = if glu.is_some() { 128 } else { 256 };
             Fire::at(kernel(
