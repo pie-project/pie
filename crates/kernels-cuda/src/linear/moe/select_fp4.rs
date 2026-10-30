@@ -115,7 +115,7 @@ pub(crate) fn mxfp4_mma_worth(
 /// The most routes an expert averages that the register-held mxfp4
 /// select takes; past it, the shared-memory-staged one.
 #[cfg(feature = "cuda")]
-pub(super) const STAGED_FROM: u32 = 32;
+pub(super) const STAGED_FROM: u32 = 16;
 
 /// The fewest routes an expert averages that Hopper's staged wgmma select
 /// takes from the register-held one (DeepSeek-V4-Flash's miniature at 24 a
@@ -256,10 +256,14 @@ pub(super) fn select_mxfp4_mma(
         .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(smem))
     } else if staged {
         const STAGES: u32 = 3;
+        const WARPS: u32 = 8;
         let nv = tensor_scales.is_some();
+        let grid = [grid[0], y.width.div_ceil(cols * WARPS / 4), 1];
         Fire::at(kernel(
             SELECT_FP4_SM80,
-            &format!("::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}>"),
+            &format!(
+                "::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}, {WARPS}>"
+            ),
         ))
         .apply(
             Launch::grid(
@@ -268,7 +272,7 @@ pub(super) fn select_mxfp4_mma(
                 } else {
                     grid
                 },
-                [THREADS, 1, 1],
+                [32 * WARPS, 1, 1],
             )
             .smem(STAGES * 8 * nb * 16 * 16),
         )

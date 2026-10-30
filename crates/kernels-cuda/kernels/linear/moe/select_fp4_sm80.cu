@@ -155,8 +155,8 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_mxfp4_mma(
 /// 64: the slice's activations staged a 128-code chunk at a time in shared
 /// memory through a `kStages` cp.async ring the CTA's warps share, so a
 /// wide fire streams each expert's codes once a 64 routes, not a 32.
-template <int kNb, int kStages, int kGlu, bool kNv = false>
-__global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
+template <int kNb, int kStages, int kGlu, bool kNv = false, int kWarps = 4>
+__global__ void __launch_bounds__(32 * kWarps) moe_select_mxfp4_mma_staged(
     const bf16* __restrict__ act,
     const i32* __restrict__ order,
     const i32* __restrict__ offsets,
@@ -177,7 +177,6 @@ __global__ void __launch_bounds__(128) moe_select_mxfp4_mma_staged(
     // Four warps a CTA, each two m16 tiles of weight rows (a GLU's gate tile
     // and its up tile).
     constexpr int kTiles = 2;
-    constexpr int kWarps = 4;
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
     constexpr int kRowsCta = kWarps * kRowsWarp;
     constexpr int kSlice = 8 * kNb;
