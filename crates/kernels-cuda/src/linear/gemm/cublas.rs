@@ -1274,6 +1274,10 @@ fn build_lt_plan(
                     lt::cublasLtMatmulTile_t::CUBLASLT_MATMUL_TILE_128x128,
                     lt::cublasLtMatmulStages_t::CUBLASLT_MATMUL_STAGES_32x6,
                 ),
+                (
+                    lt::cublasLtMatmulTile_t::CUBLASLT_MATMUL_TILE_128x128,
+                    lt::cublasLtMatmulStages_t::CUBLASLT_MATMUL_STAGES_64x3,
+                ),
             ] {
                 for split in [1i32, 2, 3] {
                     let scheme = if split == 1 {
@@ -1659,7 +1663,7 @@ impl Device {
         // And one whose plan offers the heuristics retiled apart from the
         // one tuned before it did.
         let key = if retiled(call.m) {
-            key ^ 0x7469_6c65_0000_0000
+            key ^ 0x7469_6c65_0000_0001
         } else {
             key
         };
