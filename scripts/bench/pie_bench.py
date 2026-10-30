@@ -296,6 +296,8 @@ def build_config(args: argparse.Namespace):
             engine_options[key] = parsed
         if args.max_forward_requests != PIE_MAX_FORWARD_REQUESTS_DEFAULT:
             engine_options["max_forward_requests"] = args.max_forward_requests
+        elif args.mode == "tput" and args.concurrency > 0:
+            engine_options["max_forward_requests"] = args.concurrency
         if args.engine == "cuda" and getattr(args, "swap_pool_size", 0):
             engine_options["swap_pool_size"] = args.swap_pool_size
         # `--max-model-len` is ONE REQUEST's context ceiling, the knob every
