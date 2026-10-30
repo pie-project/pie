@@ -1268,7 +1268,7 @@ mod tests {
         ("serve8b_region", "head_pe.csl", "ec8349abdb11aabd454cd6113a60f9da5614f374519ab14ea162684c4148fcfe"),
         ("serve8b_region", "embed_pe.csl", "8e2769143d5e799f25483d53fb9b8aeae108b1f3e4a95ebecc65a9d967cdf65b"),
         ("serve8b_region", "filler.csl", "0f8106389be8053db738c6bb2189987e0a5716a31372b537f33dcd5aaa54fff5"),
-        ("serve8b_region", "vm_pe.csl", "70504a46ff28cc70ba62a5bcbc3e626a8dafc72869ff9721f546e565d084052e"),
+        ("serve8b_region", "vm_pe.csl", "31fa54184438f17f0666961f60c3f46b4e34ec73b95c4f0dbf3b287ab5549f54"),
         ("serve8b_region", "vm_stub.csl", "de0cae945badccacc9b9583cf74c1e47bb14fd82b8287d1b47a0defca4243dbb"),
     ];
 

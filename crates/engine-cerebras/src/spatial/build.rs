@@ -445,8 +445,15 @@ fn serve8b_region_params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Vec<(&'stat
             ("VMX", 1), ("VMREAL", 1), ("max_ops", vm.max_ops), ("nreg", vm.nreg), ("pool_words", vm.pool_words),
             ("feat", vm.feat), ("opmask_lo", lo as usize), ("opmask_hi", hi as usize), ("ring", vm.ring_d),
             ("ring_w", vm.ring_w), ("vm_rows", vm.rows), ("vm_sin", vm.step_input), ("vm_lprog", 1),
-            ("vm_pwalk", usize::from(vm.pwalk.unwrap_or(true))), ("bank_words", vm.lane_programs.unwrap_or(0)),
+            ("vm_pwalk", usize::from(vm.pwalk.unwrap_or(true))),
+            // Several lanes: 128 bank words a lane at most (Fork 11's B 4 fit:
+            // every current program's live window, 33-108 words, admits).
+            ("bank_words", if g.lanes > 1 { vm.lane_programs.unwrap_or(0).min(128 * g.lanes) } else { vm.lane_programs.unwrap_or(0) }),
             ("vm_prof", usize::from(vm.prof)), ("vm_lanes", g.lanes),
+            // Fork 3's VM options as Fork 11 fit them: the last hub's level-2
+            // list in wide; the pipelined canonical sum (2, concatenating, is
+            // B 1's once hardware shows its gain).
+            ("VML2W", 1), ("VMSUMPIPE", 1),
         ]);
         if g.lanes > 1 {
             out.push(("HLBN", 1));
@@ -936,7 +943,8 @@ mod qwen3_8b {
 
     /// With Fork 3's VM image the region plan is Fork 11's real-VM builds
     /// (scratch/fork11/fvr_params.txt: the VM block, Vr 160, HH 952, HLBN 1
-    /// at B 4), staging at B 1.
+    /// at B 4; VML2W 1, and bank_words 512 at B 4 from their later fit),
+    /// staging at B 1.
     #[test]
     fn the_plan_places_qwen3_8b_regions_with_the_vm() {
         let base = "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:240,RHc:18,RDc:4,RGs:32,RIc:48,RNL:3,RGY:16,\
@@ -944,7 +952,7 @@ mod qwen3_8b {
                     HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:952,Vr:160,Gx:8,Gy:28,vocab:151936,PASSES:3,MODE:0,\
                     OVL:0,VMC:0,CAP:64,iters:1,VMX:1,VMREAL:1,max_ops:104,nreg:12,pool_words:211,feat:1007,\
                     opmask_lo:3757088255,opmask_hi:256,ring:16,ring_w:5,vm_rows:5,vm_sin:5,vm_lprog:1,vm_pwalk:1,\
-                    bank_words:768,vm_prof:0";
+                    vm_prof:0,VML2W:1,VMSUMPIPE:1";
         let vm = VmImage {
             max_ops: 104,
             nreg: 12,
@@ -960,7 +968,10 @@ mod qwen3_8b {
             lanes: None,
             pwalk: Some(true),
         };
-        for (b, np, host, extra) in [(1, 3, false, "vm_lanes:1,B:1,NP:3,KVST:1"), (4, 1, true, "vm_lanes:4,HLBN:1,B:4,NP:1,KVST:0")] {
+        for (b, np, host, extra) in [
+            (1, 3, false, "bank_words:768,vm_lanes:1,B:1,NP:3,KVST:1"),
+            (4, 1, true, "bank_words:512,vm_lanes:4,HLBN:1,B:4,NP:1,KVST:0"),
+        ] {
             let goals = Goals { blocks: Some(1), host_copy: host, grid_lanes: b, ..Goals::lanes(b) };
             let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
             let mut cfg = ServeConfig::new(goals);

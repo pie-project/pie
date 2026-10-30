@@ -67,6 +67,8 @@ param bank_words: u16 = 0;
 param vm_prof: u16 = 0;
 param vm_lanes: u16 = 0;
 param KVST: u16 = 0;       // KV page staging slots a unit PE (Fork 4's interface; 0: none)
+param VML2W: u16 = 0;     // Fork 3's vm_l2w: 1 puts the last hub's level-2 list in wide (B4: frees ~600 B)
+param VMSUMPIPE: u16 = 1;  // Fork 3's vm_sumpipe (1 pipelined canonical sum; 2 concatenating, B1 only: +1.3 KB on the last VM column)
 param VMDBG: u16 = 0;      // Fork 3's vm_dbg (diagnostics; 0 normal)
 param HEADMODE: u16;   // 0: the host feeds layer 0 and reads the last; 2: head and strip
 param HH: u16;
@@ -154,7 +156,7 @@ layout {
           .max_ops = max_ops, .nreg = nreg, .pool_words = pool_words, .feat = feat, .ring = ring,
           .ring_w = ring_w, .vm_prof = vm_prof, .vm_lanes = vm_lanes, .vm_rows = vm_rows,
           .vm_lprog = vm_lprog, .bank_words = bank_words, .vm_pwalk = vm_pwalk, .opmask_lo = opmask_lo,
-          .opmask_hi = opmask_hi, .vm_sin = vm_sin, .vm_outside = 1, .vm_x0 = XV, .vm_dbg = VMDBG,
+          .opmask_hi = opmask_hi, .vm_sin = vm_sin, .vm_outside = 1, .vm_x0 = XV, .vm_dbg = VMDBG, .vm_sumpipe = VMSUMPIPE, .vm_l2w = VML2W,
           .vm_c_a = 18, .vm_c_b = 19, .vm_c_e = 0, .vm_c_g = 20, .vm_c_k = 17, .vm_c_vl = 2, .vm_c_vt = 3,
           .vm_c_park0 = 13, .vm_c_park1 = 10,
           .S2D_SB = B, .KVCP = KVCP, .HROUTE = HROUTE, .WS = WS, .KS = KS,
