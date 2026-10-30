@@ -393,9 +393,12 @@ fn serve8b_region_params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Vec<(&'stat
     let ncol = plan.layers - band - rc * rr * rnl;
     let c = g.py / 2;
     // With an eta VM (VMX, VM5.md): Fork 3's VM as a 5-column block east of
-    // the strip, Vr 160 vocab rows a head PE (32 a VM column) and the fewest
-    // head rows that hold the vocabulary with an even feeder-row group;
-    // without, the head as tall as the grid column, VMC 1.
+    // the strip, Vr 160 vocab rows a head PE (32 a VM column: required) and
+    // the fewest head rows HH >= vocab / Vr, even (F = HH / 2), whose feeder
+    // half F has an even row group Gy <= 28 (Gy must divide F; evenness and
+    // the cap of 28, the group the Vr 160 fits were measured at, are this
+    // plan's choices, not head2d_v10's limits); without, the head as tall
+    // as the grid column, VMC 1.
     let (hh, vr, vmc, vw) = match cfg.vm {
         Some(_) => {
             let vr = 160;
