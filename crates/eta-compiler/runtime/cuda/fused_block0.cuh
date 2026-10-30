@@ -1883,6 +1883,8 @@ __device__ __forceinline__ void ptir_fast_argmax_intrinsic(
     const m1_u32 last = input_desc.last;
     M1ArgmaxCandidate candidate{
         m1_neg_inf(), 0u, 0u, 0u};
+    float best = m1_neg_inf();
+    m1_u32 at = 0xffffffffu;
 
     // 16-byte vectors (eight bf16 or four f32 values), FLIGHT of them in
     // flight a thread before any is folded: one block scans the whole row,
@@ -1915,15 +1917,27 @@ __device__ __forceinline__ void ptir_fast_argmax_intrinsic(
             candidate = m1_argmax_combine(candidate, next);
           }
         } else {
+          float most = __uint_as_float(words[0] << 16);
 #pragma unroll
-          for (m1_u32 k = 0; k < 8u; ++k) {
-            const float value =
-                __uint_as_float((words[k >> 1] >> ((k & 1u) * 16u)) << 16);
-            const M1ArgmaxCandidate next{
-                value, v * 8u + k, m1_isnan(value) ? 0u : 1u, 0u};
-            candidate = m1_argmax_combine(candidate, next);
+          for (m1_u32 k = 1; k < 8u; ++k) {
+            most = fmaxf(most, __uint_as_float((k & 1u) ? (words[k >> 1] & 0xffff0000u)
+                                                        : (words[k >> 1] << 16)));
+          }
+          if (most > best || (at == 0xffffffffu && !m1_isnan(most))) {
+            best = most;
+            at = v;
           }
         }
+      }
+    }
+    if (at != 0xffffffffu) {
+      const M1U32x4 held = packed_row[at];
+      const m1_u32 words[4] = {held.x, held.y, held.z, held.w};
+#pragma unroll
+      for (m1_u32 k = 8u; k-- > 0u;) {
+        const float value =
+            __uint_as_float((words[k >> 1] >> ((k & 1u) * 16u)) << 16);
+        if (value == best) candidate = M1ArgmaxCandidate{value, at * 8u + k, 1u, 0u};
       }
     }
     for (m1_u32 index = vectors * per + threadIdx.x;

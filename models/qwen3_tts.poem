@@ -493,10 +493,9 @@ def predict(arm, m):
     y = ops.elemwise.add(y, arm.input("seed", dtype.bf16, "row", p.hidden))
     route = ops.gather.embed(arm.tokens(), m.route, m.codes)
     y = run_stack(arm, p, y)
-    rows = arm.readout_rows()
-    y = ops.gather.gather_rows(y, rows)
-    head, _ = ops.linear.moe_route(ops.gather.gather_rows(route, rows), m.route.shape[1], 1, routing.softmax())
+    head, _ = ops.linear.moe_route(route, m.route.shape[1], 1, routing.softmax())
     logits = ops.linear.moe_matmul_select(y, m.books_head, head, 1)
+    logits = ops.gather.gather_rows(logits, arm.readout_rows())
     output("logits", logits)
     return logits
 
