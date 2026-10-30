@@ -296,7 +296,7 @@ pub(super) fn select_mxfp4_mma(
         )
     } else if staged {
         const STAGES: u32 = 3;
-        const WARPS: u32 = 8;
+        const WARPS: u32 = 4;
         let nv = tensor_scales.is_some();
         let grid = [grid[0], y.width.div_ceil(cols * WARPS / 4), 1];
         Fire::at(kernel(
