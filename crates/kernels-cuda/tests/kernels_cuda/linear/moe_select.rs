@@ -206,6 +206,8 @@ fn the_routed_selects_answer_the_routed_dot() {
     let w4a8 = Tuning { mxfp4_w4a8_from: 1, ..mma };
     #[rustfmt::skip]
     let tma = Tuning { mxfp4_w4a8_tma: true, ..w4a8 };
+    #[rustfmt::skip]
+    let ws = Tuning { mxfp4_w4a8_ws: true, ..tma };
     let lean = Tuning {
         mxfp4_select_lean: true,
         ..d
@@ -291,6 +293,10 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Mx, tma, [8, 400, 4, 192, 2048], t, None, 18),
         (K::Mx, tma, [16, 300, 6, 512, 4096], t, None, 16),
         (K::Mx, tma, [8, 5, 4, 256, 512], t, None, 1),
+        (K::Mx, ws, [8, 400, 4, 320, 1024], f, None, 0),
+        (K::Mx, ws, [8, 400, 4, 192, 2048], t, None, 18),
+        (K::Mx, ws, [16, 300, 6, 512, 4096], t, None, 16),
+        (K::Mx, ws, [8, 5, 4, 256, 512], t, None, 1),
         (K::MxBias, mma, [8, 32, 4, 192, 2048], t, alpha, 0),
         // A K of whole 64s on Hopper's wgmma slice (gpt-oss's 2880): a
         // prefill's routes, its GLU, NVFP4's.
@@ -603,9 +609,11 @@ fn the_bf16_prefill_selects_answer_the_routed_dot() {
 fn w4a8_select_timing() {
     let mut b = Bench::new(7);
     let tma = std::env::var("W4A8_TMA").is_ok();
+    let ws = std::env::var("W4A8_WS").is_ok();
     let ctx = b.ctx().with_tuning(Tuning {
         mxfp4_w4a8_from: 1,
         mxfp4_w4a8_tma: tma,
+        mxfp4_w4a8_ws: ws,
         ..Tuning::DEFAULT
     });
     let (ex, tokens, top) = (16usize, 8192usize, 6usize);

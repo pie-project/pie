@@ -570,6 +570,7 @@ fn select_mxfp4_w4a8_tma(
         },
     )?;
     let (count, kw) = (fan.route_count as usize, x.width as usize);
+    let ws = ctx.tuning().mxfp4_w4a8_ws && ctx.smem_fits(W4A8_TMA_SMEM);
     let xq = ctx.scratch_stream(OP, "linear.mxfp4_w4a8_x", count * kw)? as u64;
     let xe = ctx.scratch_stream(OP, "linear.mxfp4_w4a8_xe", count * (kw / 32))? as u64;
     let lanes = u32::try_from(count * kw / 8).map_err(|_| refuse(OP, "too many rows"))?;
@@ -577,7 +578,7 @@ fn select_mxfp4_w4a8_tma(
         OP,
         Fire::at(kernel(
             SELECT_FP4_SM120,
-            &format!("::pie::linear::quantize_rows_mxfp8_routed<{gran}>"),
+            &format!("::pie::linear::quantize_rows_mxfp8_routed<{gran}, {ws}>"),
         ))
         .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
         &[
@@ -609,11 +610,18 @@ fn select_mxfp4_w4a8_tma(
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
     })?;
     let tiles = y.width.div_ceil(256);
-    let fire = Fire::at(kernel(
-        SELECT_FP4_SM120,
-        "::pie::linear::moe_select_mxfp4_w4a8_tma<0, 3>",
-    ))
-    .apply(Launch::grid([tiles, work_cap, 1], [512, 1, 1]).smem(W4A8_TMA_SMEM));
+    // Persistent: a CTA a multiprocessor over the (row tile, slice) jobs.
+    let sms = ctx.multiprocessors().unwrap_or(1).max(1);
+    let fire = if ws {
+        Fire::at(kernel(SELECT_FP4_SM120, "::pie::linear::moe_select_mxfp4_w4a8_ws<3>"))
+            .apply(Launch::grid([sms.min(tiles * work_cap), 1, 1], [384, 1, 1]).smem(W4A8_TMA_SMEM))
+    } else {
+        Fire::at(kernel(
+            SELECT_FP4_SM120,
+            "::pie::linear::moe_select_mxfp4_w4a8_tma<0, 3>",
+        ))
+        .apply(Launch::grid([tiles, work_cap, 1], [512, 1, 1]).smem(W4A8_TMA_SMEM))
+    };
     let map = ArgValue::of::<[u64; 16]>;
     let args = [
         map(&map_x),

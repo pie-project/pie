@@ -337,6 +337,13 @@ pub struct MoeMxfp4W4a8From(pub u32);
 #[decision(id = "kernel.moe.mxfp4_w4a8_tma", flag, default = false, tune = search)]
 pub struct MoeMxfp4W4a8Tma;
 
+/// The TMA W4A8 select warp-specialized and persistent: a producer
+/// warpgroup's lane landing the stages, two MMA warpgroups of 64x64 warps
+/// reading them by ldmatrix. Off but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_w4a8_ws", flag, default = false, tune = search)]
+pub struct MoeMxfp4W4a8Ws;
+
 /// The fewest rows a projection cut into two row halves (Qwen3.5's qkv|z)
 /// lands as two GEMMs off the weight's two slices, where
 /// `kernel.elemwise.rows_vec` is on; fewer run the GEMM and the cut.
@@ -853,6 +860,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4Fp8From>()
         .add::<MoeMxfp4W4a8From>()
         .add::<MoeMxfp4W4a8Tma>()
+        .add::<MoeMxfp4W4a8Ws>()
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
         .add::<MoeMegaUntil>()
@@ -994,6 +1002,7 @@ tuning! {
     mxfp4_fp8_from: u32 = 0, get MoeMxfp4Fp8From;
     mxfp4_w4a8_from: u32 = 0, get MoeMxfp4W4a8From;
     mxfp4_w4a8_tma: bool = false, on MoeMxfp4W4a8Tma;
+    mxfp4_w4a8_ws: bool = false, on MoeMxfp4W4a8Ws;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
     moe_mega_until: u32 = 0, get MoeMegaUntil;

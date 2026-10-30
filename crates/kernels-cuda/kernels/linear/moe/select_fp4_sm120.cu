@@ -256,8 +256,10 @@ namespace pie::linear {
 /// `quantize_rows_mxfp8` into route order: position `p` of `order` (each
 /// expert's routes contiguous) takes row `order[p] / act_div` of `x`, so an
 /// expert's slice is one box of rows for TMA. Positions past the fire's
-/// routes (`offsets[num_experts]`) are left.
-template <int kGran>
+/// routes (`offsets[num_experts]`) are left. `kSplit`: a 32's codes 8c..8c+3
+/// at 4c and 8c+4..8c+7 at 16 + 4c, as `moe_select_mxfp4_w4a8_ws`'s
+/// ldmatrix hands lane c its B words.
+template <int kGran, bool kSplit = false>
 __global__ void __launch_bounds__(128) quantize_rows_mxfp8_routed(
     const bf16* __restrict__ x, const i32* __restrict__ order, const i32* __restrict__ offsets,
     u8* __restrict__ codes, u8* __restrict__ exps, int rows, int k, int act_div, int num_experts)
@@ -275,7 +277,15 @@ __global__ void __launch_bounds__(128) quantize_rows_mxfp8_routed(
     q.load(x + static_cast<long long>(src) * k + (sl % blocks) * kGran, lane);
     if (!live) return;
     const long long at = static_cast<long long>(p) * k + (sl % blocks) * kGran;
-    *reinterpret_cast<unsigned long long*>(codes + at + (lane % Block::kLanes) * 8) = q.codes();
+    if constexpr (kSplit) {
+        const int q8 = (lane % Block::kLanes) * 8;
+        const unsigned long long w = q.codes();
+        u8* to = codes + at + (q8 & ~31) + ((q8 >> 3) & 3) * 4;
+        *reinterpret_cast<unsigned*>(to) = static_cast<unsigned>(w);
+        *reinterpret_cast<unsigned*>(to + 16) = static_cast<unsigned>(w >> 32);
+    } else {
+        *reinterpret_cast<unsigned long long*>(codes + at + (lane % Block::kLanes) * 8) = q.codes();
+    }
     const int part = lane % Block::kLanes;
     if (part % 4 == 0) exps[at / 32 + part / 4] = static_cast<u8>(q.e + 127);
 }
@@ -498,6 +508,245 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     auto factor = [](int) { return 1.f; };
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin + 8 * kNb * group,
                                       count - 8 * kNb * group, out, n, inter, row_base, g, c, limit, galpha);
+}
+
+}  // namespace pie::linear
+
+namespace pie::linear {
+
+namespace w4a8 {
+
+// Four 8x8 b16 matrices of shared memory: lane l's address the row l % 8 of
+// matrix l / 8, a lane's word i its quad's row of matrix i at 4 (lane % 4).
+__device__ __forceinline__ void ldsm4(unsigned (&r)[4], unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(addr));
+}
+
+// `mma` under byte `kJ` of each side's scale word.
+template <int kJ>
+__device__ __forceinline__ void mma_at(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1,
+                                       unsigned sa, unsigned sb) {
+    asm volatile(
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e4m3."
+        "f32.ue8m0 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, "
+        "{%13}, {%14, %15};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sa), "n"(kJ), "n"(0), "r"(sb),
+          "n"(kJ), "n"(0));
+}
+
+// `tma_2d` into this CTA's shared memory (no cluster-address path).
+__device__ __forceinline__ void tma_2d_cta(void* dst, unsigned long long* bar, const TmaMap* map, int x, int y) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%3, %4}], [%2];\n" ::"r"(saddr(dst)),
+        "l"(reinterpret_cast<unsigned long long>(map)), "r"(saddr(bar)), "r"(x), "r"(y)
+        : "memory");
+}
+
+template <int kV>
+struct Const {
+    static constexpr int value = kV;
+};
+
+}  // namespace w4a8
+
+/// `moe_select_mxfp4_w4a8_tma` warp-specialized and persistent: warp 8's
+/// lane (warpgroup 2, 40 registers a thread) issues each stage's boxes once the eight MMA warps have released it,
+/// a CTA a SM walking the (row tile, slice) jobs, row tiles fastest. An MMA
+/// warp holds 64 rows x 64 routes, both read by ldmatrix: the routes'
+/// codes as `quantize_rows_mxfp8_routed<kGran, true>` lays them (a 32's
+/// codes 8c..8c+3 at 4c, 8c+4..8c+7 at 16 + 4c), each 8-route block's B
+/// words one matrix row; the scales a byte of a chunk's word to each MMA.
+template <int kStages>
+__global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
+    const __grid_constant__ w4a8::TmaMap map_x,
+    const __grid_constant__ w4a8::TmaMap map_w,
+    const u8* __restrict__ xe,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const i32* __restrict__ work,
+    const u8* __restrict__ scales,
+    const bf16* __restrict__ bias,
+    bf16* __restrict__ out,
+    int act_div,
+    int n,
+    int k,
+    int num_experts,
+    int inter,
+    float limit,
+    float galpha)
+{
+    constexpr int kNb = 8;
+    constexpr int kTiles = 4;
+    constexpr int kX = 128 * 128;
+    constexpr int kW = 256 * 64;
+    constexpr int kStage = kX + kW;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int tiles = (n + 255) / 256;
+    const int jobs = tiles * offsets[num_experts + 1];
+    const int chunks = k >> 7;
+
+    extern __shared__ __align__(1024) unsigned char w4a8_ws_smem[];
+    unsigned char* ring = reinterpret_cast<unsigned char*>(
+        (reinterpret_cast<unsigned long long>(w4a8_ws_smem) + 1023) & ~1023ull);
+    unsigned long long* full = reinterpret_cast<unsigned long long*>(ring + kStages * kStage);
+    unsigned long long* empty = full + kStages;
+    if (tid == 0) {
+#pragma unroll
+        for (int s = 0; s < kStages; ++s) {
+            w4a8::bar_init(full + s, 1);
+            w4a8::bar_init(empty + s, 8);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    }
+    __syncthreads();
+
+    // Warpgroup 2 the producer, its registers to the MMA warpgroups.
+    if (warp >= 8) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n" ::: "memory");
+        if (warp != 8 || lane != 0) return;
+        int s = 0;
+        unsigned ph = 0;
+        for (int job = static_cast<int>(blockIdx.x); job < jobs; job += static_cast<int>(gridDim.x)) {
+            const int item = work[job / tiles];
+            const int expert = item >> 16;
+            const int begin = offsets[expert] + (item & 0xFFFF) * 128;
+            if (offsets[expert + 1] - begin <= 0) continue;
+            const int w_y = expert * n + (job % tiles) * 256;
+            for (int ch = 0; ch < chunks; ++ch) {
+                w4a8::bar_wait(empty + s, ph ^ 1);
+                unsigned char* st = ring + s * kStage;
+                w4a8::bar_expect(full + s, kStage);
+                w4a8::tma_2d_cta(st, full + s, &map_x, ch * 128, begin);
+                w4a8::tma_2d_cta(st + kX, full + s, &map_w, ch * 64, w_y);
+                w4a8::tma_2d_cta(st + kX + kW / 2, full + s, &map_w, ch * 64, w_y + 128);
+                if (++s == kStages) {
+                    s = 0;
+                    ph ^= 1;
+                }
+            }
+        }
+        return;
+    }
+
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n" ::: "memory");
+    // Warp (wr, wc): rows 64 wr, routes 64 wc of the CTA's 256 x 128.
+    const int wr = warp & 3;
+    const int wc = warp >> 2;
+    const int g = lane >> 2;
+    const int c = lane & 3;
+    const int sf_row = k >> 5;
+    const int last = offsets[num_experts] - 1;
+    // ldmatrix rows: A matrix m is tile m / 2's rows 8 (m % 2).., B matrix m
+    // block m / 2's half m % 2 (the 64B and 128B swizzles off the rows).
+    const int m = lane >> 3;
+    const unsigned ring_s = w4a8::saddr(ring);
+    const unsigned a_at = kX + (wr * 64 + 16 * (m >> 1) + 8 * (m & 1) + (lane & 7)) * 64;
+    const int a_sw = (lane >> 1) & 3;
+    const unsigned b_at = (wc * 64 + 8 * (m >> 1) + (lane & 7)) * 128;
+    const int b_sw = lane & 7;
+    const int b_h = m & 1;
+
+    float acc[kTiles][kNb][4];
+    unsigned sa[kTiles], sb[kNb], na[kTiles], nb[kNb];
+    int s = 0;
+    unsigned ph = 0;
+    for (int job = static_cast<int>(blockIdx.x); job < jobs; job += static_cast<int>(gridDim.x)) {
+        const int item = work[job / tiles];
+        const int expert = item >> 16;
+        const int begin = offsets[expert] + (item & 0xFFFF) * 128;
+        const int count = min(offsets[expert + 1] - begin, 128);
+        if (count <= 0) continue;
+        const int cta_row = (job % tiles) * 256;
+        const int row_base = cta_row + wr * 64;
+        const int live = row_base < n ? min(max(count - wc * 64, 0), 64) : 0;
+        const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+        auto load_s = [&](int ch, unsigned (&ta)[kTiles], unsigned (&tb)[kNb]) {
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t) {
+                const int row = min(row_base + 16 * t + 8 * (c & 1) + g, n - 1);
+                ta[t] = __ldg(reinterpret_cast<const unsigned*>(s_e + static_cast<long long>(row) * sf_row + ch * 4));
+            }
+#pragma unroll
+            for (int b = 0; b < kNb; ++b) {
+                const int route = min(begin + wc * 64 + 8 * b + g, last);
+                tb[b] = __ldg(reinterpret_cast<const unsigned*>(xe + static_cast<long long>(route) * sf_row + ch * 4));
+            }
+        };
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+            for (int b = 0; b < kNb; ++b)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
+        if (live > 0) load_s(0, sa, sb);
+        // A 32 of the chunk: each tile pair's A words and block pair's B
+        // words one ldmatrix; blocks past the warp's routes left.
+        auto step = [&](unsigned st, auto partial, auto jc) {
+            constexpr bool kPart = decltype(partial)::value != 0;
+            constexpr int j = decltype(jc)::value;
+            unsigned a[kTiles][4];
+#pragma unroll
+            for (int tp = 0; tp < 2; ++tp) {
+                unsigned r[4];
+                w4a8::ldsm4(r, st + a_at + tp * 2048 + ((j ^ a_sw) << 4));
+                w4a8::spread(r[0], a[2 * tp][0], a[2 * tp][2]);
+                w4a8::spread(r[1], a[2 * tp][1], a[2 * tp][3]);
+                w4a8::spread(r[2], a[2 * tp + 1][0], a[2 * tp + 1][2]);
+                w4a8::spread(r[3], a[2 * tp + 1][1], a[2 * tp + 1][3]);
+            }
+#pragma unroll
+            for (int bp = 0; bp < kNb / 2; ++bp) {
+                if (kPart && 16 * bp >= live) continue;
+                unsigned r[4];
+                w4a8::ldsm4(r, st + b_at + bp * 2048 + (((2 * j + b_h) ^ b_sw) << 4));
+#pragma unroll
+                for (int t = 0; t < kTiles; ++t)
+                    w4a8::mma_at<j>(acc[t][2 * bp], a[t], r[0], r[1], sa[t], sb[2 * bp]);
+                if (kPart && 16 * bp + 8 >= live) continue;
+#pragma unroll
+                for (int t = 0; t < kTiles; ++t)
+                    w4a8::mma_at<j>(acc[t][2 * bp + 1], a[t], r[2], r[3], sa[t], sb[2 * bp + 1]);
+            }
+        };
+        auto chunk = [&](unsigned st, auto partial) {
+            step(st, partial, w4a8::Const<0>{});
+            step(st, partial, w4a8::Const<1>{});
+            step(st, partial, w4a8::Const<2>{});
+            step(st, partial, w4a8::Const<3>{});
+        };
+        for (int ch = 0; ch < chunks; ++ch) {
+            if (live > 0 && ch + 1 < chunks) load_s(ch + 1, na, nb);
+            w4a8::bar_wait(full + s, ph);
+            const unsigned st = ring_s + s * kStage;
+            if (live == 64)
+                chunk(st, w4a8::Const<0>{});
+            else if (live > 0)
+                chunk(st, w4a8::Const<1>{});
+            __syncwarp();
+            if (lane == 0)
+                asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(w4a8::saddr(empty + s)) : "memory");
+            if (++s == kStages) {
+                s = 0;
+                ph ^= 1;
+            }
+#pragma unroll
+            for (int t = 0; t < kTiles; ++t) sa[t] = na[t];
+#pragma unroll
+            for (int b = 0; b < kNb; ++b) sb[b] = nb[b];
+        }
+        if (live <= 0) continue;
+        const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+        auto factor = [](int) { return 1.f; };
+        w4mma::w4_land<0, kTiles, kNb>(acc, factor, b_e, order, begin + wc * 64, live, out, n, inter, row_base, g,
+                                       c, limit, galpha);
+    }
 }
 
 }  // namespace pie::linear
