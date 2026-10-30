@@ -15,6 +15,9 @@ moe.bf16_mma_until = 65536
 # MiniMax-M3.1-Flash mini pf32-512 70.8k -> 94.3k, c512 23.4k -> 28.2k tok/s
 moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
+# a single-row block-FP8 projection as the GEMV over bf16 rows, the codes streamed once, as sm_90/sm_100:
+# MiniMax-M3.1-Flash mini raw decode 285 -> 304 tok/s, greedy tokens unchanged
+gemm.fp8_gemv_until = 1
 # the tensor-core attention, hyper-connection and KDA kernels A100, H100 and L40S run: DeepSeek-V4.1 mini
 # raw decode 106 -> 239 tok/s, pf16-512 5.2k -> 33.6k; DeepSeek-V4 mini pf16 32k -> 72k; Qwen3.8-Flash-Next
 # mini raw decode 455 -> 501, pf16 108k -> 140k; Kimi-K3 mini raw prefill 8.4k -> 13.4k
