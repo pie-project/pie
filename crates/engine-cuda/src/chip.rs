@@ -1035,6 +1035,14 @@ mod tests {
                     prefill_lattice_from: 256,
                     prefill_lattice_steps: 8,
                     forward_tokens: if std::ptr::eq(p, &l40s) { 2048 } else { 0 },
+                    seated_first: std::ptr::eq(p, &l40s),
+                    recording: if std::ptr::eq(p, &l40s) {
+                        Recording::Bodies {
+                            mem_megabytes: 1024,
+                        }
+                    } else {
+                        Engine::of(&registry().defaults()).recording
+                    },
                     ..Engine::of(&registry().defaults())
                 }
             );
@@ -1064,6 +1072,9 @@ mod tests {
                     bf16_mma_until: defaults.bf16_mma_until,
                     mxfp4_fp8_from: defaults.mxfp4_fp8_from,
                     ssm_kda_chunked: defaults.ssm_kda_chunked,
+                    decode_grouped_prefill_lse: defaults.decode_grouped_prefill_lse,
+                    decode_grouped_prefill_window: defaults.decode_grouped_prefill_window,
+                    fa2_live: defaults.fa2_live,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
                 defaults,
@@ -1093,6 +1104,13 @@ mod tests {
                     || (spec.id == "kernel.moe.bf16_mma_until" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.moe.mxfp4_fp8_from" && std::ptr::eq(p, &l40s))
                     || spec.id == "kernel.ssm.kda_chunked"
+                    || (spec.id == "engine.seated_first" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "engine.recording" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.sdpa.decode.grouped_prefill_lse"
+                        && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.sdpa.decode.grouped_prefill_window"
+                        && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.sdpa.fa2_live" && std::ptr::eq(p, &l40s))
                 {
                     continue;
                 }
