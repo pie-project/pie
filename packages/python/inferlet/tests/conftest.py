@@ -647,6 +647,15 @@ def _make_media() -> types.ModuleType:
     return m
 
 
+def _make_frames() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.frames")
+    m.ImageFormat = Enum("ImageFormat", "PNG JPEG WEBP RAW_RGB8 Y4M MP4_H264")
+    m.AudioFormat = Enum("AudioFormat", "WAV RAW_F32")
+    m.Frames = type("Frames", (), {})
+    m.Pcm = type("Pcm", (), {})
+    return m
+
+
 # ---------------------------------------------------------------------------
 # Installation
 # ---------------------------------------------------------------------------
@@ -680,6 +689,7 @@ def install() -> None:
         "grammar": _make_grammar(),
         "tools": _make_tools(),
         "media": _make_media(),
+        "frames": _make_frames(),
     }
     sys.modules.setdefault("componentize_py_types", _make_componentize_py_types())
 
