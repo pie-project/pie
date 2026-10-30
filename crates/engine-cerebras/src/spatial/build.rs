@@ -472,6 +472,17 @@ fn serve8b_region_params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Vec<(&'stat
     Ok(out)
 }
 
+/// Builds PIE refuses to compile: serve2d's one-sequence qwen2d grids
+/// (`GRID` 0) loaded and then hung on hardware (0150), and nothing has
+/// checked them since the paged and ring work.
+fn refused(design: Design, params: &[(String, String)]) -> R<()> {
+    let grid = params.iter().find(|(k, _)| k == "GRID").map(|(_, v)| v.trim());
+    if design == Design::Serve2d && grid == Some("0") {
+        return Err("serve2d GRID:0 is unsupported (hung on hardware, 0150); use GRID:1 with B:1 for one sequence".into());
+    }
+    Ok(())
+}
+
 /// The layout's parameters: (name, has a default), in declaration order.
 pub fn layout_params(layout: &str) -> Vec<(String, bool)> {
     layout
@@ -560,6 +571,7 @@ pub fn params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<(Design, Vec<(String, 
             None => return Err(format!("{}: the layout's `{name}` has no value", d.name())),
         }
     }
+    refused(d, &out)?;
     let unknown: Vec<&str> = set.iter().map(|(k, _)| *k).filter(|k| !decl.iter().any(|(n, _)| n == k)).collect();
     // Plan keys the other 2-D layout takes (NP, PROF on serve2d) are dropped silently;
     // pins and config keys must exist.
@@ -631,6 +643,7 @@ fn rectangle(design: Design, params: &[(String, String)]) -> R<(u32, u32)> {
 /// `pie_manifest.json`. `system`: laid out on the whole wafer.
 pub fn compile(design: Design, params: &[(String, String)], target: crate::sdk::Target, system: bool) -> R<PathBuf> {
     use crate::sdk::{Arch, Compile, Cslc};
+    refused(design, params)?;
     let files = design.files()?;
     let (w, h) = rectangle(design, params)?;
     let (fabric_dims, fabric_offsets) = crate::sdk::cslc::memcpy_fabric(w, h);
@@ -812,6 +825,29 @@ mod tiny {
         if !declared.iter().any(|(n, _)| n == "vm_lprog") {
             assert!(params(&plan, &cfg).unwrap_err().contains("vm_lprog"));
         }
+    }
+
+    /// serve2d's one-sequence grids (GRID 0) are refused, by the plan's
+    /// pins and by an explicit compile alike.
+    #[test]
+    fn serve2d_grid_0_is_refused() {
+        let (plan, mut cfg) = pipe_config();
+        cfg.goals.pipeline = false;
+        cfg.vm = None;
+        cfg.mmax = None;
+        cfg.hb = None;
+        cfg.hlm = None;
+        cfg.spec = None;
+        cfg.smp = false;
+        let plan2 = SpatialPlan::derive(&plan.spec, crate::spatial::plan::WaferDims::CS3, cfg.goals).unwrap();
+        let (d, p) = params(&plan2, &cfg).unwrap();
+        assert_eq!(d, Design::Serve2d);
+        assert!(refused(d, &p).is_ok());
+        cfg.pins.push(("GRID", 0));
+        assert!(params(&plan2, &cfg).unwrap_err().contains("GRID:0 is unsupported"));
+        let explicit = vec![("GRID".to_string(), "0".to_string())];
+        assert!(compile(Design::Serve2d, &explicit, crate::sdk::Target::Wse3, false).unwrap_err().contains("0150"));
+        assert!(refused(Design::Serve2dPipe, &explicit).is_ok());
     }
 
     #[test]
