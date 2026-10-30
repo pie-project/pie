@@ -1574,15 +1574,17 @@ mod tests {
         policy.on_fire_enqueued(stamp(c, 0, 0, 1), Some(c), 93, 256, 1);
         let queued: QueuedFireIds = [92, 93].into_iter().collect();
         assert_eq!(
-            policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now()),
-            FramePlan::Park,
-            "c's prompt binds behind a's on the card, b's decode waits to batch with a's"
+            fires(&policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now())),
+            vec![93],
+            "c's prompt seals behind a's on the card, b's decode waits to batch with a's"
         );
         policy.on_frame_retired([a, b]);
-        assert_eq!(
-            fires(&plan(&mut policy, &queued, Instant::now())),
-            vec![93],
-            "c's prompt seals while a builds its next pass"
+        assert!(
+            matches!(
+                plan(&mut policy, &queued, Instant::now()),
+                FramePlan::Hold(_)
+            ),
+            "b's decode waits for a's next pass"
         );
     }
 
