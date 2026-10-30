@@ -1,7 +1,8 @@
 //! serve8b through the engine's own wafer path on the fabric simulator (the
 //! checks of `serve8b/run.py --mode serve`): `serve8b_sim <program dir>
-//! <ckpt dir> <new> <steps2>`. B lanes of prompts [3,1,4], [7,2], [11,8,5],
-//! [6,6] (repeated), lane b on pool pages from b·NB·PY/B: one launch of
+//! <ckpt dir> <new> <steps2>`. A launch's lanes (B, or MMAX micro-batches of
+//! B on serve8b_region_pipe) of prompts [3,1,4], [7,2], [11,8,5], [6,6]
+//! (repeated), lane b of n on pool pages from b·NB·PY/n: one launch of
 //! max prompt + `new` passes, a continuation of `steps2` passes from the
 //! last token with the logits rows. Then, on any build, a page copy: lane 0's
 //! pages copied to free ones and one more pass of lane 0 on the copies next
@@ -29,7 +30,7 @@ fn main() -> Result<(), String> {
     )?;
     let Design::Grid(grid) = m.design() else { return Err("not a grid build".into()) };
     let shape = grid.paged.ok_or("not a batched build")?;
-    let (b_n, pool, ps) = (shape.lanes, shape.pages() as u32, shape.page_size);
+    let (b_n, pool, ps) = (grid.launch_lanes(), shape.pages() as u32, shape.page_size);
     let base: [&[u32]; 4] = [&[3, 1, 4], &[7, 2], &[11, 8, 5], &[6, 6]];
     let prompts: Vec<Vec<u32>> = (0..b_n).map(|b| base[b % 4].to_vec()).collect();
     let steps1 = prompts.iter().map(Vec::len).max().unwrap_or(0) + new;

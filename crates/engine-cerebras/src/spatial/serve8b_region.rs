@@ -190,7 +190,9 @@ pub fn layout(get: &dyn Fn(&str) -> Option<usize>) -> R<Layout2d> {
             blocks: p("NB")?,
             entries: p("E")?,
         }),
-        mmax: None,
+        // serve8b_region_pipe (`PIPE` 1): MMAX micro-batches of B lanes a
+        // launch round the units.
+        mmax: if get("PIPE").unwrap_or(0) == 1 { Some(p("MMAX")?) } else { None },
         host_copy: true,
         vm: None,
         hlm: None,
@@ -223,6 +225,14 @@ pub fn layout(get: &dyn Fn(&str) -> Option<usize>) -> R<Layout2d> {
         && c * 2 * lay.hc >= lay.hidden;
     if !ok {
         return Err(format!("serve8b_region params do not make a layout: {lay:?} {u:?}"));
+    }
+    if let Some(m) = lay.mmax {
+        // A ring with every unit busy can deadlock (the handoffs are
+        // synchronous); the VM block is not on the ring.
+        let n = u.units(&lay).len();
+        if m == 0 || m + 1 > n || u.vm.is_some() || lay.kvst > 0 {
+            return Err(format!("serve8b_region_pipe: MMAX {m} on {n} units, VMX {}, KVST {}", u.vm.is_some(), lay.kvst));
+        }
     }
     Ok(lay)
 }
@@ -795,6 +805,95 @@ pub fn copy_pages(lay: &Layout2d, u: &Units, rt: &mut Runtime, pairs: &[(u32, u3
     Ok(())
 }
 
+/// serve8b_region_pipe: every unit's `mtab`, micro-batch m's table in slot
+/// m of each of the unit's rows (`table_of(rows)`: `tables` for a unit of
+/// `rows` rows, one per micro-batch; unused slots zero), written by row
+/// broadcast.
+pub fn put_pipe_tables(
+    lay: &Layout2d,
+    rt: &mut Runtime,
+    table_of: &dyn Fn(usize) -> R<Vec<Vec<u32>>>,
+) -> R<()> {
+    let (shape, slots) = match (lay.paged, lay.mmax, lay.s8b) {
+        (Some(s), Some(m), Some(S8b::Units(_))) => (s, m),
+        _ => return Err("micro-batch tables on a build without serve8b_region_pipe's ring".into()),
+    };
+    let w = shape.row_words();
+    let mut made: Vec<(usize, Vec<u32>)> = Vec::new();
+    for g in lay.grid_areas() {
+        let rows = g.h as usize;
+        if !made.iter().any(|t| t.0 == rows) {
+            let tables = table_of(rows)?;
+            if tables.is_empty() || tables.len() > slots {
+                return Err(format!("{} micro-batch(es) for a ring of {slots}", tables.len()));
+            }
+            made.push((rows, pipe_rows(&tables, rows, slots, w)));
+        }
+        let mt = &made.iter().find(|t| t.0 == rows).expect("built above").1;
+        rt.memcpy_h2d_rowbcast("mtab", mt, g, slots * w, DataType::Bits32).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// A unit's `mtab` rows: row y holds slot m's `w` words, micro-batch m's
+/// table row y (`tables[m]`, `rows` rows of `w`), zero past the tables.
+fn pipe_rows(tables: &[Vec<u32>], rows: usize, slots: usize, w: usize) -> Vec<u32> {
+    let mut mt = Vec::with_capacity(rows * slots * w);
+    for y in 0..rows {
+        for m in 0..slots {
+            match tables.get(m) {
+                Some(t) => mt.extend_from_slice(&t[y * w..(y + 1) * w]),
+                None => mt.extend(std::iter::repeat_n(0, w)),
+            }
+        }
+    }
+    mt
+}
+
+/// serve8b_region_pipe's head check after a launch: each feeder PE's
+/// `perr` (mismatches, first expected, first got) between the micro-batch
+/// it expected and the index word that came with x from the last unit. Any
+/// mismatch is an error: tokens of one micro-batch taken as another's.
+pub fn check_pipe(lay: &Layout2d, rt: &mut Runtime) -> R<()> {
+    let c = lay.chunk_cols();
+    let mut pe = vec![0u32; c * 3];
+    rt.memcpy_d2h("perr", &mut pe, rect(lay.head_x(), lay.feeder(), c, 1), 3, Order::RowMajor, DataType::Bits32)
+        .map_err(|e| e.to_string())?;
+    let bad: Vec<(usize, &[u32])> = pe.chunks_exact(3).enumerate().filter(|(_, r)| r[0] != 0).collect();
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "micro-batch misalignment at the head's feeder (column: [mismatches, first expected, first got]): {bad:?}"
+        ))
+    }
+}
+
+/// serve8b_region_pipe's queue probe: a launch of no laps (the units run no
+/// pass; the head and strip only their bootstrap) that records each unit
+/// PE's output-queue status at its start (`prof[14]`). The PEs (unit, px,
+/// py, status) whose output queues are not all empty: wavelets left from
+/// the last launch.
+pub fn queue_probe(lay: &Layout2d, rt: &mut Runtime, nmb: usize) -> R<Vec<(usize, usize, usize, u32)>> {
+    let Some(S8b::Units(u)) = lay.s8b else {
+        return Err("the queue probe is serve8b_region_pipe's".into());
+    };
+    let e = |e: crate::sdk::Error| e.to_string();
+    rt.launch("compute", &[0, nmb as u32]).map_err(e)?;
+    let mut bad = Vec::new();
+    for v in u.units(lay) {
+        let (px, py) = (v.k.px, v.k.py);
+        let mut a = vec![0u32; px * py * 16];
+        rt.memcpy_d2h("prof", &mut a, rect(v.x0, v.y0, px, py), 16, Order::RowMajor, DataType::Bits32).map_err(e)?;
+        for (i, w) in a.chunks_exact(16).enumerate() {
+            if (w[14] >> 8) & 0xff != 0xff {
+                bad.push((v.idx, i % px, i / px, w[14]));
+            }
+        }
+    }
+    Ok(bad)
+}
+
 /// One VM lane's program: its table and its homes' seeds, the logits rows
 /// it reads a turn.
 pub struct VmLane<'a> {
@@ -1016,6 +1115,32 @@ mod tests {
         RNL:3,RGY:16,RC:2,RR:4,NCOL:7,RTR:4,HR:4096,Qh:4,PS:16,NB:1,E:1,MC:1,W16:1,KV16:1,KVCP:0,PROF:0,TIME:0,\
         HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,PASSES:3,MODE:0,OVL:0,VMC:1,\
         CAP:64,iters:1,B:1,NP:3";
+
+    /// serve8b_region_pipe's ring: MMAX micro-batches of B (0167's B 1 x 12
+    /// on 0125's 20 units); a ring of every unit, the VM block or staging
+    /// make no layout. A unit's mtab row y is the micro-batches' row y in
+    /// slot order, zero past them.
+    #[test]
+    fn the_pipe_ring_and_its_tables() {
+        let pipe = B1.replace("CAP:64", "CAP:32").replace("NP:3", "NP:1");
+        let lay = lay_of(&format!("{pipe},PIPE:1,MMAX:12"));
+        assert_eq!((lay.mmax, lay.launch_lanes()), (Some(12), 12));
+        assert_eq!(lay_of(&pipe).mmax, None);
+        assert_eq!(lay_of(&format!("{pipe},PIPE:0,MMAX:12")).mmax, None);
+        let of = |p: &str| {
+            let kv: Vec<(&str, usize)> =
+                p.split(',').map(|p| p.split_once(':').map(|(k, v)| (k, v.parse().unwrap())).unwrap()).collect();
+            Layout2d::of(|k| kv.iter().find(|p| p.0 == k).map(|p| p.1)).unwrap()
+        };
+        assert!(of(&format!("{pipe},PIPE:1,MMAX:19")).is_ok());
+        assert!(of(&format!("{pipe},PIPE:1,MMAX:20")).unwrap_err().contains("20 units"));
+        assert!(of(&format!("{pipe},PIPE:1,MMAX:4,KVST:1")).is_err());
+        let t = |m: u32| (0..2 * 3).map(|i| 100 * m + i).collect::<Vec<u32>>();
+        assert_eq!(
+            pipe_rows(&[t(1), t(2)], 2, 3, 3),
+            [100, 101, 102, 200, 201, 202, 0, 0, 0, 103, 104, 105, 203, 204, 205, 0, 0, 0]
+        );
+    }
 
     /// The VM's per-fire control: bit lane CAP + iteration, every VM row.
     #[test]

@@ -834,7 +834,13 @@ pub fn fire_lanes(
     // Micro-batches (one on a build without a ring).
     let mbs: Vec<&[BatchLane]> = lanes.chunks(b_n).collect();
     let slots = lay.mmax.unwrap_or(1);
+    let ring_units = lay.mmax.is_some() && matches!(lay.s8b, Some(super::serve8b::S8b::Units(_)));
     match lay.mmax {
+        // serve8b_region_pipe: each unit's own micro-batch tables (`mtab`).
+        Some(_) if ring_units => {
+            let of = |rows: usize| mbs.iter().map(|mb| table_rows(mb, rows)).collect::<R<Vec<_>>>();
+            super::serve8b_region::put_pipe_tables(lay, rt, &of)?;
+        }
         None => {
             // Every fabric row of the grids: its grid row's table row (a
             // serve8b_region unit's: its own rows').
@@ -917,6 +923,9 @@ pub fn fire_lanes(
     let read = rt.memcpy_d2h(SYM.out_tokens, &mut out, one, words, Order::RowMajor, DataType::Bits32);
     rt.wait_pending();
     read.map_err(e)?;
+    if ring_units {
+        super::serve8b_region::check_pipe(lay, rt)?;
+    }
     // Lane i is micro-batch i / B's lane i % B: [i][CAP] either way.
     let tokens: Vec<Vec<u32>> = (0..lanes.len())
         .map(|i| out[i * lay.cap..i * lay.cap + steps].to_vec())

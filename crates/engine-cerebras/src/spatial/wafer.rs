@@ -178,7 +178,7 @@ impl Design {
                 .and_then(|(_, v)| v.trim().parse().ok())
         };
         match (built.as_deref(), super::serve2d::Layout2d::of(get)) {
-            (Some("serve2d" | "serve2d_pipe" | "serve8b" | "serve8b_region") | None, Some(grid)) => grid
+            (Some("serve2d" | "serve2d_pipe" | "serve8b" | "serve8b_region" | "serve8b_region_pipe") | None, Some(grid)) => grid
                 .map(|mut g| {
                     // guest4hz's vmlane is 3 words a virtual lane, with a set B
                     // (guest4h2s, the merged guest4hz) 4.
