@@ -174,6 +174,29 @@ pub fn select_fp8_w8a8(
             Share::Take
         },
     )?;
+    // A busy expert's 128-route slices on 256-row tiles where N is whole 256s.
+    if nb == 16 && y.width.is_multiple_of(256) {
+        return ctx.fire(
+            OP,
+            Fire::at(kernel(SELECT_SM80, "::pie::linear::moe_select_fp8a8_wide")).apply(
+                Launch::grid([work_cap, y.width / 256, 1], [256, 1, 1]).smem(2 * (256 + 128) * 128),
+            ),
+            &[
+                ArgValue::Ptr(xq),
+                ArgValue::Ptr(xe),
+                ArgValue::Ptr(order),
+                ArgValue::Ptr(offsets),
+                ArgValue::Ptr(work),
+                ArgValue::Ptr(codes),
+                ArgValue::Ptr(atoms),
+                y.arg(),
+                act_div.arg(),
+                n.arg(),
+                stated(OP, x.width)?.arg(),
+                stated(OP, experts)?.arg(),
+            ],
+        );
+    }
     ctx.fire(
         OP,
         Fire::at(kernel(
