@@ -45,9 +45,9 @@ sdpa.decode.grouped_prefill_from = 8
 sdpa.decode.grouped_prefill_lse = true
 sdpa.decode.grouped_prefill_window = true
 sdpa.fa2_live = true
-# wide MXFP4 selects of a release that asks for e4m3 activations (MiMo) run W8A8 on a block-FP8
-# copy of the bank, as SGLang reads them
-moe.mxfp4_fp8_from = 256
+# wide MXFP4 selects of a release that asks for e4m3 activations (DeepSeek-V4, V4.1, MiMo) run W4A8
+# on the block-scaled mma.sync, as SGLang reads them (no block-FP8 copy of the bank)
+moe.mxfp4_w4a8_from = 256
 
 # independent chains (shared expert beside the routed ones) on side streams, as sm100 runs them:
 # Qwen3.6-35B-A3B single-request decode 170 -> 179 tok/s, greedy tokens unchanged, c128 unchanged

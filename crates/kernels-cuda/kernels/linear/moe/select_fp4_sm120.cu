@@ -98,17 +98,17 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
     constexpr int kRowsCta = kWarps * kRowsWarp;
     constexpr int kSlice = 8 * kNb * kGroups;
-    // A stage: the slice's 128 codes a route (rows 144 apart, so a warp's
-    // 8-byte reads of eight routes fall on distinct banks), a route's four
-    // scales, the CTA's 256 rows' 64 code bytes (80 apart, for its 4-byte
-    // reads), a row's four scales.
-    constexpr int kXStride = 144;
-    constexpr int kWStride = 80;
+    // A stage: the slice's 128 codes a route, each 16-byte run at its index
+    // xor the route's (so a warp's 8-byte reads of eight routes fall on
+    // distinct banks), a route's four scales, then the CTA's 256 rows' 64
+    // code bytes, each run at its index xor half the row's (the same for the
+    // 4-byte reads). The rows' scales go to registers a chunk ahead.
+    constexpr int kXStride = 128;
+    constexpr int kWStride = 64;
     constexpr int kX = kSlice * kXStride;
     constexpr int kXs = kSlice * 4;
     constexpr int kW = kWarps * 32 * kWStride;
-    constexpr int kWs = kWarps * 32 * 4;
-    constexpr int kStage = kX + kXs + kW + kWs;
+    constexpr int kStage = kX + kXs + kW;
 
     const int at = static_cast<int>(act_div == 1 ? blockIdx.y : blockIdx.x);
     if (at >= offsets[num_experts + 1]) return;
@@ -149,6 +149,18 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
     const int xr = tid >> 2;
     const int xq4 = tid & 3;
     const int xsrc = xr < count ? order[begin + xr] / act_div : -1;
+    // Each tile's row whose scale this lane hands the MMA (g at even c, g + 8
+    // at odd), its four a chunk.
+    const u8* srow[kTiles];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t) {
+        const int tile = kGlu != 0 ? row_base + t * inter : row_base + 16 * t;
+        srow[t] = s_e + static_cast<long long>(min(max(tile, 0) + 8 * (c & 1) + g, n - 1)) * sf_row;
+    }
+    auto load_s = [&](int ch, unsigned (&s)[kTiles]) {
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t) s[t] = __ldg(reinterpret_cast<const unsigned*>(srow[t] + ch * 4));
+    };
 
     extern __shared__ __align__(16) unsigned char w4a8_smem[];
     auto stage = [&](int ch) {
@@ -156,8 +168,8 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
             unsigned char* st = w4a8_smem + (ch % kStages) * kStage;
             const bool live = xsrc >= 0;
             const u8* xf = xq + static_cast<long long>(live ? xsrc : 0) * k + ch * 128 + xq4 * 16;
-            w4a8::cp16(st + xr * kXStride + xq4 * 16, xf, live ? 16 : 0);
-            w4a8::cp16(st + xr * kXStride + 64 + xq4 * 16, xf + 64, live ? 16 : 0);
+            w4a8::cp16(st + xr * kXStride + ((xq4 ^ (xr & 7)) * 16), xf, live ? 16 : 0);
+            w4a8::cp16(st + xr * kXStride + (((4 + xq4) ^ (xr & 7)) * 16), xf + 64, live ? 16 : 0);
             if (xq4 == 0) {
                 w4a8::cp4(st + kX + xr * 4, xe + static_cast<long long>(live ? xsrc : 0) * sf_row + ch * 4,
                           live ? 4 : 0);
@@ -166,8 +178,7 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
             const u8* wf = w_e + own_row * row_bytes + ch * 64;
 #pragma unroll
             for (int q = own_half * 4 / kGroups; q < (own_half + 1) * 4 / kGroups; ++q)
-                w4a8::cp16(ws + own * kWStride + q * 16, wf + q * 16, 16);
-            if (own_half == 0) w4a8::cp4(ws + kW + own * 4, s_e + static_cast<long long>(own_row) * sf_row + ch * 4, 4);
+                w4a8::cp16(ws + own * kWStride + ((q ^ ((own >> 1) & 3)) * 16), wf + q * 16, 16);
         }
         asm volatile("cp.async.commit_group;\n" ::);
     };
@@ -183,7 +194,10 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
 #pragma unroll
     for (int s = 0; s < kStages - 1; ++s) stage(s);
 
+    unsigned cs[kTiles], ns[kTiles];
+    load_s(0, cs);
     for (int ch = 0; ch < chunks; ++ch) {
+        if (ch + 1 < chunks) load_s(ch + 1, ns);
         asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 2));
         __syncthreads();
         // The ring's oldest stage, every warp past its MMAs.
@@ -192,12 +206,11 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
             const unsigned char* st = w4a8_smem + (ch % kStages) * kStage;
             const unsigned* xs = reinterpret_cast<const unsigned*>(st + kX);
             const unsigned char* ws = st + kX + kXs;
-            const unsigned* wsc = reinterpret_cast<const unsigned*>(ws + kW);
             // A row's scale from the lanes of its parity (row g at even c,
             // g + 8 at odd), a route's from its group's lanes.
             unsigned sa[kTiles], sb[kNb];
 #pragma unroll
-            for (int t = 0; t < kTiles; ++t) sa[t] = wsc[warp * 32 + t * 16 + (c & 1) * 8 + g];
+            for (int t = 0; t < kTiles; ++t) sa[t] = cs[t];
 #pragma unroll
             for (int b = 0; b < kNb; ++b) sb[b] = xs[64 * group + 8 * b + g];
 #pragma unroll
@@ -207,14 +220,16 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
                 for (int t = 0; t < kTiles; ++t)
 #pragma unroll
                     for (int h = 0; h < 2; ++h) {
+                        const int r = warp * 32 + t * 16 + h * 8 + g;
                         const unsigned w = *reinterpret_cast<const unsigned*>(
-                            ws + (warp * 32 + t * 16 + h * 8 + g) * kWStride + j * 16 + c * 4);
+                            ws + r * kWStride + ((j ^ ((r >> 1) & 3)) * 16) + c * 4);
                         w4a8::spread(w, a[t][h], a[t][2 + h]);
                     }
 #pragma unroll
                 for (int b = 0; b < kNb; ++b) {
-                    const uint2 bv =
-                        *reinterpret_cast<const uint2*>(st + (64 * group + 8 * b + g) * kXStride + j * 32 + 8 * c);
+                    const int xrow = 64 * group + 8 * b + g;
+                    const uint2 bv = *reinterpret_cast<const uint2*>(
+                        st + xrow * kXStride + (((2 * j + (c >> 1)) ^ (xrow & 7)) * 16) + 8 * (c & 1));
                     const unsigned sbj = (sb[b] >> (8 * j)) & 0xFFu;
 #pragma unroll
                     for (int t = 0; t < kTiles; ++t)
@@ -222,6 +237,8 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
                 }
             }
         }
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t) cs[t] = ns[t];
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
     if (!rows_live || count <= 64 * group) return;

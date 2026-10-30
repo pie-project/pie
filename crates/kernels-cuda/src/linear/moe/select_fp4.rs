@@ -383,11 +383,11 @@ fn w4a8_takes(ctx: &Ctx, x: Tensor, routes: Tensor) -> bool {
 /// routes' 128 codes (144 apart) and scales, 256 rows' 64 code bytes (80
 /// apart) and scales.
 #[cfg(feature = "cuda")]
-const W4A8_STAGES: u32 = 2;
+const W4A8_STAGES: u32 = 3;
 #[cfg(feature = "cuda")]
 const W4A8_GROUPS: u32 = 2;
 #[cfg(feature = "cuda")]
-const W4A8_STAGE: u32 = W4A8_GROUPS * 64 * (144 + 4) + 256 * 80 + 256 * 4;
+const W4A8_STAGE: u32 = W4A8_GROUPS * 64 * (128 + 4) + 256 * 64;
 
 /// A routed mxfp4 select whose release quantizes its rows to e4m3 in
 /// `gran`s (32 or 128), W4A8 on sm_120a's block-scaled mma.sync: `x`'s rows
