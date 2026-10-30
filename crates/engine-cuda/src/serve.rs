@@ -117,6 +117,8 @@ pub struct Shell {
     one_frame_when_short: bool,
     /// `engine.seated_first`.
     seated_first: bool,
+    /// `engine.prefill_lanes`.
+    prefill_lanes: u32,
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
