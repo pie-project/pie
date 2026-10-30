@@ -425,7 +425,8 @@ pub fn attention_lse(
             head_dim,
             sm_scale,
             o,
-            lse,
+            Some(lse),
+            None,
         );
     }
 
@@ -548,7 +549,8 @@ pub fn attention_lse_selected(
             head_dim,
             sm_scale,
             o,
-            lse,
+            Some(lse),
+            None,
         );
     }
 
