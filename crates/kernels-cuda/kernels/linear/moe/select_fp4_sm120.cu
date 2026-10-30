@@ -769,10 +769,49 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
                 for (int t = 0; t < kTiles; ++t) qa[t] = qn[t];
         }
         if (live <= 0) continue;
+        // Land each 8-route block's routes 2c, 2c + 1 (a bf16 pair a row
+        // 8m + g) transposed over the quad's eight g: lane g then holds
+        // rows 8g..8g+7 of both, a 16-byte store each.
         const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
-        auto factor = [](int) { return 1.f; };
-        w4mma::w4_land<0, kTiles, kNb>(acc, factor, b_e, order, begin + wc * 64, live, out, n, inter, row_base, g,
-                                       c, limit, galpha);
+        const int rows8 = row_base + 8 * g;
+#pragma unroll
+        for (int b = 0; b < kNb; ++b) {
+            if (8 * b >= live) continue;
+            unsigned w[8];
+#pragma unroll
+            for (int mm = 0; mm < 8; ++mm) {
+                const float add =
+                    b_e != nullptr ? bf16_to_f32(b_e[min(row_base + 8 * mm + g, n - 1)]) : 0.f;
+                w[mm] = pack_bf16x2(acc[mm >> 1][b][2 * (mm & 1)] + add, acc[mm >> 1][b][2 * (mm & 1) + 1] + add);
+            }
+#pragma unroll
+            for (int kb = 4; kb > 0; kb >>= 1) {
+                const bool up = (g & kb) != 0;
+#pragma unroll
+                for (int mm = 0; mm < 8; ++mm) {
+                    if ((mm & kb) != 0) continue;
+                    const unsigned x = __shfl_xor_sync(0xffffffffu, up ? w[mm] : w[mm | kb], kb << 2);
+                    if (up)
+                        w[mm] = x;
+                    else
+                        w[mm | kb] = x;
+                }
+            }
+            const int tok = 8 * b + 2 * c;
+            if (rows8 >= n) continue;
+            if (tok < live) {
+                const long long route = order[begin + wc * 64 + tok];
+                *reinterpret_cast<uint4*>(out + route * n + rows8) =
+                    make_uint4(__byte_perm(w[0], w[1], 0x5410), __byte_perm(w[2], w[3], 0x5410),
+                               __byte_perm(w[4], w[5], 0x5410), __byte_perm(w[6], w[7], 0x5410));
+            }
+            if (tok + 1 < live) {
+                const long long route = order[begin + wc * 64 + tok + 1];
+                *reinterpret_cast<uint4*>(out + route * n + rows8) =
+                    make_uint4(__byte_perm(w[0], w[1], 0x7632), __byte_perm(w[2], w[3], 0x7632),
+                               __byte_perm(w[4], w[5], 0x7632), __byte_perm(w[6], w[7], 0x7632));
+            }
+        }
     }
 }
 

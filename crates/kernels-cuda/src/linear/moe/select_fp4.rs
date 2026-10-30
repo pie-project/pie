@@ -570,7 +570,10 @@ fn select_mxfp4_w4a8_tma(
         },
     )?;
     let (count, kw) = (fan.route_count as usize, x.width as usize);
-    let ws = ctx.tuning().mxfp4_w4a8_ws && x.width.is_multiple_of(256) && ctx.smem_fits(W4A8_TMA_SMEM);
+    let ws = ctx.tuning().mxfp4_w4a8_ws
+        && x.width.is_multiple_of(256)
+        && y.width.is_multiple_of(8)
+        && ctx.smem_fits(W4A8_TMA_SMEM);
     let xq = ctx.scratch_stream(OP, "linear.mxfp4_w4a8_x", count * kw)? as u64;
     let xe = ctx.scratch_stream(OP, "linear.mxfp4_w4a8_xe", count * (kw / 32))? as u64;
     let lanes = u32::try_from(count * kw / 8).map_err(|_| refuse(OP, "too many rows"))?;
