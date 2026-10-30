@@ -101,8 +101,16 @@ pub(crate) fn fork_dag(
         .map(|(at, region)| forkable(region) && !touches.barrier[at])
         .collect();
 
-    let mut finish = vec![0f32; n];
-    let mut free = vec![0f32; lanes];
+    // Priced per request class: a fire runs one class, so regions of
+    // classes apart (a decode arm and a prefill one) never hold a lane
+    // against each other.
+    let classes = regions
+        .iter()
+        .filter_map(|r| r.mask.iter().max())
+        .max()
+        .map_or(1, |c| c + 1);
+    let mut finish = vec![vec![0f32; classes]; n];
+    let mut free = vec![vec![0f32; classes]; lanes];
     let mut lane_of = vec![0usize; n];
     let mut last: Vec<Option<usize>> = vec![None; lanes];
     // `synced[l][t]`: the latest region of lane `t` lane `l` has waited past.
@@ -120,7 +128,7 @@ pub(crate) fn fork_dag(
             || units_of.get(r - 1).copied().unwrap_or(0) != unit;
         if unit_first {
             unit_start = r;
-            free.fill(0.0);
+            free.iter_mut().for_each(|lane| lane.fill(0.0));
             last.fill(None);
             for row in &mut synced {
                 row.fill(None);
@@ -130,13 +138,15 @@ pub(crate) fn fork_dag(
             || regions[r + 1].phase != Phase::Capture
             || units_of.get(r + 1).copied().unwrap_or(0) != unit;
 
-        let mut ready = 0f32;
+        let mut ready = vec![0f32; classes];
         let mut need: Vec<Option<usize>> = vec![None; lanes];
         for a in unit_start..r {
             if !ordered.path(a, r) {
                 continue;
             }
-            ready = ready.max(finish[a]);
+            for (at, held) in ready.iter_mut().zip(&finish[a]) {
+                *at = at.max(*held);
+            }
             let l = lane_of[a];
             need[l] = Some(need[l].map_or(a, |held| held.max(a)));
         }
@@ -148,8 +158,24 @@ pub(crate) fn fork_dag(
                 .get(regions[r].nodes.start as usize)
                 .map_or(0, |&l| (l as usize).min(lanes - 1))
         } else {
-            let start = |l: usize| ready.max(free[l]);
-            (0..lanes)
+            // A side lane only where the region starts sooner there in every
+            // class it runs in.
+            let start = |l: usize| -> f32 {
+                regions[r]
+                    .mask
+                    .iter()
+                    .map(|c| ready[c].max(free[l][c]))
+                    .sum()
+            };
+            let sooner = |l: usize| {
+                !regions[r].mask.is_empty()
+                    && regions[r]
+                        .mask
+                        .iter()
+                        .all(|c| ready[c].max(free[l][c]) < ready[c].max(free[0][c]))
+            };
+            (1..lanes)
+                .filter(|&l| sooner(l))
                 .min_by(|&x, &y| start(x).total_cmp(&start(y)).then_with(|| x.cmp(&y)))
                 .unwrap_or(0)
         };
@@ -190,9 +216,10 @@ pub(crate) fn fork_dag(
             sources[r].push(a);
             synced[lane][t] = Some(a);
         }
-        let start = ready.max(free[lane]);
-        finish[r] = start + costs[r];
-        free[lane] = finish[r];
+        for c in regions[r].mask.iter() {
+            finish[r][c] = ready[c].max(free[lane][c]) + costs[r];
+            free[lane][c] = finish[r][c];
+        }
         lane_of[r] = lane;
         regions[r].stream = lane as u32;
         last[lane] = Some(r);
