@@ -545,6 +545,12 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
              "(flashinfer_mxfp4) wants 128-multiple widths a tp4 share is not.",
     )
     p.add_argument(
+        "--sglang-kv-cache-dtype",
+        default=None,
+        help="SGLang's KV cache dtype. Its auto pick for DSA models on SM100 and newer "
+             "(SM120 too) is fp8_e4m3; bfloat16 keeps the cache at pie's and vLLM's precision.",
+    )
+    p.add_argument(
         "--sglang-dsa-backend",
         default=None,
         help="SGLang's DSA prefill and decode kernels. Its auto pick on an "
