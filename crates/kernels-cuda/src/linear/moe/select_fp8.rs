@@ -228,8 +228,16 @@ pub fn matmul_fp8_scaled(
     }
     let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
     // 128 rows by 256 columns a CTA, two stages, for a prefill's rows; 128 by
-    // 128, three stages, for fewer.
-    let (shape, cols, stages) = if x.rows >= 2048 { ("2, 4, 4, 8, 2", 256, 2) } else { ("2, 4, 4, 4, 3", 128, 3) };
+    // 128, three stages, where those still fill four waves; else 64 by 64, two
+    // CTAs an SM (a decode batch's 512 rows over a 13824-wide plane).
+    let sms = ctx.multiprocessors().unwrap_or(132);
+    let (shape, rows, cols, stages, threads) = if x.rows >= 2048 {
+        ("2, 4, 4, 8, 2", 128, 256, 2, 256)
+    } else if x.rows.div_ceil(128) * y.width.div_ceil(128) >= 4 * sms {
+        ("2, 4, 4, 4, 3", 128, 128, 3, 256)
+    } else {
+        ("2, 2, 2, 4, 3", 64, 64, 3, 128)
+    };
     ctx.fire(
         OP,
         Fire::at(kernel(
@@ -237,8 +245,8 @@ pub fn matmul_fp8_scaled(
             &format!("::pie::linear::fp8_dense_scaled<{shape}>"),
         ))
         .apply(
-            Launch::grid([y.width.div_ceil(cols), x.rows.div_ceil(128), 1], [256, 1, 1])
-                .smem(stages * (128 + cols) * 128),
+            Launch::grid([y.width.div_ceil(cols), x.rows.div_ceil(rows), 1], [threads, 1, 1])
+                .smem(stages * (rows + cols) * 128),
         ),
         &[
             ArgValue::Ptr(xq),
