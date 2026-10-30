@@ -117,6 +117,8 @@ pub struct Shell {
     one_frame_when_short: bool,
     /// `engine.seated_first`.
     seated_first: bool,
+    /// `engine.prefill_lanes`.
+    prefill_lanes: u32,
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
@@ -774,6 +776,16 @@ impl Shell {
         adopted: &[Option<std::sync::Arc<crate::program::Endpoint>>],
         ids: &[engine::ChannelId],
     ) -> Result<engine::InstanceId> {
+        let reads_scores = self.programs.program(program_id).is_some_and(|program| {
+            program
+                .plan
+                .outputs()
+                .iter()
+                .any(|(name, _)| *name == "attn.scores")
+        });
+        if reads_scores {
+            self.arena.ensure_whole(&mut self.pools)?;
+        }
         let stream = self.device.stream();
         let buffers_rs = self.buffers.is_some();
         self.programs.bind(

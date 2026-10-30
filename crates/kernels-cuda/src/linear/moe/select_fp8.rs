@@ -245,8 +245,11 @@ pub fn matmul_fp8_scaled(
             &format!("::pie::linear::fp8_dense_scaled<{shape}>"),
         ))
         .apply(
-            Launch::grid([y.width.div_ceil(cols), x.rows.div_ceil(rows), 1], [threads, 1, 1])
-                .smem(stages * (rows + cols) * 128),
+            Launch::grid(
+                [y.width.div_ceil(cols), x.rows.div_ceil(rows), 1],
+                [threads, 1, 1],
+            )
+            .smem(stages * (rows + cols) * 128),
         ),
         &[
             ArgValue::Ptr(xq),
