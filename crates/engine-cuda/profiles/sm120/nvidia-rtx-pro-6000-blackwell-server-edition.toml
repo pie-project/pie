@@ -29,6 +29,9 @@ ssm.conv_vec4 = true
 ssm.gdn_out_bf16 = true
 attn_res.fused_norm = true
 gemm.fp8_shadow = true
+# kernels launch as programmatic dependents, as on the RTX 5090: Qwen3-0.6B single-request decode
+# 1.58 -> 1.50 ms a token, greedy tokens unchanged
+pdl = true
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"
