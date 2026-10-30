@@ -722,7 +722,7 @@ impl KvStore {
         let mut order: Vec<_> = groups
             .into_iter()
             .map(|((_, key, decoded), (ids, last_use))| {
-                let frees = self.table.device_pages_freed(&self.roots(&ids)) > 0;
+                let frees = self.table.frees_device_pages(&self.roots(&ids));
                 ((!frees, key, !decoded, last_use), (key, ids))
             })
             .collect();

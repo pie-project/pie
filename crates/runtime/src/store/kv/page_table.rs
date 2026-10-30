@@ -1523,6 +1523,29 @@ impl KvPageTable {
     /// A root whose pages all went below the device, or that shares them with a
     /// live reader, frees none.
     pub fn device_pages_freed(&self, roots: &[NodeId]) -> u32 {
+        let (through, exact) = self.anchors(roots);
+        through
+            .iter()
+            .map(|(&node, &dropped)| self.node_pages_freed(node, dropped, &through, &exact))
+            .sum()
+    }
+
+    /// Whether dropping `roots` frees any device page: `device_pages_freed`
+    /// read leaf first, stopping at the first node that frees one, so a prefix
+    /// every cached prompt shares is not walked child by child for each group.
+    pub fn frees_device_pages(&self, roots: &[NodeId]) -> bool {
+        let (through, exact) = self.anchors(roots);
+        let mut seen = FxHashSet::default();
+        roots
+            .iter()
+            .flat_map(|&root| self.path_nodes(root))
+            .any(|node| {
+                seen.insert(node)
+                    && self.node_pages_freed(node, through[&node], &through, &exact) > 0
+            })
+    }
+
+    fn anchors(&self, roots: &[NodeId]) -> (HashMap<NodeId, u32>, HashMap<NodeId, u32>) {
         let mut through: HashMap<NodeId, u32> = HashMap::new();
         let mut exact: HashMap<NodeId, u32> = HashMap::new();
         for &root in roots {
@@ -1531,46 +1554,50 @@ impl KvPageTable {
                 *through.entry(node).or_insert(0) += 1;
             }
         }
-        through
-            .iter()
-            .map(|(&node, &dropped)| {
-                let Some(entry) = self.nodes.get(node) else {
-                    return 0;
-                };
-                let Pages::Owned { backings, .. } = &entry.pages else {
-                    return 0;
-                };
-                let resident =
-                    |index: &usize| matches!(backings[*index], KvPageBacking::Resident(_));
-                if entry.path_anchors == dropped {
-                    return (0..backings.len()).filter(resident).count() as u32;
-                }
-                // Only selections still read it: it keeps the pages they take.
-                if entry.exact_anchors != exact.get(&node).copied().unwrap_or(0)
-                    || self
-                        .swap_locations
-                        .iter()
-                        .any(|location| location.node == node)
-                {
-                    return 0;
-                }
-                let mut taken = Vec::new();
-                for child in &entry.children {
-                    let child_entry = self.nodes.get(*child).expect("live child");
-                    if child_entry.path_anchors == through.get(child).copied().unwrap_or(0) {
-                        continue;
-                    }
-                    match &child_entry.pages {
-                        Pages::ParentSelection { runs } => taken.extend(runs.iter().cloned()),
-                        Pages::Owned { .. } => return 0,
-                    }
-                }
-                let kept: HashSet<u32> = union(taken).into_iter().flatten().collect();
-                (0..backings.len())
-                    .filter(|index| resident(index) && !kept.contains(&(*index as u32)))
-                    .count() as u32
-            })
-            .sum()
+        (through, exact)
+    }
+
+    fn node_pages_freed(
+        &self,
+        node: NodeId,
+        dropped: u32,
+        through: &HashMap<NodeId, u32>,
+        exact: &HashMap<NodeId, u32>,
+    ) -> u32 {
+        let Some(entry) = self.nodes.get(node) else {
+            return 0;
+        };
+        let Pages::Owned { backings, .. } = &entry.pages else {
+            return 0;
+        };
+        let resident = |index: &usize| matches!(backings[*index], KvPageBacking::Resident(_));
+        if entry.path_anchors == dropped {
+            return (0..backings.len()).filter(resident).count() as u32;
+        }
+        // Only selections still read it: it keeps the pages they take.
+        if entry.exact_anchors != exact.get(&node).copied().unwrap_or(0)
+            || self
+                .swap_locations
+                .iter()
+                .any(|location| location.node == node)
+        {
+            return 0;
+        }
+        let mut taken = Vec::new();
+        for child in &entry.children {
+            let child_entry = self.nodes.get(*child).expect("live child");
+            if child_entry.path_anchors == through.get(child).copied().unwrap_or(0) {
+                continue;
+            }
+            match &child_entry.pages {
+                Pages::ParentSelection { runs } => taken.extend(runs.iter().cloned()),
+                Pages::Owned { .. } => return 0,
+            }
+        }
+        let kept: HashSet<u32> = union(taken).into_iter().flatten().collect();
+        (0..backings.len())
+            .filter(|index| resident(index) && !kept.contains(&(*index as u32)))
+            .count() as u32
     }
 
     /// Dropping what holds it would change pages under the move.
