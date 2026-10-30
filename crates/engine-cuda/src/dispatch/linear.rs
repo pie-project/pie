@@ -2075,8 +2075,8 @@ impl Run<'_> {
         )
     }
 
-    /// [`linear::moe::matmul_fp8_scaled`] for a batch's rows (past the decode
-    /// widths the W8A16 kernels take) of a resident 128x128-block FP8 plane;
+    /// [`linear::moe::matmul_fp8_scaled`] for a batch's rows (128 or more: fewer
+    /// read the bf16 copy faster) of a resident 128x128-block FP8 plane;
     /// `false` where it does not take them.
     #[cfg(feature = "cuda")]
     fn fp8_scaled_matmul(
@@ -2093,7 +2093,7 @@ impl Run<'_> {
             || atoms.dtype != Dtype::U8
             || atoms.width == 0
             || act.width.div_ceil(atoms.width) != 128
-            || act.rows <= linear::w8a16::MMA_UNTIL
+            || act.rows < 128
             || crate::device::alloc::is_host_pointer(codes.ptr)
         {
             return Ok(false);
