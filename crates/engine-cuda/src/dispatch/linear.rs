@@ -2272,6 +2272,15 @@ impl Run<'_> {
         }
         let act = self.tensor(act);
         let mut out = self.tensor(y);
+        // A batch's rows of an MXFP8 plane quantized 1x32 as the checkpoint
+        // declares them, on cuBLASLt's MXFP8 GEMM where it has one (sm_120).
+        if act.rows > linear::w8a16::MMA_UNTIL
+            && atoms.width > 0
+            && act.width == atoms.width * 32
+            && linear::gemm::cublas_lt_fp8::matmul_mx(self.ctx(), op, act, codes.ptr, atoms.ptr, &mut out)?
+        {
+            return Ok(());
+        }
         // A batch's rows on the plane's bf16 copy (`kernel.gemm.fp8_shadow`).
         if act.rows > linear::w8a16::MMA_UNTIL
             && let Some(shadow) = self.fp8_shadow(w)

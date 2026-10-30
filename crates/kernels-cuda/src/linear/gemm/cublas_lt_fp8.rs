@@ -55,7 +55,7 @@ impl Drop for Plan {
     }
 }
 
-type Key = (i32, u32, u32, u32, usize);
+type Key = (i32, u32, u32, u32, usize, bool);
 
 struct Lt {
     handles: HashMap<i32, usize>,
@@ -81,7 +81,7 @@ fn device() -> i32 {
 
 /// The descriptors of a `[m, k] x [n, k]^T` product, and the first algorithm
 /// cuBLASLt offers for it; `None` where it offers none.
-fn build(handle: lt::cublasLtHandle_t, m: u32, n: u32, k: u32, workspace: usize) -> Option<Plan> {
+fn build(handle: lt::cublasLtHandle_t, m: u32, n: u32, k: u32, workspace: usize, mx: bool) -> Option<Plan> {
     let mut plan = Plan {
         desc: std::ptr::null_mut(),
         a: std::ptr::null_mut(),
@@ -114,10 +114,18 @@ fn build(handle: lt::cublasLtHandle_t, m: u32, n: u32, k: u32, workspace: usize)
         cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
         cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
     );
-    let (sa, sb) = (
-        lt::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_BLK128x128_32F,
-        lt::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC128_32F,
-    );
+    // `mx`: MXFP8, a ue8m0 exponent a 1x32 block on both sides, in tcgen05's atoms
+    let (sa, sb) = if mx {
+        (
+            lt::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0,
+            lt::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0,
+        )
+    } else {
+        (
+            lt::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_BLK128x128_32F,
+            lt::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC128_32F,
+        )
+    };
     let op = std::mem::size_of::<cudarc::cublas::sys::cublasOperation_t>();
     let mode = std::mem::size_of::<lt::cublasLtMatmulMatrixScale_t>();
     if !(set(
@@ -228,6 +236,7 @@ fn plan_for(
     n: u32,
     k: u32,
     workspace: usize,
+    mx: bool,
 ) -> Option<(lt::cublasLtHandle_t, Arc<Mutex<Plan>>)> {
     let mut st = state().lock().expect("lock poisoned");
     let dev = device();
@@ -246,8 +255,8 @@ fn plan_for(
     };
     let plan = st
         .plans
-        .entry((dev, m, n, k, workspace))
-        .or_insert_with(|| build(handle, m, n, k, workspace).map(|p| Arc::new(Mutex::new(p))))
+        .entry((dev, m, n, k, workspace, mx))
+        .or_insert_with(|| build(handle, m, n, k, workspace, mx).map(|p| Arc::new(Mutex::new(p))))
         .clone()?;
     Some((handle, plan))
 }
@@ -354,7 +363,7 @@ pub fn matmul(
     // cuBLASLt takes the rows in whole fours; the padding rows are zero.
     let mpad = m.div_ceil(4) * 4;
     let workspace = (ctx.tuning().gemm_workspace_mb as usize) << 20;
-    let Some((handle, plan)) = plan_for(mpad, n, k, workspace) else {
+    let Some((handle, plan)) = plan_for(mpad, n, k, workspace, false) else {
         return Ok(false);
     };
     let blocks = k / 128;
@@ -389,6 +398,30 @@ pub fn matmul(
             stated(op, k)?.arg(),
         ],
     )?;
+    run(ctx, op, handle, &plan, workspace, codes, ws_scales, xq, xs, d, y, m, mpad, n, k)
+}
+
+/// The plan's product of `codes` (scales at `a_scales`) and the quantized rows
+/// `xq` (scales at `xs`) into `d`, its first `m` rows copied to `y` where padded.
+#[allow(clippy::too_many_arguments)]
+fn run(
+    ctx: &Ctx,
+    op: &'static str,
+    handle: lt::cublasLtHandle_t,
+    plan: &Mutex<Plan>,
+    workspace: usize,
+    codes: u64,
+    ws_scales: u64,
+    xq: u64,
+    xs: u64,
+    d: u64,
+    y: &mut Tensor,
+    m: u32,
+    mpad: u32,
+    n: u32,
+    k: u32,
+) -> Result<bool, Error> {
+    let _ = mpad;
     let plan = plan.lock().expect("plan lock poisoned");
     let slab = ctx.scratch_stream(op, LT_WORKSPACE, workspace)?;
     use lt::cublasLtMatmulDescAttributes_t as A;
@@ -469,4 +502,57 @@ pub fn matmul(
         }
     }
     Ok(true)
+}
+
+/// `y = q(act) . W^T` for an `n x k` MXFP8 plane (`codes`, a ue8m0 exponent a
+/// 1x32 block in tcgen05's atoms at `atoms`), `q` the rows' e4m3 1x32 (MXFP8)
+/// quantization, as the checkpoint's activations are declared: cuBLASLt's
+/// block-scaled FP8 GEMM where there is no tcgen05 one (sm_120). `Ok(false)`
+/// for a shape or device cuBLASLt does not take.
+pub fn matmul_mx(
+    ctx: &Ctx,
+    op: &'static str,
+    act: Tensor,
+    codes: u64,
+    atoms: u64,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    use crate::linear::act_quant;
+    let (m, n, k) = (act.rows, y.width, act.width);
+    if act.dtype != Dtype::Bf16
+        || y.dtype != Dtype::Bf16
+        || y.rows != m
+        || m == 0
+        || !n.is_multiple_of(128)
+        || !k.is_multiple_of(128)
+    {
+        return Ok(false);
+    }
+    // the rows in whole 128s, the scales' tile: the padding rows' products are dropped
+    let mpad = m.div_ceil(128) * 128;
+    let workspace = (ctx.tuning().gemm_workspace_mb as usize) << 20;
+    let Some((handle, plan)) = plan_for(mpad, n, k, workspace, true) else {
+        return Ok(false);
+    };
+    let scratch = |name, bytes: u64| -> Result<u64, Error> {
+        Ok(ctx.scratch_stream(op, name, usize::try_from(bytes).unwrap_or(usize::MAX))? as u64)
+    };
+    let xq = scratch("linear.lt_mx_x", u64::from(mpad) * u64::from(k))?;
+    let atom_bytes = (mpad / 128) as usize * (k / 128) as usize * 512;
+    let xs = act_quant::atoms_of(ctx, op, "linear.lt_mx_xs", atom_bytes)?;
+    act_quant::quantize(
+        ctx,
+        op,
+        act_quant::Format::E4m3 { gran: 32 },
+        act_quant::Source::rows(act, None),
+        xq,
+        xs,
+        atom_bytes,
+    )?;
+    let d = if mpad == m {
+        y.ptr
+    } else {
+        scratch("linear.lt_mx_d", u64::from(mpad) * u64::from(n) * 2)?
+    };
+    run(ctx, op, handle, &plan, workspace, codes, atoms, xq, xs, d, y, m, mpad, n, k)
 }
