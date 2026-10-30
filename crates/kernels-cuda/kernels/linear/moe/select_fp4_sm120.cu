@@ -258,7 +258,8 @@ namespace pie::linear {
 /// expert's slice is one box of rows for TMA. Positions past the fire's
 /// routes (`offsets[num_experts]`) are left. `kSplit`: a 32's codes 8c..8c+3
 /// at 4c and 8c+4..8c+7 at 16 + 4c, as `moe_select_mxfp4_w4a8_ws`'s
-/// ldmatrix hands lane c its B words.
+/// ldmatrix hands lane c its B words, and the exponents a 128-chunk's word
+/// a route, chunk-major (`[k / 128][routes]`), an 8-route block's one sector.
 template <int kGran, bool kSplit = false>
 __global__ void __launch_bounds__(128) quantize_rows_mxfp8_routed(
     const bf16* __restrict__ x, const i32* __restrict__ order, const i32* __restrict__ offsets,
@@ -287,7 +288,13 @@ __global__ void __launch_bounds__(128) quantize_rows_mxfp8_routed(
         *reinterpret_cast<unsigned long long*>(codes + at + (lane % Block::kLanes) * 8) = q.codes();
     }
     const int part = lane % Block::kLanes;
-    if (part % 4 == 0) exps[at / 32 + part / 4] = static_cast<u8>(q.e + 127);
+    if (part % 4 != 0) return;
+    if constexpr (kSplit) {
+        const int b32 = (sl % blocks) * (kGran / 32) + part / 4;
+        exps[(static_cast<long long>(b32 >> 2) * total + p) * 4 + (b32 & 3)] = static_cast<u8>(q.e + 127);
+    } else {
+        exps[at / 32 + part / 4] = static_cast<u8>(q.e + 127);
+    }
 }
 
 namespace w4a8 {
@@ -654,7 +661,8 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
     const int b_h = m & 1;
 
     float acc[kTiles][kNb][4];
-    unsigned sa[kTiles], sb[kNb], na[kTiles], nb[kNb];
+    unsigned sa[kTiles], sb[kNb], nb[kNb];
+    uint2 qa[kTiles], qn[kTiles];
     int s = 0;
     unsigned ph = 0;
     for (int job = static_cast<int>(blockIdx.x); job < jobs; job += static_cast<int>(gridDim.x)) {
@@ -667,16 +675,24 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
         const int row_base = cta_row + wr * 64;
         const int live = row_base < n ? min(max(count - wc * 64, 0), 64) : 0;
         const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
-        auto load_s = [&](int ch, unsigned (&ta)[kTiles], unsigned (&tb)[kNb]) {
+        // The rows' scales four chunks a load: lane c's row (g, or g + 8 at
+        // odd c) at chunks 4q + 2 (c / 2).., a chunk's word shuffled from
+        // its lane; the routes' a chunk (chunk-major, a block one sector).
+        auto load_a = [&](int q, uint2 (&ta)[kTiles]) {
+            const int from = 4 * q + 2 * (c >> 1);
 #pragma unroll
             for (int t = 0; t < kTiles; ++t) {
                 const int row = min(row_base + 16 * t + 8 * (c & 1) + g, n - 1);
-                ta[t] = __ldg(reinterpret_cast<const unsigned*>(s_e + static_cast<long long>(row) * sf_row + ch * 4));
+                ta[t] = from < chunks ? __ldg(reinterpret_cast<const uint2*>(
+                                            s_e + static_cast<long long>(row) * sf_row + from * 4))
+                                      : make_uint2(0u, 0u);
             }
+        };
+        auto load_b = [&](int ch, unsigned (&tb)[kNb]) {
 #pragma unroll
             for (int b = 0; b < kNb; ++b) {
                 const int route = min(begin + wc * 64 + 8 * b + g, last);
-                tb[b] = __ldg(reinterpret_cast<const unsigned*>(xe + static_cast<long long>(route) * sf_row + ch * 4));
+                tb[b] = __ldg(reinterpret_cast<const unsigned*>(xe) + static_cast<long long>(ch) * (last + 1) + route);
             }
         };
 #pragma unroll
@@ -685,7 +701,10 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
             for (int b = 0; b < kNb; ++b)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
-        if (live > 0) load_s(0, sa, sb);
+        if (live > 0) {
+            load_a(0, qa);
+            load_b(0, sb);
+        }
         // A 32 of the chunk: each tile pair's A words and block pair's B
         // words one ldmatrix; blocks past the warp's routes left.
         auto step = [&](unsigned st, auto partial, auto jc) {
@@ -722,7 +741,14 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
             step(st, partial, w4a8::Const<3>{});
         };
         for (int ch = 0; ch < chunks; ++ch) {
-            if (live > 0 && ch + 1 < chunks) load_s(ch + 1, na, nb);
+            if (live > 0) {
+                if (ch + 1 < chunks) load_b(ch + 1, nb);
+                if ((ch & 3) == 0 && ch + 4 < chunks) load_a((ch >> 2) + 1, qn);
+                const int i = ch & 3;
+                const int src = (lane & ~3) | (c & 1) | (i & 2);
+#pragma unroll
+                for (int t = 0; t < kTiles; ++t) sa[t] = __shfl_sync(0xffffffffu, (i & 1) ? qa[t].y : qa[t].x, src);
+            }
             w4a8::bar_wait(full + s, ph);
             const unsigned st = ring_s + s * kStage;
             if (live == 64)
@@ -737,9 +763,10 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
                 ph ^= 1;
             }
 #pragma unroll
-            for (int t = 0; t < kTiles; ++t) sa[t] = na[t];
-#pragma unroll
             for (int b = 0; b < kNb; ++b) sb[b] = nb[b];
+            if ((ch & 3) == 3)
+#pragma unroll
+                for (int t = 0; t < kTiles; ++t) qa[t] = qn[t];
         }
         if (live <= 0) continue;
         const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
