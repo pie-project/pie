@@ -147,6 +147,34 @@ impl VmLayout {
         })
     }
 
+    /// Set B of a two-set head (serve2d_pipe's `VMB` columns right after
+    /// this set's VM columns, its own image): its geometry and its own
+    /// limits (the `b_` params), for a program to be weighed against the
+    /// image it would run on. `None` without a set B.
+    pub fn set_b(&self, get: impl Fn(&str) -> Option<usize>) -> Option<VmLayout> {
+        let cols = get("VMB").filter(|&c| c > 0)?;
+        let vr = get("Vr")?;
+        if vr % cols != 0 {
+            return None;
+        }
+        let half = |k: &str| get(k).map_or(0xffff_ffff, |v| v as u64 & 0xffff_ffff);
+        Some(VmLayout {
+            root: self.root + self.cols,
+            cols,
+            vr: vr / cols,
+            max_ops: get("b_max_ops")?,
+            nreg: get("b_nreg")?,
+            pool_words: get("b_pool_words")?,
+            feat: get("b_feat").unwrap_or(self.feat as usize) as u32,
+            opmask: half("b_opmask_lo") | half("b_opmask_hi") << 32,
+            sin: get("b_vm_sin").unwrap_or(0),
+            lprog: get("b_vm_lprog").unwrap_or(0) != 0,
+            bank_words: get("b_bank_words").unwrap_or(0),
+            // The head (where `gmode` lives) is the same two-set head.
+            ..*self
+        })
+    }
+
     /// Block b's VM column j.
     pub fn column_j(&self, b: usize, j: usize) -> usize {
         self.x0 + b * self.block_cols + self.root + 1 + j
@@ -221,6 +249,14 @@ impl VmLayout {
         }
         if !table.wide_outputs.is_empty() {
             return Some("vocabulary-wide host outputs (read from the VM's registers)".into());
+        }
+        // A per-lane-program image keeps each lane's window in its bank: one
+        // past the bank never fits, however few lanes run beside it.
+        if self.lprog {
+            let words = super::slots::Window::of(table).words(self.vr);
+            if words > self.bank_words {
+                return Some(format!("a window of {words} words; the image's bank holds {}", self.bank_words));
+            }
         }
         None
     }
@@ -790,5 +826,71 @@ mod tests {
         // Top-p's mass pivot (F_PMASS, 512) on an image built at 511.
         let (pmass, _) = case_table(&case(8 | 512)).unwrap();
         assert!(lay.refuses(&pmass).unwrap().contains("0x200"));
+    }
+
+    /// serve2d_pipe's two VM sets as built: set A at 0156's params, set B at
+    /// a7f3031cb's (radix top-k: pool 776, bank 600, nreg 6, 136 ops, op 28
+    /// out of its mask).
+    fn pipe_sets() -> (VmLayout, VmLayout) {
+        let params = [
+            ("VM", 1), ("VMC", 6), ("PY", 128), ("Gx", 16), ("HH", 792), ("Vr", 192), ("feat", 1007), ("vocab", 151_936),
+            ("max_ops", 104), ("nreg", 12), ("pool_words", 211), ("vm_lprog", 1), ("bank_words", 520),
+            ("opmask_lo", 3_757_088_255), ("opmask_hi", 256),
+            ("VMB", 6), ("b_max_ops", 136), ("b_nreg", 6), ("b_pool_words", 776), ("b_vm_lprog", 1), ("b_bank_words", 600),
+            ("b_opmask_lo", 2_146_450_875 & !(1 << 28)), ("b_opmask_hi", 256),
+        ];
+        let get = |k: &str| params.iter().find(|p| p.0 == k).map(|p| p.1);
+        let a = VmLayout::serve2d(512, get).unwrap();
+        let b = a.set_b(get).unwrap();
+        (a, b)
+    }
+
+    /// A program of `ins` instructions with Fork 3's real-vocabulary shape:
+    /// `nreg` wide registers, `pool` pool words, a bank window of `window`
+    /// pool words and one wide register (W1).
+    fn program(ins: usize, nreg: u32, pool: u32, window: u32) -> Table {
+        let case = serde_json::json!({"table": vec![[0, 0, 0, 0, 0, 0]; ins], "homes": [], "outputs": [], "seeds": {},
+                                      "tok_home": 0, "nreg": nreg, "pool_words": pool, "feat": 0,
+                                      "bank_pool": [[0, window]], "bank_regs": [1]});
+        case_table(&case).unwrap().0
+    }
+
+    #[test]
+    fn set_b_sits_after_set_a_s_columns_with_its_own_limits() {
+        let (a, b) = pipe_sets();
+        assert_eq!(b.column_j(0, 0), a.column_j(0, 5) + 1);
+        assert_eq!((b.vr, b.max_ops, b.nreg, b.pool_words, b.bank_words), (32, 136, 6, 776, 600));
+        assert_eq!(b.opmask & 1 << 28, 0);
+        assert_eq!((a.max_ops, a.pool_words, a.bank_words), (104, 211, 520));
+    }
+
+    #[test]
+    fn tail_free_fits_neither_set_and_stays_on_the_host() {
+        // 189f13bf and d5e399e6 at the real vocabulary: windows 552 and 551.
+        let (a, b) = pipe_sets();
+        for t in [program(64, 5, 904, 520), program(63, 5, 903, 519)] {
+            assert!(a.refuses(&t).is_some_and(|w| w.contains("pool words")));
+            assert!(b.refuses(&t).is_some_and(|w| w.contains("pool words")));
+        }
+        // A window past the bank never fits either, whatever its pool.
+        let wide = program(40, 4, 200, 590);
+        assert!(a.refuses(&wide).is_some_and(|w| w.contains("window of 622 words")));
+        assert!(b.refuses(&wide).is_some_and(|w| w.contains("window of 622 words")));
+    }
+
+    #[test]
+    fn typical_twice_fits_set_b_s_bank() {
+        // 10dff76b: a window of 263 + 32 = 295 words, two in 600.
+        let (a, b) = pipe_sets();
+        let t = program(50, 6, 775, 263);
+        assert!(a.refuses(&t).is_some_and(|w| w.contains("pool words")));
+        assert_eq!(b.refuses(&t), None);
+        let lane = || {
+            let program = super::super::lane::Program { table: program(50, 6, 775, 263), epilogue: 0, homes: Default::default(), logits: String::new() };
+            Some(super::super::slots::LaneProgram { key: 1, program: std::sync::Arc::new(program) })
+        };
+        let two = super::super::slots::Slots::plan(&b, &[lane(), lane()]).unwrap();
+        assert_eq!(two.lanes[1].as_ref().unwrap().off, 295);
+        assert!(super::super::slots::Slots::plan(&b, &[lane(), lane(), lane()]).is_err());
     }
 }
