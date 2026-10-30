@@ -263,6 +263,9 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Mx, mma, [8, 12, 4, 384, 2880], t, None, 0),
         (K::Mx, mma, [8, 100, 4, 384, 2880], f, None, 0),
         (K::MxBias, mma, [8, 16, 4, 192, 2880], t, alpha, 8),
+        // An Ada's few routes an expert on its 512-code runs: by route, a
+        // partial row tile.
+        (K::MxBias, mma, [8, 24, 4, 320, 2880], f, None, 0),
         // Past 32 routes an expert, the shared-memory-staged kernel: by
         // token and by route, its GLU under scales past f16's range, a live
         // window, NVFP4 and its GLU.

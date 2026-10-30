@@ -191,8 +191,17 @@ pub(super) fn select_mxfp4_mma(
     let staged = !cvt
         && (per > STAGED_FROM
             || (hopper_wgmma() && per >= WGMMA_FROM && x.width.is_multiple_of(64)));
+    // An Ada's experts of 16 routes or fewer on average:
+    // `moe_select_mxfp4_mma_run`, its lanes reading 512-code runs of a row
+    // (gpt-oss-120b's miniature at c128 on an L40S: 2490 to 2645 tok/s).
+    let run = !cvt
+        && !staged
+        && tensor_scales.is_none()
+        && crate::jit::cache::arch() == Some("sm_89")
+        && x.width.is_multiple_of(64);
     let nb: u32 = match per {
         _ if staged => 8,
+        _ if run => 4,
         0..=4 => 1,
         5..=12 => 2,
         _ => 4,
@@ -293,6 +302,25 @@ pub(super) fn select_mxfp4_mma(
                 [256, 1, 1],
             )
             .smem(PIPE_STAGES * PIPE_STAGE),
+        )
+    } else if run {
+        const STAGES: u32 = 4;
+        const WARPS: u32 = 4;
+        let grid = [grid[0], y.width.div_ceil(cols * WARPS / 4), 1];
+        Fire::at(kernel(
+            SELECT_FP4_SM80,
+            &format!("::pie::linear::moe_select_mxfp4_mma_run<{nb}, {STAGES}, {code}, {WARPS}>"),
+        ))
+        .apply(
+            Launch::grid(
+                if act_div == 1 {
+                    [grid[1], grid[0], 1]
+                } else {
+                    grid
+                },
+                [32 * WARPS, 1, 1],
+            )
+            .smem(STAGES * 8 * nb * 256),
         )
     } else if staged {
         const STAGES: u32 = 3;

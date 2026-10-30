@@ -322,6 +322,201 @@ __global__ void __launch_bounds__(32 * kWarps) moe_select_mxfp4_mma_staged(
                                       row_base, g, c, limit, galpha);
 }
 
+/// `moe_select_mxfp4_mma_staged` for a decode's skewed experts (a slice of
+/// up to `8 kNb` routes, its n8 blocks past the slice's routes skipped): a
+/// lane reads 64 bytes of a row's codes at a time, four 32-code groups of a
+/// 512-code run (its quad's four lanes the run's 256 bytes), where a
+/// 128-code chunk reads 64 bytes a row, so the bank streams in longer runs
+/// of each row; through L1, a lane's four loads of a run translate a cold
+/// layer's pages once a line, not once a load. A lane's `j`-th group of
+/// each run is chunk `j` of the run to `compute_staged`, the routes' runs of
+/// those groups staged a chunk at a time. `k` whole 64s.
+template <int kNb, int kStages, int kGlu, int kWarps = 4>
+__global__ void __launch_bounds__(32 * kWarps, 384 / (32 * kWarps)) moe_select_mxfp4_mma_run(
+    const bf16* __restrict__ act,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const i32* __restrict__ work,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const bf16* __restrict__ bias,
+    bf16* __restrict__ out,
+    int act_div,
+    int n,
+    int k,
+    int num_experts,
+    int inter,
+    float limit,
+    float galpha,
+    const float* __restrict__)
+{
+    constexpr int kTiles = 2;
+    constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
+    constexpr int kRowsCta = kWarps * kRowsWarp;
+    constexpr int kSlice = 8 * kNb;
+    constexpr int kStageRuns = kSlice * 16;
+    constexpr int kThreads = 32 * kWarps;
+    constexpr int kRowStep = kThreads / 16;
+    constexpr int kPasses = kSlice / kRowStep;
+    static_assert(kPasses * kRowStep == kSlice, "the slice stages in whole passes");
+
+    const int at = static_cast<int>(act_div == 1 ? blockIdx.y : blockIdx.x);
+    if (at >= offsets[num_experts + 1]) return;
+    const int item = work[at];
+    const int expert = item >> 16;
+    const int slice = item & 0xFFFF;
+    const int begin = offsets[expert] + slice * kSlice;
+    const int count = min(offsets[expert + 1] - begin, kSlice);
+    if (count <= 0) return;
+    // The slice's live n8 blocks.
+    const int blocks = (count + 7) >> 3;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int g = lane >> 2;
+    const int c = lane & 3;
+    const int row_base = static_cast<int>(act_div == 1 ? blockIdx.x : blockIdx.y) * kRowsCta + warp * kRowsWarp;
+    const int span = kGlu != 0 ? inter : n;
+    auto tile_row = [&](int t) { return kGlu != 0 ? row_base + t * inter : row_base + 16 * t; };
+    const bool rows_live = row_base < span;
+
+    const int groups = k >> 5;
+    const int runs = (groups + 15) >> 4;
+    const long long row_bytes = k >> 1;
+    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
+    const u8* s_e = scales + static_cast<long long>(expert) * n * groups;
+
+    // This lane's 64 bytes of a run, and its four groups' scales.
+    const u8* wrow[kTiles][2];
+    const u8* srow[kTiles][2];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int r = min(max(tile_row(t), 0) + 8 * h + g, n - 1);
+            wrow[t][h] = w_e + r * row_bytes + c * 64;
+            srow[t][h] = s_e + static_cast<long long>(r) * groups + 4 * c;
+        }
+
+    // A thread stages run `q` of a chunk (lane `q / 4`'s group of the run,
+    // its 8-code run `q % 4`) for route rows tid / 16 + kRowStep p.
+    const int q = tid & 15;
+    const int col_q = 128 * (q >> 2) + 8 * (q & 3);
+    const bf16* src[kPasses];
+#pragma unroll
+    for (int p = 0; p < kPasses; ++p) {
+        const int tok = (tid >> 4) + kRowStep * p;
+        src[p] = tok < count ? act + static_cast<long long>(order[begin + tok] / act_div) * k + col_q
+                             : nullptr;
+    }
+    extern __shared__ __align__(16) uint4 run_x[];
+    auto stage = [&](int v) {
+        if (v < 4 * runs) {
+            uint4* dst = run_x + (v % kStages) * kStageRuns;
+            const int col = (v >> 2) * 512 + 32 * (v & 3) + col_q;
+#pragma unroll
+            for (int p = 0; p < kPasses; ++p) {
+                const int row = (tid >> 4) + kRowStep * p;
+                if (row < 8 * blocks) {
+                    const bool live = src[p] != nullptr && col < k;
+                    const unsigned saddr = static_cast<unsigned>(__cvta_generic_to_shared(dst + w4mma::x_slot(row, q)));
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(saddr),
+                                 "l"(live ? src[p] + (col - col_q) : act), "r"(live ? 16 : 0));
+                }
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    uint4 cw[4][kTiles][2];
+    unsigned cs[kTiles][2];
+    auto load_w = [&](int s, int j) {
+        const bool live = rows_live && s < runs && s * 16 + 4 * c + j < groups;
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+                cw[j][t][h] = live ? pie_ld_line(reinterpret_cast<const uint4*>(wrow[t][h] + s * 256 + j * 16)) : make_uint4(0, 0, 0, 0);
+    };
+    // A run's four scales a row (127, a factor of one, past the bank's
+    // groups): two halfwords, `k` whole 64s.
+    auto load_s = [&](int s) {
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int g0 = s * 16 + 4 * c;
+                const unsigned lo = rows_live && g0 < groups ? w4mma::ld_scale2_l2(srow[t][h] + s * 16) : 0x7F7Fu;
+                const unsigned hi = rows_live && g0 + 2 < groups ? w4mma::ld_scale2_l2(srow[t][h] + s * 16 + 2) : 0x7F7Fu;
+                cs[t][h] = lo | (hi << 16);
+            }
+    };
+
+    float acc[kTiles][kNb][4];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int b = 0; b < kNb; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
+
+#pragma unroll
+    for (int v = 0; v < kStages - 1; ++v) stage(v);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) load_w(0, j);
+    load_s(0);
+
+    for (int s = 0; s < runs; ++s) {
+        unsigned ss[kTiles][2];
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) ss[t][h] = cs[t][h];
+        load_s(s + 1);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int v = 4 * s + j;
+            asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 2));
+            {
+                uint4* xs_w = run_x + (v % kStages) * kStageRuns;
+#pragma unroll
+                for (int p = 0; p < kPasses; ++p) {
+                    const int row = (tid >> 4) + kRowStep * p;
+                    if (row < 8 * blocks) w4mma::lay_staged(xs_w + w4mma::x_slot(row, q));
+                }
+            }
+            __syncthreads();
+            // The ring's oldest stage, every warp past its reads.
+            stage(v + kStages - 1);
+            if (rows_live) {
+                unsigned sj[kTiles][2];
+                bool wide = false;
+#pragma unroll
+                for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        sj[t][h] = (ss[t][h] >> (8 * j)) & 0xFFu;
+                        wide |= sj[t][h] > 128u;
+                    }
+                const uint4* xs = run_x + (v % kStages) * kStageRuns;
+                if (__any_sync(0xffffffffu, wide)) {
+                    w4mma::compute_staged<true, false>(cw[j], sj, xs, g, c, acc, blocks);
+                } else {
+                    w4mma::compute_staged<false, false>(cw[j], sj, xs, g, c, acc, blocks);
+                }
+            }
+            load_w(s + 1, j);
+        }
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    if (!rows_live) return;
+
+    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    auto factor = [](int) { return 1.f; };
+    w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,
+                                      row_base, g, c, limit, galpha);
+}
+
 /// `moe_select_mxfp4_mma_staged` for a wide fire, `k` whole 128s: eight
 /// warps a CTA (256 rows, or 128 GLU columns), each 128-code chunk's codes
 /// and scales staged with the slice's 64 routes through one `kStages`

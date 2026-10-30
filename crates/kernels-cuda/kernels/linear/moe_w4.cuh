@@ -41,6 +41,13 @@ __device__ __forceinline__ unsigned ld_scale2(const u8* p) {
     return v;
 }
 
+/// `ld_scale2`, the row's next 256 bytes of scales brought into L2 with it.
+__device__ __forceinline__ unsigned ld_scale2_l2(const u8* p) {
+    unsigned short v;
+    asm volatile("ld.global.nc.L2::256B.u16 %0, [%1];\n" : "=h"(v) : "l"(p));
+    return v;
+}
+
 __device__ __forceinline__ unsigned ld_scale(const u8* p) {
     unsigned short v;
     asm volatile("ld.global.nc.L1::no_allocate.u8 %0, [%1];\n" : "=h"(v) : "l"(p));
@@ -260,7 +267,7 @@ __device__ __forceinline__ void lay_staged(uint4* at) {
 template <bool wide, bool kNv, int kTiles, int kNb>
 __device__ __forceinline__ void compute_staged(const uint4 (&cw)[kTiles][2], const unsigned (&cs)[kTiles][2],
                                                const uint4* __restrict__ xs, int g, int c,
-                                               float (&acc)[kTiles][kNb][4]) {
+                                               float (&acc)[kTiles][kNb][4], int blocks = kNb) {
     unsigned s1[kTiles][2], s2[kTiles][2], nv[kTiles][2][2];
 #pragma unroll
     for (int t = 0; t < kTiles; ++t)
@@ -293,7 +300,8 @@ __device__ __forceinline__ void compute_staged(const uint4 (&cw)[kTiles][2], con
         // k-steps' (b0, b1) pairs.
         uint4 xv[kNb];
 #pragma unroll
-        for (int b = 0; b < kNb; ++b) xv[b] = xs[x_slot(8 * b + g, 4 * c + w)];
+        for (int b = 0; b < kNb; ++b)
+            if (b < blocks) xv[b] = xs[x_slot(8 * b + g, 4 * c + w)];
 #pragma unroll
         for (int jj = 0; jj < 2; ++jj) {
             unsigned b0[kNb], b1[kNb];
@@ -318,7 +326,8 @@ __device__ __forceinline__ void compute_staged(const uint4 (&cw)[kTiles][2], con
                     a3 = mul2(a3, s2[t][1]);
                 }
 #pragma unroll
-                for (int b = 0; b < kNb; ++b) mma_m16n8k16(acc[t][b], {a0, a1, a2, a3}, {b0[b], b1[b]});
+                for (int b = 0; b < kNb; ++b)
+                    if (b < blocks) mma_m16n8k16(acc[t][b], {a0, a1, a2, a3}, {b0[b], b1[b]});
             }
         }
     }
