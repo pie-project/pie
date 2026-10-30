@@ -3,7 +3,7 @@
 //! of them: page `a` out, then in at page `b`; prints the host copy's and
 //! every written row's SHA-256, for comparison with `serve_lib8b.py` over the
 //! same mock (with `KVST`, serve8b's staging kernels emulated on it).
-//! `serve8b_pages <K:V,... params> <a> <b>`
+//! `serve8b_pages <K:V,... params> <a> <b>` (or comma lists: several pages at once)
 
 use std::collections::HashMap;
 
@@ -133,7 +133,8 @@ fn main() -> Result<(), String> {
         .map(|(k, v)| (k.to_string(), v.parse().unwrap_or(0)))
         .collect();
     let lay = Layout2d::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1)).ok_or("not a serve8b build")??;
-    let (a, b): (u32, u32) = (args[2].parse().map_err(|e| format!("{e}"))?, args[3].parse().map_err(|e| format!("{e}"))?);
+    let list = |s: &str| -> Result<Vec<u32>, String> { s.split(',').map(|x| x.parse().map_err(|e| format!("{e}"))).collect() };
+    let (a_all, b_all) = (list(&args[2])?, list(&args[3])?);
     let mut dev = Mock::default();
     if lay.kvst > 0 {
         let shape = lay.paged.ok_or("not a paged build")?;
@@ -147,8 +148,19 @@ fn main() -> Result<(), String> {
         };
         dev.stage = Some(Stage { units, blocks: shape.blocks, slots: lay.kvst, packed });
     }
-    let out = serve8b::page_out(&lay, &mut dev, a)?;
-    println!("page_out {a} {} {}", out.len(), sha(&out));
-    serve8b::page_in(&lay, &mut dev, b, &out)?;
+    if a_all.len() == 1 {
+        let (a, b) = (a_all[0], b_all[0]);
+        let out = serve8b::page_out(&lay, &mut dev, a)?;
+        println!("page_out {a} {} {}", out.len(), sha(&out));
+        serve8b::page_in(&lay, &mut dev, b, &out)?;
+    } else {
+        // Several pages at once (page_out_many / page_in_many).
+        let outs = serve8b::page_out_many(&lay, &mut dev, &a_all)?;
+        for (a, out) in a_all.iter().zip(&outs) {
+            println!("page_out {a} {} {}", out.len(), sha(out));
+        }
+        let ins: Vec<(u32, Vec<u32>)> = b_all.iter().copied().zip(outs).collect();
+        serve8b::page_in_many(&lay, &mut dev, &ins)?;
+    }
     Ok(())
 }
