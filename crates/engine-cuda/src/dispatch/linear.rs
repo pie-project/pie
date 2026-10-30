@@ -2091,6 +2091,32 @@ impl Run<'_> {
         )
     }
 
+    /// [`linear::moe::matmul_fp8_scaled`] for a batch's rows (128 or more: fewer
+    /// read the bf16 copy faster) of a resident 128x128-block FP8 plane;
+    /// `false` where it does not take them.
+    #[cfg(feature = "cuda")]
+    fn fp8_scaled_matmul(
+        &mut self,
+        act: ValueId,
+        w: ValueId,
+        block_scales: ValueId,
+        y: ValueId,
+    ) -> Result<bool, kernels_cuda::Error> {
+        let codes = self.tensor(w);
+        let atoms = self.tensor(block_scales);
+        let act = self.tensor(act);
+        if codes.dtype != Dtype::E4m3
+            || atoms.dtype != Dtype::U8
+            || atoms.width == 0
+            || act.width.div_ceil(atoms.width) != 128
+            || act.rows < 128
+            || crate::device::alloc::is_host_pointer(codes.ptr)
+        {
+            return Ok(false);
+        }
+        linear::moe::matmul_fp8_scaled(self.ctx(), act, codes.ptr, atoms.ptr, &mut self.tensor(y))
+    }
+
     /// A projection whose activations are quantized first, on the tcgen05
     /// GEMM: e4m3 in `gran`s against MXFP4 codes.
     #[cfg(feature = "cuda")]
@@ -2104,6 +2130,14 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "linear.matmul";
         if !linear::gemm_sm100::supported() {
+            // A batch's rows of a 128x128-block FP8 plane quantized 1x128 as
+            // the deployment says, on sm_120a's block-scaled mma.sync (W8A8).
+            if let Some(block_scales) = block_scales
+                && quant == (ActQuant::E4m3 { gran: 128 })
+                && self.fp8_scaled_matmul(act, w, block_scales, y)?
+            {
+                return Ok(());
+            }
             return self.matmul_a16(OP, act, w, block_scales, y);
         }
         if let Some(block_scales) = block_scales {
