@@ -78,8 +78,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             }
             tokens => tokens,
         };
+        // only where it at least halves the fire: a trunk of few value heads seats enough lanes that the
+        // wide fire feeds its experts better (Qwen3.6-35B-A3B pf64 lost 4% at 5120 rows of 8192)
         if let Some(fit) = walk_fire_fit(&boot.trace, engine.walk_fire_rows, device.device().num_sm)
-            && fit < boot.budget.max_tokens
+            && fit * 2 <= boot.budget.max_tokens
         {
             eprintln!(
                 "engine-cuda: fires of {fit} rows where {} were asked: the chunked gated delta \
