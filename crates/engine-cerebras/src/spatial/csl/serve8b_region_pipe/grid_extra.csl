@@ -65,6 +65,15 @@ fn s2d_lane(b: u16, off: u16, n: u16) mem1d_dsd {
   return @set_dsd_length(@increment_dsd_offset(s2d_x1, @as(i16, b * Hc + off), f32), n);
 }
 
+// serve8b_region_pipe (ps1's simulator fatal "OUT_Q[2] must be empty during
+// config"): with micro-batches back to back, a send's last wavelets can still
+// sit in output queue 2 (the next stage busy) when the next pass reconfigures
+// its color (a relay PE's multicast color differs from its send color). Wait
+// for the queue to drain before every reconfiguration.
+fn s2d_oq2(c: u16) void {
+  while ((tile_config.output_queue_status.get_raw() & 0x0400) == 0) {}   // queue 2 empty (empty mask in the high byte)
+  rt.oq_color(2, c);
+}
 fn recv_x() void {
   if (rtab[1] > 0) { rt.iq_color(2, rtab[OFF_I]); }
   var k: u16 = 0;
@@ -75,7 +84,7 @@ fn recv_x() void {
   }
   if (rtab[3] != RNONE) {
     // The row's assembling PE multicasts the whole row on.
-    rt.oq_color(2, rtab[3]);
+    s2d_oq2(rtab[3]);
     @fmovs(fout(q_gb_out, S2D_XN), x_all);
   }
   if (rtab[4] != RNONE) { rt.iq_color(2, rtab[4]); }
@@ -89,7 +98,7 @@ var s2d_mw = @zeros([1]f32);
 const s2d_mw_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> s2d_mw[i] });
 fn send_x() void {
   const ns = rtab[2] & 0xff;
-  if (ns > 0) { rt.oq_color(2, rtab[OFF_O]); }
+  if (ns > 0) { s2d_oq2(rtab[OFF_O]); }
   var k: u16 = 0;
   while (k < ns) : (k += 1) {
     const e = OFF_O + 3 * k;
@@ -131,6 +140,10 @@ fn s2d_tab_io(m: u16, load: bool) void {
 fn compute(steps: u32, start_pos: u32) void {
   if (S2D_TIME == 1) { timestamp.enable_tsc(); }
   const nmb: u32 = if (S2D_PIPE == 1) start_pos else 1;
+  // serve8b_region_pipe probe: this PE's output-queue status at the launch's
+  // start (high byte: the empty mask; a launch that left wavelets behind shows
+  // a 0 bit here at the next launch). The host reads it via prof[14].
+  prof[14] = @as(u32, tile_config.output_queue_status.get_raw());
   // (counters, not % and /: no integer division in the PE's code)
   var i: u32 = 0;
   var m: u16 = 0;

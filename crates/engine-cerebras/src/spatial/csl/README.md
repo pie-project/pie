@@ -37,7 +37,8 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
   (per-micro-batch tables `mtab`, the index word after x to the head), the
   head's `head_extra.csl` (virtual lanes, the micro-batch check `perr`) and
   the embedding strip; the rest is serve8b_region's. The plan offers only
-  0148's hardware shapes (B 4 x 4 at CAP 16, B 2 x 8 at CAP 32).
+  0167's hardware shapes (B 4 x 4 at CAP 16, B 2 x 8 and B 1 x 12 at
+  CAP 32). The units drain output queue 2 before recoloring it.
 
 The generated `*_pe.csl` are byte-identical to the bench payload's `sync.py`
 outputs. `codegen.rs` pins their hashes; with `PIE_CEREBRAS_PAYLOAD` set, its
