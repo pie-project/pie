@@ -71,8 +71,9 @@ pub struct Layout2d {
     /// A second VM set (`VMB` columns after set A's, its own image: the
     /// `b_` params).
     pub vm_b: Option<super::guest4::wafer::VmLayout>,
-    /// `vm_conc`: the two sets run at once, each told its rows a launch
-    /// (`gring[3]`, written before every launch).
+    /// `VMCONC` (the layout's; the VM image's `vm_conc`): the two sets run
+    /// at once, each told its rows a launch (`gring[3]`, written before
+    /// every launch).
     pub vm_conc: bool,
     /// `DEFER`: the head defers the VM's tokens (compute's micro-batch
     /// argument's bit 16) on a launch whose every lane the VM samples, over
@@ -143,7 +144,7 @@ impl Layout2d {
                 hlbn: get("HLBN"),
                 vmlane_words: 2,
                 vm_b: None,
-                vm_conc: get("vm_conc").unwrap_or(0) != 0 && get("VMB").unwrap_or(0) > 0,
+                vm_conc: get("VMCONC").unwrap_or(0) != 0 && get("VMB").unwrap_or(0) > 0,
                 vm_defer: get("DEFER").unwrap_or(0) != 0,
                 kvst: get("KVST").unwrap_or(0),
                 s8b: None,
@@ -1193,6 +1194,28 @@ mod tests {
         // The chunk columns either side of it.
         assert_eq!(head_runs(&lay), vec![0..3, 4..5]);
         assert!(head_runs(&lay).into_iter().all(|r| check_head_columns(&lay, "mtab", r).is_ok()));
+    }
+
+    #[test]
+    fn concurrent_sets_and_deferred_tokens_read_the_layout_s_names() {
+        // A two-set build's out.json params: VMCONC and DEFER as the layout
+        // names them (the VM image's own `vm_conc` is not the layout's).
+        let base = [
+            ("PX", 4), ("PY", 4), ("Hc", 16), ("HR", 64), ("Dc", 8), ("Gs", 4), ("Qh", 2),
+            ("Ic", 16), ("Tc", 1), ("W16", 0), ("KV16", 0), ("WF32", 1), ("GRID", 1),
+            ("HEADMODE", 2), ("B", 2), ("PS", 16), ("NB", 2), ("E", 2), ("MMAX", 2), ("GW", 2),
+            ("GH", 4), ("HH", 16), ("Vr", 32), ("Gx", 4), ("VMC", 1), ("vocab", 250), ("CAP", 8),
+            ("VM", 1), ("max_ops", 48), ("nreg", 6), ("pool_words", 64), ("feat", 99),
+            ("VMB", 1), ("b_max_ops", 64), ("b_nreg", 6), ("b_pool_words", 64),
+        ];
+        let lay = |extra: &[(&str, usize)]| {
+            let params: Vec<(&str, usize)> = base.iter().chain(extra).copied().collect();
+            Layout2d::of(|k| params.iter().find(|p| p.0 == k).map(|p| p.1)).unwrap().unwrap()
+        };
+        let on = lay(&[("VMCONC", 1), ("DEFER", 1)]);
+        assert!(on.vm_b.is_some() && on.vm_conc && on.vm_defer);
+        let off = lay(&[("vm_conc", 1)]);
+        assert!(!off.vm_conc && !off.vm_defer);
     }
 
     #[test]
