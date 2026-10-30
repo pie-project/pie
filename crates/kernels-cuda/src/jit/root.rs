@@ -88,6 +88,7 @@ const SPECIFIC: &[(&str, Toolchain)] = &[
     ("linear/moe/mega_sm100.cu", Toolchain::new(12, 9)),
     ("elemwise/hc_sm100.cu", Toolchain::new(12, 9)),
     ("linear/moe/select_sm90.cu", Toolchain::ANY),
+    ("linear/moe/select_fp4_sm120.cu", Toolchain::new(12, 9)),
     ("linear/w8a16_sm90.cu", Toolchain::ANY),
     ("linear/fp8_dense_sm120.cu", Toolchain::new(12, 9)),
 ];
