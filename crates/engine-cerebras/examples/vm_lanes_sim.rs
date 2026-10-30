@@ -44,6 +44,13 @@ fn main() -> Result<(), String> {
     let n = grid.launch_lanes();
     let ps = shape.page_size as u32;
     let (lay, _) = m.vm_shape().ok_or("the build has no VM")?;
+    // Two VM sets: lanes 0..na are set A's, the rest set B's.
+    let (na, nb) = m.vm_lanes();
+    if nb > 0 && na + nb != n {
+        return Err(format!("VM sets of {na} and {nb} lanes for {n} head lanes"));
+    }
+    let lay_b = m.vm_shape_b().map(|(l, _)| l);
+    let lay_of = |v: usize| if v < na { lay } else { lay_b.unwrap_or(lay) };
     let case_of = |lane: usize| lane.min(cases.len() - 1);
     // IDLE_LANES=1,2: lanes without a program (a per-lane-program image's
     // idle banks, as the engine leaves them).
@@ -113,7 +120,11 @@ fn main() -> Result<(), String> {
             programs.push(Some(slots::LaneProgram { key: c as u64, program: std::sync::Arc::new(program) }));
             seeds.push(Some(copy(&s)));
         }
-        m.vm_place_lanes(&programs, &seeds, &[])?;
+        let seeds_b = if nb > 0 { seeds.split_off(na) } else { Vec::new() };
+        m.vm_place_lanes(0, &programs[..na.min(n)], &seeds, &[])?;
+        if nb > 0 {
+            m.vm_place_lanes(1, &programs[na..], &seeds_b, &[])?;
+        }
         placed = programs;
     } else {
         m.vm_load_lanes(&cases[0].0)?;
@@ -155,9 +166,9 @@ fn main() -> Result<(), String> {
                 logits: String::new(),
             };
             placed[0] = Some(slots::LaneProgram { key: 1000, program: std::sync::Arc::new(program) });
-            let mut fresh: Vec<Option<Vec<wafer::Seed>>> = (0..n).map(|_| None).collect();
+            let mut fresh: Vec<Option<Vec<wafer::Seed>>> = (0..na).map(|_| None).collect();
             fresh[0] = Some(seeds);
-            m.vm_place_lanes(&placed, &fresh, &[])?;
+            m.vm_place_lanes(0, &placed[..na], &fresh, &[])?;
             lane0 = (json.clone(), *at);
             eprintln!("lane 0 re-placed at step {at}");
         }
@@ -187,9 +198,9 @@ fn main() -> Result<(), String> {
                 &mut placed[0],
                 Some(slots::LaneProgram { key: 2000, program: std::sync::Arc::new(program) }),
             );
-            let mut fresh: Vec<Option<Vec<wafer::Seed>>> = (0..n).map(|_| None).collect();
+            let mut fresh: Vec<Option<Vec<wafer::Seed>>> = (0..na).map(|_| None).collect();
             fresh[0] = Some(seeds);
-            let window = m.vm_place_lanes(&placed, &fresh, &[])?.swap_remove(0);
+            let window = m.vm_place_lanes(0, &placed[..na], &fresh, &[])?.swap_remove(0);
             let window = if std::env::var("EVICT_SEEDS").is_ok_and(|v| v == "1") { None } else { window };
             away = Some((mine, kept, window, std::mem::replace(&mut lane0, (json.clone(), *from))));
             eprintln!("lane 0 evicted at step {from}");
@@ -198,13 +209,13 @@ fn main() -> Result<(), String> {
         if let Some((_, back, _)) = evict.as_ref().filter(|(_, back, _)| *back == s) {
             let (mine, kept, window, (json, start)) = away.take().ok_or("EVICT back before from")?;
             placed[0] = mine;
-            let mut fresh: Vec<Option<Vec<wafer::Seed>>> = (0..n).map(|_| None).collect();
+            let mut fresh: Vec<Option<Vec<wafer::Seed>>> = (0..na).map(|_| None).collect();
             fresh[0] = Some(kept);
             let parked = window.is_some();
-            let mut windows: Vec<Option<slots::Parked>> = vec![None; n];
+            let mut windows: Vec<Option<slots::Parked>> = vec![None; na];
             windows[0] = window;
             if !hold {
-                m.vm_place_lanes(&placed, &fresh, &windows)?;
+                m.vm_place_lanes(0, &placed[..na], &fresh, &windows)?;
             }
             lane0 = (json, start + (s - lane0.1));
             eprintln!("lane 0 placed again at step {back} (window parked: {parked})");
@@ -226,7 +237,7 @@ fn main() -> Result<(), String> {
                 if table.per_step.is_empty() || idle.contains(&v) || (hold && v == 0 && away.is_some()) {
                     return Ok(None);
                 }
-                let entries = slots::step_entries(&lay, &table)?;
+                let entries = slots::step_entries(&lay_of(v), &table)?;
                 let words = &json["per_step_words"][step];
                 let values = entries
                     .iter()

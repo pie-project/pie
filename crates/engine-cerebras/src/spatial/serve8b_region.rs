@@ -196,7 +196,9 @@ pub fn layout(get: &dyn Fn(&str) -> Option<usize>) -> R<Layout2d> {
         hlm: None,
         hlbn: get("HLBN"),
         vmlane_words: 2,
-        vm_set_a_lanes: None,
+        vm_b: None,
+        vm_conc: false,
+        vm_defer: false,
         kvst: get("KVST").unwrap_or(0),
         s8b: Some(S8b::Units(u)),
     };

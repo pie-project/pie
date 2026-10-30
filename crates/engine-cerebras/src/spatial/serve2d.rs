@@ -65,12 +65,19 @@ pub struct Layout2d {
     pub hlbn: Option<usize>,
     /// Words of a virtual lane's VM control (`vmlane`): 2 (gmode, forced
     /// prefix) on guest4hs, 3 on guest4hz (and the offset to the lane's
-    /// turn's last row), 4 on guest4h2s (and the lane's VM set: 0, set A,
-    /// the only one the engine drives yet).
+    /// turn's last row), 4 with a second VM set (and the lane's set: 0 A,
+    /// 1 B).
     pub vmlane_words: usize,
-    /// Set A's VM lanes (`vm_lanes`; 0 or absent: every head lane): head
-    /// lanes past them are set B's turns (vmlane word 3).
-    pub vm_set_a_lanes: Option<usize>,
+    /// A second VM set (`VMB` columns after set A's, its own image: the
+    /// `b_` params).
+    pub vm_b: Option<super::guest4::wafer::VmLayout>,
+    /// `vm_conc`: the two sets run at once, each told its rows a launch
+    /// (`gring[3]`, written before every launch).
+    pub vm_conc: bool,
+    /// `DEFER`: the head defers the VM's tokens (compute's micro-batch
+    /// argument's bit 16) on a launch whose every lane the VM samples, over
+    /// two micro-batches or more.
+    pub vm_defer: bool,
     /// `KVST`: KV staging slots a grid PE (`kstage`/`vstage`, `page_stage`
     /// / `page_unstage`; scratch/fork4/kv-staging-interface.md); 0: the
     /// host reads and patches whole kc/vc rows.
@@ -135,7 +142,9 @@ impl Layout2d {
                 hlm: get("HLM"),
                 hlbn: get("HLBN"),
                 vmlane_words: 2,
-                vm_set_a_lanes: get("vm_lanes").filter(|&n| n > 0),
+                vm_b: None,
+                vm_conc: get("vm_conc").unwrap_or(0) != 0 && get("VMB").unwrap_or(0) > 0,
+                vm_defer: get("DEFER").unwrap_or(0) != 0,
                 kvst: get("KVST").unwrap_or(0),
                 s8b: None,
             };
@@ -162,6 +171,7 @@ impl Layout2d {
             // plain batching), whose lanes the VM time-multiplexes.
             if lay.paged.is_none() || lay.mmax.is_some() {
                 lay.vm = super::guest4::wafer::VmLayout::serve2d(lay.head_x(), &get);
+                lay.vm_b = lay.vm.and_then(|a| a.set_b(&get));
             }
             if lay.py * lay.hc < lay.hidden || lay.gs == 0 || lay.gx == 0 || (lay.vmc > 1 && lay.vm.is_none()) {
                 return Err(format!("serve2d params do not make a layout: {lay:?}"));
@@ -769,15 +779,24 @@ pub fn fire(
     fire_lanes(lay, rt, lanes, steps, want_logits, None, vm_written)
 }
 
-/// [`fire`] on a VM build, `vm_lanes[v]` 1 for each virtual lane the VM
-/// samples (`None`: none; the head's argmax every lane).
+/// A VM launch's control a virtual lane (head lane m·B + b): whether the VM
+/// samples it (`gmode_l`) and whose turn it is (vmlane word 3: 0 set A, 1
+/// set B). A set counts its own turns, so each lap must give it exactly its
+/// lanes.
+pub struct VmTurns<'a> {
+    pub sampled: &'a [u32],
+    pub sets: &'a [u32],
+}
+
+/// [`fire`] on a VM build with `vm`'s turns (`None`: the head's argmax every
+/// lane).
 pub fn fire_lanes(
     lay: &Layout2d,
     rt: &mut Runtime,
     lanes: &[BatchLane],
     steps: usize,
     want_logits: bool,
-    vm_lanes: Option<&[u32]>,
+    vm: Option<&VmTurns>,
     vm_written: &mut Vec<u32>,
 ) -> R<(Vec<Vec<u32>>, Vec<Vec<f32>>)> {
     let shape = lay.paged.ok_or("a batched launch on a one-sequence build")?;
@@ -848,12 +867,10 @@ pub fn fire_lanes(
                     for b in 0..b_n {
                         let lane = mb.get(b).unwrap_or(&mb[0]);
                         let v = m * b_n + b;
-                        control[v * w] = vm_lanes.and_then(|g| g.get(v).copied()).unwrap_or(0);
+                        control[v * w] = vm.and_then(|t| t.sampled.get(v).copied()).unwrap_or(0);
                         control[v * w + 1] = lane.forced.len() as u32;
-                        // guest4h2s: a head lane past set A's VM lanes is a
-                        // set B turn, so set A counts only its own.
-                        if w >= 4 && lay.vm_set_a_lanes.is_some_and(|a| v >= a) {
-                            control[v * w + 3] = 1;
+                        if w >= 4 {
+                            control[v * w + 3] = vm.and_then(|t| t.sets.get(v).copied()).unwrap_or(0);
                         }
                     }
                 }
@@ -889,7 +906,12 @@ pub fn fire_lanes(
         .map_err(e)?;
     // The batched build ignores the second argument; the ring bootstraps
     // that many micro-batches.
-    let second = if lay.mmax.is_some() { mbs.len() as u32 } else { 0 };
+    let mut second = if lay.mmax.is_some() { mbs.len() as u32 } else { 0 };
+    // DEFER: every lane of the launch on the VM, two micro-batches or more.
+    let all_vm = vm.is_some_and(|t| (0..mbs.len() * b_n).all(|v| t.sampled.get(v) == Some(&1)));
+    if lay.vm_defer && lay.mmax.is_some() && all_vm && mbs.len() >= 2 {
+        second |= 1 << 16;
+    }
     rt.launch_nonblock(SYM.compute, &[steps as u32, second]).map_err(e)?;
     let mut out = vec![0u32; words];
     let read = rt.memcpy_d2h(SYM.out_tokens, &mut out, one, words, Order::RowMajor, DataType::Bits32);

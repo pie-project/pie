@@ -200,8 +200,9 @@ impl Design {
                         };
                         if (3..=4).contains(&words) {
                             g.vmlane_words = words;
-                            // guest4hz on: glane carries a live lane's rows.
-                            if let Some(vm) = g.vm.as_mut() {
+                            // guest4hz on: glane carries a live lane's rows,
+                            // on either set (one image, two rectangles).
+                            for vm in [g.vm.as_mut(), g.vm_b.as_mut()].into_iter().flatten() {
                                 vm.lane_rows = true;
                             }
                         }
@@ -574,8 +575,10 @@ pub struct WaferModel {
     steps: u64,
     /// Batched launches' lane-passes (tokens through the model).
     lane_steps: u64,
-    /// The head's eta VM, when the build has one.
+    /// The head's eta VM, when the build has one (set A), and a second VM
+    /// set's (B: its own columns and image) beside it.
     vm: Option<Vm>,
+    vm_b: Option<Vm>,
     /// A host-tier page copy is between its staging launch and its memcpy
     /// (the slots may alias a scratch buffer a fire uses): fires wait.
     staged: bool,
@@ -736,6 +739,7 @@ impl WaferModel {
             launches: 0,
             lane_steps: 0,
             vm: None,
+            vm_b: None,
             staged: false,
             vm_written: Vec::new(),
             steps: 0,
@@ -755,6 +759,18 @@ impl WaferModel {
                 loaded: false,
                 slots: super::guest4::slots::Slots::default(),
             });
+            if let Some(lay) = grid.vm_b {
+                let ring = super::guest4::lane::read_ring(&mut model.rt, lay.hub(), words)?;
+                tracing::info!(?ring, ops = lay.max_ops, registers = lay.nreg, pool = lay.pool_words, bank = lay.bank_words, "spatial wafer: the head has a second VM set (B)");
+                model.vm_b = Some(Vm {
+                    lay,
+                    ring,
+                    gmode: 0,
+                    steps: 0,
+                    loaded: false,
+                    slots: super::guest4::slots::Slots::default(),
+                });
+            }
         }
         // One request (position 0; later requests overwrite its KV) so the
         // first real one does not pay first-launch costs.
@@ -873,20 +889,28 @@ impl WaferModel {
         self.vm.as_ref().map(|vm| (vm.lay, vm.ring))
     }
 
+    /// The second VM set's (B), if the program has one.
+    pub fn vm_shape_b(&self) -> Option<(super::guest4::wafer::VmLayout, super::guest4::lane::Ring)> {
+        self.vm_b.as_ref().map(|vm| (vm.lay, vm.ring))
+    }
+
     /// A per-lane-program image's lanes: each its program (`None`: idle),
     /// the arena and windows compacted again, a lane on the same program
     /// keeping its window's state, a lane in `parked` getting the window it
     /// left back, a lane in `seeds` starting from them. The windows of the
     /// lanes that leave (their program gone or changed, or their bank
     /// seeded for another), by lane.
+    /// `set` 0 places set A's lanes, 1 set B's.
     pub fn vm_place_lanes(
         &mut self,
+        set: usize,
         programs: &[Option<super::guest4::slots::LaneProgram>],
         seeds: &[Option<Vec<super::guest4::wafer::Seed>>],
         parked: &[Option<super::guest4::slots::Parked>],
     ) -> R<Vec<Option<super::guest4::slots::Parked>>> {
         use super::guest4::{slots::Slots, wafer};
-        let vm = self.vm.as_mut().ok_or("the wafer program has no VM")?;
+        let vm = if set == 0 { self.vm.as_mut() } else { self.vm_b.as_mut() };
+        let vm = vm.ok_or(if set == 0 { "the wafer program has no VM" } else { "the wafer program has no VM set B" })?;
         if !vm.lay.lprog {
             return Err("the VM image runs one program for every lane (no vm_lprog)".into());
         }
@@ -914,22 +938,38 @@ impl WaferModel {
         // A first load writes gmode 1 (load_slots); a later placement leaves
         // gmode as the device has it (0 after argmax launches), for vm_fire
         // to set.
-        if !vm.loaded {
+        let fresh = !vm.loaded;
+        if fresh {
             vm.steps = 0;
             vm.gmode = 1;
         }
         vm.loaded = true;
         vm.slots = slots;
+        // `gmode` is one word over both sets' head: set A's copy tracks it.
+        if fresh && let Some(a) = self.vm.as_mut() {
+            a.gmode = 1;
+        }
         Ok(left)
     }
 
-    /// One lap of a multi-lane VM launch: `lanes` (one per VM lane, in lane
-    /// order m·B + b; idle lanes repeat a live one) each forced its token,
-    /// the VM sampling the next one of each lane in `sampled` from its bank.
-    /// Every other lane's turn is skipped (its gmode_l 0: the head's argmax,
-    /// no bank swap, no section, no ring row), so an idle or waiting lane
-    /// never runs a program. Per lane: the token the VM sampled, the turn's
-    /// `out` words, its pool after it (empty for a skipped lane).
+    /// The VM lanes a launch carries: set A's, then set B's (global lane g
+    /// is head lane g; g past set A's lanes is set B's lane g − A's).
+    pub fn vm_lanes(&self) -> (usize, usize) {
+        let lanes = |vm: &Option<Vm>| vm.as_ref().map_or(0, |vm| vm.ring.lanes as usize);
+        (lanes(&self.vm), lanes(&self.vm_b))
+    }
+
+    /// One lap of a multi-lane VM launch over both VM sets: `lanes` (head
+    /// lane g is global VM lane g, [`WaferModel::vm_lanes`]; idle lanes
+    /// repeat a live one) each forced its token, the VM sampling the next
+    /// one of each lane in `sampled` from its set's bank. Every other
+    /// lane's turn is skipped (its gmode_l 0: the head's argmax, no bank
+    /// swap, no section, no ring row), so an idle or waiting lane never
+    /// runs a program. Each set counts only its own turns (its lanes in
+    /// head-lane order, its ring, its step input), so every lap gives each
+    /// set exactly its lanes. Per global lane: the token the VM sampled,
+    /// the turn's `out` words, its pool after it (empty for a skipped
+    /// lane).
     pub fn vm_fire(
         &mut self,
         lanes: &[super::serve2d::BatchLane],
@@ -938,71 +978,98 @@ impl WaferModel {
     ) -> R<Vec<VmStep>> {
         use super::guest4::wafer;
         self.unstaged()?;
+        let (na, nb) = self.vm_lanes();
         let Design::Grid(grid) = &self.design else {
             return Err("a VM launch on a strip program".into());
         };
-        let vm = self.vm.as_mut().ok_or("the wafer program has no VM")?;
-        // The VM's lanes are the launch's first `n` head lanes; any past
-        // them (another VM set's) are skipped.
-        let n = vm.ring.lanes as usize;
-        if !vm.loaded || lanes.len() != grid.launch_lanes() || n > lanes.len() {
+        let n = na + nb;
+        let fits = if nb > 0 { lanes.len() == n } else { n <= lanes.len() };
+        if na == 0 || lanes.len() != grid.launch_lanes() || !fits {
             return Err(format!(
-                "a VM launch of {} lanes on a VM of {n} ({} lanes a launch, program loaded: {})",
+                "a VM launch of {} lanes on VM sets of {na} and {nb} lanes ({} lanes a launch)",
                 lanes.len(),
-                grid.launch_lanes(),
-                vm.loaded
+                grid.launch_lanes()
             ));
         }
-        // The step-input ring has `ring_d` slots: a launch's turns, skips
-        // included, must fit it.
-        if n > vm.ring.depth as usize {
-            return Err(format!("a launch of {n} turns on a VM ring of {}", vm.ring.depth));
+        let is_sampled = |g: usize| g < n && sampled.get(g).copied().unwrap_or(false);
+        let ranges = [0..na, na..n];
+        for (set, range) in ranges.iter().enumerate() {
+            let vm = if set == 0 { self.vm.as_ref() } else { self.vm_b.as_ref() };
+            let Some(vm) = vm else { continue };
+            if range.clone().any(is_sampled) && !vm.loaded {
+                return Err(format!("set {set}'s lanes sampled with no program loaded"));
+            }
+            // The step-input ring has `ring_d` slots: a launch's turns,
+            // skips included, must fit it.
+            if range.len() > vm.ring.depth as usize {
+                return Err(format!("a launch of {} turns on set {set}'s ring of {}", range.len(), vm.ring.depth));
+            }
         }
-        if vm.gmode != 1 {
-            wafer::set_gmode(&mut self.rt, &vm.lay, 1)?;
-            vm.gmode = 1;
+        // `gmode` covers both sets' head: set A's copy tracks it.
+        let a = self.vm.as_mut().ok_or("the wafer program has no VM")?;
+        if a.gmode != 1 {
+            wafer::set_gmode(&mut self.rt, &a.lay, 1)?;
+            a.gmode = 1;
         }
-        if vm.lay.sin > 0 {
-            let mut inputs = inputs.to_vec();
-            inputs.resize(n, None);
-            let images = super::guest4::slots::step_images(&vm.lay, vm.ring.depth as usize, &inputs);
-            wafer::write_step(&mut self.rt, &vm.lay, &images)?;
-        } else if inputs.iter().any(Option::is_some) {
-            return Err("step input for a VM image without it".into());
+        for (set, range) in ranges.iter().enumerate() {
+            let vm = if set == 0 { self.vm.as_ref() } else { self.vm_b.as_ref() };
+            let Some(vm) = vm else { continue };
+            let mine: Vec<StepInput> = range.clone().map(|g| inputs.get(g).cloned().flatten()).collect();
+            if vm.lay.sin > 0 {
+                let images = super::guest4::slots::step_images(&vm.lay, vm.ring.depth as usize, &mine);
+                wafer::write_step(&mut self.rt, &vm.lay, &images)?;
+            } else if mine.iter().any(Option::is_some) {
+                return Err(format!("step input for set {set}, whose image has none"));
+            }
+            // vm_conc: the set's rows this launch, before every launch.
+            if grid.vm_conc {
+                wafer::write_conc_rows(&mut self.rt, &vm.lay, vm.ring, range.len() as u32)?;
+            }
         }
-        let mask: Vec<u32> =
-            (0..lanes.len()).map(|l| u32::from(l < n && sampled.get(l).copied().unwrap_or(false))).collect();
+        let mask: Vec<u32> = (0..lanes.len()).map(|g| u32::from(is_sampled(g))).collect();
+        let sets: Vec<u32> = (0..lanes.len()).map(|g| u32::from(g >= na && g < n)).collect();
         self.launches += 1;
         self.steps += 1;
         self.lane_steps += n as u64;
-        let (tokens, _) =
-            super::serve2d::fire_lanes(grid, &mut self.rt, lanes, 1, false, Some(&mask), &mut self.vm_written)?;
-        // The ring takes a row a sampled turn (the VM's `ostep`, every
-        // lane's in turn order): this launch's are the `count` before the
-        // VM's own count now, read back so the host cannot drift from it.
-        let count = mask.iter().sum::<u32>() as usize;
-        let ostep = wafer::read_ostep(&mut self.rt, &vm.lay)?;
-        if ostep != vm.steps + count as u64 {
-            tracing::warn!(ostep, expected = vm.steps + count as u64, count, "spatial wafer: the VM's sampled-turn count is not the host's");
+        let turns = super::serve2d::VmTurns { sampled: &mask, sets: &sets };
+        let (tokens, _) = super::serve2d::fire_lanes(grid, &mut self.rt, lanes, 1, false, Some(&turns), &mut self.vm_written)?;
+        let mut out: Vec<VmStep> = tokens
+            .iter()
+            .take(n)
+            .map(|t| (t.first().copied().unwrap_or_default(), Vec::new(), Vec::new()))
+            .collect();
+        for (set, range) in ranges.iter().enumerate() {
+            let vm = if set == 0 { self.vm.as_mut() } else { self.vm_b.as_mut() };
+            let Some(vm) = vm else { continue };
+            // The set's ring takes a row a sampled turn of its own (its
+            // `ostep`, its lanes in turn order): this launch's are the
+            // `count` before its count now, read back so the host cannot
+            // drift from it.
+            let count = range.clone().filter(|&g| is_sampled(g)).count();
+            if count == 0 {
+                continue;
+            }
+            let ostep = wafer::read_ostep(&mut self.rt, &vm.lay)?;
+            if ostep != vm.steps + count as u64 {
+                tracing::warn!(set, ostep, expected = vm.steps + count as u64, count, "spatial wafer: a VM set's sampled-turn count is not the host's");
+            }
+            let first = ostep.saturating_sub(count as u64);
+            let mut rows = wafer::read_out_rows(&mut self.rt, &vm.lay, vm.ring, first, count)?.into_iter();
+            vm.steps = ostep;
+            let pools = if vm.lay.lprog {
+                let hub = wafer::read_hub_bank(&mut self.rt, &vm.lay)?;
+                vm.slots.pools(&vm.lay, &hub)
+            } else {
+                wafer::read_bank_pools(&mut self.rt, &vm.lay, range.len())?
+            };
+            for (k, g) in range.clone().enumerate() {
+                if is_sampled(g) {
+                    out[g].1 = rows.next().unwrap_or_default();
+                    out[g].2 = pools.get(k).cloned().unwrap_or_default();
+                }
+            }
         }
-        let first = ostep.saturating_sub(count as u64);
-        let mut rows = wafer::read_out_rows(&mut self.rt, &vm.lay, vm.ring, first, count)?.into_iter();
-        vm.steps = ostep;
-        let pools = if vm.lay.lprog {
-            let hub = wafer::read_hub_bank(&mut self.rt, &vm.lay)?;
-            vm.slots.pools(&vm.lay, &hub)
-        } else {
-            wafer::read_bank_pools(&mut self.rt, &vm.lay, n)?
-        };
-        Ok(tokens
-            .into_iter()
-            .zip(pools)
-            .zip(mask)
-            .map(|((t, pool), m)| {
-                let token = t.first().copied().unwrap_or_default();
-                if m == 1 { (token, rows.next().unwrap_or_default(), pool) } else { (token, Vec::new(), Vec::new()) }
-            })
-            .collect())
+        Ok(out)
     }
 
     /// The last launch's logits rows of the first HLB lanes (y x 1/rms in
@@ -1340,6 +1407,7 @@ enum Job {
     },
     /// A per-lane-program image's lanes placed.
     VmPlaceLanes {
+        set: usize,
         programs: Vec<Option<super::guest4::slots::LaneProgram>>,
         seeds: Vec<Option<Vec<super::guest4::wafer::Seed>>>,
         parked: Vec<Option<super::guest4::slots::Parked>>,
@@ -1367,8 +1435,10 @@ pub struct Wafer {
     /// The KV positions one sequence may hold (a lane's pages on a batched
     /// build).
     pub positions: usize,
-    /// The head's eta VM (its shape and out ring), when the build has one.
+    /// The head's eta VM (its shape and out ring), when the build has one,
+    /// and a second VM set's (B).
     pub vm: Option<(super::guest4::wafer::VmLayout, super::guest4::lane::Ring)>,
+    pub vm_b: Option<(super::guest4::wafer::VmLayout, super::guest4::lane::Ring)>,
     /// Bytes of one page's host copy (`None`: the host keeps no pages of
     /// this build).
     pub page_bytes: Option<usize>,
@@ -1415,6 +1485,7 @@ impl Wafer {
                             logit_lanes,
                             positions: m.design.positions(),
                             vm: m.vm.as_ref().map(|vm| (vm.lay, vm.ring)),
+                            vm_b: m.vm_b.as_ref().map(|vm| (vm.lay, vm.ring)),
                             page_bytes: m.page_bytes(),
                             thread: None,
                             vocab: m.design.vocab(),
@@ -1461,8 +1532,8 @@ impl Wafer {
                             }
                             continue;
                         }
-                        Job::VmPlaceLanes { programs, seeds, parked, left } => {
-                            let reply = model.vm_place_lanes(&programs, &seeds, &parked).map(|out| {
+                        Job::VmPlaceLanes { set, programs, seeds, parked, left } => {
+                            let reply = model.vm_place_lanes(set, &programs, &seeds, &parked).map(|out| {
                                 let _ = left.send(out);
                                 Vec::new()
                             });
@@ -1622,13 +1693,14 @@ impl Wafer {
     /// [`WaferModel::vm_place_lanes`] on the wafer's thread.
     pub fn vm_place_lanes(
         &mut self,
+        set: usize,
         programs: Vec<Option<super::guest4::slots::LaneProgram>>,
         seeds: Vec<Option<Vec<super::guest4::wafer::Seed>>>,
         parked: Vec<Option<super::guest4::slots::Parked>>,
     ) -> R<Vec<Option<super::guest4::slots::Parked>>> {
         let _busy = super::Busy::start();
         let (tx, rx) = mpsc::channel();
-        self.vm_job(Job::VmPlaceLanes { programs, seeds, parked, left: tx })?;
+        self.vm_job(Job::VmPlaceLanes { set, programs, seeds, parked, left: tx })?;
         rx.recv().map_err(|_| "the wafer thread went away".to_string())
     }
 

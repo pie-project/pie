@@ -390,6 +390,17 @@ pub fn set_gmode(rt: &mut Runtime, lay: &VmLayout, mode: u32) -> R<()> {
         .map_err(|e| e.to_string())
 }
 
+/// `vm_conc`: the set's rows this launch (`gring[3]`; its head rows,
+/// skipped turns included) on every one of its VM PEs, with the ring's
+/// header as it reads. The VM reads it at every launch's start and keeps
+/// it, so it is written before every launch.
+pub fn write_conc_rows(rt: &mut Runtime, lay: &VmLayout, ring: super::lane::Ring, rows: u32) -> R<()> {
+    let at = rect(lay.column_j(0, 0), 0, lay.cols, lay.rows + 1);
+    let n = lay.cols * (lay.rows + 1);
+    let words: Vec<u32> = (0..n).flat_map(|_| [ring.depth, ring.width, ring.lanes, rows]).collect();
+    rt.memcpy_h2d("gring", &words, at, 4, Order::RowMajor, DataType::Bits32).map_err(|e| e.to_string())
+}
+
 /// The VM's pool (every VM PE holds the same words): the pool homes' values
 /// after its last step, the token's home among them.
 pub fn read_pool(rt: &mut Runtime, lay: &VmLayout) -> R<Vec<u32>> {
