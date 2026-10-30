@@ -1165,9 +1165,45 @@ impl KvStore {
         Ok(self.table.log_end(ws, seq, rows)?)
     }
 
+    /// The whole logged pages not sealed yet, as `(start, prev, tokens)`, for
+    /// [`Self::fold`] to be handed their hashes made off the lock.
+    pub fn fold_rows(
+        &self,
+        ws: WorkingSetId,
+    ) -> Result<Option<(u64, Option<Hash256>, Vec<u32>)>, KvStoreError> {
+        let page = u64::from(self.page_size);
+        if page == 0 {
+            return Ok(None);
+        }
+        let sealed = self.table.sealed_prefix(ws)?;
+        let logged = self.table.logged(ws)?;
+        let full = (logged.len() as u64)
+            .div_euclid(page)
+            .min(self.table.mapped_len(ws)?);
+        if full <= sealed {
+            return Ok(None);
+        }
+        let start = sealed * page;
+        let Some(prev) = self.chain_root(ws, start, self.page_size)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            start,
+            prev,
+            logged[start as usize..(full * page) as usize].to_vec(),
+        )))
+    }
+
     /// `decoded` when a decode wrote them, which the cache lets go before a
-    /// prompt.
-    pub fn fold(&mut self, ws: WorkingSetId, to: u64, decoded: bool) -> Result<u64, KvStoreError> {
+    /// prompt. `hashed` is [`Self::fold_rows`] with its `chain_slots`, used
+    /// when it chains from the same row.
+    pub fn fold(
+        &mut self,
+        ws: WorkingSetId,
+        to: u64,
+        decoded: bool,
+        hashed: Option<&(u64, Option<Hash256>, Vec<u32>, Vec<Hash256>)>,
+    ) -> Result<u64, KvStoreError> {
         let folded = self.table.freeze(ws, to)?;
         let page = u64::from(self.page_size);
         if page == 0 {
@@ -1187,7 +1223,14 @@ impl KvStore {
             return Ok(0);
         };
         let tokens = logged[start as usize..(full * page) as usize].to_vec();
-        let slots = hash::chain_slots(&self.domain, prev, start, &tokens);
+        let slots = match hashed {
+            Some((at, root, rows, slots))
+                if *at == start && *root == prev && rows.starts_with(&tokens) =>
+            {
+                slots[..tokens.len()].to_vec()
+            }
+            _ => hash::chain_slots(&self.domain, prev, start, &tokens),
+        };
         self.seal_rows(ws, start, &slots, self.page_size)?;
         if !decoded {
             self.table.reach_prompt(ws, full)?;

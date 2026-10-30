@@ -143,6 +143,6 @@ mod tests {
             .ensure_backed_reserved(ws, pages, &mut granted)
             .unwrap();
         store.log_rows(ws, 0, tokens).unwrap();
-        assert_eq!(store.fold(ws, u64::from(page), false).unwrap(), 1);
+        assert_eq!(store.fold(ws, u64::from(page), false, None).unwrap(), 1);
     }
 }

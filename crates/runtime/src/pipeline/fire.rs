@@ -3353,6 +3353,19 @@ fn settle_fold(
     success: bool,
 ) {
     let FoldAt { by, decoded } = fold;
+    // A prompt's slot hashes are made before the store is locked: 512 rows
+    // take ~0.5 ms, which every other lane's finalize waited out behind it.
+    let hashed = (success && !decoded)
+        .then(|| {
+            crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+                Some((kv.domain(), kv.fold_rows(ws).ok()??))
+            })
+        })
+        .flatten()
+        .map(|(domain, (start, prev, tokens))| {
+            let slots = crate::store::kv::hash::chain_slots(&domain, prev, start, &tokens);
+            (start, prev, tokens, slots)
+        });
     let folded = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
         let frozen = kv.folded(ws)?;
         let (to, cursor) = match by {
@@ -3377,7 +3390,7 @@ fn settle_fold(
             }
         };
         let pages = match to.filter(|_| success) {
-            Some(to) => kv.fold(ws, to, decoded)?,
+            Some(to) => kv.fold(ws, to, decoded, hashed.as_ref())?,
             None => 0,
         };
         Ok::<_, crate::store::kv::KvStoreError>((pages, kv.folded(ws)?, cursor))
@@ -4524,7 +4537,7 @@ mod fold_tests {
         let ws = {
             let mut kv = stores.kv.lock();
             let ws = kv.create_working_set();
-            kv.fold(ws, folded, false).unwrap();
+            kv.fold(ws, folded, false, None).unwrap();
             ws
         };
         (stores, ws)

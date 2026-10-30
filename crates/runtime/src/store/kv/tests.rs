@@ -960,7 +960,7 @@ fn decoded(store: &mut KvStore, tokens: &[u32], prefilled: usize, logged: usize)
     store
         .log_end(ws, seq, Some((0, &tokens[..prefilled])))
         .unwrap();
-    store.fold(ws, prefilled as u64, false).unwrap();
+    store.fold(ws, prefilled as u64, false, None).unwrap();
     for at in prefilled..logged {
         let seq = store.log_begin(ws, at as u64).unwrap();
         store
