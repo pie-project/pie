@@ -245,6 +245,11 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Mx, mma, [4, 200, 2, 384, 1024], f, None, 0),
         (K::MxBias, mma, [8, 80, 4, 192, 2880], t, alpha, 2),
         (K::Mx, mma, [8, 120, 4, 256, 512], t, None, 1),
+        // A wide fire of K whole 128s: the eight-warp ring of codes and
+        // routes, a partial 256-row tile by route, its GLU under scales past
+        // the f16 range.
+        (K::Mx, mma, [8, 400, 4, 320, 1024], f, None, 0),
+        (K::MxBias, mma, [8, 400, 4, 192, 2048], t, alpha, 2),
         // Hopper's wgmma slice below the staged kernel's 32 routes an expert.
         (K::Mx, mma, [8, 48, 4, 384, 1024], t, None, 0),
         (K::MxBias, mma, [8, 32, 4, 192, 2048], t, alpha, 0),
