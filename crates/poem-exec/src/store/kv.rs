@@ -340,10 +340,11 @@ impl Paging {
             Some(window) => {
                 let past = pages.saturating_sub(u64::from(self.pages_per_slot));
                 // Lanes that share the pages never past their windows hold a
-                // windowed page for each kv page.
+                // windowed page for each kv page, and one more each.
                 let short = window.lanes > 0
                     && pages / u64::from(window.lanes) <= u64::from(self.window_held());
                 1 + pages.min(u64::from(self.window_ring()) + if short { past } else { past / 2 })
+                    + if short { u64::from(window.lanes) } else { 0 }
             }
         }
     }
