@@ -66,6 +66,9 @@ state_slots_per_lane = 2
 # prompt fires pad to 64 lanes, not the 512 decoding lanes two slots seat: Qwen3.8-Flash-Next mini
 # raw prefill 58.9k -> 68.7k, pf16-512 150.1k -> 160.5k tok/s, c512 unchanged, greedy parity unchanged
 prefill_lanes = 64
+# a prefill's fire on sixteen buckets a doubling: gemma-4-31b pf16-512's 14-lane fire (7742 rows) ran
+# the 8192 bucket's GEMMs, now 7845's; pf16 5,845 -> 6,282 tok/s, pf8 5,941 -> 6,047, greedy tokens unchanged
+prefill_lattice_steps = 16
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"
