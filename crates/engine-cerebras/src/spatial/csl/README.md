@@ -34,6 +34,27 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
   (`kvstage.csl`: serve2d*'s KV page staging, `KVST` slots a paged-grid PE;
   serve8b's is in its `grid_extra.csl`), layout, routing helpers,
   `*_extra.csl` (what it appends to each kernel) and base programs.
+- serve2d_pipe's second VM set, as hardware ran it (0156's build with
+  Fork 3's radix image and 0168's sum defaults: 1232 bytes free on set A's
+  fullest VM PE, 928 on set B's; typical and tail-free fit it together, 114
+  ops, and its bank holds tail-free's window, 552 words, or two typical
+  lanes', 590). In the deployment's config:
+
+  ```toml
+  [cerebras.spatial.serve.vm_b]
+  cols = 6
+  max_ops = 136
+  nreg = 6
+  pool_words = 904
+  bank_words = 640
+  feat = 495
+  opmask_lo = 1878015419
+  opmask_hi = 256
+  ring_w = 8
+  ring_d = 16
+  rows = 2
+  lanes = 2
+  ```
 - `serve8b_region_pipe/`: serve8b_region as a pipeline ring (`PIPE`, up to
   `MMAX` micro-batches a lap): its layout, the units' `grid_extra.csl`
   (per-micro-batch tables `mtab`, the index word after x to the head), the

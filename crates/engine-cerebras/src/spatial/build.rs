@@ -958,6 +958,28 @@ mod tiny {
         assert!(ServeConfig::from_toml(&no_cols, 16).unwrap_err().contains("cols"));
     }
 
+    /// The csl README's `[vm_b]` (serve2d_pipe's set B as hardware ran it)
+    /// parses to 0156's `b_*` parameters with the fitted limits.
+    #[test]
+    fn the_readme_vm_b_is_the_fitted_set_b() {
+        let readme = include_str!("csl/README.md");
+        let at = readme.find("[cerebras.spatial.serve.vm_b]").expect("the README's [vm_b]");
+        let block: String = readme[at..readme[at..].find("```").map_or(readme.len(), |e| at + e)]
+            .lines()
+            .skip(1)
+            .map(|l| format!("{}\n", l.trim()))
+            .collect();
+        let t: toml::Table = toml::from_str(&format!("[vm_b]\n{block}")).unwrap();
+        let (img, cols) = ServeConfig::from_toml(&t, 16).unwrap().vm_b.unwrap();
+        let got: Vec<(&str, usize)> = img.params_b(cols);
+        let want = "VMB:6,b_max_ops:136,b_nreg:6,b_pool_words:904,b_feat:495,b_ring_w:8,b_ring_d:16,b_vm_prof:0,\
+                    b_vm_lanes:2,b_vm_rows:2,b_vm_lprog:1,b_bank_words:640,b_vm_pwalk:1,b_vm_sin:0,\
+                    b_opmask_lo:1878015419,b_opmask_hi:256";
+        let want: Vec<(&str, usize)> =
+            want.split(',').map(|kv| kv.split_once(':').map(|(k, v)| (k, v.parse().unwrap())).unwrap()).collect();
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn a_plan_without_a_program_is_refused() {
         let goals = Goals { pipeline: true, ..Goals::lanes(2) };
