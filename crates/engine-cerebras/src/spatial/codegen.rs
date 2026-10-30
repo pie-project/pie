@@ -688,7 +688,7 @@ param S2D_VMC: u16;\nparam S2D_VMAT: u16;\n\
     s = patch(
         &s,
         "fn compute(steps: u32) void {\n  timestamp.enable_tsc();\n  steps_total = steps;\n  pass_i = 0;\n  @activate(STEP);\n}\n",
-        "fn compute(laps: u32, nmb: u32) void {\n  timestamp.enable_tsc();\n  steps_total = laps * nmb;\n  pass_i = 0;\n  s2d_start();\n}\n",
+        "fn compute(laps: u32, nmb: u32) void {\n  timestamp.enable_tsc();\n  // nmb's high half: the head's launch flags (DEFER).\n  steps_total = laps * (nmb & 0xffff);\n  pass_i = 0;\n  s2d_start();\n}\n",
         "compute",
     )?;
     let mut own = exports(&s);
@@ -1339,10 +1339,10 @@ mod tests {
         ("serve2d", "head_stub.csl", "572f7e7c6f8065a29970ea1785b55023d77d313daf0b2f6051254be096235a1f"),
         ("serve2d", "filler.csl", "9f435cfd600f91915db70d1bd947c202a90a21fe3f72decd974173f977f09211"),
         ("serve2d", "vm_pe.csl", "ac1e9110a0d4e1253d48df48477ddcaf53aad7cf007969b6077eec53f2a88c42"),
-        ("serve2d_pipe", "grid_pe.csl", "37bb4a86878b05fede651b072293f28fcf9b69e05786111b976bfe909ca22991"),
-        ("serve2d_pipe", "head_pe.csl", "dbad3ea4babb668918bf15b15cf79eb1889a067c33836931af3119b8fd42ce59"),
+        ("serve2d_pipe", "grid_pe.csl", "01cad0a29fb7d9d9a2780160bde68ca5e9510dac712f4be376ddedbdc4caeb8c"),
+        ("serve2d_pipe", "head_pe.csl", "3e5ec4d008e92b055b42c1d315fe7aa328ebf4cd6f8a3acc801062644dc0449e"),
         ("serve2d_pipe", "filler.csl", "9d5a34b90889efbb80c0f5bff82fc6e0723f50143729cf57d4edf05156e38f71"),
-        ("serve2d_pipe", "vm_pe.csl", "b8ffbb627cb83ee79efa610efe2a3f02a73b6df86fb9803902a680382c295840"),
+        ("serve2d_pipe", "vm_pe.csl", "e4a4b11b46a9638b7d4727b028b6b61dc2dd3a1f7c013d1ce44df45a510ff95d"),
         ("serve8b", "grid_pe.csl", "04c7a6d99f99b15cd845ef9c3d0ef20aac4ef23d2cae04a2af0315278860b56f"),
         ("serve8b", "head_pe.csl", "c9d5b14ad454fd62eae6c592fd2c2e21b484c59b29c160a1c363e6307bfd054d"),
         ("serve8b", "embed_pe.csl", "991c1ce046039415a39f9afb0c6e2e8673a91ff3e7057637abd6477fc99f39e9"),

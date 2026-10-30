@@ -100,8 +100,14 @@ param opmask_hi: u32 = 0xffffffff;
 // Fork 3's merged VM (guest4hz): the canonical sum's mode (1 pipelined chunks,
 // 2 one-pass concatenating), wide logits rows (l2w), and set B's token color
 // to set A's sender (unrouted on row F at the head's VM columns). Both sets.
-param vm_sumpipe: u16 = 3;
-param vm_l2w: u16 = 1;
+// 1: the head can take a VM step's tokens one step later (compute's nmb bit
+// 16 per launch; head_extra.csl, DEFER). 0: the blocking head only.
+param DEFER: u16 = 0;
+// 1: the two VM sets run at once (Fork 3's vm_conc): set B's rows on colour 13,
+// its tokens on C_BT straight to the final root. Every lane of a VM launch on the VM.
+param VMCONC: u16 = 0;
+param vm_sumpipe: u16 = 1;
+param vm_l2w: u16 = 0;
 param vm_c_bt: u16 = 12;
 param HLM: u16 = 4;
 param SPEC_H: u16;
@@ -150,7 +156,7 @@ layout {
           .ring_w = ring_w, .vm_prof = vm_prof, .vm_lanes = if (vm_lanes > 0) vm_lanes else MMAX * B, .vm_rows = vm_rows,
           .vm_sin = vm_sin, .opmask_lo = opmask_lo, .opmask_hi = opmask_hi,
           .vm_lprog = vm_lprog, .bank_words = bank_words,
-          .vm_pwalk = vm_pwalk, .vm_sumpipe = vm_sumpipe, .vm_l2w = vm_l2w, .vm_c_bt = vm_c_bt,
+          .vm_conc = VMCONC, .vm_pwalk = vm_pwalk, .vm_sumpipe = vm_sumpipe, .vm_l2w = vm_l2w, .vm_c_bt = vm_c_bt,
           .GPX = PX, .GPY = PY, .GW = GW, .GH = GH, .S2D_SB = B,
         });
       } else if (VM == 1 and VMB > 0 and x > GW * PX + HR2X + VMC and x <= GW * PX + HR2X + VMT and y <= HH) {
@@ -167,7 +173,7 @@ layout {
           .ring_w = b_ring_w, .vm_prof = b_vm_prof, .vm_lanes = b_vm_lanes, .vm_rows = b_vm_rows,
           .vm_sin = b_vm_sin, .opmask_lo = b_opmask_lo, .opmask_hi = b_opmask_hi,
           .vm_lprog = b_vm_lprog, .bank_words = b_bank_words,
-          .vm_pwalk = b_vm_pwalk, .vm_sumpipe = vm_sumpipe, .vm_l2w = vm_l2w, .vm_c_bt = vm_c_bt,
+          .vm_conc = VMCONC, .vm_pwalk = b_vm_pwalk, .vm_sumpipe = vm_sumpipe, .vm_l2w = vm_l2w, .vm_c_bt = vm_c_bt,
           .GPX = PX, .GPY = PY, .GW = GW, .GH = GH, .S2D_SB = B,
         });
       } else if (x >= GW * PX and y <= HH) {
@@ -178,7 +184,7 @@ layout {
           .VMC = VMT, .WF32 = WF32,
           .GPX = PX, .GPY = PY, .GW = GW, .GH = GH, .CAP = CAP, .SB = B, .HB = HB, .HLB = HLB, .MMAX = MMAX,
           .GE = E, .S2D_DBG = 0,
-          .SMP = SMP, .SPEC = SPEC, .GPS = PS, .SPEC_H = SPEC_H, .SPEC_T = SPEC_T, .SPEC_O = SPEC_O,
+          .SMP = SMP, .SPEC = SPEC, .DEFER = DEFER, .VMCONC = VMCONC, .GPS = PS, .SPEC_H = SPEC_H, .SPEC_T = SPEC_T, .SPEC_O = SPEC_O,
           .S2D_REG = if (y == HH / 2) 0 else 1,
           .S2D_ROOTC = if (x - GW * PX == HR2X and y != HH / 2) 1 else 0,
           .S2D_FINAL = if (x - GW * PX == HR2X and y == HH / 2) 1 else 0,

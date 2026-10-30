@@ -157,9 +157,19 @@ fn s2d_pass() void {
 fn s2d_restore() void {
   if (s2d_injected) {
     s2d_pass();
+    s2d_oq_drained(3);
     s2d_rt.oq_color(3, s2d_rt.cn(c_r1_0));
     s2d_injected = false;
   }
+}
+
+// An output queue is recolored only once it has drained: a DSD send completes
+// when its wavelets enter the queue, not when they leave it, and with
+// micro-batches back to back (or a deferred step's row sums still leaving)
+// the previous use can still be in it (Fork 11's 0148/0149: "OUT_Q[2] must be
+// empty during config"; bit 8 + q of the status is queue q's empty flag).
+fn s2d_oq_drained(comptime q: u16) void {
+  while ((tile_config.output_queue_status.get_raw() & (@as(u16, 0x0100) << q)) == 0) {}
 }
 
 // Whether this step sends embeddings on (not a launch's last iteration).
@@ -450,12 +460,9 @@ fn smp_advance() void {
 }
 
 // ---------------------------------------------------------------- a head step
-fn hb_step_region() void {
-  // 0: the HB normed chunks arrive (the last step's injector may restore);
-  // 1: the GEMVs, then the sums of h^2.
-  @fmovs(hb_xs_dsd, fin(q_x_in, HB * Hc));
-  s2d_restore();
-  mark(0);
+// Shared by the blocking step and the deferred halves (one copy of the code
+// each: the root column's PEs are near full).
+noinline fn hb_logits() void {
   @fmovs(hb_y_dsd, 0.0);
   var b: u16 = 0;
   while (b < HB) : (b += 1) {
@@ -473,30 +480,76 @@ fn hb_step_region() void {
   // 2: the row sum of every lane at once.
   reduce(false, C, Gx, col, hb_y_dsd, HB * YS);
   mark(2);
+}
+noinline fn hb_root_rows() void {
+  var b: u16 = 0;
+  b = 0;
+  while (b < HB) : (b += 1) {
+    const vl = s2d_mb * SB + s2d_grp * HB + b;
+    s2d_yscale[vl] = rsqrt_f(hb_y[b * YS + Vr] / @as(f32, C * Hc) + 1.0e-6);
+    if (vl < HLB) {
+      @fmovs(@increment_dsd_offset(s2d_hl_dsd, @as(i16, vl * Vr), f32),
+             @increment_dsd_offset(hb_y1_dsd, @as(i16, b * YS), f32));
+    }
+  }
+}
+noinline fn hb_vm_rows() void {
+  var b: u16 = 0;
+  b = 0;
+  while (b < HB) : (b += 1) {
+    const vl = s2d_mb * SB + s2d_grp * HB + b;
+    hb_y[b * YS + Vr] = s2d_yscale[vl];
+    // ctl: 2·set + (1: skip the turn), set 0 = A, 1 = B (two VM sets).
+    hb_y[b * YS + Vr + 1] = @as(f32, 2 * vmlane[VLW * vl + 3] + (if (hb_vm_lane(vl)) @as(u32, 0) else 1));
+    if (hb_conc_b(vl)) {
+      @fmovs(fout(q_r2_1_out, Vr + 2),
+             @set_dsd_length(@increment_dsd_offset(hb_y1_dsd, @as(i16, b * YS), f32), Vr + 2));
+    } else {
+      @fmovs(fout(q_x_out, Vr + 2),
+             @set_dsd_length(@increment_dsd_offset(hb_y1_dsd, @as(i16, b * YS), f32), Vr + 2));
+    }
+  }
+}
+noinline fn hb_region_emb() void {
+  if (!hb_sends()) { return; }
+  hb_schedule();
+  var k: u16 = 0;
+  while (k < HB) : (k += 1) {
+    if (k > 0 and hb_rnd[k] != hb_rnd[k - 1]) {
+      @fmovs(hb_go_dsd, fin(q_x_in, 1));
+      s2d_restore();
+    }
+    const v = @as(u32, hb_ib[hb_ord[k]]);
+    if (v >= base and v < base + @as(u32, nvalid)) {
+      const j = @as(u16, v - base);
+      for (@range(u16, Hc)) |h| { hb_emb[h] = wt32[1 + h * Vr + j]; }
+      if (py < F) { color_config.reset_routes(C_EU, .{ .rx = RAMP, .tx = SOUTH }); }
+      else { color_config.reset_routes(C_EU, .{ .rx = RAMP, .tx = NORTH }); }
+      s2d_oq_drained(3);
+      s2d_rt.oq_color(3, s2d_rt.cn(C_EU));
+      s2d_injected = true;
+      @fmovs(fout(q_r1_0_out, Hc), hb_emb_dsd);
+    }
+  }
+  mark(4);
+}
+
+fn hb_step_region() void {
+  // 0: the HB normed chunks arrive (the last step's injector may restore);
+  // 1: the GEMVs, then the sums of h^2.
+  @fmovs(hb_xs_dsd, fin(q_x_in, HB * Hc));
+  s2d_restore();
+  mark(0);
+  hb_logits();
+  var b: u16 = 0;
   // 3: the root column's argmax a lane, the pairs down its halves; the winners.
   if (root_col) {
-    b = 0;
-    while (b < HB) : (b += 1) {
-      const vl = s2d_mb * SB + s2d_grp * HB + b;
-      s2d_yscale[vl] = rsqrt_f(hb_y[b * YS + Vr] / @as(f32, C * Hc) + 1.0e-6);
-      if (vl < HLB) {
-        @fmovs(@increment_dsd_offset(s2d_hl_dsd, @as(i16, vl * Vr), f32),
-               @increment_dsd_offset(hb_y1_dsd, @as(i16, b * YS), f32));
-      }
-    }
+    hb_root_rows();
     if (hb_vm()) {
       // The VM: each lane's row, 1/rms and ctl (Vr + 2 words) east to the VM
       // columns, in lane order (ctl 1: the VM skips the lane's turn: a forced
       // row or an argmax lane); the tokens come back through the final root.
-      b = 0;
-      while (b < HB) : (b += 1) {
-        const vl = s2d_mb * SB + s2d_grp * HB + b;
-        hb_y[b * YS + Vr] = s2d_yscale[vl];
-        // ctl: 2·set + (1: skip the turn), set 0 = A, 1 = B (two VM sets).
-        hb_y[b * YS + Vr + 1] = @as(f32, 2 * vmlane[VLW * vl + 3] + (if (hb_vm_lane(vl)) @as(u32, 0) else 1));
-        @fmovs(fout(q_x_out, Vr + 2),
-               @set_dsd_length(@increment_dsd_offset(hb_y1_dsd, @as(i16, b * YS), f32), Vr + 2));
-      }
+      hb_vm_rows();
     }
     if (hb_argmax_step()) {
       if (SMP == 1) { smp_perturb(); }
@@ -515,26 +568,7 @@ fn hb_step_region() void {
   if (SMP == 1) { smp_advance(); }
   mark(3);
   // 4: the winners' chunks to the feeder, in rounds.
-  if (!hb_sends()) { return; }
-  hb_schedule();
-  var k: u16 = 0;
-  while (k < HB) : (k += 1) {
-    if (k > 0 and hb_rnd[k] != hb_rnd[k - 1]) {
-      @fmovs(hb_go_dsd, fin(q_x_in, 1));
-      s2d_restore();
-    }
-    const v = @as(u32, hb_ib[hb_ord[k]]);
-    if (v >= base and v < base + @as(u32, nvalid)) {
-      const j = @as(u16, v - base);
-      for (@range(u16, Hc)) |h| { hb_emb[h] = wt32[1 + h * Vr + j]; }
-      if (py < F) { color_config.reset_routes(C_EU, .{ .rx = RAMP, .tx = SOUTH }); }
-      else { color_config.reset_routes(C_EU, .{ .rx = RAMP, .tx = NORTH }); }
-      s2d_rt.oq_color(3, s2d_rt.cn(C_EU));
-      s2d_injected = true;
-      @fmovs(fout(q_r1_0_out, Hc), hb_emb_dsd);
-    }
-  }
-  mark(4);
+  hb_region_emb();
 }
 
 fn hb_step_feeder() void {
@@ -578,7 +612,8 @@ fn hb_step_feeder() void {
     // last row the program's), all of the step's first; then each lane.
     b = 0;
     while (b < HB) : (b += 1) {
-      @fmovs(hb_vt_dsd, fin(q_x_in, 1));
+      if (hb_conc_b(s2d_mb * SB + s2d_grp * HB + b)) { @fmovs(hb_vt_dsd, fin(q_r2_1_in, 1)); }
+      else { @fmovs(hb_vt_dsd, fin(q_x_in, 1)); }
       hb_vts[b] = hb_vt[0];
     }
     b = 0;
@@ -762,14 +797,155 @@ fn spec_shift(a: u32) void {
 
 // `laps` laps of `nmb` micro-batches (see above). The final root's prof:
 // cycles of its steps after the first lap, [0..2] by phase, [8] the steps.
+// ---------------------------------------------------------------- deferred VM tokens
+// DEFER (the launch's nmb, bit 16; VM builds, every lane on the VM, nmb >= 2,
+// no SMP / SPEC): a head step is split in two. A(s): x in, the GEMVs, the row
+// sum, and the root column's rows to the VM, without waiting for the tokens.
+// B(s): the final root takes the HB tokens (in row order), decides and
+// multicasts them, the embedding rounds, and after a micro-batch's last group
+// its payload on to layer 0. Every head PE runs A(s + 1) before B(s), so the
+// VM samples step s's rows while the head takes the next micro-batch's x.
+// (nmb >= 2: step s + 1's x is another micro-batch's, already on its way.)
+// B(s) runs with step s's (iteration, micro-batch, group); the feeders keep
+// each micro-batch's table (s2d_tsave), since A(s + 1) overwrites s2d_xb.
+param VMCONC: u16 = 0;     // layout VMCONC: set B runs at once with A (vm_conc)
+// vm_conc (VMCONC 1, a VM launch): set B's rows leave the root column on
+// colour 13 through output queue 6 (the argmax chain's: every lane of a VM
+// launch is on the VM, so the chain is idle), its tokens reach the final root
+// on C_BT (12) through input queue 6. Bound at compute start, restored at the
+// end, each recolor after its queue has drained.
+const C_VL2: color = @get_color(13);
+const C_BT2: color = @get_color(12);
+fn s2d_conc(on: bool) void {
+  if (root_col and py != F) {
+    s2d_oq_drained(6);
+    if (on) {
+      color_config.reset_routes(C_VL2, .{ .rx = RAMP, .tx = EAST });
+      s2d_rt.oq_color(6, s2d_rt.cn(C_VL2));
+    } else {
+      s2d_rt.oq_color(6, s2d_rt.cn(c_r2_1));
+    }
+  }
+  if (col == R2X and py == F) {
+    if (on) {
+      color_config.reset_routes(C_BT2, .{ .rx = EAST, .tx = RAMP });
+      s2d_rt.iq_color(6, s2d_rt.cn(C_BT2));
+    } else {
+      s2d_rt.iq_color(6, s2d_rt.cn(c_r2_1));
+    }
+  }
+}
+// a lane's VM set under vm_conc (vmlane word 3)
+fn hb_conc_b(vl: u16) bool { return VMCONC == 1 and vmlane[VLW * vl + 3] == 1; }
+param DEFER: u16 = 0;      // layout DEFER: the image supports the deferred launch flag
+const DEFER_OK: bool = DEFER == 1 and VMC >= 1 and SMP == 0 and SPEC == 0;
+const TSAVEN: u16 = if (S2D_REG == 0 and DEFER_OK) MMAX * S2D_NTAB else 1;
+var s2d_tsave = @zeros([TSAVEN]f32);
+const s2d_tsave_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{S2D_NTAB} -> s2d_tsave[i] });
+
+fn hb_region_a() void {
+  @fmovs(hb_xs_dsd, fin(q_x_in, HB * Hc));
+  s2d_restore();
+  mark(0);
+  hb_logits();
+  if (root_col) {
+    hb_root_rows();
+    hb_vm_rows();
+  }
+}
+
+fn hb_region_b() void {
+  @fmovs(hb_ib_dsd, fin(q_ib_in, HB + 1));
+  mark(3);
+  hb_region_emb();
+}
+
+fn hb_feeder_a() void {
+  if (s2d_iter > 0 and s2d_grp == 0) {
+    @fmovs(s2d_xb_dsd, fin(q_r1_1_in, S2D_NIO));
+    @fmovs(@increment_dsd_offset(s2d_tsave_dsd, @as(i16, s2d_mb * S2D_NTAB), f32), s2d_xtab_dsd);
+  }
+  var b: u16 = 0;
+  while (b < HB) : (b += 1) {
+    const lane = s2d_grp * HB + b;
+    const xl = @increment_dsd_offset(hb_xs1_dsd, @as(i16, b * Hc), f32);
+    var ss: f32 = 0.0;
+    const xi = @increment_dsd_offset(s2d_xb1_dsd, @as(i16, lane * Hc), f32);
+    @fmuls(xl, xi, gam_dsd);
+    for (@range(u16, Hc)) |h| {
+      const v = s2d_xb[lane * Hc + h];
+      ss += v * v;
+    }
+    hb_xs[HB * Hc + b] = ss;
+  }
+  @fmovs(fout(q_x_out, HB * Hc), hb_xs_dsd);
+  @fmovs(fout(q_x_out, HB), hb_ss_dsd);
+  mark(0);
+}
+
+fn hb_feeder_b() void {
+  var b: u16 = 0;
+  if (col == R2X) {
+    // the final root: step s's tokens, one a row in row order (the VM keeps it)
+    b = 0;
+    while (b < HB) : (b += 1) {
+      if (hb_conc_b(s2d_mb * SB + s2d_grp * HB + b)) { @fmovs(hb_vt_dsd, fin(q_r2_1_in, 1)); }
+      else { @fmovs(hb_vt_dsd, fin(q_x_in, 1)); }
+      hb_vts[b] = hb_vt[0];
+    }
+    b = 0;
+    while (b < HB) : (b += 1) {
+      const vl = s2d_mb * SB + s2d_grp * HB + b;
+      const last = @as(u16, vmlane[VLW * vl + 2]);
+      hb_ib[b] = s2d_decide(vl, hb_vts[b + last]);
+    }
+    hb_ib[HB] = -1.0;
+    @fmovs(fout(q_ib_out, HB + 1), hb_ib_dsd);
+  } else {
+    @fmovs(hb_ib_dsd, fin(q_ib_in, HB + 1));
+  }
+  mark(1);
+  if (!hb_sends()) { return; }
+  hb_schedule();
+  var k: u16 = 0;
+  while (k < HB) : (k += 1) {
+    if (k > 0 and hb_rnd[k] != hb_rnd[k - 1]) { @fmovs(fout(q_x_out, 1), hb_go_dsd); }
+    const lb = hb_ord[k];
+    if (hb_upper(lb)) { color_config.reset_routes(C_EU, .{ .rx = NORTH, .tx = RAMP }); }
+    else { color_config.reset_routes(C_EU, .{ .rx = SOUTH, .tx = RAMP }); }
+    const lane = s2d_grp * HB + lb;
+    @fmovs(@increment_dsd_offset(s2d_eb1_dsd, @as(i16, lane * Hc), f32), fin(q_r1_0_in, Hc));
+  }
+  if (s2d_grp == NGRP - 1) {
+    @fmovs(s2d_etab_dsd, @increment_dsd_offset(s2d_tsave_dsd, @as(i16, s2d_mb * S2D_NTAB), f32));
+    @fmovs(fout(q_r1_1_out, S2D_NIO), s2d_eb_dsd);
+  }
+  mark(2);
+}
+
+fn hb_a() void { if (py == F) { hb_feeder_a(); } else { hb_region_a(); } }
+fn hb_b() void { if (py == F) { hb_feeder_b(); } else { hb_region_b(); } }
+
 fn compute(laps: u32, nmb: u32) void {
   timestamp.enable_tsc();
   s2d_steps = laps;
+  const nm = nmb & 0xffff;
+  // vm_conc: the queues are rebound at iteration 1's start, not here:
+  // iteration 0 (the bootstrap) runs the argmax pair chain on them.
+  const conc = VMCONC == 1 and VMC >= 1 and gmode[0] == 1 and !vm;
+  var conc_on = false;
+  // DEFER (bit 16): step s's tokens are taken after step s + 1's A half.
+  const dfr = DEFER_OK and (nmb >> 16) != 0 and nm >= 2;
+  var pend = false;
+  var pi: u32 = 0;
+  var pm: u16 = 0;
+  var pg: u16 = 0;
   var i: u32 = 0;
   while (i <= laps) : (i += 1) {
     s2d_iter = i;
+    if (conc and i == 1) { s2d_conc(true); conc_on = true; }
     var m: u16 = 0;
-    while (m < @as(u16, nmb)) : (m += 1) {
+    while (m < @as(u16, nm)) : (m += 1) {
       s2d_mb = m;
       var g: u16 = 0;
       while (g < NGRP) : (g += 1) {
@@ -777,10 +953,25 @@ fn compute(laps: u32, nmb: u32) void {
         timing = i >= 1 and i < laps;
         if (timing) { prof[8] += 1; }
         timestamp.get_timestamp(&t_mark);
-        if (vm) { step_vm(); } else if (py == F) { hb_step_feeder(); } else { hb_step_region(); }
+        if (vm) {
+          step_vm();
+        } else if (dfr and hb_vm()) {
+          hb_a();
+          if (pend) {
+            s2d_iter = pi; s2d_mb = pm; s2d_grp = pg;
+            hb_b();
+            s2d_iter = i; s2d_mb = m; s2d_grp = g;
+          }
+          pend = true; pi = i; pm = m; pg = g;
+        } else if (py == F) { hb_step_feeder(); } else { hb_step_region(); }
       }
     }
   }
+  if (pend) {
+    s2d_iter = pi; s2d_mb = pm; s2d_grp = pg;
+    hb_b();
+  }
+  if (conc_on) { s2d_conc(false); }
   sys_mod.unblock_cmd_stream();
 }
 

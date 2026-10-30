@@ -924,7 +924,7 @@ noinline fn sum_cat() void {
   @fmovs(red_dsd(1), fab_in(q7_in, 1));
 }
 const SUMPIPE: bool = vm_sumpipe != 0;
-comptime { if (SPLIT) { @comptime_assert(vm_sumpipe <= 1 and !OPK_LISTS); } }
+comptime { if (SPLIT) { @comptime_assert(vm_sumpipe != 0 and vm_sumpipe != 2 and !OPK_LISTS); } }
 const SUMROWS: bool = vm_sumpipe == 3 and NB == 1 and Vt == 32 and 32 * NVC <= RB;
 const SR_COL = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{32} -> red[i * @as(i16, NVC)] });
 fn sr_pass(n: u16) void { if (n > 0) { @fmovs(fab_out(q3_out, n), fab_in(q4_in, n)); } }
@@ -938,6 +938,39 @@ const SR_T8 = @get_dsd(mem4d_dsd, .{ .tensor_access = |g, i|{NVC, 8} -> red[g * 
 const SR_T4 = @get_dsd(mem4d_dsd, .{ .tensor_access = |g, i|{NVC, 4} -> red[g * 32 + i] });
 const SR_T2 = @get_dsd(mem4d_dsd, .{ .tensor_access = |g, i|{NVC, 2} -> red[g * 32 + i] });
 const SR_T1 = @get_dsd(mem4d_dsd, .{ .tensor_access = |g, i|{NVC, 1} -> red[g * 32 + i] });
+// vm_split: chain c's far row among a half's chunk rows [s0, s0 + len)
+// (north: the first of its parity, south: the last); past them if none
+fn sr_far(north: bool, c: u16, s0: u16, len: u16) u16 {
+  if (north) {
+    const want = (F - 1 - c) % 2;
+    return if (s0 % 2 == want) s0 else s0 + 1;
+  }
+  const e = s0 + len - 1;
+  const want = (F + c) % 2;
+  return if (e % 2 == want) e else e - 1;   // (s0 - 1 when none: e = s0 of the other parity)
+}
+fn sr_has(north: bool, c: u16, s0: u16, len: u16) bool {
+  if (len == 0) { return false; }
+  const f = sr_far(north, c, s0, len);
+  return if (north) f < s0 + len else f + 1 > s0;
+}
+// a half's two chains into red[0..n) (the first present moves, the second adds)
+fn sr_join(comptime q0: input_queue, comptime q1: input_queue, north: bool, s0: u16, n: u16) void {
+  const h0 = sr_has(north, 0, s0, n);
+  const h1 = sr_has(north, 1, s0, n);
+  if (h0) { @fmovs(red_dsd(n), fab_in(q0, n)); }
+  if (h1) { if (h0) { @fadds(red_dsd(n), red_dsd(n), fab_in(q1, n)); } else { @fmovs(red_dsd(n), fab_in(q1, n)); } }
+}
+// the same into the last hub's own column (rows r .. r + n of the chunk)
+fn sr_col2(comptime q0: input_queue, comptime q1: input_queue, north: bool, s0: u16, r: u16, n: u16) void {
+  const h0 = sr_has(north, 0, s0, n);
+  const h1 = sr_has(north, 1, s0, n);
+  if (h0) { sr_col(q0, NVC - 1, r, n); }
+  if (h1) {
+    const dst = @set_dsd_length(@increment_dsd_offset(SR_COL, @as(i16, r * NVC + NVC - 1), f32), n);
+    if (h0) { @fadds(dst, dst, fab_in(q1, n)); } else { @fmovs(dst, fab_in(q1, n)); }
+  }
+}
 noinline fn sum_rows() void {
   const nch = (H + 31) / 32;
   if (!hub) { red[0] = myblk[0]; }
@@ -951,11 +984,15 @@ noinline fn sum_rows() void {
       const len = if (north) nn else ns;
       if (len == 0) { continue; }
       const s0 = if (north) r0 else r0 + nn;   // the half's first chunk row
-      // in the chain: between the chunk's far row and the hub
-      if (north and vry < s0) { continue; }
-      if (!north and vry > s0 + len - 1) { continue; }
+      // the chain's far row in the chunk (vm_split: this PE's chain, rows
+      // of one parity); in the chain: between it and the hub
+      const sc_: u16 = (if (north) F - 1 - vry else vry - F) % 2;
+      if (SPLIT and !sr_has(north, sc_, s0, len)) { continue; }   // no row of this chain in the chunk
+      const fr = if (!SPLIT) (if (north) s0 else s0 + len - 1) else sr_far(north, sc_, s0, len);
+      if (north and vry < fr) { continue; }
+      if (!north and vry > fr) { continue; }
       const mine = vry >= s0 and vry < s0 + len;
-      const far = if (north) vry == s0 else vry == s0 + len - 1;
+      const far = vry == fr;
       if (!mine) {
         sr_pass(len);
       } else {
@@ -972,14 +1009,27 @@ noinline fn sum_rows() void {
       }
     } else if (!hub_last) {
       if (!hub_first) { @fmovs(fab_out(q3_out, VJ * (r1 - r0)), fab_in(q6_in, VJ * (r1 - r0))); }
-      if (nn > 0) { @fmovs(fab_out(q3_out, nn), fab_in(q4_in, nn)); }
-      if (ns > 0) { @fmovs(fab_out(q3_out, ns), fab_in(q5_in, ns)); }
+      if (SPLIT) {
+        // each half's two chains joined (one adds 0 where the other has the row)
+        sr_join(q4_in, q3_in, true, r0, nn);
+        if (nn > 0) { @fmovs(fab_out(q3_out, nn), red_dsd(nn)); }
+        sr_join(q5_in, q2_in, false, r0 + nn, ns);
+        if (ns > 0) { @fmovs(fab_out(q3_out, ns), red_dsd(ns)); }
+      } else {
+        if (nn > 0) { @fmovs(fab_out(q3_out, nn), fab_in(q4_in, nn)); }
+        if (ns > 0) { @fmovs(fab_out(q3_out, ns), fab_in(q5_in, ns)); }
+      }
     } else {
       const L = r1 - r0;
       if (L < 32) { @fmovs(red_dsd(32 * NVC), 0.0); }   // a short last chunk: its missing lanes 0
       { var c: u16 = 0; while (c + 1 < NVC) : (c += 1) { sr_col(q6_in, c, 0, L); } }
-      sr_col(q4_in, NVC - 1, 0, nn);
-      sr_col(q5_in, NVC - 1, nn, ns);
+      if (SPLIT) {
+        sr_col2(q4_in, q3_in, true, r0, 0, nn);
+        sr_col2(q5_in, q2_in, false, r0 + nn, nn, ns);
+      } else {
+        sr_col(q4_in, NVC - 1, 0, nn);
+        sr_col(q5_in, NVC - 1, nn, ns);
+      }
       // the chunk's NVC groups' trees at once (offsets 16 .. 1), their sums to l2
       @fadds(SR_T16, SR_T16, @increment_dsd_offset(SR_T16, 16, f32));
       @fadds(SR_T8, SR_T8, @increment_dsd_offset(SR_T8, 8, f32));

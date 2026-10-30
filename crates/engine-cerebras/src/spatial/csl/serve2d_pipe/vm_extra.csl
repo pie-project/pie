@@ -12,5 +12,6 @@ fn s2d_vm_paths() void {
 
 // The ring's `compute(laps, nmb)`: laps · nmb · B lane-turns.
 fn compute(laps: u32, nmb: u32) void {
-  s2d_vm_run(laps * nmb * @as(u32, S2D_SB));
+  // nmb's high half: the head's launch flags (DEFER).
+  s2d_vm_run(laps * (nmb & 0xffff) * @as(u32, S2D_SB));
 }

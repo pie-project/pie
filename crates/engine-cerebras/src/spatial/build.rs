@@ -546,7 +546,13 @@ fn refused(design: Design, params: &[(String, String)]) -> R<()> {
     if design == Design::Serve2dPipe && get("B").is_some() {
         let (b, hb, m, cap) = (num("B"), num("HB"), num("MMAX"), num("CAP"));
         let vm = num("VM") == 1;
-        let why = if hb > 4 {
+        // VMCONC (both VM sets at once): 0175's symmetric 8/8 only, B 4 HB 4
+        // at up to 4 micro-batches and CAP 16 with 8 lanes on each set.
+        let conc = num("VMCONC") == 1;
+        let conc_ran = vm && num("VMB") > 0 && num("vm_lanes") == 8 && num("b_vm_lanes") == 8;
+        let why = if conc && !(conc_ran && b == 4 && hb == 4 && m <= 4 && cap <= 16) {
+            Some("serve2d_pipe VMCONC runs only as 0175 did: B 4 HB 4, MMAX <= 4, CAP <= 16, 8 lanes on each VM set")
+        } else if hb > 4 {
             Some("serve2d_pipe HB > 4 is unsupported: an 8-lane head group hangs on some winner patterns (0158/0172/0173)")
         } else if b > 8 {
             Some("serve2d_pipe B > 8 is unsupported: lanes past the first get wrong embeddings (0171)")
@@ -558,7 +564,7 @@ fn refused(design: Design, params: &[(String, String)]) -> R<()> {
         if let Some(why) = why {
             return Err(format!(
                 "{why} (B:{b} HB:{hb} MMAX:{m} CAP:{cap} VM:{}); hardware ran B:4 HB:4 MMAX<=8 CAP<=32 (0154, 0157), \
-and MMAX<=4 CAP<=16 with the VM sets (0156, 0158)",
+MMAX<=4 CAP<=16 with the VM sets (0156, 0158), and their 8/8 VMCONC (0175)",
                 usize::from(vm)
             ));
         }
@@ -650,6 +656,16 @@ pub fn params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<(Design, Vec<(String, 
     if let Some(vm) = vm {
         for (k, v) in vm.params() {
             put(&mut set, k, v);
+        }
+        // serve2d_pipe's sum options as hardware measured them (0168): the
+        // layout's own defaults are the older 1 and 0 (it is 0175's as run).
+        if d == Design::Serve2dPipe {
+            if vm.sumpipe.is_none() {
+                put(&mut set, "vm_sumpipe", 3);
+            }
+            if vm.l2w.is_none() {
+                put(&mut set, "vm_l2w", 1);
+            }
         }
     }
     for &(k, v) in &vm_b {
@@ -889,7 +905,9 @@ mod tiny {
     use super::*;
     use crate::spatial::plan::WaferDims;
 
-    /// The same parameters as the out.json of the build the simulator ran.
+    /// The same parameters as the out.json of the build the simulator ran,
+    /// with the sum options the layout defaulted to since 0168 (3 and 1) now
+    /// stated by the plan.
     #[test]
     fn tiny_pipe_params_match_the_simulated_build() {
         let (plan, cfg) = pipe_config();
@@ -898,7 +916,8 @@ mod tiny {
         let want = "PX:4,PY:4,Hc:16,HR:64,Dc:8,Gs:4,Qh:2,Ic:16,Tc:1,W16:0,KV16:0,GRID:1,HEADMODE:2,B:2,PS:16,\
                     NB:2,E:2,MC:1,MMAX:2,HB:2,GW:2,GH:4,F:8,HH:16,Vr:32,Gx:4,Gy:4,Gb:1,vocab:250,PASSES:3,\
                     UNTIED:0,CERT:0,MODE:0,OVL:0,VMC:1,WF32:1,CAP:8,DBG:0,SPEC:0,SPEC_H:1,SPEC_T:1,SPEC_O:1,\
-                    SMP:0,HLM:4,iters:1,VM:1,max_ops:48,nreg:6,pool_words:64,feat:99,ring_w:1,ring_d:32,vm_prof:0";
+                    SMP:0,HLM:4,iters:1,VM:1,max_ops:48,nreg:6,pool_words:64,feat:99,ring_w:1,ring_d:32,vm_prof:0,\
+                    vm_sumpipe:3,vm_l2w:1";
         let mut want: Vec<(String, String)> = want
             .split(',')
             .map(|kv| kv.split_once(':').map(|(k, v)| (k.trim().to_string(), v.to_string())).unwrap())
@@ -965,6 +984,11 @@ mod tiny {
         assert!(bad("B:8,HB:4,MMAX:4,CAP:16").contains("unrun"));
         assert!(bad("B:4,HB:4,MMAX:9,CAP:16").contains("unrun"));
         assert!(bad("B:4,HB:4,MMAX:8,CAP:16,VM:1").contains("unrun"));
+        // 0175's symmetric 8/8 VMCONC, and nothing else of it.
+        let conc = "B:4,HB:4,MMAX:4,CAP:16,VM:1,VMB:6,vm_lanes:8,b_vm_lanes:8,VMCONC:1";
+        assert!(refused(Design::Serve2dPipe, &p(conc)).is_ok());
+        assert!(bad(&conc.replace("b_vm_lanes:8", "b_vm_lanes:2")).contains("0175"));
+        assert!(bad(&conc.replace("MMAX:4", "MMAX:8")).contains("0175"));
         let (plan, mut cfg) = pipe_config();
         assert!(params(&plan, &cfg).is_ok());
         cfg.hb = Some(1);
