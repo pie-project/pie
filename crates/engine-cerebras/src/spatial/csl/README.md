@@ -14,6 +14,8 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
   - `qwen2d_paged8b_hr.csl`: the bf16 8B layer with the HROUTE (host-written
     collective routes), ROT8 and GY params: serve8b's and serve8b_region's
     grids.
+  - `softmax_s123.json`: Fork 11's p8fast softmax levers (S1-S3) as text
+    patches on both 8B unit kernels (softmax_s123.py's REPS).
   - `qwen2d_region.csl`: several bf16 layers on one region (x stays in
     place between them): serve8b_region's regions.
 - `vm/`: eta VM images, snapshots of the VM generator's output (`gen_vm.py`

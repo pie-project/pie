@@ -21,6 +21,9 @@ mod src {
     pub const HEAD2D_V10: &str = include_str!("csl/kernels/head2d_v10.csl");
     pub const QWEN2D_PAGED8B_HR: &str = include_str!("csl/kernels/qwen2d_paged8b_hr.csl");
     pub const QWEN2D_REGION: &str = include_str!("csl/kernels/qwen2d_region.csl");
+    /// Fork 11's p8fast softmax levers S1-S3 as (old, new) text pairs on
+    /// qwen2d_paged8b's or qwen2d_region's pe.csl (softmax_s123.py's REPS).
+    pub const SOFTMAX_S123: &str = include_str!("csl/kernels/softmax_s123.json");
     pub const VM_HM: &str = include_str!("csl/vm/guest4hm_vm.csl");
     pub const VM_H2S: &str = include_str!("csl/vm/guest4h2s_vm.csl");
 
@@ -796,6 +799,25 @@ pub fn serve2d_pipe() -> R<Vec<File>> {
 
 // ---------------------------------------------------------------- serve8b
 
+/// softmax_s123.py's `apply`: Fork 11's p8fast softmax levers (S1: the
+/// max-shift and rescale as one 2-D op, exp over act-sized chunks; S2: the
+/// max and sum folds as a halving tree; S3: the exp sums ride the values
+/// all-reduce) on an 8B unit kernel's text, each anchor found once.
+fn softmax_s123(text: &str, tag: &str) -> R<String> {
+    let reps: serde_json::Value =
+        serde_json::from_str(src::SOFTMAX_S123).map_err(|e| format!("softmax_s123.json: {e}"))?;
+    let mut s = text.to_string();
+    for r in reps.as_array().ok_or("softmax_s123.json: not a list")? {
+        let (old, new) = (r["old"].as_str().unwrap_or(""), r["new"].as_str().unwrap_or(""));
+        let n = s.matches(old).count();
+        if old.is_empty() || n != 1 {
+            return Err(format!("softmax_s123: {tag} changed: anchor found {n} times"));
+        }
+        s = s.replacen(old, new, 1);
+    }
+    Ok(s)
+}
+
 const S8B_GRID_NAMES: &[(&str, &str)] = &[
     ("x", "f32"), ("tab", "u32"), ("gamma1", "f32"), ("gamma2", "f32"), ("wqa", "WS"), ("wqv", "WS"),
     ("wv", "WS"), ("qkn_w", "f32"), ("rot_c", "f32"), ("rot_s", "f32"), ("kc", "KS"), ("vc", "KS"),
@@ -856,7 +878,7 @@ const S2D_XN: u16 = B * Hc;       // x's words a PE: B lanes of Hc, lane-major\n
 fn s8b_grid() -> R<String> {
     let tag = "qwen2d_paged8b/pe.csl";
     let mut s = patch(
-        src::QWEN2D_PAGED8B_HR,
+        &softmax_s123(src::QWEN2D_PAGED8B_HR, tag)?,
         "param c_r1_0: color;\n",
         "// serve8b: 1 times each pass (prof[0]).\nparam S2D_TIME: u16;\nparam c_r1_0: color;\n",
         "params",
@@ -1041,7 +1063,7 @@ fn page_unstage(page: u32, slot: u32) void { sys_mod.unblock_cmd_stream(); }"
 fn s8br_unit(kernel: &str, src: &str) -> R<String> {
     let tag = format!("{kernel}/pe.csl");
     let mut s = patch(
-        src,
+        &softmax_s123(src, &tag)?,
         "param c_r1_0: color;\n",
         concat!(
             "// serve8b: 1 times each pass (prof[0]); the route table's route capacity.\n",
@@ -1259,12 +1281,12 @@ mod tests {
         ("serve2d_pipe", "head_pe.csl", "fb24f5dbfd907520336bd07311d9b9ca8554909e6c93b6f6c428985e657525a0"),
         ("serve2d_pipe", "filler.csl", "6ee6aeea07fcdaf3a46c72ab03dcab7bf2c1b92b4f2c12bb29feab9e43b57bb5"),
         ("serve2d_pipe", "vm_pe.csl", "20008b5ed4887f1f8d6dff7fecea16984ed503271c0fb037b58fee8bdfcf1984"),
-        ("serve8b", "grid_pe.csl", "c3801ca4c38c243931dbf65b749dc837ed5b996039c63838f1a5ee165f611619"),
+        ("serve8b", "grid_pe.csl", "23fbf3711644e34822d7b9a2dd8faa4b96ef939c8e4cccd31aa8479107438da8"),
         ("serve8b", "head_pe.csl", "c9d5b14ad454fd62eae6c592fd2c2e21b484c59b29c160a1c363e6307bfd054d"),
         ("serve8b", "embed_pe.csl", "991c1ce046039415a39f9afb0c6e2e8673a91ff3e7057637abd6477fc99f39e9"),
         ("serve8b", "filler.csl", "bf9e83043319a16c8bac8d11f9d552c22249cfe16dbfb1f8c4a23316e2dbe843"),
-        ("serve8b_region", "grid_pe.csl", "1aa7ef357ae869c410f554533de054d01cdfe1412833d10cac1ec09027918e3b"),
-        ("serve8b_region", "region_pe.csl", "d8b3f505a1ea28723791bd8b1e9a8e7e69cd1c73860e5380be495a29243b50a3"),
+        ("serve8b_region", "grid_pe.csl", "636d768e5ece3f8387f882decea52f6f4671248b66eabf6d06aafb724b8034cb"),
+        ("serve8b_region", "region_pe.csl", "6ecd178e0a3c59efe3d3ef96fa3a6cdb09f5f6f2ad14e3296d40e53744853778"),
         ("serve8b_region", "head_pe.csl", "ec8349abdb11aabd454cd6113a60f9da5614f374519ab14ea162684c4148fcfe"),
         ("serve8b_region", "embed_pe.csl", "8e2769143d5e799f25483d53fb9b8aeae108b1f3e4a95ebecc65a9d967cdf65b"),
         ("serve8b_region", "filler.csl", "0f8106389be8053db738c6bb2189987e0a5716a31372b537f33dcd5aaa54fff5"),
