@@ -506,10 +506,19 @@ fn serve8b_region_params(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Vec<(&'stat
 /// lane exact): (lanes, micro-batches at most, CAP).
 const S8BRP_RUN: &[(usize, usize, usize)] = &[(4, 4, 16), (2, 8, 32)];
 
+/// Every serve8b_region_pipe build is refused until 0167 (the output-queue
+/// drain fix) passes on hardware: these programs recolor a unit's output
+/// queue 2 without waiting for it to drain, the likely cause of B 1's hang,
+/// and nothing bounds the occupancy at which that happens at any shape.
+const S8BRP_HELD: &str = "serve8b_region_pipe is held until 0167 (its output-queue drain fix) passes on hardware";
+
 /// serve8b_region_pipe's micro-batches (`mmax`, or the most 0148 ran) and
 /// CAP for `lanes`: only 0148's shapes. B 1 (12 micro-batches) hung in its
 /// second launch (0149 is bisecting it); the rest are unrun.
 fn pipe_shape(lanes: usize, cfg: &ServeConfig) -> R<(usize, usize)> {
+    if !S8BRP_HELD.is_empty() {
+        return Err(S8BRP_HELD.into());
+    }
     if cfg.vm.is_some() {
         return Err("serve8b_region_pipe has no eta VM yet (VMX unrun on the ring)".into());
     }
@@ -533,6 +542,9 @@ fn refused(design: Design, params: &[(String, String)]) -> R<()> {
     let num = |k: &str| get(k).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     if design == Design::Serve2d && get("GRID") == Some("0") {
         return Err("serve2d GRID:0 is unsupported (hung on hardware, 0150); use GRID:1 with B:1 for one sequence".into());
+    }
+    if design == Design::Serve8bRegionPipe && num("PIPE") == 1 && !S8BRP_HELD.is_empty() {
+        return Err(S8BRP_HELD.into());
     }
     if design == Design::Serve8bRegionPipe && num("PIPE") == 1 {
         let (b, m, cap) = (num("B"), num("MMAX"), num("CAP"));
@@ -1054,6 +1066,21 @@ mod qwen3_8b {
     /// a larger CAP, the VM or staging are refused, by the plan and by pins.
     #[test]
     fn the_plan_places_qwen3_8b_pipe_as_0148_and_refuses_the_rest() {
+        if !S8BRP_HELD.is_empty() {
+            // Held: every shape is refused, 0148's included.
+            for b in [4, 2, 1] {
+                let goals = Goals { blocks: Some(1), host_copy: true, grid_lanes: 4, pipeline: true, ..Goals::lanes(b) };
+                let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+                let mut cfg = ServeConfig::new(goals);
+                cfg.region = true;
+                assert!(params(&plan, &cfg).unwrap_err().contains("0167"), "B {b}");
+            }
+            let p: Vec<(String, String)> = [("PIPE", "1"), ("B", "4"), ("MMAX", "4"), ("CAP", "16"), ("PY", "144")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .into();
+            assert!(refused(Design::Serve8bRegionPipe, &p).unwrap_err().contains("0167"));
+            return;
+        }
         let base = "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:240,RHc:18,RDc:4,RGs:32,RIc:48,RNL:3,RGY:16,\
                     RC:2,RR:4,NCOL:7,RTR:4,HR:4096,Qh:4,PS:16,NB:1,E:1,MC:1,W16:1,KV16:1,KVCP:0,PROF:0,TIME:0,\
                     HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,PASSES:3,MODE:0,\
