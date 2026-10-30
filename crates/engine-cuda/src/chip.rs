@@ -98,6 +98,13 @@ pub struct OneFrameWhenShort;
 #[decision(id = "engine.seated_first", flag, default = false, tune = engine)]
 pub struct SeatedFirst;
 
+/// Whether a windowed pool of short lanes takes a page a lane past its kv
+/// pages (`Paging::spare`), for a card whose ring, not its kv pages, runs
+/// dry first. Off cuts it 1:1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.window_spare", flag, default = false, tune = engine)]
+pub struct WindowSpare;
+
 /// The rows one fire takes when `[engine] max_forward_tokens` is not
 /// stated; 0 keeps the fixed 8192. Wider fires batch more prompts' chunks
 /// into one pass of the weights, and their activation arena grows with them.
@@ -152,6 +159,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<StateSlotsPerLane>()
         .add::<OneFrameWhenShort>()
         .add::<SeatedFirst>()
+        .add::<WindowSpare>()
         .add::<ForwardTokens>()
         .add::<WalkFireRows>()
         .add::<PrefillLanes>()
@@ -242,6 +250,7 @@ pub struct Engine {
     pub state_slots_per_lane: u32,
     pub one_frame_when_short: bool,
     pub seated_first: bool,
+    pub window_spare: bool,
     pub forward_tokens: u32,
     pub walk_fire_rows: u32,
     pub prefill_lanes: u32,
@@ -273,6 +282,7 @@ impl Engine {
             state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
             one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
             seated_first: profile.on::<SeatedFirst>(&Anywhere),
+            window_spare: profile.on::<WindowSpare>(&Anywhere),
             forward_tokens: profile.get::<ForwardTokens>().0,
             walk_fire_rows: profile.get::<WalkFireRows>().0,
             prefill_lanes: profile.get::<PrefillLanes>().0,
@@ -751,6 +761,7 @@ mod tests {
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 seated_first: false,
+                window_spare: false,
                 forward_tokens: 0,
                 walk_fire_rows: 0,
                 prefill_lanes: 0,
@@ -828,6 +839,7 @@ mod tests {
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 seated_first: false,
+                window_spare: false,
                 forward_tokens: 0,
                 walk_fire_rows: 0,
                 prefill_lanes: 0,
@@ -1087,6 +1099,7 @@ mod tests {
                     decode_grouped_prefill_lse: defaults.decode_grouped_prefill_lse,
                     decode_grouped_prefill_window: defaults.decode_grouped_prefill_window,
                     fa2_live: defaults.fa2_live,
+                    compressed_replay: defaults.compressed_replay,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
                 defaults,
@@ -1123,6 +1136,7 @@ mod tests {
                     || (spec.id == "kernel.sdpa.decode.grouped_prefill_window"
                         && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.fa2_live" && std::ptr::eq(p, &l40s))
+                    || (spec.id == "kernel.sdpa.compressed_replay" && std::ptr::eq(p, &l40s))
                 {
                     continue;
                 }

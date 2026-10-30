@@ -220,6 +220,13 @@ pub struct GemmFp8GemvUntil(pub u32);
 #[decision(id = "kernel.gemm.fp8_shadow", flag, default = false, tune = search)]
 pub struct GemmFp8Shadow;
 
+/// Whether a block-FP8 dense projection (no tcgen05) keeps its 128x128
+/// exponents spread over 1x32 blocks, laid once at load, so a batch's rows
+/// run cuBLASLt's MXFP8 GEMM on the same codes (sm_120).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_mx", flag, default = false, tune = search)]
+pub struct GemmFp8Mx;
+
 /// The most rows a dense fp8b128 projection runs on the mma.sync fp8
 /// kernel (`moe::dense_fp8_shape` says where it leads, in which CTA
 /// shape), its rows quantized in the same launch. 0: never.
@@ -323,6 +330,12 @@ pub struct MoeMxfp4Fp8From(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_w4a8_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4W4a8From(pub u32);
+
+/// The W4A8 select's stages landed by TMA, its rows quantized in route order
+/// so an expert's slice is one box. Off but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_w4a8_tma", flag, default = false, tune = search)]
+pub struct MoeMxfp4W4a8Tma;
 
 /// The fewest rows a projection cut into two row halves (Qwen3.5's qkv|z)
 /// lands as two GEMMs off the weight's two slices, where
@@ -839,6 +852,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4A8From>()
         .add::<MoeMxfp4Fp8From>()
         .add::<MoeMxfp4W4a8From>()
+        .add::<MoeMxfp4W4a8Tma>()
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
         .add::<MoeMegaUntil>()
@@ -846,6 +860,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
         .add::<GemmFp8Shadow>()
+        .add::<GemmFp8Mx>()
         .add::<GemmFp8MmaGemvUntil>()
         .add::<GemmFp8MmaKUntil>()
         .add::<AttnResFusedNorm>()
@@ -978,6 +993,7 @@ tuning! {
     mxfp4_a8_from: u32 = 0, get MoeMxfp4A8From;
     mxfp4_fp8_from: u32 = 0, get MoeMxfp4Fp8From;
     mxfp4_w4a8_from: u32 = 0, get MoeMxfp4W4a8From;
+    mxfp4_w4a8_tma: bool = false, on MoeMxfp4W4a8Tma;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
     moe_mega_until: u32 = 0, get MoeMegaUntil;
@@ -985,6 +1001,7 @@ tuning! {
     mla_expanded_from: u32 = 65_536, get MlaExpandedFrom;
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
     gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
+    gemm_fp8_mx: bool = false, on GemmFp8Mx;
     gemm_fp8_mma_gemv_until: u32 = 0, get GemmFp8MmaGemvUntil;
     gemm_fp8_mma_k_until: u32 = 0, get GemmFp8MmaKUntil;
     attn_res_fused_norm: bool = false, on AttnResFusedNorm;

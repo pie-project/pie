@@ -164,7 +164,8 @@ pub struct Pooled<'a> {
 
 /// Whether [`decode`] takes this shape: 64 heads at 512 over bf16 planes, or
 /// over fp8 rows (window and pool alike), in shared memory this device lets
-/// a block hold (sm_86 and sm_89 do not: their opt-in tops at 99 KiB).
+/// a block hold (sm_86 and sm_89 hold bf16 planes alone: their opt-in tops
+/// at 99 KiB).
 #[must_use]
 pub fn takes(
     ctx: &Ctx,
@@ -236,6 +237,11 @@ fn smem(rows: Option<(Rows, Rows)>) -> u32 {
         };
         let ((wd, ws), (pd, ps)) = (split(w), split(p));
         stages * KEYS * (wd.max(pd) + ws.max(ps)) + tile
+    } else if crate::jit::compute_capability_major() == Some(8)
+        && crate::jit::max_shared_memory_per_block_optin().is_some_and(|bytes| bytes < 128 << 10)
+    {
+        // Two bf16 tiles where a block holds 99 KiB (sm_86, sm_89).
+        2 * tile
     } else {
         4 * tile
     };

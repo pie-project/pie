@@ -1021,7 +1021,13 @@ impl Weights {
         }
         Ok(Weights {
             store,
-            table: WeightTable(table, BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
+            table: WeightTable(
+                table,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
             banks: banks(trace, &places),
             experts,
             from_cache,
@@ -1217,6 +1223,99 @@ impl Weights {
                 "cudaStreamSynchronize",
                 cudarc::runtime::sys::cudaStreamSynchronize(stream.cast()),
             )?;
+        }
+        Ok(done)
+    }
+
+    /// `kernel.gemm.fp8_mx`: each block-FP8 dense projection's 128x128-block
+    /// exponents spread over its 1x32 blocks once here, in tcgen05's atoms,
+    /// that a batch's rows read on cuBLASLt's MXFP8 GEMM. Returns the planes.
+    #[cfg(feature = "cuda")]
+    pub fn spread_fp8_dense(
+        &mut self,
+        trace: &Trace,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<u32> {
+        use cudarc::runtime::sys::{cudaMemcpyAsync, cudaMemcpyKind};
+        use poem_ir::{Def, Linear, Operation};
+        let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
+            Some(Def::Weight(at)) => Some(*at as usize),
+            _ => None,
+        };
+        let atom = |r: usize, c: usize, cols: usize| {
+            (r / 128 * cols.div_ceil(4) + c / 4) * 512 + (r % 32) * 16 + (r / 32) % 4 * 4 + c % 4
+        };
+        let sync = || {
+            // SAFETY: the load's stream.
+            crate::device::ctx::check("cudaStreamSynchronize", unsafe {
+                crate::device::rt::cudaStreamSynchronize(stream.cast())
+            })
+        };
+        let mut done = 0;
+        for node in &trace.nodes {
+            let Operation::Linear(Linear::Matmul {
+                w,
+                scales: Some(scales),
+                quant: Some(_),
+                logits: false,
+                ..
+            }) = &node.op
+            else {
+                continue;
+            };
+            let (Some(at), Some(s_at)) = (weight(*w), weight(*scales)) else {
+                continue;
+            };
+            let (Some(Some(WeightRow::Dense(codes))), Some(Some(WeightRow::Dense(atoms)))) = (
+                self.table.0.get(at).copied(),
+                self.table.0.get(s_at).copied(),
+            ) else {
+                continue;
+            };
+            let (n, k) = (codes.rows as usize, codes.width as usize);
+            if self.table.4.contains_key(&at)
+                || atoms.dtype != Dtype::U8
+                || atoms.width as usize * 128 != k
+                || crate::device::alloc::is_host_pointer(atoms.ptr)
+            {
+                continue;
+            }
+            let mut from = vec![0u8; kernels_cuda::linear::gemm_sm100::atom_bytes(n, k, 128)];
+            let mut to = vec![0u8; kernels_cuda::linear::gemm_sm100::atom_bytes(n, k, 32)];
+            // SAFETY: `from` and the plane's atoms are both `from.len()` bytes.
+            crate::device::ctx::check("cudaMemcpyAsync", unsafe {
+                cudaMemcpyAsync(
+                    from.as_mut_ptr().cast(),
+                    atoms.ptr as usize as *const core::ffi::c_void,
+                    from.len(),
+                    cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                    stream.cast(),
+                )
+            })?;
+            sync()?;
+            for r in 0..n {
+                for c in 0..k / 32 {
+                    to[atom(r, c, k / 32)] = from[atom(r, c / 4, k / 128)];
+                }
+            }
+            let buffer = Buffer::zeroed_on(stream, to.len())?;
+            // SAFETY: the buffer and `to` are both `to.len()` bytes.
+            crate::device::ctx::check("cudaMemcpyAsync", unsafe {
+                cudaMemcpyAsync(
+                    buffer.ptr() as usize as *mut core::ffi::c_void,
+                    to.as_ptr().cast(),
+                    to.len(),
+                    cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    stream.cast(),
+                )
+            })?;
+            sync()?;
+            self.table.4.insert(
+                at,
+                Tensor::new(buffer.ptr(), codes.rows, (k / 32) as u32, Dtype::U8),
+            );
+            self.decoded.push(buffer);
+            done += 1;
         }
         Ok(done)
     }

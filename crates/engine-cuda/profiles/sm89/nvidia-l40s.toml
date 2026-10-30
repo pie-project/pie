@@ -26,6 +26,9 @@ elemwise.rows_vec = true
 sdpa.merge_warp = true
 sdpa.pool_mma = true
 sdpa.selected_mma = true
+# DeepSeek-V4.1 bounded replay, as vLLM prefills it (its decoder layers
+# route a quarter of a 2048-token batch): pf16-512 prefill 19.8k to ~29.8k tok/s.
+sdpa.compressed_replay = true
 moe.bf16_mma_from = 16
 moe.bf16_mma_until = 65536
 moe.mxfp4_fp8_from = 256

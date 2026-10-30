@@ -489,3 +489,53 @@ fn an_mxfp8_release_laid_a_row_a_32_answers_the_dot() {
         }
     }
 }
+
+#[test]
+fn the_fp8_select_lands_its_swiglu_as_the_glu_after_it() {
+    use kernels_cuda::linear::gemm_sm100::Glu;
+    use kernels_cuda::linear::moe::{group_routes, select_fp8_w8a8, select_fp8_w8a8_glu};
+    if !kernels_cuda::linear::moe::fp8_w8a8_capable() {
+        return;
+    }
+    // (rows, groups, intermediate, k): an expert's routes past 64, ragged.
+    for (rows, groups, inter, k) in [(200usize, 3usize, 256usize, 1024usize), (130, 2, 640, 512)] {
+        let mut b = Bench::new(0x61 + rows as u64);
+        let (x, _) = b.bf16(rows * groups * k);
+        let (codes, atoms, _) = fp8_bank(&mut b, groups * 2 * inter, k, 128, 0x52);
+        let rg = rows * groups;
+        let (packed, apart, fused) = (b.out(rg, 2 * inter), b.out(rg, inter), b.out(rg, inter));
+        let ctx = b.ctx().with_tuning(GEMV);
+        let mut routes = t(b.zeros(rg * 4), rows, groups, I32);
+        group_routes(&ctx, groups as u32, &mut routes).expect("the routes lay");
+        let xr = t(x, rg, k, Bf16);
+        let mut p = t(packed.ptr, rg, 2 * inter, Bf16);
+        select_fp8_w8a8(&ctx, xr, codes, atoms, groups as u32, routes, &mut p)
+            .expect("the select fires");
+        let mut ya = t(apart.ptr, rg, inter, Bf16);
+        kernels_cuda::linear::glu::swiglu(&ctx, p, inter as u32, 1, &mut ya)
+            .expect("the glu fires");
+        let mut yf = t(fused.ptr, rg, inter, Bf16);
+        let took = select_fp8_w8a8_glu(
+            &ctx,
+            xr,
+            codes,
+            atoms,
+            groups as u32,
+            routes,
+            &mut yf,
+            Glu::Swiglu,
+        )
+        .expect("the fused select fires");
+        assert!(took, "{rows}x{groups}x{inter}x{k} lands its glu");
+        let (want, got) = (b.read(apart.ptr, rg * inter), b.read(fused.ptr, rg * inter));
+        let differ = want
+            .iter()
+            .zip(&got)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            differ, 0,
+            "{rows}x{groups}x{inter}x{k}: {differ} values differ"
+        );
+    }
+}

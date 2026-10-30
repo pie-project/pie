@@ -1334,7 +1334,10 @@ __global__ void __launch_bounds__(128 * kWN) moe_select_fp8a8_mma(
 /// unpadded swizzled stages. A warp holds half its rows' A fragments for a
 /// whole 128-code step and runs each 8-route block's four K chunks before
 /// scaling it, so a block's sums stay a few registers, not the tile's; the
-/// sums leave through the stages, a route's 256 rows a run.
+/// sums leave through the stages, a route's 256 rows a run. `kGlu`: the
+/// gate-up bank's 128 gate rows and their 128 up rows a CTA (`n` both
+/// halves), each route's 128 GLU values out in `n / 2` columns.
+template <int kGlu>
 __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
     const u8* __restrict__ xq,
     const u8* __restrict__ xe,
@@ -1344,7 +1347,7 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
     const u8* __restrict__ weight,
     const u8* __restrict__ atoms,
     bf16* __restrict__ out,
-    int act_div, int n, int k, int num_experts)
+    int act_div, int n, int k, int num_experts, float limit, float galpha)
 {
     constexpr int kRowsCta = 256;
     constexpr int kSlice = 128;
@@ -1367,8 +1370,14 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
     const int g = lane >> 2;
     const int c = lane & 3;
     const int cta_row0 = static_cast<int>(blockIdx.y) * kRowsCta;
-    const int row_base = cta_row0 + wm * 64;
     const int blocks = k / kBK;
+    // A staged row's bank row: under a GLU the first 128 gate rows, then their up rows.
+    const int c0 = static_cast<int>(blockIdx.y) * (kRowsCta / 2);
+    auto wrow = [&](int row) {
+        if constexpr (kGlu != 0) return row < kRowsCta / 2 ? c0 + row : n / 2 + c0 + row - kRowsCta / 2;
+        else return cta_row0 + row;
+    };
+    const int row_base = wrow(wm * 64);
 
     const u8* w_e = weight + static_cast<long long>(expert) * n * k;
     const u8* atoms_at = atoms + atom_offset(expert * n + (row_base & ~127), 0, blocks);
@@ -1387,9 +1396,9 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
             const int row = i / kChunks;
             const int ch = i % kChunks;
             u8* dst = sW + off(row, ch);
-            if (cta_row0 + row < n) {
+            if (wrow(row) < n) {
                 __pipeline_memcpy_async(
-                    dst, w_e + static_cast<long long>(cta_row0 + row) * k + k0 + ch * 16, 16);
+                    dst, w_e + static_cast<long long>(wrow(row)) * k + k0 + ch * 16, 16);
             } else {
                 *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
             }
@@ -1493,6 +1502,29 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
                 sOut[(64 * wn + 8 * b + 2 * c + (e & 1)) * kOut + wm * 64 + 16 * t + g + (e >= 2 ? 8 : 0)] =
                     f32_to_bf16(acc[t][b][e] + 0.f);
     __syncthreads();
+    if constexpr (kGlu != 0) {
+        // Eight GLU values a run: a gate run and its up run, as `swiglu_vec8` lands SwiGLU.
+        const int inter = n / 2;
+#pragma unroll 4
+        for (int i = tid; i < kSlice * (kRowsCta / 16); i += 256) {
+            const int tok = i / (kRowsCta / 16);
+            const int ch = i % (kRowsCta / 16);
+            if (tok >= count) continue;
+            const bf16* gs = sOut + tok * kOut + 8 * ch;
+            uint4 packed;
+            bf16* o8 = reinterpret_cast<bf16*>(&packed);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float gv = bf16_to_f32(gs[j]);
+                const float uv = bf16_to_f32(gs[kRowsCta / 2 + j]);
+                if constexpr (kGlu == 1) o8[j] = f32_to_bf16(gv / (1.f + __expf(-gv)) * uv);
+                else o8[j] = f32_to_bf16(act::glu<kGlu>(gv, uv, limit, galpha));
+            }
+            *reinterpret_cast<uint4*>(out + static_cast<long long>(order[begin + tok]) * inter + c0 + 8 * ch) =
+                packed;
+        }
+        return;
+    }
 #pragma unroll 4
     for (int i = tid; i < kSlice * (kRowsCta / 8); i += 256) {
         const int tok = i / (kRowsCta / 8);

@@ -438,15 +438,27 @@ pub fn select_mxfp4_w4a8(
     }
     let (op, glu, bias, (code, limit, alpha)) = (OP, false, None::<Tensor>, (0, 0.0f32, 0.0f32));
     let fan = &selected(OP, x, routes, y)?;
+    if ctx.tuning().mxfp4_w4a8_tma && codes.ptr.is_multiple_of(16) && ctx.smem_fits(W4A8_TMA_SMEM) {
+        return select_mxfp4_w4a8_tma(ctx, x, codes, scales, routes, y, gran, fan);
+    }
     let (rows, kw) = (x.rows as usize, x.width as usize);
     let xq = ctx.scratch_stream(op, "linear.mxfp4_w4a8_x", rows * kw)? as u64;
     let xe = ctx.scratch_stream(op, "linear.mxfp4_w4a8_xe", rows * (kw / 32))? as u64;
     let lanes = u32::try_from(rows * (kw / 32) * 4).map_err(|_| refuse(op, "too many rows"))?;
     ctx.fire(
         op,
-        Fire::at(kernel(SELECT_FP4_SM120, &format!("::pie::linear::quantize_rows_mxfp8<{gran}>")))
-            .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
-        &[x.arg(), ArgValue::Ptr(xq), ArgValue::Ptr(xe), stated(op, x.rows)?.arg(), stated(op, x.width)?.arg()],
+        Fire::at(kernel(
+            SELECT_FP4_SM120,
+            &format!("::pie::linear::quantize_rows_mxfp8<{gran}>"),
+        ))
+        .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
+        &[
+            x.arg(),
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xe),
+            stated(op, x.rows)?.arg(),
+            stated(op, x.width)?.arg(),
+        ],
     )?;
     let experts = codes.rows.clamp(1, EXPERT_CAP);
     let bank_rows = if glu { 2 * y.width } else { y.width };
@@ -454,7 +466,12 @@ pub fn select_mxfp4_w4a8(
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
     let inter = stated(op, y.width)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
-    let RouteOrder { order, offsets, work, work_cap } = route_order_sliced(
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
         ctx,
         op,
         routes,
@@ -462,7 +479,11 @@ pub fn select_mxfp4_w4a8(
         experts,
         64 * W4A8_GROUPS,
         true,
-        if glu || KEEP_NEXT.with(core::cell::Cell::get) { Share::Keep } else { Share::Take },
+        if glu || KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
     )?;
     let tiles = y.width.div_ceil(if glu { 128 } else { 256 });
     let fire = Fire::at(kernel(
@@ -470,8 +491,15 @@ pub fn select_mxfp4_w4a8(
         &format!("::pie::linear::moe_select_mxfp4_w4a8<{code}, {W4A8_STAGES}, {W4A8_GROUPS}>"),
     ))
     .apply(
-        Launch::grid(if act_div == 1 { [tiles, work_cap, 1] } else { [work_cap, tiles, 1] }, [256 * W4A8_GROUPS, 1, 1])
-            .smem(W4A8_STAGES * W4A8_STAGE),
+        Launch::grid(
+            if act_div == 1 {
+                [tiles, work_cap, 1]
+            } else {
+                [work_cap, tiles, 1]
+            },
+            [256 * W4A8_GROUPS, 1, 1],
+        )
+        .smem(W4A8_STAGES * W4A8_STAGE),
     );
     let args = [
         ArgValue::Ptr(xq),
@@ -492,6 +520,120 @@ pub fn select_mxfp4_w4a8(
         alpha.arg(),
     ];
     ctx.fire(op, fire, &args)?;
+    Ok(true)
+}
+
+/// `moe_select_mxfp4_w4a8_tma`'s shared memory: three stages of a slice's 128
+/// routes and 256 rows (32 KiB), their barriers, and the 1024 alignment.
+#[cfg(feature = "cuda")]
+const W4A8_TMA_SMEM: u32 = 3 * 32768 + 64 + 1024;
+
+/// [`select_mxfp4_w4a8`] on TMA: `x`'s rows quantized in route order (each
+/// expert's slice one box of them), the bank's codes and those rows in
+/// tensor maps.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn select_mxfp4_w4a8_tma(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    gran: u32,
+    fan: &Selected,
+) -> Result<bool, Error> {
+    use crate::linear::gemm_sm100::{Map, encode};
+    use cudarc::driver::sys as dr;
+    const OP: &str = "linear.moe_select_mxfp4_w4a8";
+    let experts = codes.rows.clamp(1, EXPERT_CAP);
+    let k = stated(OP, x.width)?;
+    let n = stated(OP, nonzero(OP, "N, the bank's output width", y.width)?)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        OP,
+        routes,
+        fan,
+        experts,
+        128,
+        true,
+        if KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    let (count, kw) = (fan.route_count as usize, x.width as usize);
+    let xq = ctx.scratch_stream(OP, "linear.mxfp4_w4a8_x", count * kw)? as u64;
+    let xe = ctx.scratch_stream(OP, "linear.mxfp4_w4a8_xe", count * (kw / 32))? as u64;
+    let lanes = u32::try_from(count * kw / 8).map_err(|_| refuse(OP, "too many rows"))?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            SELECT_FP4_SM120,
+            &format!("::pie::linear::quantize_rows_mxfp8_routed<{gran}>"),
+        ))
+        .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
+        &[
+            x.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xe),
+            stated(OP, fan.route_count)?.arg(),
+            k.arg(),
+            act_div.arg(),
+            stated(OP, experts)?.arg(),
+        ],
+    )?;
+    let map_x = encode(Map {
+        ptr: xq,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        dims: [x.width, fan.route_count, 0],
+        strides: [u64::from(x.width), 0],
+        boxes: [128, 128, 1],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    })?;
+    let map_w = encode(Map {
+        ptr: codes.ptr,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        dims: [x.width / 2, experts * y.width, 0],
+        strides: [u64::from(x.width / 2), 0],
+        boxes: [64, 128, 1],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
+    })?;
+    let tiles = y.width.div_ceil(256);
+    let fire = Fire::at(kernel(
+        SELECT_FP4_SM120,
+        "::pie::linear::moe_select_mxfp4_w4a8_tma<0, 3>",
+    ))
+    .apply(Launch::grid([tiles, work_cap, 1], [512, 1, 1]).smem(W4A8_TMA_SMEM));
+    let map = ArgValue::of::<[u64; 16]>;
+    let args = [
+        map(&map_x),
+        map(&map_w),
+        ArgValue::Ptr(xe),
+        ArgValue::Ptr(order),
+        ArgValue::Ptr(offsets),
+        ArgValue::Ptr(work),
+        scales.arg(),
+        ArgValue::ABSENT,
+        y.arg(),
+        act_div.arg(),
+        n.arg(),
+        k.arg(),
+        stated(OP, experts)?.arg(),
+        n.arg(),
+        0.0f32.arg(),
+        0.0f32.arg(),
+    ];
+    ctx.fire(OP, fire, &args)?;
     Ok(true)
 }
 

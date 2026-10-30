@@ -642,7 +642,8 @@ impl Shell {
             crate::store::window_of(&boot.trace)?,
             boot.budget.max_tokens,
         )
-        .seated(boot.budget.max_lanes);
+        .seated(boot.budget.max_lanes)
+        .spare(engine.window_spare);
         // A class attending both ways decodes its planes over all its rows once, at load.
         let decoding = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
             matches!(def, poem_ir::Def::Weight(w)
@@ -699,6 +700,11 @@ impl Shell {
         if device.ctx().tuning().gemm_fp8_shadow && !kernels_cuda::linear::gemm_sm100::supported() {
             weights.shadow_fp8_dense(&boot.trace, device.stream())?;
         }
+        // `kernel.gemm.fp8_mx`: block-FP8 dense planes keep 1x32 exponents.
+        #[cfg(feature = "cuda")]
+        if device.ctx().tuning().gemm_fp8_mx && !kernels_cuda::linear::gemm_sm100::supported() {
+            weights.spread_fp8_dense(&boot.trace, device.stream())?;
+        }
         // `kernel.moe.mxfp4_fp8_from`: MXFP4 banks keep a block-FP8 copy.
         #[cfg(feature = "cuda")]
         if device.ctx().tuning().mxfp4_fp8_from > 0
@@ -728,7 +734,8 @@ impl Shell {
                 crate::store::window_of(&boot.trace)?,
                 boot.budget.max_tokens,
             )
-            .seated(boot.budget.max_lanes);
+            .seated(boot.budget.max_lanes)
+            .spare(engine.window_spare);
         device.open_lanes(
             compiled.streams.streams.saturating_sub(1),
             compiled.streams.events,
