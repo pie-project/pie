@@ -43,6 +43,11 @@ fn bank(codes: u64, atoms: u64, [e, n, k]: [usize; 3], alpha: Option<[u64; 3]>) 
 /// for a select after.
 type Case = (K, Tuning, [usize; 5], bool, Option<Glu>, u8);
 
+/// Whether the W4A8 select's block-scaled mma.sync is this card's.
+fn w4a8_here() -> bool {
+    kernels_cuda::jit::cache::features().warp_block_scale
+}
+
 fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
     let even = tuning.moe_even_waves_from > 0;
     let what = format!("{kind:?} {ex}x{tokens}x{top} {by_token} {n}x{k} {f:?} {flags} even {even}");
@@ -61,9 +66,10 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
     let raw = tab(raw.len(), |i| pick(big(i), to_bf16(65536.0), raw[i]));
     let mut a = tab(raw.len(), |i| f64::from(from_bf16(raw[i])));
     // The W4A8 select reads its rows as MXFP8.
-    if tuning.mxfp4_w4a8_from > 0 && kernels_cuda::jit::cache::features().warp_block_scale {
-        for block in a.chunks_mut(32) {
-            let (q, s) = quant_e4m3(&tab(32, |i| block[i] as f32));
+    if tuning.mxfp4_w4a8_from > 0 && w4a8_here() {
+        let gran = pick(flags & 16 != 0, 128, 32);
+        for block in a.chunks_mut(gran) {
+            let (q, s) = quant_e4m3(&tab(gran, |i| block[i] as f32));
             block.iter_mut().zip(q).for_each(|(v, q)| *v = f64::from(e4m3(q) * ue8m0(s)));
         }
     }
@@ -123,6 +129,10 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
         (K::Affine, _) => {
             let (fs, zs) = (t(fz.0, ex, n * k / 32, U8), t(fz.1, ex, n * k / 32, U8));
             moe::matmul_select_quant(&ctx, x, mx, fs, Some(zs), r, &mut y, SEAT)
+        }
+        (K::Mx, _) if tuning.mxfp4_w4a8_from > 0 => {
+            let gran = pick(flags & 16 != 0, 128, 32);
+            moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, gran).map(|took| assert_eq!(took, w4a8_here(), "the arm takes the fire"))
         }
         (K::Mx, _) => moe::matmul_select_quant(&ctx, x, mx, sc, None, r, &mut y, SEAT),
         (K::MxBias, _) => {
@@ -265,8 +275,8 @@ fn the_routed_selects_answer_the_routed_dot() {
         // by route over a partial 256-row tile, its GLU under scales past
         // f16's range, V4-Flash's leg, a few routes under a live window.
         (K::Mx, w4a8, [8, 400, 4, 320, 1024], f, None, 0),
-        (K::MxBias, w4a8, [8, 400, 4, 192, 2048], t, alpha, 2),
-        (K::Mx, w4a8, [16, 300, 6, 512, 4096], t, None, 0),
+        (K::Mx, w4a8, [8, 400, 4, 192, 2048], t, None, 18),
+        (K::Mx, w4a8, [16, 300, 6, 512, 4096], t, None, 16),
         (K::Mx, w4a8, [8, 5, 4, 256, 512], t, None, 1),
         (K::MxBias, mma, [8, 32, 4, 192, 2048], t, alpha, 0),
         // A K of whole 64s on Hopper's wgmma slice (gpt-oss's 2880): a

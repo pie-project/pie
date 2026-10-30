@@ -4,25 +4,28 @@
 
 namespace pie::linear {
 
-/// `x`'s rows `[rows, k]` as MXFP8 (`E4m3Block<32>`): e4m3 codes row-major
-/// into `codes`, each 32's ue8m0 exponent a byte into `exps` (`[rows, k / 32]`).
-/// Four lanes a block; 128 threads, `ceil(rows k / 1024)` blocks.
+/// `x`'s rows `[rows, k]` as e4m3 in 1x`kGran` blocks (`E4m3Block`): codes
+/// row-major into `codes`, each block's ue8m0 exponent a byte into `exps`
+/// once a 32 (`[rows, k / 32]`), as the block-scaled MMA reads it. `kGran /
+/// 8` lanes a block; 128 threads, `ceil(rows k / 1024)` blocks.
+template <int kGran>
 __global__ void __launch_bounds__(128) quantize_rows_mxfp8(
     const bf16* __restrict__ x, u8* __restrict__ codes, u8* __restrict__ exps, int rows, int k)
 {
-    using Block = E4m3Block<32>;
-    const int blocks = k / 32;
+    using Block = E4m3Block<kGran>;
+    const int blocks = k / kGran;
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int slot = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / Block::kLanes);
     // Every lane joins the block's shuffles; a slot past the rows reads row 0.
     const bool live = slot < rows * blocks;
     const int sl = live ? slot : 0;
-    const long long at = static_cast<long long>(sl / blocks) * k + (sl % blocks) * 32;
+    const long long at = static_cast<long long>(sl / blocks) * k + (sl % blocks) * kGran;
     Block q;
     q.load(x + at, lane);
     if (!live) return;
     *reinterpret_cast<unsigned long long*>(codes + at + (lane % Block::kLanes) * 8) = q.codes();
-    if (lane % Block::kLanes == 0) exps[sl] = static_cast<u8>(q.e + 127);
+    const int part = lane % Block::kLanes;
+    if (part % 4 == 0) exps[at / 32 + part / 4] = static_cast<u8>(q.e + 127);
 }
 
 namespace w4a8 {
