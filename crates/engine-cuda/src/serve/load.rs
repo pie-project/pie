@@ -847,7 +847,13 @@ impl Shell {
             .map_or(0, |forked| forked.bytes);
         let arena_bytes = compiled.arena.bytes.max(forked_bytes);
         let mut arena = Arena::reserve(arena_bytes, &pools)?;
-        arena.ensure(&mut pools, arena_bytes)?;
+        let unscored = compiled.arena.scores_from(&boot.trace).max(
+            compiled
+                .arena_forked
+                .as_ref()
+                .map_or(0, |forked| forked.scores_from(&boot.trace)),
+        );
+        arena.ensure(&mut pools, unscored)?;
         let predicate = crate::store::rs::Predicate::reserve(
             boot.budget.max_lanes,
             crate::store::rs::snapshots(&boot.trace, |k_dim| {
