@@ -1345,8 +1345,8 @@ impl Run<'_> {
                 Some(Glu::Relu2),
             );
         }
-        // The device and the profile first: nothing resolved off tcgen05.
-        if !self.ctx().tuning().moe_tc5 || !linear::gemm_sm100::supported() {
+        // The profile first: a tcgen05 device with its grouped GEMM off resolves nothing.
+        if !self.ctx().tuning().moe_tc5 && linear::gemm_sm100::supported() {
             return Ok(false);
         }
         let (packed, y, glu) = match *glu {
@@ -1386,6 +1386,22 @@ impl Run<'_> {
                 act: poem_ir::GluAct::GegluTanh,
                 ..
             } => (packed, y, Glu::GegluTanh),
+            Linear::Glu {
+                packed: Some(packed),
+                y,
+                gate: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Situ { beta, up_cap, .. },
+                ..
+            } => (
+                packed,
+                y,
+                Glu::Situ {
+                    beta,
+                    cap: up_cap.unwrap_or(0.0),
+                },
+            ),
             _ => return Ok(false),
         };
         let Some((x, routes, sy, bank, experts)) = self.routed_bank(select) else {
