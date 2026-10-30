@@ -378,7 +378,7 @@ pub(crate) fn anchored(
             return (None, planned(device), lt);
         };
         if status != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone
-            || device.chosen.len() >= 1024
+            || device.chosen.len() >= 4096
             || (m as usize) * (n as usize) * 2 * (parts as usize + outs.len()) > 256 << 20
         {
             return (None, planned(device), lt);
@@ -1670,7 +1670,7 @@ impl Device {
         if let Some(tactic) = self.chosen.get(&key) {
             return Some(*tactic);
         }
-        if self.chosen.len() >= 1024 {
+        if self.chosen.len() >= 4096 {
             return None;
         }
         if let Some(tactic) = self
