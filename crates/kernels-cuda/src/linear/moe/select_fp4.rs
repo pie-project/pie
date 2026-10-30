@@ -416,9 +416,18 @@ pub fn select_mxfp4_w4a8(
     let lanes = u32::try_from(rows * (kw / 32) * 4).map_err(|_| refuse(op, "too many rows"))?;
     ctx.fire(
         op,
-        Fire::at(kernel(SELECT_FP4_SM120, &format!("::pie::linear::quantize_rows_mxfp8<{gran}>")))
-            .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
-        &[x.arg(), ArgValue::Ptr(xq), ArgValue::Ptr(xe), stated(op, x.rows)?.arg(), stated(op, x.width)?.arg()],
+        Fire::at(kernel(
+            SELECT_FP4_SM120,
+            &format!("::pie::linear::quantize_rows_mxfp8<{gran}>"),
+        ))
+        .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
+        &[
+            x.arg(),
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xe),
+            stated(op, x.rows)?.arg(),
+            stated(op, x.width)?.arg(),
+        ],
     )?;
     let experts = codes.rows.clamp(1, EXPERT_CAP);
     let bank_rows = if glu { 2 * y.width } else { y.width };
@@ -426,7 +435,12 @@ pub fn select_mxfp4_w4a8(
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
     let inter = stated(op, y.width)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
-    let RouteOrder { order, offsets, work, work_cap } = route_order_sliced(
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
         ctx,
         op,
         routes,
@@ -434,7 +448,11 @@ pub fn select_mxfp4_w4a8(
         experts,
         64 * W4A8_GROUPS,
         true,
-        if glu || KEEP_NEXT.with(core::cell::Cell::get) { Share::Keep } else { Share::Take },
+        if glu || KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
     )?;
     let tiles = y.width.div_ceil(if glu { 128 } else { 256 });
     let fire = Fire::at(kernel(
@@ -442,8 +460,15 @@ pub fn select_mxfp4_w4a8(
         &format!("::pie::linear::moe_select_mxfp4_w4a8<{code}, {W4A8_STAGES}, {W4A8_GROUPS}>"),
     ))
     .apply(
-        Launch::grid(if act_div == 1 { [tiles, work_cap, 1] } else { [work_cap, tiles, 1] }, [256 * W4A8_GROUPS, 1, 1])
-            .smem(W4A8_STAGES * W4A8_STAGE),
+        Launch::grid(
+            if act_div == 1 {
+                [tiles, work_cap, 1]
+            } else {
+                [work_cap, tiles, 1]
+            },
+            [256 * W4A8_GROUPS, 1, 1],
+        )
+        .smem(W4A8_STAGES * W4A8_STAGE),
     );
     let args = [
         ArgValue::Ptr(xq),
