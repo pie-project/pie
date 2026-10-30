@@ -12,6 +12,16 @@ namespace w4mma {
 
 using ::pie::ld_stream;
 
+/// `ld_stream`, the row's next 256 bytes brought into L2 with it: a chunk
+/// reads 64 bytes a row, and the chunks after it read the rest.
+__device__ __forceinline__ uint4 ld_stream_l2(const void* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+}
+
 /// a * b, bf16 x 2, subnormals kept.
 __device__ __forceinline__ unsigned mul2(unsigned a, unsigned b) {
     unsigned d;
