@@ -275,6 +275,85 @@ fn a_wedged_head_short_of_state_alone_still_reclaims_by_restart() {
     stores.rs.lock().unwrap().release_reservation(held);
 }
 
+/// A dry pool of eight pages, an older lane's growth and a younger prompt
+/// waiting on it, neither holding a page a kill could free: the off run's
+/// moment, when a third process had just finished.
+fn dry_pool_two_asks(planner: &ResidencyPlanner) -> Vec<EntryKey> {
+    planner.with_inner(|inner| {
+        [(ProcessId::new_v4(), 1), (ProcessId::new_v4(), 3)]
+            .into_iter()
+            .map(|(pid, kv_pages)| {
+                let seq = inner.next_seq;
+                inner.next_seq += 1;
+                let mut proc = Proc::new(seq);
+                proc.admitted = true;
+                inner.procs.insert(pid, proc);
+                inner.enqueue(pid, allocation(Demand { kv_pages, rs: RsUnits::default() }))
+            })
+            .collect()
+    })
+}
+
+fn unfailed(planner: &ResidencyPlanner, keys: &[EntryKey]) -> usize {
+    planner.with_inner(|inner| {
+        keys.iter()
+            .filter(|key| matches!(inner.queue[key].kind, WaitKind::Allocation { outcome: None, .. }))
+            .count()
+    })
+}
+
+#[test]
+fn a_departure_s_pages_are_waited_for_before_an_ask_holding_nothing_fails() {
+    // The finished process's working set still holds its pages: nothing
+    // fails while it does. Once it is released, a stall that remains is a
+    // wedge, and the youngest ask fails as before.
+    let pool = Arc::new(RacePool::new(8));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let keys = dry_pool_two_asks(&planner);
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let gone = crate::store::registry::get(model, 0).kv.lock().create_working_set();
+    planner.with_inner(|inner| inner.releasing.insert(gone));
+    assert!(planner.is_wedged());
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    assert_eq!(unfailed(&planner, &keys), 2, "an ask fails while a departure's pages come back");
+    planner.working_set_released(gone);
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    planner.with_inner(|inner| {
+        assert!(matches!(inner.queue[&keys[0]].kind, WaitKind::Allocation { outcome: None, .. }));
+        assert!(matches!(
+            inner.queue[&keys[1]].kind,
+            WaitKind::Allocation { outcome: Some(Err(PlannerError::Starved { .. })), .. }
+        ));
+    });
+}
+
+#[test]
+fn a_departure_held_behind_a_long_fire_is_waited_for_however_long() {
+    // The departed process's working set is released while a fire still
+    // leases it (a launch can take minutes): its pages come back only when
+    // the lease drops. No clock is involved: the planner waits for the
+    // release itself, so the empty asker does not fail before it.
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let stores = crate::store::registry::get(model, 0);
+    let id = stores.kv.lock().create_working_set();
+    crate::planner::init_planner(model, 0, ResidencyPlanner::new(Arc::new(RacePool::new(8)) as Arc<dyn PoolPort>));
+    let planner = crate::planner::planner_for(model, 0).expect("the test model's planner");
+    let keys = dry_pool_two_asks(&planner);
+    let ws = crate::store::kv::working_set::KvWorkingSet::new(model, 0, id, 16);
+    let lease = ws.fire_lease().expect("a fire leases the working set");
+    planner.with_inner(|inner| inner.releasing.insert(id));
+    ws.release();
+    for _ in 0..100 {
+        planner.check_starvation(StarveCause::NoSwapRoom);
+    }
+    assert_eq!(unfailed(&planner, &keys), 2, "an ask fails while the departure's release waits on a fire");
+    assert!(planner.with_inner(|inner| inner.releasing.contains(&id)));
+    drop(lease);
+    assert!(planner.with_inner(|inner| inner.releasing.is_empty()), "the fire's end releases the working set");
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    assert_eq!(unfailed(&planner, &keys), 1, "a stall that outlasts the release is a wedge");
+}
+
 #[test]
 fn a_burst_serves_exactly_the_fundable_prefix_in_one_pass() {
     let pool = Arc::new(RacePool::new(64));
