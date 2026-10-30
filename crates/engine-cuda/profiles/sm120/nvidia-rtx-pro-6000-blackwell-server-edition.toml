@@ -33,6 +33,13 @@ gemm.fp8_shadow = true
 # 1.58 -> 1.50 ms a token, greedy tokens unchanged
 pdl = true
 
+# independent chains (shared expert beside the routed ones) on side streams, as sm100 runs them:
+# Qwen3.6-35B-A3B single-request decode 170 -> 179 tok/s, greedy tokens unchanged, c128 unchanged
+[compiler]
+branches = true
+dag_streams = true
+dag_streams_until = 256
+
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"
 measured = [
