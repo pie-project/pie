@@ -672,22 +672,34 @@ __global__ void __launch_bounds__(kBM * kWN) moe_select_bf16_gemm(
             const long long route = order[begin + tok];
             if constexpr (kGlu != 0 && kGlu != 6) {
 #pragma unroll
-                for (int j = 0; j < kNT / 2; ++j)
-#pragma unroll
-                    for (int e = 0; e < 2; ++e) {
-                        const int col = c0 + (kWRows / 2) * wn + 8 * j + 2 * t + e;
-                        if (col < inter)
-                            out[route * inter + col] = f32_to_bf16(act::glu<kGlu>(
-                                acc[mt][j][2 * hh + e], acc[mt][j + kNT / 2][2 * hh + e], limit, galpha));
+                for (int j = 0; j < kNT / 2; ++j) {
+                    const int col = c0 + (kWRows / 2) * wn + 8 * j + 2 * t;
+                    const float v0 = act::glu<kGlu>(acc[mt][j][2 * hh], acc[mt][j + kNT / 2][2 * hh], limit, galpha);
+                    const float v1 = act::glu<kGlu>(acc[mt][j][2 * hh + 1], acc[mt][j + kNT / 2][2 * hh + 1], limit, galpha);
+                    // an even column pair lands as one 4-byte store
+                    if (col + 1 < inter && (inter & 1) == 0)
+                        *reinterpret_cast<unsigned*>(out + route * inter + col) = pack_bf16x2(v0, v1);
+                    else {
+                        if (col < inter) out[route * inter + col] = f32_to_bf16(v0);
+                        if (col + 1 < inter) out[route * inter + col + 1] = f32_to_bf16(v1);
                     }
+                }
             } else {
 #pragma unroll
-                for (int j = 0; j < kNT; ++j)
+                for (int j = 0; j < kNT; ++j) {
+                    const int row = c0 + kWRows * wn + 8 * j + 2 * t;
+                    float v[2];
 #pragma unroll
-                    for (int e = 0; e < 2; ++e) {
-                        const int row = c0 + kWRows * wn + 8 * j + 2 * t + e;
-                        if (row < n) out[route * n + row] = f32_to_bf16(kGlu == 6 ? fmaxf(acc[mt][j][2 * hh + e], 0.f) * fmaxf(acc[mt][j][2 * hh + e], 0.f) : acc[mt][j][2 * hh + e]);
+                    for (int e = 0; e < 2; ++e)
+                        v[e] = kGlu == 6 ? fmaxf(acc[mt][j][2 * hh + e], 0.f) * fmaxf(acc[mt][j][2 * hh + e], 0.f) : acc[mt][j][2 * hh + e];
+                    // an even row pair lands as one 4-byte store
+                    if (row + 1 < n && (n & 1) == 0)
+                        *reinterpret_cast<unsigned*>(out + route * n + row) = pack_bf16x2(v[0], v[1]);
+                    else {
+                        if (row < n) out[route * n + row] = f32_to_bf16(v[0]);
+                        if (row + 1 < n) out[route * n + row + 1] = f32_to_bf16(v[1]);
                     }
+                }
             }
         }
 }
