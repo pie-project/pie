@@ -81,7 +81,14 @@ fn device() -> i32 {
 
 /// The descriptors of a `[m, k] x [n, k]^T` product, and the first algorithm
 /// cuBLASLt offers for it; `None` where it offers none.
-fn build(handle: lt::cublasLtHandle_t, m: u32, n: u32, k: u32, workspace: usize, mx: bool) -> Option<Plan> {
+fn build(
+    handle: lt::cublasLtHandle_t,
+    m: u32,
+    n: u32,
+    k: u32,
+    workspace: usize,
+    mx: bool,
+) -> Option<Plan> {
     let mut plan = Plan {
         desc: std::ptr::null_mut(),
         a: std::ptr::null_mut(),
@@ -398,7 +405,9 @@ pub fn matmul(
             stated(op, k)?.arg(),
         ],
     )?;
-    run(ctx, op, handle, &plan, workspace, codes, ws_scales, xq, xs, d, y, m, mpad, n, k)
+    run(
+        ctx, op, handle, &plan, workspace, codes, ws_scales, xq, xs, d, y, m, mpad, n, k,
+    )
 }
 
 /// The plan's product of `codes` (scales at `a_scales`) and the quantized rows
@@ -554,5 +563,7 @@ pub fn matmul_mx(
     } else {
         scratch("linear.lt_mx_d", u64::from(mpad) * u64::from(n) * 2)?
     };
-    run(ctx, op, handle, &plan, workspace, codes, atoms, xq, xs, d, y, m, mpad, n, k)
+    run(
+        ctx, op, handle, &plan, workspace, codes, atoms, xq, xs, d, y, m, mpad, n, k,
+    )
 }

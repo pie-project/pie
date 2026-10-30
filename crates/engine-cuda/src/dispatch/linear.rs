@@ -2277,7 +2277,14 @@ impl Run<'_> {
         if act.rows > linear::w8a16::MMA_UNTIL
             && atoms.width > 0
             && act.width == atoms.width * 32
-            && linear::gemm::cublas_lt_fp8::matmul_mx(self.ctx(), op, act, codes.ptr, atoms.ptr, &mut out)?
+            && linear::gemm::cublas_lt_fp8::matmul_mx(
+                self.ctx(),
+                op,
+                act,
+                codes.ptr,
+                atoms.ptr,
+                &mut out,
+            )?
         {
             return Ok(());
         }
