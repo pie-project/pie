@@ -220,6 +220,13 @@ pub struct GemmFp8GemvUntil(pub u32);
 #[decision(id = "kernel.gemm.fp8_shadow", flag, default = false, tune = search)]
 pub struct GemmFp8Shadow;
 
+/// Whether a block-FP8 dense projection (no tcgen05) keeps its 128x128
+/// exponents spread over 1x32 blocks, laid once at load, so a batch's rows
+/// run cuBLASLt's MXFP8 GEMM on the same codes (sm_120).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_mx", flag, default = false, tune = search)]
+pub struct GemmFp8Mx;
+
 /// The most rows a dense fp8b128 projection runs on the mma.sync fp8
 /// kernel (`moe::dense_fp8_shape` says where it leads, in which CTA
 /// shape), its rows quantized in the same launch. 0: never.
@@ -853,6 +860,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
         .add::<GemmFp8Shadow>()
+        .add::<GemmFp8Mx>()
         .add::<GemmFp8MmaGemvUntil>()
         .add::<GemmFp8MmaKUntil>()
         .add::<AttnResFusedNorm>()
@@ -993,6 +1001,7 @@ tuning! {
     mla_expanded_from: u32 = 65_536, get MlaExpandedFrom;
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
     gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
+    gemm_fp8_mx: bool = false, on GemmFp8Mx;
     gemm_fp8_mma_gemv_until: u32 = 0, get GemmFp8MmaGemvUntil;
     gemm_fp8_mma_k_until: u32 = 0, get GemmFp8MmaKUntil;
     attn_res_fused_norm: bool = false, on AttnResFusedNorm;

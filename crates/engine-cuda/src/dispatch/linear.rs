@@ -2178,6 +2178,19 @@ impl Run<'_> {
         {
             return Ok(false);
         }
+        // Its exponents spread to 1x32 at load: cuBLASLt's MXFP8 GEMM (`kernel.gemm.fp8_mx`).
+        if let Some(mx) = self.fp8_mx_atoms(w)
+            && linear::gemm::cublas_lt_fp8::matmul_mx(
+                self.ctx(),
+                "linear.matmul",
+                act,
+                codes.ptr,
+                mx.ptr,
+                &mut self.tensor(y),
+            )?
+        {
+            return Ok(true);
+        }
         linear::moe::matmul_fp8_scaled(self.ctx(), act, codes.ptr, atoms.ptr, &mut self.tensor(y))
     }
 
