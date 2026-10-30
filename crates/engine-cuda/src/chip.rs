@@ -130,7 +130,7 @@ pub struct PrefillLatticeFrom(pub u32);
 
 /// Buckets a doubling the default lattice takes past `engine.prefill_lattice_from`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.prefill_lattice_steps", constant(set(4, 8)), default = 4, tune = engine)]
+#[decision(id = "engine.prefill_lattice_steps", constant(set(4, 8, 16)), default = 4, tune = engine)]
 pub struct PrefillLatticeSteps(pub u32);
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
