@@ -1228,6 +1228,11 @@ mod tests {
         );
         rig_admit(&router, &placed, &routing).await;
         router.dispatched(&placed, WorkerId(1));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while router.placement(&placed).0.is_none() {
+            assert!(Instant::now() < deadline, "the placement never arrived");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(router.placement(&placed).0, Some(WorkerId(1)));
 
         // The controller dies before the move is due, and stays down past it.
