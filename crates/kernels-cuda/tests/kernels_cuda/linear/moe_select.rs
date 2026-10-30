@@ -582,3 +582,28 @@ fn the_bf16_prefill_selects_answer_the_routed_dot() {
         b.check(y.ptr, &want, TOL, &what);
     }
 }
+
+/// DeepSeek-V4-Flash's gate-up and down legs at a prefill's 8192 tokens on
+/// the W4A8 select, fired for a profiler (no host dot).
+#[test]
+#[ignore = "timing only"]
+fn w4a8_select_timing() {
+    let mut b = Bench::new(7);
+    let ctx = b.ctx().with_tuning(Tuning { mxfp4_w4a8_from: 1, ..Tuning::DEFAULT });
+    let (ex, tokens, top) = (16usize, 8192usize, 6usize);
+    for (n, k, by_token) in [(4096usize, 4096usize, true), (4096, 2048, false)] {
+        let rows_x = if by_token { tokens } else { tokens * top };
+        let (raw, _) = b.lcg.row(rows_x * k);
+        let x = t(b.up(&raw), rows_x, k, Bf16);
+        let codes = tab(ex * n * k / 2, |i| (i * 2_654_435_761 >> 7) as u8);
+        let scales = tab(ex * n * k / 32, |i| 120 + (i % 7) as u8);
+        let (mx, sc) = (t(b.up(&codes), ex, n * k / 2, U8), t(b.up(&scales), ex, n * k / 32, U8));
+        let routes = tab(tokens * top, |r| ((r / top * 3 + r % top * 5) % ex) as i32);
+        let r = t(b.up(&routes), tokens, top, I32);
+        let mut y = b.out(tokens * top, n);
+        for _ in 0..5 {
+            assert!(moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, 128).expect("fires"));
+        }
+        b.sync();
+    }
+}

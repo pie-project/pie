@@ -383,9 +383,11 @@ fn w4a8_takes(ctx: &Ctx, x: Tensor, routes: Tensor) -> bool {
 /// routes' 128 codes (144 apart) and scales, 256 rows' 64 code bytes (80
 /// apart) and scales.
 #[cfg(feature = "cuda")]
-const W4A8_STAGES: u32 = 3;
+const W4A8_STAGES: u32 = 2;
 #[cfg(feature = "cuda")]
-const W4A8_STAGE: u32 = 64 * 144 + 64 * 4 + 256 * 80 + 256 * 4;
+const W4A8_GROUPS: u32 = 2;
+#[cfg(feature = "cuda")]
+const W4A8_STAGE: u32 = W4A8_GROUPS * 64 * (144 + 4) + 256 * 80 + 256 * 4;
 
 /// A routed mxfp4 select whose release quantizes its rows to e4m3 in
 /// `gran`s (32 or 128), W4A8 on sm_120a's block-scaled mma.sync: `x`'s rows
@@ -430,17 +432,17 @@ pub fn select_mxfp4_w4a8(
         routes,
         fan,
         experts,
-        64,
+        64 * W4A8_GROUPS,
         true,
         if glu || KEEP_NEXT.with(core::cell::Cell::get) { Share::Keep } else { Share::Take },
     )?;
     let tiles = y.width.div_ceil(if glu { 128 } else { 256 });
     let fire = Fire::at(kernel(
         SELECT_FP4_SM120,
-        &format!("::pie::linear::moe_select_mxfp4_w4a8<{code}, {W4A8_STAGES}>"),
+        &format!("::pie::linear::moe_select_mxfp4_w4a8<{code}, {W4A8_STAGES}, {W4A8_GROUPS}>"),
     ))
     .apply(
-        Launch::grid(if act_div == 1 { [tiles, work_cap, 1] } else { [work_cap, tiles, 1] }, [256, 1, 1])
+        Launch::grid(if act_div == 1 { [tiles, work_cap, 1] } else { [work_cap, tiles, 1] }, [256 * W4A8_GROUPS, 1, 1])
             .smem(W4A8_STAGES * W4A8_STAGE),
     );
     let args = [

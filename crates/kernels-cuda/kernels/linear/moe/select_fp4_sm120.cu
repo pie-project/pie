@@ -70,10 +70,11 @@ __device__ __forceinline__ void cp4(void* dst, const void* from, int bytes) {
 /// `quantize_rows_mxfp8` (`xq` codes, `xe` a ue8m0 a 32), the bank's e2m1
 /// codes against them under both sides' e8m0 scales, as the FlashInfer
 /// SM120 CUTLASS MoE runs MXFP4 experts. Eight warps a CTA (256 rows, or 128
-/// GLU columns), a slice of 64 routes, `k` whole 128s: each 128-code chunk's
-/// codes, routes and scales staged through one `kStages` cp.async ring.
-template <int kGlu, int kStages>
-__global__ void __launch_bounds__(256, 1) moe_select_mxfp4_w4a8(
+/// GLU columns) a 64 routes, `kGroups` of them a CTA over a slice of 64
+/// `kGroups` routes, `k` whole 128s: each 128-code chunk's codes, routes and
+/// scales staged through one `kStages` cp.async ring.
+template <int kGlu, int kStages, int kGroups>
+__global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
     const u8* __restrict__ xq,
     const u8* __restrict__ xe,
     const i32* __restrict__ order,
@@ -96,7 +97,7 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_w4a8(
     constexpr int kWarps = 8;
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
     constexpr int kRowsCta = kWarps * kRowsWarp;
-    constexpr int kSlice = 8 * kNb;
+    constexpr int kSlice = 8 * kNb * kGroups;
     // A stage: the slice's 128 codes a route (rows 144 apart, so a warp's
     // 8-byte reads of eight routes fall on distinct banks), a route's four
     // scales, the CTA's 256 rows' 64 code bytes (80 apart, for its 4-byte
@@ -119,7 +120,8 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_w4a8(
     if (count <= 0) return;
 
     const int tid = static_cast<int>(threadIdx.x);
-    const int warp = tid >> 5;
+    const int warp = (tid >> 5) % kWarps;
+    const int group = tid / 256;
     const int lane = tid & 31;
     const int g = lane >> 2;
     const int c = lane & 3;
@@ -136,11 +138,14 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_w4a8(
 
     // The stage row this thread copies: warp tid / 32's tile (tid / 16) % 2,
     // half (tid / 8) % 2, row tid % 8, as the warp's lanes read it.
-    const int own_base = cta_row + (tid >> 5) * kRowsWarp;
-    const int own_t = (tid >> 4) & 1;
+    const int own = tid % 256;
+    const int own_half = tid / 256;
+    const int own_base = cta_row + (own >> 5) * kRowsWarp;
+    const int own_t = (own >> 4) & 1;
     const int own_tile = kGlu != 0 ? own_base + own_t * inter : own_base + 16 * own_t;
-    const int own_row = min(max(own_tile, 0) + (tid & 15), n - 1);
-    // The slice route this thread copies a quarter of: route tid / 4.
+    const int own_row = min(max(own_tile, 0) + (own & 15), n - 1);
+    // The slice routes this thread copies a quarter of: route tid / 4 (and
+    // past them, tid / 4 + 64 kGroups, with fewer threads than 4 a route).
     const int xr = tid >> 2;
     const int xq4 = tid & 3;
     const int xsrc = xr < count ? order[begin + xr] / act_div : -1;
@@ -160,8 +165,9 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_w4a8(
             unsigned char* ws = st + kX + kXs;
             const u8* wf = w_e + own_row * row_bytes + ch * 64;
 #pragma unroll
-            for (int q = 0; q < 4; ++q) w4a8::cp16(ws + tid * kWStride + q * 16, wf + q * 16, 16);
-            w4a8::cp4(ws + kW + tid * 4, s_e + static_cast<long long>(own_row) * sf_row + ch * 4, 4);
+            for (int q = own_half * 4 / kGroups; q < (own_half + 1) * 4 / kGroups; ++q)
+                w4a8::cp16(ws + own * kWStride + q * 16, wf + q * 16, 16);
+            if (own_half == 0) w4a8::cp4(ws + kW + own * 4, s_e + static_cast<long long>(own_row) * sf_row + ch * 4, 4);
         }
         asm volatile("cp.async.commit_group;\n" ::);
     };
@@ -193,7 +199,7 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_w4a8(
 #pragma unroll
             for (int t = 0; t < kTiles; ++t) sa[t] = wsc[warp * 32 + t * 16 + (c & 1) * 8 + g];
 #pragma unroll
-            for (int b = 0; b < kNb; ++b) sb[b] = xs[8 * b + g];
+            for (int b = 0; b < kNb; ++b) sb[b] = xs[64 * group + 8 * b + g];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 unsigned a[kTiles][4];
@@ -208,7 +214,7 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_w4a8(
 #pragma unroll
                 for (int b = 0; b < kNb; ++b) {
                     const uint2 bv =
-                        *reinterpret_cast<const uint2*>(st + (8 * b + g) * kXStride + j * 32 + 8 * c);
+                        *reinterpret_cast<const uint2*>(st + (64 * group + 8 * b + g) * kXStride + j * 32 + 8 * c);
                     const unsigned sbj = (sb[b] >> (8 * j)) & 0xFFu;
 #pragma unroll
                     for (int t = 0; t < kTiles; ++t)
@@ -218,11 +224,11 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_w4a8(
         }
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
-    if (!rows_live) return;
+    if (!rows_live || count <= 64 * group) return;
 
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
     auto factor = [](int) { return 1.f; };
-    w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin, count, out, n, inter,
+    w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin + 64 * group, count - 64 * group, out, n, inter,
                                       row_base, g, c, limit, galpha);
 }
 
