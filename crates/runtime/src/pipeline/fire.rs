@@ -3355,7 +3355,19 @@ fn settle_fold(
     let FoldAt { by, decoded } = fold;
     // A prompt's slot hashes are made before the store is locked: 512 rows
     // take ~0.5 ms, which every other lane's finalize waited out behind it.
-    let hashed = (success && !decoded)
+    let folds = match &by {
+        FoldBy::To(_) => true,
+        FoldBy::Settled { count, tags, .. } => {
+            count.is_some()
+                || (!tags.is_empty()
+                    && tags.iter().all(|tag| {
+                        reported
+                            .get(tag)
+                            .is_some_and(|written| written.fold.is_some())
+                    }))
+        }
+    };
+    let hashed = (success && !decoded && folds)
         .then(|| {
             crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
                 Some((kv.domain(), kv.fold_rows(ws).ok()??))
