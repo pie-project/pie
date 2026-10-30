@@ -49,6 +49,9 @@ sdpa.fa2_live = true
 # on the block-scaled mma.sync, as SGLang reads them (no block-FP8 copy of the bank)
 moe.mxfp4_w4a8_from = 256
 moe.mxfp4_w4a8_tma = true
+# block-FP8 dense projections' batch rows on cuBLASLt's MXFP8 GEMM, the 128x128 exponents spread to
+# 1x32 at load (~700 TF against the mma.sync kernel's ~500 at 8192 rows), as SGLang's CUTLASS GEMM reads them
+gemm.fp8_mx = true
 
 # independent chains (shared expert beside the routed ones) on side streams, as sm100 runs them:
 # Qwen3.6-35B-A3B single-request decode 170 -> 179 tok/s, greedy tokens unchanged, c128 unchanged
