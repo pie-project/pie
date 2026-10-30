@@ -44,9 +44,10 @@ pub struct VmImage {
     /// Top-p walks eta's order in rounds (`vm_pwalk`, the layout's default
     /// 1); `Some(false)`: the list engine.
     pub pwalk: Option<bool>,
-    /// Fork 3's merged guest4hz options: the canonical sum (`vm_sumpipe`, 1
-    /// pipelined, 2 concatenating) and the last hub's level-2 list in wide
-    /// registers (`vm_l2w`); `None`: the layout's default.
+    /// Fork 3's merged guest4hz options: the canonical sum (`vm_sumpipe`, 3
+    /// by row chunks, 1 pipelined, 2 concatenating) and the last hub's
+    /// level-2 list in wide registers (`vm_l2w`); `None`: the layout's
+    /// default (serve2d_pipe's: 3 and 1, from 0168).
     pub sumpipe: Option<usize>,
     pub l2w: Option<bool>,
 }

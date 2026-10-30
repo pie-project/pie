@@ -100,8 +100,8 @@ param opmask_hi: u32 = 0xffffffff;
 // Fork 3's merged VM (guest4hz): the canonical sum's mode (1 pipelined chunks,
 // 2 one-pass concatenating), wide logits rows (l2w), and set B's token color
 // to set A's sender (unrouted on row F at the head's VM columns). Both sets.
-param vm_sumpipe: u16 = 1;
-param vm_l2w: u16 = 0;
+param vm_sumpipe: u16 = 3;
+param vm_l2w: u16 = 1;
 param vm_c_bt: u16 = 12;
 param HLM: u16 = 4;
 param SPEC_H: u16;

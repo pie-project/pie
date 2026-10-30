@@ -27,7 +27,9 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
     per-lane programs, rows per turn (0: an idle lane), top-p by rounds,
     top-k by radix select (the VM's `vm_topk` 1, its default: 0164, typical
     3.23M -> 214k cycles a step; the rounds top-k compiled out;
-    `vm_lazyrng` stays 0) and the `vm_sumpipe` / `vm_l2w` options.
+    `vm_lazyrng` stays 0), the `vm_sumpipe` / `vm_l2w` options (serve2d_pipe's
+    layout defaults them to 3 and 1: 0168, top-p's sum -41%, typical's
+    token -7.5%), and an output-queue empty-wait before init's recolors.
 - `serve2d/`, `serve2d_pipe/`, `serve8b/`, `serve8b_region/`: each design's
   (`kvstage.csl`: serve2d*'s KV page staging, `KVST` slots a paged-grid PE;
   serve8b's is in its `grid_extra.csl`), layout, routing helpers,

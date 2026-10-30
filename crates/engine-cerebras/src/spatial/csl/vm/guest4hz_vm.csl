@@ -158,11 +158,11 @@ const q5_in = @get_input_queue(5);
 const q6_in = @get_input_queue(6);
 const q7_in = @get_input_queue(7);
 // The VM's colors (layout params; defaults: head2d / serve2d's).
-param vm_sumpipe: u16 = 1;  // 1: the canonical sum's chunks folded back to back, the last hub sums them (one result)
+param vm_sumpipe: u16 = 3;  // 3 (default; 0168: sum 54.5k -> 32.4k): by row chunks (one block, Vt 32; else as 1); 1: chunks folded back to back; 0: chunk by chunk; 2: concatenation
 param vm_topk: u16 = 1;    // vm_pwalk TOPK: 1 radix select (windows of vm_rxw entries; default, 0164: 15x); 0 rounds of KB
 param vm_rxw: u16 = 0;     // radix windows (0: RB / 2; smaller only for simulator tests)
 param vm_lazyrng: u16 = 0; // 1: WRNG registers drawn where read (exact)
-param vm_l2w: u16 = 0;     // 1: the last hub's level-2 list in wide (a hub holds no row; the list lives within one sum op): -L2N words
+param vm_l2w: u16 = 1;     // 1 (default): the last hub's level-2 list in wide where it fits (a hub holds no row; the list lives within one sum op): -L2N words
 param vm_ch: u16 = 256;     // blocks a chunk (a multiple of 32; smaller only for simulator tests)
 param vm_dbg: u16 = 0;      // diagnostics: 1 rows and tokens only (no sections); 2 + a max fold a row; 3 + the
                             // compute-start pre sections only (no main); 0 normal. gdbg: [rows read, tokens sent, folds, phase]
@@ -181,6 +181,9 @@ param vm_c_park0: u16 = 17; // parked input queues: colors never routed at VM PE
 param vm_c_park1: u16 = 16;
 param vm_conc: u16 = 0;    // two sets at once: B's rows on vm_c_vl2, B's tokens by route to the root
 param vm_c_vl2: u16 = 13;   // vm_conc: set B's rows
+param vm_split: u16 = 0;   // two interleaved chains a half column (half the fold hops)
+param vm_c_a2: u16 = 20;   // vm_split: chain 1's colours
+param vm_c_b2: u16 = 11;
 param vm_c_bt: u16 = 12;    // two VM sets: set B's token west to set A's sender
 const C_A: u16 = vm_c_a;
 const C_B: u16 = vm_c_b;
@@ -192,6 +195,37 @@ const C_VT: u16 = vm_c_vt;
 const C_PARK0: u16 = vm_c_park0;
 const C_PARK1: u16 = vm_c_park1;
 const C_BT: u16 = vm_c_bt;
+const SPLIT: bool = vm_split != 0;
+const C_A2: u16 = vm_c_a2;
+const C_B2: u16 = vm_c_b2;
+const q3_in = @get_input_queue(3);
+// chain c's colour at hop parity p (north; the south's p is offset by one)
+fn sp_col(c: u16, p: u16) u16 { return if (c == 0) (if (p == 0) C_A else C_B) else (if (p == 0) C_A2 else C_B2); }
+// a split-chain PE dd rows from the hub's neighbour (last: the half's farthest);
+// tw toward the hub, aw away; off: the south's colour offset
+fn sp_routes(comptime tw: direction, comptime aw: direction, dd: u16, last: u16, off: u16) void {
+  const ch = dd % 2;
+  const hp = dd / 2;
+  const sc = sp_col(ch, (hp + off) % 2);
+  color_config.reset_routes(col_of(sc), .{ .rx = RAMP, .tx = tw });
+  oq_color(3, sc);
+  col_end = dd + 2 > last;
+  if (!col_end) {
+    const rc = sp_col(ch, (hp + 1 + off) % 2);
+    color_config.reset_routes(col_of(rc), .{ .rx = aw, .tx = RAMP });
+    iq_color(4, rc);
+  }
+  if (dd + 1 <= last) {
+    // the other chain's hop from dd + 1 crosses this row
+    const pc = sp_col(1 - ch, ((dd + 1) / 2 + off) % 2);
+    color_config.reset_routes(col_of(pc), .{ .rx = aw, .tx = tw });
+  }
+  if (dd == last) {
+    color_config.reset_routes(col_of(C_K), .{ .rx = tw, .tx = RAMP });
+  } else {
+    color_config.reset_routes(col_of(C_K), .{ .rx = tw, .tx = [2]direction{ RAMP, aw } });
+  }
+}
 const CONC: bool = vm_conc != 0 and VSET2 != 0;
 const C_VLS: u16 = if (CONC and VSET == 1) vm_c_vl2 else vm_c_vl;   // this set's rows
 const C_VL2: u16 = vm_c_vl2;  // two VM sets: set B's token, west to set A's sender
@@ -200,7 +234,7 @@ const C_VL2: u16 = vm_c_vl2;  // two VM sets: set B's token, west to set A's sen
 // queues for the same color").
 comptime {
   @comptime_assert(vm_c_a < 21 and vm_c_b < 21 and vm_c_e < 21 and vm_c_g < 21 and vm_c_k < 21);
-  @comptime_assert(vm_c_vl < 21 and vm_c_vt < 21 and vm_c_park0 < 21 and vm_c_park1 < 21 and vm_c_bt < 21 and vm_c_vl2 < 21);
+  @comptime_assert(vm_c_vl < 21 and vm_c_vt < 21 and vm_c_park0 < 21 and vm_c_park1 < 21 and vm_c_bt < 21 and vm_c_vl2 < 21 and vm_c_a2 < 21 and vm_c_b2 < 21);
 }
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
@@ -236,9 +270,9 @@ var tmp = @zeros([Vt]f32);
 const tmp0 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vt} -> tmp[i] });
 var red = @zeros([RB]f32);
 var myblk = @zeros([Vt / 32]f32);
-var l2_own = @zeros([if (vm_l2w != 0) 1 else L2N]f32);
-var l2: [*]f32 = if (vm_l2w != 0) &wide else &l2_own;
-comptime { if (vm_l2w != 0) { @comptime_assert(NREG * Vt >= L2N); } }
+const L2W: bool = vm_l2w != 0 and NREG * Vt >= L2N;   // (only where the hub's wide holds it)
+var l2_own = @zeros([if (L2W) 1 else L2N]f32);
+var l2: [*]f32 = if (L2W) &wide else &l2_own;
 var chunk: u16 = 0;
 var order = @zeros([Vt]u16);
 
@@ -735,6 +769,7 @@ noinline fn lane_fold(kind: u16, n: u16) void {
   }
   take(q4_in, m);
   take(q5_in, m);
+  if (SPLIT) { take(q3_in, m); take(q2_in, m); }
   if (hub_first or hub_last) {
     if (!hub_first) { take(q6_in, m); }
     @fmovs(fab_out(q3_out, m), red_dsd(m));
@@ -776,7 +811,7 @@ noinline fn cat_tree() f32 {
 }
 // (out of line: each fabric DSD site costs code, the chain's few helpers do)
 const cat_row_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NVC} -> cat_row[i] });
-const l2_dsd = if (vm_l2w != 0) @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{L2N} -> wide[i] })
+const l2_dsd = if (L2W) @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{L2N} -> wide[i] })
                 else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{L2N} -> l2_own[i] });
 noinline fn c_fwd(n: u16) void { if (n > 0) { @fmovs(fab_out(q3_out, n), fab_in(q4_in, n)); } }
 noinline fn c_out(src: mem1d_dsd, n: u16) void { if (n > 0) { @fmovs(fab_out(q3_out, n), @set_dsd_length(src, n)); } }
@@ -889,6 +924,7 @@ noinline fn sum_cat() void {
   @fmovs(red_dsd(1), fab_in(q7_in, 1));
 }
 const SUMPIPE: bool = vm_sumpipe != 0;
+comptime { if (SPLIT) { @comptime_assert(vm_sumpipe <= 1 and !OPK_LISTS); } }
 const SUMROWS: bool = vm_sumpipe == 3 and NB == 1 and Vt == 32 and 32 * NVC <= RB;
 const SR_COL = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{32} -> red[i * @as(i16, NVC)] });
 fn sr_pass(n: u16) void { if (n > 0) { @fmovs(fab_out(q3_out, n), fab_in(q4_in, n)); } }
@@ -897,15 +933,11 @@ fn sr_zero(n: u16) void { if (n > 0) { @fmovs(fab_out(q3_out, n), 0.0); } }
 fn sr_col(comptime q: input_queue, c: u16, r: u16, n: u16) void {
   if (n > 0) { @fmovs(@set_dsd_length(@increment_dsd_offset(SR_COL, @as(i16, r * NVC + c), f32), n), fab_in(q, n)); }
 }
-noinline fn sr_tree(g: u16) void {
-  var off: u16 = 16;
-  while (off > 0) {
-    const glo = @set_dsd_length(@increment_dsd_offset(red_dsd(RB), @as(i16, g * 32), f32), off);
-    const ghi = @increment_dsd_offset(glo, @as(i16, off), f32);
-    @fadds(glo, glo, ghi);
-    off = off / 2;
-  }
-}
+const SR_T16 = @get_dsd(mem4d_dsd, .{ .tensor_access = |g, i|{NVC, 16} -> red[g * 32 + i] });
+const SR_T8 = @get_dsd(mem4d_dsd, .{ .tensor_access = |g, i|{NVC, 8} -> red[g * 32 + i] });
+const SR_T4 = @get_dsd(mem4d_dsd, .{ .tensor_access = |g, i|{NVC, 4} -> red[g * 32 + i] });
+const SR_T2 = @get_dsd(mem4d_dsd, .{ .tensor_access = |g, i|{NVC, 2} -> red[g * 32 + i] });
+const SR_T1 = @get_dsd(mem4d_dsd, .{ .tensor_access = |g, i|{NVC, 1} -> red[g * 32 + i] });
 noinline fn sum_rows() void {
   const nch = (H + 31) / 32;
   if (!hub) { red[0] = myblk[0]; }
@@ -944,15 +976,18 @@ noinline fn sum_rows() void {
       if (ns > 0) { @fmovs(fab_out(q3_out, ns), fab_in(q5_in, ns)); }
     } else {
       const L = r1 - r0;
-      @fmovs(red_dsd(32 * NVC), 0.0);
+      if (L < 32) { @fmovs(red_dsd(32 * NVC), 0.0); }   // a short last chunk: its missing lanes 0
       { var c: u16 = 0; while (c + 1 < NVC) : (c += 1) { sr_col(q6_in, c, 0, L); } }
       sr_col(q4_in, NVC - 1, 0, nn);
       sr_col(q5_in, NVC - 1, nn, ns);
+      // the chunk's NVC groups' trees at once (offsets 16 .. 1), their sums to l2
+      @fadds(SR_T16, SR_T16, @increment_dsd_offset(SR_T16, 16, f32));
+      @fadds(SR_T8, SR_T8, @increment_dsd_offset(SR_T8, 8, f32));
+      @fadds(SR_T4, SR_T4, @increment_dsd_offset(SR_T4, 4, f32));
+      @fadds(SR_T2, SR_T2, @increment_dsd_offset(SR_T2, 2, f32));
+      @fadds(SR_T1, SR_T1, @increment_dsd_offset(SR_T1, 1, f32));
       const ng = (L * NVC + 31) / 32;
-      { var g: u16 = 0; while (g < ng) : (g += 1) {
-        sr_tree(g);
-        l2[k * NVC + g] = red[g * 32];
-      } }
+      { var g: u16 = 0; while (g < ng) : (g += 1) { l2[k * NVC + g] = red[g * 32]; } }
     }
   } }
   if (hub and hub_last) {
@@ -985,6 +1020,7 @@ noinline fn sum_pipe() void {
     } else {
       take(q4_in, n);
       take(q5_in, n);
+      if (SPLIT) { take(q3_in, n); take(q2_in, n); }
       if (hub_last) {
         if (!hub_first) { take(q6_in, n); }
         // level 2 of this chunk's blocks (groups of 32, missing lanes 0)
@@ -1581,6 +1617,7 @@ noinline fn rx_gather() u16 {
   } else {
     n = rx_take(q4_in, 0);
     n += rx_take(q5_in, 2 * n);
+    if (SPLIT) { n += rx_take(q3_in, 2 * n); n += rx_take(q2_in, 2 * n); }
     if (!hub_first) { n += rx_take(q6_in, 2 * n); }
     if (hub_last) { rx_sort(n); }
     rx_send(n);
@@ -2227,6 +2264,9 @@ fn iq_color(comptime qid: u16, c: u16) void {
   @set_config(addr, v, tile_config.input_queue_config.in_queue_addr_range);
 }
 fn oq_color(comptime qid: u16, c: u16) void {
+  // a send completes when its wavelets are in the queue, not out of it:
+  // recolor only once the queue has drained (empty mask in the high byte)
+  while ((tile_config.output_queue_status.get_raw() & (@as(u16, 0x0100) << qid)) == 0) {}
   const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
   var v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
   v = (v & 0xfe0f) | (c << 4);
@@ -2338,7 +2378,11 @@ fn init() void {
   // both (their colors differ), then the hubs chain east on E/G by block
   // parity through the head's feeder-row PEs (their routes are the head's
   // init); the result K goes back west and up/down the columns.
-  if (vy < F) {
+  if (SPLIT and vy < F) {
+    sp_routes(SOUTH, NORTH, F - 1 - vy, F - 1, 0);
+  } else if (SPLIT and vy > F) {
+    sp_routes(NORTH, SOUTH, vy - F - 1, H - F - 1, 1);
+  } else if (vy < F) {
     const sc = if (vy % 2 == 0) C_A else C_B;
     const rc = if (vy % 2 == 0) C_B else C_A;
     color_config.reset_routes(col_of(sc), .{ .rx = RAMP, .tx = SOUTH });
@@ -2364,8 +2408,14 @@ fn init() void {
     }
   } else {
     // The hub: from the north (row F-1's color), from the south (row F+1's).
-    const nc = if ((F - 1) % 2 == 0) C_A else C_B;
-    const sc2 = if ((F + 1) % 2 == 0) C_B else C_A;
+    const nc = if (SPLIT) C_A else if ((F - 1) % 2 == 0) C_A else C_B;
+    const sc2 = if (SPLIT) C_B else if ((F + 1) % 2 == 0) C_B else C_A;
+    if (SPLIT) {
+      color_config.reset_routes(col_of(C_A2), .{ .rx = NORTH, .tx = RAMP });
+      iq_color(3, C_A2);
+      color_config.reset_routes(col_of(C_B2), .{ .rx = SOUTH, .tx = RAMP });
+      iq_color(2, C_B2);
+    }
     color_config.reset_routes(col_of(nc), .{ .rx = NORTH, .tx = RAMP });
     iq_color(4, nc);
     color_config.reset_routes(col_of(sc2), .{ .rx = SOUTH, .tx = RAMP });
@@ -2691,6 +2741,7 @@ comptime {
   @initialize_queue(q5_in, .{ .color = @get_color(C_A) });
   @initialize_queue(q6_in, .{ .color = @get_color(C_E) });
   @initialize_queue(q7_in, .{ .color = @get_color(C_K) });
+  if (SPLIT) { @initialize_queue(q3_in, .{ .color = @get_color(C_A2) }); }
 
   @export_symbol(wide_ptr, "gwide");
   @export_symbol(pool_ptr, "gpool");
