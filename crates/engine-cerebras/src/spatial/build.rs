@@ -531,11 +531,12 @@ fn pipe_shape(lanes: usize, cfg: &ServeConfig) -> R<(usize, usize)> {
 /// KV staging are unrun on the ring.
 /// And serve2d_pipe's outside the shapes hardware ran right (pins
 /// included): B 4 with HB 4 (one head group a micro-batch) at up to 8
-/// micro-batches and CAP 32 (0154), with the VM sets at up to 4 and CAP 16
-/// (0156, 0158). Several head groups a micro-batch deposit the wrong tokens
-/// (B 16 HB 4: 63 of 64 lanes zero, 0171), and B 8 HB 8 hangs on long
-/// launches (0154, 0158; 0172 probes where). Smaller B (simulator builds)
-/// stays open with HB = B.
+/// micro-batches and CAP 32 (0154, 0157; exact even with every lane's
+/// winner the same every step, 0174), with the VM sets at up to 4 and CAP
+/// 16 (0156, 0158). An 8-lane head group hangs on some winner patterns
+/// (0158, 0172, 0173), and past B 8 lanes after the first get wrong
+/// embeddings (0171); the rest is unrun. Smaller B (simulator builds) stays
+/// open with HB = B.
 fn refused(design: Design, params: &[(String, String)]) -> R<()> {
     let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.trim());
     let num = |k: &str| get(k).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
@@ -545,19 +546,19 @@ fn refused(design: Design, params: &[(String, String)]) -> R<()> {
     if design == Design::Serve2dPipe && get("B").is_some() {
         let (b, hb, m, cap) = (num("B"), num("HB"), num("MMAX"), num("CAP"));
         let vm = num("VM") == 1;
-        let why = if hb != b {
-            Some("several head groups a micro-batch deposit wrong tokens (HB < B: 0171)")
-        } else if b > 4 {
-            Some("B 8 and up hang on long launches (0154, 0158) or are unrun")
-        } else if m > 8 || cap > 32 || (vm && (m > 4 || cap > 16)) {
-            Some("unrun on hardware")
+        let why = if hb > 4 {
+            Some("serve2d_pipe HB > 4 is unsupported: an 8-lane head group hangs on some winner patterns (0158/0172/0173)")
+        } else if b > 8 {
+            Some("serve2d_pipe B > 8 is unsupported: lanes past the first get wrong embeddings (0171)")
+        } else if hb != b || b > 4 || m > 8 || cap > 32 || (vm && (m > 4 || cap > 16)) {
+            Some("serve2d_pipe's shape is unrun on hardware")
         } else {
             None
         };
         if let Some(why) = why {
             return Err(format!(
-                "serve2d_pipe B:{b} HB:{hb} MMAX:{m} CAP:{cap} VM:{} is unsupported: {why}; hardware ran B:4 HB:4 \
-MMAX<=8 CAP<=32 (0154), and MMAX<=4 CAP<=16 with the VM sets (0156, 0158)",
+                "{why} (B:{b} HB:{hb} MMAX:{m} CAP:{cap} VM:{}); hardware ran B:4 HB:4 MMAX<=8 CAP<=32 (0154, 0157), \
+and MMAX<=4 CAP<=16 with the VM sets (0156, 0158)",
                 usize::from(vm)
             ));
         }
@@ -959,14 +960,15 @@ mod tiny {
         for ok in ["B:4,HB:4,MMAX:8,CAP:32", "B:4,HB:4,MMAX:4,CAP:16,VM:1", "B:2,HB:2,MMAX:2,CAP:8,VM:1"] {
             assert!(refused(Design::Serve2dPipe, &p(ok)).is_ok(), "{ok}");
         }
-        assert!(bad("B:16,HB:4,MMAX:4,CAP:12").contains("0171"));
-        assert!(bad("B:8,HB:8,MMAX:8,CAP:16").contains("0158"));
+        assert!(bad("B:16,HB:4,MMAX:4,CAP:12").contains("B > 8 is unsupported"));
+        assert!(bad("B:8,HB:8,MMAX:8,CAP:16").contains("HB > 4 is unsupported"));
+        assert!(bad("B:8,HB:4,MMAX:4,CAP:16").contains("unrun"));
         assert!(bad("B:4,HB:4,MMAX:9,CAP:16").contains("unrun"));
         assert!(bad("B:4,HB:4,MMAX:8,CAP:16,VM:1").contains("unrun"));
         let (plan, mut cfg) = pipe_config();
         assert!(params(&plan, &cfg).is_ok());
         cfg.hb = Some(1);
-        assert!(params(&plan, &cfg).unwrap_err().contains("0171"));
+        assert!(params(&plan, &cfg).unwrap_err().contains("unrun"));
     }
 
     #[test]
