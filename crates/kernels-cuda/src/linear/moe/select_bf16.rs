@@ -303,14 +303,26 @@ pub fn select_bf16_held(
         if bm != 64 {
             order = route_order_sliced(ctx, op, routes, &fan, experts, bm, true, Share::No)?;
         }
-        Fire::at(kernel(
-            SELECT_SM80,
-            &format!("::pie::linear::moe_select_bf16_gemm<{STAGES}, {code}, {WN}, {bm}>"),
-        ))
-        .apply(
-            Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [bm * WN, 1, 1])
-                .smem(STAGES * (bm + 128) * 128),
-        )
+        if bm == 128 {
+            let cols = if glu.is_some() { 128 } else { 256 };
+            Fire::at(kernel(
+                SELECT_SM80,
+                &format!("::pie::linear::moe_select_bf16_gemm_wide<{code}>"),
+            ))
+            .apply(
+                Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [256, 1, 1])
+                    .smem(2 * (128 + 256) * 128),
+            )
+        } else {
+            Fire::at(kernel(
+                SELECT_SM80,
+                &format!("::pie::linear::moe_select_bf16_gemm<{STAGES}, {code}, {WN}, {bm}>"),
+            ))
+            .apply(
+                Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [bm * WN, 1, 1])
+                    .smem(STAGES * (bm + 128) * 128),
+            )
+        }
     } else {
         let cols = if glu.is_some() { 64 } else { 64 * tiles };
         Fire::at(kernel(
