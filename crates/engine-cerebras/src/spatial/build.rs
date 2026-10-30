@@ -529,11 +529,38 @@ fn pipe_shape(lanes: usize, cfg: &ServeConfig) -> R<(usize, usize)> {
 /// So are serve8b_region_pipe's builds outside 0167's shapes (pins
 /// included): more micro-batches, a larger CAP, other grids, the VM block or
 /// KV staging are unrun on the ring.
+/// And serve2d_pipe's outside the shapes hardware ran right (pins
+/// included): B 4 with HB 4 (one head group a micro-batch) at up to 8
+/// micro-batches and CAP 32 (0154), with the VM sets at up to 4 and CAP 16
+/// (0156, 0158). Several head groups a micro-batch deposit the wrong tokens
+/// (B 16 HB 4: 63 of 64 lanes zero, 0171), and B 8 HB 8 hangs on long
+/// launches (0154, 0158; 0172 probes where). Smaller B (simulator builds)
+/// stays open with HB = B.
 fn refused(design: Design, params: &[(String, String)]) -> R<()> {
     let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.trim());
     let num = |k: &str| get(k).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     if design == Design::Serve2d && get("GRID") == Some("0") {
         return Err("serve2d GRID:0 is unsupported (hung on hardware, 0150); use GRID:1 with B:1 for one sequence".into());
+    }
+    if design == Design::Serve2dPipe && get("B").is_some() {
+        let (b, hb, m, cap) = (num("B"), num("HB"), num("MMAX"), num("CAP"));
+        let vm = num("VM") == 1;
+        let why = if hb != b {
+            Some("several head groups a micro-batch deposit wrong tokens (HB < B: 0171)")
+        } else if b > 4 {
+            Some("B 8 and up hang on long launches (0154, 0158) or are unrun")
+        } else if m > 8 || cap > 32 || (vm && (m > 4 || cap > 16)) {
+            Some("unrun on hardware")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            return Err(format!(
+                "serve2d_pipe B:{b} HB:{hb} MMAX:{m} CAP:{cap} VM:{} is unsupported: {why}; hardware ran B:4 HB:4 \
+MMAX<=8 CAP<=32 (0154), and MMAX<=4 CAP<=16 with the VM sets (0156, 0158)",
+                usize::from(vm)
+            ));
+        }
     }
     if design == Design::Serve8bRegionPipe && num("PIPE") == 1 {
         let (b, m, cap) = (num("B"), num("MMAX"), num("CAP"));
@@ -920,6 +947,26 @@ mod tiny {
         let explicit = vec![("GRID".to_string(), "0".to_string())];
         assert!(compile(Design::Serve2d, &explicit, crate::sdk::Target::Wse3, false).unwrap_err().contains("0150"));
         assert!(refused(Design::Serve2dPipe, &explicit).is_ok());
+    }
+
+    /// serve2d_pipe: only the shapes hardware ran right, pins included.
+    #[test]
+    fn serve2d_pipe_refuses_its_unvalidated_shapes() {
+        let p = |s: &str| -> Vec<(String, String)> {
+            s.split(',').map(|kv| kv.split_once(':').map(|(k, v)| (k.to_string(), v.to_string())).unwrap()).collect()
+        };
+        let bad = |s: &str| refused(Design::Serve2dPipe, &p(s)).unwrap_err();
+        for ok in ["B:4,HB:4,MMAX:8,CAP:32", "B:4,HB:4,MMAX:4,CAP:16,VM:1", "B:2,HB:2,MMAX:2,CAP:8,VM:1"] {
+            assert!(refused(Design::Serve2dPipe, &p(ok)).is_ok(), "{ok}");
+        }
+        assert!(bad("B:16,HB:4,MMAX:4,CAP:12").contains("0171"));
+        assert!(bad("B:8,HB:8,MMAX:8,CAP:16").contains("0158"));
+        assert!(bad("B:4,HB:4,MMAX:9,CAP:16").contains("unrun"));
+        assert!(bad("B:4,HB:4,MMAX:8,CAP:16,VM:1").contains("unrun"));
+        let (plan, mut cfg) = pipe_config();
+        assert!(params(&plan, &cfg).is_ok());
+        cfg.hb = Some(1);
+        assert!(params(&plan, &cfg).unwrap_err().contains("0171"));
     }
 
     #[test]
