@@ -61,6 +61,9 @@ dag_streams_until = 256
 # the card fed while the next prompts arrive: Qwen3.8-Flash-Next mini pf16-512 142k -> 160k tok/s
 [engine]
 walk_fire_rows = 1024
+# sixteen prefill buckets a doubling, not eight: a 533-row prompt ran a 559-row bucket and five of them
+# a 2,897-row one, 5-9% padded rows past the ridge where each costs as much as a real one
+prefill_lattice_steps = 16
 # two recurrent-state slots a lane, so a hybrid trunk seats past the fixed 256: Nemotron-3-Super mini
 # c512 4,749 -> 5,028 tok/s (slots cut to fit the card), greedy tokens unchanged
 state_slots_per_lane = 2
