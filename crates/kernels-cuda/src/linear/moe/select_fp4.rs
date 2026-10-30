@@ -115,7 +115,7 @@ pub(crate) fn mxfp4_mma_worth(
 /// The most routes an expert averages that the register-held mxfp4
 /// select takes; past it, the shared-memory-staged one.
 #[cfg(feature = "cuda")]
-pub(super) const STAGED_FROM: u32 = 32;
+pub(super) const STAGED_FROM: u32 = 16;
 
 /// The fewest routes an expert averages that Hopper's staged wgmma select
 /// takes from the register-held one (DeepSeek-V4-Flash's miniature at 24 a
