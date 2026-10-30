@@ -247,6 +247,8 @@ pub struct Paging {
 pub struct Windowed {
     pub tokens: u32,
     pub fire_pages: u32,
+    /// The lanes the pool seats at once; 0 when unstated.
+    pub lanes: u32,
 }
 
 /// The widest window a kv row of `trace` is declared with: the model's
@@ -292,7 +294,17 @@ impl Paging {
             .map(|tokens| Windowed {
                 tokens,
                 fire_pages: max_tokens.div_ceil(self.page_size) + 1,
+                lanes: 0,
             });
+        self
+    }
+
+    /// The paging with its windowed pool sized for `lanes` seated at once.
+    #[must_use]
+    pub fn seated(mut self, lanes: u32) -> Paging {
+        if let Some(window) = self.window.as_mut() {
+            window.lanes = lanes;
+        }
         self
     }
 
@@ -325,9 +337,13 @@ impl Paging {
     pub fn window_pages_at(&self, pages: u64) -> u64 {
         match self.window {
             None => pages,
-            Some(_) => {
+            Some(window) => {
                 let past = pages.saturating_sub(u64::from(self.pages_per_slot));
-                1 + pages.min(u64::from(self.window_ring()) + past / 2)
+                // Lanes that share the pages never past their windows hold a
+                // windowed page for each kv page.
+                let short = window.lanes > 0
+                    && pages / u64::from(window.lanes) <= u64::from(self.window_held());
+                1 + pages.min(u64::from(self.window_ring()) + if short { past } else { past / 2 })
             }
         }
     }

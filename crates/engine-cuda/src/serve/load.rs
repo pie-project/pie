@@ -629,7 +629,8 @@ impl Shell {
         .windowed(
             crate::store::window_of(&boot.trace)?,
             boot.budget.max_tokens,
-        );
+        )
+        .seated(boot.budget.max_lanes);
         // A class attending both ways decodes its planes over all its rows once, at load.
         let decoding = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
             matches!(def, poem_ir::Def::Weight(w)
@@ -710,10 +711,12 @@ impl Shell {
             weights.table(),
             engine,
         )?;
-        let paging = paging.windowed(
-            crate::store::window_of(&boot.trace)?,
-            boot.budget.max_tokens,
-        );
+        let paging = paging
+            .windowed(
+                crate::store::window_of(&boot.trace)?,
+                boot.budget.max_tokens,
+            )
+            .seated(boot.budget.max_lanes);
         device.open_lanes(
             compiled.streams.streams.saturating_sub(1),
             compiled.streams.events,
