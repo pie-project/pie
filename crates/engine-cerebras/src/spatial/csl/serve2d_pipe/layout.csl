@@ -97,6 +97,12 @@ param b_opmask_hi: u32 = 0xffffffff;
 param b_ring_d: u16 = 32;
 param opmask_lo: u32 = 0xffffffff;
 param opmask_hi: u32 = 0xffffffff;
+// Fork 3's merged VM (guest4hz): the canonical sum's mode (1 pipelined chunks,
+// 2 one-pass concatenating), wide logits rows (l2w), and set B's token color
+// to set A's sender (unrouted on row F at the head's VM columns). Both sets.
+param vm_sumpipe: u16 = 1;
+param vm_l2w: u16 = 0;
+param vm_c_bt: u16 = 12;
 param HLM: u16 = 4;
 param SPEC_H: u16;
 param SPEC_T: u16;
@@ -144,7 +150,7 @@ layout {
           .ring_w = ring_w, .vm_prof = vm_prof, .vm_lanes = if (vm_lanes > 0) vm_lanes else MMAX * B, .vm_rows = vm_rows,
           .vm_sin = vm_sin, .opmask_lo = opmask_lo, .opmask_hi = opmask_hi,
           .vm_lprog = vm_lprog, .bank_words = bank_words,
-          .vm_pwalk = vm_pwalk,
+          .vm_pwalk = vm_pwalk, .vm_sumpipe = vm_sumpipe, .vm_l2w = vm_l2w, .vm_c_bt = vm_c_bt,
           .GPX = PX, .GPY = PY, .GW = GW, .GH = GH, .S2D_SB = B,
         });
       } else if (VM == 1 and VMB > 0 and x > GW * PX + HR2X + VMC and x <= GW * PX + HR2X + VMT and y <= HH) {
@@ -161,7 +167,7 @@ layout {
           .ring_w = b_ring_w, .vm_prof = b_vm_prof, .vm_lanes = b_vm_lanes, .vm_rows = b_vm_rows,
           .vm_sin = b_vm_sin, .opmask_lo = b_opmask_lo, .opmask_hi = b_opmask_hi,
           .vm_lprog = b_vm_lprog, .bank_words = b_bank_words,
-          .vm_pwalk = b_vm_pwalk,
+          .vm_pwalk = b_vm_pwalk, .vm_sumpipe = vm_sumpipe, .vm_l2w = vm_l2w, .vm_c_bt = vm_c_bt,
           .GPX = PX, .GPY = PY, .GW = GW, .GH = GH, .S2D_SB = B,
         });
       } else if (x >= GW * PX and y <= HH) {
@@ -245,6 +251,7 @@ layout {
   @export_name("gprof", [*]u32, true);
   @export_name("gostep", [*]u32, true);
   @export_name("gring", [*]u32, true);
+  @export_name("gdbg", [*]u32, true);
   @export_name("gcycles", [*]u32, true);
   @export_name("gvalid", [*]u32, true);
   @export_name("gtok_home", [*]u32, true);

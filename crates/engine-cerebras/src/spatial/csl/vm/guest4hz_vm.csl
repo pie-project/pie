@@ -18,6 +18,10 @@ param C: u16;
 param Vr: u16;      // the head's vocab rows a root PE
 param NVC: u16;     // VM columns a block: each takes Vr / NVC of a row's vocab rows
 param VJ: u16;      // this VM column (0 .. NVC - 1)
+param CBW: u16 = 0;   // two VM sets: block width (C + both sets' columns)
+param VSET: u16 = 0;  // two VM sets: this PE's set (0: A, 1: B)
+param VSET2: u16 = 0; // 1: two VM sets in the block (A: VJ over NVC columns, then B's)
+param VLAST: u16 = 0; // two VM sets: 1 at the block's last VM column (the logits row stops)
 param Gx: u16;
 param Gb: u16;
 param vocab: u32;
@@ -39,16 +43,12 @@ param vm_rows: u16;    // logits rows a turn (a multi-row program: W0..W(rows-1)
 param vm_lprog: u16;   // 1: per-lane programs (an op arena, glane: a lane's table base, token home, bank window)
 param bank_words: u16;  // vm_lprog: the bank arena's words
 param vm_pwalk: u16;   // 1: top-p by an entry walk of folds (no list engine)
-param CBW: u16;        // block width: C + all VM columns
-param VSET: u16;       // this PE's VM set (0: A, 1: B)
-param VSET2: u16;      // 1: two VM sets in the block
-param VLAST: u16;      // 1: the block's last VM column (the row stops here)
 param opmask_lo: u32;  // opcodes 0..31 the image runs (bit o)
 param opmask_hi: u32;  // opcodes 32..63
 param vm_sin: u16;     // per-step host input words a turn (0: no step-input path)
 const Vt: u16 = Vr / NVC;
-const CB: u16 = CBW;   // fabric columns a block (head + both VM sets)
 const TWO: bool = VSET2 != 0;
+const CB: u16 = if (TWO) CBW else C + NVC;
 const NB: u16 = W / CB;
 const R1X: u16 = Gx / 2;
 const NGX: u16 = C / Gx;
@@ -76,8 +76,8 @@ const LBX: u16 = 128;   // the head's streaming merge: lists up to 128 pairs (re
 var lb: u16 = LB;
 // The fold buffer: the canonical sum's blocks, a gather's words, a list.
 // The canonical sum concatenates the lane's block sums CH at a time.
-const CH: u16 = 256;   // a multiple of 32 (the level-2 groups); 512+ does not fit the 0095 images
-const RB: u16 = CH;
+const CH: u16 = vm_ch;   // a multiple of 32 (the level-2 groups); 512+ does not fit the 0095 images
+const RB: u16 = if (CH > 256) CH else 256;   // (a test CH below 256 keeps the 256-word buffer)
 const L2N: u16 = nblk / 32 + 1;
 
 // ---- opcodes (etagen's src/isa.rs) ----
@@ -158,9 +158,15 @@ const q5_in = @get_input_queue(5);
 const q6_in = @get_input_queue(6);
 const q7_in = @get_input_queue(7);
 // The VM's colors (layout params; defaults: head2d / serve2d's).
+param vm_sumpipe: u16 = 1;  // 1: the canonical sum's chunks folded back to back, the last hub sums them (one result)
+param vm_l2w: u16 = 0;     // 1: the last hub's level-2 list in wide (a hub holds no row; the list lives within one sum op): -L2N words
+param vm_ch: u16 = 256;     // blocks a chunk (a multiple of 32; smaller only for simulator tests)
+param vm_dbg: u16 = 0;      // diagnostics: 1 rows and tokens only (no sections); 2 + a max fold a row; 3 + the
+                            // compute-start pre sections only (no main); 0 normal. gdbg: [rows read, tokens sent, folds, phase]
 param vm_outside: u16 = 0;  // 1: the VM block outside the head (no head colors routed; one block)
 param vm_x0: u16 = 0;       // vm_outside: the block's first fabric column (layout x)
 const OUTSIDE: bool = vm_outside != 0;
+comptime { @comptime_assert(!(OUTSIDE and VSET2 != 0)); }   // two VM sets: inside the head only
 param vm_c_a: u16 = 0;      // column chain, rows of one parity
 param vm_c_b: u16 = 1;      // column chain, the other parity
 param vm_c_e: u16 = 18;     // hub row chain, even hubs
@@ -170,6 +176,7 @@ param vm_c_vl: u16 = 2;     // the logits row in
 param vm_c_vt: u16 = 3;     // the token out
 param vm_c_park0: u16 = 17; // parked input queues: colors never routed at VM PEs
 param vm_c_park1: u16 = 16;
+param vm_c_bt: u16 = 12;    // two VM sets: set B's token west to set A's sender
 const C_A: u16 = vm_c_a;
 const C_B: u16 = vm_c_b;
 const C_E: u16 = vm_c_e;
@@ -179,7 +186,14 @@ const C_VL: u16 = vm_c_vl;
 const C_VT: u16 = vm_c_vt;
 const C_PARK0: u16 = vm_c_park0;
 const C_PARK1: u16 = vm_c_park1;
-const C_BT: u16 = 12;      // two VM sets: set B's token, west to set A's sender
+const C_BT: u16 = vm_c_bt;  // two VM sets: set B's token, west to set A's sender
+// memcpy (SDK 2.10) owns colors 21-23 (21 RXCOMMAND, 22 H2D, 23 D2H) and binds
+// input queue 1 to 22: a VM color there clashes at load ("two master input
+// queues for the same color").
+comptime {
+  @comptime_assert(vm_c_a < 21 and vm_c_b < 21 and vm_c_e < 21 and vm_c_g < 21 and vm_c_k < 21);
+  @comptime_assert(vm_c_vl < 21 and vm_c_vt < 21 and vm_c_park0 < 21 and vm_c_park1 < 21 and vm_c_bt < 21);
+}
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
@@ -214,7 +228,9 @@ var tmp = @zeros([Vt]f32);
 const tmp0 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vt} -> tmp[i] });
 var red = @zeros([RB]f32);
 var myblk = @zeros([Vt / 32]f32);
-var l2 = @zeros([L2N]f32);
+var l2_own = @zeros([if (vm_l2w != 0) 1 else L2N]f32);
+var l2: [*]f32 = if (vm_l2w != 0) &wide else &l2_own;
+comptime { if (vm_l2w != 0) { @comptime_assert(NREG * Vt >= L2N); } }
 var chunk: u16 = 0;
 var order = @zeros([Vt]u16);
 
@@ -724,6 +740,199 @@ fn lane_fold(kind: u16, n: u16) void {
 }
 
 // One chunk of the canonical sum's blocks: this PE's in their slots.
+// vm_sumpipe 2 (one block, Vt 32): the canonical sum as a concatenation.
+// Each region row's NVC block sums go east to the last VM column (the row
+// gather); that column's two half chains carry, hop by hop, [edge | open |
+// fulls]: edge, the 32 slots of the group the halves split (if F·NVC is not
+// a multiple of 32); open, the group being filled; fulls, every completed
+// group's level-2 sum (32-lane tree, missing lanes 0). A PE whose blocks
+// complete a group trees it into its fulls slot; the rest stream through.
+// The last hub joins the halves, sums the level-2 list (canon_sum) and sends
+// the one result (K). Same trees, so the same bits as the chunked sum.
+const SUMCAT: bool = vm_sumpipe == 2 and NB == 1 and Vt == 32;
+comptime { if (SUMCAT) { @comptime_assert(@as(u32, H) * @as(u32, NVC) < 65536); } }
+fn cat_col(j: u16) u16 { return if (j % 2 == 0) C_E else C_G; }
+// (the chain's two 32-word groups live in red, idle during the sum)
+var cat_row = @zeros([NVC]f32);
+const cat_buf_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{32} -> red[i] });
+const cat_own_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{32} -> red[i + 32] });
+noinline fn cat_tree() f32 {
+  var off: u16 = 16;
+  while (off > 0) {
+    const lo = @set_dsd_length(cat_buf_dsd, off);
+    const hi = @increment_dsd_offset(lo, @as(i16, off), f32);
+    @fadds(lo, lo, hi);
+    off = off / 2;
+  }
+  return red[0];
+}
+// (out of line: each fabric DSD site costs code, the chain's few helpers do)
+const cat_row_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NVC} -> cat_row[i] });
+const l2_dsd = if (vm_l2w != 0) @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{L2N} -> wide[i] })
+                else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{L2N} -> l2_own[i] });
+noinline fn c_fwd(n: u16) void { if (n > 0) { @fmovs(fab_out(q3_out, n), fab_in(q4_in, n)); } }
+noinline fn c_out(src: mem1d_dsd, n: u16) void { if (n > 0) { @fmovs(fab_out(q3_out, n), @set_dsd_length(src, n)); } }
+noinline fn c_in(dst: mem1d_dsd, n: u16) void { if (n > 0) { @fmovs(@set_dsd_length(dst, n), fab_in(q4_in, n)); } }
+noinline fn c_add(src: mem1d_dsd) void { @fadds(fab_out(q3_out, 32), src, fab_in(q4_in, 32)); }
+// n words of the chain: forwarded, or (the chain's first PE) zeros
+fn c_pass(n: u16) void {
+  if (!col_end) { c_fwd(n); return; }
+  if (n > 0) { @fmovs(fab_out(q3_out, n), 0.0); }
+}
+noinline fn sum_cat() void {
+  const N = NVC;
+  const SN: u16 = @as(u16, F) * @as(u16, N);
+  const TOT: u16 = @as(u16, H) * @as(u16, N);
+  const qb: u16 = SN / 32;
+  const strad = SN % 32 != 0;
+  const ql0: u16 = if (strad) qb + 1 else qb;
+  const qend: u16 = (TOT + 31) / 32;
+  if (!hub) {
+    // the row gather
+    if (VJ > 0) { @fmovs(@set_dsd_length(cat_row_dsd, VJ), fab_in(q6_in, VJ)); }
+    cat_row[VJ] = myblk[0];
+    if (VJ + 1 < NVC) {
+      @fmovs(fab_out(q2_out, VJ + 1), @set_dsd_length(cat_row_dsd, VJ + 1));
+    } else {
+      // the last column's half chain
+      const up = vy < F;
+      const ry: u16 = if (up) @as(u16, vy) else @as(u16, vy) - 1;
+      const g0: u16 = ry * @as(u16, N);
+      const s: u16 = if (up) 0 else SN;
+      const e: u16 = if (up) SN else TOT;
+      const q0: u16 = if (up) 0 else ql0;
+      const nf: u16 = @as(u16, if (up) qb else qend - ql0);
+      // edge: this row's blocks of the split group
+      @fmovs(cat_own_dsd, 0.0);
+      var has_edge = false;
+      { var k: u16 = 0; while (k < N) : (k += 1) {
+        const g = g0 + @as(u16, k);
+        if (strad and g / 32 == qb) { red[32 + @as(u16, g % 32)] = cat_row[k]; has_edge = true; }
+      } }
+      if (col_end) { c_out(cat_own_dsd, 32); } else if (has_edge) { c_add(cat_own_dsd); } else { c_fwd(32); }
+      // the open group and the completed ones, the blocks in chain order
+      var done_q = @zeros([2]u16);
+      var done_v = @zeros([2]f32);
+      var nd: u16 = 0;
+      var mode: u16 = 0;   // 0: no open-group block yet; 1: streams the open group; 2: took it in
+      @fmovs(cat_buf_dsd, 0.0);
+      { var t: u16 = 0; while (t < N) : (t += 1) {
+        const k = if (up) t else N - 1 - t;
+        const g = g0 + @as(u16, k);
+        const q = g / 32;
+        if (strad and q == qb) { continue; }
+        const last_g: u16 = if (up) (if (32 * q + 31 < e - 1) 32 * q + 31 else e - 1) else (if (32 * q > s) 32 * q else s);
+        if (mode == 0) {
+          // does this row complete the incoming open group? then it takes it in
+          var completes = false;
+          { var u: u16 = t; while (u < N) : (u += 1) {
+            if (g0 + @as(u16, if (up) u else N - 1 - u) == last_g) { completes = true; }
+          } }
+          mode = if (completes) 2 else 1;
+          if (completes and !col_end) { c_in(cat_buf_dsd, 32); }
+        }
+        red[@as(u16, g % 32)] = cat_row[k];
+        if (mode == 2 and g == last_g) {
+          done_q[nd] = @as(u16, q - q0);
+          done_v[nd] = cat_tree();
+          nd += 1;
+          @fmovs(cat_buf_dsd, 0.0);
+        }
+      } }
+      if (mode == 1) {
+        if (col_end) { c_out(cat_buf_dsd, 32); } else { c_add(cat_buf_dsd); }
+      } else if (mode == 0) {
+        c_pass(32);
+      } else {
+        c_out(cat_buf_dsd, 32);
+      }
+      // fulls: passed on, this row's completed sums in their slots (in order)
+      if (nd == 2 and done_q[0] > done_q[1]) {
+        const tq = done_q[0]; done_q[0] = done_q[1]; done_q[1] = tq;
+        const tv = done_v[0]; done_v[0] = done_v[1]; done_v[1] = tv;
+      }
+      var at: u16 = 0;
+      { var d: u16 = 0; while (d < nd) : (d += 1) {
+        c_pass(done_q[d] - at);
+        if (!col_end) { c_in(cat_buf_dsd, 1); }
+        red[0] = done_v[d];
+        c_out(cat_buf_dsd, 1);
+        at = done_q[d] + 1;
+      } }
+      c_pass(nf - at);
+    }
+  } else if (hub_last) {
+    // the halves: north (q4), then south (q5)
+    const nfu: u16 = @as(u16, qb);
+    const nfl: u16 = @as(u16, qend - ql0);
+    c_in(cat_buf_dsd, 32);
+    c_in(cat_own_dsd, 32);   // the open group: empty at a chain's end
+    c_in(l2_dsd, nfu);
+    @fadds(cat_buf_dsd, cat_buf_dsd, fab_in(q5_in, 32));
+    @fmovs(cat_own_dsd, fab_in(q5_in, 32));
+    if (nfl > 0) { @fmovs(@set_dsd_length(@increment_dsd_offset(l2_dsd, @as(i16, @as(u16, ql0)), f32), nfl), fab_in(q5_in, nfl)); }
+    if (strad) { l2[@as(u16, qb)] = cat_tree(); }
+    const n2 = @as(u16, qend);
+    { var k: u16 = 0; while (k < L2N) : (k += 1) { if (k < n2) { red[k] = l2[k]; } } }
+    red[0] = canon_sum(n2);
+    @fmovs(fab_out(q3_out, 1), red_dsd(1));
+    return;
+  }
+  @fmovs(red_dsd(1), fab_in(q7_in, 1));
+}
+const SUMPIPE: bool = vm_sumpipe != 0;
+noinline fn sum_pipe() void {
+  fkind = K_SUM;
+  const nch = (nblk + CH - 1) / CH;
+  { var k: u16 = 0; while (k < nch) : (k += 1) {
+    const lo = k * CH;
+    const n = if (nblk - lo < CH) nblk - lo else CH;
+    @fmovs(red_dsd(n), 0.0);
+    if (!hub) {
+      const b0 = @as(u16, lane_base() / 32);
+      { var blk: u16 = 0; while (blk < Vt / 32) : (blk += 1) {
+        const g = b0 + blk;
+        if (g >= lo and g < lo + n) { red[g - lo] = myblk[blk]; }
+      } }
+      if (col_end) {
+        @fmovs(fab_out(q3_out, n), red_dsd(n));
+      } else {
+        @fadds(fab_out(q3_out, n), red_dsd(n), fab_in(q4_in, n));
+      }
+    } else {
+      take(q4_in, n);
+      take(q5_in, n);
+      if (hub_last) {
+        if (!hub_first) { take(q6_in, n); }
+        // level 2 of this chunk's blocks (groups of 32, missing lanes 0)
+        { var z: u16 = n; while (z % 32 != 0) : (z += 1) { red[z] = 0.0; } }
+        var g: u16 = 0;
+        while (g * 32 < n) : (g += 1) {
+          var off: u16 = 16;
+          while (off > 0) {
+            const glo = @set_dsd_length(@increment_dsd_offset(red_dsd(RB), @as(i16, g * 32), f32), off);
+            const ghi = @increment_dsd_offset(glo, @as(i16, off), f32);
+            @fadds(glo, glo, ghi);
+            off = off / 2;
+          }
+          l2[lo / 32 + g] = red[g * 32];
+        }
+      } else if (hub_first) {
+        @fmovs(fab_out(q3_out, n), red_dsd(n));
+      } else {
+        @fadds(fab_out(q3_out, n), red_dsd(n), fab_in(q6_in, n));
+      }
+    }
+  } }
+  if (hub and hub_last) {
+    const n2 = (nblk + 31) / 32;
+    { var k: u16 = 0; while (k < L2N) : (k += 1) { if (k < n2) { red[k] = l2[k]; } } }
+    red[0] = canon_sum(n2);
+    @fmovs(fab_out(q3_out, 1), red_dsd(1));
+  } else {
+    @fmovs(red_dsd(1), fab_in(q7_in, 1));
+  }
+}
 noinline fn sum_chunk() void {
   const lo = chunk * CH;
   const n = if (nblk - lo < CH) nblk - lo else CH;
@@ -1291,7 +1500,7 @@ fn exec() void {
           myblk[blk] = tmp[blk * 32];
         } }
         chunk = 0;
-        sum_chunk();
+        if (SUMCAT) { sum_cat(); } else if (SUMPIPE) { sum_pipe(); } else { sum_chunk(); }
       } else if (c == 1 or c == 2) {
         // max; min as -max(-x). Padding: the identity.
         var acc: f32 = NEG_INF;
@@ -1579,7 +1788,9 @@ fn exec() void {
 // A fold's result is in red on every PE of the lane: finish its op.
 fn resume_body() bool {
   if ((feat & F_RED) != 0 and (OPK_RRED and pend == RRED)) {
-    if (pend_c == 0) {
+    if (pend_c == 0 and SUMPIPE) {
+      setf(pend_d, red[0]);
+    } else if (!SUMPIPE and pend_c == 0) {
       // Level 2 of this chunk's blocks (groups of 32), then the next chunk.
       const lo = chunk * CH;
       const n = if (nblk - lo < CH) nblk - lo else CH;
@@ -1793,7 +2004,9 @@ fn hub_feeder_routes() void {
 }
 
 // The out ring's depth (steps a launch), for the host and the engine.
-var gring = @zeros([3]u32);   // depth, words a step, lanes
+var gring = @zeros([3]u32);
+var gdbg = @zeros([4]u32);   // vm_dbg: rows read, tokens sent, folds, phase
+var gdbg_ptr: [*]u32 = &gdbg;   // depth, words a step, lanes
 var gring_ptr: [*]u32 = &gring;
 
 fn init() void {
@@ -1822,8 +2035,9 @@ fn init() void {
       color_config.reset_routes(c_r2_0, .{ .rx = EAST, .tx = WEST });
       color_config.reset_routes(c_r2_1, .{ .rx = EAST, .tx = WEST });
     }
-    // The root's row (Vr + 1 words) passes every VM column of the block.
-    if (VLAST == 0) {
+    // The root's row (Vr + 1 words) passes every VM column of the block
+    // (two sets: both sets' columns; VLAST marks the last).
+    if (if (TWO) VLAST == 0 else VJ + 1 < NVC) {
       color_config.reset_routes(col_of(C_VL), .{ .rx = WEST, .tx = [2]direction{ RAMP, EAST } });
     } else {
       color_config.reset_routes(col_of(C_VL), .{ .rx = WEST, .tx = RAMP });
@@ -1909,6 +2123,19 @@ fn init() void {
   // Two input queues on one color would split its wavelets: park the queues
   // this PE does not read on colors nothing routes here.
   if (!hub) { iq_color(5, C_PARK0); iq_color(6, C_PARK1); }
+  // vm_sumpipe 2: the row gather of the canonical sum (region rows): VM column
+  // j sends its row's blocks so far east on c(j) (out queue 2: the token's
+  // queue, idle here) and takes column j - 1's on c(j - 1) (in queue 6).
+  if (SUMCAT and !hub) {
+    if (VJ + 1 < NVC) {
+      color_config.reset_routes(col_of(cat_col(VJ)), .{ .rx = RAMP, .tx = EAST });
+      oq_color(2, cat_col(VJ));
+    }
+    if (VJ > 0) {
+      color_config.reset_routes(col_of(cat_col(VJ - 1)), .{ .rx = WEST, .tx = RAMP });
+      iq_color(6, cat_col(VJ - 1));
+    }
+  }
   if (hub and hub_first) { iq_color(6, C_PARK1); }
   if (TWO and VSET == 0 and hub and vblk == BM and VJ == 0) { iq_color(6, C_BT); }
   timestamp.enable_tsc();
@@ -2049,7 +2276,9 @@ fn answer(v: f32) void {
 
 fn compute(steps: u32) void {
   if (gmode[0] == 1) {
-    { var l: u16 = 0; while (l < NL) : (l += 1) {
+    { var l: u16 = 0; while (l < NL and (vm_dbg == 0 or vm_dbg == 3)) : (l += 1) {
+      if (LP and (glane[l * 4] >> 16) == 0) { continue; }   // an empty lane: no pre
+      gdbg[3] = 10 + @as(u32, l);
       swap_in(l);
       if (SIN > 0) { step_in(l, @as(u32, l)); }
       run_section(0);
@@ -2062,12 +2291,42 @@ fn compute(steps: u32) void {
     // with token 0 at once (the head waits for a token each step), the
     // last row's token is the program's. vm_lprog: NR is the lane's own
     // (glane word 0's high half; 0 means 1), at most vm_rows.
+    if (vm_dbg == 1 or vm_dbg == 2) {
+      while (i < steps) : (i += 1) {
+        gdbg[3] = 1;
+        take_row();
+        gdbg[0] += 1;
+        if (vm_dbg == 2) {
+          gdbg[3] = 2;
+          red[0] = 1.0;
+          lane_fold(K_MAX, 1);
+          gdbg[2] += 1;
+        }
+        gdbg[3] = 3;
+        answer(0.0);
+        if (hub and vblk == BM and VJ == 0) { gdbg[1] += 1; }
+      }
+      i = steps;
+    }
+    if (vm_dbg == 3) {
+      // the start pre ran above: now rows and tokens only
+      while (i < steps) : (i += 1) {
+        take_row();
+        gdbg[0] += 1;
+        answer(0.0);
+        if (hub and vblk == BM and VJ == 0) { gdbg[1] += 1; }
+      }
+      i = steps;
+    }
     while (i < steps) {
       var NR: u16 = vm_rows;
+      var empty = false;
       if (LP) {
         NR = @as(u16, glane[lane * 4] >> 16);
-        if (NR == 0) { NR = 1; }
+        // rows 0: an empty lane (a zeroed glane): its turn is a skip, one row
+        if (NR == 0) { NR = 1; empty = true; }
       }
+      if (!TWO) { i += @as(u32, NR); }
       // Row 0: Vr logits, 1/rms, ctl (0: sample; else skip the turn: no
       // bank swap, no sections, no ring row, token 0). The hub has no row:
       // the PE above it hands it ctl on its fold color. Two VM sets (TWO):
@@ -2091,9 +2350,9 @@ fn compute(steps: u32) void {
           i += 1;
           continue;
         }
+        i += @as(u32, NR);
       }
-      i += @as(u32, NR);
-      const skip = if (TWO) (cv == 1.0 or cv == 3.0) else cv != 0.0;
+      const skip = (if (TWO) (cv == 1.0 or cv == 3.0) else cv != 0.0) or empty;
       if (!skip) {
         swap_in(lane);
         if (!hub) { @fmuls(wide0, vin_dsd, vin[Vt]); }
@@ -2145,6 +2404,7 @@ comptime {
   @export_symbol(tok_home_ptr, "gtok_home");
   @export_symbol(gsin_ptr, "gsin");
   @export_symbol(glane_ptr, "glane");
+  @export_symbol(gdbg_ptr, "gdbg");
   @export_symbol(gbdesc_ptr, "gbdesc");
   @export_symbol(gsdesc_ptr, "gsdesc");
   @export_symbol(gmode_ptr, "gmode");

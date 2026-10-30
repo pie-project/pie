@@ -5,8 +5,8 @@
 //! max prompt + `new` passes, a continuation of `steps2` passes from the
 //! last token with the logits rows. Then, on any build, a page copy: lane 0's
 //! pages copied to free ones and one more pass of lane 0 on the copies next
-//! to lane 1 continuing lane 0 on its own pages (the two must agree). Prints
-//! one JSON line.
+//! to lane 1 continuing lane 0 on its own pages (the two must agree;
+//! `SERVE8B_SIM_NO_COPY` skips it, for slow builds). Prints one JSON line.
 
 use std::path::Path;
 
@@ -61,6 +61,10 @@ fn main() -> Result<(), String> {
         .map(|row| row.iter().enumerate().fold(0, |best, (i, &x)| if x > row[best] { i } else { best }))
         .collect();
     let got: Vec<Vec<u32>> = (0..b_n).map(|b| [out1[b].clone(), out2[b].clone()].concat()).collect();
+    if std::env::var_os("SERVE8B_SIM_NO_COPY").is_some() {
+        println!("{}", serde_json::json!({"prompts": prompts, "got": got, "logits_argmax": argmax}));
+        return Ok(());
+    }
     // Lane 0's pages copied to pages no lane holds, then one more pass of
     // lane 0 on the copies (lane 0) and on its own pages (lane 1).
     let held: Vec<u32> = pages.concat();

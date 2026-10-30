@@ -44,6 +44,11 @@ pub struct VmImage {
     /// Top-p walks eta's order in rounds (`vm_pwalk`, the layout's default
     /// 1); `Some(false)`: the list engine.
     pub pwalk: Option<bool>,
+    /// Fork 3's merged guest4hz options: the canonical sum (`vm_sumpipe`, 1
+    /// pipelined, 2 concatenating) and the last hub's level-2 list in wide
+    /// registers (`vm_l2w`); `None`: the layout's default.
+    pub sumpipe: Option<usize>,
+    pub l2w: Option<bool>,
 }
 
 impl VmImage {
@@ -78,6 +83,12 @@ impl VmImage {
         }
         if let Some(pwalk) = self.pwalk {
             out.push(("vm_pwalk", usize::from(pwalk)));
+        }
+        if let Some(sumpipe) = self.sumpipe {
+            out.push(("vm_sumpipe", sumpipe));
+        }
+        if let Some(l2w) = self.l2w {
+            out.push(("vm_l2w", usize::from(l2w)));
         }
         out
     }
@@ -161,7 +172,7 @@ impl ServeConfig {
     /// - `[vm]`: `max_ops`, `nreg`, `pool_words`, `feat`, `ring_w` (default
     ///   1), `ring_d` (32), `prof`, `step_input`, `rows`, `bank_words`
     ///   (per-lane programs), `opmask_lo`/`opmask_hi`, `lanes` (`vm_lanes`),
-    ///   `pwalk` (`vm_pwalk`);
+    ///   `pwalk` (`vm_pwalk`), `sumpipe` (`vm_sumpipe`), `l2w` (`vm_l2w`);
     /// - `[vm_b]` (serve2d_pipe's second VM set, guest4h2s): the same keys
     ///   for its image (the layout's `b_*`) and `cols` (`VMB`);
     /// - `[pins]`: layout parameters by name, for shapes the plan does not
@@ -236,6 +247,8 @@ impl ServeConfig {
                         .then(|| (lo.unwrap_or(0xffff_ffff) as u32, hi.unwrap_or(0xffff_ffff) as u32)),
                     lanes: int(m, "lanes")?,
                     pwalk: m.get("pwalk").map(|_| flag(m, "pwalk")).transpose()?,
+                    sumpipe: int(m, "sumpipe")?,
+                    l2w: m.get("l2w").map(|_| flag(m, "l2w")).transpose()?,
                 })
                 .map(|img| Some((img, int(m, "cols").ok().flatten())))
             }
@@ -774,6 +787,8 @@ pub mod presets {
                 opmask: None,
                 lanes: None,
                 pwalk: None,
+                sumpipe: None,
+                l2w: None,
             }),
             pins: vec![
                 ("Tc", 1), ("E", 2), ("GW", 2), ("GH", 4), ("F", 8), ("HH", 16), ("Vr", 32),
@@ -1007,6 +1022,8 @@ mod qwen3_8b {
             opmask: Some((3_757_088_255, 256)),
             lanes: None,
             pwalk: Some(true),
+            sumpipe: None,
+            l2w: None,
         };
         for (b, np, host, extra) in [
             (1, 3, false, "bank_words:768,vm_lanes:1,B:1,NP:3,KVST:1"),
