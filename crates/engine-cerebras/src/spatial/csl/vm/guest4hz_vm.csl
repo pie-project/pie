@@ -159,6 +159,9 @@ const q6_in = @get_input_queue(6);
 const q7_in = @get_input_queue(7);
 // The VM's colors (layout params; defaults: head2d / serve2d's).
 param vm_sumpipe: u16 = 1;  // 1: the canonical sum's chunks folded back to back, the last hub sums them (one result)
+param vm_topk: u16 = 1;    // vm_pwalk TOPK: 1 radix select (windows of vm_rxw entries; default, 0164: 15x); 0 rounds of KB
+param vm_rxw: u16 = 0;     // radix windows (0: RB / 2; smaller only for simulator tests)
+param vm_lazyrng: u16 = 0; // 1: WRNG registers drawn where read (exact)
 param vm_l2w: u16 = 0;     // 1: the last hub's level-2 list in wide (a hub holds no row; the list lives within one sum op): -L2N words
 param vm_ch: u16 = 256;     // blocks a chunk (a multiple of 32; smaller only for simulator tests)
 param vm_dbg: u16 = 0;      // diagnostics: 1 rows and tokens only (no sections); 2 + a max fold a row; 3 + the
@@ -176,6 +179,8 @@ param vm_c_vl: u16 = 2;     // the logits row in
 param vm_c_vt: u16 = 3;     // the token out
 param vm_c_park0: u16 = 17; // parked input queues: colors never routed at VM PEs
 param vm_c_park1: u16 = 16;
+param vm_conc: u16 = 0;    // two sets at once: B's rows on vm_c_vl2, B's tokens by route to the root
+param vm_c_vl2: u16 = 13;   // vm_conc: set B's rows
 param vm_c_bt: u16 = 12;    // two VM sets: set B's token west to set A's sender
 const C_A: u16 = vm_c_a;
 const C_B: u16 = vm_c_b;
@@ -186,13 +191,16 @@ const C_VL: u16 = vm_c_vl;
 const C_VT: u16 = vm_c_vt;
 const C_PARK0: u16 = vm_c_park0;
 const C_PARK1: u16 = vm_c_park1;
-const C_BT: u16 = vm_c_bt;  // two VM sets: set B's token, west to set A's sender
+const C_BT: u16 = vm_c_bt;
+const CONC: bool = vm_conc != 0 and VSET2 != 0;
+const C_VLS: u16 = if (CONC and VSET == 1) vm_c_vl2 else vm_c_vl;   // this set's rows
+const C_VL2: u16 = vm_c_vl2;  // two VM sets: set B's token, west to set A's sender
 // memcpy (SDK 2.10) owns colors 21-23 (21 RXCOMMAND, 22 H2D, 23 D2H) and binds
 // input queue 1 to 22: a VM color there clashes at load ("two master input
 // queues for the same color").
 comptime {
   @comptime_assert(vm_c_a < 21 and vm_c_b < 21 and vm_c_e < 21 and vm_c_g < 21 and vm_c_k < 21);
-  @comptime_assert(vm_c_vl < 21 and vm_c_vt < 21 and vm_c_park0 < 21 and vm_c_park1 < 21 and vm_c_bt < 21);
+  @comptime_assert(vm_c_vl < 21 and vm_c_vt < 21 and vm_c_park0 < 21 and vm_c_park1 < 21 and vm_c_bt < 21 and vm_c_vl2 < 21);
 }
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
@@ -705,7 +713,7 @@ var hub_last: bool = false;  // the last block's hub (sends the result)
 
 // A lane fold of red[0..n) (max or sum) or of the sorted list in red[0..2lb);
 // returns with the result in red on every VM PE (the hubs included).
-fn lane_fold(kind: u16, n: u16) void {
+noinline fn lane_fold(kind: u16, n: u16) void {
   fkind = kind;
   if (OPK_LISTS and kind == K_LIST) {
     list_fold();
@@ -881,6 +889,81 @@ noinline fn sum_cat() void {
   @fmovs(red_dsd(1), fab_in(q7_in, 1));
 }
 const SUMPIPE: bool = vm_sumpipe != 0;
+const SUMROWS: bool = vm_sumpipe == 3 and NB == 1 and Vt == 32 and 32 * NVC <= RB;
+const SR_COL = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{32} -> red[i * @as(i16, NVC)] });
+fn sr_pass(n: u16) void { if (n > 0) { @fmovs(fab_out(q3_out, n), fab_in(q4_in, n)); } }
+fn sr_zero(n: u16) void { if (n > 0) { @fmovs(fab_out(q3_out, n), 0.0); } }
+// column c's rows [r, r + n) of the chunk, from queue q, into red (block order)
+fn sr_col(comptime q: input_queue, c: u16, r: u16, n: u16) void {
+  if (n > 0) { @fmovs(@set_dsd_length(@increment_dsd_offset(SR_COL, @as(i16, r * NVC + c), f32), n), fab_in(q, n)); }
+}
+noinline fn sr_tree(g: u16) void {
+  var off: u16 = 16;
+  while (off > 0) {
+    const glo = @set_dsd_length(@increment_dsd_offset(red_dsd(RB), @as(i16, g * 32), f32), off);
+    const ghi = @increment_dsd_offset(glo, @as(i16, off), f32);
+    @fadds(glo, glo, ghi);
+    off = off / 2;
+  }
+}
+noinline fn sum_rows() void {
+  const nch = (H + 31) / 32;
+  if (!hub) { red[0] = myblk[0]; }
+  { var k: u16 = 0; while (k < nch) : (k += 1) {
+    const r0 = k * 32;
+    const r1 = if (H - r0 < 32) H else r0 + 32;
+    const nn: u16 = if (r0 < F) (if (r1 < F) r1 else F) - r0 else 0;   // the chunk's north rows
+    const ns: u16 = (r1 - r0) - nn;
+    if (!hub) {
+      const north = vy < F;
+      const len = if (north) nn else ns;
+      if (len == 0) { continue; }
+      const s0 = if (north) r0 else r0 + nn;   // the half's first chunk row
+      // in the chain: between the chunk's far row and the hub
+      if (north and vry < s0) { continue; }
+      if (!north and vry > s0 + len - 1) { continue; }
+      const mine = vry >= s0 and vry < s0 + len;
+      const far = if (north) vry == s0 else vry == s0 + len - 1;
+      if (!mine) {
+        sr_pass(len);
+      } else {
+        const idx = vry - s0;
+        if (far) {
+          sr_zero(idx);
+          @fmovs(fab_out(q3_out, 1), red_dsd(1));
+          sr_zero(len - idx - 1);
+        } else {
+          sr_pass(idx);
+          @fadds(fab_out(q3_out, 1), red_dsd(1), fab_in(q4_in, 1));
+          sr_pass(len - idx - 1);
+        }
+      }
+    } else if (!hub_last) {
+      if (!hub_first) { @fmovs(fab_out(q3_out, VJ * (r1 - r0)), fab_in(q6_in, VJ * (r1 - r0))); }
+      if (nn > 0) { @fmovs(fab_out(q3_out, nn), fab_in(q4_in, nn)); }
+      if (ns > 0) { @fmovs(fab_out(q3_out, ns), fab_in(q5_in, ns)); }
+    } else {
+      const L = r1 - r0;
+      @fmovs(red_dsd(32 * NVC), 0.0);
+      { var c: u16 = 0; while (c + 1 < NVC) : (c += 1) { sr_col(q6_in, c, 0, L); } }
+      sr_col(q4_in, NVC - 1, 0, nn);
+      sr_col(q5_in, NVC - 1, nn, ns);
+      const ng = (L * NVC + 31) / 32;
+      { var g: u16 = 0; while (g < ng) : (g += 1) {
+        sr_tree(g);
+        l2[k * NVC + g] = red[g * 32];
+      } }
+    }
+  } }
+  if (hub and hub_last) {
+    const n2 = (nblk + 31) / 32;
+    { var k: u16 = 0; while (k < L2N) : (k += 1) { if (k < n2) { red[k] = l2[k]; } } }
+    red[0] = canon_sum(n2);
+    @fmovs(fab_out(q3_out, 1), red_dsd(1));
+  } else {
+    @fmovs(red_dsd(1), fab_in(q7_in, 1));
+  }
+}
 noinline fn sum_pipe() void {
   fkind = K_SUM;
   const nch = (nblk + CH - 1) / CH;
@@ -1352,6 +1435,159 @@ noinline fn topk_rounds(dv: u32, a: u32, di: u32, k: u32) void {
     if (red[2 * KB - 1] >= 3.0e38) { break; }
   }
 }
+// vm_topk 1: eta's top_k by radix select. The k-th entry of eta's order
+// (value descending, -0 == +0, ties by index ascending, NaN left out) is found
+// digit by digit (4 bits, most significant first) on an order key of the
+// value, then (ties at the k-th value only) on the inverted index: each digit
+// a 16-bin count fold. Each entry's class (kord: 0 out, 1 in the bucket being
+// resolved, 2 taken) narrows pass by pass. The selection (exactly
+// min(k, entries)) is then concatenated hop by hop to the last hub ([count |
+// value, index pairs]), sorted there in eta's order and sent back (K): every
+// PE writes it out.
+const RADIX: bool = vm_topk != 0;
+fn rx_key(x: f32) u32 {
+  const b: u32 = if (x == 0.0) 0 else @bitcast(u32, x);
+  return if ((b & 0x80000000) != 0) ~b else (b | 0x80000000);
+}
+// digit sh (a multiple of 4) of the value key (ph 0) or of the inverted index
+noinline fn rx_dig(ph: u16, x: f32, g: u32, sh: u16) u16 {
+  const key: u32 = if (ph == 0) rx_key(x) else 0xfffff - g;
+  const half: u16 = if (sh >= 16) @as(u16, key >> 16) else @as(u16, key & 0xffff);
+  const s4: u16 = if (sh >= 16) sh - 16 else sh;
+  return (half >> s4) & 15;
+}
+var rx_oa: u16 = 0;
+var rx_lo: u32 = 0;
+var rx_m: u16 = 0;
+// One pass over this PE's entries in the bucket (kord 1): dg 16 counts their
+// digit sh into red[0..16); else narrows them to digit dg (above 2, below 0).
+noinline fn rx_scan(ph: u16, sh: u16, dg: u16) void {
+  if (dg == 16) { @fmovs(red_dsd(16), 0.0); }
+  { var i: u16 = 0; while (i < rx_m) : (i += 1) {
+    if (kord[i] == 1) {
+      const d = rx_dig(ph, wide[rx_oa + i], rx_lo + @as(u32, i), sh);
+      if (dg == 16) { red[d] += 1.0; } else { kord[i] = if (d > dg) 2 else if (d == dg) 1 else 0; }
+    }
+  } }
+}
+noinline fn rx_fold16() void { lane_fold(K_SUM, 16); }
+var rx_cnt = @zeros([1]u32);
+const rx_cnt_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> rx_cnt[i] });
+fn rx_at(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(red_dsd(RB), @as(i16, o), f32), n); }
+// [count | value, index pairs] from queue q into red at o (raw words); the count
+fn rx_take(comptime q: input_queue, o: u16) u16 {
+  @mov32(rx_cnt_dsd, fab_in(q, 1));
+  const n = @as(u16, rx_cnt[0]);
+  if (n > 0) { @mov32(rx_at(o, 2 * n), fab_in(q, 2 * n)); }
+  return n;
+}
+noinline fn rx_send(n: u16) void {
+  rx_cnt[0] = n;
+  @mov32(fab_out(q3_out, 1), rx_cnt_dsd);
+  if (n > 0) { @mov32(fab_out(q3_out, 2 * n), red_dsd(2 * n)); }
+}
+fn rx_ix(j: u16) u32 { return @bitcast(u32, red[2 * j + 1]); }
+// Shell sort of the n pairs in red (eta's order; the keys are distinct).
+noinline fn rx_sort(n: u16) void {
+  var gap: u16 = 40;
+  while (true) {
+    var i: u16 = gap;
+    while (i < n) : (i += 1) {
+      const v = red[2 * i];
+      const x = rx_ix(i);
+      var j: u16 = i;
+      while (j >= gap and (red[2 * (j - gap)] < v or (red[2 * (j - gap)] == v and rx_ix(j - gap) > x))) : (j -= gap) {
+        red[2 * j] = red[2 * (j - gap)];
+        red[2 * j + 1] = red[2 * (j - gap) + 1];
+      }
+      red[2 * j] = v;
+      red[2 * j + 1] = @bitcast(f32, x);
+    }
+    if (gap == 1) { break; }
+    gap = (gap - 1) / 3;
+  }
+}
+// One window: the next w entries of eta's order among those not yet out
+// (kord 4), selected, gathered and sorted (rx_gather); their count.
+noinline fn rx_window(w: f32) u16 {
+  { var i: u16 = 0; while (i < rx_m) : (i += 1) {
+    const x = wide[rx_oa + i];
+    kord[i] = if (kord[i] == 4) 4 else if (x == x) 1 else 0;
+  } }
+  var ph: u16 = 0;
+  var need: f32 = w;
+  var first = true;
+  var sh: u16 = 28;
+  while (true) {
+    rx_scan(ph, sh, 16);
+    rx_fold16();
+    if (first) {
+      first = false;
+      var tot: f32 = 0.0;
+      { var b: u16 = 0; while (b < 16) : (b += 1) { tot += red[b]; } }
+      if (w >= tot) { break; }   // every entry left is taken
+    }
+    var dg: u16 = 15;
+    while (red[dg] < need) : (dg -= 1) { need -= red[dg]; }
+    const c = red[dg];
+    rx_scan(ph, sh, dg);
+    if (c == need or (ph == 1 and sh == 0)) { break; }   // the whole bucket is taken
+    if (sh == 0) {
+      // ties at the w-th value: the same on the inverted index (distinct)
+      ph = 1; sh = 16;
+    } else {
+      sh -= 4;
+    }
+  }
+  return rx_gather();
+}
+// eta's top_k: windows of at most RB / 2 entries (one, for k <= 128).
+noinline fn topk_radix(dv: u32, a: u32, di: u32, k: u32) void {
+  rx_oa = @as(u16, a) * Vt; rx_lo = lane_base(); rx_m = nloc();
+  { var i: u16 = 0; while (i < rx_m) : (i += 1) { kord[i] = 0; } }
+  var got: u32 = 0;
+  while (got < k) {
+    const W: u32 = if (vm_rxw != 0 and vm_rxw < RB / 2) vm_rxw else RB / 2;
+    const w: u32 = if (k - got < W) k - got else W;
+    const n = rx_window(@as(f32, w));
+    { var j: u16 = 0; while (j < n) : (j += 1) {
+      setf(dv + got, red[2 * j]);
+      pool[@as(u16, di + got)] = rx_ix(j);
+      got += 1;
+    } }
+    if (@as(u32, n) < w) { break; }
+  }
+}
+// This PE's selection as pairs, concatenated to the last hub, sorted there,
+// sent back: the pair count (every PE).
+noinline fn rx_gather() u16 {
+  var mine: u16 = 0;
+  { var i: u16 = 0; while (i < rx_m) : (i += 1) {
+    if (kord[i] == 1 or kord[i] == 2) {
+      kord[i] = 4;
+      red[2 * mine] = wide[rx_oa + i];
+      red[2 * mine + 1] = @bitcast(f32, rx_lo + @as(u32, i));
+      mine += 1;
+    }
+  } }
+  var n: u16 = 0;
+  if (!hub) {
+    var nin: u16 = 0;
+    if (!col_end) { @mov32(rx_cnt_dsd, fab_in(q4_in, 1)); nin = @as(u16, rx_cnt[0]); }
+    rx_cnt[0] = nin + mine;
+    @mov32(fab_out(q3_out, 1), rx_cnt_dsd);
+    if (nin > 0) { @mov32(fab_out(q3_out, 2 * nin), fab_in(q4_in, 2 * nin)); }
+    if (mine > 0) { @mov32(fab_out(q3_out, 2 * mine), red_dsd(2 * mine)); }
+  } else {
+    n = rx_take(q4_in, 0);
+    n += rx_take(q5_in, 2 * n);
+    if (!hub_first) { n += rx_take(q6_in, 2 * n); }
+    if (hub_last) { rx_sort(n); }
+    rx_send(n);
+  }
+  if (!hub or !hub_last) { n = rx_take(q7_in, 0); }
+  return n;
+}
 noinline fn pivmass_walk(d: u32, a: u32, p: f32) void {
   const m = nloc();
   const lo = lane_base();
@@ -1412,6 +1648,20 @@ fn exec() void {
     const cb = (fl & 16) != 0;
     const n = @as(u16, fl >> 8);
     pc += 1;
+    if (LAZY and lz_reg[cur_lane] != 0 and op != HALT and op != WRNG) {
+      const L = lz_reg[cur_lane] - 1;
+      if (op == WBIN and !ab and !bb and c <= 1 and (a == @as(u32, L)) != (b == @as(u32, L))) {
+        lz_binop(d, a, b, c, L);
+        continue;
+      }
+      // the op's wide-register fields (the rest are pool words or immediates)
+      const wop = op < 20 or op == QGATHER or op == QSCATTER;
+      const hd = wop and lz_hits(L, d, n);
+      const ha = wop and !ab and op != WFILL and lz_hits(L, a, n);
+      const hb = (op == WBIN or op == WCMP or op == WSEL) and !bb and lz_hits(L, b, n);
+      const hc = op == WSEL and lz_hits(L, c, n);
+      if (hd or ha or hb or hc) { lz_fill(); }
+    }
     if (op == HALT) {
       prof_pc = 0xffff;
       finish();
@@ -1468,6 +1718,12 @@ fn exec() void {
       @fmovs(reg(d), pf(a));
     } else if ((OPK_WIOTA and op == WIOTA)) {
       { var i: u16 = 0; while (i < Vt) : (i += 1) { wide[@as(u16, d) * Vt + i] = @as(f32, lane_base() + @as(u32, i)); } }
+    } else if ((feat & F_RNG) != 0 and LAZY and OPK_WRNG and op == WRNG) {
+      var z: u64 = seed_of(a, cb);
+      const j1: u64 = @as(u64, lane_base()) + @as(u64, b) + 1;
+      lz_z[cur_lane] = z + LANE_STRIDE * j1;
+      lz_reg[cur_lane] = @as(u16, d) + 1;
+      lz_g[cur_lane] = if (c != 0) 1 else 0;
     } else if ((feat & F_RNG) != 0 and ((OPK_WRNG and op == WRNG))) {
       var z: u64 = seed_of(a, cb);
       // b: the index of the row's first entry (a multi-row draw: row r at r·vocab).
@@ -1500,7 +1756,7 @@ fn exec() void {
           myblk[blk] = tmp[blk * 32];
         } }
         chunk = 0;
-        if (SUMCAT) { sum_cat(); } else if (SUMPIPE) { sum_pipe(); } else { sum_chunk(); }
+        if (SUMROWS) { sum_rows(); } else if (SUMCAT) { sum_cat(); } else if (SUMPIPE) { sum_pipe(); } else { sum_chunk(); }
       } else if (c == 1 or c == 2) {
         // max; min as -max(-x). Padding: the identity.
         var acc: f32 = NEG_INF;
@@ -1606,7 +1862,7 @@ fn exec() void {
       while (!resume_body()) {}
       continue;
     } else if ((feat & F_LIST) != 0 and PWALK and OPK_TOPK and op == TOPK) {
-      if (c > 0) { topk_rounds(d, a, b, c); }
+      if (c > 0 and RADIX) { topk_radix(d, a, b, c); } else if (c > 0 and !RADIX) { topk_rounds(d, a, b, c); }
     } else if ((feat & F_LIST) != 0 and !PWALK and (OPK_TOPK and op == TOPK)) {
       // The k largest in eta's order: two rounds of a 256-bin count
       // histogram give a key floor with at least k entries above it, then
@@ -2004,7 +2260,8 @@ fn hub_feeder_routes() void {
 }
 
 // The out ring's depth (steps a launch), for the host and the engine.
-var gring = @zeros([3]u32);
+var gring = @zeros([if (CONC) 4 else 3]u32);
+const G_CSTEPS: u16 = if (CONC) 3 else 0;
 var gdbg = @zeros([4]u32);   // vm_dbg: rows read, tokens sent, folds, phase
 var gdbg_ptr: [*]u32 = &gdbg;   // depth, words a step, lanes
 var gring_ptr: [*]u32 = &gring;
@@ -2037,12 +2294,21 @@ fn init() void {
     }
     // The root's row (Vr + 1 words) passes every VM column of the block
     // (two sets: both sets' columns; VLAST marks the last).
-    if (if (TWO) VLAST == 0 else VJ + 1 < NVC) {
+    if (CONC) {
+      // concurrent sets: each set's rows stop at its own last column; B's
+      // pass A's columns
+      if (VSET == 0) { color_config.reset_routes(col_of(C_VL2), .{ .rx = WEST, .tx = EAST }); }
+      if (VJ + 1 < NVC) {
+        color_config.reset_routes(col_of(C_VLS), .{ .rx = WEST, .tx = [2]direction{ RAMP, EAST } });
+      } else {
+        color_config.reset_routes(col_of(C_VLS), .{ .rx = WEST, .tx = RAMP });
+      }
+    } else if (if (TWO) VLAST == 0 else VJ + 1 < NVC) {
       color_config.reset_routes(col_of(C_VL), .{ .rx = WEST, .tx = [2]direction{ RAMP, EAST } });
     } else {
       color_config.reset_routes(col_of(C_VL), .{ .rx = WEST, .tx = RAMP });
     }
-    iq_color(2, C_VL);
+    iq_color(2, C_VLS);
   } else {
     if (!OUTSIDE) { hub_feeder_routes(); }
     // Two sets (one block): set B's tokens go west on C_BT through set A's
@@ -2052,7 +2318,8 @@ fn init() void {
       color_config.reset_routes(col_of(C_BT), .{ .rx = EAST, .tx = WEST });
     }
     if (TWO and VSET == 0 and vblk == BM and VJ == 0) {
-      color_config.reset_routes(col_of(C_BT), .{ .rx = EAST, .tx = RAMP });
+      // (vm_conc: on to the final root, which takes B's tokens itself)
+      color_config.reset_routes(col_of(C_BT), .{ .rx = EAST, .tx = if (CONC) WEST else RAMP });
     }
     if (TWO and VSET == 1 and vblk == BM and VJ == 0) {
       color_config.reset_routes(col_of(C_BT), .{ .rx = RAMP, .tx = WEST });
@@ -2137,7 +2404,7 @@ fn init() void {
     }
   }
   if (hub and hub_first) { iq_color(6, C_PARK1); }
-  if (TWO and VSET == 0 and hub and vblk == BM and VJ == 0) { iq_color(6, C_BT); }
+  if (TWO and !CONC and VSET == 0 and hub and vblk == BM and VJ == 0) { iq_color(6, C_BT); }
   timestamp.enable_tsc();
   sys_mod.unblock_cmd_stream();
 }
@@ -2199,6 +2466,7 @@ noinline fn bank_move(l: u16, into: bool) void {
   } }
 }
 fn swap_in(l: u16) void {
+  cur_lane = l;
   if (LP) {
     obase = @as(u16, glane[l * 4] & 0xffff);
     otok = @as(u16, glane[l * 4 + 1]);
@@ -2231,6 +2499,38 @@ var gsin = @zeros([if (SIN > 0) ring * SIN else 1]u32);
 var gsin_ptr: [*]u32 = &gsin;
 var gsdesc = @zeros([if (SIN > 0) NL * 12 else 1]u32);
 var gsdesc_ptr: [*]u32 = &gsdesc;
+const LAZY: bool = vm_lazyrng != 0;
+var cur_lane: u16 = 0;
+var lz_reg = @zeros([NL]u16);   // the lazy register + 1 (0: none)
+var lz_z = @zeros([NL]u64);     // its entry 0's stream point
+var lz_g = @zeros([NL]u16);     // Gumbel
+fn lz_hits(L: u16, r: u32, n: u16) bool {
+  const lo = @as(u32, L);
+  return r <= lo and lo < r + @as(u32, if (n > 1) n else 1);
+}
+noinline fn lz_fill() void {
+  const L = lz_reg[cur_lane] - 1;
+  var z = lz_z[cur_lane];
+  const g = lz_g[cur_lane] != 0;
+  { var i: u16 = 0; while (i < Vt) : (i += 1) {
+    wide[L * Vt + i] = draw(z, g);
+    z = z + LANE_STRIDE;
+  } }
+  lz_reg[cur_lane] = 0;
+}
+noinline fn lz_binop(d: u32, a: u32, b: u32, c: u32, L: u16) void {
+  const first = @as(u16, a) == L;
+  const o = @as(u16, if (first) b else a) * Vt;
+  var z = lz_z[cur_lane];
+  const g = lz_g[cur_lane] != 0;
+  { var i: u16 = 0; while (i < Vt) : (i += 1) {
+    const x = wide[o + i];
+    const r = if (x - x == 0.0) draw(z, g) else 1.0;
+    wide[@as(u16, d) * Vt + i] = if (first) binf(c, r, x) else binf(c, x, r);
+    z = z + LANE_STRIDE;
+  } }
+  if (@as(u16, d) == L) { lz_reg[cur_lane] = 0; }
+}
 noinline fn step_in(l: u16, t: u32) void {
   const base = @as(u16, t % @as(u32, ring)) * SIN;
   var e: u16 = 0;
@@ -2243,6 +2543,7 @@ noinline fn step_in(l: u16, t: u32) void {
     var k: u16 = 0;
     while (k < n) : (k += 1) {
       if (kind == 1) {
+        if (LAZY and lz_reg[l] == dst + k + 1) { lz_reg[l] = 0; }   // overwritten whole
         var w = gsin[src + k];
         const o = (dst + k) * Vt;
         var i: u16 = 0;
@@ -2274,7 +2575,8 @@ fn answer(v: f32) void {
   }
 }
 
-fn compute(steps: u32) void {
+fn compute(steps_arg: u32) void {
+  const steps: u32 = if (CONC and gring[G_CSTEPS] != 0) gring[G_CSTEPS] else steps_arg;
   if (gmode[0] == 1) {
     { var l: u16 = 0; while (l < NL and (vm_dbg == 0 or vm_dbg == 3)) : (l += 1) {
       if (LP and (glane[l * 4] >> 16) == 0) { continue; }   // an empty lane: no pre
@@ -2343,7 +2645,7 @@ fn compute(steps: u32) void {
         const mine = if (VSET == 0) (cv == 0.0 or cv == 1.0) else (cv == 2.0 or cv == 3.0);
         if (!mine) {
           // set A's token sender relays set B's token for this row
-          if (VSET == 0 and hub and vblk == BM and VJ == 0) {
+          if (!CONC and VSET == 0 and hub and vblk == BM and VJ == 0) {
             @fmovs(tokv_dsd, fab_in(q6_in, 1));
             @fmovs(fab_out(q2_out, 1), tokv_dsd);
           }
@@ -2382,7 +2684,7 @@ fn compute(steps: u32) void {
 }
 
 comptime {
-  @initialize_queue(q2_in, .{ .color = @get_color(C_VL) });
+  @initialize_queue(q2_in, .{ .color = @get_color(C_VLS) });
   @initialize_queue(q2_out, .{ .color = @get_color(C_VT) });
   @initialize_queue(q3_out, .{ .color = @get_color(C_A) });
   @initialize_queue(q4_in, .{ .color = @get_color(C_B) });

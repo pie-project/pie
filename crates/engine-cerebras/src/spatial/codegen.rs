@@ -802,7 +802,7 @@ param GPX: u16;\nparam GPY: u16;\nparam GW: u16;\nparam GH: u16;\nparam S2D_SB: 
         "init routes",
     )?;
     s = one_column_result(&s, "one-column result route")?;
-    s = patch(&s, "fn compute(steps: u32) void {", "fn s2d_vm_run(steps: u32) void {", "compute")?;
+    s = patch(&s, "fn compute(steps_arg: u32) void {", "fn s2d_vm_run(steps_arg: u32) void {", "compute")?;
     s = s.replace("  @export_symbol(compute);", "");
     let own = exports(&s);
     s = format!(
@@ -1342,7 +1342,7 @@ mod tests {
         ("serve2d_pipe", "grid_pe.csl", "37bb4a86878b05fede651b072293f28fcf9b69e05786111b976bfe909ca22991"),
         ("serve2d_pipe", "head_pe.csl", "dbad3ea4babb668918bf15b15cf79eb1889a067c33836931af3119b8fd42ce59"),
         ("serve2d_pipe", "filler.csl", "9d5a34b90889efbb80c0f5bff82fc6e0723f50143729cf57d4edf05156e38f71"),
-        ("serve2d_pipe", "vm_pe.csl", "b19266d1bea6b2692e17265bb7a1be88298aa18a32c7aa19120c59b9eeb9bd9c"),
+        ("serve2d_pipe", "vm_pe.csl", "9c53d35bcc738c6ba60b5dc65e8a4805d40d691f8322ce3899eefeb78bad395a"),
         ("serve8b", "grid_pe.csl", "04c7a6d99f99b15cd845ef9c3d0ef20aac4ef23d2cae04a2af0315278860b56f"),
         ("serve8b", "head_pe.csl", "c9d5b14ad454fd62eae6c592fd2c2e21b484c59b29c160a1c363e6307bfd054d"),
         ("serve8b", "embed_pe.csl", "991c1ce046039415a39f9afb0c6e2e8673a91ff3e7057637abd6477fc99f39e9"),
