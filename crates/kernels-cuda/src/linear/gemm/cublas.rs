@@ -1167,6 +1167,13 @@ fn build_lt_plan(
         return None;
     }
     heuristics.truncate((returned as usize).min(heuristics_wanted.max(1)));
+    let mma1688 = |h: &lt::cublasLtMatmulHeuristicResult_t| {
+        inner_shape(&h.algo)
+            == lt::cublasLtMatmulInnerShape_t::CUBLASLT_MATMUL_INNER_SHAPE_MMA1688 as u16
+    };
+    if heuristics.iter().any(|h| !mma1688(h)) {
+        heuristics.retain(|h| !mma1688(h));
+    }
     let mut augmented: Vec<lt::cublasLtMatmulHeuristicResult_t> = Vec::new();
     for heuristic in &heuristics {
         let mut supports: i32 = 0;
@@ -1897,6 +1904,27 @@ const FINALISTS: usize = 8;
 const FINAL_ROUNDS: usize = 4;
 const FINAL_TIE: f32 = 1.02;
 
+fn inner_shape(algo: &lt::cublasLtMatmulAlgo_t) -> u16 {
+    let mut shape: u16 = 0;
+    let mut written: usize = 0;
+    // SAFETY: `algo` is an algorithm cuBLASLt returned; `shape` is a u16
+    // local of the size passed and `written` a local.
+    let asked = unsafe {
+        lt::cublasLtMatmulAlgoConfigGetAttribute(
+            std::ptr::from_ref(algo),
+            lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID,
+            std::ptr::from_mut(&mut shape).cast(),
+            std::mem::size_of::<u16>(),
+            &raw mut written,
+        )
+    };
+    if asked != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        clear_error();
+        return 0;
+    }
+    shape
+}
+
 /// An algorithm's K splits (1 when it does not split K).
 fn splits_of(algo: &lt::cublasLtMatmulAlgo_t) -> i32 {
     let mut splits: i32 = 1;
@@ -2526,7 +2554,7 @@ fn signature() -> String {
         .collect();
     let name = String::from_utf8_lossy(&name).into_owned();
     format!(
-        "# pie-dense-gemm v10 sm{}{} cublas={version} dev={name}",
+        "# pie-dense-gemm v11 sm{}{} cublas={version} dev={name}",
         prop.major, prop.minor
     )
 }
