@@ -299,6 +299,9 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
                 out = f"{head}\n... ({len(res['out']) - len(head) - len(tail)} characters cut) ...\n{tail}"
             messages.append({"role": "user", "content": f"<returncode>{res['rc']}</returncode>\n<output>\n{out}</output>",
                              "turn": turns})
+        if config.get("dump"):
+            Path(config["dump"]).mkdir(parents=True, exist_ok=True)
+            Path(config["dump"], f"{task.id}.json").write_text(json.dumps(messages))
         return {
             "patch": patch, "solved": await loop.run_in_executor(None, box.evaluate, task, patch),
             "decoded_tokens": completion,
