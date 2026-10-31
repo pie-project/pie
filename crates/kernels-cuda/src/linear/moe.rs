@@ -40,7 +40,7 @@ const SELECT_SM80: &str = "linear/moe/select_sm80.cu";
 #[cfg(feature = "cuda")]
 const SELECT_SM90: &str = "linear/moe/select_sm90.cu";
 #[cfg(feature = "cuda")]
-const DENSE_SM120: &str = "linear/fp8_dense_sm120.cu";
+const SELECT_FP8_SM120: &str = "linear/moe/select_fp8_sm120.cu";
 
 const BLOCK: u32 = 256;
 

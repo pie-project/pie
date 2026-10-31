@@ -163,7 +163,7 @@ impl core::fmt::Display for Uncut {
 }
 
 #[must_use]
-pub fn widen(compiled: &CompiledModel, admits: &[Admit], bucket: u32) -> Vec<Admit> {
+pub fn widen(compiled: &CompiledModel, admits: &[Admit]) -> Vec<Admit> {
     let template = compiled.template();
     let mut table: Vec<Admit> = (0..template.len())
         .map(|at| admits.get(at).copied().unwrap_or(Admit::Island))
@@ -302,7 +302,7 @@ pub fn cuts(
     bucket: u32,
 ) -> core::result::Result<Vec<Stretch>, Uncut> {
     let template = compiled.template();
-    let table = widen(compiled, admits, bucket);
+    let table = widen(compiled, admits);
     if table.contains(&Admit::Island) {
         let mut seen: Vec<((&poem_ir::ClassSet, u32), Admit)> = Vec::new();
         for (index, region) in template.iter().enumerate() {
