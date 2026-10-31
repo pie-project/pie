@@ -571,7 +571,7 @@ class Swarm:
                     self.kill(b, "duplicate")
                     continue
                 seen[key] = b
-                if b.loops.get(key, 0) >= 2:  # the third run of a command that changed nothing
+                if cfg["kill_loops"] and b.loops.get(key, 0) >= 2:  # the third run of a command that changed nothing
                     self.kill(b, "loop")
                     continue
                 b.loops[key] = b.loops.get(key, 0) + 1
@@ -686,7 +686,7 @@ class Swarm:
 
     def render(self, b: Branch, r: dict) -> str:
         out = r["out"]
-        if len(out) > 200:
+        if self.cfg["note_repeats"] and len(out) > 200:
             h = hash(out)
             if h in b.outputs:
                 self.stats.repeated_outputs += 1
@@ -741,6 +741,8 @@ DEFAULTS = {
     "submit_after": 3,
     "no_rewrite": False,  # rewind a reply that overwrites a file it has read, and start it as an edit
     "ahead": True,  # decode on the run-ahead path, a fork per reply, instead of one host round trip a token
+    "kill_loops": True,  # end a branch on the third run of a command that changed nothing
+    "note_repeats": True,  # replace an output seen before with a note that it repeats
     "forget_after": 0,  # turns after a command that its output leaves the KV; 0 keeps it
     "forget_keep": 64,  # tokens kept at each end of a forgotten output
     "forget_replies": False,  # drop the agent's old replies the same way

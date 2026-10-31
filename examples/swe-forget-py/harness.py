@@ -382,7 +382,8 @@ async def main() -> None:
     if args.mode in ("linear", "lean"):
         config.update(width=1, judge=False, dedup=False, memo=False)
     if args.mode == "forget":
-        config.update(width=1, judge=False, dedup=False, memo=False)
+        # the API arm's loop has neither rule
+        config.update(width=1, judge=False, dedup=False, memo=False, kill_loops=False, note_repeats=False)
         config.setdefault("forget_after", 4)
     if args.mode == "lean":  # one agent, plus the three token savers
         config.update(verify_stop=True, no_rewrite=True, max_thought_tokens=192)
