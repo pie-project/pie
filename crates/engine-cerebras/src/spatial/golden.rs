@@ -697,7 +697,7 @@ const PINS: &[(&str, usize, &str)] = &[
     (
         "serve2d_pipe_conc/vm",
         33,
-        "d6766ca18c9b6450bfc8a9d425073439",
+        "d611b6dbad4f464ee740be90aedda436",
     ),
     (
         "serve2d_pipe_conc/vm_all",
@@ -951,6 +951,117 @@ fn runs() -> &'static [(Scenario, Phases)] {
 /// call a scenario makes names a symbol its spec's components declare (a
 /// variable at the width copied, a function), and every declared symbol is
 /// one the design's generated layout exports.
+/// The vmlane words (four a virtual lane) a VM launch of scenario `name`
+/// writes when it samples lane 0 of each set, each set's lane 0 placed;
+/// and which lanes' turns came back with a ring row.
+fn vm_launch_control(name: &str) -> (Vec<u32>, Vec<bool>, Vec<bool>) {
+    let sc = scenarios()
+        .into_iter()
+        .find(|s| s.name == name)
+        .expect("the scenario");
+    let design = ProgramSpec::from_params(sc.built, &sc.params).expect("the scenario's design");
+    let rec = Recorder::default();
+    let ring = design.vm_abi().map_or(0, |abi| abi.ring_words);
+    let launch = design.launch_lanes();
+    for (vm, lanes_key) in [(design.vm(), "vm_lanes"), (design.vm_b(), "b_vm_lanes")] {
+        if let Some(vm) = vm {
+            let (x, y) = vm.hub();
+            let lanes = num(&sc.params, lanes_key).unwrap_or(launch) as u32;
+            let depth = num(&sc.params, "ring_d").unwrap_or(32) as u32;
+            let width = num(&sc.params, "ring_w").unwrap_or(1) as u32;
+            rec.preset("gring", x as i32, y as i32, &[depth, width, lanes][..ring]);
+        }
+    }
+    let ckpt = Ckpt::synthetic(shapes(
+        &design,
+        design.head.kind == super::program::HeadKind::Untied,
+    ));
+    let col = (design.head_x() + design.r2x()) as i32;
+    let pool = design.paged().expect("a batched build").pages() as u32;
+    let mut m = WaferModel::on_device(
+        Box::new(rec.clone()),
+        design,
+        Weights::Place(&ckpt),
+        Some(1.0e6),
+        ring,
+    )
+    .expect("the load");
+    let (na, nb) = m.vm_lanes();
+    let (table, seeds) = vm_table();
+    let program = Arc::new(Program {
+        table,
+        epilogue: 0,
+        homes: BTreeSet::new(),
+        logits: "logits".into(),
+    });
+    for (set, n) in [(0, na), (1, nb)] {
+        let shape = if set == 0 {
+            m.vm_shape()
+        } else {
+            m.vm_shape_b()
+        };
+        if shape.is_some_and(|(l, _)| l.lprog) {
+            let mut programs = vec![None; n];
+            programs[0] = Some(LaneProgram {
+                key: 1,
+                program: program.clone(),
+            });
+            let mut lane_seeds = vec![None; n];
+            lane_seeds[0] = Some(seeds.clone());
+            m.vm_place_lanes(set, &programs, &lane_seeds, &vec![None; n])
+                .expect("placed");
+        } else {
+            m.vm_load_lanes(&program.table).expect("loaded");
+            m.vm_seed_bank(0, &seeds).expect("seeded");
+        }
+    }
+    let mut sampled = vec![false; na + nb];
+    sampled[0] = true;
+    sampled[na] = true;
+    let two = lanes(launch, pool, 5, 1, |b| vec![b as u32 + 1]);
+    let steps = m.vm_fire(&two, &sampled, &[]).expect("the VM launch");
+    let words = rec.memory("vmlane", col, 0).expect("vmlane written");
+    (
+        words,
+        sampled,
+        steps.iter().map(|(_, row, _)| !row.is_empty()).collect(),
+    )
+}
+
+#[test]
+fn a_vmconc_launch_keeps_every_lane_on_the_vm() {
+    // VMCONC rebinds the head's argmax chain to set B's rows for a VM launch
+    // (0196: a lane left on the head's argmax hung the wafer). Every lane is
+    // a VM lane; one the launch does not sample sits its turn out (its
+    // forced prefix past the launch's one lap), and only sampled lanes come
+    // back with a turn.
+    let (words, sampled, answered) = vm_launch_control("serve2d_pipe_conc");
+    for (v, w) in words.chunks(4).enumerate() {
+        assert_eq!(w[0], 1, "lane {v} on the head's argmax under VMCONC");
+        if sampled[v] {
+            assert_eq!(w[1], 1, "sampled lane {v} skips its turn");
+        } else {
+            assert_eq!(w[1], 2, "lane {v} is not a skipped turn");
+        }
+        assert_eq!(
+            answered.get(v).copied().unwrap_or(false),
+            sampled[v],
+            "lane {v}'s turn read back"
+        );
+    }
+    // Without VMCONC the chain stays the head's: an unsampled lane takes
+    // its argmax as before.
+    let (words, sampled, _) = vm_launch_control("serve2d_pipe_ab");
+    for (v, w) in words.chunks(4).enumerate() {
+        assert_eq!(
+            w[0],
+            u32::from(sampled[v]),
+            "lane {v}'s gmode_l without VMCONC"
+        );
+        assert_eq!(w[1], 1, "lane {v}'s forced prefix without VMCONC");
+    }
+}
+
 #[test]
 fn the_abi_covers_every_call_and_the_sources_export_it() {
     use super::component::abi::Kind;

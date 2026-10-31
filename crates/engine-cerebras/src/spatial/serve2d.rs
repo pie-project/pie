@@ -575,10 +575,12 @@ pub fn fire(
 /// A VM launch's control a virtual lane (head lane m·B + b): whether the VM
 /// samples it (`gmode_l`) and whose turn it is (vmlane word 3: 0 set A, 1
 /// set B). A set counts its own turns, so each lap must give it exactly its
-/// lanes.
+/// lanes. `nforce`, where given, replaces a lane's forced-prefix word: a VM
+/// lane's iterations before it are skipped turns.
 pub struct VmTurns<'a> {
     pub sampled: &'a [u32],
     pub sets: &'a [u32],
+    pub nforce: Option<&'a [u32]>,
 }
 
 /// [`fire`] on a VM build with `vm`'s turns (`None`: the head's argmax every

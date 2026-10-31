@@ -340,6 +340,16 @@ mod recorder {
                 .insert((symbol.to_string(), x, y), words.to_vec());
         }
 
+        /// The words PE (x, y) holds of `symbol`, as last written (or
+        /// preset).
+        pub fn memory(&self, symbol: &str, x: i32, y: i32) -> Option<Vec<u32>> {
+            self.state
+                .borrow()
+                .memory
+                .get(&(symbol.to_string(), x, y))
+                .cloned()
+        }
+
         /// The calls so far, and the log emptied.
         pub fn take(&self) -> Vec<Call> {
             std::mem::take(&mut self.state.borrow_mut().calls)
