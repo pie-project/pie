@@ -1,0 +1,43 @@
+// serve8b's filler: the rectangle's PEs outside the grids, the head and the
+// embedding strip (the free grid slots, and rows past the head). They only
+// route the staircases that cross them (paths.csl, HEADMODE 2) and take part
+// in launches.
+param memcpy_params;
+param PX: u16;
+param PY: u16;
+param XH0: u16;        // the head's first column
+param XL: u16;         // the last layer's grid corner
+param YL: u16;
+param F: u16;
+param VMC: u16;
+param VMAT: u16;
+param HEADMODE: u16;
+param KVCP: u16;
+param HROUTE: u16;     // the layout's HROUTE (the dummies' exports)
+param XV: u16;         // the VM block's first column (0: none) and the final root's (paths.csl)
+param RCX: u16;
+param WS: type;        // the grids' weight and KV element types (their exports)
+param KS: type;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_mod = @import_module("<layout>");
+const paths = @import_module("paths.csl", .{ .GWD = PX, .GHT = PY, .XL = XL, .YL = YL, .XH = XH0, .F = F,
+                                             .C = PY / 2, .VMC = VMC, .VMAT = VMAT, .XE = XH0 + PY / 2 + VMC,
+                                             .EC = PY / 4, .XV = XV, .RCX = RCX });
+
+fn init() void {
+  if (HEADMODE == 2) { paths.routes(layout_mod.get_x_coord(), layout_mod.get_y_coord()); }
+  sys_mod.unblock_cmd_stream();
+}
+
+fn compute(steps: u32, start_pos: u32) void {
+  sys_mod.unblock_cmd_stream();
+}
+
+fn copy_kv(src: u32, dst: u32, phase: u32) void { sys_mod.unblock_cmd_stream(); }
+
+comptime {
+  @export_symbol(init);
+  @export_symbol(compute);
+  if (KVCP == 1) { @export_symbol(copy_kv); }
+}

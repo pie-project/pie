@@ -106,8 +106,8 @@ pub mod open {
 
     #[cfg(feature = "cerebras")]
     pub fn cerebras(config_bytes: &[u8]) -> Result<EngineBox> {
-        engine_cerebras::open(config_bytes, crate::engine::load::contract_for)
-            .map(|engine| Box::new(engine) as EngineBox)
+        // `[cerebras.spatial]` selects the spatial engine (a wafer program).
+        engine_cerebras::open_engine(config_bytes, crate::engine::load::contract_for)
             .map_err(::anyhow::Error::msg)
     }
 

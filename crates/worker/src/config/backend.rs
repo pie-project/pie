@@ -189,6 +189,36 @@ pub struct CerebrasEngineOptions {
     pub max_model_len: Option<u32>,
     /// Trace and compile the first fire shapes at load.
     pub prewarm: bool,
+    /// The spatial engine (the model forward as a resident wafer program,
+    /// instead of the phase programs) on this compiled program's output
+    /// directory, run on `cmaddr` (else the simulator). Omit, with
+    /// `spatial_serve`, for the cerebras shell.
+    pub spatial_program: Option<String>,
+    /// Steps a greedy lane's token loop runs past its row in one wafer
+    /// launch (0: off); omit for the engine's default.
+    pub spatial_lookahead: Option<u32>,
+    /// Who runs epilogues the wafer's guest VM can: `"off"` (the host, the
+    /// default), `"check"` (the VM contract played on the host) or `"wafer"`.
+    pub spatial_guest: Option<String>,
+    /// A Hugging Face directory the wafer program's weights are read from;
+    /// omit for the model's checkpoint.
+    pub spatial_ckpt: Option<String>,
+    /// The spatial engine's program built by PIE from the model's plan: the
+    /// lanes, page size, pipeline, eta VM image, ... (the engine's
+    /// `[cerebras.spatial.serve]`; `engine-cerebras` `spatial::build`).
+    /// Used when `spatial_program` is not set; the
+    /// compile is cached, so later starts reuse it.
+    pub spatial_serve: Option<toml::Table>,
+    /// The guest placement's forecast: the model's token in cycles (omit:
+    /// from its size), the share of it a table's `pre` may take and `main`
+    /// may add before the epilogue stays on the host.
+    pub spatial_token_cycles: Option<u64>,
+    pub spatial_pre_margin: Option<f64>,
+    pub spatial_main_fraction: Option<f64>,
+    /// The engine's switches (`[cerebras.switches]`: placement, serving,
+    /// toolchain; `engine-cerebras` `switches`), each winning over its old
+    /// `PIE_CEREBRAS_*` variable.
+    pub switches: Option<toml::Table>,
 }
 
 impl Default for CerebrasEngineOptions {
@@ -202,6 +232,15 @@ impl Default for CerebrasEngineOptions {
             max_state_slots: None,
             max_model_len: None,
             prewarm: false,
+            spatial_program: None,
+            spatial_lookahead: None,
+            spatial_guest: None,
+            spatial_ckpt: None,
+            spatial_serve: None,
+            spatial_token_cycles: None,
+            spatial_pre_margin: None,
+            spatial_main_fraction: None,
+            switches: None,
         }
     }
 }

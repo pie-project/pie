@@ -62,60 +62,6 @@ pub(crate) struct Tally {
     interpreted: AtomicU64,
 }
 
-/// A step's completion: `sink(at, ..)` runs once every hold on it is
-/// released (the submitter's own, and one per flight or device event the
-/// step waits on), with the first fault any of them reported.
-pub(crate) struct Latch {
-    at: engine::StepDone,
-    sink: Option<engine::CompletionSink>,
-    holds: std::sync::atomic::AtomicUsize,
-    fault: std::sync::Mutex<Option<String>>,
-}
-
-impl Latch {
-    /// A latch holding once, for the submitter.
-    pub(crate) fn new(at: engine::StepDone, sink: Option<engine::CompletionSink>) -> Arc<Latch> {
-        Arc::new(Latch {
-            at,
-            sink,
-            holds: std::sync::atomic::AtomicUsize::new(1),
-            fault: std::sync::Mutex::new(None),
-        })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn hold(&self) {
-        self.holds.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(crate) fn release(&self, outcome: Result<(), String>) {
-        if let Err(why) = outcome {
-            self.fault
-                .lock()
-                .expect("fault lock poisoned")
-                .get_or_insert(why);
-        }
-        if self.holds.fetch_sub(1, Ordering::AcqRel) != 1 {
-            return;
-        }
-        tracing::debug!(
-            frame = self.at.frame.0,
-            step = self.at.step,
-            "cerebras step landed"
-        );
-        let fault = self.fault.lock().expect("fault lock poisoned").take();
-        if let Some(sink) = &self.sink {
-            sink(
-                self.at,
-                match fault {
-                    None => engine::StepOutcome::Committed,
-                    Some(why) => engine::StepOutcome::Faulted(why),
-                },
-            );
-        }
-    }
-}
-
 /// A lane's tokens off its `embed_tokens` channel, on the host.
 pub enum Tokens {
     Host(Vec<u32>),
@@ -660,25 +606,12 @@ impl Plane {
     /// output it reads is kept for its lane, else in the host interpreter
     /// over the rows read out for them in `kept`. Returns, per attachment,
     /// whether it ran on the device.
+    #[allow(clippy::too_many_lines)]
     pub fn fire_guests(
         &mut self,
         device: &crate::device::Device,
         attachments: &[(InstanceId, u32)],
         kept: Option<&crate::readout::Kept>,
-        point: Stage,
-    ) -> Result<Vec<bool>, Refusal> {
-        self.fire_guests_with(device, attachments, kept, None, point)
-    }
-
-    /// `fire_guests`; `latch` is not held, every pass lands before this
-    /// returns.
-    #[allow(clippy::too_many_lines)]
-    pub(crate) fn fire_guests_with(
-        &mut self,
-        device: &crate::device::Device,
-        attachments: &[(InstanceId, u32)],
-        kept: Option<&crate::readout::Kept>,
-        _latch: Option<&Arc<Latch>>,
         point: Stage,
     ) -> Result<Vec<bool>, Refusal> {
         use crate::guest::run::{Bound, OnDeviceMany, Unfit, bound, guest_lanes, prepare};
@@ -840,6 +773,112 @@ impl Plane {
     #[must_use]
     pub fn stage_runs(&self) -> (u64, u64) {
         (self.stages.runs, self.stages.lanes)
+    }
+
+    /// The outputs `instance`'s program reads from a fire: (name, the pass's
+    /// lane). An engine running guests in the interpreter feeds these.
+    #[must_use]
+    pub fn outputs_of(&self, instance: InstanceId) -> Vec<(String, u32)> {
+        self.instances.get(&instance).map_or_else(Vec::new, |seat| {
+            seat.plan
+                .outputs()
+                .into_iter()
+                .map(|(name, k)| (name.to_string(), k))
+                .collect()
+        })
+    }
+
+    /// Whether `instance`'s program reads output `name` only through
+    /// `reduce_argmax` (reshapes between allowed): its passes then answer the
+    /// same over any row with the same argmax, so the logits themselves need
+    /// not come back. Every other output it reads makes it `false`.
+    pub fn greedy_reads(&self, instance: InstanceId, name: &str) -> bool {
+        use eta_compiler::codegen::launch::ValueOrigin;
+        use eta_ir::op::tags;
+        let Some(seat) = self.instances.get(&instance) else {
+            return false;
+        };
+        let package = &seat.plan.package;
+        let mut rows: Vec<u32> = Vec::new();
+        for value in &package.values {
+            if value.source == ValueOrigin::Output {
+                if value.output.as_deref() != Some(name) {
+                    return false;
+                }
+                rows.push(value.id);
+            }
+        }
+        if rows.is_empty() {
+            return false;
+        }
+        let ops: Vec<&eta_compiler::codegen::launch::LaunchOp> =
+            package.stages.iter().flat_map(|stage| &stage.ops).collect();
+        // Follow the logits through reshapes; any other reader is a no.
+        while let Some(value) = rows.pop() {
+            if package
+                .stages
+                .iter()
+                .any(|stage| stage.puts.iter().any(|put| put.value == value))
+            {
+                return false;
+            }
+            for op in &ops {
+                if !op.reads().any(|read| read == value) {
+                    continue;
+                }
+                match op.tag {
+                    tags::REDUCE_ARGMAX => {}
+                    tags::RESHAPE => rows.push(op.result_id),
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    /// The program `instance` runs, its plan and its channels.
+    #[must_use]
+    pub fn instance_view(
+        &self,
+        instance: InstanceId,
+    ) -> Option<(ProgramId, Arc<ExecPlan>, &InterpInstance)> {
+        self.instances
+            .get(&instance)
+            .map(|seat| (seat.program, Arc::clone(&seat.plan), &seat.inst))
+    }
+
+    /// [`Plane::fire_interpreted`] with the stages run by `runner`.
+    pub fn fire_with(
+        &mut self,
+        instance: InstanceId,
+        outputs: &[(String, u32, Value)],
+        at: Stage,
+        runner: &mut dyn eta_exec::StageRunner,
+    ) -> Result<(), Refusal> {
+        let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        let inputs = PassInputs { outputs };
+        let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, runner, at);
+        let program = seat.program;
+        match outcome {
+            StepOutcome::Committed => Ok(()),
+            StepOutcome::Blocked(channel) => Err(Refusal::Program(format!(
+                "instance {instance} (program {program}) blocked on channel {channel}"
+            ))),
+            StepOutcome::Faulted(why) => Err(Refusal::Program(format!(
+                "instance {instance} (program {program}) faulted: {why}"
+            ))),
+        }
+    }
+
+    /// The plan `instance` runs.
+    #[must_use]
+    pub fn plan_of(&self, instance: InstanceId) -> Option<Arc<ExecPlan>> {
+        self.instances
+            .get(&instance)
+            .map(|seat| Arc::clone(&seat.plan))
     }
 
     #[must_use]

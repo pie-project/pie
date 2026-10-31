@@ -220,13 +220,11 @@ pub fn prepare(
     Ok(())
 }
 
-/// The most lanes one guest program carries (`PIE_CEREBRAS_GUEST_LANES`,
+/// The most lanes one guest program carries (the `guest_lanes` switch,
 /// 16 by default: a rectangle's rows, one lane each).
 #[must_use]
 pub fn guest_lanes() -> usize {
-    std::env::var("PIE_CEREBRAS_GUEST_LANES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    crate::switches::parse::<usize>("guest_lanes")
         .filter(|v| *v > 0)
         .unwrap_or(16)
 }

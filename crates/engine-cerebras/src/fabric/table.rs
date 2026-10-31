@@ -112,8 +112,14 @@ impl Program {
     /// the table carries, or a row does not fit a PE.
     pub(super) fn render_whole(&self, exports: &[Export]) -> Option<Rendered> {
         let all_phases: Vec<&Phase> = self.phases.iter().collect();
-        if all_phases.is_empty() || all_phases.iter().any(|p| p.host.is_some()) {
-            trace_fusion("whole fire refused: a host phase");
+        if all_phases.is_empty() {
+            trace_fusion("whole fire refused: no phases");
+            return None;
+        }
+        if let Some(host) = all_phases.iter().find_map(|p| p.host.as_ref()) {
+            let op = format!("{:?}", host.op);
+            let name = op.split([' ', '{']).next().unwrap_or("?");
+            trace_fusion(&format!("whole fire refused: a host phase ({name})"));
             return None;
         }
         let pes = all_phases[0].pes;
@@ -132,8 +138,13 @@ impl Program {
         }
         let texts = texts_of(&all_phases);
         let all: String = texts.concat();
-        if self.views.iter().any(|v| mentions(&all, &v.name)) {
-            trace_fusion("whole fire refused: a view");
+        if let Some(v) = self.views.iter().find(|v| mentions(&all, &v.name)) {
+            let at = all_phases
+                .iter()
+                .zip(&texts)
+                .find(|(_, t)| mentions(t, &v.name))
+                .map_or("?", |(p, _)| p.func.name.as_str());
+            trace_fusion(&format!("whole fire refused: a view ({v:?} in {at})"));
             return None;
         }
         // A buffer two lane plans lay out must be laid out alike (strided).
@@ -410,7 +421,7 @@ impl Program {
             .sum::<u64>()
             + u64::from(tables.iter().map(|t| t.ops_words).max().unwrap_or(1));
         let fixed = lines_of(kernels_cerebras::library::prelude()) + 60;
-        let forced = std::env::var("PIE_CEREBRAS_WHOLE_FIRE").is_ok_and(|v| v == "force");
+        let forced = crate::switches::get("whole_fire").is_some_and(|v| v == "force");
         for (g, row) in rows.iter().enumerate() {
             let helpers: u64 = self
                 .helpers_for(&row.body)
@@ -419,18 +430,19 @@ impl Program {
                 .sum();
             let code = TABLE_CODE_WORDS_PER_LINE * (helpers + fixed + row.kernels.len() as u64)
                 + TABLE_FIXED_WORDS;
-            if std::env::var_os("PIE_CEREBRAS_TRACE_FUSION").is_some() {
-                eprintln!(
-                    "fusion: whole fire row {g} of {h}: {} phases, {} kernels, {data} data words ({} ops), {code} code words (budget {FUSED_PE_WORDS})",
-                    row.phases,
-                    row.kernels.len(),
-                    tables[g].ops_words
-                );
-                if std::env::var_os("PIE_CEREBRAS_TRACE_ARENA").is_some() {
-                    for (n, o, w) in &tables[g].arena {
-                        eprintln!("fusion:   row {g} arena {o:>6} +{w:<6} {n}");
-                    }
-                }
+            tracing::debug!(
+                row = g,
+                rows = h,
+                phases = row.phases,
+                kernels = row.kernels.len(),
+                data,
+                ops = tables[g].ops_words,
+                code,
+                budget = FUSED_PE_WORDS,
+                "cerebras fusion: a whole-fire row"
+            );
+            for (name, offset, words) in &tables[g].arena {
+                tracing::trace!(row = g, offset, words, name, "cerebras fusion: arena");
             }
             if data + code > FUSED_PE_WORDS && !forced {
                 trace_fusion(&format!("whole fire refused: row {g} over the budget"));

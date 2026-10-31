@@ -1,0 +1,41 @@
+// serve8b's filler: the rectangle's PEs outside the grids, the head and the
+// embedding strip (the free grid slots, and rows past the head). They only
+// route the staircases that cross them (paths.csl, HEADMODE 2) and take part
+// in launches.
+param memcpy_params;
+param PX: u16;
+param PY: u16;
+param GW: u16;
+param GH: u16;
+param GS: u16;
+param NL: u16;
+param F: u16;
+param VMC: u16;
+param VMAT: u16;
+param HEADMODE: u16;
+param KVCP: u16;
+param WS: type;        // the grids' weight and KV element types (their exports)
+param KS: type;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_mod = @import_module("<layout>");
+const paths = @import_module("paths.csl", .{ .GWD = PX, .GHT = PY, .GW = GW, .GH = GH, .GS = GS, .NL = NL,
+                                             .XH = GW * PX, .F = F, .C = PY / 2, .VMC = VMC, .VMAT = VMAT,
+                                             .XE = GW * PX + PY / 2 + VMC, .EC = PY / 4 });
+
+fn init() void {
+  if (HEADMODE == 2) { paths.routes(layout_mod.get_x_coord(), layout_mod.get_y_coord()); }
+  sys_mod.unblock_cmd_stream();
+}
+
+fn compute(steps: u32, start_pos: u32) void {
+  sys_mod.unblock_cmd_stream();
+}
+
+fn copy_kv(src: u32, dst: u32, phase: u32) void { sys_mod.unblock_cmd_stream(); }
+
+comptime {
+  @export_symbol(init);
+  @export_symbol(compute);
+  if (KVCP == 1) { @export_symbol(copy_kv); }
+}

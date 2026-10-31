@@ -4,7 +4,7 @@
 //! `libsdkruntime.so`, whose only public surface is the pybind module used by
 //! `cs_python`. This module dlopens the SDK's shared libraries at runtime and
 //! calls their mangled C++ entry points directly, with the object layouts and
-//! calling conventions mirrored in [`abi`] and [`sys`]. There is no Python,
+//! calling conventions mirrored in `abi` and [`sys`]. There is no Python,
 //! no C++ shim and no build script; the crate builds on a box without the SDK.
 //!
 //! # Host setup
@@ -20,7 +20,7 @@
 //! ```
 //!
 //! No container, PRoot or environment variables are needed after that.
-//! [`Sdk::open`] looks for the libraries in `$PIE_CEREBRAS_SDK_LIB`, then
+//! [`Sdk::open`] looks for the libraries in the `sdk_lib` switch, then
 //! `/cbcore/lib`, and prepends the sibling `bin/` directory to `PATH` because
 //! the runtime shells out to helpers such as `cself_default`.
 //!
@@ -134,9 +134,9 @@ pub struct Sdk {
 }
 
 impl Sdk {
-    /// Default library directory: `$PIE_CEREBRAS_SDK_LIB` or `/cbcore/lib`.
+    /// Default library directory: the `sdk_lib` switch, or `/cbcore/lib`.
     pub fn default_lib_dir() -> PathBuf {
-        std::env::var_os("PIE_CEREBRAS_SDK_LIB")
+        crate::switches::get("sdk_lib")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/cbcore/lib"))
     }
@@ -286,6 +286,8 @@ pub struct RpcSymbol {
     pub id: u16,
     pub kind: RpcKind,
     pub ty: String,
+    /// A function's parameter count (`inputs`), 0 for variables.
+    pub inputs: usize,
 }
 
 /// The exported symbols of a compiled program, keyed by exported name.
@@ -318,12 +320,14 @@ impl Rpc {
                 other => return Err(Error::Rpc(format!("symbol {name} has kind {other:?}"))),
             };
             let ty = s["type"].as_str().unwrap_or_default().to_string();
+            let inputs = s["inputs"].as_array().map_or(0, Vec::len);
             symbols.insert(
                 name.to_string(),
                 RpcSymbol {
                     id: id as u16,
                     kind,
                     ty,
+                    inputs,
                 },
             );
         }
@@ -375,6 +379,46 @@ pub struct Runtime {
     _artifacts: Box<ArtifactsMem>,
     _platform: PlatformMem,
     running: bool,
+    /// Nonblocking calls not yet waited on, each with the host words it
+    /// reads (kept alive until its task is done).
+    pending: Vec<(Task, Vec<u32>)>,
+    /// Blocking copies and launches so far: calls, time, words.
+    pub io: IoStats,
+}
+
+/// A runtime's blocking calls by kind: how many, how long they took, how
+/// many words they moved (the per-token cost the host pays the device).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IoStats {
+    pub h2d: (u64, u64, u64),
+    pub d2h: (u64, u64, u64),
+    pub launch: (u64, u64),
+}
+
+impl IoStats {
+    fn add(slot: &mut (u64, u64, u64), t0: std::time::Instant, words: usize) {
+        slot.0 += 1;
+        slot.1 += t0.elapsed().as_nanos() as u64;
+        slot.2 += words as u64;
+    }
+}
+
+impl std::fmt::Display for IoStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ms = |ns: u64| ns as f64 / 1e6;
+        write!(
+            f,
+            "h2d {} calls {:.1} ms {} words; d2h {} calls {:.1} ms {} words; launch {} calls {:.1} ms",
+            self.h2d.0,
+            ms(self.h2d.1),
+            self.h2d.2,
+            self.d2h.0,
+            ms(self.d2h.1),
+            self.d2h.2,
+            self.launch.0,
+            ms(self.launch.1)
+        )
+    }
 }
 
 impl Runtime {
@@ -443,6 +487,8 @@ impl Runtime {
             _artifacts: artifacts,
             _platform: platform,
             running: false,
+            pending: Vec::new(),
+            io: IoStats::default(),
         })
     }
 
@@ -473,6 +519,7 @@ impl Runtime {
 
     /// Stops the program. Idempotent.
     pub fn stop(&mut self) {
+        self.wait_pending();
         if self.running {
             // SAFETY: constructed, running runtime.
             unsafe { (self.api().stop)(self.this()) }
@@ -519,6 +566,7 @@ impl Runtime {
     ) -> Result<()> {
         let id = self.rpc.id(symbol, RpcKind::Var)?;
         self.check_size(symbol, rect, elems_per_pe, data.len())?;
+        let t0 = std::time::Instant::now();
         let opts = MemcpyOptions::new(false, data_type as i32, order as i32, false);
         let mut task = Task::empty();
         // SAFETY: data outlives the blocking copy; the SDK only reads it.
@@ -537,6 +585,7 @@ impl Runtime {
             )
         };
         self.finish(&mut task);
+        IoStats::add(&mut self.io.h2d, t0, data.len());
         Ok(())
     }
 
@@ -552,6 +601,7 @@ impl Runtime {
     ) -> Result<()> {
         let id = self.rpc.id(symbol, RpcKind::Var)?;
         self.check_size(symbol, rect, elems_per_pe, out.len())?;
+        let t0 = std::time::Instant::now();
         let opts = MemcpyOptions::new(false, data_type as i32, order as i32, false);
         let mut task = Task::empty();
         // SAFETY: out outlives the blocking copy and holds exactly the words checked above.
@@ -570,12 +620,122 @@ impl Runtime {
             )
         };
         self.finish(&mut task);
+        IoStats::add(&mut self.io.d2h, t0, out.len());
         Ok(())
+    }
+
+    /// Copies row `r` of `data` (`elems_per_pe` elements a row) into the
+    /// exported variable `symbol` on every PE of row `r` of `rect`: one
+    /// copy whose data is the rectangle's height, not its area (a per-row
+    /// table every column reads).
+    pub fn memcpy_h2d_rowbcast(
+        &mut self,
+        symbol: &str,
+        data: &[u32],
+        rect: Rect,
+        elems_per_pe: usize,
+        data_type: DataType,
+    ) -> Result<()> {
+        let id = self.rpc.id(symbol, RpcKind::Var)?;
+        let expected = (rect.h.max(0) as usize) * elems_per_pe;
+        if data.len() != expected {
+            return Err(Error::Size {
+                symbol: symbol.into(),
+                expected,
+                actual: data.len(),
+            });
+        }
+        let rowbcast = self.api().memcpy_h2d_rowbcast.ok_or_else(|| {
+            Error::MissingSymbol(
+                "cerebras::SdkRuntime::memcpy_h2d_rowbcast".into(),
+                "this SDK has no row-broadcast copy (the batched builds' tables need it)".into(),
+            )
+        })?;
+        let t0 = std::time::Instant::now();
+        let opts = MemcpyOptions::new(false, data_type as i32, Order::RowMajor as i32, false);
+        let mut task = Task::empty();
+        // SAFETY: data outlives the blocking copy; the SDK only reads it.
+        unsafe {
+            (rowbcast)(
+                &mut task,
+                self.this(),
+                id,
+                data.as_ptr() as *mut c_void,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                elems_per_pe as i32,
+                &opts,
+            )
+        };
+        self.finish(&mut task);
+        IoStats::add(&mut self.io.h2d, t0, data.len());
+        Ok(())
+    }
+
+    /// Copies `data` into `symbol` like [`Runtime::memcpy_h2d`] without
+    /// waiting: the copy is queued ahead of later calls, and
+    /// [`Runtime::wait_pending`] (or any later blocking call's caller) ends it.
+    pub fn memcpy_h2d_nonblock(
+        &mut self,
+        symbol: &str,
+        data: Vec<u32>,
+        rect: Rect,
+        elems_per_pe: usize,
+        order: Order,
+        data_type: DataType,
+    ) -> Result<()> {
+        let id = self.rpc.id(symbol, RpcKind::Var)?;
+        self.check_size(symbol, rect, elems_per_pe, data.len())?;
+        let opts = MemcpyOptions::new(false, data_type as i32, order as i32, true);
+        let mut task = Task::empty();
+        // SAFETY: data moves into `pending` and lives until the task is waited on.
+        unsafe {
+            (self.api().memcpy_h2d)(
+                &mut task,
+                self.this(),
+                id,
+                data.as_ptr() as *mut c_void,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                elems_per_pe as i32,
+                &opts,
+            )
+        };
+        self.pending.push((task, data));
+        Ok(())
+    }
+
+    /// Launches `name` with `args` without waiting (see
+    /// [`Runtime::memcpy_h2d_nonblock`]).
+    pub fn launch_nonblock(&mut self, name: &str, args: &[u32]) -> Result<()> {
+        self.rpc.id(name, RpcKind::Func)?;
+        let name_s = CxxString::new(name);
+        let args = args.to_vec();
+        let vec = CxxVecU32::borrow(&args);
+        let opts = MemcpyOptions::new(false, 0, 0, true);
+        let mut task = Task::empty();
+        // SAFETY: mirrors are live for the call; the arguments stay alive in
+        // `pending` until the task is waited on.
+        unsafe { (self.api().call)(&mut task, self.this(), &*name_s, &vec, &opts) };
+        self.pending.push((task, args));
+        Ok(())
+    }
+
+    /// Waits for and releases every nonblocking call made so far.
+    pub fn wait_pending(&mut self) {
+        for (mut task, _words) in std::mem::take(&mut self.pending) {
+            self.finish(&mut task);
+        }
     }
 
     /// Launches the exported function `name` with `args` and waits for it.
     pub fn launch(&mut self, name: &str, args: &[u32]) -> Result<()> {
         self.rpc.id(name, RpcKind::Func)?;
+        let t0 = std::time::Instant::now();
         let name_s = CxxString::new(name);
         let vec = CxxVecU32::borrow(args);
         let opts = MemcpyOptions::new(false, 0, 0, false);
@@ -583,6 +743,8 @@ impl Runtime {
         // SAFETY: mirrors are live for the duration of the call.
         unsafe { (self.api().call)(&mut task, self.this(), &*name_s, &vec, &opts) };
         self.finish(&mut task);
+        self.io.launch.0 += 1;
+        self.io.launch.1 += t0.elapsed().as_nanos() as u64;
         Ok(())
     }
 }

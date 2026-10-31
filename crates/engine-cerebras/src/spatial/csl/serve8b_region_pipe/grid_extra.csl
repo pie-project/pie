@@ -1,0 +1,259 @@
+// ---------------------------------------------------------------- serve8b_region
+// (appended to qwen2d_paged8b's and qwen2d_region's pe.csl by sync.py) The
+// handoff of x (B lanes of Hc a row, lane-major) between layer units: 128 x
+// 144 grids of one layer and 256 x 240 regions of NL layers (x stays in place
+// between a region's layers). Row py of a unit holds hidden dims
+// [py Hc, (py + 1) Hc) on every column.
+//
+// Placement and chaining are the host's (serve_lib8b.WaferModel.route_table):
+// before `init` it writes each PE's `rtab`, which init applies and every pass
+// follows. The device only moves *pieces*: a piece is (color, off, n), the
+// words [off, off + n) of every lane's Hc, B x n words lane-major on the wire.
+// - A plain handoff is one piece (c, 0, Hc) in and one out.
+// - A re-chunk (a unit of another Hc) delivers a row's dims in 2-3 pieces from
+//   the rows of the unit before, each on its own path and color; the row's
+//   assembling PE takes them in turn, then multicasts the row (`relay`).
+//
+// rtab (u16, 16-bit memcpy): [nr, nrecv, nsend, relay, fwd_in, px, py,
+//   (color, rx, tx1, tx2) x RT_R, (color, off, n) x RT_I, (color, off, n) x RT_O]
+// colors by number (NONE 0xff), directions as the kernel's D_* (0 ramp, 1 N,
+// 2 S, 3 E, 4 W). Routes are read-modify-written (only the route bits change).
+// - recv pieces arrive on one color, in order; each is B lanes of n words.
+// - send entries all use one color (an output queue's color is never changed
+//   while wavelets may still sit in it); off = FWD forwards n words (pieces
+//   from another source PE, which reach this PE on fwd_in) without staging.
+// Queue 2 (free in both kernels) carries every piece. Its input color is set
+// at a receive's start (the unit is idle-waiting by then: every token passes
+// the units in order) and to fwd_in after it (a forward's pieces come after
+// this unit's layer).
+const rt = @import_module("rt.csl");
+const RT_R: u16 = S2D_RTR;
+const RT_I: u16 = 3;
+const RT_O: u16 = 3;
+const RTN: u16 = 7 + 4 * RT_R + 3 * RT_I + 3 * RT_O;
+const RNONE: u16 = 0xff;
+const FWD: u16 = 0xffff;
+const OFF_R: u16 = 7;
+const OFF_I: u16 = OFF_R + 4 * RT_R;
+const OFF_O: u16 = OFF_I + 3 * RT_I;
+var rtab = @zeros([RTN]u16);
+var rtab_ptr: [*]u16 = &rtab;
+const s2d_x1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> x[i] });
+
+// The PE's place in its unit, from the host (units need not sit on multiples
+// of their size: the regions start below the band).
+fn s2d_place() void {
+  px = rtab[5];
+  py = rtab[6];
+}
+
+fn s2d_routes() void {
+  const cc0 = color_config.get_color_config_addr(@get_color(0));
+  var k: u16 = 0;
+  while (k < rtab[0]) : (k += 1) {
+    const e = OFF_R + 4 * k;
+    const addr = cc0 + rtab[e];
+    var r = @get_config(addr, tgt.color_addr_range);
+    r = r & @get_int(tgt.fabric_io.CLEAR_MASK);
+    r = r | rxw(rtab[e + 1]) | txw(rtab[e + 2]) | txw(rtab[e + 3]);
+    @set_config(addr, r, tgt.color_addr_range);
+  }
+}
+
+// Lane b's words [off, off + n) of x.
+fn s2d_lane(b: u16, off: u16, n: u16) mem1d_dsd {
+  return @set_dsd_length(@increment_dsd_offset(s2d_x1, @as(i16, b * Hc + off), f32), n);
+}
+
+// serve8b_region_pipe (ps1's simulator fatal "OUT_Q[2] must be empty during
+// config"): with micro-batches back to back, a send's last wavelets can still
+// sit in output queue 2 (the next stage busy) when the next pass reconfigures
+// its color (a relay PE's multicast color differs from its send color). Wait
+// for the queue to drain before every reconfiguration.
+fn s2d_oq2(c: u16) void {
+  while ((tile_config.output_queue_status.get_raw() & 0x0400) == 0) {}   // queue 2 empty (empty mask in the high byte)
+  rt.oq_color(2, c);
+}
+fn recv_x() void {
+  if (rtab[1] > 0) { rt.iq_color(2, rtab[OFF_I]); }
+  var k: u16 = 0;
+  while (k < rtab[1]) : (k += 1) {
+    const e = OFF_I + 3 * k;
+    var b: u16 = 0;
+    while (b < B) : (b += 1) { @fmovs(s2d_lane(b, rtab[e + 1], rtab[e + 2]), fin(q_gb_in, rtab[e + 2])); }
+  }
+  if (rtab[3] != RNONE) {
+    // The row's assembling PE multicasts the whole row on.
+    s2d_oq2(rtab[3]);
+    @fmovs(fout(q_gb_out, S2D_XN), x_all);
+  }
+  if (rtab[4] != RNONE) { rt.iq_color(2, rtab[4]); }
+}
+
+// serve8b_region_pipe: rtab[2] bit 8 (host-set on the last unit's PEs that
+// send x to the head) appends the micro-batch index as one word after the
+// pieces; the head's feeder checks it against its own count (perr).
+var s2d_m: u16 = 0;
+var s2d_mw = @zeros([1]f32);
+const s2d_mw_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> s2d_mw[i] });
+fn send_x() void {
+  const ns = rtab[2] & 0xff;
+  if (ns > 0) { s2d_oq2(rtab[OFF_O]); }
+  var k: u16 = 0;
+  while (k < ns) : (k += 1) {
+    const e = OFF_O + 3 * k;
+    const n = rtab[e + 2];
+    if (rtab[e + 1] == FWD) {
+      @fmovs(fout(q_gb_out, n), fin(q_gb_in, n));
+    } else {
+      var b: u16 = 0;
+      while (b < B) : (b += 1) { @fmovs(fout(q_gb_out, n), s2d_lane(b, rtab[e + 1], n)); }
+    }
+  }
+  if (S2D_PIPE == 1 and (rtab[2] & 0x100) != 0) {
+    s2d_mw[0] = @as(f32, s2d_m);
+    @fmovs(fout(q_gb_out, 1), s2d_mw_dsd);
+  }
+}
+
+// `steps` passes, each through this unit once: x in from the unit before
+// (layer 0: the host's or the embedding strip's), the unit's layer(s), x out.
+// start_pos is unused (positions come from `tab`). S2D_TIME 1 (PROF 0): prof[0]
+// sums the passes' cycles after the first (~0.3 KB of code, off by default).
+// S2D_NOLAYER 1 (checking the handoffs alone): x passes every unit unchanged.
+// serve8b_region_pipe: S2D_PIPE 1 runs nmb micro-batches (start_pos) round
+// the ring for `steps` laps: pass p is micro-batch m = p % nmb of lap p / nmb
+// (the ring keeps their order). A micro-batch's table lives here, in
+// mtab[m] (host-written before the launch); each pass loads it into the
+// kernel's tab, advances it a lap (the kernel's own prologue), and stores it.
+var s2d_mtab = @zeros([if (S2D_PIPE == 1) S2D_MMAX * NTAB else 1]u32);
+var s2d_mtab_ptr: [*]u32 = &s2d_mtab;
+fn s2d_tab_io(m: u16, load: bool) void {
+  var k: u16 = 0;
+  var o: u16 = 0;
+  var j: u16 = 0;
+  while (j < m) : (j += 1) { o += NTAB; }
+  while (k < NTAB) : (k += 1) {
+    if (load) { tab[k] = s2d_mtab[o + k]; } else { s2d_mtab[o + k] = tab[k]; }
+  }
+}
+fn compute(steps: u32, start_pos: u32) void {
+  if (S2D_TIME == 1) { timestamp.enable_tsc(); }
+  const nmb: u32 = if (S2D_PIPE == 1) start_pos else 1;
+  // serve8b_region_pipe probe: this PE's output-queue status at the launch's
+  // start (high byte: the empty mask; a launch that left wavelets behind shows
+  // a 0 bit here at the next launch). The host reads it via prof[14].
+  prof[14] = @as(u32, tile_config.output_queue_status.get_raw());
+  // (counters, not % and /: no integer division in the PE's code)
+  var i: u32 = 0;
+  var m: u16 = 0;
+  var lap: u32 = 0;
+  while (i < steps * nmb) : (i += 1) {
+    s2d_m = m;
+    if (S2D_PIPE == 1) { s2d_tab_io(m, true); }
+    s2d_pass_start(lap, start_pos);   // the kernel's per-pass prologue (sync.py)
+    recv_x();
+    if (S2D_TIME == 1) {
+      timing = i > 0;
+      pass_start();
+      timestamp.get_timestamp(&t_mark);
+    }
+    if (S2D_NOLAYER == 0) { s2d_layers(); }   // the kernel's layer(s) (sync.py)
+    if (S2D_TIME == 1) { pass_end(); }
+    send_x();
+    if (S2D_PIPE == 1) { s2d_tab_io(m, false); }
+    m += 1;
+    if (@as(u32, m) == nmb) { m = 0; lap += 1; }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+// KV page staging (Fork 4's kv-staging-interface.md; KVST slots, 0: none):
+// page_stage(page, slot) copies pool page `page`'s block (row page % PY,
+// block page / PY) of kc / vc, every layer of the unit, into slot `slot` of
+// kstage / vstage; page_unstage copies it back. Local copies only (no
+// fabric): every unit runs them in one launch, between launches. A slot is
+// [S2D_KL layers][Dc · PS] in kc's (and vc's) own block order; slots back to
+// back, no pad.
+const S2D_STAGE_TASK: u16 = 10;    // a local task id free in the kernel and memcpy
+const S2D_KN: u16 = Dc * PS;                 // a page's cells a layer
+const S2D_KCN: u16 = NB * Dc * PS;           // a layer's cells a PE
+const S2D_SN: u16 = if (KVST > 0) KVST * S2D_KL * S2D_KN else 1;
+var kstage = @zeros([S2D_SN]KS);
+var kstage_ptr: [*]KS = &kstage;
+var vstage = @zeros([S2D_SN]KS);
+var vstage_ptr: [*]KS = &vstage;
+// The copies: 16-bit moves (bit for bit) on DSDs rebased at run time.
+var s2d_u16 = @zeros([1]u16);
+const s2d_d16 = @get_dsd(mem1d_dsd, .{ .base_address = &s2d_u16, .extent = S2D_KN });
+comptime {
+  if (KVST > 0) { @comptime_assert(KV16 == 1); }
+}
+// One copy of the code for both launches: they record their arguments and
+// activate a local task (an exported function's body is inlined into
+// memcpy's dispatcher, once a launch).
+var s2d_pg: u32 = 0;
+var s2d_sl: u32 = 0;
+var s2d_back: bool = false;
+const s2d_task_id: local_task_id = @get_local_task_id(S2D_STAGE_TASK);
+task s2d_task() void { s2d_stage(s2d_pg, s2d_sl, s2d_back); }
+comptime {
+  if (KVST > 0) { @bind_local_task(s2d_task, s2d_task_id); }
+}
+fn s2d_stage(page: u32, slot: u32, back: bool) void {
+  // row page % PY, block page / PY, the slot's offset: by additions (no
+  // integer multiply or divide in the PE's code)
+  var r = @as(u16, page);
+  var src: u16 = 1;
+  while (r >= PY) : (r -= PY) { src += S2D_KN; }
+  if (KVST > 0 and py == r) {
+    var dst: u16 = 0;
+    if (KVST > 1) {
+      var k: u16 = 0;
+      while (k < @as(u16, slot)) : (k += 1) { dst += S2D_KL * S2D_KN; }
+    }
+    const kst: [*]u16 = @ptrcast([*]u16, &kstage);
+    const vst: [*]u16 = @ptrcast([*]u16, &vstage);
+    const kcp = @ptrcast([*]u16, &kc);
+    const vcp = @ptrcast([*]u16, &vc);
+    var l: u16 = 0;
+    while (l < S2D_KL) : (l += 1) {
+      var ka = @ptrcast([*]u16, &kst[dst]);
+      var kb = @ptrcast([*]u16, &kcp[src]);
+      var va = @ptrcast([*]u16, &vst[dst]);
+      var vb = @ptrcast([*]u16, &vcp[src]);
+      if (back) {
+        const t = ka; ka = kb; kb = t;
+        const u = va; va = vb; vb = u;
+      }
+      @mov16(@set_dsd_base_addr(s2d_d16, ka), @set_dsd_base_addr(s2d_d16, kb));
+      @mov16(@set_dsd_base_addr(s2d_d16, va), @set_dsd_base_addr(s2d_d16, vb));
+      src += S2D_KCN;
+      dst += S2D_KN;
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn page_stage(page: u32, slot: u32) void {
+  s2d_pg = page;
+  s2d_sl = slot;
+  s2d_back = false;
+  @activate(s2d_task_id);
+}
+fn page_unstage(page: u32, slot: u32) void {
+  s2d_pg = page;
+  s2d_sl = slot;
+  s2d_back = true;
+  @activate(s2d_task_id);
+}
+
+comptime {
+  @export_symbol(rtab_ptr, "rtab");
+  @export_symbol(s2d_mtab_ptr, "mtab");
+  if (KVST > 0) {
+    @export_symbol(kstage_ptr, "kstage");
+    @export_symbol(vstage_ptr, "vstage");
+    @export_symbol(page_stage);
+    @export_symbol(page_unstage);
+  }
+}

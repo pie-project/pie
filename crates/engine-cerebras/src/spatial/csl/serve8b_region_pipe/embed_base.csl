@@ -1,0 +1,172 @@
+// serve8b's embedding strip: model.embed_tokens (untied from the head's
+// lm_head) on EC = PY / 4 columns east of the head, HH + 1 rows with the
+// feeder row F in the middle (as the head). Region PE (strip column of group
+// c, region row ry) holds hidden dims [c He, (c + 1) He) (He = 4 Hc: grid
+// chunks 4c .. 4c + 3) of vocab rows [ry Ve, (ry + 1) Ve), row-major bf16, two
+// to a u32 word (`etab`). Group c's column is XE + EC - 1 - c (paths.csl).
+// A lane step:
+// - every strip PE takes the winner index the head multicasts (c_ib, from the
+//   west along its row);
+// - the PEs of the winner's region row each send their He dims (bf16 widened
+//   to f32) along their column to the collector at row F (C_EI: pass-through
+//   routes toward F; the sending PE switches its own to inject and back at
+//   the next index, a head step later, when its wavelets are long gone);
+// - the collector keeps the lane's He words; after the iteration's last lane
+//   it sends chunk 4c + k ([B][Hc], lane-major) north on C_E[k] to layer 0's
+//   row 4c + k (the E staircase).
+// The head runs steps + 1 iterations (the last one's tokens go nowhere): the
+// strip takes every index and sends iterations 0 .. steps - 1's on.
+param memcpy_params;
+param PX: u16;         // the grids' width, height, hidden dims a row
+param PY: u16;
+param Hc: u16;
+param XH0: u16;        // the head's first column
+param XL: u16;         // the last layer's grid corner
+param YL: u16;
+param F: u16;          // the feeder row (HH / 2)
+param VMC: u16;        // the head's VM column, at chunk column VMAT
+param VMAT: u16;
+param Ve: u16;         // vocab rows a region PE (the head's Vr)
+param vocab: u32;
+param B: u16;          // lanes a pass
+param KVCP: u16;
+param S2D_PIPE: u16 = 0;   // serve8b_region_pipe
+param HROUTE: u16;     // the layout's HROUTE (the dummies' exports)
+param XV: u16;         // the VM block's first column (0: none) and the final root's (paths.csl)
+param RCX: u16;
+param WS: type;        // the grids' weight and KV element types (their exports)
+param KS: type;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_mod = @import_module("<layout>");
+const rt = @import_module("rt.csl");
+const EC: u16 = PY / 4;
+const He: u16 = 4 * Hc;
+const XE: u16 = XH0 + PY / 2 + VMC;
+const paths = @import_module("paths.csl", .{ .GWD = PX, .GHT = PY, .XL = XL, .YL = YL, .XH = XH0, .F = F,
+                                             .C = PY / 2, .VMC = VMC, .VMAT = VMAT, .XE = XE, .EC = EC,
+                                             .XV = XV, .RCX = RCX });
+const C_IB: color = @get_color(10);   // head2d's winner multicast (c_ib)
+const C_EI: color = @get_color(11);   // a strip column, to its collector
+
+const q_e0 = @get_output_queue(2);
+const q_e1 = @get_output_queue(3);
+const q_e2 = @get_output_queue(4);
+const q_e3 = @get_output_queue(5);
+const q_ei_in = @get_input_queue(6);
+const q_ei_out = @get_output_queue(6);
+const q_ib = @get_input_queue(7);
+
+fn fout(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fin(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+
+var etab = @zeros([Ve * He / 2]u32);
+var etab_ptr: [*]u32 = &etab;
+// A row's He dims as f32 (bf16 in the high halves; the low halves stay 0).
+var emb = @zeros([He]f32);
+const emb_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{He} -> emb[i] });
+// The collector's lanes [B][He].
+var eb = @zeros([B * He]f32);
+const eb_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{He} -> eb[i] });
+const ebk_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> eb[i] });
+var ib = @zeros([1]f32);
+const ib_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> ib[i] });
+var u16one = @zeros([1]u16);
+var src16 = @get_dsd(mem1d_dsd, .{ .base_address = &u16one, .extent = He });   // etab as u16 (init)
+var dst16 = @get_dsd(mem1d_dsd, .{ .base_address = &u16one, .extent = He });   // emb's high halves (init)
+
+var collector: bool = false;
+var above: bool = false;
+var base: u32 = 0;
+var nvalid: u32 = 0;
+var injected: bool = false;
+
+fn pass_route() void {
+  if (above) { rt.route(C_EI, rt.RX_N, rt.TX_S); } else { rt.route(C_EI, rt.RX_S, rt.TX_N); }
+}
+
+fn init() void {
+  const gx = layout_mod.get_x_coord();
+  const gy = layout_mod.get_y_coord();
+  collector = gy == F;
+  above = gy < F;
+  const ry = if (gy > F) gy - 1 else gy;
+  base = @as(u32, ry) * @as(u32, Ve);
+  nvalid = if (collector or base >= vocab) 0 else if (vocab - base >= @as(u32, Ve)) @as(u32, Ve) else vocab - base;
+  src16 = @set_dsd_base_addr(src16, @ptrcast([*]u16, &etab));
+  dst16 = @set_dsd_stride(@set_dsd_base_addr(dst16, @ptrcast([*]u16, &emb)), 2);
+  dst16 = @increment_dsd_offset(dst16, 1, u16);
+  paths.routes(gx, gy);
+  if (gx == XE + EC - 1) { rt.route(C_IB, rt.RX_W, rt.TX_R); }
+  else { rt.route(C_IB, rt.RX_W, rt.TX_R | rt.TX_E); }
+  if (!collector) { pass_route(); }
+  sys_mod.unblock_cmd_stream();
+}
+
+fn send_chunk(comptime q: output_queue, k: u16) void {
+  var b: u16 = 0;
+  while (b < B) : (b += 1) {
+    @fmovs(fout(q, Hc), @increment_dsd_offset(ebk_dsd, @as(i16, b * He + k * Hc), f32));
+  }
+}
+
+fn compute(steps: u32, start_pos: u32) void {
+  // serve8b_region_pipe: nmb micro-batches (start_pos) a lap, in ring order.
+  const nmb: u32 = if (S2D_PIPE == 1) start_pos else 1;
+  var i: u32 = 0;
+  while (i <= steps) : (i += 1) {
+   var m: u32 = 0;
+   while (m < nmb) : (m += 1) {
+    var b: u16 = 0;
+    while (b < B) : (b += 1) {
+      @fmovs(ib_dsd, fin(q_ib, 1));
+      if (injected) {
+        pass_route();
+        injected = false;
+      }
+      if (i < steps) {
+        const v = @as(u32, ib[0]);
+        if (collector) {
+          // The winner's region row is above or below this row.
+          if (v / @as(u32, Ve) < @as(u32, F)) { rt.route(C_EI, rt.RX_N, rt.TX_R); }
+          else { rt.route(C_EI, rt.RX_S, rt.TX_R); }
+          @fmovs(@increment_dsd_offset(eb_dsd, @as(i16, b * He), f32), fin(q_ei_in, He));
+        } else if (v >= base and v < base + nvalid) {
+          const j = @as(u16, v - base);
+          @mov16(dst16, @increment_dsd_offset(src16, @as(i16, j * He), u16));
+          if (above) { rt.route(C_EI, rt.RX_R, rt.TX_S); } else { rt.route(C_EI, rt.RX_R, rt.TX_N); }
+          injected = true;
+          @fmovs(fout(q_ei_out, He), emb_dsd);
+        }
+      }
+    }
+    if (collector and i < steps) {
+      send_chunk(q_e0, 0);
+      send_chunk(q_e1, 1);
+      send_chunk(q_e2, 2);
+      send_chunk(q_e3, 3);
+    }
+   }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+fn copy_kv(src: u32, dst: u32, phase: u32) void { sys_mod.unblock_cmd_stream(); }
+
+comptime {
+  @initialize_queue(q_e0, .{ .color = paths.C_E0 });
+  @initialize_queue(q_e1, .{ .color = paths.C_E1 });
+  @initialize_queue(q_e2, .{ .color = paths.C_E2 });
+  @initialize_queue(q_e3, .{ .color = paths.C_E3 });
+  @initialize_queue(q_ei_in, .{ .color = C_EI });
+  @initialize_queue(q_ei_out, .{ .color = C_EI });
+  @initialize_queue(q_ib, .{ .color = C_IB });
+  @export_symbol(etab_ptr, "etab");
+  @export_symbol(init);
+  @export_symbol(compute);
+  if (KVCP == 1) { @export_symbol(copy_kv); }
+}

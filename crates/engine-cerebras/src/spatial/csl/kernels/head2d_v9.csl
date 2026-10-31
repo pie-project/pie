@@ -1,0 +1,1040 @@
+// The LM head (see layout.csl). Row F feeds: its PEs hold the final hidden
+// state's chunks, apply the norm weights and multicast them up and down their
+// columns. A region PE computes Vr partial logits over its Hc dims; a
+// two-phase grouped reduction (WaferLLM comm_pe.csl) sums each block's row of
+// PEs into the block's root column, which takes its rows' argmax and reduces
+// (value, index) pairs down both halves of the column into the feeder row;
+// the blocks' feeder PEs reduce theirs along the feeder row (two-phase, in
+// groups of Gb blocks) into block BM's, which multicasts the winning index to
+// every PE. The PEs holding the
+// winner's row copy its embedding (tied weights) out.
+// The final RMSNorm's 1/rms scales every logit alike, so the argmax skips
+// it; `y` at the root column holds the logits before that scale.
+// Every step is synchronous: blocking fabric ops, no tasks.
+param memcpy_params;
+param W: u16;
+param H: u16;
+param F: u16;          // the feeder's fabric row (H / 2)
+param C: u16;
+param Hc: u16;
+param Vr: u16;
+param Gx: u16;
+param Gy: u16;
+param Gb: u16;
+param vocab: u32;
+param PASSES: u16;
+param UNTIED: u16;
+param CERT: u16;
+param MODE: u16;
+param OVL: u16;
+param VMC: u16;
+param WF32: u16;
+param c_r1_0: color;
+param c_r1_1: color;
+param c_r2_0: color;
+param c_r2_1: color;
+param c_x: color;
+param c_ib: color;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_mod = @import_module("<layout>");
+const timestamp = @import_module("<time>");
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+
+const ONEPASS: bool = MODE != 0;        // round 1 from bf16(x) alone
+const CERTIFY: bool = MODE == 1 or MODE == 3;
+const NB: u16 = W / (C + VMC);          // vocab blocks
+const R1X: u16 = Gx / 2;
+const NGX: u16 = C / Gx;
+const R2X: u16 = (NGX / 2) * Gx + R1X;   // a block's root column (in the block)
+const CB: u16 = C + VMC;                 // fabric columns a block (VMC: the VM column at R2X + 1)
+comptime {
+  // The VM column must be interior to its block (never a row's last column):
+  // the winner tree and the row chains pass through it.
+  if (VMC == 1) { @comptime_assert(R2X + 1 < C); }
+}
+const R1B: u16 = Gb / 2;
+const NGB: u16 = NB / Gb;
+const BM: u16 = (NGB / 2) * Gb + R1B;    // the block whose root wins last
+const RC: u16 = BM * CB + R2X;           // the final root's column (feeder row)
+const R1Y: u16 = Gy / 2;
+const NGH: u16 = F / Gy;                 // groups in each half of a root column
+const NEG: f32 = -1.0e30;
+
+// Vr padded to a power of two for the max by halving.
+const VP: u16 = if (Vr <= 32) 32 else if (Vr <= 64) 64 else if (Vr <= 128) 128
+  else if (Vr <= 256) 256 else if (Vr <= 512) 512 else 1024;
+
+const q_x_in = @get_input_queue(2);
+const q_x_out = @get_output_queue(2);
+const q_r1_0_in = @get_input_queue(3);
+const q_r1_0_out = @get_output_queue(3);
+const q_r1_1_in = @get_input_queue(4);
+const q_r1_1_out = @get_output_queue(4);
+const q_r2_0_in = @get_input_queue(5);
+const q_r2_0_out = @get_output_queue(5);
+const q_r2_1_in = @get_input_queue(6);
+const q_r2_1_out = @get_output_queue(6);
+const q_ib_in = @get_input_queue(7);
+const q_ib_out = @get_output_queue(7);
+
+fn fout(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fin(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+
+// Re-binding a queue to another color at runtime (empty queue): the VM
+// contract's colors 2 (logits east) and 3 (token in) ride queue 2, which is
+// bound to c_x but idle on root PEs (out) and on the feeder row (in).
+const C_VL: u16 = 2;    // root PE -> VM PE: y[Vr], yscale
+const C_VT: u16 = 3;    // VM PE -> final root: the sampled token
+const c_vl = @get_color(2);
+const c_vt = @get_color(3);
+fn iq_color(comptime qid: u16, c: u16) void {
+  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
+  var v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
+  v = (v & 0xffe0) | c;
+  @set_config(addr, v, tile_config.input_queue_config.in_queue_addr_range);
+}
+fn oq_color(comptime qid: u16, c: u16) void {
+  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
+  var v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
+  v = (v & 0xfe0f) | (c << 4);
+  @set_config(addr, v, tile_config.output_queue_config.out_queue_addr_range);
+}
+
+var px: u16 = 0;
+var py: u16 = 0;
+var ry: u16 = 0;          // region row
+var blk: u16 = 0;         // vocab block
+var col: u16 = 0;         // column in the block
+var root_col: bool = false;
+var vm: bool = false;      // a VM column PE (VMC)
+var upper: bool = false;  // region row above the feeder
+var kk: u16 = 0;          // row in its half, counted from the half's far end
+var nvalid: u16 = 0;      // this PE's real vocab rows
+var base: u32 = 0;        // this PE's first vocab row
+
+// ---------------------------------------------------------------- routes
+// Two-phase grouped reduction along an axis of length L in groups of G
+// (WaferLLM comm_pe.csl): phase 1 chains each group from both ends into its
+// root R1, phase 2 chains the group roots into R2. Colors alternate by parity.
+fn route_phase1(comptime HEAD: direction, comptime TAIL: direction, comptime R1: u16, r: u16) void {
+  if (r == R1) {
+    if (r % 2 == 0) {
+      color_config.reset_routes(c_r1_0, .{ .rx = HEAD, .tx = RAMP });
+      color_config.reset_routes(c_r1_1, .{ .rx = TAIL, .tx = RAMP });
+    } else {
+      color_config.reset_routes(c_r1_1, .{ .rx = HEAD, .tx = RAMP });
+      color_config.reset_routes(c_r1_0, .{ .rx = TAIL, .tx = RAMP });
+    }
+  } else if (r < R1) {
+    if (r % 2 == 0) {
+      color_config.reset_routes(c_r1_0, .{ .rx = HEAD, .tx = RAMP });
+      color_config.reset_routes(c_r1_1, .{ .rx = RAMP, .tx = TAIL });
+    } else {
+      color_config.reset_routes(c_r1_1, .{ .rx = HEAD, .tx = RAMP });
+      color_config.reset_routes(c_r1_0, .{ .rx = RAMP, .tx = TAIL });
+    }
+  } else {
+    if (r % 2 == 0) {
+      color_config.reset_routes(c_r1_1, .{ .rx = TAIL, .tx = RAMP });
+      color_config.reset_routes(c_r1_0, .{ .rx = RAMP, .tx = HEAD });
+    } else {
+      color_config.reset_routes(c_r1_0, .{ .rx = TAIL, .tx = RAMP });
+      color_config.reset_routes(c_r1_1, .{ .rx = RAMP, .tx = HEAD });
+    }
+  }
+}
+
+fn route_phase2(comptime HEAD: direction, comptime TAIL: direction, comptime G: u16,
+                comptime R1: u16, comptime R2: u16, id: u16) void {
+  const qt = id / G;
+  const r = id % G;
+  if (id == R2) {
+    if (qt % 2 == 0) {
+      color_config.reset_routes(c_r2_0, .{ .rx = HEAD, .tx = RAMP });
+      color_config.reset_routes(c_r2_1, .{ .rx = TAIL, .tx = RAMP });
+    } else {
+      color_config.reset_routes(c_r2_1, .{ .rx = HEAD, .tx = RAMP });
+      color_config.reset_routes(c_r2_0, .{ .rx = TAIL, .tx = RAMP });
+    }
+  } else if (id < R2) {
+    if (r == R1) {
+      if (qt % 2 == 0) {
+        color_config.reset_routes(c_r2_0, .{ .rx = HEAD, .tx = RAMP });
+        color_config.reset_routes(c_r2_1, .{ .rx = RAMP, .tx = TAIL });
+      } else {
+        color_config.reset_routes(c_r2_1, .{ .rx = HEAD, .tx = RAMP });
+        color_config.reset_routes(c_r2_0, .{ .rx = RAMP, .tx = TAIL });
+      }
+    } else {
+      color_config.reset_routes(c_r2_0, .{ .rx = HEAD, .tx = TAIL });
+      color_config.reset_routes(c_r2_1, .{ .rx = HEAD, .tx = TAIL });
+    }
+  } else {
+    if (r == R1) {
+      if (qt % 2 == 0) {
+        color_config.reset_routes(c_r2_1, .{ .rx = TAIL, .tx = RAMP });
+        color_config.reset_routes(c_r2_0, .{ .rx = RAMP, .tx = HEAD });
+      } else {
+        color_config.reset_routes(c_r2_0, .{ .rx = TAIL, .tx = RAMP });
+        color_config.reset_routes(c_r2_1, .{ .rx = RAMP, .tx = HEAD });
+      }
+    } else {
+      color_config.reset_routes(c_r2_0, .{ .rx = TAIL, .tx = HEAD });
+      color_config.reset_routes(c_r2_1, .{ .rx = TAIL, .tx = HEAD });
+    }
+  }
+}
+
+fn routes_x() void {
+  route_phase1(WEST, EAST, R1X, col % Gx);
+  if (NGX > 1) { route_phase2(WEST, EAST, Gx, R1X, R2X, col); }
+}
+
+// Down a root column, each half on its own: phase 1 within groups of Gy
+// (two-sided into R1Y), phase 2 one-sided from the group roots toward the
+// feeder: the upper half's flow south, the lower half's north, so the feeder
+// PE takes one pair from each side. kk counts rows from the half's far end
+// (upper: ry; lower: H - 1 - ry) and g groups from there; group g's root
+// sends toward the feeder on channel cu(g) = g % 2 (upper) or cl(g) =
+// 1 - g % 2 (lower), so the two reaching the feeder differ. Channels are
+// integer codes (0: r2_0, 1: r2_1, 2: r1_0, 3: r1_1) mapped to colors and
+// queues by comptime branches.
+fn cu(g: u16) u16 { return g % 2; }
+fn cl(g: u16) u16 { return 1 - g % 2; }
+fn set_route(k: u16, comptime rx: direction, comptime tx: direction) void {
+  if (k == 0) { color_config.reset_routes(c_r2_0, .{ .rx = rx, .tx = tx }); }
+  else if (k == 1) { color_config.reset_routes(c_r2_1, .{ .rx = rx, .tx = tx }); }
+  else if (k == 2) { color_config.reset_routes(c_r1_0, .{ .rx = rx, .tx = tx }); }
+  else { color_config.reset_routes(c_r1_1, .{ .rx = rx, .tx = tx }); }
+}
+fn routes_y() void {
+  const r = kk % Gy;
+  const g = kk / Gy;
+  if (upper) {
+    route_phase1(NORTH, SOUTH, R1Y, r);
+    if (r == R1Y) {
+      if (g > 0) { set_route(cu(g - 1), NORTH, RAMP); }
+      set_route(cu(g), RAMP, SOUTH);
+    } else {
+      color_config.reset_routes(c_r2_0, .{ .rx = NORTH, .tx = SOUTH });
+      color_config.reset_routes(c_r2_1, .{ .rx = NORTH, .tx = SOUTH });
+    }
+  } else {
+    route_phase1(SOUTH, NORTH, R1Y, r);
+    if (r == R1Y) {
+      if (g > 0) { set_route(cl(g - 1), SOUTH, RAMP); }
+      set_route(cl(g), RAMP, NORTH);
+    } else {
+      color_config.reset_routes(c_r2_0, .{ .rx = SOUTH, .tx = NORTH });
+      color_config.reset_routes(c_r2_1, .{ .rx = SOUTH, .tx = NORTH });
+    }
+  }
+}
+
+// The hidden chunk: up and down each column from the feeder row.
+fn route_x() void {
+  if (py == F) {
+    color_config.reset_routes(c_x, .{ .rx = RAMP, .tx = [2]direction{ NORTH, SOUTH } });
+  } else if (py == 0) {
+    color_config.reset_routes(c_x, .{ .rx = SOUTH, .tx = RAMP });
+  } else if (py == H) {
+    color_config.reset_routes(c_x, .{ .rx = NORTH, .tx = RAMP });
+  } else if (py < F) {
+    color_config.reset_routes(c_x, .{ .rx = SOUTH, .tx = [2]direction{ RAMP, NORTH } });
+  } else {
+    color_config.reset_routes(c_x, .{ .rx = NORTH, .tx = [2]direction{ RAMP, SOUTH } });
+  }
+}
+
+// The feeder row. A block's feeder PE (column R2X of the block) takes its
+// column's pair from each side on r2 (the halves' last channels), then the
+// blocks' pairs reduce along the row: phase 1 on r1 within groups of Gb
+// blocks (route_phase1 over block ids), phase 2 on r2 among the group roots
+// into block BM (route_phase2). r2 serves the column takes and the row's
+// phase 2 in turn: a block's feeder PE switches it after its takes and back
+// after the winner (the two use disjoint directions, so a pair that arrives
+// early waits). Feeder PEs between two block roots pass those channels on.
+fn routes_feeder_y() void {
+  set_route(cu(NGH - 1), NORTH, RAMP);
+  set_route(cl(NGH - 1), SOUTH, RAMP);
+}
+fn routes_feeder_x2() void {
+  if (NGB > 1) { route_phase2(WEST, EAST, Gb, R1B, BM, blk); }
+}
+fn route_feeder() void {
+  if (col == R2X and !vm) {
+    route_phase1(WEST, EAST, R1B, blk % Gb);
+    routes_feeder_y();
+  } else if (px > R2X and px < (NB - 1) * CB + R2X) {
+    // Between the roots of blocks bl and bl + 1 (VM column PEs too).
+    const bl = (px - R2X) / CB;
+    if (bl / Gb == (bl + 1) / Gb) {
+      const r = bl % Gb;
+      if (r + 1 <= R1B) {
+        // r sends east to r + 1: r1_1 from an even r, r1_0 from an odd one.
+        if (r % 2 == 0) { set_route(3, WEST, EAST); } else { set_route(2, WEST, EAST); }
+      } else {
+        // r + 1 sends west to r: r1_0 from an even r + 1, r1_1 from an odd one.
+        if ((r + 1) % 2 == 0) { set_route(2, EAST, WEST); } else { set_route(3, EAST, WEST); }
+      }
+    }
+    if (px < RC) { set_route(0, WEST, EAST); set_route(1, WEST, EAST); }
+    else { set_route(0, EAST, WEST); set_route(1, EAST, WEST); }
+  }
+}
+
+// The winning index: from the final root (feeder row, column RC) a spine up
+// and down column RC, and from the spine along every fabric row.
+fn route_ib() void {
+  const top = py == 0;
+  const bottom = py == H;
+  const west = RC > 0;
+  const east = RC < W - 1;
+  if (px == RC) {
+    if (py == F) {
+      if (west and east) { color_config.reset_routes(c_ib, .{ .rx = RAMP, .tx = [4]direction{ NORTH, SOUTH, EAST, WEST } }); }
+      else if (east) { color_config.reset_routes(c_ib, .{ .rx = RAMP, .tx = [3]direction{ NORTH, SOUTH, EAST } }); }
+      else if (west) { color_config.reset_routes(c_ib, .{ .rx = RAMP, .tx = [3]direction{ NORTH, SOUTH, WEST } }); }
+      else { color_config.reset_routes(c_ib, .{ .rx = RAMP, .tx = [2]direction{ NORTH, SOUTH } }); }
+    } else if (py < F) {
+      if (top) {
+        if (west and east) { color_config.reset_routes(c_ib, .{ .rx = SOUTH, .tx = [3]direction{ EAST, WEST, RAMP } }); }
+        else if (east) { color_config.reset_routes(c_ib, .{ .rx = SOUTH, .tx = [2]direction{ EAST, RAMP } }); }
+        else if (west) { color_config.reset_routes(c_ib, .{ .rx = SOUTH, .tx = [2]direction{ WEST, RAMP } }); }
+        else { color_config.reset_routes(c_ib, .{ .rx = SOUTH, .tx = RAMP }); }
+      } else {
+        if (west and east) { color_config.reset_routes(c_ib, .{ .rx = SOUTH, .tx = [4]direction{ NORTH, EAST, WEST, RAMP } }); }
+        else if (east) { color_config.reset_routes(c_ib, .{ .rx = SOUTH, .tx = [3]direction{ NORTH, EAST, RAMP } }); }
+        else if (west) { color_config.reset_routes(c_ib, .{ .rx = SOUTH, .tx = [3]direction{ NORTH, WEST, RAMP } }); }
+        else { color_config.reset_routes(c_ib, .{ .rx = SOUTH, .tx = [2]direction{ NORTH, RAMP } }); }
+      }
+    } else {
+      if (bottom) {
+        if (west and east) { color_config.reset_routes(c_ib, .{ .rx = NORTH, .tx = [3]direction{ EAST, WEST, RAMP } }); }
+        else if (east) { color_config.reset_routes(c_ib, .{ .rx = NORTH, .tx = [2]direction{ EAST, RAMP } }); }
+        else if (west) { color_config.reset_routes(c_ib, .{ .rx = NORTH, .tx = [2]direction{ WEST, RAMP } }); }
+        else { color_config.reset_routes(c_ib, .{ .rx = NORTH, .tx = RAMP }); }
+      } else {
+        if (west and east) { color_config.reset_routes(c_ib, .{ .rx = NORTH, .tx = [4]direction{ SOUTH, EAST, WEST, RAMP } }); }
+        else if (east) { color_config.reset_routes(c_ib, .{ .rx = NORTH, .tx = [3]direction{ SOUTH, EAST, RAMP } }); }
+        else if (west) { color_config.reset_routes(c_ib, .{ .rx = NORTH, .tx = [3]direction{ SOUTH, WEST, RAMP } }); }
+        else { color_config.reset_routes(c_ib, .{ .rx = NORTH, .tx = [2]direction{ SOUTH, RAMP } }); }
+      }
+    }
+  } else if (vm) {
+    // A VM PE (never at a row's end) passes the winner on without taking it.
+    if (px < RC) { color_config.reset_routes(c_ib, .{ .rx = EAST, .tx = WEST }); }
+    else { color_config.reset_routes(c_ib, .{ .rx = WEST, .tx = EAST }); }
+  } else if (px < RC) {
+    if (px == 0) { color_config.reset_routes(c_ib, .{ .rx = EAST, .tx = RAMP }); }
+    else { color_config.reset_routes(c_ib, .{ .rx = EAST, .tx = [2]direction{ WEST, RAMP } }); }
+  } else {
+    if (px == W - 1) { color_config.reset_routes(c_ib, .{ .rx = WEST, .tx = RAMP }); }
+    else { color_config.reset_routes(c_ib, .{ .rx = WEST, .tx = [2]direction{ EAST, RAMP } }); }
+  }
+}
+
+// ---------------------------------------------------------------- reductions
+fn op_in(comptime is_max: bool, buf: mem1d_dsd, comptime q: input_queue, n: u16) void {
+  if (is_max) { @fmaxs(buf, buf, fin(q, n)); } else { @fadds(buf, buf, fin(q, n)); }
+}
+fn op_fwd(comptime is_max: bool, comptime qo: output_queue, comptime qi: input_queue,
+          buf: mem1d_dsd, n: u16) void {
+  if (is_max) { @fmaxs(fout(qo, n), fin(qi, n), buf); } else { @fadds(fout(qo, n), fin(qi, n), buf); }
+}
+
+// Sum (or max) of buf along an axis of length L into its root R2 (reduce, no
+// broadcast), streamed: a forwarding PE combines and sends as values arrive.
+fn reduce(comptime is_max: bool, comptime L: u16, comptime G: u16, id: u16, buf0: mem1d_dsd, n: u16) void {
+  // Every operand exactly n long: on hardware a longer memory operand waits
+  // for wavelets the fabric operand never brings (the simulator stops at the
+  // shorter one).
+  const buf = @set_dsd_length(buf0, n);
+  const R1 = G / 2;
+  const NG = L / G;
+  const R2 = (NG / 2) * G + R1;
+  const r = id % G;
+  if (r == R1) {
+    if (R1 < G - 1) { op_in(is_max, buf, q_r1_0_in, n); }
+    op_in(is_max, buf, q_r1_1_in, n);
+  } else if (r > R1) {
+    if (r % 2 == 0) {
+      if (r == G - 1) { @fmovs(fout(q_r1_0_out, n), buf); }
+      else { op_fwd(is_max, q_r1_0_out, q_r1_1_in, buf, n); }
+    } else {
+      if (r == G - 1) { @fmovs(fout(q_r1_1_out, n), buf); }
+      else { op_fwd(is_max, q_r1_1_out, q_r1_0_in, buf, n); }
+    }
+  } else {
+    if (r % 2 == 0) {
+      if (r == 0) { @fmovs(fout(q_r1_1_out, n), buf); }
+      else { op_fwd(is_max, q_r1_1_out, q_r1_0_in, buf, n); }
+    } else {
+      op_fwd(is_max, q_r1_0_out, q_r1_1_in, buf, n);
+    }
+  }
+  if (NG == 1) { return; }
+  const qt = id / G;
+  if (id == R2) {
+    if (R2 < L - G) { op_in(is_max, buf, q_r2_0_in, n); }
+    op_in(is_max, buf, q_r2_1_in, n);
+  } else if (r == R1) {
+    if (id > R2) {
+      if (id > L - G - 1) {
+        if (qt % 2 == 0) { @fmovs(fout(q_r2_0_out, n), buf); }
+        else { @fmovs(fout(q_r2_1_out, n), buf); }
+      } else {
+        if (qt % 2 == 0) { op_fwd(is_max, q_r2_0_out, q_r2_1_in, buf, n); }
+        else { op_fwd(is_max, q_r2_1_out, q_r2_0_in, buf, n); }
+      }
+    } else {
+      if (id < G) { @fmovs(fout(q_r2_1_out, n), buf); }
+      else {
+        if (qt % 2 == 0) { op_fwd(is_max, q_r2_1_out, q_r2_0_in, buf, n); }
+        else { op_fwd(is_max, q_r2_0_out, q_r2_1_in, buf, n); }
+      }
+    }
+  }
+}
+
+// (value, index) pairs: the larger value, the smaller index on a tie. Store
+// and forward: a pair cannot be combined element-wise.
+// Tuples (m1, i1, lo1, hi1, hi2): the best approximate logit and its row, that
+// row's exact-logit bounds, and the highest upper bound of any other row.
+const TW: u16 = if (MODE == 1) 5 else if (MODE == 3) 4 else 2;
+var best = @zeros([5]f32);             // TW of them travel
+const best_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TW} -> best[i] });
+var other = @zeros([5]f32);
+const other_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TW} -> other[i] });
+fn max3(a: f32, b: f32, c: f32) f32 {
+  const m = if (a > b) a else b;
+  return if (m > c) m else c;
+}
+const best4_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{4} -> best[i] });
+const other4_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{4} -> other[i] });
+fn take(comptime q: input_queue) void {
+  @fmovs(other_dsd, fin(q, TW));
+  const wins = other[0] > best[0] or (other[0] == best[0] and other[1] < best[1]);
+  if (MODE == 1) {
+    if (wins) {
+      const h2 = max3(other[4], best[3], best[4]);
+      @fmovs(best4_dsd, other4_dsd);
+      best[4] = h2;
+    } else {
+      best[4] = max3(best[4], other[3], other[4]);
+    }
+  } else if (MODE == 3) {
+    // (m1, i1, m2, B): B is the same everywhere (max |w|_2 times rho).
+    if (wins) {
+      const m2 = if (other[2] > best[0]) other[2] else best[0];
+      best[0] = other[0];
+      best[1] = other[1];
+      best[2] = m2;
+    } else if (other[0] > best[2]) {
+      best[2] = other[0];
+    }
+    if (other[3] > best[3]) { best[3] = other[3]; }
+  } else if (wins) {
+    best[0] = other[0];
+    best[1] = other[1];
+  }
+}
+fn give(comptime q: output_queue) void {
+  @fmovs(fout(q, TW), best_dsd);
+}
+fn best_init() void {
+  best[0] = NEG;
+  best[1] = 1.0e9;
+  for (@range(u16, TW - 2)) |i| { best[i + 2] = NEG; }
+}
+fn take_c(k: u16) void {
+  if (k == 0) { take(q_r2_0_in); } else if (k == 1) { take(q_r2_1_in); }
+  else if (k == 2) { take(q_r1_0_in); } else { take(q_r1_1_in); }
+}
+fn give_c(k: u16) void {
+  if (k == 0) { give(q_r2_0_out); } else if (k == 1) { give(q_r2_1_out); }
+  else if (k == 2) { give(q_r1_0_out); } else { give(q_r1_1_out); }
+}
+
+// Pairs along the feeder row over block ids (the generic two-phase shape).
+fn row_pairs() void {
+  const r = blk % Gb;
+  if (r == R1B) {
+    if (R1B < Gb - 1) { take(q_r1_0_in); }
+    take(q_r1_1_in);
+  } else if (r > R1B) {
+    if (r % 2 == 0) {
+      if (r == Gb - 1) { give(q_r1_0_out); } else { take(q_r1_1_in); give(q_r1_0_out); }
+    } else {
+      if (r == Gb - 1) { give(q_r1_1_out); } else { take(q_r1_0_in); give(q_r1_1_out); }
+    }
+  } else {
+    if (r % 2 == 0) {
+      if (r == 0) { give(q_r1_1_out); } else { take(q_r1_0_in); give(q_r1_1_out); }
+    } else {
+      take(q_r1_1_in);
+      give(q_r1_0_out);
+    }
+  }
+  if (NGB == 1) { return; }
+  const id = blk;
+  const qt = id / Gb;
+  if (id == BM) {
+    if (BM < NB - Gb) { take(q_r2_0_in); }
+    take(q_r2_1_in);
+  } else if (r == R1B) {
+    if (id > BM) {
+      if (id > NB - Gb - 1) {
+        if (qt % 2 == 0) { give(q_r2_0_out); } else { give(q_r2_1_out); }
+      } else {
+        if (qt % 2 == 0) { take(q_r2_1_in); give(q_r2_0_out); }
+        else { take(q_r2_0_in); give(q_r2_1_out); }
+      }
+    } else {
+      if (id < Gb) { give(q_r2_1_out); }
+      else {
+        if (qt % 2 == 0) { take(q_r2_0_in); give(q_r2_1_out); }
+        else { take(q_r2_1_in); give(q_r2_0_out); }
+      }
+    }
+  }
+}
+
+// A root column's half: phase 1 into each group's root, phase 2 from the far
+// group onwards into the feeder.
+fn reduce_half() void {
+  const r = kk % Gy;
+  const g = kk / Gy;
+  // Phase 1 (route_phase1 orientation: HEAD is the far end).
+  if (r == R1Y) {
+    if (R1Y < Gy - 1) { take(q_r1_0_in); }
+    take(q_r1_1_in);
+  } else if (r > R1Y) {
+    if (r % 2 == 0) {
+      if (r == Gy - 1) { give(q_r1_0_out); } else { take(q_r1_1_in); give(q_r1_0_out); }
+    } else {
+      if (r == Gy - 1) { give(q_r1_1_out); } else { take(q_r1_0_in); give(q_r1_1_out); }
+    }
+  } else {
+    if (r % 2 == 0) {
+      if (r == 0) { give(q_r1_1_out); } else { take(q_r1_0_in); give(q_r1_1_out); }
+    } else {
+      take(q_r1_1_in);
+      give(q_r1_0_out);
+    }
+  }
+  // Phase 2.
+  if (r == R1Y) {
+    if (upper) {
+      if (g > 0) { take_c(cu(g - 1)); }
+      give_c(cu(g));
+    } else {
+      if (g > 0) { take_c(cl(g - 1)); }
+      give_c(cl(g));
+    }
+  }
+}
+
+// ---------------------------------------------------------------- state
+// The lm_head tile: Hc runs of Vr bf16 (dim-major); the host writes it as
+// u32 words, two values each (element 2k in the low half). With UNTIED the
+// embedding table's tile (same rows, same dims) sits beside it in `et`.
+const NW: u16 = Hc * Vr;                 // even (checked by the host)
+var w16 = @zeros([if (WF32 == 1) 2 else NW]bf16);
+// WF32: f32 weights, one element past a 16-byte boundary against y (bank
+// offset); the host writes a leading pad word.
+var wt32: [if (WF32 == 1) NW + 1 else 1]f32 align(16) = @zeros([if (WF32 == 1) NW + 1 else 1]f32);
+const wt32_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> wt32[i + 1] });
+var e16 = @zeros([if (UNTIED == 1) NW else 2]bf16);
+var dummy_u32 = @zeros([1]u32);
+var wt_ptr: [*]u32 = &dummy_u32;
+var et_ptr: [*]u32 = &dummy_u32;
+const w16_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> w16[i] });
+// y: Vr logits, then (CERT) this PE's share of |x - bf16(x)|^2, summed with
+// them across the row.
+// y: Vr logits, sum h^2 (word Vr: summed over the row = over the hidden
+// size), and (CERTIFY) |x - bf16(x)|^2 (word Vr + 1).
+const NY: u16 = if (MODE == 1 or MODE == 3) Vr + 2 else Vr + 1;
+var y: [Vr + 2]f32 align(16) = @zeros([Vr + 2]f32);
+var y_ptr: [*]f32 = &y;
+const y_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> y[i] });
+const yx_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr + 2} -> y[i] });
+const yv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr + 1} -> y[i] });
+// CERT: the exact remainder W (x - p0) (fallback), each row's |w|_2 (root
+// columns, host-written), the upper bounds y + |w|_2 rho.
+var z: [if (CERTIFY) Vr else 1]f32 align(16) = @zeros([if (CERTIFY) Vr else 1]f32);
+const z_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> z[i] });
+var l2: [if (MODE == 1) Vr else 1]f32 align(16) = @zeros([if (MODE == 1) Vr else 1]f32);
+var l2_ptr: [*]f32 = &l2;
+const l2_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> l2[i] });
+var hiv: [if (CERTIFY) Vr else 1]f32 align(16) = @zeros([if (CERTIFY) Vr else 1]f32);
+const hiv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> hiv[i] });
+var force = @zeros([1]u32);
+var lmax = @zeros([1]f32);              // MODE 3: max |w_v|_2 over all rows (host)
+var lmax_ptr: [*]f32 = &lmax;
+var force_ptr: [*]u32 = &force;
+var rs: f32 = 0.0;
+// The VM contract: gmode (host-written on every PE: 1 = the VM picks the
+// token), the bench's stand-in VM (vm_tok: the token the block-BM feeder-row
+// VM PE sends; vin: what a VM PE received), 1/rms.
+var gmode = @zeros([1]u32);
+var gmode_ptr: [*]u32 = &gmode;
+var vm_tok = @zeros([1]f32);
+var vm_tok_ptr: [*]f32 = &vm_tok;
+var vin: [Vr + 1]f32 = @zeros([Vr + 1]f32);
+var vin_ptr: [*]f32 = &vin;
+const vin_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr + 1} -> vin[i] });
+var yscale: f32 = 0.0;
+var xin: [Hc]f32 align(16) = @zeros([Hc]f32);
+var xin_ptr: [*]f32 = &xin;
+const xin_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> xin[i] });
+var gam = @zeros([Hc]f32);
+var gam_ptr: [*]f32 = &gam;
+const gam_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> gam[i] });
+// The normed chunk h * gamma, then (word Hc) the chunk's sum of h^2: the row
+// sum adds those up for 1/rms (yscale).
+var xs: [Hc + 1]f32 align(16) = @zeros([Hc + 1]f32);
+const xs_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> xs[i] });
+const xs1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc + 1} -> xs[i] });
+// x as up to three bf16 parts (x = p0 + p1 + p2 to 24 bits): bf16 x bf16
+// products are exact in f32, so three @fmachs passes give f32-exact products.
+var xp = @zeros([3 * Hc]bf16);
+const xp_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> xp[i] });
+var emb = @zeros([Hc]f32);
+var emb_ptr: [*]f32 = &emb;
+var tok = @zeros([4]f32);   // max logit, winner, certified, fallbacks so far
+var tok_ptr: [*]f32 = &tok;
+var sc: [VP]f32 align(16) = @zeros([VP]f32);
+
+// y += A x: per part, explicit DSRs and @map over the part (sdk-examples
+// single-tile-matvec) with @fmachs (bf16 multiply, f32 add; SIMD 4).
+const mv_dest = @get_dsr(dsr_dest, 1);
+const mv_src0 = @get_dsr(dsr_src0, 1);
+const mv_src1 = @get_dsr(dsr_src1, 1);
+fn mv_step(xv: bf16) void {
+  @fmachs(mv_dest, mv_src0, mv_src1, xv);
+}
+var r1v: [Hc]f32 align(16) = @zeros([Hc]f32);
+var tv: [Hc]f32 align(16) = @zeros([Hc]f32);
+const r1v_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> r1v[i] });
+const tv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> tv[i] });
+fn split_x() void {
+  const p0 = xp_dsd;
+  const p1 = @increment_dsd_offset(xp_dsd, @as(i16, Hc), bf16);
+  const p2 = @increment_dsd_offset(xp_dsd, @as(i16, 2 * Hc), bf16);
+  @fs2h(p0, xs_dsd);
+  @fh2s(tv_dsd, p0);
+  @fsubs(r1v_dsd, xs_dsd, tv_dsd);         // x - p0, exact
+  @fs2h(p1, r1v_dsd);
+  @fh2s(tv_dsd, p1);
+  @fsubs(tv_dsd, r1v_dsd, tv_dsd);         // x - p0 - p1, exact
+  @fs2h(p2, tv_dsd);
+  rs = 0.0;
+  for (@range(u16, Hc)) |h| { rs += r1v[h] * r1v[h]; }
+}
+
+fn matvec_parts(dst: mem1d_dsd, k0: u16, k1: u16) void {
+  var k: u16 = k0;
+  while (k < k1) : (k += 1) {
+    const part = @increment_dsd_offset(xp_dsd, @as(i16, k * Hc), bf16);
+    @load_to_dsr(mv_dest, dst, .{ .save_address = false });
+    @load_to_dsr(mv_src0, dst, .{ .save_address = false });
+    @load_to_dsr(mv_src1, w16_dsd, .{ .save_address = true });
+    @map(mv_step, part);
+  }
+}
+fn mv32_step(xv: f32) void {
+  @fmacs(mv_dest, mv_src0, mv_src1, xv);
+}
+fn matvec() void {
+  if (WF32 == 1) {
+    @load_to_dsr(mv_dest, y_dsd, .{ .save_address = false });
+    @load_to_dsr(mv_src0, y_dsd, .{ .save_address = false });
+    @load_to_dsr(mv_src1, wt32_dsd, .{ .save_address = true });
+    @map(mv32_step, xs_dsd);
+    return;
+  }
+  split_x();
+  matvec_parts(y_dsd, 0, if (ONEPASS) 1 else PASSES);
+}
+
+// The row's argmax into `best`, all vector ops: the max m of y, then the max
+// of (y - m) * 1e20 - index, which is -j for the first row j holding m (y - m
+// is exactly 0 there; elsewhere at least an ulp of m, which times 1e20 dwarfs
+// any index).
+// Each max folds the Vr values onto VP/2 and halves from there.
+var negiv: [VP]f32 align(16) = @zeros([VP]f32);
+const sc_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VP} -> sc[i] });
+const negiv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> negiv[i] });
+const HALF: u16 = VP / 2;
+const TAIL: u16 = Vr - HALF;     // Vr > VP / 2 by VP's choice (VP >= 32)
+fn max_of(src: mem1d_dsd) f32 {
+  const lo = @set_dsd_length(sc_all, HALF);
+  @fmovs(lo, @set_dsd_length(src, HALF));
+  if (TAIL > 0) {
+    const t = @set_dsd_length(sc_all, TAIL);
+    @fmaxs(t, t, @set_dsd_length(@increment_dsd_offset(src, @as(i16, HALF), f32), TAIL));
+  }
+  var n: u16 = HALF / 2;
+  while (n >= 1) {
+    const l = @set_dsd_length(sc_all, n);
+    @fmaxs(l, l, @increment_dsd_offset(l, @as(i16, n), f32));
+    if (n == 1) { break; }
+    n /= 2;
+  }
+  return sc[0];
+}
+var score: [Vr]f32 align(16) = @zeros([Vr]f32);
+const score_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> score[i] });
+fn local_argmax() void {
+  if (nvalid < Vr) {
+    @fmovs(@increment_dsd_offset(@set_dsd_length(y_dsd, Vr - nvalid), @as(i16, nvalid), f32), NEG);
+  }
+  const m = max_of(y_dsd);
+  @fsubs(score_dsd, y_dsd, m);
+  @fmacs(score_dsd, negiv_dsd, score_dsd, 1.0e20);
+  const j = -max_of(score_dsd);
+  best[0] = m;
+  best[1] = @as(f32, base) + j;
+  if (MODE == 1) {
+    best[2] = m;
+    best[3] = m;
+    best[4] = NEG;
+  } else if (MODE == 3) {
+    best[2] = NEG;
+    best[3] = 0.0;
+  }
+}
+
+// CERT round 1: the bounds from rho = |x - bf16(x)|_2 (y[Vr] holds its
+// square summed over the row): row v's exact logit is within |w_v|_2 rho.
+fn local_bounds() void {
+  const rho = sqrt_f(y[Vr + 1]) * 1.0001;
+  const jj0 = @as(u16, best[1] - @as(f32, base));
+  if (MODE == 3) {
+    // The row's second best and the uniform bound.
+    @fmovs(hiv_dsd, y_dsd);
+    hiv[jj0] = NEG;
+    best[2] = max_of(hiv_dsd);
+    best[3] = lmax[0] * rho;
+    return;
+  }
+  const jj = @as(u16, best[1] - @as(f32, base));
+  best[2] = best[0] - l2[jj] * rho;
+  best[3] = best[0] + l2[jj] * rho;
+  @fmovs(hiv_dsd, y_dsd);
+  @fmacs(hiv_dsd, hiv_dsd, l2_dsd, rho);
+  hiv[jj] = NEG;
+  best[4] = max_of(hiv_dsd);
+}
+fn rsqrt_f(v: f32) f32 {
+  var r = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
+  const h = 0.5 * v;
+  r = r * (1.5 - h * r * r);
+  r = r * (1.5 - h * r * r);
+  r = r * (1.5 - h * r * r);
+  return r;
+}
+fn sqrt_f(v: f32) f32 {
+  if (v <= 0.0) { return 0.0; }
+  // 1/sqrt by the bit trick and Newton steps, then v * that.
+  var r = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
+  const h = 0.5 * v;
+  r = r * (1.5 - h * r * r);
+  r = r * (1.5 - h * r * r);
+  r = r * (1.5 - h * r * r);
+  return v * r * 1.000001;
+}
+
+// ---------------------------------------------------------------- profile
+const NPROF: u16 = 16;
+var prof = @zeros([NPROF]u32);
+var prof_ptr: [*]u32 = &prof;
+var t_mark = @zeros([timestamp.tsc_size_words]u16);
+var t_now = @zeros([timestamp.tsc_size_words]u16);
+var t_step = @zeros([timestamp.tsc_size_words]u16);
+var timing: bool = false;
+fn tsc(t: *[timestamp.tsc_size_words]u16) u64 {
+  return @as(u64, t.*[0]) | (@as(u64, t.*[1]) << 16) | (@as(u64, t.*[2]) << 32);
+}
+fn mark(slot: u16) void {
+  timestamp.get_timestamp(&t_now);
+  if (timing) { prof[slot] += @as(u32, (tsc(&t_now) - tsc(&t_mark)) & 0xffffffff); }
+  t_mark = t_now;
+}
+
+// ---------------------------------------------------------------- the head
+var ib = @zeros([1]f32);
+const ib_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> ib[i] });
+
+// The feeder side of one argmax round; returns the winner (-1: not certified).
+fn feeder_round(exact: bool) f32 {
+  if (VMC == 1 and gmode[0] == 1) {
+    // The VM picks: the final root takes its token (color 3, queue 2) and
+    // multicasts it as the winner; the block roots skip their chains.
+    if (px == RC) {
+      @fmovs(ib_dsd, fin(q_x_in, 1));
+      tok[0] = 0.0;
+      tok[1] = ib[0];
+      tok[2] = 1.0;
+      @fmovs(fout(q_ib_out, 1), ib_dsd);
+    } else {
+      @fmovs(ib_dsd, fin(q_ib_in, 1));
+    }
+    return ib[0];
+  }
+  if (col == R2X) {
+    best_init();
+    take_c(cu(NGH - 1));
+    take_c(cl(NGH - 1));
+    routes_feeder_x2();
+    row_pairs();
+    if (px == RC) {
+      // Certified when the winner's lower bound beats every other row's
+      // upper bound (with room for f32 rounding of the approximate sums).
+      const margin = 1.0e-4 * (1.0 + (if (best[0] > 0.0) best[0] else -best[0]));
+      const ok = exact or !CERTIFY or (force[0] == 0 and
+        (if (MODE == 1) best[2] > best[4] + margin else best[0] - best[2] > 2.0 * best[3] + margin));
+      tok[0] = best[0];
+      tok[1] = best[1];
+      tok[2] = if (ok) 1.0 else 0.0;
+      tok[3] = tok[3] + (if (ok) 0.0 else 1.0);   // fallbacks so far
+      ib[0] = if (ok) best[1] else -1.0;
+      @fmovs(fout(q_ib_out, 1), ib_dsd);
+    } else {
+      @fmovs(ib_dsd, fin(q_ib_in, 1));
+    }
+    routes_feeder_y();
+  } else {
+    @fmovs(ib_dsd, fin(q_ib_in, 1));
+  }
+  return ib[0];
+}
+
+fn step_feeder() void {
+  @fmuls(xs_dsd, xin_dsd, gam_dsd);
+  @fmovs(fout(q_x_out, Hc), xs_dsd);
+  // Then the chunk's sum of h^2 (for 1/rms), off the GEMV's path.
+  var ss: f32 = 0.0;
+  for (@range(u16, Hc)) |h| { ss += xin[h] * xin[h]; }
+  xs[Hc] = ss;
+  @fmovs(fout(q_x_out, 1), @set_dsd_length(@increment_dsd_offset(xs1_dsd, @as(i16, Hc), f32), 1));
+  mark(0);
+  // 1: the (certified) winner; 2: the exact round when it was not.
+  const w = feeder_round(false);
+  mark(1);
+  if (CERTIFY and w < 0.0) { const w2 = feeder_round(true); ib[0] = w2; }
+  mark(2);
+}
+
+// The root column's side of one argmax round.
+fn column_round(certify: bool) void {
+  routes_y();
+  local_argmax();
+  if (certify) { local_bounds(); }
+  reduce_half();
+  @fmovs(ib_dsd, fin(q_ib_in, 1));
+  // Back to the row routes only now: other column PEs' tuples may still be
+  // passing through this router until the winner is known.
+  routes_x();
+}
+
+fn emb_copy() void {
+  const v = @as(u32, ib[0]);
+  if (v >= base and v < base + @as(u32, nvalid)) {
+    const j = @as(u16, v - base);
+    // bf16 -> f32 exactly: the 16 bits into the high half.
+    for (@range(u16, Hc)) |h| {
+      if (WF32 == 1) {
+        emb[h] = wt32[1 + h * Vr + j];
+      } else {
+        const bits = if (UNTIED == 1) @bitcast(u16, e16[h * Vr + j]) else @bitcast(u16, w16[h * Vr + j]);
+        emb[h] = @bitcast(f32, @as(u32, bits) << 16);
+      }
+    }
+  }
+}
+
+fn step_region() void {
+  // 0: the normed hidden chunk arrives; 1: Vr partial logits (CERT: from
+  // bf16(x) only) and the row's |x - bf16(x)|^2 share.
+  @fmovs(xs_dsd, fin(q_x_in, Hc));
+  mark(0);
+  @fmovs(y_dsd, 0.0);
+  matvec();
+  @fmovs(@set_dsd_length(@increment_dsd_offset(xs1_dsd, @as(i16, Hc), f32), 1), fin(q_x_in, 1));
+  y[Vr] = xs[Hc];
+  y[Vr + 1] = rs;
+  mark(1);
+  // 2: summed across the block's row into its root column.
+  reduce(false, C, Gx, col, yx_dsd, NY);
+  mark(2);
+  if (root_col) {
+    // 1/rms of the hidden state (word Vr now sums h^2 over the hidden size).
+    yscale = rsqrt_f(y[Vr] / @as(f32, C * Hc) + 1.0e-6);
+  }
+  if (VMC == 1 and gmode[0] == 1) {
+    // Hook A for the VM: the logits row and 1/rms one hop east (color 2);
+    // the token comes back from the VM through the final root.
+    if (root_col) {
+      y[Vr] = yscale;
+      @fmovs(fout(q_x_out, Vr + 1), yv_dsd);
+    }
+    @fmovs(ib_dsd, fin(q_ib_in, 1));
+    mark(3);
+    mark(4);
+    emb_copy();
+    mark(5);
+    return;
+  }
+  // 3: the argmax round(s) and the winner. OVL: a non-root PE computes the
+  // remainder W (x - bf16(x)) first, in round 1's wait.
+  if (root_col) {
+    column_round(CERTIFY);
+  } else {
+    if (CERTIFY and OVL == 1) {
+      @fmovs(z_dsd, 0.0);
+      matvec_parts(z_dsd, 1, 3);
+    }
+    @fmovs(ib_dsd, fin(q_ib_in, 1));
+  }
+  mark(3);
+  if (CERTIFY and ib[0] < 0.0) {
+    // 4: not certified: the remainder W (x - bf16(x)) from the other two
+    // parts, summed across the row onto the root column's logits; then an
+    // exact round.
+    if (OVL == 0 or root_col) {
+      @fmovs(z_dsd, 0.0);
+      matvec_parts(z_dsd, 1, 3);
+    }
+    reduce(false, C, Gx, col, z_dsd, Vr);
+    if (root_col) {
+      @fadds(y_dsd, y_dsd, z_dsd);
+      column_round(false);
+    } else {
+      @fmovs(ib_dsd, fin(q_ib_in, 1));
+    }
+  }
+  mark(4);
+  // 5: the winner's embedding chunk at its row of PEs.
+  emb_copy();
+  mark(5);
+}
+
+// The bench's stand-in VM (Fork 3's VM replaces these PEs' code): with
+// gmode = 1 a VM PE takes its root's row (color 2) into vin, and block BM's
+// feeder-row VM PE sends vm_tok to the final root (color 3).
+fn step_vm() void {
+  if (gmode[0] != 1) { return; }
+  if (py != F) {
+    @fmovs(vin_dsd, fin(q_x_in, Vr + 1));
+  } else if (blk == BM) {
+    @fmovs(fout(q_x_out, 1), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> vm_tok[i] }));
+  }
+}
+
+fn init() void {
+  px = layout_mod.get_x_coord();
+  py = layout_mod.get_y_coord();
+  ry = if (py > F) py - 1 else py;
+  blk = px / CB;
+  const cc = px % CB;
+  vm = VMC == 1 and cc == R2X + 1;
+  col = if (VMC == 1 and cc > R2X) cc - 1 else cc;
+  root_col = py != F and col == R2X and !vm;
+  upper = py < F;
+  kk = if (upper) ry else H - 1 - ry;
+  base = (@as(u32, blk) * @as(u32, H) + @as(u32, ry)) * @as(u32, Vr);
+  nvalid = if (py == F or base >= vocab) 0
+    else if (vocab - base >= @as(u32, Vr)) Vr else @as(u16, vocab - base);
+  for (@range(u16, Vr)) |i| { negiv[i] = -@as(f32, i); }
+  wt_ptr = if (WF32 == 1) @ptrcast([*]u32, &wt32) else @ptrcast([*]u32, &w16);
+  if (UNTIED == 1) { et_ptr = @ptrcast([*]u32, &e16); }
+  if (vm) {
+    nvalid = 0;
+    if (py != F) {
+      // A region row's chains run west into the root (the root column is the
+      // VM column's west neighbor); the root's logits come in from the west.
+      color_config.reset_routes(c_r1_0, .{ .rx = EAST, .tx = WEST });
+      color_config.reset_routes(c_r1_1, .{ .rx = EAST, .tx = WEST });
+      color_config.reset_routes(c_r2_0, .{ .rx = EAST, .tx = WEST });
+      color_config.reset_routes(c_r2_1, .{ .rx = EAST, .tx = WEST });
+      color_config.reset_routes(c_vl, .{ .rx = WEST, .tx = RAMP });
+      iq_color(2, C_VL);
+    } else {
+      route_feeder();
+      if (blk == BM) {
+        color_config.reset_routes(c_vt, .{ .rx = RAMP, .tx = WEST });
+        oq_color(2, C_VT);
+      }
+    }
+    route_ib();
+    sys_mod.unblock_cmd_stream();
+    return;
+  }
+  route_x();
+  route_ib();
+  if (py == F) { route_feeder(); } else { routes_x(); }
+  if (VMC == 1) {
+    if (root_col) {
+      color_config.reset_routes(c_vl, .{ .rx = RAMP, .tx = EAST });
+      oq_color(2, C_VL);
+    }
+    if (py == F and px == RC) {
+      color_config.reset_routes(c_vt, .{ .rx = EAST, .tx = RAMP });
+      iq_color(2, C_VT);
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+// `steps` head steps on the same hidden state; profiled from the second
+// (launch skew). The feeder starts each step when the last winner reaches it.
+fn compute(steps: u32) void {
+  timestamp.enable_tsc();
+  var i: u32 = 0;
+  while (i < steps) : (i += 1) {
+    timing = i > 0;
+    timestamp.get_timestamp(&t_mark);
+    if (vm) { step_vm(); } else if (py == F) { step_feeder(); } else { step_region(); }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @initialize_queue(q_x_in, .{ .color = c_x });
+  @initialize_queue(q_x_out, .{ .color = c_x });
+  @initialize_queue(q_r1_0_in, .{ .color = c_r1_0 });
+  @initialize_queue(q_r1_0_out, .{ .color = c_r1_0 });
+  @initialize_queue(q_r1_1_in, .{ .color = c_r1_1 });
+  @initialize_queue(q_r1_1_out, .{ .color = c_r1_1 });
+  @initialize_queue(q_r2_0_in, .{ .color = c_r2_0 });
+  @initialize_queue(q_r2_0_out, .{ .color = c_r2_0 });
+  @initialize_queue(q_r2_1_in, .{ .color = c_r2_1 });
+  @initialize_queue(q_r2_1_out, .{ .color = c_r2_1 });
+  @initialize_queue(q_ib_in, .{ .color = c_ib });
+  @initialize_queue(q_ib_out, .{ .color = c_ib });
+
+  @export_symbol(wt_ptr, "wt");
+  @export_symbol(et_ptr, "et");
+  @export_symbol(l2_ptr, "l2");
+  @export_symbol(force_ptr, "force");
+  @export_symbol(lmax_ptr, "lmax");
+  @export_symbol(gmode_ptr, "gmode");
+  @export_symbol(vm_tok_ptr, "vm_tok");
+  @export_symbol(vin_ptr, "vin");
+  @export_symbol(xin_ptr, "xin");
+  @export_symbol(gam_ptr, "gam");
+  @export_symbol(y_ptr, "y");
+  @export_symbol(emb_ptr, "emb");
+  @export_symbol(tok_ptr, "tok");
+  @export_symbol(prof_ptr, "prof");
+  @export_symbol(init);
+  @export_symbol(compute);
+}

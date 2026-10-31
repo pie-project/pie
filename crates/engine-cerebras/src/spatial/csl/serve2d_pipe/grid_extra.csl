@@ -1,0 +1,120 @@
+// ---------------------------------------------------------------- serve2d_pipe
+// (appended to qwen2d_pring's pe.csl by serve2d_pipe/sync.py) A grid's place
+// in the ring of NL layer grids and the head, and its handoffs. The grids sit
+// as serve2d's (GW across, GH down, serpentine; layer 0 top-right, next to the
+// head) and hand [x | tab] on by serve2d's routes:
+// - within a strip: an edge PE of row py sends the row's [x | tab] across
+//   (R(L + 1)), multicast along row py of the next grid (R alternates by layer
+//   parity);
+// - between strips: the diagonal PE (j, j) sends down column j (CV); the next
+//   grid's (j, j) takes it and relays it along row j (R(L));
+// - the last grid's diagonal sends to the head (S); the head's feeders send
+//   layer 0's input (E) to its diagonal, which relays it.
+// Queue 2 (pring's handoff) has one color each way for the whole launch: in,
+// the row's R(L), or CV/E at a relaying diagonal; out, the stage's output, or
+// R(L) at a relaying diagonal. A relaying diagonal therefore never sends the
+// stage's output: on its row the next PE inward sends it, and the diagonal
+// passes it through.
+// Every micro-batch comes from the head (none is preloaded): a launch posts
+// the first receive, and every pass sends its output on.
+const rt = @import_module("rt.csl");
+const paths = @import_module("paths.csl", .{ .GWD = P, .GHT = P, .GW = GW, .GH = GH, .NL = NL,
+                                             .XH = GW * P, .F = F, .C = P, .VMC = S2D_VMC,
+                                             .VMAT = S2D_VMAT });
+const C_R0: color = @get_color(11);
+const C_R1: color = @get_color(12);
+const C_CV: color = @get_color(13);
+
+var L: u16 = 0;
+var in_kind: u16 = 0;    // 1 from the west, 2 from the east, 3 diagonal (CV), 4 diagonal (E: the head)
+var out_kind: u16 = 0;   // 1 east, 2 west, 3 south (CV), 4 the head (S)
+var ocol: u16 = 0;       // out_kind 1/2: the column of row py that sends
+
+fn r_color(l: u16) u16 { return if (l % 2 == 0) rt.cn(C_R0) else rt.cn(C_R1); }
+fn r_route(l: u16, rx: u16, tx: u16) void {
+  if (l % 2 == 0) { rt.route(C_R0, rx, tx); } else { rt.route(C_R1, rx, tx); }
+}
+
+fn s2d_place() void {
+  const gx = layout_mod.get_x_coord();
+  const gy = layout_mod.get_y_coord();
+  const sx = gx / P;
+  const sy = gy / P;
+  px = gx % P;
+  py = gy % P;
+  lx = px;
+  const k = if (sy % 2 == 0) GW - 1 - sx else sx;
+  L = sy * GW + k;
+  in_kind = if (L == 0) 4 else if (k != 0) (if (sy % 2 == 0) 2 else 1) else 3;
+  out_kind = if (L == NL - 1) 4 else if (k != GW - 1) (if (sy % 2 == 0) 2 else 1) else 3;
+  const relay_grid = in_kind >= 3;
+  if (out_kind == 1) { ocol = if (relay_grid and py == P - 1) P - 2 else P - 1; }
+  if (out_kind == 2) { ocol = if (relay_grid and py == 0) 1 else 0; }
+}
+
+fn s2d_relays() bool { return in_kind >= 3 and px == py; }
+
+fn s2d_routes() void {
+  const tw: u16 = if (px > 0) rt.TX_W else 0;
+  const te: u16 = if (px < P - 1) rt.TX_E else 0;
+  // Input multicast along this row.
+  if (in_kind == 1) {
+    r_route(L, rt.RX_W, rt.TX_R | te);
+  } else if (in_kind == 2) {
+    r_route(L, rt.RX_E, rt.TX_R | tw);
+  } else {
+    if (px == py) { r_route(L, rt.RX_R, tw | te); }
+    else if (px < py) { r_route(L, rt.RX_E, rt.TX_R | tw); }
+    else { r_route(L, rt.RX_W, rt.TX_R | te); }
+    // CV down this column to the diagonal (E: paths.csl).
+    if (in_kind == 3) {
+      if (py < px) { rt.route(C_CV, rt.RX_N, rt.TX_S); }
+      else if (py == px) { rt.route(C_CV, rt.RX_N, rt.TX_R); }
+    }
+  }
+  // Output.
+  if (out_kind == 1) {
+    if (px == ocol) { r_route(L + 1, rt.RX_R, rt.TX_E); }
+    else if (px > ocol) { r_route(L + 1, rt.RX_W, rt.TX_E); }
+  }
+  if (out_kind == 2) {
+    if (px == ocol) { r_route(L + 1, rt.RX_R, rt.TX_W); }
+    else if (px < ocol) { r_route(L + 1, rt.RX_E, rt.TX_W); }
+  }
+  if (out_kind == 3) {
+    if (py == px) { rt.route(C_CV, rt.RX_R, rt.TX_S); }
+    else if (py > px) { rt.route(C_CV, rt.RX_N, rt.TX_S); }
+  }
+  paths.routes(layout_mod.get_x_coord(), layout_mod.get_y_coord());
+  // Queue 2's colors for good.
+  if (s2d_relays()) {
+    if (in_kind == 3) { rt.iq_color(2, rt.cn(C_CV)); } else { rt.iq_color(2, rt.cn(paths.C_E)); }
+    rt.oq_color(2, r_color(L));
+  } else {
+    rt.iq_color(2, r_color(L));
+    if (out_kind == 1 or out_kind == 2) { rt.oq_color(2, r_color(L + 1)); }
+    else if (out_kind == 3) { rt.oq_color(2, rt.cn(C_CV)); }
+    else { rt.oq_color(2, rt.cn(paths.C_S)); }
+  }
+}
+
+// A relaying diagonal: the micro-batch on along its row before it starts on it.
+fn s2d_relay() void {
+  if (s2d_relays()) { @fmovs(fout(q_h_out, NIO), in_dsd); }
+}
+
+fn s2d_send() void {
+  var send = false;
+  if ((out_kind == 1 or out_kind == 2) and px == ocol) { send = true; }
+  if (out_kind >= 3 and px == py) { send = true; }
+  if (send) { @fmovs(fout(q_h_out, NIO), io_dsd); }
+}
+
+// A launch's first receive (the step task posts the rest).
+fn s2d_start() void {
+  if (steps_total == 0) {
+    sys_mod.unblock_cmd_stream();
+    return;
+  }
+  @fmovs(in_dsd, fin(q_h_in, NIO), .{ .async = true, .activate = RECVD });
+}

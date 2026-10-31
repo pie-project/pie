@@ -54,6 +54,7 @@ impl KvLifecycle {
         stores.seats.lock().unwrap().release(self.id);
         stores.seats_freed.notify_waiters();
         if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
+            planner.working_set_released(self.id);
             planner.pages_freed();
         }
     }

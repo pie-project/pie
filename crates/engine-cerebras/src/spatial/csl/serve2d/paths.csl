@@ -1,0 +1,96 @@
+// serve2d: the two staircases between the layer grids and the head, as
+// routes for whichever PE (grid or head) they cross. Chunk j of x (Hc dims)
+// travels on its own path; the paths of one color never share a router.
+// - S: the last grid's diagonal (j, j) east along its row j to head column j,
+//   then north up that column to the feeder row F.
+// - E: feeder (j, F) north to row Y0 - j (Y0 = 2 GHT - 1: below layer 0's
+//   strip and the next), west to layer 0's column j, north to its (j, j).
+// Non-crossing needs the feeder row below layer 0's next strip (F > Y0) and
+// above the last strip (F < its top row); one head column a chunk (hcol).
+param GWD: u16;        // a grid's width (columns)
+param GHT: u16;        // a grid's height (rows = x's chunks)
+param GW: u16;         // grids across
+param GH: u16;         // grids down
+param NL: u16;         // layers (= GW x GH)
+param XH: u16;         // the head's first column
+param F: u16;          // the feeder row (fabric row)
+// The head's columns: blocks of C chunk columns plus VMC columns of other PEs
+// (the eta VM's, CONTRACT.md section 6) at block columns VMAT .. VMAT + VMC - 1
+// (head2d: right after its root column, R2X + 1; Fork 3's multi-column VM). Chunk j's column is hcol(j); the
+// staircases cross the VM columns on pass-through routes (a VM PE's init
+// calls routes() too).
+param C: u16;
+param VMC: u16;
+param VMAT: u16;
+
+fn hcol(j: u16) u16 {
+  const c = j % C;
+  return XH + (j / C) * (C + VMC) + c + (if (VMC >= 1 and c >= VMAT) VMC else 0);
+}
+// The chunk whose column gx is, or GHT (none: a VM column or off the head).
+fn chunk_at(gx: u16) u16 {
+  if (gx < XH) { return GHT; }
+  const off = gx - XH;
+  const cc = off % (C + VMC);
+  if (VMC >= 1 and cc >= VMAT and cc < VMAT + VMC) { return GHT; }
+  const c = if (VMC >= 1 and cc >= VMAT + VMC) cc - VMC else cc;
+  const j = (off / (C + VMC)) * C + c;
+  return if (c < C and j < GHT) j else GHT;
+}
+
+const rt = @import_module("rt.csl");
+const C_S: color = @get_color(14);
+const C_E: color = @get_color(15);
+
+// Layer l's grid origin (serpentine: even strips run west from the east end).
+fn origin_x(l: u16) u16 {
+  const sy = l / GW;
+  const k = l % GW;
+  return (if (sy % 2 == 0) GW - 1 - k else k) * GWD;
+}
+fn origin_y(l: u16) u16 { return (l / GW) * GHT; }
+
+fn routes(gx: u16, gy: u16) void {
+  // S.
+  const xl = origin_x(NL - 1);
+  const yl = origin_y(NL - 1);
+  if (gy >= yl and gy < yl + GHT) {
+    const j = gy - yl;
+    if (gx == xl + j) { rt.route(C_S, rt.RX_R, rt.TX_E); }
+    else if (gx > xl + j and gx < hcol(j)) { rt.route(C_S, rt.RX_W, rt.TX_E); }
+    else if (gx == hcol(j)) { rt.route(C_S, rt.RX_W, rt.TX_N); }
+  }
+  const jc = chunk_at(gx);
+  if (jc < GHT) {
+    if (gy > F and gy < yl + jc) { rt.route(C_S, rt.RX_S, rt.TX_N); }
+    else if (gy == F) { rt.route(C_S, rt.RX_S, rt.TX_R); }
+  }
+  // E.
+  const x0 = origin_x(0);
+  const y0 = 2 * GHT - 1;
+  if (jc < GHT) {
+    if (gy == F) { rt.route(C_E, rt.RX_R, rt.TX_N); }
+    else if (gy > y0 - jc and gy < F) { rt.route(C_E, rt.RX_S, rt.TX_N); }
+    else if (gy == y0 - jc) { rt.route(C_E, rt.RX_S, rt.TX_W); }
+  }
+  if (gy + GHT > y0 and gy <= y0) {
+    const j = y0 - gy;
+    if (gx > x0 + j and gx < hcol(j)) { rt.route(C_E, rt.RX_E, rt.TX_W); }
+    else if (gx == x0 + j) { rt.route(C_E, rt.RX_E, rt.TX_N); }
+  }
+  if (gx >= x0 and gx < x0 + GHT) {
+    const j = gx - x0;
+    if (gy > j and gy < y0 - j) { rt.route(C_E, rt.RX_S, rt.TX_N); }
+    else if (gy == j) { rt.route(C_E, rt.RX_S, rt.TX_R); }
+  }
+}
+
+// The VM column's share (VM 1: only the staircases' row legs cross it, toward
+// chunk columns past the VM columns): smaller code than routes() on the VM's
+// full PEs.
+fn vm_routes(gy: u16) void {
+  const yl = origin_y(NL - 1);
+  if (gy >= yl and gy < yl + GHT and gy - yl >= VMAT) { rt.route(C_S, rt.RX_W, rt.TX_E); }
+  const y0 = 2 * GHT - 1;
+  if (gy + GHT > y0 and gy <= y0 and y0 - gy >= VMAT) { rt.route(C_E, rt.RX_E, rt.TX_W); }
+}

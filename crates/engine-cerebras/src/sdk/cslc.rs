@@ -8,11 +8,15 @@
 //!
 //! Locations come from the environment when set, otherwise from the
 //! standard image layout:
-//! - `PIE_CEREBRAS_CSLC`: the front-end script (default: the single
+//! - the `cslc` switch: the front-end script (default: the single
 //!   `/cb/toolchains/cslang/rel-sdk-*/*/bin/cslc`);
-//! - `PIE_CEREBRAS_PYTHON`: the interpreter (default
+//! - the `python` switch: the interpreter (default
 //!   `/python/python-x86_64/bin/python3`);
-//! - `PIE_CEREBRAS_SDK_LIB`: shared with [`super::Sdk`] (default `/cbcore/lib`).
+//! - the `sdk_lib` switch: shared with [`super::Sdk`] (default `/cbcore/lib`;
+//!   its parent is the image's `/cbcore`);
+//! - the `cslang_root` switch: where the default `cslc` is looked for.
+//!
+//! A memcpy program's fabric is [`memcpy_fabric`]'s halo around it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -76,11 +80,12 @@ impl Compile {
         h: u32,
         out: impl Into<PathBuf>,
     ) -> Self {
+        let (fabric_dims, fabric_offsets) = memcpy_fabric(w, h);
         Compile {
             arch,
             layout: layout.into(),
-            fabric_dims: (w + 7, h + 2),
-            fabric_offsets: (4, 1),
+            fabric_dims,
+            fabric_offsets,
             params: Vec::new(),
             memcpy: true,
             // One channel a row: host copies stream in parallel down the rows.
@@ -132,10 +137,10 @@ pub struct Cslc {
 impl Cslc {
     /// Finds the compiler from the environment or the standard image layout.
     pub fn find() -> Result<Self, Error> {
-        let python = std::env::var_os("PIE_CEREBRAS_PYTHON")
+        let python = crate::switches::get("python")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/python/python-x86_64/bin/python3"));
-        let frontend = match std::env::var_os("PIE_CEREBRAS_CSLC") {
+        let frontend = match crate::switches::get("cslc") {
             Some(p) => PathBuf::from(p),
             None => default_frontend()?,
         };
@@ -233,14 +238,11 @@ impl Cslc {
         }
         cmd.env_remove("PYTHONHOME").env_remove("VIRTUAL_ENV");
 
-        // The compiler is bounded (`PIE_CEREBRAS_COMPILE_TIMEOUT` seconds,
+        // The compiler is bounded (the `compile_timeout` switch, seconds;
         // 1800 by default): a hung front end or linker must not hold a
         // fire forever.
         let timeout = std::time::Duration::from_secs(
-            std::env::var("PIE_CEREBRAS_COMPILE_TIMEOUT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1800),
+            crate::switches::parse("compile_timeout").unwrap_or(1800),
         );
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -291,8 +293,18 @@ impl Cslc {
     }
 }
 
+/// The smallest fabric a memcpy program of `w` x `h` PEs fits, and its
+/// offset: the memcpy layouts take 7 extra columns and 2 extra rows, the
+/// program placed at (4, 1).
+#[must_use]
+pub fn memcpy_fabric(w: u32, h: u32) -> ((u32, u32), (u32, u32)) {
+    ((w + 7, h + 2), (4, 1))
+}
+
 fn default_frontend() -> Result<PathBuf, Error> {
-    let root = Path::new("/cb/toolchains/cslang");
+    let root = crate::switches::get("cslang_root")
+        .map_or_else(|| PathBuf::from("/cb/toolchains/cslang"), PathBuf::from);
+    let root = root.as_path();
     let mut found = Vec::new();
     for release in read_dirs(root) {
         for build in read_dirs(&release) {

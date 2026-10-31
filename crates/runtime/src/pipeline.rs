@@ -18,6 +18,9 @@ pub struct Pipeline {
     pub(crate) failure: PipelineFailure,
     pub(crate) scope: crate::store::PipelineScope,
     pub(crate) frame_seq: std::sync::atomic::AtomicU64,
+    /// The frames it posted and whether it closed, shared with every fire it
+    /// hands an engine (`engine::ahead::Ahead`).
+    pub(crate) posts: Arc<::engine::ahead::Posts>,
 }
 
 impl Pipeline {
@@ -34,6 +37,7 @@ impl Pipeline {
                     .is_none_or(|fires| fires.lock().unwrap().is_empty())
             }),
             frame_seq: std::sync::atomic::AtomicU64::new(0),
+            posts: Arc::default(),
         }
     }
 
