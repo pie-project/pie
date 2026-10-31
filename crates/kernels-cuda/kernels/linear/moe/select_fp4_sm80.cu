@@ -556,7 +556,7 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_mma_pipe(
     constexpr int kWRuns = kWarps * kTiles * 2 * 32;
     constexpr int kStage = kXRuns + kWRuns + kWRuns / 16;
 
-    const int at = static_cast<int>(act_div == 1 ? blockIdx.y : blockIdx.x);
+    const int at = static_cast<int>(blockIdx.y);
     if (at >= offsets[num_experts + 1]) return;
     const int item = work[at];
     const int expert = item >> 16;
@@ -570,7 +570,7 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_mma_pipe(
     const int lane = tid & 31;
     const int g = lane >> 2;
     const int c = lane & 3;
-    const int row_base = static_cast<int>(act_div == 1 ? blockIdx.x : blockIdx.y) * kRowsCta + warp * kRowsWarp;
+    const int row_base = static_cast<int>(blockIdx.x) * kRowsCta + warp * kRowsWarp;
     const int span = kGlu != 0 ? inter : n;
     auto tile_row = [&](int t) { return kGlu != 0 ? row_base + t * inter : row_base + 16 * t; };
     const bool rows_live = row_base < span;
