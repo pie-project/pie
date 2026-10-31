@@ -9,10 +9,12 @@
   --mode paths   greedy tokens past a forgotten span, host loop against run-ahead.
   --mode decl    what a plain lane reads out.
   --mode merged  chunks read apart and merged, against one sequence masked to match.
+  --mode read    a codebase read in order, or in parallel and merged; then questions.
   --mode team    sub-agents forked from one context, each asked about its own module;
                  `focus` makes each forget the other modules first.
 """
 
+import json
 import random
 import time
 
@@ -378,6 +380,100 @@ async def merged(input: dict) -> dict:
     }
 
 
+async def read(input: dict) -> dict:
+    """A codebase attached as `docs`. `seq` reads it in order, as one context. `par` forks a reader
+    for each chunk, reads them side by side at the positions they would have had, and merges
+    them. Then both answer the same questions, some of which need two chunks."""
+    data = json.loads(session.file("docs"))
+    header, chunks, questions = data["header"], data["chunks"], data["questions"]
+    arm, decode = input.get("arm", "par"), input.get("decode", 12)
+    h, each, count = len(header), len(chunks[0]), len(chunks)
+    v = model.output_vocab_size()
+    ws, pipe = WorkingSet(), Pipeline()
+    await step(ws, pipe, header)
+    t0 = time.monotonic()
+    readers = []
+    if arm == "seq":
+        for part in chunks:
+            for at in range(0, each, 1024):
+                await step(ws, pipe, part[at:at + 1024])
+    else:
+        readers = [ws.fork(pipe) for _ in chunks]
+        width = input.get("width", 1024 // count)
+        for at in range(0, each, width):
+            rows = [part[at:at + width] for part in chunks]
+            fwd = ForwardPass()
+            fwd.embed(
+                Channel.from_([token for row in rows for token in row], dtype.i32),
+                Channel.from_([i * len(rows[0]) for i in range(count + 1)], dtype.u32),
+            )
+            spots = [h + i * each + at + j for i in range(count) for j in range(len(rows[0]))]
+            fwd.state(readers, StateGeometry.folding(positions=Channel.from_(spots, dtype.u32)))
+            done = Channel([count], dtype.i32)
+
+            @fwd.epilogue
+            def _():
+                done.put(reduce_argmax(reshape(intrinsics.output(0, "logits"), [count, v])))
+
+            pipe.submit(fwd)
+            await done.take_host()
+    reading = time.monotonic() - t0
+    t0 = time.monotonic()
+    merged_slots = sum(ws.merge(reader, h, h + each) for reader in readers)
+    merging = time.monotonic() - t0
+    batch, answers = input.get("batch", 16), []
+    t0 = time.monotonic()
+    for at in range(0, len(questions), batch):
+        group = questions[at:at + batch]
+        forks = [ws.fork(pipe) for _ in group]
+        lanes = len(group)
+        indptr = [0]
+        for question in group:
+            indptr.append(indptr[-1] + len(question["q"]))
+        first = Channel([lanes], dtype.i32)
+        ask = ForwardPass()
+        ask.embed(Channel.from_([t for question in group for t in question["q"]], dtype.i32), Channel.from_(indptr, dtype.u32))
+        ask.state(forks, StateGeometry.folding())
+
+        @ask.epilogue
+        def _():
+            first.put(reduce_argmax(reshape(intrinsics.output(0, "logits"), [lanes, v])))
+
+        pipe.submit(ask)
+        heads = await first.take_host()
+        tok_in = Channel.from_(heads, dtype.i32)
+        tok_out = Channel([lanes], dtype.i32).capacity(channel_capacity())
+        go = ForwardPass()
+        go.embed(tok_in, Channel.from_(list(range(lanes + 1)), dtype.u32))
+        go.state(forks, StateGeometry.folding())
+
+        @go.epilogue
+        def _():
+            token = reduce_argmax(reshape(intrinsics.output(0, "logits"), [lanes, v]))
+            tok_in.put(token)
+            tok_out.put(token)
+
+        out = [[t] for t in heads]
+
+        async def on_step() -> bool:
+            for lane, token in enumerate(await tok_out.take_host()):
+                out[lane].append(token)
+            return True
+
+        await pipe.run_ahead(go, decode, on_step, end=False)
+        answers += [model.decode(row) for row in out]
+    asking = time.monotonic() - t0
+    pipe.close()
+    tally = lambda kind: sum(q["a"] in text for q, text in zip(questions, answers) if q["kind"] == kind)
+    return {
+        "arm": arm, "chunks": count, "tokens": h + each * count, "merged_slots": merged_slots,
+        "read_s": round(reading, 2), "read_tps": round(each * count / reading, 1), "merge_ms": round(merging * 1000, 2),
+        "ask_s": round(asking, 2), "questions": len(questions),
+        "right_one": tally("one"), "right_two": tally("two"), "of_each": len(questions) // 2,
+        "samples": [text[:14] for text in answers[:6]],
+    }
+
+
 async def sweep(input: dict) -> dict:
     """`speed` over every context and fraction, in one engine."""
     rows = []
@@ -393,4 +489,4 @@ async def main(input: dict) -> dict:
     mode = input.get("mode", "exact")
     if mode == "decl":
         return {"outputs": [[o.name, o.width, o.layers, o.readout] for o in model.lane([]).outputs], "page": kv_page_size()}
-    return await {"exact": exact, "speed": speed, "sweep": sweep, "paths": paths, "team": team, "merged": merged}[mode](input)
+    return await {"exact": exact, "speed": speed, "sweep": sweep, "paths": paths, "team": team, "merged": merged, "read": read}[mode](input)
