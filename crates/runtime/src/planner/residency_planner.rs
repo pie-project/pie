@@ -6,7 +6,9 @@ use tokio::sync::Notify;
 
 use crate::store::rs::RsUnits;
 
+use super::departure::Departure;
 use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReservation};
+use super::holdings::held_page_count;
 use super::inner::Inner;
 use super::pool::PoolPort;
 use super::proc::{Proc, Residency};
@@ -449,8 +451,40 @@ impl ResidencyPlanner {
         });
     }
 
+    /// The hold `pid` keeps on its place here past its exit (see
+    /// [`Departure`]): the same one for every holder while any lives, none
+    /// once `pid` has left.
+    pub fn departure(self: &Arc<Self>, pid: ProcessId) -> Option<Arc<Departure>> {
+        self.with_inner(|inner| {
+            let proc = inner.procs.get_mut(&pid)?;
+            if let Some(departure) = proc.departure.upgrade() {
+                return Some(departure);
+            }
+            let departure = Arc::new(Departure::new(self, pid));
+            proc.departure = Arc::downgrade(&departure);
+            Some(departure)
+        })
+    }
+
+    /// `pid`'s last hold dropped: what its working sets held is back.
+    pub(super) fn departed(self: &Arc<Self>, pid: ProcessId) {
+        let settled = self.with_inner(|inner| {
+            !inner.procs.contains_key(&pid) && inner.evicting.remove(&pid).is_some()
+        });
+        if settled {
+            self.re_arm_idle_reclaim();
+            self.poke();
+        }
+    }
+
+    /// `pid` leaves: its client has heard, its seat and asks go now. What
+    /// its working sets hold stays on its way back, as an eviction's would,
+    /// until its last [`Departure`] hold drops (each set's release drops its
+    /// own, however long a fire leases it), so the fleet is not read as
+    /// wedged for pages no one registered holds.
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
-        self.note_releasing(pid);
+        let (model, engine) = self.port.locus();
+        let held = held_page_count(pid, model, engine);
         // A seat taken again after the process ended goes back.
         crate::inferlet::process::vacate_seat(pid);
         let (signal, removed) = self.with_inner(|inner| {
@@ -464,8 +498,23 @@ impl ResidencyPlanner {
             {
                 inner.completion_credit = inner.completion_credit.saturating_add(1);
             }
-            let signal = departed.map(|proc| proc.signal);
             inner.settle_eviction(pid);
+            // Its holds outlive it only while one lives; the last one's drop
+            // settles this, and cannot have run before it is put here.
+            if held > 0
+                && departed
+                    .as_ref()
+                    .is_some_and(|proc| proc.departure.strong_count() > 0)
+            {
+                inner.evicting.insert(
+                    pid,
+                    Reclaim {
+                        pages: held,
+                        rs: RsUnits::default(),
+                    },
+                );
+            }
+            let signal = departed.map(|proc| proc.signal);
             inner.killing.remove(&pid);
             inner.host_swap_blocked.clear();
             inner.prepare_blocked.clear();
@@ -492,33 +541,6 @@ impl ResidencyPlanner {
         drop(removed);
         self.re_arm_idle_reclaim();
         self.poke();
-    }
-
-    /// The working sets `pid` leaves holding pages: its residency still
-    /// names them here, and they drop after it is gone. Under the kv lock a
-    /// release cannot slip between the count and the note: one done before
-    /// holds nothing, one after finds its note to clear.
-    fn note_releasing(&self, pid: ProcessId) {
-        let (model, engine) = self.port.locus();
-        let sets = crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine);
-        if sets.is_empty() {
-            return;
-        }
-        let Some(stores) = crate::store::registry::try_get(model, engine) else {
-            return;
-        };
-        crate::store::registry::with_kv_lock(&stores.kv, "planner-departure", |kv| {
-            let holding: Vec<_> = sets
-                .into_iter()
-                .filter(|&ws| kv.held_page_count(&HashSet::from([ws])).unwrap_or(0) > 0)
-                .collect();
-            self.with_inner(|inner| inner.releasing.extend(holding));
-        });
-    }
-
-    /// `ws` released (a departed process's pages back, or anyone's).
-    pub fn working_set_released(&self, ws: crate::store::kv::page_table::WorkingSetId) {
-        self.with_inner(|inner| inner.releasing.remove(&ws));
     }
 
     pub fn pages_freed(self: &Arc<Self>) {

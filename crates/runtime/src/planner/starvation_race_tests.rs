@@ -316,29 +316,82 @@ fn unfailed(planner: &ResidencyPlanner, keys: &[EntryKey]) -> usize {
     })
 }
 
-#[test]
-fn a_departure_s_pages_are_waited_for_before_an_ask_holding_nothing_fails() {
-    // The finished process's working set still holds its pages: nothing
-    // fails while it does. Once it is released, a stall that remains is a
-    // wedge, and the youngest ask fails as before.
-    let pool = Arc::new(RacePool::new(8));
-    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
-    let keys = dry_pool_two_asks(&planner);
-    let model = crate::store::registry::register_model(16, &[64], &[2]);
-    let gone = crate::store::registry::get(model, 0)
-        .kv
+type HeldResidency = Arc<std::sync::Mutex<crate::inferlet::process::residency::ProcessResidency>>;
+
+/// A process about to leave: registered and admitted, its residency naming
+/// one KV working set that holds two device pages. With `hold`, the set
+/// holds the process's [`crate::planner::Departure`] as its context gives
+/// it one.
+struct Leaving {
+    pid: ProcessId,
+    ws: crate::store::kv::working_set::KvWorkingSet,
+    departure: Arc<crate::planner::Departure>,
+    residency: HeldResidency,
+}
+
+fn leaving(planner: &Arc<ResidencyPlanner>, model: usize, hold: bool) -> Leaving {
+    use crate::inferlet::process::residency::{ProcessResidency, register_residency};
+    let stores = crate::store::registry::get(model, 0);
+    let id = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+        let id = kv.create_working_set();
+        kv.reserve(id, 2).unwrap();
+        let mut granted = kv.reserve_device_pages(2).unwrap();
+        kv.ensure_backed_reserved(id, 2, &mut granted).unwrap();
+        id
+    });
+    let ws = crate::store::kv::working_set::KvWorkingSet::new(model, 0, id, 16);
+    let pid = ProcessId::new_v4();
+    let residency = Arc::new(std::sync::Mutex::new(ProcessResidency::default()));
+    residency
         .lock()
-        .create_working_set();
-    planner.with_inner(|inner| inner.releasing.insert(gone));
-    assert!(planner.is_wedged());
-    planner.check_starvation(StarveCause::NoSwapRoom);
-    assert_eq!(
-        unfailed(&planner, &keys),
-        2,
-        "an ask fails while a departure's pages come back"
-    );
-    planner.working_set_released(gone);
-    planner.check_starvation(StarveCause::NoSwapRoom);
+        .unwrap()
+        .kv_working_sets
+        .insert((model, 0, id), ws.suspend_handle());
+    register_residency(pid, Arc::downgrade(&residency));
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let departure = planner.departure(pid).expect("a registered process");
+    assert!(Arc::ptr_eq(&departure, &planner.departure(pid).unwrap()));
+    if hold {
+        ws.hold_departure(departure.clone());
+    }
+    Leaving {
+        pid,
+        ws,
+        departure,
+        residency,
+    }
+}
+
+/// `Process::terminate`'s planner steps: the planner forgets it, it gives
+/// its own hold up, its residency goes. Its working set, still in the
+/// resource table the teardown holds, is what is left.
+fn terminate(
+    planner: &Arc<ResidencyPlanner>,
+    leaving: Leaving,
+) -> (ProcessId, crate::store::kv::working_set::KvWorkingSet) {
+    planner.unregister(leaving.pid);
+    drop(leaving.departure);
+    crate::inferlet::process::residency::unregister_residency(leaving.pid);
+    drop(leaving.residency);
+    assert!(planner.departure(leaving.pid).is_none(), "it has left");
+    (leaving.pid, leaving.ws)
+}
+
+/// A dry pool of eight pages at `model`'s locus, where the departing
+/// processes' working sets live.
+fn departure_pool(model: usize) -> Arc<dyn PoolPort> {
+    Arc::new(RacePool {
+        rs_model: Some(model),
+        ..RacePool::new(8)
+    })
+}
+
+fn on_its_way_back(planner: &ResidencyPlanner, pid: ProcessId) -> Option<u32> {
+    planner.with_inner(|inner| inner.evicting.get(&pid).map(|mark| mark.pages))
+}
+
+fn youngest_starved(planner: &ResidencyPlanner, keys: &[EntryKey]) {
     planner.with_inner(|inner| {
         assert!(matches!(
             inner.queue[&keys[0]].kind,
@@ -355,25 +408,45 @@ fn a_departure_s_pages_are_waited_for_before_an_ask_holding_nothing_fails() {
 }
 
 #[test]
+fn a_departure_s_pages_are_waited_for_before_an_ask_holding_nothing_fails() {
+    // The finished process has left the planner, but its working set still
+    // holds its pages until the teardown drops its resources: nothing fails
+    // while it does. Once the set is released, a stall that remains is a
+    // wedge, and the youngest ask fails as before.
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let keys = dry_pool_two_asks(&planner);
+    let (pid, ws) = terminate(&planner, leaving(&planner, model, true));
+    assert_eq!(on_its_way_back(&planner, pid), Some(2));
+    assert!(!planner.is_wedged(), "its pages are on their way back");
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    assert_eq!(
+        unfailed(&planner, &keys),
+        2,
+        "an ask fails while a departure's pages come back"
+    );
+    // The release itself pokes the planner, which finds the wedge: no
+    // later event is needed to fail the youngest ask.
+    drop(ws);
+    assert_eq!(on_its_way_back(&planner, pid), None, "its set is released");
+    youngest_starved(&planner, &keys);
+}
+
+#[test]
 fn a_departure_held_behind_a_long_fire_is_waited_for_however_long() {
     // The departed process's working set is released while a fire still
     // leases it (a launch can take minutes): its pages come back only when
     // the lease drops. No clock is involved: the planner waits for the
     // release itself, so the empty asker does not fail before it.
     let model = crate::store::registry::register_model(16, &[64], &[2]);
-    let stores = crate::store::registry::get(model, 0);
-    let id = stores.kv.lock().create_working_set();
-    crate::planner::init_planner(
-        model,
-        0,
-        ResidencyPlanner::new(Arc::new(RacePool::new(8)) as Arc<dyn PoolPort>),
-    );
+    crate::planner::init_planner(model, 0, ResidencyPlanner::new(departure_pool(model)));
     let planner = crate::planner::planner_for(model, 0).expect("the test model's planner");
     let keys = dry_pool_two_asks(&planner);
-    let ws = crate::store::kv::working_set::KvWorkingSet::new(model, 0, id, 16);
-    let lease = ws.fire_lease().expect("a fire leases the working set");
-    planner.with_inner(|inner| inner.releasing.insert(id));
+    let gone = leaving(&planner, model, true);
+    let lease = gone.ws.fire_lease().expect("a fire leases the working set");
+    let (pid, ws) = terminate(&planner, gone);
     ws.release();
+    drop(ws);
     for _ in 0..100 {
         planner.check_starvation(StarveCause::NoSwapRoom);
     }
@@ -382,10 +455,11 @@ fn a_departure_held_behind_a_long_fire_is_waited_for_however_long() {
         2,
         "an ask fails while the departure's release waits on a fire"
     );
-    assert!(planner.with_inner(|inner| inner.releasing.contains(&id)));
+    assert_eq!(on_its_way_back(&planner, pid), Some(2));
     drop(lease);
-    assert!(
-        planner.with_inner(|inner| inner.releasing.is_empty()),
+    assert_eq!(
+        on_its_way_back(&planner, pid),
+        None,
         "the fire's end releases the working set"
     );
     planner.check_starvation(StarveCause::NoSwapRoom);
@@ -394,6 +468,75 @@ fn a_departure_held_behind_a_long_fire_is_waited_for_however_long() {
         1,
         "a stall that outlasts the release is a wedge"
     );
+}
+
+#[test]
+fn a_departure_never_waits_on_its_pages_nor_outlives_its_holds() {
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+
+    // Its exit is not held up by a set a fire leases: its asks and its
+    // place go at once, and the completion is credited.
+    let gone = leaving(&planner, model, true);
+    let ask = planner.with_inner(|inner| {
+        inner.enqueue(
+            gone.pid,
+            allocation(Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            }),
+        )
+    });
+    let lease = gone.ws.fire_lease().unwrap();
+    let credit = planner.with_inner(|inner| inner.completion_credit);
+    let (pid, ws) = terminate(&planner, gone);
+    planner.with_inner(|inner| {
+        assert!(!inner.procs.contains_key(&pid));
+        assert!(!inner.queue.contains_key(&ask));
+        assert_eq!(inner.completion_credit, credit + 1);
+    });
+    assert_eq!(on_its_way_back(&planner, pid), Some(2));
+    drop((ws, lease));
+    assert_eq!(on_its_way_back(&planner, pid), None);
+
+    // A set released before its process leaves leaves nothing on the way.
+    let gone = leaving(&planner, model, true);
+    gone.ws.release();
+    let (pid, _ws) = terminate(&planner, gone);
+    assert_eq!(on_its_way_back(&planner, pid), None);
+
+    // A suspend in flight as it leaves: the suspend's end does not settle
+    // the departure, its set's release does.
+    let gone = leaving(&planner, model, true);
+    let wake = planner.with_inner(|inner| {
+        inner.begin_eviction(
+            gone.pid,
+            Reclaim {
+                pages: 2,
+                rs: RsUnits::default(),
+            },
+        )
+    });
+    drop(wake);
+    let (pid, ws) = terminate(&planner, gone);
+    planner.report_evicted(pid, 2, RsUnits::default());
+    assert_eq!(on_its_way_back(&planner, pid), Some(2));
+    planner.eviction_failed(pid);
+    assert_eq!(on_its_way_back(&planner, pid), Some(2));
+    drop(ws);
+    assert_eq!(on_its_way_back(&planner, pid), None);
+}
+
+#[test]
+fn pages_no_hold_watches_are_not_waited_for() {
+    // A set its context never saw holds no departure: no release would
+    // clear a mark for it, so none is made, and the stall is a wedge.
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let keys = dry_pool_two_asks(&planner);
+    let (pid, _ws) = terminate(&planner, leaving(&planner, model, false));
+    assert_eq!(on_its_way_back(&planner, pid), None);
+    youngest_starved(&planner, &keys);
 }
 
 #[test]
