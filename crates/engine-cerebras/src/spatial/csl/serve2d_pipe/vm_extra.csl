@@ -1,0 +1,17 @@
+// ---------------------------------------------------------------- serve2d_pipe
+// (appended to Fork 3's banked multi-column VM by serve2d_pipe/sync.py) The
+// VM on the ring's head: vm_lanes = MMAX·B lane banks, one turn a sampled lane
+// step. The head sends rows (and takes tokens) only on sampled iterations
+// (i >= 1), in lane order v = m·B + b, nmb = MMAX micro-batches, so turn t is
+// lane t % vm_lanes. The staircases' row legs cross the VM columns.
+const s2d_paths = @import_module("paths.csl", .{ .GWD = GPX, .GHT = GPY, .GW = GW, .GH = GH, .NL = GW * GH,
+                                                 .XH = GW * GPX, .F = F, .C = C, .VMC = NVC, .VMAT = R2X + 1 });
+fn s2d_vm_paths() void {
+  s2d_paths.vm_routes(layout_mod.get_y_coord());
+}
+
+// The ring's `compute(laps, nmb)`: laps · nmb · B lane-turns.
+fn compute(laps: u32, nmb: u32) void {
+  // nmb's high half: the head's launch flags (DEFER).
+  s2d_vm_run(laps * (nmb & 0xffff) * @as(u32, S2D_SB));
+}

@@ -1,0 +1,176 @@
+// ---------------------------------------------------------------- serve2d
+// (appended to head2d's pe.csl by serve2d/sync.py) The head in the model:
+// - its feeder row takes the last layer's x by the S staircase (chunk j into
+//   the feeder PE of chunk column j; one block, NB = 1);
+// - the final root decides each step's token: a forced (prompt) token wins,
+//   else the argmax; it records the argmax in `out_tokens`;
+// - the winner row's chunks go up or down their columns to the feeder on one
+//   color (EU): static pass-through routes toward the feeder; the winning PE
+//   switches its own to inject, and back only after the next step's x has
+//   arrived (a whole layer pass later: its wavelets are long gone); the
+//   feeder's input queue 3 is bound to EU once, and only its route's input
+//   side (north or south) is set a step (an early chunk waits on the link);
+//   from the feeder to layer 0 by the E staircase;
+// - `compute(steps, start_pos)`: steps + 1 iterations. Iteration 0 runs on
+//   x = 0 and takes the forced first token (it only starts the loop);
+//   iteration i >= 1 takes layer step i - 1's output; the last sends nothing.
+// - SB lanes (the paged grids' B): an iteration runs the head once a lane.
+//   The feeder takes every lane's x at once (S carries SB x Hc a chunk,
+//   lane-major), feeds them a lane at a time, collects the lanes' embedding
+//   chunks and sends them to layer 0 together after the last lane. Tokens are
+//   per lane: in_tokens/out_tokens [SB][CAP]; logits rows and 1/rms per lane
+//   (hlogits [SB][Vr], yscale [SB]) are the last iteration's.
+// The cross-block queues 3/4 (unused with one block) carry the feeder's
+// serve2d traffic: input 4 = S, input 3 = EU, output 4 = E.
+const s2d_rt = @import_module("rt.csl");
+const s2d_paths = @import_module("paths.csl", .{ .GWD = GPX, .GHT = GPY, .GW = GW, .GH = GH,
+                                                 .NL = GW * GH, .XH = GW * GPX, .F = F, .C = C, .VMC = VMC,
+                                                 .VMAT = R2X + 1 });
+// The winner row's chunk to the feeder: color 11, the grids' R0, which no head
+// router otherwise carries (routers are per PE).
+const C_EU: color = @get_color(11);
+comptime {
+  @comptime_assert(NB == 1);           // the feeder's queues 3/4 and the staircases (one chunk a column)
+  @comptime_assert(C == GPY);          // a feeder column a grid row (x's chunk)
+}
+
+const SAMPLE: u32 = 0xffffffff;
+var in_tokens = @zeros([SB * CAP]u32);       // the final root's: forced tokens [lane][i] (SAMPLE: the argmax)
+var in_tokens_ptr: [*]u32 = &in_tokens;
+var out_tokens = @zeros([SB * CAP]u32);      // the final root's: iteration i's argmax at [lane][i - 1]
+var out_tokens_ptr: [*]u32 = &out_tokens;
+var s2d_lane: u16 = 0;
+// The final RMSNorm's 1/rms (head2d's `yscale`, the same on every root PE),
+// for reading logits: y * yscale.
+var s2d_yscale = @zeros([SB]f32);
+var s2d_yscale_ptr: [*]f32 = &s2d_yscale;
+// A root PE's logits rows (its Vr vocab rows), before 1/rms: lanes 0..HLB-1
+// only (memory: at SB = 16 every lane's row would not fit a head PE).
+var s2d_hl = @zeros([HLB * Vr]f32);
+var s2d_hl_ptr: [*]f32 = &s2d_hl;
+const s2d_hl_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> s2d_hl[i] });
+var s2d_iter: u32 = 0;
+var s2d_steps: u32 = 0;
+var s2d_injected: bool = false;
+const s2d_emb_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> emb[i] });
+// The feeder's lanes: x in (from S), embedding chunks out (to E).
+var s2d_xb = @zeros([SB * Hc]f32);
+const s2d_xb_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SB * Hc} -> s2d_xb[i] });
+const s2d_xb1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> s2d_xb[i] });
+var s2d_eb = @zeros([SB * Hc]f32);
+const s2d_eb_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SB * Hc} -> s2d_eb[i] });
+const s2d_eb1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> s2d_eb[i] });
+
+fn s2d_head_init() void {
+  s2d_paths.routes(px + GW * GPX, py);
+  if (vm) { return; }
+  if (py == F) {
+    color_config.reset_routes(C_EU, .{ .rx = NORTH, .tx = RAMP });
+    s2d_rt.iq_color(3, s2d_rt.cn(C_EU));
+    s2d_rt.iq_color(4, s2d_rt.cn(s2d_paths.C_S));
+    s2d_rt.oq_color(4, s2d_rt.cn(s2d_paths.C_E));
+  } else {
+    s2d_pass();
+  }
+}
+
+// A region PE's EU route: passing the column on toward the feeder. Routes that
+// change while the head runs go through <tile_config>'s reset_routes (as
+// head2d's own runtime switches do).
+fn s2d_pass() void {
+  if (py < F) { color_config.reset_routes(C_EU, .{ .rx = NORTH, .tx = SOUTH }); }
+  else { color_config.reset_routes(C_EU, .{ .rx = SOUTH, .tx = NORTH }); }
+}
+
+// A region PE, once this step's x has arrived (a whole layer pass after the
+// last embedding chunk left): back to passing the column through, queue 3's
+// output back to the row chain.
+fn s2d_after_x() void {
+  if (s2d_injected) {
+    s2d_pass();
+    s2d_rt.oq_color(3, s2d_rt.cn(c_r1_0));
+    s2d_injected = false;
+  }
+}
+
+// The feeder's x: zeros at the bootstrap iteration, else the last layer's
+// chunk from S.
+fn s2d_feeder_in() void {
+  if (s2d_iter == 0) {
+    @fmovs(xin_dsd, 0.0);
+    return;
+  }
+  if (s2d_lane == 0) { @fmovs(s2d_xb_dsd, fin(q_r1_1_in, SB * Hc)); }
+  @fmovs(xin_dsd, @increment_dsd_offset(s2d_xb1_dsd, @as(i16, s2d_lane * Hc), f32));
+}
+
+// The final root: this iteration's token from the argmax `v` (-1: not
+// certified yet, the exact round decides).
+fn s2d_decide(v: f32) f32 {
+  const i = s2d_iter;
+  const row = @as(u32, s2d_lane) * @as(u32, CAP);
+  if (v >= 0.0 and i >= 1 and i <= CAP) { out_tokens[row + i - 1] = @as(u32, v); }
+  if (i < CAP and in_tokens[row + i] != SAMPLE) { return @as(f32, in_tokens[row + i]); }
+  return v;
+}
+
+// The winner's vocab row: its region row, and whether it is above the feeder.
+fn s2d_winner_above() bool {
+  const v = @as(u32, ib[0]);
+  const r = (v / @as(u32, Vr)) % @as(u32, H);
+  return r < @as(u32, F);
+}
+
+// A region PE of the winner's row sends its embedding chunk to the feeder
+// (not on a launch's last iteration).
+fn s2d_emb_out() void {
+  if (root_col) {
+    s2d_yscale[s2d_lane] = yscale;
+    if (s2d_lane < HLB) {
+      @fmovs(@increment_dsd_offset(s2d_hl_dsd, @as(i16, s2d_lane * Vr), f32), y_dsd);
+    }
+  }
+  if (vm or s2d_iter >= s2d_steps or S2D_DBG >= 2) { return; }
+  const v = @as(u32, ib[0]);
+  if (!(v >= base and v < base + @as(u32, nvalid))) { return; }
+  if (py < F) { color_config.reset_routes(C_EU, .{ .rx = RAMP, .tx = SOUTH }); }
+  else { color_config.reset_routes(C_EU, .{ .rx = RAMP, .tx = NORTH }); }
+  s2d_rt.oq_color(3, s2d_rt.cn(C_EU));
+  s2d_injected = true;
+  @fmovs(fout(q_r1_0_out, Hc), s2d_emb_dsd);
+}
+
+// A feeder PE: the winner's chunk from its column, on to layer 0 (E).
+fn s2d_feeder_emb() void {
+  if (vm or s2d_iter >= s2d_steps or S2D_DBG >= 2) { return; }
+  if (s2d_winner_above()) { color_config.reset_routes(C_EU, .{ .rx = NORTH, .tx = RAMP }); }
+  else { color_config.reset_routes(C_EU, .{ .rx = SOUTH, .tx = RAMP }); }
+  @fmovs(@increment_dsd_offset(s2d_eb1_dsd, @as(i16, s2d_lane * Hc), f32), fin(q_r1_0_in, Hc));
+  if (s2d_lane == SB - 1) { @fmovs(fout(q_r1_1_out, SB * Hc), s2d_eb_dsd); }
+}
+
+// `steps` model steps from position `start_pos` (the grids' count): steps + 1
+// head iterations, see above. start_pos is the grids' (the head keeps none).
+fn compute(steps: u32, start_pos: u32) void {
+  timestamp.enable_tsc();
+  s2d_steps = steps;
+  var i: u32 = 0;
+  while (i <= steps) : (i += 1) {
+    s2d_iter = i;
+    var b: u16 = 0;
+    while (b < SB) : (b += 1) {
+      s2d_lane = b;
+      timing = i > 1;
+      timestamp.get_timestamp(&t_mark);
+      if (vm) { step_vm(); } else if (py == F) { step_feeder(); } else { step_region(); }
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @export_symbol(in_tokens_ptr, "in_tokens");
+  @export_symbol(out_tokens_ptr, "out_tokens");
+  @export_symbol(s2d_yscale_ptr, "yscale");
+  @export_symbol(s2d_hl_ptr, "hlogits");
+}

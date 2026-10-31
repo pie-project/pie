@@ -1,0 +1,7 @@
+// y[r][at..at + width] = x[r] for `rows` rows, `y` rows `stride` wide.
+fn k_concat_cols(x: [*]f32, y: [*]f32, rows: i32, width: i32, stride: i32, at: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    k_copy(y, r * stride + at, x, r * width, width);
+  }
+}

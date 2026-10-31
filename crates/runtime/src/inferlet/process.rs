@@ -459,12 +459,13 @@ fn spawn_inner(
     crate::offload::executors::set(id, executors.clone());
     crate::policy::schedule::alias(id, inherit_client_pid.unwrap_or(id));
     crate::planner::assign(id, inherit_client_pid);
-    if let Some(planner) = crate::planner::planner_of(id) {
+    let departure = crate::planner::planner_of(id).and_then(|planner| {
         match inherit_seq {
             Some(seq) => planner.register_with_seq(id, seq),
             None => planner.register(id),
         }
-    }
+        planner.departure(id)
+    });
     let process = Process::new(
         id,
         inherit_client_pid.unwrap_or(id),
@@ -477,6 +478,7 @@ fn spawn_inner(
         result_tx,
         arrival,
         executors,
+        departure,
     );
     if let Err(error) = SERVICES.spawn(id, || process) {
         if let Some(planner) = crate::planner::planner_of(id) {
@@ -640,6 +642,9 @@ struct Process {
     arrival: Arrival,
     /// Kept for a restart: the new process runs its passes where this one did.
     executors: Vec<String>,
+    /// Its hold on its place in the planner, given up once it has left:
+    /// the planner forgets it after this and its working sets' holds.
+    departure: Option<Arc<crate::planner::Departure>>,
 }
 
 impl Process {
@@ -666,6 +671,7 @@ impl Process {
         result_tx: SharedResultTx,
         arrival: Arrival,
         executors: Vec<String>,
+        departure: Option<Arc<crate::planner::Departure>>,
     ) -> Self {
         let task = Self::run(
             process_id,
@@ -694,6 +700,7 @@ impl Process {
             result_tx,
             arrival,
             executors,
+            departure,
         }
     }
 
@@ -933,6 +940,9 @@ impl Process {
         if let Some(planner) = crate::planner::planner_of(self.process_id) {
             planner.unregister(self.process_id);
         }
+        // After `unregister`: what its working sets still hold is counted
+        // as on its way back until their own holds drop as well.
+        drop(self.departure.take());
         crate::planner::release(self.process_id);
         residency::unregister_residency(self.process_id);
         crate::offload::executors::forget(self.process_id);
@@ -1064,6 +1074,7 @@ mod tests {
             result_tx,
             arrival: Arrival::default(),
             executors: Vec::new(),
+            departure: None,
         }
     }
 

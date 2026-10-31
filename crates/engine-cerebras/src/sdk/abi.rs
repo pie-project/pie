@@ -3,7 +3,8 @@
 //! Every layout here was recovered empirically from SDK 2.10.1 (x86_64,
 //! libstdc++ 13, `_GLIBCXX_USE_CXX11_ABI=1`) by dumping the objects the SDK's
 //! own pybind module builds, and is checked by the simulator round trip in
-//! `examples/gemv.rs`. Nothing in this file is a public API.
+//! the `a_program_compiles_and_runs_on_the_simulator` test. Nothing in this
+//! file is a public API.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;

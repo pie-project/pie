@@ -35,9 +35,9 @@ pub struct Forms {
 /// Whether every stage of `package` lowers (for one lane, every intrinsic
 /// fed as a value), and over how many PEs the lane spreads.
 pub fn admits(package: &LaunchPackage) -> Result<u32, Refused> {
-    if std::env::var_os("PIE_CEREBRAS_GUESTS_ON_HOST").is_some_and(|v| v != "0") {
+    if crate::switches::on("guests_on_host") {
         return Err(Refused(
-            "PIE_CEREBRAS_GUESTS_ON_HOST asks for the host interpreter".into(),
+            "the `guests_on_host` switch asks for the host interpreter".into(),
         ));
     }
     if let Some(cols) = run::columns_above(package, 0) {

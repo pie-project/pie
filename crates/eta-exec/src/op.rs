@@ -130,22 +130,34 @@ pub fn combine_int_argmax(
     left
 }
 
+/// The index of the row's largest non-NaN value, the first of equal ones
+/// (`-0.0 == 0.0`), 0 when no value is greater than NaN. The max runs over
+/// eight independent lanes (a NaN never wins `v > m`, so it needs no test)
+/// and vectorizes; the first index holding it is then found a 64-wide chunk
+/// at a time. At a 151,936-wide row (Qwen3's vocabulary) this is about 0.02
+/// ms where a branchy one-element scan took 0.16.
 #[must_use]
 pub fn argmax_row(row: &[f32]) -> i32 {
-    let mut best = f32::NEG_INFINITY;
-    let mut at = 0u32;
-    let mut have = false;
-    for (j, &value) in row.iter().enumerate() {
-        if value.is_nan() {
-            continue;
-        }
-        if !have || value > best {
-            best = value;
-            at = j as u32;
-            have = true;
+    let mut lanes = [f32::NEG_INFINITY; 8];
+    let (chunks, rest) = row.as_chunks::<8>();
+    for chunk in chunks {
+        for (lane, &value) in lanes.iter_mut().zip(chunk) {
+            *lane = if value > *lane { value } else { *lane };
         }
     }
-    at as i32
+    let mut top = f32::NEG_INFINITY;
+    for &value in lanes.iter().chain(rest) {
+        if value > top {
+            top = value;
+        }
+    }
+    for (c, chunk) in row.chunks(64).enumerate() {
+        if chunk.iter().fold(false, |hit, &value| hit | (value == top)) {
+            let at = chunk.iter().position(|&value| value == top).unwrap_or(0);
+            return (c * 64 + at) as i32;
+        }
+    }
+    0
 }
 
 #[must_use]
@@ -1038,6 +1050,90 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
 #[cfg(test)]
 mod tests {
     use super::{argmax_row, canonical_reduce_by};
+
+    /// The one-element scan `argmax_row` replaced, its reference.
+    fn argmax_row_scan(row: &[f32]) -> i32 {
+        let mut best = f32::NEG_INFINITY;
+        let mut at = 0u32;
+        let mut have = false;
+        for (j, &value) in row.iter().enumerate() {
+            if value.is_nan() {
+                continue;
+            }
+            if !have || value > best {
+                best = value;
+                at = j as u32;
+                have = true;
+            }
+        }
+        at as i32
+    }
+
+    /// Values with many ties and every special: NaN, ±inf, ±0.
+    fn special(state: &mut u64) -> f32 {
+        let mut next = || {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        };
+        match next() % 16 {
+            0 => f32::NAN,
+            1 => f32::INFINITY,
+            2 => f32::NEG_INFINITY,
+            3 => 0.0,
+            4 => -0.0,
+            5..=9 => (next() % 5) as f32 - 2.0,
+            _ => {
+                f32::from_bits((next() as u32) & 0x7f7f_ffff)
+                    * if next().is_multiple_of(2) { 1.0 } else { -1.0 }
+            }
+        }
+    }
+
+    /// The vectorized scan answers exactly what the one-element scan did:
+    /// random rows (ties, NaN, ±inf, ±0) at widths around its 8- and 64-wide
+    /// steps and at Qwen3's vocabulary, all-equal, all-NaN, empty and one-hot
+    /// rows.
+    #[test]
+    fn the_vectorized_scan_answers_what_the_one_element_scan_did() {
+        let same = |row: &[f32]| assert_eq!(argmax_row(row), argmax_row_scan(row), "{row:?}");
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for width in [1usize, 2, 7, 8, 9, 63, 64, 65, 127, 128, 129, 1000, 4096] {
+            for _ in 0..200 {
+                let row: Vec<f32> = (0..width).map(|_| special(&mut state)).collect();
+                same(&row);
+            }
+        }
+        for _ in 0..8 {
+            let row: Vec<f32> = (0..151_936).map(|_| special(&mut state)).collect();
+            same(&row);
+        }
+        for v in [
+            1.5f32,
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ] {
+            for width in [1usize, 9, 65, 151_936] {
+                same(&vec![v; width]);
+            }
+        }
+        for width in [1usize, 9, 65, 151_936] {
+            for at in [0, width / 2, width - 1] {
+                let mut row = vec![0.0f32; width];
+                row[at] = 1.0;
+                same(&row);
+            }
+        }
+        same(&[]);
+        same(&[-0.0, 0.0]);
+        same(&[0.0, -0.0]);
+        same(&[f32::NAN, f32::NEG_INFINITY, f32::NAN]);
+        same(&[f32::NAN, -0.0, f32::NAN, 0.0, 0.0]);
+    }
 
     #[derive(Clone, Copy, Debug)]
     struct ArgmaxCandidate {

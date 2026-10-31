@@ -1,4 +1,4 @@
-//! Runs one compiled program on the fabric simulator in its own process.
+//! Runs one compiled program on the fabric simulator or a CS system in its own process.
 //!
 //! The SDK's simulator can be created once per process, so anything that
 //! runs programs repeatedly (the kernel bench, the engine's tests) spawns this
@@ -18,6 +18,8 @@
 //!
 //! Buffer files are raw little-endian 32-bit words, PE after PE over the
 //! spec's `"rect": [w, h]` (default one PE), each PE's share contiguous.
+//! A `"cmaddr"` string selects a CS system instead of the simulator. Its
+//! artifacts must have been compiled for that system's full fabric dimensions.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -216,6 +218,13 @@ fn run() -> Result<(), String> {
         serde_json::from_str(&std::fs::read_to_string(&spec_path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     let target = target_of(spec["target"].as_str().unwrap_or("wse3"));
+    let platform = match spec.get("cmaddr") {
+        None | Some(serde_json::Value::Null) => Platform::Simulator(Simulator::new(target)),
+        Some(serde_json::Value::String(cmaddr)) if !cmaddr.trim().is_empty() => Platform::System {
+            cmaddr: cmaddr.clone(),
+        },
+        _ => return Err("cmaddr must be a nonempty string".to_string()),
+    };
 
     // The SDK notes the cwd when its libraries load and the simulator writes
     // its logs and scratch directories there: move into the spec's directory
@@ -225,13 +234,7 @@ fn run() -> Result<(), String> {
     std::env::set_current_dir(&spec_dir).map_err(|e| format!("cd {}: {e}", spec_dir.display()))?;
 
     let sdk = Sdk::open().map_err(|e| e.to_string())?;
-    let mut rt = Runtime::new(
-        sdk,
-        &artifacts,
-        Platform::Simulator(Simulator::new(target)),
-        "WARNING",
-    )
-    .map_err(|e| e.to_string())?;
+    let mut rt = Runtime::new(sdk, &artifacts, platform, "WARNING").map_err(|e| e.to_string())?;
     rt.load();
     rt.run();
     run_spec(

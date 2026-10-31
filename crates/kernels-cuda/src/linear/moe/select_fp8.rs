@@ -234,7 +234,7 @@ pub fn select_fp8_w8a8(
 
 /// `y = q(x) . W^T` for one 128x128-block FP8 plane (W8A8) on sm_120a's
 /// block-scaled mma.sync, the rows' and the plane's exponents applied in the
-/// MMA (`linear/fp8_dense_sm120.cu`). `Ok(false)` off sm_120a, or for a shape
+/// MMA (`linear/moe/select_fp8_sm120.cu`). `Ok(false)` off sm_120a, or for a shape
 /// it does not take.
 #[cfg(feature = "cuda")]
 pub fn matmul_fp8_scaled(
@@ -270,7 +270,7 @@ pub fn matmul_fp8_scaled(
     ctx.fire(
         OP,
         Fire::at(kernel(
-            DENSE_SM120,
+            SELECT_FP8_SM120,
             &format!("::pie::linear::fp8_dense_scaled<{shape}>"),
         ))
         .apply(

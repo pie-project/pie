@@ -1,0 +1,1017 @@
+// qwen2d_pring: a ring of K paged qwen2d layers (qwen2d_paged), each its own P x P
+// square, K micro-batches of B lanes in flight (every stage busy). The handoff is
+// qwen2d_chain's: the next input's receive posted asynchronously (queue 2) before
+// the layer, the output sent after it, so a full ring cannot deadlock.
+// A micro-batch carries its tables with it: the handoff moves [x | tab] along
+// each row (a row's page entries and bitmaps are its own, and the same on every
+// stage: a pool page id names a page in every layer). The last stage advances
+// every lane (RoPE position and write slot a step on, the new slot visible: a
+// lap is a token) before handing back to stage 0. A stage keeps nothing per
+// micro-batch but its KV pool.
+//
+// (qwen2d_paged's header follows.)
+// qwen2d_paged: the batched qwen2d layer (qwen2d_batch v2) over a paged KV pool,
+// for continuous batching with PIE's page model. B lanes a pass, each its own
+// position and page table; lanes of different sequences, and the rows of a
+// prefill chunk (lanes of one sequence at consecutive positions sharing its
+// pages), run in one pass.
+//
+// Pool: physical page g (PS positions) lives whole on row g % P, as KV block
+// g / P of that row (NB blocks a PE); each column holds its kv dims of it.
+// Keys block-major, then dim-major ([blk][d][PS]); values [blk][PS][d]. A
+// page is one contiguous per-PE block, so a lane's attention costs a matvec
+// per page it uses, on the page's row.
+//
+// A pass's tables (one row-broadcast H2D): every lane's position, and for this
+// row each lane's entries (block, logical page), at most E a lane. Position p
+// of a lane is page p / PS, offset p % PS (PIE's KvDelta.pages). A page's
+// valid length is min(PS, pos + 1 - page·PS): causality, prefill chunks and a
+// truncate (the runtime's smaller `held`) need nothing else. copy_kv is
+// copy_page(src, dst), a block copy down each column.
+param memcpy_params;
+param P: u16;
+param Hc: u16;
+param Dc: u16;
+param Gs: u16;
+param Ic: u16;
+param PS: u16;         // page size (positions)
+param NB: u16;         // KV blocks a PE (pool pages = NB · P)
+param E: u16;          // entries a lane a row (its pages on this row, at most)
+param B: u16;          // lanes a pass
+param MC: u16;         // lanes an MLP chunk (B % MC == 0): gate/up and act hold MC lanes
+param c_r1_0: color;
+param c_r1_1: color;
+param c_r2_0: color;
+param c_r2_1: color;
+param c_bc: color;
+param c_gb: color;     // unused: the group broadcast rides on c_bc
+param c_cp: color;     // unused
+param c_in: color;     // this stage's input (handoff from the west, or the return)
+param c_out: color;    // this stage's output
+param c_ret: color;    // the return color (last stage -> stage 0)
+param K: u16;          // stages in the ring = micro-batches in flight
+param stage: u16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_mod = @import_module("<layout>");
+const timestamp = @import_module("<time>");
+const math = @import_module("<math>");
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+
+const HID: f32 = @as(f32, P * Hc);
+const HD: f32 = @as(f32, Gs * Dc);   // head_dim
+const EPS: f32 = 1.0e-6;
+const R1: u16 = Gs / 2;              // phase-1 root within a group
+const NG: u16 = P / Gs;              // groups along an axis
+const R2: u16 = (NG / 2) * Gs + R1;  // phase-2 root
+const QD: u16 = 4 * Dc;              // [q head a | q head b | k | v]
+const DH: u16 = Dc / 2;
+
+// ---------------------------------------------------------------- collectives
+// Two-phase grouped all-reduce (WaferLLM comm_pe.csl, in f32): phase 1 chains
+// each group of Gs PEs from both ends into its root, phase 2 chains the group
+// roots into R2, then R2 broadcasts. Along X, "seg" stops after phase 1 and
+// each group root broadcasts within its group (a kv head's columns).
+const q_r1_0_in = @get_input_queue(3);
+const q_r1_0_out = @get_output_queue(3);
+const q_r1_1_in = @get_input_queue(4);
+const q_r1_1_out = @get_output_queue(4);
+const q_r2_0_in = @get_input_queue(5);
+const q_r2_0_out = @get_output_queue(5);
+const q_r2_1_in = @get_input_queue(6);
+const q_r2_1_out = @get_output_queue(6);
+const q_bc_in = @get_input_queue(7);
+const q_bc_out = @get_output_queue(7);
+// Queue 2: the handoff (the group broadcast and page copies ride on c_bc).
+const q_h_in = @get_input_queue(2);
+const q_h_out = @get_output_queue(2);
+
+fn fout(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fin(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+
+var px: u16 = 0;
+var py: u16 = 0;
+
+// Routes are written as raw color-config words from runtime directions (one
+// copy of the code; <tile_config>'s reset_routes needs comptime directions and
+// cost ~1.1 KB a specialization). Directions: 0 ramp, 1 north, 2 south, 3 east,
+// 4 west.
+const tgt = tile_config.target;
+const D_RAMP: u16 = 0;
+const D_N: u16 = 1;
+const D_S: u16 = 2;
+const D_E: u16 = 3;
+const D_W: u16 = 4;
+// The config bits of each direction, indexed by D_*.
+const rx_bits = [5]tgt.reg_type { @get_int(tgt.fabric_io.RX_RAMP), @get_int(tgt.fabric_io.RX_NORTH),
+  @get_int(tgt.fabric_io.RX_SOUTH), @get_int(tgt.fabric_io.RX_EAST), @get_int(tgt.fabric_io.RX_WEST) };
+const tx_bits = [5]tgt.reg_type { @get_int(tgt.fabric_io.TX_RAMP), @get_int(tgt.fabric_io.TX_NORTH),
+  @get_int(tgt.fabric_io.TX_SOUTH), @get_int(tgt.fabric_io.TX_EAST), @get_int(tgt.fabric_io.TX_WEST) };
+var rxt = rx_bits;
+var txt = tx_bits;
+fn rxw(d: u16) tgt.reg_type { return rxt[d]; }
+fn txw(d: u16) tgt.reg_type { return txt[d]; }
+// c: rx from one direction, tx to t1 (and t2 when t2 != t1).
+fn set_route(c: color, rx: u16, t1: u16, t2: u16) void {
+  const addr = color_config.get_color_config_addr(c);
+  var r = @get_config(addr, tgt.color_addr_range);
+  r = r & @get_int(tgt.fabric_io.CLEAR_MASK);
+  r = r | rxw(rx) | txw(t1) | txw(t2);
+  @set_config(addr, r, tgt.color_addr_range);
+}
+
+// Phase 1 within a group of Gs along the axis: chains from both ends into R1
+// (even and odd positions alternate the two colors so a PE never forwards on
+// the color it receives on).
+fn route_phase1(H: u16, T: u16, r: u16) void {
+  const ev = r % 2 == 0;
+  const ca = if (ev) c_r1_0 else c_r1_1;
+  const cb = if (ev) c_r1_1 else c_r1_0;
+  if (r == R1) {
+    set_route(ca, H, D_RAMP, D_RAMP);
+    set_route(cb, T, D_RAMP, D_RAMP);
+  } else if (r < R1) {
+    set_route(ca, H, D_RAMP, D_RAMP);
+    set_route(cb, D_RAMP, T, T);
+  } else {
+    set_route(cb, T, D_RAMP, D_RAMP);
+    set_route(ca, D_RAMP, H, H);
+  }
+}
+
+fn route_phase2(H: u16, T: u16, id: u16) void {
+  const qt = id / Gs;
+  const r = id % Gs;
+  const ev = qt % 2 == 0;
+  const ca = if (ev) c_r2_0 else c_r2_1;
+  const cb = if (ev) c_r2_1 else c_r2_0;
+  if (id == R2) {
+    set_route(ca, H, D_RAMP, D_RAMP);
+    set_route(cb, T, D_RAMP, D_RAMP);
+  } else if (id < R2) {
+    if (r == R1) {
+      set_route(ca, H, D_RAMP, D_RAMP);
+      set_route(cb, D_RAMP, T, T);
+    } else {
+      set_route(c_r2_0, H, T, T);
+      set_route(c_r2_1, H, T, T);
+    }
+  } else {
+    if (r == R1) {
+      set_route(cb, T, D_RAMP, D_RAMP);
+      set_route(ca, D_RAMP, H, H);
+    } else {
+      set_route(c_r2_0, T, H, H);
+      set_route(c_r2_1, T, H, H);
+    }
+  }
+}
+
+fn route_bcast(H: u16, T: u16, id: u16, last: u16) void {
+  if (id == R2) {
+    set_route(c_bc, D_RAMP, H, T);
+  } else if (id < R2) {
+    if (id == 0) { set_route(c_bc, T, D_RAMP, D_RAMP); }
+    else { set_route(c_bc, T, H, D_RAMP); }
+  } else {
+    if (id == last) { set_route(c_bc, H, D_RAMP, D_RAMP); }
+    else { set_route(c_bc, H, D_RAMP, T); }
+  }
+}
+
+// The group broadcast (segment all-reduce along X) on c_bc.
+fn route_gbcast() void {
+  const r = px % Gs;
+  if (r == R1) {
+    set_route(c_bc, D_RAMP, D_W, if (R1 == Gs - 1) D_W else D_E);
+  } else if (r < R1) {
+    if (r == 0) { set_route(c_bc, D_E, D_RAMP, D_RAMP); }
+    else { set_route(c_bc, D_E, D_W, D_RAMP); }
+  } else {
+    if (r == Gs - 1) { set_route(c_bc, D_W, D_RAMP, D_RAMP); }
+    else { set_route(c_bc, D_W, D_RAMP, D_E); }
+  }
+}
+
+var axis_x: bool = false;
+var axis_id: u16 = 0;
+fn set_axis(x: bool) void {
+  const h = if (x) D_W else D_N;
+  const t = if (x) D_E else D_S;
+  const id = if (x) px else py;
+  route_phase1(h, t, id % Gs);
+  route_phase2(h, t, id);
+  route_bcast(h, t, id, P - 1);
+  axis_x = x;
+  axis_id = id;
+}
+fn axis_y() void { set_axis(false); }
+fn axis_xx() void { set_axis(true); }
+
+// dst = a op b, op: sum or max.
+fn op_in(is_max: bool, buf: mem1d_dsd, comptime q: input_queue, n: u16) void {
+  if (is_max) { @fmaxs(buf, buf, fin(q, n)); } else { @fadds(buf, buf, fin(q, n)); }
+}
+fn op_fwd(is_max: bool, comptime qo: output_queue, comptime qi: input_queue,
+          buf: mem1d_dsd, n: u16) void {
+  if (is_max) { @fmaxs(fout(qo, n), fin(qi, n), buf); } else { @fadds(fout(qo, n), fin(qi, n), buf); }
+}
+
+fn phase1(is_max: bool, buf: mem1d_dsd, n: u16) void {
+  const r = axis_id % Gs;
+  if (r == R1) {
+    if (R1 < Gs - 1) { op_in(is_max, buf, q_r1_0_in, n); }
+    op_in(is_max, buf, q_r1_1_in, n);
+  } else if (r > R1) {
+    if (r % 2 == 0) {
+      if (r == Gs - 1) { @fmovs(fout(q_r1_0_out, n), buf); }
+      else { op_fwd(is_max, q_r1_0_out, q_r1_1_in, buf, n); }
+    } else {
+      if (r == Gs - 1) { @fmovs(fout(q_r1_1_out, n), buf); }
+      else { op_fwd(is_max, q_r1_1_out, q_r1_0_in, buf, n); }
+    }
+  } else {
+    if (r % 2 == 0) {
+      if (r == 0) { @fmovs(fout(q_r1_1_out, n), buf); }
+      else { op_fwd(is_max, q_r1_1_out, q_r1_0_in, buf, n); }
+    } else {
+      op_fwd(is_max, q_r1_0_out, q_r1_1_in, buf, n);
+    }
+  }
+}
+
+fn phase2(is_max: bool, buf: mem1d_dsd, n: u16) void {
+  const id = axis_id;
+  const r = id % Gs;
+  const qt = id / Gs;
+  if (id == R2) {
+    if (R2 < P - Gs) { op_in(is_max, buf, q_r2_0_in, n); }
+    op_in(is_max, buf, q_r2_1_in, n);
+  } else if (id > R2) {
+    if (r == R1) {
+      if (id > P - Gs - 1) {
+        if (qt % 2 == 0) { @fmovs(fout(q_r2_0_out, n), buf); }
+        else { @fmovs(fout(q_r2_1_out, n), buf); }
+      } else {
+        if (qt % 2 == 0) { op_fwd(is_max, q_r2_0_out, q_r2_1_in, buf, n); }
+        else { op_fwd(is_max, q_r2_1_out, q_r2_0_in, buf, n); }
+      }
+    }
+  } else {
+    if (r == R1) {
+      if (id < Gs) { @fmovs(fout(q_r2_1_out, n), buf); }
+      else {
+        if (qt % 2 == 0) { op_fwd(is_max, q_r2_1_out, q_r2_0_in, buf, n); }
+        else { op_fwd(is_max, q_r2_0_out, q_r2_1_in, buf, n); }
+      }
+    }
+  }
+}
+
+// Sum (or max) of buf over the current axis, left in buf on every PE.
+fn allreduce(is_max: bool, buf: mem1d_dsd, n: u16) void {
+  phase1(is_max, buf, n);
+  if (NG > 1) { phase2(is_max, buf, n); }
+  if (axis_id == R2) { @fmovs(fout(q_bc_out, n), buf); }
+  else { @fmovs(buf, fin(q_bc_in, n)); }
+}
+
+// Sum of buf over this PE's group of Gs columns (axis X).
+fn allreduce_seg(buf: mem1d_dsd, n: u16) void {
+  phase1(false, buf, n);
+  route_gbcast();                       // c_bc: the group's broadcast for now
+  if (px % Gs == R1) { @fmovs(fout(q_bc_out, n), buf); }
+  else { @fmovs(buf, fin(q_bc_in, n)); }
+  route_bcast(D_W, D_E, px, P - 1);     // back to the X axis's broadcast
+}
+
+
+// Trip counts read at runtime (an exported array the compiler cannot fold),
+// so per-lane loops are not unrolled: unrolled, the code grew ~0.9 KB a lane.
+var dims = @zeros([5]u16);           // B, E, TC, 2B, MC: set in init
+var dims_ptr: [*]u16 = &dims;
+
+// ---------------------------------------------------------------- state
+const DHc: u16 = Dc / 2;
+const N2B: u16 = 2 * B;            // (lane, head) pairs
+const TC: u16 = E * PS;            // a lane's score slots a row: entry e, offset o
+const NS: u16 = TC * N2B;          // scores a PE: [t][b][h], t = e·PS + o
+const iN2B: i16 = @as(i16, N2B);
+const iB: i16 = @as(i16, B);
+const iDc: i16 = @as(i16, Dc);
+const NONE: u32 = 0xffffffff;
+const GU1: u16 = 2 * Ic + 1;
+
+fn at(d: mem1d_dsd, off: u16) mem1d_dsd {
+  return @increment_dsd_offset(d, @as(i16, off), f32);
+}
+
+// A pass's tables: positions [B], entries' blocks [B][E], their logical pages [B][E].
+// A pass's tables: RoPE positions [B], KV write slots [B], and for this row
+// each lane's entries: blocks [B][E], logical pages [B][E], visibility
+// bitmaps [B][E] (bit o: the lane sees slot page·PS + o). A lane's write slot
+// and RoPE position differ for beams (siblings rotate alike, write apart); the
+// bitmaps say which cells a lane attends (causal prefixes, a beam's ancestors,
+// a sink + window).
+const NTAB: u16 = 2 * B + 3 * B * E;
+// The tables ride after x in the handoff buffer (u32 bits in f32 words).
+fn tabw(k: u16) u32 { return @bitcast(u32, x[B * Hc + k]); }
+fn tabset(k: u16, v: u32) void { x[B * Hc + k] = @bitcast(f32, v); }
+fn wslot(b: u16) u32 { return tabw(B + b); }
+fn eblk(b: u16, e: u16) u32 { return tabw(2 * B + b * E + e); }
+fn epg(b: u16, e: u16) u32 { return tabw(2 * B + B * E + b * E + e); }
+fn ebits(b: u16, e: u16) u32 {
+  if (tabw(2 * B + b * E + e) == NONE) { return 0; }
+  return tabw(2 * B + 2 * B * E + b * E + e);
+}
+// The next decode position: RoPE position and write slot a step on, the new
+// slot made visible on the row that holds its page (the host gives every page
+// a launch's steps reach, with its bits for the slots before).
+fn advance(b: u16) void {
+  tabset(b, tabw(b) + 1);
+  tabset(B + b, tabw(B + b) + 1);
+  const ws = tabw(B + b);
+  const pg = ws / @as(u32, PS);
+  var e: u16 = 0;
+  while (e < dims[1]) : (e += 1) {
+    if (eblk(b, e) != NONE and epg(b, e) == pg) {
+      tabset(2 * B + 2 * B * E + b * E + e, tabw(2 * B + 2 * B * E + b * E + e) | @as(u32, 1) << @as(u16, ws % @as(u32, PS)));
+    }
+  }
+}
+
+// [x (B·Hc) | tab (NTAB)]: what a micro-batch carries from stage to stage.
+const NIO: u16 = B * Hc + NTAB;
+var x = @zeros([NIO]f32);
+var x_ptr: [*]f32 = &x;
+const io_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NIO} -> x[i] });
+const x_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> x[i] });
+const x_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * Hc} -> x[i] });
+var gamma1 = @zeros([Hc]f32);
+var gamma1_ptr: [*]f32 = &gamma1;
+const g1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> gamma1[i] });
+var gamma2 = @zeros([Hc]f32);
+var gamma2_ptr: [*]f32 = &gamma2;
+const g2_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> gamma2[i] });
+// x * gamma, a lane at a time (in sv: free in phases 0 and 10–11).
+const xn_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> sv[i] });
+
+var wqa: [Hc * 3 * DHc + 1]f32 align(16) = @zeros([Hc * 3 * DHc + 1]f32);
+var wqa_ptr: [*]f32 = &wqa;
+const wqa_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{3 * DHc} -> wqa[i + 1] });
+var wqv: [Hc * 3 * DHc + 1]f32 align(16) = @zeros([Hc * 3 * DHc + 1]f32);
+var wqv_ptr: [*]f32 = &wqv;
+const wqv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{3 * DHc} -> wqv[i + 1] });
+var wv: [Hc * Dc + 1]f32 align(16) = @zeros([Hc * Dc + 1]f32);
+var wv_ptr: [*]f32 = &wv;
+const wv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> wv[i + 1] });
+// QKV payload: first halves of q a, q b, k [b][3][DH], second halves, v [b][Dc],
+// x's sums of squares [b].
+const QH: u16 = 3 * B * DHc;
+const QKN: u16 = 2 * QH;
+const QKV_N: u16 = QKN + B * Dc + B;
+var qkv: [QKV_N]f32 align(16) = @zeros([QKV_N]f32);
+const qh_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{3 * DHc} -> qkv[i] });
+const half_a = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QH} -> qkv[i] });
+const half_v = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QH} -> qkv[@as(i16, QH) + i] });
+const v_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> qkv[@as(i16, QKN) + i] });
+const qkv_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QKV_N} -> qkv[i] });
+const qk_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QKN} -> qkv[i] });
+const qkv_ssq = @get_dsd(mem1d_dsd, .{ .tensor_access = |b|{B} -> qkv[@as(i16, QKN + B * Dc) + b] });
+const qd_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DHc} -> qkv[i] });
+// q/k norm weights [half][q a, q b, k][DH] (1/sqrt(head_dim) in q's), applied a lane at a time.
+var qkn_w = @zeros([3 * Dc]f32);
+var qkn_w_ptr: [*]f32 = &qkn_w;
+const qkn_a = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{3 * DHc} -> qkn_w[i] });
+const qkn_v = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{3 * DHc} -> qkn_w[@as(i16, 3 * DHc) + i] });
+// q/k sums of squares [b·3] (all-reduced over the kv head's columns), then
+// their RMS scales, applied a head at a time over both halves.
+var ssq3 = @zeros([3 * B]f32);
+const ssq3_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{3 * B} -> ssq3[i] });
+fn scl_t() mem4d_dsd { return @get_dsd(mem4d_dsd, .{ .tensor_access = |k, j|{3 * B, DHc} -> ssq3[k] }); }
+fn sq_t() mem4d_dsd { return @get_dsd(mem4d_dsd, .{ .tensor_access = |k, j|{3 * B, DHc} -> act[j * 3 * iB + k] }); }
+fn sqx_t() mem4d_dsd { return @get_dsd(mem4d_dsd, .{ .tensor_access = |b, i|{B, Hc} -> act[i * iB + b] }); }
+const sqx_b = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B} -> act[i] });
+
+// The pool.
+var kc: [NB * Dc * PS + 1]f32 align(16) = @zeros([NB * Dc * PS + 1]f32);
+var kc_ptr: [*]f32 = &kc;
+const kc_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PS} -> kc[i + 1] });
+var vc: [NB * PS * Dc + 1]f32 align(16) = @zeros([NB * PS * Dc + 1]f32);
+var vc_ptr: [*]f32 = &vc;
+const vc_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> vc[i + 1] });
+const kblk_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc * PS} -> kc[i + 1] });
+const vblk_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PS * Dc} -> vc[i + 1] });
+
+var s: [NS]f32 align(16) = @zeros([NS]f32);
+const s_scores = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> s[i] });
+const sa_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |t|{PS} -> s[t * iN2B] });     // a page's run, lane 0 head a
+const NSR: u16 = if (NS > QH) NS else QH;
+const SVN: u16 = if (QH > B * Hc) QH else B * Hc;
+var sv = @zeros([SVN]f32);        // RoPE's scratch; x * gamma
+const ETN: u16 = if (NSR > B * Hc) NSR else B * Hc;
+var et = @zeros([ETN]f32);        // the softmax's trees; RoPE's scratch; hv
+const et_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> et[i] });
+
+var bcv = @zeros([N2B]f32);
+const bcv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |j|{N2B} -> bcv[j] });
+const srow_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |j|{N2B} -> s[j] });
+// Softmax all-reduces: the maxes, then the sums, [2B].
+var red = @zeros([N2B]f32);
+const red_2b = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N2B} -> red[i] });
+var fallbacks = @zeros([1]u32);   // kept for the interface (always 0: one path)
+var fallbacks_ptr: [*]u32 = &fallbacks;
+
+// (o in act: free in phases 6–8.)
+const o_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Dc} -> act[i] });
+const o_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * 2 * Dc} -> act[i] });
+const oa_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> act[i] });
+
+var wo: [2 * Dc * Hc + 1]f32 align(16) = @zeros([2 * Dc * Hc + 1]f32);
+var wo_ptr: [*]f32 = &wo;
+const wo_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> wo[i + 1] });
+// (hv in et: free in phases 8–9 and 14–15.)
+const hv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> et[i] });
+const hv_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * Hc} -> et[i] });
+
+var wgu: [Hc * 2 * Ic + 1]f32 align(16) = @zeros([Hc * 2 * Ic + 1]f32);
+var wgu_ptr: [*]f32 = &wgu;
+const wgu_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Ic} -> wgu[i + 1] });
+// The MLP runs MC lanes at a time: gate/up partials [MC][2·Ic + x's sum of
+// squares], act [MC][Ic]; the down partials of every lane gather in hv for
+// one all-reduce. (For 8B, gate/up + act are ~0.9 KB a lane.)
+var gu: [MC * GU1]f32 align(16) = @zeros([MC * GU1]f32);
+const gu_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Ic} -> gu[i] });
+const gu_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC * GU1} -> gu[i] });
+const g_col = @get_dsd(mem1d_dsd, .{ .tensor_access = |b|{MC} -> gu[b * @as(i16, GU1)] });
+const u_col = @get_dsd(mem1d_dsd, .{ .tensor_access = |b|{MC} -> gu[b * @as(i16, GU1) + @as(i16, Ic)] });
+var xss = @zeros([B]f32);            // x's sums of squares (the second RMSNorm), every lane
+const xss_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B} -> xss[i] });
+const ACT0: u16 = if (MC * Ic > QH) MC * Ic else QH;
+const ACT1: u16 = if (ACT0 > B * Hc) ACT0 else B * Hc;
+const ACTN: u16 = if (ACT1 > B * 2 * Dc) ACT1 else B * 2 * Dc;
+var act: [ACTN]f32 align(16) = @zeros([ACTN]f32);
+const act_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> act[i] });
+const act_mc = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC * Ic} -> act[i] });
+const act_col = @get_dsd(mem1d_dsd, .{ .tensor_access = |b|{MC} -> act[b * @as(i16, Ic)] });
+var ta = @zeros([B]f32);
+var tt = @zeros([B]f32);
+var te = @zeros([B]f32);
+var tr = @zeros([B]f32);
+var td = @zeros([B]f32);
+const ta_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC} -> ta[i] });
+const tt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC} -> tt[i] });
+const te_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC} -> te[i] });
+const tr_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC} -> tr[i] });
+const td_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC} -> td[i] });
+
+var wd: [Ic * Hc + 1]f32 align(16) = @zeros([Ic * Hc + 1]f32);
+var wd_ptr: [*]f32 = &wd;
+const wd_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> wd[i + 1] });
+
+// ---------------------------------------------------------------- compute
+const mv_dest = @get_dsr(dsr_dest, 1);
+const mv_src0 = @get_dsr(dsr_src0, 1);
+const mv_src1 = @get_dsr(dsr_src1, 1);
+fn mv_step(xv: f32) void {
+  @fmacs(mv_dest, mv_src0, mv_src1, xv);
+}
+fn matvec(y: mem1d_dsd, a: mem1d_dsd, xv: mem1d_dsd) void {
+  @load_to_dsr(mv_dest, y, .{ .save_address = false });
+  @load_to_dsr(mv_src0, y, .{ .save_address = false });
+  @load_to_dsr(mv_src1, a, .{ .save_address = true });
+  @map(mv_step, xv);
+}
+fn rsqrt(v: f32) f32 {
+  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
+  const h = 0.5 * v;
+  y = y * (1.5 - h * y * y);
+  y = y * (1.5 - h * y * y);
+  y = y * (1.5 - h * y * y);
+  return y;
+}
+fn recip(v: f32) f32 {
+  const r = rsqrt(v);
+  return r * r;
+}
+fn rms_scale(sum: f32, n: f32) f32 {
+  return rsqrt(sum * (1.0 / n) + EPS);
+}
+fn ln_approx(v: f32) f32 {
+  return (@as(f32, @bitcast(u32, v)) * (1.0 / 8388608.0) - 127.0) * 0.6931472;
+}
+// buf [n][m] (n a power of two) halved over n in place: buf[0..m) = the
+// sums (or maxes). One runtime instance.
+fn halve(buf: mem1d_dsd, n: u16, m: u16, is_max: bool) void {
+  var half = n / 2;
+  while (half >= 1) : (half /= 2) {
+    const lo = @set_dsd_length(buf, half * m);
+    const hi = @set_dsd_length(at(buf, half * m), half * m);
+    if (is_max) { @fmaxs(lo, lo, hi); } else { @fadds(lo, lo, hi); }
+  }
+}
+fn x_ssq(dst: mem1d_dsd) void {
+  @fmuls(sqx_t(), x_all, x_all);
+  halve(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * Hc} -> act[i] }), Hc, B, false);
+  @fmovs(dst, sqx_b);
+}
+
+// Each lane's position this pass; RoPE cos/sin [b][3][DH], once a launch, then
+// advanced a position a pass.
+var cur = @zeros([B]u32);
+const NR: u16 = QH;
+// RoPE: cos/sin(p · f_j) for this column's DH frequencies, built each pass for
+// every lane from three tables of 16 (p = 256a + 16b + c, positions < 4096;
+// the host's at load, a column its own) by two angle additions. Lane b's are
+// laid out [b][3 heads][DH] (replicated over q a, q b, k) for the vector RoPE.
+const ROT_L: u16 = 16;
+var rot_c = @zeros([3 * ROT_L * DHc]f32);   // [level][16][DH]
+var rot_c_ptr: [*]f32 = &rot_c;
+var rot_s = @zeros([3 * ROT_L * DHc]f32);
+var rot_s_ptr: [*]f32 = &rot_s;
+var rc = @zeros([NR]f32);
+var rs = @zeros([NR]f32);
+const rc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NR} -> rc[i] });
+const rs_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NR} -> rs[i] });
+const r1_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NR} -> sv[i] });
+const r2_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NR} -> et[i] });
+const r3_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NR} -> act[i] });
+fn rope_tables() void {
+  var b: u16 = 0;
+  while (b < dims[0]) : (b += 1) {
+    const p_ = cur[b];
+    const ia = @as(u16, (p_ / 256) % ROT_L) * DHc;
+    const ib = (ROT_L + @as(u16, (p_ / 16) % ROT_L)) * DHc;
+    const ic = (2 * ROT_L + @as(u16, p_ % ROT_L)) * DHc;
+    var j: u16 = 0;
+    while (j < DHc) : (j += 1) {
+      const c1 = rot_c[ia + j] * rot_c[ib + j] - rot_s[ia + j] * rot_s[ib + j];
+      const s1 = rot_s[ia + j] * rot_c[ib + j] + rot_c[ia + j] * rot_s[ib + j];
+      const c = c1 * rot_c[ic + j] - s1 * rot_s[ic + j];
+      const sn = s1 * rot_c[ic + j] + c1 * rot_s[ic + j];
+      var h: u16 = 0;
+      while (h < 3) : (h += 1) {
+        rc[(b * 3 + h) * DHc + j] = c;
+        rs[(b * 3 + h) * DHc + j] = sn;
+      }
+    }
+  }
+}
+fn rope_all() void {
+  @fmuls(r1_d, half_a, rc_d);
+  @fmuls(r2_d, half_v, rs_d);
+  @fsubs(r1_d, r1_d, r2_d);
+  @fmuls(r2_d, half_v, rc_d);
+  @fmuls(r3_d, half_a, rs_d);
+  @fadds(r2_d, r2_d, r3_d);
+  @fmovs(half_a, r1_d);
+  @fmovs(half_v, r2_d);
+}
+// exp(v/256)'s degree-7 Taylor coefficients after 1/5040 (runtime loops: the
+// unrolled form cost ~1.5 KB of code at each use).
+var exp_coeffs = [7]f32 { 1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0 };
+// buf = exp(buf) for buf <= 0 (or -1e30): exp(v/256) by the polynomial, squared 8 times.
+fn exp_poly(buf: mem1d_dsd, tmp: mem1d_dsd) void {
+  @fmaxs(tmp, buf, -88.0);
+  @fmuls(tmp, tmp, 0.00390625);
+  @fmovs(buf, 1.0 / 5040.0);
+  var c: u16 = 0;
+  while (c < 7) : (c += 1) {
+    @fmuls(buf, buf, tmp);
+    @fadds(buf, buf, exp_coeffs[c]);
+  }
+  c = 0;
+  while (c < 8) : (c += 1) { @fmuls(buf, buf, buf); }
+}
+fn exp_inplace(buf: mem1d_dsd, tmp: mem1d_dsd) void { exp_poly(buf, tmp); }
+fn silu_col(e: u16) void {
+  const g = at(g_col, e);
+  const u = at(u_col, e);
+  @fabss(ta_d, g);
+  @fnegs(te_d, ta_d);
+  exp_poly(te_d, tt_d);           // e = exp(-|g|)
+  @fadds(td_d, te_d, 1.0);
+  @fmuls(tr_d, td_d, -0.47058823529411764);
+  @fadds(tr_d, tr_d, 1.411764705882353);
+  var it: u16 = 0;
+  while (it < 3) : (it += 1) {
+    @fmuls(tt_d, td_d, tr_d);
+    @fnegs(tt_d, tt_d);
+    @fadds(tt_d, tt_d, 2.0);
+    @fmuls(tr_d, tr_d, tt_d);
+  }
+  @fnegs(tt_d, te_d);
+  @fadds(tt_d, tt_d, 1.0);
+  @fmuls(tt_d, tt_d, tr_d);
+  @fmuls(tt_d, tt_d, ta_d);
+  @fadds(tt_d, tt_d, g);
+  @fmuls(tt_d, tt_d, 0.5);
+  @fmuls(at(act_col, e), tt_d, u);
+}
+
+// ---------------------------------------------------------------- profile
+const NPROF: u16 = 16;
+var prof = @zeros([NPROF]u32);
+var prof_ptr: [*]u32 = &prof;
+var t_mark = @zeros([timestamp.tsc_size_words]u16);
+var t_now = @zeros([timestamp.tsc_size_words]u16);
+var timing: bool = false;
+fn tsc(t: *[timestamp.tsc_size_words]u16) u64 {
+  return @as(u64, t.*[0]) | (@as(u64, t.*[1]) << 16) | (@as(u64, t.*[2]) << 32);
+}
+fn mark(slot: u16) void {
+  timestamp.get_timestamp(&t_now);
+  if (timing) { prof[slot] += @as(u32, (tsc(&t_now) - tsc(&t_mark)) & 0xffffffff); }
+  t_mark = t_now;
+}
+
+fn bcast(comptime is_mul: bool) void {
+  var t: u16 = 0;
+  while (t < dims[2]) : (t += 1) {
+    const r = at(srow_dsd, t * N2B);
+    if (is_mul) { @fmuls(r, r, bcv_dsd); } else { @fsubs(r, r, bcv_dsd); }
+  }
+}
+fn exp_sums() void {
+  bcast(false);
+  exp_inplace(s_scores, et_dsd);       // invalid slots: exp(-1e31) ~ 1e-38
+  @fmovs(et_dsd, s_scores);
+  halve(et_dsd, TC, N2B, false);
+  @fmovs(red_2b, @set_dsd_length(et_dsd, N2B));
+}
+
+// ---------------------------------------------------------------- the layer
+fn layer() void {
+  var b: u16 = 0;
+  // 0–1: QKV partials (a lane at a time) and x's sums of squares; one
+  // all-reduce over the rows; RMSNorm.
+  axis_y();
+  @fmovs(qkv_all, 0.0);
+  b = 0;
+  while (b < dims[0]) : (b += 1) {
+    const xb = at(xn_dsd, b * Hc);
+    @fmuls(xb, at(x_dsd, b * Hc), g1_dsd);
+    matvec(at(qh_dsd, b * 3 * DHc), wqa_dsd, xb);
+    matvec(at(qh_dsd, QH + b * 3 * DHc), wqv_dsd, xb);
+    matvec(at(v_dsd, b * Dc), wv_dsd, xb);
+  }
+  x_ssq(qkv_ssq);
+  mark(0);
+  allreduce(false, qkv_all, QKV_N);
+  b = 0;
+  while (b < dims[0]) : (b += 1) {
+    const sc = rms_scale(qkv[QKN + B * Dc + b], HID);
+    const qa = at(qh_dsd, b * 3 * DHc);
+    const qv = at(qh_dsd, QH + b * 3 * DHc);
+    const vb = at(v_dsd, b * Dc);
+    @fmuls(qa, qa, sc);
+    @fmuls(qv, qv, sc);
+    @fmuls(vb, vb, sc);
+  }
+  mark(1);
+  // 2: q/k RMSNorm first (their sums of squares all-reduced over the kv head's
+  // columns), then norm weights, RoPE, KV append: appended keys are final, so
+  // lanes sharing a page see them in this same pass.
+  @fmuls(r1_d, half_a, half_a);
+  @fmuls(r2_d, half_v, half_v);
+  @fadds(sq_t(), r1_d, r2_d);
+  halve(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QH} -> act[i] }), DHc, 3 * B, false);
+  @fmovs(ssq3_dsd, @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{3 * B} -> act[i] }));
+  axis_xx();
+  allreduce_seg(ssq3_dsd, 3 * B);
+  var k: u16 = 0;
+  while (k < 3 * dims[0]) : (k += 1) { ssq3[k] = rms_scale(ssq3[k], HD); }
+  @fmuls(@get_dsd(mem4d_dsd, .{ .tensor_access = |kk, j|{3 * B, DHc} -> qkv[kk * @as(i16, DHc) + j] }),
+         @get_dsd(mem4d_dsd, .{ .tensor_access = |kk, j|{3 * B, DHc} -> qkv[kk * @as(i16, DHc) + j] }), scl_t());
+  @fmuls(@get_dsd(mem4d_dsd, .{ .tensor_access = |kk, j|{3 * B, DHc} -> qkv[@as(i16, QH) + kk * @as(i16, DHc) + j] }),
+         @get_dsd(mem4d_dsd, .{ .tensor_access = |kk, j|{3 * B, DHc} -> qkv[@as(i16, QH) + kk * @as(i16, DHc) + j] }), scl_t());
+  b = 0;
+  while (b < dims[0]) : (b += 1) {
+    const qa = at(qh_dsd, b * 3 * DHc);
+    const qv = at(qh_dsd, QH + b * 3 * DHc);
+    @fmuls(qa, qa, qkn_a);
+    @fmuls(qv, qv, qkn_v);
+  }
+  rope_all();
+  b = 0;
+  while (b < dims[0]) : (b += 1) {
+    const pg = wslot(b) / @as(u32, PS);
+    const oo = @as(u16, wslot(b) % @as(u32, PS));
+    var e: u16 = 0;
+    while (e < dims[1]) : (e += 1) {
+      if (eblk(b, e) != NONE and epg(b, e) == pg) {
+        const blk = @as(u16, eblk(b, e));
+        var d: u16 = 0;
+        while (d < Dc) : (d += 1) {
+          const kidx = (if (d < DHc) 0 else QH) + (3 * b + 2) * DHc + d % DHc;
+          kc[1 + blk * Dc * PS + d * PS + oo] = qkv[kidx];
+          vc[1 + blk * PS * Dc + oo * Dc + d] = qkv[QKN + b * Dc + d];
+        }
+      }
+    }
+  }
+  mark(2);
+  // 3: scores a page at a time ([t][b][h], t = e·PS + o); 4: summed over the
+  // kv head's columns.
+  // Every slot starts at -1e30; a visible entry's run is zeroed for its
+  // matvecs, and its slots the lane does not see set back to -1e30 (summed
+  // over the head's columns they stay ~-1e31: nothing in the softmax). A
+  // bitmap that is a prefix (the usual causal case) takes two ops; any other
+  // pattern a slot at a time.
+  @fmovs(s_scores, -1.0e30);
+  b = 0;
+  while (b < dims[0]) : (b += 1) {
+    const ha = 3 * b * DHc;
+    var e: u16 = 0;
+    while (e < dims[1]) : (e += 1) {
+      const bits = ebits(b, e);
+      if (bits != 0) {
+        const blk = @as(u16, eblk(b, e));
+        const sa = at(sa_dsd, e * PS * N2B + 2 * b);
+        const sb = at(sa, 1);
+        const kb = at(kc_dsd, blk * Dc * PS);
+        const kv2 = at(kb, DHc * PS);
+        @fmovs(sa, 0.0);
+        @fmovs(sb, 0.0);
+        matvec(sa, kb, at(qd_dsd, ha));
+        matvec(sa, kv2, at(qd_dsd, QH + ha));
+        matvec(sb, kb, at(qd_dsd, ha + DHc));
+        matvec(sb, kv2, at(qd_dsd, QH + ha + DHc));
+        if ((bits & (bits + 1)) == 0) {
+          var v: u16 = 0;
+          while (v < PS and ((bits >> v) & 1) == 1) : (v += 1) {}
+          if (v < PS) {
+            @fmovs(@set_dsd_length(at(sa, v * N2B), PS - v), -1.0e30);
+            @fmovs(@set_dsd_length(at(sb, v * N2B), PS - v), -1.0e30);
+          }
+        } else {
+          var o: u16 = 0;
+          while (o < PS) : (o += 1) {
+            if (((bits >> o) & 1) == 0) {
+              const t = (e * PS + o) * N2B + 2 * b;
+              s[t] = -1.0e30;
+              s[t + 1] = -1.0e30;
+            }
+          }
+        }
+      }
+    }
+  }
+  mark(3);
+  allreduce_seg(s_scores, NS);
+  mark(4);
+  // 5: softmax over every row's keys: each (lane, head)'s max all-reduced,
+  // the exponentials and their sums, the sums all-reduced (one path).
+  axis_y();
+  @fmovs(et_dsd, s_scores);
+  halve(et_dsd, TC, N2B, true);
+  @fmovs(red_2b, @set_dsd_length(et_dsd, N2B));
+  allreduce(true, red_2b, N2B);
+  @fmovs(bcv_dsd, red_2b);
+  exp_sums();
+  allreduce(false, red_2b, N2B);
+  var j: u16 = 0;
+  while (j < dims[3]) : (j += 1) { bcv[j] = recip(red[j]); }
+  bcast(true);
+  mark(5);
+  // 6: value partials a page at a time; 7: summed over the rows.
+  @fmovs(o_all, 0.0);
+  b = 0;
+  while (b < dims[0]) : (b += 1) {
+    var e: u16 = 0;
+    while (e < dims[1]) : (e += 1) {
+      if (ebits(b, e) != 0) {
+        const blk = @as(u16, eblk(b, e));
+        const vb = at(vc_dsd, blk * PS * Dc);
+        const pa = at(sa_dsd, e * PS * N2B + 2 * b);
+        matvec(at(oa_dsd, b * 2 * Dc), vb, pa);
+        matvec(at(oa_dsd, b * 2 * Dc + Dc), vb, at(pa, 1));
+      }
+    }
+  }
+  mark(6);
+  allreduce(false, o_all, B * 2 * Dc);
+  mark(7);
+  // 8–9: O projection, summed over the columns, residual.
+  axis_xx();
+  @fmovs(hv_all, 0.0);
+  b = 0;
+  while (b < dims[0]) : (b += 1) { matvec(at(hv_dsd, b * Hc), wo_dsd, at(o_dsd, b * 2 * Dc)); }
+  mark(8);
+  allreduce(false, hv_all, B * Hc);
+  @fadds(x_all, x_all, hv_all);
+  mark(9);
+  // 10–14: the second RMSNorm and the MLP, MC lanes at a time: gate/up
+  // partials, summed over the rows (with x's sums of squares), scaled; silu·u
+  // (a row its share of the elements), summed over the rows; down partials
+  // into hv. 15: hv summed over the columns, the residual.
+  axis_y();
+  x_ssq(xss_dsd);
+  mark(10);
+  @fmovs(hv_all, 0.0);
+  var c0: u16 = 0;
+  while (c0 < dims[0]) : (c0 += dims[4]) {
+    var k: u16 = 0;
+    while (k < dims[4]) : (k += 1) {
+      const lb = c0 + k;
+      @fmuls(at(xn_dsd, lb * Hc), at(x_dsd, lb * Hc), g2_dsd);
+      const gb = at(gu_dsd, k * GU1);
+      @fmovs(gb, 0.0);
+      matvec(gb, wgu_dsd, at(xn_dsd, lb * Hc));
+      gu[k * GU1 + 2 * Ic] = xss[lb];
+    }
+    allreduce(false, gu_all, MC * GU1);
+    k = 0;
+    while (k < dims[4]) : (k += 1) {
+      const gb = at(gu_dsd, k * GU1);
+      @fmuls(gb, gb, rms_scale(gu[k * GU1 + 2 * Ic], HID));
+    }
+    @fmovs(act_mc, 0.0);
+    var el: u16 = py;
+    while (el < Ic) : (el += P) { silu_col(el); }
+    allreduce(false, act_mc, MC * Ic);
+    k = 0;
+    while (k < dims[4]) : (k += 1) { matvec(at(hv_dsd, (c0 + k) * Hc), wd_dsd, at(act_dsd, k * Ic)); }
+  }
+  mark(13);
+  axis_xx();
+  allreduce(false, hv_all, B * Hc);
+  @fadds(x_all, x_all, hv_all);
+  mark(15);
+}
+
+fn init() void {
+  lx = layout_mod.get_x_coord() % P;
+  dims[0] = B;
+  dims[1] = E;
+  dims[2] = TC;
+  dims[3] = N2B;
+  dims[4] = MC;
+  px = lx;
+  py = layout_mod.get_y_coord();
+  route_gbcast();
+  axis_y();
+  route_handoff();
+  sys_mod.unblock_cmd_stream();
+}
+
+var lx: u16 = 0;
+
+// Handoff routes along each row (as qwen2d_chain).
+fn route_handoff() void {
+  if (stage == 0) {
+    if (lx == 0) { set_route(c_in, D_E, D_RAMP, D_RAMP); }
+    else { set_route(c_in, D_E, D_RAMP, D_W); }
+  } else {
+    if (lx == P - 1) { set_route(c_in, D_W, D_RAMP, D_RAMP); }
+    else { set_route(c_in, D_W, D_RAMP, D_E); }
+  }
+  if (stage == K - 1) {
+    if (lx == P - 1) { set_route(c_out, D_RAMP, D_W, D_W); }
+    else { set_route(c_out, D_E, D_W, D_W); }
+  } else {
+    if (lx == P - 1) { set_route(c_out, D_RAMP, D_E, D_E); }
+  }
+  if (stage > 0 and stage < K - 1) { set_route(c_ret, D_E, D_W, D_W); }
+}
+
+var inbuf = @zeros([NIO]f32);
+const in_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NIO} -> inbuf[i] });
+var steps_total: u32 = 0;
+var pass_i: u32 = 0;
+const STEP: local_task_id = @get_local_task_id(9);
+const RECVD: local_task_id = @get_local_task_id(10);
+
+// One pass on whatever micro-batch x holds: the next input's receive posted
+// first, then the layer, then [x | tab] goes east (the last stage advances
+// every lane first).
+task step_task() void {
+  var b: u16 = 0;
+  while (b < dims[0]) : (b += 1) { cur[b] = tabw(b); }
+  rope_tables();
+  timing = pass_i >= K;
+  timestamp.get_timestamp(&t_mark);
+  const more = pass_i + 1 < steps_total;
+  if (more) {
+    @fmovs(in_dsd, fin(q_h_in, NIO), .{ .async = true, .activate = RECVD });
+  }
+  layer();
+  if (stage == K - 1) {
+    b = 0;
+    while (b < dims[0]) : (b += 1) { advance(b); }
+  }
+  if (more and lx == P - 1) {
+    @fmovs(fout(q_h_out, NIO), io_dsd);
+  }
+  pass_i += 1;
+  if (!more) { sys_mod.unblock_cmd_stream(); }
+}
+
+task recvd_task() void {
+  @fmovs(io_dsd, in_dsd);
+  @activate(STEP);
+}
+
+// `steps` passes a stage; x holds [x | tab] of the micro-batch it starts with.
+fn compute(steps: u32) void {
+  timestamp.enable_tsc();
+  steps_total = steps;
+  pass_i = 0;
+  @activate(STEP);
+}
+
+// copy_kv: pool page src's KV into page dst (whole pages), down each column on
+// c_bc (its routes are the layer's again at the next axis switch):
+// row src % P sends block src / P, row dst % P receives it into dst / P; the
+// rows between pass it on. One page a launch (the launch is the barrier the
+// routes need).
+fn copy_page(src: u32, dst: u32) void {
+  const rs_ = @as(u16, src % @as(u32, P));
+  const rd = @as(u16, dst % @as(u32, P));
+  const bs = @as(u16, src / @as(u32, P));
+  const bd = @as(u16, dst / @as(u32, P));
+  const kfrom = at(kblk_dsd, bs * Dc * PS);
+  const vfrom = at(vblk_dsd, bs * PS * Dc);
+  const kto = at(kblk_dsd, bd * Dc * PS);
+  const vto = at(vblk_dsd, bd * PS * Dc);
+  if (rs_ == rd) {
+    if (py == rs_) {
+      @fmovs(kto, kfrom);
+      @fmovs(vto, vfrom);
+    }
+  } else {
+    const down = rs_ < rd;
+    const lo = if (down) rs_ else rd;
+    const hi = if (down) rd else rs_;
+    if (py >= lo and py <= hi) {
+      const from = if (down) D_N else D_S;     // the data comes from upstream
+      const to = if (down) D_S else D_N;
+      if (py == rs_) { set_route(c_bc, D_RAMP, to, to); }
+      else if (py == rd) { set_route(c_bc, from, D_RAMP, D_RAMP); }
+      else { set_route(c_bc, from, to, to); }
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+// Second half of a copy, after every PE on the path has its route (a launch
+// apart): the sender sends, the receiver takes.
+fn copy_move(src: u32, dst: u32) void {
+  const rs_ = @as(u16, src % @as(u32, P));
+  const rd = @as(u16, dst % @as(u32, P));
+  if (rs_ != rd) {
+    const bs = @as(u16, src / @as(u32, P));
+    const bd = @as(u16, dst / @as(u32, P));
+    if (py == rs_) {
+      @fmovs(fout(q_bc_out, Dc * PS), at(kblk_dsd, bs * Dc * PS));
+      @fmovs(fout(q_bc_out, PS * Dc), at(vblk_dsd, bs * PS * Dc));
+    } else if (py == rd) {
+      @fmovs(at(kblk_dsd, bd * Dc * PS), fin(q_bc_in, Dc * PS));
+      @fmovs(at(vblk_dsd, bd * PS * Dc), fin(q_bc_in, PS * Dc));
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @initialize_queue(q_h_in, .{ .color = c_in });
+  @initialize_queue(q_h_out, .{ .color = c_out });
+  @bind_local_task(step_task, STEP);
+  @bind_local_task(recvd_task, RECVD);
+  @initialize_queue(q_r1_0_in, .{ .color = c_r1_0 });
+  @initialize_queue(q_r1_0_out, .{ .color = c_r1_0 });
+  @initialize_queue(q_r1_1_in, .{ .color = c_r1_1 });
+  @initialize_queue(q_r1_1_out, .{ .color = c_r1_1 });
+  @initialize_queue(q_r2_0_in, .{ .color = c_r2_0 });
+  @initialize_queue(q_r2_0_out, .{ .color = c_r2_0 });
+  @initialize_queue(q_r2_1_in, .{ .color = c_r2_1 });
+  @initialize_queue(q_r2_1_out, .{ .color = c_r2_1 });
+  @initialize_queue(q_bc_in, .{ .color = c_bc });
+  @initialize_queue(q_bc_out, .{ .color = c_bc });
+
+  @export_symbol(x_ptr, "x");
+  @export_symbol(gamma1_ptr, "gamma1");
+  @export_symbol(gamma2_ptr, "gamma2");
+  @export_symbol(wqa_ptr, "wqa");
+  @export_symbol(wqv_ptr, "wqv");
+  @export_symbol(wv_ptr, "wv");
+  @export_symbol(qkn_w_ptr, "qkn_w");
+  @export_symbol(rot_c_ptr, "rot_c");
+  @export_symbol(rot_s_ptr, "rot_s");
+  @export_symbol(kc_ptr, "kc");
+  @export_symbol(vc_ptr, "vc");
+  @export_symbol(wo_ptr, "wo");
+  @export_symbol(wgu_ptr, "wgu");
+  @export_symbol(wd_ptr, "wd");
+  @export_symbol(prof_ptr, "prof");
+  @export_symbol(dims_ptr, "dims");
+  @export_symbol(fallbacks_ptr, "fallbacks");
+  @export_symbol(init);
+  @export_symbol(compute);
+  @export_symbol(copy_page);
+  @export_symbol(copy_move);
+}

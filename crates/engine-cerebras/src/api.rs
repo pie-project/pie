@@ -15,7 +15,7 @@
 //! the pass it waits on. A fire whose `embed_tokens` cell is still in
 //! flight reads it on the device, straight out of the pass's output (a
 //! scatter into its input pack); any other port that reads an in-flight
-//! cell waits for it to land. `PIE_CEREBRAS_SYNC=1` settles every frame inside
+//! cell waits for it to land. The `sync` switch (1) settles every frame inside
 //! `submit`, for an A/B.
 #![allow(unsafe_code)]
 
@@ -121,10 +121,10 @@ struct StepSettle {
     policies: Vec<Readout>,
 }
 
-/// `PIE_CEREBRAS_SYNC=1`: every frame settles inside `submit`.
+/// The `sync` switch (1): every frame settles inside `submit`.
 fn synchronous() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_CEREBRAS_SYNC").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| crate::switches::on("sync"))
 }
 
 impl Cerebras {
@@ -174,14 +174,14 @@ impl Cerebras {
     }
 }
 
-fn refusal(refusal: crate::program::Refusal) -> Error {
+pub(crate) fn refusal(refusal: crate::program::Refusal) -> Error {
     match refusal {
         crate::program::Refusal::Closed { what, id } => Error::Closed { what, id },
         crate::program::Refusal::Program(why) => Error::Program(why),
     }
 }
 
-fn port_error(error: engine::ports::PortError) -> Error {
+pub(crate) fn port_error(error: engine::ports::PortError) -> Error {
     fault(Fault::Program {
         at: "program::ports",
         why: error.0,
@@ -223,9 +223,9 @@ pub(crate) fn fault(fault: Fault) -> Error {
     }
 }
 
-const DEFAULT_STATE_SLOTS: u32 = 4;
+pub(crate) const DEFAULT_STATE_SLOTS: u32 = 4;
 
-fn bake_budgets(budgets: &LoadBudgets) -> Budget {
+pub(crate) fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,
@@ -494,10 +494,12 @@ impl Engine for Cerebras {
                 frame: id,
                 step: index as u32,
             };
-            let latch = crate::program::Latch::new(at, self.sink.clone());
-            let (ticket, settle) = self.fire_step(step, &latch)?;
-            // The submitter's hold: the step is done once its passes land.
-            latch.release(Ok(()));
+            // Every pass of the step lands before `fire_step` returns.
+            let (ticket, settle) = self.fire_step(step)?;
+            tracing::debug!(frame = at.frame.0, step = at.step, "cerebras step landed");
+            if let Some(sink) = &self.sink {
+                sink(at, engine::StepOutcome::Committed);
+            }
             steps.push(ticket);
             settles.push(settle);
         }
@@ -679,25 +681,6 @@ impl Engine for Cerebras {
 struct LaneFeeds {
     cells: Vec<Vec<(u32, Vec<u8>)>>,
     voxels: Vec<Vec<u8>>,
-}
-
-/// `PIE_CEREBRAS_CAPTURE=<dir>` writes every submitted step there as JSON
-/// (`step-<n>.json`), for replaying a served request offline.
-fn capture(step: &engine::fire::Step) {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let Some(dir) = std::env::var_os("PIE_CEREBRAS_CAPTURE") else {
-        return;
-    };
-    let at = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::path::Path::new(&dir).join(format!("step-{at:05}.json"));
-    match serde_json::to_vec(step) {
-        Ok(bytes) => {
-            if let Err(why) = std::fs::write(&path, bytes) {
-                tracing::warn!("PIE_CEREBRAS_CAPTURE: {}: {why}", path.display());
-            }
-        }
-        Err(why) => tracing::warn!("PIE_CEREBRAS_CAPTURE: step {at}: {why}"),
-    }
 }
 
 /// One lane of a device-resolved fire, as its instance's descriptor ports
@@ -993,9 +976,7 @@ impl Cerebras {
     fn fire_step(
         &mut self,
         submission: &engine::fire::Step,
-        latch: &std::sync::Arc<crate::program::Latch>,
     ) -> EngineResult<(FireTicket, StepSettle)> {
-        capture(submission);
         // Checked before a prologue moves the cursors the caller predicted.
         for attachment in &submission.attachments {
             if let Some(lane) = submission.lanes.get(attachment.lane as usize)
@@ -1240,13 +1221,7 @@ impl Cerebras {
                 .device();
             let ran = self
                 .programs
-                .fire_guests_with(
-                    device,
-                    &attached,
-                    kept.as_deref(),
-                    Some(latch),
-                    Stage::Epilogue,
-                )
+                .fire_guests(device, &attached, kept.as_deref(), Stage::Epilogue)
                 .map_err(refusal)?;
             for (&(_, lane), ran) in attached.iter().zip(ran) {
                 if let Some(slot) = on_device.get_mut(lane as usize) {

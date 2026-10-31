@@ -1,0 +1,60 @@
+// ---------------------------------------------------------------- KV page staging
+// (appended to the paged layer grids by sync.py) Fork 4's host KV tier: a page
+// moves through KVST staging slots a PE instead of whole kc / vc rows (memcpy
+// takes no offset into a symbol). page_stage(page, slot): on grid row
+// page % P every PE copies block page / P of kc / vc into slot `slot` of
+// kstage / vstage (kc's Dc·PS order, vc's PS·Dc order, slots back to back,
+// no pad); page_unstage the reverse. Local copies only: every grid runs them
+// in one launch (call them between launches, as copy_page).
+// KVST 0: one word each (the names stay exported; nothing is staged).
+const KVS_W: u16 = if (KVST > 0) KVST * Dc * PS else 1;
+var kstage = @zeros([KVS_W]f32);
+var kstage_ptr: [*]f32 = &kstage;
+var vstage = @zeros([KVS_W]f32);
+var vstage_ptr: [*]f32 = &vstage;
+const kst_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc * PS} -> kstage[i] });
+const vst_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PS * Dc} -> vstage[i] });
+
+// The launches only record their arguments and activate one local task that
+// holds the copies (memcpy's dispatcher inlines each exported launch's body).
+var kvs_page: u32 = 0;
+var kvs_slot: u32 = 0;
+var kvs_in: bool = false;     // true: unstage (slot -> pool)
+const KVS_TASK: local_task_id = @get_local_task_id(11);
+
+task kvs_task() void {
+  if (KVST > 0 and py == @as(u16, kvs_page % @as(u32, P))) {
+    const b = @as(u16, kvs_page / @as(u32, P));
+    const s = @as(u16, kvs_slot);
+    if (kvs_in) {
+      @fmovs(at(kblk_dsd, b * Dc * PS), at(kst_dsd, s * Dc * PS));
+      @fmovs(at(vblk_dsd, b * PS * Dc), at(vst_dsd, s * PS * Dc));
+    } else {
+      @fmovs(at(kst_dsd, s * Dc * PS), at(kblk_dsd, b * Dc * PS));
+      @fmovs(at(vst_dsd, s * PS * Dc), at(vblk_dsd, b * PS * Dc));
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+fn page_stage(page: u32, slot: u32) void {
+  kvs_page = page;
+  kvs_slot = slot;
+  kvs_in = false;
+  @activate(KVS_TASK);
+}
+
+fn page_unstage(page: u32, slot: u32) void {
+  kvs_page = page;
+  kvs_slot = slot;
+  kvs_in = true;
+  @activate(KVS_TASK);
+}
+
+comptime {
+  @bind_local_task(kvs_task, KVS_TASK);
+  @export_symbol(kstage_ptr, "kstage");
+  @export_symbol(vstage_ptr, "vstage");
+  @export_symbol(page_stage);
+  @export_symbol(page_unstage);
+}

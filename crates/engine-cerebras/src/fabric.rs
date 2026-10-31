@@ -27,9 +27,19 @@ use kernels_cerebras::plan::{LaneSplit, Plan};
 
 use lanes::LanePlan;
 
+mod arena;
 pub mod lanes;
 mod plan;
+mod render;
 mod table;
+
+use render::reduce_mentions;
+
+pub use arena::{
+    ARENA_CHUNK, MOVE_ROW_WORDS, MOVE_ROWS, MOVE_SCRATCH, OP_BROADCAST, OP_BROADCAST_FROM,
+    OP_GATHER, OP_HANDOFF, OP_NOP, OP_ON, OP_REDUCE, OP_ROOT, OPS_SLACK_WORDS, RowShape, Table,
+    TableOp, Unified, WORK_SLACK_WORDS, keep_layout, op_words, parse_global_table,
+};
 
 pub use plan::Planner;
 
@@ -207,52 +217,38 @@ impl Default for Fabric {
     }
 }
 
-/// The fabric's terms as this process sets them: each from its
-/// environment variable, else the default.
+/// The fabric's terms as this process sets them: each from its switch
+/// ([`crate::switches`]: `[cerebras.switches]`, else the old variable),
+/// else the default.
 ///
-/// - `PIE_CEREBRAS_PE_WORDS`: the data words one phase places on a PE.
-/// - `PIE_CEREBRAS_SHARD_WORDS`: the elements of one buffer a PE holds
+/// - `pe_words`: the data words one phase places on a PE.
+/// - `shard_words`: the elements of one buffer a PE holds
 ///   before it is split (a small budget makes a small model take every
 ///   split form).
-/// - `PIE_CEREBRAS_MAX_PES`: the PEs one phase spreads over (a wafer takes
+/// - `max_pes`: the PEs one phase spreads over (a wafer takes
 ///   hundreds of thousands).
-/// - `PIE_CEREBRAS_RESIDENT_PES=N` (N > 1): the resident placement, every
+/// - `resident_pes=N` (N > 1): the resident placement, every
 ///   phase of a fire on one row of N PEs.
-/// - `PIE_CEREBRAS_FABRIC_SUM=0`: partials add on the host, not the fabric.
-/// - `PIE_CEREBRAS_HALF_WEIGHTS=1`, `PIE_CEREBRAS_HALF_POOL=1`: bf16
+/// - `fabric_sum=0`: partials add on the host, not the fabric.
+/// - `half_weights=1`, `half_pool=1`: bf16
 ///   weights, kv pools, packed two halves a word on the device.
-/// - `PIE_CEREBRAS_ATTN_ROWS`: the most rows one attention phase takes.
+/// - `attn_rows`: the most rows one attention phase takes.
 #[must_use]
 pub fn terms() -> Fabric {
-    let number = |var: &str| {
-        std::env::var(var)
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-    };
-    let on = |var: &str| std::env::var(var).is_ok_and(|v| v != "0");
+    let number = |name: &str| crate::switches::parse::<u64>(name).filter(|v| *v > 0);
+    let on = crate::switches::on;
     let default = Fabric::default();
     Fabric {
-        pe_words: number("PIE_CEREBRAS_PE_WORDS").unwrap_or(default.pe_words),
-        shard_words: number("PIE_CEREBRAS_SHARD_WORDS").unwrap_or(default.shard_words),
-        max_pes: std::env::var("PIE_CEREBRAS_MAX_PES")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
+        pe_words: number("pe_words").unwrap_or(default.pe_words),
+        shard_words: number("shard_words").unwrap_or(default.shard_words),
+        max_pes: crate::switches::parse::<u32>("max_pes")
             .filter(|v| *v > 0)
             .unwrap_or(default.max_pes),
-        resident_pes: std::env::var("PIE_CEREBRAS_RESIDENT_PES")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| *v > 1),
-        fabric_sum: std::env::var("PIE_CEREBRAS_FABRIC_SUM")
-            .ok()
-            .is_none_or(|v| v != "0"),
-        half_weights: on("PIE_CEREBRAS_HALF_WEIGHTS"),
-        half_pool: on("PIE_CEREBRAS_HALF_POOL"),
-        attn_rows: std::env::var("PIE_CEREBRAS_ATTN_ROWS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| *v > 0),
+        resident_pes: crate::switches::parse::<u32>("resident_pes").filter(|v| *v > 1),
+        fabric_sum: crate::switches::get("fabric_sum").is_none_or(|v| v != "0" && v != "false"),
+        half_weights: on("half_weights"),
+        half_pool: on("half_pool"),
+        attn_rows: crate::switches::parse::<u32>("attn_rows").filter(|v| *v > 0),
     }
 }
 
@@ -554,465 +550,28 @@ pub struct Manifest {
     pub tables: Vec<Table>,
 }
 
-/// Whether fused programs render table-driven (`PIE_CEREBRAS_TABLE=1`):
+/// Whether fused programs render table-driven (the `table` switch at 1):
 /// one interpreter over the kernels the program uses, the buffers in an
 /// arena at fixed offsets, the phases a table of kernel calls and
 /// collectives the host uploads as data.
 pub fn table_mode() -> bool {
-    std::env::var("PIE_CEREBRAS_TABLE").is_ok_and(|v| v != "0")
+    crate::switches::on("table")
 }
 
 /// Whether a fire renders as one table-driven program over every phase
-/// (`PIE_CEREBRAS_WHOLE_FIRE=1`, with `table_mode` and the resident
+/// (the `whole_fire` switch at 1, with `table_mode` and the resident
 /// placement): the buffers keep one layout across phases, the arena is
 /// allotted by liveness, and the host moves only inputs and outputs.
 pub fn whole_fire() -> bool {
-    table_mode() && std::env::var("PIE_CEREBRAS_WHOLE_FIRE").is_ok_and(|v| v != "0")
+    table_mode() && crate::switches::on("whole_fire")
 }
 
 /// Whether kv pools stay on the device between fires
-/// (`PIE_CEREBRAS_KEEP_POOLS=1`, with a whole-fire program of one unified
+/// (the `keep_pools` switch at 1, with a whole-fire program of one unified
 /// shape on a resident server): kept like the weights, their page moves
 /// becoming table rows the host fills per fire.
 pub fn keep_pools() -> bool {
-    whole_fire() && std::env::var("PIE_CEREBRAS_KEEP_POOLS").is_ok_and(|v| v != "0")
-}
-
-/// Rows a kept-pool program reserves at the table's start for the fire's
-/// page moves (three rows a move between PEs), and the words of the
-/// scratch page they travel through.
-pub const MOVE_ROWS: u32 = 48;
-pub const MOVE_SCRATCH: u64 = 1024;
-
-/// Words one arena array holds (a word address of 16 bits): a larger
-/// arena is several arrays, an offset naming its array by `offset /
-/// ARENA_CHUNK`.
-pub const ARENA_CHUNK: u64 = 8192;
-
-/// Words an op row holds beside its length word: the opcode and its
-/// operands.
-#[must_use]
-pub fn op_words(op: &TableOp) -> u32 {
-    match op {
-        TableOp::Call { args, on, root, .. } => {
-            args.len() as u32 + 1 + u32::from(on.is_some()) * 2 + u32::from(*root && on.is_none())
-        }
-        TableOp::Collective(_) => 4,
-        TableOp::Nop => MOVE_ROW_WORDS,
-    }
-}
-
-/// Words a page-move row holds (`OP_ON pe k_copy dst 0 src 0 words`).
-pub const MOVE_ROW_WORDS: u32 = 8;
-
-/// The table-driven form of a program: the kernels it dispatches (opcode =
-/// index), the op rows (each its length word, then the opcode and the
-/// operands; a zero length ends the table), and the arena every buffer
-/// lives in.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Table {
-    pub kernels: Vec<Kernel>,
-    /// Words the op table holds (the rows, padded with zeros to a unified
-    /// capacity).
-    pub ops_words: u32,
-    pub ops: Vec<TableOp>,
-    /// Arena slots `(name, offset, words)` per PE: the exports (as laid
-    /// out for the PE) and the scratch arrays (zeros).
-    pub arena: Vec<(String, u64, u64)>,
-    pub arena_words: u64,
-    /// The first `keep_chunks` arena arrays hold the kept exports alone:
-    /// a resident server uploads them once and never reads them back.
-    pub keep_chunks: u32,
-    /// Rows the table holds (`ops.len()` padded with no-ops to a unified
-    /// capacity).
-    pub rows: u32,
-    /// The first `move_rows` rows are no-ops the host fills with the
-    /// fire's page moves (kept pools).
-    pub move_rows: u32,
-    /// Constant tables `(name, words)` the kernels index (rope frequencies,
-    /// n-gram primes): kept arena slots the host fills once, in place of
-    /// the CSL globals the op table cannot point at.
-    pub consts: Vec<(String, Vec<u32>)>,
-    /// Phases the table runs (a whole fire's row: its share of the fire).
-    pub phases: u32,
-}
-
-/// A CSL global array literal `var NAME = [N]T { a, b, … };` of `f32`,
-/// `i32`, `u32` or `u64`, as the words it holds (a `u64` low word first,
-/// as the PE lays it out).
-#[must_use]
-pub fn parse_global_table(line: &str) -> Option<(String, Vec<u32>)> {
-    let rest = line.trim().strip_prefix("var ")?;
-    let (name, rest) = rest.split_once(" = [")?;
-    let (count, rest) = rest.split_once(']')?;
-    let count: usize = count.trim().parse().ok()?;
-    let (elem, rest) = rest.split_once('{')?;
-    let elem = elem.trim();
-    let body = rest.trim().trim_end_matches(';').trim().strip_suffix('}')?;
-    let lits: Vec<&str> = body
-        .split(',')
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    if lits.len() != count {
-        return None;
-    }
-    let mut words = Vec::with_capacity(count * 2);
-    for l in lits {
-        match elem {
-            "f32" => words.push(l.parse::<f32>().ok()?.to_bits()),
-            "i32" => words.push(l.parse::<i32>().ok()? as u32),
-            "u32" => words.push(l.parse::<u32>().ok()?),
-            "u64" => {
-                let v = l.parse::<u64>().ok()?;
-                words.push(v as u32);
-                words.push((v >> 32) as u32);
-            }
-            _ => return None,
-        }
-    }
-    Some((name.trim().to_string(), words))
-}
-
-impl Table {
-    /// Arena arrays the PE declares: `arena_words` in chunks of
-    /// [`ARENA_CHUNK`] (one array a chunk).
-    #[must_use]
-    pub fn chunks(&self) -> u64 {
-        self.arena_words.div_ceil(ARENA_CHUNK).max(1)
-    }
-
-    /// Words arena array `c` holds: the chunk's prefix the arena's slots
-    /// reach (a kept chunk padded to the boundary declares its kept words
-    /// alone, so a model's few kept weights do not cost a whole chunk).
-    #[must_use]
-    pub fn chunk_words(&self, c: u64) -> u64 {
-        let lo = c * ARENA_CHUNK;
-        let hi = (lo + ARENA_CHUNK).min(self.arena_words);
-        let reach = self
-            .arena
-            .iter()
-            .filter(|(_, off, words)| *off < hi && off + words > lo)
-            .map(|(_, off, words)| (off + words).min(hi))
-            .max()
-            .unwrap_or(lo);
-        // A chunk below the arena's end without a slot still carries one
-        // word (the arena stays addressable chunk by chunk).
-        if c + 1 < self.chunks() && reach == lo {
-            return 1;
-        }
-        reach.saturating_sub(lo).max(1)
-    }
-
-    /// Words the PE's arena arrays take together.
-    #[must_use]
-    pub fn data_words(&self) -> u64 {
-        (0..self.chunks()).map(|c| self.chunk_words(c)).sum::<u64>() + u64::from(self.ops_words)
-    }
-}
-
-/// What every class of a model agrees on so their whole-fire programs are
-/// one program text (one compiled binary, one resident server whose kept
-/// arena outlives the fire classes): the partition of the fire into rows
-/// of PEs, the kept exports' slots (one layout over the whole rectangle,
-/// each slot an exported symbol the host uploads once), and per row the
-/// kernels dispatched, the arena's size, the table's capacity.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Unified {
-    /// Phases a row, when the classes' fires split alike (`None` leaves
-    /// each fire to its own fused groups: a single row, or a partition
-    /// still to be chosen).
-    pub row_phases: Option<Vec<usize>>,
-    /// Kept exports `(name, offset, words)`, in the arena's first arrays,
-    /// the same on every row.
-    pub keep: Vec<(String, u64, u64)>,
-    pub keep_chunks: u32,
-    /// Row by row (one for a single-row program); empty while only the
-    /// partition is fixed.
-    pub rows: Vec<RowShape>,
-}
-
-/// One row's shape under a unified whole fire.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct RowShape {
-    pub kernels: Vec<Kernel>,
-    pub arena_words: u64,
-    pub rows: u32,
-    pub ops_words: u32,
-}
-
-/// Slack a unified shape adds over the probes' largest work region and op
-/// table, so a fire a little off the probes still renders under the shape
-/// (a fire the shape refuses falls back to its own programs and loses
-/// the kept pools).
-pub const WORK_SLACK_WORDS: u64 = 256;
-pub const OPS_SLACK_WORDS: u32 = 64;
-
-/// Lays kept slots `(name, words)` from the arena's start, each within one
-/// chunk: the slots and the chunks they take.
-#[must_use]
-pub fn keep_layout(mut kept: Vec<(String, u64)>) -> (Vec<(String, u64, u64)>, u32) {
-    kept.sort();
-    kept.dedup_by(|a, b| {
-        if a.0 == b.0 {
-            b.1 = b.1.max(a.1);
-            true
-        } else {
-            false
-        }
-    });
-    let mut at = 0u64;
-    let mut placed = Vec::new();
-    for (name, words) in kept {
-        let chunk = at / ARENA_CHUNK;
-        if words <= ARENA_CHUNK && (at + words - 1) / ARENA_CHUNK != chunk {
-            at = (chunk + 1) * ARENA_CHUNK;
-        }
-        placed.push((name, at, words));
-        at += words;
-    }
-    (placed, at.div_ceil(ARENA_CHUNK) as u32)
-}
-
-impl RowShape {
-    /// The union of several tables of one row: every kernel, the largest
-    /// work region, table and row.
-    pub fn union<'a>(tables: impl IntoIterator<Item = &'a Table>) -> RowShape {
-        let mut kernels: Vec<Kernel> = Vec::new();
-        let (mut work, mut rows, mut ops_words) = (0u64, 0u32, 0u32);
-        for t in tables {
-            for k in &t.kernels {
-                if !kernels.contains(k) {
-                    kernels.push(*k);
-                }
-            }
-            work = work.max(
-                t.arena_words
-                    .saturating_sub(u64::from(t.keep_chunks) * ARENA_CHUNK),
-            );
-            rows = rows.max(t.rows);
-            ops_words = ops_words.max(t.ops_words);
-        }
-        if keep_pools() && !kernels.contains(&Kernel::Copy) {
-            kernels.push(Kernel::Copy);
-        }
-        RowShape {
-            kernels,
-            // The work region's words, with slack: the first-fit liveness
-            // layout is not monotone in a fire's rows (a six-row prefill
-            // once needed one word more than the eight-row probe), so a
-            // fire a little off the probes still fits the shape. The kept
-            // chunks are added once the shared kept layout is known.
-            arena_words: work + WORK_SLACK_WORDS,
-            rows,
-            ops_words: ops_words + OPS_SLACK_WORDS,
-        }
-    }
-}
-
-impl Unified {
-    /// The union of several single-row programs' tables.
-    pub fn union<'a>(tables: impl IntoIterator<Item = &'a Table>) -> Unified {
-        let tables: Vec<&Table> = tables.into_iter().collect();
-        let mut u = Unified {
-            row_phases: None,
-            keep: Vec::new(),
-            keep_chunks: 0,
-            rows: vec![RowShape::union(tables.iter().copied())],
-        };
-        u.unite_keep(tables.iter().copied());
-        u
-    }
-
-    /// The partition every class is to follow: that of the program with
-    /// the most rows, when every program runs the same number of phases
-    /// (`None` otherwise). A program is its rows' tables.
-    pub fn partition(programs: &[Vec<Table>]) -> Option<Unified> {
-        let phases = |p: &Vec<Table>| p.iter().map(|t| t.phases as usize).sum::<usize>();
-        let first = programs.first()?;
-        if programs.iter().any(|p| phases(p) != phases(first)) {
-            return None;
-        }
-        let widest = programs.iter().max_by_key(|p| p.len())?;
-        Some(Unified {
-            row_phases: Some(widest.iter().map(|t| t.phases as usize).collect()),
-            keep: Vec::new(),
-            keep_chunks: 0,
-            rows: Vec::new(),
-        })
-    }
-
-    /// The union of several programs that split alike (every program the
-    /// same rows of the same phase counts): a shape a row, one kept layout.
-    pub fn union_rows(programs: &[Vec<Table>]) -> Option<Unified> {
-        let first = programs.first()?;
-        let phases: Vec<usize> = first.iter().map(|t| t.phases as usize).collect();
-        if programs
-            .iter()
-            .any(|p| p.iter().map(|t| t.phases as usize).collect::<Vec<_>>() != phases)
-        {
-            return None;
-        }
-        let rows = (0..first.len())
-            .map(|g| RowShape::union(programs.iter().map(|p| &p[g])))
-            .collect();
-        let mut u = Unified {
-            row_phases: (first.len() > 1).then_some(phases),
-            keep: Vec::new(),
-            keep_chunks: 0,
-            rows,
-        };
-        u.unite_keep(programs.iter().flatten());
-        Some(u)
-    }
-
-    /// Lays every table's kept slots out once and puts the rows' work
-    /// regions after them.
-    fn unite_keep<'a>(&mut self, tables: impl IntoIterator<Item = &'a Table>) {
-        let mut kept: Vec<(String, u64)> = Vec::new();
-        for t in tables {
-            for (name, off, words) in &t.arena {
-                if t.keep_chunks > 0 && *off < u64::from(t.keep_chunks) * ARENA_CHUNK {
-                    kept.push((name.clone(), *words));
-                }
-            }
-        }
-        let (keep, keep_chunks) = keep_layout(kept);
-        self.keep = keep;
-        self.keep_chunks = keep_chunks;
-        for r in &mut self.rows {
-            r.arena_words += u64::from(keep_chunks) * ARENA_CHUNK;
-        }
-    }
-}
-
-/// One row of the op table.
-#[derive(Debug, Clone, PartialEq)]
-pub enum TableOp {
-    /// Kernel `kernel` with `args` (pointers as arena offsets), on every PE,
-    /// the row's root alone (`root`), or one PE alone (`on`).
-    Call {
-        root: bool,
-        on: Option<u32>,
-        kernel: u32,
-        args: Vec<Arg>,
-    },
-    /// A collective along the row; the interpreter resumes after it lands.
-    Collective(FabricOp),
-    /// A row the host may fill (a page move), else skipped.
-    Nop,
-}
-
-/// Opcodes below the kernels: the collectives and the root-only call.
-pub const OP_REDUCE: i32 = -1;
-pub const OP_GATHER: i32 = -2;
-pub const OP_BROADCAST: i32 = -3;
-pub const OP_ROOT: i32 = -4;
-pub const OP_NOP: i32 = -5;
-pub const OP_ON: i32 = -6;
-pub const OP_BROADCAST_FROM: i32 = -7;
-pub const OP_HANDOFF: i32 = -8;
-
-/// The CSL of a fused group's step machine: the phases' functions run
-/// in order, each phase's steps after its function, every step handing
-/// the next to its collective's callback; the last state rounds and
-/// finishes the last reduce and ends the run.
-fn render_chain(chain: &[(&str, Option<&FabricReduce>)], pe: &mut String) {
-    // States: statements, then one collective; the trailing statements
-    // (functions after the last collective, roundings, finishes) end
-    // the run.
-    let mut states: Vec<(Vec<String>, &FabricOp)> = Vec::new();
-    let mut pending: Vec<String> = Vec::new();
-    for (func, reduce) in chain {
-        pending.push(format!("{func}();"));
-        if let Some(r) = reduce {
-            for step in &r.steps {
-                let mut lines = std::mem::take(&mut pending);
-                lines.extend(step.calls.iter().map(Guarded::render));
-                states.push((lines, &step.op));
-            }
-            // The finish lays the merged words out, then they round.
-            pending.extend(r.finish.iter().map(Guarded::render));
-            for (name, n) in &r.round {
-                pending.push(format!("k_round_bf16(@ptrcast([*]f32, &{name}), {n});"));
-            }
-        }
-    }
-    pe.push_str("var px: i32 = 0;\nvar st: u16 = 0;\nfn step_fn() void {\n  switch (st) {\n");
-    for (i, (lines, op)) in states.iter().enumerate() {
-        let _ = writeln!(pe, "    {i} => {{");
-        for l in lines {
-            let _ = writeln!(pe, "      {l}");
-        }
-        let _ = writeln!(pe, "      st = {};", i + 1);
-        match op {
-            FabricOp::Reduce { send, recv, count } => {
-                let _ = writeln!(
-                    pe,
-                    "      mpi_x.reduce_fadds(0, @ptrcast([*]f32, &{send}), @ptrcast([*]f32, &{recv}), {count}, step_id);"
-                );
-            }
-            FabricOp::Gather { send, recv, count } => {
-                let _ = writeln!(
-                    pe,
-                    "      mpi_x.gather(0, @ptrcast([*]u32, &{send}), @ptrcast([*]u32, &{recv}), {count}, step_id);"
-                );
-            }
-            FabricOp::Broadcast { buf, count } => {
-                let _ = writeln!(
-                    pe,
-                    "      mpi_x.broadcast(0, @ptrcast([*]u32, &{buf}), {count}, step_id);"
-                );
-            }
-            FabricOp::BroadcastFrom { root, buf, count } => {
-                let _ = writeln!(
-                    pe,
-                    "      mpi_x.broadcast({root}, @ptrcast([*]u32, &{buf}), {count}, step_id);"
-                );
-            }
-            // A handoff belongs to a whole fire's rows, never to a
-            // function program's step machine.
-            FabricOp::Handoff { .. } => {}
-        }
-        pe.push_str("    },\n");
-    }
-    let _ = writeln!(pe, "    {} => {{", states.len());
-    for l in &pending {
-        let _ = writeln!(pe, "      {l}");
-    }
-    pe.push_str("      sys_mod.unblock_cmd_stream();\n    },\n    else => {},\n  }\n}\n");
-    pe.push_str("task step_task() void { step_fn(); }\n");
-    pe.push_str("fn run() void {\n  mpi_x.init();\n  px = @as(i32, mpi_x.pe_id);\n  st = 0;\n  step_fn();\n}\n");
-}
-
-/// Every name the steps and the finish mention (for export selection).
-fn reduce_mentions(r: &FabricReduce) -> String {
-    let mut text = String::new();
-    for step in &r.steps {
-        for g in &step.calls {
-            text.push_str(&g.render());
-            text.push('\n');
-        }
-        match &step.op {
-            FabricOp::Reduce { send, recv, .. } | FabricOp::Gather { send, recv, .. } => {
-                let _ = writeln!(text, "{send} {recv}");
-            }
-            FabricOp::Broadcast { buf, .. }
-            | FabricOp::BroadcastFrom { buf, .. }
-            | FabricOp::Handoff { buf, .. } => {
-                let _ = writeln!(text, "{buf}");
-            }
-        }
-    }
-    for g in &r.finish {
-        text.push_str(&g.render());
-        text.push('\n');
-    }
-    for (name, _) in &r.round {
-        text.push_str(name);
-        text.push('\n');
-    }
-    text
+    whole_fire() && crate::switches::on("keep_pools")
 }
 
 /// The rendered sources, ready for `cslc`.
@@ -1078,7 +637,7 @@ impl Program {
         format!("{hint}_{}", self.names)
     }
 
-    /// Names what the next phase lowers; [`take_scope`] hands it out.
+    /// Names what the next phase lowers; [`Self::take_scope`] hands it out.
     pub fn scope(&mut self, name: &str) {
         self.scope = Some(name.replace('.', "_"));
     }
@@ -1213,12 +772,6 @@ impl Program {
         name
     }
 
-    /// A private array under a name the caller chose (unique among its
-    /// scratch); `elem` is `f32`, `i32` or `u32`.
-    pub fn scratch_named(&mut self, name: &str, len: u64, elem: &'static str) {
-        self.scratch.push((name.to_string(), len, elem));
-    }
-
     /// A global declaration line (a DSD, a constant table); `line` includes its `;`.
     pub fn global(&mut self, line: impl Into<String>) {
         let line = line.into();
@@ -1302,579 +855,6 @@ impl Program {
             })
             .collect()
     }
-
-    /// The helpers `body` needs, in declaration order: those it names, and
-    /// those the chosen helpers name in turn (a kernel's own helpers).
-    fn helpers_for(&self, body: &str) -> Vec<&str> {
-        let wanted = |text: &str, name: &str, h: &str| {
-            mentions(text, name)
-                || h.lines()
-                    .any(|l| l.starts_with("fn ") && mentions(text, fn_name(l)))
-        };
-        let all: Vec<(&str, &str)> = self
-            .helpers
-            .iter()
-            .map(|(n, h)| (n.as_str(), h.as_str()))
-            .collect();
-        let mut chosen: Vec<bool> = all.iter().map(|(n, h)| wanted(body, n, h)).collect();
-        loop {
-            let mut grew = false;
-            for i in 0..all.len() {
-                if chosen[i] {
-                    continue;
-                }
-                let (n, h) = all[i];
-                let by_chosen = all
-                    .iter()
-                    .zip(&chosen)
-                    .any(|((_, src), c)| *c && wanted(src, n, h));
-                if by_chosen {
-                    chosen[i] = true;
-                    grew = true;
-                }
-            }
-            if !grew {
-                break;
-            }
-        }
-        all.iter()
-            .zip(&chosen)
-            .filter(|(_, c)| **c)
-            .map(|((_, h), _)| *h)
-            .collect()
-    }
-
-    /// The phases in run order, adjacent fabric phases fused into one
-    /// program when they run on the same PEs, hold every shared buffer
-    /// the same way, carry no lane plan, and fit a PE together: a fused
-    /// group runs its functions in sequence, so a buffer one writes and
-    /// the next reads stays on the PE instead of crossing the host twice
-    /// (`PIE_CEREBRAS_FUSE=0` keeps every phase apart).
-    fn fused_phases(&self) -> Vec<Vec<&Phase>> {
-        self.fused_phases_with(0)
-    }
-
-    /// The fused groups when every group also carries `extra` data words
-    /// (a whole fire's kept slots, the same on every row).
-    pub(crate) fn fused_phases_with(&self, extra: u64) -> Vec<Vec<&Phase>> {
-        let fuse = std::env::var("PIE_CEREBRAS_FUSE")
-            .ok()
-            .is_none_or(|v| v != "0");
-        let exports = self.exports();
-        let mut groups: Vec<Vec<&Phase>> = Vec::new();
-        let words_of = |group: &[&Phase]| -> u64 {
-            let mut body = String::new();
-            for p in group {
-                p.func.render(&mut body);
-            }
-            let shard_of = |name: &str| -> Shard {
-                group
-                    .iter()
-                    .flat_map(|p| p.shards.iter())
-                    .find(|(n, _)| n == name)
-                    .map_or(Shard::Whole, |(_, s)| *s)
-            };
-            let buffers: u64 = exports
-                .iter()
-                .filter(|e| mentions(&body, &e.name))
-                .map(|e| {
-                    Export {
-                        shard: shard_of(&e.name),
-                        ..e.clone()
-                    }
-                    .local()
-                })
-                .sum();
-            let scratch: u64 = self
-                .scratch
-                .iter()
-                .filter(|(name, _, _)| mentions(&body, name))
-                .map(|(_, len, _)| *len)
-                .sum();
-            buffers + scratch
-        };
-        // A view is its own array on the PE, cut from its root before the
-        // program runs: a phase naming a view cannot share a program with
-        // one naming the view's root or another view of it, or one would
-        // read what the other wrote through a stale copy.
-        let text_of = |p: &Phase| {
-            let mut t = String::new();
-            p.func.render(&mut t);
-            t
-        };
-        let roots_of = |text: &str| -> Vec<(String, String)> {
-            self.views
-                .iter()
-                .filter(|v| mentions(text, &v.name))
-                .map(|v| (v.name.clone(), v.root.clone()))
-                .collect()
-        };
-        let views_clash = |a: &str, b: &str| {
-            let clash = |x: &str, y: &str| {
-                roots_of(x).iter().any(|(view, root)| {
-                    mentions(y, root)
-                        || self
-                            .views
-                            .iter()
-                            .any(|w| w.root == *root && w.name != *view && mentions(y, &w.name))
-                })
-            };
-            clash(a, b) || clash(b, a)
-        };
-        // The code a fused group links beside its data: the kernels it
-        // names, the prelude, its own functions and the export plumbing,
-        // at `CODE_WORDS_PER_LINE` (the data budget alone assumes one
-        // phase's worth of code).
-        let code_of = |group: &[&Phase]| -> u64 {
-            let mut body = String::new();
-            for p in group {
-                p.func.render(&mut body);
-            }
-            let lines = |t: &str| {
-                t.lines()
-                    .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with("//"))
-                    .count() as u64
-            };
-            let helpers: u64 = self.helpers_for(&body).iter().map(|h| lines(h)).sum();
-            let used = exports.iter().filter(|e| mentions(&body, &e.name)).count() as u64;
-            // The step machine: about eight lines a collective, and the
-            // collectives module's own code and buffers once.
-            let steps: u64 = group
-                .iter()
-                .filter_map(|p| p.reduce.as_ref())
-                .map(|r| r.steps.len() as u64 + r.finish.len() as u64 + r.round.len() as u64)
-                .sum();
-            // A table-driven group also holds its op table: a row (about
-            // twelve words) per call and per step.
-            let calls: u64 = group
-                .iter()
-                .map(|p| p.func.body.calls().count() as u64)
-                .sum();
-            let source = lines(kernels_cerebras::library::prelude())
-                + helpers
-                + lines(&body)
-                + 2 * used
-                + 2 * group.len() as u64
-                + 8 * steps
-                + 30;
-            if table_mode() {
-                // A table program's operands are runtime values and its
-                // dispatch unpacks them: measured over linked programs,
-                // about `TABLE_CODE_WORDS_PER_LINE` a line plus a fixed
-                // part (collectives included), the op table beside.
-                return TABLE_CODE_WORDS_PER_LINE * source
-                    + TABLE_FIXED_WORDS
-                    + 12 * (calls + steps);
-            }
-            let module = if steps > 0 { COLLECTIVES_WORDS } else { 0 };
-            CODE_WORDS_PER_LINE * source + module
-        };
-        // Reducing phases bring their own rectangle (one group of partials
-        // a row); every reduce of a program must agree on it, and PE `p`
-        // sits at the same place under any rectangle of the same size.
-        let rects_agree = |g: &[&Phase], p: &Phase| {
-            let rects: Vec<(u32, u32)> = g
-                .iter()
-                .chain(std::iter::once(&p))
-                .filter_map(|q| q.reduce.as_ref().map(|r| r.rect))
-                .collect();
-            rects.windows(2).all(|w| w[0] == w[1])
-        };
-        // Lane phases bring their own plans: a buffer one plan lays out
-        // must be no other plan's.
-        let owned = |l: &LanePlan| -> Vec<String> {
-            let mut names: Vec<String> = vec![l.header.clone(), l.slots.clone()];
-            names.extend(l.banks.iter().map(|(n, ..)| n.clone()));
-            names.extend(l.row_outputs.iter().map(|(n, ..)| n.clone()));
-            names.extend(l.cols.iter().map(|c| c.name.clone()));
-            if let Some(p) = &l.pages {
-                names.extend(p.rewritten.iter().cloned());
-                match &p.source {
-                    PageSource::Csr { indptr, indices } => {
-                        names.push(indptr.clone());
-                        names.push(indices.clone());
-                    }
-                    PageSource::Rows { table } => names.push(table.clone()),
-                }
-            }
-            names.retain(|n| !n.is_empty());
-            names
-        };
-        // Two strided plans (the resident placement) lay every shared
-        // buffer out the same way (pages by `page % pes`, lane lists
-        // whole), so they may share.
-        let strided = |l: &LanePlan| l.pages.as_ref().is_some_and(|p| p.strided);
-        let lanes_apart = |g: &[&Phase], p: &Phase| {
-            let Some(mine) = &p.lane else {
-                return true;
-            };
-            let names = owned(mine);
-            g.iter().filter_map(|q| q.lane.as_ref()).all(|other| {
-                (strided(mine) && strided(other) && mine.pes == other.pes)
-                    || owned(other).iter().all(|n| !names.contains(n))
-            })
-        };
-        for phase in &self.phases {
-            let text = text_of(phase);
-            let joins = fuse
-                && phase.host.is_none()
-                && groups.last().is_some_and(|g| {
-                    let head = g[0];
-                    let group_text: String = g.iter().map(|p| text_of(p)).collect();
-                    head.host.is_none()
-                        && head.pes == phase.pes
-                        && !views_clash(&text, &group_text)
-                        && rects_agree(g, phase)
-                        && lanes_apart(g, phase)
-                        && phase.shards.iter().all(|(n, s)| {
-                            g.iter()
-                                .flat_map(|p| p.shards.iter())
-                                .all(|(m, t)| m != n || t == s)
-                        })
-                });
-            if joins {
-                let last = groups.last_mut().expect("a group");
-                last.push(phase);
-                let (words, code) = (words_of(last), code_of(last));
-                if std::env::var_os("PIE_CEREBRAS_TRACE_FUSION").is_some() {
-                    eprintln!(
-                        "fusion: {} phases, {words} data words, {code} code words (budget {FUSED_PE_WORDS})",
-                        last.len()
-                    );
-                }
-                if words + code + extra > FUSED_PE_WORDS {
-                    last.pop();
-                    groups.push(vec![phase]);
-                }
-            } else {
-                groups.push(vec![phase]);
-            }
-        }
-        groups
-    }
-
-    /// Renders every phase as its own single-PE memcpy program: each one
-    /// exports only the buffers its statements name, all as in-out (the host
-    /// carries every buffer between phases). Globals, helpers and scratch
-    /// arrays follow the phases that name them.
-    pub fn render_phases(&self) -> Vec<Rendered> {
-        self.render_phases_whole().0
-    }
-
-    /// `render_phases`, and whether the fire rendered as one whole-fire
-    /// program (a fire that did not falls back to its fused groups; under
-    /// kept pools that fallback would run on a pool of its own, so the
-    /// caller refuses the fire instead).
-    pub fn render_phases_whole(&self) -> (Vec<Rendered>, bool) {
-        let exports = self.exports();
-        if whole_fire()
-            && let Some(rendered) = self.render_whole(&exports)
-        {
-            return (vec![rendered], true);
-        }
-        (self.render_groups(&exports), false)
-    }
-
-    fn render_groups(&self, exports: &[Export]) -> Vec<Rendered> {
-        let exports = exports.to_vec();
-        self.fused_phases()
-            .into_iter()
-            .map(|group| {
-                let phase = group[0];
-                let f = &phase.func;
-                if let Some(host) = &phase.host {
-                    let names = host.op.names();
-                    let used: Vec<Export> = exports
-                        .iter()
-                        .filter(|e| names.contains(&e.name.as_str()))
-                        .map(|e| Export {
-                            role: Symbol::InOut,
-                            ..e.clone()
-                        })
-                        .collect();
-                    let views = self.views.iter().filter(|v| used.iter().any(|e| e.name == v.name)).cloned().collect();
-                    return Rendered {
-                        layout: String::new(),
-                        pe: String::new(),
-                        manifest: Manifest {
-                            exports: used,
-                            entry: "host".into(),
-                            rect: (0, 0),
-                            views,
-                            lanes: Vec::new(),
-                            host: Some(host.clone()),
-                            table: None,
-                            tables: Vec::new(),
-                        },
-                    };
-                }
-                // A fused group: every phase's function, run in order.
-                let mut body = String::new();
-                for p in &group {
-                    p.func.render(&mut body);
-                }
-                // The reduces' epilogues name their partials and outputs:
-                // they count as mentioned for export, scratch and helper
-                // selection.
-                let reduces: Vec<&FabricReduce> = group.iter().filter_map(|p| p.reduce.as_ref()).collect();
-                let reduce = reduces.first().copied();
-                for r in &reduces {
-                    for l in reduce_mentions(r).lines() {
-                        let _ = writeln!(body, "// {l}");
-                    }
-                }
-                let shard_of = |name: &str| -> Shard {
-                    group
-                        .iter()
-                        .flat_map(|p| p.shards.iter())
-                        .find(|(n, _)| n == name)
-                        .map_or(Shard::Whole, |(_, s)| *s)
-                };
-                // Every buffer travels both ways (the host holds the state)
-                // but a packed one: a packed input (a weight) is never read
-                // back, a packed in-out (a pool) comes back to be unpacked.
-                let used: Vec<Export> = exports
-                    .iter()
-                    .filter(|e| mentions(&body, &e.name))
-                    .map(|e| Export {
-                        shard: shard_of(&e.name),
-                        role: if e.packed { e.role } else { Symbol::InOut },
-                        ..e.clone()
-                    })
-                    .collect();
-                if table_mode()
-                    && let Some(rendered) = self.render_table(&group, &used, &reduces, false)
-                {
-                    if let Some(t) = &rendered.manifest.table {
-                        let lines = rendered.pe.lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with("//")).count();
-                        trace_fusion(&format!(
-                            "table of {} phases: arena {} words, ops {} words, {lines} lines",
-                            group.len(),
-                            t.arena_words,
-                            u64::from(t.ops_words)
-                        ));
-                        if std::env::var_os("PIE_CEREBRAS_TRACE_ARENA").is_some() {
-                            for (n, o, w) in &t.arena {
-                                eprintln!("fusion:   arena {o:>6} +{w:<6} {n}");
-                            }
-                        }
-                    }
-                    return rendered;
-                }
-                let mut pe = String::new();
-                pe.push_str("param memcpy_params;\n");
-                // The PE's index in the rectangle (`p` of the shards).
-                pe.push_str("param pe_id: u16;\n");
-                if reduce.is_some() {
-                    pe.push_str("param c2d_params;\n");
-                }
-                pe.push_str("const sys_mod = @import_module(\"<memcpy/memcpy>\", memcpy_params);\n");
-                pe.push_str("const math = @import_module(\"<math>\");\n");
-                if reduce.is_some() {
-                    pe.push_str(
-                        "const mpi_x = @import_module(\"<collectives_2d/pe>\", .{ .dim_params = c2d_params.x, .queues = [2]u16{2, 4}, .dest_dsr_ids = [1]u16{1}, .src0_dsr_ids = [1]u16{1}, .src1_dsr_ids = [1]u16{1} });\n",
-                    );
-                    pe.push_str("const step_id: local_task_id = @get_local_task_id(15);\n");
-                }
-                pe.push('\n');
-                pe.push_str(kernels_cerebras::library::prelude());
-                pe.push('\n');
-                for e in &used {
-                    let _ = writeln!(pe, "var {}: [{}]{};", e.name, e.local(), e.elem);
-                    let _ = writeln!(pe, "var {0}_ptr: [*]{1} = &{0};", e.name, e.elem);
-                }
-                for (name, len, elem) in &self.scratch {
-                    if mentions(&body, name) {
-                        let _ = writeln!(pe, "var {name} = @zeros([{len}]{elem});");
-                    }
-                }
-                pe.push('\n');
-                for g in &self.globals {
-                    if global_name(g).is_some_and(|n| mentions(&body, n)) {
-                        pe.push_str(g);
-                        pe.push('\n');
-                    }
-                }
-                pe.push('\n');
-                for h in self.helpers_for(&body) {
-                    pe.push_str(h);
-                    pe.push('\n');
-                }
-                pe.push_str(&body);
-                pe.push('\n');
-                match reduce {
-                    // The functions run with their collectives between them
-                    // (a step machine), the last callback ending the run.
-                    Some(_) => {
-                        let chain: Vec<(&str, Option<&FabricReduce>)> = group
-                            .iter()
-                            .map(|p| (p.func.name.as_str(), p.reduce.as_ref()))
-                            .collect();
-                        render_chain(&chain, &mut pe);
-                    }
-                    None => {
-                        pe.push_str("fn run() void {\n");
-                        for p in &group {
-                            let _ = writeln!(pe, "  {}();", p.func.name);
-                        }
-                        pe.push_str("  sys_mod.unblock_cmd_stream();\n}\n");
-                    }
-                }
-                let _ = f;
-                pe.push_str("comptime {\n");
-                if reduce.is_some() {
-                    pe.push_str("  @bind_local_task(step_task, step_id);\n");
-                }
-                for e in &used {
-                    let _ = writeln!(pe, "  @export_symbol({0}_ptr, \"{0}\");", e.name);
-                }
-                pe.push_str("  @export_symbol(run);\n}\n");
-
-                let pes = phase.pes.max(1);
-                // PE `p` sits at `(p % w, p / w)` of a rectangle as tall as
-                // fits: a row-major memcpy hands block `p` to that PE, and
-                // the host copies stream one channel a row. A reducing phase
-                // takes its own rectangle, one group of partials a row.
-                let (w, h) = reduce.map_or_else(|| rect_of(pes), |r| r.rect);
-                let mut layout = String::new();
-                let _ = writeln!(
-                    layout,
-                    "const memcpy = @import_module(\"<memcpy/get_params>\", .{{ .width = {w}, .height = {h} }});"
-                );
-                if reduce.is_some() {
-                    layout.push_str("const c2d = @import_module(\"<collectives_2d/params>\");\n");
-                }
-                let _ = writeln!(layout, "\nlayout {{\n  @set_rectangle({w}, {h});");
-                let _ = writeln!(
-                    layout,
-                    "  for (@range(i16, {h})) |y| {{\n    for (@range(i16, {w})) |x| {{"
-                );
-                if reduce.is_some() {
-                    layout.push_str(
-                        "      const params = c2d.get_params(@as(u16, x), @as(u16, y), .{ .x_colors = .{ @get_color(0), @get_color(1) }, .x_entrypoints = .{ @get_local_task_id(10), @get_local_task_id(11) }, .y_colors = .{ @get_color(4), @get_color(5) }, .y_entrypoints = .{ @get_local_task_id(12), @get_local_task_id(13) } });\n",
-                    );
-                    let _ = writeln!(layout, "      @set_tile_code(x, y, \"pe.csl\", .{{ .memcpy_params = memcpy.get_params(x), .pe_id = @as(u16, y * {w} + x), .c2d_params = params }});");
-                } else {
-                    let _ = writeln!(layout, "      @set_tile_code(x, y, \"pe.csl\", .{{ .memcpy_params = memcpy.get_params(x), .pe_id = @as(u16, y * {w} + x) }});");
-                }
-                layout.push_str("    }\n  }\n");
-                for e in &used {
-                    let _ = writeln!(layout, "  @export_name(\"{}\", [*]{}, true);", e.name, e.elem);
-                }
-                layout.push_str("  @export_name(\"run\", fn()void);\n}\n");
-                let views = self.views.iter().filter(|v| used.iter().any(|e| e.name == v.name)).cloned().collect();
-                Rendered {
-                    layout,
-                    pe,
-                    manifest: Manifest {
-                        exports: used,
-                        entry: "run".into(),
-                        rect: (w, h),
-                        views,
-                        lanes: group.iter().filter_map(|p| p.lane.clone()).collect(),
-                        host: None,
-                        table: None,
-                        tables: Vec::new(),
-                    },
-                }
-            })
-            .collect()
-    }
-
-    /// The table-driven rendering of a fused group: `None` when a phase
-    /// carries a statement that is not a kernel call, or an argument the
-    /// table cannot carry (a pointer to a global), so the group renders as
-    /// functions instead.
-    /// A whole fire as one table-driven program: every phase on the same
-    /// PEs (the resident placement), no host phase, no view, each buffer
-    /// laid out one way throughout; `None` when the fire does not fit that
-    /// shape, and the phases render as groups.
-    /// Renders a single-PE memcpy program.
-    pub fn render(&self) -> Rendered {
-        let exports = self.exports();
-        let entry = "run";
-
-        let mut layout = String::new();
-        layout.push_str("const memcpy = @import_module(\"<memcpy/get_params>\", .{ .width = 1, .height = 1 });\n\n");
-        layout.push_str("layout {\n  @set_rectangle(1, 1);\n");
-        layout.push_str(
-            "  @set_tile_code(0, 0, \"pe.csl\", .{ .memcpy_params = memcpy.get_params(0), .pe_id = @as(u16, 0) });\n",
-        );
-        for e in &exports {
-            let _ = writeln!(
-                layout,
-                "  @export_name(\"{}\", [*]{}, true);",
-                e.name, e.elem
-            );
-        }
-        let _ = writeln!(layout, "  @export_name(\"{entry}\", fn()void);");
-        layout.push_str("}\n");
-
-        let mut pe = String::new();
-        pe.push_str("param memcpy_params;\nparam pe_id: u16;\n");
-        pe.push_str("const sys_mod = @import_module(\"<memcpy/memcpy>\", memcpy_params);\n");
-        pe.push_str("const math = @import_module(\"<math>\");\n\n");
-        pe.push_str(kernels_cerebras::library::prelude());
-        pe.push('\n');
-        for e in &exports {
-            let n = e.rows as u64 * e.width as u64;
-            match e.role {
-                Symbol::Input | Symbol::InOut => {
-                    let _ = writeln!(pe, "var {}: [{n}]{};", e.name, e.elem);
-                }
-                Symbol::Output => {
-                    let _ = writeln!(pe, "var {} = @zeros([{n}]{});", e.name, e.elem);
-                }
-            }
-            let _ = writeln!(pe, "var {0}_ptr: [*]{1} = &{0};", e.name, e.elem);
-        }
-        for (name, len, elem) in &self.scratch {
-            let _ = writeln!(pe, "var {name} = @zeros([{len}]{elem});");
-        }
-        pe.push('\n');
-        for g in &self.globals {
-            pe.push_str(g);
-            pe.push('\n');
-        }
-        pe.push('\n');
-        for h in self.helpers.values() {
-            pe.push_str(h);
-            pe.push('\n');
-        }
-        for phase in &self.phases {
-            phase.func.render(&mut pe);
-            pe.push('\n');
-        }
-        let _ = writeln!(pe, "fn {entry}() void {{");
-        for line in &self.prologue {
-            let _ = writeln!(pe, "  {line}");
-        }
-        for phase in &self.phases {
-            let _ = writeln!(pe, "  {}();", phase.func.name);
-        }
-        pe.push_str("  sys_mod.unblock_cmd_stream();\n}\n\n");
-        pe.push_str("comptime {\n");
-        for e in &exports {
-            let _ = writeln!(pe, "  @export_symbol({0}_ptr, \"{0}\");", e.name);
-        }
-        let _ = writeln!(pe, "  @export_symbol({entry});");
-        pe.push_str("}\n");
-
-        Rendered {
-            layout,
-            pe,
-            manifest: Manifest {
-                exports,
-                entry: entry.into(),
-                rect: (1, 1),
-                views: self.views.clone(),
-                lanes: Vec::new(),
-                host: None,
-                table: None,
-                tables: Vec::new(),
-            },
-        }
-    }
 }
 
 /// Whether `text` names the identifier `name` (not as part of a longer one).
@@ -1931,9 +911,7 @@ pub const FUSED_PE_WORDS: u64 = 11000;
 pub const COLLECTIVES_WORDS: u64 = 2500;
 
 fn trace_fusion(what: &str) {
-    if std::env::var_os("PIE_CEREBRAS_TRACE_FUSION").is_some() {
-        eprintln!("fusion: {what}");
-    }
+    tracing::debug!("cerebras fusion: {what}");
 }
 
 /// Code words a line of a table-driven program costs, and the words it

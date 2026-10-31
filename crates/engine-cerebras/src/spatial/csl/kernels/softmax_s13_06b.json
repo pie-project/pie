@@ -1,0 +1,22 @@
+[
+ {
+  "old": "const ACTN: u16 = if (ACT1 > B * 2 * Dc) ACT1 else B * 2 * Dc;\n",
+  "new": "// S3: o [B][2][Dc] and after it the N2B exp sums, summed in one all-reduce.\nconst ACTN: u16 = if (ACT1 > B * 2 * Dc + N2B) ACT1 else B * 2 * Dc + N2B;\n"
+ },
+ {
+  "old": "const o_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * 2 * Dc} -> act[i] });\n",
+  "new": "const o_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * 2 * Dc} -> act[i] });\nconst osx_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * 2 * Dc + N2B} -> act[i] });\nconst osum_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N2B} -> act[@as(i16, B * 2 * Dc) + i] });\nconst o_qd = @get_dsd(mem4d_dsd, .{ .tensor_access = |q, d|{N2B, Dc} -> act[q * iDc + d] });\nconst bcv_qd = @get_dsd(mem4d_dsd, .{ .tensor_access = |q, d|{N2B, Dc} -> bcv[q] });\n"
+ },
+ {
+  "old": "fn bcast(comptime is_mul: bool) void {\n  var t: u16 = 0;\n  while (t < dims[2]) : (t += 1) {\n    const r = at(srow_dsd, t * N2B);\n    if (is_mul) { @fmuls(r, r, bcv_dsd); } else { @fsubs(r, r, bcv_dsd); }\n  }\n}\n",
+  "new": "// S1: every slot row in one op (rows past dims[2] are invalid slots at\n// -1e30; exp_inplace already runs over all of them).\nconst s_tj = @get_dsd(mem4d_dsd, .{ .tensor_access = |t, j|{TC, N2B} -> s[t * iN2B + j] });\nconst bcv_tj = @get_dsd(mem4d_dsd, .{ .tensor_access = |t, j|{TC, N2B} -> bcv[j] });\nfn bc_mul() void { @fmuls(s_tj, s_tj, bcv_tj); }\nfn bc_sub() void { @fsubs(s_tj, s_tj, bcv_tj); }\nfn bcast(comptime is_mul: bool) void {\n  if (is_mul) { bc_mul(); } else { bc_sub(); }\n}\n"
+ },
+ {
+  "old": "  exp_sums();\n  allreduce(false, red_2b, N2B);\n  var j: u16 = 0;\n  while (j < dims[3]) : (j += 1) { bcv[j] = recip(red[j]); }\n  bcast(true);\n  mark(5);\n",
+  "new": "  exp_sums();\n  // S3: the exp sums ride in the values all-reduce (after o); o is divided\n  // after it.\n  @fmovs(osum_dsd, red_2b);\n  mark(5);\n"
+ },
+ {
+  "old": "  mark(6);\n  allreduce(false, o_all, B * 2 * Dc);\n  mark(7);\n",
+  "new": "  mark(6);\n  allreduce(false, osx_all, B * 2 * Dc + N2B);\n  var j: u16 = 0;\n  while (j < N2B) : (j += 1) { bcv[j] = if (j < dims[3]) recip(act[B * 2 * Dc + j]) else 0.0; }\n  @fmuls(o_qd, o_qd, bcv_qd);\n  mark(7);\n"
+ }
+]

@@ -304,7 +304,21 @@ impl Schedule {
 pub fn block(width: u32, schedule: Schedule) -> u32 {
     match schedule {
         Schedule::Packed => BLOCK,
-        Schedule::Spread => lanes(width).max(32),
+        Schedule::Spread => laned(width, schedule).max(32),
+    }
+}
+
+/// The threads a row of `width` takes under `schedule`: a spread row wider
+/// than a block's vectors takes up to 1024, a vector each.
+#[must_use]
+pub fn laned(width: u32, schedule: Schedule) -> u32 {
+    match schedule {
+        Schedule::Packed => lanes(width),
+        Schedule::Spread => width
+            .div_ceil(VEC_WIDTH)
+            .max(1)
+            .next_power_of_two()
+            .min(1024),
     }
 }
 
@@ -330,8 +344,8 @@ pub(crate) fn per(op: &'static str, width: u32) -> Result<u32, Error> {
 /// The floats of shared memory a skeleton of `width`-wide rows in blocks of
 /// `block` threads whose body shares its row takes: a block's rows of f32.
 #[must_use]
-pub fn shared_floats(width: u32, block: u32) -> u32 {
-    let lanes = lanes(width);
+pub fn shared_floats(width: u32, block: u32, schedule: Schedule) -> u32 {
+    let lanes = laned(width, schedule);
     block * (width / VEC_WIDTH).div_ceil(lanes) * VEC_WIDTH
 }
 
@@ -359,7 +373,7 @@ pub(crate) fn entrypoint(
     format!(
         "::pie::elemwise::row_skeleton<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}, {late}u, {stream}u>",
         block(width, schedule),
-        lanes(width),
+        laned(width, schedule),
         stored.len()
     )
 }
@@ -428,10 +442,10 @@ pub(crate) fn fire(
         .chain(outs.iter().flat_map(|p| p.store.words()))
         .collect();
     let threads = block(width, schedule);
-    let blocks = skeleton_rows.div_ceil(threads / lanes(width));
+    let blocks = skeleton_rows.div_ceil(threads / laned(width, schedule));
     let floats = shared.table
         + if shared.shares {
-            shared_floats(width, threads)
+            shared_floats(width, threads, schedule)
         } else {
             0
         };

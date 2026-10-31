@@ -74,6 +74,9 @@ pub const STOP: &[u8] = b"_ZN8cerebras10SdkRuntime4stopEv\0";
 pub const CALL: &[u8] = b"_ZN8cerebras10SdkRuntime4callERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEERKSt6vectorIjSaIjEERKNS_13MemcpyOptionsE\0";
 pub const MEMCPY_H2D: &[u8] =
     b"_ZN8cerebras10SdkRuntime10memcpy_h2dEtPviiiiiRKNS_13MemcpyOptionsE\0";
+/// The data of each row of the rectangle, broadcast to every PE of it.
+pub const MEMCPY_H2D_ROWBCAST: &[u8] =
+    b"_ZN8cerebras10SdkRuntime19memcpy_h2d_rowbcastEtPviiiiiRKNS_13MemcpyOptionsE\0";
 pub const MEMCPY_D2H: &[u8] =
     b"_ZN8cerebras10SdkRuntime10memcpy_d2hEPvtiiiiiRKNS_13MemcpyOptionsE\0";
 pub const TASK_WAIT: &[u8] = b"_ZN8cerebras10SdkRuntime9task_waitERKNS0_4TaskE\0";
@@ -93,6 +96,9 @@ pub struct Api {
     pub stop: ThisFn,
     pub call: CallFn,
     pub memcpy_h2d: H2dFn,
+    /// Same signature as `memcpy_h2d`; `None` on an SDK without it (only
+    /// the batched wafer builds' tables need it).
+    pub memcpy_h2d_rowbcast: Option<H2dFn>,
     pub memcpy_d2h: D2hFn,
     pub task_wait: TaskFn,
     pub is_task_done: TaskDoneFn,
@@ -127,6 +133,7 @@ impl Api {
             stop: sym(runtime, STOP)?,
             call: sym(runtime, CALL)?,
             memcpy_h2d: sym(runtime, MEMCPY_H2D)?,
+            memcpy_h2d_rowbcast: sym(runtime, MEMCPY_H2D_ROWBCAST).ok(),
             memcpy_d2h: sym(runtime, MEMCPY_D2H)?,
             task_wait: sym(runtime, TASK_WAIT)?,
             is_task_done: sym(runtime, IS_TASK_DONE)?,

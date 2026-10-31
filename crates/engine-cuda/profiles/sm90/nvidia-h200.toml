@@ -11,6 +11,8 @@ qmm.gemm_from = 12  # 2.1% faster end to end
 qmm.split_thin_max = 16  # 1.2% faster end to end
 qmm.split_warps_per_sm = 80  # 2.3% faster end to end
 ssm.gdn_scan_until = 48  # 1.9% faster end to end
+sdpa.index_mma = true
+sdpa.index_radix = true
 
 [engine]
 prefill_lattice_from = 192  # 2.0% faster end to end

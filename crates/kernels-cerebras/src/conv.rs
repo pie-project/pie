@@ -2,9 +2,12 @@
 
 use dtype::Dtype;
 
+use crate::csl::Arg;
 use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
-use crate::phase::HostOp;
+use crate::gather::copy_split;
+use crate::library::Kernel;
+use crate::phase::{HostOp, Shard};
 use crate::tensor::Tensor;
 
 fn table(op: &'static str, what: &str, grid: Tensor) -> Result<u32, Error> {
@@ -248,20 +251,62 @@ pub fn concat_cols(ctx: &Ctx<'_>, xs: &[Tensor], y: Tensor) -> Result<(), Error>
         return Err(refuse(OP, "the inputs' widths sum to the output's"));
     }
     let rows = y.rows;
-    for (x, at) in spans {
-        ctx.emit(&mut |cx| {
-            let xb = cx.read(x)?;
-            let yb = cx.write(y)?;
-            cx.host(HostOp::ConcatCols {
-                x: xb.name,
-                y: yb.name,
+    // One phase copies every input into its columns, so `y` is whole when
+    // the phase ends: by row groups when the rows fit PEs, else the host.
+    let split = matches!(y.dtype, Dtype::Bf16 | Dtype::F32)
+        .then(|| {
+            copy_split(
+                ctx,
+                OP,
                 rows,
-                width: x.width,
-                stride: y.width,
-                at,
-            });
-            Ok(())
-        })?;
-    }
-    Ok(())
+                y.width,
+                spans.iter().all(|(x, _)| x.rows == rows),
+            )
+        })
+        .flatten();
+    let Some(rg) = split else {
+        for (x, at) in spans {
+            ctx.emit(&mut |cx| {
+                let xb = cx.read(x)?;
+                let yb = cx.write(y)?;
+                cx.host(HostOp::ConcatCols {
+                    x: xb.name,
+                    y: yb.name,
+                    rows,
+                    width: x.width,
+                    stride: y.width,
+                    at,
+                });
+                Ok(())
+            })?;
+        }
+        return Ok(());
+    };
+    ctx.emit(&mut |cx| {
+        let xbs = spans
+            .iter()
+            .map(|(x, _)| cx.read(*x))
+            .collect::<Result<Vec<_>, _>>()?;
+        let yb = cx.write(y)?;
+        if rg > 1 {
+            cx.over(rg);
+            for b in xbs.iter().chain([&yb]) {
+                cx.shard(b, Shard::Rows(rg));
+            }
+        }
+        for (xb, (x, at)) in xbs.into_iter().zip(&spans) {
+            cx.call(
+                Kernel::ConcatCols,
+                vec![
+                    Arg::Ptr(xb),
+                    Arg::Ptr(yb.clone()),
+                    Arg::Int(i64::from(rows / rg)),
+                    Arg::Int(i64::from(x.width)),
+                    Arg::Int(i64::from(y.width)),
+                    Arg::Int(i64::from(*at)),
+                ],
+            );
+        }
+        Ok(())
+    })
 }

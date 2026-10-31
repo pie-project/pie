@@ -217,6 +217,11 @@ pub struct Lane {
     /// Unique to its pass in a fire, so two passes' lanes never attend each other.
     #[serde(default)]
     pub group: Option<u32>,
+    /// How many more fires the frame this lane's fire belongs to sends
+    /// after it (`None`: not part of a frame). An engine that runs a device
+    /// token loop past its rows stops where the frame does.
+    #[serde(default)]
+    pub fires_after: Option<u32>,
     #[serde(default)]
     pub inputs: Vec<InputFeed>,
     /// The lane takes no seat; the state it carries, if any, is the row `rs_slot` names.

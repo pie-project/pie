@@ -1,0 +1,904 @@
+// One qwen3 decoder layer, 2-D partitioned over PX columns x PY rows (see
+// layout.csl). Columns past the model's kv heads carry zero (phantom) heads.
+// PE (px, py) holds x's chunk py (Hc dims; the same on every column) and the
+// kv dims of column px (Dc: half of them from the first half of the head, half
+// from the second, so RoPE pairs stay on the PE); the Qh query heads of that
+// kv head over the same dims; KV slots t of positions t * PY + py.
+// Every step is synchronous: blocking fabric ops, no tasks.
+// Weights are f32 (W16 = 0) or 16-bit (bf16 with --fp16-format=bf16, W16 = 1):
+// then y += W x runs as NP passes of @fmachs over x split into bf16 parts
+// (3 parts carry all of an f32's 24 mantissa bits, so W x is exact up to the
+// order of the f32 additions).
+param memcpy_params;
+param PX: u16;
+param PY: u16;
+param Hc: u16;
+param HR: u16;    // the model's hidden size (PY * Hc may pad it with zeros)
+param Dc: u16;
+param Gs: u16;
+param Qh: u16;
+param Ic: u16;
+param Tc: u16;
+param W16: u16;
+param NP: u16;
+param KV16: u16;
+param PROF: u16;   // 1: per-phase cycles (prof[0..16)); 0: the whole layer in prof[0]   // 1: the KV cache in bf16 (u16 storage), as PIE's bf16 KV
+param c_r1_0: color;
+param c_r1_1: color;
+param c_r2_0: color;
+param c_r2_1: color;
+param c_bc: color;
+param c_gb: color;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_mod = @import_module("<layout>");
+const timestamp = @import_module("<time>");
+const math = @import_module("<math>");
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+
+const HID: f32 = @as(f32, HR);
+const HD: f32 = @as(f32, Gs * Dc);   // head_dim
+const EPS: f32 = 1.0e-6;
+const R1: u16 = Gs / 2;              // phase-1 root within a group
+const NGX: u16 = PX / Gs;            // groups along X, Y
+const NGY: u16 = PY / Gs;
+const R2X: u16 = (NGX / 2) * Gs + R1;   // phase-2 roots
+const R2Y: u16 = (NGY / 2) * Gs + R1;
+// The current axis's: PEs, groups, phase-2 root (set by axis_y / axis_xx).
+var LEN: u16 = PY;
+var NG: u16 = NGY;
+var R2: u16 = R2Y;
+const QD: u16 = (Qh + 2) * Dc;       // [q heads | k | v]
+const QO: u16 = Qh * Dc;             // the query heads' dims (and o's)
+const DH: u16 = Dc / 2;
+const QT: u16 = Qh * Tc;             // scores, [slot][head]
+const WT = if (W16 == 1) @fp16() else f32;   // weight arithmetic type (bf16 with --fp16-format=bf16)
+const WS = if (W16 == 1) u16 else f32;   // weight storage (bf16 bits exported as u16)
+var wdummy = @zeros([1]WT);
+const KT = if (KV16 == 1) @fp16() else f32;   // KV arithmetic type
+const KS = if (KV16 == 1) u16 else f32;       // KV storage
+var kdummy = @zeros([1]KT);
+
+// ---------------------------------------------------------------- collectives
+// Two-phase grouped all-reduce (WaferLLM comm_pe.csl, in f32): phase 1 chains
+// each group of Gs PEs from both ends into its root, phase 2 chains the group
+// roots into R2, then R2 broadcasts. Along X, "seg" stops after phase 1 and
+// each group root broadcasts within its group (a kv head's columns).
+const q_r1_0_in = @get_input_queue(3);
+const q_r1_0_out = @get_output_queue(3);
+const q_r1_1_in = @get_input_queue(4);
+const q_r1_1_out = @get_output_queue(4);
+const q_r2_0_in = @get_input_queue(5);
+const q_r2_0_out = @get_output_queue(5);
+const q_r2_1_in = @get_input_queue(6);
+const q_r2_1_out = @get_output_queue(6);
+const q_bc_in = @get_input_queue(7);
+const q_bc_out = @get_output_queue(7);
+const q_gb_in = @get_input_queue(2);
+const q_gb_out = @get_output_queue(2);
+
+fn fout(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fin(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+
+var px: u16 = 0;
+var py: u16 = 0;
+
+fn route_phase1(comptime HEAD: direction, comptime TAIL: direction, r: u16) void {
+  if (r == R1) {
+    if (r % 2 == 0) {
+      color_config.reset_routes(c_r1_0, .{ .rx = HEAD, .tx = RAMP });
+      color_config.reset_routes(c_r1_1, .{ .rx = TAIL, .tx = RAMP });
+    } else {
+      color_config.reset_routes(c_r1_1, .{ .rx = HEAD, .tx = RAMP });
+      color_config.reset_routes(c_r1_0, .{ .rx = TAIL, .tx = RAMP });
+    }
+  } else if (r < R1) {
+    if (r % 2 == 0) {
+      color_config.reset_routes(c_r1_0, .{ .rx = HEAD, .tx = RAMP });
+      color_config.reset_routes(c_r1_1, .{ .rx = RAMP, .tx = TAIL });
+    } else {
+      color_config.reset_routes(c_r1_1, .{ .rx = HEAD, .tx = RAMP });
+      color_config.reset_routes(c_r1_0, .{ .rx = RAMP, .tx = TAIL });
+    }
+  } else {
+    if (r % 2 == 0) {
+      color_config.reset_routes(c_r1_1, .{ .rx = TAIL, .tx = RAMP });
+      color_config.reset_routes(c_r1_0, .{ .rx = RAMP, .tx = HEAD });
+    } else {
+      color_config.reset_routes(c_r1_0, .{ .rx = TAIL, .tx = RAMP });
+      color_config.reset_routes(c_r1_1, .{ .rx = RAMP, .tx = HEAD });
+    }
+  }
+}
+
+fn route_phase2(comptime HEAD: direction, comptime TAIL: direction, id: u16) void {
+  const qt = id / Gs;
+  const r = id % Gs;
+  if (id == R2) {
+    if (qt % 2 == 0) {
+      color_config.reset_routes(c_r2_0, .{ .rx = HEAD, .tx = RAMP });
+      color_config.reset_routes(c_r2_1, .{ .rx = TAIL, .tx = RAMP });
+    } else {
+      color_config.reset_routes(c_r2_1, .{ .rx = HEAD, .tx = RAMP });
+      color_config.reset_routes(c_r2_0, .{ .rx = TAIL, .tx = RAMP });
+    }
+  } else if (id < R2) {
+    if (r == R1) {
+      if (qt % 2 == 0) {
+        color_config.reset_routes(c_r2_0, .{ .rx = HEAD, .tx = RAMP });
+        color_config.reset_routes(c_r2_1, .{ .rx = RAMP, .tx = TAIL });
+      } else {
+        color_config.reset_routes(c_r2_1, .{ .rx = HEAD, .tx = RAMP });
+        color_config.reset_routes(c_r2_0, .{ .rx = RAMP, .tx = TAIL });
+      }
+    } else {
+      color_config.reset_routes(c_r2_0, .{ .rx = HEAD, .tx = TAIL });
+      color_config.reset_routes(c_r2_1, .{ .rx = HEAD, .tx = TAIL });
+    }
+  } else {
+    if (r == R1) {
+      if (qt % 2 == 0) {
+        color_config.reset_routes(c_r2_1, .{ .rx = TAIL, .tx = RAMP });
+        color_config.reset_routes(c_r2_0, .{ .rx = RAMP, .tx = HEAD });
+      } else {
+        color_config.reset_routes(c_r2_0, .{ .rx = TAIL, .tx = RAMP });
+        color_config.reset_routes(c_r2_1, .{ .rx = RAMP, .tx = HEAD });
+      }
+    } else {
+      color_config.reset_routes(c_r2_0, .{ .rx = TAIL, .tx = HEAD });
+      color_config.reset_routes(c_r2_1, .{ .rx = TAIL, .tx = HEAD });
+    }
+  }
+}
+
+fn route_bcast(comptime HEAD: direction, comptime TAIL: direction, id: u16) void {
+  if (id == R2) {
+    color_config.reset_routes(c_bc, .{ .rx = RAMP, .tx = [2]direction{ HEAD, TAIL } });
+  } else if (id < R2) {
+    if (id == 0) {
+      color_config.reset_routes(c_bc, .{ .rx = TAIL, .tx = RAMP });
+    } else {
+      color_config.reset_routes(c_bc, .{ .rx = TAIL, .tx = [2]direction{ HEAD, RAMP } });
+    }
+  } else {
+    if (id == LEN - 1) {
+      color_config.reset_routes(c_bc, .{ .rx = HEAD, .tx = RAMP });
+    } else {
+      color_config.reset_routes(c_bc, .{ .rx = HEAD, .tx = [2]direction{ RAMP, TAIL } });
+    }
+  }
+}
+
+// The group broadcast is only used along X: its routes are set once.
+fn route_gbcast() void {
+  const r = px % Gs;
+  if (r == R1) {
+    if (R1 == Gs - 1) {
+      color_config.reset_routes(c_gb, .{ .rx = RAMP, .tx = WEST });
+    } else {
+      color_config.reset_routes(c_gb, .{ .rx = RAMP, .tx = [2]direction{ WEST, EAST } });
+    }
+  } else if (r < R1) {
+    if (r == 0) {
+      color_config.reset_routes(c_gb, .{ .rx = EAST, .tx = RAMP });
+    } else {
+      color_config.reset_routes(c_gb, .{ .rx = EAST, .tx = [2]direction{ WEST, RAMP } });
+    }
+  } else {
+    if (r == Gs - 1) {
+      color_config.reset_routes(c_gb, .{ .rx = WEST, .tx = RAMP });
+    } else {
+      color_config.reset_routes(c_gb, .{ .rx = WEST, .tx = [2]direction{ RAMP, EAST } });
+    }
+  }
+}
+
+var axis_x: bool = false;
+var axis_id: u16 = 0;
+fn axis_y() void {
+  LEN = PY;
+  NG = NGY;
+  R2 = R2Y;
+  route_phase1(NORTH, SOUTH, py % Gs);
+  route_phase2(NORTH, SOUTH, py);
+  route_bcast(NORTH, SOUTH, py);
+  axis_x = false;
+  axis_id = py;
+}
+fn axis_xx() void {
+  LEN = PX;
+  NG = NGX;
+  R2 = R2X;
+  route_phase1(WEST, EAST, px % Gs);
+  route_phase2(WEST, EAST, px);
+  route_bcast(WEST, EAST, px);
+  axis_x = true;
+  axis_id = px;
+}
+
+// dst = a op b, op: sum or max.
+fn op_in(comptime is_max: bool, buf: mem1d_dsd, comptime q: input_queue, n: u16) void {
+  if (is_max) { @fmaxs(buf, buf, fin(q, n)); } else { @fadds(buf, buf, fin(q, n)); }
+}
+fn op_fwd(comptime is_max: bool, comptime qo: output_queue, comptime qi: input_queue,
+          buf: mem1d_dsd, n: u16) void {
+  if (is_max) { @fmaxs(fout(qo, n), fin(qi, n), buf); } else { @fadds(fout(qo, n), fin(qi, n), buf); }
+}
+
+fn phase1(comptime is_max: bool, buf: mem1d_dsd, n: u16) void {
+  const r = axis_id % Gs;
+  if (r == R1) {
+    if (R1 < Gs - 1) { op_in(is_max, buf, q_r1_0_in, n); }
+    op_in(is_max, buf, q_r1_1_in, n);
+  } else if (r > R1) {
+    if (r % 2 == 0) {
+      if (r == Gs - 1) { @fmovs(fout(q_r1_0_out, n), buf); }
+      else { op_fwd(is_max, q_r1_0_out, q_r1_1_in, buf, n); }
+    } else {
+      if (r == Gs - 1) { @fmovs(fout(q_r1_1_out, n), buf); }
+      else { op_fwd(is_max, q_r1_1_out, q_r1_0_in, buf, n); }
+    }
+  } else {
+    if (r % 2 == 0) {
+      if (r == 0) { @fmovs(fout(q_r1_1_out, n), buf); }
+      else { op_fwd(is_max, q_r1_1_out, q_r1_0_in, buf, n); }
+    } else {
+      op_fwd(is_max, q_r1_0_out, q_r1_1_in, buf, n);
+    }
+  }
+}
+
+fn phase2(comptime is_max: bool, buf: mem1d_dsd, n: u16) void {
+  const id = axis_id;
+  const r = id % Gs;
+  const qt = id / Gs;
+  if (id == R2) {
+    if (R2 < LEN - Gs) { op_in(is_max, buf, q_r2_0_in, n); }
+    op_in(is_max, buf, q_r2_1_in, n);
+  } else if (id > R2) {
+    if (r == R1) {
+      if (id > LEN - Gs - 1) {
+        if (qt % 2 == 0) { @fmovs(fout(q_r2_0_out, n), buf); }
+        else { @fmovs(fout(q_r2_1_out, n), buf); }
+      } else {
+        if (qt % 2 == 0) { op_fwd(is_max, q_r2_0_out, q_r2_1_in, buf, n); }
+        else { op_fwd(is_max, q_r2_1_out, q_r2_0_in, buf, n); }
+      }
+    }
+  } else {
+    if (r == R1) {
+      if (id < Gs) { @fmovs(fout(q_r2_1_out, n), buf); }
+      else {
+        if (qt % 2 == 0) { op_fwd(is_max, q_r2_1_out, q_r2_0_in, buf, n); }
+        else { op_fwd(is_max, q_r2_0_out, q_r2_1_in, buf, n); }
+      }
+    }
+  }
+}
+
+// Sum (or max) of buf over the current axis, left in buf on every PE.
+fn allreduce(comptime is_max: bool, buf: mem1d_dsd, n: u16) void {
+  phase1(is_max, buf, n);
+  if (NG > 1) { phase2(is_max, buf, n); }
+  if (axis_id == R2) { @fmovs(fout(q_bc_out, n), buf); }
+  else { @fmovs(buf, fin(q_bc_in, n)); }
+}
+
+// Sum of buf over this PE's group of Gs columns (axis X).
+fn allreduce_seg(buf: mem1d_dsd, n: u16) void {
+  phase1(false, buf, n);
+  if (px % Gs == R1) { @fmovs(fout(q_gb_out, n), buf); }
+  else { @fmovs(buf, fin(q_gb_in, n)); }
+}
+
+// ---------------------------------------------------------------- state
+var x = @zeros([Hc]f32);
+var x_ptr: [*]f32 = &x;
+const x_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> x[i] });
+var gamma1 = @zeros([Hc]f32);
+var gamma1_ptr: [*]f32 = &gamma1;
+const g1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> gamma1[i] });
+var gamma2 = @zeros([Hc]f32);
+var gamma2_ptr: [*]f32 = &gamma2;
+const g2_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> gamma2[i] });
+var xn: [Hc]f32 align(16) = @zeros([Hc]f32);
+const xn_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> xn[i] });
+
+const NRED: u16 = 3 * Qh;
+var red = @zeros([NRED]f32);
+const red_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NRED} -> red[i] });
+
+// Matrices one element past a 16-byte boundary, their y vectors on one
+// (bank offset, sdk-examples single-tile-matvec); the host writes a leading pad.
+var wqkv: [Hc * QD + 1]WS align(16) = @zeros([Hc * QD + 1]WS);
+var wqkv_ptr: [*]WS = &wqkv;
+var wqkv_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = QD })
+                else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> wqkv[i + 1] });
+// One more word: x's sum of squares rides with the QKV partials.
+var qkv: [QD + 1]f32 align(16) = @zeros([QD + 1]f32);
+const qkv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> qkv[i] });
+const qkv_ext_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD + 1} -> qkv[i] });
+const q_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QO} -> qkv[i] });
+const head0_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> qkv[i] });
+fn head(h: u16) mem1d_dsd { return @increment_dsd_offset(head0_dsd, @as(i16, h * Dc), f32); }
+
+var qkn_w = @zeros([2 * Dc]f32);   // q's norm weights (1/sqrt(head_dim) folded in), k's
+var qkn_w_ptr: [*]f32 = &qkn_w;
+const qnw_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> qkn_w[i] });
+const knw_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> qkn_w[@as(i16, Dc) + i] });
+// cos and sin of this column's RoPE frequencies (the host's; [cos | sin]).
+var inv_freq = @zeros([2 * DH]f32);
+var inv_freq_ptr: [*]f32 = &inv_freq;
+
+// Keys dim-major (column d: Tc slots), values slot-major (column t: Dc dims).
+var kc: [Dc * Tc + 1]KS align(16) = @zeros([Dc * Tc + 1]KS);
+var kc_ptr: [*]KS = &kc;
+var kc_dsd = if (KV16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &kdummy, .extent = Tc })
+             else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Tc} -> kc[i + 1] });
+var vc: [Tc * Dc + 1]KS align(16) = @zeros([Tc * Dc + 1]KS);
+var vc_ptr: [*]KS = &vc;
+var vc_dsd = if (KV16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &kdummy, .extent = Dc })
+             else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> vc[i + 1] });
+// A KV entry from f32: bf16 (round to nearest even) when KV16.
+fn kv_store(v: f32) KS {
+  if (KV16 == 1) {
+    const u = @bitcast(u32, v);
+    return @as(u16, (u + 0x7fff + ((u >> 16) & 1)) >> 16);
+  } else {
+    return v;
+  }
+}
+
+// Scores interleaved by slot ([t][head]): a row's filled slots of all heads
+// are one contiguous run. 3 Qh more words: what rides with the all-reduces
+// (q/k sums of squares; softmax sums and offset flags).
+var s: [QT + 3 * Qh]f32 align(16) = @zeros([QT + 3 * Qh]f32);
+const s_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QT} -> s[i] });
+const s_qk_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QT + Qh + 1} -> s[i] });
+const s_sm_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QT + 3 * Qh} -> s[i] });
+const sh0_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Tc} -> s[i * @as(i16, Qh)] });
+fn shead(h: u16) mem1d_dsd { return @increment_dsd_offset(sh0_dsd, @as(i16, h), f32); }
+var et = @zeros([QT]f32);
+const et_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QT} -> et[i] });
+// Each of a kv head's Gs columns exponentiates its own SH slots of a long row.
+const SH: u16 = (Tc + Gs - 1) / Gs;
+comptime { @comptime_assert(QT >= XMAX); }
+// The exponent offset carried from the last step (a head each).
+// The q heads' RMS scales of this step (the exact path recomputes the scores).
+var rq = @zeros([Qh]f32);
+var off = @zeros([Qh]f32);
+var hmax = @zeros([Qh]f32);
+var off_ok: bool = false;
+var fallbacks = @zeros([1]u32);   // softmax steps that took the exact path
+var fallbacks_ptr: [*]u32 = &fallbacks;
+
+// 3 Qh more words: the softmax sums and offset flags ride with the values.
+var o: [QO + 3 * Qh]f32 align(16) = @zeros([QO + 3 * Qh]f32);
+const o_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QO} -> o[i] });
+const o_ext_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QO + 3 * Qh} -> o[i] });
+const o0_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> o[i] });
+
+var wo: [QO * Hc + 1]WS align(16) = @zeros([QO * Hc + 1]WS);
+var wo_ptr: [*]WS = &wo;
+var wo_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = Hc })
+                else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> wo[i + 1] });
+var hv: [Hc]f32 align(16) = @zeros([Hc]f32);
+const hv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> hv[i] });
+
+var wgu: [Hc * 2 * Ic + 1]WS align(16) = @zeros([Hc * 2 * Ic + 1]WS);
+var wgu_ptr: [*]WS = &wgu;
+var wgu_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = 2 * Ic })
+                else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Ic} -> wgu[i + 1] });
+var gu: [2 * Ic + 1]f32 align(16) = @zeros([2 * Ic + 1]f32);
+const gu_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Ic} -> gu[i] });
+const gu_ext_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Ic + 1} -> gu[i] });
+// silu(g) * u replaces g in place (gu's first Ic words).
+const act_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> gu[i] });
+
+var wd: [Ic * Hc + 1]WS align(16) = @zeros([Ic * Hc + 1]WS);
+var wd_ptr: [*]WS = &wd;
+var wd_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = Hc })
+                else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> wd[i + 1] });
+
+// x split into bf16 parts for the 16-bit matvecs (the longest x: max(Hc, QO,
+// Ic)); their f32 scratch borrows the scores' buffers, idle during matvecs.
+const XMAX0: u16 = if (Hc > QO) (if (Hc > Ic) Hc else Ic) else (if (QO > Ic) QO else Ic);
+// (with a bf16 cache, p over the slots is an x too)
+const XMAX: u16 = if (KV16 == 1 and Tc > XMAX0) Tc else XMAX0;
+var xpart = @zeros([NP * XMAX]@fp16());
+const xpart_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XMAX} -> xpart[i] });
+// Their f32 scratch: et, and s or gu, whichever the call leaves free.
+const xres_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XMAX} -> et[i] });
+const xtmp_s_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XMAX} -> s[i] });
+const xtmp_g_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XMAX} -> gu[i] });
+
+// ---------------------------------------------------------------- compute
+// y += A x with explicit DSRs and @map (sdk-examples single-tile-matvec).
+const mv_dest = @get_dsr(dsr_dest, 1);
+const mv_src0 = @get_dsr(dsr_src0, 1);
+const mv_src1 = @get_dsr(dsr_src1, 1);
+fn mv_step(xv: f32) void {
+  @fmacs(mv_dest, mv_src0, mv_src1, xv);
+}
+fn mv16_step(xv: @fp16()) void {
+  @fmachs(mv_dest, mv_src0, mv_src1, xv);
+}
+fn matvec(y: mem1d_dsd, a: mem1d_dsd, xv: mem1d_dsd) void {
+  @load_to_dsr(mv_dest, y, .{ .save_address = false });
+  @load_to_dsr(mv_src0, y, .{ .save_address = false });
+  @load_to_dsr(mv_src1, a, .{ .save_address = true });
+  @map(mv_step, xv);
+}
+// y += W x for weights in WT: f32 as matvec, 16-bit as NP @fmachs passes over
+// x's bf16 parts (x = p0 + p1 + p2 exactly for NP = 3).
+fn wmatvec(y: mem1d_dsd, a: mem1d_dsd, xv: mem1d_dsd, n: u16) void {
+  mvany(W16 == 1, y, a, xv, n, xtmp_s_dsd);
+}
+fn mvany(comptime w16: bool, y: mem1d_dsd, a: mem1d_dsd, xv: mem1d_dsd, n: u16, scratch: mem1d_dsd) void {
+  if (!w16) {
+    matvec(y, a, xv);
+  } else {
+    const res = @set_dsd_length(xres_dsd, n);
+    const tmp = @set_dsd_length(scratch, n);
+    @fmovs(res, xv);
+    for (@range(u16, NP)) |k| {
+      const part = @set_dsd_length(@increment_dsd_offset(xpart_dsd, @as(i16, k * XMAX), @fp16()), n);
+      @fs2h(part, res);
+      if (k + 1 < NP) {
+        @fh2s(tmp, part);
+        @fsubs(res, res, tmp);
+      }
+      @load_to_dsr(mv_dest, y, .{ .save_address = false });
+      @load_to_dsr(mv_src0, y, .{ .save_address = false });
+      @load_to_dsr(mv_src1, a, .{ .save_address = true });
+      @map(mv16_step, part);
+    }
+  }
+}
+
+fn ssq(buf: [*]f32, n: u16) f32 {
+  var acc: f32 = 0.0;
+  for (@range(u16, n)) |i| { acc += buf[i] * buf[i]; }
+  return acc;
+}
+
+// 1/sqrt(v): the bit-trick estimate and three Newton steps (multiplies only).
+fn rsqrt(v: f32) f32 {
+  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
+  const h = 0.5 * v;
+  y = y * (1.5 - h * y * y);
+  y = y * (1.5 - h * y * y);
+  y = y * (1.5 - h * y * y);
+  return y;
+}
+// ln(v) to within ~0.1 from the float's exponent and mantissa bits (enough
+// for the softmax offset, which only has to stay near the scores' top).
+fn ln_approx(v: f32) f32 {
+  return (@as(f32, @bitcast(u32, v)) * (1.0 / 8388608.0) - 127.0) * 0.6931472;
+}
+fn recip(v: f32) f32 {
+  const r = rsqrt(v);
+  return r * r;
+}
+fn rms_scale(sum: f32, n: f32) f32 {
+  return rsqrt(sum * (1.0 / n) + EPS);
+}
+
+var cur: u32 = 0;
+// cos/sin of this step's angles: computed once a launch (rope_start), then
+// advanced a position a step by angle addition (rope_next).
+var rc = @zeros([DH]f32);
+var rs = @zeros([DH]f32);
+var rcd = @zeros([DH]f32);
+var rsd = @zeros([DH]f32);
+// The rotation by cur * f: the rotation by f (from the host) raised to cur by
+// squaring (no trigonometry on the PE).
+fn rope_start() void {
+  for (@range(u16, DH)) |j| {
+    rcd[j] = inv_freq[j];
+    rsd[j] = inv_freq[DH + j];
+    var c: f32 = 1.0;
+    var sn: f32 = 0.0;
+    var bc = rcd[j];
+    var bs = rsd[j];
+    var e = cur;
+    while (e > 0) : (e >>= 1) {
+      if (e & 1 == 1) {
+        const t = c * bc - sn * bs;
+        sn = sn * bc + c * bs;
+        c = t;
+      }
+      const u = bc * bc - bs * bs;
+      bs = 2.0 * bc * bs;
+      bc = u;
+    }
+    rc[j] = c;
+    rs[j] = sn;
+  }
+}
+fn rope_next() void {
+  for (@range(u16, DH)) |j| {
+    const c = rc[j] * rcd[j] - rs[j] * rsd[j];
+    rs[j] = rs[j] * rcd[j] + rc[j] * rsd[j];
+    rc[j] = c;
+  }
+}
+// Rotate the pairs (h[j], h[DH + j]) of the Qh query heads and k.
+fn rope_heads() void {
+  for (@range(u16, DH)) |j| {
+    const c = rc[j];
+    const sn = rs[j];
+    for (@range(u16, Qh + 1)) |h| {
+      const base = h * Dc;
+      const a = qkv[base + j];
+      const b = qkv[base + DH + j];
+      qkv[base + j] = a * c - b * sn;
+      qkv[base + DH + j] = b * c + a * sn;
+    }
+  }
+}
+
+// The heads' max (or sum) over the interleaved et ([slot][head], n slots), by
+// halving in place, one op a level (an odd middle slot waits a level); the
+// results land at et[0, Qh).
+fn heads_tree(comptime n: u16, comptime is_max: bool) void {
+  const half = n / 2;
+  const lo = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * half} -> et[i] });
+  const hi = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * half} -> et[@as(i16, Qh * (n - half)) + i] });
+  if (is_max) { @fmaxs(lo, lo, hi); } else { @fadds(lo, lo, hi); }
+  if (n - half > 1) { heads_tree(n - half, is_max); }
+}
+
+// (a runtime loop over them keeps the code small)
+var exp_coeffs = [7]f32 { 1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0 };
+// s[off, off + n) = exp of itself (<= 0): exp(s/256) by a degree-7
+// polynomial, then squared 8 times, as in our other kernels.
+fn exp_inplace(at: u16, n: u16) void {
+  const sd = @set_dsd_length(@increment_dsd_offset(s_dsd, @as(i16, at), f32), n);
+  const ed = @set_dsd_length(et_dsd, n);
+  @fmaxs(ed, sd, -88.0);
+  @fmuls(ed, ed, 0.00390625);
+  @fmovs(sd, 1.0 / 5040.0);
+  var c: u16 = 0;
+  while (c < 7) : (c += 1) {
+    @fmuls(sd, sd, ed);
+    @fadds(sd, sd, exp_coeffs[c]);
+  }
+  c = 0;
+  while (c < 8) : (c += 1) { @fmuls(sd, sd, sd); }
+}
+
+// s <- exp(s - off) per head over the filled slots, zeros elsewhere; the
+// heads' partial sums into red[0, Qh).
+fn exp_sums(filled: u16, hole: mem1d_dsd) void {
+  for (@range(u16, Qh)) |h| { @fsubs(shead(h), shead(h), off[h]); }
+  if (filled > 0) { exp_inplace(0, Qh * filled); }
+  if (filled < Tc) { @fmovs(hole, 0.0); }
+  @fmovs(et_dsd, s_dsd);
+  heads_tree(Tc, false);
+  for (@range(u16, Qh)) |h| { red[h] = et[h]; }
+}
+
+// s <- the heads' score partials over this column's dims and the filled
+// slots (the full matvec, or for a short row one multiply-add a dim).
+fn score_partials(filled: u16) void {
+  @fmovs(s_dsd, 0.0);
+  if (KV16 == 1) {
+    if (filled > 0) {
+      for (@range(u16, Qh)) |h| { mvany(true, shead(h), kc_dsd, head(h), Dc, xtmp_g_dsd); }
+    }
+  } else if (2 * filled >= Tc) {
+    for (@range(u16, Qh)) |h| { matvec(shead(h), kc_dsd, head(h)); }
+  } else if (filled > 0) {
+    for (@range(u16, Dc)) |d| {
+      const kd = @set_dsd_length(@increment_dsd_offset(kc_dsd, @as(i16, d * Tc), f32), filled);
+      for (@range(u16, Qh)) |h| {
+        const fh = @set_dsd_length(shead(h), filled);
+        @fmacs(fh, fh, kd, qkv[h * Dc + d]);
+      }
+    }
+  }
+}
+
+// o <- the heads' value partials over the filled slots, weighted by s.
+fn values_partial(filled: u16) void {
+  @fmovs(o_dsd, 0.0);
+  if (filled > 0) {
+    for (@range(u16, Qh)) |h| {
+      const oh = @increment_dsd_offset(o0_dsd, @as(i16, h * Dc), f32);
+      if (KV16 == 1) { mvany(true, oh, vc_dsd, @set_dsd_length(shead(h), filled), filled, xtmp_g_dsd); }
+      else { matvec(oh, vc_dsd, @set_dsd_length(shead(h), filled)); }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- profile
+const NPROF: u16 = 16;
+var prof = @zeros([NPROF]u32);
+var prof_ptr: [*]u32 = &prof;
+var t_mark = @zeros([timestamp.tsc_size_words]u16);
+var t_now = @zeros([timestamp.tsc_size_words]u16);
+var timing: bool = false;
+fn tsc(t: *[timestamp.tsc_size_words]u16) u64 {
+  return @as(u64, t.*[0]) | (@as(u64, t.*[1]) << 16) | (@as(u64, t.*[2]) << 32);
+}
+fn mark(slot: u16) void {
+  if (PROF == 1 or slot == NPROF - 1) {
+    timestamp.get_timestamp(&t_now);
+    if (timing) { prof[if (PROF == 1) slot else 0] += @as(u32, (tsc(&t_now) - tsc(&t_mark)) & 0xffffffff); }
+    t_mark = t_now;
+  }
+}
+
+// ---------------------------------------------------------------- the layer
+// Routes: X and Y collectives share colors and queues, and each PE switches
+// its routes at its own pace; so every switch happens right after the
+// collective that precedes it, before any local work. A PE then only ever
+// accepts wavelets for the collective it runs next (all PEs run them in the
+// same order), never data that a neighbor ahead sends for a later collective
+// of the other axis. The layer starts and ends in Y.
+fn layer() void {
+  // 0: QKV partials of x * gamma1, and x's sum of squares; 1: summed over the
+  // rows, then the RMSNorm scale.
+  @fmuls(xn_dsd, x_dsd, g1_dsd);
+  @fmovs(qkv_dsd, 0.0);
+  wmatvec(qkv_dsd, wqkv_dsd, xn_dsd, Hc);
+  qkv[QD] = ssq(&x, Hc);
+  mark(0);
+  allreduce(false, qkv_ext_dsd, QD + 1);
+  axis_xx();
+  @fmuls(qkv_dsd, qkv_dsd, rms_scale(qkv[QD], HID));
+  mark(1);
+  // 2: q/k norm weights and RoPE on the raw q/k (their RMS scales, scalars a
+  // head, come with the scores' all-reduce), KV append.
+  for (@range(u16, Qh + 1)) |h| {
+    s[QT + h] = ssq(@ptrcast([*]f32, &qkv[h * Dc]), Dc);
+    @fmuls(head(h), head(h), if (h < Qh) qnw_dsd else knw_dsd);
+  }
+  rope_heads();
+  // This position's slot is written after the scores' all-reduce (the key
+  // once its RMS scale is known); until then it holds zeros.
+  const mine = cur % PY == py;
+  const slot = @as(u16, cur / PY);
+  if (mine) {
+    for (@range(u16, Dc)) |d| { kc[1 + d * Tc + slot] = kv_store(0.0); }
+  }
+  mark(2);
+  // 3: score partials over this column's dims (the full matvec, or for a short
+  // row one multiply-add a dim over the filled slots); 4: summed over the
+  // head's columns with the q/k sums of squares, then the q/k RMS scales (the
+  // new key's on its own slot, and on its cache entry).
+  const filled: u16 = if (cur >= py) @as(u16, (cur - py) / PY + 1) else 0;
+  score_partials(filled);
+  if (mine) {   // the new key's raw scores
+    for (@range(u16, Qh)) |h| {
+      var acc: f32 = 0.0;
+      for (@range(u16, Dc)) |d| { acc += qkv[h * Dc + d] * qkv[QO + d]; }
+      s[Qh * slot + h] = acc;
+    }
+  }
+  mark(3);
+  allreduce_seg(s_qk_dsd, QT + Qh + 1);
+  const long = 2 * filled >= Tc;
+  if (!(off_ok and long)) { axis_y(); }   // else a segment gather comes first
+  for (@range(u16, Qh)) |h| {
+    rq[h] = rms_scale(s[QT + h], HD);
+    @fmuls(shead(h), shead(h), rq[h]);
+  }
+  if (mine) {
+    const rk = rms_scale(s[QT + Qh], HD);
+    for (@range(u16, Qh)) |h| { s[Qh * slot + h] *= rk; }
+    for (@range(u16, Dc)) |d| {
+      kc[1 + d * Tc + slot] = kv_store(qkv[QO + d] * rk);
+      vc[1 + slot * Dc + d] = kv_store(qkv[QO + Dc + d]);
+    }
+  }
+  mark(4);
+  // 5-7: softmax and values. Fast path: the exponent offset is the last
+  // step's log-sum-exp (an upper bound of its scores); the values are summed
+  // over the unnormalized exponentials, and their sums and the offset's
+  // check flags ride with the values in one all-reduce over the rows, after
+  // which o is normalized. Long rows split the exponentials over the head's
+  // Gs columns and gather them (with sums and flags) in one segment
+  // all-reduce. If the flags say the offset could overflow or underflow, the
+  // exact path all-reduces the max, then the sums, then the values.
+  const hole = @set_dsd_length(@increment_dsd_offset(s_dsd, @as(i16, Qh * filled), f32), Qh * (Tc - filled));
+  if (filled < Tc) { @fmovs(hole, -1.0e30); }
+  @fmovs(et_dsd, s_dsd);
+  heads_tree(Tc, true);
+  for (@range(u16, Qh)) |h| { hmax[h] = et[h]; }
+  var done = false;
+  if (off_ok) {
+    const lead = !long or px % Gs == 0;   // one column a row raises the flags
+    for (@range(u16, Qh)) |h| {
+      red[Qh + h] = if (lead and hmax[h] - off[h] > 70.0) 1.0 else 0.0;
+      red[2 * Qh + h] = if (lead and filled > 0 and hmax[h] < off[h] - 60.0) 1.0 else 0.0;
+    }
+    if (long) {
+      const base0: u16 = (px % Gs) * SH;
+      const base: u16 = if (base0 < Tc) base0 else Tc;
+      const nj: u16 = if (filled > base) (if (filled - base < SH) filled - base else SH) else 0;
+      for (@range(u16, Qh)) |h| { red[h] = 0.0; }
+      for (@range(u16, nj)) |i| {
+        for (@range(u16, Qh)) |h| { s[Qh * (base + i) + h] -= off[h]; }
+      }
+      if (nj > 0) {
+        exp_inplace(Qh * base, Qh * nj);
+        for (@range(u16, nj)) |i| {
+          for (@range(u16, Qh)) |h| { red[h] += s[Qh * (base + i) + h]; }
+        }
+      }
+      if (base > 0) { @fmovs(@set_dsd_length(s_dsd, Qh * base), 0.0); }
+      const end = Qh * (base + nj);
+      if (end < QT) {
+        @fmovs(@set_dsd_length(@increment_dsd_offset(s_dsd, @as(i16, end), f32), QT - end), 0.0);
+      }
+      for (@range(u16, 3 * Qh)) |i| { s[QT + i] = red[i]; }
+      allreduce_seg(s_sm_dsd, QT + 3 * Qh);
+      axis_y();
+      for (@range(u16, 3 * Qh)) |i| { red[i] = s[QT + i]; }
+    } else {
+      exp_sums(filled, hole);
+    }
+    mark(5);
+    values_partial(filled);
+    for (@range(u16, 3 * Qh)) |i| { o[QO + i] = red[i]; }
+    mark(6);
+    allreduce(false, o_ext_dsd, QO + 3 * Qh);
+    axis_xx();   // next: the O projection's, or the exact path's scores
+    for (@range(u16, 3 * Qh)) |i| { red[i] = o[QO + i]; }
+    const rows = @as(f32, if (cur + 1 < PY) cur + 1 else PY);
+    done = true;
+    for (@range(u16, Qh)) |h| {
+      if (red[Qh + h] > 0.0 or red[2 * Qh + h] >= rows) { done = false; }
+    }
+    if (done) {
+      for (@range(u16, Qh)) |h| {
+        @fmuls(@increment_dsd_offset(o0_dsd, @as(i16, h * Dc), f32),
+               @increment_dsd_offset(o0_dsd, @as(i16, h * Dc), f32), recip(red[h]));
+      }
+    }
+  }
+  if (!done) {
+    // The exact path: the max, the sums and the values, each all-reduced. A
+    // failed fast path has spent the scores: they are computed again (this
+    // step's key is in the cache now); on the first step they are intact.
+    fallbacks[0] += 1;
+    if (off_ok) {
+      score_partials(filled);
+      allreduce_seg(s_dsd, QT);
+      axis_y();
+      for (@range(u16, Qh)) |h| { @fmuls(shead(h), shead(h), rq[h]); }
+      if (filled < Tc) { @fmovs(hole, -1.0e30); }
+    }
+    for (@range(u16, Qh)) |h| { red[h] = hmax[h]; }
+    allreduce(true, @set_dsd_length(red_dsd, Qh), Qh);
+    for (@range(u16, Qh)) |h| { off[h] = red[h]; }
+    exp_sums(filled, hole);
+    allreduce(false, @set_dsd_length(red_dsd, Qh), Qh);
+    for (@range(u16, Qh)) |h| { @fmuls(shead(h), shead(h), recip(red[h])); }
+    mark(5);
+    values_partial(filled);
+    mark(6);
+    allreduce(false, o_dsd, QO);
+    axis_xx();
+  }
+  // The next step's offsets: this step's log-sum-exp (red[h] holds the sums).
+  for (@range(u16, Qh)) |h| { off[h] = off[h] + ln_approx(red[h]); }
+  off_ok = true;
+  mark(7);
+  // 8: O projection partials; 9: summed over the columns; the residual.
+  @fmovs(hv_dsd, 0.0);
+  wmatvec(hv_dsd, wo_dsd, o_dsd, QO);
+  mark(8);
+  allreduce(false, hv_dsd, Hc);
+  axis_y();
+  @fadds(x_dsd, x_dsd, hv_dsd);
+  mark(9);
+  // 10: gate/up partials of x * gamma2 and x's sum of squares; 11-12: summed
+  // over the rows, then the RMSNorm scale.
+  @fmuls(xn_dsd, x_dsd, g2_dsd);
+  gu[2 * Ic] = ssq(&x, Hc);
+  mark(10);
+  @fmovs(gu_dsd, 0.0);
+  wmatvec(gu_dsd, wgu_dsd, xn_dsd, Hc);
+  mark(11);
+  allreduce(false, gu_ext_dsd, 2 * Ic + 1);
+  @fmuls(gu_dsd, gu_dsd, rms_scale(gu[2 * Ic], HID));
+  mark(12);
+  // 13: silu(g) * u, each row its share of the elements, shared by an all-reduce.
+  // (this row's elements first, into u's place; then act = g's place)
+  var e: u16 = py;
+  while (e < Ic) : (e += PY) {
+    const gv = gu[e];
+    gu[Ic + e] = gv * gu[Ic + e] * recip(1.0 + math.exp_f32(-gv));
+  }
+  @fmovs(act_dsd, 0.0);
+  e = py;
+  while (e < Ic) : (e += PY) { gu[e] = gu[Ic + e]; }
+  allreduce(false, act_dsd, Ic);
+  axis_xx();
+  mark(13);
+  // 14: down partials; 15: summed over the columns; the residual.
+  @fmovs(hv_dsd, 0.0);
+  wmatvec(hv_dsd, wd_dsd, act_dsd, Ic);
+  mark(14);
+  allreduce(false, hv_dsd, Hc);
+  axis_y();
+  @fadds(x_dsd, x_dsd, hv_dsd);
+  mark(15);
+}
+
+// 16-bit weights: their DSDs point at the u16 storage, one element in.
+fn rebase16() void {
+  if (KV16 == 1) {
+    kc_dsd = @set_dsd_base_addr(kc_dsd, @ptrcast([*]@fp16(), &kc[1]));
+    vc_dsd = @set_dsd_base_addr(vc_dsd, @ptrcast([*]@fp16(), &vc[1]));
+  }
+  if (W16 == 1) {
+    wqkv_dsd = @set_dsd_base_addr(wqkv_dsd, @ptrcast([*]@fp16(), &wqkv[1]));
+    wo_dsd = @set_dsd_base_addr(wo_dsd, @ptrcast([*]@fp16(), &wo[1]));
+    wgu_dsd = @set_dsd_base_addr(wgu_dsd, @ptrcast([*]@fp16(), &wgu[1]));
+    wd_dsd = @set_dsd_base_addr(wd_dsd, @ptrcast([*]@fp16(), &wd[1]));
+  }
+}
+
+fn init() void {
+  rebase16();
+  px = layout_mod.get_x_coord();
+  py = layout_mod.get_y_coord();
+  route_gbcast();
+  axis_y();
+  sys_mod.unblock_cmd_stream();
+}
+
+// `steps` decode steps from position `start_pos`, each feeding its output x
+// back as the next step's input. Profiled from the second step (launch skew).
+fn compute(steps: u32, start_pos: u32) void {
+  timestamp.enable_tsc();
+  var i: u32 = 0;
+  while (i < steps) : (i += 1) {
+    cur = start_pos + i;
+    if (i == 0) { rope_start(); } else { rope_next(); }
+    timing = i > 0;
+    timestamp.get_timestamp(&t_mark);
+    layer();
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @initialize_queue(q_r1_0_in, .{ .color = c_r1_0 });
+  @initialize_queue(q_r1_0_out, .{ .color = c_r1_0 });
+  @initialize_queue(q_r1_1_in, .{ .color = c_r1_1 });
+  @initialize_queue(q_r1_1_out, .{ .color = c_r1_1 });
+  @initialize_queue(q_r2_0_in, .{ .color = c_r2_0 });
+  @initialize_queue(q_r2_0_out, .{ .color = c_r2_0 });
+  @initialize_queue(q_r2_1_in, .{ .color = c_r2_1 });
+  @initialize_queue(q_r2_1_out, .{ .color = c_r2_1 });
+  @initialize_queue(q_bc_in, .{ .color = c_bc });
+  @initialize_queue(q_bc_out, .{ .color = c_bc });
+  @initialize_queue(q_gb_in, .{ .color = c_gb });
+  @initialize_queue(q_gb_out, .{ .color = c_gb });
+
+  @export_symbol(x_ptr, "x");
+  @export_symbol(gamma1_ptr, "gamma1");
+  @export_symbol(gamma2_ptr, "gamma2");
+  @export_symbol(wqkv_ptr, "wqkv");
+  @export_symbol(qkn_w_ptr, "qkn_w");
+  @export_symbol(inv_freq_ptr, "inv_freq");
+  @export_symbol(kc_ptr, "kc");
+  @export_symbol(vc_ptr, "vc");
+  @export_symbol(wo_ptr, "wo");
+  @export_symbol(wgu_ptr, "wgu");
+  @export_symbol(wd_ptr, "wd");
+  @export_symbol(prof_ptr, "prof");
+  @export_symbol(fallbacks_ptr, "fallbacks");
+  @export_symbol(init);
+  @export_symbol(compute);
+}

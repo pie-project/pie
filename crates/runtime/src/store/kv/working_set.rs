@@ -30,6 +30,9 @@ struct KvLifecycle {
     engine: EngineId,
     id: WorkingSetId,
     pipeline_scope: Mutex<Option<crate::store::PipelineScope>>,
+    /// Its owner's hold on the planner past its exit, given back once the
+    /// pages are: the planner forgets a process only after its last set.
+    departure: Mutex<Option<Arc<crate::planner::Departure>>>,
 }
 
 impl KvLifecycle {
@@ -53,6 +56,8 @@ impl KvLifecycle {
         });
         stores.seats.lock().unwrap().release(self.id);
         stores.seats_freed.notify_waiters();
+        let departure = self.departure.lock().unwrap().take();
+        drop(departure);
         if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
             planner.pages_freed();
         }
@@ -188,6 +193,7 @@ impl KvWorkingSet {
                 engine,
                 id,
                 pipeline_scope: Mutex::new(pipeline_scope),
+                departure: Mutex::new(None),
             }),
         }
     }
@@ -216,5 +222,14 @@ impl KvWorkingSet {
 
     pub fn release(&self) {
         self.lifecycle.release();
+    }
+
+    /// Holds `departure` until this set is released: its owner's pages are
+    /// not back before then. A set released already holds nothing.
+    pub fn hold_departure(&self, departure: Arc<crate::planner::Departure>) {
+        let mut held = self.lifecycle.departure.lock().unwrap();
+        if !self.lifecycle.released.load(Ordering::Acquire) {
+            *held = Some(departure);
+        }
     }
 }

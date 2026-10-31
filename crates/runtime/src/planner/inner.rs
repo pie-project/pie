@@ -25,6 +25,9 @@ pub(super) struct Inner {
     pub(super) procs: HashMap<ProcessId, Proc>,
     pub(super) queue: BTreeMap<EntryKey, Waiter>,
     pub(super) accum: DevicePageReservation,
+    /// Pages on their way back: a suspend's in flight, keyed by its process,
+    /// or a departed process's still held by its working sets, keyed by the
+    /// process gone, until its last [`super::Departure`] hold drops.
     pub(super) evicting: HashMap<ProcessId, Reclaim>,
     pub(super) completion_credit: u32,
     pub(super) host_swap_blocked: HashSet<ProcessId>,
