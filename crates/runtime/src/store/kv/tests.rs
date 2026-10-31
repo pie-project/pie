@@ -97,6 +97,38 @@ fn tests_every_case() {
     a_suspend_leaves_forgotten_pages_behind();
     a_fire_out_keeps_what_was_forgotten_until_it_lands();
     a_forgotten_page_is_found_by_no_key();
+    a_merged_page_outlives_what_read_it();
+}
+
+fn a_merged_page_outlives_what_read_it() {
+    let mut store = KvStore::new(8, h(66));
+    let reader = store.create_working_set();
+    let read = commit_fresh(&mut store, reader, 3, 1);
+    let ws = store.create_working_set();
+    let own = commit_fresh(&mut store, ws, 1, 2);
+    let view = store.fork(reader).unwrap();
+    store.merge(ws, view, 1..3, 16).unwrap();
+    let merged = vec![read[1].0, read[2].0];
+    assert_eq!(store.merged_pages(ws).unwrap(), merged);
+    assert_eq!(
+        store.flat_table(ws).unwrap(),
+        own.as_slice(),
+        "its own table"
+    );
+    let fork = store.fork(ws).unwrap();
+    assert_eq!(store.merged_pages(fork).unwrap(), merged);
+    gone(&mut store, reader);
+    assert_eq!(store.available_pages(), 4, "the view holds them");
+    assert_eq!(store.merged_pages(ws).unwrap(), merged);
+    store.advance(fork, 32, 16).unwrap();
+    assert_eq!(
+        (store.lead(fork).unwrap(), store.lead(ws).unwrap()),
+        (32, 0)
+    );
+    gone(&mut store, fork);
+    gone(&mut store, ws);
+    gone(&mut store, view);
+    assert_eq!(store.available_pages(), 8);
 }
 
 fn forgotten(store: &mut KvStore, ws: WorkingSetId, pages: std::ops::Range<u64>) -> usize {
