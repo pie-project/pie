@@ -701,6 +701,9 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
             for (int b = 0; b < kNb; ++b)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
+        // The warp's 64 routes' rows for the landing, lane l's 2l and 2l + 1.
+        const int own0 = 2 * lane < live ? order[begin + wc * 64 + 2 * lane] : 0;
+        const int own1 = 2 * lane + 1 < live ? order[begin + wc * 64 + 2 * lane + 1] : 0;
         if (live > 0) {
             load_a(0, qa);
             load_b(0, sb);
@@ -798,20 +801,71 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
                 }
             }
             const int tok = 8 * b + 2 * c;
+            const long long route0 = __shfl_sync(0xffffffffu, own0, 4 * b + c);
+            const long long route1 = __shfl_sync(0xffffffffu, own1, 4 * b + c);
             if (rows8 >= n) continue;
             if (tok < live) {
-                const long long route = order[begin + wc * 64 + tok];
-                *reinterpret_cast<uint4*>(out + route * n + rows8) =
+                *reinterpret_cast<uint4*>(out + route0 * n + rows8) =
                     make_uint4(__byte_perm(w[0], w[1], 0x5410), __byte_perm(w[2], w[3], 0x5410),
                                __byte_perm(w[4], w[5], 0x5410), __byte_perm(w[6], w[7], 0x5410));
             }
             if (tok + 1 < live) {
-                const long long route = order[begin + wc * 64 + tok + 1];
-                *reinterpret_cast<uint4*>(out + route * n + rows8) =
+                *reinterpret_cast<uint4*>(out + route1 * n + rows8) =
                     make_uint4(__byte_perm(w[0], w[1], 0x7632), __byte_perm(w[2], w[3], 0x7632),
                                __byte_perm(w[4], w[5], 0x7632), __byte_perm(w[6], w[7], 0x7632));
             }
         }
+    }
+}
+
+}  // namespace pie::linear
+
+namespace pie::linear {
+
+/// Each live route's position in `order` (`slot[order[p]] = p`); routes
+/// past the live ones keep what the scratch held.
+__global__ void __launch_bounds__(256) moe_route_slots(
+    const i32* __restrict__ order, const i32* __restrict__ offsets, i32* __restrict__ slot, int num_experts)
+{
+    const int p = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (p < offsets[num_experts + 2]) slot[order[p]] = p;
+}
+
+/// `quantize_rows_mxfp8_routed<kGran, true>` a token at a time: each of
+/// `x`'s `rows` tokens quantized once, its codes and exponents landed at
+/// the positions of its `top` routes (`slot`, kept only where `order`
+/// agrees and the route is selected).
+template <int kGran>
+__global__ void __launch_bounds__(128) quantize_rows_mxfp8_scatter(
+    const bf16* __restrict__ x, const i32* __restrict__ order, const i32* __restrict__ offsets,
+    const i32* __restrict__ slot, u8* __restrict__ codes, u8* __restrict__ exps, int rows, int k, int top,
+    int num_experts)
+{
+    using Block = E4m3Block<kGran>;
+    const int blocks = k / kGran;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int at = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / Block::kLanes);
+    const bool live = at < rows * blocks;
+    const int sl = live ? at : 0;
+    const int t = sl / blocks;
+    Block q;
+    q.load(x + static_cast<long long>(t) * k + (sl % blocks) * kGran, lane);
+    if (!live) return;
+    const int total = offsets[num_experts];
+    const unsigned long long w = q.codes();
+    const int part = lane % Block::kLanes;
+    const int q8 = part * 8;
+    const int in_row = (sl % blocks) * kGran + (q8 & ~31) + ((q8 >> 3) & 3) * 4;
+    const int b32 = (sl % blocks) * (kGran / 32) + part / 4;
+    for (int s = 0; s < top; ++s) {
+        const int r = t * top + s;
+        const int p = slot[r];
+        if (p < 0 || p >= total || order[p] != r) continue;
+        u8* to = codes + static_cast<long long>(p) * k + in_row;
+        *reinterpret_cast<unsigned*>(to) = static_cast<unsigned>(w);
+        *reinterpret_cast<unsigned*>(to + 16) = static_cast<unsigned>(w >> 32);
+        if (part % 4 == 0)
+            exps[(static_cast<long long>(b32 >> 2) * total + p) * 4 + (b32 & 3)] = static_cast<u8>(q.e + 127);
     }
 }
 

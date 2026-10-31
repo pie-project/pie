@@ -577,25 +577,64 @@ fn select_mxfp4_w4a8_tma(
     let xq = ctx.scratch_stream(OP, "linear.mxfp4_w4a8_x", count * kw)? as u64;
     let xe = ctx.scratch_stream(OP, "linear.mxfp4_w4a8_xe", count * (kw / 32))? as u64;
     let lanes = u32::try_from(count * kw / 8).map_err(|_| refuse(OP, "too many rows"))?;
-    ctx.fire(
-        OP,
-        Fire::at(kernel(
-            SELECT_FP4_SM120,
-            &format!("::pie::linear::quantize_rows_mxfp8_routed<{gran}, {ws}>"),
-        ))
-        .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
-        &[
-            x.arg(),
-            ArgValue::Ptr(order),
-            ArgValue::Ptr(offsets),
-            ArgValue::Ptr(xq),
-            ArgValue::Ptr(xe),
-            stated(OP, fan.route_count)?.arg(),
-            k.arg(),
-            act_div.arg(),
-            stated(OP, experts)?.arg(),
-        ],
-    )?;
+    if ws && act_div > 1 {
+        // A token's rows quantized once, landed at its routes' positions.
+        let slot = ctx.scratch_stream(OP, "linear.mxfp4_w4a8_slot", count * 4)? as u64;
+        let routes_n = u32::try_from(count).map_err(|_| refuse(OP, "too many routes"))?;
+        ctx.fire(
+            OP,
+            Fire::at(kernel(SELECT_FP4_SM120, "::pie::linear::moe_route_slots"))
+                .apply(Launch::grid([routes_n.div_ceil(256), 1, 1], [256, 1, 1])),
+            &[
+                ArgValue::Ptr(order),
+                ArgValue::Ptr(offsets),
+                ArgValue::Ptr(slot),
+                stated(OP, experts)?.arg(),
+            ],
+        )?;
+        let token_lanes =
+            u32::try_from(x.rows as usize * kw / 8).map_err(|_| refuse(OP, "too many rows"))?;
+        ctx.fire(
+            OP,
+            Fire::at(kernel(
+                SELECT_FP4_SM120,
+                &format!("::pie::linear::quantize_rows_mxfp8_scatter<{gran}>"),
+            ))
+            .apply(Launch::grid([token_lanes.div_ceil(128), 1, 1], [128, 1, 1])),
+            &[
+                x.arg(),
+                ArgValue::Ptr(order),
+                ArgValue::Ptr(offsets),
+                ArgValue::Ptr(slot),
+                ArgValue::Ptr(xq),
+                ArgValue::Ptr(xe),
+                stated(OP, x.rows)?.arg(),
+                k.arg(),
+                act_div.arg(),
+                stated(OP, experts)?.arg(),
+            ],
+        )?;
+    } else {
+        ctx.fire(
+            OP,
+            Fire::at(kernel(
+                SELECT_FP4_SM120,
+                &format!("::pie::linear::quantize_rows_mxfp8_routed<{gran}, {ws}>"),
+            ))
+            .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
+            &[
+                x.arg(),
+                ArgValue::Ptr(order),
+                ArgValue::Ptr(offsets),
+                ArgValue::Ptr(xq),
+                ArgValue::Ptr(xe),
+                stated(OP, fan.route_count)?.arg(),
+                k.arg(),
+                act_div.arg(),
+                stated(OP, experts)?.arg(),
+            ],
+        )?;
+    }
     let map_x = encode(Map {
         ptr: xq,
         ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
@@ -616,8 +655,11 @@ fn select_mxfp4_w4a8_tma(
     // Persistent: a CTA a multiprocessor over the (row tile, slice) jobs.
     let sms = ctx.multiprocessors().unwrap_or(1).max(1);
     let fire = if ws {
-        Fire::at(kernel(SELECT_FP4_SM120, "::pie::linear::moe_select_mxfp4_w4a8_ws<3>"))
-            .apply(Launch::grid([sms.min(tiles * work_cap), 1, 1], [384, 1, 1]).smem(W4A8_TMA_SMEM))
+        Fire::at(kernel(
+            SELECT_FP4_SM120,
+            "::pie::linear::moe_select_mxfp4_w4a8_ws<3>",
+        ))
+        .apply(Launch::grid([sms.min(tiles * work_cap), 1, 1], [384, 1, 1]).smem(W4A8_TMA_SMEM))
     } else {
         Fire::at(kernel(
             SELECT_FP4_SM120,
