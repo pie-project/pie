@@ -381,6 +381,8 @@ async def main() -> None:
     config = {**DEFAULTS, **json.loads(args.config)}
     if args.mode in ("linear", "lean"):
         config.update(width=1, judge=False, dedup=False, memo=False)
+    if args.mode == "linear":
+        config.update(kill_loops=False, note_repeats=False)
     if args.mode == "forget":
         # the API arm's loop has neither rule
         config.update(width=1, judge=False, dedup=False, memo=False, kill_loops=False, note_repeats=False)
