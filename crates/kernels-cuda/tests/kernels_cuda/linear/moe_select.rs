@@ -282,6 +282,8 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::MxBias, mma, [8, 400, 4, 192, 2048], t, alpha, 2),
         // Hopper's wgmma slice below the staged kernel's 32 routes an expert.
         (K::Mx, mma, [8, 48, 4, 384, 1024], t, None, 0),
+        // Hopper's wide slice (128 routes, two warpgroups) on gpt-oss's K.
+        (K::MxBias, mma, [8, 400, 4, 192, 2880], t, alpha, 8),
         // W4A8 on sm_120a's block-scaled mma.sync (elsewhere the bf16 arms):
         // by route over a partial 256-row tile, its GLU under scales past
         // f16's range, V4-Flash's leg, a few routes under a live window.
