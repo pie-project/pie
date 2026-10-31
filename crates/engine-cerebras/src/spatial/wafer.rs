@@ -982,6 +982,14 @@ enum Job {
         steps: usize,
         logits: bool,
     },
+    /// A batched build's launch posted without waiting on it: answered on
+    /// its own channel, then `landed` is told.
+    Posted {
+        lanes: Vec<super::serve2d::BatchLane>,
+        steps: usize,
+        reply: mpsc::Sender<BatchAnswer>,
+        landed: Box<dyn FnOnce() + Send>,
+    },
     /// A batched build's whole-page copies (answered on the batch channel).
     Copy {
         pairs: Vec<(u32, u32)>,
@@ -1029,7 +1037,7 @@ enum Job {
 
 type Answer = R<(Vec<u32>, Vec<Vec<f32>>)>;
 /// Each lane's tokens and logits rows.
-type BatchAnswer = R<super::serve2d::BatchOut>;
+pub(crate) type BatchAnswer = R<super::serve2d::BatchOut>;
 
 /// A [`WaferModel`] on its own thread.
 pub struct Wafer {
@@ -1119,6 +1127,18 @@ impl Wafer {
                             if batch_tx.send(reply).is_err() {
                                 break;
                             }
+                            continue;
+                        }
+                        Job::Posted {
+                            lanes,
+                            steps,
+                            reply,
+                            landed,
+                        } => {
+                            // The poster may have gone (its lanes diverged):
+                            // the launch still ran, in order.
+                            let _ = reply.send(model.fire_batch(&lanes, steps, false));
+                            landed();
                             continue;
                         }
                         Job::VmLoad { program, seeds } => {
@@ -1255,6 +1275,28 @@ impl Wafer {
         self.batch_answers
             .recv()
             .map_err(|_| "the wafer thread went away".to_string())?
+    }
+
+    /// [`WaferModel::fire_batch`] of argmax only, posted: the wafer's
+    /// thread runs it after every job before, answers on `reply`, then
+    /// calls `landed`. Jobs posted after it run after it.
+    pub fn post_batch(
+        &mut self,
+        lanes: Vec<super::serve2d::BatchLane>,
+        steps: usize,
+        reply: mpsc::Sender<BatchAnswer>,
+        landed: Box<dyn FnOnce() + Send>,
+    ) -> R<()> {
+        self.jobs
+            .as_ref()
+            .ok_or("the wafer is closed")?
+            .send(Job::Posted {
+                lanes,
+                steps,
+                reply,
+                landed,
+            })
+            .map_err(|_| "the wafer thread went away".to_string())
     }
 
     /// Why the head's VM cannot take `table`, if it cannot (as

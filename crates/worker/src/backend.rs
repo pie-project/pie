@@ -820,6 +820,9 @@ pub(crate) fn create_engine_backend(
                 if let Some(lookahead) = opts.spatial_lookahead {
                     boot_doc.push_str(&format!("lookahead = {lookahead}\n"));
                 }
+                if let Some(asynchronous) = opts.spatial_async {
+                    boot_doc.push_str(&format!("async = {asynchronous}\n"));
+                }
                 if let Some(ckpt) = &opts.spatial_ckpt {
                     boot_doc.push_str(&format!("ckpt = {}\n", toml::Value::String(ckpt.clone())));
                 }

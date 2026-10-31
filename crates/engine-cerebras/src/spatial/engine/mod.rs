@@ -10,6 +10,7 @@ mod fire;
 mod guest_vm;
 mod kv;
 mod launch;
+mod posted;
 
 use std::path::Path;
 
@@ -93,6 +94,13 @@ pub struct Spatial {
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
     pending: Option<(FrameId, Vec<Vec<LaneReadout>>)>,
+    /// Steps posted and not yet run (an asynchronous engine), the token
+    /// loop continuation on the wafer, the steps the wafer's thread already
+    /// reported landed, and the loops started (each loop's epoch).
+    posted: std::collections::VecDeque<posted::Posted>,
+    in_flight: Option<posted::InFlight>,
+    reported: std::collections::HashSet<(u64, u32)>,
+    next_loop: u64,
 }
 
 impl Spatial {
@@ -132,6 +140,10 @@ impl Spatial {
             next_frame: 0,
             sink: None,
             pending: None,
+            posted: std::collections::VecDeque::new(),
+            in_flight: None,
+            reported: std::collections::HashSet::new(),
+            next_loop: 0,
         }
     }
 
@@ -428,6 +440,7 @@ impl Engine for Spatial {
 
     fn copy_kv(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<()> {
         copy.validate()?;
+        self.drain();
         if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
             tracing::debug!(target: "spatial_trace", "spatial-trace copy_kv: {copy:?}");
         }
@@ -505,11 +518,13 @@ impl Engine for Spatial {
     }
 
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
+        self.drain();
         self.guest_vms.remove(&id);
         self.programs.close_instance(id).map_err(refusal)
     }
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
+        self.drain();
         self.programs.close_channel(id).map_err(refusal)
     }
 
@@ -536,6 +551,15 @@ impl Engine for Spatial {
         self.sink = Some(sink);
     }
 
+    fn settles_asynchronously(&self) -> bool {
+        self.asynchronous()
+    }
+
+    fn publish_landed(&mut self) -> EngineResult<()> {
+        self.pump();
+        Ok(())
+    }
+
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         frame.validate_for(
             self.caps
@@ -550,6 +574,23 @@ impl Engine for Spatial {
                 frame.steps.len(),
                 frame.steps.first().map(|s| s.attachments.len())
             );
+        }
+        if self.asynchronous() {
+            posted::post(&mut self.posted, id, &frame.steps);
+            self.pump();
+            // Readouts come on the lanes' channels: a step lands when its
+            // epilogue has run.
+            return Ok(FrameTicket {
+                id,
+                steps: frame
+                    .steps
+                    .iter()
+                    .map(|_| FireTicket {
+                        id: FireId(self.next_fire),
+                        readouts: Vec::new(),
+                    })
+                    .collect(),
+            });
         }
         let mut steps = Vec::with_capacity(frame.steps.len());
         let mut readouts = Vec::with_capacity(frame.steps.len());

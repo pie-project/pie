@@ -200,6 +200,10 @@ pub struct CerebrasEngineOptions {
     /// Who runs epilogues the wafer's guest VM can: `"off"` (the host, the
     /// default), `"check"` (the VM contract played on the host) or `"wafer"`.
     pub spatial_guest: Option<String>,
+    /// Whether the spatial engine settles frames asynchronously (the wafer
+    /// running a token loop on while the host runs epilogues); omit for the
+    /// engine's default (on).
+    pub spatial_async: Option<bool>,
     /// A Hugging Face directory the wafer program's weights are read from;
     /// omit for the model's checkpoint.
     pub spatial_ckpt: Option<String>,
@@ -235,6 +239,7 @@ impl Default for CerebrasEngineOptions {
             spatial_program: None,
             spatial_lookahead: None,
             spatial_guest: None,
+            spatial_async: None,
             spatial_ckpt: None,
             spatial_serve: None,
             spatial_token_cycles: None,

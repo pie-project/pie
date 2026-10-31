@@ -85,9 +85,15 @@ fn one_reader(step: &engine::fire::Step, at: usize) -> bool {
 
 /// A paged lane's token loop past its row ([`Spatial::paged_ahead`]).
 pub(super) struct PagedAhead {
-    next: u32,
-    pages: Vec<u32>,
-    run: std::collections::VecDeque<(u32, u32)>,
+    pub(super) next: u32,
+    pub(super) pages: Vec<u32>,
+    pub(super) run: std::collections::VecDeque<(u32, u32)>,
+    /// Its rows' RoPE position less their slot.
+    pub(super) shift: u32,
+    /// The loop's last argmax (the input of the row after its run), and
+    /// which loop this is: a continuation landing for another is dropped.
+    pub(super) last: u32,
+    pub(super) epoch: u64,
 }
 
 impl PagedAhead {
@@ -104,6 +110,22 @@ impl PagedAhead {
         }
         self.next += 1;
         self.run.pop_front().map(|(_, answer)| answer)
+    }
+
+    /// The slot the row after the loop's run writes.
+    pub(super) fn end(&self) -> u32 {
+        self.next + self.run.len() as u32
+    }
+
+    /// A continuation's `answers`, the loop run on from [`PagedAhead::end`]
+    /// fed [`PagedAhead::last`]: each row's input the argmax before it.
+    pub(super) fn extend(&mut self, answers: &[u32]) {
+        let mut input = self.last;
+        for &answer in answers {
+            self.run.push_back((input, answer));
+            input = answer;
+        }
+        self.last = input;
     }
 }
 
@@ -673,7 +695,9 @@ impl Spatial {
                         && let Some(run) = self.paged_ahead.get_mut(&lane.slot)
                         && let Some(token) = run.answer(slots[0], &lane.kv.pages, tokens[at][0])
                     {
-                        if run.run.is_empty() {
+                        // An asynchronous engine keeps a used-up loop: its
+                        // continuation may be on the wafer, or post next.
+                        if run.run.is_empty() && !self.asynchronous() {
                             self.paged_ahead.remove(&lane.slot);
                         }
                         self.ahead_hits += 1;
@@ -719,6 +743,8 @@ impl Spatial {
                     ));
                     (Vec::new(), false)
                 } else {
+                    // A row off the lane's pages ends any loop it had.
+                    self.paged_ahead.remove(&lane.slot);
                     // A model of one sequence a cache runs causal attention
                     // only (a paged model attends what each row's mask says).
                     self.check_masks(lane, at, start, tokens[at].len(), dense_masks.get(&at))?;
@@ -797,6 +823,7 @@ impl Spatial {
                     let extra: Vec<u32> = (next..next + k as u32).collect();
                     self.kv
                         .write_paged(lanes[at].slot, &lane.pages, &extra, &token[..k]);
+                    self.next_loop = self.next_loop.wrapping_add(1);
                     self.paged_ahead.insert(
                         lanes[at].slot,
                         PagedAhead {
@@ -807,6 +834,9 @@ impl Spatial {
                                 .copied()
                                 .zip(token[1..].iter().copied())
                                 .collect(),
+                            shift: lane.positions[0].wrapping_sub(lane.slots[0]),
+                            last: token[k],
+                            epoch: self.next_loop,
                         },
                     );
                     self.ahead_runs += 1;
@@ -993,6 +1023,9 @@ mod tests {
             next: 10,
             pages: vec![3],
             run: [(5, 6), (6, 7), (7, 8)].into_iter().collect(),
+            shift: 0,
+            last: 8,
+            epoch: 0,
         };
         // A row the stream did not send (another input, slot or page) gets
         // nothing: a stop or the token limit leaves the rest unanswered.
@@ -1004,5 +1037,42 @@ mod tests {
         assert_eq!(run.answer(11, &[3, 4], 6), Some(7));
         assert_eq!(run.answer(12, &[3, 4], 7), Some(8));
         assert_eq!(run.answer(13, &[3, 4], 8), None);
+    }
+
+    #[test]
+    fn a_continuation_answers_as_one_longer_loop_would() {
+        // One loop of five rows from slot 10, fed 5: argmax 6, 7, 8, 9, 10.
+        let whole: Vec<(u32, u32)> = vec![(5, 6), (6, 7), (7, 8), (8, 9), (9, 10)];
+        // The same loop as three rows, then a continuation of two from its
+        // end fed its last argmax.
+        let mut run = PagedAhead {
+            next: 10,
+            pages: vec![3],
+            run: whole[..3].iter().copied().collect(),
+            shift: 0,
+            last: 8,
+            epoch: 1,
+        };
+        assert_eq!(run.end(), 13);
+        // Rows answered before the continuation lands keep their place.
+        assert_eq!(run.answer(10, &[3], 5), Some(6));
+        run.extend(&[9, 10]);
+        assert_eq!((run.end(), run.last), (15, 10));
+        let mut fresh = PagedAhead {
+            next: 11,
+            pages: vec![3],
+            run: whole[1..].iter().copied().collect(),
+            shift: 0,
+            last: 10,
+            epoch: 2,
+        };
+        for (slot, input) in (11..15).zip([6, 7, 8, 9]) {
+            let want = fresh.answer(slot, &[3], input);
+            assert_eq!(run.answer(slot, &[3], input), want, "slot {slot}");
+            assert!(want.is_some());
+        }
+        // Used up, it answers nothing, and the next continuation is fed 10.
+        assert_eq!(run.answer(15, &[3], 10), None);
+        assert_eq!((run.end(), run.last), (15, 10));
     }
 }
