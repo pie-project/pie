@@ -312,17 +312,7 @@ pub(super) fn select_mxfp4_mma(
             SELECT_FP4_SM80,
             &format!("::pie::linear::moe_select_mxfp4_mma_pipe<{code}, {PIPE_STAGES}>"),
         ))
-        .apply(
-            Launch::grid(
-                if act_div == 1 {
-                    [tiles, grid[0], 1]
-                } else {
-                    [grid[0], tiles, 1]
-                },
-                [256, 1, 1],
-            )
-            .smem(PIPE_STAGES * PIPE_STAGE),
-        )
+        .apply(Launch::grid([tiles, grid[0], 1], [256, 1, 1]).smem(PIPE_STAGES * PIPE_STAGE))
     } else if run {
         const STAGES: u32 = 4;
         const WARPS: u32 = 4;
