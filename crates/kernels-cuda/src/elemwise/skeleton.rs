@@ -314,7 +314,11 @@ pub fn block(width: u32, schedule: Schedule) -> u32 {
 pub fn laned(width: u32, schedule: Schedule) -> u32 {
     match schedule {
         Schedule::Packed => lanes(width),
-        Schedule::Spread => width.div_ceil(VEC_WIDTH).max(1).next_power_of_two().min(1024),
+        Schedule::Spread => width
+            .div_ceil(VEC_WIDTH)
+            .max(1)
+            .next_power_of_two()
+            .min(1024),
     }
 }
 
