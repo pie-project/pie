@@ -724,6 +724,13 @@ impl Engine for Cuda {
             },
             has_lora: true,
             has_attn_page_mask: false,
+            rotates_by_table: paging.window.is_none()
+                && shell.trace().values.iter().any(|decl| {
+                    matches!(
+                        decl.def,
+                        poem_ir::Def::Input(poem_ir::RuntimeInput::MropePositions)
+                    )
+                }),
             draft_block: drafter.map_or(0, |d| d.rows),
             draft_mask_token: drafter.map_or(0, |d| d.mask_token),
             draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),

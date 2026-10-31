@@ -3,12 +3,13 @@
 # `kv_heads`, `head_dim`, `theta`, `sm_scale`, `eps`); `w` a layer's
 # weights under their usual names.
 
-def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_norm = None, biased = False):
+def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_norm = None, biased = False, tabled = False):
     """Grouped-query attention over `w.kv`, out through `w.o`. `biased` adds
     `w.q_bias`, `w.k_bias` and `w.v_bias`; `qk_norm` norms q and k by
     `w.q_norm` and `w.k_norm`, each head on its own ("head") or across its
     full width ("width"); `rotary_dim` rotates only that many leading dims
-    of each head."""
+    of each head; `tabled` rotates by the positions the mrope table states, so
+    a row's rotation can run past its slot in a working set that forgot pages."""
     pages = inputs.kv(w.kv)
     d = m.head_dim
     q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
@@ -21,6 +22,8 @@ def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_
         q = ops.elemwise.rmsnorm(q, w.q_norm, m.eps)
         k = ops.elemwise.rmsnorm(k, w.k_norm, m.eps)
     rotation = rotary.full() if rotary_dim == None else rotary.partial(rotary_dim)
+    if tabled:
+        rotation = rotary.mrope([d // 2, 0, 0], "interleaved", d)
     q, k = ops.elemwise.rope(q, positions, d, m.theta, rotation, k = k, scaling = scaling)
     ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
 

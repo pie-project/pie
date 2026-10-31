@@ -149,6 +149,11 @@ pub struct Capabilities {
     #[serde(default)]
     pub has_attn_page_mask: bool,
 
+    /// A row's rotation rides its own table, apart from the kv row that bounds
+    /// it, so a working set can forget pages and keep its rows' positions.
+    #[serde(default)]
+    pub rotates_by_table: bool,
+
     #[serde(default)]
     pub draft_block: u32,
     #[serde(default)]

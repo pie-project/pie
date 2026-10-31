@@ -1758,14 +1758,39 @@ pub(crate) fn map_lane_pages(
             continue;
         }
         let table = working_set_flat_table(stores, *ws)?;
+        let forgotten =
+            crate::store::registry::with_kv_lock(&stores.kv, "host-pages", |kv| kv.forgotten(*ws))
+                .map_err(|error| error.to_string())?;
         for &lane in lanes {
             let Some(lane) = req.lanes.get_mut(lane) else {
                 continue;
             };
+            skip_forgotten(lane, &forgotten, stores.kv_page_size);
             map_pages(&mut lane.kv.pages, &table)?;
         }
     }
     Ok(())
+}
+
+/// The lane reads and writes through the pages it kept, so `held` counts those;
+/// its rows keep the positions they had.
+fn skip_forgotten(
+    lane: &mut ::engine::Lane,
+    forgotten: &std::collections::BTreeSet<u64>,
+    page: u32,
+) {
+    if forgotten.is_empty() {
+        return;
+    }
+    let (held, page) = (lane.kv.held, page.max(1));
+    if lane.positions.is_empty() {
+        lane.positions = (held..held + lane.tokens.len() as u32).collect();
+    }
+    let behind = forgotten.range(..u64::from(held / page)).count() as u32;
+    lane.kv
+        .pages
+        .retain(|page| !forgotten.contains(&u64::from(*page)));
+    lane.kv.held = held - behind * page;
 }
 
 fn map_pages(pages: &mut [u32], table: &[u32]) -> Result<(), String> {
@@ -1776,6 +1801,9 @@ fn map_pages(pages: &mut [u32], table: &[u32]) -> Result<(), String> {
                 table.len()
             ));
         };
+        if pool == crate::store::kv::page_table::FORGOTTEN_PAGE.0 {
+            return Err(format!("pipeline: KV page {page} was given up"));
+        }
         *page = pool;
     }
     Ok(())
@@ -1799,6 +1827,17 @@ fn stamp_lane_translation(
     groups: &LaneGroups,
 ) -> Result<(), String> {
     for (ws, lanes) in groups {
+        let forgot = crate::store::registry::with_kv_lock(&stores.kv, "host-pages", |kv| {
+            kv.forgotten(*ws).map(|pages| !pages.is_empty())
+        })
+        .map_err(|error| error.to_string())?;
+        if forgot {
+            return Err(
+                "pipeline: rows the device places read every page, and this working set \
+                 forgot some: state its slots"
+                    .to_string(),
+            );
+        }
         let table = working_set_flat_table(stores, *ws)?;
         for &lane in lanes {
             if let Some(lane) = req.lanes.get_mut(lane) {

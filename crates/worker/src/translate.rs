@@ -166,6 +166,7 @@ fn build_model(
                 draft_mask_token: g.caps.draft_mask_token,
                 draft_proposals_from: g.caps.draft_proposals_from,
                 has_attn_page_mask: g.caps.has_attn_page_mask,
+                rotates_by_table: g.caps.rotates_by_table,
                 has_lora: g.caps.has_lora,
                 adapter_attachments: g.caps.adapter_attachments,
                 rs_snapshots: g.caps.rs_snapshots,

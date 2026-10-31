@@ -255,7 +255,7 @@ def tap(mtp, layer, y, fused):
     return ops.elemwise.residual_add(part, fused)
 
 def forward(m, inputs):
-    positions = inputs.positions()
+    positions = inputs.mrope_positions()
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
     scaling = rope_scaling(m.rope)
@@ -263,7 +263,7 @@ def forward(m, inputs):
     def block(l, w, carried):
         y, fused = carried
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, w, positions, scaling = scaling, qk_norm = "head")
+        o = attention(x, inputs, m, w, positions, scaling = scaling, qk_norm = "head", tabled = True)
         y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
         y = ops.elemwise.residual_add(swiglu(x, w), y)
