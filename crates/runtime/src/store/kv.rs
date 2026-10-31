@@ -80,7 +80,7 @@ impl KvResidencyTxn {
             let (tier, slot) = match page.swapped {
                 KvPageBacking::Swapped(slot) => (MemoryDomain::HostPinned, slot.0),
                 KvPageBacking::OnDisk(slot) => (MemoryDomain::LocalDisk, slot.0),
-                KvPageBacking::Resident(_) => {
+                KvPageBacking::Resident(_) | KvPageBacking::Forgotten => {
                     unreachable!("a swap page is backed below the device")
                 }
             };
@@ -321,6 +321,10 @@ impl KvStore {
         let Some(last) = start.checked_sub(1) else {
             return Ok(Some(None));
         };
+        // What follows a forgotten page reads less than its tokens say.
+        if !self.table.forgotten(ws)?.is_empty() {
+            return Ok(None);
+        }
         let hashes = self.table.page_token_hashes(ws, last / page)?;
         Ok(hashes
             .get((last % page) as usize)
@@ -792,6 +796,7 @@ impl KvStore {
             }
             match self.table.backing_at(&location)? {
                 KvPageBacking::Resident(_) => {}
+                KvPageBacking::Forgotten => return Ok(None),
                 swapped => below.push((location, swapped)),
             }
         }
@@ -872,6 +877,7 @@ impl KvStore {
                 KvPageBacking::Resident(page) => device.push(page),
                 KvPageBacking::Swapped(slot) => host.push(slot),
                 KvPageBacking::OnDisk(slot) => disk.push(slot),
+                KvPageBacking::Forgotten => {}
             }
         }
         self.pool.release_reserved(device);
@@ -1014,6 +1020,23 @@ impl KvStore {
         start: u64,
     ) -> Result<(), KvStoreError> {
         Ok(self.table.forget(ws, pages, start)?)
+    }
+
+    /// Under the epoch of the fires already out, which may still read them.
+    /// Answers the device pages given back.
+    pub fn reclaim_forgotten(&mut self, ws: WorkingSetId) -> Result<usize, KvStoreError> {
+        let freed = self.table.reclaim_forgotten(ws)?;
+        if freed.is_empty() {
+            return Ok(0);
+        }
+        let count = freed
+            .iter()
+            .filter(|backing| matches!(backing, KvPageBacking::Resident(_)))
+            .count();
+        self.recycle_backings(freed, self.current_epoch());
+        self.retire_idle();
+        self.refresh_flat(ws);
+        Ok(count)
     }
 
     pub fn forgotten(
@@ -1305,6 +1328,7 @@ impl KvStore {
             match backing {
                 KvPageBacking::Swapped(slot) => host.push(slot),
                 KvPageBacking::OnDisk(slot) => disk.push(slot),
+                KvPageBacking::Forgotten => {}
                 KvPageBacking::Resident(_) => unreachable!("released below the device"),
             }
         }

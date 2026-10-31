@@ -1801,6 +1801,9 @@ fn map_pages(pages: &mut [u32], table: &[u32]) -> Result<(), String> {
                 table.len()
             ));
         };
+        if pool == crate::store::kv::page_table::FORGOTTEN_PAGE.0 {
+            return Err(format!("pipeline: KV page {page} was given up"));
+        }
         *page = pool;
     }
     Ok(())
@@ -1824,6 +1827,17 @@ fn stamp_lane_translation(
     groups: &LaneGroups,
 ) -> Result<(), String> {
     for (ws, lanes) in groups {
+        let forgot = crate::store::registry::with_kv_lock(&stores.kv, "host-pages", |kv| {
+            kv.forgotten(*ws).map(|pages| !pages.is_empty())
+        })
+        .map_err(|error| error.to_string())?;
+        if forgot {
+            return Err(
+                "pipeline: rows the device places read every page, and this working set \
+                 forgot some: state its slots"
+                    .to_string(),
+            );
+        }
         let table = working_set_flat_table(stores, *ws)?;
         for &lane in lanes {
             if let Some(lane) = req.lanes.get_mut(lane) {

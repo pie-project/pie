@@ -58,7 +58,12 @@ pub enum KvPageBacking {
     Resident(PhysicalKvPageId),
     Swapped(HostKvSlotId),
     OnDisk(DiskKvSlotId),
+    /// Its one reader forgot it: the place stays, the page went back.
+    Forgotten,
 }
+
+/// What a flat table holds for a forgotten page; no fire reads it.
+pub const FORGOTTEN_PAGE: PhysicalKvPageId = PhysicalKvPageId(u32::MAX);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReclaimQuote {
@@ -123,6 +128,8 @@ struct WorkingSetEntry {
     pending: BTreeMap<u64, u64>,
     /// Pages later rows no longer read.
     forgotten: BTreeSet<u64>,
+    /// Of them, those still backed: another reader may hold them.
+    unfreed: BTreeSet<u64>,
 }
 
 impl WorkingSetEntry {
@@ -139,6 +146,7 @@ impl WorkingSetEntry {
             logged: Vec::new(),
             pending: BTreeMap::new(),
             forgotten: BTreeSet::new(),
+            unfreed: BTreeSet::new(),
         }
     }
 }
@@ -221,9 +229,10 @@ impl KvPageTable {
             logged.truncate(cut as usize);
         }
         let (folded, prompt_pages) = (entry.folded, entry.prompt_pages);
-        let forgotten = entry.forgotten.clone();
+        let (forgotten, unfreed) = (entry.forgotten.clone(), entry.unfreed.clone());
         let mut child_entry = WorkingSetEntry::new(terminal, page_len, mapped_len);
         child_entry.forgotten = forgotten;
+        child_entry.unfreed = unfreed;
         child_entry.logged = logged;
         child_entry.folded = folded;
         child_entry.prompt_pages = prompt_pages;
@@ -243,13 +252,78 @@ impl KvPageTable {
         start: u64,
     ) -> Result<(), KvTableError> {
         let entry = self.entry_mut(ws)?;
-        entry.forgotten.extend(pages);
+        if pages.is_empty() {
+            return Ok(());
+        }
+        entry.forgotten.extend(pages.clone());
+        entry.unfreed.extend(pages);
         entry.logged.truncate(start as usize);
         Ok(())
     }
 
     pub fn forgotten(&self, ws: WorkingSetId) -> Result<&BTreeSet<u64>, KvTableError> {
         Ok(&self.entry(ws)?.forgotten)
+    }
+
+    /// What only `ws` reads of what it forgot gives its backing up; what
+    /// another reader or a move holds waits for a later call.
+    pub fn reclaim_forgotten(
+        &mut self,
+        ws: WorkingSetId,
+    ) -> Result<Vec<KvPageBacking>, KvTableError> {
+        let waiting = std::mem::take(&mut self.entry_mut(ws)?.unfreed);
+        let entry = self.entry(ws)?;
+        let mapped_len = entry.mapped_len;
+        let segs = self.segments(entry.terminal, mapped_len);
+        let mut freed = Vec::new();
+        let mut unfreed = BTreeSet::new();
+        for index in waiting {
+            let location = segs
+                .iter()
+                .find(|s| (index as i64) >= s.start)
+                .filter(|_| index < mapped_len)
+                .map(|seg| self.resolve_location(seg.node, (index as i64 - seg.start) as u64));
+            match location {
+                Some(location)
+                    if self.page_readers(location.node, location.local) == 1
+                        && !self.swap_locations.contains(&location) =>
+                {
+                    freed.push(self.give_up(location));
+                }
+                _ => {
+                    unfreed.insert(index);
+                }
+            }
+        }
+        self.entry_mut(ws)?.unfreed = unfreed;
+        Ok(freed)
+    }
+
+    /// No key finds the page again: what follows it reads less than its
+    /// tokens say.
+    fn give_up(&mut self, location: TriePageLocation) -> KvPageBacking {
+        let local = location.local as usize;
+        let node = self.nodes.get_mut(location.node).expect("live node");
+        let Pages::Owned {
+            backings,
+            token_hashes,
+            page_hashes,
+        } = &mut node.pages
+        else {
+            unreachable!("resolved to owner");
+        };
+        if local == 0
+            && let Some(first) = page_hashes[0]
+            && let Some(copies) = self.node_starts.get_mut(&first)
+        {
+            copies.retain(|copy| *copy != location.node);
+            if copies.is_empty() {
+                self.node_starts.remove(&first);
+            }
+        }
+        page_hashes[local] = None;
+        token_hashes[local] = vec![None];
+        std::mem::replace(&mut backings[local], KvPageBacking::Forgotten)
     }
 
     /// What follows `start` is dropped first; logged only where the log reaches
@@ -665,6 +739,7 @@ impl KvPageTable {
                     debug_assert!(false, "swapped backing must be released through KvStore");
                     None
                 }
+                KvPageBacking::Forgotten => None,
             })
             .collect()
     }
@@ -1216,6 +1291,7 @@ impl KvPageTable {
     fn resolve_id(&self, node: NodeId, local: u64) -> Option<PhysicalKvPageId> {
         match self.resolve_backing(node, local) {
             KvPageBacking::Resident(id) => Some(id),
+            KvPageBacking::Forgotten => Some(FORGOTTEN_PAGE),
             KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => None,
         }
     }
@@ -1407,6 +1483,7 @@ impl KvPageTable {
             }
             match self.backing_at(location) {
                 Ok(KvPageBacking::Resident(_)) => pages += 1,
+                Ok(KvPageBacking::Forgotten) => {}
                 _ => swapped += 1,
             }
         }
@@ -1431,7 +1508,9 @@ impl KvPageTable {
             .filter(|location| !staying.contains(location))
             .filter_map(|location| match self.backing_at(&location).ok()? {
                 KvPageBacking::Resident(id) => Some((location, id)),
-                KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => None,
+                KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) | KvPageBacking::Forgotten => {
+                    None
+                }
             })
             .collect())
     }
@@ -1732,14 +1811,18 @@ impl KvPageTable {
             .locations(working_sets)?
             .into_iter()
             .filter_map(|location| match self.backing_at(&location).ok()? {
-                KvPageBacking::Resident(_) => None,
+                KvPageBacking::Resident(_) | KvPageBacking::Forgotten => None,
                 swapped => Some((location, swapped)),
             })
             .collect())
     }
 
     pub fn held_pages(&self, working_sets: &HashSet<WorkingSetId>) -> Result<usize, KvTableError> {
-        Ok(self.locations(working_sets)?.len())
+        Ok(self
+            .locations(working_sets)?
+            .iter()
+            .filter(|location| !matches!(self.backing_at(location), Ok(KvPageBacking::Forgotten)))
+            .count())
     }
 
     pub fn pin_working_sets(

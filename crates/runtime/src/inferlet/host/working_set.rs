@@ -255,15 +255,10 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         let stores = store_registry::get(kv.model, kv.engine);
         let page = stores.kv_page_size.max(1);
         let (first, last) = (start.div_ceil(page), end / page);
-        if first >= last {
-            return Ok(Ok(0));
-        }
+        // An empty span still gives up what waited on another reader.
         let (pages, from) = (u64::from(first)..u64::from(last), u64::from(first * page));
-        let forgot = store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
-            s.forget(kv.id, pages, from)
-        });
-        Ok(match forgot {
-            Ok(()) => Ok((last - first) * page),
+        Ok(match kv.forget(pages, from) {
+            Ok(()) => Ok(last.saturating_sub(first) * page),
             Err(error) => Err(error.to_string()),
         })
     }
