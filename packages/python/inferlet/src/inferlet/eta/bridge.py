@@ -354,10 +354,12 @@ class Pipeline:
         fwd: "ForwardPass",
         budget: int,
         on_token: Callable[[], Awaitable[bool] | bool | None],
+        end: bool = True,
     ) -> int:
         """Keep the runtime's run-ahead window full while `on_token` consumes
         results, until `budget` fires submit or `on_token` returns False.
-        Returns the run count."""
+        Returns the run count. With `end` false the pipeline stays open: fires
+        past a stop still run, and what follows on it runs after them."""
         if budget == 0:
             return 0
         # Every slot of a frame is its own fire: the runtime advances the
@@ -385,7 +387,7 @@ class Pipeline:
                 break
             submit_one_frame()
 
-        ended = False
+        ended = not end
         if submitted >= budget and not ended:
             self.close()
             ended = True

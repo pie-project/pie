@@ -166,7 +166,8 @@ async def paths(input: dict) -> dict:
     for arm in ("host", "ahead"):
         ws, pipe = WorkingSet(), Pipeline()
         token = await step(ws, pipe, prompt)
-        ws.forget(start, end)
+        if input.get("forget", 1):
+            ws.forget(start, end)
         if arm == "ahead":
             runs[arm] = await ahead(ws, pipe, token, steps)
             continue
@@ -176,7 +177,9 @@ async def paths(input: dict) -> dict:
             out.append(token)
         pipe.close()
         runs[arm] = out
-    return {"same": runs["host"] == runs["ahead"], "agree": sum(x == y for x, y in zip(runs["host"], runs["ahead"])), "steps": steps}
+    agree = sum(x == y for x, y in zip(runs["host"], runs["ahead"]))
+    split = next((i for i, (x, y) in enumerate(zip(runs["host"], runs["ahead"])) if x != y), None)
+    return {"same": runs["host"] == runs["ahead"], "agree": agree, "split": split, "steps": steps}
 
 
 async def speed(input: dict) -> dict:

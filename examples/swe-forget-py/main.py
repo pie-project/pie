@@ -59,8 +59,10 @@ from inferlet.eta import (
     constant,
     dtype,
     entropy,
+    channel_capacity,
     gumbel_max,
     intrinsics,
+    iota,
     reduce_argmax,
     reshape,
     scalar_gather,
@@ -168,6 +170,7 @@ class Branch:
         self.forgotten = parent.forgotten if parent else 0  # of them, no longer read
         self.outputs_at: list[list[int]] = [list(o) for o in parent.outputs_at] if parent else []  # [start, end, turn]
         self.pending = pending  # sampled, not yet in the working set
+        self.unfed: list[int] = []  # the last reply, decoded on a scratch fork: it goes in with the next observation
         self.commands: list[str] = list(parent.commands) if parent else []
         self.seen: set[tuple[str, str]] = set(parent.seen) if parent else set()  # (state, command) run
         self.loops: dict[tuple[str, str], int] = dict(parent.loops) if parent else {}
@@ -242,11 +245,137 @@ class Swarm:
         token = await tok.take_scalar()
         return token, await ent.take_scalar()
 
+    async def stream(self, b: Branch, prefix: list[int], budget: int, keep) -> None:
+        """Sample on a scratch fork of `b` on the run-ahead path until `keep(token)`
+        says stop. Tokens past the stop were decoded ahead and die with the fork; the
+        reply goes into `b` with the next observation, so `b` is the turn's bookmark."""
+        cfg, stats = self.cfg, self.stats
+        temperature = cfg["temperature"]
+        scratch = b.ws.fork(b.pipe)
+        live = b.length - b.forgotten + len(prefix)
+        stats.attn_reads += len(prefix) * live
+        stats.peak_live = max(stats.peak_live, live)
+        first_rng = Channel.from_([b.seed, b.length], dtype.u32)
+        first = Channel([1], dtype.i32)
+        fwd = ForwardPass()
+        fwd.embed(prefix)
+        fwd.state([scratch], StateGeometry.folding())
+
+        @fwd.epilogue
+        def _():
+            first.put(reshape(gumbel_max(intrinsics.output(0, "logits") / temperature, first_rng.take()), [1]))
+
+        b.pipe.submit(fwd)
+        token = await first.take_scalar()
+        if keep(token):
+            tok_in = Channel.from_([token], dtype.i32)
+            tok_out = Channel([1], dtype.i32).capacity(channel_capacity())
+            rng = Channel.from_([b.seed ^ 0x5BD1, b.length], dtype.u32)
+            decode = ForwardPass()
+            decode.embed(tok_in, Channel.from_([0, 1], dtype.u32))
+            decode.state([scratch], StateGeometry.folding())
+
+            @decode.epilogue
+            def _():
+                r = rng.take()
+                sampled = reshape(gumbel_max(intrinsics.output(0, "logits") / temperature, r), [1])
+                tok_in.put(sampled)
+                tok_out.put(sampled)
+                rng.put(r + iota(2))
+
+            async def on_token() -> bool:
+                stats.attn_reads += live
+                return keep(await tok_out.take_scalar())
+
+            await b.pipe.run_ahead(decode, budget, on_token, end=False)
+
+    async def sample_ahead(self, b: Branch, check: bool) -> tuple[list[int], bool, str | None]:
+        """`sample_reply` on the run-ahead path: the same stops, rewinds and forced openers."""
+        cfg = self.cfg
+        out = list(b.hint) if b.hint else []
+        forced = bool(b.hint)
+        prefix = ([b.pending] if b.pending is not None else []) + out
+        if b.hint:
+            b.hint = None
+        elif b.pending is None or b.pending in self.stops:
+            return [], False, None
+        else:
+            out = [b.pending]
+        verdict: dict = {}
+
+        def keep(token: int) -> bool:
+            if token in self.stops:
+                verdict["end"] = "stop"
+                return False
+            out.append(token)
+            tail = model.decode(out[-2:])
+            if "`" in tail and COMMAND.search(model.decode(out)):
+                verdict["end"] = "closed"
+                return False
+            if check and cfg["no_rewrite"] and "\n" in tail:
+                match = REWRITE.search(model.decode(out))
+                if match and norm(match.group(1)) in b.files:
+                    verdict.update(end="rewind", why="rewrite")
+                    return False
+            if check and any(c in tail for c in ".!?\n"):
+                text = model.decode(out)
+                if "```" not in text and repeats_sentence(text):
+                    verdict.update(end="rewind", why="sentence")
+                    return False
+            if not forced and len(out) >= cfg["max_thought_tokens"] and "```" not in model.decode(out):
+                verdict["end"] = "long"
+                return False
+            if len(out) >= cfg["max_turn_tokens"]:
+                verdict["end"] = "cap"
+                return False
+            return True
+
+        while True:
+            verdict.clear()
+            await self.stream(b, prefix, cfg["max_turn_tokens"] - len(out), keep)
+            end = verdict.get("end")
+            if end == "closed":
+                return out, True, None
+            if end == "rewind":
+                return out, False, verdict["why"]
+            needs_block = end == "long" or (end == "stop" and "```" not in model.decode(out))
+            if forced or not needs_block:
+                return out, False, None
+            # thinking ran long, or the reply tried to end with no command: open the block for it
+            forced = True
+            self.stats.forced += 1
+            out += model.encode("\n```bash\n")
+            prefix = list(out)
+
+    async def decode_ahead(self, b: Branch) -> None:
+        """One reply on the run-ahead path; a rewind just samples again from `b`."""
+        cfg = self.cfg
+        pending = b.pending
+        for attempt in range(cfg["max_rewinds"] + 1):
+            b.pending = pending
+            out, closed, why = await self.sample_ahead(b, check=attempt < cfg["max_rewinds"])
+            self.stats.decoded += len(out)
+            text = model.decode(out)
+            if why is None and closed and (b.state, command(text)) in b.seen:
+                why = "command"
+            if why is None or attempt == cfg["max_rewinds"]:
+                break
+            self.stats.rewinds[why] += 1
+            self.stats.rewound_tokens += len(out)
+            b.seed += 104729
+            if why == "rewrite":
+                b.hint = model.encode(REWRITE_HINT)
+        b.text = text
+        b.unfed = out[:-1] if closed else out
+        b.pending = out[-1] if closed else None
+
     async def decode_turn(self, b: Branch) -> None:
         """One reply. A fork taken first is the turn's bookmark: a reply that repeats
         itself, or repeats a command already run here, is thrown away and resampled
         from it with a new seed, so the loop never enters the agent's context."""
         cfg = self.cfg
+        if cfg["ahead"]:
+            return await self.decode_ahead(b)
         mark, mark_length, mark_pending = b.ws.fork(b.pipe), b.length, b.pending
         for attempt in range(cfg["max_rewinds"] + 1):
             out, closed, why = await self.sample_reply(b, check=attempt < cfg["max_rewinds"])
@@ -315,7 +444,8 @@ class Swarm:
 
     async def observe(self, b: Branch, observation: str) -> None:
         """Close the reply, add the command's output as the user's turn, open the next reply."""
-        tokens = ([b.pending] if b.pending is not None else []) + self.asst_tail
+        tokens = b.unfed + ([b.pending] if b.pending is not None else []) + self.asst_tail
+        b.unfed = []
         tokens += self.user_head
         body = model.encode(observation)
         start = b.length + len(tokens)
@@ -607,6 +737,7 @@ DEFAULTS = {
     "verify_stop": False,  # nudge to submit once a failing check passes, submit `submit_after` turns later
     "submit_after": 3,
     "no_rewrite": False,  # rewind a reply that overwrites a file it has read, and start it as an edit
+    "ahead": True,  # decode on the run-ahead path, a fork per reply, instead of one host round trip a token
     "forget_after": 0,  # turns after a command that its output leaves the KV; 0 keeps it
     "forget_keep": 64,  # tokens kept at each end of a forgotten output
 }
