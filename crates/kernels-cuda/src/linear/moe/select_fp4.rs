@@ -123,6 +123,11 @@ pub(super) const STAGED_FROM: u32 = 16;
 #[cfg(feature = "cuda")]
 pub(super) const WGMMA_FROM: u32 = 13;
 
+#[cfg(feature = "cuda")]
+fn wgmma_wide_from() -> u32 {
+    std::env::var("PIE_WGMMA_WIDE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(256)
+}
+
 /// The fewest routes an expert averages that the staged slice takes on
 /// `moe_select_mxfp4_mma_pipe`: below it the fire's 256-row CTAs fill the
 /// card too thinly (DeepSeek-V4.1's miniature at 128 tokens: 7-30% slower,
@@ -199,7 +204,10 @@ pub(super) fn select_mxfp4_mma(
         && tensor_scales.is_none()
         && crate::jit::cache::arch() == Some("sm_89")
         && x.width.is_multiple_of(64);
+    // Hopper's wgmma slice of 128 routes past `WGMMA_WIDE_FROM` an expert.
+    let wide = staged && hopper_wgmma() && x.width.is_multiple_of(64) && per >= wgmma_wide_from();
     let nb: u32 = match per {
+        _ if wide => 16,
         _ if staged => 8,
         _ if run => 4,
         0..=4 => 1,
@@ -277,12 +285,13 @@ pub(super) fn select_mxfp4_mma(
         // card three CTAs an SM deep (their shared memory), else three.
         let nv = tensor_scales.is_some();
         let sms = ctx.multiprocessors().unwrap_or(132);
-        let ctas = fan.route_count.div_ceil(64) * grid[1];
-        let stages: u32 = if ctas >= 3 * sms - sms / 2 { 2 } else { 3 };
-        let smem = stages * (64 * 256 + 128 * (64 + 8)) + 128 * 32 + 1024;
+        let slice = 8 * nb;
+        let ctas = fan.route_count.div_ceil(slice) * grid[1];
+        let stages: u32 = if wide || ctas >= 3 * sms - sms / 2 { 2 } else { 3 };
+        let smem = stages * (slice * 256 + 128 * (64 + 8)) + 128 * 32 + 1024;
         Fire::at(kernel(
             SELECT_SM90,
-            &format!("::pie::linear::moe_select_fp4_wgmma<{code}, {nv}, {stages}>"),
+            &format!("::pie::linear::moe_select_fp4_wgmma<{code}, {nv}, {stages}, {slice}>"),
         ))
         .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(smem))
     } else if pipe {

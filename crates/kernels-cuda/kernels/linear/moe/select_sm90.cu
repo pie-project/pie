@@ -297,25 +297,24 @@ __global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
 /// alone. Grid `[work_cap, rows / 128]` (64 GLU columns), 128 threads,
 /// `kStages 25600 + 5120` bytes of shared memory past a 1024-byte alignment.
 
-template <int kGlu, bool kNv, int kStages>
-__global__ void __launch_bounds__(128, 3) moe_select_fp4_wgmma(
+template <int kGlu, bool kNv, int kStages, int kSlice = 64>
+__global__ void __launch_bounds__(128, kSlice == 64 ? 3 : 2) moe_select_fp4_wgmma(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const bf16* __restrict__ bias, bf16* __restrict__ out, int act_div, int n, int k,
     int num_experts, int inter, float limit, float galpha, const float* __restrict__ tscale) {
-    constexpr int kSlice = 64;
     constexpr int kT = 2;
     constexpr int kThreads = 128;
     // A stage: the routes' two K-major atoms (128 codes), then the CTA's
     // rows' codes (64 bytes a row, its 16-byte runs swizzled by row pairs)
     // and scales (8 bytes a row).
-    constexpr int kAtom = 64 * 128;
+    constexpr int kAtom = kSlice * 128;
     constexpr int kRows = 64 * kT;
     constexpr int kB = 2 * kAtom;
     // Whole 1024s, each stage's atoms on the swizzle's alignment.
     constexpr int kStage = (kB + kRows * (64 + 8) + 1023) / 1024 * 1024;
     // A thread's 16-byte route runs, code runs and scale runs a chunk.
-    constexpr int kRuns = 64 * 16 / kThreads;
+    constexpr int kRuns = kSlice * 16 / kThreads;
     constexpr int kSegs = kRows * 4 / kThreads;
     constexpr int kSfs = (kRows + kThreads - 1) / kThreads;
 
@@ -439,11 +438,11 @@ __global__ void __launch_bounds__(128, 3) moe_select_fp4_wgmma(
         asm volatile("cp.async.commit_group;\n" ::);
     };
 
-    float acc[kT][8][4];
+    float acc[kT][kSlice / 8][4];
 #pragma unroll
     for (int t = 0; t < kT; ++t)
 #pragma unroll
-        for (int b = 0; b < 8; ++b)
+        for (int b = 0; b < kSlice / 8; ++b)
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
 
@@ -539,7 +538,7 @@ __global__ void __launch_bounds__(128, 3) moe_select_fp4_wgmma(
             const unsigned long long db = wgfp8::desc(st + (s >> 2) * kAtom + (s & 3) * 32);
             asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 #pragma unroll
-            for (int t = 0; t < kT; ++t) wgfp4::mma(reinterpret_cast<float(&)[32]>(acc[t]), as[t], db);
+            for (int t = 0; t < kT; ++t) wgfp4::mma(reinterpret_cast<float(&)[kSlice / 2]>(acc[t]), as[t], db);
             asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
             // The step before's A registers are free once its MMAs land.
             asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
@@ -554,7 +553,7 @@ __global__ void __launch_bounds__(128, 3) moe_select_fp4_wgmma(
     const float* t_e = kNv ? tscale + static_cast<long long>(expert) * n : nullptr;
     auto factor = [&](int row) { return kNv ? t_e[row] * 256.f : 1.f; };
     if (row_base >= span) return;
-    w4mma::w4_land<kGlu, kT, 8, 64>(acc, factor, b_e, order, begin, count, out, n, inter, row_base,
+    w4mma::w4_land<kGlu, kT, kSlice / 8, 64>(acc, factor, b_e, order, begin, count, out, n, inter, row_base,
                                     g, c, limit, galpha);
 }
 
