@@ -13,6 +13,8 @@ sdpa.decode.split_small = true  # 1.7% faster end to end
 sdpa.decode.static_max_requests = 256  # 1.8% faster end to end
 sdpa.index_split_until = 512  # 4.3% faster end to end
 ssm.gdn_scan_until = 56  # 4.3% faster end to end
+sdpa.index_mma = true
+sdpa.index_radix = true
 
 [engine]
 working_set_percent = 90  # 1.9% faster end to end
