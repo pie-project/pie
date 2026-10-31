@@ -5,12 +5,13 @@
                  `forget` must decode what `mask` decodes.
   --mode speed   one lane at a `context` of tokens with a `fraction` of its pages
                  forgotten: decode and tool-turn prefill tokens per second.
+  --mode sweep   `speed` over comma-separated `contexts` and `fractions`.
 """
 
 import random
 import time
 
-from inferlet import model
+from inferlet import model, session
 from inferlet.eta import (
     Channel,
     ForwardPass,
@@ -162,5 +163,17 @@ async def speed(input: dict) -> dict:
     }
 
 
+async def sweep(input: dict) -> dict:
+    """`speed` over every context and fraction, in one engine."""
+    rows = []
+    for context in input["contexts"].split(","):
+        for fraction in input["fractions"].split(","):
+            row = await speed({**input, "context": int(context), "fraction": float(fraction)})
+            rows.append(row)
+            session.send(row)
+    return {"rows": rows}
+
+
 async def main(input: dict) -> dict:
-    return await (exact if input.get("mode", "exact") == "exact" else speed)(input)
+    mode = input.get("mode", "exact")
+    return await {"exact": exact, "speed": speed, "sweep": sweep}[mode](input)
