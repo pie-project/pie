@@ -305,6 +305,10 @@ class WorkingSet:
         """A child sharing the frozen part, with a copy of the buffer."""
         return WorkingSet._wrap(_wit(self.ws.fork, on.wit, what="fork"))
 
+    def forget(self, start: int, end: int) -> int:
+        """Later rows stop reading the whole pages inside frozen `[start, end)`; returns the slots dropped."""
+        return _wit(self.ws.forget, start, end, what="forget")
+
 
 # ---------------------------------------------------------------------------
 # Pipeline

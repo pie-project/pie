@@ -226,6 +226,40 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         })?))
     }
 
+    async fn forget(
+        &mut self,
+        this: Resource<WorkingSet>,
+        start: u32,
+        end: u32,
+    ) -> Result<Result<u32, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let (kv_rep, cursor) = {
+            let ws = self.ctx().table.get(&this)?;
+            (ws.kv, ws.cursor())
+        };
+        if !cursor.folded_exact || end > cursor.folded {
+            return Ok(Err(format!(
+                "forget reaches {end}, past the frozen {} slot(s)",
+                cursor.folded
+            )));
+        }
+        let kv = kv_of(self, kv_rep)?;
+        let stores = store_registry::get(kv.model, kv.engine);
+        let page = stores.kv_page_size.max(1);
+        let (first, last) = (start.div_ceil(page), end / page);
+        if first >= last {
+            return Ok(Ok(0));
+        }
+        let (pages, from) = (u64::from(first)..u64::from(last), u64::from(first * page));
+        let forgot = store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
+            s.forget(kv.id, pages, from)
+        });
+        Ok(match forgot {
+            Ok(()) => Ok((last - first) * page),
+            Err(error) => Err(error.to_string()),
+        })
+    }
+
     async fn drop(&mut self, this: Resource<WorkingSet>) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.delete(this)?;

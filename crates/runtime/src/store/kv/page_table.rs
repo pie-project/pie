@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
 use rustc_hash::FxHashSet;
@@ -121,6 +121,8 @@ struct WorkingSetEntry {
     logged: Vec<u32>,
     /// One that never settles leaves the log cut there.
     pending: BTreeMap<u64, u64>,
+    /// Pages later rows no longer read.
+    forgotten: BTreeSet<u64>,
 }
 
 impl WorkingSetEntry {
@@ -136,6 +138,7 @@ impl WorkingSetEntry {
             supplied: 0,
             logged: Vec::new(),
             pending: BTreeMap::new(),
+            forgotten: BTreeSet::new(),
         }
     }
 }
@@ -218,7 +221,9 @@ impl KvPageTable {
             logged.truncate(cut as usize);
         }
         let (folded, prompt_pages) = (entry.folded, entry.prompt_pages);
+        let forgotten = entry.forgotten.clone();
         let mut child_entry = WorkingSetEntry::new(terminal, page_len, mapped_len);
+        child_entry.forgotten = forgotten;
         child_entry.logged = logged;
         child_entry.folded = folded;
         child_entry.prompt_pages = prompt_pages;
@@ -227,6 +232,24 @@ impl KvPageTable {
             self.add_anchor(terminal);
         }
         Ok(child)
+    }
+
+    /// Rows written after this read less than their tokens say, so the log
+    /// stops at `start`: they must not publish as the prompt's own state.
+    pub fn forget(
+        &mut self,
+        ws: WorkingSetId,
+        pages: Range<u64>,
+        start: u64,
+    ) -> Result<(), KvTableError> {
+        let entry = self.entry_mut(ws)?;
+        entry.forgotten.extend(pages);
+        entry.logged.truncate(start as usize);
+        Ok(())
+    }
+
+    pub fn forgotten(&self, ws: WorkingSetId) -> Result<&BTreeSet<u64>, KvTableError> {
+        Ok(&self.entry(ws)?.forgotten)
     }
 
     /// What follows `start` is dropped first; logged only where the log reaches

@@ -1007,6 +1007,22 @@ impl KvStore {
         Ok(child)
     }
 
+    pub fn forget(
+        &mut self,
+        ws: WorkingSetId,
+        pages: Range<u64>,
+        start: u64,
+    ) -> Result<(), KvStoreError> {
+        Ok(self.table.forget(ws, pages, start)?)
+    }
+
+    pub fn forgotten(
+        &self,
+        ws: WorkingSetId,
+    ) -> Result<std::collections::BTreeSet<u64>, KvStoreError> {
+        Ok(self.table.forgotten(ws)?.clone())
+    }
+
     pub fn reserve(&mut self, ws: WorkingSetId, pages: u64) -> Result<Range<u64>, KvStoreError> {
         Ok(self.table.reserve(ws, pages)?)
     }

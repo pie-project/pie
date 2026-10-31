@@ -399,6 +399,12 @@ impl WorkingSet {
         self.ws.cached_tokens()
     }
 
+    /// Later rows stop reading the whole pages inside frozen `[start, end)`;
+    /// returns the slots dropped.
+    pub fn forget(&self, start: u32, end: u32) -> Result<u32, String> {
+        self.ws.forget(start, end).map_err(|error| error.to_string())
+    }
+
     /// A child sharing the frozen part, with a copy of the buffer.
     pub fn fork(&self, on: &Pipeline) -> Result<WorkingSet, String> {
         Ok(WorkingSet {
