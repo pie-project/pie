@@ -290,11 +290,13 @@ pub(super) fn select_mxfp4_mma(
         let nv = tensor_scales.is_some();
         let sms = ctx.multiprocessors().unwrap_or(132);
         // A wide fire's CTA: two warpgroups' 256 rows (128 GLU columns) on a
-        // 128-route slice, one CTA an SM on a three-stage ring.
+        // 128-route slice, one CTA an SM on a four-stage ring.
         let (slice, wg) = if wide { (128, 2) } else { (64, 1) };
         let grid = [grid[0], y.width.div_ceil(cols * wg), 1];
         let ctas = fan.route_count.div_ceil(slice) * grid[1];
-        let stages: u32 = if !wide && ctas >= 3 * sms - sms / 2 {
+        let stages: u32 = if wide {
+            4
+        } else if ctas >= 3 * sms - sms / 2 {
             2
         } else {
             3

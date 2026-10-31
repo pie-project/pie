@@ -449,14 +449,18 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
 
+    // Two warpgroups prefetch a chunk less far, so the chunk before stays
+    // live in its slot and its last MMAs overlap the next chunk.
+    constexpr int kAhead = kWg == 2 ? kStages - 2 : kStages - 1;
+    unsigned a[2][kT][4];
 #pragma unroll
-    for (int s = 0; s < kStages - 1; ++s) stage(s);
+    for (int s = 0; s < kAhead; ++s) stage(s);
 
     for (int ch = 0; ch < chunks; ++ch) {
-        asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 2));
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(kAhead - 1));
         __syncthreads();
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-        stage(ch + kStages - 1);
+        stage(ch + kAhead);
 
         const u8* st = ring + (ch % kStages) * kStage;
         // The lane's rows (h: g, g + 8) of each tile in the stage.
@@ -503,8 +507,6 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2
         }
         const unsigned sel = 0x4440u | static_cast<unsigned>(c);
         const int steps = ch == chunks - 1 ? tail_steps : 8;
-
-        unsigned a[2][kT][4];
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             if (s >= steps) break;
@@ -548,8 +550,9 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2
 #pragma unroll
             for (int t = 0; t < kT; ++t) wgfp4::hold(as[t]);
         }
-        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+        if constexpr (kAhead == kStages - 1) asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
     }
+    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
     asm volatile("cp.async.wait_group 0;\n" ::);
 
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
