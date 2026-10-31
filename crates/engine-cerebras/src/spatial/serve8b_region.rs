@@ -290,6 +290,9 @@ pub struct Tables {
     lanes: u32,
     rtr: usize,
     pe: HashMap<(usize, usize), Pe>,
+    /// serve8b_region_pipe's ring (units8r.py there): the last unit's x to
+    /// the head carries the micro-batch word (`nsend` bit 8).
+    pub pipe: bool,
 }
 
 fn step(d: u32) -> (isize, isize) {
@@ -324,7 +327,7 @@ impl Tables {
                 }
             }
         }
-        let mut t = Tables { units, lanes: lanes as u32, rtr, pe };
+        let mut t = Tables { units, lanes: lanes as u32, rtr, pe, pipe: false };
         t.build()?;
         Ok(t)
     }
@@ -622,11 +625,28 @@ impl Tables {
                         u.idx, e.routes, e.recv, e.send
                     ));
                 }
+                // The ring: the next pass's pieces may arrive on the recv
+                // color while queue 2 is bound to fwd_in, so the two differ;
+                // the last unit's PEs sending x to the head (colors 14, 15)
+                // append the micro-batch word after their pieces.
+                let mut nsend = e.send.len() as u32;
+                if self.pipe {
+                    if let Some(r) = e.recv.first()
+                        && e.fwd_in != NONE
+                        && r[0] == e.fwd_in
+                    {
+                        return Err(format!("unit {} PE ({px}, {py}): recv color == fwd_in {}", u.idx, e.fwd_in));
+                    }
+                    let last = self.units.last().is_some_and(|l| l.idx == u.idx);
+                    if last && e.send.first().is_some_and(|s| s[0] == 14 || s[0] == 15) {
+                        nsend |= 0x100;
+                    }
+                }
                 let at = (py * u.k.px + px) * rtn;
                 t[at..at + 7].copy_from_slice(&[
                     e.routes.len() as u32,
                     e.recv.len() as u32,
-                    e.send.len() as u32,
+                    nsend,
                     e.relay,
                     e.fwd_in,
                     px as u32,
@@ -733,7 +753,8 @@ pub fn put_routes(lay: &Layout2d, u: &Units, sink: &mut dyn Sink, rbits: Option<
             sink.h2d("rcfg", rect(v.x0, v.y0, v.k.px, v.k.py), 11, &words)?;
         }
     }
-    let tables = Tables::new(units.clone(), lay.paged.map_or(1, |s| s.lanes), u.rtr)?;
+    let mut tables = Tables::new(units.clone(), lay.paged.map_or(1, |s| s.lanes), u.rtr)?;
+    tables.pipe = lay.mmax.is_some();
     for v in &units {
         sink.h2d16("rtab", rect(v.x0, v.y0, v.k.px, v.k.py), tables.rtn(), &tables.table(v)?)?;
     }
@@ -1135,6 +1156,28 @@ mod tests {
         assert!(of(&format!("{pipe},PIPE:1,MMAX:19")).is_ok());
         assert!(of(&format!("{pipe},PIPE:1,MMAX:20")).unwrap_err().contains("20 units"));
         assert!(of(&format!("{pipe},PIPE:1,MMAX:4,KVST:1")).is_err());
+        // The ring's tables: the last unit's PEs that send x to the head
+        // flag their piece count (bit 8: append the micro-batch word), and
+        // nothing else changes; the plain build flags none.
+        let ring = lay_of(&format!("{pipe},PIPE:1,MMAX:12"));
+        let Some(S8b::Units(u)) = ring.s8b else { panic!("units") };
+        let units = u.units(&ring);
+        let mut tables = Tables::new(units.clone(), 1, u.rtr).unwrap();
+        let plain: Vec<Vec<u32>> = units.iter().map(|v| tables.table(v).unwrap()).collect();
+        tables.pipe = true;
+        let rtn = tables.rtn();
+        for (v, p) in units.iter().zip(&plain) {
+            let r = tables.table(v).unwrap();
+            let flagged = r.chunks(rtn).filter(|pe| pe[2] & 0x100 != 0).count();
+            assert_eq!(flagged > 0, v.idx == units.len() - 1, "unit {}", v.idx);
+            let unflag: Vec<u32> = r.chunks(rtn).flat_map(|pe| {
+                let mut pe = pe.to_vec();
+                pe[2] &= 0xff;
+                pe
+            }).collect();
+            assert_eq!(&unflag, p, "unit {}", v.idx);
+            assert!(p.chunks(rtn).all(|pe| pe[2] & 0x100 == 0));
+        }
         let t = |m: u32| (0..2 * 3).map(|i| 100 * m + i).collect::<Vec<u32>>();
         assert_eq!(
             pipe_rows(&[t(1), t(2)], 2, 3, 3),
