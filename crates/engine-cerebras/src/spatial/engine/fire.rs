@@ -74,12 +74,12 @@ impl PagedAhead {
     }
 }
 
-/// How far a greedy decode row's launch runs past it: the fires its
-/// pipeline has left once known (else the lookahead), at most CAP − 2 and
-/// never past the lane's own pages (`pages` of `size` slots, the row at
-/// `slot`).
+/// How far a greedy decode row's launch runs past it: the lookahead, or
+/// the fires its frame still sends if more (those are certain to come), at
+/// most CAP − 2 and never past the lane's own pages (`pages` of `size`
+/// slots, the row at `slot`).
 fn ahead_steps(
-    fires_left: Option<u32>,
+    fires_after: Option<u32>,
     lookahead: usize,
     cap: usize,
     pages: usize,
@@ -90,9 +90,8 @@ fn ahead_steps(
         return 0;
     }
     let room = (pages as u32 * size).saturating_sub(slot + 1) as usize;
-    fires_left
-        .map_or(lookahead, |f| f as usize)
-        .min(lookahead)
+    lookahead
+        .max(fires_after.map_or(0, |f| f as usize))
         .min(cap - 2)
         .min(room)
 }
@@ -217,8 +216,12 @@ impl Spatial {
                 } else {
                     FIRST_LOOP.min(lookahead)
                 };
-                // No further than the lane's pipeline will fire.
-                ahead.map_or(c.next_loop, |fires| c.next_loop.min(fires as usize))
+                // At least as far as the lane's frame will fire: those
+                // fires are certain, so a large frame starts at its size.
+                c.next_loop = c
+                    .next_loop
+                    .max(ahead.map_or(0, |fires| (fires as usize).min(lookahead)));
+                c.next_loop
             };
             tracing::info!(
                 rows = tokens.len(),
@@ -519,10 +522,7 @@ impl Spatial {
                     .get(&at)
                     .is_some_and(|&instance| self.programs.greedy_reads(instance, &name))
                     && one_reader(step, at);
-                let ahead = lane
-                    .ahead
-                    .as_ref()
-                    .and_then(engine::ahead::Ahead::fires_left);
+                let ahead = lane.fires_after;
                 let first_slot = port_slots
                     .get(&at)
                     .and_then(|s| s.first().copied())
@@ -901,11 +901,16 @@ mod tests {
         // The last slot of the last page: nothing past it.
         assert_eq!(ahead_steps(None, 32, 16, 2, 16, 31), 0);
         // CAP bounds it (two iterations of the launch are the row and its
-        // first follower), and so do the fires left once known.
+        // first follower).
         assert_eq!(ahead_steps(None, 32, 8, 4, 16, 0), 6);
-        assert_eq!(ahead_steps(Some(2), 32, 16, 4, 16, 0), 2);
-        assert_eq!(ahead_steps(Some(0), 32, 16, 4, 16, 0), 0);
         assert_eq!(ahead_steps(None, 32, 2, 4, 16, 0), 0);
+        // The fires the frame still sends are a floor, not a ceiling: a
+        // small frame (more frames may follow) keeps the lookahead, a large
+        // one runs past it, up to CAP − 2.
+        assert_eq!(ahead_steps(Some(0), 32, 64, 4, 16, 0), 32);
+        assert_eq!(ahead_steps(Some(2), 32, 64, 4, 16, 0), 32);
+        assert_eq!(ahead_steps(Some(50), 32, 64, 4, 16, 0), 50);
+        assert_eq!(ahead_steps(Some(90), 32, 64, 8, 16, 0), 62);
     }
 
     #[test]

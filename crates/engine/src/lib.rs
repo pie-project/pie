@@ -8,7 +8,6 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
-pub mod ahead;
 pub mod caps;
 pub mod channel;
 #[cfg(any(unix, windows))]
