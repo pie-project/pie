@@ -386,6 +386,8 @@ async def read(input: dict) -> dict:
     them. Then both answer the same questions, some of which need two chunks."""
     data = json.loads(session.file("docs"))
     header, chunks, questions = data["header"], data["chunks"], data["questions"]
+    if input.get("kind"):
+        questions = [q for q in questions if q["kind"] == input["kind"]]
     arm, decode = input.get("arm", "par"), input.get("decode", 12)
     h, each, count = len(header), len(chunks[0]), len(chunks)
     v = model.output_vocab_size()
@@ -397,6 +399,11 @@ async def read(input: dict) -> dict:
         for part in chunks:
             for at in range(0, each, 1024):
                 await step(ws, pipe, part[at:at + 1024])
+    elif arm == "apart":
+        readers = [ws.fork(pipe) for _ in chunks]
+        for i, part in enumerate(chunks):
+            for at in range(0, each, 1024):
+                await read_chunk(readers[i], pipe, part[at:at + 1024], h + i * each + at, None, 0, 0)
     else:
         readers = [ws.fork(pipe) for _ in chunks]
         width = input.get("width", 1024 // count)
@@ -419,7 +426,8 @@ async def read(input: dict) -> dict:
             await done.take_host()
     reading = time.monotonic() - t0
     t0 = time.monotonic()
-    merged_slots = sum(ws.merge(reader, h, h + each) for reader in readers)
+    picked = input.get("picked", 0)
+    merged_slots = 0 if picked else sum(ws.merge(reader, h, h + each) for reader in readers)
     merging = time.monotonic() - t0
     batch, answers = input.get("batch", 16), []
     t0 = time.monotonic()
@@ -428,12 +436,21 @@ async def read(input: dict) -> dict:
         forks = [ws.fork(pipe) for _ in group]
         lanes = len(group)
         indptr = [0]
+        for lane, question in enumerate(group):
+            if picked:  # only the chunks this question needs, the best a page selector could do
+                for chunk in sorted(question["chunks"]):
+                    forks[lane].merge(readers[chunk], h, h + each)
         for question in group:
             indptr.append(indptr[-1] + len(question["q"]))
         first = Channel([lanes], dtype.i32)
         ask = ForwardPass()
         ask.embed(Channel.from_([t for question in group for t in question["q"]], dtype.i32), Channel.from_(indptr, dtype.u32))
-        ask.state(forks, StateGeometry.folding())
+        total = h + each * count
+        if picked:  # rows run on past every chunk, merged here or not
+            spots = [total + j for question in group for j in range(len(question["q"]))]
+            ask.state(forks, StateGeometry.folding(positions=Channel.from_(spots, dtype.u32)))
+        else:
+            ask.state(forks, StateGeometry.folding())
 
         @ask.epilogue
         def _():
@@ -441,6 +458,24 @@ async def read(input: dict) -> dict:
 
         pipe.submit(ask)
         heads = await first.take_host()
+        if picked:
+            out = [[t] for t in heads]
+            for turn in range(decode):
+                next_tokens = Channel([lanes], dtype.i32)
+                go = ForwardPass()
+                go.embed(Channel.from_([row[-1] for row in out], dtype.i32), Channel.from_(list(range(lanes + 1)), dtype.u32))
+                spots = [total + len(question["q"]) + turn for question in group]
+                go.state(forks, StateGeometry.folding(positions=Channel.from_(spots, dtype.u32)))
+
+                @go.epilogue
+                def _():
+                    next_tokens.put(reduce_argmax(reshape(intrinsics.output(0, "logits"), [lanes, v])))
+
+                pipe.submit(go)
+                for lane, token in enumerate(await next_tokens.take_host()):
+                    out[lane].append(token)
+            answers += [model.decode(row) for row in out]
+            continue
         tok_in = Channel.from_(heads, dtype.i32)
         tok_out = Channel([lanes], dtype.i32).capacity(channel_capacity())
         go = ForwardPass()
@@ -464,12 +499,14 @@ async def read(input: dict) -> dict:
         answers += [model.decode(row) for row in out]
     asking = time.monotonic() - t0
     pipe.close()
-    tally = lambda kind: sum(q["a"] in text for q, text in zip(questions, answers) if q["kind"] == kind)
+    hit = lambda q, text: all(part in text for part in q["a"].split())
+    tally = lambda kind: sum(hit(q, text) for q, text in zip(questions, answers) if q["kind"] == kind)
     return {
         "arm": arm, "chunks": count, "tokens": h + each * count, "merged_slots": merged_slots,
         "read_s": round(reading, 2), "read_tps": round(each * count / reading, 1), "merge_ms": round(merging * 1000, 2),
         "ask_s": round(asking, 2), "questions": len(questions),
-        "right_one": tally("one"), "right_two": tally("two"), "of_each": len(questions) // 2,
+        "right_one": tally("one"), "right_two": tally("two"), "right_pair": tally("pair"), "right_quad": tally("quad"),
+        "right": [int(hit(q, text)) for q, text in zip(questions, answers)],
         "samples": [text[:14] for text in answers[:6]],
     }
 
