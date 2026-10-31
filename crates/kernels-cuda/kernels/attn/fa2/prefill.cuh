@@ -2594,6 +2594,34 @@ __device__ __forceinline__ void vosplit_write_o(
   }
 }
 
+template <typename KTraits, uint32_t kD, typename Params>
+__device__ __forceinline__ void apply_sinks(const Params& params, float (*o_frag)[kD][8],
+                                            typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2],
+                                            const uint32_t qo_packed_idx_base,
+                                            const uint32_t kv_head_idx,
+                                            const uint_fastdiv group_size,
+                                            const uint32_t lane_idx) {
+  // PIE: a row's output times sigmoid(lse - sink), `sink_rescale`'s scale.
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      uint32_t q, r;
+      group_size.divmod(qo_packed_idx_base + lane_idx / 4 + j * 8 + mma_q * 16, q, r);
+      const float lse = math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]);
+      const float sink = float(params.maybe_sinks[kv_head_idx * group_size + r]);
+      const float rs = isfinite(lse) ? 1.0f / (1.0f + __expf(sink - lse * 0.69314718055994530942f)) : 1.0f;
+#pragma unroll
+      for (uint32_t i = 0; i < kD; ++i) {
+        o_frag[mma_q][i][j * 2 + 0] *= rs;
+        o_frag[mma_q][i][j * 2 + 1] *= rs;
+        o_frag[mma_q][i][j * 2 + 4] *= rs;
+        o_frag[mma_q][i][j * 2 + 5] *= rs;
+      }
+    }
+  }
+}
+
 template <typename KTraits, typename Params, typename SmemStorage>
 __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const Params params, SmemStorage& smem_storage, const dim3 tid = threadIdx,
@@ -3127,6 +3155,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
 
       if constexpr (KTraits::USE_VO_SPLIT) {
+        if (params.maybe_sinks != nullptr && !partition_kv)
+          apply_sinks<KTraits>(params, o_frag, m, d, qo_packed_idx_base, kv_head_idx, group_size,
+                               lane_idx);
         vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
                                  partition_kv ? num_kv_chunks * o_stride_n : o_stride_n, o_stride_h,
                                  get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
@@ -3138,6 +3169,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         transform_output<KTraits, Params>(params, variant, o_frag, m, d, request_idx,
                                           kv_tile_idx, qo_packed_idx_base, warp_idx, lane_idx,
                                           kv_head_idx, group_size);
+        if (params.maybe_sinks != nullptr && !partition_kv)
+          apply_sinks<KTraits>(params, o_frag, m, d, qo_packed_idx_base, kv_head_idx, group_size,
+                               lane_idx);
 
         write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base + d_base * 16, qo_packed_idx_base,
                                   qo_len,

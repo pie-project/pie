@@ -117,6 +117,7 @@ pub struct PrefillPagedParams {
     pub maybe_token_pos_in_items_ptr: DevicePtr,
     pub token_pos_in_items_len: u32,
     pub maybe_max_item_len_ptr: DevicePtr,
+    pub maybe_sinks: DevicePtr,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

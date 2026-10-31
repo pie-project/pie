@@ -558,6 +558,48 @@ pub fn matmul_mx(
         xs,
         atom_bytes,
     )?;
+    let whole = m / 128 * 128;
+    if mpad != m && whole > 0 {
+        // The whole 128s straight into `y`, then the last tile through a
+        // 128-row scratch: only its live rows are copied, not all `m`.
+        let (Some((_, main)), Some((_, last))) = (
+            plan_for(whole, n, k, workspace, true),
+            plan_for(128, n, k, workspace, true),
+        ) else {
+            return Ok(false);
+        };
+        run(
+            ctx, op, handle, &main, workspace, codes, atoms, xq, xs, y.ptr, y, whole, whole, n, k,
+        )?;
+        let d = scratch("linear.lt_mx_d", 128 * u64::from(n) * 2)?;
+        let mut tail = Tensor::new(
+            y.ptr + u64::from(whole) * u64::from(n) * 2,
+            m - whole,
+            n,
+            Dtype::Bf16,
+        );
+        let (xq_tail, xs_tail) = (
+            xq + u64::from(whole) * u64::from(k),
+            xs + u64::from(whole / 128) * u64::from(k / 128) * 512,
+        );
+        return run(
+            ctx,
+            op,
+            handle,
+            &last,
+            workspace,
+            codes,
+            atoms,
+            xq_tail,
+            xs_tail,
+            d,
+            &mut tail,
+            m - whole,
+            128,
+            n,
+            k,
+        );
+    }
     let d = if mpad == m {
         y.ptr
     } else {

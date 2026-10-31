@@ -616,8 +616,11 @@ fn select_mxfp4_w4a8_tma(
     // Persistent: a CTA a multiprocessor over the (row tile, slice) jobs.
     let sms = ctx.multiprocessors().unwrap_or(1).max(1);
     let fire = if ws {
-        Fire::at(kernel(SELECT_FP4_SM120, "::pie::linear::moe_select_mxfp4_w4a8_ws<3>"))
-            .apply(Launch::grid([sms.min(tiles * work_cap), 1, 1], [384, 1, 1]).smem(W4A8_TMA_SMEM))
+        Fire::at(kernel(
+            SELECT_FP4_SM120,
+            "::pie::linear::moe_select_mxfp4_w4a8_ws<3>",
+        ))
+        .apply(Launch::grid([sms.min(tiles * work_cap), 1, 1], [384, 1, 1]).smem(W4A8_TMA_SMEM))
     } else {
         Fire::at(kernel(
             SELECT_FP4_SM120,

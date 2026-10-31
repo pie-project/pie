@@ -136,6 +136,9 @@ struct BatchPrefillPagedParams {
   uint16_t* maybe_token_pos_in_items_ptr;
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
+  // PIE: each head's sink logit, applied as `sink_rescale` applies it where the
+  // fire's rows are not split over kv chunks (null: none).
+  DTypeO* maybe_sinks;
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];

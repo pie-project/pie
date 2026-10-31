@@ -90,6 +90,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             );
             boot.budget.max_tokens = fit;
         }
+        if engine.fire_rows > 0 && engine.fire_rows < boot.budget.max_tokens {
+            boot.budget.max_tokens = engine.fire_rows;
+        }
     }
     if engine.host_planes {
         let freed = boot.residency.host_declared(&boot.trace)?;

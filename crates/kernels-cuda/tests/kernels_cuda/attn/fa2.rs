@@ -144,9 +144,9 @@ fn check_live(
         indptr: col(&mut gpu, &qo, I32),
     };
     let (o_at, lse_at) = (gpu.zeros(rows * qw * 2), gpu.zeros(rows * qh * 4));
-    // The tcgen05 prefill folds bf16 sinks in its epilogue.
+    // The prefills (tcgen05's, and FA2's unsplit rows) fold bf16 sinks in their epilogues.
     let sinks16: Vec<u16> = sinks.iter().map(|&v| crate::common::to_bf16(v)).collect();
-    let sink_t = match tuning.prefill_tc5 {
+    let sink_t = match tuning.prefill_tc5 || lanes.is_none() {
         true => col(&mut gpu, &sinks16, Bf16),
         false => col(&mut gpu, &sinks, F32),
     };
@@ -271,6 +271,8 @@ fn the_paged_attention_answers_the_reference() {
         ([64, 8, 64], dec, w200, both, pre, read(true, true, 0, 0)),
         ([32, 4, 512], chunks, None, own, pre, fa2),
         ([8, 2, 128], chunks, w100, sunk, pre, fa2),
+        // DeepSeek-V4's window: 64 heads over one 512-wide kv head, its sinks in the epilogue.
+        ([64, 1, 512], chunks, w128, sunk, pre, fa2),
         // B200's tcgen05 prefill: whole, over a short window (its blocks each walking several tiles), and
         // a 64-wide head's tile pairs.
         ([32, 4, 128], chunks, None, rec, pre, tuned(|t| t.prefill_tc5 = true)),
