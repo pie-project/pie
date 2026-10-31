@@ -15,6 +15,7 @@ sdpa.index_split_until = 512  # 4.3% faster end to end
 ssm.gdn_scan_until = 56  # 4.3% faster end to end
 sdpa.index_radix = true
 sdpa.index_mma = true
+gemm.fp8_shadow = true
 
 [engine]
 working_set_percent = 90  # 1.9% faster end to end
