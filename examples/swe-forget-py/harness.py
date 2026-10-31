@@ -195,10 +195,17 @@ async def run_pie(task: Task, uri: str, config: dict, quiet: bool) -> dict:
     try:
         async with PieClient(uri) as client:
             await client.authenticate("swarm")
-            program = await client.install_program_bytes(
-                PROGRAM.read_bytes(), PROGRAM.stem + ".py", "0.1.0", force_overwrite=True)
-            process = await client.launch_process(
-                program, {"system": SYSTEM, "task": task.issue, "config": config})
+            for attempt in range(8):  # tasks starting together overwrite the program under each other
+                program = await client.install_program_bytes(
+                    PROGRAM.read_bytes(), PROGRAM.stem + ".py", "0.1.0", force_overwrite=True)
+                try:
+                    process = await client.launch_process(
+                        program, {"system": SYSTEM, "task": task.issue, "config": config})
+                    break
+                except Exception:
+                    if attempt == 7:
+                        raise
+                    await asyncio.sleep(1 + attempt)
             tool_seconds = 0.0
             while True:
                 event, value = await process.recv()

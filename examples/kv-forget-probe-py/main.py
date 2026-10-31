@@ -8,6 +8,8 @@
   --mode sweep   `speed` over comma-separated `contexts` and `fractions`.
   --mode paths   greedy tokens past a forgotten span, host loop against run-ahead.
   --mode decl    what a plain lane reads out.
+  --mode team    sub-agents forked from one context, each asked about its own module;
+                 `focus` makes each forget the other modules first.
 """
 
 import random
@@ -90,7 +92,7 @@ async def exact(input: dict) -> dict:
     steps = input.get("steps", 48)
     prompt = text_tokens(n, 1)
     forced = text_tokens(steps, 2)
-    first_page = n // (4 * page)
+    first_page = 0 if input.get("lead") else n // (4 * page)
     last_page = 3 * n // (4 * page)
     hide = range(first_page * page, last_page * page)
     span = n + steps + 1
@@ -213,6 +215,108 @@ async def speed(input: dict) -> dict:
     }
 
 
+FILLER = [
+    "The handler retries the request after the timeout expires and logs the failure.",
+    "A cached entry is dropped when its owner closes the connection to the pool.",
+    "Each worker reads one batch from the queue and writes its result to the store.",
+    "The parser skips blank lines and keeps a count of the fields it has seen.",
+    "On shutdown the scheduler waits for running jobs and then flushes the journal.",
+    "The client signs every call and rejects a reply whose checksum does not match.",
+]
+
+
+def team_docs(agents: int, tokens_each: int) -> tuple[list[str], list[tuple[str, str]]]:
+    """One module per agent, each hiding one constant, and the question that asks for it."""
+    rng = random.Random(11)
+    docs, asks = [], []
+    for agent in range(agents):
+        name = f"module_{agent:02d}"
+        lines = [rng.choice(FILLER) for _ in range(tokens_each // 16)]
+        secret = rng.randrange(1000, 9999)
+        lines.insert(rng.randrange(len(lines) // 4, 3 * len(lines) // 4), f"In {name} the retry limit constant is set to {secret}.")
+        docs.append(f"# {name}\n" + "\n".join(lines) + "\n")
+        asks.append((f"\nQuestion: In {name}, what is the retry limit constant? Answer with the number only.\nAnswer:", str(secret)))
+    return docs, asks
+
+
+async def team(input: dict) -> dict:
+    """A parent reads every module; each sub-agent forks from it and answers about its own.
+    With `focus`, a sub-agent forgets the other modules first: no re-read, and each decodes
+    over its own pages only, while the parent and the others keep theirs."""
+    agents, each = input["agents"], input["tokens_each"]
+    focus, decode = input.get("focus", 0), input.get("decode", 32)
+    docs, asks = team_docs(agents, each)
+    parts = [model.encode(doc) for doc in docs]
+    tokens = [token for part in parts for token in part]
+    ats = [0]
+    for part in parts:
+        ats.append(ats[-1] + len(part))
+    n = len(tokens)
+    ws, pipe = WorkingSet(), Pipeline()
+    t0 = time.monotonic()
+    for at in range(0, n, 4096):
+        await step(ws, pipe, tokens[at:at + 4096])
+    parent = time.monotonic() - t0
+    t0 = time.monotonic()
+    forks = [ws.fork(pipe) for _ in range(agents)]
+    if focus:
+        for agent, child in enumerate(forks):
+            # the first tokens stay: a model reading none of them loses the thread (attention sinks)
+            child.forget(input.get("sink", 64), ats[agent])
+            child.forget(ats[agent + 1], n)
+    forked = time.monotonic() - t0
+    questions = [model.encode(ask) for ask, _ in asks]
+    v = model.output_vocab_size()
+    indptr = [0]
+    for question in questions:
+        indptr.append(indptr[-1] + len(question))
+    t0 = time.monotonic()
+    first = Channel([agents], dtype.i32)
+    ask = ForwardPass()
+    ask.embed(Channel.from_([t for question in questions for t in question], dtype.i32), Channel.from_(indptr, dtype.u32))
+    ask.state(forks, StateGeometry.folding())
+
+    @ask.epilogue
+    def _():
+        first.put(reduce_argmax(reshape(intrinsics.output(0, "logits"), [agents, v])))
+
+    pipe.submit(ask)
+    tokens_now = await first.take_host()
+    ttft = time.monotonic() - t0
+    tok_in = Channel.from_(tokens_now, dtype.i32)
+    tok_out = Channel([agents], dtype.i32).capacity(channel_capacity())
+    step_pass = ForwardPass()
+    step_pass.embed(tok_in, Channel.from_(list(range(agents + 1)), dtype.u32))
+    step_pass.state(forks, StateGeometry.folding())
+
+    @step_pass.epilogue
+    def _():
+        token = reduce_argmax(reshape(intrinsics.output(0, "logits"), [agents, v]))
+        tok_in.put(token)
+        tok_out.put(token)
+
+    out = [[t] for t in tokens_now]
+
+    async def on_step() -> bool:
+        for agent, token in enumerate(await tok_out.take_host()):
+            out[agent].append(token)
+        return True
+
+    t1 = time.monotonic()
+    await pipe.run_ahead(step_pass, decode, on_step)
+    done = time.monotonic() - t1
+    answers = [model.decode(row) for row in out]
+    right = sum(answer in text for (_, answer), text in zip(asks, answers))
+    return {
+        "agents": agents, "tokens_each": each, "context": n, "focus": focus,
+        "parent_s": round(parent, 3), "fork_ms": round(forked * 1000, 2),
+        "first_token_s": round(ttft, 3), "decode_s": round(done, 3),
+        "total_s": round(forked + ttft + done, 3),
+        "tokens_per_s": round(agents * decode / done, 1),
+        "right": right, "answers": [text[:16] for text in answers], "wanted": [answer for _, answer in asks],
+    }
+
+
 async def sweep(input: dict) -> dict:
     """`speed` over every context and fraction, in one engine."""
     rows = []
@@ -228,4 +332,4 @@ async def main(input: dict) -> dict:
     mode = input.get("mode", "exact")
     if mode == "decl":
         return {"outputs": [[o.name, o.width, o.layers, o.readout] for o in model.lane([]).outputs], "page": kv_page_size()}
-    return await {"exact": exact, "speed": speed, "sweep": sweep, "paths": paths}[mode](input)
+    return await {"exact": exact, "speed": speed, "sweep": sweep, "paths": paths, "team": team}[mode](input)
