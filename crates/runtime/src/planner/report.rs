@@ -12,10 +12,11 @@ use super::{ProcessId, ResidencyPlanner};
 impl ResidencyPlanner {
     pub(super) fn report_evicted(self: &Arc<Self>, pid: ProcessId, freed: u32, rs_freed: RsUnits) {
         self.with_inner(|inner| {
-            inner.settle_eviction(pid);
+            // One that left meanwhile is settled by its departure.
             let Some(proc) = inner.procs.get_mut(&pid) else {
                 return;
             };
+            inner.evicting.remove(&pid);
             debug_assert_eq!(proc.state, Residency::Evicting);
             proc.state = Residency::Evicted;
             let demand = Demand {
@@ -56,7 +57,10 @@ impl ResidencyPlanner {
         found_nothing: bool,
     ) {
         let signal = self.with_inner(|inner| {
-            inner.settle_eviction(pid);
+            // One that left meanwhile is settled by its departure.
+            if inner.procs.contains_key(&pid) {
+                inner.settle_eviction(pid);
+            }
             if host_swap_full {
                 inner.host_swap_blocked.insert(pid);
             }

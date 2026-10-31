@@ -123,6 +123,12 @@ pub(super) const STAGED_FROM: u32 = 16;
 #[cfg(feature = "cuda")]
 pub(super) const WGMMA_FROM: u32 = 13;
 
+/// The fewest routes an expert averages that take Hopper's wide wgmma slice:
+/// 128 routes on two warpgroups' 256 rows (gpt-oss-20b on an H100: pf32-512
+/// 33.1k to 41.4k tok/s, c1024 16.6k to 18.6k).
+#[cfg(feature = "cuda")]
+pub(super) const WGMMA_WIDE_FROM: u32 = 128;
+
 /// The fewest routes an expert averages that the staged slice takes on
 /// `moe_select_mxfp4_mma_pipe`: below it the fire's 256-row CTAs fill the
 /// card too thinly (DeepSeek-V4.1's miniature at 128 tokens: 7-30% slower,
@@ -199,7 +205,13 @@ pub(super) fn select_mxfp4_mma(
         && tensor_scales.is_none()
         && crate::jit::cache::arch() == Some("sm_89")
         && x.width.is_multiple_of(64);
+    let wide = staged
+        && hopper_wgmma()
+        && tensor_scales.is_none()
+        && x.width.is_multiple_of(64)
+        && per >= WGMMA_WIDE_FROM;
     let nb: u32 = match per {
+        _ if wide => 16,
         _ if staged => 8,
         _ if run => 4,
         0..=4 => 1,
@@ -277,14 +289,22 @@ pub(super) fn select_mxfp4_mma(
         // card three CTAs an SM deep (their shared memory), else three.
         let nv = tensor_scales.is_some();
         let sms = ctx.multiprocessors().unwrap_or(132);
-        let ctas = fan.route_count.div_ceil(64) * grid[1];
-        let stages: u32 = if ctas >= 3 * sms - sms / 2 { 2 } else { 3 };
-        let smem = stages * (64 * 256 + 128 * (64 + 8)) + 128 * 32 + 1024;
+        // A wide fire's CTA: two warpgroups' 256 rows (128 GLU columns) on a
+        // 128-route slice, one CTA an SM on a three-stage ring.
+        let (slice, wg) = if wide { (128, 2) } else { (64, 1) };
+        let grid = [grid[0], y.width.div_ceil(cols * wg), 1];
+        let ctas = fan.route_count.div_ceil(slice) * grid[1];
+        let stages: u32 = if !wide && ctas >= 3 * sms - sms / 2 {
+            2
+        } else {
+            3
+        };
+        let smem = stages * (slice * 256 + wg * 128 * (64 + 8)) + wg * 128 * 32 + 1024;
         Fire::at(kernel(
             SELECT_SM90,
-            &format!("::pie::linear::moe_select_fp4_wgmma<{code}, {nv}, {stages}>"),
+            &format!("::pie::linear::moe_select_fp4_wgmma<{code}, {nv}, {stages}, {slice}, {wg}>"),
         ))
-        .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(smem))
+        .apply(Launch::grid(grid, [THREADS * wg, 1, 1]).smem(smem))
     } else if pipe {
         let cols = if glu.is_some() { 128 } else { 256 };
         let tiles = y.width.div_ceil(cols);

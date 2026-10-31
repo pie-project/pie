@@ -282,6 +282,8 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::MxBias, mma, [8, 400, 4, 192, 2048], t, alpha, 2),
         // Hopper's wgmma slice below the staged kernel's 32 routes an expert.
         (K::Mx, mma, [8, 48, 4, 384, 1024], t, None, 0),
+        // Hopper's wide slice (128 routes, two warpgroups) on gpt-oss's K.
+        (K::MxBias, mma, [8, 400, 4, 192, 2880], t, alpha, 8),
         // W4A8 on sm_120a's block-scaled mma.sync (elsewhere the bf16 arms):
         // by route over a partial 256-row tile, its GLU under scales past
         // f16's range, V4-Flash's leg, a few routes under a live window.
@@ -621,7 +623,7 @@ fn w4a8_select_timing() {
         let rows_x = if by_token { tokens } else { tokens * top };
         let (raw, _) = b.lcg.row(rows_x * k);
         let x = t(b.up(&raw), rows_x, k, Bf16);
-        let codes = tab(ex * n * k / 2, |i| (i * 2_654_435_761 >> 7) as u8);
+        let codes = tab(ex * n * k / 2, |i| ((i * 2_654_435_761) >> 7) as u8);
         let scales = tab(ex * n * k / 32, |i| 120 + (i % 7) as u8);
         let (mx, sc) = (
             t(b.up(&codes), ex, n * k / 2, U8),

@@ -763,18 +763,14 @@ impl Shell {
     /// the plan reads one.
     #[must_use]
     pub fn readout_output(&self) -> Option<(String, u32)> {
-        (self.exports.iter())
-            .find(|out| out.decl.readout && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32))
-            .map(|out| (out.decl.name.clone(), out.decl.width))
+        float_readout(&self.exports).map(|out| (out.decl.name.clone(), out.decl.width))
     }
 
     /// The width of the float output read at the readout rows, when the plan
     /// reads one.
     #[must_use]
     pub fn readout_width(&self) -> Option<u32> {
-        (self.exports.iter())
-            .find(|out| out.decl.readout && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32))
-            .map(|out| out.decl.width)
+        float_readout(&self.exports).map(|out| out.decl.width)
     }
 
     /// The patch element the plan's image tower reads, if it has one.
@@ -1003,8 +999,93 @@ fn timing_epoch() -> &'static std::time::Instant {
     EPOCH.get_or_init(std::time::Instant::now)
 }
 
+/// The output a program's epilogue binds the model's logits under.
+const LOGITS: &str = "logits";
+
+/// The float output the engine fills at a plan's readout rows: the one named
+/// [`LOGITS`], which a program's epilogue reads. A model's draft heads read
+/// at the same rows (a Qwen3 forward states `mtp.logits` before its own
+/// `logits`), so neither the first nor the last float readout is the model's
+/// by position. A plan with no `logits` but one float readout reads that.
+fn float_readout(
+    exports: &[poem_exec::feeds::ClassOutput],
+) -> Option<&poem_exec::feeds::ClassOutput> {
+    let float = |out: &&poem_exec::feeds::ClassOutput| {
+        out.decl.readout && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32)
+    };
+    let mut floats = exports.iter().filter(float);
+    if let Some(out) = exports
+        .iter()
+        .filter(float)
+        .find(|out| out.decl.name == LOGITS)
+    {
+        return Some(out);
+    }
+    match (floats.next(), floats.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
+}
+
 /// The `timing` switch: log where each fire's host time goes.
 pub(crate) fn timing() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::switches::on("timing"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(name: &str, dtype: Dtype, readout: bool) -> poem_exec::feeds::ClassOutput {
+        poem_exec::feeds::ClassOutput {
+            decl: poem_ir::OutputDecl {
+                name: name.into(),
+                axis: poem_ir::InputAxis::Row,
+                width: 250,
+                dtype,
+                layers: 0,
+                readout,
+                tail: 0,
+            },
+            values: Vec::new(),
+            grid: None,
+            classes: poem_ir::ClassSet::default(),
+        }
+    }
+
+    /// A Qwen3 forward states its self-draft head before its logits
+    /// (`mtp.logits`, `mtp.drafts`, then `logits`), and the engine hands an
+    /// epilogue the rows of its readout under that readout's name: a program
+    /// reading `logits` binds only when the readout is `logits` (with
+    /// `mtp.logits` it was unbound). By name, not position: a float output
+    /// declared after `logits` does not take it either.
+    #[test]
+    fn the_readout_is_the_model_s_logits_not_a_draft_head_s() {
+        let name = |exports: &[poem_exec::feeds::ClassOutput]| {
+            float_readout(exports).map(|o| o.decl.name.clone())
+        };
+        // The new Qwen3 forward: its self-draft head first, then `logits`.
+        let qwen3 = [
+            output("mtp.logits", Dtype::F32, true),
+            output("mtp.drafts", Dtype::I32, true),
+            output(LOGITS, Dtype::F32, true),
+        ];
+        assert_eq!(name(&qwen3).as_deref(), Some(LOGITS));
+        // A float output declared after `logits` does not take it either.
+        let appended = [
+            output(LOGITS, Dtype::F32, true),
+            output("mtp.logits", Dtype::F32, true),
+        ];
+        assert_eq!(name(&appended).as_deref(), Some(LOGITS));
+        // A model without a draft head; one float readout of another name.
+        assert_eq!(name(&qwen3[2..]).as_deref(), Some(LOGITS));
+        assert_eq!(name(&appended[1..]).as_deref(), Some("mtp.logits"));
+        // Two float readouts, neither `logits`; no float readout at all.
+        assert_eq!(
+            name(&[output("a", Dtype::F32, true), output("b", Dtype::F32, true)]),
+            None
+        );
+        assert_eq!(name(&qwen3[1..2]), None);
+    }
 }

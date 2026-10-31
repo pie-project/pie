@@ -87,6 +87,8 @@ pub struct Spatial {
     /// the slot its next row writes, then each row's expected token and the
     /// argmax it already has (its K/V written on the lane's own pages).
     paged_ahead: std::collections::HashMap<u32, PagedAhead>,
+    /// The token loop's answer row, reused fire to fire.
+    one_hot: fire::OneHotRow,
     next_fire: u64,
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
@@ -125,6 +127,7 @@ impl Spatial {
             ahead_hits: 0,
             ahead_runs: 0,
             paged_ahead: std::collections::HashMap::new(),
+            one_hot: fire::OneHotRow::default(),
             next_fire: 0,
             next_frame: 0,
             sink: None,
