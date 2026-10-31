@@ -575,7 +575,7 @@ impl Engine for Spatial {
                 frame.steps.first().map(|s| s.attachments.len())
             );
         }
-        if self.asynchronous() {
+        if self.settling() {
             posted::post(&mut self.posted, id, &frame.steps);
             self.pump();
             // Readouts come on the lanes' channels: a step lands when its

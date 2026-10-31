@@ -202,7 +202,8 @@ pub struct CerebrasEngineOptions {
     pub spatial_guest: Option<String>,
     /// Whether the spatial engine settles frames asynchronously (the wafer
     /// running a token loop on while the host runs epilogues); omit for the
-    /// engine's default (on). Serve it with `[runtime] frame_dispatch_depth
+    /// engine's default (on for a one-lane build, off for a
+    /// pipelined or multi-lane one). Serve it with `[runtime] frame_dispatch_depth
     /// = 15`: the loop runs on only over the fires the guest has posted.
     pub spatial_async: Option<bool>,
     /// A Hugging Face directory the wafer program's weights are read from;
