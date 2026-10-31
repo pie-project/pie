@@ -1,0 +1,168 @@
+// ---------------------------------------------------------------- serve2d
+// (appended to qwen2d's pe.csl by serve2d/sync.py) The grid's place among the
+// layers and the layer-to-layer handoff of x. Grids sit GW across, GH down,
+// serpentine: even strips run west from the east end (layer 0 top-right, next
+// to the head), odd strips east. A grid's x leaves as it came in: row py holds
+// chunk py on every column.
+// - Within a strip: the edge column's row py sends its chunk across (R_out),
+//   multicast along row py of the next grid (R_in) at router speed.
+// - Between strips: the diagonal PE (j, j) sends chunk j down column j (CV);
+//   the next grid's (j, j) takes it and multicasts it along row j.
+// R alternates by layer parity, so a grid's input and output colors differ.
+// The handoffs borrow queue 2 (idle between steps: qwen2d's segment broadcast,
+// qwen2d_paged's page copy; S2D_Q2C, from sync.py): its input color is swapped
+// for the receive and back; an output swap is undone at the next step's start
+// (a token later: nothing is still queued). x moves whole: S2D_XN words (B
+// lanes of Hc for the paged grid, lane-major).
+const rt = @import_module("rt.csl");
+// The staircases to and from the head (paths.csl): every PE they cross sets
+// its routes.
+const paths = @import_module("paths.csl", .{ .GWD = PX, .GHT = PY, .GW = GW, .GH = GH, .NL = NL,
+                                             .XH = GW * PX, .F = F, .C = PY, .VMC = S2D_VMC,
+                                             .VMAT = S2D_VMAT });
+// The diagonal relay takes chunk j at (j, j): a grid at least as wide as tall.
+comptime { @comptime_assert(PX >= PY); }
+const C_R0: color = @get_color(11);
+const C_R1: color = @get_color(12);
+const C_CV: color = @get_color(13);
+
+var L: u16 = 0;
+// HEADMODE 0: layer 0's x from the host, the last layer's to the host; 1: the
+// stub head (x from the last layer straight back to layer 0; the host's x at
+// a launch's first step); 2: the head.
+var in_kind: u16 = 0;    // 0 none (the host), 1 from the west, 2 from the east, 3 diagonal (CV), 4 diagonal (E)
+var out_kind: u16 = 0;   // 0 none (the host), 1 east, 2 west, 3 south (CV), 4 the head (S)
+var oq_swapped: bool = false;
+
+fn r_color(l: u16) u16 { return if (l % 2 == 0) rt.cn(C_R0) else rt.cn(C_R1); }
+fn r_route(l: u16, rx: u16, tx: u16) void {
+  if (l % 2 == 0) { rt.route(C_R0, rx, tx); } else { rt.route(C_R1, rx, tx); }
+}
+
+fn s2d_place() void {
+  const gx = layout_mod.get_x_coord();
+  const gy = layout_mod.get_y_coord();
+  const sx = gx / PX;
+  const sy = gy / PY;
+  px = gx % PX;
+  py = gy % PY;
+  const k = if (sy % 2 == 0) GW - 1 - sx else sx;
+  L = sy * GW + k;
+  // S2D_DBG 1 (bisecting): layer 0 keeps the host's x even with the head.
+  in_kind = if (L == 0) (if (HEADMODE == 0 or S2D_DBG >= 1) 0 else 4) else if (k != 0) (if (sy % 2 == 0) 2 else 1) else 3;
+  out_kind = if (L == NL - 1) (if (HEADMODE == 0) 0 else 4) else if (k != GW - 1) (if (sy % 2 == 0) 2 else 1) else 3;
+}
+
+fn s2d_routes() void {
+  const w = px > 0;
+  const e = px < PX - 1;
+  const tw: u16 = if (w) rt.TX_W else 0;
+  const te: u16 = if (e) rt.TX_E else 0;
+  // Input multicast along this row.
+  if (in_kind == 1) {
+    r_route(L, rt.RX_W, rt.TX_R | te);
+  } else if (in_kind == 2) {
+    r_route(L, rt.RX_E, rt.TX_R | tw);
+  } else if (in_kind == 3 or in_kind == 4) {
+    if (px == py) { r_route(L, rt.RX_R, tw | te); }
+    else if (px < py) { r_route(L, rt.RX_E, rt.TX_R | tw); }
+    else { r_route(L, rt.RX_W, rt.TX_R | te); }
+    // CV down this column to the diagonal (E: paths.csl).
+    if (in_kind == 3) {
+      if (py < px) { rt.route(C_CV, rt.RX_N, rt.TX_S); }
+      else if (py == px) { rt.route(C_CV, rt.RX_N, rt.TX_R); }
+    }
+  }
+  // Output.
+  if (out_kind == 1 and px == PX - 1) { r_route(L + 1, rt.RX_R, rt.TX_E); }
+  if (out_kind == 2 and px == 0) { r_route(L + 1, rt.RX_R, rt.TX_W); }
+  if (out_kind == 3) {
+    if (py == px) { rt.route(C_CV, rt.RX_R, rt.TX_S); }
+    else if (py > px) { rt.route(C_CV, rt.RX_N, rt.TX_S); }
+  }
+  if (HEADMODE != 0) {
+    paths.routes(layout_mod.get_x_coord(), layout_mod.get_y_coord());
+  }
+}
+
+const s2d_x_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{S2D_XN} -> x[i] });
+
+fn recv_x(first: bool) void {
+  if (in_kind == 0) { return; }
+  // The stub head: a launch's first x is the host's.
+  if (in_kind == 4 and HEADMODE == 1 and first) { return; }
+  if ((in_kind == 3 or in_kind == 4) and px == py) {
+    if (in_kind == 3) { rt.iq_color(2, rt.cn(C_CV)); } else { rt.iq_color(2, rt.cn(paths.C_E)); }
+    @fmovs(s2d_x_dsd, fin(q_gb_in, S2D_XN));
+    rt.oq_color(2, r_color(L));
+    oq_swapped = true;
+    @fmovs(fout(q_gb_out, S2D_XN), s2d_x_dsd);
+  } else {
+    rt.iq_color(2, r_color(L));
+    @fmovs(s2d_x_dsd, fin(q_gb_in, S2D_XN));
+  }
+  rt.iq_color(2, rt.cn(S2D_Q2C));
+}
+
+fn send_x() void {
+  var send = false;
+  if (out_kind == 1 and px == PX - 1) { rt.oq_color(2, r_color(L + 1)); send = true; }
+  if (out_kind == 2 and px == 0) { rt.oq_color(2, r_color(L + 1)); send = true; }
+  if (out_kind == 3 and px == py) { rt.oq_color(2, rt.cn(C_CV)); send = true; }
+  if (out_kind == 4 and px == py) { rt.oq_color(2, rt.cn(paths.C_S)); send = true; }
+  if (send) {
+    oq_swapped = true;
+    @fmovs(fout(q_gb_out, S2D_XN), s2d_x_dsd);
+  }
+}
+
+fn restore_oq() void {
+  if (oq_swapped) {
+    rt.oq_color(2, rt.cn(S2D_Q2C));
+    oq_swapped = false;
+  }
+}
+
+// The last step's cycles at this PE (its own TSC; PEs' TSCs are not
+// synchronized, so durations only): 0 waiting for x, 1 x in -> x out (the
+// layer and the send), 2 the layer alone.
+var stamps = @zeros([4]u32);
+var stamps_ptr: [*]u32 = &stamps;
+var ts0 = @zeros([timestamp.tsc_size_words]u16);
+var ts1 = @zeros([timestamp.tsc_size_words]u16);
+var ts2 = @zeros([timestamp.tsc_size_words]u16);
+var ts3 = @zeros([timestamp.tsc_size_words]u16);
+fn span32(a: *[timestamp.tsc_size_words]u16, b: *[timestamp.tsc_size_words]u16) u32 {
+  return @as(u32, (tsc(b) - tsc(a)) & 0xffffffff);
+}
+
+// `steps` tokens from position `start_pos`, each through this grid once: x in
+// from the layer before (layer 0: the host's), the layer, x out.
+fn compute(steps: u32, start_pos: u32) void {
+  timestamp.enable_tsc();
+  var i: u32 = 0;
+  while (i < steps) : (i += 1) {
+    s2d_pass_start(i, start_pos);   // positions and RoPE (the grid's own; sync.py)
+    timestamp.get_timestamp(&ts0);
+    recv_x(i == 0);
+    timestamp.get_timestamp(&ts1);
+    // The relay's send (above) or the last step's send is long out by now:
+    // queue 2's output goes back to the segment broadcast.
+    restore_oq();
+    timing = i > 0;
+    timestamp.get_timestamp(&t_mark);
+    layer();
+    timestamp.get_timestamp(&ts2);
+    send_x();
+    timestamp.get_timestamp(&ts3);
+    stamps[0] = span32(&ts0, &ts1);
+    stamps[1] = span32(&ts1, &ts3);
+    stamps[2] = span32(&ts1, &ts2);
+    stamps[3] = i + 1;
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @export_symbol(stamps_ptr, "stamps");
+}

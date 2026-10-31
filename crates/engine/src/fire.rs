@@ -230,6 +230,11 @@ pub struct Lane {
     /// an engine that taps ([`crate::Engine::tap_groups`]).
     #[serde(default)]
     pub tap: Option<Tap>,
+    /// Where this lane's fire sits in its pipeline, for an engine that runs
+    /// ahead of the fires it is given (a device token loop):
+    /// [`crate::ahead::Ahead::fires_left`]. In process only.
+    #[serde(skip)]
+    pub ahead: Option<crate::ahead::Ahead>,
 }
 
 /// Pool pages `pages[i]` read into host kv slots `slots[i]` as the fire

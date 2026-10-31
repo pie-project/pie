@@ -93,16 +93,6 @@ impl Inputs {
         if pack.is_empty() {
             pack.push(0);
         }
-        // `PIE_CEREBRAS_DUMP_PACK=<prefix>`: the pack (`<prefix>.i32`) and
-        // each input array (`<prefix>.in<n>`) of the latest fire.
-        if let Some(pre) = std::env::var_os("PIE_CEREBRAS_DUMP_PACK") {
-            let pre = pre.to_string_lossy().to_string();
-            let bytes: Vec<u8> = pack.iter().flat_map(|x| x.to_le_bytes()).collect();
-            let _ = std::fs::write(format!("{pre}.i32"), &bytes);
-            for (i, a) in self.arrays.iter().enumerate() {
-                let _ = std::fs::write(format!("{pre}.in{i}"), &a.bytes);
-            }
-        }
         device.upload_words(Dtype::I32, pack.iter().map(|x| *x as u32).collect())
     }
 

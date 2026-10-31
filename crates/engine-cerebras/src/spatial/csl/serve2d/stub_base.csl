@@ -1,0 +1,57 @@
+// serve2d's stub head (HEADMODE 1): the head's strip with no LM head, for
+// checking the token loop through every layer. A feeder-row PE (column j of
+// the strip) takes chunk j from the last layer (S) and sends it straight back
+// to layer 0 (E), every step but a launch's last (its x stays with the last
+// grid for the host); the other PEs only route the staircases. The strip is
+// PY wide (one column a chunk).
+param memcpy_params;
+param PX: u16;         // a grid's width
+param PY: u16;         // a grid's height (x's chunks)
+param Hc: u16;
+param GW: u16;
+param GH: u16;
+param F: u16;
+param WS: type;        // the grids' weight and KV element types (their exports)
+param KS: type;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_mod = @import_module("<layout>");
+const rt = @import_module("rt.csl");
+const paths = @import_module("paths.csl", .{ .GWD = PX, .GHT = PY, .GW = GW, .GH = GH, .NL = GW * GH,
+                                             .XH = GW * PX, .F = F, .C = PY, .VMC = 0, .VMAT = 0 });
+
+const q_in = @get_input_queue(2);
+const q_out = @get_output_queue(2);
+
+var xb = @zeros([Hc]f32);
+const xb_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> xb[i] });
+var feeder: bool = false;
+
+
+fn init() void {
+  const gx = layout_mod.get_x_coord();
+  const gy = layout_mod.get_y_coord();
+  feeder = gy == F;
+  paths.routes(gx, gy);
+  sys_mod.unblock_cmd_stream();
+}
+
+fn compute(steps: u32, start_pos: u32) void {
+  if (feeder) {
+    var i: u32 = 0;
+    while (i < steps) : (i += 1) {
+      @fmovs(xb_dsd, @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q_in }), Hc));
+      if (i + 1 < steps) {
+        @fmovs(@set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q_out }), Hc), xb_dsd);
+      }
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @initialize_queue(q_in, .{ .color = paths.C_S });
+  @initialize_queue(q_out, .{ .color = paths.C_E });
+  @export_symbol(init);
+  @export_symbol(compute);
+}

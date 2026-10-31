@@ -654,26 +654,11 @@ fn pivot_only(rows: u32, vocab: u32, which: u8) -> (TraceContainer, Vec<u32>) {
 }
 
 fn the_pivot_agrees(device: &Device, stages: &mut Stages, rows: u32, vocab: u32, which: u8) {
-    let swapped = std::env::var_os("PIE_GUEST_SWAP").is_some();
     let (container, outs) = pivot_only(rows, vocab, which);
     let plan = plan_of(container, vocab);
     let seeds = vec![
-        (
-            0,
-            Value::I32(if swapped {
-                vec![20, 1, 0, 5000]
-            } else {
-                vec![1, 20, 0, 5000]
-            }),
-        ),
-        (
-            1,
-            Value::F32(if swapped {
-                vec![0.95, 0.5, 1.0, 0.0]
-            } else {
-                vec![0.5, 0.95, 1.0, 0.0]
-            }),
-        ),
+        (0, Value::I32(vec![1, 20, 0, 5000])),
+        (1, Value::F32(vec![0.5, 0.95, 1.0, 0.0])),
     ];
     let plane = logits_plane(rows, vocab, 11);
     let want = host(&plan, &seeds, &plane, rows, &outs);
@@ -1126,96 +1111,43 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     let device = &device;
     let mut stages = Stages::default();
 
-    // `PIE_GUEST_CASES` picks a subset: `narrow` (one PE per lane), `wide`
-    // (a lane over a row of PEs), or a program's name.
-    let pick = std::env::var("PIE_GUEST_CASES").unwrap_or_default();
-    let want = |case: &str, group: &str| pick.is_empty() || pick == group || pick == case;
     // One PE per lane.
-    if want("statistics", "narrow") {
-        the_statistics_agree(device, &mut stages, VOCAB);
-    }
-    if want("acceptance", "narrow") {
-        the_acceptance_rule_agrees(device, &mut stages);
-    }
-    if want("corners", "narrow") {
-        the_corners_agree(device, &mut stages);
-    }
-    if want("sampler", "narrow") {
-        the_sampler_agrees(device, &mut stages, 64);
-    }
-    if want("rowwise", "narrow") {
-        the_rowwise_sampler_agrees(device, &mut stages, VOCAB);
-    }
+    the_statistics_agree(device, &mut stages, VOCAB);
+    the_acceptance_rule_agrees(device, &mut stages);
+    the_corners_agree(device, &mut stages);
+    the_sampler_agrees(device, &mut stages, 64);
+    the_rowwise_sampler_agrees(device, &mut stages, VOCAB);
     // A lane over a row of PEs: a vocabulary no PE holds alone.
     let wide = 4096;
     let (container, _) = statistics(wide);
     let plan = plan_of(container, wide);
     let cols = engine_cerebras::guest::run::columns_of(&plan.package).expect("fits");
     assert!(cols > 1, "a {wide}-wide lane spreads over PEs ({cols})");
-    eprintln!("a {wide}-wide statistics lane spreads over {cols} PEs");
-    let t0 = std::time::Instant::now();
-    if want("wide-statistics", "wide") {
-        the_statistics_agree(device, &mut stages, wide);
-        eprintln!("wide statistics: {:.0}s", t0.elapsed().as_secs_f64());
-    }
-    let t1 = std::time::Instant::now();
-    if want("wide-sampler", "wide") {
-        the_sampler_agrees(device, &mut stages, wide);
-        eprintln!("wide sampler: {:.0}s", t1.elapsed().as_secs_f64());
-    }
-    let t2 = std::time::Instant::now();
-    if want("wide-rowwise", "wide") {
-        the_rowwise_sampler_agrees(device, &mut stages, wide);
-        eprintln!("wide rowwise: {:.0}s", t2.elapsed().as_secs_f64());
-    }
+    the_statistics_agree(device, &mut stages, wide);
+    the_sampler_agrees(device, &mut stages, wide);
+    the_rowwise_sampler_agrees(device, &mut stages, wide);
     // Ragged spreads: an axis the PEs do not divide, so the last PEs hold
     // a partial block or none (4100 over 32 PEs: blocks of 160, PE 25 holds
     // 100, PEs 26..31 none; 100 over 2 PEs: blocks of 64, PE 1 holds 36).
-    if want("ragged-statistics", "ragged") {
-        spread_over(32);
-        let t = std::time::Instant::now();
-        the_statistics_agree(device, &mut stages, 4100);
-        eprintln!("ragged statistics: {:.0}s", t.elapsed().as_secs_f64());
+    spread_over(32);
+    the_statistics_agree(device, &mut stages, 4100);
+    spread_over(2);
+    the_sampler_agrees(device, &mut stages, 100);
+    the_rowwise_sampler_agrees(device, &mut stages, 100);
+    // Each pivot predicate alone over ragged rows (rank, mass, floor).
+    for which in 0..3 {
+        the_pivot_agrees(device, &mut stages, 4, 100, which);
     }
-    if want("ragged-sampler", "ragged") {
-        spread_over(2);
-        the_sampler_agrees(device, &mut stages, 100);
-    }
-    if want("ragged-rowwise", "ragged") {
-        spread_over(2);
-        the_rowwise_sampler_agrees(device, &mut stages, 100);
-    }
-    // One pivot at a time over ragged rows (`ragged-rank`, `ragged-mass`,
-    // `ragged-floor`), for pinning a disagreement down.
-    for (name, which) in [
-        ("ragged-rank", 0u8),
-        ("ragged-mass", 1),
-        ("ragged-floor", 2),
-    ] {
-        if want(name, "pivots") {
-            spread_over(2);
-            the_pivot_agrees(device, &mut stages, 4, 100, which);
-            eprintln!("{name}: agrees");
-        }
-    }
-    // The same over an axis the PEs divide (128 over 2), for telling a
+    // The same over an axis the PEs divide (128 over 2), which tells a
     // ragged fault from a many-rows one.
-    for (name, which) in [("even-rank", 0u8), ("even-mass", 1)] {
-        if want(name, "even") {
-            spread_over(2);
-            the_pivot_agrees(device, &mut stages, 4, 128, which);
-            eprintln!("{name}: agrees");
-        }
+    for which in 0..2 {
+        the_pivot_agrees(device, &mut stages, 4, 128, which);
     }
     // The sampler at Qwen's vocabulary, on the simulator (hours), at the
     // spread of its own (the pivot cases above forced two PEs; forced over
     // two, a 151936-wide lane is 925k words a PE and the stages refuse).
     spread_over(0);
-    if want("qwen-run", "qwen") {
-        let t = std::time::Instant::now();
-        the_sampler_agrees(device, &mut stages, 151_936);
-        eprintln!("qwen sampler: {:.0}s", t.elapsed().as_secs_f64());
-    }
+    the_sampler_agrees(device, &mut stages, 151_936);
     spread_over(0);
     eprintln!("ran {} stage(s) on the simulator", stages.runs);
 }
@@ -1304,12 +1236,7 @@ fn the_corners_agree(device: &Device, stages: &mut Stages) {
 fn the_sampler_agrees(device: &Device, stages: &mut Stages, vocab: u32) {
     let (container, outs, _) = sampler(vocab);
     let plan = plan_of(container, vocab);
-    // One pass at a real vocabulary (`PIE_GUEST_SEEDS=1`), three otherwise.
-    let seeds: Vec<u64> = match std::env::var("PIE_GUEST_SEEDS").ok().as_deref() {
-        Some("1") => vec![3],
-        _ => vec![3, 4, 5],
-    };
-    for seed in seeds {
+    for seed in [3, 4, 5] {
         let seeds = sampler_seeds(vocab, seed);
         let plane = logits_plane(1, vocab, seed);
         let want = host(&plan, &seeds, &plane, 1, &outs);

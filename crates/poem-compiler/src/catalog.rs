@@ -625,8 +625,11 @@ impl std::error::Error for Unmatched {}
 pub const REPOSITORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../models");
 
 static REPOSITORY_CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
-    Catalog::from_dir(Path::new(REPOSITORY))
-        .unwrap_or_else(|why| panic!("the repository's packages under {REPOSITORY}: {why}"))
+    // `PIE_MODELS_DIR` names a copy of `models/` for a binary run away from
+    // the tree it was built in (a remote worker).
+    let dir = std::env::var("PIE_MODELS_DIR").unwrap_or_else(|_| REPOSITORY.to_string());
+    Catalog::from_dir(Path::new(&dir))
+        .unwrap_or_else(|why| panic!("the repository's packages under {dir}: {why}"))
 });
 
 /// The repository's `models/`, read from disk: what the tests serve.

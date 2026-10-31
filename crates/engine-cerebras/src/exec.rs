@@ -57,11 +57,6 @@ pub fn run_program(
     bind_and_run(device, &program.sig, program, weights, pools, inputs, wait)
 }
 
-/// A maintenance program: pools only, nothing out.
-pub fn maintain(device: &Device, tracer: Tracer<'_>, pools: &mut Pools) -> Result<()> {
-    run(device, tracer, None, pools, &Inputs::new(), true).map(|_| ())
-}
-
 fn bind_and_run(
     device: &Device,
     sig: &Signature,

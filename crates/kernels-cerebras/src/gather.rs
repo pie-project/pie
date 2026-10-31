@@ -33,7 +33,7 @@ fn embed_pes(ctx: &Ctx<'_>, table: Tensor, beside: u64) -> Option<u32> {
 /// The rows of a row-wise copy over PEs: `rg` row groups when every buffer
 /// has `rows` rows and a group's words fit a PE, else one PE when the
 /// whole fits, else `None` (the host copies).
-fn copy_split(
+pub(crate) fn copy_split(
     ctx: &Ctx<'_>,
     op: &'static str,
     rows: u32,

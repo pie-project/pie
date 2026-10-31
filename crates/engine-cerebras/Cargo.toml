@@ -16,6 +16,7 @@ dtype = { package = "pie-dtype", path = "../dtype" }
 kernels-cerebras = { path = "../kernels-cerebras" }
 libloading = "0.9"
 libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 toml = "1.1"
@@ -31,6 +32,7 @@ tracing = "0.1"
 blake3 = "1"
 
 [dev-dependencies]
+sha2 = "0.10"
 poem = { package = "pie-poem", path = "../poem" }
 ztensor-compat = { workspace = true }
 ztensor = { workspace = true }

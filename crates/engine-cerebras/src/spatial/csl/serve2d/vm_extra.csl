@@ -1,0 +1,51 @@
+// ---------------------------------------------------------------- serve2d
+// (replaces guest4h3/vm.csl's compute; serve2d/sync.py) The VM column in
+// serve2d's head: the staircases to and from the head cross it (pass-through
+// routes, paths.csl, as every PE they cross).
+const s2d_paths = @import_module("paths.csl", .{ .GWD = GPX, .GHT = GPY, .GW = GW, .GH = GH, .NL = GW * GH,
+                                                 .XH = GW * GPX, .F = F, .C = C, .VMC = 1, .VMAT = R2X + 1 });
+fn s2d_vm_paths() void {
+  s2d_paths.vm_routes(layout_mod.get_y_coord());
+}
+
+// This VM column's slice of the root's row (Vt words; the other columns'
+// slices pass and are dropped), then 1/rms.
+fn s2d_take_row() void {
+  var jj: u16 = 0;
+  while (jj < NVC) : (jj += 1) {
+    if (jj == VJ) { @fmovs(vin_dsd, fab_in(q2_in, Vt)); } else { @fmovs(tmp0, fab_in(q2_in, Vt)); }
+  }
+  @fmovs(@set_dsd_length(@increment_dsd_offset(vin_dsd, @as(i16, Vt), f32), 1), fab_in(q2_in, 1));
+}
+
+// serve2d's `compute(steps, start_pos)`: the head runs steps + 1 iterations;
+// iteration 0 is the bootstrap (x = 0; the forced first token wins), so the
+// VM only takes its row and answers token 0, without running the program: its
+// steps (RNG, out ring) are the real samples, after layer steps 0..steps-1.
+// With gmode 1, per iteration i >= 1: the row in (this column's slice·1/rms
+// into W0), the main section, the token to the final root (block BM's VM
+// column 0 hub), the next step's pre section.
+fn compute(steps: u32, start_pos: u32) void {
+  if (gmode[0] == 1) {
+    run_section(0);
+    var i: u32 = 0;
+    while (i <= steps) : (i += 1) {
+      if (!hub) { s2d_take_row(); }
+      if (i == 0) {
+        if (hub and vblk == BM and VJ == 0) {
+          tokv[0] = 0.0;
+          @fmovs(fab_out(q2_out, 1), tokv_dsd);
+        }
+        continue;
+      }
+      if (!hub) { @fmuls(wide0, vin_dsd, vin[Vt]); }
+      run_section(1);
+      if (hub and vblk == BM and VJ == 0) {
+        tokv[0] = @as(f32, @bitcast(i32, pool[@as(u16, tok_home[0])]));
+        @fmovs(fab_out(q2_out, 1), tokv_dsd);
+      }
+      run_section(0);
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}

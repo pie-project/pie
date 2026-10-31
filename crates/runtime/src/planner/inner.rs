@@ -31,6 +31,9 @@ pub(super) struct Inner {
     pub(super) prepare_blocked: HashSet<ProcessId>,
     pub(super) killing: HashSet<ProcessId>,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
+    /// Working sets of processes that have left and still hold pages: they
+    /// come back when each is released (its last fire done), which pokes.
+    pub(super) releasing: HashSet<crate::store::kv::page_table::WorkingSetId>,
 }
 
 impl Inner {

@@ -299,29 +299,6 @@ impl Dit {
         &self.feeds
     }
 
-    pub(crate) fn dry_inputs(&self, class: usize) -> Vec<Seat> {
-        self.feeds
-            .inputs
-            .iter()
-            .filter(|(seat, readers)| !seat.voxel() && readers.contains(class))
-            .map(|(seat, _)| *seat)
-            .collect()
-    }
-
-    pub(crate) fn dry_voxel(&self) -> Option<(Vec<u32>, Dtype, Option<[u32; 3]>)> {
-        self.voxel
-            .as_ref()
-            .map(|seat| (seat.widths.clone(), seat.dtype, seat.token_patch))
-    }
-
-    pub(crate) fn dry_voxel_width(&self, class: usize) -> Option<u32> {
-        self.feeds
-            .inputs
-            .iter()
-            .find(|(seat, readers)| seat.voxel() && readers.contains(class))
-            .map(|(seat, _)| seat.width)
-    }
-
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.feeds.inputs.is_empty()

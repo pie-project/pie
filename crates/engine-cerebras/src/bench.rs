@@ -54,7 +54,7 @@ pub struct Bench {
     pub last: Option<Rendered>,
     /// The last program's phases as rendered for the fabric (what ran).
     pub phases: Vec<Rendered>,
-    /// Where the last program was compiled, kept when `PIE_CEREBRAS_KEEP` is set.
+    /// Where the last program was compiled, kept when the `keep` switch is set.
     pub last_dir: Option<PathBuf>,
 }
 
@@ -202,7 +202,7 @@ impl Bench {
             }
         }
 
-        if std::env::var_os("PIE_CEREBRAS_KEEP").is_some() {
+        if crate::switches::get("keep").is_some() {
             let kept = dir.keep();
             eprintln!("kept {}", kept.display());
             self.last_dir = Some(kept);

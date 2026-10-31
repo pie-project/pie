@@ -2,7 +2,7 @@
 //! preparation, and the delta rule recurrence, on one PE.
 //!
 //! Reference: kernels-xla `ssm` and the host references in
-//! `engine-xla/tests/kernels_ssm.rs`. Conv state holds `hist = (w-1)·dil+1`
+//! engine-cerebras's `tests/engine_cerebras/kernels_ssm.rs`. Conv state holds `hist = (w-1)·dil+1`
 //! rows per slot, oldest first; delta state holds `[hv, dv, dk]` per slot;
 //! both banks are f32. Slot `i32::MAX` (or any slot outside the bank) means
 //! the write does not land.

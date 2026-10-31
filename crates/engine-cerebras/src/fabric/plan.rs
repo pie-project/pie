@@ -13,8 +13,8 @@ use kernels_cerebras::plan::{
 
 use super::Fabric;
 
-/// The most words one array holds: a word address of 16 bits (the probe's
-/// 8448-word array fails a 14-bit-plus-shift relocation).
+/// The most words one array holds: a word address of 16 bits (an 8448-word
+/// array fails to link: its relocation is 14 bits plus a shift).
 pub const ARRAY_WORDS: u64 = 8192;
 
 /// The planner over a set of terms.

@@ -9,8 +9,8 @@
 //! and runs them.
 //!
 //! Entries follow the kernels-slang surface (module path, name, arguments) and
-//! the numerics rules of `.wiki/xla/kernels.md`: compute in f32, round at the
-//! write, refuse rather than approximate.
+//! the backends' shared numerics rules: compute in f32, round at the write,
+//! refuse rather than approximate.
 
 pub mod attn;
 pub mod conv;

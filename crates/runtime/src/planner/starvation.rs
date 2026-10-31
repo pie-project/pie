@@ -80,6 +80,12 @@ impl ResidencyPlanner {
         if !self.is_wedged() {
             return;
         }
+        // A process that has left still has pages on their way back (its
+        // working sets drop once its last fire is done, and their release
+        // pokes the planner): the pool is waiting, not wedged.
+        if self.with_inner(|inner| !inner.releasing.is_empty()) {
+            return;
+        }
         // Idle cache on its way to the host is neither dropped nor swept
         // while it moves, and frees its device pages when it lands (which
         // pokes the planner): the pool is not starved, it is waiting.

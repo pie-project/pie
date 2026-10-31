@@ -568,7 +568,7 @@ impl TensorSink for Landing<'_> {
     }
 }
 
-/// Weights for a dry shell (`crate::dry`): the handle table a landing would
+/// Weights for a dry shell (`Shell::load_dry`): the handle table a landing would
 /// mint, and no buffers.
 impl Weights {
     pub(crate) fn dry(handles: &Handles, trace: &Trace, _prescale: bool) -> Result<Weights> {

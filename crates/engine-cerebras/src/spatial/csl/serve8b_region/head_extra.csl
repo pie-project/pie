@@ -1,0 +1,145 @@
+// ---------------------------------------------------------------- serve8b
+// (appended to head2d_v10's pe.csl by serve8b/sync.py) The head in the 8B
+// model: one block of C = GPY / 2 chunk columns (+ the VM column), Hc = 2 GHc
+// hidden dims a column: grid chunks 2k and 2k + 1 land in head column k.
+// - Its feeder row takes the last layer's x by the S staircase: chunk 2k on
+//   C_S0 into queue 3, chunk 2k + 1 on C_S1 into queue 4 (the cross-block
+//   queues, unused with one block), SB lanes each [SB][GHc] lane-major;
+//   lane b's feeder input is [chunk 2k | chunk 2k + 1] of lane b.
+// - The final root decides each step's token: a forced (prompt) token wins,
+//   else the argmax; it records the argmax in `out_tokens`. The winner index
+//   it multicasts on c_ib now runs on east past the head's last column into
+//   the embedding strip (embed_pe.csl), which sends the token's embedding to
+//   layer 0 (untied: model.embed_tokens there, lm_head.weight here). The head
+//   sends no embedding chunk itself (head2d's emb_copy still fills `emb` from
+//   its lm_head tile; unused).
+// - `compute(steps, start_pos)`: steps + 1 iterations of SB lanes. Iteration
+//   0 runs on x = 0 and takes the forced first token (it only starts the
+//   loop); iteration i >= 1 takes layer step i - 1's output. The strip sends
+//   iterations 0 .. steps - 1's tokens on.
+const s2d_rt = @import_module("rt.csl");
+const s2d_paths = @import_module("paths.csl", .{ .GWD = GPX, .GHT = GPY, .XL = XL, .YL = YL, .XH = XH0,
+                                                 .F = F, .C = C, .VMC = VMC, .VMAT = R2X + 1,
+                                                 .XE = XH0 + C + VMC, .EC = GPY / 4,
+                                                 .XV = if (S2D_VMX == 1) XH0 + C + VMC + GPY / 4 else 0,
+                                                 .RCX = XH0 + R2X });
+comptime {
+  @comptime_assert(NB == 1);           // one block: the feeder's queues 3/4, a feeder column a chunk pair
+  @comptime_assert(2 * C == GPY);      // grid chunks 2k, 2k + 1 in head column k
+  @comptime_assert(Hc == 2 * GHc);
+  // One winner multicast a lane step (the strip counts them): no certificate.
+  @comptime_assert(MODE == 0 or MODE == 2);
+}
+
+const SAMPLE: u32 = 0xffffffff;
+var in_tokens = @zeros([SB * CAP]u32);       // the final root's: forced tokens [lane][i] (SAMPLE: the argmax)
+var in_tokens_ptr: [*]u32 = &in_tokens;
+var out_tokens = @zeros([SB * CAP]u32);      // the final root's: iteration i's argmax at [lane][i - 1]
+var out_tokens_ptr: [*]u32 = &out_tokens;
+var s2d_lane: u16 = 0;
+// The final RMSNorm's 1/rms per lane (the same on every root PE), for reading
+// logits: y * yscale.
+var s2d_yscale = @zeros([SB]f32);
+var s2d_yscale_ptr: [*]f32 = &s2d_yscale;
+// A root PE's logits rows (its Vr vocab rows), before 1/rms: lanes 0..HLB-1.
+var s2d_hl = @zeros([HLB * Vr]f32);
+var s2d_hl_ptr: [*]f32 = &s2d_hl;
+const s2d_hl_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Vr} -> s2d_hl[i] });
+var s2d_iter: u32 = 0;
+var s2d_steps: u32 = 0;
+// The feeder's lanes from S: chunk 2k [SB][GHc], chunk 2k + 1 [SB][GHc].
+var s2d_xa = @zeros([SB * GHc]f32);
+var s2d_xb = @zeros([SB * GHc]f32);
+const s2d_xa_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SB * GHc} -> s2d_xa[i] });
+const s2d_xb_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SB * GHc} -> s2d_xb[i] });
+const s2d_xa1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GHc} -> s2d_xa[i] });
+const s2d_xb1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GHc} -> s2d_xb[i] });
+const s2d_xin_lo = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GHc} -> xin[i] });
+const s2d_xin_hi = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GHc} -> xin[i + @as(i16, GHc)] });
+
+fn s2d_head_init() void {
+  s2d_paths.routes(px + XH0, py);
+  if (vm) { return; }
+  if (py == F) {
+    s2d_rt.iq_color(3, s2d_rt.cn(s2d_paths.C_S0));
+    s2d_rt.iq_color(4, s2d_rt.cn(s2d_paths.C_S1));
+  }
+}
+
+// (serve2d's region hook: nothing to undo here.)
+fn s2d_after_x() void {}
+
+// The feeder's x: zeros at the bootstrap iteration, else the last layer's
+// chunk pair from S (every lane at the first lane's step).
+fn s2d_feeder_in() void {
+  if (s2d_iter == 0) {
+    @fmovs(xin_dsd, 0.0);
+    return;
+  }
+  if (s2d_lane == 0) {
+    @fmovs(s2d_xa_dsd, fin(q_r1_0_in, SB * GHc));
+    @fmovs(s2d_xb_dsd, fin(q_r1_1_in, SB * GHc));
+  }
+  @fmovs(s2d_xin_lo, @increment_dsd_offset(s2d_xa1_dsd, @as(i16, s2d_lane) * @as(i16, GHc), f32));
+  @fmovs(s2d_xin_hi, @increment_dsd_offset(s2d_xb1_dsd, @as(i16, s2d_lane) * @as(i16, GHc), f32));
+}
+
+// The external VM's ctl word a lane step (VM5.md): bit lane * CAP + iteration
+// of `vmctl` (host-written on the root column each fire); 1.0 asks the VM to
+// skip the turn and answer token 0.
+var s2d_vmctl = @zeros([(SB * CAP + 31) / 32]u32);
+var s2d_vmctl_ptr: [*]u32 = &s2d_vmctl;
+fn s2d_ctl() f32 {
+  const k = @as(u32, s2d_lane) * @as(u32, CAP) + s2d_iter;
+  if (s2d_iter >= CAP) { return 0.0; }
+  return if (((s2d_vmctl[k / 32] >> @as(u16, k % 32)) & 1) == 1) 1.0 else 0.0;
+}
+
+// The final root: this iteration's token from the argmax `v`.
+fn s2d_decide(v: f32) f32 {
+  const i = s2d_iter;
+  const row = @as(u32, s2d_lane) * @as(u32, CAP);
+  if (v >= 0.0 and i >= 1 and i <= CAP) { out_tokens[row + i - 1] = @as(u32, v); }
+  if (i < CAP and in_tokens[row + i] != SAMPLE) { return @as(f32, in_tokens[row + i]); }
+  return v;
+}
+
+// After the winner: the root column keeps this lane's 1/rms and logits row.
+fn s2d_emb_out() void {
+  if (root_col) {
+    s2d_yscale[s2d_lane] = yscale;
+    if (s2d_lane < HLB) {
+      @fmovs(@increment_dsd_offset(s2d_hl_dsd, @as(i16, s2d_lane * Vr), f32), y_dsd);
+    }
+  }
+}
+
+// `steps` model steps (the grids' count): steps + 1 head iterations, see
+// above. start_pos is the grids' (the head keeps none).
+fn compute(steps: u32, start_pos: u32) void {
+  timestamp.enable_tsc();
+  s2d_steps = steps;
+  var i: u32 = 0;
+  while (i <= steps) : (i += 1) {
+    s2d_iter = i;
+    var b: u16 = 0;
+    while (b < SB) : (b += 1) {
+      s2d_lane = b;
+      timing = i > 1;
+      timestamp.get_timestamp(&t_mark);
+      if (vm) { step_vm(); } else if (py == F) { step_feeder(); } else { step_region(); }
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+
+fn copy_kv(src: u32, dst: u32, phase: u32) void { sys_mod.unblock_cmd_stream(); }
+
+comptime {
+  @export_symbol(in_tokens_ptr, "in_tokens");
+  @export_symbol(out_tokens_ptr, "out_tokens");
+  @export_symbol(s2d_yscale_ptr, "yscale");
+  @export_symbol(s2d_hl_ptr, "hlogits");
+  @export_symbol(s2d_vmctl_ptr, "vmctl");
+  if (KVCP == 1) { @export_symbol(copy_kv); }
+}

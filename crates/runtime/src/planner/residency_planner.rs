@@ -450,6 +450,7 @@ impl ResidencyPlanner {
     }
 
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
+        self.note_releasing(pid);
         // A seat taken again after the process ended goes back.
         crate::inferlet::process::vacate_seat(pid);
         let (signal, removed) = self.with_inner(|inner| {
@@ -491,6 +492,33 @@ impl ResidencyPlanner {
         drop(removed);
         self.re_arm_idle_reclaim();
         self.poke();
+    }
+
+    /// The working sets `pid` leaves holding pages: its residency still
+    /// names them here, and they drop after it is gone. Under the kv lock a
+    /// release cannot slip between the count and the note: one done before
+    /// holds nothing, one after finds its note to clear.
+    fn note_releasing(&self, pid: ProcessId) {
+        let (model, engine) = self.port.locus();
+        let sets = crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine);
+        if sets.is_empty() {
+            return;
+        }
+        let Some(stores) = crate::store::registry::try_get(model, engine) else {
+            return;
+        };
+        crate::store::registry::with_kv_lock(&stores.kv, "planner-departure", |kv| {
+            let holding: Vec<_> = sets
+                .into_iter()
+                .filter(|&ws| kv.held_page_count(&HashSet::from([ws])).unwrap_or(0) > 0)
+                .collect();
+            self.with_inner(|inner| inner.releasing.extend(holding));
+        });
+    }
+
+    /// `ws` released (a departed process's pages back, or anyone's).
+    pub fn working_set_released(&self, ws: crate::store::kv::page_table::WorkingSetId) {
+        self.with_inner(|inner| inner.releasing.remove(&ws));
     }
 
     pub fn pages_freed(self: &Arc<Self>) {

@@ -8,7 +8,7 @@
 
 use kernels_cerebras::{Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor};
 use poem_exec::fire::At;
-use poem_ir::{Def, Dim, Dtype, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
+use poem_ir::{Def, Dim, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
 use crate::store::{CachePool, CacheTable};
 use crate::trace::Handles;
@@ -125,7 +125,6 @@ pub enum StructSlot {
     Prefill(PrefillPlan),
 }
 
-#[allow(dead_code)]
 pub struct Run<'c> {
     ctx: &'c Ctx<'c>,
 
@@ -149,8 +148,6 @@ pub struct Run<'c> {
 
     place: &'c At,
 
-    compressor: Vec<(u32, [Tensor; 2])>,
-
     rs: Option<std::rc::Rc<crate::rs::Seat>>,
 
     /// Values whose planes a debugging reader asked for, and what the walk
@@ -163,7 +160,6 @@ pub struct Run<'c> {
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
 }
 
-#[allow(dead_code)]
 impl<'c> Run<'c> {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -190,7 +186,6 @@ impl<'c> Run<'c> {
             fire,
             windows,
             place,
-            compressor: Vec::new(),
             rs: None,
             probes: Vec::new(),
             probed: std::cell::RefCell::new(Vec::new()),
@@ -238,13 +233,6 @@ impl<'c> Run<'c> {
 
     pub(crate) fn rs_seat(&self) -> Option<std::rc::Rc<crate::rs::Seat>> {
         self.rs.clone()
-    }
-
-    /// Hands the walk the compressor planes of each space that has them.
-    #[must_use]
-    pub fn with_compressor(mut self, compressor: Vec<(u32, [Tensor; 2])>) -> Self {
-        self.compressor = compressor;
-        self
     }
 
     pub(crate) fn window(&self) -> &'c Window {
@@ -304,29 +292,6 @@ impl<'c> Run<'c> {
 
     pub(crate) fn bindings(&self) -> &FireBindings {
         &self.fire
-    }
-
-    /// This replica's rank in the tensor-parallel group. kernels-cerebras compiles
-    /// for one replica (`collective`'s world of one), so it is 0 until the
-    /// engine runs SPMD with `num_replicas > 1`.
-    pub(crate) fn rank(&self) -> u32 {
-        0
-    }
-
-    /// The fire's clip slot table (one i32 slot per voxel lane).
-    pub(crate) fn clip_slots(&self) -> Option<Tensor> {
-        self.fire.clip_slots
-    }
-
-    /// A fresh per-fire array of `rows × width` `dtype`, zeros until
-    /// written: the scratch a GPU dispatch would carve from its arena.
-    pub(crate) fn temp(&self, rows: u32, width: u32, dtype: Dtype) -> Tensor {
-        self.handles.root(crate::trace::Root {
-            source: crate::trace::Source::Temp,
-            dtype,
-            rows,
-            width,
-        })
     }
 
     fn slice(&self, handle: Tensor, skip: u32, keep: u32) -> Tensor {
@@ -575,12 +540,6 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// Every weight is one dense plane on this backend.
-    pub(crate) fn banked(&self, id: ValueId) -> Option<()> {
-        let _ = id;
-        None
-    }
-
     pub(crate) fn declared(&self, id: ValueId) -> StructKind {
         match &self.values[id.0 as usize].ty {
             Ty::Struct(kind) => *kind,
@@ -628,18 +587,6 @@ impl<'c> Run<'c> {
             }
             _ => panic!("value {at} is not a cache space; tensors resolve through `Run::tensor`"),
         }
-    }
-
-    /// The compressor state planes `[kv, score]` of the kv space `pages`
-    /// names.
-    pub(crate) fn pool_state(&self, pages: ValueId) -> Option<[Tensor; 2]> {
-        let Def::Cache(space) = self.values[pages.0 as usize].def else {
-            return None;
-        };
-        self.compressor
-            .iter()
-            .find(|(s, _)| *s == space)
-            .map(|(_, p)| *p)
     }
 
     pub(crate) fn put(&mut self, id: ValueId, built: StructSlot) {
