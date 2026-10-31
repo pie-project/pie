@@ -65,6 +65,9 @@ dag_streams_until = 256
 # the card fed while the next prompts arrive: Qwen3.8-Flash-Next mini pf16-512 142k -> 160k tok/s
 [engine]
 walk_fire_rows = 1024
+# a fire takes at most 5120 rows, so a batch's prompts end over two fires and those the first
+# finishes are answered, and replaced, while the second runs: DeepSeek-V4 mini pf16-512 98.7k -> 103k
+fire_rows = 5120
 # two recurrent-state slots a lane, so a hybrid trunk seats past the fixed 256: Nemotron-3-Super mini
 # c512 4,749 -> 5,028 tok/s (slots cut to fit the card), greedy tokens unchanged
 state_slots_per_lane = 2

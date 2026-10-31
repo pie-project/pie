@@ -363,6 +363,12 @@ fn fa2_prefill_with(
         params.maybe_custom_mask = bits.ptr;
         params.maybe_mask_indptr = indptr.ptr;
     }
+    // Unsplit rows land their sinks in the kernel's epilogue (no sink pass after).
+    let sunk = sinks
+        .filter(|s| s.dtype == o.dtype && !plan.info.split_kv && mask.is_none() && rel.is_none());
+    if let Some(s) = sunk {
+        params.maybe_sinks = s.ptr;
+    }
     // A bf16 pool's live widths, read out of its wider heads where the
     // profile says (`kernel.sdpa.fa2_live`): the padding past them is zeros
     // the product need not read.
@@ -431,7 +437,7 @@ fn fa2_prefill_with(
         };
         merge::fold(ctx, op, &sinked(split, sinks))
     } else {
-        Ok(false)
+        Ok(sunk.is_some())
     }
 }
 
