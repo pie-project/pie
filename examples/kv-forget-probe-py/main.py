@@ -6,6 +6,8 @@
   --mode speed   one lane at a `context` of tokens with a `fraction` of its pages
                  forgotten: decode and tool-turn prefill tokens per second.
   --mode sweep   `speed` over comma-separated `contexts` and `fractions`.
+  --mode paths   greedy tokens past a forgotten span, host loop against run-ahead.
+  --mode decl    what a plain lane reads out.
 """
 
 import random
@@ -18,6 +20,7 @@ from inferlet.eta import (
     Pipeline,
     StateGeometry,
     WorkingSet,
+    channel_capacity,
     dtype,
     intrinsics,
     kv_page_size,
@@ -130,35 +133,79 @@ async def exact(input: dict) -> dict:
     }
 
 
+async def ahead(ws: WorkingSet, pipe: Pipeline, first: int, budget: int) -> list[int]:
+    """`budget` greedy tokens on the run-ahead path; closes `pipe`."""
+    tok_in = Channel.from_([first], dtype.i32)
+    tok_out = Channel([1], dtype.i32).capacity(channel_capacity())
+    fwd = ForwardPass()
+    fwd.embed(tok_in, Channel.from_([0, 1], dtype.u32))
+    fwd.state([ws], StateGeometry.folding())
+
+    @fwd.epilogue
+    def _():
+        token = reshape(reduce_argmax(intrinsics.output(0, "logits")), [1])
+        tok_in.put(token)
+        tok_out.put(token)
+
+    out: list[int] = []
+
+    async def on_token() -> bool:
+        out.append(await tok_out.take_scalar())
+        return len(out) < budget
+
+    await pipe.run_ahead(fwd, budget, on_token)
+    return out
+
+
+async def paths(input: dict) -> dict:
+    """Greedy tokens on the host loop and on the run-ahead path, past a forgotten span."""
+    n, page, steps = input.get("context", 2048), kv_page_size(), input.get("steps", 64)
+    prompt = text_tokens(n, 1)
+    start, end = n // (4 * page) * page, 3 * n // (4 * page) * page
+    runs = {}
+    for arm in ("host", "ahead"):
+        ws, pipe = WorkingSet(), Pipeline()
+        token = await step(ws, pipe, prompt)
+        ws.forget(start, end)
+        if arm == "ahead":
+            runs[arm] = await ahead(ws, pipe, token, steps)
+            continue
+        out = []
+        for _ in range(steps):
+            token = await step(ws, pipe, [token])
+            out.append(token)
+        pipe.close()
+        runs[arm] = out
+    return {"same": runs["host"] == runs["ahead"], "agree": sum(x == y for x, y in zip(runs["host"], runs["ahead"])), "steps": steps}
+
+
 async def speed(input: dict) -> dict:
     n, page = input["context"], kv_page_size()
     fraction = input.get("fraction", 0.0)
     decode, tool = input.get("decode", 64), input.get("tool", 512)
     ws, pipe = WorkingSet(), Pipeline()
-    token = 0
     chunks = input.get("chunk", 2048)
+    parts = [text_tokens(min(chunks, n - at), at + 1) for at in range(0, n, chunks)]
     t0 = time.monotonic()
-    made = 0
-    while made < n:
-        part = text_tokens(min(chunks, n - made), made + 1)
+    for part in parts:
         token = await step(ws, pipe, part)
-        made += len(part)
     prefill = time.monotonic() - t0
     keep = int(n * (1 - fraction)) // page * page
     dropped = ws.forget(page, n - keep + page) if fraction > 0 else 0
-    t0 = time.monotonic()
-    for _ in range(decode):
-        token = await step(ws, pipe, [token])
-    decoding = time.monotonic() - t0
     part = text_tokens(tool, 7)
     t0 = time.monotonic()
     token = await step(ws, pipe, part)
     turn = time.monotonic() - t0
-    pipe.close()
+    t0 = time.monotonic()
+    token = await step(ws, pipe, [token])
+    t1 = time.monotonic()
+    out = await ahead(ws, pipe, token, decode)
+    decoding = time.monotonic() - t1
     return {
         "context": n, "fraction": fraction, "dropped": dropped, "page": page,
         "prefill_tps": round(n / prefill, 1),
-        "decode_tps": round(decode / decoding, 2),
+        "decode_tps": round((len(out) - 1) / decoding, 2),
+        "first_token_ms": round((t1 - t0) * 1000, 1),
         "tool_prefill_tps": round(tool / turn, 1),
     }
 
@@ -176,4 +223,6 @@ async def sweep(input: dict) -> dict:
 
 async def main(input: dict) -> dict:
     mode = input.get("mode", "exact")
-    return await {"exact": exact, "speed": speed, "sweep": sweep}[mode](input)
+    if mode == "decl":
+        return {"outputs": [[o.name, o.width, o.layers, o.readout] for o in model.lane([]).outputs], "page": kv_page_size()}
+    return await {"exact": exact, "speed": speed, "sweep": sweep, "paths": paths}[mode](input)
