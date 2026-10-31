@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 use rustc_hash::FxHashSet;
 use smallvec::{SmallVec, smallvec};
@@ -127,7 +128,7 @@ struct WorkingSetEntry {
     /// One that never settles leaves the log cut there.
     pending: BTreeMap<u64, u64>,
     /// Pages later rows no longer read.
-    forgotten: BTreeSet<u64>,
+    forgotten: Arc<BTreeSet<u64>>,
     /// Of them, those still backed: another reader may hold them.
     unfreed: BTreeSet<u64>,
 }
@@ -145,7 +146,7 @@ impl WorkingSetEntry {
             supplied: 0,
             logged: Vec::new(),
             pending: BTreeMap::new(),
-            forgotten: BTreeSet::new(),
+            forgotten: Arc::default(),
             unfreed: BTreeSet::new(),
         }
     }
@@ -255,13 +256,13 @@ impl KvPageTable {
         if pages.is_empty() {
             return Ok(());
         }
-        entry.forgotten.extend(pages.clone());
+        Arc::make_mut(&mut entry.forgotten).extend(pages.clone());
         entry.unfreed.extend(pages);
         entry.logged.truncate(start as usize);
         Ok(())
     }
 
-    pub fn forgotten(&self, ws: WorkingSetId) -> Result<&BTreeSet<u64>, KvTableError> {
+    pub fn forgotten(&self, ws: WorkingSetId) -> Result<&Arc<BTreeSet<u64>>, KvTableError> {
         Ok(&self.entry(ws)?.forgotten)
     }
 

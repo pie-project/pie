@@ -1042,7 +1042,7 @@ impl KvStore {
     pub fn forgotten(
         &self,
         ws: WorkingSetId,
-    ) -> Result<std::collections::BTreeSet<u64>, KvStoreError> {
+    ) -> Result<Arc<std::collections::BTreeSet<u64>>, KvStoreError> {
         Ok(self.table.forgotten(ws)?.clone())
     }
 
