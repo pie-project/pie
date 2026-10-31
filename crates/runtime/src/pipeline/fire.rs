@@ -1758,10 +1758,9 @@ pub(crate) fn map_lane_pages(
             continue;
         }
         let table = working_set_flat_table(stores, *ws)?;
-        let forgotten = crate::store::registry::with_kv_lock(&stores.kv, "host-pages", |kv| {
-            kv.forgotten(*ws)
-        })
-        .map_err(|error| error.to_string())?;
+        let forgotten =
+            crate::store::registry::with_kv_lock(&stores.kv, "host-pages", |kv| kv.forgotten(*ws))
+                .map_err(|error| error.to_string())?;
         for &lane in lanes {
             let Some(lane) = req.lanes.get_mut(lane) else {
                 continue;
@@ -1788,7 +1787,9 @@ fn skip_forgotten(
         lane.positions = (held..held + lane.tokens.len() as u32).collect();
     }
     let behind = forgotten.range(..u64::from(held / page)).count() as u32;
-    lane.kv.pages.retain(|page| !forgotten.contains(&u64::from(*page)));
+    lane.kv
+        .pages
+        .retain(|page| !forgotten.contains(&u64::from(*page)));
     lane.kv.held = held - behind * page;
 }
 
