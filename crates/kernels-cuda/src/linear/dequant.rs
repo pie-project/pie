@@ -437,7 +437,7 @@ pub fn nvfp4_matmul(
     if act.rows == 0 {
         return Ok(());
     }
-    if act.dtype == Dtype::Bf16 && act.rows > 1 && !seat.streams() {
+    if act.dtype == Dtype::Bf16 && act.rows > 16 && !seat.streams() {
         let tile = nvfp4_plane(ctx, op, codes, scales, tensor_scales, n, k, seat)?;
         return gemm::act_x_wt(ctx, op, act, tile, y);
     }
