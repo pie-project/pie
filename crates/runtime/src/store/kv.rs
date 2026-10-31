@@ -323,7 +323,10 @@ impl KvStore {
         };
         // What follows a forgotten page reads less than its tokens say, and
         // what follows a merge more.
-        if !self.table.forgotten(ws)?.is_empty() || !self.table.merged(ws)?.is_empty() {
+        if !self.table.forgotten(ws)?.is_empty()
+            || !self.table.merged(ws)?.is_empty()
+            || self.table.lead(ws)? != 0
+        {
             return Ok(None);
         }
         let hashes = self.table.page_token_hashes(ws, last / page)?;
@@ -1055,6 +1058,19 @@ impl KvStore {
         start: u64,
     ) -> Result<(), KvStoreError> {
         Ok(self.table.merge(ws, view, pages, start)?)
+    }
+
+    pub fn advance(
+        &mut self,
+        ws: WorkingSetId,
+        slots: u32,
+        start: u64,
+    ) -> Result<(), KvStoreError> {
+        Ok(self.table.advance(ws, slots, start)?)
+    }
+
+    pub fn lead(&self, ws: WorkingSetId) -> Result<u32, KvStoreError> {
+        Ok(self.table.lead(ws)?)
     }
 
     /// The pages merged into `ws`, in the pool, in merge order.

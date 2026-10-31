@@ -307,6 +307,27 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         Ok(Ok((last - first) * page))
     }
 
+    async fn advance(
+        &mut self,
+        this: Resource<WorkingSet>,
+        slots: u32,
+    ) -> Result<Result<(), String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        if let Some(refusal) = cannot_change_reads() {
+            return Ok(Err(refusal));
+        }
+        let (kv_rep, folded) = {
+            let ws = self.ctx().table.get(&this)?;
+            (ws.kv, ws.cursor().folded)
+        };
+        let kv = kv_of(self, kv_rep)?;
+        let stores = store_registry::get(kv.model, kv.engine);
+        let moved = store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
+            s.advance(kv.id, slots, u64::from(folded))
+        });
+        Ok(moved.map_err(|error| error.to_string()))
+    }
+
     async fn drop(&mut self, this: Resource<WorkingSet>) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.delete(this)?;

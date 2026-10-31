@@ -43,6 +43,10 @@ interface working-set {
         // becomes of `other`. Rows here run on past the slots merged.
         // Returns the slots merged.
         merge: func(other: borrow<working-set>, start: u32, end: u32) -> result<u32, error>;
+
+        // Rows from here on run `slots` positions further: past what a merge
+        // of only some chunks left out.
+        advance: func(slots: u32) -> result<_, error>;
     }
 
 }

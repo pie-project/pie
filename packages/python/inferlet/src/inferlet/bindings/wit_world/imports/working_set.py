@@ -50,6 +50,14 @@ class WorkingSet:
         cached tokens.
         """
         raise NotImplementedError
+    def advance(self, slots: int) -> None:
+        """
+        Rows from here on run `slots` positions further: past what a merge
+        of only some chunks left out.
+        
+        Raises: `wit_world.types.Err(wit_world.imports.types.Error)`
+        """
+        raise NotImplementedError
     def merge(self, other: Self, start: int, end: int) -> int:
         """
         Later rows of this working set and its forks also read the whole

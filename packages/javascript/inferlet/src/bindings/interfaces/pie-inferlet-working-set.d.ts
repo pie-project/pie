@@ -36,4 +36,9 @@ export class WorkingSet {
   * Returns the slots merged.
   */
   merge(other: WorkingSet, start: number, end: number): number;
+  /**
+  * Rows from here on run `slots` positions further: past what a merge
+  * of only some chunks left out.
+  */
+  advance(slots: number): void;
 }

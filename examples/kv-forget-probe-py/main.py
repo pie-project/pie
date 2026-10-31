@@ -438,19 +438,14 @@ async def read(input: dict) -> dict:
         indptr = [0]
         for lane, question in enumerate(group):
             if picked:  # only the chunks this question needs, the best a page selector could do
-                for chunk in sorted(question["chunks"]):
-                    forks[lane].merge(readers[chunk], h, h + each)
+                slots = sum(forks[lane].merge(readers[chunk], h, h + each) for chunk in sorted(question["chunks"]))
+                forks[lane].advance(each * count - slots)
         for question in group:
             indptr.append(indptr[-1] + len(question["q"]))
         first = Channel([lanes], dtype.i32)
         ask = ForwardPass()
         ask.embed(Channel.from_([t for question in group for t in question["q"]], dtype.i32), Channel.from_(indptr, dtype.u32))
-        total = h + each * count
-        if picked:  # rows run on past every chunk, merged here or not
-            spots = [total + j for question in group for j in range(len(question["q"]))]
-            ask.state(forks, StateGeometry.folding(positions=Channel.from_(spots, dtype.u32)))
-        else:
-            ask.state(forks, StateGeometry.folding())
+        ask.state(forks, StateGeometry.folding())
 
         @ask.epilogue
         def _():
@@ -458,24 +453,6 @@ async def read(input: dict) -> dict:
 
         pipe.submit(ask)
         heads = await first.take_host()
-        if picked:
-            out = [[t] for t in heads]
-            for turn in range(decode):
-                next_tokens = Channel([lanes], dtype.i32)
-                go = ForwardPass()
-                go.embed(Channel.from_([row[-1] for row in out], dtype.i32), Channel.from_(list(range(lanes + 1)), dtype.u32))
-                spots = [total + len(question["q"]) + turn for question in group]
-                go.state(forks, StateGeometry.folding(positions=Channel.from_(spots, dtype.u32)))
-
-                @go.epilogue
-                def _():
-                    next_tokens.put(reduce_argmax(reshape(intrinsics.output(0, "logits"), [lanes, v])))
-
-                pipe.submit(go)
-                for lane, token in enumerate(await next_tokens.take_host()):
-                    out[lane].append(token)
-            answers += [model.decode(row) for row in out]
-            continue
         tok_in = Channel.from_(heads, dtype.i32)
         tok_out = Channel([lanes], dtype.i32).capacity(channel_capacity())
         go = ForwardPass()

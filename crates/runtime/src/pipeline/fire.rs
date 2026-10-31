@@ -1758,16 +1758,20 @@ pub(crate) fn map_lane_pages(
             continue;
         }
         let table = working_set_flat_table(stores, *ws)?;
-        let (forgotten, merged) =
+        let (forgotten, merged, lead) =
             crate::store::registry::with_kv_lock(&stores.kv, "host-pages", |kv| {
-                Ok::<_, crate::store::kv::KvStoreError>((kv.forgotten(*ws)?, kv.merged_pages(*ws)?))
+                Ok::<_, crate::store::kv::KvStoreError>((
+                    kv.forgotten(*ws)?,
+                    kv.merged_pages(*ws)?,
+                    kv.lead(*ws)?,
+                ))
             })
             .map_err(|error| error.to_string())?;
         for &lane in lanes {
             let Some(lane) = req.lanes.get_mut(lane) else {
                 continue;
             };
-            let at = skip_forgotten(lane, &forgotten, &merged, stores.kv_page_size);
+            let at = skip_forgotten(lane, &forgotten, &merged, lead, stores.kv_page_size);
             map_pages(&mut lane.kv.pages, &table)?;
             lane.kv.pages.splice(at..at, merged.iter().copied());
         }
@@ -1782,15 +1786,17 @@ fn skip_forgotten(
     lane: &mut ::engine::Lane,
     forgotten: &std::collections::BTreeSet<u64>,
     merged: &[u32],
+    lead: u32,
     page: u32,
 ) -> usize {
     let (held, page) = (lane.kv.held, page.max(1));
-    if forgotten.is_empty() && merged.is_empty() {
+    if forgotten.is_empty() && merged.is_empty() && lead == 0 {
         return 0;
     }
     let extra = merged.len() as u32 * page;
     if lane.positions.is_empty() {
-        lane.positions = (held + extra..held + extra + lane.tokens.len() as u32).collect();
+        let at = held + extra + lead;
+        lane.positions = (at..at + lane.tokens.len() as u32).collect();
     }
     let behind = forgotten.range(..u64::from(held / page)).count() as u32;
     lane.kv
@@ -1836,7 +1842,9 @@ fn stamp_lane_translation(
     for (ws, lanes) in groups {
         let forgot = crate::store::registry::with_kv_lock(&stores.kv, "host-pages", |kv| {
             Ok::<_, crate::store::kv::KvStoreError>(
-                !kv.forgotten(*ws)?.is_empty() || !kv.merged_pages(*ws)?.is_empty(),
+                !kv.forgotten(*ws)?.is_empty()
+                    || !kv.merged_pages(*ws)?.is_empty()
+                    || kv.lead(*ws)? != 0,
             )
         })
         .map_err(|error| error.to_string())?;

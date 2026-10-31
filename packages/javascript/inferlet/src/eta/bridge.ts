@@ -299,6 +299,11 @@ export class WorkingSet {
     return wit('merge', () => this.ws.merge(other.ws, start, end));
   }
 
+  /** Rows from here on run `slots` positions further: past what a merge of only some chunks left out. */
+  advance(slots: number): void {
+    wit('advance', () => this.ws.advance(slots));
+  }
+
   /** A child sharing the frozen part, with a copy of the buffer. */
   fork(on: Pipeline): WorkingSet {
     return WorkingSet.wrap(wit('fork', () => this.ws.fork(on.wit)));

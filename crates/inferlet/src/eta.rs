@@ -415,6 +415,12 @@ impl WorkingSet {
             .map_err(|error| error.to_string())
     }
 
+    /// Rows from here on run `slots` positions further: past what a merge of
+    /// only some chunks left out.
+    pub fn advance(&self, slots: u32) -> Result<(), String> {
+        self.ws.advance(slots).map_err(|error| error.to_string())
+    }
+
     /// A child sharing the frozen part, with a copy of the buffer.
     pub fn fork(&self, on: &Pipeline) -> Result<WorkingSet, String> {
         Ok(WorkingSet {

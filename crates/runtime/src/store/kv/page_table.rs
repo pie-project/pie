@@ -131,6 +131,8 @@ struct WorkingSetEntry {
     forgotten: Arc<BTreeSet<u64>>,
     /// Pages of other working sets later rows read too.
     merged: Vec<(WorkingSetId, Range<u64>)>,
+    /// Positions later rows run on by, past their slots and what is merged.
+    lead: u32,
     /// Of them, those still backed: another reader may hold them.
     unfreed: BTreeSet<u64>,
 }
@@ -150,6 +152,7 @@ impl WorkingSetEntry {
             pending: BTreeMap::new(),
             forgotten: Arc::default(),
             merged: Vec::new(),
+            lead: 0,
             unfreed: BTreeSet::new(),
         }
     }
@@ -234,8 +237,9 @@ impl KvPageTable {
         }
         let (folded, prompt_pages) = (entry.folded, entry.prompt_pages);
         let (forgotten, unfreed) = (entry.forgotten.clone(), entry.unfreed.clone());
-        let merged = entry.merged.clone();
+        let (merged, lead) = (entry.merged.clone(), entry.lead);
         let mut child_entry = WorkingSetEntry::new(terminal, page_len, mapped_len);
+        child_entry.lead = lead;
         child_entry.forgotten = forgotten;
         child_entry.merged = merged;
         child_entry.unfreed = unfreed;
@@ -280,6 +284,22 @@ impl KvPageTable {
         entry.merged.push((view, pages));
         entry.logged.truncate(start.saturating_sub(1) as usize);
         Ok(())
+    }
+
+    pub fn advance(
+        &mut self,
+        ws: WorkingSetId,
+        slots: u32,
+        start: u64,
+    ) -> Result<(), KvTableError> {
+        let entry = self.entry_mut(ws)?;
+        entry.lead += slots;
+        entry.logged.truncate(start.saturating_sub(1) as usize);
+        Ok(())
+    }
+
+    pub fn lead(&self, ws: WorkingSetId) -> Result<u32, KvTableError> {
+        Ok(self.entry(ws)?.lead)
     }
 
     pub fn merged(&self, ws: WorkingSetId) -> Result<&[(WorkingSetId, Range<u64>)], KvTableError> {

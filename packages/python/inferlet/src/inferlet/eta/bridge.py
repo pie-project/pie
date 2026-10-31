@@ -313,6 +313,10 @@ class WorkingSet:
         """Later rows also read the whole frozen pages of `other` inside `[start, end)`; returns the slots merged."""
         return _wit(self.ws.merge, other.ws, start, end, what="merge")
 
+    def advance(self, slots: int) -> None:
+        """Rows from here on run `slots` positions further: past what a merge of only some chunks left out."""
+        _wit(self.ws.advance, slots, what="advance")
+
 
 # ---------------------------------------------------------------------------
 # Pipeline

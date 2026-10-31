@@ -134,6 +134,7 @@ export class WorkingSetStub {
   merge() {
     return 0;
   }
+  advance() {}
   fork() {
     return new WorkingSetStub();
   }
