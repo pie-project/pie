@@ -42,6 +42,8 @@ pub struct ProcessCtx {
     script: Option<Arc<Script>>,
 
     residency: Arc<Mutex<ProcessResidency>>,
+    /// Handed to each KV working set it makes: see [`crate::planner::Departure`].
+    departure: Option<Arc<crate::planner::Departure>>,
     prewarm_permit: Option<OrderedPermit>,
     props: client_api::Props,
     files: Arc<client_api::Files>,
@@ -214,6 +216,7 @@ impl ProcessCtx {
                 super::residency::register_residency(id, Arc::downgrade(&residency));
                 residency
             },
+            departure: crate::planner::planner_of(id).and_then(|planner| planner.departure(id)),
             prewarm_permit: None,
             props: client_api::Props::new(),
             files: Arc::default(),
@@ -318,6 +321,9 @@ impl ProcessCtx {
             .unwrap()
             .kv_working_sets
             .insert((ws.model, ws.engine, ws.id), ws.suspend_handle());
+        if let Some(departure) = &self.departure {
+            ws.hold_departure(departure.clone());
+        }
         let stores = crate::store::registry::get(ws.model, ws.engine);
         let owned = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
             kv.set_owner(ws.id, self.id())

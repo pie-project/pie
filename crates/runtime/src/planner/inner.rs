@@ -25,15 +25,15 @@ pub(super) struct Inner {
     pub(super) procs: HashMap<ProcessId, Proc>,
     pub(super) queue: BTreeMap<EntryKey, Waiter>,
     pub(super) accum: DevicePageReservation,
+    /// Pages on their way back: a suspend's in flight, keyed by its process,
+    /// or a departed process's still held by its working sets, keyed by the
+    /// process gone, until its last [`super::Departure`] hold drops.
     pub(super) evicting: HashMap<ProcessId, Reclaim>,
     pub(super) completion_credit: u32,
     pub(super) host_swap_blocked: HashSet<ProcessId>,
     pub(super) prepare_blocked: HashSet<ProcessId>,
     pub(super) killing: HashSet<ProcessId>,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
-    /// Working sets of processes that have left and still hold pages: they
-    /// come back when each is released (its last fire done), which pokes.
-    pub(super) releasing: HashSet<crate::store::kv::page_table::WorkingSetId>,
 }
 
 impl Inner {
