@@ -8,6 +8,7 @@
   --mode sweep   `speed` over comma-separated `contexts` and `fractions`.
   --mode paths   greedy tokens past a forgotten span, host loop against run-ahead.
   --mode decl    what a plain lane reads out.
+  --mode merged  chunks read apart and merged, against one sequence masked to match.
   --mode team    sub-agents forked from one context, each asked about its own module;
                  `focus` makes each forget the other modules first.
 """
@@ -317,6 +318,66 @@ async def team(input: dict) -> dict:
     }
 
 
+async def read_chunk(ws: WorkingSet, pipe: Pipeline, tokens: list[int], at: int, keep: range | None, start: int, span: int) -> None:
+    """Read `tokens` at positions from `at`; with `keep`, as rows of one sequence that see only
+    the header and their own chunk, which is what a fork reading the chunk alone computes."""
+    fwd = ForwardPass()
+    fwd.embed(tokens)
+    if keep is not None:
+        rows = [(key < keep.start or start <= key <= start + row) for row in range(len(tokens)) for key in range(span)]
+        fwd.mask(Channel.from_shaped([len(tokens), span], rows, dtype.bool))
+        fwd.state([ws], StateGeometry.folding())
+    else:
+        positions = Channel.from_(list(range(at, at + len(tokens))), dtype.u32)
+        fwd.state([ws], StateGeometry.folding(positions=positions))
+    tok = Channel([1], dtype.i32)
+
+    @fwd.epilogue
+    def _():
+        tok.put(reshape(reduce_argmax(intrinsics.output(0, "logits")), [1]))
+
+    pipe.submit(fwd)
+    await tok.take_scalar()
+
+
+async def merged(input: dict) -> dict:
+    """`merge` against one sequence masked so each chunk saw only the header and itself: chunks
+    read apart and merged must give the same logits."""
+    page = kv_page_size()
+    header_len, chunk_len = input.get("header", 8) * page, input.get("chunk", 16) * page
+    chunks, steps = input.get("chunks", 4), input.get("steps", 8)
+    header = text_tokens(header_len, 3)
+    parts = [text_tokens(chunk_len, 20 + i) for i in range(chunks)]
+    forced = text_tokens(steps, 2)
+    total = header_len + chunks * chunk_len
+    span = total + steps + 1
+    arms = {}
+    for arm in ("seen", "mask", "merge"):
+        ws, pipe = WorkingSet(), Pipeline()
+        await step(ws, pipe, header)
+        readers = []
+        for i, part in enumerate(parts):
+            start = header_len + i * chunk_len
+            if arm == "merge":
+                child = ws.fork(pipe)
+                await read_chunk(child, pipe, part, start, None, 0, 0)
+                readers.append(child)
+            elif arm == "mask":
+                await read_chunk(ws, pipe, part, start, range(header_len, span), start, span)
+            else:
+                await step(ws, pipe, part)
+        slots = sum(ws.merge(child, header_len, header_len + chunk_len) for child in readers)
+        rows = [await logits_of(ws, pipe, [token]) for token in forced]
+        pipe.close()
+        arms[arm] = {"rows": rows, "slots": slots}
+    gap = lambda a, b: [round(apart(x, y), 4) for x, y in zip(arms[a]["rows"], arms[b]["rows"])]
+    return {
+        "page": page, "total": total, "merged_slots": arms["merge"]["slots"],
+        "merge_vs_mask_max": max(gap("merge", "mask")), "merge_vs_mask": gap("merge", "mask"),
+        "seen_vs_mask_max": max(gap("seen", "mask")),
+    }
+
+
 async def sweep(input: dict) -> dict:
     """`speed` over every context and fraction, in one engine."""
     rows = []
@@ -332,4 +393,4 @@ async def main(input: dict) -> dict:
     mode = input.get("mode", "exact")
     if mode == "decl":
         return {"outputs": [[o.name, o.width, o.layers, o.readout] for o in model.lane([]).outputs], "page": kv_page_size()}
-    return await {"exact": exact, "speed": speed, "sweep": sweep, "paths": paths, "team": team}[mode](input)
+    return await {"exact": exact, "speed": speed, "sweep": sweep, "paths": paths, "team": team, "merged": merged}[mode](input)

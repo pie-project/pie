@@ -50,6 +50,17 @@ class WorkingSet:
         cached tokens.
         """
         raise NotImplementedError
+    def merge(self, other: Self, start: int, end: int) -> int:
+        """
+        Later rows of this working set and its forks also read the whole
+        frozen pages of `other` inside `[start, end)`, as they stand now;
+        nothing is recomputed or copied, and they stay readable whatever
+        becomes of `other`. Rows here run on past the slots merged.
+        Returns the slots merged.
+        
+        Raises: `wit_world.types.Err(wit_world.imports.types.Error)`
+        """
+        raise NotImplementedError
     def forget(self, start: int, end: int) -> int:
         """
         Later rows of this working set and its forks no longer read the

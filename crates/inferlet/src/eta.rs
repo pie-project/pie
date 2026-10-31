@@ -407,6 +407,14 @@ impl WorkingSet {
             .map_err(|error| error.to_string())
     }
 
+    /// Later rows also read the whole frozen pages of `other` inside
+    /// `[start, end)`; returns the slots merged.
+    pub fn merge(&self, other: &WorkingSet, start: u32, end: u32) -> Result<u32, String> {
+        self.ws
+            .merge(&other.ws, start, end)
+            .map_err(|error| error.to_string())
+    }
+
     /// A child sharing the frozen part, with a copy of the buffer.
     pub fn fork(&self, on: &Pipeline) -> Result<WorkingSet, String> {
         Ok(WorkingSet {

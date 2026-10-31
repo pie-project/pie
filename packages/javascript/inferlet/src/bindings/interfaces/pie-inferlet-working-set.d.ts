@@ -30,4 +30,10 @@ export class WorkingSet {
   * and nothing is recomputed. Returns the slots dropped.
   */
   forget(start: number, end: number): number;
+  /**
+  * Later rows of this working set and its forks also read the whole
+  * frozen pages of `other` inside `[start, end)`, as they stand now.
+  * Returns the slots merged.
+  */
+  merge(other: WorkingSet, start: number, end: number): number;
 }

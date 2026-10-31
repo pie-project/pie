@@ -309,6 +309,10 @@ class WorkingSet:
         """Later rows stop reading the whole pages inside frozen `[start, end)`; returns the slots dropped."""
         return _wit(self.ws.forget, start, end, what="forget")
 
+    def merge(self, other: "WorkingSet", start: int, end: int) -> int:
+        """Later rows also read the whole frozen pages of `other` inside `[start, end)`; returns the slots merged."""
+        return _wit(self.ws.merge, other.ws, start, end, what="merge")
+
 
 # ---------------------------------------------------------------------------
 # Pipeline

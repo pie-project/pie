@@ -321,8 +321,9 @@ impl KvStore {
         let Some(last) = start.checked_sub(1) else {
             return Ok(Some(None));
         };
-        // What follows a forgotten page reads less than its tokens say.
-        if !self.table.forgotten(ws)?.is_empty() {
+        // What follows a forgotten page reads less than its tokens say, and
+        // what follows a merge more.
+        if !self.table.forgotten(ws)?.is_empty() || !self.table.merged(ws)?.is_empty() {
             return Ok(None);
         }
         let hashes = self.table.page_token_hashes(ws, last / page)?;
@@ -1044,6 +1045,32 @@ impl KvStore {
         ws: WorkingSetId,
     ) -> Result<Arc<std::collections::BTreeSet<u64>>, KvStoreError> {
         Ok(self.table.forgotten(ws)?.clone())
+    }
+
+    pub fn merge(
+        &mut self,
+        ws: WorkingSetId,
+        view: WorkingSetId,
+        pages: Range<u64>,
+        start: u64,
+    ) -> Result<(), KvStoreError> {
+        Ok(self.table.merge(ws, view, pages, start)?)
+    }
+
+    /// The pages merged into `ws`, in the pool, in merge order.
+    pub fn merged_pages(&mut self, ws: WorkingSetId) -> Result<Vec<u32>, KvStoreError> {
+        let merged = self.table.merged(ws)?.to_vec();
+        let mut pages = Vec::new();
+        for (view, range) in merged {
+            let table = self.flat_table(view)?;
+            pages.extend(
+                table[range.start as usize..range.end as usize]
+                    .iter()
+                    .filter(|page| **page != page_table::FORGOTTEN_PAGE)
+                    .map(|page| page.0),
+            );
+        }
+        Ok(pages)
     }
 
     pub fn reserve(&mut self, ws: WorkingSetId, pages: u64) -> Result<Range<u64>, KvStoreError> {

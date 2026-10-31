@@ -1758,39 +1758,46 @@ pub(crate) fn map_lane_pages(
             continue;
         }
         let table = working_set_flat_table(stores, *ws)?;
-        let forgotten =
-            crate::store::registry::with_kv_lock(&stores.kv, "host-pages", |kv| kv.forgotten(*ws))
-                .map_err(|error| error.to_string())?;
+        let (forgotten, merged) =
+            crate::store::registry::with_kv_lock(&stores.kv, "host-pages", |kv| {
+                Ok::<_, crate::store::kv::KvStoreError>((kv.forgotten(*ws)?, kv.merged_pages(*ws)?))
+            })
+            .map_err(|error| error.to_string())?;
         for &lane in lanes {
             let Some(lane) = req.lanes.get_mut(lane) else {
                 continue;
             };
-            skip_forgotten(lane, &forgotten, stores.kv_page_size);
+            let at = skip_forgotten(lane, &forgotten, &merged, stores.kv_page_size);
             map_pages(&mut lane.kv.pages, &table)?;
+            lane.kv.pages.splice(at..at, merged.iter().copied());
         }
     }
     Ok(())
 }
 
-/// The lane reads and writes through the pages it kept, so `held` counts those;
-/// its rows keep the positions they had.
+/// The lane reads and writes through the pages it kept and the ones merged in
+/// before the page it writes, so `held` counts those; its rows keep the
+/// positions they had. Answers where the merged pages go in its table.
 fn skip_forgotten(
     lane: &mut ::engine::Lane,
     forgotten: &std::collections::BTreeSet<u64>,
+    merged: &[u32],
     page: u32,
-) {
-    if forgotten.is_empty() {
-        return;
-    }
+) -> usize {
     let (held, page) = (lane.kv.held, page.max(1));
+    if forgotten.is_empty() && merged.is_empty() {
+        return 0;
+    }
+    let extra = merged.len() as u32 * page;
     if lane.positions.is_empty() {
-        lane.positions = (held..held + lane.tokens.len() as u32).collect();
+        lane.positions = (held + extra..held + extra + lane.tokens.len() as u32).collect();
     }
     let behind = forgotten.range(..u64::from(held / page)).count() as u32;
     lane.kv
         .pages
         .retain(|page| !forgotten.contains(&u64::from(*page)));
-    lane.kv.held = held - behind * page;
+    lane.kv.held = held - behind * page + extra;
+    (held / page - behind) as usize
 }
 
 fn map_pages(pages: &mut [u32], table: &[u32]) -> Result<(), String> {
@@ -1828,13 +1835,15 @@ fn stamp_lane_translation(
 ) -> Result<(), String> {
     for (ws, lanes) in groups {
         let forgot = crate::store::registry::with_kv_lock(&stores.kv, "host-pages", |kv| {
-            kv.forgotten(*ws).map(|pages| !pages.is_empty())
+            Ok::<_, crate::store::kv::KvStoreError>(
+                !kv.forgotten(*ws)?.is_empty() || !kv.merged_pages(*ws)?.is_empty(),
+            )
         })
         .map_err(|error| error.to_string())?;
         if forgot {
             return Err(
                 "pipeline: rows the device places read every page, and this working set \
-                 forgot some: state its slots"
+                 forgot or merged some: state its slots"
                     .to_string(),
             );
         }
