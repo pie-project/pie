@@ -27,6 +27,39 @@ fn one_hot(width: usize, token: Option<u32>) -> Vec<f32> {
     row
 }
 
+/// The vocabulary-wide row a token loop's answer is handed over as (a
+/// one-hot of its argmax), kept between fires: a fire takes it (every cell 0
+/// but the answer's), the epilogue reads it, and it comes back with that one
+/// cell cleared. A Qwen3 row is 600 KB, which a fresh allocation zeroed and
+/// freed every answered fire.
+#[derive(Default)]
+pub(super) struct OneHotRow {
+    spare: Option<Vec<f32>>,
+}
+
+impl OneHotRow {
+    /// A row of `width`, 1 at `token`, 0 elsewhere: what [`one_hot`] builds.
+    fn take(&mut self, width: usize, token: u32) -> Vec<f32> {
+        let mut row = match self.spare.take() {
+            Some(row) if row.len() == width => row,
+            _ => vec![0f32; width],
+        };
+        if let Some(cell) = row.get_mut(token as usize) {
+            *cell = 1.0;
+        }
+        row
+    }
+
+    /// A row [`OneHotRow::take`] gave out, back with `token`'s cell cleared
+    /// (the epilogue only reads it): every cell 0 again.
+    fn give_back(&mut self, mut row: Vec<f32>, token: u32) {
+        if let Some(cell) = row.get_mut(token as usize) {
+            *cell = 0.0;
+        }
+        self.spare = Some(row);
+    }
+}
+
 /// The logits a lane of `n` rows asks the model for when `rows` are read:
 /// none, the last row's alone, or every row's.
 fn logits_wanted(rows: &[u32], n: usize) -> wafer::Logits {
@@ -474,6 +507,8 @@ impl Spatial {
             Error::Load("the model reads no float output at its readout rows".into())
         })?;
         let mut logits: Vec<Vec<Vec<f32>>> = Vec::with_capacity(lanes.len());
+        // A lane whose one row is the token loop's reused one-hot: its token.
+        let mut hot: Vec<Option<u32>> = Vec::with_capacity(lanes.len());
         let mut read_rows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         // Lanes a token loop answered (their row a one-hot of the argmax).
         let mut fast: Vec<bool> = Vec::with_capacity(lanes.len());
@@ -644,7 +679,8 @@ impl Spatial {
                         self.ahead_hits += 1;
                         self.kv
                             .write_paged(lane.slot, &lane.kv.pages, &slots, &tokens[at]);
-                        logits.push(vec![one_hot(width as usize, Some(token))]);
+                        logits.push(vec![self.one_hot.take(width as usize, token)]);
+                        hot.push(Some(token));
                         fast.push(true);
                         read_rows.push(rows);
                         continue;
@@ -717,6 +753,7 @@ impl Spatial {
                 }
             };
             logits.push(out);
+            hot.push(None);
             fast.push(ran_ahead);
             read_rows.push(rows);
         }
@@ -819,6 +856,8 @@ impl Spatial {
                 continue;
             }
             let mut outputs: Vec<(String, u32, Value)> = Vec::new();
+            // Outputs holding the reused one-hot: (index, its token).
+            let mut lent: Vec<(usize, u32)> = Vec::new();
             for (out_name, k) in self.programs.outputs_of(attachment.instance) {
                 let lane = attachment.lane as usize + k as usize;
                 if out_name != name && out_name.starts_with("attn.") {
@@ -839,7 +878,10 @@ impl Spatial {
                         && end <= lane + 1
                         && logits[lane].len() == 1
                     {
-                        // Its one row, handed over: nothing reads it again.
+                        // Its one row, handed over: nothing else reads it.
+                        if let Some(token) = hot.get(lane).copied().flatten() {
+                            lent.push((outputs.len(), token));
+                        }
                         std::mem::take(&mut logits[lane][0])
                     } else {
                         (lane..end.max(lane + 1))
@@ -857,6 +899,13 @@ impl Spatial {
                 self.programs
                     .fire_interpreted(attachment.instance, &outputs, Stage::Epilogue)
                     .map_err(refusal)?;
+            }
+            for (i, token) in lent {
+                if let Value::F32(row) =
+                    std::mem::replace(&mut outputs[i].2, Value::F32(Vec::new()))
+                {
+                    self.one_hot.give_back(row, token);
+                }
             }
         }
         self.fires += 1;
@@ -893,6 +942,30 @@ impl Spatial {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Consecutive answered fires with different tokens hand the epilogue
+    /// exactly the row a fresh one-hot would be: the last fire's cell is
+    /// gone, a new width starts over, and a token past the row leaves it all
+    /// 0, as `one_hot` does.
+    #[test]
+    fn a_reused_answer_row_is_a_fresh_one_hot_every_fire() {
+        let mut pool = OneHotRow::default();
+        let width = 151_936;
+        for token in [5u32, 9, 9, 0, 151_935, 77, 151_936, 3] {
+            let row = pool.take(width, token);
+            assert!(row == one_hot(width, Some(token)), "token {token}");
+            pool.give_back(row, token);
+        }
+        // A smaller vocabulary, then back: never a cell of the other's.
+        let row = pool.take(250, 249);
+        assert!(row == one_hot(250, Some(249)));
+        pool.give_back(row, 249);
+        let row = pool.take(width, 12);
+        assert!(row == one_hot(width, Some(12)));
+        pool.give_back(row, 12);
+        let row = pool.take(width, 13);
+        assert!(row == one_hot(width, Some(13)));
+    }
 
     #[test]
     fn a_token_loop_never_runs_past_the_lane_s_pages() {
