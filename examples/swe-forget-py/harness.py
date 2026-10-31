@@ -111,7 +111,7 @@ class Sandboxes:
         return hashlib.sha1(self.patch(path).encode()).hexdigest()[:12]
 
     def patch(self, path: Path) -> str:
-        return subprocess.run(DIFF, shell=True, cwd=path, capture_output=True, text=True).stdout
+        return subprocess.run(DIFF, shell=True, cwd=path, capture_output=True, text=True, errors="replace").stdout
 
     def exec(self, bid: int, cmd: str) -> dict:
         path = self.dir(bid)
@@ -185,6 +185,10 @@ def sandboxes(task) -> Sandboxes:
     return SweSandboxes(task) if isinstance(task, SweTask) else Sandboxes(task)
 
 
+INSTALL = asyncio.Lock()
+INSTALLED: dict = {}
+
+
 async def run_pie(task: Task, uri: str, config: dict, quiet: bool) -> dict:
     from pie_client import Event, PieClient
 
@@ -195,17 +199,12 @@ async def run_pie(task: Task, uri: str, config: dict, quiet: bool) -> dict:
     try:
         async with PieClient(uri) as client:
             await client.authenticate("swarm")
-            for attempt in range(8):  # tasks starting together overwrite the program under each other
-                program = await client.install_program_bytes(
-                    PROGRAM.read_bytes(), PROGRAM.stem + ".py", "0.1.0", force_overwrite=True)
-                try:
-                    process = await client.launch_process(
-                        program, {"system": SYSTEM, "task": task.issue, "config": config})
-                    break
-                except Exception:
-                    if attempt == 7:
-                        raise
-                    await asyncio.sleep(1 + attempt)
+            async with INSTALL:  # once: tasks starting together overwrite it under each other
+                if INSTALLED.get("program") is None:
+                    INSTALLED["program"] = await client.install_program_bytes(
+                        PROGRAM.read_bytes(), PROGRAM.stem + ".py", "0.1.0", force_overwrite=True)
+            process = await client.launch_process(
+                INSTALLED["program"], {"system": SYSTEM, "task": task.issue, "config": config})
             tool_seconds = 0.0
             while True:
                 event, value = await process.recv()
@@ -278,7 +277,7 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
     t0 = time.monotonic()
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task.issue}]
     prompt = completion = cached = turns = format_errors = forced_actions = rewinds = 0
-    state, seen = "base", set()
+    state, seen, runs = "base", set(), {}
     tool_seconds = 0.0
     patch = ""
     loop = asyncio.get_running_loop()
@@ -326,6 +325,9 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
                 continue
             t = time.monotonic()
             seen.add((state, cmd))
+            runs[(state, cmd)] = runs.get((state, cmd), 0) + 1
+            if config.get("kill_loops") and runs[(state, cmd)] > 2:  # the third run of a command that changed nothing
+                break
             res = await loop.run_in_executor(None, box.exec, 0, cmd)
             state = res["state"]
             tool_seconds += time.monotonic() - t
