@@ -155,7 +155,7 @@ class SweSandboxes(Sandboxes):
 
     def run(self, path: Path, cmd: str) -> tuple[int, str]:
         p = subprocess.run(["/swe/bin/exec", self.task.id, str(path), str(self.timeout)], input=cmd,
-                           capture_output=True, text=True, timeout=self.timeout + 30)
+                           capture_output=True, text=True, errors="replace", timeout=self.timeout + 30)
         return p.returncode, p.stdout + p.stderr
 
     def evaluate(self, task: "SweTask", patch: str) -> bool:
