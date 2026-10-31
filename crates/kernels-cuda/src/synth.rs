@@ -309,13 +309,15 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
     // streams its row parameters through its passes; packed rows otherwise
     // issue a later pass's parameters late, and spread ones load every
     // parameter up front.
-    let streamed = |per| if fits(&stored[..ins.len()], ones, outs, per) {
-        0
-    } else {
-        (0u32..)
-            .zip(ins)
-            .filter(|(_, form)| !form.scalar())
-            .fold(0u32, |mask, (k, _)| mask | 1 << k)
+    let streamed = |per| {
+        if fits(&stored[..ins.len()], ones, outs, per) {
+            0
+        } else {
+            (0u32..)
+                .zip(ins)
+                .filter(|(_, form)| !form.scalar())
+                .fold(0u32, |mask, (k, _)| mask | 1 << k)
+        }
     };
     let stream = streamed(per);
     let late = body.late & !ones & !stream;
