@@ -309,7 +309,7 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
     // streams its row parameters through its passes; packed rows otherwise
     // issue a later pass's parameters late, and spread ones load every
     // parameter up front.
-    let stream = if fits(&stored[..ins.len()], ones, outs, per) {
+    let streamed = |per| if fits(&stored[..ins.len()], ones, outs, per) {
         0
     } else {
         (0u32..)
@@ -317,8 +317,11 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
             .filter(|(_, form)| !form.scalar())
             .fold(0u32, |mask, (k, _)| mask | 1 << k)
     };
+    let stream = streamed(per);
     let late = body.late & !ones & !stream;
     let laid = |schedule| {
+        let per = (width / skeleton::VEC_WIDTH).div_ceil(skeleton::laned(width, schedule));
+        let stream = streamed(per);
         crate::jit::generated(
             if schedule == Schedule::Packed {
                 packed_root
@@ -346,7 +349,7 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
         )
     };
     let spread = (skeleton::block(width, Schedule::Spread)
-        < skeleton::block(width, Schedule::Packed)
+        != skeleton::block(width, Schedule::Packed)
         || late != 0
         || body.packed.is_some())
     .then(|| laid(Schedule::Spread));
