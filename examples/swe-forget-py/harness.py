@@ -237,13 +237,19 @@ async def run_pie(task: Task, uri: str, config: dict, quiet: bool) -> dict:
         box.close()
 
 
-def chat(base_url: str, model: str, messages: list, max_tokens: int, temperature: float) -> dict:
+def chat(base_url: str, model: str, messages: list, max_tokens: int, temperature: float, reply: str = "") -> dict:
     # thinking off and plain temperature sampling, as the swarm does: no top-k/top-p or
     # penalties the model's generation_config would otherwise switch on
     messages = [{k: v for k, v in m.items() if k != "turn"} for m in messages]
+    extra = {}
+    if reply:  # go on from what the reply has so far
+        messages.append({"role": "assistant", "content": reply})
+        extra = {"add_generation_prompt": False, "continue_final_message": True}
+    # a turn ends at the command block's closing fence, as the inferlet's does
     body = json.dumps({"model": model, "messages": messages, "max_tokens": max_tokens,
                        "temperature": temperature, "top_p": 1.0, "top_k": -1, "min_p": 0.0,
                        "presence_penalty": 0.0, "frequency_penalty": 0.0, "repetition_penalty": 1.0,
+                       "stop": ["\n```\n"], "include_stop_str_in_output": True, **extra,
                        "chat_template_kwargs": {"enable_thinking": False}}).encode()
     req = urllib.request.Request(f"{base_url}/chat/completions", body, {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
@@ -257,6 +263,8 @@ def clear_stale(messages: list, turn: int, config: dict) -> None:
     if not after:
         return
     for m in messages:
+        if m["role"] == "assistant" and config.get("clear_replies") and m.get("turn") is None:
+            m["turn"] = turn
         if m.get("turn") is not None and turn - m["turn"] >= after:
             del m["turn"]
             text = m["content"]
@@ -269,7 +277,8 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
     box = sandboxes(task)
     t0 = time.monotonic()
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task.issue}]
-    prompt = completion = cached = turns = format_errors = 0
+    prompt = completion = cached = turns = format_errors = forced_actions = rewinds = 0
+    state, seen = "base", set()
     tool_seconds = 0.0
     patch = ""
     loop = asyncio.get_running_loop()
@@ -277,14 +286,37 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
         last_prompt = 0
         # the swarm's limits: the sampled-token budget, and a context past which a branch dies
         while completion < config["token_budget"] and last_prompt + config["max_turn_tokens"] < config["max_context"]:
-            r = await loop.run_in_executor(None, chat, base_url, model, messages,
-                                           config["max_turn_tokens"], config["temperature"])
-            usage = r.get("usage", {})
-            last_prompt = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-            prompt += usage.get("prompt_tokens", 0)
-            completion += usage.get("completion_tokens", 0)
-            cached += (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
-            text = r["choices"][0]["message"]["content"] or ""
+            # the inferlet's turn over an API: past `max_thought_tokens` with no command, or
+            # ending with none, the command block is opened for the reply; a command already
+            # run in this state is thrown away and sampled again
+            for attempt in range(config["max_rewinds"] + 1):
+                text, forced, budget = "", False, config["max_turn_tokens"]
+                limit = config["max_thought_tokens"]
+                while budget > 0:
+                    r = await loop.run_in_executor(None, chat, base_url, model, messages, min(limit, budget),
+                                                   config["temperature"], text)
+                    usage = r.get("usage", {})
+                    last_prompt = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                    prompt += usage.get("prompt_tokens", 0)
+                    completion += usage.get("completion_tokens", 0)
+                    budget -= usage.get("completion_tokens", 0)
+                    cached += (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+                    text += r["choices"][0]["message"]["content"] or ""
+                    if COMMAND.search(text):
+                        break
+                    if "```" in text:
+                        if r["choices"][0].get("finish_reason") == "stop":
+                            break
+                    elif forced:
+                        break
+                    else:
+                        forced = True
+                        forced_actions += 1
+                        text += "\n```bash\n"
+                    limit = budget
+                if (state, command(text)) not in seen or attempt == config["max_rewinds"]:
+                    break
+                rewinds += 1
             messages.append({"role": "assistant", "content": text})
             turns += 1
             cmd = command(text)
@@ -293,7 +325,9 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
                 messages.append({"role": "user", "content": FORMAT_ERROR})
                 continue
             t = time.monotonic()
+            seen.add((state, cmd))
             res = await loop.run_in_executor(None, box.exec, 0, cmd)
+            state = res["state"]
             tool_seconds += time.monotonic() - t
             if "patch" in res:
                 patch = res["patch"]
@@ -314,6 +348,7 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
             "decoded_tokens": completion,
             "prompt_tokens": prompt, "cached_prompt_tokens": cached,
             "prefilled_tokens": prompt - cached, "turns": turns, "format_errors": format_errors,
+            "forced_actions": forced_actions, "command_rewinds": rewinds,
             "tool_seconds": round(tool_seconds, 2), "wall_seconds": round(time.monotonic() - t0, 2),
         }
     finally:
@@ -321,7 +356,7 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
 
 
 DEFAULTS = {"temperature": 0.7, "max_turn_tokens": 1536, "max_output_chars": 6000, "token_budget": 60000,
-            "max_context": 48000}
+            "max_context": 48000, "max_thought_tokens": 384, "max_rewinds": 2}
 
 
 async def main() -> None:
