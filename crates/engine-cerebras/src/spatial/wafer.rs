@@ -636,7 +636,26 @@ impl WaferModel {
                 wafer::write_conc_rows(&mut *self.rt, &vm.lay, vm.ring, range.len() as u32)?;
             }
         }
-        let mask: Vec<u32> = (0..lanes.len()).map(|g| u32::from(is_sampled(g))).collect();
+        // VMCONC: a VM launch rebinds the head's argmax chain to set B's
+        // rows, so no lane may take the head's argmax (gmode_l 0). Every lane
+        // is a VM lane; one this launch does not sample is a skipped turn
+        // instead (its forced prefix past the launch's one lap): routed to
+        // its set and counted in its rows, bank untouched, token 0, which no
+        // one reads (only sampled lanes' tokens come back).
+        let conc = grid.vm_conc();
+        let mask: Vec<u32> = (0..lanes.len())
+            .map(|g| u32::from(conc || is_sampled(g)))
+            .collect();
+        let nforce: Vec<u32> = (0..lanes.len())
+            .map(|g| {
+                let forced = lanes[g].forced.len() as u32;
+                if is_sampled(g) {
+                    forced
+                } else {
+                    forced.max(1) + 1
+                }
+            })
+            .collect();
         let sets: Vec<u32> = (0..lanes.len())
             .map(|g| u32::from(g >= na && g < n))
             .collect();
@@ -646,6 +665,7 @@ impl WaferModel {
         let turns = super::serve2d::VmTurns {
             sampled: &mask,
             sets: &sets,
+            nforce: conc.then_some(&nforce[..]),
         };
         let (tokens, _) = super::serve2d::fire_lanes(
             grid,

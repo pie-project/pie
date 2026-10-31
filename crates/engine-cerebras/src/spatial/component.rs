@@ -578,7 +578,10 @@ impl Sampler {
                 let lane = mb.get(b).unwrap_or(&mb[0]);
                 let v = m * b_n + b;
                 control[v * w] = vm.and_then(|t| t.sampled.get(v).copied()).unwrap_or(0);
-                control[v * w + 1] = lane.forced.len() as u32;
+                control[v * w + 1] = vm
+                    .and_then(|t| t.nforce)
+                    .and_then(|f| f.get(v).copied())
+                    .unwrap_or(lane.forced.len() as u32);
                 if w >= 4 {
                     control[v * w + 3] = vm.and_then(|t| t.sets.get(v).copied()).unwrap_or(0);
                 }
