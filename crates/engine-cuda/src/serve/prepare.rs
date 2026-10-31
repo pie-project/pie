@@ -1449,7 +1449,6 @@ impl FrameShell for Shell {
         let key = key.with_islands(&record::widen(
             &self.compiled,
             &windows.admits_axes(totals, &self.shifted, &self.lane_shifted, self.staging()),
-            token_axis.bucket,
         ));
         let ladder = key.classes.clone();
         let patch_ladder = key.patch.as_ref().map(|axis| axis.classes.clone());

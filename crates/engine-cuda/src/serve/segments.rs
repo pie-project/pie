@@ -36,7 +36,6 @@ impl Shell {
                             &self.lane_shifted,
                             self.staging()
                         ),
-                        key.bucket
                     ),
                 "the admissibility table for {key} is not what this key derived \
                  before, so `Windows::admits` has grown an input the key does \
@@ -47,7 +46,6 @@ impl Shell {
         let admits: std::sync::Arc<[crate::window::Admit]> = record::widen(
             &self.compiled,
             &windows.admits_axes(totals, &self.shifted, &self.lane_shifted, self.staging()),
-            key.bucket,
         )
         .into();
         if self.segments.len() > record::MAX_BODIES * 4 {

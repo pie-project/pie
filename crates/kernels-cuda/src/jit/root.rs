@@ -90,7 +90,7 @@ const SPECIFIC: &[(&str, Toolchain)] = &[
     ("linear/moe/select_sm90.cu", Toolchain::ANY),
     ("linear/moe/select_fp4_sm120.cu", Toolchain::new(12, 9)),
     ("linear/w8a16_sm90.cu", Toolchain::ANY),
-    ("linear/fp8_dense_sm120.cu", Toolchain::new(12, 9)),
+    ("linear/moe/select_fp8_sm120.cu", Toolchain::new(12, 9)),
 ];
 
 /// The units compiled for the arch-specific target on a tcgen05 chip and the

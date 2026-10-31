@@ -623,7 +623,7 @@ fn w4a8_select_timing() {
         let rows_x = if by_token { tokens } else { tokens * top };
         let (raw, _) = b.lcg.row(rows_x * k);
         let x = t(b.up(&raw), rows_x, k, Bf16);
-        let codes = tab(ex * n * k / 2, |i| (i * 2_654_435_761 >> 7) as u8);
+        let codes = tab(ex * n * k / 2, |i| ((i * 2_654_435_761) >> 7) as u8);
         let scales = tab(ex * n * k / 32, |i| 120 + (i % 7) as u8);
         let (mx, sc) = (
             t(b.up(&codes), ex, n * k / 2, U8),
