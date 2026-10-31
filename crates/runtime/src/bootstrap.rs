@@ -149,6 +149,7 @@ pub struct EngineConfig {
     pub draft_mask_token: u32,
     pub draft_proposals_from: u32,
     pub has_attn_page_mask: bool,
+    pub rotates_by_table: bool,
     pub has_lora: bool,
     /// The engine takes an attachment for an adapter alone
     /// ([`::engine::fire::Attachment::adapter_only`]): an adapted pass can be cut.
@@ -338,6 +339,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         draft_mask_token: engine_configs.first().map_or(0, |d| d.draft_mask_token),
         draft_proposals_from: engine_configs.first().map_or(1, |d| d.draft_proposals_from),
         has_attn_page_mask: all(|d| d.has_attn_page_mask),
+        rotates_by_table: all(|d| d.rotates_by_table),
         adapter_attachments: all(|d| d.adapter_attachments),
         rs_snapshots: engine_configs
             .iter()

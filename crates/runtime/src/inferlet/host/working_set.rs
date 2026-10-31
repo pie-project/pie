@@ -233,6 +233,14 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         end: u32,
     ) -> Result<Result<u32, String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
+        let model = crate::model::model();
+        if !model.eta_caps().rotates_by_table || model.rs_caps().has_state() {
+            return Ok(Err(
+                "this model cannot forget: its rows rotate by their slots, or a recurrent \
+                 state has already folded them"
+                    .to_string(),
+            ));
+        }
         let (kv_rep, cursor) = {
             let ws = self.ctx().table.get(&this)?;
             (ws.kv, ws.cursor())
