@@ -444,6 +444,7 @@ class Swarm:
 
     async def observe(self, b: Branch, observation: str) -> None:
         """Close the reply, add the command's output as the user's turn, open the next reply."""
+        reply = [b.length, b.length + len(b.unfed), b.turns]
         tokens = b.unfed + ([b.pending] if b.pending is not None else []) + self.asst_tail
         b.unfed = []
         tokens += self.user_head
@@ -454,6 +455,8 @@ class Swarm:
         b.pending, b.entropy = await self.feed(b, tokens, self.cfg["temperature"], measure=True)
         self.stats.prefilled += len(tokens)
         b.outputs_at.append([start, start + len(body), b.turns])
+        if self.cfg["forget_replies"]:
+            b.outputs_at.append(reply)
         self.forget_stale(b)
 
     def forget_stale(self, b: Branch) -> None:
@@ -740,6 +743,7 @@ DEFAULTS = {
     "ahead": True,  # decode on the run-ahead path, a fork per reply, instead of one host round trip a token
     "forget_after": 0,  # turns after a command that its output leaves the KV; 0 keeps it
     "forget_keep": 64,  # tokens kept at each end of a forgotten output
+    "forget_replies": False,  # drop the agent's old replies the same way
 }
 
 
