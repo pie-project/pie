@@ -13,6 +13,15 @@ pub struct SpatialBoot {
     /// The most steps a greedy lane's token loop runs past its row (0: off;
     /// loops start at 8 and double while a sequence uses them up).
     pub lookahead: Option<usize>,
+    /// Whether frames settle asynchronously (default on): the wafer runs a
+    /// token loop on while the host runs its answered rows' epilogues.
+    /// `false`: each frame runs whole inside its submit. A continuation
+    /// covers only fires the lane has posted, so it runs as far as
+    /// `[runtime] frame_dispatch_depth` lets the guest post: 15 (the most)
+    /// is the depth to serve with (on a CS-3, 0.6B B1 at frame size 4: 1394
+    /// tok/s at depth 2, 1545 at 15; 8B B1: 733, 779).
+    #[serde(rename = "async")]
+    pub asynchronous: Option<bool>,
     /// A Hugging Face directory to read the weights from instead of the
     /// load's checkpoint.
     pub ckpt: Option<String>,
@@ -86,7 +95,12 @@ mod tests {
             .expect("a table");
         assert_eq!(b.program.as_deref(), Some("p"));
         assert_eq!(b.lookahead, Some(8));
+        assert_eq!(b.asynchronous, None);
         assert_eq!((b.pre_margin, b.main_fraction), (Some(1.0), Some(0.5)));
+        let b = of("[cerebras.spatial]\nprogram = \"p\"\nasync = false\n")
+            .expect("parses")
+            .expect("a table");
+        assert_eq!(b.asynchronous, Some(false));
     }
 
     #[test]
