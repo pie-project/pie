@@ -296,6 +296,7 @@ __global__ void __launch_bounds__(128) moe_select_bf16_wgmma(
 /// 64 codes stages its half (the rest zero) and steps its first four k-steps
 /// alone. Grid `[work_cap, rows / 128]` (64 GLU columns), 128 threads,
 /// `kStages 25600 + 5120` bytes of shared memory past a 1024-byte alignment.
+/// `kSlice` 128 and `kWg` 2: 128 routes against two warpgroups' tiles.
 
 template <int kGlu, bool kNv, int kStages, int kSlice = 64, int kWg = 1>
 __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2) moe_select_fp4_wgmma(

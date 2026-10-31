@@ -123,10 +123,11 @@ pub(super) const STAGED_FROM: u32 = 16;
 #[cfg(feature = "cuda")]
 pub(super) const WGMMA_FROM: u32 = 13;
 
+/// The fewest routes an expert averages that take Hopper's wide wgmma slice:
+/// 128 routes on two warpgroups' 256 rows (gpt-oss-20b on an H100: pf32-512
+/// 33.1k to 41.4k tok/s, c1024 16.6k to 18.6k).
 #[cfg(feature = "cuda")]
-fn wgmma_wide_from() -> u32 {
-    std::env::var("PIE_WGMMA_WIDE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(256)
-}
+pub(super) const WGMMA_WIDE_FROM: u32 = 128;
 
 /// The fewest routes an expert averages that the staged slice takes on
 /// `moe_select_mxfp4_mma_pipe`: below it the fire's 256-row CTAs fill the
@@ -204,8 +205,11 @@ pub(super) fn select_mxfp4_mma(
         && tensor_scales.is_none()
         && crate::jit::cache::arch() == Some("sm_89")
         && x.width.is_multiple_of(64);
-    // Hopper's wgmma slice of 128 routes past `WGMMA_WIDE_FROM` an expert.
-    let wide = staged && hopper_wgmma() && x.width.is_multiple_of(64) && per >= wgmma_wide_from();
+    let wide = staged
+        && hopper_wgmma()
+        && tensor_scales.is_none()
+        && x.width.is_multiple_of(64)
+        && per >= WGMMA_WIDE_FROM;
     let nb: u32 = match per {
         _ if wide => 16,
         _ if staged => 8,
