@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use super::KvStore;
 use super::hash::Hash256;
 use super::page_table::{
-    KvPageBacking, KvPageTable, NoReclaim, PhysicalKvPageId, PublishedPage, ReclaimQuote,
-    WorkingSetId,
+    FORGOTTEN_PAGE, KvPageBacking, KvPageTable, NoReclaim, PhysicalKvPageId, PublishedPage,
+    ReclaimQuote, WorkingSetId,
 };
 use super::write::{KvPreparedWrite, PageCommit, PreparedTarget};
 use crate::inferlet::process::ProcessId;
@@ -48,12 +48,14 @@ fn sorted_backings(mut v: Vec<KvPageBacking>) -> Vec<u32> {
         KvPageBacking::Resident(page) => page.0,
         KvPageBacking::Swapped(slot) => slot.0,
         KvPageBacking::OnDisk(slot) => slot.0,
+        KvPageBacking::Forgotten => u32::MAX,
     });
     v.into_iter()
         .map(|backing| match backing {
             KvPageBacking::Resident(page) => page.0,
             KvPageBacking::Swapped(slot) => slot.0,
             KvPageBacking::OnDisk(slot) => slot.0,
+            KvPageBacking::Forgotten => u32::MAX,
         })
         .collect()
 }
@@ -90,6 +92,173 @@ fn tests_every_case() {
     a_demote_leaves_what_a_higher_key_covers();
     an_answer_goes_before_an_older_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
+    a_forgotten_page_goes_back_to_the_pool();
+    a_page_a_fork_reads_waits_for_the_fork();
+    a_suspend_leaves_forgotten_pages_behind();
+    a_fire_out_keeps_what_was_forgotten_until_it_lands();
+    a_forgotten_page_is_found_by_no_key();
+}
+
+fn forgotten(store: &mut KvStore, ws: WorkingSetId, pages: std::ops::Range<u64>) -> usize {
+    store.forget(ws, pages.clone(), pages.start * 16).unwrap();
+    store.reclaim_forgotten(ws).unwrap()
+}
+
+fn gone(store: &mut KvStore, ws: WorkingSetId) {
+    store.release_working_set(ws, store.current_epoch());
+    store.retire_idle();
+}
+
+fn a_forgotten_page_goes_back_to_the_pool() {
+    let mut store = KvStore::new(8, h(61));
+    let ws = store.create_working_set();
+    let kept = commit_fresh(&mut store, ws, 4, 1);
+    assert_eq!(store.available_pages(), 4);
+    assert_eq!(forgotten(&mut store, ws, 1..3), 2);
+    assert_eq!(store.available_pages(), 6);
+    assert_eq!(store.held_page_count(&HashSet::from([ws])).unwrap(), 2);
+    assert_eq!(
+        store.flat_table(ws).unwrap(),
+        [kept[0], FORGOTTEN_PAGE, FORGOTTEN_PAGE, kept[3]],
+        "the table keeps its length, and what stays where it was"
+    );
+    assert_eq!(store.reclaim_forgotten(ws).unwrap(), 0, "only once");
+    gone(&mut store, ws);
+    assert_eq!(store.available_pages(), 8, "the rest, and nothing twice");
+}
+
+fn a_page_a_fork_reads_waits_for_the_fork() {
+    let mut store = KvStore::new(8, h(62));
+    let parent = store.create_working_set();
+    let pages = commit_fresh(&mut store, parent, 3, 1);
+    let child = store.fork(parent).unwrap();
+    assert_eq!(
+        forgotten(&mut store, parent, 0..2),
+        0,
+        "the fork reads them"
+    );
+    assert_eq!(store.available_pages(), 5);
+    assert_eq!(store.flat_table(child).unwrap(), pages.as_slice());
+    gone(&mut store, child);
+    assert_eq!(store.available_pages(), 5, "until the next try");
+    assert_eq!(store.reclaim_forgotten(parent).unwrap(), 2);
+    assert_eq!(store.available_pages(), 7);
+    gone(&mut store, parent);
+    assert_eq!(store.available_pages(), 8);
+
+    // A fork of what forgot does not read it, so the last of them gives it up.
+    let parent = store.create_working_set();
+    commit_fresh(&mut store, parent, 3, 1);
+    let reader = store.fork(parent).unwrap();
+    assert_eq!(forgotten(&mut store, parent, 0..2), 0);
+    let late = store.fork(parent).unwrap();
+    assert_eq!(store.forgotten(late).unwrap().len(), 2);
+    gone(&mut store, reader);
+    assert_eq!(
+        store.reclaim_forgotten(parent).unwrap(),
+        0,
+        "late holds them"
+    );
+    gone(&mut store, parent);
+    assert_eq!(store.available_pages(), 5);
+    assert_eq!(store.reclaim_forgotten(late).unwrap(), 2);
+    gone(&mut store, late);
+    assert_eq!(store.available_pages(), 8);
+}
+
+fn a_suspend_leaves_forgotten_pages_behind() {
+    let mut store = KvStore::new_with_swap(4, 4, 0, h(63));
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 4, 1);
+    assert_eq!(forgotten(&mut store, ws, 1..3), 2);
+    let sets = HashSet::from([ws]);
+    let Some(txn) = store.prepare_suspend(&sets).unwrap() else {
+        panic!("two private resident pages suspend");
+    };
+    assert_eq!(store.commit_suspend(txn).unwrap(), 2);
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 4);
+    assert_eq!(store.swapped_page_count(&sets).unwrap(), 2);
+
+    let mut granted = store.reserve_device_pages(2).unwrap();
+    let txn = store.prepare_restore(&sets, &mut granted).unwrap();
+    assert_eq!(txn.page_count(), 2, "nothing brings a forgotten page back");
+    assert_eq!(store.commit_restore(txn).unwrap(), 2);
+    let table = store.flat_table(ws).unwrap().to_vec();
+    assert_eq!(table[1..3], [FORGOTTEN_PAGE, FORGOTTEN_PAGE]);
+    assert!(table[0] != FORGOTTEN_PAGE && table[3] != FORGOTTEN_PAGE);
+    assert_eq!(store.host_swap_available(), 4);
+
+    // Forgotten below the device, it gives its slot back.
+    let txn = store.prepare_suspend(&sets).unwrap().unwrap();
+    assert_eq!(store.commit_suspend(txn).unwrap(), 2);
+    store.retire_idle();
+    assert_eq!(store.host_swap_available(), 2);
+    assert_eq!(forgotten(&mut store, ws, 0..1), 0, "no device page");
+    assert_eq!(store.host_swap_available(), 3);
+    gone(&mut store, ws);
+    assert_eq!(store.host_swap_available(), 4);
+    assert_eq!(store.available_pages(), 4);
+}
+
+fn a_fire_out_keeps_what_was_forgotten_until_it_lands() {
+    let mut store = KvStore::new(4, h(64));
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 2, 1);
+    store.reserve(ws, 1).unwrap();
+    let prepared = prepare_write(&mut store, ws, &[2]);
+    let seq = store.publish_prepared(prepared, &[pc(1)]).unwrap();
+    assert_eq!(forgotten(&mut store, ws, 0..1), 1);
+    assert_eq!(store.available_pages(), 1, "the fire may read it");
+    store.settle(seq);
+    assert_eq!(store.available_pages(), 2);
+}
+
+fn a_forgotten_page_is_found_by_no_key() {
+    let mut store = KvStore::new(8, h(65));
+    let tokens: Vec<u32> = (0..64).map(|t| 700 + t).collect();
+    store.set_keeps(true);
+    store.set_page_size(16);
+    let ws = store.create_working_set();
+    commit_opaque(&mut store, ws, 4);
+    seal(&mut store, ws, 0, &tokens);
+    store.log_rows(ws, 0, &tokens).unwrap();
+    let probe = store.create_working_set();
+    let keys = keys_ahead(&store, probe, 0, &tokens);
+    assert_eq!(store.cached_run_any_tier(&keys).len(), 4);
+    assert_eq!(forgotten(&mut store, ws, 2..3), 1);
+    assert_eq!(
+        store.cached_run_any_tier(&keys).len(),
+        2,
+        "a key finds the pages before it"
+    );
+    assert_eq!(store.chain_root(ws, 64, 16).unwrap(), None);
+    assert_eq!(store.page_keys(ws, 64, &[], 16).unwrap(), None);
+
+    // What follows seals under no key, at a fold or by a pass.
+    commit_opaque(&mut store, ws, 1);
+    store.log_rows(ws, 64, &[9; 16]).unwrap();
+    assert_eq!(store.fold(ws, 80, true).unwrap(), 0);
+
+    gone(&mut store, ws);
+    assert_eq!(store.cached_working_sets().len(), 0, "no owner, no set");
+    assert_eq!(store.cached_run_any_tier(&keys).len(), 2);
+    assert_eq!(store.available_pages(), 6, "the prefix before it stays");
+    gone(&mut store, probe);
+
+    // The first page of a node leaves the index it was found by.
+    let mut store = KvStore::new(8, h(66));
+    let ws = store.create_working_set();
+    commit_opaque(&mut store, ws, 2);
+    seal(&mut store, ws, 0, &tokens[..32]);
+    let probe = store.create_working_set();
+    let keys = keys_ahead(&store, probe, 0, &tokens[..32]);
+    assert_eq!(forgotten(&mut store, ws, 0..1), 1);
+    assert_eq!(store.cached_run_any_tier(&keys).len(), 0);
+    assert_eq!(store.sealed_keys().len(), 1, "the page after it is whole");
+    gone(&mut store, ws);
+    assert_eq!(store.sealed_keys().len(), 0);
+    assert_eq!(store.available_pages(), 8);
 }
 
 /// Pages that came from another worker, whose keys this worker computes from

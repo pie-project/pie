@@ -128,6 +128,9 @@ export class WorkingSetStub {
   cachedTokens() {
     return 0;
   }
+  forget() {
+    return 0;
+  }
   fork() {
     return new WorkingSetStub();
   }

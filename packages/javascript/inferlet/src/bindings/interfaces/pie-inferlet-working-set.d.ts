@@ -24,4 +24,10 @@ export class WorkingSet {
   * ordered on `on`.
   */
   fork(on: Pipeline): WorkingSet;
+  /**
+  * Later rows of this working set and its forks no longer read the
+  * whole pages inside frozen `[start, end)`; rows keep their positions
+  * and nothing is recomputed. Returns the slots dropped.
+  */
+  forget(start: number, end: number): number;
 }
