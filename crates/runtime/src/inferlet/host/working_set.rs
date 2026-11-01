@@ -233,13 +233,8 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         end: u32,
     ) -> Result<Result<u32, String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        let model = crate::model::model();
-        if !model.eta_caps().rotates_by_table || model.rs_caps().has_state() {
-            return Ok(Err(
-                "this model cannot forget: its rows rotate by their slots, or a recurrent \
-                 state has already folded them"
-                    .to_string(),
-            ));
+        if let Some(refusal) = cannot_change_reads() {
+            return Ok(Err(refusal));
         }
         let (kv_rep, cursor) = {
             let ws = self.ctx().table.get(&this)?;
@@ -263,6 +258,76 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         })
     }
 
+    async fn merge(
+        &mut self,
+        this: Resource<WorkingSet>,
+        other: Resource<WorkingSet>,
+        start: u32,
+        end: u32,
+    ) -> Result<Result<u32, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        if let Some(refusal) = cannot_change_reads() {
+            return Ok(Err(refusal));
+        }
+        let (kv_rep, folded) = {
+            let ws = self.ctx().table.get(&this)?;
+            (ws.kv, ws.cursor().folded)
+        };
+        let (other_rep, cursor) = {
+            let ws = self.ctx().table.get(&other)?;
+            (ws.kv, ws.cursor())
+        };
+        if !cursor.folded_exact || end > cursor.folded {
+            return Ok(Err(format!(
+                "merge reaches {end}, past the frozen {} slot(s)",
+                cursor.folded
+            )));
+        }
+        let (kv, from) = (kv_of(self, kv_rep)?, kv_of(self, other_rep)?);
+        let stores = store_registry::get(kv.model, kv.engine);
+        let page = stores.kv_page_size.max(1);
+        let (first, last) = (start.div_ceil(page), end / page);
+        if first >= last {
+            return Ok(Ok(0));
+        }
+        let pages = u64::from(first)..u64::from(last);
+        // The process holds a fork of `other` to its end: its pages stay, and
+        // move between tiers with the process's other working sets.
+        let view = store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
+            let view = s.fork(from.id)?;
+            s.merge(kv.id, view, pages, u64::from(folded))?;
+            Ok::<_, crate::store::kv::KvStoreError>(view)
+        });
+        let view = match view {
+            Ok(view) => from.forked(view),
+            Err(error) => return Ok(Err(error.to_string())),
+        };
+        self.register_kv_working_set(&view);
+        self.ctx().table.push(view)?;
+        Ok(Ok((last - first) * page))
+    }
+
+    async fn advance(
+        &mut self,
+        this: Resource<WorkingSet>,
+        slots: u32,
+    ) -> Result<Result<(), String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        if let Some(refusal) = cannot_change_reads() {
+            return Ok(Err(refusal));
+        }
+        let (kv_rep, folded) = {
+            let ws = self.ctx().table.get(&this)?;
+            (ws.kv, ws.cursor().folded)
+        };
+        let kv = kv_of(self, kv_rep)?;
+        let stores = store_registry::get(kv.model, kv.engine);
+        let moved = store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
+            s.advance(kv.id, slots, u64::from(folded))
+        });
+        Ok(moved.map_err(|error| error.to_string()))
+    }
+
     async fn drop(&mut self, this: Resource<WorkingSet>) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.delete(this)?;
@@ -282,6 +347,16 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         }
         Ok(())
     }
+}
+
+/// Why rows of this model cannot read other pages than their slots say.
+fn cannot_change_reads() -> Option<String> {
+    let model = crate::model::model();
+    (!model.eta_caps().rotates_by_table || model.rs_caps().has_state()).then(|| {
+        "this model cannot change what a working set reads: its rows rotate by their slots, \
+         or a recurrent state has already folded them"
+            .to_string()
+    })
 }
 
 pub(crate) fn grow_pages(kv: &KvWorkingSet, end: u32) -> Result<(), String> {

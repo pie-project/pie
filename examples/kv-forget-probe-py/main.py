@@ -8,10 +8,13 @@
   --mode sweep   `speed` over comma-separated `contexts` and `fractions`.
   --mode paths   greedy tokens past a forgotten span, host loop against run-ahead.
   --mode decl    what a plain lane reads out.
+  --mode merged  chunks read apart and merged, against one sequence masked to match.
+  --mode read    a codebase read in order, or in parallel and merged; then questions.
   --mode team    sub-agents forked from one context, each asked about its own module;
                  `focus` makes each forget the other modules first.
 """
 
+import json
 import random
 import time
 
@@ -317,6 +320,174 @@ async def team(input: dict) -> dict:
     }
 
 
+async def read_chunk(ws: WorkingSet, pipe: Pipeline, tokens: list[int], at: int, keep: range | None, start: int, span: int) -> None:
+    """Read `tokens` at positions from `at`; with `keep`, as rows of one sequence that see only
+    the header and their own chunk, which is what a fork reading the chunk alone computes."""
+    fwd = ForwardPass()
+    fwd.embed(tokens)
+    if keep is not None:
+        rows = [(key < keep.start or start <= key <= start + row) for row in range(len(tokens)) for key in range(span)]
+        fwd.mask(Channel.from_shaped([len(tokens), span], rows, dtype.bool))
+        fwd.state([ws], StateGeometry.folding())
+    else:
+        positions = Channel.from_(list(range(at, at + len(tokens))), dtype.u32)
+        fwd.state([ws], StateGeometry.folding(positions=positions))
+    tok = Channel([1], dtype.i32)
+
+    @fwd.epilogue
+    def _():
+        tok.put(reshape(reduce_argmax(intrinsics.output(0, "logits")), [1]))
+
+    pipe.submit(fwd)
+    await tok.take_scalar()
+
+
+async def merged(input: dict) -> dict:
+    """`merge` against one sequence masked so each chunk saw only the header and itself: chunks
+    read apart and merged must give the same logits."""
+    page = kv_page_size()
+    header_len, chunk_len = input.get("header", 8) * page, input.get("chunk", 16) * page
+    chunks, steps = input.get("chunks", 4), input.get("steps", 8)
+    header = text_tokens(header_len, 3)
+    parts = [text_tokens(chunk_len, 20 + i) for i in range(chunks)]
+    forced = text_tokens(steps, 2)
+    total = header_len + chunks * chunk_len
+    span = total + steps + 1
+    arms = {}
+    for arm in ("seen", "mask", "merge"):
+        ws, pipe = WorkingSet(), Pipeline()
+        await step(ws, pipe, header)
+        readers = []
+        for i, part in enumerate(parts):
+            start = header_len + i * chunk_len
+            if arm == "merge":
+                child = ws.fork(pipe)
+                await read_chunk(child, pipe, part, start, None, 0, 0)
+                readers.append(child)
+            elif arm == "mask":
+                await read_chunk(ws, pipe, part, start, range(header_len, span), start, span)
+            else:
+                await step(ws, pipe, part)
+        slots = sum(ws.merge(child, header_len, header_len + chunk_len) for child in readers)
+        rows = [await logits_of(ws, pipe, [token]) for token in forced]
+        pipe.close()
+        arms[arm] = {"rows": rows, "slots": slots}
+    gap = lambda a, b: [round(apart(x, y), 4) for x, y in zip(arms[a]["rows"], arms[b]["rows"])]
+    return {
+        "page": page, "total": total, "merged_slots": arms["merge"]["slots"],
+        "merge_vs_mask_max": max(gap("merge", "mask")), "merge_vs_mask": gap("merge", "mask"),
+        "seen_vs_mask_max": max(gap("seen", "mask")),
+    }
+
+
+async def read(input: dict) -> dict:
+    """A codebase attached as `docs`. `seq` reads it in order, as one context. `par` forks a reader
+    for each chunk, reads them side by side at the positions they would have had, and merges
+    them. Then both answer the same questions, some of which need two chunks."""
+    data = json.loads(session.file("docs"))
+    header, chunks, questions = data["header"], data["chunks"], data["questions"]
+    if input.get("kind"):
+        questions = [q for q in questions if q["kind"] == input["kind"]]
+    arm, decode = input.get("arm", "par"), input.get("decode", 12)
+    h, each, count = len(header), len(chunks[0]), len(chunks)
+    v = model.output_vocab_size()
+    ws, pipe = WorkingSet(), Pipeline()
+    await step(ws, pipe, header)
+    t0 = time.monotonic()
+    readers = []
+    if arm == "seq":
+        for part in chunks:
+            for at in range(0, each, 1024):
+                await step(ws, pipe, part[at:at + 1024])
+    elif arm == "apart":
+        readers = [ws.fork(pipe) for _ in chunks]
+        for i, part in enumerate(chunks):
+            for at in range(0, each, 1024):
+                await read_chunk(readers[i], pipe, part[at:at + 1024], h + i * each + at, None, 0, 0)
+    else:
+        readers = [ws.fork(pipe) for _ in chunks]
+        width = input.get("width", 1024 // count)
+        for at in range(0, each, width):
+            rows = [part[at:at + width] for part in chunks]
+            fwd = ForwardPass()
+            fwd.embed(
+                Channel.from_([token for row in rows for token in row], dtype.i32),
+                Channel.from_([i * len(rows[0]) for i in range(count + 1)], dtype.u32),
+            )
+            spots = [h + i * each + at + j for i in range(count) for j in range(len(rows[0]))]
+            fwd.state(readers, StateGeometry.folding(positions=Channel.from_(spots, dtype.u32)))
+            done = Channel([count], dtype.i32)
+
+            @fwd.epilogue
+            def _():
+                done.put(reduce_argmax(reshape(intrinsics.output(0, "logits"), [count, v])))
+
+            pipe.submit(fwd)
+            await done.take_host()
+    reading = time.monotonic() - t0
+    t0 = time.monotonic()
+    picked = input.get("picked", 0)
+    merged_slots = 0 if picked else sum(ws.merge(reader, h, h + each) for reader in readers)
+    merging = time.monotonic() - t0
+    batch, answers = input.get("batch", 16), []
+    t0 = time.monotonic()
+    for at in range(0, len(questions), batch):
+        group = questions[at:at + batch]
+        forks = [ws.fork(pipe) for _ in group]
+        lanes = len(group)
+        indptr = [0]
+        for lane, question in enumerate(group):
+            if picked:  # only the chunks this question needs, the best a page selector could do
+                slots = sum(forks[lane].merge(readers[chunk], h, h + each) for chunk in sorted(question["chunks"]))
+                forks[lane].advance(each * count - slots)
+        for question in group:
+            indptr.append(indptr[-1] + len(question["q"]))
+        first = Channel([lanes], dtype.i32)
+        ask = ForwardPass()
+        ask.embed(Channel.from_([t for question in group for t in question["q"]], dtype.i32), Channel.from_(indptr, dtype.u32))
+        ask.state(forks, StateGeometry.folding())
+
+        @ask.epilogue
+        def _():
+            first.put(reduce_argmax(reshape(intrinsics.output(0, "logits"), [lanes, v])))
+
+        pipe.submit(ask)
+        heads = await first.take_host()
+        tok_in = Channel.from_(heads, dtype.i32)
+        tok_out = Channel([lanes], dtype.i32).capacity(channel_capacity())
+        go = ForwardPass()
+        go.embed(tok_in, Channel.from_(list(range(lanes + 1)), dtype.u32))
+        go.state(forks, StateGeometry.folding())
+
+        @go.epilogue
+        def _():
+            token = reduce_argmax(reshape(intrinsics.output(0, "logits"), [lanes, v]))
+            tok_in.put(token)
+            tok_out.put(token)
+
+        out = [[t] for t in heads]
+
+        async def on_step() -> bool:
+            for lane, token in enumerate(await tok_out.take_host()):
+                out[lane].append(token)
+            return True
+
+        await pipe.run_ahead(go, decode, on_step, end=False)
+        answers += [model.decode(row) for row in out]
+    asking = time.monotonic() - t0
+    pipe.close()
+    hit = lambda q, text: all(part in text for part in q["a"].split())
+    tally = lambda kind: sum(hit(q, text) for q, text in zip(questions, answers) if q["kind"] == kind)
+    return {
+        "arm": arm, "chunks": count, "tokens": h + each * count, "merged_slots": merged_slots,
+        "read_s": round(reading, 2), "read_tps": round(each * count / reading, 1), "merge_ms": round(merging * 1000, 2),
+        "ask_s": round(asking, 2), "questions": len(questions),
+        "right_one": tally("one"), "right_two": tally("two"), "right_pair": tally("pair"), "right_quad": tally("quad"),
+        "right": [int(hit(q, text)) for q, text in zip(questions, answers)],
+        "samples": [text[:14] for text in answers[:6]],
+    }
+
+
 async def sweep(input: dict) -> dict:
     """`speed` over every context and fraction, in one engine."""
     rows = []
@@ -332,4 +503,4 @@ async def main(input: dict) -> dict:
     mode = input.get("mode", "exact")
     if mode == "decl":
         return {"outputs": [[o.name, o.width, o.layers, o.readout] for o in model.lane([]).outputs], "page": kv_page_size()}
-    return await {"exact": exact, "speed": speed, "sweep": sweep, "paths": paths, "team": team}[mode](input)
+    return await {"exact": exact, "speed": speed, "sweep": sweep, "paths": paths, "team": team, "merged": merged, "read": read}[mode](input)

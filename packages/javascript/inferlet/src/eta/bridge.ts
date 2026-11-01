@@ -294,6 +294,16 @@ export class WorkingSet {
     return wit('forget', () => this.ws.forget(start, end));
   }
 
+  /** Later rows also read the whole frozen pages of `other` inside `[start, end)`; returns the slots merged. */
+  merge(other: WorkingSet, start: number, end: number): number {
+    return wit('merge', () => this.ws.merge(other.ws, start, end));
+  }
+
+  /** Rows from here on run `slots` positions further: past what a merge of only some chunks left out. */
+  advance(slots: number): void {
+    wit('advance', () => this.ws.advance(slots));
+  }
+
   /** A child sharing the frozen part, with a copy of the buffer. */
   fork(on: Pipeline): WorkingSet {
     return WorkingSet.wrap(wit('fork', () => this.ws.fork(on.wit)));
