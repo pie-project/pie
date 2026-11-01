@@ -1862,7 +1862,7 @@ mod tests {
         (
             "serve8b",
             "grid_pe.csl",
-            "04c7a6d99f99b15cd845ef9c3d0ef20aac4ef23d2cae04a2af0315278860b56f",
+            "24449b97365e202aacec8b35408490458f94990652201508e796d7410b5bbcd0",
         ),
         (
             "serve8b",
@@ -1882,12 +1882,12 @@ mod tests {
         (
             "serve8b_region",
             "grid_pe.csl",
-            "cbb8fe8351a810a725cd7a4db2213930247469684fa52e21c2a473ac1c5c8e87",
+            "8bf4075a5b95e1d79ba68a4cd8f2b6194573ff69298976f5c920443750eaaad3",
         ),
         (
             "serve8b_region",
             "region_pe.csl",
-            "7bc64cd4c7280db5a1564a9594c14156bf238a75f7c5274dbb30def72f3b94e3",
+            "c59b6089733cc1241a766f26e896bcc99fbdb2bba345d8b26388a233314211c8",
         ),
         (
             "serve8b_region",
@@ -1917,12 +1917,12 @@ mod tests {
         (
             "serve8b_region_pipe",
             "grid_pe.csl",
-            "eb7ba4391c5cdf574779986a347b40a18eca9538565c173e70c1a263d4579326",
+            "f18ef599882f6218fa6883287fa26729bb14b6f56fcb38fa6e2d118a0599ff48",
         ),
         (
             "serve8b_region_pipe",
             "region_pe.csl",
-            "f63cbafd2d5830829a4869cb317943cc792cda88ad8f23c5b2bd73077393ba20",
+            "dfd2dc07a0a5601ea0906d306950a33856947d33c0fb270588023e4b0becb3b8",
         ),
         (
             "serve8b_region_pipe",

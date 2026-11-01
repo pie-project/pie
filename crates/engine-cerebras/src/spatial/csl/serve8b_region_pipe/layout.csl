@@ -92,6 +92,7 @@ const C_R2_0: color = @get_color(6);
 const C_R2_1: color = @get_color(5);
 const C_BC: color = @get_color(9);
 const C_GB: color = @get_color(10);
+const C_GBC: color = @get_color(16);   // the segment all-reduce's group broadcast, a color of its own
 // Lanes whose logits rows the head keeps (hlogits): HLBN, or min(B, 4) when 0.
 const HLB: u16 = if (HLBN > 0) HLBN else if (B < 4) B else 4;
 
@@ -183,7 +184,7 @@ layout {
           .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC, .W16 = W16, .NP = NP, .KV16 = KV16,
           .KVCP = KVCP, .PROF = PROF, .HROUTE = HROUTE, .ROT8 = ROT8, .S2D_TIME = TIME, .S2D_RTR = RTR, .S2D_NOLAYER = NOLAYER,
           .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
-          .c_bc = C_BC, .c_gb = C_GB,
+          .c_bc = C_BC, .c_gb = C_GB, .GBC = 1, .c_gbc = C_GBC,
         });
       } else if (region) {
         @set_tile_code(x, y, "region_pe.csl", .{
@@ -192,7 +193,7 @@ layout {
           .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC, .W16 = W16, .NP = NP, .KV16 = KV16,
           .KVCP = KVCP, .PROF = PROF, .NL = RNL, .GY = RGY, .HROUTE = HROUTE, .ROT8 = ROT8, .S2D_TIME = TIME, .S2D_RTR = RTR, .S2D_NOLAYER = NOLAYER,
           .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
-          .c_bc = C_BC, .c_gb = C_GB,
+          .c_bc = C_BC, .c_gb = C_GB, .GBC = 1, .c_gbc = C_GBC,
         });
       } else {
         @set_tile_code(x, y, "filler.csl", .{

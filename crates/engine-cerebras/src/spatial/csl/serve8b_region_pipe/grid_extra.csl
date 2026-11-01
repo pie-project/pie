@@ -147,6 +147,7 @@ fn s2d_tab_io(m: u16, load: bool) void {
   }
 }
 fn compute(steps: u32, start_pos: u32) void {
+  gbc_routes();   // the group broadcast's own color (GBC 1), its routes for this launch
   if (S2D_TIME == 1) { timestamp.enable_tsc(); }
   const nmb: u32 = if (S2D_PIPE == 1) start_pos else 1;
   // serve8b_region_pipe probe: this PE's output-queue status at the launch's
