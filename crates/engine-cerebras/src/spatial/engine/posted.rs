@@ -60,9 +60,24 @@ fn launch_of(mut candidates: Vec<(usize, usize)>, lanes: usize) -> (Vec<usize>, 
 }
 
 impl Spatial {
-    /// Whether frames settle asynchronously (`async`, on unless set false).
+    /// Whether frames settle asynchronously: `async` when set, else on for
+    /// a build whose launches carry one lane (B1, no pipeline), the shape
+    /// it is measured on. A pipelined or multi-lane build packs several
+    /// lanes' continuations into one launch, and a 12-stream pipe program
+    /// stalled on that on a CS-3 (a launch never answered); set `async` to
+    /// run it there anyway.
     pub(super) fn asynchronous(&self) -> bool {
-        self.spatial.asynchronous.unwrap_or(true)
+        self.spatial.asynchronous.unwrap_or_else(|| {
+            self.model
+                .as_ref()
+                .is_some_and(|w| w.paged.is_some() && w.launch_lanes <= 1)
+        })
+    }
+
+    /// Whether this engine runs asynchronously now: the runtime asked
+    /// [`Spatial::asynchronous`] and gave it a completion sink.
+    pub(super) fn settling(&self) -> bool {
+        self.sink.is_some()
     }
 
     /// Runs posted steps in order as far as the wafer has answered them,

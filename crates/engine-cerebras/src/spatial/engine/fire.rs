@@ -697,7 +697,7 @@ impl Spatial {
                     {
                         // An asynchronous engine keeps a used-up loop: its
                         // continuation may be on the wafer, or post next.
-                        if run.run.is_empty() && !self.asynchronous() {
+                        if run.run.is_empty() && !self.settling() {
                             self.paged_ahead.remove(&lane.slot);
                         }
                         self.ahead_hits += 1;
