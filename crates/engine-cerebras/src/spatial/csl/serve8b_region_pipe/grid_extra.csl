@@ -87,7 +87,11 @@ fn recv_x() void {
     s2d_oq2(rtab[3]);
     @fmovs(fout(q_gb_out, S2D_XN), x_all);
   }
-  if (rtab[4] != RNONE) { rt.iq_color(2, rtab[4]); }
+  // Queue 2 keeps the recv color: with micro-batches back to back the next
+  // one's x can arrive right behind this one's, and a queue recolored to
+  // fwd_in here would hand those words to the forward below (the ring then
+  // waits on pieces that never come; a CS-3 launch of 5 micro-batches hung
+  // so). A forward's pieces take input queue 7 instead (send_x).
 }
 
 // serve8b_region_pipe: rtab[2] bit 8 (host-set on the last unit's PEs that
@@ -99,17 +103,22 @@ const s2d_mw_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> s2d_mw[i] }
 fn send_x() void {
   const ns = rtab[2] & 0xff;
   if (ns > 0) { s2d_oq2(rtab[OFF_O]); }
+  // A forward's pieces arrive on fwd_in at input queue 7, the broadcast's,
+  // which is idle during the send: this pass's broadcasts are all read, and
+  // the next pass's need this PE in its next layer first.
+  if (rtab[4] != RNONE) { rt.iq_color(7, rtab[4]); }
   var k: u16 = 0;
   while (k < ns) : (k += 1) {
     const e = OFF_O + 3 * k;
     const n = rtab[e + 2];
     if (rtab[e + 1] == FWD) {
-      @fmovs(fout(q_gb_out, n), fin(q_gb_in, n));
+      @fmovs(fout(q_gb_out, n), fin(q_bc_in, n));
     } else {
       var b: u16 = 0;
       while (b < B) : (b += 1) { @fmovs(fout(q_gb_out, n), s2d_lane(b, rtab[e + 1], n)); }
     }
   }
+  if (rtab[4] != RNONE) { rt.iq_color(7, @get_int(c_bc)); }
   if (S2D_PIPE == 1 and (rtab[2] & 0x100) != 0) {
     s2d_mw[0] = @as(f32, s2d_m);
     @fmovs(fout(q_gb_out, 1), s2d_mw_dsd);

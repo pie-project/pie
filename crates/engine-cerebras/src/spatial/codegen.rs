@@ -1917,12 +1917,12 @@ mod tests {
         (
             "serve8b_region_pipe",
             "grid_pe.csl",
-            "7e44cea7fd5e823a5502a3d398b009bf96766ddd77d478735d6bee6fcb9672ba",
+            "eb7ba4391c5cdf574779986a347b40a18eca9538565c173e70c1a263d4579326",
         ),
         (
             "serve8b_region_pipe",
             "region_pe.csl",
-            "f4e5d8b88153ce2efcc4de471bd8d5a2ab71f11d5461a32fd28041cab6fa336e",
+            "f63cbafd2d5830829a4869cb317943cc792cda88ad8f23c5b2bd73077393ba20",
         ),
         (
             "serve8b_region_pipe",
