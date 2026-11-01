@@ -23,7 +23,7 @@ kernels-ir = { path = "../kernels-ir" }
 profile = { package = "pie-profile", path = "../profile" }
 
 libloading = { version = "0.9", optional = true }
-miniz_oxide = { version = "0.8", optional = true }
+miniz_oxide = { version = "0.9", optional = true }
 
 tracing = "0.1"
 

@@ -33,7 +33,7 @@ builtins = { path = "../builtins" }
 client-api = { package = "pie-client-api", path = "../client-api" }
 serde_json = "1"
 thiserror = "2.0.19"
-wasmparser = "0.259"
+wasmparser = "0.262"
 wasmtime = { version = "49.0.2", default-features = false, features = [
     "runtime",
     "std",
