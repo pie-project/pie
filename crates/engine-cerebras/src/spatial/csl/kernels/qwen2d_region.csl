@@ -45,6 +45,8 @@ param c_r1_1: color;
 param c_r2_0: color;
 param c_r2_1: color;
 param c_bc: color;
+param GBC: u16 = 0;          // 1: the group broadcast on its own color (serve8b_region_pipe)
+param c_gbc: color = @get_color(16);
 param c_gb: color;     // unused: the group broadcast and page copies ride on c_bc
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
@@ -372,8 +374,57 @@ fn allreduce(is_max: bool, buf: mem1d_dsd, n: u16) void {
 }
 
 // Sum of buf over this PE's group of Gs columns (axis X).
+// GBC 1 (serve8b_region_pipe): the group broadcast runs on c_gbc, whose
+// routes (the group's) are set once a launch (gbc_routes), instead of c_bc's
+// routes switching between the group's and the X axis's broadcast: both run
+// along X, so with micro-batches back to back a wavelet of one could be taken
+// under the other's routes (a CS-3 pipe launch hung so). Queue 7 moves to
+// c_gbc around it: the root's output queue drained before each recolor, a
+// member's input queue recolored only between complete reads; a wavelet of
+// the other color meanwhile waits in the router.
+fn gbc_iq7(c: u16) void {
+  const addr = tile_config.input_queue_config.get_input_queue_config_addr(7);
+  var v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
+  v = (v & 0xffe0) | c;
+  @set_config(addr, v, tile_config.input_queue_config.in_queue_addr_range);
+}
+fn gbc_oq7(c: u16) void {
+  while ((tile_config.output_queue_status.get_raw() & 0x8000) == 0) {}   // queue 7 empty
+  const addr = tile_config.output_queue_config.get_output_queue_config_addr(7);
+  var v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
+  v = (v & 0xfe0f) | (c << 4);
+  @set_config(addr, v, tile_config.output_queue_config.out_queue_addr_range);
+}
+fn gbc_routes() void {
+  if (HROUTE == 1) {
+    put_route(color_config.get_color_config_addr(c_gbc), rcfg[2 * NCOL]);
+    return;
+  }
+  const r = px % Gs;
+  if (r == R1) {
+    set_route(c_gbc, D_RAMP, D_W, if (R1 == Gs - 1) D_W else D_E);
+  } else if (r < R1) {
+    if (r == 0) { set_route(c_gbc, D_E, D_RAMP, D_RAMP); }
+    else { set_route(c_gbc, D_E, D_W, D_RAMP); }
+  } else {
+    if (r == Gs - 1) { set_route(c_gbc, D_W, D_RAMP, D_RAMP); }
+    else { set_route(c_gbc, D_W, D_RAMP, D_E); }
+  }
+}
 fn allreduce_seg(buf: mem1d_dsd, n: u16) void {
   phase1(false, buf, n);
+  if (GBC == 1) {
+    if (px % Gs == R1) {
+      gbc_oq7(@get_int(c_gbc));
+      @fmovs(fout(q_bc_out, n), buf);
+      gbc_oq7(@get_int(c_bc));
+    } else {
+      gbc_iq7(@get_int(c_gbc));
+      @fmovs(buf, fin(q_bc_in, n));
+      gbc_iq7(@get_int(c_bc));
+    }
+    return;
+  }
   if (HROUTE == 1) { put_route(caddr[4], rcfg[2 * NCOL]); } else { route_gbcast(); }   // c_bc: the group's broadcast for now
   if (px % Gs == R1) { @fmovs(fout(q_bc_out, n), buf); }
   else { @fmovs(buf, fin(q_bc_in, n)); }
