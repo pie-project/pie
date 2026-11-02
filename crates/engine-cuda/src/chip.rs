@@ -1071,7 +1071,7 @@ mod tests {
                 Engine {
                     prefill_lattice_from: 256,
                     prefill_lattice_steps: 8,
-                    forward_tokens: if std::ptr::eq(p, &l40s) { 2048 } else { 0 },
+                    forward_tokens: if std::ptr::eq(p, &l40s) { 2304 } else { 0 },
                     seated_first: std::ptr::eq(p, &l40s),
                     recording: if std::ptr::eq(p, &l40s) {
                         Recording::Bodies {
