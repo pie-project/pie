@@ -1897,12 +1897,23 @@ impl KvPageTable {
         // the pages some selection takes, and its other pages go.
         let (children, kept) = {
             let n = self.nodes.get(owner).expect("live node");
-            if !matches!(n.pages, Pages::Owned { .. }) || n.children.is_empty() {
+            let Pages::Owned { backings, .. } = &n.pages else {
+                return Vec::new();
+            };
+            if n.children.is_empty() {
                 return Vec::new();
             }
+            let len = backings.len();
             let mut taken = Vec::new();
             for &child in &n.children {
                 match &self.nodes.get(child).expect("live child").pages {
+                    // A selection of every page keeps them all: nothing goes,
+                    // and a shared prefix of thousands of children asks no more.
+                    Pages::ParentSelection { runs }
+                        if runs.iter().any(|r| r.start == 0 && r.end as usize >= len) =>
+                    {
+                        return Vec::new();
+                    }
                     Pages::ParentSelection { runs } => taken.extend(runs.iter().cloned()),
                     Pages::Owned { .. } => return Vec::new(),
                 }
