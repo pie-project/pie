@@ -36,6 +36,11 @@ pub(super) struct Proc {
     pub(super) reseating: bool,
     /// It has been granted pages: a seated lane whose next claim is growth.
     pub(super) seated: bool,
+    /// The most device kv pages and rs units it has held at a grant, for
+    /// [`super::to_end::ToEnd`].
+    pub(super) peak: (u32, crate::store::rs::RsUnits),
+    /// What it held at its first grant: its prompt.
+    pub(super) first: (u32, crate::store::rs::RsUnits),
     /// Its holds past its exit; see [`Departure`].
     pub(super) departure: Weak<Departure>,
 }
@@ -62,6 +67,8 @@ impl Proc {
             seatless: false,
             reseating: false,
             seated: false,
+            peak: Default::default(),
+            first: Default::default(),
             departure: Weak::new(),
         }
     }
