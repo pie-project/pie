@@ -64,7 +64,7 @@ impl ToEnd {
 
 fn dbg_line(s: String) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/toend.log") {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/root/toend.log") {
         let _ = writeln!(f, "{s}");
     }
 }
