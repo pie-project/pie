@@ -23,6 +23,7 @@ pub(super) struct ToEnd {
 impl ToEnd {
     /// What a finished process held, folded into the footprint.
     pub(super) fn learn(&mut self, kv: u32, rs: RsUnits) {
+        eprintln!("TOEND learn kv={kv} rs={rs:?} fp={:?} live={}", self.footprint, self.live.len());
         self.footprint = Some(match self.footprint {
             None => (kv, rs),
             Some((k, r)) => (
@@ -50,6 +51,9 @@ impl ToEnd {
             .iter()
             .filter(|pid| procs.get(pid).is_some_and(|proc| !proc.idle))
             .count() as u64;
+        if self.live.len() % 16 == 0 {
+            eprintln!("TOEND room live={live} kv_total={kv_total} rs_total={rs_total:?} fp={:?}", self.footprint);
+        }
         let fits = |each: u32, total: u32| (live + 1) * u64::from(each) <= u64::from(total);
         live == 0
             || (fits(kv, kv_total)
