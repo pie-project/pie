@@ -222,12 +222,19 @@ async def run_pie(rows: list[dict], cfg: dict, args) -> list[dict]:
                         (HERE / "main.py").read_bytes(), "deepconf.py", "0.1.0", force_overwrite=True)
             proc = await client.launch_process(
                 program["id"], {"prompt_tokens": row["ids"], "stop_tokens": row["stops"], "config": cfg})
-            while True:
-                event, value = await proc.recv()
-                if event is Event.Return:
-                    return json.loads(value)
-                if event is Event.Error:
-                    return {"error": str(value)[-500:]}
+
+            async def result() -> dict:
+                while True:
+                    event, value = await proc.recv()
+                    if event is Event.Return:
+                        return json.loads(value)
+                    if event is Event.Error:
+                        return {"error": str(value)[-500:]}
+
+            try:
+                return await asyncio.wait_for(result(), args.timeout)
+            except asyncio.TimeoutError:
+                return {"error": f"no answer after {args.timeout} s"}
 
     return await asyncio.gather(*[one(r) for r in rows])
 
@@ -238,13 +245,13 @@ async def run_vllm(rows: list[dict], cfg: dict, args, tokenizer) -> list[dict]:
 
     engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
         model=args.model, max_model_len=args.max_model_len, gpu_memory_utilization=0.9,
-        enable_prefix_caching=True, disable_log_stats=True))
+        enable_prefix_caching=True, disable_log_stats=True, kv_cache_dtype="fp8" if args.kv_fp8 else "auto"))
     sem = asyncio.Semaphore(args.concurrent)
 
     async def one(row: dict) -> dict:
         async with sem:
             try:
-                return await VllmDeepConf(engine, tokenizer, cfg, row["id"], row["ids"]).run()
+                return await asyncio.wait_for(VllmDeepConf(engine, tokenizer, cfg, row["id"], row["ids"]).run(), args.timeout)
             except Exception as e:  # noqa: BLE001
                 import traceback
                 cause = e.__cause__ or e
@@ -269,6 +276,8 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=32768)
     ap.add_argument("--max-model-len", type=int, default=34816)
     ap.add_argument("--uri", default="ws://127.0.0.1:8080")
+    ap.add_argument("--kv-fp8", action="store_true", help="vLLM: FP8 KV, as pie's e4m3 deployment")
+    ap.add_argument("--timeout", type=float, default=2400, help="seconds a question may take")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
