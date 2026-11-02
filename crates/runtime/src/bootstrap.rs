@@ -475,7 +475,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
                 crate::planner::RegistryPool::new(arena_model_idx, engine, kv_swap_capable),
             ))
-            .seated_first(seated_first),
+            .seated_first(seated_first)
+            .seat_to_end(seated_first),
         );
     }
     // After the gates and the planner it orders exist.

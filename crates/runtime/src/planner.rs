@@ -21,6 +21,7 @@ mod report;
 mod residency_planner;
 mod starvation;
 mod stats;
+mod to_end;
 mod victim;
 mod wait;
 

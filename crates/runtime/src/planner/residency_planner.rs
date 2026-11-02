@@ -42,6 +42,9 @@ pub struct ResidencyPlanner {
     /// against the seated lanes' growth and takes its grant, so prompts seated
     /// at once each see the others' pages gone.
     pub(super) seating: parking_lot::Mutex<()>,
+    /// `PoolFacts::seat_to_end`: see [`super::to_end::ToEnd`].
+    seat_to_end: bool,
+    to_end_notify: Notify,
 }
 
 impl ResidencyPlanner {
@@ -60,7 +63,17 @@ impl ResidencyPlanner {
             stats: PlannerStats::default(),
             seated_first: false,
             seating: parking_lot::Mutex::new(()),
+            seat_to_end: false,
+            to_end_notify: Notify::new(),
         }
+    }
+
+    /// With `PoolFacts::seat_to_end`, a process starts only while the pools
+    /// hold the started ones to the end (see [`super::to_end::ToEnd`]).
+    #[must_use]
+    pub fn seat_to_end(mut self, on: bool) -> Self {
+        self.seat_to_end = on;
+        self
     }
 
     /// With `PoolFacts::seated_first`, seated growth doesn't park behind a waiting
@@ -239,8 +252,41 @@ impl ResidencyPlanner {
             });
             match notify {
                 Some(notify) => notify.notified().await,
-                None => return,
+                None => break,
             }
+        }
+        if self.seat_to_end {
+            self.admit_to_end(pid).await;
+        }
+    }
+
+    /// Holds `pid` back, oldest first, until the pools hold it to the end
+    /// beside the processes already started.
+    async fn admit_to_end(&self, pid: ProcessId) {
+        loop {
+            let notified = self.to_end_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let (_, kv_total) = self.port.device_stats();
+            let (_, rs_total) = self.port.rs_stats();
+            let passed = self.with_inner(|inner| {
+                let Some(rank) = inner.procs.get(&pid).map(Proc::rank) else {
+                    return true;
+                };
+                inner.to_end.waiting.insert((rank, pid));
+                let first = inner.to_end.waiting.first() == Some(&(rank, pid));
+                if !first || !inner.to_end.room(&inner.procs, kv_total, rs_total) {
+                    return false;
+                }
+                inner.to_end.waiting.remove(&(rank, pid));
+                inner.to_end.live.insert(pid);
+                true
+            });
+            if passed {
+                self.to_end_notify.notify_waiters();
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -270,6 +316,9 @@ impl ResidencyPlanner {
                 return;
             };
             proc.idle = idle;
+            if self.seat_to_end {
+                self.to_end_notify.notify_waiters();
+            }
             let parked = if idle || proc.held || proc.seatless {
                 None
             } else {
@@ -485,12 +534,28 @@ impl ResidencyPlanner {
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
         let (model, engine) = self.port.locus();
         let held = held_page_count(pid, model, engine);
+        let held_rs = if self.seat_to_end {
+            super::holdings::held_rs_units(pid, model, engine)
+        } else {
+            RsUnits::default()
+        };
         // A seat taken again after the process ended goes back.
         crate::inferlet::process::vacate_seat(pid);
         let (signal, removed) = self.with_inner(|inner| {
             let departed = inner.procs.remove(&pid);
             if departed.is_some() {
                 inner.admitting.retain(|(_, waiting), _| *waiting != pid);
+            }
+            if self.seat_to_end {
+                if inner.to_end.live.remove(&pid)
+                    && held > 0
+                    && departed.as_ref().is_some_and(|proc| {
+                        proc.admitted && proc.state == Residency::Resident && !proc.respawn
+                    })
+                {
+                    inner.to_end.learn(held, held_rs);
+                }
+                inner.to_end.waiting.retain(|(_, waiting)| *waiting != pid);
             }
             if departed
                 .as_ref()
@@ -539,6 +604,9 @@ impl ResidencyPlanner {
             signal.notify_waiters();
         }
         drop(removed);
+        if self.seat_to_end {
+            self.to_end_notify.notify_waiters();
+        }
         self.re_arm_idle_reclaim();
         self.poke();
     }
