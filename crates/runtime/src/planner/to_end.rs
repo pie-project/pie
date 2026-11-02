@@ -111,8 +111,12 @@ impl ToEnd {
                 self.footprint
             ));
         }
-        kv_most <= u64::from(kv_total)
-            && pages_most <= u64::from(rs_total.pages)
+        let over: u64 = std::env::var("PIE_TOEND_OVER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        kv_most * 100 <= u64::from(kv_total) * over
+            && pages_most * 100 <= u64::from(rs_total.pages) * over
             && slots <= u64::from(rs_total.slots)
     }
 }
