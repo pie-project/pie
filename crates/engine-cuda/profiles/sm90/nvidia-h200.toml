@@ -19,6 +19,18 @@ prefill_lattice_from = 192  # 2.0% faster end to end
 # two recurrent-state slots a lane, so a hybrid trunk seats past the fixed 256, as on the RTX PRO 6000:
 # Qwen3.8-Flash-Next mini c512 54.4k -> 65.8k tok/s, single-stream greedy tokens unchanged
 state_slots_per_lane = 2
+# a Gemma-4 process starts only while the pools hold the started ones to the end, a decoding lane's pages
+# before a waiting prompt's, the windowed ring a page a lane past its kv pages, as on the RTX PRO 6000:
+# gemma-4-26b-a4b c1024 10.7k -> 12.7k tok/s, single-request decode 264 -> 279 tok/s
+seated_first = true
+seat_to_end = true
+window_spare = true
+
+[compiler]
+# independent chains on side streams, as on the H100
+branches = true
+dag_streams = true
+dag_streams_until = 256
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 26.2 -> 26.2 ms, 1-lane step 3.06 -> 2.87 ms, 4-lane step 5.16 -> 4.85 ms, 8-lane step 6.21 -> 6.12 ms, readout cosine 1.0000"
