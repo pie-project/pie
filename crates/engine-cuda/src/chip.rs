@@ -227,6 +227,7 @@ shelved!(
         "sm110.toml",
         "sm120.toml",
         "sm120/nvidia-geforce-rtx-5090.toml",
+        "sm120/nvidia-rtx-pro-4500-blackwell.toml",
         "sm120/nvidia-rtx-pro-6000-blackwell-server-edition.toml",
         "sm121.toml",
     ],
