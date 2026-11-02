@@ -477,7 +477,7 @@ mod tests {
             (8, 0, "NVIDIA A30"),
             (8, 6, "NVIDIA A10"),
             (8, 7, "Orin"),
-            (8, 9, "NVIDIA L4"),
+            (8, 9, "NVIDIA L20"),
             (9, 0, "NVIDIA H800"),
             (10, 0, "NVIDIA GB200"),
             (10, 3, "NVIDIA B300"),
