@@ -289,8 +289,22 @@ impl ResidencyPlanner {
             let notified = self.to_end_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let (_, kv_total) = self.port.device_stats();
-            let (_, rs_total) = self.port.rs_stats();
+            let (kv_free, kv_total) = self.port.device_stats();
+            let (rs_free, rs_total) = self.port.rs_stats();
+            {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+                    super::to_end::dbg_line(format!(
+                        "TOEND free kv={kv_free}/{kv_total} rs={rs_free:?} parks={} evict={} restores={} waiters={} live={} reclaimable={}",
+                        self.stats.parks.load(Ordering::Relaxed),
+                        self.stats.evictions.load(Ordering::Relaxed),
+                        self.stats.restores.load(Ordering::Relaxed),
+                        self.waiters.load(Ordering::Relaxed),
+                        self.lock_inner().to_end.live.len(),
+                        self.port.reclaimable_idle(),
+                    ));
+                }
+            }
             let passed = self.with_inner(|inner| {
                 let Some(rank) = inner.procs.get(&pid).map(Proc::rank) else {
                     return true;

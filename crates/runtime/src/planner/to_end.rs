@@ -113,7 +113,7 @@ impl ToEnd {
     }
 }
 
-fn dbg_line(s: String) {
+pub(super) fn dbg_line(s: String) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
