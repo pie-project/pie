@@ -260,6 +260,25 @@ impl ResidencyPlanner {
         }
     }
 
+    /// What `pid` holds once `demand` lands, kept as its peak.
+    pub fn note_peak(&self, pid: ProcessId, demand: Demand) {
+        if !self.seat_to_end {
+            return;
+        }
+        let (model, engine) = self.port.locus();
+        let kv = held_page_count(pid, model, engine) + demand.kv_pages;
+        let rs = super::holdings::held_rs_units(pid, model, engine).add(demand.rs);
+        if let Some(proc) = self.lock_inner().procs.get_mut(&pid) {
+            proc.peak = (
+                proc.peak.0.max(kv),
+                RsUnits {
+                    slots: proc.peak.1.slots.max(rs.slots),
+                    pages: proc.peak.1.pages.max(rs.pages),
+                },
+            );
+        }
+    }
+
     /// Holds `pid` back, oldest first, until the pools hold it to the end
     /// beside the processes already started.
     async fn admit_to_end(&self, pid: ProcessId) {
@@ -534,11 +553,6 @@ impl ResidencyPlanner {
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
         let (model, engine) = self.port.locus();
         let held = held_page_count(pid, model, engine);
-        let held_rs = if self.seat_to_end {
-            super::holdings::held_rs_units(pid, model, engine)
-        } else {
-            RsUnits::default()
-        };
         // A seat taken again after the process ended goes back.
         crate::inferlet::process::vacate_seat(pid);
         let (signal, removed) = self.with_inner(|inner| {
@@ -547,14 +561,16 @@ impl ResidencyPlanner {
                 inner.admitting.retain(|(_, waiting), _| *waiting != pid);
             }
             if self.seat_to_end {
-                if inner.to_end.live.remove(&pid)
-                    && held > 0
-                    && departed.as_ref().is_some_and(|proc| {
-                        proc.admitted && proc.state == Residency::Resident && !proc.respawn
-                    })
+                if let Some(proc) = departed.as_ref().filter(|proc| {
+                    proc.admitted
+                        && proc.state == Residency::Resident
+                        && !proc.respawn
+                        && proc.peak.0 > 0
+                }) && inner.to_end.live.remove(&pid)
                 {
-                    inner.to_end.learn(held, held_rs);
+                    inner.to_end.learn(proc.peak.0, proc.peak.1);
                 }
+                inner.to_end.live.remove(&pid);
                 inner.to_end.waiting.retain(|(_, waiting)| *waiting != pid);
             }
             if departed

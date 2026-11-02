@@ -416,8 +416,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let seated_first = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seated_first);
     {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/root/toend.log") {
-            let _ = writeln!(f, "TOEND boot seated_first={seated_first} n={}", engine_configs.len());
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/root/toend.log")
+        {
+            let _ = writeln!(
+                f,
+                "TOEND boot seated_first={seated_first} n={}",
+                engine_configs.len()
+            );
         }
     }
     if let Some(d) = engine_configs.first() {

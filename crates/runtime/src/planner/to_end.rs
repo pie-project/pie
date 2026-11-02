@@ -23,7 +23,11 @@ pub(super) struct ToEnd {
 impl ToEnd {
     /// What a finished process held, folded into the footprint.
     pub(super) fn learn(&mut self, kv: u32, rs: RsUnits) {
-        dbg_line(format!("TOEND learn kv={kv} rs={rs:?} fp={:?} live={}", self.footprint, self.live.len()));
+        dbg_line(format!(
+            "TOEND learn kv={kv} rs={rs:?} fp={:?} live={}",
+            self.footprint,
+            self.live.len()
+        ));
         self.footprint = Some(match self.footprint {
             None => (kv, rs),
             Some((k, r)) => (
@@ -52,7 +56,10 @@ impl ToEnd {
             .filter(|pid| procs.get(pid).is_some_and(|proc| !proc.idle))
             .count() as u64;
         if self.live.len() % 16 == 0 {
-            dbg_line(format!("TOEND room live={live} kv_total={kv_total} rs_total={rs_total:?} fp={:?}", self.footprint));
+            dbg_line(format!(
+                "TOEND room live={live} kv_total={kv_total} rs_total={rs_total:?} fp={:?}",
+                self.footprint
+            ));
         }
         let fits = |each: u32, total: u32| (live + 1) * u64::from(each) <= u64::from(total);
         live == 0
@@ -64,7 +71,11 @@ impl ToEnd {
 
 fn dbg_line(s: String) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/root/toend.log") {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/root/toend.log")
+    {
         let _ = writeln!(f, "{s}");
     }
 }
