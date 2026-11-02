@@ -61,16 +61,17 @@ fn launch_of(mut candidates: Vec<(usize, usize)>, lanes: usize) -> (Vec<usize>, 
 
 impl Spatial {
     /// Whether frames settle asynchronously: `async` when set, else on for
-    /// a build whose launches carry one lane (B1, no pipeline), the shape
-    /// it is measured on. A pipelined or multi-lane build packs several
-    /// lanes' continuations into one launch, and a 12-stream pipe program
-    /// stalled on that on a CS-3 (a launch never answered); set `async` to
-    /// run it there anyway.
+    /// a build of one lane a micro-batch (B1, with or without the pipeline
+    /// ring), the shapes it is measured on: the ring's 12-stream 8B program
+    /// serves 1,914 tok/s asynchronously against 654 synchronously. A build
+    /// of more lanes a micro-batch keeps the synchronous engine until it is
+    /// measured; set `async` to run it there anyway.
     pub(super) fn asynchronous(&self) -> bool {
         self.spatial.asynchronous.unwrap_or_else(|| {
             self.model
                 .as_ref()
-                .is_some_and(|w| w.paged.is_some() && w.launch_lanes <= 1)
+                .and_then(|w| w.paged)
+                .is_some_and(|shape| shape.lanes == 1)
         })
     }
 
