@@ -108,12 +108,19 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_wgmma(
             }
         }
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+        // The step's scales, read while its MMAs run.
         const float sw = gfp8::exp2_biased(atoms_at[(kb / 4) * 512 + kb % 4]);
+        float sc[kR / 8][2];
+#pragma unroll
+        for (int j = 0; j < kR / 8; ++j)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+                sc[j][h] = xrow[j][h] >= 0 ? sw * gfp8::exp2_biased(xe[xrow[j][h] * blocks + kb]) : 0.f;
+        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 #pragma unroll
         for (int j = 0; j < kR / 8; ++j) {
-            const float s0 = xrow[j][0] >= 0 ? sw * gfp8::exp2_biased(xe[xrow[j][0] * blocks + kb]) : 0.f;
-            const float s1 = xrow[j][1] >= 0 ? sw * gfp8::exp2_biased(xe[xrow[j][1] * blocks + kb]) : 0.f;
+            const float s0 = sc[j][0];
+            const float s1 = sc[j][1];
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
                 acc[t][4 * j + 0] = fmaf(blk[t][4 * j + 0], s0, acc[t][4 * j + 0]);
