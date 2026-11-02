@@ -217,6 +217,7 @@ shelved!(
         "sm87.toml",
         "sm89.toml",
         "sm89/nvidia-geforce-rtx-4090.toml",
+        "sm89/nvidia-l4.toml",
         "sm89/nvidia-l40s.toml",
         "sm90.toml",
         "sm90/nvidia-h100-80gb-hbm3.toml",
