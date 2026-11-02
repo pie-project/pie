@@ -88,9 +88,13 @@ impl ToEnd {
         if live.is_empty() {
             return true;
         }
-        let mut kv: Vec<u32> = live.iter().map(|proc| proc.peak.0).collect();
+        // A lane not yet granted holds its prompt as soon as it is.
+        let mut kv: Vec<u32> = live.iter().map(|proc| proc.peak.0.max(first.0)).collect();
         kv.push(first.0);
-        let mut pages: Vec<u32> = live.iter().map(|proc| proc.peak.1.pages).collect();
+        let mut pages: Vec<u32> = live
+            .iter()
+            .map(|proc| proc.peak.1.pages.max(first.1.pages))
+            .collect();
         pages.push(first.1.pages);
         let slots = live
             .iter()
