@@ -62,6 +62,8 @@ DIFF = "git add -A -N . && git diff HEAD -- . ':(exclude)*.pyc' ':(exclude)*/__p
 # a sandbox no command has changed yet: the start, or a diff that is empty
 UNEDITED = {"base", hashlib.sha1(b"").hexdigest()[:12]}
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+# a message to pie holds under 8 MB: past this, an output keeps its ends and its length, all the agent reads
+OUT_CAP = 500_000
 
 
 def clone(src: Path, dst: Path) -> None:
@@ -222,6 +224,9 @@ async def run_pie(task: Task, uri: str, config: dict, quiet: bool) -> dict:
                         t = time.monotonic()
                         results = await asyncio.gather(*[
                             loop.run_in_executor(pool, box.exec, c["bid"], c["cmd"]) for c in msg["calls"]])
+                        for r in results:
+                            if len(r["out"]) > OUT_CAP:
+                                r["chars"], r["out"] = len(r["out"]), r["out"][:OUT_CAP // 2] + r["out"][-OUT_CAP // 2:]
                         tool_seconds += time.monotonic() - t
                         await process.signal(json.dumps({"results": results}))
                     elif op == "log" and not quiet:

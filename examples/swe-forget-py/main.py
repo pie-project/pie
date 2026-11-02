@@ -723,7 +723,7 @@ class Swarm:
         limit = self.cfg["max_output_chars"]
         if len(out) > limit:
             head, tail = out[: limit * 2 // 3], out[-limit // 3:]
-            out = f"{head}\n... ({len(r['out']) - len(head) - len(tail)} characters cut) ...\n{tail}"
+            out = f"{head}\n... ({r.get('chars', len(r['out'])) - len(head) - len(tail)} characters cut) ...\n{tail}"
         return f"<returncode>{r['rc']}</returncode>\n<output>\n{out}</output>"
 
     @staticmethod
