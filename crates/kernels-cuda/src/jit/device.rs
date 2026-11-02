@@ -169,6 +169,7 @@ pub fn census() -> Vec<(&'static str, usize)> {
 }
 
 const SLAB_GRAIN: usize = 8 << 20;
+const SMALL_SLAB_GRAIN: usize = 256 << 10;
 
 fn grow(
     arena: &mut Arena,
@@ -184,7 +185,15 @@ fn grow(
     if old_bytes >= bytes {
         return Ok(());
     }
-    let want = bytes.div_ceil(SLAB_GRAIN).saturating_mul(SLAB_GRAIN);
+    // A slab under the grain takes its own size to the small grain: one a
+    // region (Gemma-4-26B's 30 MoE route orders of 0.1 MiB each) held 8 MiB
+    // apiece, 240 MiB the cache rows never saw.
+    let grain = if bytes < SLAB_GRAIN {
+        SMALL_SLAB_GRAIN
+    } else {
+        SLAB_GRAIN
+    };
+    let want = bytes.div_ceil(grain).saturating_mul(grain);
     let mut fresh: *mut c_void = core::ptr::null_mut();
 
     // SAFETY: a live local out-parameter and a byte count this caller checked
