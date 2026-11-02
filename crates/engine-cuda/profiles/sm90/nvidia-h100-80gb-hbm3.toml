@@ -22,6 +22,13 @@ working_set_percent = 90  # 1.9% faster end to end
 
 [compiler]
 synth_regions = false  # 1.2% faster end to end
+# independent chains (a shared expert beside the routed ones, a gate beside its trunk) on side
+# streams, as sm100 and the RTX PRO 6000 run them: single-request decode Qwen3.6-35B-A3B mini
+# 246 -> 260, Gemma-4-E4B 178 -> 197, Hy4 mini 270 -> 281 tok/s; Qwen3.8-27B c128 2.22k -> 2.48k;
+# greedy tokens unchanged on gpt-oss-20b, Gemma-4-E4B, Hy4, Qwen3.6 and Qwen3.8-27B
+branches = true
+dag_streams = true
+dag_streams_until = 256
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 26.9 -> 27.0 ms, 1-lane step 3.56 -> 3.48 ms, 4-lane step 5.79 -> 5.73 ms, 8-lane step 7.19 -> 7.16 ms, readout cosine 1.0000"
