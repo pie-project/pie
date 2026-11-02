@@ -162,8 +162,14 @@ impl ToEnd {
         };
         let steady =
             mid(kv_total, end.0, first.0).min(mid(rs_total.pages, end.1.pages, first.1.pages));
-        let rate = steady as f64 / life.as_secs_f64().max(1e-3);
-        let cap = (steady as f64 / 8.0).max(1.0);
+        let knob = |name: &str, default: f64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(default)
+        };
+        let rate = knob("PIE_TOEND_RATE", 1.0) * steady as f64 / life.as_secs_f64().max(1e-3);
+        let cap = (steady as f64 / knob("PIE_TOEND_BURST", 8.0)).max(1.0);
         self.bank = match self.topped {
             None => cap,
             Some(at) => (self.bank + rate * now.duration_since(at).as_secs_f64()).min(cap),
