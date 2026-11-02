@@ -135,10 +135,11 @@ def run_vllm(args, head, chunks, asks, stops) -> dict:
         # that follow hit it instead of each reading it at the same time
         store = head + [t for c in chunks for t in c["ids"]]
         llm.generate([{"prompt_token_ids": store}], SamplingParams(max_tokens=1), use_tqdm=False)
+    read = time.monotonic() - t0
     outs = llm.generate(prompts, sp, use_tqdm=False)
     wall = time.monotonic() - t0
     answers = [o.outputs[0].text for o in outs]
-    return {"answers": answers, "answer_s": round(wall, 3), "wall_s": round(wall, 3),
+    return {"answers": answers, "read_s": round(read, 3), "answer_s": round(wall - read, 3), "wall_s": round(wall, 3),
             "prompt_tokens": sum(len(p["prompt_token_ids"]) for p in prompts),
             "store_tokens": len(head) + sum(len(c["ids"]) for c in chunks)}
 
