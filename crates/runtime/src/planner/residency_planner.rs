@@ -305,24 +305,31 @@ impl ResidencyPlanner {
                     ));
                 }
             }
-            let passed = self.with_inner(|inner| {
+            let now = std::time::Instant::now();
+            let gate = self.with_inner(|inner| {
                 let Some(rank) = inner.procs.get(&pid).map(Proc::rank) else {
-                    return true;
+                    return Ok(());
                 };
                 inner.to_end.waiting.insert((rank, pid));
-                let first = inner.to_end.waiting.first() == Some(&(rank, pid));
-                if !first || !inner.to_end.room(&inner.procs, kv_total, rs_total) {
-                    return false;
+                if inner.to_end.waiting.first() != Some(&(rank, pid)) {
+                    return Err(None);
                 }
+                let procs = &inner.procs;
+                inner.to_end.room(procs, kv_total, rs_total, now)?;
                 inner.to_end.waiting.remove(&(rank, pid));
-                inner.to_end.live.insert(pid);
-                true
+                inner.to_end.pass(pid, now);
+                Ok(())
             });
-            if passed {
-                self.to_end_notify.notify_waiters();
-                return;
+            match gate {
+                Ok(()) => {
+                    self.to_end_notify.notify_waiters();
+                    return;
+                }
+                Err(None) => notified.await,
+                Err(Some(ramp)) => {
+                    let _ = tokio::time::timeout(ramp, notified).await;
+                }
             }
-            notified.await;
         }
     }
 
@@ -578,16 +585,17 @@ impl ResidencyPlanner {
                 inner.admitting.retain(|(_, waiting), _| *waiting != pid);
             }
             if self.seat_to_end {
-                if let Some(proc) = departed.as_ref().filter(|proc| {
+                let finished = departed.as_ref().filter(|proc| {
                     proc.admitted
                         && proc.state == Residency::Resident
                         && !proc.respawn
                         && proc.peak.0 > 0
-                }) && inner.to_end.live.remove(&pid)
+                });
+                if inner.to_end.leave(pid, finished.is_some())
+                    && let Some(proc) = finished
                 {
                     inner.to_end.learn(proc.peak, proc.first);
                 }
-                inner.to_end.live.remove(&pid);
                 inner.to_end.waiting.retain(|(_, waiting)| *waiting != pid);
             }
             if departed

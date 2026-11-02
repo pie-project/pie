@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::store::rs::RsUnits;
 
@@ -21,6 +22,13 @@ pub(super) struct ToEnd {
     pub(super) live: HashSet<ProcessId>,
     /// Waiting at the gate, oldest first.
     pub(super) waiting: BTreeSet<(Rank, ProcessId)>,
+    /// When each live one passed the gate.
+    since: HashMap<ProcessId, Instant>,
+    /// How long a process lives past the gate, averaged.
+    life: Option<Duration>,
+    /// Starts banked by the ramp, and when it was last topped up.
+    bank: f64,
+    topped: Option<Instant>,
 }
 
 pub(super) type Units = (u32, RsUnits);
@@ -56,6 +64,22 @@ fn most_at_once(held: &mut [u32], end: u32) -> u64 {
 }
 
 impl ToEnd {
+    /// Records `pid` passing the gate.
+    pub(super) fn pass(&mut self, pid: ProcessId, now: Instant) {
+        self.live.insert(pid);
+        self.since.insert(pid, now);
+    }
+
+    /// Forgets `pid`; what it lived, if it finished, is folded in.
+    pub(super) fn leave(&mut self, pid: ProcessId, finished: bool) -> bool {
+        let since = self.since.remove(&pid);
+        if finished && let Some(since) = since {
+            let lived = since.elapsed();
+            self.life = Some(self.life.map_or(lived, |life| (life * 3 + lived) / 4));
+        }
+        self.live.remove(&pid)
+    }
+
     /// What a finished process held at most and at its prompt.
     pub(super) fn learn(&mut self, peak: Units, first: Units) {
         dbg_line(format!(
@@ -69,15 +93,17 @@ impl ToEnd {
         });
     }
 
-    /// Whether one more process fits beside the live ones to the end.
+    /// Whether one more process starts now: `Err(None)` waits for a process
+    /// to leave, `Err(Some(d))` for `d` more of the ramp.
     pub(super) fn room(
-        &self,
-        procs: &std::collections::HashMap<ProcessId, Proc>,
+        &mut self,
+        procs: &HashMap<ProcessId, Proc>,
         kv_total: u32,
         rs_total: RsUnits,
-    ) -> bool {
+        now: Instant,
+    ) -> Result<(), Option<Duration>> {
         let Some((end, first)) = self.footprint else {
-            return true;
+            return Ok(());
         };
         let live: Vec<&Proc> = self
             .live
@@ -86,7 +112,7 @@ impl ToEnd {
             .filter(|proc| !proc.idle)
             .collect();
         if live.is_empty() {
-            return true;
+            return Ok(());
         }
         // A lane not yet granted holds its prompt as soon as it is.
         let mut kv: Vec<u32> = live.iter().map(|proc| proc.peak.0.max(first.0)).collect();
@@ -105,19 +131,50 @@ impl ToEnd {
         let pages_most = most_at_once(&mut pages, end.1.pages);
         if self.live.len() % 16 == 0 {
             dbg_line(format!(
-                "TOEND room live={} kv={kv_most}/{kv_total} pages={pages_most}/{} fp={:?}",
+                "TOEND room live={} kv={kv_most}/{kv_total} pages={pages_most}/{} fp={:?} life={:?} bank={:.2}",
                 live.len(),
                 rs_total.pages,
-                self.footprint
+                self.footprint,
+                self.life,
+                self.bank
             ));
         }
-        let over: u64 = std::env::var("PIE_TOEND_OVER")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100);
-        kv_most * 100 <= u64::from(kv_total) * over
-            && pages_most * 100 <= u64::from(rs_total.pages) * over
-            && slots <= u64::from(rs_total.slots)
+        if kv_most > u64::from(kv_total)
+            || pages_most > u64::from(rs_total.pages)
+            || slots > u64::from(rs_total.slots)
+        {
+            return Err(None);
+        }
+        // Where more want to run than the pools hold to the end at once,
+        // starts are spread over a life, so the lanes finish apart and the
+        // pools hold more of them, each midway, than a batch started at once.
+        let Some(life) = self.life else {
+            return Ok(());
+        };
+        let fit = |total: u32, end: u32| u64::from(total) / u64::from(end.max(1));
+        let at_once = fit(kv_total, end.0).min(fit(rs_total.pages, end.1.pages));
+        if (self.live.len() + self.waiting.len()) as u64 <= at_once {
+            self.topped = None;
+            return Ok(());
+        }
+        let mid = |total: u32, end: u32, first: u32| {
+            2 * u64::from(total) / u64::from((end + first).max(1))
+        };
+        let steady =
+            mid(kv_total, end.0, first.0).min(mid(rs_total.pages, end.1.pages, first.1.pages));
+        let rate = steady as f64 / life.as_secs_f64().max(1e-3);
+        let cap = (steady as f64 / 8.0).max(1.0);
+        self.bank = match self.topped {
+            None => cap,
+            Some(at) => (self.bank + rate * now.duration_since(at).as_secs_f64()).min(cap),
+        };
+        self.topped = Some(now);
+        if self.bank >= 1.0 {
+            self.bank -= 1.0;
+            Ok(())
+        } else {
+            Err(Some(Duration::from_secs_f64((1.0 - self.bank) / rate)))
+        }
     }
 }
 
