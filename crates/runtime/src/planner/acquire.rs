@@ -106,6 +106,19 @@ impl ResidencyPlanner {
         quorum_id: ProcessId,
         demand: Demand,
     ) -> Result<Acquired, PlannerError> {
+        let acquired = self.acquire_inner(pid, quorum_id, demand).await;
+        if matches!(acquired, Ok(Acquired::Granted(_))) {
+            self.note_peak(pid, demand);
+        }
+        acquired
+    }
+
+    async fn acquire_inner(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        quorum_id: ProcessId,
+        demand: Demand,
+    ) -> Result<Acquired, PlannerError> {
         if let Some(grant) = self.grant_now(pid, demand) {
             return Ok(Acquired::Granted(grant));
         }

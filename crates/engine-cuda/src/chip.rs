@@ -98,6 +98,14 @@ pub struct OneFrameWhenShort;
 #[decision(id = "engine.seated_first", flag, default = false, tune = engine)]
 pub struct SeatedFirst;
 
+/// Whether a process starts only while the pools hold the started ones to
+/// the pages a finished one held (`PoolFacts::seat_to_end`), for a card
+/// whose pools seat fewer full lanes than the batch asks. Off starts each
+/// at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.seat_to_end", flag, default = false, tune = engine)]
+pub struct SeatToEnd;
+
 /// Whether a windowed pool of short lanes takes a page a lane past its kv
 /// pages (`Paging::spare`), for a card whose ring, not its kv pages, runs
 /// dry first. Off cuts it 1:1.
@@ -261,6 +269,7 @@ pub struct Engine {
     pub state_slots_per_lane: u32,
     pub one_frame_when_short: bool,
     pub seated_first: bool,
+    pub seat_to_end: bool,
     pub window_spare: bool,
     pub forward_tokens: u32,
     pub walk_fire_rows: u32,
@@ -294,6 +303,7 @@ impl Engine {
             state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
             one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
             seated_first: profile.on::<SeatedFirst>(&Anywhere),
+            seat_to_end: profile.on::<SeatToEnd>(&Anywhere),
             window_spare: profile.on::<WindowSpare>(&Anywhere),
             forward_tokens: profile.get::<ForwardTokens>().0,
             walk_fire_rows: profile.get::<WalkFireRows>().0,
@@ -774,6 +784,7 @@ mod tests {
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 seated_first: false,
+                seat_to_end: false,
                 window_spare: false,
                 forward_tokens: 0,
                 walk_fire_rows: 0,
@@ -853,6 +864,7 @@ mod tests {
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 seated_first: false,
+                seat_to_end: false,
                 window_spare: false,
                 forward_tokens: 0,
                 walk_fire_rows: 0,

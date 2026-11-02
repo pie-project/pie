@@ -34,6 +34,7 @@ pub(super) struct Inner {
     pub(super) prepare_blocked: HashSet<ProcessId>,
     pub(super) killing: HashSet<ProcessId>,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
+    pub(super) to_end: super::to_end::ToEnd,
 }
 
 impl Inner {

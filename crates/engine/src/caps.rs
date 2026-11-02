@@ -97,6 +97,11 @@ pub struct PoolFacts {
     /// order of arrival, a waiting prompt older than a lane preempting it.
     #[serde(default)]
     pub seated_first: bool,
+    /// The engine would rather a process wait to start until the pools hold
+    /// the started ones to the pages a finished one held, than start each at
+    /// once and evict lanes the pools then run short for.
+    #[serde(default)]
+    pub seat_to_end: bool,
 }
 
 impl PoolFacts {

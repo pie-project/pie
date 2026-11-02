@@ -1040,6 +1040,7 @@ impl Shell {
             copies: engine.copies,
             one_frame_when_short: engine.one_frame_when_short,
             seated_first: engine.seated_first,
+            seat_to_end: engine.seat_to_end,
             prefill_lanes: engine.prefill_lanes,
             pad: engine.recording.pad(),
             golden_arm: Golden::Off,

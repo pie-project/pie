@@ -117,6 +117,8 @@ pub struct Shell {
     one_frame_when_short: bool,
     /// `engine.seated_first`.
     seated_first: bool,
+    /// `engine.seat_to_end`.
+    seat_to_end: bool,
     /// `engine.prefill_lanes`.
     prefill_lanes: u32,
     pad: bool,
@@ -386,6 +388,13 @@ impl Shell {
     #[must_use]
     pub fn seated_first(&self) -> bool {
         self.seated_first
+    }
+
+    /// Whether this load asks the planner to start a process only while the
+    /// pools hold the started ones to the end (`engine.seat_to_end`).
+    #[must_use]
+    pub fn seat_to_end(&self) -> bool {
+        self.seat_to_end
     }
 
     /// Host rs rows: a state slot and a buffer page each, parked apart.
