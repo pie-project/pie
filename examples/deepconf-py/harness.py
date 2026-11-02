@@ -236,7 +236,13 @@ async def run_pie(rows: list[dict], cfg: dict, args) -> list[dict]:
             except asyncio.TimeoutError:
                 return {"error": f"no answer after {args.timeout} s"}
 
-    return await asyncio.gather(*[one(r) for r in rows])
+    async def logged(row: dict) -> dict:
+        res = await one(row)
+        print(json.dumps({"done": row["id"], "answer": res.get("answer"), "gold": row["answer"],
+                          "tokens": res.get("decoded_tokens"), "error": bool(res.get("error"))}), flush=True)
+        return res
+
+    return await asyncio.gather(*[logged(r) for r in rows])
 
 
 async def run_vllm(rows: list[dict], cfg: dict, args, tokenizer) -> list[dict]:
@@ -257,8 +263,14 @@ async def run_vllm(rows: list[dict], cfg: dict, args, tokenizer) -> list[dict]:
                 cause = e.__cause__ or e
                 return {"error": "".join(traceback.format_exception(cause))[-1500:]}
 
+    async def logged(row: dict) -> dict:
+        res = await one(row)
+        print(json.dumps({"done": row["id"], "answer": res.get("answer"), "gold": row["answer"],
+                          "tokens": res.get("decoded_tokens"), "error": bool(res.get("error"))}), flush=True)
+        return res
+
     try:
-        return await asyncio.gather(*[one(r) for r in rows])
+        return await asyncio.gather(*[logged(r) for r in rows])
     finally:
         engine.shutdown()
 
