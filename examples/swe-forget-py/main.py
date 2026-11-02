@@ -85,6 +85,8 @@ REWRITE_HINT = (
 CHECK = re.compile(r"\b(python3?|pytest|tox|\./runtests\.py|bin/test)\b")
 REWRITE = re.compile(r"cat\s+>\s*([^\s<>|;&]+)\s*<<")
 PATH = re.compile(r"(?<![\w/])((?:\./|/testbed/)?[\w-]+(?:/[\w.-]+)*\.(?:py|pyx|pyi|cfg|toml|ini|rst|txt|c|h))\b")
+# a sandbox no command has changed yet: the start, or a diff that is empty (its sha1)
+UNEDITED = {"base", "da39a3ee5e6b"}
 
 
 def norm(path: str) -> str:
@@ -143,7 +145,8 @@ class Stats:
         self.execs = 0
         self.memo_hits = 0
         self.spawned = 1
-        self.killed = {"duplicate": 0, "pruned": 0, "loop": 0, "context": 0, "budget": 0, "stopped": 0}
+        self.killed = {"duplicate": 0, "pruned": 0, "loop": 0, "context": 0, "budget": 0, "stopped": 0, "restart": 0}
+        self.restarts = 0  # attempts started over from the issue
         self.turns = 0
         self.format_errors = 0
         self.rewinds = {"sentence": 0, "command": 0, "rewrite": 0}
@@ -509,6 +512,16 @@ class Swarm:
         self.branches += kids
         return kids
 
+    def restart(self, b: Branch) -> bool:
+        """End a stalled attempt and start a fresh one from the issue's bookmark, if any are left."""
+        if self.origin is None or self.stats.restarts >= self.cfg["restarts"] or self.budget_left() <= 0:
+            return False
+        self.kill(b, "restart")
+        kid = self.fork(self.origin, 1)[0]
+        kid.next_obs, kid.result = None, None
+        self.stats.restarts += 1
+        return True
+
     def kill(self, b: Branch, why: str) -> None:
         if not b.alive:
             return
@@ -539,6 +552,12 @@ class Swarm:
         root.pending, _ = await self.feed(root, prompt, cfg["temperature"])
         self.stats.prefilled += len(prompt)
         self.branches.append(root)
+        # restart: the issue, read once, is kept as a bookmark; a stalled attempt starts over
+        # from a fork of it, so nothing is prefilled again
+        self.origin = None
+        if cfg["restarts"]:
+            self.origin = self.fork(root, 1)[0]
+            self.branches.remove(self.origin)
 
         while self.live():
             live = self.live()
@@ -572,7 +591,8 @@ class Swarm:
                     continue
                 seen[key] = b
                 if cfg["kill_loops"] and b.loops.get(key, 0) >= 2:  # the third run of a command that changed nothing
-                    self.kill(b, "loop")
+                    if not self.restart(b):
+                        self.kill(b, "loop")
                     continue
                 b.loops[key] = b.loops.get(key, 0) + 1
                 b.commands.append(cmd)
@@ -612,6 +632,13 @@ class Swarm:
                         continue
                     b.next_obs = self.render(b, r)
                     self.after_command(b, b.commands[-1], r)
+
+            # restart: an attempt that runs long, or has changed no file by `edit_by`, starts over
+            for b in self.live():
+                if getattr(b, "next_obs", None) is not None and (
+                        (cfg["restart_turns"] and b.turns >= cfg["restart_turns"])
+                        or (cfg["edit_by"] and b.turns >= cfg["edit_by"] and b.state in UNEDITED)):
+                    self.restart(b)
 
             # stop: a patch enough branches agree on, or the budget is gone
             winner = self.consensus()
@@ -665,6 +692,7 @@ class Swarm:
             "verified": s.verified,
             "auto_submits": s.auto_submits,
             "submitted": len(self.submitted),
+            "restarts": s.restarts,
         }
 
     def after_command(self, b: Branch, cmd: str, r: dict) -> None:
@@ -742,6 +770,9 @@ DEFAULTS = {
     "no_rewrite": False,  # rewind a reply that overwrites a file it has read, and start it as an edit
     "ahead": True,  # decode on the run-ahead path, a fork per reply, instead of one host round trip a token
     "kill_loops": True,  # end a branch on the third run of a command that changed nothing
+    "restarts": 0,  # fresh attempts from the issue after a loop or a stall, within the token budget
+    "restart_turns": 40,  # an attempt this many turns long without a patch starts over
+    "edit_by": 15,  # an attempt that has changed no file by this turn starts over
     "note_repeats": True,  # replace an output seen before with a note that it repeats
     "forget_after": 0,  # turns after a command that its output leaves the KV; 0 keeps it
     "forget_keep": 64,  # tokens kept at each end of a forgotten output
