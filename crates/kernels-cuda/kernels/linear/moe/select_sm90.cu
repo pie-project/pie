@@ -16,7 +16,9 @@ constexpr int kWgStages = 3;
 /// spread to its rows in tcgen05's atoms (a weight row an atom row), the
 /// routes laid out by expert (`order`, `offsets`, `work` as `moe_route_order`
 /// lays them, slices of `kR`). `n` and `k` whole 128s. Grid `[work_cap, n /
-/// 128]`, 128 threads, `kWgStages (128 + kR) 128 + 1024` bytes of shared memory.
+/// 128]`, 128 threads, `4 (128 + kR) 128 + 1024` bytes of shared memory: a
+/// step's MMAs run while the step before's block sums are scaled into the
+/// sums, two steps' worth in flight on a ring of four stages.
 template <int kR>
 __global__ void __launch_bounds__(128) moe_select_fp8a8_wgmma(
     const u8* __restrict__ xq, const u8* __restrict__ xe, const i32* __restrict__ order,
@@ -76,39 +78,17 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_wgmma(
             xrow[j][h] = tok < count ? order[begin + tok] / act_div : -1;
         }
 
-    float acc[2][kF], blk[2][kF];
+    // Two steps' block sums: a step's MMAs land in one while the other's are
+    // scaled into `acc`.
+    constexpr int kSt = 4, kAhead = 2;
+    float acc[2][kF], blk0[2][kF], blk1[2][kF];
 #pragma unroll
     for (int t = 0; t < 2; ++t)
 #pragma unroll
         for (int i = 0; i < kF; ++i) acc[t][i] = 0.f;
 
-#pragma unroll
-    for (int s = 0; s < kWgStages - 1; ++s) {
-        if (s < blocks) load(s, s);
-        asm volatile("cp.async.commit_group;\n" ::);
-    }
-    for (int kb = 0; kb < blocks; ++kb) {
-        asm volatile("cp.async.wait_group %0;\n" ::"n"(kWgStages - 2));
-        __syncthreads();
-        // The stage's generic-proxy writes, seen by the MMA's async proxy.
-        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-        const int next = kb + kWgStages - 1;
-        if (next < blocks) load(next, next % kWgStages);
-        asm volatile("cp.async.commit_group;\n" ::);
-
-        const u8* a = smem + (kb % kWgStages) * kStage;
-        const u8* b = a + kA;
-        asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-#pragma unroll
-        for (int kk = 0; kk < 4; ++kk) {
-            const unsigned long long db = wgfp8::desc(b + kk * 32);
-#pragma unroll
-            for (int t = 0; t < 2; ++t) {
-                wgfp8::Mma<kR>::run(blk[t], wgfp8::desc(a + t * 64 * 128 + kk * 32), db, kk > 0);
-            }
-        }
-        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+    // Step `kb`'s block sums `blk`, scaled by its weight and route exponents.
+    auto scale = [&](const float (&blk)[2][kF], int kb) {
         const float sw = gfp8::exp2_biased(atoms_at[(kb / 4) * 512 + kb % 4]);
 #pragma unroll
         for (int j = 0; j < kR / 8; ++j) {
@@ -122,8 +102,49 @@ __global__ void __launch_bounds__(128) moe_select_fp8a8_wgmma(
                 acc[t][4 * j + 3] = fmaf(blk[t][4 * j + 3], s1, acc[t][4 * j + 3]);
             }
         }
-        // The stage just read is the one a later step refills.
+    };
+    // Step `kb`: its MMAs into `cur`, then the step before's `prev` scaled
+    // while they run. The stage it refills was last read two steps back,
+    // whose MMAs every thread has waited out by the barrier.
+    auto step = [&](float (&cur)[2][kF], const float (&prev)[2][kF], int kb) {
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(kAhead - 1));
         __syncthreads();
+        // The stage's generic-proxy writes, seen by the MMA's async proxy.
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        const int next = kb + kAhead;
+        if (next < blocks) load(next, next % kSt);
+        asm volatile("cp.async.commit_group;\n" ::);
+
+        const u8* a = smem + (kb % kSt) * kStage;
+        const u8* b = a + kA;
+        asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            const unsigned long long db = wgfp8::desc(b + kk * 32);
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                wgfp8::Mma<kR>::run(cur[t], wgfp8::desc(a + t * 64 * 128 + kk * 32), db, kk > 0);
+            }
+        }
+        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+        asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+        if (kb > 0) scale(prev, kb - 1);
+    };
+
+#pragma unroll
+    for (int s = 0; s < kAhead; ++s) {
+        if (s < blocks) load(s, s);
+        asm volatile("cp.async.commit_group;\n" ::);
+    }
+    for (int kb = 0; kb < blocks; kb += 2) {
+        step(blk0, blk1, kb);
+        if (kb + 1 < blocks) step(blk1, blk0, kb + 1);
+    }
+    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+    if ((blocks - 1) & 1) {
+        scale(blk1, blocks - 1);
+    } else {
+        scale(blk0, blocks - 1);
     }
 
 #pragma unroll

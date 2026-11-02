@@ -120,9 +120,9 @@ pub fn select_fp8_w8a8(
                 Share::Take
             },
         )?;
-        // `kWgStages` stages of 128 code rows and the slice's route rows, a
+        // Four stages of 128 code rows and the slice's route rows, a
         // 128-code K step each, past the 1024-byte alignment.
-        let smem = 3 * (128 + slice) * 128 + 1024;
+        let smem = 4 * (128 + slice) * 128 + 1024;
         return ctx.fire(
             OP,
             Fire::at(kernel(
