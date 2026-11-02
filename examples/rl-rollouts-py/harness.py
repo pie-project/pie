@@ -28,9 +28,14 @@ HERE = Path(__file__).parent
 SUFFIX = "\nPlease reason step by step, and put your final answer within \\boxed{}."
 
 
-def load_problems(limit: int, levels: set[str]) -> list[dict]:
+def load_problems(limit: int, levels: set[str], dataset: str = "math") -> list[dict]:
     from datasets import load_dataset
 
+    if dataset == "gsm8k":
+        ds = load_dataset("openai/gsm8k", "main", split="test")
+        rows = [{"id": f"gsm8k-{i}", "problem": r["question"], "answer": r["answer"].split("####")[-1].strip().replace(",", "")}
+                for i, r in enumerate(ds)]
+        return rows[:limit] if limit else rows
     ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
     rows = [{"id": r["unique_id"], "problem": r["problem"], "answer": r["answer"]}
             for r in ds if str(r["level"]) in levels]
@@ -183,6 +188,7 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=4096)
     ap.add_argument("--problems", type=int, default=64)
     ap.add_argument("--levels", default="4,5", help="MATH levels to draw prompts from")
+    ap.add_argument("--dataset", choices=["math", "gsm8k"], default="math")
     ap.add_argument("--concurrent", type=int, default=8, help="prompts in flight")
     ap.add_argument("--max-model-len", type=int, default=8192)
     ap.add_argument("--kv-fp8", action="store_true")
@@ -195,7 +201,7 @@ def main() -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     stops = [tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")]
-    rows = load_problems(args.problems, set(args.levels.split(",")))
+    rows = load_problems(args.problems, set(args.levels.split(",")), args.dataset)
     for r in rows:
         text = tokenizer.apply_chat_template([{"role": "user", "content": r["problem"] + SUFFIX}],
                                              add_generation_prompt=True, tokenize=False, enable_thinking=False)
