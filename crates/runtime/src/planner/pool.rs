@@ -50,7 +50,14 @@ pub struct RegistryPool {
     model: usize,
     engine: usize,
     suspend_capable: bool,
+    /// The last count of reclaimable idle pages and when it was taken.
+    reclaimable: parking_lot::Mutex<Option<(crate::rt::Instant, u32)>>,
 }
+
+/// How long a count of reclaimable idle pages stands: counting walks every
+/// cached entry under the kv lock, and the pressure report asks every
+/// 100 ms, so a full cache would hold the lock a fire waits on.
+const RECLAIMABLE_FRESH: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl RegistryPool {
     pub fn new(model: usize, engine: usize, suspend_capable: bool) -> Self {
@@ -58,6 +65,7 @@ impl RegistryPool {
             model,
             engine,
             suspend_capable,
+            reclaimable: parking_lot::Mutex::new(None),
         }
     }
 
@@ -125,9 +133,17 @@ impl PoolPort for RegistryPool {
     }
 
     fn reclaimable_idle(&self) -> u32 {
-        self.with_kv_tagged("planner-reclaimable-idle", |kv| {
+        let mut last = self.reclaimable.lock();
+        if let Some((at, pages)) = *last
+            && at.elapsed() < RECLAIMABLE_FRESH
+        {
+            return pages;
+        }
+        let pages = self.with_kv_tagged("planner-reclaimable-idle", |kv| {
             kv.reclaimable_cache_pages()
-        })
+        });
+        *last = Some((crate::rt::Instant::now(), pages));
+        pages
     }
 
     fn suspend_capable(&self) -> bool {

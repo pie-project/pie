@@ -553,19 +553,28 @@ impl KvStore {
         self.split_at_steps(&keys);
         self.split_persisted();
         let mut freed = 0;
-        for (key, ids) in self.reclaim_order(&keys) {
-            let before = freed;
-            freed += self.settle_on_disk(&ids, key, &keys, epoch);
-            if freed == before {
-                let ids = ids
-                    .into_iter()
-                    .filter(|id| !self.cache.get(id).is_some_and(|e| self.persisted_whole(e)))
-                    .collect();
-                freed += self.drop_entries(ids, By::Host, epoch);
+        let mut groups = self.reclaim_order(&keys);
+        'passes: for last in [false, true] {
+            let mut later = Vec::new();
+            for (key, ids) in std::mem::take(&mut groups) {
+                if !last && !self.table.frees_device_pages(&self.roots(&ids)) {
+                    later.push((key, ids));
+                    continue;
+                }
+                let before = freed;
+                freed += self.settle_on_disk(&ids, key, &keys, epoch);
+                if freed == before {
+                    let ids = ids
+                        .into_iter()
+                        .filter(|id| !self.cache.get(id).is_some_and(|e| self.persisted_whole(e)))
+                        .collect();
+                    freed += self.drop_entries(ids, By::Host, epoch);
+                }
+                if freed >= (self.pool.capacity() as usize / 64).max(1) {
+                    break 'passes;
+                }
             }
-            if freed >= (self.pool.capacity() as usize / 64).max(1) {
-                break;
-            }
+            groups = later;
         }
         tracing::debug!(target: "pie::kv", freed, "reclaimed");
         freed
@@ -695,8 +704,9 @@ impl KvStore {
         }
     }
 
-    /// An owner's answers before its prompts; groups that free no device page
-    /// go last, and one wholly below the device never.
+    /// An owner's answers before its prompts; one wholly below the device
+    /// never. Groups that free no device page go last: the callers ask as
+    /// they go, so a reclaim that stops early asks only the groups it reaches.
     fn reclaim_order(&self, keys: &impl Keys) -> Vec<(i64, Vec<u64>)> {
         let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
         if unused.is_empty() {
@@ -721,10 +731,7 @@ impl KvStore {
         }
         let mut order: Vec<_> = groups
             .into_iter()
-            .map(|((_, key, decoded), (ids, last_use))| {
-                let frees = self.table.frees_device_pages(&self.roots(&ids));
-                ((!frees, key, !decoded, last_use), (key, ids))
-            })
+            .map(|((_, key, decoded), (ids, last_use))| ((key, !decoded, last_use), (key, ids)))
             .collect();
         order.sort_unstable_by_key(|(order, _)| *order);
         order.into_iter().map(|(_, group)| group).collect()
@@ -747,19 +754,28 @@ impl KvStore {
         }
         self.split_at_steps(&keys);
         self.split_persisted();
-        for (key, ids) in self.reclaim_order(&keys) {
-            // What a higher key also covers stays with it.
-            let above = self.above(key, &keys);
-            let mut pages = self.table.cache_only_pages(&self.roots(&ids), &above);
-            // A page with a copy on disk settles there when its room is
-            // wanted, at no cost: host room is for the rest.
-            pages.retain(|(location, _)| self.copy_of(location).is_none());
-            if pages.is_empty() {
-                continue;
+        let mut groups = self.reclaim_order(&keys);
+        for last in [false, true] {
+            let mut later = Vec::new();
+            for (key, ids) in std::mem::take(&mut groups) {
+                if !last && !self.table.frees_device_pages(&self.roots(&ids)) {
+                    later.push((key, ids));
+                    continue;
+                }
+                // What a higher key also covers stays with it.
+                let above = self.above(key, &keys);
+                let mut pages = self.table.cache_only_pages(&self.roots(&ids), &above);
+                // A page with a copy on disk settles there when its room is
+                // wanted, at no cost: host room is for the rest.
+                pages.retain(|(location, _)| self.copy_of(location).is_none());
+                if pages.is_empty() {
+                    continue;
+                }
+                pages.truncate(room);
+                tracing::debug!(target: "pie::kv", pages = pages.len(), "demote");
+                return Ok(Some(self.prepare_move_out(&HashSet::new(), pages)?));
             }
-            pages.truncate(room);
-            tracing::debug!(target: "pie::kv", pages = pages.len(), "demote");
-            return Ok(Some(self.prepare_move_out(&HashSet::new(), pages)?));
+            groups = later;
         }
         Ok(None)
     }
