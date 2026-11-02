@@ -1444,13 +1444,34 @@ impl Weights {
             } => Some(*bank),
             _ => None,
         };
+        // A select whose product a GLU reads is a gate-up leg; the rest are
+        // down legs, copied only where the profile says (`kernel.moe.mxfp4_bf16_down`).
+        let down_too = ctx.tuning().mxfp4_bf16_down;
+        let glu_in: std::collections::BTreeSet<_> = trace
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.op {
+                Operation::Linear(Linear::Glu {
+                    packed: Some(p), ..
+                }) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        let gate_up = |op: &Linear| match op {
+            Linear::MoeSelect { y, .. } => down_too || glu_in.contains(y),
+            _ => false,
+        };
         let mut read = std::collections::BTreeSet::new();
         for node in &trace.nodes {
             let ws: Vec<_> = match &node.op {
-                Operation::Linear(op) => a16(op).into_iter().collect(),
+                Operation::Linear(op) if gate_up(op) => a16(op).into_iter().collect(),
+                Operation::Linear(_) => continue,
                 Operation::Fused(
                     Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
-                ) => [a16(select), a16(down)].into_iter().flatten().collect(),
+                ) => [a16(select), if down_too { a16(down) } else { None }]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
                 Operation::Fused(Fused::MoeSelectGlu { select, .. }) => {
                     a16(select).into_iter().collect()
                 }
