@@ -452,11 +452,13 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2
 #pragma unroll
     for (int s = 0; s < kStages - 1; ++s) stage(s);
 
+    // A step's A registers, two deep: the MMAs of a chunk's last step are in
+    // flight into the next chunk's first.
+    unsigned a[2][kT][4];
     for (int ch = 0; ch < chunks; ++ch) {
         asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 2));
         __syncthreads();
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-        stage(ch + kStages - 1);
 
         const u8* st = ring + (ch % kStages) * kStage;
         // The lane's rows (h: g, g + 8) of each tile in the stage.
@@ -504,7 +506,6 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2
         const unsigned sel = 0x4440u | static_cast<unsigned>(c);
         const int steps = ch == chunks - 1 ? tail_steps : 8;
 
-        unsigned a[2][kT][4];
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             if (s >= steps) break;
@@ -547,9 +548,16 @@ __global__ void __launch_bounds__(128 * kWg, kWg == 2 ? 1 : kSlice == 64 ? 3 : 2
             asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
 #pragma unroll
             for (int t = 0; t < kT; ++t) wgfp4::hold(as[t]);
+            // The chunk before's last MMAs have landed in every warpgroup once
+            // each is past its first step here: its stage refills now, so the
+            // MMAs stay in flight across the chunk's edge.
+            if (s == 0) {
+                __syncthreads();
+                stage(ch + kStages - 1);
+            }
         }
-        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
     }
+    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
     asm volatile("cp.async.wait_group 0;\n" ::);
 
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
