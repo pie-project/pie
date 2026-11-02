@@ -246,7 +246,9 @@ async def run_vllm(rows: list[dict], cfg: dict, args, tokenizer) -> list[dict]:
             try:
                 return await VllmDeepConf(engine, tokenizer, cfg, row["id"], row["ids"]).run()
             except Exception as e:  # noqa: BLE001
-                return {"error": repr(e)[-500:]}
+                import traceback
+                cause = e.__cause__ or e
+                return {"error": "".join(traceback.format_exception(cause))[-1500:]}
 
     try:
         return await asyncio.gather(*[one(r) for r in rows])
@@ -277,9 +279,10 @@ def main() -> None:
     i, n = map(int, args.shard.split("/"))
     rows = load_problems(args.problems)[i::n]
     for r in rows:
-        r["ids"] = tokenizer.apply_chat_template(
-            [{"role": "user", "content": r["problem"] + SUFFIX}], add_generation_prompt=True, tokenize=True,
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": r["problem"] + SUFFIX}], add_generation_prompt=True, tokenize=False,
             enable_thinking=True)
+        r["ids"] = tokenizer.encode(text, add_special_tokens=False)
         r["stops"] = stops
     eta = MODES[args.mode]
     cfg = {"budget": args.budget, "eta": eta, "max_tokens": args.max_tokens,
