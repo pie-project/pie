@@ -1426,6 +1426,97 @@ impl Weights {
         Ok(done)
     }
 
+    /// `kernel.moe.mxfp4_bf16_from`: each resident MXFP4 bank a bf16-activation
+    /// select reads keeps a bf16 copy, widened once here (each value exactly),
+    /// that wide selects read on Hopper's wgmma GEMM. Returns the banks it widened.
+    #[cfg(feature = "cuda")]
+    pub fn copy_mxfp4_banks_bf16(
+        &mut self,
+        trace: &Trace,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<u32> {
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        use poem_ir::{Def, Fused, Linear, Operation};
+        let a16 = |op: &Linear| match op {
+            Linear::MoeSelect {
+                bank, quant: None, ..
+            } => Some(*bank),
+            _ => None,
+        };
+        let mut read = std::collections::BTreeSet::new();
+        for node in &trace.nodes {
+            let ws: Vec<_> = match &node.op {
+                Operation::Linear(op) => a16(op).into_iter().collect(),
+                Operation::Fused(
+                    Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
+                ) => [a16(select), a16(down)].into_iter().flatten().collect(),
+                Operation::Fused(Fused::MoeSelectGlu { select, .. }) => {
+                    a16(select).into_iter().collect()
+                }
+                _ => continue,
+            };
+            for w in ws {
+                if let Some(Def::Weight(at)) = trace.values.get(w.0 as usize).map(|v| &v.def) {
+                    read.insert(*at as usize);
+                }
+            }
+        }
+        let mut done = 0;
+        for at in read {
+            if trace.params[at].dtype != Dtype::Mxfp4 || self.table.3.contains_key(&at) {
+                continue;
+            }
+            let Some(Some(WeightRow::Planes {
+                codes,
+                scales,
+                seat,
+                atoms: false,
+                lanes: false,
+                ..
+            })) = self.table.0.get(at).copied()
+            else {
+                continue;
+            };
+            // An MXFP4 plane is `[experts, rows, blocks, 16]` bytes.
+            let shape = &trace.params[at].shape;
+            if shape.len() < 3 {
+                continue;
+            }
+            let rows: u64 = shape[..shape.len() - 2].iter().product();
+            let k = shape[shape.len() - 2] * 32;
+            if seat.streams()
+                || crate::device::alloc::is_host_pointer(codes.ptr)
+                || crate::device::alloc::is_host_pointer(scales.ptr)
+                || rows == 0
+                || !k.is_multiple_of(64)
+            {
+                continue;
+            }
+            let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+            let buffer = Buffer::zeroed_on(stream, (rows * k * 2) as usize)?;
+            kernels_cuda::linear::moe::mxfp4_to_bf16(
+                &ctx,
+                codes.ptr,
+                scales.ptr,
+                to32(rows),
+                to32(k),
+                buffer.ptr(),
+            )?;
+            crate::device::ctx::sync(stream)?;
+            self.table.3.insert(
+                at,
+                (
+                    Tensor::new(buffer.ptr(), codes.rows, to32(k), Dtype::Bf16),
+                    Tensor::new(0, 0, 0, Dtype::U8),
+                ),
+            );
+            self.decoded.push(buffer);
+            done += 1;
+        }
+        Ok(done)
+    }
+
     pub fn rotate(
         &mut self,
         trace: &Trace,

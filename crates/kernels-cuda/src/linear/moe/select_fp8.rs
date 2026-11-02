@@ -773,6 +773,35 @@ pub fn mxfp4_to_fp8b128(
     quantize_fp8b128(ctx, Tensor::new(wide, rows, k, Dtype::Bf16), codes, atoms)
 }
 
+/// An MXFP4 bank (`rows` rows of `k` codes, an e8m0 scale a 32) as bf16 at
+/// `out` (`rows * k * 2` bytes), each value exactly the code times its
+/// block's scale.
+#[cfg(feature = "cuda")]
+pub fn mxfp4_to_bf16(
+    ctx: &Ctx,
+    src_codes: u64,
+    src_scales: u64,
+    rows: u32,
+    k: u32,
+    out: u64,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mxfp4_to_bf16";
+    let count = u64::from(rows) * u64::from(k);
+    let threads = u32::try_from(count.div_ceil(8))
+        .map_err(|_| refuse(OP, "the bank's 8-code runs pass a 32-bit launch"))?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(DEQUANT, "::pie::linear::dequantize_mxfp4"))
+            .apply(Launch::flat(threads, 256)),
+        &[
+            ArgValue::Ptr(src_codes),
+            ArgValue::Ptr(src_scales),
+            ArgValue::Ptr(out),
+            (count as i64).arg(),
+        ],
+    )
+}
+
 /// An fp8b128 plane (`codes` `[rows, k]`, each 128x128 block's exponent
 /// spread to its rows in tcgen05's atoms at `atoms`) as bf16 at `out`, each
 /// value exactly: the bf16 [`quantize_fp8b128`] read.

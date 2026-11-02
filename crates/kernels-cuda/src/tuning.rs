@@ -324,6 +324,13 @@ pub struct MoeMxfp4A8From(pub u32);
 #[decision(id = "kernel.moe.mxfp4_fp8_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4Fp8From(pub u32);
 
+/// The fewest routes a bf16-activation MXFP4 select runs, on Hopper, on a
+/// bf16 copy of its bank widened once at load (each value exactly), on the
+/// warp-specialized wgmma GEMM. 0: never, and no copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_bf16_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4Bf16From(pub u32);
+
 /// The fewest routes an MXFP4 select runs W4A8 on sm_120a's block-scaled
 /// mma.sync, its rows quantized as MXFP8 (as SGLang reads MXFP4 experts on
 /// the consumer Blackwells). 0: never.
@@ -858,6 +865,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4A8Until>()
         .add::<MoeMxfp4A8From>()
         .add::<MoeMxfp4Fp8From>()
+        .add::<MoeMxfp4Bf16From>()
         .add::<MoeMxfp4W4a8From>()
         .add::<MoeMxfp4W4a8Tma>()
         .add::<MoeMxfp4W4a8Ws>()
@@ -1000,6 +1008,7 @@ tuning! {
     mxfp4_a8_until: u32 = 0, get MoeMxfp4A8Until;
     mxfp4_a8_from: u32 = 0, get MoeMxfp4A8From;
     mxfp4_fp8_from: u32 = 0, get MoeMxfp4Fp8From;
+    mxfp4_bf16_from: u32 = 0, get MoeMxfp4Bf16From;
     mxfp4_w4a8_from: u32 = 0, get MoeMxfp4W4a8From;
     mxfp4_w4a8_tma: bool = false, on MoeMxfp4W4a8Tma;
     mxfp4_w4a8_ws: bool = false, on MoeMxfp4W4a8Ws;
