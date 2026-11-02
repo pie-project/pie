@@ -61,10 +61,9 @@ branches = true
 dag_streams = true
 dag_streams_until = 256
 
-# fires of three lanes' 1024 prompt rows over a gated delta trunk (5 of a batch's 556-token prompts) keep
-# the card fed while the next prompts arrive: Qwen3.8-Flash-Next mini pf16-512 142k -> 160k tok/s
+# no 1024-row walk fires (the PRO 6000's line): on this card they starve the gated delta trunk,
+# Qwen3.8-Flash-Next mini pf32-512 62.1k -> 76.8k, Qwen3.8-27B mini20 pf8-512 7.98k -> 8.89k tok/s, greedy tokens unchanged
 [engine]
-walk_fire_rows = 1024
 # a fire takes at most 5120 rows, so a batch's prompts end over two fires and those the first
 # finishes are answered, and replaced, while the second runs: DeepSeek-V4 mini pf16-512 98.7k -> 103k
 fire_rows = 5120
