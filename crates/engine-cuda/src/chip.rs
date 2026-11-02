@@ -98,6 +98,14 @@ pub struct OneFrameWhenShort;
 #[decision(id = "engine.seated_first", flag, default = false, tune = engine)]
 pub struct SeatedFirst;
 
+/// Whether a process starts only while the pools hold the started ones to
+/// the pages a finished one held (`PoolFacts::seat_to_end`), for a card
+/// whose pools seat fewer full lanes than the batch asks. Off starts each
+/// at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.seat_to_end", flag, default = false, tune = engine)]
+pub struct SeatToEnd;
+
 /// Whether a windowed pool of short lanes takes a page a lane past its kv
 /// pages (`Paging::spare`), for a card whose ring, not its kv pages, runs
 /// dry first. Off cuts it 1:1.
@@ -166,6 +174,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<StateSlotsPerLane>()
         .add::<OneFrameWhenShort>()
         .add::<SeatedFirst>()
+        .add::<SeatToEnd>()
         .add::<WindowSpare>()
         .add::<ForwardTokens>()
         .add::<WalkFireRows>()
@@ -217,9 +226,11 @@ shelved!(
         "sm87.toml",
         "sm89.toml",
         "sm89/nvidia-geforce-rtx-4090.toml",
+        "sm89/nvidia-l4.toml",
         "sm89/nvidia-l40s.toml",
         "sm90.toml",
         "sm90/nvidia-h100-80gb-hbm3.toml",
+        "sm90/nvidia-h100-pcie.toml",
         "sm90/nvidia-h200.toml",
         "sm100.toml",
         "sm100/nvidia-b200.toml",
@@ -227,6 +238,7 @@ shelved!(
         "sm110.toml",
         "sm120.toml",
         "sm120/nvidia-geforce-rtx-5090.toml",
+        "sm120/nvidia-rtx-pro-4500-blackwell.toml",
         "sm120/nvidia-rtx-pro-6000-blackwell-server-edition.toml",
         "sm121.toml",
     ],
@@ -258,6 +270,7 @@ pub struct Engine {
     pub state_slots_per_lane: u32,
     pub one_frame_when_short: bool,
     pub seated_first: bool,
+    pub seat_to_end: bool,
     pub window_spare: bool,
     pub forward_tokens: u32,
     pub walk_fire_rows: u32,
@@ -291,6 +304,7 @@ impl Engine {
             state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
             one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
             seated_first: profile.on::<SeatedFirst>(&Anywhere),
+            seat_to_end: profile.on::<SeatToEnd>(&Anywhere),
             window_spare: profile.on::<WindowSpare>(&Anywhere),
             forward_tokens: profile.get::<ForwardTokens>().0,
             walk_fire_rows: profile.get::<WalkFireRows>().0,
@@ -476,7 +490,7 @@ mod tests {
             (8, 0, "NVIDIA A30"),
             (8, 6, "NVIDIA A10"),
             (8, 7, "Orin"),
-            (8, 9, "NVIDIA L4"),
+            (8, 9, "NVIDIA L20"),
             (9, 0, "NVIDIA H800"),
             (10, 0, "NVIDIA GB200"),
             (10, 3, "NVIDIA B300"),
@@ -771,6 +785,7 @@ mod tests {
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 seated_first: false,
+                seat_to_end: false,
                 window_spare: false,
                 forward_tokens: 0,
                 walk_fire_rows: 0,
@@ -850,6 +865,7 @@ mod tests {
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,
                 seated_first: false,
+                seat_to_end: false,
                 window_spare: false,
                 forward_tokens: 0,
                 walk_fire_rows: 0,
@@ -1070,7 +1086,7 @@ mod tests {
                 Engine {
                     prefill_lattice_from: 256,
                     prefill_lattice_steps: 8,
-                    forward_tokens: if std::ptr::eq(p, &l40s) { 2048 } else { 0 },
+                    forward_tokens: if std::ptr::eq(p, &l40s) { 2304 } else { 0 },
                     seated_first: std::ptr::eq(p, &l40s),
                     recording: if std::ptr::eq(p, &l40s) {
                         Recording::Bodies {

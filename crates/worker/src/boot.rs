@@ -17,6 +17,26 @@ pub(crate) struct LoadedModelEngines {
     pub(crate) metadata: runtime::model::ModelMetadata,
 }
 
+/// The wafer's token loops answer each lane as far as its guest has posted,
+/// so a cerebras engine serves at the runtime's most (`frame_size` 4,
+/// `frame_dispatch_depth` 15: `pie config init` writes them): below it fewer
+/// lanes ride each loop (the 8B ring's 12 streams took turns, 6 a launch, at
+/// frame_size 2). Advice only; the configuration stands.
+fn advise_cerebras_frames(runtime: &config::RuntimeConfig) {
+    let (size, depth) = (
+        u32::from(engine::runahead::Runahead::STEPS_MAX),
+        u32::from(engine::runahead::Runahead::MAX_FRAMES),
+    );
+    if runtime.frame_size < size || runtime.frame_dispatch_depth < depth {
+        tracing::warn!(
+            frame_size = runtime.frame_size,
+            frame_dispatch_depth = runtime.frame_dispatch_depth,
+            "cerebras serves at [runtime] frame_size = {size}, frame_dispatch_depth = {depth}: \
+             below them fewer lanes ride each wafer loop"
+        );
+    }
+}
+
 pub(crate) fn load_model_engines(
     user_cfg: &config::Config,
     home: &Path,
@@ -26,6 +46,9 @@ pub(crate) fn load_model_engines(
         let m = &user_cfg.model;
         let e = &user_cfg.engine;
         let flavor = crate::backend::flavor::resolve(e.kind, &m.name)?;
+        if e.kind == config::EngineKind::Cerebras {
+            advise_cerebras_frames(&user_cfg.runtime);
+        }
 
         let world_size = e.device.len();
         let tp_degree = if e.tensor_parallel_size == 0 {

@@ -14,6 +14,32 @@ sdpa.decode.static_max_requests = 320  # 2.5% faster end to end
 sdpa.merge_warp = true  # 1.4% faster end to end
 ssm.kda_step_fused = true  # 1.0% faster end to end
 
+# The L40S's sm_89 kernel lines (tensor-core attention, hyper-connection,
+# indexer and MoE paths), the same chip: DeepSeek-V4-Flash's mini raw decode
+# 288 to 336 tok/s and pf16-512 19.5k to 45.6k, Qwen3.8-Flash-Next's mini
+# pf16-512 62k to 83k, gpt-oss-20b c256 5.1k to 5.7k on an RTX 4090.
+gemm.rows_m = 16
+moe.nvfp4_mma_from = 17
+moe.nvfp4_mma_until = 65536
+gemm.fp8_shadow = true
+sdpa.decode.grouped_prefill_from = 8
+sdpa.decode.grouped_prefill_lse = true
+sdpa.decode.grouped_prefill_window = true
+sdpa.fa2_live = true
+sdpa.index_mma = true
+sdpa.index_radix = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+elemwise.norm_emit = true
+elemwise.rows_vec = true
+sdpa.pool_mma = true
+sdpa.selected_mma = true
+sdpa.compressed_replay = true
+moe.bf16_mma_from = 16
+moe.bf16_mma_until = 65536
+moe.mxfp4_fp8_from = 256
+moe.mxfp4_mma_per_from = 4
+
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 35.9 -> 35.2 ms, 1-lane step 3.55 -> 3.48 ms, 4-lane step 5.23 -> 5.17 ms, 8-lane step 7.52 -> 7.47 ms, readout cosine 1.0000"
 measured = [

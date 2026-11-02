@@ -59,34 +59,6 @@ fn launch_of(mut candidates: Vec<(usize, usize)>, lanes: usize) -> (Vec<usize>, 
     (taken.into_iter().map(|(i, _)| i).collect(), steps)
 }
 
-/// A continuation's lanes and iterations, given each ready lane's
-/// iterations (`ready`: those whose posted fires run past their loop), the
-/// lanes a continuation could run (`active`), whether the next step waits on
-/// the wafer (`stalled`) and a launch's lanes (`most`): every active lane
-/// together, the fewest iterations any of them has room for, so they stay in
-/// step (a launch costs about the same at 1 lane as at 12); none while an
-/// active lane is not ready yet and the host still has answered rows to run
-/// (running them posts its fires); else, the pipe would stall, the ready
-/// lanes as [`launch_of`] picks them.
-fn lockstep_of(
-    ready: Vec<(usize, usize)>,
-    active: usize,
-    stalled: bool,
-    most: usize,
-) -> Option<(Vec<usize>, usize)> {
-    if !ready.is_empty() && ready.len() >= active {
-        let mut all = ready;
-        all.sort_by_key(|&(i, _)| i);
-        all.truncate(most.max(1));
-        let steps = all.iter().map(|&(_, n)| n).min().unwrap_or(0);
-        return Some((all.into_iter().map(|(i, _)| i).collect(), steps));
-    }
-    if !stalled {
-        return None;
-    }
-    Some(launch_of(ready, most))
-}
-
 impl Spatial {
     /// Whether frames settle asynchronously: `async` when set, else on for
     /// a build of one lane a micro-batch (B1, with or without the pipeline
@@ -272,32 +244,10 @@ impl Spatial {
                 lanes.push((slot, end, lane.kv.pages.clone(), steps));
             }
         }
-        // The lanes a continuation may run on (loops whose stream still
-        // posts fires) and whether the next step must wait on the wafer.
-        let active = self
-            .paged_ahead
-            .keys()
-            .filter(|&&slot| {
-                self.posted
-                    .iter()
-                    .any(|p| p.step.lanes.iter().any(|l| l.slot == slot))
-            })
-            .count();
-        let stalled = self.posted.front().is_some_and(|head| {
-            head.step.lanes.iter().any(|l| {
-                self.paged_ahead
-                    .get(&l.slot)
-                    .is_none_or(|run| run.end() <= l.kv.held)
-            })
-        });
-        let Some((taken, steps)) = lockstep_of(
+        let (taken, steps) = launch_of(
             lanes.iter().enumerate().map(|(i, l)| (i, l.3)).collect(),
-            active,
-            stalled,
             most,
-        ) else {
-            return;
-        };
+        );
         if taken.is_empty() || steps == 0 {
             return;
         }
@@ -369,33 +319,6 @@ pub(super) fn post(queue: &mut VecDeque<Posted>, frame: FrameId, steps: &[Step])
 #[cfg(test)]
 mod tests {
     use super::launch_of;
-
-    #[test]
-    fn a_continuation_runs_every_active_lane_or_waits_for_them() {
-        use super::lockstep_of;
-        // Every active lane ready: all of them, at the fewest iterations.
-        assert_eq!(
-            lockstep_of(vec![(0, 16), (1, 9), (2, 16)], 3, false, 12),
-            Some((vec![0, 1, 2], 9))
-        );
-        // One active lane not ready while the host has rows to run: wait.
-        assert_eq!(lockstep_of(vec![(0, 16), (1, 16)], 3, false, 12), None);
-        // The next step waits on the wafer: the ready lanes go now.
-        assert_eq!(
-            lockstep_of(vec![(0, 16), (1, 16)], 3, true, 12),
-            Some((vec![0, 1], 16))
-        );
-        // At most a launch's lanes.
-        let twelve: Vec<(usize, usize)> = (0..14).map(|i| (i, 16)).collect();
-        assert_eq!(lockstep_of(twelve, 14, false, 12).unwrap().0.len(), 12);
-        // One lane (B1): as before, it goes when ready, nothing otherwise.
-        assert_eq!(
-            lockstep_of(vec![(0, 31)], 1, false, 12),
-            Some((vec![0], 31))
-        );
-        assert_eq!(lockstep_of(Vec::new(), 1, false, 12), None);
-        assert_eq!(lockstep_of(Vec::new(), 1, true, 12), Some((Vec::new(), 0)));
-    }
 
     #[test]
     fn a_continuation_launches_the_lanes_that_run_about_as_far() {

@@ -1,5 +1,6 @@
 #include "linear/codec.cuh"
 #include "linear/moe_w4.cuh"
+#include "linear/quant.cuh"
 #include "prim/mma.cuh"
 
 namespace pie::linear {
@@ -418,6 +419,269 @@ __global__ void __launch_bounds__(128, kMinBlocks) moe_select_mxfp4_cvt(
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, [](int) { return 1.f; }, b_e, order, begin, count, out,
                                       n, inter, row_base, g, c, limit, galpha);
+}
+
+// `moe_matmul_select_mxfp4` (the decode arm: a block a route, `kRows` rows a
+// warp) with each 32-code block widened by the e2m1 converts rather than
+// byte permutes: the same f16 codes and products in the same order, so the
+// same bits, at fewer ALU slots a code (gpt-oss-20b's routed projections at
+// one token on a B200: 18.2 and 10.7 us to 14.5 and 8.6).
+template <class T, int kRows>
+__global__ void moe_matmul_select_mxfp4_cvt(
+    const T* __restrict__ act,
+    const i32* __restrict__ routes,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const T* __restrict__ bias,
+    T* __restrict__ out,
+    int top_k,
+    int act_div,
+    int n,
+    int k,
+    const MoeGroupBases* __restrict__ bases,
+    unsigned int* __restrict__ group_hits,
+    const u32* __restrict__ win)
+{
+    const int route = blockIdx.x;
+
+    if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
+
+    const int plane_route = win != nullptr ? route + static_cast<int>(win[1]) * top_k : route;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+    const int row0 = (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kRows;
+    if (row0 >= n) return;
+    const int expert = routes[plane_route];
+
+    moe_note_group(group_hits);
+
+    const int groups_per_row = k / 32;
+
+    const u8* codes_at = codes;
+    const u8* scales_at = scales;
+    if (bases != nullptr) {
+        const MoeGroupBases seat = *bases;
+        codes_at = seat.codes;
+        scales_at = seat.scales;
+    }
+
+    const u8* w = codes_at + static_cast<long long>(expert) * n * (k / 2);
+    const u8* s = scales_at + static_cast<long long>(expert) * n * groups_per_row;
+
+    const T* x = act + static_cast<long long>(plane_route / act_div) * k;
+
+    int row_of[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) row_of[r] = min(row0 + r, n - 1);
+
+    constexpr int kU = 2;
+    const uint4* wq = reinterpret_cast<const uint4*>(w);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x);
+
+    float acc[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
+
+    for (int g0 = lane_id; g0 < groups_per_row; g0 += 32 * kU) {
+        uint4 ww[kU][kRows];
+        u8 sc[kU][kRows];
+#pragma unroll
+        for (int u = 0; u < kU; ++u) {
+            const int g = min(g0 + 32 * u, groups_per_row - 1);
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                const long long at = static_cast<long long>(row_of[r]) * groups_per_row + g;
+                ww[u][r] = wq[at];
+                sc[u][r] = s[at];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kU; ++u) {
+            const int g = g0 + 32 * u;
+            if (g >= groups_per_row) break;
+            float part[kRows];
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) part[r] = 0.f;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const uint4 xq = x4[g * 4 + q];
+                const T* xe = reinterpret_cast<const T*>(&xq);
+                float xv[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) xv[j] = Elem<T>::to_f32(xe[j]);
+#pragma unroll
+                for (int r = 0; r < kRows; ++r) {
+                    unsigned qd[4];
+                    w4cvt::e2m1x8((&ww[u][r].x)[q], qd);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&qd[j]));
+                        part[r] = fmaf(f.x, xv[2 * j], part[r]);
+                        part[r] = fmaf(f.y, xv[2 * j + 1], part[r]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRows; ++r)
+                acc[r] = fmaf(part[r], mxfp4_block_scale(sc[u][r]), acc[r]);
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+            acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], off);
+    }
+    if (lane_id == 0) {
+        const T* b = bias != nullptr
+            ? bias + static_cast<long long>(expert) * n
+            : nullptr;
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const int row = row0 + r;
+            if (row >= n) break;
+            float v = acc[r];
+            if (b != nullptr) v += Elem<T>::to_f32(b[row]);
+            out[static_cast<long long>(plane_route) * n + row] = Elem<T>::from_f32(v);
+        }
+    }
+}
+
+// `moe_matmul_select_nvfp4` (a decode's few routes an expert, and NVFP4's
+// dense product) with each code word widened by the e2m1 converts, as
+// `moe_matmul_select_mxfp4_cvt` widens MXFP4's: the same bits.
+template <class T, int kRowsT>
+__global__ void moe_matmul_select_nvfp4_cvt(
+    const T* __restrict__ act,
+    const i32* __restrict__ routes,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const float* __restrict__ tensor_scales,
+    T* __restrict__ out,
+    int top_k,
+    int act_div,
+    int n,
+    int k,
+    const MoeGroupBases* __restrict__ bases,
+    unsigned int* __restrict__ group_hits,
+    const u32* __restrict__ win)
+{
+    constexpr int kRows = kRowsT;
+    const int route = blockIdx.x;
+
+    if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
+
+    const int plane_route = win != nullptr ? route + static_cast<int>(win[1]) * top_k : route;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+    const int row0 = (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kRows;
+    if (row0 >= n) return;
+    const int expert = routes != nullptr ? routes[plane_route] : 0;
+    T* y = out + static_cast<long long>(plane_route) * n;
+    if (expert < 0) {
+        if (lane_id == 0) {
+#pragma unroll
+            for (int r = 0; r < kRows; ++r)
+                if (row0 + r < n) y[row0 + r] = Elem<T>::from_f32(0.f);
+        }
+        return;
+    }
+
+    moe_note_group(group_hits);
+
+    // A 16-byte load is 32 codes, two groups of a row.
+    const int chunks = k / 32;
+    const int groups = k / 16;
+
+    const u8* codes_at = codes;
+    const u8* scales_at = scales;
+    const float* tensor_at = tensor_scales;
+    if (bases != nullptr) {
+        const MoeGroupBases seat = *bases;
+        codes_at = seat.codes;
+        scales_at = seat.scales;
+        tensor_at = reinterpret_cast<const float*>(seat.biases);
+    }
+
+    const uint4* wq = reinterpret_cast<const uint4*>(
+        codes_at + static_cast<long long>(expert) * n * (k / 2));
+    const unsigned short* s2 = reinterpret_cast<const unsigned short*>(
+        scales_at + static_cast<long long>(expert) * n * groups);
+    const float* g = tensor_at + static_cast<long long>(expert) * n;
+
+    const T* x = act + static_cast<long long>(plane_route / act_div) * k;
+    const uint4* x4 = reinterpret_cast<const uint4*>(x);
+
+    int row_of[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) row_of[r] = min(row0 + r, n - 1);
+
+    constexpr int kU = 2;
+    float acc[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
+
+    for (int c0 = lane_id; c0 < chunks; c0 += 32 * kU) {
+        uint4 ww[kU][kRows];
+        unsigned short sc[kU][kRows];
+#pragma unroll
+        for (int u = 0; u < kU; ++u) {
+            const int c = min(c0 + 32 * u, chunks - 1);
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                const long long at = static_cast<long long>(row_of[r]) * chunks + c;
+                ww[u][r] = wq[at];
+                sc[u][r] = s2[at];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kU; ++u) {
+            const int c = c0 + 32 * u;
+            if (c >= chunks) break;
+            float part[2][kRows];
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) part[0][r] = part[1][r] = 0.f;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const uint4 xq = x4[c * 4 + q];
+                const T* xe = reinterpret_cast<const T*>(&xq);
+                float xv[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) xv[j] = Elem<T>::to_f32(xe[j]);
+#pragma unroll
+                for (int r = 0; r < kRows; ++r) {
+                    unsigned qd[4];
+                    w4cvt::e2m1x8((&ww[u][r].x)[q], qd);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&qd[j]));
+                        part[q >> 1][r] = fmaf(f.x, xv[2 * j], part[q >> 1][r]);
+                        part[q >> 1][r] = fmaf(f.y, xv[2 * j + 1], part[q >> 1][r]);
+                    }
+                }
+            }
+            constexpr float kBack = 1.f;
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                acc[r] = fmaf(part[0][r], nvfp4_scale(static_cast<u8>(sc[u][r] & 0xFFu)) * kBack, acc[r]);
+                acc[r] = fmaf(part[1][r], nvfp4_scale(static_cast<u8>(sc[u][r] >> 8)) * kBack, acc[r]);
+            }
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+            acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], off);
+    }
+    if (lane_id == 0) {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const int row = row0 + r;
+            if (row >= n) break;
+            y[row] = Elem<T>::from_f32(acc[r] * g[row]);
+        }
+    }
 }
 
 }

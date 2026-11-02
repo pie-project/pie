@@ -17,9 +17,50 @@ sdpa.index_radix = true  # 1.0% faster end to end
 sdpa.prefill.tc5 = true  # 1.4% faster end to end
 ssm.kda_step_fused = true  # 1.7% faster end to end
 
+# the sm_120 switches the RTX PRO 6000 runs (same chip family): bf16 and NVFP4 MoE on the grouped mma.sync
+# kernels, the single-row block-FP8 GEMV, the tensor-core attention, hyper-connection and KDA kernels, the
+# grouped-prefill decode rows, W4A8 MXFP4 selects and block-FP8 dense on cuBLASLt MXFP8
+moe.bf16_mma_from = 16
+moe.bf16_mma_until = 65536
+moe.nvfp4_mma_from = 17
+moe.nvfp4_mma_until = 65536
+gemm.fp8_gemv_until = 1
+elemwise.rows_vec = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+elemwise.norm_emit = true
+sdpa.merge_warp = true
+sdpa.selected_mma = true
+sdpa.pool_mma = true
+sdpa.index_mma = true
+ssm.kda_chunked = true
+ssm.conv_vec4 = true
+ssm.gdn_out_bf16 = true
+attn_res.fused_norm = true
+gemm.fp8_shadow = true
+sdpa.decode.grouped_prefill_from = 8
+sdpa.decode.grouped_prefill_lse = true
+sdpa.decode.grouped_prefill_window = true
+sdpa.fa2_live = true
+moe.mxfp4_w4a8_from = 256
+moe.mxfp4_w4a8_tma = true
+moe.mxfp4_w4a8_ws = true
+gemm.fp8_mx = true
+
+# independent chains (shared expert beside the routed ones) on side streams, as the RTX PRO 6000
+[compiler]
+branches = true
+dag_streams = true
+dag_streams_until = 256
+
 [engine]
 prefill_lattice_from = 384  # 2.9% faster end to end
 working_set_percent = 75  # 4.9% faster end to end
+walk_fire_rows = 1024
+fire_rows = 5120
+state_slots_per_lane = 2
+prefill_lanes = 64
+window_spare = true
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 27.7 -> 27.1 ms, 1-lane step 2.87 -> 2.80 ms, 4-lane step 4.45 -> 4.23 ms, 8-lane step 6.93 -> 6.79 ms, readout cosine 1.0000"
