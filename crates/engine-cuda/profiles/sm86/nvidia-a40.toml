@@ -3,10 +3,63 @@ api = 1
 [target]
 device = "NVIDIA A40"
 
-# pie tune (quick) on a RunPod NVIDIA A40, each line's win end to end on gpt-oss-20b.
+# The A100 file: the same sm_8x kernels. Raw-512-256 decode / prefill tok/s on
+# a RunPod A40, sm86 tier alone -> these lines: DeepSeek-V4.1 mini 62.6 / 1.5k ->
+# 128.1 / 10.2k, Kimi-K3 mini 39.0 / 2.85k -> 39.6 / 4.2k, gpt-oss-20b 126.5 -> 129.3.
 [kernel]
-moe.mxfp4_select_lean = true  # 1.3% faster end to end
-sdpa.merge_warp = true  # 1.6% faster end to end
+gemm.fp8_gemv_until = 2
+gemm.skinny_rows = 0
+gemv.bf16 = "narrow"
+gemv.splitk_max_n = 1048576
+gemm.narrow_n = 8
+gemm.fp8_shadow = true
+gemm.grouped_gemv = true
+gemm.affine_mma = true
+elemwise.rows_vec = true
+sdpa.merge_warp = true
+sdpa.decode.grouped_prefill_from = 8
+sdpa.decode.grouped_prefill_lse = true
+sdpa.decode.grouped_prefill_window = true
+sdpa.fa2_live = true
+sdpa.index_mma = true
+sdpa.index_radix = true
+sdpa.pool_mma = true
+sdpa.selected_mma = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+elemwise.norm_emit = true
+sdpa.compressed_decode_until = 64
+gemm.rows_m = 8
+mla.expanded_from = 256
+attn_res.fused_norm = true
+moe.mxfp4_mma_from = 17
+moe.mxfp4_mma_until = 16777216
+moe.mxfp4_mma_per_from = 0
+moe.mxfp4_select_lean = true
+moe.nvfp4_mma_from = 17
+moe.nvfp4_mma_until = 65536
+moe.bf16_mma_from = 16
+moe.bf16_mma_until = 65536
+sdpa.compressed_replay = true
+ssm.gdn_fused_scan = true
+ssm.conv_vec4 = true
+ssm.gdn_out_bf16 = true
+ssm.kda_chunked = true
+ssm.kda_step_fused = true
+ssm.gdn_step_blocks = 3
+
+# A prefill's fire on eight buckets a doubling from 256 rows (its GEMMs run
+# its bucket's rows), and a bucket between powers of two below.
+[engine]
+prefill_lattice_from = 256
+prefill_lattice_steps = 8
+lattice_steps = 2
+
+# Independent chains on side streams: decode latency +5-11% (Gemma 4, Qwen3.6-A3B,
+# DeepSeek-V4, GLM-5.3, Hy4), outputs unchanged; a join's branches on them too.
+[compiler]
+dag_streams = true
+branches = true
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 64.9 -> 63.9 ms, 1-lane step 5.60 -> 5.54 ms, 4-lane step 8.86 -> 8.47 ms, 8-lane step 14.19 -> 13.23 ms, readout cosine 1.0000"
