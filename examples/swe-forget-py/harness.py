@@ -213,10 +213,11 @@ async def run_pie(task: Task, uri: str, config: dict, quiet: bool) -> dict:
                 if event is Event.Message:
                     msg = json.loads(value)
                     op = msg.get("op")
+                    # a repository copy takes seconds: off the loop, so other tasks' sockets stay alive
                     if op == "fork":
-                        box.fork(msg["from"], msg["to"])
+                        await loop.run_in_executor(pool, box.fork, msg["from"], msg["to"])
                     elif op == "kill":
-                        box.kill(msg["bid"])
+                        await loop.run_in_executor(pool, box.kill, msg["bid"])
                     elif op == "exec":
                         t = time.monotonic()
                         results = await asyncio.gather(*[
@@ -282,11 +283,11 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
     state, seen, runs = "base", set(), {}
     # restart: each attempt after the first runs in a fresh copy of the repository; sandbox 0 stays clean
     restarts, start, looped, bid = 0, 0, False, (1 if config["restarts"] else 0)
+    loop = asyncio.get_running_loop()
     if bid:
-        box.fork(0, [bid])
+        await loop.run_in_executor(None, box.fork, 0, [bid])
     tool_seconds = 0.0
     patch = ""
-    loop = asyncio.get_running_loop()
     try:
         last_prompt = 0
         # the swarm's limits: the sampled-token budget, and a context past which a branch dies
@@ -297,9 +298,9 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
                     looped or (config["restart_turns"] and n >= config["restart_turns"])
                     or (config["edit_by"] and n >= config["edit_by"] and state in UNEDITED)):
                 restarts += 1
-                box.kill(bid)
+                await loop.run_in_executor(None, box.kill, bid)
                 bid += 1
-                box.fork(0, [bid])
+                await loop.run_in_executor(None, box.fork, 0, [bid])
                 messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task.issue}]
                 state, seen, runs, start, last_prompt, looped = "base", set(), {}, turns, 0, False
             # the inferlet's turn over an API: past `max_thought_tokens` with no command, or
