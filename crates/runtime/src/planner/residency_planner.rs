@@ -269,6 +269,9 @@ impl ResidencyPlanner {
         let kv = held_page_count(pid, model, engine) + demand.kv_pages;
         let rs = super::holdings::held_rs_units(pid, model, engine).add(demand.rs);
         if let Some(proc) = self.lock_inner().procs.get_mut(&pid) {
+            if proc.peak.0 == 0 && proc.peak.1.is_zero() {
+                proc.first = (kv, rs);
+            }
             proc.peak = (
                 proc.peak.0.max(kv),
                 RsUnits {
@@ -568,7 +571,7 @@ impl ResidencyPlanner {
                         && proc.peak.0 > 0
                 }) && inner.to_end.live.remove(&pid)
                 {
-                    inner.to_end.learn(proc.peak.0, proc.peak.1);
+                    inner.to_end.learn(proc.peak, proc.first);
                 }
                 inner.to_end.live.remove(&pid);
                 inner.to_end.waiting.retain(|(_, waiting)| *waiting != pid);
