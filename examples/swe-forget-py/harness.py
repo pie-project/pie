@@ -59,7 +59,11 @@ FORMAT_ERROR = (
 
 # the agent's changes, new files included, without bytecode
 DIFF = "git add -A -N . && git diff HEAD -- . ':(exclude)*.pyc' ':(exclude)*/__pycache__/*'"
+# a sandbox no command has changed yet: the start, or a diff that is empty
+UNEDITED = {"base", hashlib.sha1(b"").hexdigest()[:12]}
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+# a message to pie holds under 8 MB: past this, an output keeps its ends and its length, all the agent reads
+OUT_CAP = 500_000
 
 
 def clone(src: Path, dst: Path) -> None:
@@ -211,14 +215,18 @@ async def run_pie(task: Task, uri: str, config: dict, quiet: bool) -> dict:
                 if event is Event.Message:
                     msg = json.loads(value)
                     op = msg.get("op")
+                    # a repository copy takes seconds: off the loop, so other tasks' sockets stay alive
                     if op == "fork":
-                        box.fork(msg["from"], msg["to"])
+                        await loop.run_in_executor(pool, box.fork, msg["from"], msg["to"])
                     elif op == "kill":
-                        box.kill(msg["bid"])
+                        await loop.run_in_executor(pool, box.kill, msg["bid"])
                     elif op == "exec":
                         t = time.monotonic()
                         results = await asyncio.gather(*[
                             loop.run_in_executor(pool, box.exec, c["bid"], c["cmd"]) for c in msg["calls"]])
+                        for r in results:
+                            if len(r["out"]) > OUT_CAP:
+                                r["chars"], r["out"] = len(r["out"]), r["out"][:OUT_CAP // 2] + r["out"][-OUT_CAP // 2:]
                         tool_seconds += time.monotonic() - t
                         await process.signal(json.dumps({"results": results}))
                     elif op == "log" and not quiet:
@@ -278,13 +286,28 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task.issue}]
     prompt = completion = cached = turns = format_errors = forced_actions = rewinds = 0
     state, seen, runs = "base", set(), {}
+    # restart: each attempt after the first runs in a fresh copy of the repository; sandbox 0 stays clean
+    restarts, start, looped, bid = 0, 0, False, (1 if config["restarts"] else 0)
+    loop = asyncio.get_running_loop()
+    if bid:
+        await loop.run_in_executor(None, box.fork, 0, [bid])
     tool_seconds = 0.0
     patch = ""
-    loop = asyncio.get_running_loop()
     try:
         last_prompt = 0
         # the swarm's limits: the sampled-token budget, and a context past which a branch dies
         while completion < config["token_budget"] and last_prompt + config["max_turn_tokens"] < config["max_context"]:
+            # the inferlet's restart rule: a loop, a long attempt, or no file changed by `edit_by`
+            n = turns - start
+            if restarts < config["restarts"] and (
+                    looped or (config["restart_turns"] and n >= config["restart_turns"])
+                    or (config["edit_by"] and n >= config["edit_by"] and state in UNEDITED)):
+                restarts += 1
+                await loop.run_in_executor(None, box.kill, bid)
+                bid += 1
+                await loop.run_in_executor(None, box.fork, 0, [bid])
+                messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task.issue}]
+                state, seen, runs, start, last_prompt, looped = "base", set(), {}, turns, 0, False
             # the inferlet's turn over an API: past `max_thought_tokens` with no command, or
             # ending with none, the command block is opened for the reply; a command already
             # run in this state is thrown away and sampled again
@@ -327,8 +350,11 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
             seen.add((state, cmd))
             runs[(state, cmd)] = runs.get((state, cmd), 0) + 1
             if config.get("kill_loops") and runs[(state, cmd)] > 2:  # the third run of a command that changed nothing
-                break
-            res = await loop.run_in_executor(None, box.exec, 0, cmd)
+                if restarts >= config["restarts"]:
+                    break
+                looped = True
+                continue
+            res = await loop.run_in_executor(None, box.exec, bid, cmd)
             state = res["state"]
             tool_seconds += time.monotonic() - t
             if "patch" in res:
@@ -350,7 +376,7 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
             "decoded_tokens": completion,
             "prompt_tokens": prompt, "cached_prompt_tokens": cached,
             "prefilled_tokens": prompt - cached, "turns": turns, "format_errors": format_errors,
-            "forced_actions": forced_actions, "command_rewinds": rewinds,
+            "forced_actions": forced_actions, "command_rewinds": rewinds, "restarts": restarts,
             "tool_seconds": round(tool_seconds, 2), "wall_seconds": round(time.monotonic() - t0, 2),
         }
     finally:
@@ -358,7 +384,8 @@ async def run_openai(task: Task, base_url: str, model: str, config: dict) -> dic
 
 
 DEFAULTS = {"temperature": 0.7, "max_turn_tokens": 1536, "max_output_chars": 6000, "token_budget": 60000,
-            "max_context": 48000, "max_thought_tokens": 384, "max_rewinds": 2}
+            "max_context": 48000, "max_thought_tokens": 384, "max_rewinds": 2,
+            "restarts": 0, "restart_turns": 40, "edit_by": 15}
 
 
 async def main() -> None:
