@@ -78,9 +78,9 @@ prefill_lanes = 64
 # page: gemma-4-31b c128 663 -> 723, gemma-4-26b c1024 2,777 -> 3,728 tok/s, greedy tokens unchanged
 window_spare = true
 # a Gemma-4 process starts only while the pools hold the started ones to the pages a finished one held,
-# starts spread over a life where more wait than fit, and a decoding lane's pages come before a waiting
+# lanes started apart counted as finishing apart, and a decoding lane's pages come before a waiting
 # prompt's, as vLLM queues: lanes no longer park at page boundaries and replay (38 replays a run -> 3):
-# gemma-4-31b c128 729 -> 960, gemma-4-26b-a4b c1024 3,906 -> 6,273 tok/s
+# gemma-4-31b c128 729 -> 925, gemma-4-26b-a4b c1024 3,906 -> 6,205 tok/s
 seated_first = true
 seat_to_end = true
 
