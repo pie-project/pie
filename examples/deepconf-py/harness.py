@@ -282,6 +282,7 @@ def main() -> None:
     ap.add_argument("--mode", choices=list(MODES), default="low")
     ap.add_argument("--budget", type=int, default=64)
     ap.add_argument("--parallel", type=int, default=16, help="traces in flight per question after the warmup")
+    ap.add_argument("--n-init", type=int, default=16, help="warmup traces that set the threshold")
     ap.add_argument("--concurrent", type=int, default=30, help="questions at once")
     ap.add_argument("--problems", type=int, default=0, help="the first N questions; 0 is all 30")
     ap.add_argument("--shard", default="0/1", help="i/n: every n-th question from the i-th, one engine per GPU")
@@ -308,7 +309,7 @@ def main() -> None:
     eta = MODES[args.mode]
     cfg = {"budget": args.budget, "eta": eta, "max_tokens": args.max_tokens,
            "parallel": args.parallel if eta is not None else args.budget,
-           "n_init": 16, "tau": 0.95, "window": 2048, "k_conf": 20,
+           "n_init": args.n_init, "tau": 0.95, "window": 2048, "k_conf": 20,
            "temperature": 0.6, "top_p": 0.95, "top_k": 20, "seed": 1}
 
     t0 = time.monotonic()
