@@ -804,7 +804,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp4_wsgemm(
     __syncthreads();
 
     if (wg == 0) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 56;\n");
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;\n");
         const long long row_bytes = k >> 1;
         const int sf_row = k >> 5;
         const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
@@ -825,17 +825,29 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp4_wsgemm(
             const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(dst));
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(at), "l"(from), "r"(live));
         };
-        // Step `kb`'s codes widened into its stage's B: a thread's 16 runs of
-        // 8 codes, one 16-byte run of a row each, at row `tid / 8 + 16 j`
-        // and the run `tid % 8` (whose scale is the step's block `run / 4`).
-        auto widen = [&](int kb) {
+        // A thread's 16 runs of 8 codes a step, one 16-byte run of a row
+        // each, at row `tid / 8 + 16 j` and the run `tid % 8`, whose scale is
+        // the step's block `run / 4`: read a step ahead, four to a word.
+        auto scales_of = [&](int kb, unsigned (&pk)[4]) {
+            const int q = tid & 7;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) pk[j] = 0u;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int r = (tid >> 3) + 16 * j;
+                pk[j >> 2] |= static_cast<unsigned>(s_e[static_cast<long long>(bank_row(r)) * sf_row + kb * 2 + (q >> 2)])
+                              << (8 * (j & 3));
+            }
+        };
+        // Step `kb`'s codes widened into its stage's B.
+        auto widen = [&](int kb, const unsigned (&pk)[4]) {
             u8* st = ring + (kb % kStages) * kStage;
             const int q = tid & 7;
-#pragma unroll 4
+#pragma unroll
             for (int j = 0; j < 16; ++j) {
                 const int r = (tid >> 3) + 16 * j;
                 const unsigned w = *reinterpret_cast<const unsigned*>(st + kA + kB + r * 32 + q * 4);
-                const unsigned b = s_e[static_cast<long long>(bank_row(r)) * sf_row + ((kb * 64 + q * 8) >> 5)];
+                const unsigned b = (pk[j >> 2] >> (8 * (j & 3))) & 0xFFu;
                 const unsigned x = b <= 128u ? (b + 126u) << 7 : 253u << 7;
                 const unsigned xx = x | (x << 16);
                 const unsigned x2 = (b << 7) | (b << 23);
@@ -849,6 +861,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp4_wsgemm(
                 *reinterpret_cast<uint4*>(st + kA + r * 128 + ((q ^ (r & 7)) << 4)) = make_uint4(o[0], o[1], o[2], o[3]);
             }
         };
+        unsigned pk[4], pk_next[4];
         for (int kb = 0; kb < steps; ++kb) {
             const int s = kb % kStages;
             if (kb >= kStages) wgbf16gemm::bar_wait(empty + s, ((kb / kStages) - 1) & 1);
@@ -866,24 +879,27 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp4_wsgemm(
                 cp(st + kA + kB + r * 32 + h * 16, w_e + bank_row(r) * row_bytes + (k0 >> 1) + h * 16, 16);
             }
             asm volatile("cp.async.commit_group;\n" ::);
+            scales_of(kb, pk_next);
             if (kb >= 1) {
                 asm volatile("cp.async.wait_group 1;\n" ::);
                 // Every producer thread's codes of the step before have landed.
                 asm volatile("bar.sync 1, 128;\n" ::: "memory");
-                widen(kb - 1);
+                widen(kb - 1, pk);
                 asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                 wgbf16gemm::bar_arrive(full + (kb - 1) % kStages);
             }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) pk[j] = pk_next[j];
         }
         asm volatile("cp.async.wait_group 0;\n" ::);
         asm volatile("bar.sync 1, 128;\n" ::: "memory");
-        widen(steps - 1);
+        widen(steps - 1, pk);
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         wgbf16gemm::bar_arrive(full + (steps - 1) % kStages);
         return;
     }
 
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 224;\n");
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 208;\n");
     const int c_wg = wg - 1;
     const int lt = tid & 127, warp = lt >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
     float acc[128];
