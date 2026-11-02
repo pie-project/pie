@@ -721,7 +721,11 @@ impl Shell {
         if device.ctx().tuning().mxfp4_bf16_from > 0
             && kernels_cuda::jit::cache::arch() == Some("sm_90")
         {
-            weights.copy_mxfp4_banks_bf16(&boot.trace, device.stream())?;
+            weights.copy_mxfp4_banks_bf16(
+                &boot.trace,
+                device.stream(),
+                device.ctx().tuning().mxfp4_bf16_down,
+            )?;
         }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(

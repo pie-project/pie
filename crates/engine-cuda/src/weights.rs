@@ -1434,6 +1434,7 @@ impl Weights {
         &mut self,
         trace: &Trace,
         stream: *mut core::ffi::c_void,
+        down_too: bool,
     ) -> Result<u32> {
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
@@ -1446,7 +1447,6 @@ impl Weights {
         };
         // A select whose product a GLU reads is a gate-up leg; the rest are
         // down legs, copied only where the profile says (`kernel.moe.mxfp4_bf16_down`).
-        let down_too = ctx.tuning().mxfp4_bf16_down;
         let glu_in: std::collections::BTreeSet<_> = trace
             .nodes
             .iter()
