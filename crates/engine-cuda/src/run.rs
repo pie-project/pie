@@ -2004,6 +2004,7 @@ impl<'c> Run<'c> {
     }
 
     /// The bf16 copy an MXFP4 bank keeps (`kernel.moe.mxfp4_bf16_from`).
+    #[cfg(feature = "cuda")]
     pub(crate) fn mxfp4_bf16_bank(&self, id: ValueId) -> Option<Tensor> {
         let Def::Weight(w) = &self.values[id.0 as usize].def else {
             return None;

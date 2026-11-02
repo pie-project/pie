@@ -1210,6 +1210,7 @@ impl Run<'_> {
             } => {
                 let (codes, scales, affine, seat) = self.planes(*bank);
                 // A wide fire on the bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
+                #[cfg(feature = "cuda")]
                 if let Some(copy) = self.mxfp4_bf16_bank(*bank)
                     && linear::moe::select_bf16_copy(
                         self.ctx(),
@@ -1964,6 +1965,7 @@ impl Run<'_> {
         let (codes, scales, biases, seat) = self.planes(bank);
         let routes = self.tensor(routes);
         // A wide fire on an MXFP4 bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
+        #[cfg(feature = "cuda")]
         if biases.is_none()
             && let Some(copy) = self.mxfp4_bf16_bank(bank)
             && linear::moe::select_bf16_copy(
