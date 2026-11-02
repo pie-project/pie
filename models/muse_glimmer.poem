@@ -52,6 +52,8 @@ DIMS = {
 def layout(id, deploy):
     w = roles(deploy, "w", exact = True).w
     d = DIMS[id]
+    if deploy.layers:
+        d = dims(layers = deploy.layers)
     proj = w
     hidden = d.hidden
     hd = d.head_dim

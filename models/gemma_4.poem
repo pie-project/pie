@@ -210,6 +210,10 @@ def layout(id, deploy):
     dtype, the experts' at the second if it has one, DiffusionGemma's
     self-conditioning block's at the third."""
     d = TRUNKS[id]
+    if id.startswith("gemma4-31b") and deploy.layers:
+        d = g31b(deploy.layers)
+    if id.startswith("gemma4-26b-a4b") and deploy.experts:
+        d = a4b(deploy.experts)
     weights = deploy.weights
     drafter = deploy.drafter
     vision = "vision" in deploy.parts
