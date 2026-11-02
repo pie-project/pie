@@ -651,7 +651,7 @@ class Swarm:
             for b in live:
                 if b.length - b.forgotten + len(model.encode(b.next_obs)) + 64 > cfg["max_context"]:
                     self.kill(b, "context")
-            live = self.live()
+            live = [b for b in self.live() if b.next_obs is not None]  # a restarted attempt has not replied yet
             await asyncio.gather(*[self.observe(b, b.next_obs) for b in live])
 
             # prune: rank by the model's own judgment, keep the best `width`
