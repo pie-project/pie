@@ -821,16 +821,30 @@ pub(super) fn matmul_select_mxfp4(
             &args,
         );
     }
-    ctx.fire(
-        op,
-        Fire::at(kernel(
+    // The tcgen05 Blackwells widen the codes with their e2m1 converts: the
+    // same bits at fewer ALU slots a code.
+    #[cfg(feature = "cuda")]
+    let cvt = (!lean && ctx.tuning().mxfp4_cvt && crate::linear::gemm_sm100::supported())
+        .then_some(SELECT_FP4_SM100);
+    #[cfg(not(feature = "cuda"))]
+    let cvt: Option<&'static str> = None;
+    let (file, entry) = if let Some(file) = cvt {
+        (
+            file,
+            format!("::pie::linear::moe_matmul_select_mxfp4_cvt<{t}, {ROWS_PER_WARP}>"),
+        )
+    } else {
+        (
             SELECT,
-            &format!(
+            format!(
                 "::pie::linear::moe_matmul_select_mxfp4<{t}, ::pie::i32({ROWS_PER_WARP}){}>",
                 if lean { ", true" } else { "" }
             ),
-        ))
-        .apply(Launch::grid(
+        )
+    };
+    ctx.fire(
+        op,
+        Fire::at(kernel(file, &entry)).apply(Launch::grid(
             [fan.route_count, y.width.div_ceil(tile), 1],
             [block, 1, 1],
         )),
