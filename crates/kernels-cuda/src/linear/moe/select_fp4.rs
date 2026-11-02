@@ -224,6 +224,64 @@ pub(super) fn select_mxfp4_mma(
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
     let inter = stated(op, y.width)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
+    // Hopper's warp-specialized wgmma GEMM from `kernel.moe.mxfp4_ws_from`
+    // routes an expert (0: never): a producer warpgroup widens a K step's
+    // codes into shared memory once a slice of 128 routes, two consumer
+    // warpgroups' MMAs read both operands there.
+    let ws_from = ctx.tuning().mxfp4_ws_from;
+    if ws_from > 0
+        && !cvt
+        && hopper_wgmma()
+        && tensor_scales.is_none()
+        && x.width.is_multiple_of(64)
+        && per >= ws_from
+        && (0..=5).contains(&code)
+    {
+        const STAGES: u32 = 3;
+        let order = route_order_sliced(
+            ctx,
+            op,
+            routes,
+            fan,
+            experts,
+            128,
+            true,
+            if glu.is_some() || KEEP_NEXT.with(core::cell::Cell::get) {
+                Share::Keep
+            } else {
+                Share::Take
+            },
+        )?;
+        let cols = if glu.is_some() { 128 } else { 256 };
+        return ctx.fire(
+            op,
+            Fire::at(kernel(
+                SELECT_SM90,
+                &format!("::pie::linear::moe_select_fp4_wsgemm<{STAGES}, {code}>"),
+            ))
+            .apply(
+                Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [384, 1, 1])
+                    .smem(STAGES * 57344 + 1024 + 128),
+            ),
+            &[
+                x.arg(),
+                ArgValue::Ptr(order.order),
+                ArgValue::Ptr(order.offsets),
+                ArgValue::Ptr(order.work),
+                codes.arg(),
+                scales.arg(),
+                bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
+                y.arg(),
+                act_div.arg(),
+                n.arg(),
+                k.arg(),
+                stated(op, experts)?.arg(),
+                inter.arg(),
+                limit.arg(),
+                alpha.arg(),
+            ],
+        );
+    }
     // A wide fire of a K of whole 128s takes the staged slice's eight-warp
     // ring of codes and routes (`moe_select_mxfp4_mma_pipe`), mxfp4 alone.
     let pipe = staged

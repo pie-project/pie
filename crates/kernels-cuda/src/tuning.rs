@@ -593,6 +593,13 @@ pub struct MoeGroupAt(pub u32);
 #[decision(id = "kernel.moe.mxfp4_grouped_reuse", constant(range(0..=64)), default = 2, tune = search)]
 pub struct MoeMxfp4GroupedReuse(pub u32);
 
+/// The fewest routes an expert averages that take Hopper's warp-specialized
+/// mxfp4 select (`moe_select_fp4_wsgemm`), its codes widened once a slice
+/// of 128 routes: 0, never, but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_ws_from", constant(range(0..=65536)), default = 0, tune = search)]
+pub struct MoeMxfp4WsFrom(pub u32);
+
 /// Whether routed matmuls over affine (mlx u4) banks take the grouped
 /// kernel once enough routes come, and whether bf16 rows there take tensor
 /// cores (WMMA).
@@ -825,6 +832,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmSkinnyRows>()
         .add::<MoeGroupAt>()
         .add::<MoeMxfp4GroupedReuse>()
+        .add::<MoeMxfp4WsFrom>()
         .add::<MoeAffineGrouped>()
         .add::<MoeAffineWmma>()
         .add::<MoeAffineGroupedFrom>()
@@ -967,6 +975,7 @@ tuning! {
     gemm_skinny_rows: u32 = 64, get GemmSkinnyRows;
     moe_group_at: u32 = 4, get MoeGroupAt;
     mxfp4_grouped_reuse: u32 = 2, get MoeMxfp4GroupedReuse;
+    mxfp4_ws_from: u32 = 0, get MoeMxfp4WsFrom;
     affine_grouped: bool = true, on MoeAffineGrouped;
     affine_wmma: bool = true, on MoeAffineWmma;
     affine_grouped_from: u32 = 16, get MoeAffineGroupedFrom;
