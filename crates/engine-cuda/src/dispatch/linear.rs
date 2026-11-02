@@ -2360,6 +2360,22 @@ impl Run<'_> {
         match codes.dtype {
             Dtype::Nvfp4 | Dtype::Mxfp4 | Dtype::U8 => {
                 let x = self.tensor(x);
+                // A wide fire on the bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`), W4A16 as below.
+                if let Some(copy) = self.mxfp4_bf16_bank(bank)
+                    && linear::moe::select_bf16_copy(
+                        self.ctx(),
+                        op,
+                        x,
+                        copy.ptr,
+                        codes.rows,
+                        None,
+                        self.tensor(routes),
+                        &mut self.tensor(y),
+                        None,
+                    )?
+                {
+                    return Ok(());
+                }
                 // A wide fire on the bank's fp8b128 copy, W8A8 (`kernel.moe.mxfp4_fp8_from`).
                 if let Some((fp8, atoms)) = self.mxfp4_fp8_bank(bank) {
                     let route_t = self.tensor(routes);

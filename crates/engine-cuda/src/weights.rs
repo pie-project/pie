@@ -1439,10 +1439,10 @@ impl Weights {
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
         use poem_ir::{Def, Fused, Linear, Operation};
+        // A bf16-activation select's bank, or one whose release quantizes its rows: Hopper has no
+        // tcgen05 GEMM, and reads those against bf16 rows too (`select_a16`).
         let a16 = |op: &Linear| match op {
-            Linear::MoeSelect {
-                bank, quant: None, ..
-            } => Some(*bank),
+            Linear::MoeSelect { bank, .. } => Some(*bank),
             _ => None,
         };
         // A select whose product a GLU reads is a gate-up leg; the rest are
