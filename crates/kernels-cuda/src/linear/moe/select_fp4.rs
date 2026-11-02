@@ -225,7 +225,7 @@ pub(super) fn select_mxfp4_mma(
     let inter = stated(op, y.width)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     // Hopper's warp-specialized wgmma GEMM from `kernel.moe.mxfp4_ws_from`
-    // routes an expert (0: never): a producer warpgroup widens a K step's
+    // routes an expert (0: never): two producer warpgroups widen a K step's
     // codes into shared memory once a slice of 128 routes, two consumer
     // warpgroups' MMAs read both operands there.
     let ws_from = ctx.tuning().mxfp4_ws_from;
@@ -260,7 +260,7 @@ pub(super) fn select_mxfp4_mma(
                 &format!("::pie::linear::moe_select_fp4_wsgemm<{STAGES}, {code}>"),
             ))
             .apply(
-                Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [384, 1, 1])
+                Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [512, 1, 1])
                     .smem(STAGES * 57344 + 1024 + 128),
             ),
             &[

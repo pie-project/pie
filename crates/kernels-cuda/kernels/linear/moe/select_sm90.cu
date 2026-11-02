@@ -758,15 +758,15 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
 
 /// `moe_select_bf16_wsgemm` over an MXFP4 bank (`codes` two e2m1 a byte,
 /// `scales` one e8m0 a 32 codes, `bias` a bf16 a bank row or none): the
-/// producer warpgroup stages a K step's routes and its 256 rows' codes by
-/// cp.async, then widens the codes to bf16 into the stage's B (128-byte
+/// two producer warpgroups stage a K step's routes and its 256 rows' codes
+/// by cp.async, then widen the codes to bf16 into the stage's B (128-byte
 /// swizzled, K-major) before handing it over, so the two consumer
 /// warpgroups' m64n256k16 MMAs read both operands from shared memory and
 /// a code is widened once a 128 routes. `k` whole 64s. Grid `[work_cap,
-/// ceil(cols / (kGlu ? 128 : 256))]`, 384 threads, `kStages * 57344 + 1024 +
+/// ceil(cols / (kGlu ? 128 : 256))]`, 512 threads, `kStages * 57344 + 1024 +
 /// 128` bytes of shared memory.
 template <int kStages, int kGlu>
-__global__ void __launch_bounds__(384, 1) moe_select_fp4_wsgemm(
+__global__ void __launch_bounds__(512, 1) moe_select_fp4_wsgemm(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const u8* __restrict__ codes, const u8* __restrict__ scales,
     const bf16* __restrict__ bias, bf16* __restrict__ out, int act_div, int n, int k,
@@ -776,6 +776,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp4_wsgemm(
     constexpr int kB = 256 * 128;      // 256 weight rows x 64 bf16
     constexpr int kC = 256 * 32;       // their 64 codes, a byte two
     constexpr int kStage = kA + kB + kC;
+    constexpr int kProd = 256;         // the producer threads
 
     if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
     const int item = work[blockIdx.x];
@@ -796,15 +797,15 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp4_wsgemm(
     const int col0 = static_cast<int>(blockIdx.y) * (kGlu != 0 ? 128 : 256);
     if (tid == 0) {
         for (int s = 0; s < kStages; ++s) {
-            wgbf16gemm::bar_init(full + s, 128);
+            wgbf16gemm::bar_init(full + s, kProd);
             wgbf16gemm::bar_init(empty + s, 8);
         }
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
     }
     __syncthreads();
 
-    if (wg == 0) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;\n");
+    if (wg < 2) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 56;\n");
         const long long row_bytes = k >> 1;
         const int sf_row = k >> 5;
         const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
@@ -815,37 +816,38 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp4_wsgemm(
             const int row = kGlu != 0 ? (r < 128 ? col0 + r : inter + col0 + (r - 128)) : col0 + r;
             return kGlu != 0 ? (r < 128 ? min(row, inter - 1) : min(row, 2 * inter - 1)) : min(row, n - 1);
         };
-        int src[8];
+        int src[1024 / kProd];
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int r = (tid + 128 * j) >> 3;
+        for (int j = 0; j < 1024 / kProd; ++j) {
+            const int r = (tid + kProd * j) >> 3;
             src[j] = r < count ? order[begin + r] / act_div : -1;
         }
         auto cp = [](void* dst, const void* from, int live) {
             const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(dst));
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(at), "l"(from), "r"(live));
         };
-        // A thread's 16 runs of 8 codes a step, one 16-byte run of a row
-        // each, at row `tid / 8 + 16 j` and the run `tid % 8`, whose scale is
+        // A thread's 8 runs of 8 codes a step, one 16-byte run of a row
+        // each, at row `tid / 8 + 32 j` and the run `tid % 8`, whose scale is
         // the step's block `run / 4`: read a step ahead, four to a word.
-        auto scales_of = [&](int kb, unsigned (&pk)[4]) {
+        constexpr int kRuns = 2048 / kProd;
+        auto scales_of = [&](int kb, unsigned (&pk)[kRuns / 4]) {
             const int q = tid & 7;
 #pragma unroll
-            for (int j = 0; j < 4; ++j) pk[j] = 0u;
+            for (int j = 0; j < kRuns / 4; ++j) pk[j] = 0u;
 #pragma unroll
-            for (int j = 0; j < 16; ++j) {
-                const int r = (tid >> 3) + 16 * j;
+            for (int j = 0; j < kRuns; ++j) {
+                const int r = (tid >> 3) + (kProd / 8) * j;
                 pk[j >> 2] |= static_cast<unsigned>(s_e[static_cast<long long>(bank_row(r)) * sf_row + kb * 2 + (q >> 2)])
                               << (8 * (j & 3));
             }
         };
         // Step `kb`'s codes widened into its stage's B.
-        auto widen = [&](int kb, const unsigned (&pk)[4]) {
+        auto widen = [&](int kb, const unsigned (&pk)[kRuns / 4]) {
             u8* st = ring + (kb % kStages) * kStage;
             const int q = tid & 7;
 #pragma unroll
-            for (int j = 0; j < 16; ++j) {
-                const int r = (tid >> 3) + 16 * j;
+            for (int j = 0; j < kRuns; ++j) {
+                const int r = (tid >> 3) + (kProd / 8) * j;
                 const unsigned w = *reinterpret_cast<const unsigned*>(st + kA + kB + r * 32 + q * 4);
                 const unsigned b = (pk[j >> 2] >> (8 * (j & 3))) & 0xFFu;
                 const unsigned x = b <= 128u ? (b + 126u) << 7 : 253u << 7;
@@ -861,21 +863,21 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp4_wsgemm(
                 *reinterpret_cast<uint4*>(st + kA + r * 128 + ((q ^ (r & 7)) << 4)) = make_uint4(o[0], o[1], o[2], o[3]);
             }
         };
-        unsigned pk[4], pk_next[4];
+        unsigned pk[kRuns / 4], pk_next[kRuns / 4];
         for (int kb = 0; kb < steps; ++kb) {
             const int s = kb % kStages;
             if (kb >= kStages) wgbf16gemm::bar_wait(empty + s, ((kb / kStages) - 1) & 1);
             u8* st = ring + s * kStage;
             const int k0 = kb * 64;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int u = tid + 128 * j, r = u >> 3, q = u & 7;
+            for (int j = 0; j < 1024 / kProd; ++j) {
+                const int u = tid + kProd * j, r = u >> 3, q = u & 7;
                 const bf16* from = src[j] >= 0 ? act + static_cast<long long>(src[j]) * k + k0 + q * 8 : act;
                 cp(st + r * 128 + ((q ^ (r & 7)) << 4), from, src[j] >= 0 ? 16 : 0);
             }
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int u = tid + 128 * j, r = u >> 1, h = u & 1;
+            for (int j = 0; j < 512 / kProd; ++j) {
+                const int u = tid + kProd * j, r = u >> 1, h = u & 1;
                 cp(st + kA + kB + r * 32 + h * 16, w_e + bank_row(r) * row_bytes + (k0 >> 1) + h * 16, 16);
             }
             asm volatile("cp.async.commit_group;\n" ::);
@@ -883,24 +885,24 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp4_wsgemm(
             if (kb >= 1) {
                 asm volatile("cp.async.wait_group 1;\n" ::);
                 // Every producer thread's codes of the step before have landed.
-                asm volatile("bar.sync 1, 128;\n" ::: "memory");
+                asm volatile("bar.sync 1, 256;\n" ::: "memory");
                 widen(kb - 1, pk);
                 asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                 wgbf16gemm::bar_arrive(full + (kb - 1) % kStages);
             }
 #pragma unroll
-            for (int j = 0; j < 4; ++j) pk[j] = pk_next[j];
+            for (int j = 0; j < kRuns / 4; ++j) pk[j] = pk_next[j];
         }
         asm volatile("cp.async.wait_group 0;\n" ::);
-        asm volatile("bar.sync 1, 128;\n" ::: "memory");
+        asm volatile("bar.sync 1, 256;\n" ::: "memory");
         widen(steps - 1, pk);
         asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
         wgbf16gemm::bar_arrive(full + (steps - 1) % kStages);
         return;
     }
 
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 208;\n");
-    const int c_wg = wg - 1;
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 200;\n");
+    const int c_wg = wg - 2;
     const int lt = tid & 127, warp = lt >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
     float acc[128];
 #pragma unroll
