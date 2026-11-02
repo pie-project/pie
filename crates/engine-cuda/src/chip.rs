@@ -217,6 +217,7 @@ shelved!(
         "sm87.toml",
         "sm89.toml",
         "sm89/nvidia-geforce-rtx-4090.toml",
+        "sm89/nvidia-l4.toml",
         "sm89/nvidia-l40s.toml",
         "sm90.toml",
         "sm90/nvidia-h100-80gb-hbm3.toml",
@@ -478,7 +479,7 @@ mod tests {
             (8, 0, "NVIDIA A30"),
             (8, 6, "NVIDIA A10"),
             (8, 7, "Orin"),
-            (8, 9, "NVIDIA L4"),
+            (8, 9, "NVIDIA L20"),
             (9, 0, "NVIDIA H800"),
             (10, 0, "NVIDIA GB200"),
             (10, 3, "NVIDIA B300"),
@@ -1072,7 +1073,7 @@ mod tests {
                 Engine {
                     prefill_lattice_from: 256,
                     prefill_lattice_steps: 8,
-                    forward_tokens: if std::ptr::eq(p, &l40s) { 2048 } else { 0 },
+                    forward_tokens: if std::ptr::eq(p, &l40s) { 2304 } else { 0 },
                     seated_first: std::ptr::eq(p, &l40s),
                     recording: if std::ptr::eq(p, &l40s) {
                         Recording::Bodies {
