@@ -14,9 +14,11 @@ second path is most likely to end differently.
 
 With `mode: flat` the program writes `group` answers from the prompt instead,
 the way plain GRPO sampling does.
+
+A prompt's answers are the lanes of one pass on one pipeline, and every fork
+goes on that pipeline too, so a working set never moves between pipelines.
 """
 
-import asyncio
 import json
 import time
 
@@ -29,6 +31,7 @@ from inferlet.eta import (
     WorkingSet,
     channel_capacity,
     dtype,
+    frame_size,
     gumbel_max,
     intrinsics,
     iota,
@@ -62,9 +65,10 @@ class Rollouts:
         self.stops = set(cfg["stop_tokens"])
         self.chains: list[Chain] = []
         self.decoded = 0
+        self.passes = 0
 
     async def prefill(self) -> None:
-        self.root, self.root_pipe = WorkingSet(), Pipeline()
+        self.root, self.pipe = WorkingSet(), Pipeline()
         fwd = ForwardPass()
         fwd.embed(self.prompt[:-1])
         fwd.state([self.root], StateGeometry.folding())
@@ -74,60 +78,77 @@ class Rollouts:
         def _():
             ready.put(reshape(reduce_argmax(intrinsics.output(0, "logits")), [1]))
 
-        self.root_pipe.submit(fwd)
+        self.pipe.submit(fwd)
         await ready.take_scalar()
 
-    def fork(self, ws: WorkingSet, pipe: Pipeline, n: int) -> tuple[list, Pipeline]:
-        """n forks of `ws`; the parent moves to a new pipeline so each fork can take its own."""
-        kids = [ws.fork(pipe) for _ in range(n)]
-        pipe.close()
-        return kids, Pipeline()
+    def fork(self, ws: WorkingSet, n: int) -> list:
+        """n forks of `ws`, after everything already on the prompt's pipeline."""
+        return [ws.fork(self.pipe) for _ in range(n)]
 
-    async def segment(self, c: Chain, pipe: Pipeline, budget: int) -> Pipeline:
-        """Write up to `budget` tokens into `c`; the run stops at a stop token or the budget."""
+    async def write(self, chains: list[Chain], budget: int) -> None:
+        """Write up to `budget` tokens into each chain, the chains as lanes of one pass.
+
+        The pass runs ahead on the prompt's pipeline, which stays open. A chain
+        that ends stops new fires; the fires in flight still write every lane,
+        so their tokens are kept, and the rest go on in a pass without it.
+        """
         cfg = self.cfg
-        k, temperature = cfg["k_conf"], cfg["temperature"]
-        tok_in = Channel.from_([c.last], dtype.i32)
-        tok_out = Channel([1], dtype.i32).capacity(channel_capacity())
-        conf_out = Channel([1], dtype.f32).capacity(channel_capacity())
-        rng = Channel.from_([cfg["seed"] + 7919 * c.id, len(c.tokens)], dtype.u32)
-        step = ForwardPass()
-        step.embed(tok_in, Channel.from_([0, 1], dtype.u32))
-        step.state([c.ws], StateGeometry.folding())
+        k, temperature, v = cfg["k_conf"], cfg["temperature"], model.output_vocab_size()
+        r = frame_size()
+        window = max(model.run_ahead_window() // r, 1) * r
+        for c in chains:
+            c.conf_sum, c.conf_n = 0.0, 0
+        live, left = [c for c in chains if not c.done], budget
+        while live and left > 0:
+            n = len(live)
+            tok_in = Channel.from_([c.last for c in live], dtype.i32)
+            tok_out = Channel([n], dtype.i32).capacity(channel_capacity())
+            conf_out = Channel([n], dtype.f32).capacity(channel_capacity())
+            rng = Channel.from_([cfg["seed"] + 7919 * self.passes, 0], dtype.u32)
+            self.passes += 1
+            step = ForwardPass()
+            step.embed(tok_in, Channel.from_(list(range(n + 1)), dtype.u32))
+            step.state([c.ws for c in live], StateGeometry.folding())
 
-        @step.epilogue
-        def _():
-            logits = intrinsics.output(0, "logits")
-            best, _ = top_k(log_softmax(logits), k)
-            conf_out.put(reshape(reduce_sum(best) * (-1.0 / k), [1]))
-            r = rng.take()
-            token = reshape(gumbel_max(logits * (1.0 / temperature), r), [1])
-            tok_in.put(token)
-            tok_out.put(token)
-            rng.put(r + iota(2))
+            @step.epilogue
+            def _():
+                logits = reshape(intrinsics.output(0, "logits"), [n, v])
+                best, _ = top_k(log_softmax(logits), k)
+                conf_out.put(reduce_sum(best) * (-1.0 / k))
+                state = rng.take()
+                token = gumbel_max(logits * (1.0 / temperature), state)
+                tok_in.put(token)
+                tok_out.put(token)
+                rng.put(state + iota(2))
 
-        c.conf_sum, c.conf_n = 0.0, 0
-
-        async def on_token() -> bool:
-            token = await tok_out.take_scalar()
-            conf = await conf_out.take_scalar()
-            self.decoded += 1
-            c.written += 1
-            if token in self.stops:
-                c.done = True
-                return False
-            c.tokens.append(token)
-            c.last = token
-            c.conf_sum += conf
-            c.conf_n += 1
-            if len(c.tokens) >= cfg["max_tokens"]:
-                c.done = True
-                return False
-            return True
-
-        await pipe.run_ahead(step, budget, on_token)
-        # the run closed this pipeline; the chain goes on, if it does, on a new one
-        return Pipeline()
+            submitted = taken = 0
+            stop = False
+            while True:
+                while not stop and submitted < left and submitted - taken < window:
+                    m = min(r, left - submitted)
+                    self.pipe.submit_frame([step] * m)
+                    submitted += m
+                if taken == submitted:
+                    break
+                tokens = await tok_out.take_host()
+                confs = await conf_out.take_host()
+                taken += 1
+                for c, token, conf in zip(live, tokens, confs):
+                    if c.done:
+                        continue
+                    self.decoded += 1
+                    c.written += 1
+                    if token in self.stops:
+                        c.done = stop = True
+                        continue
+                    c.tokens.append(token)
+                    c.last = token
+                    c.conf_sum += conf
+                    c.conf_n += 1
+                    if len(c.tokens) >= cfg["max_tokens"]:
+                        c.done = stop = True
+            left -= taken
+            live = [c for c in live if not c.done]
 
     async def run(self) -> dict:
         cfg = self.cfg
@@ -135,39 +156,29 @@ class Rollouts:
         await self.prefill()
         group, last = cfg["group"], self.prompt[-1]
         if cfg["mode"] == "flat":
-            kids, self.root_pipe = self.fork(self.root, self.root_pipe, group)
-            self.chains = [Chain(ws, [], last) for ws in kids]
-            await asyncio.gather(*[self.segment(c, Pipeline(), cfg["max_tokens"]) for c in self.chains])
+            self.chains = [Chain(ws, [], last) for ws in self.fork(self.root, group)]
+            await self.write(self.chains, cfg["max_tokens"])
         else:
-            kids, self.root_pipe = self.fork(self.root, self.root_pipe, cfg["roots"])
-            self.chains = [Chain(ws, [], last) for ws in kids]
-            pipes = {c.id: Pipeline() for c in self.chains}
+            self.chains = [Chain(ws, [], last) for ws in self.fork(self.root, cfg["roots"])]
             while True:
                 live = [c for c in self.chains if not c.done]
                 if not live:
                     break
-                fresh = await asyncio.gather(*[self.segment(c, pipes[c.id], cfg["segment"]) for c in live])
-                for c, p in zip(live, fresh):
-                    pipes[c.id] = p
+                await self.write(live, cfg["segment"])
                 # grow the group where it was least sure, `per_round` forks a round, so the
                 # branch points spread over the answer's length
                 room = min(group - len(self.chains), cfg["per_round"])
                 unsure = sorted((c for c in live if not c.done and c.conf_n),
                                 key=lambda c: c.conf_sum / c.conf_n)[:room]
                 for c in unsure:
-                    (kid_ws,), pipes[c.id] = self.fork(c.ws, pipes[c.id], 1)
-                    kid = Chain(kid_ws, c.tokens, c.last, parent=c)
-                    pipes[kid.id] = Pipeline()
-                    self.chains.append(kid)
-            for p in pipes.values():
-                p.close()
+                    (kid_ws,) = self.fork(c.ws, 1)
+                    self.chains.append(Chain(kid_ws, c.tokens, c.last, parent=c))
             # answers that ended before the tree was full: the rest of the group starts from the prompt
             if len(self.chains) < group:
-                kids, self.root_pipe = self.fork(self.root, self.root_pipe, group - len(self.chains))
-                extra = [Chain(ws, [], last) for ws in kids]
+                extra = [Chain(ws, [], last) for ws in self.fork(self.root, group - len(self.chains))]
                 self.chains += extra
-                await asyncio.gather(*[self.segment(c, Pipeline(), cfg["max_tokens"]) for c in extra])
-        self.root_pipe.close()
+                await self.write(extra, cfg["max_tokens"])
+        self.pipe.close()
         return {
             "mode": cfg["mode"],
             "answers": [model.decode(c.tokens) for c in self.chains],
