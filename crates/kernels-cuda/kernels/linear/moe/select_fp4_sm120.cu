@@ -816,3 +816,227 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
 }
 
 }  // namespace pie::linear
+
+namespace pie::linear {
+
+/// `x`'s rows `[rows, k]` as NVFP4 for a W4A4 select: e2m1 codes row-major
+/// (`[rows, k / 2]`, the low nibble first), each 16's e4m3 scale a byte
+/// (`[rows, k / 16]`), under the experts' one global (`input_scales[0]`: load
+/// lays the experts' largest), as `act_quant_nvfp4` quantizes them. A thread
+/// a 16.
+__global__ void __launch_bounds__(128) quantize_rows_nvfp4(
+    const bf16* __restrict__ x, const float* __restrict__ input_scales, u8* __restrict__ codes,
+    u8* __restrict__ sf, int rows, int k)
+{
+    const int blocks = k / 16;
+    const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at >= static_cast<long long>(rows) * blocks) return;
+    const int r = static_cast<int>(at / blocks);
+    const int b = static_cast<int>(at % blocks);
+    float v[16];
+    const float amax = load_block16(x + static_cast<long long>(r) * k + b * 16, v);
+    uint2 w;
+    const u8 s = nvfp4_block16(v, amax, __fdiv_rn(1.f, input_scales[0]), w);
+    *reinterpret_cast<uint2*>(codes + static_cast<long long>(r) * (k / 2) + b * 8) = w;
+    sf[static_cast<long long>(r) * blocks + b] = s;
+}
+
+namespace w4a4 {
+
+// d += (A . B) under both sides' ue4m3 scales a 16, A 16x64 e2m1 and B 64x8
+// e2m1 packed two a byte, the four scales of a row of A (and of a column of
+// B) in one word.
+__device__ __forceinline__ void mma(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1,
+                                    unsigned sa, unsigned sb) {
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
+        "f32.ue4m3 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, "
+        "{%13}, {%14, %15};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sa),
+          "h"(static_cast<unsigned short>(0)), "h"(static_cast<unsigned short>(0)), "r"(sb),
+          "h"(static_cast<unsigned short>(0)), "h"(static_cast<unsigned short>(0)));
+}
+
+__device__ __forceinline__ void cp8(void* dst, const void* from, int bytes) {
+    const unsigned saddr = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(saddr), "l"(from), "r"(bytes));
+}
+
+}  // namespace w4a4
+
+/// A routed NVFP4 select W4A4 on sm_120a's block-scaled mma.sync
+/// (`kind::mxf4nvf4`), as the release quantizes its rows and as the FlashInfer
+/// SM120 CUTLASS MoE runs NVFP4 experts: the rows quantized by
+/// `quantize_rows_nvfp4` (`xq` codes, `xs` an e4m3 a 16), the bank's e2m1
+/// codes against them under both sides' scales, a row's tensor scale and
+/// the expert's input scale in the landing. `moe_select_mxfp4_w4a8`'s shape:
+/// eight warps a CTA (256 rows) a 64 routes, `kGroups` of them a CTA, `k`
+/// whole 128s staged through one `kStages` cp.async ring.
+template <int kStages, int kGroups>
+__global__ void __launch_bounds__(256 * kGroups, 1) moe_select_nvfp4_w4a4(
+    const u8* __restrict__ xq,
+    const u8* __restrict__ xs,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const i32* __restrict__ work,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const float* __restrict__ tensor_scales,
+    const float* __restrict__ input_scales,
+    bf16* __restrict__ out,
+    int act_div,
+    int n,
+    int k,
+    int num_experts)
+{
+    constexpr int kNb = 8;
+    constexpr int kTiles = 2;
+    constexpr int kWarps = 8;
+    constexpr int kRowsWarp = kTiles * 16;
+    constexpr int kRowsCta = kWarps * kRowsWarp;
+    constexpr int kSlice = 8 * kNb * kGroups;
+    // A stage: the slice's 128 codes a route (64 bytes, each 16-byte run at
+    // its index xor the route's), a route's eight scales, then the CTA's 256
+    // rows' 64 code bytes (each run at its index xor half the row's). The
+    // rows' scales go to registers a chunk ahead.
+    constexpr int kXStride = 64;
+    constexpr int kWStride = 64;
+    constexpr int kX = kSlice * kXStride;
+    constexpr int kXs = kSlice * 8;
+    constexpr int kW = kWarps * 32 * kWStride;
+    constexpr int kStage = kX + kXs + kW;
+
+    const int at = static_cast<int>(act_div == 1 ? blockIdx.y : blockIdx.x);
+    if (at >= offsets[num_experts + 1]) return;
+    const int item = work[at];
+    const int expert = item >> 16;
+    const int slice = item & 0xFFFF;
+    const int begin = offsets[expert] + slice * kSlice;
+    const int count = min(offsets[expert + 1] - begin, kSlice);
+    if (count <= 0) return;
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = (tid >> 5) % kWarps;
+    const int group = tid / 256;
+    const int lane = tid & 31;
+    const int g = lane >> 2;
+    const int c = lane & 3;
+    const int cta_row = static_cast<int>(act_div == 1 ? blockIdx.x : blockIdx.y) * kRowsCta;
+    const int row_base = cta_row + warp * kRowsWarp;
+    const bool rows_live = row_base < n;
+
+    const int chunks = k >> 7;
+    const long long row_bytes = k >> 1;
+    const int sf_row = k >> 4;
+    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
+    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+
+    const int own = tid % 256;
+    const int own_half = tid / 256;
+    const int own_base = cta_row + (own >> 5) * kRowsWarp;
+    const int own_t = (own >> 4) & 1;
+    const int own_row = min(max(own_base + 16 * own_t, 0) + (own & 15), n - 1);
+    const int xr = tid >> 2;
+    const int xq4 = tid & 3;
+    const int xsrc = xr < count ? order[begin + xr] / act_div : -1;
+    // Each tile's row whose scales this lane hands the MMA (g at even c,
+    // g + 8 at odd), its eight a chunk.
+    const u8* srow[kTiles];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t) {
+        const int tile = row_base + 16 * t;
+        srow[t] = s_e + static_cast<long long>(min(max(tile, 0) + 8 * (c & 1) + g, n - 1)) * sf_row;
+    }
+    auto load_s = [&](int ch, uint2 (&s)[kTiles]) {
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t) s[t] = __ldg(reinterpret_cast<const uint2*>(srow[t] + ch * 8));
+    };
+
+    extern __shared__ __align__(16) unsigned char w4a4_smem[];
+    auto stage = [&](int ch) {
+        if (ch < chunks) {
+            unsigned char* st = w4a4_smem + (ch % kStages) * kStage;
+            const bool live = xsrc >= 0;
+            const u8* xf = xq + static_cast<long long>(live ? xsrc : 0) * row_bytes + ch * 64 + xq4 * 16;
+            w4a8::cp16(st + xr * kXStride + ((xq4 ^ (xr & 3)) * 16), xf, live ? 16 : 0);
+            if (xq4 == 0) {
+                w4a4::cp8(st + kX + xr * 8, xs + static_cast<long long>(live ? xsrc : 0) * sf_row + ch * 8,
+                          live ? 8 : 0);
+            }
+            unsigned char* ws = st + kX + kXs;
+            const u8* wf = w_e + own_row * row_bytes + ch * 64;
+#pragma unroll
+            for (int q = own_half * 4 / kGroups; q < (own_half + 1) * 4 / kGroups; ++q)
+                w4a8::cp16(ws + own * kWStride + ((q ^ ((own >> 1) & 3)) * 16), wf + q * 16, 16);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+
+    float acc[kTiles][kNb][4];
+#pragma unroll
+    for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+        for (int b = 0; b < kNb; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < kStages - 1; ++s) stage(s);
+
+    uint2 cs[kTiles], ns[kTiles];
+    load_s(0, cs);
+    for (int ch = 0; ch < chunks; ++ch) {
+        if (ch + 1 < chunks) load_s(ch + 1, ns);
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 2));
+        __syncthreads();
+        stage(ch + kStages - 1);
+        if (rows_live) {
+            const unsigned char* st = w4a4_smem + (ch % kStages) * kStage;
+            const unsigned char* xsp = st + kX;
+            const unsigned char* ws = st + kX + kXs;
+            uint2 sb[kNb];
+#pragma unroll
+            for (int b = 0; b < kNb; ++b)
+                sb[b] = *reinterpret_cast<const uint2*>(xsp + (64 * group + 8 * b + g) * 8);
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                unsigned a[kTiles][4];
+#pragma unroll
+                for (int t = 0; t < kTiles; ++t)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int r = warp * 32 + t * 16 + h * 8 + g;
+                        const unsigned char* wr = ws + r * kWStride + c * 4;
+                        a[t][h] = *reinterpret_cast<const unsigned*>(wr + (((2 * j) ^ ((r >> 1) & 3)) * 16));
+                        a[t][2 + h] =
+                            *reinterpret_cast<const unsigned*>(wr + (((2 * j + 1) ^ ((r >> 1) & 3)) * 16));
+                    }
+#pragma unroll
+                for (int b = 0; b < kNb; ++b) {
+                    const int xrow = 64 * group + 8 * b + g;
+                    const unsigned char* xrp = st + xrow * kXStride + c * 4;
+                    const unsigned b0 = *reinterpret_cast<const unsigned*>(xrp + (((2 * j) ^ (xrow & 3)) * 16));
+                    const unsigned b1 =
+                        *reinterpret_cast<const unsigned*>(xrp + (((2 * j + 1) ^ (xrow & 3)) * 16));
+                    const unsigned sbj = j == 0 ? sb[b].x : sb[b].y;
+#pragma unroll
+                    for (int t = 0; t < kTiles; ++t)
+                        w4a4::mma(acc[t][b], a[t], b0, b1, j == 0 ? cs[t].x : cs[t].y, sbj);
+                }
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < kTiles; ++t) cs[t] = ns[t];
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    if (!rows_live || count <= 64 * group) return;
+
+    const float* ts_e = tensor_scales + static_cast<long long>(expert) * n;
+    const float in_scale = input_scales[expert];
+    auto factor = [&](int row) { return ts_e[row] * in_scale; };
+    w4mma::w4_land<0, kTiles, kNb>(acc, factor, nullptr, order, begin + 64 * group, count - 64 * group, out, n, n,
+                                   row_base, g, c, 0.f, 0.f);
+}
+
+}  // namespace pie::linear
