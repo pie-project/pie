@@ -189,17 +189,22 @@ pub(super) fn select_mxfp4_mma(
     // fire streams each expert's codes once a 64.
     // Hopper's wgmma slice from `WGMMA_FROM`: the register-held kernel's
     // 32-route block is ALU-bound past 16 routes.
-    let staged = !cvt
-        && (per > ctx.tuning().mxfp4_staged_from
-            || (hopper_wgmma() && per >= WGMMA_FROM && x.width.is_multiple_of(64)));
-    // An Ada's experts of 16 routes or fewer on average:
-    // `moe_select_mxfp4_mma_run`, its lanes reading 512-code runs of a row
-    // (gpt-oss-120b's miniature at c128 on an L40S: 2490 to 2645 tok/s).
-    let run = !cvt
-        && !staged
+    // An Ada's experts of `kernel.moe.mxfp4_run_until` routes or fewer on
+    // average: `moe_select_mxfp4_mma_run`, its lanes reading 512-code runs
+    // of a row (gpt-oss-120b's miniature at c128 on an L40S: 2490 to 2645 tok/s).
+    let ada_run = !cvt
         && tensor_scales.is_none()
         && crate::jit::cache::arch() == Some("sm_89")
         && x.width.is_multiple_of(64);
+    let staged_from = if ada_run {
+        ctx.tuning().mxfp4_run_until
+    } else {
+        ctx.tuning().mxfp4_staged_from
+    };
+    let staged = !cvt
+        && (per > staged_from
+            || (hopper_wgmma() && per >= WGMMA_FROM && x.width.is_multiple_of(64)));
+    let run = ada_run && !staged;
     let nvfp4_wide_from = ctx.tuning().nvfp4_wide_from;
     let wide = staged
         && hopper_wgmma()

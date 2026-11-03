@@ -40,6 +40,11 @@ moe.bf16_mma_until = 65536
 moe.mxfp4_fp8_from = 256
 moe.mxfp4_mma_per_from = 4
 
+# gpt-oss-20b's c256 decode (32 routes an expert) on the run kernel's
+# 32-route slices, not the staged kernel's half-filled 64-route ones: c256
+# 5.97k to 6.56k tok/s.
+moe.mxfp4_run_until = 32
+
 # A prefill's block-FP8 projections W8A8 on the wide fp8 tiles, as the
 # deployment quantizes them, not bf16 on the widened copy: MiMo-V2.6-Flash's
 # mini pf16-512 45.4k to 49.2k tok/s.
