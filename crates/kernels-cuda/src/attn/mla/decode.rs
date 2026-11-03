@@ -104,8 +104,11 @@ pub(crate) mod naive {
         }
         let selected = ptrs.selection != 0;
 
-        // Hopper's wgmma kernel, 64 heads a CTA (`kernel.sdpa.mla_wgmma`).
+        // Hopper's wgmma kernel, 64 heads a CTA (`kernel.sdpa.mla_wgmma`), for
+        // fires of `kernel.sdpa.mla_wgmma_rows` rows and more: a few rows' keys
+        // split wider on the 16-head kernel.
         if shape.window == 0
+            && u32::try_from(shape.total_tokens).unwrap_or(0) >= ctx.tuning().mla_wgmma_rows
             && (!selected || shape.top_k > 0)
             && !shape.fp8
             && ctx.tuning().mla_wgmma
