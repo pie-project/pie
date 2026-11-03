@@ -1,0 +1,239 @@
+"""LatentMAS (Zou et al., ICML 2026) on pie, against vLLM: a question's team of four agents (planner,
+critic, refiner, judger) as the paper runs it, with the paper's prompts and answer checks.
+
+  python harness.py pie  --model Qwen/Qwen3-4B --method latent --task gsm8k --out pie_latent.jsonl
+  python harness.py vllm --model Qwen/Qwen3-4B --method text   --task gsm8k --out vllm_text.jsonl
+
+Prompts, datasets and scoring are the authors' (`--ref`, a checkout of github.com/Gen-Verse/LatentMAS:
+prompts.py, data.py, utils.py), so only the engine differs. Methods:
+
+- single: one agent answers.
+- text: TextMAS, the paper's text baseline: each agent writes, and every later agent reads all the notes.
+- latent: LatentMAS: planner, critic and refiner each read their prompt into one shared context and take
+  `--steps` latent steps there; the judger answers from that context. pie only: an engine that takes
+  text and returns text has no latent step.
+
+On pie a question's team is one process (main.py). On vLLM an agent's turn is one AsyncLLM request,
+with prefix caching. Either way `--concurrent` teams run at once, each going on as its agents finish.
+"""
+
+import argparse
+import asyncio
+import json
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+HERE = Path(__file__).parent
+CODE = ("humanevalplus", "mbppplus")
+
+
+def load(args):
+    sys.path.insert(0, str(Path(args.ref).resolve()))
+    import data
+
+    loader = {"gsm8k": data.load_gsm8k, "arc_challenge": data.load_arc_challenge, "arc_easy": data.load_arc_easy,
+              "humanevalplus": data.load_humanevalplus, "mbppplus": data.load_mbppplus}[args.task]
+    items = list(loader(split="test"))
+    return items[: args.n] if args.n else items
+
+
+def prompts(args):
+    """The authors' message builders for this task and method."""
+    from methods import default_agents
+    from prompts import (build_agent_message_sequential_latent_mas, build_agent_messages_sequential_text_mas,
+                         build_agent_messages_single_agent)
+
+    ns = SimpleNamespace(task=args.task, think=False, prompt="sequential", model_name=args.model,
+                         text_mas_context_length=-1, method=None)
+    agents = default_agents()
+    return SimpleNamespace(
+        agents=agents,
+        single=lambda q: build_agent_messages_single_agent(question=q, args=SimpleNamespace(**{**vars(ns), "method": "baseline"})),
+        text=lambda role, q, ctx: build_agent_messages_sequential_text_mas(role=role, question=q, context=ctx, method="text_mas", args=ns),
+        latent=lambda role, q: build_agent_message_sequential_latent_mas(role=role, question=q, context="", method="latent_mas", args=ns),
+    )
+
+
+def score(args, item, text):
+    """As the authors' methods do: the last python block run against the tests (10 s), else the last
+    \\boxed{} (or the last number), lower-cased."""
+    from utils import extract_gsm8k_answer, extract_markdown_python_block, normalize_answer, run_with_timeout
+
+    if args.task in CODE:
+        code = extract_markdown_python_block(text)
+        return None, bool(code) and run_with_timeout(code + "\n" + item["gold"], timeout=10)[0]
+    pred = normalize_answer(extract_gsm8k_answer(text))
+    return pred, bool(pred and item["gold"] and pred == item["gold"])
+
+
+def embedding_scale(model: str) -> float:
+    """The mean norm of the model's input embeddings: the size a latent input is scaled to."""
+    import torch
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+
+    path = Path(model) if Path(model).exists() else Path(snapshot_download(model, allow_patterns=["*.safetensors", "*.json"]))
+    for f in sorted(path.glob("*.safetensors")):
+        with safe_open(str(f), "pt") as st:
+            if "model.embed_tokens.weight" in st.keys():
+                return st.get_tensor("model.embed_tokens.weight").float().norm(dim=1).mean().item()
+    raise SystemExit(f"no model.embed_tokens.weight under {path}")
+
+
+# ── a team's turns, on either engine ──────────────────────────────────────────────
+
+
+async def solve(args, p, item, k, ask):
+    """One question: the method's agents in turn; `ask(request)` runs one turn and returns its reply."""
+    q = item["question"]
+    sampling = {"max_tokens": args.max_tokens, "temperature": args.temperature, "top_p": args.top_p}
+    if args.method == "single":
+        return (await ask({"op": "say", "messages": p.single(q), "fresh": True, "seed": k, **sampling}))["text"]
+    if args.method == "text":
+        context = ""
+        for i, agent in enumerate(p.agents):
+            out = (await ask({"op": "say", "messages": p.text(agent.role, q, context), "fresh": True,
+                              "seed": k * 8 + i, **sampling}))["text"].strip()
+            if agent.role == "judger":
+                return out
+            context += f"[{agent.name}]:\n{out}\n\n"
+    for agent in p.agents:
+        messages = p.latent(agent.role, q)
+        if agent.role != "judger":
+            await ask({"op": "think", "messages": messages, "steps": args.steps, "scale": args.scale})
+        else:
+            # as the authors' code: with no latent steps the judger answers on a fresh context
+            return (await ask({"op": "say", "messages": messages, "fresh": args.steps == 0, "seed": k, **sampling}))["text"]
+
+
+async def run_pie(args, p, items, tally):
+    from pie_client import Event, PieClient
+
+    client = PieClient(args.uri)
+    await client.connect()
+    await client.authenticate("latentmas")
+    program = await client.install_program_bytes((HERE / "main.py").read_bytes(), "latentmas.py", "0.1.0", force_overwrite=True)
+    gate = asyncio.Semaphore(args.concurrent)
+
+    async def team(k, item):
+        async with gate:
+            process = None
+
+            async def ask(request):
+                nonlocal process
+                if process is None:
+                    process = await client.launch_process(program, request)
+                else:
+                    await process.signal(json.dumps(request))
+                event, value = await process.recv()
+                if event != Event.Message:
+                    raise RuntimeError(f"the team's process ended: {str(value)[-500:]}")
+                reply = json.loads(value)
+                if "error" in reply:
+                    raise RuntimeError(reply["error"])
+                tally["made"] += len(reply.get("tokens", ()))
+                tally["read"] += reply.get("read", 0)
+                return reply
+
+            try:
+                return await solve(args, p, item, k, ask)
+            finally:
+                if process is not None:
+                    await process.signal("quit")
+
+    try:
+        return await asyncio.gather(*[team(k, item) for k, item in enumerate(items)], return_exceptions=True)
+    finally:
+        await client.close()
+
+
+async def run_vllm(args, p, items, tally):
+    from transformers import AutoTokenizer
+    from vllm import SamplingParams
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.sampling_params import RequestOutputKind
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    if args.method == "latent":
+        raise SystemExit("vLLM takes text and returns text: it has no latent step")
+    tok = AutoTokenizer.from_pretrained(args.model)
+    engine = AsyncLLM.from_engine_args(AsyncEngineArgs(model=args.model, max_model_len=args.max_model_len,
+                                                       gpu_memory_utilization=0.9, enable_prefix_caching=True,
+                                                       disable_log_stats=True))
+    gate = asyncio.Semaphore(args.concurrent)
+    ids = iter(range(1 << 62))
+
+    async def team(k, item):
+        async with gate:
+            async def ask(request):
+                prompt = tok.apply_chat_template(request["messages"], tokenize=False, add_generation_prompt=True)
+                ids_ = tok.encode(prompt, add_special_tokens=False)
+                sp = SamplingParams(temperature=request["temperature"], top_p=request["top_p"], max_tokens=request["max_tokens"],
+                                    seed=request["seed"], output_kind=RequestOutputKind.FINAL_ONLY)
+                out = None
+                async for out in engine.generate({"prompt_token_ids": ids_}, sp, f"r{next(ids)}"):
+                    pass
+                o = out.outputs[0]
+                tally["made"] += len(o.token_ids)
+                tally["read"] += len(ids_)
+                return {"text": o.text, "tokens": list(o.token_ids)}
+
+            return await solve(args, p, item, k, ask)
+
+    try:
+        return await asyncio.gather(*[team(k, item) for k, item in enumerate(items)], return_exceptions=True)
+    finally:
+        engine.shutdown()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("engine", choices=["pie", "vllm"])
+    ap.add_argument("--model", default="Qwen/Qwen3-4B")
+    ap.add_argument("--method", choices=["single", "text", "latent"], default="latent")
+    ap.add_argument("--task", choices=["gsm8k", "arc_challenge", "arc_easy", "humanevalplus", "mbppplus"], default="gsm8k")
+    ap.add_argument("--n", type=int, default=0, help="questions, from the first (0: all)")
+    ap.add_argument("--steps", type=int, default=40, help="latent steps per agent (the paper: accuracy peaks at 40-80)")
+    ap.add_argument("--scale", type=float, default=0.0, help="latent input norm (0: the model's mean embedding norm)")
+    ap.add_argument("--max-tokens", type=int, default=0, help="per agent (0: the paper's, 2048, or 4096 for code)")
+    ap.add_argument("--temperature", type=float, default=0.6)
+    ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--concurrent", type=int, default=64, help="teams at once")
+    ap.add_argument("--max-model-len", type=int, default=16384)
+    ap.add_argument("--ref", default="LatentMAS", help="a checkout of github.com/Gen-Verse/LatentMAS")
+    ap.add_argument("--uri", default="ws://127.0.0.1:8080")
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+    args.max_tokens = args.max_tokens or (4096 if args.task in CODE else 2048)
+
+    items = load(args)
+    p = prompts(args)
+    if args.method == "latent" and not args.scale:
+        args.scale = embedding_scale(args.model)
+    tally = {"made": 0, "read": 0}
+    t0 = time.monotonic()
+    texts = asyncio.run((run_pie if args.engine == "pie" else run_vllm)(args, p, items, tally))
+    wall = time.monotonic() - t0
+
+    correct = errors = 0
+    with open(args.out, "w") as f:
+        for k, (item, text) in enumerate(zip(items, texts)):
+            if isinstance(text, BaseException):
+                errors += 1
+                f.write(json.dumps({"k": k, "error": repr(text)[-800:]}) + "\n")
+                continue
+            pred, ok = score(args, item, text)
+            correct += ok
+            f.write(json.dumps({"k": k, "pred": pred, "correct": ok, "text": text}) + "\n")
+    summary = {"engine": args.engine, "model": args.model, "method": args.method, "task": args.task, "n": len(items),
+               "steps": args.steps if args.method == "latent" else None, "accuracy": round(correct / max(len(items), 1), 4),
+               "wall_s": round(wall, 1), "tokens_written": tally["made"], "tokens_read": tally["read"],
+               "concurrent": args.concurrent, "errors": errors}
+    print(json.dumps(summary), flush=True)
+    Path(args.out + ".summary.json").write_text(json.dumps(summary))
+
+
+if __name__ == "__main__":
+    main()
