@@ -865,6 +865,18 @@ impl KvPageTable {
         keys
     }
 
+    /// Every sealed page's key, repeats kept: a copy taken under the kv lock
+    /// that the caller hashes after letting it go.
+    pub fn sealed_key_list(&self) -> Vec<Hash256> {
+        let mut keys = Vec::new();
+        for (_, node) in self.nodes.iter() {
+            if let Pages::Owned { page_hashes, .. } = &node.pages {
+                keys.extend(page_hashes.iter().flatten().copied());
+            }
+        }
+        keys
+    }
+
     /// A node of sealed pages that came from elsewhere. Grafted `after` the
     /// page it extends, a pass that maps the prefix maps it too: attaching
     /// takes the trie path to a run's last page. With no `after` it starts a

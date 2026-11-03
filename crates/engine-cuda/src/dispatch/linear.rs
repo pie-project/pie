@@ -1351,7 +1351,7 @@ impl Run<'_> {
                 y: sy,
                 bias: None,
                 quantized: true,
-                quant: Some(ActQuant::E4m3 { gran: 128 }),
+                quant: Some(ActQuant::E4m3 { gran: 32 | 128 }),
                 ..
             },
             Linear::Glu {
@@ -2403,7 +2403,7 @@ impl Run<'_> {
                     let route_t = self.tensor(routes);
                     let mut out = self.tensor(y);
                     if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from
-                        && linear::moe::fp8_w8a8_takes(x, out.width)
+                        && linear::moe::fp8_select_takes(x, out.width)
                     {
                         return linear::moe::select_fp8_w8a8(
                             self.ctx(),
@@ -2513,6 +2513,17 @@ impl Run<'_> {
                 atoms.ptr,
                 &mut out,
             )?
+        {
+            return Ok(());
+        }
+        // A prefill's rows W8A8 on an Ada's wide fp8 tiles, as the
+        // deployment quantizes them (`kernel.gemm.fp8_wide_from`).
+        let wide_from = self.ctx().tuning().gemm_fp8_wide_from;
+        if wide_from > 0
+            && act.rows >= wide_from
+            && atoms.width > 0
+            && act.width == atoms.width * 128
+            && linear::moe::matmul_fp8_w8a8_wide(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)?
         {
             return Ok(());
         }

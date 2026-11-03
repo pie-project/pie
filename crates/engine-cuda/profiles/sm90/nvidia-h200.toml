@@ -16,6 +16,9 @@ sdpa.index_radix = true
 # a paged decode of a group of at most eight query heads on the tensor-core kernel, as the B200:
 # gemma-4-E4B c512 22.0k -> 23.6k tok/s, single-request decode 249 -> 253 tok/s
 sdpa.decode.gqa = true
+# from groups of two query heads a KV head: MiniMax's single-head groups read slower so
+# (MiniMax-M3.1-Flash mini60 raw decode 77.9 at every group, 86.4 off, 93.9 from two)
+sdpa.decode.gqa_min_group = 2
 # MXFP4 banks kept as an exact bf16 copy, read past 1024 routes a fire by the warp-specialized wgmma
 # GEMM as on the H100, the down banks too, all copies or none, leaving a quarter of the free memory to the
 # cache rows (MiMo-V2.6 mini48's 87 GB keep their MXFP4 banks):

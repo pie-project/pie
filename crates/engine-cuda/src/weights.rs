@@ -1345,12 +1345,13 @@ impl Weights {
     ) -> Result<u32> {
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
-        // Only banks whose selects quantize their rows in 1x128 blocks, the copy's.
+        // Only banks whose selects quantize their rows to e4m3, in 1x128 blocks
+        // (the copy's) or 1x32 (MXFP8, which the copy's selects read at 1x128).
         use poem_ir::{ActQuant, Def, Fused, Linear, Operation};
         let w128 = |op: &Linear| match op {
             Linear::MoeSelect {
                 bank,
-                quant: Some(ActQuant::E4m3 { gran: 128 }),
+                quant: Some(ActQuant::E4m3 { gran: 32 | 128 }),
                 ..
             } => Some(*bank),
             _ => None,
@@ -1401,7 +1402,7 @@ impl Weights {
                 || crate::device::alloc::is_host_pointer(scales.ptr)
                 || rows == 0
                 || !rows.is_multiple_of(128)
-                || !k.is_multiple_of(512)
+                || !k.is_multiple_of(128)
             {
                 continue;
             }
