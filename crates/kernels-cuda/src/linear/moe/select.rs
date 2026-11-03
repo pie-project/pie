@@ -587,7 +587,9 @@ pub(crate) fn select_gemv_swiglu(
     experts: ExpertTable,
 ) -> Result<bool, Error> {
     const OP: &str = "fused.moe_select_gemv_swiglu";
-    const ROWS: u32 = 4;
+    // Two gate rows and their up rows a warp: as many blocks as the select's
+    // four rows a warp over both halves.
+    const ROWS: u32 = 2;
     let fan = selected(OP, x, routes, y)?;
     if x.dtype != Dtype::Bf16
         || bank.dtype != Dtype::Bf16
