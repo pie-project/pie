@@ -16,6 +16,9 @@ sdpa.decode.gqa_cluster = 4  # 2.5% faster end to end
 sdpa.index_radix = true  # 1.0% faster end to end
 sdpa.prefill.tc5 = true  # 1.4% faster end to end
 ssm.kda_step_fused = true  # 1.7% faster end to end
+# NVFP4 experts of a W4A4 release against NVFP4 rows on the block-scaled mma.sync, as the release asks:
+# MiniMax-M3.1-Flash mini raw prefill 50.9k -> 71.1k, c256 24.1k -> 29.7k, pf16-512 94.5k -> 129.5k tok/s
+moe.nvfp4_w4a4_from = 64
 
 # the sm_120 switches the RTX PRO 6000 runs (same chip family): bf16 and NVFP4 MoE on the grouped mma.sync
 # kernels, the single-row block-FP8 GEMV, the tensor-core attention, hyper-connection and KDA kernels, the
