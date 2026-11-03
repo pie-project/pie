@@ -339,6 +339,16 @@ pub struct MoeMxfp4Bf16From(pub u32);
 #[decision(id = "kernel.moe.fp8a8_ws_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeFp8a8WsFrom(pub u32);
 
+/// A decode's W8A16 block-FP8 select (`moe_select_fp8_mma`): the CTAs' warps
+/// an SM its K split aims at, and the chunks a warp keeps in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.fp8_mma_fill", constant(range(1..=16)), default = 4, tune = search)]
+pub struct MoeFp8MmaFill(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.fp8_mma_depth", constant(range(2..=8)), default = 4, tune = search)]
+pub struct MoeFp8MmaDepth(pub u32);
+
 /// Whether a routed MLP's down bank keeps the bf16 copy too
 /// (`kernel.moe.mxfp4_bf16_from`), not its gate-up bank alone: the copy is
 /// four times the bank's bytes, and the cache rows lose what it takes.
@@ -883,6 +893,8 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4Bf16From>()
         .add::<MoeMxfp4Bf16Down>()
         .add::<MoeFp8a8WsFrom>()
+        .add::<MoeFp8MmaFill>()
+        .add::<MoeFp8MmaDepth>()
         .add::<MoeMxfp4W4a8From>()
         .add::<MoeMxfp4W4a8Tma>()
         .add::<MoeMxfp4W4a8Ws>()
@@ -1028,6 +1040,8 @@ tuning! {
     mxfp4_bf16_from: u32 = 0, get MoeMxfp4Bf16From;
     mxfp4_bf16_down: bool = false, on MoeMxfp4Bf16Down;
     fp8a8_ws_from: u32 = 0, get MoeFp8a8WsFrom;
+    fp8_mma_fill: u32 = 4, get MoeFp8MmaFill;
+    fp8_mma_depth: u32 = 4, get MoeFp8MmaDepth;
     mxfp4_w4a8_from: u32 = 0, get MoeMxfp4W4a8From;
     mxfp4_w4a8_tma: bool = false, on MoeMxfp4W4a8Tma;
     mxfp4_w4a8_ws: bool = false, on MoeMxfp4W4a8Ws;
