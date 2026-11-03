@@ -39,7 +39,7 @@ def hf_inputs(a, tokens):
     import torch
     from transformers import AutoModelForCausalLM
 
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    device = a.device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).to(device).eval()
     inputs = []
     with torch.no_grad():
@@ -64,6 +64,7 @@ def main() -> None:
     p.add_argument("--steps", type=int, default=40)
     p.add_argument("--scale", type=float, default=1.0974, help="Qwen3-4B's mean input-embedding norm")
     p.add_argument("--uri", default="ws://127.0.0.1:8080")
+    p.add_argument("--device", default="", help="where Hugging Face runs (default: the GPU, else the CPU)")
     a = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(a.model)
