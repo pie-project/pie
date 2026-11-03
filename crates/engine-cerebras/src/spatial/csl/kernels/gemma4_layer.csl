@@ -46,6 +46,8 @@ param OWN: u16;        // 1: the layer computes its k and v
 param SHARE: u16;      // 1: its k and v go to kvo
 param PC: u16;         // PLE dims a column (0: no PLE)
 param PR: u16;         // PLE vocab rows a PE row
+param W16: u16 = 1;    // 1: bf16 weights (u16 storage); the PLE table is bf16 always
+param NP: u16 = 3;     // bf16 parts of x in a W16 matvec (3: exact)
 param c_r1_0: color;
 param c_r1_1: color;
 param c_r2_0: color;
@@ -377,23 +379,39 @@ var kvo_ptr: [*]f32 = &kvo;
 // (wpm, Hc x PC), the gate (wpg, Hc x PC), the projection back (wpp, PC x
 // Hc), the table's slice [PR][PC] and the PLE norm's weights [PC].
 const PCn: u16 = if (PC > 0) PC else 1;
+// Weight storage and the W16 matvec's scratch (x's f32 remainder, its bf16
+// parts), after qwen35_attn's.
+const WST = if (W16 == 1) u16 else f32;
+var wdummy = @zeros([1]@fp16());
+fn mx2(a: u16, b: u16) u16 { return if (a > b) a else b; }
+const XMAX: u16 = mx2(mx2(Hc, Qh * Dc), mx2(Ic, PCn));
+const XM: u16 = if (W16 == 1) XMAX else 1;
+var xs32 = @zeros([XM]f32);
+var xt32 = @zeros([XM]f32);
+var xpart = @zeros([NP * XM]@fp16());
+const xs_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XM} -> xs32[i] });
+const xt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XM} -> xt32[i] });
+const xpart_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XM} -> xpart[i] });
 const PRn: u16 = if (PR > 0) PR else 1;
 var x0 = @zeros([B * Hc]f32);
 var x0_ptr: [*]f32 = &x0;
 const x0_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> x0[i] });
 var tok = @zeros([B]u32);
 var tok_ptr: [*]u32 = &tok;
-var wpm: [Hc * PCn + 1]f32 align(16) = @zeros([Hc * PCn + 1]f32);
-var wpm_ptr: [*]f32 = &wpm;
-const wpm_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PCn} -> wpm[i + 1] });
-var wpg: [Hc * PCn + 1]f32 align(16) = @zeros([Hc * PCn + 1]f32);
-var wpg_ptr: [*]f32 = &wpg;
-const wpg_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PCn} -> wpg[i + 1] });
-var wpp: [PCn * Hc + 1]f32 align(16) = @zeros([PCn * Hc + 1]f32);
-var wpp_ptr: [*]f32 = &wpp;
-const wpp_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> wpp[i + 1] });
-var ptab = @zeros([PRn * PCn]f32);
-var ptab_ptr: [*]f32 = &ptab;
+var wpm: [Hc * PCn + 1]WST align(16) = @zeros([Hc * PCn + 1]WST);
+var wpm_ptr: [*]WST = &wpm;
+var wpm_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = PCn })
+              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PCn} -> wpm[i + 1] });
+var wpg: [Hc * PCn + 1]WST align(16) = @zeros([Hc * PCn + 1]WST);
+var wpg_ptr: [*]WST = &wpg;
+var wpg_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = PCn })
+              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PCn} -> wpg[i + 1] });
+var wpp: [PCn * Hc + 1]WST align(16) = @zeros([PCn * Hc + 1]WST);
+var wpp_ptr: [*]WST = &wpp;
+var wpp_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = Hc })
+              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> wpp[i + 1] });
+var ptab = @zeros([PRn * PCn]u16);
+var ptab_ptr: [*]u16 = &ptab;
 var pnw = @zeros([PCn]f32);
 var pnw_ptr: [*]f32 = &pnw;
 const pnw_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PCn} -> pnw[i] });
@@ -421,15 +439,18 @@ const hss_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B} -> hss[i] });
 // x * gamma, a lane at a time (in sv: free in phases 0 and 10–11).
 const xn_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> sv[i] });
 
-var wqa: [Hc * NH1 * DHc + 1]f32 align(16) = @zeros([Hc * NH1 * DHc + 1]f32);
-var wqa_ptr: [*]f32 = &wqa;
-const wqa_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NH1 * DHc} -> wqa[i + 1] });
-var wqv: [Hc * NH1 * DHc + 1]f32 align(16) = @zeros([Hc * NH1 * DHc + 1]f32);
-var wqv_ptr: [*]f32 = &wqv;
-const wqv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NH1 * DHc} -> wqv[i + 1] });
-var wv: [Hc * Dc + 1]f32 align(16) = @zeros([Hc * Dc + 1]f32);
-var wv_ptr: [*]f32 = &wv;
-const wv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> wv[i + 1] });
+var wqa: [Hc * NH1 * DHc + 1]WST align(16) = @zeros([Hc * NH1 * DHc + 1]WST);
+var wqa_ptr: [*]WST = &wqa;
+var wqa_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = NH1 * DHc })
+              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NH1 * DHc} -> wqa[i + 1] });
+var wqv: [Hc * NH1 * DHc + 1]WST align(16) = @zeros([Hc * NH1 * DHc + 1]WST);
+var wqv_ptr: [*]WST = &wqv;
+var wqv_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = NH1 * DHc })
+              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NH1 * DHc} -> wqv[i + 1] });
+var wv: [Hc * Dc + 1]WST align(16) = @zeros([Hc * Dc + 1]WST);
+var wv_ptr: [*]WST = &wv;
+var wv_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = Dc })
+              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> wv[i + 1] });
 // QKV payload: first halves of q a, q b, k [b][3][DH], second halves, v [b][Dc],
 // x's sums of squares [b].
 const QH: u16 = NH1 * B * DHc;
@@ -493,24 +514,24 @@ const o_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * Dc} -> act[i] });
 const o_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * Qh * Dc} -> act[i] });
 const oa_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> act[i] });
 
-var wo: [Qh * Dc * Hc + 1]f32 align(16) = @zeros([Qh * Dc * Hc + 1]f32);
-var wo_ptr: [*]f32 = &wo;
-const wo_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> wo[i + 1] });
+var wo: [Qh * Dc * Hc + 1]WST align(16) = @zeros([Qh * Dc * Hc + 1]WST);
+var wo_ptr: [*]WST = &wo;
+var wo_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = Hc })
+              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> wo[i + 1] });
 // (hv in et: free in phases 8–9 and 14–15.)
 const hv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> et[i] });
 const hv_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * Hc} -> et[i] });
 
-var wgu: [Hc * 2 * Ic + 1]f32 align(16) = @zeros([Hc * 2 * Ic + 1]f32);
-var wgu_ptr: [*]f32 = &wgu;
-const wgu_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Ic} -> wgu[i + 1] });
+var wgu: [Hc * 2 * Ic + 1]WST align(16) = @zeros([Hc * 2 * Ic + 1]WST);
+var wgu_ptr: [*]WST = &wgu;
+var wgu_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = 2 * Ic })
+              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Ic} -> wgu[i + 1] });
 // The MLP runs MC lanes at a time: gate/up partials [MC][2·Ic + x's sum of
 // squares], act [MC][Ic]; the down partials of every lane gather in hv for
 // one all-reduce. (For 8B, gate/up + act are ~0.9 KB a lane.)
 var gu: [MC * GU1]f32 align(16) = @zeros([MC * GU1]f32);
 const gu_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Ic} -> gu[i] });
 const gu_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC * GU1} -> gu[i] });
-const g_col = @get_dsd(mem1d_dsd, .{ .tensor_access = |b|{MC} -> gu[b * @as(i16, GU1)] });
-const u_col = @get_dsd(mem1d_dsd, .{ .tensor_access = |b|{MC} -> gu[b * @as(i16, GU1) + @as(i16, Ic)] });
 var xss = @zeros([B]f32);            // x's sums of squares (the second RMSNorm), every lane
 const xss_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B} -> xss[i] });
 const ACT0: u16 = if (MC * Ic > QH) MC * Ic else QH;
@@ -531,9 +552,10 @@ const te_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC} -> te[i] });
 const tr_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC} -> tr[i] });
 const td_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC} -> td[i] });
 
-var wd: [Ic * Hc + 1]f32 align(16) = @zeros([Ic * Hc + 1]f32);
-var wd_ptr: [*]f32 = &wd;
-const wd_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> wd[i + 1] });
+var wd: [Ic * Hc + 1]WST align(16) = @zeros([Ic * Hc + 1]WST);
+var wd_ptr: [*]WST = &wd;
+var wd_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = Hc })
+              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> wd[i + 1] });
 
 // ---------------------------------------------------------------- compute
 const mv_dest = @get_dsr(dsr_dest, 1);
@@ -547,6 +569,49 @@ fn matvec(y: mem1d_dsd, a: mem1d_dsd, xv: mem1d_dsd) void {
   @load_to_dsr(mv_src0, y, .{ .save_address = false });
   @load_to_dsr(mv_src1, a, .{ .save_address = true });
   @map(mv_step, xv);
+}
+// 16-bit weights (W16): x split into NP bf16 parts (exact at NP 3), each part
+// one @fmachs pass over the bf16 rows (qwen2d_paged8b's matvec).
+fn mv16_step(xv: @fp16()) void {
+  @fmachs(mv_dest, mv_src0, mv_src1, xv);
+}
+fn xsplit(xv: mem1d_dsd, n: u16) void {
+  const res = @set_dsd_length(xs_d, n);
+  const tmp = @set_dsd_length(xt_d, n);
+  @fmovs(res, xv);
+  var k: u16 = 0;
+  while (k < NP) : (k += 1) {
+    const part = @set_dsd_length(@increment_dsd_offset(xpart_d, @as(i16, k * XM), @fp16()), n);
+    @fs2h(part, res);
+    if (k + 1 < NP) {
+      @fh2s(tmp, part);
+      @fsubs(res, res, tmp);
+    }
+  }
+}
+// y += A x over x's parts as `xsplit` left them (n of x's elements).
+fn mvparts(y: mem1d_dsd, a: mem1d_dsd, n: u16) void {
+  var k: u16 = 0;
+  while (k < NP) : (k += 1) {
+    const part = @set_dsd_length(@increment_dsd_offset(xpart_d, @as(i16, k * XM), @fp16()), n);
+    @load_to_dsr(mv_dest, y, .{ .save_address = false });
+    @load_to_dsr(mv_src0, y, .{ .save_address = false });
+    @load_to_dsr(mv_src1, a, .{ .save_address = true });
+    @map(mv16_step, part);
+  }
+}
+// y += A x for a weight matrix A: f32 rows, or (W16) bf16 rows.
+fn wmv(y: mem1d_dsd, a: mem1d_dsd, xv: mem1d_dsd, n: u16) void {
+  if (W16 == 0) {
+    matvec(y, a, xv);
+  } else {
+    xsplit(xv, n);
+    mvparts(y, a, n);
+  }
+}
+// A PLE table cell as f32 (the table is bf16 in every build, widened by its bits).
+fn ptab_at(i: u16) f32 {
+  return @bitcast(f32, @as(u32, ptab[i]) << 16);
 }
 fn rsqrt(v: f32) f32 {
   var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
@@ -681,8 +746,19 @@ fn gelu_t(g: mem1d_dsd, u: mem1d_dsd, out: mem1d_dsd, ta: mem1d_dsd, tt: mem1d_d
   @fmuls(tt, tt, 0.5);
   @fmuls(out, tt, u);
 }
+// Element e of every chunk lane's gate and up, gathered first: their lane
+// stride (2·Ic + 1) overflows a DSD's 8-bit stride at Gemma's widths.
+var gcol = @zeros([MC]f32);
+var ucol = @zeros([MC]f32);
+const gcol_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC} -> gcol[i] });
+const ucol_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MC} -> ucol[i] });
 fn gelu_col(e: u16) void {
-  gelu_t(at(g_col, e), at(u_col, e), at(act_col, e), ta_d, tt_d, te_d, tr_d, td_d);
+  var k: u16 = 0;
+  while (k < dims[4]) : (k += 1) {
+    gcol[k] = gu[k * GU1 + e];
+    ucol[k] = gu[k * GU1 + Ic + e];
+  }
+  gelu_t(gcol_d, ucol_d, at(act_col, e), ta_d, tt_d, te_d, tr_d, td_d);
 }
 
 // hv (B lanes of Hc, every column alike) RMS-normed over the hidden size
@@ -711,13 +787,13 @@ fn ple() void {
   @fmovs(pl_all, 0.0);
   var b: u16 = 0;
   while (b < dims[0]) : (b += 1) {
-    matvec(at(pl_lane, b * PCn), wpm_dsd, at(x0_dsd, b * Hc));
-    matvec(at(pl_lane, 2 * NBP + b * PCn), wpg_dsd, at(x_dsd, b * Hc));
+    wmv(at(pl_lane, b * PCn), wpm_dsd, at(x0_dsd, b * Hc), Hc);
+    wmv(at(pl_lane, 2 * NBP + b * PCn), wpg_dsd, at(x_dsd, b * Hc), Hc);
     const t = tok[b];
     if (t / @as(u32, PRn) == @as(u32, py)) {
       const r = @as(u16, t % @as(u32, PRn));
       var c: u16 = 0;
-      while (c < PC) : (c += 1) { pl[NBP + b * PCn + c] = ptab[r * PCn + c]; }
+      while (c < PC) : (c += 1) { pl[NBP + b * PCn + c] = ptab_at(r * PCn + c); }
     }
   }
   allreduce(false, pl_all, 3 * NBP);
@@ -741,7 +817,7 @@ fn ple() void {
   gelu_t(pg_d, pr_d, pt_d, p1_d, p2_d, p3_d, p4_d, @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NBP} -> sv[i] }));
   @fmovs(hv_all, 0.0);
   b = 0;
-  while (b < dims[0]) : (b += 1) { matvec(at(hv_dsd, b * Hc), wpp_dsd, at(pl_lane, NBP + b * PCn)); }
+  while (b < dims[0]) : (b += 1) { wmv(at(hv_dsd, b * Hc), wpp_dsd, at(pl_lane, NBP + b * PCn), PC); }
   allreduce(false, hv_all, B * Hc);
   hv_norm(g5_dsd);
   @fadds(x_all, x_all, hv_all);
@@ -789,9 +865,16 @@ fn layer() void {
   while (b < dims[0]) : (b += 1) {
     const xb = at(xn_dsd, b * Hc);
     @fmuls(xb, at(x_dsd, b * Hc), g1_dsd);
-    matvec(at(qh_dsd, b * NH1 * DHc), wqa_dsd, xb);
-    matvec(at(qh_dsd, QH + b * NH1 * DHc), wqv_dsd, xb);
-    matvec(at(v_dsd, b * Dc), wv_dsd, xb);
+    if (W16 == 1) {
+      xsplit(xb, Hc);
+      mvparts(at(qh_dsd, b * NH1 * DHc), wqa_dsd, Hc);
+      mvparts(at(qh_dsd, QH + b * NH1 * DHc), wqv_dsd, Hc);
+      mvparts(at(v_dsd, b * Dc), wv_dsd, Hc);
+    } else {
+      matvec(at(qh_dsd, b * NH1 * DHc), wqa_dsd, xb);
+      matvec(at(qh_dsd, QH + b * NH1 * DHc), wqv_dsd, xb);
+      matvec(at(v_dsd, b * Dc), wv_dsd, xb);
+    }
   }
   x_ssq(qkv_ssq);
   mark(0);
@@ -967,7 +1050,7 @@ fn layer() void {
   axis_xx();
   @fmovs(hv_all, 0.0);
   b = 0;
-  while (b < dims[0]) : (b += 1) { matvec(at(hv_dsd, b * Hc), wo_dsd, at(o_dsd, b * Qh * Dc)); }
+  while (b < dims[0]) : (b += 1) { wmv(at(hv_dsd, b * Hc), wo_dsd, at(o_dsd, b * Qh * Dc), Qh * Dc); }
   mark(8);
   allreduce(false, hv_all, B * Hc);
   hv_norm(g3_dsd);
@@ -989,7 +1072,7 @@ fn layer() void {
       @fmuls(at(xn_dsd, lb * Hc), at(x_dsd, lb * Hc), g2_dsd);
       const gb = at(gu_dsd, k * GU1);
       @fmovs(gb, 0.0);
-      matvec(gb, wgu_dsd, at(xn_dsd, lb * Hc));
+      wmv(gb, wgu_dsd, at(xn_dsd, lb * Hc), Hc);
       gu[k * GU1 + 2 * Ic] = xss[lb];
     }
     allreduce(false, gu_all, MC * GU1);
@@ -1003,7 +1086,7 @@ fn layer() void {
     while (el < Ic) : (el += P) { gelu_col(el); }
     allreduce(false, act_mc, MC * Ic);
     k = 0;
-    while (k < dims[4]) : (k += 1) { matvec(at(hv_dsd, (c0 + k) * Hc), wd_dsd, at(act_dsd, k * Ic)); }
+    while (k < dims[4]) : (k += 1) { wmv(at(hv_dsd, (c0 + k) * Hc), wd_dsd, at(act_dsd, k * Ic), Ic); }
   }
   mark(13);
   axis_xx();
@@ -1016,6 +1099,17 @@ fn layer() void {
 }
 
 fn init() void {
+  if (W16 == 1) {
+    wqa_dsd = @set_dsd_base_addr(wqa_dsd, @ptrcast([*]@fp16(), &wqa[1]));
+    wqv_dsd = @set_dsd_base_addr(wqv_dsd, @ptrcast([*]@fp16(), &wqv[1]));
+    wv_dsd = @set_dsd_base_addr(wv_dsd, @ptrcast([*]@fp16(), &wv[1]));
+    wo_dsd = @set_dsd_base_addr(wo_dsd, @ptrcast([*]@fp16(), &wo[1]));
+    wgu_dsd = @set_dsd_base_addr(wgu_dsd, @ptrcast([*]@fp16(), &wgu[1]));
+    wd_dsd = @set_dsd_base_addr(wd_dsd, @ptrcast([*]@fp16(), &wd[1]));
+    wpm_dsd = @set_dsd_base_addr(wpm_dsd, @ptrcast([*]@fp16(), &wpm[1]));
+    wpg_dsd = @set_dsd_base_addr(wpg_dsd, @ptrcast([*]@fp16(), &wpg[1]));
+    wpp_dsd = @set_dsd_base_addr(wpp_dsd, @ptrcast([*]@fp16(), &wpp[1]));
+  }
   dims[0] = B;
   dims[1] = E;
   dims[2] = TC;
