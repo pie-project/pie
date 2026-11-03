@@ -15,6 +15,9 @@ moe.bf16_mma_until = 65536
 # MiniMax-M3.1-Flash mini pf32-512 70.8k -> 94.3k, c512 23.4k -> 28.2k tok/s
 moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
+# NVFP4 selects of a W4A4 release on the block-scaled mma.sync, as the RTX 5090: MiniMax-M3.1-Flash mini
+# pf8-512 45.4k -> 55.7k, c512 14.8k -> 16.8k tok/s (vLLM 50.2k / 14.9k)
+moe.nvfp4_w4a4_from = 64
 # a single-row block-FP8 projection as the GEMV over bf16 rows, the codes streamed once, as sm_90/sm_100:
 # MiniMax-M3.1-Flash mini raw decode 285 -> 304 tok/s, greedy tokens unchanged
 gemm.fp8_gemv_until = 1
@@ -67,9 +70,9 @@ dag_streams_until = 256
 # a fire takes at most 5120 rows, so a batch's prompts end over two fires and those the first
 # finishes are answered, and replaced, while the second runs: DeepSeek-V4 mini pf16-512 98.7k -> 103k
 fire_rows = 5120
-# two recurrent-state slots a lane, so a hybrid trunk seats past the fixed 256: Nemotron-3-Super mini
-# c512 4,749 -> 5,028 tok/s (slots cut to fit the card), greedy tokens unchanged
-state_slots_per_lane = 2
+# one recurrent-state slot a lane (the PRO 6000 asks two): on 32 GB the doubled slab left the Qwen3.8-27B
+# mini20 kv pages for 3 sequences, c128 453 -> 2,410 tok/s; Nemotron, Qwen3.6-35B, Qwen3.8-Flash-Next unchanged
+state_slots_per_lane = 1
 # prompt fires pad to 64 lanes, not the 512 decoding lanes two slots seat: Qwen3.8-Flash-Next mini
 # raw prefill 58.9k -> 68.7k, pf16-512 150.1k -> 160.5k tok/s, c512 unchanged, greedy parity unchanged
 prefill_lanes = 64

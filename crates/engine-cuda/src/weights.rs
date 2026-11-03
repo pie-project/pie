@@ -1145,12 +1145,15 @@ impl Weights {
 
     /// `kernel.gemm.fp8_shadow`: each block-FP8 dense projection read at
     /// bf16 activations keeps a bf16 copy, widened once here, that a
-    /// batch's rows read on cuBLAS. Returns the planes it widened.
+    /// batch's rows read on cuBLAS. With `mixed` only the planes whose
+    /// 128-row blocks carry other exponents (MiMo's 192-row heads), which
+    /// no 128x128-block GEMM reads. Returns the planes it widened.
     #[cfg(feature = "cuda")]
     pub fn shadow_fp8_dense(
         &mut self,
         trace: &Trace,
         stream: *mut core::ffi::c_void,
+        mixed: bool,
     ) -> Result<u32> {
         use poem_ir::{Def, Linear, Operation};
         let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
@@ -1189,6 +1192,17 @@ impl Weights {
             }
             let (n, k) = (codes.rows, codes.width);
             let gran = k.div_ceil(atoms.width);
+            if mixed
+                && (gran != 128
+                    || kernels_cuda::linear::gemm::cublas_lt_fp8::rows_share_blocks(
+                        "linear.fp8_shadow",
+                        atoms.ptr,
+                        n,
+                        k,
+                    )?)
+            {
+                continue;
+            }
             let bytes = u64::from(n) * u64::from(k) * 2;
             if bytes > budget {
                 continue;
@@ -1331,12 +1345,13 @@ impl Weights {
     ) -> Result<u32> {
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
-        // Only banks whose selects quantize their rows in 1x128 blocks, the copy's.
+        // Only banks whose selects quantize their rows to e4m3, in 1x128 blocks
+        // (the copy's) or 1x32 (MXFP8, which the copy's selects read at 1x128).
         use poem_ir::{ActQuant, Def, Fused, Linear, Operation};
         let w128 = |op: &Linear| match op {
             Linear::MoeSelect {
                 bank,
-                quant: Some(ActQuant::E4m3 { gran: 128 }),
+                quant: Some(ActQuant::E4m3 { gran: 32 | 128 }),
                 ..
             } => Some(*bank),
             _ => None,
@@ -1387,7 +1402,7 @@ impl Weights {
                 || crate::device::alloc::is_host_pointer(scales.ptr)
                 || rows == 0
                 || !rows.is_multiple_of(128)
-                || !k.is_multiple_of(512)
+                || !k.is_multiple_of(128)
             {
                 continue;
             }
@@ -1435,6 +1450,7 @@ impl Weights {
         trace: &Trace,
         stream: *mut core::ffi::c_void,
         down_too: bool,
+        keep_percent: u32,
     ) -> Result<u32> {
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
@@ -1483,10 +1499,10 @@ impl Weights {
                 }
             }
         }
-        let mut done = 0;
-        for at in read {
+        // A bank's planes, rows and K where it takes a copy.
+        let candidate = |at: usize| {
             if trace.params[at].dtype != Dtype::Mxfp4 || self.table.3.contains_key(&at) {
-                continue;
+                return None;
             }
             let Some(Some(WeightRow::Planes {
                 codes,
@@ -1497,12 +1513,12 @@ impl Weights {
                 ..
             })) = self.table.0.get(at).copied()
             else {
-                continue;
+                return None;
             };
             // An MXFP4 plane is `[experts, rows, blocks, 16]` bytes.
             let shape = &trace.params[at].shape;
             if shape.len() < 3 {
-                continue;
+                return None;
             }
             let rows: u64 = shape[..shape.len() - 2].iter().product();
             let k = shape[shape.len() - 2] * 32;
@@ -1512,8 +1528,22 @@ impl Weights {
                 || rows == 0
                 || !k.is_multiple_of(64)
             {
-                continue;
+                return None;
             }
+            Some((at, codes, scales, rows, k))
+        };
+        let picked: Vec<_> = read.into_iter().filter_map(candidate).collect();
+        // Every copy or none: they leave `kernel.moe.mxfp4_bf16_keep` percent
+        // of the free memory to the cache rows, or the banks stay MXFP4.
+        let total: u64 = picked.iter().map(|&(_, _, _, rows, k)| rows * k * 2).sum();
+        if keep_percent > 0
+            && crate::device::alloc::free_bytes()
+                .is_none_or(|free| free - free.min(total) < free / 100 * u64::from(keep_percent))
+        {
+            return Ok(0);
+        }
+        let mut done = 0;
+        for (at, codes, scales, rows, k) in picked {
             let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
             let buffer = Buffer::zeroed_on(stream, (rows * k * 2) as usize)?;
             kernels_cuda::linear::moe::mxfp4_to_bf16(

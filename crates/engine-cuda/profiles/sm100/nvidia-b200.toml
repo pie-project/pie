@@ -5,12 +5,13 @@ device = "NVIDIA B200"
 
 # Each line's measured win is in the commit that set it.
 # cuBLAS over the fused skinny GEMM; selected attention and its index on
-# the tensor cores.
+# the tensor cores; MXFP4 experts' W4A16 GEMMs in fp16.
 [kernel]
 gemm.narrow_n = 8
 gemm.skinny_rows = 0
 sdpa.index_mma = true
 sdpa.selected_mma = true
+moe.mxfp4_f16 = true
 
 # Two state slots a lane (one frame a lane where they seat fewer lanes than
 # the engine batches), host-mapped `host` planes, 16384-row fires, a decoding

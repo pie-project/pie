@@ -273,11 +273,12 @@ fn plan_for(
 /// (codes and atoms, two planes) is never a rotated tenant, so its atoms sit
 /// where the load put them. A miss converts on a thread of its own, on its own
 /// stream, so a capturing stream's graph never holds the conversion: every
-/// graph reads the one finished copy.
-fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<u64, Error> {
+/// graph reads the one finished copy. `None` where a block's rows carry
+/// other exponents: a 128x128 scale cannot state them.
+fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<Option<u64>, Error> {
     use cudarc::runtime::sys as rt;
     /// The converted scales by device, atoms' address, `n` and `k`.
-    type Converted = Mutex<HashMap<(i32, u64, u32, u32), u64>>;
+    type Converted = Mutex<HashMap<(i32, u64, u32, u32), Option<u64>>>;
     static SCALES: OnceLock<Converted> = OnceLock::new();
     let dev = device();
     let key = (dev, atoms, n, k);
@@ -292,7 +293,7 @@ fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<u64, Er
     let bytes = (n / 128) as usize * kbp as usize * 4;
     let made = std::thread::scope(|scope| {
         scope
-            .spawn(|| -> Result<u64, Error> {
+            .spawn(|| -> Result<Option<u64>, Error> {
                 let fail = |what: &str, code: rt::cudaError_t| {
                     refuse(
                         op,
@@ -307,15 +308,20 @@ fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<u64, Er
                         return Err(fail("cudaSetDevice", code));
                     }
                     let mut at: *mut c_void = std::ptr::null_mut();
-                    let code = rt::cudaMalloc(&raw mut at, bytes.max(4));
+                    let code = rt::cudaMalloc(&raw mut at, bytes + 4);
                     if code != rt::cudaError::cudaSuccess {
                         return Err(fail("cudaMalloc", code));
                     }
+                    let mixed = at as u64 + bytes as u64;
                     let mut stream: rt::cudaStream_t = std::ptr::null_mut();
                     let code =
                         rt::cudaStreamCreateWithFlags(&raw mut stream, rt::cudaStreamNonBlocking);
                     if code != rt::cudaError::cudaSuccess {
                         return Err(fail("cudaStreamCreateWithFlags", code));
+                    }
+                    let code = rt::cudaMemsetAsync(mixed as *mut c_void, 0, 4, stream);
+                    if code != rt::cudaError::cudaSuccess {
+                        return Err(fail("cudaMemsetAsync", code));
                     }
                     let ctx = Ctx::on(stream.cast());
                     let fired = ctx.fire(
@@ -328,7 +334,16 @@ fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<u64, Er
                             ArgValue::Ptr(at as u64),
                             stated(op, n)?.arg(),
                             stated(op, k)?.arg(),
+                            ArgValue::Ptr(mixed),
                         ],
+                    );
+                    let mut flag = 0i32;
+                    let copied = rt::cudaMemcpyAsync(
+                        (&raw mut flag).cast(),
+                        mixed as *const c_void,
+                        4,
+                        rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                        stream,
                     );
                     let code = rt::cudaStreamSynchronize(stream);
                     let _ = rt::cudaStreamDestroy(stream);
@@ -336,7 +351,10 @@ fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<u64, Er
                     if code != rt::cudaError::cudaSuccess {
                         return Err(fail("cudaStreamSynchronize", code));
                     }
-                    Ok(at as u64)
+                    if copied != rt::cudaError::cudaSuccess {
+                        return Err(fail("cudaMemcpyAsync", copied));
+                    }
+                    Ok((flag == 0).then_some(at as u64))
                 }
             })
             .join()
@@ -344,6 +362,16 @@ fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<u64, Er
     })?;
     held.insert(key, made);
     Ok(made)
+}
+
+/// Whether each 128-row block of an `n x k` FP8 plane's rows carries one
+/// exponent a 128-column block, as a 128x128-block kernel reads them: rows
+/// laid out of their checkpoint blocks (MiMo's 192-row heads) do not.
+pub fn rows_share_blocks(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<bool, Error> {
+    if !n.is_multiple_of(128) || !k.is_multiple_of(128) {
+        return Ok(false);
+    }
+    Ok(weight_scales(op, atoms, n, k)?.is_some())
 }
 
 /// `y = q(act) . (W 2^(s - 127))^T` for an `n x k` 128x128-block FP8 plane
@@ -373,13 +401,15 @@ pub fn matmul(
     let Some((handle, plan)) = plan_for(mpad, n, k, workspace, false) else {
         return Ok(false);
     };
+    let Some(ws_scales) = weight_scales(op, atoms, n, k)? else {
+        return Ok(false);
+    };
     let blocks = k / 128;
     let scratch = |name, bytes: u64| -> Result<u64, Error> {
         Ok(ctx.scratch_stream(op, name, usize::try_from(bytes).unwrap_or(usize::MAX))? as u64)
     };
     let xq = scratch("linear.lt_fp8_x", u64::from(mpad) * u64::from(k))?;
     let xs = scratch("linear.lt_fp8_xs", u64::from(blocks) * u64::from(mpad) * 4)?;
-    let ws_scales = weight_scales(op, atoms, n, k)?;
     let d = if mpad == m {
         y.ptr
     } else {

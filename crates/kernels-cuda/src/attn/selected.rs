@@ -30,11 +30,24 @@ fn mma_dim(ctx: &Ctx, head_dim: i32, group: i32) -> Option<i32> {
         .then_some(head_dim)
 }
 
-/// `mma::Shape<D>::kBytes`: Q, four warps' key and value chunks, and their
-/// running maxima and sums.
-const fn mma_smem_bytes(head_dim: i32) -> u32 {
+/// `mma::Shape<D, W>::kBytes`: Q, `warps` warps' key and value chunks, and
+/// their running maxima and sums.
+const fn mma_smem_bytes(head_dim: i32, warps: u32) -> u32 {
     let ld = head_dim as u32 + 8;
-    16 * ld * 2 + 4 * (2 * 16 * ld * 2) + 4 * 16 * 2 * 4
+    16 * ld * 2 + warps * (2 * 16 * ld * 2) + warps * 16 * 2 * 4
+}
+
+/// The warps a block of the tensor-core walk runs: four, but sixteen where
+/// the fire's (row, kv head) blocks are too few to fill a quarter of the
+/// SMs (a decode's lone row: MiniMax-M3.1-Flash's four kv heads ran on four
+/// blocks of four warps, each warp waiting out its chunks one at a time).
+fn mma_warps(ctx: &Ctx, blocks: u32, head_dim: i32) -> u32 {
+    let sms = ctx.multiprocessors().unwrap_or(108);
+    if blocks.saturating_mul(4) < sms && ctx.smem_fits(mma_smem_bytes(head_dim, 16)) {
+        16
+    } else {
+        4
+    }
 }
 
 /// `mma::Tile`: eight rows a block, six warps, maps of up to 4096 blocks.
@@ -196,18 +209,25 @@ fn selected(
     }
     if let Some(dim) = mma_dim(ctx, head_dim, q_heads / kv_heads) {
         #[allow(clippy::cast_sign_loss)]
+        let warps = mma_warps(
+            ctx,
+            (total_tokens as u32).saturating_mul(kv_heads as u32),
+            dim,
+        );
+        #[allow(clippy::cast_sign_loss)]
         let launch = Launch::grid(
             [total_tokens as u32, kv_heads as u32, 1],
-            [MMA_THREADS, 1, 1],
+            [MMA_THREADS / 4 * warps, 1, 1],
         )
-        .smem(mma_smem_bytes(dim));
+        .smem(mma_smem_bytes(dim, warps));
+        let entry = if warps == 4 {
+            format!("::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}>")
+        } else {
+            format!("::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}, {warps}>")
+        };
         return ctx.fire(
             op,
-            Fire::at(kernel(
-                SELECTED_SM80,
-                &format!("::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}>"),
-            ))
-            .apply(launch),
+            Fire::at(kernel(SELECTED_SM80, &entry)).apply(launch),
             &[
                 q.data.arg(),
                 pool.keys.arg(),

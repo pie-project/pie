@@ -112,11 +112,6 @@ pub(crate) fn mxfp4_mma_worth(
         && x.width.is_multiple_of(32)
 }
 
-/// The most routes an expert averages that the register-held mxfp4
-/// select takes; past it, the shared-memory-staged one.
-#[cfg(feature = "cuda")]
-pub(super) const STAGED_FROM: u32 = 16;
-
 /// The fewest routes an expert averages that Hopper's staged wgmma select
 /// takes from the register-held one (DeepSeek-V4-Flash's miniature at 24 a
 /// 64-row decode: 11% less time a fire).
@@ -189,7 +184,7 @@ pub(super) fn select_mxfp4_mma(
     // An expert's slice is 8, 16 or 32 routes: as few 8-route blocks as the
     // average expert fills.
     let per = fan.route_count.div_ceil(experts);
-    // Past `STAGED_FROM` routes an expert, its activations staged in shared
+    // Past `kernel.moe.mxfp4_staged_from` routes an expert, its activations staged in shared
     // memory a CTA of 64 routes (`moe_select_mxfp4_mma_staged`), so a wide
     // fire streams each expert's codes once a 64.
     // Hopper's wgmma slice from `WGMMA_FROM`: the register-held kernel's
@@ -204,19 +199,23 @@ pub(super) fn select_mxfp4_mma(
     let staged_from = if ada_run {
         ctx.tuning().mxfp4_run_until
     } else {
-        STAGED_FROM
+        ctx.tuning().mxfp4_staged_from
     };
     let staged = !cvt
         && (per > staged_from
             || (hopper_wgmma() && per >= WGMMA_FROM && x.width.is_multiple_of(64)));
     let run = ada_run && !staged;
+    let nvfp4_wide_from = ctx.tuning().nvfp4_wide_from;
     let wide = staged
         && hopper_wgmma()
-        && tensor_scales.is_none()
         && x.width.is_multiple_of(64)
-        && per >= WGMMA_WIDE_FROM;
+        && match tensor_scales {
+            None => per >= WGMMA_WIDE_FROM,
+            Some(_) => nvfp4_wide_from > 0 && per >= nvfp4_wide_from,
+        };
     let nb: u32 = match per {
         _ if wide => 16,
+        _ if staged && per <= ctx.tuning().mxfp4_staged_narrow_until => 4,
         _ if staged => 8,
         _ if run => 4,
         0..=4 => 1,
@@ -535,6 +534,127 @@ pub fn select_mxfp4_w4a8(
         alpha.arg(),
     ];
     ctx.fire(op, fire, &args)?;
+    Ok(true)
+}
+
+/// The stages of `moe_select_nvfp4_w4a4`'s ring, its route groups a CTA, and a
+/// stage's bytes: the slice's routes' 64 code bytes and eight scales, 256
+/// rows' 64 code bytes.
+#[cfg(feature = "cuda")]
+const W4A4_STAGES: u32 = 3;
+#[cfg(feature = "cuda")]
+const W4A4_GROUPS: u32 = 2;
+#[cfg(feature = "cuda")]
+const W4A4_STAGE: u32 = W4A4_GROUPS * 64 * (64 + 8) + 256 * 64;
+
+/// A routed NVFP4 select of a release that quantizes its rows to NVFP4
+/// (W4A4), on sm_120a's block-scaled mma.sync: `x`'s rows so quantized in
+/// stream scratch under the experts' global, then `moe_select_nvfp4_w4a4` over
+/// each expert's 64-route slices, `scales` row-major e4m3 a 16 codes and
+/// `tensor_scales` an f32 a row. `Ok(false)` where the kernel does not take
+/// the fire (`kernel.moe.nvfp4_w4a4_from`).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn select_nvfp4_w4a4(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    tensor_scales: Tensor,
+    input_scales: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.moe_select_nvfp4_w4a4";
+    let from = ctx.tuning().nvfp4_w4a4_from;
+    if from == 0
+        || routes.rows * routes.width < from
+        || x.dtype != Dtype::Bf16
+        || y.dtype != Dtype::Bf16
+        || x.width == 0
+        || !x.width.is_multiple_of(128)
+        || !crate::jit::cache::features().warp_block_scale
+        || !ctx.smem_fits(W4A4_STAGES * W4A4_STAGE)
+    {
+        return Ok(false);
+    }
+    let fan = &selected(OP, x, routes, y)?;
+    let (rows, kw) = (x.rows as usize, x.width as usize);
+    let xq = ctx.scratch_stream(OP, "linear.nvfp4_w4a4_x", rows * kw / 2)? as u64;
+    let xs = ctx.scratch_stream(OP, "linear.nvfp4_w4a4_xs", rows * (kw / 16))? as u64;
+    let lanes = u32::try_from(rows * (kw / 16)).map_err(|_| refuse(OP, "too many rows"))?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            SELECT_FP4_SM120,
+            "::pie::linear::quantize_rows_nvfp4",
+        ))
+        .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
+        &[
+            x.arg(),
+            input_scales.arg(),
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xs),
+            stated(OP, x.rows)?.arg(),
+            stated(OP, x.width)?.arg(),
+        ],
+    )?;
+    let experts = codes.rows.clamp(1, EXPERT_CAP);
+    let k = stated(OP, x.width)?;
+    let n = stated(OP, nonzero(OP, "N, the bank's output width", y.width)?)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    } = route_order_sliced(
+        ctx,
+        OP,
+        routes,
+        fan,
+        experts,
+        64 * W4A4_GROUPS,
+        true,
+        if KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    let tiles = y.width.div_ceil(256);
+    let fire = Fire::at(kernel(
+        SELECT_FP4_SM120,
+        &format!("::pie::linear::moe_select_nvfp4_w4a4<{W4A4_STAGES}, {W4A4_GROUPS}>"),
+    ))
+    .apply(
+        Launch::grid(
+            if act_div == 1 {
+                [tiles, work_cap, 1]
+            } else {
+                [work_cap, tiles, 1]
+            },
+            [256 * W4A4_GROUPS, 1, 1],
+        )
+        .smem(W4A4_STAGES * W4A4_STAGE),
+    );
+    let args = [
+        ArgValue::Ptr(xq),
+        ArgValue::Ptr(xs),
+        ArgValue::Ptr(order),
+        ArgValue::Ptr(offsets),
+        ArgValue::Ptr(work),
+        codes.arg(),
+        scales.arg(),
+        tensor_scales.arg(),
+        input_scales.arg(),
+        y.arg(),
+        act_div.arg(),
+        n.arg(),
+        k.arg(),
+        stated(OP, experts)?.arg(),
+    ];
+    ctx.fire(OP, fire, &args)?;
     Ok(true)
 }
 

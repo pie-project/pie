@@ -220,6 +220,14 @@ pub struct GemmFp8GemvUntil(pub u32);
 #[decision(id = "kernel.gemm.fp8_shadow", flag, default = false, tune = search)]
 pub struct GemmFp8Shadow;
 
+/// The fewest rows a block-FP8 dense projection read at bf16 activations
+/// runs W8A8 on an Ada's wide fp8 tiles with (`matmul_fp8_w8a8_wide`, the
+/// rows quantized to e4m3 in 1x128 blocks), ahead of the bf16 copy
+/// (`kernel.gemm.fp8_shadow`). 0: never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_wide_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct GemmFp8WideFrom(pub u32);
+
 /// Whether a block-FP8 dense projection (no tcgen05) keeps its 128x128
 /// exponents spread over 1x32 blocks, laid once at load, so a batch's rows
 /// run cuBLASLt's MXFP8 GEMM on the same codes (sm_120).
@@ -289,6 +297,14 @@ pub struct MoeBf16MmaUntil(pub u32);
 #[decision(id = "kernel.moe.mxfp4_cvt", flag, default = false, tune = search)]
 pub struct MoeMxfp4Cvt;
 
+/// Whether a W4A16 MXFP4 routed MLP on the tcgen05 grouped GEMM multiplies
+/// in fp16: its activations land as fp16, its e2m1 weights dequantize to fp16
+/// by one convert a pair (bf16 takes byte permutes), the same products where
+/// the values sit in fp16's range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_f16", flag, default = false, tune = search)]
+pub struct MoeMxfp4F16;
+
 /// The most routes an e2m1-convert select (`kernel.moe.mxfp4_cvt`) splits
 /// each work item's K across a cluster of two CTAs for, their sums met in
 /// the cluster's shared memory: a fire that few leaves most SMs idle. 0:
@@ -296,6 +312,21 @@ pub struct MoeMxfp4Cvt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_cvt_ksplit_until", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4CvtKsplitUntil(pub u32);
+
+/// The most routes an expert averages that the register-held mxfp4 select
+/// takes; past it, the shared-memory-staged one (16 but where a chip's
+/// profile says).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_staged_from", constant(range(0..=65_536)), default = 16, tune = search)]
+pub struct MoeMxfp4StagedFrom(pub u32);
+
+/// The most routes an expert averages that the shared-memory-staged mxfp4
+/// select (`moe_select_mxfp4_mma_staged`) stages in slices of 32 routes,
+/// not 64: past its expert's routes a slice multiplies empty n8 blocks. 0:
+/// always 64.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_staged_narrow_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4StagedNarrowUntil(pub u32);
 
 /// A grouped bf16 projection on routes that send each group to its own
 /// plane (DeepSeek-V4's `wo_a`, dequantized at import from the checkpoint's
@@ -338,6 +369,30 @@ pub struct MoeMxfp4Fp8From(pub u32);
 #[decision(id = "kernel.moe.mxfp4_bf16_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4Bf16From(pub u32);
 
+/// The fewest routes an expert, on average, a block-FP8 select runs on
+/// Hopper's warp-specialized wgmma GEMM (128 routes by 128 weight rows a CTA,
+/// a producer warpgroup and two consumers); fewer keep the one-warpgroup
+/// select. 0: never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.fp8a8_ws_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeFp8a8WsFrom(pub u32);
+
+/// Whether the warp-specialized block-FP8 select keeps 128 weight rows a
+/// CTA where N would take 256 (`kernel.moe.fp8a8_ws_from`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.fp8a8_ws_narrow", flag, default = false, tune = search)]
+pub struct MoeFp8a8WsNarrow;
+
+/// A decode's W8A16 block-FP8 select (`moe_select_fp8_mma`): the CTAs' warps
+/// an SM its K split aims at, and the chunks a warp keeps in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.fp8_mma_fill", constant(range(1..=16)), default = 4, tune = search)]
+pub struct MoeFp8MmaFill(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.fp8_mma_depth", constant(range(2..=8)), default = 4, tune = search)]
+pub struct MoeFp8MmaDepth(pub u32);
+
 /// Whether a routed MLP's down bank keeps the bf16 copy too
 /// (`kernel.moe.mxfp4_bf16_from`), not its gate-up bank alone: the copy is
 /// four times the bank's bytes, and the cache rows lose what it takes.
@@ -345,12 +400,34 @@ pub struct MoeMxfp4Bf16From(pub u32);
 #[decision(id = "kernel.moe.mxfp4_bf16_down", flag, default = false, tune = search)]
 pub struct MoeMxfp4Bf16Down;
 
+/// The percent of the device memory free before the bf16 copies
+/// (`kernel.moe.mxfp4_bf16_from`) that they leave free, no bank copied where
+/// all of them would take more: the cache rows keep that much. 0: no floor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_bf16_keep", constant(range(0..=100)), default = 0, tune = search)]
+pub struct MoeMxfp4Bf16Keep(pub u32);
+
 /// The fewest routes an MXFP4 select runs W4A8 on sm_120a's block-scaled
 /// mma.sync, its rows quantized as MXFP8 (as SGLang reads MXFP4 experts on
 /// the consumer Blackwells). 0: never.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_w4a8_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4W4a8From(pub u32);
+
+/// The fewest routes an expert averages that Hopper's NVFP4 selects take the
+/// wide wgmma slice at (`moe_select_fp4_wgmma`, two warpgroups on a
+/// 128-route slice), as the MXFP4 ones do from 128; fewer, and all where 0,
+/// keep the one-warpgroup 64-route slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.nvfp4_wide_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeNvfp4WideFrom(pub u32);
+
+/// The fewest routes an NVFP4 select of a W4A4 release runs W4A4 on sm_120a's
+/// block-scaled mma.sync, its rows quantized as NVFP4 (as the FlashInfer SM120
+/// CUTLASS MoE reads NVFP4 experts on the consumer Blackwells). 0: never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.nvfp4_w4a4_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeNvfp4W4a4From(pub u32);
 
 /// The W4A8 select's stages landed by TMA, its rows quantized in route order
 /// so an expert's slice is one box. Off but where a chip's profile says.
@@ -439,6 +516,21 @@ pub struct GemmFp8GroupedTc5Until(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.mla_sparse", flag, default = false, tune = search)]
 pub struct SdpaMlaSparse;
+
+/// Whether the paged latent attention (64 heads in whole groups over a
+/// 512-wide bf16 latent and a 64-wide rotated part: GLM-5.3's DSA) runs 64
+/// heads a CTA on Hopper's wgmma (`attn/mla/sparse_sm90.cu`); off, the
+/// 16-head mma.sync kernel serves it as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.mla_wgmma", flag, default = false, tune = search)]
+pub struct SdpaMlaWgmma;
+
+/// The fewest rows a latent attention fire runs the wgmma kernel at
+/// (`kernel.sdpa.mla_wgmma`); fewer (a decode's few rows) keep the 16-head
+/// kernel, whose keys split wider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.mla_wgmma_rows", constant(range(1..=65_536)), default = 1, tune = search)]
+pub struct SdpaMlaWgmmaRows(pub u32);
 
 /// Whether the tcgen05 sparse MLA pass reads a row that sees no more keys
 /// than its selection holds (a decode at a short context, a prefill's rows
@@ -787,6 +879,13 @@ pub struct Fa2Live;
 #[decision(id = "kernel.sdpa.decode.gqa", flag, default = false, tune = search)]
 pub struct DecodeGqa;
 
+/// The fewest query heads a KV head that a paged decode takes the
+/// tensor-core kernel at (`kernel.sdpa.decode.gqa`); narrower groups keep
+/// the FA2 decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.gqa_min_group", constant(range(1..=8)), default = 1, tune = search)]
+pub struct DecodeGqaMinGroup(pub u32);
+
 /// The fewest requests a 64-wide decode takes the tensor-core kernel at;
 /// narrower, the FA2 decode reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -875,14 +974,24 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeBf16MmaFrom>()
         .add::<MoeBf16MmaUntil>()
         .add::<MoeMxfp4Cvt>()
+        .add::<MoeMxfp4F16>()
         .add::<MoeMxfp4CvtKsplitUntil>()
+        .add::<MoeMxfp4StagedNarrowUntil>()
+        .add::<MoeMxfp4StagedFrom>()
         .add::<GemmFp8ODown>()
         .add::<MoeMxfp4A8Until>()
         .add::<MoeMxfp4A8From>()
         .add::<MoeMxfp4Fp8From>()
         .add::<MoeMxfp4Bf16From>()
         .add::<MoeMxfp4Bf16Down>()
+        .add::<MoeFp8a8WsFrom>()
+        .add::<MoeFp8a8WsNarrow>()
+        .add::<MoeFp8MmaFill>()
+        .add::<MoeFp8MmaDepth>()
+        .add::<MoeMxfp4Bf16Keep>()
         .add::<MoeMxfp4W4a8From>()
+        .add::<MoeNvfp4W4a4From>()
+        .add::<MoeNvfp4WideFrom>()
         .add::<MoeMxfp4W4a8Tma>()
         .add::<MoeMxfp4W4a8Ws>()
         .add::<MoeW4a4FusedFrom>()
@@ -892,6 +1001,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
         .add::<GemmFp8Shadow>()
+        .add::<GemmFp8WideFrom>()
         .add::<GemmFp8Mx>()
         .add::<GemmFp8MmaGemvUntil>()
         .add::<GemmFp8MmaKUntil>()
@@ -919,6 +1029,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeGroupedPrefillWindow>()
         .add::<Fa2Live>()
         .add::<DecodeGqa>()
+        .add::<DecodeGqaMinGroup>()
         .add::<DecodeGqaFrom64>()
         .add::<DecodeGqaWholeWindow>()
         .add::<DecodeGqaCluster>()
@@ -936,6 +1047,8 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaCompressedFp4PassFrom>()
         .add::<GemmFp8GroupedTc5Until>()
         .add::<SdpaMlaSparse>()
+        .add::<SdpaMlaWgmma>()
+        .add::<SdpaMlaWgmmaRows>()
         .add::<SdpaMlaDenseShort>()
         .add::<GemmNarrowN>();
 }
@@ -1020,14 +1133,24 @@ tuning! {
     bf16_mma_from: u32 = 0, get MoeBf16MmaFrom;
     bf16_mma_until: u32 = 0, get MoeBf16MmaUntil;
     mxfp4_cvt: bool = false, on MoeMxfp4Cvt;
+    moe_mxfp4_f16: bool = false, on MoeMxfp4F16;
     mxfp4_cvt_ksplit_until: u32 = 0, get MoeMxfp4CvtKsplitUntil;
+    mxfp4_staged_narrow_until: u32 = 0, get MoeMxfp4StagedNarrowUntil;
+    mxfp4_staged_from: u32 = 16, get MoeMxfp4StagedFrom;
     fp8_o_down: bool = false, on GemmFp8ODown;
     mxfp4_a8_until: u32 = 0, get MoeMxfp4A8Until;
     mxfp4_a8_from: u32 = 0, get MoeMxfp4A8From;
     mxfp4_fp8_from: u32 = 0, get MoeMxfp4Fp8From;
     mxfp4_bf16_from: u32 = 0, get MoeMxfp4Bf16From;
     mxfp4_bf16_down: bool = false, on MoeMxfp4Bf16Down;
+    fp8a8_ws_from: u32 = 0, get MoeFp8a8WsFrom;
+    fp8a8_ws_narrow: bool = false, on MoeFp8a8WsNarrow;
+    fp8_mma_fill: u32 = 4, get MoeFp8MmaFill;
+    fp8_mma_depth: u32 = 4, get MoeFp8MmaDepth;
+    mxfp4_bf16_keep: u32 = 0, get MoeMxfp4Bf16Keep;
     mxfp4_w4a8_from: u32 = 0, get MoeMxfp4W4a8From;
+    nvfp4_w4a4_from: u32 = 0, get MoeNvfp4W4a4From;
+    nvfp4_wide_from: u32 = 0, get MoeNvfp4WideFrom;
     mxfp4_w4a8_tma: bool = false, on MoeMxfp4W4a8Tma;
     mxfp4_w4a8_ws: bool = false, on MoeMxfp4W4a8Ws;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
@@ -1037,6 +1160,7 @@ tuning! {
     mla_expanded_from: u32 = 65_536, get MlaExpandedFrom;
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
     gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
+    gemm_fp8_wide_from: u32 = 0, get GemmFp8WideFrom;
     gemm_fp8_mx: bool = false, on GemmFp8Mx;
     gemm_fp8_mma_gemv_until: u32 = 0, get GemmFp8MmaGemvUntil;
     gemm_fp8_mma_k_until: u32 = 0, get GemmFp8MmaKUntil;
@@ -1064,6 +1188,7 @@ tuning! {
     decode_grouped_prefill_window: bool = false, on DecodeGroupedPrefillWindow;
     fa2_live: bool = false, on Fa2Live;
     decode_gqa: bool = false, on DecodeGqa;
+    decode_gqa_min_group: u32 = 1, get DecodeGqaMinGroup;
     decode_gqa_from_64: u32 = 0, get DecodeGqaFrom64;
     decode_gqa_whole_window: u32 = 0, get DecodeGqaWholeWindow;
     decode_gqa_cluster: u32 = 0, get DecodeGqaCluster;
@@ -1081,6 +1206,8 @@ tuning! {
     compressed_fp4_pass_from: u32 = 0, get SdpaCompressedFp4PassFrom;
     gemm_fp8_grouped_tc5_until: u32 = 0, get GemmFp8GroupedTc5Until;
     mla_sparse: bool = false, on SdpaMlaSparse;
+    mla_wgmma: bool = false, on SdpaMlaWgmma;
+    mla_wgmma_rows: u32 = 1, get SdpaMlaWgmmaRows;
     mla_dense_short: bool = false, on SdpaMlaDenseShort;
     gemm_narrow_n: u32 = 0, get GemmNarrowN;
 }

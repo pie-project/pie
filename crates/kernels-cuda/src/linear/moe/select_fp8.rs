@@ -69,6 +69,23 @@ pub fn fp8_w8a8_takes(x: Tensor, n: u32) -> bool {
     x.dtype == Dtype::Bf16 && x.width > 0 && x.width.is_multiple_of(512) && n.is_multiple_of(128)
 }
 
+/// Whether [`select_fp8_w8a8`] takes a select of `x` against a bank `n`
+/// rows wide: on Hopper its wgmma kernels step K a 128-wide block at a time,
+/// so K in whole 128s (an MXFP4 bank's fp8b128 copy lays its exponents so);
+/// elsewhere as [`fp8_w8a8_takes`].
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn fp8_select_takes(x: Tensor, n: u32) -> bool {
+    if hopper_wgmma() {
+        x.dtype == Dtype::Bf16
+            && x.width > 0
+            && x.width.is_multiple_of(128)
+            && n.is_multiple_of(128)
+    } else {
+        fp8_w8a8_takes(x, n)
+    }
+}
+
 /// `y[route] = q(x[route or its token]) . W[routes[route]]^T` for a
 /// 128x128-block FP8 bank (W8A8, `q` the rows' e4m3 1x128 quantization) on
 /// mma.sync, off tcgen05: the rows quantized once, routes laid out by expert
@@ -87,10 +104,10 @@ pub fn select_fp8_w8a8(
     const OP: &str = "linear.moe_select_fp8_w8a8";
     let fan = selected(OP, x, routes, y)?;
     let n = stated(OP, nonzero(OP, "N, the bank's output width", y.width)?)?;
-    if !fp8_w8a8_takes(x, y.width) || experts == 0 {
+    if !fp8_select_takes(x, y.width) || experts == 0 {
         return Err(refuse(
             OP,
-            "the fp8 select takes bf16 rows, K in 512s and N in 128s",
+            "the fp8 select takes bf16 rows, K in 512s (128s on Hopper) and N in 128s",
         ));
     }
     let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
@@ -99,6 +116,63 @@ pub fn select_fp8_w8a8(
     // On Hopper, wgmma (sm_90a): an expert's slice 32 routes, or 64 past an
     // average of 16, at about the card's rate either way, so a busy expert's
     // routes rarely spill into a second read of its codes.
+    // A prefill's busy experts on the warp-specialized GEMM
+    // (`kernel.moe.fp8a8_ws_from`): 128 routes by 128 weight rows a CTA.
+    let ws_from = ctx.tuning().fp8a8_ws_from;
+    if hopper_wgmma() && ws_from > 0 && per >= ws_from {
+        // Two 128-row halves a CTA where N is whole 256s (the routes' rows
+        // read half as often), four stages; one, six stages.
+        let halves: u32 = if y.width.is_multiple_of(256) && !ctx.tuning().fp8a8_ws_narrow {
+            2
+        } else {
+            1
+        };
+        let stages: u32 = if halves == 2 { 4 } else { 6 };
+        let RouteOrder {
+            order,
+            offsets,
+            work,
+            work_cap,
+        } = route_order_sliced(
+            ctx,
+            OP,
+            routes,
+            &fan,
+            experts,
+            128,
+            true,
+            if KEEP_NEXT.with(core::cell::Cell::get) {
+                Share::Keep
+            } else {
+                Share::Take
+            },
+        )?;
+        return ctx.fire(
+            OP,
+            Fire::at(kernel(
+                SELECT_SM90,
+                &format!("::pie::linear::moe_select_fp8a8_wsgemm<{stages}, {halves}>"),
+            ))
+            .apply(
+                Launch::grid([work_cap, y.width / (128 * halves), 1], [384, 1, 1])
+                    .smem(stages * 16384 * (1 + halves) + 1024 + 128),
+            ),
+            &[
+                ArgValue::Ptr(xq),
+                ArgValue::Ptr(xe),
+                ArgValue::Ptr(order),
+                ArgValue::Ptr(offsets),
+                ArgValue::Ptr(work),
+                ArgValue::Ptr(codes),
+                ArgValue::Ptr(atoms),
+                y.arg(),
+                act_div.arg(),
+                n.arg(),
+                stated(OP, x.width)?.arg(),
+                stated(OP, experts)?.arg(),
+            ],
+        );
+    }
     if hopper_wgmma() {
         let slice: u32 = if per <= 16 { 32 } else { 64 };
         let RouteOrder {
@@ -454,6 +528,58 @@ pub fn matmul_fp8_w8a8(
     )
 }
 
+/// [`matmul_fp8_w8a8`] for a prefill's rows on an Ada: the routed select's
+/// 256x128 tiles over the rows in order (W8A8, as SGLang runs a block-FP8
+/// plane there). `Ok(false)` elsewhere, or for a shape it does not take.
+#[cfg(feature = "cuda")]
+pub fn matmul_fp8_w8a8_wide(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: u64,
+    atoms: u64,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.matmul_fp8_w8a8_wide";
+    if crate::jit::cache::arch() != Some("sm_89")
+        || x.rows == 0
+        || !fp8_w8a8_takes(x, y.width)
+        || !y.width.is_multiple_of(256)
+        || y.rows != x.rows
+        || y.dtype != Dtype::Bf16
+    {
+        return Ok(false);
+    }
+    let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            SELECT_SM80,
+            "::pie::linear::moe_select_fp8a8_wide<0, true>",
+        ))
+        .apply(
+            Launch::grid([x.rows.div_ceil(128), y.width / 256, 1], [256, 1, 1])
+                .smem(2 * (256 + 128) * 128),
+        ),
+        &[
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xe),
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            y.arg(),
+            1i32.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, x.width)?.arg(),
+            stated(OP, x.rows)?.arg(),
+            0f32.arg(),
+            1f32.arg(),
+        ],
+    )?;
+    Ok(true)
+}
+
 /// Three stages of 128 weight rows and 8 nb route rows, each a 128-code K
 /// step padded by 16 bytes (`kFp8a8Stages`).
 #[cfg(feature = "cuda")]
@@ -481,7 +607,7 @@ pub fn select_fp8_w8a16(
     glu: Option<crate::linear::gemm_sm100::Glu>,
 ) -> Result<(), Error> {
     const THREADS: u32 = 128;
-    const DEPTH: u32 = 4;
+    let depth = ctx.tuning().fp8_mma_depth;
     let fan = selected(op, x, routes, y)?;
     if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
         return Err(refuse(op, "a W8A16 select reads and lands bf16 rows"));
@@ -517,7 +643,7 @@ pub fn select_fp8_w8a16(
         y,
         glu.is_some(),
         fan.route_count >= FP8_GEMM_FROM,
-        4,
+        ctx.tuning().fp8_mma_fill,
     )?;
     let fire = if tiled {
         // Three stages of 64 routes' activations and 128 rows' codes, 64 of
@@ -536,7 +662,7 @@ pub fn select_fp8_w8a16(
     } else {
         let cols = if glu.is_some() { 64 } else { 64 * tiles };
         Fire::at(kernel(SELECT_SM80, &format!(
-                "::pie::linear::moe_select_fp8_mma<{nb}, {DEPTH}, {code}, {gran}, {tiles}, {ksplit}>"
+                "::pie::linear::moe_select_fp8_mma<{nb}, {depth}, {code}, {gran}, {tiles}, {ksplit}>"
             )))
         .apply(Launch::grid(
             [order.work_cap, y.width.div_ceil(cols), 1],
