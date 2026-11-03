@@ -254,6 +254,7 @@ async fn acquire_grant<C: FireContext>(
     };
     if windowed {
         if let Some(grant) = planner.grant_now(pid, demand) {
+            planner.note_peak(pid, demand);
             return Ok(Some(grant));
         }
         // The tail may hold this frame's earlier slots, which fire only once

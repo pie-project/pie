@@ -32,6 +32,10 @@ const MAX_ROUTES: u32 = 1028;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Elem {
     Bf16,
+    /// fp16: a W4A16 MXFP4 select's activations, its e2m1 weights under their
+    /// power-of-two scales landing in fp16 exactly as in bf16 (one convert a
+    /// pair, where bf16 takes byte permutes).
+    F16,
     /// fp8 e4m3, one a byte.
     E4m3,
     /// fp4 e2m1, two a byte, the even element in the low nibble.
@@ -133,7 +137,8 @@ enum Kind {
     Nvf4,
     /// W4A16: bf16 activations against 4-bit weights the kernel dequantizes
     /// to bf16 (1: e2m1 under ue8m0 a 32, mxfp4; 2: e2m1 under e4m3 a 16,
-    /// nvfp4; 3: affine u4, bf16 scale and zero a group).
+    /// nvfp4; 3: affine u4, bf16 scale and zero a group; 4: as 1 against
+    /// fp16 activations, dequantized to fp16).
     Mixed(u32),
 }
 
@@ -170,6 +175,7 @@ impl Kind {
         match (act.elem, w.elem, gran(act), gran(w)) {
             (Elem::Bf16, Elem::Bf16, None, None) => Ok(Self::Bf16),
             (Elem::Bf16, Elem::E2m1, None, Some(32)) => Ok(Self::Mixed(1)),
+            (Elem::F16, Elem::E2m1, None, Some(32)) => Ok(Self::Mixed(4)),
             (Elem::Bf16, Elem::E2m1, None, Some(16)) => Ok(Self::Mixed(2)),
             (Elem::Bf16, Elem::U4, None, Some(32 | 64 | 128)) => Ok(Self::Mixed(3)),
             (Elem::E4m3, Elem::E4m3, None, None) => Ok(Self::Fp8),
@@ -190,6 +196,7 @@ impl Kind {
     /// The instruction descriptor's format code for one side.
     const fn format(self, elem: Elem) -> u32 {
         match (self, elem) {
+            (Self::Mixed(4), _) => 0,
             (Self::Bf16 | Self::Mixed(_), _) | (Self::Nvf4, _) => 1,
             (_, Elem::E2m1) => 5,
             _ => 0,
@@ -776,7 +783,23 @@ pub fn grouped_gemm_epi(
     routed: u32,
 ) -> Result<(), Error> {
     let sms = ctx.multiprocessors().unwrap_or(148);
-    let plan = Plan::grouped(&g, n, k, routed, sms);
+    let mut plan = Plan::grouped(&g, n, k, routed, sms);
+    // An fp16 W4A16 GLU fire of 64 routes an expert or fewer runs in 64-row
+    // Q tiles: an expert's rows fill one, where a 128-row tile ran half
+    // empty (gpt-oss-20b c512 on a B200, measured).
+    if matches!(Kind::of(act, w), Ok(Kind::Mixed(4)))
+        && matches!(g.groups, Groups::Contiguous { .. })
+        && routed <= 64 * g.experts
+        && epi.glu.is_some()
+    {
+        plan = Plan {
+            swap: true,
+            pair: false,
+            bn: 64,
+            stages: 0,
+            splits: 1,
+        };
+    }
     grouped_gemm_epi_with(ctx, act, w, y, g, [n, k], alpha, epi, plan)
 }
 
@@ -1353,6 +1376,7 @@ fn tensor_map(
     }
     let (ty, inner, stride, box_k) = match (kind, o.elem) {
         (_, Elem::Bf16) => (T::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, k, u64::from(k) * 2, 64),
+        (_, Elem::F16) => (T::CU_TENSOR_MAP_DATA_TYPE_FLOAT16, k, u64::from(k) * 2, 64),
         (_, Elem::E4m3) => (T::CU_TENSOR_MAP_DATA_TYPE_UINT8, k, u64::from(k), 128),
         (Kind::Nvf4, Elem::E2m1) => (
             T::CU_TENSOR_MAP_DATA_TYPE_UINT8,

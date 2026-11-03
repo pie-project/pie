@@ -255,6 +255,7 @@ pub fn select_bf16_held(
                 ArgValue::Ptr(order.offsets),
                 ArgValue::Ptr(order.work),
                 ArgValue::Ptr(bank),
+                ArgValue::Ptr(0),
                 y.arg(),
                 act_div.arg(),
                 n.arg(),
@@ -267,12 +268,15 @@ pub fn select_bf16_held(
         )?;
         return Ok(true);
     }
+    // A prefill's experts averaging the wide tile's routes lay their order in
+    // its 128-route slices once, kept for the down select.
+    let wide = fan.route_count.div_ceil(experts) >= ctx.tuning().bf16_wide_from.max(128);
     let SelectPlan {
         nb,
         tiled,
         tiles,
         ksplit,
-        mut order,
+        order,
     } = select_plan(
         ctx,
         op,
@@ -285,6 +289,7 @@ pub fn select_bf16_held(
         // bf16 codes stream twice an fp8 bank's bytes: deeper K splits keep
         // more of them in flight (Hy4's decode +2%).
         8,
+        wide.then_some(128),
     )?;
     if relu2 && !tiled {
         return Ok(false);
@@ -292,17 +297,10 @@ pub fn select_bf16_held(
     let fire = if tiled {
         // Three stages of 64 routes' and 128 rows' 64 of K, four warps a
         // CTA each 32 routes by 64 rows: two CTAs an SM.
-        const STAGES: u32 = 3;
+        let stages = ctx.tuning().bf16_gemm_stages.clamp(2, 4);
         const WN: u32 = 2;
         let cols = if glu.is_some() { 64 } else { 128 };
-        let bm: u32 = if fan.route_count.div_ceil(experts) >= 128 {
-            128
-        } else {
-            64
-        };
-        if bm != 64 {
-            order = route_order_sliced(ctx, op, routes, &fan, experts, bm, true, Share::No)?;
-        }
+        let bm: u32 = if wide { 128 } else { 64 };
         if bm == 128 {
             let cols = if glu.is_some() { 128 } else { 256 };
             Fire::at(kernel(
@@ -316,11 +314,11 @@ pub fn select_bf16_held(
         } else {
             Fire::at(kernel(
                 SELECT_SM80,
-                &format!("::pie::linear::moe_select_bf16_gemm<{STAGES}, {code}, {WN}, {bm}>"),
+                &format!("::pie::linear::moe_select_bf16_gemm<{stages}, {code}, {WN}, {bm}>"),
             ))
             .apply(
                 Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [bm * WN, 1, 1])
-                    .smem(STAGES * (bm + 128) * 128),
+                    .smem(stages * (bm + 128) * 128),
             )
         }
     } else {
@@ -345,6 +343,89 @@ pub fn select_bf16_held(
             ArgValue::Ptr(order.offsets),
             ArgValue::Ptr(order.work),
             ArgValue::Ptr(bank),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+            inter.arg(),
+            limit.arg(),
+            alpha.arg(),
+        ],
+    )?;
+    Ok(true)
+}
+
+/// A wide fire of a bf16-activation MXFP4 select on Hopper, read from its
+/// bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`, each value exactly the
+/// code times its block's scale) on the warp-specialized wgmma GEMM, the
+/// expert bias and the GLU in its epilogue. `Ok(false)` for a fire it does
+/// not take: the caller reads the MXFP4 bank.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn select_bf16_copy(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    bank: u64,
+    experts: u32,
+    bias: Option<Tensor>,
+    routes: Tensor,
+    y: &mut Tensor,
+    glu: Option<crate::linear::gemm_sm100::Glu>,
+) -> Result<bool, Error> {
+    const STAGES: u32 = 4;
+    let fan = selected(op, x, routes, y)?;
+    if !hopper_wgmma()
+        || x.dtype != Dtype::Bf16
+        || y.dtype != Dtype::Bf16
+        || !x.width.is_multiple_of(64)
+        || !bank.is_multiple_of(16)
+        || fan.route_count < ctx.tuning().mxfp4_bf16_from.max(1)
+        || bias.is_some_and(|b| b.dtype != Dtype::Bf16)
+        || matches!(glu, Some(crate::linear::gemm_sm100::Glu::Relu2))
+    {
+        return Ok(false);
+    }
+    let (code, limit, alpha) = glu_code(op, glu)?;
+    let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
+    let experts = experts.clamp(1, EXPERT_CAP);
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
+    let inter = stated(op, y.width)?;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let order = route_order_sliced(
+        ctx,
+        op,
+        routes,
+        &fan,
+        experts,
+        128,
+        true,
+        if glu.is_some() || KEEP_NEXT.with(core::cell::Cell::get) {
+            Share::Keep
+        } else {
+            Share::Take
+        },
+    )?;
+    let cols = if glu.is_some() { 128 } else { 256 };
+    ctx.fire(
+        op,
+        Fire::at(kernel(
+            SELECT_SM90,
+            &format!("::pie::linear::moe_select_bf16_wsgemm<{STAGES}, {code}>"),
+        ))
+        .apply(
+            Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [384, 1, 1])
+                .smem(STAGES * 49152 + 1024 + 128),
+        ),
+        &[
+            x.arg(),
+            ArgValue::Ptr(order.order),
+            ArgValue::Ptr(order.offsets),
+            ArgValue::Ptr(order.work),
+            ArgValue::Ptr(bank),
+            ArgValue::Ptr(bias.map_or(0, |b| b.ptr)),
             y.arg(),
             act_div.arg(),
             n.arg(),

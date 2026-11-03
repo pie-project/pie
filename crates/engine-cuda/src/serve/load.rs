@@ -698,10 +698,16 @@ impl Shell {
         if device.ctx().tuning().fp8_o_down && kernels_cuda::linear::gemm_sm100::supported() {
             weights.requantize_grouped(&boot.trace, device.stream())?;
         }
-        // `kernel.gemm.fp8_shadow`: block-FP8 dense planes keep a bf16 copy.
+        // `kernel.gemm.fp8_shadow`: block-FP8 dense planes keep a bf16 copy;
+        // without it, where the FP8 MMA reads 128x128 blocks, the planes whose
+        // rows carry their own exponents do.
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().gemm_fp8_shadow && !kernels_cuda::linear::gemm_sm100::supported() {
-            weights.shadow_fp8_dense(&boot.trace, device.stream())?;
+        if !kernels_cuda::linear::gemm_sm100::supported()
+            && (device.ctx().tuning().gemm_fp8_shadow
+                || kernels_cuda::linear::moe::fp8_w8a8_capable())
+        {
+            let mixed = !device.ctx().tuning().gemm_fp8_shadow;
+            weights.shadow_fp8_dense(&boot.trace, device.stream(), mixed)?;
         }
         // `kernel.gemm.fp8_mx`: block-FP8 dense planes keep 1x32 exponents.
         #[cfg(feature = "cuda")]
@@ -715,6 +721,18 @@ impl Shell {
             && kernels_cuda::linear::moe::fp8_w8a8_capable()
         {
             weights.shadow_mxfp4_banks(&boot.trace, device.stream())?;
+        }
+        // `kernel.moe.mxfp4_bf16_from`: MXFP4 banks keep a bf16 copy on Hopper.
+        #[cfg(feature = "cuda")]
+        if device.ctx().tuning().mxfp4_bf16_from > 0
+            && kernels_cuda::jit::cache::arch() == Some("sm_90")
+        {
+            weights.copy_mxfp4_banks_bf16(
+                &boot.trace,
+                device.stream(),
+                device.ctx().tuning().mxfp4_bf16_down,
+                device.ctx().tuning().mxfp4_bf16_keep,
+            )?;
         }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -1040,6 +1058,7 @@ impl Shell {
             copies: engine.copies,
             one_frame_when_short: engine.one_frame_when_short,
             seated_first: engine.seated_first,
+            seat_to_end: engine.seat_to_end,
             prefill_lanes: engine.prefill_lanes,
             pad: engine.recording.pad(),
             golden_arm: Golden::Off,

@@ -465,16 +465,29 @@ __global__ void __launch_bounds__(128) quantize_rows_e4m3b128_lt(
 /// A 128x128-block FP8 plane's exponents (in tcgen05's atoms, a weight row an
 /// atom row) as cuBLASLt's `BLK128x128_32F` A scales: an f32 a block at
 /// `out[nb * kbp + kb]`, `kbp` the K blocks rounded up to four (the padding
-/// zero). One thread a slot of `n / 128` x `kbp`.
+/// zero). One thread a slot of `n / 128` x `kbp`. A block whose 128 rows
+/// carry other exponents (rows laid out of their checkpoint blocks, MiMo's
+/// 192-row heads) sets `mixed`: no 128x128 scale reads it.
 __global__ void __launch_bounds__(256) fp8b128_atoms_to_lt(
-    const u8* __restrict__ atoms, float* __restrict__ out, int n, int k)
+    const u8* __restrict__ atoms, float* __restrict__ out, int n, int k, int* __restrict__ mixed)
 {
     const int blocks = k / 128;
     const int kbp = (blocks + 3) / 4 * 4;
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= (n / 128) * kbp) return;
     const int nb = i / kbp, kb = i % kbp;
-    out[i] = kb < blocks ? gfp8::exp2_biased(atoms[atom_offset(nb * 128, kb, blocks)]) : 0.f;
+    if (kb >= blocks) {
+        out[i] = 0.f;
+        return;
+    }
+    const u8 first = atoms[atom_offset(nb * 128, kb, blocks)];
+    for (int r = 1; r < 128; ++r) {
+        if (atoms[atom_offset(nb * 128 + r, kb, blocks)] != first) {
+            atomicOr(mixed, 1);
+            break;
+        }
+    }
+    out[i] = gfp8::exp2_biased(first);
 }
 
 struct fp8_e4m3 {

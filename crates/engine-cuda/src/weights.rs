@@ -1145,12 +1145,15 @@ impl Weights {
 
     /// `kernel.gemm.fp8_shadow`: each block-FP8 dense projection read at
     /// bf16 activations keeps a bf16 copy, widened once here, that a
-    /// batch's rows read on cuBLAS. Returns the planes it widened.
+    /// batch's rows read on cuBLAS. With `mixed` only the planes whose
+    /// 128-row blocks carry other exponents (MiMo's 192-row heads), which
+    /// no 128x128-block GEMM reads. Returns the planes it widened.
     #[cfg(feature = "cuda")]
     pub fn shadow_fp8_dense(
         &mut self,
         trace: &Trace,
         stream: *mut core::ffi::c_void,
+        mixed: bool,
     ) -> Result<u32> {
         use poem_ir::{Def, Linear, Operation};
         let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
@@ -1189,6 +1192,17 @@ impl Weights {
             }
             let (n, k) = (codes.rows, codes.width);
             let gran = k.div_ceil(atoms.width);
+            if mixed
+                && (gran != 128
+                    || kernels_cuda::linear::gemm::cublas_lt_fp8::rows_share_blocks(
+                        "linear.fp8_shadow",
+                        atoms.ptr,
+                        n,
+                        k,
+                    )?)
+            {
+                continue;
+            }
             let bytes = u64::from(n) * u64::from(k) * 2;
             if bytes > budget {
                 continue;
@@ -1331,12 +1345,13 @@ impl Weights {
     ) -> Result<u32> {
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
-        // Only banks whose selects quantize their rows in 1x128 blocks, the copy's.
+        // Only banks whose selects quantize their rows to e4m3, in 1x128 blocks
+        // (the copy's) or 1x32 (MXFP8, which the copy's selects read at 1x128).
         use poem_ir::{ActQuant, Def, Fused, Linear, Operation};
         let w128 = |op: &Linear| match op {
             Linear::MoeSelect {
                 bank,
-                quant: Some(ActQuant::E4m3 { gran: 128 }),
+                quant: Some(ActQuant::E4m3 { gran: 32 | 128 }),
                 ..
             } => Some(*bank),
             _ => None,
@@ -1387,7 +1402,7 @@ impl Weights {
                 || crate::device::alloc::is_host_pointer(scales.ptr)
                 || rows == 0
                 || !rows.is_multiple_of(128)
-                || !k.is_multiple_of(512)
+                || !k.is_multiple_of(128)
             {
                 continue;
             }
@@ -1418,6 +1433,133 @@ impl Weights {
                         to32(k / 128),
                         Dtype::U8,
                     ),
+                ),
+            );
+            self.decoded.push(buffer);
+            done += 1;
+        }
+        Ok(done)
+    }
+
+    /// `kernel.moe.mxfp4_bf16_from`: each resident MXFP4 bank a bf16-activation
+    /// select reads keeps a bf16 copy, widened once here (each value exactly),
+    /// that wide selects read on Hopper's wgmma GEMM. Returns the banks it widened.
+    #[cfg(feature = "cuda")]
+    pub fn copy_mxfp4_banks_bf16(
+        &mut self,
+        trace: &Trace,
+        stream: *mut core::ffi::c_void,
+        down_too: bool,
+        keep_percent: u32,
+    ) -> Result<u32> {
+        // SAFETY: `stream` is the load's stream, live for the load.
+        let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+        use poem_ir::{Def, Fused, Linear, Operation};
+        // A bf16-activation select's bank, or one whose release quantizes its rows: Hopper has no
+        // tcgen05 GEMM, and reads those against bf16 rows too (`select_a16`).
+        let a16 = |op: &Linear| match op {
+            Linear::MoeSelect { bank, .. } => Some(*bank),
+            _ => None,
+        };
+        // A select whose product a GLU reads is a gate-up leg; the rest are
+        // down legs, copied only where the profile says (`kernel.moe.mxfp4_bf16_down`).
+        let glu_in: std::collections::BTreeSet<_> = trace
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.op {
+                Operation::Linear(Linear::Glu {
+                    packed: Some(p), ..
+                }) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        let gate_up = |op: &Linear| match op {
+            Linear::MoeSelect { y, .. } => down_too || glu_in.contains(y),
+            _ => false,
+        };
+        let mut read = std::collections::BTreeSet::new();
+        for node in &trace.nodes {
+            let ws: Vec<_> = match &node.op {
+                Operation::Linear(op) if gate_up(op) => a16(op).into_iter().collect(),
+                Operation::Linear(_) => continue,
+                Operation::Fused(
+                    Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
+                ) => [a16(select), if down_too { a16(down) } else { None }]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+                Operation::Fused(Fused::MoeSelectGlu { select, .. }) => {
+                    a16(select).into_iter().collect()
+                }
+                _ => continue,
+            };
+            for w in ws {
+                if let Some(Def::Weight(at)) = trace.values.get(w.0 as usize).map(|v| &v.def) {
+                    read.insert(*at as usize);
+                }
+            }
+        }
+        // A bank's planes, rows and K where it takes a copy.
+        let candidate = |at: usize| {
+            if trace.params[at].dtype != Dtype::Mxfp4 || self.table.3.contains_key(&at) {
+                return None;
+            }
+            let Some(Some(WeightRow::Planes {
+                codes,
+                scales,
+                seat,
+                atoms: false,
+                lanes: false,
+                ..
+            })) = self.table.0.get(at).copied()
+            else {
+                return None;
+            };
+            // An MXFP4 plane is `[experts, rows, blocks, 16]` bytes.
+            let shape = &trace.params[at].shape;
+            if shape.len() < 3 {
+                return None;
+            }
+            let rows: u64 = shape[..shape.len() - 2].iter().product();
+            let k = shape[shape.len() - 2] * 32;
+            if seat.streams()
+                || crate::device::alloc::is_host_pointer(codes.ptr)
+                || crate::device::alloc::is_host_pointer(scales.ptr)
+                || rows == 0
+                || !k.is_multiple_of(64)
+            {
+                return None;
+            }
+            Some((at, codes, scales, rows, k))
+        };
+        let picked: Vec<_> = read.into_iter().filter_map(candidate).collect();
+        // Every copy or none: they leave `kernel.moe.mxfp4_bf16_keep` percent
+        // of the free memory to the cache rows, or the banks stay MXFP4.
+        let total: u64 = picked.iter().map(|&(_, _, _, rows, k)| rows * k * 2).sum();
+        if keep_percent > 0
+            && crate::device::alloc::free_bytes()
+                .is_none_or(|free| free - free.min(total) < free / 100 * u64::from(keep_percent))
+        {
+            return Ok(0);
+        }
+        let mut done = 0;
+        for (at, codes, scales, rows, k) in picked {
+            let to32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+            let buffer = Buffer::zeroed_on(stream, (rows * k * 2) as usize)?;
+            kernels_cuda::linear::moe::mxfp4_to_bf16(
+                &ctx,
+                codes.ptr,
+                scales.ptr,
+                to32(rows),
+                to32(k),
+                buffer.ptr(),
+            )?;
+            crate::device::ctx::sync(stream)?;
+            self.table.3.insert(
+                at,
+                (
+                    Tensor::new(buffer.ptr(), codes.rows, to32(k), Dtype::Bf16),
+                    Tensor::new(0, 0, 0, Dtype::U8),
                 ),
             );
             self.decoded.push(buffer);

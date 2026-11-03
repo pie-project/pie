@@ -28,12 +28,20 @@ pub fn default_config_content() -> Result<String> {
         );
     };
     let model_block: &str = DEFAULT_MODEL_BLOCK;
-    Ok(format!("{HEADER}{model_block}{engine_block}{TAIL}"))
+    let frames: &str = match flavor {
+        #[cfg(feature = "cerebras")]
+        Some(flavor::Flavor::Cerebras) => CEREBRAS_FRAMES,
+        #[allow(unreachable_patterns)]
+        _ => DEFAULT_FRAMES,
+    };
+    Ok(format!(
+        "{HEADER}{model_block}{engine_block}{RUNTIME}{frames}{TAIL}"
+    ))
 }
 
 #[cfg(test)]
 pub(crate) fn config_content_with_any_engine() -> String {
-    format!("{HEADER}{DEFAULT_MODEL_BLOCK}{CUDA_ENGINE_BLOCK}{TAIL}")
+    format!("{HEADER}{DEFAULT_MODEL_BLOCK}{CUDA_ENGINE_BLOCK}{RUNTIME}{DEFAULT_FRAMES}{TAIL}")
 }
 
 const HEADER: &str = r#"# Pie configuration, written by `pie config init`. Edit freely.
@@ -73,15 +81,28 @@ source = "Qwen/Qwen3.5-0.8B"
 # disk_kv_persistent   = false    # keep the disk tier as cache for the next run
 "#;
 
-const TAIL: &str = r#"
+const RUNTIME: &str = r#"
 [runtime]
 # Batching and timeouts. Every default here is measured; `pie config list`
 # carries the reasoning.
 # submit_deadline          = "50ms"
 # silence_timeout          = "30s"
-# frame_size               = 2     # guest contract: the submit depth is
+"#;
+
+const DEFAULT_FRAMES: &str = r#"# frame_size               = 2     # guest contract: the submit depth is
 # frame_dispatch_depth     = 2     # derived from it, not a key of its own
-# max_concurrent_processes = 64    # omit: from the engine's max_forward_requests
+"#;
+
+// The wafer's token loops answer each lane as far as its guest has posted:
+// at the runtime's most (4 steps a frame, 15 frames) every lane keeps posted
+// past a loop's end, so each continuation carries every lane (the 8B pipeline
+// ring's 12 streams, 12 lanes a launch; at 2 and 2 or 2 and 15, fewer).
+#[cfg(any(feature = "cerebras", test))]
+const CEREBRAS_FRAMES: &str = r#"frame_size               = 4     # the most: each lane posts this far
+frame_dispatch_depth     = 15    # ahead, so every lane rides each wafer loop
+"#;
+
+const TAIL: &str = r#"# max_concurrent_processes = 64    # omit: from the engine's max_forward_requests
 # worker_policy            = "noop"  # a PLEX worker policy: built-in name or .wasm path
 
 [sandbox]
@@ -244,23 +265,40 @@ mod tests {
     }
 
     fn the_vulkan_block_states_only_keys_the_engine_declares() {
-        let content = format!("{HEADER}{DEFAULT_MODEL_BLOCK}{VULKAN_ENGINE_BLOCK}{TAIL}");
+        let content = format!(
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{VULKAN_ENGINE_BLOCK}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+        );
         worker::Config::parse(&content).expect("the vulkan template must parse");
     }
 
     fn the_wgpu_block_states_only_keys_the_engine_declares() {
-        let content = format!("{HEADER}{DEFAULT_MODEL_BLOCK}{WGPU_ENGINE_BLOCK}{TAIL}");
+        let content = format!(
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{WGPU_ENGINE_BLOCK}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+        );
         worker::Config::parse(&content).expect("the wgpu template must parse");
     }
 
     fn the_xla_block_states_only_keys_the_engine_declares() {
-        let content = format!("{HEADER}{DEFAULT_MODEL_BLOCK}{XLA_ENGINE_BLOCK}{TAIL}");
+        let content = format!(
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{XLA_ENGINE_BLOCK}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+        );
         worker::Config::parse(&content).expect("the xla template must parse");
     }
 
     fn the_cerebras_block_states_only_keys_the_engine_declares() {
-        let content = format!("{HEADER}{DEFAULT_MODEL_BLOCK}{CEREBRAS_ENGINE_BLOCK}{TAIL}");
-        worker::Config::parse(&content).expect("the cerebras template must parse");
+        let content = format!(
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{CEREBRAS_ENGINE_BLOCK}{RUNTIME}{CEREBRAS_FRAMES}{TAIL}"
+        );
+        let config = worker::Config::parse(&content).expect("the cerebras template must parse");
+        // The runtime's most (`Runahead::STEPS_MAX`, `MAX_FRAMES`), which the
+        // worker's boot advises for cerebras.
+        assert_eq!(
+            (
+                config.runtime.frame_size,
+                config.runtime.frame_dispatch_depth
+            ),
+            (4, 15)
+        );
     }
 
     fn a_binary_with_an_engine_writes_a_config_that_parses() {

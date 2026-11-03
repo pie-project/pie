@@ -13,12 +13,62 @@ qmm.split_warps_per_sm = 80  # 2.3% faster end to end
 ssm.gdn_scan_until = 48  # 1.9% faster end to end
 sdpa.index_mma = true
 sdpa.index_radix = true
+# a paged decode of a group of at most eight query heads on the tensor-core kernel, as the B200:
+# gemma-4-E4B c512 22.0k -> 23.6k tok/s, single-request decode 249 -> 253 tok/s
+sdpa.decode.gqa = true
+# from groups of two query heads a KV head: MiniMax's single-head groups read slower so
+# (MiniMax-M3.1-Flash mini60 raw decode 77.9 at every group, 86.4 off, 93.9 from two)
+sdpa.decode.gqa_min_group = 2
+# MXFP4 banks kept as an exact bf16 copy, read past 1024 routes a fire by the warp-specialized wgmma
+# GEMM as on the H100, the down banks too, all copies or none, leaving a quarter of the free memory to the
+# cache rows (MiMo-V2.6 mini48's 87 GB keep their MXFP4 banks):
+# gpt-oss-20b pf64-512 51.5k -> 65.2k, c1024 19.2k -> 22.6k, raw prefill 23.2k -> 28.2k tok/s
+moe.mxfp4_bf16_from = 1024
+moe.mxfp4_bf16_down = true
+moe.mxfp4_bf16_keep = 25
+# block-FP8 selects of 64 routes an expert and more on the warp-specialized wgmma GEMM:
+# GLM-5.3 mini78 pf16-512 4.06k -> 6.04k, c1024 2.42k -> 3.49k, raw prefill 3.42k -> 4.67k tok/s
+moe.fp8a8_ws_from = 64
+# a decode's W8A16 block-FP8 select split toward 16 CTAs' warps an SM: GLM-5.3 mini78 raw decode 45 -> 50 tok/s
+moe.fp8_mma_fill = 16
+# and two chunks in flight a warp, not four (fewer registers, more warps an SM): GLM-5.3 mini78 raw decode
+# 50.5 -> 55.3 tok/s, greedy tokens unchanged (6/6 raw prompts)
+moe.fp8_mma_depth = 2
+# GLM-5.3's DSA attention 64 heads a CTA on wgmma, not the 16-head mma.sync kernel:
+# mini78 pf16-512 6.06k -> 6.89k, c1024 3.47k -> 3.85k, raw prefill 4.82k -> 5.17k tok/s, parity KL 0.0153 -> 0.0160
+sdpa.mla_wgmma = true
+# from 64 rows: a decode's few rows split wider on the 16-head kernel (GLM-5.3 raw decode 54.1 -> 55.3 tok/s)
+sdpa.mla_wgmma_rows = 64
+# NVFP4 experts on the register-dequant wgmma select past 16 routes (as the H100), two warpgroups on
+# 128-route slices from 128 routes an expert, and a fire's working set up to 70% of the memory past the
+# weights (at the default half MiniMax's fires were cut to 1024 tokens and 256 lanes):
+# MiniMax-M3.1-Flash mini60 pf32-512 6.18k -> 10.2k, c512 2.32k -> 3.0k tok/s, raw prefill and decode unchanged
+moe.nvfp4_mma_from = 17
+moe.nvfp4_mma_until = 65536
+moe.nvfp4_wide_from = 128
 
 [engine]
 prefill_lattice_from = 192  # 2.0% faster end to end
+working_set_percent = 70
+# fires of 16384 rows, not 8192, as the B200: Qwen3.6-35B-A3B pf32-512 54.5k -> 57.6k, Qwen3-0.6B pf128-512
+# 406k -> 419k, gemma-4-26B-A4B pf64-512 52.5k -> 54.1k, MiniMax mini60 pf32-512 10.2k -> 10.4k tok/s;
+# Qwen3.6 c512 12.6k -> 12.8k, gemma-4-26B-A4B c1024 14.1k -> 14.6k
+forward_tokens = 16384
 # two recurrent-state slots a lane, so a hybrid trunk seats past the fixed 256, as on the RTX PRO 6000:
 # Qwen3.8-Flash-Next mini c512 54.4k -> 65.8k tok/s, single-stream greedy tokens unchanged
 state_slots_per_lane = 2
+# a Gemma-4 process starts only while the pools hold the started ones to the end, a decoding lane's pages
+# before a waiting prompt's, the windowed ring a page a lane past its kv pages, as on the RTX PRO 6000:
+# gemma-4-26b-a4b c1024 10.7k -> 12.7k tok/s, single-request decode 264 -> 279 tok/s
+seated_first = true
+seat_to_end = true
+window_spare = true
+
+[compiler]
+# independent chains on side streams, as on the H100
+branches = true
+dag_streams = true
+dag_streams_until = 256
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 26.2 -> 26.2 ms, 1-lane step 3.06 -> 2.87 ms, 4-lane step 5.16 -> 4.85 ms, 8-lane step 6.21 -> 6.12 ms, readout cosine 1.0000"

@@ -865,6 +865,18 @@ impl KvPageTable {
         keys
     }
 
+    /// Every sealed page's key, repeats kept: a copy taken under the kv lock
+    /// that the caller hashes after letting it go.
+    pub fn sealed_key_list(&self) -> Vec<Hash256> {
+        let mut keys = Vec::new();
+        for (_, node) in self.nodes.iter() {
+            if let Pages::Owned { page_hashes, .. } = &node.pages {
+                keys.extend(page_hashes.iter().flatten().copied());
+            }
+        }
+        keys
+    }
+
     /// A node of sealed pages that came from elsewhere. Grafted `after` the
     /// page it extends, a pass that maps the prefix maps it too: attaching
     /// takes the trie path to a run's last page. With no `after` it starts a
@@ -1897,12 +1909,23 @@ impl KvPageTable {
         // the pages some selection takes, and its other pages go.
         let (children, kept) = {
             let n = self.nodes.get(owner).expect("live node");
-            if !matches!(n.pages, Pages::Owned { .. }) || n.children.is_empty() {
+            let Pages::Owned { backings, .. } = &n.pages else {
+                return Vec::new();
+            };
+            if n.children.is_empty() {
                 return Vec::new();
             }
+            let len = backings.len();
             let mut taken = Vec::new();
             for &child in &n.children {
                 match &self.nodes.get(child).expect("live child").pages {
+                    // A selection of every page keeps them all: nothing goes,
+                    // and a shared prefix of thousands of children asks no more.
+                    Pages::ParentSelection { runs }
+                        if runs.iter().any(|r| r.start == 0 && r.end as usize >= len) =>
+                    {
+                        return Vec::new();
+                    }
                     Pages::ParentSelection { runs } => taken.extend(runs.iter().cloned()),
                     Pages::Owned { .. } => return Vec::new(),
                 }

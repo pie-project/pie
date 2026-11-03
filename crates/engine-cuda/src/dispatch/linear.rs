@@ -1209,6 +1209,23 @@ impl Run<'_> {
                 ..
             } => {
                 let (codes, scales, affine, seat) = self.planes(*bank);
+                // A wide fire on the bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
+                #[cfg(feature = "cuda")]
+                if let Some(copy) = self.mxfp4_bf16_bank(*bank)
+                    && linear::moe::select_bf16_copy(
+                        self.ctx(),
+                        "linear.moe_select",
+                        self.tensor(*x),
+                        copy.ptr,
+                        codes.rows,
+                        Some(self.tensor(*bias)),
+                        self.tensor(*routes),
+                        &mut self.tensor(*y),
+                        None,
+                    )?
+                {
+                    return Ok(());
+                }
                 if codes.dtype == Dtype::Nvfp4 {
                     return Err(kernels_cuda::Error::Backend {
                         op: "linear.moe_select",
@@ -1334,7 +1351,7 @@ impl Run<'_> {
                 y: sy,
                 bias: None,
                 quantized: true,
-                quant: Some(ActQuant::E4m3 { gran: 128 }),
+                quant: Some(ActQuant::E4m3 { gran: 32 | 128 }),
                 ..
             },
             Linear::Glu {
@@ -1448,6 +1465,36 @@ impl Run<'_> {
             ),
             _ => return Ok(false),
         };
+        // A wide fire on an MXFP4 bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
+        if let Linear::MoeSelect {
+            x: cx,
+            bank: cb,
+            bias: cbias,
+            routes: cr,
+            y: csy,
+            quant: None,
+            ..
+        } = *select
+            && csy == packed
+            && let Some(copy) = self.mxfp4_bf16_bank(cb)
+        {
+            let experts = self.planes(cb).0.rows;
+            let bias = cbias.map(|b| self.tensor(b));
+            let (x, routes, mut out) = (self.tensor(cx), self.tensor(cr), self.tensor(y));
+            if linear::moe::select_bf16_copy(
+                self.ctx(),
+                "fused.moe_select_glu",
+                x,
+                copy.ptr,
+                experts,
+                bias,
+                routes,
+                &mut out,
+                Some(glu),
+            )? {
+                return Ok(true);
+            }
+        }
         let Some((x, routes, sy, bank, experts)) = self.routed_bank(select) else {
             return Ok(false);
         };
@@ -1917,6 +1964,24 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         let (codes, scales, biases, seat) = self.planes(bank);
         let routes = self.tensor(routes);
+        // A wide fire on an MXFP4 bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
+        #[cfg(feature = "cuda")]
+        if biases.is_none()
+            && let Some(copy) = self.mxfp4_bf16_bank(bank)
+            && linear::moe::select_bf16_copy(
+                self.ctx(),
+                "linear.moe_select",
+                x,
+                copy.ptr,
+                codes.rows,
+                None,
+                routes,
+                &mut self.tensor(y),
+                None,
+            )?
+        {
+            return Ok(());
+        }
         per_tensor_e4m3_is_a_table("linear.moe_select", codes)?;
         if codes.dtype == Dtype::Nvfp4 {
             let tensor_scales = tensor_scales("linear.moe_select", biases)?;
@@ -2013,6 +2078,26 @@ impl Run<'_> {
                     self.tensor(routes),
                     &mut self.tensor(y),
                     gran,
+                )?
+            {
+                return Ok(());
+            }
+            // An NVFP4 bank against NVFP4 rows (W4A4), as the release asks,
+            // on the block-scaled mma.sync (`kernel.moe.nvfp4_w4a4_from`).
+            if let ActQuant::Nvfp4 = quant
+                && codes.dtype == Dtype::Nvfp4
+                && let (Some(tensor_scales), Some(input_scales)) = (biases, input_scales)
+                && !seat.streams()
+                && !crate::device::alloc::is_host_pointer(codes.ptr)
+                && linear::moe::select_nvfp4_w4a4(
+                    self.ctx(),
+                    self.tensor(x),
+                    codes,
+                    scales,
+                    tensor_scales,
+                    self.tensor(input_scales),
+                    self.tensor(routes),
+                    &mut self.tensor(y),
                 )?
             {
                 return Ok(());
@@ -2297,12 +2382,28 @@ impl Run<'_> {
         match codes.dtype {
             Dtype::Nvfp4 | Dtype::Mxfp4 | Dtype::U8 => {
                 let x = self.tensor(x);
+                // A wide fire on the bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`), W4A16 as below.
+                if let Some(copy) = self.mxfp4_bf16_bank(bank)
+                    && linear::moe::select_bf16_copy(
+                        self.ctx(),
+                        op,
+                        x,
+                        copy.ptr,
+                        codes.rows,
+                        None,
+                        self.tensor(routes),
+                        &mut self.tensor(y),
+                        None,
+                    )?
+                {
+                    return Ok(());
+                }
                 // A wide fire on the bank's fp8b128 copy, W8A8 (`kernel.moe.mxfp4_fp8_from`).
                 if let Some((fp8, atoms)) = self.mxfp4_fp8_bank(bank) {
                     let route_t = self.tensor(routes);
                     let mut out = self.tensor(y);
                     if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from
-                        && linear::moe::fp8_w8a8_takes(x, out.width)
+                        && linear::moe::fp8_select_takes(x, out.width)
                     {
                         return linear::moe::select_fp8_w8a8(
                             self.ctx(),
@@ -2415,6 +2516,17 @@ impl Run<'_> {
         {
             return Ok(());
         }
+        // A prefill's rows W8A8 on an Ada's wide fp8 tiles, as the
+        // deployment quantizes them (`kernel.gemm.fp8_wide_from`).
+        let wide_from = self.ctx().tuning().gemm_fp8_wide_from;
+        if wide_from > 0
+            && act.rows >= wide_from
+            && atoms.width > 0
+            && act.width == atoms.width * 128
+            && linear::moe::matmul_fp8_w8a8_wide(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)?
+        {
+            return Ok(());
+        }
         // A batch's rows on the plane's bf16 copy (`kernel.gemm.fp8_shadow`).
         if act.rows > linear::w8a16::MMA_UNTIL
             && let Some(shadow) = self.fp8_shadow(w)
@@ -2456,6 +2568,7 @@ impl Run<'_> {
             && linear::moe::FP8_W8A8_DENSE.contains(&act.rows)
             && linear::moe::fp8_w8a8_capable()
             && linear::moe::fp8_w8a8_takes(act, out.width)
+            && linear::gemm::cublas_lt_fp8::rows_share_blocks(op, atoms.ptr, out.width, k)?
         {
             return linear::moe::matmul_fp8_w8a8(self.ctx(), act, codes.ptr, atoms.ptr, &mut out);
         }

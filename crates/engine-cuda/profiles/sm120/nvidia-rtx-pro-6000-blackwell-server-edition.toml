@@ -74,9 +74,14 @@ state_slots_per_lane = 2
 # prompt fires pad to 64 lanes, not the 512 decoding lanes two slots seat: Qwen3.8-Flash-Next mini
 # raw prefill 58.9k -> 68.7k, pf16-512 150.1k -> 160.5k tok/s, c512 unchanged, greedy parity unchanged
 prefill_lanes = 64
-# a Gemma-4 windowed ring a page a lane past its kv pages, which ran dry first and parked lanes at every
-# page: gemma-4-31b c128 663 -> 723, gemma-4-26b c1024 2,777 -> 3,728 tok/s, greedy tokens unchanged
-window_spare = true
+# a Gemma-4 process starts only while the pools hold the started ones to the pages a finished one held,
+# lanes started apart counted as finishing apart, and a decoding lane's pages come before a waiting
+# prompt's, as vLLM queues: lanes no longer park at page boundaries and replay (38 replays a run -> 3).
+# Seated so, a lane holds as many windowed pages as kv pages, so the ring takes no spare page a lane
+# (window_spare, 1,839 ring pages beside 1,711 kv pages on gemma-4-31b): 1,823 of each.
+# gemma-4-31b c128 729 -> 960, gemma-4-26b-a4b c1024 3,906 -> 6,250 tok/s
+seated_first = true
+seat_to_end = true
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"

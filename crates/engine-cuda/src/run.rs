@@ -1996,7 +1996,24 @@ impl<'c> Run<'c> {
         let Def::Weight(w) = &self.values[id.0 as usize].def else {
             return None;
         };
-        self.weights.3.get(&(*w as usize)).copied()
+        self.weights
+            .3
+            .get(&(*w as usize))
+            .copied()
+            .filter(|(c, _)| c.dtype == poem_ir::Dtype::E4m3)
+    }
+
+    /// The bf16 copy an MXFP4 bank keeps (`kernel.moe.mxfp4_bf16_from`).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn mxfp4_bf16_bank(&self, id: ValueId) -> Option<Tensor> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        self.weights
+            .3
+            .get(&(*w as usize))
+            .map(|(c, _)| *c)
+            .filter(|c| c.dtype == poem_ir::Dtype::Bf16)
     }
 
     pub(crate) fn maybe_tiled_planes(

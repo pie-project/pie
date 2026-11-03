@@ -166,6 +166,8 @@ def layout(id, deploy):
     if weights != dtype.bf16:
         fail("{} stores its weights at bf16, not {}".format(id, weights))
     d = DIMS[id]
+    if id != "kimik3" and (deploy.layers or deploy.experts):
+        d = released(deploy.layers or d.layers, deploy.experts or d.moe.experts, d.res_block)
     hidden = d.hidden
     moe_in = d.moe.latent if d.moe.latent != None else hidden
     a = d.mla

@@ -16,10 +16,72 @@ sdpa.decode.gqa_cluster = 4  # 2.5% faster end to end
 sdpa.index_radix = true  # 1.0% faster end to end
 sdpa.prefill.tc5 = true  # 1.4% faster end to end
 ssm.kda_step_fused = true  # 1.7% faster end to end
+# NVFP4 experts of a W4A4 release against NVFP4 rows on the block-scaled mma.sync, as the release asks:
+# MiniMax-M3.1-Flash mini raw prefill 50.9k -> 71.1k, c256 24.1k -> 29.7k, pf16-512 94.5k -> 129.5k tok/s
+moe.nvfp4_w4a4_from = 64
+# bf16 selects on the 64-route tile in two stages, two CTAs an SM in 100 KiB (three stages seat one), never the
+# 128 x 256 tile: Nemotron-3-Super mini raw prefill 13.0k -> 14.3k, pf16-512 15.9k -> 16.6k tok/s
+moe.bf16_wide_from = 65536
+moe.bf16_gemm_stages = 2
+
+# the sm_120 switches the RTX PRO 6000 runs (same chip family): bf16 and NVFP4 MoE on the grouped mma.sync
+# kernels, the single-row block-FP8 GEMV, the tensor-core attention, hyper-connection and KDA kernels, the
+# grouped-prefill decode rows, W4A8 MXFP4 selects and block-FP8 dense on cuBLASLt MXFP8
+moe.bf16_mma_from = 16
+moe.bf16_mma_until = 65536
+moe.nvfp4_mma_from = 17
+moe.nvfp4_mma_until = 65536
+gemm.fp8_gemv_until = 1
+elemwise.rows_vec = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+elemwise.norm_emit = true
+sdpa.merge_warp = true
+sdpa.selected_mma = true
+sdpa.pool_mma = true
+sdpa.index_mma = true
+ssm.kda_chunked = true
+ssm.conv_vec4 = true
+ssm.gdn_out_bf16 = true
+attn_res.fused_norm = true
+gemm.fp8_shadow = true
+sdpa.decode.grouped_prefill_from = 8
+sdpa.decode.grouped_prefill_lse = true
+sdpa.decode.grouped_prefill_window = true
+sdpa.fa2_live = true
+moe.mxfp4_w4a8_from = 256
+moe.mxfp4_w4a8_tma = true
+moe.mxfp4_w4a8_ws = true
+gemm.fp8_mx = true
+
+# independent chains (shared expert beside the routed ones) on side streams, as the RTX PRO 6000
+[compiler]
+branches = true
+dag_streams = true
+dag_streams_until = 256
 
 [engine]
 prefill_lattice_from = 384  # 2.9% faster end to end
 working_set_percent = 75  # 4.9% faster end to end
+walk_fire_rows = 1024
+fire_rows = 5120
+# one recurrent-state slot a lane, as the RTX PRO 4500 (the PRO 6000 asks two): on 32 GB the doubled KDA slab seated
+# Kimi-K3 mini4 229 sequences, c256 8.22k -> 9.09k tok/s, Qwen3.8-27B mini20 c128 3.48k -> 4.16k; unstated, a fixed
+# 256 slots left Qwen3.8-27B's kv pages one sequence at c128 (505 tok/s); Nemotron-3-Super, Qwen3.8-Flash-Next unchanged
+state_slots_per_lane = 1
+prefill_lanes = 64
+# a process starts only while the pools hold the started ones to the end, as vLLM queues (pie #1332):
+# gemma-4-26b-a4b mini c128 3.02k -> 4.17k, gemma-4-e4b c512 8.55k -> 9.49k, qwen3-0.6b c512 22.0k -> 30.3k tok/s
+seated_first = true
+seat_to_end = true
+# seated to the end, a lane holds as many windowed pages as kv pages: no spare ring page a lane (pie #1340). The
+# spare pages took ~4 GB beside Gemma-4-31B mini18's 20.5 GB and it did not boot; gemma-4-26b-a4b mini c128
+# 4.17k -> 4.93k tok/s, gpt-oss-20b c512 11.19k / 11.14k, pf16-512 32.5k / 32.1k
+window_spare = false
+# graph bodies held to 1 GiB, not a quarter of what is past the weights (1.4-4 GiB on 32 GB; every model here arms
+# all its compositions in under 200 MiB), the rest for the cache rows: gemma-4-31b mini18 c128 2.39k -> 2.94k,
+# gemma-4-26b-a4b mini c128 5.58k -> 5.70k tok/s
+recording = { use = "bodies", mem_mb = 1024 }
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 27.7 -> 27.1 ms, 1-lane step 2.87 -> 2.80 ms, 4-lane step 4.45 -> 4.23 ms, 8-lane step 6.93 -> 6.79 ms, readout cosine 1.0000"

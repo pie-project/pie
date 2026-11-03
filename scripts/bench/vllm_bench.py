@@ -140,6 +140,8 @@ def run(args: argparse.Namespace):
         llm_kwargs["kernel_config"] = {"moe_backend": args.moe_backend}
     if args.enforce_eager:
         llm_kwargs["enforce_eager"] = True
+    if getattr(args, "compilation_config", None):
+        llm_kwargs["compilation_config"] = json.loads(args.compilation_config)
     if getattr(args, "language_model_only", False):
         llm_kwargs["language_model_only"] = True
     if os.environ.get("VLLM_DISABLE_CUSTOM_AR"):
@@ -375,6 +377,8 @@ def run_streaming(args: argparse.Namespace):
     engine_kwargs = {}
     if args.enforce_eager:
         engine_kwargs["enforce_eager"] = True
+    if getattr(args, "compilation_config", None):
+        engine_kwargs["compilation_config"] = json.loads(args.compilation_config)
     if getattr(args, "language_model_only", False):
         engine_kwargs["language_model_only"] = True
     if getattr(args, "num_gpu_blocks_override", 0):
@@ -645,6 +649,13 @@ def main() -> None:
                  "headline baseline should report.",
         )
         sp.add_argument("--enforce-eager", action="store_true")
+        sp.add_argument(
+            "--compilation-config",
+            default=None,
+            help="JSON object passed through to vLLM's compilation_config, e.g. "
+                 '\'{"cudagraph_mode": "PIECEWISE"}\' where vLLM drops to eager because '
+                 "its attention backend has no full-graph support.",
+        )
         sp.add_argument(
             "--language-model-only", action="store_true",
             help="Build the text tower alone: a miniature carved without its "

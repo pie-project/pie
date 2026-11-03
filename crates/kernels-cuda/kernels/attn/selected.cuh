@@ -27,7 +27,7 @@ constexpr int kWarps = 4;
 constexpr int kThreads = kWarps * 32;
 constexpr int kKeys = 16;
 
-template <int D>
+template <int D, int W = kWarps>
 struct Shape {
     static constexpr int kLd = D + 8;
     static constexpr int kNTiles = D / 8;
@@ -36,11 +36,11 @@ struct Shape {
     static constexpr int kQBytes = 16 * kLd * 2;
     static constexpr int kWarpBytes = 2 * kKeys * kLd * 2;
     static_assert(kWarpBytes >= 16 * D * 4, "a warp's output fits where its chunks were");
-    static constexpr int kBytes = kQBytes + kWarps * kWarpBytes + kWarps * 16 * 2 * 4;
+    static constexpr int kBytes = kQBytes + W * kWarpBytes + W * 16 * 2 * 4;
 };
 
-template <int D>
-__global__ __launch_bounds__(kThreads) void sdpa_paged_selected_mma_kernel(
+template <int D, int W = kWarps>
+__global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
     const __nv_bfloat16* __restrict__ queries,
     const __nv_bfloat16* __restrict__ k_pages,
     const __nv_bfloat16* __restrict__ v_pages,
@@ -54,7 +54,9 @@ __global__ __launch_bounds__(kThreads) void sdpa_paged_selected_mma_kernel(
     i32 top_k, i32 ratio, i32 per_head,
     const u32* __restrict__ win)
 {
-    using S = Shape<D>;
+    using S = Shape<D, W>;
+    constexpr int kWarps = W;
+    constexpr int kThreads = W * 32;
     constexpr int kLd = S::kLd;
     constexpr int kNTiles = S::kNTiles;
     constexpr int kChunks = D / 8;

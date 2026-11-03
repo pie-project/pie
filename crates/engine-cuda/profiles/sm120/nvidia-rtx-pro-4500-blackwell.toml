@@ -1,0 +1,209 @@
+api = 1
+
+[target]
+device = "NVIDIA RTX PRO 4500 Blackwell"
+
+# Starts as the RTX PRO 6000 profile (the same sm_120 die family, 99 KiB shared memory); lines below are its measured wins.
+[kernel]
+attn.qkv_rows_from = 88  # 1.4% faster end to end
+moe.mxfp4_mma_from = 49  # 2.9% faster end to end
+moe.mxfp4_select_lean = true  # 1.7% faster end to end
+# bf16 MoE routes past one token on the grouped mma.sync kernel: Qwen3.6-35B-A3B c128 1,489 -> 3,590 tok/s
+moe.bf16_mma_from = 16
+moe.bf16_mma_until = 65536
+# NVFP4 experts against bf16 rows on the register-dequant mma.sync kernel past one token, as L40S:
+# MiniMax-M3.1-Flash mini pf32-512 70.8k -> 94.3k, c512 23.4k -> 28.2k tok/s
+moe.nvfp4_mma_from = 17
+moe.nvfp4_mma_until = 65536
+# NVFP4 selects of a W4A4 release on the block-scaled mma.sync, as the RTX 5090: MiniMax-M3.1-Flash mini
+# pf8-512 45.4k -> 55.7k, c512 14.8k -> 16.8k tok/s (vLLM 50.2k / 14.9k)
+moe.nvfp4_w4a4_from = 64
+# a single-row block-FP8 projection as the GEMV over bf16 rows, the codes streamed once, as sm_90/sm_100:
+# MiniMax-M3.1-Flash mini raw decode 285 -> 304 tok/s, greedy tokens unchanged
+gemm.fp8_gemv_until = 1
+# the tensor-core attention, hyper-connection and KDA kernels A100, H100 and L40S run: DeepSeek-V4.1 mini
+# raw decode 106 -> 239 tok/s, pf16-512 5.2k -> 33.6k; DeepSeek-V4 mini pf16 32k -> 72k; Qwen3.8-Flash-Next
+# mini raw decode 455 -> 501, pf16 108k -> 140k; Kimi-K3 mini raw prefill 8.4k -> 13.4k
+elemwise.rows_vec = true
+elemwise.hc_tile = true
+elemwise.hc_mma = true
+elemwise.norm_emit = true
+sdpa.merge_warp = true
+sdpa.selected_mma = true
+sdpa.pool_mma = true
+sdpa.index_mma = true
+sdpa.index_radix = true
+ssm.kda_chunked = true
+ssm.kda_step_fused = true
+ssm.conv_vec4 = true
+ssm.gdn_out_bf16 = true
+attn_res.fused_norm = true
+gemm.fp8_shadow = true
+# kernels launch as programmatic dependents, as on the RTX 5090: Qwen3-0.6B single-request decode
+# 1.58 -> 1.50 ms a token, greedy tokens unchanged
+pdl = true
+# MiMo's wide-group decode rows (and its sink layers' windowed ones) read the cache through the
+# prefill kernel at their live head widths, as on the A100 and L40S
+sdpa.decode.grouped_prefill_from = 8
+sdpa.decode.grouped_prefill_lse = true
+sdpa.decode.grouped_prefill_window = true
+sdpa.fa2_live = true
+# wide MXFP4 selects of a release that asks for e4m3 activations (DeepSeek-V4, V4.1, MiMo) run W4A8
+# on the block-scaled mma.sync, as SGLang reads them (no block-FP8 copy of the bank)
+moe.mxfp4_w4a8_from = 256
+moe.mxfp4_w4a8_tma = true
+moe.mxfp4_w4a8_ws = true
+# block-FP8 dense projections' batch rows on cuBLASLt's MXFP8 GEMM, the 128x128 exponents spread to
+# 1x32 at load (~700 TF against the mma.sync kernel's ~500 at 8192 rows), as SGLang's CUTLASS GEMM reads them
+gemm.fp8_mx = true
+
+# independent chains (shared expert beside the routed ones) on side streams, as sm100 runs them:
+# Qwen3.6-35B-A3B single-request decode 170 -> 179 tok/s, greedy tokens unchanged, c128 unchanged
+[compiler]
+branches = true
+dag_streams = true
+dag_streams_until = 256
+
+# no 1024-row walk fires (the PRO 6000's line): on this card they starve the gated delta trunk,
+# Qwen3.8-Flash-Next mini pf32-512 62.1k -> 76.8k, Qwen3.8-27B mini20 pf8-512 7.98k -> 8.89k tok/s, greedy tokens unchanged
+[engine]
+# a fire takes at most 5120 rows, so a batch's prompts end over two fires and those the first
+# finishes are answered, and replaced, while the second runs: DeepSeek-V4 mini pf16-512 98.7k -> 103k
+fire_rows = 5120
+# one recurrent-state slot a lane (the PRO 6000 asks two): on 32 GB the doubled slab left the Qwen3.8-27B
+# mini20 kv pages for 3 sequences, c128 453 -> 2,410 tok/s; Nemotron, Qwen3.6-35B, Qwen3.8-Flash-Next unchanged
+state_slots_per_lane = 1
+# prompt fires pad to 64 lanes, not the 512 decoding lanes two slots seat: Qwen3.8-Flash-Next mini
+# raw prefill 58.9k -> 68.7k, pf16-512 150.1k -> 160.5k tok/s, c512 unchanged, greedy parity unchanged
+prefill_lanes = 64
+# a Gemma-4 windowed ring a page a lane past its kv pages, which ran dry first and parked lanes at every
+# page: gemma-4-31b c128 663 -> 723, gemma-4-26b c1024 2,777 -> 3,728 tok/s, greedy tokens unchanged
+window_spare = true
+
+[provenance]
+source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"
+measured = [
+  "kernel.attn.qkv_rows_from",
+  "kernel.attn_res.fused_norm",
+  "kernel.elemwise.hc_mma",
+  "kernel.elemwise.hc_tile",
+  "kernel.elemwise.norm_emit",
+  "kernel.elemwise.rows_vec",
+  "kernel.gemm.affine_mma",
+  "kernel.gemm.fp8_o_down",
+  "kernel.gemm.fp8_shadow",
+  "kernel.gemm.grouped_gemv",
+  "kernel.gemm.heuristics",
+  "kernel.gemm.skinny_rows",
+  "kernel.gemm.split_rows_from",
+  "kernel.gemm.tc5_raster",
+  "kernel.gemm.workspace_mb",
+  "kernel.gemv.bf16",
+  "kernel.gemv.splitk_max_n",
+  "kernel.mla.expanded_from",
+  "kernel.mla.path",
+  "kernel.moe.affine_grouped",
+  "kernel.moe.affine_grouped_from",
+  "kernel.moe.affine_wmma",
+  "kernel.moe.group_at",
+  "kernel.moe.grouped",
+  "kernel.moe.mxfp4_cvt",
+  "kernel.moe.mxfp4_grouped",
+  "kernel.moe.mxfp4_grouped_reuse",
+  "kernel.moe.mxfp4_mma_from",
+  "kernel.moe.mxfp4_mma_until",
+  "kernel.moe.mxfp4_select_lean",
+  "kernel.moe.mxfp4_wmma",
+  "kernel.moe.nvfp4_mma_from",
+  "kernel.moe.routes_sized",
+  "kernel.moe.tc5",
+  "kernel.moe.tc5_from",
+  "kernel.moe.w4a4_fused_from",
+  "kernel.moe.w4a4_fused_layout",
+  "kernel.moe.w4a8_fused_from",
+  "kernel.pdl",
+  "kernel.qmm.gemm_from",
+  "kernel.qmm.gemv_mma_from",
+  "kernel.qmm.long_rows",
+  "kernel.qmm.split_thin_max",
+  "kernel.qmm.split_warps_per_sm",
+  "kernel.qmm.split_wide_max",
+  "kernel.sdpa.decode.chunk_floor_128",
+  "kernel.sdpa.decode.gqa",
+  "kernel.sdpa.decode.gqa_cluster",
+  "kernel.sdpa.decode.gqa_deep_64",
+  "kernel.sdpa.decode.grouped_prefill_lse",
+  "kernel.sdpa.decode.grouped_prefill_window",
+  "kernel.sdpa.decode.split_small",
+  "kernel.sdpa.decode.split_window",
+  "kernel.sdpa.decode.static_max_requests",
+  "kernel.sdpa.fa2_live",
+  "kernel.sdpa.index_fp4_tc5",
+  "kernel.sdpa.index_mma",
+  "kernel.sdpa.index_radix",
+  "kernel.sdpa.index_split_until",
+  "kernel.sdpa.index_tc5",
+  "kernel.sdpa.merge_warp",
+  "kernel.sdpa.mla_dense_short",
+  "kernel.sdpa.mla_sparse",
+  "kernel.sdpa.pool_mma",
+  "kernel.sdpa.prefill.ctas_per_sm",
+  "kernel.sdpa.prefill.tc5",
+  "kernel.sdpa.prefill.wide_sliding",
+  "kernel.sdpa.selected_mma",
+  "kernel.ssm.conv_vec4",
+  "kernel.ssm.gdn_fused_scan",
+  "kernel.ssm.gdn_out_bf16",
+  "kernel.ssm.gdn_scan_until",
+  "kernel.ssm.gdn_step_blocks",
+  "kernel.ssm.gdn_tc5",
+  "kernel.ssm.kda_chunked",
+  "kernel.ssm.kda_step_fused",
+  "engine.copies",
+  "engine.graphs",
+  "engine.host_planes",
+  "engine.lattice_steps",
+  "engine.one_frame_when_short",
+  "engine.prefill_lattice_from",
+  "engine.prefill_lattice_steps",
+  "engine.recording",
+  "engine.seated_first",
+  "engine.working_set_percent",
+  "fuse.hc_fold_pre",
+  "fuse.hc_gates_norm",
+  "fuse.hc_pre",
+  "fuse.hc_prenorm_project",
+  "fuse.index_topk_rope",
+  "fuse.lse_sink",
+  "fuse.matmul_moe_route",
+  "fuse.matmul_split_rows",
+  "fuse.mla_prefill_expanded",
+  "fuse.moe_experts",
+  "fuse.moe_mega",
+  "fuse.moe_select_glu",
+  "fuse.norm_rope_last_append",
+  "fuse.norm_rope_pair",
+  "fuse.pool_attention",
+  "fuse.pool_compress",
+  "fuse.qkv_fused_qknorm_rope_vnorm_write",
+  "fuse.res_blend_rmsnorm",
+  "compiler.branches",
+  "compiler.cond_fixed_us",
+  "compiler.cond_per_arm_us",
+  "compiler.cost.attn_us",
+  "compiler.cost.conv_us",
+  "compiler.cost.custom_us",
+  "compiler.cost.elemwise_us",
+  "compiler.cost.gather_us",
+  "compiler.cost.linear_us",
+  "compiler.cost.sampling_us",
+  "compiler.cost.ssm_us",
+  "compiler.dag_streams",
+  "compiler.fat_region_us",
+  "compiler.fork_floor_us",
+  "compiler.grouped",
+  "compiler.launch_us",
+  "compiler.side_streams",
+  "compiler.synth_anchors",
+  "compiler.synth_regions",
+]

@@ -141,6 +141,9 @@ pub struct EngineConfig {
     /// The engine asks the planner to serve a decoding lane's pages before a
     /// prompt waiting to be seated (`PoolFacts::seated_first`).
     pub seated_first: bool,
+    /// The engine asks the planner to start a process only while the pools
+    /// hold the started ones to the end (`PoolFacts::seat_to_end`).
+    pub seat_to_end: bool,
     pub rs_cache_slot_bytes: u64,
     pub rs_host_slots: usize,
     pub rs_buffer_pages: u32,
@@ -311,6 +314,30 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 seats
             }
             _ => cap,
+        })
+        .map(|cap| {
+            // A seated-first pool of kv pages alone seats no more than five
+            // sequences a sequence at the declared context holds: past that,
+            // admitted prompts seat lanes the pool then suspends for each
+            // other's growth (Gemma-4-26B on an A100, c512: 2.9k tok/s
+            // admitting all 512, 4.7k at 224; its 5791 pages seat 45 at 2048).
+            let seats = engine_configs
+                .iter()
+                .filter(|d| d.seated_first && d.limits.max_context > 0)
+                .map(|d| 5 * d.total_pages * kv_page_size / d.limits.max_context)
+                .min();
+            match seats {
+                Some(seats) if rs_seat_cap.is_none() && cap > seats.max(1) => {
+                    tracing::info!(
+                        requested = cap,
+                        seated = seats,
+                        "admission: capped at five sequences a sequence at the declared context \
+                         holds in the kv pool"
+                    );
+                    seats.max(1)
+                }
+                _ => cap,
+            }
         });
     process::init_admission(admission_cap);
 
@@ -414,6 +441,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .first()
         .is_some_and(|d| d.cpu_pages > 0 || d.disk_pages > 0);
     let seated_first = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seated_first);
+    let seat_to_end = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seat_to_end);
     if let Some(d) = engine_configs.first() {
         if kv_swap_capable {
             tracing::info!(
@@ -475,7 +503,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
                 crate::planner::RegistryPool::new(arena_model_idx, engine, kv_swap_capable),
             ))
-            .seated_first(seated_first),
+            .seated_first(seated_first)
+            .seat_to_end(seat_to_end),
         );
     }
     // After the gates and the planner it orders exist.

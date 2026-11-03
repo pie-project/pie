@@ -30,6 +30,11 @@ const LAST_PAGE_LENS: [i32; 2] = [13, 5];
 const TOP_K: usize = 131;
 const PICKS: usize = 96;
 const INT_BYTES: usize = 4 << 20;
+
+thread_local! {
+    /// Whether the fires run Hopper's wgmma kernel (`kernel.sdpa.mla_wgmma`).
+    static WG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 const FLOAT_BYTES: usize = 64 << 20;
 
 struct Case {
@@ -234,6 +239,7 @@ fn score(
     let ctx = gpu.ctx().with_tuning(Tuning {
         mla_naive: true,
         mla_sparse: tc,
+        mla_wgmma: WG.with(std::cell::Cell::get),
         ..Tuning::DEFAULT
     });
     if let Some((live, base)) = window {
@@ -344,7 +350,9 @@ fn check(rope: usize, window: Option<(u32, u32)>, decode: bool, pooled: bool) {
     let want = match window {
         None if !pooled => case.reference(),
         _ => {
+            let was = WG.with(|w| w.replace(false));
             let (naive, _) = score(rope, false, window, decode, pooled);
+            WG.with(|w| w.set(was));
             (naive.0.iter().map(|&b| from_bf16(b)).collect(), naive.1)
         }
     };
@@ -496,6 +504,7 @@ fn decode_rows(reqs: usize, tc: bool) -> Vec<u16> {
     let out = gpu.zeros(reqs * HEADS * RANK * 2);
     let ctx = gpu.ctx().with_tuning(Tuning {
         mla_sparse: tc,
+        mla_wgmma: WG.with(std::cell::Cell::get),
         ..Tuning::DEFAULT
     });
     let fire = || {
@@ -679,6 +688,7 @@ fn decode_heads(
     let ctx = gpu.ctx().with_tuning(Tuning {
         mla_sparse: true,
         mla_dense_short: dense,
+        mla_wgmma: WG.with(std::cell::Cell::get),
         ..Tuning::DEFAULT
     });
     let fire = || {
@@ -813,6 +823,44 @@ fn fp8_rows_read_any_head_count_sixty_four_a_pass() {
         assert!(
             rel < 0.05,
             "{heads} heads, {rows} rows of {kv} keys, rope {rope}: relative error {rel}"
+        );
+    }
+}
+
+/// Hopper's wgmma kernel (`kernel.sdpa.mla_wgmma`, 64 heads a CTA) against
+/// the host reference and the 16-head mma.sync kernel: prefill and decode
+/// rows, a pooled selection, a staged window, a decode split over the
+/// multiprocessors, a short selection read dense, more heads than 64.
+#[test]
+fn the_sparse_mla_lands_on_wgmma() {
+    if kernels_cuda::linear::gemm_sm100::supported() {
+        return;
+    }
+    let same = |got: &[u16], want: &[u16], what: &str| {
+        for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+            let (g, w) = (from_bf16(g), from_bf16(w));
+            assert!(close(g, w), "{what}: value {i}: {g} against {w}");
+        }
+    };
+    WG.with(|w| w.set(true));
+    check(64, None, false, false);
+    check(64, None, true, false);
+    check(64, None, false, true);
+    check(64, None, true, true);
+    check(64, Some((30, 25)), false, false);
+    let got = decode_bs8(false);
+    let dense = decode_heads(HEADS, 4, 300, 64, false, true, true);
+    let wide = decode_heads(128, 4, 1000, 64, false, false, true);
+    WG.with(|w| w.set(false));
+    same(&got, &decode_bs8(false), "8 decode rows split");
+    let want = decode_heads(HEADS, 4, 300, 64, false, true, true);
+    same(&dense.0, &want.0, "a short selection read dense");
+    let want_wide = decode_heads(128, 4, 1000, 64, false, false, true);
+    same(&wide.0, &want_wide.0, "128 heads");
+    for (g, w) in wide.1.iter().zip(&want_wide.1) {
+        assert!(
+            (g - w).abs() <= 1.0e-2 * w.abs().max(1.0),
+            "128 heads: lse {g} against {w}"
         );
     }
 }

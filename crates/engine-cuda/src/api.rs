@@ -710,6 +710,7 @@ impl Engine for Cuda {
                 disk_kv_kept: shell.disk_kv_kept(),
                 one_frame_when_short: shell.one_frame_when_short(),
                 seated_first: shell.seated_first(),
+                seat_to_end: shell.seat_to_end(),
             },
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
@@ -1185,8 +1186,11 @@ impl Cuda {
                 let Some(bound) = self.adapters.get(&attachment.instance) else {
                     continue;
                 };
-                if let Some(slot) = lane_adapters.get_mut(attachment.lane as usize) {
-                    *slot = Some(bound.slot);
+                // The attachment is its pass's lanes, `lanes` of them from `lane`.
+                for at in attachment.lane..attachment.lane + attachment.lanes.max(1) {
+                    if let Some(slot) = lane_adapters.get_mut(at as usize) {
+                        *slot = Some(bound.slot);
+                    }
                 }
             }
         }
