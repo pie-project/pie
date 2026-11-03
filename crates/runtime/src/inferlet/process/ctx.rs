@@ -53,6 +53,10 @@ pub struct ProcessCtx {
     admission_wait_us: u64,
     residency_flag: Option<Arc<AtomicBool>>,
     limits: wasmtime::StoreLimits,
+    /// `PIE_TURN_TRACE`: when the guest's last take returned, and its
+    /// submits so far.
+    pub(crate) turn_last_take: Option<std::time::Instant>,
+    pub(crate) turn_submits: u32,
 }
 
 impl Drop for ProcessCtx {
@@ -228,6 +232,8 @@ impl ProcessCtx {
             limits: wasmtime::StoreLimitsBuilder::new()
                 .memory_size(policy.memory_limit)
                 .build(),
+            turn_last_take: None,
+            turn_submits: 0,
         })
     }
 

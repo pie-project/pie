@@ -81,8 +81,8 @@ impl ResidencyPlanner {
                     .is_some_and(|proc| !proc.seated)
             {
                 let (kv_free, kv_total) = self.port.device_stats();
-                let watermark = (u64::from(kv_total) * u64::from(self.seat_watermark_permille))
-                    .div_ceil(1000);
+                let watermark =
+                    (u64::from(kv_total) * u64::from(self.seat_watermark_permille)).div_ceil(1000);
                 if u64::from(kv_free) < u64::from(demand.kv_pages) + watermark {
                     return None;
                 }

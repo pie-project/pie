@@ -20,3 +20,4 @@ pub(crate) mod service;
 pub mod store;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod telemetry;
+pub mod turn_trace;

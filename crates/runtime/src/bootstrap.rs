@@ -593,6 +593,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         });
     }
 
+    crate::turn_trace::spawn();
     crate::scheduler::set_submit_deadline(std::time::Duration::from_micros(
         scheduler.submit_deadline_us,
     ));

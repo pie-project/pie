@@ -451,7 +451,13 @@ impl pie::inferlet::channel::HostChannelWithStore<ProcessCtx> for HasSelf<Proces
         accessor: &Accessor<ProcessCtx, Self>,
         this: Resource<Channel>,
     ) -> Anyhow<Result<Vec<u8>, String>> {
-        materialize_channel(accessor, this, ChannelReadMode::Take).await
+        let taken = materialize_channel(accessor, this, ChannelReadMode::Take).await;
+        if crate::turn_trace::on() {
+            accessor.with(|mut access| {
+                access.get().turn_last_take = Some(std::time::Instant::now());
+            });
+        }
+        taken
     }
 
     async fn read(
@@ -1470,7 +1476,15 @@ impl pie::inferlet::forward::Host for ProcessCtx {
         on: Resource<crate::pipeline::Pipeline>,
         slots: Vec<Option<Resource<ForwardPass>>>,
     ) -> Anyhow<Result<(), String>> {
-        self.core_submit(on, slots).await
+        if !crate::turn_trace::on() {
+            return self.core_submit(on, slots).await;
+        }
+        let start = std::time::Instant::now();
+        let gap = self.turn_last_take.take().map(|at| start - at);
+        let submitted = self.core_submit(on, slots).await;
+        crate::turn_trace::submit(gap, start.elapsed(), self.turn_submits == 0);
+        self.turn_submits += 1;
+        submitted
     }
 
     async fn park(&mut self, on: Resource<crate::pipeline::Pipeline>) -> Anyhow<()> {

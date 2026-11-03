@@ -794,9 +794,10 @@ impl Process {
             } else {
                 OutputMode::Discard
             };
-            let (mut store, instance) = linker::instantiate(process_id, username, &program, output)
-                .await
-                .map_err(|e| e.to_string())?;
+            crate::turn_trace::instantiating(1);
+            let instantiated = linker::instantiate(process_id, username, &program, output).await;
+            crate::turn_trace::instantiating(-1);
+            let (mut store, instance) = instantiated.map_err(|e| e.to_string())?;
             instantiate_us = duration_us(instantiate_start.elapsed());
             store.data_mut().install_prewarm_permit(prewarm_permit);
             store.data_mut().set_props(props);
@@ -845,6 +846,7 @@ impl Process {
             result
         }
         .await;
+        crate::turn_trace::finished();
         record_process_timing(
             admission_wait_us,
             instantiate_us,
