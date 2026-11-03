@@ -725,6 +725,7 @@ impl Shell {
                 &boot.trace,
                 device.stream(),
                 device.ctx().tuning().mxfp4_bf16_down,
+                device.ctx().tuning().mxfp4_bf16_keep,
             )?;
         }
         if boot.knobs.diagnostics.arm_trace {
