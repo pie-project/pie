@@ -1402,7 +1402,7 @@ impl Weights {
                 || crate::device::alloc::is_host_pointer(scales.ptr)
                 || rows == 0
                 || !rows.is_multiple_of(128)
-                || !k.is_multiple_of(512)
+                || !k.is_multiple_of(128)
             {
                 continue;
             }
