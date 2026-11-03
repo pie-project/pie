@@ -849,6 +849,13 @@ pub struct Fa2Live;
 #[decision(id = "kernel.sdpa.decode.gqa", flag, default = false, tune = search)]
 pub struct DecodeGqa;
 
+/// The fewest query heads a KV head that a paged decode takes the
+/// tensor-core kernel at (`kernel.sdpa.decode.gqa`); narrower groups keep
+/// the FA2 decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.gqa_min_group", constant(range(1..=8)), default = 1, tune = search)]
+pub struct DecodeGqaMinGroup(pub u32);
+
 /// The fewest requests a 64-wide decode takes the tensor-core kernel at;
 /// narrower, the FA2 decode reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -988,6 +995,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeGroupedPrefillWindow>()
         .add::<Fa2Live>()
         .add::<DecodeGqa>()
+        .add::<DecodeGqaMinGroup>()
         .add::<DecodeGqaFrom64>()
         .add::<DecodeGqaWholeWindow>()
         .add::<DecodeGqaCluster>()
@@ -1142,6 +1150,7 @@ tuning! {
     decode_grouped_prefill_window: bool = false, on DecodeGroupedPrefillWindow;
     fa2_live: bool = false, on Fa2Live;
     decode_gqa: bool = false, on DecodeGqa;
+    decode_gqa_min_group: u32 = 1, get DecodeGqaMinGroup;
     decode_gqa_from_64: u32 = 0, get DecodeGqaFrom64;
     decode_gqa_whole_window: u32 = 0, get DecodeGqaWholeWindow;
     decode_gqa_cluster: u32 = 0, get DecodeGqaCluster;
