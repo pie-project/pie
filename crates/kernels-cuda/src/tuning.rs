@@ -262,6 +262,13 @@ pub struct MoeMxfp4MmaFrom(pub u32);
 #[decision(id = "kernel.moe.mxfp4_mma_per_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4MmaPerFrom(pub u32);
 
+/// The most routes an expert averages that an Ada's mxfp4 select runs on
+/// the run kernel (`moe_select_mxfp4_mma_run`, 32-route slices) with, past
+/// it the staged kernel's 64-route slices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_run_until", constant(range(1..=65_536)), default = 16, tune = search)]
+pub struct MoeMxfp4RunUntil(pub u32);
+
 /// The fewest routes a routed bf16 select runs on the graph-safe grouped
 /// mma.sync kernel with (`moe_select_bf16_mma`), rather than the per-route
 /// GEMV. Bf16 experts have no tcgen05 or cuBLAS grouped path under a
@@ -864,6 +871,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4MmaUntil>()
         .add::<MoeMxfp4MmaFrom>()
         .add::<MoeMxfp4MmaPerFrom>()
+        .add::<MoeMxfp4RunUntil>()
         .add::<MoeBf16MmaFrom>()
         .add::<MoeBf16MmaUntil>()
         .add::<MoeMxfp4Cvt>()
@@ -1008,6 +1016,7 @@ tuning! {
     mxfp4_mma_until: u32 = 0, get MoeMxfp4MmaUntil;
     mxfp4_mma_from: u32 = 64, get MoeMxfp4MmaFrom;
     mxfp4_mma_per_from: u32 = 0, get MoeMxfp4MmaPerFrom;
+    mxfp4_run_until: u32 = 16, get MoeMxfp4RunUntil;
     bf16_mma_from: u32 = 0, get MoeBf16MmaFrom;
     bf16_mma_until: u32 = 0, get MoeBf16MmaUntil;
     mxfp4_cvt: bool = false, on MoeMxfp4Cvt;

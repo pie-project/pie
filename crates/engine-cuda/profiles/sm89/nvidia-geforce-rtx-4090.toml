@@ -40,6 +40,11 @@ moe.bf16_mma_until = 65536
 moe.mxfp4_fp8_from = 256
 moe.mxfp4_mma_per_from = 4
 
+# gpt-oss-20b's c256 decode (32 routes an expert) on the run kernel's
+# 32-route slices, not the staged kernel's half-filled 64-route ones: c256
+# 5.97k to 6.56k tok/s.
+moe.mxfp4_run_until = 32
+
 # A fire's working set may take 65% of the 24 GB card past the weights, not
 # half: at 50% gpt-oss-20b's 8192-token fires were served at 1024 and c256 at
 # 128 lanes; at 65% pf16-512 15.9k to 22.5k tok/s and c256 5.7k to 6.1k.
