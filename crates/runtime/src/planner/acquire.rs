@@ -81,6 +81,9 @@ impl ResidencyPlanner {
                     return None;
                 }
             }
+            if demand.kv_pages > 0 && self.lock_inner().seat_full(pid) {
+                return None;
+            }
             let grant = self.try_reserve(demand)?;
             if let Some(proc) = self.lock_inner().procs.get_mut(&pid) {
                 proc.seated = true;

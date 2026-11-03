@@ -52,6 +52,9 @@ impl ResidencyPlanner {
                     WaitKind::Allocation { demand, .. } => Some(*demand),
                     WaitKind::Restore { .. } => None,
                 };
+                if self.seated_first && demand.is_some() && inner.seat_full(pid) {
+                    return Step::Done;
+                }
                 let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
                 if missing > 0 {
                     return Step::Absorb {

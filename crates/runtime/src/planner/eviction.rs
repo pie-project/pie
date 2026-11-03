@@ -248,10 +248,16 @@ impl ResidencyPlanner {
     ) -> bool {
         let (wake, spawned) = self.with_inner(|inner| {
             let (mut wake, mut spawned) = (Vec::new(), Vec::new());
-            let head_rank = match inner.unmet_head() {
-                Some((key, _)) if key == head_key => key.0,
+            let (head_rank, growth) = match inner.unmet_head() {
+                Some((key, waiter)) if key == head_key => (
+                    key.0,
+                    self.seated_first
+                        && inner.procs.get(&waiter.pid).is_some_and(|proc| proc.seated),
+                ),
                 _ => return (wake, spawned),
             };
+            let seated_before = inner.seated_lanes();
+            let mut lanes_suspended = 0u32;
             for (pid, expected) in picks {
                 let Some(proc) = inner.procs.get(&pid) else {
                     continue;
@@ -262,8 +268,18 @@ impl ResidencyPlanner {
                 {
                     continue;
                 }
+                if growth && proc.seated && !proc.idle && !proc.held {
+                    lanes_suspended += 1;
+                }
                 wake.extend(inner.begin_eviction(pid, expected));
                 spawned.push(pid);
+            }
+            if lanes_suspended > 0 {
+                // A lane's growth suspended lanes still decoding: the pool holds
+                // the rest; seat no prompt past them until lanes finish.
+                let held = seated_before.saturating_sub(lanes_suspended).max(1);
+                inner.seat_limit = Some(inner.seat_limit.map_or(held, |limit| limit.min(held)));
+                inner.seat_credit = 0;
             }
             (wake, spawned)
         });

@@ -498,6 +498,15 @@ impl ResidencyPlanner {
             {
                 inner.completion_credit = inner.completion_credit.saturating_add(1);
             }
+            // A lane finished without one suspending another: try one more
+            // every fourth.
+            if departed.as_ref().is_some_and(|proc| proc.seated) && inner.seat_limit.is_some() {
+                inner.seat_credit += 1;
+                if inner.seat_credit >= 4 {
+                    inner.seat_credit = 0;
+                    inner.seat_limit = inner.seat_limit.map(|limit| limit.saturating_add(1));
+                }
+            }
             inner.settle_eviction(pid);
             // Its holds outlive it only while one lives; the last one's drop
             // settles this, and cannot have run before it is put here.

@@ -34,6 +34,11 @@ pub(super) struct Inner {
     pub(super) prepare_blocked: HashSet<ProcessId>,
     pub(super) killing: HashSet<ProcessId>,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
+    /// With `PoolFacts::seated_first`, the seated lanes the pool last held
+    /// without suspending one for another's growth: a prompt seats only below
+    /// it. Set at such a suspension, it grows a lane every few departures.
+    pub(super) seat_limit: Option<u32>,
+    pub(super) seat_credit: u32,
 }
 
 impl Inner {
@@ -134,6 +139,29 @@ impl Inner {
     /// A seated lane's growth takes free pages at once rather than parking behind
     /// claims served after it anyway (a waiting prompt holding nothing); a
     /// higher-ranked seated waiter or preempted process still goes first.
+    /// Seated lanes still decoding: resident, not waiting on their client.
+    pub(super) fn seated_lanes(&self) -> u32 {
+        u32::try_from(
+            self.procs
+                .values()
+                .filter(|proc| proc.seated && !proc.idle && proc.state == Residency::Resident)
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
+    /// Whether `pid`, a prompt not yet seated, waits for a lane to finish:
+    /// the pool held no more lanes than are seated now the last time a lane's
+    /// growth suspended another (Gemma-4-26B on an A100, c512: 67 of 512 lanes
+    /// decoding as they suspended each other, 192 seated at once with none).
+    pub(super) fn seat_full(&self, pid: ProcessId) -> bool {
+        self.seat_limit.is_some_and(|limit| {
+            self.procs.get(&pid).is_some_and(|proc| !proc.seated)
+                && !self.fleet_stalled()
+                && self.seated_lanes() >= limit
+        })
+    }
+
     pub(super) fn growth_first(&self, pid: ProcessId) -> bool {
         let Some(proc) = self.procs.get(&pid) else {
             return false;
