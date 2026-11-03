@@ -1145,12 +1145,15 @@ impl Weights {
 
     /// `kernel.gemm.fp8_shadow`: each block-FP8 dense projection read at
     /// bf16 activations keeps a bf16 copy, widened once here, that a
-    /// batch's rows read on cuBLAS. Returns the planes it widened.
+    /// batch's rows read on cuBLAS. With `mixed` only the planes whose
+    /// 128-row blocks carry other exponents (MiMo's 192-row heads), which
+    /// no 128x128-block GEMM reads. Returns the planes it widened.
     #[cfg(feature = "cuda")]
     pub fn shadow_fp8_dense(
         &mut self,
         trace: &Trace,
         stream: *mut core::ffi::c_void,
+        mixed: bool,
     ) -> Result<u32> {
         use poem_ir::{Def, Linear, Operation};
         let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
@@ -1189,6 +1192,17 @@ impl Weights {
             }
             let (n, k) = (codes.rows, codes.width);
             let gran = k.div_ceil(atoms.width);
+            if mixed
+                && (gran != 128
+                    || kernels_cuda::linear::gemm::cublas_lt_fp8::rows_share_blocks(
+                        "linear.fp8_shadow",
+                        atoms.ptr,
+                        n,
+                        k,
+                    )?)
+            {
+                continue;
+            }
             let bytes = u64::from(n) * u64::from(k) * 2;
             if bytes > budget {
                 continue;
