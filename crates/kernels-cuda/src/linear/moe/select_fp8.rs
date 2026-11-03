@@ -99,6 +99,56 @@ pub fn select_fp8_w8a8(
     // On Hopper, wgmma (sm_90a): an expert's slice 32 routes, or 64 past an
     // average of 16, at about the card's rate either way, so a busy expert's
     // routes rarely spill into a second read of its codes.
+    // A prefill's busy experts on the warp-specialized GEMM
+    // (`kernel.moe.fp8a8_ws_from`): 128 routes by 128 weight rows a CTA.
+    let ws_from = ctx.tuning().fp8a8_ws_from;
+    if hopper_wgmma() && ws_from > 0 && per >= ws_from {
+        const STAGES: u32 = 6;
+        let RouteOrder {
+            order,
+            offsets,
+            work,
+            work_cap,
+        } = route_order_sliced(
+            ctx,
+            OP,
+            routes,
+            &fan,
+            experts,
+            128,
+            true,
+            if KEEP_NEXT.with(core::cell::Cell::get) {
+                Share::Keep
+            } else {
+                Share::Take
+            },
+        )?;
+        return ctx.fire(
+            OP,
+            Fire::at(kernel(
+                SELECT_SM90,
+                &format!("::pie::linear::moe_select_fp8a8_wsgemm<{STAGES}>"),
+            ))
+            .apply(
+                Launch::grid([work_cap, y.width / 128, 1], [384, 1, 1])
+                    .smem(STAGES * 32768 + 1024 + 128),
+            ),
+            &[
+                ArgValue::Ptr(xq),
+                ArgValue::Ptr(xe),
+                ArgValue::Ptr(order),
+                ArgValue::Ptr(offsets),
+                ArgValue::Ptr(work),
+                ArgValue::Ptr(codes),
+                ArgValue::Ptr(atoms),
+                y.arg(),
+                act_div.arg(),
+                n.arg(),
+                stated(OP, x.width)?.arg(),
+                stated(OP, experts)?.arg(),
+            ],
+        );
+    }
     if hopper_wgmma() {
         let slice: u32 = if per <= 16 { 32 } else { 64 };
         let RouteOrder {
