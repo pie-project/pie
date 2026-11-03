@@ -15,6 +15,11 @@ sdpa.index_split_until = 512  # 4.3% faster end to end
 ssm.gdn_scan_until = 56  # 4.3% faster end to end
 sdpa.index_mma = true
 sdpa.index_radix = true
+# a paged decode of a group of at most eight query heads on the tensor-core kernel, as the H200 and B200:
+# gpt-oss-20b c1024 20.0k -> 20.5k, c512 17.3k -> 17.9k tok/s
+sdpa.decode.gqa = true
+# from groups of two query heads a KV head, as the H200 (MiniMax's single-head groups read slower so)
+sdpa.decode.gqa_min_group = 2
 gemm.fp8_shadow = true
 # MXFP4 gate-up banks kept as an exact bf16 copy, read past 1024 routes a fire by the
 # warp-specialized wgmma GEMM (the register-dequant select ran ~330 TFLOP/s): gpt-oss-20b
