@@ -632,6 +632,7 @@ pub(crate) fn carve(
     flatten(&mut placements);
     let (mut spans, live_in) = lives(trace, &placements, classes);
     outlive_the_region(trace, conc, &mut spans);
+    let held = hold_out_scores(trace, &mut placements);
 
     let stacks = stacks(trace, &placements);
     let mut conservative = placements.clone();
@@ -656,6 +657,9 @@ pub(crate) fn carve(
     } else {
         (conservative, blind)
     };
+    for (id, slot) in held {
+        placements[id] = slot;
+    }
     let bytes = lift_scores(trace, &mut placements, bytes);
 
     Ok(ArenaMap {
@@ -1115,6 +1119,25 @@ fn widen(set: &mut ClassSet, by: &ClassSet) {
 }
 
 const BIND_ALIGN: u64 = 256;
+
+/// The `attn.scores` planes taken out of the placement, to be put back on
+/// top of every other slot (`lift_scores`): placed among the rest, their
+/// layer-long lives held the bottom of the arena, every later slot went over
+/// them, and lifted they left that room under the rest unused (gpt-oss-20b
+/// at 1024 lanes: 6 GiB of 8.6 the arena backed without scores).
+fn hold_out_scores(trace: &Trace, placements: &mut [Placement]) -> Vec<(usize, Placement)> {
+    let mut held: Vec<(usize, Placement)> = Vec::new();
+    for output in trace.outputs.iter().filter(|output| output.name == SCORES) {
+        let id = root(placements, output.value).0 as usize;
+        if placements.get(id).is_some_and(Placement::is_arena) {
+            held.push((
+                id,
+                core::mem::replace(&mut placements[id], Placement::Param(u32::MAX)),
+            ));
+        }
+    }
+    held
+}
 
 /// Each layer's `attn.scores` plane on top of every other slot, so a load no
 /// program reads scores from backs the arena only up to [`ArenaMap::scores_from`].
