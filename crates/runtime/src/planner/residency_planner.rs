@@ -45,6 +45,8 @@ pub struct ResidencyPlanner {
     /// `PoolFacts::seat_to_end`: see [`super::to_end::ToEnd`].
     seat_to_end: bool,
     to_end_notify: Notify,
+    /// `PoolFacts::preempt_newest`: see [`Self::preempt_newest_lane`].
+    pub(super) preempt_newest: bool,
 }
 
 impl ResidencyPlanner {
@@ -65,6 +67,7 @@ impl ResidencyPlanner {
             seating: parking_lot::Mutex::new(()),
             seat_to_end: false,
             to_end_notify: Notify::new(),
+            preempt_newest: std::env::var("PIE_PREEMPT_NEWEST").is_ok_and(|v| v == "1"),
         }
     }
 

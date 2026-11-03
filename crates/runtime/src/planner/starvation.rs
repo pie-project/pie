@@ -176,6 +176,65 @@ impl ResidencyPlanner {
         }
     }
 
+    /// A seated lane short of its next pages takes them from the youngest
+    /// restartable lane parked on pages, which replays from its prompt, as
+    /// vLLM preempts its newest sequence, rather than waiting on a suspend's
+    /// copy to the host or disk. One at a time: the next waits for the kill
+    /// to land. False where the head is a prompt not yet seated, or no lane
+    /// holding pages can be restarted.
+    pub(super) fn preempt_newest_lane(self: &Arc<Self>, head_pid: ProcessId) -> bool {
+        let seated =
+            self.with_inner(|inner| inner.procs.get(&head_pid).is_some_and(|proc| proc.seated));
+        if !seated {
+            return false;
+        }
+        if self.with_inner(|inner| inner.kill_in_flight()) {
+            return true;
+        }
+        let Some(victim_key) = self.pick_starvation_victim(StarveCause::NoSwapRoom) else {
+            return false;
+        };
+        let (free, total) = self.port.device_stats();
+        let notify = self.with_inner(|inner| {
+            let victim = inner.queue.get_mut(&victim_key)?;
+            let victim_pid = victim.pid;
+            if !crate::inferlet::process::is_restartable(victim_pid) {
+                return None;
+            }
+            let WaitKind::Allocation {
+                demand,
+                notify,
+                outcome,
+                ..
+            } = &mut victim.kind
+            else {
+                return None;
+            };
+            if outcome.is_some() {
+                return None;
+            }
+            *outcome = Some(Err(PlannerError::Starved {
+                need: demand.kv_pages,
+                free,
+                total,
+                cause: StarveCause::NoSwapRoom,
+            }));
+            let notify = notify.clone();
+            inner.killing.insert(victim_pid);
+            Some((notify, victim_pid))
+        });
+        let Some((notify, victim_pid)) = notify else {
+            return false;
+        };
+        if crate::inferlet::process::request_restart(victim_pid) {
+            self.stats
+                .starvation_restarts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        notify.notify_waiters();
+        true
+    }
+
     fn pick_starvation_victim(&self, cause: StarveCause) -> Option<EntryKey> {
         let candidates: Vec<(EntryKey, ProcessId)> = self.with_inner(|inner| {
             inner
