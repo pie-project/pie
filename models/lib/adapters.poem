@@ -3,11 +3,10 @@
 
 ADAPTERS = struct(slots = 8, rank = 16)
 
-def banks(hidden, width = None):
-    """The `lora_a` and `lora_b` banks over a `hidden`-wide residual, read
-    from a `width`-wide input when it is not the residual."""
+def banks(hidden):
+    """The `lora_a` and `lora_b` banks over a `hidden`-wide residual."""
     return (
-        weight([ADAPTERS.slots, ADAPTERS.rank, hidden if width == None else width]).registered(),
+        weight([ADAPTERS.slots, ADAPTERS.rank, hidden]).registered(),
         weight([ADAPTERS.slots, hidden, ADAPTERS.rank]).registered(),
     )
 
