@@ -17,6 +17,11 @@ gemm.grouped_gemv = true
 gemm.affine_mma = true
 elemwise.rows_vec = true
 sdpa.merge_warp = true
+# a paged decode of a group of at most eight query heads on the tensor-core kernel, from groups of two
+# (as the H100 and H200): Nemotron-3-Super mini c256 1380 -> 1634, c512 1392 -> 1651 tok/s; gpt-oss-20b
+# c1024 4961 -> 5001; gemma-4-26b-a4b mini c256 unchanged
+sdpa.decode.gqa = true
+sdpa.decode.gqa_min_group = 2
 sdpa.decode.grouped_prefill_from = 8
 sdpa.decode.grouped_prefill_lse = true
 sdpa.decode.grouped_prefill_window = true
