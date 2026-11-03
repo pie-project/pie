@@ -200,9 +200,10 @@ pub fn select_bf16_held(
     let glu = glu.filter(|_| !relu2);
     let (code, limit, alpha) = glu_code(op, glu)?;
     let code = if relu2 { 6 } else { code };
+    // On Hopper only the warp-specialized GEMM below lands relu^2 in its epilogue.
     if relu2
         && (crate::linear::gemm_sm100::supported()
-            || hopper_wgmma()
+            || (hopper_wgmma() && fan.route_count.div_ceil(experts.clamp(1, EXPERT_CAP)) < BF16_WSGEMM_FROM)
             || fan.route_count < BF16_GEMM_FROM
             || !x.width.is_multiple_of(64))
     {
@@ -221,7 +222,7 @@ pub fn select_bf16_held(
         && fan.route_count >= BF16_GEMM_FROM
         && fan.route_count.div_ceil(experts) >= BF16_WSGEMM_FROM
         && x.width.is_multiple_of(64)
-        && (0..=5).contains(&code)
+        && (0..=6).contains(&code)
     {
         const STAGES: u32 = 4;
         let order = route_order_sliced(
