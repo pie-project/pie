@@ -67,7 +67,7 @@ impl ResidencyPlanner {
             seating: parking_lot::Mutex::new(()),
             seat_to_end: false,
             to_end_notify: Notify::new(),
-            preempt_newest: std::env::var("PIE_PREEMPT_NEWEST").is_ok_and(|v| v == "1"),
+            preempt_newest: false,
         }
     }
 
@@ -76,6 +76,13 @@ impl ResidencyPlanner {
     #[must_use]
     pub fn seat_to_end(mut self, on: bool) -> Self {
         self.seat_to_end = on;
+        self
+    }
+
+    /// With `PoolFacts::preempt_newest`, see [`Self::preempt_newest_lane`].
+    #[must_use]
+    pub fn preempt_newest(mut self, on: bool) -> Self {
+        self.preempt_newest = on;
         self
     }
 

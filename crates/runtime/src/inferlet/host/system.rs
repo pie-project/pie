@@ -20,4 +20,13 @@ impl pie::inferlet::system::Host for ProcessCtx {
         crate::inferlet::process::declare_restartable(self.id());
         Ok(())
     }
+
+    async fn record_progress(&mut self, tokens: Vec<u32>) -> Result<()> {
+        crate::inferlet::process::record_progress(self.id(), &tokens);
+        Ok(())
+    }
+
+    async fn progress(&mut self) -> Result<Vec<u32>> {
+        Ok(crate::inferlet::process::progress(self.id()))
+    }
 }

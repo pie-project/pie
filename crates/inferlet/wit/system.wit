@@ -26,4 +26,14 @@ interface system {
     // becomes the queue head, and the head is never chosen as a victim.
     declare-restartable: func();
 
+    // A restartable program's tokens so far, kept for its restart: what a
+    // run records here comes back from `progress` in the run that replaces
+    // it, which can resume from them in one pass instead of producing them
+    // again.
+    record-progress: func(tokens: list<u32>);
+
+    // What the runs this one replaces recorded, oldest first; empty on a
+    // first run.
+    progress: func() -> list<u32>;
+
 }

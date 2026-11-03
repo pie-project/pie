@@ -192,6 +192,27 @@ async fn run_one(
     if prompt_vec.is_empty() {
         return Err("empty prompt".into());
     }
+    // A restarted run resumes from the tokens its earlier runs recorded, in
+    // the one prefill, rather than decoding them again a step each.
+    let restartable = bind_barrier.is_none() && !input.wait_for_start;
+    let resumed = if restartable {
+        inferlet::runtime::progress()
+    } else {
+        Vec::new()
+    };
+    if resumed.len() >= input.max_tokens {
+        return Ok(RunResult {
+            num_prompt_tokens,
+            num_output_tokens: resumed.len(),
+            tokens: resumed,
+            ttft_us: None,
+            intertoken_us: Vec::new(),
+            token_monotonic_ns: Vec::new(),
+            prologue_us,
+        });
+    }
+    let mut prompt_vec = prompt_vec;
+    prompt_vec.extend_from_slice(&resumed);
 
     if honor_wait_for_start && input.wait_for_start {
         session::send("ready");
@@ -220,7 +241,7 @@ async fn run_one(
     let embed_indptr_p = Channel::from([0u32, n]);
     // Decode fires: the prefill sample already spends one of the
     // `max_tokens` sampler activations.
-    let budget = input.max_tokens - 1;
+    let budget = input.max_tokens - resumed.len() - 1;
     // A host-visible channel cannot attach to two passes, so this one is device-only.
     let tok_in = (!input.host_first_token).then(|| Channel::new([1], dtype::i32));
     let g0_ch = Channel::new([1], dtype::i32);
@@ -442,12 +463,16 @@ async fn run_one(
 
     let wasm_delay = std::time::Duration::from_micros(input.wasm_delay_us);
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
-    let mut emitted = 0usize; // sampler emissions counted (stop excluded)
+    generated.extend_from_slice(&resumed);
+    let mut emitted = resumed.len(); // sampler emissions counted (stop excluded)
 
     let mut stopped = stop_tokens.contains(&(g0 as u32));
     if !stopped {
         emitted += 1;
         generated.push(g0 as u32);
+        if restartable {
+            inferlet::runtime::record_progress(&[g0 as u32]);
+        }
         if let Some(now_ns) = first_token_monotonic_ns {
             token_monotonic_ns.push(now_ns);
         }
@@ -480,6 +505,9 @@ async fn run_one(
         }
         emitted += 1;
         generated.push(t0 as u32);
+        if restartable {
+            inferlet::runtime::record_progress(&[t0 as u32]);
+        }
         if input.report_arrivals {
             let now_ns = inferlet::monotonic_now_ns();
             let previous_ns = *token_monotonic_ns

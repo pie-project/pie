@@ -119,6 +119,8 @@ pub struct Shell {
     seated_first: bool,
     /// `engine.seat_to_end`.
     seat_to_end: bool,
+    /// `engine.preempt_newest`.
+    preempt_newest: bool,
     /// `engine.prefill_lanes`.
     prefill_lanes: u32,
     pad: bool,
@@ -395,6 +397,13 @@ impl Shell {
     #[must_use]
     pub fn seat_to_end(&self) -> bool {
         self.seat_to_end
+    }
+
+    /// Whether this load asks the planner to preempt the youngest lane for
+    /// a seated one's pages (`engine.preempt_newest`).
+    #[must_use]
+    pub fn preempt_newest(&self) -> bool {
+        self.preempt_newest
     }
 
     /// Host rs rows: a state slot and a buffer page each, parked apart.

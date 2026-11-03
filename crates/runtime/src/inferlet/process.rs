@@ -51,6 +51,30 @@ pub(crate) fn request_restart(process_id: ProcessId) -> bool {
     true
 }
 
+/// A restartable process's recorded tokens, by its client's pid, so the run
+/// a restart puts in its place reads them back.
+static PROGRESS: LazyLock<Mutex<HashMap<ProcessId, Vec<u32>>>> = LazyLock::new(Default::default);
+
+pub(crate) fn record_progress(process_id: ProcessId, tokens: &[u32]) {
+    let client_pid = crate::policy::schedule::plex_id(process_id);
+    PROGRESS
+        .lock()
+        .unwrap()
+        .entry(client_pid)
+        .or_default()
+        .extend_from_slice(tokens);
+}
+
+pub(crate) fn progress(process_id: ProcessId) -> Vec<u32> {
+    let client_pid = crate::policy::schedule::plex_id(process_id);
+    PROGRESS
+        .lock()
+        .unwrap()
+        .get(&client_pid)
+        .cloned()
+        .unwrap_or_default()
+}
+
 static RESTART_ALIAS: LazyLock<RwLock<HashMap<ProcessId, ProcessId>>> =
     LazyLock::new(Default::default);
 
@@ -936,6 +960,7 @@ impl Process {
 
         if !restarted {
             RESTART_ALIAS.write().unwrap().remove(&self.client_pid);
+            PROGRESS.lock().unwrap().remove(&self.client_pid);
         }
         if let Some(planner) = crate::planner::planner_of(self.process_id) {
             planner.unregister(self.process_id);

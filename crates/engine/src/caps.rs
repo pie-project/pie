@@ -102,6 +102,11 @@ pub struct PoolFacts {
     /// once and evict lanes the pools then run short for.
     #[serde(default)]
     pub seat_to_end: bool,
+    /// The engine would rather a seated lane short of pages take them from
+    /// the youngest lane, restarted to resume from its tokens, than wait on
+    /// a suspend.
+    #[serde(default)]
+    pub preempt_newest: bool,
 }
 
 impl PoolFacts {

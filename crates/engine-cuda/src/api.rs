@@ -711,6 +711,7 @@ impl Engine for Cuda {
                 one_frame_when_short: shell.one_frame_when_short(),
                 seated_first: shell.seated_first(),
                 seat_to_end: shell.seat_to_end(),
+                preempt_newest: shell.preempt_newest(),
             },
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
