@@ -454,6 +454,58 @@ pub fn matmul_fp8_w8a8(
     )
 }
 
+/// [`matmul_fp8_w8a8`] for a prefill's rows on an Ada: the routed select's
+/// 256x128 tiles over the rows in order (W8A8, as SGLang runs a block-FP8
+/// plane there). `Ok(false)` elsewhere, or for a shape it does not take.
+#[cfg(feature = "cuda")]
+pub fn matmul_fp8_w8a8_wide(
+    ctx: &Ctx,
+    x: Tensor,
+    codes: u64,
+    atoms: u64,
+    y: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.matmul_fp8_w8a8_wide";
+    if crate::jit::cache::arch() != Some("sm_89")
+        || x.rows == 0
+        || !fp8_w8a8_takes(x, y.width)
+        || !y.width.is_multiple_of(256)
+        || y.rows != x.rows
+        || y.dtype != Dtype::Bf16
+    {
+        return Ok(false);
+    }
+    let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            SELECT_SM80,
+            "::pie::linear::moe_select_fp8a8_wide<0, true>",
+        ))
+        .apply(
+            Launch::grid([x.rows.div_ceil(128), y.width / 256, 1], [256, 1, 1])
+                .smem(2 * (256 + 128) * 128),
+        ),
+        &[
+            ArgValue::Ptr(xq),
+            ArgValue::Ptr(xe),
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::ABSENT,
+            ArgValue::Ptr(codes),
+            ArgValue::Ptr(atoms),
+            y.arg(),
+            1i32.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, x.width)?.arg(),
+            stated(OP, x.rows)?.arg(),
+            0f32.arg(),
+            1f32.arg(),
+        ],
+    )?;
+    Ok(true)
+}
+
 /// Three stages of 128 weight rows and 8 nb route rows, each a 128-code K
 /// step padded by 16 bytes (`kFp8a8Stages`).
 #[cfg(feature = "cuda")]

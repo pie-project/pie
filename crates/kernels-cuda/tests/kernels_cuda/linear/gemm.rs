@@ -201,9 +201,10 @@ fn the_fp8_block_projections_answer_the_dot() {
     // split across warps, then rows padded to four); 4, the W8A8 matmul
     // (narrow planes K split, wide ones whole); 5, a row's groups as its
     // routes on the W8A8 select; 6, cuBLASLt's block-scaled FP8 GEMM (rows
-    // padded to fours).
+    // padded to fours); 7, the W8A8 matmul on the wide tiles (an Ada's
+    // prefill rows, ragged).
     #[rustfmt::skip]
-    let cases = [(0, 2, 1, 4096, 2048), (0, 4, 1, 8192, 1024), (0, 4, 1, 32768, 1024),
+    let cases = [(7, 300, 1, 512, 1024), (7, 1000, 1, 768, 512),(0, 2, 1, 4096, 2048), (0, 4, 1, 8192, 1024), (0, 4, 1, 32768, 1024),
         (0, 8, 1, 1024, 4096), (1, 3, 8, 256, 1024), (2, 37, 4, 256, 1024), (3, 1, 1, 640, 6144),
         (3, 3, 1, 1024, 1536), (4, 5, 1, 384, 512), (4, 13, 1, 256, 1024), (4, 30, 1, 128, 2048),
         (4, 130, 1, 640, 1536), (4, 40, 1, 16384, 512), (4, 130, 1, 32768, 512),
@@ -225,6 +226,7 @@ fn the_fp8_block_projections_answer_the_dot() {
     for (arm, rows, groups, n, k) in cases {
         if (!supported() && arm == 2)
             || (!fp8_mma && matches!(arm, 0 | 1 | 4 | 5))
+            || (arm == 7 && kernels_cuda::jit::cache::arch() != Some("sm_89"))
             || (!hopper && arm == 6)
         {
             continue;
@@ -260,6 +262,8 @@ fn the_fp8_block_projections_answer_the_dot() {
             }
             3 => kernels_cuda::linear::gemv_fp8::fp8_block_gemv(&ctx, xt, codes, atoms, 128, &mut y).map(|took| assert!(took)),
             4 => matmul_fp8_w8a8(&ctx, xt, codes, atoms, &mut y),
+            7 => kernels_cuda::linear::moe::matmul_fp8_w8a8_wide(&ctx, xt, codes, atoms, &mut y)
+                .map(|took| assert!(took, "the wide tiles take {rows}x{n}x{k}")),
             6 => kernels_cuda::linear::gemm::cublas_lt_fp8::matmul(&ctx, "test", xt, codes, atoms, &mut y)
                 .map(|took| assert!(took, "cuBLASLt takes {rows}x{n}x{k}")),
             _ => {
