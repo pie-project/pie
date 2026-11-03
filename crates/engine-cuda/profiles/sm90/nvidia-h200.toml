@@ -16,6 +16,9 @@ sdpa.index_radix = true
 # a paged decode of a group of at most eight query heads on the tensor-core kernel, as the B200:
 # gemma-4-E4B c512 22.0k -> 23.6k tok/s, single-request decode 249 -> 253 tok/s
 sdpa.decode.gqa = true
+# from groups of two query heads a KV head: MiniMax's single-head groups read slower so
+# (MiniMax-M3.1-Flash mini60 raw decode 77.9 at every group, 86.4 off, 93.9 from two)
+sdpa.decode.gqa_min_group = 2
 # MXFP4 banks kept as an exact bf16 copy, read past 1024 routes a fire by the warp-specialized wgmma
 # GEMM as on the H100, the down banks too, all copies or none, leaving a quarter of the free memory to the
 # cache rows (MiMo-V2.6 mini48's 87 GB keep their MXFP4 banks):
@@ -34,6 +37,8 @@ moe.fp8_mma_depth = 2
 # GLM-5.3's DSA attention 64 heads a CTA on wgmma, not the 16-head mma.sync kernel:
 # mini78 pf16-512 6.06k -> 6.89k, c1024 3.47k -> 3.85k, raw prefill 4.82k -> 5.17k tok/s, parity KL 0.0153 -> 0.0160
 sdpa.mla_wgmma = true
+# from 64 rows: a decode's few rows split wider on the 16-head kernel (GLM-5.3 raw decode 54.1 -> 55.3 tok/s)
+sdpa.mla_wgmma_rows = 64
 # NVFP4 experts on the register-dequant wgmma select past 16 routes (as the H100), two warpgroups on
 # 128-route slices from 128 routes an expert, and a fire's working set up to 70% of the memory past the
 # weights (at the default half MiniMax's fires were cut to 1024 tokens and 256 lanes):

@@ -290,6 +290,14 @@ pub struct MoeMxfp4Cvt;
 #[decision(id = "kernel.moe.mxfp4_cvt_ksplit_until", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4CvtKsplitUntil(pub u32);
 
+/// The most routes an expert averages that the shared-memory-staged mxfp4
+/// select (`moe_select_mxfp4_mma_staged`) stages in slices of 32 routes,
+/// not 64: past its expert's routes a slice multiplies empty n8 blocks. 0:
+/// always 64.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_staged_narrow_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4StagedNarrowUntil(pub u32);
+
 /// A grouped bf16 projection on routes that send each group to its own
 /// plane (DeepSeek-V4's `wo_a`, dequantized at import from the checkpoint's
 /// fp8b128) requantized at load to fp8b128, each value exactly the
@@ -486,6 +494,13 @@ pub struct SdpaMlaSparse;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.mla_wgmma", flag, default = false, tune = search)]
 pub struct SdpaMlaWgmma;
+
+/// The fewest rows a latent attention fire runs the wgmma kernel at
+/// (`kernel.sdpa.mla_wgmma`); fewer (a decode's few rows) keep the 16-head
+/// kernel, whose keys split wider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.mla_wgmma_rows", constant(range(1..=65_536)), default = 1, tune = search)]
+pub struct SdpaMlaWgmmaRows(pub u32);
 
 /// Whether the tcgen05 sparse MLA pass reads a row that sees no more keys
 /// than its selection holds (a decode at a short context, a prefill's rows
@@ -834,6 +849,13 @@ pub struct Fa2Live;
 #[decision(id = "kernel.sdpa.decode.gqa", flag, default = false, tune = search)]
 pub struct DecodeGqa;
 
+/// The fewest query heads a KV head that a paged decode takes the
+/// tensor-core kernel at (`kernel.sdpa.decode.gqa`); narrower groups keep
+/// the FA2 decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.decode.gqa_min_group", constant(range(1..=8)), default = 1, tune = search)]
+pub struct DecodeGqaMinGroup(pub u32);
+
 /// The fewest requests a 64-wide decode takes the tensor-core kernel at;
 /// narrower, the FA2 decode reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -922,6 +944,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeBf16MmaUntil>()
         .add::<MoeMxfp4Cvt>()
         .add::<MoeMxfp4CvtKsplitUntil>()
+        .add::<MoeMxfp4StagedNarrowUntil>()
         .add::<GemmFp8ODown>()
         .add::<MoeMxfp4A8Until>()
         .add::<MoeMxfp4A8From>()
@@ -972,6 +995,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeGroupedPrefillWindow>()
         .add::<Fa2Live>()
         .add::<DecodeGqa>()
+        .add::<DecodeGqaMinGroup>()
         .add::<DecodeGqaFrom64>()
         .add::<DecodeGqaWholeWindow>()
         .add::<DecodeGqaCluster>()
@@ -990,6 +1014,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmFp8GroupedTc5Until>()
         .add::<SdpaMlaSparse>()
         .add::<SdpaMlaWgmma>()
+        .add::<SdpaMlaWgmmaRows>()
         .add::<SdpaMlaDenseShort>()
         .add::<GemmNarrowN>();
 }
@@ -1074,6 +1099,7 @@ tuning! {
     bf16_mma_until: u32 = 0, get MoeBf16MmaUntil;
     mxfp4_cvt: bool = false, on MoeMxfp4Cvt;
     mxfp4_cvt_ksplit_until: u32 = 0, get MoeMxfp4CvtKsplitUntil;
+    mxfp4_staged_narrow_until: u32 = 0, get MoeMxfp4StagedNarrowUntil;
     fp8_o_down: bool = false, on GemmFp8ODown;
     mxfp4_a8_until: u32 = 0, get MoeMxfp4A8Until;
     mxfp4_a8_from: u32 = 0, get MoeMxfp4A8From;
@@ -1124,6 +1150,7 @@ tuning! {
     decode_grouped_prefill_window: bool = false, on DecodeGroupedPrefillWindow;
     fa2_live: bool = false, on Fa2Live;
     decode_gqa: bool = false, on DecodeGqa;
+    decode_gqa_min_group: u32 = 1, get DecodeGqaMinGroup;
     decode_gqa_from_64: u32 = 0, get DecodeGqaFrom64;
     decode_gqa_whole_window: u32 = 0, get DecodeGqaWholeWindow;
     decode_gqa_cluster: u32 = 0, get DecodeGqaCluster;
@@ -1142,6 +1169,7 @@ tuning! {
     gemm_fp8_grouped_tc5_until: u32 = 0, get GemmFp8GroupedTc5Until;
     mla_sparse: bool = false, on SdpaMlaSparse;
     mla_wgmma: bool = false, on SdpaMlaWgmma;
+    mla_wgmma_rows: u32 = 1, get SdpaMlaWgmmaRows;
     mla_dense_short: bool = false, on SdpaMlaDenseShort;
     gemm_narrow_n: u32 = 0, get GemmNarrowN;
 }
