@@ -72,6 +72,21 @@ impl ResidencyPlanner {
             // see the room the others are about to take, and seat lanes their
             // first page boundary finds short.
             let _seating = self.seating.lock();
+            if self.seat_watermark_permille > 0
+                && demand.kv_pages > 0
+                && self
+                    .lock_inner()
+                    .procs
+                    .get(&pid)
+                    .is_some_and(|proc| !proc.seated)
+            {
+                let (kv_free, kv_total) = self.port.device_stats();
+                let watermark = (u64::from(kv_total) * u64::from(self.seat_watermark_permille))
+                    .div_ceil(1000);
+                if u64::from(kv_free) < u64::from(demand.kv_pages) + watermark {
+                    return None;
+                }
+            }
             if !demand.rs.is_zero() {
                 let (rs_free, rs_total) = self.port.rs_stats();
                 let reserve =

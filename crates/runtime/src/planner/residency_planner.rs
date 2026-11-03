@@ -47,6 +47,9 @@ pub struct ResidencyPlanner {
     to_end_notify: Notify,
     /// `PoolFacts::preempt_newest`: see [`Self::preempt_newest_lane`].
     pub(super) preempt_newest: bool,
+    /// Kv pages, in thousandths of the pool, a prompt's first grant leaves
+    /// free for the seated lanes to grow into, as vLLM's watermark does.
+    pub(super) seat_watermark_permille: u32,
 }
 
 impl ResidencyPlanner {
@@ -68,6 +71,7 @@ impl ResidencyPlanner {
             seat_to_end: false,
             to_end_notify: Notify::new(),
             preempt_newest: false,
+            seat_watermark_permille: 0,
         }
     }
 
@@ -83,6 +87,14 @@ impl ResidencyPlanner {
     #[must_use]
     pub fn preempt_newest(mut self, on: bool) -> Self {
         self.preempt_newest = on;
+        self.seat_watermark_permille = if on { 10 } else { 0 };
+        self
+    }
+
+    /// A prompt's first grant leaves `permille` of the kv pages free.
+    #[must_use]
+    pub fn seat_watermark_permille(mut self, permille: u32) -> Self {
+        self.seat_watermark_permille = permille;
         self
     }
 

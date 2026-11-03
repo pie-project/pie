@@ -491,7 +491,13 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             ))
             .seated_first(seated_first)
             .seat_to_end(seat_to_end)
-            .preempt_newest(preempt_newest),
+            .preempt_newest(preempt_newest)
+            .seat_watermark_permille(
+                std::env::var("PIE_AB_WATERMARK_PERMILLE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(if preempt_newest { 10 } else { 0 }),
+            ),
         );
     }
     // After the gates and the planner it orders exist.
