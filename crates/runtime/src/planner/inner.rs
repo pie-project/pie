@@ -150,7 +150,19 @@ impl Inner {
                 .count(),
         )
         .unwrap_or(u32::MAX);
-        seated.saturating_mul(2).min(kv_total / 8)
+        static KNOB: std::sync::LazyLock<(u32, u32)> = std::sync::LazyLock::new(|| {
+            let get = |k: &str, d: u32| {
+                std::env::var(k)
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(d)
+            };
+            (
+                get("PIE_KV_SEAT_PAGES", 2),
+                get("PIE_KV_SEAT_SHARE", 8).max(1),
+            )
+        });
+        seated.saturating_mul(KNOB.0).min(kv_total / KNOB.1)
     }
 
     pub(super) fn growth_first(&self, pid: ProcessId) -> bool {
