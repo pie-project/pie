@@ -133,6 +133,13 @@ pub fn select_glu(
     use crate::linear::gemm_sm100;
     const OP: &str = "fused.moe_select_glu";
     let fan = selected(OP, x, routes, y)?;
+    // A decode's bf16 SwiGLU select on one GEMV launch, the GLU with it.
+    if let GluBank::Bf16(b) = bank
+        && matches!(glu, gemm_sm100::Glu::Swiglu)
+        && super::select::select_gemv_swiglu(ctx, x, b, routes, y, experts)?
+    {
+        return Ok(true);
+    }
     // A narrow mxfp4 fire reads its bank faster on the register-dequant
     // kernel, which lands the GLU too.
     if let GluBank::Mxfp4 {

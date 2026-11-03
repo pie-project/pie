@@ -572,6 +572,79 @@ pub(crate) fn select_gemv(
     )
 }
 
+/// A decode's gate-up select and its SwiGLU on one GEMV launch
+/// (`moe_matmul_select_gemv_swiglu`): a bf16 bank `[experts, 2 * I, K]`,
+/// `y` `[routes, I]`, where the select alone would take the per-route GEMV
+/// (no tcgen05 or mma.sync fire). Lands what [`select_gemv`] and
+/// `swiglu_vec8` land. `Ok(false)` where it does not take the fire.
+#[cfg(feature = "cuda")]
+pub(crate) fn select_gemv_swiglu(
+    ctx: &Ctx,
+    x: Tensor,
+    bank: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    experts: ExpertTable,
+) -> Result<bool, Error> {
+    const OP: &str = "fused.moe_select_gemv_swiglu";
+    const ROWS: u32 = 4;
+    let fan = selected(OP, x, routes, y)?;
+    if x.dtype != Dtype::Bf16
+        || bank.dtype != Dtype::Bf16
+        || y.dtype != Dtype::Bf16
+        || !fan.by_token
+        || fan.route_count == 0
+        || fan.route_count > MAX_GRID_Y
+        || x.width == 0
+        || !x.width.is_multiple_of(8)
+        || u64::from(bank.width) != 2 * u64::from(x.width) * u64::from(y.width)
+        || tc5_worth(
+            ctx,
+            x,
+            (bank.dtype, bank.rows),
+            y,
+            experts,
+            routes.rows,
+            fan.route_count,
+        )
+        || (super::select_bf16::bf16_mma_spans(ctx, fan.route_count)
+            && fan.route_count > fan.top_k.unsigned_abs())
+    {
+        return Ok(false);
+    }
+    let k = stated(OP, x.width)?;
+    let inter = stated(OP, nonzero(OP, "I, the GLU's width", y.width)?)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            SELECT,
+            &format!("::pie::linear::moe_matmul_select_gemv_swiglu<::pie::bf16, {ROWS}>"),
+        ))
+        .apply(
+            Launch::grid(
+                [y.width.div_ceil(GEMV_WARPS * ROWS), fan.route_count, 1],
+                [WARP, GEMV_WARPS, 1],
+            )
+            .programmatic(ctx.tuning().pdl),
+        ),
+        &[
+            routes.arg(),
+            x.arg(),
+            bank.arg(),
+            y.arg(),
+            fan.top_k.arg(),
+            k.arg(),
+            inter.arg(),
+            (2 * i64::from(inter) * i64::from(k)).arg(),
+            ArgValue::Ptr(experts.table),
+            ArgValue::Ptr(experts.hits),
+            stated(OP, fan.route_count)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}
+
 pub(crate) const EXPERT_CAP: u32 = 4096;
 
 pub(crate) const GROUPED_TILE_N: u32 = 128;

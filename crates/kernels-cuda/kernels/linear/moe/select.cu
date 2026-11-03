@@ -136,6 +136,89 @@ __global__ void moe_matmul_select_gemv_by_token(
         expert_table, expert_hits, win, route_count);
 }
 
+// A decode's gate-up select and its SwiGLU in one launch: a warp's `kRows`
+// gate rows of a bank laid `[experts, 2 * I, K]` (gate rows, then up rows)
+// beside the same up rows, each sum rounded as the select lands it before
+// `swiglu_vec8`'s SwiGLU, so the values are the two launches' bit for bit.
+template <class T, int kRows>
+__global__ void moe_matmul_select_gemv_swiglu(
+    const i32* __restrict__ topk_idx,
+    const T* __restrict__ act,
+    const T* __restrict__ weight_base,
+    T* __restrict__ out,
+    int top_k, int K, int I, long long expert_stride,
+    const T* const* __restrict__ expert_table,
+    unsigned int* __restrict__ expert_hits,
+    int route_count,
+    const u32* __restrict__ win)
+{
+    pdl_wait();
+    pdl_launch();
+    const int route = static_cast<int>(blockIdx.y + blockIdx.z * gridDim.y);
+    if (route >= route_count) return;
+    if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
+    const int plane_route = win != nullptr ? route + static_cast<int>(win[1]) * top_k : route;
+    const int row0 = (static_cast<int>(blockIdx.x) * kGemvWarps + static_cast<int>(threadIdx.y)) * kRows;
+    if (row0 >= I) return;
+    const int lane = threadIdx.x;
+    const int expert = topk_idx[plane_route];
+    if (expert < 0) {
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < kRows; ++r)
+                if (row0 + r < I) out[(long long)plane_route * I + row0 + r] = Elem<T>::from_f32(0.f);
+        }
+        return;
+    }
+    if (blockIdx.x == 0 && threadIdx.y == 0 && lane == 0) {
+        moe_note_expert(expert_hits, expert);
+    }
+    const T* w = moe_expert_base(weight_base, expert_table, expert, expert_stride);
+    const float4* w4[2 * kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+        const long long row = min(row0 + r, I - 1);
+        w4[r] = reinterpret_cast<const float4*>(w + row * K);
+        w4[kRows + r] = reinterpret_cast<const float4*>(w + (row + I) * K);
+    }
+    const float4* x4 = reinterpret_cast<const float4*>(act + (long long)(plane_route / top_k) * K);
+    float acc[2 * kRows];
+#pragma unroll
+    for (int r = 0; r < 2 * kRows; ++r) acc[r] = 0.f;
+    const int vec = K / kMoeVecWidth;
+    for (int i = lane; i < vec; i += 32) {
+        float4 wv[2 * kRows];
+#pragma unroll
+        for (int r = 0; r < 2 * kRows; ++r) wv[r] = w4[r][i];
+        const float4 xv = x4[i];
+        const T* xb = reinterpret_cast<const T*>(&xv);
+#pragma unroll
+        for (int r = 0; r < 2 * kRows; ++r) {
+            const T* wb = reinterpret_cast<const T*>(&wv[r]);
+#pragma unroll
+            for (int j = 0; j < kMoeVecWidth; ++j) {
+                acc[r] += Elem<T>::to_f32(wb[j]) * Elem<T>::to_f32(xb[j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+        for (int r = 0; r < 2 * kRows; ++r) acc[r] += __shfl_down_sync(0xffffffffu, acc[r], off);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            if (row0 + r < I) {
+                const float g = Elem<T>::to_f32(Elem<T>::from_f32(acc[r]));
+                const float u = Elem<T>::to_f32(Elem<T>::from_f32(acc[kRows + r]));
+                const float silu = g / (1.f + __expf(-g));
+                out[(long long)plane_route * I + row0 + r] = Elem<T>::from_f32(silu * u);
+            }
+        }
+    }
+}
+
 template <class T, int kRows>
 __global__ void moe_matmul_select_gemv_by_route(
     const i32* __restrict__ topk_idx,
