@@ -88,7 +88,33 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
 #pragma unroll
     for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
     const int vec = K / kMoeVecWidth;
-    for (int i = lane; i < vec; i += 32) {
+    // `kU` steps' loads issue before their sums (a decode's few routes are
+    // too few warps to hide a load a step); each row still sums in step order.
+    constexpr int kU = kRows >= 8 ? 2 : 4;
+    int i = lane;
+    for (; i + 32 * (kU - 1) < vec; i += 32 * kU) {
+        float4 wv[kU][kRows];
+        float4 xv[kU];
+#pragma unroll
+        for (int u = 0; u < kU; ++u) {
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) wv[u][r] = w4[r][i + 32 * u];
+            xv[u] = x4[i + 32 * u];
+        }
+#pragma unroll
+        for (int u = 0; u < kU; ++u) {
+            const T* xb = reinterpret_cast<const T*>(&xv[u]);
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                const T* wb = reinterpret_cast<const T*>(&wv[u][r]);
+#pragma unroll
+                for (int j = 0; j < kMoeVecWidth; ++j) {
+                    acc[r] += Elem<T>::to_f32(wb[j]) * Elem<T>::to_f32(xb[j]);
+                }
+            }
+        }
+    }
+    for (; i < vec; i += 32) {
         float4 wv[kRows];
 #pragma unroll
         for (int r = 0; r < kRows; ++r) wv[r] = w4[r][i];
