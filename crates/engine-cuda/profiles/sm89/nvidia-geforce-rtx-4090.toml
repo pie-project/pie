@@ -46,6 +46,13 @@ moe.mxfp4_mma_per_from = 4
 [engine]
 working_set_percent = 65
 
+# Independent chains on side streams, as the H100, sm100 and the RTX PRO 6000
+# run them: single-request decode Qwen3.5-0.8B 456 -> 464, Qwen3-0.6B 513 ->
+# 523, gpt-oss-20b 201.3 -> 203.3 tok/s; greedy tokens unchanged.
+[compiler]
+dag_streams = true
+dag_streams_until = 256
+
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 35.9 -> 35.2 ms, 1-lane step 3.55 -> 3.48 ms, 4-lane step 5.23 -> 5.17 ms, 8-lane step 7.52 -> 7.47 ms, readout cosine 1.0000"
 measured = [
