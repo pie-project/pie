@@ -130,8 +130,17 @@ pub fn select_fp8_w8a8(
                 &format!("::pie::linear::moe_select_fp8a8_wsgemm<{STAGES}>"),
             ))
             .apply(
-                Launch::grid([work_cap, y.width / 128, 1], [384, 1, 1])
-                    .smem(STAGES * 32768 + 1024 + 128),
+                Launch::grid(
+                    [
+                        (work_cap * (y.width / 128))
+                            .min(ctx.multiprocessors().unwrap_or(132))
+                            .max(1),
+                        1,
+                        1,
+                    ],
+                    [384, 1, 1],
+                )
+                .smem(STAGES * 32768 + 1024 + 128),
             ),
             &[
                 ArgValue::Ptr(xq),
