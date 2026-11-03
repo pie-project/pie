@@ -61,11 +61,12 @@ struct Shape {
     static constexpr int kBytes = kQBytes + W * kWarpBytes + W * 16 * 2 * 4;
 };
 
-// With `R` above one, a cluster of R blocks along x serves the (row, kv
-// head), each block every R-th of the warps' chunks, and folds the R * W
+// With `kRanks` above one, a cluster of that many blocks along x serves the
+// (row, kv head), each block every kRanks-th of the warps' chunks, and folds
+// the kRanks * W
 // warps' partials across the cluster, rank by rank (one block: the warps'
 // fold as before).
-template <int D, int W = kWarps, int R = 1>
+template <int D, int W = kWarps, int kRanks = 1>
 __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
     const __nv_bfloat16* __restrict__ queries,
     const __nv_bfloat16* __restrict__ k_pages,
@@ -86,8 +87,8 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
     constexpr int kLd = S::kLd;
     constexpr int kNTiles = S::kNTiles;
     constexpr int kChunks = D / 8;
-    const int t = static_cast<int>(blockIdx.x) / R;
-    const int rank = static_cast<int>(blockIdx.x) % R;
+    const int t = static_cast<int>(blockIdx.x) / kRanks;
+    const int rank = static_cast<int>(blockIdx.x) % kRanks;
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
     if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
@@ -147,7 +148,7 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
     }
     float m_lo = -CUDART_INF_F, m_hi = -CUDART_INF_F, l_lo = 0.f, l_hi = 0.f;
 
-    for (int base = (rank * kWarps + warp) * kKeys; base < steps; base += R * kWarps * kKeys) {
+    for (int base = (rank * kWarps + warp) * kKeys; base < steps; base += kRanks * kWarps * kKeys) {
         if (lane < kKeys) {
             const int n = base + lane;
             int j = -1;
@@ -270,17 +271,17 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
         sML[(warp * 16 + g + 8) * 2 + 1] = l_hi;
     }
     __syncthreads();
-    if constexpr (R > 1) sync_ranks();
-    auto at = [&](const float* p, int q) { return R > 1 ? ld_rank(p, q) : *p; };
-    for (int idx = rank * kThreads + tid; idx < G * D; idx += R * kThreads) {
+    if constexpr (kRanks > 1) sync_ranks();
+    auto at = [&](const float* p, int q) { return kRanks > 1 ? ld_rank(p, q) : *p; };
+    for (int idx = rank * kThreads + tid; idx < G * D; idx += kRanks * kThreads) {
         const int row = idx / D;
         const int d = idx % D;
         float m_all = -CUDART_INF_F;
-        for (int q = 0; q < R; ++q)
+        for (int q = 0; q < kRanks; ++q)
             for (int w = 0; w < kWarps; ++w) m_all = fmaxf(m_all, at(&sML[(w * 16 + row) * 2], q));
         float l_all = 0.f, v = 0.f;
         if (m_all > -CUDART_INF_F) {
-            for (int q = 0; q < R; ++q) {
+            for (int q = 0; q < kRanks; ++q) {
                 for (int w = 0; w < kWarps; ++w) {
                     const float mw = at(&sML[(w * 16 + row) * 2], q);
                     if (mw == -CUDART_INF_F) continue;
@@ -297,7 +298,7 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
             __float2bfloat16(v * inv);
     }
     // No block leaves while another may still read its shared memory.
-    if constexpr (R > 1) sync_ranks();
+    if constexpr (kRanks > 1) sync_ranks();
 }
 
 // Rows that share their keys: a block serves `kTileRows` consecutive query
