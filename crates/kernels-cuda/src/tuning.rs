@@ -345,6 +345,13 @@ pub struct MoeMxfp4Bf16Down;
 #[decision(id = "kernel.moe.mxfp4_w4a8_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4W4a8From(pub u32);
 
+/// The fewest routes an NVFP4 select of a W4A4 release runs W4A4 on sm_120a's
+/// block-scaled mma.sync, its rows quantized as NVFP4 (as the FlashInfer SM120
+/// CUTLASS MoE reads NVFP4 experts on the consumer Blackwells). 0: never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.nvfp4_w4a4_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeNvfp4W4a4From(pub u32);
+
 /// The W4A8 select's stages landed by TMA, its rows quantized in route order
 /// so an expert's slice is one box. Off but where a chip's profile says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -875,6 +882,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4Bf16From>()
         .add::<MoeMxfp4Bf16Down>()
         .add::<MoeMxfp4W4a8From>()
+        .add::<MoeNvfp4W4a4From>()
         .add::<MoeMxfp4W4a8Tma>()
         .add::<MoeMxfp4W4a8Ws>()
         .add::<MoeW4a4FusedFrom>()
@@ -1019,6 +1027,7 @@ tuning! {
     mxfp4_bf16_from: u32 = 0, get MoeMxfp4Bf16From;
     mxfp4_bf16_down: bool = false, on MoeMxfp4Bf16Down;
     mxfp4_w4a8_from: u32 = 0, get MoeMxfp4W4a8From;
+    nvfp4_w4a4_from: u32 = 0, get MoeNvfp4W4a4From;
     mxfp4_w4a8_tma: bool = false, on MoeMxfp4W4a8Tma;
     mxfp4_w4a8_ws: bool = false, on MoeMxfp4W4a8Ws;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
