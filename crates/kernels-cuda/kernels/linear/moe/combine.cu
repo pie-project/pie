@@ -231,23 +231,6 @@ __global__ void route_scatter_rows_f16(
         make_uint4(h[0], h[1], h[2], h[3]);
 }
 
-// `x[i] = fp16(x[i])` in place over `n8` runs of eight bf16.
-__global__ void rows_bf16_to_f16(u32* __restrict__ x, long long n8)
-{
-    const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (at >= n8) return;
-    uint4* p = reinterpret_cast<uint4*>(x) + at;
-    const uint4 v = *p;
-    const u32 w[4] = {v.x, v.y, v.z, v.w};
-    u32 h[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const __half2 q = __floats2half2_rn(bf16x2_lo(w[i]), bf16x2_hi(w[i]));
-        h[i] = *reinterpret_cast<const u32*>(&q);
-    }
-    *p = make_uint4(h[0], h[1], h[2], h[3]);
-}
-
 template <class T>
 __global__ void moe_sigmoid_gate_add(
     T* __restrict__ out,
