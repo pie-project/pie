@@ -195,6 +195,8 @@ __global__ void __launch_bounds__(32 * kWarps) moe_select_mxfp4_mma_staged(
     const int begin = offsets[expert] + slice * kSlice;
     const int count = min(offsets[expert + 1] - begin, kSlice);
     if (count <= 0) return;
+    // The slice's n8 blocks past its routes skipped: an expert's last slice is rarely full.
+    const int blocks = (count + 7) >> 3;
 
     const int tid = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -296,11 +298,11 @@ __global__ void __launch_bounds__(32 * kWarps) moe_select_mxfp4_mma_staged(
 #pragma unroll
             for (int t = 0; t < kTiles; ++t) wide |= cs[t][0] > 128u || cs[t][1] > 128u;
             if constexpr (kNv) {
-                w4mma::compute_staged<false, true>(cw, cs, xs, g, c, acc);
+                w4mma::compute_staged<false, true>(cw, cs, xs, g, c, acc, blocks);
             } else if (__any_sync(0xffffffffu, wide)) {
-                w4mma::compute_staged<true, false>(cw, cs, xs, g, c, acc);
+                w4mma::compute_staged<true, false>(cw, cs, xs, g, c, acc, blocks);
             } else {
-                w4mma::compute_staged<false, false>(cw, cs, xs, g, c, acc);
+                w4mma::compute_staged<false, false>(cw, cs, xs, g, c, acc, blocks);
             }
         }
         stage(ch + kStages - 1);
@@ -564,6 +566,7 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_mma_pipe(
     const int begin = offsets[expert] + slice * kSlice;
     const int count = min(offsets[expert + 1] - begin, kSlice);
     if (count <= 0) return;
+    const int blocks = (count + 7) >> 3;
 
     const int tid = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -661,9 +664,9 @@ __global__ void __launch_bounds__(256, 1) moe_select_mxfp4_mma_pipe(
                     wide |= cs[t][h] > 128u;
                 }
             if (__any_sync(0xffffffffu, wide)) {
-                w4mma::compute_staged<true, false>(cw, cs, st, g, c, acc);
+                w4mma::compute_staged<true, false>(cw, cs, st, g, c, acc, blocks);
             } else {
-                w4mma::compute_staged<false, false>(cw, cs, st, g, c, acc);
+                w4mma::compute_staged<false, false>(cw, cs, st, g, c, acc, blocks);
             }
         }
     }
