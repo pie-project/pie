@@ -1533,12 +1533,16 @@ impl Weights {
             Some((at, codes, scales, rows, k))
         };
         let picked: Vec<_> = read.into_iter().filter_map(candidate).collect();
-        // Every copy or none: they leave `kernel.moe.mxfp4_bf16_keep` percent
-        // of the free memory to the cache rows, or the banks stay MXFP4.
+        // Every copy or none: they fit the free memory and leave
+        // `kernel.moe.mxfp4_bf16_keep` percent of it to the cache rows, or the
+        // banks stay MXFP4.
         let total: u64 = picked.iter().map(|&(_, _, _, rows, k)| rows * k * 2).sum();
-        if keep_percent > 0
-            && crate::device::alloc::free_bytes()
-                .is_none_or(|free| free - free.min(total) < free / 100 * u64::from(keep_percent))
+        let free = crate::device::alloc::free_bytes();
+        if free.is_some_and(|free| total > free)
+            || (keep_percent > 0
+                && free.is_none_or(|free| {
+                    free - free.min(total) < free / 100 * u64::from(keep_percent)
+                }))
         {
             return Ok(0);
         }
