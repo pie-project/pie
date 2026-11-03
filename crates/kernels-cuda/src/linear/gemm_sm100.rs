@@ -787,6 +787,22 @@ pub fn grouped_gemm_epi(
     // An fp16 W4A16 GLU fire of 64 routes an expert or fewer runs in 64-row
     // Q tiles: an expert's rows fill one, where a 128-row tile ran half
     // empty (gpt-oss-20b c512 on a B200, measured).
+    // A bf16 GLU fire of 32 routes an expert or fewer runs swapped in 32-row
+    // Q tiles: a 128-row tile ran three quarters empty (gemma-4-26b-a4b c1024
+    // on a B200, its 128 experts at 32 routes, measured).
+    if matches!(Kind::of(act, w), Ok(Kind::Bf16))
+        && matches!(g.groups, Groups::Contiguous { .. })
+        && routed <= 32 * g.experts
+        && epi.glu.is_some()
+    {
+        plan = Plan {
+            swap: true,
+            pair: false,
+            bn: 32,
+            stages: 0,
+            splits: 1,
+        };
+    }
     if matches!(Kind::of(act, w), Ok(Kind::Mixed(4)))
         && matches!(g.groups, Groups::Contiguous { .. })
         && routed <= 64 * g.experts
@@ -859,10 +875,10 @@ pub fn grouped_gemm_epi_with(
     let job = match g.groups {
         Groups::Contiguous { offsets, rows, cap } => {
             let swap = plan.swap;
-            if swap && !matches!(kind, Kind::Mixed(_) | Kind::Mx | Kind::Nvf4) {
+            if swap && !matches!(kind, Kind::Bf16 | Kind::Mixed(_) | Kind::Mx | Kind::Nvf4) {
                 return Err(refuse(
                     OP,
-                    "a contiguous group runs unswapped (a W4A16 or an NVFP4 one swapped too)",
+                    "a contiguous group runs unswapped (a bf16, W4A16 or NVFP4 one swapped too)",
                 ));
             }
             // A 32-row Q tile at an odd quarter of its rows' 128-row scale
