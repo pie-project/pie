@@ -103,7 +103,14 @@ pub fn select_fp8_w8a8(
     // (`kernel.moe.fp8a8_ws_from`): 128 routes by 128 weight rows a CTA.
     let ws_from = ctx.tuning().fp8a8_ws_from;
     if hopper_wgmma() && ws_from > 0 && per >= ws_from {
-        const STAGES: u32 = 6;
+        // Two 128-row halves a CTA where N is whole 256s (the routes' rows
+        // read half as often), four stages; one, six stages.
+        let halves: u32 = if y.width.is_multiple_of(256) && !ctx.tuning().fp8a8_ws_narrow {
+            2
+        } else {
+            1
+        };
+        let stages: u32 = if halves == 2 { 4 } else { 6 };
         let RouteOrder {
             order,
             offsets,
@@ -127,20 +134,11 @@ pub fn select_fp8_w8a8(
             OP,
             Fire::at(kernel(
                 SELECT_SM90,
-                &format!("::pie::linear::moe_select_fp8a8_wsgemm<{STAGES}>"),
+                &format!("::pie::linear::moe_select_fp8a8_wsgemm<{stages}, {halves}>"),
             ))
             .apply(
-                Launch::grid(
-                    [
-                        (work_cap * (y.width / 128))
-                            .min(ctx.multiprocessors().unwrap_or(132))
-                            .max(1),
-                        1,
-                        1,
-                    ],
-                    [384, 1, 1],
-                )
-                .smem(STAGES * 32768 + 1024 + 128),
+                Launch::grid([work_cap, y.width / (128 * halves), 1], [384, 1, 1])
+                    .smem(stages * 16384 * (1 + halves) + 1024 + 128),
             ),
             &[
                 ArgValue::Ptr(xq),

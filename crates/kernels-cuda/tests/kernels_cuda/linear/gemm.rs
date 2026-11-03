@@ -211,7 +211,7 @@ fn the_fp8_block_projections_answer_the_dot() {
         (6, 5, 1, 384, 512), (6, 64, 1, 640, 1536),
         (6, 37, 1, 16384, 512), (6, 130, 1, 256, 2048),
         (7, 37, 4, 256, 1024), (7, 200, 3, 512, 1024), (7, 130, 2, 768, 512),
-        (7, 1000, 2, 2048, 256)];
+        (7, 1000, 2, 2048, 256), (7, 130, 2, 384, 512)];
     // The mma.sync fp8 kernels (arms 0, 1, 4 and 5) are sm_89's: an Ada's e4m3 MMA.
     let fp8_mma = kernels_cuda::jit::cache::arch()
         .and_then(|a| {
