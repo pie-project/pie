@@ -57,8 +57,9 @@ pub(crate) fn remote() -> Option<Arc<dyn Remote>> {
 pub fn sealed_keys() -> HashSet<Hash256> {
     let mut keys = HashSet::new();
     for stores in crate::store::registry::all_for_model(0) {
+        // copied under the lock every guest's fire waits on, hashed after
         keys.extend(with_kv_lock(&stores.kv, "offload-report", |kv| {
-            kv.sealed_keys()
+            kv.sealed_key_list()
         }));
     }
     keys

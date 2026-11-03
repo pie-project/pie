@@ -95,6 +95,17 @@ impl std::fmt::LowerHex for PipelineScopeId {
 
 /// Cached pages are reclaimable, so they count as free.
 pub fn kv_tokens() -> (u64, u64) {
+    // The report asks every 100 ms, and counting the cached pages walks every
+    // cache entry under the kv lock every guest's fire waits on: the count
+    // stands for a second.
+    static LAST: std::sync::Mutex<Option<(crate::rt::Instant, (u64, u64))>> =
+        std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if let Some((at, tokens)) = *last
+        && at.elapsed() < std::time::Duration::from_secs(1)
+    {
+        return tokens;
+    }
     let mut capacity = 0u64;
     let mut used = 0u64;
     for stores in registry::all_for_model(0) {
@@ -110,6 +121,7 @@ pub fn kv_tokens() -> (u64, u64) {
         capacity += total * page;
         used += total.saturating_sub(available).saturating_sub(cached) * page;
     }
+    *last = Some((crate::rt::Instant::now(), (capacity, used)));
     (capacity, used)
 }
 
