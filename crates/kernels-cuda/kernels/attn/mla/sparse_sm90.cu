@@ -189,17 +189,25 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
         cp16(sQ + at_of(row, ch), src, true);
     }
 
-    // A tile's slots (and which hold a key), then its copies.
-    auto slots = [&](int j0, int stage) {
+    // A tile's slots (and which hold a key), read a tile ahead into the
+    // first 64 threads' registers under the scores' MMAs, then published.
+    long long nslot = -1;
+    bool nok = false;
+    auto fetch = [&](int j0) {
         if (tid < kBK) {
             const int n = j0 + tid;
             int j = n;
             if (srow != nullptr) j = n < j_hi ? srow[n] : -1;
-            const bool ok = n < j_hi && j >= 0 && j < j_end;
-            s_slot[tid] = ok
+            nok = n < j_hi && j >= 0 && j < j_end;
+            nslot = nok
                 ? static_cast<long long>(kv_page_indices[pages_first + j / page_size]) * page_size + (j % page_size)
                 : -1;
-            const unsigned bits = __ballot_sync(0xffffffffu, ok);
+        }
+    };
+    auto publish = [&](int stage) {
+        if (tid < kBK) {
+            s_slot[tid] = nslot;
+            const unsigned bits = __ballot_sync(0xffffffffu, nok);
             if (lane == 0) reinterpret_cast<unsigned*>(&s_ok[stage])[warp] = bits;
         }
     };
@@ -228,9 +236,11 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
 
     const int tiles = (j_hi - j_lo + kBK - 1) / kBK;
     if (tiles > 0) {
-        slots(j_lo, 0);
+        fetch(j_lo);
+        publish(0);
         __syncthreads();
         issue(0);
+        if (tiles > 1) fetch(j_lo + kBK);
     } else {
         asm volatile("cp.async.commit_group;\n" ::);
     }
@@ -239,7 +249,7 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
         const int st = i & 1;
         __syncthreads();
         if (i + 1 < tiles) {
-            slots(j_lo + (i + 1) * kBK, st ^ 1);
+            publish(st ^ 1);
             __syncthreads();
             issue(st ^ 1);
             asm volatile("cp.async.wait_group 1;\n" ::: "memory");
@@ -263,6 +273,7 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
             }
         }
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+        if (i + 2 < tiles) fetch(j_lo + (i + 2) * kBK);
         asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 
         // Row g and g + 8 of the warp's 16: keys 32 wg + 8 j + 2 c (+1).
