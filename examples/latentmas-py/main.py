@@ -12,8 +12,8 @@ Messages in (JSON), each answered with one JSON message:
 
 - `{"op": "think", "messages" | "tokens", "steps", "scale"}`: read the prompt after the context, then
   take `steps` latent steps there. Replies `{"len", "read"}`.
-- `{"op": "say", "messages" | "tokens", "max_tokens", "temperature", "top_p", "seed", "fresh"}`: read
-  the prompt (on an empty context when `fresh`) and sample a reply. Replies
+- `{"op": "say", "messages" | "tokens", "max_tokens", "temperature", "top_p", "top_k", "seed", "fresh"}`:
+  read the prompt (on an empty context when `fresh`) and sample a reply. Replies
   `{"tokens", "text", "read", "len"}`.
 - `{"op": "probe", "tokens", "steps", "scale"}`: `think` on an empty context, one host trip a step,
   sending each latent input as `{"input"}` as it lands (a parity check against Hugging Face). Replies
@@ -42,7 +42,10 @@ from inferlet.eta import (
     frame_size,
     intrinsics,
     iota,
+    mask_apply,
     nucleus_sample,
+    pivot_threshold,
+    rank_le,
     reduce_argmax,
     reduce_sum,
     reshape,
@@ -73,10 +76,13 @@ def realign(h, width: int, scale: float):
     return h * broadcast(reshape(rsqrt(reduce_sum(h * h)) * scale, [1, 1]), [1, width])
 
 
-def sample(logits, temperature: float, top_p: float, state):
-    """The sampled next token, as a `[1]` cell: greedy at temperature 0, else top-p."""
+def sample(logits, temperature: float, top_p: float, top_k: int, state):
+    """The sampled next token, as a `[1]` cell: greedy at temperature 0, else top-p, among the `top_k`
+    likeliest first when set (Hugging Face's and vLLM's order)."""
     if temperature == 0:
         return reshape(reduce_argmax(logits), [1])
+    if top_k:
+        logits = mask_apply(logits, pivot_threshold(logits, rank_le(top_k)))
     return reshape(nucleus_sample(logits * (1.0 / temperature), top_p, state), [1])
 
 
@@ -192,14 +198,14 @@ class Team:
             self.len += 1
         return steps
 
-    async def say(self, tokens: list[int], count: int, temperature: float, top_p: float, seed: int,
+    async def say(self, tokens: list[int], count: int, temperature: float, top_p: float, top_k: int, seed: int,
                   stops: set[int], stream: bool) -> list[int]:
         rng_first = Channel.from_([seed, 0], dtype.u32)
         first_out = Channel([1], dtype.i32)
 
         def first_epilogue():
             state = rng_first.take()
-            first_out.put(sample(intrinsics.output(0, "logits"), temperature, top_p, state))
+            first_out.put(sample(intrinsics.output(0, "logits"), temperature, top_p, top_k, state))
 
         self.read(tokens, "text", first_epilogue)
         first = await first_out.take_scalar()
@@ -217,7 +223,7 @@ class Team:
         @fwd.epilogue
         def _():
             state = rng.take()
-            token = sample(intrinsics.output(0, "logits"), temperature, top_p, state)
+            token = sample(intrinsics.output(0, "logits"), temperature, top_p, top_k, state)
             tok_in.put(token)
             tok_out.put(token)
             rng.put(state + iota(2))
@@ -270,8 +276,8 @@ async def main(input: dict) -> dict:
             tokens = prompt(request)
             stops = set(int(t) for t in request.get("stops") or chat.stop_tokens())
             made = await team.say(tokens, int(request["max_tokens"]), float(request.get("temperature", 0.0)),
-                                  float(request.get("top_p", 1.0)), int(request.get("seed", 0)), stops,
-                                  bool(request.get("stream")))
+                                  float(request.get("top_p", 1.0)), int(request.get("top_k", 0)),
+                                  int(request.get("seed", 0)), stops, bool(request.get("stream")))
             reply = {"tokens": made, "text": model.decode([t for t in made if t not in stops]),
                      "read": len(tokens), "len": team.len}
         else:

@@ -88,7 +88,7 @@ def embedding_scale(model: str) -> float:
 async def solve(args, p, item, k, ask):
     """One question: the method's agents in turn; `ask(request)` runs one turn and returns its reply."""
     q = item["question"]
-    sampling = {"max_tokens": args.max_tokens, "temperature": args.temperature, "top_p": args.top_p}
+    sampling = {"max_tokens": args.max_tokens, "temperature": args.temperature, "top_p": args.top_p, "top_k": args.top_k}
     if args.method == "single":
         return (await ask({"op": "say", "messages": p.single(q), "fresh": True, "seed": k, **sampling}))["text"]
     if args.method == "text":
@@ -173,7 +173,8 @@ async def run_vllm(args, p, items, tally):
                 prompt = tok.apply_chat_template(request["messages"], tokenize=False, add_generation_prompt=True)
                 ids_ = tok.encode(prompt, add_special_tokens=False)
                 sp = SamplingParams(temperature=request["temperature"], top_p=request["top_p"], max_tokens=request["max_tokens"],
-                                    seed=request["seed"], output_kind=RequestOutputKind.FINAL_ONLY)
+                                    seed=request["seed"], output_kind=RequestOutputKind.FINAL_ONLY,
+                                    **({"top_k": request["top_k"]} if request["top_k"] else {}))
                 out = None
                 async for out in engine.generate({"prompt_token_ids": ids_}, sp, f"r{next(ids)}"):
                     pass
@@ -204,6 +205,7 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=0, help="per agent (0: the paper's, 2048, or 4096 for code)")
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--top-k", type=int, default=0, help="0: off; Hugging Face's generate takes the model's own (Qwen3: 20)")
     ap.add_argument("--concurrent", type=int, default=64, help="teams at once")
     ap.add_argument("--max-model-len", type=int, default=16384)
     ap.add_argument("--ref", default="LatentMAS", help="a checkout of github.com/Gen-Verse/LatentMAS")
@@ -231,7 +233,8 @@ def main() -> None:
             correct += ok
             f.write(json.dumps({"k": k, "pred": pred, "correct": ok, "text": text}) + "\n")
     summary = {"engine": args.engine, "model": args.model, "method": args.method, "task": args.task, "n": len(items),
-               "steps": args.steps if args.method == "latent" else None, "accuracy": round(correct / max(len(items), 1), 4),
+               "steps": args.steps if args.method == "latent" else None, "top_k": args.top_k,
+               "accuracy": round(correct / max(len(items), 1), 4),
                "wall_s": round(wall, 1), "tokens_written": tally["made"], "tokens_read": tally["read"],
                "concurrent": args.concurrent, "errors": errors}
     print(json.dumps(summary), flush=True)
