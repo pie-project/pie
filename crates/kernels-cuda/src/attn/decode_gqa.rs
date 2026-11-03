@@ -319,6 +319,7 @@ mod tests {
             whole_window: 128,
             cluster: 8,
             deep_64: false,
+            min_group: 1,
         };
         assert!(gate.takes(256, 2, 1) && gate.takes(64, 8, 16));
         assert!(!gate.takes(64, 8, 15) && !gate.takes(256, 16, 64) && !gate.takes(512, 8, 64));
