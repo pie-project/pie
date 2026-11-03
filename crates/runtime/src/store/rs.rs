@@ -224,7 +224,7 @@ pub struct RsStore {
     /// a release finds the newest without walking every fire in flight
     /// (a full card's lanes each hold a fire or two, and a windowed ring
     /// releases dozens of pages a lane).
-    touched_by: HashMap<RsSlotId, Vec<u64>>,
+    touched_by: HashMap<RsSlotId, BTreeMap<u64, u32>>,
     /// Checkpoints: hidden forks no process holds.
     checkpoints: HashMap<Hash256, RsCheckpoint>,
 }
@@ -377,7 +377,12 @@ impl RsStore {
             let from = touch.reads.len();
             touch.reads.extend(ids);
             for &id in &touch.reads[from..] {
-                self.touched_by.entry(id).or_default().push(seq);
+                *self
+                    .touched_by
+                    .entry(id)
+                    .or_default()
+                    .entry(seq)
+                    .or_insert(0) += 1;
             }
         }
     }
@@ -897,7 +902,12 @@ impl RsStore {
                 .collect(),
         };
         for &id in touch.writes.iter().chain(&touch.reads) {
-            self.touched_by.entry(id).or_default().push(self.seq);
+            *self
+                .touched_by
+                .entry(id)
+                .or_default()
+                .entry(self.seq)
+                .or_insert(0) += 1;
         }
         self.inflight.insert(self.seq, touch);
         Ok(RsPreparedWrite {
@@ -948,7 +958,12 @@ impl RsStore {
         if let Some(touch) = self.inflight.get_mut(&prepared.seq) {
             touch.writes.extend(&slots);
             for &id in &slots {
-                self.touched_by.entry(id).or_default().push(prepared.seq);
+                *self
+                    .touched_by
+                    .entry(id)
+                    .or_default()
+                    .entry(prepared.seq)
+                    .or_insert(0) += 1;
             }
         }
         prepared.allocated.extend(&slots);
@@ -1076,7 +1091,12 @@ impl RsStore {
         };
         for id in touch.writes.iter().chain(&touch.reads) {
             if let Some(seqs) = self.touched_by.get_mut(id) {
-                seqs.retain(|&s| s != seq);
+                if let Some(count) = seqs.get_mut(&seq) {
+                    *count -= 1;
+                    if *count == 0 {
+                        seqs.remove(&seq);
+                    }
+                }
                 if seqs.is_empty() {
                     self.touched_by.remove(id);
                 }
@@ -1473,7 +1493,7 @@ impl RsStore {
         let epoch = self
             .touched_by
             .get(&id)
-            .and_then(|seqs| seqs.iter().max().copied())
+            .and_then(|seqs| seqs.keys().next_back().copied())
             .map_or_else(
                 || {
                     self.inflight
