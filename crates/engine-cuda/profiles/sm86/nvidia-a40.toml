@@ -36,6 +36,8 @@ moe.mxfp4_mma_from = 17
 moe.mxfp4_mma_until = 16777216
 moe.mxfp4_mma_per_from = 0
 moe.mxfp4_select_lean = true
+# a decode's experts of 32 routes or fewer on 32-route staged slices: gpt-oss-20b c256 3551 -> 3750 tok/s
+moe.mxfp4_staged_narrow_until = 32
 moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
 moe.bf16_mma_from = 16
@@ -54,6 +56,14 @@ ssm.gdn_step_blocks = 3
 prefill_lattice_from = 256
 prefill_lattice_steps = 8
 lattice_steps = 2
+# a fire's working set may take 65% of the card past the weights, as the L4's: gpt-oss-20b in one process
+# with c1024 kept 8192-token fires (it served 1024), pf16-512 8.2k -> 11.8k, c1024 4.3k -> 4.8k tok/s
+working_set_percent = 65
+# a Gemma-4 process starts only while the pools hold the started ones to the end, a decoding lane's pages
+# before a waiting prompt's, as the H100, H200 and RTX PRO 6000 profiles: gemma-4-26b-a4b mini c256
+# 1198 -> 1620, gemma-4-31b mini c128 313 -> 446, gemma-4-E4B c1024 3313 -> 4329 tok/s
+seated_first = true
+seat_to_end = true
 
 # Independent chains on side streams: decode latency +5-11% (Gemma 4, Qwen3.6-A3B,
 # DeepSeek-V4, GLM-5.3, Hy4), outputs unchanged; a join's branches on them too.

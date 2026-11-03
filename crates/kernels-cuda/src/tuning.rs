@@ -290,6 +290,14 @@ pub struct MoeMxfp4Cvt;
 #[decision(id = "kernel.moe.mxfp4_cvt_ksplit_until", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4CvtKsplitUntil(pub u32);
 
+/// The most routes an expert averages that the shared-memory-staged mxfp4
+/// select (`moe_select_mxfp4_mma_staged`) stages in slices of 32 routes,
+/// not 64: past its expert's routes a slice multiplies empty n8 blocks. 0:
+/// always 64.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_staged_narrow_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4StagedNarrowUntil(pub u32);
+
 /// A grouped bf16 projection on routes that send each group to its own
 /// plane (DeepSeek-V4's `wo_a`, dequantized at import from the checkpoint's
 /// fp8b128) requantized at load to fp8b128, each value exactly the
@@ -929,6 +937,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeBf16MmaUntil>()
         .add::<MoeMxfp4Cvt>()
         .add::<MoeMxfp4CvtKsplitUntil>()
+        .add::<MoeMxfp4StagedNarrowUntil>()
         .add::<GemmFp8ODown>()
         .add::<MoeMxfp4A8Until>()
         .add::<MoeMxfp4A8From>()
@@ -1082,6 +1091,7 @@ tuning! {
     bf16_mma_until: u32 = 0, get MoeBf16MmaUntil;
     mxfp4_cvt: bool = false, on MoeMxfp4Cvt;
     mxfp4_cvt_ksplit_until: u32 = 0, get MoeMxfp4CvtKsplitUntil;
+    mxfp4_staged_narrow_until: u32 = 0, get MoeMxfp4StagedNarrowUntil;
     fp8_o_down: bool = false, on GemmFp8ODown;
     mxfp4_a8_until: u32 = 0, get MoeMxfp4A8Until;
     mxfp4_a8_from: u32 = 0, get MoeMxfp4A8From;
