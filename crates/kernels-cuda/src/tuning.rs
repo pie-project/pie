@@ -440,6 +440,13 @@ pub struct CompressedDecodeUntil(pub u32);
 #[decision(id = "kernel.sdpa.selected_mma", flag, default = false, tune = search)]
 pub struct SdpaSelectedMma;
 
+/// The blocks a cluster splits a selected attention's (row, kv head) keys
+/// across where a fire's blocks are too few to fill the SMs (a decode's lone
+/// row), folding the slices through distributed shared memory; 1 none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.selected_ranks", constant(set(1, 2, 4, 8)), default = 1, tune = search)]
+pub struct SdpaSelectedRanks(pub u32);
+
 /// Whether a compressed-pool attention (`attention.pool_lse`, and its
 /// selected form) runs on the tensor cores, a block a row's 16 heads, rather
 /// than the scalar walk a block a row and head. Off reads the pool the
@@ -1009,6 +1016,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeGqaCluster>()
         .add::<DecodeGqaDeep64>()
         .add::<SdpaSelectedMma>()
+        .add::<SdpaSelectedRanks>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
         .add::<SdpaIndexFp4Tc5>()
@@ -1165,6 +1173,7 @@ tuning! {
     decode_gqa_cluster: u32 = 0, get DecodeGqaCluster;
     decode_gqa_deep_64: bool = false, on DecodeGqaDeep64;
     selected_mma: bool = false, on SdpaSelectedMma;
+    selected_ranks: u32 = 1, get SdpaSelectedRanks;
     index_mma: bool = false, on SdpaIndexMma;
     index_tc5: bool = false, on SdpaIndexTc5;
     index_fp4_tc5: bool = false, on SdpaIndexFp4Tc5;

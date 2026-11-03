@@ -27,6 +27,28 @@ constexpr int kWarps = 4;
 constexpr int kThreads = kWarps * 32;
 constexpr int kKeys = 16;
 
+// A float at `at` in cluster block `rank`'s shared memory (this block's
+// address of it), and the cluster's barrier: a split row's fold.
+__device__ __forceinline__ float ld_rank(const float* at, int rank) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    const unsigned local = static_cast<unsigned>(__cvta_generic_to_shared(at));
+    unsigned remote;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(local), "r"(rank));
+    float v;
+    asm volatile("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote) : "memory");
+    return v;
+#else
+    return rank == 0 ? *at : 0.f;
+#endif
+}
+
+__device__ __forceinline__ void sync_ranks() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::
+                     : "memory");
+#endif
+}
+
 template <int D, int W = kWarps>
 struct Shape {
     static constexpr int kLd = D + 8;
@@ -39,7 +61,11 @@ struct Shape {
     static constexpr int kBytes = kQBytes + W * kWarpBytes + W * 16 * 2 * 4;
 };
 
-template <int D, int W = kWarps>
+// With `R` above one, a cluster of R blocks along x serves the (row, kv
+// head), each block every R-th of the warps' chunks, and folds the R * W
+// warps' partials across the cluster, rank by rank (one block: the warps'
+// fold as before).
+template <int D, int W = kWarps, int R = 1>
 __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
     const __nv_bfloat16* __restrict__ queries,
     const __nv_bfloat16* __restrict__ k_pages,
@@ -60,7 +86,8 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
     constexpr int kLd = S::kLd;
     constexpr int kNTiles = S::kNTiles;
     constexpr int kChunks = D / 8;
-    const int t = static_cast<int>(blockIdx.x);
+    const int t = static_cast<int>(blockIdx.x) / R;
+    const int rank = static_cast<int>(blockIdx.x) % R;
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
     if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
@@ -120,7 +147,7 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
     }
     float m_lo = -CUDART_INF_F, m_hi = -CUDART_INF_F, l_lo = 0.f, l_hi = 0.f;
 
-    for (int base = warp * kKeys; base < steps; base += kWarps * kKeys) {
+    for (int base = (rank * kWarps + warp) * kKeys; base < steps; base += R * kWarps * kKeys) {
         if (lane < kKeys) {
             const int n = base + lane;
             int j = -1;
@@ -243,27 +270,34 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
         sML[(warp * 16 + g + 8) * 2 + 1] = l_hi;
     }
     __syncthreads();
-    for (int idx = tid; idx < G * D; idx += kThreads) {
+    if constexpr (R > 1) sync_ranks();
+    auto at = [&](const float* p, int q) { return R > 1 ? ld_rank(p, q) : *p; };
+    for (int idx = rank * kThreads + tid; idx < G * D; idx += R * kThreads) {
         const int row = idx / D;
         const int d = idx % D;
         float m_all = -CUDART_INF_F;
-        for (int w = 0; w < kWarps; ++w) m_all = fmaxf(m_all, sML[(w * 16 + row) * 2]);
+        for (int q = 0; q < R; ++q)
+            for (int w = 0; w < kWarps; ++w) m_all = fmaxf(m_all, at(&sML[(w * 16 + row) * 2], q));
         float l_all = 0.f, v = 0.f;
         if (m_all > -CUDART_INF_F) {
-            for (int w = 0; w < kWarps; ++w) {
-                const float mw = sML[(w * 16 + row) * 2];
-                if (mw == -CUDART_INF_F) continue;
-                const float e = __expf(mw - m_all);
-                l_all += sML[(w * 16 + row) * 2 + 1] * e;
-                const float* ow =
-                    reinterpret_cast<const float*>(smem_raw + S::kQBytes + w * S::kWarpBytes);
-                v += ow[row * D + d] * e;
+            for (int q = 0; q < R; ++q) {
+                for (int w = 0; w < kWarps; ++w) {
+                    const float mw = at(&sML[(w * 16 + row) * 2], q);
+                    if (mw == -CUDART_INF_F) continue;
+                    const float e = __expf(mw - m_all);
+                    l_all += at(&sML[(w * 16 + row) * 2 + 1], q) * e;
+                    const float* ow =
+                        reinterpret_cast<const float*>(smem_raw + S::kQBytes + w * S::kWarpBytes);
+                    v += at(&ow[row * D + d], q) * e;
+                }
             }
         }
         const float inv = l_all > 0.f ? 1.f / l_all : 0.f;
         o[(static_cast<long long>(t_row) * H + kv_head * G + row) * D + d] =
             __float2bfloat16(v * inv);
     }
+    // No block leaves while another may still read its shared memory.
+    if constexpr (R > 1) sync_ranks();
 }
 
 // Rows that share their keys: a block serves `kTileRows` consecutive query

@@ -50,6 +50,19 @@ fn mma_warps(ctx: &Ctx, blocks: u32, head_dim: i32) -> u32 {
     }
 }
 
+/// The blocks a cluster splits each (row, kv head) of the tensor-core walk
+/// across (`kernel.sdpa.selected_ranks`), where the fire's blocks are too few
+/// to fill a quarter of the SMs; 1 elsewhere.
+fn mma_ranks(ctx: &Ctx, blocks: u32) -> u32 {
+    let sms = ctx.multiprocessors().unwrap_or(108);
+    let ranks = ctx.tuning().selected_ranks;
+    if ranks > 1 && blocks.saturating_mul(4) < sms {
+        ranks.min(8)
+    } else {
+        1
+    }
+}
+
 /// `mma::Tile`: eight rows a block, six warps, maps of up to 4096 blocks.
 const TILE_ROWS: i32 = 8;
 const TILE_THREADS: u32 = 192;
@@ -215,12 +228,19 @@ fn selected(
             dim,
         );
         #[allow(clippy::cast_sign_loss)]
+        let ranks = mma_ranks(ctx, (total_tokens as u32).saturating_mul(kv_heads as u32));
+        #[allow(clippy::cast_sign_loss)]
         let launch = Launch::grid(
-            [total_tokens as u32, kv_heads as u32, 1],
+            [(total_tokens as u32) * ranks, kv_heads as u32, 1],
             [MMA_THREADS / 4 * warps, 1, 1],
         )
+        .cluster(ranks)
         .smem(mma_smem_bytes(dim, warps));
-        let entry = if warps == 4 {
+        let entry = if ranks > 1 {
+            format!(
+                "::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}, {warps}, {ranks}>"
+            )
+        } else if warps == 4 {
             format!("::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}>")
         } else {
             format!("::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}, {warps}>")
