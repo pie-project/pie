@@ -368,6 +368,25 @@ fn the_routed_selects_answer_the_routed_dot() {
     cases.into_iter().for_each(routed);
 }
 
+/// MiMo-V2.6's expert legs (K 4096 gate-up, 2048 down) on the H200's MXFP4
+/// arms, from a decode's routes to a prefill's.
+#[test]
+fn mimo_mxfp4_selects_answer_the_routed_dot() {
+    let d = Tuning::DEFAULT;
+    #[rustfmt::skip]
+    let h200 = Tuning { mxfp4_mma_until: 16_777_216, mxfp4_mma_from: 28, mxfp4_select_lean: true, mxfp4_grouped_reuse: 3, ..d };
+    let (sw, f, t) = (Some(Glu::Swiglu), false, true);
+    let mut cases: Vec<Case> = Vec::new();
+    for tokens in [1, 3, 8, 20, 40, 96, 300, 600] {
+        for tu in [d, h200] {
+            cases.push((K::Mx, tu, [32, tokens, 8, 256, 4096], t, None, 0));
+            cases.push((K::Mx, tu, [32, tokens, 8, 256, 4096], t, sw, 0));
+            cases.push((K::Mx, tu, [32, tokens, 8, 384, 2048], f, None, 0));
+        }
+    }
+    cases.into_iter().for_each(routed);
+}
+
 /// A routed MLP's bank `[experts][rows][k]` of bf16, MXFP4, or against
 /// quantized rows NVFP4 (W4A4, `a`: 4), MXFP4 (W4A8, 8) or block FP8 (W8A8,
 /// 16), and its values.
