@@ -32,6 +32,7 @@ F8 = dtype.e4m3tile128a8
 DEPLOYMENTS = [
     deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-4b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-4b", weights = dtype.u4g64, kv = dtype.bf16),
     deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16, drafter = "mtp"),
     deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("qwen3-8b", weights = dtype.u4g64, kv = dtype.bf16),
