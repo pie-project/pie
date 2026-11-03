@@ -2516,6 +2516,17 @@ impl Run<'_> {
         {
             return Ok(());
         }
+        // A prefill's rows W8A8 on an Ada's wide fp8 tiles, as the
+        // deployment quantizes them (`kernel.gemm.fp8_wide_from`).
+        let wide_from = self.ctx().tuning().gemm_fp8_wide_from;
+        if wide_from > 0
+            && act.rows >= wide_from
+            && atoms.width > 0
+            && act.width == atoms.width * 128
+            && linear::moe::matmul_fp8_w8a8_wide(self.ctx(), act, codes.ptr, atoms.ptr, &mut out)?
+        {
+            return Ok(());
+        }
         // A batch's rows on the plane's bf16 copy (`kernel.gemm.fp8_shadow`).
         if act.rows > linear::w8a16::MMA_UNTIL
             && let Some(shadow) = self.fp8_shadow(w)

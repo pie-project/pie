@@ -40,6 +40,11 @@ moe.bf16_mma_until = 65536
 moe.mxfp4_fp8_from = 256
 moe.mxfp4_mma_per_from = 4
 
+# A prefill's block-FP8 projections W8A8 on the wide fp8 tiles, as the
+# deployment quantizes them, not bf16 on the widened copy: MiMo-V2.6-Flash's
+# mini pf16-512 45.4k to 49.2k tok/s.
+gemm.fp8_wide_from = 257
+
 # A fire's working set may take 65% of the 24 GB card past the weights, not
 # half: at 50% gpt-oss-20b's 8192-token fires were served at 1024 and c256 at
 # 128 lanes; at 65% pf16-512 15.9k to 22.5k tok/s and c256 5.7k to 6.1k.

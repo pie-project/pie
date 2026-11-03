@@ -220,6 +220,14 @@ pub struct GemmFp8GemvUntil(pub u32);
 #[decision(id = "kernel.gemm.fp8_shadow", flag, default = false, tune = search)]
 pub struct GemmFp8Shadow;
 
+/// The fewest rows a block-FP8 dense projection read at bf16 activations
+/// runs W8A8 on an Ada's wide fp8 tiles with (`matmul_fp8_w8a8_wide`, the
+/// rows quantized to e4m3 in 1x128 blocks), ahead of the bf16 copy
+/// (`kernel.gemm.fp8_shadow`). 0: never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_wide_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct GemmFp8WideFrom(pub u32);
+
 /// Whether a block-FP8 dense projection (no tcgen05) keeps its 128x128
 /// exponents spread over 1x32 blocks, laid once at load, so a batch's rows
 /// run cuBLASLt's MXFP8 GEMM on the same codes (sm_120).
@@ -985,6 +993,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
         .add::<GemmFp8Shadow>()
+        .add::<GemmFp8WideFrom>()
         .add::<GemmFp8Mx>()
         .add::<GemmFp8MmaGemvUntil>()
         .add::<GemmFp8MmaKUntil>()
@@ -1142,6 +1151,7 @@ tuning! {
     mla_expanded_from: u32 = 65_536, get MlaExpandedFrom;
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
     gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
+    gemm_fp8_wide_from: u32 = 0, get GemmFp8WideFrom;
     gemm_fp8_mx: bool = false, on GemmFp8Mx;
     gemm_fp8_mma_gemv_until: u32 = 0, get GemmFp8MmaGemvUntil;
     gemm_fp8_mma_k_until: u32 = 0, get GemmFp8MmaKUntil;
