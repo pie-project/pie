@@ -27,6 +27,11 @@ moe.mxfp4_select_lean = true
 
 [engine]
 working_set_percent = 90  # 1.9% faster end to end
+# a Gemma-4 process starts only while the pools hold the started ones to the end, a decoding lane's
+# pages before a waiting prompt's, as the H200 and RTX PRO 6000 profiles: gemma-4-26b-a4b mini c512
+# 9.6k -> 11.3k, c1024 4.4k -> 8.7k tok/s; gemma-4-E4B unchanged
+seated_first = true
+seat_to_end = true
 
 [compiler]
 synth_regions = false  # 1.2% faster end to end
