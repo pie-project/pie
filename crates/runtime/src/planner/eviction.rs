@@ -248,10 +248,15 @@ impl ResidencyPlanner {
     ) -> bool {
         let (wake, spawned) = self.with_inner(|inner| {
             let (mut wake, mut spawned) = (Vec::new(), Vec::new());
-            let head_rank = match inner.unmet_head() {
-                Some((key, _)) if key == head_key => key.0,
+            let (head_rank, growth) = match inner.unmet_head() {
+                Some((key, waiter)) if key == head_key => (
+                    key.0,
+                    self.seated_first
+                        && inner.procs.get(&waiter.pid).is_some_and(|proc| proc.seated),
+                ),
                 _ => return (wake, spawned),
             };
+            let mut lanes_suspended = 0usize;
             for (pid, expected) in picks {
                 let Some(proc) = inner.procs.get(&pid) else {
                     continue;
@@ -262,8 +267,15 @@ impl ResidencyPlanner {
                 {
                     continue;
                 }
+                if growth && proc.seated && !proc.idle && !proc.held {
+                    lanes_suspended += 1;
+                }
                 wake.extend(inner.begin_eviction(pid, expected));
                 spawned.push(pid);
+            }
+            if lanes_suspended > 0 {
+                inner.calm_departures = 0;
+                crate::inferlet::process::throttle_admission(lanes_suspended);
             }
             (wake, spawned)
         });

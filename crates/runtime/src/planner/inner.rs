@@ -35,6 +35,8 @@ pub(super) struct Inner {
     pub(super) killing: HashSet<ProcessId>,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
     pub(super) to_end: super::to_end::ToEnd,
+    /// Lanes finished since one's growth last suspended another.
+    pub(super) calm_departures: u32,
 }
 
 impl Inner {

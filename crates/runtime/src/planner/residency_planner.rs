@@ -588,6 +588,14 @@ impl ResidencyPlanner {
             {
                 inner.completion_credit = inner.completion_credit.saturating_add(1);
             }
+            // Four lanes finished with none suspended: admit one more again.
+            if self.seated_first && departed.as_ref().is_some_and(|proc| proc.seated) {
+                inner.calm_departures += 1;
+                if inner.calm_departures >= 4 {
+                    inner.calm_departures = 0;
+                    crate::inferlet::process::relax_admission();
+                }
+            }
             inner.settle_eviction(pid);
             // Its holds outlive it only while one lives; the last one's drop
             // settles this, and cannot have run before it is put here.
