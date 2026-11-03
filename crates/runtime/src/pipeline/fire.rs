@@ -2603,7 +2603,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             &full,
             cuttable,
             rs_ws_ids.is_empty(),
-            prefill_share(page_size, engine),
+            // A share is at least a row: lanes of one row each (a decode) are never cut by it,
+            // and reading it locks the engine registry and walks every live process.
+            if full.lanes.iter().all(|lane| lane.tokens.len() <= 1) {
+                u32::MAX
+            } else {
+                prefill_share(page_size, engine)
+            },
             page_size,
             &forced,
             &switched.tails,
