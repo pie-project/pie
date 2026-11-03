@@ -24,6 +24,11 @@ moe.mxfp4_bf16_from = 1024
 # as the H200 profile: gpt-oss-20b raw decode 352 -> 383 tok/s
 moe.mxfp4_grouped_reuse = 3
 moe.mxfp4_select_lean = true
+# NVFP4 experts against bf16 rows on the register-dequant mma.sync kernel past one token, as the
+# RTX PRO 6000 and L40S: MiniMax-M3.1-Flash mini pf32-512 4.7k -> 8.5k tok/s (prefill-only job),
+# Qwen3.8-Flash-Next mini unchanged, MiniMax parity KL unchanged
+moe.nvfp4_mma_from = 17
+moe.nvfp4_mma_until = 65536
 
 [engine]
 working_set_percent = 90  # 1.9% faster end to end
