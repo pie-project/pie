@@ -13,6 +13,18 @@ qmm.split_warps_per_sm = 80  # 2.3% faster end to end
 ssm.gdn_scan_until = 48  # 1.9% faster end to end
 sdpa.index_mma = true
 sdpa.index_radix = true
+# MXFP4 banks kept as an exact bf16 copy, read past 1024 routes a fire by the warp-specialized wgmma
+# GEMM as on the H100, the down banks too, all copies or none, leaving a quarter of the free memory to the
+# cache rows (MiMo-V2.6 mini48's 87 GB keep their MXFP4 banks):
+# gpt-oss-20b pf64-512 51.5k -> 65.2k, c1024 19.2k -> 22.6k, raw prefill 23.2k -> 28.2k tok/s
+moe.mxfp4_bf16_from = 1024
+moe.mxfp4_bf16_down = true
+moe.mxfp4_bf16_keep = 25
+# block-FP8 selects of 64 routes an expert and more on the warp-specialized wgmma GEMM:
+# GLM-5.3 mini78 pf16-512 4.06k -> 6.04k, c1024 2.42k -> 3.49k, raw prefill 3.42k -> 4.67k tok/s
+moe.fp8a8_ws_from = 64
+# a decode's W8A16 block-FP8 select split toward 16 CTAs' warps an SM: GLM-5.3 mini78 raw decode 45 -> 50 tok/s
+moe.fp8_mma_fill = 16
 
 [engine]
 prefill_lattice_from = 192  # 2.0% faster end to end
