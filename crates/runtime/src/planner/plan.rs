@@ -37,6 +37,7 @@ impl ResidencyPlanner {
         self.reseat_released();
         loop {
             let (rs_free, rs_total) = self.port.rs_stats();
+            let (kv_free, kv_total) = self.port.device_stats();
             let rs_growth = self.rs_growth();
             let step = self.with_inner(|inner| {
                 let Some((key, waiter)) = inner.unmet_head() else {
@@ -52,6 +53,15 @@ impl ResidencyPlanner {
                     WaitKind::Allocation { demand, .. } => Some(*demand),
                     WaitKind::Restore { .. } => None,
                 };
+                if self.seated_first && demand.is_some() {
+                    let reserve = inner.kv_seating_reserve(pid, kv_total);
+                    if reserve > 0
+                        && kv_free.saturating_add(inner.accum.len() as u32)
+                            < waiter.kv_need().saturating_add(reserve)
+                    {
+                        return Step::Done;
+                    }
+                }
                 let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
                 if missing > 0 {
                     return Step::Absorb {

@@ -81,6 +81,13 @@ impl ResidencyPlanner {
                     return None;
                 }
             }
+            if demand.kv_pages > 0 {
+                let (kv_free, kv_total) = self.port.device_stats();
+                let reserve = self.lock_inner().kv_seating_reserve(pid, kv_total);
+                if reserve > 0 && kv_free < demand.kv_pages.saturating_add(reserve) {
+                    return None;
+                }
+            }
             let grant = self.try_reserve(demand)?;
             if let Some(proc) = self.lock_inner().procs.get_mut(&pid) {
                 proc.seated = true;

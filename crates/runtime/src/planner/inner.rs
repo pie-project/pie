@@ -134,6 +134,25 @@ impl Inner {
     /// A seated lane's growth takes free pages at once rather than parking behind
     /// claims served after it anyway (a waiting prompt holding nothing); a
     /// higher-ranked seated waiter or preempted process still goes first.
+    /// The kv pages a prompt not yet seated leaves free for the seated lanes'
+    /// next pages (`PoolFacts::seated_first`): two a seated lane, at most an
+    /// eighth of the pool. Without it a prompt takes the pages a finished lane
+    /// freed, the lanes still decoding run short, and the pool thrashes
+    /// suspending them (Gemma-4-26B on an A100, c512: 67 of 512 lanes seated).
+    pub(super) fn kv_seating_reserve(&self, pid: ProcessId, kv_total: u32) -> u32 {
+        if self.procs.get(&pid).is_none_or(|proc| proc.seated) || self.fleet_stalled() {
+            return 0;
+        }
+        let seated = u32::try_from(
+            self.procs
+                .values()
+                .filter(|proc| proc.seated && !proc.idle && proc.state == Residency::Resident)
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        seated.saturating_mul(2).min(kv_total / 8)
+    }
+
     pub(super) fn growth_first(&self, pid: ProcessId) -> bool {
         let Some(proc) = self.procs.get(&pid) else {
             return false;
