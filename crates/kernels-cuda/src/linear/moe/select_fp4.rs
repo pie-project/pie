@@ -216,6 +216,7 @@ pub(super) fn select_mxfp4_mma(
     let nb: u32 = match per {
         _ if wide => 16,
         _ if staged && per <= ctx.tuning().mxfp4_staged_narrow_until => 4,
+        _ if staged && glu.is_some() && per <= ctx.tuning().mxfp4_staged_glu_narrow_until => 4,
         _ if staged => 8,
         _ if run => 4,
         0..=4 => 1,
@@ -337,14 +338,18 @@ pub(super) fn select_mxfp4_mma(
             .smem(STAGES * 8 * nb * 256),
         )
     } else if staged {
-        const STAGES: u32 = 3;
+        let stages: u32 = if glu.is_some() {
+            3
+        } else {
+            ctx.tuning().mxfp4_staged_down_stages
+        };
         const WARPS: u32 = 8;
         let nv = tensor_scales.is_some();
         let grid = [grid[0], y.width.div_ceil(cols * WARPS / 4), 1];
         Fire::at(kernel(
             SELECT_FP4_SM80,
             &format!(
-                "::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}, {WARPS}>"
+                "::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {stages}, {code}, {nv}, {WARPS}>"
             ),
         ))
         .apply(
@@ -356,7 +361,7 @@ pub(super) fn select_mxfp4_mma(
                 },
                 [32 * WARPS, 1, 1],
             )
-            .smem(STAGES * 8 * nb * 16 * 16),
+            .smem(stages * 8 * nb * 16 * 16),
         )
     } else {
         let depth = MMA_DEPTH;

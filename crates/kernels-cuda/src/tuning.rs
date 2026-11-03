@@ -328,6 +328,19 @@ pub struct MoeMxfp4StagedFrom(pub u32);
 #[decision(id = "kernel.moe.mxfp4_staged_narrow_until", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4StagedNarrowUntil(pub u32);
 
+/// `kernel.moe.mxfp4_staged_narrow_until` for a GLU bank (gate and up rows)
+/// alone: its staged slices take 32 routes up to this many routes an expert,
+/// twice the CTAs over the bank. 0: as the bank's other rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_staged_glu_narrow_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMxfp4StagedGluNarrowUntil(pub u32);
+
+/// The stages of the staged mxfp4 select's activation ring on a bank that
+/// lands no GLU (a down projection).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_staged_down_stages", constant(set(2, 3)), default = 3, tune = search)]
+pub struct MoeMxfp4StagedDownStages(pub u32);
+
 /// A grouped bf16 projection on routes that send each group to its own
 /// plane (DeepSeek-V4's `wo_a`, dequantized at import from the checkpoint's
 /// fp8b128) requantized at load to fp8b128, each value exactly the
@@ -990,6 +1003,8 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4F16>()
         .add::<MoeMxfp4CvtKsplitUntil>()
         .add::<MoeMxfp4StagedNarrowUntil>()
+        .add::<MoeMxfp4StagedGluNarrowUntil>()
+        .add::<MoeMxfp4StagedDownStages>()
         .add::<MoeMxfp4StagedFrom>()
         .add::<GemmFp8ODown>()
         .add::<MoeMxfp4A8Until>()
@@ -1151,6 +1166,8 @@ tuning! {
     moe_mxfp4_f16: bool = false, on MoeMxfp4F16;
     mxfp4_cvt_ksplit_until: u32 = 0, get MoeMxfp4CvtKsplitUntil;
     mxfp4_staged_narrow_until: u32 = 0, get MoeMxfp4StagedNarrowUntil;
+    mxfp4_staged_glu_narrow_until: u32 = 0, get MoeMxfp4StagedGluNarrowUntil;
+    mxfp4_staged_down_stages: u32 = 3, get MoeMxfp4StagedDownStages;
     mxfp4_staged_from: u32 = 16, get MoeMxfp4StagedFrom;
     fp8_o_down: bool = false, on GemmFp8ODown;
     mxfp4_a8_until: u32 = 0, get MoeMxfp4A8Until;
