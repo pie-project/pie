@@ -640,15 +640,18 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
     // Tile `t`'s expert, routes and first output column (128 GLU columns, or
     // 256 rows): 0 past the work, 1 an empty slice, 2 a tile to run.
     int expert = 0, begin = 0, count = 0, col0 = 0;
+    // The work items run fastest, so the CTAs at once share weight tiles.
+    const int items = offsets[num_experts + 1];
     auto at = [&](int t) {
         if (!kPersist && t > 0) return 0;
-        const int item_at = kPersist ? t / col_tiles : static_cast<int>(blockIdx.x);
-        if (item_at >= offsets[num_experts + 1]) return 0;
+        if (kPersist && t >= items * col_tiles) return 0;
+        const int item_at = kPersist ? t % items : static_cast<int>(blockIdx.x);
+        if (item_at >= items) return 0;
         const int item = work[item_at];
         expert = item >> 16;
         begin = offsets[expert] + (item & 0xFFFF) * kSlice;
         count = min(offsets[expert + 1] - begin, kSlice);
-        col0 = (kPersist ? t % col_tiles : static_cast<int>(blockIdx.y)) * (kGlu != 0 ? 128 : 256);
+        col0 = (kPersist ? t / items : static_cast<int>(blockIdx.y)) * (kGlu != 0 ? 128 : 256);
         return count > 0 ? 2 : 1;
     };
     const int t0 = kPersist ? static_cast<int>(blockIdx.x) : 0;
