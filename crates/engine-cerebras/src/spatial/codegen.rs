@@ -32,6 +32,10 @@ mod src {
     pub const VM_HZ: &str = include_str!("csl/vm/guest4hz_vm.csl");
     /// Every design's runtime route and queue-color helpers.
     pub const RT: &str = include_str!("csl/rt.csl");
+    /// Qwen3.5's layer units and serve_q35's layout.
+    pub const QWEN35_GDN: &str = include_str!("csl/kernels/qwen35_gdn.csl");
+    pub const QWEN35_ATTN: &str = include_str!("csl/kernels/qwen35_attn.csl");
+    pub const Q35_LAYOUT: &str = include_str!("csl/serve_q35/layout.csl");
 
     pub mod s2d {
         pub const LAYOUT: &str = include_str!("csl/serve2d/layout.csl");
@@ -510,8 +514,8 @@ fn s2d_pass_start(i: u32, start_pos: u32) void {{\n{}\n}}\n",
     );
     let mut own = exports(&s);
     own.push("stamps".into());
-    // The paged grid holds the staging slots; qwen2d's launches only return.
-    let stage = if kernel == "qwen2d_paged" {
+    // The paged grids hold the staging slots; qwen2d's launches only return.
+    let stage = if kernel == "qwen2d_paged" || kernel == "qwen35_attn" {
         own.extend(["kstage", "vstage"].map(String::from));
         src::s2d::KVSTAGE
     } else {
@@ -753,6 +757,86 @@ pub fn serve2d() -> R<Vec<File>> {
             s2d_plain(src::s2d::FILLER_BASE, "filler_base.csl", "the filler"),
         ),
         ("vm_pe.csl", s2d_vm()?),
+    ])
+}
+
+// ---------------------------------------------------------------- serve_q35
+
+/// The names only serve_q35's units export: the Gated DeltaNet unit's
+/// tables and state, the attention unit's gates.
+const Q35_NAMES: &[(&str, &str)] = &[
+    ("wp", "f32"),
+    ("cw", "f32"),
+    ("cst", "f32"),
+    ("gab", "f32"),
+    ("nw", "f32"),
+    ("st", "f32"),
+    ("wg", "f32"),
+];
+
+/// A slot reset that only returns (every PE but the GDN unit's).
+const RESET_FN: &str = "fn reset(b: u32) void { sys_mod.unblock_cmd_stream(); }\ncomptime {\n  @export_symbol(reset);\n}\n";
+
+/// serve2d's program `text` made serve_q35's: a dummy for each serve_q35
+/// name it does not export, and `fns`.
+fn q35_more(text: String, fns: &str) -> String {
+    let own = exports(&text);
+    let mut decls = Vec::new();
+    let mut lines = Vec::new();
+    for &(n, ty) in Q35_NAMES {
+        if own.iter().any(|o| o == n) {
+            continue;
+        }
+        if decls.is_empty() {
+            decls.push(format!(
+                "var q35_dum = @zeros([1]{ty});\nvar q35_dum_ptr: [*]{ty} = &q35_dum;"
+            ));
+        }
+        lines.push(format!("  @export_symbol(q35_dum_ptr, \"{n}\");"));
+    }
+    let dummies = if lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "// serve_q35: the units' exported names.\n{}\ncomptime {{\n{}\n}}\n",
+            decls.join("\n"),
+            lines.join("\n")
+        )
+    };
+    format!(
+        "// serve_q35: serve2d's generated program with the qwen35 units' names.\n{}\n{dummies}{fns}",
+        text.trim_end_matches('\n')
+    )
+}
+
+/// serve_q35's build directory: serve2d's handoffs, head, filler and VM
+/// around Qwen3.5's two units.
+pub fn serve_q35() -> R<Vec<File>> {
+    // The GDN unit has no pool: its copy and staging launches only return.
+    let gdn = q35_more(s2d_grid("qwen35_gdn", src::QWEN35_GDN)?, COPY_FNS);
+    let attn = q35_more(s2d_grid("qwen35_attn", src::QWEN35_ATTN)?, RESET_FN);
+    Ok(vec![
+        ("layout.csl", src::Q35_LAYOUT.to_string()),
+        ("paths.csl", src::s2d::PATHS.to_string()),
+        ("rt.csl", src::RT.to_string()),
+        ("gdn_pe.csl", gdn),
+        ("attn_pe.csl", attn),
+        ("head_pe.csl", q35_more(s2d_head()?, RESET_FN)),
+        (
+            "head_stub.csl",
+            q35_more(
+                s2d_plain(src::s2d::STUB_BASE, "stub_base.csl", "the stub head"),
+                RESET_FN,
+            ),
+        ),
+        (
+            "filler.csl",
+            q35_more(
+                s2d_plain(src::s2d::FILLER_BASE, "filler_base.csl", "the filler"),
+                RESET_FN,
+            ),
+        ),
+        ("vm_pe.csl", q35_more(s2d_vm()?, RESET_FN)),
     ])
 }
 
@@ -1804,6 +1888,18 @@ pub fn serve8b_region(pipe: bool) -> R<Vec<File>> {
 mod tests {
     use super::*;
 
+    /// `Q35_OUT=<dir>`: serve_q35's build directory written there (to
+    /// compile it with cslc by hand).
+    #[test]
+    #[ignore]
+    fn dump_serve_q35() {
+        let dir = std::path::PathBuf::from(std::env::var("Q35_OUT").expect("Q35_OUT"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in serve_q35().expect("serve_q35 generates") {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+    }
+
     /// The generated files' blake3. These are the programs validated on CS-3
     /// hardware: a change to a kernel, an extra or a generator moves a hash,
     /// and a moved hash is a different wafer program, to be validated again
@@ -1950,6 +2046,53 @@ mod tests {
             "d098decfc668200e89eb43c17d3e450b993129f26a65a2f052425a7536abe125",
         ),
     ];
+
+    /// serve_q35's files (not yet a `Design`): pinned as the others, the
+    /// programs run on the fabric simulator (payload serve_q35, `--mode sim`).
+    const Q35_PINNED: &[(&str, &str)] = &[
+        (
+            "layout.csl",
+            "c9990fb36f57d8c9cc8342d93c8d454db4d6831d6e3cb854a333429851952552",
+        ),
+        (
+            "gdn_pe.csl",
+            "86299e87db24dce6dbb3414a89b36a90c176282765ca13262f222e41b4da39f5",
+        ),
+        (
+            "attn_pe.csl",
+            "ead473de9a09fa71d79f2b0da7c8ec898da425472668765b7008ace2a0622568",
+        ),
+        (
+            "head_pe.csl",
+            "435dc5db1596f4a82050335eebc6f1194436d2f7b639e2584ec0087f3aa94071",
+        ),
+        (
+            "head_stub.csl",
+            "5e53795b6e8d4dae4817e75b70ad33c1dec8d930cad152672fb4954dd768bd07",
+        ),
+        (
+            "filler.csl",
+            "8ead8263ba862ef2a3fc0adf294a006c8ac434f03b55c8f8dc15b6efc0a97c0d",
+        ),
+        (
+            "vm_pe.csl",
+            "b3e6bd93cb3ac384a190b909eaf3c5f72a010761bee407890e49ce7574575642",
+        ),
+    ];
+
+    #[test]
+    fn serve_q35_matches_its_pins() {
+        let files = serve_q35().unwrap();
+        let mut moved = Vec::new();
+        for (file, want) in Q35_PINNED {
+            let got = files.iter().find(|(n, _)| n == file).unwrap();
+            let have = blake3::hash(got.1.as_bytes()).to_hex().to_string();
+            if have != *want {
+                moved.push(format!("{file}: {have}"));
+            }
+        }
+        assert!(moved.is_empty(), "moved: {moved:?}");
+    }
 
     #[test]
     fn generators_match_their_pins() {

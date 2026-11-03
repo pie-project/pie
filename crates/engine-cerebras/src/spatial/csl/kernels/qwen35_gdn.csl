@@ -31,6 +31,8 @@ param c_r1_1: color;
 param c_r2_0: color;
 param c_r2_1: color;
 param c_bc: color;
+param c_gb: color;     // unused (serve designs' layouts pass it)
+param c_cp: color;     // unused: queue 2 stays free (a design's handoff takes it)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const layout_mod = @import_module("<layout>");
@@ -678,6 +680,7 @@ fn compute(steps: u32) void {
   timestamp.enable_tsc();
   var i: u32 = 0;
   while (i < steps) : (i += 1) {
+    // No per-pass prologue: the layer reads no positions.
     timing = i > 0;
     timestamp.get_timestamp(&t_mark);
     layer();

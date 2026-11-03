@@ -319,7 +319,26 @@ impl Q35Plan {
             ("Vr", h.vr),
             ("Gx", h.gx),
             ("Gy", h.gy),
+            ("Gb", h.gb),
             ("vocab", self.spec.vocab),
+            // serve2d's layout parameters at the values its f32 paged
+            // builds carry (the head's: three passes, exact, tied).
+            ("HR", self.spec.hidden),
+            ("Tc", super::plan::TC),
+            ("W16", 0),
+            ("NP", 3),
+            ("KV16", 0),
+            ("PROF", 0),
+            ("GRID", 1),
+            ("PASSES", 3),
+            ("UNTIED", 0),
+            ("CERT", 0),
+            ("MODE", 0),
+            ("OVL", 0),
+            ("VMC", h.vmc),
+            ("WF32", 1),
+            ("DBG", 0),
+            ("iters", 1),
         ]
     }
 }
