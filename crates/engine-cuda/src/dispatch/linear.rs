@@ -1351,7 +1351,7 @@ impl Run<'_> {
                 y: sy,
                 bias: None,
                 quantized: true,
-                quant: Some(ActQuant::E4m3 { gran: 128 }),
+                quant: Some(ActQuant::E4m3 { gran: 32 | 128 }),
                 ..
             },
             Linear::Glu {
