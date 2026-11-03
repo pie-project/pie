@@ -238,10 +238,10 @@ TRANSFORMERS = [
 # k RMS-normed per head and rotated in full (neox halves), and a SwiGLU MLP.
 # A row with an adapter adds its LoRA correction to the attention's output.
 # A deployment stretched by YaRN turns its rotation at the scaled frequencies.
-# Three readings: `text` reads out logits; `hidden` reads out the normed last
-# hidden state instead; `latent` reads it out too and takes each row's input
-# from `latents`, not a token's embedding: a latent step of LatentMAS (Zou et
-# al., ICML 2026), which feeds a row's hidden state back in as the next row.
+# Two readings: `text` embeds each row's token; `latent` takes the row's input
+# from `latents` instead, a latent step of LatentMAS (Zou et al., ICML 2026),
+# which feeds a row's hidden state back in as the next row. Every row read out
+# exposes its normed last hidden state beside its logits.
 
 def caches(m, c):
     kv = c.kv_space(m.kv)
@@ -262,9 +262,8 @@ def tap(mtp, layer, y, fused):
     return ops.elemwise.residual_add(part, fused)
 
 def forward(m, inputs):
-    switch("reading", ["text", "hidden", "latent"])
+    switch("reading", ["text", "latent"])
     latent = switch_is("reading", "latent")
-    hidden = ~switch_is("reading", "text")
     positions = inputs.positions()
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     y = merge([inputs.on(latent).input("latents", dtype.bf16, "row", m.hidden), y.on(~latent)])
@@ -282,8 +281,8 @@ def forward(m, inputs):
 
     y, fused = inputs.fold_layers(m.layers, (y, None), block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
-    output("hidden", ops.gather.gather_rows(x.on(hidden), inputs.on(hidden).readout_rows()))
-    x = ops.gather.gather_rows(x.on(~hidden), inputs.on(~hidden).readout_rows())
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    output("hidden", x)
     logits = ops.linear.lm_head(x, m.embed if m.head == None else m.head)
     if m.mtp != None:
         draft(m, inputs, fused, logits, scaling)

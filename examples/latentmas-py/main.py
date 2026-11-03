@@ -18,6 +18,7 @@ Messages in (JSON), each answered with one JSON message:
 - `{"op": "probe", "tokens", "steps", "scale"}`: `think` on an empty context, one host trip a step,
   sending each latent input as `{"input"}` as it lands (a parity check against Hugging Face). Replies
   `{"steps"}`.
+- `{"op": "render", "messages"}`: replies the templated `{"tokens"}`.
 - `"quit"`.
 
 `messages` (`[{"role", "content"}]`) are templated here with the model's own chat template. With
@@ -121,12 +122,12 @@ class Team:
         self.len += len(tokens)
 
     async def first_latent(self, tokens: list[int], scale: float) -> list[float]:
-        """Reads `tokens` under the `hidden` reading; the first latent input, on the host."""
+        """Reads `tokens`; the first latent input (the last row's hidden state, realigned), on the host."""
         first = Channel([1, self.width], dtype.f32)
-        self.read(tokens, "hidden", lambda: first.put(realign(intrinsics.output(0, "hidden"), self.width, scale)))
+        self.read(tokens, "text", lambda: first.put(realign(intrinsics.output(0, "hidden"), self.width, scale)))
         return await first.take_host()
 
-    def latent_pass(self, lat: Channel, scale: float, ack: Channel | None) -> ForwardPass:
+    def latent_pass(self, lat: Channel, scale: float, ack: Channel | None, echo: bool = False) -> ForwardPass:
         """One latent step: the row's input is `lat`, and its epilogue puts the next one there."""
         fwd = ForwardPass()
         fwd.switch(0, "reading", "latent")
@@ -141,29 +142,34 @@ class Team:
             if self.latent_embeds:
                 token.put(token.take())  # the row's token is unread, but each fire consumes one
             lat.take()
-            lat.put(realign(intrinsics.output(0, "hidden"), self.width, scale))
+            nxt = realign(intrinsics.output(0, "hidden"), self.width, scale)
+            lat.put(nxt)
             if ack is not None:
-                ack.put(iota(1))
+                ack.put(nxt if echo else iota(1))
 
         return fwd
 
-    async def think(self, tokens: list[int], steps: int, scale: float, stream: bool) -> None:
+    async def think(self, tokens: list[int], steps: int, scale: float, stream: bool, echo: bool = False) -> None:
         first = await self.first_latent(tokens, scale)
         if steps == 0:
             return
         lat = Channel.from_shaped([1, self.width], first, dtype.f32)
-        ack = Channel([1], dtype.u32).capacity(channel_capacity())
+        # each step acknowledges with a count, or, when the trajectory is asked for, with its latent input
+        ack = (Channel([1, self.width], dtype.f32) if echo else Channel([1], dtype.u32)).capacity(channel_capacity())
         done = 0
+        self.trace = [first]
 
         async def consume():
             nonlocal done
-            await ack.take_host()
+            value = await ack.take_host()
+            if echo:
+                self.trace.append(value)
             done += 1
             if stream:
                 session.send(json.dumps({"step": done}))
 
         # a pass off the model's default reading posts one fire a frame
-        await drive(self.pipe, self.latent_pass(lat, scale, ack), steps, consume, 1)
+        await drive(self.pipe, self.latent_pass(lat, scale, ack, echo), steps, consume, 1)
         self.len += steps
 
     async def probe(self, tokens: list[int], steps: int, scale: float) -> int:
@@ -248,8 +254,13 @@ async def main(input: dict) -> dict:
         op = request.get("op")
         if op == "think":
             tokens = prompt(request)
-            await team.think(tokens, int(request["steps"]), float(request["scale"]), bool(request.get("stream")))
+            await team.think(tokens, int(request["steps"]), float(request["scale"]), bool(request.get("stream")),
+                             bool(request.get("echo")))
             reply = {"len": team.len, "read": len(tokens)}
+            if request.get("echo"):
+                reply["trace"] = team.trace
+        elif op == "render":
+            reply = {"tokens": render(request["messages"])}
         elif op == "probe":
             team.fresh()
             reply = {"steps": await team.probe(prompt(request), int(request["steps"]), float(request["scale"]))}
