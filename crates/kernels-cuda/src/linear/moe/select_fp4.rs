@@ -124,13 +124,6 @@ pub(super) const WGMMA_FROM: u32 = 13;
 #[cfg(feature = "cuda")]
 pub(super) const WGMMA_WIDE_FROM: u32 = 128;
 
-/// The fewest routes an expert averages that the staged slice takes on
-/// `moe_select_mxfp4_mma_pipe`: below it the fire's 256-row CTAs fill the
-/// card too thinly (DeepSeek-V4.1's miniature at 128 tokens: 7-30% slower,
-/// at 512 even; 9-27% faster from 1024).
-#[cfg(feature = "cuda")]
-const PIPE_FROM: u32 = 192;
-
 /// The stages of `moe_select_mxfp4_mma_pipe`'s ring, and a stage's bytes:
 /// 64 routes' 128-code runs, 256 rows' codes and their scales.
 #[cfg(feature = "cuda")]
@@ -229,9 +222,13 @@ pub(super) fn select_mxfp4_mma(
     let inter = stated(op, y.width)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     // A wide fire of a K of whole 128s takes the staged slice's eight-warp
-    // ring of codes and routes (`moe_select_mxfp4_mma_pipe`), mxfp4 alone.
+    // ring of codes and routes (`moe_select_mxfp4_mma_pipe`), mxfp4 alone,
+    // from `kernel.moe.mxfp4_pipe_from` routes an expert: below 192 the
+    // fire's 256-row CTAs fill the card too thinly (DeepSeek-V4.1's
+    // miniature at 128 tokens: 7-30% slower, at 512 even; 9-27% faster from
+    // 1024).
     let pipe = staged
-        && per >= PIPE_FROM
+        && per >= ctx.tuning().mxfp4_pipe_from
         && !hopper_wgmma()
         && tensor_scales.is_none()
         && k % 128 == 0
