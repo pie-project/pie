@@ -207,7 +207,7 @@ pub(super) fn select_mxfp4_mma(
         && x.width.is_multiple_of(64);
     let wide = staged
         && hopper_wgmma()
-        && tensor_scales.is_none()
+        && (tensor_scales.is_none() || ctx.tuning().nvfp4_wide)
         && x.width.is_multiple_of(64)
         && per >= WGMMA_WIDE_FROM;
     let nb: u32 = match per {

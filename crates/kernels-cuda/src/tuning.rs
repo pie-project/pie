@@ -376,6 +376,13 @@ pub struct MoeMxfp4Bf16Keep(pub u32);
 #[decision(id = "kernel.moe.mxfp4_w4a8_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4W4a8From(pub u32);
 
+/// Whether Hopper's NVFP4 selects of 128 routes an expert and more take the
+/// wide wgmma slice (`moe_select_fp4_wgmma`, two warpgroups on a 128-route
+/// slice), as the MXFP4 ones do; off, the one-warpgroup 64-route slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.nvfp4_wide", flag, default = false, tune = search)]
+pub struct MoeNvfp4Wide;
+
 /// The fewest routes an NVFP4 select of a W4A4 release runs W4A4 on sm_120a's
 /// block-scaled mma.sync, its rows quantized as NVFP4 (as the FlashInfer SM120
 /// CUTLASS MoE reads NVFP4 experts on the consumer Blackwells). 0: never.
@@ -919,6 +926,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4Bf16Keep>()
         .add::<MoeMxfp4W4a8From>()
         .add::<MoeNvfp4W4a4From>()
+        .add::<MoeNvfp4Wide>()
         .add::<MoeMxfp4W4a8Tma>()
         .add::<MoeMxfp4W4a8Ws>()
         .add::<MoeW4a4FusedFrom>()
@@ -1069,6 +1077,7 @@ tuning! {
     mxfp4_bf16_keep: u32 = 0, get MoeMxfp4Bf16Keep;
     mxfp4_w4a8_from: u32 = 0, get MoeMxfp4W4a8From;
     nvfp4_w4a4_from: u32 = 0, get MoeNvfp4W4a4From;
+    nvfp4_wide: bool = false, on MoeNvfp4Wide;
     mxfp4_w4a8_tma: bool = false, on MoeMxfp4W4a8Tma;
     mxfp4_w4a8_ws: bool = false, on MoeMxfp4W4a8Ws;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;

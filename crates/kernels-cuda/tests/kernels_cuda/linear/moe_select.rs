@@ -222,6 +222,8 @@ fn the_routed_selects_answer_the_routed_dot() {
     } else {
         Tuning { nvfp4_mma_until: 65_536, ..d }
     };
+    #[rustfmt::skip]
+    let nv_wide = Tuning { nvfp4_wide: true, ..nv_mma };
     let (sw, f, t) = (Some(Glu::Swiglu), false, true);
     #[rustfmt::skip]
     let alpha = Some(Glu::SwigluClampAlpha { limit: 1e4, alpha: 1.702 });
@@ -327,6 +329,11 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Nv, nv_mma, [8, 64, 8, 200, 1024], f, None, 0),
         (K::MxBias, mma, [8, 80, 4, 192, 2816], t, alpha, 2),
         (K::Nv, nv_mma, [8, 64, 8, 6144, 512], t, None, 0),
+        // Hopper's wide slice on NVFP4 (`kernel.moe.nvfp4_wide`): a prefill's
+        // routes, by token and by route, its GLU.
+        (K::Nv, nv_wide, [8, 300, 8, 256, 1024], t, None, 0),
+        (K::Nv, nv_wide, [8, 300, 8, 384, 1024], f, None, 0),
+        (K::Nv, nv_wide, [8, 300, 8, 256, 1024], t, sw, 0),
     ];
     // Off tcgen05 (Hopper) the arms its tunings name do not take the fire.
     cases.retain(|case| supported() || !(case.1.moe_tc5 || case.1.mxfp4_cvt));
