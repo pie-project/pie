@@ -389,6 +389,24 @@ pub struct Stamp {
 pub enum Key {
     Shared(Stamp),
     Own(engine::InstanceId),
+    /// An instance's own planes, by their contents: every pass that carries
+    /// the same adapter shares one slot, landed once.
+    Planes(u64),
+}
+
+/// A fingerprint of an adapter's planes: every bank name and byte.
+fn planes_fingerprint(planes: &[AdapterPlane<'_>]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |w: u64| h = (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    for plane in planes {
+        for chunk in plane.bank.as_bytes().chunks(8).chain(plane.bytes.chunks(8)) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            mix(u64::from_le_bytes(word));
+        }
+        mix(plane.bytes.len() as u64);
+    }
+    h
 }
 
 fn stat(at: &Path, file: &str, name: &str) -> Result<(String, u64, u128)> {
@@ -615,7 +633,7 @@ impl Adapters {
 
     pub fn key(&self, source: &Source<'_>) -> Result<Key> {
         match source {
-            Source::Own { instance, .. } => Ok(Key::Own(*instance)),
+            Source::Own { planes, .. } => Ok(Key::Planes(planes_fingerprint(planes))),
             Source::Shared { name } => {
                 let dir = self.vfs.resolve(name)?;
                 let manifest = Manifest::read(&dir, name)?;
