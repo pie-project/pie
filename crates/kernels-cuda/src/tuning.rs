@@ -383,6 +383,19 @@ pub struct MoeMxfp4W4a8From(pub u32);
 #[decision(id = "kernel.moe.nvfp4_w4a4_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeNvfp4W4a4From(pub u32);
 
+/// The fewest routes an expert averages that a bf16 select's prefill fire
+/// takes on the wide 128 x 256 tile (`moe_select_bf16_gemm_wide`); fewer
+/// keep the three-stage 64-route one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.bf16_wide_from", constant(range(1..=65_536)), default = 128, tune = search)]
+pub struct MoeBf16WideFrom(pub u32);
+
+/// The stages of the 64-route bf16 select GEMM (`moe_select_bf16_gemm`): three
+/// take 72 KiB a CTA, one CTA on a card of 100 KiB an SM; two seat two CTAs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.bf16_gemm_stages", constant(range(2..=4)), default = 3, tune = search)]
+pub struct MoeBf16GemmStages(pub u32);
+
 /// The W4A8 select's stages landed by TMA, its rows quantized in route order
 /// so an expert's slice is one box. Off but where a chip's profile says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -919,6 +932,8 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4Bf16Keep>()
         .add::<MoeMxfp4W4a8From>()
         .add::<MoeNvfp4W4a4From>()
+        .add::<MoeBf16WideFrom>()
+        .add::<MoeBf16GemmStages>()
         .add::<MoeMxfp4W4a8Tma>()
         .add::<MoeMxfp4W4a8Ws>()
         .add::<MoeW4a4FusedFrom>()
@@ -1069,6 +1084,8 @@ tuning! {
     mxfp4_bf16_keep: u32 = 0, get MoeMxfp4Bf16Keep;
     mxfp4_w4a8_from: u32 = 0, get MoeMxfp4W4a8From;
     nvfp4_w4a4_from: u32 = 0, get MoeNvfp4W4a4From;
+    bf16_wide_from: u32 = 128, get MoeBf16WideFrom;
+    bf16_gemm_stages: u32 = 3, get MoeBf16GemmStages;
     mxfp4_w4a8_tma: bool = false, on MoeMxfp4W4a8Tma;
     mxfp4_w4a8_ws: bool = false, on MoeMxfp4W4a8Ws;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
