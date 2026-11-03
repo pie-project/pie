@@ -11,8 +11,8 @@
 //! anything else with the first op or field that differs.
 
 use poem_ir::{
-    Attn, CacheRow, Def, Dtype, Elemwise, Gather, GluAct, Linear, NormAxis, NormWeight, Operands,
-    Operation, Param, RopeFreqs, Trace, Turn, ValueId,
+    Attn, CacheRow, Def, Dtype, Elemwise, GateActivation, Gather, GluAct, Linear, NormAxis,
+    NormWeight, Operands, Operation, Param, RopeFreqs, Ssm, Trace, Turn, ValueId,
 };
 
 use super::plan::ROPE_POSITIONS;
@@ -61,6 +61,52 @@ pub struct ModelSpec {
     pub weights: Dtype,
     /// The KV cache's dtype as deployed.
     pub kv: Dtype,
+    /// The norms scale by `1 + w` (Qwen3.5's): the placement adds the one.
+    pub norm_plus_one: bool,
+    /// A hybrid of attention and Gated DeltaNet layers (Qwen3.5); `None`:
+    /// every layer attends. The attention fields above describe its
+    /// attention layers.
+    pub hybrid: Option<Hybrid>,
+}
+
+/// What a layer mixes its sequence with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    /// Full causal GQA attention over the paged KV pool.
+    Attention,
+    /// A Gated DeltaNet: a short causal conv, then the gated delta rule over
+    /// a per-request recurrent state.
+    GatedDelta,
+}
+
+/// A Gated DeltaNet layer's dims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gdn {
+    pub k_heads: usize,
+    pub v_heads: usize,
+    pub k_dim: usize,
+    pub v_dim: usize,
+    pub conv_width: usize,
+}
+
+impl Gdn {
+    /// The conv's channels: q, k and v.
+    pub fn conv_channels(&self) -> usize {
+        2 * self.k_heads * self.k_dim + self.v_heads * self.v_dim
+    }
+}
+
+/// A hybrid model's layer mix and the facts its two layer kinds add.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hybrid {
+    pub kinds: Vec<LayerKind>,
+    pub gdn: Gdn,
+    /// The attention output is gated by `sigmoid` of a second query half
+    /// (`SplitQGate`, `GateSigmoidMul`).
+    pub attn_gate: bool,
+    /// RoPE turns the first `rotary_dim` dims of a head, pairs `(i, i +
+    /// rotary_dim / 2)`.
+    pub rotary_dim: usize,
 }
 
 /// A difference from the kernels as built that the plan can absorb at small
@@ -144,6 +190,13 @@ impl ModelSpec {
     /// Reads the spec off `trace`, or refuses: the first op or field that
     /// the spatial kernels do not implement, with its layer.
     pub fn read(trace: &Trace) -> Result<ModelSpec, Refused> {
+        if trace
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Operation::Ssm(Ssm::GatedDelta { .. })))
+        {
+            return read_hybrid(trace);
+        }
         let param = |v: ValueId| -> Option<&Param> {
             match trace.values.get(v.0 as usize)?.def {
                 Def::Weight(i) => trace.params.get(i as usize),
@@ -553,6 +606,8 @@ impl ModelSpec {
             sm_scale: first.sm_scale.unwrap_or(0.0),
             weights,
             kv,
+            norm_plus_one: false,
+            hybrid: None,
         })
     }
 
@@ -575,6 +630,428 @@ impl ModelSpec {
     pub fn group(&self) -> usize {
         self.q_heads / self.kv_heads
     }
+}
+
+/// One hybrid layer's facts, gathered op by op.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct HybridLayer {
+    row_norms: usize,
+    head_norms: usize,
+    /// (q_width, kv_width) of the attention's SplitQkv.
+    qkv: Option<(u32, u32)>,
+    q_gate: Option<u32>,
+    gate_mul: usize,
+    rope: Option<(u32, u32, f32)>,
+    appends: usize,
+    attends: usize,
+    sm_scale: Option<f32>,
+    kv_heads: Option<u32>,
+    conv: Option<u32>,
+    gates: usize,
+    deltas: Option<(u32, u32, u32, u32)>,
+    gated_norms: usize,
+    split_rows: Option<u32>,
+    glus: usize,
+    inter: Option<u32>,
+    residuals: usize,
+    weights: Vec<ValueId>,
+}
+
+/// [`ModelSpec::read`] for a model with Gated DeltaNet layers: the Qwen3.5
+/// dense structure (layers of either kind, each pre-normed with `1 + w`
+/// RMSNorms and followed by a SwiGLU MLP; gated attention with partial RoPE)
+/// or a refusal naming what differs.
+fn read_hybrid(trace: &Trace) -> Result<ModelSpec, Refused> {
+    let name = &trace.name;
+    let param = |v: ValueId| -> Option<&Param> {
+        match trace.values.get(v.0 as usize)?.def {
+            Def::Weight(i) => trace.params.get(i as usize),
+            _ => None,
+        }
+    };
+    let mut layers: Vec<HybridLayer> = Vec::new();
+    let (mut vocab, mut embed, mut head, mut q_heads) = (None, None, None, None);
+    let (mut final_norms, mut eps) = (0usize, None::<f32>);
+    for node in &trace.nodes {
+        let op_name = node.op.name();
+        let at = |why: &str| match node.layer {
+            Some(l) => format!("{name}: layer {l}: {op_name}: {why}"),
+            None => format!("{name}: {op_name}: {why}"),
+        };
+        let l = node.layer.map(|l| l as usize);
+        if let Some(l) = l
+            && layers.len() <= l
+        {
+            layers.resize(l + 1, HybridLayer::default());
+        }
+        let layer = l.map(|l| &mut layers[l]);
+        match (&node.op, layer) {
+            (
+                Operation::Gather(Gather::Embed {
+                    table,
+                    vocab: v,
+                    weights: None,
+                    scales: None,
+                    concat: false,
+                    ..
+                }),
+                None,
+            ) => {
+                vocab = Some(*v as usize);
+                embed = Some(*table);
+            }
+            (Operation::Gather(Gather::Rows { .. }), None) => {}
+            (Operation::Sampling(_), None) => {}
+            (
+                Operation::Elemwise(Elemwise::Rmsnorm {
+                    weight,
+                    axis,
+                    eps: e,
+                    ..
+                }),
+                layer,
+            ) => {
+                if !matches!(weight, NormWeight::PlusOne(_)) {
+                    return refuse(at(&format!("norm weight {weight:?} (wanted 1 + w)")));
+                }
+                if eps.is_some_and(|eps| eps != *e) {
+                    return refuse(at("RMSNorm epsilons differ between norms"));
+                }
+                eps = Some(*e);
+                match (axis, layer) {
+                    (NormAxis::Row, Some(layer)) => layer.row_norms += 1,
+                    (NormAxis::Row, None) => final_norms += 1,
+                    (NormAxis::Head(_), Some(layer)) => layer.head_norms += 1,
+                    (axis, _) => return refuse(at(&format!("a norm over {axis:?}"))),
+                }
+            }
+            (
+                Operation::Linear(Linear::Matmul {
+                    w,
+                    quant: None,
+                    input_scales: None,
+                    scales: None,
+                    logits,
+                    ..
+                }),
+                layer,
+            ) => match (logits, layer) {
+                (false, Some(layer)) => layer.weights.push(*w),
+                (true, None) => head = Some(*w),
+                _ => return refuse(at("a projection outside the decoder layers")),
+            },
+            (Operation::Linear(Linear::LoraCorrect { .. }), Some(_)) => {}
+            (
+                Operation::Linear(Linear::Glu {
+                    packed: Some(_),
+                    weights: None,
+                    intermediate,
+                    act: GluAct::Swiglu,
+                    limit: None,
+                    ..
+                }),
+                Some(layer),
+            ) => {
+                layer.glus += 1;
+                layer.inter = Some(*intermediate);
+            }
+            (Operation::Elemwise(Elemwise::ResidualAdd { gate: None, .. }), Some(layer)) => {
+                layer.residuals += 1
+            }
+            (Operation::Gather(Gather::SplitRows { width, .. }), Some(layer)) => {
+                layer.split_rows = Some(*width)
+            }
+            (
+                Operation::Ssm(
+                    Ssm::CausalConv1d {
+                        bias: None,
+                        conv_width,
+                        dilation: 1,
+                        ..
+                    }
+                    | Ssm::CausalConv1dChunked {
+                        bias: None,
+                        conv_width,
+                        dilation: 1,
+                        ..
+                    },
+                ),
+                Some(layer),
+            ) => {
+                if layer.conv.is_some_and(|w| w != *conv_width) {
+                    return refuse(at("the conv's two forms differ"));
+                }
+                layer.conv = Some(*conv_width);
+            }
+            (Operation::Ssm(Ssm::GdnGates { .. }), Some(layer)) => layer.gates += 1,
+            (
+                Operation::Ssm(
+                    Ssm::GatedDelta {
+                        k_heads,
+                        v_heads,
+                        k_dim,
+                        v_dim,
+                        ..
+                    }
+                    | Ssm::GatedDeltaChunked {
+                        k_heads,
+                        v_heads,
+                        k_dim,
+                        v_dim,
+                        ..
+                    },
+                ),
+                Some(layer),
+            ) => {
+                let d = (*k_heads, *v_heads, *k_dim, *v_dim);
+                if layer.deltas.is_some_and(|x| x != d) {
+                    return refuse(at("the delta rule's two forms differ"));
+                }
+                layer.deltas = Some(d);
+            }
+            (
+                Operation::Elemwise(Elemwise::RmsnormGated {
+                    weight: Some(_),
+                    act: GateActivation::Silu,
+                    eps: e,
+                    ..
+                }),
+                Some(layer),
+            ) => {
+                if eps.is_some_and(|eps| eps != *e) {
+                    return refuse(at("RMSNorm epsilons differ between norms"));
+                }
+                layer.gated_norms += 1;
+            }
+            (
+                Operation::Gather(Gather::SplitQkv {
+                    q_width, kv_width, ..
+                }),
+                Some(layer),
+            ) => layer.qkv = Some((*q_width, *kv_width)),
+            (Operation::Gather(Gather::SplitQGate { head_dim, .. }), Some(layer)) => {
+                layer.q_gate = Some(*head_dim)
+            }
+            (Operation::Elemwise(Elemwise::GateSigmoidMul { heads: None, .. }), Some(layer)) => {
+                layer.gate_mul += 1
+            }
+            (
+                Operation::Elemwise(Elemwise::Rope {
+                    k: Some(_),
+                    head_dim,
+                    theta,
+                    turn: Turn::Partial { rotary_dim, span },
+                    freqs: None,
+                    ..
+                }),
+                Some(layer),
+            ) if 2 * *span == *rotary_dim && rotary_dim <= head_dim => {
+                layer.rope = Some((*head_dim, *rotary_dim, *theta))
+            }
+            (
+                Operation::Attn(
+                    Attn::PlanDecode {
+                        q_heads: q,
+                        window: None,
+                        ..
+                    }
+                    | Attn::PlanPrefill {
+                        q_heads: q,
+                        window: None,
+                        ..
+                    },
+                ),
+                None,
+            ) => q_heads = Some(*q as usize),
+            (Operation::Attn(Attn::KvAppend { v: Some(_), .. }), Some(layer)) => layer.appends += 1,
+            (
+                Operation::Attn(
+                    Attn::Decode {
+                        window: None,
+                        selection: None,
+                        bias: None,
+                        selected: None,
+                        rel: None,
+                        sm_scale,
+                        ..
+                    }
+                    | Attn::Prefill {
+                        window: None,
+                        selection: None,
+                        bias: None,
+                        selected: None,
+                        rel: None,
+                        causal: true,
+                        sm_scale,
+                        ..
+                    },
+                ),
+                Some(layer),
+            ) => {
+                if let Operation::Attn(Attn::Prefill { kv_heads, .. }) = &node.op {
+                    layer.kv_heads = Some(*kv_heads);
+                }
+                layer.attends += 1;
+                layer.sm_scale = Some(*sm_scale);
+            }
+            (Operation::Attn(Attn::ScoreCapture { .. }), Some(_)) => {}
+            (op, _) => {
+                return refuse(at(&format!("{} ({op:?})", what(op_name))
+                    .chars()
+                    .take(400)
+                    .collect::<String>()));
+            }
+        }
+    }
+    let (Some(vocab), Some(embed), Some(q_heads), Some(head)) = (vocab, embed, q_heads, head)
+    else {
+        return refuse(format!(
+            "{name}: no token embedding, attention plan or lm_head"
+        ));
+    };
+    if final_norms != 1 {
+        return refuse(format!("{name}: {final_norms} norms outside the layers"));
+    }
+    let hidden = param(embed)
+        .and_then(|p| p.shape.get(1).copied())
+        .ok_or_else(|| Refused(format!("{name}: the embedding table is not a weight")))?
+        as usize;
+    let (mut kinds, mut attn, mut gdn, mut inter) = (Vec::new(), None, None, None);
+    let mut weights = None;
+    for (l, layer) in layers.iter().enumerate() {
+        let bad = |why: String| refuse(format!("{name}: layer {l}: {why}"));
+        if layer.row_norms != 2 || layer.glus != 1 || layer.residuals != 2 {
+            return bad(format!(
+                "{} row norms, {} GLUs, {} residual adds (wanted a pre-normed mixer and SwiGLU MLP)",
+                layer.row_norms, layer.glus, layer.residuals
+            ));
+        }
+        if inter.is_some_and(|i| Some(i) != layer.inter) {
+            return bad("its MLP differs from layer 0's".into());
+        }
+        inter = layer.inter;
+        for w in &layer.weights {
+            let dtype = param(*w).map(|p| p.dtype);
+            if weights.is_some_and(|d| Some(d) != dtype) {
+                return bad("projections of different dtypes".into());
+            }
+            weights = dtype;
+        }
+        match (layer.deltas, layer.rope) {
+            (Some((kh, vh, kd, vd)), None) => {
+                let conv = layer.conv.unwrap_or(0) as usize;
+                let g = Gdn {
+                    k_heads: kh as usize,
+                    v_heads: vh as usize,
+                    k_dim: kd as usize,
+                    v_dim: vd as usize,
+                    conv_width: conv,
+                };
+                // in_qkvz, in_ba, out_proj and the MLP's two; the conv over q, k
+                // and v, z apart.
+                if layer.weights.len() != 5
+                    || conv == 0
+                    || layer.gates == 0
+                    || layer.gated_norms == 0
+                    || layer.split_rows != Some(g.conv_channels() as u32)
+                    || layer.appends + layer.attends + layer.head_norms != 0
+                {
+                    return bad(format!(
+                        "not a Gated DeltaNet layer as Qwen3.5's: {layer:?}"
+                    ));
+                }
+                if gdn.is_some_and(|x| x != g) {
+                    return bad("its Gated DeltaNet differs from the first's".into());
+                }
+                gdn = Some(g);
+                kinds.push(LayerKind::GatedDelta);
+            }
+            (None, Some((hd, rot, theta))) => {
+                let (Some((qw, kvw)), Some(kv), Some(sm)) =
+                    (layer.qkv, layer.kv_heads, layer.sm_scale)
+                else {
+                    return bad("an attention layer without its q/k/v split or reads".into());
+                };
+                if layer.q_gate != Some(hd)
+                    || layer.gate_mul != 1
+                    || layer.head_norms != 2
+                    || layer.appends != 1
+                    || layer.attends == 0
+                    || layer.weights.len() != 4
+                    || qw != 2 * q_heads as u32 * hd
+                    || kvw != kv * hd
+                {
+                    return bad(format!(
+                        "not a gated attention layer as Qwen3.5's: {layer:?}"
+                    ));
+                }
+                let a = (hd as usize, rot as usize, theta, kv as usize, sm);
+                if attn.is_some_and(|x| x != a) {
+                    return bad("its attention differs from the first's".into());
+                }
+                attn = Some(a);
+                kinds.push(LayerKind::Attention);
+            }
+            _ => return bad("neither an attention nor a Gated DeltaNet layer".into()),
+        }
+    }
+    let (Some((head_dim, rotary_dim, theta, kv_heads, sm_scale)), Some(gdn), Some(inter)) =
+        (attn, gdn, inter)
+    else {
+        return refuse(format!("{name}: a hybrid wants both layer kinds"));
+    };
+    let weights = weights.ok_or_else(|| Refused(format!("{name}: no projection weights")))?;
+    if !matches!(weights, Dtype::Bf16 | Dtype::F32) {
+        return refuse(format!(
+            "{name}: {weights:?} projections (the kernels hold f32 or bf16 weights; plan the \
+             model's bf16 deployment)"
+        ));
+    }
+    let kv = trace
+        .caches
+        .iter()
+        .find_map(|c| match c {
+            CacheRow::Kv {
+                dtype,
+                window: None,
+                rows: None,
+                ..
+            } => Some(*dtype),
+            _ => None,
+        })
+        .ok_or_else(|| Refused(format!("{name}: no KV cache the kernels keep")))?;
+    if !matches!(kv, Dtype::Bf16 | Dtype::F32) {
+        return refuse(format!("{name}: {kv:?} KV (the kernels store f32 or bf16)"));
+    }
+    if !q_heads.is_multiple_of(kv_heads) || !gdn.v_heads.is_multiple_of(gdn.k_heads) {
+        return refuse(format!("{name}: heads that do not group"));
+    }
+    let tied = head == embed || param(head).map(|p| &p.name) == param(embed).map(|p| &p.name);
+    Ok(ModelSpec {
+        name: name.clone(),
+        layers: layers.len(),
+        hidden,
+        q_heads,
+        kv_heads,
+        head_dim,
+        inter: inter as usize,
+        vocab,
+        tied,
+        qk_norm: true,
+        rope_theta: theta,
+        rope_table: None,
+        rms_eps: eps.unwrap_or(0.0),
+        sm_scale,
+        weights,
+        kv,
+        norm_plus_one: true,
+        hybrid: Some(Hybrid {
+            kinds,
+            gdn,
+            attn_gate: true,
+            rotary_dim,
+        }),
+    })
 }
 
 /// A compiled program's params, read from its `out.json` (`params`: numbers
@@ -607,6 +1084,12 @@ impl ModelSpec {
         let name = &self.name;
         fn no<T>(name: &str, why: String) -> Result<T, Refused> {
             refuse(format!("{name}: the wafer program: {why}"))
+        }
+        if self.hybrid.is_some() && get("Q35").is_none() {
+            return no(
+                name,
+                "Gated DeltaNet layers (only a qwen35 program carries them)".into(),
+            );
         }
         // What every program and today's placement assume.
         if self.rms_eps != KERNEL_EPS {
@@ -742,5 +1225,81 @@ impl ModelSpec {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(name: &str) -> Result<ModelSpec, Refused> {
+        let c = poem_compiler::catalog::repository();
+        let t = c
+            .parse(name)
+            .expect(name)
+            .trace(poem_ir::Platform::Cerebras);
+        ModelSpec::read(&t)
+    }
+
+    /// Qwen3.5-0.8B reads as a hybrid: 18 Gated DeltaNet layers and every
+    /// fourth layer gated attention (head_dim 256, the first 64 dims turned).
+    #[test]
+    fn qwen35_reads_as_a_hybrid() {
+        let s = spec("qwen35-d0.8b-bf16-kv-bf16").expect("qwen3.5 0.8b reads");
+        assert_eq!(
+            (s.layers, s.hidden, s.inter, s.vocab),
+            (24, 1024, 3584, 248_320)
+        );
+        assert_eq!(
+            (s.q_heads, s.kv_heads, s.head_dim, s.sm_scale),
+            (8, 2, 256, 0.0625)
+        );
+        assert!(s.tied && s.qk_norm && s.norm_plus_one);
+        assert_eq!((s.rope_theta, s.rms_eps), (1e7, 1e-6));
+        let h = s.hybrid.as_ref().expect("a hybrid");
+        assert_eq!(h.rotary_dim, 64);
+        assert!(h.attn_gate);
+        assert_eq!(
+            h.gdn,
+            Gdn {
+                k_heads: 16,
+                v_heads: 16,
+                k_dim: 128,
+                v_dim: 128,
+                conv_width: 4
+            }
+        );
+        assert_eq!(h.gdn.conv_channels(), 6144);
+        for (l, k) in h.kinds.iter().enumerate() {
+            let want = if l % 4 == 3 {
+                LayerKind::Attention
+            } else {
+                LayerKind::GatedDelta
+            };
+            assert_eq!(*k, want, "layer {l}");
+        }
+        // The larger dense ones read too (16 k heads, 32 v heads from 4B).
+        for (name, layers, hidden, vh) in [
+            ("qwen35-d4b-bf16-kv-bf16", 32, 2560, 32),
+            ("qwen35-d9b-bf16-kv-bf16", 32, 4096, 32),
+        ] {
+            let s = spec(name).expect(name);
+            let h = s.hybrid.as_ref().unwrap();
+            assert_eq!(
+                (s.layers, s.hidden, h.gdn.v_heads),
+                (layers, hidden, vh),
+                "{name}"
+            );
+        }
+    }
+
+    /// A hybrid model is refused on a program without its layers.
+    #[test]
+    fn a_hybrid_wants_a_qwen35_program() {
+        let s = spec("qwen35-d0.8b-bf16-kv-bf16").unwrap();
+        let err = s
+            .check_program(|k| (k == "HEADMODE").then_some(2))
+            .unwrap_err();
+        assert!(err.0.contains("Gated DeltaNet"), "{err}");
     }
 }

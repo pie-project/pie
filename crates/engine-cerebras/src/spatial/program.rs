@@ -10,9 +10,10 @@
 //!
 //! - [`Model`]: the dims the program was built for (hidden, query heads a
 //!   kv head, vocabulary) and its launch's iterations (`CAP`);
-//! - [`Layers`]: the decoder layers' pipeline: f32 qwen2d grids (serve2d),
-//!   bf16 grids in strips (serve8b) or grids and several-layer regions
-//!   (serve8b_region);
+//! - [`Layers`]: the decoder layers' pipeline: f32 qwen2d grids (serve2d;
+//!   on serve_q35 each grid a Gated DeltaNet or gated-attention unit by its
+//!   [`Hybrid`] mix), bf16 grids in strips (serve8b) or grids and
+//!   several-layer regions (serve8b_region);
 //! - [`Stage`]: one batch a launch, or a ring of `MMAX` micro-batches;
 //! - [`Head`]: the head's rows, columns and logits lanes;
 //! - [`Kv`]: one sequence's cache, or a paged pool with its page-copy and
@@ -70,12 +71,14 @@ pub struct Model {
 pub enum Layers {
     /// serve2d / serve2d_pipe: one f32 qwen2d grid a layer, `gw` across and
     /// `gh` down, serpentine; `tc` KV positions a PE row on a one-sequence
-    /// build.
+    /// build. serve_q35: each grid a Gated DeltaNet or a gated-attention
+    /// unit (`hybrid`).
     Grids {
         grid: Kernel,
         gw: usize,
         gh: usize,
         tc: usize,
+        hybrid: Option<Hybrid>,
     },
     /// serve8b: bf16 grids in strips; strips past the first `full` skip
     /// their westmost slot.
@@ -87,6 +90,47 @@ pub enum Layers {
     },
     /// serve8b_region: grids and several-layer regions.
     Units { grid: Kernel, units: Units },
+}
+
+/// serve_q35's layer mix and its Gated DeltaNet unit's splits: layer `l`
+/// attends where bit `l` of `kinds` is set (`KINDS`), else is a Gated
+/// DeltaNet of `gk` columns a k head, `dk` k dims a column, `vh` v heads a
+/// k head of `dv` dims a column, a `cw`-wide causal conv; RoPE turns `rot`
+/// dims of an attention head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hybrid {
+    pub kinds: u64,
+    pub gk: usize,
+    pub dk: usize,
+    pub vh: usize,
+    pub dv: usize,
+    pub cw: usize,
+    pub rot: usize,
+}
+
+impl Hybrid {
+    /// Whether layer `l` attends (its grid holds a KV pool).
+    #[must_use]
+    pub fn attends(&self, l: usize) -> bool {
+        self.kinds >> l & 1 == 1
+    }
+
+    /// A Gated DeltaNet column's conv channels (q, k and v) and its words of
+    /// one lane's conv window and recurrent state row.
+    #[must_use]
+    pub fn conv_channels(&self) -> usize {
+        2 * self.dk + self.vh * self.dv
+    }
+
+    #[must_use]
+    pub fn window_words(&self) -> usize {
+        (self.cw - 1) * self.conv_channels()
+    }
+
+    #[must_use]
+    pub fn state_words(&self) -> usize {
+        self.vh * self.dv
+    }
 }
 
 impl Layers {
@@ -250,7 +294,7 @@ impl ProgramSpec {
     pub fn from_params(design: Design, params: &[(String, String)]) -> R<ProgramSpec> {
         let get = Get(params);
         let mut spec = match design {
-            Design::Serve2d | Design::Serve2dPipe => serve2d(design, &get)?,
+            Design::Serve2d | Design::Serve2dPipe | Design::ServeQ35 => serve2d(design, &get)?,
             Design::Serve8b => serve8b(&get)?,
             Design::Serve8bRegion | Design::Serve8bRegionPipe => serve8b_region(design, &get)?,
         };
@@ -441,7 +485,9 @@ impl ProgramSpec {
     /// PIE) are a build of.
     pub fn infer_design(params: &[(String, String)]) -> R<Design> {
         let get = Get(params);
-        Ok(if get.opt("RPX").is_some() {
+        Ok(if get.opt("Q35") == Some(1) {
+            Design::ServeQ35
+        } else if get.opt("RPX").is_some() {
             if get.opt("PIPE") == Some(1) {
                 Design::Serve8bRegionPipe
             } else {
@@ -514,6 +560,22 @@ impl ProgramSpec {
             (Layers::Grids { gw, .. } | Layers::Strips { gw, .. }, "GW") => Some(gw),
             (Layers::Grids { gh, .. } | Layers::Strips { gh, .. }, "GH") => Some(gh),
             (Layers::Grids { tc, .. }, "Tc") => Some(tc),
+            (
+                Layers::Grids {
+                    hybrid: Some(h), ..
+                },
+                _,
+            ) => match k {
+                "Q35" => Some(1),
+                "KINDS" => usize::try_from(h.kinds).ok(),
+                "GK" => Some(h.gk),
+                "DK" => Some(h.dk),
+                "VH" => Some(h.vh),
+                "DV" => Some(h.dv),
+                "CW" => Some(h.cw),
+                "ROT" => Some(h.rot),
+                _ => None,
+            },
             (Layers::Strips { full, .. }, "GS") => Some(full),
             (Layers::Units { units: u, .. }, _) => match k {
                 "RPX" => Some(u.rpx),
@@ -621,7 +683,25 @@ impl ProgramSpec {
     }
 
     fn is_serve2d(&self) -> bool {
-        matches!(self.design, Design::Serve2d | Design::Serve2dPipe)
+        matches!(
+            self.design,
+            Design::Serve2d | Design::Serve2dPipe | Design::ServeQ35
+        )
+    }
+
+    /// serve_q35's layer mix (`None`: every layer attends).
+    #[must_use]
+    pub fn hybrid(&self) -> Option<Hybrid> {
+        match self.layers {
+            Layers::Grids { hybrid, .. } => hybrid,
+            _ => None,
+        }
+    }
+
+    /// Whether layer `l`'s grid attends (holds a KV pool).
+    #[must_use]
+    pub fn attends(&self, l: usize) -> bool {
+        self.hybrid().is_none_or(|h| h.attends(l))
     }
 
     // ------------------------------------------------------- the geometry
@@ -795,6 +875,15 @@ impl ProgramSpec {
                 }
                 a
             }
+            Layers::Grids {
+                hybrid: Some(_), ..
+            } => (0..self.layers())
+                .filter(|&l| self.attends(l))
+                .map(|l| {
+                    let (x, y) = self.origin(l);
+                    rect(x, y, px, py)
+                })
+                .collect(),
             Layers::Grids { gw, gh, .. } => vec![rect(0, 0, gw * px, gh * py)],
         }
     }
@@ -983,6 +1072,7 @@ fn serve2d(design: Design, get: &Get) -> R<ProgramSpec> {
             gw: get.req("GW")?,
             gh: get.req("GH")?,
             tc: get.req("Tc")?,
+            hybrid: None,
         },
         stage: Stage::Single,
         head: head(get, true)?,
@@ -992,8 +1082,27 @@ fn serve2d(design: Design, get: &Get) -> R<ProgramSpec> {
         raw: BTreeMap::new(),
         order: Vec::new(),
     };
+    if design == Design::ServeQ35 {
+        let kinds = get.req("KINDS")? as u64;
+        let hybrid = Hybrid {
+            kinds,
+            gk: get.req("GK")?,
+            dk: get.req("DK")?,
+            vh: get.req("VH")?,
+            dv: get.req("DV")?,
+            cw: get.req("CW")?,
+            rot: get.req("ROT")?,
+        };
+        if get.opt("GRID") != Some(1) || get.opt("MMAX").is_some() || get.opt("B") != Some(1) {
+            return Err("serve_q35 is a batched (GRID 1) build of one lane (B 1), no ring".into());
+        }
+        if let Layers::Grids { hybrid: h, .. } = &mut spec.layers {
+            *h = Some(hybrid);
+        }
+    }
+    let qh_ok = spec.model.qh == 2 || design == Design::ServeQ35;
     if get.opt("GRID").unwrap_or(0) == 1 {
-        if grid.px != grid.py || spec.model.qh != 2 || spec.model.hidden != grid.py * grid.hc {
+        if grid.px != grid.py || !qh_ok || spec.model.hidden != grid.py * grid.hc {
             return Err(format!(
                 "a batched serve2d build wants square grids, Qh 2 and no hidden padding: {spec:?}"
             ));

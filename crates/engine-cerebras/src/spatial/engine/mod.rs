@@ -438,6 +438,36 @@ impl Engine for Spatial {
         })
     }
 
+    /// A serve_q35 build's recurrent states, a row to a row (the wafer
+    /// keeps each state's tokens: a copy's lane replays them).
+    fn copy_state(&mut self, copy: &engine::transfer::StateCopy) -> EngineResult<()> {
+        copy.device_only("cerebras-spatial")?;
+        if !copy.pages.is_empty() {
+            return Err(Error::Unsupported {
+                verb: "`copy_state` of buffer pages on the wafer",
+                engine: "cerebras-spatial",
+            });
+        }
+        self.drain();
+        let w = self.model()?;
+        if !w.recurrent {
+            return Err(Error::Unsupported {
+                verb: "`copy_state` on a wafer build without recurrent layers",
+                engine: "cerebras-spatial",
+            });
+        }
+        for (at, m) in copy.moves.iter().enumerate() {
+            if m.src_token_offset != 0 || m.dst_token_offset != 0 {
+                return Err(Error::Invalid(format!(
+                    "state move {at} names a token offset; the wafer moves whole states"
+                )));
+            }
+            w.copy_state(m.src_slot_id, m.dst_slot_id)
+                .map_err(|e| Error::Device(format!("the wafer model: {e}")))?;
+        }
+        Ok(())
+    }
+
     fn copy_kv(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<()> {
         copy.validate()?;
         self.drain();
