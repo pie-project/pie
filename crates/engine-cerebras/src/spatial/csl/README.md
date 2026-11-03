@@ -26,6 +26,15 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
     (P 128: the GDN unit 30.1 KB a PE at B 1, 39.1 KB at B 8; the
     attention unit 34.2 KB at B 1 NB 8, 41.4 KB at B 8). No design places
     them yet: no codegen pin.
+  - `gemma4_layer.csl`: a Gemma 4 dense layer on qwen35_attn's grid without
+    the gates: v normed per head, the attention's and the MLP's outputs
+    normed before their residual adds, a GELU-tanh GLU, the per-layer
+    embedding (`PC` dims a column of the layer's table for `PR` vocab rows
+    a row, the context projection of `x0`), the layer's scalar, and the
+    shared tail's k and v in (`OWN` 0, `kvi`) or out (`SHARE` 1, `kvo`).
+    Matches numpy on the fabric simulator at P 16 (sliding, global with a
+    partial RoPE, and a shared-tail layer; two fires of two lanes). f32
+    storage: at E2B's dims it does not link (bf16 storage is next).
   - `qwen2d_region.csl`: several bf16 layers on one region (x stays in
     place between them): serve8b_region's regions.
   - `softmax_s123.json`, `softmax_s13_06b.json`: the fast-softmax levers
