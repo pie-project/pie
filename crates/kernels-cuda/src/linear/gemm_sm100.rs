@@ -766,6 +766,8 @@ impl Plan {
     }
 }
 
+const BN64_DOWN: bool = false;
+
 /// `y = epilogue(alpha * alpha_e[e] * act . w[e]^T)`, each row against its
 /// expert `e`'s weight: `n` the output's columns, a GLU's bank
 /// `[experts][2n][k]` (each expert's gate rows, then its up rows); `routed`
@@ -783,7 +785,23 @@ pub fn grouped_gemm_epi(
     routed: u32,
 ) -> Result<(), Error> {
     let sms = ctx.multiprocessors().unwrap_or(148);
-    let plan = Plan::grouped(&g, n, k, routed, sms);
+    let mut plan = Plan::grouped(&g, n, k, routed, sms);
+    // An fp16 W4A16 fire of 64 routes an expert or fewer runs swapped in
+    // 64-row Q tiles: an expert's rows fill one, where a 128-row tile ran
+    // half empty.
+    if matches!(Kind::of(act, w), Ok(Kind::Mixed(4)))
+        && matches!(g.groups, Groups::Contiguous { .. })
+        && routed <= 64 * g.experts
+        && (BN64_DOWN || epi.glu.is_some())
+    {
+        plan = Plan {
+            swap: true,
+            pair: false,
+            bn: 64,
+            stages: 0,
+            splits: 1,
+        };
+    }
     grouped_gemm_epi_with(ctx, act, w, y, g, [n, k], alpha, epi, plan)
 }
 
