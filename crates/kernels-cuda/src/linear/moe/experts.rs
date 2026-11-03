@@ -452,11 +452,17 @@ pub(super) fn experts_w4a4(
     let count = tokens * routes.width;
     let experts = up_codes.rows;
     let (k, n) = (x.width, y.width);
-    // Only SwiGLU's and relu2's epilogues land what the four apart would.
+    // Only SwiGLU's (clamped with alpha too) and relu2's epilogues land what
+    // the four apart would.
     if count == 0
         || norm.is_some_and(|(s, _)| s.dtype != Dtype::Bf16 || s.rows * s.width != y.width)
         || tokens < ctx.tuning().moe_w4a4_fused_from
-        || !matches!(glu, gemm_sm100::Glu::Swiglu | gemm_sm100::Glu::Relu2)
+        || !matches!(
+            glu,
+            gemm_sm100::Glu::Swiglu
+                | gemm_sm100::Glu::Relu2
+                | gemm_sm100::Glu::SwigluClampAlpha { .. }
+        )
         || !ctx.tuning().moe_tc5
         || !gemm_sm100::supported()
         || x.dtype != Dtype::Bf16
