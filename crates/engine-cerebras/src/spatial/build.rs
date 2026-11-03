@@ -1340,6 +1340,8 @@ pub mod presets {
             sm_scale: 1.0 / 32f32.sqrt(),
             weights: poem_ir::Dtype::F32,
             kv: poem_ir::Dtype::F32,
+            norm_plus_one: false,
+            hybrid: None,
         }
     }
 

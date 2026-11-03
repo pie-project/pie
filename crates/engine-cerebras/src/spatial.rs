@@ -58,6 +58,7 @@ pub mod manifest;
 pub mod model;
 pub mod paged;
 pub mod plan;
+pub mod plan_q35;
 pub mod program;
 pub mod serve2d;
 pub mod serve8b;

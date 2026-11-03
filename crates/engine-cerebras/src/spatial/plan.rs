@@ -217,7 +217,7 @@ const HEAD32_TABLES: usize = 16_384;
 /// 4 KB together at most (B 16 at CAP 64 ran out); the pipe's take MMAX x B
 /// x CAP, 1024 words at most. Pipelines run up to 8 micro-batches, head
 /// steps of up to 8 lanes.
-const TOKENS_SERVE: usize = 512;
+pub(super) const TOKENS_SERVE: usize = 512;
 const TOKENS_PIPE: usize = 1024;
 const MMAX: usize = 8;
 const HEAD_BATCH: usize = 8;
@@ -313,6 +313,11 @@ impl SpatialPlan {
         goals: Goals,
     ) -> Result<SpatialPlan, Refused> {
         let name = &spec.name;
+        if spec.hybrid.is_some() {
+            return refuse(format!(
+                "{name}: Gated DeltaNet layers (plan it with plan_q35::Q35Plan)"
+            ));
+        }
         if !spec.head_dim.is_multiple_of(DC) || !(spec.head_dim / DC).is_multiple_of(2) {
             return refuse(format!(
                 "{name}: head_dim {} does not split into an even number of {DC}-dim column slices",
@@ -514,7 +519,7 @@ impl SpatialPlan {
     /// taller than the grids, its feeder row (HH / 2) below layer 0's strip
     /// and the next and above the last. The fewest vocabulary rows a PE
     /// (multiples of 32) that fit.
-    fn head32(spec: &ModelSpec, grid: &Grid, height: usize, gh: usize) -> Option<Head> {
+    pub(super) fn head32(spec: &ModelSpec, grid: &Grid, height: usize, gh: usize) -> Option<Head> {
         let p = grid.py;
         let tables = if spec.tied { 1 } else { 2 };
         (1..)
@@ -1051,7 +1056,6 @@ mod tests {
     fn other_structures_are_refused() {
         for (name, why) in [
             ("qwen3-30b-a3b-bf16-kv-bf16", "mixture of experts"),
-            ("qwen35-d0.8b-bf16-kv-bf16", "gated-delta"),
             ("gemma4-12b-bf16-kv-bf16", ""),
             ("qwen3-8b-u4g64-kv-bf16", "U4g64 projections"),
             ("qwen3-0.6b-bf16-kv-e4m3", "E4m3 KV"),
