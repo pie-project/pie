@@ -125,6 +125,10 @@ __global__ void __launch_bounds__(kOffsetThreads) route_lay_out_small(
     float* __restrict__ alpha2,
     int alpha_rows2)
 {
+    // A programmatic dependent (`kernel.pdl`) reads nothing until its
+    // producer is done; its consumer may launch from here.
+    pdl_wait();
+    pdl_launch();
     extern __shared__ int lay[];
     int* tally = lay;
     int* start = lay + experts;

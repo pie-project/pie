@@ -896,7 +896,11 @@ pub(crate) fn lay_out_with(
         ctx.fire(
             op,
             Fire::at(kernel(ROUTE, "::pie::linear::route_lay_out_small"))
-                .apply(Launch::flat(1024, 1024).smem(8 * experts)),
+                .apply(
+                    Launch::flat(1024, 1024)
+                        .smem(8 * experts)
+                        .programmatic(ctx.tuning().pdl),
+                ),
             &[
                 routes.arg(),
                 int(count)?,
