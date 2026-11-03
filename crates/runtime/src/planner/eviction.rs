@@ -134,6 +134,9 @@ impl ResidencyPlanner {
         let Some(victims) = self.victim_set() else {
             return;
         };
+        if self.preempt_newest && self.preempt_newest_lane(victims.head_pid) {
+            return;
+        }
         let (swap_free, swap_total) = self.swap_stats();
         if victims.deficit.pages > 0 {
             if !self.port.suspend_capable() || swap_free == 0 {
