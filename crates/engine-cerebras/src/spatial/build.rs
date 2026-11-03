@@ -345,11 +345,42 @@ pub fn build_for(
     target: crate::sdk::Target,
     system: bool,
 ) -> R<PathBuf> {
+    if spec.hybrid.is_some() {
+        let program = q35_program(spec, cfg)?;
+        tracing::info!(design = program.design.name(), model = %spec.name, "spatial build: the plan's program");
+        return compile(&program, target, system);
+    }
     let plan = SpatialPlan::derive(spec, super::plan::WaferDims::CS3, cfg.goals)
         .map_err(|e| e.to_string())?;
     let program = program(&plan, cfg)?;
     tracing::info!(design = program.design.name(), model = %spec.name, "spatial build: the plan's program");
     compile(&program, target, system)
+}
+
+/// A hybrid model's serve_q35 program: its plan's parameters, as given
+/// (the config's pins and VM images are serve2d's and serve8b's).
+pub fn q35_program(spec: &super::model::ModelSpec, cfg: &ServeConfig) -> R<ProgramSpec> {
+    let plan = super::plan_q35::Q35Plan::derive(spec, super::plan::WaferDims::CS3, cfg.goals)
+        .map_err(|e| e.to_string())?;
+    if plan.program.is_none() {
+        return Err(format!(
+            "{}: no full program places the model: {}",
+            spec.name,
+            plan.blockers.join("; ")
+        ));
+    }
+    if cfg.region || cfg.vm.is_some() || cfg.pins.gw.is_some() {
+        return Err(format!(
+            "{}: serve_q35 takes no `region`, VM image or pins",
+            spec.name
+        ));
+    }
+    let params: super::program::Params = plan
+        .params()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    ProgramSpec::from_params(Design::ServeQ35, &params)
 }
 
 /// The design a plan's family builds: paged8b grids go into serve8b.
@@ -873,6 +904,7 @@ fn serve2d(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Draft> {
             gw: p.gw,
             gh: p.gh,
             tc: super::plan::TC,
+            hybrid: None,
         },
         match (pipe, mmax) {
             (true, m) if m > 0 => Stage::Ring { mmax: m },
@@ -1138,6 +1170,7 @@ pub fn program(plan: &SpatialPlan, cfg: &ServeConfig) -> R<ProgramSpec> {
         Design::Serve8b => serve8b(plan, cfg)?,
         Design::Serve8bRegion | Design::Serve8bRegionPipe => serve8b_region(plan, cfg, d)?,
         Design::Serve2d | Design::Serve2dPipe => serve2d(plan, cfg, d)?,
+        Design::ServeQ35 => return Err("serve_q35 builds from a hybrid plan (q35_program)".into()),
     };
     cfg.pins.apply(&mut draft);
     // The head's VM on the final geometry (serve8b_region's is its block).

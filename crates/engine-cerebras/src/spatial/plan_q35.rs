@@ -263,9 +263,6 @@ impl Q35Plan {
                 wafer.width, wafer.height
             ));
         };
-        blockers.push(
-            "no design places the qwen35 units (qwen35_gdn, qwen35_attn): no program yet".into(),
-        );
         Ok(Q35Plan {
             spec: spec.clone(),
             kinds: hy.kinds.clone(),
@@ -423,13 +420,52 @@ mod tests {
         assert_eq!((pl.gw * pl.gh, pl.cap), (24, 64));
         assert!(pl.width <= 755 && pl.height <= 1170, "{pl:?}");
         assert!(p.head.vr * p.head.hh >= 248_320);
-        // The CSL is the one blocker left.
-        assert_eq!(p.blockers.len(), 1, "{:?}", p.blockers);
-        assert!(p.blockers[0].contains("no design"));
+        assert!(p.blockers.is_empty(), "{:?}", p.blockers);
         let prm = p.params();
         let get = |k: &str| prm.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
         assert_eq!(get("KINDS"), Some(0x888888));
         assert_eq!(get("Q35"), Some(1));
+    }
+
+    /// The plan's params make serve_q35's program: a ServeQ35 spec read
+    /// back byte for byte, its attention grids the layers `KINDS` names
+    /// (the only ones holding a pool and taking a table), and the
+    /// launch's `reset`; a program compiled outside PIE (its `out.json`)
+    /// is read as one by its `Q35`.
+    #[test]
+    fn the_plan_reads_back_as_a_serve_q35_program() {
+        use crate::spatial::codegen::Design;
+        use crate::spatial::program::ProgramSpec;
+        let s = spec("qwen35-d0.8b-bf16-kv-bf16");
+        let p = Q35Plan::derive(&s, WaferDims::CS3, Goals::lanes(1)).expect("a plan");
+        let params: Vec<(String, String)> = p
+            .params()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(ProgramSpec::infer_design(&params), Ok(Design::ServeQ35));
+        let prog = ProgramSpec::from_params(Design::ServeQ35, &params).expect("a program");
+        assert_eq!(prog.to_params(), params);
+        let h = prog.hybrid().expect("the layer mix");
+        assert_eq!((h.gk, h.dk, h.vh, h.dv, h.cw, h.rot), (8, 16, 1, 16, 4, 64));
+        assert_eq!((h.window_words(), h.state_words()), (144, 16));
+        let attends: Vec<usize> = (0..prog.layers()).filter(|&l| prog.attends(l)).collect();
+        assert_eq!(attends, vec![3, 7, 11, 15, 19, 23]);
+        let areas = prog.grid_areas();
+        assert_eq!(areas.len(), 6);
+        assert_eq!((areas[0].x as usize, areas[0].y as usize), prog.origin(3));
+        assert_eq!(
+            (prog.qh(), prog.head_dim(), prog.positions()),
+            (4, 256, 2048)
+        );
+        assert!(
+            prog.abi().iter().any(|(_, s)| s.name == "reset"),
+            "the launch resets a slot"
+        );
+        // serve2d's own checks still hold its params to f32 paged builds.
+        let mut bad = params.clone();
+        bad.iter_mut().find(|(k, _)| k == "B").expect("B").1 = "2".into();
+        assert!(ProgramSpec::from_params(Design::ServeQ35, &bad).is_err());
     }
 
     /// The larger dense ones split (32 v heads over 16 k heads: VH 2), but

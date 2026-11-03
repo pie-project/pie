@@ -12,7 +12,7 @@ use eta_ir::registry::{GeometryClass, Stage};
 use super::Spatial;
 use super::launch::{self, MODEL_NS, PagedLane};
 use crate::api::{port_error, refusal};
-use crate::spatial::wafer;
+use crate::spatial::{serve2d, wafer};
 
 /// Steps a sequence's first token loop runs past its row.
 const FIRST_LOOP: usize = 8;
@@ -62,6 +62,22 @@ impl OneHotRow {
 
 /// The logits a lane of `n` rows asks the model for when `rows` are read:
 /// none, the last row's alone, or every row's.
+/// The lane's recurrent state as the wafer keeps it (a serve_q35 build;
+/// the other builds ignore it): the runtime's state row, else the lane's
+/// seat; fresh where the runtime says, else where its rows start the
+/// sequence.
+fn state_seat(lane: &engine::fire::Lane, first_slot: u32) -> Option<serve2d::StateSeat> {
+    let fresh = match lane.rs_reset {
+        engine::fire::RsReset::Fresh => true,
+        engine::fire::RsReset::Held => false,
+        engine::fire::RsReset::Inferred => first_slot == 0,
+    };
+    Some(serve2d::StateSeat {
+        key: lane.rs_slot.unwrap_or(lane.slot),
+        fresh,
+    })
+}
+
 fn logits_wanted(rows: &[u32], n: usize) -> wafer::Logits {
     if rows.is_empty() {
         wafer::Logits::None
@@ -94,6 +110,8 @@ pub(super) struct PagedAhead {
     /// which loop this is: a continuation landing for another is dropped.
     pub(super) last: u32,
     pub(super) epoch: u64,
+    /// The recurrent state the loop runs on (a serve_q35 build).
+    pub(super) state: Option<u32>,
 }
 
 impl PagedAhead {
@@ -544,7 +562,14 @@ impl Spatial {
             std::collections::HashMap::new();
         // Cells the fire's paged lanes so far will have written.
         let mut planned: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        let recurrent = self.model.as_ref().is_some_and(|w| w.recurrent);
         for (at, lane) in lanes.iter().enumerate() {
+            if recurrent && lane.rs != engine::fire::RsVerb::Fold {
+                return Err(Error::Unsupported {
+                    verb: "a buffered recurrent-state verb on the wafer (it folds every row)",
+                    engine: "cerebras-spatial",
+                });
+            }
             let n = tokens[at].len() as u32;
             let rows: Vec<u32> = match &lane.readout {
                 Readout::Rows(rows) => rows.clone(),
@@ -619,6 +644,8 @@ impl Spatial {
                             argmax_rows: false,
                             ahead: 0,
                             vm: None,
+                            // The history replays into a fresh state.
+                            state: state_seat(lane, 0),
                         };
                         launch::fire_paged(self.model()?, &[&refill])?;
                         self.kv
@@ -738,6 +765,7 @@ impl Spatial {
                                 && which == wafer::Logits::All
                                 && vm.is_none(),
                             vm,
+                            state: state_seat(lane, first_slot),
                         },
                         rows.clone(),
                     ));
@@ -837,6 +865,7 @@ impl Spatial {
                             shift: lane.positions[0].wrapping_sub(lane.slots[0]),
                             last: token[k],
                             epoch: self.next_loop,
+                            state: lane.state.map(|s| s.key),
                         },
                     );
                     self.ahead_runs += 1;
@@ -1026,6 +1055,7 @@ mod tests {
             shift: 0,
             last: 8,
             epoch: 0,
+            state: None,
         };
         // A row the stream did not send (another input, slot or page) gets
         // nothing: a stop or the token limit leaves the rest unanswered.
@@ -1052,6 +1082,7 @@ mod tests {
             shift: 0,
             last: 8,
             epoch: 1,
+            state: None,
         };
         assert_eq!(run.end(), 13);
         // Rows answered before the continuation lands keep their place.
@@ -1065,6 +1096,7 @@ mod tests {
             shift: 0,
             last: 10,
             epoch: 2,
+            state: None,
         };
         for (slot, input) in (11..15).zip([6, 7, 8, 9]) {
             let want = fresh.answer(slot, &[3], input);

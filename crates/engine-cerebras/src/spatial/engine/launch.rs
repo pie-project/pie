@@ -202,6 +202,11 @@ pub(super) fn fire_paged(
                                 .as_ref()
                                 .map(|rows| rows[first].iter().flat_map(|&[a, b]| a..b).collect()),
                             forced: lane.tokens[first..first + rows].to_vec(),
+                            // Only a lane's first piece starts its state.
+                            state: lane.state.map(|s| crate::spatial::serve2d::StateSeat {
+                                fresh: s.fresh && first == 0,
+                                ..s
+                            }),
                         }
                     })
                     .collect();
@@ -290,6 +295,8 @@ pub(super) struct PagedLane {
     /// The instance whose epilogue the wafer head's multi-lane VM samples
     /// for this lane (its one row, in its VM lane's bank).
     pub(super) vm: Option<InstanceId>,
+    /// Its recurrent state on a build with recurrent layers.
+    pub(super) state: Option<crate::spatial::serve2d::StateSeat>,
 }
 
 #[cfg(test)]

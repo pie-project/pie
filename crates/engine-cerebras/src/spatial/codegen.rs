@@ -104,6 +104,9 @@ pub enum Design {
     /// serve8b_region's units as a pipeline ring: micro-batches round the
     /// units and the head each lap (serve8b_region_pipe).
     Serve8bRegionPipe,
+    /// Qwen3.5 dense: serve2d's program around Gated DeltaNet and
+    /// gated-attention grids, layer by layer (serve_q35).
+    ServeQ35,
 }
 
 impl Design {
@@ -114,6 +117,7 @@ impl Design {
             Design::Serve8b => "serve8b",
             Design::Serve8bRegion => "serve8b_region",
             Design::Serve8bRegionPipe => "serve8b_region_pipe",
+            Design::ServeQ35 => "serve_q35",
         }
     }
 
@@ -124,6 +128,7 @@ impl Design {
             "serve8b" => Some(Design::Serve8b),
             "serve8b_region" => Some(Design::Serve8bRegion),
             "serve8b_region_pipe" => Some(Design::Serve8bRegionPipe),
+            "serve_q35" => Some(Design::ServeQ35),
             _ => None,
         }
     }
@@ -131,7 +136,7 @@ impl Design {
     /// The eta VM image the design's sources carry (enabled by its params).
     pub fn vm_image(self) -> Option<&'static str> {
         match self {
-            Design::Serve2d => Some("guest4hm"),
+            Design::Serve2d | Design::ServeQ35 => Some("guest4hm"),
             // The guest4hz image: one or two resident sets (VMB).
             Design::Serve2dPipe => Some("guest4hz"),
             Design::Serve8b => None,
@@ -145,7 +150,7 @@ impl Design {
     /// in serve8b's aliased scratch; and whether they alias it.
     pub fn kv_staging(self) -> (&'static str, bool) {
         match self {
-            Design::Serve2d | Design::Serve2dPipe => ("f32", false),
+            Design::Serve2d | Design::Serve2dPipe | Design::ServeQ35 => ("f32", false),
             Design::Serve8b => ("bf16x2", true),
             Design::Serve8bRegion | Design::Serve8bRegionPipe => ("bf16", false),
         }
@@ -159,6 +164,7 @@ impl Design {
             Design::Serve8b => serve8b(),
             Design::Serve8bRegion => serve8b_region(false),
             Design::Serve8bRegionPipe => serve8b_region(true),
+            Design::ServeQ35 => serve_q35(),
         }
     }
 }

@@ -389,6 +389,7 @@ fn lanes(
             pages: (0..npg).map(|i| (b as u32 * npg + i) % pool).collect(),
             visible: None,
             forced: forced(b),
+            state: None,
         })
         .collect()
 }

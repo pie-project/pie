@@ -103,6 +103,13 @@ struct Parts {
     q: usize,
     kv: usize,
     inter: usize,
+    /// Qwen3.5's packed planes: `gdn.in_qkvz` = q, k, v (`qkv` rows) | z
+    /// (`vw`), `gdn.in_ba` = b | a (`vh` rows each), `attn.qg_proj_k_proj_v_proj`
+    /// = q and gate (`qg`) | k | v (`kv`); 0 on a model without them.
+    qkv: usize,
+    vw: usize,
+    vh: usize,
+    qg: usize,
 }
 
 /// How the poem names Qwen 3's transformers tensors (models/qwen3_dense.poem's
@@ -123,6 +130,54 @@ const TRANSFORMERS: &[(&str, &str)] = &[
     ("up", "mlp.up_proj.weight"),
     ("down", "mlp.down_proj.weight"),
 ];
+
+/// How the poem names Qwen3.5's transformers tensors past `layers.{l}.`
+/// (models/qwen_3.poem's `safetensors`), its packed planes by their parts.
+const QWEN35: &[(&str, &str)] = &[
+    ("mixer_norm", "input_layernorm.weight"),
+    ("mlp_norm", "post_attention_layernorm.weight"),
+    ("mlp.gate", "mlp.gate_proj.weight"),
+    ("mlp.up", "mlp.up_proj.weight"),
+    ("mlp.down", "mlp.down_proj.weight"),
+    ("gdn.in_qkv", "linear_attn.in_proj_qkv.weight"),
+    ("gdn.in_z", "linear_attn.in_proj_z.weight"),
+    ("gdn.in_b", "linear_attn.in_proj_b.weight"),
+    ("gdn.in_a", "linear_attn.in_proj_a.weight"),
+    ("gdn.conv", "linear_attn.conv1d.weight"),
+    ("gdn.dt_bias", "linear_attn.dt_bias"),
+    ("gdn.a_log", "linear_attn.A_log"),
+    ("gdn.norm", "linear_attn.norm.weight"),
+    ("gdn.out_proj", "linear_attn.out_proj.weight"),
+    ("attn.qg_proj", "self_attn.q_proj.weight"),
+    ("attn.k_proj", "self_attn.k_proj.weight"),
+    ("attn.v_proj", "self_attn.v_proj.weight"),
+    ("attn.o_proj", "self_attn.o_proj.weight"),
+    ("attn.q_norm", "self_attn.q_norm.weight"),
+    ("attn.k_norm", "self_attn.k_norm.weight"),
+];
+
+/// Where a checkpoint keeps its language model: Qwen3.5's under
+/// `model.language_model.`, a text-only one's under `model.`, a stripped
+/// `weights.npz`'s at the top.
+const TRUNKS: &[&str] = &["model.language_model.", "model.", ""];
+
+/// A poem parameter name's transformers tensor, as Qwen3.5's checkpoints
+/// spell it: one name for each trunk.
+fn qwen35_names(name: &str) -> Vec<String> {
+    let rest = match name {
+        "embed" => Some("embed_tokens.weight".to_string()),
+        "final_norm" => Some("norm.weight".to_string()),
+        _ => name.strip_prefix("layers.").and_then(|rest| {
+            let (l, part) = rest.split_once('.')?;
+            l.parse::<usize>().ok()?;
+            let hf = QWEN35.iter().find(|e| e.0 == part)?.1;
+            Some(format!("layers.{l}.{hf}"))
+        }),
+    };
+    rest.map_or_else(Vec::new, |r| {
+        TRUNKS.iter().map(|t| format!("{t}{r}")).collect()
+    })
+}
 
 /// A poem parameter name's transformers tensor.
 fn transformers_name(name: &str) -> Option<String> {
@@ -254,10 +309,15 @@ impl Ckpt {
             .sink(&mut sink)
             .run()
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        let gdn = spec.hybrid.as_ref().map(|h| h.gdn);
         let parts = Parts {
             q: spec.q_heads * spec.head_dim,
             kv: spec.kv_heads * spec.head_dim,
             inter: spec.inter,
+            qkv: gdn.map_or(0, |g| g.conv_channels()),
+            vw: gdn.map_or(0, |g| g.v_heads * g.v_dim),
+            vh: gdn.map_or(0, |g| g.v_heads),
+            qg: 2 * spec.q_heads * spec.head_dim,
         };
         Ok(Ckpt {
             inner: Inner::Landed {
@@ -312,7 +372,10 @@ impl Ckpt {
     fn raw(&self, name: &str) -> R<Option<Raw>> {
         match &self.inner {
             Inner::Files { paths, entries } => {
-                let Some(e) = transformers_name(name).and_then(|n| entries.get(&n)) else {
+                let found = transformers_name(name)
+                    .and_then(|n| entries.get(&n))
+                    .or_else(|| qwen35_names(name).iter().find_map(|n| entries.get(n)));
+                let Some(e) = found else {
                     return Ok(None);
                 };
                 let path = &paths[e.file];
@@ -346,7 +409,15 @@ impl Ckpt {
                     Some(x) => x,
                     None => return Ok(None),
                 };
+                let pk = parts;
                 let (packed, lo, hi) = match part {
+                    "in_qkv" => ("in_qkvz", 0, pk.qkv),
+                    "in_z" => ("in_qkvz", pk.qkv, pk.qkv + pk.vw),
+                    "in_b" => ("in_ba", 0, pk.vh),
+                    "in_a" => ("in_ba", pk.vh, 2 * pk.vh),
+                    "qg_proj" => ("qg_proj_k_proj_v_proj", 0, pk.qg),
+                    "k_proj" => ("qg_proj_k_proj_v_proj", pk.qg, pk.qg + pk.kv),
+                    "v_proj" => ("qg_proj_k_proj_v_proj", pk.qg + pk.kv, pk.qg + 2 * pk.kv),
                     "q" => ("qkv", 0, parts.q),
                     "k" => ("qkv", parts.q, parts.q + parts.kv),
                     "v" => ("qkv", parts.q + parts.kv, parts.q + 2 * parts.kv),
@@ -720,6 +791,10 @@ mod tests {
                     q: 4,
                     kv: 2,
                     inter: 3,
+                    qkv: 0,
+                    vw: 0,
+                    vh: 0,
+                    qg: 8,
                 },
             },
             config: serde_json::Value::Null,

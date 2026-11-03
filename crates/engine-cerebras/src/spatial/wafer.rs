@@ -135,6 +135,21 @@ pub struct WaferModel {
     /// The VM control (`vmlane`) the head holds, as last written: a launch
     /// writes it only when it changes.
     vm_written: Vec<u32>,
+    /// A build with recurrent layers (serve_q35): whose state lane slot 0
+    /// holds, and every state's tokens so far.
+    states: States,
+}
+
+/// The recurrent states of a serve_q35 build. The wafer holds one lane
+/// slot's (B 1): `resident`'s, its tokens `tokens[resident]`; any other
+/// key's state is its tokens, replayed from a fresh state when a lane runs
+/// on it (as a lane's KV is brought back on a one-sequence build).
+#[derive(Default)]
+struct States {
+    resident: Option<u32>,
+    tokens: std::collections::HashMap<u32, Vec<u32>>,
+    /// Tokens replayed to bring a state back, for the logs.
+    replayed: u64,
 }
 
 /// The head VM's state on the host: its shape and ring, the `gmode` the
@@ -282,6 +297,7 @@ impl WaferModel {
             staged: false,
             vm_written: Vec::new(),
             steps: 0,
+            states: States::default(),
         };
         if let Some(lay) = model.design.vm() {
             let words = ring;
@@ -334,6 +350,7 @@ impl WaferModel {
                 pages: vec![0],
                 visible: None,
                 forced: vec![0],
+                state: None,
             };
             model.fire_batch(&[warm], 1, false)?;
         } else {
@@ -570,6 +587,11 @@ impl WaferModel {
     ) -> R<Vec<VmStep>> {
         use super::guest4::wafer;
         self.unstaged()?;
+        if self.design.hybrid().is_some() {
+            return Err(
+                "the head's VM samples no serve_q35 lane (its states run on fire_batch)".into(),
+            );
+        }
         let (na, nb) = self.vm_lanes();
         let grid = &self.design;
         let n = na + nb;
@@ -804,14 +826,144 @@ impl WaferModel {
                 "spatial wafer: batch totals"
             );
         }
-        super::serve2d::fire(
-            grid,
+        let recurrent = grid.hybrid().is_some();
+        if recurrent {
+            self.seat_state(lanes)?;
+        }
+        let out = super::serve2d::fire(
+            &self.design,
             &mut *self.rt,
             lanes,
             steps,
             want_logits,
             &mut self.vm_written,
-        )
+        )?;
+        if recurrent {
+            self.ran_state(lanes, steps, &out.0);
+        }
+        Ok(out)
+    }
+
+    /// Lane slot 0's recurrent state brought to the launch's lane: zeroed
+    /// for a fresh start, kept when it is the lane's at the lane's first
+    /// slot, else the lane's tokens before it replayed from zero (on the
+    /// lane's pages, which they rewrite as they were). A scratch launch (no
+    /// state) leaves it nobody's.
+    fn seat_state(&mut self, lanes: &[super::serve2d::BatchLane]) -> R<()> {
+        let [lane] = lanes else {
+            return Err(format!(
+                "a serve_q35 launch carries one lane (B 1), not {}",
+                lanes.len()
+            ));
+        };
+        let Some(seat) = lane.state else {
+            self.states.resident = None;
+            return Ok(());
+        };
+        let at = lane.slot as usize;
+        if seat.fresh {
+            if at != 0 {
+                return Err(format!(
+                    "a fresh recurrent state {} at slot {at}: its tokens before are unknown",
+                    seat.key
+                ));
+            }
+            self.reset_state()?;
+            self.states.tokens.insert(seat.key, Vec::new());
+            self.states.resident = Some(seat.key);
+            return Ok(());
+        }
+        let held = self.states.tokens.get(&seat.key);
+        if self.states.resident == Some(seat.key) && held.is_some_and(|t| t.len() == at) {
+            return Ok(());
+        }
+        let Some(before) = held.filter(|t| t.len() >= at).map(|t| t[..at].to_vec()) else {
+            return Err(format!(
+                "recurrent state {} at slot {at}: the wafer knows {} of its tokens",
+                seat.key,
+                held.map_or(0, Vec::len)
+            ));
+        };
+        self.reset_state()?;
+        self.states.resident = None;
+        let cap = self.design.cap().saturating_sub(1).max(1);
+        let shift = lane.pos.wrapping_sub(lane.slot);
+        for (i, chunk) in before.chunks(cap).enumerate() {
+            let first = (i * cap) as u32;
+            let replay = super::serve2d::BatchLane {
+                pos: first.wrapping_add(shift),
+                slot: first,
+                pages: lane.pages.clone(),
+                visible: None,
+                forced: chunk.to_vec(),
+                state: None,
+            };
+            super::serve2d::fire(
+                &self.design,
+                &mut *self.rt,
+                &[replay],
+                chunk.len(),
+                false,
+                &mut self.vm_written,
+            )?;
+        }
+        self.states.replayed += at as u64;
+        tracing::info!(
+            key = seat.key,
+            tokens = at,
+            total = self.states.replayed,
+            "spatial wafer: a recurrent state replayed from its tokens"
+        );
+        self.states.tokens.insert(seat.key, before);
+        self.states.resident = Some(seat.key);
+        Ok(())
+    }
+
+    /// The state's tokens after a launch: the forced ones, then each
+    /// iteration past them fed the argmax before.
+    fn ran_state(
+        &mut self,
+        lanes: &[super::serve2d::BatchLane],
+        steps: usize,
+        argmax: &[Vec<u32>],
+    ) {
+        let (Some(lane), Some(key)) = (lanes.first(), self.states.resident) else {
+            return;
+        };
+        let out = argmax.first().map_or(&[][..], Vec::as_slice);
+        let f = lane.forced.len().min(steps);
+        let fed = lane.forced[..f].iter().copied().chain(
+            out.iter()
+                .skip(f.saturating_sub(1))
+                .take(steps - f)
+                .copied(),
+        );
+        let tokens = self.states.tokens.entry(key).or_default();
+        tokens.truncate(lane.slot as usize);
+        tokens.extend(fed);
+    }
+
+    /// Lane slot 0's recurrent state zeroed (its conv window and state).
+    fn reset_state(&mut self) -> R<()> {
+        self.rt
+            .launch("reset", &[0])
+            .map_err(|e| format!("the recurrent state's reset: {e}"))
+    }
+
+    /// `copy_state`: state `dst` becomes `src`'s (its tokens; the wafer's
+    /// slot replays them when a lane runs on it).
+    pub fn copy_state(&mut self, src: u32, dst: u32) -> R<()> {
+        let tokens = self
+            .states
+            .tokens
+            .get(&src)
+            .cloned()
+            .ok_or_else(|| format!("copy_state from recurrent state {src}, which never ran"))?;
+        self.states.tokens.insert(dst, tokens);
+        if self.states.resident == Some(dst) {
+            self.states.resident = None;
+        }
+        Ok(())
     }
 
     /// A batched build's whole-page copies (every layer's pool).
@@ -994,6 +1146,11 @@ enum Job {
     Copy {
         pairs: Vec<(u32, u32)>,
     },
+    /// A recurrent state's copy (the batch channel).
+    CopyState {
+        src: u32,
+        dst: u32,
+    },
     /// Pages to and from the host tier (the batch channel: the pages'
     /// words as the answer's rows).
     PageOut {
@@ -1066,6 +1223,8 @@ pub struct Wafer {
     thread: Option<std::thread::JoinHandle<()>>,
     pub vocab: usize,
     pub hidden: usize,
+    /// The build has recurrent layers (serve_q35): lanes carry their state.
+    pub recurrent: bool,
 }
 
 impl Wafer {
@@ -1108,6 +1267,7 @@ impl Wafer {
                             thread: None,
                             vocab: m.design.vocab(),
                             hidden: m.design.hidden(),
+                            recurrent: m.design.hybrid().is_some(),
                         }));
                         m
                     }
@@ -1208,6 +1368,15 @@ impl Wafer {
                         }
                         Job::PageIn { pages } => {
                             let reply = model.page_in(&pages).map(|()| (Vec::new(), Vec::new()));
+                            if batch_tx.send(reply).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Job::CopyState { src, dst } => {
+                            let reply = model
+                                .copy_state(src, dst)
+                                .map(|()| (Vec::new(), Vec::new()));
                             if batch_tx.send(reply).is_err() {
                                 break;
                             }
@@ -1438,6 +1607,20 @@ impl Wafer {
             .as_ref()
             .ok_or("the wafer is closed")?
             .send(Job::PageIn { pages })
+            .map_err(|_| "the wafer thread went away".to_string())?;
+        self.batch_answers
+            .recv()
+            .map_err(|_| "the wafer thread went away".to_string())?
+            .map(drop)
+    }
+
+    /// [`WaferModel::copy_state`] on the wafer's thread, after every job
+    /// before it.
+    pub fn copy_state(&mut self, src: u32, dst: u32) -> R<()> {
+        self.jobs
+            .as_ref()
+            .ok_or("the wafer is closed")?
+            .send(Job::CopyState { src, dst })
             .map_err(|_| "the wafer thread went away".to_string())?;
         self.batch_answers
             .recv()
