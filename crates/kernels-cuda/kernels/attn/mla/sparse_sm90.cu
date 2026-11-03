@@ -140,7 +140,9 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
     const int g = lane >> 2;
     const int c = lane & 3;
 
-    const int t = blockIdx.y;
+    // The rows last first: a causal prefill's late rows read the most tiles,
+    // and the light early ones then fill the last wave.
+    const int t = static_cast<int>(gridDim.y - 1 - blockIdx.y);
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
     if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
