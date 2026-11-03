@@ -25,6 +25,9 @@ moe.mxfp4_bf16_keep = 25
 moe.fp8a8_ws_from = 64
 # a decode's W8A16 block-FP8 select split toward 16 CTAs' warps an SM: GLM-5.3 mini78 raw decode 45 -> 50 tok/s
 moe.fp8_mma_fill = 16
+# and two chunks in flight a warp, not four (fewer registers, more warps an SM): GLM-5.3 mini78 raw decode
+# 50.5 -> 55.3 tok/s, greedy tokens unchanged (6/6 raw prompts)
+moe.fp8_mma_depth = 2
 # GLM-5.3's DSA attention 64 heads a CTA on wgmma, not the 16-head mma.sync kernel:
 # mini78 pf16-512 6.06k -> 6.89k, c1024 3.47k -> 3.85k, raw prefill 4.82k -> 5.17k tok/s, parity KL 0.0153 -> 0.0160
 sdpa.mla_wgmma = true
