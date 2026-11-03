@@ -404,6 +404,14 @@ pub struct MoeMxfp4W4a8Tma;
 #[decision(id = "kernel.moe.mxfp4_w4a8_ws", flag, default = false, tune = search)]
 pub struct MoeMxfp4W4a8Ws;
 
+/// Whether a block-FP8 dense projection in 32-wide blocks (MXFP8) keeps a
+/// bf16 copy, widened once at load, that a batch's rows read on cuBLAS,
+/// where no FP8 GEMM reads its blocks (no tcgen05), without
+/// `kernel.gemm.fp8_shadow`'s copies of the 128-wide ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.fp8_shadow_mx", flag, default = false, tune = search)]
+pub struct GemmFp8ShadowMx;
+
 /// The fewest rows a projection cut into two row halves (Qwen3.5's qkv|z)
 /// lands as two GEMMs off the weight's two slices, where
 /// `kernel.elemwise.rows_vec` is on; fewer run the GEMM and the cut.
@@ -945,6 +953,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
         .add::<GemmFp8Shadow>()
+        .add::<GemmFp8ShadowMx>()
         .add::<GemmFp8Mx>()
         .add::<GemmFp8MmaGemvUntil>()
         .add::<GemmFp8MmaKUntil>()
@@ -1097,6 +1106,7 @@ tuning! {
     mla_expanded_from: u32 = 65_536, get MlaExpandedFrom;
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
     gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
+    gemm_fp8_shadow_mx: bool = false, on GemmFp8ShadowMx;
     gemm_fp8_mx: bool = false, on GemmFp8Mx;
     gemm_fp8_mma_gemv_until: u32 = 0, get GemmFp8MmaGemvUntil;
     gemm_fp8_mma_k_until: u32 = 0, get GemmFp8MmaKUntil;

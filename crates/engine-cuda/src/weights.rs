@@ -1154,6 +1154,7 @@ impl Weights {
         trace: &Trace,
         stream: *mut core::ffi::c_void,
         mixed: bool,
+        mx: bool,
     ) -> Result<u32> {
         use poem_ir::{Def, Linear, Operation};
         let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
@@ -1192,7 +1193,10 @@ impl Weights {
             }
             let (n, k) = (codes.rows, codes.width);
             let gran = k.div_ceil(atoms.width);
+            // With `mx` a plane of 32-wide blocks (MXFP8), which no FP8 GEMM
+            // here reads, keeps a copy too.
             if mixed
+                && !(mx && gran == 32)
                 && (gran != 128
                     || kernels_cuda::linear::gemm::cublas_lt_fp8::rows_share_blocks(
                         "linear.fp8_shadow",

@@ -707,7 +707,8 @@ impl Shell {
                 || kernels_cuda::linear::moe::fp8_w8a8_capable())
         {
             let mixed = !device.ctx().tuning().gemm_fp8_shadow;
-            weights.shadow_fp8_dense(&boot.trace, device.stream(), mixed)?;
+            let mx = device.ctx().tuning().gemm_fp8_shadow_mx;
+            weights.shadow_fp8_dense(&boot.trace, device.stream(), mixed, mx)?;
         }
         // `kernel.gemm.fp8_mx`: block-FP8 dense planes keep 1x32 exponents.
         #[cfg(feature = "cuda")]
