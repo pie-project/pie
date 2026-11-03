@@ -110,8 +110,15 @@ class Team:
     def __init__(self) -> None:
         self.pipe = Pipeline()
         self.fresh()
-        self.width = next(i.width for i in model.lane([("reading", "latent")]).inputs if i.name == "latents")
-        self.latent_embeds = model.lane([("reading", "latent")]).embeds
+        self.width = None
+
+    def latent_lane(self) -> None:
+        """The latent reading's input width, and whether its rows embed a token too: asked at the first
+        latent step, so a team that only reads and writes text runs on any model."""
+        if self.width is None:
+            lane = model.lane([("reading", "latent")])
+            self.width = next(i.width for i in lane.inputs if i.name == "latents")
+            self.latent_embeds = lane.embeds
 
     def fresh(self) -> None:
         self.ws, self.len = WorkingSet(), 0
@@ -129,6 +136,7 @@ class Team:
 
     async def first_latent(self, tokens: list[int], scale: float) -> list[float]:
         """Reads `tokens`; the first latent input (the last row's hidden state, realigned), on the host."""
+        self.latent_lane()
         first = Channel([1, self.width], dtype.f32)
         self.read(tokens, "text", lambda: first.put(realign(intrinsics.output(0, "hidden"), self.width, scale)))
         return await first.take_host()
