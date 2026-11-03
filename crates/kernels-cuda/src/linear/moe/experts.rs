@@ -344,7 +344,8 @@ pub fn experts(
             ..gemm_sm100::Epilogue::STORE
         };
         // MXFP4 banks multiply in fp16 where the profile says
-        // (`kernel.moe.mxfp4_f16`): the rows land fp16, the hidden turns.
+        // (`kernel.moe.mxfp4_f16`): the rows land fp16, and the GLU lands the
+        // hidden fp16 (rounded through bf16, as apart).
         let mxfp4 = |o: gemm_sm100::Operand| {
             o.elem == gemm_sm100::Elem::E2m1 && o.scales.is_some_and(|s| s.gran == 32)
         };
@@ -367,9 +368,6 @@ pub fn experts(
             up_epi,
             count,
         )?;
-        if f16 {
-            act_quant::rows_to_f16(ctx, OP, hs, rows as u64 * u64::from(inter))?;
-        }
         let ys = ctx.scratch_stream(OP, GROUPED_Y, rows * y.width as usize * 2)? as u64;
         gemm_sm100::grouped_gemm_epi(
             ctx,

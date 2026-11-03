@@ -1229,25 +1229,6 @@ pub(crate) fn scatter_rows_as(
     )
 }
 
-/// `x[i] = fp16(x[i])` in place over `elems` bf16 (a multiple of eight,
-/// 16-byte aligned).
-pub(crate) fn rows_to_f16(ctx: &Ctx, op: &'static str, x: u64, elems: u64) -> Result<(), Error> {
-    if !elems.is_multiple_of(8) || !crate::jit::aligned16(x) {
-        return Err(refuse(op, "an fp16 convert walks 16-byte runs of eight"));
-    }
-    let runs = u32::try_from(elems / 8)
-        .map_err(|_| refuse(op, format!("{elems} elements overflow a launch")))?;
-    if runs == 0 {
-        return Ok(());
-    }
-    ctx.fire(
-        op,
-        Fire::at(kernel(COMBINE, "::pie::linear::rows_bf16_to_f16"))
-            .apply(Launch::flat(runs, BLOCK)),
-        &[ArgValue::Ptr(x), i64::from(runs).arg()],
-    )
-}
-
 /// `alpha[e] = input_scales[e] · tensor_scales[e][0]`: an NVFP4 bank's
 /// per-expert product scale, its first row's tensor scale standing for the
 /// expert's (vLLM reads a gated bank's gate leg's for both legs).

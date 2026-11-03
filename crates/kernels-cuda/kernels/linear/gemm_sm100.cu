@@ -1547,7 +1547,17 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
 #pragma unroll
                         for (int j = 0; j < 32; ++j) {
                             if (j0 + j < x.lim_q) {
-                                y[static_cast<size_t>(q0 + j) * ldy + p] = f32_to_bf16(h[j]);
+                                if constexpr (kMix == 4 && kGlu != 0) {
+                                    // The fp16 down GEMM's operand: the bf16 value
+                                    // the store rounds to, as fp16.
+                                    const float r = bf16_to_f32(f32_to_bf16(h[j]));
+                                    unsigned short hb;
+                                    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(hb) : "f"(r));
+                                    reinterpret_cast<unsigned short*>(
+                                        y)[static_cast<size_t>(q0 + j) * ldy + p] = hb;
+                                } else {
+                                    y[static_cast<size_t>(q0 + j) * ldy + p] = f32_to_bf16(h[j]);
+                                }
                             }
                         }
                     }
