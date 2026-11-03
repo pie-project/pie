@@ -14,11 +14,12 @@ ssm.gdn_scan_until = 48  # 1.9% faster end to end
 sdpa.index_mma = true
 sdpa.index_radix = true
 # MXFP4 banks kept as an exact bf16 copy, read past 1024 routes a fire by the warp-specialized wgmma
-# GEMM as on the H100, the down banks too, the copies leaving half the free memory to the cache rows:
+# GEMM as on the H100, the down banks too, all copies or none, leaving a quarter of the free memory to the
+# cache rows (MiMo-V2.6 mini48's 87 GB keep their MXFP4 banks):
 # gpt-oss-20b pf64-512 51.5k -> 65.2k, c1024 19.2k -> 22.6k, raw prefill 23.2k -> 28.2k tok/s
 moe.mxfp4_bf16_from = 1024
 moe.mxfp4_bf16_down = true
-moe.mxfp4_bf16_keep = 50
+moe.mxfp4_bf16_keep = 25
 
 [engine]
 prefill_lattice_from = 192  # 2.0% faster end to end

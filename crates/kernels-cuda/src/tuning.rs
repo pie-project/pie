@@ -339,8 +339,8 @@ pub struct MoeMxfp4Bf16From(pub u32);
 pub struct MoeMxfp4Bf16Down;
 
 /// The percent of the device memory free before the bf16 copies
-/// (`kernel.moe.mxfp4_bf16_from`) that they leave free, a bank skipped where
-/// its copy would take more: the cache rows keep that much. 0: no floor.
+/// (`kernel.moe.mxfp4_bf16_from`) that they leave free, no bank copied where
+/// all of them would take more: the cache rows keep that much. 0: no floor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.mxfp4_bf16_keep", constant(range(0..=100)), default = 0, tune = search)]
 pub struct MoeMxfp4Bf16Keep(pub u32);
