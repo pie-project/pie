@@ -26,7 +26,7 @@ constexpr int kThreads = 256;
 
 /// The dynamic shared memory the kernel takes: the 1024-byte alignment, Q,
 /// two key tiles, P, the stage's slots, the halves' row maxima.
-constexpr int kSmem = 1024 + 3 * kTileBytes + kAtomBytes + kBK * 8 + 2 * kH * 4 + 64;
+constexpr int kSmem = 1024 + 3 * kTileBytes + kAtomBytes + 2 * kBK * 8 + 2 * kH * 4 + 64;
 
 __device__ __forceinline__ unsigned long long desc_k(const void* smem) {
     const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(smem));
@@ -128,7 +128,7 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
     unsigned char* sK = sQ + kTileBytes;
     unsigned char* sP = sK + 2 * kTileBytes;
     long long* s_slot = reinterpret_cast<long long*>(sP + kAtomBytes);
-    float* s_max = reinterpret_cast<float*>(s_slot + kBK);
+    float* s_max = reinterpret_cast<float*>(s_slot + 2 * kBK);
     int* s_misc = reinterpret_cast<int*>(s_max + 2 * kH);
     unsigned long long* s_ok = reinterpret_cast<unsigned long long*>(s_misc + 4);
 
@@ -140,7 +140,9 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
     const int g = lane >> 2;
     const int c = lane & 3;
 
-    const int t = blockIdx.y;
+    // The rows last first: a causal prefill's late rows read the most tiles,
+    // and the light early ones then fill the last wave.
+    const int t = static_cast<int>(gridDim.y - 1 - blockIdx.y);
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
     if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
@@ -206,17 +208,20 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
     };
     auto publish = [&](int stage) {
         if (tid < kBK) {
-            s_slot[tid] = nslot;
+            s_slot[stage * kBK + tid] = nslot;
             const unsigned bits = __ballot_sync(0xffffffffu, nok);
             if (lane == 0) reinterpret_cast<unsigned*>(&s_ok[stage])[warp] = bits;
         }
     };
     auto issue = [&](int stage) {
         unsigned char* dst = sK + stage * kTileBytes;
-        for (int i = tid; i < kBK * (kD / 8); i += kThreads) {
+        const long long* slots = s_slot + stage * kBK;
+#pragma unroll
+        for (int u = 0; u < kBK * (kD / 8) / kThreads; ++u) {
+            const int i = tid + u * kThreads;
             const int row = i / (kD / 8);
             const int ch = i % (kD / 8);
-            const long long slot = s_slot[row];
+            const long long slot = slots[row];
             const bool live = slot >= 0;
             const long long at = live ? slot : 0;
             const void* src = ch < kCkv / 8
@@ -238,9 +243,12 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
     if (tiles > 0) {
         fetch(j_lo);
         publish(0);
+        if (tiles > 1) {
+            fetch(j_lo + kBK);
+            publish(1);
+        }
         __syncthreads();
         issue(0);
-        if (tiles > 1) fetch(j_lo + kBK);
     } else {
         asm volatile("cp.async.commit_group;\n" ::);
     }
@@ -249,8 +257,6 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
         const int st = i & 1;
         __syncthreads();
         if (i + 1 < tiles) {
-            publish(st ^ 1);
-            __syncthreads();
             issue(st ^ 1);
             asm volatile("cp.async.wait_group 1;\n" ::: "memory");
         } else {
@@ -348,6 +354,10 @@ __global__ __launch_bounds__(kThreads, 1) void mla_wgmma_paged_kernel(
                   desc_mn(tile + (4 * wg) * kAtomBytes + kk * 16 * 128, kAtomBytes, 8 * 128));
         }
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+        // Tile i + 2's slots, read under the scores' MMAs, land where tile
+        // i's were (its copies issued a tile ago); the next top barrier
+        // publishes them.
+        if (i + 2 < tiles) publish(st);
         asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
     }
     asm volatile("cp.async.wait_all;\n" ::: "memory");

@@ -299,7 +299,7 @@ pub(crate) mod naive {
     }
 
     /// `wg::kSmem`: the alignment, Q, two key tiles, P and the small arrays.
-    const WG_SMEM_BYTES: u32 = 1024 + 3 * 9 * 8192 + 8192 + 64 * 8 + 2 * 64 * 4 + 64;
+    const WG_SMEM_BYTES: u32 = 1024 + 3 * 9 * 8192 + 8192 + 2 * 64 * 8 + 2 * 64 * 4 + 64;
     const WG_THREADS: u32 = 256;
     const WG_BK: u32 = 64;
 
