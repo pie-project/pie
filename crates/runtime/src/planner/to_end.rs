@@ -96,11 +96,30 @@ impl ToEnd {
             .map(|proc| u64::from(proc.peak.1.slots))
             .sum::<u64>()
             + u64::from(first.1.slots.max(end.1.slots));
+        let young = kv.iter().filter(|&&held| held <= first.0 + 1).count() as u64;
         let kv_most = most_at_once(&mut kv, end.0);
         let pages_most = most_at_once(&mut pages, end.1.pages);
-        kv_most <= u64::from(kv_total)
-            && pages_most <= u64::from(rs_total.pages)
-            && slots <= u64::from(rs_total.slots)
+        if kv_most > u64::from(kv_total)
+            || pages_most > u64::from(rs_total.pages)
+            || slots > u64::from(rs_total.slots)
+        {
+            return false;
+        }
+        // Where more wait than the pools hold to the end at once, a page's
+        // worth of starts at a time: lanes started in one burst finish in
+        // one, and the pools then hold each to its end, where lanes spread
+        // over a life hold half as much each on the way.
+        let fit = |total: u32, each: u32| u64::from(total) / u64::from(each.max(1));
+        let at_once = fit(kv_total, end.0).min(fit(rs_total.pages, end.1.pages));
+        if (self.live.len() + self.waiting.len()) as u64 <= at_once {
+            return true;
+        }
+        let spread = fit(kv_total, (end.0 + first.0).div_ceil(2)).min(fit(
+            rs_total.pages,
+            (end.1.pages + first.1.pages).div_ceil(2),
+        ));
+        let a_page = spread.div_ceil(u64::from(end.0.saturating_sub(first.0).max(1)));
+        young <= a_page
     }
 }
 
