@@ -38,6 +38,7 @@ fn main() -> Result<(), String> {
         pages,
         visible: None,
         forced,
+        state: None,
     };
     let lanes: Vec<BatchLane> = (0..b_n)
         .map(|b| lane(0, pages[b].clone(), prompts[b].clone()))
