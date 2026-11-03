@@ -96,15 +96,27 @@ __global__ void __launch_bounds__(kWarps * 32) fp8_block_gemv(
 #pragma unroll
         for (int j = 0; j < kM; ++j) acc[i][j] = 0.f;
     }
+    // The next pass's codes and exponents load under this pass's products.
+    uint4 wn[kRows];
+    float sn[kRows];
+    auto fetch = [&](int c) {
+#pragma unroll
+        for (int i = 0; i < kRows; ++i) {
+            const int row = min(row0 + i, n - 1);
+            wn[i] = ld_stream(codes + static_cast<long long>(row) * k + c);
+            sn[i] = __uint_as_float((static_cast<unsigned>(atoms[atom_offset(row, c / kGran, blocks)]) + kCodeBias) << 23);
+        }
+    };
+    if (part_k * 512 + lane * 16 < k) fetch(part_k * 512 + lane * 16);
     for (int c0 = part_k * 512 + lane * 16; c0 < k; c0 += 512 * splits) {
         uint4 w[kRows];
         float s[kRows];
 #pragma unroll
         for (int i = 0; i < kRows; ++i) {
-            const int row = min(row0 + i, n - 1);
-            w[i] = ld_stream(codes + static_cast<long long>(row) * k + c0);
-            s[i] = __uint_as_float((static_cast<unsigned>(atoms[atom_offset(row, c0 / kGran, blocks)]) + kCodeBias) << 23);
+            w[i] = wn[i];
+            s[i] = sn[i];
         }
+        if (c0 + 512 * splits < k) fetch(c0 + 512 * splits);
         // The activations' sixteen columns of each row, read through L1
         // (every warp of the block reads the same).
         uint4 xr[kM][2];
