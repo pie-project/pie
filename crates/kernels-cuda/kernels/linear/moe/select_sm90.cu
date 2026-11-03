@@ -829,14 +829,15 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp8a8_wsgemm(
     // Tile `t`'s expert, routes and first weight row: 0 past the work, 1 an
     // empty slice, 2 a tile to run.
     int expert = 0, begin = 0, count = 0, row0 = 0;
+    // The work items run fastest, so the CTAs at once share weight tiles.
+    const int items = offsets[num_experts + 1];
     auto at = [&](int t) {
-        const int item_at = t / col_tiles;
-        if (item_at >= offsets[num_experts + 1]) return 0;
-        const int item = work[item_at];
+        if (t >= items * col_tiles) return 0;
+        const int item = work[t % items];
         expert = item >> 16;
         begin = offsets[expert] + (item & 0xFFFF) * kSlice;
         count = min(offsets[expert + 1] - begin, kSlice);
-        row0 = (t % col_tiles) * 128;
+        row0 = (t / items) * 128;
         return count > 0 ? 2 : 1;
     };
 
