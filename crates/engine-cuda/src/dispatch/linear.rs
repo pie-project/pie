@@ -2082,6 +2082,26 @@ impl Run<'_> {
             {
                 return Ok(());
             }
+            // An NVFP4 bank against NVFP4 rows (W4A4), as the release asks,
+            // on the block-scaled mma.sync (`kernel.moe.nvfp4_w4a4_from`).
+            if let ActQuant::Nvfp4 = quant
+                && codes.dtype == Dtype::Nvfp4
+                && let (Some(tensor_scales), Some(input_scales)) = (biases, input_scales)
+                && !seat.streams()
+                && !crate::device::alloc::is_host_pointer(codes.ptr)
+                && linear::moe::select_nvfp4_w4a4(
+                    self.ctx(),
+                    self.tensor(x),
+                    codes,
+                    scales,
+                    tensor_scales,
+                    self.tensor(input_scales),
+                    self.tensor(routes),
+                    &mut self.tensor(y),
+                )?
+            {
+                return Ok(());
+            }
             return self.select_a16(OP, x, bank, routes, y);
         }
         let (codes, scales, biases, seat) = self.planes(bank);
