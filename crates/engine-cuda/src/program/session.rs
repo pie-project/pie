@@ -73,6 +73,9 @@ pub struct Session {
     /// A decode envelope's device-computed mask is packed into the staged
     /// mask on the device and never read on the host ([`Self::resolve_on`]).
     mask_on_device: bool,
+    /// The channels that are only a `lora` sink's planes: the bank is landed
+    /// from their seeds at bind, so a fire never pulls their cells again.
+    sink_planes: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -134,6 +137,11 @@ impl Session {
             shadow,
             device: PortMask::NONE,
             mask_on_device: false,
+            sink_planes: crate::adapter::sink_of(&plan.package)
+                .ok()
+                .flatten()
+                .map(|sink| sink.planes.iter().map(|&(_, channel)| channel as usize).collect())
+                .unwrap_or_default(),
         };
         for (channel, wire) in seeds {
             if shadow
@@ -657,6 +665,9 @@ impl Session {
             }
             let takes = plan.takes_channel(slot, at);
             let puts = plan.puts_channel(slot, at);
+            if !takes && !puts && self.sink_planes.contains(&channel) {
+                continue;
+            }
             let addresses_head = takes || plan.reads_channel(slot, at);
 
             let shared = self
