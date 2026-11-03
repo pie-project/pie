@@ -15,6 +15,9 @@ moe.bf16_mma_until = 65536
 # MiniMax-M3.1-Flash mini pf32-512 70.8k -> 94.3k, c512 23.4k -> 28.2k tok/s
 moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
+# NVFP4 selects of a W4A4 release on the block-scaled mma.sync, as the RTX 5090: MiniMax-M3.1-Flash mini
+# pf8-512 45.4k -> 55.7k, c512 14.8k -> 16.8k tok/s (vLLM 50.2k / 14.9k)
+moe.nvfp4_w4a4_from = 64
 # a single-row block-FP8 projection as the GEMV over bf16 rows, the codes streamed once, as sm_90/sm_100:
 # MiniMax-M3.1-Flash mini raw decode 285 -> 304 tok/s, greedy tokens unchanged
 gemm.fp8_gemv_until = 1
