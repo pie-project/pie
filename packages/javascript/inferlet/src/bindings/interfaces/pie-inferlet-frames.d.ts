@@ -34,7 +34,7 @@ export type Channel = import('./pie-inferlet-channel.js').Channel;
  * 
  * ## `"mp4-h264"`
  */
-export type ImageFormat = 'png' | 'jpeg' | 'webp' | 'raw-rgb8' | 'y4m' | 'mp4-h264';
+export type ImageFormat = "png" | "jpeg" | "webp" | "raw-rgb8" | "y4m" | "mp4-h264";
 /**
  * How a `pcm` handle is serialized. `wav` is 16-bit PCM RIFF (the form
  * every player takes); `raw-f32` is the parity format — the samples as
@@ -45,7 +45,7 @@ export type ImageFormat = 'png' | 'jpeg' | 'webp' | 'raw-rgb8' | 'y4m' | 'mp4-h2
  * 
  * ## `"raw-f32"`
  */
-export type AudioFormat = 'wav' | 'raw-f32';
+export type AudioFormat = "wav" | "raw-f32";
 
 export class Frames {
   /**
