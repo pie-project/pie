@@ -368,6 +368,24 @@ fn the_routed_selects_answer_the_routed_dot() {
     cases.into_iter().for_each(routed);
 }
 
+/// Hopper's wide wgmma slice on NVFP4 (`kernel.moe.nvfp4_wide_from`): a
+/// prefill's routes, by token and by route, its GLU, a slice partly full.
+#[test]
+fn nvfp4_wide_selects_answer_the_routed_dot() {
+    #[rustfmt::skip]
+    let nv_wide = Tuning { nvfp4_mma_until: 65_536, nvfp4_wide_from: 64, ..Tuning::DEFAULT };
+    let (sw, f, t) = (Some(Glu::Swiglu), false, true);
+    #[rustfmt::skip]
+    let cases: Vec<Case> = vec![
+        (K::Nv, nv_wide, [8, 300, 8, 256, 1024], t, None, 0),
+        (K::Nv, nv_wide, [8, 300, 8, 384, 1024], f, None, 0),
+        (K::Nv, nv_wide, [8, 300, 8, 256, 1024], t, sw, 0),
+        (K::Nv, nv_wide, [16, 600, 8, 320, 2048], t, None, 0),
+        (K::Nv, nv_wide, [32, 300, 8, 256, 1024], t, None, 0),
+    ];
+    cases.into_iter().for_each(routed);
+}
+
 /// A routed MLP's bank `[experts][rows][k]` of bf16, MXFP4, or against
 /// quantized rows NVFP4 (W4A4, `a`: 4), MXFP4 (W4A8, 8) or block FP8 (W8A8,
 /// 16), and its values.

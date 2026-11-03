@@ -376,6 +376,14 @@ pub struct MoeMxfp4Bf16Keep(pub u32);
 #[decision(id = "kernel.moe.mxfp4_w4a8_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4W4a8From(pub u32);
 
+/// The fewest routes an expert averages that Hopper's NVFP4 selects take the
+/// wide wgmma slice at (`moe_select_fp4_wgmma`, two warpgroups on a
+/// 128-route slice), as the MXFP4 ones do from 128; fewer, and all where 0,
+/// keep the one-warpgroup 64-route slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.nvfp4_wide_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeNvfp4WideFrom(pub u32);
+
 /// The fewest routes an NVFP4 select of a W4A4 release runs W4A4 on sm_120a's
 /// block-scaled mma.sync, its rows quantized as NVFP4 (as the FlashInfer SM120
 /// CUTLASS MoE reads NVFP4 experts on the consumer Blackwells). 0: never.
@@ -470,6 +478,21 @@ pub struct GemmFp8GroupedTc5Until(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.mla_sparse", flag, default = false, tune = search)]
 pub struct SdpaMlaSparse;
+
+/// Whether the paged latent attention (64 heads in whole groups over a
+/// 512-wide bf16 latent and a 64-wide rotated part: GLM-5.3's DSA) runs 64
+/// heads a CTA on Hopper's wgmma (`attn/mla/sparse_sm90.cu`); off, the
+/// 16-head mma.sync kernel serves it as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.mla_wgmma", flag, default = false, tune = search)]
+pub struct SdpaMlaWgmma;
+
+/// The fewest rows a latent attention fire runs the wgmma kernel at
+/// (`kernel.sdpa.mla_wgmma`); fewer (a decode's few rows) keep the 16-head
+/// kernel, whose keys split wider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.mla_wgmma_rows", constant(range(1..=65_536)), default = 1, tune = search)]
+pub struct SdpaMlaWgmmaRows(pub u32);
 
 /// Whether the tcgen05 sparse MLA pass reads a row that sees no more keys
 /// than its selection holds (a decode at a short context, a prefill's rows
@@ -919,6 +942,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4Bf16Keep>()
         .add::<MoeMxfp4W4a8From>()
         .add::<MoeNvfp4W4a4From>()
+        .add::<MoeNvfp4WideFrom>()
         .add::<MoeMxfp4W4a8Tma>()
         .add::<MoeMxfp4W4a8Ws>()
         .add::<MoeW4a4FusedFrom>()
@@ -972,6 +996,8 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaCompressedFp4PassFrom>()
         .add::<GemmFp8GroupedTc5Until>()
         .add::<SdpaMlaSparse>()
+        .add::<SdpaMlaWgmma>()
+        .add::<SdpaMlaWgmmaRows>()
         .add::<SdpaMlaDenseShort>()
         .add::<GemmNarrowN>();
 }
@@ -1069,6 +1095,7 @@ tuning! {
     mxfp4_bf16_keep: u32 = 0, get MoeMxfp4Bf16Keep;
     mxfp4_w4a8_from: u32 = 0, get MoeMxfp4W4a8From;
     nvfp4_w4a4_from: u32 = 0, get MoeNvfp4W4a4From;
+    nvfp4_wide_from: u32 = 0, get MoeNvfp4WideFrom;
     mxfp4_w4a8_tma: bool = false, on MoeMxfp4W4a8Tma;
     mxfp4_w4a8_ws: bool = false, on MoeMxfp4W4a8Ws;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
@@ -1122,6 +1149,8 @@ tuning! {
     compressed_fp4_pass_from: u32 = 0, get SdpaCompressedFp4PassFrom;
     gemm_fp8_grouped_tc5_until: u32 = 0, get GemmFp8GroupedTc5Until;
     mla_sparse: bool = false, on SdpaMlaSparse;
+    mla_wgmma: bool = false, on SdpaMlaWgmma;
+    mla_wgmma_rows: u32 = 1, get SdpaMlaWgmmaRows;
     mla_dense_short: bool = false, on SdpaMlaDenseShort;
     gemm_narrow_n: u32 = 0, get GemmNarrowN;
 }
