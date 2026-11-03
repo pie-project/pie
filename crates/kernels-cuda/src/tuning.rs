@@ -338,6 +338,13 @@ pub struct MoeMxfp4Bf16From(pub u32);
 #[decision(id = "kernel.moe.mxfp4_bf16_down", flag, default = false, tune = search)]
 pub struct MoeMxfp4Bf16Down;
 
+/// Whether Hopper's warp-specialized bf16 select runs persistent: a CTA an
+/// SM walking the fire's tiles, the producer filling the next tile's stages
+/// while the consumers land the last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.bf16_ws_persist", flag, default = false, tune = search)]
+pub struct MoeBf16WsPersist;
+
 /// The fewest routes an MXFP4 select runs W4A8 on sm_120a's block-scaled
 /// mma.sync, its rows quantized as MXFP8 (as SGLang reads MXFP4 experts on
 /// the consumer Blackwells). 0: never.
@@ -874,6 +881,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4Fp8From>()
         .add::<MoeMxfp4Bf16From>()
         .add::<MoeMxfp4Bf16Down>()
+        .add::<MoeBf16WsPersist>()
         .add::<MoeMxfp4W4a8From>()
         .add::<MoeMxfp4W4a8Tma>()
         .add::<MoeMxfp4W4a8Ws>()
@@ -1018,6 +1026,7 @@ tuning! {
     mxfp4_fp8_from: u32 = 0, get MoeMxfp4Fp8From;
     mxfp4_bf16_from: u32 = 0, get MoeMxfp4Bf16From;
     mxfp4_bf16_down: bool = false, on MoeMxfp4Bf16Down;
+    bf16_ws_persist: bool = false, on MoeBf16WsPersist;
     mxfp4_w4a8_from: u32 = 0, get MoeMxfp4W4a8From;
     mxfp4_w4a8_tma: bool = false, on MoeMxfp4W4a8Tma;
     mxfp4_w4a8_ws: bool = false, on MoeMxfp4W4a8Ws;

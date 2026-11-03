@@ -604,24 +604,19 @@ __device__ __forceinline__ void bar_wait(unsigned long long* bar, unsigned parit
 /// 64 of the routes. A GLU's gate and up columns lie in the same lane's
 /// accumulators (columns `x` and `128 + x`). `k` whole 64s. Grid
 /// `[work_cap, ceil(cols / (kGlu ? 128 : 256))]`, 384 threads, `kStages *
-/// 49152 + 1024 + 128` bytes of shared memory.
-template <int kStages, int kGlu>
+/// 49152 + 1024 + 128` bytes of shared memory. `kPersist`: a grid of
+/// `[ctas, 1]` walks the `work_cap x col_tiles` tiles, the producer filling
+/// the next tile's stages while the consumers land the last.
+template <int kStages, int kGlu, bool kPersist = false>
 __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
     const i32* __restrict__ work, const bf16* __restrict__ weight, const bf16* __restrict__ bias,
     bf16* __restrict__ out, int act_div, int n, int k, int num_experts, int inter, float limit,
-    float galpha) {
+    float galpha, int col_tiles = 1) {
     constexpr int kSlice = 128;
     constexpr int kA = kSlice * 128;   // 128 routes x 64 bf16
     constexpr int kB = 256 * 128;      // 256 weight rows x 64 bf16
     constexpr int kStage = kA + kB;
-
-    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
-    const int item = work[blockIdx.x];
-    const int expert = item >> 16;
-    const int begin = offsets[expert] + (item & 0xFFFF) * kSlice;
-    const int count = min(offsets[expert + 1] - begin, kSlice);
-    if (count <= 0) return;
 
     extern __shared__ uint4 wsgemm_smem[];
     const unsigned base = static_cast<unsigned>(__cvta_generic_to_shared(wsgemm_smem));
@@ -632,8 +627,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
     const int tid = static_cast<int>(threadIdx.x);
     const int wg = tid >> 7;
     const int steps = k >> 6;
-    // The CTA's first output column: 128 GLU columns, or 256 rows.
-    const int col0 = static_cast<int>(blockIdx.y) * (kGlu != 0 ? 128 : 256);
+    if (!kPersist && static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
     if (tid == 0) {
         for (int s = 0; s < kStages; ++s) {
             wgbf16gemm::bar_init(full + s, 128);
@@ -643,56 +637,80 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
     }
     __syncthreads();
 
+    // Tile `t`'s expert, routes and first output column (128 GLU columns, or
+    // 256 rows): 0 past the work, 1 an empty slice, 2 a tile to run.
+    int expert = 0, begin = 0, count = 0, col0 = 0;
+    auto at = [&](int t) {
+        if (!kPersist && t > 0) return 0;
+        const int item_at = kPersist ? t / col_tiles : static_cast<int>(blockIdx.x);
+        if (item_at >= offsets[num_experts + 1]) return 0;
+        const int item = work[item_at];
+        expert = item >> 16;
+        begin = offsets[expert] + (item & 0xFFFF) * kSlice;
+        count = min(offsets[expert + 1] - begin, kSlice);
+        col0 = (kPersist ? t % col_tiles : static_cast<int>(blockIdx.y)) * (kGlu != 0 ? 128 : 256);
+        return count > 0 ? 2 : 1;
+    };
+    const int t0 = kPersist ? static_cast<int>(blockIdx.x) : 0;
+    const int stride = kPersist ? static_cast<int>(gridDim.x) : 1 << 30;
+
     if (wg == 0) {
         // The producer: its rows of each stage, gathered.
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n");
-        const bf16* w_e = weight + static_cast<long long>(expert) * n * k;
-        const bf16* asrc[8];
-        int alive[8];
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int r = (tid + 128 * j) >> 3;
-            alive[j] = r < count;
-            asrc[j] = act + static_cast<long long>(alive[j] ? order[begin + r] / act_div : 0) * k;
-        }
-        const bf16* bsrc[16];
-#pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            const int r = (tid + 128 * j) >> 3;
-            const int row = kGlu != 0 ? (r < 128 ? col0 + r : inter + col0 + (r - 128)) : col0 + r;
-            const int clamp = kGlu != 0 ? (r < 128 ? min(row, inter - 1) : min(row, 2 * inter - 1)) : min(row, n - 1);
-            bsrc[j] = w_e + static_cast<long long>(clamp) * k;
-        }
         auto cp = [](void* dst, const void* from, int live) {
             const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(dst));
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(at), "l"(from), "r"(live));
         };
         constexpr int kLag = 1;
-        for (int kb = 0; kb < steps; ++kb) {
-            const int s = kb % kStages;
-            if (kb >= kStages) wgbf16gemm::bar_wait(empty + s, ((kb / kStages) - 1) & 1);
-            u8* st = ring + s * kStage;
-            const int k0 = kb * 64;
+        int g = 0;
+        for (int t = t0;; t += stride) {
+            const int state = at(t);
+            if (state == 0) break;
+            if (state == 1) continue;
+            const bf16* w_e = weight + static_cast<long long>(expert) * n * k;
+            const bf16* asrc[8];
+            int alive[8];
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                const int u = tid + 128 * j, r = u >> 3, q = u & 7;
-                cp(st + r * 128 + ((q ^ (r & 7)) << 4), asrc[j] + k0 + q * 8, alive[j] ? 16 : 0);
+                const int r = (tid + 128 * j) >> 3;
+                alive[j] = r < count;
+                asrc[j] = act + static_cast<long long>(alive[j] ? order[begin + r] / act_div : 0) * k;
             }
+            const bf16* bsrc[16];
 #pragma unroll
             for (int j = 0; j < 16; ++j) {
-                const int u = tid + 128 * j, r = u >> 3, q = u & 7;
-                cp(st + kA + r * 128 + ((q ^ (r & 7)) << 4), bsrc[j] + k0 + q * 8, 16);
+                const int r = (tid + 128 * j) >> 3;
+                const int row = kGlu != 0 ? (r < 128 ? col0 + r : inter + col0 + (r - 128)) : col0 + r;
+                const int clamp = kGlu != 0 ? (r < 128 ? min(row, inter - 1) : min(row, 2 * inter - 1)) : min(row, n - 1);
+                bsrc[j] = w_e + static_cast<long long>(clamp) * k;
             }
-            asm volatile("cp.async.commit_group;\n" ::);
-            if (kb >= kLag) {
-                asm volatile("cp.async.wait_group %0;\n" ::"n"(kLag));
-                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-                wgbf16gemm::bar_arrive(full + (kb - kLag) % kStages);
+            for (int kb = 0; kb < steps; ++kb) {
+                const int gs = g + kb, s = gs % kStages;
+                if (gs >= kStages) wgbf16gemm::bar_wait(empty + s, ((gs / kStages) - 1) & 1);
+                u8* st = ring + s * kStage;
+                const int k0 = kb * 64;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int u = tid + 128 * j, r = u >> 3, q = u & 7;
+                    cp(st + r * 128 + ((q ^ (r & 7)) << 4), asrc[j] + k0 + q * 8, alive[j] ? 16 : 0);
+                }
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const int u = tid + 128 * j, r = u >> 3, q = u & 7;
+                    cp(st + kA + r * 128 + ((q ^ (r & 7)) << 4), bsrc[j] + k0 + q * 8, 16);
+                }
+                asm volatile("cp.async.commit_group;\n" ::);
+                if (kb >= kLag) {
+                    asm volatile("cp.async.wait_group %0;\n" ::"n"(kLag));
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    wgbf16gemm::bar_arrive(full + (gs - kLag) % kStages);
+                }
             }
+            asm volatile("cp.async.wait_group 0;\n" ::);
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            for (int kb = max(0, steps - kLag); kb < steps; ++kb) wgbf16gemm::bar_arrive(full + (g + kb) % kStages);
+            g += steps;
         }
-        asm volatile("cp.async.wait_group 0;\n" ::);
-        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-        for (int kb = max(0, steps - kLag); kb < steps; ++kb) wgbf16gemm::bar_arrive(full + kb % kStages);
         return;
     }
 
@@ -700,12 +718,17 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
     asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n");
     const int c_wg = wg - 1;
     const int lt = tid & 127, warp = lt >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
+    int gstep = 0;
+    for (int t = t0;; t += stride) {
+    const int state = at(t);
+    if (state == 0) break;
+    if (state == 1) continue;
     float acc[128];
 #pragma unroll
     for (int i = 0; i < 128; ++i) acc[i] = 0.f;
     for (int kb = 0; kb < steps; ++kb) {
-        const int s = kb % kStages;
-        wgbf16gemm::bar_wait(full + s, (kb / kStages) & 1);
+        const int gs = gstep + kb, s = gs % kStages;
+        wgbf16gemm::bar_wait(full + s, (gs / kStages) & 1);
         const u8* st = ring + s * kStage;
         asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 #pragma unroll
@@ -715,9 +738,12 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
         asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
         // The stage before is read: hand it back.
-        if (kb > 0 && lane == 0) wgbf16gemm::bar_arrive(empty + (kb - 1) % kStages);
+        if (kb > 0 && lane == 0) wgbf16gemm::bar_arrive(empty + (gs - 1) % kStages);
     }
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+    // The tile's last stage, handed back for the next tile's.
+    if (kPersist && lane == 0) wgbf16gemm::bar_arrive(empty + (gstep + steps - 1) % kStages);
+    gstep += steps;
 
     // An expert's bias (a GLU's gate rows, then its up rows), where it has one.
     const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
@@ -766,6 +792,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
                 }
             }
         }
+    }
     }
 }
 

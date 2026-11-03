@@ -551,12 +551,21 @@ fn the_bf16_prefill_selects_answer_the_routed_dot() {
     if kernels_cuda::jit::cache::arch() != Some("sm_90") {
         return;
     }
-    let (ex, tokens, top, k) = (8usize, 256usize, 4usize, 512usize);
-    for glu in [None, Some(Glu::GegluTanh), Some(Glu::Swiglu)] {
+    let (ex, top) = (8usize, 4usize);
+    // (tokens, k, persistent): the last more tiles than the card's SMs.
+    let shapes = [
+        (256usize, 512usize, false),
+        (256, 512, true),
+        (4096, 256, true),
+    ];
+    for (glu, (tokens, k, persist)) in [None, Some(Glu::GegluTanh), Some(Glu::Swiglu)]
+        .into_iter()
+        .flat_map(|g| shapes.map(|sh| (g, sh)))
+    {
         let inter = 192usize;
         let n = if glu.is_some() { inter } else { 384 };
         let rows = if glu.is_some() { 2 * inter } else { n };
-        let what = format!("bf16 prefill select {ex}x{tokens}x{top} {n}x{k} {glu:?}");
+        let what = format!("bf16 prefill select {ex}x{tokens}x{top} {n}x{k} {glu:?} {persist}");
         let mut b = Bench::new(0xbf1 ^ (n + k) as u64);
         let count = tokens * top;
         let routes = tab(count, |r| ((r / top * 3 + r % top * 5) % ex) as i32);
@@ -564,6 +573,10 @@ fn the_bf16_prefill_selects_answer_the_routed_dot() {
         let (bank, wv) = b.bf16(ex * rows * k);
         let mut y = b.out(count, n);
         let ctx = b.ctx();
+        let ctx = ctx.with_tuning(Tuning {
+            bf16_ws_persist: persist,
+            ..ctx.tuning()
+        });
         let took = moe::select_bf16_held(
             &ctx,
             "test",

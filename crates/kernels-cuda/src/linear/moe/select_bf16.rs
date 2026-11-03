@@ -170,6 +170,27 @@ pub(super) const BF16_GEMM_FROM: u32 = 256;
 /// a prefill's, in slices of 128.
 pub(super) const BF16_WSGEMM_FROM: u32 = 64;
 
+/// The warp-specialized bf16 GEMM's kernel, grid and column tiles: one CTA a
+/// tile, or under `kernel.moe.bf16_ws_persist` a CTA an SM walking them.
+#[cfg(feature = "cuda")]
+fn wsgemm_grid(
+    ctx: &Ctx,
+    stages: u32,
+    code: i32,
+    work_cap: u32,
+    col_tiles: u32,
+) -> (String, [u32; 3], u32) {
+    if ctx.tuning().bf16_ws_persist {
+        let ctas = (work_cap * col_tiles)
+            .min(ctx.multiprocessors().unwrap_or(132))
+            .max(1);
+        let name = format!("::pie::linear::moe_select_bf16_wsgemm<{stages}, {code}, true>");
+        return (name, [ctas, 1, 1], col_tiles);
+    }
+    let name = format!("::pie::linear::moe_select_bf16_wsgemm<{stages}, {code}>");
+    (name, [work_cap, col_tiles, 1], col_tiles)
+}
+
 /// A routed select over a bf16 bank (`experts x n x k` at `bank`) on mma.sync
 /// (`linear/moe_w8.cuh`): the register-held `moe_select_bf16_held`, each
 /// expert's rows streamed once a slice of its routes, or from
@@ -239,16 +260,12 @@ pub fn select_bf16_held(
             },
         )?;
         let cols = if glu.is_some() { 128 } else { 256 };
+        let (name, grid, col_tiles) =
+            wsgemm_grid(ctx, STAGES, code, order.work_cap, y.width.div_ceil(cols));
         ctx.fire(
             op,
-            Fire::at(kernel(
-                SELECT_SM90,
-                &format!("::pie::linear::moe_select_bf16_wsgemm<{STAGES}, {code}>"),
-            ))
-            .apply(
-                Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [384, 1, 1])
-                    .smem(STAGES * 49152 + 1024 + 128),
-            ),
+            Fire::at(kernel(SELECT_SM90, &name))
+                .apply(Launch::grid(grid, [384, 1, 1]).smem(STAGES * 49152 + 1024 + 128)),
             &[
                 x.arg(),
                 ArgValue::Ptr(order.order),
@@ -264,6 +281,7 @@ pub fn select_bf16_held(
                 inter.arg(),
                 limit.arg(),
                 alpha.arg(),
+                col_tiles.arg(),
             ],
         )?;
         return Ok(true);
@@ -412,16 +430,12 @@ pub fn select_bf16_copy(
         },
     )?;
     let cols = if glu.is_some() { 128 } else { 256 };
+    let (name, grid, col_tiles) =
+        wsgemm_grid(ctx, STAGES, code, order.work_cap, y.width.div_ceil(cols));
     ctx.fire(
         op,
-        Fire::at(kernel(
-            SELECT_SM90,
-            &format!("::pie::linear::moe_select_bf16_wsgemm<{STAGES}, {code}>"),
-        ))
-        .apply(
-            Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [384, 1, 1])
-                .smem(STAGES * 49152 + 1024 + 128),
-        ),
+        Fire::at(kernel(SELECT_SM90, &name))
+            .apply(Launch::grid(grid, [384, 1, 1]).smem(STAGES * 49152 + 1024 + 128)),
         &[
             x.arg(),
             ArgValue::Ptr(order.order),
@@ -437,6 +451,7 @@ pub fn select_bf16_copy(
             inter.arg(),
             limit.arg(),
             alpha.arg(),
+            col_tiles.arg(),
         ],
     )?;
     Ok(true)
