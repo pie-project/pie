@@ -290,6 +290,14 @@ pub struct MoeMxfp4Cvt;
 #[decision(id = "kernel.moe.mxfp4_cvt_ksplit_until", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4CvtKsplitUntil(pub u32);
 
+/// The most routes an expert averages that a bf16 select keeps off the tiled
+/// mma.sync GEMM (`moe_select_bf16_gemm`, 64 routes a CTA) where there are no
+/// tcgen05 GEMMs: fewer take the grouped or per-route kernels (12 but where
+/// a chip's profile says).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.bf16_tiled_per_from", constant(range(0..=65_536)), default = 12, tune = search)]
+pub struct MoeBf16TiledPerFrom(pub u32);
+
 /// The most routes an expert averages that the register-held mxfp4 select
 /// takes; past it, the shared-memory-staged one (16 but where a chip's
 /// profile says).
@@ -953,6 +961,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4CvtKsplitUntil>()
         .add::<MoeMxfp4StagedNarrowUntil>()
         .add::<MoeMxfp4StagedFrom>()
+        .add::<MoeBf16TiledPerFrom>()
         .add::<GemmFp8ODown>()
         .add::<MoeMxfp4A8Until>()
         .add::<MoeMxfp4A8From>()
@@ -1109,6 +1118,7 @@ tuning! {
     mxfp4_cvt_ksplit_until: u32 = 0, get MoeMxfp4CvtKsplitUntil;
     mxfp4_staged_narrow_until: u32 = 0, get MoeMxfp4StagedNarrowUntil;
     mxfp4_staged_from: u32 = 16, get MoeMxfp4StagedFrom;
+    bf16_tiled_per_from: u32 = 12, get MoeBf16TiledPerFrom;
     fp8_o_down: bool = false, on GemmFp8ODown;
     mxfp4_a8_until: u32 = 0, get MoeMxfp4A8Until;
     mxfp4_a8_from: u32 = 0, get MoeMxfp4A8From;

@@ -132,7 +132,7 @@ pub fn matmul_select(
         // rows, 196 against 146 us a select; every decode measured).
         let tiled = fan.route_count >= BF16_GEMM_FROM
             && x.width.is_multiple_of(64)
-            && fan.route_count.div_ceil(bank.rows.max(1)) > 12;
+            && fan.route_count.div_ceil(bank.rows.max(1)) > ctx.tuning().bf16_tiled_per_from;
         if !crate::linear::gemm_sm100::supported()
             && tiled
             && bank.dtype == Dtype::Bf16
