@@ -144,7 +144,9 @@ async def run_pie(args, p, items, tally):
                     await process.signal("quit")
 
     try:
-        return await asyncio.gather(*[team(k, item) for k, item in enumerate(items)], return_exceptions=True)
+        t0 = time.monotonic()
+        texts = await asyncio.gather(*[team(k, item) for k, item in enumerate(items)], return_exceptions=True)
+        return texts, time.monotonic() - t0
     finally:
         await client.close()
 
@@ -183,7 +185,9 @@ async def run_vllm(args, p, items, tally):
             return await solve(args, p, item, k, ask)
 
     try:
-        return await asyncio.gather(*[team(k, item) for k, item in enumerate(items)], return_exceptions=True)
+        t0 = time.monotonic()
+        texts = await asyncio.gather(*[team(k, item) for k, item in enumerate(items)], return_exceptions=True)
+        return texts, time.monotonic() - t0
     finally:
         engine.shutdown()
 
@@ -213,9 +217,8 @@ def main() -> None:
     if args.method == "latent" and not args.scale:
         args.scale = embedding_scale(args.model)
     tally = {"made": 0, "read": 0}
-    t0 = time.monotonic()
-    texts = asyncio.run((run_pie if args.engine == "pie" else run_vllm)(args, p, items, tally))
-    wall = time.monotonic() - t0
+    # timed from the first team to the last answer: neither engine's start-up counts
+    texts, wall = asyncio.run((run_pie if args.engine == "pie" else run_vllm)(args, p, items, tally))
 
     correct = errors = 0
     with open(args.out, "w") as f:
