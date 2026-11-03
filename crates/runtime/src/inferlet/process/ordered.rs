@@ -17,6 +17,10 @@ pub(crate) struct OrderedSemaphore {
 #[derive(Debug)]
 struct State {
     permits: usize,
+    /// Permits owed back to `withhold`: the next ones returned pay it first.
+    debt: usize,
+    /// Permits withheld so far and not yet given back by `restore`.
+    withheld: usize,
     holds: bool,
     next_seq: u64,
     waiters: Vec<Waiter>,
@@ -44,6 +48,8 @@ impl OrderedSemaphore {
         Arc::new(Self {
             state: Mutex::new(State {
                 permits,
+                debt: 0,
+                withheld: 0,
                 holds,
                 next_seq: 0,
                 waiters: Vec::new(),
@@ -61,8 +67,35 @@ impl OrderedSemaphore {
 
     pub(crate) fn add_permits(&self, n: usize) {
         let mut state = self.lock();
-        state.permits += n;
+        let paid = n.min(state.debt);
+        state.debt -= paid;
+        state.permits += n - paid;
         state.grant();
+    }
+
+    /// Takes `n` permits out of circulation: free ones now, the rest as their
+    /// holders return them.
+    pub(crate) fn withhold(&self, n: usize) {
+        let mut state = self.lock();
+        let now = n.min(state.permits);
+        state.permits -= now;
+        state.debt += n - now;
+        state.withheld += n;
+    }
+
+    /// Gives back up to `n` of the permits `withhold` took.
+    pub(crate) fn restore(&self, n: usize) {
+        let mut state = self.lock();
+        let n = n.min(state.withheld);
+        state.withheld -= n;
+        let forgiven = n.min(state.debt);
+        state.debt -= forgiven;
+        state.permits += n - forgiven;
+        state.grant();
+    }
+
+    pub(crate) fn withheld(&self) -> usize {
+        self.lock().withheld
     }
 
     #[cfg_attr(

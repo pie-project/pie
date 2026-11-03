@@ -357,6 +357,35 @@ pub(crate) fn set_bind_release_hold(hold: bool) {
     target_arch = "wasm32",
     allow(dead_code, reason = "no policy runs in the browser")
 )]
+/// A lane's growth suspended `lanes` lanes still decoding: admit that many
+/// fewer processes at once, so the pool stops seating more than it holds
+/// (Gemma-4-26B on an A100, c512: 2.9k tok/s admitting all 512, 4.5k at 192).
+pub(crate) fn throttle_admission(lanes: usize) {
+    if let Some(Some(semaphore)) = ADMISSION.get() {
+        let room = EXECUTION_SLOT_CAPACITY
+            .get()
+            .copied()
+            .flatten()
+            .unwrap_or(0)
+            .saturating_sub(semaphore.withheld());
+        // keep a quarter of the cap: a burst of suspensions is not the pool's size
+        let floor = EXECUTION_SLOT_CAPACITY
+            .get()
+            .copied()
+            .flatten()
+            .unwrap_or(0)
+            / 4;
+        semaphore.withhold(lanes.min(room.saturating_sub(floor)));
+    }
+}
+
+/// A lane finished with none suspended since: admit one more again.
+pub(crate) fn relax_admission() {
+    if let Some(Some(semaphore)) = ADMISSION.get() {
+        semaphore.restore(1);
+    }
+}
+
 pub(crate) fn regrant_admission() {
     for gate in [&PREWARM_ADMISSION, &BIND_ADMISSION, &ADMISSION] {
         if let Some(Some(semaphore)) = gate.get() {
