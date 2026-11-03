@@ -456,7 +456,9 @@ pub(super) fn experts_w4a4(
     if count == 0
         || norm.is_some_and(|(s, _)| s.dtype != Dtype::Bf16 || s.rows * s.width != y.width)
         || tokens < ctx.tuning().moe_w4a4_fused_from
-        || !matches!(glu, gemm_sm100::Glu::Swiglu | gemm_sm100::Glu::Relu2)
+        || !(matches!(glu, gemm_sm100::Glu::Swiglu | gemm_sm100::Glu::Relu2)
+            || std::env::var_os("PIE_EXP_W4A4_CLAMP").is_some()
+                && matches!(glu, gemm_sm100::Glu::SwigluClampAlpha { .. }))
         || !ctx.tuning().moe_tc5
         || !gemm_sm100::supported()
         || x.dtype != Dtype::Bf16
