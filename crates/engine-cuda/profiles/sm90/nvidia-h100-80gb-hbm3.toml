@@ -16,6 +16,14 @@ ssm.gdn_scan_until = 56  # 4.3% faster end to end
 sdpa.index_mma = true
 sdpa.index_radix = true
 gemm.fp8_shadow = true
+# MXFP4 gate-up banks kept as an exact bf16 copy, read past 1024 routes a fire by the
+# warp-specialized wgmma GEMM (the register-dequant select ran ~330 TFLOP/s): gpt-oss-20b
+# pf64-512 53.3k -> 60.4k, c1024 18.3k -> 20.4k, raw prefill 20.6k -> 22.4k; DeepSeek-V4 mini
+# pf32 99.6k -> 108.8k; MiMo mini pf32 103.9k -> 113.3k; Kimi-K3 mini8 pf32 24.3k -> 25.8k
+moe.mxfp4_bf16_from = 1024
+# as the H200 profile: gpt-oss-20b raw decode 352 -> 383 tok/s
+moe.mxfp4_grouped_reuse = 3
+moe.mxfp4_select_lean = true
 
 [engine]
 working_set_percent = 90  # 1.9% faster end to end

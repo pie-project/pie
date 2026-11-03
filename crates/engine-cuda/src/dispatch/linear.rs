@@ -1209,6 +1209,23 @@ impl Run<'_> {
                 ..
             } => {
                 let (codes, scales, affine, seat) = self.planes(*bank);
+                // A wide fire on the bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
+                #[cfg(feature = "cuda")]
+                if let Some(copy) = self.mxfp4_bf16_bank(*bank)
+                    && linear::moe::select_bf16_copy(
+                        self.ctx(),
+                        "linear.moe_select",
+                        self.tensor(*x),
+                        copy.ptr,
+                        codes.rows,
+                        Some(self.tensor(*bias)),
+                        self.tensor(*routes),
+                        &mut self.tensor(*y),
+                        None,
+                    )?
+                {
+                    return Ok(());
+                }
                 if codes.dtype == Dtype::Nvfp4 {
                     return Err(kernels_cuda::Error::Backend {
                         op: "linear.moe_select",
@@ -1448,6 +1465,36 @@ impl Run<'_> {
             ),
             _ => return Ok(false),
         };
+        // A wide fire on an MXFP4 bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
+        if let Linear::MoeSelect {
+            x: cx,
+            bank: cb,
+            bias: cbias,
+            routes: cr,
+            y: csy,
+            quant: None,
+            ..
+        } = *select
+            && csy == packed
+            && let Some(copy) = self.mxfp4_bf16_bank(cb)
+        {
+            let experts = self.planes(cb).0.rows;
+            let bias = cbias.map(|b| self.tensor(b));
+            let (x, routes, mut out) = (self.tensor(cx), self.tensor(cr), self.tensor(y));
+            if linear::moe::select_bf16_copy(
+                self.ctx(),
+                "fused.moe_select_glu",
+                x,
+                copy.ptr,
+                experts,
+                bias,
+                routes,
+                &mut out,
+                Some(glu),
+            )? {
+                return Ok(true);
+            }
+        }
         let Some((x, routes, sy, bank, experts)) = self.routed_bank(select) else {
             return Ok(false);
         };
@@ -1917,6 +1964,24 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         let (codes, scales, biases, seat) = self.planes(bank);
         let routes = self.tensor(routes);
+        // A wide fire on an MXFP4 bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
+        #[cfg(feature = "cuda")]
+        if biases.is_none()
+            && let Some(copy) = self.mxfp4_bf16_bank(bank)
+            && linear::moe::select_bf16_copy(
+                self.ctx(),
+                "linear.moe_select",
+                x,
+                copy.ptr,
+                codes.rows,
+                None,
+                routes,
+                &mut self.tensor(y),
+                None,
+            )?
+        {
+            return Ok(());
+        }
         per_tensor_e4m3_is_a_table("linear.moe_select", codes)?;
         if codes.dtype == Dtype::Nvfp4 {
             let tensor_scales = tensor_scales("linear.moe_select", biases)?;
@@ -2297,6 +2362,22 @@ impl Run<'_> {
         match codes.dtype {
             Dtype::Nvfp4 | Dtype::Mxfp4 | Dtype::U8 => {
                 let x = self.tensor(x);
+                // A wide fire on the bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`), W4A16 as below.
+                if let Some(copy) = self.mxfp4_bf16_bank(bank)
+                    && linear::moe::select_bf16_copy(
+                        self.ctx(),
+                        op,
+                        x,
+                        copy.ptr,
+                        codes.rows,
+                        None,
+                        self.tensor(routes),
+                        &mut self.tensor(y),
+                        None,
+                    )?
+                {
+                    return Ok(());
+                }
                 // A wide fire on the bank's fp8b128 copy, W8A8 (`kernel.moe.mxfp4_fp8_from`).
                 if let Some((fp8, atoms)) = self.mxfp4_fp8_bank(bank) {
                     let route_t = self.tensor(routes);

@@ -608,8 +608,9 @@ __device__ __forceinline__ void bar_wait(unsigned long long* bar, unsigned parit
 template <int kStages, int kGlu>
 __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
     const bf16* __restrict__ act, const i32* __restrict__ order, const i32* __restrict__ offsets,
-    const i32* __restrict__ work, const bf16* __restrict__ weight, bf16* __restrict__ out,
-    int act_div, int n, int k, int num_experts, int inter, float limit, float galpha) {
+    const i32* __restrict__ work, const bf16* __restrict__ weight, const bf16* __restrict__ bias,
+    bf16* __restrict__ out, int act_div, int n, int k, int num_experts, int inter, float limit,
+    float galpha) {
     constexpr int kSlice = 128;
     constexpr int kA = kSlice * 128;   // 128 routes x 64 bf16
     constexpr int kB = 256 * 128;      // 256 weight rows x 64 bf16
@@ -718,6 +719,8 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
     }
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 
+    // An expert's bias (a GLU's gate rows, then its up rows), where it has one.
+    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
     // acc[4 j + q]: route row 16 warp + g (+ 8 for q >= 2) of the
     // warpgroup's 64, column 8 j + 2 c (+ 1 for odd q) of the 256.
 #pragma unroll
@@ -730,8 +733,17 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
             for (int j = 0; j < 16; ++j) {
                 const int col = col0 + 8 * j + 2 * c;
                 if (col >= inter) continue;
-                const float o0 = act::glu<kGlu>(acc[4 * j + 2 * h], acc[4 * (j + 16) + 2 * h], limit, galpha);
-                const float o1 = act::glu<kGlu>(acc[4 * j + 2 * h + 1], acc[4 * (j + 16) + 2 * h + 1], limit, galpha);
+                float bg0 = 0.f, bg1 = 0.f, bu0 = 0.f, bu1 = 0.f;
+                if (b_e != nullptr) {
+                    bg0 = bf16_to_f32(b_e[col]);
+                    bu0 = bf16_to_f32(b_e[inter + col]);
+                    if (col + 1 < inter) {
+                        bg1 = bf16_to_f32(b_e[col + 1]);
+                        bu1 = bf16_to_f32(b_e[inter + col + 1]);
+                    }
+                }
+                const float o0 = act::glu<kGlu>(acc[4 * j + 2 * h] + bg0, acc[4 * (j + 16) + 2 * h] + bu0, limit, galpha);
+                const float o1 = act::glu<kGlu>(acc[4 * j + 2 * h + 1] + bg1, acc[4 * (j + 16) + 2 * h + 1] + bu1, limit, galpha);
                 bf16* o = out + route * inter + col;
                 if (col + 1 < inter) {
                     *reinterpret_cast<unsigned*>(o) = pack_bf16x2(o0, o1);
@@ -744,11 +756,13 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
             for (int j = 0; j < 32; ++j) {
                 const int col = col0 + 8 * j + 2 * c;
                 if (col >= n) continue;
+                const float b0 = b_e != nullptr ? bf16_to_f32(b_e[col]) : 0.f;
+                const float b1 = b_e != nullptr && col + 1 < n ? bf16_to_f32(b_e[col + 1]) : 0.f;
                 bf16* o = out + route * n + col;
                 if (col + 1 < n) {
-                    *reinterpret_cast<unsigned*>(o) = pack_bf16x2(acc[4 * j + 2 * h], acc[4 * j + 2 * h + 1]);
+                    *reinterpret_cast<unsigned*>(o) = pack_bf16x2(acc[4 * j + 2 * h] + b0, acc[4 * j + 2 * h + 1] + b1);
                 } else {
-                    o[0] = f32_to_bf16(acc[4 * j + 2 * h]);
+                    o[0] = f32_to_bf16(acc[4 * j + 2 * h] + b0);
                 }
             }
         }

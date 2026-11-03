@@ -716,6 +716,17 @@ impl Shell {
         {
             weights.shadow_mxfp4_banks(&boot.trace, device.stream())?;
         }
+        // `kernel.moe.mxfp4_bf16_from`: MXFP4 banks keep a bf16 copy on Hopper.
+        #[cfg(feature = "cuda")]
+        if device.ctx().tuning().mxfp4_bf16_from > 0
+            && kernels_cuda::jit::cache::arch() == Some("sm_90")
+        {
+            weights.copy_mxfp4_banks_bf16(
+                &boot.trace,
+                device.stream(),
+                device.ctx().tuning().mxfp4_bf16_down,
+            )?;
+        }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after weights resident",
