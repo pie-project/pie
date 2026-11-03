@@ -572,10 +572,10 @@ fn the_bf16_prefill_selects_answer_the_routed_dot() {
         let (x, xv) = b.bf16(tokens * k);
         let (bank, wv) = b.bf16(ex * rows * k);
         let mut y = b.out(count, n);
-        let ctx = b.ctx();
-        let ctx = ctx.with_tuning(Tuning {
+        let base = b.ctx().tuning();
+        let ctx = b.ctx().with_tuning(Tuning {
             bf16_ws_persist: persist,
-            ..ctx.tuning()
+            ..base
         });
         let took = moe::select_bf16_held(
             &ctx,
