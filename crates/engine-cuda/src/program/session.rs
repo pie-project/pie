@@ -140,7 +140,12 @@ impl Session {
             sink_planes: crate::adapter::sink_of(&plan.package)
                 .ok()
                 .flatten()
-                .map(|sink| sink.planes.iter().map(|&(_, channel)| channel as usize).collect())
+                .map(|sink| {
+                    sink.planes
+                        .iter()
+                        .map(|&(_, channel)| channel as usize)
+                        .collect()
+                })
                 .unwrap_or_default(),
         };
         for (channel, wire) in seeds {
