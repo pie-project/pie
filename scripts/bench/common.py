@@ -545,6 +545,12 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
              "(flashinfer_mxfp4) wants 128-multiple widths a tp4 share is not.",
     )
     p.add_argument(
+        "--sglang-flashinfer-mxfp4-moe-precision",
+        default=None,
+        help="SGLang's flashinfer_mxfp4 MoE activations. Its default on SM100 quantizes them "
+             "to MXFP8; bf16 keeps gpt-oss at pie's and vLLM's W4A16.",
+    )
+    p.add_argument(
         "--sglang-kv-cache-dtype",
         default=None,
         help="SGLang's KV cache dtype. Its auto pick for DSA models on SM100 and newer "
