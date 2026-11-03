@@ -29,6 +29,11 @@ moe.mxfp4_select_lean = true
 # Qwen3.8-Flash-Next mini unchanged, MiniMax parity KL unchanged
 moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
+# block-FP8 selects of 64 routes an expert and more on the warp-specialized wgmma GEMM, and a decode's
+# W8A16 block-FP8 select split toward 16 CTAs' warps an SM, as the H200: GLM-5.3-Flash mini8
+# pf128-512 59.8k -> 77.7k, c256 17.7k -> 19.3k, raw decode 413 -> 423, raw prefill 30.2k -> 33.2k tok/s
+moe.fp8a8_ws_from = 64
+moe.fp8_mma_fill = 16
 
 [engine]
 working_set_percent = 90  # 1.9% faster end to end
