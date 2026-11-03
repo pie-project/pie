@@ -766,8 +766,6 @@ impl Plan {
     }
 }
 
-const BN64_DOWN: bool = true;
-
 /// `y = epilogue(alpha * alpha_e[e] * act . w[e]^T)`, each row against its
 /// expert `e`'s weight: `n` the output's columns, a GLU's bank
 /// `[experts][2n][k]` (each expert's gate rows, then its up rows); `routed`
