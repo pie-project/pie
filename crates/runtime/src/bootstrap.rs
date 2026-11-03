@@ -144,6 +144,9 @@ pub struct EngineConfig {
     /// The engine asks the planner to start a process only while the pools
     /// hold the started ones to the end (`PoolFacts::seat_to_end`).
     pub seat_to_end: bool,
+    /// With `seat_to_end`, the planner paces the start of a wave the pools
+    /// hold only as lanes finishing apart (`PoolFacts::seat_paced`).
+    pub seat_paced: bool,
     pub rs_cache_slot_bytes: u64,
     pub rs_host_slots: usize,
     pub rs_buffer_pages: u32,
@@ -442,6 +445,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .is_some_and(|d| d.cpu_pages > 0 || d.disk_pages > 0);
     let seated_first = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seated_first);
     let seat_to_end = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seat_to_end);
+    let seat_paced = seat_to_end && engine_configs.iter().all(|d| d.seat_paced);
     if let Some(d) = engine_configs.first() {
         if kv_swap_capable {
             tracing::info!(
@@ -504,7 +508,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 crate::planner::RegistryPool::new(arena_model_idx, engine, kv_swap_capable),
             ))
             .seated_first(seated_first)
-            .seat_to_end(seat_to_end),
+            .seat_to_end(seat_to_end)
+            .seat_paced(seat_paced),
         );
     }
     // After the gates and the planner it orders exist.

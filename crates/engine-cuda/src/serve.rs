@@ -119,6 +119,8 @@ pub struct Shell {
     seated_first: bool,
     /// `engine.seat_to_end`.
     seat_to_end: bool,
+    /// `engine.seat_paced`.
+    seat_paced: bool,
     /// `engine.prefill_lanes`.
     prefill_lanes: u32,
     pad: bool,
@@ -395,6 +397,13 @@ impl Shell {
     #[must_use]
     pub fn seat_to_end(&self) -> bool {
         self.seat_to_end
+    }
+
+    /// Whether a lane seated to the end only beside started ones finishing
+    /// apart waits for each started one's prompt (`engine.seat_paced`).
+    #[must_use]
+    pub fn seat_paced(&self) -> bool {
+        self.seat_paced
     }
 
     /// Host rs rows: a state slot and a buffer page each, parked apart.

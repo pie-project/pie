@@ -76,6 +76,14 @@ impl ResidencyPlanner {
         self
     }
 
+    /// With `PoolFacts::seat_paced`, a process the pools hold to the end only
+    /// beside started ones finishing apart starts once each has its prompt.
+    #[must_use]
+    pub fn seat_paced(mut self, on: bool) -> Self {
+        self.inner.get_mut().to_end.paced = on;
+        self
+    }
+
     /// With `PoolFacts::seated_first`, seated growth doesn't park behind a waiting
     /// prompt, which is seated only within the rings' growth room
     /// (`PoolPort::rs_growth`) and suspends only an idle lane.
@@ -268,10 +276,14 @@ impl ResidencyPlanner {
         let (model, engine) = self.port.locus();
         let kv = held_page_count(pid, model, engine) + demand.kv_pages;
         let rs = super::holdings::held_rs_units(pid, model, engine).add(demand.rs);
-        if let Some(proc) = self.lock_inner().procs.get_mut(&pid) {
+        let mut grew = false;
+        let mut inner = self.lock_inner();
+        let paced = inner.to_end.paced;
+        if let Some(proc) = inner.procs.get_mut(&pid) {
             if proc.peak.0 == 0 && proc.peak.1.is_zero() {
                 proc.first = (kv, rs);
             }
+            grew = kv > proc.peak.0;
             proc.peak = (
                 proc.peak.0.max(kv),
                 RsUnits {
@@ -279,6 +291,11 @@ impl ResidencyPlanner {
                     pages: proc.peak.1.pages.max(rs.pages),
                 },
             );
+        }
+        drop(inner);
+        // A paced gate counts the lanes not yet grown past their prompt.
+        if paced && grew {
+            self.to_end_notify.notify_waiters();
         }
     }
 

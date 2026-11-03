@@ -102,6 +102,10 @@ pub struct PoolFacts {
     /// once and evict lanes the pools then run short for.
     #[serde(default)]
     pub seat_to_end: bool,
+    /// With `seat_to_end`, a process the pools hold only beside started ones
+    /// finishing apart waits until every started one has its prompt.
+    #[serde(default)]
+    pub seat_paced: bool,
 }
 
 impl PoolFacts {
