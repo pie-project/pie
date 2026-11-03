@@ -114,6 +114,25 @@ pub fn prefill_expanded(
         let cells = u64::from(pages) * u64::from(page);
         let cells32 = u32::try_from(cells).map_err(|_| refuse(OP, "the fire's cells overflow"))?;
         let bytes = |n: u64| usize::try_from(n * 2).unwrap_or(usize::MAX);
+        // The fire's expanded rows take scratch past the fitted pool where many
+        // lanes' pages ride one fire (Kimi-K3's 64 heads at c512: 10 GB): taken
+        // before anything is launched, a card that cannot grow them leaves the
+        // fire to the absorbed form.
+        let take = |name: &'static str, n: usize| match ctx.scratch_stream(OP, name, n) {
+            Ok(ptr) => Ok(Some(ptr as u64)),
+            Err(Error::Backend { detail, .. })
+                if detail.contains("cudaErrorMemoryAllocation growing") =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        };
+        let (Some(exp), Some(keys)) = (
+            take(EXP, bytes(cells * u64::from(width)))?,
+            take(KEYS, bytes(cells * u64::from(h.heads * dqk)))?,
+        ) else {
+            return Ok(false);
+        };
         let lat = ctx.scratch_stream(OP, LAT, bytes(cells * u64::from(h.kv_lora_rank)))? as u64;
         let kpe = ctx.scratch_stream(OP, KPE, bytes(cells * u64::from(h.rope)))? as u64;
         let ident = ctx.scratch_stream(OP, IDENT, pages as usize * 4)? as u64;
@@ -142,7 +161,6 @@ pub fn prefill_expanded(
             ],
         )?;
         // Each cell's heads expanded: `[heads][nope + v]` a cell.
-        let exp = ctx.scratch_stream(OP, EXP, bytes(cells * u64::from(width)))? as u64;
         let mut expanded = Tensor::new(exp, cells32, width, Dtype::Bf16);
         crate::linear::gemm::matmul(
             ctx,
@@ -150,7 +168,6 @@ pub fn prefill_expanded(
             kv_b,
             &mut expanded,
         )?;
-        let keys = ctx.scratch_stream(OP, KEYS, bytes(cells * u64::from(h.heads * dqk)))? as u64;
         let key_runs = cells * u64::from(h.heads) * u64::from(dqk / 8);
         ctx.fire(
             OP,
