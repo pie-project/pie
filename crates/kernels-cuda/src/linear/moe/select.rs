@@ -632,6 +632,7 @@ pub(super) fn select_plan(
     glu: bool,
     gemm: bool,
     fill: u32,
+    wide: Option<u32>,
 ) -> Result<SelectPlan, Error> {
     let nb: u32 = match fan.route_count.div_ceil(experts) {
         0..=4 => 1,
@@ -645,7 +646,7 @@ pub(super) fn select_plan(
         routes,
         fan,
         experts,
-        8 * nb,
+        wide.filter(|_| nb == 8).unwrap_or(8 * nb),
         true,
         if glu || KEEP_NEXT.with(core::cell::Cell::get) {
             Share::Keep

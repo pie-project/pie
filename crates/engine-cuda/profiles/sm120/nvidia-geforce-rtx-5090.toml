@@ -19,6 +19,10 @@ ssm.kda_step_fused = true  # 1.7% faster end to end
 # NVFP4 experts of a W4A4 release against NVFP4 rows on the block-scaled mma.sync, as the release asks:
 # MiniMax-M3.1-Flash mini raw prefill 50.9k -> 71.1k, c256 24.1k -> 29.7k, pf16-512 94.5k -> 129.5k tok/s
 moe.nvfp4_w4a4_from = 64
+# bf16 selects on the 64-route tile in two stages, two CTAs an SM in 100 KiB (three stages seat one), never the
+# 128 x 256 tile: Nemotron-3-Super mini raw prefill 13.0k -> 14.3k, pf16-512 15.9k -> 16.6k tok/s
+moe.bf16_wide_from = 65536
+moe.bf16_gemm_stages = 2
 
 # the sm_120 switches the RTX PRO 6000 runs (same chip family): bf16 and NVFP4 MoE on the grouped mma.sync
 # kernels, the single-row block-FP8 GEMV, the tensor-core attention, hyper-connection and KDA kernels, the
