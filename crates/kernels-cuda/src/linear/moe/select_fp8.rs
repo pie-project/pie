@@ -69,6 +69,20 @@ pub fn fp8_w8a8_takes(x: Tensor, n: u32) -> bool {
     x.dtype == Dtype::Bf16 && x.width > 0 && x.width.is_multiple_of(512) && n.is_multiple_of(128)
 }
 
+/// Whether [`select_fp8_w8a8`] takes a select of `x` against a bank `n`
+/// rows wide: on Hopper its wgmma kernels step K a 128-wide block at a time,
+/// so K in whole 128s (an MXFP4 bank's fp8b128 copy lays its exponents so);
+/// elsewhere as [`fp8_w8a8_takes`].
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn fp8_select_takes(x: Tensor, n: u32) -> bool {
+    if hopper_wgmma() {
+        x.dtype == Dtype::Bf16 && x.width > 0 && x.width.is_multiple_of(128) && n.is_multiple_of(128)
+    } else {
+        fp8_w8a8_takes(x, n)
+    }
+}
+
 /// `y[route] = q(x[route or its token]) . W[routes[route]]^T` for a
 /// 128x128-block FP8 bank (W8A8, `q` the rows' e4m3 1x128 quantization) on
 /// mma.sync, off tcgen05: the rows quantized once, routes laid out by expert
@@ -87,10 +101,10 @@ pub fn select_fp8_w8a8(
     const OP: &str = "linear.moe_select_fp8_w8a8";
     let fan = selected(OP, x, routes, y)?;
     let n = stated(OP, nonzero(OP, "N, the bank's output width", y.width)?)?;
-    if !fp8_w8a8_takes(x, y.width) || experts == 0 {
+    if !fp8_select_takes(x, y.width) || experts == 0 {
         return Err(refuse(
             OP,
-            "the fp8 select takes bf16 rows, K in 512s and N in 128s",
+            "the fp8 select takes bf16 rows, K in 512s (128s on Hopper) and N in 128s",
         ));
     }
     let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;

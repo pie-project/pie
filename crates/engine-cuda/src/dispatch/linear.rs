@@ -2403,7 +2403,7 @@ impl Run<'_> {
                     let route_t = self.tensor(routes);
                     let mut out = self.tensor(y);
                     if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from
-                        && linear::moe::fp8_w8a8_takes(x, out.width)
+                        && linear::moe::fp8_select_takes(x, out.width)
                     {
                         return linear::moe::select_fp8_w8a8(
                             self.ctx(),
