@@ -198,8 +198,9 @@ static_assert(kBK % 16 == 0, "kBK must be a multiple of the mma k step");
 // plane, a cell's latent and rotated e4m3 codes in one row under a scale of
 // 1, at `ckv_pages`; each staged chunk is widened to bf16 as it lands (the
 // tcgen05 sparse pass reads them otherwise).
-template <int KPE, bool kFp8 = false>
-__global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_kernel(
+// `kMt` 16-head tiles a block (one query row): its key tiles staged once for them all.
+template <int KPE, bool kFp8 = false, int kMt = 1>
+__global__ __launch_bounds__(kThreads, kMt == 1 ? PIE_MLA_MMA_MINBLK : 1) void mla_mma_paged_kernel(
     const __nv_bfloat16* __restrict__ q_nope,
     const __nv_bfloat16* __restrict__ q_pe,
     const __nv_bfloat16* __restrict__ ckv_pages,
@@ -222,14 +223,15 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     constexpr int kKpe = KPE;
     constexpr int kD = kCkv + kKpe;
     constexpr int kLdD = kD + 8;
+    constexpr int kRows = kBM * kMt;
     extern __shared__ __align__(16) char smem_raw[];
     __nv_bfloat16* sQ = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16* sKbuf = sQ + kBM * kLdD;
+    __nv_bfloat16* sKbuf = sQ + kRows * kLdD;
     __nv_bfloat16* sP = sKbuf + kStages * kBK * kLdD;
-    float* sS = reinterpret_cast<float*>(sP + kBM * kLdP);
-    float* sM = sS + kBM * kBK;
-    float* sL = sM + kBM;
-    float* sCorr = sL + kBM;
+    float* sS = reinterpret_cast<float*>(sP + kRows * kLdP);
+    float* sM = sS + kRows * kBK;
+    float* sL = sM + kRows;
+    float* sCorr = sL + kRows;
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -242,11 +244,11 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
 
     if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
-    const int h0 = blockIdx.x * kBM;
+    const int h0 = blockIdx.x * kRows;
 
     __shared__ int s_req;
     if (tid == 0) s_req = 0;
-    if (tid < kBM) { sM[tid] = -CUDART_INF_F; sL[tid] = 0.f; }
+    if (tid < kRows) { sM[tid] = -CUDART_INF_F; sL[tid] = 0.f; }
     __syncthreads();
 
     for (int i = tid; i < R; i += kThreads) {
@@ -294,7 +296,7 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const int j_hi = min(steps, j_lo + per);
 
     constexpr int kChunksPerRow = kD / 8;
-    for (int c = tid; c < kBM * kChunksPerRow; c += kThreads) {
+    for (int c = tid; c < kRows * kChunksPerRow; c += kThreads) {
         const int row = c / kChunksPerRow;
         const int d = (c % kChunksPerRow) * 8;
         const long long qh = (static_cast<long long>(t_row) * H + h0 + row);
@@ -304,11 +306,13 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
         *reinterpret_cast<int4*>(sQ + row * kLdD + d) = v;
     }
 
-    float oacc[kNTiles][4];
+    float oacc[kMt][kNTiles][4];
+    #pragma unroll
+    for (int mt = 0; mt < kMt; ++mt)
     #pragma unroll
     for (int n = 0; n < kNTiles; ++n) {
         #pragma unroll
-        for (int i = 0; i < 4; ++i) oacc[n][i] = 0.f;
+        for (int i = 0; i < 4; ++i) oacc[mt][n][i] = 0.f;
     }
     const int g = lane >> 2, p = (lane & 3) << 1;
     const int dbase = warp * kDimsPerWarp;
@@ -388,11 +392,13 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
         __syncthreads();
         const __nv_bfloat16* sK = sKbuf + stage * (kBK * kLdD);
 
-        float sacc[kSNTiles][4];
+        float sacc[kMt][kSNTiles][4];
+        #pragma unroll
+        for (int mt = 0; mt < kMt; ++mt)
         #pragma unroll
         for (int n = 0; n < kSNTiles; ++n) {
             #pragma unroll
-            for (int i = 0; i < 4; ++i) sacc[n][i] = 0.f;
+            for (int i = 0; i < 4; ++i) sacc[mt][n][i] = 0.f;
         }
         {
 
@@ -400,28 +406,33 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
                 sK + static_cast<long long>(warp * 8 * kSNTiles) * kLdD;
             #pragma unroll 2
             for (int k0 = 0; k0 < kD; k0 += 16) {
-                std::uint32_t a[4];
-                ld_a(a, sQ + k0, kLdD, lane);
+                std::uint32_t a[kMt][4];
+                #pragma unroll
+                for (int mt = 0; mt < kMt; ++mt) ld_a(a[mt], sQ + mt * kBM * kLdD + k0, kLdD, lane);
                 #pragma unroll
                 for (int n = 0; n < kSNTiles; ++n) {
                     std::uint32_t b[2];
                     ld_b(b, kbase + static_cast<long long>(n * 8) * kLdD + k0, kLdD, lane);
-                    mma_m16n8k16(sacc[n], a, b);
+                    #pragma unroll
+                    for (int mt = 0; mt < kMt; ++mt) mma_m16n8k16(sacc[mt][n], a[mt], b);
                 }
             }
         }
         #pragma unroll
+        for (int mt = 0; mt < kMt; ++mt)
+        #pragma unroll
         for (int n = 0; n < kSNTiles; ++n) {
             const int ncol = (warp * kSNTiles + n) * 8 + p;
-            sS[g * kBK + ncol] = sacc[n][0];
-            sS[g * kBK + ncol + 1] = sacc[n][1];
-            sS[(g + 8) * kBK + ncol] = sacc[n][2];
-            sS[(g + 8) * kBK + ncol + 1] = sacc[n][3];
+            const int r0 = mt * kBM + g;
+            sS[r0 * kBK + ncol] = sacc[mt][n][0];
+            sS[r0 * kBK + ncol + 1] = sacc[mt][n][1];
+            sS[(r0 + 8) * kBK + ncol] = sacc[mt][n][2];
+            sS[(r0 + 8) * kBK + ncol + 1] = sacc[mt][n][3];
         }
         __syncthreads();
 
         {
-            constexpr int kSubs = kThreads / kBM;
+            constexpr int kSubs = kThreads / kRows;
             constexpr int kColsPerSub = kBK / kSubs;
             const int row = tid / kSubs;
             const int sub = tid % kSubs;
@@ -468,21 +479,26 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
         }
         __syncthreads();
 
-        const float c0 = sCorr[g], c1 = sCorr[g + 8];
         #pragma unroll
-        for (int n = 0; n < kNTiles; ++n) {
-            oacc[n][0] *= c0; oacc[n][1] *= c0;
-            oacc[n][2] *= c1; oacc[n][3] *= c1;
+        for (int mt = 0; mt < kMt; ++mt) {
+            const float c0 = sCorr[mt * kBM + g], c1 = sCorr[mt * kBM + g + 8];
+            #pragma unroll
+            for (int n = 0; n < kNTiles; ++n) {
+                oacc[mt][n][0] *= c0; oacc[mt][n][1] *= c0;
+                oacc[mt][n][2] *= c1; oacc[mt][n][3] *= c1;
+            }
         }
         #pragma unroll
         for (int k0 = 0; k0 < kBK; k0 += 16) {
-            std::uint32_t a[4];
-            ld_a(a, sP + k0, kLdP, lane);
+            std::uint32_t a[kMt][4];
+            #pragma unroll
+            for (int mt = 0; mt < kMt; ++mt) ld_a(a[mt], sP + mt * kBM * kLdP + k0, kLdP, lane);
             #pragma unroll
             for (int n = 0; n < kNTiles; ++n) {
                 std::uint32_t b[2];
                 ld_b_trans(b, sK + static_cast<long long>(k0) * kLdD + dbase + n * 8, kLdD, lane);
-                mma_m16n8k16(oacc[n], a, b);
+                #pragma unroll
+                for (int mt = 0; mt < kMt; ++mt) mma_m16n8k16(oacc[mt][n], a[mt], b);
             }
         }
     }
@@ -493,23 +509,26 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     __nv_bfloat16* o_at = split ? part_o : o;
     const long long unit =
         split ? static_cast<long long>(t_row) * splits + blockIdx.z : static_cast<long long>(t_row);
-    if (lse_at != nullptr && tid < kBM) {
+    if (lse_at != nullptr && tid < kRows) {
         const float l = sL[tid];
         lse_at[unit * H + h0 + tid] =
             (l > 0.f) ? (sM[tid] + logf(l)) * 1.4426950408889634f : -CUDART_INF_F;
     }
-    const float l0 = sL[g], l1 = sL[g + 8];
+    #pragma unroll
+    for (int mt = 0; mt < kMt; ++mt) {
+    const float l0 = sL[mt * kBM + g], l1 = sL[mt * kBM + g + 8];
     const float i0 = (l0 > 0.f) ? (1.f / l0) : 0.f;
     const float i1 = (l1 > 0.f) ? (1.f / l1) : 0.f;
-    __nv_bfloat16* o0 = o_at + (unit * H + h0 + g) * kCkv;
-    __nv_bfloat16* o1 = o_at + (unit * H + h0 + g + 8) * kCkv;
+    __nv_bfloat16* o0 = o_at + (unit * H + h0 + mt * kBM + g) * kCkv;
+    __nv_bfloat16* o1 = o_at + (unit * H + h0 + mt * kBM + g + 8) * kCkv;
     #pragma unroll
     for (int n = 0; n < kNTiles; ++n) {
         const int d = dbase + n * 8 + p;
-        o0[d] = __float2bfloat16(oacc[n][0] * i0);
-        o0[d + 1] = __float2bfloat16(oacc[n][1] * i0);
-        o1[d] = __float2bfloat16(oacc[n][2] * i1);
-        o1[d + 1] = __float2bfloat16(oacc[n][3] * i1);
+        o0[d] = __float2bfloat16(oacc[mt][n][0] * i0);
+        o0[d + 1] = __float2bfloat16(oacc[mt][n][1] * i0);
+        o1[d] = __float2bfloat16(oacc[mt][n][2] * i1);
+        o1[d + 1] = __float2bfloat16(oacc[mt][n][3] * i1);
+    }
     }
 }
 

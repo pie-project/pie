@@ -197,6 +197,11 @@ fn plan(gpu: &mut Gpu, case: &Case, device: &Device) -> MlaPlan {
     plan
 }
 
+thread_local! {
+    /// The tensor-core kernel's 16-head tiles a block (`kernel.mla.mma_tiles`).
+    static TILES: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+}
+
 /// Scores and log-sum-exp, `tc` choosing the tcgen05 pass; `window` is
 /// `(live, base)` over the rows.
 fn score(
@@ -234,6 +239,7 @@ fn score(
     let ctx = gpu.ctx().with_tuning(Tuning {
         mla_naive: true,
         mla_sparse: tc,
+        mla_mma_tiles: TILES.with(std::cell::Cell::get),
         ..Tuning::DEFAULT
     });
     if let Some((live, base)) = window {
@@ -394,6 +400,18 @@ fn the_sparse_mla_lands_on_tcgen05() {
     check(64, Some((30, 25)), false, false);
     // The decode arm sees the request's keys, not the row's own prefix: the
     // selections here read none past a row's position, so both answer alike.
+    check(64, None, true, false);
+}
+
+/// The tensor-core kernel at two 16-head tiles a block lands what one does.
+#[test]
+fn the_mla_mma_kernel_lands_alike_at_two_head_tiles() {
+    TILES.with(|t| t.set(2));
+    for rope in [64, 0] {
+        check(rope, None, false, false);
+        check(rope, None, false, true);
+    }
+    check(64, Some((30, 25)), false, false);
     check(64, None, true, false);
 }
 

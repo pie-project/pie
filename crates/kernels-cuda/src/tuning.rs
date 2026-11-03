@@ -369,6 +369,13 @@ pub struct MoeMxfp4Bf16Down;
 #[decision(id = "kernel.moe.mxfp4_bf16_keep", constant(range(0..=100)), default = 0, tune = search)]
 pub struct MoeMxfp4Bf16Keep(pub u32);
 
+/// The 16-head tiles a block of the tensor-core latent attention
+/// (`mla_mma_paged_kernel`) takes, 1 or 2: two stage each key tile once for
+/// 32 heads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.mla.mma_tiles", constant(range(1..=2)), default = 1, tune = search)]
+pub struct MlaMmaTiles(pub u32);
+
 /// The fewest routes an MXFP4 select runs W4A8 on sm_120a's block-scaled
 /// mma.sync, its rows quantized as MXFP8 (as SGLang reads MXFP4 experts on
 /// the consumer Blackwells). 0: never.
@@ -912,6 +919,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4Fp8From>()
         .add::<MoeMxfp4Bf16From>()
         .add::<MoeMxfp4Bf16Down>()
+        .add::<MlaMmaTiles>()
         .add::<MoeFp8a8WsFrom>()
         .add::<MoeFp8a8WsNarrow>()
         .add::<MoeFp8MmaFill>()
@@ -1062,6 +1070,7 @@ tuning! {
     mxfp4_fp8_from: u32 = 0, get MoeMxfp4Fp8From;
     mxfp4_bf16_from: u32 = 0, get MoeMxfp4Bf16From;
     mxfp4_bf16_down: bool = false, on MoeMxfp4Bf16Down;
+    mla_mma_tiles: u32 = 1, get MlaMmaTiles;
     fp8a8_ws_from: u32 = 0, get MoeFp8a8WsFrom;
     fp8a8_ws_narrow: bool = false, on MoeFp8a8WsNarrow;
     fp8_mma_fill: u32 = 4, get MoeFp8MmaFill;

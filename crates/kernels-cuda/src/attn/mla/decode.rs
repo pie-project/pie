@@ -109,9 +109,17 @@ pub(crate) mod naive {
             && (!selected || shape.top_k > 0)
             && mma_supported(shape.kv_lora_rank, shape.rope_dim, shape.num_heads)
         {
+            // `kernel.mla.mma_tiles` 16-head tiles a block, where the heads
+            // split into them: each key tile staged once for them all.
+            let tiles = ctx.tuning().mla_mma_tiles.clamp(1, 2);
+            let tiles = if shape.num_heads % (MMA_BM * tiles as i32) == 0 {
+                tiles
+            } else {
+                1
+            };
             #[allow(clippy::cast_sign_loss)]
             let (blocks, rows, heads) = (
-                (shape.num_heads / MMA_BM).max(0) as u32,
+                (shape.num_heads / (MMA_BM * tiles as i32)).max(0) as u32,
                 shape.total_tokens.max(0) as u32,
                 shape.num_heads.max(0) as u32,
             );
@@ -134,16 +142,17 @@ pub(crate) mod naive {
             } else {
                 (0, 0)
             };
-            let launch =
-                Launch::grid([blocks, rows, splits], [MMA_THREADS, 1, 1]).smem(MMA_SMEM_BYTES);
+            // A second tile's query, probabilities, scores and row stats.
+            let smem = MMA_SMEM_BYTES + (tiles - 1) * 25_280;
+            let launch = Launch::grid([blocks, rows, splits], [MMA_THREADS, 1, 1]).smem(smem);
             ctx.fire(
                 op,
                 Fire::at(kernel(
                     DECODE_SM80,
                     &format!(
-                        "::pie::attn::mla::mla_naive::mma_detail::mla_mma_paged_kernel<{}{}>",
+                        "::pie::attn::mla::mla_naive::mma_detail::mla_mma_paged_kernel<{}, {}, {tiles}>",
                         shape.rope_dim,
-                        if shape.fp8 { ", true" } else { "" }
+                        shape.fp8
                     ),
                 ))
                 .apply(launch),
