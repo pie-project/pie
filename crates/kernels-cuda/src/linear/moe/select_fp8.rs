@@ -99,6 +99,63 @@ pub fn select_fp8_w8a8(
     // On Hopper, wgmma (sm_90a): an expert's slice 32 routes, or 64 past an
     // average of 16, at about the card's rate either way, so a busy expert's
     // routes rarely spill into a second read of its codes.
+    // A prefill's busy experts on the warp-specialized GEMM
+    // (`kernel.moe.fp8a8_ws_from`): 128 routes by 128 weight rows a CTA.
+    let ws_from = ctx.tuning().fp8a8_ws_from;
+    if hopper_wgmma() && ws_from > 0 && per >= ws_from {
+        // Two 128-row halves a CTA where N is whole 256s (the routes' rows
+        // read half as often), four stages; one, six stages.
+        let halves: u32 = if y.width.is_multiple_of(256) && !ctx.tuning().fp8a8_ws_narrow {
+            2
+        } else {
+            1
+        };
+        let stages: u32 = if halves == 2 { 4 } else { 6 };
+        let RouteOrder {
+            order,
+            offsets,
+            work,
+            work_cap,
+        } = route_order_sliced(
+            ctx,
+            OP,
+            routes,
+            &fan,
+            experts,
+            128,
+            true,
+            if KEEP_NEXT.with(core::cell::Cell::get) {
+                Share::Keep
+            } else {
+                Share::Take
+            },
+        )?;
+        return ctx.fire(
+            OP,
+            Fire::at(kernel(
+                SELECT_SM90,
+                &format!("::pie::linear::moe_select_fp8a8_wsgemm<{stages}, {halves}>"),
+            ))
+            .apply(
+                Launch::grid([work_cap, y.width / (128 * halves), 1], [384, 1, 1])
+                    .smem(stages * 16384 * (1 + halves) + 1024 + 128),
+            ),
+            &[
+                ArgValue::Ptr(xq),
+                ArgValue::Ptr(xe),
+                ArgValue::Ptr(order),
+                ArgValue::Ptr(offsets),
+                ArgValue::Ptr(work),
+                ArgValue::Ptr(codes),
+                ArgValue::Ptr(atoms),
+                y.arg(),
+                act_div.arg(),
+                n.arg(),
+                stated(OP, x.width)?.arg(),
+                stated(OP, experts)?.arg(),
+            ],
+        );
+    }
     if hopper_wgmma() {
         let slice: u32 = if per <= 16 { 32 } else { 64 };
         let RouteOrder {
@@ -481,7 +538,7 @@ pub fn select_fp8_w8a16(
     glu: Option<crate::linear::gemm_sm100::Glu>,
 ) -> Result<(), Error> {
     const THREADS: u32 = 128;
-    const DEPTH: u32 = 4;
+    let depth = ctx.tuning().fp8_mma_depth;
     let fan = selected(op, x, routes, y)?;
     if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
         return Err(refuse(op, "a W8A16 select reads and lands bf16 rows"));
@@ -517,7 +574,7 @@ pub fn select_fp8_w8a16(
         y,
         glu.is_some(),
         fan.route_count >= FP8_GEMM_FROM,
-        4,
+        ctx.tuning().fp8_mma_fill,
     )?;
     let fire = if tiled {
         // Three stages of 64 routes' activations and 128 rows' codes, 64 of
@@ -536,7 +593,7 @@ pub fn select_fp8_w8a16(
     } else {
         let cols = if glu.is_some() { 64 } else { 64 * tiles };
         Fire::at(kernel(SELECT_SM80, &format!(
-                "::pie::linear::moe_select_fp8_mma<{nb}, {DEPTH}, {code}, {gran}, {tiles}, {ksplit}>"
+                "::pie::linear::moe_select_fp8_mma<{nb}, {depth}, {code}, {gran}, {tiles}, {ksplit}>"
             )))
         .apply(Launch::grid(
             [order.work_cap, y.width.div_ceil(cols), 1],
