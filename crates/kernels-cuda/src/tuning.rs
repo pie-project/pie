@@ -46,7 +46,7 @@ pub struct MoeMxfp4MmaUntil(pub u32);
 /// dequantized in registers on mma.sync); never (until 0) but where a
 /// chip's profile says (B200's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.nvfp4_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
+#[decision(id = "kernel.moe.nvfp4_mma_until", constant(range(0..=16_777_216)), default = 0, tune = search)]
 pub struct MoeNvfp4MmaUntil(pub u32);
 
 /// The most rows a router's product and its top-k run as one tcgen05 launch
