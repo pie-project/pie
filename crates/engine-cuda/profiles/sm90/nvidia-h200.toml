@@ -28,9 +28,17 @@ moe.fp8_mma_fill = 16
 # GLM-5.3's DSA attention 64 heads a CTA on wgmma, not the 16-head mma.sync kernel:
 # mini78 pf16-512 6.06k -> 6.89k, c1024 3.47k -> 3.85k, raw prefill 4.82k -> 5.17k tok/s, parity KL 0.0153 -> 0.0160
 sdpa.mla_wgmma = true
+# NVFP4 experts on the register-dequant wgmma select past 16 routes (as the H100), two warpgroups on
+# 128-route slices from 128 routes an expert, and a fire's working set up to 70% of the memory past the
+# weights (at the default half MiniMax's fires were cut to 1024 tokens and 256 lanes):
+# MiniMax-M3.1-Flash mini60 pf32-512 6.18k -> 10.2k, c512 2.32k -> 3.0k tok/s, raw prefill and decode unchanged
+moe.nvfp4_mma_from = 17
+moe.nvfp4_mma_until = 65536
+moe.nvfp4_wide_from = 128
 
 [engine]
 prefill_lattice_from = 192  # 2.0% faster end to end
+working_set_percent = 70
 # two recurrent-state slots a lane, so a hybrid trunk seats past the fixed 256, as on the RTX PRO 6000:
 # Qwen3.8-Flash-Next mini c512 54.4k -> 65.8k tok/s, single-stream greedy tokens unchanged
 state_slots_per_lane = 2
