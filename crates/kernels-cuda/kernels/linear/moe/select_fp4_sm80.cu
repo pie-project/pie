@@ -295,12 +295,14 @@ __global__ void __launch_bounds__(32 * kWarps) moe_select_mxfp4_mma_staged(
             bool wide = false;
 #pragma unroll
             for (int t = 0; t < kTiles; ++t) wide |= cs[t][0] > 128u || cs[t][1] > 128u;
+            // n8 blocks past the slice's routes multiply nothing the land keeps
+            const int blocks = (count + 7) >> 3;
             if constexpr (kNv) {
-                w4mma::compute_staged<false, true>(cw, cs, xs, g, c, acc);
+                w4mma::compute_staged<false, true>(cw, cs, xs, g, c, acc, blocks);
             } else if (__any_sync(0xffffffffu, wide)) {
-                w4mma::compute_staged<true, false>(cw, cs, xs, g, c, acc);
+                w4mma::compute_staged<true, false>(cw, cs, xs, g, c, acc, blocks);
             } else {
-                w4mma::compute_staged<false, false>(cw, cs, xs, g, c, acc);
+                w4mma::compute_staged<false, false>(cw, cs, xs, g, c, acc, blocks);
             }
         }
         stage(ch + kStages - 1);
