@@ -150,15 +150,31 @@ def fetch_bytes(repo: str, revision: str, name: str,
 
 def fetch_to_file(repo: str, revision: str, name: str, dest: Path,
                   start: int, end: int) -> None:
-    headers = {"Range": f"bytes={start}-{end - 1}"}
+    # A span in 64 MiB pieces on eight connections: one connection to the
+    # hub carries ~4 MB/s from some hosts, eight carry eight times that.
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with _urlopen(file_url(repo, revision, name), headers) as resp, tmp.open("wb") as out:
-        while True:
-            buf = resp.read(CHUNK)
-            if not buf:
-                break
-            out.write(buf)
-    got, want = tmp.stat().st_size, end - start
+    piece = 64 << 20
+    with tmp.open("wb") as out:
+        out.truncate(end - start)
+
+    def part(lo: int) -> int:
+        hi = min(lo + piece, end)
+        headers = {"Range": f"bytes={lo}-{hi - 1}"}
+        n = 0
+        with _urlopen(file_url(repo, revision, name), headers) as resp, tmp.open("r+b") as out:
+            out.seek(lo - start)
+            while True:
+                buf = resp.read(CHUNK)
+                if not buf:
+                    break
+                out.write(buf)
+                n += len(buf)
+        return n
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(8) as pool:
+        got = sum(pool.map(part, range(start, end, piece)))
+    want = end - start
     if got != want:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(f"{name}[{start}:{end}] short read: {got} != {want}")
