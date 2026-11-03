@@ -47,7 +47,7 @@ prefill_lattice_from = 192  # 2.0% faster end to end
 working_set_percent = 70
 # fires of 16384 rows, not 8192, as the B200: Qwen3.6-35B-A3B pf32-512 54.5k -> 57.6k, Qwen3-0.6B pf128-512
 # 406k -> 419k, gemma-4-26B-A4B pf64-512 52.5k -> 54.1k, MiniMax mini60 pf32-512 10.2k -> 10.4k tok/s;
-# Qwen3.6 c512 12.6k -> 12.8k
+# Qwen3.6 c512 12.6k -> 12.8k, gemma-4-26B-A4B c1024 14.1k -> 14.6k
 forward_tokens = 16384
 # two recurrent-state slots a lane, so a hybrid trunk seats past the fixed 256, as on the RTX PRO 6000:
 # Qwen3.8-Flash-Next mini c512 54.4k -> 65.8k tok/s, single-stream greedy tokens unchanged
