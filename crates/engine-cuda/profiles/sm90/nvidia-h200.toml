@@ -25,6 +25,10 @@ moe.mxfp4_bf16_keep = 25
 moe.fp8a8_ws_from = 64
 # a decode's W8A16 block-FP8 select split toward 16 CTAs' warps an SM: GLM-5.3 mini78 raw decode 45 -> 50 tok/s
 moe.fp8_mma_fill = 16
+# NVFP4 selects of 16 routes and more on the staged wgmma select (W4A16), not the grouped mma.sync one:
+# MiniMax-M3.1 mini60 pf32-512 GPU time 14.6 -> 7.9 s
+moe.nvfp4_mma_from = 16
+moe.nvfp4_mma_until = 16777216
 
 [engine]
 prefill_lattice_from = 192  # 2.0% faster end to end
