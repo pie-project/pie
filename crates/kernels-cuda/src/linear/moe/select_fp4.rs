@@ -205,11 +205,14 @@ pub(super) fn select_mxfp4_mma(
         && tensor_scales.is_none()
         && crate::jit::cache::arch() == Some("sm_89")
         && x.width.is_multiple_of(64);
+    let nvfp4_wide_from = ctx.tuning().nvfp4_wide_from;
     let wide = staged
         && hopper_wgmma()
-        && tensor_scales.is_none()
         && x.width.is_multiple_of(64)
-        && per >= WGMMA_WIDE_FROM;
+        && match tensor_scales {
+            None => per >= WGMMA_WIDE_FROM,
+            Some(_) => nvfp4_wide_from > 0 && per >= nvfp4_wide_from,
+        };
     let nb: u32 = match per {
         _ if wide => 16,
         _ if staged => 8,
