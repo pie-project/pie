@@ -61,9 +61,23 @@ prefill_lattice_from = 384  # 2.9% faster end to end
 working_set_percent = 75  # 4.9% faster end to end
 walk_fire_rows = 1024
 fire_rows = 5120
-state_slots_per_lane = 2
+# one recurrent-state slot a lane, as the RTX PRO 4500 (the PRO 6000 asks two): on 32 GB the doubled KDA slab seated
+# Kimi-K3 mini4 229 sequences, c256 8.22k -> 9.09k tok/s, Qwen3.8-27B mini20 c128 3.48k -> 4.16k; unstated, a fixed
+# 256 slots left Qwen3.8-27B's kv pages one sequence at c128 (505 tok/s); Nemotron-3-Super, Qwen3.8-Flash-Next unchanged
+state_slots_per_lane = 1
 prefill_lanes = 64
-window_spare = true
+# a process starts only while the pools hold the started ones to the end, as vLLM queues (pie #1332):
+# gemma-4-26b-a4b mini c128 3.02k -> 4.17k, gemma-4-e4b c512 8.55k -> 9.49k, qwen3-0.6b c512 22.0k -> 30.3k tok/s
+seated_first = true
+seat_to_end = true
+# seated to the end, a lane holds as many windowed pages as kv pages: no spare ring page a lane (pie #1340). The
+# spare pages took ~4 GB beside Gemma-4-31B mini18's 20.5 GB and it did not boot; gemma-4-26b-a4b mini c128
+# 4.17k -> 4.93k tok/s, gpt-oss-20b c512 11.19k / 11.14k, pf16-512 32.5k / 32.1k
+window_spare = false
+# graph bodies held to 1 GiB, not a quarter of what is past the weights (1.4-4 GiB on 32 GB; every model here arms
+# all its compositions in under 200 MiB), the rest for the cache rows: gemma-4-31b mini18 c128 2.39k -> 2.94k,
+# gemma-4-26b-a4b mini c128 5.58k -> 5.70k tok/s
+recording = { use = "bodies", mem_mb = 1024 }
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 27.7 -> 27.1 ms, 1-lane step 2.87 -> 2.80 ms, 4-lane step 4.45 -> 4.23 ms, 8-lane step 6.93 -> 6.79 ms, readout cosine 1.0000"
