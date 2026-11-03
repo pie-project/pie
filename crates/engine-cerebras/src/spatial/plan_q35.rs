@@ -40,10 +40,11 @@ pub struct GdnUnit {
     pub mlp_chunk: usize,
 }
 
-/// serve2d's fitted fixed bytes a PE (code, runtime, collectives), which
-/// the units share; a lane's misc scratch as serve2d's.
-const FIXED: usize = 24_984;
-const LANE_MISC: usize = 50;
+/// The GDN unit's fixed bytes a PE (code, runtime, collectives) and a
+/// lane's misc scratch, fitted to its links at P 128: 30,112 B at B 1 and
+/// 39,120 B at B 8 (the model: 30,240 and 39,680).
+const FIXED: usize = 22_384;
+const LANE_MISC: usize = 82;
 
 impl GdnUnit {
     /// A column's projection outputs: q and k (`DK` each), v and z (`VH x
@@ -263,7 +264,7 @@ impl Q35Plan {
             ));
         };
         blockers.push(
-            "the qwen35 units' CSL (qwen35_gdn, qwen35_attn) is not built: no program yet".into(),
+            "no design places the qwen35 units (qwen35_gdn, qwen35_attn): no program yet".into(),
         );
         Ok(Q35Plan {
             spec: spec.clone(),
@@ -353,6 +354,45 @@ mod tests {
         assert_eq!((a.gs, a.dc, a.qh, p.attn.rot), (64, 4, 4, 64));
         assert!(g.bytes() <= p.pe_bytes, "gdn {}", g.bytes());
         assert!(p.attn.bytes() <= p.pe_bytes, "attn {}", p.attn.bytes());
+        // The memory models against the units' links at these dims.
+        let at = |b: usize, nb: usize| {
+            let (gg, mut aa) = (
+                GdnUnit {
+                    lanes: b,
+                    mlp_chunk: b.min(2),
+                    ..g
+                },
+                p.attn,
+            );
+            aa.grid = Grid {
+                lanes: b,
+                blocks: nb,
+                mlp_chunk: b.min(2),
+                ..aa.grid
+            };
+            (gg.bytes(), aa.bytes())
+        };
+        println!(
+            "models: B1 NB8 {:?} B8 NB8 {:?} B8 NB4 {:?}",
+            at(1, 8),
+            at(8, 8),
+            at(8, 4)
+        );
+        for (b, nb, gdn, attn) in [
+            (1, 8, 30_112, 34_240),
+            (8, 8, 39_120, 41_424),
+            (8, 4, 39_120, 39_376),
+        ] {
+            let (mg, ma) = at(b, nb);
+            assert!(
+                mg >= gdn && mg <= gdn + 1024,
+                "gdn B {b}: model {mg}, link {gdn}"
+            );
+            assert!(
+                ma >= attn && ma <= attn + 3072,
+                "attn B {b} NB {nb}: model {ma}, link {attn}"
+            );
+        }
         assert_eq!(
             p.kinds
                 .iter()
@@ -366,7 +406,7 @@ mod tests {
         assert!(p.head.vr * p.head.hh >= 248_320);
         // The CSL is the one blocker left.
         assert_eq!(p.blockers.len(), 1, "{:?}", p.blockers);
-        assert!(p.blockers[0].contains("not built"));
+        assert!(p.blockers[0].contains("no design"));
         let prm = p.params();
         let get = |k: &str| prm.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
         assert_eq!(get("KINDS"), Some(0x888888));
