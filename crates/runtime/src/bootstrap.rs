@@ -423,6 +423,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let seat_to_end = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seat_to_end);
     let preempt_newest =
         !engine_configs.is_empty() && engine_configs.iter().all(|d| d.preempt_newest);
+    // AB-ONLY
+    let ab = |k: &str, d: bool| std::env::var(k).map_or(d, |v| v == "1");
+    let seat_to_end = ab("PIE_AB_SEAT_TO_END", seat_to_end);
+    let preempt_newest = ab("PIE_AB_PREEMPT_NEWEST", preempt_newest);
+    let seated_first = ab("PIE_AB_SEATED_FIRST", seated_first);
     if let Some(d) = engine_configs.first() {
         if kv_swap_capable {
             tracing::info!(
