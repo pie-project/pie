@@ -243,7 +243,7 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
     static_assert(kKind >= 0 && kKind <= 3, "four kinds");
     static_assert(kPair == 1 || (kPair == 2 && !kSwap && kBN >= 64), "a pair splits a wide Q");
     static_assert(kGroup == 0 ||
-                      (((kGroup == 1) == !kSwap || (kGroup == 1 && (kMix != 0 || kKind == 2 || kKind == 3))) &&
+                      (((kGroup == 1) == !kSwap || (kGroup == 1 && (kMix != 0 || kKind == 0 || kKind == 2 || kKind == 3))) &&
                        (kGroup == 1 || kPair == 1)),
                   "contiguous groups run unswapped (a W4A16 or NVFP4 one swapped too), masked "
                   "swapped on lone CTAs");
