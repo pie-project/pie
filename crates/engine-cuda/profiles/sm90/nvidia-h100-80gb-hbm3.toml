@@ -43,6 +43,11 @@ moe.nvfp4_mma_until = 65536
 # pf128-512 59.8k -> 77.7k, c256 17.7k -> 19.3k, raw decode 413 -> 423, raw prefill 30.2k -> 33.2k tok/s
 moe.fp8a8_ws_from = 64
 moe.fp8_mma_fill = 16
+# and two chunks in flight a warp, not four; GLM-5.3's DSA attention 64 heads a CTA on wgmma, from 64
+# rows, as the H200: GLM-5.3 mini78 pf32-512 5.80k -> 6.61k, c256 2.32k -> 2.50k, raw decode 43 -> 46, raw prefill 4.33k -> 4.79k tok/s
+moe.fp8_mma_depth = 2
+sdpa.mla_wgmma = true
+sdpa.mla_wgmma_rows = 64
 
 [engine]
 working_set_percent = 90  # 1.9% faster end to end

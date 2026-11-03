@@ -290,6 +290,13 @@ pub struct MoeMxfp4Cvt;
 #[decision(id = "kernel.moe.mxfp4_cvt_ksplit_until", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4CvtKsplitUntil(pub u32);
 
+/// The most routes an expert averages that the register-held mxfp4 select
+/// takes; past it, the shared-memory-staged one (16 but where a chip's
+/// profile says).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_staged_from", constant(range(0..=65_536)), default = 16, tune = search)]
+pub struct MoeMxfp4StagedFrom(pub u32);
+
 /// The most routes an expert averages that the shared-memory-staged mxfp4
 /// select (`moe_select_mxfp4_mma_staged`) stages in slices of 32 routes,
 /// not 64: past its expert's routes a slice multiplies empty n8 blocks. 0:
@@ -945,6 +952,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4Cvt>()
         .add::<MoeMxfp4CvtKsplitUntil>()
         .add::<MoeMxfp4StagedNarrowUntil>()
+        .add::<MoeMxfp4StagedFrom>()
         .add::<GemmFp8ODown>()
         .add::<MoeMxfp4A8Until>()
         .add::<MoeMxfp4A8From>()
@@ -1100,6 +1108,7 @@ tuning! {
     mxfp4_cvt: bool = false, on MoeMxfp4Cvt;
     mxfp4_cvt_ksplit_until: u32 = 0, get MoeMxfp4CvtKsplitUntil;
     mxfp4_staged_narrow_until: u32 = 0, get MoeMxfp4StagedNarrowUntil;
+    mxfp4_staged_from: u32 = 16, get MoeMxfp4StagedFrom;
     fp8_o_down: bool = false, on GemmFp8ODown;
     mxfp4_a8_until: u32 = 0, get MoeMxfp4A8Until;
     mxfp4_a8_from: u32 = 0, get MoeMxfp4A8From;
