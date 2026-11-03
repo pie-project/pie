@@ -39,6 +39,12 @@ moe.mxfp4_mma_per_from = 4
 
 [engine]
 seated_first = true
+# a process starts only while the pools hold the started ones to the end, the windowed ring a page a
+# lane past its kv pages, as on the RTX PRO 6000 and the H200 (Gemma-4 under the L4's KV pressure)
+seat_to_end = true
+window_spare = true
+# a fire's working set may take 65% of the 24 GB card past the weights, as on the RTX 4090
+working_set_percent = 65
 recording = { use = "bodies", mem_mb = 1024 }
 forward_tokens = 2304
 prefill_lattice_steps = 8
