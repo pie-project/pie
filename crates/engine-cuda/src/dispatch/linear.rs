@@ -2557,6 +2557,7 @@ impl Run<'_> {
             && linear::moe::FP8_W8A8_DENSE.contains(&act.rows)
             && linear::moe::fp8_w8a8_capable()
             && linear::moe::fp8_w8a8_takes(act, out.width)
+            && linear::gemm::cublas_lt_fp8::rows_share_blocks(op, atoms.ptr, out.width, k)?
         {
             return linear::moe::matmul_fp8_w8a8(self.ctx(), act, codes.ptr, atoms.ptr, &mut out);
         }
