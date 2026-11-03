@@ -338,6 +338,13 @@ pub struct MoeMxfp4Bf16From(pub u32);
 #[decision(id = "kernel.moe.mxfp4_bf16_down", flag, default = false, tune = search)]
 pub struct MoeMxfp4Bf16Down;
 
+/// The percent of the device memory free before the bf16 copies
+/// (`kernel.moe.mxfp4_bf16_from`) that they leave free, a bank skipped where
+/// its copy would take more: the cache rows keep that much. 0: no floor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_bf16_keep", constant(range(0..=100)), default = 0, tune = search)]
+pub struct MoeMxfp4Bf16Keep(pub u32);
+
 /// The fewest routes an MXFP4 select runs W4A8 on sm_120a's block-scaled
 /// mma.sync, its rows quantized as MXFP8 (as SGLang reads MXFP4 experts on
 /// the consumer Blackwells). 0: never.
@@ -874,6 +881,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4Fp8From>()
         .add::<MoeMxfp4Bf16From>()
         .add::<MoeMxfp4Bf16Down>()
+        .add::<MoeMxfp4Bf16Keep>()
         .add::<MoeMxfp4W4a8From>()
         .add::<MoeMxfp4W4a8Tma>()
         .add::<MoeMxfp4W4a8Ws>()
@@ -1018,6 +1026,7 @@ tuning! {
     mxfp4_fp8_from: u32 = 0, get MoeMxfp4Fp8From;
     mxfp4_bf16_from: u32 = 0, get MoeMxfp4Bf16From;
     mxfp4_bf16_down: bool = false, on MoeMxfp4Bf16Down;
+    mxfp4_bf16_keep: u32 = 0, get MoeMxfp4Bf16Keep;
     mxfp4_w4a8_from: u32 = 0, get MoeMxfp4W4a8From;
     mxfp4_w4a8_tma: bool = false, on MoeMxfp4W4a8Tma;
     mxfp4_w4a8_ws: bool = false, on MoeMxfp4W4a8Ws;

@@ -1435,6 +1435,7 @@ impl Weights {
         trace: &Trace,
         stream: *mut core::ffi::c_void,
         down_too: bool,
+        keep_percent: u32,
     ) -> Result<u32> {
         // SAFETY: `stream` is the load's stream, live for the load.
         let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
@@ -1483,6 +1484,10 @@ impl Weights {
                 }
             }
         }
+        // The free memory the copies leave (`kernel.moe.mxfp4_bf16_keep`).
+        let floor = crate::device::alloc::free_bytes()
+            .filter(|_| keep_percent > 0)
+            .map(|free| free / 100 * u64::from(keep_percent));
         let mut done = 0;
         for at in read {
             if trace.params[at].dtype != Dtype::Mxfp4 || self.table.3.contains_key(&at) {
@@ -1511,6 +1516,11 @@ impl Weights {
                 || crate::device::alloc::is_host_pointer(scales.ptr)
                 || rows == 0
                 || !k.is_multiple_of(64)
+            {
+                continue;
+            }
+            if let Some(floor) = floor
+                && crate::device::alloc::free_bytes().is_none_or(|free| free < floor + rows * k * 2)
             {
                 continue;
             }
