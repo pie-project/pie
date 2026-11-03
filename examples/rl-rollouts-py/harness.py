@@ -169,9 +169,11 @@ async def run_pie(rows: list[dict], cfg: dict, args) -> list[dict]:
                         return {"error": str(value)[-800:]}
 
             try:
-                return await asyncio.wait_for(result(), args.timeout)
+                res = await asyncio.wait_for(result(), args.timeout)
             except asyncio.TimeoutError:
-                return {"error": f"no answer after {args.timeout} s"}
+                res = {"error": f"no answer after {args.timeout} s"}
+            print(json.dumps({"done": row["id"], "seconds": res.get("seconds"), "error": res.get("error")}), flush=True)
+            return res
 
     return await asyncio.gather(*[one(r) for r in rows])
 
