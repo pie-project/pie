@@ -40,8 +40,15 @@ pub fn fp8_block_gemv(
     {
         return Ok(false);
     }
-    // Warps a row group: each at least two 512-code passes of K.
-    let splits = (k / 1024).clamp(1, WARPS).next_power_of_two().min(WARPS);
+    // Warps a row group: each at least two 512-code passes of K, and the same
+    // number of them where a split divides the passes (6144: four warps of
+    // three, not eight of one or two, MiniMax-M3's projections 25% faster on
+    // an A100 decode).
+    let passes = k / 512;
+    let splits = (1..=WARPS.min((k / 1024).max(1)))
+        .rev()
+        .find(|s| s.is_power_of_two() && passes.is_multiple_of(*s))
+        .unwrap_or_else(|| (k / 1024).clamp(1, WARPS).next_power_of_two().min(WARPS));
     let rows_pad: u32 = match m {
         1 => 1,
         2 => 2,
