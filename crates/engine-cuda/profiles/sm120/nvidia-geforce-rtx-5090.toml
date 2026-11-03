@@ -72,6 +72,10 @@ seat_to_end = true
 # spare pages took ~4 GB beside Gemma-4-31B mini18's 20.5 GB and it did not boot; gemma-4-26b-a4b mini c128
 # 4.17k -> 4.93k tok/s, gpt-oss-20b c512 11.19k / 11.14k, pf16-512 32.5k / 32.1k
 window_spare = false
+# graph bodies held to 1 GiB, not a quarter of what is past the weights (1.4-4 GiB on 32 GB; every model here arms
+# all its compositions in under 200 MiB), the rest for the cache rows: gemma-4-31b mini18 c128 2.39k -> 2.94k,
+# gemma-4-26b-a4b mini c128 5.58k -> 5.70k tok/s
+recording = { use = "bodies", mem_mb = 1024 }
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 27.7 -> 27.1 ms, 1-lane step 2.87 -> 2.80 ms, 4-lane step 4.45 -> 4.23 ms, 8-lane step 6.93 -> 6.79 ms, readout cosine 1.0000"
