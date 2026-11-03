@@ -25,14 +25,20 @@ async def pie_inputs(a, tokens):
     client = PieClient(a.uri)
     await client.connect()
     await client.authenticate("parity")
-    program = await client.install_program_bytes((HERE / "main.py").read_bytes(), "latentmas.py", "0.1.0", force_overwrite=True)
+    program = await client.install_program_bytes((HERE / "main.py").read_bytes(), "latentmas-parity.py", "0.1.0", force_overwrite=True)
     process = await client.launch_process(program, {"op": "probe", "tokens": tokens, "steps": a.steps, "scale": a.scale})
-    event, value = await process.recv()
+    inputs = []
+    while True:
+        event, value = await process.recv()
+        if event != Event.Message:
+            raise SystemExit(value)
+        message = json.loads(value)
+        if "input" not in message:
+            break
+        inputs.append(message["input"])
     await process.signal("quit")
     await client.close()
-    if event != Event.Message:
-        raise SystemExit(value)
-    return json.loads(value)["inputs"]
+    return inputs
 
 
 def hf_inputs(a, tokens):

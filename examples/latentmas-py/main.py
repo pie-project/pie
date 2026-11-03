@@ -16,7 +16,8 @@ Messages in (JSON), each answered with one JSON message:
   the prompt (on an empty context when `fresh`) and sample a reply. Replies
   `{"tokens", "text", "read", "len"}`.
 - `{"op": "probe", "tokens", "steps", "scale"}`: `think` on an empty context, one host trip a step,
-  replying each latent input (a parity check against Hugging Face). Replies `{"inputs"}`.
+  sending each latent input as `{"input"}` as it lands (a parity check against Hugging Face). Replies
+  `{"steps"}`.
 - `"quit"`.
 
 `messages` (`[{"role", "content"}]`) are templated here with the model's own chat template. With
@@ -165,8 +166,10 @@ class Team:
         await drive(self.pipe, self.latent_pass(lat, scale, ack), steps, consume, 1)
         self.len += steps
 
-    async def probe(self, tokens: list[int], steps: int, scale: float) -> list[list[float]]:
+    async def probe(self, tokens: list[int], steps: int, scale: float) -> int:
+        """Each latent input goes out as its own message: a whole run of them exceeds a frame."""
         inputs = [await self.first_latent(tokens, scale)]
+        session.send(json.dumps({"input": inputs[-1]}))
         for _ in range(steps):
             lat = Channel.from_shaped([1, self.width], inputs[-1], dtype.f32)
             out = Channel([1, self.width], dtype.f32)
@@ -179,8 +182,9 @@ class Team:
             fwd.epilogue(lambda: out.put(realign(intrinsics.output(0, "hidden"), self.width, scale)))
             self.pipe.submit(fwd)
             inputs.append(await out.take_host())
+            session.send(json.dumps({"input": inputs[-1]}))
             self.len += 1
-        return inputs
+        return steps
 
     async def say(self, tokens: list[int], count: int, temperature: float, top_p: float, seed: int,
                   stops: set[int], stream: bool) -> list[int]:
@@ -248,7 +252,7 @@ async def main(input: dict) -> dict:
             reply = {"len": team.len, "read": len(tokens)}
         elif op == "probe":
             team.fresh()
-            reply = {"inputs": await team.probe(prompt(request), int(request["steps"]), float(request["scale"]))}
+            reply = {"steps": await team.probe(prompt(request), int(request["steps"]), float(request["scale"]))}
         elif op == "say":
             if request.get("fresh"):
                 team.fresh()
