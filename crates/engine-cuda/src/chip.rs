@@ -133,6 +133,13 @@ pub struct WalkFireRows(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.fire_rows", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct FireRows(pub u32);
+/// The most rows a fire takes, past `engine.fire_rows`, over a model whose
+/// kv is read through a window of at least 512 tokens (Gemma-4): its
+/// decoding lanes wait out a fire's prompt rows, so a narrower fire keeps
+/// them stepping while prompts arrive. 0: `engine.fire_rows`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.windowed_fire_rows", constant(range(0..=65536)), default = 0, tune = engine)]
+pub struct WindowedFireRows(pub u32);
 /// The most lanes a fire of prompts alone (no decoding lane) carries and pads
 /// its graph to, its lanes' state walk and readout rows with them, so a load
 /// seating many decoding lanes does not pad its prompt fires to all of them;
@@ -179,6 +186,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<ForwardTokens>()
         .add::<WalkFireRows>()
         .add::<FireRows>()
+        .add::<WindowedFireRows>()
         .add::<PrefillLanes>()
         .add::<HostPlanes>()
         .add::<PrefillLatticeFrom>()
@@ -275,6 +283,7 @@ pub struct Engine {
     pub forward_tokens: u32,
     pub walk_fire_rows: u32,
     pub fire_rows: u32,
+    pub windowed_fire_rows: u32,
     pub prefill_lanes: u32,
     pub host_planes: bool,
     pub prefill_lattice_from: u32,
@@ -309,6 +318,7 @@ impl Engine {
             forward_tokens: profile.get::<ForwardTokens>().0,
             walk_fire_rows: profile.get::<WalkFireRows>().0,
             fire_rows: profile.get::<FireRows>().0,
+            windowed_fire_rows: profile.get::<WindowedFireRows>().0,
             prefill_lanes: profile.get::<PrefillLanes>().0,
             host_planes: profile.on::<HostPlanes>(&Anywhere),
             prefill_lattice_from: profile.get::<PrefillLatticeFrom>().0,
@@ -790,6 +800,7 @@ mod tests {
                 forward_tokens: 0,
                 walk_fire_rows: 0,
                 fire_rows: 0,
+                windowed_fire_rows: 0,
                 prefill_lanes: 0,
                 host_planes: false,
                 prefill_lattice_from: 256,
@@ -870,6 +881,7 @@ mod tests {
                 forward_tokens: 0,
                 walk_fire_rows: 0,
                 fire_rows: 0,
+                windowed_fire_rows: 0,
                 prefill_lanes: 0,
                 host_planes: false,
                 ..Engine::of(&b200)

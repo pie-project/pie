@@ -93,6 +93,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         if engine.fire_rows > 0 && engine.fire_rows < boot.budget.max_tokens {
             boot.budget.max_tokens = engine.fire_rows;
         }
+        if engine.windowed_fire_rows > 0
+            && engine.windowed_fire_rows < boot.budget.max_tokens
+            && crate::store::window_of(&boot.trace)?.is_some_and(|window| window >= 512)
+        {
+            boot.budget.max_tokens = engine.windowed_fire_rows;
+        }
     }
     if engine.host_planes {
         let freed = boot.residency.host_declared(&boot.trace)?;
