@@ -707,7 +707,13 @@ impl Shell {
                 || kernels_cuda::linear::moe::fp8_w8a8_capable())
         {
             let mixed = !device.ctx().tuning().gemm_fp8_shadow;
-            weights.shadow_fp8_dense(&boot.trace, device.stream(), mixed)?;
+            let copied = weights.shadow_fp8_dense(&boot.trace, device.stream(), mixed)?;
+            if mixed && copied > 0 {
+                eprintln!(
+                    "engine-cuda: {copied} block-FP8 plane(s) whose rows carry their own \
+                     exponents keep a bf16 copy for a batch's rows"
+                );
+            }
         }
         // `kernel.gemm.fp8_mx`: block-FP8 dense planes keep 1x32 exponents.
         #[cfg(feature = "cuda")]
