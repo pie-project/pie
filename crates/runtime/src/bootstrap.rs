@@ -324,7 +324,13 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             let seats = engine_configs
                 .iter()
                 .filter(|d| d.seated_first && d.limits.max_context > 0)
-                .map(|d| 5 * d.total_pages * kv_page_size / d.limits.max_context)
+                .map(|d| {
+                    let factor = std::env::var("PIE_KV_ADMISSION_FACTOR")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(5);
+                    factor * d.total_pages * kv_page_size / d.limits.max_context
+                })
                 .min();
             match seats {
                 Some(seats) if rs_seat_cap.is_none() && cap > seats.max(1) => {
