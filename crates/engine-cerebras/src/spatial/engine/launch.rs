@@ -89,21 +89,56 @@ pub(super) fn fire_paged(
         ));
     }
     let cap = w.cap.saturating_sub(1).max(1);
+    let consecutive = |v: &[u32]| v.windows(2).all(|p| p[1] == p[0] + 1);
+    // A verify (every row's argmax) runs as a prefill chunk: the head's
+    // argmax comes back for each row.
+    let row_by_row: Vec<bool> = lanes
+        .iter()
+        .map(|lane| {
+            lane.visible.is_some()
+                || (lane.which == wafer::Logits::All && !lane.argmax_rows)
+                || !consecutive(&lane.slots)
+                || !consecutive(&lane.positions)
+        })
+        .collect();
+    // Prefill chunks that want no logits (argmax on the wafer, or none) and
+    // run no token loop share their launches when a launch takes more lanes
+    // than one: cut together (see [`staircase`]), the lanes' n-th pieces run
+    // the same rows, not a launch for each prompt length.
+    let shared: Vec<usize> = (0..lanes.len())
+        .filter(|&i| {
+            let lane = lanes[i];
+            !row_by_row[i]
+                && lane.ahead == 0
+                && (lane.argmax_only || lane.argmax_rows || lane.which == wafer::Logits::None)
+        })
+        .collect();
+    let mut cuts: Vec<Option<std::vec::IntoIter<usize>>> = (0..lanes.len()).map(|_| None).collect();
+    if w.launch_lanes > 1 && shared.len() > 1 {
+        let together = staircase(
+            &shared
+                .iter()
+                .map(|&i| lanes[i].tokens.len())
+                .collect::<Vec<_>>(),
+            cap,
+        );
+        for (&i, mine) in shared.iter().zip(together) {
+            cuts[i] = Some(mine.into_iter());
+        }
+    }
     // Each lane's pieces: (first row, rows, logits wanted, iterations).
     let mut pieces: Vec<Vec<(usize, usize, bool, usize)>> = Vec::with_capacity(lanes.len());
-    for lane in lanes {
+    for (li, lane) in lanes.iter().enumerate() {
         let n = lane.tokens.len();
-        let consecutive = |v: &[u32]| v.windows(2).all(|p| p[1] == p[0] + 1);
-        // A verify (every row's argmax) runs as a prefill chunk: the head's
-        // argmax comes back for each row.
-        let row_by_row = lane.visible.is_some()
-            || (lane.which == wafer::Logits::All && !lane.argmax_rows)
-            || !consecutive(&lane.slots)
-            || !consecutive(&lane.positions);
+        let row_by_row = row_by_row[li];
         let mut mine = Vec::new();
         let mut at = 0;
         while at < n {
-            let rows = if row_by_row { 1 } else { (n - at).min(cap) };
+            let rows = match cuts[li].as_mut().and_then(Iterator::next) {
+                Some(rows) => rows,
+                None if row_by_row => 1,
+                None => (n - at).min(cap),
+            };
             let last = at + rows == n;
             let want = match lane.which {
                 _ if lane.argmax_only || lane.argmax_rows => false,
@@ -206,6 +241,26 @@ pub(super) fn fire_paged(
         .collect())
 }
 
+/// Lanes of `rows` rows each cut into pieces together: every lane with rows
+/// left runs the fewest any of them has left (at most `cap`), so the lanes'
+/// n-th pieces are the same length and share a launch (prompts of 11 to 16
+/// rows: 11 rows for all, then 1, 1, 2, 1 for the longer ones, not a launch
+/// of each length).
+fn staircase(rows: &[usize], cap: usize) -> Vec<Vec<usize>> {
+    let mut left = rows.to_vec();
+    let mut cuts = vec![Vec::new(); rows.len()];
+    while let Some(step) = left.iter().copied().filter(|&n| n > 0).min() {
+        let step = step.min(cap.max(1));
+        for (n, mine) in left.iter_mut().zip(&mut cuts) {
+            if *n > 0 {
+                mine.push(step);
+                *n -= step;
+            }
+        }
+    }
+    cuts
+}
+
 /// A paged lane's answer: its logits rows, or (argmax only) its last row's
 /// argmax, or (a verify) every row's.
 pub(super) type PagedAnswer = (Vec<Vec<f32>>, Vec<u32>);
@@ -235,4 +290,34 @@ pub(super) struct PagedLane {
     /// The instance whose epilogue the wafer head's multi-lane VM samples
     /// for this lane (its one row, in its VM lane's bank).
     pub(super) vm: Option<InstanceId>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::staircase;
+
+    #[test]
+    fn prompts_of_other_lengths_share_their_launches() {
+        // 11 to 16 rows: all at 11, then the longer ones on.
+        let cuts = staircase(&[13, 11, 16, 12, 15], 31);
+        assert_eq!(
+            cuts,
+            vec![
+                vec![11, 1, 1],
+                vec![11],
+                vec![11, 1, 1, 2, 1],
+                vec![11, 1],
+                vec![11, 1, 1, 2]
+            ]
+        );
+        // Every lane's rows, all of them.
+        for (cut, n) in cuts.iter().zip([13, 11, 16, 12, 15]) {
+            assert_eq!(cut.iter().sum::<usize>(), n);
+        }
+        // At most a launch's iterations a piece.
+        assert_eq!(staircase(&[40, 70], 31), vec![vec![31, 9], vec![31, 9, 30]]);
+        // One length: as one lane alone.
+        assert_eq!(staircase(&[12, 12], 31), vec![vec![12], vec![12]]);
+        assert_eq!(staircase(&[], 31), Vec::<Vec<usize>>::new());
+    }
 }
