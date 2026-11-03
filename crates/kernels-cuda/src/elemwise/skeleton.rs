@@ -285,6 +285,9 @@ impl Schedule {
     /// rows).
     #[must_use]
     pub fn of(width: u32, rows: u32, multiprocessors: u32) -> Schedule {
+        if std::env::var_os("PIE_EXP_SPREAD").is_some() {
+            return Schedule::Spread;
+        }
         let packed = rows.div_ceil(BLOCK / lanes(width));
         let spread = if block(width, Schedule::Spread) < BLOCK {
             8 * packed <= multiprocessors
