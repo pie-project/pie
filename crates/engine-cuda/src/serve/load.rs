@@ -722,10 +722,12 @@ impl Shell {
         {
             weights.shadow_mxfp4_banks(&boot.trace, device.stream())?;
         }
-        // `kernel.moe.mxfp4_bf16_from`: MXFP4 banks keep a bf16 copy on Hopper.
+        // `kernel.moe.mxfp4_bf16_from`: MXFP4 banks keep a bf16 copy on Hopper
+        // and Blackwell's tcgen05 parts.
         #[cfg(feature = "cuda")]
         if device.ctx().tuning().mxfp4_bf16_from > 0
-            && kernels_cuda::jit::cache::arch() == Some("sm_90")
+            && (kernels_cuda::jit::cache::arch() == Some("sm_90")
+                || kernels_cuda::linear::gemm_sm100::supported())
         {
             weights.copy_mxfp4_banks_bf16(
                 &boot.trace,

@@ -379,6 +379,43 @@ pub fn select_bf16_copy(
 ) -> Result<bool, Error> {
     const STAGES: u32 = 4;
     let fan = selected(op, x, routes, y)?;
+    // On Blackwell the copy is a bf16 bank to the grouped tcgen05 GEMM, its
+    // bias and GLU in the epilogue as the MXFP4 bank's.
+    if !hopper_wgmma() && crate::linear::gemm_sm100::supported() {
+        let rows = if glu.is_some() { 2 * y.width } else { y.width };
+        if x.dtype != Dtype::Bf16
+            || y.dtype != Dtype::Bf16
+            || fan.route_count < ctx.tuning().mxfp4_bf16_from.max(1)
+            || bias.is_some_and(|b| b.dtype != Dtype::Bf16)
+            || !super::select::tc5_worth(
+                ctx,
+                x,
+                (Dtype::Bf16, experts),
+                y,
+                super::select::ExpertTable::RESIDENT,
+                routes.rows,
+                fan.route_count,
+            )
+            || rows == 0
+        {
+            return Ok(false);
+        }
+        super::select::select_tc5(
+            ctx,
+            op,
+            x,
+            crate::linear::gemm_sm100::Operand::plain(bank, crate::linear::gemm_sm100::Elem::Bf16),
+            experts,
+            routes,
+            y,
+            crate::linear::gemm_sm100::Epilogue {
+                glu,
+                bias: bias.map_or(0, |b| b.ptr),
+                ..crate::linear::gemm_sm100::Epilogue::STORE
+            },
+        )?;
+        return Ok(true);
+    }
     if !hopper_wgmma()
         || x.dtype != Dtype::Bf16
         || y.dtype != Dtype::Bf16
