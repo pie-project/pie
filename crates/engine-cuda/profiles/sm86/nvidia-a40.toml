@@ -36,8 +36,9 @@ moe.mxfp4_mma_from = 17
 moe.mxfp4_mma_until = 16777216
 moe.mxfp4_mma_per_from = 0
 moe.mxfp4_select_lean = true
-# a decode's experts of 32 routes or fewer on 32-route staged slices: gpt-oss-20b c256 3551 -> 3750 tok/s
-moe.mxfp4_staged_narrow_until = 32
+# a decode's experts of 32 routes or fewer on the register-held select, not the staged one: gpt-oss-20b
+# c256 3599 -> 4132 tok/s, c512 and wider unchanged (their experts average past 32)
+moe.mxfp4_staged_from = 32
 moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
 moe.bf16_mma_from = 16
