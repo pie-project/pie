@@ -55,6 +55,15 @@ gemm.fp8_wide_from = 257
 # 128 lanes; at 65% pf16-512 15.9k to 22.5k tok/s and c256 5.7k to 6.1k.
 [engine]
 working_set_percent = 65
+# A process starts only while the pools hold the started ones to the end, a
+# decoding lane's pages before a waiting prompt's, as the A40, H100, H200 and
+# RTX PRO 6000 profiles; graph bodies held to 512 MiB, not a quarter of what
+# is past the weights (1.5 GiB beside the 24 GB card's Gemma-4 miniatures,
+# which arm 88 and 458 MiB): gemma-4-31b mini12 c256 2.01k -> 2.82k,
+# gemma-4-26b-a4b mini c256 1.82k -> 2.58k tok/s.
+seated_first = true
+seat_to_end = true
+recording = { use = "bodies", mem_mb = 512 }
 
 # Independent chains on side streams, as the H100, sm100 and the RTX PRO 6000
 # run them: single-request decode Qwen3.5-0.8B 456 -> 464, Qwen3-0.6B 513 ->
