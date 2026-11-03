@@ -9,10 +9,11 @@ use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse};
 use super::Layer;
 
 const DECODE_SM80: &str = "attn/mla/decode_sm80.cu";
+const SPARSE_SM90: &str = "attn/mla/sparse_sm90.cu";
 
 pub(crate) mod naive {
-    use super::DECODE_SM80;
     use super::{ArgValue, Ctx, Error, Fire, Launch, refuse};
+    use super::{DECODE_SM80, SPARSE_SM90};
     use crate::jit::{Arg, kernel};
 
     pub const NAIVE_BLOCK: u32 = 256;
@@ -102,6 +103,20 @@ pub(crate) mod naive {
             ));
         }
         let selected = ptrs.selection != 0;
+
+        // Hopper's wgmma kernel, 64 heads a CTA (`kernel.sdpa.mla_wgmma`).
+        if shape.window == 0
+            && (!selected || shape.top_k > 0)
+            && !shape.fp8
+            && ctx.tuning().mla_wgmma
+            && hopper()
+            && shape.kv_lora_rank == 512
+            && shape.rope_dim == 64
+            && shape.num_heads > 0
+            && shape.num_heads % 64 == 0
+        {
+            return wgmma(ctx, op, ptrs, shape);
+        }
 
         // A selection reads on the tensor cores as a dense window does: a
         // tile is the selection's positions rather than the window's.
@@ -266,6 +281,102 @@ pub(crate) mod naive {
                 shape.causal.arg(),
                 g.arg(),
                 shape.window.arg(),
+                ctx.stage(),
+            ],
+        )
+    }
+
+    /// Whether this device is Hopper, whose arch-specific target has wgmma.
+    fn hopper() -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::cache::arch() == Some("sm_90")
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
+    /// `wg::kSmem`: the alignment, Q, two key tiles, P and the small arrays.
+    const WG_SMEM_BYTES: u32 = 1024 + 3 * 9 * 8192 + 8192 + 64 * 8 + 2 * 64 * 4 + 64;
+    const WG_THREADS: u32 = 256;
+    const WG_BK: u32 = 64;
+
+    /// The wgmma kernel's launch: `mla_mma_paged_kernel`'s rows, splits and
+    /// fold, 64 heads a CTA.
+    fn wgmma(ctx: &Ctx, op: &'static str, ptrs: Ptrs, shape: Shape) -> Result<(), Error> {
+        #[allow(clippy::cast_sign_loss)]
+        let (blocks, rows, heads) = (
+            (shape.num_heads / 64).max(0) as u32,
+            shape.total_tokens.max(0) as u32,
+            shape.num_heads.max(0) as u32,
+        );
+        let sms = ctx.multiprocessors().unwrap_or(132);
+        let mut splits = (sms / (blocks * rows).max(1)).clamp(1, 32);
+        if ptrs.selection != 0 {
+            #[allow(clippy::cast_sign_loss)]
+            let tiles = (shape.top_k.max(1) as u32).div_ceil(WG_BK);
+            splits = splits.min(tiles).max(1);
+        }
+        let (part_o, part_lse) = if splits > 1 {
+            let units = rows as usize * splits as usize * heads as usize;
+            (
+                ctx.scratch_shared(op, "attn.mla_mma.part_o", units * 512 * 2)? as u64,
+                ctx.scratch_shared(op, "attn.mla_mma.part_lse", units * 4)? as u64,
+            )
+        } else {
+            (0, 0)
+        };
+        ctx.fire(
+            op,
+            Fire::at(kernel(
+                SPARSE_SM90,
+                "::pie::attn::mla::wg::mla_wgmma_paged_kernel",
+            ))
+            .apply(Launch::grid([blocks, rows, splits], [WG_THREADS, 1, 1]).smem(WG_SMEM_BYTES)),
+            &[
+                ArgValue::Ptr(ptrs.q_nope),
+                ArgValue::Ptr(ptrs.q_pe),
+                ArgValue::Ptr(ptrs.ckv_pages),
+                ArgValue::Ptr(ptrs.kpe_pages),
+                ArgValue::Ptr(ptrs.qo_indptr),
+                ArgValue::Ptr(ptrs.kv_page_indices),
+                ArgValue::Ptr(ptrs.kv_page_indptr),
+                ArgValue::Ptr(ptrs.kv_last_page_lens),
+                ArgValue::Ptr(ptrs.o),
+                ArgValue::Ptr(ptrs.lse),
+                ArgValue::Ptr(part_o),
+                ArgValue::Ptr(part_lse),
+                ArgValue::Ptr(ptrs.selection),
+                shape.top_k.arg(),
+                i32::from(ctx.tuning().mla_dense_short).arg(),
+                shape.num_requests.arg(),
+                shape.num_heads.arg(),
+                shape.page_size.arg(),
+                shape.sm_scale.arg(),
+                shape.causal.arg(),
+                ctx.stage(),
+            ],
+        )?;
+        if splits == 1 {
+            return Ok(());
+        }
+        ctx.fire(
+            op,
+            Fire::at(kernel(
+                DECODE_SM80,
+                "::pie::attn::mla::mla_naive::mma_detail::mla_mma_fold",
+            ))
+            .apply(Launch::grid([rows, heads, 1], [128, 1, 1])),
+            &[
+                ArgValue::Ptr(part_o),
+                ArgValue::Ptr(part_lse),
+                ArgValue::Ptr(ptrs.o),
+                ArgValue::Ptr(ptrs.lse),
+                #[allow(clippy::cast_possible_wrap)]
+                (splits as i32).arg(),
+                shape.num_heads.arg(),
                 ctx.stage(),
             ],
         )

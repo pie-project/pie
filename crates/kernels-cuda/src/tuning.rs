@@ -471,6 +471,14 @@ pub struct GemmFp8GroupedTc5Until(pub u32);
 #[decision(id = "kernel.sdpa.mla_sparse", flag, default = false, tune = search)]
 pub struct SdpaMlaSparse;
 
+/// Whether the paged latent attention (64 heads in whole groups over a
+/// 512-wide bf16 latent and a 64-wide rotated part: GLM-5.3's DSA) runs 64
+/// heads a CTA on Hopper's wgmma (`attn/mla/sparse_sm90.cu`); off, the
+/// 16-head mma.sync kernel serves it as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.mla_wgmma", flag, default = false, tune = search)]
+pub struct SdpaMlaWgmma;
+
 /// Whether the tcgen05 sparse MLA pass reads a row that sees no more keys
 /// than its selection holds (a decode at a short context, a prefill's rows
 /// before the top-k) as dense: every key it sees in order, its selection
@@ -972,6 +980,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaCompressedFp4PassFrom>()
         .add::<GemmFp8GroupedTc5Until>()
         .add::<SdpaMlaSparse>()
+        .add::<SdpaMlaWgmma>()
         .add::<SdpaMlaDenseShort>()
         .add::<GemmNarrowN>();
 }
@@ -1122,6 +1131,7 @@ tuning! {
     compressed_fp4_pass_from: u32 = 0, get SdpaCompressedFp4PassFrom;
     gemm_fp8_grouped_tc5_until: u32 = 0, get GemmFp8GroupedTc5Until;
     mla_sparse: bool = false, on SdpaMlaSparse;
+    mla_wgmma: bool = false, on SdpaMlaWgmma;
     mla_dense_short: bool = false, on SdpaMlaDenseShort;
     gemm_narrow_n: u32 = 0, get GemmNarrowN;
 }
