@@ -220,6 +220,11 @@ pub struct RsStore {
     seq: u64,
     /// Unsettled fires by seq, with the slots each writes and reads.
     inflight: BTreeMap<u64, Touch>,
+    /// For each slot an unsettled fire writes or reads, those fires' seqs:
+    /// a release finds the newest without walking every fire in flight
+    /// (a full card's lanes each hold a fire or two, and a windowed ring
+    /// releases dozens of pages a lane).
+    touched_by: HashMap<RsSlotId, Vec<u64>>,
     /// Checkpoints: hidden forks no process holds.
     checkpoints: HashMap<Hash256, RsCheckpoint>,
 }
@@ -278,6 +283,7 @@ impl RsStore {
             working_sets: GenMap::new(),
             seq: 0,
             inflight: BTreeMap::new(),
+            touched_by: HashMap::new(),
             checkpoints: HashMap::new(),
         }
     }
@@ -368,7 +374,11 @@ impl RsStore {
     /// writes or copies, so none is recycled while it still reads them.
     pub fn note_reads(&mut self, seq: u64, ids: impl IntoIterator<Item = RsSlotId>) {
         if let Some(touch) = self.inflight.get_mut(&seq) {
+            let from = touch.reads.len();
             touch.reads.extend(ids);
+            for &id in &touch.reads[from..] {
+                self.touched_by.entry(id).or_default().push(seq);
+            }
         }
     }
 
@@ -886,6 +896,9 @@ impl RsStore {
                 .chain(buffers.iter().filter_map(RsBufferTarget::src))
                 .collect(),
         };
+        for &id in touch.writes.iter().chain(&touch.reads) {
+            self.touched_by.entry(id).or_default().push(self.seq);
+        }
         self.inflight.insert(self.seq, touch);
         Ok(RsPreparedWrite {
             ws,
@@ -934,6 +947,9 @@ impl RsStore {
         };
         if let Some(touch) = self.inflight.get_mut(&prepared.seq) {
             touch.writes.extend(&slots);
+            for &id in &slots {
+                self.touched_by.entry(id).or_default().push(prepared.seq);
+            }
         }
         prepared.allocated.extend(&slots);
         prepared.snapshots = rows.iter().copied().zip(slots).collect();
@@ -1053,16 +1069,31 @@ impl RsStore {
         entry.buffer[index] = Some(dst);
     }
 
+    /// Drops the unsettled fire `seq` and its entries in `touched_by`.
+    fn forget_fire(&mut self, seq: u64) {
+        let Some(touch) = self.inflight.remove(&seq) else {
+            return;
+        };
+        for id in touch.writes.iter().chain(&touch.reads) {
+            if let Some(seqs) = self.touched_by.get_mut(id) {
+                seqs.retain(|&s| s != seq);
+                if seqs.is_empty() {
+                    self.touched_by.remove(id);
+                }
+            }
+        }
+    }
+
     pub fn settle(&mut self, published: RsPublished) {
         for seq in published.seqs() {
-            self.inflight.remove(seq);
+            self.forget_fire(*seq);
         }
         self.retire_idle();
     }
 
     pub fn cancel_prepared(&mut self, prepared: RsPreparedWrite) {
         self.recycle(prepared.allocated, prepared.seq);
-        self.inflight.remove(&prepared.seq);
+        self.forget_fire(prepared.seq);
         self.retire_idle();
     }
 
@@ -1440,10 +1471,9 @@ impl RsStore {
             return true;
         }
         let epoch = self
-            .inflight
-            .iter()
-            .rev()
-            .find(|(_, touch)| touch.writes.contains(&id) || touch.reads.contains(&id))
+            .touched_by
+            .get(&id)
+            .and_then(|seqs| seqs.iter().max().copied())
             .map_or_else(
                 || {
                     self.inflight
@@ -1451,7 +1481,7 @@ impl RsStore {
                         .next()
                         .map_or(self.seq, |&oldest| oldest - 1)
                 },
-                |(&seq, _)| seq,
+                |seq| seq,
             );
         self.recycle(vec![id], epoch);
         true
