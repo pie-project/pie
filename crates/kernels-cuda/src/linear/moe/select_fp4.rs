@@ -215,6 +215,7 @@ pub(super) fn select_mxfp4_mma(
         };
     let nb: u32 = match per {
         _ if wide => 16,
+        _ if staged && per <= ctx.tuning().mxfp4_staged_narrow_until => 4,
         _ if staged => 8,
         _ if run => 4,
         0..=4 => 1,
