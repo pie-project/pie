@@ -98,7 +98,10 @@ impl ToEnd {
             + u64::from(first.1.slots.max(end.1.slots));
         let kv_most = most_at_once(&mut kv, end.0);
         let pages_most = most_at_once(&mut pages, end.1.pages);
-        let over: u64 = std::env::var("PIE_TO_END_OVER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let over: u64 = std::env::var("PIE_TO_END_OVER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         kv_most <= u64::from(kv_total) * (100 + over) / 100
             && pages_most <= u64::from(rs_total.pages)
             && slots <= u64::from(rs_total.slots)

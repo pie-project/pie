@@ -77,7 +77,10 @@ pub fn fp8_w8a8_takes(x: Tensor, n: u32) -> bool {
 #[must_use]
 pub fn fp8_select_takes(x: Tensor, n: u32) -> bool {
     if hopper_wgmma() {
-        x.dtype == Dtype::Bf16 && x.width > 0 && x.width.is_multiple_of(128) && n.is_multiple_of(128)
+        x.dtype == Dtype::Bf16
+            && x.width > 0
+            && x.width.is_multiple_of(128)
+            && n.is_multiple_of(128)
     } else {
         fp8_w8a8_takes(x, n)
     }
