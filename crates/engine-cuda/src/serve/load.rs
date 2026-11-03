@@ -698,10 +698,16 @@ impl Shell {
         if device.ctx().tuning().fp8_o_down && kernels_cuda::linear::gemm_sm100::supported() {
             weights.requantize_grouped(&boot.trace, device.stream())?;
         }
-        // `kernel.gemm.fp8_shadow`: block-FP8 dense planes keep a bf16 copy.
+        // `kernel.gemm.fp8_shadow`: block-FP8 dense planes keep a bf16 copy;
+        // without it, where the FP8 MMA reads 128x128 blocks, the planes whose
+        // rows carry their own exponents do.
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().gemm_fp8_shadow && !kernels_cuda::linear::gemm_sm100::supported() {
-            weights.shadow_fp8_dense(&boot.trace, device.stream())?;
+        if !kernels_cuda::linear::gemm_sm100::supported()
+            && (device.ctx().tuning().gemm_fp8_shadow
+                || kernels_cuda::linear::moe::fp8_w8a8_capable())
+        {
+            let mixed = !device.ctx().tuning().gemm_fp8_shadow;
+            weights.shadow_fp8_dense(&boot.trace, device.stream(), mixed)?;
         }
         // `kernel.gemm.fp8_mx`: block-FP8 dense planes keep 1x32 exponents.
         #[cfg(feature = "cuda")]

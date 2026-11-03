@@ -407,7 +407,8 @@ impl RsStore {
         let Some(entry) = self.working_sets.remove(ws) else {
             return 0;
         };
-        Self::slots(&entry).filter(|&id| self.decref(id)).count()
+        let ids: Vec<RsSlotId> = Self::slots(&entry).collect();
+        self.decref_all(&ids)
     }
 
     fn slots(entry: &RsEntry) -> impl Iterator<Item = RsSlotId> + '_ {
@@ -1423,6 +1424,55 @@ impl RsStore {
 
     fn ref_count(&self, id: RsSlotId) -> u32 {
         self.refs.get(&id).copied().unwrap_or(1)
+    }
+
+    /// [`Self::decref`] of each of `ids`, the newest unsettled fire touching
+    /// each found in one walk over the fires in flight rather than one walk
+    /// a slot (a full card's lanes ending together, a windowed ring's dozens
+    /// of pages each, held the store's lock for seconds). Returns how many
+    /// it was the last holder of.
+    fn decref_all(&mut self, ids: &[RsSlotId]) -> usize {
+        let mut freed = 0;
+        let mut last: Vec<RsSlotId> = Vec::new();
+        for &id in ids {
+            let count = self.refs.entry(id).or_insert(1);
+            *count -= 1;
+            if *count != 0 {
+                continue;
+            }
+            self.refs.remove(&id);
+            freed += 1;
+            if self.is_host(id) {
+                self.release_host([id]);
+            } else {
+                last.push(id);
+            }
+        }
+        if last.is_empty() {
+            return freed;
+        }
+        let want: HashSet<RsSlotId> = last.iter().copied().collect();
+        let mut newest: HashMap<RsSlotId, u64> = HashMap::new();
+        for (&seq, touch) in self.inflight.iter().rev() {
+            if newest.len() == want.len() {
+                break;
+            }
+            for id in touch.writes.iter().chain(&touch.reads) {
+                if want.contains(id) {
+                    newest.entry(*id).or_insert(seq);
+                }
+            }
+        }
+        let settled = self
+            .inflight
+            .keys()
+            .next()
+            .map_or(self.seq, |&oldest| oldest - 1);
+        for id in last {
+            let epoch = newest.get(&id).copied().unwrap_or(settled);
+            self.recycle(vec![id], epoch);
+        }
+        freed
     }
 
     /// Drops a reference to `id`, recycling it once none remains, behind

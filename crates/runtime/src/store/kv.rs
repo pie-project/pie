@@ -865,8 +865,8 @@ impl KvStore {
     }
 
     /// Every sealed page's key here, on any tier.
-    pub fn sealed_keys(&self) -> std::collections::HashSet<Hash256> {
-        self.table.sealed_keys()
+    pub fn sealed_key_list(&self) -> Vec<Hash256> {
+        self.table.sealed_key_list()
     }
 
     /// Host slots to land pages in that come from another worker; given

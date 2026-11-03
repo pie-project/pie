@@ -40,11 +40,23 @@ moe.bf16_mma_until = 65536
 moe.mxfp4_fp8_from = 256
 moe.mxfp4_mma_per_from = 4
 
+# A prefill's block-FP8 projections W8A8 on the wide fp8 tiles, as the
+# deployment quantizes them, not bf16 on the widened copy: MiMo-V2.6-Flash's
+# mini pf16-512 45.4k to 49.2k tok/s.
+gemm.fp8_wide_from = 257
+
 # A fire's working set may take 65% of the 24 GB card past the weights, not
 # half: at 50% gpt-oss-20b's 8192-token fires were served at 1024 and c256 at
 # 128 lanes; at 65% pf16-512 15.9k to 22.5k tok/s and c256 5.7k to 6.1k.
 [engine]
 working_set_percent = 65
+
+# Independent chains on side streams, as the H100, sm100 and the RTX PRO 6000
+# run them: single-request decode Qwen3.5-0.8B 456 -> 464, Qwen3-0.6B 513 ->
+# 523, gpt-oss-20b 201.3 -> 203.3 tok/s; greedy tokens unchanged.
+[compiler]
+dag_streams = true
+dag_streams_until = 256
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 35.9 -> 35.2 ms, 1-lane step 3.55 -> 3.48 ms, 4-lane step 5.23 -> 5.17 ms, 8-lane step 7.52 -> 7.47 ms, readout cosine 1.0000"

@@ -64,6 +64,11 @@ ssm.gdn_step_blocks = 3
 prefill_lattice_from = 256
 prefill_lattice_steps = 8
 lattice_steps = 2
+# A decoding lane's next pages before a waiting prompt's, and admission held
+# to five sequences a declared-context sequence holds: Gemma-4-26B (bf16, a
+# 19.5 GiB pool) c512 2.6k -> 4.5k tok/s, c1024 2.5k -> 4.5k; Gemma-4-31B c128
+# 309 -> 465.
+seated_first = true
 
 # Independent chains on side streams: decode latency +5-11% (Gemma 4, Qwen3.6-A3B,
 # DeepSeek-V4, GLM-5.3, Hy4), outputs unchanged; a join's branches on them too.
@@ -108,6 +113,7 @@ measured = [
   "kernel.ssm.kda_step_fused",
   "engine.prefill_lattice_from",
   "engine.lattice_steps",
+  "engine.seated_first",
   "compiler.dag_streams",
   "kernel.elemwise.hc_tile",
   "kernel.elemwise.hc_mma",

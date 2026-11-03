@@ -109,6 +109,8 @@ pub struct Gate {
     /// 64-wide heads over a bf16 pool take [`Stamp::DEEP_64`]
     /// (`kernel.sdpa.decode.gqa_deep_64`).
     pub deep_64: bool,
+    /// The fewest query heads a KV head (`kernel.sdpa.decode.gqa_min_group`).
+    pub min_group: u32,
 }
 
 impl Gate {
@@ -120,6 +122,7 @@ impl Gate {
             whole_window: tuning.decode_gqa_whole_window,
             cluster: tuning.decode_gqa_cluster,
             deep_64: tuning.decode_gqa_deep_64,
+            min_group: tuning.decode_gqa_min_group,
         }
     }
 
@@ -137,7 +140,7 @@ impl Gate {
     /// decode at some batch (the pool's own checks aside).
     #[must_use]
     pub fn stamps(self, head_dim: u32, group: u32) -> bool {
-        self.on && (1..=8).contains(&group) && Stamp::of(head_dim).is_some()
+        self.on && (self.min_group.max(1)..=8).contains(&group) && Stamp::of(head_dim).is_some()
     }
 
     /// Whether a plan of this width, group and request count takes it.
@@ -316,6 +319,7 @@ mod tests {
             whole_window: 128,
             cluster: 8,
             deep_64: false,
+            min_group: 1,
         };
         assert!(gate.takes(256, 2, 1) && gate.takes(64, 8, 16));
         assert!(!gate.takes(64, 8, 15) && !gate.takes(256, 16, 64) && !gate.takes(512, 8, 64));
