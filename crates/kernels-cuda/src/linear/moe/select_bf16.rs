@@ -179,16 +179,16 @@ fn wsgemm_grid(
     code: i32,
     work_cap: u32,
     col_tiles: u32,
-) -> (String, [u32; 3], u32) {
+) -> (String, [u32; 3], bool) {
     if ctx.tuning().bf16_ws_persist {
         let ctas = (work_cap * col_tiles)
             .min(ctx.multiprocessors().unwrap_or(132))
             .max(1);
-        let name = format!("::pie::linear::moe_select_bf16_wsgemm<{stages}, {code}, true>");
-        return (name, [ctas, 1, 1], col_tiles);
+        let name = format!("::pie::linear::moe_select_bf16_wsgemm_persist<{stages}, {code}>");
+        return (name, [ctas, 1, 1], true);
     }
     let name = format!("::pie::linear::moe_select_bf16_wsgemm<{stages}, {code}>");
-    (name, [work_cap, col_tiles, 1], col_tiles)
+    (name, [work_cap, col_tiles, 1], false)
 }
 
 /// A routed select over a bf16 bank (`experts x n x k` at `bank`) on mma.sync
@@ -260,7 +260,7 @@ pub fn select_bf16_held(
             },
         )?;
         let cols = if glu.is_some() { 128 } else { 256 };
-        let (name, grid, col_tiles) =
+        let (name, grid, persist) =
             wsgemm_grid(ctx, STAGES, code, order.work_cap, y.width.div_ceil(cols));
         ctx.fire(
             op,
@@ -281,8 +281,8 @@ pub fn select_bf16_held(
                 inter.arg(),
                 limit.arg(),
                 alpha.arg(),
-                col_tiles.arg(),
-            ],
+                y.width.div_ceil(cols).arg(),
+            ][..14 + usize::from(persist)],
         )?;
         return Ok(true);
     }
@@ -430,7 +430,7 @@ pub fn select_bf16_copy(
         },
     )?;
     let cols = if glu.is_some() { 128 } else { 256 };
-    let (name, grid, col_tiles) =
+    let (name, grid, persist) =
         wsgemm_grid(ctx, STAGES, code, order.work_cap, y.width.div_ceil(cols));
     ctx.fire(
         op,
@@ -451,8 +451,8 @@ pub fn select_bf16_copy(
             inter.arg(),
             limit.arg(),
             alpha.arg(),
-            col_tiles.arg(),
-        ],
+            y.width.div_ceil(cols).arg(),
+        ][..14 + usize::from(persist)],
     )?;
     Ok(true)
 }
