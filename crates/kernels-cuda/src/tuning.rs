@@ -487,6 +487,13 @@ pub struct SdpaMlaSparse;
 #[decision(id = "kernel.sdpa.mla_wgmma", flag, default = false, tune = search)]
 pub struct SdpaMlaWgmma;
 
+/// The fewest rows a latent attention fire runs the wgmma kernel at
+/// (`kernel.sdpa.mla_wgmma`); fewer (a decode's few rows) keep the 16-head
+/// kernel, whose keys split wider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.mla_wgmma_rows", constant(range(1..=65_536)), default = 1, tune = search)]
+pub struct SdpaMlaWgmmaRows(pub u32);
+
 /// Whether the tcgen05 sparse MLA pass reads a row that sees no more keys
 /// than its selection holds (a decode at a short context, a prefill's rows
 /// before the top-k) as dense: every key it sees in order, its selection
@@ -990,6 +997,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmFp8GroupedTc5Until>()
         .add::<SdpaMlaSparse>()
         .add::<SdpaMlaWgmma>()
+        .add::<SdpaMlaWgmmaRows>()
         .add::<SdpaMlaDenseShort>()
         .add::<GemmNarrowN>();
 }
@@ -1142,6 +1150,7 @@ tuning! {
     gemm_fp8_grouped_tc5_until: u32 = 0, get GemmFp8GroupedTc5Until;
     mla_sparse: bool = false, on SdpaMlaSparse;
     mla_wgmma: bool = false, on SdpaMlaWgmma;
+    mla_wgmma_rows: u32 = 1, get SdpaMlaWgmmaRows;
     mla_dense_short: bool = false, on SdpaMlaDenseShort;
     gemm_narrow_n: u32 = 0, get GemmNarrowN;
 }
