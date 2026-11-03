@@ -1176,6 +1176,21 @@ pub(crate) fn scatter_rows(
     count: u32,
     grouped: u64,
 ) -> Result<(), Error> {
+    scatter_rows_as(ctx, op, x, div, pos, count, grouped, false)
+}
+
+/// [`scatter_rows`], the grouped rows landing as fp16 where `f16`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scatter_rows_as(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    div: u32,
+    pos: u64,
+    count: u32,
+    grouped: u64,
+    f16: bool,
+) -> Result<(), Error> {
     if x.dtype != Dtype::Bf16 || !x.width.is_multiple_of(8) {
         return Err(refuse(
             op,
@@ -1194,8 +1209,15 @@ pub(crate) fn scatter_rows(
     let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
-        Fire::at(kernel(COMBINE, "::pie::linear::route_scatter_rows"))
-            .apply(Launch::flat(runs, BLOCK)),
+        Fire::at(kernel(
+            COMBINE,
+            if f16 {
+                "::pie::linear::route_scatter_rows_f16"
+            } else {
+                "::pie::linear::route_scatter_rows"
+            },
+        ))
+        .apply(Launch::flat(runs, BLOCK)),
         &[
             x.arg(),
             ArgValue::Ptr(pos),
@@ -1204,6 +1226,25 @@ pub(crate) fn scatter_rows(
             int(x.width)?,
             int(div)?,
         ],
+    )
+}
+
+/// `x[i] = fp16(x[i])` in place over `elems` bf16 (a multiple of eight,
+/// 16-byte aligned).
+pub(crate) fn rows_to_f16(ctx: &Ctx, op: &'static str, x: u64, elems: u64) -> Result<(), Error> {
+    if !elems.is_multiple_of(8) || !crate::jit::aligned16(x) {
+        return Err(refuse(op, "an fp16 convert walks 16-byte runs of eight"));
+    }
+    let runs = u32::try_from(elems / 8)
+        .map_err(|_| refuse(op, format!("{elems} elements overflow a launch")))?;
+    if runs == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        op,
+        Fire::at(kernel(COMBINE, "::pie::linear::rows_bf16_to_f16"))
+            .apply(Launch::flat(runs, BLOCK)),
+        &[ArgValue::Ptr(x), i64::from(runs).arg()],
     )
 }
 

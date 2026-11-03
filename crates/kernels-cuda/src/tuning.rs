@@ -282,6 +282,14 @@ pub struct MoeBf16MmaUntil(pub u32);
 #[decision(id = "kernel.moe.mxfp4_cvt", flag, default = false, tune = search)]
 pub struct MoeMxfp4Cvt;
 
+/// Whether a W4A16 MXFP4 routed MLP on the tcgen05 grouped GEMM multiplies
+/// in fp16: its activations land as fp16, its e2m1 weights dequantize to fp16
+/// by one convert a pair (bf16 takes byte permutes), the same products where
+/// the values sit in fp16's range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mxfp4_f16", flag, default = false, tune = search)]
+pub struct MoeMxfp4F16;
+
 /// The most routes an e2m1-convert select (`kernel.moe.mxfp4_cvt`) splits
 /// each work item's K across a cluster of two CTAs for, their sums met in
 /// the cluster's shared memory: a fire that few leaves most SMs idle. 0:
@@ -950,6 +958,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeBf16MmaFrom>()
         .add::<MoeBf16MmaUntil>()
         .add::<MoeMxfp4Cvt>()
+        .add::<MoeMxfp4F16>()
         .add::<MoeMxfp4CvtKsplitUntil>()
         .add::<MoeMxfp4StagedNarrowUntil>()
         .add::<MoeMxfp4StagedFrom>()
@@ -1106,6 +1115,7 @@ tuning! {
     bf16_mma_from: u32 = 0, get MoeBf16MmaFrom;
     bf16_mma_until: u32 = 0, get MoeBf16MmaUntil;
     mxfp4_cvt: bool = false, on MoeMxfp4Cvt;
+    moe_mxfp4_f16: bool = false, on MoeMxfp4F16;
     mxfp4_cvt_ksplit_until: u32 = 0, get MoeMxfp4CvtKsplitUntil;
     mxfp4_staged_narrow_until: u32 = 0, get MoeMxfp4StagedNarrowUntil;
     mxfp4_staged_from: u32 = 16, get MoeMxfp4StagedFrom;

@@ -343,11 +343,22 @@ pub fn experts(
             live_rows: layout.live_rows(),
             ..gemm_sm100::Epilogue::STORE
         };
+        // MXFP4 banks multiply in fp16 where the profile says
+        // (`kernel.moe.mxfp4_f16`): the rows land fp16, the hidden turns.
+        let mxfp4 = |o: gemm_sm100::Operand| {
+            o.elem == gemm_sm100::Elem::E2m1 && o.scales.is_some_and(|s| s.gran == 32)
+        };
+        let f16 = ctx.tuning().moe_mxfp4_f16 && mxfp4(u.0) && mxfp4(d.0);
+        let act = if f16 {
+            gemm_sm100::Elem::F16
+        } else {
+            gemm_sm100::Elem::Bf16
+        };
         let xs = ctx.scratch_stream(OP, GROUPED_X, rows * k as usize * 2)? as u64;
-        act_quant::scatter_rows(ctx, OP, x, routes.width, layout.pos, count, xs)?;
+        act_quant::scatter_rows_as(ctx, OP, x, routes.width, layout.pos, count, xs, f16)?;
         gemm_sm100::grouped_gemm_epi(
             ctx,
-            gemm_sm100::Operand::plain(xs, gemm_sm100::Elem::Bf16),
+            gemm_sm100::Operand::plain(xs, act),
             u.0,
             hs,
             grouped,
@@ -356,10 +367,13 @@ pub fn experts(
             up_epi,
             count,
         )?;
+        if f16 {
+            act_quant::rows_to_f16(ctx, OP, hs, rows as u64 * u64::from(inter))?;
+        }
         let ys = ctx.scratch_stream(OP, GROUPED_Y, rows * y.width as usize * 2)? as u64;
         gemm_sm100::grouped_gemm_epi(
             ctx,
-            gemm_sm100::Operand::plain(hs, gemm_sm100::Elem::Bf16),
+            gemm_sm100::Operand::plain(hs, act),
             d.0,
             ys,
             grouped,

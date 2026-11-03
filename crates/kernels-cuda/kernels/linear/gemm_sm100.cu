@@ -86,6 +86,27 @@ constexpr unsigned kXGroupsMax = 2;
 // pair (mxfp4: ue8m0 2^(b - 127), 0 standing for 2^-127; nvfp4: an e4m3).
 template <int kMix>
 __device__ __forceinline__ uint4 dequant8(unsigned code, unsigned char sb) {
+    if constexpr (kMix == 4) {
+        // fp16 (mxfp4 against fp16 activations): one convert a pair, then the
+        // scale 2^(b - 127) as an fp16 power of two (subnormal from 2^-24,
+        // 0 below), an exact multiply a pair.
+        unsigned w[4];
+        asm("{\n\t.reg .b8 b0, b1, b2, b3;\n\tmov.b32 {b0, b1, b2, b3}, %4;\n\t"
+            "cvt.rn.f16x2.e2m1x2 %0, b0;\n\tcvt.rn.f16x2.e2m1x2 %1, b1;\n\t"
+            "cvt.rn.f16x2.e2m1x2 %2, b2;\n\tcvt.rn.f16x2.e2m1x2 %3, b3;\n\t}"
+            : "=r"(w[0]), "=r"(w[1]), "=r"(w[2]), "=r"(w[3])
+            : "r"(code));
+        const int e = static_cast<int>(sb) - 127;
+        unsigned scale = e >= -14 ? static_cast<unsigned>(e + 15) << 10
+                         : e >= -24 ? 1u << (e + 24)
+                                    : 0u;
+        scale |= scale << 16;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(w[i]) : "r"(w[i]), "r"(scale));
+        }
+        return make_uint4(w[0], w[1], w[2], w[3]);
+    }
     auto four = [](unsigned nib, unsigned& a, unsigned& b) {
         const unsigned sel = nib & 0x7777u;
         const unsigned hi = __byte_perm(0x3F3F3F00u, 0x40404040u, sel);
@@ -899,9 +920,9 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                             const bool accumulate = kb > kb0 || j > 0;
                             if constexpr (kMixP) {
                                 mma_f16_ts(d, a_slot + h * 32 + j * 8, b,
-                                           idesc_dense(kF16Bf16, kF16Bf16, kM, kBN), accumulate);
+                                           idesc_dense(kFmtP, kFmtQ, kM, kBN), accumulate);
                             } else if constexpr (kKind == 0) {
-                                mma_f16<kPair>(d, a, b, idesc_dense(kF16Bf16, kF16Bf16, kM, kBN),
+                                mma_f16<kPair>(d, a, b, idesc_dense(kFmtP, kFmtQ, kM, kBN),
                                                accumulate);
                             } else if constexpr (kKind == 1) {
                                 mma_f8f6f4<kPair>(d, a, b, idesc_dense(kFmtP, kFmtQ, kM, kBN),

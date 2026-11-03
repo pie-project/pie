@@ -202,6 +202,52 @@ __global__ void route_scatter_rows(
         *reinterpret_cast<const uint4*>(x + static_cast<long long>(r / div) * k + c);
 }
 
+// As `route_scatter_rows`, each row landing as fp16 (a W4A16 MXFP4 select's
+// activations: bf16 within fp16's range lands exactly).
+__global__ void route_scatter_rows_f16(
+    const bf16* __restrict__ x,
+    const i32* __restrict__ pos,
+    __half* __restrict__ grouped,
+    int count,
+    int k,
+    int div)
+{
+    const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int runs = k / 8;
+    if (at >= static_cast<long long>(count) * runs) return;
+    const int r = static_cast<int>(at / runs);
+    const int c = static_cast<int>(at % runs) * 8;
+    const int o = pos[r];
+    if (o < 0) return;
+    const uint4 v = *reinterpret_cast<const uint4*>(x + static_cast<long long>(r / div) * k + c);
+    const u32 w[4] = {v.x, v.y, v.z, v.w};
+    u32 h[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __half2 p = __floats2half2_rn(bf16x2_lo(w[i]), bf16x2_hi(w[i]));
+        h[i] = *reinterpret_cast<const u32*>(&p);
+    }
+    *reinterpret_cast<uint4*>(grouped + static_cast<long long>(o) * k + c) =
+        make_uint4(h[0], h[1], h[2], h[3]);
+}
+
+// `x[i] = fp16(x[i])` in place over `n8` runs of eight bf16.
+__global__ void rows_bf16_to_f16(u32* __restrict__ x, long long n8)
+{
+    const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at >= n8) return;
+    uint4* p = reinterpret_cast<uint4*>(x) + at;
+    const uint4 v = *p;
+    const u32 w[4] = {v.x, v.y, v.z, v.w};
+    u32 h[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __half2 q = __floats2half2_rn(bf16x2_lo(w[i]), bf16x2_hi(w[i]));
+        h[i] = *reinterpret_cast<const u32*>(&q);
+    }
+    *p = make_uint4(h[0], h[1], h[2], h[3]);
+}
+
 template <class T>
 __global__ void moe_sigmoid_gate_add(
     T* __restrict__ out,
