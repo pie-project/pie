@@ -2654,6 +2654,14 @@ impl Run<'_> {
                 );
             }
         }
+        // A decode's few rows over 1x32 exponents (MXFP8) as the same GEMV over the
+        // activations as they are (`kernel.gemm.fp8_gemv_until`): the tcgen05 GEMM's
+        // 32-row tiles leave a lone row's launch mostly idle.
+        if block == 32
+            && gemv_fp8::fp8_block_gemv(self.ctx(), act, codes.ptr, atoms.ptr, 32, &mut out)?
+        {
+            return Ok(());
+        }
         act_quant::matmul(
             self.ctx(),
             OP,
