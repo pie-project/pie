@@ -80,6 +80,8 @@ def layout(id, deploy):
     if deploy.weights not in [[dtype.bf16, dtype.nvfp4], [dtype.bf16, dtype.nvfp4a4], [dtype.bf16, dtype.mxfp4], [dtype.bf16]]:
         fail("{} stores its weights bf16 with NVFP4 or MXFP4 experts, not {}".format(id, deploy.weights))
     d = DIMS[id]
+    if id != "muse-spark-open" and (deploy.layers or deploy.experts):
+        d = dims(layers = deploy.layers or d.layers, experts = deploy.experts or d.experts)
     w = dtype.bf16
     routed = deploy.weights[1] if len(deploy.weights) > 1 else w
     hidden = d.hidden
