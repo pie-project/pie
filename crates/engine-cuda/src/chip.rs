@@ -184,6 +184,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<OneFrameWhenShort>()
         .add::<SeatedFirst>()
         .add::<SeatToEnd>()
+        .add::<SeatPaced>()
         .add::<WindowSpare>()
         .add::<ForwardTokens>()
         .add::<WalkFireRows>()
