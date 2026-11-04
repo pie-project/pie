@@ -48,6 +48,8 @@ param WF32: u16;
 param CAP: u16;
 param NPC: u16;        // PLE region columns
 param RPP: u16;        // vocab rows a PLE PE
+param G1: u16 = 0;     // the grids' all-reduce groups (0: Gs; at one kv head, 16 shortens the chains)
+param WIN: u32 = 0;    // the sliding layers' window (slots a query sees, its own included; 0: all)
 param DBG: u16 = 0;
 param KVST: u16 = 0;
 param VM: u16 = 0;     // the eta VM (not yet: head2d's stand-in columns)
@@ -150,7 +152,7 @@ layout {
             .P = P, .Hc = Hc, .Dc = (if (glob) DcG else DcS), .Gs = Gs,
             .Ic = (if (ll < NOWN) IcS else IcT), .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC, .Qh = Qh,
             .OWN = (if (ll < NOWN) 1 else 0), .SHARE = (if (((SHB >> ll) & 1) == 1) 1 else 0), .PC = PC,
-            .W16 = 1, .NP = NP,
+            .W16 = 1, .NP = NP, .G1 = G1, .WIN = (if (glob) 0 else WIN),
             .GW = GW, .GH = GH, .NL = NL, .F = F, .HEADMODE = 2,
             .S2D_VMC = VMC, .S2D_VMAT = HR2X + 1, .S2D_DBG = DBG, .KVST = KVST,
             .S2D_PATHS = (if (sy <= 1) 1 else 0) | (if (ll == NL - 1) 2 else 0)

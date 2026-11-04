@@ -410,7 +410,12 @@ mod tests {
         );
         let spec = ProgramSpec::from_params(Design::ServeG4, &params).expect("a serve_g4 program");
         let ckpt = Ckpt::open(&dir.join("ckpt")).expect("the checkpoint");
-        let rec = Recorder::default();
+        // G4_FORGET: a full-size run that keeps nothing (shapes and time).
+        let rec = if std::env::var("G4_FORGET").is_ok() {
+            Recorder::default().forgetful()
+        } else {
+            Recorder::default()
+        };
         let mut dev = rec.clone();
         super::place(&spec, &ckpt, &mut dev).expect("the layers");
         crate::spatial::serve2d::place_head(&spec, &ckpt, &mut dev).expect("the head");

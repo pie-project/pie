@@ -2428,12 +2428,12 @@ mod tests {
         ),
     ];
 
-    /// serve_g4's files as validated on CS-3 (requests 0380-0383: E2B bare,
-    /// greedy 64/64 against the f32 golden).
+    /// serve_g4's files as validated on CS-3 (0385: E2B bare with WIN 512,
+    /// greedy 64/64 x3 against the f32 golden, 720/720 past the window).
     const G4_PINNED: &[(&str, &str)] = &[
         (
             "layout.csl",
-            "b2d6f6c7d77a37128e0b5c5fb97f0c5d01d93f402b3545105dda499b5af81b05",
+            "4b975ba758cf06f93834f98721ee01a29cde77d68ec28618284496e91921c0ab",
         ),
         (
             "paths.csl",
@@ -2441,7 +2441,7 @@ mod tests {
         ),
         (
             "grid_pe.csl",
-            "bc8c91e9258828c7ba7561aeed2e690e72b8bbd14388ffa0bad8085e70781543",
+            "a0f7eb5f868920fd10a93839919ab1679b15dd20f5561ed912b5bcf7c3bb0357",
         ),
         (
             "head_pe.csl",

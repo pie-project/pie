@@ -47,6 +47,8 @@ param SHARE: u16;      // 1: its k and v go to kvo
 param PC: u16;         // PLE dims a column (0: no PLE)
 param W16: u16 = 1;    // 1: bf16 weights (u16 storage)
 param NP: u16 = 3;     // bf16 parts of x in a W16 matvec (3: exact)
+param G1: u16 = 0;     // the all-reduces' phase-1 group along an axis (0: Gs; else a divisor of P, Gs == P)
+param WIN: u32 = 0;    // a sliding layer's window: a lane at write slot w sees slots (w - WIN, w] (0: all)
 param c_r1_0: color;
 param c_r1_1: color;
 param c_r2_0: color;
@@ -65,9 +67,13 @@ const color_config = tile_config.color_config;
 const HID: f32 = @as(f32, P * Hc);
 const HD: f32 = @as(f32, Gs * Dc);   // head_dim
 const EPS: f32 = 1.0e-6;
-const R1: u16 = Gs / 2;              // phase-1 root within a group
-const NG: u16 = P / Gs;              // groups along an axis
-const R2: u16 = (NG / 2) * Gs + R1;  // phase-2 root
+// The all-reduces' groups: Gs PEs (a kv head's columns: allreduce_seg's),
+// or G1 where one kv head spans the grid (the segment is then the row).
+const GA: u16 = if (G1 == 0) Gs else G1;
+comptime { @comptime_assert(GA == Gs or (Gs == P and P % GA == 0)); }
+const R1: u16 = GA / 2;              // phase-1 root within a group
+const NG: u16 = P / GA;              // groups along an axis
+const R2: u16 = (NG / 2) * GA + R1;  // phase-2 root
 const NH1: u16 = Qh + 1;             // [q heads | k] a lane, each in two halves
 const DH: u16 = Dc / 2;
 
@@ -147,8 +153,8 @@ fn route_phase1(H: u16, T: u16, r: u16) void {
 }
 
 fn route_phase2(H: u16, T: u16, id: u16) void {
-  const qt = id / Gs;
-  const r = id % Gs;
+  const qt = id / GA;
+  const r = id % GA;
   const ev = qt % 2 == 0;
   const ca = if (ev) c_r2_0 else c_r2_1;
   const cb = if (ev) c_r2_1 else c_r2_0;
@@ -206,7 +212,7 @@ fn set_axis(x: bool) void {
   const h = if (x) D_W else D_N;
   const t = if (x) D_E else D_S;
   const id = if (x) px else py;
-  route_phase1(h, t, id % Gs);
+  route_phase1(h, t, id % GA);
   route_phase2(h, t, id);
   route_bcast(h, t, id, P - 1);
   axis_x = x;
@@ -225,16 +231,16 @@ fn op_fwd(is_max: bool, comptime qo: output_queue, comptime qi: input_queue,
 }
 
 fn phase1(is_max: bool, buf: mem1d_dsd, n: u16) void {
-  const r = axis_id % Gs;
+  const r = axis_id % GA;
   if (r == R1) {
-    if (R1 < Gs - 1) { op_in(is_max, buf, q_r1_0_in, n); }
+    if (R1 < GA - 1) { op_in(is_max, buf, q_r1_0_in, n); }
     op_in(is_max, buf, q_r1_1_in, n);
   } else if (r > R1) {
     if (r % 2 == 0) {
-      if (r == Gs - 1) { @fmovs(fout(q_r1_0_out, n), buf); }
+      if (r == GA - 1) { @fmovs(fout(q_r1_0_out, n), buf); }
       else { op_fwd(is_max, q_r1_0_out, q_r1_1_in, buf, n); }
     } else {
-      if (r == Gs - 1) { @fmovs(fout(q_r1_1_out, n), buf); }
+      if (r == GA - 1) { @fmovs(fout(q_r1_1_out, n), buf); }
       else { op_fwd(is_max, q_r1_1_out, q_r1_0_in, buf, n); }
     }
   } else {
@@ -249,14 +255,14 @@ fn phase1(is_max: bool, buf: mem1d_dsd, n: u16) void {
 
 fn phase2(is_max: bool, buf: mem1d_dsd, n: u16) void {
   const id = axis_id;
-  const r = id % Gs;
-  const qt = id / Gs;
+  const r = id % GA;
+  const qt = id / GA;
   if (id == R2) {
-    if (R2 < P - Gs) { op_in(is_max, buf, q_r2_0_in, n); }
+    if (R2 < P - GA) { op_in(is_max, buf, q_r2_0_in, n); }
     op_in(is_max, buf, q_r2_1_in, n);
   } else if (id > R2) {
     if (r == R1) {
-      if (id > P - Gs - 1) {
+      if (id > P - GA - 1) {
         if (qt % 2 == 0) { @fmovs(fout(q_r2_0_out, n), buf); }
         else { @fmovs(fout(q_r2_1_out, n), buf); }
       } else {
@@ -266,7 +272,7 @@ fn phase2(is_max: bool, buf: mem1d_dsd, n: u16) void {
     }
   } else {
     if (r == R1) {
-      if (id < Gs) { @fmovs(fout(q_r2_1_out, n), buf); }
+      if (id < GA) { @fmovs(fout(q_r2_1_out, n), buf); }
       else {
         if (qt % 2 == 0) { op_fwd(is_max, q_r2_1_out, q_r2_0_in, buf, n); }
         else { op_fwd(is_max, q_r2_0_out, q_r2_1_in, buf, n); }
@@ -285,6 +291,11 @@ fn allreduce(is_max: bool, buf: mem1d_dsd, n: u16) void {
 
 // Sum of buf over this PE's group of Gs columns (axis X).
 fn allreduce_seg(buf: mem1d_dsd, n: u16) void {
+  if (GA != Gs) {
+    // One kv head spans the row (Gs == P): the row's all-reduce.
+    allreduce(false, buf, n);
+    return;
+  }
   phase1(false, buf, n);
   route_gbcast();                       // c_bc: the group's broadcast for now
   if (px % Gs == R1) { @fmovs(fout(q_bc_out, n), buf); }
@@ -342,6 +353,23 @@ fn advance(b: u16) void {
   while (e < dims[1]) : (e += 1) {
     if (eblk(b, e) != NONE and epg(b, e) == pg) {
       tab[2 * B + 2 * B * E + b * E + e] |= @as(u32, 1) << @as(u16, ws % @as(u32, PS));
+    }
+  }
+}
+
+// The sliding window (WIN > 0): the lane's bits below its write slot's
+// window cleared on this row's entries, every pass (advance only adds bits).
+fn clip_window(b: u16) void {
+  const ws = tab[B + b];
+  if (ws < WIN) { return; }
+  const lo = ws + 1 - WIN;             // the first slot it sees
+  var e: u16 = 0;
+  while (e < dims[1]) : (e += 1) {
+    if (eblk(b, e) != NONE) {
+      const p0 = epg(b, e) * @as(u32, PS);
+      const at = 2 * B + 2 * B * E + b * E + e;
+      if (p0 + @as(u32, PS) <= lo) { tab[at] = 0; }
+      else if (p0 < lo) { tab[at] &= ~((@as(u32, 1) << @as(u16, lo - p0)) - 1); }
     }
   }
 }
@@ -1136,6 +1164,10 @@ fn compute(steps: u32) void {
       b = 0;
     }
     while (b < dims[0]) : (b += 1) { cur[b] = tab[b]; }
+    if (WIN > 0) {
+      b = 0;
+      while (b < dims[0]) : (b += 1) { clip_window(b); }
+    }
     rope_tables();
     timing = i > 0;
     timestamp.get_timestamp(&t_mark);
