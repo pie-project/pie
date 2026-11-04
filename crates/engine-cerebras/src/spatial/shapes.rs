@@ -217,7 +217,8 @@ pub const RAN: &[Ran] = &[
                  (frame 4, depth 15) 94.9-95.6% of bare over 6 reps (0481), on OP2 \
                  1,345.0-1,356.7 tok/s = 95.1-96.0% of bare 1,413.9 (0484); with QKV1 (one QKV \
                  matvec, the plan's `qkv1`) 1,443.0 (0485, regions 46.2-46.6k a pass), greedy = \
-                 golden for 512, mismatches only at the two known ties",
+                 golden for 512, mismatches only at the two known ties; pie B 1 on it \
+                 1,368.6-1,378.5 = 94.8-95.5% of bare 1,443.3 in 5 of 6 reps (0487)",
     },
     Ran {
         design: Design::Serve8bRegion,
