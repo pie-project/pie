@@ -61,7 +61,7 @@ fn main() -> Result<(), String> {
     }
     let pages: Vec<u32> = match std::env::var("BENCH8B_PAGEORDER").ok() {
         None => (0..npg).collect(),
-        Some(spec) => ar_page_order(&spec, npg, shape.pages())?,
+        Some(spec) => ar_page_order(&spec, npg, &shape)?,
     };
     let lane = |pos: usize, forced: Vec<u32>| BatchLane {
         pos: pos as u32,
@@ -180,43 +180,15 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-/// `BENCH8B_PAGEORDER=ar:<py>:<gy>`: logical page i on pool page
-/// (i / py) py + order[i % py], `order` the rows of a py-row unit by their
-/// all-reduce slack (the grouped two-phase chains into R2 = (py/gy/2) gy +
-/// gy/2, then R2's broadcast): the rows a lane's last, partial round of
-/// pages lands on (one position more than the others at PS 1) are the ones
-/// the o/l all-reduce waits for least. Positions keep their order; only the
-/// rows move.
-fn ar_page_order(spec: &str, npg: u32, pool: usize) -> Result<Vec<u32>, String> {
-    let f: Vec<&str> = spec.split(':').collect();
-    let bad = || format!("BENCH8B_PAGEORDER {spec:?}: want ar:<py>:<gy>");
-    if f.len() != 3 || f[0] != "ar" {
-        return Err(bad());
-    }
-    let py: i64 = f[1].parse().map_err(|_| bad())?;
-    let gy: i64 = f[2].parse().map_err(|_| bad())?;
-    if py <= 0 || gy <= 0 || py % gy != 0 {
-        return Err(bad());
-    }
-    let ng = py / gy;
-    let (gr, r2g) = (gy / 2, ng / 2);
-    let slack = |r: i64| -> f64 {
-        let (g, k) = (r / gy, r % gy);
-        let p1 = if k == gr { gr } else if k < gr { k } else { gy - 1 - k };
-        let r2 = r2g * gy + gr;
-        2.3 * (r2.max(py - 1 - r2) - (r - r2).abs()) as f64
-            + 50.0 * (r2g.max(ng - 1 - r2g) - (g - r2g).abs()) as f64
-            + 12.4 * p1 as f64
-    };
-    let mut order: Vec<i64> = (0..py).collect();
-    order.sort_by(|&a, &b| slack(b).partial_cmp(&slack(a)).unwrap().then(a.cmp(&b)));
-    let py = py as u32;
-    let pages: Vec<u32> = (0..npg).map(|i| (i / py) * py + order[(i % py) as usize] as u32).collect();
-    if let Some(&m) = pages.iter().max() {
-        if m as usize >= pool {
-            return Err(format!("BENCH8B_PAGEORDER: page {m} outside a pool of {pool}"));
-        }
-    }
-    eprintln!("BENCH8B_PAGEORDER rows first: {:?}", &order[..8.min(order.len())]);
-    Ok(pages)
+/// `BENCH8B_PAGEORDER=ar:<py>:<gy>`: logical page i on
+/// [`engine_cerebras::spatial::paged::RowOrder`]'s page for i (the rows by
+/// o/l all-reduce slack; positions keep their order, only rows move).
+fn ar_page_order(
+    spec: &str,
+    npg: u32,
+    shape: &engine_cerebras::spatial::paged::Shape,
+) -> Result<Vec<u32>, String> {
+    let o = engine_cerebras::spatial::paged::RowOrder::parse(spec, shape)?;
+    eprintln!("BENCH8B_PAGEORDER rows first: {:?}", &o.rows()[..8.min(o.rows().len())]);
+    Ok((0..npg).map(|i| o.map(i)).collect())
 }

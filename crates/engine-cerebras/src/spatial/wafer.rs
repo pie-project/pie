@@ -1382,6 +1382,23 @@ pub struct Wafer {
     /// the handle: the lanes' page tables, the page copies and the host
     /// tier's pages. `paged` and `page_bytes` are PIE's view.
     pub group: u32,
+    /// `PIE_CEREBRAS_PAGE_ORDER` (`ar:<py>:<gy>`): kernel pages relabelled
+    /// onto the rows by all-reduce slack ([`super::paged::RowOrder`]),
+    /// after the group expansion, on every page the handle passes on.
+    pub row_order: Option<super::paged::RowOrder>,
+}
+
+/// The handle's page order from `PIE_CEREBRAS_PAGE_ORDER`, over a kernel
+/// pool of `paged`'s pages (unset or no pool: none).
+fn row_order_env(paged: Option<super::paged::Shape>) -> R<Option<super::paged::RowOrder>> {
+    match (std::env::var("PIE_CEREBRAS_PAGE_ORDER").ok(), paged) {
+        (Some(spec), Some(shape)) => {
+            let o = super::paged::RowOrder::parse(&spec, &shape)?;
+            tracing::info!("PIE_CEREBRAS_PAGE_ORDER {spec}: rows first {:?}", &o.rows()[..4.min(o.rows().len())]);
+            Ok(Some(o))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// One launch's account: how long the wafer thread waited for it (`idle_ms`,
@@ -1461,6 +1478,13 @@ impl Wafer {
                             hidden: m.design.hidden(),
                             recurrent: m.design.hybrid().is_some(),
                             group: 1,
+                            row_order: match row_order_env(m.design.paged()) {
+                                Ok(o) => o,
+                                Err(e) => {
+                                    let _ = ready_tx.send(Err(e));
+                                    return;
+                                }
+                            },
                         }));
                         m
                     }
@@ -1623,10 +1647,12 @@ impl Wafer {
                 }
             })
             .map_err(|e| format!("spawning the wafer thread: {e}"))?;
-        let facts = ready_rx
+        let mut facts = ready_rx
             .recv()
             .map_err(|_| "the wafer thread died while loading".to_string())??;
+        let row_order = facts.row_order.take();
         Ok(Wafer {
+            row_order,
             jobs: Some(job_tx),
             answers: ans_rx,
             batch_answers: batch_rx,
@@ -1659,12 +1685,19 @@ impl Wafer {
         self.page_bytes = self.page_bytes.map(|b| b * g);
     }
 
+    /// PIE page `p`'s kernel page `o` (of `group`), relabelled by the page
+    /// order when there is one.
+    fn kpage(&self, p: u32, o: u32) -> u32 {
+        let k = p * self.group + o;
+        self.row_order.as_ref().map_or(k, |r| r.map(k))
+    }
+
     /// PIE page ids as the program's (each `group` kernel pages, in order).
     fn kernel_pages(&self, pages: &[u32]) -> Vec<u32> {
         let g = self.group;
         pages
             .iter()
-            .flat_map(|&p| (0..g).map(move |o| p * g + o))
+            .flat_map(|&p| (0..g).map(move |o| self.kpage(p, o)))
             .collect()
     }
 
@@ -1672,7 +1705,7 @@ impl Wafer {
         &self,
         mut lanes: Vec<super::serve2d::BatchLane>,
     ) -> Vec<super::serve2d::BatchLane> {
-        if self.group > 1 {
+        if self.group > 1 || self.row_order.is_some() {
             for l in &mut lanes {
                 l.pages = self.kernel_pages(&l.pages);
             }
@@ -1868,7 +1901,7 @@ impl Wafer {
     pub fn page_in(&mut self, pages: Vec<(u32, Vec<u32>)>) -> R<()> {
         let _busy = Busy::start();
         let g = self.group;
-        let pages = if g > 1 {
+        let pages = if g > 1 || self.row_order.is_some() {
             let mut out = Vec::new();
             for (p, words) in pages {
                 let n = words.len() / g as usize;
@@ -1879,7 +1912,7 @@ impl Wafer {
                     ));
                 }
                 for (o, c) in words.chunks(n.max(1)).enumerate() {
-                    out.push((p * g + o as u32, c.to_vec()));
+                    out.push((self.kpage(p, o as u32), c.to_vec()));
                 }
             }
             out
@@ -1916,7 +1949,8 @@ impl Wafer {
         let g = self.group;
         let pairs: Vec<(u32, u32)> = pairs
             .into_iter()
-            .flat_map(|(s, d)| (0..g).map(move |o| (s * g + o, d * g + o)))
+            .flat_map(|(s, d)| (0..g).map(move |o| (s, d, o)))
+            .map(|(s, d, o)| (self.kpage(s, o), self.kpage(d, o)))
             .collect();
         self.jobs
             .as_ref()
@@ -2007,6 +2041,7 @@ mod tests {
             hidden: 0,
             recurrent: false,
             group: 1,
+            row_order: None,
         };
         let kernel = w.paged.unwrap();
         w.page_as(16);
@@ -2027,6 +2062,12 @@ mod tests {
         // A second call, or a page size the kernel's do not tile, changes nothing.
         w.page_as(16);
         assert_eq!(w.group, 16);
+        // The page order relabels the expanded kernel pages (row 104 first).
+        w.row_order = Some(super::super::paged::RowOrder::parse("ar:208:16", &kernel).unwrap());
+        assert_eq!(w.kernel_pages(&[0])[..3], [104, 103, 105]);
+        assert_eq!(w.kernel_lanes(vec![super::super::serve2d::BatchLane {
+            pos: 0, slot: 0, pages: vec![0], visible: None, forced: vec![], state: None,
+        }])[0].pages[..2], [104, 103]);
     }
 
     #[test]

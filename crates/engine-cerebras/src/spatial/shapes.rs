@@ -236,7 +236,10 @@ pub const RAN: &[Ran] = &[
                  160-token free-running stream identical across them; lever D by the U order \
                  (1 + 10 x 3 + 5, YD 208, NCOL 5, RPY 208, RHc 20, RTR 5) 1,166.8 (0476), the \
                  same 14 mismatches at the same margins; + OP2 + RGX 16 1,208.2 (0483), + QKV1 \
-                 1,234.8 (0486), the same 14 mismatches, both streams equal to 0483's for 160",
+                 1,234.8 (0486), the same 14 mismatches, both streams equal to 0483's for 160; \
+                 the same program with the pages on the rows by all-reduce slack (page order \
+                 ar:208:16, host only) 1,244.6 (0489, regions 45.5-45.9k a pass), the same 14 \
+                 mismatches, rep 0 = 0486 rep 1 for 160",
     },
 ];
 
