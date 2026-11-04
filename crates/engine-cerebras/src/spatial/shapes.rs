@@ -198,6 +198,33 @@ pub const RAN: &[Ran] = &[
                  its 144 tokens, 4,361 tok/s median over 10 bursts; B 1 region on the same \
                  grids equal to the f32 golden up to near ties (0400b, 0401)",
     },
+    // serve8b_region (no ring; recorded, not gating): the cerebras-8b-speed
+    // builds (SPD 1, LSE 1, HV's PS 1 / NB 16 / E 5, MODE 2), bare B 1.
+    Ran {
+        design: Design::Serve8bRegion,
+        lanes: (1, 1),
+        mmax: 0,
+        cap: 128,
+        vm: Vm::Off,
+        py: Some(152),
+        reason: "real Llama 3.1 8B, B 1, SPD + LSE + HV + MODE 2 at CAP 128: option A \
+                 (RPY 240) 1,284.9 tok/s (0469) and with the one-search append 1,303.2 (0471), \
+                 greedy = the f32 golden for 225 tokens (the 0.0107 tie), 0 teacher-forced \
+                 mismatches; lever D (YD 624, RR 5, RPY 208, RHc 20, RTR 5) 1,365.4 (0472), \
+                 greedy = golden for 512, mismatches only at the two known ties (225, 274)",
+    },
+    Ran {
+        design: Design::Serve8bRegion,
+        lanes: (1, 1),
+        mmax: 0,
+        cap: 64,
+        vm: Vm::Off,
+        py: Some(144),
+        reason: "real Qwen3-8B, B 1, SPD + LSE + HV + MODE 2 at CAP 64, option A: 1,108.7 \
+                 tok/s (0470), 1,120.3 with the one-search append (0473); the same 14 \
+                 teacher-forced mismatches as the bf16 reference (model differences), the \
+                 160-token free-running stream identical across them",
+    },
 ];
 
 /// A shape known to fail, and why.
