@@ -157,7 +157,8 @@ pub struct Hybrid {
 /// rows a column (the tail's `ict`), `pc` PLE dims a column, the PLE
 /// region's `npc` columns of `rpp` vocabulary rows a PE; `esb`/`psb` the
 /// f32 bits of sqrt(hidden) and sqrt(PLE)/sqrt(2); `win` the sliding
-/// layers' window (slots a query sees, its own included; 0: every slot).
+/// layers' window (slots a query sees, its own included; 0: every slot);
+/// `g1` the grids' all-reduce groups (0: `Gs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gemma {
     pub kinds: u64,
@@ -173,6 +174,8 @@ pub struct Gemma {
     pub esb: u32,
     pub psb: u32,
     pub win: usize,
+    /// The all-reduces' phase-1 group (`G1`; 0: `Gs`).
+    pub g1: usize,
 }
 
 impl Gemma {
@@ -710,6 +713,7 @@ impl ProgramSpec {
                 "ESB" => Some(g.esb as usize),
                 "PSB" => Some(g.psb as usize),
                 "WIN" => Some(g.win),
+                "G1" => Some(g.g1),
                 _ => None,
             },
             (Layers::Strips { full, .. }, "GS") => Some(full),
@@ -1334,6 +1338,7 @@ fn serve_g4(get: &Get) -> R<ProgramSpec> {
         esb: u32::try_from(get.req("ESB")?).map_err(|e| e.to_string())?,
         psb: u32::try_from(get.req("PSB")?).map_err(|e| e.to_string())?,
         win: get.opt("WIN").unwrap_or(0),
+        g1: get.opt("G1").unwrap_or(0),
     };
     let (gw, gh) = (get.req("GW")?, get.req("GH")?);
     if g.nl > gw * gh || g.nl <= (gh - 1) * gw || g.nown > g.nl {

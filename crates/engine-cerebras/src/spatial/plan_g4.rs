@@ -393,6 +393,9 @@ impl G4Plan {
             ("NPC", pr.npc),
             ("RPP", pr.rpp),
             ("WIN", s.window),
+            // One kv head spans the grid: all-reduces in groups of 16
+            // (0386: 499 vs 434 tok/s, the same tokens).
+            ("G1", if g.gs == g.px { 16 } else { 0 }),
         ])
     }
 }
@@ -459,8 +462,8 @@ mod tests {
     }
 
     /// E2B's params at B 1: the program built and verified on the CS-3
-    /// (scratch/g4/prog/full.params, plus the sliding window), read back as
-    /// a serve_g4 program.
+    /// (scratch/g4/prog/full.params, plus the sliding window and G1: 0386),
+    /// read back as a serve_g4 program.
     #[test]
     fn e2b_params_are_the_chip_programs() {
         use crate::spatial::codegen::Design;
@@ -478,7 +481,7 @@ mod tests {
             "P:128,Hc:12,Gs:128,Qh:8,DcS:2,DcG:4,IcS:48,IcT:96,PC:2,KINDS:17734058512,NL:35,\
              NOWN:15,PS:16,NB:1,E:1,B:1,MC:1,GW:4,GH:9,ESB:1109181553,PSB:1093993715,NP:3,F:576,\
              HH:1152,Vr:228,Gx:16,Gy:18,Gb:1,vocab:262144,PASSES:3,UNTIED:0,CERT:0,MODE:0,OVL:0,\
-             VMC:1,WF32:1,CAP:64,NPC:114,RPP:18,WIN:512"
+             VMC:1,WF32:1,CAP:64,NPC:114,RPP:18,WIN:512,G1:16"
         );
         let pr = p.program.expect("a program");
         assert_eq!((pr.head_pe, pr.ple_pe), (37_648, 42_736));
