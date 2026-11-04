@@ -220,6 +220,9 @@ pub struct RsStore {
     seq: u64,
     /// Unsettled fires by seq, with the slots each writes and reads.
     inflight: BTreeMap<u64, Touch>,
+    /// The same, by slot: the seqs of the unsettled fires that touch it, each
+    /// with how many times its touch names the slot.
+    touched: HashMap<RsSlotId, BTreeMap<u64, u32>>,
     /// Checkpoints: hidden forks no process holds.
     checkpoints: HashMap<Hash256, RsCheckpoint>,
 }
@@ -278,6 +281,7 @@ impl RsStore {
             working_sets: GenMap::new(),
             seq: 0,
             inflight: BTreeMap::new(),
+            touched: HashMap::new(),
             checkpoints: HashMap::new(),
         }
     }
@@ -368,7 +372,9 @@ impl RsStore {
     /// writes or copies, so none is recycled while it still reads them.
     pub fn note_reads(&mut self, seq: u64, ids: impl IntoIterator<Item = RsSlotId>) {
         if let Some(touch) = self.inflight.get_mut(&seq) {
-            touch.reads.extend(ids);
+            let ids: Vec<RsSlotId> = ids.into_iter().collect();
+            touch.reads.extend(&ids);
+            self.touch_ids(seq, ids);
         }
     }
 
@@ -887,6 +893,7 @@ impl RsStore {
                 .chain(buffers.iter().filter_map(RsBufferTarget::src))
                 .collect(),
         };
+        self.touch_ids(self.seq, touch.writes.iter().chain(&touch.reads).copied());
         self.inflight.insert(self.seq, touch);
         Ok(RsPreparedWrite {
             ws,
@@ -935,6 +942,7 @@ impl RsStore {
         };
         if let Some(touch) = self.inflight.get_mut(&prepared.seq) {
             touch.writes.extend(&slots);
+            self.touch_ids(prepared.seq, slots.iter().copied());
         }
         prepared.allocated.extend(&slots);
         prepared.snapshots = rows.iter().copied().zip(slots).collect();
@@ -1056,14 +1064,14 @@ impl RsStore {
 
     pub fn settle(&mut self, published: RsPublished) {
         for seq in published.seqs() {
-            self.inflight.remove(seq);
+            self.settle_seq(*seq);
         }
         self.retire_idle();
     }
 
     pub fn cancel_prepared(&mut self, prepared: RsPreparedWrite) {
         self.recycle(prepared.allocated, prepared.seq);
-        self.inflight.remove(&prepared.seq);
+        self.settle_seq(prepared.seq);
         self.retire_idle();
     }
 
@@ -1451,28 +1459,50 @@ impl RsStore {
         if last.is_empty() {
             return freed;
         }
-        let want: HashSet<RsSlotId> = last.iter().copied().collect();
-        let mut newest: HashMap<RsSlotId, u64> = HashMap::new();
-        for (&seq, touch) in self.inflight.iter().rev() {
-            if newest.len() == want.len() {
-                break;
-            }
-            for id in touch.writes.iter().chain(&touch.reads) {
-                if want.contains(id) {
-                    newest.entry(*id).or_insert(seq);
-                }
-            }
-        }
         let settled = self
             .inflight
             .keys()
             .next()
             .map_or(self.seq, |&oldest| oldest - 1);
         for id in last {
-            let epoch = newest.get(&id).copied().unwrap_or(settled);
+            let epoch = self.newest_touch(id).unwrap_or(settled);
             self.recycle(vec![id], epoch);
         }
         freed
+    }
+
+    fn touch_ids(&mut self, seq: u64, ids: impl IntoIterator<Item = RsSlotId>) {
+        for id in ids {
+            *self.touched.entry(id).or_default().entry(seq).or_insert(0) += 1;
+        }
+    }
+
+    /// The fire under `seq` settled: it no longer touches its slots.
+    fn settle_seq(&mut self, seq: u64) {
+        let Some(touch) = self.inflight.remove(&seq) else {
+            return;
+        };
+        for id in touch.writes.iter().chain(&touch.reads) {
+            let Some(seqs) = self.touched.get_mut(id) else {
+                continue;
+            };
+            if let Some(count) = seqs.get_mut(&seq) {
+                *count -= 1;
+                if *count == 0 {
+                    seqs.remove(&seq);
+                }
+            }
+            if seqs.is_empty() {
+                self.touched.remove(id);
+            }
+        }
+    }
+
+    /// The newest unsettled fire that writes or reads `id`.
+    fn newest_touch(&self, id: RsSlotId) -> Option<u64> {
+        self.touched
+            .get(&id)
+            .and_then(|seqs| seqs.keys().next_back().copied())
     }
 
     /// Drops a reference to `id`, recycling it once none remains, behind
@@ -1489,20 +1519,12 @@ impl RsStore {
             self.release_host([id]);
             return true;
         }
-        let epoch = self
-            .inflight
-            .iter()
-            .rev()
-            .find(|(_, touch)| touch.writes.contains(&id) || touch.reads.contains(&id))
-            .map_or_else(
-                || {
-                    self.inflight
-                        .keys()
-                        .next()
-                        .map_or(self.seq, |&oldest| oldest - 1)
-                },
-                |(&seq, _)| seq,
-            );
+        let epoch = self.newest_touch(id).unwrap_or_else(|| {
+            self.inflight
+                .keys()
+                .next()
+                .map_or(self.seq, |&oldest| oldest - 1)
+        });
         self.recycle(vec![id], epoch);
         true
     }
