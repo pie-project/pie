@@ -131,6 +131,10 @@ def a4b(experts):
 
 A4B = a4b(128)
 
+def g12b(layers):
+    return trunk(hidden = 3840, layers = layers, q_heads = 16, kv_heads = 8, global_kv_heads = 1,
+                 inter = 15360, window = 1024)
+
 def g31b(layers):
     return trunk(hidden = 5376, layers = layers, q_heads = 32, kv_heads = 16, global_kv_heads = 4,
                  inter = 21504, window = 1024)
@@ -214,6 +218,8 @@ def layout(id, deploy):
     d = TRUNKS[id]
     if id.startswith("gemma4-31b") and deploy.layers:
         d = g31b(deploy.layers)
+    if id == "gemma4-12b" and deploy.layers:
+        d = g12b(deploy.layers)
     if id.startswith("gemma4-26b-a4b") and deploy.experts:
         d = a4b(deploy.experts)
     weights = deploy.weights
