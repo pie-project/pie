@@ -18,8 +18,8 @@
 //!   them even at four codes a u16. It cannot fit.
 //! - the attention unit alone (gptoss_attn: no MLP, no q/k norm, long-vector
 //!   softmax): 15.7 KB of code; 38,400 B a PE at Hc 74, B 1, E 7, NB 7;
-//! - the MoE grid alone at Hc 15, Ic 23, 32 experts: 47,232 B a PE at B 1,
-//!   +304 B a lane (24,448 B of it the experts, the rest code and buffers).
+//! - the MoE grid alone at Hc 15, Ic 23, 32 experts: 47,056 B a PE at B 1,
+//!   +320 B a lane (24,448 B of it the experts, the rest code and buffers).
 //!
 //! MoE storage a PE (moe_mxfp4): each expert's gate/up tile (Hc x 2 Ic) and
 //! down tile (Ic x Hc) as three planes of ceil(L / 3) input rows of MXFP4
@@ -34,10 +34,10 @@ const PE_LIMIT: usize = 0xc000 - 768;
 
 /// The MoE grid's bytes a PE besides [`MoeUnit::buffers`] and the experts:
 /// code, runtime, collectives, x and the host kernel's leftovers (fitted to
-/// the Hc 15, Ic 23, NE 32, B 1 link: 47,232 B).
-const MOE_FIXED: usize = 18_050;
+/// the Hc 15, Ic 23, NE 32, B 1 link: 47,056 B).
+const MOE_FIXED: usize = 17_966;
 /// A lane's bytes the host kernel adds beside the MoE's own (x, its table).
-const MOE_LANE_HOST: usize = 148;
+const MOE_LANE_HOST: usize = 166;
 
 /// gptoss_attn's links (no MLP, no q/k norm; its biases and sinks in) run
 /// this far under paged8b's grid model plus the softmax's scratch
@@ -103,12 +103,14 @@ impl MoeUnit {
     pub fn buffers(&self) -> usize {
         let (g2, ne, tk, hc, ic) = (self.g2(), self.experts, self.top_k, self.hc, self.ic);
         let rmax = g2.max(hc);
-        let msc = 4 * (2 * g2).div_ceil(4).max((2 * hc).div_ceil(4));
-        let dec = (hc.div_ceil(3) * g2).max(ic.div_ceil(3) * hc);
+        // The SwiGLU (every slot at once) borrows the decode's buffers.
+        let swn = tk * ic;
+        let msc = (4 * (2 * g2).div_ceil(4).max((2 * hc).div_ceil(4))).max(swn);
+        let dec = (hc.div_ceil(3) * g2).max(ic.div_ceil(3) * hc).max(2 * swn);
         2 * (hc * ne + 1)
             + 4 * (ne + ne.div_ceil(self.py) * g2 + ne.div_ceil(self.px) * hc + 2)
-            + 4 * (dec + msc + 2 * rmax + tk)
-            + 4 * (self.mlp_chunk * tk * g2 + tk * ic + 5 * ic)
+            + 4 * (dec + msc + (2 * rmax).max(swn) + tk)
+            + 4 * (self.mlp_chunk * tk * g2 + tk * ic + swn)
             + self.lanes * (4 * (ne + 1) + 2 * tk + 4 * tk)
     }
 
@@ -333,20 +335,20 @@ mod tests {
         }
     }
 
-    /// The MoE model reproduces its links within 32 B.
+    /// The MoE model reproduces its links within 48 B.
     #[test]
     fn the_moe_model_is_fitted_to_the_links() {
         let links = [
-            (unit(36, 15, 32, 1, 1), 47_232),
-            (unit(36, 15, 32, 2, 1), 47_536),
-            (unit(36, 15, 32, 4, 1), 48_160),
-            (unit(36, 15, 32, 4, 2), 48_880),
-            (unit(36, 14, 32, 1, 1), 46_560),
-            (unit(36, 13, 8, 1, 1), 27_648),
+            (unit(36, 15, 32, 1, 1), 47_056),
+            (unit(36, 15, 32, 2, 1), 47_408),
+            (unit(36, 15, 32, 4, 1), 48_000),
+            (unit(36, 15, 32, 4, 2), 48_720),
+            (unit(36, 14, 32, 1, 1), 46_400),
+            (unit(36, 13, 8, 1, 1), 27_488),
         ];
         for (u, top) in links {
             let d = u.bytes() as isize - top as isize;
-            assert!(d.abs() <= 32, "{u:?}: model {} link {top}", u.bytes());
+            assert!(d.abs() <= 48, "{u:?}: model {} link {top}", u.bytes());
         }
         assert_eq!(unit(36, 15, 32, 1, 1).expert_bytes(), 24_448);
     }

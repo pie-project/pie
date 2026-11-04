@@ -54,6 +54,7 @@ const NEC: u16 = (NE + PX - 1) / PX;       // down bias slots a PE (experts px +
 const NE1: u16 = NE + 1;
 const DECN: u16 = mx2(GN3, DN3);
 const RMAX: u16 = mx2(G2, Hc);
+const SWN: u16 = TK * Ic;                  // SwiGLU over every slot at once
 
 var mx = @zeros([(NE * XW + 1) / 2]u32);
 var mx_ptr: [*]u32 = &mx;
@@ -68,20 +69,18 @@ var dnb_ptr: [*]f32 = &dnb;
 var mcfg = @zeros([2]u32);                 // inputs in the first 32-block: gate/up, down
 var mcfg_ptr: [*]u32 = &mcfg;
 
-var mdec: [DECN]f32 align(16) = @zeros([DECN]f32);   // low halves stay zero
-var mvec: [MSC]f32 = @zeros([MSC]f32);
-var myb = @zeros([2 * RMAX]f32);
+// mdec, mvec and myb are the SwiGLU's temps between the matvecs (it zeroes
+// mdec's and mvec's words again after).
+var mdec: [mx2(DECN, 2 * SWN)]f32 align(16) = @zeros([mx2(DECN, 2 * SWN)]f32);   // low halves stay zero
+var mvec: [mx2(MSC, SWN)]f32 = @zeros([mx2(MSC, SWN)]f32);
+var myb = @zeros([mx2(2 * RMAX, SWN)]f32);
 var rl = @zeros([B * NE1]f32);
 var sel = @zeros([B * TK]u16);
 var wts = @zeros([B * TK]f32);
 var wtmp = @zeros([TK]f32);
 var mgu = @zeros([MC * TK * G2]f32);
 var mact = @zeros([TK * Ic]f32);
-var sw_a = @zeros([Ic]f32);
-var sw_e = @zeros([Ic]f32);
-var sw_d = @zeros([Ic]f32);
-var sw_r = @zeros([Ic]f32);
-var sw_t = @zeros([Ic]f32);
+var swg = @zeros([SWN]f32);
 var m16 = @zeros([1]u16);
 
 const rl_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * NE1} -> rl[i] });
@@ -99,11 +98,12 @@ const mact_v = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> mact[i] });
 const myb_v = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * RMAX} -> myb[i] });
 const mvec_v = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MSC} -> mvec[i] });
 const mdec_v = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{RMAX} -> mdec[i] });
-const sw_a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> sw_a[i] });
-const sw_e_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> sw_e[i] });
-const sw_d_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> sw_d[i] });
-const sw_r_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> sw_r[i] });
-const sw_t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> sw_t[i] });
+const sw_g_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SWN} -> swg[i] });
+const sw_a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SWN} -> mdec[i] });
+const sw_e_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SWN} -> mdec[@as(i16, SWN) + i] });
+const sw_d_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SWN} -> myb[i] });
+const sw_r_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SWN} -> mvec[i] });
+const mact_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SWN} -> mact[i] });
 // A u16 view (base addresses set at run time).
 const u16_v = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> m16[i] });
 
@@ -203,24 +203,21 @@ fn route(b: u16) f32 {
   return sc;
 }
 
-// mact[slot] = (clamp(u) + 1) x g' sigmoid(alpha g'), g' = min(g, limit), as
-// 0.5 (g' + |g'| tanh(alpha |g'| / 2)) with tanh(z/2) = (1 - e) / (1 + e), e = exp(-z).
-fn swiglu(g: mem1d_dsd, u: mem1d_dsd, out: mem1d_dsd) void {
-  @fmovs(sw_t_d, SWL);
-  @fmovs(sw_d_d, -SWL);
+// mact = (clamp(u) + 1) x g' sigmoid(alpha g'), g' = min(g, limit), as
+// 0.5 (g' + |g'| tanh(alpha |g'| / 2)) with tanh(z/2) = (1 - e) / (1 + e),
+// e = exp(-z); over every slot at once: g in swg, u in mact on entry.
+fn swiglu() void {
+  const out = mact_all;
   // (fmins via -max(-a, -b))
-  @fnegs(sw_a_d, g);
-  @fnegs(sw_r_d, sw_t_d);
-  @fmaxs(sw_a_d, sw_a_d, sw_r_d);
-  @fnegs(sw_a_d, sw_a_d);            // g' = min(g, L)
-  @fnegs(sw_e_d, u);
-  @fmaxs(sw_e_d, sw_e_d, sw_r_d);
-  @fnegs(sw_e_d, sw_e_d);            // min(u, L)
-  @fmaxs(out, sw_e_d, sw_d_d);       // clamp(u, -L, L)
+  @fnegs(sw_g_d, sw_g_d);
+  @fmaxs(sw_g_d, sw_g_d, -SWL);
+  @fnegs(sw_g_d, sw_g_d);            // g' = min(g, L), kept
+  @fnegs(out, out);
+  @fmaxs(out, out, -SWL);
+  @fnegs(out, out);                  // min(u, L)
+  @fmaxs(out, out, -SWL);            // clamp(u, -L, L)
   @fadds(out, out, 1.0);             // u + 1
-  // sw_t = g' (kept), sw_r = |g'|
-  @fmovs(sw_t_d, sw_a_d);
-  @fabss(sw_r_d, sw_a_d);
+  @fabss(sw_r_d, sw_g_d);
   @fmuls(sw_e_d, sw_r_d, -SWA);
   exp_poly(sw_e_d, sw_d_d);          // e = exp(-alpha |g'|)
   @fadds(sw_d_d, sw_e_d, 1.0);       // 1 + e in [1, 2]
@@ -228,20 +225,24 @@ fn swiglu(g: mem1d_dsd, u: mem1d_dsd, out: mem1d_dsd) void {
   @fadds(sw_a_d, sw_a_d, 1.411764705882353);
   var it: u16 = 0;
   while (it < 3) : (it += 1) {
-    @fmuls(myb_v_ic(), sw_d_d, sw_a_d);
-    @fnegs(myb_v_ic(), myb_v_ic());
-    @fadds(myb_v_ic(), myb_v_ic(), 2.0);
-    @fmuls(sw_a_d, sw_a_d, myb_v_ic());
+    @fmuls(sw_r_d, sw_d_d, sw_a_d);
+    @fnegs(sw_r_d, sw_r_d);
+    @fadds(sw_r_d, sw_r_d, 2.0);
+    @fmuls(sw_a_d, sw_a_d, sw_r_d);
   }                                  // sw_a = 1 / (1 + e)
   @fnegs(sw_e_d, sw_e_d);
   @fadds(sw_e_d, sw_e_d, 1.0);       // 1 - e
   @fmuls(sw_e_d, sw_e_d, sw_a_d);
+  @fabss(sw_r_d, sw_g_d);
   @fmuls(sw_e_d, sw_e_d, sw_r_d);    // |g'| tanh
-  @fadds(sw_e_d, sw_e_d, sw_t_d);
+  @fadds(sw_e_d, sw_e_d, sw_g_d);
   @fmuls(sw_e_d, sw_e_d, 0.5);       // g' sigmoid(alpha g')
   @fmuls(out, out, sw_e_d);
+  // The decode's buffers again: their low halves zero.
+  @fmovs(sw_a_d, 0.0);
+  @fmovs(sw_e_d, 0.0);
+  @fmovs(sw_r_d, 0.0);
 }
-fn myb_v_ic() mem1d_dsd { return @set_dsd_length(myb_v, Ic); }
 
 fn moe_mlp() void {
   const p2k = @bitcast(f32, @as(u32, 127 + MXK) << 23);
@@ -290,11 +291,16 @@ fn moe_mlp() void {
       const hb = at(hv_dsd, lb * Hc);
       var s: u16 = 0;
       while (s < TK) : (s += 1) {
+        const g = @set_dsd_length(at(mgu_v, (k * TK + s) * G2), Ic);
+        @fmovs(@set_dsd_length(at(sw_g_d, s * Ic), Ic), g);
+        @fmovs(at(mact_v, s * Ic), at(g, Ic));
+      }
+      swiglu();
+      s = 0;
+      while (s < TK) : (s += 1) {
         const e = sel[lb * TK + s];
         const w = wts[lb * TK + s];
-        const g = at(mgu_v, (k * TK + s) * G2);
         const a = at(mact_v, s * Ic);
-        swiglu(@set_dsd_length(g, Ic), @set_dsd_length(at(g, Ic), Ic), a);
         @fmuls(a, a, w * p2k);
         mxmv(hb, e * XW + GN3, DL3, e * XW + GN3 + DN3, 1, Ic, Hc, dsplit, a);
         var k2: u16 = 0;
