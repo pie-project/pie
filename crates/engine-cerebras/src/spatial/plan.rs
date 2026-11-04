@@ -1463,6 +1463,68 @@ mod tests {
         }
     }
 
+    /// u4 scale duplication and the uniform one-layer layout (`--nocapture`,
+    /// U4G64-README "Scale dedupe"): per model (the feasibility stand-ins),
+    /// a unit PE's bytes at 128-column one-layer units sharing `UNITS` PEs
+    /// (rows: the most that fit, and the most with group-aligned hidden
+    /// tiles, `64 % Hc == 0` or `Hc % 64 == 0`), as the kernel holds scales
+    /// (`dup`) and with each scale on one PE (`own`: wo and wd by a cross-PE
+    /// per-group reduction, plus its partials' buffer), and the u4 head.
+    #[test]
+    #[ignore]
+    fn u4_dedupe_print() {
+        // Unit PEs of a wafer less the head, strip and VM columns (U4G64-README).
+        const UNITS: usize = 757_000;
+        let base = spec("qwen3-14b-u4g64-kv-bf16").expect("14b");
+        let most = WaferDims::CS3.pe_bytes - 768;
+        let models = [
+            ("qwen3-14b", 5120, 40, 40, 8, 17408, 151_936),
+            ("qwen36-27b", 5120, 64, 48, 8, 20680, 248_320),
+            ("gemma4-12b", 3840, 48, 40, 8, 15648, 262_144),
+            ("gemma4-31b", 5376, 60, 72, 8, 23552, 262_144),
+            ("muse-glimmer-30b", 6656, 52, 32, 8, 20824, 202_048),
+            ("qwen3-32b", 5120, 64, 64, 8, 25600, 151_936),
+        ];
+        let goals = Goals { lanes: 1, grid_lanes: 1, host_copy: true, blocks: Some(1), ..Goals::default() };
+        for (name, hidden, layers, q, kv, inter, vocab) in models {
+            let s = ModelSpec { hidden, layers, q_heads: q, kv_heads: kv, inter, vocab, ..base.clone() };
+            let pmax = (UNITS / (layers * 128)) / 4 * 4;
+            let aligned = (4..=pmax)
+                .rev()
+                .step_by(4)
+                .find(|&py| {
+                    let hc = hidden.div_ceil(py);
+                    64 % hc == 0 || hc % 64 == 0
+                });
+            let vr = vocab.div_ceil(1152);
+            for (tag, py) in [("most", Some(pmax)), ("aligned", aligned)] {
+                let Some(py) = py else { continue };
+                let g = SpatialPlan::grid(&s, 128, py, true, &goals);
+                let head = final_root_bytes(vr + vr % 2, g.hc, 1, 1, None, 32, true);
+                let t = super::super::u4::tiles(g.hc, g.dc, g.gs, g.qh, g.ic, true);
+                let sb = super::super::u4::scale_bytes(&t);
+                let (dup, own): (usize, usize) = sb.iter().fold((0, 0), |(a, b), &(d, o)| (a + d, b + o));
+                // The reduction's partials, [g][n + 1] f32 of the widest tile it
+                // serves, past what the decode buffer (free by then) holds.
+                let buf = 2 * (super::super::u4::BUF_WORDS + 1);
+                let part = t
+                    .iter()
+                    .zip(&sb)
+                    .filter(|(_, (d, o))| o < d)
+                    .map(|(t, _)| (4 * t.g * (t.n + 1)).saturating_sub(buf))
+                    .max()
+                    .unwrap_or(0);
+                let dupb = g.bytes(false) + Grid::staging_bytes(1);
+                let ownb = dupb - dup + own + part;
+                println!(
+                    "DEDUP {name} {tag}: {layers} x 128x{py} Hc {} Dc {} Qh {} Ic {}: scales dup {dup} own {own} (wqkv {:?} wo {:?} wgu {:?} wd {:?}); PE dup {dupb} ({:+}), own {ownb} ({:+}); head Vr {vr} {head} B",
+                    g.hc, g.dc, g.qh, g.ic, sb[0], sb[3], sb[4], sb[5],
+                    dupb as isize - most as isize, ownb as isize - most as isize
+                );
+            }
+        }
+    }
+
     /// A model's serve8b_region params at B 1 (`PARAMS_OF=<name>`,
     /// `--nocapture`): the request's `extra`.
     #[test]

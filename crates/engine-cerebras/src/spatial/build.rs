@@ -627,10 +627,23 @@ struct Placement {
 /// collectives), the matvecs by the PE's tile elements (u4 decode costs
 /// about 2 cycles an element on the simulator, bf16 about 0.6) and the
 /// collectives' hops. Only for ranking placements.
+/// On u4 units, each tile's groups add their epilogue (a few short f32
+/// ops of N, about 120 cycles of overhead and 2 a column) and each
+/// segment its scalar setup: group-aligned hidden tiles (`64 % Hc == 0`,
+/// one group) cost less than a tile straddling two.
 fn unit_cost(g: &super::plan::Grid) -> usize {
     let elems = g.hc * ((2 * g.qh + 2) * g.dc + 3 * g.ic);
     let per = if g.w4 { 20 } else { 6 };
-    8000 + elems * per / 10 + 20 * (g.px + g.py)
+    let groups = if g.w4 {
+        super::u4::tiles(g.hc, g.dc, g.gs, g.qh, g.ic, g.lanes == 1)
+            .iter()
+            .filter(|t| t.r > 0)
+            .map(|t| t.g * (120 + 2 * t.n) + 60 * t.segs())
+            .sum()
+    } else {
+        0
+    };
+    8000 + elems * per / 10 + 20 * (g.px + g.py) + groups
 }
 
 /// A unit PE's image must end this far below the top of its memory (the

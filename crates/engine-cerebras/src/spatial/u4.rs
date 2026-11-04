@@ -272,6 +272,22 @@ pub fn pe_bytes(
     symbols + 2 * (buf + 1) + 4 * (nmax + 1) + 4 * nmax + 2 * 2 * xmax
 }
 
+/// A unit PE's scale and bias bytes a layer, by tile: as the kernel holds
+/// them (every group the PE's rows touch: `Tile::g`), and owned (each
+/// (output, group) pair on one of the PEs sharing it; a run of `r` rows
+/// can be given at most `ceil(r / 64)` groups, every PE of the axis owning
+/// some). The difference is what a cross-PE per-group reduction saves.
+#[must_use]
+pub fn scale_bytes(t: &[Tile; 6]) -> [(usize, usize); 6] {
+    t.map(|t| {
+        if t.r == 0 {
+            (0, 0)
+        } else {
+            (4 * t.g * t.n, 4 * t.n * t.g.min(t.r.div_ceil(GROUP)))
+        }
+    })
+}
+
 /// A tile's column: output row `o` of a quantized matrix, or padding.
 pub type Col<'a> = Option<(&'a Q4, usize)>;
 
