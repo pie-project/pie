@@ -2004,9 +2004,16 @@ def main() -> int:
 
     print(f"[1/6] reading {args.repo} config + index")
     cfg = json.loads(fetch_bytes(args.repo, args.revision, "config.json"))
-    index_json = json.loads(fetch_bytes(args.repo, args.revision,
-                                        "model.safetensors.index.json"))
-    weight_map: dict[str, str] = index_json["weight_map"]
+    try:
+        index_json = json.loads(fetch_bytes(args.repo, args.revision,
+                                            "model.safetensors.index.json"))
+        weight_map: dict[str, str] = index_json["weight_map"]
+    except urllib.error.HTTPError as exc:
+        # a checkpoint in one file (gemma-4-E4B-it) has no index: its header names every tensor
+        if exc.code != 404:
+            raise
+        weight_map = {name: "model.safetensors"
+                      for name in read_shard_header(args.repo, args.revision, "model.safetensors")}
 
     family = resolve_family(cfg, weight_map, args.family)
     fam = FAMILIES[family]
