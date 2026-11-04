@@ -263,6 +263,9 @@ impl Spatial {
                 pages: lane_pages.clone(),
                 visible: None,
                 forced: vec![run.last],
+                state: run
+                    .state
+                    .map(|key| serve2d::StateSeat { key, fresh: false }),
             });
             flight_lanes.push((*slot, run.epoch, *end));
             pages.push(lane_pages.clone());

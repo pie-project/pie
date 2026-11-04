@@ -74,6 +74,7 @@ fn tests_every_case() {
     a_move_under_way_keeps_only_the_pages_it_holds();
     a_page_seals_under_a_key_that_names_its_prefix();
     keys_computed_ahead_find_what_another_sealed();
+    keys_from_row_zero_are_hashed_without_the_store();
     a_working_set_that_goes_leaves_its_sealed_prefix();
     a_working_set_maps_in_what_another_sealed();
     a_pass_maps_in_more_after_what_it_mapped_in();
@@ -709,6 +710,17 @@ fn seal(store: &mut KvStore, ws: WorkingSetId, start: u64, tokens: &[u32]) -> u3
 fn keys_ahead(store: &KvStore, ws: WorkingSetId, start: u64, tokens: &[u32]) -> Vec<Hash256> {
     let slots = store.slot_hashes(ws, start, tokens, 16).unwrap().unwrap();
     store.page_keys(ws, start, &slots, 16).unwrap().unwrap()
+}
+
+fn keys_from_row_zero_are_hashed_without_the_store() {
+    let mut store = KvStore::new(16, h(15));
+    let ws = store.create_working_set();
+    let tokens: Vec<u32> = (0..40).map(|t| 900 + t).collect();
+    let slots = store.slot_hashes(ws, 0, &tokens, 16).unwrap().unwrap();
+    let keys = store.page_keys(ws, 0, &slots, 16).unwrap().unwrap();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(KvStore::fresh_page_keys(&slots, 16), keys);
+    assert!(KvStore::fresh_page_keys(&slots[..15], 16).is_empty());
 }
 
 fn commit_opaque(store: &mut KvStore, ws: WorkingSetId, n: u64) {

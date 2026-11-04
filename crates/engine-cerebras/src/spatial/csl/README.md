@@ -14,6 +14,18 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
   - `qwen2d_paged8b_hr.csl`: the bf16 8B layer with the HROUTE (host-written
     collective routes), ROT8 and GY params: serve8b's and serve8b_region's
     grids.
+  - `qwen35_gdn.csl`: Qwen3.5's Gated DeltaNet layer and its MLP on a
+    P x P f32 grid (P = k_dim), the recurrent state's row k on grid row k,
+    the conv window and state a lane slot's (`reset`).
+  - `qwen35_attn.csl`: qwen2d_paged with `Qh` query heads a kv head, each
+    gated by sigmoid of its gate projection; a partial RoPE is the
+    placement's (unturned pairs turn by zero).
+  - Both units match numpy on the fabric simulator (16 x 16 and 32 x 32
+    grids: several steps, a slot reset, two passes a launch; the attention
+    unit through the paged scenario) and link at Qwen3.5-0.8B's dims
+    (P 128: the GDN unit 30.1 KB a PE at B 1, 39.1 KB at B 8; the
+    attention unit 34.2 KB at B 1 NB 8, 41.4 KB at B 8). No design places
+    them yet: no codegen pin.
   - `qwen2d_region.csl`: several bf16 layers on one region (x stays in
     place between them): serve8b_region's regions.
   - `softmax_s123.json`, `softmax_s13_06b.json`: the fast-softmax levers

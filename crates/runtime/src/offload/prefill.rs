@@ -291,8 +291,13 @@ fn plan(
     if limit <= first {
         return None;
     }
+    let fresh =
+        (held == 0).then(|| crate::store::kv::KvStore::fresh_page_keys(slots, stores.kv_page_size));
     with_kv_lock(&stores.kv, "offload-plan", |kv| {
-        let keys = kv.page_keys(ws, held, slots, stores.kv_page_size).ok()??;
+        let keys = match fresh {
+            Some(keys) => keys,
+            None => kv.page_keys(ws, held, slots, stores.kv_page_size).ok()??,
+        };
         // The run is counted from token 0, as the keys are.
         let have = (kv.cached_run_any_tier(&keys).len() as u64).max(first);
         if have >= limit {

@@ -29,6 +29,7 @@ fn main() -> Result<(), String> {
         pages: pages[b].clone(),
         visible: None,
         forced,
+        state: None,
     };
     // Prefill: the prompts must be the same length to share a launch.
     assert_eq!(prompts[0].len(), prompts[1].len());

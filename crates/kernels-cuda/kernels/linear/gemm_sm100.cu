@@ -1271,6 +1271,15 @@ __global__ __launch_bounds__(kMix != 0 ? 224 + 32 * tc5k::kXWarps : 224, 1) void
                         return __fdividef(g, 1.f + __expf(-g)) * u;
                     }
                 }
+                // SwiGLU clamped with alpha likewise, in `swiglu_clamp_alpha`'s
+                // precise quotient.
+                if constexpr (kOut == 2 && kGlu == 3) {
+                    if (epi.in_scale != nullptr) {
+                        g = fminf(bf16_to_f32(f32_to_bf16(g)), epi.limit);
+                        u = fminf(fmaxf(bf16_to_f32(f32_to_bf16(u)), -epi.limit), epi.limit);
+                        return (u + 1.f) * (g / (1.f + expf(-epi.galpha * g)));
+                    }
+                }
                 return tc5k::glu<kGlu>(g, u, epi.limit, epi.galpha);
             };
             // An ungated activation (relu2) of a value, or the value itself;

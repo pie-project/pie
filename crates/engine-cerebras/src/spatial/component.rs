@@ -141,6 +141,13 @@ impl Component for Layers {
         let f32s = |names: &[&'static str]| names.iter().map(|&n| S::var32(n)).collect::<Vec<_>>();
         match self {
             // qwen2d's one-sequence grids, and qwen2d_paged's.
+            // serve_q35's two units, every name either exports.
+            Layers::Grids {
+                hybrid: Some(_), ..
+            } => f32s(&[
+                "wp", "cw", "cst", "gab", "nw", "st", "wg", "wqa", "wqv", "wv", "qkn_w", "rot_c",
+                "rot_s", "wo", "wgu", "wd", "gamma1", "gamma2",
+            ]),
             Layers::Grids { .. } => match spec.kv {
                 Kv::Sequence => f32s(&[
                     "wqkv", "qkn_w", "inv_freq", "wo", "wgu", "wd", "gamma1", "gamma2",
@@ -189,6 +196,9 @@ impl Component for Layers {
 
     fn place(&self, spec: &ProgramSpec, w: &Weights, dev: &mut dyn Device) -> R<()> {
         match self {
+            Layers::Grids {
+                hybrid: Some(_), ..
+            } => super::serve_q35::place_layers(spec, w.ckpt, w.rope_theta, dev),
             Layers::Grids { .. } => super::serve2d::place_layers(spec, w.ckpt, w.rope_theta, dev),
             Layers::Strips { .. } => super::serve8b::place_layers(spec, w.ckpt, w.rope_theta, dev),
             Layers::Units { units, .. } => {
@@ -321,7 +331,11 @@ impl Kv {
     /// grid.
     fn host_pool(spec: &ProgramSpec, shape: Shape) -> HostPool {
         HostPool {
-            grids: (0..spec.layers()).map(|l| spec.origin(l)).collect(),
+            // serve_q35's attention grids (the others hold no pool).
+            grids: (0..spec.layers())
+                .filter(|&l| spec.attends(l))
+                .map(|l| spec.origin(l))
+                .collect(),
             cols: spec.px(),
             shape,
             cells: spec.dc() * shape.page_size,
@@ -664,6 +678,10 @@ pub mod abi {
     #[must_use]
     pub fn launch(spec: &ProgramSpec) -> Vec<Symbol> {
         let mut out = vec![Symbol::func("init", 0), Symbol::func(SYM.compute, 2)];
+        // serve_q35: a lane slot's Gated DeltaNet state zeroed.
+        if spec.hybrid().is_some() {
+            out.push(Symbol::func("reset", 1));
+        }
         if spec.paged().is_some() {
             out.push(Symbol::var32(match spec.stage {
                 Stage::Ring { .. } => SYM.ring_table,

@@ -19,8 +19,11 @@ DEPLOYMENTS = [
     deployment("gptoss-20b", weights = [dtype.u4g64, dtype.mxfp4], kv = dtype.bf16),
     deployment("gptoss-20b", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
     deployment("gptoss-20b-mini", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
+    deployment("gptoss-20b-mini", weights = [dtype.u4g64, dtype.mxfp4], kv = dtype.bf16),
     deployment("gptoss-120b-mini-e64", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
     deployment("gptoss-120b", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
+    deployment("gptoss-120b-mini-e64", weights = [dtype.u4g32, dtype.mxfp4], kv = dtype.bf16),
+    deployment("gptoss-120b", weights = [dtype.u4g32, dtype.mxfp4], kv = dtype.bf16),
     # Keys and values e4m3 under a unit scale, as vLLM's Blackwell recipe
     # serves gpt-oss.
     deployment("gptoss-20b", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.e4m3),
@@ -100,10 +103,12 @@ def layout(id, deploy):
     if deploy.drafter != None and deploy.drafter != "dflash":
         fail("{} drafts with dflash or nothing, not {}".format(id, deploy.drafter))
     d = DIMS[id]
+    if deploy.layers or deploy.experts:
+        d = dims(deploy.layers or d.layers, deploy.experts or d.experts)
     r = roles(deploy, "weights", "experts", exact = True)
     weights, experts = r.weights, r.experts
     dense = compute(weights)
-    router = dtype.u8g64 if weights == dtype.u4g64 else weights
+    router = dtype.u8g64 if weights in [dtype.u4g64, dtype.u4g32] else weights
     hidden = d.hidden
     hd = d.head_dim
     q_w = d.q_heads * hd
