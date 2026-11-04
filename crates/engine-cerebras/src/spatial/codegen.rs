@@ -30,6 +30,12 @@ mod src {
     /// Their S1 and S3 on the 0.6B layer, qwen2d_paged's or qwen2d_pring's
     /// pe.csl.
     pub const SOFTMAX_S13_06B: &str = include_str!("csl/kernels/softmax_s13_06b.json");
+    /// The op cuts (cerebras-8b-speed, `Variant::speed`) on both unit
+    /// kernels: exp by range reduction (the softmax's and SiLU's).
+    pub const SPEED_OPS: &str = include_str!("csl/kernels/speed_ops.json");
+    /// On qwen2d_region's only (the grids' images have no room): the scores
+    /// without kmv's per-call conversions, RoPE over every head at once.
+    pub const SPEED_OPS_REGION: &str = include_str!("csl/kernels/speed_ops_region.json");
     pub const VM_HM: &str = include_str!("csl/vm/guest4hm_vm.csl");
     pub const VM_HZ: &str = include_str!("csl/vm/guest4hz_vm.csl");
     /// Every design's runtime route and queue-color helpers.
@@ -259,6 +265,9 @@ pub struct Variant {
     pub identity_qk_norm: bool,
     /// The RMSNorm epsilon's f32 bits, when not the kernels' literal 1e-6.
     pub eps_bits: Option<u32>,
+    /// `SPD` 1: the units' op cuts (`speed_ops*.json`; a faster, slightly
+    /// more exact exp, otherwise the same arithmetic).
+    pub speed: bool,
 }
 
 impl Variant {
@@ -287,6 +296,12 @@ impl Variant {
                 &s[..a],
                 &s[b..]
             );
+        }
+        if self.speed {
+            s = apply_reps("speed_ops", src::SPEED_OPS, &s, tag)?;
+            if tag.starts_with("qwen2d_region/") {
+                s = apply_reps("speed_ops_region", src::SPEED_OPS_REGION, &s, tag)?;
+            }
         }
         if let Some(bits) = self.eps_bits {
             let eps = f32::from_bits(bits);

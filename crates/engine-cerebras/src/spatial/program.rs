@@ -70,6 +70,8 @@ pub struct Model {
     pub qk_norm: bool,
     /// `EPS`: the RMSNorm epsilon's f32 bits (0: the kernels' 1e-6).
     pub eps_bits: u32,
+    /// `SPD` 1: the units carry the speed op cuts (`Variant::speed`).
+    pub speed: bool,
 }
 
 impl Model {
@@ -83,6 +85,7 @@ impl Model {
             cap,
             qk_norm: true,
             eps_bits: 0,
+            speed: false,
         }
     }
 
@@ -102,6 +105,7 @@ impl Model {
         super::codegen::Variant {
             identity_qk_norm: !self.qk_norm,
             eps_bits: (self.eps_bits != 0).then_some(self.eps_bits),
+            speed: self.speed,
         }
     }
 }
@@ -680,6 +684,7 @@ impl ProgramSpec {
             "CAP" => Some(m.cap),
             "QKN" => Some(usize::from(m.qk_norm)),
             "EPS" => Some(m.eps_bits as usize),
+            "SPD" => Some(usize::from(m.speed)),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1298,6 +1303,7 @@ fn model(get: &Get) -> R<Model> {
         cap: get.req("CAP")?,
         qk_norm: get.opt("QKN").unwrap_or(1) != 0,
         eps_bits: u32::try_from(get.opt("EPS").unwrap_or(0)).map_err(|e| format!("EPS: {e}"))?,
+        speed: get.opt("SPD").unwrap_or(0) != 0,
     })
 }
 

@@ -53,6 +53,9 @@ param ROT8: u16;       // 1: RoPE tables of 4 x 8
 // epsilon's f32 bits (0: the kernels' 1e-6).
 param QKN: u16 = 1;
 param EPS: u32 = 0;
+// SPD 1: the units carry the speed op cuts (codegen.rs `Variant::speed`; the
+// layout passes it on to neither).
+param SPD: u16 = 0;
 param NOLAYER: u16 = 0;    // 1 (checking the handoffs alone): the units skip their layers
 param VMX: u16 = 0;        // 1: a 5-column VM block east of the strip (VM5.md; then VMC 0)
 param VMREAL: u16 = 0;     // VMX: 1 Fork 3's eta VM (vm_pe.csl), 0 the stand-in (vm_stub.csl)

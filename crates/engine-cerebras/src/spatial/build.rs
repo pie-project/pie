@@ -156,6 +156,12 @@ pub struct ServeConfig {
     /// regions) instead of serve8b's strips; with the `pipeline` goal, as
     /// serve8b_region_pipe's ring (`mmax` micro-batches).
     pub region: bool,
+    /// serve8b_region(_pipe): the units' op cuts (`SPD` 1, codegen's
+    /// `Variant::speed`; cerebras-8b-speed).
+    pub speed: bool,
+    /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
+    /// exact three-part x (`MODE` 0): a third of the head's matvec.
+    pub head_one_pass: bool,
     pub pins: Pins,
 }
 
@@ -171,6 +177,8 @@ impl ServeConfig {
             spec: None,
             smp: false,
             region: false,
+            speed: false,
+            head_one_pass: false,
             pins: Pins::default(),
         }
     }
@@ -235,6 +243,8 @@ impl ServeConfig {
             "pins",
             "region",
             "rows",
+            "speed",
+            "head_one_pass",
         ];
         if let Some(k) = t.keys().find(|k| !known.contains(&k.as_str())) {
             return Err(format!("[cerebras.spatial.serve]: unknown key `{k}`"));
@@ -322,6 +332,8 @@ impl ServeConfig {
             spec,
             smp: flag(t, "smp")?,
             region: flag(t, "region")?,
+            speed: flag(t, "speed")?,
+            head_one_pass: flag(t, "head_one_pass")?,
             pins: match t.get("pins") {
                 None => Pins::default(),
                 Some(v) => {
@@ -1129,6 +1141,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             } else {
                 plan.spec.rms_eps.to_bits()
             },
+            speed: cfg.speed,
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1171,6 +1184,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if plan.spec.rms_eps != super::model::KERNEL_EPS {
         st.push(Typed("EPS"));
     }
+    if cfg.speed {
+        st.push(Typed("SPD"));
+    }
     st.extend([
         Knob("MC", g.mlp_chunk),
         Knob("W16", usize::from(g.w16)),
@@ -1188,7 +1204,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         Knob("Gy", gy),
         Typed("vocab"),
         Knob("PASSES", 3),
-        Knob("MODE", 0),
+        Knob("MODE", if cfg.head_one_pass { 2 } else { 0 }),
         Knob("OVL", 0),
         Typed("VMC"),
         Typed("CAP"),
@@ -2381,6 +2397,7 @@ mod llama31_8b {
     use super::*;
     use crate::spatial::model::ModelSpec;
     use crate::spatial::plan::WaferDims;
+    use crate::spatial::codegen::Variant;
 
     fn spec() -> ModelSpec {
         let catalog = poem_compiler::catalog::repository();
@@ -2463,6 +2480,37 @@ mod llama31_8b {
             _ => get(k),
         };
         assert!(plan.spec.check_program(qwen_get).is_err());
+    }
+
+    /// `speed` states SPD 1 (and `head_one_pass` MODE 2): the units' files
+    /// carry the op cuts (the exp on both kernels, the scores' and RoPE's on
+    /// the regions only), the rest is the default build's.
+    #[test]
+    fn speed_states_spd_and_patches_the_units() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.speed = true;
+        cfg.head_one_pass = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
+        assert_eq!(get("SPD").as_deref(), Some("1"));
+        assert_eq!(get("MODE").as_deref(), Some("2"));
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        assert!(lay.model.speed);
+        let base = d.files_with(Variant { speed: false, ..lay.model.variant() }).unwrap();
+        let fast = d.files_with(lay.model.variant()).unwrap();
+        for ((n, a), (_, b)) in base.iter().zip(&fast) {
+            match *n {
+                "grid_pe.csl" => {
+                    assert!(b.contains("fn exp_fast(") && !a.contains("fn exp_fast("));
+                    assert!(!b.contains("fn q_parts("));
+                }
+                "region_pe.csl" => {
+                    assert!(b.contains("fn exp_fast(") && b.contains("fn q_parts("));
+                    assert!(b.contains("fn rope_vec("));
+                }
+                _ => assert_eq!(a, b, "{n}"),
+            }
+        }
     }
 
     /// The ring at PY 152: B 1 x 12 at CAP 32 ran on hardware (0402) and
