@@ -127,12 +127,51 @@ fn main() -> Result<(), String> {
         }
         at += n;
     }
+    // BENCH8B_PROF=<launches>: the profile counters (a TIME 1 build) over
+    // that many decode launches of CAP - 1 passes from position 256 (the
+    // golden's tokens forced), zeroed first; each unit's and the head's
+    // per-slot max and mean over its PEs, a timed pass (CAP - 2 a launch).
+    let mut profile = serde_json::Value::Null;
+    if let Some(k) = std::env::var("BENCH8B_PROF").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let mut run = || -> Result<serde_json::Value, String> {
+            m.profile(true)?;
+            let at0 = 256.min(seq.len().saturating_sub(cap));
+            // (every pass's position inside the lane's pages)
+            let k = k.min((npg as usize * ps).saturating_sub(at0 + 1) / (cap - 1)).max(1);
+            let tp = Instant::now();
+            for j in 0..k {
+                let at = at0 + j * (cap - 1);
+                let forced: Vec<u32> = (0..cap - 1).map(|i| seq[(at + i) % seq.len()]).collect();
+                m.fire_batch(&[lane(at, forced)], cap - 1, false)?;
+            }
+            let wall = tp.elapsed().as_secs_f64();
+            let timed = (k * (cap - 2)) as f64;
+            let units: Vec<serde_json::Value> = m
+                .profile(false)?
+                .into_iter()
+                .map(|(r, mx, mean)| {
+                    serde_json::json!({
+                        "rect": [r.x, r.y, r.w, r.h],
+                        "max": mx.iter().map(|&v| v as f64 / timed).collect::<Vec<_>>(),
+                        "mean": mean.iter().map(|&v| v / timed).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "launches": k, "timed_passes": timed, "start": at0,
+                "wall_s": wall, "ms_pass": 1e3 * wall / (k * (cap - 1)) as f64,
+                "units": units,
+            }))
+        };
+        profile = run().unwrap_or_else(|e| serde_json::json!({"error": e}));
+    }
     println!(
         "{}",
         serde_json::json!({
             "program": args[1], "w4": m.design().weights_u4(), "cap": cap, "load_s": load_s,
             "prompt_len": prompt.len(), "new": new, "runs": runs,
             "teacher": {"tokens": want.len(), "mismatches": mismatches},
+            "profile": profile,
         })
     );
     Ok(())

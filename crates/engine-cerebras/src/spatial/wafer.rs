@@ -487,6 +487,36 @@ impl WaferModel {
         &self.design
     }
 
+    /// The profile counters (`prof`, 16 words a PE) of every layer unit
+    /// (serve8b_region's grid areas, in layer order) and of the head block:
+    /// for each, the max and the mean over its PEs a slot. The units count
+    /// under TIME 1 (PROF 0: slot 0 the pass; PROF 1: a slot a phase), the
+    /// head always. `zero` writes them back to 0 after the read.
+    pub fn profile(&mut self, zero: bool) -> R<Vec<(Rect, Vec<u32>, Vec<f64>)>> {
+        const NP: usize = 16;
+        let mut rects = self.design.grid_areas();
+        let hx = self.design.head_x();
+        rects.push(rect(hx, 0, self.design.chunk_cols() + self.design.vmc(), self.design.hh() + 1));
+        let mut out = Vec::new();
+        for r in rects {
+            let a = self.rt.get("prof", r, NP)?;
+            let n = a.len() / NP;
+            let mut mx = vec![0u32; NP];
+            let mut mean = vec![0f64; NP];
+            for pe in a.chunks(NP) {
+                for s in 0..NP {
+                    mx[s] = mx[s].max(pe[s]);
+                    mean[s] += pe[s] as f64 / n as f64;
+                }
+            }
+            if zero {
+                self.rt.write("prof", r, NP, &vec![0u32; a.len()])?;
+            }
+            out.push((r, mx, mean));
+        }
+        Ok(out)
+    }
+
     /// Why the head's VM cannot take `table` (no VM, or a table past its
     /// limits or its ring's width), if it cannot.
     pub fn vm_refuses(&self, table: &super::guest4::Table) -> Option<String> {
