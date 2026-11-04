@@ -16,8 +16,8 @@
 //! - attention and the MoE on one grid (qwen2d_paged8b_hr with the MoE as its
 //!   MLP, 128 x 234, Hc 13): 34.3 KB a PE besides the experts, 52.5 KB with
 //!   them even at four codes a u16. It cannot fit.
-//! - the attention unit alone (no MLP): 21 KB a PE besides its weights, pool
-//!   and lanes (the model below: paged8b's, at most 1.3 KB high);
+//! - the attention unit alone (gptoss_attn: no MLP, no q/k norm): 14.6 KB of
+//!   code; 35,520 B a PE at Hc 74, B 1, E 7, NB 7;
 //! - the MoE grid alone at Hc 15, Ic 23, 32 experts: 47,232 B a PE at B 1,
 //!   +304 B a lane (24,448 B of it the experts, the rest code and buffers).
 //!
@@ -39,12 +39,10 @@ const MOE_FIXED: usize = 18_050;
 /// A lane's bytes the host kernel adds beside the MoE's own (x, its table).
 const MOE_LANE_HOST: usize = 148;
 
-/// The attention unit's links run 164 to 1,300 B under paged8b's grid model
-/// (they carry no MLP code); the model keeps the smallest gap.
-const ATTN_LESS: usize = 164;
-/// gpt-oss's attention extras a PE, not linked yet (estimate): q/k/v and o
-/// biases, the sinks, and their code.
-const ATTN_EXTRA_CODE: usize = 640;
+/// gptoss_attn's links (no MLP, no q/k norm; its biases and sinks in) run
+/// 3,510 to 3,534 B under paged8b's grid model; the model keeps the smallest
+/// gap.
+const ATTN_LESS: usize = 3_510;
 
 /// The embedding strip's tables a PE, at most (serve8b's: 116 dims x 132
 /// rows, bf16).
@@ -172,11 +170,9 @@ impl AttnUnit {
         }
     }
 
-    /// A PE's bytes: the links' model plus the unlinked extras.
+    /// A PE's bytes (gptoss_attn).
     pub fn bytes(&self) -> usize {
-        let g = &self.grid;
-        let extra = 4 * ((g.qh + 2) * g.dc + g.hc + g.qh) + ATTN_EXTRA_CODE;
-        g.bytes(false) - ATTN_LESS + extra
+        self.grid.bytes(false) - ATTN_LESS
     }
 }
 
@@ -195,7 +191,8 @@ pub struct GptossLayout {
     pub k: usize,
     pub head_c: usize,
     pub vr: usize,
-    /// The embedding strip: `strip_c` columns of 4 Hc dims.
+    /// The embedding strip: `strip_c` columns of `j` MoE rows' Hc dims.
+    pub j: usize,
     pub strip_c: usize,
     pub width: usize,
     pub height: usize,
@@ -204,8 +201,8 @@ pub struct GptossLayout {
 impl GptossLayout {
     /// The layout for `lanes` lanes of up to `context` positions: slots of
     /// as many rows as `down` bands give, the attention unit's rows (and with
-    /// them the MoE grid's) chosen for the largest slack of the two units,
-    /// the narrowest head whose tables fit.
+    /// them the MoE grid's) chosen for the largest KV pool, the narrowest head
+    /// and strip whose tables fit.
     pub fn derive(
         spec: &ModelSpec,
         wafer: WaferDims,
@@ -218,7 +215,7 @@ impl GptossLayout {
         }
         let context = context.min(ROPE_POSITIONS);
         let px = spec.kv_heads * (spec.head_dim / DC);
-        let mut best: Option<(usize, GptossLayout)> = None;
+        let mut best: Option<((usize, usize), GptossLayout)> = None;
         let mut why = Vec::new();
         for down in 1..=spec.layers {
             let height = wafer.height / down;
@@ -245,17 +242,18 @@ impl GptossLayout {
                 let Some((k, head_c, vr)) = Self::head(spec, moe.hc, rm) else {
                     continue;
                 };
-                let strip_c = rm.div_ceil(4);
-                if 2 * 4 * moe.hc * vr > STRIP_TABLES {
+                // The strip: the most MoE rows a column whose tables fit.
+                let Some(j) = (1..=8).rev().find(|j| 2 * j * moe.hc * vr <= STRIP_TABLES) else {
                     continue;
-                }
+                };
+                let strip_c = rm.div_ceil(j);
                 let width = across * px + head_c + 1 + strip_c;
                 if width > wafer.width || HEAD_ROWS > wafer.height {
                     why.push(format!("{down} bands, ra {ra}: {width} columns"));
                     continue;
                 }
-                // Slack before the pool takes the attention unit's rest.
-                let slack = (PE_LIMIT - a0.bytes()).min(PE_LIMIT - moe.bytes());
+                // The largest pool, then the MoE grid's slack.
+                let slack = (blocks * ra, PE_LIMIT - moe.bytes());
                 let l = GptossLayout {
                     across,
                     down,
@@ -266,6 +264,7 @@ impl GptossLayout {
                     k,
                     head_c,
                     vr,
+                    j,
                     strip_c,
                     width,
                     height: down * height,
@@ -346,28 +345,22 @@ mod tests {
         assert_eq!(unit(36, 15, 32, 1, 1).expert_bytes(), 24_448);
     }
 
-    /// The attention model never runs under its links, and at most 1.3 KB
-    /// over (hc, lanes, entries, blocks -> image end; the extras excluded).
+    /// The attention model never runs under gptoss_attn's links, and at most
+    /// 32 B over (hc, lanes, entries, blocks -> image end).
     #[test]
     fn the_attention_model_covers_the_links() {
         let s = spec("gptoss-20b-bf16-mxfp4-kv-bf16");
         let links = [
-            ((13, 1, 1, 4), 23_936),
-            ((85, 1, 1, 4), 36_736),
-            ((85, 1, 1, 32), 43_904),
-            ((85, 1, 8, 8), 40_992),
-            ((69, 1, 6, 8), 37_200),
-            ((69, 2, 6, 8), 40_928),
-            ((69, 4, 6, 8), 47_968),
-            ((69, 4, 2, 8), 39_616),
-            ((69, 8, 1, 8), 41_648),
+            ((74, 1, 7, 7), 35_520),
+            ((74, 2, 7, 14), 41_424),
+            ((74, 1, 6, 8), 35_248),
         ];
         for ((hc, b, e, nb), top) in links {
             let mut a = AttnUnit::new(&s, 2880usize.div_ceil(hc), b, e, nb);
             a.grid.hc = hc;
-            let m = a.grid.bytes(false) - ATTN_LESS;
+            let m = a.bytes();
             assert!(
-                m >= top && m <= top + 1_300,
+                m >= top && m <= top + 32,
                 "hc {hc} B {b} E {e} NB {nb}: model {m} link {top}"
             );
         }
@@ -389,7 +382,7 @@ mod tests {
             assert!(l.pool_positions() >= lanes * ctx);
             println!(
                 "B {lanes} x {ctx}: {} x {} slots of 128 x ({} + {}), attention Hc {} E {} NB {} ({} B, pool {} positions), \
-                 MoE Hc {} Ic {} ({} B), head {} x {} cols (k {}, Vr {}), strip {}, {} x {}",
+                 MoE Hc {} Ic {} ({} B), head {} x {} cols (k {}, Vr {}), strip {} (j {}), {} x {}",
                 l.across,
                 l.down,
                 l.ra,
@@ -407,6 +400,7 @@ mod tests {
                 l.k,
                 l.vr,
                 l.strip_c,
+                l.j,
                 l.width,
                 l.height
             );
