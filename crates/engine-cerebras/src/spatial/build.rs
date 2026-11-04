@@ -887,8 +887,12 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         Typed("CAP"),
         Knob("iters", 1),
         Typed("B"),
-        Knob("NP", if pipe.is_some() { 1 } else { 3 }),
+        // u4g64 units take x as one bf16 part, as MLX's bf16 activations.
+        Knob("NP", if pipe.is_some() || g.w4 { 1 } else { 3 }),
     ]);
+    if g.w4 {
+        st.push(Knob("W4", 1));
+    }
     Ok(Draft { spec, stated: st })
 }
 
@@ -1285,7 +1289,7 @@ pub fn program(plan: &SpatialPlan, cfg: &ServeConfig) -> R<ProgramSpec> {
         let b = cfg.vm_b.map(|(img, _)| limits(&img));
         draft.spec.sampler = draft.spec.head_sampler(limits(&vm), b, false);
     }
-    let files = d.files()?;
+    let files = d.files_w4(plan.grid.w4)?;
     let layout = &files
         .iter()
         .find(|f| f.0 == "layout.csl")
@@ -1375,7 +1379,7 @@ pub fn compile(program: &ProgramSpec, target: crate::sdk::Target, system: bool) 
     use crate::sdk::{Arch, Compile, Cslc};
     let (design, params) = (program.design, &program.to_params());
     shapes::check(design, params)?;
-    let files = design.files_with(program.model.variant())?;
+    let files = design.files_for(program.model.variant(), program.weights_u4())?;
     let (w, h) = program.rectangle();
     let (w, h) = (w as u32, h as u32);
     let (fabric_dims, fabric_offsets) = crate::sdk::cslc::memcpy_fabric(w, h);

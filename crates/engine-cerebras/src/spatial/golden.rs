@@ -132,7 +132,7 @@ const S8BR_HW: &str = "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:240,RHc:
     CAP:64,iters:1,B:1,NP:3";
 
 /// The model a program's params describe, as checkpoint shapes.
-fn shapes(g: &ProgramSpec, untied: bool) -> Vec<(String, Vec<usize>)> {
+pub(super) fn shapes(g: &ProgramSpec, untied: bool) -> Vec<(String, Vec<usize>)> {
     let (hid, d, qh, vocab) = (g.hidden(), g.head_dim(), g.qh(), g.vocab());
     let nkv = g.px() / g.gs();
     let (qdim, inter) = (nkv * qh * d, g.px() * g.ic());

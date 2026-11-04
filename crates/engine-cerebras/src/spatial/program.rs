@@ -653,6 +653,13 @@ impl ProgramSpec {
             .collect()
     }
 
+    /// The units hold u4g64 weights (`W4 1`: codegen's W4 variant of
+    /// serve8b_region, placed by `spatial::u4`).
+    #[must_use]
+    pub fn weights_u4(&self) -> bool {
+        self.knobs.get("W4").is_some_and(|v| v.trim() == "1")
+    }
+
     /// The typed parameter `k`, from the component that holds it (`None`:
     /// a knob, or a parameter this design's components do not hold).
     #[must_use]

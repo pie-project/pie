@@ -192,6 +192,7 @@ impl Q35Plan {
             w16: false,
             kv16: false,
             host_copy: goals.host_copy,
+            w4: false,
         };
         let mut attn = AttnUnit {
             grid,

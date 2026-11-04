@@ -126,6 +126,9 @@ pub struct Grid {
     pub w16: bool,
     pub kv16: bool,
     pub host_copy: bool,
+    /// The projections stay u4g64 in PE memory (`W4`, `spatial::u4`; on
+    /// the bf16 units only).
+    pub w4: bool,
 }
 
 impl Grid {
@@ -251,6 +254,11 @@ const RING_CODE: usize = 576;
 
 impl Grid {
     fn weight_bytes(&self) -> usize {
+        if self.w4 {
+            // The six u4 tiles (codes, groups' scales and biases, segments)
+            // and the decode scratch (`u4::pe_bytes`).
+            return super::u4::pe_bytes(self.hc, self.dc, self.gs, self.qh, self.ic, 1);
+        }
         // wqkv Hc x (Qh + 2) Dc, wo Qh Dc x Hc, wgu Hc x 2 Ic, wd Ic x Hc.
         let elems = self.hc * ((2 * self.qh + 2) * self.dc + 3 * self.ic);
         elems * if self.w16 { 2 } else { 4 }
@@ -361,6 +369,9 @@ impl SpatialPlan {
                 spec.hidden, spec.inter
             ));
         }
+        if spec.weights == poem_ir::Dtype::U4g64 {
+            why_not_serve2d.push("u4g64 weights run on the bf16 units (W4) only".into());
+        }
         let pipeline = goals.pipeline;
         if why_not_serve2d.is_empty() {
             let grid = Self::grid(spec, px, px, false, &goals);
@@ -412,6 +423,7 @@ impl SpatialPlan {
             w16,
             kv16: w16,
             host_copy: goals.host_copy,
+            w4: w16 && spec.weights == poem_ir::Dtype::U4g64,
         };
         if goals.blocks.is_none() {
             let mut nb = 1;
@@ -577,6 +589,9 @@ impl SpatialPlan {
             blocks: Some(1),
             ..goals
         };
+        // The fewest rows (steps of 16) whose grid fits (a u4g64 model's by
+        // its u4 bytes: fewer rows a layer, so more layers on the wafer),
+        // or the rows pinned.
         let py = match goals.rows {
             Some(py) if py == 0 || !py.is_multiple_of(4) || py > wafer.height => {
                 return refuse(format!(
@@ -1075,13 +1090,36 @@ mod tests {
         assert_eq!((p.family, p.grid.ic, p.grid.qh), (Family::Paged8b, 112, 4));
     }
 
+    /// A u4g64 deployment reads, and plans its grid by the u4 byte model:
+    /// fewer rows a layer than its bf16 deployment's, W4 on.
+    #[test]
+    fn u4g64_plans_smaller_grids() {
+        for id in ["qwen3-8b", "qwen3-14b", "qwen3-32b"] {
+            let u = spec(&format!("{id}-u4g64-kv-bf16")).expect("u4g64 reads");
+            let b = spec(&format!("{id}-bf16-kv-bf16")).expect("bf16 reads");
+            assert_eq!(u.weights, Dtype::U4g64);
+            let (pu, pb) = (plan(&u, Goals::lanes(1)), plan(&b, Goals::lanes(1)));
+            assert!(pu.grid.w4 && !pb.grid.w4);
+            assert_eq!(pu.family, Family::Paged8b);
+            // On the bf16 grid the u4 tiles and their decode scratch take
+            // less than the bf16 tiles, and the u4 grid has fewer rows;
+            // except where the u4 per-PE overhead (the decoded plane, the
+            // groups' accumulators and scales: they scale with a PE's
+            // outputs, not its Hc) outweighs the codes: Qwen3-32B (Ic 200,
+            // Hc 10 at 512 rows) plans more rows in u4 than in bf16.
+            let on_bf16 = Grid { w4: true, ..pb.grid };
+            let smaller = on_bf16.weight_bytes() < pb.grid.weight_bytes();
+            assert_eq!(smaller, id != "qwen3-32b", "{id}");
+            assert_eq!(pu.grid.py < pb.grid.py, id != "qwen3-32b", "{id}");
+        }
+    }
+
     /// Models whose structure the kernels don't implement are refused by name.
     #[test]
     fn other_structures_are_refused() {
         for (name, why) in [
             ("qwen3-30b-a3b-bf16-kv-bf16", "mixture of experts"),
             ("gemma4-12b-bf16-kv-bf16", ""),
-            ("qwen3-8b-u4g64-kv-bf16", "U4g64 projections"),
             ("qwen3-0.6b-bf16-kv-e4m3", "E4m3 KV"),
         ] {
             let err = spec(name).expect_err(name);
@@ -1134,6 +1172,74 @@ mod tests {
         assert!(err.0.contains("untied lm_head"), "{err}");
     }
 
+    /// Prints whether serve8b_region (option A) builds each Qwen3 model at
+    /// B 1, bf16 and u4g64 (`--nocapture`).
+    #[test]
+    fn region_fits_print() {
+        for id in ["qwen3-8b", "qwen3-14b", "qwen3-32b"] {
+            for w in ["bf16", "u4g64"] {
+                let name = format!("{id}-{w}-kv-bf16");
+                let s = spec(&name).expect(&name);
+                let goals = Goals {
+                    lanes: 1,
+                    grid_lanes: 4,
+                    host_copy: true,
+                    ..Goals::default()
+                };
+                let p = plan(&s, goals);
+                let mut cfg = super::super::build::ServeConfig::new(goals);
+                cfg.region = true;
+                let g = &p.grid;
+                match super::super::build::program(&p, &cfg) {
+                    Ok(spec) => println!(
+                        "FIT {name}: grid {}x{} Hc {} bytes {} -> {:?} {:?}",
+                        g.px, g.py, g.hc, p.grid_bytes, spec.design, spec.rectangle()
+                    ),
+                    Err(e) => println!(
+                        "FIT {name}: grid {}x{} Hc {} bytes {} -> {e}",
+                        g.px, g.py, g.hc, p.grid_bytes
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The unit PE bytes behind a 14B/32B u4 layout (`--nocapture`): the
+    /// grid at serve8b_region's widest head-fitting PY (144) and the
+    /// 256 x 240 region at 3..5 layers a PE (the byte model of one layer,
+    /// the rest's weights, tables and pool blocks added).
+    #[test]
+    fn unit_bytes_print() {
+        for (name, py) in [("qwen3-14b-u4g64-kv-bf16", 144), ("qwen3-32b-u4g64-kv-bf16", 144)] {
+            let s = spec(name).expect(name);
+            let goals = Goals { lanes: 1, grid_lanes: 1, host_copy: true, blocks: Some(1), ..Goals::default() };
+            let g = SpatialPlan::grid(&s, 128, py, true, &goals);
+            let r = Grid {
+                px: 256,
+                py: 240,
+                hc: s.hidden.div_ceil(240),
+                dc: 4,
+                gs: 32,
+                ic: s.inter.div_ceil(256),
+                ..g
+            };
+            let per = r.weight_bytes() + r.table_bytes() + r.blocks * r.block_bytes();
+            println!(
+                "UNIT {name}: grid 128x{py} Hc {} Ic {} = {} B (u4 weights {}); region 256x240 RHc {} RIc {}: {}",
+                g.hc,
+                g.ic,
+                g.bytes(false),
+                g.weight_bytes(),
+                r.hc,
+                r.ic,
+                (3..=5)
+                    .map(|nl| format!("RNL {nl} = {} B", r.bytes(false) + (nl - 1) * per))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
     /// Prints every model's plan (`--nocapture`): the table in PLAN.md.
     #[test]
     fn plans_print() {
@@ -1143,6 +1249,9 @@ mod tests {
             ("qwen3-14b-bf16-kv-bf16", 4),
             ("qwen3-32b-bf16-kv-bf16", 4),
             ("llama31-8b-bf16-kv-bf16", 4),
+            ("qwen3-8b-u4g64-kv-bf16", 4),
+            ("qwen3-14b-u4g64-kv-bf16", 4),
+            ("qwen3-32b-u4g64-kv-bf16", 4),
         ] {
             let s = spec(name).expect(name);
             match SpatialPlan::derive(&s, WaferDims::CS3, Goals::lanes(b)) {

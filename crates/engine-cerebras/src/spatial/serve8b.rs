@@ -231,7 +231,7 @@ pub struct Rope<'a> {
 
 /// Per-PE blocks of a `k.py` x `k.px` unit, one leading pad element a PE,
 /// 16-bit: `f(py, px, out)` appends a PE's elements.
-fn put_pe16(
+pub(crate) fn put_pe16(
     k: Kernel,
     dev: &mut dyn Device,
     sym: &str,
@@ -343,84 +343,88 @@ pub(crate) fn unit(
     };
     // Hidden dim (py, hc), or None in the padding past HR.
     let dim = |py: usize, kk: usize| Some(py * hc + kk).filter(|&x| x < hid);
-    let wq = mats("q", nq * d, hid)?;
-    let wk = mats("k", nkv * d, hid)?;
-    // Layer li's head h's (Qh: k's) row of dim dd of kv head g.
-    let qk = |li: usize, g: usize, h: usize, dd: usize, col: usize| -> u32 {
-        if h < qh {
-            u32::from(wq[li][((g * qh + h) * d + dd) * hid + col])
-        } else {
-            u32::from(wk[li][(g * d + dd) * hid + col])
+    if lay.weights_u4() {
+        super::u4::place_unit(lay, ckpt, k, layers, at, dev)?;
+    } else {
+        let wq = mats("q", nq * d, hid)?;
+        let wk = mats("k", nkv * d, hid)?;
+        // Layer li's head h's (Qh: k's) row of dim dd of kv head g.
+        let qk = |li: usize, g: usize, h: usize, dd: usize, col: usize| -> u32 {
+            if h < qh {
+                u32::from(wq[li][((g * qh + h) * d + dd) * hid + col])
+            } else {
+                u32::from(wk[li][(g * d + dd) * hid + col])
+            }
+        };
+        for (sym, half) in [("wqa", 0), ("wqv", dh)] {
+            put_pe16(k, dev, sym, at, nl * hc * nh * dh, |py, px, out| {
+                let (g, dl) = (px / gs, dl(px));
+                for li in 0..nl {
+                    for kk in 0..hc {
+                        for h in 0..nh {
+                            for i in 0..dh {
+                                out.push(dim(py, kk).map_or(0, |col| qk(li, g, h, dl[half + i], col)));
+                            }
+                        }
+                    }
+                }
+            })?;
         }
-    };
-    for (sym, half) in [("wqa", 0), ("wqv", dh)] {
-        put_pe16(k, dev, sym, at, nl * hc * nh * dh, |py, px, out| {
+        drop((wq, wk));
+        let wv = mats("v", nkv * d, hid)?;
+        put_pe16(k, dev, "wv", at, nl * hc * dc, |py, px, out| {
             let (g, dl) = (px / gs, dl(px));
-            for li in 0..nl {
+            for w in &wv {
                 for kk in 0..hc {
-                    for h in 0..nh {
-                        for i in 0..dh {
-                            out.push(dim(py, kk).map_or(0, |col| qk(li, g, h, dl[half + i], col)));
+                    for &dd in &dl {
+                        out.push(dim(py, kk).map_or(0, |col| u32::from(w[(g * d + dd) * hid + col])));
+                    }
+                }
+            }
+        })?;
+        drop(wv);
+        let wo = mats("o", hid, nq * d)?;
+        put_pe16(k, dev, "wo", at, nl * qh * dc * hc, |py, px, out| {
+            let (g, dl) = (px / gs, dl(px));
+            for w in &wo {
+                for h in 0..qh {
+                    for &dd in &dl {
+                        let c = (g * qh + h) * d + dd;
+                        for kk in 0..hc {
+                            out.push(dim(py, kk).map_or(0, |row| u32::from(w[row * nq * d + c])));
                         }
                     }
                 }
             }
         })?;
-    }
-    drop((wq, wk));
-    let wv = mats("v", nkv * d, hid)?;
-    put_pe16(k, dev, "wv", at, nl * hc * dc, |py, px, out| {
-        let (g, dl) = (px / gs, dl(px));
-        for w in &wv {
-            for kk in 0..hc {
-                for &dd in &dl {
-                    out.push(dim(py, kk).map_or(0, |col| u32::from(w[(g * d + dd) * hid + col])));
-                }
-            }
-        }
-    })?;
-    drop(wv);
-    let wo = mats("o", hid, nq * d)?;
-    put_pe16(k, dev, "wo", at, nl * qh * dc * hc, |py, px, out| {
-        let (g, dl) = (px / gs, dl(px));
-        for w in &wo {
-            for h in 0..qh {
-                for &dd in &dl {
-                    let c = (g * qh + h) * d + dd;
-                    for kk in 0..hc {
-                        out.push(dim(py, kk).map_or(0, |row| u32::from(w[row * nq * d + c])));
+        drop(wo);
+        let wg = mats("gate", inter, hid)?;
+        let wu = mats("up", inter, hid)?;
+        put_pe16(k, dev, "wgu", at, nl * hc * 2 * ic, |py, px, out| {
+            for li in 0..nl {
+                for kk in 0..hc {
+                    for (w, i) in [&wg[li], &wu[li]]
+                        .into_iter()
+                        .flat_map(|w| (0..ic).map(move |i| (w, i)))
+                    {
+                        out.push(dim(py, kk).map_or(0, |col| u32::from(w[(px * ic + i) * hid + col])));
                     }
                 }
             }
-        }
-    })?;
-    drop(wo);
-    let wg = mats("gate", inter, hid)?;
-    let wu = mats("up", inter, hid)?;
-    put_pe16(k, dev, "wgu", at, nl * hc * 2 * ic, |py, px, out| {
-        for li in 0..nl {
-            for kk in 0..hc {
-                for (w, i) in [&wg[li], &wu[li]]
-                    .into_iter()
-                    .flat_map(|w| (0..ic).map(move |i| (w, i)))
-                {
-                    out.push(dim(py, kk).map_or(0, |col| u32::from(w[(px * ic + i) * hid + col])));
+        })?;
+        drop((wg, wu));
+        let wd = mats("down", hid, inter)?;
+        put_pe16(k, dev, "wd", at, nl * ic * hc, |py, px, out| {
+            for w in &wd {
+                for i in 0..ic {
+                    for kk in 0..hc {
+                        out.push(dim(py, kk).map_or(0, |row| u32::from(w[row * inter + px * ic + i])));
+                    }
                 }
             }
-        }
-    })?;
-    drop((wg, wu));
-    let wd = mats("down", hid, inter)?;
-    put_pe16(k, dev, "wd", at, nl * ic * hc, |py, px, out| {
-        for w in &wd {
-            for i in 0..ic {
-                for kk in 0..hc {
-                    out.push(dim(py, kk).map_or(0, |row| u32::from(w[row * inter + px * ic + i])));
-                }
-            }
-        }
-    })?;
-    drop(wd);
+        })?;
+        drop(wd);
+    }
     // Without q/k norms (Llama; the units built without them) the weights
     // are ones: q's still carries 1/sqrt(head_dim).
     let (qn, kn) = if lay.model.qk_norm {

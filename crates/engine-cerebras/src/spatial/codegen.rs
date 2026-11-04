@@ -22,6 +22,8 @@ mod src {
     pub const HEAD2D_V10: &str = include_str!("csl/kernels/head2d_v10.csl");
     pub const QWEN2D_PAGED8B_HR: &str = include_str!("csl/kernels/qwen2d_paged8b_hr.csl");
     pub const QWEN2D_REGION: &str = include_str!("csl/kernels/qwen2d_region.csl");
+    /// The u4g64 matvec (W4 builds), spliced into the unit kernels.
+    pub const U4MV: &str = include_str!("csl/kernels/u4mv.csl");
     /// The fast softmax levers S1-S3 as (old, new) text pairs on
     /// qwen2d_paged8b's or qwen2d_region's pe.csl.
     pub const SOFTMAX_S123: &str = include_str!("csl/kernels/softmax_s123.json");
@@ -193,6 +195,23 @@ impl Design {
             Design::Serve8bRegion | Design::Serve8bRegionPipe | Design::ServeGptoss => {
                 ("bf16", false)
             }
+        }
+    }
+
+    /// [`Design::files`], or with `w4` the u4g64-weight variant (W4 1:
+    /// serve8b_region and its pipe only; the default files are untouched).
+    pub fn files_w4(self, w4: bool) -> R<Vec<File>> {
+        self.files_for(Variant::default(), w4)
+    }
+
+    /// [`Design::files_with`] for a model `variant`, with `w4` its u4g64
+    /// units ([`Design::files_w4`]).
+    pub fn files_for(self, variant: Variant, w4: bool) -> R<Vec<File>> {
+        match (self, w4) {
+            (_, false) => self.files_with(variant),
+            (Design::Serve8bRegion, true) => serve8b_region_w4(false, true, variant),
+            (Design::Serve8bRegionPipe, true) => serve8b_region_w4(true, true, variant),
+            (d, true) => Err(format!("{} has no u4g64 (W4) variant", d.name())),
         }
     }
 
@@ -2229,8 +2248,104 @@ comptime {{\n  if (KVCP == 1) {{ @export_symbol(copy_kv); }}\n}}\n{}",
     ))
 }
 
+/// A unit kernel (qwen2d_paged8b or qwen2d_region) with u4g64 weights:
+/// `u4mv.csl` spliced in, each weight symbol sized for its u4 tile
+/// (`spatial::u4`), the matvecs on it `wmv4`. `layers`: the kernel's
+/// layers a PE (`1`, or the region's `NL`).
+fn w4_unit(src: &str, tag: &str, layers: &str) -> R<String> {
+    let (consts, fns) = src::U4MV
+        .split_once("//@@ fns\n")
+        .ok_or("gen: u4mv.csl lost its //@@ fns mark")?;
+    let consts = consts.trim_start_matches("//@@ consts\n");
+    let anchor = "// Weights (16-bit: base addresses set in init, one past a 16-byte boundary).\n";
+    let mut s = patch(
+        src,
+        anchor,
+        &format!("const W4L: u16 = {layers};   // layers a PE (u4mv.csl)\n{consts}{anchor}"),
+        tag,
+    )?;
+    for (m, sym) in ["wqa", "wqv", "wv", "wo", "wgu", "wd"].iter().enumerate() {
+        let head = format!("var {sym}: [");
+        let at = s
+            .find(&head)
+            .ok_or_else(|| format!("gen: {tag} changed: no {sym} declaration"))?;
+        let end = at + s[at..].find('\n').unwrap_or(0);
+        s.replace_range(
+            at..end,
+            &format!("var {sym}: [W4B{m} + 1]WS align(16) = @zeros([W4B{m} + 1]WS);"),
+        );
+    }
+    s = patch(&s, "fn rsqrt(v: f32) f32 {\n", &format!("{fns}\nfn rsqrt(v: f32) f32 {{\n"), tag)?;
+    for (old, new) in [
+        (
+            "wmv(at(qh_dsd, b * NH * DHc), wqa_dsd, xb, Hc, sc_s);",
+            "wmv4(at(qh_dsd, b * NH * DHc), 0, xb, sc_s);",
+        ),
+        (
+            "wmv(at(qh_dsd, QH + b * NH * DHc), wqv_dsd, xb, Hc, sc_s);",
+            "wmv4(at(qh_dsd, QH + b * NH * DHc), 1, xb, sc_s);",
+        ),
+        (
+            "wmv(at(v_dsd, b * Dc), wv_dsd, xb, Hc, sc_s);",
+            "wmv4(at(v_dsd, b * Dc), 2, xb, sc_s);",
+        ),
+        (
+            "wmv(at(hv_dsd, b * Hc), wo_dsd, at(ob_dsd, b * QO), QO, sc_s);",
+            "wmv4(at(hv_dsd, b * Hc), 3, at(ob_dsd, b * QO), sc_s);",
+        ),
+        ("wmv(gb, wgu_dsd, xn_dsd, Hc, sc_s);", "wmv4(gb, 4, xn_dsd, sc_s);"),
+        (
+            "wmv(at(hv_dsd, (c0 + k) * Hc), wd_dsd, at(act_lane, k), Ic, sc_gu);",
+            "wmv4(at(hv_dsd, (c0 + k) * Hc), 5, at(act_lane, k), sc_gu);",
+        ),
+        ("  rebase16();\n", "  rebase16();\n  w4_rebase();\n"),
+    ] {
+        s = patch(&s, old, new, tag)?;
+    }
+    if layers != "1" {
+        s = patch(
+            &s,
+            "fn set_layer(l: u16) void {\n",
+            "fn set_layer(l: u16) void {\n  w4lay = l;\n",
+            tag,
+        )?;
+    }
+    Ok(s)
+}
+
 /// serve8b_region's build directory, or serve8b_region_pipe's (`pipe`).
 pub fn serve8b_region(pipe: bool, variant: Variant) -> R<Vec<File>> {
+    serve8b_region_w4(pipe, false, variant)
+}
+
+/// [`serve8b_region`], with `w4` the u4g64-weight units (`w4_unit`) and a
+/// layout that takes `W4`.
+fn serve8b_region_w4(pipe: bool, w4: bool, variant: Variant) -> R<Vec<File>> {
+    let (grid, region) = if w4 {
+        (
+            w4_unit(src::QWEN2D_PAGED8B_HR, "qwen2d_paged8b/pe.csl (W4)", "1")?,
+            w4_unit(src::QWEN2D_REGION, "qwen2d_region/pe.csl (W4)", "NL")?,
+        )
+    } else {
+        (
+            src::QWEN2D_PAGED8B_HR.to_string(),
+            src::QWEN2D_REGION.to_string(),
+        )
+    };
+    let mut files = serve8b_region_files(pipe, &grid, &region, variant)?;
+    if w4 {
+        let layout = &mut files[0].1;
+        *layout = patch(
+            layout,
+            "param PX: u16;\n",
+            "param PX: u16;\nparam W4: u16 = 0;   // 1: u4g64 weights in the units (codegen's W4 variant)\n",
+            "serve8b_region layout (W4)",
+        )?;
+    }
+    Ok(files)
+}
+
+fn serve8b_region_files(pipe: bool, grid: &str, region: &str, variant: Variant) -> R<Vec<File>> {
     let (layout, embed) = if pipe {
         (src::s8brp::LAYOUT, src::s8brp::EMBED_BASE)
     } else {
@@ -2240,14 +2355,8 @@ pub fn serve8b_region(pipe: bool, variant: Variant) -> R<Vec<File>> {
         ("layout.csl", layout.to_string()),
         ("paths.csl", src::s8br::PATHS.to_string()),
         ("rt.csl", src::RT.to_string()),
-        (
-            "grid_pe.csl",
-            s8br_unit("qwen2d_paged8b", src::QWEN2D_PAGED8B_HR, pipe, variant)?,
-        ),
-        (
-            "region_pe.csl",
-            s8br_unit("qwen2d_region", src::QWEN2D_REGION, pipe, variant)?,
-        ),
+        ("grid_pe.csl", s8br_unit("qwen2d_paged8b", grid, pipe, variant)?),
+        ("region_pe.csl", s8br_unit("qwen2d_region", region, pipe, variant)?),
         ("head_pe.csl", s8br_head(pipe)?),
         (
             "embed_pe.csl",
@@ -2487,6 +2596,20 @@ mod tests {
         }
     }
 
+    /// `DESIGN_OUT=<dir> DESIGN=<name> [W4=1]`: a design's build directory
+    /// written there (a payload compiled by hand or on the worker).
+    #[test]
+    #[ignore]
+    fn dump_design() {
+        let dir = std::path::PathBuf::from(std::env::var("DESIGN_OUT").expect("DESIGN_OUT"));
+        let d = Design::parse(&std::env::var("DESIGN").expect("DESIGN")).expect("a design");
+        let w4 = std::env::var("W4").is_ok_and(|v| v == "1");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in d.files_w4(w4).expect("generates") {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+    }
+
     /// Every serve_g4 program exports each data name of its layout.
     #[test]
     fn serve_g4_exports_every_name() {
@@ -2509,6 +2632,30 @@ mod tests {
                 "{name} exports {extra:?} the layout lacks"
             );
         }
+    }
+
+    /// The W4 variant: the default files untouched (`files_w4(false)`), the
+    /// units' weight symbols resized and every matvec on `wmv4`, the layout
+    /// taking `W4`, the head and the rest as they were.
+    #[test]
+    fn w4_variant_patches_only_the_units() {
+        for d in [Design::Serve8bRegion, Design::Serve8bRegionPipe] {
+            assert_eq!(d.files_w4(false).unwrap(), d.files().unwrap());
+            let (plain, w4) = (d.files().unwrap(), d.files_w4(true).unwrap());
+            for ((n, a), (m, b)) in plain.iter().zip(&w4) {
+                assert_eq!(n, m);
+                match *n {
+                    "grid_pe.csl" | "region_pe.csl" => {
+                        assert!(b.matches("wmv(").count() == 1 && b.matches("wmv4(").count() == 7, "{n}");
+                        assert!(b.contains("var wqa: [W4B0 + 1]WS"), "{n}");
+                        assert_eq!(b.contains("w4lay = l;"), *n == "region_pe.csl", "{n}");
+                    }
+                    "layout.csl" => assert!(b.contains("param W4: u16 = 0;") && a != b),
+                    _ => assert_eq!(a, b, "{n}"),
+                }
+            }
+        }
+        assert!(Design::Serve2d.files_w4(true).is_err());
     }
 
     /// The generated files' blake3. These are the programs validated on CS-3
