@@ -100,7 +100,7 @@ def layout(id, deploy):
     hidden, hd = d.hidden, d.head_dim
 
     def layer(l):
-        lora_a, lora_b = banks(hidden, d.q_heads * hd)
+        lora_a, lora_b = banks(hidden)
         return struct(
             attn_norm = weight([hidden]),
             q = weight([d.q_heads * hd, hidden], proj),
@@ -233,8 +233,7 @@ TRANSFORMERS = [
 
 # The forward of Qwen 3 (dense): pre-norm layers of full attention, its q and
 # k RMS-normed per head and rotated in full (neox halves), and a SwiGLU MLP.
-# A row with an adapter adds its LoRA correction to the out projection (PEFT's
-# `o_proj`), read from the heads' output.
+# A row with an adapter adds its LoRA correction to the attention's output.
 # A deployment stretched by YaRN turns its rotation at the scaled frequencies.
 
 def caches(m, c):
@@ -264,9 +263,8 @@ def forward(m, inputs):
     def block(l, w, carried):
         y, fused = carried
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, w, positions, scaling = scaling, qk_norm = "head",
-                      adapt = lambda a, o: corrected(a, o, w, routes))
-        y = ops.elemwise.residual_add(o, y)
+        o = attention(x, inputs, m, w, positions, scaling = scaling, qk_norm = "head")
+        y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
         y = ops.elemwise.residual_add(swiglu(x, w), y)
         return (y, tap(m.mtp, l, y, fused))

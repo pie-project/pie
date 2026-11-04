@@ -29,6 +29,7 @@ fn main() -> Result<(), String> {
         pages: (0..npg).map(|i| (g * npg + i) as u32).collect(),
         visible: None,
         forced,
+        state: None,
     };
     let (out1, _) = m.fire_batch(
         &(0..n)
