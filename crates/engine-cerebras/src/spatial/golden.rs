@@ -432,11 +432,16 @@ fn run_spec(sc: &Scenario, design: ProgramSpec) -> Phases {
     let paged = grid.paged();
     let logit_lanes = grid.logit_lanes();
     let mut phases: Phases = Vec::new();
-    let mut m =
-        match WaferModel::on_device(Box::new(rec.clone()), design, weights, Some(1.0e6), ring) {
-            Ok(m) => m,
-            Err(e) => panic!("{}: the load fails: {e}", sc.name),
-        };
+    let mut m = match WaferModel::on_device(
+        Box::new(rec.clone()),
+        design,
+        weights,
+        Some(super::wafer::Rotary::theta(1.0e6)),
+        ring,
+    ) {
+        Ok(m) => m,
+        Err(e) => panic!("{}: the load fails: {e}", sc.name),
+    };
     phases.push(("load", rec.take()));
     let mut note = |phases: &mut Phases, phase: &'static str, ok: bool| {
         let mut calls = rec.take();
@@ -983,7 +988,7 @@ fn vm_launch_control(name: &str) -> (Vec<u32>, Vec<bool>, Vec<bool>) {
         Box::new(rec.clone()),
         design,
         Weights::Place(&ckpt),
-        Some(1.0e6),
+        Some(super::wafer::Rotary::theta(1.0e6)),
         ring,
     )
     .expect("the load");

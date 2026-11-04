@@ -26,7 +26,7 @@ use super::device::Device;
 use super::program::Layers;
 use super::program::ProgramSpec;
 use super::serve8b::{Kernel, Rope};
-use super::wafer::{inv_freq, rect};
+use super::wafer::rect;
 use crate::sdk::{DataType, Order};
 
 type R<T> = std::result::Result<T, String>;
@@ -755,10 +755,10 @@ pub(crate) fn place_layers(
     lay: &ProgramSpec,
     u: &Units,
     ckpt: &Ckpt,
-    rope_theta: f64,
+    rope: &super::wafer::Rotary,
     dev: &mut dyn Device,
 ) -> R<()> {
-    let inv_freq = inv_freq(rope_theta, lay.gs() * lay.dc());
+    let inv_freq = rope.inv_freq(lay.gs() * lay.dc())?;
     let rope = if u.rot8 {
         Rope {
             units: &[512, 64, 8, 1],

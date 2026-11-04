@@ -27,10 +27,10 @@ use crate::sdk::{DataType, Order};
 
 type R<T> = std::result::Result<T, String>;
 
-/// What a load places: the checkpoint and RoPE's theta.
+/// What a load places: the checkpoint and RoPE's frequencies.
 pub struct Weights<'a> {
     pub ckpt: &'a Ckpt,
-    pub rope_theta: f64,
+    pub rope: &'a super::wafer::Rotary,
 }
 
 /// One part of a wafer program, as the host drives it.
@@ -198,11 +198,21 @@ impl Component for Layers {
         match self {
             Layers::Grids {
                 hybrid: Some(_), ..
-            } => super::serve_q35::place_layers(spec, w.ckpt, w.rope_theta, dev),
-            Layers::Grids { .. } => super::serve2d::place_layers(spec, w.ckpt, w.rope_theta, dev),
-            Layers::Strips { .. } => super::serve8b::place_layers(spec, w.ckpt, w.rope_theta, dev),
+            } => super::serve_q35::place_layers(
+                spec,
+                w.ckpt,
+                w.rope.theta_only(spec.design.name())?,
+                dev,
+            ),
+            Layers::Grids { .. } => super::serve2d::place_layers(
+                spec,
+                w.ckpt,
+                w.rope.theta_only(spec.design.name())?,
+                dev,
+            ),
+            Layers::Strips { .. } => super::serve8b::place_layers(spec, w.ckpt, w.rope, dev),
             Layers::Units { units, .. } => {
-                super::serve8b_region::place_layers(spec, units, w.ckpt, w.rope_theta, dev)
+                super::serve8b_region::place_layers(spec, units, w.ckpt, w.rope, dev)
             }
         }
     }

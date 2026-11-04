@@ -158,14 +158,88 @@ impl Design {
 
     /// Every file of the program's build directory, `layout.csl` first.
     pub fn files(self) -> R<Vec<File>> {
+        self.files_with(Variant::default())
+    }
+
+    /// [`Design::files`] for a model `variant`: the default's files are
+    /// [`Design::files`]' byte for byte; another variant patches the layer
+    /// units (serve8b_region and serve8b_region_pipe only).
+    pub fn files_with(self, variant: Variant) -> R<Vec<File>> {
+        if variant != Variant::default()
+            && !matches!(self, Design::Serve8bRegion | Design::Serve8bRegionPipe)
+        {
+            return Err(format!(
+                "{}: no model variant ({variant:?}); serve8b_region's units take one",
+                self.name()
+            ));
+        }
         match self {
             Design::Serve2d => serve2d(),
             Design::Serve2dPipe => serve2d_pipe(),
             Design::Serve8b => serve8b(),
-            Design::Serve8bRegion => serve8b_region(false),
-            Design::Serve8bRegionPipe => serve8b_region(true),
+            Design::Serve8bRegion => serve8b_region(false, variant),
+            Design::Serve8bRegionPipe => serve8b_region(true, variant),
             Design::ServeQ35 => serve_q35(),
         }
+    }
+}
+
+/// What a model changes in the paged8b layer units, as text patches on the
+/// kernels (the default patches nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Variant {
+    /// No q/k RMSNorm (Llama): the per-head sums of squares, their segment
+    /// all-reduce and the two scales are cut; the norm weights (`qkn_w`)
+    /// still scale q and k (the host writes 1/sqrt(head_dim) and 1).
+    pub identity_qk_norm: bool,
+    /// The RMSNorm epsilon's f32 bits, when not the kernels' literal 1e-6.
+    pub eps_bits: Option<u32>,
+}
+
+impl Variant {
+    /// The variant's patches on a paged8b unit kernel (`tag` names it).
+    fn apply(self, text: &str, tag: &str) -> R<String> {
+        let mut s = text.to_string();
+        if self.identity_qk_norm {
+            let start = "  const sqa = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QH} -> s[@as(i16, QH) + i] });\n";
+            let end = "  @fmuls(half_v, half_v, scl_t());\n";
+            let bad = || format!("gen: {tag} changed: the q/k RMSNorm block not found once");
+            if s.matches(start).count() != 1 || s.matches(end).count() != 1 {
+                return Err(bad());
+            }
+            let a = s.find(start).ok_or_else(bad)?;
+            let b = a + s[a..].find(end).ok_or_else(bad)? + end.len();
+            let block = &s[a..b];
+            if !block.contains("allreduce_seg(ssq3_dsd, NH * B);\n")
+                || !block.contains("  axis_xx();\n")
+            {
+                return Err(bad());
+            }
+            // The axis switch stays right after the QKV all-reduce (the next
+            // collective, the scores', is along X); `k` is the layer's.
+            s = format!(
+                "{}  // (identity q/k norm: no per-head RMSNorm)\n  axis_xx();\n  var k: u16 = 0;\n{}",
+                &s[..a],
+                &s[b..]
+            );
+        }
+        if let Some(bits) = self.eps_bits {
+            let eps = f32::from_bits(bits);
+            if !(eps.is_finite() && eps > 0.0) {
+                return Err(format!("gen: RMSNorm eps {eps} is not a positive number"));
+            }
+            let mut lit = format!("{eps:e}");
+            if !lit.contains('.') {
+                lit = lit.replacen('e', ".0e", 1);
+            }
+            s = patch(
+                &s,
+                "const EPS: f32 = 1.0e-6;\n",
+                &format!("const EPS: f32 = {lit};\n"),
+                &format!("{tag}'s EPS"),
+            )?;
+        }
+        Ok(s)
     }
 }
 
@@ -1596,10 +1670,10 @@ fn page_unstage(page: u32, slot: u32) void { sys_mod.unblock_cmd_stream(); }"
 /// A unit kernel (qwen2d_paged8b or qwen2d_region) with serve8b_region's
 /// grid_extra: the host's placement and handoffs, its pass prologue and its
 /// layer(s) lifted out of `compute`.
-fn s8br_unit(kernel: &str, src: &str, pipe: bool) -> R<String> {
+fn s8br_unit(kernel: &str, src: &str, pipe: bool, variant: Variant) -> R<String> {
     let tag = format!("{kernel}/pe.csl");
     let mut s = patch(
-        &softmax_s123(src, &tag)?,
+        &variant.apply(&softmax_s123(src, &tag)?, &tag)?,
         "param c_r1_0: color;\n",
         &format!(
             "// serve8b: 1 times each pass (prof[0]); the route table's route capacity.\n\
@@ -1845,7 +1919,7 @@ comptime {{\n  if (KVCP == 1) {{ @export_symbol(copy_kv); }}\n}}\n{}",
 }
 
 /// serve8b_region's build directory, or serve8b_region_pipe's (`pipe`).
-pub fn serve8b_region(pipe: bool) -> R<Vec<File>> {
+pub fn serve8b_region(pipe: bool, variant: Variant) -> R<Vec<File>> {
     let (layout, embed) = if pipe {
         (src::s8brp::LAYOUT, src::s8brp::EMBED_BASE)
     } else {
@@ -1857,11 +1931,11 @@ pub fn serve8b_region(pipe: bool) -> R<Vec<File>> {
         ("rt.csl", src::RT.to_string()),
         (
             "grid_pe.csl",
-            s8br_unit("qwen2d_paged8b", src::QWEN2D_PAGED8B_HR, pipe)?,
+            s8br_unit("qwen2d_paged8b", src::QWEN2D_PAGED8B_HR, pipe, variant)?,
         ),
         (
             "region_pe.csl",
-            s8br_unit("qwen2d_region", src::QWEN2D_REGION, pipe)?,
+            s8br_unit("qwen2d_region", src::QWEN2D_REGION, pipe, variant)?,
         ),
         ("head_pe.csl", s8br_head(pipe)?),
         (

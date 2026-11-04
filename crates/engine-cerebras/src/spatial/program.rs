@@ -64,6 +64,45 @@ pub struct Model {
     /// `CAP`: head iterations a launch (a launch runs at most `CAP - 1`
     /// passes).
     pub cap: usize,
+    /// `QKN`: the units norm q and k per head (0: Llama's identity; the
+    /// units' sources are generated without the norm, codegen's `Variant`).
+    pub qk_norm: bool,
+    /// `EPS`: the RMSNorm epsilon's f32 bits (0: the kernels' 1e-6).
+    pub eps_bits: u32,
+}
+
+impl Model {
+    /// The dims, Qwen3's q/k norms and the kernels' epsilon.
+    #[must_use]
+    pub fn dims(hidden: usize, qh: usize, vocab: usize, cap: usize) -> Model {
+        Model {
+            hidden,
+            qh,
+            vocab,
+            cap,
+            qk_norm: true,
+            eps_bits: 0,
+        }
+    }
+
+    /// The RMSNorm epsilon the units compute with.
+    #[must_use]
+    pub fn eps(&self) -> f32 {
+        if self.eps_bits == 0 {
+            super::model::KERNEL_EPS
+        } else {
+            f32::from_bits(self.eps_bits)
+        }
+    }
+
+    /// What the units' sources are generated for.
+    #[must_use]
+    pub fn variant(&self) -> super::codegen::Variant {
+        super::codegen::Variant {
+            identity_qk_norm: !self.qk_norm,
+            eps_bits: (self.eps_bits != 0).then_some(self.eps_bits),
+        }
+    }
 }
 
 /// The decoder layers' pipeline.
@@ -539,6 +578,8 @@ impl ProgramSpec {
             "Qh" => Some(m.qh),
             "vocab" => Some(m.vocab),
             "CAP" => Some(m.cap),
+            "QKN" => Some(usize::from(m.qk_norm)),
+            "EPS" => Some(m.eps_bits as usize),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1025,6 +1066,8 @@ fn model(get: &Get) -> R<Model> {
         qh: get.req("Qh")?,
         vocab: get.req("vocab")?,
         cap: get.req("CAP")?,
+        qk_norm: get.opt("QKN").unwrap_or(1) != 0,
+        eps_bits: u32::try_from(get.opt("EPS").unwrap_or(0)).map_err(|e| format!("EPS: {e}"))?,
     })
 }
 

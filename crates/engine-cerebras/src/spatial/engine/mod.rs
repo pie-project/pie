@@ -277,7 +277,12 @@ impl Engine for Spatial {
                 ..crate::sdk::Simulator::new(self.boot.target)
             }),
         };
-        let theta = Some(f64::from(spec.rope_theta));
+        // RoPE as the trace states it: theta's frequencies, or its scaled
+        // table (llama3).
+        let rope = Some(wafer::Rotary {
+            theta: f64::from(spec.rope_theta),
+            table: spec.rope_table.as_ref().map(|t| t.inv_freq.clone()),
+        });
         // The weights through PIE's checkpoint path (the load's contract
         // over its checkpoint); `ckpt` names a Hugging Face directory
         // instead.
@@ -286,7 +291,7 @@ impl Engine for Spatial {
             None => ckpt::Ckpt::landed(&weights_trace, &contract, Path::new(&path)),
         }
         .map_err(|e| Error::Load(format!("the spatial wafer model's weights: {e}")))?;
-        let w = wafer::Wafer::open(program.into(), weights, platform, theta)
+        let w = wafer::Wafer::open(program.into(), weights, platform, rope)
             .map_err(|e| Error::Load(format!("the spatial wafer model: {e}")))?;
         tracing::info!(
             program,

@@ -109,21 +109,22 @@ pub struct Hybrid {
     pub rotary_dim: usize,
 }
 
-/// A difference from the kernels as built that the plan can absorb at small
-/// cost, but that nothing implements yet.
+/// A difference from the kernels as first built (for Qwen3) that the plan
+/// absorbs at small cost; serve8b_region builds the first two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Need {
-    /// No q/k RMSNorm (Llama). The paged kernels always scale q and k by
-    /// their per-head 1/rms (the sums of squares ride the scores' segment
-    /// all-reduce); a build flag that skips both scales and the two sums
-    /// would make the norm the identity. Kernel change, not built.
+    /// No q/k RMSNorm (Llama). The paged kernels scale q and k by their
+    /// per-head 1/rms (the sums of squares ride a segment all-reduce).
+    /// serve8b_region's units are generated without both (codegen's
+    /// `Variant`, the program's `QKN` 0); the host writes ones for the norm
+    /// weights. The other designs still norm.
     IdentityQkNorm,
     /// The trace states RoPE's frequencies (llama3 or YaRN scaling). The
     /// kernels build cos/sin from per-column frequency tables the host
-    /// writes (`rot_c`/`rot_s`), so this is placement only: write the stated
-    /// table instead of theta's, and fold YaRN's cos/sin scale into q's and
-    /// k's norm weights (scores scale by its square). `serve2d::place`
-    /// takes a theta today.
+    /// writes (`rot_c`/`rot_s`), so this is placement only: serve8b and
+    /// serve8b_region write the stated table instead of theta's
+    /// (`wafer::Rotary`). YaRN's cos/sin scale is not folded yet;
+    /// `serve2d::place` takes a theta.
     RopeTable,
     /// An untied lm_head (Qwen3-8B and up). The kernels' heads hold a
     /// separate embedding table (head2d `UNTIED` 1), but the engine's
@@ -1091,27 +1092,55 @@ impl ModelSpec {
                 "Gated DeltaNet layers (only a qwen35 program carries them)".into(),
             );
         }
-        // What every program and today's placement assume.
-        if self.rms_eps != KERNEL_EPS {
+        // The epsilon and the q/k norms the units were generated for
+        // (`EPS`, `QKN`: serve8b_region's variants; elsewhere the kernels'
+        // 1e-6 and Qwen3's norms).
+        let eps = match get("EPS") {
+            None | Some(0) => KERNEL_EPS,
+            Some(bits) => f32::from_bits(u32::try_from(bits).unwrap_or(0)),
+        };
+        if self.rms_eps != eps {
             return no(
                 name,
                 format!(
-                    "RMSNorm eps {} (the CSL's literal is {KERNEL_EPS})",
+                    "RMSNorm eps {} (the program's is {eps}; serve8b_region builds another as `EPS`)",
                     self.rms_eps
                 ),
             );
         }
-        if !self.qk_norm {
+        let qkn = get("QKN").is_none_or(|q| q != 0);
+        if self.qk_norm != qkn {
             return no(
                 name,
-                "no q/k RMSNorm (the kernels always norm q and k; Need::IdentityQkNorm)".into(),
+                if self.qk_norm {
+                    "q/k RMSNorm, and the program's units are built without it (QKN 0)".into()
+                } else {
+                    "no q/k RMSNorm (the program's units norm q and k; serve8b_region builds \
+                     them without as QKN 0, Need::IdentityQkNorm)"
+                        .into()
+                },
             );
         }
-        if self.rope_table.is_some() {
-            return no(
-                name,
-                "scaled RoPE (the placement builds frequencies from theta; Need::RopeTable)".into(),
-            );
+        // A stated table: serve8b's and serve8b_region's placement writes
+        // it (cos/sin unscaled: llama3, not YaRN's mscale).
+        if let Some(t) = &self.rope_table {
+            if get("GS").is_none() && get("RPX").is_none() {
+                return no(
+                    name,
+                    "scaled RoPE (this program's placement builds frequencies from theta; \
+                     serve8b and serve8b_region write the table, Need::RopeTable)"
+                        .into(),
+                );
+            }
+            if t.mscale != 1.0 {
+                return no(
+                    name,
+                    format!(
+                        "RoPE cos/sin scaled by {} (YaRN's mscale is not placed)",
+                        t.mscale
+                    ),
+                );
+            }
         }
         let scale = (self.head_dim as f32).sqrt().recip();
         if (self.sm_scale - scale).abs() > 1e-6 * scale {

@@ -56,6 +56,11 @@ pub struct Goals {
     pub pipeline: bool,
     /// Copy pages on the host (`KVCP` 0): no copy kernel, ~0.9 KB a PE back.
     pub host_copy: bool,
+    /// A paged8b grid's rows (`PY`), pinned (a multiple of 4); `None`: the
+    /// fewest in steps of 16 that hold `grid_lanes`. serve8b_region at
+    /// Llama 3.1 8B's inter wants 152 (the 160 the steps give is 6 columns
+    /// too wide for its head and strip).
+    pub rows: Option<usize>,
 }
 
 impl Default for Goals {
@@ -70,6 +75,7 @@ impl Default for Goals {
             cap: None,
             pipeline: false,
             host_copy: false,
+            rows: None,
         }
     }
 }
@@ -561,11 +567,19 @@ impl SpatialPlan {
             blocks: Some(1),
             ..goals
         };
-        let py = (1..)
-            .map(|k| 16 * k)
-            .take_while(|&py| py <= wafer.height)
-            .find(|&py| Self::grid(spec, px, py, true, &sizing).bytes(false) <= wafer.pe_bytes)
-            .ok_or_else(|| {
+        let py = match goals.rows {
+            Some(py) if py == 0 || !py.is_multiple_of(4) || py > wafer.height => {
+                return refuse(format!(
+                    "{name}: {py} grid rows (a pinned PY is a multiple of 4 within the wafer)"
+                ));
+            }
+            Some(py) => Some(py),
+            None => (1..)
+                .map(|k| 16 * k)
+                .take_while(|&py| py <= wafer.height)
+                .find(|&py| Self::grid(spec, px, py, true, &sizing).bytes(false) <= wafer.pe_bytes),
+        }
+        .ok_or_else(|| {
                 let tall = Self::grid(spec, px, wafer.height / 16 * 16, true, &sizing);
                 Refused(format!(
                     "{name}: no {px}-column bf16 grid holds {} lanes: even {} rows want {} bytes a PE (of {})",

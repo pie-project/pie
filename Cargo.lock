@@ -1739,6 +1739,7 @@ dependencies = [
 name = "engine-cerebras"
 version = "0.6.0"
 dependencies = [
+ "anyhow",
  "blake3",
  "checkpoint",
  "engine",

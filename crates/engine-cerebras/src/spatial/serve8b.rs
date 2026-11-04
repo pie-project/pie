@@ -18,7 +18,7 @@
 use super::ckpt::Ckpt;
 use super::device::Device;
 use super::program::ProgramSpec;
-use super::wafer::{inv_freq, rect};
+use super::wafer::rect;
 
 type R<T> = std::result::Result<T, String>;
 
@@ -274,10 +274,10 @@ fn put_pe32(
 pub(crate) fn place_layers(
     lay: &ProgramSpec,
     ckpt: &Ckpt,
-    rope_theta: f64,
+    rope: &super::wafer::Rotary,
     dev: &mut dyn Device,
 ) -> R<()> {
-    let inv_freq = inv_freq(rope_theta, lay.gs() * lay.dc());
+    let inv_freq = rope.inv_freq(lay.gs() * lay.dc())?;
     let rope = Rope {
         units: &[256, 16, 1],
         len: 16,
@@ -421,8 +421,14 @@ pub(crate) fn unit(
         }
     })?;
     drop(wd);
-    let qn = vecs("q_norm", d)?;
-    let kn = vecs("k_norm", d)?;
+    // Without q/k norms (Llama; the units built without them) the weights
+    // are ones: q's still carries 1/sqrt(head_dim).
+    let (qn, kn) = if lay.model.qk_norm {
+        (vecs("q_norm", d)?, vecs("k_norm", d)?)
+    } else {
+        let ones = vec![vec![1.0f32; d]; nl];
+        (ones.clone(), ones)
+    };
     let scale = (d as f64).sqrt() as f32;
     put_pe32(k, dev, "qkn_w", at, nl * 2 * nh * dh, |_, px, out| {
         let dl = dl(px);

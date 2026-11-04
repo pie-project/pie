@@ -188,6 +188,131 @@ pub(crate) fn inv_freq(rope_theta: f64, d: usize) -> Vec<f32> {
         .collect()
 }
 
+/// RoPE's frequencies a placement writes: `theta`'s, unless a table is
+/// stated (a llama3/YaRN scaling: the trace's, or the checkpoint config's
+/// `rope_scaling`), `d / 2` inverse frequencies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rotary {
+    pub theta: f64,
+    pub table: Option<Vec<f32>>,
+}
+
+impl Rotary {
+    #[must_use]
+    pub fn theta(theta: f64) -> Rotary {
+        Rotary { theta, table: None }
+    }
+
+    /// The inverse frequencies over `d` dims: the table's, or theta's.
+    pub fn inv_freq(&self, d: usize) -> R<Vec<f32>> {
+        match &self.table {
+            None => Ok(inv_freq(self.theta, d)),
+            Some(t) if t.len() == d / 2 => Ok(t.clone()),
+            Some(t) => Err(format!(
+                "RoPE table of {} frequencies for a head of {d} dims",
+                t.len()
+            )),
+        }
+    }
+
+    /// Theta, on placements that build frequencies from theta alone.
+    pub fn theta_only(&self, what: &str) -> R<f64> {
+        match self.table {
+            None => Ok(self.theta),
+            Some(_) => Err(format!(
+                "{what}'s placement builds RoPE from theta; a scaled table (llama3/YaRN) \
+                 is serve8b's and serve8b_region's"
+            )),
+        }
+    }
+
+    /// The checkpoint config's: `rope_theta` (or `rope_parameters`'), and
+    /// its `rope_scaling` turned into a table over `d` dims (`None`: no
+    /// theta stated).
+    pub fn of_config(config: &serde_json::Value, d: usize) -> R<Option<Rotary>> {
+        let params = &config["rope_parameters"];
+        let Some(theta) = config["rope_theta"]
+            .as_f64()
+            .or_else(|| params["rope_theta"].as_f64())
+        else {
+            return Ok(None);
+        };
+        let scaling = match &config["rope_scaling"] {
+            serde_json::Value::Object(_) => &config["rope_scaling"],
+            _ => params,
+        };
+        let max = config["max_position_embeddings"]
+            .as_u64()
+            .and_then(|m| u32::try_from(m).ok());
+        let table = match poem::rope::RopeScaling::of(&JsonDict(scaling), max)
+            .map_err(|e| format!("config.json's rope scaling: {e}"))?
+        {
+            None => None,
+            Some(s) => {
+                let pairs = u32::try_from(d / 2).map_err(|e| e.to_string())?;
+                let f = s
+                    .freqs(theta as f32, pairs, pairs)
+                    .map_err(|e| format!("config.json's rope scaling: {e}"))?;
+                if f.mscale != 1.0 {
+                    return Err(format!(
+                        "config.json's rope scaling scales cos/sin by {} (YaRN): not placed",
+                        f.mscale
+                    ));
+                }
+                Some(f.inv_freq)
+            }
+        };
+        Ok(Some(Rotary { theta, table }))
+    }
+}
+
+/// A `rope_scaling` dict of a config.json, read by key.
+struct JsonDict<'a>(&'a serde_json::Value);
+
+impl poem::rope::Entries for JsonDict<'_> {
+    fn number(&self, key: &str) -> anyhow::Result<Option<f64>> {
+        match &self.0[key] {
+            serde_json::Value::Null => Ok(None),
+            v => v
+                .as_f64()
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("rope scaling's `{key}` is a number, not {v}")),
+        }
+    }
+    fn numbers(&self, key: &str) -> anyhow::Result<Option<Vec<f64>>> {
+        match &self.0[key] {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::Array(a) => a
+                .iter()
+                .map(|v| {
+                    v.as_f64()
+                        .ok_or_else(|| anyhow::anyhow!("rope scaling's `{key}` holds {v}"))
+                })
+                .collect::<anyhow::Result<_>>()
+                .map(Some),
+            v => anyhow::bail!("rope scaling's `{key}` is a list, not {v}"),
+        }
+    }
+    fn text(&self, key: &str) -> anyhow::Result<Option<String>> {
+        match &self.0[key] {
+            serde_json::Value::Null => Ok(None),
+            v => v
+                .as_str()
+                .map(|t| Some(t.to_string()))
+                .ok_or_else(|| anyhow::anyhow!("rope scaling's `{key}` is a string, not {v}")),
+        }
+    }
+    fn flag(&self, key: &str) -> anyhow::Result<Option<bool>> {
+        match &self.0[key] {
+            serde_json::Value::Null => Ok(None),
+            v => v
+                .as_bool()
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("rope scaling's `{key}` is a bool, not {v}")),
+        }
+    }
+}
+
 /// What a load places: a checkpoint's weights, or nothing (a host-protocol
 /// check of a shape too large to fill).
 #[derive(Clone, Copy)]
@@ -196,41 +321,42 @@ pub enum Weights<'a> {
     Skip,
 }
 
-/// Refuses `ckpt` where a component of `design` cannot place it; RoPE's
-/// theta: `rope_theta` (the model's), else the checkpoint
-/// config's, else 1e6.
-fn check_weights(design: &ProgramSpec, ckpt: &Ckpt, rope_theta: Option<f64>) -> R<f64> {
+/// Refuses `ckpt` where a component of `design` cannot place it; RoPE:
+/// `rope` (the model's), else the checkpoint config's (its theta and
+/// scaling), else theta 1e6.
+fn check_weights(design: &ProgramSpec, ckpt: &Ckpt, rope: Option<Rotary>) -> R<Rotary> {
     for c in design.components() {
         c.validate(design, ckpt)?;
     }
-    let config_theta = ckpt.config()["rope_theta"].as_f64();
-    if let (Some(theta), Some(config)) = (rope_theta, config_theta)
-        && (theta - config).abs() > 1e-6 * config.abs()
+    let config = Rotary::of_config(ckpt.config(), design.head_dim())?;
+    if let (Some(rope), Some(config)) = (&rope, &config)
+        && ((rope.theta - config.theta).abs() > 1e-6 * config.theta.abs()
+            || rope.table.is_some() != config.table.is_some())
     {
         tracing::warn!(
-            theta,
-            config,
-            "spatial wafer: the checkpoint config's rope_theta differs from the model's"
+            theta = rope.theta,
+            config = config.theta,
+            "spatial wafer: the checkpoint config's RoPE differs from the model's"
         );
     }
-    Ok(rope_theta.or(config_theta).unwrap_or(1.0e6))
+    Ok(rope.or(config).unwrap_or(Rotary::theta(1.0e6)))
 }
 
 impl WaferModel {
-    /// [`WaferModel::open_with`] on a Hugging Face directory, RoPE's theta
-    /// from its config.
+    /// [`WaferModel::open_with`] on a Hugging Face directory, RoPE from its
+    /// config.
     pub fn open(program: &Path, ckpt_dir: &Path, platform: Platform) -> R<WaferModel> {
         WaferModel::open_with(program, Ckpt::open(ckpt_dir)?, platform, None)
     }
 
-    /// Loads `program` and places `ckpt`'s weights; RoPE's theta is
-    /// `rope_theta` (the model's, from its trace), else the checkpoint
-    /// config's (else 1e6).
+    /// Loads `program` and places `ckpt`'s weights; RoPE is `rope` (the
+    /// model's, from its trace), else the checkpoint config's (else theta
+    /// 1e6).
     pub fn open_with(
         program: &Path,
         ckpt: Ckpt,
         platform: Platform,
-        rope_theta: Option<f64>,
+        rope: Option<Rotary>,
     ) -> R<WaferModel> {
         let design = read_design(program)?;
         // The VM's out ring's words, from the program's own account.
@@ -239,13 +365,7 @@ impl WaferModel {
         let mut rt = Runtime::new(sdk, program, platform, "WARNING").map_err(|e| e.to_string())?;
         rt.load();
         rt.run();
-        WaferModel::on_device(
-            Box::new(rt),
-            design,
-            Weights::Place(&ckpt),
-            rope_theta,
-            ring,
-        )
+        WaferModel::on_device(Box::new(rt), design, Weights::Place(&ckpt), rope, ring)
     }
 
     /// The loaded program `design` on `dev` (loaded and running): its
@@ -255,12 +375,12 @@ impl WaferModel {
         mut rt: Box<dyn Device>,
         design: ProgramSpec,
         weights: Weights,
-        rope_theta: Option<f64>,
+        rope: Option<Rotary>,
         ring: usize,
     ) -> R<WaferModel> {
-        let rope_theta = match weights {
-            Weights::Place(ckpt) => Some(check_weights(&design, ckpt, rope_theta)?),
-            Weights::Skip => rope_theta,
+        let rope = match weights {
+            Weights::Place(ckpt) => Some(check_weights(&design, ckpt, rope)?),
+            Weights::Skip => rope,
         };
         let started = Instant::now();
         // The route tables `init` applies.
@@ -277,8 +397,8 @@ impl WaferModel {
             "spatial wafer: program loaded"
         );
         let started = Instant::now();
-        if let (Weights::Place(ckpt), Some(rope_theta)) = (weights, rope_theta) {
-            let w = super::component::Weights { ckpt, rope_theta };
+        if let (Weights::Place(ckpt), Some(rope)) = (weights, &rope) {
+            let w = super::component::Weights { ckpt, rope };
             for c in design.components() {
                 c.place(&design, &w, &mut *rt)?;
             }
@@ -1229,13 +1349,13 @@ pub struct Wafer {
 
 impl Wafer {
     /// Loads `program` (the compiler's output directory) on `platform` and
-    /// places `ckpt` (RoPE's theta `rope_theta`, else the checkpoint
-    /// config's); returns once the model answers.
+    /// places `ckpt` (RoPE `rope`, else the checkpoint config's); returns
+    /// once the model answers.
     pub fn open(
         program: PathBuf,
         ckpt: Ckpt,
         platform: Platform,
-        rope_theta: Option<f64>,
+        rope: Option<Rotary>,
     ) -> R<Wafer> {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
@@ -1245,7 +1365,7 @@ impl Wafer {
         let thread = std::thread::Builder::new()
             .name("spatial-wafer".into())
             .spawn(move || {
-                let mut model = match WaferModel::open_with(&program, ckpt, platform, rope_theta) {
+                let mut model = match WaferModel::open_with(&program, ckpt, platform, rope) {
                     Ok(m) => {
                         let g = &m.design;
                         let (paged, (launch_lanes, logit_lanes)) =

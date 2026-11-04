@@ -181,7 +181,7 @@ impl ServeConfig {
     /// directory is configured. Keys (all optional):
     /// - the plan's goals: `lanes`, `grid_lanes`, `page_size` (default
     ///   `page_size`, PIE's), `blocks`, `max_blocks`, `mlp_chunk`, `cap`,
-    ///   `pipeline`, `host_copy`;
+    ///   `pipeline`, `host_copy`, `rows` (a paged8b grid's PY);
     /// - serve2d_pipe: `mmax`, `hb`, `hlm`, `smp`, and `[spec]` (`history`,
     ///   `table`, `out`);
     /// - `region`: a paged8b (8B) plan as serve8b_region's units;
@@ -234,6 +234,7 @@ impl ServeConfig {
             "vm_b",
             "pins",
             "region",
+            "rows",
         ];
         if let Some(k) = t.keys().find(|k| !known.contains(&k.as_str())) {
             return Err(format!("[cerebras.spatial.serve]: unknown key `{k}`"));
@@ -250,6 +251,7 @@ impl ServeConfig {
             cap: int(t, "cap")?,
             pipeline: flag(t, "pipeline")?,
             host_copy: flag(t, "host_copy")?,
+            rows: int(t, "rows")?,
         };
         let spec = match t.get("spec") {
             None => None,
@@ -474,12 +476,7 @@ fn serve8b(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Draft> {
     });
     let spec = ProgramSpec::new(
         Design::Serve8b,
-        Model {
-            hidden: g.hidden,
-            qh: g.qh,
-            vocab: plan.vocab,
-            cap,
-        },
+        Model::dims(g.hidden, g.qh, plan.vocab, cap),
         Layers::Strips {
             grid: kernel(g),
             gw: p.gw,
@@ -575,6 +572,13 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     let ncol = plan.layers - band - rc * rr * rnl;
     let c = g.py / 2;
+    // The grids' Y phase-1 group: Gs, or the largest even divisor of PY
+    // below it (152 rows: 8).
+    let grid_gy = (2..=g.gs)
+        .rev()
+        .step_by(2)
+        .find(|x| g.py.is_multiple_of(*x))
+        .unwrap_or(2);
     // With an eta VM (VMX): the guest4hz VM as a 5-column block east of
     // the strip, Vr 160 vocab rows a head PE (32 a VM column: required) and
     // the fewest head rows HH >= vocab / Vr, even (F = HH / 2), whose feeder
@@ -593,8 +597,30 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             (hh, vr, 0, 5)
         }
         None => {
-            let hh = g.py * (1 + ncol);
-            (hh, plan.vocab.div_ceil(hh), 1, 0)
+            // The grid column's height; taller (to 2 YL at most: the feeder
+            // half above the last layer) while the strip's tiles (Vr rows
+            // of 4 Hc dims) pass STRIP_TABLE, with a feeder half F that a
+            // row group of 16-24 divides (Qwen3-8B's 1152 rows hold as is;
+            // Llama's 3 column grids are short for its vocabulary).
+            // Vr even (head2d_v10's row pairs).
+            let vr_of = |hh: usize| plan.vocab.div_ceil(hh).next_multiple_of(2);
+            let fits = |hh: usize| {
+                vr_of(hh) * 4 * g.hc * 2 <= STRIP_TABLE
+                    && (16..=24).step_by(2).any(|x| (hh / 2).is_multiple_of(x))
+            };
+            let mut hh = g.py * (1 + ncol);
+            if !fits(hh) {
+                hh = (hh..(2 * g.py * ncol).min(wafer.height))
+                    .step_by(2)
+                    .find(|&hh| fits(hh))
+                    .ok_or_else(|| {
+                        format!(
+                            "{}: serve8b_region's strip holds no {}-row vocabulary beside {ncol} column grids of PY {}",
+                            plan.spec.name, plan.vocab, g.py
+                        )
+                    })?;
+            }
+            (hh, vr_of(hh), 1, 0)
         }
     };
     let width = rc * rpx + g.px + c + vmc + g.py / 4 + vw;
@@ -654,7 +680,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         rr,
         ncol,
         rtr: 4,
-        gy: g.gs,
+        gy: grid_gy,
         rgy,
         hroute: true,
         rot8: true,
@@ -730,10 +756,15 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     let spec = ProgramSpec::new(
         design,
         Model {
-            hidden: g.hidden,
-            qh: g.qh,
-            vocab: plan.vocab,
-            cap,
+            // Llama: no q/k norms, its own epsilon (the units' sources
+            // follow, codegen's `Variant`).
+            qk_norm: plan.spec.qk_norm,
+            eps_bits: if plan.spec.rms_eps == super::model::KERNEL_EPS {
+                0
+            } else {
+                plan.spec.rms_eps.to_bits()
+            },
+            ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
             grid: kernel(g),
@@ -764,6 +795,17 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         ]
         .map(Typed),
     );
+    // Stated only where they differ from the layout's defaults (Qwen3's
+    // builds keep their parameters).
+    if grid_gy != g.gs {
+        st.push(Typed("GY"));
+    }
+    if !plan.spec.qk_norm {
+        st.push(Typed("QKN"));
+    }
+    if plan.spec.rms_eps != super::model::KERNEL_EPS {
+        st.push(Typed("EPS"));
+    }
     st.extend([
         Knob("MC", g.mlp_chunk),
         Knob("W16", usize::from(g.w16)),
@@ -791,6 +833,11 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     ]);
     Ok(Draft { spec, stated: st })
 }
+
+/// The bytes of a serve8b_region strip PE's embedding tiles (`Vr` rows of
+/// 4 `Hc` bf16 dims) the head's height is chosen for: 32 KiB (Qwen3-8B's
+/// validated strip holds 30.6 KB).
+const STRIP_TABLE: usize = 32 * 1024;
 
 /// serve8b_region_pipe's micro-batches (`mmax`, or the most validated) and
 /// CAP for `lanes`: only the validated shapes; the rest are unrun.
@@ -893,12 +940,7 @@ fn serve2d(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Draft> {
     let mmax = cfg.mmax.unwrap_or(p.mmax.unwrap_or(1));
     let spec = ProgramSpec::new(
         design,
-        Model {
-            hidden: g.hidden,
-            qh: g.qh,
-            vocab: plan.vocab,
-            cap: p.cap,
-        },
+        Model::dims(g.hidden, g.qh, plan.vocab, p.cap),
         Layers::Grids {
             grid: kernel(g),
             gw: p.gw,
@@ -1270,7 +1312,7 @@ pub fn compile(program: &ProgramSpec, target: crate::sdk::Target, system: bool) 
     use crate::sdk::{Arch, Compile, Cslc};
     let (design, params) = (program.design, &program.to_params());
     shapes::check(design, params)?;
-    let files = design.files()?;
+    let files = design.files_with(program.model.variant())?;
     let (w, h) = program.rectangle();
     let (w, h) = (w as u32, h as u32);
     let (fabric_dims, fabric_offsets) = crate::sdk::cslc::memcpy_fabric(w, h);
@@ -1953,5 +1995,163 @@ mod qwen3_8b {
                 crate::spatial::program::ProgramSpec::from_params(d, &p).expect("serve8b_region");
             assert_eq!(lay.layers(), 36);
         }
+    }
+}
+
+#[cfg(test)]
+mod llama31_8b {
+    use super::*;
+    use crate::spatial::model::ModelSpec;
+    use crate::spatial::plan::WaferDims;
+
+    fn spec() -> ModelSpec {
+        let catalog = poem_compiler::catalog::repository();
+        let d = catalog
+            .parse("llama31-8b-bf16-kv-bf16")
+            .expect("llama31-8b parses");
+        ModelSpec::read(&d.trace(poem_ir::Platform::Cerebras)).expect("llama31-8b reads")
+    }
+
+    fn cfg_for(b: usize, pipeline: bool) -> (SpatialPlan, ServeConfig) {
+        let goals = Goals {
+            blocks: Some(1),
+            host_copy: true,
+            grid_lanes: 4,
+            pipeline,
+            rows: Some(152),
+            ..Goals::lanes(b)
+        };
+        let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+        let mut cfg = ServeConfig::new(goals);
+        cfg.region = true;
+        (plan, cfg)
+    }
+
+    /// Llama 3.1 8B as serve8b_region's units: 152-row grids (GY 8; 160
+    /// would be 761 columns), 3 column grids and a head grown to 864 rows so
+    /// the strip's tiles hold the vocabulary, the units built without q/k
+    /// norms at eps 1e-5. The model takes the program; the full rectangle
+    /// fits the wafer.
+    #[test]
+    fn the_plan_places_llama_3_regions() {
+        let (plan, cfg) = cfg_for(1, false);
+        let (d, p) = params(&plan, &cfg).unwrap();
+        assert_eq!(d, Design::Serve8bRegion);
+        let get = |k: &str| p.iter().find(|e| e.0 == k).and_then(|e| e.1.parse().ok());
+        for (k, v) in [
+            ("PY", 152),
+            ("Hc", 27),
+            ("Ic", 112),
+            ("RIc", 56),
+            ("GY", 8),
+            ("NCOL", 3),
+            ("HH", 864),
+            ("Vr", 150),
+            ("Gx", 4),
+            ("Gy", 24),
+            ("QKN", 0),
+            ("EPS", 1e-5f32.to_bits() as usize),
+        ] {
+            assert_eq!(get(k), Some(v), "{k}");
+        }
+        plan.spec
+            .check_program(get)
+            .expect("the model takes serve8b_region");
+        assert_eq!(rectangle(d, &p).unwrap(), (755, 1112));
+        let lay = ProgramSpec::from_params(d, &p).expect("serve8b_region");
+        assert_eq!(lay.layers(), 32);
+        assert!(!lay.model.qk_norm);
+        // The generated units differ from Qwen3's by the variant alone.
+        let qwen = d.files().unwrap();
+        let llama = d.files_with(lay.model.variant()).unwrap();
+        for ((n, a), (_, b)) in qwen.iter().zip(&llama) {
+            let unit = *n == "grid_pe.csl" || *n == "region_pe.csl";
+            assert_eq!(a == b, !unit, "{n}");
+            if unit {
+                assert!(a.contains("allreduce_seg(ssq3_dsd, NH * B);"));
+                assert!(!b.contains("allreduce_seg(ssq3_dsd, NH * B);"), "{n}");
+                assert!(b.contains("const EPS: f32 = 1.0e-5;"), "{n}");
+            }
+        }
+        // Qwen3-8B's model refuses a Llama program, and Llama a Qwen3 one.
+        let qwen3 = poem_compiler::catalog::repository()
+            .parse("qwen3-8b-bf16-kv-bf16")
+            .unwrap()
+            .trace(poem_ir::Platform::Cerebras);
+        let qwen3 = ModelSpec::read(&qwen3).unwrap();
+        assert!(qwen3.check_program(get).is_err());
+        let qwen_get = |k: &str| match k {
+            "QKN" | "EPS" => None,
+            _ => get(k),
+        };
+        assert!(plan.spec.check_program(qwen_get).is_err());
+    }
+
+    /// The ring (B 1 x 12 at CAP 32, B 4 x 4) composes, and the registry
+    /// refuses it until PY 152 has run on hardware.
+    #[test]
+    fn the_llama_3_ring_waits_for_hardware() {
+        for b in [1, 4] {
+            let (plan, cfg) = cfg_for(b, true);
+            let e = params(&plan, &cfg).unwrap_err();
+            assert!(e.contains("PY:152 is unsupported"), "{e}");
+        }
+    }
+
+    /// Without the rows pin the plan's 160 rows are too wide for the head
+    /// and strip, and serve8b's strips do not hold 32 layers.
+    #[test]
+    fn llama_3_wants_its_rows_pinned() {
+        let goals = Goals {
+            blocks: Some(1),
+            host_copy: true,
+            grid_lanes: 4,
+            ..Goals::lanes(1)
+        };
+        let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+        let mut cfg = ServeConfig::new(goals);
+        cfg.region = true;
+        assert!(params(&plan, &cfg).unwrap_err().contains("761 x"));
+        cfg.region = false;
+        assert!(params(&plan, &cfg).is_err());
+    }
+
+    /// The checkpoint config's llama3 scaling gives the trace's table.
+    #[test]
+    fn the_config_rope_scaling_is_the_traces_table() {
+        let config = serde_json::json!({
+            "rope_theta": 500000.0,
+            "max_position_embeddings": 131072,
+            "rope_scaling": {
+                "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192, "rope_type": "llama3"
+            }
+        });
+        let r = crate::spatial::wafer::Rotary::of_config(&config, 128)
+            .unwrap()
+            .unwrap();
+        let s = spec();
+        let want = &s.rope_table.as_ref().unwrap().inv_freq;
+        let got = r.table.as_ref().unwrap();
+        assert_eq!(got.len(), 64);
+        for (a, b) in got.iter().zip(want) {
+            assert!((a - b).abs() <= 1e-6 * b.abs(), "{a} {b}");
+        }
+        assert_eq!(r.inv_freq(128).unwrap(), *got);
+        assert!(r.inv_freq(64).is_err());
+        assert!(r.theta_only("serve2d").is_err());
+        // transformers 5 spells it rope_parameters; a plain config has none.
+        let v5 = serde_json::json!({ "rope_parameters": config["rope_scaling"].clone() });
+        let mut v5 = v5;
+        v5["rope_parameters"]["rope_theta"] = serde_json::json!(500000.0);
+        let r5 = crate::spatial::wafer::Rotary::of_config(&v5, 128)
+            .unwrap()
+            .unwrap();
+        assert_eq!(r5.table, r.table);
+        let plain = serde_json::json!({ "rope_theta": 1.0e6 });
+        let p = crate::spatial::wafer::Rotary::of_config(&plain, 128)
+            .unwrap()
+            .unwrap();
+        assert!(p.table.is_none());
     }
 }
