@@ -154,6 +154,7 @@ fn main() -> Result<(), String> {
                         pages: (0..npg).map(|i| v as u32 * npg + i).collect(),
                         visible: None,
                         forced: vec![3, 7],
+                        state: None,
                     })
                     .collect();
                 m.fire_batch(&lanes, 2, false)?;
@@ -246,6 +247,7 @@ fn main() -> Result<(), String> {
                 pages: (0..npg).map(|i| v as u32 * npg + i).collect(),
                 visible: None,
                 forced: vec![*toks[v].last().unwrap()],
+                state: None,
             })
             .collect();
         // Each lane's step input at step s (its case's `per_step_words`).
