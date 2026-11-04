@@ -252,12 +252,8 @@ pub fn select_fp8_w8a8(
     if nb == 16 && y.width.is_multiple_of(256) {
         return ctx.fire(
             OP,
-            Fire::at(kernel(
-                SELECT_SM80,
-                "::pie::linear::moe_select_fp8a8_wide<0>",
-            ))
-            .apply(
-                Launch::grid([work_cap, y.width / 256, 1], [256, 1, 1]).smem(2 * (256 + 128) * 128),
+            Fire::at(kernel(SELECT_SM80, &wide_kernel("0", ctx))).apply(
+                Launch::grid([work_cap, y.width / 256, 1], [256, 1, 1]).smem(wide_smem(ctx)),
             ),
             &[
                 ArgValue::Ptr(xq),
@@ -418,11 +414,8 @@ pub fn select_fp8_w8a8_glu(
     )?;
     ctx.fire(
         OP,
-        Fire::at(kernel(
-            SELECT_SM80,
-            &format!("::pie::linear::moe_select_fp8a8_wide<{code}>"),
-        ))
-        .apply(Launch::grid([work_cap, n / 256, 1], [256, 1, 1]).smem(2 * (256 + 128) * 128)),
+        Fire::at(kernel(SELECT_SM80, &wide_kernel(&code.to_string(), ctx)))
+            .apply(Launch::grid([work_cap, n / 256, 1], [256, 1, 1]).smem(wide_smem(ctx))),
         &[
             ArgValue::Ptr(xq),
             ArgValue::Ptr(xe),
@@ -552,13 +545,9 @@ pub fn matmul_fp8_w8a8_wide(
     let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(
-            SELECT_SM80,
-            "::pie::linear::moe_select_fp8a8_wide<0, true>",
-        ))
-        .apply(
+        Fire::at(kernel(SELECT_SM80, &wide_kernel("0, true", ctx))).apply(
             Launch::grid([x.rows.div_ceil(128), y.width / 256, 1], [256, 1, 1])
-                .smem(2 * (256 + 128) * 128),
+                .smem(wide_smem(ctx)),
         ),
         &[
             ArgValue::Ptr(xq),
@@ -578,6 +567,31 @@ pub fn matmul_fp8_w8a8_wide(
         ],
     )?;
     Ok(true)
+}
+
+/// `moe_select_fp8a8_wide`'s instance: two 128-code stages, or four 64-code
+/// ones where the chip says (`kernel.moe.fp8a8_deep`), the same tile.
+#[cfg(feature = "cuda")]
+fn wide_kernel(args: &str, ctx: &Ctx) -> String {
+    if ctx.tuning().fp8a8_deep {
+        let args = if args.contains(',') {
+            args.to_string()
+        } else {
+            format!("{args}, false")
+        };
+        format!("::pie::linear::moe_select_fp8a8_wide<{args}, 64, 4>")
+    } else {
+        format!("::pie::linear::moe_select_fp8a8_wide<{args}>")
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn wide_smem(ctx: &Ctx) -> u32 {
+    if ctx.tuning().fp8a8_deep {
+        4 * (256 + 128) * 64
+    } else {
+        2 * (256 + 128) * 128
+    }
 }
 
 /// Three stages of 128 weight rows and 8 nb route rows, each a 128-code K

@@ -1337,7 +1337,7 @@ __global__ void __launch_bounds__(128 * kWN) moe_select_fp8a8_mma(
 /// sums leave through the stages, a route's 256 rows a run. `kGlu`: the
 /// gate-up bank's 128 gate rows and their 128 up rows a CTA (`n` both
 /// halves), each route's 128 GLU values out in `n / 2` columns.
-template <int kGlu, bool kDense = false>
+template <int kGlu, bool kDense = false, int kBKt = 128, int kStages = 2>
 __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
     const u8* __restrict__ xq,
     const u8* __restrict__ xe,
@@ -1351,7 +1351,7 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
 {
     constexpr int kRowsCta = 256;
     constexpr int kSlice = 128;
-    constexpr int kBK = 128;
+    constexpr int kBK = kBKt;  // codes a staged K step: 128, or 64 four stages deep
     constexpr int kChunks = kBK / 16;
     constexpr int kStage = (kRowsCta + kSlice) * kBK;
     constexpr int kNbW = 8;  // 8-route blocks a warp
@@ -1372,7 +1372,8 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
     const int g = lane >> 2;
     const int c = lane & 3;
     const int cta_row0 = static_cast<int>(blockIdx.y) * kRowsCta;
-    const int blocks = k / kBK;
+    const int blocks = k / 128;  // 128-code exponent blocks
+    const int steps = k / kBK;
     // A staged row's bank row: under a GLU the first 128 gate rows, then their up rows.
     const int c0 = static_cast<int>(blockIdx.y) * (kRowsCta / 2);
     auto wrow = [&](int row) {
@@ -1384,7 +1385,7 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
     const u8* w_e = weight + static_cast<long long>(expert) * n * k;
     const u8* atoms_at = atoms + atom_offset(expert * n + (row_base & ~127), 0, blocks);
 
-    auto off = [](int row, int chunk) { return row * kBK + (chunk ^ (row & 7)) * 16; };
+    auto off = [](int row, int chunk) { return row * kBK + (chunk ^ (row & (kChunks - 1))) * 16; };
 
     extern __shared__ uint4 fp8a8_smem[];
     u8* smem = reinterpret_cast<u8*>(fp8a8_smem);
@@ -1437,42 +1438,47 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[t][b][e] = 0.f;
 
-    load(0, 0);
-    __pipeline_commit();
-    for (int s = 0; s < blocks; ++s) {
-        __pipeline_wait_prior(0);
+#pragma unroll
+    for (int i = 0; i < kStages - 1; ++i) {
+        if (i < steps) load(i, i);
+        __pipeline_commit();
+    }
+    for (int s = 0; s < steps; ++s) {
+        __pipeline_wait_prior(kStages - 2);
         __syncthreads();
-        if (s + 1 < blocks) load(s + 1, (s + 1) & 1);
+        if (s + kStages - 1 < steps) load(s + kStages - 1, (s + kStages - 1) % kStages);
         __pipeline_commit();
 
-        const float sw = gfp8::exp2_biased(atoms_at[(s / 4) * 512 + s % 4]);
+        const int sb = s * kBK / 128;  // the step's exponent block
+        const float sw = gfp8::exp2_biased(atoms_at[(sb / 4) * 512 + sb % 4]);
         float sc[kNbW][2];
 #pragma unroll
         for (int b = 0; b < kNbW; ++b)
 #pragma unroll
             for (int h = 0; h < 2; ++h)
-                sc[b][h] = xrow[b][h] >= 0 ? sw * gfp8::exp2_biased(xe[xrow[b][h] * blocks + s]) : 0.f;
+                sc[b][h] = xrow[b][h] >= 0 ? sw * gfp8::exp2_biased(xe[xrow[b][h] * blocks + sb]) : 0.f;
 
-        const u8* sW = smem + (s & 1) * kStage;
+        const u8* sW = smem + (s % kStages) * kStage;
         const u8* sX = sW + kRowsCta * kBK;
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
-            unsigned a[2][4][4];
+            constexpr int kKs = kBK / 32;  // 32-code mma steps a staged step
+            unsigned a[2][kKs][4];
 #pragma unroll
             for (int tt = 0; tt < 2; ++tt)
 #pragma unroll
-                for (int kk = 0; kk < 4; ++kk)
+                for (int kk = 0; kk < kKs; ++kk)
                     ldmatrix_x4(a[tt][kk], sW + off(wm * 64 + 16 * (2 * half + tt) + (lane & 15),
                                                     2 * kk + (lane >> 4)));
 #pragma unroll
             for (int b = 0; b < kNbW; ++b) {
-                unsigned bk[2][4];
+                unsigned bk[kKs / 2][4];
 #pragma unroll
-                for (int p = 0; p < 2; ++p)
+                for (int p = 0; p < kKs / 2; ++p)
                     ldmatrix_x4(bk[p], sX + off(64 * wn + 8 * b + (lane & 7), 4 * p + (lane >> 3)));
                 float blk[2][4] = {};
 #pragma unroll
-                for (int kk = 0; kk < 4; ++kk)
+                for (int kk = 0; kk < kKs; ++kk)
 #pragma unroll
                     for (int tt = 0; tt < 2; ++tt)
                         gfp8::mma(blk[tt], a[tt][kk][0], a[tt][kk][1], a[tt][kk][2], a[tt][kk][3],

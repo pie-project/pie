@@ -391,6 +391,13 @@ pub struct MoeFp8a8WsFrom(pub u32);
 #[decision(id = "kernel.moe.fp8a8_ws_narrow", flag, default = false, tune = search)]
 pub struct MoeFp8a8WsNarrow;
 
+/// Whether the 256x128 block-FP8 select (`moe_select_fp8a8_wide`) stages
+/// 64-code K steps four deep rather than 128-code ones two deep: an Ada's
+/// one CTA an SM then keeps three loads in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.fp8a8_deep", flag, default = false, tune = search)]
+pub struct MoeFp8a8Deep;
+
 /// A decode's W8A16 block-FP8 select (`moe_select_fp8_mma`): the CTAs' warps
 /// an SM its K split aims at, and the chunks a warp keeps in flight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -1042,6 +1049,7 @@ pub fn register(registry: &mut Registry) {
         .add::<KernelPdl>()
         .add::<GemmRowsM>()
         .add::<GemmBf16SplitFrom>()
+        .add::<MoeFp8a8Deep>()
         .add::<GemmTc5SplitTickets>()
         .add::<MoeNvfp4MmaUntil>()
         .add::<MoeGateTc5Until>()
@@ -1204,6 +1212,7 @@ tuning! {
     pdl: bool = false, on KernelPdl;
     gemm_rows_m: u32 = 0, get GemmRowsM;
     gemm_bf16_split_from: u32 = 0, get GemmBf16SplitFrom;
+    fp8a8_deep: bool = false, on MoeFp8a8Deep;
     gemm_tc5_split_tickets: u32 = 0, get GemmTc5SplitTickets;
     nvfp4_mma_from: u32 = 1, get MoeNvfp4MmaFrom;
     nvfp4_mma_until: u32 = 0, get MoeNvfp4MmaUntil;
