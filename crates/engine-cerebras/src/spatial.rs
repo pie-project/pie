@@ -58,6 +58,7 @@ pub mod manifest;
 pub mod model;
 pub mod model_g4;
 pub mod model_moe;
+pub mod moe_place;
 pub mod paged;
 pub mod plan;
 pub mod plan_g4;
