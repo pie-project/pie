@@ -19,6 +19,8 @@ const LIB: &str = "lib";
 
 static INSTALLED: OnceLock<(PathBuf, Vec<(String, Seeded)>)> = OnceLock::new();
 
+static OVERLAID: OnceLock<Catalog> = OnceLock::new();
+
 #[must_use]
 pub fn embedded_tree() -> Tree {
     Tree {
@@ -106,6 +108,25 @@ pub fn install(models: &Path) -> &'static [(String, Seeded)] {
 #[must_use]
 pub fn installed() -> Option<&'static Path> {
     INSTALLED.get().map(|(models, _)| models.as_path())
+}
+
+/// Serves the embedded packages with `files` over them, for a host with no
+/// models directory to edit: each is named by its path under one. Unlike a
+/// directory, this refuses a package that does not load, since the caller is
+/// there to hear it. Call it once, before anything reads the catalog.
+pub fn overlay(files: impl IntoIterator<Item = (String, String)>) -> Result<(), Refused> {
+    let catalog = overlaid(files)?;
+    OVERLAID
+        .set(catalog)
+        .map_err(|_| Refused("the catalog is already overlaid".to_string()))
+}
+
+fn overlaid(files: impl IntoIterator<Item = (String, String)>) -> Result<Catalog, Refused> {
+    let catalog = Catalog::from_tree(&embedded_tree().overlay(files)?)?;
+    match template_faults(&catalog).into_iter().next() {
+        Some(why) => Err(why),
+        None => Ok(catalog),
+    }
 }
 
 /// Each directory the tree seeds: every package, and `lib`.
@@ -353,7 +374,7 @@ pub fn template_faults(catalog: &Catalog) -> Vec<Refused> {
 }
 
 pub fn catalog() -> &'static Catalog {
-    &CATALOG
+    OVERLAID.get().unwrap_or(&CATALOG)
 }
 
 #[must_use]
@@ -368,6 +389,52 @@ pub fn deployments() -> impl Iterator<Item = &'static Deployment> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_overlay_replaces_and_adds_packages() {
+        let embedded = embedded_tree();
+        let tree = embedded
+            .clone()
+            .overlay([
+                ("qwen_3.poem".to_string(), "# edited\n".to_string()),
+                ("yours/model.poem".to_string(), "# mine\n".to_string()),
+                ("lib/mine.poem".to_string(), "# shared\n".to_string()),
+            ])
+            .unwrap();
+        let files = |name: &str| &tree.packages.iter().find(|(n, _)| n == name).unwrap().1;
+        assert_eq!(files("qwen_3")[0].1, "# edited\n");
+        assert_eq!(files("yours")[0].0, "model.poem");
+        assert!(tree.library.iter().any(|(f, _)| f == "//lib/mine.poem"));
+        assert_eq!(tree.packages.len(), embedded.packages.len() + 1);
+        assert!(tree.packages.is_sorted());
+    }
+
+    #[test]
+    fn an_overlay_of_a_good_package_serves() {
+        let embedded = embedded_tree();
+        let (_, files) = embedded
+            .packages
+            .iter()
+            .find(|(n, _)| n == "qwen_3")
+            .unwrap();
+        let edited = format!("# edited\n{}", files[0].1);
+        let catalog = overlaid([("qwen_3.poem".to_string(), edited)]).unwrap();
+        assert!(catalog.package("qwen_3").is_some());
+    }
+
+    #[test]
+    fn an_overlay_refuses_what_a_models_directory_cannot_hold() {
+        for path in ["notes.txt", ".poem", "a/b/c.poem"] {
+            let refused = embedded_tree().overlay([(path.to_string(), String::new())]);
+            assert!(refused.is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn an_overlay_refuses_a_package_that_does_not_load() {
+        let broken = overlaid([("qwen_3.poem".to_string(), "def (\n".to_string())]);
+        assert!(broken.err().unwrap().0.contains("qwen_3"));
+    }
 
     #[test]
     fn seeding_every_case() {

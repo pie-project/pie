@@ -28,6 +28,8 @@ export function bootLazy(
   url: string,
   config?: string,
   onProgress?: (served: number, total: number, from: "network" | "cache") => void,
+  /** Paths under a models directory to their text. */
+  packages?: Record<string, string>,
 ): Promise<BootSummary>;
 
 export function awaitCache(): Promise<void>;
@@ -47,6 +49,13 @@ export interface StartOptions extends LoadOptions {
   model: string;
   /** The boot config: an object, or TOML text. */
   config?: Record<string, unknown> | string;
+  /**
+   * Poem files over the ones this build embeds, as editing `$PIE_HOME/models/`
+   * does for `pie serve`: a path under that directory (`qwen_3.poem`,
+   * `mimo_v2/model.poem`, `lib/nn.poem`) to its text, or a URL to fetch it
+   * from. The boot is refused if one does not load.
+   */
+  packages?: Record<string, string | URL>;
   onProgress?: (served: number, total: number, from: "network" | "cache") => void;
 }
 

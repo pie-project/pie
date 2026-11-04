@@ -108,7 +108,10 @@ export class Server {
     let config = options;
     let home = process.env.PIE_HOME?.trim() || join(homedir(), '.pie');
     if (options && typeof options === 'object' && typeof options.model === 'string') {
-      const { model, config: rest = {} } = options;
+      const { model, config: rest = {}, packages = {} } = options;
+      if (Object.keys(packages).length > 0) {
+        throw new Error('Server.start: `packages` is for the browser; under Node, edit `<home>/models/`');
+      }
       if (typeof rest !== 'object') throw new Error('Server.start: with `model`, `config` is an object');
       config = { ...rest, model: { name: 'default', ...(rest.model ?? {}), source: model } };
       home = options.home ?? home;

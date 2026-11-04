@@ -119,7 +119,7 @@ export const host = {
     return { worker: typeof WorkerGlobalScope !== "undefined" };
   },
 
-  async bootLazy(url, config, base, onProgress) {
+  async bootLazy(url, config, base, packages, onProgress) {
     cacheFill = null;
     const href = new URL(url, base ?? location.href).href;
     const { size, etag } = await describe(href);
@@ -163,7 +163,7 @@ export const host = {
     const t0 = performance.now();
     let summary;
     try {
-      summary = JSON.parse(await driven(bindings.pie_boot_lazy(config, url.split("/").pop(), size)));
+      summary = JSON.parse(await driven(bindings.pie_boot_lazy(config, url.split("/").pop(), size, packages)));
     } finally {
       globalThis.__pieHost.fetchRange = refuse;
       console.log(`pie: lazy boot served ${requests} range request(s), ${(served / 1048576).toFixed(0)} MiB from ${from}, in ${(performance.now() - t0).toFixed(0)} ms`);
