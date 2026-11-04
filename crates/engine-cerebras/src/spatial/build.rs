@@ -1457,6 +1457,7 @@ pub mod presets {
             kv: poem_ir::Dtype::F32,
             norm_plus_one: false,
             hybrid: None,
+            moe: None,
         }
     }
 

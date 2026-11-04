@@ -67,6 +67,9 @@ pub struct ModelSpec {
     /// every layer attends. The attention fields above describe its
     /// attention layers.
     pub hybrid: Option<Hybrid>,
+    /// A routed mixture of experts in every layer (gpt-oss), with its
+    /// attention's extras; `None`: one dense SwiGLU MLP a layer.
+    pub moe: Option<super::model_moe::MoeModel>,
 }
 
 /// What a layer mixes its sequence with.
@@ -191,6 +194,14 @@ impl ModelSpec {
     /// Reads the spec off `trace`, or refuses: the first op or field that
     /// the spatial kernels do not implement, with its layer.
     pub fn read(trace: &Trace) -> Result<ModelSpec, Refused> {
+        if trace
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Operation::Linear(Linear::MoeRoute { .. })))
+        {
+            return super::model_moe::read(trace)
+                .map_err(|e| Refused(format!("{e} (a mixture of experts unlike gpt-oss's)")));
+        }
         if trace
             .nodes
             .iter()
@@ -609,6 +620,7 @@ impl ModelSpec {
             kv,
             norm_plus_one: false,
             hybrid: None,
+            moe: None,
         })
     }
 
@@ -1052,6 +1064,7 @@ fn read_hybrid(trace: &Trace) -> Result<ModelSpec, Refused> {
             attn_gate: true,
             rotary_dim,
         }),
+        moe: None,
     })
 }
 
@@ -1085,6 +1098,12 @@ impl ModelSpec {
         let name = &self.name;
         fn no<T>(name: &str, why: String) -> Result<T, Refused> {
             refuse(format!("{name}: the wafer program: {why}"))
+        }
+        if self.moe.is_some() {
+            return no(
+                name,
+                "a mixture of experts (no program places one yet)".into(),
+            );
         }
         if self.hybrid.is_some() && get("Q35").is_none() {
             return no(

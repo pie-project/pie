@@ -57,6 +57,7 @@ pub mod guest4;
 pub mod manifest;
 pub mod model;
 pub mod model_g4;
+pub mod model_moe;
 pub mod paged;
 pub mod plan;
 pub mod plan_g4;
