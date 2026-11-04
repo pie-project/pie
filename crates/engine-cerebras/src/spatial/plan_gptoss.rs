@@ -16,8 +16,8 @@
 //! - attention and the MoE on one grid (qwen2d_paged8b_hr with the MoE as its
 //!   MLP, 128 x 234, Hc 13): 34.3 KB a PE besides the experts, 52.5 KB with
 //!   them even at four codes a u16. It cannot fit.
-//! - the attention unit alone (gptoss_attn: no MLP, no q/k norm): 14.6 KB of
-//!   code; 35,520 B a PE at Hc 74, B 1, E 7, NB 7;
+//! - the attention unit alone (gptoss_attn: no MLP, no q/k norm, long-vector
+//!   softmax): 15.7 KB of code; 38,400 B a PE at Hc 74, B 1, E 7, NB 7;
 //! - the MoE grid alone at Hc 15, Ic 23, 32 experts: 47,232 B a PE at B 1,
 //!   +304 B a lane (24,448 B of it the experts, the rest code and buffers).
 //!
@@ -40,9 +40,9 @@ const MOE_FIXED: usize = 18_050;
 const MOE_LANE_HOST: usize = 148;
 
 /// gptoss_attn's links (no MLP, no q/k norm; its biases and sinks in) run
-/// 3,510 to 3,534 B under paged8b's grid model; the model keeps the smallest
-/// gap.
-const ATTN_LESS: usize = 3_510;
+/// this far under paged8b's grid model plus the softmax's scratch
+/// ([`AttnUnit::softmax_scratch`]); the model keeps the smallest gap.
+const ATTN_LESS: usize = 2_382;
 
 /// The embedding strip's tables a PE, at most (serve8b's: 116 dims x 132
 /// rows, bf16).
@@ -172,7 +172,13 @@ impl AttnUnit {
 
     /// A PE's bytes (gptoss_attn).
     pub fn bytes(&self) -> usize {
-        self.grid.bytes(false) - ATTN_LESS
+        self.grid.bytes(false) + self.softmax_scratch() - ATTN_LESS
+    }
+
+    /// The softmax's scratch (`xs`): half a PE's score rows, f32.
+    pub fn softmax_scratch(&self) -> usize {
+        let g = &self.grid;
+        4 * (g.entries * g.page_size).div_ceil(2) * g.qh * g.lanes
     }
 }
 
@@ -346,21 +352,21 @@ mod tests {
     }
 
     /// The attention model never runs under gptoss_attn's links, and at most
-    /// 32 B over (hc, lanes, entries, blocks -> image end).
+    /// 48 B over (hc, lanes, entries, blocks -> image end).
     #[test]
     fn the_attention_model_covers_the_links() {
         let s = spec("gptoss-20b-bf16-mxfp4-kv-bf16");
         let links = [
-            ((74, 1, 7, 7), 35_520),
-            ((74, 2, 7, 14), 41_424),
-            ((74, 1, 6, 8), 35_248),
+            ((74, 1, 7, 7), 38_400),
+            ((74, 2, 7, 14), 46_160),
+            ((74, 1, 6, 8), 37_872),
         ];
         for ((hc, b, e, nb), top) in links {
             let mut a = AttnUnit::new(&s, 2880usize.div_ceil(hc), b, e, nb);
             a.grid.hc = hc;
             let m = a.bytes();
             assert!(
-                m >= top && m <= top + 32,
+                m >= top && m <= top + 48,
                 "hc {hc} B {b} E {e} NB {nb}: model {m} link {top}"
             );
         }
