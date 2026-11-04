@@ -3,8 +3,14 @@ api = 1
 [target]
 assumes = { generation = 6 }
 
+# a 512-token prompt (and its template) ran a 1024-row fire: 128-row rungs between the powers of two
+# from 512 up (#1184, Gemma-4-31B cut Raw prefill 8.8k vs vLLM-TPU 12.8k tok/s)
+[engine]
+pad.row_steps = 4
+
 [provenance]
 measured = [
+  "engine.pad.row_steps",
   "kernel.attn.block_keys",
   "kernel.attn.block_rows",
   "kernel.attn.budget_mi",
