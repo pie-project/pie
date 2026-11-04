@@ -101,21 +101,6 @@ impl ToEnd {
             .map(|proc| u64::from(proc.peak.1.slots))
             .sum::<u64>()
             + u64::from(first.1.slots.max(end.1.slots));
-        // Paced: lanes started together hold their pages together to the
-        // end, so past what the pools hold in step, a page-wide class of
-        // the youngest lanes takes at most twice its share of the lanes the
-        // pools hold in step, spread over the pages a lane grows by.
-        if self.paced && (live.len() as u64 + 1) * u64::from(end.0) > u64::from(kv_total) {
-            let growth = u64::from(end.0.saturating_sub(first.0).max(1));
-            let class = (u64::from(kv_total) / u64::from(end.0.max(1)))
-                .div_ceil(growth)
-                .max(1)
-                * 2;
-            let young = live.iter().filter(|proc| proc.peak.0 <= first.0).count() as u64;
-            if young >= class {
-                return false;
-            }
-        }
         let kv_most = most_at_once(&mut kv, end.0);
         let pages_most = most_at_once(&mut pages, end.1.pages);
         let over: u64 = std::env::var("PIE_TO_END_OVER")
