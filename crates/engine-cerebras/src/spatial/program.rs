@@ -784,6 +784,7 @@ impl ProgramSpec {
                 "RC" => Some(u.rc),
                 "RR" => Some(u.rr),
                 "NCOL" => Some(u.ncol),
+                "YD" => Some(u.yd),
                 "RTR" => Some(u.rtr),
                 "GY" => Some(u.gy),
                 "RGY" => Some(u.rgy),
@@ -1170,7 +1171,11 @@ impl ProgramSpec {
                 // The band and regions (RC RPX), the grid column (PX), the
                 // head and the strip, and VMX's 5-column VM block.
                 let vw = if u.vm.is_some() { 5 } else { 0 };
-                let lh = (py + u.rr * u.rpy).max(py * (1 + u.ncol));
+                let lh = if u.yd > 0 {
+                    (u.rr * u.rpy).max(u.yd + py)
+                } else {
+                    (py + u.rr * u.rpy).max(py * (1 + u.ncol))
+                };
                 (
                     u.rc * u.rpx + px + py / 2 + self.vmc() + py / 4 + vw,
                     lh.max(head),
@@ -1578,6 +1583,17 @@ fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
             rc * rpx
         ));
     }
+    let yd = get.opt("YD").unwrap_or(0);
+    if yd > 0 {
+        let (rr, ncol) = (get.req("RR")?, get.req("NCOL")?);
+        let last = rr.saturating_sub(2) * rpy;
+        if rc != 2 || rr < 3 || rr % 2 == 0 || ncol != 1 || yd < last || yd + grid.py > last + rpy {
+            return Err(format!(
+                "serve8b_region YD {yd}: lever D takes RC 2, an odd RR >= 3, NCOL 1 and the last grid within rows {last}..{} (RC {rc}, RR {rr}, NCOL {ncol})",
+                last + rpy
+            ));
+        }
+    }
     let u = Units {
         rpx,
         rpy,
@@ -1595,7 +1611,12 @@ fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
         hroute: get.opt("HROUTE").unwrap_or(0) == 1,
         rot8: get.opt("ROT8").unwrap_or(0) == 1,
         nolayer: get.opt("NOLAYER").unwrap_or(0) == 1,
-        band: rc * rpx / px + 1,
+        band: if get.opt("YD").unwrap_or(0) > 0 {
+            1
+        } else {
+            rc * rpx / px + 1
+        },
+        yd: get.opt("YD").unwrap_or(0),
         vm: match (get.opt("VMX"), get.opt("VMREAL")) {
             (Some(1), Some(1)) => Some(VmBlock {
                 max_ops: get.req("max_ops")?,

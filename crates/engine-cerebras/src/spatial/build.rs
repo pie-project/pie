@@ -1069,6 +1069,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         rot8: true,
         nolayer: false,
         band,
+        yd: 0,
         vm: None,
     };
     let mut st: Vec<Stated> = Vec::new();

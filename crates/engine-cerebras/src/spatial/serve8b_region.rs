@@ -51,6 +51,10 @@ const C_A_HOP: [u32; 2] = [2, 3];
 /// Re-chunk B: one leg color, hops alternate.
 const C_B_LEG: u32 = 3;
 const C_B_HOP: [u32; 2] = [4, 14];
+/// Re-chunk C (lever D: layer 0's grid into the region west of it): legs by
+/// dest row parity, the third where a parity's last leg left the same row
+/// (the grid's last rows feed several dest rows); hops C_A_HOP.
+const C_C_LEG: [u32; 3] = [19, 20, 17];
 const RT_I: usize = 3;
 const RT_O: usize = 3;
 
@@ -78,8 +82,12 @@ pub struct Units {
     pub rot8: bool,
     /// The units skip their layers (checking the handoffs): no weights.
     pub nolayer: bool,
-    /// Grids in the top band, layer 0's included (XC / PX + 1).
+    /// Grids in the top band, layer 0's included (XC / PX + 1; 1 under `YD`).
     pub band: usize,
+    /// `YD` > 0 (lever D): no band; the regions from row 0 (RC 2, RR odd),
+    /// entered from layer 0's grid to their east, and the last layer's grid
+    /// at (XC, YD) beside the last region (NCOL 1). 0: option A.
+    pub yd: usize,
     /// The eta VM as the block east of the strip (`VMX`, `VMREAL`).
     pub vm: Option<VmBlock>,
 }
@@ -165,6 +173,28 @@ impl Units {
             });
         };
         let xc = self.rc * self.rpx;
+        if self.yd > 0 {
+            // Lever D: layer 0 at (XC, 0); the regions (RC 2 x RR, RR odd)
+            // from (1, 0) by rows 0..RR-3 (east-west, then west-east, ...),
+            // then (0, RR-2), (0, RR-1), (1, RR-1), (1, RR-2); the last grid
+            // at (XC, YD) east of that region.
+            add(Kind::Grid, xc, 0);
+            let mut cells: Vec<(usize, usize)> = Vec::new();
+            for r in 0..self.rr.saturating_sub(2) {
+                if r % 2 == 0 {
+                    cells.extend([(1, r), (0, r)]);
+                } else {
+                    cells.extend([(0, r), (1, r)]);
+                }
+            }
+            let (a, b) = (self.rr.saturating_sub(2), self.rr.saturating_sub(1));
+            cells.extend([(0, a), (0, b), (1, b), (1, a)]);
+            for (c, r) in cells {
+                add(Kind::Region, c * self.rpx, r * self.rpy);
+            }
+            add(Kind::Grid, xc, self.yd);
+            return out;
+        }
         for i in 0..self.band {
             add(Kind::Grid, xc - i * lay.px(), 0);
         }
@@ -452,6 +482,12 @@ impl Tables {
             }
         } else if a.x0 == b.x0 && b.y0 == a.y0 + ak.py && ak.px <= bk.px {
             self.rechunk_a(a, b, r)?;
+        } else if a.kind == Kind::Grid
+            && b.kind == Kind::Region
+            && a.x0 == b.x0 + bk.px
+            && a.y0 == b.y0
+        {
+            self.rechunk_c(a, b, r)?;
         } else if b.x0 == a.x0 + ak.px
             && b.y0 >= a.y0
             && b.y0 + bk.py <= a.y0 + ak.py
@@ -592,6 +628,49 @@ impl Tables {
             self.at(b.x0, yg)?.relay = r;
             self.row_mcast(r, b, g, b.x0, D_RAMP)?;
             self.recv_row(b, g, r, Some(b.x0))?;
+        }
+        Ok(())
+    }
+
+    /// Lever D: a grid east of a region, both from the same row. Dest row
+    /// g's pieces chained down grid column a.x0 + g mod a.PX (hops C_A_HOP),
+    /// then on C_C_LEG[g % 2] (or [2]) west along the last source's row into the
+    /// region, to its column b.x0 + b.PX - ceil(b.PY / 2) + g / 2, and down
+    /// to row g, whose PE multicasts the row. A leg's columns increase with
+    /// g within its color and its source rows strictly, so a row's westward
+    /// leg crosses only columns of later rows, whose legs start below it.
+    fn rechunk_c(&mut self, a: &Unit, b: &Unit, r: u32) -> R<()> {
+        let mut prev = [usize::MAX; 3];
+        for g in 0..b.k.py {
+            let p = Tables::pieces(a, b, g);
+            if p.is_empty() {
+                continue;
+            }
+            let col = a.x0 + g % a.k.px;
+            let srcs: Vec<Piece> = p
+                .iter()
+                .map(|&(row, so, d, n)| (a.y0 + row, so, d, n))
+                .collect();
+            let yg = b.y0 + g;
+            let last = srcs[srcs.len() - 1].0;
+            if last > yg {
+                return Err("re-chunk C: a source row below its dest row".into());
+            }
+            let xg = b.x0 + b.k.px - b.k.py.div_ceil(2) + g / 2;
+            let mut pts = vec![(col, last), (xg, last)];
+            if last != yg {
+                pts.push((xg, yg));
+            }
+            let dest = (xg, yg);
+            let k = if prev[g % 2] == last { 2 } else { g % 2 };
+            if prev[k] == last {
+                return Err("re-chunk C: three dest rows' legs leave one row".into());
+            }
+            prev[k] = last;
+            self.chain(col, &srcs, C_A_HOP, C_C_LEG[k], &pts, dest, true)?;
+            self.at(dest.0, dest.1)?.relay = r;
+            self.row_mcast(r, b, g, xg, D_RAMP)?;
+            self.recv_row(b, g, r, Some(xg))?;
         }
         Ok(())
     }
@@ -1287,6 +1366,57 @@ mod tests {
             vm_load(&lay, &mut rec, &[None])
                 .unwrap_err()
                 .contains("lanes")
+        );
+    }
+
+    /// Lever D (`YD`): Llama 3.1 8B as layer 0's grid, 10 regions of
+    /// 256 x 208 (30 layers) and the last grid at (512, 624).
+    #[test]
+    fn lever_d_units_and_tables() {
+        let p = "PX:128,PY:152,Hc:27,Dc:8,Gs:16,Ic:112,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:56,\
+        RNL:3,RGY:16,GY:8,RC:2,RR:5,NCOL:1,YD:624,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
+        PROF:0,TIME:1,HROUTE:1,ROT8:1,QKN:0,EPS:925353388,NOLAYER:0,HEADMODE:2,HH:864,Vr:150,Gx:4,Gy:24,\
+        vocab:128256,PASSES:3,MODE:2,OVL:0,VMC:1,CAP:128,iters:1,B:1,NP:1,SPD:1,LSE:1";
+        let lay = lay_of(p);
+        let Layers::Units { units: u, .. } = lay.layers else {
+            panic!("not serve8b_region")
+        };
+        let units = u.units(&lay);
+        assert_eq!((units.len(), lay.layers(), lay.head_x()), (12, 32, 640));
+        let at: Vec<_> = units.iter().map(|v| (v.x0, v.y0, v.layers.start)).collect();
+        assert_eq!(
+            at,
+            vec![
+                (512, 0, 0),
+                (256, 0, 1),
+                (0, 0, 4),
+                (0, 208, 7),
+                (256, 208, 10),
+                (256, 416, 13),
+                (0, 416, 16),
+                (0, 624, 19),
+                (0, 832, 22),
+                (256, 832, 25),
+                (256, 624, 28),
+                (512, 624, 31)
+            ]
+        );
+        assert_eq!(lay.rectangle().1, 1040);
+        let t = Tables::new(units.clone(), 1, u.rtr).unwrap();
+        for v in &units {
+            assert_eq!(t.table(v).unwrap().len(), v.k.px * v.k.py * t.rtn());
+        }
+        let bad = p.replace("YD:624", "YD:432");
+        assert!(
+            ProgramSpec::of_pairs(
+                &bad.split(',')
+                    .map(|q| q
+                        .split_once(':')
+                        .map(|(k, v)| (k, v.parse().unwrap()))
+                        .unwrap())
+                    .collect::<Vec<_>>()
+            )
+            .is_err()
         );
     }
 
