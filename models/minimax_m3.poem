@@ -303,7 +303,7 @@ def swiglu_oai(x, f):
 def moe(x, f):
     """The routed experts, scaled, beside the shared expert."""
     experts, weights = ops.linear.moe_route(
-        ops.linear.matmul(x, f.router),
+        ops.linear.matmul_f32(x, f.router),
         f.experts,
         f.top_k,
         routing.sigmoid(renormalize = True, scaling = f.routed_scaling),
