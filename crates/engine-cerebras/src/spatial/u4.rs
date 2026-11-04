@@ -567,8 +567,339 @@ pub(crate) fn place_unit(
     Ok(())
 }
 
+/// `name` (a `rows` x `cols` matrix, `rows` read from the checkpoint) in
+/// u4g64: as landed, else its bf16 weight quantized.
+fn q4_whole(ckpt: &Ckpt, name: &str, cols: usize) -> R<Q4> {
+    if let Some(l) = ckpt.u4g64(name)? {
+        return Q4::of(ckpt, name, l.rows, cols);
+    }
+    let (shape, bits) = ckpt.bits(name)?;
+    if shape.len() != 2 || shape[1] != cols {
+        return Err(format!("{name} is {shape:?}; the program wants [_, {cols}]"));
+    }
+    Q4::quantize(&bits, shape[0], cols)
+}
+
+/// The head's u4 tile at `W4H` 1 (`codegen::w4_head`): a head PE's `hh2`
+/// dims of x (a run from a multiple of `hh2`) by its `vr` vocab rows.
+#[must_use]
+pub fn head_tile(hh2: usize, vr: usize) -> Tile {
+    Tile {
+        r: hh2,
+        n: vr,
+        g: run_groups(hh2),
+    }
+}
+
+/// u32 words of a head PE's `wt` at `W4H` 1 (`W4TW`): a pad and the
+/// blob, u16 words two to a u32 (element 2k in the low half).
+#[must_use]
+pub fn head_words(t: Tile) -> usize {
+    (t.words(1) + 2) / 2
+}
+
+/// u16 words `w` (a pad first) packed two to a u32 into `n32` words.
+fn pack16(w: &[u32], n32: usize, out: &mut Vec<u32>) {
+    for k in 0..n32 {
+        let at = |i: usize| w.get(i).copied().unwrap_or(0) & 0xffff;
+        out.push(at(2 * k) | at(2 * k + 1) << 16);
+    }
+}
+
+/// The head's lm_head in u4g64 (`W4H` 1): head PE (chunk column c, region
+/// row ry) holds dims `c hh2 ..` of vocab rows `ry Vr ..` as one [`blob`]
+/// ([`head_tile`]) after a pad word in `wt`; the VM column zero.
+pub(crate) fn place_head(
+    lay: &super::program::ProgramSpec,
+    ckpt: &Ckpt,
+    dev: &mut dyn super::device::Device,
+) -> R<()> {
+    let (vr, hid, hh2) = (lay.vr(), lay.hidden(), 2 * lay.hc());
+    let q = q4_whole(ckpt, "head", hid)?;
+    if q.rows > lay.vocab() || lay.vocab() > lay.hh() * vr {
+        return Err(format!(
+            "head is [{}, {hid}]; the head holds {} rows ({} words)",
+            q.rows,
+            lay.vocab(),
+            lay.hh() * vr
+        ));
+    }
+    let t = head_tile(hh2, vr);
+    let n32 = head_words(t);
+    let cols = super::serve8b::head_cols(lay);
+    let mut err = None;
+    let mut tile = |row: usize, c: usize, out: &mut Vec<u32>| {
+        let rows: Vec<Option<usize>> =
+            (0..hh2).map(|k| Some(c * hh2 + k).filter(|&d| d < hid)).collect();
+        let col: Vec<Col> = (0..vr)
+            .map(|vv| Some(row * vr + vv).filter(|&o| o < q.rows).map(|o| (&q, o)))
+            .collect();
+        let mut w = vec![0u32];
+        if let Err(e) = blob(t, &rows, &[col], &mut w) {
+            err.get_or_insert(format!("u4g64 head at chunk column {c}, row {row}: {e}"));
+        }
+        pack16(&w, n32, out);
+    };
+    let words = {
+        let mut all = Vec::with_capacity(lay.hh() * cols.len() * n32);
+        for row in 0..lay.hh() {
+            for c in &cols {
+                match c {
+                    Some(c) => tile(row, *c, &mut all),
+                    None => all.extend(std::iter::repeat_n(0, n32)),
+                }
+            }
+        }
+        all
+    };
+    if let Some(e) = err {
+        return Err(e);
+    }
+    let w = cols.len() * n32;
+    super::serve8b::region_rows(lay, dev, "wt", lay.head_x(), cols.len(), n32, |r0, r1| {
+        words[r0 * w..r1 * w].to_vec()
+    })
+}
+
+/// The embedding strip's row layout at `W4H` 1 (`codegen::w4_embed`) for
+/// `he` dims a PE: the groups a run of `he` dims from a multiple of `he`
+/// touches (`E4G`), a vocab row's u16 words (`E4RW`), the PE's u32 words
+/// for `ve` rows.
+#[must_use]
+pub fn embed_layout(he: usize, ve: usize) -> (usize, usize, usize) {
+    let g = run_groups(he);
+    let rw = he / 4 + 2 * g;
+    (g, rw, (2 + ve * rw).div_ceil(2))
+}
+
+/// One strip PE's u16 words at `W4H` 1: `[ph, 0]` (its first dim `d0` mod
+/// 64), then for each of its `ve` vocab rows from `v0` the codes of dims
+/// `d0 .. d0 + he` (word i: dims i, he/4 + i, ... at bits 0, 4, 8, 12),
+/// then the row's scales and biases of the groups from `d0 / 64`.
+#[must_use]
+pub fn embed_words(q: &Q4, hid: usize, d0: usize, he: usize, v0: usize, ve: usize) -> Vec<u32> {
+    let (g, rw, _) = embed_layout(he, ve);
+    let hq = he / 4;
+    let mut w = Vec::with_capacity(2 + ve * rw);
+    w.extend([(d0 % GROUP) as u32, 0]);
+    for vv in 0..ve {
+        let row = v0 + vv;
+        let real = row < q.rows;
+        let code = |d: usize| -> u32 {
+            if real && d < hid { u32::from(q.code(row, d)) } else { 0 }
+        };
+        for i in 0..hq {
+            w.push((0..4).map(|pl| code(d0 + pl * hq + i) << (4 * pl)).fold(0, |a, b| a | b));
+        }
+        for half in 0..2 {
+            for sl in 0..g {
+                let gi = d0 / GROUP + sl;
+                let v = if real && gi * GROUP < hid {
+                    let (s, b) = q.affine(row, gi);
+                    if half == 0 { s } else { b }
+                } else {
+                    0
+                };
+                w.push(u32::from(v));
+            }
+        }
+    }
+    w
+}
+
+/// The kernel's reading of a strip row (`e4_row`): dim k of row `j` as
+/// `scale * code + bias` in f32.
+#[must_use]
+pub fn embed_row(w: &[u32], he: usize, ve: usize, j: usize) -> Vec<f32> {
+    let (g, rw, _) = embed_layout(he, ve);
+    let (hq, ph) = (he / 4, w[0] as usize);
+    let r = &w[2 + j * rw..2 + (j + 1) * rw];
+    (0..he)
+        .map(|k| {
+            let (pl, i) = (k / hq, k % hq);
+            let q = (r[i] >> (4 * pl)) & 15;
+            let sl = (ph + k) >> 6;
+            let s = bf16_f32(r[hq + sl] as u16);
+            let b = bf16_f32(r[hq + g + sl] as u16);
+            s * q as f32 + b
+        })
+        .collect()
+}
+
+/// The embedding strip in u4g64 (`W4H` 1): strip PE (column EC-1-c, region
+/// row ry) holds dims `[c He, (c+1) He)` of vocab rows `ry Ve ..`
+/// ([`embed_words`]) in `etab`.
+pub(crate) fn place_embed(
+    lay: &super::program::ProgramSpec,
+    ckpt: &Ckpt,
+    dev: &mut dyn super::device::Device,
+) -> R<()> {
+    let (ve, hid) = (lay.vr(), lay.hidden());
+    let (ec, he) = (lay.py() / 4, 4 * lay.hc());
+    let q = q4_whole(ckpt, "embed", hid)?;
+    if q.rows > lay.hh() * ve {
+        return Err(format!(
+            "embed is [{}, {hid}]; the strip holds {} rows",
+            q.rows,
+            lay.hh() * ve
+        ));
+    }
+    let n32 = embed_layout(he, ve).2;
+    let xe = lay.head_x() + lay.chunk_cols() + lay.vmc();
+    super::serve8b::region_rows(lay, dev, "etab", xe, ec, n32, |r0, r1| {
+        let mut t = Vec::with_capacity((r1 - r0) * ec * n32);
+        for row in r0..r1 {
+            for s in 0..ec {
+                let c = ec - 1 - s;
+                pack16(&embed_words(&q, hid, c * he, he, row * ve, ve), n32, &mut t);
+            }
+        }
+        t
+    })
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A W4H build's head and strip, placed through `serve8b::head` /
+    /// `serve8b::embed` on the recorder, read back PE by PE: each head PE's
+    /// `wt` (the kernel's `W4TW` words) is its dims-by-vocab-rows tile of
+    /// the quantized lm_head, each strip PE's `etab` its rows' dequantized
+    /// embeddings; padding past the vocab and the hidden size reads 0.
+    #[test]
+    fn w4h_head_and_strip_read_back() {
+        use super::super::codegen::Design;
+        use super::super::device::Recorder;
+        use super::super::program::ProgramSpec;
+        let base = "PX:8,PY:16,Hc:4,Dc:8,Gs:8,Ic:24,RPX:16,RPY:24,RHc:3,RDc:4,RGs:16,RIc:12,RNL:2,\
+            RGY:8,RC:2,RR:2,NCOL:2,RTR:5,HR:64,Qh:4,PS:4,NB:2,E:2,B:1,MC:1,W16:1,NP:1,KV16:1,KVCP:0,\
+            PROF:0,TIME:0,HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:32,Vr:32,Gx:4,Gy:8,vocab:1000,\
+            PASSES:3,MODE:0,OVL:0,VMC:1,CAP:16,iters:1,W4:1,W4H:1";
+        let kv: Vec<(String, String)> = base
+            .split(',')
+            .filter_map(|p| p.split_once(':'))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect();
+        let lay = ProgramSpec::from_params(Design::Serve8bRegion, &kv).unwrap();
+        assert!(lay.head_u4());
+        let ckpt = Ckpt::synthetic(super::super::golden::shapes(&lay, true));
+        let mut dev = Recorder::default();
+        super::super::serve8b::head(&lay, &ckpt, &mut dev).unwrap();
+        super::super::serve8b::embed(&lay, &ckpt, &mut dev).unwrap();
+        let hid = lay.hidden();
+        let (vr, hh2, he) = (lay.vr(), 2 * lay.hc(), 4 * lay.hc());
+        let (shape, bits) = ckpt.bits("head").unwrap();
+        let qh = Q4::quantize(&bits, shape[0], hid).unwrap();
+        let (shape, bits) = ckpt.bits("embed").unwrap();
+        let qe = Q4::quantize(&bits, shape[0], hid).unwrap();
+        let unpack = |w: Vec<u32>| -> Vec<u32> { w.iter().flat_map(|&x| [x & 0xffff, x >> 16]).collect() };
+        let (f, cols) = (lay.feeder(), super::super::serve8b::head_cols(&lay));
+        let t = head_tile(hh2, vr);
+        let (mut heads, mut strips) = (0, 0);
+        for ry in 0..lay.hh() {
+            let y = if ry < f { ry } else { ry + 1 };
+            for (i, c) in cols.iter().enumerate() {
+                let Some(c) = *c else { continue };
+                let w = dev.memory("wt", (lay.head_x() + i) as i32, y as i32).unwrap();
+                assert_eq!(w.len(), head_words(t));
+                let u = unpack(w);
+                let x: Vec<f32> = (0..hh2).map(|k| bf16_f32(bf16_bits(((k + c) as f32 * 0.7).cos()))).collect();
+                let got = apply(t, &u[1..], 0, &x);
+                for (vv, g) in got.iter().enumerate() {
+                    let o = ry * vr + vv;
+                    let want: f64 = (0..hh2)
+                        .filter(|&k| o < qh.rows && c * hh2 + k < hid)
+                        .map(|k| f64::from(qh.value(o, c * hh2 + k)) * f64::from(x[k]))
+                        .sum();
+                    assert!((g - want).abs() < 1e-4, "head ({c}, {ry}) row {o}: {g} vs {want}");
+                }
+                heads += 1;
+            }
+            let ec = lay.py() / 4;
+            let xe = lay.head_x() + lay.chunk_cols() + lay.vmc();
+            for s in 0..ec {
+                let c = ec - 1 - s;
+                let w = dev.memory("etab", (xe + s) as i32, y as i32).unwrap();
+                assert_eq!(w.len(), embed_layout(he, vr).2);
+                let u = unpack(w);
+                for j in 0..vr {
+                    let o = ry * vr + j;
+                    for (k, g) in embed_row(&u, he, vr, j).iter().enumerate() {
+                        let d = c * he + k;
+                        let want = if o < qe.rows && d < hid { qe.value(o, d) } else { 0.0 };
+                        assert_eq!(g.to_bits(), want.to_bits(), "strip ({c}, {ry}) row {o} dim {d}");
+                    }
+                }
+                strips += 1;
+            }
+        }
+        assert!(heads > 0 && strips > 0);
+    }
+
+    /// The strip's u4 rows read back (`embed_row`, the kernel's `e4_row`)
+    /// equal the dequantized weight bit for bit, at every group phase and
+    /// past the hidden size and the vocab.
+    #[test]
+    fn embed_rows_read_back_exactly() {
+        let (rows, hid) = (7, 320);
+        let w: Vec<u16> = (0..rows * hid)
+            .map(|i| bf16_bits(((i * 37 % 101) as f32 - 50.0) * 0.013))
+            .collect();
+        let q = Q4::quantize(&w, rows, hid).unwrap();
+        for he in [16, 64, 144, 128] {
+            for c in 0..hid.div_ceil(he) {
+                let (d0, ve) = (c * he, 4);
+                for v0 in [0, 4] {
+                    let words = embed_words(&q, hid, d0, he, v0, ve);
+                    assert_eq!(words.len(), 2 + ve * embed_layout(he, ve).1);
+                    for j in 0..ve {
+                        let got = embed_row(&words, he, ve, j);
+                        for (k, g) in got.iter().enumerate() {
+                            let (o, d) = (v0 + j, d0 + k);
+                            let want = if o < rows && d < hid { q.value(o, d) } else { 0.0 };
+                            assert_eq!(g.to_bits(), want.to_bits(), "he {he} c {c} row {o} dim {d}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The head's tile at its shapes: a blob of `head_words` u32 words,
+    /// read back (`apply`) as the dense dequantized matvec.
+    #[test]
+    fn head_tile_reads_back() {
+        let (vocab, hid) = (50, 192);
+        let w: Vec<u16> = (0..vocab * hid)
+            .map(|i| bf16_bits(((i * 53 % 97) as f32 - 48.0) * 0.02))
+            .collect();
+        let q = Q4::quantize(&w, vocab, hid).unwrap();
+        for (hh2, vr) in [(72, 12), (40, 9), (64, 16)] {
+            let t = head_tile(hh2, vr);
+            for c in 0..hid.div_ceil(hh2) {
+                for row in 0..vocab.div_ceil(vr) {
+                    let rows: Vec<Option<usize>> =
+                        (0..hh2).map(|k| Some(c * hh2 + k).filter(|&d| d < hid)).collect();
+                    let col: Vec<Col> = (0..vr)
+                        .map(|vv| Some(row * vr + vv).filter(|&o| o < vocab).map(|o| (&q, o)))
+                        .collect();
+                    let mut b = Vec::new();
+                    blob(t, &rows, &[col], &mut b).unwrap();
+                    assert_eq!((b.len() + 2) / 2, head_words(t));
+                    let x: Vec<f32> = (0..hh2).map(|k| bf16_f32(bf16_bits((k as f32 * 0.37).sin()))).collect();
+                    let y = apply(t, &b, 0, &x);
+                    for (vv, yv) in y.iter().enumerate() {
+                        let o = row * vr + vv;
+                        let want: f64 = (0..hh2)
+                            .filter(|&k| o < vocab && c * hh2 + k < hid)
+                            .map(|k| f64::from(q.value(o, c * hh2 + k)) * f64::from(x[k]))
+                            .sum();
+                        assert!((yv - want).abs() < 1e-4, "hh2 {hh2} c {c} row {o}: {yv} vs {want}");
+                    }
+                }
+            }
+        }
+    }
     use super::*;
 
     fn lcg(seed: &mut u64) -> f32 {

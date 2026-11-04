@@ -375,12 +375,64 @@ pub const KVST_LAYER_BYTES: usize = 112;
 /// (`hlb` lanes) and, on a ring of `mmax` micro-batches, the pipe's code and
 /// per-lane state. Link probes (2026-11-04, Qwen3-14B u4 pipe x12, B 1,
 /// `vr` 64-140, `hc` 29-36: this bounds every probe, at most ~370 B high).
+/// With `u4` (`W4H` 1) the bf16 rows are one u4g64 tile ([`head_u4_bytes`]).
 #[must_use]
-pub fn head_bytes(vr: usize, hc: usize, lanes: usize, hlb: usize, mmax: Option<usize>) -> usize {
+pub fn head_bytes(
+    vr: usize,
+    hc: usize,
+    lanes: usize,
+    hlb: usize,
+    mmax: Option<usize>,
+    u4: bool,
+) -> usize {
     let vp = vr.next_power_of_two().max(32);
     let pipe = mmax.map_or(0, |m| HEAD_PIPE + 4 * m * lanes);
-    HEAD_FIXED + vr * (4 * hc + 20) + 60 * hc + 8 * vp + 4 * vr * hlb.saturating_sub(1) + pipe
+    // Per-row f32 vectors: 20 B a row bf16; 14 B a row fits the u4 probes.
+    let rows = if u4 { head_u4_bytes(vr, hc) + vr * 14 } else { vr * (4 * hc + 20) };
+    HEAD_FIXED + rows + 60 * hc + 8 * vp + 4 * vr * hlb.saturating_sub(1) + pipe
 }
+
+/// A `W4H` head PE's u4 part (`codegen::w4_head`): the tile (`2 hc` dims
+/// by `vr` rows, a pad), the u4 scratch at NP 3 (decode buffer,
+/// accumulator, widened scales, x's parts, `wmv4`'s f32 scratch, the
+/// header copy) and `HEAD_W4_CODE`. Link probes (2026-11-04, B 1 heads
+/// with their final root's tokens, W4H 1): Vr 132, 72 dims, CAP 64: 39,392
+/// B (bf16: 46,256); Vr 228, 80 dims, CAP 32: 47,280 B; pipe x12 Vr 228:
+/// head 47,424 B, final root 48,944 B at CAP 16. The model is within 50 B
+/// above each (the per-row term is 14 B on u4 heads).
+#[must_use]
+pub fn head_u4_bytes(vr: usize, hc: usize) -> usize {
+    let t = super::u4::head_tile(2 * hc, vr);
+    let np = 3;
+    4 * super::u4::head_words(t)
+        + 2 * (t.chunk() * (t.n + 1) + 1)
+        + 4 * (t.n + 1)
+        + 4 * t.n
+        + 2 * 3 * np * t.r
+        + 8 * t.r
+        + 2 * t.header()
+        + HEAD_W4_CODE
+}
+pub const HEAD_W4_CODE: usize = 1_140;
+
+/// The embedding strip's PE (`embed_pe.csl`): `ve` vocab rows of `4 hc`
+/// dims, bf16 or (`u4`, `W4H` 1) [`super::u4::embed_layout`]'s rows, and
+/// its f32 row and lanes. Link probes (2026-11-04, Qwen3-14B u4 B 1, Ve
+/// 132, Hc 36): 47,184 B bf16, 21,664 B u4; Ve 228, Hc 40: 32,112 B u4. The planner did not check this
+/// image before: at 200k+ vocabularies it overflows like the head's.
+#[must_use]
+pub fn embed_bytes(ve: usize, hc: usize, lanes: usize, u4: bool) -> usize {
+    let he = 4 * hc;
+    let rows = if u4 {
+        let (_, rw, n32) = super::u4::embed_layout(he, ve);
+        4 * n32 + 2 * rw + EMBED_W4_CODE
+    } else {
+        2 * ve * he
+    };
+    EMBED_FIXED + 4 * he * (lanes + 1) + rows
+}
+pub const EMBED_FIXED: usize = 8_016;
+pub const EMBED_W4_CODE: usize = 828;
 
 /// The final root's head PE: [`head_bytes`] and its forced and argmax token
 /// rows (`in_tokens`, `out_tokens`: `mmax` x `lanes` x `cap` u32 each; probe:
@@ -394,8 +446,9 @@ pub fn final_root_bytes(
     hlb: usize,
     mmax: Option<usize>,
     cap: usize,
+    u4: bool,
 ) -> usize {
-    head_bytes(vr, hc, lanes, hlb, mmax) + 8 * mmax.unwrap_or(1) * lanes * cap
+    head_bytes(vr, hc, lanes, hlb, mmax, u4) + 8 * mmax.unwrap_or(1) * lanes * cap
 }
 
 /// [`head_bytes`]' constant (code, runtime and the small buffers) and the
@@ -1302,6 +1355,23 @@ mod tests {
                     ),
                 }
             }
+        }
+    }
+
+    /// The head and strip byte model at W4H 1 against its link probes.
+    #[test]
+    fn head_u4_model_bounds_probes() {
+        for (vr, hc, mmax, cap, probe) in [
+            (132, 36, None, 64, 39_392),
+            (228, 40, None, 32, 47_280),
+            (228, 40, Some(12), 16, 48_944),
+        ] {
+            let m = final_root_bytes(vr, hc, 1, 1, mmax, cap, true);
+            assert!(m >= probe && m <= probe + 400, "Vr {vr}: model {m} vs probe {probe}");
+        }
+        for (ve, hc, u4, probe) in [(132, 36, false, 47_184), (132, 36, true, 21_664), (228, 40, true, 32_112)] {
+            let m = embed_bytes(ve, hc, 1, u4);
+            assert!(m >= probe && m <= probe + 200, "Ve {ve} u4 {u4}: model {m} vs probe {probe}");
         }
     }
 

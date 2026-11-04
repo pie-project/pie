@@ -504,7 +504,7 @@ pub(crate) fn unit(
 /// Writes a table of `HH` region rows, `w` PEs of `n` words each, built
 /// [`BLOCK`] rows at a time by `tile(r0, r1)`, to the region rows at
 /// columns `x0..` (skipping the feeder row F, as `_region_rows`).
-fn region_rows(
+pub(crate) fn region_rows(
     lay: &ProgramSpec,
     dev: &mut dyn Device,
     sym: &str,
@@ -533,7 +533,7 @@ fn region_rows(
 }
 
 /// Two bf16 to a u32 word, element 2k in the low half.
-fn pack(lo: u16, hi: u16) -> u32 {
+pub(crate) fn pack(lo: u16, hi: u16) -> u32 {
     u32::from(lo) | (u32::from(hi) << 16)
 }
 
@@ -541,13 +541,17 @@ fn pack(lo: u16, hi: u16) -> u32 {
 /// holds dims c Hh .. of vocab rows ry Vr .., dim-major, two to a word; a
 /// zero VM column after the root column; the final norm on the feeder row.
 pub(crate) fn head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()> {
+    if lay.head_u4() {
+        super::u4::place_head(lay, ckpt, dev)?;
+        return head_gamma(lay, ckpt, dev, 2 * lay.hc());
+    }
     head_with(lay, ckpt, dev, 2 * lay.hc())
 }
 
 /// [`head`] with `hh2` dims a chunk column (serve8b's pairs of grid rows,
 /// serve_gptoss's triples).
 pub(crate) fn head_with(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device, hh2: usize) -> R<()> {
-    let (vr, c_n, hid, vmc) = (lay.vr(), lay.chunk_cols(), lay.hidden(), lay.vmc());
+    let (vr, hid) = (lay.vr(), lay.hidden());
     let (shape, lm) = ckpt.bits("head")?;
     let v = shape[0];
     if shape.len() != 2 || shape[1] != hid || v > lay.vocab() || lay.vocab() > lay.hh() * vr {
@@ -557,14 +561,8 @@ pub(crate) fn head_with(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device, hh
             lay.hh() * vr
         ));
     }
-    let r2x = lay.r2x();
     // Head columns (VM included): chunk column c, or None for the VM's.
-    let cols: Vec<Option<usize>> = (0..c_n)
-        .flat_map(|c| {
-            let vm = if c == r2x { vmc } else { 0 };
-            std::iter::once(Some(c)).chain(std::iter::repeat_n(None, vm))
-        })
-        .collect();
+    let cols = head_cols(lay);
     let n = hh2 * vr / 2;
     let el = |row: usize, c: usize, j: usize| -> u16 {
         let (k, vv) = (j / vr, j % vr);
@@ -590,6 +588,23 @@ pub(crate) fn head_with(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device, hh
         t
     })?;
     drop(lm);
+    head_gamma(lay, ckpt, dev, hh2)
+}
+
+/// The head's chunk columns, the VM's (`None`) after the root column.
+pub(crate) fn head_cols(lay: &ProgramSpec) -> Vec<Option<usize>> {
+    let (r2x, vmc) = (lay.r2x(), lay.vmc());
+    (0..lay.chunk_cols())
+        .flat_map(|c| {
+            let vm = if c == r2x { vmc } else { 0 };
+            std::iter::once(Some(c)).chain(std::iter::repeat_n(None, vm))
+        })
+        .collect()
+}
+
+/// The final norm on the head's feeder row (`hh2` dims a chunk column).
+fn head_gamma(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device, hh2: usize) -> R<()> {
+    let (hid, cols) = (lay.hidden(), head_cols(lay));
     let g = vector(ckpt, "final_norm", hid)?;
     let gam: Vec<u32> = cols
         .iter()
@@ -608,6 +623,9 @@ pub(crate) fn head_with(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device, hh
 /// column EC-1-c, ry) holds dims [c He, (c+1) He) of vocab rows ry Vr ..,
 /// row-major bf16, two to a word.
 pub(crate) fn embed(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()> {
+    if lay.head_u4() {
+        return super::u4::place_embed(lay, ckpt, dev);
+    }
     embed_with(lay, ckpt, dev, lay.py() / 4, 4 * lay.hc())
 }
 

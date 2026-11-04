@@ -660,6 +660,13 @@ impl ProgramSpec {
         self.knobs.get("W4").is_some_and(|v| v.trim() == "1")
     }
 
+    /// The head's lm_head tiles and the embedding strip hold u4g64 too
+    /// (`W4H 1`, on a `W4 1` build: `spatial::u4::place_head`/`place_embed`).
+    #[must_use]
+    pub fn head_u4(&self) -> bool {
+        self.weights_u4() && self.knobs.get("W4H").is_some_and(|v| v.trim() == "1")
+    }
+
     /// The typed parameter `k`, from the component that holds it (`None`:
     /// a knob, or a parameter this design's components do not hold).
     #[must_use]

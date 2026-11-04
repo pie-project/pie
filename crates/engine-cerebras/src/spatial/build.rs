@@ -616,6 +616,9 @@ struct Placement {
     hh: usize,
     vr: usize,
     vmc: usize,
+    /// The head and embedding strip hold u4g64 (`W4H` 1): a u4 plan whose
+    /// bf16 head or strip PE does not fit.
+    head4: bool,
     /// The search's cost estimate (lower is faster; see `unit_cost`).
     cost: usize,
 }
@@ -737,15 +740,21 @@ fn place_at(
         g.bytes(ring) + staging(1) <= most
             && (rc * rr == 0 || r.region_bytes(rnl, ring) + staging(rnl) <= most)
     };
-    // The head's PEs (no VM block): their rows at CAP 1; serve8b_region then
-    // picks the CAP the final root holds (`plan::final_root_bytes`).
-    if check_bytes
-        && !vm
-        && super::plan::final_root_bytes(vr, g.hc, g.lanes, g.lanes.min(4), ring.then_some(12), 1)
-            > most
-    {
+    // The head's PEs (no VM block): their rows at CAP 1 (serve8b_region then
+    // picks the CAP the final root holds, `plan::final_root_bytes`) and the
+    // embedding strip's; bf16, or u4g64 on a u4 plan when bf16 does not fit.
+    let head_fits = |u4: bool| {
+        super::plan::final_root_bytes(vr, g.hc, g.lanes, g.lanes.min(4), ring.then_some(12), 1, u4)
+            <= most
+            && super::plan::embed_bytes(vr, g.hc, g.lanes, u4) <= most
+    };
+    let head4 = if !check_bytes || vm || head_fits(false) {
+        false
+    } else if g.w4 && head_fits(true) {
+        true
+    } else {
         return None;
-    }
+    };
     let (g, region) = if check_bytes {
         let nb = (1..=g.blocks).rev().find(|&nb| fits(nb))?;
         (
@@ -768,6 +777,7 @@ fn place_at(
         hh,
         vr,
         vmc,
+        head4,
         cost,
     })
 }
@@ -823,15 +833,18 @@ pub(crate) fn placement_report(plan: &SpatialPlan, ring: bool) -> String {
                                 g.lanes.min(4),
                                 ring.then_some(12),
                                 1,
+                                g.w4,
                             );
+                            let eb = super::plan::embed_bytes(p.vr, p.grid.hc, g.lanes, g.w4);
                             // The units only: the head is reported, not ranked.
                             let over = [gb, rb].iter().map(|&b| b as isize - most as isize).max().unwrap_or(0);
                             if best.as_ref().is_none_or(|(o, _)| over < *o) {
                                 best = Some((
                                     over,
                                     format!(
-                                        "grid {}x{} Hc {} Ic {} {gb} B; regions {}x{} RNL {rnl} {rc}x{rr} {rb} B; NCOL {}; head Vr {} {hb} B; room {most} B (worst over {over})",
-                                        p.grid.px, p.grid.py, p.grid.hc, p.grid.ic, p.rpx, p.rpy, p.ncol, p.vr
+                                        "grid {}x{} Hc {} Ic {} {gb} B; regions {}x{} RNL {rnl} {rc}x{rr} {rb} B; NCOL {}; head Vr {} {hb} B, strip {eb} B{}; room {most} B (worst over {over})",
+                                        p.grid.px, p.grid.py, p.grid.hc, p.grid.ic, p.rpx, p.rpy, p.ncol, p.vr,
+                                        if g.w4 { " (u4)" } else { "" }
                                     ),
                                 ));
                             }
@@ -918,6 +931,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         hh,
         vr,
         vmc,
+        head4,
         ..
     } = pl;
     let rgy = RGY;
@@ -968,7 +982,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         let mmax = pipe.map(|(m, _)| m);
         let most = super::plan::WaferDims::CS3.pe_bytes - STACK_MARGIN;
         let fits = |c: usize| {
-            super::plan::final_root_bytes(vr, g.hc, g.lanes, hlb, mmax, c) <= most
+            super::plan::final_root_bytes(vr, g.hc, g.lanes, hlb, mmax, c, head4) <= most
         };
         let mut c = cap;
         while c > 1 && !fits(c) {
@@ -1150,6 +1164,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     ]);
     if g.w4 {
         st.push(Knob("W4", 1));
+    }
+    if head4 {
+        st.push(Knob("W4H", 1));
     }
     Ok(Draft { spec, stated: st })
 }

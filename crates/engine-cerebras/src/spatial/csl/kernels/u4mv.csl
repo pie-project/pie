@@ -38,6 +38,7 @@ const W4F: bool = B == 1;
 const W4Rv = [6]u16 { Hc, Hc, Hc, Qh * Dc, Hc, Ic };
 const W4Nv = [6]u16 { if (W4F) 2 * (Qh + 1) * W4DH + Dc else (Qh + 1) * W4DH, (Qh + 1) * W4DH, Dc, Hc, 2 * Ic, Hc };
 const W4Gv = [6]u16 { W4GH, W4GH, W4GH, W4GO, W4GH, W4GD };
+//@@ tables
 fn w4p(m: u16) u16 { return (W4Rv[m] + 3) / 4; }
 // The decode buffer's budget (u16 words; spatial::u4::BUF_WORDS).
 const W4BUFW: u16 = 1024;
@@ -101,6 +102,7 @@ fn w4_rebase() void {
   w4pl_h = @set_dsd_base_addr(w4pl_h, @ptrcast([*]@fp16(), &w4pl[1]));
   w4sf_f = @set_dsd_base_addr(w4sf_f, @ptrcast([*]f32, &w4sf));
 }
+//@@ unitfn
 fn w4blob(m: u16) [*]u16 {
   if (m == 0) { return @ptrcast([*]u16, &wqa[1]); }
   if (m == 1) { return @ptrcast([*]u16, &wqv[1]); }
@@ -109,6 +111,7 @@ fn w4blob(m: u16) [*]u16 {
   if (m == 4) { return @ptrcast([*]u16, &wgu[1]); }
   return @ptrcast([*]u16, &wd[1]);
 }
+//@@ core
 // The tile's header, copied by a DSD op before each matvec: only the host
 // writes the weight symbols, so scalar reads of them straight from the code
 // could fold to their zero initial values (seen on the simulator: a
