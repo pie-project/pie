@@ -398,6 +398,7 @@ impl Spatial {
             pages: lane.pages.clone(),
             visible: None,
             forced: lane.tokens.clone(),
+            state: lane.state,
         };
         // Every head lane of the launch: the VM sets' are the first `n`;
         // any rest (a set this path does not drive) repeat a live lane,

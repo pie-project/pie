@@ -112,11 +112,6 @@ pub(crate) fn mxfp4_mma_worth(
         && x.width.is_multiple_of(32)
 }
 
-/// The most routes an expert averages that the register-held mxfp4
-/// select takes; past it, the shared-memory-staged one.
-#[cfg(feature = "cuda")]
-pub(super) const STAGED_FROM: u32 = 16;
-
 /// The fewest routes an expert averages that Hopper's staged wgmma select
 /// takes from the register-held one (DeepSeek-V4-Flash's miniature at 24 a
 /// 64-row decode: 11% less time a fire).
@@ -189,29 +184,38 @@ pub(super) fn select_mxfp4_mma(
     // An expert's slice is 8, 16 or 32 routes: as few 8-route blocks as the
     // average expert fills.
     let per = fan.route_count.div_ceil(experts);
-    // Past `STAGED_FROM` routes an expert, its activations staged in shared
+    // Past `kernel.moe.mxfp4_staged_from` routes an expert, its activations staged in shared
     // memory a CTA of 64 routes (`moe_select_mxfp4_mma_staged`), so a wide
     // fire streams each expert's codes once a 64.
     // Hopper's wgmma slice from `WGMMA_FROM`: the register-held kernel's
     // 32-route block is ALU-bound past 16 routes.
-    let staged = !cvt
-        && (per > STAGED_FROM
-            || (hopper_wgmma() && per >= WGMMA_FROM && x.width.is_multiple_of(64)));
-    // An Ada's experts of 16 routes or fewer on average:
-    // `moe_select_mxfp4_mma_run`, its lanes reading 512-code runs of a row
-    // (gpt-oss-120b's miniature at c128 on an L40S: 2490 to 2645 tok/s).
-    let run = !cvt
-        && !staged
+    // An Ada's experts of `kernel.moe.mxfp4_run_until` routes or fewer on
+    // average: `moe_select_mxfp4_mma_run`, its lanes reading 512-code runs
+    // of a row (gpt-oss-120b's miniature at c128 on an L40S: 2490 to 2645 tok/s).
+    let ada_run = !cvt
         && tensor_scales.is_none()
         && crate::jit::cache::arch() == Some("sm_89")
         && x.width.is_multiple_of(64);
+    let staged_from = if ada_run {
+        ctx.tuning().mxfp4_run_until
+    } else {
+        ctx.tuning().mxfp4_staged_from
+    };
+    let staged = !cvt
+        && (per > staged_from
+            || (hopper_wgmma() && per >= WGMMA_FROM && x.width.is_multiple_of(64)));
+    let run = ada_run && !staged;
+    let nvfp4_wide_from = ctx.tuning().nvfp4_wide_from;
     let wide = staged
         && hopper_wgmma()
-        && tensor_scales.is_none()
         && x.width.is_multiple_of(64)
-        && per >= WGMMA_WIDE_FROM;
+        && match tensor_scales {
+            None => per >= WGMMA_WIDE_FROM,
+            Some(_) => nvfp4_wide_from > 0 && per >= nvfp4_wide_from,
+        };
     let nb: u32 = match per {
         _ if wide => 16,
+        _ if staged && per <= ctx.tuning().mxfp4_staged_narrow_until => 4,
         _ if staged => 8,
         _ if run => 4,
         0..=4 => 1,

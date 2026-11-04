@@ -425,6 +425,8 @@ pub(crate) fn place_head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -
     }
     let norm = ckpt.get("final_norm")?;
     norm.expect_shape("final_norm", &[hid])?;
+    // serve_q35's norm scales by 1 + w.
+    let one = if lay.hybrid().is_some() { 1.0 } else { 0.0 };
     for qs in &segments {
         let gam: Vec<f32> = qs
             .clone()
@@ -432,7 +434,10 @@ pub(crate) fn place_head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -
                 let c = chunk(q);
                 (0..hc).map(move |h| c.map(|c| c * hc + h))
             })
-            .map(|dim| dim.and_then(|d| norm.data.get(d).copied()).unwrap_or(0.0))
+            .map(|dim| {
+                dim.and_then(|d| norm.data.get(d).copied())
+                    .map_or(0.0, |w| w + one)
+            })
             .collect();
         dev.put("gam", rect(hx + qs.start, f, qs.len(), 1), hc, &words(&gam))?;
     }
@@ -553,6 +558,19 @@ pub struct BatchLane {
     pub pages: Vec<u32>,
     pub visible: Option<Vec<u32>>,
     pub forced: Vec<u32>,
+    /// On a build with recurrent layers (serve_q35), whose state the lane
+    /// runs on (`None`: a scratch launch, the state after it nobody's).
+    pub state: Option<StateSeat>,
+}
+
+/// A lane's recurrent state on a serve_q35 build: the runtime's state row
+/// (`key`), and whether the lane starts it afresh. The wafer holds one
+/// lane slot's state; a lane on another key is brought to its own first
+/// (its tokens so far replayed from a fresh state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateSeat {
+    pub key: u32,
+    pub fresh: bool,
 }
 
 /// One launch of `steps` passes over `lanes` (at most

@@ -200,9 +200,11 @@ pub fn select_bf16_held(
     let glu = glu.filter(|_| !relu2);
     let (code, limit, alpha) = glu_code(op, glu)?;
     let code = if relu2 { 6 } else { code };
+    // On Hopper only the warp-specialized GEMM below lands relu^2 in its epilogue.
     if relu2
         && (crate::linear::gemm_sm100::supported()
-            || hopper_wgmma()
+            || (hopper_wgmma()
+                && fan.route_count.div_ceil(experts.clamp(1, EXPERT_CAP)) < BF16_WSGEMM_FROM)
             || fan.route_count < BF16_GEMM_FROM
             || !x.width.is_multiple_of(64))
     {
@@ -221,7 +223,7 @@ pub fn select_bf16_held(
         && fan.route_count >= BF16_GEMM_FROM
         && fan.route_count.div_ceil(experts) >= BF16_WSGEMM_FROM
         && x.width.is_multiple_of(64)
-        && (0..=5).contains(&code)
+        && (0..=6).contains(&code)
     {
         const STAGES: u32 = 4;
         let order = route_order_sliced(
@@ -268,12 +270,15 @@ pub fn select_bf16_held(
         )?;
         return Ok(true);
     }
+    // A prefill's experts averaging the wide tile's routes lay their order in
+    // its 128-route slices once, kept for the down select.
+    let wide = fan.route_count.div_ceil(experts) >= ctx.tuning().bf16_wide_from.max(128);
     let SelectPlan {
         nb,
         tiled,
         tiles,
         ksplit,
-        mut order,
+        order,
     } = select_plan(
         ctx,
         op,
@@ -286,6 +291,7 @@ pub fn select_bf16_held(
         // bf16 codes stream twice an fp8 bank's bytes: deeper K splits keep
         // more of them in flight (Hy4's decode +2%).
         8,
+        wide.then_some(128),
     )?;
     if relu2 && !tiled {
         return Ok(false);
@@ -293,17 +299,10 @@ pub fn select_bf16_held(
     let fire = if tiled {
         // Three stages of 64 routes' and 128 rows' 64 of K, four warps a
         // CTA each 32 routes by 64 rows: two CTAs an SM.
-        const STAGES: u32 = 3;
+        let stages = ctx.tuning().bf16_gemm_stages.clamp(2, 4);
         const WN: u32 = 2;
         let cols = if glu.is_some() { 64 } else { 128 };
-        let bm: u32 = if fan.route_count.div_ceil(experts) >= 128 {
-            128
-        } else {
-            64
-        };
-        if bm != 64 {
-            order = route_order_sliced(ctx, op, routes, &fan, experts, bm, true, Share::No)?;
-        }
+        let bm: u32 = if wide { 128 } else { 64 };
         if bm == 128 {
             let cols = if glu.is_some() { 128 } else { 256 };
             Fire::at(kernel(
@@ -317,11 +316,11 @@ pub fn select_bf16_held(
         } else {
             Fire::at(kernel(
                 SELECT_SM80,
-                &format!("::pie::linear::moe_select_bf16_gemm<{STAGES}, {code}, {WN}, {bm}>"),
+                &format!("::pie::linear::moe_select_bf16_gemm<{stages}, {code}, {WN}, {bm}>"),
             ))
             .apply(
                 Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [bm * WN, 1, 1])
-                    .smem(STAGES * (bm + 128) * 128),
+                    .smem(stages * (bm + 128) * 128),
             )
         }
     } else {

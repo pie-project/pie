@@ -150,15 +150,31 @@ def fetch_bytes(repo: str, revision: str, name: str,
 
 def fetch_to_file(repo: str, revision: str, name: str, dest: Path,
                   start: int, end: int) -> None:
-    headers = {"Range": f"bytes={start}-{end - 1}"}
+    # A span in 64 MiB pieces on eight connections: one connection to the
+    # hub carries ~4 MB/s from some hosts, eight carry eight times that.
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with _urlopen(file_url(repo, revision, name), headers) as resp, tmp.open("wb") as out:
-        while True:
-            buf = resp.read(CHUNK)
-            if not buf:
-                break
-            out.write(buf)
-    got, want = tmp.stat().st_size, end - start
+    piece = 64 << 20
+    with tmp.open("wb") as out:
+        out.truncate(end - start)
+
+    def part(lo: int) -> int:
+        hi = min(lo + piece, end)
+        headers = {"Range": f"bytes={lo}-{hi - 1}"}
+        n = 0
+        with _urlopen(file_url(repo, revision, name), headers) as resp, tmp.open("r+b") as out:
+            out.seek(lo - start)
+            while True:
+                buf = resp.read(CHUNK)
+                if not buf:
+                    break
+                out.write(buf)
+                n += len(buf)
+        return n
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(8) as pool:
+        got = sum(pool.map(part, range(start, end, piece)))
+    want = end - start
     if got != want:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(f"{name}[{start}:{end}] short read: {got} != {want}")
@@ -1738,6 +1754,58 @@ FAMILIES: dict[str, dict[str, Any]] = {
         config_rewrite=_rewrite_glm5_next,
         text_cfg_key="text_config",
         keep_res=(re.compile(r"^model\.visual\."),),
+    ),
+    # The Macs' 4-bit MLX checkpoints (`mlx_lm.convert` layout: the text tower
+    # under `language_model.`, each projection's `.scales`/`.biases` beside its
+    # codes, routed banks stacked on dim 0), cut to fit a smaller Mac.
+    "qwen3_5_mlx": dict(
+        model_type="qwen3_5",
+        layer_prefix="language_model.model.layers.",
+        expert_re=None,
+        router_suffixes=(),
+        globals_keep=tuple(f"language_model.{m}.{p}" for m in ("model.embed_tokens", "lm_head")
+                           for p in ("weight", "scales", "biases")) + ("language_model.model.norm.weight",),
+        default_layers="0-7",
+        config_rewrite=_rewrite_qwen3_5_moe,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^vision_tower\."),),
+    ),
+    "gemma4_mlx": dict(
+        model_type="gemma4",
+        layer_prefix="language_model.model.layers.",
+        expert_re=None,
+        router_suffixes=tuple(f"{m}.{p}" for m in ("router.proj", "experts.switch_glu.gate_proj",
+                                                    "experts.switch_glu.up_proj", "experts.switch_glu.down_proj")
+                              for p in ("weight", "scales", "biases")) + ("router.per_expert_scale",),
+        globals_keep=tuple(f"language_model.model.embed_tokens.{p}" for p in ("weight", "scales", "biases"))
+        + ("language_model.model.norm.weight",),
+        default_layers="0-5",
+        config_rewrite=_rewrite_gemma4,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^(vision_tower|embed_vision)\."),),
+    ),
+    "muse_glimmer_mlx": dict(
+        model_type="muse_glimmer",
+        layer_prefix="language_model.model.layers.",
+        expert_re=None,
+        router_suffixes=(),
+        globals_keep=tuple(f"language_model.{m}.{p}" for m in ("model.embed_tokens", "lm_head")
+                           for p in ("weight", "scales", "biases")) + ("language_model.model.norm.weight",),
+        default_layers="0-7",
+        config_rewrite=_rewrite_muse_glimmer,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^vision_"),),
+    ),
+    "gpt_oss_mlx": dict(
+        model_type="gpt_oss",
+        layer_prefix="model.layers.",
+        expert_re=None,
+        router_suffixes=tuple(f"mlp.{m}.{p}" for m in ("router", "experts.gate_proj", "experts.up_proj", "experts.down_proj")
+                              for p in ("weight", "scales", "biases", "bias")),
+        globals_keep=tuple(f"{m}.{p}" for m in ("model.embed_tokens", "lm_head")
+                           for p in ("weight", "scales", "biases")) + ("model.norm.weight",),
+        default_layers="0-3",
+        config_rewrite=_rewrite_gpt_oss,
     ),
 }
 

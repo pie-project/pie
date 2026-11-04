@@ -317,6 +317,30 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 seats
             }
             _ => cap,
+        })
+        .map(|cap| {
+            // A seated-first pool of kv pages alone seats no more than five
+            // sequences a sequence at the declared context holds: past that,
+            // admitted prompts seat lanes the pool then suspends for each
+            // other's growth (Gemma-4-26B on an A100, c512: 2.9k tok/s
+            // admitting all 512, 4.7k at 224; its 5791 pages seat 45 at 2048).
+            let seats = engine_configs
+                .iter()
+                .filter(|d| d.seated_first && d.limits.max_context > 0)
+                .map(|d| 5 * d.total_pages * kv_page_size / d.limits.max_context)
+                .min();
+            match seats {
+                Some(seats) if rs_seat_cap.is_none() && cap > seats.max(1) => {
+                    tracing::info!(
+                        requested = cap,
+                        seated = seats,
+                        "admission: capped at five sequences a sequence at the declared context \
+                         holds in the kv pool"
+                    );
+                    seats.max(1)
+                }
+                _ => cap,
+            }
         });
     process::init_admission(admission_cap);
 

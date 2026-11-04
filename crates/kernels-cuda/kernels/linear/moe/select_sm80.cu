@@ -1337,7 +1337,7 @@ __global__ void __launch_bounds__(128 * kWN) moe_select_fp8a8_mma(
 /// sums leave through the stages, a route's 256 rows a run. `kGlu`: the
 /// gate-up bank's 128 gate rows and their 128 up rows a CTA (`n` both
 /// halves), each route's 128 GLU values out in `n / 2` columns.
-template <int kGlu>
+template <int kGlu, bool kDense = false>
 __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
     const u8* __restrict__ xq,
     const u8* __restrict__ xe,
@@ -1356,12 +1356,14 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
     constexpr int kStage = (kRowsCta + kSlice) * kBK;
     constexpr int kNbW = 8;  // 8-route blocks a warp
 
-    if (static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
-    const int item = work[blockIdx.x];
-    const int expert = item >> 16;
-    const int begin = offsets[expert] + (item & 0xFFFF) * kSlice;
-    const int count = min(offsets[expert + 1] - begin, kSlice);
+    // `kDense`: one plane's rows in order, `num_experts` their count.
+    if (!kDense && static_cast<int>(blockIdx.x) >= offsets[num_experts + 1]) return;
+    const int item = kDense ? static_cast<int>(blockIdx.x) : work[blockIdx.x];
+    const int expert = kDense ? 0 : item >> 16;
+    const int begin = kDense ? item * kSlice : offsets[expert] + (item & 0xFFFF) * kSlice;
+    const int count = min((kDense ? num_experts : offsets[expert + 1]) - begin, kSlice);
     if (count <= 0) return;
+    auto ord = [&](int at) { return kDense ? at : order[at]; };
 
     const int tid = static_cast<int>(threadIdx.x);
     const int lane = tid & 31;
@@ -1410,7 +1412,7 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
             u8* dst = sX + off(tok, ch);
             if (tok < count) {
                 __pipeline_memcpy_async(
-                    dst, xq + static_cast<long long>(order[begin + tok] / act_div) * k + k0 + ch * 16, 16);
+                    dst, xq + static_cast<long long>(ord(begin + tok) / act_div) * k + k0 + ch * 16, 16);
             } else {
                 *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
             }
@@ -1424,7 +1426,7 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int tok = 64 * wn + 8 * b + 2 * c + h;
-            xrow[b][h] = tok < count ? order[begin + tok] / act_div : -1;
+            xrow[b][h] = tok < count ? ord(begin + tok) / act_div : -1;
         }
 
     float acc[4][kNbW][4];
@@ -1520,7 +1522,7 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
                 if constexpr (kGlu == 1) o8[j] = f32_to_bf16(gv / (1.f + __expf(-gv)) * uv);
                 else o8[j] = f32_to_bf16(act::glu<kGlu>(gv, uv, limit, galpha));
             }
-            *reinterpret_cast<uint4*>(out + static_cast<long long>(order[begin + tok]) * inter + c0 + 8 * ch) =
+            *reinterpret_cast<uint4*>(out + static_cast<long long>(ord(begin + tok)) * inter + c0 + 8 * ch) =
                 packed;
         }
         return;
@@ -1530,7 +1532,7 @@ __global__ void __launch_bounds__(256) moe_select_fp8a8_wide(
         const int tok = i / (kRowsCta / 8);
         const int ch = i % (kRowsCta / 8);
         if (tok < count)
-            *reinterpret_cast<uint4*>(out + static_cast<long long>(order[begin + tok]) * n + cta_row0 + 8 * ch) =
+            *reinterpret_cast<uint4*>(out + static_cast<long long>(ord(begin + tok)) * n + cta_row0 + 8 * ch) =
                 *reinterpret_cast<const uint4*>(sOut + tok * kOut + 8 * ch);
     }
 }

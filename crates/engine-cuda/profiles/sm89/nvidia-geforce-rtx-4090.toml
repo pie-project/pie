@@ -40,11 +40,46 @@ moe.bf16_mma_until = 65536
 moe.mxfp4_fp8_from = 256
 moe.mxfp4_mma_per_from = 4
 
+# gpt-oss-20b's c256 decode (32 routes an expert) on the run kernel's
+# 32-route slices, not the staged kernel's half-filled 64-route ones: c256
+# 5.97k to 6.56k tok/s.
+moe.mxfp4_run_until = 32
+
+# A prefill's wide bf16 products (from 1024 rows) on cuBLAS's own algorithm
+# with a split's partials summed in bf16, as torch runs them for vLLM and
+# SGLang: gemma-4-31b mini12 pf16-512 10.8k -> 11.3k, kimi-k3 mini4
+# 13.7k -> 14.2k, qwen3.8-27b mini12 pf32-512 14.3k -> 14.7k tok/s.
+gemm.bf16_split_from = 1024
+
+# A prefill's block-FP8 projections W8A8 on the wide fp8 tiles, as the
+# deployment quantizes them, not bf16 on the widened copy: MiMo-V2.6-Flash's
+# mini pf16-512 45.4k to 49.2k tok/s.
+gemm.fp8_wide_from = 257
+
 # A fire's working set may take 65% of the 24 GB card past the weights, not
 # half: at 50% gpt-oss-20b's 8192-token fires were served at 1024 and c256 at
 # 128 lanes; at 65% pf16-512 15.9k to 22.5k tok/s and c256 5.7k to 6.1k.
 [engine]
 working_set_percent = 65
+# A process starts only while the pools hold the started ones to the end, a
+# decoding lane's pages before a waiting prompt's, as the A40, H100, H200 and
+# RTX PRO 6000 profiles: gemma-4-31b mini12 c256 2.01k -> 2.70k,
+# gemma-4-26b-a4b mini c256 1.82k -> 2.59k tok/s. Graph bodies keep their
+# quarter: held to 512 MiB, gpt-oss-20b armed 12 of its 106 compositions,
+# and at 640-768 MiB a guest program's scratch found no room mid-run.
+seated_first = true
+seat_to_end = true
+# Eight lattice buckets a doubling past 256 rows, as the L40S: a fire of a
+# batch's prompts pads less (gemma-4-E4B pf16-512 at 4480-row fires 16.6k ->
+# 17.1k tok/s).
+prefill_lattice_steps = 8
+
+# Independent chains on side streams, as the H100, sm100 and the RTX PRO 6000
+# run them: single-request decode Qwen3.5-0.8B 456 -> 464, Qwen3-0.6B 513 ->
+# 523, gpt-oss-20b 201.3 -> 203.3 tok/s; greedy tokens unchanged.
+[compiler]
+dag_streams = true
+dag_streams_until = 256
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 35.9 -> 35.2 ms, 1-lane step 3.55 -> 3.48 ms, 4-lane step 5.23 -> 5.17 ms, 8-lane step 7.52 -> 7.47 ms, readout cosine 1.0000"

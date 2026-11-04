@@ -343,11 +343,23 @@ pub fn experts(
             live_rows: layout.live_rows(),
             ..gemm_sm100::Epilogue::STORE
         };
+        // MXFP4 banks multiply in fp16 where the profile says
+        // (`kernel.moe.mxfp4_f16`): the rows land fp16, and the GLU lands the
+        // hidden fp16 (rounded through bf16, as apart).
+        let mxfp4 = |o: gemm_sm100::Operand| {
+            o.elem == gemm_sm100::Elem::E2m1 && o.scales.is_some_and(|s| s.gran == 32)
+        };
+        let f16 = ctx.tuning().moe_mxfp4_f16 && mxfp4(u.0) && mxfp4(d.0);
+        let act = if f16 {
+            gemm_sm100::Elem::F16
+        } else {
+            gemm_sm100::Elem::Bf16
+        };
         let xs = ctx.scratch_stream(OP, GROUPED_X, rows * k as usize * 2)? as u64;
-        act_quant::scatter_rows(ctx, OP, x, routes.width, layout.pos, count, xs)?;
+        act_quant::scatter_rows_as(ctx, OP, x, routes.width, layout.pos, count, xs, f16)?;
         gemm_sm100::grouped_gemm_epi(
             ctx,
-            gemm_sm100::Operand::plain(xs, gemm_sm100::Elem::Bf16),
+            gemm_sm100::Operand::plain(xs, act),
             u.0,
             hs,
             grouped,
@@ -359,7 +371,7 @@ pub fn experts(
         let ys = ctx.scratch_stream(OP, GROUPED_Y, rows * y.width as usize * 2)? as u64;
         gemm_sm100::grouped_gemm_epi(
             ctx,
-            gemm_sm100::Operand::plain(hs, gemm_sm100::Elem::Bf16),
+            gemm_sm100::Operand::plain(hs, act),
             d.0,
             ys,
             grouped,
@@ -440,11 +452,17 @@ pub(super) fn experts_w4a4(
     let count = tokens * routes.width;
     let experts = up_codes.rows;
     let (k, n) = (x.width, y.width);
-    // Only SwiGLU's and relu2's epilogues land what the four apart would.
+    // Only SwiGLU's (clamped with alpha too) and relu2's epilogues land what
+    // the four apart would.
     if count == 0
         || norm.is_some_and(|(s, _)| s.dtype != Dtype::Bf16 || s.rows * s.width != y.width)
         || tokens < ctx.tuning().moe_w4a4_fused_from
-        || !matches!(glu, gemm_sm100::Glu::Swiglu | gemm_sm100::Glu::Relu2)
+        || !matches!(
+            glu,
+            gemm_sm100::Glu::Swiglu
+                | gemm_sm100::Glu::Relu2
+                | gemm_sm100::Glu::SwigluClampAlpha { .. }
+        )
         || !ctx.tuning().moe_tc5
         || !gemm_sm100::supported()
         || x.dtype != Dtype::Bf16

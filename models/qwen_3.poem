@@ -53,6 +53,8 @@ MODELS = [
     qwen("qwen35-tiny", mini = True, layers = 4),
     qwen("qwen36-35b-a3b-mini", mini = True, layers = 5),
     qwen("qwen36-35b-a3b-mini64", mini = True, layers = 5),
+    qwen("qwen36-27b-mini", mini = True, layers = 8),
+    qwen("qwen38-27b-mini", mini = True, template = CHATML_QWEN38, tokenizer = TOKENIZER_38, layers = 8),
     fixture("qwen36-27b-bonsai"),
     # Served end to end (`scripts/tiny_qwen3_moe.py`): an inferlet reads its depth and vocabulary.
     fixture("qwen3-a3b-micro", layers = 4, vocab = 2048),
@@ -108,6 +110,8 @@ DEPLOYMENTS = [
     deployment("qwen36-35b-a3b", weights = U4, kv = BF),
     deployment("qwen36-35b-a3b-mini", weights = U4, kv = BF),
     deployment("qwen36-35b-a3b-mini64", weights = U4, kv = BF),
+    deployment("qwen36-27b-mini", weights = U4, kv = BF),
+    deployment("qwen38-27b-mini", weights = U4, kv = BF),
     deployment("ornith15-397b", weights = U4, kv = BF),
     deployment("ornith15-397b", weights = U4, kv = BF, parts = ["vision"]),
     deployment("ornith15-397b", weights = BF, kv = BF),
@@ -407,6 +411,8 @@ FIXED = {
     "qwen3-micro-text-hd256": micro_text(256, False),
     "qwen3-micro-text-hd256-rotated": micro_text(256, True),
     "qwen36-27b-bonsai": d27b(),
+    "qwen36-27b-mini": d27b(layers = 8),
+    "qwen38-27b-mini": d27b(layers = 8),
 }
 
 def d4b(**over):

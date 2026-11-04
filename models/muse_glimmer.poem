@@ -18,6 +18,7 @@ DEPLOYMENTS = [
     deployment("muse-glimmer-30b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("muse-glimmer-30b", weights = dtype.u4g64, kv = dtype.bf16),
     deployment("muse-glimmer-30b-mini-l24", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("muse-glimmer-30b-mini-l24", weights = dtype.u4g64, kv = dtype.bf16),
     deployment("muse-glimmer-30b-mini-l8", weights = dtype.bf16, kv = dtype.bf16),
 ]
 

@@ -220,6 +220,9 @@ pub struct RsStore {
     seq: u64,
     /// Unsettled fires by seq, with the slots each writes and reads.
     inflight: BTreeMap<u64, Touch>,
+    /// The same, by slot: the seqs of the unsettled fires that touch it, each
+    /// with how many times its touch names the slot.
+    touched: HashMap<RsSlotId, BTreeMap<u64, u32>>,
     /// Checkpoints: hidden forks no process holds.
     checkpoints: HashMap<Hash256, RsCheckpoint>,
 }
@@ -278,6 +281,7 @@ impl RsStore {
             working_sets: GenMap::new(),
             seq: 0,
             inflight: BTreeMap::new(),
+            touched: HashMap::new(),
             checkpoints: HashMap::new(),
         }
     }
@@ -368,7 +372,9 @@ impl RsStore {
     /// writes or copies, so none is recycled while it still reads them.
     pub fn note_reads(&mut self, seq: u64, ids: impl IntoIterator<Item = RsSlotId>) {
         if let Some(touch) = self.inflight.get_mut(&seq) {
-            touch.reads.extend(ids);
+            let ids: Vec<RsSlotId> = ids.into_iter().collect();
+            touch.reads.extend(&ids);
+            self.touch_ids(seq, ids);
         }
     }
 
@@ -407,7 +413,8 @@ impl RsStore {
         let Some(entry) = self.working_sets.remove(ws) else {
             return 0;
         };
-        Self::slots(&entry).filter(|&id| self.decref(id)).count()
+        let ids: Vec<RsSlotId> = Self::slots(&entry).collect();
+        self.decref_all(&ids)
     }
 
     fn slots(entry: &RsEntry) -> impl Iterator<Item = RsSlotId> + '_ {
@@ -886,6 +893,7 @@ impl RsStore {
                 .chain(buffers.iter().filter_map(RsBufferTarget::src))
                 .collect(),
         };
+        self.touch_ids(self.seq, touch.writes.iter().chain(&touch.reads).copied());
         self.inflight.insert(self.seq, touch);
         Ok(RsPreparedWrite {
             ws,
@@ -934,6 +942,7 @@ impl RsStore {
         };
         if let Some(touch) = self.inflight.get_mut(&prepared.seq) {
             touch.writes.extend(&slots);
+            self.touch_ids(prepared.seq, slots.iter().copied());
         }
         prepared.allocated.extend(&slots);
         prepared.snapshots = rows.iter().copied().zip(slots).collect();
@@ -1055,14 +1064,14 @@ impl RsStore {
 
     pub fn settle(&mut self, published: RsPublished) {
         for seq in published.seqs() {
-            self.inflight.remove(seq);
+            self.settle_seq(*seq);
         }
         self.retire_idle();
     }
 
     pub fn cancel_prepared(&mut self, prepared: RsPreparedWrite) {
         self.recycle(prepared.allocated, prepared.seq);
-        self.inflight.remove(&prepared.seq);
+        self.settle_seq(prepared.seq);
         self.retire_idle();
     }
 
@@ -1425,6 +1434,77 @@ impl RsStore {
         self.refs.get(&id).copied().unwrap_or(1)
     }
 
+    /// [`Self::decref`] of each of `ids`, the newest unsettled fire touching
+    /// each found in one walk over the fires in flight rather than one walk
+    /// a slot (a full card's lanes ending together, a windowed ring's dozens
+    /// of pages each, held the store's lock for seconds). Returns how many
+    /// it was the last holder of.
+    fn decref_all(&mut self, ids: &[RsSlotId]) -> usize {
+        let mut freed = 0;
+        let mut last: Vec<RsSlotId> = Vec::new();
+        for &id in ids {
+            let count = self.refs.entry(id).or_insert(1);
+            *count -= 1;
+            if *count != 0 {
+                continue;
+            }
+            self.refs.remove(&id);
+            freed += 1;
+            if self.is_host(id) {
+                self.release_host([id]);
+            } else {
+                last.push(id);
+            }
+        }
+        if last.is_empty() {
+            return freed;
+        }
+        let settled = self
+            .inflight
+            .keys()
+            .next()
+            .map_or(self.seq, |&oldest| oldest - 1);
+        for id in last {
+            let epoch = self.newest_touch(id).unwrap_or(settled);
+            self.recycle(vec![id], epoch);
+        }
+        freed
+    }
+
+    fn touch_ids(&mut self, seq: u64, ids: impl IntoIterator<Item = RsSlotId>) {
+        for id in ids {
+            *self.touched.entry(id).or_default().entry(seq).or_insert(0) += 1;
+        }
+    }
+
+    /// The fire under `seq` settled: it no longer touches its slots.
+    fn settle_seq(&mut self, seq: u64) {
+        let Some(touch) = self.inflight.remove(&seq) else {
+            return;
+        };
+        for id in touch.writes.iter().chain(&touch.reads) {
+            let Some(seqs) = self.touched.get_mut(id) else {
+                continue;
+            };
+            if let Some(count) = seqs.get_mut(&seq) {
+                *count -= 1;
+                if *count == 0 {
+                    seqs.remove(&seq);
+                }
+            }
+            if seqs.is_empty() {
+                self.touched.remove(id);
+            }
+        }
+    }
+
+    /// The newest unsettled fire that writes or reads `id`.
+    fn newest_touch(&self, id: RsSlotId) -> Option<u64> {
+        self.touched
+            .get(&id)
+            .and_then(|seqs| seqs.keys().next_back().copied())
+    }
+
     /// Drops a reference to `id`, recycling it once none remains, behind
     /// the newest unsettled fire that writes or reads it: no fire still
     /// reading a slot sees it reused, and none that never did holds it.
@@ -1439,20 +1519,12 @@ impl RsStore {
             self.release_host([id]);
             return true;
         }
-        let epoch = self
-            .inflight
-            .iter()
-            .rev()
-            .find(|(_, touch)| touch.writes.contains(&id) || touch.reads.contains(&id))
-            .map_or_else(
-                || {
-                    self.inflight
-                        .keys()
-                        .next()
-                        .map_or(self.seq, |&oldest| oldest - 1)
-                },
-                |(&seq, _)| seq,
-            );
+        let epoch = self.newest_touch(id).unwrap_or_else(|| {
+            self.inflight
+                .keys()
+                .next()
+                .map_or(self.seq, |&oldest| oldest - 1)
+        });
         self.recycle(vec![id], epoch);
         true
     }

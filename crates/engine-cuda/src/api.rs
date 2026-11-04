@@ -1187,8 +1187,11 @@ impl Cuda {
                 let Some(bound) = self.adapters.get(&attachment.instance) else {
                     continue;
                 };
-                if let Some(slot) = lane_adapters.get_mut(attachment.lane as usize) {
-                    *slot = Some(bound.slot);
+                // The attachment is its pass's lanes, `lanes` of them from `lane`.
+                for at in attachment.lane..attachment.lane + attachment.lanes.max(1) {
+                    if let Some(slot) = lane_adapters.get_mut(at as usize) {
+                        *slot = Some(bound.slot);
+                    }
                 }
             }
         }

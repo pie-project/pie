@@ -611,6 +611,8 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
     const i32* __restrict__ work, const bf16* __restrict__ weight, const bf16* __restrict__ bias,
     bf16* __restrict__ out, int act_div, int n, int k, int num_experts, int inter, float limit,
     float galpha) {
+    // A GLU's gate and up rows side by side; relu^2 (6) is no GLU, its rows as they are.
+    constexpr bool kGated = kGlu != 0 && kGlu != 6;
     constexpr int kSlice = 128;
     constexpr int kA = kSlice * 128;   // 128 routes x 64 bf16
     constexpr int kB = 256 * 128;      // 256 weight rows x 64 bf16
@@ -633,7 +635,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
     const int wg = tid >> 7;
     const int steps = k >> 6;
     // The CTA's first output column: 128 GLU columns, or 256 rows.
-    const int col0 = static_cast<int>(blockIdx.y) * (kGlu != 0 ? 128 : 256);
+    const int col0 = static_cast<int>(blockIdx.y) * (kGated ? 128 : 256);
     if (tid == 0) {
         for (int s = 0; s < kStages; ++s) {
             wgbf16gemm::bar_init(full + s, 128);
@@ -659,8 +661,8 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
             const int r = (tid + 128 * j) >> 3;
-            const int row = kGlu != 0 ? (r < 128 ? col0 + r : inter + col0 + (r - 128)) : col0 + r;
-            const int clamp = kGlu != 0 ? (r < 128 ? min(row, inter - 1) : min(row, 2 * inter - 1)) : min(row, n - 1);
+            const int row = kGated ? (r < 128 ? col0 + r : inter + col0 + (r - 128)) : col0 + r;
+            const int clamp = kGated ? (r < 128 ? min(row, inter - 1) : min(row, 2 * inter - 1)) : min(row, n - 1);
             bsrc[j] = w_e + static_cast<long long>(clamp) * k;
         }
         auto cp = [](void* dst, const void* from, int live) {
@@ -728,7 +730,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
         const int r = c_wg * 64 + 16 * warp + g + 8 * h;
         if (r >= count) continue;
         const long long route = order[begin + r];
-        if constexpr (kGlu != 0) {
+        if constexpr (kGated) {
 #pragma unroll
             for (int j = 0; j < 16; ++j) {
                 const int col = col0 + 8 * j + 2 * c;
@@ -759,10 +761,15 @@ __global__ void __launch_bounds__(384, 1) moe_select_bf16_wsgemm(
                 const float b0 = b_e != nullptr ? bf16_to_f32(b_e[col]) : 0.f;
                 const float b1 = b_e != nullptr && col + 1 < n ? bf16_to_f32(b_e[col + 1]) : 0.f;
                 bf16* o = out + route * n + col;
+                float v0 = acc[4 * j + 2 * h] + b0, v1 = acc[4 * j + 2 * h + 1] + b1;
+                if constexpr (kGlu == 6) {
+                    v0 = fmaxf(v0, 0.f) * fmaxf(v0, 0.f);
+                    v1 = fmaxf(v1, 0.f) * fmaxf(v1, 0.f);
+                }
                 if (col + 1 < n) {
-                    *reinterpret_cast<unsigned*>(o) = pack_bf16x2(acc[4 * j + 2 * h] + b0, acc[4 * j + 2 * h + 1] + b1);
+                    *reinterpret_cast<unsigned*>(o) = pack_bf16x2(v0, v1);
                 } else {
-                    o[0] = f32_to_bf16(acc[4 * j + 2 * h] + b0);
+                    o[0] = f32_to_bf16(v0);
                 }
             }
         }

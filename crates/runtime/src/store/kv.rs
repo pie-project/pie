@@ -376,6 +376,15 @@ impl KvStore {
         Ok(sealed)
     }
 
+    /// [`Self::page_keys`] from row 0, which reads nothing of the store: a
+    /// caller hashes them before it takes the store's lock.
+    pub fn fresh_page_keys(slots: &[Hash256], page_size: u32) -> Vec<Hash256> {
+        slots
+            .chunks_exact(page_size.max(1) as usize)
+            .map(|page| hash::page_hash(&page.iter().copied().map(Some).collect::<Vec<_>>()))
+            .collect()
+    }
+
     /// `None` when an earlier page is not sealed: no key names what follows.
     pub fn page_keys(
         &self,
@@ -865,8 +874,8 @@ impl KvStore {
     }
 
     /// Every sealed page's key here, on any tier.
-    pub fn sealed_keys(&self) -> std::collections::HashSet<Hash256> {
-        self.table.sealed_keys()
+    pub fn sealed_key_list(&self) -> Vec<Hash256> {
+        self.table.sealed_key_list()
     }
 
     /// Host slots to land pages in that come from another worker; given
