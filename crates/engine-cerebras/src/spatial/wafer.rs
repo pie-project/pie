@@ -1924,6 +1924,57 @@ impl Drop for Wafer {
 mod tests {
     use super::*;
 
+    /// An HV build (PS 1, NB 16, E 5 on 152 rows) paged PIE's way (16):
+    /// 152 PIE pages of 16, each 16 kernel pages in order; a 531-position
+    /// lane on PIE pages 0..34 makes a kernel table (at most 4 a row).
+    #[test]
+    fn hv_pages_as_pie_pages() {
+        let mut w = Wafer {
+            jobs: None,
+            answers: mpsc::channel().1,
+            batch_answers: mpsc::channel().1,
+            vm_answers: mpsc::channel().1,
+            paged: Some(super::super::paged::Shape {
+                lanes: 1,
+                rows: 152,
+                page_size: 1,
+                blocks: 16,
+                entries: 5,
+            }),
+            cap: 128,
+            launch_lanes: 1,
+            logit_lanes: 1,
+            positions: 760,
+            vm: None,
+            vm_b: None,
+            page_bytes: Some(100),
+            thread: None,
+            vocab: 0,
+            hidden: 0,
+            recurrent: false,
+            group: 1,
+        };
+        let kernel = w.paged.unwrap();
+        w.page_as(16);
+        let pie = w.paged.unwrap();
+        assert_eq!(
+            (w.group, pie.page_size, pie.pages(), w.page_bytes),
+            (16, 16, 152, Some(1600))
+        );
+        assert_eq!(w.kernel_pages(&[2, 0])[..3], [32, 33, 34]);
+        assert_eq!(w.kernel_pages(&[2, 0])[16..18], [0, 1]);
+        let lane = super::super::paged::Lane {
+            pos: 530,
+            slot: 530,
+            pages: w.kernel_pages(&(0..34).collect::<Vec<u32>>()),
+            visible: None,
+        };
+        assert!(super::super::paged::table(&kernel, &[lane], 1).is_ok());
+        // A second call, or a page size the kernel's do not tile, changes nothing.
+        w.page_as(16);
+        assert_eq!(w.group, 16);
+    }
+
     #[test]
     fn bf16_pages_pack_two_a_word_and_back() {
         let cells: Vec<u32> = (0..7).map(|i| 0x3f80 + i).collect();
