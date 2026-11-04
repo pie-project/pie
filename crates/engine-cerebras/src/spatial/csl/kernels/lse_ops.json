@@ -54,5 +54,17 @@
  {
   "old": "  const id = axis_id;\n  const r = id % ga();\n  const qt = id / ga();\n",
   "new": "  const id = axis_id;\n  const r = ar_r;\n  const qt = ar_qt;\n"
+ },
+ {
+  "old": "  if (px % Gs == R1) { @fmovs(fout(q_bc_out, n), buf); }\n  else { @fmovs(buf, fin(q_bc_in, n)); }\n",
+  "new": "  if (px % Gs == R1) { @fmovs(fout(q_bc_out, n), buf); oq_drain(); }\n  else { @fmovs(buf, fin(q_bc_in, n)); }\n"
+ },
+ {
+  "old": "    var i: u16 = 0;\n    while (i < NCOL) : (i += 1) { put_route(caddr[i], rcfg[(if (x) 0 else NCOL) + i]); }\n",
+  "new": "    oq_drain();\n    var i: u16 = 0;\n    while (i < NCOL) : (i += 1) { put_route(caddr[i], rcfg[(if (x) 0 else NCOL) + i]); }\n"
+ },
+ {
+  "old": "fn ilog2(comptime v: u16) u16 {\n",
+  "new": "fn oq_drain() void {\n  while ((tile_config.output_queue_status.get_raw() & 0xf800) != 0xf800) {}   // queues 3-7 empty\n}\nfn ilog2(comptime v: u16) u16 {\n"
  }
 ]

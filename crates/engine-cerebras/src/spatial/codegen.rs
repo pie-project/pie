@@ -39,6 +39,8 @@ mod src {
     /// The softmax against a carried log-sum-exp reference, no max all-reduce,
     /// and the collectives' group arithmetic by shifts (`Variant::lse`).
     pub const LSE_OPS: &str = include_str!("csl/kernels/lse_ops.json");
+    /// Under `lse`, at PS 1: scores and values vectorized over a kv head's query heads.
+    pub const HV_OPS: &str = include_str!("csl/kernels/hv_ops.json");
     pub const VM_HM: &str = include_str!("csl/vm/guest4hm_vm.csl");
     pub const VM_HZ: &str = include_str!("csl/vm/guest4hz_vm.csl");
     /// Every design's runtime route and queue-color helpers.
@@ -307,7 +309,9 @@ impl Variant {
         }
         if self.speed {
             s = apply_reps("speed_ops", src::SPEED_OPS, &s, tag)?;
-            if tag.starts_with("qwen2d_region/") {
+            // (the grids take the scores and RoPE cuts too under LSE, which frees
+            // the ~1 KB they need)
+            if tag.starts_with("qwen2d_region/") || self.lse {
                 s = apply_reps("speed_ops_region", src::SPEED_OPS_REGION, &s, tag)?;
             }
         }
@@ -320,11 +324,14 @@ impl Variant {
             // grid's only one.
             let at = "var mref = @zeros([LNL * NQB]f32);\n";
             let def = if tag.starts_with("qwen2d_region/") {
-                "const LNL: u16 = NL;\nfn lsel() u16 { return lw; }\n"
+                "const LNL: u16 = NL;\nfn lsel() u16 { return lw; }\nfn kvoff() u16 { return lw * KCN; }\n"
             } else {
-                "const LNL: u16 = 1;\nfn lsel() u16 { return 0; }\n"
+                "const LNL: u16 = 1;\nfn lsel() u16 { return 0; }\nfn kvoff() u16 { return 0; }\n"
             };
             s = patch(&s, at, &format!("{def}{at}"), &format!("{tag}'s LSE reference"))?;
+            // PS 1 pages: the attention over the kv head's query heads (dead
+            // code at other page sizes).
+            s = apply_reps("hv_ops", src::HV_OPS, &s, tag)?;
         }
         if let Some(bits) = self.eps_bits {
             let eps = f32::from_bits(bits);
