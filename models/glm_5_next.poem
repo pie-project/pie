@@ -159,6 +159,8 @@ def layout(id, deploy):
         weights, experts = deploy.weights
         draft = None
     d = DIMS[id]
+    if id != "glm53-flash" and (deploy.layers or deploy.experts):
+        d = flash(layers = deploy.layers or d.layers, experts = deploy.experts or d.moe.experts)
     dense = compute(weights)
     # The release's FP8 keeps its KDA, kv_b and indexer projections, table
     # and head bf16; mlx stores them at its own width.
