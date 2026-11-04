@@ -184,8 +184,37 @@ pub(crate) fn act_x_wt(
         k,
         anchor: None,
     };
-    let capturing = capture_status(stream);
     let tuning = ctx.tuning();
+    // A prefill's wide product on cuBLAS's own algorithm with a split's
+    // partials summed in bf16, as torch runs it by default
+    // (`kernel.gemm.bf16_split_from`); the handle is set back at once.
+    if tuning.gemm_bf16_split_from > 0
+        && m >= i32::try_from(tuning.gemm_bf16_split_from).unwrap_or(i32::MAX)
+    {
+        // SAFETY: `handle` is this context's live cuBLAS handle.
+        unsafe {
+            cudarc::cublas::sys::cublasSetMathMode(
+                handle,
+                cudarc::cublas::sys::cublasMath_t::CUBLAS_DEFAULT_MATH,
+            )
+        };
+        let status = gemm_ex(
+            handle,
+            call,
+            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        );
+        // SAFETY: as above.
+        unsafe {
+            cudarc::cublas::sys::cublasSetMathMode(
+                handle,
+                cudarc::cublas::sys::cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
+            )
+        };
+        if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Ok(());
+        }
+    }
+    let capturing = capture_status(stream);
     let (plan, tactic, lt_handle, want) = with_device(|device| {
         device.configure(
             (tuning.gemm_workspace_mb as usize) << 20,
