@@ -61,6 +61,7 @@ pub mod model_moe;
 pub mod paged;
 pub mod plan;
 pub mod plan_g4;
+pub mod plan_gptoss;
 pub mod plan_q35;
 pub mod program;
 pub mod serve2d;
