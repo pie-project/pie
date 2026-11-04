@@ -36,6 +36,8 @@ mod src {
     /// On qwen2d_region's only (the grids' images have no room): the scores
     /// without kmv's per-call conversions, RoPE over every head at once.
     pub const SPEED_OPS_REGION: &str = include_str!("csl/kernels/speed_ops_region.json");
+    /// The q_parts subset of `SPEED_OPS_REGION` (grids under `lse`).
+    pub const SPEED_OPS_QPARTS: &str = include_str!("csl/kernels/speed_ops_qparts.json");
     /// The softmax against a carried log-sum-exp reference, no max all-reduce,
     /// and the collectives' group arithmetic by shifts (`Variant::lse`).
     pub const LSE_OPS: &str = include_str!("csl/kernels/lse_ops.json");
@@ -309,10 +311,12 @@ impl Variant {
         }
         if self.speed {
             s = apply_reps("speed_ops", src::SPEED_OPS, &s, tag)?;
-            // (the grids take the scores and RoPE cuts too under LSE, which frees
-            // the ~1 KB they need)
-            if tag.starts_with("qwen2d_region/") || self.lse {
+            if tag.starts_with("qwen2d_region/") {
                 s = apply_reps("speed_ops_region", src::SPEED_OPS_REGION, &s, tag)?;
+            } else if self.lse {
+                // (the grids under LSE: q's bf16 parts only, for HV's scores; the
+                // region's scores/RoPE cuts made a grid layer slower on 0468)
+                s = apply_reps("speed_ops_qparts", src::SPEED_OPS_QPARTS, &s, tag)?;
             }
         }
         if self.lse {

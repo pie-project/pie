@@ -65,6 +65,6 @@
  },
  {
   "old": "fn ilog2(comptime v: u16) u16 {\n",
-  "new": "fn oq_drain() void {\n  while ((tile_config.output_queue_status.get_raw() & 0xf800) != 0xf800) {}   // queues 3-7 empty\n}\nfn ilog2(comptime v: u16) u16 {\n"
+  "new": "fn oq_drain() void {\n  while ((tile_config.output_queue_status.get_raw() & 0x8000) == 0) {}   // queue 7 (c_bc) empty\n}\nfn ilog2(comptime v: u16) u16 {\n"
  }
 ]

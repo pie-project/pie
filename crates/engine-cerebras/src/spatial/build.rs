@@ -2546,7 +2546,8 @@ mod llama31_8b {
                     assert!(b.contains("while (apass < 8)") && b.contains("fn gsh()"), "{n}");
                     assert!(!b.contains("  const r = axis_id % ga();\n"), "{n}");
                     assert!(b.contains("    ar_qt = axis_id >> gsh();\n"), "{n}");
-                    assert!(b.contains("fn q_parts(") && b.contains("fn rope_vec("), "{n}");
+                    assert!(b.contains("fn q_parts("), "{n}");
+                    assert_eq!(b.contains("fn rope_vec("), *n == "region_pe.csl", "{n}");
                     assert!(b.contains("const HV: bool = PS == 1;"), "{n}");
                 }
                 _ => assert_eq!(a, b, "{n}"),
