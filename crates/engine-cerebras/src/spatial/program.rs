@@ -72,6 +72,8 @@ pub struct Model {
     pub eps_bits: u32,
     /// `SPD` 1: the units carry the speed op cuts (`Variant::speed`).
     pub speed: bool,
+    /// `LSE` 1: the units' softmax against a carried reference (`Variant::lse`).
+    pub lse: bool,
 }
 
 impl Model {
@@ -86,6 +88,7 @@ impl Model {
             qk_norm: true,
             eps_bits: 0,
             speed: false,
+            lse: false,
         }
     }
 
@@ -106,6 +109,7 @@ impl Model {
             identity_qk_norm: !self.qk_norm,
             eps_bits: (self.eps_bits != 0).then_some(self.eps_bits),
             speed: self.speed,
+            lse: self.lse,
         }
     }
 }
@@ -685,6 +689,7 @@ impl ProgramSpec {
             "QKN" => Some(usize::from(m.qk_norm)),
             "EPS" => Some(m.eps_bits as usize),
             "SPD" => Some(usize::from(m.speed)),
+            "LSE" => Some(usize::from(m.lse)),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1304,6 +1309,7 @@ fn model(get: &Get) -> R<Model> {
         qk_norm: get.opt("QKN").unwrap_or(1) != 0,
         eps_bits: u32::try_from(get.opt("EPS").unwrap_or(0)).map_err(|e| format!("EPS: {e}"))?,
         speed: get.opt("SPD").unwrap_or(0) != 0,
+        lse: get.opt("LSE").unwrap_or(0) != 0,
     })
 }
 

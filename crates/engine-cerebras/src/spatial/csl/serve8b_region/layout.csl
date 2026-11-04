@@ -56,6 +56,9 @@ param EPS: u32 = 0;
 // SPD 1: the units carry the speed op cuts (codegen.rs `Variant::speed`; the
 // layout passes it on to neither).
 param SPD: u16 = 0;
+// LSE 1 (with SPD): the softmax against a carried log-sum-exp (codegen.rs
+// `Variant::lse`; passed on to neither).
+param LSE: u16 = 0;
 param NOLAYER: u16 = 0;    // 1 (checking the handoffs alone): the units skip their layers
 param VMX: u16 = 0;        // 1: a 5-column VM block east of the strip (VM5.md; then VMC 0)
 param VMREAL: u16 = 0;     // VMX: 1 Fork 3's eta VM (vm_pe.csl), 0 the stand-in (vm_stub.csl)

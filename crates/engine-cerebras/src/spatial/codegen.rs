@@ -36,6 +36,9 @@ mod src {
     /// On qwen2d_region's only (the grids' images have no room): the scores
     /// without kmv's per-call conversions, RoPE over every head at once.
     pub const SPEED_OPS_REGION: &str = include_str!("csl/kernels/speed_ops_region.json");
+    /// The softmax against a carried log-sum-exp reference, no max all-reduce,
+    /// and the collectives' group arithmetic by shifts (`Variant::lse`).
+    pub const LSE_OPS: &str = include_str!("csl/kernels/lse_ops.json");
     pub const VM_HM: &str = include_str!("csl/vm/guest4hm_vm.csl");
     pub const VM_HZ: &str = include_str!("csl/vm/guest4hz_vm.csl");
     /// Every design's runtime route and queue-color helpers.
@@ -268,6 +271,11 @@ pub struct Variant {
     /// `SPD` 1: the units' op cuts (`speed_ops*.json`; a faster, slightly
     /// more exact exp, otherwise the same arithmetic).
     pub speed: bool,
+    /// `LSE` 1 (with `speed`): each layer's softmax runs against the last
+    /// pass's log-sum-exp instead of an all-reduced max (one all-reduce fewer;
+    /// a pass whose sums leave [2^-80, 2^101) is redone by every PE), and the
+    /// all-reduces' group arithmetic is shifts (no soft divide/modulo).
+    pub lse: bool,
 }
 
 impl Variant {
@@ -302,6 +310,21 @@ impl Variant {
             if tag.starts_with("qwen2d_region/") {
                 s = apply_reps("speed_ops_region", src::SPEED_OPS_REGION, &s, tag)?;
             }
+        }
+        if self.lse {
+            if !self.speed {
+                return Err(format!("gen: {tag}: LSE needs SPD (exp_fast's clamp)"));
+            }
+            s = apply_reps("lse_ops", src::LSE_OPS, &s, tag)?;
+            // The reference's layer: a region's current one (`lw` of `NL`), a
+            // grid's only one.
+            let at = "var mref = @zeros([LNL * NQB]f32);\n";
+            let def = if tag.starts_with("qwen2d_region/") {
+                "const LNL: u16 = NL;\nfn lsel() u16 { return lw; }\n"
+            } else {
+                "const LNL: u16 = 1;\nfn lsel() u16 { return 0; }\n"
+            };
+            s = patch(&s, at, &format!("{def}{at}"), &format!("{tag}'s LSE reference"))?;
         }
         if let Some(bits) = self.eps_bits {
             let eps = f32::from_bits(bits);

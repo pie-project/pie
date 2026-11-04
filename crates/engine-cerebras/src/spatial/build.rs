@@ -159,6 +159,9 @@ pub struct ServeConfig {
     /// serve8b_region(_pipe): the units' op cuts (`SPD` 1, codegen's
     /// `Variant::speed`; cerebras-8b-speed).
     pub speed: bool,
+    /// serve8b_region(_pipe), with `speed`: the softmax against a carried
+    /// log-sum-exp, no max all-reduce (`LSE` 1, codegen's `Variant::lse`).
+    pub lse: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -178,6 +181,7 @@ impl ServeConfig {
             smp: false,
             region: false,
             speed: false,
+            lse: false,
             head_one_pass: false,
             pins: Pins::default(),
         }
@@ -244,6 +248,7 @@ impl ServeConfig {
             "region",
             "rows",
             "speed",
+            "lse",
             "head_one_pass",
         ];
         if let Some(k) = t.keys().find(|k| !known.contains(&k.as_str())) {
@@ -333,6 +338,7 @@ impl ServeConfig {
             smp: flag(t, "smp")?,
             region: flag(t, "region")?,
             speed: flag(t, "speed")?,
+            lse: flag(t, "lse")?,
             head_one_pass: flag(t, "head_one_pass")?,
             pins: match t.get("pins") {
                 None => Pins::default(),
@@ -1142,6 +1148,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
                 plan.spec.rms_eps.to_bits()
             },
             speed: cfg.speed,
+            lse: cfg.lse,
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1186,6 +1193,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.speed {
         st.push(Typed("SPD"));
+    }
+    if cfg.lse {
+        st.push(Typed("LSE"));
     }
     st.extend([
         Knob("MC", g.mlp_chunk),
@@ -2511,6 +2521,37 @@ mod llama31_8b {
                 _ => assert_eq!(a, b, "{n}"),
             }
         }
+    }
+
+    /// `lse` (with `speed`) states LSE 1: both units' files drop the max
+    /// all-reduce (the attention runs as a loop that a bad pass repeats) and
+    /// the collectives' soft divide/modulo; `lse` without `speed` is refused.
+    #[test]
+    fn lse_states_lse_and_patches_both_units() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.speed = true;
+        cfg.lse = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
+        assert_eq!(get("LSE").as_deref(), Some("1"));
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        assert!(lay.model.lse && lay.model.speed);
+        let base = d.files_with(Variant { lse: false, ..lay.model.variant() }).unwrap();
+        let lse = d.files_with(lay.model.variant()).unwrap();
+        for ((n, a), (_, b)) in base.iter().zip(&lse) {
+            match *n {
+                "grid_pe.csl" | "region_pe.csl" => {
+                    assert!(a.contains("allreduce(true, red_dsd, NQB);"), "{n}");
+                    assert!(!b.contains("allreduce(true,"), "{n}");
+                    assert!(b.contains("while (apass < 8)") && b.contains("fn gsh()"), "{n}");
+                    assert!(!b.contains("  const r = axis_id % ga();\n"), "{n}");
+                    assert!(b.contains("    ar_qt = axis_id >> gsh();\n"), "{n}");
+                }
+                _ => assert_eq!(a, b, "{n}"),
+            }
+        }
+        let alone = Variant { speed: false, ..lay.model.variant() };
+        assert!(d.files_with(alone).is_err());
     }
 
     /// The ring at PY 152: B 1 x 12 at CAP 32 ran on hardware (0402) and
