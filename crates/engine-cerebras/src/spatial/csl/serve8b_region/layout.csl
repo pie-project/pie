@@ -32,7 +32,7 @@ param GY: u16 = 0;     // the grids' Y phase-1 group (0: Gs; must divide PY)
 param RC: u16;         // region columns
 param RR: u16;         // region rows
 param NCOL: u16;       // grids in the column below layer 0
-param YD: u16 = 0;     // lever D (> 0): no band, regions from row 0, the last grid at (XC, YD) (NCOL 1)
+param YD: u16 = 0;     // lever D (> 0): no band, regions from row 0, the last NCOL grids down the column from (XC, YD)
 param RTR: u16;        // routes a unit PE's table holds (the host checks)
 param HR: u16;
 param Qh: u16;
@@ -118,14 +118,14 @@ const XE: u16 = XH + HW;
 const XV: u16 = if (VW > 0) XE + EW else 0;
 const RY0: u16 = if (YD > 0) 0 else PY;       // the regions' first row
 const RB: u16 = RY0 + RR * RPY;              // below the regions
-const CB: u16 = if (YD > 0) YD + PY else PY * (1 + NCOL);   // below the grid column
+const CB: u16 = if (YD > 0) YD + NCOL * PY else PY * (1 + NCOL);   // below the grid column
 const LH: u16 = if (RB > CB) RB else CB;
 const F: u16 = if (HEADMODE == 2) HH / 2 else 0;
 const HR2X: u16 = if (HEADMODE == 2) (C / Gx / 2) * Gx + Gx / 2 else 0;
 const HVMC: u16 = if (HEADMODE == 2) VMC else 0;
 const RH: u16 = if (HEADMODE == 2 and HH + 1 > LH) HH + 1 else LH;
 const XL: u16 = XC;                          // the last layer's grid
-const YL: u16 = if (YD > 0) YD else PY * NCOL;
+const YL: u16 = if (YD > 0) YD + (NCOL - 1) * PY else PY * NCOL;
 const RCX: u16 = XH + HR2X;                   // the final root's column
 const memcpy = @import_module("<memcpy/get_params>", .{ .width = XE + EW + VW, .height = RH });
 

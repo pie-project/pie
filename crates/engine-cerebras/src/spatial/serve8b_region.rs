@@ -84,9 +84,10 @@ pub struct Units {
     pub nolayer: bool,
     /// Grids in the top band, layer 0's included (XC / PX + 1; 1 under `YD`).
     pub band: usize,
-    /// `YD` > 0 (lever D): no band; the regions from row 0 (RC 2, RR odd),
-    /// entered from layer 0's grid to their east, and the last layer's grid
-    /// at (XC, YD) beside the last region (NCOL 1). 0: option A.
+    /// `YD` > 0 (lever D): no band; the regions from row 0 (RC 2), entered
+    /// from layer 0's grid to their east, and the last NCOL layers' grids
+    /// down the column from (XC, YD) beside the last region (in region row
+    /// RR - 2, RR odd, or row 1). 0: option A.
     pub yd: usize,
     /// The eta VM as the block east of the strip (`VMX`, `VMREAL`).
     pub vm: Option<VmBlock>,
@@ -174,25 +175,35 @@ impl Units {
         };
         let xc = self.rc * self.rpx;
         if self.yd > 0 {
-            // Lever D: layer 0 at (XC, 0); the regions (RC 2 x RR, RR odd)
-            // from (1, 0) by rows 0..RR-3 (east-west, then west-east, ...),
-            // then (0, RR-2), (0, RR-1), (1, RR-1), (1, RR-2); the last grid
-            // at (XC, YD) east of that region.
+            // Lever D: layer 0 at (XC, 0); the regions (RC 2 x RR) entered at
+            // (1, 0); the last NCOL grids down the column from (XC, YD), east
+            // of the last region. YD in region row RR - 2 (RR odd): from (1,
+            // 0) by rows 0..RR-3 (east-west, then west-east, ...), then (0,
+            // RR-2), (0, RR-1), (1, RR-1), (1, RR-2). YD in region row 1 (any
+            // RR): down column 0 from (0, 0), back up column 1 to (1, 1).
             add(Kind::Grid, xc, 0);
             let mut cells: Vec<(usize, usize)> = Vec::new();
-            for r in 0..self.rr.saturating_sub(2) {
-                if r % 2 == 0 {
-                    cells.extend([(1, r), (0, r)]);
-                } else {
-                    cells.extend([(0, r), (1, r)]);
+            if self.yd / self.rpy == 1 && self.rr != 3 {
+                cells.push((1, 0));
+                cells.extend((0..self.rr).map(|r| (0, r)));
+                cells.extend((1..self.rr).rev().map(|r| (1, r)));
+            } else {
+                for r in 0..self.rr.saturating_sub(2) {
+                    if r % 2 == 0 {
+                        cells.extend([(1, r), (0, r)]);
+                    } else {
+                        cells.extend([(0, r), (1, r)]);
+                    }
                 }
+                let (a, b) = (self.rr.saturating_sub(2), self.rr.saturating_sub(1));
+                cells.extend([(0, a), (0, b), (1, b), (1, a)]);
             }
-            let (a, b) = (self.rr.saturating_sub(2), self.rr.saturating_sub(1));
-            cells.extend([(0, a), (0, b), (1, b), (1, a)]);
             for (c, r) in cells {
                 add(Kind::Region, c * self.rpx, r * self.rpy);
             }
-            add(Kind::Grid, xc, self.yd);
+            for k in 0..self.ncol.max(1) {
+                add(Kind::Grid, xc, self.yd + k * lay.py());
+            }
             return out;
         }
         for i in 0..self.band {
@@ -1418,6 +1429,50 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Lever D for Qwen3-8B (36 layers): layer 0's grid, 10 regions of
+    /// 256 x 208 by the U (down column 0, back up column 1 to (1, 1)) and
+    /// the last 5 grids down the column from (512, 208).
+    #[test]
+    fn lever_d_u_units_and_tables() {
+        let p = "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:48,RNL:3,RGY:16,\
+        RC:2,RR:5,NCOL:5,YD:208,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,PROF:0,TIME:0,\
+        HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,PASSES:3,MODE:2,OVL:0,\
+        VMC:1,CAP:64,iters:1,B:1,NP:1,SPD:1,LSE:1";
+        let lay = lay_of(p);
+        let Layers::Units { units: u, .. } = lay.layers else {
+            panic!("not serve8b_region")
+        };
+        let units = u.units(&lay);
+        assert_eq!((units.len(), lay.layers()), (16, 36));
+        let at: Vec<_> = units.iter().map(|v| (v.x0, v.y0, v.layers.start)).collect();
+        assert_eq!(
+            at,
+            vec![
+                (512, 0, 0),
+                (256, 0, 1),
+                (0, 0, 4),
+                (0, 208, 7),
+                (0, 416, 10),
+                (0, 624, 13),
+                (0, 832, 16),
+                (256, 832, 19),
+                (256, 624, 22),
+                (256, 416, 25),
+                (256, 208, 28),
+                (512, 208, 31),
+                (512, 352, 32),
+                (512, 496, 33),
+                (512, 640, 34),
+                (512, 784, 35)
+            ]
+        );
+        assert_eq!(lay.rectangle().1, 1153);
+        let t = Tables::new(units.clone(), 1, u.rtr).unwrap();
+        for v in &units {
+            assert_eq!(t.table(v).unwrap().len(), v.k.px * v.k.py * t.rtn());
+        }
     }
 
     #[test]

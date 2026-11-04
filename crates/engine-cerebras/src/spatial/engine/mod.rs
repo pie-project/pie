@@ -349,6 +349,11 @@ impl Engine for Spatial {
         let trace_name = shell.trace().name.clone();
         let paging = shell.paging();
         self.kv.page_size = paging.page_size;
+        // A build with shorter pages than PIE's (HV, PS 1) is paged PIE's
+        // way: the wafer handle expands each PIE page into its kernel pages.
+        if let Some(w) = self.model.as_mut() {
+            w.page_as(paging.page_size as usize);
+        }
         // A batched wafer build's pool is PIE's: the same page size, and at
         // least the pages PIE hands out.
         if let Some(w) = &self.model

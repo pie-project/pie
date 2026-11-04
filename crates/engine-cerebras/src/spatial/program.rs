@@ -1172,7 +1172,7 @@ impl ProgramSpec {
                 // head and the strip, and VMX's 5-column VM block.
                 let vw = if u.vm.is_some() { 5 } else { 0 };
                 let lh = if u.yd > 0 {
-                    (u.rr * u.rpy).max(u.yd + py)
+                    (u.rr * u.rpy).max(u.yd + u.ncol.max(1) * py)
                 } else {
                     (py + u.rr * u.rpy).max(py * (1 + u.ncol))
                 };
@@ -1585,12 +1585,14 @@ fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
     }
     let yd = get.opt("YD").unwrap_or(0);
     if yd > 0 {
+        // The last region: in row RR - 2 (RR odd, the snake) or row 1 (the
+        // U); the column's first grid within its rows.
         let (rr, ncol) = (get.req("RR")?, get.req("NCOL")?);
-        let last = rr.saturating_sub(2) * rpy;
-        if rc != 2 || rr < 3 || rr % 2 == 0 || ncol != 1 || yd < last || yd + grid.py > last + rpy {
+        let k = yd / rpy.max(1);
+        let row_ok = k == 1 || (rr % 2 == 1 && k + 2 == rr);
+        if rc != 2 || rr < 3 || ncol == 0 || !row_ok || yd + grid.py > (k + 1) * rpy {
             return Err(format!(
-                "serve8b_region YD {yd}: lever D takes RC 2, an odd RR >= 3, NCOL 1 and the last grid within rows {last}..{} (RC {rc}, RR {rr}, NCOL {ncol})",
-                last + rpy
+                "serve8b_region YD {yd}: lever D takes RC 2, RR >= 3, NCOL >= 1 and the column's first grid within the rows of region row 1 or (RR odd) RR - 2 (RC {rc}, RR {rr}, NCOL {ncol})"
             ));
         }
     }

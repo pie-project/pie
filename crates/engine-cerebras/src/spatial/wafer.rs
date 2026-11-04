@@ -1375,6 +1375,13 @@ pub struct Wafer {
     pub hidden: usize,
     /// The build has recurrent layers (serve_q35): lanes carry their state.
     pub recurrent: bool,
+    /// Kernel pages a PIE page (1: the program's pages are PIE's). A build
+    /// whose pages are shorter than PIE's (HV, `PS` 1) keeps PIE's page
+    /// size: PIE page `g` is kernel pages `g * group .. (g + 1) * group`
+    /// (offset `o` in kernel page `g * group + o / PS`), expanded here at
+    /// the handle: the lanes' page tables, the page copies and the host
+    /// tier's pages. `paged` and `page_bytes` are PIE's view.
+    pub group: u32,
 }
 
 impl Wafer {
@@ -1418,6 +1425,7 @@ impl Wafer {
                             vocab: m.design.vocab(),
                             hidden: m.design.hidden(),
                             recurrent: m.design.hybrid().is_some(),
+                            group: 1,
                         }));
                         m
                     }
@@ -1574,6 +1582,50 @@ impl Wafer {
         })
     }
 
+    /// Pages PIE's way: `page_size` positions a page, a whole number of
+    /// the program's (which then divide its blocks a row). Sets
+    /// [`Wafer::group`] and turns `paged` and `page_bytes` into PIE's
+    /// view; a page size the program's pages do not tile is left alone
+    /// (the load's check then refuses it).
+    pub fn page_as(&mut self, page_size: usize) {
+        let Some(shape) = self.paged else { return };
+        if self.group != 1 || shape.page_size == 0 || page_size <= shape.page_size {
+            return;
+        }
+        let g = page_size / shape.page_size;
+        if g * shape.page_size != page_size || !shape.blocks.is_multiple_of(g) {
+            return;
+        }
+        self.group = g as u32;
+        self.paged = Some(super::paged::Shape {
+            page_size,
+            blocks: shape.blocks / g,
+            ..shape
+        });
+        self.page_bytes = self.page_bytes.map(|b| b * g);
+    }
+
+    /// PIE page ids as the program's (each `group` kernel pages, in order).
+    fn kernel_pages(&self, pages: &[u32]) -> Vec<u32> {
+        let g = self.group;
+        pages
+            .iter()
+            .flat_map(|&p| (0..g).map(move |o| p * g + o))
+            .collect()
+    }
+
+    fn kernel_lanes(
+        &self,
+        mut lanes: Vec<super::serve2d::BatchLane>,
+    ) -> Vec<super::serve2d::BatchLane> {
+        if self.group > 1 {
+            for l in &mut lanes {
+                l.pages = self.kernel_pages(&l.pages);
+            }
+        }
+        lanes
+    }
+
     /// [`WaferModel::fire_batch`] on the wafer's thread.
     pub fn fire_batch(
         &mut self,
@@ -1582,6 +1634,7 @@ impl Wafer {
         logits: bool,
     ) -> BatchAnswer {
         let _busy = Busy::start();
+        let lanes = self.kernel_lanes(lanes);
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?
@@ -1606,6 +1659,7 @@ impl Wafer {
         reply: mpsc::Sender<BatchAnswer>,
         landed: Box<dyn FnOnce() + Send>,
     ) -> R<()> {
+        let lanes = self.kernel_lanes(lanes);
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?
@@ -1681,6 +1735,7 @@ impl Wafer {
         inputs: Vec<StepInput>,
     ) -> R<Vec<VmStep>> {
         let _busy = Busy::start();
+        let lanes = self.kernel_lanes(lanes);
         self.vm_job(Job::VmFire {
             lanes,
             sampled,
@@ -1739,20 +1794,44 @@ impl Wafer {
     /// [`WaferModel::page_out`] on the wafer's thread.
     pub fn page_out(&mut self, pages: Vec<u32>) -> R<Vec<Vec<u32>>> {
         let _busy = Busy::start();
+        let g = self.group as usize;
+        let pages = self.kernel_pages(&pages);
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?
             .send(Job::PageOut { pages })
             .map_err(|_| "the wafer thread went away".to_string())?;
-        self.batch_answers
+        let words = self
+            .batch_answers
             .recv()
             .map_err(|_| "the wafer thread went away".to_string())?
-            .map(|(words, _)| words)
+            .map(|(words, _)| words)?;
+        // A PIE page's words: its kernel pages' in order.
+        Ok(words.chunks(g.max(1)).map(|c| c.concat()).collect())
     }
 
     /// [`WaferModel::page_in`] on the wafer's thread.
     pub fn page_in(&mut self, pages: Vec<(u32, Vec<u32>)>) -> R<()> {
         let _busy = Busy::start();
+        let g = self.group;
+        let pages = if g > 1 {
+            let mut out = Vec::new();
+            for (p, words) in pages {
+                let n = words.len() / g as usize;
+                if n * g as usize != words.len() {
+                    return Err(format!(
+                        "page {p}'s host copy is {} words, not {g} kernel pages' worth",
+                        words.len()
+                    ));
+                }
+                for (o, c) in words.chunks(n.max(1)).enumerate() {
+                    out.push((p * g + o as u32, c.to_vec()));
+                }
+            }
+            out
+        } else {
+            pages
+        };
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?
@@ -1780,6 +1859,11 @@ impl Wafer {
 
     pub fn copy_pages(&mut self, pairs: Vec<(u32, u32)>) -> R<()> {
         let _busy = Busy::start();
+        let g = self.group;
+        let pairs: Vec<(u32, u32)> = pairs
+            .into_iter()
+            .flat_map(|(s, d)| (0..g).map(move |o| (s * g + o, d * g + o)))
+            .collect();
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?

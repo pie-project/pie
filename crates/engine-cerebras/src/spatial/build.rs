@@ -165,6 +165,15 @@ pub struct ServeConfig {
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
+    /// serve8b_region, with `lse`: the attention vectorized over a kv head's
+    /// query heads (HV): one-position kernel pages (`PS` 1, `NB` the plan's
+    /// blocks x PIE's page size, `E` 5). PIE keeps its page size; the
+    /// engine expands each PIE page into its kernel pages
+    /// ([`super::wafer::Wafer::page_as`]).
+    pub hv: bool,
+    /// serve8b_region: lever D (`YD`), every layer but the first and last
+    /// in regions of `RPY` 208 (no band; the last grid at (XC, YD)).
+    pub lever_d: bool,
     pub pins: Pins,
 }
 
@@ -183,6 +192,8 @@ impl ServeConfig {
             speed: false,
             lse: false,
             head_one_pass: false,
+            hv: false,
+            lever_d: false,
             pins: Pins::default(),
         }
     }
@@ -250,6 +261,8 @@ impl ServeConfig {
             "speed",
             "lse",
             "head_one_pass",
+            "hv",
+            "lever_d",
         ];
         if let Some(k) = t.keys().find(|k| !known.contains(&k.as_str())) {
             return Err(format!("[cerebras.spatial.serve]: unknown key `{k}`"));
@@ -340,6 +353,8 @@ impl ServeConfig {
             speed: flag(t, "speed")?,
             lse: flag(t, "lse")?,
             head_one_pass: flag(t, "head_one_pass")?,
+            hv: flag(t, "hv")?,
+            lever_d: flag(t, "lever_d")?,
             pins: match t.get("pins") {
                 None => Pins::default(),
                 Some(v) => {
@@ -972,23 +987,155 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         .pipeline
         .then(|| pipe_shape(plan.grid.lanes, cfg))
         .transpose()?;
-    let pl = placement(plan, cfg.vm.is_some(), pipe.is_some())?;
-    let Placement {
-        rpx,
-        rpy,
-        rnl,
-        rc,
-        rr,
-        band,
-        ncol,
-        hh,
-        vr,
-        vmc,
-        head4,
-        ..
-    } = pl;
-    let rgy = RGY;
-    let g = &pl.grid;
+    if cfg.hv && !cfg.lse {
+        return Err("serve8b_region's HV (`hv`) needs `lse` (and `speed`)".into());
+    }
+    // Lever D (`lever_d`): its fixed all-region layout; else the placement
+    // (option A for bf16 plans, the search for u4).
+    let (gv, rpx, rpy, rnl, rc, rr, band, ncol, hh, vr, vmc, head4, rgy, yd) = if cfg.lever_d {
+        let g = &plan.grid;
+        let wafer = super::plan::WaferDims::CS3;
+        if g.w4 {
+            return Err("serve8b_region's lever D (`lever_d`) takes bf16 units only".into());
+        }
+        // Lever D: layer 0's grid, RC x RR regions of RNL layers from row 0 at
+        // RPY 208 (RGY 16 divides it; RR 5 is the most the wafer's rows hold),
+        // the remaining NCOL layers' grids down the column.
+        let (rc, rnl, rpy, rgy) = (2, 3, if cfg.lever_d { 208 } else { 240 }, 16);
+        let rpx = 2 * g.px;
+        let (rr, band) = if cfg.lever_d {
+            let rr = 5;
+            if plan.layers < 2 + rc * rr * rnl || rr * rpy > wafer.height {
+                return Err(format!(
+                    "{}: serve8b_region's lever D takes {} layers or more, not {}",
+                    plan.spec.name,
+                    2 + rc * rr * rnl,
+                    plan.layers
+                ));
+            }
+            (rr, 1)
+        } else {
+            (4, 2 * 2 * g.px / g.px + 1)
+        };
+        if !g.dc.is_multiple_of(4) || !g.ic.is_multiple_of(2) || plan.layers < band + rc * rr * rnl + 1
+        {
+            return Err(format!(
+                "{}: serve8b_region's option A does not take this grid ({g:?})",
+                plan.spec.name
+            ));
+        }
+        let ncol = plan.layers - band - rc * rr * rnl;
+        // The last layer's grid row (the layout's YL): the head's feeder half F
+        // lies in [PY, YL).
+        // One column grid: beside the snake's last region (row RR - 2, as
+        // 0472 ran); more: beside the U's (row 1), so they fit below it.
+        let yd = match (cfg.lever_d, ncol) {
+            (false, _) => 0,
+            (true, 1) => (rr - 2) * rpy,
+            (true, _) => rpy,
+        };
+        let yl = if cfg.lever_d {
+            yd + (ncol - 1) * g.py
+        } else {
+            g.py * ncol
+        };
+        // The head's height as option A's (its hardware-validated heads: Llama
+        // 864, Qwen3-8B 1152): its column grids' count.
+        let ncol_a = if cfg.lever_d {
+            plan.layers.saturating_sub(2 * 2 + 1 + rc * 4 * rnl)
+        } else {
+            ncol
+        };
+        let c = g.py / 2;
+        // With an eta VM (VMX): the guest4hz VM as a 5-column block east of
+        // the strip, Vr 160 vocab rows a head PE (32 a VM column: required) and
+        // the fewest head rows HH >= vocab / Vr, even (F = HH / 2), whose feeder
+        // half F has an even row group Gy <= 28 (Gy must divide F; evenness and
+        // the cap of 28, the group the Vr 160 fits were measured at, are this
+        // plan's choices, not head2d_v10's limits); without, the head as tall
+        // as the grid column, VMC 1.
+        let (hh, vr, vmc, vw) = match cfg.vm {
+            Some(_) => {
+                let vr = 160;
+                let mut hh = plan.vocab.div_ceil(vr);
+                hh += hh % 2;
+                while !(4..=28).step_by(2).any(|x| (hh / 2) % x == 0) {
+                    hh += 2;
+                }
+                (hh, vr, 0, 5)
+            }
+            None => {
+                // The grid column's height; taller (to 2 YL at most: the feeder
+                // half above the last layer) while the strip's tiles (Vr rows
+                // of 4 Hc dims) pass STRIP_TABLE, with a feeder half F that a
+                // row group of 16-24 divides (Qwen3-8B's 1152 rows hold as is;
+                // Llama's 3 column grids are short for its vocabulary).
+                // Vr even (head2d_v10's row pairs).
+                let vr_of = |hh: usize| plan.vocab.div_ceil(hh).next_multiple_of(2);
+                let fits = |hh: usize| {
+                    vr_of(hh) * 4 * g.hc * 2 <= STRIP_TABLE
+                        && (16..=24).step_by(2).any(|x| (hh / 2).is_multiple_of(x))
+                };
+                let mut hh = g.py * (1 + ncol_a);
+                if !fits(hh) {
+                    hh = (hh..(2 * g.py * ncol_a).min(wafer.height))
+                        .step_by(2)
+                        .find(|&hh| fits(hh))
+                        .ok_or_else(|| {
+                            format!(
+                                "{}: serve8b_region's strip holds no {}-row vocabulary beside {ncol} column grids of PY {}",
+                                plan.spec.name, plan.vocab, g.py
+                            )
+                        })?;
+                }
+                (hh, vr_of(hh), 1, 0)
+            }
+        };
+        let width = rc * rpx + g.px + c + vmc + g.py / 4 + vw;
+        let lh = if cfg.lever_d {
+            (rr * rpy).max(yd + ncol * g.py)
+        } else {
+            g.py + rr * rpy
+        };
+        if width > wafer.width || hh + 1 > wafer.height || lh > wafer.height {
+            return Err(format!(
+                "{}: serve8b_region's {width} x {} does not fit the wafer",
+                plan.spec.name,
+                hh + 1
+            ));
+        }
+    let f = hh / 2;
+        if f < g.py || f >= yl {
+            return Err(format!(
+                "{}: serve8b_region's feeder row {f} is not between the grids' {} and {yl}",
+                plan.spec.name, g.py
+            ));
+        }
+        (
+            *g, rpx, rpy, rnl, rc, rr, band, ncol, hh, vr, vmc, false, rgy, yd,
+        )
+    } else {
+        let pl = placement(plan, cfg.vm.is_some(), pipe.is_some())?;
+        let Placement {
+            rpx,
+            rpy,
+            rnl,
+            rc,
+            rr,
+            band,
+            ncol,
+            hh,
+            vr,
+            vmc,
+            head4,
+            ..
+        } = pl;
+        let rgy = RGY;
+        (
+            pl.grid, rpx, rpy, rnl, rc, rr, band, ncol, hh, vr, vmc, head4, rgy, 0,
+        )
+    };
+    let g = &gv;
     let c = g.py / 2;
     // The grids' Y phase-1 group: Gs, or the largest even divisor of PY
     // below it (152 rows: 8).
@@ -1062,14 +1209,15 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         rc,
         rr,
         ncol,
-        rtr: 4,
+        // Lever D: the grid's bottom row carries three re-chunk legs and E.
+        rtr: if cfg.lever_d { 5 } else { 4 },
         gy: grid_gy,
         rgy,
         hroute: true,
         rot8: true,
         nolayer: false,
         band,
-        yd: 0,
+        yd,
         vm: None,
     };
     let mut st: Vec<Stated> = Vec::new();
@@ -1169,7 +1317,17 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             defer: false,
         },
         Kv::Paged {
-            shape: pool(g, g.py.min(rpy)),
+            shape: if cfg.hv {
+                // HV: one-position kernel pages, PIE's pages' worth a block.
+                Shape {
+                    page_size: 1,
+                    blocks: g.blocks * g.page_size,
+                    entries: 5,
+                    ..pool(g, g.py.min(rpy))
+                }
+            } else {
+                pool(g, g.py.min(rpy))
+            },
             copy: PageCopy::Host,
             staging,
         },
@@ -1197,6 +1355,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.lse {
         st.push(Typed("LSE"));
+    }
+    if cfg.lever_d {
+        st.push(Typed("YD"));
     }
     st.extend([
         Knob("MC", g.mlp_chunk),
@@ -2153,7 +2314,7 @@ mod qwen3_8b {
         ModelSpec::read(&d.trace(poem_ir::Platform::Cerebras)).expect("qwen3-8b reads")
     }
 
-    fn sorted(extra: &str) -> Vec<(String, String)> {
+    pub(super) fn sorted(extra: &str) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = extra
             .split(',')
             .map(|kv| {
@@ -2254,6 +2415,44 @@ mod qwen3_8b {
             let p2: Vec<(String, String)> = p.clone();
             assert_eq!(rectangle(d, &p2).unwrap(), (749, 1153));
         }
+    }
+
+    /// Lever D for Qwen3-8B (36 layers: 1 + 10 x 3 + 5): the U order, the
+    /// five column grids from (512, 208), the head as option A's (HH 1152);
+    /// with `hv`, `speed`, `lse`, `head_one_pass` (the payload speed8b_qld).
+    #[test]
+    fn the_plan_places_qwen3_8b_lever_d() {
+        let goals = Goals {
+            blocks: Some(1),
+            host_copy: false,
+            grid_lanes: 1,
+            ..Goals::lanes(1)
+        };
+        let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+        let mut cfg = ServeConfig::new(goals);
+        cfg.region = true;
+        cfg.speed = true;
+        cfg.lse = true;
+        cfg.hv = true;
+        cfg.lever_d = true;
+        cfg.head_one_pass = true;
+        cfg.pins.set("NP", 1).unwrap();
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            sorted(
+                "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:48,RNL:3,\
+                 RGY:16,RC:2,RR:5,NCOL:5,YD:208,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
+                 PROF:0,TIME:0,HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,\
+                 PASSES:3,MODE:2,OVL:0,VMC:1,CAP:64,iters:1,B:1,NP:1,KVST:1,SPD:1,LSE:1"
+            )
+        );
+        let lay =
+            crate::spatial::program::ProgramSpec::from_params(d, &p).expect("serve8b_region D");
+        assert_eq!(lay.layers(), 36);
+        assert_eq!(rectangle(d, &p).unwrap(), (749, 1153));
     }
 
     /// `region` with `pipeline` is the validated serve8b_region_pipe builds (B 4 x 4
@@ -2491,6 +2690,40 @@ mod llama31_8b {
             _ => get(k),
         };
         assert!(plan.spec.check_program(qwen_get).is_err());
+    }
+
+    /// `lever_d` + `hv` (with `speed`, `lse`, `head_one_pass`, CAP 128):
+    /// the plan states 0472's hardware build (lever D, Llama as 1 + 10 x 3
+    /// + 1 at RPY 208; HV's one-position pages), NP pinned to 1 as there,
+    /// but for its TIME 1.
+    #[test]
+    fn the_plan_places_llama_3_lever_d_as_0472() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.goals.cap = Some(128);
+        cfg.speed = true;
+        cfg.lse = true;
+        cfg.head_one_pass = true;
+        cfg.hv = true;
+        cfg.lever_d = true;
+        cfg.pins.set("NP", 1).unwrap();
+        let plan = SpatialPlan::derive(&plan.spec, WaferDims::CS3, cfg.goals).unwrap();
+        let (d, p) = params(&plan, &cfg).unwrap();
+        assert_eq!(d, Design::Serve8bRegion);
+        let want = "PX:128,PY:152,Hc:27,Dc:8,Gs:16,Ic:112,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:56,RNL:3,\
+                    RGY:16,GY:8,RC:2,RR:5,NCOL:1,YD:624,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,\
+                    KVCP:0,PROF:0,TIME:0,HROUTE:1,ROT8:1,QKN:0,EPS:925353388,NOLAYER:0,HEADMODE:2,HH:864,\
+                    Vr:150,Gx:4,Gy:24,vocab:128256,PASSES:3,MODE:2,OVL:0,VMC:1,CAP:128,iters:1,B:1,NP:1,\
+                    SPD:1,LSE:1";
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(got, super::qwen3_8b::sorted(want));
+        assert_eq!(rectangle(d, &p).unwrap().1, 1040);
+        let lay = ProgramSpec::from_params(d, &p).expect("serve8b_region D");
+        assert_eq!(lay.layers(), 32);
+        // HV without LSE, and D on a layer count it cannot take, are refused.
+        cfg.lse = false;
+        assert!(params(&plan, &cfg).is_err());
     }
 
     /// `speed` states SPD 1 (and `head_one_pass` MODE 2): the units' files
