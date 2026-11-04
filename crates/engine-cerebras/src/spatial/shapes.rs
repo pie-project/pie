@@ -211,7 +211,9 @@ pub const RAN: &[Ran] = &[
                  (RPY 240) 1,284.9 tok/s (0469) and with the one-search append 1,303.2 (0471), \
                  greedy = the f32 golden for 225 tokens (the 0.0107 tie), 0 teacher-forced \
                  mismatches; lever D (YD 624, RR 5, RPY 208, RHc 20, RTR 5) 1,365.4 (0472), \
-                 greedy = golden for 512, mismatches only at the two known ties (225, 274)",
+                 greedy = golden for 512, mismatches only at the two known ties (225, 274); \
+                 with OP2 (scalar SiLU, set_axis skip) 1,403.7 (0480), the same accuracy; pie \
+                 B 1 (frame 4, depth 15) 94.9-95.6% of bare over 6 reps (0481)",
     },
     Ran {
         design: Design::Serve8bRegion,
