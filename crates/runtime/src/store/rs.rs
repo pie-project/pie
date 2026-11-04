@@ -222,6 +222,8 @@ pub struct RsStore {
     inflight: BTreeMap<u64, Touch>,
     /// By slot number, the newest seq whose fire touched the slot.
     last_touch: Vec<u64>,
+    /// By slot number, how many times unsettled fires' touches name it.
+    pending_touch: Vec<u32>,
     /// Checkpoints: hidden forks no process holds.
     checkpoints: HashMap<Hash256, RsCheckpoint>,
 }
@@ -281,6 +283,7 @@ impl RsStore {
             seq: 0,
             inflight: BTreeMap::new(),
             last_touch: Vec::new(),
+            pending_touch: Vec::new(),
             checkpoints: HashMap::new(),
         }
     }
@@ -1475,26 +1478,34 @@ impl RsStore {
             let at = id.0 as usize;
             if at >= self.last_touch.len() {
                 self.last_touch.resize(at + 1, 0);
+                self.pending_touch.resize(at + 1, 0);
             }
             self.last_touch[at] = self.last_touch[at].max(seq);
+            self.pending_touch[at] += 1;
         }
     }
 
     fn settle_seq(&mut self, seq: u64) {
-        self.inflight.remove(&seq);
+        let Some(touch) = self.inflight.remove(&seq) else {
+            return;
+        };
+        for id in touch.writes.iter().chain(&touch.reads) {
+            if let Some(count) = self.pending_touch.get_mut(id.0 as usize) {
+                *count = count.saturating_sub(1);
+            }
+        }
     }
 
-    /// The seq `id` is recycled behind while a fire may still touch it: the
-    /// newest fire that touched it, while that is not older than every
-    /// unsettled fire. Never earlier than the newest unsettled fire that
-    /// writes or reads it, though it can be later, when the newest toucher
-    /// has settled and an older unrelated fire has not.
+    /// The seq `id` is recycled behind while a fire may still touch it:
+    /// none once no unsettled fire touches it, else the newest fire that
+    /// touched it. That is the newest unsettled one, unless it settled before
+    /// an older one that touches it too, when it is later than needed.
     fn newest_touch(&self, id: RsSlotId) -> Option<u64> {
-        let oldest = *self.inflight.keys().next()?;
-        self.last_touch
-            .get(id.0 as usize)
-            .copied()
-            .filter(|&seq| seq >= oldest)
+        let at = id.0 as usize;
+        if self.pending_touch.get(at).copied().unwrap_or(0) == 0 {
+            return None;
+        }
+        self.last_touch.get(at).copied()
     }
 
     /// Drops a reference to `id`, recycling it once none remains, behind
