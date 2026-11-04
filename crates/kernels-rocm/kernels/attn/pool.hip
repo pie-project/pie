@@ -77,12 +77,15 @@ __global__ void pool_gather_paged(const bf16* __restrict__ state_kv, const bf16*
                                   const float* __restrict__ ape, const i32* __restrict__ boundary_pos,
                                   const i32* __restrict__ boundary_req, const i32* __restrict__ page_indices,
                                   const i32* __restrict__ page_indptr, bf16* __restrict__ out, int head_dim, int ratio,
-                                  int coff, int page_size, int state_pitch) {
-    const int c = blockIdx.x;
+                                  int coff, int page_size, int state_pitch, const u32* __restrict__ win) {
+    // a replayed body's padded rows past the live window hold stale boundaries (a c1024 fire faulted reading them)
+    const Window live{win};
+    if (!live.live(blockIdx.x)) return;
+    const long long c = live.plane(blockIdx.x);
     const int window = coff * ratio, width = coff * head_dim;
     const long long pitch = state_pitch;
     const int bpos = boundary_pos[c], req = boundary_req[c];
-    bf16* orow = out + static_cast<long long>(c) * head_dim;
+    bf16* orow = out + c * head_dim;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         if (bpos < 0) {
             orow[d] = from_f32<bf16>(0.f);
@@ -136,14 +139,16 @@ __global__ void index_block_mean_paged(const bf16* __restrict__ key_pages, bf16*
 __global__ void pool_store_entries(const bf16* __restrict__ entries, bf16* __restrict__ pages,
                                    const i32* __restrict__ boundary_pos, const i32* __restrict__ boundary_req,
                                    const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
-                                   int head_dim, int page_size, int div) {
-    const int c = blockIdx.x;
+                                   int head_dim, int page_size, int div, const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long c = window.plane(blockIdx.x);
     if (boundary_pos[c] < 0) return;
     // A compact pool (`div` its ratio): the entry at its index, `page_size /
     // div` a page; else at the boundary's position.
     const long long slot =
         pool_slot(page_indices, page_indptr, boundary_req[c], boundary_pos[c] / div, page_size / div);
-    copy_row(entries + static_cast<long long>(c) * head_dim, pages + slot * head_dim, head_dim);
+    copy_row(entries + c * head_dim, pages + slot * head_dim, head_dim);
 }
 
 // --------------------------------------------------------- attention --
