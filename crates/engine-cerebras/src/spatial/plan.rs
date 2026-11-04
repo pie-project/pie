@@ -257,7 +257,15 @@ impl Grid {
         if self.w4 {
             // The six u4 tiles (codes, groups' scales and biases, segments)
             // and the decode scratch (`u4::pe_bytes`).
-            return super::u4::pe_bytes(self.hc, self.dc, self.gs, self.qh, self.ic, 1);
+            return super::u4::pe_bytes(
+                self.hc,
+                self.dc,
+                self.gs,
+                self.qh,
+                self.ic,
+                1,
+                self.lanes == 1,
+            );
         }
         // wqkv Hc x (Qh + 2) Dc, wo Qh Dc x Hc, wgu Hc x 2 Ic, wd Ic x Hc.
         let elems = self.hc * ((2 * self.qh + 2) * self.dc + 3 * self.ic);
@@ -311,13 +319,94 @@ impl Grid {
         } else {
             0
         };
+        let w4 = if self.w4 { W4_CODE } else { 0 };
         fixed - copy
+            + w4
             + ring
             + self.weight_bytes()
             + self.table_bytes()
             + self.blocks * self.block_bytes()
             + self.lanes * self.lane_bytes()
             + 4 * self.mlp_chunk * (3 * self.ic + 1)
+    }
+}
+
+impl Grid {
+    /// One more layer's bytes on a PE holding several (a region's): its
+    /// weights (without the u4 decode scratch, shared), tables and pool.
+    pub fn layer_bytes(&self) -> usize {
+        let weights = if self.w4 {
+            super::u4::tiles(self.hc, self.dc, self.gs, self.qh, self.ic, self.lanes == 1)
+                .iter()
+                .map(|t| 2 * t.layer_words())
+                .sum()
+        } else {
+            self.weight_bytes()
+        };
+        weights + self.table_bytes() + self.blocks * self.block_bytes()
+    }
+
+    /// A region PE's estimated bytes at `nl` layers (qwen2d_region: the
+    /// grid kernel's model, `REGION_EXTRA` more code, the layers past the
+    /// first by [`Grid::layer_bytes`]).
+    pub fn region_bytes(&self, nl: usize, ring: bool) -> usize {
+        self.bytes(ring) + REGION_EXTRA + nl.saturating_sub(1) * self.layer_bytes()
+    }
+}
+
+/// qwen2d_region's image over the grid model at the same tiles (link probe,
+/// 2026-11-04: Qwen3-14B u4 regions 256 x 144, RHc 36, RDc 4, RIc 68, RNL 2:
+/// 47,488 B against 43,510 + `W4_CODE` + staging; see U4G64-README).
+pub const REGION_EXTRA: usize = 1_314;
+/// A W4 unit image over the grid model (the u4 matvec's code and what the
+/// model does not count; link probe, 2026-11-04: the Qwen3-14B u4 grid
+/// 128 x 144, Hc 36, Ic 136: 46,048 B against 43,496 + staging).
+pub const W4_CODE: usize = 1_688;
+/// KV page staging (`KVST` 1, B 1 builds without a ring): a unit PE's
+/// bytes, and each layer past a region's first (link probe, 2026-11-04,
+/// Qwen3-14B u4 B 1: KVST 1 against 0, grid 864 B, RNL 2 region 976 B).
+pub const KVST_BYTES: usize = 864;
+pub const KVST_LAYER_BYTES: usize = 112;
+
+/// serve8b_region's head PE (`head_pe.csl`, HEADMODE 2, MODE 0, untied, no
+/// VM block) at `vr` vocab rows and the grid's `hc` (the head holds 2 `hc`
+/// dims a row): the bf16 rows, the per-row f32 vectors, the max-by-halving
+/// scratch (`VP`, `vr` padded to a power of two), the kept logits rows
+/// (`hlb` lanes) and, on a ring of `mmax` micro-batches, the pipe's code and
+/// per-lane state. Link probes (2026-11-04, Qwen3-14B u4 pipe x12, B 1,
+/// `vr` 64-140, `hc` 29-36: this bounds every probe, at most ~370 B high).
+#[must_use]
+pub fn head_bytes(vr: usize, hc: usize, lanes: usize, hlb: usize, mmax: Option<usize>) -> usize {
+    let vp = vr.next_power_of_two().max(32);
+    let pipe = mmax.map_or(0, |m| HEAD_PIPE + 4 * m * lanes);
+    HEAD_FIXED + vr * (4 * hc + 20) + 60 * hc + 8 * vp + 4 * vr * hlb.saturating_sub(1) + pipe
+}
+
+/// The final root's head PE: [`head_bytes`] and its forced and argmax token
+/// rows (`in_tokens`, `out_tokens`: `mmax` x `lanes` x `cap` u32 each; probe:
+/// the Qwen3-14B pipe x12 final root at CAP 32, 49,408 B, overflowed the
+/// PE, which no grid, region or plain head probe showed; 0427, 0428).
+#[must_use]
+pub fn final_root_bytes(
+    vr: usize,
+    hc: usize,
+    lanes: usize,
+    hlb: usize,
+    mmax: Option<usize>,
+    cap: usize,
+) -> usize {
+    head_bytes(vr, hc, lanes, hlb, mmax) + 8 * mmax.unwrap_or(1) * lanes * cap
+}
+
+/// [`head_bytes`]' constant (code, runtime and the small buffers) and the
+/// ring's part over one shape's B 1 head (45,808 B unpiped, 46,320 at MMAX 12).
+pub const HEAD_FIXED: usize = 20_288;
+pub const HEAD_PIPE: usize = 464;
+
+impl Grid {
+    /// The KV staging slots' bytes on a unit PE of `nl` layers.
+    pub fn staging_bytes(nl: usize) -> usize {
+        KVST_BYTES + nl.saturating_sub(1) * KVST_LAYER_BYTES
     }
 }
 
@@ -1101,12 +1190,13 @@ mod tests {
             let (pu, pb) = (plan(&u, Goals::lanes(1)), plan(&b, Goals::lanes(1)));
             assert!(pu.grid.w4 && !pb.grid.w4);
             assert_eq!(pu.family, Family::Paged8b);
-            // On the bf16 grid the u4 tiles and their decode scratch take
-            // less than the bf16 tiles, and the u4 grid has fewer rows;
-            // except where the u4 per-PE overhead (the decoded plane, the
-            // groups' accumulators and scales: they scale with a PE's
-            // outputs, not its Hc) outweighs the codes: Qwen3-32B (Ic 200,
-            // Hc 10 at 512 rows) plans more rows in u4 than in bf16.
+            // On the bf16 grid the u4 tiles and their decode scratch (a
+            // constant now) take less than the bf16 tiles, and the u4 grid
+            // has fewer rows; except at Qwen3-32B's 400 rows (Hc 13, so the
+            // fewest rows the planner looks for are tiny tiles): every PE of
+            // a group's rows keeps the group's scales and biases for its
+            // outputs, 8 bytes an output a group at Hc < 64 against Hc / 2
+            // of codes, and with the u4 code's bytes it plans more rows.
             let on_bf16 = Grid { w4: true, ..pb.grid };
             let smaller = on_bf16.weight_bytes() < pb.grid.weight_bytes();
             assert_eq!(smaller, id != "qwen3-32b", "{id}");
@@ -1192,8 +1282,19 @@ mod tests {
                 let g = &p.grid;
                 match super::super::build::program(&p, &cfg) {
                     Ok(spec) => println!(
-                        "FIT {name}: grid {}x{} Hc {} bytes {} -> {:?} {:?}",
-                        g.px, g.py, g.hc, p.grid_bytes, spec.design, spec.rectangle()
+                        "FIT {name}: plan grid {}x{} Hc {} bytes {} -> {:?} {:?} {:?} {:?}",
+                        g.px, g.py, g.hc, p.grid_bytes, spec.design, spec.rectangle(),
+                        match &spec.layers {
+                            super::super::program::Layers::Units { grid, .. } => format!("grid {}x{} Hc {}", grid.px, grid.py, grid.hc),
+                            _ => String::new(),
+                        },
+                        match &spec.layers {
+                            super::super::program::Layers::Units { units, .. } => format!(
+                                "regions {}x{} RNL {} RC {} RR {} NCOL {} RHc {} RIc {}",
+                                units.rpx, units.rpy, units.rnl, units.rc, units.rr, units.ncol, units.rhc, units.ric
+                            ),
+                            _ => String::new(),
+                        }
                     ),
                     Err(e) => println!(
                         "FIT {name}: grid {}x{} Hc {} bytes {} -> {e}",
@@ -1202,6 +1303,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// u4g64 feasibility of the 27B-31B class on serve8b_region
+    /// (`--nocapture`): each model as a Qwen3-style dense stand-in of the
+    /// same per-layer u4 bytes (head_dim 128; attention rows the shape allows,
+    /// the rest of the projections folded into `inter`), its own vocab and
+    /// tying, then at Qwen3's vocab (the head alone), at B 1 and on the ring,
+    /// the fewest KV blocks. See U4G64-README "Other u4 models".
+    #[test]
+    #[ignore]
+    fn u4_feasibility_print() {
+        let base = spec("qwen3-14b-u4g64-kv-bf16").expect("14b");
+        // (name, hidden, layers, q, kv, inter, vocab, tied)
+        let models = [
+            ("qwen3-14b", 5120, 40, 40, 8, 17408, 151_936, false),
+            ("qwen36-27b", 5120, 64, 48, 8, 20680, 248_320, false),
+            ("gemma4-12b", 3840, 48, 40, 8, 15648, 262_144, true),
+            ("gemma4-31b", 5376, 60, 72, 8, 23552, 262_144, true),
+            ("muse-glimmer-30b", 6656, 52, 32, 8, 20824, 202_048, false),
+            ("qwen3-32b", 5120, 64, 64, 8, 25600, 151_936, false),
+        ];
+        for (name, hidden, layers, q, kv, inter, vocab, tied) in models {
+            for v in [vocab, 151_936] {
+                for pipeline in [false, true] {
+                    let s = ModelSpec {
+                        name: format!("{name}-u4g64"),
+                        hidden,
+                        layers,
+                        q_heads: q,
+                        kv_heads: kv,
+                        inter,
+                        vocab: v,
+                        tied,
+                        ..base.clone()
+                    };
+                    let goals = Goals {
+                        lanes: 1,
+                        grid_lanes: 1,
+                        host_copy: true,
+                        pipeline,
+                        blocks: Some(1),
+                        ..Goals::default()
+                    };
+                    let tag = format!("{name} vocab {v} pipe {}", u8::from(pipeline));
+                    // The planner's head2d gate is not serve8b_region's head
+                    // (`build::place_at` sizes that): plan at a small vocab, then
+                    // place at the model's.
+                    let small = ModelSpec { vocab: 32_000, ..s.clone() };
+                    let p = match SpatialPlan::derive(&small, WaferDims::CS3, goals) {
+                        Ok(p) => SpatialPlan { vocab: v, ..p },
+                        Err(e) => {
+                            println!("FEAS {tag}: no plan: {e}");
+                            continue;
+                        }
+                    };
+                    if v == vocab && !pipeline {
+                        // A grid PE's bytes by part, at the plan's grid.
+                        let g = &p.grid;
+                        let elems = g.hc * ((2 * g.qh + 2) * g.dc + 3 * g.ic);
+                        let ideal = elems * 9 / 16;
+                        let codes = elems / 2;
+                        println!(
+                            "PARTS {name}: grid {}x{} Hc {} Ic {}: u4 tiles+scratch {} B (codes {codes}, codes+scales {ideal}), tables {}, KV block {}, lane {}, total {}",
+                            g.px, g.py, g.hc, g.ic, g.weight_bytes(), g.table_bytes(), g.block_bytes(),
+                            g.lane_bytes(), g.bytes(false)
+                        );
+                    }
+                    let mut cfg = super::super::build::ServeConfig::new(goals);
+                    cfg.region = true;
+                    match super::super::build::params(&p, &cfg) {
+                        Ok((d, kv)) => {
+                            let get = |k: &str| {
+                                kv.iter().find(|(n, _)| *n == k).map_or(String::new(), |(_, v)| v.to_string())
+                            };
+                            println!(
+                                "FEAS {tag}: {d:?} grid {}x{} Hc {} Ic {}, regions {}x{} RNL {} {}x{}, NCOL {}, NB {}, Vr {}, CAP {}",
+                                get("PX"), get("PY"), get("Hc"), get("Ic"), get("RPX"), get("RPY"),
+                                get("RNL"), get("RC"), get("RR"), get("NCOL"), get("NB"), get("Vr"), get("CAP")
+                            );
+                        }
+                        Err(e) => println!(
+                            "FEAS {tag}: {e}\n  closest: {}",
+                            super::super::build::placement_report(&p, pipeline)
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A model's serve8b_region params at B 1 (`PARAMS_OF=<name>`,
+    /// `--nocapture`): the request's `extra`.
+    #[test]
+    #[ignore]
+    fn region_params_print() {
+        let name = std::env::var("PARAMS_OF").expect("PARAMS_OF");
+        let s = spec(&name).expect("spec");
+        let pipeline = std::env::var("PIPE").is_ok_and(|v| v == "1");
+        let grid_lanes = std::env::var("GRID_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let goals = Goals { lanes: 1, grid_lanes, host_copy: true, pipeline, ..Goals::default() };
+        let p = plan(&s, goals);
+        let mut cfg = super::super::build::ServeConfig::new(goals);
+        cfg.region = true;
+        let (d, kv) = super::super::build::params(&p, &cfg).expect("params");
+        let spec = super::super::program::ProgramSpec::from_params(d, &kv).expect("spec");
+        println!("PARAMS {:?} {:?} {}", d, spec.rectangle(), kv.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(","));
     }
 
     /// The unit PE bytes behind a 14B/32B u4 layout (`--nocapture`): the
@@ -1237,6 +1444,28 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+        }
+    }
+
+    /// The byte model at given unit shapes (`GRID_AT=hidden,inter,qh,py,ic`,
+    /// `--nocapture`), to compare with a link probe's image sizes.
+    #[test]
+    #[ignore]
+    fn grid_bytes_at() {
+        let v: Vec<usize> = std::env::var("GRID_AT")
+            .expect("GRID_AT")
+            .split(',')
+            .map(|x| x.parse().unwrap())
+            .collect();
+        let s = spec("qwen3-14b-u4g64-kv-bf16").unwrap();
+        let goals = Goals { lanes: 1, grid_lanes: 1, host_copy: true, blocks: Some(1), ..Goals::default() };
+        let g = Grid { hidden: v[0], hc: v[0].div_ceil(v[3]), qh: v[2], py: v[3], ic: v[4], ..SpatialPlan::grid(&s, 128, v[3], true, &goals) };
+        let _ = v[1];
+        println!("BYTES grid {} (u4 {}) region nl1 {} layer {}", g.bytes(false), g.weight_bytes(), g.region_bytes(1, false), g.layer_bytes());
+        // GRID_AT=...,px,dc,gs,nl: a region of those
+        if v.len() > 5 {
+            let r = Grid { px: v[5], dc: v[6], gs: v[7], ..g };
+            println!("BYTES region {}x{} nl {} = {} ring {} (grid ring {})", r.px, r.py, v[8], r.region_bytes(v[8], false), r.region_bytes(v[8], true), g.bytes(true));
         }
     }
 

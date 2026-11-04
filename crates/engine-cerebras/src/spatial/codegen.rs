@@ -2279,7 +2279,7 @@ fn w4_unit(src: &str, tag: &str, layers: &str) -> R<String> {
     for (old, new) in [
         (
             "wmv(at(qh_dsd, b * NH * DHc), wqa_dsd, xb, Hc, sc_s);",
-            "wmv4(at(qh_dsd, b * NH * DHc), 0, xb, sc_s);",
+            "if (W4F) {\n      wmv4(qkv_all, 0, xb, sc_s);\n    } else {\n    wmv4(at(qh_dsd, b * NH * DHc), 0, xb, sc_s);",
         ),
         (
             "wmv(at(qh_dsd, QH + b * NH * DHc), wqv_dsd, xb, Hc, sc_s);",
@@ -2287,7 +2287,7 @@ fn w4_unit(src: &str, tag: &str, layers: &str) -> R<String> {
         ),
         (
             "wmv(at(v_dsd, b * Dc), wv_dsd, xb, Hc, sc_s);",
-            "wmv4(at(v_dsd, b * Dc), 2, xb, sc_s);",
+            "wmv4(at(v_dsd, b * Dc), 2, xb, sc_s);\n    }",
         ),
         (
             "wmv(at(hv_dsd, b * Hc), wo_dsd, at(ob_dsd, b * QO), QO, sc_s);",
@@ -2646,7 +2646,8 @@ mod tests {
                 assert_eq!(n, m);
                 match *n {
                     "grid_pe.csl" | "region_pe.csl" => {
-                        assert!(b.matches("wmv(").count() == 1 && b.matches("wmv4(").count() == 7, "{n}");
+                        assert!(b.matches("wmv(").count() == 1 && b.matches("wmv4(").count() == 8, "{n}");
+                        assert!(b.contains("wmv4(qkv_all, 0, xb, sc_s);"), "{n}");
                         assert!(b.contains("var wqa: [W4B0 + 1]WS"), "{n}");
                         assert_eq!(b.contains("w4lay = l;"), *n == "region_pe.csl", "{n}");
                     }

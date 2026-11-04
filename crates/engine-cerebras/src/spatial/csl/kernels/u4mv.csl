@@ -15,8 +15,8 @@
 // Memory past the codes and scales is a constant: a segment's rows decode into
 // one buffer of W4BUFW words (K(m) = W4BUFW / (N + 1) rows), one accumulator
 // of N + 1 (a group's epilogue runs when the next group starts), and the x
-// parts of planes 1 and 2 (planes 0 and 3 read xpart); the buffer also holds
-// the epilogue's widened scales.
+// parts of planes 1 and 2 (planes 0 and 3 read xpart), and a group's scales
+// widened to f32 (N).
 // Matrices m: 0 wqa, 1 wqv, 2 wv, 3 wo, 4 wgu, 5 wd.
 const W4DH: u16 = Dc / 2;
 const W4HD: u16 = Gs * Dc;
@@ -31,8 +31,12 @@ fn w4runs(n: u16) u16 {
 const W4GH: u16 = w4runs(Hc);
 const W4GD: u16 = w4runs(Ic);
 const W4GO: u16 = if (64 % W4DH == 0 and (W4HD / 2) % 64 == 0) 2 * Qh else 2 * Qh * w4runs(W4DH);
+// B 1 (W4F): wqa, wqv and wv are one tile [wqa | wqv | wv], one matvec into
+// qkv (their outputs are contiguous there at B 1: q and k first halves,
+// second halves, v); the wqv and wv symbols are one word past the pad.
+const W4F: bool = B == 1;
 const W4Rv = [6]u16 { Hc, Hc, Hc, Qh * Dc, Hc, Ic };
-const W4Nv = [6]u16 { (Qh + 1) * W4DH, (Qh + 1) * W4DH, Dc, Hc, 2 * Ic, Hc };
+const W4Nv = [6]u16 { if (W4F) 2 * (Qh + 1) * W4DH + Dc else (Qh + 1) * W4DH, (Qh + 1) * W4DH, Dc, Hc, 2 * Ic, Hc };
 const W4Gv = [6]u16 { W4GH, W4GH, W4GH, W4GO, W4GH, W4GD };
 fn w4p(m: u16) u16 { return (W4Rv[m] + 3) / 4; }
 // The decode buffer's budget (u16 words; spatial::u4::BUF_WORDS).
@@ -49,7 +53,10 @@ fn w4segs(m: u16) u16 { return 4 * ((w4p(m) + w4k(m) - 1) / w4k(m)) + W4Gv[m] - 
 // Header words, a layer's words, a symbol's words (without the pad).
 fn w4hdr(m: u16) u16 { return 2 + 4 * w4segs(m); }
 fn w4lw(m: u16) u16 { return w4p(m) * (W4Nv[m] + 1) + 2 * W4Gv[m] * W4Nv[m]; }
-fn w4blob_words(m: u16) u16 { return w4hdr(m) + W4L * w4lw(m); }
+fn w4blob_words(m: u16) u16 {
+  if (W4F and (m == 1 or m == 2)) { return 1; }
+  return w4hdr(m) + W4L * w4lw(m);
+}
 // The same per matrix as tables (wmv4's m is a runtime value: no divisions there).
 const W4Pv = [6]u16 { w4p(0), w4p(1), w4p(2), w4p(3), w4p(4), w4p(5) };
 const W4Hv = [6]u16 { w4hdr(0), w4hdr(1), w4hdr(2), w4hdr(3), w4hdr(4), w4hdr(5) };
@@ -64,8 +71,7 @@ const W4B4: u16 = w4blob_words(4);
 const W4B5: u16 = w4blob_words(5);
 fn w4bw(m: u16) u16 { return w4k(m) * (W4Nv[m] + 1); }
 const W4NM: u16 = w4mx(w4mx(W4Nv[0], W4Nv[3]), W4Nv[4]);
-// The buffer also holds a group's scales and biases widened to f32 (4 N words).
-const W4PL: u16 = w4mx(w4mx(w4mx(w4mx(w4bw(0), w4bw(2)), w4mx(w4bw(3), w4bw(4))), w4bw(5)), 4 * W4NM);
+const W4PL: u16 = w4mx(w4mx(w4mx(w4bw(0), w4bw(2)), w4mx(w4bw(3), w4bw(4))), w4bw(5));
 const W4AC: u16 = w4mx(W4NM, w4mx(W4Nv[2], W4Nv[5])) + 1;
 //@@ fns
 // u4 scratch: the segment's decoded rows (u16 codes, then bf16 in place), one
@@ -76,11 +82,12 @@ var w4pl: [W4PL + 1]u16 align(16) = @zeros([W4PL + 1]u16);
 var w4acc: [W4AC]f32 align(16) = @zeros([W4AC]f32);
 const W4XP: u16 = NP * XMAX;
 var w4xp = @zeros([2 * W4XP]@fp16());
-// The buffer as f32 (a group's [scales | biases] widened in the epilogue: the
-// widen is 0 + h * 1, exact). A zero-stride zero source instead of the
-// zeroing crashed the simulator once the scratch sat above byte 0x8000.
+// A group's scales widened to f32: the u16 high halves (one mov16); the low
+// halves stay zero.
+var w4sf: [2 * W4NM]u16 align(16) = @zeros([2 * W4NM]u16);
 var w4fdummy = @zeros([1]f32);
-var w4f_d = @get_dsd(mem1d_dsd, .{ .base_address = &w4fdummy, .extent = 2 * W4NM });
+const w4sf_u = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{W4NM} -> w4sf[2 * i + 1] });
+var w4sf_f = @get_dsd(mem1d_dsd, .{ .base_address = &w4fdummy, .extent = W4NM });
 var w4lay: u16 = 0;                   // the unit's current layer
 var w4pl_u = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{W4PL} -> w4pl[i + 1] });
 var w4pl_h = @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = W4PL });
@@ -92,7 +99,7 @@ const w4mask = [3]u16 { 0x000f, 0x00f0, 0x0f00 };
 const w4inv = [3]f32 { 1.0, 0.0625, 0.00390625 };
 fn w4_rebase() void {
   w4pl_h = @set_dsd_base_addr(w4pl_h, @ptrcast([*]@fp16(), &w4pl[1]));
-  w4f_d = @set_dsd_base_addr(w4f_d, @ptrcast([*]f32, &w4pl[0]));
+  w4sf_f = @set_dsd_base_addr(w4sf_f, @ptrcast([*]f32, &w4sf));
 }
 fn w4blob(m: u16) [*]u16 {
   if (m == 0) { return @ptrcast([*]u16, &wqa[1]); }
@@ -121,22 +128,27 @@ fn w4part(pk: u16, k: u16, r0: u16, ln: u16) mem1d_dsd {
   }
   return @set_dsd_length(@increment_dsd_offset(xpart_dsd, @as(i16, k * XMAX + r0), @fp16()), ln);
 }
-// y += s_g acc + b_g sum_g(x); so: group g's [scales | biases]. Runs between
-// segments, so the decode buffer is free for the widened [s | b].
+// y += s_g acc + b_g sum_g(x) (the sum in two bf16 parts); so: group g's
+// [scales | biases].
 fn w4epi(y: mem1d_dsd, bp: [*]u16, so: u16, N: u16) void {
-  const sbf = @set_dsd_length(w4f_d, 2 * N);
-  @fmovs(sbf, 0.0);
-  @fmachs(sbf, sbf, w4ath(bp, so, 2 * N), @as(@fp16(), 1.0));
   const accg = @set_dsd_length(w4acc_d, N);
-  @fmuls(accg, accg, @set_dsd_length(w4f_d, N));
+  @mov16(@set_dsd_length(w4sf_u, N), w4at(bp, so, N));
+  @fmuls(accg, accg, @set_dsd_length(w4sf_f, N));
   @fadds(y, y, accg);
-  @fmacs(y, y, @set_dsd_length(@increment_dsd_offset(w4f_d, @as(i16, N), f32), N), w4acc[N]);
+  const xs = w4acc[N];
+  const hi = @as(@fp16(), xs);
+  const lo = @as(@fp16(), xs - @as(f32, hi));
+  const bd = w4ath(bp, so + N, N);
+  @fmachs(y, y, bd, hi);
+  @fmachs(y, y, bd, lo);
 }
-// y += A x for matrix m's u4 tile (x: its R rows; scr: 2R f32 words). wqv
-// and wv (m 1, 2) follow wqa on the same x: they reuse its parts.
-fn wmv4(y: mem1d_dsd, m: u16, xv: mem1d_dsd, scr: mem1d_dsd) void {
+// y += A x for matrix m's u4 tile (x: its R rows; scr: 2R f32 words; y's
+// first N words). wqv and wv (m 1, 2) follow wqa on the same x: they reuse
+// its parts.
+fn wmv4(y0: mem1d_dsd, m: u16, xv: mem1d_dsd, scr: mem1d_dsd) void {
   const R = W4Rv[m];
   const N = W4Nv[m];
+  const y = @set_dsd_length(y0, N);
   const N1 = N + 1;
   const bp = w4blob(m);
   @mov16(@set_dsd_length(w4hd_d, W4Hv[m]), w4at(bp, 0, W4Hv[m]));

@@ -163,7 +163,7 @@ impl Tile {
     /// group starts.
     #[must_use]
     pub fn segs(&self) -> usize {
-        4 * self.planes().div_ceil(self.chunk()) + self.g - 1
+        (4 * self.planes().div_ceil(self.chunk()) + self.g).saturating_sub(1)
     }
     #[must_use]
     pub fn header(&self) -> usize {
@@ -173,9 +173,13 @@ impl Tile {
     pub fn layer_words(&self) -> usize {
         self.planes() * (self.n + 1) + 2 * self.g * self.n
     }
-    /// The symbol's u16 words past its pad, for `nl` layers.
+    /// The symbol's u16 words past its pad, for `nl` layers (none for an
+    /// absent tile: wqv and wv when fused into wqa).
     #[must_use]
     pub fn words(&self, nl: usize) -> usize {
+        if self.r == 0 {
+            return 0;
+        }
         self.header() + nl * self.layer_words()
     }
 }
@@ -195,8 +199,9 @@ fn run_groups(n: usize) -> usize {
 /// The six tiles of a unit PE (`wqa wqv wv wo wgu wd`), as `u4mv.csl`
 /// sizes them: `hc` hidden dims a row, `dc` kv dims a column (`gs`
 /// columns a head), `qh` query heads a kv head, `ic` intermediate dims.
+/// `fused` (B 1, `W4F`): wqa is `[wqa | wqv | wv]`, wqv and wv are absent.
 #[must_use]
-pub fn tiles(hc: usize, dc: usize, gs: usize, qh: usize, ic: usize) -> [Tile; 6] {
+pub fn tiles(hc: usize, dc: usize, gs: usize, qh: usize, ic: usize, fused: bool) -> [Tile; 6] {
     let dh = dc / 2;
     let hd = gs * dc;
     let gh = run_groups(hc);
@@ -210,10 +215,23 @@ pub fn tiles(hc: usize, dc: usize, gs: usize, qh: usize, ic: usize) -> [Tile; 6]
         n: (qh + 1) * dh,
         g: gh,
     };
+    let none = Tile { r: 0, n: 0, g: 0 };
+    let (qa, qv, v) = if fused {
+        (
+            Tile {
+                n: 2 * (qh + 1) * dh + dc,
+                ..qk
+            },
+            none,
+            none,
+        )
+    } else {
+        (qk, qk, Tile { r: hc, n: dc, g: gh })
+    };
     [
-        qk,
-        qk,
-        Tile { r: hc, n: dc, g: gh },
+        qa,
+        qv,
+        v,
         Tile {
             r: qh * dc,
             n: hc,
@@ -235,15 +253,23 @@ pub fn tiles(hc: usize, dc: usize, gs: usize, qh: usize, ic: usize) -> [Tile; 6]
 /// Bytes a unit PE's u4 weights and u4 scratch take for `nl` layers (the
 /// planner's byte model; the bf16 tiles' `2 · elements` otherwise).
 #[must_use]
-pub fn pe_bytes(hc: usize, dc: usize, gs: usize, qh: usize, ic: usize, nl: usize) -> usize {
-    let t = tiles(hc, dc, gs, qh, ic);
+pub fn pe_bytes(
+    hc: usize,
+    dc: usize,
+    gs: usize,
+    qh: usize,
+    ic: usize,
+    nl: usize,
+    fused: bool,
+) -> usize {
+    let t = tiles(hc, dc, gs, qh, ic, fused);
     let symbols: usize = t.iter().map(|t| 2 * (t.words(nl) + 1)).sum();
     let nmax = t.iter().map(|t| t.n).max().unwrap_or(0);
-    let buf = t.iter().map(|t| t.chunk() * (t.n + 1)).max().unwrap_or(0).max(4 * nmax);
+    let buf = t.iter().map(|t| t.chunk() * (t.n + 1)).max().unwrap_or(0);
     let xmax = hc.max(qh * dc).max(ic);
-    // The decode buffer (also a group's widened scales), one accumulator,
-    // x's parts for planes 1 and 2 (NP 1).
-    symbols + 2 * (buf + 1) + 4 * (nmax + 1) + 2 * 2 * xmax
+    // The decode buffer, one accumulator, a group's widened scales, x's
+    // parts for planes 1 and 2 (NP 1).
+    symbols + 2 * (buf + 1) + 4 * (nmax + 1) + 4 * nmax + 2 * 2 * xmax
 }
 
 /// A tile's column: output row `o` of a quantized matrix, or padding.
@@ -432,7 +458,8 @@ pub(crate) fn place_unit(
     let (d, dh, nh) = (gs * dc, dc / 2, qh + 1);
     let nkv = pxn / gs;
     let (nq, inter) = (nkv * qh, pxn * ic);
-    let t = tiles(hc, dc, gs, qh, ic);
+    let fused = lay.paged().is_some_and(|s| s.lanes == 1);
+    let t = tiles(hc, dc, gs, qh, ic, fused);
     let name = |l: usize, w: &str| format!("layers.{l}.{w}");
     let mats = |w: &str, rows: usize, cols: usize| -> R<Vec<Q4>> {
         layers
@@ -453,39 +480,53 @@ pub(crate) fn place_unit(
     };
     let wq = mats("q", nq * d, hid)?;
     let wk = mats("k", nkv * d, hid)?;
-    for (m, half) in [(0usize, 0usize), (1, dh)] {
-        let sym = ["wqa", "wqv"][m];
-        put(dev, sym, t[m], &|py, px| {
-            let (g, dl) = (px / gs, dl(px));
+    let wv = mats("v", nkv * d, hid)?;
+    // Layer li's columns of wqa (half 0) or wqv (half dh): the q heads' and
+    // k's dims of that RoPE half; of wv: v's dims.
+    let qk_cols = |li: usize, px: usize, half: usize| -> Vec<Col<'_>> {
+        let (g, dl) = (px / gs, dl(px));
+        (0..nh)
+            .flat_map(|h| (0..dh).map(move |i| (h, i)))
+            .map(|(h, i)| {
+                let dd = dl[half + i];
+                Some(if h < qh {
+                    (&wq[li], (g * qh + h) * d + dd)
+                } else {
+                    (&wk[li], g * d + dd)
+                })
+            })
+            .collect()
+    };
+    let v_cols = |li: usize, px: usize| -> Vec<Col<'_>> {
+        let g = px / gs;
+        dl(px).iter().map(|&dd| Some((&wv[li], g * d + dd))).collect()
+    };
+    if fused {
+        put(dev, "wqa", t[0], &|py, px| {
             let cols = (0..nl)
                 .map(|li| {
-                    (0..nh)
-                        .flat_map(|h| (0..dh).map(move |i| (h, i)))
-                        .map(|(h, i)| {
-                            let dd = dl[half + i];
-                            Some(if h < qh {
-                                (&wq[li], (g * qh + h) * d + dd)
-                            } else {
-                                (&wk[li], g * d + dd)
-                            })
-                        })
-                        .collect()
+                    let mut c = qk_cols(li, px, 0);
+                    c.extend(qk_cols(li, px, dh));
+                    c.extend(v_cols(li, px));
+                    c
                 })
                 .collect();
             (hidden_rows(py), cols)
         })?;
+    } else {
+        for (m, half) in [(0usize, 0usize), (1, dh)] {
+            let sym = ["wqa", "wqv"][m];
+            put(dev, sym, t[m], &|py, px| {
+                let cols = (0..nl).map(|li| qk_cols(li, px, half)).collect();
+                (hidden_rows(py), cols)
+            })?;
+        }
+        put(dev, "wv", t[2], &|py, px| {
+            let cols = (0..nl).map(|li| v_cols(li, px)).collect();
+            (hidden_rows(py), cols)
+        })?;
     }
-    drop((wq, wk));
-    let wv = mats("v", nkv * d, hid)?;
-    put(dev, "wv", t[2], &|py, px| {
-        let (g, dl) = (px / gs, dl(px));
-        let cols = wv
-            .iter()
-            .map(|w| dl.iter().map(|&dd| Some((w, g * d + dd))).collect())
-            .collect();
-        (hidden_rows(py), cols)
-    })?;
-    drop(wv);
+    drop((wq, wk, wv));
     let wo = mats("o", hid, nq * d)?;
     put(dev, "wo", t[3], &|py, px| {
         let (g, dl) = (px / gs, dl(px));
@@ -618,87 +659,108 @@ mod tests {
     /// Qwen3-8B's grid and region tiles; the O rows' groups.
     #[test]
     fn tiles_of_the_8b_units() {
-        let g = tiles(29, 8, 16, 4, 96);
+        let g = tiles(29, 8, 16, 4, 96, false);
         assert_eq!(g[3], Tile { r: 32, n: 29, g: 8 });
         assert_eq!((g[0].g, g[5].g), (2, 3));
-        let r = tiles(18, 4, 32, 4, 48);
+        let r = tiles(18, 4, 32, 4, 48, false);
         assert_eq!(r[3], Tile { r: 16, n: 18, g: 8 });
         // u4 vs bf16 bytes a grid PE (weights only).
         let bf16 = 2 * 29 * ((2 * 4 + 2) * 8 + 3 * 96);
-        let u4 = pe_bytes(29, 8, 16, 4, 96, 1);
+        let u4 = pe_bytes(29, 8, 16, 4, 96, 1, false);
+        // Fused at B 1: one tile of all three, the same codes.
+        let f = tiles(29, 8, 16, 4, 96, true);
+        assert_eq!((f[0].n, f[1].words(1), f[2].words(1)), (48, 0, 0));
         assert!(u4 < bf16, "{u4} {bf16}");
     }
 
     /// serve8b_region's placement in u4 (W4 1) holds, PE by PE, every
     /// entry of its bf16 placement's tiles (within a quantization step):
-    /// the same rows and columns in every unit, layer and matrix.
+    /// the same rows and columns in every unit, layer and matrix; at B 1
+    /// wqa's tile is the bf16 wqa, wqv and wv tiles side by side.
     #[test]
     fn u4_units_hold_the_bf16_tiles() {
         use super::super::codegen::Design;
         use super::super::device::{Device, Recorder};
         use super::super::program::{Layers, ProgramSpec};
         use super::super::wafer::rect;
-        let base = "PX:8,PY:16,Hc:4,Dc:8,Gs:8,Ic:24,RPX:16,RPY:24,RHc:3,RDc:4,RGs:16,RIc:12,RNL:2,\
-            RGY:8,RC:2,RR:2,NCOL:2,RTR:5,HR:64,Qh:4,PS:4,NB:2,E:2,B:2,MC:1,W16:1,NP:1,KV16:1,KVCP:0,\
-            PROF:0,TIME:0,HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:32,Vr:32,Gx:4,Gy:8,vocab:1000,\
-            PASSES:3,MODE:0,OVL:0,VMC:1,CAP:16,iters:1";
-        let kv = |s: &str| -> Vec<(String, String)> {
-            s.split(',')
-                .filter_map(|p| p.split_once(':'))
-                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-                .collect()
-        };
-        let bf = ProgramSpec::from_params(Design::Serve8bRegion, &kv(base)).unwrap();
-        let w4 = ProgramSpec::from_params(Design::Serve8bRegion, &kv(&format!("{base},W4:1")))
-            .unwrap();
-        assert!(w4.weights_u4() && !bf.weights_u4());
-        let Layers::Units { units, .. } = &bf.layers else {
-            panic!("units")
-        };
-        let ckpt = Ckpt::synthetic(super::super::golden::shapes(&bf, true));
-        let rope = super::super::wafer::Rotary::theta(1.0e6);
-        let (mut a, mut b) = (Recorder::default(), Recorder::default());
-        super::super::serve8b_region::place_layers(&bf, units, &ckpt, &rope, &mut a).unwrap();
-        super::super::serve8b_region::place_layers(&w4, units, &ckpt, &rope, &mut b).unwrap();
-        let mut checked = 0;
-        for v in units.units(&bf) {
-            let k = v.k;
-            let nl = v.layers.len();
-            let t = tiles(k.hc, k.dc, k.gs, bf.qh(), k.ic);
-            for (m, sym) in ["wqa", "wqv", "wv", "wo", "wgu", "wd"].iter().enumerate() {
-                let elems = t[m].r * t[m].n;
+        for b in [2, 1] {
+            let base = format!(
+                "PX:8,PY:16,Hc:4,Dc:8,Gs:8,Ic:24,RPX:16,RPY:24,RHc:3,RDc:4,RGs:16,RIc:12,RNL:2,\
+                RGY:8,RC:2,RR:2,NCOL:2,RTR:5,HR:64,Qh:4,PS:4,NB:2,E:2,B:{b},MC:1,W16:1,NP:1,KV16:1,KVCP:0,\
+                PROF:0,TIME:0,HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:32,Vr:32,Gx:4,Gy:8,vocab:1000,\
+                PASSES:3,MODE:0,OVL:0,VMC:1,CAP:16,iters:1"
+            );
+            let kv = |s: &str| -> Vec<(String, String)> {
+                s.split(',')
+                    .filter_map(|p| p.split_once(':'))
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                    .collect()
+            };
+            let bf = ProgramSpec::from_params(Design::Serve8bRegion, &kv(&base)).unwrap();
+            let w4 = ProgramSpec::from_params(Design::Serve8bRegion, &kv(&format!("{base},W4:1")))
+                .unwrap();
+            assert!(w4.weights_u4() && !bf.weights_u4());
+            let Layers::Units { units, .. } = &bf.layers else {
+                panic!("units")
+            };
+            let ckpt = Ckpt::synthetic(super::super::golden::shapes(&bf, true));
+            let rope = super::super::wafer::Rotary::theta(1.0e6);
+            let (mut a, mut q) = (Recorder::default(), Recorder::default());
+            super::super::serve8b_region::place_layers(&bf, units, &ckpt, &rope, &mut a).unwrap();
+            super::super::serve8b_region::place_layers(&w4, units, &ckpt, &rope, &mut q).unwrap();
+            let fused = b == 1;
+            let mut checked = 0;
+            for v in units.units(&bf) {
+                let k = v.k;
+                let nl = v.layers.len();
+                let t = tiles(k.hc, k.dc, k.gs, bf.qh(), k.ic, false);
+                let tq = tiles(k.hc, k.dc, k.gs, bf.qh(), k.ic, fused);
                 let r = rect(v.x0, v.y0, k.px, k.py);
-                let dense = a.get16(sym, r, nl * elems + 1).unwrap();
-                let quant = b.get16(sym, r, t[m].words(nl) + 1).unwrap();
-                let span = dense
-                    .iter()
-                    .map(|&w| bf16_f32(w as u16))
-                    .fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
-                let tol = f64::from(span.1 - span.0) / 15.0 * 1.05 + 1e-6;
-                for pe in 0..k.px * k.py {
-                    let d = &dense[pe * (nl * elems + 1) + 1..(pe + 1) * (nl * elems + 1)];
-                    let q = &quant[pe * (t[m].words(nl) + 1) + 1..(pe + 1) * (t[m].words(nl) + 1)];
-                    for l in 0..nl {
-                        for row in 0..t[m].r {
-                            let mut x = vec![0f32; t[m].r];
-                            x[row] = 1.0;
-                            let y = apply(t[m], q, l, &x);
-                            for c in 0..t[m].n {
-                                let want = f64::from(bf16_f32(d[l * elems + row * t[m].n + c] as u16));
-                                assert!(
-                                    (y[c] - want).abs() <= tol,
-                                    "{sym} unit {} pe {pe} layer {l} ({row}, {c}): {} vs {want}",
-                                    v.idx,
-                                    y[c]
-                                );
-                                checked += 1;
+                let syms = ["wqa", "wqv", "wv", "wo", "wgu", "wd"];
+                // The u4 symbol holding bf16 matrix m, and its first column there.
+                let home = |m: usize| -> (usize, usize) {
+                    match m {
+                        1 if fused => (0, t[0].n),
+                        2 if fused => (0, t[0].n + t[1].n),
+                        _ => (m, 0),
+                    }
+                };
+                for (m, sym) in syms.iter().enumerate() {
+                    let (hm, c0) = home(m);
+                    let elems = t[m].r * t[m].n;
+                    let qw = tq[hm].words(nl) + 1;
+                    let dense = a.get16(sym, r, nl * elems + 1).unwrap();
+                    let quant = q.get16(syms[hm], r, qw).unwrap();
+                    let span = dense
+                        .iter()
+                        .map(|&w| bf16_f32(w as u16))
+                        .fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
+                    let tol = f64::from(span.1 - span.0) / 15.0 * 1.05 + 1e-6;
+                    for pe in 0..k.px * k.py {
+                        let d = &dense[pe * (nl * elems + 1) + 1..(pe + 1) * (nl * elems + 1)];
+                        let qb = &quant[pe * qw + 1..(pe + 1) * qw];
+                        for l in 0..nl {
+                            for row in 0..t[m].r {
+                                let mut x = vec![0f32; t[m].r];
+                                x[row] = 1.0;
+                                let y = apply(tq[hm], qb, l, &x);
+                                for c in 0..t[m].n {
+                                    let want = f64::from(bf16_f32(d[l * elems + row * t[m].n + c] as u16));
+                                    assert!(
+                                        (y[c0 + c] - want).abs() <= tol,
+                                        "B {b} {sym} unit {} pe {pe} layer {l} ({row}, {c}): {} vs {want}",
+                                        v.idx,
+                                        y[c0 + c]
+                                    );
+                                    checked += 1;
+                                }
                             }
                         }
                     }
                 }
             }
+            assert!(checked > 100_000, "{checked}");
         }
-        assert!(checked > 100_000, "{checked}");
     }
 
     /// `U4_DUMP=<ckpt dir>:<param>:<out file>`: the param quantized, written

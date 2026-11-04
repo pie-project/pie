@@ -597,6 +597,295 @@ fn serve8b(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Draft> {
     Ok(Draft { spec, stated: st })
 }
 
+/// The regions' Y phase-1 group (it must divide `RPY`).
+const RGY: usize = 16;
+
+/// serve8b_region's units: the grid (one layer a unit, the band and the
+/// column), `RC` x `RR` regions of `RPX` x `RPY` holding `RNL` layers each,
+/// and the head's rows (`hh`, `vr`, `vmc`) that go with them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Placement {
+    grid: super::plan::Grid,
+    rpx: usize,
+    rpy: usize,
+    rnl: usize,
+    rc: usize,
+    rr: usize,
+    band: usize,
+    ncol: usize,
+    hh: usize,
+    vr: usize,
+    vmc: usize,
+    /// The search's cost estimate (lower is faster; see `unit_cost`).
+    cost: usize,
+}
+
+/// A unit layer's estimated cycles: a fixed part (norms, attention,
+/// collectives), the matvecs by the PE's tile elements (u4 decode costs
+/// about 2 cycles an element on the simulator, bf16 about 0.6) and the
+/// collectives' hops. Only for ranking placements.
+fn unit_cost(g: &super::plan::Grid) -> usize {
+    let elems = g.hc * ((2 * g.qh + 2) * g.dc + 3 * g.ic);
+    let per = if g.w4 { 20 } else { 6 };
+    8000 + elems * per / 10 + 20 * (g.px + g.py)
+}
+
+/// A unit PE's image must end this far below the top of its memory (the
+/// stack is not counted by the linker).
+const STACK_MARGIN: usize = 768;
+
+/// The placement at `grid` with these regions when it fits the wafer and
+/// its PEs: the shape rules of the layout (and `program::serve8b_region`),
+/// the head beside the column, the feeder row between the grids' rows, the
+/// byte model of `plan::Grid` for grid and region PEs (`check_bytes`).
+#[allow(clippy::too_many_arguments)]
+fn place_at(
+    plan: &SpatialPlan,
+    grid: super::plan::Grid,
+    (rpx, rpy, rnl, rc, rr): (usize, usize, usize, usize, usize),
+    vm: bool,
+    ring: bool,
+    check_bytes: bool,
+    grow_head: bool,
+) -> Option<Placement> {
+    let wafer = super::plan::WaferDims::CS3;
+    let g = grid;
+    if rpx == 0 || rpy == 0 || !(rc * rpx).is_multiple_of(g.px) || !rpx.is_multiple_of(g.px) {
+        return None;
+    }
+    let wide = rpx / g.px;
+    let (rgs, ric) = (wide * g.gs, g.ic / wide);
+    let rdc = g.dc / wide;
+    if !g.py.is_multiple_of(4)
+        || !rpy.is_multiple_of(RGY)
+        || rdc * wide != g.dc
+        || !rdc.is_multiple_of(2)
+        || ric * wide != g.ic
+        || g.hidden.div_ceil(rpy) * rpy < g.hidden
+    {
+        return None;
+    }
+    let band = rc * rpx / g.px + 1;
+    let ncol = plan.layers.checked_sub(band + rc * rr * rnl)?;
+    let c = g.py / 2;
+    let (hh, vr, vmc, vw) = if vm {
+        let vr = 160;
+        let mut hh = plan.vocab.div_ceil(vr);
+        hh += hh % 2;
+        while !(4..=28).step_by(2).any(|x| (hh / 2) % x == 0) {
+            hh += 2;
+        }
+        (hh, vr, 0, 5)
+    } else {
+        // The grid column's height; with `grow_head` (option A) taller (to
+        // 2 YL at most: the feeder half above the last layer) while the
+        // strip's tiles (Vr rows of 4 Hc dims) pass STRIP_TABLE, with a
+        // feeder half F that a row group of 16-24 divides (Qwen3-8B's 1152
+        // rows hold as is; Llama's 3 column grids are short for its
+        // vocabulary). Vr even (head2d_v10's row pairs).
+        let vr_of = |hh: usize| plan.vocab.div_ceil(hh).next_multiple_of(2);
+        let fits = |hh: usize| {
+            vr_of(hh) * 4 * g.hc * 2 <= STRIP_TABLE
+                && (16..=24).step_by(2).any(|x| (hh / 2).is_multiple_of(x))
+        };
+        let mut hh = g.py * (1 + ncol);
+        if grow_head && !fits(hh) {
+            hh = (hh..(2 * g.py * ncol).min(wafer.height))
+                .step_by(2)
+                .find(|&hh| fits(hh))?;
+        }
+        (hh, vr_of(hh), 1, 0)
+    };
+    let width = rc * rpx + g.px + c + vmc + g.py / 4 + vw;
+    if c * 2 * g.hc < g.hidden {
+        return None;
+    }
+    let f = hh / 2;
+    if width > wafer.width
+        || hh + 1 > wafer.height
+        || g.py + rr * rpy > wafer.height
+        || g.py * (1 + ncol) > wafer.height
+        || f < g.py
+        || f >= g.py * ncol
+    {
+        return None;
+    }
+    let region = super::plan::Grid {
+        px: rpx,
+        py: rpy,
+        hc: g.hidden.div_ceil(rpy),
+        dc: rdc,
+        gs: rgs,
+        ic: ric,
+        ..g
+    };
+    // The deepest pool (up to the plan's) both unit kinds hold; B 1 without
+    // a ring stages KV pages (`KVST` 1, as `serve8b_region` builds it).
+    let most = wafer.pe_bytes - STACK_MARGIN;
+    let staging = |nl: usize| {
+        if g.lanes == 1 && !ring {
+            super::plan::Grid::staging_bytes(nl)
+        } else {
+            0
+        }
+    };
+    let fits = |nb: usize| {
+        let (g, r) = (
+            super::plan::Grid { blocks: nb, ..g },
+            super::plan::Grid { blocks: nb, ..region },
+        );
+        g.bytes(ring) + staging(1) <= most
+            && (rc * rr == 0 || r.region_bytes(rnl, ring) + staging(rnl) <= most)
+    };
+    // The head's PEs (no VM block): their rows at CAP 1; serve8b_region then
+    // picks the CAP the final root holds (`plan::final_root_bytes`).
+    if check_bytes
+        && !vm
+        && super::plan::final_root_bytes(vr, g.hc, g.lanes, g.lanes.min(4), ring.then_some(12), 1)
+            > most
+    {
+        return None;
+    }
+    let (g, region) = if check_bytes {
+        let nb = (1..=g.blocks).rev().find(|&nb| fits(nb))?;
+        (
+            super::plan::Grid { blocks: nb, ..g },
+            super::plan::Grid { blocks: nb, ..region },
+        )
+    } else {
+        (g, region)
+    };
+    let cost = (band + ncol) * unit_cost(&g) + rc * rr * rnl * unit_cost(&region);
+    Some(Placement {
+        grid: g,
+        rpx,
+        rpy,
+        rnl,
+        rc,
+        rr,
+        band,
+        ncol,
+        hh,
+        vr,
+        vmc,
+        cost,
+    })
+}
+
+/// serve8b_region's placement for `plan`: option A (`RC` 2, `RNL` 3, `RR`
+/// 4, `RPY` 240, regions twice the grid's width; the shape built and run
+/// for Qwen3-8B) when it takes the plan's bf16 grid; else (and for u4g64
+/// units, whose bytes a layer differ) the cheapest
+/// placement (`unit_cost`) that fits, over grids of the plan's columns and
+/// at least its rows (16-row steps), regions one or two grids wide of
+/// 16-row steps, 1 to 4 layers a region, up to 4 x 8 regions.
+/// Why no placement fits (feasibility studies): over the search's shapes
+/// that fit the wafer's geometry, the one whose worse unit kind (grid or
+/// region PE) overshoots least, at one KV block: its shape, the grid and
+/// region bytes and its head's final root at CAP 1, against the PE's room.
+#[cfg(test)]
+pub(crate) fn placement_report(plan: &SpatialPlan, ring: bool) -> String {
+    let g = plan.grid;
+    let wafer = super::plan::WaferDims::CS3;
+    let most = wafer.pe_bytes - STACK_MARGIN;
+    let mut best: Option<(isize, String)> = None;
+    for py in (g.py..=wafer.height / 2).step_by(16) {
+        let grid = super::plan::Grid {
+            py,
+            hc: g.hidden.div_ceil(py),
+            blocks: 1,
+            ..g
+        };
+        for wide in [1, 2] {
+            for rpy in (64..=wafer.height - py).step_by(16) {
+                for rnl in 1..=4 {
+                    for rc in 1..=4 {
+                        for rr in 1..=8 {
+                            let at = (wide * g.px, rpy, rnl, rc, rr);
+                            let Some(p) = place_at(plan, grid, at, false, ring, false, false) else {
+                                continue;
+                            };
+                            let r = super::plan::Grid {
+                                px: p.rpx,
+                                py: p.rpy,
+                                hc: g.hidden.div_ceil(p.rpy),
+                                dc: g.dc * g.px / p.rpx,
+                                gs: g.gs * p.rpx / g.px,
+                                ic: g.ic * g.px / p.rpx,
+                                ..p.grid
+                            };
+                            let gb = p.grid.bytes(ring);
+                            let rb = r.region_bytes(rnl, ring);
+                            let hb = super::plan::final_root_bytes(
+                                p.vr,
+                                p.grid.hc,
+                                g.lanes,
+                                g.lanes.min(4),
+                                ring.then_some(12),
+                                1,
+                            );
+                            // The units only: the head is reported, not ranked.
+                            let over = [gb, rb].iter().map(|&b| b as isize - most as isize).max().unwrap_or(0);
+                            if best.as_ref().is_none_or(|(o, _)| over < *o) {
+                                best = Some((
+                                    over,
+                                    format!(
+                                        "grid {}x{} Hc {} Ic {} {gb} B; regions {}x{} RNL {rnl} {rc}x{rr} {rb} B; NCOL {}; head Vr {} {hb} B; room {most} B (worst over {over})",
+                                        p.grid.px, p.grid.py, p.grid.hc, p.grid.ic, p.rpx, p.rpy, p.ncol, p.vr
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best.map_or_else(|| "no shape fits the wafer's geometry".into(), |(_, s)| s)
+}
+
+fn placement(plan: &SpatialPlan, vm: bool, ring: bool) -> R<Placement> {
+    let g = plan.grid;
+    if !g.w4
+        && g.dc.is_multiple_of(4)
+        && g.ic.is_multiple_of(2)
+        && let Some(p) = place_at(plan, g, (2 * g.px, 240, 3, 2, 4), vm, ring, false, true)
+    {
+        return Ok(p);
+    }
+    let wafer = super::plan::WaferDims::CS3;
+    let mut best: Option<Placement> = None;
+    for py in (g.py..=wafer.height / 2).step_by(16) {
+        let grid = super::plan::Grid {
+            py,
+            hc: g.hidden.div_ceil(py),
+            ..g
+        };
+        for wide in [1, 2] {
+            for rpy in (64..=wafer.height - py).step_by(16) {
+                for rnl in 1..=4 {
+                    for rc in 1..=4 {
+                        for rr in 1..=8 {
+                            let at = (wide * g.px, rpy, rnl, rc, rr);
+                            if let Some(p) = place_at(plan, grid, at, vm, ring, true, false)
+                                && best.is_none_or(|b| p.cost < b.cost)
+                            {
+                                best = Some(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best.ok_or_else(|| {
+        format!(
+            "{}: no serve8b_region placement of {} layers fits the wafer (grids of {} columns, regions 1-2 grids wide, 1-4 layers a region)",
+            plan.spec.name, plan.layers, g.px
+        )
+    })
+}
+
 /// serve8b_region's placement of a paged8b plan ("option A"): the
 /// plan's grid for the first and last layers (a top band of `RC RPX / PX
 /// + 1` grids, `NCOL` grids down the column beside the head) and between
@@ -617,18 +906,22 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         .pipeline
         .then(|| pipe_shape(plan.grid.lanes, cfg))
         .transpose()?;
-    let g = &plan.grid;
-    let wafer = super::plan::WaferDims::CS3;
-    let (rc, rnl, rr, rpy, rgy) = (2, 3, 4, 240, 16);
-    let (rpx, band) = (2 * g.px, 2 * 2 * g.px / g.px + 1);
-    if !g.dc.is_multiple_of(4) || !g.ic.is_multiple_of(2) || plan.layers < band + rc * rr * rnl + 1
-    {
-        return Err(format!(
-            "{}: serve8b_region's option A does not take this grid ({g:?})",
-            plan.spec.name
-        ));
-    }
-    let ncol = plan.layers - band - rc * rr * rnl;
+    let pl = placement(plan, cfg.vm.is_some(), pipe.is_some())?;
+    let Placement {
+        rpx,
+        rpy,
+        rnl,
+        rc,
+        rr,
+        band,
+        ncol,
+        hh,
+        vr,
+        vmc,
+        ..
+    } = pl;
+    let rgy = RGY;
+    let g = &pl.grid;
     let c = g.py / 2;
     // The grids' Y phase-1 group: Gs, or the largest even divisor of PY
     // below it (152 rows: 8).
@@ -637,67 +930,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         .step_by(2)
         .find(|x| g.py.is_multiple_of(*x))
         .unwrap_or(2);
-    // With an eta VM (VMX): the guest4hz VM as a 5-column block east of
-    // the strip, Vr 160 vocab rows a head PE (32 a VM column: required) and
-    // the fewest head rows HH >= vocab / Vr, even (F = HH / 2), whose feeder
-    // half F has an even row group Gy <= 28 (Gy must divide F; evenness and
-    // the cap of 28, the group the Vr 160 fits were measured at, are this
-    // plan's choices, not head2d_v10's limits); without, the head as tall
-    // as the grid column, VMC 1.
-    let (hh, vr, vmc, vw) = match cfg.vm {
-        Some(_) => {
-            let vr = 160;
-            let mut hh = plan.vocab.div_ceil(vr);
-            hh += hh % 2;
-            while !(4..=28).step_by(2).any(|x| (hh / 2) % x == 0) {
-                hh += 2;
-            }
-            (hh, vr, 0, 5)
-        }
-        None => {
-            // The grid column's height; taller (to 2 YL at most: the feeder
-            // half above the last layer) while the strip's tiles (Vr rows
-            // of 4 Hc dims) pass STRIP_TABLE, with a feeder half F that a
-            // row group of 16-24 divides (Qwen3-8B's 1152 rows hold as is;
-            // Llama's 3 column grids are short for its vocabulary).
-            // Vr even (head2d_v10's row pairs).
-            let vr_of = |hh: usize| plan.vocab.div_ceil(hh).next_multiple_of(2);
-            let fits = |hh: usize| {
-                vr_of(hh) * 4 * g.hc * 2 <= STRIP_TABLE
-                    && (16..=24).step_by(2).any(|x| (hh / 2).is_multiple_of(x))
-            };
-            let mut hh = g.py * (1 + ncol);
-            if !fits(hh) {
-                hh = (hh..(2 * g.py * ncol).min(wafer.height))
-                    .step_by(2)
-                    .find(|&hh| fits(hh))
-                    .ok_or_else(|| {
-                        format!(
-                            "{}: serve8b_region's strip holds no {}-row vocabulary beside {ncol} column grids of PY {}",
-                            plan.spec.name, plan.vocab, g.py
-                        )
-                    })?;
-            }
-            (hh, vr_of(hh), 1, 0)
-        }
-    };
-    let width = rc * rpx + g.px + c + vmc + g.py / 4 + vw;
-    if width > wafer.width || hh + 1 > wafer.height || g.py + rr * rpy > wafer.height {
-        return Err(format!(
-            "{}: serve8b_region's {width} x {} does not fit the wafer",
-            plan.spec.name,
-            hh + 1
-        ));
-    }
     let f = hh / 2;
-    if f < g.py || f >= g.py * ncol {
-        return Err(format!(
-            "{}: serve8b_region's feeder row {f} is not between the grids' {} and {}",
-            plan.spec.name,
-            g.py,
-            g.py * ncol
-        ));
-    }
     let gx = [16, 8, 4, 2]
         .into_iter()
         .find(|x| c.is_multiple_of(*x) && c / x >= 2)
@@ -726,13 +959,38 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         Some((_, pcap)) => cap.min(pcap),
         None => cap,
     };
+    // The final root's head PE holds `in_tokens`/`out_tokens` of MMAX x B x
+    // CAP (`plan::final_root_bytes`): the largest CAP (halving) that fits it.
+    let cap = if cfg.vm.is_some() {
+        cap
+    } else {
+        let hlb = g.lanes.min(4);
+        let mmax = pipe.map(|(m, _)| m);
+        let most = super::plan::WaferDims::CS3.pe_bytes - STACK_MARGIN;
+        let fits = |c: usize| {
+            super::plan::final_root_bytes(vr, g.hc, g.lanes, hlb, mmax, c) <= most
+        };
+        let mut c = cap;
+        while c > 1 && !fits(c) {
+            c /= 2;
+        }
+        if !fits(c) || (cfg.goals.cap.is_some() && c < cap) {
+            return Err(format!(
+                "serve8b_region: the final root's head PE (Vr {vr}, {} dims, B {}, MMAX {}) holds CAP {c} at most, not {cap}",
+                2 * g.hc,
+                g.lanes,
+                mmax.unwrap_or(1)
+            ));
+        }
+        c
+    };
     let units = Units {
         rpx,
         rpy,
         rhc: g.hidden.div_ceil(rpy),
-        rdc: g.dc / 2,
-        rgs: 2 * g.gs,
-        ric: g.ic / 2,
+        rdc: g.dc * g.px / rpx,
+        rgs: g.gs * rpx / g.px,
+        ric: g.ic * g.px / rpx,
         rnl,
         rc,
         rr,
