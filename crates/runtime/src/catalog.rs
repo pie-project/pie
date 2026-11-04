@@ -374,7 +374,7 @@ pub fn template_faults(catalog: &Catalog) -> Vec<Refused> {
 }
 
 pub fn catalog() -> &'static Catalog {
-    OVERLAID.get().unwrap_or(&CATALOG)
+    OVERLAID.get().unwrap_or_else(|| &CATALOG)
 }
 
 #[must_use]
