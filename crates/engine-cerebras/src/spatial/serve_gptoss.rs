@@ -14,7 +14,7 @@
 
 use super::ckpt::Ckpt;
 use super::device::Device;
-use super::moe_place::{MoeGrid, MoeLayer, pack_moe};
+use super::moe_place::{MoeGrid, MoeLayer, MoeTiles, pack_moe};
 use super::paged::{NONE, Shape};
 use super::serve8b::Kernel;
 use super::serve8b_region::{Kind, Piece, Tables, Unit, route_words};
@@ -679,6 +679,11 @@ impl MoeWeights {
 /// Layer `u.layers.start`'s MoE unit (`_moe`): moe_place's tiles, the
 /// router bf16, the post-attention norm by row.
 pub fn place_moe(gpt: &Gpt, hidden: usize, u: &Unit, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()> {
+    put_moe(hidden, u, ckpt, &moe_tiles(gpt, hidden, u, ckpt)?, dev)
+}
+
+/// Layer `u.layers.start`'s MoE tiles off the checkpoint.
+fn moe_tiles(gpt: &Gpt, hidden: usize, u: &Unit, ckpt: &Ckpt) -> R<MoeTiles> {
     let l = u.layers.start;
     let w = MoeWeights::read(ckpt, l)?;
     if w.experts != gpt.ne || w.hidden != hidden {
@@ -693,8 +698,11 @@ pub fn place_moe(gpt: &Gpt, hidden: usize, u: &Unit, ckpt: &Ckpt, dev: &mut dyn 
         hc: u.k.hc,
         ic: gpt.ic,
     };
-    let t = pack_moe(&w.layer(), g).map_err(|e| format!("layer {l}: {e}"))?;
-    drop(w);
+    pack_moe(&w.layer(), g).map_err(|e| format!("layer {l}: {e}"))
+}
+
+fn put_moe(hidden: usize, u: &Unit, ckpt: &Ckpt, t: &MoeTiles, dev: &mut dyn Device) -> R<()> {
+    let l = u.layers.start;
     let at = rect(u.x0, u.y0, u.k.px, u.k.py);
     let pes = u.k.px * u.k.py;
     let n = |v: usize| v / pes;
@@ -724,7 +732,11 @@ pub fn place_moe(gpt: &Gpt, hidden: usize, u: &Unit, ckpt: &Ckpt, dev: &mut dyn 
     })
 }
 
-/// Every unit's weights, layer by layer.
+/// Layers whose MoE tiles are built at once (a layer's experts and tiles
+/// take about 1.5 GB of host memory).
+const MOE_THREADS: usize = 3;
+
+/// Every unit's weights, `MOE_THREADS` layers' MoE tiles built at once.
 pub fn place_units(
     gpt: &Gpt,
     hidden: usize,
@@ -741,11 +753,28 @@ pub fn place_units(
             gpt.gs * gpt.dc
         ));
     }
-    for u in gpt.slots.units() {
-        match u.kind {
-            Kind::Attn => place_attn(gpt, hidden, &u, ckpt, &yarn, lanes, dev)?,
-            _ => {
-                place_moe(gpt, hidden, &u, ckpt, dev)?;
+    let units = gpt.slots.units();
+    for layers in units.chunks(2 * MOE_THREADS) {
+        let tiles: Vec<R<MoeTiles>> = std::thread::scope(|s| {
+            let jobs: Vec<_> = layers
+                .iter()
+                .filter(|u| u.kind == Kind::Moe)
+                .map(|u| s.spawn(move || moe_tiles(gpt, hidden, u, ckpt)))
+                .collect();
+            jobs.into_iter()
+                .map(|j| {
+                    j.join()
+                        .unwrap_or_else(|_| Err("a MoE tile thread panicked".into()))
+                })
+                .collect()
+        });
+        let mut tiles = tiles.into_iter();
+        for u in layers {
+            if u.kind == Kind::Attn {
+                place_attn(gpt, hidden, u, ckpt, &yarn, lanes, dev)?;
+            } else {
+                let t = tiles.next().ok_or("a MoE unit without its tiles")??;
+                put_moe(hidden, u, ckpt, &t, dev)?;
                 tracing::info!(
                     layer = u.layers.start,
                     "spatial wafer: serve_gptoss layer placed"
@@ -941,11 +970,8 @@ mod tests {
         use crate::spatial::paged::{Lane, table};
         use crate::spatial::program::{ProgramSpec, parse_params};
         let params = parse_params(MINI);
-        let spec = ProgramSpec::from_params(
-            crate::spatial::codegen::Design::ServeGptoss,
-            &params,
-        )
-        .unwrap();
+        let spec = ProgramSpec::from_params(crate::spatial::codegen::Design::ServeGptoss, &params)
+            .unwrap();
         let gpt = spec.gptoss().unwrap();
         let shape = spec.paged().unwrap();
         assert_eq!((shape.rows, shape.entries, shape.pages()), (5, 2, 10));
@@ -1058,7 +1084,10 @@ mod tests {
                 eprintln!("{c}");
             }
         }
-        assert!(calls.iter().any(|c| c.starts_with("launch compute")), "{calls:?}");
+        assert!(
+            calls.iter().any(|c| c.starts_with("launch compute")),
+            "{calls:?}"
+        );
     }
 
     /// The simulator's mini program.
