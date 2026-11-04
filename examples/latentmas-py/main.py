@@ -10,8 +10,9 @@ pass of a team goes on the team's one pipeline, so its working set never moves b
 
 Messages in (JSON), each answered with one JSON message:
 
-- `{"op": "think", "messages" | "tokens", "steps", "scale"}`: read the prompt after the context, then
-  take `steps` latent steps there. Replies `{"len", "read"}`.
+- `{"op": "think", "messages" | "tokens", "steps", "scale", "exits"}`: read the prompt after the context, then
+  take up to `steps` latent steps there, stopping early once a step's likeliest token is one of `exits`
+  (one host trip a step then). Replies `{"len", "read", "taken"}`.
 - `{"op": "say", "messages" | "tokens", "max_tokens", "temperature", "top_p", "top_k", "seed", "fresh"}`:
   read the prompt (on an empty context when `fresh`) and sample a reply. Replies
   `{"tokens", "text", "read", "len"}`.
@@ -21,6 +22,7 @@ Messages in (JSON), each answered with one JSON message:
 - `{"op": "render", "messages"}`: replies the templated `{"tokens"}`.
 - `"quit"`.
 
+`after` (token ids) is read right after the prompt, e.g. an empty thinking block.
 `messages` (`[{"role", "content"}]`) are templated here with the model's own chat template. With
 `"stream": true`, `think` sends `{"step": k}` as latent step `k` lands and `say` sends
 `{"delta": text}` as it writes, before the reply.
@@ -67,7 +69,8 @@ def render(messages: list[dict]) -> list[int]:
 
 
 def prompt(request: dict) -> list[int]:
-    return render(request["messages"]) if request.get("messages") else [int(t) for t in request["tokens"]]
+    tokens = render(request["messages"]) if request.get("messages") else [int(t) for t in request["tokens"]]
+    return tokens + [int(t) for t in request.get("after") or ()]
 
 
 def realign(h, width: int, scale: float):
@@ -86,11 +89,11 @@ def sample(logits, temperature: float, top_p: float, top_k: int, state):
     return reshape(nucleus_sample(logits * (1.0 / temperature), top_p, state), [1])
 
 
-async def drive(pipe: Pipeline, fwd: ForwardPass, budget: int, consume, wide: int) -> int:
+async def drive(pipe: Pipeline, fwd: ForwardPass, budget: int, consume, wide: int, window: int = 0) -> int:
     """Submit `fwd` up to `budget` fires, `wide` a frame, keeping the run-ahead window full while
     `consume` drains one fire's result a call; `consume` returning False stops new fires, and the
     ones in flight are drained. The pipeline stays open for the team's next pass."""
-    window = max(model.run_ahead_window() // wide, 1) * wide
+    window = window or max(model.run_ahead_window() // wide, 1) * wide
     submitted = taken = 0
     stop = False
     while True:
@@ -141,7 +144,8 @@ class Team:
         self.read(tokens, "text", lambda: first.put(realign(intrinsics.output(0, "hidden"), self.width, scale)))
         return await first.take_host()
 
-    def latent_pass(self, lat: Channel, scale: float, ack: Channel | None, echo: bool = False) -> ForwardPass:
+    def latent_pass(self, lat: Channel, scale: float, ack: Channel | None, echo: bool = False,
+                    probe: bool = False) -> ForwardPass:
         """One latent step: the row's input is `lat`, and its epilogue puts the next one there."""
         fwd = ForwardPass()
         fwd.switch(0, "reading", "latent")
@@ -159,32 +163,40 @@ class Team:
             nxt = realign(intrinsics.output(0, "hidden"), self.width, scale)
             lat.put(nxt)
             if ack is not None:
-                ack.put(nxt if echo else iota(1))
+                ack.put(nxt if echo else reshape(reduce_argmax(intrinsics.output(0, "logits")), [1]) if probe else iota(1))
 
         return fwd
 
-    async def think(self, tokens: list[int], steps: int, scale: float, stream: bool, echo: bool = False) -> None:
+    async def think(self, tokens: list[int], steps: int, scale: float, stream: bool, echo: bool = False,
+                    exits: set[int] = frozenset()) -> int:
         first = await self.first_latent(tokens, scale)
         if steps == 0:
-            return
+            return 0
         lat = Channel.from_shaped([1, self.width], first, dtype.f32)
         # each step acknowledges with a count, or, when the trajectory is asked for, with its latent input
-        ack = (Channel([1, self.width], dtype.f32) if echo else Channel([1], dtype.u32)).capacity(channel_capacity())
+        probe = bool(exits) and not echo
+        ack = (Channel([1, self.width], dtype.f32) if echo else Channel([1], dtype.i32 if probe else dtype.u32)
+               ).capacity(channel_capacity())
         done = 0
         self.trace = [first]
 
         async def consume():
             nonlocal done
-            value = await ack.take_host()
+            value = await (ack.take_scalar() if probe else ack.take_host())
             if echo:
                 self.trace.append(value)
             done += 1
             if stream:
                 session.send(json.dumps({"step": done}))
+            if probe and value in exits:
+                return False  # the latent thought reads as finished: stop here (LaTER's exit)
 
-        # a pass off the model's default reading posts one fire a frame
-        await drive(self.pipe, self.latent_pass(lat, scale, ack, echo), steps, consume, 1)
-        self.len += steps
+        # a pass off the model's default reading posts one fire a frame; an early exit runs one step at a time,
+        # so no step past the exit lands in the context
+        taken = await drive(self.pipe, self.latent_pass(lat, scale, ack, echo, probe), steps, consume, 1,
+                            1 if probe else 0)
+        self.len += taken
+        return taken
 
     async def probe(self, tokens: list[int], steps: int, scale: float) -> int:
         """Each latent input goes out as its own message: a whole run of them exceeds a frame."""
@@ -268,9 +280,9 @@ async def main(input: dict) -> dict:
         op = request.get("op")
         if op == "think":
             tokens = prompt(request)
-            await team.think(tokens, int(request["steps"]), float(request["scale"]), bool(request.get("stream")),
-                             bool(request.get("echo")))
-            reply = {"len": team.len, "read": len(tokens)}
+            taken = await team.think(tokens, int(request["steps"]), float(request["scale"]), bool(request.get("stream")),
+                                     bool(request.get("echo")), set(int(t) for t in request.get("exits") or ()))
+            reply = {"len": team.len, "read": len(tokens), "taken": taken}
             if request.get("echo"):
                 reply["trace"] = team.trace
         elif op == "render":
