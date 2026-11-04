@@ -79,9 +79,14 @@ fn cached(stores: &Stores, keys: &[Hash256], held_pages: usize) -> usize {
 pub(crate) async fn before_pass(stores: &Stores, ws: WorkingSetId, held: u64, slots: &[Hash256]) {
     let page_size = stores.kv_page_size;
     let page = u64::from(page_size.max(1));
-    let Some(keys) = with_kv_lock(&stores.kv, "coalesce", |kv| {
-        kv.page_keys(ws, held, slots, page_size).ok().flatten()
-    }) else {
+    let keys = if held == 0 {
+        Some(crate::store::kv::KvStore::fresh_page_keys(slots, page_size))
+    } else {
+        with_kv_lock(&stores.kv, "coalesce", |kv| {
+            kv.page_keys(ws, held, slots, page_size).ok().flatten()
+        })
+    };
+    let Some(keys) = keys else {
         return;
     };
     let held_pages = (held / page) as usize;
