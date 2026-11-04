@@ -35,6 +35,16 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
     Matches numpy on the fabric simulator at P 16 (sliding, global with a
     partial RoPE, and a shared-tail layer; two fires of two lanes). f32
     storage: at E2B's dims it does not link (bf16 storage is next).
+  - `moe_mxfp4.csl`: a routed mixture of experts (gpt-oss's; NE experts,
+    top TK, biases, clamped SwiGLU) in place of a layer kernel's dense MLP,
+    appended to qwen2d_paged8b_hr-style kernels (their buffers and
+    collectives). Every expert resident and sliced like the dense MLP, so a
+    token's TK experts run on every PE. MXFP4 codes three a u16, decoded by a
+    shift and a mask into f32 high halves (fp4 x 2^-126; the 0.5 code is a
+    denormal, which CS-3's FMAC keeps: request 0440), inputs prescaled by
+    2^MXK, E8M0 scales a byte an output a 32-block run. Matches numpy on the
+    fabric simulator (16 x 12, Hc 10 / HR 115, Ic 7, NE 20, B 2; 16 x 16,
+    NE 8, B 3, MC 3: rel 5e-7). No design places it yet: no codegen pin.
   - `qwen2d_region.csl`: several bf16 layers on one region (x stays in
     place between them): serve8b_region's regions.
   - `softmax_s123.json`, `softmax_s13_06b.json`: the fast-softmax levers
