@@ -2714,6 +2714,58 @@ mod tests {
         assert!(moved.is_empty(), "moved: {moved:?}");
     }
 
+    /// serve_gptoss's files as CS-3 ran them (0450, KV16 0: 64/64 against
+    /// both f32 goldens, twice; 0447, KV16 1, ran the same files bar the
+    /// layout's KV16 param).
+    const GPT_PINNED: &[(&str, &str)] = &[
+        (
+            "layout.csl",
+            "14b4e545bb6f157bbe687c8e4492ca49655b465d4246e5562851a3cc34dcf89c",
+        ),
+        (
+            "paths.csl",
+            "93259873c95fe60c9ef435961eedfe4c1af84dea79e2e983eb779114e5c22a8b",
+        ),
+        (
+            "rt.csl",
+            "fa8261a091e7fb6a4d9e2624c9c0846476da1a76518a5fc95b9eb64f253471b9",
+        ),
+        (
+            "attn_pe.csl",
+            "d55919587666cc4a32a6f21395916723616d00f127320b5b1c885b5d4dc6e7b0",
+        ),
+        (
+            "moe_pe.csl",
+            "a03433d3f846c6852e0bf30e9970e9b76449fc54a45363fec4aefb888a4f2fe9",
+        ),
+        (
+            "head_pe.csl",
+            "a26d6e62f3ecaeaa7c35c198be05740352bfb0fa9c27e347415b9b39f49ab830",
+        ),
+        (
+            "embed_pe.csl",
+            "8dcd4eb301e714d9a407948f83d176142bf625eb5617faf693560aa303f4c30d",
+        ),
+        (
+            "filler.csl",
+            "5a4c8464faca4024d17562f667a01ec3bbbd1690402377119d88ef2bfb65170b",
+        ),
+    ];
+
+    #[test]
+    fn serve_gptoss_matches_its_pins() {
+        let files = serve_gptoss().unwrap();
+        let mut moved = Vec::new();
+        for (file, want) in GPT_PINNED {
+            let got = files.iter().find(|(n, _)| n == file).unwrap();
+            let have = blake3::hash(got.1.as_bytes()).to_hex().to_string();
+            if have != *want {
+                moved.push(format!("{file}: {have}"));
+            }
+        }
+        assert!(moved.is_empty(), "moved: {moved:?}");
+    }
+
     /// gptoss_moe is gen.py's MoE unit (validated on CS-3, 0446) byte for
     /// byte, without the test's debug exports.
     #[test]
