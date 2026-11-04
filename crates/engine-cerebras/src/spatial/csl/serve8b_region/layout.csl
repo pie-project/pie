@@ -66,6 +66,9 @@ param OP2: u16 = 0;
 // RGX > 0 (with OP2): the regions' X full all-reduces in groups of RGX
 // (codegen.rs `Variant::rgx`; the host writes its routes; passed on to neither).
 param RGX: u16 = 0;
+// QKV1 1 (with OP2, B 1): one QKV matvec over fused rows (codegen.rs
+// `Variant::qkv1`; the host lays wqa out; passed on to neither).
+param QKV1: u16 = 0;
 param NOLAYER: u16 = 0;    // 1 (checking the handoffs alone): the units skip their layers
 param VMX: u16 = 0;        // 1: a 5-column VM block east of the strip (VM5.md; then VMC 0)
 param VMREAL: u16 = 0;     // VMX: 1 Fork 3's eta VM (vm_pe.csl), 0 the stand-in (vm_stub.csl)

@@ -297,6 +297,10 @@ pub struct Variant {
     /// of RGX (`rgx_ops.json`; the host's `rcfg` carries the third route
     /// set and log2(RGX)).
     pub rgx: bool,
+    /// `QKV1` 1 (with `ops2`, B 1, W16 1): q's two RoPE halves and v as one
+    /// matvec: `wqa` holds a layer's [Hc][q a | q v | v] rows (the host's
+    /// `serve8b::unit` lays them out), `wqv` and `wv` are 2-word dummies.
+    pub qkv1: bool,
 }
 
 impl Variant {
@@ -349,7 +353,12 @@ impl Variant {
             } else {
                 "const LNL: u16 = 1;\nfn lsel() u16 { return 0; }\nfn kvoff() u16 { return 0; }\n"
             };
-            s = patch(&s, at, &format!("{def}{at}"), &format!("{tag}'s LSE reference"))?;
+            s = patch(
+                &s,
+                at,
+                &format!("{def}{at}"),
+                &format!("{tag}'s LSE reference"),
+            )?;
             // PS 1 pages: the attention over the kv head's query heads (dead
             // code at other page sizes).
             s = apply_reps("hv_ops", src::HV_OPS, &s, tag)?;
@@ -359,6 +368,12 @@ impl Variant {
                 return Err(format!("gen: {tag}: OP2 needs LSE"));
             }
             s = apply_reps("ops2", src::OPS2, &s, tag)?;
+        }
+        if self.qkv1 {
+            if !self.ops2 {
+                return Err(format!("gen: {tag}: QKV1 needs OP2"));
+            }
+            s = qkv1(&s, tag)?;
         }
         if self.rgx && tag.starts_with("qwen2d_region/") {
             if !self.ops2 {
@@ -416,6 +431,76 @@ pub fn gptoss_moe() -> R<String> {
         &s[b..],
         src::MOE_MXFP4
     ))
+}
+
+/// `QKV1`'s patch on a paged8b unit kernel (grid or region): one QKV
+/// matvec over fused rows (Hc ops of length QKW instead of 3 x Hc).
+fn qkv1(text: &str, tag: &str) -> R<String> {
+    let region = tag.starts_with("qwen2d_region/");
+    let nl = if region { "NL * " } else { "" };
+    let what = |w: &str| format!("{tag}'s QKV1 {w}");
+    let mut s = patch(
+        text,
+        &format!(
+            "var wqa: [{nl}Hc * NH * DHc + 1]WS align(16) = @zeros([{nl}Hc * NH * DHc + 1]WS);\n"
+        ),
+        &format!(
+            "// (qkv1) a layer's [Hc][q a | q v | v] rows: one matvec of QKW a row.\n\
+             const QKW: u16 = 2 * NH * DHc + Dc;\n\
+             comptime {{ @comptime_assert(B == 1 and W16 == 1); }}\n\
+             var wqa: [{nl}Hc * QKW + 1]WS align(16) = @zeros([{nl}Hc * QKW + 1]WS);\n"
+        ),
+        &what("wqa"),
+    )?;
+    s = patch(
+        &s,
+        "var wqa_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = NH * DHc })\n              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NH * DHc} -> wqa[i + 1] });\n",
+        "var wqa_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = QKW });\n",
+        &what("wqa_dsd"),
+    )?;
+    s = patch(
+        &s,
+        &format!(
+            "var wqv: [{nl}Hc * NH * DHc + 1]WS align(16) = @zeros([{nl}Hc * NH * DHc + 1]WS);\n"
+        ),
+        "var wqv: [2]WS align(16) = @zeros([2]WS);   // (qkv1) in wqa\n",
+        &what("wqv"),
+    )?;
+    s = patch(
+        &s,
+        &format!("var wv: [{nl}Hc * Dc + 1]WS align(16) = @zeros([{nl}Hc * Dc + 1]WS);\n"),
+        "var wv: [2]WS align(16) = @zeros([2]WS);   // (qkv1) in wqa\n",
+        &what("wv"),
+    )?;
+    s = patch(
+        &s,
+        "    wmv(at(qh_dsd, b * NH * DHc), wqa_dsd, xb, Hc, sc_s);\n    wmv(at(qh_dsd, QH + b * NH * DHc), wqv_dsd, xb, Hc, sc_s);\n    wmv(at(v_dsd, b * Dc), wv_dsd, xb, Hc, sc_s);\n",
+        "    // (qkv1) B 1: q a, q v (at QH) and v (at QKN = 2 QH) are contiguous.\n    wmv(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QKW} -> qkv[i] }), wqa_dsd, xb, Hc, sc_s);\n",
+        &what("matvec"),
+    )?;
+    let (a, q, v) = if region {
+        (
+            "&wqa[1 + l * Hc * NH * DHc]",
+            "&wqv[1 + l * Hc * NH * DHc]",
+            "&wv[1 + l * Hc * Dc]",
+        )
+    } else {
+        ("&wqa[1]", "&wqv[1]", "&wv[1]")
+    };
+    let a2 = if region {
+        "&wqa[1 + l * Hc * QKW]"
+    } else {
+        "&wqa[1]"
+    };
+    s = patch(
+        &s,
+        &format!(
+            "    wqa_dsd = @set_dsd_base_addr(wqa_dsd, @ptrcast([*]@fp16(), {a}));\n    wqv_dsd = @set_dsd_base_addr(wqv_dsd, @ptrcast([*]@fp16(), {q}));\n    wv_dsd = @set_dsd_base_addr(wv_dsd, @ptrcast([*]@fp16(), {v}));\n"
+        ),
+        &format!("    wqa_dsd = @set_dsd_base_addr(wqa_dsd, @ptrcast([*]@fp16(), {a2}));\n"),
+        &what("bases"),
+    )?;
+    Ok(s)
 }
 
 // ---------------------------------------------------------------- text helpers

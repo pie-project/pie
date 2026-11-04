@@ -165,6 +165,9 @@ pub struct ServeConfig {
     /// serve8b_region(_pipe), with `lse`: the second op cuts (`OP2` 1,
     /// codegen's `Variant::ops2`).
     pub ops2: bool,
+    /// serve8b_region(_pipe), with `ops2` at B 1: q, k and v as one matvec
+    /// (`QKV1` 1, codegen's `Variant::qkv1`).
+    pub qkv1: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -195,6 +198,7 @@ impl ServeConfig {
             speed: false,
             lse: false,
             ops2: false,
+            qkv1: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -265,6 +269,7 @@ impl ServeConfig {
             "speed",
             "lse",
             "ops2",
+            "qkv1",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -358,6 +363,7 @@ impl ServeConfig {
             speed: flag(t, "speed")?,
             lse: flag(t, "lse")?,
             ops2: flag(t, "ops2")?,
+            qkv1: flag(t, "qkv1")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -996,6 +1002,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if cfg.ops2 && !cfg.lse {
         return Err("serve8b_region's second op cuts (`ops2`) need `lse`".into());
     }
+    if cfg.qkv1 && !cfg.ops2 {
+        return Err("serve8b_region's one QKV matvec (`qkv1`) needs `ops2`".into());
+    }
     if cfg.hv && !cfg.lse {
         return Err("serve8b_region's HV (`hv`) needs `lse` (and `speed`)".into());
     }
@@ -1308,6 +1317,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             speed: cfg.speed,
             lse: cfg.lse,
             ops2: cfg.ops2,
+            qkv1: cfg.qkv1,
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1368,6 +1378,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.ops2 {
         st.push(Typed("OP2"));
+    }
+    if cfg.qkv1 {
+        st.push(Typed("QKV1"));
     }
     if cfg.lever_d {
         st.push(Typed("YD"));
@@ -2622,9 +2635,9 @@ mod qwen3_8b {
 #[cfg(test)]
 mod llama31_8b {
     use super::*;
+    use crate::spatial::codegen::Variant;
     use crate::spatial::model::ModelSpec;
     use crate::spatial::plan::WaferDims;
-    use crate::spatial::codegen::Variant;
 
     fn spec() -> ModelSpec {
         let catalog = poem_compiler::catalog::repository();
@@ -2789,7 +2802,12 @@ mod llama31_8b {
         assert_eq!(get("MODE").as_deref(), Some("2"));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         assert!(lay.model.speed);
-        let base = d.files_with(Variant { speed: false, ..lay.model.variant() }).unwrap();
+        let base = d
+            .files_with(Variant {
+                speed: false,
+                ..lay.model.variant()
+            })
+            .unwrap();
         let fast = d.files_with(lay.model.variant()).unwrap();
         for ((n, a), (_, b)) in base.iter().zip(&fast) {
             match *n {
@@ -2819,14 +2837,22 @@ mod llama31_8b {
         assert_eq!(get("LSE").as_deref(), Some("1"));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         assert!(lay.model.lse && lay.model.speed);
-        let base = d.files_with(Variant { lse: false, ..lay.model.variant() }).unwrap();
+        let base = d
+            .files_with(Variant {
+                lse: false,
+                ..lay.model.variant()
+            })
+            .unwrap();
         let lse = d.files_with(lay.model.variant()).unwrap();
         for ((n, a), (_, b)) in base.iter().zip(&lse) {
             match *n {
                 "grid_pe.csl" | "region_pe.csl" => {
                     assert!(a.contains("allreduce(true, red_dsd, NQB);"), "{n}");
                     assert!(!b.contains("allreduce(true,"), "{n}");
-                    assert!(b.contains("while (apass < 8)") && b.contains("fn gsh()"), "{n}");
+                    assert!(
+                        b.contains("while (apass < 8)") && b.contains("fn gsh()"),
+                        "{n}"
+                    );
                     assert!(!b.contains("  const r = axis_id % ga();\n"), "{n}");
                     assert!(b.contains("    ar_qt = axis_id >> gsh();\n"), "{n}");
                     assert!(b.contains("fn q_parts("), "{n}");
@@ -2836,7 +2862,10 @@ mod llama31_8b {
                 _ => assert_eq!(a, b, "{n}"),
             }
         }
-        let alone = Variant { speed: false, ..lay.model.variant() };
+        let alone = Variant {
+            speed: false,
+            ..lay.model.variant()
+        };
         assert!(d.files_with(alone).is_err());
     }
 
@@ -2855,21 +2884,75 @@ mod llama31_8b {
         assert_eq!(get("OP2").as_deref(), Some("1"));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         assert!(lay.model.ops2);
-        let base = d.files_with(Variant { ops2: false, ..lay.model.variant() }).unwrap();
+        let base = d
+            .files_with(Variant {
+                ops2: false,
+                ..lay.model.variant()
+            })
+            .unwrap();
         let op2 = d.files_with(lay.model.variant()).unwrap();
         for ((n, a), (_, b)) in base.iter().zip(&op2) {
             match *n {
                 "grid_pe.csl" | "region_pe.csl" => {
                     assert!(!a.contains("fn silu1(") && b.contains("fn silu1("), "{n}");
                     assert!(b.contains("  if (axis_cur == want) { return; }\n"), "{n}");
-                    assert!(b.contains("    mark(14);\n") && !a.contains("mark(14)"), "{n}");
+                    assert!(
+                        b.contains("    mark(14);\n") && !a.contains("mark(14)"),
+                        "{n}"
+                    );
                 }
                 _ => assert_eq!(a, b, "{n}"),
             }
         }
-        let alone = Variant { lse: false, speed: true, ..lay.model.variant() };
+        let alone = Variant {
+            lse: false,
+            speed: true,
+            ..lay.model.variant()
+        };
         assert!(d.files_with(alone).is_err());
         cfg.lse = false;
+        assert!(params(&plan, &cfg).is_err());
+    }
+
+    /// `qkv1` (with `ops2`) states QKV1 1: both units run one QKV matvec
+    /// over `wqa`'s fused rows (wqv, wv as dummies); nothing else changes;
+    /// without `ops2` it is refused.
+    #[test]
+    fn qkv1_states_qkv1_and_patches_both_units() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.speed = true;
+        cfg.lse = true;
+        cfg.ops2 = true;
+        cfg.qkv1 = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
+        assert_eq!(get("QKV1").as_deref(), Some("1"));
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        assert!(lay.model.qkv1);
+        let base = d
+            .files_with(Variant {
+                qkv1: false,
+                ..lay.model.variant()
+            })
+            .unwrap();
+        let one = d.files_with(lay.model.variant()).unwrap();
+        for ((n, a), (_, b)) in base.iter().zip(&one) {
+            match *n {
+                "grid_pe.csl" | "region_pe.csl" => {
+                    assert!(
+                        a.contains("wqv_dsd, xb, Hc, sc_s);") && !b.contains("wqv_dsd, xb"),
+                        "{n}"
+                    );
+                    assert!(
+                        b.contains("{QKW} -> qkv[i] }), wqa_dsd, xb, Hc, sc_s);"),
+                        "{n}"
+                    );
+                    assert!(b.contains("var wv: [2]WS align(16)"), "{n}");
+                }
+                _ => assert_eq!(a, b, "{n}"),
+            }
+        }
+        cfg.ops2 = false;
         assert!(params(&plan, &cfg).is_err());
     }
 

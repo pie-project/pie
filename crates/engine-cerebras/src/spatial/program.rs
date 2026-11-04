@@ -79,6 +79,8 @@ pub struct Model {
     /// `RGX`: the regions' X full all-reduces' phase-1 group (0: RGs;
     /// `Variant::rgx`).
     pub rgx: usize,
+    /// `QKV1` 1: one QKV matvec over fused rows (`Variant::qkv1`).
+    pub qkv1: bool,
 }
 
 impl Model {
@@ -96,6 +98,7 @@ impl Model {
             lse: false,
             ops2: false,
             rgx: 0,
+            qkv1: false,
         }
     }
 
@@ -119,6 +122,7 @@ impl Model {
             lse: self.lse,
             ops2: self.ops2,
             rgx: self.rgx > 0,
+            qkv1: self.qkv1,
         }
     }
 }
@@ -701,6 +705,7 @@ impl ProgramSpec {
             "LSE" => Some(usize::from(m.lse)),
             "OP2" => Some(usize::from(m.ops2)),
             "RGX" => Some(m.rgx),
+            "QKV1" => Some(usize::from(m.qkv1)),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1328,6 +1333,7 @@ fn model(get: &Get) -> R<Model> {
         lse: get.opt("LSE").unwrap_or(0) != 0,
         ops2: get.opt("OP2").unwrap_or(0) != 0,
         rgx: get.opt("RGX").unwrap_or(0),
+        qkv1: get.opt("QKV1").unwrap_or(0) != 0,
     })
 }
 
