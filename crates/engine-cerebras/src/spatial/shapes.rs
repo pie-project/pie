@@ -221,7 +221,10 @@ pub const RAN: &[Ran] = &[
                  1,368.6-1,378.5 = 94.8-95.5% of bare 1,443.3 in 5 of 6 reps (0487); the same \
                  program with the lane's pages on the rows by o/l all-reduce slack (bench8b \
                  BENCH8B_PAGEORDER ar:208:16, host only) 1,461.5 (0488, regions 45.6-46.0k a \
-                 pass; control 1,442.9), teacher-forced 1 mismatch (the 225 tie)",
+                 pass; control 1,442.9), teacher-forced 1 mismatch (the 225 tie); bare \
+                 1,460.0-1,461.3 and pie B 1 with PIE_CEREBRAS_PAGE_ORDER 1,386.2-1,401.7 = \
+                 94.9-96.0% (0490; 0487 1,368.6-1,378.5), every pie stream = the f32 golden \
+                 for 512 or off it only at the 225 tie",
     },
     Ran {
         design: Design::Serve8bRegion,
