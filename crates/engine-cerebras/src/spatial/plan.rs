@@ -281,6 +281,16 @@ impl Grid {
     }
 
     /// A PE's estimated bytes.
+    /// The fixed bytes [`Grid::bytes`] counts (code and fixed data).
+    pub fn fixed_bytes(&self) -> usize {
+        let copy = if self.host_copy { COPY_CODE } else { 0 };
+        (if self.w16 {
+            PAGED8B_FIXED
+        } else {
+            SERVE2D_FIXED
+        }) - copy
+    }
+
     pub fn bytes(&self, ring: bool) -> usize {
         let fixed = if self.w16 {
             PAGED8B_FIXED

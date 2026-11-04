@@ -66,21 +66,24 @@ pub struct G4Unit {
 }
 
 impl G4Unit {
-    /// A PE's estimated bytes: the paged grid's at bf16 weights, plus the
-    /// sandwich norms' gammas, the PLE table slice, its three projections'
-    /// slices (bf16), the handoff's `x0` and the shared kv.
+    /// A PE's estimated bytes, fitted to the linked ELFs of gemma4_layer at
+    /// E2B's dims (`G4_FIXED`: its code, task table and fixed data): the
+    /// paged grid's data at bf16 weights, plus the sandwich norms' gammas,
+    /// the three PLE projections' slices (bf16), the handoff's `x0` and PLE
+    /// row, and the shared kv. The PLE tables live in the head region.
     pub fn bytes(&self) -> usize {
         let g = &self.grid;
-        let mut b = g.bytes(true) + 4 * 3 * g.hc;
+        let mut b = G4_FIXED + G4_LANE * g.lanes + 26 * g.ic + 228 * g.dc + g.bytes(false)
+            - g.fixed_bytes()
+            + 4 * 3 * g.hc;
         if !self.owns_kv {
             // No k/v projection: wqkv holds q alone.
             b -= 2 * g.hc * 2 * g.dc;
         }
         if self.ple_c > 0 {
-            b += 2 * self.ple_rows * self.ple_c // the table
-                + 2 * 3 * g.hc * self.ple_c // model_proj, gate, proj slices
+            b += 2 * 3 * g.hc * self.ple_c // model_proj, gate, proj slices
                 + 4 * (g.hc + 1) // the PLE norm's gamma and the scalar
-                + 4 * g.lanes * (g.hc + 3 * self.ple_c); // x0, relay, row, gate
+                + 4 * g.lanes * (g.hc + 4 * self.ple_c); // x0, prow, relay, row, gate
         }
         if self.shares_kv || !self.owns_kv {
             b += 4 * g.lanes * 2 * g.dc;
@@ -88,6 +91,14 @@ impl G4Unit {
         b
     }
 }
+
+/// gemma4_layer's fixed bytes a PE (its code is ~27.4 KB: qwen35_attn's
+/// plus the norms, GELU, PLE and the W16 matvec), and what the grid's data
+/// terms leave out a lane (scratch the unit adds) and an `ic` and a `dc`
+/// (the MLP's and the heads' buffers), fitted to the linked sizes in
+/// [`tests::units_match_their_linked_size`].
+const G4_FIXED: usize = 27_846;
+const G4_LANE: usize = 1_108;
 
 /// Gemma 4 on the wafer.
 #[derive(Debug, Clone, PartialEq)]
@@ -216,10 +227,12 @@ impl G4Plan {
         let gh = layers.div_ceil(gw);
         let head_cols = wafer.width - gw * p;
         let head_pes = head_cols * wafer.height;
-        let head_bytes = HEAD_FIXED + (2 * spec.vocab * spec.hidden).div_ceil(head_pes);
+        // The head holds the tied embedding and every layer's PLE table (bf16).
+        let ple = spec.ple_dim.map_or(0, |d| d * spec.layers());
+        let head_bytes = HEAD_FIXED + (2 * spec.vocab * (spec.hidden + ple)).div_ceil(head_pes);
         if head_bytes > wafer.pe_bytes {
             blockers.push(format!(
-                "the head's {} bf16 rows over {head_cols} x {} PEs want {head_bytes} bytes a PE",
+                "the head's {} bf16 rows (embedding and PLE tables) over {head_cols} x {} PEs want {head_bytes} bytes a PE",
                 spec.vocab, wafer.height
             ));
         }
@@ -310,6 +323,40 @@ mod tests {
                 println!("{name} B {b}:");
                 show(&G4Plan::derive(&spec(name), WaferDims::CS3, Goals::lanes(b)).expect(name));
             }
+        }
+    }
+
+    /// The unit's bytes against gemma4_layer linked at E2B's dims
+    /// (scratch/g4/real16, SDK 2.10.1: the ELF's allocated sections): never
+    /// under, at most 1.5 KB over.
+    #[test]
+    fn units_match_their_linked_size() {
+        let p = G4Plan::derive(
+            &spec("gemma4-e2b-bf16-kv-bf16"),
+            WaferDims::CS3,
+            Goals::lanes(1),
+        )
+        .expect("plans");
+        let at = |l: usize, lanes: usize, mc: usize, shares: bool| {
+            let mut u = p.units[l];
+            u.grid.lanes = lanes;
+            u.grid.mlp_chunk = mc;
+            u.shares_kv = shares;
+            u.bytes()
+        };
+        // (layer, lanes, MLP chunk, shares kv, linked bytes)
+        for (l, lanes, mc, shares, linked) in [
+            (0, 1, 1, true, 37_434),   // sliding, Dc 2, Ic 48
+            (4, 1, 1, false, 39_530),  // global, Dc 4, Ic 48
+            (19, 1, 1, false, 44_618), // shared tail, global, Ic 96
+            (19, 2, 2, false, 47_614),
+            (4, 4, 2, true, 46_034),
+        ] {
+            let est = at(l, lanes, mc, shares);
+            assert!(
+                est >= linked && est <= linked + 1536,
+                "layer {l} B {lanes}: {est} vs {linked}"
+            );
         }
     }
 }
