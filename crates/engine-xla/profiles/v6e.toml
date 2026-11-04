@@ -3,8 +3,14 @@ api = 1
 [target]
 assumes = { generation = 6 }
 
+# a 512-token prompt (and its cold tag) padded to a 1024-row fire on powers of two; at 150%
+# rungs it pads to 710 (#1184: Raw prefill 8.8k vs vLLM-TPU 12.8k tok/s, Gemma-4-31B cut)
+[engine]
+pad.growth = 150
+
 [provenance]
 measured = [
+  "engine.pad.growth",
   "kernel.attn.block_keys",
   "kernel.attn.block_rows",
   "kernel.attn.budget_mi",

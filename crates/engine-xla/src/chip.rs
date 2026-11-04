@@ -331,11 +331,10 @@ mod tests {
             kernels_xla::tuning::Tuning::on(&profile, Tpu::of("TPU v6 lite").vmem_bytes()),
             kernels_xla::tuning::Tuning::DEFAULT
         );
-        assert_eq!(Engine::of(&profile), Engine::of(&registry().defaults()));
         assert_eq!(
             Engine::of(&profile).pad,
             Pad {
-                growth: 200,
+                growth: 150,
                 room: 128,
                 mixed_host_rung: 16,
                 page_floor: 16,
