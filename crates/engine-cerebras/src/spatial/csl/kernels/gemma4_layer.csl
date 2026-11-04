@@ -2,15 +2,15 @@
 // Against qwen35_attn: no attention gates; v RMS-normed per head without a
 // weight; the attention's and the MLP's outputs RMS-normed (gamma3, gamma4)
 // before their residual adds; a GELU-tanh GLU; the per-layer embedding
-// (PC > 0): column c holds PC dims of the layer's table for row py's PR
-// vocab rows, the token's row summed down the columns with the context
+// (PC > 0): the token's row of the layer's table arrives gathered (prow,
+// column c its PC dims; the head region holds the tables), joined with the context
 // projection of x0 (the embedding, beside x) and the gate's partials, the
 // context half normed over the PLE width, gelu(gate) * mix projected back,
 // normed (gamma5) and added; then x scales by the layer's scalar. OWN 0: the
 // layer takes its k and v (normed, turned) from kvi (the shared tail);
 // SHARE 1: it leaves them in kvo. The placement carries the rest: the
 // softmax scale of 1 is q's norm weights without the kernels' 1/sqrt(d), a
-// partial RoPE a turn of zero, the PLE scales folded into wpm, ptab and pnw.
+// partial RoPE a turn of zero, the PLE scales folded into wpm, the gathered row and pnw.
 //
 // qwen2d_paged: the batched qwen2d layer (qwen2d_batch v2) over a paged KV pool,
 // for continuous batching with PIE's page model. B lanes a pass, each its own
@@ -45,8 +45,7 @@ param Qh: u16;         // query heads a kv head
 param OWN: u16;        // 1: the layer computes its k and v
 param SHARE: u16;      // 1: its k and v go to kvo
 param PC: u16;         // PLE dims a column (0: no PLE)
-param PR: u16;         // PLE vocab rows a PE row
-param W16: u16 = 1;    // 1: bf16 weights (u16 storage); the PLE table is bf16 always
+param W16: u16 = 1;    // 1: bf16 weights (u16 storage)
 param NP: u16 = 3;     // bf16 parts of x in a W16 matvec (3: exact)
 param c_r1_0: color;
 param c_r1_1: color;
@@ -377,7 +376,7 @@ var kvo = @zeros([B * 2 * Dc]f32);
 var kvo_ptr: [*]f32 = &kvo;
 // PLE: the embedding x0 [b][Hc], the lanes' tokens, the context projection
 // (wpm, Hc x PC), the gate (wpg, Hc x PC), the projection back (wpp, PC x
-// Hc), the table's slice [PR][PC] and the PLE norm's weights [PC].
+// Hc) and the PLE norm's weights [PC].
 const PCn: u16 = if (PC > 0) PC else 1;
 // Weight storage and the W16 matvec's scratch (x's f32 remainder, its bf16
 // parts), after qwen35_attn's.
@@ -392,12 +391,14 @@ var xpart = @zeros([NP * XM]@fp16());
 const xs_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XM} -> xs32[i] });
 const xt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XM} -> xt32[i] });
 const xpart_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XM} -> xpart[i] });
-const PRn: u16 = if (PR > 0) PR else 1;
 var x0 = @zeros([B * Hc]f32);
 var x0_ptr: [*]f32 = &x0;
 const x0_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> x0[i] });
-var tok = @zeros([B]u32);
-var tok_ptr: [*]u32 = &tok;
+// The token's PLE row for this layer, this column's PC dims [b][PC] (the
+// head region holds the tables and gathers it; the handoff brings it).
+var prow = @zeros([B * PCn]f32);
+var prow_ptr: [*]f32 = &prow;
+const prow_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * PCn} -> prow[i] });
 var wpm: [Hc * PCn + 1]WST align(16) = @zeros([Hc * PCn + 1]WST);
 var wpm_ptr: [*]WST = &wpm;
 var wpm_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = PCn })
@@ -410,8 +411,6 @@ var wpp: [PCn * Hc + 1]WST align(16) = @zeros([PCn * Hc + 1]WST);
 var wpp_ptr: [*]WST = &wpp;
 var wpp_dsd = if (W16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = Hc })
               else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> wpp[i + 1] });
-var ptab = @zeros([PRn * PCn]u16);
-var ptab_ptr: [*]u16 = &ptab;
 var pnw = @zeros([PCn]f32);
 var pnw_ptr: [*]f32 = &pnw;
 const pnw_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PCn} -> pnw[i] });
@@ -609,10 +608,6 @@ fn wmv(y: mem1d_dsd, a: mem1d_dsd, xv: mem1d_dsd, n: u16) void {
     mvparts(y, a, n);
   }
 }
-// A PLE table cell as f32 (the table is bf16 in every build, widened by its bits).
-fn ptab_at(i: u16) f32 {
-  return @bitcast(f32, @as(u32, ptab[i]) << 16);
-}
 fn rsqrt(v: f32) f32 {
   var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
   const h = 0.5 * v;
@@ -789,13 +784,10 @@ fn ple() void {
   while (b < dims[0]) : (b += 1) {
     wmv(at(pl_lane, b * PCn), wpm_dsd, at(x0_dsd, b * Hc), Hc);
     wmv(at(pl_lane, 2 * NBP + b * PCn), wpg_dsd, at(x_dsd, b * Hc), Hc);
-    const t = tok[b];
-    if (t / @as(u32, PRn) == @as(u32, py)) {
-      const r = @as(u16, t % @as(u32, PRn));
-      var c: u16 = 0;
-      while (c < PC) : (c += 1) { pl[NBP + b * PCn + c] = ptab_at(r * PCn + c); }
-    }
   }
+  // The token's table row (this column's PC dims, gathered by the head into
+  // prow) joins the sum on row 0 only.
+  if (py == 0) { @fmovs(pt_d, prow_d); }
   allreduce(false, pl_all, 3 * NBP);
   @fmuls(p1_d, pr_d, pr_d);
   b = 0;
@@ -813,7 +805,7 @@ fn ple() void {
     @fmuls(rl, rl, rms_scale(pss[b], @as(f32, P * PC)));
     @fmuls(rl, rl, pnw_dsd);
   }
-  @fadds(pr_d, pr_d, pt_d);       // mix (the 1/sqrt 2 is in pnw and ptab)
+  @fadds(pr_d, pr_d, pt_d);       // mix (the 1/sqrt 2 is in pnw and the row)
   gelu_t(pg_d, pr_d, pt_d, p1_d, p2_d, p3_d, p4_d, @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NBP} -> sv[i] }));
   @fmovs(hv_all, 0.0);
   b = 0;
@@ -1222,11 +1214,10 @@ comptime {
   @export_symbol(kvi_ptr, "kvi");
   @export_symbol(kvo_ptr, "kvo");
   @export_symbol(x0_ptr, "x0");
-  @export_symbol(tok_ptr, "tok");
+  @export_symbol(prow_ptr, "prow");
   @export_symbol(wpm_ptr, "wpm");
   @export_symbol(wpg_ptr, "wpg");
   @export_symbol(wpp_ptr, "wpp");
-  @export_symbol(ptab_ptr, "ptab");
   @export_symbol(pnw_ptr, "pnw");
   @export_symbol(qkn_w_ptr, "qkn_w");
   @export_symbol(rot_c_ptr, "rot_c");
