@@ -35,6 +35,7 @@ param KV16: u16;       // 1: KV in bf16
 param KVCP: u16 = 1;   // 1: the copy_kv kernel, 0: the host copies pages by memcpy
 param PROF: u16;
 param EPS: f32 = 1.0e-5;  // RMSNorm epsilon
+param WIN: u32 = 0;    // a sliding layer's window: a lane at write slot w sees slots (w - WIN, w] (0: all)
 param GY: u16 = 0;     // rows a Y-axis phase-1 group (0: Gs); must divide PY
 param HROUTE: u16 = 0; // 1: the host computes each PE's route bits (`rcfg`); no route-building code
 param ROT8: u16 = 0;   // 1: RoPE tables of 4 levels x 8 (p = 512a + 64b + 8c + d) instead of 3 x 16       // 1: per-phase cycles (prof), 0: the whole pass only (prof[0])
@@ -483,6 +484,23 @@ fn advance(b: u16) void {
   while (e < dims[1]) : (e += 1) {
     if (eblk(b, e) != NONE and epg(b, e) == pg) {
       tab[2 * B + 2 * B * E + b * E + e] |= @as(u32, 1) << @as(u16, ws % @as(u32, PS));
+    }
+  }
+}
+
+// The sliding window (WIN > 0): the lane's bits below its write slot's
+// window cleared on this row's entries, every pass (advance only adds bits).
+fn clip_window(b: u16) void {
+  const ws = tab[B + b];
+  if (ws < WIN) { return; }
+  const lo = ws + 1 - WIN;             // the first slot it sees
+  var e: u16 = 0;
+  while (e < dims[1]) : (e += 1) {
+    if (eblk(b, e) != NONE) {
+      const p0 = epg(b, e) * @as(u32, PS);
+      const at = 2 * B + 2 * B * E + b * E + e;
+      if (p0 + @as(u32, PS) <= lo) { tab[at] = 0; }
+      else if (p0 < lo) { tab[at] &= ~((@as(u32, 1) << @as(u16, lo - p0)) - 1); }
     }
   }
 }
@@ -1144,6 +1162,10 @@ fn compute(steps: u32) void {
     if (i > 0) {
       var b: u16 = 0;
       while (b < dims[0]) : (b += 1) { advance(b); }
+    }
+    if (WIN > 0) {
+      var b: u16 = 0;
+      while (b < dims[0]) : (b += 1) { clip_window(b); }
     }
     timing = i > 0;
     pass_start();

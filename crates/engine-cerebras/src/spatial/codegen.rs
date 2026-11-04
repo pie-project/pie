@@ -70,6 +70,15 @@ mod src {
         pub const FILLER_BASE: &str = include_str!("csl/serve8b/filler_base.csl");
     }
 
+    /// serve_gptoss's own files (its units' grid_extra is serve8b_region's).
+    pub mod gpt {
+        pub const LAYOUT: &str = include_str!("csl/serve_gptoss/layout.csl");
+        pub const PATHS: &str = include_str!("csl/serve_gptoss/paths.csl");
+        pub const HEAD_EXTRA: &str = include_str!("csl/serve_gptoss/head_extra.csl");
+        pub const EMBED_BASE: &str = include_str!("csl/serve_gptoss/embed_base.csl");
+        pub const FILLER_BASE: &str = include_str!("csl/serve_gptoss/filler_base.csl");
+    }
+
     pub mod s8br {
         pub const LAYOUT: &str = include_str!("csl/serve8b_region/layout.csl");
         pub const PATHS: &str = include_str!("csl/serve8b_region/paths.csl");
@@ -1940,14 +1949,28 @@ fn page_unstage(page: u32, slot: u32) void { sys_mod.unblock_cmd_stream(); }"
 /// layer(s) lifted out of `compute`.
 fn s8br_unit(kernel: &str, src: &str, pipe: bool, variant: Variant) -> R<String> {
     let tag = format!("{kernel}/pe.csl");
-    let mut s = patch(
+    unit_with(
+        kernel,
         &variant.apply(&softmax_s123(src, &tag)?, &tag)?,
+        pipe,
+        false,
+    )
+}
+
+/// s8br_unit's body on a kernel source as given; `gpt`: serve_gptoss's unit
+/// (receive capacity S2D_RTI, serve_gptoss's dummies).
+fn unit_with(kernel: &str, src: &str, pipe: bool, gpt: bool) -> R<String> {
+    let tag = format!("{kernel}/pe.csl");
+    let mut s = patch(
+        src,
         "param c_r1_0: color;\n",
         &format!(
             "// serve8b: 1 times each pass (prof[0]); the route table's route capacity.\n\
 param S2D_TIME: u16;\nparam S2D_RTR: u16;\nparam S2D_NOLAYER: u16;\n{}param c_r1_0: color;\n",
             if pipe {
                 "param S2D_PIPE: u16 = 0;\nparam S2D_MMAX: u16 = 1;   // serve8b_region_pipe\n"
+            } else if gpt {
+                "param S2D_RTI: u16;   // serve_gptoss: pieces a PE receives\n"
             } else {
                 ""
             }
@@ -1992,16 +2015,27 @@ fn s2d_pass_start(i: u32, start_pos: u32) void {{\n{}\n}}\nfn s2d_layers() void 
     );
     s = format!("{}\n{}", &s[..start], &s[end..]);
     let grid_extra = if pipe {
-        src::s8brp::GRID_EXTRA
+        src::s8brp::GRID_EXTRA.to_string()
+    } else if gpt {
+        patch(
+            src::s8br::GRID_EXTRA,
+            "const RT_I: u16 = 3;\n",
+            "const RT_I: u16 = S2D_RTI;\n",
+            "grid_extra RT_I",
+        )?
     } else {
-        src::s8br::GRID_EXTRA
+        src::s8br::GRID_EXTRA.to_string()
     };
     let mut own = exports(&s);
-    own.extend(exports(grid_extra));
+    own.extend(exports(&grid_extra));
     let nlk = if kernel == "qwen2d_region" { "NL" } else { "1" };
-    let extra = format!(
-        "{S8B_GRID_VARIANT}const S2D_KL: u16 = {nlk};       // layers a unit (KV staging)\n\n{pass_fn}\n{grid_extra}\n{}",
+    let dummies = if gpt {
+        gpt_dummies(&own)
+    } else {
         s8br_dummies(&own, pipe)
+    };
+    let extra = format!(
+        "{S8B_GRID_VARIANT}const S2D_KL: u16 = {nlk};       // layers a unit (KV staging)\n\n{pass_fn}\n{grid_extra}\n{dummies}"
     );
     // `\ncomptime {\n(  if (NL > 1)...\n)?  @initialize_queue(q_r1_0_in`
     let mut at = None;
@@ -2232,9 +2266,183 @@ pub fn serve8b_region(pipe: bool, variant: Variant) -> R<Vec<File>> {
     ])
 }
 
+// ---------------------------------------------------------------- serve_gptoss
+
+/// serve_gptoss's names: the units' (attention and MoE), the head's and
+/// the strip's, in the layout's export order.
+const GPT_NAMES: &[(&str, &str)] = &[
+    ("x", "f32"),
+    ("tab", "u32"),
+    ("gamma1", "f32"),
+    ("gamma2", "f32"),
+    ("wqa", "WS"),
+    ("wqv", "WS"),
+    ("wv", "WS"),
+    ("qkn_w", "f32"),
+    ("rot_c", "f32"),
+    ("rot_s", "f32"),
+    ("kc", "KS"),
+    ("vc", "KS"),
+    ("wo", "WS"),
+    ("wgu", "WS"),
+    ("wd", "WS"),
+    ("prof", "u32"),
+    ("dims", "u16"),
+    ("rtab", "u16"),
+    ("bqa", "f32"),
+    ("bqv", "f32"),
+    ("bv", "f32"),
+    ("bo", "f32"),
+    ("snk", "f32"),
+    ("mx", "u32"),
+    ("rw", "u16"),
+    ("rb", "f32"),
+    ("gub", "f32"),
+    ("dnb", "f32"),
+    ("mcfg", "u32"),
+    ("wt", "u32"),
+    ("et", "u32"),
+    ("l2", "f32"),
+    ("force", "u32"),
+    ("lmax", "f32"),
+    ("gmode", "u32"),
+    ("vm_tok", "f32"),
+    ("vin", "f32"),
+    ("xin", "f32"),
+    ("gam", "f32"),
+    ("y", "f32"),
+    ("emb", "f32"),
+    ("tok", "f32"),
+    ("in_tokens", "u32"),
+    ("out_tokens", "u32"),
+    ("yscale", "f32"),
+    ("vmctl", "u32"),
+    ("hlogits", "f32"),
+    ("etab", "u32"),
+];
+
+/// serve_gptoss's dummies: a 1-word array per name a program lacks (the
+/// HROUTE ones conditional).
+fn gpt_dummies(own: &[String]) -> String {
+    let all = Names::of(GPT_NAMES).with(S8BR_HROUTE_NAMES);
+    let mut lines = Vec::new();
+    let mut decls = Vec::new();
+    for &(n, ty) in &all.0 {
+        if own.iter().any(|o| o == n) {
+            continue;
+        }
+        decls.push(format!(
+            "var s2d_d_{n} = @zeros([1]{ty});\nvar s2d_d_{n}_ptr: [*]{ty} = &s2d_d_{n};"
+        ));
+        if S8BR_HROUTE_NAMES.iter().any(|h| h.0 == n) {
+            lines.push(format!(
+                "  if (HROUTE == 1) {{ @export_symbol(s2d_d_{n}_ptr, \"{n}\"); }}"
+            ));
+        } else {
+            lines.push(format!("  @export_symbol(s2d_d_{n}_ptr, \"{n}\");"));
+        }
+    }
+    format!(
+        "// serve_gptoss: the other programs' exported names.\nparam KVST: u16;   // KV staging slots (0: none)\n{}\ncomptime {{\n{}\n}}\n",
+        decls.join("\n"),
+        lines.join("\n")
+    )
+}
+
+/// head2d_v10 as serve_gptoss's head: serve8b_region's head patches with
+/// chunk triples (head_extra), no external VM.
+fn gpt_head() -> R<String> {
+    let mut s = s8br_head(false)?;
+    let a = s
+        .find("\n\n// ---------------------------------------------------------------- serve8b\n")
+        .ok_or("gen: gpt head: head_extra not found")?;
+    s.truncate(a);
+    let s = patch(
+        &s,
+        "param S2D_VMX: u16;\n",
+        "param S2D_VMX: u16;\n// serve_gptoss: the strip's columns (attention rows).\nparam EC: u16;\n",
+        "gpt head params",
+    )?;
+    let s = s.replacen(
+        "// GENERATED by serve8b/sync.py from head2d_v10/pe.csl (Fork 7) + serve8b/head_extra.csl.\n\
+// Do not edit: change head_extra.csl or sync.py and rerun.\n",
+        "// GENERATED by codegen::serve_gptoss from head2d_v10/pe.csl + serve_gptoss/head_extra.csl.\n",
+        1,
+    );
+    let mut own = exports(&s);
+    own.extend(["in_tokens", "out_tokens", "yscale", "hlogits", "vmctl"].map(String::from));
+    Ok(format!(
+        "{}\n\n{}\n{}",
+        s.trim_end_matches('\n'),
+        src::gpt::HEAD_EXTRA,
+        gpt_dummies(&own)
+    ))
+}
+
+fn gpt_plain(base: &str, base_name: &str, what: &str) -> String {
+    format!(
+        "// GENERATED by codegen::serve_gptoss from {base_name} ({what}).\n{base}\n{}",
+        gpt_dummies(&exports(base))
+    )
+}
+
+/// serve_gptoss's build directory: attention units (gptoss_attn) over MoE
+/// units (gptoss_moe) in slots, chained by host tables as serve8b_region's
+/// units, head2d_v10 on chunk triples and the embedding strip.
+pub fn serve_gptoss() -> R<Vec<File>> {
+    let tagged = |what: &str, s: String| format!("// GENERATED by codegen::serve_gptoss from {what} + serve8b_region/grid_extra.csl.\n{s}");
+    Ok(vec![
+        ("layout.csl", src::gpt::LAYOUT.to_string()),
+        ("paths.csl", src::gpt::PATHS.to_string()),
+        ("rt.csl", src::RT.to_string()),
+        (
+            "attn_pe.csl",
+            tagged("gptoss_attn.csl", unit_with("gptoss_attn", src::GPTOSS_ATTN, false, true)?),
+        ),
+        (
+            "moe_pe.csl",
+            tagged(
+                "gptoss_moe()",
+                unit_with(
+                    "gptoss_moe",
+                    // gpt-oss's RMSNorm epsilon (qwen2d_paged8b's is 1e-6).
+                    &patch(
+                        &gptoss_moe()?,
+                        "const EPS: f32 = 1.0e-6;\n",
+                        "const EPS: f32 = 1.0e-5;   // serve_gptoss: gpt-oss's rms_norm_eps\n",
+                        "moe EPS",
+                    )?,
+                    false,
+                    true,
+                )?,
+            ),
+        ),
+        ("head_pe.csl", gpt_head()?),
+        (
+            "embed_pe.csl",
+            gpt_plain(src::gpt::EMBED_BASE, "embed_base.csl", "the embedding strip"),
+        ),
+        (
+            "filler.csl",
+            gpt_plain(src::gpt::FILLER_BASE, "filler_base.csl", "the filler"),
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `GPT_OUT=<dir>`: serve_gptoss's build directory written there.
+    #[test]
+    #[ignore]
+    fn dump_serve_gptoss() {
+        let dir = std::path::PathBuf::from(std::env::var("GPT_OUT").expect("GPT_OUT"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in serve_gptoss().expect("serve_gptoss generates") {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+    }
 
     /// `Q35_OUT=<dir>`: serve_q35's build directory written there (to
     /// compile it with cslc by hand).
