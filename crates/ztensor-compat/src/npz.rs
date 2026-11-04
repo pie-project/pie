@@ -180,7 +180,9 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
 
         let stored = entry.compression() == zip::CompressionMethod::Stored;
         let (header, placed) = if stored {
-            let start = entry.data_start();
+            let start = entry
+                .data_start()
+                .ok_or_else(|| bad(format!("entry {name:?} has no data offset")))?;
             let size = entry.size();
             if crate::safe::add("npz entry", start, size)? > store.len() {
                 return Err(bad(format!("entry {name:?} extends past file")));
