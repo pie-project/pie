@@ -20,6 +20,11 @@ test('a server installs language components and inferlets from bytes', () => {
   }
 });
 
+test('under Node, `packages` is refused rather than ignored', async () => {
+  const packages = { 'qwen_3.poem': '# edited\n' };
+  await assert.rejects(Server.start({ model: 'Qwen/Qwen3.5-0.8B', packages }), /<home>\/models/);
+});
+
 test('with `model`, the config must be an object', async () => {
   await assert.rejects(Server.start({ model: 'Qwen/Qwen3.5-0.8B', config: '[server]\nlisten = "127.0.0.1:0"\n' }), /config.*object/);
 });
