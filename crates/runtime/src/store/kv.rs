@@ -376,6 +376,15 @@ impl KvStore {
         Ok(sealed)
     }
 
+    /// [`Self::page_keys`] from row 0, which reads nothing of the store: a
+    /// caller hashes them before it takes the store's lock.
+    pub fn fresh_page_keys(slots: &[Hash256], page_size: u32) -> Vec<Hash256> {
+        slots
+            .chunks_exact(page_size.max(1) as usize)
+            .map(|page| hash::page_hash(&page.iter().copied().map(Some).collect::<Vec<_>>()))
+            .collect()
+    }
+
     /// `None` when an earlier page is not sealed: no key names what follows.
     pub fn page_keys(
         &self,

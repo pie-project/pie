@@ -822,9 +822,16 @@ fn supply(
     let page = u64::from(page_size.max(1));
     let limit = (held + rows - 1) / page;
     let tokens_of = |pages: u64| &full.lanes[0].tokens[..((pages * page) - held) as usize];
+    let fresh = (held == 0).then(|| crate::store::kv::KvStore::fresh_page_keys(slots, page_size));
     let looked = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-        let Some(keys) = kv.page_keys(ws, held, slots, page_size)? else {
-            return Ok(None);
+        let keys = match fresh {
+            Some(keys) => keys,
+            None => {
+                let Some(keys) = kv.page_keys(ws, held, slots, page_size)? else {
+                    return Ok(None);
+                };
+                keys
+            }
         };
         let run = kv.cached_run(&keys);
         let clean = held.is_multiple_of(page) && kv.mapped_len(ws)? == held / page;
@@ -906,9 +913,16 @@ async fn promote<C: FireContext>(
     let held = u64::from(full.lanes[0].kv.held);
     let page = u64::from(page_size.max(1));
     let limit = ((held + slots.len() as u64 - 1) / page) as usize;
+    let fresh = (held == 0).then(|| crate::store::kv::KvStore::fresh_page_keys(slots, page_size));
     let found = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-        let Some(keys) = kv.page_keys(ws.id, held, slots, page_size)? else {
-            return Ok::<_, crate::store::kv::KvStoreError>(None);
+        let keys = match fresh {
+            Some(keys) => keys,
+            None => {
+                let Some(keys) = kv.page_keys(ws.id, held, slots, page_size)? else {
+                    return Ok::<_, crate::store::kv::KvStoreError>(None);
+                };
+                keys
+            }
         };
         let mut run = kv.cached_run_any_tier(&keys);
         run.truncate(limit);
