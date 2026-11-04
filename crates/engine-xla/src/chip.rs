@@ -178,6 +178,13 @@ pub struct PageFloor(pub u32);
 #[decision(id = "engine.pad.prefill_floor", constant(set(1, 8, 16, 32, 64)), default = 16, tune = search)]
 pub struct PrefillFloor(pub u32);
 
+/// Row rungs between two rungs of the ladder from 512 rows up, at even
+/// 128-row multiples: a 512-token prompt (with its template) runs a 640-row
+/// fire, not a 1024-row one. 1 keeps the ladder as `growth` lays it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.pad.row_steps", constant(set(1, 2, 4)), default = 1, tune = search)]
+pub struct PadRowSteps(pub u32);
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("xla", FACTS, &["rows"]);
     kernels_xla::tuning::register(&mut r);
@@ -188,7 +195,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<PadRoom>()
         .add::<MixedHostRung>()
         .add::<PageFloor>()
-        .add::<PrefillFloor>();
+        .add::<PrefillFloor>()
+        .add::<PadRowSteps>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     poem_compiler::costs::register(&mut r, 2);
     r
@@ -224,6 +232,8 @@ pub struct Pad {
     pub page_floor: u32,
     /// The least rows a fire that prefills is padded to.
     pub prefill_floor: u32,
+    /// Row rungs a step of the ladder holds from 512 rows up.
+    pub row_steps: u32,
 }
 
 impl Pad {
@@ -248,14 +258,24 @@ impl Pad {
         r
     }
 
-    /// Every rung from 1 below `top`, then `top`.
+    /// Every rung from 1 below `top`, then `top`; from 512 up, each step
+    /// split into `row_steps` rungs of whole 128-row multiples.
     #[must_use]
     pub fn ladder(&self, top: u32) -> Vec<u32> {
         let mut out = Vec::new();
         let mut r = 1;
         while r < top {
             out.push(r);
-            r = self.next(r);
+            let next = self.next(r);
+            if r >= 512 && self.row_steps > 1 {
+                for i in 1..self.row_steps {
+                    let at = (r + (next - r) * i / self.row_steps).div_ceil(128) * 128;
+                    if at > r && at < next && at < top && out.last() != Some(&at) {
+                        out.push(at);
+                    }
+                }
+            }
+            r = next;
         }
         out.push(top);
         out
@@ -276,6 +296,7 @@ impl Engine {
                 mixed_host_rung: profile.get::<MixedHostRung>().0,
                 page_floor: profile.get::<PageFloor>().0,
                 prefill_floor: profile.get::<PrefillFloor>().0,
+                row_steps: profile.get::<PadRowSteps>().0,
             },
         }
     }
@@ -331,7 +352,6 @@ mod tests {
             kernels_xla::tuning::Tuning::on(&profile, Tpu::of("TPU v6 lite").vmem_bytes()),
             kernels_xla::tuning::Tuning::DEFAULT
         );
-        assert_eq!(Engine::of(&profile), Engine::of(&registry().defaults()));
         assert_eq!(
             Engine::of(&profile).pad,
             Pad {
@@ -340,6 +360,7 @@ mod tests {
                 mixed_host_rung: 16,
                 page_floor: 16,
                 prefill_floor: 16,
+                row_steps: 4,
             }
         );
         assert_eq!(
@@ -421,5 +442,16 @@ mod tests {
         assert_eq!(pad.ladder(100), vec![1, 2, 4, 8, 16, 32, 64, 100]);
         let finer = Pad { growth: 150, ..pad };
         assert_eq!(finer.ladder(40), vec![1, 2, 3, 5, 8, 12, 18, 27, 40]);
+        let steps = Pad {
+            row_steps: 4,
+            ..pad
+        };
+        assert_eq!(
+            steps.ladder(2176),
+            vec![
+                1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048,
+                2176
+            ]
+        );
     }
 }
