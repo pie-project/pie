@@ -117,6 +117,10 @@ pub enum Design {
     /// Qwen3.5 dense: serve2d's program around Gated DeltaNet and
     /// gated-attention grids, layer by layer (serve_q35).
     ServeQ35,
+    /// Gemma 4 dense: gemma4_layer grids in serve2d's chain, the f32 head2d
+    /// over the tied embedding and the per-layer embedding region east of
+    /// it (serve_g4).
+    ServeG4,
 }
 
 impl Design {
@@ -128,6 +132,7 @@ impl Design {
             Design::Serve8bRegion => "serve8b_region",
             Design::Serve8bRegionPipe => "serve8b_region_pipe",
             Design::ServeQ35 => "serve_q35",
+            Design::ServeG4 => "serve_g4",
         }
     }
 
@@ -139,6 +144,7 @@ impl Design {
             "serve8b_region" => Some(Design::Serve8bRegion),
             "serve8b_region_pipe" => Some(Design::Serve8bRegionPipe),
             "serve_q35" => Some(Design::ServeQ35),
+            "serve_g4" => Some(Design::ServeG4),
             _ => None,
         }
     }
@@ -149,7 +155,8 @@ impl Design {
             Design::Serve2d | Design::ServeQ35 => Some("guest4hm"),
             // The guest4hz image: one or two resident sets (VMB).
             Design::Serve2dPipe => Some("guest4hz"),
-            Design::Serve8b => None,
+            // serve_g4: head2d's stand-in VM column only.
+            Design::Serve8b | Design::ServeG4 => None,
             // guest4hz as the block east of the strip (with VMX).
             Design::Serve8bRegion | Design::Serve8bRegionPipe => Some("guest4hz"),
         }
@@ -160,7 +167,10 @@ impl Design {
     /// in serve8b's aliased scratch; and whether they alias it.
     pub fn kv_staging(self) -> (&'static str, bool) {
         match self {
-            Design::Serve2d | Design::Serve2dPipe | Design::ServeQ35 => ("f32", false),
+            // serve_g4 builds no staging (KVST 0).
+            Design::Serve2d | Design::Serve2dPipe | Design::ServeQ35 | Design::ServeG4 => {
+                ("f32", false)
+            }
             Design::Serve8b => ("bf16x2", true),
             Design::Serve8bRegion | Design::Serve8bRegionPipe => ("bf16", false),
         }
@@ -190,6 +200,7 @@ impl Design {
             Design::Serve8bRegion => serve8b_region(false, variant),
             Design::Serve8bRegionPipe => serve8b_region(true, variant),
             Design::ServeQ35 => serve_q35(),
+            Design::ServeG4 => serve_g4(),
         }
     }
 }

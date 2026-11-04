@@ -350,6 +350,19 @@ mod recorder {
                 .cloned()
         }
 
+        /// Every (symbol, x, y) and its words, sorted.
+        pub fn dump(&self) -> Vec<((String, i32, i32), Vec<u32>)> {
+            let mut out: Vec<_> = self
+                .state
+                .borrow()
+                .memory
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            out.sort();
+            out
+        }
+
         /// The calls so far, and the log emptied.
         pub fn take(&self) -> Vec<Call> {
             std::mem::take(&mut self.state.borrow_mut().calls)

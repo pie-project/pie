@@ -359,6 +359,44 @@ pub fn build_for(
     compile(&program, target, system)
 }
 
+/// The serve_g4 program PIE builds for Gemma 4 `spec` under `cfg`: its
+/// plan's parameters, the compile (cached).
+pub fn build_g4(
+    spec: &super::model_g4::G4Spec,
+    cfg: &ServeConfig,
+    target: crate::sdk::Target,
+    system: bool,
+) -> R<PathBuf> {
+    let program = g4_program(spec, cfg)?;
+    tracing::info!(design = program.design.name(), model = %spec.name, "spatial build: the plan's program");
+    compile(&program, target, system)
+}
+
+/// Gemma 4's serve_g4 program: its plan's parameters, as given (the
+/// config's pins and VM images are serve2d's and serve8b's).
+pub fn g4_program(spec: &super::model_g4::G4Spec, cfg: &ServeConfig) -> R<ProgramSpec> {
+    let plan = super::plan_g4::G4Plan::derive(spec, super::plan::WaferDims::CS3, cfg.goals)
+        .map_err(|e| e.to_string())?;
+    let Some(params) = plan.params() else {
+        return Err(format!(
+            "{}: no serve_g4 program places the model: {}",
+            spec.name,
+            plan.blockers.join("; ")
+        ));
+    };
+    if cfg.region || cfg.vm.is_some() || cfg.pins.gw.is_some() {
+        return Err(format!(
+            "{}: serve_g4 takes no `region`, VM image or pins",
+            spec.name
+        ));
+    }
+    let params: super::program::Params = params
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    ProgramSpec::from_params(Design::ServeG4, &params)
+}
+
 /// A hybrid model's serve_q35 program: its plan's parameters, as given
 /// (the config's pins and VM images are serve2d's and serve8b's).
 pub fn q35_program(spec: &super::model::ModelSpec, cfg: &ServeConfig) -> R<ProgramSpec> {
@@ -947,6 +985,7 @@ fn serve2d(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Draft> {
             gh: p.gh,
             tc: super::plan::TC,
             hybrid: None,
+            gemma: None,
         },
         match (pipe, mmax) {
             (true, m) if m > 0 => Stage::Ring { mmax: m },
@@ -1213,6 +1252,7 @@ pub fn program(plan: &SpatialPlan, cfg: &ServeConfig) -> R<ProgramSpec> {
         Design::Serve8bRegion | Design::Serve8bRegionPipe => serve8b_region(plan, cfg, d)?,
         Design::Serve2d | Design::Serve2dPipe => serve2d(plan, cfg, d)?,
         Design::ServeQ35 => return Err("serve_q35 builds from a hybrid plan (q35_program)".into()),
+        Design::ServeG4 => return Err("serve_g4 builds from a Gemma 4 plan (g4_program)".into()),
     };
     cfg.pins.apply(&mut draft);
     // The head's VM on the final geometry (serve8b_region's is its block).

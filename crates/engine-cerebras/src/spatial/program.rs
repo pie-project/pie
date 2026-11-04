@@ -118,6 +118,9 @@ pub enum Layers {
         gh: usize,
         tc: usize,
         hybrid: Option<Hybrid>,
+        /// serve_g4: Gemma 4's layers on the grids (`grid` is a sliding
+        /// layer's of the shared prefix; [`Gemma`] the rest).
+        gemma: Option<Gemma>,
     },
     /// serve8b: bf16 grids in strips; strips past the first `full` skip
     /// their westmost slot.
@@ -145,6 +148,71 @@ pub struct Hybrid {
     pub dv: usize,
     pub cw: usize,
     pub rot: usize,
+}
+
+/// serve_g4's Gemma 4 layers: `nl` grids (the last strip's missing ones are
+/// fillers), layer `l` reading globally where bit `l` of `kinds` is set
+/// (`dcg` dims a column, else `dcs`), the first `nown` owning their kv (the
+/// shared tail after them reads its reading's source's), the MLP `ics`
+/// rows a column (the tail's `ict`), `pc` PLE dims a column, the PLE
+/// region's `npc` columns of `rpp` vocabulary rows a PE; `esb`/`psb` the
+/// f32 bits of sqrt(hidden) and sqrt(PLE)/sqrt(2); `win` the sliding
+/// layers' window (slots a query sees, its own included; 0: every slot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gemma {
+    pub kinds: u64,
+    pub nl: usize,
+    pub nown: usize,
+    pub dcs: usize,
+    pub dcg: usize,
+    pub ics: usize,
+    pub ict: usize,
+    pub pc: usize,
+    pub npc: usize,
+    pub rpp: usize,
+    pub esb: u32,
+    pub psb: u32,
+    pub win: usize,
+}
+
+impl Gemma {
+    /// Whether layer `l` reads globally.
+    #[must_use]
+    pub fn global(&self, l: usize) -> bool {
+        self.kinds >> l & 1 == 1
+    }
+
+    /// Layer `l`'s kv dims a column.
+    #[must_use]
+    pub fn dc(&self, l: usize) -> usize {
+        if self.global(l) { self.dcg } else { self.dcs }
+    }
+
+    /// Layer `l`'s MLP rows a column.
+    #[must_use]
+    pub fn ic(&self, l: usize) -> usize {
+        if l < self.nown { self.ics } else { self.ict }
+    }
+
+    /// The layer whose kv layer `l` reads: itself below `nown`, else the
+    /// last owning layer of its reading.
+    #[must_use]
+    pub fn source(&self, l: usize) -> usize {
+        if l < self.nown {
+            return l;
+        }
+        (0..self.nown)
+            .rev()
+            .find(|&j| self.global(j) == self.global(l))
+            .unwrap_or(l)
+    }
+
+    /// The PLE row's u32 words a lane (a strip's `gw` layers, two bf16 a
+    /// word).
+    #[must_use]
+    pub fn row_words(&self, gw: usize, p: usize) -> usize {
+        gw * p * self.pc / 2
+    }
 }
 
 impl Hybrid {
@@ -336,6 +404,7 @@ impl ProgramSpec {
             Design::Serve2d | Design::Serve2dPipe | Design::ServeQ35 => serve2d(design, &get)?,
             Design::Serve8b => serve8b(&get)?,
             Design::Serve8bRegion | Design::Serve8bRegionPipe => serve8b_region(design, &get)?,
+            Design::ServeG4 => serve_g4(&get)?,
         };
         spec.order = params.iter().map(|(k, _)| k.clone()).collect();
         spec.knobs = params
@@ -524,7 +593,9 @@ impl ProgramSpec {
     /// PIE) are a build of.
     pub fn infer_design(params: &[(String, String)]) -> R<Design> {
         let get = Get(params);
-        Ok(if get.opt("Q35") == Some(1) {
+        Ok(if get.opt("NOWN").is_some() && get.opt("NPC").is_some() {
+            Design::ServeG4
+        } else if get.opt("Q35") == Some(1) {
             Design::ServeQ35
         } else if get.opt("RPX").is_some() {
             if get.opt("PIPE") == Some(1) {
@@ -615,6 +686,30 @@ impl ProgramSpec {
                 "DV" => Some(h.dv),
                 "CW" => Some(h.cw),
                 "ROT" => Some(h.rot),
+                _ => None,
+            },
+            (
+                Layers::Grids {
+                    gemma: Some(g),
+                    grid,
+                    ..
+                },
+                _,
+            ) => match k {
+                "P" => Some(grid.px),
+                "DcS" => Some(g.dcs),
+                "DcG" => Some(g.dcg),
+                "IcS" => Some(g.ics),
+                "IcT" => Some(g.ict),
+                "PC" => Some(g.pc),
+                "KINDS" => usize::try_from(g.kinds).ok(),
+                "NL" => Some(g.nl),
+                "NOWN" => Some(g.nown),
+                "NPC" => Some(g.npc),
+                "RPP" => Some(g.rpp),
+                "ESB" => Some(g.esb as usize),
+                "PSB" => Some(g.psb as usize),
+                "WIN" => Some(g.win),
                 _ => None,
             },
             (Layers::Strips { full, .. }, "GS") => Some(full),
@@ -743,6 +838,15 @@ impl ProgramSpec {
     #[must_use]
     pub fn attends(&self, l: usize) -> bool {
         self.hybrid().is_none_or(|h| h.attends(l))
+    }
+
+    /// serve_g4's Gemma 4 layers.
+    #[must_use]
+    pub fn gemma(&self) -> Option<Gemma> {
+        match self.layers {
+            Layers::Grids { gemma, .. } => gemma,
+            _ => None,
+        }
     }
 
     // ------------------------------------------------------- the geometry
@@ -887,6 +991,7 @@ impl ProgramSpec {
         match self.layers {
             Layers::Strips { full, gw, gh, .. } => full * gw + (gh - full) * (gw - 1),
             Layers::Units { units, .. } => units.layers(),
+            Layers::Grids { gemma: Some(g), .. } => g.nl,
             Layers::Grids { gw, gh, .. } => gw * gh,
         }
     }
@@ -925,6 +1030,22 @@ impl ProgramSpec {
                     rect(x, y, px, py)
                 })
                 .collect(),
+            // serve_g4: the full strips, then the last one's layers (its
+            // missing grids are fillers).
+            Layers::Grids {
+                gemma: Some(g), gw, ..
+            } => {
+                let (full, rest) = (g.nl / gw, g.nl % gw);
+                let mut a = Vec::new();
+                if full > 0 {
+                    a.push(rect(0, 0, gw * px, full * py));
+                }
+                if rest > 0 {
+                    let x = if full % 2 == 0 { gw - rest } else { 0 };
+                    a.push(rect(x * px, full * py, rest * px, py));
+                }
+                a
+            }
             Layers::Grids { gw, gh, .. } => vec![rect(0, 0, gw * px, gh * py)],
         }
     }
@@ -937,7 +1058,10 @@ impl ProgramSpec {
         let (px, py, hh) = (self.px(), self.py(), self.hh());
         let head = hh + 1;
         match self.layers {
-            Layers::Grids { gw, gh, .. } => (gw * px + py + self.vmc(), (gh * py).max(head)),
+            Layers::Grids { gw, gh, gemma, .. } => (
+                gw * px + py + self.vmc() + gemma.map_or(0, |g| g.npc),
+                (gh * py).max(head),
+            ),
             Layers::Strips { gw, gh, .. } => {
                 (gw * px + py / 2 + self.vmc() + py / 4, (gh * py).max(head))
             }
@@ -1116,6 +1240,7 @@ fn serve2d(design: Design, get: &Get) -> R<ProgramSpec> {
             gh: get.req("GH")?,
             tc: get.req("Tc")?,
             hybrid: None,
+            gemma: None,
         },
         stage: Stage::Single,
         head: head(get, true)?,
@@ -1184,6 +1309,80 @@ fn serve2d(design: Design, get: &Get) -> R<ProgramSpec> {
         || (spec.vmc() > 1 && spec.vm().is_none())
     {
         return Err(format!("serve2d params do not make a layout: {spec:?}"));
+    }
+    Ok(spec)
+}
+
+/// serve_g4: Gemma 4's layers as bf16 gemma4_layer grids (serpentine as
+/// serve2d's), the f32 head2d over the tied embedding, the PLE region east
+/// of it; a paged pool on every grid (the shared tail's its own, fed by
+/// the handoff), the head's argmax.
+fn serve_g4(get: &Get) -> R<ProgramSpec> {
+    let p = get.req("P")?;
+    let hc = get.req("Hc")?;
+    let g = Gemma {
+        kinds: get.req("KINDS")? as u64,
+        nl: get.req("NL")?,
+        nown: get.req("NOWN")?,
+        dcs: get.req("DcS")?,
+        dcg: get.req("DcG")?,
+        ics: get.req("IcS")?,
+        ict: get.req("IcT")?,
+        pc: get.req("PC")?,
+        npc: get.req("NPC")?,
+        rpp: get.req("RPP")?,
+        esb: u32::try_from(get.req("ESB")?).map_err(|e| e.to_string())?,
+        psb: u32::try_from(get.req("PSB")?).map_err(|e| e.to_string())?,
+        win: get.opt("WIN").unwrap_or(0),
+    };
+    let (gw, gh) = (get.req("GW")?, get.req("GH")?);
+    if g.nl > gw * gh || g.nl <= (gh - 1) * gw || g.nown > g.nl {
+        return Err(format!(
+            "serve_g4: {} layers do not fill {gw} x {gh} grids (the last strip part)",
+            g.nl
+        ));
+    }
+    if get.opt("VM").unwrap_or(0) != 0 || get.opt("KVST").unwrap_or(0) != 0 {
+        return Err("serve_g4 carries no VM and no KV staging (VM 0, KVST 0)".into());
+    }
+    let grid = Kernel {
+        px: p,
+        py: p,
+        hc,
+        dc: g.dcs,
+        gs: get.req("Gs")?,
+        ic: g.ics,
+    };
+    let spec = ProgramSpec {
+        design: Design::ServeG4,
+        model: Model {
+            hidden: p * hc,
+            qh: get.req("Qh")?,
+            vocab: get.req("vocab")?,
+            cap: get.req("CAP")?,
+        },
+        layers: Layers::Grids {
+            grid,
+            gw,
+            gh,
+            tc: 0,
+            hybrid: None,
+            gemma: Some(g),
+        },
+        stage: Stage::Single,
+        head: head(get, true)?,
+        kv: Kv::Paged {
+            shape: shape(get, p)?,
+            copy: PageCopy::Kernels,
+            staging: 0,
+        },
+        sampler: Sampler::Argmax,
+        knobs: BTreeMap::new(),
+        raw: BTreeMap::new(),
+        order: Vec::new(),
+    };
+    if spec.gs() == 0 || spec.gx() == 0 || spec.vmc() != 1 || p % spec.gs() != 0 {
+        return Err(format!("serve_g4 params do not make a layout: {spec:?}"));
     }
     Ok(spec)
 }

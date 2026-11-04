@@ -244,6 +244,110 @@ impl G4Spec {
     }
 }
 
+impl G4Spec {
+    /// Checks a compiled serve_g4 program's params (its `out.json`) against
+    /// this model: the dims, each layer's reading and kv role, the PLE
+    /// width, and the sliding window (`WIN`: a program without it would let
+    /// a sliding layer see past the window).
+    pub fn check_program(&self, get: impl Fn(&str) -> Option<usize>) -> Result<(), Refused> {
+        let name = &self.name;
+        let no = |why: String| refuse(format!("{name}: the wafer program: {why}"));
+        let need = |k: &str| {
+            get(k).ok_or_else(|| {
+                Refused(format!(
+                    "{name}: the wafer program has no {k} (not serve_g4)"
+                ))
+            })
+        };
+        let (p, hc, gs, qh) = (need("P")?, need("Hc")?, need("Gs")?, need("Qh")?);
+        if p * hc != self.hidden
+            || gs == 0
+            || (p / gs) * qh != self.q_heads
+            || p / gs != self.kv_heads
+        {
+            return no(format!(
+                "P {p} Hc {hc} Gs {gs} Qh {qh} for hidden {}, {} q heads over {} kv heads",
+                self.hidden, self.q_heads, self.kv_heads
+            ));
+        }
+        if need("NL")? != self.layers()
+            || need("NOWN")? != self.owners()
+            || need("vocab")? != self.vocab
+        {
+            return no(format!(
+                "{} layers ({} owning kv), vocab {}: the program's NL {:?} NOWN {:?} vocab {:?}",
+                self.layers(),
+                self.owners(),
+                self.vocab,
+                get("NL"),
+                get("NOWN"),
+                get("vocab")
+            ));
+        }
+        let kinds = need("KINDS")? as u64;
+        for (l, r) in self.readings.iter().enumerate() {
+            let glob = kinds >> l & 1 == 1;
+            if glob != (*r == Reading::Global) {
+                return no(format!("layer {l} reads {r:?}; KINDS says otherwise"));
+            }
+        }
+        if need("DcS")? * gs != self.head_dim || need("DcG")? * gs != self.global_head_dim {
+            return no(format!(
+                "DcS/DcG over Gs {gs} are not head dims {}/{}",
+                self.head_dim, self.global_head_dim
+            ));
+        }
+        let ic = |l: usize| {
+            if l < self.owners() {
+                get("IcS")
+            } else {
+                get("IcT")
+            }
+        };
+        if let Some(l) = (0..self.layers()).find(|&l| ic(l).map(|i| i * p) != Some(self.inter[l])) {
+            return no(format!(
+                "layer {l}'s MLP is {} wide; IcS/IcT say otherwise",
+                self.inter[l]
+            ));
+        }
+        if get("PC").unwrap_or(0) * p != self.ple_dim.unwrap_or(0) {
+            return no(format!(
+                "PC {:?} for a PLE width {:?}",
+                get("PC"),
+                self.ple_dim
+            ));
+        }
+        if get("WIN").unwrap_or(0) != self.window {
+            return no(format!(
+                "WIN {:?}: the sliding layers see the last {} positions",
+                get("WIN"),
+                self.window
+            ));
+        }
+        Ok(())
+    }
+
+    /// Weights the model holds (the projections, the MLPs, the embedding):
+    /// the engine's account of its size.
+    pub fn params(&self) -> f64 {
+        let h = self.hidden as f64;
+        let mut n = self.vocab as f64 * h;
+        for l in 0..self.layers() {
+            let d = match self.readings[l] {
+                Reading::Sliding => self.head_dim,
+                Reading::Global => self.global_head_dim,
+            } as f64;
+            let kv = if self.kv_source[l] == l {
+                2.0 * self.kv_heads as f64
+            } else {
+                0.0
+            };
+            n += h * d * (2.0 * self.q_heads as f64 + kv) + 3.0 * h * self.inter[l] as f64;
+        }
+        n
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

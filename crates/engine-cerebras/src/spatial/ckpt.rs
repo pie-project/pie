@@ -470,6 +470,57 @@ impl Ckpt {
             data: widen(dtype, &raw),
         })
     }
+
+    /// A Hugging Face directory's tensor by its name past the language
+    /// model's trunk (`model.language_model.`, `model.` or none), widened
+    /// to f32: what serve_g4 places (Gemma 4's own names).
+    pub fn hf(&self, leaf: &str) -> R<Tensor> {
+        let (dtype, shape, raw) = self.hf_raw(leaf, None)?;
+        Ok(Tensor {
+            shape,
+            data: widen(dtype, &raw),
+        })
+    }
+
+    /// Rows `lo..hi` of [`Ckpt::hf`]'s tensor `leaf` as bf16 bits (a bf16
+    /// tensor's untouched), and the whole tensor's shape: a large table
+    /// read a band of rows at a time.
+    pub fn hf_rows_bits(&self, leaf: &str, lo: usize, hi: usize) -> R<(Vec<usize>, Vec<u16>)> {
+        let (dtype, shape, raw) = self.hf_raw(leaf, Some((lo, hi)))?;
+        let bits = match dtype {
+            Dtype::Bf16 => raw
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+            _ => widen(dtype, &raw).iter().map(|&x| bf16_bits(x)).collect(),
+        };
+        Ok((shape, bits))
+    }
+
+    fn hf_raw(&self, leaf: &str, rows: Option<(usize, usize)>) -> R<Raw> {
+        let Inner::Files { paths, entries } = &self.inner else {
+            return Err(format!(
+                "{leaf}: this placement reads a Hugging Face directory (`spatial_ckpt`), \
+                 not the landed planes"
+            ));
+        };
+        let e = TRUNKS
+            .iter()
+            .find_map(|t| entries.get(&format!("{t}{leaf}")))
+            .ok_or_else(|| format!("the checkpoint has no tensor {leaf}"))?;
+        let row = e.shape.iter().skip(1).product::<usize>() * e.dtype.bytes();
+        let n = e.shape.first().copied().unwrap_or(1);
+        let (lo, hi) = rows.unwrap_or((0, n));
+        if lo > hi || hi > n {
+            return Err(format!("{leaf}: rows {lo}..{hi} of {n}"));
+        }
+        let path = &paths[e.file];
+        let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let raw = read_at(&mut file, e.offset + (lo * row) as u64, (hi - lo) * row)?;
+        Ok((e.dtype, e.shape.clone(), raw))
+    }
 }
 
 /// Collects the executor's planes by plan param name.

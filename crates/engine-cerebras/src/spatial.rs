@@ -38,7 +38,7 @@
 //! - [`plan`], [`shapes`], [`build`]: the plan, the hardware-validated
 //!   shapes, the build of a [`program::ProgramSpec`];
 //! - [`program`], [`component`]: the typed program and its components'
-//!   host halves and ABI ([`serve2d`], [`serve_q35`], [`serve8b`], [`serve8b_region`]: the
+//!   host halves and ABI ([`serve2d`], [`serve_q35`], [`serve_g4`], [`serve8b`], [`serve8b_region`]: the
 //!   designs' tile layouts and route rules);
 //! - [`device`], [`wafer`]: the [`device::Device`] the host drives, and the
 //!   driver;
@@ -65,6 +65,7 @@ pub mod program;
 pub mod serve2d;
 pub mod serve8b;
 pub mod serve8b_region;
+pub mod serve_g4;
 pub mod serve_q35;
 pub mod shapes;
 pub mod wafer;

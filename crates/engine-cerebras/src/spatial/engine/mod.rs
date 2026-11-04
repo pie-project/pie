@@ -151,7 +151,7 @@ impl Spatial {
     /// model's plan (`serve`); checked against the model (dims, layers,
     /// vocabulary, and what the placement assumes: the head, eps, q/k
     /// norms, theta).
-    fn program_dir(&self, spec: &model::ModelSpec, page_size: usize) -> EngineResult<String> {
+    fn program_dir(&self, spec: &Read, page_size: usize) -> EngineResult<String> {
         let program = match &self.spatial.program {
             Some(dir) => Some(dir.clone()),
             None => match &self.spatial.serve {
@@ -159,8 +159,13 @@ impl Spatial {
                 Some(t) => {
                     let cfg = build::ServeConfig::from_toml(t, page_size)
                         .map_err(|e| Error::Load(e.to_string()))?;
+                    let (target, system) = (self.boot.target, self.boot.cmaddr.is_some());
+                    let built = match spec {
+                        Read::Dense(spec) => build::build_for(spec, &cfg, target, system),
+                        Read::Gemma(g) => build::build_g4(g, &cfg, target, system),
+                    };
                     Some(
-                        build::build_for(spec, &cfg, self.boot.target, self.boot.cmaddr.is_some())
+                        built
                             .map_err(|e| Error::Load(format!("building the spatial program: {e}")))?
                             .display()
                             .to_string(),
@@ -179,8 +184,12 @@ impl Spatial {
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .ok_or_else(|| Error::Load(format!("{}: no readable out.json", out_json.display())))?;
-        spec.check_program(model::out_json_params(&json))
-            .map_err(|e| Error::Load(e.to_string()))?;
+        let get = model::out_json_params(&json);
+        match spec {
+            Read::Dense(spec) => spec.check_program(get),
+            Read::Gemma(g) => g.check_program(get),
+        }
+        .map_err(|e| Error::Load(e.to_string()))?;
         Ok(program)
     }
 
@@ -188,6 +197,25 @@ impl Spatial {
         self.model
             .as_mut()
             .ok_or_else(|| Error::Load("the spatial engine has no model loaded".into()))
+    }
+}
+
+/// The model as the spatial kernels see it: a Qwen3-dense-like model (or
+/// Qwen3.5's hybrid), or Gemma 4 dense (serve_g4).
+enum Read {
+    Dense(model::ModelSpec),
+    Gemma(super::model_g4::G4Spec),
+}
+
+impl Read {
+    /// The trace as one of the two; ModelSpec's refusal when neither reads.
+    fn of(trace: &poem_ir::Trace) -> Result<Read, model::Refused> {
+        match model::ModelSpec::read(trace) {
+            Ok(spec) => Ok(Read::Dense(spec)),
+            Err(why) => super::model_g4::G4Spec::read(trace)
+                .map(Read::Gemma)
+                .map_err(|_| why),
+        }
     }
 }
 
@@ -232,15 +260,18 @@ impl Engine for Spatial {
             poem_compiler::state_slots(budgets.slots, &trace, crate::api::DEFAULT_STATE_SLOTS);
         // The model as the spatial kernels see it: refused here unless its
         // structure is one they implement (spatial/plan.rs).
-        let spec = model::ModelSpec::read(&trace).map_err(|e| Error::Load(e.to_string()))?;
+        let spec = Read::of(&trace).map_err(|e| Error::Load(e.to_string()))?;
         // The weights land by the trace's params (the shell takes the trace).
         let weights_trace = trace.clone();
-        self.params = {
-            let (h, hd) = (spec.hidden as f64, spec.head_dim as f64);
-            let attn = h * hd * (2 * spec.q_heads + 2 * spec.kv_heads) as f64;
-            let heads = if spec.tied { 1.0 } else { 2.0 };
-            spec.layers as f64 * (attn + 3.0 * h * spec.inter as f64)
-                + heads * spec.vocab as f64 * h
+        self.params = match &spec {
+            Read::Dense(spec) => {
+                let (h, hd) = (spec.hidden as f64, spec.head_dim as f64);
+                let attn = h * hd * (2 * spec.q_heads + 2 * spec.kv_heads) as f64;
+                let heads = if spec.tied { 1.0 } else { 2.0 };
+                spec.layers as f64 * (attn + 3.0 * h * spec.inter as f64)
+                    + heads * spec.vocab as f64 * h
+            }
+            Read::Gemma(g) => g.params(),
         };
         let shell = Shell::load_dry(
             Boot {
@@ -278,10 +309,17 @@ impl Engine for Spatial {
             }),
         };
         // RoPE as the trace states it: theta's frequencies, or its scaled
-        // table (llama3).
-        let rope = Some(wafer::Rotary {
-            theta: f64::from(spec.rope_theta),
-            table: spec.rope_table.as_ref().map(|t| t.inv_freq.clone()),
+        // table (llama3). serve_g4 reads both readings' RoPE from the
+        // checkpoint.
+        let rope = Some(match &spec {
+            Read::Dense(spec) => wafer::Rotary {
+                theta: f64::from(spec.rope_theta),
+                table: spec.rope_table.as_ref().map(|t| t.inv_freq.clone()),
+            },
+            Read::Gemma(g) => wafer::Rotary {
+                theta: f64::from(g.theta),
+                table: None,
+            },
         });
         // The weights through PIE's checkpoint path (the load's contract
         // over its checkpoint); `ckpt` names a Hugging Face directory

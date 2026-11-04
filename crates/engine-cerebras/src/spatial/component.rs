@@ -140,6 +140,19 @@ impl Component for Layers {
         use abi::Symbol as S;
         let f32s = |names: &[&'static str]| names.iter().map(|&n| S::var32(n)).collect::<Vec<_>>();
         match self {
+            // serve_g4's gemma4_layer grids (bf16 projections) and the PLE
+            // region's tables.
+            Layers::Grids { gemma: Some(_), .. } => {
+                let mut out: Vec<S> = ["wqa", "wqv", "wv", "wo", "wgu", "wd", "wpm", "wpg", "wpp"]
+                    .into_iter()
+                    .map(S::var16)
+                    .collect();
+                out.extend(f32s(&[
+                    "qkn_w", "rot_c", "rot_s", "gamma1", "gamma2", "gamma3", "gamma4", "gamma5",
+                    "scal", "pnw", "ptab",
+                ]));
+                out
+            }
             // qwen2d's one-sequence grids, and qwen2d_paged's.
             // serve_q35's two units, every name either exports.
             Layers::Grids {
@@ -196,6 +209,7 @@ impl Component for Layers {
 
     fn place(&self, spec: &ProgramSpec, w: &Weights, dev: &mut dyn Device) -> R<()> {
         match self {
+            Layers::Grids { gemma: Some(_), .. } => super::serve_g4::place(spec, w.ckpt, dev),
             Layers::Grids {
                 hybrid: Some(_), ..
             } => super::serve_q35::place_layers(
@@ -384,6 +398,8 @@ impl Kv {
     pub fn page_words(&self, spec: &ProgramSpec) -> Option<usize> {
         let (shape, _, _) = self.paged().ok()?;
         match spec.layers {
+            // serve_g4's pools differ by reading (Dc): no host tier.
+            Layers::Grids { gemma: Some(_), .. } => None,
             Layers::Grids { .. } => Some(paged::page_words(&Kv::host_pool(spec, shape))),
             _ => super::serve8b::page_words(spec).ok(),
         }
@@ -405,6 +421,9 @@ impl Kv {
         pages: &[u32],
     ) -> R<Vec<Vec<u32>>> {
         let (shape, _, staging) = self.paged()?;
+        if spec.gemma().is_some() {
+            return Err("serve_g4's pages stay on the wafer (no host tier)".into());
+        }
         match spec.layers {
             Layers::Grids { .. } => {
                 let pool = Kv::host_pool(spec, shape);
@@ -429,6 +448,9 @@ impl Kv {
         pages: &[(u32, Vec<u32>)],
     ) -> R<()> {
         let (shape, _, staging) = self.paged()?;
+        if spec.gemma().is_some() {
+            return Err("serve_g4's pages stay on the wafer (no host tier)".into());
+        }
         match spec.layers {
             Layers::Grids { .. } => {
                 let pool = Kv::host_pool(spec, shape);

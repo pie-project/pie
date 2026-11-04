@@ -114,13 +114,39 @@ pub struct G4Plan {
     pub head_bytes: usize,
     pub pe_bytes: usize,
     pub needs: Vec<G4Need>,
+    /// serve_g4's layout of the plan (`None`: blocked).
+    pub program: Option<G4Program>,
     /// Why no program places the model (empty when one does).
     pub blockers: Vec<String>,
 }
 
-/// The bf16 head's fixed bytes a PE (head2d_v10 as serve8b builds it,
-/// less its tiles).
-const HEAD_FIXED: usize = 14_000;
+/// serve_g4's head and PLE region: head2d's one f32 block of `p` chunk
+/// columns and `vmc` (its stand-in VM column) east of the grids, `hh`
+/// region rows of `vr` vocabulary rows (the feeder row between them), its
+/// root's `gx` x `gy` groups; east of it `npc` columns of PLE PEs holding
+/// `rpp` vocabulary rows of their strip's tables; `cap` tokens a launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct G4Program {
+    pub hh: usize,
+    pub vr: usize,
+    pub gx: usize,
+    pub gy: usize,
+    pub gb: usize,
+    pub vmc: usize,
+    pub npc: usize,
+    pub rpp: usize,
+    pub cap: usize,
+    /// Bytes a PE: head2d's block, a PLE PE.
+    pub head_pe: usize,
+    pub ple_pe: usize,
+}
+
+/// head2d's f32 block's bytes a PE less its tiles (`Hc Vr + 1` words):
+/// linked at E2B (37,648 bytes at Hc 12, Vr 228).
+const HEAD_FIXED: usize = 26_700;
+/// A PLE PE's bytes less its table slice (`RPP x NWW` words): linked at E2B
+/// (42,736 bytes at RPP 18, NWW 512).
+const PLE_FIXED: usize = 5_872;
 
 impl G4Plan {
     pub fn derive(spec: &G4Spec, wafer: WaferDims, goals: Goals) -> Result<G4Plan, Refused> {
@@ -226,16 +252,58 @@ impl G4Plan {
         };
         let gh = layers.div_ceil(gw);
         let head_cols = wafer.width - gw * p;
-        let head_pes = head_cols * wafer.height;
-        // The head holds the tied embedding and every layer's PLE table (bf16).
-        let ple = spec.ple_dim.map_or(0, |d| d * spec.layers());
-        let head_bytes = HEAD_FIXED + (2 * spec.vocab * (spec.hidden + ple)).div_ceil(head_pes);
-        if head_bytes > wafer.pe_bytes {
+        // head2d's block (f32 tiles of the tied embedding): `hh` region rows
+        // and the feeder row, as tall as the grids (even); its stand-in VM
+        // column; then the PLE region in the columns left.
+        let vmc = 1;
+        let hh = (gh * p).next_multiple_of(2);
+        let vr = spec.vocab.div_ceil(hh);
+        let hc = spec.hidden / p;
+        let head_pe = HEAD_FIXED + 4 * (hc * vr + 1);
+        let npc = head_cols.saturating_sub(p + vmc);
+        let nww = gw * p * ple_c / 2;
+        let rpp = if npc == 0 {
+            0
+        } else {
+            spec.vocab.div_ceil(npc * p)
+        };
+        let ple_pe = PLE_FIXED + 4 * rpp * nww;
+        let head_bytes = head_pe.max(ple_pe);
+        if hh + 1 > wafer.height || npc == 0 {
             blockers.push(format!(
-                "the head's {} bf16 rows (embedding and PLE tables) over {head_cols} x {} PEs want {head_bytes} bytes a PE",
-                spec.vocab, wafer.height
+                "head2d's {hh} rows and the PLE region do not fit {} x {} beside {gw} x {gh} grids",
+                wafer.width, wafer.height
             ));
         }
+        if head_pe > wafer.pe_bytes || ple_pe > wafer.pe_bytes {
+            blockers.push(format!(
+                "the head ({head_pe} bytes a PE: {vr} vocabulary rows) or the PLE region ({ple_pe}: \
+                 {rpp} rows over {npc} columns) over {} bytes",
+                wafer.pe_bytes
+            ));
+        }
+        // head2d's root groups: Gx 16 columns, Gy 18 rows a group dividing
+        // the feeder's halves.
+        let (gx, gy, gb) = (16, 18, 1);
+        if !p.is_multiple_of(gx) || !(hh / 2).is_multiple_of(gy) {
+            blockers.push(format!(
+                "head2d's groups ({gx} x {gy}) do not split {p} columns and {} rows",
+                hh / 2
+            ));
+        }
+        let program = blockers.is_empty().then_some(G4Program {
+            hh,
+            vr,
+            gx,
+            gy,
+            gb,
+            vmc,
+            npc,
+            rpp,
+            cap: goals.cap.unwrap_or(64),
+            head_pe,
+            ple_pe,
+        });
         let mut needs = vec![G4Need::SoftcapSampling];
         if units.iter().any(|u| u.reading == Reading::Sliding) {
             needs.insert(0, G4Need::WindowBits);
@@ -249,8 +317,83 @@ impl G4Plan {
             head_bytes,
             pe_bytes: wafer.pe_bytes,
             needs,
+            program,
             blockers,
         })
+    }
+
+    /// serve_g4's parameters (`layout.csl`'s order), `None` when no program
+    /// places the plan.
+    #[must_use]
+    pub fn params(&self) -> Option<Vec<(&'static str, usize)>> {
+        let pr = self.program.as_ref()?;
+        let (s, u0) = (&self.spec, &self.units[0]);
+        let g = &u0.grid;
+        let nown = s.owners();
+        if (0..s.layers()).any(|l| (l < nown) != (s.kv_source[l] == l)) {
+            return None;
+        }
+        let kinds = (0..s.layers())
+            .filter(|&l| s.readings[l] == Reading::Global)
+            .fold(0usize, |m, l| m | 1 << l);
+        let dc = |r: Reading| {
+            self.units
+                .iter()
+                .find(|u| u.reading == r)
+                .map_or(0, |u| u.grid.dc)
+        };
+        let ic_tail = self.units.get(nown).map_or(g.ic, |u| u.grid.ic);
+        let f32_bits = |x: f32| x.to_bits() as usize;
+        let ple = s.ple_dim.unwrap_or(0) as f32;
+        Some(vec![
+            ("P", g.px),
+            ("Hc", g.hc),
+            ("Gs", g.gs),
+            ("Qh", g.qh),
+            ("DcS", dc(Reading::Sliding)),
+            ("DcG", dc(Reading::Global)),
+            ("IcS", g.ic),
+            ("IcT", ic_tail),
+            ("PC", u0.ple_c),
+            ("KINDS", kinds),
+            ("NL", s.layers()),
+            ("NOWN", nown),
+            ("PS", g.page_size),
+            (
+                "NB",
+                self.units.iter().map(|u| u.grid.blocks).max().unwrap_or(1),
+            ),
+            ("E", g.entries),
+            ("B", g.lanes),
+            ("MC", g.mlp_chunk),
+            ("GW", self.gw),
+            ("GH", self.gh),
+            ("ESB", f32_bits((s.hidden as f32).sqrt())),
+            (
+                "PSB",
+                f32_bits(ple.sqrt() * std::f32::consts::FRAC_1_SQRT_2),
+            ),
+            ("NP", 3),
+            ("F", pr.hh / 2),
+            ("HH", pr.hh),
+            ("Vr", pr.vr),
+            ("Gx", pr.gx),
+            ("Gy", pr.gy),
+            ("Gb", pr.gb),
+            ("vocab", s.vocab),
+            // head2d's f32 head as serve2d builds it: three passes, exact.
+            ("PASSES", 3),
+            ("UNTIED", 0),
+            ("CERT", 0),
+            ("MODE", 0),
+            ("OVL", 0),
+            ("VMC", pr.vmc),
+            ("WF32", 1),
+            ("CAP", pr.cap),
+            ("NPC", pr.npc),
+            ("RPP", pr.rpp),
+            ("WIN", s.window),
+        ])
     }
 }
 
@@ -313,6 +456,57 @@ mod tests {
         assert!(u(13).shares_kv && u(14).shares_kv && !u(12).shares_kv && !u(15).owns_kv);
         assert_eq!((p.gw, p.gh, p.head_cols), (4, 9, 243));
         assert!(p.blockers.is_empty(), "{:?}", p.blockers);
+    }
+
+    /// E2B's params at B 1: the program built and verified on the CS-3
+    /// (scratch/g4/prog/full.params, plus the sliding window), read back as
+    /// a serve_g4 program.
+    #[test]
+    fn e2b_params_are_the_chip_programs() {
+        use crate::spatial::codegen::Design;
+        use crate::spatial::program::ProgramSpec;
+        let s = spec("gemma4-e2b-bf16-kv-bf16");
+        let p = G4Plan::derive(&s, WaferDims::CS3, Goals::lanes(1)).expect("plans");
+        let text: Vec<String> = p
+            .params()
+            .expect("a program")
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect();
+        assert_eq!(
+            text.join(","),
+            "P:128,Hc:12,Gs:128,Qh:8,DcS:2,DcG:4,IcS:48,IcT:96,PC:2,KINDS:17734058512,NL:35,\
+             NOWN:15,PS:16,NB:1,E:1,B:1,MC:1,GW:4,GH:9,ESB:1109181553,PSB:1093993715,NP:3,F:576,\
+             HH:1152,Vr:228,Gx:16,Gy:18,Gb:1,vocab:262144,PASSES:3,UNTIED:0,CERT:0,MODE:0,OVL:0,\
+             VMC:1,WF32:1,CAP:64,NPC:114,RPP:18,WIN:512"
+        );
+        let pr = p.program.expect("a program");
+        assert_eq!((pr.head_pe, pr.ple_pe), (37_648, 42_736));
+        let params: Vec<(String, String)> = p
+            .params()
+            .expect("a program")
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(ProgramSpec::infer_design(&params), Ok(Design::ServeG4));
+        let prog = ProgramSpec::from_params(Design::ServeG4, &params).expect("a program");
+        assert_eq!(prog.to_params(), params);
+        assert_eq!(prog.rectangle(), (755, 1153));
+        assert_eq!(prog.layers(), 35);
+        let g = prog.gemma().expect("gemma");
+        assert_eq!((g.source(15), g.source(19), g.source(34)), (13, 14, 14));
+        assert_eq!((g.dc(4), g.dc(5), g.ic(14), g.ic(15)), (4, 2, 48, 96));
+        // Strips 0-7 whole, strip 8's three layers east of its filler.
+        let areas: Vec<(i32, i32, i32, i32)> = prog
+            .grid_areas()
+            .iter()
+            .map(|r| (r.x, r.y, r.w, r.h))
+            .collect();
+        assert_eq!(areas, vec![(0, 0, 512, 1024), (128, 1024, 384, 128)]);
+        assert_eq!(prog.origin(32), (384, 1024));
+        assert_eq!(prog.origin(34), (128, 1024));
+        assert_eq!(prog.root(), (512 + 72, 576));
+        assert_eq!(prog.positions(), 2048);
     }
 
     /// Prints E2B's and E4B's plans at 1 and 4 lanes (`--nocapture`).
