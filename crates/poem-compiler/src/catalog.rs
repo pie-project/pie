@@ -552,6 +552,59 @@ impl Tree {
         }
         Ok(Tree { packages, library })
     }
+
+    /// This tree with `files` written over it, each named by its path under a
+    /// models directory: `qwen_3.poem`, `mimo_v2/model.poem` or `lib/nn.poem`.
+    pub fn overlay(
+        mut self,
+        files: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Tree, Refused> {
+        for (path, text) in files {
+            let (dir, file) = path.rsplit_once('/').unwrap_or(("", &path));
+            let stem = file.strip_suffix(".poem").filter(|stem| !stem.is_empty());
+            let Some(stem) = stem else {
+                return Err(Refused(format!("`{path}` is no `.poem` file")));
+            };
+            if dir == "lib" || dir.starts_with("lib/") {
+                let name = format!("{LIBRARY}{}", &path["lib/".len()..]);
+                put(&mut self.library, name, text);
+            } else if dir.is_empty() {
+                let at = package_at(&mut self.packages, stem);
+                *at = vec![(file.to_string(), text)];
+            } else if dir.contains('/') {
+                return Err(Refused(format!(
+                    "`{path}` is too deep: a package is a `.poem` file or a directory of them"
+                )));
+            } else {
+                put(package_at(&mut self.packages, dir), file.to_string(), text);
+            }
+        }
+        self.packages.sort();
+        self.library.sort();
+        Ok(self)
+    }
+}
+
+/// The files of the package `name`, a new one if the tree has none.
+fn package_at<'a>(
+    packages: &'a mut Vec<(String, Vec<(String, String)>)>,
+    name: &str,
+) -> &'a mut Vec<(String, String)> {
+    let at = match packages.iter().position(|(n, _)| n == name) {
+        Some(at) => at,
+        None => {
+            packages.push((name.to_string(), Vec::new()));
+            packages.len() - 1
+        }
+    };
+    &mut packages[at].1
+}
+
+fn put(files: &mut Vec<(String, String)>, name: String, text: String) {
+    match files.iter_mut().find(|(n, _)| *n == name) {
+        Some(file) => file.1 = text,
+        None => files.push((name, text)),
+    }
 }
 
 fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) -> Result<(), Refused> {

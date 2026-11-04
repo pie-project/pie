@@ -132,7 +132,7 @@ export class ForwardPass {
   * `value`; an unset switch takes its first declared value. Set
   * before `program`.
   */
-  'switch'(lane: number, name: string, value: string): void;
+  "switch"(lane: number, name: string, value: string): void;
   /**
   * Bind lane `lane`'s model input `name` (`model.lane`) to `ch`, whose
   * committed cell is read at every submit: `[width]`, `[rows, width]`

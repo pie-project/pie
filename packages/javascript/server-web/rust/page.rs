@@ -183,8 +183,18 @@ pub fn pie_range_failed(request: u32, error: String) {
 }
 
 #[wasm_bindgen]
-pub fn pie_boot_lazy(config_toml: String, model_name: String, len: f64) -> js_sys::Promise {
+pub fn pie_boot_lazy(
+    config_toml: String,
+    model_name: String,
+    len: f64,
+    packages_json: String,
+) -> js_sys::Promise {
     promise(async move {
+        let packages: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&packages_json)?;
+        if !packages.is_empty() {
+            runtime::catalog::overlay(packages)?;
+        }
         let (config, doc) = crate::engine::parse_config(&config_toml)?;
         let device = if config.engine {
             Some(crate::engine::request(doc).await?)

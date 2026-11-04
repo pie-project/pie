@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 tokenizer = { path = "../tokenizer" }
 anyhow = "1.0"
-lru = "0.18.1"
+lru = "0.19.0"
 rustc-hash = "2.1"
 serde_json = { version = "1.0", features = ["preserve_order"] }
 

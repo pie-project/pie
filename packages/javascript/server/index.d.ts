@@ -13,6 +13,12 @@ export interface StartOptions {
   config?: Record<string, unknown> | string;
   /** Node: where the runtime keeps its files (installed inferlets, languages, caches, models); `$PIE_HOME`, else `~/.pie`. */
   home?: string;
+  /**
+   * Browser only: poem files over the ones this build embeds, each a path under
+   * a models directory to its text or a URL. Node reads `<home>/models/`, and
+   * refuses this option rather than ignore it.
+   */
+  packages?: Record<string, string | URL>;
   /** Browser only: download progress of a lazy boot. */
   onProgress?: (served: number, total: number, from: 'network' | 'cache') => void;
 }

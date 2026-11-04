@@ -115,8 +115,9 @@ export async function memoryBytes() {
   return await ready().call("memoryBytes");
 }
 
-export async function bootLazy(url, config, onProgress) {
-  return await ready().call("bootLazy", [url, config, location.href], { onProgress });
+export async function bootLazy(url, config, onProgress, packages = {}) {
+  const files = JSON.stringify(packages);
+  return await ready().call("bootLazy", [url, config, location.href, files], { onProgress });
 }
 
 export async function awaitCache() {
@@ -134,6 +135,17 @@ async function bytesOf(source) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
+/** Each package's text: a URL is fetched, a string is the text itself. */
+async function packageTexts(packages) {
+  const texts = await Promise.all(
+    Object.entries(packages).map(async ([path, source]) => [
+      path,
+      source instanceof URL ? new TextDecoder().decode(await bytesOf(source)) : source,
+    ]),
+  );
+  return Object.fromEntries(texts);
+}
+
 /** One running pie in this tab, with the surface of the Node host. */
 export class Server {
   #summary;
@@ -147,13 +159,21 @@ export class Server {
   /**
    * Boot the runtime and the WebGPU engine. `model` is the URL of a
    * `.wgpu.zt` artifact served with Range support; `config` the boot config
-   * (an object, or TOML text). Resolves once the weights are on the device,
-   * with every registered language component installed.
+   * (an object, or TOML text). `packages` lays poem files over the ones this
+   * build embeds, as editing `$PIE_HOME/models/` does for `pie serve`: a path
+   * under that directory (`qwen_3.poem`) to its text or a URL, refused here if
+   * it does not load. Resolves once the weights are on the device, with every
+   * registered language component installed.
    */
-  static async start({ model, config = {}, onProgress, worker = true, log, wasmUrl } = {}) {
+  static async start({ model, config = {}, packages = {}, onProgress, worker = true, log, wasmUrl } = {}) {
     if (typeof model !== "string") throw new Error("Server.start: `model` is the URL of the artifact to serve");
     if (!backend) await load({ worker, log, wasmUrl });
-    const summary = await bootLazy(model, typeof config === "string" ? config : JSON.stringify(config), onProgress);
+    const summary = await bootLazy(
+      model,
+      typeof config === "string" ? config : JSON.stringify(config),
+      onProgress,
+      await packageTexts(packages),
+    );
     const server = new Server(summary);
     server.#detach = await attachLanguages(server);
     return server;
