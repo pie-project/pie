@@ -2087,15 +2087,21 @@ mod llama31_8b {
         assert!(plan.spec.check_program(qwen_get).is_err());
     }
 
-    /// The ring (B 1 x 12 at CAP 32, B 4 x 4) composes, and the registry
-    /// refuses it until PY 152 has run on hardware.
+    /// The ring at PY 152: B 1 x 12 at CAP 32 ran on hardware (0402) and
+    /// builds; B 4 x 4 has not run there and stays refused.
     #[test]
-    fn the_llama_3_ring_waits_for_hardware() {
-        for b in [1, 4] {
-            let (plan, cfg) = cfg_for(b, true);
-            let e = params(&plan, &cfg).unwrap_err();
-            assert!(e.contains("PY:152 is unsupported"), "{e}");
-        }
+    fn the_llama_3_ring_b1_ran_on_hardware() {
+        let (plan, cfg) = cfg_for(1, true);
+        let (d, p) = params(&plan, &cfg).unwrap();
+        assert_eq!(d, Design::Serve8bRegionPipe);
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.as_str());
+        assert_eq!(
+            (get("PY"), get("B"), get("MMAX"), get("CAP")),
+            (Some("152"), Some("1"), Some("12"), Some("32"))
+        );
+        let (plan, cfg) = cfg_for(4, true);
+        let e = params(&plan, &cfg).unwrap_err();
+        assert!(e.contains("PY:152 is unsupported"), "{e}");
     }
 
     /// Without the rows pin the plan's 160 rows are too wide for the head

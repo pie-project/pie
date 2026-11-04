@@ -186,6 +186,18 @@ pub const RAN: &[Ran] = &[
         py: Some(144),
         reason: "real Qwen3-8B, every lane exact, on B 4's grids",
     },
+    Ran {
+        design: Design::Serve8bRegionPipe,
+        lanes: (1, 1),
+        mmax: 12,
+        cap: 32,
+        vm: Vm::Off,
+        py: Some(152),
+        reason: "real Llama 3.1 8B (QKN 0, eps 1e-5, llama3 RoPE table) on 152-row grids: \
+                 pie serve x12 (0402) all streams done, stream 0 equal to the f32 golden for \
+                 its 144 tokens, 4,361 tok/s median over 10 bursts; B 1 region on the same \
+                 grids equal to the f32 golden up to near ties (0400b, 0401)",
+    },
 ];
 
 /// A shape known to fail, and why.
@@ -244,7 +256,8 @@ MMAX<=4 CAP<=16 with the VM sets, and their 8/8 VMCONC",
         Design::Serve8bRegionPipe => format!(
             "serve8b_region_pipe B:{} MMAX:{} CAP:{} VMX:{} KVST:{} PY:{} is unsupported: only \
 B:4 MMAX<=4 CAP<=16, B:2 MMAX<=8 CAP<=32 and B:1 MMAX<=12 CAP<=32 on B 4's grids (PY 144, \
-grid_lanes 4) without the VM block or staging ran on hardware",
+grid_lanes 4), and B:1 MMAX<=12 CAP<=32 on PY 152 (Llama 3.1 8B), without the VM block or staging \
+ran on hardware",
             s.lanes,
             s.mmax,
             s.cap,
