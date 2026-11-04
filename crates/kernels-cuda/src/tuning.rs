@@ -78,6 +78,14 @@ pub struct GemmTc5SplitTickets(pub u32);
 #[decision(id = "kernel.gemm.rows_m", constant(range(0..=16)), default = 0, tune = search)]
 pub struct GemmRowsM(pub u32);
 
+/// The fewest rows a dense bf16 product runs on `cublasGemmEx`'s own
+/// algorithm with a split's partials summed in bf16, as torch's default
+/// lets cuBLAS: a prefill's wide products on an Ada's GeForce tensor cores
+/// then take the split tiles. 0 never: every split summed in f32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.gemm.bf16_split_from", constant(range(0..=65536)), default = 0, tune = search)]
+pub struct GemmBf16SplitFrom(pub u32);
+
 /// Programmatic dependent launch: a kernel that opts in (it waits on its
 /// predecessor in-kernel before reading what that one wrote) launches while
 /// the stream's previous kernel finishes, its launch latency hidden. Off but
@@ -1033,6 +1041,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmTc5Raster>()
         .add::<KernelPdl>()
         .add::<GemmRowsM>()
+        .add::<GemmBf16SplitFrom>()
         .add::<GemmTc5SplitTickets>()
         .add::<MoeNvfp4MmaUntil>()
         .add::<MoeGateTc5Until>()
@@ -1194,6 +1203,7 @@ tuning! {
     gemm_tc5_raster: u32 = 8, get GemmTc5Raster;
     pdl: bool = false, on KernelPdl;
     gemm_rows_m: u32 = 0, get GemmRowsM;
+    gemm_bf16_split_from: u32 = 0, get GemmBf16SplitFrom;
     gemm_tc5_split_tickets: u32 = 0, get GemmTc5SplitTickets;
     nvfp4_mma_from: u32 = 1, get MoeNvfp4MmaFrom;
     nvfp4_mma_until: u32 = 0, get MoeNvfp4MmaUntil;
