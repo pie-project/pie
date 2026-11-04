@@ -537,8 +537,13 @@ fn pack(lo: u16, hi: u16) -> u32 {
 /// holds dims c Hh .. of vocab rows ry Vr .., dim-major, two to a word; a
 /// zero VM column after the root column; the final norm on the feeder row.
 pub(crate) fn head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()> {
+    head_with(lay, ckpt, dev, 2 * lay.hc())
+}
+
+/// [`head`] with `hh2` dims a chunk column (serve8b's pairs of grid rows,
+/// serve_gptoss's triples).
+pub(crate) fn head_with(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device, hh2: usize) -> R<()> {
     let (vr, c_n, hid, vmc) = (lay.vr(), lay.chunk_cols(), lay.hidden(), lay.vmc());
-    let hh2 = 2 * lay.hc();
     let (shape, lm) = ckpt.bits("head")?;
     let v = shape[0];
     if shape.len() != 2 || shape[1] != hid || v > lay.vocab() || lay.vocab() > lay.hh() * vr {
@@ -599,8 +604,19 @@ pub(crate) fn head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()
 /// column EC-1-c, ry) holds dims [c He, (c+1) He) of vocab rows ry Vr ..,
 /// row-major bf16, two to a word.
 pub(crate) fn embed(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()> {
+    embed_with(lay, ckpt, dev, lay.py() / 4, 4 * lay.hc())
+}
+
+/// [`embed`] over `ec` strip columns of `he` dims (a PE's words padded to
+/// whole words when `Vr He` is odd).
+pub(crate) fn embed_with(
+    lay: &ProgramSpec,
+    ckpt: &Ckpt,
+    dev: &mut dyn Device,
+    ec: usize,
+    he: usize,
+) -> R<()> {
     let (ve, hid) = (lay.vr(), lay.hidden());
-    let (ec, he) = (lay.py() / 4, 4 * lay.hc());
     let (shape, em) = ckpt.bits("embed")?;
     let v = shape[0];
     if shape.len() != 2 || shape[1] != hid || v > lay.hh() * ve {
@@ -609,11 +625,11 @@ pub(crate) fn embed(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<(
             lay.hh() * ve
         ));
     }
-    let n = ve * he / 2;
+    let n = (ve * he).div_ceil(2);
     let el = |row: usize, c: usize, j: usize| -> u16 {
         let (vv, k) = (j / he, j % he);
         let (vocab_row, d) = (row * ve + vv, c * he + k);
-        if vocab_row < v && d < hid {
+        if vv < ve && vocab_row < v && d < hid {
             em[vocab_row * hid + d]
         } else {
             0

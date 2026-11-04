@@ -34,6 +34,7 @@ use std::collections::BTreeMap;
 use super::codegen::Design;
 use super::guest4::wafer::{HeadGeometry, VmLayout, VmLimits};
 use super::paged::Shape;
+use super::serve_gptoss::{Gpt, Slots};
 use super::serve8b::Kernel;
 use super::serve8b_region::{Units, VmBlock};
 use super::wafer::rect;
@@ -132,6 +133,9 @@ pub enum Layers {
     },
     /// serve8b_region: grids and several-layer regions.
     Units { grid: Kernel, units: Units },
+    /// serve_gptoss: per layer an attention unit over a MoE grid (`grid`,
+    /// whose rows the head's chunk triples follow) in a slot.
+    Gptoss { grid: Kernel, gpt: Gpt },
 }
 
 /// serve_q35's layer mix and its Gated DeltaNet unit's splits: layer `l`
@@ -250,7 +254,8 @@ impl Layers {
         match *self {
             Layers::Grids { grid, .. }
             | Layers::Strips { grid, .. }
-            | Layers::Units { grid, .. } => grid,
+            | Layers::Units { grid, .. }
+            | Layers::Gptoss { grid, .. } => grid,
         }
     }
 }
@@ -273,6 +278,10 @@ pub enum HeadKind {
     /// head2d_v10 over bf16 tiles of `lm_head` (an untied head), `PY / 2`
     /// chunk columns, and the embedding strip east of it.
     Untied,
+    /// head2d_v10 as serve_gptoss carries it: `PY / 3` chunk columns of
+    /// the MoE grid's row triples, the embedding strip of the attention
+    /// unit's rows east of it.
+    Triples,
 }
 
 /// The head: `hh` region rows of `vr` vocabulary rows (its feeder row
@@ -408,6 +417,7 @@ impl ProgramSpec {
             Design::Serve8b => serve8b(&get)?,
             Design::Serve8bRegion | Design::Serve8bRegionPipe => serve8b_region(design, &get)?,
             Design::ServeG4 => serve_g4(&get)?,
+            Design::ServeGptoss => serve_gptoss(&get)?,
         };
         spec.order = params.iter().map(|(k, _)| k.clone()).collect();
         spec.knobs = params
@@ -600,6 +610,8 @@ impl ProgramSpec {
             Design::ServeG4
         } else if get.opt("Q35") == Some(1) {
             Design::ServeQ35
+        } else if get.opt("NE").is_some() && get.opt("AY").is_some() {
+            Design::ServeGptoss
         } else if get.opt("RPX").is_some() {
             if get.opt("PIPE") == Some(1) {
                 Design::Serve8bRegionPipe
@@ -717,6 +729,26 @@ impl ProgramSpec {
                 _ => None,
             },
             (Layers::Strips { full, .. }, "GS") => Some(full),
+            (Layers::Gptoss { gpt: g, .. }, _) => match k {
+                "AY" => Some(g.slots.ay),
+                "AHc" => Some(g.slots.ahc),
+                "MY" => Some(g.slots.my),
+                "MHc" => Some(g.slots.mhc),
+                "GW" => Some(g.slots.gw),
+                "GH" => Some(g.slots.gh),
+                "NL" => Some(g.slots.nl),
+                "NE" => Some(g.ne),
+                "TK" => Some(g.tk),
+                "AGY" => Some(g.agy),
+                "MGY" => Some(g.mgy),
+                "SLW" => usize::try_from(g.slw).ok(),
+                "WIN" => Some(g.win),
+                "RTR" => Some(g.rtr),
+                "RTI" => Some(g.rti),
+                "HROUTE" => Some(usize::from(g.hroute)),
+                "KV16" => Some(usize::from(g.kv16)),
+                _ => None,
+            },
             (Layers::Units { units: u, .. }, _) => match k {
                 "RPX" => Some(u.rpx),
                 "RPY" => Some(u.rpy),
@@ -896,12 +928,21 @@ impl ProgramSpec {
         match self.layers {
             Layers::Grids { gw, .. } | Layers::Strips { gw, .. } => gw,
             Layers::Units { .. } => 0,
+            Layers::Gptoss { gpt, .. } => gpt.slots.gw,
         }
     }
     pub fn gh(&self) -> usize {
         match self.layers {
             Layers::Grids { gh, .. } | Layers::Strips { gh, .. } => gh,
             Layers::Units { .. } => 0,
+            Layers::Gptoss { gpt, .. } => gpt.slots.gh,
+        }
+    }
+    /// serve_gptoss's params beyond its MoE grid.
+    pub fn gptoss(&self) -> Option<Gpt> {
+        match self.layers {
+            Layers::Gptoss { gpt, .. } => Some(gpt),
+            _ => None,
         }
     }
     pub fn hh(&self) -> usize {
@@ -997,6 +1038,7 @@ impl ProgramSpec {
             Layers::Units { units, .. } => units.layers(),
             Layers::Grids { gemma: Some(g), .. } => g.nl,
             Layers::Grids { gw, gh, .. } => gw * gh,
+            Layers::Gptoss { gpt, .. } => gpt.slots.nl,
         }
     }
 
@@ -1005,6 +1047,7 @@ impl ProgramSpec {
         match self.head.kind {
             HeadKind::Tied => self.py(),
             HeadKind::Untied => self.py() / 2,
+            HeadKind::Triples => self.py() / 3,
         }
     }
 
@@ -1015,6 +1058,12 @@ impl ProgramSpec {
         match self.layers {
             Layers::Units { units, .. } => units
                 .units(self)
+                .iter()
+                .map(|u| rect(u.x0, u.y0, u.k.px, u.k.py))
+                .collect(),
+            Layers::Gptoss { gpt, .. } => gpt
+                .slots
+                .units()
                 .iter()
                 .map(|u| rect(u.x0, u.y0, u.k.px, u.k.py))
                 .collect(),
@@ -1077,6 +1126,15 @@ impl ProgramSpec {
                 (
                     u.rc * u.rpx + px + py / 2 + self.vmc() + py / 4 + vw,
                     lh.max(head),
+                )
+            }
+            // The slots, the head's chunk triples and VM columns, the strip
+            // (one column an attention row).
+            Layers::Gptoss { gpt, .. } => {
+                let s = gpt.slots;
+                (
+                    s.gw * px + py / 3 + self.vmc() + s.ay,
+                    (s.gh * (s.ay + s.my)).max(head),
                 )
             }
         }
@@ -1152,6 +1210,12 @@ impl ProgramSpec {
                     .iter()
                     .find(|v| v.layers.contains(&l))
                     .unwrap_or(&all[0]);
+                return (unit.x0, unit.y0);
+            }
+            // serve_gptoss: the layer's attention unit (its pool).
+            Layers::Gptoss { gpt, .. } => {
+                let all = gpt.slots.units();
+                let unit = all.get(2 * l).unwrap_or(&all[0]);
                 return (unit.x0, unit.y0);
             }
             // serve8b: strips past the full ones skip their westmost slot.
@@ -1561,6 +1625,98 @@ fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
                 spec.kvst()
             ));
         }
+    }
+    Ok(spec)
+}
+
+/// serve_gptoss: attention units over MoE grids in slots, head2d_v10 on
+/// the MoE rows' triples, the strip east of it; the pool on the attention
+/// units (`AY` rows), its pages copied by the host.
+fn serve_gptoss(get: &Get) -> R<ProgramSpec> {
+    let px = get.req("PX")?;
+    let (my, mhc) = (get.req("MY")?, get.req("MHc")?);
+    let slots = Slots {
+        px,
+        ay: get.req("AY")?,
+        ahc: get.req("AHc")?,
+        my,
+        mhc,
+        gw: get.req("GW")?,
+        gh: get.req("GH")?,
+        nl: get.req("NL")?,
+    };
+    let (dc, gs, ic) = (get.req("Dc")?, get.req("Gs")?, get.req("Ic")?);
+    let gpt = Gpt {
+        slots,
+        dc,
+        gs,
+        ic,
+        ne: get.req("NE")?,
+        tk: get.req("TK")?,
+        agy: get.req("AGY")?,
+        mgy: get.req("MGY")?,
+        slw: get
+            .0
+            .iter()
+            .find(|(k, _)| k == "SLW")
+            .and_then(|(_, v)| v.trim().parse().ok())
+            .ok_or("no param SLW")?,
+        win: get.req("WIN")?,
+        rtr: get.req("RTR")?,
+        rti: get.req("RTI")?,
+        hroute: get.opt("HROUTE").unwrap_or(0) == 1,
+        // Absent: the bf16 pool the first builds had.
+        kv16: get.opt("KV16").unwrap_or(1) == 1,
+    };
+    let grid = Kernel {
+        px,
+        py: my,
+        hc: mhc,
+        dc,
+        gs,
+        ic,
+    };
+    let mut head = head(get, false)?;
+    head.kind = HeadKind::Triples;
+    let spec = ProgramSpec {
+        design: Design::ServeGptoss,
+        model: model(get)?,
+        layers: Layers::Gptoss { grid, gpt },
+        stage: Stage::Single,
+        head,
+        kv: Kv::Paged {
+            shape: shape(get, slots.ay)?,
+            copy: PageCopy::Host,
+            staging: 0,
+        },
+        sampler: Sampler::Argmax,
+        knobs: BTreeMap::new(),
+        raw: BTreeMap::new(),
+        order: Vec::new(),
+    };
+    let hid = spec.hidden();
+    let c = spec.chunk_cols();
+    let ok = gs > 0
+        && px % gs == 0
+        && dc.is_multiple_of(2)
+        && slots.nl > 0
+        && slots.nl <= slots.gw + slots.gw * (slots.gh - 1)
+        && slots.gw % 2 == 1
+        && slots.ay * slots.ahc >= hid
+        && my * mhc >= hid
+        && my.is_multiple_of(3)
+        && px * ic >= gpt.ne.min(1)
+        && spec.gx() > 0
+        && c.is_multiple_of(spec.gx())
+        && spec.vmc() <= 1
+        && spec.hh().is_multiple_of(2)
+        && c * 3 * mhc >= hid
+        && slots.ay.is_multiple_of(gpt.agy.max(1))
+        && my.is_multiple_of(gpt.mgy.max(1));
+    if !ok {
+        return Err(format!(
+            "serve_gptoss params do not make a layout: {spec:?}"
+        ));
     }
     Ok(spec)
 }

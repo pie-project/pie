@@ -1099,11 +1099,14 @@ impl ModelSpec {
         fn no<T>(name: &str, why: String) -> Result<T, Refused> {
             refuse(format!("{name}: the wafer program: {why}"))
         }
-        if self.moe.is_some() {
-            return no(
-                name,
-                "a mixture of experts (no program places one yet)".into(),
-            );
+        if let Some(moe) = &self.moe {
+            if get("NE").is_none() || get("AY").is_none() {
+                return no(
+                    name,
+                    "a mixture of experts (only a serve_gptoss program places one)".into(),
+                );
+            }
+            return super::model_moe::check_gptoss(self, moe, &get);
         }
         if self.hybrid.is_some() && get("Q35").is_none() {
             return no(

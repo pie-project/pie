@@ -346,6 +346,103 @@ pub fn read(trace: &Trace) -> Result<ModelSpec, Refused> {
     })
 }
 
+/// gpt-oss's rms_norm_eps, serve_gptoss's literal (codegen's `EPS`).
+pub const GPTOSS_EPS: f32 = 1e-5;
+
+/// A serve_gptoss program's params against the model: the dims, the
+/// experts, the window and which layers it covers, and what the units'
+/// CSL keeps as constants (eps, gpt-oss's clamped SwiGLU, the top-k
+/// softmax, MXFP4 experts, biases and sinks, an untied head). The
+/// placement folds 1/sqrt(head_dim) into Wq (a power of two) and reads
+/// YaRN from the checkpoint's config.
+pub fn check_gptoss(
+    spec: &ModelSpec,
+    m: &MoeModel,
+    get: &impl Fn(&str) -> Option<usize>,
+) -> Result<(), Refused> {
+    let name = &spec.name;
+    let no = |why: String| refuse(format!("{name}: the serve_gptoss program: {why}"));
+    let p = |k: &str| {
+        get(k).ok_or_else(|| Refused(format!("{name}: the wafer program has no param {k}")))
+    };
+    let eq = |what: &str, have: usize, want: usize| {
+        if have == want {
+            Ok(())
+        } else {
+            no(format!("{what} is {have}; the model's is {want}"))
+        }
+    };
+    eq("HR (hidden)", p("HR")?, spec.hidden)?;
+    eq("NL (layers)", p("NL")?, spec.layers)?;
+    eq("vocab", p("vocab")?, spec.vocab)?;
+    eq(
+        "Qh (q heads a kv head)",
+        p("Qh")?,
+        spec.q_heads / spec.kv_heads.max(1),
+    )?;
+    eq("Dc x Gs (head_dim)", p("Dc")? * p("Gs")?, spec.head_dim)?;
+    eq(
+        "PX / Gs (kv heads)",
+        p("PX")? / p("Gs")?.max(1),
+        spec.kv_heads,
+    )?;
+    eq("NE (experts)", p("NE")?, m.experts)?;
+    eq("TK (experts a token)", p("TK")?, m.top_k)?;
+    if spec.rms_eps != GPTOSS_EPS {
+        return no(format!(
+            "RMSNorm eps {} (the units' is {GPTOSS_EPS})",
+            spec.rms_eps
+        ));
+    }
+    if spec.tied || spec.qk_norm {
+        return no("a tied head or q/k norms (gpt-oss has neither)".into());
+    }
+    let scale = (spec.head_dim as f32).sqrt().recip();
+    if (spec.sm_scale - scale).abs() > 1e-6 * scale {
+        return no(format!(
+            "softmax scale {} (not 1/sqrt(head_dim))",
+            spec.sm_scale
+        ));
+    }
+    if m.expert_dtype != Dtype::Mxfp4
+        || m.act != (GluAct::SwigluAlpha { alpha: 1.702 })
+        || m.limit != Some(7.0)
+        || !(m.router_bias && m.gate_up_bias && m.down_bias && m.qkv_bias && m.o_bias && m.sinks)
+    {
+        return no(format!(
+            "experts {:?}, {:?} limited {:?}, biases/sinks {:?}: the units implement gpt-oss's \
+             (MXFP4, SwiGLU alpha 1.702 clamped at 7, every bias and the sinks)",
+            m.expert_dtype,
+            m.act,
+            m.limit,
+            (
+                m.router_bias,
+                m.gate_up_bias,
+                m.down_bias,
+                m.qkv_bias,
+                m.o_bias,
+                m.sinks
+            )
+        ));
+    }
+    if m.yarn.is_none() {
+        return no("no YaRN rope (the placement reads gpt-oss's from the config)".into());
+    }
+    // SLW: bit l for a windowed layer, all over one window WIN.
+    let slw = (0..spec.layers).fold(0u64, |acc, l| {
+        acc | (u64::from(m.windows.get(l).is_some_and(Option::is_some)) << l)
+    });
+    eq("SLW (windowed layers)", p("SLW")?, slw as usize)?;
+    let (n, win) = m.windowed();
+    if n > 0 {
+        if m.windows.iter().flatten().any(|&w| w != win) {
+            return no("windows of more than one width".into());
+        }
+        eq("WIN (the window)", p("WIN")?, win as usize)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

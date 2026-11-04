@@ -347,6 +347,11 @@ pub fn build_for(
     target: crate::sdk::Target,
     system: bool,
 ) -> R<PathBuf> {
+    if spec.moe.is_some() {
+        let program = gptoss_program(spec, cfg)?;
+        tracing::info!(design = program.design.name(), model = %spec.name, "spatial build: the plan's program");
+        return compile(&program, target, system);
+    }
     if spec.hybrid.is_some() {
         let program = q35_program(spec, cfg)?;
         tracing::info!(design = program.design.name(), model = %spec.name, "spatial build: the plan's program");
@@ -421,6 +426,21 @@ pub fn q35_program(spec: &super::model::ModelSpec, cfg: &ServeConfig) -> R<Progr
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     ProgramSpec::from_params(Design::ServeQ35, &params)
+}
+
+/// A MoE model's serve_gptoss program: the validated layout's params
+/// (the f32 pool, `KV16` 0), its lanes and page size the config's.
+pub fn gptoss_program(spec: &super::model::ModelSpec, cfg: &ServeConfig) -> R<ProgramSpec> {
+    if cfg.region || cfg.vm.is_some() || cfg.pins.gw.is_some() || cfg.mmax.is_some() {
+        return Err(format!(
+            "{}: serve_gptoss takes no `region`, ring, VM image or pins",
+            spec.name
+        ));
+    }
+    let params =
+        super::plan_gptoss::program_params(spec, cfg.goals.lanes.max(1), cfg.goals.page_size)
+            .map_err(|e| e.to_string())?;
+    ProgramSpec::from_params(Design::ServeGptoss, &params)
 }
 
 /// The design a plan's family builds: paged8b grids go into serve8b.
@@ -1185,13 +1205,13 @@ impl Pins {
         if let Some(v) = self.gw {
             match &mut spec.layers {
                 Layers::Grids { gw, .. } | Layers::Strips { gw, .. } => *gw = v,
-                Layers::Units { .. } => {}
+                Layers::Units { .. } | Layers::Gptoss { .. } => {}
             }
         }
         if let Some(v) = self.gh {
             match &mut spec.layers {
                 Layers::Grids { gh, .. } | Layers::Strips { gh, .. } => *gh = v,
-                Layers::Units { .. } => {}
+                Layers::Units { .. } | Layers::Gptoss { .. } => {}
             }
         }
         spec.head.hh = self.hh.unwrap_or(spec.head.hh);
@@ -1253,6 +1273,9 @@ pub fn program(plan: &SpatialPlan, cfg: &ServeConfig) -> R<ProgramSpec> {
         Design::Serve2d | Design::Serve2dPipe => serve2d(plan, cfg, d)?,
         Design::ServeQ35 => return Err("serve_q35 builds from a hybrid plan (q35_program)".into()),
         Design::ServeG4 => return Err("serve_g4 builds from a Gemma 4 plan (g4_program)".into()),
+        Design::ServeGptoss => {
+            return Err("serve_gptoss builds from a MoE plan (gptoss_program)".into());
+        }
     };
     cfg.pins.apply(&mut draft);
     // The head's VM on the final geometry (serve8b_region's is its block).

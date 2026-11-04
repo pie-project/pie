@@ -133,6 +133,10 @@ pub enum Design {
     /// over the tied embedding and the per-layer embedding region east of
     /// it (serve_g4).
     ServeG4,
+    /// gpt-oss: per layer a gptoss_attn unit over a gptoss_moe grid in a
+    /// slot, chained by host tables; head2d_v10 on chunk triples and the
+    /// embedding strip (serve_gptoss).
+    ServeGptoss,
 }
 
 impl Design {
@@ -145,6 +149,7 @@ impl Design {
             Design::Serve8bRegionPipe => "serve8b_region_pipe",
             Design::ServeQ35 => "serve_q35",
             Design::ServeG4 => "serve_g4",
+            Design::ServeGptoss => "serve_gptoss",
         }
     }
 
@@ -157,6 +162,7 @@ impl Design {
             "serve8b_region_pipe" => Some(Design::Serve8bRegionPipe),
             "serve_q35" => Some(Design::ServeQ35),
             "serve_g4" => Some(Design::ServeG4),
+            "serve_gptoss" => Some(Design::ServeGptoss),
             _ => None,
         }
     }
@@ -168,7 +174,7 @@ impl Design {
             // The guest4hz image: one or two resident sets (VMB).
             Design::Serve2dPipe => Some("guest4hz"),
             // serve_g4: head2d's stand-in VM column only.
-            Design::Serve8b | Design::ServeG4 => None,
+            Design::Serve8b | Design::ServeG4 | Design::ServeGptoss => None,
             // guest4hz as the block east of the strip (with VMX).
             Design::Serve8bRegion | Design::Serve8bRegionPipe => Some("guest4hz"),
         }
@@ -184,7 +190,9 @@ impl Design {
                 ("f32", false)
             }
             Design::Serve8b => ("bf16x2", true),
-            Design::Serve8bRegion | Design::Serve8bRegionPipe => ("bf16", false),
+            Design::Serve8bRegion | Design::Serve8bRegionPipe | Design::ServeGptoss => {
+                ("bf16", false)
+            }
         }
     }
 
@@ -213,6 +221,7 @@ impl Design {
             Design::Serve8bRegionPipe => serve8b_region(true, variant),
             Design::ServeQ35 => serve_q35(),
             Design::ServeG4 => serve_g4(),
+            Design::ServeGptoss => serve_gptoss(),
         }
     }
 }

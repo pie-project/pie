@@ -309,6 +309,50 @@ impl GptossLayout {
     }
 }
 
+/// The serve_gptoss program CS-3 ran for gpt-oss-20b at B 1 (requests 0450
+/// on: 64/64 against the f32 goldens, 478 tok/s), the f32 pool (`KV16` 0):
+/// its params, the model's own (hidden, layers, experts, window, vocabulary)
+/// checked against the layout's. Another model has no validated layout
+/// yet.
+pub const GPTOSS_20B_B1: &str = "PX:128,AY:42,AHc:69,MY:192,MHc:15,HR:2880,Dc:4,Gs:16,Qh:8,\
+Ic:23,NE:32,TK:4,AGY:14,MGY:16,GW:5,GH:5,NL:24,SLW:5592405,WIN:128,RTR:6,RTI:6,PS:16,NB:8,E:7,\
+B:1,MC:1,NP:3,PROF:0,TIME:0,HROUTE:1,KV16:0,HH:1152,Vr:176,Gx:8,Gy:24,vocab:201088,PASSES:3,\
+MODE:0,OVL:0,VMC:1,CAP:64,iters:1";
+
+/// The in-tree build's params for `spec`: [`GPTOSS_20B_B1`], if the model
+/// is the one it places (at `lanes` 1, pages of 16).
+pub fn program_params(
+    spec: &ModelSpec,
+    lanes: usize,
+    page_size: usize,
+) -> Result<Vec<(String, String)>, Refused> {
+    let params = super::program::parse_params(GPTOSS_20B_B1);
+    let get = |k: &str| {
+        params
+            .iter()
+            .find(|(n, _)| n == k)
+            .and_then(|(_, v)| v.parse::<usize>().ok())
+    };
+    if lanes != 1 || page_size != get("PS").unwrap_or(0) {
+        return refuse(format!(
+            "{}: serve_gptoss runs B 1 with pages of {} (asked {lanes} lanes, pages of \
+             {page_size})",
+            spec.name,
+            get("PS").unwrap_or(0)
+        ));
+    }
+    let m = spec
+        .moe
+        .as_ref()
+        .ok_or_else(|| Refused(format!("{}: not a mixture of experts", spec.name)))?;
+    super::model_moe::check_gptoss(spec, m, &get).map_err(|e| {
+        Refused(format!(
+            "{e} (serve_gptoss's one validated layout is gpt-oss-20b's)"
+        ))
+    })?;
+    Ok(params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +421,26 @@ mod tests {
     /// gpt-oss-20b: 24 slots of attention over MoE and the head fit the
     /// wafer at 1 and 2 lanes of 4096 positions and 4 of 1024; not 4 of 4096
     /// nor 8.
+    /// The in-tree build's params are the CS-3 program's (0450's extra),
+    /// read back as themselves; the mini model is refused.
+    #[test]
+    fn the_build_params_are_the_validated_programs() {
+        use crate::spatial::codegen::Design;
+        use crate::spatial::program::ProgramSpec;
+        let s = spec("gptoss-20b-bf16-mxfp4-kv-bf16");
+        let params = program_params(&s, 1, 16).unwrap();
+        let prog = ProgramSpec::from_params(Design::ServeGptoss, &params).unwrap();
+        assert_eq!(prog.to_params(), params);
+        assert_eq!(prog.rectangle(), (747, 1170));
+        assert_eq!(ProgramSpec::infer_design(&params), Ok(Design::ServeGptoss));
+        assert_eq!(prog.root(), (640 + 36, 576));
+        let g = prog.gptoss().unwrap();
+        assert!(!g.kv16 && g.windowed(0) && !g.windowed(1));
+        assert!(program_params(&s, 2, 16).is_err());
+        let mini = spec("gptoss-20b-mini-bf16-mxfp4-kv-bf16");
+        assert!(program_params(&mini, 1, 16).is_err());
+    }
+
     #[test]
     fn gptoss_20b_fits_the_wafer_as_attention_and_moe_units() {
         let s = spec("gptoss-20b-bf16-mxfp4-kv-bf16");
