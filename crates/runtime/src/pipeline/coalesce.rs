@@ -13,7 +13,9 @@
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::rt::Instant;
 
 use crate::store::kv::hash::Hash256;
 use crate::store::kv::page_table::WorkingSetId;
@@ -101,7 +103,7 @@ pub(crate) async fn before_pass(stores: &Stores, ws: WorkingSetId, held: u64, sl
             if have >= want {
                 break;
             }
-            tokio::time::sleep(POLL).await;
+            let _ = crate::rt::time::timeout(POLL, std::future::pending::<()>()).await;
         }
         have = cached(stores, &keys, held_pages);
         tracing::debug!(
