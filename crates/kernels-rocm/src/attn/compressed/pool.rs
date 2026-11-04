@@ -249,6 +249,7 @@ pub fn gather(
             coff.arg(),
             pages.page_size.arg(),
             count(OP, "the state plane's row pitch", state_kv.width)?.arg(),
+            ctx.stage(),
         ],
     )
 }
@@ -319,6 +320,7 @@ pub fn kv_append(
             head_dim.arg(),
             pool.page_size.arg(),
             div.arg(),
+            ctx.stage(),
         ],
     )
 }
