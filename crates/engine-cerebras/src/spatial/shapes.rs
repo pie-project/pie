@@ -223,7 +223,9 @@ pub const RAN: &[Ran] = &[
         reason: "real Qwen3-8B, B 1, SPD + LSE + HV + MODE 2 at CAP 64, option A: 1,108.7 \
                  tok/s (0470), 1,120.3 with the one-search append (0473); the same 14 \
                  teacher-forced mismatches as the bf16 reference (model differences), the \
-                 160-token free-running stream identical across them",
+                 160-token free-running stream identical across them; lever D by the U order \
+                 (1 + 10 x 3 + 5, YD 208, NCOL 5, RPY 208, RHc 20, RTR 5) 1,166.8 (0476), the \
+                 same 14 mismatches at the same margins",
     },
 ];
 
