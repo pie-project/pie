@@ -45,6 +45,12 @@ moe.mxfp4_mma_per_from = 4
 # 5.97k to 6.56k tok/s.
 moe.mxfp4_run_until = 32
 
+# A prefill's wide bf16 products (from 1024 rows) on cuBLAS's own algorithm
+# with a split's partials summed in bf16, as torch runs them for vLLM and
+# SGLang: gemma-4-31b mini12 pf16-512 10.8k -> 11.3k, kimi-k3 mini4
+# 13.7k -> 14.2k, qwen3.8-27b mini12 pf32-512 14.3k -> 14.7k tok/s.
+gemm.bf16_split_from = 1024
+
 # A prefill's block-FP8 projections W8A8 on the wide fp8 tiles, as the
 # deployment quantizes them, not bf16 on the widened copy: MiMo-V2.6-Flash's
 # mini pf16-512 45.4k to 49.2k tok/s.
@@ -63,6 +69,10 @@ working_set_percent = 65
 # and at 640-768 MiB a guest program's scratch found no room mid-run.
 seated_first = true
 seat_to_end = true
+# Eight lattice buckets a doubling past 256 rows, as the L40S: a fire of a
+# batch's prompts pads less (gemma-4-E4B pf16-512 at 4480-row fires 16.6k ->
+# 17.1k tok/s).
+prefill_lattice_steps = 8
 
 # Independent chains on side streams, as the H100, sm100 and the RTX PRO 6000
 # run them: single-request decode Qwen3.5-0.8B 456 -> 464, Qwen3-0.6B 513 ->
