@@ -583,13 +583,24 @@ impl Stage {
                     let all: Vec<u32> = (0..grids.h as usize / rows)
                         .flat_map(|_| tab.iter().copied())
                         .collect();
-                    dev.memcpy_h2d_rowbcast(
-                        SYM.table,
-                        &all,
-                        grids,
-                        shape.row_words(),
-                        DataType::Bits32,
-                    )
+                    if merge {
+                        // (HV builds: queued; the launch after them waits)
+                        dev.memcpy_h2d_rowbcast_nonblock(
+                            SYM.table,
+                            all,
+                            grids,
+                            shape.row_words(),
+                            DataType::Bits32,
+                        )
+                    } else {
+                        dev.memcpy_h2d_rowbcast(
+                            SYM.table,
+                            &all,
+                            grids,
+                            shape.row_words(),
+                            DataType::Bits32,
+                        )
+                    }
                     .map_err(e)?;
                 }
                 Ok(())

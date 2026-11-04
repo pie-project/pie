@@ -51,6 +51,19 @@ pub trait Device {
         data_type: DataType,
     ) -> sdk::Result<()>;
 
+    /// [`Device::memcpy_h2d_rowbcast`] queued without waiting (the default
+    /// waits).
+    fn memcpy_h2d_rowbcast_nonblock(
+        &mut self,
+        symbol: &str,
+        data: Vec<u32>,
+        rect: Rect,
+        elems_per_pe: usize,
+        data_type: DataType,
+    ) -> sdk::Result<()> {
+        self.memcpy_h2d_rowbcast(symbol, &data, rect, elems_per_pe, data_type)
+    }
+
     /// [`Device::memcpy_h2d`] queued without waiting.
     fn memcpy_h2d_nonblock(
         &mut self,
@@ -201,6 +214,17 @@ impl Device for Runtime {
         data_type: DataType,
     ) -> sdk::Result<()> {
         Runtime::memcpy_h2d_rowbcast(self, symbol, data, rect, elems_per_pe, data_type)
+    }
+
+    fn memcpy_h2d_rowbcast_nonblock(
+        &mut self,
+        symbol: &str,
+        data: Vec<u32>,
+        rect: Rect,
+        elems_per_pe: usize,
+        data_type: DataType,
+    ) -> sdk::Result<()> {
+        Runtime::memcpy_h2d_rowbcast_nonblock(self, symbol, data, rect, elems_per_pe, data_type)
     }
 
     fn memcpy_h2d_nonblock(
