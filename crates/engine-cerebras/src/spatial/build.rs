@@ -2747,6 +2747,34 @@ mod llama31_8b {
         assert!(params(&plan, &cfg).is_err());
     }
 
+    /// `ops2` on 0472's config states 0480's program: the same parameters
+    /// plus OP2 1 (0480 ran OP2's unit files hand-copied into 0472's build;
+    /// the codegen's files for these parameters are byte-identical to them).
+    #[test]
+    fn the_plan_places_llama_3_lever_d_with_ops2_as_0480() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.goals.cap = Some(128);
+        cfg.speed = true;
+        cfg.lse = true;
+        cfg.ops2 = true;
+        cfg.head_one_pass = true;
+        cfg.hv = true;
+        cfg.lever_d = true;
+        cfg.pins.set("NP", 1).unwrap();
+        let plan = SpatialPlan::derive(&plan.spec, WaferDims::CS3, cfg.goals).unwrap();
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let mut off = cfg.clone();
+        off.ops2 = false;
+        let (_, mut base) = params(&plan, &off).unwrap();
+        base.push(("OP2".to_string(), "1".to_string()));
+        let (mut got, mut want) = (p.clone(), base);
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+        let lay = ProgramSpec::from_params(d, &p).expect("serve8b_region D + OP2");
+        assert!(lay.model.ops2 && lay.layers() == 32);
+    }
+
     /// `speed` states SPD 1 (and `head_one_pass` MODE 2): the units' files
     /// carry the op cuts (the exp on both kernels, the scores' and RoPE's on
     /// the regions only), the rest is the default build's.
