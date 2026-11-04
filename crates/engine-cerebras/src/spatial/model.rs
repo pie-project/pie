@@ -1227,7 +1227,12 @@ impl ModelSpec {
             match untied_head {
                 // serve8b_region: the band, the regions' layers, the grid column.
                 Some(_) if region => {
-                    let band = p("RC")? * p("RPX")? / px + 1;
+                    // Lever D (YD > 0): no band, layer 0's grid alone.
+                    let band = if get("YD").is_some_and(|v| v > 0) {
+                        1
+                    } else {
+                        p("RC")? * p("RPX")? / px + 1
+                    };
                     eq(
                         "the units' layers",
                         band + p("RC")? * p("RR")? * p("RNL")? + p("NCOL")?,

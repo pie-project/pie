@@ -2452,6 +2452,10 @@ mod qwen3_8b {
         let lay =
             crate::spatial::program::ProgramSpec::from_params(d, &p).expect("serve8b_region D");
         assert_eq!(lay.layers(), 36);
+        let num = |k: &str| p.iter().find(|e| e.0 == k).and_then(|e| e.1.parse().ok());
+        plan.spec
+            .check_program(num)
+            .expect("the model takes the lever D program");
         assert_eq!(rectangle(d, &p).unwrap(), (749, 1153));
     }
 
@@ -2721,6 +2725,10 @@ mod llama31_8b {
         assert_eq!(rectangle(d, &p).unwrap().1, 1040);
         let lay = ProgramSpec::from_params(d, &p).expect("serve8b_region D");
         assert_eq!(lay.layers(), 32);
+        let num = |k: &str| p.iter().find(|e| e.0 == k).and_then(|e| e.1.parse().ok());
+        plan.spec
+            .check_program(num)
+            .expect("the model takes the lever D program");
         // HV without LSE, and D on a layer count it cannot take, are refused.
         cfg.lse = false;
         assert!(params(&plan, &cfg).is_err());
