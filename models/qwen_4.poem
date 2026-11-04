@@ -433,7 +433,9 @@ def build(mix, kv, rope, d, hashes, draft, vision):
 # How a Qwen 3.8 Flash Next checkpoint is laid out: transformers' names,
 # modelopt's NVFP4 export of them (each expert its own e2m1 planes, the
 # n-gram table e4m3 under one scale), or mlx_lm's, with the hyper-connections,
-# the n-gram embedding and the draft head beside the trunk.
+# the n-gram embedding and the draft head beside the trunk; or mlx_vlm's, the
+# same names but `shards.{i}` n-gram parts and its norms as released, without
+# the `+ 1` mlx_lm folds in.
 
 LAYOUTS = [
     struct(
@@ -443,6 +445,8 @@ LAYOUTS = [
         tower = "model.visual.",
         mlx = False,
         nvfp4 = True,
+        shard = "shard_{}",
+        folded = False,
     ),
     struct(
         name = "transformers",
@@ -451,6 +455,8 @@ LAYOUTS = [
         tower = "model.visual.",
         mlx = False,
         nvfp4 = False,
+        shard = "shard_{}",
+        folded = False,
     ),
     struct(
         name = "mlx_lm",
@@ -459,14 +465,29 @@ LAYOUTS = [
         tower = "vision_tower.",
         mlx = True,
         nvfp4 = False,
+        shard = "shard_{}",
+        folded = True,
+    ),
+    struct(
+        name = "mlx_vlm",
+        trunk = "language_model.model.",
+        head = "language_model.lm_head.weight",
+        tower = "vision_tower.",
+        mlx = True,
+        nvfp4 = False,
+        shard = "shards.{}",
+        folded = False,
     ),
 ]
 
 def recognizes(layout):
     """`layout` is recognized by its embedding; modelopt's, which shares
-    transformers' names, by the e4m3 scales of its first expert."""
+    transformers' names, by the e4m3 scales of its first expert; mlx_vlm's,
+    which shares mlx_lm's, by the name of its first n-gram part."""
     scaled = lambda: has(layout.trunk + "layers.0.mlp.experts.0.gate_proj.weight_scale")
-    return lambda checkpoint: has(layout.trunk + "embed_tokens.weight") and scaled() == layout.nvfp4
+    part = "ple.ple_embedding.ngram_embedding.shards.0.weight"
+    vlm = lambda: any([has(layout.trunk + "layers.{}.{}".format(l, part)) for l in range(8)])
+    return lambda checkpoint: has(layout.trunk + "embed_tokens.weight") and scaled() == layout.nvfp4 and vlm() == (layout.name == "mlx_vlm")
 
 def safetensors_format(layout, read, states = []):
     """`layout`'s format: `read(reads, layout)`."""
@@ -524,7 +545,7 @@ def formats(m):
     return [safetensors_format(layout, lambda reads, layout: read(m, reads, layout)) for layout in LAYOUTS]
 
 def read(m, reads, layout):
-    norm = norm_of(layout)
+    norm = norm_of(layout) if layout.folded or not layout.mlx else lambda name: src(name)
     trunk = lambda tail: layout.trunk + tail
 
     reads.read(m.embed, trunk("embed_tokens.weight"))
@@ -548,7 +569,7 @@ def read(m, reads, layout):
 
     p = m.ple
     n = lambda tail: trunk("layers.{}.ple.{}".format(p.layer, tail))
-    shards = [n("ple_embedding.ngram_embedding.shard_{}.weight".format(i)) for i in range(p.shards)]
+    shards = [n("ple_embedding.ngram_embedding.{}.weight".format(layout.shard.format(i))) for i in range(p.shards)]
     if layout.nvfp4:
         read_e4m3_table(reads, p.table, shards, n("ple_embedding.ngram_embedding.weight_scale"))
     else:
