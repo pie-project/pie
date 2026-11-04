@@ -629,11 +629,19 @@ fn ln_approx(v: f32) f32 {
 // buf [n][m] (n a power of two) halved over n in place: buf[0..m) = the
 // sums (or maxes). One runtime instance.
 fn halve(buf: mem1d_dsd, n: u16, m: u16, is_max: bool) void {
-  var half = n / 2;
-  while (half >= 1) : (half /= 2) {
+  var k = n;
+  while (k > 1) {
+    if (k % 2 == 1) {
+      const r0 = @set_dsd_length(buf, m);
+      const rl = @set_dsd_length(at(buf, (k - 1) * m), m);
+      if (is_max) { @fmaxs(r0, r0, rl); } else { @fadds(r0, r0, rl); }
+      k -= 1;
+    }
+    const half = k / 2;
     const lo = @set_dsd_length(buf, half * m);
     const hi = @set_dsd_length(at(buf, half * m), half * m);
     if (is_max) { @fmaxs(lo, lo, hi); } else { @fadds(lo, lo, hi); }
+    k = half;
   }
 }
 fn x_ssq(dst: mem1d_dsd) void {
