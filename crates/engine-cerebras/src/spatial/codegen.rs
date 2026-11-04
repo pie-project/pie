@@ -2417,6 +2417,49 @@ mod tests {
         ),
     ];
 
+    /// serve_g4's files as validated on CS-3 (requests 0380-0383: E2B bare,
+    /// greedy 64/64 against the f32 golden).
+    const G4_PINNED: &[(&str, &str)] = &[
+        (
+            "layout.csl",
+            "b2d6f6c7d77a37128e0b5c5fb97f0c5d01d93f402b3545105dda499b5af81b05",
+        ),
+        (
+            "paths.csl",
+            "fe565b5210cb4f2c824cef1079fbd4ab929ae7e8e2fa885dabc166c6f4d6c1f4",
+        ),
+        (
+            "grid_pe.csl",
+            "bc8c91e9258828c7ba7561aeed2e690e72b8bbd14388ffa0bad8085e70781543",
+        ),
+        (
+            "head_pe.csl",
+            "972d9617a7491a2e28bd6f1fb2d010e4cf1b1eb2e1da23c5abf3befb68fc0f9f",
+        ),
+        (
+            "ple_pe.csl",
+            "34d31c94f666820d287f796adb57bc4dc2ac4012dc9a548941130fd11e9fb492",
+        ),
+        (
+            "filler.csl",
+            "1302a6c3ebdc600578e1a8bd278ef816a19b694089e8d013e3d6e1b62cb2db5b",
+        ),
+    ];
+
+    #[test]
+    fn serve_g4_matches_its_pins() {
+        let files = serve_g4().unwrap();
+        let mut moved = Vec::new();
+        for (file, want) in G4_PINNED {
+            let got = files.iter().find(|(n, _)| n == file).unwrap();
+            let have = blake3::hash(got.1.as_bytes()).to_hex().to_string();
+            if have != *want {
+                moved.push(format!("{file}: {have}"));
+            }
+        }
+        assert!(moved.is_empty(), "moved: {moved:?}");
+    }
+
     #[test]
     fn serve_q35_matches_its_pins() {
         let files = serve_q35().unwrap();
