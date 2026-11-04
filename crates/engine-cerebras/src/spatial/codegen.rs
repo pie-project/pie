@@ -46,6 +46,9 @@ mod src {
         pub const FILLER_BASE: &str = include_str!("csl/serve_g4/filler_base.csl");
         pub const PATHS: &str = include_str!("csl/serve_g4/paths.csl");
     }
+    /// gpt-oss's attention unit and routed MoE.
+    pub const GPTOSS_ATTN: &str = include_str!("csl/kernels/gptoss_attn.csl");
+    pub const MOE_MXFP4: &str = include_str!("csl/kernels/moe_mxfp4.csl");
 
     pub mod s2d {
         pub const LAYOUT: &str = include_str!("csl/serve2d/layout.csl");
@@ -262,6 +265,38 @@ impl Variant {
         }
         Ok(s)
     }
+}
+
+// ---------------------------------------------------------------- gpt-oss
+
+/// gpt-oss's MoE grid unit: qwen2d_paged8b_hr's infrastructure (memcpy,
+/// collectives, init/compute, x and its table) with layer() = moe_mlp(),
+/// the dense MLP's tiles cut to a word, and moe_mxfp4 appended. This is the
+/// source the simulator (t1, t2) and CS-3 (0446) ran, less their debug
+/// exports (`payload/moe_mxfp4/gen.py`).
+pub fn gptoss_moe() -> R<String> {
+    let hr = src::QWEN2D_PAGED8B_HR;
+    let s = patch(
+        hr,
+        "var wgu: [Hc * 2 * Ic + 1]WS align(16) = @zeros([Hc * 2 * Ic + 1]WS);",
+        "var wgu: [2]WS align(16) = @zeros([2]WS);",
+        "moe: wgu",
+    )?;
+    let s = patch(
+        &s,
+        "var wd: [Ic * Hc + 1]WS align(16) = @zeros([Ic * Hc + 1]WS);",
+        "var wd: [2]WS align(16) = @zeros([2]WS);",
+        "moe: wd",
+    )?;
+    let (Some(a), Some(b)) = (s.find("fn layer() void {"), s.find("fn rebase16() void {")) else {
+        return Err("gen: moe: layer()/rebase16() anchors".into());
+    };
+    Ok(format!(
+        "{}fn layer() void {{ moe_mlp(); }}\n\n{}{}",
+        &s[..a],
+        &s[b..],
+        src::MOE_MXFP4
+    ))
 }
 
 // ---------------------------------------------------------------- text helpers
@@ -2469,6 +2504,27 @@ mod tests {
             }
         }
         assert!(moved.is_empty(), "moved: {moved:?}");
+    }
+
+    /// gptoss_moe is gen.py's MoE unit (validated on CS-3, 0446) byte for
+    /// byte, without the test's debug exports.
+    #[test]
+    fn gptoss_moe_matches_its_pin() {
+        let s = gptoss_moe().unwrap();
+        assert_eq!(
+            blake3::hash(s.as_bytes()).to_hex().as_str(),
+            GPTOSS_MOE_PIN,
+            "gptoss_moe moved"
+        );
+    }
+    const GPTOSS_MOE_PIN: &str = "a48509aedb54f9dcd683aaf7ff498f7eb9ca07f539d9f4908e1c04f91ed7ee8e";
+
+    /// `GPTOSS_MOE_OUT=<file>`: gptoss_moe's source written there.
+    #[test]
+    #[ignore]
+    fn dump_gptoss_moe() {
+        let f = std::env::var("GPTOSS_MOE_OUT").expect("GPTOSS_MOE_OUT");
+        std::fs::write(f, gptoss_moe().unwrap()).unwrap();
     }
 
     #[test]
