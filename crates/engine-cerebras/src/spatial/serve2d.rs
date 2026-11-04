@@ -627,6 +627,10 @@ pub struct VmTurns<'a> {
     pub nforce: Option<&'a [u32]>,
 }
 
+/// The last launch's host time writing its tables and turns (ns): the
+/// wafer's per-launch account reads it.
+pub(crate) static TABLES_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// [`fire`] on a VM build with `vm`'s turns (`None`: the head's argmax every
 /// lane).
 pub fn fire_lanes(
@@ -688,8 +692,13 @@ pub fn fire_lanes(
     let mbs: Vec<&[BatchLane]> = lanes.chunks(b_n).collect();
     let slots = lay.mmax().unwrap_or(1);
     let e = |e: crate::sdk::Error| e.to_string();
+    let t_tables = std::time::Instant::now();
     lay.stage.write_tables(lay, rt, &mbs, &table_rows)?;
     lay.sampler.write_turns(lay, rt, &mbs, vm, vm_written)?;
+    TABLES_NS.store(
+        u64::try_from(t_tables.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let mut inn = vec![SAMPLE; slots * b_n * lay.cap()];
     for (m, mb) in mbs.iter().enumerate() {
         for b in 0..b_n {

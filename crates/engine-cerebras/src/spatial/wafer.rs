@@ -1384,6 +1384,41 @@ pub struct Wafer {
     pub group: u32,
 }
 
+/// One launch's account: how long the wafer thread waited for it (`idle_ms`,
+/// since its previous job), how long it ran (`ms`, tables to tokens), its
+/// passes and lanes, and the kernel pages its lanes name.
+fn launch_line(
+    kind: &str,
+    lanes: &[super::serve2d::BatchLane],
+    steps: usize,
+    idle_from: std::time::Instant,
+    t0: std::time::Instant,
+) {
+    tracing::info!(
+        kind,
+        steps,
+        lanes = lanes.len(),
+        pages = lanes.iter().map(|l| l.pages.len()).sum::<usize>(),
+        pos = lanes.first().map_or(0, |l| l.pos),
+        idle_ms = (t0 - idle_from).as_secs_f64() * 1e3,
+        tables_ms = super::serve2d::TABLES_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        ms = t0.elapsed().as_secs_f64() * 1e3,
+        "spatial wafer: launch"
+    );
+}
+
+/// A page job's account (`copy_pages`, `page_out`, `page_in`): its kernel
+/// pages, the wafer thread's wait for it and its time.
+fn job_line(kind: &str, pages: usize, idle_from: std::time::Instant, t0: std::time::Instant) {
+    tracing::info!(
+        kind,
+        pages,
+        idle_ms = (t0 - idle_from).as_secs_f64() * 1e3,
+        ms = t0.elapsed().as_secs_f64() * 1e3,
+        "spatial wafer: page job"
+    );
+}
+
 impl Wafer {
     /// Loads `program` (the compiler's output directory) on `platform` and
     /// places `ckpt` (RoPE `rope`, else the checkpoint config's); returns
@@ -1434,6 +1469,9 @@ impl Wafer {
                         return;
                     }
                 };
+                // The end of the previous job: a launch's `idle_ms` is the
+                // wafer thread's wait for it (the host's share between launches).
+                let mut idle_from = std::time::Instant::now();
                 for job in job_rx {
                     let answer = match job {
                         Job::Batch {
@@ -1441,7 +1479,10 @@ impl Wafer {
                             steps,
                             logits,
                         } => {
+                            let t0 = std::time::Instant::now();
                             let reply = model.fire_batch(&lanes, steps, logits);
+                            launch_line("batch", &lanes, steps, idle_from, t0);
+                            idle_from = std::time::Instant::now();
                             if batch_tx.send(reply).is_err() {
                                 break;
                             }
@@ -1455,8 +1496,11 @@ impl Wafer {
                         } => {
                             // The poster may have gone (its lanes diverged):
                             // the launch still ran, in order.
+                            let t0 = std::time::Instant::now();
                             let _ = reply.send(model.fire_batch(&lanes, steps, false));
+                            launch_line("posted", &lanes, steps, idle_from, t0);
                             landed();
+                            idle_from = std::time::Instant::now();
                             continue;
                         }
                         Job::VmLoad { program, seeds } => {
@@ -1518,14 +1562,20 @@ impl Wafer {
                             continue;
                         }
                         Job::PageOut { pages } => {
+                            let t0 = std::time::Instant::now();
                             let reply = model.page_out(&pages).map(|words| (words, Vec::new()));
+                            job_line("page_out", pages.len(), idle_from, t0);
+                            idle_from = std::time::Instant::now();
                             if batch_tx.send(reply).is_err() {
                                 break;
                             }
                             continue;
                         }
                         Job::PageIn { pages } => {
+                            let t0 = std::time::Instant::now();
                             let reply = model.page_in(&pages).map(|()| (Vec::new(), Vec::new()));
+                            job_line("page_in", pages.len(), idle_from, t0);
+                            idle_from = std::time::Instant::now();
                             if batch_tx.send(reply).is_err() {
                                 break;
                             }
@@ -1541,7 +1591,10 @@ impl Wafer {
                             continue;
                         }
                         Job::Copy { pairs } => {
+                            let t0 = std::time::Instant::now();
                             let reply = model.copy_pages(&pairs).map(|()| (Vec::new(), Vec::new()));
+                            job_line("copy_pages", pairs.len(), idle_from, t0);
+                            idle_from = std::time::Instant::now();
                             if batch_tx.send(reply).is_err() {
                                 break;
                             }
@@ -1558,6 +1611,7 @@ impl Wafer {
                             extra,
                         } => model.greedy(&tokens, start, extra).map(|a| (a, Vec::new())),
                     };
+                    idle_from = std::time::Instant::now();
                     tracing::info!(
                         launches = model.launches,
                         steps = model.steps,

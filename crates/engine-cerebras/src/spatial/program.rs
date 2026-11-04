@@ -74,6 +74,11 @@ pub struct Model {
     pub speed: bool,
     /// `LSE` 1: the units' softmax against a carried reference (`Variant::lse`).
     pub lse: bool,
+    /// `OP2` 1: the second op cuts (`Variant::ops2`).
+    pub ops2: bool,
+    /// `RGX`: the regions' X full all-reduces' phase-1 group (0: RGs;
+    /// `Variant::rgx`).
+    pub rgx: usize,
 }
 
 impl Model {
@@ -89,6 +94,8 @@ impl Model {
             eps_bits: 0,
             speed: false,
             lse: false,
+            ops2: false,
+            rgx: 0,
         }
     }
 
@@ -110,6 +117,8 @@ impl Model {
             eps_bits: (self.eps_bits != 0).then_some(self.eps_bits),
             speed: self.speed,
             lse: self.lse,
+            ops2: self.ops2,
+            rgx: self.rgx > 0,
         }
     }
 }
@@ -690,6 +699,8 @@ impl ProgramSpec {
             "EPS" => Some(m.eps_bits as usize),
             "SPD" => Some(usize::from(m.speed)),
             "LSE" => Some(usize::from(m.lse)),
+            "OP2" => Some(usize::from(m.ops2)),
+            "RGX" => Some(m.rgx),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1315,6 +1326,8 @@ fn model(get: &Get) -> R<Model> {
         eps_bits: u32::try_from(get.opt("EPS").unwrap_or(0)).map_err(|e| format!("EPS: {e}"))?,
         speed: get.opt("SPD").unwrap_or(0) != 0,
         lse: get.opt("LSE").unwrap_or(0) != 0,
+        ops2: get.opt("OP2").unwrap_or(0) != 0,
+        rgx: get.opt("RGX").unwrap_or(0),
     })
 }
 

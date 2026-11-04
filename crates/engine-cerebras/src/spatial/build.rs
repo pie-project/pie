@@ -162,6 +162,9 @@ pub struct ServeConfig {
     /// serve8b_region(_pipe), with `speed`: the softmax against a carried
     /// log-sum-exp, no max all-reduce (`LSE` 1, codegen's `Variant::lse`).
     pub lse: bool,
+    /// serve8b_region(_pipe), with `lse`: the second op cuts (`OP2` 1,
+    /// codegen's `Variant::ops2`).
+    pub ops2: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -191,6 +194,7 @@ impl ServeConfig {
             region: false,
             speed: false,
             lse: false,
+            ops2: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -260,6 +264,7 @@ impl ServeConfig {
             "rows",
             "speed",
             "lse",
+            "ops2",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -352,6 +357,7 @@ impl ServeConfig {
             region: flag(t, "region")?,
             speed: flag(t, "speed")?,
             lse: flag(t, "lse")?,
+            ops2: flag(t, "ops2")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -987,6 +993,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         .pipeline
         .then(|| pipe_shape(plan.grid.lanes, cfg))
         .transpose()?;
+    if cfg.ops2 && !cfg.lse {
+        return Err("serve8b_region's second op cuts (`ops2`) need `lse`".into());
+    }
     if cfg.hv && !cfg.lse {
         return Err("serve8b_region's HV (`hv`) needs `lse` (and `speed`)".into());
     }
@@ -1298,6 +1307,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             },
             speed: cfg.speed,
             lse: cfg.lse,
+            ops2: cfg.ops2,
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1355,6 +1365,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.lse {
         st.push(Typed("LSE"));
+    }
+    if cfg.ops2 {
+        st.push(Typed("OP2"));
     }
     if cfg.lever_d {
         st.push(Typed("YD"));
@@ -2797,6 +2810,39 @@ mod llama31_8b {
         }
         let alone = Variant { speed: false, ..lay.model.variant() };
         assert!(d.files_with(alone).is_err());
+    }
+
+    /// `ops2` (with `lse`) states OP2 1: both units' SiLU element runs as
+    /// scalars at MC 1, set_axis returns on the axis it already has, PROF 1
+    /// splits the MLP's marks; nothing else changes; without `lse` it is
+    /// refused.
+    #[test]
+    fn ops2_states_op2_and_patches_both_units() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.speed = true;
+        cfg.lse = true;
+        cfg.ops2 = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
+        assert_eq!(get("OP2").as_deref(), Some("1"));
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        assert!(lay.model.ops2);
+        let base = d.files_with(Variant { ops2: false, ..lay.model.variant() }).unwrap();
+        let op2 = d.files_with(lay.model.variant()).unwrap();
+        for ((n, a), (_, b)) in base.iter().zip(&op2) {
+            match *n {
+                "grid_pe.csl" | "region_pe.csl" => {
+                    assert!(!a.contains("fn silu1(") && b.contains("fn silu1("), "{n}");
+                    assert!(b.contains("  if (axis_cur == want) { return; }\n"), "{n}");
+                    assert!(b.contains("    mark(14);\n") && !a.contains("mark(14)"), "{n}");
+                }
+                _ => assert_eq!(a, b, "{n}"),
+            }
+        }
+        let alone = Variant { lse: false, speed: true, ..lay.model.variant() };
+        assert!(d.files_with(alone).is_err());
+        cfg.lse = false;
+        assert!(params(&plan, &cfg).is_err());
     }
 
     /// The ring at PY 152: B 1 x 12 at CAP 32 ran on hardware (0402) and

@@ -23,7 +23,7 @@ use super::program::{HeadKind, Kv, Layers, PageCopy, ProgramSpec, Sampler, Stage
 use super::serve2d::{BatchLane, VmTurns};
 use super::serve8b::Kernel;
 use super::wafer::rect;
-use crate::sdk::{DataType, Order};
+use crate::sdk::{DataType, Order, Rect};
 
 type R<T> = std::result::Result<T, String>;
 
@@ -573,8 +573,9 @@ impl Stage {
                 let lanes: Vec<BatchLane> = mbs.iter().flat_map(|mb| mb.iter().cloned()).collect();
                 let units = matches!(layers, Layers::Units { .. });
                 let mut tabs: Vec<(usize, Vec<u32>)> = Vec::new();
-                for grids in spec.grid_areas() {
-                    let rows = if units { grids.h as usize } else { spec.py() };
+                // (HV builds, PS 1: same-height units in one call each)
+                let merge = units && shape.page_size == 1;
+                for (grids, rows) in table_areas(spec.grid_areas(), merge, units, spec.py()) {
                     if !tabs.iter().any(|t| t.0 == rows) {
                         tabs.push((rows, table_rows(&lanes, rows)?));
                     }
@@ -784,4 +785,45 @@ pub mod abi {
         }
         out
     }
+}
+
+/// The rects the paged tables go to (and their units' rows), one row broadcast each: serve8b_region's
+/// units of one height (regions; their tables are the same) that tile a
+/// rectangle exactly as one rect (the table repeated down it), so a launch
+/// writes the 10 regions of lever D in one call instead of ten (`merge`:
+/// HV builds); every other area as it is.
+fn table_areas(areas: Vec<Rect>, merge: bool, units: bool, py: usize) -> Vec<(Rect, usize)> {
+    if !merge {
+        return areas
+            .into_iter()
+            .map(|a| (a, if units { a.h as usize } else { py }))
+            .collect();
+    }
+    let mut out: Vec<(Rect, usize)> = Vec::new();
+    let mut seen: Vec<i32> = Vec::new();
+    for a in &areas {
+        if seen.contains(&a.h) {
+            continue;
+        }
+        seen.push(a.h);
+        let same: Vec<&Rect> = areas.iter().filter(|b| b.h == a.h).collect();
+        let (x0, y0) = (
+            same.iter().map(|b| b.x).min().unwrap_or(0),
+            same.iter().map(|b| b.y).min().unwrap_or(0),
+        );
+        let (x1, y1) = (
+            same.iter().map(|b| b.x + b.w).max().unwrap_or(0),
+            same.iter().map(|b| b.y + b.h).max().unwrap_or(0),
+        );
+        let area: i64 = same.iter().map(|b| i64::from(b.w) * i64::from(b.h)).sum();
+        let tiles = same.len() > 1
+            && area == i64::from(x1 - x0) * i64::from(y1 - y0)
+            && same.iter().all(|b| (b.y - y0) % a.h == 0);
+        if tiles {
+            out.push((Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, a.h as usize));
+        } else {
+            out.extend(same.into_iter().map(|b| (*b, b.h as usize)));
+        }
+    }
+    out
 }

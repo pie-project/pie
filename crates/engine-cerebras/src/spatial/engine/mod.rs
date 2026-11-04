@@ -518,7 +518,13 @@ impl Engine for Spatial {
 
     fn copy_kv(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<()> {
         copy.validate()?;
+        let t0 = std::time::Instant::now();
         self.drain();
+        tracing::info!(
+            pages = copy.src_page_ids.len(),
+            drain_ms = t0.elapsed().as_secs_f64() * 1e3,
+            "spatial: copy_kv"
+        );
         if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
             tracing::debug!(target: "spatial_trace", "spatial-trace copy_kv: {copy:?}");
         }
