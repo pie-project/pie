@@ -102,6 +102,9 @@ pub const NVC: usize = 5;
 pub enum Kind {
     Grid,
     Region,
+    /// serve_gptoss's units.
+    Attn,
+    Moe,
 }
 
 /// One layer unit: its kind, place and layers.
@@ -199,9 +202,11 @@ struct Pe {
 /// Every unit PE's routes, pieces in and out, relay color and forward
 /// color.
 pub struct Tables {
-    units: Vec<Unit>,
-    lanes: u32,
+    pub(crate) units: Vec<Unit>,
+    pub(crate) lanes: u32,
     rtr: usize,
+    /// Pieces a PE receives (RT_I; serve_gptoss's S2D_RTI).
+    pub(crate) rti: usize,
     pe: HashMap<(usize, usize), Pe>,
     /// serve8b_region_pipe's ring: the last unit's x to the head carries
     /// the micro-batch word (`nsend` bit 8).
@@ -227,10 +232,17 @@ fn opp(d: u32) -> u32 {
 }
 
 /// A source piece: (source fabric y, source offset, dest offset, words a lane).
-type Piece = (usize, u32, u32, u32);
+pub(crate) type Piece = (usize, u32, u32, u32);
 
 impl Tables {
     pub fn new(units: Vec<Unit>, lanes: usize, rtr: usize) -> R<Tables> {
+        let mut t = Tables::empty(units, lanes, rtr);
+        t.build()?;
+        Ok(t)
+    }
+
+    /// Every unit PE with no routes or pieces yet.
+    pub(crate) fn empty(units: Vec<Unit>, lanes: usize, rtr: usize) -> Tables {
         let mut pe = HashMap::new();
         for u in &units {
             for y in u.y0..u.y0 + u.k.py {
@@ -246,15 +258,24 @@ impl Tables {
                 }
             }
         }
-        let mut t = Tables {
+        Tables {
             units,
             lanes: lanes as u32,
             rtr,
+            rti: RT_I,
             pe,
             pipe: false,
-        };
-        t.build()?;
-        Ok(t)
+        }
+    }
+
+    pub(crate) fn set_relay(&mut self, x: usize, y: usize, c: u32) -> R<()> {
+        self.at(x, y)?.relay = c;
+        Ok(())
+    }
+
+    pub(crate) fn set_fwd_in(&mut self, x: usize, y: usize, c: u32) -> R<()> {
+        self.at(x, y)?.fwd_in = c;
+        Ok(())
     }
 
     fn at(&mut self, x: usize, y: usize) -> R<&mut Pe> {
@@ -263,7 +284,7 @@ impl Tables {
             .ok_or_else(|| format!("a path leaves the units at ({x}, {y})"))
     }
 
-    fn route(&mut self, x: usize, y: usize, color: u32, rx: u32, t1: u32, t2: u32) -> R<()> {
+    pub(crate) fn route(&mut self, x: usize, y: usize, color: u32, rx: u32, t1: u32, t2: u32) -> R<()> {
         let e = self.at(x, y)?;
         let r = (rx, t1, t2);
         match e.routes.get(&color) {
@@ -277,7 +298,7 @@ impl Tables {
 
     /// A point-to-point path through corner points (straight segments):
     /// RAMP in at the first, RAMP out at the last.
-    fn leg(&mut self, color: u32, pts: &[(usize, usize)]) -> R<()> {
+    pub(crate) fn leg(&mut self, color: u32, pts: &[(usize, usize)]) -> R<()> {
         let mut cells = vec![pts[0]];
         let mut dirs = Vec::new();
         for w in pts.windows(2) {
@@ -319,7 +340,7 @@ impl Tables {
 
     /// Unit `u`'s row `row` takes `color` at column `xin` (from `rxin`, or
     /// RAMP: that PE multicasts its own) and every PE of the row gets it.
-    fn row_mcast(&mut self, color: u32, u: &Unit, row: usize, xin: usize, rxin: u32) -> R<()> {
+    pub(crate) fn row_mcast(&mut self, color: u32, u: &Unit, row: usize, xin: usize, rxin: u32) -> R<()> {
         let y = u.y0 + row;
         let (xa, xb) = (u.x0, u.x0 + u.k.px - 1);
         for x in xa..=xb {
@@ -347,12 +368,12 @@ impl Tables {
         Ok(())
     }
 
-    fn recv(&mut self, x: usize, y: usize, color: u32, off: u32, n: u32) -> R<()> {
+    pub(crate) fn recv(&mut self, x: usize, y: usize, color: u32, off: u32, n: u32) -> R<()> {
         self.at(x, y)?.recv.push([color, off, n]);
         Ok(())
     }
 
-    fn send(&mut self, x: usize, y: usize, color: u32, off: u32, n: u32) -> R<()> {
+    pub(crate) fn send(&mut self, x: usize, y: usize, color: u32, off: u32, n: u32) -> R<()> {
         self.at(x, y)?.send.push([color, off, n]);
         Ok(())
     }
@@ -435,7 +456,7 @@ impl Tables {
     }
 
     /// Dest row g's pieces: (source row, source offset, dest offset, n).
-    fn pieces(a: &Unit, b: &Unit, g: usize) -> Vec<(usize, u32, u32, u32)> {
+    pub(crate) fn pieces(a: &Unit, b: &Unit, g: usize) -> Vec<(usize, u32, u32, u32)> {
         let (lo, hi) = (g * b.k.hc, ((g + 1) * b.k.hc).min(a.k.py * a.k.hc));
         let mut out = Vec::new();
         let mut d = lo;
@@ -453,7 +474,7 @@ impl Tables {
     /// `dest`. Down (A): top first, each adds its own after what it
     /// forwards; up (B): bottom first, each sends its own first.
     #[allow(clippy::too_many_arguments)]
-    fn chain(
+    pub(crate) fn chain(
         &mut self,
         col: usize,
         srcs: &[Piece],
@@ -499,7 +520,7 @@ impl Tables {
     /// A grid above a region: dest row g's pieces chained down column
     /// a.x0 + g mod a.PX, then down to (that column, b's row g), which
     /// multicasts the row.
-    fn rechunk_a(&mut self, a: &Unit, b: &Unit, r: u32) -> R<()> {
+    pub(crate) fn rechunk_a(&mut self, a: &Unit, b: &Unit, r: u32) -> R<()> {
         for g in 0..b.k.py {
             let p = Tables::pieces(a, b, g);
             if p.is_empty() {
@@ -562,7 +583,7 @@ impl Tables {
 
     /// Words of a PE's table.
     pub fn rtn(&self) -> usize {
-        7 + 4 * self.rtr + 3 * RT_I + 3 * RT_O
+        7 + 4 * self.rtr + 3 * self.rti + 3 * RT_O
     }
 
     /// Unit `u`'s `rtab`, `PY` x `PX` PEs of [`Tables::rtn`] words (16-bit
@@ -570,14 +591,14 @@ impl Tables {
     /// tx2) x RTR, (color, off, n) x 3 in, (color, off, n) x 3 out]`.
     pub fn table(&self, u: &Unit) -> R<Vec<u32>> {
         let rtn = self.rtn();
-        let (oi, oo) = (7 + 4 * self.rtr, 7 + 4 * self.rtr + 3 * RT_I);
+        let (oi, oo) = (7 + 4 * self.rtr, 7 + 4 * self.rtr + 3 * self.rti);
         let mut t = vec![0u32; u.k.py * u.k.px * rtn];
         for py in 0..u.k.py {
             for px in 0..u.k.px {
                 let e = &self.pe[&(u.x0 + px, u.y0 + py)];
                 let one_color = |v: &[[u32; 3]]| v.iter().all(|p| p[0] == v[0][0]);
                 if e.routes.len() > self.rtr
-                    || e.recv.len() > RT_I
+                    || e.recv.len() > self.rti
                     || e.send.len() > RT_O
                     || !one_color(&e.recv)
                     || !one_color(&e.send)
