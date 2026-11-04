@@ -57,6 +57,7 @@ param VMC: u16;
 param CAP: u16;
 param HLBN: u16 = 0;
 param iters: u16;
+param KV16: u16 = 1;      // the attention units' KV in bf16 (0: f32)
 param NOLAYER: u16 = 0;   // 1 (checking the handoffs alone): the units skip their layers
 param kernel_rows: u16 = 0;   // the bench driver's (unused)
 param kernel_cols: u16 = 0;
@@ -68,6 +69,7 @@ const C_R2_1: color = @get_color(5);
 const C_BC: color = @get_color(9);
 const C_GB: color = @get_color(10);
 const HLB: u16 = if (HLBN > 0) HLBN else if (B < 4) B else 4;
+const KS = if (KV16 == 1) u16 else f32;     // the units' KV element (their kc/vc exports)
 const SY: u16 = AY + MY;                     // a slot's rows
 const XH: u16 = GW * PX;                     // the head's first column
 const C: u16 = MY / 3;
@@ -118,7 +120,7 @@ layout {
           .vocab = vocab, .PASSES = PASSES, .UNTIED = 0, .CERT = 0, .MODE = MODE, .OVL = OVL,
           .VMC = VMC, .WF32 = 0, .SCHAIN = 0,
           .GPX = PX, .GPY = MY, .GHc = MHc, .XH0 = XH, .XL = XH - PX, .YL = YS, .CAP = CAP, .SB = B,
-          .HLB = HLB, .KVCP = 0, .HROUTE = HROUTE, .S2D_VMX = 0, .WS = u16, .KS = u16,
+          .HLB = HLB, .KVCP = 0, .HROUTE = HROUTE, .S2D_VMX = 0, .WS = u16, .KS = KS,
           .EC = EC,
           .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
           .c_x = C_BC, .c_ib = C_GB,
@@ -127,13 +129,13 @@ layout {
         @set_tile_code(x, y, "embed_pe.csl", .{
           .memcpy_params = mp, .KVST = KVST, .MY = MY, .Hc = AHc, .XH0 = XH, .YS = YS,
           .F = F, .VMC = VMC, .VMAT = HR2X + 1, .C = C, .EC = EC, .Ve = Vr, .vocab = vocab, .B = B,
-          .HROUTE = HROUTE, .WS = u16, .KS = u16,
+          .HROUTE = HROUTE, .WS = u16, .KS = KS,
         });
       } else if (attn) {
         @set_tile_code(x, y, "attn_pe.csl", .{
           .memcpy_params = mp, .KVST = KVST,
           .PX = PX, .PY = AY, .Hc = AHc, .HR = HR, .Dc = Dc, .Gs = Gs, .Qh = Qh, .Ic = 1,
-          .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC, .W16 = 1, .NP = NP, .KV16 = 1,
+          .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC, .W16 = 1, .NP = NP, .KV16 = KV16,
           .KVCP = 0, .PROF = PROF, .GY = AGY, .HROUTE = HROUTE,
           .WIN = if (((SLW >> l) & 1) == 1) WIN else 0,
           .S2D_TIME = TIME, .S2D_RTR = RTR, .S2D_RTI = RTI, .S2D_NOLAYER = NOLAYER,
@@ -144,7 +146,7 @@ layout {
         @set_tile_code(x, y, "moe_pe.csl", .{
           .memcpy_params = mp, .KVST = KVST,
           .PX = PX, .PY = MY, .Hc = MHc, .HR = HR, .Dc = 2, .Gs = Gs, .Qh = 1, .Ic = Ic,
-          .PS = 2, .NB = 1, .E = 1, .B = B, .MC = MC, .W16 = 1, .NP = NP, .KV16 = 1,
+          .PS = 2, .NB = 1, .E = 1, .B = B, .MC = MC, .W16 = 1, .NP = NP, .KV16 = KV16,
           .KVCP = 0, .PROF = PROF, .GY = MGY, .HROUTE = HROUTE, .NE = NE, .TK = TK,
           .S2D_TIME = TIME, .S2D_RTR = RTR, .S2D_RTI = RTI, .S2D_NOLAYER = NOLAYER,
           .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
@@ -153,7 +155,7 @@ layout {
       } else {
         @set_tile_code(x, y, "filler.csl", .{
           .memcpy_params = mp, .KVST = KVST, .MY = MY, .XH0 = XH, .YS = YS, .F = F, .VMC = VMC,
-          .VMAT = HR2X + 1, .C = C, .EC = EC, .HROUTE = HROUTE, .WS = u16, .KS = u16,
+          .VMAT = HR2X + 1, .C = C, .EC = EC, .HROUTE = HROUTE, .WS = u16, .KS = KS,
         });
       }
     }
@@ -168,8 +170,8 @@ layout {
   @export_name("qkn_w", [*]f32, true);
   @export_name("rot_c", [*]f32, true);
   @export_name("rot_s", [*]f32, true);
-  @export_name("kc", [*]u16, true);
-  @export_name("vc", [*]u16, true);
+  @export_name("kc", [*]KS, true);
+  @export_name("vc", [*]KS, true);
   @export_name("wo", [*]u16, true);
   @export_name("wgu", [*]u16, true);
   @export_name("wd", [*]u16, true);
