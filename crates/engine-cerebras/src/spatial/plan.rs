@@ -216,7 +216,7 @@ const VR_STEP: usize = 32;
 /// most ~19.5 KB of tables a PE beside its buffers and code.
 const HEAD16_ROWS: usize = 256;
 const HEAD16_HC: usize = 32;
-const HEAD16_TABLES: usize = 19_500;
+pub(super) const HEAD16_TABLES: usize = 19_500;
 /// The f32 one-block head beside serve2d's grids: tables a PE, at most.
 const HEAD32_TABLES: usize = 16_384;
 /// serve2d: `in_tokens` + `out_tokens` at the root take B x CAP words each,
@@ -262,7 +262,7 @@ impl Grid {
         4 * (2 * self.hc + 2 * (self.qh + 1) * dh + 2 * 3 * 16 * dh)
     }
 
-    fn block_bytes(&self) -> usize {
+    pub(super) fn block_bytes(&self) -> usize {
         2 * self.dc * self.page_size * if self.kv16 { 2 } else { 4 }
     }
 

@@ -1,36 +1,59 @@
-//! gpt-oss on the wafer: the fit of its MoE unit (`moe_mxfp4`), from linked
-//! sizes, and the layouts it rules out.
+//! gpt-oss on the wafer: a layer as two units and their layout, from linked
+//! sizes.
 //!
-//! Every expert is resident and sliced over a PX x PY grid like a dense MLP
-//! (row py: Hc hidden dims; column px: Ic intermediate dims of gate, up and
-//! down), so a token's top-k experts run on every PE of the grid. A PE holds
-//! each expert's tiles as MXFP4 codes (three a u16) and a scale byte for
-//! each output of each 32-block run of its inputs (at most two runs a tile).
+//! A layer is a slot of `PX` x (`ra` + `rm`) PEs: an attention unit of
+//! `PX` x `ra` (qwen2d_paged8b_hr's attention: kv heads x Gs columns of Dc
+//! head dims, `ceil(hidden / ra)` hidden dims a row, the layer's KV pool) over
+//! a MoE grid of `PX` x `rm` (`moe_mxfp4`: every expert resident and sliced
+//! like a dense MLP, `ceil(hidden / rm)` dims a row, `ceil(inter / PX)` a
+//! column, so a token's top-k experts run on every PE of the grid). The
+//! slots tile the wafer `across` x `down`; the bf16 head (head2d, `k` MoE rows
+//! a chunk column) and the embedding strip stand east of them.
 //!
-//! Measured (cslc links, `cs_readelf --syms` on an interior PE, B 1):
-//! - the MoE unit alone (moe_mxfp4 on qwen2d_paged8b_hr's collectives, the
-//!   layer body the MoE only) at 120 x 180, Hc 16, Ic 24, NE 8: 17,332 B of
-//!   code and 20,346 B of data, of which 7,168 B the experts' tiles and
-//!   5,580 B the host kernel's attention buffers a MoE grid would not carry;
-//! - qwen2d_paged8b_hr's attention with the MoE in place of its MLP (W16,
-//!   KV16, HROUTE, no copy kernel) at 128 x 234, Hc 13, Ic 23, NE 8: 24,520 B
-//!   of code and 18,642 B of data, of which 5,760 B the experts' tiles and
-//!   1,798 B the dense MLP's dead weights.
+//! Why two units: a layer's slot is ~30k PEs (24 layers and the head on
+//! 755 x 1170), and the per-PE cost that is not weights decides the fit.
+//! Measured (cslc links, `cs_readelf --syms` on an interior PE):
+//! - attention and the MoE on one grid (qwen2d_paged8b_hr with the MoE as its
+//!   MLP, 128 x 234, Hc 13): 34.3 KB a PE besides the experts, 52.5 KB with
+//!   them even at four codes a u16. It cannot fit.
+//! - the attention unit alone (no MLP): 21 KB a PE besides its weights, pool
+//!   and lanes (the model below: paged8b's, at most 1.3 KB high);
+//! - the MoE grid alone at Hc 15, Ic 23, 32 experts: 47,232 B a PE at B 1,
+//!   +304 B a lane (24,448 B of it the experts, the rest code and buffers).
+//!
+//! MoE storage a PE (moe_mxfp4): each expert's gate/up tile (Hc x 2 Ic) and
+//! down tile (Ic x Hc) as three planes of ceil(L / 3) input rows of MXFP4
+//! codes (three a u16), then a word of two scale bases and each tile's 2R
+//! scale offsets as nibbles (gpt-oss-20b's widest tile spans 14).
 
 use super::model::{ModelSpec, Refused, refuse};
+use super::plan::{Grid, HEAD16_TABLES, ROPE_POSITIONS, WaferDims};
 
-/// PE memory (`plan::WaferDims::pe_bytes`) less the stack's margin.
+/// PE memory less the stack's margin.
 const PE_LIMIT: usize = 0xc000 - 768;
 
-/// The MoE unit's bytes a PE besides the experts' tiles and its own
-/// buffers: code, runtime, collectives, x (fitted to the 120 x 180 link).
-const MOE_FIXED: usize = 17_332 + 20_346 - 7_168 - 5_580 - MOE_BUF_AT_LINK;
-/// [`MoeUnit::buffers`] at the link's shape.
-const MOE_BUF_AT_LINK: usize = 5_956;
-/// The attention layer's bytes a PE besides the MoE (fitted to the 128 x 234
-/// link: everything but the experts, the MoE's buffers and the dead MLP).
-const ATTN_MOE_FIXED: usize = 24_520 + 18_642 - 5_760 - 1_798 - ATTN_BUF_AT_LINK;
-const ATTN_BUF_AT_LINK: usize = 5_084;
+/// The MoE grid's bytes a PE besides [`MoeUnit::buffers`] and the experts:
+/// code, runtime, collectives, x and the host kernel's leftovers (fitted to
+/// the Hc 15, Ic 23, NE 32, B 1 link: 47,232 B).
+const MOE_FIXED: usize = 18_050;
+/// A lane's bytes the host kernel adds beside the MoE's own (x, its table).
+const MOE_LANE_HOST: usize = 148;
+
+/// The attention unit's links run 164 to 1,300 B under paged8b's grid model
+/// (they carry no MLP code); the model keeps the smallest gap.
+const ATTN_LESS: usize = 164;
+/// gpt-oss's attention extras a PE, not linked yet (estimate): q/k/v and o
+/// biases, the sinks, and their code.
+const ATTN_EXTRA_CODE: usize = 640;
+
+/// The embedding strip's tables a PE, at most (serve8b's: 116 dims x 132
+/// rows, bf16).
+const STRIP_TABLES: usize = 30_624;
+/// head2d's region rows (serve8b's 1152: the feeder row in the middle).
+const HEAD_ROWS: usize = 1152;
+/// Head dims a column (Dc) and the KV page size the attention unit runs.
+const DC: usize = 4;
+const PAGE: usize = 16;
 
 /// One MoE grid's shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,50 +86,219 @@ impl MoeUnit {
         })
     }
 
-    /// An expert's u16 words a PE: gate/up and down codes, two runs of scale
-    /// bytes each (moe_mxfp4's `XW`).
+    fn g2(&self) -> usize {
+        2 * self.ic
+    }
+
+    /// An expert's u16 words a PE (moe_mxfp4's `XW`): code planes, the base
+    /// word, the scale offsets.
     pub fn expert_words(&self) -> usize {
-        let g2 = 2 * self.ic;
-        (self.hc * g2).div_ceil(3)
-            + (self.ic * self.hc).div_ceil(3)
-            + 2 * g2.div_ceil(2)
-            + 2 * self.hc.div_ceil(2)
+        let g2 = self.g2();
+        self.hc.div_ceil(3) * g2
+            + self.ic.div_ceil(3) * self.hc
+            + 1
+            + (2 * g2).div_ceil(4)
+            + (2 * self.hc).div_ceil(4)
     }
 
-    /// The unit's buffers a PE (decode scratch, router tile, biases, lanes).
+    /// The unit's buffers a PE: router tile, biases, decode scratch, lanes.
     pub fn buffers(&self) -> usize {
-        let (g2, ne, tk) = (2 * self.ic, self.experts, self.top_k);
-        let dec = 3
-            * (self.hc * g2)
-                .div_ceil(3)
-                .max((self.ic * self.hc).div_ceil(3));
-        let ner = ne.div_ceil(self.py);
-        let nec = ne.div_ceil(self.px);
-        4 * (dec
-            + self.mlp_chunk * tk * g2
-            + self.hc * ne
-            + ne
-            + ner * g2
-            + nec * self.hc
-            + tk * self.ic
-            + 5 * self.ic
-            + 2 * g2.max(self.hc)
-            + self.lanes * (ne + 1 + 2 * tk))
+        let (g2, ne, tk, hc, ic) = (self.g2(), self.experts, self.top_k, self.hc, self.ic);
+        let rmax = g2.max(hc);
+        let msc = 4 * (2 * g2).div_ceil(4).max((2 * hc).div_ceil(4));
+        let dec = (hc.div_ceil(3) * g2).max(ic.div_ceil(3) * hc);
+        2 * (hc * ne + 1)
+            + 4 * (ne + ne.div_ceil(self.py) * g2 + ne.div_ceil(self.px) * hc + 2)
+            + 4 * (dec + msc + 2 * rmax + tk)
+            + 4 * (self.mlp_chunk * tk * g2 + tk * ic + 5 * ic)
+            + self.lanes * (4 * (ne + 1) + 2 * tk + 4 * tk)
     }
 
-    /// A MoE-only grid PE's bytes.
+    /// The experts' bytes a PE (`mx`, u32 words).
+    pub fn expert_bytes(&self) -> usize {
+        4 * (self.experts * self.expert_words()).div_ceil(2)
+    }
+
+    /// A PE's bytes.
     pub fn bytes(&self) -> usize {
-        MOE_FIXED + self.buffers() + 2 * self.experts * self.expert_words()
-    }
-
-    /// A PE's bytes when the grid also runs the layer's attention
-    /// (qwen2d_paged8b_hr's, bf16).
-    pub fn bytes_with_attention(&self) -> usize {
-        ATTN_MOE_FIXED + self.buffers() + 2 * self.experts * self.expert_words()
+        MOE_FIXED
+            + self.lanes.saturating_sub(1) * MOE_LANE_HOST
+            + self.buffers()
+            + self.expert_bytes()
     }
 
     pub fn pes(&self) -> usize {
         self.px * self.py
+    }
+}
+
+/// One layer's attention unit: qwen2d_paged8b_hr's attention alone, bf16
+/// weights and KV, pages copied by the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttnUnit {
+    pub grid: Grid,
+}
+
+impl AttnUnit {
+    /// `ra` rows, `lanes` lanes of `entries` pages a row, `blocks` pool pages
+    /// a row.
+    pub fn new(
+        spec: &ModelSpec,
+        ra: usize,
+        lanes: usize,
+        entries: usize,
+        blocks: usize,
+    ) -> AttnUnit {
+        let gs = spec.head_dim / DC;
+        AttnUnit {
+            grid: Grid {
+                px: spec.kv_heads * gs,
+                py: ra,
+                hc: spec.hidden.div_ceil(ra),
+                hidden: spec.hidden,
+                dc: DC,
+                gs,
+                qh: spec.q_heads / spec.kv_heads,
+                ic: 1,
+                lanes,
+                page_size: PAGE,
+                blocks,
+                entries,
+                mlp_chunk: 1,
+                w16: true,
+                kv16: true,
+                host_copy: true,
+            },
+        }
+    }
+
+    /// A PE's bytes: the links' model plus the unlinked extras.
+    pub fn bytes(&self) -> usize {
+        let g = &self.grid;
+        let extra = 4 * ((g.qh + 2) * g.dc + g.hc + g.qh) + ATTN_EXTRA_CODE;
+        g.bytes(false) - ATTN_LESS + extra
+    }
+}
+
+/// The whole program's shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GptossLayout {
+    /// Slots across and down; slot `PX` x (`ra` + `rm`).
+    pub across: usize,
+    pub down: usize,
+    pub ra: usize,
+    pub rm: usize,
+    pub attn: AttnUnit,
+    pub moe: MoeUnit,
+    /// MoE rows a head chunk column (`head_c` columns of `k` Hc dims, + the VM
+    /// column), `vr` vocabulary rows a head PE over `HEAD_ROWS` rows.
+    pub k: usize,
+    pub head_c: usize,
+    pub vr: usize,
+    /// The embedding strip: `strip_c` columns of 4 Hc dims.
+    pub strip_c: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl GptossLayout {
+    /// The layout for `lanes` lanes of up to `context` positions: slots of
+    /// as many rows as `down` bands give, the attention unit's rows (and with
+    /// them the MoE grid's) chosen for the largest slack of the two units,
+    /// the narrowest head whose tables fit.
+    pub fn derive(
+        spec: &ModelSpec,
+        wafer: WaferDims,
+        lanes: usize,
+        context: usize,
+    ) -> Result<GptossLayout, Refused> {
+        let name = &spec.name;
+        if spec.moe.is_none() {
+            return refuse(format!("{name}: not a mixture of experts"));
+        }
+        let context = context.min(ROPE_POSITIONS);
+        let px = spec.kv_heads * (spec.head_dim / DC);
+        let mut best: Option<(usize, GptossLayout)> = None;
+        let mut why = Vec::new();
+        for down in 1..=spec.layers {
+            let height = wafer.height / down;
+            let across = spec.layers.div_ceil(down);
+            for ra in 8..height {
+                let rm = height - ra;
+                let entries = context.div_ceil(ra * PAGE);
+                // The pool: every lane's pages a row, and what else fits.
+                let need = lanes * entries;
+                let a0 = AttnUnit::new(spec, ra, lanes, entries, need);
+                if a0.bytes() > PE_LIMIT {
+                    continue;
+                }
+                let blocks = need + (PE_LIMIT - a0.bytes()) / a0.grid.block_bytes();
+                let attn = AttnUnit::new(spec, ra, lanes, entries, blocks.max(need));
+                let moe = MoeUnit::new(spec, px, rm, lanes)?;
+                if moe.bytes() > PE_LIMIT {
+                    why.push(format!(
+                        "{down} bands, ra {ra}: MoE grid {px} x {rm} wants {} B a PE",
+                        moe.bytes()
+                    ));
+                    continue;
+                }
+                let Some((k, head_c, vr)) = Self::head(spec, moe.hc, rm) else {
+                    continue;
+                };
+                let strip_c = rm.div_ceil(4);
+                if 2 * 4 * moe.hc * vr > STRIP_TABLES {
+                    continue;
+                }
+                let width = across * px + head_c + 1 + strip_c;
+                if width > wafer.width || HEAD_ROWS > wafer.height {
+                    why.push(format!("{down} bands, ra {ra}: {width} columns"));
+                    continue;
+                }
+                // Slack before the pool takes the attention unit's rest.
+                let slack = (PE_LIMIT - a0.bytes()).min(PE_LIMIT - moe.bytes());
+                let l = GptossLayout {
+                    across,
+                    down,
+                    ra,
+                    rm,
+                    attn,
+                    moe,
+                    k,
+                    head_c,
+                    vr,
+                    strip_c,
+                    width,
+                    height: down * height,
+                };
+                if best.as_ref().is_none_or(|(s, _)| slack > *s) {
+                    best = Some((slack, l));
+                }
+            }
+        }
+        best.map(|(_, l)| l).ok_or_else(|| {
+            Refused(format!(
+                "{name}: no layout holds {} layers at {lanes} lanes of {context} positions ({})",
+                spec.layers,
+                why.last()
+                    .map(String::as_str)
+                    .unwrap_or("no attention unit fits")
+            ))
+        })
+    }
+
+    /// The narrowest head over `rm` MoE rows of `hc` dims: `k` rows a chunk
+    /// column, its tables within head2d's.
+    fn head(spec: &ModelSpec, hc: usize, rm: usize) -> Option<(usize, usize, usize)> {
+        let vr = spec.vocab.div_ceil(HEAD_ROWS);
+        (1..=8)
+            .rev()
+            .find(|k| 2 * k * hc * vr <= HEAD16_TABLES)
+            .map(|k| (k, rm.div_ceil(k), vr))
+    }
+
+    /// Lanes' positions the pool holds a layer.
+    pub fn pool_positions(&self) -> usize {
+        self.attn.grid.blocks * self.ra * PAGE
     }
 }
 
@@ -123,61 +315,105 @@ mod tests {
         ModelSpec::read(&t).unwrap()
     }
 
-    fn unit(px: usize, py: usize, hc: usize, ic: usize, ne: usize) -> MoeUnit {
+    fn unit(py: usize, hc: usize, ne: usize, lanes: usize, mc: usize) -> MoeUnit {
         MoeUnit {
-            px,
+            px: 32,
             py,
             hc,
-            ic,
+            ic: 23,
             experts: ne,
             top_k: 4,
-            lanes: 1,
-            mlp_chunk: 1,
+            lanes,
+            mlp_chunk: mc,
         }
     }
 
-    /// The model reproduces both links.
+    /// The MoE model reproduces its links within 32 B.
     #[test]
-    fn the_memory_model_is_fitted_to_the_links() {
-        let u = unit(120, 180, 16, 24, 8);
-        assert_eq!(u.buffers(), MOE_BUF_AT_LINK);
-        assert_eq!(2 * 8 * u.expert_words(), 7_168);
-        assert_eq!(u.bytes(), 17_332 + 20_346 - 5_580);
-        let a = unit(128, 234, 13, 23, 8);
-        assert_eq!(a.buffers(), ATTN_BUF_AT_LINK);
-        assert_eq!(2 * 8 * a.expert_words(), 5_760);
-        assert_eq!(a.bytes_with_attention(), 24_520 + 18_642 - 1_798);
+    fn the_moe_model_is_fitted_to_the_links() {
+        let links = [
+            (unit(36, 15, 32, 1, 1), 47_232),
+            (unit(36, 15, 32, 2, 1), 47_536),
+            (unit(36, 15, 32, 4, 1), 48_160),
+            (unit(36, 15, 32, 4, 2), 48_880),
+            (unit(36, 14, 32, 1, 1), 46_560),
+            (unit(36, 13, 8, 1, 1), 27_648),
+        ];
+        for (u, top) in links {
+            let d = u.bytes() as isize - top as isize;
+            assert!(d.abs() <= 32, "{u:?}: model {} link {top}", u.bytes());
+        }
+        assert_eq!(unit(36, 15, 32, 1, 1).expert_bytes(), 24_448);
     }
 
-    /// gpt-oss-20b's 32 experts do not fit a layer grid that also attends
-    /// (128 x 234, the most rows five bands of grids leave), nor a MoE-only
-    /// grid of 120 x 180: each layer's MoE wants more PEs than a 24-layer
-    /// wafer gives a layer at today's code and three codes a u16.
+    /// The attention model never runs under its links, and at most 1.3 KB
+    /// over (hc, lanes, entries, blocks -> image end; the extras excluded).
     #[test]
-    fn gptoss_20b_wants_more_pes_a_layer_than_one_grid() {
+    fn the_attention_model_covers_the_links() {
         let s = spec("gptoss-20b-bf16-mxfp4-kv-bf16");
-        let one = MoeUnit::new(&s, 128, 234, 1).unwrap();
-        assert_eq!((one.hc, one.ic), (13, 23));
-        assert!(
-            one.bytes_with_attention() > PE_LIMIT,
-            "{}",
-            one.bytes_with_attention()
-        );
-        let moe = MoeUnit::new(&s, 120, 180, 1).unwrap();
-        assert!(moe.bytes() > PE_LIMIT, "{}", moe.bytes());
-        // The smallest MoE-only grid of 128 columns that fits, and its share
-        // of the wafer over 24 layers.
-        let py = (180..=1172)
-            .find(|&py| MoeUnit::new(&s, 128, py, 1).unwrap().bytes() <= PE_LIMIT)
-            .unwrap();
-        let fit = MoeUnit::new(&s, 128, py, 1).unwrap();
-        let wafer = 762 * 1172;
-        assert!(24 * fit.pes() < wafer, "py {py}: {} PEs", 24 * fit.pes());
-        println!(
-            "gpt-oss-20b MoE grid 128 x {py}: {} B a PE, {} PEs over 24 layers ({:.0}% of the wafer)",
-            fit.bytes(),
-            24 * fit.pes(),
-            100.0 * (24 * fit.pes()) as f64 / wafer as f64
-        );
+        let links = [
+            ((13, 1, 1, 4), 23_936),
+            ((85, 1, 1, 4), 36_736),
+            ((85, 1, 1, 32), 43_904),
+            ((85, 1, 8, 8), 40_992),
+            ((69, 1, 6, 8), 37_200),
+            ((69, 2, 6, 8), 40_928),
+            ((69, 4, 6, 8), 47_968),
+            ((69, 4, 2, 8), 39_616),
+            ((69, 8, 1, 8), 41_648),
+        ];
+        for ((hc, b, e, nb), top) in links {
+            let mut a = AttnUnit::new(&s, 2880usize.div_ceil(hc), b, e, nb);
+            a.grid.hc = hc;
+            let m = a.grid.bytes(false) - ATTN_LESS;
+            assert!(
+                m >= top && m <= top + 1_300,
+                "hc {hc} B {b} E {e} NB {nb}: model {m} link {top}"
+            );
+        }
+    }
+
+    /// gpt-oss-20b: 24 slots of attention over MoE and the head fit the
+    /// wafer at 1 and 2 lanes of 4096 positions and 4 of 1024; not 4 of 4096
+    /// nor 8.
+    #[test]
+    fn gptoss_20b_fits_the_wafer_as_attention_and_moe_units() {
+        let s = spec("gptoss-20b-bf16-mxfp4-kv-bf16");
+        for (lanes, ctx) in [(1, 4096), (2, 4096), (4, 1024)] {
+            let l = GptossLayout::derive(&s, WaferDims::CS3, lanes, ctx).unwrap();
+            assert!(
+                l.across * l.down >= 24 && l.width <= 755 && l.height <= 1170,
+                "{l:?}"
+            );
+            assert!(l.attn.bytes() <= PE_LIMIT && l.moe.bytes() <= PE_LIMIT);
+            assert!(l.pool_positions() >= lanes * ctx);
+            println!(
+                "B {lanes} x {ctx}: {} x {} slots of 128 x ({} + {}), attention Hc {} E {} NB {} ({} B, pool {} positions), \
+                 MoE Hc {} Ic {} ({} B), head {} x {} cols (k {}, Vr {}), strip {}, {} x {}",
+                l.across,
+                l.down,
+                l.ra,
+                l.rm,
+                l.attn.grid.hc,
+                l.attn.grid.entries,
+                l.attn.grid.blocks,
+                l.attn.bytes(),
+                l.pool_positions(),
+                l.moe.hc,
+                l.moe.ic,
+                l.moe.bytes(),
+                l.head_c + 1,
+                HEAD_ROWS,
+                l.k,
+                l.vr,
+                l.strip_c,
+                l.width,
+                l.height
+            );
+        }
+        // Lanes are bounded by the MoE grid's ~300 B a lane (B 8 wants 49.4 KB at
+        // Hc 15) and, at long context, by the attention unit's scores.
+        assert!(GptossLayout::derive(&s, WaferDims::CS3, 4, 4096).is_err());
+        assert!(GptossLayout::derive(&s, WaferDims::CS3, 8, 512).is_err());
     }
 }
