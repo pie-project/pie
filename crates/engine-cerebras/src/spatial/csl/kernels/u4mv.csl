@@ -1,0 +1,157 @@
+//@@ consts
+// ---------------------------------------------------------------- u4g64 weights
+// (u4mv.csl, spliced in by codegen for W4 builds.) Each weight symbol (wqa wqv
+// wv wo wgu wd) holds its matrix's u4g64 tile in place of the bf16 one, in
+// u16 words after the leading pad:
+//   [ng, nseg] [W4S(m) x (r0, len, g)]   the PE's groups and row segments
+//   per layer: codes [P][N + 1], then per group g: scales [N], biases [N] (bf16)
+// R rows (one per x element), N outputs. Word (p, j) holds the codes of rows
+// p, P + p, 2P + p, 3P + p (P = ceil(R / 4)) at bits 0, 4, 8, 12: plane k is
+// one shift and mask of the whole tile. Column N's codes are 1, so a group's
+// accumulator ends with the sum of its x. A segment is a run of rows in one
+// plane and one group (64 consecutive input dims, MLX's affine form):
+//   y += sum_g s_g * (sum_{r in g} x_r q_r) + b_g * (sum_{r in g} x_r).
+// Matrices m: 0 wqa, 1 wqv, 2 wv, 3 wo, 4 wgu, 5 wd.
+const W4DH: u16 = Dc / 2;
+const W4HD: u16 = Gs * Dc;
+// Groups a PE's rows can touch: a run of Hc (Ic) consecutive input dims, and
+// the O rows' 2 Qh runs of DH dims (one group each when DH divides 64 and a
+// half head starts on a group).
+const W4GH: u16 = (Hc + 62) / 64 + 1;
+const W4GD: u16 = (Ic + 62) / 64 + 1;
+const W4GO: u16 = if (64 % W4DH == 0 and (W4HD / 2) % 64 == 0) 2 * Qh else 2 * Qh * ((W4DH + 62) / 64 + 1);
+const W4Rv = [6]u16 { Hc, Hc, Hc, Qh * Dc, Hc, Ic };
+const W4Nv = [6]u16 { (Qh + 1) * W4DH, (Qh + 1) * W4DH, Dc, Hc, 2 * Ic, Hc };
+const W4Gv = [6]u16 { W4GH, W4GH, W4GH, W4GO, W4GH, W4GD };
+fn w4p(m: u16) u16 { return (W4Rv[m] + 3) / 4; }
+// Header words, a layer's words, a symbol's words (without the pad).
+fn w4hdr(m: u16) u16 { return 2 + 3 * (W4Gv[m] + 3); }
+fn w4lw(m: u16) u16 { return w4p(m) * (W4Nv[m] + 1) + 2 * W4Gv[m] * W4Nv[m]; }
+fn w4blob_words(m: u16) u16 { return w4hdr(m) + W4L * w4lw(m); }
+fn w4mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+const W4B0: u16 = w4blob_words(0);
+const W4B1: u16 = w4blob_words(1);
+const W4B2: u16 = w4blob_words(2);
+const W4B3: u16 = w4blob_words(3);
+const W4B4: u16 = w4blob_words(4);
+const W4B5: u16 = w4blob_words(5);
+fn w4plw(m: u16) u16 { return w4p(m) * (W4Nv[m] + 1); }
+fn w4acw(m: u16) u16 { return W4Gv[m] * (W4Nv[m] + 1); }
+const W4PL: u16 = w4mx(w4mx(w4mx(w4plw(0), w4plw(2)), w4mx(w4plw(3), w4plw(4))), w4plw(5));
+const W4AC: u16 = w4mx(w4mx(w4mx(w4acw(0), w4acw(2)), w4mx(w4acw(3), w4acw(4))), w4acw(5));
+const W4NM: u16 = w4mx(w4mx(W4Nv[0], W4Nv[3]), W4Nv[4]);
+//@@ fns
+// u4 scratch: the decoded plane (u16 codes, then bf16 in place), the groups'
+// accumulators, x's parts scaled for each plane (planes 0-2 are masked, not
+// shifted: plane k decodes to q 16^k, its x parts are x 16^-k, exactly).
+var w4pl: [W4PL + 1]u16 align(16) = @zeros([W4PL + 1]u16);
+var w4acc: [W4AC]f32 align(16) = @zeros([W4AC]f32);
+const W4XP: u16 = NP * XMAX;
+var w4xp = @zeros([4 * W4XP]@fp16());
+// A group's scales widened to f32 (the u16 high halves; the low halves stay zero).
+var w4sf: [2 * W4NM]u16 align(16) = @zeros([2 * W4NM]u16);
+var w4fdummy = @zeros([1]f32);
+const w4sf_u = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{W4NM} -> w4sf[2 * i + 1] });
+var w4sf_f = @get_dsd(mem1d_dsd, .{ .base_address = &w4fdummy, .extent = W4NM });
+var w4lay: u16 = 0;                   // the unit's current layer
+var w4pl_u = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{W4PL} -> w4pl[i + 1] });
+var w4pl_h = @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = W4PL });
+var w4u_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{W4PL} -> w4pl[i + 1] });
+var w4h_d = @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = W4PL });
+const w4acc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{W4AC} -> w4acc[i] });
+const w4xp_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{W4XP} -> w4xp[i] });
+const w4mask = [3]u16 { 0x000f, 0x00f0, 0x0f00 };
+const w4inv = [4]f32 { 1.0, 0.0625, 0.00390625, 1.0 };
+fn w4_rebase() void {
+  w4pl_h = @set_dsd_base_addr(w4pl_h, @ptrcast([*]@fp16(), &w4pl[1]));
+  w4sf_f = @set_dsd_base_addr(w4sf_f, @ptrcast([*]f32, &w4sf));
+}
+fn w4blob(m: u16) [*]u16 {
+  if (m == 0) { return @ptrcast([*]u16, &wqa[1]); }
+  if (m == 1) { return @ptrcast([*]u16, &wqv[1]); }
+  if (m == 2) { return @ptrcast([*]u16, &wv[1]); }
+  if (m == 3) { return @ptrcast([*]u16, &wo[1]); }
+  if (m == 4) { return @ptrcast([*]u16, &wgu[1]); }
+  return @ptrcast([*]u16, &wd[1]);
+}
+fn w4at(bp: [*]u16, off: u16, n: u16) mem1d_dsd {
+  return @set_dsd_length(@set_dsd_base_addr(w4u_d, @ptrcast([*]u16, &bp[off])), n);
+}
+fn w4ath(bp: [*]u16, off: u16, n: u16) mem1d_dsd {
+  return @set_dsd_length(@set_dsd_base_addr(w4h_d, @ptrcast([*]@fp16(), &bp[off])), n);
+}
+// y += A x for matrix m's u4 tile (x: its R rows; scr: 2R f32 words).
+fn wmv4(y: mem1d_dsd, m: u16, xv: mem1d_dsd, scr: mem1d_dsd) void {
+  const R = W4Rv[m];
+  const N = W4Nv[m];
+  const N1 = N + 1;
+  const P = w4p(m);
+  const bp = w4blob(m);
+  const ng = bp[0];
+  const nseg = bp[1];
+  const lb = w4hdr(m) + w4lay * w4lw(m);
+  // x's bf16 parts (as mvany), then each scaled for planes 1 and 2.
+  const res = @set_dsd_length(scr, R);
+  const tmp = @set_dsd_length(at(scr, R), R);
+  @fmovs(res, xv);
+  var k: u16 = 0;
+  while (k < NP) : (k += 1) {
+    const part = @set_dsd_length(@increment_dsd_offset(w4xp_d, @as(i16, k * XMAX), @fp16()), R);
+    @fs2h(part, res);
+    if (k + 1 < NP) {
+      @fh2s(tmp, part);
+      @fsubs(res, res, tmp);
+    }
+    var pk: u16 = 1;
+    while (pk < 4) : (pk += 1) {
+      const sc = @set_dsd_length(@increment_dsd_offset(w4xp_d, @as(i16, pk * W4XP + k * XMAX), @fp16()), R);
+      @fmulh(sc, part, @as(@fp16(), w4inv[pk]));
+    }
+  }
+  @fmovs(@set_dsd_length(w4acc_d, ng * N1), 0.0);
+  const words = w4at(bp, lb, P * N1);
+  const plu = @set_dsd_length(w4pl_u, P * N1);
+  const plh = @set_dsd_length(w4pl_h, P * N1);
+  var cur: u16 = 4;
+  var s: u16 = 0;
+  while (s < nseg) : (s += 1) {
+    const r0 = bp[2 + 3 * s];
+    const ln = bp[3 + 3 * s];
+    const g = bp[4 + 3 * s];
+    const pk = r0 / P;
+    if (pk != cur) {
+      cur = pk;
+      if (pk == 3) {
+        @slr16(plu, words, @as(u16, 12));
+      } else {
+        @and16(plu, words, w4mask[pk]);
+      }
+      @xp162fh(plh, plu);
+    }
+    const accg = @set_dsd_length(at(w4acc_d, g * N1), N1);
+    const row = @set_dsd_length(@increment_dsd_offset(plh, @as(i16, (r0 - pk * P) * N1), @fp16()), N1);
+    k = 0;
+    while (k < NP) : (k += 1) {
+      const part = @set_dsd_length(@increment_dsd_offset(w4xp_d, @as(i16, pk * W4XP + k * XMAX + r0), @fp16()), ln);
+      @load_to_dsr(mv_dest, accg, .{ .save_address = false });
+      @load_to_dsr(mv_src0, accg, .{ .save_address = false });
+      @load_to_dsr(mv_src1, row, .{ .save_address = true });
+      @map(mv16_step, part);
+    }
+  }
+  // y += s_g acc_g + b_g sum_g(x), the sum in two bf16 parts.
+  var g: u16 = 0;
+  while (g < ng) : (g += 1) {
+    const so = lb + P * N1 + 2 * g * N;
+    const accg = @set_dsd_length(at(w4acc_d, g * N1), N);
+    @mov16(@set_dsd_length(w4sf_u, N), w4at(bp, so, N));
+    @fmuls(accg, accg, @set_dsd_length(w4sf_f, N));
+    @fadds(y, y, accg);
+    const xs = w4acc[g * N1 + N];
+    const hi = @as(@fp16(), xs);
+    const lo = @as(@fp16(), xs - @as(f32, hi));
+    const bd = w4ath(bp, so + N, N);
+    @fmachs(y, y, bd, hi);
+    @fmachs(y, y, bd, lo);
+  }
+}
