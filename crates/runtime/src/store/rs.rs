@@ -220,9 +220,8 @@ pub struct RsStore {
     seq: u64,
     /// Unsettled fires by seq, with the slots each writes and reads.
     inflight: BTreeMap<u64, Touch>,
-    /// The same, by slot: the seqs of the unsettled fires that touch it, each
-    /// with how many times its touch names the slot.
-    touched: HashMap<RsSlotId, BTreeMap<u64, u32>>,
+    /// By slot number, the newest seq whose fire touched the slot.
+    last_touch: Vec<u64>,
     /// Checkpoints: hidden forks no process holds.
     checkpoints: HashMap<Hash256, RsCheckpoint>,
 }
@@ -281,7 +280,7 @@ impl RsStore {
             working_sets: GenMap::new(),
             seq: 0,
             inflight: BTreeMap::new(),
-            touched: HashMap::new(),
+            last_touch: Vec::new(),
             checkpoints: HashMap::new(),
         }
     }
@@ -1473,36 +1472,29 @@ impl RsStore {
 
     fn touch_ids(&mut self, seq: u64, ids: impl IntoIterator<Item = RsSlotId>) {
         for id in ids {
-            *self.touched.entry(id).or_default().entry(seq).or_insert(0) += 1;
+            let at = id.0 as usize;
+            if at >= self.last_touch.len() {
+                self.last_touch.resize(at + 1, 0);
+            }
+            self.last_touch[at] = self.last_touch[at].max(seq);
         }
     }
 
-    /// The fire under `seq` settled: it no longer touches its slots.
     fn settle_seq(&mut self, seq: u64) {
-        let Some(touch) = self.inflight.remove(&seq) else {
-            return;
-        };
-        for id in touch.writes.iter().chain(&touch.reads) {
-            let Some(seqs) = self.touched.get_mut(id) else {
-                continue;
-            };
-            if let Some(count) = seqs.get_mut(&seq) {
-                *count -= 1;
-                if *count == 0 {
-                    seqs.remove(&seq);
-                }
-            }
-            if seqs.is_empty() {
-                self.touched.remove(id);
-            }
-        }
+        self.inflight.remove(&seq);
     }
 
-    /// The newest unsettled fire that writes or reads `id`.
+    /// The seq `id` is recycled behind while a fire may still touch it: the
+    /// newest fire that touched it, while that is not older than every
+    /// unsettled fire. Never earlier than the newest unsettled fire that
+    /// writes or reads it, though it can be later, when the newest toucher
+    /// has settled and an older unrelated fire has not.
     fn newest_touch(&self, id: RsSlotId) -> Option<u64> {
-        self.touched
-            .get(&id)
-            .and_then(|seqs| seqs.keys().next_back().copied())
+        let oldest = *self.inflight.keys().next()?;
+        self.last_touch
+            .get(id.0 as usize)
+            .copied()
+            .filter(|&seq| seq >= oldest)
     }
 
     /// Drops a reference to `id`, recycling it once none remains, behind
