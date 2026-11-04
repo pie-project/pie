@@ -215,7 +215,9 @@ pub const RAN: &[Ran] = &[
                  with OP2 (scalar SiLU, set_axis skip; the plan's `ops2`, its codegen files \
                  byte-identical to 0480's) 1,403.7 (0480), the same accuracy; pie B 1 \
                  (frame 4, depth 15) 94.9-95.6% of bare over 6 reps (0481), on OP2 \
-                 1,345.0-1,356.7 tok/s = 95.1-96.0% of bare 1,413.9 (0484)",
+                 1,345.0-1,356.7 tok/s = 95.1-96.0% of bare 1,413.9 (0484); with QKV1 (one QKV \
+                 matvec, the plan's `qkv1`) 1,443.0 (0485, regions 46.2-46.6k a pass), greedy = \
+                 golden for 512, mismatches only at the two known ties",
     },
     Ran {
         design: Design::Serve8bRegion,
