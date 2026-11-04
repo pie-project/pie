@@ -932,6 +932,140 @@ mod tests {
         std::fs::write(dir.join("rs.bin"), out).unwrap();
     }
 
+    /// A launch's tables: every attention PE the pool table, every MoE PE
+    /// the lanes' positions (E 1, no pages), as gptoss_host.put_tables;
+    /// no PE outside a unit written (the spare slot, the head).
+    #[test]
+    fn a_launch_writes_each_unit_its_table() {
+        use crate::spatial::device::Recorder;
+        use crate::spatial::paged::{Lane, table};
+        use crate::spatial::program::{ProgramSpec, parse_params};
+        let params = parse_params(MINI);
+        let spec = ProgramSpec::from_params(
+            crate::spatial::codegen::Design::ServeGptoss,
+            &params,
+        )
+        .unwrap();
+        let gpt = spec.gptoss().unwrap();
+        let shape = spec.paged().unwrap();
+        assert_eq!((shape.rows, shape.entries, shape.pages()), (5, 2, 10));
+        let lane = Lane {
+            pos: 9,
+            slot: 9,
+            pages: vec![7, 2, 4],
+            visible: None,
+        };
+        let attn = table(&shape, std::slice::from_ref(&lane), 3).unwrap();
+        let rec = Recorder::default();
+        let mut dev = rec.clone();
+        put_tables(&gpt, shape, &mut dev, &attn).unwrap();
+        let mut moe = vec![NONE; 5];
+        moe[..2].copy_from_slice(&[9, 9]);
+        let units = gpt.slots.units();
+        let mut pes = 0;
+        for u in &units {
+            for py in 0..u.k.py {
+                let want = if u.kind == Kind::Attn {
+                    attn[py * shape.row_words()..(py + 1) * shape.row_words()].to_vec()
+                } else {
+                    moe.clone()
+                };
+                for px in 0..u.k.px {
+                    let at = ((u.x0 + px) as i32, (u.y0 + py) as i32);
+                    assert_eq!(rec.memory("tab", at.0, at.1), Some(want.clone()), "{at:?}");
+                    pes += 1;
+                }
+            }
+        }
+        assert_eq!(rec.dump().len(), pes);
+        // Row 2 holds logical page 0 (pool page 7: block 1), its four
+        // positions visible.
+        let r2 = &attn[2 * shape.row_words()..3 * shape.row_words()];
+        assert_eq!((r2[0], r2[1], r2[2], r2[4], r2[6]), (9, 9, 1, 0, 0xf));
+        // Every slot used: each slot row's attention and MoE units as one
+        // run each; at full size the spare slot splits the last row.
+        assert_eq!(runs(&units).len(), 2 * 3);
+        let full = Slots {
+            px: 128,
+            ay: 42,
+            ahc: 69,
+            my: 192,
+            mhc: 15,
+            gw: 5,
+            gh: 5,
+            nl: 24,
+        };
+        assert_eq!(runs(&full.units()).len(), 2 * 5);
+    }
+
+    /// `GPT_CKPT=<ck_mini6>`: the driver's whole host side on the mini
+    /// program on a recording device: load (routes, init, placement,
+    /// warm-up), a prompt launch, a decode launch with the logits read, a
+    /// page copy and the host tier's page out and in; every symbol it
+    /// touches is one the components declare.
+    #[test]
+    #[ignore]
+    fn the_driver_runs_the_mini_program() {
+        use crate::spatial::device::Recorder;
+        use crate::spatial::program::{ProgramSpec, parse_params};
+        use crate::spatial::serve2d::BatchLane;
+        use crate::spatial::wafer::{WaferModel, Weights};
+        let spec = ProgramSpec::from_params(
+            crate::spatial::codegen::Design::ServeGptoss,
+            &parse_params(MINI),
+        )
+        .unwrap();
+        let ckpt = Ckpt::open(std::path::Path::new(
+            &std::env::var("GPT_CKPT").expect("GPT_CKPT"),
+        ))
+        .unwrap();
+        let rec = Recorder::default();
+        let u0 = &spec.gptoss().unwrap().slots.units()[0];
+        rec.preset("rbits", u0.x0 as i32, u0.y0 as i32, &[1; 10]);
+        let declared: std::collections::BTreeSet<&str> =
+            spec.abi().iter().map(|(_, s)| s.name).collect();
+        let mut m = WaferModel::on_device(
+            Box::new(rec.clone()),
+            spec.clone(),
+            Weights::Place(&ckpt),
+            None,
+            0,
+        )
+        .expect("loads");
+        let lane = |pos: u32, forced: Vec<u32>| BatchLane {
+            pos,
+            slot: pos,
+            pages: vec![3, 8, 1],
+            visible: None,
+            forced,
+            state: None,
+        };
+        m.fire_batch(&[lane(0, vec![5, 6, 7])], 3, false).unwrap();
+        let (_, logits) = m.fire_batch(&[lane(3, vec![9])], 1, true).unwrap();
+        assert_eq!(logits.len(), 1);
+        assert_eq!(logits[0].len(), 1000);
+        m.copy_pages(&[(3, 4)]).unwrap();
+        let out = m.page_out(&[4]).unwrap();
+        m.page_in(&[(5, out[0].clone())]).unwrap();
+        let calls = rec.take();
+        for c in &calls {
+            if let Some(sym) = c.split_whitespace().nth(1) {
+                assert!(declared.contains(sym), "{c}: `{sym}` undeclared");
+            }
+        }
+        if std::env::var("GPT_PRINT").is_ok() {
+            for c in calls.iter().filter(|c| !c.contains(" wqa ")) {
+                eprintln!("{c}");
+            }
+        }
+        assert!(calls.iter().any(|c| c.starts_with("launch compute")), "{calls:?}");
+    }
+
+    /// The simulator's mini program.
+    const MINI: &str = "PX:8,AY:5,AHc:13,MY:18,MHc:4,HR:64,Dc:4,Gs:4,Qh:2,Ic:5,NE:8,TK:4,\
+AGY:5,MGY:6,GW:3,GH:3,NL:9,SLW:341,WIN:4,RTR:6,RTI:6,PS:4,NB:2,E:2,B:1,MC:1,NP:3,PROF:0,TIME:0,\
+HROUTE:1,HH:40,Vr:25,Gx:2,Gy:4,vocab:1000,PASSES:3,MODE:0,OVL:0,VMC:1,CAP:16,iters:1";
+
     /// The tables equal the bare host's (gptoss_host.Tables, FNV-1a 64 of
     /// every unit's rtab words in unit order), at the simulator's mini shape
     /// and at full size (the program CS-3 ran in 0447).
