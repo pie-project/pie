@@ -419,6 +419,28 @@ impl Variant {
                 "    return @bitcast(u16, @as(@fp16(), @bitcast(f32, u)));   // (f16)\n",
                 &format!("{tag}'s F16 kv_store"),
             )?;
+            // No scalar f32 -> @fp16() conversions in an IEEE build (0498-0503:
+            // the layers hang there, the head and handoffs alone run): the
+            // HV append converts k and v by DSD ops, the values matvec reads
+            // the probabilities from an f16 copy made by one @fs2h.
+            s = patch(
+                &s,
+                "  var d: u16 = 0;\n  while (d < Dc) : (d += 1) {\n    const kidx = (if (d < DHc) 0 else QH) + Qh * DHc + d % DHc;\n    kc[1 + kvoff() + blk * Dc + d] = kv_store(qkv[kidx]);\n    vc[1 + kvoff() + blk * Dc + d] = kv_store(qkv[QKN + d]);\n  }\n",
+                "  // (f16) k's two RoPE halves and v rounded by DSD ops\n  const kb = @set_dsd_length(kat(kc_dsd, blk * Dc), DHc);\n  @fs2h(kb, @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DHc} -> qkv[@as(i16, Qh * DHc) + i] }));\n  @fs2h(@increment_dsd_offset(kb, @as(i16, DHc), @fp16()), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DHc} -> qkv[@as(i16, QH + Qh * DHc) + i] }));\n  @fs2h(@set_dsd_length(kat(vc_dsd, blk * Dc), Dc), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> qkv[@as(i16, QKN) + i] }));\n",
+                &format!("{tag}'s F16 HV append"),
+            )?;
+            s = patch(
+                &s,
+                "  @fmovs(o_all, 0.0);\n",
+                "  @fmovs(o_all, 0.0);\n  // (f16) the probabilities as f16, for the values matvec's scalars (NS <= XMAX)\n  @fs2h(@set_dsd_length(xpart_dsd, NS), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> s[i] }));\n",
+                &format!("{tag}'s F16 probabilities"),
+            )?;
+            s = patch(
+                &s,
+                "@fmachs(od, od, vb, @as(@fp16(), s[e * NQB + b * Qh + h]));",
+                "@fmachs(od, od, vb, xpart[e * NQB + b * Qh + h]);   // (f16)",
+                &format!("{tag}'s F16 values"),
+            )?;
             if self.f16 == 2 && tag.starts_with("qwen2d_region/") {
                 s = apply_reps("f16acc_ops", src::F16ACC_OPS, &s, tag)?;
             }
