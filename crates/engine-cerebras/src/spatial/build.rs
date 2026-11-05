@@ -168,6 +168,13 @@ pub struct ServeConfig {
     /// serve8b_region(_pipe), with `ops2` at B 1: q, k and v as one matvec
     /// (`QKV1` 1, codegen's `Variant::qkv1`).
     pub qkv1: bool,
+    /// serve8b_region(_pipe), with `ops2`: the regions' Y all-reduces with FIFO
+    /// dual-input merges (`ARF` 1, codegen's `Variant::arf`).
+    pub arf: bool,
+    /// serve8b_region(_pipe), with `ops2`: an IEEE f16 build (`F16` 1);
+    /// `f16acc` also the regions' f16-accumulating matvecs (`F16` 2).
+    pub f16: bool,
+    pub f16acc: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -199,6 +206,9 @@ impl ServeConfig {
             lse: false,
             ops2: false,
             qkv1: false,
+            arf: false,
+            f16: false,
+            f16acc: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -270,6 +280,9 @@ impl ServeConfig {
             "lse",
             "ops2",
             "qkv1",
+            "arf",
+            "f16",
+            "f16acc",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -364,6 +377,9 @@ impl ServeConfig {
             lse: flag(t, "lse")?,
             ops2: flag(t, "ops2")?,
             qkv1: flag(t, "qkv1")?,
+            arf: flag(t, "arf")?,
+            f16: flag(t, "f16")?,
+            f16acc: flag(t, "f16acc")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -1005,6 +1021,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if cfg.qkv1 && !cfg.ops2 {
         return Err("serve8b_region's one QKV matvec (`qkv1`) needs `ops2`".into());
     }
+    if (cfg.arf || cfg.f16 || cfg.f16acc) && !cfg.ops2 {
+        return Err("serve8b_region's `arf` / `f16` / `f16acc` need `ops2`".into());
+    }
     if cfg.hv && !cfg.lse {
         return Err("serve8b_region's HV (`hv`) needs `lse` (and `speed`)".into());
     }
@@ -1318,6 +1337,8 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             lse: cfg.lse,
             ops2: cfg.ops2,
             qkv1: cfg.qkv1,
+            arf: usize::from(cfg.arf),
+            f16: if cfg.f16acc { 2 } else { usize::from(cfg.f16) },
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1381,6 +1402,12 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.qkv1 {
         st.push(Typed("QKV1"));
+    }
+    if cfg.arf {
+        st.push(Typed("ARF"));
+    }
+    if cfg.f16 || cfg.f16acc {
+        st.push(Typed("F16"));
     }
     if cfg.lever_d {
         st.push(Typed("YD"));
@@ -2948,6 +2975,53 @@ mod llama31_8b {
                         "{n}"
                     );
                     assert!(b.contains("var wv: [2]WS align(16)"), "{n}");
+                }
+                _ => assert_eq!(a, b, "{n}"),
+            }
+        }
+        cfg.ops2 = false;
+        assert!(params(&plan, &cfg).is_err());
+    }
+
+    /// `arf` states ARF 1 (the regions' Y all-reduces, grids unchanged);
+    /// `f16acc` states F16 2 (KV and the head in f16 in both units' files,
+    /// the regions' f16-accumulating matvecs); without `ops2` both are refused.
+    #[test]
+    fn arf_and_f16acc_state_their_params_and_patch_the_units() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.speed = true;
+        cfg.lse = true;
+        cfg.ops2 = true;
+        cfg.qkv1 = true;
+        cfg.arf = true;
+        cfg.f16acc = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
+        assert_eq!(get("ARF").as_deref(), Some("1"));
+        assert_eq!(get("F16").as_deref(), Some("2"));
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        assert_eq!((lay.model.arf, lay.model.f16), (1, 2));
+        let base = d
+            .files_with(Variant {
+                arf: 0,
+                f16: 0,
+                ..lay.model.variant()
+            })
+            .unwrap();
+        let new = d.files_with(lay.model.variant()).unwrap();
+        for ((n, a), (_, b)) in base.iter().zip(&new) {
+            match *n {
+                "region_pe.csl" => {
+                    assert!(!a.contains("fn arf_ar(") && b.contains("fn arf_ar("), "{n}");
+                    assert!(b.contains("wmvh(gb, wgu_dsd, xn_dsd, Hc, 2 * Ic, false);"), "{n}");
+                    assert!(b.contains("@as(@fp16(), @bitcast(f32, u))"), "{n}");
+                }
+                "grid_pe.csl" => {
+                    assert!(!b.contains("fn arf_ar(") && !b.contains("fn wmvh("), "{n}");
+                    assert!(b.contains("@as(@fp16(), @bitcast(f32, u))"), "{n}");
+                }
+                "head_pe.csl" => {
+                    assert!(a.contains("]bf16);") && !b.contains("]bf16);") && b.contains("@fp16()"), "{n}");
                 }
                 _ => assert_eq!(a, b, "{n}"),
             }
