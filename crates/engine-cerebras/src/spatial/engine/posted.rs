@@ -69,11 +69,27 @@ fn parse_continuation(v: Option<&str>) -> Option<usize> {
 /// than the latest posted fire's row (at slot `held`).
 fn continuation_steps(room: usize, cap: usize, end: u32, held: u32, posted_only: Option<usize>) -> usize {
     let steps = room.min(cap);
-    match posted_only {
-        Some(most) => steps.min(most).min((held + 1).saturating_sub(end) as usize),
-        None => steps,
+    let Some(most) = posted_only else {
+        return steps;
+    };
+    let posted = (held + 1).saturating_sub(end) as usize;
+    if posted < most && posted <= steps {
+        // Fewer rows posted than a launch takes: the stream's end (or a
+        // guest running behind). The host hands a launch's answers on one
+        // by one (~0.1 ms a token on the CS-3, 0561), so a last launch of
+        // all of them leaves that whole burst after the wafer is done: keep
+        // a short launch for the last rows, the earlier burst handed on
+        // while it runs (it takes ~0.6 ms a step).
+        let tail = TAIL_MIN.max(posted.div_ceil(6));
+        if posted >= 2 * tail {
+            return posted - tail;
+        }
     }
+    steps.min(most).min(posted)
 }
+
+/// The shortest last launch [`continuation_steps`] keeps back.
+const TAIL_MIN: usize = 8;
 
 /// The continuation lanes worth one launch, from each candidate's
 /// iterations (most first): those with at least half the most, all run the
@@ -370,9 +386,13 @@ mod tests {
         let all = Some(usize::MAX);
         assert_eq!(continuation_steps(16, 127, 528, 529, None), 16);
         assert_eq!(continuation_steps(16, 127, 528, 529, all), 2);
+        // A short posted run (the end) keeps its last rows for a launch of their own.
+        assert_eq!(continuation_steps(61, 127, 483, 529, Some(64)), 39);
+        assert_eq!(continuation_steps(61, 127, 522, 529, Some(64)), 8);
         // Mid-stream, fires posted far ahead: the cap, then the pages.
         assert_eq!(continuation_steps(200, 127, 100, 300, all), 127);
         assert_eq!(continuation_steps(60, 127, 100, 300, all), 60);
+        assert_eq!(continuation_steps(60, 127, 100, 300, Some(84)), 60);
         assert_eq!(continuation_steps(60, 127, 100, 99, all), 0);
         // posted:84 keeps launches even.
         assert_eq!(continuation_steps(200, 127, 100, 300, Some(84)), 84);
