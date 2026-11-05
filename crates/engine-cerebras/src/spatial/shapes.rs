@@ -243,7 +243,10 @@ pub const RAN: &[Ran] = &[
                  1,662.9 (0511, regions 39.35k a pass = 13.12k a layer, token 467.5k cycles), \
                  greedy = golden for 512, 0 teacher-forced mismatches; F16 3 (the grids' matvecs \
                  f16-accumulating too, the plan's `f16accg`) 1,683.4 / 1,683.8 (0515, grids \
-                 18.96k / 20.84k a pass), the same accuracy",
+                 18.96k / 20.84k a pass), the same accuracy; pie B 1 on the F16 2 program \
+                 (the plan's `arfx` + `mem` + `op3` + `f16acc`) 1,555.3-1,586.2 = 93.6-95.4% of \
+                 bare 1,662.1-1,662.7 in 5 of 6 reps (0516; rep 1 1,304.5 with a 63.5 ms host \
+                 gap), streams = golden for 512 x5 or off it only at the 274 tie x1",
     },
     Ran {
         design: Design::Serve8bRegion,
