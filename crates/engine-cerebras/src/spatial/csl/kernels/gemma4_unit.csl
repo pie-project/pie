@@ -19,7 +19,7 @@
 // feedforward, post-attention and post-feedforward norm weights and its scalar.
 // The u4g64 matvec (u4mv.csl's wmv4, spliced by codegen at //@@ u4fns): matrices
 // m 0 fused QKV, 1 O, 2 gate, 3 up, 4 down, at table index 5 kind + m.
-// B 1 only (the fused QKV), HROUTE 1, GY > 0, KV16, KVCP 0.
+// B 1 only (the fused QKV), HROUTE 1, GY > 0, KVCP 0; KV16 (KV16 0, an f32 pool: check builds).
 //
 // qwen2d_region: NL consecutive layers on one region (the layout of
 // docs/cerebras-8b-latency.md): every PE holds its slice of each layer's
@@ -1302,8 +1302,14 @@ fn set_layer(l: u16) void {
   lrx = if (g) 2 * NCOL + 1 else 0;
   lgb = if (g) 3 * NCOL + 1 else 2 * NCOL;
   lrot = if (g and NK == 2) RB * DHc else 0;
-  kc_dsd = @set_dsd_base_addr(kc_dsd, @ptrcast([*]@fp16(), &kc[1 + l * KCN]));
-  vc_dsd = @set_dsd_base_addr(vc_dsd, @ptrcast([*]@fp16(), &vc[1 + l * KCN]));
+  if (KV16 == 1) {
+    kc_dsd = @set_dsd_base_addr(kc_dsd, @ptrcast([*]@fp16(), &kc[1 + l * KCN]));
+    vc_dsd = @set_dsd_base_addr(vc_dsd, @ptrcast([*]@fp16(), &vc[1 + l * KCN]));
+  } else {
+    // (an f32 pool: G12 check builds)
+    kc_dsd = @set_dsd_base_addr(kc_dsd, @ptrcast([*]f32, &kc[1 + l * KCN]));
+    vc_dsd = @set_dsd_base_addr(vc_dsd, @ptrcast([*]f32, &vc[1 + l * KCN]));
+  }
 }
 fn rebase16() void { set_layer(0); }
 
@@ -1422,13 +1428,13 @@ fn copy_kv(src: u32, dst: u32, phase: u32) void {
 }
 
 comptime {
-  @comptime_assert(B == 1 and MC == 1 and NL <= 2 and GY > 0 and HROUTE == 1 and GBC == 0 and KV16 == 1);
+  @comptime_assert(B == 1 and MC == 1 and NL <= 2 and GY > 0 and HROUTE == 1 and GBC == 0);
   @comptime_assert(QhG == 0 or (GsG > 0 and PX % GsG == 0 and GY > 0));
   @comptime_assert(ACTN >= Hc and (!(HAS_S and HAS_G) or (ETN >= (Qh + 1) * DHc and 2 * (Qh + 1) * DHc + Dc <= QKN)));
 }
 
 comptime {
-  if (NL > 1) { @comptime_assert(W16 == 1 and KV16 == 1); }
+  if (NL > 1) { @comptime_assert(W16 == 1); }
   @initialize_queue(q_r1_0_in, .{ .color = c_r1_0 });
   @initialize_queue(q_r1_0_out, .{ .color = c_r1_0 });
   @initialize_queue(q_r1_1_in, .{ .color = c_r1_1 });

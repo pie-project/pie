@@ -218,6 +218,7 @@ impl G12Plan {
             win: spec.window,
             w4buf: W4BUF,
             esb: (spec.hidden as f32).sqrt().to_bits(),
+            kv16: true,
         };
         let mut plan = G12Plan {
             name: spec.name.clone(),
@@ -526,6 +527,7 @@ mod tests {
             win: 1024,
             w4buf: W4BUF,
             esb: 0,
+            kv16: true,
         };
         let ks = u4g12::kinds(2, 16, &knobs);
         let grid = Kernel {

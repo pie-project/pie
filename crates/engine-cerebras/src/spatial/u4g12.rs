@@ -55,6 +55,8 @@ pub struct G12 {
     pub w4buf: usize,
     /// f32 bits of the embedding's scale (sqrt(hidden)).
     pub esb: u32,
+    /// The pool in bf16 (`KV16` 1, every served build); f32 on a check build.
+    pub kv16: bool,
 }
 
 impl G12 {
@@ -570,9 +572,15 @@ fn place_unit(lay: &ProgramSpec, g: &G12, ckpt: &Ckpt, v: &Unit, dev: &mut dyn D
         .ok_or("serve8b_region without its paged shape")?;
     let kv = nl * shape.blocks * dc * shape.page_size;
     for sym in ["kc", "vc"] {
-        put_pe16(k, dev, sym, at, kv, |_, _, out| {
-            out.extend(std::iter::repeat_n(0, kv))
-        })?;
+        if g.kv16 {
+            put_pe16(k, dev, sym, at, kv, |_, _, out| {
+                out.extend(std::iter::repeat_n(0, kv))
+            })?;
+        } else {
+            put32(k, dev, sym, at, kv + 1, &|_, _, out| {
+                out.extend(std::iter::repeat_n(0, kv + 1))
+            })?;
+        }
     }
     Ok(())
 }
@@ -653,6 +661,7 @@ mod tests {
             win: 1024,
             w4buf: 512,
             esb: (3840f32).sqrt().to_bits(),
+            kv16: true,
         }
     }
 

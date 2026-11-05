@@ -363,7 +363,7 @@ impl Component for Kv {
         // The pool's cells at the KV's width; the staging slots as the
         // design packs them (f32 or bf16 pairs in 32-bit words, bf16 one a
         // word).
-        let w = if spec.layers.kv_bytes() == 2 {
+        let w = if spec.kv_bytes() == 2 {
             S::var16
         } else {
             S::var32
@@ -416,7 +416,7 @@ impl Kv {
             cols: spec.px(),
             shape,
             cells: spec.dc() * shape.page_size,
-            data_type: if spec.layers.kv_bytes() == 2 {
+            data_type: if spec.kv_bytes() == 2 {
                 DataType::Bits16
             } else {
                 DataType::Bits32
@@ -466,7 +466,7 @@ impl Kv {
     /// Bytes of one page's host copy: its cells at the KV's own width.
     #[must_use]
     pub fn page_bytes(&self, spec: &ProgramSpec) -> Option<usize> {
-        self.page_words(spec).map(|n| n * spec.layers.kv_bytes())
+        self.page_words(spec).map(|n| n * spec.kv_bytes())
     }
 
     /// `pages`' cells off the device, through the staging slots on a build

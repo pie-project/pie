@@ -1163,7 +1163,7 @@ impl WaferModel {
     /// (the host tier's suspension). Only between launches.
     pub fn page_out(&mut self, pages: &[u32]) -> R<Vec<Vec<u32>>> {
         let grid = &self.design;
-        let bf16 = grid.layers.kv_bytes() == 2;
+        let bf16 = grid.kv_bytes() == 2;
         // A staged copy is one with no fire inside it: the flag stays up
         // past an error midway, and fires refuse while it is.
         self.staged = true;
@@ -1184,7 +1184,7 @@ impl WaferModel {
             .kv
             .page_words(grid)
             .ok_or("the host keeps no pages of this build")?;
-        let bf16 = grid.layers.kv_bytes() == 2;
+        let bf16 = grid.kv_bytes() == 2;
         self.staged = true;
         let cells: Vec<(u32, Vec<u32>)> = pages
             .iter()

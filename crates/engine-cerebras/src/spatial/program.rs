@@ -746,7 +746,19 @@ impl ProgramSpec {
             win: knob("WIN").unwrap_or(0) as usize,
             w4buf: knob("W4BUF").unwrap_or(1024) as usize,
             esb: knob("ESB").unwrap_or(0) as u32,
+            kv16: knob("KV16") != Some(0),
         })
+    }
+
+    /// Bytes of a KV cell: the layers' width, or f32 on a G12 check build
+    /// with `KV16 0` (an f32 pool: the tiny simulator's exact comparison).
+    #[must_use]
+    pub fn kv_bytes(&self) -> usize {
+        if self.gemma12().is_some_and(|g| !g.kv16) {
+            4
+        } else {
+            self.layers.kv_bytes()
+        }
     }
 
     /// The head's lm_head tiles and the embedding strip hold u4g64 too
@@ -1686,7 +1698,9 @@ fn serve8b(get: &Get) -> R<ProgramSpec> {
 /// embedding strip as serve8b's.
 fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
     headmode(get, "serve8b_region")?;
-    if get.req("W16")? != 1 || get.req("KV16")? != 1 || get.opt("KVCP").unwrap_or(0) != 0 {
+    // (G12 check builds may keep an f32 pool: KV16 0.)
+    let kv16_ok = get.req("KV16")? == 1 || get.opt("G12") == Some(1);
+    if get.req("W16")? != 1 || !kv16_ok || get.opt("KVCP").unwrap_or(0) != 0 {
         return Err("serve8b_region keeps weights and KV in bf16 and copies pages by the host (W16 1, KV16 1, KVCP 0)".into());
     }
     let grid = kernel(get)?;
