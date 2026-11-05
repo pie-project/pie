@@ -271,7 +271,11 @@ pub const RAN: &[Ran] = &[
                  pass), + rsqrt in two Newton steps (TRM 479) 1,903.1 / 1,902.5 (0533), + the \
                  head's split_x alone (TRM 255) 1,897.4 / 1,897.7 (0533, head matvec mean 4.28k \
                  against 5.34k), each = golden for 512, 0 teacher-forced mismatches; ARF 7 (the \
-                 segment all-reduce as streamed halves) hung (0532)",
+                 segment all-reduce as streamed halves) hung (0532: kernel ARF constant 1); \
+                 TRM 511 + ARY 16 + HVC 1 1,908.7 / 1,908.2 (0534), golden for 512, 0 \
+                 mismatches; pie B 1 on it (bundle x7: + `trim` + `ary16` + `hvc`) 1,820.6, \
+                 1,824.0, 1,805.8, 1,820.5, 1,805.7 = 94.6-95.6% of bare (rep 1 1,455.6: the \
+                 host fire stall), every stream = golden for 512",
     },
     Ran {
         design: Design::Serve8bRegion,
@@ -301,7 +305,9 @@ pub const RAN: &[Ran] = &[
                  grids 15.9-16.4k), the same 14 mismatches; + XAC 1,445.9 / 1,443.8 (0529, \
                  regions 39.8-39.9k a pass), the same 14 mismatches; + TRM 31 1,521.8 / 1,520.6 \
                  (0531) with 13 teacher-forced mismatches, not 0529's 14 (9 differ): TRM's \
-                 inexact bits (2: another summation order, 8: exp at degree 4) move Qwen's",
+                 inexact bits (2: another summation order, 8: exp at degree 4) move Qwen's; \
+                 the exact bits (TRM 245) + HVC 1 1,537.7 / 1,539.4 and + ARY 16 1,539.4 / \
+                 1,538.5 (0534), both with 0529's 14 mismatches exactly",
     },
 ];
 
