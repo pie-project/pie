@@ -241,7 +241,9 @@ pub const RAN: &[Ran] = &[
                  plan's `op3`) 1,594.2 / 1,594.7 (0510, regions 41.48k a pass = 13.83k a layer), \
                  mismatches only at the two ties; with F16 2 (the plan's `f16acc`) 1,663.3 / \
                  1,662.9 (0511, regions 39.35k a pass = 13.12k a layer, token 467.5k cycles), \
-                 greedy = golden for 512, 0 teacher-forced mismatches",
+                 greedy = golden for 512, 0 teacher-forced mismatches; F16 3 (the grids' matvecs \
+                 f16-accumulating too, the plan's `f16accg`) 1,683.4 / 1,683.8 (0515, grids \
+                 18.96k / 20.84k a pass), the same accuracy",
     },
     Ran {
         design: Design::Serve8bRegion,
