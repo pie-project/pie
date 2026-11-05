@@ -128,6 +128,8 @@ def run(args: argparse.Namespace):
         max_num_seqs = max(1, args.num_requests)
     else:
         max_num_seqs = args.concurrency
+    if getattr(args, "max_num_seqs", 0):
+        max_num_seqs = min(max_num_seqs, args.max_num_seqs)
     llm_kwargs = {}
     if args.attention_backend:
         llm_kwargs["attention_config"] = {"backend": args.attention_backend}
@@ -374,6 +376,8 @@ def run_streaming(args: argparse.Namespace):
         max_num_seqs = max(1, args.num_requests)
     else:
         max_num_seqs = args.concurrency
+    if getattr(args, "max_num_seqs", 0):
+        max_num_seqs = min(max_num_seqs, args.max_num_seqs)
     engine_kwargs = {}
     if args.enforce_eager:
         engine_kwargs["enforce_eager"] = True
@@ -688,6 +692,14 @@ def main() -> None:
             default=False,
         )
         sp.add_argument("--max-num-batched-tokens", type=int, default=None)
+        sp.add_argument(
+            "--max-num-seqs",
+            type=int,
+            default=0,
+            help="Cap on vLLM's max_num_seqs (0: the concurrency). For a hybrid "
+                 "model whose per-sequence state pool cannot hold every offered "
+                 "request at once; the rest queue in vLLM's scheduler.",
+        )
         sp.add_argument(
             "--kv-cache-dtype",
             default="auto",
