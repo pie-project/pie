@@ -171,6 +171,8 @@ pub struct ServeConfig {
     /// serve8b_region(_pipe), with `ops2`: the regions' Y all-reduces with FIFO
     /// dual-input merges (`ARF` 1, codegen's `Variant::arf`).
     pub arf: bool,
+    /// With `arf`: also the regions' X full all-reduces (`ARF` 3).
+    pub arfx: bool,
     /// serve8b_region(_pipe), with `ops2`: an IEEE f16 build (`F16` 1);
     /// `f16acc` also the regions' f16-accumulating matvecs (`F16` 2).
     pub f16: bool,
@@ -210,6 +212,7 @@ impl ServeConfig {
             ops2: false,
             qkv1: false,
             arf: false,
+            arfx: false,
             f16: false,
             f16acc: false,
             mem: false,
@@ -285,6 +288,7 @@ impl ServeConfig {
             "ops2",
             "qkv1",
             "arf",
+            "arfx",
             "f16",
             "f16acc",
             "mem",
@@ -383,6 +387,7 @@ impl ServeConfig {
             ops2: flag(t, "ops2")?,
             qkv1: flag(t, "qkv1")?,
             arf: flag(t, "arf")?,
+            arfx: flag(t, "arfx")?,
             f16: flag(t, "f16")?,
             f16acc: flag(t, "f16acc")?,
             mem: flag(t, "mem")?,
@@ -1030,6 +1035,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if (cfg.arf || cfg.f16 || cfg.f16acc) && !cfg.ops2 {
         return Err("serve8b_region's `arf` / `f16` / `f16acc` need `ops2`".into());
     }
+    if cfg.arfx && !cfg.arf {
+        return Err("serve8b_region's X all-reduces (`arfx`) need `arf`".into());
+    }
     if cfg.mem && !cfg.arf {
         return Err("serve8b_region's code cuts (`mem`) need `arf`".into());
     }
@@ -1346,7 +1354,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             lse: cfg.lse,
             ops2: cfg.ops2,
             qkv1: cfg.qkv1,
-            arf: usize::from(cfg.arf),
+            arf: if cfg.arfx { 3 } else { usize::from(cfg.arf) },
             f16: if cfg.f16acc { 2 } else { usize::from(cfg.f16) },
             mem: usize::from(cfg.mem),
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
@@ -3007,15 +3015,16 @@ mod llama31_8b {
         cfg.ops2 = true;
         cfg.qkv1 = true;
         cfg.arf = true;
+        cfg.arfx = true;
         cfg.f16acc = true;
         cfg.mem = true;
         let (d, p) = params(&plan, &cfg).unwrap();
         let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
-        assert_eq!(get("ARF").as_deref(), Some("1"));
+        assert_eq!(get("ARF").as_deref(), Some("3"));
         assert_eq!(get("F16").as_deref(), Some("2"));
         assert_eq!(get("MEM").as_deref(), Some("1"));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
-        assert_eq!((lay.model.arf, lay.model.f16, lay.model.mem), (1, 2, 1));
+        assert_eq!((lay.model.arf, lay.model.f16, lay.model.mem), (3, 2, 1));
         let base = d
             .files_with(Variant {
                 arf: 0,
@@ -3032,6 +3041,7 @@ mod llama31_8b {
                     assert!(b.contains("wmvh(gb, wgu_dsd, xn_dsd, Hc, 2 * Ic, false);"), "{n}");
                     assert!(b.contains("@as(@fp16(), @bitcast(f32, u))"), "{n}");
                     assert!(b.contains("const R2X: u16 =") && b.contains("while (c < dims[10])"), "{n}");
+                    assert!(b.contains("fn axis_xa()") && b.contains("3 * NCOL + 3"), "{n}");
                 }
                 "grid_pe.csl" => {
                     assert!(!b.contains("fn arf_ar(") && !b.contains("fn wmvh("), "{n}");
@@ -3047,7 +3057,9 @@ mod llama31_8b {
         assert!(params(&plan, &cfg).is_err());
         cfg.ops2 = true;
         cfg.arf = false;
-        assert!(params(&plan, &cfg).is_err(), "mem without arf");
+        assert!(params(&plan, &cfg).is_err(), "mem / arfx without arf");
+        cfg.mem = false;
+        assert!(params(&plan, &cfg).is_err(), "arfx without arf");
     }
 
     /// The ring at PY 152: B 1 x 12 at CAP 32 ran on hardware (0402) and

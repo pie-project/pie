@@ -46,5 +46,17 @@
  {
   "old": "  if (NG > 1) { phase2(is_max, buf, n); }\n  if (axis_id == R2) {",
   "new": "  if ((XC and PX > Gs) or (!XC and NG > 1)) { phase2(is_max, buf, n); }\n  if (axis_id == (if (XC) R2X else R2)) {"
+ },
+ {
+  "old": "    timestamp.get_timestamp(&t_now);\n    if (timing) { prof[slot] += @as(u32, (tsc(&t_now) - tsc(&t_mark)) & 0xffffffff); }\n    t_mark = t_now;\n",
+  "new": "    // (mem) 32-bit differences of the TSC's low words, the last mark's in t_lo\n    timestamp.get_timestamp(&t_now);\n    const lo = @as(u32, t_now[0]) | (@as(u32, t_now[1]) << 16);\n    if (timing) { prof[slot] += lo - t_lo; }\n    t_lo = lo;\n"
+ },
+ {
+  "old": "var timing: bool = false;\n",
+  "new": "var timing: bool = false;\nvar t_lo: u32 = 0;   // (mem)\n"
+ },
+ {
+  "old": "fn pass_start() void {\n",
+  "new": "fn pass_start() void {\n  if (PROF == 1) {   // (mem) the pass's first mark from here\n    timestamp.get_timestamp(&t_now);\n    t_lo = @as(u32, t_now[0]) | (@as(u32, t_now[1]) << 16);\n  }\n"
  }
 ]
