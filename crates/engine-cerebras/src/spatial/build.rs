@@ -198,6 +198,12 @@ pub struct ServeConfig {
     /// codegen's `Variant::trim`: 1 the exact cuts, 2 x's sums of squares by
     /// a scalar loop, 8 exp at degree 4; 4 the grids too with `f16accg`).
     pub trim: bool,
+    /// With `arfx` and `xac`: the segment all-reduce as streamed halves too
+    /// (`ARF` 7, codegen's arfs_ops; the host's X set as segment lines).
+    pub arfs: bool,
+    /// With `arf`: the ARF Y streamed halves in groups of 16 rows (`ARY` 16;
+    /// the host's route words).
+    pub ary16: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -240,6 +246,8 @@ impl ServeConfig {
             f16_clamp: false,
             xac: false,
             trim: false,
+            arfs: false,
+            ary16: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -322,6 +330,8 @@ impl ServeConfig {
             "f16_clamp",
             "xac",
             "trim",
+            "arfs",
+            "ary16",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -427,6 +437,8 @@ impl ServeConfig {
             f16_clamp: flag(t, "f16_clamp")?,
             xac: flag(t, "xac")?,
             trim: flag(t, "trim")?,
+            arfs: flag(t, "arfs")?,
+            ary16: flag(t, "ary16")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -1092,8 +1104,14 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if cfg.xac && !cfg.arfx {
         return Err("serve8b_region's `xac` needs `arfx`".into());
     }
-    if cfg.trim && !(cfg.qkv1 && cfg.ops2 && cfg.f16acc) {
-        return Err("serve8b_region's `trim` needs `qkv1`, `ops2` and `f16acc`".into());
+    if cfg.trim && !(cfg.qkv1 && cfg.ops2 && cfg.f16acc && cfg.arfx) {
+        return Err("serve8b_region's `trim` needs `qkv1`, `ops2`, `f16acc` and `arfx`".into());
+    }
+    if cfg.arfs && !(cfg.arfx && cfg.xac) {
+        return Err("serve8b_region's `arfs` needs `arfx` and `xac`".into());
+    }
+    if cfg.ary16 && !cfg.arf {
+        return Err("serve8b_region's `ary16` needs `arf`".into());
     }
     if cfg.hv && !cfg.lse {
         return Err("serve8b_region's HV (`hv`) needs `lse` (and `speed`)".into());
@@ -1408,7 +1426,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             lse: cfg.lse,
             ops2: cfg.ops2,
             qkv1: cfg.qkv1,
-            arf: if cfg.arfx { 3 } else { usize::from(cfg.arf) },
+            arf: if cfg.arfs { 7 } else if cfg.arfx { 3 } else { usize::from(cfg.arf) },
             f16: if cfg.f16accg { 3 } else if cfg.f16acc { 2 } else { usize::from(cfg.f16) },
             // (MEM 3 where the q/k norm is the identity: q's scale a constant)
             mem: if cfg.mem { if plan.spec.qk_norm { 1 } else { 3 } } else { 0 },
@@ -1421,7 +1439,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             },
             f16cl: cfg.f16_clamp,
             xac: cfg.xac,
-            trim: if cfg.trim { 11 | (usize::from(cfg.grid_levers && cfg.f16accg) << 2) } else { 0 },
+            // (TRM: every bit but 2's first form; the grids' with their f16 accumulation)
+            trim: if cfg.trim { 123 | (usize::from(cfg.grid_levers && cfg.f16accg) << 2) } else { 0 },
+            ary: if cfg.ary16 { 16 } else { 0 },
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1509,6 +1529,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.trim {
         st.push(Typed("TRM"));
+    }
+    if cfg.ary16 {
+        st.push(Typed("ARY"));
     }
     if cfg.lever_d {
         st.push(Typed("YD"));
@@ -2918,18 +2941,20 @@ mod llama31_8b {
         got.retain(|(k, _)| k != "KVST");
         got.sort();
         assert_eq!(got, super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1")));
-        // + trim: 0531's sp531_t4 (TRM 15: the cuts in both units)
-        cfg.trim = true;
+        // + trim + arfs + ary16: TRM 127, ARF 7, ARY 16
+        (cfg.trim, cfg.arfs, cfg.ary16) = (true, true, true);
         let (d, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1,TRM:15")));
+        let want7 = want.replace("ARF:3", "ARF:7");
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:127,ARY:16")));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         for (n, text) in d.files_with(lay.model.variant()).unwrap() {
             if n == "region_pe.csl" || n == "grid_pe.csl" {
                 assert!(text.contains("(trm) y starts at 0") && text.contains("(trm 2)") && text.contains("(trm 8)"), "{n}");
-                assert!(text.contains("(trm) both halves' q heads in one op"), "{n}");
+                assert!(text.contains("(trm) both halves' q heads in one op") && text.contains("(trm 16)"), "{n}");
+                assert!(text.contains("(trm 64)") && text.contains("(arfs)"), "{n}");
             }
         }
     }
