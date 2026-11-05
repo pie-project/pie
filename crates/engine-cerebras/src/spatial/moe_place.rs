@@ -112,9 +112,9 @@ pub fn plane_pack(codes: &[u16], l: usize, r: usize) -> Vec<u16> {
     let n3 = l.div_ceil(3) * r;
     let mut w = vec![0u16; n3];
     for p in 0..3 {
-        for k in 0..n3 {
+        for (k, wk) in w.iter_mut().enumerate() {
             let c = codes.get(p * n3 + k).copied().unwrap_or(0);
-            w[k] |= ((c & 8) << (12 - 3 * p)) | ((c & 7) << (6 - 3 * p));
+            *wk |= ((c & 8) << (12 - 3 * p)) | ((c & 7) << (6 - 3 * p));
         }
     }
     w

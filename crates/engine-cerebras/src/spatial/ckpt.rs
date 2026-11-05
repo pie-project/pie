@@ -242,7 +242,7 @@ impl Ckpt {
         let index = dir.join("model.safetensors.index.json");
         let (paths, entries) = if dir.join("model.safetensors").exists() {
             let path = dir.join("model.safetensors");
-            let entries = safetensors(&[path.clone()], 0)?;
+            let entries = safetensors(std::slice::from_ref(&path), 0)?;
             (vec![vec![path]], entries)
         } else if index.exists() {
             let map: serde_json::Value = serde_json::from_str(

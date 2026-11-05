@@ -284,7 +284,15 @@ impl Tables {
             .ok_or_else(|| format!("a path leaves the units at ({x}, {y})"))
     }
 
-    pub(crate) fn route(&mut self, x: usize, y: usize, color: u32, rx: u32, t1: u32, t2: u32) -> R<()> {
+    pub(crate) fn route(
+        &mut self,
+        x: usize,
+        y: usize,
+        color: u32,
+        rx: u32,
+        t1: u32,
+        t2: u32,
+    ) -> R<()> {
         let e = self.at(x, y)?;
         let r = (rx, t1, t2);
         match e.routes.get(&color) {
@@ -340,7 +348,14 @@ impl Tables {
 
     /// Unit `u`'s row `row` takes `color` at column `xin` (from `rxin`, or
     /// RAMP: that PE multicasts its own) and every PE of the row gets it.
-    pub(crate) fn row_mcast(&mut self, color: u32, u: &Unit, row: usize, xin: usize, rxin: u32) -> R<()> {
+    pub(crate) fn row_mcast(
+        &mut self,
+        color: u32,
+        u: &Unit,
+        row: usize,
+        xin: usize,
+        rxin: u32,
+    ) -> R<()> {
         let y = u.y0 + row;
         let (xa, xb) = (u.x0, u.x0 + u.k.px - 1);
         for x in xa..=xb {
