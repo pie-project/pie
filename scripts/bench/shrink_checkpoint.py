@@ -1498,7 +1498,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
         config_rewrite=_rewrite_gemma4,
         text_cfg_key="text_config",
         # The towers are kept so the miniature loads unmodified as `Gemma4ForConditionalGeneration`.
-        keep_res=(re.compile(r"^model\.(vision_tower|embed_vision)\."),),
+        keep_res=(re.compile(r"^model\.(vision_tower|embed_vision|vision_embedder)\."), re.compile(r"^vision_embedder\.")),
     ),
     "muse_glimmer": dict(
         layer_prefix="model.language_model.layers.",
