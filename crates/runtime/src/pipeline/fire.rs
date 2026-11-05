@@ -2165,6 +2165,19 @@ fn settling(parts: &[FireWs]) -> Vec<CursorCell> {
         .collect()
 }
 
+/// The working sets a piece writes: those with a lane that has rows in it. A set whose lanes
+/// all ride only in a later piece (a decode lane's one row beside a prompt cut into pieces) is
+/// not written here; its span would be empty, which reads as a write at slot 0, inside what the
+/// set already froze, so it takes no lease, transaction or log in this piece.
+fn written_groups<W>(piece_groups: &[(W, Vec<usize>)]) -> Vec<usize> {
+    piece_groups
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, lanes))| !lanes.is_empty())
+        .map(|(group, _)| group)
+        .collect()
+}
+
 fn written_span_of(
     req: &crate::engine::FireRequest,
     lanes: &[usize],
@@ -2753,10 +2766,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .map(|&row| (row - slots.start) as u32)
                 .collect();
             inside.drain(..inside.len().saturating_sub(snapshots));
-            let sets: Vec<(&KvWorkingSet, Written)> = group_sets
+            let present = written_groups(&piece_groups);
+            let sets: Vec<(&KvWorkingSet, Written)> = present
                 .iter()
-                .zip(&spans)
-                .map(|(set, (_, written))| (set, Written::Span(written.clone())))
+                .map(|&group| (&group_sets[group], Written::Span(spans[group].1.clone())))
                 .collect();
             let rs_plan = || {
                 if ring {
@@ -2793,12 +2806,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 && plain
                 && plain_decode(&req, adapted, fire_wide_mask);
             let mut parts = Vec::with_capacity(group_sets.len());
-            for (group, ((set, (slots, written)), (lease, kvtxn))) in group_sets
-                .iter()
-                .zip(&spans)
-                .zip(leases.into_iter().zip(kvtxns))
-                .enumerate()
-            {
+            for (&group, (lease, kvtxn)) in present.iter().zip(leases.into_iter().zip(kvtxns)) {
+                let (set, (slots, written)) = (&group_sets[group], &spans[group]);
                 let logged = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
                     let folded = kv.folded(set.id)?;
                     let pages = if reports && kv.keeps() {
@@ -4301,6 +4310,7 @@ mod cut_tests {
         a_masked_pass_is_cut_with_its_rows_masks();
         the_last_piece_holds_what_the_program_reads();
         several_lanes_are_cut_and_end_together();
+        a_lane_only_in_the_last_piece_is_not_written_before_it();
         a_pass_with_media_is_cut_before_its_first_span();
         a_pass_with_media_keys_the_rows_before_it();
     }
@@ -4452,6 +4462,46 @@ mod cut_tests {
             1,
             "not where the lanes carry recurrent state"
         );
+    }
+
+    fn a_lane_only_in_the_last_piece_is_not_written_before_it() {
+        // A prompt cut into pieces beside a decode lane whose one row rides only in the last.
+        let mut req = prefill_lane(0, 100, 16);
+        let decode = prefill_lane(17, 1, 16).lanes.remove(0);
+        req.lanes.push(decode);
+        let pieces = pass_pieces(&req, true, true, 32, 16, &[], &[]);
+        assert!(pieces.len() > 1, "the prompt is cut");
+        let groups = [(0u32, vec![0]), (1u32, vec![1])];
+        for (at, piece) in pieces.iter().enumerate() {
+            let kept: Vec<usize> = (0..req.lanes.len())
+                .filter(|&lane| piece[lane].is_some())
+                .collect();
+            let piece_groups: Vec<(u32, Vec<usize>)> = groups
+                .iter()
+                .map(|(ws, lanes)| {
+                    (
+                        *ws,
+                        lanes
+                            .iter()
+                            .filter_map(|lane| kept.iter().position(|k| k == lane))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let last = at + 1 == pieces.len();
+            let written = written_groups(&piece_groups);
+            assert_eq!(
+                written,
+                if last { vec![0, 1] } else { vec![0] },
+                "piece {at}"
+            );
+            if !last {
+                // what the decode lane's set would have logged here: a write at slot 0, inside
+                // the 17 slots it already froze
+                let rows = rows_of_lanes(&req, piece, false, 16);
+                assert_eq!(written_span_of(&rows, &piece_groups[1].1, 16), (0..0, 0..0));
+            }
+        }
     }
 
     fn the_last_piece_holds_what_the_program_reads() {
