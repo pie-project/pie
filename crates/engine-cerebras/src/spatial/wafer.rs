@@ -517,6 +517,15 @@ impl WaferModel {
         Ok(out)
     }
 
+    /// The head block's profile counters per PE (16 words a PE, row-major over
+    /// [`Self::profile`]'s head rectangle), and that rectangle's width.
+    pub fn profile_head_raw(&mut self) -> R<(Vec<u32>, usize)> {
+        let hx = self.design.head_x();
+        let w = self.design.chunk_cols() + self.design.vmc();
+        let a = self.rt.get("prof", rect(hx, 0, w, self.design.hh() + 1), 16)?;
+        Ok((a, w))
+    }
+
     /// Why the head's VM cannot take `table` (no VM, or a table past its
     /// limits or its ring's width), if it cannot.
     pub fn vm_refuses(&self, table: &super::guest4::Table) -> Option<String> {

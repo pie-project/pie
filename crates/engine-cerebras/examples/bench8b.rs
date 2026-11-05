@@ -160,7 +160,32 @@ fn main() -> Result<(), String> {
                     })
                 })
                 .collect();
+            // BENCH8B_HEADMAP=1: the head's slots 0-5 averaged over each column
+            // and each row (where the head's max comes from).
+            let mut headmap = serde_json::Value::Null;
+            if std::env::var("BENCH8B_HEADMAP").is_ok_and(|v| v == "1") {
+                let (a, w) = m.profile_head_raw()?;
+                let h = a.len() / 16 / w;
+                let mut cols = vec![vec![0f64; w]; 6];
+                let mut rows = vec![vec![0f64; h]; 6];
+                let mut rmax = vec![vec![0f64; h]; 6];
+                for y in 0..h {
+                    for x in 0..w {
+                        for s in 0..6 {
+                            let v = a[(y * w + x) * 16 + s] as f64 / timed;
+                            cols[s][x] += v / h as f64;
+                            rows[s][y] += v / w as f64;
+                            rmax[s][y] = rmax[s][y].max(v);
+                        }
+                    }
+                }
+                let r1 = |v: &Vec<Vec<f64>>| -> Vec<Vec<f64>> {
+                    v.iter().map(|r| r.iter().map(|x| x.round()).collect()).collect()
+                };
+                headmap = serde_json::json!({"cols": r1(&cols), "rows": r1(&rows), "rows_max": r1(&rmax)});
+            }
             Ok(serde_json::json!({
+                "headmap": headmap,
                 "launches": k, "timed_passes": timed, "start": at0,
                 "wall_s": wall, "ms_pass": 1e3 * wall / (k * (cap - 1)) as f64,
                 "units": units,
