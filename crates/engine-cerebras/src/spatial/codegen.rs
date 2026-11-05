@@ -2256,7 +2256,9 @@ fn w4_unit(src: &str, tag: &str, layers: &str) -> R<String> {
     let (consts, fns) = src::U4MV
         .split_once("//@@ fns\n")
         .ok_or("gen: u4mv.csl lost its //@@ fns mark")?;
-    let consts = consts.trim_start_matches("//@@ consts\n").replace("//@@ tables\n", "");
+    let consts = consts
+        .trim_start_matches("//@@ consts\n")
+        .replace("//@@ tables\n", "");
     let fns = fns.replace("//@@ unitfn\n", "").replace("//@@ core\n", "");
     let anchor = "// Weights (16-bit: base addresses set in init, one past a 16-byte boundary).\n";
     let mut s = patch(
@@ -2276,7 +2278,12 @@ fn w4_unit(src: &str, tag: &str, layers: &str) -> R<String> {
             &format!("var {sym}: [W4B{m} + 1]WS align(16) = @zeros([W4B{m} + 1]WS);"),
         );
     }
-    s = patch(&s, "fn rsqrt(v: f32) f32 {\n", &format!("{fns}\nfn rsqrt(v: f32) f32 {{\n"), tag)?;
+    s = patch(
+        &s,
+        "fn rsqrt(v: f32) f32 {\n",
+        &format!("{fns}\nfn rsqrt(v: f32) f32 {{\n"),
+        tag,
+    )?;
     for (old, new) in [
         (
             "wmv(at(qh_dsd, b * NH * DHc), wqa_dsd, xb, Hc, sc_s);",
@@ -2294,7 +2301,10 @@ fn w4_unit(src: &str, tag: &str, layers: &str) -> R<String> {
             "wmv(at(hv_dsd, b * Hc), wo_dsd, at(ob_dsd, b * QO), QO, sc_s);",
             "wmv4(at(hv_dsd, b * Hc), 3, at(ob_dsd, b * QO), sc_s);",
         ),
-        ("wmv(gb, wgu_dsd, xn_dsd, Hc, sc_s);", "wmv4(gb, 4, xn_dsd, sc_s);"),
+        (
+            "wmv(gb, wgu_dsd, xn_dsd, Hc, sc_s);",
+            "wmv4(gb, 4, xn_dsd, sc_s);",
+        ),
         (
             "wmv(at(hv_dsd, (c0 + k) * Hc), wd_dsd, at(act_lane, k), Ic, sc_gu);",
             "wmv4(at(hv_dsd, (c0 + k) * Hc), 5, at(act_lane, k), sc_gu);",
@@ -2359,8 +2369,18 @@ fn w4_layout(text: &str) -> R<String> {
 param W4H: u16 = 0;  // 1: u4g64 head and embedding strip too\n",
         tag,
     )?;
-    let s = patch(&s, ".VMC = VMC, .WF32 = 0, .SCHAIN = 0,", ".VMC = VMC, .WF32 = 0, .SCHAIN = 0, .W4H = W4H,", tag)?;
-    patch(&s, ".Ve = Vr, .vocab = vocab,", ".Ve = Vr, .W4H = W4H, .vocab = vocab,", tag)
+    let s = patch(
+        &s,
+        ".VMC = VMC, .WF32 = 0, .SCHAIN = 0,",
+        ".VMC = VMC, .WF32 = 0, .SCHAIN = 0, .W4H = W4H,",
+        tag,
+    )?;
+    patch(
+        &s,
+        ".Ve = Vr, .vocab = vocab,",
+        ".Ve = Vr, .W4H = W4H, .vocab = vocab,",
+        tag,
+    )
 }
 
 /// The head (head2d_v10 as serve8b_region generates it) taking `W4H`: at 1
@@ -2384,7 +2404,12 @@ fn w4_head(text: &str) -> R<String> {
         .split_once("//@@ core\n")
         .ok_or("gen: u4mv.csl lost its //@@ core mark")?
         .1;
-    let mut s = patch(text, "param WF32: u16;\n", "param WF32: u16;\nparam W4H: u16;   // 1: the lm_head tile in u4g64 (u4mv.csl)\n", tag)?;
+    let mut s = patch(
+        text,
+        "param WF32: u16;\n",
+        "param WF32: u16;\nparam W4H: u16;   // 1: the lm_head tile in u4g64 (u4mv.csl)\n",
+        tag,
+    )?;
     s = patch(
         &s,
         "var w16 = @zeros([if (WF32 == 1) 2 else NW]bf16);\n",
@@ -2427,7 +2452,12 @@ const w4scr_dsd = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{2 * W4R1}} -> w4
     )?;
     // serve8b_region's embedding is the strip's: the head's copy of the
     // winner's row (tied weights) is unused there.
-    s = patch(&s, "fn emb_copy() void {\n", "fn emb_copy() void {\n  if (W4H == 1) { return; }\n", tag)?;
+    s = patch(
+        &s,
+        "fn emb_copy() void {\n",
+        "fn emb_copy() void {\n  if (W4H == 1) { return; }\n",
+        tag,
+    )?;
     patch(
         &s,
         "  wt_ptr = if (WF32 == 1) @ptrcast([*]u32, &wt32) else @ptrcast([*]u32, &w16);\n",
@@ -2445,7 +2475,12 @@ const w4scr_dsd = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{2 * W4R1}} -> w4
 /// `scale * code + bias` (exactly the golden's dequantized weight).
 fn w4_embed(text: &str) -> R<String> {
     let tag = "embed_pe.csl (W4)";
-    let mut s = patch(text, "param Ve: u16;", "param W4H: u16;      // 1: the rows in u4g64 (see etab)\nparam Ve: u16;", tag)?;
+    let mut s = patch(
+        text,
+        "param Ve: u16;",
+        "param W4H: u16;      // 1: the rows in u4g64 (see etab)\nparam Ve: u16;",
+        tag,
+    )?;
     s = patch(
         &s,
         "var etab = @zeros([Ve * He / 2]u32);\n",
@@ -2495,8 +2530,14 @@ fn serve8b_region_files(pipe: bool, grid: &str, region: &str, variant: Variant) 
         ("layout.csl", layout.to_string()),
         ("paths.csl", src::s8br::PATHS.to_string()),
         ("rt.csl", src::RT.to_string()),
-        ("grid_pe.csl", s8br_unit("qwen2d_paged8b", grid, pipe, variant)?),
-        ("region_pe.csl", s8br_unit("qwen2d_region", region, pipe, variant)?),
+        (
+            "grid_pe.csl",
+            s8br_unit("qwen2d_paged8b", grid, pipe, variant)?,
+        ),
+        (
+            "region_pe.csl",
+            s8br_unit("qwen2d_region", region, pipe, variant)?,
+        ),
         ("head_pe.csl", s8br_head(pipe)?),
         (
             "embed_pe.csl",
@@ -2786,14 +2827,24 @@ mod tests {
                 assert_eq!(n, m);
                 match *n {
                     "grid_pe.csl" | "region_pe.csl" => {
-                        assert!(b.matches("wmv(").count() == 1 && b.matches("wmv4(").count() == 8, "{n}");
+                        assert!(
+                            b.matches("wmv(").count() == 1 && b.matches("wmv4(").count() == 8,
+                            "{n}"
+                        );
                         assert!(b.contains("wmv4(qkv_all, 0, xb, sc_s);"), "{n}");
                         assert!(b.contains("var wqa: [W4B0 + 1]WS"), "{n}");
                         assert_eq!(b.contains("w4lay = l;"), *n == "region_pe.csl", "{n}");
                     }
-                    "layout.csl" => assert!(b.contains("param W4: u16 = 0;") && b.contains(".W4H = W4H,") && a != b),
-                    "head_pe.csl" => assert!(b.contains("wmv4(y_dsd, 0, xs_dsd, w4scr_dsd);") && b.contains("param W4H: u16;")),
-                    "embed_pe.csl" => assert!(b.contains("e4_row(j);") && b.contains("param W4H: u16;")),
+                    "layout.csl" => assert!(
+                        b.contains("param W4: u16 = 0;") && b.contains(".W4H = W4H,") && a != b
+                    ),
+                    "head_pe.csl" => assert!(
+                        b.contains("wmv4(y_dsd, 0, xs_dsd, w4scr_dsd);")
+                            && b.contains("param W4H: u16;")
+                    ),
+                    "embed_pe.csl" => {
+                        assert!(b.contains("e4_row(j);") && b.contains("param W4H: u16;"))
+                    }
                     _ => assert_eq!(a, b, "{n}"),
                 }
             }

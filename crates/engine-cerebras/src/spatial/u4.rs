@@ -88,7 +88,8 @@ impl Q4 {
             }
             let (scale, bias) = checkpoint::codec::mlx::mlx_affine_group_params_bits(&vals, 4);
             for (k, &v) in vals.iter().enumerate() {
-                q.codes[gi * GROUP + k] = (((v as f32) - bias) / scale).round().clamp(0.0, 15.0) as u8;
+                q.codes[gi * GROUP + k] =
+                    (((v as f32) - bias) / scale).round().clamp(0.0, 15.0) as u8;
             }
             q.scales[gi] = bf16_bits(scale);
             q.biases[gi] = bf16_bits(bias);
@@ -226,7 +227,15 @@ pub fn tiles(hc: usize, dc: usize, gs: usize, qh: usize, ic: usize, fused: bool)
             none,
         )
     } else {
-        (qk, qk, Tile { r: hc, n: dc, g: gh })
+        (
+            qk,
+            qk,
+            Tile {
+                r: hc,
+                n: dc,
+                g: gh,
+            },
+        )
     };
     [
         qa,
@@ -328,10 +337,10 @@ pub fn blob(t: Tile, rows: &[Option<usize>], cols: &[Vec<Col>], out: &mut Vec<u3
     }
     let (p, kr) = (t.planes(), t.chunk());
     let mut segs: Vec<[usize; 3]> = Vec::new();
-    for r in 0..t.r {
+    for (r, &sl) in slot.iter().enumerate().take(t.r) {
         match segs.last_mut() {
-            Some(s) if s[2] == slot[r] && !(r % p).is_multiple_of(kr) => s[1] += 1,
-            _ => segs.push([r, 1, slot[r]]),
+            Some(s) if s[2] == sl && !(r % p).is_multiple_of(kr) => s[1] += 1,
+            _ => segs.push([r, 1, sl]),
         }
     }
     if segs.len() > t.segs() {
@@ -345,7 +354,12 @@ pub fn blob(t: Tile, rows: &[Option<usize>], cols: &[Vec<Col>], out: &mut Vec<u3
     for i in 0..t.segs() {
         out.extend(segs.get(i).map_or([0; 4], |&[r0, len, g]| {
             let k = r0 / p;
-            [((r0 - k * p) * (t.n + 1)) as u32, len as u32, r0 as u32, (k << 8 | g) as u32]
+            [
+                ((r0 - k * p) * (t.n + 1)) as u32,
+                len as u32,
+                r0 as u32,
+                (k << 8 | g) as u32,
+            ]
         }));
     }
     for layer in cols {
@@ -515,7 +529,10 @@ pub(crate) fn place_unit(
     };
     let v_cols = |li: usize, px: usize| -> Vec<Col<'_>> {
         let g = px / gs;
-        dl(px).iter().map(|&dd| Some((&wv[li], g * d + dd))).collect()
+        dl(px)
+            .iter()
+            .map(|&dd| Some((&wv[li], g * d + dd)))
+            .collect()
     };
     if fused {
         put(dev, "wqa", t[0], &|py, px| {
@@ -591,7 +608,9 @@ fn q4_whole(ckpt: &Ckpt, name: &str, cols: usize) -> R<Q4> {
     }
     let (shape, bits) = ckpt.bits(name)?;
     if shape.len() != 2 || shape[1] != cols {
-        return Err(format!("{name} is {shape:?}; the program wants [_, {cols}]"));
+        return Err(format!(
+            "{name} is {shape:?}; the program wants [_, {cols}]"
+        ));
     }
     Q4::quantize(&bits, shape[0], cols)
 }
@@ -645,8 +664,9 @@ pub(crate) fn place_head(
     let cols = super::serve8b::head_cols(lay);
     let mut err = None;
     let mut tile = |row: usize, c: usize, out: &mut Vec<u32>| {
-        let rows: Vec<Option<usize>> =
-            (0..hh2).map(|k| Some(c * hh2 + k).filter(|&d| d < hid)).collect();
+        let rows: Vec<Option<usize>> = (0..hh2)
+            .map(|k| Some(c * hh2 + k).filter(|&d| d < hid))
+            .collect();
         let col: Vec<Col> = (0..vr)
             .map(|vv| Some(row * vr + vv).filter(|&o| o < q.rows).map(|o| (&q, o)))
             .collect();
@@ -702,10 +722,18 @@ pub fn embed_words(q: &Q4, hid: usize, d0: usize, he: usize, v0: usize, ve: usiz
         let row = v0 + vv;
         let real = row < q.rows;
         let code = |d: usize| -> u32 {
-            if real && d < hid { u32::from(q.code(row, d)) } else { 0 }
+            if real && d < hid {
+                u32::from(q.code(row, d))
+            } else {
+                0
+            }
         };
         for i in 0..hq {
-            w.push((0..4).map(|pl| code(d0 + pl * hq + i) << (4 * pl)).fold(0, |a, b| a | b));
+            w.push(
+                (0..4)
+                    .map(|pl| code(d0 + pl * hq + i) << (4 * pl))
+                    .fold(0, |a, b| a | b),
+            );
         }
         for half in 0..2 {
             for sl in 0..g {
@@ -808,7 +836,8 @@ mod tests {
         let qh = Q4::quantize(&bits, shape[0], hid).unwrap();
         let (shape, bits) = ckpt.bits("embed").unwrap();
         let qe = Q4::quantize(&bits, shape[0], hid).unwrap();
-        let unpack = |w: Vec<u32>| -> Vec<u32> { w.iter().flat_map(|&x| [x & 0xffff, x >> 16]).collect() };
+        let unpack =
+            |w: Vec<u32>| -> Vec<u32> { w.iter().flat_map(|&x| [x & 0xffff, x >> 16]).collect() };
         let (f, cols) = (lay.feeder(), super::super::serve8b::head_cols(&lay));
         let t = head_tile(hh2, vr);
         let (mut heads, mut strips) = (0, 0);
@@ -816,10 +845,14 @@ mod tests {
             let y = if ry < f { ry } else { ry + 1 };
             for (i, c) in cols.iter().enumerate() {
                 let Some(c) = *c else { continue };
-                let w = dev.memory("wt", (lay.head_x() + i) as i32, y as i32).unwrap();
+                let w = dev
+                    .memory("wt", (lay.head_x() + i) as i32, y as i32)
+                    .unwrap();
                 assert_eq!(w.len(), head_words(t));
                 let u = unpack(w);
-                let x: Vec<f32> = (0..hh2).map(|k| bf16_f32(bf16_bits(((k + c) as f32 * 0.7).cos()))).collect();
+                let x: Vec<f32> = (0..hh2)
+                    .map(|k| bf16_f32(bf16_bits(((k + c) as f32 * 0.7).cos())))
+                    .collect();
                 let got = apply(t, &u[1..], 0, &x);
                 for (vv, g) in got.iter().enumerate() {
                     let o = ry * vr + vv;
@@ -827,7 +860,10 @@ mod tests {
                         .filter(|&k| o < qh.rows && c * hh2 + k < hid)
                         .map(|k| f64::from(qh.value(o, c * hh2 + k)) * f64::from(x[k]))
                         .sum();
-                    assert!((g - want).abs() < 1e-4, "head ({c}, {ry}) row {o}: {g} vs {want}");
+                    assert!(
+                        (g - want).abs() < 1e-4,
+                        "head ({c}, {ry}) row {o}: {g} vs {want}"
+                    );
                 }
                 heads += 1;
             }
@@ -842,8 +878,16 @@ mod tests {
                     let o = ry * vr + j;
                     for (k, g) in embed_row(&u, he, vr, j).iter().enumerate() {
                         let d = c * he + k;
-                        let want = if o < qe.rows && d < hid { qe.value(o, d) } else { 0.0 };
-                        assert_eq!(g.to_bits(), want.to_bits(), "strip ({c}, {ry}) row {o} dim {d}");
+                        let want = if o < qe.rows && d < hid {
+                            qe.value(o, d)
+                        } else {
+                            0.0
+                        };
+                        assert_eq!(
+                            g.to_bits(),
+                            want.to_bits(),
+                            "strip ({c}, {ry}) row {o} dim {d}"
+                        );
                     }
                 }
                 strips += 1;
@@ -872,8 +916,16 @@ mod tests {
                         let got = embed_row(&words, he, ve, j);
                         for (k, g) in got.iter().enumerate() {
                             let (o, d) = (v0 + j, d0 + k);
-                            let want = if o < rows && d < hid { q.value(o, d) } else { 0.0 };
-                            assert_eq!(g.to_bits(), want.to_bits(), "he {he} c {c} row {o} dim {d}");
+                            let want = if o < rows && d < hid {
+                                q.value(o, d)
+                            } else {
+                                0.0
+                            };
+                            assert_eq!(
+                                g.to_bits(),
+                                want.to_bits(),
+                                "he {he} c {c} row {o} dim {d}"
+                            );
                         }
                     }
                 }
@@ -894,15 +946,18 @@ mod tests {
             let t = head_tile(hh2, vr);
             for c in 0..hid.div_ceil(hh2) {
                 for row in 0..vocab.div_ceil(vr) {
-                    let rows: Vec<Option<usize>> =
-                        (0..hh2).map(|k| Some(c * hh2 + k).filter(|&d| d < hid)).collect();
+                    let rows: Vec<Option<usize>> = (0..hh2)
+                        .map(|k| Some(c * hh2 + k).filter(|&d| d < hid))
+                        .collect();
                     let col: Vec<Col> = (0..vr)
                         .map(|vv| Some(row * vr + vv).filter(|&o| o < vocab).map(|o| (&q, o)))
                         .collect();
                     let mut b = Vec::new();
                     blob(t, &rows, &[col], &mut b).unwrap();
                     assert_eq!((b.len() + 2) / 2, head_words(t));
-                    let x: Vec<f32> = (0..hh2).map(|k| bf16_f32(bf16_bits((k as f32 * 0.37).sin()))).collect();
+                    let x: Vec<f32> = (0..hh2)
+                        .map(|k| bf16_f32(bf16_bits((k as f32 * 0.37).sin())))
+                        .collect();
                     let y = apply(t, &b, 0, &x);
                     for (vv, yv) in y.iter().enumerate() {
                         let o = row * vr + vv;
@@ -910,7 +965,10 @@ mod tests {
                             .filter(|&k| o < vocab && c * hh2 + k < hid)
                             .map(|k| f64::from(q.value(o, c * hh2 + k)) * f64::from(x[k]))
                             .sum();
-                        assert!((yv - want).abs() < 1e-4, "hh2 {hh2} c {c} row {o}: {yv} vs {want}");
+                        assert!(
+                            (yv - want).abs() < 1e-4,
+                            "hh2 {hh2} c {c} row {o}: {yv} vs {want}"
+                        );
                     }
                 }
             }
@@ -919,7 +977,9 @@ mod tests {
     use super::*;
 
     fn lcg(seed: &mut u64) -> f32 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((*seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.1
     }
 
@@ -929,7 +989,9 @@ mod tests {
     fn blob_applies_the_dequantized_matrix() {
         let (rows, cols) = (40, 256);
         let mut seed = 7;
-        let w: Vec<u16> = (0..rows * cols).map(|_| bf16_bits(lcg(&mut seed))).collect();
+        let w: Vec<u16> = (0..rows * cols)
+            .map(|_| bf16_bits(lcg(&mut seed)))
+            .collect();
         let q = Q4::quantize(&w, rows, cols).unwrap();
         // Quantization error within a step (MLX's scale rounds the range's
         // edge onto a code; the far end can clamp).
@@ -952,14 +1014,12 @@ mod tests {
         let x: Vec<f32> = (0..30).map(|i| (i as f32 * 0.37).sin()).collect();
         for (l, base) in [(0usize, 3usize), (1, 20)] {
             let y = apply(t, &out, l, &x);
-            for j in 0..7 {
+            for (j, &yj) in y.iter().enumerate().take(7) {
                 let o = if l == 0 { base + 2 * j } else { base + j };
                 let want: f64 = (0..29)
-                    .map(|r| {
-                        f64::from(q.value(o, 50 + r)) * bf16_round(x[r])
-                    })
+                    .map(|r| f64::from(q.value(o, 50 + r)) * bf16_round(x[r]))
                     .sum();
-                assert!((y[j] - want).abs() < 1e-6 * want.abs().max(1.0), "{l} {j}");
+                assert!((yj - want).abs() < 1e-6 * want.abs().max(1.0), "{l} {j}");
             }
         }
     }
@@ -970,15 +1030,27 @@ mod tests {
     fn landed_u4g64_reads_as_quantized() {
         let (rows, cols) = (6, 128);
         let mut seed = 11;
-        let w: Vec<u16> = (0..rows * cols).map(|_| bf16_bits(lcg(&mut seed))).collect();
+        let w: Vec<u16> = (0..rows * cols)
+            .map(|_| bf16_bits(lcg(&mut seed)))
+            .collect();
         let q = Q4::quantize(&w, rows, cols).unwrap();
         let packed: Vec<u8> = q.codes.chunks(2).map(|c| c[0] | c[1] << 4).collect();
         let le = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
         let base = "model.layers.0.mlp.down_proj";
         let parts: Vec<(String, &str, Vec<usize>, Vec<u8>)> = vec![
             (format!("{base}.codes"), "U8", vec![rows, cols / 2], packed),
-            (format!("{base}.scales"), "BF16", vec![rows, cols / 64], le(&q.scales)),
-            (format!("{base}.biases"), "BF16", vec![rows, cols / 64], le(&q.biases)),
+            (
+                format!("{base}.scales"),
+                "BF16",
+                vec![rows, cols / 64],
+                le(&q.scales),
+            ),
+            (
+                format!("{base}.biases"),
+                "BF16",
+                vec![rows, cols / 64],
+                le(&q.biases),
+            ),
         ];
         let (mut header, mut data) = (serde_json::Map::new(), Vec::new());
         for (name, dtype, shape, bytes) in &parts {
@@ -1092,7 +1164,8 @@ mod tests {
                                 x[row] = 1.0;
                                 let y = apply(tq[hm], qb, l, &x);
                                 for c in 0..t[m].n {
-                                    let want = f64::from(bf16_f32(d[l * elems + row * t[m].n + c] as u16));
+                                    let want =
+                                        f64::from(bf16_f32(d[l * elems + row * t[m].n + c] as u16));
                                     assert!(
                                         (y[c0 + c] - want).abs() <= tol,
                                         "B {b} {sym} unit {} pe {pe} layer {l} ({row}, {c}): {} vs {want}",

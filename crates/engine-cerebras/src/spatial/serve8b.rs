@@ -363,7 +363,9 @@ pub(crate) fn unit(
                     for kk in 0..hc {
                         for h in 0..nh {
                             for i in 0..dh {
-                                out.push(dim(py, kk).map_or(0, |col| qk(li, g, h, dl[half + i], col)));
+                                out.push(
+                                    dim(py, kk).map_or(0, |col| qk(li, g, h, dl[half + i], col)),
+                                );
                             }
                         }
                     }
@@ -377,7 +379,9 @@ pub(crate) fn unit(
             for w in &wv {
                 for kk in 0..hc {
                     for &dd in &dl {
-                        out.push(dim(py, kk).map_or(0, |col| u32::from(w[(g * d + dd) * hid + col])));
+                        out.push(
+                            dim(py, kk).map_or(0, |col| u32::from(w[(g * d + dd) * hid + col])),
+                        );
                     }
                 }
             }
@@ -407,7 +411,9 @@ pub(crate) fn unit(
                         .into_iter()
                         .flat_map(|w| (0..ic).map(move |i| (w, i)))
                     {
-                        out.push(dim(py, kk).map_or(0, |col| u32::from(w[(px * ic + i) * hid + col])));
+                        out.push(
+                            dim(py, kk).map_or(0, |col| u32::from(w[(px * ic + i) * hid + col])),
+                        );
                     }
                 }
             }
@@ -418,7 +424,9 @@ pub(crate) fn unit(
             for w in &wd {
                 for i in 0..ic {
                     for kk in 0..hc {
-                        out.push(dim(py, kk).map_or(0, |row| u32::from(w[row * inter + px * ic + i])));
+                        out.push(
+                            dim(py, kk).map_or(0, |row| u32::from(w[row * inter + px * ic + i])),
+                        );
                     }
                 }
             }

@@ -748,7 +748,10 @@ fn place_at(
     let fits = |nb: usize| {
         let (g, r) = (
             super::plan::Grid { blocks: nb, ..g },
-            super::plan::Grid { blocks: nb, ..region },
+            super::plan::Grid {
+                blocks: nb,
+                ..region
+            },
         );
         g.bytes(ring) + staging(1) <= most
             && (rc * rr == 0 || r.region_bytes(rnl, ring) + staging(rnl) <= most)
@@ -772,7 +775,10 @@ fn place_at(
         let nb = (1..=g.blocks).rev().find(|&nb| fits(nb))?;
         (
             super::plan::Grid { blocks: nb, ..g },
-            super::plan::Grid { blocks: nb, ..region },
+            super::plan::Grid {
+                blocks: nb,
+                ..region
+            },
         )
     } else {
         (g, region)
@@ -825,7 +831,8 @@ pub(crate) fn placement_report(plan: &SpatialPlan, ring: bool) -> String {
                     for rc in 1..=4 {
                         for rr in 1..=8 {
                             let at = (wide * g.px, rpy, rnl, rc, rr);
-                            let Some(p) = place_at(plan, grid, at, false, ring, false, false) else {
+                            let Some(p) = place_at(plan, grid, at, false, ring, false, false)
+                            else {
                                 continue;
                             };
                             let r = super::plan::Grid {
@@ -850,13 +857,24 @@ pub(crate) fn placement_report(plan: &SpatialPlan, ring: bool) -> String {
                             );
                             let eb = super::plan::embed_bytes(p.vr, p.grid.hc, g.lanes, g.w4);
                             // The units only: the head is reported, not ranked.
-                            let over = [gb, rb].iter().map(|&b| b as isize - most as isize).max().unwrap_or(0);
+                            let over = [gb, rb]
+                                .iter()
+                                .map(|&b| b as isize - most as isize)
+                                .max()
+                                .unwrap_or(0);
                             if best.as_ref().is_none_or(|(o, _)| over < *o) {
                                 best = Some((
                                     over,
                                     format!(
                                         "grid {}x{} Hc {} Ic {} {gb} B; regions {}x{} RNL {rnl} {rc}x{rr} {rb} B; NCOL {}; head Vr {} {hb} B, strip {eb} B{}; room {most} B (worst over {over})",
-                                        p.grid.px, p.grid.py, p.grid.hc, p.grid.ic, p.rpx, p.rpy, p.ncol, p.vr,
+                                        p.grid.px,
+                                        p.grid.py,
+                                        p.grid.hc,
+                                        p.grid.ic,
+                                        p.rpx,
+                                        p.rpy,
+                                        p.ncol,
+                                        p.vr,
                                         if g.w4 { " (u4)" } else { "" }
                                     ),
                                 ));

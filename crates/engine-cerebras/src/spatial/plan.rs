@@ -388,7 +388,11 @@ pub fn head_bytes(
     let vp = vr.next_power_of_two().max(32);
     let pipe = mmax.map_or(0, |m| HEAD_PIPE + 4 * m * lanes);
     // Per-row f32 vectors: 20 B a row bf16; 14 B a row fits the u4 probes.
-    let rows = if u4 { head_u4_bytes(vr, hc) + vr * 14 } else { vr * (4 * hc + 20) };
+    let rows = if u4 {
+        head_u4_bytes(vr, hc) + vr * 14
+    } else {
+        vr * (4 * hc + 20)
+    };
     HEAD_FIXED + rows + 60 * hc + 8 * vp + 4 * vr * hlb.saturating_sub(1) + pipe
 }
 
@@ -1250,7 +1254,10 @@ mod tests {
             // a group's rows keeps the group's scales and biases for its
             // outputs, 8 bytes an output a group at Hc < 64 against Hc / 2
             // of codes, and with the u4 code's bytes it plans more rows.
-            let on_bf16 = Grid { w4: true, ..pb.grid };
+            let on_bf16 = Grid {
+                w4: true,
+                ..pb.grid
+            };
             let smaller = on_bf16.weight_bytes() < pb.grid.weight_bytes();
             assert_eq!(smaller, id != "qwen3-32b", "{id}");
             assert_eq!(pu.grid.py < pb.grid.py, id != "qwen3-32b", "{id}");
@@ -1336,15 +1343,28 @@ mod tests {
                 match super::super::build::program(&p, &cfg) {
                     Ok(spec) => println!(
                         "FIT {name}: plan grid {}x{} Hc {} bytes {} -> {:?} {:?} {:?} {:?}",
-                        g.px, g.py, g.hc, p.grid_bytes, spec.design, spec.rectangle(),
+                        g.px,
+                        g.py,
+                        g.hc,
+                        p.grid_bytes,
+                        spec.design,
+                        spec.rectangle(),
                         match &spec.layers {
-                            super::super::program::Layers::Units { grid, .. } => format!("grid {}x{} Hc {}", grid.px, grid.py, grid.hc),
+                            super::super::program::Layers::Units { grid, .. } =>
+                                format!("grid {}x{} Hc {}", grid.px, grid.py, grid.hc),
                             _ => String::new(),
                         },
                         match &spec.layers {
                             super::super::program::Layers::Units { units, .. } => format!(
                                 "regions {}x{} RNL {} RC {} RR {} NCOL {} RHc {} RIc {}",
-                                units.rpx, units.rpy, units.rnl, units.rc, units.rr, units.ncol, units.rhc, units.ric
+                                units.rpx,
+                                units.rpy,
+                                units.rnl,
+                                units.rc,
+                                units.rr,
+                                units.ncol,
+                                units.rhc,
+                                units.ric
                             ),
                             _ => String::new(),
                         }
@@ -1367,11 +1387,21 @@ mod tests {
             (228, 40, Some(12), 16, 48_944),
         ] {
             let m = final_root_bytes(vr, hc, 1, 1, mmax, cap, true);
-            assert!(m >= probe && m <= probe + 400, "Vr {vr}: model {m} vs probe {probe}");
+            assert!(
+                m >= probe && m <= probe + 400,
+                "Vr {vr}: model {m} vs probe {probe}"
+            );
         }
-        for (ve, hc, u4, probe) in [(132, 36, false, 47_184), (132, 36, true, 21_664), (228, 40, true, 32_112)] {
+        for (ve, hc, u4, probe) in [
+            (132, 36, false, 47_184),
+            (132, 36, true, 21_664),
+            (228, 40, true, 32_112),
+        ] {
             let m = embed_bytes(ve, hc, 1, u4);
-            assert!(m >= probe && m <= probe + 200, "Ve {ve} u4 {u4}: model {m} vs probe {probe}");
+            assert!(
+                m >= probe && m <= probe + 200,
+                "Ve {ve} u4 {u4}: model {m} vs probe {probe}"
+            );
         }
     }
 
@@ -1420,7 +1450,10 @@ mod tests {
                     // The planner's head2d gate is not serve8b_region's head
                     // (`build::place_at` sizes that): plan at a small vocab, then
                     // place at the model's.
-                    let small = ModelSpec { vocab: 32_000, ..s.clone() };
+                    let small = ModelSpec {
+                        vocab: 32_000,
+                        ..s.clone()
+                    };
                     let p = match SpatialPlan::derive(&small, WaferDims::CS3, goals) {
                         Ok(p) => SpatialPlan { vocab: v, ..p },
                         Err(e) => {
@@ -1436,8 +1469,15 @@ mod tests {
                         let codes = elems / 2;
                         println!(
                             "PARTS {name}: grid {}x{} Hc {} Ic {}: u4 tiles+scratch {} B (codes {codes}, codes+scales {ideal}), tables {}, KV block {}, lane {}, total {}",
-                            g.px, g.py, g.hc, g.ic, g.weight_bytes(), g.table_bytes(), g.block_bytes(),
-                            g.lane_bytes(), g.bytes(false)
+                            g.px,
+                            g.py,
+                            g.hc,
+                            g.ic,
+                            g.weight_bytes(),
+                            g.table_bytes(),
+                            g.block_bytes(),
+                            g.lane_bytes(),
+                            g.bytes(false)
                         );
                     }
                     let mut cfg = super::super::build::ServeConfig::new(goals);
@@ -1445,12 +1485,25 @@ mod tests {
                     match super::super::build::params(&p, &cfg) {
                         Ok((d, kv)) => {
                             let get = |k: &str| {
-                                kv.iter().find(|(n, _)| *n == k).map_or(String::new(), |(_, v)| v.to_string())
+                                kv.iter()
+                                    .find(|(n, _)| *n == k)
+                                    .map_or(String::new(), |(_, v)| v.to_string())
                             };
                             println!(
                                 "FEAS {tag}: {d:?} grid {}x{} Hc {} Ic {}, regions {}x{} RNL {} {}x{}, NCOL {}, NB {}, Vr {}, CAP {}",
-                                get("PX"), get("PY"), get("Hc"), get("Ic"), get("RPX"), get("RPY"),
-                                get("RNL"), get("RC"), get("RR"), get("NCOL"), get("NB"), get("Vr"), get("CAP")
+                                get("PX"),
+                                get("PY"),
+                                get("Hc"),
+                                get("Ic"),
+                                get("RPX"),
+                                get("RPY"),
+                                get("RNL"),
+                                get("RC"),
+                                get("RR"),
+                                get("NCOL"),
+                                get("NB"),
+                                get("Vr"),
+                                get("CAP")
                             );
                         }
                         Err(e) => println!(
@@ -1485,17 +1538,28 @@ mod tests {
             ("muse-glimmer-30b", 6656, 52, 32, 8, 20824, 202_048),
             ("qwen3-32b", 5120, 64, 64, 8, 25600, 151_936),
         ];
-        let goals = Goals { lanes: 1, grid_lanes: 1, host_copy: true, blocks: Some(1), ..Goals::default() };
+        let goals = Goals {
+            lanes: 1,
+            grid_lanes: 1,
+            host_copy: true,
+            blocks: Some(1),
+            ..Goals::default()
+        };
         for (name, hidden, layers, q, kv, inter, vocab) in models {
-            let s = ModelSpec { hidden, layers, q_heads: q, kv_heads: kv, inter, vocab, ..base.clone() };
+            let s = ModelSpec {
+                hidden,
+                layers,
+                q_heads: q,
+                kv_heads: kv,
+                inter,
+                vocab,
+                ..base.clone()
+            };
             let pmax = (UNITS / (layers * 128)) / 4 * 4;
-            let aligned = (4..=pmax)
-                .rev()
-                .step_by(4)
-                .find(|&py| {
-                    let hc = hidden.div_ceil(py);
-                    64 % hc == 0 || hc % 64 == 0
-                });
+            let aligned = (4..=pmax).rev().step_by(4).find(|&py| {
+                let hc = hidden.div_ceil(py);
+                64 % hc == 0 || hc % 64 == 0
+            });
             let vr = vocab.div_ceil(1152);
             for (tag, py) in [("most", Some(pmax)), ("aligned", aligned)] {
                 let Some(py) = py else { continue };
@@ -1503,7 +1567,8 @@ mod tests {
                 let head = final_root_bytes(vr + vr % 2, g.hc, 1, 1, None, 32, true);
                 let t = super::super::u4::tiles(g.hc, g.dc, g.gs, g.qh, g.ic, true);
                 let sb = super::super::u4::scale_bytes(&t);
-                let (dup, own): (usize, usize) = sb.iter().fold((0, 0), |(a, b), &(d, o)| (a + d, b + o));
+                let (dup, own): (usize, usize) =
+                    sb.iter().fold((0, 0), |(a, b), &(d, o)| (a + d, b + o));
                 // The reduction's partials, [g][n + 1] f32 of the widest tile it
                 // serves, past what the decode buffer (free by then) holds.
                 let buf = 2 * (super::super::u4::BUF_WORDS + 1);
@@ -1518,8 +1583,16 @@ mod tests {
                 let ownb = dupb - dup + own + part;
                 println!(
                     "DEDUP {name} {tag}: {layers} x 128x{py} Hc {} Dc {} Qh {} Ic {}: scales dup {dup} own {own} (wqkv {:?} wo {:?} wgu {:?} wd {:?}); PE dup {dupb} ({:+}), own {ownb} ({:+}); head Vr {vr} {head} B",
-                    g.hc, g.dc, g.qh, g.ic, sb[0], sb[3], sb[4], sb[5],
-                    dupb as isize - most as isize, ownb as isize - most as isize
+                    g.hc,
+                    g.dc,
+                    g.qh,
+                    g.ic,
+                    sb[0],
+                    sb[3],
+                    sb[4],
+                    sb[5],
+                    dupb as isize - most as isize,
+                    ownb as isize - most as isize
                 );
             }
         }
@@ -1533,14 +1606,31 @@ mod tests {
         let name = std::env::var("PARAMS_OF").expect("PARAMS_OF");
         let s = spec(&name).expect("spec");
         let pipeline = std::env::var("PIPE").is_ok_and(|v| v == "1");
-        let grid_lanes = std::env::var("GRID_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-        let goals = Goals { lanes: 1, grid_lanes, host_copy: true, pipeline, ..Goals::default() };
+        let grid_lanes = std::env::var("GRID_LANES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let goals = Goals {
+            lanes: 1,
+            grid_lanes,
+            host_copy: true,
+            pipeline,
+            ..Goals::default()
+        };
         let p = plan(&s, goals);
         let mut cfg = super::super::build::ServeConfig::new(goals);
         cfg.region = true;
         let (d, kv) = super::super::build::params(&p, &cfg).expect("params");
         let spec = super::super::program::ProgramSpec::from_params(d, &kv).expect("spec");
-        println!("PARAMS {:?} {:?} {}", d, spec.rectangle(), kv.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(","));
+        println!(
+            "PARAMS {:?} {:?} {}",
+            d,
+            spec.rectangle(),
+            kv.iter()
+                .map(|(k, v)| format!("{k}:{v}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
     }
 
     /// The unit PE bytes behind a 14B/32B u4 layout (`--nocapture`): the
@@ -1549,9 +1639,18 @@ mod tests {
     /// the rest's weights, tables and pool blocks added).
     #[test]
     fn unit_bytes_print() {
-        for (name, py) in [("qwen3-14b-u4g64-kv-bf16", 144), ("qwen3-32b-u4g64-kv-bf16", 144)] {
+        for (name, py) in [
+            ("qwen3-14b-u4g64-kv-bf16", 144),
+            ("qwen3-32b-u4g64-kv-bf16", 144),
+        ] {
             let s = spec(name).expect(name);
-            let goals = Goals { lanes: 1, grid_lanes: 1, host_copy: true, blocks: Some(1), ..Goals::default() };
+            let goals = Goals {
+                lanes: 1,
+                grid_lanes: 1,
+                host_copy: true,
+                blocks: Some(1),
+                ..Goals::default()
+            };
             let g = SpatialPlan::grid(&s, 128, py, true, &goals);
             let r = Grid {
                 px: 256,
@@ -1590,14 +1689,46 @@ mod tests {
             .map(|x| x.parse().unwrap())
             .collect();
         let s = spec("qwen3-14b-u4g64-kv-bf16").unwrap();
-        let goals = Goals { lanes: 1, grid_lanes: 1, host_copy: true, blocks: Some(1), ..Goals::default() };
-        let g = Grid { hidden: v[0], hc: v[0].div_ceil(v[3]), qh: v[2], py: v[3], ic: v[4], ..SpatialPlan::grid(&s, 128, v[3], true, &goals) };
+        let goals = Goals {
+            lanes: 1,
+            grid_lanes: 1,
+            host_copy: true,
+            blocks: Some(1),
+            ..Goals::default()
+        };
+        let g = Grid {
+            hidden: v[0],
+            hc: v[0].div_ceil(v[3]),
+            qh: v[2],
+            py: v[3],
+            ic: v[4],
+            ..SpatialPlan::grid(&s, 128, v[3], true, &goals)
+        };
         let _ = v[1];
-        println!("BYTES grid {} (u4 {}) region nl1 {} layer {}", g.bytes(false), g.weight_bytes(), g.region_bytes(1, false), g.layer_bytes());
+        println!(
+            "BYTES grid {} (u4 {}) region nl1 {} layer {}",
+            g.bytes(false),
+            g.weight_bytes(),
+            g.region_bytes(1, false),
+            g.layer_bytes()
+        );
         // GRID_AT=...,px,dc,gs,nl: a region of those
         if v.len() > 5 {
-            let r = Grid { px: v[5], dc: v[6], gs: v[7], ..g };
-            println!("BYTES region {}x{} nl {} = {} ring {} (grid ring {})", r.px, r.py, v[8], r.region_bytes(v[8], false), r.region_bytes(v[8], true), g.bytes(true));
+            let r = Grid {
+                px: v[5],
+                dc: v[6],
+                gs: v[7],
+                ..g
+            };
+            println!(
+                "BYTES region {}x{} nl {} = {} ring {} (grid ring {})",
+                r.px,
+                r.py,
+                v[8],
+                r.region_bytes(v[8], false),
+                r.region_bytes(v[8], true),
+                g.bytes(true)
+            );
         }
     }
 

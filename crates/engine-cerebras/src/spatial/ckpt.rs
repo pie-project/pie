@@ -495,8 +495,8 @@ impl Ckpt {
         let Inner::Files { paths, entries } = &self.inner else {
             return Ok(None);
         };
-        let Some(base) = transformers_name(name)
-            .and_then(|n| n.strip_suffix(".weight").map(String::from))
+        let Some(base) =
+            transformers_name(name).and_then(|n| n.strip_suffix(".weight").map(String::from))
         else {
             return Ok(None);
         };
@@ -505,7 +505,10 @@ impl Ckpt {
                 return Ok(None);
             };
             if e.dtype != dtype || e.shape.len() != 2 {
-                return Err(format!("{base}.{suffix}: {:?} {:?} (want 2-d {dtype:?})", e.dtype, e.shape));
+                return Err(format!(
+                    "{base}.{suffix}: {:?} {:?} (want 2-d {dtype:?})",
+                    e.dtype, e.shape
+                ));
             }
             let raw = read_pieces(&paths[e.file], e.offset, e.elems() * e.dtype.bytes())?;
             Ok(Some((e.shape.clone(), raw)))
@@ -513,15 +516,23 @@ impl Ckpt {
         let Some((cs, codes)) = read("codes", Dtype::U8)? else {
             return Ok(None);
         };
-        let (Some((ss, s)), Some((bs, b))) = (read("scales", Dtype::Bf16)?, read("biases", Dtype::Bf16)?) else {
+        let (Some((ss, s)), Some((bs, b))) =
+            (read("scales", Dtype::Bf16)?, read("biases", Dtype::Bf16)?)
+        else {
             return Err(format!("{base}.codes without its scales and biases"));
         };
         let (rows, cols) = (cs[0], 2 * cs[1]);
         if ss != [rows, cols / 64] || bs != ss {
-            return Err(format!("{base}: codes {cs:?}, scales {ss:?}, biases {bs:?}"));
+            return Err(format!(
+                "{base}: codes {cs:?}, scales {ss:?}, biases {bs:?}"
+            ));
         }
         let words = |raw: Vec<u8>| -> Vec<u16> {
-            raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+            raw.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
         };
         Ok(Some(U4Landed {
             rows,
