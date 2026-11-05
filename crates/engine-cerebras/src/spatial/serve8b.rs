@@ -188,6 +188,43 @@ pub fn put_routes(lay: &ProgramSpec, dev: &mut dyn Device) -> R<()> {
     Ok(())
 }
 
+/// bf16 bits to IEEE f16 bits, round to nearest even (subnormals kept,
+/// overflow to infinity): the 16-bit weights of an `F16` program (compiled
+/// without `--fp16-format=bf16`).
+pub(crate) fn f16_bits(b: u16) -> u16 {
+    let u = u32::from(b) << 16;
+    let sign = ((u >> 16) & 0x8000) as u16;
+    let a = u & 0x7fff_ffff;
+    if a >= 0x7f80_0000 {
+        return sign | 0x7c00 | if a > 0x7f80_0000 { 0x200 } else { 0 };
+    }
+    let e = (a >> 23) as i32 - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7c00;
+    }
+    let m = (a & 0x7f_ffff) | 0x80_0000; // 24 bits with the hidden one
+    // f16's value is m * 2^(e - 15 - 23); its unit in the last place is
+    // 2^(max(e, 1) - 15 - 10): shift m right by 13 + (1 - e) below the normals.
+    let sh = 13 + (1 - e).max(0) as u32;
+    if sh > 24 + 1 {
+        return sign;
+    }
+    let (q, r) = (m >> sh, m & ((1 << sh) - 1));
+    let half = 1u32 << (sh - 1);
+    let q = q + u32::from(r > half || (r == half && q & 1 == 1));
+    // q carries the hidden bit for normals (e >= 1): exponent field e - 1 + carry.
+    let bits = if e >= 1 { ((e as u32 - 1) << 10) + q } else { q };
+    sign | bits as u16
+}
+
+/// The 16-bit weights as the program reads them: bf16 bits, or f16 under `F16`.
+pub(crate) fn f16_if(lay: &ProgramSpec, m: Vec<u16>) -> Vec<u16> {
+    if lay.model.f16 == 0 {
+        return m;
+    }
+    m.into_iter().map(f16_bits).collect()
+}
+
 /// A 2-D tensor's bf16 bits, its shape checked.
 pub(crate) fn matrix(ckpt: &Ckpt, name: &str, rows: usize, cols: usize) -> R<Vec<u16>> {
     let (shape, bits) = ckpt.bits(name)?;
@@ -325,7 +362,7 @@ pub(crate) fn unit(
     let mats = |w: &str, rows: usize, cols: usize| -> R<Vec<Vec<u16>>> {
         layers
             .iter()
-            .map(|&l| matrix(ckpt, &name(l, w), rows, cols))
+            .map(|&l| matrix(ckpt, &name(l, w), rows, cols).map(|m| f16_if(lay, m)))
             .collect()
     };
     let vecs = |w: &str, n: usize| -> R<Vec<Vec<f32>>> {
@@ -587,6 +624,7 @@ pub(crate) fn head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()
 pub(crate) fn head_with(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device, hh2: usize) -> R<()> {
     let (vr, hid) = (lay.vr(), lay.hidden());
     let (shape, lm) = ckpt.bits("head")?;
+    let lm = f16_if(lay, lm);
     let v = shape[0];
     if shape.len() != 2 || shape[1] != hid || v > lay.vocab() || lay.vocab() > lay.hh() * vr {
         return Err(format!(
@@ -1030,6 +1068,43 @@ pub fn page_in_many(lay: &ProgramSpec, dev: &mut dyn Device, pages: &[(u32, Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every bf16 value goes to its nearest f16 (ties to even), subnormals
+    /// included; past f16's range to infinity; NaN stays NaN.
+    #[test]
+    fn f16_bits_round_every_bf16_to_nearest() {
+        let f16v = |h: u16| -> f64 {
+            let (s, e, m) = (if h >> 15 == 1 { -1.0 } else { 1.0 }, (h >> 10) & 0x1f, f64::from(h & 0x3ff));
+            match e {
+                0 => s * m * 2f64.powi(-24),
+                31 => if m == 0.0 { s * f64::INFINITY } else { f64::NAN },
+                _ => s * (1.0 + m / 1024.0) * 2f64.powi(i32::from(e) - 15),
+            }
+        };
+        for b in 0..=u16::MAX {
+            let x = f64::from(f32::from_bits(u32::from(b) << 16));
+            let h = f16_bits(b);
+            if x.is_nan() {
+                assert!(f16v(h).is_nan(), "{b:#x}");
+                continue;
+            }
+            if x.abs() >= 65520.0 {
+                assert_eq!(f16v(h), x.signum() * f64::INFINITY, "{b:#x}");
+                continue;
+            }
+            let y = f16v(h);
+            assert_eq!(y.is_sign_negative(), x.is_sign_negative(), "{b:#x}");
+            let (lo, hi) = (f16v(h.wrapping_sub(1) & 0x7fff | (h & 0x8000)), f16v((h & 0x7fff) + 1 | (h & 0x8000)));
+            let dist = |v: f64| if v.is_nan() { f64::INFINITY } else { (v - x).abs() };
+            let err = dist(y);
+            assert!(err <= dist(lo) && err <= dist(hi), "{b:#x}: {x} -> {y}");
+            if err > 0.0 && (err == dist(lo) || err == dist(hi)) {
+                assert_eq!(h & 1, 0, "{b:#x}: a tie goes to even");
+            }
+        }
+        assert_eq!(f16_bits(0x3f80), 0x3c00);
+        assert_eq!(f16_bits(0xc000), 0xc000);
+    }
 
     /// A simulator build (HEADMODE 2, B 2): 5 layers in strips of
     /// 2, 2 and 1 grids.

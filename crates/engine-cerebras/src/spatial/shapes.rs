@@ -224,7 +224,11 @@ pub const RAN: &[Ran] = &[
                  pass; control 1,442.9), teacher-forced 1 mismatch (the 225 tie); bare \
                  1,460.0-1,461.3 and pie B 1 with PIE_CEREBRAS_PAGE_ORDER 1,386.2-1,401.7 = \
                  94.9-96.0% (0490; 0487 1,368.6-1,378.5), every pie stream = the f32 golden \
-                 for 512 or off it only at the 225 tie",
+                 for 512 or off it only at the 225 tie; with ARF 1 (the regions' four Y \
+                 all-reduces as streamed halves with FIFO dual-input merges, host routes) \
+                 1,494.1 / 1,494.8 (0497, regions 44.59-44.75k a pass = 14.9k a layer; \
+                 same-session control 0496 1,461.1-1,461.7, 45.66k), teacher-forced \
+                 mismatches only at the two known ties (225, 274)",
     },
     Ran {
         design: Design::Serve8bRegion,

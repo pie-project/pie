@@ -81,6 +81,12 @@ pub struct Model {
     pub rgx: usize,
     /// `QKV1` 1: one QKV matvec over fused rows (`Variant::qkv1`).
     pub qkv1: bool,
+    /// `ARF`: the regions' FIFO dual-input all-reduces (`Variant::arf`; 0 off).
+    pub arf: usize,
+    /// `F16`: 1 an IEEE f16 build (no `--fp16-format=bf16`; the host writes
+    /// f16 weights), 2 also the regions' weight matvecs accumulating in f16
+    /// (`Variant::f16`). 0: bf16.
+    pub f16: usize,
 }
 
 impl Model {
@@ -99,6 +105,8 @@ impl Model {
             ops2: false,
             rgx: 0,
             qkv1: false,
+            arf: 0,
+            f16: 0,
         }
     }
 
@@ -123,6 +131,8 @@ impl Model {
             ops2: self.ops2,
             rgx: self.rgx > 0,
             qkv1: self.qkv1,
+            arf: u16::try_from(self.arf).unwrap_or(0),
+            f16: u16::try_from(self.f16).unwrap_or(0),
         }
     }
 }
@@ -706,6 +716,8 @@ impl ProgramSpec {
             "OP2" => Some(usize::from(m.ops2)),
             "RGX" => Some(m.rgx),
             "QKV1" => Some(usize::from(m.qkv1)),
+            "ARF" => Some(m.arf),
+            "F16" => Some(m.f16),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1334,6 +1346,8 @@ fn model(get: &Get) -> R<Model> {
         ops2: get.opt("OP2").unwrap_or(0) != 0,
         rgx: get.opt("RGX").unwrap_or(0),
         qkv1: get.opt("QKV1").unwrap_or(0) != 0,
+        arf: get.opt("ARF").unwrap_or(0),
+        f16: get.opt("F16").unwrap_or(0),
     })
 }
 

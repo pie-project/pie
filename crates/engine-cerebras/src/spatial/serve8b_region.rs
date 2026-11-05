@@ -859,6 +859,75 @@ pub fn route_words_gx(
     out
 }
 
+/// ARF's words a region PE: [`route_words`]' 11 with the Y set replaced by
+/// the streamed-halves routes (docs/cerebras-8b-speed.md 9.5 / 10), then the
+/// PE's Y role: bit 0 the root (row py_n / 2), bit 1 in its half's farthest
+/// group, bit 2 its level-1 input colour c_r1[k % 2], bit 3 its level-2 output
+/// colour c_r2[(q + half) % 2], bits 4..12 its 1-based place in its group
+/// (1: the group's end, next to the root's side), bits 12..20 the group's size
+/// (12 words a PE). `arg`: rows a group, a power of two.
+pub fn route_words_arf(rb: &[u32], px_n: usize, py_n: usize, gs: usize, gy: usize, arg: usize) -> Vec<u32> {
+    const RAMP: usize = 0;
+    const N_: usize = 1;
+    const S_: usize = 2;
+    let word = |(rx, t1, t2): (usize, usize, usize)| rb[rx] | rb[5 + t1] | rb[5 + t2];
+    let base = route_words(rb, px_n, py_n, gs, gy);
+    let mut out = vec![0u32; py_n * px_n * 12];
+    let root = py_n / 2;
+    for py in 0..py_n {
+        for px in 0..px_n {
+            let (at, b) = ((py * px_n + px) * 12, (py * px_n + px) * 11);
+            out[at..at + 11].copy_from_slice(&base[b..b + 11]);
+            let mut cfg = [None; 5];
+            let role: u32;
+            if py == root {
+                cfg[2] = Some((N_, RAMP, RAMP));
+                cfg[3] = Some((S_, RAMP, RAMP));
+                cfg[4] = Some((RAMP, N_, S_));
+                role = 1;
+            } else {
+                let north = py < root;
+                let half = usize::from(!north);
+                let k = if north { root - py } else { py - root };
+                let kmax = if north { root } else { py_n - 1 - root };
+                let nq = kmax.div_ceil(arg);
+                let q = (k - 1) / arg;
+                let kk = k - q * arg;
+                let far = q + 1 == nq;
+                let gsz = if far { kmax - q * arg } else { arg };
+                let (tow, awy) = if north { (S_, N_) } else { (N_, S_) };
+                let (r1, s2) = (k % 2, (q + half) % 2);
+                let r2 = 1 - s2;
+                if kk < gsz {
+                    cfg[r1] = Some((awy, RAMP, RAMP));
+                }
+                if kk > 1 {
+                    cfg[1 - r1] = Some((RAMP, tow, tow));
+                }
+                if kk == 1 {
+                    cfg[2 + s2] = Some((RAMP, tow, tow));
+                    if !far {
+                        cfg[2 + r2] = Some((awy, RAMP, RAMP));
+                    }
+                } else if !far {
+                    cfg[2 + r2] = Some((awy, tow, tow));
+                }
+                let edge = py == 0 || py == py_n - 1;
+                cfg[4] = Some((tow, RAMP, if edge { RAMP } else { awy }));
+                role = (u32::from(far) << 1) | ((r1 as u32) << 2) | ((s2 as u32) << 3) | ((kk as u32) << 4) | ((gsz as u32) << 12);
+            }
+            for (c, f) in cfg.iter().enumerate() {
+                out[at + 5 + c] = f.map_or(0, word);
+            }
+            if py == root {
+                out[at + 9] |= rb[5 + RAMP]; // the root's loop-back
+            }
+            out[at + 11] = role;
+        }
+    }
+    out
+}
+
 /// Every unit's `rcfg` (with `HROUTE`, from the program's `rbits`) and
 /// `rtab`: before `init`.
 pub fn put_routes(
@@ -878,8 +947,16 @@ pub fn put_routes(
             if gx > 0 && (!gx.is_power_of_two() || v.k.px % gx != 0 || gx > v.k.px / 2) {
                 return Err(format!("RGX {gx} does not split the region's {} columns", v.k.px));
             }
-            let words = route_words_gx(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), gx);
-            let n = if gx > 0 { 17 } else { 11 };
+            // (ARF: the regions' Y all-reduces as streamed halves, groups of 8)
+            let arf = v.kind != Kind::Grid && lay.model.arf != 0;
+            if arf && gx > 0 {
+                return Err("ARF with RGX: not built".into());
+            }
+            let (words, n) = if arf {
+                (route_words_arf(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), 8), 12)
+            } else {
+                (route_words_gx(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), gx), if gx > 0 { 17 } else { 11 })
+            };
             dev.put("rcfg", rect(v.x0, v.y0, v.k.px, v.k.py), n, &words)?;
         }
     }
@@ -1474,6 +1551,97 @@ mod tests {
             assert_eq!(gx[pe * 17..pe * 17 + 11], base[pe * 11..pe * 11 + 11]);
             assert_eq!(gx[pe * 17 + 11..pe * 17 + 16], g16[pe * 11..pe * 11 + 5]);
             assert_eq!(gx[pe * 17 + 16], 4);
+        }
+    }
+
+    /// ARF's Y words, run as the kernel's arf_ar runs them on one column:
+    /// every stream lands on the queue its PE's role reads, the root's sum
+    /// counts every row once, and the broadcast reaches every row once.
+    #[test]
+    fn arf_route_words_reduce_every_row_once() {
+        let rb: Vec<u32> = (0..10).map(|i| 1u32 << i).collect();
+        for (py_n, px_n) in [(208, 2), (24, 1), (17, 1), (9, 1), (3, 1)] {
+            let w = route_words_arf(&rb, px_n, py_n, 32, 16, 8);
+            let base = route_words(&rb, px_n, py_n, 32, 16);
+            assert_eq!(w.len(), px_n * py_n * 12);
+            for pe in 0..px_n * py_n {
+                assert_eq!(w[pe * 12..pe * 12 + 5], base[pe * 11..pe * 11 + 5], "X set");
+                assert_eq!(w[pe * 12 + 10], base[pe * 11 + 10], "group broadcast");
+            }
+            let word = |p: usize, c: usize| w[p * px_n * 12 + 5 + c];
+            let role = |p: usize| w[p * px_n * 12 + 11];
+            // Where a stream sent by p on Y colour c (0..5) lands: every PE whose
+            // router passes it to its ramp (directions: 1 north = p - 1, 2 south).
+            let lands = |p: usize, c: usize| -> Vec<usize> {
+                assert_ne!(word(p, c) & 1, 0, "row {p} colour {c}: not from its ramp");
+                let mut out = vec![];
+                let mut todo = vec![(p, word(p, c))];
+                while let Some((at, wd)) = todo.pop() {
+                    if wd & (1 << 5) != 0 && at != p || (at == p && wd & (1 << 5) != 0 && c == 4) {
+                        out.push(at);
+                    }
+                    for (d, from) in [(1usize, 2usize), (2, 1)] {
+                        if wd & (1 << (5 + d)) != 0 {
+                            let q = if d == 1 { at - 1 } else { at + 1 };
+                            assert_ne!(word(q, c) & (1 << from), 0, "row {q} colour {c}: not from {from}");
+                            todo.push((q, word(q, c)));
+                        }
+                    }
+                }
+                out
+            };
+            // Each PE's inputs (colour) and output colour, as arf_ar reads them.
+            let root = py_n / 2;
+            let mut ins: Vec<Vec<usize>> = vec![vec![]; py_n];
+            let mut outc = vec![0usize; py_n];
+            for p in 0..py_n {
+                let r = role(p);
+                let (r1, s2) = (((r >> 2) & 1) as usize, ((r >> 3) & 1) as usize);
+                let (kk, gs) = ((r >> 4) & 0xff, (r >> 12) & 0xff);
+                if r & 1 != 0 {
+                    assert_eq!(p, root);
+                    ins[p] = vec![2, 3];
+                    outc[p] = 4;
+                } else if kk > 1 {
+                    ins[p] = if kk < gs { vec![r1] } else { vec![] };
+                    outc[p] = 1 - r1;
+                } else if r & 2 != 0 {
+                    ins[p] = if gs > 1 { vec![r1] } else { vec![] };
+                    outc[p] = 2 + s2;
+                } else {
+                    ins[p] = vec![r1, 3 - s2];
+                    outc[p] = 2 + s2;
+                }
+            }
+            // Dataflow: a PE's sum (rows counted) once all its inputs landed.
+            let mut sum: Vec<Option<Vec<u32>>> = vec![None; py_n];
+            let mut got: Vec<Vec<(usize, Vec<u32>)>> = vec![vec![]; py_n];
+            for _ in 0..py_n + 1 {
+                for p in 0..py_n {
+                    if sum[p].is_some() || got[p].len() < ins[p].len() {
+                        continue;
+                    }
+                    let mut v = vec![0u32; py_n];
+                    v[p] += 1;
+                    for (_, g) in &got[p] {
+                        for (a, b) in v.iter_mut().zip(g) {
+                            *a += b;
+                        }
+                    }
+                    if p != root {
+                        let to = lands(p, outc[p]);
+                        assert_eq!(to.len(), 1, "row {p}'s stream lands on {to:?}");
+                        assert!(ins[to[0]].contains(&outc[p]), "row {p} -> {}: colour {}", to[0], outc[p]);
+                        assert!(got[to[0]].iter().all(|(c, _)| *c != outc[p]), "two streams on one queue");
+                        got[to[0]].push((outc[p], v.clone()));
+                    }
+                    sum[p] = Some(v);
+                }
+            }
+            assert_eq!(sum[root].as_deref(), Some(&vec![1u32; py_n][..]), "PY {py_n}");
+            let mut bc = lands(root, 4);
+            bc.sort_unstable();
+            assert_eq!(bc, (0..py_n).collect::<Vec<_>>(), "PY {py_n}: the broadcast");
         }
     }
 

@@ -69,6 +69,12 @@ param RGX: u16 = 0;
 // QKV1 1 (with OP2, B 1): one QKV matvec over fused rows (codegen.rs
 // `Variant::qkv1`; the host lays wqa out; passed on to neither).
 param QKV1: u16 = 0;
+// ARF > 0 (with OP2): the regions' FIFO dual-input all-reduces (codegen.rs
+// `Variant::arf`; the host writes its Y routes and roles; passed on to neither).
+param ARF: u16 = 0;
+// F16 > 0 (with OP2): an IEEE f16 build, 2 with the regions' f16-accumulating
+// matvecs (codegen.rs `Variant::f16`; the host writes f16 weights; passed on to neither).
+param F16: u16 = 0;
 param NOLAYER: u16 = 0;    // 1 (checking the handoffs alone): the units skip their layers
 param VMX: u16 = 0;        // 1: a 5-column VM block east of the strip (VM5.md; then VMC 0)
 param VMREAL: u16 = 0;     // VMX: 1 Fork 3's eta VM (vm_pe.csl), 0 the stand-in (vm_stub.csl)
