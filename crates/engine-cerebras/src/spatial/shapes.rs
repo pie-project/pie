@@ -250,7 +250,10 @@ pub const RAN: &[Ran] = &[
                  the probabilities' f16 copy scaled by a power of two (bf16's redo window, no \
                  redos) 1,678.2 / 1,679.4 (0518, grids 18.8 / 18.4k), the same accuracy; pie B 1 \
                  on it (the plan's `f16accg` too) 1,585.2-1,602.3 = 94.4-95.5% of bare \
-                 1,677.5-1,678.9 (0519), every pie and bare stream = golden for 512",
+                 1,677.5-1,678.9 (0519), every pie and bare stream = golden for 512; with the \
+                 grids taking ARF 3 + OP3 + MEM 3 too (GRD 7, the plan's `grid_levers`) \
+                 1,692.5 / 1,693.5 (0522, grids 16.8 / 16.6k), greedy = golden for 512, 0 \
+                 teacher-forced mismatches",
     },
     Ran {
         design: Design::Serve8bRegion,
@@ -276,7 +279,8 @@ pub const RAN: &[Ran] = &[
                  f16 copy 1,407.4 / 1,407.4 (0518, regions 40.0-40.2k a pass, no redos), the same \
                  14 mismatches; pie B 1 on it (160 tokens) 1,212.4-1,233.6 = 86.2-87.7% of bare \
                  1,406.0-1,406.7 (0520; device 0.722 ms a step against 0.711), every pie stream = \
-                 bare's",
+                 bare's; with GRD 7 (the six grids: ARF 3 + OP3 + MEM 1) 1,435.0 / 1,436.4 (0523, \
+                 grids 15.9-16.4k), the same 14 mismatches",
     },
 ];
 
