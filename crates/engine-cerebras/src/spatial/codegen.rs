@@ -486,7 +486,7 @@ impl Variant {
                 ("    bcv[j] = recip(l);\n", "    bcv[j] = -recip(l);   // (f16) the values carry -p\n"),
                 (
                     "    if (e < 770048.0 or e >= 3735552.0) { bad = 1.0; }\n",
-                    "    if (e < 1949696.0 or e >= 2326528.0) { bad = 1.0; }   // (f16) the sum in [2^-8, 2^15)\n",
+                    "    // (f16) the sum in [2^-8, 2^15); PROF 0 counts the redos by side in prof[2] / prof[3]\n    if (e < 1949696.0) { bad = 1.0; if (PROF == 0) { prof[2] += 1; } }\n    if (e >= 2326528.0) { bad = 1.0; if (PROF == 0) { prof[3] += 1; } }\n",
                 ),
             ] {
                 s = patch(&s, old, new, &format!("{tag}'s F16 range"))?;
