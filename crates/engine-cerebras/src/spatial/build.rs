@@ -693,22 +693,26 @@ fn place_at(
         }
         (hh, vr, 0, 5)
     } else {
-        // The grid column's height; with `grow_head` (option A) taller (to
-        // 2 YL at most: the feeder half above the last layer) while the
-        // strip's tiles (Vr rows of 4 Hc dims) pass STRIP_TABLE, with a
-        // feeder half F that a row group of 16-24 divides (Qwen3-8B's 1152
-        // rows hold as is; Llama's 3 column grids are short for its
-        // vocabulary). Vr even (head2d_v10's row pairs).
+        // The grid column's height; with `grow_head` (option A) the first
+        // taller one (to 2 YL at most: the feeder half above the last
+        // layer) whose strip tiles (Vr rows of 4 Hc dims) pass STRIP_TABLE,
+        // with a feeder half F that a row group of 16-24 divides, when the
+        // column's own does not and a taller one does (Qwen3-8B's 1152 rows
+        // hold as is; Llama's 3 column grids are short for its vocabulary).
+        // Vr even (head2d_v10's row pairs).
         let vr_of = |hh: usize| plan.vocab.div_ceil(hh).next_multiple_of(2);
         let fits = |hh: usize| {
             vr_of(hh) * 4 * g.hc * 2 <= STRIP_TABLE
                 && (16..=24).step_by(2).any(|x| (hh / 2).is_multiple_of(x))
         };
         let mut hh = g.py * (1 + ncol);
-        if grow_head && !fits(hh) {
-            hh = (hh..(2 * g.py * ncol).min(wafer.height))
+        if grow_head
+            && !fits(hh)
+            && let Some(taller) = (hh..(2 * g.py * ncol).min(wafer.height))
                 .step_by(2)
-                .find(|&hh| fits(hh))?;
+                .find(|&hh| fits(hh))
+        {
+            hh = taller;
         }
         (hh, vr_of(hh), 1, 0)
     };
@@ -2479,7 +2483,8 @@ mod llama31_8b {
     }
 
     /// Without the rows pin the plan's 160 rows are too wide for the head
-    /// and strip, and serve8b's strips do not hold 32 layers.
+    /// and strip (option A at 160 rows is 761 columns; the placement search
+    /// finds no other shape), and serve8b's strips do not hold 32 layers.
     #[test]
     fn llama_3_wants_its_rows_pinned() {
         let goals = Goals {
@@ -2491,7 +2496,22 @@ mod llama31_8b {
         let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
         let mut cfg = ServeConfig::new(goals);
         cfg.region = true;
-        assert!(params(&plan, &cfg).unwrap_err().contains("761 x"));
+        let g = plan.grid;
+        assert_eq!(g.py, 160);
+        assert!(
+            place_at(
+                &plan,
+                g,
+                (2 * g.px, 240, 3, 2, 4),
+                false,
+                false,
+                false,
+                true
+            )
+            .is_none()
+        );
+        let e = params(&plan, &cfg).unwrap_err();
+        assert!(e.contains("no serve8b_region placement"), "{e}");
         cfg.region = false;
         assert!(params(&plan, &cfg).is_err());
     }
