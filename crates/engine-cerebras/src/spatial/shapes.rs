@@ -287,7 +287,8 @@ pub const RAN: &[Ran] = &[
                  14 mismatches; pie B 1 on it (160 tokens) 1,212.4-1,233.6 = 86.2-87.7% of bare \
                  1,406.0-1,406.7 (0520; device 0.722 ms a step against 0.711), every pie stream = \
                  bare's; with GRD 7 (the six grids: ARF 3 + OP3 + MEM 1) 1,435.0 / 1,436.4 (0523, \
-                 grids 15.9-16.4k), the same 14 mismatches",
+                 grids 15.9-16.4k), the same 14 mismatches; + XAC 1,445.9 / 1,443.8 (0529, \
+                 regions 39.8-39.9k a pass), the same 14 mismatches",
     },
 ];
 
