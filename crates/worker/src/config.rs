@@ -1178,6 +1178,21 @@ device = ["metal:0"]
         adapters_are_absent_by_default_and_that_is_zero_seats();
         the_seat_count_is_stated_once_or_derived_from_the_roster();
         an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
+        the_dispatch_depth_is_bounded_by_the_engine_kind();
+    }
+
+    /// A staged engine keeps the 64-bit ring's 15 frames; only the cerebras
+    /// shell, which posts frames to a host queue, takes more.
+    fn the_dispatch_depth_is_bounded_by_the_engine_kind() {
+        for (depth, ok) in [(15, true), (16, false)] {
+            let toml = format!("{MINIMAL_METAL}\n[runtime]\nframe_dispatch_depth = {depth}\n");
+            let cfg: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(cfg.validate().is_ok(), ok, "metal at depth {depth}");
+        }
+        assert_eq!(Config::max_frames(EngineKind::Cerebras), Runahead::UNSTAGED_MAX_FRAMES);
+        for kind in [EngineKind::Cuda, EngineKind::Metal, EngineKind::Vulkan, EngineKind::Wgpu, EngineKind::Xla] {
+            assert_eq!(Config::max_frames(kind), Runahead::MAX_FRAMES, "{kind:?}");
+        }
     }
 
     fn an_unknown_key_is_refused() {
