@@ -1447,7 +1447,13 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             xac: cfg.xac,
             // (TRM: every bit, the grids' with their f16 accumulation; 0533: TRM 479
             // 1,903.1 / 1,902.5 tok/s and TRM 255 1,897.4 / 1,897.7, both = golden)
-            trim: if cfg.trim { 507 | (usize::from(cfg.grid_levers && cfg.f16accg) << 2) } else { 0 },
+            // (with q/k norms, Qwen3-8B: the exact bits alone, 241 - 2, 8 and 256 move its
+            // teacher-forced set; 0534: TRM 245 kept 0529's 14 mismatches)
+            trim: if cfg.trim {
+                (if plan.spec.qk_norm { 241 } else { 507 }) | (usize::from(cfg.grid_levers && cfg.f16accg) << 2)
+            } else {
+                0
+            },
             ary: if cfg.ary16 { 16 } else { 0 },
             hvc: cfg.hvc,
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
