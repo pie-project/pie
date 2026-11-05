@@ -93,6 +93,8 @@ pub struct Model {
     pub op3: usize,
     /// `GRD`: bits of the regions' levers the grids take too (`Variant::grid`; 0 off).
     pub grid: usize,
+    /// `F16CL` 1: the regions' f16 copy clamped, 0515's redo window (`Variant::f16cl`).
+    pub f16cl: bool,
 }
 
 impl Model {
@@ -116,6 +118,7 @@ impl Model {
             mem: 0,
             op3: 0,
             grid: 0,
+            f16cl: false,
         }
     }
 
@@ -145,6 +148,7 @@ impl Model {
             mem: u16::try_from(self.mem).unwrap_or(0),
             op3: u16::try_from(self.op3).unwrap_or(0),
             grid: u16::try_from(self.grid).unwrap_or(0),
+            f16cl: self.f16cl,
         }
     }
 }
@@ -733,6 +737,7 @@ impl ProgramSpec {
             "MEM" => Some(m.mem),
             "OP3" => Some(m.op3),
             "GRD" => Some(m.grid),
+            "F16CL" => Some(usize::from(m.f16cl)),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1366,6 +1371,7 @@ fn model(get: &Get) -> R<Model> {
         mem: get.opt("MEM").unwrap_or(0),
         op3: get.opt("OP3").unwrap_or(0),
         grid: get.opt("GRD").unwrap_or(0),
+        f16cl: get.opt("F16CL").unwrap_or(0) != 0,
     })
 }
 

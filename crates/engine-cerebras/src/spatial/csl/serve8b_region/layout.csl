@@ -83,6 +83,8 @@ param OP3: u16 = 0;
 param GRD: u16 = 0;
 // GPROF 1: the grids alone built with PROF 1 (their phases; the regions keep PROF).
 param GPROF: u16 = 0;
+// F16CL 1: the regions' f16 copy clamped, 0515's redo window (codegen.rs `Variant::f16cl`; passed on to neither).
+param F16CL: u16 = 0;
 param NOLAYER: u16 = 0;    // 1 (checking the handoffs alone): the units skip their layers
 param VMX: u16 = 0;        // 1: a 5-column VM block east of the strip (VM5.md; then VMC 0)
 param VMREAL: u16 = 0;     // VMX: 1 Fork 3's eta VM (vm_pe.csl), 0 the stand-in (vm_stub.csl)
