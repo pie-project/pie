@@ -3040,7 +3040,7 @@ mod llama31_8b {
                     assert!(!a.contains("fn arf_ar(") && b.contains("fn arf_ar("), "{n}");
                     assert!(b.contains("wmvh(gb, wgu_dsd, xn_dsd, Hc, 2 * Ic, false);"), "{n}");
                     assert!(b.contains("@as(@fp16(), @bitcast(f32, u))"), "{n}");
-                    assert!(b.contains("const R2X: u16 =") && b.contains("while (c < dims[10])"), "{n}");
+                    assert!(b.contains("const R2X: u16 =") && b.contains("prof[slot] += lo - t_lo;"), "{n}");
                     assert!(b.contains("fn axis_xa()") && b.contains("3 * NCOL + 3"), "{n}");
                 }
                 "grid_pe.csl" => {
