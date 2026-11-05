@@ -916,7 +916,10 @@ fn arf_line(n: usize, k: usize, arg: usize) -> ([Option<(usize, usize, usize)>; 
 /// (12 words a PE). `arg`: rows a group, a power of two. `argx` > 0 (ARF 3):
 /// also the X axis's full all-reduces' set and role, the same streamed halves
 /// along the row (root column px_n / 2, groups of `argx` columns): words
-/// 12..17 and 17 (18 words a PE).
+/// 12..17 and 17 (18 words a PE). `seg` (ARF bit 4): the X set (words 0..5)
+/// as streamed halves on each segment of `gs` columns (root at its column
+/// gs / 2, groups of 8) and its role in word 10 (the group broadcast's word).
+#[allow(clippy::too_many_arguments)]
 pub fn route_words_arf(
     rb: &[u32],
     px_n: usize,
@@ -925,6 +928,7 @@ pub fn route_words_arf(
     gy: usize,
     arg: usize,
     argx: usize,
+    seg: bool,
 ) -> Vec<u32> {
     const N_: usize = 1;
     const S_: usize = 2;
@@ -961,6 +965,9 @@ pub fn route_words_arf(
             if argx > 0 {
                 out[at + 17] = put(&mut out, at + 12, px_n, px, argx, (W_, E_));
             }
+            if seg {
+                out[at + 10] = put(&mut out, at, gs, px % gs, 8, (W_, E_));
+            }
         }
     }
     out
@@ -994,8 +1001,13 @@ pub fn put_routes(
             let argx = if lay.model.arf & 2 != 0 { 16 } else { 0 };
             // (ARY: the Y groups' rows, 8 by default; 0495: 16 is ~15 cycles faster at 208 rows)
             let ary = if lay.model.ary > 0 { lay.model.ary } else { 8 };
+            // (ARF bit 4: the segment all-reduce as streamed halves on each segment too)
+            let seg = lay.model.arf & 4 != 0;
+            if seg && v.k.px % v.k.gs != 0 {
+                return Err(format!("ARF 7: segments of {} do not split {} columns", v.k.gs, v.k.px));
+            }
             let (words, n) = if arf {
-                (route_words_arf(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), ary, argx), if argx > 0 { 18 } else { 12 })
+                (route_words_arf(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), ary, argx, seg), if argx > 0 { 18 } else { 12 })
             } else {
                 (route_words_gx(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), gx), if gx > 0 { 17 } else { 11 })
             };
@@ -1683,18 +1695,35 @@ mod tests {
     fn arf_route_words_reduce_every_row_once() {
         let rb: Vec<u32> = (0..10).map(|i| 1u32 << i).collect();
         // (ARY: Y groups of 8 or 16 rows)
-        for (argx, ary) in [(0, 8), (16, 8), (16, 16)] {
+        for (argx, ary, seg) in [(0, 8, false), (16, 8, false), (16, 16, false), (16, 8, true)] {
             for (py_n, px_n) in [(208, 2), (24, 1), (17, 1), (9, 1), (3, 1), (5, 256), (4, 33), (3, 17), (3, 3), (152, 128)] {
                 if argx == 0 && px_n > 2 {
                     continue;
                 }
                 let st = if argx > 0 { 18 } else { 12 };
-                let w = route_words_arf(&rb, px_n, py_n, 32.min(px_n.next_power_of_two()), 16.min(py_n.next_power_of_two()), ary, argx);
+                let (px_n, py_n): (usize, usize) = (px_n, py_n);
+                let gsx = 32.min(px_n.next_power_of_two());
+                if seg && (px_n % gsx != 0 || gsx < 3) {
+                    continue;
+                }
+                let w = route_words_arf(&rb, px_n, py_n, gsx, 16.min(py_n.next_power_of_two()), ary, argx, seg);
                 let base = route_words(&rb, px_n, py_n, 32.min(px_n.next_power_of_two()), 16.min(py_n.next_power_of_two()));
                 assert_eq!(w.len(), px_n * py_n * st);
                 for pe in 0..px_n * py_n {
-                    assert_eq!(w[pe * st..pe * st + 5], base[pe * 11..pe * 11 + 5], "X set");
-                    assert_eq!(w[pe * st + 10], base[pe * 11 + 10], "group broadcast");
+                    if !seg {
+                        assert_eq!(w[pe * st..pe * st + 5], base[pe * 11..pe * 11 + 5], "X set");
+                        assert_eq!(w[pe * st + 10], base[pe * 11 + 10], "group broadcast");
+                    }
+                }
+                // (ARF bit 4: every segment of gsx columns a line of its own)
+                if seg {
+                    for py in 0..py_n {
+                        for s0 in (0..px_n).step_by(gsx) {
+                            let word = |p: usize, c: usize| w[(py * px_n + s0 + p) * st + c];
+                            let role = |p: usize| w[(py * px_n + s0 + p) * st + 10];
+                            check_arf_line(gsx, &word, &role, (4, 3));
+                        }
+                    }
                 }
                 for px in 0..px_n {
                     let word = |p: usize, c: usize| w[(p * px_n + px) * st + 5 + c];
