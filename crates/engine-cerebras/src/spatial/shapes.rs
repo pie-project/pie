@@ -265,7 +265,13 @@ pub const RAN: &[Ran] = &[
                  + exp at degree 4 and the residuals from the receives (TRM 29) 1,804.7 / 1,804.7 \
                  (0531), + x's sums of squares by a scalar loop (TRM 31) 1,832.2 / 1,832.7 (0531, \
                  regions 36.3-36.4k a pass, grids 16.2 / 15.9k), each = golden for 512, 0 \
-                 teacher-forced mismatches (TRM 7's stride-0 accumulate: garbage, 0530)",
+                 teacher-forced mismatches (TRM 7's stride-0 accumulate: garbage, 0530); + HV's \
+                 zeroings by reads and entries once a pass, Y groups of 16 and centred vertical \
+                 handoffs (TRM 223, ARY 16, HVC 1) 1,892.8 / 1,891.8 (0533, regions 34.9-35.1k a \
+                 pass), + rsqrt in two Newton steps (TRM 479) 1,903.1 / 1,902.5 (0533), + the \
+                 head's split_x alone (TRM 255) 1,897.4 / 1,897.7 (0533, head matvec mean 4.28k \
+                 against 5.34k), each = golden for 512, 0 teacher-forced mismatches; ARF 7 (the \
+                 segment all-reduce as streamed halves) hung (0532)",
     },
     Ran {
         design: Design::Serve8bRegion,
