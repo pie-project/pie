@@ -196,6 +196,49 @@ fn top_k_has_one_canonical_signature_and_library_kind() {
     );
 }
 
+/// A reshape to the shape its value already has normalizes away: a greedy pick that reshapes
+/// its logits to their own shape first is the program that does not, so its argmax reads the
+/// logits directly.
+#[test]
+fn an_identity_reshape_is_its_value() {
+    let plain = program(1, 1);
+    let mut container = plain.container.clone();
+    let epilogue = container
+        .stages
+        .iter_mut()
+        .find(|stage| stage.stage == Stage::Epilogue)
+        .unwrap();
+    let Op::Output { shape, .. } = epilogue.ops[0] else {
+        panic!("the epilogue starts with its logits");
+    };
+    let Op::ChanPut { chan, .. } = epilogue.ops[3] else {
+        panic!("the epilogue ends with its put");
+    };
+    epilogue.ops = vec![
+        epilogue.ops[0].clone(),
+        Op::Reshape { value: 0, shape },
+        Op::ReduceArgmax(1),
+        Op::Reshape {
+            value: 2,
+            shape: Shape::vector(1),
+        },
+        Op::ChanPut { chan, value: 3 },
+    ];
+    let reshaped = served(container, 32);
+    let plain = compile_stage(&plain, Stage::Epilogue).unwrap();
+    let reshaped = compile_stage(&reshaped, Stage::Epilogue).unwrap();
+    assert!(
+        !reshaped
+            .normalized
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Reshape { .. })),
+        "{:?}",
+        reshaped.normalized.ops
+    );
+    assert_eq!(plain.signature, reshaped.signature);
+}
+
 /// `0 + -0` is `+0` in every float width: a one-element cumsum or an
 /// `x + 0` of a half-width float is not its element, as in f32; in integer
 /// arithmetic it is.
