@@ -188,6 +188,12 @@ pub struct ServeConfig {
     /// serve8b_region(_pipe), with `arf`, `op3` or `mem`: the grids take those
     /// levers too (`GRD`, codegen's `Variant::grid`).
     pub grid_levers: bool,
+    /// With `f16acc`: the regions' f16 probability copy clamped with 0515's redo
+    /// window (`F16CL` 1, codegen's `Variant::f16cl`; Llama: 0526).
+    pub f16_clamp: bool,
+    /// With `arfx`: the regions' XA all-reduces on their own colours (`XAC` 1,
+    /// codegen's `Variant::xac`).
+    pub xac: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -227,6 +233,8 @@ impl ServeConfig {
             mem: false,
             op3: false,
             grid_levers: false,
+            f16_clamp: false,
+            xac: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -306,6 +314,8 @@ impl ServeConfig {
             "mem",
             "op3",
             "grid_levers",
+            "f16_clamp",
+            "xac",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -408,6 +418,8 @@ impl ServeConfig {
             mem: flag(t, "mem")?,
             op3: flag(t, "op3")?,
             grid_levers: flag(t, "grid_levers")?,
+            f16_clamp: flag(t, "f16_clamp")?,
+            xac: flag(t, "xac")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -1067,6 +1079,12 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if cfg.grid_levers && !(cfg.arf || cfg.op3) {
         return Err("serve8b_region's `grid_levers` needs `arf` or `op3`".into());
     }
+    if cfg.f16_clamp && !cfg.f16acc {
+        return Err("serve8b_region's `f16_clamp` needs `f16acc`".into());
+    }
+    if cfg.xac && !cfg.arfx {
+        return Err("serve8b_region's `xac` needs `arfx`".into());
+    }
     if cfg.hv && !cfg.lse {
         return Err("serve8b_region's HV (`hv`) needs `lse` (and `speed`)".into());
     }
@@ -1391,6 +1409,8 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             } else {
                 0
             },
+            f16cl: cfg.f16_clamp,
+            xac: cfg.xac,
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1469,6 +1489,12 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.grid_levers {
         st.push(Typed("GRD"));
+    }
+    if cfg.f16_clamp {
+        st.push(Typed("F16CL"));
+    }
+    if cfg.xac {
+        st.push(Typed("XAC"));
     }
     if cfg.lever_d {
         st.push(Typed("YD"));
@@ -2871,6 +2897,13 @@ mod llama31_8b {
         got.retain(|(k, _)| k != "KVST");
         got.sort();
         assert_eq!(got, super::qwen3_8b::sorted(want));
+        // + f16_clamp + xac: 0527's sp527_gx7
+        (cfg.f16_clamp, cfg.xac) = (true, true);
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1")));
     }
 
     /// `ops2` on 0472's config states 0480's program: the same parameters
