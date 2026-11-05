@@ -710,6 +710,7 @@ pub fn fire_lanes(
     let (rx, ry) = lay.root();
     let one = rect(rx, ry, 1, 1);
     let words = inn.len();
+    let t_in = std::time::Instant::now();
     rt.memcpy_h2d_nonblock(
         SYM.in_tokens,
         inn,
@@ -722,8 +723,10 @@ pub fn fire_lanes(
     // DEFER: every lane of the launch on the VM, two micro-batches or more.
     let all_vm = vm.is_some_and(|t| (0..mbs.len() * b_n).all(|v| t.sampled.get(v) == Some(&1)));
     let args = lay.compute_args(steps, mbs.len(), all_vm);
+    let t_launch = std::time::Instant::now();
     rt.launch_nonblock(SYM.compute, &args).map_err(e)?;
     let mut out = vec![0u32; words];
+    let t_read = std::time::Instant::now();
     let read = rt.memcpy_d2h(
         SYM.out_tokens,
         &mut out,
@@ -732,8 +735,23 @@ pub fn fire_lanes(
         Order::RowMajor,
         DataType::Bits32,
     );
+    let t_wait = std::time::Instant::now();
     rt.wait_pending();
     read.map_err(e)?;
+    // (A launch far slower than its steps: where its host time went.)
+    let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+    let t_end = std::time::Instant::now();
+    if ms(t_tables, t_end) > 20.0 + 1.5 * steps as f64 {
+        tracing::warn!(
+            steps,
+            tables_ms = ms(t_tables, t_in),
+            in_tokens_ms = ms(t_in, t_launch),
+            launch_ms = ms(t_launch, t_read),
+            d2h_ms = ms(t_read, t_wait),
+            wait_ms = ms(t_wait, t_end),
+            "spatial wafer: a slow launch"
+        );
+    }
     lay.stage.check_launch(lay, rt)?;
     // Lane i is micro-batch i / B's lane i % B: [i][CAP] either way.
     let tokens: Vec<Vec<u32>> = (0..lanes.len())

@@ -1351,6 +1351,41 @@ enum Job {
     },
 }
 
+impl Job {
+    /// The job's name in the slow-job line.
+    fn kind(&self) -> &'static str {
+        match self {
+            Job::Forward { .. } => "forward",
+            Job::Greedy { .. } => "greedy",
+            Job::Batch { .. } => "batch",
+            Job::Posted { .. } => "posted",
+            Job::Copy { .. } => "copy",
+            Job::CopyState { .. } => "copy_state",
+            Job::PageOut { .. } => "page_out",
+            Job::PageIn { .. } => "page_in",
+            Job::VmLoad { .. } => "vm_load",
+            Job::VmStep { .. } => "vm_step",
+            Job::VmLoadLanes { .. } => "vm_load_lanes",
+            Job::VmSeedBank { .. } => "vm_seed_bank",
+            Job::VmFire { .. } => "vm_fire",
+            Job::VmPlaceLanes { .. } => "vm_place_lanes",
+        }
+    }
+}
+
+/// Logs a wafer-thread job that took over 50 ms when it ends (dropped); a
+/// launch (`batch`, `posted`) says so itself when slow for its steps.
+struct SlowJob(&'static str, std::time::Instant);
+
+impl Drop for SlowJob {
+    fn drop(&mut self) {
+        let ms = self.1.elapsed().as_secs_f64() * 1e3;
+        if ms > 50.0 && !matches!(self.0, "batch" | "posted") {
+            tracing::warn!(kind = self.0, ms, "spatial wafer: a slow job");
+        }
+    }
+}
+
 type Answer = R<(Vec<u32>, Vec<Vec<f32>>)>;
 /// Each lane's tokens and logits rows.
 pub(crate) type BatchAnswer = R<super::serve2d::BatchOut>;
@@ -1506,6 +1541,11 @@ impl Wafer {
                 // wafer thread's wait for it (the host's share between launches).
                 let mut idle_from = std::time::Instant::now();
                 for job in job_rx {
+                    // (Every job the wafer thread runs, timed when slow: the
+                    // host-stall hunt.)
+                    let job_t0 = std::time::Instant::now();
+                    let job_kind = job.kind();
+                    let _slow = SlowJob(job_kind, job_t0);
                     let answer = match job {
                         Job::Batch {
                             lanes,
