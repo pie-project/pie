@@ -274,7 +274,9 @@ pub const RAN: &[Ran] = &[
                  41.5-41.7k a pass = 13.9k a layer) and with F16 2 1,360.9 / 1,359.4 (0512, \
                  regions 40.0-43.7k a pass), both the same 14 mismatches; F16 3 with the scaled \
                  f16 copy 1,407.4 / 1,407.4 (0518, regions 40.0-40.2k a pass, no redos), the same \
-                 14 mismatches",
+                 14 mismatches; pie B 1 on it (160 tokens) 1,212.4-1,233.6 = 86.2-87.7% of bare \
+                 1,406.0-1,406.7 (0520; device 0.722 ms a step against 0.711), every pie stream = \
+                 bare's",
     },
 ];
 
