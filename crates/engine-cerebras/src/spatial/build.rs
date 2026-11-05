@@ -185,6 +185,9 @@ pub struct ServeConfig {
     /// serve8b_region(_pipe), with `ops2`: the regions' RoPE tables once a
     /// pass (`OP3` 1, codegen's `Variant::op3`).
     pub op3: bool,
+    /// serve8b_region(_pipe), with `arf`, `op3` or `mem`: the grids take those
+    /// levers too (`GRD`, codegen's `Variant::grid`).
+    pub grid_levers: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -223,6 +226,7 @@ impl ServeConfig {
             f16accg: false,
             mem: false,
             op3: false,
+            grid_levers: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -301,6 +305,7 @@ impl ServeConfig {
             "f16accg",
             "mem",
             "op3",
+            "grid_levers",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -402,6 +407,7 @@ impl ServeConfig {
             f16accg: flag(t, "f16accg")?,
             mem: flag(t, "mem")?,
             op3: flag(t, "op3")?,
+            grid_levers: flag(t, "grid_levers")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -1058,6 +1064,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if cfg.mem && !cfg.arf {
         return Err("serve8b_region's code cuts (`mem`) need `arf`".into());
     }
+    if cfg.grid_levers && !(cfg.arf || cfg.op3) {
+        return Err("serve8b_region's `grid_levers` needs `arf` or `op3`".into());
+    }
     if cfg.hv && !cfg.lse {
         return Err("serve8b_region's HV (`hv`) needs `lse` (and `speed`)".into());
     }
@@ -1376,6 +1385,12 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             // (MEM 3 where the q/k norm is the identity: q's scale a constant)
             mem: if cfg.mem { if plan.spec.qk_norm { 1 } else { 3 } } else { 0 },
             op3: usize::from(cfg.op3),
+            // (the grids' levers: ARF 1, OP3 2, MEM 4; MEM's only with ARF)
+            grid: if cfg.grid_levers {
+                usize::from(cfg.arf) | (usize::from(cfg.op3) << 1) | (usize::from(cfg.mem && cfg.arf) << 2)
+            } else {
+                0
+            },
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1451,6 +1466,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.op3 {
         st.push(Typed("OP3"));
+    }
+    if cfg.grid_levers {
+        st.push(Typed("GRD"));
     }
     if cfg.lever_d {
         st.push(Typed("YD"));
@@ -3087,6 +3105,42 @@ mod llama31_8b {
         assert!(params(&plan, &cfg).is_err(), "mem / arfx without arf");
         cfg.mem = false;
         assert!(params(&plan, &cfg).is_err(), "arfx without arf");
+    }
+
+    /// `grid_levers` states GRD (ARF 1, OP3 2, MEM 4) and patches the grid
+    /// kernel with the regions' levers; the regions' sources stay as without it.
+    #[test]
+    fn grid_levers_state_grd_and_patch_the_grids() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        (cfg.speed, cfg.lse, cfg.ops2, cfg.qkv1, cfg.arf, cfg.arfx) = (true, true, true, true, true, true);
+        (cfg.f16acc, cfg.f16accg, cfg.mem, cfg.op3) = (true, true, true, true);
+        let (d, p0) = params(&plan, &cfg).unwrap();
+        cfg.grid_levers = true;
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
+        assert_eq!(get("GRD").as_deref(), Some("7"));
+        assert!(p0.iter().all(|e| e.0 != "GRD"));
+        let base = ProgramSpec::from_params(d, &p0).unwrap();
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        assert_eq!(lay.model.grid, 7);
+        let a = d.files_with(base.model.variant()).unwrap();
+        let b = d.files_with(lay.model.variant()).unwrap();
+        for ((n, x), (_, y)) in a.iter().zip(&b) {
+            if *n == "grid_pe.csl" {
+                assert!(!x.contains("fn arf_ar(") && y.contains("fn arf_ar(") && y.contains("fn axis_xa()"), "{n}");
+                assert!(y.contains("rope_tab();   // (op3)") && y.contains("fn rope_vec()"), "{n}");
+                assert!(y.contains("const QSCL: f32") && !y.contains("const qkn_a"), "{n}");
+            } else {
+                assert_eq!(x, y, "{n}");
+            }
+        }
+        cfg.arf = false;
+        cfg.arfx = false;
+        cfg.mem = false;
+        let (_, p) = params(&plan, &cfg).unwrap();
+        assert_eq!(p.iter().find(|e| e.0 == "GRD").map(|e| e.1.as_str()), Some("2"));
+        cfg.op3 = false;
+        assert!(params(&plan, &cfg).is_err(), "grid_levers with no lever");
     }
 
     /// The ring at PY 152: B 1 x 12 at CAP 32 ran on hardware (0402) and

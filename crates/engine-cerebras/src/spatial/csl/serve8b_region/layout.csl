@@ -81,6 +81,8 @@ param MEM: u16 = 0;
 param OP3: u16 = 0;
 // GRD bits: the regions' ARF (1), OP3 (2), MEM (4) in the grid kernel too (codegen.rs `Variant::grid`; passed on to neither).
 param GRD: u16 = 0;
+// GPROF 1: the grids alone built with PROF 1 (their phases; the regions keep PROF).
+param GPROF: u16 = 0;
 param NOLAYER: u16 = 0;    // 1 (checking the handoffs alone): the units skip their layers
 param VMX: u16 = 0;        // 1: a 5-column VM block east of the strip (VM5.md; then VMC 0)
 param VMREAL: u16 = 0;     // VMX: 1 Fork 3's eta VM (vm_pe.csl), 0 the stand-in (vm_stub.csl)
@@ -214,7 +216,7 @@ layout {
           .memcpy_params = mp, .KVST = KVST,
           .PX = PX, .PY = PY, .Hc = Hc, .HR = HR, .Dc = Dc, .Gs = Gs, .Qh = Qh, .Ic = Ic,
           .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC, .W16 = W16, .NP = NP, .KV16 = KV16,
-          .KVCP = KVCP, .PROF = PROF, .GY = GY, .HROUTE = HROUTE, .ROT8 = ROT8, .S2D_TIME = TIME, .S2D_RTR = RTR, .S2D_NOLAYER = NOLAYER,
+          .KVCP = KVCP, .PROF = if (GPROF == 1) 1 else PROF, .GY = GY, .HROUTE = HROUTE, .ROT8 = ROT8, .S2D_TIME = TIME, .S2D_RTR = RTR, .S2D_NOLAYER = NOLAYER,
           .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
           .c_bc = C_BC, .c_gb = C_GB,
         });
