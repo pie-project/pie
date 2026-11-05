@@ -91,6 +91,8 @@ pub struct Model {
     pub mem: usize,
     /// `OP3`: the regions' third op cuts (`Variant::op3`; 0 off).
     pub op3: usize,
+    /// `GRD`: bits of the regions' levers the grids take too (`Variant::grid`; 0 off).
+    pub grid: usize,
 }
 
 impl Model {
@@ -113,6 +115,7 @@ impl Model {
             f16: 0,
             mem: 0,
             op3: 0,
+            grid: 0,
         }
     }
 
@@ -141,6 +144,7 @@ impl Model {
             f16: u16::try_from(self.f16).unwrap_or(0),
             mem: u16::try_from(self.mem).unwrap_or(0),
             op3: u16::try_from(self.op3).unwrap_or(0),
+            grid: u16::try_from(self.grid).unwrap_or(0),
         }
     }
 }
@@ -728,6 +732,7 @@ impl ProgramSpec {
             "F16" => Some(m.f16),
             "MEM" => Some(m.mem),
             "OP3" => Some(m.op3),
+            "GRD" => Some(m.grid),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1360,6 +1365,7 @@ fn model(get: &Get) -> R<Model> {
         f16: get.opt("F16").unwrap_or(0),
         mem: get.opt("MEM").unwrap_or(0),
         op3: get.opt("OP3").unwrap_or(0),
+        grid: get.opt("GRD").unwrap_or(0),
     })
 }
 

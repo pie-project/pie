@@ -986,7 +986,8 @@ pub fn put_routes(
                 return Err(format!("RGX {gx} does not split the region's {} columns", v.k.px));
             }
             // (ARF: the regions' Y all-reduces as streamed halves, groups of 8)
-            let arf = v.kind != Kind::Grid && lay.model.arf != 0;
+            // (GRD bit 1: the grids' too)
+            let arf = (v.kind != Kind::Grid || lay.model.grid & 1 != 0) && lay.model.arf != 0;
             if arf && gx > 0 {
                 return Err("ARF with RGX: not built".into());
             }
@@ -1038,7 +1039,7 @@ pub(crate) fn place_layers(
     if !u.nolayer {
         for v in u.units(lay) {
             let layers: Vec<usize> = v.layers.clone().collect();
-            let qkn = v.kind == Kind::Grid || lay.model.mem & 2 == 0;
+            let qkn = (v.kind == Kind::Grid && lay.model.grid & 4 == 0) || lay.model.mem & 2 == 0;
             super::serve8b::unit(lay, ckpt, v.k, &layers, (v.x0, v.y0), &rope, false, qkn, dev)?;
         }
     }
@@ -1680,7 +1681,7 @@ mod tests {
     fn arf_route_words_reduce_every_row_once() {
         let rb: Vec<u32> = (0..10).map(|i| 1u32 << i).collect();
         for argx in [0, 16] {
-            for (py_n, px_n) in [(208, 2), (24, 1), (17, 1), (9, 1), (3, 1), (5, 256), (4, 33), (3, 17), (3, 3)] {
+            for (py_n, px_n) in [(208, 2), (24, 1), (17, 1), (9, 1), (3, 1), (5, 256), (4, 33), (3, 17), (3, 3), (152, 128)] {
                 if argx == 0 && px_n > 2 {
                     continue;
                 }

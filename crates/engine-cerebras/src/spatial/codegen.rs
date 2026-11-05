@@ -340,12 +340,23 @@ pub struct Variant {
     /// their repeat once a pass (the NL layers share the position), each
     /// layer rotating every head by seven DSD ops (`op3_ops.json`). 0: off.
     pub op3: u16,
+    /// `GRD` bits (grids only; 0 off): the regions' levers in the grid
+    /// kernel too, as the model states them: 1 `arf` (with `ARF`), 2 `op3`
+    /// (with `OP3`), 4 `mem` (with `MEM`).
+    pub grid: u16,
 }
 
 impl Variant {
     /// The variant's patches on a paged8b unit kernel (`tag` names it).
     fn apply(self, text: &str, tag: &str) -> R<String> {
         let mut s = text.to_string();
+        let region = tag.starts_with("qwen2d_region/");
+        // (GRD: a region lever on the grid kernel as well)
+        let unit = |bit: u16| region || (self.grid & bit) != 0;
+        if !region && self.grid & 4 != 0 && self.grid & 1 == 0 {
+            // (MEM's phase1/phase2 on X only hold under ARF)
+            return Err(format!("gen: {tag}: GRD 4 (MEM) needs GRD 1 (ARF)"));
+        }
         if self.identity_qk_norm {
             let start = "  const sqa = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QH} -> s[@as(i16, QH) + i] });\n";
             let end = "  @fmuls(half_v, half_v, scl_t());\n";
@@ -420,7 +431,7 @@ impl Variant {
             }
             s = apply_reps("rgx_ops", src::RGX_OPS, &s, tag)?;
         }
-        if self.arf != 0 && tag.starts_with("qwen2d_region/") {
+        if self.arf != 0 && unit(1) {
             if !self.ops2 {
                 return Err(format!("gen: {tag}: ARF needs OP2"));
             }
@@ -528,7 +539,7 @@ impl Variant {
                 s = apply_reps("f16acc_ops", src::F16ACC_OPS, &s, tag)?;
             }
         }
-        if self.mem != 0 && tag.starts_with("qwen2d_region/") {
+        if self.mem != 0 && unit(4) {
             if self.mem != 1 && self.mem != 3 {
                 return Err(format!("gen: {tag}: MEM {} unknown (1: the code cuts, 3: and q's constant scale)", self.mem));
             }
@@ -540,15 +551,34 @@ impl Variant {
             }
             s = apply_reps("mem_ops", src::MEM_OPS, &s, tag)?;
             if self.mem & 2 != 0 {
-                s = apply_reps("mem_qkn", src::MEM_QKN, &s, tag)?;
+                if region {
+                    s = apply_reps("mem_qkn", src::MEM_QKN, &s, tag)?;
+                } else {
+                    // (GRD: the grid's one layer - qkn_w unstacked, no `lw`)
+                    let j = src::MEM_QKN
+                        .replace("[NL * 2 * NH * DHc]", "[2 * NH * DHc]")
+                        .replace("at(qkn_a, lw * 2 * NH * DHc)", "qkn_a")
+                        .replace("at(qkn_v, lw * 2 * NH * DHc)", "qkn_v");
+                    s = apply_reps("mem_qkn (grid)", &j, &s, tag)?;
+                }
             }
         }
-        if self.op3 != 0 && tag.starts_with("qwen2d_region/") {
+        if self.op3 != 0 && unit(2) {
             if self.op3 != 1 {
                 return Err(format!("gen: {tag}: OP3 {} unknown (1: RoPE a pass)", self.op3));
             }
             if !self.ops2 {
                 return Err(format!("gen: {tag}: OP3 needs OP2"));
+            }
+            if !region {
+                // (GRD: the grids lack the regions' RV rotation; speed_ops_region's
+                // two RoPE entries, 3 and 4, bring it in first)
+                let all: serde_json::Value = serde_json::from_str(src::SPEED_OPS_REGION)
+                    .map_err(|e| format!("speed_ops_region.json: {e}"))?;
+                let two = serde_json::Value::Array(
+                    all.as_array().ok_or("speed_ops_region.json: not a list")?[3..5].to_vec(),
+                );
+                s = apply_reps("speed_ops_region RoPE (grid)", &two.to_string(), &s, tag)?;
             }
             s = apply_reps("op3_ops", src::OP3_OPS, &s, tag)?;
         }
