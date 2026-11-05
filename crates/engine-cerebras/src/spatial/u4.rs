@@ -158,17 +158,30 @@ impl Tile {
     /// decode buffer holds [`BUF_WORDS`].
     #[must_use]
     pub fn chunk(&self) -> usize {
-        (BUF_WORDS / (self.n + 1)).clamp(1, self.planes().max(1))
+        self.chunk_in(BUF_WORDS)
+    }
+    /// [`Tile::chunk`] for a decode buffer of `buf` u16 words.
+    #[must_use]
+    pub fn chunk_in(&self, buf: usize) -> usize {
+        (buf / (self.n + 1)).clamp(1, self.planes().max(1))
     }
     /// Segment slots (`w4segs`): the planes' chunks, split again where a
     /// group starts.
     #[must_use]
     pub fn segs(&self) -> usize {
-        (4 * self.planes().div_ceil(self.chunk()) + self.g).saturating_sub(1)
+        self.segs_in(BUF_WORDS)
+    }
+    #[must_use]
+    pub fn segs_in(&self, buf: usize) -> usize {
+        (4 * self.planes().div_ceil(self.chunk_in(buf)) + self.g).saturating_sub(1)
     }
     #[must_use]
     pub fn header(&self) -> usize {
-        2 + 4 * self.segs()
+        self.header_in(BUF_WORDS)
+    }
+    #[must_use]
+    pub fn header_in(&self, buf: usize) -> usize {
+        2 + 4 * self.segs_in(buf)
     }
     #[must_use]
     pub fn layer_words(&self) -> usize {
@@ -187,7 +200,7 @@ impl Tile {
 
 /// Groups a run of `n` consecutive input dims starting at a multiple of
 /// `n` can touch (`u4mv.csl`'s `w4runs`).
-fn run_groups(n: usize) -> usize {
+pub(crate) fn run_groups(n: usize) -> usize {
     if GROUP.is_multiple_of(n) {
         1
     } else if n.is_multiple_of(GROUP) {
@@ -304,6 +317,11 @@ pub type Col<'a> = Option<(&'a Q4, usize)>;
 /// `t`: `rows` its input dims (`None`: zero padding), `cols[l]` layer `l`'s
 /// outputs. Every layer's rows are the same dims, so one header serves all.
 pub fn blob(t: Tile, rows: &[Option<usize>], cols: &[Vec<Col>], out: &mut Vec<u32>) -> R<()> {
+    blob_in(t, BUF_WORDS, rows, cols, out)
+}
+
+/// [`blob`] for a decode buffer of `buf` u16 words (the header's segments).
+pub fn blob_in(t: Tile, buf: usize, rows: &[Option<usize>], cols: &[Vec<Col>], out: &mut Vec<u32>) -> R<()> {
     if rows.len() != t.r || cols.iter().any(|c| c.len() != t.n) {
         return Err(format!(
             "u4 tile {t:?}: {} rows, columns {:?}",
@@ -335,7 +353,7 @@ pub fn blob(t: Tile, rows: &[Option<usize>], cols: &[Vec<Col>], out: &mut Vec<u3
             groups.len()
         ));
     }
-    let (p, kr) = (t.planes(), t.chunk());
+    let (p, kr) = (t.planes(), t.chunk_in(buf));
     let mut segs: Vec<[usize; 3]> = Vec::new();
     for (r, &sl) in slot.iter().enumerate().take(t.r) {
         match segs.last_mut() {
@@ -343,7 +361,7 @@ pub fn blob(t: Tile, rows: &[Option<usize>], cols: &[Vec<Col>], out: &mut Vec<u3
             _ => segs.push([r, 1, sl]),
         }
     }
-    if segs.len() > t.segs() {
+    if segs.len() > t.segs_in(buf) {
         return Err(format!("u4 tile {t:?}: {} segments", segs.len()));
     }
     let start = out.len();
@@ -351,7 +369,7 @@ pub fn blob(t: Tile, rows: &[Option<usize>], cols: &[Vec<Col>], out: &mut Vec<u3
     out.push(segs.len() as u32);
     // Segment records: the codes' word offset in a layer, the rows, the
     // first row, plane << 8 | group slot.
-    for i in 0..t.segs() {
+    for i in 0..t.segs_in(buf) {
         out.extend(segs.get(i).map_or([0; 4], |&[r0, len, g]| {
             let k = r0 / p;
             [
@@ -400,7 +418,7 @@ pub fn blob(t: Tile, rows: &[Option<usize>], cols: &[Vec<Col>], out: &mut Vec<u3
             }
         }
     }
-    debug_assert_eq!(out.len() - start, t.words(cols.len()));
+    debug_assert_eq!(out.len() - start, t.header_in(buf) + cols.len() * t.layer_words());
     Ok(())
 }
 
@@ -408,9 +426,14 @@ pub fn blob(t: Tile, rows: &[Option<usize>], cols: &[Vec<Col>], out: &mut Vec<u3
 /// kernel's arithmetic in f64 (the tests' reference).
 #[must_use]
 pub fn apply(t: Tile, words: &[u32], l: usize, x: &[f32]) -> Vec<f64> {
+    apply_at(t, words, t.header() + l * t.layer_words(), x)
+}
+
+/// [`apply`] with the layer's words at `lb` (the header at `words[0]`).
+#[must_use]
+pub fn apply_at(t: Tile, words: &[u32], lb: usize, x: &[f32]) -> Vec<f64> {
     let w = words;
     let (ng, nseg) = (w[0] as usize, w[1] as usize);
-    let lb = t.header() + l * t.layer_words();
     let p = t.planes();
     let mut acc = vec![vec![0f64; t.n + 1]; ng];
     for s in 0..nseg {
@@ -650,7 +673,8 @@ pub(crate) fn place_head(
     dev: &mut dyn super::device::Device,
 ) -> R<()> {
     let (vr, hid, hh2) = (lay.vr(), lay.hidden(), 2 * lay.hc());
-    let q = q4_whole(ckpt, "head", hid)?;
+    // A tied head (Gemma 4) is the embedding's codes.
+    let q = q4_whole(ckpt, if ckpt.tied_head()? { "embed" } else { "head" }, hid)?;
     if q.rows > lay.vocab() || lay.vocab() > lay.hh() * vr {
         return Err(format!(
             "head is [{}, {hid}]; the head holds {} rows ({} words)",

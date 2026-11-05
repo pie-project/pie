@@ -308,8 +308,11 @@ impl Component for super::program::Head {
 
     /// The tied head computes the logits from the embedding; the untied
     /// one places `lm_head` (and the embedding apart).
-    fn validate(&self, _spec: &ProgramSpec, ckpt: &Ckpt) -> R<()> {
+    fn validate(&self, spec: &ProgramSpec, ckpt: &Ckpt) -> R<()> {
         match self.kind {
+            // Gemma 4 on serve8b_region (G12): the u4 head and strip both
+            // read the tied embedding's codes.
+            HeadKind::Untied if spec.gemma12().is_some() && ckpt.tied_head()? => Ok(()),
             HeadKind::Untied | HeadKind::Triples if !ckpt.has("head") => Err(
                 "the checkpoint has no `head`; serve8b serves untied models (a tied one would \
                  need the embedding as the head)"

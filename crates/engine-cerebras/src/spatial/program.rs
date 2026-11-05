@@ -729,6 +729,26 @@ impl ProgramSpec {
         self.knobs.get("W4").is_some_and(|v| v.trim() == "1")
     }
 
+    /// Gemma 4 dense on serve8b_region (`G12 1` on a `W4 1`, `W4H 1` build:
+    /// `codegen::serve8b_region_g12`, placed by `spatial::u4g12`): its kinds,
+    /// the global kind's shape, the window, the decode buffer, the embedding's
+    /// scale.
+    #[must_use]
+    pub fn gemma12(&self) -> Option<super::u4g12::G12> {
+        let knob = |k: &str| self.knobs.get(k).and_then(|v| v.trim().parse::<u64>().ok());
+        if knob("G12") != Some(1) || !self.head_u4() {
+            return None;
+        }
+        Some(super::u4g12::G12 {
+            kinds: knob("KINDS").unwrap_or(0),
+            qhg: knob("QhG").unwrap_or(0) as usize,
+            gsg: knob("GsG").unwrap_or(0) as usize,
+            win: knob("WIN").unwrap_or(0) as usize,
+            w4buf: knob("W4BUF").unwrap_or(1024) as usize,
+            esb: knob("ESB").unwrap_or(0) as u32,
+        })
+    }
+
     /// The head's lm_head tiles and the embedding strip hold u4g64 too
     /// (`W4H 1`, on a `W4 1` build: `spatial::u4::place_head`/`place_embed`).
     #[must_use]
@@ -970,7 +990,8 @@ impl ProgramSpec {
     /// The program's build directory: its design's files for the model's
     /// variant and, at `W4 1`, its u4g64 units ([`Design::files_for`]);
     /// serve_q35w's for a W16 serve_q35 (serve_q35 itself stays #1412's f32
-    /// program); serve_gptoss's levered units with its `MOE` knob
+    /// program); serve8b_region's Gemma 4 units for a `G12 1` program
+    /// ([`super::codegen::serve8b_region_g12`]); serve_gptoss's levered units with its `MOE` knob
     /// ([`super::codegen::serve_gptoss_with`]).
     pub fn files(&self) -> Result<Vec<super::codegen::File>, String> {
         let (variant, u4) = (self.model.variant(), self.weights_u4());
@@ -981,6 +1002,9 @@ impl ProgramSpec {
                 ));
             }
             return super::codegen::serve_q35w();
+        }
+        if self.gemma12().is_some() {
+            return super::codegen::serve8b_region_g12(variant);
         }
         if self.design == Design::ServeGptoss {
             // (the attention units' levers from the model, the MoE units' MOE knob)

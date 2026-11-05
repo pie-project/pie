@@ -24,6 +24,9 @@ mod src {
     pub const QWEN2D_REGION: &str = include_str!("csl/kernels/qwen2d_region.csl");
     /// The u4g64 matvec (W4 builds), spliced into the unit kernels.
     pub const U4MV: &str = include_str!("csl/kernels/u4mv.csl");
+    /// Gemma 4 dense's serve8b_region unit (u4g64, sliding and global
+    /// layers; `serve8b_region_g12`).
+    pub const GEMMA4_UNIT: &str = include_str!("csl/kernels/gemma4_unit.csl");
     /// The fast softmax levers S1-S3 as (old, new) text pairs on
     /// qwen2d_paged8b's or qwen2d_region's pe.csl.
     pub const SOFTMAX_S123: &str = include_str!("csl/kernels/softmax_s123.json");
@@ -4082,6 +4085,132 @@ fn e4_row(j: u16) void {\n\
     )
 }
 
+// ------------------------------------------------- serve8b_region, Gemma 4 dense
+
+/// gemma4_unit with u4mv.csl's matvec spliced in (its fns and core, the
+/// kernel's own tables and `w4blob`): a matrix's header at its kind's offset
+/// in the symbol, a layer's words at the unit's per-layer offset, up reusing
+/// gate's x parts.
+fn g12_unit() -> R<String> {
+    let tag = "gemma4_unit/pe.csl";
+    let (_, fns) = src::U4MV
+        .split_once("//@@ fns\n")
+        .ok_or("gen: u4mv.csl lost its //@@ fns mark")?;
+    let (fns_a, rest) = fns
+        .split_once("//@@ unitfn\n")
+        .ok_or("gen: u4mv.csl lost its //@@ unitfn mark")?;
+    let core = rest
+        .split_once("//@@ core\n")
+        .ok_or("gen: u4mv.csl lost its //@@ core mark")?
+        .1;
+    let core = patch(
+        core,
+        "  @mov16(@set_dsd_length(w4hd_d, W4Hv[m]), w4at(bp, 0, W4Hv[m]));\n",
+        "  @mov16(@set_dsd_length(w4hd_d, W4Hv[m]), w4at(bp, W4HOv[m], W4Hv[m]));\n",
+        "u4mv header (G12)",
+    )?;
+    let core = patch(
+        &core,
+        "  const lb = W4Hv[m] + w4lay * W4LWv[m];\n",
+        "  const lb = W4LOv[w4lay * 10 + m];\n",
+        "u4mv layer base (G12)",
+    )?;
+    let core = patch(&core, "  if (m != 1 and m != 2) {\n", "  if (W4XNv[m] == 1) {\n", "u4mv x parts (G12)")?;
+    patch(src::GEMMA4_UNIT, "//@@ u4fns\n", &format!("{fns_a}{core}"), tag)
+}
+
+/// The Gemma layout: serve8b_region's W4 layout taking the layers' kinds
+/// (`KINDS`, bit l: layer l reads globally), the global kind's shape (`QhG`,
+/// `GsG`), the sliding window (`WIN`), the u4 decode buffer (`W4BUF`), the
+/// grids' Y group (`GY`) and the embedding's scale (`ESB`, f32 bits of
+/// sqrt(hidden)); each unit's kinds (`KND`) from its place in the layer
+/// order (serve8b_region::Units::units).
+fn g12_layout(text: &str) -> R<String> {
+    let tag = "serve8b_region layout (G12)";
+    let s = patch(
+        text,
+        "param W4H: u16 = 0;  // 1: u4g64 head and embedding strip too\n",
+        "param W4H: u16 = 0;  // 1: u4g64 head and embedding strip too\n\
+// Gemma 4 dense (gemma4_unit): bit l of KINDS, layer l reads globally (QhG query heads a kv\n\
+// copy of GsG columns); the sliding layers' window; the u4 decode buffer; the grids' Y group;\n\
+// f32 bits of the embedding's scale (sqrt(hidden)); the grids' Y group is the layout's GY.\n\
+param G12: u16 = 1;\nparam KINDS: u64 = 0;\nparam QhG: u16 = 0;\nparam GsG: u16 = 0;\nparam WIN: u32 = 0;\n\
+param W4BUF: u16 = 1024;\nparam ESB: u32 = 0;\n",
+        tag,
+    )?;
+    let s = patch(
+        &s,
+        "const memcpy = @import_module(\"<memcpy/get_params>\", .{ .width = XE + EW + VW, .height = RH });\n",
+        "const memcpy = @import_module(\"<memcpy/get_params>\", .{ .width = XE + EW + VW, .height = RH });\n\
+// A unit's kinds: bits l0 .. l0 + n of KINDS; a grid's layer (band: layer 0 at XC, then\n\
+// west; the column below it: after the regions) and a region's first (serpentine by columns).\n\
+const G12BAND: u16 = RC * RPX / PX + 1;\n\
+fn g12_bits(l0: u16, n: u16) u16 {\n  return @as(u16, (KINDS >> l0) & ((@as(u64, 1) << n) - 1));\n}\n\
+fn g12_gk(x: u16, y: u16) u16 {\n  if (x >= XC) {\n    const k = y / PY;\n\
+    if (k == 0) { return g12_bits(0, 1); }\n    return g12_bits(G12BAND + RC * RR * RNL + k - 1, 1);\n  }\n\
+  return g12_bits((XC - (x / PX) * PX) / PX, 1);\n}\n\
+fn g12_rk(x: u16, y: u16) u16 {\n  const c = x / RPX;\n  const ri = (y - PY) / RPY;\n\
+  const i = if (c % 2 == 0) ri else RR - 1 - ri;\n  return g12_bits(G12BAND + (c * RR + i) * RNL, RNL);\n}\n",
+        tag,
+    )?;
+    let s = patch(
+        &s,
+        ".KVCP = KVCP, .PROF = if (GPROF == 1) 1 else PROF, .GY = GY, .HROUTE = HROUTE, .ROT8 = ROT8, .S2D_TIME = TIME, .S2D_RTR = RTR, .S2D_NOLAYER = NOLAYER,\n",
+        ".KVCP = KVCP, .PROF = if (GPROF == 1) 1 else PROF, .GY = GY, .HROUTE = HROUTE, .ROT8 = ROT8, .S2D_TIME = TIME, .S2D_RTR = RTR, .S2D_NOLAYER = NOLAYER,\n\
+          .QhG = QhG, .GsG = GsG, .KND = g12_gk(x, y), .WIN = WIN, .W4BUF = W4BUF,\n",
+        tag,
+    )?;
+    let s = patch(
+        &s,
+        ".KVCP = KVCP, .PROF = PROF, .NL = RNL, .GY = RGY, .HROUTE = HROUTE, .ROT8 = ROT8, .S2D_TIME = TIME, .S2D_RTR = RTR, .S2D_NOLAYER = NOLAYER,\n",
+        ".KVCP = KVCP, .PROF = PROF, .NL = RNL, .GY = RGY, .HROUTE = HROUTE, .ROT8 = ROT8, .S2D_TIME = TIME, .S2D_RTR = RTR, .S2D_NOLAYER = NOLAYER,\n\
+          .QhG = QhG, .GsG = GsG, .KND = g12_rk(x, y), .WIN = WIN, .W4BUF = W4BUF,\n",
+        tag,
+    )?;
+    let s = patch(&s, ".Ve = Vr, .W4H = W4H, .vocab = vocab,", ".Ve = Vr, .W4H = W4H, .ESB = ESB, .vocab = vocab,", tag)?;
+    // Grids may be shorter than wide (Gemma-4-12B: 128 x 96): the handoffs
+    // (serve8b_region::Tables), the staircases and the head and strip take
+    // rows only; serve8b's [PX, 2 PX] stays the default layout's.
+    patch(
+        &s,
+        "@comptime_assert(PY % 4 == 0 and PY >= PX and PY <= 2 * PX and RPY <= 2 * RPX);",
+        "@comptime_assert(PY % 4 == 0 and PY <= 2 * PX and RPY <= 2 * RPX);",
+        tag,
+    )
+}
+
+/// The Gemma strip: the winner's u4 row dequantized times the embedding's
+/// scale (`ESB`, the f32 bits of sqrt(hidden)).
+fn g12_embed(text: &str) -> R<String> {
+    let tag = "embed_pe.csl (G12)";
+    let s = patch(
+        text,
+        "param W4H: u16;      // 1: the rows in u4g64 (see etab)\n",
+        "param W4H: u16;      // 1: the rows in u4g64 (see etab)\n\
+param ESB: u32;      // Gemma: f32 bits of the embedding's scale (sqrt(hidden))\n\
+const G12ES: f32 = @bitcast(f32, ESB);\n",
+        tag,
+    )?;
+    patch(&s, "emb[k] = sc * @as(f32, q) + bi;\n", "emb[k] = (sc * @as(f32, q) + bi) * G12ES;\n", tag)
+}
+
+/// serve8b_region for Gemma 4 dense in u4g64 (`G12 1` on a `W4 1`, `W4H 1`
+/// build): gemma4_unit grids and regions, the W4H head and the strip
+/// scaling the embedding. The default and W4 files are untouched.
+/// `variant`: the speed levers ported to gemma4_unit (default: none).
+pub fn serve8b_region_g12(variant: Variant) -> R<Vec<File>> {
+    let unit = g12_unit()?;
+    let mut files = serve8b_region_files(false, &unit, &unit, variant)?;
+    for (name, text) in &mut files {
+        *text = match *name {
+            "layout.csl" => g12_layout(&w4_layout(text)?)?,
+            "head_pe.csl" => w4_head(text)?,
+            "embed_pe.csl" => g12_embed(&w4_embed(text)?)?,
+            _ => continue,
+        };
+    }
+    Ok(files)
+}
 fn serve8b_region_files(pipe: bool, grid: &str, region: &str, variant: Variant) -> R<Vec<File>> {
     let (layout, embed) = if pipe {
         (src::s8brp::LAYOUT, src::s8brp::EMBED_BASE)
@@ -4458,16 +4587,19 @@ mod tests {
         }
     }
 
-    /// `DESIGN_OUT=<dir> DESIGN=<name> [W4=1]`: a design's build directory
-    /// written there (a payload compiled by hand or on the worker).
+    /// `DESIGN_OUT=<dir> DESIGN=<name> [W4=1] [G12=1]`: a design's build
+    /// directory written there (a payload compiled by hand or on the worker;
+    /// `G12=1`: serve8b_region's Gemma 4 variant).
     #[test]
     #[ignore]
     fn dump_design() {
         let dir = std::path::PathBuf::from(std::env::var("DESIGN_OUT").expect("DESIGN_OUT"));
         let d = Design::parse(&std::env::var("DESIGN").expect("DESIGN")).expect("a design");
         let w4 = std::env::var("W4").is_ok_and(|v| v == "1");
+        let g12 = std::env::var("G12").is_ok_and(|v| v == "1");
         std::fs::create_dir_all(&dir).unwrap();
-        for (name, text) in d.files_w4(w4).expect("generates") {
+        let files = if g12 { serve8b_region_g12(Variant::default()) } else { d.files_w4(w4) };
+        for (name, text) in files.expect("generates") {
             std::fs::write(dir.join(name), text).unwrap();
         }
     }
@@ -4559,6 +4691,35 @@ mod tests {
             }
         }
         assert!(Design::Serve2d.files_w4(true).is_err());
+    }
+
+    /// The Gemma 4 variant (G12): the default and W4 files untouched; its
+    /// units gemma4_unit with u4mv's matvec at the kernel's per-layer
+    /// offsets, its layout taking the kinds and passing each unit's, its
+    /// strip scaling the row, its head the W4 one, the rest the W4 files.
+    #[test]
+    fn g12_variant_adds_only_gemma() {
+        let w4 = Design::Serve8bRegion.files_w4(true).unwrap();
+        assert_eq!(Design::Serve8bRegion.files_w4(false).unwrap(), Design::Serve8bRegion.files().unwrap());
+        let g12 = serve8b_region_g12(Variant::default()).unwrap();
+        assert_eq!(serve8b_region_g12(Variant::default()).unwrap(), g12, "deterministic");
+        for ((n, a), (m, b)) in w4.iter().zip(&g12) {
+            assert_eq!(n, m);
+            match *n {
+                "grid_pe.csl" | "region_pe.csl" => {
+                    assert!(b.contains("fn gelu_col(") && !b.contains("silu_col(el)"), "{n}");
+                    assert!(b.contains("const lb = W4LOv[w4lay * 10 + m];") && b.contains("w4at(bp, W4HOv[m], W4Hv[m])"), "{n}");
+                    assert_eq!(b.matches("wmv4(").count(), 6, "{n}: wmv4's definition and five calls");
+                    assert!(!b.contains("\n//@@ u4fns\n"), "{n}");
+                }
+                "layout.csl" => {
+                    assert!(b.contains("param KINDS: u64 = 0;") && b.contains(".KND = g12_gk(x, y)") && b.contains(".KND = g12_rk(x, y)"));
+                    assert!(b.contains(".ESB = ESB,") && !b.contains("PY >= PX"));
+                }
+                "embed_pe.csl" => assert!(b.contains("(sc * @as(f32, q) + bi) * G12ES") && b.contains("param ESB: u32;")),
+                _ => assert_eq!(a, b, "{n}"),
+            }
+        }
     }
 
     /// The generated files' blake3. These are the programs validated on CS-3

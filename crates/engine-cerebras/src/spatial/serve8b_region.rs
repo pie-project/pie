@@ -1019,7 +1019,12 @@ pub fn put_routes(
     rbits: Option<&[u32]>,
 ) -> R<()> {
     let units = u.units(lay);
-    if u.hroute {
+    if let (true, Some(g)) = (u.hroute, lay.gemma12()) {
+        let rb = rbits
+            .filter(|b| b.len() >= 10)
+            .ok_or("HROUTE 1 without the program's rbits")?;
+        super::u4g12::put_rcfg(lay, u, &g, dev, rb)?;
+    } else if u.hroute {
         let rb = rbits
             .filter(|b| b.len() >= 10)
             .ok_or("HROUTE 1 without the program's rbits")?;
@@ -1094,6 +1099,9 @@ pub(crate) fn place_layers(
     rope: &super::wafer::Rotary,
     dev: &mut dyn Device,
 ) -> R<()> {
+    if let Some(g) = lay.gemma12() {
+        return super::u4g12::place_layers(lay, u, &g, ckpt, dev);
+    }
     let inv_freq = rope.inv_freq(lay.gs() * lay.dc())?;
     let rope = if u.rot8 {
         Rope {

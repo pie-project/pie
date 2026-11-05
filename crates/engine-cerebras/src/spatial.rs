@@ -61,6 +61,7 @@ pub mod model_moe;
 pub mod moe_place;
 pub mod paged;
 pub mod plan;
+pub mod plan_g12;
 pub mod plan_g4;
 pub mod plan_gptoss;
 pub mod plan_q35;
@@ -73,6 +74,7 @@ pub mod serve_gptoss;
 pub mod serve_q35;
 pub mod shapes;
 pub mod u4;
+pub mod u4g12;
 pub mod wafer;
 
 pub use config::SpatialBoot;
