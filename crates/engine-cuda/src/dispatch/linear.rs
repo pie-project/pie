@@ -2442,7 +2442,7 @@ impl Run<'_> {
                 // FP8 MMA where there is one (W8A8).
                 if linear::moe::fp8_w8a8_capable()
                     && routes.rows * routes.width >= linear::moe::FP8_W8A8_FROM
-                    && linear::moe::fp8_w8a8_takes(x, self.tensor(y).width)
+                    && linear::moe::fp8_select_takes(x, self.tensor(y).width)
                 {
                     return linear::moe::select_fp8_w8a8(
                         self.ctx(),
