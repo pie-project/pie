@@ -71,6 +71,11 @@ const CONFIGURED: &[(&str, &[&str], Toolchain)] = &[
         &["--device-as-default-execution-space"],
         Toolchain::ANY,
     ),
+    (
+        "linear/moe/select_fp4_sm120.cu",
+        &["--device-as-default-execution-space"],
+        Toolchain::ANY,
+    ),
 ];
 
 /// The units compiled for the arch-specific target, each with the NVRTC
