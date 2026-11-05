@@ -98,7 +98,7 @@ fn main() -> Result<(), String> {
             worst = worst.max(rel);
             rows.push(
                 serde_json::json!({"pos": b - 1, "max_abs": diff, "scale": scale, "rel": rel,
-                "argmax": common::argmax(row), "want": want[b - 1]}),
+                "argmax": common::argmax(row), "want": want[b - 1], "logits": row}),
             );
             eprintln!(
                 "launch {a}..{b}: logits rel {rel:.3e} (max |d| {diff:.3e}, scale {scale:.3})"

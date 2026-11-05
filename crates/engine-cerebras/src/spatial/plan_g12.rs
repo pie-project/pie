@@ -32,16 +32,16 @@ const W4BUF: usize = 512;
 const PX: usize = 128;
 
 /// gemma4_unit's code and fixed data a PE past what [`unit_bytes`] counts,
-/// by image class: link probe 2026-11-05 (scratch/g12/lp/g12d: Gemma-4-12B,
+/// by image class: link probe 2026-11-05 (scratch/g12/lp/g12e, with the c_bc drains: Gemma-4-12B,
 /// grids 128 x 96 Hc 40, regions 128 x 240 RHc 16 RNL 2, NB 1, PS 16, WIN
-/// 1024, W4BUF 512, KVST 0): grid sliding 44,272 B, grid global 48,048,
-/// region SS 44,896, region GS 47,744; each constant makes its class exact
+/// 1024, W4BUF 512, KVST 0): grid sliding 44,416 B, grid global 47,120,
+/// region SS 43,920, region GS 46,720; each constant makes its class exact
 /// there. A unit with a global layer lays its lanes out at QhG heads and,
 /// mixed, carries the spread and both kinds' route words: more code.
-const CODE_GRID_S: usize = 24_258;
-const CODE_GRID_G: usize = 25_858;
-const CODE_REGION_S: usize = 25_946;
-const CODE_REGION_MIX: usize = 26_762;
+const CODE_GRID_S: usize = 24_402;
+const CODE_GRID_G: usize = 24_930;
+const CODE_REGION_S: usize = 24_970;
+const CODE_REGION_MIX: usize = 25_738;
 
 /// A placement: the grid and region kernels, the counts, the head's rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -545,10 +545,10 @@ mod tests {
             ic: 120,
         };
         for (k, glob, want) in [
-            (grid, vec![false], 44_272),
-            (grid, vec![true], 48_048),
-            (region, vec![false, false], 44_896),
-            (region, vec![true, false], 47_744),
+            (grid, vec![false], 44_416),
+            (grid, vec![true], 47_120),
+            (region, vec![false, false], 43_920),
+            (region, vec![true, false], 46_720),
         ] {
             assert_eq!(unit_bytes(k, &glob, &ks, 1, 16, 1), want, "{k:?} {glob:?}");
         }

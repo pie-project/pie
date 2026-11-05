@@ -261,7 +261,15 @@ fn put_route(addr: u16, bits: u32) void {
   const r = @get_config(addr, tgt.color_addr_range) & @get_int(tgt.fabric_io.CLEAR_MASK);
   @set_config(addr, r | @as(tgt.reg_type, bits), tgt.color_addr_range);
 }
+// A send completes when its wavelets enter output queue 7, not when they
+// leave it: a c_bc route rewritten right after a root's send would route its
+// last wavelets anew (simulator: "landing C9 from link R, but inputMask is W",
+// a group root's scores). Every c_bc route rewrite waits for the queue.
+fn bc_drain() void {
+  while ((tile_config.output_queue_status.get_raw() & 0x8000) == 0) {}   // queue 7 empty
+}
 fn set_axis(x: bool) void {
+  bc_drain();
   if (GY != 0) {
     GA = if (x) lgs else GYv;
     RA = ga() / 2;
@@ -462,8 +470,9 @@ fn allreduce_seg(buf: mem1d_dsd, n: u16) void {
     }
     return;
   }
+  bc_drain();
   put_route(caddr[4], rcfg[lgb]);   // c_bc: the group's broadcast for now
-  if (px % lgs == lgs / 2) { @fmovs(fout(q_bc_out, n), buf); }
+  if (px % lgs == lgs / 2) { @fmovs(fout(q_bc_out, n), buf); bc_drain(); }
   else { @fmovs(buf, fin(q_bc_in, n)); }
   put_route(caddr[4], rcfg[lrx + 4]);   // back to the X axis's broadcast
 }
