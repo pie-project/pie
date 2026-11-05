@@ -231,7 +231,13 @@ pub const RAN: &[Ran] = &[
                  mismatches only at the two known ties (225, 274); bare 1,494.1-1,495.1 and pie \
                  B 1 (the plan's `arf`, PIE_CEREBRAS_PAGE_ORDER) 1,422.0-1,434.9 = 95.1-96.0% of \
                  bare (0502), every pie stream one of the known three (= golden for 512, or off \
-                 it only at the 225 or 274 tie)",
+                 it only at the 225 or 274 tie); ARF 3 (+ the X full all-reduces, the plan's \
+                 `arfx`) + MEM 1 1,530.5 / 1,531.0 (0508, regions 43.45-43.57k a pass = 14.5k a \
+                 layer), mismatches only at the two known ties; the IEEE f16 build (F16 1) with \
+                 its probabilities kept finite 1,451.8 / 1,451.6 (0509, 0504's program + the \
+                 fix), ARF + F16 2 (f16-accumulating region matvecs) + MEM 1 1,565.5 / 1,565.6 \
+                 (0509, regions 42.2k a pass = 14.07k a layer), both greedy = golden for 512 and \
+                 0 teacher-forced mismatches",
     },
     Ran {
         design: Design::Serve8bRegion,
