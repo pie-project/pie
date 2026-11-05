@@ -1445,8 +1445,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             },
             f16cl: cfg.f16_clamp,
             xac: cfg.xac,
-            // (TRM: every bit but 2's first form; the grids' with their f16 accumulation)
-            trim: if cfg.trim { 123 | (usize::from(cfg.grid_levers && cfg.f16accg) << 2) } else { 0 },
+            // (TRM: every bit, the grids' with their f16 accumulation; 0533: TRM 479
+            // 1,903.1 / 1,902.5 tok/s and TRM 255 1,897.4 / 1,897.7, both = golden)
+            trim: if cfg.trim { 507 | (usize::from(cfg.grid_levers && cfg.f16accg) << 2) } else { 0 },
             ary: if cfg.ary16 { 16 } else { 0 },
             hvc: cfg.hvc,
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
@@ -2951,14 +2952,20 @@ mod llama31_8b {
         got.retain(|(k, _)| k != "KVST");
         got.sort();
         assert_eq!(got, super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1")));
-        // + trim + arfs + ary16 + hvc: TRM 127, ARF 7, ARY 16, HVC 1
-        (cfg.trim, cfg.arfs, cfg.ary16, cfg.hvc) = (true, true, true, true);
+        // + trim + ary16 + hvc: TRM 511, ARY 16, HVC 1 (0534's sp534_t14); + arfs: ARF 7
+        (cfg.trim, cfg.ary16, cfg.hvc) = (true, true, true);
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1,TRM:511,ARY:16,HVC:1")));
+        cfg.arfs = true;
         let (d, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
         let want7 = want.replace("ARF:3", "ARF:7");
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:127,ARY:16,HVC:1")));
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:511,ARY:16,HVC:1")));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         for (n, text) in d.files_with(lay.model.variant()).unwrap() {
             if n == "region_pe.csl" || n == "grid_pe.csl" {
