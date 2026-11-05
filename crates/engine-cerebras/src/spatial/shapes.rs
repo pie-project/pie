@@ -248,7 +248,9 @@ pub const RAN: &[Ran] = &[
                  bare 1,662.1-1,662.7 in 5 of 6 reps (0516; rep 1 1,304.5 with a 63.5 ms host \
                  gap), streams = golden for 512 x5 or off it only at the 274 tie x1; F16 3 with \
                  the probabilities' f16 copy scaled by a power of two (bf16's redo window, no \
-                 redos) 1,678.2 / 1,679.4 (0518, grids 18.8 / 18.4k), the same accuracy",
+                 redos) 1,678.2 / 1,679.4 (0518, grids 18.8 / 18.4k), the same accuracy; pie B 1 \
+                 on it (the plan's `f16accg` too) 1,585.2-1,602.3 = 94.4-95.5% of bare \
+                 1,677.5-1,678.9 (0519), every pie and bare stream = golden for 512",
     },
     Ran {
         design: Design::Serve8bRegion,
