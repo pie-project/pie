@@ -258,7 +258,9 @@ pub const RAN: &[Ran] = &[
                  99.6 ms host fire stall), every pie and bare stream = golden for 512; + the \
                  regions' f16 copy clamped with 0515's window (F16CL) 1,705.8 / 1,706.4 (0526, \
                  regions 39.20-39.37k a pass) and + XA on its own colours (XAC) 1,709.9 / \
-                 1,711.6 (0527, regions 39.10-39.26k), both = golden for 512, 0 mismatches",
+                 1,711.6 (0527, regions 39.10-39.26k), both = golden for 512, 0 mismatches; pie \
+                 B 1 on it (bundle x6: + `f16_clamp` + `xac`) 1,614.8-1,631.4 = 94.4-95.4% of bare \
+                 1,709.7-1,710.6 (0528), every pie and bare stream = golden for 512",
     },
     Ran {
         design: Design::Serve8bRegion,
