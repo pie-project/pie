@@ -95,6 +95,9 @@ pub struct Model {
     pub grid: usize,
     /// `F16CL` 1: the regions' f16 copy clamped, 0515's redo window (`Variant::f16cl`).
     pub f16cl: bool,
+    /// `XAC` 1 (with ARF 3, KVCP 0): the regions' XA all-reduces on their own
+    /// colours (`Variant::xac`).
+    pub xac: bool,
 }
 
 impl Model {
@@ -119,6 +122,7 @@ impl Model {
             op3: 0,
             grid: 0,
             f16cl: false,
+            xac: false,
         }
     }
 
@@ -149,6 +153,7 @@ impl Model {
             op3: u16::try_from(self.op3).unwrap_or(0),
             grid: u16::try_from(self.grid).unwrap_or(0),
             f16cl: self.f16cl,
+            xac: self.xac,
         }
     }
 }
@@ -738,6 +743,7 @@ impl ProgramSpec {
             "OP3" => Some(m.op3),
             "GRD" => Some(m.grid),
             "F16CL" => Some(usize::from(m.f16cl)),
+            "XAC" => Some(usize::from(m.xac)),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1372,6 +1378,7 @@ fn model(get: &Get) -> R<Model> {
         op3: get.opt("OP3").unwrap_or(0),
         grid: get.opt("GRD").unwrap_or(0),
         f16cl: get.opt("F16CL").unwrap_or(0) != 0,
+        xac: get.opt("XAC").unwrap_or(0) != 0,
     })
 }
 

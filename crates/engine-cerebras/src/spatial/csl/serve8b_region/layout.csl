@@ -85,6 +85,8 @@ param GRD: u16 = 0;
 param GPROF: u16 = 0;
 // F16CL 1: the regions' f16 copy clamped, 0515's redo window (codegen.rs `Variant::f16cl`; passed on to neither).
 param F16CL: u16 = 0;
+// XAC 1: the regions' XA all-reduces on their own colours 0, 1, 2, 15 (codegen.rs `Variant::xac`; passed on to neither).
+param XAC: u16 = 0;
 param NOLAYER: u16 = 0;    // 1 (checking the handoffs alone): the units skip their layers
 param VMX: u16 = 0;        // 1: a 5-column VM block east of the strip (VM5.md; then VMC 0)
 param VMREAL: u16 = 0;     // VMX: 1 Fork 3's eta VM (vm_pe.csl), 0 the stand-in (vm_stub.csl)

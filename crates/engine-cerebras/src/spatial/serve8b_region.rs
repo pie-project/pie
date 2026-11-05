@@ -1799,6 +1799,31 @@ mod tests {
         }
     }
 
+    /// XAC's colours (0, 1, 2, 15) and the park colour 16 route through no
+    /// region PE (codegen.rs `xac`), nor do the collectives' 5-10.
+    #[test]
+    fn xac_colours_are_free_on_regions() {
+        let p = "PX:128,PY:152,Hc:27,Dc:8,Gs:16,Ic:112,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:56,\
+        RNL:3,RGY:16,GY:8,RC:2,RR:5,NCOL:1,YD:624,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
+        PROF:0,TIME:1,HROUTE:1,ROT8:1,QKN:0,EPS:925353388,NOLAYER:0,HEADMODE:2,HH:864,Vr:150,Gx:4,Gy:24,\
+        vocab:128256,PASSES:3,MODE:2,OVL:0,VMC:1,CAP:128,iters:1,B:1,NP:1,SPD:1,LSE:1";
+        let lay = lay_of(p);
+        let Layers::Units { units: u, .. } = lay.layers else { panic!("not serve8b_region") };
+        let units = u.units(&lay);
+        let t = Tables::new(units.clone(), 1, u.rtr).unwrap();
+        for v in units.iter().filter(|v| v.kind == Kind::Region) {
+            for py in 0..v.k.py {
+                for px in 0..v.k.px {
+                    let e = &t.pe[&(v.x0 + px, v.y0 + py)];
+                    let mut cs: Vec<u32> = e.routes.keys().copied().collect();
+                    cs.extend(e.recv.iter().chain(&e.send).map(|r| r[0]));
+                    cs.extend([e.relay, e.fwd_in]);
+                    assert!(cs.iter().all(|c| ![0, 1, 2, 15, 16].contains(c) && !(5..=10).contains(c)), "{cs:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn lever_d_units_and_tables() {
         let p = "PX:128,PY:152,Hc:27,Dc:8,Gs:16,Ic:112,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:56,\

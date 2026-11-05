@@ -348,6 +348,11 @@ pub struct Variant {
     /// the redo window narrowed (0515's form) instead of scaled; grids keep
     /// the scaled copy.
     pub f16cl: bool,
+    /// `XAC` 1 (with ARF 3, regions only, KVCP 0): the XA all-reduces' (O,
+    /// down) level-1 / level-2 colours their own (0, 1, 2, 15), routed once at
+    /// init, so a switch to or from XA rebinds the queues and rewrites c_bc's
+    /// route alone.
+    pub xac: bool,
 }
 
 impl Variant {
@@ -609,6 +614,12 @@ impl Variant {
             }
             s = apply_reps("op3_ops", src::OP3_OPS, &s, tag)?;
         }
+        if self.xac && region {
+            if self.arf != 3 {
+                return Err(format!("gen: {tag}: XAC needs ARF 3"));
+            }
+            s = xac(&s, tag)?;
+        }
         if let Some(bits) = self.eps_bits {
             let eps = f32::from_bits(bits);
             if !(eps.is_finite() && eps > 0.0) {
@@ -659,6 +670,74 @@ pub fn gptoss_moe() -> R<String> {
         &s[b..],
         src::MOE_MXFP4
     ))
+}
+
+/// `XAC`'s patches on the region kernel (after ARF 3's): XA's level-1 and
+/// level-2 colours are its own (0, 1, 2, 15: no handoff routes them through a
+/// region PE, test `xac_colours_are_free_on_regions`), routed once at init, and
+/// arf_qv binds XA's queues to them; c_bc stays shared, so a switch to or from
+/// XA rewrites its route alone; the other shared colours' routes are rewritten
+/// only between Y and X seg.
+fn xac(text: &str, tag: &str) -> R<String> {
+    let what = |w: &str| format!("{tag}'s XAC {w}");
+    let mut s = patch(
+        text,
+        "const a_oq6 = tile_config.output_queue_config.get_output_queue_config_addr(6);\n",
+        "const a_oq6 = tile_config.output_queue_config.get_output_queue_config_addr(6);\n\
+         // (xac) XA's c_r1_0, c_r1_1, c_r2_0, c_r2_1 on their own colours, routed once (arf_setup).\n\
+         comptime { @comptime_assert(KVCP == 0 and HROUTE == 1); }\n\
+         const XAC_C = [4]u16 { 0, 1, 2, 15 };\n\
+         const xaddr = [4]u16 { @as(u16, color_config.get_color_config_addr(@get_color(0))),\n\
+         \x20 @as(u16, color_config.get_color_config_addr(@get_color(1))), @as(u16, color_config.get_color_config_addr(@get_color(2))),\n\
+         \x20 @as(u16, color_config.get_color_config_addr(@get_color(15))) };\n\
+         var rt_cur: u16 = 3;   // (xac) the shared colours' routes: 0 Y, 1 X seg, 3 none yet\n",
+        &what("colours"),
+    )?;
+    s = patch(
+        &s,
+        "fn arf_setup() void {\n  arf_qv(0, rcfg[2 * NCOL + 1]);\n  arf_qv(12, rcfg[3 * NCOL + 2]);   // (arx)\n}\n",
+        "fn arf_setup() void {\n  arf_qv(0, rcfg[2 * NCOL + 1]);\n  arf_qv(12, rcfg[3 * NCOL + 2]);   // (arx)\n\
+         \x20 var i: u16 = 0;   // (xac) XA's own colours' routes, once\n\
+         \x20 while (i < 4) : (i += 1) { put_route(xaddr[i], rcfg[2 * NCOL + 2 + i]); }\n}\n",
+        &what("setup"),
+    )?;
+    for (i, (k, c)) in [("c10", "c_r1_0"), ("c11", "c_r1_1"), ("c20", "c_r2_0"), ("c21", "c_r2_1")].into_iter().enumerate() {
+        s = patch(
+            &s,
+            &format!("  const {k}: u16 = @get_int({c});\n"),
+            &format!("  const {k}: u16 = if (o == 12) XAC_C[{i}] else @get_int({c});   // (xac)\n"),
+            &what(k),
+        )?;
+    }
+    s = patch(
+        &s,
+        "  hy_qv[6] = b_i3 | c10; hy_qv[7] = b_o4 | (c11 << 4); hy_qv[8] = b_i5 | c20;\n  hy_qv[9] = b_o6 | (c21 << 4); hy_qv[10] = b_i6 | c21; hy_qv[11] = b_i4 | c11;\n",
+        "  if (o == 0) {   // (xac) X seg's defaults: the shared colours\n\
+         \x20 hy_qv[6] = b_i3 | c10; hy_qv[7] = b_o4 | (c11 << 4); hy_qv[8] = b_i5 | c20;\n\
+         \x20 hy_qv[9] = b_o6 | (c21 << 4); hy_qv[10] = b_i6 | c21; hy_qv[11] = b_i4 | c11;\n  }\n",
+        &what("X seg defaults"),
+    )?;
+    s = patch(
+        &s,
+        "  if (axis_cur == want) { return; }\n  axis_cur = want;\n",
+        "  if (axis_cur == want) { return; }\n  const was_xa = axis_cur == 2;   // (xac)\n  axis_cur = want;\n",
+        &what("previous axis"),
+    )?;
+    s = patch(
+        &s,
+        "    var i: u16 = 0;\n    while (i < NCOL) : (i += 1) { put_route(caddr[i], rcfg[ar_off[want] + i]); }\n    return;\n",
+        "    // (xac) XA: c_bc's route alone; Y / X seg: all five when the set changes,\n\
+         \x20   // else c_bc's back from XA\n\
+         \x20   if (want != 2 and rt_cur != want) {\n\
+         \x20     rt_cur = want;\n\
+         \x20     var i: u16 = 0;\n\
+         \x20     while (i < NCOL) : (i += 1) { put_route(caddr[i], rcfg[ar_off[want] + i]); }\n\
+         \x20   } else if (want == 2 or was_xa) {\n\
+         \x20     put_route(caddr[4], rcfg[ar_off[want] + 4]);\n\
+         \x20   }\n    return;\n",
+        &what("switch"),
+    )?;
+    Ok(s)
 }
 
 /// `QKV1`'s patch on a paged8b unit kernel (grid or region): one QKV
