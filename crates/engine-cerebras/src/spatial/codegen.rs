@@ -365,8 +365,9 @@ pub struct Variant {
     /// instead of an f32 zero and its f16 copy, the gate/up rms scale applied
     /// to the one element a row's SiLU reads, the QKV rms scale as one
     /// multiply, RoPE without its copy; with MEM 3 also q's scale in one op,
-    /// `trm_qscl.json`); **2** x's sums of squares by one stride-0 accumulate
-    /// instead of a halving tree (`trm_ssq.json`; another summation order);
+    /// `trm_qscl.json`); **2** x's sums of squares by a scalar loop instead of
+    /// a halving tree (`trm_ssq.json`; another summation order; the first
+    /// form, a stride-0 accumulate, was wrong on hardware: 0530);
     /// **4** the grids take them too; **8** exp's polynomial at degree 4
     /// (near-minimax on |r| <= ln2/2, relative error 2.7e-6 against f16's 2.4e-4
     /// for the probabilities and SiLU's output) and SiLU's reciprocal in two

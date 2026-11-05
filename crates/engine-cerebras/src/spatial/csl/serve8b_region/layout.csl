@@ -88,8 +88,8 @@ param F16CL: u16 = 0;
 // XAC 1: the regions' XA all-reduces on their own colours 0, 1, 2, 15 (codegen.rs `Variant::xac`; passed on to neither).
 param XAC: u16 = 0;
 // TRM bits: 1 the regions' op cuts that keep every result (wmvh's f16 zero, the gate/up
-// scale in SiLU, one rms multiply, RoPE's copy), 2 also x's sum of squares by one
-// accumulate, 4 the grids too, 8 exp at degree 4 and SiLU's reciprocal in 2 Newton
+// scale in SiLU, one rms multiply, RoPE's copy), 2 also x's sum of squares by a
+// scalar loop, 4 the grids too, 8 exp at degree 4 and SiLU's reciprocal in 2 Newton
 // steps, 16 the O and down residuals and act taken from the all-reduces' receives
 // (codegen.rs `Variant::trim`; passed on to neither).
 param TRM: u16 = 0;

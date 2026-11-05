@@ -196,7 +196,7 @@ pub struct ServeConfig {
     pub xac: bool,
     /// With `qkv1`, `ops2` and `f16acc` (B 1): the units' op cuts (`TRM`,
     /// codegen's `Variant::trim`: 1 the exact cuts, 2 x's sums of squares by
-    /// one accumulate, 8 exp at degree 4; 4 the grids too with `f16accg`).
+    /// a scalar loop, 8 exp at degree 4; 4 the grids too with `f16accg`).
     pub trim: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
