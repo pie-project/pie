@@ -275,7 +275,9 @@ pub const RAN: &[Ran] = &[
                  TRM 511 + ARY 16 + HVC 1 1,908.7 / 1,908.2 (0534), golden for 512, 0 \
                  mismatches; pie B 1 on it (bundle x7: + `trim` + `ary16` + `hvc`) 1,820.6, \
                  1,824.0, 1,805.8, 1,820.5, 1,805.7 = 94.6-95.6% of bare (rep 1 1,455.6: the \
-                 host fire stall), every stream = golden for 512",
+                 host fire stall), every stream = golden for 512; + the segment all-reduce \
+                 as streamed halves with the kernels' ARF constant fixed (ARF 7) 1,927.8 / \
+                 1,927.2 (0535, regions 34.35-34.51k a pass), golden for 512, 0 mismatches",
     },
     Ran {
         design: Design::Serve8bRegion,
@@ -307,7 +309,8 @@ pub const RAN: &[Ran] = &[
                  (0531) with 13 teacher-forced mismatches, not 0529's 14 (9 differ): TRM's \
                  inexact bits (2: another summation order, 8: exp at degree 4) move Qwen's; \
                  the exact bits (TRM 245) + HVC 1 1,537.7 / 1,539.4 and + ARY 16 1,539.4 / \
-                 1,538.5 (0534), both with 0529's 14 mismatches exactly",
+                 1,538.5 (0534), both with 0529's 14 mismatches exactly; + ARF 7 1,564.0 / \
+                 1,563.6 (0535, regions 36.6-36.9k a pass), the same 14",
     },
 ];
 
