@@ -199,6 +199,7 @@ struct Params {
 #endif
 #if defined(PIE_TILED)
     int n_rows;
+    int first_tile;
 #endif
 #if defined(PIE_SPLIT)
     int splits;
@@ -263,7 +264,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint q_head = group.x;
     uint lane = local.x;
     uint slot_y = local.y;
-    uint row = group.y * uint(PIE_TILE_ROWS) + slot_y;
+    uint tile = group.y + uint(params.first_tile);
+    uint row = tile * uint(PIE_TILE_ROWS) + slot_y;
     bool live = row < uint(params.n_rows);
 
     int req = live ? req_of_token[row] : 0;
@@ -277,7 +279,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (lane == 0u && slot_y == 0u) {
         int last = -1;
         for (uint r = 0u; r < uint(PIE_TILE_ROWS); r++) {
-            uint at = group.y * uint(PIE_TILE_ROWS) + r;
+            uint at = tile * uint(PIE_TILE_ROWS) + r;
             if (at < uint(params.n_rows)) {
                 last = max(last, position_ids[at]);
             }

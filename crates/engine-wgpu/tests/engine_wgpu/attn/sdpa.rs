@@ -289,13 +289,19 @@ fn paged_attention_answers_the_reference() {
                             tile_lanes: lanes,
                             split_groups: 1024,
                             split_min_keys: MIN_KEYS,
+                            prefill_work: 0,
                         };
                         let lses: &[bool] = if matches!(form, Form::Selected) {
                             &[false]
                         } else {
                             &[false, true]
                         };
-                        for &with_lse in lses {
+                        let works = lses.iter().flat_map(|&lse| [(lse, 0), (lse, 1)]);
+                        for (with_lse, prefill_work) in works {
+                            let tactic = sdpa::Tactic {
+                                prefill_work,
+                                ..tactic
+                            };
                             let (o, l) = (gpu.zeros(n), gpu.up_f32(&vec![0.0; rows * QH]));
                             let lse = with_lse.then(|| t(l, rows, QH, Dtype::F32));
                             let ot = t(o, rows, QH * hd, Dtype::Bf16);

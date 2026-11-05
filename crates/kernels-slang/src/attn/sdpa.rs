@@ -45,6 +45,10 @@ pub struct Tactic {
     pub split_groups: u32,
     /// The fewest keys a split walks.
     pub split_min_keys: u32,
+    /// The rows a prefill dispatch holds, times the keys each may attend; a
+    /// fire past it takes more dispatches, each costing a few ms. 0 holds a
+    /// fire's rows in one dispatch.
+    pub prefill_work: u64,
 }
 
 /// The f32 planes a split decode lands its partials in: `part_out` a head
@@ -475,11 +479,26 @@ pub fn prefill(
     };
     let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?;
     args.push(stated(OP, shape.rows)?.arg());
-    ctx.fire(
-        Fire::at(SDPA, entry)
-            .tier(tier)
-            .groups([shape.q_heads, shape.rows.div_ceil(tile), 1])
-            .group([lanes, tile, 1]),
-        &args,
-    )
+    let tiles = shape.rows.div_ceil(tile);
+    let keys = u64::from(pool.page_indices.rows) * pool.page_size.max(1) as u64;
+    let keys = window
+        .map_or(keys, |window| keys.min(u64::from(window)))
+        .max(1);
+    let rows = match tactic.prefill_work {
+        0 => shape.rows,
+        work => (work / keys).min(u64::from(shape.rows)) as u32,
+    };
+    let step = (rows / tile).max(1);
+    for first in (0..tiles).step_by(step as usize) {
+        let mut args = args.clone();
+        args.push(stated(OP, first)?.arg());
+        ctx.fire(
+            Fire::at(SDPA, entry)
+                .tier(tier)
+                .groups([shape.q_heads, step.min(tiles - first), 1])
+                .group([lanes, tile, 1]),
+            &args,
+        )?;
+    }
+    Ok(())
 }
