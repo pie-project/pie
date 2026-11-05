@@ -378,7 +378,8 @@ pub struct Variant {
     /// Newton steps (1.2e-5; `trm_exp.json`); **16** the O and down residuals
     /// added by the all-reduce's own receive (O's redo flag moved to the
     /// front, so a redone pass adds nothing) and act received straight into
-    /// the down matvec's f16 x (`trm_fuse.json`, with ARF 3).
+    /// the down matvec's f16 x (`trm_fuse.json`, with ARF 3); **32** the
+    /// head's MODE 2 split_x as bf16(x) alone (`head_trim`).
     pub trim: u16,
 }
 
@@ -656,8 +657,8 @@ impl Variant {
             s = apply_reps("arfs_ops", src::ARFS_OPS, &s, tag)?;
         }
         if self.trim != 0 && (region || self.trim & 4 != 0) {
-            if self.trim & 1 == 0 || self.trim > 31 {
-                return Err(format!("gen: {tag}: TRM {} unknown (1 the cuts, 2 and the sums of squares, 4 the grids too, 8 exp at degree 4, 16 the residuals from the fabric)", self.trim));
+            if self.trim & 1 == 0 || self.trim > 63 {
+                return Err(format!("gen: {tag}: TRM {} unknown (1 the cuts, 2 and the sums of squares, 4 the grids too, 8 exp at degree 4, 16 the residuals from the fabric, 32 the head's split_x)", self.trim));
             }
             if self.trim & 16 != 0 && self.arf & 3 != 3 {
                 return Err(format!("gen: {tag}: TRM 16 needs ARF 3"));
@@ -2216,6 +2217,17 @@ fn softmax_s13_06b(text: &str, tag: &str) -> R<String> {
 /// A JSON list of {old, new} text pairs applied in order, each anchor found once.
 /// `F16`: the head's `bf16` type (legal only with `--fp16-format=bf16`) as
 /// `@fp16()`, IEEE f16 in an F16 build; comments untouched.
+/// `TRM` bit 32 on the head: MODE 2's split_x makes bf16(x) alone (one pass,
+/// no certify: the other two parts and |x - bf16(x)|^2 are never read).
+fn head_trim(text: &str) -> R<String> {
+    patch(
+        text,
+        "fn split_x() void {\n  const p0 = xp_dsd;\n",
+        "fn split_x() void {\n  const p0 = xp_dsd;\n  // (trm 32) one pass, no certify: bf16(x) alone (the other parts and rs are unread)\n  if (ONEPASS and !CERTIFY) { @fs2h(p0, xs_dsd); return; }\n",
+        "the head's split_x (TRM 32)",
+    )
+}
+
 fn f16_head(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 256);
     for line in text.split_inclusive('\n') {
@@ -3211,7 +3223,10 @@ fn serve8b_region_files(pipe: bool, grid: &str, region: &str, variant: Variant) 
             "region_pe.csl",
             s8br_unit("qwen2d_region", region, pipe, variant)?,
         ),
-        ("head_pe.csl", if variant.f16 != 0 { f16_head(&s8br_head(pipe)?) } else { s8br_head(pipe)? }),
+        ("head_pe.csl", {
+            let h = if variant.f16 != 0 { f16_head(&s8br_head(pipe)?) } else { s8br_head(pipe)? };
+            if variant.trim & 32 != 0 { head_trim(&h)? } else { h }
+        }),
         (
             "embed_pe.csl",
             s8br_plain(embed, "embed_base.csl", "the embedding strip", pipe),
