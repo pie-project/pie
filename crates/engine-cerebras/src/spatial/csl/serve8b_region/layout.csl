@@ -95,6 +95,8 @@ param XAC: u16 = 0;
 param TRM: u16 = 0;
 // ARY: rows a group of the ARF Y all-reduces (the host's route words; 0: 8; passed on to neither).
 param ARY: u16 = 0;
+// HVC 1: vertical handoffs send row py down column (PX - PY) / 2 + py (the host's tables; passed on to neither).
+param HVC: u16 = 0;
 param NOLAYER: u16 = 0;    // 1 (checking the handoffs alone): the units skip their layers
 param VMX: u16 = 0;        // 1: a 5-column VM block east of the strip (VM5.md; then VMC 0)
 param VMREAL: u16 = 0;     // VMX: 1 Fork 3's eta VM (vm_pe.csl), 0 the stand-in (vm_stub.csl)

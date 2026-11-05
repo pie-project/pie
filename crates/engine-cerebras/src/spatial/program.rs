@@ -103,6 +103,8 @@ pub struct Model {
     /// `ARY`: rows a group of the ARF Y all-reduces' streamed halves (the
     /// host's route words; 0: 8).
     pub ary: usize,
+    /// `HVC` 1: vertical handoffs on centred columns (the host's tables).
+    pub hvc: bool,
 }
 
 impl Model {
@@ -130,6 +132,7 @@ impl Model {
             xac: false,
             trim: 0,
             ary: 0,
+            hvc: false,
         }
     }
 
@@ -754,6 +757,7 @@ impl ProgramSpec {
             "XAC" => Some(usize::from(m.xac)),
             "TRM" => Some(m.trim),
             "ARY" => Some(m.ary),
+            "HVC" => Some(usize::from(m.hvc)),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1391,6 +1395,7 @@ fn model(get: &Get) -> R<Model> {
         xac: get.opt("XAC").unwrap_or(0) != 0,
         trim: get.opt("TRM").unwrap_or(0),
         ary: get.opt("ARY").unwrap_or(0),
+        hvc: get.opt("HVC").unwrap_or(0) != 0,
     })
 }
 

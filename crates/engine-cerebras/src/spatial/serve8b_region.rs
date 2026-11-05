@@ -252,6 +252,10 @@ pub struct Tables {
     /// serve8b_region_pipe's ring: the last unit's x to the head carries
     /// the micro-batch word (`nsend` bit 8).
     pub pipe: bool,
+    /// `HVC` 1: a vertical handoff sends row py down column (PX - PY) / 2 + py
+    /// (rows centred on the unit's columns) instead of column py, so the
+    /// next unit's row multicast reaches its far column sooner.
+    centred: bool,
 }
 
 fn step(d: u32) -> (isize, isize) {
@@ -277,7 +281,13 @@ pub(crate) type Piece = (usize, u32, u32, u32);
 
 impl Tables {
     pub fn new(units: Vec<Unit>, lanes: usize, rtr: usize) -> R<Tables> {
+        Tables::new_with(units, lanes, rtr, false)
+    }
+
+    /// [`Tables::new`], `centred`: `HVC`'s vertical handoff columns.
+    pub fn new_with(units: Vec<Unit>, lanes: usize, rtr: usize, centred: bool) -> R<Tables> {
         let mut t = Tables::empty(units, lanes, rtr);
+        t.centred = centred;
         t.build()?;
         Ok(t)
     }
@@ -306,6 +316,7 @@ impl Tables {
             rti: RT_I,
             pe,
             pipe: false,
+            centred: false,
         }
     }
 
@@ -481,8 +492,10 @@ impl Tables {
                 self.recv_row(b, py, r, None)?;
             }
         } else if same && a.x0 == b.x0 && a.y0.abs_diff(b.y0) == ak.py {
+            // (HVC: the rows' columns centred when the unit is wider than tall)
+            let c0 = if self.centred && ak.px >= ak.py { (ak.px - ak.py) / 2 } else { 0 };
             for py in 0..ak.py {
-                let c = a.x0 + py % ak.px;
+                let c = a.x0 + (c0 + py) % ak.px;
                 let cv = C_V[b.idx % 2][usize::from(py >= ak.px)];
                 self.leg(cv, &[(c, a.y0 + py), (c, b.y0 + py)])?;
                 self.send(c, a.y0 + py, cv, 0, ak.hc as u32)?;
@@ -1014,7 +1027,7 @@ pub fn put_routes(
             dev.put("rcfg", rect(v.x0, v.y0, v.k.px, v.k.py), n, &words)?;
         }
     }
-    let mut tables = Tables::new(units.clone(), lay.paged().map_or(1, |s| s.lanes), u.rtr)?;
+    let mut tables = Tables::new_with(units.clone(), lay.paged().map_or(1, |s| s.lanes), u.rtr, lay.model.hvc)?;
     tables.pipe = lay.mmax().is_some();
     for v in &units {
         dev.put16(
@@ -1898,6 +1911,16 @@ mod tests {
         for v in &units {
             assert_eq!(t.table(v).unwrap().len(), v.k.px * v.k.py * t.rtn());
         }
+        // (HVC: the vertical handoffs on centred columns build too, every route
+        // conflict-free, and differ from the default only there)
+        let tc = Tables::new_with(units.clone(), 1, u.rtr, true).unwrap();
+        let mut changed = 0;
+        for v in &units {
+            let (a, b) = (t.table(v).unwrap(), tc.table(v).unwrap());
+            assert_eq!(a.len(), b.len());
+            changed += usize::from(a != b);
+        }
+        assert!(changed >= 5, "{changed} units' tables changed");
         let bad = p.replace("YD:624", "YD:432");
         assert!(
             ProgramSpec::of_pairs(
