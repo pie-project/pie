@@ -237,7 +237,11 @@ pub const RAN: &[Ran] = &[
                  its probabilities kept finite 1,451.8 / 1,451.6 (0509, 0504's program + the \
                  fix), ARF + F16 2 (f16-accumulating region matvecs) + MEM 1 1,565.5 / 1,565.6 \
                  (0509, regions 42.2k a pass = 14.07k a layer), both greedy = golden for 512 and \
-                 0 teacher-forced mismatches",
+                 0 teacher-forced mismatches; ARF 3 + MEM 3 + OP3 (RoPE's tables once a pass, the \
+                 plan's `op3`) 1,594.2 / 1,594.7 (0510, regions 41.48k a pass = 13.83k a layer), \
+                 mismatches only at the two ties; with F16 2 (the plan's `f16acc`) 1,663.3 / \
+                 1,662.9 (0511, regions 39.35k a pass = 13.12k a layer, token 467.5k cycles), \
+                 greedy = golden for 512, 0 teacher-forced mismatches",
     },
     Ran {
         design: Design::Serve8bRegion,
