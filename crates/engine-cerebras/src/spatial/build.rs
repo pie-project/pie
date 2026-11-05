@@ -204,6 +204,9 @@ pub struct ServeConfig {
     /// With `arf`: the ARF Y streamed halves in groups of 16 rows (`ARY` 16;
     /// the host's route words).
     pub ary16: bool,
+    /// serve8b_region(_pipe): vertical handoffs on centred columns (`HVC` 1;
+    /// the host's tables).
+    pub hvc: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -248,6 +251,7 @@ impl ServeConfig {
             trim: false,
             arfs: false,
             ary16: false,
+            hvc: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -332,6 +336,7 @@ impl ServeConfig {
             "trim",
             "arfs",
             "ary16",
+            "hvc",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -439,6 +444,7 @@ impl ServeConfig {
             trim: flag(t, "trim")?,
             arfs: flag(t, "arfs")?,
             ary16: flag(t, "ary16")?,
+            hvc: flag(t, "hvc")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -1442,6 +1448,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             // (TRM: every bit but 2's first form; the grids' with their f16 accumulation)
             trim: if cfg.trim { 123 | (usize::from(cfg.grid_levers && cfg.f16accg) << 2) } else { 0 },
             ary: if cfg.ary16 { 16 } else { 0 },
+            hvc: cfg.hvc,
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1532,6 +1539,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.ary16 {
         st.push(Typed("ARY"));
+    }
+    if cfg.hvc {
+        st.push(Typed("HVC"));
     }
     if cfg.lever_d {
         st.push(Typed("YD"));
@@ -2941,14 +2951,14 @@ mod llama31_8b {
         got.retain(|(k, _)| k != "KVST");
         got.sort();
         assert_eq!(got, super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1")));
-        // + trim + arfs + ary16: TRM 127, ARF 7, ARY 16
-        (cfg.trim, cfg.arfs, cfg.ary16) = (true, true, true);
+        // + trim + arfs + ary16 + hvc: TRM 127, ARF 7, ARY 16, HVC 1
+        (cfg.trim, cfg.arfs, cfg.ary16, cfg.hvc) = (true, true, true, true);
         let (d, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
         let want7 = want.replace("ARF:3", "ARF:7");
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:127,ARY:16")));
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:127,ARY:16,HVC:1")));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         for (n, text) in d.files_with(lay.model.variant()).unwrap() {
             if n == "region_pe.csl" || n == "grid_pe.csl" {
