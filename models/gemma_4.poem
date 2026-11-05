@@ -125,8 +125,8 @@ def e4b(layers):
 E2B = trunk(hidden = 1536, layers = 35, q_heads = 8, kv_heads = 1, global_kv_heads = 1, inter = 6144,
             window = 512, shared_tail = 20, ple_dim = 256, full_every = 5, wide_tail = True)
 
-def a4b(experts):
-    return trunk(hidden = 2816, layers = 30, q_heads = 16, kv_heads = 8, global_kv_heads = 2, inter = 2112,
+def a4b(experts, layers = 30):
+    return trunk(hidden = 2816, layers = layers, q_heads = 16, kv_heads = 8, global_kv_heads = 2, inter = 2112,
                  window = 1024, moe = struct(experts = experts, top_k = 8, inter = 704))
 
 A4B = a4b(128)
@@ -220,8 +220,8 @@ def layout(id, deploy):
         d = g31b(deploy.layers)
     if id == "gemma4-12b" and deploy.layers:
         d = g12b(deploy.layers)
-    if id.startswith("gemma4-26b-a4b") and deploy.experts:
-        d = a4b(deploy.experts)
+    if id.startswith("gemma4-26b-a4b") and (deploy.experts or deploy.layers):
+        d = a4b(deploy.experts or d.moe.experts, deploy.layers or d.layers)
     weights = deploy.weights
     drafter = deploy.drafter
     vision = "vision" in deploy.parts
