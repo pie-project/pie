@@ -1424,12 +1424,7 @@ fn serve_g4(get: &Get) -> R<ProgramSpec> {
     };
     let spec = ProgramSpec {
         design: Design::ServeG4,
-        model: Model {
-            hidden: p * hc,
-            qh: get.req("Qh")?,
-            vocab: get.req("vocab")?,
-            cap: get.req("CAP")?,
-        },
+        model: Model::dims(p * hc, get.req("Qh")?, get.req("vocab")?, get.req("CAP")?),
         layers: Layers::Grids {
             grid,
             gw,

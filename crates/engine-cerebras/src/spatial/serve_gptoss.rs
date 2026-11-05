@@ -928,7 +928,7 @@ mod tests {
         let mut dev = rec.clone();
         let w = Weights {
             ckpt: &ckpt,
-            rope_theta: 0.0,
+            rope: &crate::spatial::wafer::Rotary::theta(0.0),
         };
         for c in spec.components() {
             c.routes(&spec, &mut dev).expect("routes");
