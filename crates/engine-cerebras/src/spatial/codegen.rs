@@ -328,7 +328,7 @@ pub struct Variant {
     /// `F16` > 0: an IEEE f16 build (the program compiles without
     /// `--fp16-format=bf16`): KV stored as f16 (both units), the head's
     /// `bf16` type as `@fp16()`; 2: also the regions' weight matvecs
-    /// accumulating in f16 (`f16acc_ops.json`). 0: bf16.
+    /// accumulating in f16 (`f16acc_ops.json`); 3: the grids' too. 0: bf16.
     pub f16: u16,
     /// `MEM` 1 (with `arf`, regions only): the region kernel's code cuts
     /// that keep every op and cost no cycles (`mem_ops.json`): ~0.5 KB a PE
@@ -433,8 +433,8 @@ impl Variant {
             }
         }
         if self.f16 != 0 {
-            if self.f16 > 2 {
-                return Err(format!("gen: {tag}: F16 {} unknown (1 f16, 2 f16 accumulation)", self.f16));
+            if self.f16 > 3 {
+                return Err(format!("gen: {tag}: F16 {} unknown (1 f16, 2 f16 accumulation in the regions, 3 and the grids)", self.f16));
             }
             if !self.ops2 {
                 return Err(format!("gen: {tag}: F16 needs OP2"));
@@ -491,7 +491,8 @@ impl Variant {
             ] {
                 s = patch(&s, old, new, &format!("{tag}'s F16 range"))?;
             }
-            if self.f16 == 2 && tag.starts_with("qwen2d_region/") {
+            // (F16 3: the grids' matvecs too; the same anchors in their kernel)
+            if (self.f16 == 2 && tag.starts_with("qwen2d_region/")) || self.f16 == 3 {
                 s = apply_reps("f16acc_ops", src::F16ACC_OPS, &s, tag)?;
             }
         }

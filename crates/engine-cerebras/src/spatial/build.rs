@@ -177,6 +177,8 @@ pub struct ServeConfig {
     /// `f16acc` also the regions' f16-accumulating matvecs (`F16` 2).
     pub f16: bool,
     pub f16acc: bool,
+    /// With `f16acc`: the grids' weight matvecs accumulate in f16 too (`F16` 3).
+    pub f16accg: bool,
     /// serve8b_region(_pipe), with `arf`: the region kernel's bit-exact code
     /// cuts (`MEM` 1, codegen's `Variant::mem`).
     pub mem: bool,
@@ -218,6 +220,7 @@ impl ServeConfig {
             arfx: false,
             f16: false,
             f16acc: false,
+            f16accg: false,
             mem: false,
             op3: false,
             head_one_pass: false,
@@ -295,6 +298,7 @@ impl ServeConfig {
             "arfx",
             "f16",
             "f16acc",
+            "f16accg",
             "mem",
             "op3",
             "head_one_pass",
@@ -395,6 +399,7 @@ impl ServeConfig {
             arfx: flag(t, "arfx")?,
             f16: flag(t, "f16")?,
             f16acc: flag(t, "f16acc")?,
+            f16accg: flag(t, "f16accg")?,
             mem: flag(t, "mem")?,
             op3: flag(t, "op3")?,
             head_one_pass: flag(t, "head_one_pass")?,
@@ -1041,6 +1046,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if (cfg.arf || cfg.f16 || cfg.f16acc) && !cfg.ops2 {
         return Err("serve8b_region's `arf` / `f16` / `f16acc` need `ops2`".into());
     }
+    if cfg.f16accg && !cfg.f16acc {
+        return Err("serve8b_region's grid f16 accumulation (`f16accg`) needs `f16acc`".into());
+    }
     if cfg.arfx && !cfg.arf {
         return Err("serve8b_region's X all-reduces (`arfx`) need `arf`".into());
     }
@@ -1364,7 +1372,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             ops2: cfg.ops2,
             qkv1: cfg.qkv1,
             arf: if cfg.arfx { 3 } else { usize::from(cfg.arf) },
-            f16: if cfg.f16acc { 2 } else { usize::from(cfg.f16) },
+            f16: if cfg.f16accg { 3 } else if cfg.f16acc { 2 } else { usize::from(cfg.f16) },
             // (MEM 3 where the q/k norm is the identity: q's scale a constant)
             mem: if cfg.mem { if plan.spec.qk_norm { 1 } else { 3 } } else { 0 },
             op3: usize::from(cfg.op3),
