@@ -261,7 +261,9 @@ pub const RAN: &[Ran] = &[
                  ar:208:16, host only) 1,244.6 (0489, regions 45.5-45.9k a pass), the same 14 \
                  mismatches, rep 0 = 0486 rep 1 for 160; with ARF 1 (no RGX) 1,260.3 / 1,261.1 \
                  (0500, regions 45.0-45.1k a pass), the same 14 mismatches (token, got, want, \
-                 margin to 4 places)",
+                 margin to 4 places); ARF 3 + MEM 1 + OP3 1,337.6 / 1,337.9 (0512, regions \
+                 41.5-41.7k a pass = 13.9k a layer) and with F16 2 1,360.9 / 1,359.4 (0512, \
+                 regions 40.0-43.7k a pass), both the same 14 mismatches",
     },
 ];
 
