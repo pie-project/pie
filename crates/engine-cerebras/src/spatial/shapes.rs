@@ -228,7 +228,10 @@ pub const RAN: &[Ran] = &[
                  all-reduces as streamed halves with FIFO dual-input merges, host routes) \
                  1,494.1 / 1,494.8 (0497, regions 44.59-44.75k a pass = 14.9k a layer; \
                  same-session control 0496 1,461.1-1,461.7, 45.66k), teacher-forced \
-                 mismatches only at the two known ties (225, 274)",
+                 mismatches only at the two known ties (225, 274); bare 1,494.1-1,495.1 and pie \
+                 B 1 (the plan's `arf`, PIE_CEREBRAS_PAGE_ORDER) 1,422.0-1,434.9 = 95.1-96.0% of \
+                 bare (0502), every pie stream one of the known three (= golden for 512, or off \
+                 it only at the 225 or 274 tie)",
     },
     Ran {
         design: Design::Serve8bRegion,
@@ -246,7 +249,9 @@ pub const RAN: &[Ran] = &[
                  1,234.8 (0486), the same 14 mismatches, both streams equal to 0483's for 160; \
                  the same program with the pages on the rows by all-reduce slack (page order \
                  ar:208:16, host only) 1,244.6 (0489, regions 45.5-45.9k a pass), the same 14 \
-                 mismatches, rep 0 = 0486 rep 1 for 160",
+                 mismatches, rep 0 = 0486 rep 1 for 160; with ARF 1 (no RGX) 1,260.3 / 1,261.1 \
+                 (0500, regions 45.0-45.1k a pass), the same 14 mismatches (token, got, want, \
+                 margin to 4 places)",
     },
 ];
 
