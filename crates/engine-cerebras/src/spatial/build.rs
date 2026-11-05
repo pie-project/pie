@@ -180,6 +180,9 @@ pub struct ServeConfig {
     /// serve8b_region(_pipe), with `arf`: the region kernel's bit-exact code
     /// cuts (`MEM` 1, codegen's `Variant::mem`).
     pub mem: bool,
+    /// serve8b_region(_pipe), with `ops2`: the regions' RoPE tables once a
+    /// pass (`OP3` 1, codegen's `Variant::op3`).
+    pub op3: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -216,6 +219,7 @@ impl ServeConfig {
             f16: false,
             f16acc: false,
             mem: false,
+            op3: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -292,6 +296,7 @@ impl ServeConfig {
             "f16",
             "f16acc",
             "mem",
+            "op3",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -391,6 +396,7 @@ impl ServeConfig {
             f16: flag(t, "f16")?,
             f16acc: flag(t, "f16acc")?,
             mem: flag(t, "mem")?,
+            op3: flag(t, "op3")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -1038,6 +1044,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if cfg.arfx && !cfg.arf {
         return Err("serve8b_region's X all-reduces (`arfx`) need `arf`".into());
     }
+    if cfg.op3 && !cfg.ops2 {
+        return Err("serve8b_region's `op3` needs `ops2`".into());
+    }
     if cfg.mem && !cfg.arf {
         return Err("serve8b_region's code cuts (`mem`) need `arf`".into());
     }
@@ -1357,6 +1366,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             arf: if cfg.arfx { 3 } else { usize::from(cfg.arf) },
             f16: if cfg.f16acc { 2 } else { usize::from(cfg.f16) },
             mem: usize::from(cfg.mem),
+            op3: usize::from(cfg.op3),
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1429,6 +1439,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.mem {
         st.push(Typed("MEM"));
+    }
+    if cfg.op3 {
+        st.push(Typed("OP3"));
     }
     if cfg.lever_d {
         st.push(Typed("YD"));
@@ -3018,11 +3031,13 @@ mod llama31_8b {
         cfg.arfx = true;
         cfg.f16acc = true;
         cfg.mem = true;
+        cfg.op3 = true;
         let (d, p) = params(&plan, &cfg).unwrap();
         let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
         assert_eq!(get("ARF").as_deref(), Some("3"));
         assert_eq!(get("F16").as_deref(), Some("2"));
         assert_eq!(get("MEM").as_deref(), Some("1"));
+        assert_eq!(get("OP3").as_deref(), Some("1"));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         assert_eq!((lay.model.arf, lay.model.f16, lay.model.mem), (3, 2, 1));
         let base = d
@@ -3030,6 +3045,7 @@ mod llama31_8b {
                 arf: 0,
                 f16: 0,
                 mem: 0,
+                op3: 0,
                 ..lay.model.variant()
             })
             .unwrap();
@@ -3042,6 +3058,7 @@ mod llama31_8b {
                     assert!(b.contains("@as(@fp16(), @bitcast(f32, u))"), "{n}");
                     assert!(b.contains("const R2X: u16 =") && b.contains("prof[slot] += lo - t_lo;"), "{n}");
                     assert!(b.contains("fn axis_xa()") && b.contains("3 * NCOL + 3"), "{n}");
+                    assert!(b.contains("rope_tab();   // (op3)"), "{n}");
                 }
                 "grid_pe.csl" => {
                     assert!(!b.contains("fn arf_ar(") && !b.contains("fn wmvh("), "{n}");

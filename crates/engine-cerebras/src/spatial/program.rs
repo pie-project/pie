@@ -89,6 +89,8 @@ pub struct Model {
     pub f16: usize,
     /// `MEM`: the region kernel's code cuts (`Variant::mem`; 0 off).
     pub mem: usize,
+    /// `OP3`: the regions' third op cuts (`Variant::op3`; 0 off).
+    pub op3: usize,
 }
 
 impl Model {
@@ -110,6 +112,7 @@ impl Model {
             arf: 0,
             f16: 0,
             mem: 0,
+            op3: 0,
         }
     }
 
@@ -137,6 +140,7 @@ impl Model {
             arf: u16::try_from(self.arf).unwrap_or(0),
             f16: u16::try_from(self.f16).unwrap_or(0),
             mem: u16::try_from(self.mem).unwrap_or(0),
+            op3: u16::try_from(self.op3).unwrap_or(0),
         }
     }
 }
@@ -723,6 +727,7 @@ impl ProgramSpec {
             "ARF" => Some(m.arf),
             "F16" => Some(m.f16),
             "MEM" => Some(m.mem),
+            "OP3" => Some(m.op3),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1354,6 +1359,7 @@ fn model(get: &Get) -> R<Model> {
         arf: get.opt("ARF").unwrap_or(0),
         f16: get.opt("F16").unwrap_or(0),
         mem: get.opt("MEM").unwrap_or(0),
+        op3: get.opt("OP3").unwrap_or(0),
     })
 }
 

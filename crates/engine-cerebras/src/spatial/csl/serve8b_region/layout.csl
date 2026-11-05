@@ -77,6 +77,8 @@ param ARF: u16 = 0;
 param F16: u16 = 0;
 // MEM 1 (with ARF): the regions' code cuts (codegen.rs `Variant::mem`; passed on to neither).
 param MEM: u16 = 0;
+// OP3 1 (with OP2): the regions' RoPE tables once a pass (codegen.rs `Variant::op3`; passed on to neither).
+param OP3: u16 = 0;
 param NOLAYER: u16 = 0;    // 1 (checking the handoffs alone): the units skip their layers
 param VMX: u16 = 0;        // 1: a 5-column VM block east of the strip (VM5.md; then VMC 0)
 param VMREAL: u16 = 0;     // VMX: 1 Fork 3's eta VM (vm_pe.csl), 0 the stand-in (vm_stub.csl)
