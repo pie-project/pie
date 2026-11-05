@@ -98,6 +98,11 @@ pub struct Model {
     /// `XAC` 1 (with ARF 3, KVCP 0): the regions' XA all-reduces on their own
     /// colours (`Variant::xac`).
     pub xac: bool,
+    /// `TRM` bits: the units' op cuts (`Variant::trim`; 0 off).
+    pub trim: usize,
+    /// `ARY`: rows a group of the ARF Y all-reduces' streamed halves (the
+    /// host's route words; 0: 8).
+    pub ary: usize,
 }
 
 impl Model {
@@ -123,6 +128,8 @@ impl Model {
             grid: 0,
             f16cl: false,
             xac: false,
+            trim: 0,
+            ary: 0,
         }
     }
 
@@ -154,6 +161,7 @@ impl Model {
             grid: u16::try_from(self.grid).unwrap_or(0),
             f16cl: self.f16cl,
             xac: self.xac,
+            trim: u16::try_from(self.trim).unwrap_or(0),
         }
     }
 }
@@ -744,6 +752,8 @@ impl ProgramSpec {
             "GRD" => Some(m.grid),
             "F16CL" => Some(usize::from(m.f16cl)),
             "XAC" => Some(usize::from(m.xac)),
+            "TRM" => Some(m.trim),
+            "ARY" => Some(m.ary),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1379,6 +1389,8 @@ fn model(get: &Get) -> R<Model> {
         grid: get.opt("GRD").unwrap_or(0),
         f16cl: get.opt("F16CL").unwrap_or(0) != 0,
         xac: get.opt("XAC").unwrap_or(0) != 0,
+        trim: get.opt("TRM").unwrap_or(0),
+        ary: get.opt("ARY").unwrap_or(0),
     })
 }
 

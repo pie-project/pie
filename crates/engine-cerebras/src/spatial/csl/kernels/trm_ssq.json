@@ -1,0 +1,6 @@
+[
+ {
+  "old": "fn x_ssq(dst: mem1d_dsd) void {\n  @fmuls(sqx_t(), x_all, x_all);\n  halve(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{B * Hc} -> s[i] }), Hc, B, false);\n  @fmovs(dst, sqx_b);\n}\n",
+  "new": "fn x_ssq(dst: mem1d_dsd) void {\n  // (trm 2) B 1: the squares summed into dst by one stride-0 accumulate\n  @fmuls(sqx_t(), x_all, x_all);\n  @fmovs(dst, 0.0);\n  const acc = @set_dsd_length(@set_dsd_stride(dst, 0), Hc);\n  @fadds(acc, acc, @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> s[i] }));\n}\n"
+ }
+]

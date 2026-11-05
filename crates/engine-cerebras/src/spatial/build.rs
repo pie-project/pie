@@ -194,6 +194,10 @@ pub struct ServeConfig {
     /// With `arfx`: the regions' XA all-reduces on their own colours (`XAC` 1,
     /// codegen's `Variant::xac`).
     pub xac: bool,
+    /// With `qkv1`, `ops2` and `f16acc` (B 1): the units' op cuts (`TRM`,
+    /// codegen's `Variant::trim`: 1 the exact cuts, 2 x's sums of squares by
+    /// one accumulate, 8 exp at degree 4; 4 the grids too with `f16accg`).
+    pub trim: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -235,6 +239,7 @@ impl ServeConfig {
             grid_levers: false,
             f16_clamp: false,
             xac: false,
+            trim: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -316,6 +321,7 @@ impl ServeConfig {
             "grid_levers",
             "f16_clamp",
             "xac",
+            "trim",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -420,6 +426,7 @@ impl ServeConfig {
             grid_levers: flag(t, "grid_levers")?,
             f16_clamp: flag(t, "f16_clamp")?,
             xac: flag(t, "xac")?,
+            trim: flag(t, "trim")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -1085,6 +1092,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if cfg.xac && !cfg.arfx {
         return Err("serve8b_region's `xac` needs `arfx`".into());
     }
+    if cfg.trim && !(cfg.qkv1 && cfg.ops2 && cfg.f16acc) {
+        return Err("serve8b_region's `trim` needs `qkv1`, `ops2` and `f16acc`".into());
+    }
     if cfg.hv && !cfg.lse {
         return Err("serve8b_region's HV (`hv`) needs `lse` (and `speed`)".into());
     }
@@ -1411,6 +1421,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             },
             f16cl: cfg.f16_clamp,
             xac: cfg.xac,
+            trim: if cfg.trim { 11 | (usize::from(cfg.grid_levers && cfg.f16accg) << 2) } else { 0 },
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1495,6 +1506,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.xac {
         st.push(Typed("XAC"));
+    }
+    if cfg.trim {
+        st.push(Typed("TRM"));
     }
     if cfg.lever_d {
         st.push(Typed("YD"));
@@ -2904,6 +2918,20 @@ mod llama31_8b {
         got.retain(|(k, _)| k != "KVST");
         got.sort();
         assert_eq!(got, super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1")));
+        // + trim: 0531's sp531_t4 (TRM 15: the cuts in both units)
+        cfg.trim = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1,TRM:15")));
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        for (n, text) in d.files_with(lay.model.variant()).unwrap() {
+            if n == "region_pe.csl" || n == "grid_pe.csl" {
+                assert!(text.contains("(trm) y starts at 0") && text.contains("(trm 2)") && text.contains("(trm 8)"), "{n}");
+                assert!(text.contains("(trm) both halves' q heads in one op"), "{n}");
+            }
+        }
     }
 
     /// `ops2` on 0472's config states 0480's program: the same parameters

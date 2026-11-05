@@ -992,8 +992,10 @@ pub fn put_routes(
                 return Err("ARF with RGX: not built".into());
             }
             let argx = if lay.model.arf & 2 != 0 { 16 } else { 0 };
+            // (ARY: the Y groups' rows, 8 by default; 0495: 16 is ~15 cycles faster at 208 rows)
+            let ary = if lay.model.ary > 0 { lay.model.ary } else { 8 };
             let (words, n) = if arf {
-                (route_words_arf(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), 8, argx), if argx > 0 { 18 } else { 12 })
+                (route_words_arf(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), ary, argx), if argx > 0 { 18 } else { 12 })
             } else {
                 (route_words_gx(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), gx), if gx > 0 { 17 } else { 11 })
             };
@@ -1680,13 +1682,14 @@ mod tests {
     #[test]
     fn arf_route_words_reduce_every_row_once() {
         let rb: Vec<u32> = (0..10).map(|i| 1u32 << i).collect();
-        for argx in [0, 16] {
+        // (ARY: Y groups of 8 or 16 rows)
+        for (argx, ary) in [(0, 8), (16, 8), (16, 16)] {
             for (py_n, px_n) in [(208, 2), (24, 1), (17, 1), (9, 1), (3, 1), (5, 256), (4, 33), (3, 17), (3, 3), (152, 128)] {
                 if argx == 0 && px_n > 2 {
                     continue;
                 }
                 let st = if argx > 0 { 18 } else { 12 };
-                let w = route_words_arf(&rb, px_n, py_n, 32.min(px_n.next_power_of_two()), 16.min(py_n.next_power_of_two()), 8, argx);
+                let w = route_words_arf(&rb, px_n, py_n, 32.min(px_n.next_power_of_two()), 16.min(py_n.next_power_of_two()), ary, argx);
                 let base = route_words(&rb, px_n, py_n, 32.min(px_n.next_power_of_two()), 16.min(py_n.next_power_of_two()));
                 assert_eq!(w.len(), px_n * py_n * st);
                 for pe in 0..px_n * py_n {
