@@ -246,7 +246,9 @@ pub const RAN: &[Ran] = &[
                  18.96k / 20.84k a pass), the same accuracy; pie B 1 on the F16 2 program \
                  (the plan's `arfx` + `mem` + `op3` + `f16acc`) 1,555.3-1,586.2 = 93.6-95.4% of \
                  bare 1,662.1-1,662.7 in 5 of 6 reps (0516; rep 1 1,304.5 with a 63.5 ms host \
-                 gap), streams = golden for 512 x5 or off it only at the 274 tie x1",
+                 gap), streams = golden for 512 x5 or off it only at the 274 tie x1; F16 3 with \
+                 the probabilities' f16 copy scaled by a power of two (bf16's redo window, no \
+                 redos) 1,678.2 / 1,679.4 (0518, grids 18.8 / 18.4k), the same accuracy",
     },
     Ran {
         design: Design::Serve8bRegion,
@@ -268,7 +270,9 @@ pub const RAN: &[Ran] = &[
                  (0500, regions 45.0-45.1k a pass), the same 14 mismatches (token, got, want, \
                  margin to 4 places); ARF 3 + MEM 1 + OP3 1,337.6 / 1,337.9 (0512, regions \
                  41.5-41.7k a pass = 13.9k a layer) and with F16 2 1,360.9 / 1,359.4 (0512, \
-                 regions 40.0-43.7k a pass), both the same 14 mismatches",
+                 regions 40.0-43.7k a pass), both the same 14 mismatches; F16 3 with the scaled \
+                 f16 copy 1,407.4 / 1,407.4 (0518, regions 40.0-40.2k a pass, no redos), the same \
+                 14 mismatches",
     },
 ];
 
