@@ -2848,6 +2848,31 @@ mod llama31_8b {
         assert!(params(&plan, &cfg).is_err());
     }
 
+    /// The Pie bundle's Llama config (x4: ops2 + qkv1 + arf + arfx + mem + op3 +
+    /// f16acc + f16accg) with `grid_levers` states 0522's sp522_g7 program
+    /// (TIME 1 there; KVST the engine's).
+    #[test]
+    fn the_plan_places_llama_3_grid_levers_as_0522() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.goals.cap = Some(128);
+        (cfg.speed, cfg.lse, cfg.ops2, cfg.qkv1, cfg.head_one_pass, cfg.hv, cfg.lever_d) =
+            (true, true, true, true, true, true, true);
+        (cfg.arf, cfg.arfx, cfg.mem, cfg.op3, cfg.f16acc, cfg.f16accg, cfg.grid_levers) =
+            (true, true, true, true, true, true, true);
+        cfg.pins.set("NP", 1).unwrap();
+        let plan = SpatialPlan::derive(&plan.spec, WaferDims::CS3, cfg.goals).unwrap();
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let want = "PX:128,PY:152,Hc:27,Dc:8,Gs:16,Ic:112,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:56,RNL:3,\
+                    RGY:16,GY:8,RC:2,RR:5,NCOL:1,YD:624,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,\
+                    KVCP:0,PROF:0,TIME:0,HROUTE:1,ROT8:1,QKN:0,EPS:925353388,NOLAYER:0,HEADMODE:2,HH:864,\
+                    Vr:150,Gx:4,Gy:24,vocab:128256,PASSES:3,MODE:2,OVL:0,VMC:1,CAP:128,iters:1,B:1,NP:1,\
+                    SPD:1,LSE:1,OP2:1,QKV1:1,ARF:3,F16:3,MEM:3,OP3:1,GRD:7";
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(got, super::qwen3_8b::sorted(want));
+    }
+
     /// `ops2` on 0472's config states 0480's program: the same parameters
     /// plus OP2 1 (0480 ran OP2's unit files hand-copied into 0472's build;
     /// the codegen's files for these parameters are byte-identical to them).
