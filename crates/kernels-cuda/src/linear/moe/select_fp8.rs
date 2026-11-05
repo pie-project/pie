@@ -114,8 +114,10 @@ pub fn select_fp8_w8a8(
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     let per = fan.route_count.div_ceil(experts);
     // On Hopper, wgmma (sm_90a): an expert's slice 32 routes, or 64 past an
-    // average of 16, at about the card's rate either way, so a busy expert's
-    // routes rarely spill into a second read of its codes.
+    // average of 32, so a busy expert's routes rarely spill into a second read
+    // of its codes; a decode's widest pass (512 rows of 8 routes over 128
+    // experts) averages 32, where 64-route slices sit half empty and ran 9%
+    // slower a step at 384 to 492 rows.
     // A prefill's busy experts on the warp-specialized GEMM
     // (`kernel.moe.fp8a8_ws_from`): 128 routes by 128 weight rows a CTA.
     let ws_from = ctx.tuning().fp8a8_ws_from;
@@ -174,7 +176,7 @@ pub fn select_fp8_w8a8(
         );
     }
     if hopper_wgmma() {
-        let slice: u32 = if per <= 16 { 32 } else { 64 };
+        let slice: u32 = if per <= 32 { 32 } else { 64 };
         let RouteOrder {
             order,
             offsets,
