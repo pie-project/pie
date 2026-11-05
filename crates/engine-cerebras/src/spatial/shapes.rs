@@ -260,7 +260,12 @@ pub const RAN: &[Ran] = &[
                  regions 39.20-39.37k a pass) and + XA on its own colours (XAC) 1,709.9 / \
                  1,711.6 (0527, regions 39.10-39.26k), both = golden for 512, 0 mismatches; pie \
                  B 1 on it (bundle x6: + `f16_clamp` + `xac`) 1,614.8-1,631.4 = 94.4-95.4% of bare \
-                 1,709.7-1,710.6 (0528), every pie and bare stream = golden for 512",
+                 1,709.7-1,710.6 (0528), every pie and bare stream = golden for 512; + the \
+                 units' exact op cuts (TRM 5) 1,762.3 / 1,762.6 (0530, regions 37.9-38.0k a pass), \
+                 + exp at degree 4 and the residuals from the receives (TRM 29) 1,804.7 / 1,804.7 \
+                 (0531), + x's sums of squares by a scalar loop (TRM 31) 1,832.2 / 1,832.7 (0531, \
+                 regions 36.3-36.4k a pass, grids 16.2 / 15.9k), each = golden for 512, 0 \
+                 teacher-forced mismatches (TRM 7's stride-0 accumulate: garbage, 0530)",
     },
     Ran {
         design: Design::Serve8bRegion,
@@ -288,7 +293,9 @@ pub const RAN: &[Ran] = &[
                  1,406.0-1,406.7 (0520; device 0.722 ms a step against 0.711), every pie stream = \
                  bare's; with GRD 7 (the six grids: ARF 3 + OP3 + MEM 1) 1,435.0 / 1,436.4 (0523, \
                  grids 15.9-16.4k), the same 14 mismatches; + XAC 1,445.9 / 1,443.8 (0529, \
-                 regions 39.8-39.9k a pass), the same 14 mismatches",
+                 regions 39.8-39.9k a pass), the same 14 mismatches; + TRM 31 1,521.8 / 1,520.6 \
+                 (0531) with 13 teacher-forced mismatches, not 0529's 14 (9 differ): TRM's \
+                 inexact bits (2: another summation order, 8: exp at degree 4) move Qwen's",
     },
 ];
 
