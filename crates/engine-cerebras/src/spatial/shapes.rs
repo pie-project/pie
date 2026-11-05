@@ -253,7 +253,9 @@ pub const RAN: &[Ran] = &[
                  1,677.5-1,678.9 (0519), every pie and bare stream = golden for 512; with the \
                  grids taking ARF 3 + OP3 + MEM 3 too (GRD 7, the plan's `grid_levers`) \
                  1,692.5 / 1,693.5 (0522, grids 16.8 / 16.6k), greedy = golden for 512, 0 \
-                 teacher-forced mismatches",
+                 teacher-forced mismatches; pie B 1 on it (bundle x5) 1,598.6-1,614.6 = \
+                 94.5-95.4% of bare 1,692.2-1,692.6 in 5 of 6 reps (0525; rep 1 1,322.0 with a \
+                 99.6 ms host fire stall), every pie and bare stream = golden for 512",
     },
     Ran {
         design: Design::Serve8bRegion,
