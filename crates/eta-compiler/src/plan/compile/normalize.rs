@@ -121,6 +121,15 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
             .collect();
 
         if result_count == 1 {
+            // A reshape to the type its value already has is that value: left in, it
+            // stands between a logits intrinsic and its argmax and keeps the argmax
+            // off the fused direct read (one block then scans every row).
+            if let Op::Reshape { value, .. } = &op
+                && normalized_types.get(*value as usize) == Some(&result_types[0])
+            {
+                value_map[base] = *value;
+                continue;
+            }
             if let Some(alias) = simplify_alias(&op, &result_types[0], &literals) {
                 value_map[base] = alias;
                 continue;
