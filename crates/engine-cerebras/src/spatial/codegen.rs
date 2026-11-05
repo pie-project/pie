@@ -471,26 +471,58 @@ impl Variant {
             // No inf / NaN from the f16 range (0507: a layer that reached its
             // residual hung the chip, one cut before it ran; a pass still on a
             // stale reference has probabilities up to e^75, whose f16 copy was
-            // inf, and o NaN from there on). The copy is min(p, 65504), made as
-            // -max(-p, -65504) in place (s is free after the sums), so the values
-            // carry -p and their divisor is -1/l; and a pass is redone when its
-            // sum leaves [2^-8, 2^15) (was [2^-80, 2^101)): a kept pass's
-            // probabilities are then < 2^15 and its largest >= 2^-8 / its slots.
+            // inf, and o NaN from there on). The copy is scaled by 2^-k, k from
+            // this PE's largest head sum (its slots' p sum, before the all-reduce)
+            // so every copied p is < 2^15 and that sum's copy is a normal f16; the
+            // values' partials are scaled back by 2^k (exact) before the
+            // all-reduce. The redo window stays bf16's [2^-80, 2^101) (0509 /
+            // 0515's narrower [2^-8, 2^15) redid passes: Qwen ~0.5 a pass in some
+            // regions). PROF 0 counts the redos by side in prof[2] / prof[3].
             s = patch(
                 &s,
                 "  @fs2h(@set_dsd_length(xpart_dsd, NS), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> s[i] }));\n",
-                "  @fnegs(s_scores, s_scores);\n  @fmaxs(s_scores, s_scores, -65504.0);   // (f16) -min(p, f16 max)\n  @fs2h(@set_dsd_length(xpart_dsd, NS), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> s[i] }));\n",
-                &format!("{tag}'s F16 clamp"),
-            )?;
-            for (old, new) in [
-                ("    bcv[j] = recip(l);\n", "    bcv[j] = -recip(l);   // (f16) the values carry -p\n"),
-                (
-                    "    if (e < 770048.0 or e >= 3735552.0) { bad = 1.0; }\n",
-                    "    // (f16) the sum in [2^-8, 2^15); PROF 0 counts the redos by side in prof[2] / prof[3]\n    if (e < 1949696.0) { bad = 1.0; if (PROF == 0) { prof[2] += 1; } }\n    if (e >= 2326528.0) { bad = 1.0; if (PROF == 0) { prof[3] += 1; } }\n",
+                concat!(
+                    "  // (f16) a scaled copy: 2^-k with this PE's largest head sum in [2^14, 2^15)\n",
+                    "  var lm: f32 = 0.0;\n",
+                    "  var jm: u16 = 0;\n",
+                    "  while (jm < dims[3]) : (jm += 1) { if (gu[B * QO + jm] > lm) { lm = gu[B * QO + jm]; } }\n",
+                    "  const eb: u32 = (@bitcast(u32, lm) >> 23) & 0xff;\n",
+                    "  var sc: f32 = 1.0;\n",
+                    "  f16_inv = 1.0;\n",
+                    "  if (eb >= 15) {\n",
+                    "    sc = @bitcast(f32, (268 - eb) << 23);\n",
+                    "    f16_inv = @bitcast(f32, (eb - 14) << 23);\n",
+                    "  }\n",
+                    "  // (only the scored slots: the rest hold -1e30, which the scale could overflow)\n",
+                    "  const nsc: u16 = if (HV) hv_n * NQB else NS;\n",
+                    "  if (nsc > 0) {\n",
+                    "    @fmuls(@set_dsd_length(s_scores, nsc), @set_dsd_length(s_scores, nsc), sc);\n",
+                    "    @fs2h(@set_dsd_length(xpart_dsd, nsc), @set_dsd_length(s_scores, nsc));\n",
+                    "  }\n",
                 ),
-            ] {
-                s = patch(&s, old, new, &format!("{tag}'s F16 range"))?;
-            }
+                &format!("{tag}'s F16 scaled copy"),
+            )?;
+            s = patch(
+                &s,
+                "  mark(6);\n",
+                "  @fmuls(o_all, o_all, f16_inv);   // (f16) the partials back to p's scale\n  mark(6);\n",
+                &format!("{tag}'s F16 rescale"),
+            )?;
+            s = patch(
+                &s,
+                "var mref = @zeros([LNL * NQB]f32);\n",
+                "var mref = @zeros([LNL * NQB]f32);\nvar f16_inv: f32 = 1.0;   // (f16) 2^k of the probabilities' copy\n",
+                &format!("{tag}'s F16 scale"),
+            )?;
+            s = patch(
+                &s,
+                "    if (e < 770048.0 or e >= 3735552.0) { bad = 1.0; }\n",
+                concat!(
+                    "    if (e < 770048.0) { bad = 1.0; if (PROF == 0) { prof[2] += 1; } }   // (f16) redos by side\n",
+                    "    if (e >= 3735552.0) { bad = 1.0; if (PROF == 0) { prof[3] += 1; } }\n",
+                ),
+                &format!("{tag}'s F16 redo count"),
+            )?;
             // (F16 3: the grids' matvecs too; the same anchors in their kernel)
             if (self.f16 == 2 && tag.starts_with("qwen2d_region/")) || self.f16 == 3 {
                 s = apply_reps("f16acc_ops", src::F16ACC_OPS, &s, tag)?;
