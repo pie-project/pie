@@ -468,6 +468,29 @@ impl Variant {
                 "@fmachs(od, od, vb, xpart[e * NQB + b * Qh + h]);   // (f16)",
                 &format!("{tag}'s F16 values"),
             )?;
+            // No inf / NaN from the f16 range (0507: a layer that reached its
+            // residual hung the chip, one cut before it ran; a pass still on a
+            // stale reference has probabilities up to e^75, whose f16 copy was
+            // inf, and o NaN from there on). The copy is min(p, 65504), made as
+            // -max(-p, -65504) in place (s is free after the sums), so the values
+            // carry -p and their divisor is -1/l; and a pass is redone when its
+            // sum leaves [2^-8, 2^15) (was [2^-80, 2^101)): a kept pass's
+            // probabilities are then < 2^15 and its largest >= 2^-8 / its slots.
+            s = patch(
+                &s,
+                "  @fs2h(@set_dsd_length(xpart_dsd, NS), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> s[i] }));\n",
+                "  @fnegs(s_scores, s_scores);\n  @fmaxs(s_scores, s_scores, -65504.0);   // (f16) -min(p, f16 max)\n  @fs2h(@set_dsd_length(xpart_dsd, NS), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> s[i] }));\n",
+                &format!("{tag}'s F16 clamp"),
+            )?;
+            for (old, new) in [
+                ("    bcv[j] = recip(l);\n", "    bcv[j] = -recip(l);   // (f16) the values carry -p\n"),
+                (
+                    "    if (e < 770048.0 or e >= 3735552.0) { bad = 1.0; }\n",
+                    "    if (e < 1949696.0 or e >= 2326528.0) { bad = 1.0; }   // (f16) the sum in [2^-8, 2^15)\n",
+                ),
+            ] {
+                s = patch(&s, old, new, &format!("{tag}'s F16 range"))?;
+            }
             if self.f16 == 2 && tag.starts_with("qwen2d_region/") {
                 s = apply_reps("f16acc_ops", src::F16ACC_OPS, &s, tag)?;
             }
