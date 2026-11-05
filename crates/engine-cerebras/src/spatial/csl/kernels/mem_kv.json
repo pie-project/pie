@@ -1,0 +1,6 @@
+[
+ {
+  "old": "  var d: u16 = 0;\n  while (d < Dc) : (d += 1) {\n    const kidx = (if (d < DHc) 0 else QH) + Qh * DHc + d % DHc;",
+  "new": "  var d: u16 = 0;\n  while (d < dims[7]) : (d += 1) {   // (mem)\n    const kidx = (if (d < DHc) 0 else QH) + Qh * DHc + d % DHc;"
+ }
+]

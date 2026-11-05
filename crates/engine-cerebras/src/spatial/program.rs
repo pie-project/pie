@@ -87,6 +87,8 @@ pub struct Model {
     /// f16 weights), 2 also the regions' weight matvecs accumulating in f16
     /// (`Variant::f16`). 0: bf16.
     pub f16: usize,
+    /// `MEM`: the region kernel's code cuts (`Variant::mem`; 0 off).
+    pub mem: usize,
 }
 
 impl Model {
@@ -107,6 +109,7 @@ impl Model {
             qkv1: false,
             arf: 0,
             f16: 0,
+            mem: 0,
         }
     }
 
@@ -133,6 +136,7 @@ impl Model {
             qkv1: self.qkv1,
             arf: u16::try_from(self.arf).unwrap_or(0),
             f16: u16::try_from(self.f16).unwrap_or(0),
+            mem: u16::try_from(self.mem).unwrap_or(0),
         }
     }
 }
@@ -718,6 +722,7 @@ impl ProgramSpec {
             "QKV1" => Some(usize::from(m.qkv1)),
             "ARF" => Some(m.arf),
             "F16" => Some(m.f16),
+            "MEM" => Some(m.mem),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1348,6 +1353,7 @@ fn model(get: &Get) -> R<Model> {
         qkv1: get.opt("QKV1").unwrap_or(0) != 0,
         arf: get.opt("ARF").unwrap_or(0),
         f16: get.opt("F16").unwrap_or(0),
+        mem: get.opt("MEM").unwrap_or(0),
     })
 }
 

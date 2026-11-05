@@ -1,0 +1,50 @@
+[
+ {
+  "old": "var dims = @zeros([6]u16);",
+  "new": "var dims = @zeros([16]u16);   // (mem) [6..14): trip counts of loops kept rolled"
+ },
+ {
+  "old": "  dims[5] = NH;\n",
+  "new": "  dims[5] = NH;\n  dims[6] = NP;\n  dims[7] = Dc;\n  dims[8] = DHc;\n  dims[9] = ROT_N;\n  dims[10] = 3;\n  dims[11] = 6;\n  dims[12] = NH;\n  dims[13] = NCOL;\n"
+ },
+ {
+  "old": "  while (c < 3) : (c += 1) {\n    @fadds(p, p, ex_a[c]);",
+  "new": "  while (c < dims[10]) : (c += 1) {\n    @fadds(p, p, ex_a[c]);"
+ },
+ {
+  "old": "  while (c < 6) : (c += 1) {\n    if (c > 0)",
+  "new": "  while (c < dims[11]) : (c += 1) {\n    if (c > 0)"
+ },
+ {
+  "old": "        while (lv < ROT_N) : (lv += 1) {",
+  "new": "        while (lv < dims[9]) : (lv += 1) {"
+ },
+ {
+  "old": "        while (kp < NP) : (kp += 1) {\n          var d: u16 = 0;\n          while (d < Dc) : (d += 1) {\n            const qo",
+  "new": "        while (kp < dims[6]) : (kp += 1) {\n          var d: u16 = 0;\n          while (d < dims[7]) : (d += 1) {\n            const qo"
+ },
+ {
+  "old": "    while (i < NCOL) : (i += 1) { put_route(",
+  "new": "    while (i < dims[13]) : (i += 1) { put_route("
+ },
+ {
+  "old": "fn op_in(is_max: bool, buf: mem1d_dsd, comptime q: input_queue, n: u16) void {\n  if (is_max) {",
+  "new": "fn op_in(is_max0: bool, buf: mem1d_dsd, comptime q: input_queue, n: u16) void {\n  const is_max = false;   // (mem) LSE: sums only\n  if (is_max) {"
+ },
+ {
+  "old": "fn op_fwd(is_max: bool, comptime qo: output_queue, comptime qi: input_queue,\n          buf: mem1d_dsd, n: u16) void {\n  if (is_max) {",
+  "new": "fn op_fwd(is_max0: bool, comptime qo: output_queue, comptime qi: input_queue,\n          buf: mem1d_dsd, n: u16) void {\n  const is_max = false;   // (mem) LSE: sums only\n  if (is_max) {"
+ },
+ {
+  "old": "fn phase1(is_max: bool, buf: mem1d_dsd, n: u16) void {\n  if (GY == 0) {\n    const r = axis_id % Gs;",
+  "new": "// (mem) Under ARF phase1/phase2 run on the X axis only (the Y full all-reduces\n// are arf_ar's): its group Gs, length PX and phase-2 root as constants.\nconst XC: bool = ARF != 0;\nconst R2X: u16 = (PX / Gs / 2) * Gs + R1;\nfn phase1(is_max: bool, buf: mem1d_dsd, n: u16) void {\n  if (GY == 0 or XC) {\n    const r = axis_id % Gs;"
+ },
+ {
+  "old": "fn phase2(is_max: bool, buf: mem1d_dsd, n: u16) void {\n  if (GY == 0) {\n    const id = axis_id;",
+  "new": "fn phase2(is_max: bool, buf: mem1d_dsd, n: u16) void {\n  if (GY == 0 or XC) {\n    const alen = if (XC) PX else alen;\n    const R2 = if (XC) R2X else R2;\n    const id = axis_id;"
+ },
+ {
+  "old": "  if (NG > 1) { phase2(is_max, buf, n); }\n  if (axis_id == R2) {",
+  "new": "  if ((XC and PX > Gs) or (!XC and NG > 1)) { phase2(is_max, buf, n); }\n  if (axis_id == (if (XC) R2X else R2)) {"
+ }
+]

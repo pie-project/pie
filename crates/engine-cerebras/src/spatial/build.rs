@@ -175,6 +175,9 @@ pub struct ServeConfig {
     /// `f16acc` also the regions' f16-accumulating matvecs (`F16` 2).
     pub f16: bool,
     pub f16acc: bool,
+    /// serve8b_region(_pipe), with `arf`: the region kernel's bit-exact code
+    /// cuts (`MEM` 1, codegen's `Variant::mem`).
+    pub mem: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -209,6 +212,7 @@ impl ServeConfig {
             arf: false,
             f16: false,
             f16acc: false,
+            mem: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -283,6 +287,7 @@ impl ServeConfig {
             "arf",
             "f16",
             "f16acc",
+            "mem",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -380,6 +385,7 @@ impl ServeConfig {
             arf: flag(t, "arf")?,
             f16: flag(t, "f16")?,
             f16acc: flag(t, "f16acc")?,
+            mem: flag(t, "mem")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -1024,6 +1030,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if (cfg.arf || cfg.f16 || cfg.f16acc) && !cfg.ops2 {
         return Err("serve8b_region's `arf` / `f16` / `f16acc` need `ops2`".into());
     }
+    if cfg.mem && !cfg.arf {
+        return Err("serve8b_region's code cuts (`mem`) need `arf`".into());
+    }
     if cfg.hv && !cfg.lse {
         return Err("serve8b_region's HV (`hv`) needs `lse` (and `speed`)".into());
     }
@@ -1339,6 +1348,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             qkv1: cfg.qkv1,
             arf: usize::from(cfg.arf),
             f16: if cfg.f16acc { 2 } else { usize::from(cfg.f16) },
+            mem: usize::from(cfg.mem),
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1408,6 +1418,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.f16 || cfg.f16acc {
         st.push(Typed("F16"));
+    }
+    if cfg.mem {
+        st.push(Typed("MEM"));
     }
     if cfg.lever_d {
         st.push(Typed("YD"));
@@ -2995,16 +3008,19 @@ mod llama31_8b {
         cfg.qkv1 = true;
         cfg.arf = true;
         cfg.f16acc = true;
+        cfg.mem = true;
         let (d, p) = params(&plan, &cfg).unwrap();
         let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
         assert_eq!(get("ARF").as_deref(), Some("1"));
         assert_eq!(get("F16").as_deref(), Some("2"));
+        assert_eq!(get("MEM").as_deref(), Some("1"));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
-        assert_eq!((lay.model.arf, lay.model.f16), (1, 2));
+        assert_eq!((lay.model.arf, lay.model.f16, lay.model.mem), (1, 2, 1));
         let base = d
             .files_with(Variant {
                 arf: 0,
                 f16: 0,
+                mem: 0,
                 ..lay.model.variant()
             })
             .unwrap();
@@ -3015,6 +3031,7 @@ mod llama31_8b {
                     assert!(!a.contains("fn arf_ar(") && b.contains("fn arf_ar("), "{n}");
                     assert!(b.contains("wmvh(gb, wgu_dsd, xn_dsd, Hc, 2 * Ic, false);"), "{n}");
                     assert!(b.contains("@as(@fp16(), @bitcast(f32, u))"), "{n}");
+                    assert!(b.contains("const R2X: u16 =") && b.contains("while (c < dims[10])"), "{n}");
                 }
                 "grid_pe.csl" => {
                     assert!(!b.contains("fn arf_ar(") && !b.contains("fn wmvh("), "{n}");
@@ -3028,6 +3045,9 @@ mod llama31_8b {
         }
         cfg.ops2 = false;
         assert!(params(&plan, &cfg).is_err());
+        cfg.ops2 = true;
+        cfg.arf = false;
+        assert!(params(&plan, &cfg).is_err(), "mem without arf");
     }
 
     /// The ring at PY 152: B 1 x 12 at CAP 32 ran on hardware (0402) and
