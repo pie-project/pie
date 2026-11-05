@@ -14,6 +14,14 @@ impl DispatchAttn for Run<'_> {
     }
 }
 
+/// A tab's prefill dispatches, in rows times keys. A GPU cannot leave a
+/// dispatch to draw the screen, and macOS ends a command buffer once that has
+/// gone on for about 20 seconds (`Impacting Interactivity`), which costs the
+/// tab its device. Smaller command buffers do not help: on an M2 Max,
+/// dispatches of 95 ms are ended and these, of 48 ms, are not. A browser hides
+/// its adapter from wgpu, so every tab pays for them, about 3% of a prefill.
+const TAB_PREFILL_WORK: u64 = 1 << 19;
+
 impl Run<'_> {
     /// How this device runs paged attention: the adapter's tier (its
     /// subgroup prefill tile where every subgroup is 32 lanes), a decode
@@ -30,6 +38,11 @@ impl Run<'_> {
             tile_lanes: 16,
             split_groups: tuning.sdpa_split_groups(),
             split_min_keys: tuning.sdpa_split_min_keys(),
+            prefill_work: if cfg!(target_arch = "wasm32") {
+                TAB_PREFILL_WORK
+            } else {
+                0
+            },
         }
     }
 

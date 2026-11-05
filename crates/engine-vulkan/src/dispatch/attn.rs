@@ -32,6 +32,7 @@ impl Run<'_> {
             tile_lanes: if shuffles { 16 } else { 32 },
             split_groups: tuning.sdpa_split_groups(),
             split_min_keys: tuning.sdpa_split_min_keys(),
+            prefill_work: 0,
         }
     }
 
