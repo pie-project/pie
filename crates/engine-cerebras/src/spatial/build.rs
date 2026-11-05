@@ -1365,7 +1365,8 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             qkv1: cfg.qkv1,
             arf: if cfg.arfx { 3 } else { usize::from(cfg.arf) },
             f16: if cfg.f16acc { 2 } else { usize::from(cfg.f16) },
-            mem: usize::from(cfg.mem),
+            // (MEM 3 where the q/k norm is the identity: q's scale a constant)
+            mem: if cfg.mem { if plan.spec.qk_norm { 1 } else { 3 } } else { 0 },
             op3: usize::from(cfg.op3),
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
@@ -3036,10 +3037,10 @@ mod llama31_8b {
         let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
         assert_eq!(get("ARF").as_deref(), Some("3"));
         assert_eq!(get("F16").as_deref(), Some("2"));
-        assert_eq!(get("MEM").as_deref(), Some("1"));
+        assert_eq!(get("MEM").as_deref(), Some("3"));
         assert_eq!(get("OP3").as_deref(), Some("1"));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
-        assert_eq!((lay.model.arf, lay.model.f16, lay.model.mem), (3, 2, 1));
+        assert_eq!((lay.model.arf, lay.model.f16, lay.model.mem), (3, 2, 3));
         let base = d
             .files_with(Variant {
                 arf: 0,
@@ -3059,6 +3060,7 @@ mod llama31_8b {
                     assert!(b.contains("const R2X: u16 =") && b.contains("prof[slot] += lo - t_lo;"), "{n}");
                     assert!(b.contains("fn axis_xa()") && b.contains("3 * NCOL + 3"), "{n}");
                     assert!(b.contains("rope_tab();   // (op3)"), "{n}");
+                    assert!(b.contains("const QSCL: f32") && !b.contains("const qkn_a"), "{n}");
                 }
                 "grid_pe.csl" => {
                     assert!(!b.contains("fn arf_ar(") && !b.contains("fn wmvh("), "{n}");

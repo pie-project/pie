@@ -1038,7 +1038,8 @@ pub(crate) fn place_layers(
     if !u.nolayer {
         for v in u.units(lay) {
             let layers: Vec<usize> = v.layers.clone().collect();
-            super::serve8b::unit(lay, ckpt, v.k, &layers, (v.x0, v.y0), &rope, false, dev)?;
+            let qkn = v.kind == Kind::Grid || lay.model.mem & 2 == 0;
+            super::serve8b::unit(lay, ckpt, v.k, &layers, (v.x0, v.y0), &rope, false, qkn, dev)?;
         }
     }
     Ok(())

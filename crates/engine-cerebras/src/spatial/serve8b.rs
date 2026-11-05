@@ -330,7 +330,7 @@ pub(crate) fn place_layers(
         ic: lay.ic(),
     };
     for l in 0..lay.layers() {
-        unit(lay, ckpt, k, &[l], lay.origin(l), &rope, true, dev)?;
+        unit(lay, ckpt, k, &[l], lay.origin(l), &rope, true, true, dev)?;
     }
     Ok(())
 }
@@ -352,6 +352,7 @@ pub(crate) fn unit(
     at: (usize, usize),
     rope: &Rope,
     kv_first: bool,
+    qkn: bool,
     dev: &mut dyn Device,
 ) -> R<()> {
     let (pxn, hc, dc, gs, ic) = (k.px, k.hc, k.dc, k.gs, k.ic);
@@ -506,26 +507,29 @@ pub(crate) fn unit(
         (ones.clone(), ones)
     };
     let scale = (d as f64).sqrt() as f32;
-    put_pe32(k, dev, "qkn_w", at, nl * 2 * nh * dh, |_, px, out| {
-        let dl = dl(px);
-        for li in 0..nl {
-            for half in [0, dh] {
-                for h in 0..nh {
-                    for i in 0..dh {
-                        let dd = dl[half + i];
-                        out.push(
-                            if h < qh {
-                                qn[li][dd] / scale
-                            } else {
-                                kn[li][dd]
-                            }
-                            .to_bits(),
-                        );
+    // (MEM 3 regions: q's scale is the kernel's constant, qkn_w one word)
+    if qkn {
+        put_pe32(k, dev, "qkn_w", at, nl * 2 * nh * dh, |_, px, out| {
+            let dl = dl(px);
+            for li in 0..nl {
+                for half in [0, dh] {
+                    for h in 0..nh {
+                        for i in 0..dh {
+                            let dd = dl[half + i];
+                            out.push(
+                                if h < qh {
+                                    qn[li][dd] / scale
+                                } else {
+                                    kn[li][dd]
+                                }
+                                .to_bits(),
+                            );
+                        }
                     }
                 }
             }
-        }
-    })?;
+        })?;
+    }
     for (sym, sin) in [("rot_c", false), ("rot_s", true)] {
         put_pe32(
             k,
