@@ -42,6 +42,34 @@ struct Landing {
     waiter: Option<StepDone>,
 }
 
+/// `PIE_CEREBRAS_CONTINUATION=posted`: a continuation runs only the rows the
+/// lane's posted fires hold (the latest at slot `held`), not on to its last
+/// page's end. With a deep `[runtime] frame_dispatch_depth` the posted fires
+/// reach far past the loop, so nothing is lost mid-stream, and the stream's
+/// last launch ends at its last row instead of running a page's tail no fire
+/// will read. Unset (or `pages`): to the page's end, as always.
+fn continuation_posted_only() -> bool {
+    static POSTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *POSTED.get_or_init(|| {
+        matches!(
+            std::env::var("PIE_CEREBRAS_CONTINUATION").ok().as_deref(),
+            Some("posted")
+        )
+    })
+}
+
+/// A continuation's iterations from the loop's `end`: the lane's pages'
+/// `room`, at most `cap`, and with `posted_only` no further than the latest
+/// posted fire's row (at slot `held`).
+fn continuation_steps(room: usize, cap: usize, end: u32, held: u32, posted_only: bool) -> usize {
+    let steps = room.min(cap);
+    if posted_only {
+        steps.min((held + 1).saturating_sub(end) as usize)
+    } else {
+        steps
+    }
+}
+
 /// The continuation lanes worth one launch, from each candidate's
 /// iterations (most first): those with at least half the most, all run the
 /// fewest of them; at most `lanes`.
@@ -225,8 +253,10 @@ impl Spatial {
         }
         let (cap, most) = (w.cap.saturating_sub(1), w.launch_lanes);
         let size = self.kv.page_size.max(1);
+        let posted_only = continuation_posted_only();
         // Per lane: (sequence slot, its loop, the pages, iterations).
         let mut lanes: Vec<(u32, u32, Vec<u32>, usize)> = Vec::new();
+        let mut account: Option<(u32, u32, usize)> = None;
         for (&slot, run) in &self.paged_ahead {
             let end = run.end();
             let latest = self
@@ -239,7 +269,8 @@ impl Spatial {
                 .max_by_key(|l| l.kv.held);
             let Some(lane) = latest else { continue };
             let room = (lane.kv.pages.len() as u32 * size).saturating_sub(end) as usize;
-            let steps = room.min(cap);
+            let steps = continuation_steps(room, cap, end, lane.kv.held, posted_only);
+            account.get_or_insert((end, lane.kv.held, room));
             if steps > 0 {
                 lanes.push((slot, end, lane.kv.pages.clone(), steps));
             }
@@ -284,9 +315,14 @@ impl Spatial {
             }
         });
         let (reply, answer) = mpsc::channel();
+        let (end, posted_to, room) = account.unwrap_or_default();
         tracing::info!(
             lanes = batch.len(),
             steps,
+            end,
+            posted_to,
+            room,
+            posted = self.posted.len(),
             "spatial: a token loop's continuation posted"
         );
         let Some(w) = self.model.as_mut() else {
@@ -321,7 +357,18 @@ pub(super) fn post(queue: &mut VecDeque<Posted>, frame: FrameId, steps: &[Step])
 
 #[cfg(test)]
 mod tests {
-    use super::launch_of;
+    use super::{continuation_steps, launch_of};
+
+    #[test]
+    fn a_posted_only_continuation_stops_at_the_latest_posted_row() {
+        // Pages to slot 544, the loop at 528, the last fire's row at 529.
+        assert_eq!(continuation_steps(16, 127, 528, 529, false), 16);
+        assert_eq!(continuation_steps(16, 127, 528, 529, true), 2);
+        // Mid-stream, fires posted far ahead: the cap, then the pages.
+        assert_eq!(continuation_steps(200, 127, 100, 300, true), 127);
+        assert_eq!(continuation_steps(60, 127, 100, 300, true), 60);
+        assert_eq!(continuation_steps(60, 127, 100, 99, true), 0);
+    }
 
     #[test]
     fn a_continuation_launches_the_lanes_that_run_about_as_far() {

@@ -95,11 +95,21 @@ impl Config {
         }
     }
 
+    /// The most `[runtime] frame_dispatch_depth` an engine kind takes: a
+    /// staging ring's bound ([`Runahead::MAX_FRAMES`]), or for the cerebras
+    /// shell, which posts frames to a host queue, [`Runahead::UNSTAGED_MAX_FRAMES`].
+    fn max_frames(kind: EngineKind) -> u8 {
+        match kind {
+            EngineKind::Cerebras => Runahead::UNSTAGED_MAX_FRAMES,
+            _ => Runahead::MAX_FRAMES,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.model.validate()?;
         self.engine.validate()?;
         self.server.validate()?;
-        self.runtime.validate()?;
+        self.runtime.validate(Self::max_frames(self.engine.kind))?;
         self.sandbox.validate()?;
         self.cluster.validate()?;
         self.offload.validate()?;
@@ -888,7 +898,7 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, max_frames: u8) -> Result<()> {
         ensure!(
             self.submit_deadline.as_micros() > 0,
             "runtime.submit_deadline must be > 0"
@@ -917,12 +927,13 @@ impl RuntimeConfig {
             self.frame_size
         );
         ensure!(
-            self.frame_dispatch_depth <= u32::from(Runahead::MAX_FRAMES),
-            "runtime.frame_dispatch_depth must be at most {} (got {}): the engine \
-             publishes its staging ring's free set as one 64-bit word, and \
-             `frames_in_flight * {} + 1` must fit in it \
-             (`engine::runahead::Runahead::MAX_FRAMES`)",
-            Runahead::MAX_FRAMES,
+            self.frame_dispatch_depth <= u32::from(max_frames),
+            "runtime.frame_dispatch_depth must be at most {} (got {}) on this engine: \
+             an engine with a staging ring publishes its free set as one 64-bit \
+             word, and `frames_in_flight * {} + 1` must fit in it \
+             (`engine::runahead::Runahead::MAX_FRAMES`; the cerebras shell, \
+             which has none, takes up to `Runahead::UNSTAGED_MAX_FRAMES`)",
+            max_frames,
             self.frame_dispatch_depth,
             Runahead::STEPS_MAX
         );
