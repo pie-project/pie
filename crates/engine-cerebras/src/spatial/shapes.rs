@@ -255,7 +255,10 @@ pub const RAN: &[Ran] = &[
                  1,692.5 / 1,693.5 (0522, grids 16.8 / 16.6k), greedy = golden for 512, 0 \
                  teacher-forced mismatches; pie B 1 on it (bundle x5) 1,598.6-1,614.6 = \
                  94.5-95.4% of bare 1,692.2-1,692.6 in 5 of 6 reps (0525; rep 1 1,322.0 with a \
-                 99.6 ms host fire stall), every pie and bare stream = golden for 512",
+                 99.6 ms host fire stall), every pie and bare stream = golden for 512; + the \
+                 regions' f16 copy clamped with 0515's window (F16CL) 1,705.8 / 1,706.4 (0526, \
+                 regions 39.20-39.37k a pass) and + XA on its own colours (XAC) 1,709.9 / \
+                 1,711.6 (0527, regions 39.10-39.26k), both = golden for 512, 0 mismatches",
     },
     Ran {
         design: Design::Serve8bRegion,

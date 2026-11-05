@@ -1807,7 +1807,13 @@ mod tests {
         RNL:3,RGY:16,GY:8,RC:2,RR:5,NCOL:1,YD:624,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
         PROF:0,TIME:1,HROUTE:1,ROT8:1,QKN:0,EPS:925353388,NOLAYER:0,HEADMODE:2,HH:864,Vr:150,Gx:4,Gy:24,\
         vocab:128256,PASSES:3,MODE:2,OVL:0,VMC:1,CAP:128,iters:1,B:1,NP:1,SPD:1,LSE:1";
-        let lay = lay_of(p);
+        // (and Qwen3-8B's: PY 144, NCOL 5 column grids from YD 208)
+        let q = p.replace("PY:152,Hc:27,Dc:8,Gs:16,Ic:112", "PY:144,Hc:29,Dc:8,Gs:16,Ic:96")
+            .replace("RIc:56", "RIc:48").replace("NCOL:1,YD:624", "NCOL:5,YD:208")
+            .replace("QKN:0,EPS:925353388,", "").replace("HH:864,Vr:150,Gx:4", "HH:1152,Vr:132,Gx:8")
+            .replace("vocab:128256", "vocab:151936").replace("CAP:128", "CAP:64");
+        for p in [p.to_string(), q] {
+        let lay = lay_of(&p);
         let Layers::Units { units: u, .. } = lay.layers else { panic!("not serve8b_region") };
         let units = u.units(&lay);
         let t = Tables::new(units.clone(), 1, u.rtr).unwrap();
@@ -1821,6 +1827,7 @@ mod tests {
                     assert!(cs.iter().all(|c| ![0, 1, 2, 15, 16].contains(c) && !(5..=10).contains(c)), "{cs:?}");
                 }
             }
+        }
         }
     }
 
