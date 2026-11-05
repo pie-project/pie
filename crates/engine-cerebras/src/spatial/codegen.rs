@@ -81,6 +81,7 @@ mod src {
     pub const TRM_FUSE: &str = include_str!("csl/kernels/trm_fuse.json");
     pub const TRM_HV: &str = include_str!("csl/kernels/trm_hv.json");
     pub const TRM_HVL: &str = include_str!("csl/kernels/trm_hvl.json");
+    pub const TRM_RSQ: &str = include_str!("csl/kernels/trm_rsq.json");
     pub const VM_HM: &str = include_str!("csl/vm/guest4hm_vm.csl");
     pub const VM_HZ: &str = include_str!("csl/vm/guest4hz_vm.csl");
     /// Every design's runtime route and queue-color helpers.
@@ -386,7 +387,9 @@ pub struct Variant {
     /// zero run, the sums' first row copied, the reference read in place);
     /// **128** (with 64) HV's scored entries found once a pass in hv_find
     /// (lane 0's e and block), the scores' and values' loops over them alone
-    /// with the heads unrolled (`trm_hvl.json`; the same ops in the same order).
+    /// with the heads unrolled (`trm_hvl.json`; the same ops in the same order);
+    /// **256** rsqrt (the rms scales, and 1/l as its square) in two Newton
+    /// steps (relative error 4.6e-6; `trm_rsq.json`).
     pub trim: u16,
 }
 
@@ -664,8 +667,8 @@ impl Variant {
             s = apply_reps("arfs_ops", src::ARFS_OPS, &s, tag)?;
         }
         if self.trim != 0 && (region || self.trim & 4 != 0) {
-            if self.trim & 1 == 0 || self.trim > 255 {
-                return Err(format!("gen: {tag}: TRM {} unknown (1 the cuts, 2 and the sums of squares, 4 the grids too, 8 exp at degree 4, 16 the residuals from the fabric, 32 the head's split_x, 64 HV's zero copies, 128 HV's entries once a pass)", self.trim));
+            if self.trim & 1 == 0 || self.trim > 511 {
+                return Err(format!("gen: {tag}: TRM {} unknown (1 the cuts, 2 and the sums of squares, 4 the grids too, 8 exp at degree 4, 16 the residuals from the fabric, 32 the head's split_x, 64 HV's zero copies, 128 HV's entries once a pass, 256 rsqrt in two Newton steps)", self.trim));
             }
             if self.trim & 128 != 0 && self.trim & 64 == 0 {
                 return Err(format!("gen: {tag}: TRM 128 needs 64 (the zero run)"));
@@ -694,6 +697,9 @@ impl Variant {
             }
             if self.trim & 128 != 0 {
                 s = apply_reps("trm_hvl", src::TRM_HVL, &s, tag)?;
+            }
+            if self.trim & 256 != 0 {
+                s = apply_reps("trm_rsq", src::TRM_RSQ, &s, tag)?;
             }
         }
         if let Some(bits) = self.eps_bits {
