@@ -16,6 +16,7 @@ use client_api::{HandleKind, HandleName, HandleOp, Handles};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::inferlet::host::frames::{Frames, Pcm};
 use crate::inferlet::host::grammar::Matcher;
 use crate::inferlet::host::working_set::{Cursor, WorkingSet};
 use crate::inferlet::process::ProcessResidency;
@@ -33,6 +34,10 @@ const MOVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// The most handles one session names at once: a name costs almost nothing,
 /// but not nothing, and a client that never closes one should hear so.
 const MAX_HANDLES: usize = 4096;
+
+/// The most pictures and sound one session holds, by what they decode to.
+/// Nothing moves these off the host, so this is all that bounds them.
+const MAX_MEDIA_BYTES: usize = 8 << 30;
 
 struct Parts {
     kv: KvWorkingSet,
@@ -262,17 +267,41 @@ pub(crate) enum Slot {
     /// Host memory and nothing else: it moves as it is. The lock is for
     /// `Sync`, which the actor holding the table needs and it alone reaches.
     Matcher(Box<Mutex<Matcher>>),
+    /// Host memory never written once made: a fork shares it.
+    Frames(Box<Frames>),
+    Pcm(Box<Pcm>),
     /// In a process, or promised by one: frames naming it wait.
     Lent,
     /// Gone for a reason the next use hears.
     Dead(String),
 }
 
+impl Slot {
+    fn media_bytes(&self) -> usize {
+        match self {
+            Slot::Unborn(HandleKind::Frames(bytes)) => bytes.len(),
+            Slot::Frames(frames) => frames.rgb8().map_or(0, <[u8]>::len),
+            Slot::Pcm(pcm) => pcm.samples.len() * size_of::<f32>(),
+            _ => 0,
+        }
+    }
+}
+
 /// A session's handles. An actor owns it, so names resolve in the order the
 /// client sent them.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Table {
     slots: HashMap<HandleName, Slot>,
+    max_media_bytes: usize,
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Table {
+            slots: HashMap::new(),
+            max_media_bytes: MAX_MEDIA_BYTES,
+        }
+    }
 }
 
 impl Table {
@@ -295,7 +324,9 @@ impl Table {
         match op {
             HandleOp::New { name, kind } => {
                 self.claim(name)?;
-                self.slots.insert(name, Slot::Unborn(kind));
+                let slot = Slot::Unborn(kind);
+                self.room_for(&slot)?;
+                self.slots.insert(name, slot);
                 Ok(json!({ "ok": true }))
             }
             HandleOp::Fork { name, from } => {
@@ -306,6 +337,8 @@ impl Table {
                     Some(Slot::Matcher(matcher)) => {
                         Slot::Matcher(Box::new(Mutex::new(matcher.lock().unwrap().fork())))
                     }
+                    Some(Slot::Frames(frames)) => Slot::Frames(frames.clone()),
+                    Some(Slot::Pcm(pcm)) => Slot::Pcm(pcm.clone()),
                     other => return Err(refusal(from, other)),
                 };
                 self.slots.insert(name, child);
@@ -320,6 +353,20 @@ impl Table {
                     Ok(json!({ "state": "unborn", "tokens": 0, "folded": 0, "engine": null }))
                 }
                 Some(Slot::Unborn(_)) => Ok(json!({ "state": "unborn" })),
+                Some(Slot::Frames(frames)) => Ok(json!({
+                    "state": "parked",
+                    "width": frames.width,
+                    "height": frames.height,
+                    "count": frames.count,
+                    "fps": frames.fps,
+                    "bytes": frames.rgb8().map_or(0, <[u8]>::len),
+                })),
+                Some(Slot::Pcm(pcm)) => Ok(json!({
+                    "state": "parked",
+                    "rate": pcm.rate,
+                    "channels": pcm.channels,
+                    "samples": pcm.samples.len(),
+                })),
                 Some(Slot::Parked(held)) => Ok(held.stat()),
                 Some(Slot::Matcher(matcher)) => {
                     let terminated = matcher.lock().unwrap().is_terminated();
@@ -327,6 +374,43 @@ impl Table {
                 }
                 other => Err(refusal(name, other)),
             },
+        }
+    }
+
+    /// The media `slot` would add within what the session may hold.
+    fn room_for(&self, slot: &Slot) -> Result<(), String> {
+        let held: usize = self.slots.values().map(Slot::media_bytes).sum();
+        if held + slot.media_bytes() > self.max_media_bytes {
+            return Err(format!(
+                "quota: this session holds {held} bytes of media; close a handle"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Encodes a handle for a client to download.
+    pub(crate) fn read(&self, name: HandleName, format: &str) -> Result<(Vec<u8>, String), String> {
+        use crate::inferlet::host::frames::{
+            audio_extension, audio_format, image_extension, image_format,
+        };
+        match self.slots.get(&name) {
+            Some(Slot::Frames(frames)) => {
+                let format =
+                    image_format(format).ok_or_else(|| format!("no image format `{format}`"))?;
+                Ok((
+                    frames.encode(format)?,
+                    format!("{name}.{}", image_extension(format)),
+                ))
+            }
+            Some(Slot::Pcm(pcm)) => {
+                let format =
+                    audio_format(format).ok_or_else(|| format!("no audio format `{format}`"))?;
+                Ok((
+                    pcm.encode(format),
+                    format!("{name}.{}", audio_extension(format)),
+                ))
+            }
+            other => Err(refusal(name, other)),
         }
     }
 
@@ -420,10 +504,15 @@ impl Table {
     /// What a process's end settled: a name with no slot here is gone.
     pub(crate) fn settle(&mut self, settled: Vec<(HandleName, Option<Slot>)>) {
         for (name, slot) in settled {
-            match slot {
-                Some(slot) => self.slots.insert(name, slot),
-                None => self.slots.remove(&name),
+            self.slots.remove(&name);
+            let Some(slot) = slot else {
+                continue;
             };
+            let slot = match self.room_for(&slot) {
+                Ok(()) => slot,
+                Err(why) => Slot::Dead(why),
+            };
+            self.slots.insert(name, slot);
         }
     }
 }
@@ -528,6 +617,12 @@ fn bind_one(ctx: &mut ProcessCtx, handle: Slot) -> anyhow::Result<Moved> {
             let matcher = grammar::compile_matcher(&source)?;
             Moved::Matcher(ctx.ctx().table.push(matcher)?.rep())
         }
+        Slot::Frames(frames) => Moved::Frames(ctx.ctx().table.push(*frames)?.rep()),
+        Slot::Unborn(HandleKind::Frames(bytes)) => {
+            let frames = Frames::decode(&bytes).map_err(anyhow::Error::msg)?;
+            Moved::Frames(ctx.ctx().table.push(frames)?.rep())
+        }
+        Slot::Pcm(pcm) => Moved::Pcm(ctx.ctx().table.push(*pcm)?.rep()),
         _ => Moved::WorkingSet(working_set::materialize(ctx)?),
     })
 }
@@ -558,6 +653,8 @@ impl Drop for Lease {
 pub(crate) enum Moved {
     WorkingSet(u32),
     Matcher(u32),
+    Frames(u32),
+    Pcm(u32),
 }
 
 /// A running process's handles.
@@ -588,21 +685,29 @@ impl Bag {
 
     pub(crate) fn take_working_set(&mut self, name: &str) -> Option<u32> {
         match self.taken.get(name)? {
-            &Moved::WorkingSet(rep) => {
-                self.taken.remove(name);
-                Some(rep)
-            }
-            Moved::Matcher(_) => None,
+            &Moved::WorkingSet(rep) => self.taken.remove(name).map(|_| rep),
+            _ => None,
         }
     }
 
     pub(crate) fn take_matcher(&mut self, name: &str) -> Option<u32> {
         match self.taken.get(name)? {
-            &Moved::Matcher(rep) => {
-                self.taken.remove(name);
-                Some(rep)
-            }
-            Moved::WorkingSet(_) => None,
+            &Moved::Matcher(rep) => self.taken.remove(name).map(|_| rep),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn take_frames(&mut self, name: &str) -> Option<u32> {
+        match self.taken.get(name)? {
+            &Moved::Frames(rep) => self.taken.remove(name).map(|_| rep),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn take_pcm(&mut self, name: &str) -> Option<u32> {
+        match self.taken.get(name)? {
+            &Moved::Pcm(rep) => self.taken.remove(name).map(|_| rep),
+            _ => None,
         }
     }
 
@@ -660,6 +765,18 @@ fn take_out(
             let matcher = resources.delete(Resource::<Matcher>::new_own(rep))?;
             return Ok(Slot::Matcher(Box::new(Mutex::new(matcher))));
         }
+        Moved::Frames(rep) => {
+            return Ok(Slot::Frames(Box::new(resources.delete(Resource::<
+                Frames,
+            >::new_own(
+                rep
+            ))?)));
+        }
+        Moved::Pcm(rep) => {
+            return Ok(Slot::Pcm(Box::new(
+                resources.delete(Resource::<Pcm>::new_own(rep))?,
+            )));
+        }
         Moved::WorkingSet(rep) => rep,
     };
     let ws = resources.delete(Resource::<WorkingSet>::new_own(rep))?;
@@ -712,6 +829,7 @@ mod tests {
     async fn handle_every_case() {
         an_unborn_handle_is_a_name_and_nothing_else().await;
         a_session_names_only_so_many().await;
+        media_past_the_session_limit_is_refused_or_dead().await;
         a_name_is_taken_once().await;
         one_bad_op_does_not_stop_the_rest().await;
         a_launch_moves_all_it_names_or_none().await;
@@ -742,6 +860,28 @@ mod tests {
         assert_eq!(
             answer(&mut table, new(MAX_HANDLES as HandleName)).await["ok"],
             true
+        );
+    }
+
+    async fn media_past_the_session_limit_is_refused_or_dead() {
+        let mut table = Table {
+            max_media_bytes: 8,
+            ..Table::default()
+        };
+        let upload = |name, len| HandleOp::New {
+            name,
+            kind: HandleKind::Frames(vec![0u8; len].into()),
+        };
+        assert_eq!(answer(&mut table, upload(1, 6)).await["ok"], true);
+        let over = answer(&mut table, upload(2, 6)).await;
+        assert!(over["error"].as_str().unwrap().starts_with("quota"));
+
+        let frames = Frames::from_rgb8(vec![0; 12], 2, 2, 1, 0.0).unwrap();
+        table.settle(vec![(3, Some(Slot::Frames(Box::new(frames))))]);
+        let landed = answer(&mut table, HandleOp::Stat { name: 3 }).await;
+        assert!(
+            landed["error"].as_str().unwrap().contains("quota"),
+            "what a process gave past the limit is lost, and says so: {landed}"
         );
     }
 

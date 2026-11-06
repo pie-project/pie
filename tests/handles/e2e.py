@@ -197,6 +197,39 @@ async def t_matcher(c, prog, whole):
     check("prefill leaves a handle holding the prompt", st["state"] == "parked" and st["tokens"] >= 59, f"{out} {st}")
     await w.close()
 
+async def t_media(c, prog, whole):
+    S = Path(__file__).parent
+    mk = await c.install_program(S / "mk.py", force_overwrite=True)
+    see = await c.install_program(S / "see.py", force_overwrite=True)
+    out, sound = await c.frames(), c.pcm()
+    await (await c.run(mk, out=out, sound=sound, w=64, h=48)).result()
+    st = await out.stat()
+    check("a process's pictures land as a handle", st["state"] == "parked" and st["width"] == 64, str(st))
+    check("and its sound", (await sound.stat())["samples"] == 400)
+    png = await out.read("png")
+    check("a client reads a handle as the format it asks", png[:8] == b"\x89PNG\r\n\x1a\n", f"{len(png)} bytes")
+    raw = await out.read("raw-rgb8")
+    check("and the handle stays", len(raw) == 64 * 48 * 3, f"{len(raw)} bytes")
+    wav = await sound.read("wav")
+    check("sound reads too", wav[:4] == b"RIFF", f"{len(wav)} bytes")
+    twin = await out.fork()
+    r = await (await c.run(see, image=twin)).result()
+    check("pictures move on to a model with no client between", r["tokens"] > 0, str(r))
+    back = await twin.read("raw-rgb8")
+    check("and come back", len(back) == len(raw) and back == raw)
+    up = await c.frames(png)
+    check("an upload is unborn until bound", (await up.stat())["state"] == "unborn")
+    u = await (await c.run(see, image=up)).result()
+    check("an upload reads as what was uploaded", u == r and (await up.read("raw-rgb8")) == raw, str(u))
+    try:
+        await out.read("tiff"); check("a format that is none is refused", False)
+    except HandleError as e: check("a format that is none is refused", "tiff" in str(e), str(e))
+    bad = await c.frames(b"not a picture")
+    try:
+        await (await c.run(see, image=bad)).result(); check("bytes that decode to nothing fail their launch", False)
+    except Exception as e: check("bytes that decode to nothing fail their launch", True, str(e)[:80])
+    for h in (out, sound, twin, up): await h.close()
+
 async def t_close(c, prog, whole, port=None):
     d = PieClient(c.server_uri if hasattr(c, "server_uri") else URI[0]); await d.connect()
     made = 0
@@ -251,7 +284,7 @@ async def main():
             except Exception: c = None; await asyncio.sleep(1)
         prog = await c.install_program(EX / "working_set_handles.wasm", force_overwrite=True)
         whole = await t_resume(c, prog)
-        for f in (t_lazy, t_order, t_dead, t_many, t_evict, t_quota, t_script, t_matcher, t_close, t_cost):
+        for f in (t_lazy, t_order, t_dead, t_many, t_evict, t_quota, t_script, t_matcher, t_media, t_close, t_cost):
             if args.only and f.__name__ not in args.only.split(","): continue
             try: await asyncio.wait_for(f(c, prog, whole), 120)
             except Exception as e:

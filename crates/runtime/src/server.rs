@@ -334,6 +334,7 @@ impl Session {
                 .iter()
                 .flat_map(client_api::HandleOp::touches)
                 .any(|name| self.handles.lent(name)),
+            ClientMessage::ReadHandle { name, .. } => self.handles.lent(*name),
             ClientMessage::LaunchProcess {
                 handles, returns, ..
             } => handles
@@ -448,6 +449,16 @@ impl Session {
                     executors,
                 )
                 .await
+            }
+
+            ClientMessage::ReadHandle {
+                corr_id,
+                name,
+                format,
+                reader,
+            } => {
+                self.handle_read_handle(corr_id, name, &format, &reader)
+                    .await
             }
 
             ClientMessage::Handles { corr_id, ops } => {

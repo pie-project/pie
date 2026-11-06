@@ -522,6 +522,40 @@ impl Client {
         Ok(name)
     }
 
+    /// Uploads encoded pictures, which decode where a process binds them.
+    pub async fn new_frames(&self, encoded: Vec<u8>) -> Result<HandleName> {
+        let name = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.handle_op(HandleOp::New {
+            name,
+            kind: HandleKind::Frames(encoded.into()),
+        })
+        .await?;
+        Ok(name)
+    }
+
+    /// Downloads a `Frames` or `Pcm` handle as `format`: its file arrives as
+    /// a process's would, and the handle stays.
+    pub async fn read_handle(&self, name: HandleName, format: String) -> Result<Process> {
+        // Picked here so events are routed before the first chunk can arrive.
+        let reader = Uuid::new_v4().to_string();
+        let rx = attach_process_events(&self.inner, &reader);
+        let msg = ClientMessage::ReadHandle {
+            corr_id: 0,
+            name,
+            format,
+            reader: reader.clone(),
+        };
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
+        if !ok {
+            return Err(Error::request("Read handle", result));
+        }
+        Ok(Process {
+            id: reader,
+            inner: Arc::clone(&self.inner),
+            event_rx: rx,
+        })
+    }
+
     /// An independent copy of `from` as it stands.
     pub async fn fork_handle(&self, from: HandleName) -> Result<HandleName> {
         let name = self.next_handle.fetch_add(1, Ordering::Relaxed);

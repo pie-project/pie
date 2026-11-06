@@ -3,13 +3,17 @@ use crate::inferlet::host::pie;
 use crate::inferlet::host::pie::inferlet::frames::{AudioFormat, ImageFormat};
 use anyhow::Result;
 use media::{mp4, still, wav, y4m};
+use std::sync::Arc;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
+/// Never written once made, so a fork of a handle shares it.
+#[derive(Clone)]
 pub enum FrameStore {
-    Host(Vec<u8>),
+    Host(Arc<Vec<u8>>),
 }
 
+#[derive(Clone)]
 pub struct Frames {
     pub store: FrameStore,
     pub width: u32,
@@ -18,8 +22,9 @@ pub struct Frames {
     pub fps: f32,
 }
 
+#[derive(Clone)]
 pub struct Pcm {
-    pub samples: Vec<f32>,
+    pub samples: Arc<Vec<f32>>,
     pub rate: u32,
     pub channels: u32,
 }
@@ -60,7 +65,7 @@ fn nvenc_device() -> usize {
 impl Frames {
     pub fn rgb8(&self) -> Result<&[u8], String> {
         match &self.store {
-            FrameStore::Host(v) => Ok(v),
+            FrameStore::Host(v) => Ok(v.as_slice()),
         }
     }
 
@@ -77,7 +82,7 @@ impl Frames {
             (rgb, width, height, 1, 0.0)
         };
         Ok(Frames {
-            store: FrameStore::Host(rgb),
+            store: FrameStore::Host(Arc::new(rgb)),
             width,
             height,
             count,
@@ -108,7 +113,7 @@ impl Frames {
             count += part.count;
         }
         Ok(Self {
-            store: FrameStore::Host(bytes),
+            store: FrameStore::Host(Arc::new(bytes)),
             width: first.width,
             height: first.height,
             count,
@@ -146,7 +151,7 @@ impl Frames {
             ));
         }
         Ok(Self {
-            store: FrameStore::Host(bytes),
+            store: FrameStore::Host(Arc::new(bytes)),
             width,
             height,
             count,
@@ -181,7 +186,7 @@ impl Frames {
             .map(|v| (((v + 1.0) * 0.5).clamp(0.0, 1.0) * 255.0).round() as u8)
             .collect();
         Ok(Self {
-            store: FrameStore::Host(bytes),
+            store: FrameStore::Host(Arc::new(bytes)),
             width,
             height,
             count,
@@ -263,7 +268,7 @@ impl Pcm {
             ));
         }
         Ok(Self {
-            samples,
+            samples: Arc::new(samples),
             rate,
             channels,
         })
@@ -275,6 +280,27 @@ impl Pcm {
             AudioFormat::RawF32 => wav::raw_f32(&self.samples),
         }
     }
+}
+
+/// A format by the name a client writes it.
+pub(crate) fn image_format(name: &str) -> Option<ImageFormat> {
+    Some(match name {
+        "png" => ImageFormat::Png,
+        "jpeg" | "jpg" => ImageFormat::Jpeg,
+        "webp" => ImageFormat::Webp,
+        "raw-rgb8" => ImageFormat::RawRgb8,
+        "y4m" => ImageFormat::Y4m,
+        "mp4" | "mp4-h264" => ImageFormat::Mp4H264,
+        _ => return None,
+    })
+}
+
+pub(crate) fn audio_format(name: &str) -> Option<AudioFormat> {
+    Some(match name {
+        "wav" => AudioFormat::Wav,
+        "raw-f32" => AudioFormat::RawF32,
+        _ => return None,
+    })
 }
 
 pub fn image_extension(format: ImageFormat) -> &'static str {

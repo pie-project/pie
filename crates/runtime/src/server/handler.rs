@@ -775,6 +775,35 @@ impl Session {
         }
     }
 
+    /// Answers as a launch does, so the file comes under an id every layer
+    /// between here and the client already routes.
+    pub(super) async fn handle_read_handle(
+        &mut self,
+        corr_id: u32,
+        name: client_api::HandleName,
+        format: &str,
+        reader: &str,
+    ) {
+        let read = uuid::Uuid::parse_str(reader)
+            .map_err(|_| "a reader is a UUID".to_string())
+            .and_then(|id| Ok((id, self.handles.read(name, format)?)));
+        let (id, (data, file)) = match read {
+            Ok(read) => read,
+            Err(why) => {
+                self.send_response(corr_id, false, why).await;
+                return;
+            }
+        };
+        self.send_response(corr_id, true, id.to_string()).await;
+        self.send_file_download(id, data.into(), Some(file)).await;
+        self.send(ServerMessage::ProcessEvent {
+            process_id: id.to_string(),
+            event: "return".to_string(),
+            value: String::new(),
+        })
+        .await;
+    }
+
     pub(super) async fn send_file_download(
         &mut self,
         process_id: ProcessId,

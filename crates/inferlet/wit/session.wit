@@ -60,6 +60,20 @@ interface session {
     /// `give-working-set` for a matcher.
     give-matcher: func(name: string, matcher: matcher) -> result<_, error>;
 
+    /// `take-working-set` for pictures: a process's output, or a client's
+    /// upload, decoded.
+    take-frames: func(name: string) -> option<frames>;
+
+    /// `give-working-set` for pictures: the client saves them or moves them
+    /// on to another process, and they never cross linear memory.
+    give-frames: func(name: string, f: frames) -> result<_, error>;
+
+    /// `take-frames` for sound.
+    take-pcm: func(name: string) -> option<pcm>;
+
+    /// `give-frames` for sound.
+    give-pcm: func(name: string, p: pcm) -> result<_, error>;
+
     /// Encodes `f` and streams the bytes to the client under `name`, WITHOUT
     /// the encoded file ever entering WASM linear memory.
     ///

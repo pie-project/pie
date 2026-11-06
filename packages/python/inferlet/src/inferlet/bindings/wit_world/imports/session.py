@@ -99,6 +99,32 @@ def give_matcher(name: str, matcher: grammar.Matcher) -> None:
     Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError
+def take_frames(name: str) -> Optional[frames.Frames]:
+    """
+    `take-working-set` for pictures: a process's output, or a client's
+    upload, decoded.
+    """
+    raise NotImplementedError
+def give_frames(name: str, f: frames.Frames) -> None:
+    """
+    `give-working-set` for pictures: the client saves them or moves them
+    on to another process, and they never cross linear memory.
+
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
+def take_pcm(name: str) -> Optional[frames.Pcm]:
+    """
+    `take-frames` for sound.
+    """
+    raise NotImplementedError
+def give_pcm(name: str, p: frames.Pcm) -> None:
+    """
+    `give-frames` for sound.
+
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
 def send_frames(f: frames.Frames, format: frames.ImageFormat, name: str) -> None:
     """
     Encodes `f` and streams the bytes to the client under `name`, WITHOUT

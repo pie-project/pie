@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 import json
 import msgpack
 import websockets
@@ -154,9 +155,12 @@ class Handle:
     """State this session owns between processes. Lazy: nothing exists on the
     server until a process binds it, so making one costs a name."""
 
-    def __init__(self, client: "PieClient", name: int):
+    def __init__(self, client: "PieClient", name: int, exists: bool = True):
         self.client = client
         self.name = name
+        # False for an output a process has yet to make: it can land, and
+        # there is nothing yet to move in.
+        self.exists = exists
 
     def marker(self, slot: str) -> dict:
         """What the input carries where this handle goes."""
@@ -177,6 +181,50 @@ class Handle:
 
 class WorkingSet(Handle):
     """One sequence's model state."""
+
+
+class Media(Handle):
+    """Host memory a process made or a client uploaded: it moves on to another
+    process without crossing the client, and comes down only when asked."""
+
+    async def read(self, format: str) -> bytes:
+        """The whole of this handle, encoded as `format`. It stays."""
+        # Picked here so the queue is open before the first chunk can arrive.
+        reader_id = str(uuid.uuid4())
+        self.client.process_event_queues[reader_id] = asyncio.Queue()
+        reader = Process(self.client, reader_id)
+        ok, result = await self.client._send_msg_and_wait(
+            {"type": "read_handle", "name": self.name, "format": format, "reader": reader_id}
+        )
+        if not ok:
+            del self.client.process_event_queues[reader_id]
+            raise HandleError(result)
+        data = None
+        while True:
+            event, value = await reader.recv()
+            if event == Event.File:
+                data = bytes(value)
+            elif event == Event.Return:
+                return data if data is not None else b""
+
+    async def save(self, path: "str | Path", format: str | None = None) -> None:
+        """Writes this handle to `path`, encoded as its suffix says."""
+        path = Path(path)
+        path.write_bytes(await self.read(format or path.suffix.lstrip(".")))
+
+
+class Frames(Media):
+    """Pictures, or one: `count` frames of RGB8."""
+
+    def marker(self, slot: str) -> dict:
+        return {"$handle": slot, "kind": "frames"}
+
+
+class Pcm(Media):
+    """Sound: interleaved samples at a rate."""
+
+    def marker(self, slot: str) -> dict:
+        return {"$handle": slot, "kind": "pcm"}
 
 
 class Matcher(Handle):
@@ -574,6 +622,19 @@ class PieClient:
         await self._handle_op({"op": "new", "name": name, "kind": {"matcher": source}})
         return Matcher(self, name)
 
+    async def frames(self, data: bytes | None = None) -> Frames:
+        """An upload, if `data` is given: encoded pictures, which decode where
+        a process binds them. Else a name for a process to give pictures to."""
+        name = self._next_handle()
+        if data is None:
+            return Frames(self, name, exists=False)
+        await self._handle_op({"op": "new", "name": name, "kind": {"frames": bytes(data)}})
+        return Frames(self, name)
+
+    def pcm(self) -> Pcm:
+        """A name for a process to give sound to."""
+        return Pcm(self, self._next_handle(), exists=False)
+
     async def launch_process(
         self,
         inferlet: str,
@@ -610,6 +671,8 @@ class PieClient:
         if not ok:
             raise Exception(f"Failed to launch process: {result}")
 
+        for handle in (returns or {}).values():
+            handle.exists = True
         process_id = result
         queue = asyncio.Queue()
         self.process_event_queues[process_id] = queue
@@ -640,8 +703,10 @@ class PieClient:
                     program.source.encode("utf-8"), f"{program.name}.py", program.version
                 )
         moved = {name: arg for name, arg in kwargs.items() if isinstance(arg, Handle)}
-        input = {**kwargs, **{name: arg.marker(name) for name, arg in moved.items()}}
-        return await self.launch_process(program, input=input, handles=moved, returns=moved)
+        present = {name: arg for name, arg in moved.items() if arg.exists}
+        input = {name: arg for name, arg in kwargs.items() if name not in moved}
+        input |= {name: arg.marker(name) for name, arg in present.items()}
+        return await self.launch_process(program, input=input, handles=present, returns=moved)
 
     async def attach_process(self, process_id: str) -> Process:
         """Attach to an existing process.

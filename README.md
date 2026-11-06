@@ -135,7 +135,20 @@ program to give it back. It lives as long as the client's connection, on one
 worker, and the planner may move it off the device while it rests. If that
 worker is lost the connection closes and says so; a turn is never run again on
 what no longer exists. A `client.matcher(json_schema=...)` moves the same way,
-beside the working set it constrains. See
+beside the working set it constrains.
+
+Pictures and sound work the same: a program gives them to the client, which
+saves them in the format it wants, or moves them on to another program with no
+bytes crossing the client:
+
+```python
+out = await client.frames()
+await (await client.run("image-gen@0.1.0", out=out, prompt="a cat")).result()
+await out.save("cat.png")
+await (await client.run("caption@0.1.0", image=out)).result()
+```
+
+See
 [`examples/working-set-handles`](examples/working-set-handles).
 
 To embed in a process, use [`pie-server`](https://pypi.org/project/pie-server/)

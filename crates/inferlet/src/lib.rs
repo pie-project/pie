@@ -97,6 +97,57 @@ pub mod session {
 
 pub mod frames {
     pub use crate::pie::inferlet::frames::{AudioFormat, Frames, ImageFormat, Pcm};
+    use crate::pie::inferlet::session;
+
+    #[derive(serde::Deserialize)]
+    struct Marker {
+        #[serde(rename = "$handle")]
+        handle: String,
+    }
+
+    impl Frames {
+        /// The handle the launch moved in under `name`.
+        pub fn take(name: &str) -> Option<Frames> {
+            session::take_frames(name)
+        }
+
+        /// Hands these pictures to the client under the launch's `name`.
+        pub fn give(self, name: &str) -> Result<(), String> {
+            session::give_frames(name, self)
+        }
+    }
+
+    impl Pcm {
+        /// The handle the launch moved in under `name`.
+        pub fn take(name: &str) -> Option<Pcm> {
+            session::take_pcm(name)
+        }
+
+        /// Hands this sound to the client under the launch's `name`.
+        pub fn give(self, name: &str) -> Result<(), String> {
+            session::give_pcm(name, self)
+        }
+    }
+
+    /// `Frames` in a typed input is the handle the client wrote there.
+    impl<'de> serde::Deserialize<'de> for Frames {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let Marker { handle } = Marker::deserialize(deserializer)?;
+            Frames::take(&handle).ok_or_else(|| {
+                serde::de::Error::custom(format!("the launch moved in no frames `{handle}`"))
+            })
+        }
+    }
+
+    /// `Pcm` in a typed input is the handle the client wrote there.
+    impl<'de> serde::Deserialize<'de> for Pcm {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let Marker { handle } = Marker::deserialize(deserializer)?;
+            Pcm::take(&handle).ok_or_else(|| {
+                serde::de::Error::custom(format!("the launch moved in no pcm `{handle}`"))
+            })
+        }
+    }
 }
 
 pub mod grammar {

@@ -60,6 +60,24 @@ export function takeMatcher(name: string): Matcher | undefined;
  */
 export function giveMatcher(name: string, matcher: Matcher): void;
 /**
+ * `take-working-set` for pictures: a process's output, or a client's
+ * upload, decoded.
+ */
+export function takeFrames(name: string): Frames | undefined;
+/**
+ * `give-working-set` for pictures: the client saves them or moves them
+ * on to another process, and they never cross linear memory.
+ */
+export function giveFrames(name: string, f: Frames): void;
+/**
+ * `take-frames` for sound.
+ */
+export function takePcm(name: string): Pcm | undefined;
+/**
+ * `give-frames` for sound.
+ */
+export function givePcm(name: string, p: Pcm): void;
+/**
  * Encodes `f` and streams the bytes to the client under `name`, WITHOUT
  * the encoded file ever entering WASM linear memory.
  * 

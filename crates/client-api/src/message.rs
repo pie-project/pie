@@ -17,6 +17,9 @@ pub type Handles = std::collections::BTreeMap<String, HandleName>;
 pub enum HandleKind {
     WorkingSet,
     Matcher(GrammarSource),
+    /// Pictures a client uploads, encoded; they decode where a process binds
+    /// them. What a process makes needs no `New`: name it in `returns`.
+    Frames(serde_bytes::ByteBuf),
 }
 
 /// A grammar as a client writes it. It compiles where a process binds it, the
@@ -139,6 +142,18 @@ pub enum ClientMessage {
     #[serde(rename = "handles")]
     Handles { corr_id: u32, ops: Vec<HandleOp> },
 
+    /// Downloads a `Frames` or `Pcm` handle, encoded as `format`: its file
+    /// comes as a process's would, under `reader`, a UUID the client picked so
+    /// it is listening before the first chunk, with a `return` when it has
+    /// all gone. The handle stays.
+    #[serde(rename = "read_handle")]
+    ReadHandle {
+        corr_id: u32,
+        name: HandleName,
+        format: String,
+        reader: String,
+    },
+
     #[serde(rename = "attach_process")]
     AttachProcess { corr_id: u32, process_id: String },
 
@@ -171,7 +186,7 @@ impl ClientMessage {
     #[must_use]
     pub fn uses_handles(&self) -> bool {
         match self {
-            ClientMessage::Handles { .. } => true,
+            ClientMessage::Handles { .. } | ClientMessage::ReadHandle { .. } => true,
             ClientMessage::LaunchProcess {
                 handles, returns, ..
             } => !handles.is_empty() || !returns.is_empty(),
@@ -188,6 +203,7 @@ impl ClientMessage {
             | ClientMessage::AddProgram { corr_id, .. }
             | ClientMessage::LaunchProcess { corr_id, .. }
             | ClientMessage::Handles { corr_id, .. }
+            | ClientMessage::ReadHandle { corr_id, .. }
             | ClientMessage::AttachProcess { corr_id, .. }
             | ClientMessage::TerminateProcess { corr_id, .. }
             | ClientMessage::ListProcesses { corr_id }
@@ -206,6 +222,7 @@ impl ClientMessage {
             | ClientMessage::AddProgram { corr_id, .. }
             | ClientMessage::LaunchProcess { corr_id, .. }
             | ClientMessage::Handles { corr_id, .. }
+            | ClientMessage::ReadHandle { corr_id, .. }
             | ClientMessage::AttachProcess { corr_id, .. }
             | ClientMessage::TerminateProcess { corr_id, .. }
             | ClientMessage::ListProcesses { corr_id }

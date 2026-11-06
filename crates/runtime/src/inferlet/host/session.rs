@@ -182,6 +182,50 @@ impl pie::inferlet::session::Host for ProcessCtx {
             .map(Resource::new_own))
     }
 
+    async fn take_frames(&mut self, name: String) -> Result<Option<Resource<Frames>>> {
+        Ok(self
+            .handles()
+            .and_then(|handles| handles.take_frames(&name))
+            .map(Resource::new_own))
+    }
+
+    async fn give_frames(
+        &mut self,
+        name: String,
+        f: Resource<Frames>,
+    ) -> Result<Result<(), String>> {
+        match self.handles() {
+            Some(handles) if handles.expects(&name) => {
+                handles.give(name, crate::handle::Moved::Frames(f.rep()));
+                Ok(Ok(()))
+            }
+            _ => {
+                pie::inferlet::frames::HostFrames::drop(self, f).await?;
+                Ok(Err(format!("this launch expects no frames `{name}`")))
+            }
+        }
+    }
+
+    async fn take_pcm(&mut self, name: String) -> Result<Option<Resource<Pcm>>> {
+        Ok(self
+            .handles()
+            .and_then(|handles| handles.take_pcm(&name))
+            .map(Resource::new_own))
+    }
+
+    async fn give_pcm(&mut self, name: String, p: Resource<Pcm>) -> Result<Result<(), String>> {
+        match self.handles() {
+            Some(handles) if handles.expects(&name) => {
+                handles.give(name, crate::handle::Moved::Pcm(p.rep()));
+                Ok(Ok(()))
+            }
+            _ => {
+                pie::inferlet::frames::HostPcm::drop(self, p).await?;
+                Ok(Err(format!("this launch expects no pcm `{name}`")))
+            }
+        }
+    }
+
     async fn take_matcher(
         &mut self,
         name: String,

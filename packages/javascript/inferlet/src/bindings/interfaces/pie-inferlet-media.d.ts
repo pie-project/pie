@@ -1,5 +1,6 @@
 /** @module Interface pie:inferlet/media@0.3.0 **/
 export type Error = import('./pie-inferlet-types.js').Error;
+export type Frames = import('./pie-inferlet-frames.js').Frames;
 /**
  * A visual span's extent in merged-token units.
  */
@@ -65,6 +66,12 @@ export class Image {
   * the model reads no stills or the bytes don't decode.
   */
   static fromBytes(bytes: Uint8Array): Image;
+  /**
+  * A one-frame `frames` as `from-bytes` reads an encoded still: pixels
+  * a process made, or a client uploaded, go on to a model with no
+  * codec between. Errors on more than one frame.
+  */
+  static fromFrames(f: Frames): Image;
   /**
   * THE SPAN, AS THE SEQUENCE CARRIES IT: prefix + placeholder run
   * (exactly `token-count` long) + suffix, in the bound model's own ids.

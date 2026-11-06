@@ -118,6 +118,10 @@ def _hydrate(value):
     if isinstance(value, dict):
         if value.get("kind") == "matcher" and "$handle" in value:
             return _inferlet.grammar.Matcher.take(value["$handle"])
+        if value.get("kind") == "frames" and "$handle" in value:
+            return _inferlet.frames.Frames.take(value["$handle"])
+        if value.get("kind") == "pcm" and "$handle" in value:
+            return _inferlet.frames.Pcm.take(value["$handle"])
         if len(value) == 1 and "$handle" in value:
             return _inferlet.eta.WorkingSet.from_input(value)
         return {key: _hydrate(item) for key, item in value.items()}

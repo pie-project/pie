@@ -261,9 +261,12 @@ export class HandleError extends Error {}
  * server until a process binds it, so making one costs a name.
  */
 export class Handle {
-    constructor(client, name) {
+    constructor(client, name, exists = true) {
         this.client = client;
         this.name = name;
+        // False for an output a process has yet to make: it can land, and
+        // there is nothing yet to move in.
+        this.exists = exists;
     }
 
     /** What the input carries where this handle goes. */
@@ -297,6 +300,47 @@ export class WorkingSet extends Handle {}
 export class Matcher extends Handle {
     marker(slot) {
         return { $handle: slot, kind: "matcher" };
+    }
+}
+
+/**
+ * Host memory a process made or a client uploaded: it moves on to another
+ * process without crossing the client, and comes down only when asked.
+ */
+export class Media extends Handle {
+    /** The whole of this handle, encoded as `format`. It stays. */
+    async read(format) {
+        // Picked here so the queue is open before the first chunk can arrive.
+        const readerId = globalThis.crypto.randomUUID();
+        this.client._openProcess(readerId);
+        const reader = new Process(this.client, readerId);
+        const { ok, result } = await this.client._sendMsgAndWait({
+            type: "read_handle", name: this.name, format, reader: readerId,
+        });
+        if (!ok) {
+            this.client.processEventQueues.delete(readerId);
+            throw new HandleError(result);
+        }
+        let data = new Uint8Array();
+        for (;;) {
+            const [event, value] = await reader.recv();
+            if (event === "file") data = value;
+            if (event === "return") return data;
+        }
+    }
+}
+
+/** Pictures, or one: `count` frames of RGB8. */
+export class Frames extends Media {
+    marker(slot) {
+        return { $handle: slot, kind: "frames" };
+    }
+}
+
+/** Sound: interleaved samples at a rate. */
+export class Pcm extends Media {
+    marker(slot) {
+        return { $handle: slot, kind: "pcm" };
     }
 }
 
@@ -639,6 +683,19 @@ export class PieClient {
     // Handles
     // =========================================================================
 
+    /** The queue a process's events arrive on, with any that came first. */
+    _openProcess(processId) {
+        const queue = new AsyncQueue();
+        this.processEventQueues.set(processId, queue);
+        if (this.orphanEvents.has(processId)) {
+            for (const tuple of this.orphanEvents.get(processId)) {
+                queue.put(tuple);
+            }
+            this.orphanEvents.delete(processId);
+        }
+        return queue;
+    }
+
     _nextHandle() {
         this.lastHandle = (this.lastHandle ?? 0) + 1;
         return this.lastHandle;
@@ -657,6 +714,23 @@ export class PieClient {
         const name = this._nextHandle();
         await this._handleOp({ op: "new", name, kind: "working_set" });
         return new WorkingSet(this, name);
+    }
+
+    /**
+     * An upload, if `data` is given: encoded pictures, which decode where a
+     * process binds them. Else a name for a process to give pictures to.
+     * @param {Uint8Array} [data]
+     */
+    async frames(data) {
+        const name = this._nextHandle();
+        if (data === undefined) return new Frames(this, name, false);
+        await this._handleOp({ op: "new", name, kind: { frames: data } });
+        return new Frames(this, name);
+    }
+
+    /** A name for a process to give sound to. */
+    pcm() {
+        return new Pcm(this, this._nextHandle(), false);
     }
 
     /**
@@ -708,16 +782,9 @@ export class PieClient {
             throw new Error(`Failed to launch process: ${result}`);
         }
 
+        for (const handle of Object.values(returns)) handle.exists = true;
         const processId = result;
-        const queue = new AsyncQueue();
-        this.processEventQueues.set(processId, queue);
-        // Replay orphan events
-        if (this.orphanEvents.has(processId)) {
-            for (const tuple of this.orphanEvents.get(processId)) {
-                queue.put(tuple);
-            }
-            this.orphanEvents.delete(processId);
-        }
+        const queue = this._openProcess(processId);
 
         return new Process(this, processId);
     }
@@ -744,11 +811,17 @@ export class PieClient {
         const moved = Object.fromEntries(
             Object.entries(input).filter(([, arg]) => arg instanceof Handle),
         );
+        const present = Object.fromEntries(
+            Object.entries(moved).filter(([, arg]) => arg.exists),
+        );
+        const plain = Object.fromEntries(
+            Object.entries(input).filter(([name]) => !(name in moved)),
+        );
         const marked = Object.fromEntries(
-            Object.entries(moved).map(([name, arg]) => [name, arg.marker(name)]),
+            Object.entries(present).map(([name, arg]) => [name, arg.marker(name)]),
         );
         return await this.launchProcess(
-            program, { ...input, ...marked }, true, {}, { handles: moved, returns: moved },
+            program, { ...plain, ...marked }, true, {}, { handles: present, returns: moved },
         );
     }
 

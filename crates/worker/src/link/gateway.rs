@@ -724,6 +724,7 @@ fn corr_id_of(m: &ClientMessage) -> Option<u32> {
         | AddProgram { corr_id, .. }
         | LaunchProcess { corr_id, .. }
         | Handles { corr_id, .. }
+        | ReadHandle { corr_id, .. }
         | AttachProcess { corr_id, .. }
         | TerminateProcess { corr_id, .. }
         | ListProcesses { corr_id }
@@ -741,7 +742,9 @@ enum ProcBinding {
 impl ProcBinding {
     fn of(m: &ClientMessage) -> Self {
         match m {
-            ClientMessage::LaunchProcess { .. } => Self::FromReply,
+            ClientMessage::LaunchProcess { .. } | ClientMessage::ReadHandle { .. } => {
+                Self::FromReply
+            }
             ClientMessage::AttachProcess { process_id, .. } => Self::Known(process_id.clone()),
             _ => Self::None,
         }
