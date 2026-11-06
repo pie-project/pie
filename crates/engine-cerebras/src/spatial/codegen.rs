@@ -405,7 +405,7 @@ pub struct Variant {
     /// rounding undone in f32 on the down partial (`trm_silh.json`); **4096**
     /// (with 512) its f16 gammas made in place in the f32 gammas' words on the
     /// first pass, no copies (`trm_xgi.json`; the host places the weights
-    /// once, after init).
+    /// once, after init); **8192** (with 1024 and 4) the grids take 1024 too.
     pub trim: u16,
 }
 
@@ -683,8 +683,8 @@ impl Variant {
             s = apply_reps("arfs_ops", src::ARFS_OPS, &s, tag)?;
         }
         if self.trim != 0 && (region || self.trim & 4 != 0) {
-            if self.trim & 1 == 0 || self.trim > 8191 {
-                return Err(format!("gen: {tag}: TRM {} unknown (1 the cuts, 2 and the sums of squares, 4 the grids too, 8 exp at degree 4, 16 the residuals from the fabric, 32 the head's split_x, 64 HV's zero copies, 128 HV's entries once a pass, 256 rsqrt in two Newton steps, 512 x g in f16, 1024 the MLP's act in f16 on every PE: no act all-reduce, 2048 its scales in f16, 4096 512's f16 gammas in place on the first pass)", self.trim));
+            if self.trim & 1 == 0 || self.trim > 16383 {
+                return Err(format!("gen: {tag}: TRM {} unknown (1 the cuts, 2 and the sums of squares, 4 the grids too, 8 exp at degree 4, 16 the residuals from the fabric, 32 the head's split_x, 64 HV's zero copies, 128 HV's entries once a pass, 256 rsqrt in two Newton steps, 512 x g in f16, 1024 the MLP's act in f16 on every PE: no act all-reduce, 2048 its scales in f16, 4096 512's f16 gammas in place on the first pass, 8192 the grids take 1024)", self.trim));
             }
             if self.trim & 128 != 0 && self.trim & 64 == 0 {
                 return Err(format!("gen: {tag}: TRM 128 needs 64 (the zero run)"));
@@ -724,7 +724,7 @@ impl Variant {
                     s = apply_reps("trm_xgi", src::TRM_XGI, &s, tag)?;
                 }
             }
-            if self.trim & 1024 != 0 && region {
+            if self.trim & 1024 != 0 && (region || self.trim & 8192 != 0) {
                 // (regions only: act = silu(s g) (s u) in f16 on every PE of a column, from
                 // the gate-up all-reduce, in place of one row an element and the act gather)
                 if self.trim & 16 == 0 {

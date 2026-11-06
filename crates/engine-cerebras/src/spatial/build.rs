@@ -209,7 +209,8 @@ pub struct ServeConfig {
     pub hvc: bool,
     /// With `trim`, models without q/k norms: the regions' MLP act in f16 on
     /// every PE of a column from the gate-up all-reduce, no act all-reduce
-    /// (`TRM` bit 1024; inexact, so not for the q/k-norm models' exact bits).
+    /// (`TRM` bit 1024; with the grids' cuts also 8192, the grids too; inexact,
+    /// so not for the q/k-norm models' exact bits).
     pub silu16: bool,
     /// With `trim`, models without q/k norms: the regions' x g in f16, its
     /// f16 gammas made in place on the first pass (`TRM` bits 512 + 4096;
@@ -1471,6 +1472,8 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
                     | (usize::from(cfg.grid_levers && cfg.f16accg) << 2)
                     // (silu16: TRM 1024, the regions' act in f16, no act all-reduce; inexact)
                     | (usize::from(cfg.silu16 && !plan.spec.qk_norm) << 10)
+                    // (and 8192: the grids too, when they take the cuts)
+                    | (usize::from(cfg.silu16 && !plan.spec.qk_norm && cfg.grid_levers && cfg.f16accg) << 13)
                     // (xg16: TRM 512 + 4096, x g in f16 with in-place f16 gammas; inexact)
                     | (if cfg.xg16 && !plan.spec.qk_norm { 512 | 4096 } else { 0 })
             } else {
@@ -3069,24 +3072,24 @@ mod llama31_8b {
                 assert!(text.contains("(trm 64)") && text.contains("(arfs)"), "{n}");
             }
         }
-        // + silu16: TRM 1535 (0538's sp538_t17b): the regions' act in f16, no act all-reduce
+        // + silu16: TRM 9727 (0538's sp538_t21): the units' act in f16, no act all-reduce
         cfg.silu16 = true;
         let (d, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:1535,ARY:16,HVC:1")));
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:9727,ARY:16,HVC:1")));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         for (n, text) in d.files_with(lay.model.variant()).unwrap() {
-            assert_eq!(text.contains("(trm 1024)"), n == "region_pe.csl", "{n}");
+            assert_eq!(text.contains("(trm 1024)"), n == "region_pe.csl" || n == "grid_pe.csl", "{n}");
         }
-        // + xg16: TRM 6143 (0538's sp538_t19)
+        // + xg16: TRM 14335 (0538's sp538_t20)
         cfg.xg16 = true;
         let (_, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:6143,ARY:16,HVC:1")));
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:14335,ARY:16,HVC:1")));
     }
 
     /// `ops2` on 0472's config states 0480's program: the same parameters
