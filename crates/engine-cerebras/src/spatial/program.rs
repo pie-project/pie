@@ -875,6 +875,30 @@ impl ProgramSpec {
         )
     }
 
+    /// Whether the layers' weights and the head's tiles are bf16 (`W16` 1,
+    /// `WF32` 0: serve_q35 past 0.8B); else f32.
+    #[must_use]
+    pub fn w16(&self) -> bool {
+        self.knobs.get("W16").is_some_and(|v| v.trim() == "1")
+    }
+
+    /// The program's build directory: its design's files for the model's
+    /// variant and, at `W4 1`, its u4g64 units ([`Design::files_for`]);
+    /// serve_q35w's for a W16 serve_q35 (serve_q35 itself stays #1412's f32
+    /// program).
+    pub fn files(&self) -> Result<Vec<super::codegen::File>, String> {
+        let (variant, u4) = (self.model.variant(), self.weights_u4());
+        if self.design == Design::ServeQ35 && self.w16() {
+            if variant != super::codegen::Variant::default() || u4 {
+                return Err(format!(
+                    "serve_q35w: no model variant ({variant:?}) or u4g64 (W4) units"
+                ));
+            }
+            return super::codegen::serve_q35w();
+        }
+        self.design.files_for(variant, u4)
+    }
+
     /// serve_q35's layer mix (`None`: every layer attends).
     #[must_use]
     pub fn hybrid(&self) -> Option<Hybrid> {
@@ -1308,8 +1332,10 @@ fn headmode(get: &Get, what: &str) -> R<()> {
 /// serve2d / serve2d_pipe: f32 qwen2d grids, head2d east of them.
 fn serve2d(design: Design, get: &Get) -> R<ProgramSpec> {
     headmode(get, "serve2d with head2d")?;
-    if get.req("W16")? != 0 || get.req("KV16")? != 0 || get.req("WF32")? != 1 {
-        return Err("the engine places f32 weights and KV (W16 0, KV16 0, WF32 1)".into());
+    // serve_q35 also places bf16 weights with bf16 head tiles (W16 1, WF32 0).
+    let w16 = design == Design::ServeQ35 && get.req("W16")? == 1 && get.req("WF32")? == 0;
+    if !w16 && (get.req("W16")? != 0 || get.req("WF32")? != 1) || get.req("KV16")? != 0 {
+        return Err("the engine places f32 weights and KV (W16 0, KV16 0, WF32 1; serve_q35 also W16 1, WF32 0)".into());
     }
     let grid = kernel(get)?;
     let host_copy = get.opt("KVCP").unwrap_or(1) == 0;
@@ -1802,7 +1828,7 @@ mod tests {
             let spec = ProgramSpec::from_params(design, &params).unwrap();
             let Some(abi) = spec.vm_abi() else { continue };
             seen += 1;
-            let files = design.files().unwrap();
+            let files = spec.files().unwrap();
             let all: String = files.iter().map(|f| f.1.as_str()).collect();
             // gring: guest4hm's `[2]u32`, guest4hz's `[if (CONC) 4 else 3]`
             // (VMCONC's fourth word the host writes as it needs).

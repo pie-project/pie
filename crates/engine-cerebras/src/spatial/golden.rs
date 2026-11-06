@@ -1074,7 +1074,7 @@ fn the_abi_covers_every_call_and_the_sources_export_it() {
     for (sc, phases) in runs() {
         let spec = ProgramSpec::from_params(sc.built, &sc.params).unwrap();
         let abi = spec.abi();
-        let files = sc.built.files().unwrap();
+        let files = spec.files().unwrap();
         let exports = super::codegen::layout_exports(&files[0].1);
         for (owner, sym) in &abi {
             assert!(

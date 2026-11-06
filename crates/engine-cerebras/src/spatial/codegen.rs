@@ -38,6 +38,10 @@ mod src {
     pub const QWEN35_GDN: &str = include_str!("csl/kernels/qwen35_gdn.csl");
     pub const QWEN35_ATTN: &str = include_str!("csl/kernels/qwen35_attn.csl");
     pub const Q35_LAYOUT: &str = include_str!("csl/serve_q35/layout.csl");
+    /// serve_q35w's (bf16 weights and head tiles).
+    pub const QWEN35W_GDN: &str = include_str!("csl/kernels/qwen35w_gdn.csl");
+    pub const QWEN35W_ATTN: &str = include_str!("csl/kernels/qwen35w_attn.csl");
+    pub const Q35W_LAYOUT: &str = include_str!("csl/serve_q35w/layout.csl");
     /// Gemma 4's layer unit and serve_g4's own files.
     pub const GEMMA4_LAYER: &str = include_str!("csl/kernels/gemma4_layer.csl");
     pub mod g4 {
@@ -599,6 +603,10 @@ fn s2d_variant(kernel: &str) -> String {
 const S2D_XN: u16 = Hc;           // x's words a PE\n\
 // qwen2d has no paged pool: the copy launches only return.\n{COPY_FNS}"
         ),
+        "qwen35w_gdn" | "qwen35w_attn" => s2d_variant("qwen2d_paged").replace(
+            "const WS = f32;                   // its weights and KV (the exports' types)",
+            "const WS = if (W16 == 1) u16 else f32; // its weights (W16: bf16) and KV, the exports' types",
+        ),
         _ => "const PX: u16 = P;                // the square grid's sides\n\
 const PY: u16 = P;\n\
 // Queue 2: free in qwen2d_paged (its page copies ride on c_bc); serve2d's.\n\
@@ -722,7 +730,7 @@ fn s2d_pass_start(i: u32, start_pos: u32) void {{\n{}\n}}\n",
     let mut own = exports(&s);
     own.push("stamps".into());
     // The paged grids hold the staging slots; qwen2d's launches only return.
-    let stage = if kernel == "qwen2d_paged" || kernel == "qwen35_attn" {
+    let stage = if kernel == "qwen2d_paged" || kernel == "qwen35_attn" || kernel == "qwen35w_attn" {
         own.extend(["kstage", "vstage"].map(String::from));
         src::s2d::KVSTAGE
     } else {
@@ -1003,6 +1011,20 @@ const Q35_NAMES: &[(&str, &str)] = &[
     ("wg", "f32"),
 ];
 
+/// serve_q35w's: its units' weights at their type (`WS`: bf16 under `W16`).
+const Q35W_NAMES: &[(&str, &str)] = &[
+    ("wp", "WS"),
+    ("cw", "f32"),
+    ("cst", "f32"),
+    ("gab", "f32"),
+    ("nw", "f32"),
+    ("st", "f32"),
+    ("wg", "WS"),
+];
+
+/// serve2d's grid names a serve_q35w unit holds at its weights' type (`WS`).
+const Q35W_WS_NAMES: &[&str] = &["wqa", "wqv", "wv"];
+
 /// A slot reset that only returns (every PE but the GDN unit's).
 const RESET_FN: &str = "fn reset(b: u32) void { sys_mod.unblock_cmd_stream(); }\ncomptime {\n  @export_symbol(reset);\n}\n";
 
@@ -1024,6 +1046,65 @@ fn q35_more(text: String, fns: &str) -> String {
         lines.push(format!("  @export_symbol(q35_dum_ptr, \"{n}\");"));
     }
     let dummies = if lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "// serve_q35: the units' exported names.\n{}\ncomptime {{\n{}\n}}\n",
+            decls.join("\n"),
+            lines.join("\n")
+        )
+    };
+    format!(
+        "// serve_q35: serve2d's generated program with the qwen35 units' names.\n{}\n{dummies}{fns}",
+        text.trim_end_matches('\n')
+    )
+}
+
+/// serve2d's program `text` made serve_q35w's: as `q35_more`, the weight
+/// names typed `WS` (serve2d's own f32 dummies for them too), one dummy a
+/// type.
+fn q35w_more(text: String, fns: &str) -> String {
+    let own = exports(&text);
+    let mut text = text;
+    let mut ws = false;
+    for n in Q35W_WS_NAMES {
+        let at = format!("_ptr, \"{n}\");");
+        let lines: Vec<String> = text
+            .lines()
+            .map(|l| match l.trim().strip_prefix("@export_symbol(s2d_dum") {
+                Some(rest) if rest.ends_with(&at) => {
+                    ws = true;
+                    format!("  @export_symbol(q35_dws_ptr, \"{n}\");")
+                }
+                _ => l.to_string(),
+            })
+            .collect();
+        text = lines.join("\n") + "\n";
+    }
+    let mut decls = Vec::new();
+    if ws {
+        decls.push("var q35_dws = @zeros([1]WS);\nvar q35_dws_ptr: [*]WS = &q35_dws;".to_string());
+    }
+    let mut lines = Vec::new();
+    let mut types: Vec<&str> = Vec::new();
+    for &(n, ty) in Q35W_NAMES {
+        if own.iter().any(|o| o == n) {
+            continue;
+        }
+        let k = match types.iter().position(|t| *t == ty) {
+            Some(i) => i,
+            None => {
+                types.push(ty);
+                decls.push(format!(
+                    "var q35_dum{i} = @zeros([1]{ty});\nvar q35_dum{i}_ptr: [*]{ty} = &q35_dum{i};",
+                    i = types.len() - 1
+                ));
+                types.len() - 1
+            }
+        };
+        lines.push(format!("  @export_symbol(q35_dum{k}_ptr, \"{n}\");"));
+    }
+    let dummies = if decls.is_empty() {
         String::new()
     } else {
         format!(
@@ -1067,6 +1148,43 @@ pub fn serve_q35() -> R<Vec<File>> {
         ),
         ("vm_pe.csl", q35_more(s2d_vm()?, RESET_FN)),
     ])
+}
+
+/// serve_q35w's build directory: serve_q35 with bf16 weights and head tiles
+/// (`W16` 1, `WF32` 0: Qwen3.5 past 0.8B), from qwen35w_gdn and qwen35w_attn.
+/// serve_q35 itself stays #1412's program, file for file.
+pub fn serve_q35w() -> R<Vec<File>> {
+    let gdn = q35w_more(s2d_grid("qwen35w_gdn", src::QWEN35W_GDN)?, COPY_FNS);
+    let attn = q35w_more(s2d_grid("qwen35w_attn", src::QWEN35W_ATTN)?, RESET_FN);
+    Ok(vec![
+        ("layout.csl", src::Q35W_LAYOUT.to_string()),
+        ("paths.csl", src::s2d::PATHS.to_string()),
+        ("rt.csl", src::RT.to_string()),
+        ("gdn_pe.csl", gdn),
+        ("attn_pe.csl", attn),
+        ("head_pe.csl", q35w_more(s2d_head()?, RESET_FN)),
+        (
+            "head_stub.csl",
+            q35w_more(
+                s2d_plain(src::s2d::STUB_BASE, "stub_base.csl", "the stub head"),
+                RESET_FN,
+            ),
+        ),
+        (
+            "filler.csl",
+            q35w_more(
+                s2d_plain(src::s2d::FILLER_BASE, "filler_base.csl", "the filler"),
+                RESET_FN,
+            ),
+        ),
+        ("vm_pe.csl", q35w_more(s2d_vm()?, RESET_FN)),
+    ])
+}
+
+/// A serve_q35 program's files by its params: serve_q35w's for a W16 build,
+/// else serve_q35's.
+pub fn serve_q35_for(w16: bool) -> R<Vec<File>> {
+    if w16 { serve_q35w() } else { serve_q35() }
 }
 
 // ---------------------------------------------------------------- serve_g4
@@ -2761,7 +2879,9 @@ mod tests {
     fn dump_serve_q35() {
         let dir = std::path::PathBuf::from(std::env::var("Q35_OUT").expect("Q35_OUT"));
         std::fs::create_dir_all(&dir).unwrap();
-        for (name, text) in serve_q35().expect("serve_q35 generates") {
+        // Q35_W16=1: serve_q35w's.
+        let w16 = std::env::var("Q35_W16").is_ok_and(|v| v == "1");
+        for (name, text) in serve_q35_for(w16).expect("serve_q35 generates") {
             std::fs::write(dir.join(name), text).unwrap();
         }
     }
@@ -3032,6 +3152,38 @@ mod tests {
         ),
     ];
 
+    /// serve_q35w's files (the W16 program, Qwen3.5-4B), pinned as serve_q35's.
+    const Q35W_PINNED: &[(&str, &str)] = &[
+        (
+            "layout.csl",
+            "379cfb4749ee1a3ab70ee11e76dc7fa76af227313a55f5b055a78020f2c2ff82",
+        ),
+        (
+            "gdn_pe.csl",
+            "47008cffb229da2bd80a0e14fb6c7ef70c38476a7a19c7df4af9f2b6695a928e",
+        ),
+        (
+            "attn_pe.csl",
+            "187150bfa8b4f663b3299d025c3721b060c223b2925172a24225fd4c9085331a",
+        ),
+        (
+            "head_pe.csl",
+            "45780603d7a0d0f41e7ee17f43f715575427a67b1d08ed1c61fc921a50e54f59",
+        ),
+        (
+            "head_stub.csl",
+            "a1cbaf509d9eeb100687c85273d4af73423326dfb6c667d9ba3634f807a8eb6a",
+        ),
+        (
+            "filler.csl",
+            "557fb15fae7c4585fbc7f127046920d60ebf2d5fa3c878626a85f7ec99f519ce",
+        ),
+        (
+            "vm_pe.csl",
+            "a045aecf6cefc919fa2ae66e6d15761111e23adf4d11927ad5dfb13a35bc7e8e",
+        ),
+    ];
+
     /// serve_g4's files as validated on CS-3 (0385: E2B bare with WIN 512,
     /// greedy 64/64 x3 against the f32 golden, 720/720 past the window).
     const G4_PINNED: &[(&str, &str)] = &[
@@ -3150,9 +3302,17 @@ mod tests {
 
     #[test]
     fn serve_q35_matches_its_pins() {
-        let files = serve_q35().unwrap();
+        for (files, pins) in [
+            (serve_q35().unwrap(), Q35_PINNED),
+            (serve_q35w().unwrap(), Q35W_PINNED),
+        ] {
+            q35_pins_hold(&files, pins);
+        }
+    }
+
+    fn q35_pins_hold(files: &[File], pins: &[(&str, &str)]) {
         let mut moved = Vec::new();
-        for (file, want) in Q35_PINNED {
+        for (file, want) in pins {
             let got = files.iter().find(|(n, _)| n == file).unwrap();
             let have = blake3::hash(got.1.as_bytes()).to_hex().to_string();
             if have != *want {

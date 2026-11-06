@@ -20,6 +20,7 @@
 
 use super::ckpt::{Ckpt, Tensor};
 use super::program::{Hybrid, ProgramSpec};
+use super::serve2d::bf16;
 use super::wafer::rect;
 use crate::spatial::device::Device;
 
@@ -31,9 +32,27 @@ const PADDED: &[&str] = &[
     "wp", "wo", "wgu", "wd", "wqa", "wqv", "wv", "wg", "kc", "vc",
 ];
 
-/// `data` (row-major by PE over a `p` x `p` grid at `at`) to `symbol`.
-fn put(dev: &mut dyn Device, symbol: &str, data: &[f32], at: (usize, usize), p: usize) -> R<()> {
+/// The weights a `W16` build holds in bf16 (one leading pad element).
+const WEIGHTS: &[&str] = &["wp", "wo", "wgu", "wd", "wqa", "wqv", "wv", "wg"];
+
+/// `data` (row-major by PE over a `p` x `p` grid at `at`) to `symbol`;
+/// under `w16` a weight's as bf16.
+fn put(
+    dev: &mut dyn Device,
+    symbol: &str,
+    data: &[f32],
+    at: (usize, usize),
+    p: usize,
+    w16: bool,
+) -> R<()> {
     let n = data.len() / (p * p);
+    if w16 && WEIGHTS.contains(&symbol) {
+        let words: Vec<u32> = data
+            .chunks_exact(n)
+            .flat_map(|pe| std::iter::once(0).chain(pe.iter().map(|&x| u32::from(bf16(x)))))
+            .collect();
+        return dev.put16(symbol, rect(at.0, at.1, p, p), n + 1, &words);
+    }
     let pad = PADDED.contains(&symbol);
     let words: Vec<u32> = if pad {
         data.chunks_exact(n)
@@ -89,7 +108,7 @@ pub(crate) fn place_layers(
         tiles.extend(mlp_tiles(&d, ckpt, l)?);
         let origin = lay.origin(l);
         for (sym, data) in &tiles {
-            put(dev, sym, data, origin, p)?;
+            put(dev, sym, data, origin, p, lay.w16())?;
         }
         tracing::info!(
             layer = l,

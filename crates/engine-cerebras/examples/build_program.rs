@@ -30,7 +30,7 @@ fn main() -> Result<(), String> {
             let dir = std::path::PathBuf::from(args.get(4).ok_or("an output directory")?);
             let program = ProgramSpec::from_params(d, &p)?;
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            for (name, text) in d.files_with(program.model.variant())? {
+            for (name, text) in program.files()? {
                 std::fs::write(dir.join(name), text).map_err(|e| e.to_string())?;
             }
             let (w, h) = program.rectangle();

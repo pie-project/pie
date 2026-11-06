@@ -253,7 +253,7 @@ const COPY_CODE: usize = 922;
 const RING_CODE: usize = 576;
 
 impl Grid {
-    fn weight_bytes(&self) -> usize {
+    pub(super) fn weight_bytes(&self) -> usize {
         if self.w4 {
             // The six u4 tiles (codes, groups' scales and biases, segments)
             // and the decode scratch (`u4::pe_bytes`).
@@ -694,11 +694,24 @@ impl SpatialPlan {
     /// and the next and above the last. The fewest vocabulary rows a PE
     /// (multiples of 32) that fit.
     pub(super) fn head32(spec: &ModelSpec, grid: &Grid, height: usize, gh: usize) -> Option<Head> {
+        Self::head_s2d(spec, grid, height, gh, true)
+    }
+
+    /// [`Self::head32`]'s head with f32 or (`!f32`) bf16 tiles, in the same
+    /// bytes of tables a PE.
+    pub(super) fn head_s2d(
+        spec: &ModelSpec,
+        grid: &Grid,
+        height: usize,
+        gh: usize,
+        f32: bool,
+    ) -> Option<Head> {
         let p = grid.py;
         let tables = if spec.tied { 1 } else { 2 };
+        let el = if f32 { 4 } else { 2 };
         (1..)
             .map(|k| k * VR_STEP)
-            .take_while(|vr| tables * 4 * grid.hc * vr <= HEAD32_TABLES)
+            .take_while(|vr| tables * el * grid.hc * vr <= HEAD32_TABLES)
             .find_map(|vr| {
                 let hh = spec.vocab.div_ceil(vr).next_multiple_of(2);
                 let f = hh / 2;
@@ -716,7 +729,7 @@ impl SpatialPlan {
                     blocks: 1,
                     vmc: 1,
                     untied: !spec.tied,
-                    f32: true,
+                    f32,
                 })
             })
     }

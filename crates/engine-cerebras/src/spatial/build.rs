@@ -1689,7 +1689,7 @@ pub fn compile(program: &ProgramSpec, target: crate::sdk::Target, system: bool) 
     use crate::sdk::{Arch, Compile, Cslc};
     let (design, params) = (program.design, &program.to_params());
     shapes::check(design, params)?;
-    let files = design.files_for(program.model.variant(), program.weights_u4())?;
+    let files = program.files()?;
     let (w, h) = program.rectangle();
     let (w, h) = (w as u32, h as u32);
     let (fabric_dims, fabric_offsets) = crate::sdk::cslc::memcpy_fabric(w, h);
