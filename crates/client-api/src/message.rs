@@ -22,6 +22,40 @@ pub enum HandleKind {
     Frames(serde_bytes::ByteBuf),
 }
 
+/// Why a handle op or launch was refused, for a client to branch on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandleErrorCode {
+    /// No such name in this session.
+    Unknown,
+    /// It existed and is gone; the message says why.
+    Dead,
+    /// A session or worker limit: closing a handle makes room.
+    Quota,
+    /// The name is taken, or the handle is in a process.
+    InUse,
+    /// The request could never work, whatever the session held.
+    Invalid,
+}
+
+impl HandleErrorCode {
+    /// What a refusal's text starts with.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HandleErrorCode::Unknown => "unknown",
+            HandleErrorCode::Dead => "dead",
+            HandleErrorCode::Quota => "quota",
+            HandleErrorCode::InUse => "in_use",
+            HandleErrorCode::Invalid => "invalid",
+        }
+    }
+}
+
+/// Frames that wait behind a launch or a lent handle, at each layer that holds
+/// them. They are what a client has sent and nothing has answered.
+pub const MAX_WAITING_HANDLE_FRAMES: usize = 256;
+
 /// A grammar as a client writes it. It compiles where a process binds it, the
 /// tokenizer being the worker's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

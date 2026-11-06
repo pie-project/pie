@@ -554,8 +554,7 @@ impl Session {
         let lease = match self.handles.lend(self.id, handles, returns, room) {
             Ok(lease) => lease,
             Err(why) => {
-                self.send_response(corr_id, false, format!("launch refused: {why}"))
-                    .await;
+                self.send_response(corr_id, false, why.to_string()).await;
                 return;
             }
         };
@@ -785,7 +784,7 @@ impl Session {
         reader: &str,
     ) {
         let read = uuid::Uuid::parse_str(reader)
-            .map_err(|_| "a reader is a UUID".to_string())
+            .map_err(|_| "invalid: a reader is a UUID".to_string())
             .and_then(|id| Ok((id, self.handles.read(name, format)?)));
         let (id, (encode, file)) = match read {
             Ok(read) => read,

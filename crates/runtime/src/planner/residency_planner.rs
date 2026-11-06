@@ -230,8 +230,8 @@ impl ResidencyPlanner {
         self.with_inner(|inner| {
             let seq = inner.next_seq;
             inner.next_seq += 1;
-            let mut proc = Proc::new(u64::MAX - seq);
-            proc.key = i64::MIN;
+            let mut proc = Proc::new(0);
+            proc.rest(seq);
             proc.holder = true;
             proc.admitted = true;
             proc.idle = true;
@@ -282,8 +282,7 @@ impl ResidencyPlanner {
             let seq = inner.next_seq;
             inner.next_seq += 1;
             if let Some(proc) = inner.procs.get_mut(&pid) {
-                proc.key = i64::MIN;
-                proc.seq = u64::MAX - seq;
+                proc.rest(seq);
             }
         });
         self.set_idle(pid, true);

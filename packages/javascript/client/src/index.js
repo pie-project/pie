@@ -253,8 +253,24 @@ export function withUpgradePath(serverUri) {
     return url.toString();
 }
 
-/** A handle op the server refused: unknown, dead, or in use. */
-export class HandleError extends Error {}
+const HANDLE_CODES = ["unknown", "dead", "quota", "in_use", "invalid"];
+
+/** The code a refusal's text starts with, if it is one. */
+function refusalCode(message) {
+    const code = message.split(":", 1)[0];
+    return HANDLE_CODES.includes(code) ? code : null;
+}
+
+/**
+ * A handle op or launch was refused. `code` says how: `unknown`, `dead`,
+ * `quota`, `in_use` or `invalid`.
+ */
+export class HandleError extends Error {
+    constructor(message, code = null) {
+        super(message);
+        this.code = code ?? refusalCode(message);
+    }
+}
 
 /**
  * State this session owns between processes. Lazy: nothing exists on the
@@ -706,7 +722,7 @@ export class PieClient {
         const { ok, result } = await this._sendMsgAndWait({ type: "handles", ops: [op] });
         if (!ok) throw new HandleError(result);
         const [answer] = JSON.parse(result);
-        if (answer.error) throw new HandleError(answer.error);
+        if (answer.error) throw new HandleError(answer.error, answer.code);
         return answer;
     }
 
@@ -784,6 +800,7 @@ export class PieClient {
         };
         const { ok, result } = await this._sendMsgAndWait(msg);
         if (!ok) {
+            if (refusalCode(result)) throw new HandleError(result);
             throw new Error(`Failed to launch process: ${result}`);
         }
 

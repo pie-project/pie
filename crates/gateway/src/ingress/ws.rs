@@ -150,10 +150,6 @@ async fn end(tx: &mut Tx, corr: Option<u32>, why: &str) {
         .await;
 }
 
-/// Handle frames held behind a launch waiting at admission. Reading on past
-/// that would keep them here unbounded, whatever the session's quotas say.
-const MAX_QUEUED_HANDLE_FRAMES: usize = 256;
-
 async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
     let (mut tx, mut rx_ws) = socket.split();
 
@@ -181,7 +177,8 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
     let mut admitting = futures::stream::FuturesUnordered::new();
     // Handle frames keep the order they were sent in, a waiting launch among
     // them: a fork sent after a launch forks what that launch wrote.
-    let (handle_tx, handle_rx) = tokio::sync::mpsc::channel::<TurnInput>(MAX_QUEUED_HANDLE_FRAMES);
+    let (handle_tx, handle_rx) =
+        tokio::sync::mpsc::channel::<TurnInput>(client_api::MAX_WAITING_HANDLE_FRAMES);
     let mut in_order = std::pin::pin!(
         futures::stream::unfold(handle_rx, |mut rx| async move {
             let req = rx.recv().await?;

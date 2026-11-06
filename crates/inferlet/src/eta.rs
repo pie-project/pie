@@ -431,12 +431,7 @@ impl Default for WorkingSet {
 /// `{"$handle": "<name>"}`.
 impl<'de> serde::Deserialize<'de> for WorkingSet {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(serde::Deserialize)]
-        struct Marker {
-            #[serde(rename = "$handle")]
-            handle: String,
-        }
-        let Marker { handle } = Marker::deserialize(deserializer)?;
+        let handle = crate::handle_marker(deserializer)?;
         WorkingSet::take(&handle).ok_or_else(|| {
             serde::de::Error::custom(format!("the launch moved in no handle `{handle}`"))
         })

@@ -67,7 +67,7 @@ async def t_lazy(c, prog, whole):
     x = await run(c, prog, v, PROMPT, 32); check("a forked unborn runs", x == whole)
     await u.close()
     try: await u.stat(); check("closed is unknown", False)
-    except HandleError as e: check("closed is unknown", "unknown" in str(e), str(e))
+    except HandleError as e: check("closed is unknown", e.code == "unknown", str(e))
     await v.close()
 
 async def t_order(c, prog, whole):
@@ -92,12 +92,12 @@ async def t_dead(c, prog, whole):
                                handles={"ws": w}, returns={"ws": never, "other": w})
     await p.result()
     try: await w.stat(); check("an ungiven return is dead", False)
-    except HandleError as e: check("an ungiven return is dead", "dead" in str(e), str(e))
+    except HandleError as e: check("an ungiven return is dead", e.code == "dead", str(e))
     st = await never.stat(); check("what was given landed", st["state"] == "parked")
     try:
         await c.launch_process(prog, input={"ws": {"$handle": "ws"}, "tokens": PROMPT, "max_tokens": 1, "seed": 7}, handles={"ws": w}, returns={"ws": w})
         check("a dead handle refuses a launch", False)
-    except Exception as e: check("a dead handle refuses a launch", "dead" in str(e), str(e)[:80])
+    except HandleError as e: check("a dead handle refuses a launch", e.code == "dead", str(e)[:80])
     await never.close(); await w.close()
     # a launch that fails before running gives its handle back
     k = await c.working_set(); x = await run(c, prog, k, PROMPT, 12)
@@ -150,8 +150,8 @@ async def t_quota(c, prog, whole):
     twin = await hs[1].fork()
     try:
         await run(c, prog, twin, [999], 2, drawn=50); check("a fork that would grow past the host is refused", False)
-    except Exception as e:
-        check("a fork that would grow past the host is refused", "quota" in str(e), str(e)[:90])
+    except HandleError as e:
+        check("a fork that would grow past the host is refused", e.code == "quota", str(e)[:90])
     check("and refused, keeps its handle", (await twin.stat())["state"] == "parked")
     await twin.close()
     check("closing the fork frees its twin", len(await run(c, prog, hs[1], [999], 2, drawn=50)) == 2)
@@ -189,7 +189,7 @@ async def t_matcher(c, prog, whole):
         await (await c.run(name, m=bad, accept=[])).result(); check("a bad grammar fails its launch", False)
     except Exception as e: check("a bad grammar fails its launch", True, str(e)[:90])
     try: await bad.stat(); check("and the handle says why", False)
-    except HandleError as e: check("and the handle says why", "dead" in str(e), str(e)[:90])
+    except HandleError as e: check("and the handle says why", e.code == "dead", str(e)[:90])
     for h in (m, f): await h.close()
     # the builtin prefill fills a handle
     w = await c.working_set()
@@ -225,7 +225,7 @@ async def t_media(c, prog, whole):
     check("an upload reads as what was uploaded", u == r and (await up.read("raw-rgb8")) == raw, str(u))
     try:
         await out.read("tiff"); check("a format that is none is refused", False)
-    except HandleError as e: check("a format that is none is refused", "tiff" in str(e), str(e))
+    except HandleError as e: check("a format that is none is refused", e.code == "invalid", str(e))
     # Whichever way the encoder goes, a reader hears how it ended.
     try:
         video = await asyncio.wait_for(out.read("mp4"), 20)

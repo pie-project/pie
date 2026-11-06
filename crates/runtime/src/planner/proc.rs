@@ -52,6 +52,13 @@ impl Proc {
         Rank::of(self.key, self.seq)
     }
 
+    /// A holder at rest: past every process, whose rank is what goes first,
+    /// and the longest parked past all. `order` counts up as holders park.
+    pub(super) fn rest(&mut self, order: u64) {
+        self.key = i64::MIN;
+        self.seq = u64::MAX - order;
+    }
+
     pub(super) fn new(seq: u64) -> Self {
         Self {
             seq,

@@ -147,8 +147,22 @@ class Process:
         await self.client.terminate_process(self.process_id)
 
 
+HANDLE_CODES = ("unknown", "dead", "quota", "in_use", "invalid")
+
+
 class HandleError(Exception):
-    """A handle op was refused: unknown, dead, or in use."""
+    """A handle op or launch was refused. `code` says how: `unknown`, `dead`,
+    `quota`, `in_use` or `invalid`."""
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code or _refusal_code(message)
+
+
+def _refusal_code(message: str) -> str | None:
+    """The code a refusal's text starts with, if it is one."""
+    code = message.split(":", 1)[0]
+    return code if code in HANDLE_CODES else None
 
 
 class Handle:
@@ -191,13 +205,12 @@ class Media(Handle):
         """The whole of this handle, encoded as `format`. It stays."""
         # Picked here so the queue is open before the first chunk can arrive.
         reader_id = str(uuid.uuid4())
-        self.client.process_event_queues[reader_id] = asyncio.Queue()
-        reader = Process(self.client, reader_id)
+        reader = self.client._open_reader(reader_id)
         ok, result = await self.client._send_msg_and_wait(
             {"type": "read_handle", "name": self.name, "format": format, "reader": reader_id}
         )
         if not ok:
-            del self.client.process_event_queues[reader_id]
+            self.client._close_reader(reader_id)
             raise HandleError(result)
         data = None
         while True:
@@ -584,6 +597,14 @@ class PieClient:
     # Process Lifecycle
     # =========================================================================
 
+    def _open_reader(self, reader_id: str) -> Process:
+        """A process-like stream that is listening before anything is sent."""
+        self.process_event_queues[reader_id] = asyncio.Queue()
+        return Process(self, reader_id)
+
+    def _close_reader(self, reader_id: str) -> None:
+        self.process_event_queues.pop(reader_id, None)
+
     def _next_handle(self) -> int:
         self._last_handle += 1
         return self._last_handle
@@ -594,7 +615,7 @@ class PieClient:
             raise HandleError(result)
         answer = json.loads(result)[0]
         if "error" in answer:
-            raise HandleError(answer["error"])
+            raise HandleError(answer["error"], answer.get("code"))
         return answer
 
     async def working_set(self) -> WorkingSet:
@@ -671,6 +692,8 @@ class PieClient:
         ok, result = await self._send_msg_and_wait(msg)
 
         if not ok:
+            if _refusal_code(result):
+                raise HandleError(result)
             raise Exception(f"Failed to launch process: {result}")
 
         for handle in (returns or {}).values():

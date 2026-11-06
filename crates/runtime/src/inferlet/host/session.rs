@@ -1,3 +1,4 @@
+use crate::handle::{Kind, Moved};
 use crate::inferlet::host::frames::{Frames, Pcm, audio_extension, image_extension};
 use crate::inferlet::host::pie;
 use crate::inferlet::host::pie::inferlet::frames::{AudioFormat, ImageFormat};
@@ -20,6 +21,19 @@ async fn idle_while<T>(pid: crate::inferlet::ProcessId, wait: impl Future<Output
         planner.set_idle(pid, false);
     }
     out
+}
+
+impl ProcessCtx {
+    /// Whether the launch expected `name`, which then lands with it at exit.
+    fn gave(&mut self, name: &str, kind: Kind, rep: u32) -> bool {
+        match self.handles() {
+            Some(handles) if handles.expects(name) => {
+                handles.give(name.to_string(), Moved { kind, rep });
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 fn suggested_name(name: &str, extension: &str) -> String {
@@ -178,14 +192,14 @@ impl pie::inferlet::session::Host for ProcessCtx {
     ) -> Result<Option<Resource<crate::inferlet::host::working_set::WorkingSet>>> {
         Ok(self
             .handles()
-            .and_then(|handles| handles.take_working_set(&name))
+            .and_then(|handles| handles.take(&name, Kind::WorkingSet))
             .map(Resource::new_own))
     }
 
     async fn take_frames(&mut self, name: String) -> Result<Option<Resource<Frames>>> {
         Ok(self
             .handles()
-            .and_then(|handles| handles.take_frames(&name))
+            .and_then(|handles| handles.take(&name, Kind::Frames))
             .map(Resource::new_own))
     }
 
@@ -194,36 +208,26 @@ impl pie::inferlet::session::Host for ProcessCtx {
         name: String,
         f: Resource<Frames>,
     ) -> Result<Result<(), String>> {
-        match self.handles() {
-            Some(handles) if handles.expects(&name) => {
-                handles.give(name, crate::handle::Moved::Frames(f.rep()));
-                Ok(Ok(()))
-            }
-            _ => {
-                pie::inferlet::frames::HostFrames::drop(self, f).await?;
-                Ok(Err(format!("this launch expects no frames `{name}`")))
-            }
+        if self.gave(&name, Kind::Frames, f.rep()) {
+            return Ok(Ok(()));
         }
+        pie::inferlet::frames::HostFrames::drop(self, f).await?;
+        Ok(Err(format!("this launch expects no frames `{name}`")))
     }
 
     async fn take_pcm(&mut self, name: String) -> Result<Option<Resource<Pcm>>> {
         Ok(self
             .handles()
-            .and_then(|handles| handles.take_pcm(&name))
+            .and_then(|handles| handles.take(&name, Kind::Pcm))
             .map(Resource::new_own))
     }
 
     async fn give_pcm(&mut self, name: String, p: Resource<Pcm>) -> Result<Result<(), String>> {
-        match self.handles() {
-            Some(handles) if handles.expects(&name) => {
-                handles.give(name, crate::handle::Moved::Pcm(p.rep()));
-                Ok(Ok(()))
-            }
-            _ => {
-                pie::inferlet::frames::HostPcm::drop(self, p).await?;
-                Ok(Err(format!("this launch expects no pcm `{name}`")))
-            }
+        if self.gave(&name, Kind::Pcm, p.rep()) {
+            return Ok(Ok(()));
         }
+        pie::inferlet::frames::HostPcm::drop(self, p).await?;
+        Ok(Err(format!("this launch expects no pcm `{name}`")))
     }
 
     async fn take_matcher(
@@ -232,7 +236,7 @@ impl pie::inferlet::session::Host for ProcessCtx {
     ) -> Result<Option<Resource<crate::inferlet::host::grammar::Matcher>>> {
         Ok(self
             .handles()
-            .and_then(|handles| handles.take_matcher(&name))
+            .and_then(|handles| handles.take(&name, Kind::Matcher))
             .map(Resource::new_own))
     }
 
@@ -241,16 +245,11 @@ impl pie::inferlet::session::Host for ProcessCtx {
         name: String,
         matcher: Resource<crate::inferlet::host::grammar::Matcher>,
     ) -> Result<Result<(), String>> {
-        match self.handles() {
-            Some(handles) if handles.expects(&name) => {
-                handles.give(name, crate::handle::Moved::Matcher(matcher.rep()));
-                Ok(Ok(()))
-            }
-            _ => {
-                pie::inferlet::grammar::HostMatcher::drop(self, matcher).await?;
-                Ok(Err(format!("this launch expects no matcher `{name}`")))
-            }
+        if self.gave(&name, Kind::Matcher, matcher.rep()) {
+            return Ok(Ok(()));
         }
+        pie::inferlet::grammar::HostMatcher::drop(self, matcher).await?;
+        Ok(Err(format!("this launch expects no matcher `{name}`")))
     }
 
     async fn give_working_set(
@@ -258,16 +257,11 @@ impl pie::inferlet::session::Host for ProcessCtx {
         name: String,
         ws: Resource<crate::inferlet::host::working_set::WorkingSet>,
     ) -> Result<Result<(), String>> {
-        match self.handles() {
-            Some(handles) if handles.expects(&name) => {
-                handles.give(name, crate::handle::Moved::WorkingSet(ws.rep()));
-                Ok(Ok(()))
-            }
-            _ => {
-                pie::inferlet::working_set::HostWorkingSet::drop(self, ws).await?;
-                Ok(Err(format!("this launch expects no working set `{name}`")))
-            }
+        if self.gave(&name, Kind::WorkingSet, ws.rep()) {
+            return Ok(Ok(()));
         }
+        pie::inferlet::working_set::HostWorkingSet::drop(self, ws).await?;
+        Ok(Err(format!("this launch expects no working set `{name}`")))
     }
 
     async fn receive_blocking(&mut self) -> Result<Option<String>> {

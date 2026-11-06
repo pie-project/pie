@@ -131,7 +131,7 @@ static CLIENT_SERVICES: LazyLock<ServiceMap<ClientId, SessionMessage>> =
 /// Where a process's end left its handles. A session gone by now drops them.
 pub(crate) fn handles_settled(
     client_id: ClientId,
-    settled: Vec<(client_api::HandleName, Option<crate::handle::Slot>)>,
+    settled: Vec<(client_api::HandleName, crate::handle::Landing)>,
 ) {
     let _ = CLIENT_SERVICES.send(&client_id, SessionMessage::HandlesSettled(settled));
 }
@@ -202,7 +202,7 @@ enum SessionMessage {
         name: Option<String>,
     },
     ClientRequest(ClientMessage),
-    HandlesSettled(Vec<(client_api::HandleName, Option<crate::handle::Slot>)>),
+    HandlesSettled(Vec<(client_api::HandleName, crate::handle::Landing)>),
     /// A turn was cancelled: if its frame is still waiting, it never runs.
     Forget(u32),
     ReceiveFile {
@@ -297,7 +297,7 @@ impl ServiceHandler for Session {
                 if client_msg.uses_handles()
                     && (!self.waiting.is_empty() || self.names_lent(&client_msg))
                 {
-                    if self.waiting.len() < crate::handle::MAX_WAITING_FRAMES {
+                    if self.waiting.len() < client_api::MAX_WAITING_HANDLE_FRAMES {
                         self.waiting.push_back(client_msg);
                     } else if let Some(corr_id) = client_msg.corr_id() {
                         let why = "quota: too many frames wait on lent handles".to_string();
@@ -603,7 +603,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn frames_waiting_on_a_handle_are_bounded() {
         let (mut session, mut rx) = lent_session().await;
-        for corr_id in 0..crate::handle::MAX_WAITING_FRAMES as u32 {
+        for corr_id in 0..client_api::MAX_WAITING_HANDLE_FRAMES as u32 {
             session
                 .handle(SessionMessage::ClientRequest(launch_on(corr_id, 1)))
                 .await;
@@ -611,7 +611,7 @@ mod tests {
         session
             .handle(SessionMessage::ClientRequest(launch_on(9999, 1)))
             .await;
-        assert_eq!(session.waiting.len(), crate::handle::MAX_WAITING_FRAMES);
+        assert_eq!(session.waiting.len(), client_api::MAX_WAITING_HANDLE_FRAMES);
         let WireServerMessage::Response {
             corr_id,
             ok,

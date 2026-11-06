@@ -4,6 +4,7 @@ pub mod props;
 
 pub use edge::{GatewayFrame, WorkerFrame};
 pub use message::{
-    ClientMessage, Files, GrammarSource, HandleKind, HandleName, HandleOp, Handles, ServerMessage,
+    ClientMessage, Files, GrammarSource, HandleErrorCode, HandleKind, HandleName, HandleOp,
+    Handles, MAX_WAITING_HANDLE_FRAMES, ServerMessage,
 };
 pub use props::Props;
