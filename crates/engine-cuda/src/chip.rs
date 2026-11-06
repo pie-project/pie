@@ -838,14 +838,15 @@ mod tests {
             kernels_cuda::tuning::Tuning {
                 gemm_skinny_rows: kernels_cuda::tuning::Tuning::of(&family).gemm_skinny_rows,
                 selected_mma: false,
+                selected_cluster: 0,
                 index_mma: false,
                 gemm_narrow_n: 0,
                 moe_mxfp4_f16: false,
                 ..tuning
             },
             kernels_cuda::tuning::Tuning::of(&family),
-            "only the skinny GEMM's reach, the two sparse-attention walks and the MXFP4 \
-             experts' fp16 differ from the family"
+            "only the skinny GEMM's reach, the two sparse-attention walks (the selected one's \
+             clusters too) and the MXFP4 experts' fp16 differ from the family"
         );
         assert!(
             tuning.selected_mma,

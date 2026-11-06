@@ -39,7 +39,10 @@ struct Shape {
     static constexpr int kBytes = kQBytes + W * kWarpBytes + W * 16 * 2 * 4;
 };
 
-template <int D, int W = kWarps>
+// With `kRanks` above one, a cluster of that many blocks reads a (row, kv
+// head), each block a slice of its key chunks, and the cluster folds the
+// slices through distributed shared memory (as `decode_gqa_sm80.cu`'s do).
+template <int D, int W = kWarps, int kRanks = 1>
 __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
     const __nv_bfloat16* __restrict__ queries,
     const __nv_bfloat16* __restrict__ k_pages,
@@ -60,7 +63,8 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
     constexpr int kLd = S::kLd;
     constexpr int kNTiles = S::kNTiles;
     constexpr int kChunks = D / 8;
-    const int t = static_cast<int>(blockIdx.x);
+    const int t = static_cast<int>(blockIdx.x) / kRanks;
+    const int rank = static_cast<int>(blockIdx.x) % kRanks;
     if (win != nullptr && t >= static_cast<int>(win[0])) return;
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
     if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
@@ -120,7 +124,7 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
     }
     float m_lo = -CUDART_INF_F, m_hi = -CUDART_INF_F, l_lo = 0.f, l_hi = 0.f;
 
-    for (int base = warp * kKeys; base < steps; base += kWarps * kKeys) {
+    for (int base = (rank * kWarps + warp) * kKeys; base < steps; base += kRanks * kWarps * kKeys) {
         if (lane < kKeys) {
             const int n = base + lane;
             int j = -1;
@@ -261,8 +265,46 @@ __global__ __launch_bounds__(W * 32) void sdpa_paged_selected_mma_kernel(
             }
         }
         const float inv = l_all > 0.f ? 1.f / l_all : 0.f;
-        o[(static_cast<long long>(t_row) * H + kv_head * G + row) * D + d] =
-            __float2bfloat16(v * inv);
+        if constexpr (kRanks > 1) {
+            // The block's slice, normalized, and its log-sum-exp, for the fold.
+            float* sF = reinterpret_cast<float*>(smem_raw + S::kBytes);
+            sF[row * D + d] = v * inv;
+            if (d == 0) sF[16 * D + row] = l_all > 0.f ? m_all + __logf(l_all) : -CUDART_INF_F;
+        } else {
+            o[(static_cast<long long>(t_row) * H + kv_head * G + row) * D + d] =
+                __float2bfloat16(v * inv);
+        }
+    }
+    if constexpr (kRanks > 1) {
+        // Each block folds its share of the (row, column) cells across the
+        // cluster's slices.
+        sync_cluster();
+        const float* sF = reinterpret_cast<const float*>(smem_raw + S::kBytes);
+        for (int idx = rank * kThreads + tid; idx < G * D; idx += kRanks * kThreads) {
+            const int row = idx / D;
+            const int d = idx % D;
+            float lse[kRanks], out[kRanks];
+            float m = -CUDART_INF_F;
+#pragma unroll
+            for (int r = 0; r < kRanks; ++r) {
+                lse[r] = ld_cluster(sF + 16 * D + row, r);
+                out[r] = ld_cluster(sF + row * D + d, r);
+                m = fmaxf(m, lse[r]);
+            }
+            float l = 0.f, v = 0.f;
+            if (m > -CUDART_INF_F) {
+#pragma unroll
+                for (int r = 0; r < kRanks; ++r) {
+                    const float e = __expf(lse[r] - m);
+                    l += e;
+                    v += e * out[r];
+                }
+            }
+            o[(static_cast<long long>(t_row) * H + kv_head * G + row) * D + d] =
+                __float2bfloat16(l > 0.f ? v / l : 0.f);
+        }
+        // No block leaves while another may still read its shared memory.
+        sync_cluster();
     }
 }
 

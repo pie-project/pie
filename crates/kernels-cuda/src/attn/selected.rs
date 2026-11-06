@@ -50,6 +50,30 @@ fn mma_warps(ctx: &Ctx, blocks: u32, head_dim: i32) -> u32 {
     }
 }
 
+/// The blocks a cluster reads a (row, kv head) of the tensor-core walk with
+/// (`kernel.sdpa.selected_cluster`, sm_90 and later): the profile's, halved
+/// while the fire's clustered blocks would fill more than a quarter of the
+/// SMs, so a decode's lone row takes the most; one where it is off.
+fn mma_ranks(ctx: &Ctx, blocks: u32, head_dim: i32) -> u32 {
+    let mut ranks = ctx.tuning().selected_cluster;
+    let sms = ctx.multiprocessors().unwrap_or(108);
+    if crate::jit::compute_capability_major().is_none_or(|major| major < 9)
+        || !ctx.smem_fits(mma_smem_bytes(head_dim, 8) + mma_fold_bytes(head_dim))
+    {
+        return 1;
+    }
+    while ranks > 1 && blocks.saturating_mul(ranks).saturating_mul(4) > sms {
+        ranks /= 2;
+    }
+    ranks.max(1)
+}
+
+/// A cluster block's slice for the fold: its 16 rows' outputs and their
+/// log-sum-exps.
+const fn mma_fold_bytes(head_dim: i32) -> u32 {
+    (16 * head_dim as u32 + 16) * 4
+}
+
 /// `mma::Tile`: eight rows a block, six warps, maps of up to 4096 blocks.
 const TILE_ROWS: i32 = 8;
 const TILE_THREADS: u32 = 192;
@@ -209,21 +233,33 @@ fn selected(
     }
     if let Some(dim) = mma_dim(ctx, head_dim, q_heads / kv_heads) {
         #[allow(clippy::cast_sign_loss)]
-        let warps = mma_warps(
-            ctx,
-            (total_tokens as u32).saturating_mul(kv_heads as u32),
-            dim,
-        );
+        let blocks = (total_tokens as u32).saturating_mul(kv_heads as u32);
+        let ranks = mma_ranks(ctx, blocks, dim);
+        let warps = if ranks > 1 {
+            8
+        } else {
+            mma_warps(ctx, blocks, dim)
+        };
         #[allow(clippy::cast_sign_loss)]
         let launch = Launch::grid(
-            [total_tokens as u32, kv_heads as u32, 1],
+            [total_tokens as u32 * ranks, kv_heads as u32, 1],
             [MMA_THREADS / 4 * warps, 1, 1],
-        )
-        .smem(mma_smem_bytes(dim, warps));
-        let entry = if warps == 4 {
-            format!("::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}>")
+        );
+        let launch = if ranks > 1 {
+            launch
+                .cluster(ranks)
+                .smem(mma_smem_bytes(dim, warps) + mma_fold_bytes(dim))
         } else {
-            format!("::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}, {warps}>")
+            launch.smem(mma_smem_bytes(dim, warps))
+        };
+        let entry = match (warps, ranks) {
+            (4, 1) => format!("::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}>"),
+            (_, 1) => format!(
+                "::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}, {warps}>"
+            ),
+            _ => format!(
+                "::pie::attn::selected::mma::sdpa_paged_selected_mma_kernel<{dim}, {warps}, {ranks}>"
+            ),
         };
         return ctx.fire(
             op,

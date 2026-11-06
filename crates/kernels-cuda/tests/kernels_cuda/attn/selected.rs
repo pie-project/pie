@@ -3,7 +3,8 @@
 // Qwen3.8-Flash-Next's selected attention: 24 query heads over 2 kv heads of
 // 256, one selection a row shared by every head, in blocks of 4 keys, with
 // the open block past the last whole one. The tensor-core walk
-// (`kernel.sdpa.selected_mma`) lands what the scalar walk lands, over two
+// (`kernel.sdpa.selected_mma`), and its decode over a cluster of blocks
+// (`kernel.sdpa.selected_cluster`), land what the scalar walk lands, over two
 // prefills whose page tables are out of order, rows that select fewer blocks
 // than the budget, rows that name a block twice or none, and a decode.
 
@@ -131,11 +132,12 @@ fn lands_alike(q_lens: [usize; 2]) {
     let sel = Tensor::new(gpu.up(&selection), tokens as u32, TOP_K as u32, Dtype::I32);
     for decode in [false, true] {
         let mut landed = Vec::new();
-        for mma in [false, true] {
+        for (mma, cluster) in [(false, 0), (true, 0), (true, 8)] {
             let out = gpu.zeros(tokens * Q_HEADS * HEAD_DIM * 2);
             let mut o = Tensor::new(out, tokens as u32, (Q_HEADS * HEAD_DIM) as u32, Dtype::Bf16);
             let ctx = gpu.ctx().with_tuning(Tuning {
                 selected_mma: mma,
+                selected_cluster: cluster,
                 ..Tuning::DEFAULT
             });
             if decode {
@@ -170,14 +172,104 @@ fn lands_alike(q_lens: [usize; 2]) {
             gpu.sync();
             landed.push(gpu.down::<u16>(out, tokens * Q_HEADS * HEAD_DIM));
         }
-        for (i, (&s, &m)) in landed[0].iter().zip(&landed[1]).enumerate() {
+        for (walk, mma) in landed.iter().enumerate().skip(1) {
+            for (i, (&s, &m)) in landed[0].iter().zip(mma).enumerate() {
+                let (s, m) = (from_bf16(s), from_bf16(m));
+                assert!(
+                    close(m, s),
+                    "{q_lens:?} decode {decode} walk {walk}: row {} head {} dim {}: the tensor cores land {m}, the scalar walk {s}",
+                    i / (Q_HEADS * HEAD_DIM),
+                    (i / HEAD_DIM) % Q_HEADS,
+                    i % HEAD_DIM
+                );
+            }
+        }
+    }
+}
+
+// MiniMax-M3's decode: 16 query heads a kv head of 128, a selection a kv
+// head (`per_head`) of 128-key blocks, one row over 1100 keys, its pages out
+// of order: a cluster of eight blocks walks keys in every block, and its fold
+// lands what the walk on one block and the scalar walk land.
+#[test]
+fn a_clusters_slices_fold_into_what_one_block_walks() {
+    const KVH: usize = 2;
+    const G: usize = 16;
+    const D: usize = 128;
+    const BLOCK: usize = 128;
+    const TOP: usize = 8;
+    const PAGE: usize = 16;
+    const LEN: usize = 1100;
+    let pages = LEN.div_ceil(PAGE);
+    let mut gpu = Gpu::open();
+    let mut rng = Lcg::seeded(0xc1_05e7);
+    let (q_raw, _) = rng.row(KVH * G * D);
+    let (k_raw, _) = rng.row(pages * PAGE * KVH * D);
+    let (v_raw, _) = rng.row(pages * PAGE * KVH * D);
+    let page_indices: Vec<i32> = (0..pages).map(|i| ((i * 7) % pages) as i32).collect();
+    // The first kv head picks the eight whole blocks, the second six of them
+    // and two empty slots.
+    let selection: Vec<i32> = [7, 3, 0, 5, 1, 6, 2, 4, 6, -1, 0, 4, -1, 2, 7, 1].to_vec();
+    let tables = [
+        gpu.up(&page_indices),
+        gpu.up(&[0, pages as i32]),
+        gpu.up(&[(LEN - (pages - 1) * PAGE) as i32]),
+    ];
+    let width = (KVH * D) as u32;
+    let slots = (pages * PAGE) as u32;
+    let kv = KvPool {
+        keys: Tensor::new(gpu.up(&k_raw), slots, width, Dtype::Bf16),
+        values: Tensor::new(gpu.up(&v_raw), slots, width, Dtype::Bf16),
+        page_indices: Tensor::new(tables[0], pages as u32, 1, Dtype::I32),
+        page_indptr: Tensor::new(tables[1], 2, 1, Dtype::I32),
+        last_page_lens: Tensor::new(tables[2], 1, 1, Dtype::I32),
+        page_size: PAGE as i32,
+        seq_stride: i64::from(width),
+        head_stride: D as i64,
+        max_pages_per_request: pages as i32,
+        pages_in_batch: pages as i32,
+        ..pool(0, 0, [0; 3])
+    };
+    let q = RaggedTensor {
+        data: Tensor::new(gpu.up(&q_raw), 1, (KVH * G * D) as u32, Dtype::Bf16),
+        indptr: Tensor::new(gpu.up(&[0i32, 1]), 2, 1, Dtype::I32),
+    };
+    let sel = Tensor::new(gpu.up(&selection), 1, (KVH * TOP) as u32, Dtype::I32);
+    #[allow(clippy::cast_precision_loss)]
+    let sm_scale = 1.0 / (D as f32).sqrt();
+    let mut landed = Vec::new();
+    for (mma, cluster) in [(false, 0), (true, 0), (true, 8)] {
+        let out = gpu.zeros(KVH * G * D * 2);
+        let mut o = Tensor::new(out, 1, (KVH * G * D) as u32, Dtype::Bf16);
+        let ctx = gpu.ctx().with_tuning(Tuning {
+            selected_mma: mma,
+            selected_cluster: cluster,
+            ..Tuning::DEFAULT
+        });
+        selected::attention_decode_selected(
+            &ctx,
+            q,
+            sel,
+            &kv,
+            None,
+            D as u32,
+            sm_scale,
+            BLOCK as u32,
+            true,
+            &mut o,
+        )
+        .expect("the selected attention fires");
+        gpu.sync();
+        landed.push(gpu.down::<u16>(out, KVH * G * D));
+    }
+    for (walk, got) in landed.iter().enumerate().skip(1) {
+        for (i, (&s, &m)) in landed[0].iter().zip(got).enumerate() {
             let (s, m) = (from_bf16(s), from_bf16(m));
             assert!(
                 close(m, s),
-                "{q_lens:?} decode {decode}: row {} head {} dim {}: the tensor cores land {m}, the scalar walk {s}",
-                i / (Q_HEADS * HEAD_DIM),
-                (i / HEAD_DIM) % Q_HEADS,
-                i % HEAD_DIM
+                "walk {walk}: head {} dim {}: the tensor cores land {m}, the scalar walk {s}",
+                i / D,
+                i % D
             );
         }
     }

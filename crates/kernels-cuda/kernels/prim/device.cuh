@@ -339,4 +339,26 @@ __device__ __forceinline__ void e4m3_pair_f32(unsigned short pair, float& lo, fl
 #endif
 }
 
+// A float in cluster block `rank`'s shared memory, at the address `at` holds
+// in this block's.
+__device__ __forceinline__ float ld_cluster(const float* at, unsigned rank) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    const unsigned local = static_cast<unsigned>(__cvta_generic_to_shared(at));
+    unsigned remote;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(local), "r"(rank));
+    float v;
+    asm volatile("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote) : "memory");
+    return v;
+#else
+    return rank == 0 ? *at : 0.f;
+#endif
+}
+
+__device__ __forceinline__ void sync_cluster() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::
+                     : "memory");
+#endif
+}
+
 }
