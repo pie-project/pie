@@ -11,6 +11,10 @@ gemm.narrow_n = 8
 gemm.skinny_rows = 0
 sdpa.index_mma = true
 sdpa.selected_mma = true
+# A decode's selected attention over a cluster of eight blocks a kv head, the slices folded in
+# distributed shared memory (MiniMax-M3.1-Flash's four kv heads ran on four blocks):
+# MiniMax-M3.1-Flash mini60 raw decode 111 -> 116 tok/s
+sdpa.selected_cluster = 8
 moe.mxfp4_f16 = true
 
 # Two state slots a lane (one frame a lane where they seat fewer lanes than

@@ -484,6 +484,15 @@ pub struct CompressedDecodeUntil(pub u32);
 #[decision(id = "kernel.sdpa.selected_mma", flag, default = false, tune = search)]
 pub struct SdpaSelectedMma;
 
+/// The most blocks a cluster splits a tensor-core selected walk's (row, kv
+/// head) across, halved while the fire's clustered blocks would fill more
+/// than a quarter of the SMs (a decode's lone row takes the most), each block
+/// eight warps on a slice of the key chunks, the slices folded through
+/// distributed shared memory; 0 keeps one block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.selected_cluster", constant(set(0, 2, 4, 8)), default = 0, tune = search)]
+pub struct SdpaSelectedCluster(pub u32);
+
 /// Whether a compressed-pool attention (`attention.pool_lse`, and its
 /// selected form) runs on the tensor cores, a block a row's 16 heads, rather
 /// than the scalar walk a block a row and head. Off reads the pool the
@@ -1059,6 +1068,7 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeGqaCluster>()
         .add::<DecodeGqaDeep64>()
         .add::<SdpaSelectedMma>()
+        .add::<SdpaSelectedCluster>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
         .add::<SdpaIndexFp4Tc5>()
@@ -1221,6 +1231,7 @@ tuning! {
     decode_gqa_cluster: u32 = 0, get DecodeGqaCluster;
     decode_gqa_deep_64: bool = false, on DecodeGqaDeep64;
     selected_mma: bool = false, on SdpaSelectedMma;
+    selected_cluster: u32 = 0, get SdpaSelectedCluster;
     index_mma: bool = false, on SdpaIndexMma;
     index_tc5: bool = false, on SdpaIndexTc5;
     index_fp4_tc5: bool = false, on SdpaIndexFp4Tc5;
