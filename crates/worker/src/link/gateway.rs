@@ -773,3 +773,25 @@ fn upload_chunk_info(m: &ClientMessage) -> Option<(usize, usize)> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod handle_turn_tests {
+    use super::*;
+
+    fn reply(ok: bool) -> ServerMessage {
+        ServerMessage::Response {
+            corr_id: 3,
+            ok,
+            result: "why, or an id".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_refused_launch_or_read_ends_its_turn() {
+        let mut process = None;
+        assert!(turn_terminal(&reply(false), Some(3), true, &mut process));
+        assert_eq!(process, None, "a refusal names no process");
+        assert!(!turn_terminal(&reply(true), Some(3), true, &mut process));
+        assert_eq!(process.as_deref(), Some("why, or an id"));
+    }
+}

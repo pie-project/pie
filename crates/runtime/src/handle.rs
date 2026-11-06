@@ -28,6 +28,7 @@ use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::kv::{KvStore, KvStoreError};
 use crate::store::registry as store_registry;
 use crate::store::rs::working_set::RsWorkingSet;
+use crate::store::rs::{RsStore, RsUnits};
 
 const MOVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const RS_MOVE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
@@ -83,13 +84,13 @@ impl Held {
         crate::planner::place(holder, kv.engine);
         if let Some(planner) = crate::planner::planner_for(kv.model, kv.engine) {
             let stores = store_registry::get(kv.model, kv.engine);
-            let owes = store_registry::with_kv_lock(&stores.kv, "handle-park", |store| {
+            let swapped = store_registry::with_kv_lock(&stores.kv, "handle-park", |store| {
                 // Parked, it is no running reader: a pair of forks at rest
                 // cannot keep the pages they share on the device.
                 store.set_parked(kv.id, true);
-                owed(store, &kv, rs.as_ref()).unwrap_or(None)
+                swapped_pages(store, &kv).unwrap_or(0)
             });
-            planner.register_holder(holder, owes);
+            planner.register_holder(holder, demand(swapped, rs.as_ref()));
         }
         Held {
             holder,
@@ -109,14 +110,19 @@ impl Held {
     /// from whether its own holder was evicted.
     async fn ready(&self, process: ProcessId) -> Result<(), String> {
         let Parts { kv, rs, .. } = self.parts();
-        let owed = settled(kv, rs.as_ref(), "handle-ready", |store| {
-            let owed = owed(store, kv, rs.as_ref())?;
-            if owed.is_none() {
+        if let Some(rs) = rs {
+            rs_settled(rs, |_| ()).await?;
+        }
+        let rs_home = rs.as_ref().is_none_or(|rs| rs_units(rs).is_zero());
+        let kv_pages = settled(kv, "handle-ready", |store| {
+            let pages = swapped_pages(store, kv)?;
+            if pages == 0 && rs_home {
                 store.set_parked(kv.id, false);
             }
-            Ok(owed)
+            Ok(pages)
         })
         .await?;
+        let owed = demand(kv_pages, rs.as_ref());
         if owed.is_none() {
             // An eviction that found no page left its fence up.
             kv.suspend_handle().unfence();
@@ -149,32 +155,36 @@ impl Held {
         store.held_page_count(&set).unwrap_or(0) + store.swapped_page_count(&set).unwrap_or(0)
     }
 
+    /// Each store forks under its own lock, with no move of its own under
+    /// way: a move of the other's cannot touch what this one holds.
     async fn fork(&self) -> Result<Held, String> {
         let Parts { kv, rs, cursor } = self.parts();
-        let stores = store_registry::get(kv.model, kv.engine);
-        let child = settled(kv, rs.as_ref(), "handle-fork", |store| {
+        let rs_child = match rs {
+            Some(rs) => {
+                let id = rs_settled(rs, |store| store.fork(rs.id))
+                    .await?
+                    .map_err(|error| error.to_string())?;
+                Some(RsWorkingSet::new(rs.model, rs.engine, id, rs.geom))
+            }
+            None => None,
+        };
+        let child = settled(kv, "handle-fork", |store| {
             let child = store.fork(kv.id)?;
             if let Some(owner) = store.owner_of(kv.id) {
                 store.set_owner(child, owner)?;
             }
             Ok(child)
         })
-        .await?;
-        let kv_child = kv.forked(child);
-        let rs_child = match rs {
-            Some(rs) => {
-                let forked = stores.rs.lock().unwrap().fork(rs.id);
-                match forked {
-                    Ok(id) => Some(RsWorkingSet::new(rs.model, rs.engine, id, rs.geom)),
-                    Err(error) => {
-                        kv_child.release();
-                        return Err(error.to_string());
-                    }
+        .await;
+        match child {
+            Ok(child) => Ok(Held::park(kv.forked(child), rs_child, cursor.clone())),
+            Err(why) => {
+                if let Some(rs) = rs_child {
+                    rs.release();
                 }
+                Err(why)
             }
-            None => None,
-        };
-        Ok(Held::park(kv_child, rs_child, cursor.clone()))
+        }
     }
 
     /// Whether its next write takes state it does not hold yet.
@@ -230,12 +240,10 @@ impl Drop for Held {
     }
 }
 
-/// Runs `f` on the store once no move holds what the set names: what it names
-/// under a move is not where its maps say. The recurrent store's lock is held
-/// through `f`, so a move of its state cannot begin under it either.
+/// Runs `f` on the store once no move holds a page `kv` maps: what a set names
+/// under a move is not where its map says.
 async fn settled<T>(
     kv: &KvWorkingSet,
-    rs: Option<&RsWorkingSet>,
     label: &'static str,
     mut f: impl FnMut(&mut KvStore) -> Result<T, KvStoreError>,
 ) -> Result<T, String> {
@@ -248,11 +256,9 @@ async fn settled<T>(
         let mut notified = std::pin::pin!(notified);
         notified.as_mut().enable();
         let done = store_registry::with_kv_lock(&stores.kv, label, |store| {
-            let state = stores.rs.lock().unwrap();
-            if store.in_move(&set)? || rs.is_some_and(|rs| state.in_move(rs.id)) {
+            if store.in_move(&set)? {
                 return Ok(None);
             }
-            drop(state);
             f(store).map(Some)
         })
         .map_err(|error| error.to_string())?;
@@ -263,29 +269,48 @@ async fn settled<T>(
         if now >= deadline {
             return Err("its pages are still moving".to_string());
         }
-        // A recurrent move ends with no signal here: look again soon.
-        let wait = (deadline - now).min(RS_MOVE_POLL);
-        let _ = crate::rt::time::timeout(wait, notified).await;
+        let _ = crate::rt::time::timeout(deadline - now, notified).await;
     }
 }
 
-/// What the set has off the device.
-fn owed(
-    store: &KvStore,
-    kv: &KvWorkingSet,
-    rs: Option<&RsWorkingSet>,
-) -> Result<Option<Demand>, KvStoreError> {
-    let kv_pages = store.swapped_page_count(&HashSet::from([kv.id]))? as u32;
-    let rs = rs.map_or_else(Default::default, |rs| {
-        let stores = store_registry::get(rs.model, rs.engine);
-        stores
-            .rs
-            .lock()
-            .unwrap()
-            .swapped_units(&HashSet::from([rs.id]))
-    });
-    let demand = Demand { kv_pages, rs };
-    Ok((!demand.is_zero()).then_some(demand))
+/// [`settled`] for recurrent state, whose moves end with no signal.
+async fn rs_settled<T>(
+    rs: &RsWorkingSet,
+    mut f: impl FnMut(&mut RsStore) -> T,
+) -> Result<T, String> {
+    let stores = store_registry::get(rs.model, rs.engine);
+    let deadline = crate::rt::time::Instant::now() + MOVE_WAIT;
+    loop {
+        {
+            let mut store = stores.rs.lock().unwrap();
+            if !store.in_move(rs.id) {
+                return Ok(f(&mut store));
+            }
+        }
+        if crate::rt::time::Instant::now() >= deadline {
+            return Err("its state is still moving".to_string());
+        }
+        let _ = crate::rt::time::timeout(RS_MOVE_POLL, std::future::pending::<()>()).await;
+    }
+}
+
+fn swapped_pages(store: &KvStore, kv: &KvWorkingSet) -> Result<u32, KvStoreError> {
+    Ok(store.swapped_page_count(&HashSet::from([kv.id]))? as u32)
+}
+
+fn rs_units(rs: &RsWorkingSet) -> RsUnits {
+    let stores = store_registry::get(rs.model, rs.engine);
+    let held = stores.rs.lock().unwrap();
+    held.swapped_units(&HashSet::from([rs.id]))
+}
+
+/// What a set owes the device, given the pages it has off it.
+fn demand(kv_pages: u32, rs: Option<&RsWorkingSet>) -> Option<Demand> {
+    let demand = Demand {
+        kv_pages,
+        rs: rs.map(rs_units).unwrap_or_default(),
+    };
+    (!demand.is_zero()).then_some(demand)
 }
 
 #[derive(Debug)]
@@ -730,7 +755,11 @@ fn bind_one(ctx: &mut ProcessCtx, handle: Slot) -> anyhow::Result<Moved> {
         }
         Slot::Frames(frames) => Moved::Frames(ctx.ctx().table.push(*frames)?.rep()),
         Slot::Pcm(pcm) => Moved::Pcm(ctx.ctx().table.push(*pcm)?.rep()),
-        _ => Moved::WorkingSet(working_set::materialize(ctx)?),
+        Slot::Unborn(HandleKind::WorkingSet) => Moved::WorkingSet(working_set::materialize(ctx)?),
+        // `lend` and `prepare` stand between a client and each of these.
+        Slot::Unborn(_) | Slot::Lent | Slot::Dead(_) => {
+            anyhow::bail!("a handle that cannot bind reached a process")
+        }
     })
 }
 
@@ -852,16 +881,10 @@ impl Bag {
         for (name, why) in self.lost {
             settled.insert(name, Some(Slot::Dead(why)));
         }
-        // A fire that failed left the cursor ahead of what was written.
-        let failed = residency.lock().unwrap().failure();
         for (slot, moved) in self.given {
             let Some(&name) = self.returns.get(&slot) else {
                 continue;
             };
-            if let (Moved::WorkingSet(_), Some(why)) = (moved, &failed) {
-                settled.insert(name, Some(Slot::Dead(format!("a pipeline failed: {why}"))));
-                continue;
-            }
             let landed = match take_out(resources, residency, moved) {
                 Ok(landed) => landed,
                 Err(error) => Slot::Dead(format!("taking `{slot}` from its process: {error}")),
@@ -911,6 +934,14 @@ fn take_out(
             held.rs_working_sets.remove(&(rs.model, rs.engine, rs.id));
         }
     }
+    // A fire that failed left the cursor ahead of what was written.
+    if let Some(why) = kv.pipeline_failure() {
+        kv.release();
+        if let Some(rs) = rs {
+            rs.release();
+        }
+        return Ok(Slot::Dead(format!("its pipeline failed: {why}")));
+    }
     Ok(Slot::Parked(Box::new(Held::park(kv, rs, cursor))))
 }
 
@@ -948,6 +979,7 @@ mod tests {
         an_unborn_handle_is_a_name_and_nothing_else().await;
         a_session_names_only_so_many().await;
         media_past_the_session_limit_is_refused_or_dead().await;
+        a_fork_counts_against_the_limit_as_what_it_shares().await;
         a_name_is_taken_once().await;
         one_bad_op_does_not_stop_the_rest().await;
         a_launch_moves_all_it_names_or_none().await;
@@ -1000,6 +1032,39 @@ mod tests {
         assert!(
             landed["error"].as_str().unwrap().contains("quota"),
             "what a process gave past the limit is lost, and says so: {landed}"
+        );
+    }
+
+    async fn a_fork_counts_against_the_limit_as_what_it_shares() {
+        let mut table = Table {
+            max_media_bytes: 16,
+            ..Table::default()
+        };
+        let upload = HandleOp::New {
+            name: 1,
+            kind: HandleKind::Frames(vec![0u8; 10].into()),
+        };
+        assert_eq!(answer(&mut table, upload).await["ok"], true);
+        let copy = answer(&mut table, HandleOp::Fork { name: 2, from: 1 }).await;
+        assert!(
+            copy["error"].as_str().unwrap().starts_with("quota"),
+            "an upload's fork copies its bytes: {copy}"
+        );
+
+        assert_eq!(
+            answer(&mut table, HandleOp::Close { name: 1 }).await["ok"],
+            true
+        );
+        let decoded = Frames::from_rgb8(vec![0; 12], 2, 2, 1, 0.0).unwrap();
+        table.settle(vec![(3, Some(Slot::Frames(Box::new(decoded))))]);
+        let fork = answer(&mut table, HandleOp::Fork { name: 4, from: 3 }).await;
+        assert_eq!(fork["ok"], true, "decoded pixels are shared: {fork}");
+        let held = Frames::from_rgb8(vec![0; 3], 1, 1, 1, 0.0).unwrap();
+        table.settle(vec![(5, Some(Slot::Frames(Box::new(held))))]);
+        assert_eq!(
+            answer(&mut table, HandleOp::Stat { name: 5 }).await["state"],
+            "parked",
+            "12 shared twice and 3 is 15, not 27"
         );
     }
 

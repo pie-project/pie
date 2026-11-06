@@ -1311,3 +1311,60 @@ fn prompts_seated_at_once_leave_the_seated_lanes_their_growth() {
         "{seated} prompts seated left {free} pages for the lanes' growth, short of {held_back}"
     );
 }
+
+#[test]
+fn a_holder_goes_before_every_process_and_oldest_first() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let process = ProcessId::new_v4();
+    planner.register(process);
+    let (older, newer) = (ProcessId::new_v4(), ProcessId::new_v4());
+    planner.register_holder(older, None);
+    planner.register_holder(newer, None);
+    planner.with_inner(|inner| {
+        let rank = |pid: &ProcessId| inner.procs[pid].rank();
+        assert!(rank(&newer) > rank(&process), "a process stays");
+        assert!(rank(&older) > rank(&newer), "the larger rank goes first");
+    });
+}
+
+#[test]
+fn a_recall_takes_the_process_s_place_and_a_failed_one_rests_again() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let process = ProcessId::new_v4();
+    planner.register(process);
+    let holder = ProcessId::new_v4();
+    planner.register_holder(holder, None);
+
+    planner.recall_holder(holder, process, None);
+    planner.with_inner(|inner| {
+        assert!(!inner.procs[&holder].idle, "no one's victim on its way in");
+        assert_eq!(inner.procs[&holder].rank(), inner.procs[&process].rank());
+    });
+
+    planner.rest_holder(holder);
+    planner.with_inner(|inner| {
+        assert!(inner.procs[&holder].idle, "anyone's victim again");
+        assert!(inner.procs[&holder].rank() > inner.procs[&process].rank());
+    });
+}
+
+#[test]
+fn a_recall_owing_pages_a_peer_moved_queues_a_restore() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let process = ProcessId::new_v4();
+    planner.register(process);
+    let holder = ProcessId::new_v4();
+    planner.register_holder(holder, None);
+    planner.recall_holder(
+        holder,
+        process,
+        Some(Demand {
+            kv_pages: 3,
+            rs: Default::default(),
+        }),
+    );
+    assert!(
+        !planner.is_resident(holder),
+        "resident to its holder, but its pages went with a peer"
+    );
+}

@@ -388,10 +388,8 @@ impl ProcessCtx {
         &self,
         scope: &crate::store::PipelineScope,
         fires: &crate::pipeline::fire::PendingFires,
-        failure: &crate::pipeline::fire::PipelineFailure,
     ) {
         let mut residency = self.residency.lock().unwrap();
-        residency.failures.push(failure.clone());
         residency
             .pipelines
             .retain(|pipeline| pipeline.fires.strong_count() > 0);

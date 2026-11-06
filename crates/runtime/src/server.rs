@@ -538,6 +538,93 @@ mod tests {
     use super::*;
     use crate::inferlet::process::probe::{self, Seen};
 
+    fn launch_on(corr_id: u32, name: client_api::HandleName) -> ClientMessage {
+        ClientMessage::LaunchProcess {
+            corr_id,
+            inferlet: "chat".into(),
+            input: String::new(),
+            capture_outputs: true,
+            props: Default::default(),
+            session: None,
+            files: Default::default(),
+            handles: client_api::Handles::from([("ws".to_string(), name)]),
+            returns: Default::default(),
+            cluster_props: Default::default(),
+            executors: Vec::new(),
+        }
+    }
+
+    /// A session with handle 1 lent to a process.
+    async fn lent_session() -> (Session, mpsc::Receiver<WireServerMessage>) {
+        let (tx, rx) = mpsc::channel(8);
+        let mut session = Session::new_inproc(
+            9,
+            install_state(0),
+            tx,
+            "acme".to_string(),
+            "al".to_string(),
+        );
+        session
+            .handles
+            .apply(vec![client_api::HandleOp::New {
+                name: 1,
+                kind: client_api::HandleKind::WorkingSet,
+            }])
+            .await;
+        let lease = session
+            .handles
+            .lend(
+                9,
+                client_api::Handles::from([("ws".to_string(), 1)]),
+                client_api::Handles::new(),
+                None,
+            )
+            .unwrap();
+        std::mem::forget(lease);
+        (session, rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_cancelled_while_it_waits_never_runs() {
+        let (mut session, _rx) = lent_session().await;
+        session
+            .handle(SessionMessage::ClientRequest(launch_on(5, 1)))
+            .await;
+        session
+            .handle(SessionMessage::ClientRequest(launch_on(6, 1)))
+            .await;
+        assert_eq!(session.waiting.len(), 2, "both name what is lent");
+
+        session.handle(SessionMessage::Forget(5)).await;
+        let left: Vec<_> = session.waiting.iter().map(ClientMessage::corr_id).collect();
+        assert_eq!(left, [Some(6)], "the other keeps its place");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frames_waiting_on_a_handle_are_bounded() {
+        let (mut session, mut rx) = lent_session().await;
+        for corr_id in 0..crate::handle::MAX_WAITING_FRAMES as u32 {
+            session
+                .handle(SessionMessage::ClientRequest(launch_on(corr_id, 1)))
+                .await;
+        }
+        session
+            .handle(SessionMessage::ClientRequest(launch_on(9999, 1)))
+            .await;
+        assert_eq!(session.waiting.len(), crate::handle::MAX_WAITING_FRAMES);
+        let WireServerMessage::Response {
+            corr_id,
+            ok,
+            result,
+            ..
+        } = rx.recv().await.expect("an answer")
+        else {
+            panic!("a response");
+        };
+        assert_eq!((corr_id, ok), (9999, false));
+        assert!(result.starts_with("quota"), "{result}");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_session_owns_only_its_own_tenant_and_users_processes() {
         let session = Session::new_inproc(

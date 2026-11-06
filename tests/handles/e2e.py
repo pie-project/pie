@@ -54,9 +54,10 @@ async def t_resume(c, prog):
     r2 = await run(c, prog, ck, [f[-1]], 20, drawn=12)
     check("a fork rolls back", f + r1 == whole and r1 == r2)
     r3 = await run(c, prog, ck, [999], 8, drawn=99)
-    ck2 = await e.fork()
-    check("forks diverge independently", r3 != r2[:8] or True, str(r3[:4]))
-    for h in (e, ck, ck2): await h.close()
+    check("a fork takes its own path", r3 != r1[:8], str(r3[:4]))
+    te, tc = (await e.stat())["tokens"], (await ck.stat())["tokens"]
+    check("and leaves the other where it stood", tc == te + 8, f"{te} {tc}")
+    for h in (e, ck): await h.close()
     return whole
 
 async def t_lazy(c, prog, whole):
@@ -305,7 +306,7 @@ async def t_review(c, prog, whole):
     check("an empty prefill gives the handle back", (await w.stat())["state"] == "parked")
     await w.close()
     # a refused read ends its turn: many in a row do not pile up
-    o = await c.frames(); await c.pcm().close() if False else None
+    o = await c.frames()
     mk = await c.install_program(S / "mk.py", force_overwrite=True)
     sound = c.pcm()
     await (await c.run(mk, out=o, sound=sound, w=8, h=8)).result()
@@ -314,7 +315,7 @@ async def t_review(c, prog, whole):
         except HandleError: pass
     check("refused reads end", len(await o.read("raw-rgb8")) == 192)
     await o.close(); await sound.close()
-    # a launch cancelled while it waits behind a lent handle never runs
+    # a launch waits its turn behind a lent handle
     w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
     long = await c.launch_process(prog, input={"ws": {"$handle": "ws"}, "tokens": [first[-1]], "max_tokens": 200, "seed": 7, "drawn": 12},
                                   handles={"ws": w}, returns={"ws": w})
@@ -324,9 +325,35 @@ async def t_review(c, prog, whole):
     p2 = await asyncio.wait_for(queued, 30); await p2.result()
     check("a launch behind a lent handle runs in turn", (await w.stat())["state"] == "parked")
     await w.close()
+    # a fire refused at its submit wrote nothing: the set is as it was
+    fail = await c.install_program(S / "fail.py", force_overwrite=True)
+    w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
+    before = (await w.stat())["tokens"]
+    out = await (await c.run(fail, ws=w, tokens=[7] * 600)).result()
+    check("a guest hears a refused fire", out["failed"], str(out)[:90])
+    check("and the set it gave is untouched", (await w.stat())["tokens"] == before)
+    r = await run(c, prog, w, [first[-1]], 20, drawn=12)
+    check("and resumes exactly", first + r == whole)
+    await w.close()
+    # handles that cannot share the device are refused, and stay as they were
+    hs = []
+    for i in range(10):
+        h = await c.working_set(); hs.append(h)
+        await run(c, prog, h, list(range(3000 + i, 3460 + i)), 1, seed=i)
+    moved = {f"h{i}": h for i, h in enumerate(hs)}
+    try:
+        p = await c.launch_process(prog, input={"tokens": [1], "max_tokens": 1, "seed": 7}, handles=moved, returns=moved)
+        await asyncio.wait_for(p.result(), 30); check("handles past the device are refused", False)
+    except asyncio.TimeoutError: check("handles past the device are refused", False, "it hung")
+    except Exception as e: check("handles past the device are refused", "quota" in str(e), str(e)[:90])
+    st = [(await h.stat())["state"] for h in hs]
+    check("and each is as it was", st == ["parked"] * 10, str(set(st)))
+    x = await run(c, prog, hs[0], [1], 2, drawn=50)
+    check("and runs", len(x) == 2)
+    for h in hs: await h.close()
 
-async def t_close(c, prog, whole, port=None):
-    d = PieClient(c.server_uri if hasattr(c, "server_uri") else URI[0]); await d.connect()
+async def t_close(c, prog, whole):
+    d = PieClient(URI[0]); await d.connect()
     made = 0
     for i in range(24):
         h = await d.working_set()

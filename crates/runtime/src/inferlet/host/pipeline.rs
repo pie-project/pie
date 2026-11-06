@@ -16,7 +16,7 @@ impl pie::inferlet::pipeline::HostPipeline for ProcessCtx {
     async fn new(&mut self) -> anyhow::Result<Resource<Pipeline>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let pipeline = Pipeline::new();
-        self.register_pipeline(&pipeline.scope, &pipeline.fires, &pipeline.failure);
+        self.register_pipeline(&pipeline.scope, &pipeline.fires);
         crate::scheduler::worker::notify_lane_open(pipeline.scope.scheduler_id(), self.id());
         Ok(self.ctx().table.push(pipeline)?)
     }
