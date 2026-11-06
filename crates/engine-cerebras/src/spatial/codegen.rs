@@ -839,8 +839,8 @@ pub fn gptoss_moe_lev(moe: u16) -> R<String> {
     if moe == 0 {
         return Ok(s);
     }
-    if moe != 1 && moe != 3 {
-        return Err(format!("gen: gptoss_moe_lev: MOE {moe} unknown (1: the op cuts, 3: and bf16 matvecs)"));
+    if moe & 1 == 0 || moe > 7 {
+        return Err(format!("gen: gptoss_moe_lev: MOE {moe} unknown (1: the op cuts, 2: bf16 matvecs, 4: exp at degree 4)"));
     }
     let w = |what: &str| format!("gptoss_moe_lev: {what}");
     let s = patch(
@@ -925,6 +925,24 @@ fn moe_mlp() void {\n",
         &w("exp_fm"),
     )?;
     let s = if moe & 2 != 0 { moe_bf16(&s)? } else { s };
+    let s = if moe & 4 != 0 {
+        // (MOE 4: exp_fm's polynomial at degree 4, near-minimax as TRM 8's;
+        // relative error 2.7e-6)
+        let s = patch(
+            &s,
+            "const exm_c = [6]f32 { 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0 };",
+            "const exm_c = [4]f32 { 0.16790908575057983, 0.5000435709953308, 0.9999634027481079, 0.9999992847442627 };   // (moe4) degree 4",
+            "MOE 4: exm_c",
+        )?;
+        patch(
+            &s,
+            "@fmuls(p, buf, 1.0 / 720.0);\nc = 0;\nwhile (c < 6) : (c += 1) {\nif (c > 0) { @fmuls(p, p, buf); }\n@fadds(p, p, exm_c[c]);\n",
+            "@fmuls(p, buf, 0.041458580642938614);   // (moe4)\nc = 0;\nwhile (c < 4) : (c += 1) {\nif (c > 0) { @fmuls(p, p, buf); }\n@fadds(p, p, exm_c[c]);\n",
+            "MOE 4: exp_fm's loop",
+        )?
+    } else {
+        s
+    };
     Ok(format!("// gptoss_moe (MOE {moe}): codegen::gptoss_moe_lev\n{s}"))
 }
 
@@ -1091,11 +1109,14 @@ pub fn gptoss_attn_lev(v: Variant) -> R<String> {
     if (v.op3 != 0 && v.grid & 2 == 0) || (v.arf != 0 && v.grid & 1 == 0) || v.grid & !3 != 0 {
         return Err("gen: gptoss_attn_lev: OP3 and ARF come as the grids' GRD 2 and 1 (no other GRD bit ported)".into());
     }
-    if v.arf & 4 != 0 || v.f16 != 0 || v.mem != 0 || v.trim != 0 || v.xac || v.rgx || v.eps_bits.is_some() {
+    if v.arf & 4 != 0 || v.f16 != 0 || v.mem != 0 || (v.trim != 0 && v.trim != 8) || v.xac || v.rgx || v.eps_bits.is_some() {
         return Err(format!("gen: gptoss_attn_lev: lever not ported ({v:?})"));
     }
     let tag = "qwen2d_paged8b/pe.csl";
-    let s = v.apply(&softmax_s123(src::QWEN2D_PAGED8B_HR, tag)?, tag)?;
+    // (TRM 8 alone, without the f16 accumulation TRM's other bits need:
+    // exp_fast's polynomial at degree 4, relative error 2.7e-6)
+    let s = Variant { trim: 0, ..v }.apply(&softmax_s123(src::QWEN2D_PAGED8B_HR, tag)?, tag)?;
+    let s = if v.trim & 8 != 0 { apply_reps("trm_exp", src::TRM_EXP, &s, tag)? } else { s };
     let w = |what: &str| format!("gptoss_attn_lev: {what}");
     let s = patch(&s, "const EPS: f32 = 1.0e-6;\n", "", &w("EPS const"))?;
     let s = patch(
@@ -4285,7 +4306,7 @@ pub fn serve_gptoss_with(v: Variant, moe: u16) -> R<Vec<File>> {
             "param QKN: u16 = 1;      // (0: the gpt-oss units' identity q/k norm, as the levers state it)\n\
 param ANP: u16 = 0;      // the attention units' x parts (0: NP, as the MoE router's)\n\
 param SPD: u16 = 0;      // the attention units' levers (codegen::gptoss_attn_lev)\n\
-param LSE: u16 = 0;\nparam OP2: u16 = 0;\nparam OP3: u16 = 0;\nparam GRD: u16 = 0;\nparam ARF: u16 = 0;      // (the hosts write the attention units' ARF route words)\nparam MOE: u16 = 0;      // the MoE units' (codegen::gptoss_moe_lev)\nparam QKV1: u16 = 0;   // wqa = [Hc][q a | q v | v], wqv / wv dummies\n\
+param LSE: u16 = 0;\nparam OP2: u16 = 0;\nparam OP3: u16 = 0;\nparam GRD: u16 = 0;\nparam TRM: u16 = 0;      // (8 alone: the attention units' exp at degree 4)\nparam ARF: u16 = 0;      // (the hosts write the attention units' ARF route words)\nparam MOE: u16 = 0;      // the MoE units' (codegen::gptoss_moe_lev)\nparam QKV1: u16 = 0;   // wqa = [Hc][q a | q v | v], wqv / wv dummies\n\
 param NOLAYER: u16 = 0;",
             "serve_gptoss layout's lever params",
         )
@@ -4367,6 +4388,7 @@ mod tests {
             lse: on("LSE"),
             ops2: on("OP2"),
             qkv1: on("QKV1"),
+            trim: p.iter().find(|(a, _)| a == "TRM").map_or(0, |(_, b)| b.parse().unwrap()),
             op3: u16::from(on("OP3")),
             arf: p.iter().find(|(a, _)| a == "ARF").map_or(0, |(_, b)| b.parse().unwrap()),
             grid: (if on("OP3") { 2 } else { 0 }) | (if on("ARF") { 1 } else { 0 }),
