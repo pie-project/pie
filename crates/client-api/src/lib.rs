@@ -3,5 +3,7 @@ pub mod message;
 pub mod props;
 
 pub use edge::{GatewayFrame, WorkerFrame};
-pub use message::{ClientMessage, Files, HandleKind, HandleName, HandleOp, Handles, ServerMessage};
+pub use message::{
+    ClientMessage, Files, GrammarSource, HandleKind, HandleName, HandleOp, Handles, ServerMessage,
+};
 pub use props::Props;

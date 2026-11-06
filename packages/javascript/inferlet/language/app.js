@@ -98,6 +98,9 @@ function parseInput(raw) {
 function hydrate(value) {
   if (Array.isArray(value)) return value.map(hydrate);
   if (value === null || typeof value !== 'object') return value;
+  if (value.kind === 'matcher' && '$handle' in value) {
+    return inferlet.grammar.Matcher.take(value.$handle);
+  }
   const keys = Object.keys(value);
   if (keys.length === 1 && keys[0] === '$handle') {
     return inferlet.eta.WorkingSet.fromInput(value);

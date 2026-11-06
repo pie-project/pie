@@ -90,15 +90,44 @@ impl std::fmt::Debug for Matcher {
     }
 }
 
+fn matcher_of(compiled: Arc<CompiledGrammar>) -> Matcher {
+    let stop_tokens = crate::model::model().instruct().seal();
+    Matcher {
+        inner: GrammarMatcher::with_compiled(compiled, stop_tokens, MAX_ROLLBACK_TOKENS),
+    }
+}
+
+/// A matcher at the start of what a client wrote.
+pub(crate) fn compile_matcher(source: &client_api::GrammarSource) -> Result<Matcher> {
+    use client_api::GrammarSource;
+    let compiler = grammar_compiler();
+    Ok(matcher_of(match source {
+        GrammarSource::JsonSchema(schema) => {
+            compiler.compile_json_schema(schema, &JsonSchemaOptions::default())?
+        }
+        GrammarSource::Regex(pattern) => compiler.compile_regex(pattern)?,
+        GrammarSource::Ebnf(ebnf) => compiler.compile_ebnf(ebnf, "root")?,
+        GrammarSource::Json => compiler.compile_builtin_json()?,
+    }))
+}
+
+impl Matcher {
+    /// An independent matcher where this one stands.
+    pub(crate) fn fork(&self) -> Matcher {
+        Matcher {
+            inner: self.inner.fork(),
+        }
+    }
+
+    pub(crate) fn is_terminated(&self) -> bool {
+        self.inner.is_terminated()
+    }
+}
+
 impl pie::inferlet::grammar::HostMatcher for ProcessCtx {
     async fn new(&mut self, grammar: Resource<Grammar>) -> Result<Resource<Matcher>> {
-        let model = crate::model::model();
-        let stop_tokens = model.instruct().seal();
         let compiled = self.ctx().table.get(&grammar)?.compiled.clone();
-        let inner = GrammarMatcher::with_compiled(compiled, stop_tokens, MAX_ROLLBACK_TOKENS);
-
-        let matcher = Matcher { inner };
-        Ok(self.ctx().table.push(matcher)?)
+        Ok(self.ctx().table.push(matcher_of(compiled))?)
     }
 
     async fn accept_tokens(

@@ -5,6 +5,7 @@
 // the packed allowed-token bitmask that `mask.ts` interprets.
 
 import * as _grammar from 'pie:inferlet/grammar@0.3.0';
+import * as _session from 'pie:inferlet/session@0.3.0';
 
 /** A grammar the host refused to compile, or a token the matcher refused. */
 export class GrammarError extends Error {
@@ -57,6 +58,18 @@ export class Matcher {
 
   constructor(grammar: Grammar | _grammar.Matcher) {
     this.inner = grammar instanceof Grammar ? new _grammar.Matcher(grammar.inner) : grammar;
+  }
+
+  /** The handle the launch moved in under `name`, once. */
+  static take(name: string): Matcher {
+    const inner = _session.takeMatcher(name);
+    if (inner === undefined) throw new GrammarError(`the launch moved in no matcher \`${name}\``);
+    return new Matcher(inner);
+  }
+
+  /** Hands this matcher back to the client under the launch's `name`. Unusable after. */
+  give(name: string): void {
+    wit('give', () => _session.giveMatcher(name, this.inner));
   }
 
   /** Advance the match by `tokenIds`; a forbidden token throws `GrammarError`. */

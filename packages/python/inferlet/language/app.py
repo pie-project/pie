@@ -116,6 +116,8 @@ def _load(script: dict) -> types.ModuleType:
 def _hydrate(value):
     """The input with each `{"$handle": name}` the client wrote as the handle."""
     if isinstance(value, dict):
+        if value.get("kind") == "matcher" and "$handle" in value:
+            return _inferlet.grammar.Matcher.take(value["$handle"])
         if len(value) == 1 and "$handle" in value:
             return _inferlet.eta.WorkingSet.from_input(value)
         return {key: _hydrate(item) for key, item in value.items()}

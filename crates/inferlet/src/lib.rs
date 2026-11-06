@@ -101,6 +101,33 @@ pub mod frames {
 
 pub mod grammar {
     pub use crate::pie::inferlet::grammar::*;
+
+    impl Matcher {
+        /// The handle the launch moved in under `name`.
+        pub fn take(name: &str) -> Option<Matcher> {
+            crate::pie::inferlet::session::take_matcher(name)
+        }
+
+        /// Hands this matcher back to the client under the launch's `name`.
+        pub fn give(self, name: &str) -> Result<(), String> {
+            crate::pie::inferlet::session::give_matcher(name, self)
+        }
+    }
+
+    /// A `Matcher` in a typed input is the handle the client wrote there.
+    impl<'de> serde::Deserialize<'de> for Matcher {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            #[derive(serde::Deserialize)]
+            struct Marker {
+                #[serde(rename = "$handle")]
+                handle: String,
+            }
+            let Marker { handle } = Marker::deserialize(deserializer)?;
+            Matcher::take(&handle).ok_or_else(|| {
+                serde::de::Error::custom(format!("the launch moved in no matcher `{handle}`"))
+            })
+        }
+    }
 }
 
 pub mod media {

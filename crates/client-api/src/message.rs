@@ -12,10 +12,22 @@ pub type HandleName = u64;
 /// Handles a launch deals in, by the name the guest knows each under.
 pub type Handles = std::collections::BTreeMap<String, HandleName>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HandleKind {
     WorkingSet,
+    Matcher(GrammarSource),
+}
+
+/// A grammar as a client writes it. It compiles where a process binds it, the
+/// tokenizer being the worker's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrammarSource {
+    JsonSchema(String),
+    Regex(String),
+    Ebnf(String),
+    Json,
 }
 
 /// What a client can do to a handle without running anything: its lifetime,
@@ -44,11 +56,11 @@ pub enum HandleOp {
 impl HandleOp {
     /// The names this op needs settled before it runs.
     pub fn touches(&self) -> impl Iterator<Item = HandleName> {
-        let (first, second) = match *self {
+        let (first, second) = match self {
             HandleOp::New { name, .. } | HandleOp::Close { name } | HandleOp::Stat { name } => {
-                (name, None)
+                (*name, None)
             }
-            HandleOp::Fork { name, from } => (name, Some(from)),
+            HandleOp::Fork { name, from } => (*name, Some(*from)),
         };
         std::iter::once(first).chain(second)
     }

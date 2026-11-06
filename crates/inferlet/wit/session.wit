@@ -3,6 +3,7 @@ interface session {
     use types.{blob, error};
     use frames.{frames, pcm, image-format, audio-format};
     use working-set.{working-set};
+    use grammar.{matcher};
 
     // Sends a message to the remote user client
     send: func(message: string);
@@ -51,6 +52,13 @@ interface session {
     /// its last fire has settled. Refused if the launch expects no such
     /// return, or has one already; `ws` is dropped either way it fails.
     give-working-set: func(name: string, ws: working-set) -> result<_, error>;
+
+    /// `take-working-set` for a matcher: it stands where the client left it,
+    /// or at the start of the grammar it wrote.
+    take-matcher: func(name: string) -> option<matcher>;
+
+    /// `give-working-set` for a matcher.
+    give-matcher: func(name: string, matcher: matcher) -> result<_, error>;
 
     /// Encodes `f` and streams the bytes to the client under `name`, WITHOUT
     /// the encoded file ever entering WASM linear memory.

@@ -257,20 +257,25 @@ export function withUpgradePath(serverUri) {
 export class HandleError extends Error {}
 
 /**
- * A working set this session owns. Lazy: nothing exists on the server until a
- * process binds it, so making one costs a name.
+ * State this session owns between processes. Lazy: nothing exists on the
+ * server until a process binds it, so making one costs a name.
  */
-export class WorkingSet {
+export class Handle {
     constructor(client, name) {
         this.client = client;
         this.name = name;
     }
 
-    /** An independent copy of this set as it stands. */
+    /** What the input carries where this handle goes. */
+    marker(slot) {
+        return { $handle: slot };
+    }
+
+    /** An independent copy of this handle as it stands. */
     async fork() {
         const child = this.client._nextHandle();
         await this.client._handleOp({ op: "fork", name: child, from: this.name });
-        return new WorkingSet(this.client, child);
+        return new this.constructor(this.client, child);
     }
 
     async stat() {
@@ -279,6 +284,19 @@ export class WorkingSet {
 
     async close() {
         await this.client._handleOp({ op: "close", name: this.name });
+    }
+}
+
+/** One sequence's model state. */
+export class WorkingSet extends Handle {}
+
+/**
+ * A grammar match in progress. It stands where it stood across processes with
+ * the working set it constrains: move and fork them together.
+ */
+export class Matcher extends Handle {
+    marker(slot) {
+        return { $handle: slot, kind: "matcher" };
     }
 }
 
@@ -641,6 +659,21 @@ export class PieClient {
         return new WorkingSet(this, name);
     }
 
+    /**
+     * A matcher at the start of one grammar, or of any JSON given none. The
+     * grammar compiles where a process binds it, and an error fails that launch.
+     * @param {{jsonSchema?: string, regex?: string, ebnf?: string}} [grammar]
+     */
+    async matcher({ jsonSchema, regex, ebnf } = {}) {
+        let source = "json";
+        if (jsonSchema !== undefined) source = { json_schema: jsonSchema };
+        else if (regex !== undefined) source = { regex };
+        else if (ebnf !== undefined) source = { ebnf };
+        const name = this._nextHandle();
+        await this._handleOp({ op: "new", name, kind: { matcher: source } });
+        return new Matcher(this, name);
+    }
+
     // =========================================================================
     // Process Lifecycle
     // =========================================================================
@@ -651,7 +684,7 @@ export class PieClient {
      * @param {Object} [input={}] Input parameters object, serialized to JSON.
      * @param {boolean} [captureOutputs=true] Stream outputs to client.
      * @param {Object<string, Uint8Array>} [files={}] Files the inferlet reads with `session.file(name)`.
-     * @param {{handles?: Object<string, WorkingSet>, returns?: Object<string, WorkingSet>}} [moved]
+     * @param {{handles?: Object<string, Handle>, returns?: Object<string, Handle>}} [moved]
      *   Handles moved into the process, and what it gives back, by the guest's names.
      * @returns {Promise<Process>}
      */
@@ -709,10 +742,10 @@ export class PieClient {
             program = program.program;
         }
         const moved = Object.fromEntries(
-            Object.entries(input).filter(([, arg]) => arg instanceof WorkingSet),
+            Object.entries(input).filter(([, arg]) => arg instanceof Handle),
         );
         const marked = Object.fromEntries(
-            Object.keys(moved).map((name) => [name, { $handle: name }]),
+            Object.entries(moved).map(([name, arg]) => [name, arg.marker(name)]),
         );
         return await this.launchProcess(
             program, { ...input, ...marked }, true, {}, { handles: moved, returns: moved },

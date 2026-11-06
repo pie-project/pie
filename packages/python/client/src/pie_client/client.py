@@ -150,25 +150,41 @@ class HandleError(Exception):
     """A handle op was refused: unknown, dead, or in use."""
 
 
-class WorkingSet:
-    """A working set this session owns. Lazy: nothing exists on the server
-    until a process binds it, so making one costs a name."""
+class Handle:
+    """State this session owns between processes. Lazy: nothing exists on the
+    server until a process binds it, so making one costs a name."""
 
     def __init__(self, client: "PieClient", name: int):
         self.client = client
         self.name = name
 
-    async def fork(self) -> "WorkingSet":
-        """An independent copy of this set as it stands."""
+    def marker(self, slot: str) -> dict:
+        """What the input carries where this handle goes."""
+        return {"$handle": slot}
+
+    async def fork(self) -> "Handle":
+        """An independent copy of this handle as it stands."""
         child = self.client._next_handle()
         await self.client._handle_op({"op": "fork", "name": child, "from": self.name})
-        return WorkingSet(self.client, child)
+        return type(self)(self.client, child)
 
     async def stat(self) -> dict:
         return await self.client._handle_op({"op": "stat", "name": self.name})
 
     async def close(self) -> None:
         await self.client._handle_op({"op": "close", "name": self.name})
+
+
+class WorkingSet(Handle):
+    """One sequence's model state."""
+
+
+class Matcher(Handle):
+    """A grammar match in progress. It stands where it stood across processes
+    with the working set it constrains: move and fork them together."""
+
+    def marker(self, slot: str) -> dict:
+        return {"$handle": slot, "kind": "matcher"}
 
 
 class PieClient:
@@ -537,14 +553,35 @@ class PieClient:
         await self._handle_op({"op": "new", "name": name, "kind": "working_set"})
         return WorkingSet(self, name)
 
+    async def matcher(
+        self,
+        *,
+        json_schema: str | None = None,
+        regex: str | None = None,
+        ebnf: str | None = None,
+    ) -> Matcher:
+        """A matcher at the start of one grammar, or of any JSON given none.
+        The grammar compiles where a process binds it, and an error in it
+        fails that launch."""
+        source: Any = "json"
+        if json_schema is not None:
+            source = {"json_schema": json_schema}
+        elif regex is not None:
+            source = {"regex": regex}
+        elif ebnf is not None:
+            source = {"ebnf": ebnf}
+        name = self._next_handle()
+        await self._handle_op({"op": "new", "name": name, "kind": {"matcher": source}})
+        return Matcher(self, name)
+
     async def launch_process(
         self,
         inferlet: str,
         input: dict | list | None = None,
         capture_outputs: bool = True,
         files: dict[str, bytes] | None = None,
-        handles: "dict[str, WorkingSet] | None" = None,
-        returns: "dict[str, WorkingSet] | None" = None,
+        handles: "dict[str, Handle] | None" = None,
+        returns: "dict[str, Handle] | None" = None,
     ) -> Process:
         """Launch a process. Returns a Process object for interaction.
 
@@ -586,7 +623,7 @@ class PieClient:
     async def run(self, program: "Inferlet | str", /, **kwargs: Any) -> Process:
         """Launch an inferlet with keyword arguments as its input.
 
-        A `WorkingSet` among the keyword arguments moves into the process and
+        A `Handle` among the keyword arguments moves into the process and
         comes back under the same handle: the guest finds it where the
         argument is, and gives it back by the same name.
 
@@ -602,8 +639,8 @@ class PieClient:
                 program = await self.install_program_bytes(
                     program.source.encode("utf-8"), f"{program.name}.py", program.version
                 )
-        moved = {name: arg for name, arg in kwargs.items() if isinstance(arg, WorkingSet)}
-        input = {**kwargs, **{name: {"$handle": name} for name in moved}}
+        moved = {name: arg for name, arg in kwargs.items() if isinstance(arg, Handle)}
+        input = {**kwargs, **{name: arg.marker(name) for name, arg in moved.items()}}
         return await self.launch_process(program, input=input, handles=moved, returns=moved)
 
     async def attach_process(self, process_id: str) -> Process:

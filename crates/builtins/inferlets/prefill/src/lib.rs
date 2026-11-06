@@ -5,7 +5,8 @@
 //! worker's cache when the program exits, for the asker to take.
 //!
 //! Input: `{"tokens": [u32, ...]}`. Output: `{"tokens": n, "cached": k}`,
-//! `k` of the `n` found already cached here.
+//! `k` of the `n` found already cached here. A launch that moves a handle in
+//! as `ws` gets it back holding the tokens: a checkpoint no model code wrote.
 
 use inferlet::eta::prelude::*;
 use serde::Deserialize;
@@ -23,7 +24,9 @@ async fn main(input: String) -> std::result::Result<String, String> {
         return Ok(serde_json::json!({"tokens": 0, "cached": 0}).to_string());
     }
     let tokens: Vec<i32> = input.tokens.iter().map(|&t| t as i32).collect();
-    let ws = WorkingSet::new();
+    let moved = WorkingSet::take("ws");
+    let keep = moved.is_some();
+    let ws = moved.unwrap_or_default();
     let pipe = Pipeline::new();
     let toks = Channel::from(&tokens[..]);
     let indptr = Channel::from([0u32, n]);
@@ -42,5 +45,9 @@ async fn main(input: String) -> std::result::Result<String, String> {
     landed.take_host::<i32>().await?;
     let cached = ws.cached_tokens();
     pipe.close();
+    drop(fwd);
+    if keep {
+        ws.give("ws")?;
+    }
     Ok(serde_json::json!({"tokens": n, "cached": cached}).to_string())
 }

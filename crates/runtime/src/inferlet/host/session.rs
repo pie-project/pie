@@ -178,8 +178,35 @@ impl pie::inferlet::session::Host for ProcessCtx {
     ) -> Result<Option<Resource<crate::inferlet::host::working_set::WorkingSet>>> {
         Ok(self
             .handles()
-            .and_then(|handles| handles.take(&name))
+            .and_then(|handles| handles.take_working_set(&name))
             .map(Resource::new_own))
+    }
+
+    async fn take_matcher(
+        &mut self,
+        name: String,
+    ) -> Result<Option<Resource<crate::inferlet::host::grammar::Matcher>>> {
+        Ok(self
+            .handles()
+            .and_then(|handles| handles.take_matcher(&name))
+            .map(Resource::new_own))
+    }
+
+    async fn give_matcher(
+        &mut self,
+        name: String,
+        matcher: Resource<crate::inferlet::host::grammar::Matcher>,
+    ) -> Result<Result<(), String>> {
+        match self.handles() {
+            Some(handles) if handles.expects(&name) => {
+                handles.give(name, crate::handle::Moved::Matcher(matcher.rep()));
+                Ok(Ok(()))
+            }
+            _ => {
+                pie::inferlet::grammar::HostMatcher::drop(self, matcher).await?;
+                Ok(Err(format!("this launch expects no matcher `{name}`")))
+            }
+        }
     }
 
     async fn give_working_set(
@@ -189,7 +216,7 @@ impl pie::inferlet::session::Host for ProcessCtx {
     ) -> Result<Result<(), String>> {
         match self.handles() {
             Some(handles) if handles.expects(&name) => {
-                handles.give(name, ws.rep());
+                handles.give(name, crate::handle::Moved::WorkingSet(ws.rep()));
                 Ok(Ok(()))
             }
             _ => {

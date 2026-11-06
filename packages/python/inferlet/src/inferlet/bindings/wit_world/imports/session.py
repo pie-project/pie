@@ -10,6 +10,7 @@ import weakref
 from componentize_py_types import Result, Ok, Err, Some
 from ..imports import frames
 from ..imports import working_set
+from ..imports import grammar
 import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
@@ -81,6 +82,19 @@ def give_working_set(name: str, ws: working_set.WorkingSet) -> None:
     returns. It lands in the client's session when this process ends, once
     its last fire has settled. Refused if the launch expects no such
     return, or has one already; `ws` is dropped either way it fails.
+
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
+def take_matcher(name: str) -> Optional[grammar.Matcher]:
+    """
+    `take-working-set` for a matcher: it stands where the client left it,
+    or at the start of the grammar it wrote.
+    """
+    raise NotImplementedError
+def give_matcher(name: str, matcher: grammar.Matcher) -> None:
+    """
+    `give-working-set` for a matcher.
 
     Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """

@@ -51,6 +51,15 @@ export function takeWorkingSet(name: string): WorkingSet | undefined;
  */
 export function giveWorkingSet(name: string, ws: WorkingSet): void;
 /**
+ * `take-working-set` for a matcher: it stands where the client left it,
+ * or at the start of the grammar it wrote.
+ */
+export function takeMatcher(name: string): Matcher | undefined;
+/**
+ * `give-working-set` for a matcher.
+ */
+export function giveMatcher(name: string, matcher: Matcher): void;
+/**
  * Encodes `f` and streams the bytes to the client under `name`, WITHOUT
  * the encoded file ever entering WASM linear memory.
  * 
@@ -98,3 +107,4 @@ export type Pcm = import('./pie-inferlet-frames.js').Pcm;
 export type ImageFormat = import('./pie-inferlet-frames.js').ImageFormat;
 export type AudioFormat = import('./pie-inferlet-frames.js').AudioFormat;
 export type WorkingSet = import('./pie-inferlet-working-set.js').WorkingSet;
+export type Matcher = import('./pie-inferlet-grammar.js').Matcher;

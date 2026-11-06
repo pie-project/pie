@@ -1,8 +1,8 @@
 use crate::crypto::ParsedPrivateKey;
 use crate::error::{Error, Result};
 use crate::message::{
-    CHUNK_SIZE_BYTES, ClientMessage, Files, HandleKind, HandleName, HandleOp, Handles, Props,
-    ServerMessage,
+    CHUNK_SIZE_BYTES, ClientMessage, Files, GrammarSource, HandleKind, HandleName, HandleOp,
+    Handles, Props, ServerMessage,
 };
 use crate::utils::IdPool;
 use base64::Engine;
@@ -505,6 +505,18 @@ impl Client {
         self.handle_op(HandleOp::New {
             name,
             kind: HandleKind::WorkingSet,
+        })
+        .await?;
+        Ok(name)
+    }
+
+    /// A new matcher at the start of `grammar`, which compiles where a process
+    /// binds it.
+    pub async fn new_matcher(&self, grammar: GrammarSource) -> Result<HandleName> {
+        let name = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.handle_op(HandleOp::New {
+            name,
+            kind: HandleKind::Matcher(grammar),
         })
         .await?;
         Ok(name)

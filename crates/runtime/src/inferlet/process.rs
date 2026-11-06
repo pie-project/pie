@@ -790,8 +790,9 @@ impl Process {
             store.data_mut().set_files(files);
             if let Some(lease) = lease {
                 lease.ready(process_id).await?;
-                let bag = lease.bind(store.data_mut()).map_err(|e| e.to_string())?;
+                let (bag, bound) = lease.bind(store.data_mut());
                 store.data_mut().set_handles(bag);
+                bound.map_err(|e| e.to_string())?;
             }
 
             let run_interface = RUN_INTERFACE;

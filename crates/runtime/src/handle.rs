@@ -16,6 +16,7 @@ use client_api::{HandleKind, HandleName, HandleOp, Handles};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::inferlet::host::grammar::Matcher;
 use crate::inferlet::host::working_set::{Cursor, WorkingSet};
 use crate::inferlet::process::ProcessResidency;
 use crate::inferlet::process::residency::{register_residency, unregister_residency};
@@ -244,8 +245,11 @@ fn owed(
 #[derive(Debug)]
 pub(crate) enum Slot {
     /// Named, and nothing else yet: a process makes it, on its own engine.
-    Unborn,
+    Unborn(HandleKind),
     Parked(Held),
+    /// Host memory and nothing else: it moves as it is. The lock is for
+    /// `Sync`, which the actor holding the table needs and it alone reaches.
+    Matcher(Mutex<Matcher>),
     /// In a process, or promised by one: frames naming it wait.
     Lent,
     /// Gone for a reason the next use hears.
@@ -278,16 +282,18 @@ impl Table {
     async fn op(&mut self, op: HandleOp) -> Result<Value, String> {
         match op {
             HandleOp::New { name, kind } => {
-                let HandleKind::WorkingSet = kind;
                 self.claim(name)?;
-                self.slots.insert(name, Slot::Unborn);
+                self.slots.insert(name, Slot::Unborn(kind));
                 Ok(json!({ "ok": true }))
             }
             HandleOp::Fork { name, from } => {
                 self.claim(name)?;
                 let child = match self.slots.get(&from) {
-                    Some(Slot::Unborn) => Slot::Unborn,
+                    Some(Slot::Unborn(kind)) => Slot::Unborn(kind.clone()),
                     Some(Slot::Parked(held)) => Slot::Parked(held.fork().await?),
+                    Some(Slot::Matcher(matcher)) => {
+                        Slot::Matcher(Mutex::new(matcher.lock().unwrap().fork()))
+                    }
                     other => return Err(refusal(from, other)),
                 };
                 self.slots.insert(name, child);
@@ -298,10 +304,15 @@ impl Table {
                 None => Err(refusal(name, None)),
             },
             HandleOp::Stat { name } => match self.slots.get(&name) {
-                Some(Slot::Unborn) => {
+                Some(Slot::Unborn(HandleKind::WorkingSet)) => {
                     Ok(json!({ "state": "unborn", "tokens": 0, "folded": 0, "engine": null }))
                 }
+                Some(Slot::Unborn(_)) => Ok(json!({ "state": "unborn" })),
                 Some(Slot::Parked(held)) => Ok(held.stat()),
+                Some(Slot::Matcher(matcher)) => {
+                    let terminated = matcher.lock().unwrap().is_terminated();
+                    Ok(json!({ "state": "parked", "terminated": terminated }))
+                }
                 other => Err(refusal(name, other)),
             },
         }
@@ -350,7 +361,12 @@ impl Table {
         }
         let unborn = handles
             .values()
-            .filter(|name| matches!(self.slots.get(name), Some(Slot::Unborn)))
+            .filter(|name| {
+                matches!(
+                    self.slots.get(name),
+                    Some(Slot::Unborn(HandleKind::WorkingSet))
+                )
+            })
             .count();
         if state_room.is_some_and(|room| (room as usize) < unborn) {
             return Err(format!(
@@ -453,28 +469,52 @@ impl Lease {
         Ok(())
     }
 
-    /// Puts each handle in `ctx`, under the name its guest takes it by.
-    pub(crate) fn bind(mut self, ctx: &mut ProcessCtx) -> anyhow::Result<Bag> {
+    /// Puts each handle in `ctx`, under the name its guest takes it by. One
+    /// that fails stops here: it is lost for that reason, and the rest go
+    /// back as they came.
+    pub(crate) fn bind(mut self, ctx: &mut ProcessCtx) -> (Bag, anyhow::Result<()>) {
         let mut bag = Bag {
             session: self.session,
             taken: HashMap::new(),
             lent: Vec::new(),
+            lost: Vec::new(),
             given: Vec::new(),
             returns: std::mem::take(&mut self.returns),
         };
-        for (slot, name, handle) in self.bound.drain(..) {
-            let rep = match handle {
-                Slot::Parked(held) => {
-                    let Parts { kv, rs, cursor } = held.into_parts();
-                    crate::inferlet::host::working_set::adopt(ctx, kv, rs, cursor)?
+        while let Some((slot, name, handle)) = self.bound.pop() {
+            match bind_one(ctx, handle) {
+                Ok(moved) => {
+                    bag.taken.insert(slot, moved);
+                    bag.lent.push(name);
                 }
-                _ => crate::inferlet::host::working_set::materialize(ctx)?,
-            };
-            bag.taken.insert(slot, rep);
-            bag.lent.push(name);
+                Err(error) => {
+                    bag.lost.push((name, format!("binding `{slot}`: {error}")));
+                    return (bag, Err(error));
+                }
+            }
         }
-        Ok(bag)
+        (bag, Ok(()))
     }
+}
+
+fn bind_one(ctx: &mut ProcessCtx, handle: Slot) -> anyhow::Result<Moved> {
+    use crate::inferlet::host::{grammar, working_set};
+    use wasmtime_wasi::WasiView;
+    Ok(match handle {
+        Slot::Parked(held) => {
+            let Parts { kv, rs, cursor } = held.into_parts();
+            Moved::WorkingSet(working_set::adopt(ctx, kv, rs, cursor)?)
+        }
+        Slot::Matcher(matcher) => {
+            let matcher = matcher.into_inner().unwrap();
+            Moved::Matcher(ctx.ctx().table.push(matcher)?.rep())
+        }
+        Slot::Unborn(HandleKind::Matcher(source)) => {
+            let matcher = grammar::compile_matcher(&source)?;
+            Moved::Matcher(ctx.ctx().table.push(matcher)?.rep())
+        }
+        _ => Moved::WorkingSet(working_set::materialize(ctx)?),
+    })
 }
 
 impl Drop for Lease {
@@ -498,14 +538,23 @@ impl Drop for Lease {
     }
 }
 
+/// A handle in a process's table, by its table rep.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Moved {
+    WorkingSet(u32),
+    Matcher(u32),
+}
+
 /// A running process's handles.
 #[derive(Debug)]
 pub(crate) struct Bag {
     session: ClientId,
-    /// Not taken by the guest yet, by name: table reps of [`WorkingSet`]s.
-    taken: HashMap<String, u32>,
+    /// Not taken by the guest yet, by name.
+    taken: HashMap<String, Moved>,
     lent: Vec<HandleName>,
-    given: Vec<(String, u32)>,
+    /// What binding lost, and why.
+    lost: Vec<(HandleName, String)>,
+    given: Vec<(String, Moved)>,
     returns: Handles,
 }
 
@@ -522,8 +571,24 @@ impl Bag {
         crate::server::handles_settled(self.session, settled);
     }
 
-    pub(crate) fn take(&mut self, name: &str) -> Option<u32> {
-        self.taken.remove(name)
+    pub(crate) fn take_working_set(&mut self, name: &str) -> Option<u32> {
+        match self.taken.get(name)? {
+            &Moved::WorkingSet(rep) => {
+                self.taken.remove(name);
+                Some(rep)
+            }
+            Moved::Matcher(_) => None,
+        }
+    }
+
+    pub(crate) fn take_matcher(&mut self, name: &str) -> Option<u32> {
+        match self.taken.get(name)? {
+            &Moved::Matcher(rep) => {
+                self.taken.remove(name);
+                Some(rep)
+            }
+            Moved::WorkingSet(_) => None,
+        }
     }
 
     /// Whether `name` is one the launch said to expect.
@@ -531,8 +596,8 @@ impl Bag {
         self.returns.contains_key(name) && !self.given.iter().any(|(given, _)| given == name)
     }
 
-    pub(crate) fn give(&mut self, name: String, rep: u32) {
-        self.given.push((name, rep));
+    pub(crate) fn give(&mut self, name: String, moved: Moved) {
+        self.given.push((name, moved));
     }
 
     /// Takes what the guest gave out of `resources`, and tells the session
@@ -552,12 +617,15 @@ impl Bag {
                 ))),
             );
         }
-        for (slot, rep) in self.given {
+        for (name, why) in self.lost {
+            settled.insert(name, Some(Slot::Dead(why)));
+        }
+        for (slot, moved) in self.given {
             let Some(&name) = self.returns.get(&slot) else {
                 continue;
             };
-            let landed = match take_out(resources, residency, rep) {
-                Ok(Parts { kv, rs, cursor }) => Slot::Parked(Held::park(kv, rs, cursor)),
+            let landed = match take_out(resources, residency, moved) {
+                Ok(landed) => landed,
                 Err(error) => Slot::Dead(format!("taking `{slot}` from its process: {error}")),
             };
             settled.insert(name, Some(landed));
@@ -569,9 +637,19 @@ impl Bag {
 fn take_out(
     resources: &mut wasmtime::component::ResourceTable,
     residency: &Mutex<ProcessResidency>,
-    rep: u32,
-) -> anyhow::Result<Parts> {
+    moved: Moved,
+) -> anyhow::Result<Slot> {
     use wasmtime::component::Resource;
+    let rep = match moved {
+        Moved::Matcher(rep) => {
+            return Ok(Slot::Matcher(Mutex::new(resources.delete(Resource::<
+                Matcher,
+            >::new_own(
+                rep
+            ))?)));
+        }
+        Moved::WorkingSet(rep) => rep,
+    };
     let ws = resources.delete(Resource::<WorkingSet>::new_own(rep))?;
     let cursor = ws.cursor();
     let kv = resources.delete(Resource::<KvWorkingSet>::new_own(ws.kv))?;
@@ -579,12 +657,14 @@ fn take_out(
         Some(rep) => Some(resources.delete(Resource::<RsWorkingSet>::new_own(rep))?),
         None => None,
     };
-    let mut held = residency.lock().unwrap();
-    held.kv_working_sets.remove(&(kv.model, kv.engine, kv.id));
-    if let Some(rs) = &rs {
-        held.rs_working_sets.remove(&(rs.model, rs.engine, rs.id));
+    {
+        let mut held = residency.lock().unwrap();
+        held.kv_working_sets.remove(&(kv.model, kv.engine, kv.id));
+        if let Some(rs) = &rs {
+            held.rs_working_sets.remove(&(rs.model, rs.engine, rs.id));
+        }
     }
-    Ok(Parts { kv, rs, cursor })
+    Ok(Slot::Parked(Held::park(kv, rs, cursor)))
 }
 
 #[cfg(test)]
