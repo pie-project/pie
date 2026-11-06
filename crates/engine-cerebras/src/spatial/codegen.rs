@@ -1005,7 +1005,7 @@ var gu: [GUN]f32 align(16) = @zeros([GUN]f32);",
     let s = patch(
         &s,
         "const ACTN: u16 = mx2(MC * Ic, DHc);",
-        "const ACTN: u16 = mx2(mx2(MC * Ic, DHc), TC * NQB);   // (gpt-oss) HV's exp over the scores",
+        "const ACTN: u16 = mx2(mx2(MC * Ic, DHc), (TC + 1) * NQB);   // (gpt-oss) HV's exp over the scores and the sinks' row",
         &w("ACTN"),
     )?;
     let s = patch(
@@ -1043,7 +1043,8 @@ const qf_t = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> qkv[i * @as(i16,
     let s = patch(
         &s,
         "// ---------------------------------------------------------------- the layer\n",
-        "// gpt-oss's biases and sinks.\n\
+        "// gpt-oss's biases and sinks (the sinks ride HV's softmax: pages of 1 only).\n\
+comptime { @comptime_assert(PS == 1); }\n\
 var bqa = @zeros([NH * DHc]f32);\n\
 var bqa_ptr: [*]f32 = &bqa;\n\
 var bqv = @zeros([NH * DHc]f32);\n\
@@ -1054,15 +1055,13 @@ var bo = @zeros([Hc]f32);\n\
 var bo_ptr: [*]f32 = &bo;\n\
 var snk = @zeros([NQB]f32);\n\
 var snk_ptr: [*]f32 = &snk;\n\
-var skx = @zeros([NQB]f32);\n\
-var skt = @zeros([NQB]f32);\n\
+
 const bqa_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NH * DHc} -> bqa[i] });\n\
 const bqv_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NH * DHc} -> bqv[i] });\n\
 const bv_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> bv[i] });\n\
 const bo_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> bo[i] });\n\
 const snk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NQB} -> snk[i] });\n\
-const skx_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NQB} -> skx[i] });\n\
-const skt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NQB} -> skt[i] });\n\
+
 comptime {\n\
   @export_symbol(bqa_ptr, \"bqa\");\n\
   @export_symbol(bqv_ptr, \"bqv\");\n\
@@ -1090,18 +1089,32 @@ comptime {\n\
         &s,
         "  @fmovs(bcv_dsd, at(mref_d, lsel() * NQB));\n",
         "  @fmovs(bcv_dsd, at(mref_d, lsel() * NQB));\n\
-  // (gpt-oss) the sinks' terms exp(min(sink - mref, 75)), added to the sums after their all-reduce\n\
-  @fsubs(skx_d, bcv_dsd, snk_d);\n\
-  @fmaxs(skx_d, skx_d, -75.0);\n\
-  @fnegs(skx_d, skx_d);\n\
-  exp_fast(skx_d, skt_d, &skt, NQB);\n",
-        &w("sinks' terms"),
+  // (gpt-oss) the sinks: one more score row on row 0 (after the rows' entries),\n\
+  // its exp(min(sink - mref, 75)) the rows' exp, its sum in the o/l all-reduce's\n\
+  var ns: u16 = hv_n;\n\
+  if (py == 0) {\n\
+    @fmovs(at(srow_dsd, hv_n * NQB), snk_d);\n\
+    ns = hv_n + 1;\n\
+  }\n",
+        &w("sinks' row"),
     )?;
     let s = patch(
         &s,
-        "  allreduce(false, osx_all, B * QO + NQB);\n",
-        "  allreduce(false, osx_all, B * QO + NQB);\n  @fadds(osum_dsd, osum_dsd, skx_d);   // (gpt-oss) the sinks\n",
-        &w("sinks' sums"),
+        "    while (t < hv_n) : (t += 1) { const r = at(srow_dsd, t * NQB); @fsubs(r, bcv_dsd, r); }\n    if (hv_n > 0) {\n      const sn = @set_dsd_length(s_flat, hv_n * NQB);\n      @fmaxs(sn, sn, -75.0);\n      @fnegs(sn, sn);\n      exp_fast(sn, @set_dsd_length(act_flat, hv_n * NQB), &act, hv_n * NQB);\n    }\n",
+        "    while (t < ns) : (t += 1) { const r = at(srow_dsd, t * NQB); @fsubs(r, bcv_dsd, r); }\n    if (ns > 0) {\n      const sn = @set_dsd_length(s_flat, ns * NQB);\n      @fmaxs(sn, sn, -75.0);\n      @fnegs(sn, sn);\n      exp_fast(sn, @set_dsd_length(act_flat, ns * NQB), &act, ns * NQB);\n    }\n",
+        &w("sinks' exp"),
+    )?;
+    let s = patch(
+        &s,
+        "    while (t < hv_n) : (t += 1) { @fadds(osum_dsd, osum_dsd, at(srow_dsd, t * NQB)); }\n",
+        "    while (t < ns) : (t += 1) { @fadds(osum_dsd, osum_dsd, at(srow_dsd, t * NQB)); }\n",
+        &w("sinks' sum"),
+    )?;
+    let s = patch(
+        &s,
+        "const SN: u16 = mx2(mx2(NS, 3 * QH), B * Hc + 2 * mx2(Hc, QO));\n",
+        "const SN: u16 = mx2(mx2(NS + NQB, 3 * QH), B * Hc + 2 * mx2(Hc, QO));   // (gpt-oss) + the sinks' row\n",
+        &w("SN"),
     )?;
     let s = patch(
         &s,
@@ -3988,11 +4001,21 @@ pub fn serve_gptoss_with(v: Variant, moe: u16) -> R<Vec<File>> {
             src::gpt::LAYOUT,
             "param NOLAYER: u16 = 0;",
             "param QKN: u16 = 1;      // (0: the gpt-oss units' identity q/k norm, as the levers state it)\n\
+param ANP: u16 = 0;      // the attention units' x parts (0: NP, as the MoE router's)\n\
 param SPD: u16 = 0;      // the attention units' levers (codegen::gptoss_attn_lev)\n\
 param LSE: u16 = 0;\nparam OP2: u16 = 0;\nparam OP3: u16 = 0;\nparam GRD: u16 = 0;\nparam ARF: u16 = 0;      // (the hosts write the attention units' ARF route words)\nparam MOE: u16 = 0;      // the MoE units' (codegen::gptoss_moe_lev)\nparam QKV1: u16 = 0;   // wqa = [Hc][q a | q v | v], wqv / wv dummies\n\
 param NOLAYER: u16 = 0;",
             "serve_gptoss layout's lever params",
-        )?
+        )
+        .and_then(|l| {
+            // (ANP > 0: the attention units' x parts, the MoE router keeps NP)
+            patch(
+                &l,
+                ".PS = PS, .NB = NB, .E = E, .B = B, .MC = MC, .W16 = 1, .NP = NP, .KV16 = KV16,",
+                ".PS = PS, .NB = NB, .E = E, .B = B, .MC = MC, .W16 = 1, .NP = if (ANP > 0) ANP else NP, .KV16 = KV16,",
+                "serve_gptoss layout's ANP",
+            )
+        })?
     };
     Ok(vec![
         ("layout.csl", layout),
