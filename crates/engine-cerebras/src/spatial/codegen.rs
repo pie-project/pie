@@ -828,6 +828,326 @@ pub fn gptoss_moe() -> R<String> {
     ))
 }
 
+/// gpt-oss's MoE grid unit with `MOE` levers (bits; 0: [`gptoss_moe`] as
+/// is): **1** op cuts that keep the routes and the arithmetic but for exp:
+/// the top TK in one scalar pass (sorted insertion, ties to the lower expert
+/// as before), plane 0's decode without its zero shift, and SwiGLU's and the
+/// routes' exp by SPD's range reduction (relative error < 2e-7, exp_poly's
+/// ~1e-6; one function for both, exp_poly dead: +0.36 KB a PE in all).
+pub fn gptoss_moe_lev(moe: u16) -> R<String> {
+    let s = gptoss_moe()?;
+    if moe == 0 {
+        return Ok(s);
+    }
+    if moe != 1 {
+        return Err(format!("gen: gptoss_moe_lev: MOE {moe} unknown (1: the op cuts)"));
+    }
+    let w = |what: &str| format!("gptoss_moe_lev: {what}");
+    let s = patch(
+        &s,
+        "  const w = at(wts_lane, b * TK);\n  var s: u16 = 0;\n  while (s < TK) : (s += 1) {\n    var best: u16 = 0;\n    var bv = ninf;\n    var e: u16 = 0;\n    while (e < NE) : (e += 1) {\n      const v = rl[base + e];\n      if (v > bv) { bv = v; best = e; }\n    }\n    sel[b * TK + s] = best;\n    wts[b * TK + s] = bv;\n    rl[base + best] = ninf;\n  }\n",
+        "  const w = at(wts_lane, b * TK);\n\
+  // (moe1) the top TK in one pass: sorted insertion, a strictly larger\n\
+  // value moves ahead (ties: the lower expert first, as TK max scans)\n\
+  const t0 = b * TK;\n\
+  var s: u16 = 0;\n\
+  while (s < TK) : (s += 1) { wts[t0 + s] = ninf; sel[t0 + s] = 0; }\n\
+  var e: u16 = 0;\n\
+  while (e < NE) : (e += 1) {\n\
+    const v = rl[base + e];\n\
+    if (v > wts[t0 + TK - 1]) {\n\
+      var k: u16 = TK - 1;\n\
+      var go: bool = true;\n\
+      while (go and k > 0) {\n\
+        if (v > wts[t0 + k - 1]) {\n\
+          wts[t0 + k] = wts[t0 + k - 1];\n\
+          sel[t0 + k] = sel[t0 + k - 1];\n\
+          k -= 1;\n\
+        } else { go = false; }\n\
+      }\n\
+      wts[t0 + k] = v;\n\
+      sel[t0 + k] = e;\n\
+    }\n\
+  }\n",
+        &w("top TK"),
+    )?;
+    let s = patch(
+        &s,
+        "    @sll16(dec, src, 3 * p);\n    @and16(dec, dec, @as(u16, 0x81C0));\n",
+        "    if (p == 0) { @and16(dec, src, @as(u16, 0x81C0)); }   // (moe1) no zero shift\n    else {\n      @sll16(dec, src, 3 * p);\n      @and16(dec, dec, @as(u16, 0x81C0));\n    }\n",
+        &w("plane 0"),
+    )?;
+    let s = patch(
+        &s,
+        "  exp_poly(w, wtmp_d);\n",
+        "  exp_fm(w, wtmp_d, &wtmp, TK);   // (moe1) exp_poly is dead: -0.9 KB, exp_fm one function\n",
+        &w("the routes' exp"),
+    )?;
+    let s = patch(
+        &s,
+        "  exp_poly(sw_e_d, sw_d_d);          // e = exp(-alpha |g'|)\n",
+        "  exp_fm(sw_e_d, sw_d_d, &myb, SWN);   // e = exp(-alpha |g'|) (moe1: range reduction)\n",
+        &w("SwiGLU's exp"),
+    )?;
+    let s = patch(
+        &s,
+        "fn moe_mlp() void {\n",
+        "// (moe1) exp(buf) in place by range reduction (SPD's exp_fast): x = max(buf,\n\
+// -80) = k ln2 + r, e^r by a degree-6 Taylor polynomial in p (n words at pb),\n\
+// times 2^k by adding k << 7 to p's high halves; ekm holds k << 7.\n\
+var ekm = @zeros([SWN]u16);\n\
+var exm16 = @get_dsd(mem1d_dsd, .{ .base_address = &ekm[0], .extent = SWN });\n\
+const exm_a = [3]f32 { 12582912.0, -12582912.0, 12582912.0 };\n\
+const exm_c = [6]f32 { 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0 };\n\
+fn exp_fm(buf: mem1d_dsd, p: mem1d_dsd, pb: [*]f32, n: u16) void {\n\
+  const kk = @set_dsd_length(exm16, n);\n\
+  const pl = @set_dsd_length(@set_dsd_stride(@set_dsd_base_addr(exm16, @ptrcast([*]u16, pb)), 2), n);\n\
+  const ph = @increment_dsd_offset(pl, 1, u16);\n\
+  @fmaxs(buf, buf, -80.0);\n\
+  @fmuls(p, buf, 1.4426950408889634);\n\
+  var c: u16 = 0;\n\
+  while (c < 3) : (c += 1) {\n\
+    @fadds(p, p, exm_a[c]);\n\
+    if (c == 1) { @fmacs(buf, buf, p, -0.6931471805599453); }\n\
+  }\n\
+  @sll16(kk, pl, 7);\n\
+  @fmuls(p, buf, 1.0 / 720.0);\n\
+  c = 0;\n\
+  while (c < 6) : (c += 1) {\n\
+    if (c > 0) { @fmuls(p, p, buf); }\n\
+    @fadds(p, p, exm_c[c]);\n\
+  }\n\
+  @add16(ph, ph, kk);\n\
+  @fmovs(buf, p);\n\
+}\n\
+\n\
+fn moe_mlp() void {\n",
+        &w("exp_fm"),
+    )?;
+    Ok(format!("// gptoss_moe (MOE {moe}): codegen::gptoss_moe_lev\n{s}"))
+}
+
+/// gpt-oss's attention unit with the paged8b grids' levers (`v`, as
+/// serve8b_region's grids take them: S123, then `Variant::apply` on the grid
+/// tag), on qwen2d_paged8b_hr instead of the hand copy gptoss_attn.csl:
+/// gptoss_attn's changes as patches on the levered text (biases, sinks, the
+/// o bias, EPS and WIN as parameters, the window clip), the MLP cut, the q/k
+/// norm weights' multiply cut (the host folds the softmax scale into Wq),
+/// and HV's scores and values in f32 when KV16 is 0 (an f32 pool: gpt-oss's
+/// greedy needs it, 0447 / 0450). The variant must have the identity q/k norm
+/// and LSE (the sinks ride LSE's sums); `qkv1` fuses the QKV matvec (the
+/// host writes wqa as [Hc][q a | q v | v], wqv and wv 2-word dummies); `op3`
+/// with GRD 2 rotates every head at once from cos/sin made in the pass
+/// prologue; no ARF, F16, MEM or TRM patches (they must be off).
+pub fn gptoss_attn_lev(v: Variant) -> R<String> {
+    if !(v.identity_qk_norm && v.speed && v.lse) {
+        return Err("gen: gptoss_attn_lev: needs the identity q/k norm, SPD and LSE".into());
+    }
+    if (v.op3 != 0 && v.grid & 2 == 0) || v.grid & !2 != 0 {
+        return Err("gen: gptoss_attn_lev: OP3 comes as the grids' GRD 2 (no other GRD bit ported)".into());
+    }
+    if v.arf != 0 || v.f16 != 0 || v.mem != 0 || v.trim != 0 || v.xac || v.rgx || v.eps_bits.is_some() {
+        return Err(format!("gen: gptoss_attn_lev: lever not ported ({v:?})"));
+    }
+    let tag = "qwen2d_paged8b/pe.csl";
+    let s = v.apply(&softmax_s123(src::QWEN2D_PAGED8B_HR, tag)?, tag)?;
+    let w = |what: &str| format!("gptoss_attn_lev: {what}");
+    let s = patch(&s, "const EPS: f32 = 1.0e-6;\n", "", &w("EPS const"))?;
+    let s = patch(
+        &s,
+        "param PROF: u16;\n",
+        "param PROF: u16;\nparam EPS: f32 = 1.0e-5;  // RMSNorm epsilon\n\
+param WIN: u32 = 0;    // a sliding layer's window: a lane at write slot w sees slots (w - WIN, w] (0: all)\n",
+        &w("params"),
+    )?;
+    let s = patch(
+        &s,
+        "// ---------------------------------------------------------------- state\n",
+        "// The sliding window (WIN > 0): the lane's bits below its write slot's\n\
+// window cleared on this row's entries, every pass (advance only adds bits).\n\
+fn clip_window(b: u16) void {\n\
+  const ws = tab[B + b];\n\
+  if (ws < WIN) { return; }\n\
+  const lo = ws + 1 - WIN;             // the first slot it sees\n\
+  var e: u16 = 0;\n\
+  while (e < dims[1]) : (e += 1) {\n\
+    if (eblk(b, e) != NONE) {\n\
+      const p0 = epg(b, e) * @as(u32, PS);\n\
+      const at = 2 * B + 2 * B * E + b * E + e;\n\
+      if (p0 + @as(u32, PS) <= lo) { tab[at] = 0; }\n\
+      else if (p0 < lo) { tab[at] &= ~((@as(u32, 1) << @as(u16, lo - p0)) - 1); }\n\
+    }\n\
+  }\n\
+}\n\
+\n\
+// ---------------------------------------------------------------- state\n",
+        &w("clip_window"),
+    )?;
+    let s = patch(
+        &s,
+        "    if (HV) { hv_find(); }\n",
+        "    if (HV) { hv_find(); }\n    if (WIN > 0) {\n      var b: u16 = 0;\n      while (b < dims[0]) : (b += 1) { clip_window(b); }\n    }\n",
+        &w("the window's call"),
+    )?;
+    let s = patch(
+        &s,
+        "var gu: [MC * GU1]f32 align(16) = @zeros([MC * GU1]f32);",
+        "const GUN: u16 = mx2(MC * GU1, B * QO + NQB);   // (gpt-oss) LSE's o and sums, no MLP\n\
+var gu: [GUN]f32 align(16) = @zeros([GUN]f32);",
+        &w("gu"),
+    )?;
+    let s = patch(
+        &s,
+        "@comptime_assert(MC * GU1 >= B * QO + NQB and SN > B * Hc);",
+        "@comptime_assert(GUN >= B * QO + NQB and SN > B * Hc);",
+        &w("gu assert"),
+    )?;
+    let s = patch(
+        &s,
+        "const ACTN: u16 = mx2(MC * Ic, DHc);",
+        "const ACTN: u16 = mx2(mx2(MC * Ic, DHc), TC * NQB);   // (gpt-oss) HV's exp over the scores",
+        &w("ACTN"),
+    )?;
+    let s = patch(
+        &s,
+        "(TC * NQB <= ACTN and KV16 == 1 and B == 1)",
+        "(TC * NQB <= ACTN and B == 1)",
+        &w("HV assert"),
+    )?;
+    // HV in f32 at KV16 0: q's heads read from qkv, k a scalar, p in f32.
+    let s = patch(
+        &s,
+        "const qh_t = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> qpart[i * @as(i16, DHc)] });\n",
+        "const qh_t = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> qpart[i * @as(i16, DHc)] });\n\
+const qf_t = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> qkv[i * @as(i16, DHc)] });   // (gpt-oss) KV16 0\n",
+        &w("qf_t"),
+    )?;
+    let old_sc = "        var kp: u16 = 0;\n        while (kp < NP) : (kp += 1) {\n          var d: u16 = 0;\n          while (d < Dc) : (d += 1) {\n            const qo = kp * 2 * QH + (if (d < DHc) 0 else QH) + b * NH * DHc + d % DHc;\n            @fmachs(run, run, @increment_dsd_offset(qh_t, @as(i16, qo), @fp16()), @bitcast(@fp16(), kc[1 + kvoff() + blk * Dc + d]));\n          }\n        }\n";
+    let s = patch(
+        &s,
+        old_sc,
+        &format!(
+            "        if (KV16 == 0) {{\n          // (gpt-oss) f32 k: one f32 multiply-add a dim over the heads\n          var d: u16 = 0;\n          while (d < Dc) : (d += 1) {{\n            const qo = (if (d < DHc) 0 else QH) + b * NH * DHc + d % DHc;\n            @fmacs(run, run, @increment_dsd_offset(qf_t, @as(i16, qo), f32), kc[1 + kvoff() + blk * Dc + d]);\n          }}\n        }} else {{\n{old_sc}        }}\n"
+        ),
+        &w("HV f32 scores"),
+    )?;
+    let old_v = "            @fmachs(od, od, vb, @as(@fp16(), s[e * NQB + b * Qh + h]));\n";
+    let s = patch(
+        &s,
+        old_v,
+        &format!(
+            "            if (KV16 == 0) {{ @fmacs(od, od, vb, s[e * NQB + b * Qh + h]); }}   // (gpt-oss) f32 v, f32 p\n            else {{\n{old_v}            }}\n"
+        ),
+        &w("HV f32 values"),
+    )?;
+    let s = patch(
+        &s,
+        "// ---------------------------------------------------------------- the layer\n",
+        "// gpt-oss's biases and sinks.\n\
+var bqa = @zeros([NH * DHc]f32);\n\
+var bqa_ptr: [*]f32 = &bqa;\n\
+var bqv = @zeros([NH * DHc]f32);\n\
+var bqv_ptr: [*]f32 = &bqv;\n\
+var bv = @zeros([Dc]f32);\n\
+var bv_ptr: [*]f32 = &bv;\n\
+var bo = @zeros([Hc]f32);\n\
+var bo_ptr: [*]f32 = &bo;\n\
+var snk = @zeros([NQB]f32);\n\
+var snk_ptr: [*]f32 = &snk;\n\
+var skx = @zeros([NQB]f32);\n\
+var skt = @zeros([NQB]f32);\n\
+const bqa_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NH * DHc} -> bqa[i] });\n\
+const bqv_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NH * DHc} -> bqv[i] });\n\
+const bv_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> bv[i] });\n\
+const bo_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> bo[i] });\n\
+const snk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NQB} -> snk[i] });\n\
+const skx_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NQB} -> skx[i] });\n\
+const skt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NQB} -> skt[i] });\n\
+comptime {\n\
+  @export_symbol(bqa_ptr, \"bqa\");\n\
+  @export_symbol(bqv_ptr, \"bqv\");\n\
+  @export_symbol(bv_ptr, \"bv\");\n\
+  @export_symbol(bo_ptr, \"bo\");\n\
+  @export_symbol(snk_ptr, \"snk\");\n\
+}\n\
+\n\
+// ---------------------------------------------------------------- the layer\n",
+        &w("biases"),
+    )?;
+    let s = patch(
+        &s,
+        "    @fmuls(vb, vb, sc);\n  }\n  mark(1);\n",
+        "    @fmuls(vb, vb, sc);\n    @fadds(qa, qa, bqa_d);\n    @fadds(qv, qv, bqv_d);\n    @fadds(vb, vb, bv_d);\n  }\n  mark(1);\n",
+        &w("qkv biases"),
+    )?;
+    let s = patch(
+        &s,
+        "  var k: u16 = 0;\n  b = 0;\n  while (b < dims[0]) : (b += 1) {\n    const qa = at(qh_dsd, b * NH * DHc);\n    const qv = at(qh_dsd, QH + b * NH * DHc);\n    @fmuls(qa, qa, qkn_a);\n    @fmuls(qv, qv, qkn_v);\n  }\n",
+        "  // (gpt-oss) no q/k norm weights: the host folds the softmax scale into Wq and bq\n",
+        &w("qkn multiply"),
+    )?;
+    let s = patch(
+        &s,
+        "  @fmovs(bcv_dsd, at(mref_d, lsel() * NQB));\n",
+        "  @fmovs(bcv_dsd, at(mref_d, lsel() * NQB));\n\
+  // (gpt-oss) the sinks' terms exp(min(sink - mref, 75)), added to the sums after their all-reduce\n\
+  @fsubs(skx_d, bcv_dsd, snk_d);\n\
+  @fmaxs(skx_d, skx_d, -75.0);\n\
+  @fnegs(skx_d, skx_d);\n\
+  exp_fast(skx_d, skt_d, &skt, NQB);\n",
+        &w("sinks' terms"),
+    )?;
+    let s = patch(
+        &s,
+        "  allreduce(false, osx_all, B * QO + NQB);\n",
+        "  allreduce(false, osx_all, B * QO + NQB);\n  @fadds(osum_dsd, osum_dsd, skx_d);   // (gpt-oss) the sinks\n",
+        &w("sinks' sums"),
+    )?;
+    let s = patch(
+        &s,
+        "  @fadds(x_all, x_all, hv_all);\n  mark(9);\n",
+        "  @fadds(x_all, x_all, hv_all);\n  b = 0;\n  while (b < dims[0]) : (b += 1) { @fadds(at(x_dsd, b * Hc), at(x_dsd, b * Hc), bo_d); }\n  mark(9);\n",
+        &w("o bias"),
+    )?;
+    // LSE's shift group arithmetic wants power-of-two groups; the attention
+    // unit's rows (AY 42) take AGY 14: divisions there (once an axis switch).
+    let s = patch(
+        &s,
+        "@comptime_assert((Gs & (Gs - 1)) == 0 and (GYv & (GYv - 1)) == 0 and HROUTE == 1); }\n",
+        "@comptime_assert((Gs & (Gs - 1)) == 0 and HROUTE == 1); }\n\
+const GY_P2: bool = (GYv & (GYv - 1)) == 0;   // (gpt-oss) else divisions\n",
+        &w("GY assert"),
+    )?;
+    let s = patch(
+        &s,
+        "    NG = alen >> gsh();\n    R2 = ((NG >> 1) << gsh()) + ra();\n",
+        "    if (GY_P2) {\n      NG = alen >> gsh();\n      R2 = ((NG >> 1) << gsh()) + ra();\n    } else {\n      NG = alen / ga();\n      R2 = (NG / 2) * ga() + ra();\n    }\n",
+        &w("NG"),
+    )?;
+    let s = patch(
+        &s,
+        "    ar_r = axis_id & (ga() - 1);\n    ar_qt = axis_id >> gsh();\n",
+        "    if (GY_P2) {\n      ar_r = axis_id & (ga() - 1);\n      ar_qt = axis_id >> gsh();\n    } else {\n      ar_r = axis_id % ga();\n      ar_qt = axis_id / ga();\n    }\n",
+        &w("ar_r"),
+    )?;
+    let (Some(a), Some(m)) = (
+        s.find("  // 10–14: the second RMSNorm and the MLP"),
+        s.find("  mark(15);\n"),
+    ) else {
+        return Err(w("the MLP's anchors"));
+    };
+    if m < a || s.matches("  mark(15);\n").count() != 1 {
+        return Err(w("the MLP's anchors"));
+    }
+    let s = format!(
+        "// gptoss_attn (levered): qwen2d_paged8b_hr's attention alone with the grids' levers\n\
+// (codegen::gptoss_attn_lev); gpt-oss's changes as gptoss_attn.csl states them.\n{}{}",
+        &s[..a],
+        &s[m + "  mark(15);\n".len()..]
+    );
+    Ok(s)
+}
+
 /// `XAC`'s patches on the region kernel (after ARF 3's): XA's level-1 and
 /// level-2 colours are its own (0, 1, 2, 15: no handoff routes them through a
 /// region PE, test `xac_colours_are_free_on_regions`), routed once at init, and
@@ -3566,26 +3886,51 @@ fn gpt_plain(base: &str, base_name: &str, what: &str) -> String {
     )
 }
 
+fn tagged_gpt(what: &str, s: String) -> String {
+    format!("// GENERATED by codegen::serve_gptoss from {what} + serve8b_region/grid_extra.csl.\n{s}")
+}
+
 /// serve_gptoss's build directory: attention units (gptoss_attn) over MoE
 /// units (gptoss_moe) in slots, chained by host tables as serve8b_region's
 /// units, head2d_v10 on chunk triples and the embedding strip.
 pub fn serve_gptoss() -> R<Vec<File>> {
-    let tagged = |what: &str, s: String| {
-        format!(
-            "// GENERATED by codegen::serve_gptoss from {what} + serve8b_region/grid_extra.csl.\n{s}"
+    serve_gptoss_with(Variant::default(), 0)
+}
+
+/// [`serve_gptoss`] with the attention units' levers `v`
+/// ([`gptoss_attn_lev`]) and the MoE units' `moe` ([`gptoss_moe_lev`]); the
+/// default (`Variant::default()`, 0) is serve_gptoss's files byte for byte.
+pub fn serve_gptoss_with(v: Variant, moe: u16) -> R<Vec<File>> {
+    let attn = if v == Variant::default() {
+        tagged_gpt(
+            "gptoss_attn.csl",
+            unit_with("gptoss_attn", src::GPTOSS_ATTN, false, true)?,
+        )
+    } else {
+        tagged_gpt(
+            "codegen::gptoss_attn_lev",
+            unit_with("gptoss_attn", &gptoss_attn_lev(v)?, false, true)?,
         )
     };
+    let tagged = tagged_gpt;
+    let layout = if v == Variant::default() && moe == 0 {
+        src::gpt::LAYOUT.to_string()
+    } else {
+        // The levers' params (the sources carry them; the hosts read QKV1).
+        patch(
+            src::gpt::LAYOUT,
+            "param NOLAYER: u16 = 0;",
+            "param SPD: u16 = 0;      // the attention units' levers (codegen::gptoss_attn_lev)\n\
+param LSE: u16 = 0;\nparam OP2: u16 = 0;\nparam OP3: u16 = 0;\nparam GRD: u16 = 0;\nparam MOE: u16 = 0;      // the MoE units' (codegen::gptoss_moe_lev)\nparam QKV1: u16 = 0;   // wqa = [Hc][q a | q v | v], wqv / wv dummies\n\
+param NOLAYER: u16 = 0;",
+            "serve_gptoss layout's lever params",
+        )?
+    };
     Ok(vec![
-        ("layout.csl", src::gpt::LAYOUT.to_string()),
+        ("layout.csl", layout),
         ("paths.csl", src::gpt::PATHS.to_string()),
         ("rt.csl", src::RT.to_string()),
-        (
-            "attn_pe.csl",
-            tagged(
-                "gptoss_attn.csl",
-                unit_with("gptoss_attn", src::GPTOSS_ATTN, false, true)?,
-            ),
-        ),
+        ("attn_pe.csl", attn),
         (
             "moe_pe.csl",
             tagged(
@@ -3594,7 +3939,7 @@ pub fn serve_gptoss() -> R<Vec<File>> {
                     "gptoss_moe",
                     // gpt-oss's RMSNorm epsilon (qwen2d_paged8b's is 1e-6).
                     &patch(
-                        &gptoss_moe()?,
+                        &gptoss_moe_lev(moe)?,
                         "const EPS: f32 = 1.0e-6;\n",
                         "const EPS: f32 = 1.0e-5;   // serve_gptoss: gpt-oss's rms_norm_eps\n",
                         "moe EPS",
@@ -3632,6 +3977,39 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         for (name, text) in serve_gptoss().expect("serve_gptoss generates") {
             std::fs::write(dir.join(name), text).unwrap();
+        }
+    }
+
+    /// `GPT_OUT=<dir> GPT_PARAMS=<K:V,...>`: serve_gptoss's build directory
+    /// for the params' variant (SPD, LSE, OP2 as serve8b_region's; QKN 0).
+    #[test]
+    #[ignore]
+    fn dump_serve_gptoss_with() {
+        let dir = std::path::PathBuf::from(std::env::var("GPT_OUT").expect("GPT_OUT"));
+        let p = crate::spatial::program::parse_params(&std::env::var("GPT_PARAMS").expect("GPT_PARAMS"));
+        let on = |k: &str| p.iter().any(|(a, b)| a == k && b != "0");
+        let v = Variant {
+            identity_qk_norm: true,
+            speed: on("SPD"),
+            lse: on("LSE"),
+            ops2: on("OP2"),
+            qkv1: on("QKV1"),
+            op3: u16::from(on("OP3")),
+            grid: if on("OP3") { 2 } else { 0 },
+            ..Variant::default()
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let moe = p.iter().find(|(a, _)| a == "MOE").map_or(0, |(_, b)| b.parse().unwrap());
+        for (name, text) in serve_gptoss_with(v, moe).expect("serve_gptoss_with generates") {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        if let Ok(raw) = std::env::var("GPT_MOE_RAW") {
+            // the MoE kernel alone (the simulator harness's, less its debug exports)
+            std::fs::write(raw, gptoss_moe_lev(moe).expect("gptoss_moe_lev")).unwrap();
+        }
+        if let Ok(raw) = std::env::var("GPT_RAW") {
+            // the attention kernel alone (the simulator harness's pe.csl)
+            std::fs::write(raw, gptoss_attn_lev(v).expect("gptoss_attn_lev")).unwrap();
         }
     }
 
