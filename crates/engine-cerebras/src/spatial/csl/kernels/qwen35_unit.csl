@@ -757,7 +757,6 @@ var qscale: f32 = 0.0;               // 1/sqrt(k_dim)
 // The attention gate's sigmoid scratch, [b][Qh][Dc].
 const GN: u16 = B * QO;
 const ggg_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> qkv[@as(i16, GT0) + i] });
-const ggo_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> qkv[i] });
 
 // x split into bf16 parts for the 16-bit matvecs, and their f32 scratch.
 const XMAX: u16 = mx2(mx2(mx2(Hc, QO), NV), mx2(mx2(Ic, PS), DHc));
@@ -1054,7 +1053,7 @@ fn gate_sigmoid() void {
   const rh = halves(&gr1[0], 1);
   @or16(rh, rh, sg);
   @fadds(r_, r_, 0.5);
-  @fmuls(ggo_d, ggo_d, r_);
+  @fmuls(o_all, o_all, r_);   // (o_all: wherever the variant keeps o)
 }
 
 fn attn_layer() void {
@@ -1204,8 +1203,8 @@ fn attn_layer() void {
   allreduce(false, o_all, B * QO);
   mark(7);
   // 8–9: O projection, summed over the columns, residual.
-  gate_sigmoid();   // (o *= sigmoid(gate) first)
   axis_xx();
+  gate_sigmoid();   // (o *= sigmoid(gate) first)
   @fmovs(hv_all, 0.0);
   b = 0;
   while (b < dims[0]) : (b += 1) { wmv(at(hv_dsd, b * Hc), wo_dsd, at(ob_dsd, b * QO), QO, sc_s); }

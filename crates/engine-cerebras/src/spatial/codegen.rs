@@ -3148,6 +3148,8 @@ const Q35R_ANCHORS: &[(&str, &str)] = &[
     ("  exp_poly(te_d, tt_d);           // e = exp(-|g|)\n", "  exp_poly(e_, t_);\n"),
     ("  exp_fast(te_d, tt_d, &tt, MC);  // e = exp(-|g|)\n", "  exp_fast(e_, t_, &gt1, n);\n"),
     ("const EX_N: u16 = mx2(ACTN, MC);", "const EX_N: u16 = mx2(mx2(ACTN, MC), NT1);"),
+    // (HV) the pool by the layer's attention slot
+    ("fn kvoff() u16 { return lw * KCN; }", "fn kvoff() u16 { return la * KCN; }"),
     // LSE's group shifts: the Y axis's from values made once (a region's 234
     // rows take no power-of-two group).
     (
