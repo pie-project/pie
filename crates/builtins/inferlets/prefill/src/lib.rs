@@ -20,11 +20,14 @@ struct Input {
 async fn main(input: String) -> std::result::Result<String, String> {
     let input: Input = serde_json::from_str(&input).map_err(|e| format!("prefill input: {e}"))?;
     let n = input.tokens.len() as u32;
+    let moved = WorkingSet::take("ws");
     if n == 0 {
+        if let Some(ws) = moved {
+            ws.give("ws")?;
+        }
         return Ok(serde_json::json!({"tokens": 0, "cached": 0}).to_string());
     }
     let tokens: Vec<i32> = input.tokens.iter().map(|&t| t as i32).collect();
-    let moved = WorkingSet::take("ws");
     let keep = moved.is_some();
     let ws = moved.unwrap_or_default();
     let pipe = Pipeline::new();

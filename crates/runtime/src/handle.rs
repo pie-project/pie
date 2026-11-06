@@ -30,6 +30,11 @@ use crate::store::registry as store_registry;
 use crate::store::rs::working_set::RsWorkingSet;
 
 const MOVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const RS_MOVE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Frames a session keeps waiting behind a lent handle. They are what a client
+/// has sent and nothing has answered, so they need a bound of their own.
+pub(crate) const MAX_WAITING_FRAMES: usize = 256;
 
 /// The most handles one session names at once: a name costs almost nothing,
 /// but not nothing, and a client that never closes one should hear so.
@@ -104,7 +109,7 @@ impl Held {
     /// from whether its own holder was evicted.
     async fn ready(&self, process: ProcessId) -> Result<(), String> {
         let Parts { kv, rs, .. } = self.parts();
-        let owed = settled(kv, "handle-ready", |store| {
+        let owed = settled(kv, rs.as_ref(), "handle-ready", |store| {
             let owed = owed(store, kv, rs.as_ref())?;
             if owed.is_none() {
                 store.set_parked(kv.id, false);
@@ -126,10 +131,28 @@ impl Held {
             .map_err(|error| format!("restoring a handle: {error}"))
     }
 
+    /// A recall that came to nothing: it is at rest again, as if never asked.
+    fn rest(&self) {
+        let Parts { kv, .. } = self.parts();
+        let stores = store_registry::get(kv.model, kv.engine);
+        store_registry::with_kv_lock(&stores.kv, "handle-rest", |store| {
+            store.set_parked(kv.id, true);
+        });
+        if let Some(planner) = crate::planner::planner_of(self.holder) {
+            planner.rest_holder(self.holder);
+        }
+    }
+
+    /// The pages this set maps, wherever they are.
+    fn page_count(&self, store: &KvStore) -> usize {
+        let set = HashSet::from([self.parts().kv.id]);
+        store.held_page_count(&set).unwrap_or(0) + store.swapped_page_count(&set).unwrap_or(0)
+    }
+
     async fn fork(&self) -> Result<Held, String> {
         let Parts { kv, rs, cursor } = self.parts();
         let stores = store_registry::get(kv.model, kv.engine);
-        let child = settled(kv, "handle-fork", |store| {
+        let child = settled(kv, rs.as_ref(), "handle-fork", |store| {
             let child = store.fork(kv.id)?;
             if let Some(owner) = store.owner_of(kv.id) {
                 store.set_owner(child, owner)?;
@@ -207,10 +230,12 @@ impl Drop for Held {
     }
 }
 
-/// Runs `f` on the store once no move holds a page `kv` maps: what a set
-/// names under a move is not where the flat map says.
+/// Runs `f` on the store once no move holds what the set names: what it names
+/// under a move is not where its maps say. The recurrent store's lock is held
+/// through `f`, so a move of its state cannot begin under it either.
 async fn settled<T>(
     kv: &KvWorkingSet,
+    rs: Option<&RsWorkingSet>,
     label: &'static str,
     mut f: impl FnMut(&mut KvStore) -> Result<T, KvStoreError>,
 ) -> Result<T, String> {
@@ -223,9 +248,11 @@ async fn settled<T>(
         let mut notified = std::pin::pin!(notified);
         notified.as_mut().enable();
         let done = store_registry::with_kv_lock(&stores.kv, label, |store| {
-            if store.in_move(&set)? {
+            let state = stores.rs.lock().unwrap();
+            if store.in_move(&set)? || rs.is_some_and(|rs| state.in_move(rs.id)) {
                 return Ok(None);
             }
+            drop(state);
             f(store).map(Some)
         })
         .map_err(|error| error.to_string())?;
@@ -236,7 +263,9 @@ async fn settled<T>(
         if now >= deadline {
             return Err("its pages are still moving".to_string());
         }
-        let _ = crate::rt::time::timeout(deadline - now, notified).await;
+        // A recurrent move ends with no signal here: look again soon.
+        let wait = (deadline - now).min(RS_MOVE_POLL);
+        let _ = crate::rt::time::timeout(wait, notified).await;
     }
 }
 
@@ -277,6 +306,15 @@ pub(crate) enum Slot {
 }
 
 impl Slot {
+    /// What tells a buffer shared between forks from another.
+    fn media_key(&self) -> Option<usize> {
+        match self {
+            Slot::Frames(frames) => frames.buffer(),
+            Slot::Pcm(pcm) => Some(pcm.samples.as_ptr() as usize),
+            _ => None,
+        }
+    }
+
     fn media_bytes(&self) -> usize {
         match self {
             Slot::Unborn(HandleKind::Frames(bytes)) => bytes.len(),
@@ -335,7 +373,11 @@ impl Table {
             HandleOp::Fork { name, from } => {
                 self.claim(name)?;
                 let child = match self.slots.get(&from) {
-                    Some(Slot::Unborn(kind)) => Slot::Unborn(kind.clone()),
+                    Some(Slot::Unborn(kind)) => {
+                        let child = Slot::Unborn(kind.clone());
+                        self.room_for(&child)?;
+                        child
+                    }
                     Some(Slot::Parked(held)) => Slot::Parked(Box::new(held.fork().await?)),
                     Some(Slot::Matcher(matcher)) => {
                         Slot::Matcher(Box::new(Mutex::new(matcher.lock().unwrap().fork())))
@@ -382,10 +424,18 @@ impl Table {
 
     /// The media `slot` would add within what the session may hold.
     fn room_for(&self, slot: &Slot) -> Result<(), String> {
-        let held: usize = self.slots.values().map(Slot::media_bytes).sum();
-        if held + slot.media_bytes() > self.max_media_bytes {
+        // A fork shares what it forked: what is shared counts once.
+        let mut seen = HashSet::new();
+        let held: usize = self
+            .slots
+            .values()
+            .chain(std::iter::once(slot))
+            .filter(|slot| slot.media_key().is_none_or(|key| seen.insert(key)))
+            .map(Slot::media_bytes)
+            .sum();
+        if held > self.max_media_bytes {
             return Err(format!(
-                "quota: this session holds {held} bytes of media; close a handle"
+                "quota: this would hold {held} bytes of media; close a handle"
             ));
         }
         Ok(())
@@ -571,7 +621,61 @@ impl Lease {
         })
     }
 
+    /// Does what can fail on what a client wrote before anything moves: a
+    /// grammar that does not compile, or bytes that decode to nothing, is
+    /// lost for that reason, and the rest go back as they came.
+    pub(crate) fn prepare(&mut self) -> Result<(), String> {
+        use crate::inferlet::host::grammar;
+        for (slot, _, handle) in &mut self.bound {
+            let made = match handle {
+                Slot::Unborn(HandleKind::Matcher(source)) => grammar::compile_matcher(source)
+                    .map(|matcher| Slot::Matcher(Box::new(Mutex::new(matcher))))
+                    .map_err(|error| error.to_string()),
+                Slot::Unborn(HandleKind::Frames(bytes)) => {
+                    Frames::decode(bytes).map(|frames| Slot::Frames(Box::new(frames)))
+                }
+                _ => continue,
+            };
+            match made {
+                Ok(made) => *handle = made,
+                Err(why) => {
+                    *handle = Slot::Dead(format!("binding `{slot}`: {why}"));
+                    return Err(why);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Brings its handles back to the device together or not at all: each
+    /// stays there until the process has it, so one past what the device
+    /// holds would wait on pages only its siblings have.
+    fn fits(&self) -> Result<(), String> {
+        let held = || {
+            self.bound.iter().filter_map(|(_, _, slot)| match slot {
+                Slot::Parked(held) => Some(held),
+                _ => None,
+            })
+        };
+        let Some(first) = held().next() else {
+            return Ok(());
+        };
+        let kv = &first.parts().kv;
+        let stores = store_registry::get(kv.model, kv.engine);
+        store_registry::with_kv_lock(&stores.kv, "handle-fits", |store| {
+            let need: usize = held().map(|held| held.page_count(store)).sum();
+            let capacity = store.capacity_pages() as usize;
+            if need > capacity {
+                return Err(format!(
+                    "quota: these handles map {need} pages and the device holds {capacity}"
+                ));
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) async fn ready(&self, process: ProcessId) -> Result<(), String> {
+        self.fits()?;
         for (_, _, slot) in &self.bound {
             if let Slot::Parked(held) = slot {
                 held.ready(process).await?;
@@ -600,6 +704,10 @@ impl Lease {
                 }
                 Err(error) => {
                     bag.lost.push((name, format!("binding `{slot}`: {error}")));
+                    // What is left goes back as it came, and lands no other way.
+                    let back: HashSet<HandleName> =
+                        self.bound.iter().map(|(_, name, _)| *name).collect();
+                    bag.returns.retain(|_, name| !back.contains(name));
                     return (bag, Err(error));
                 }
             }
@@ -609,7 +717,7 @@ impl Lease {
 }
 
 fn bind_one(ctx: &mut ProcessCtx, handle: Slot) -> anyhow::Result<Moved> {
-    use crate::inferlet::host::{grammar, working_set};
+    use crate::inferlet::host::working_set;
     use wasmtime_wasi::WasiView;
     Ok(match handle {
         Slot::Parked(held) => {
@@ -620,15 +728,7 @@ fn bind_one(ctx: &mut ProcessCtx, handle: Slot) -> anyhow::Result<Moved> {
             let matcher = matcher.into_inner().unwrap();
             Moved::Matcher(ctx.ctx().table.push(matcher)?.rep())
         }
-        Slot::Unborn(HandleKind::Matcher(source)) => {
-            let matcher = grammar::compile_matcher(&source)?;
-            Moved::Matcher(ctx.ctx().table.push(matcher)?.rep())
-        }
         Slot::Frames(frames) => Moved::Frames(ctx.ctx().table.push(*frames)?.rep()),
-        Slot::Unborn(HandleKind::Frames(bytes)) => {
-            let frames = Frames::decode(&bytes).map_err(anyhow::Error::msg)?;
-            Moved::Frames(ctx.ctx().table.push(frames)?.rep())
-        }
         Slot::Pcm(pcm) => Moved::Pcm(ctx.ctx().table.push(*pcm)?.rep()),
         _ => Moved::WorkingSet(working_set::materialize(ctx)?),
     })
@@ -638,6 +738,11 @@ impl Drop for Lease {
     fn drop(&mut self) {
         if self.bound.is_empty() && self.returns.is_empty() {
             return;
+        }
+        for (_, _, slot) in &self.bound {
+            if let Slot::Parked(held) = slot {
+                held.rest();
+            }
         }
         let back: HashSet<HandleName> = self.bound.iter().map(|(_, name, _)| *name).collect();
         let mut settled: Vec<(HandleName, Option<Slot>)> = self
@@ -747,10 +852,16 @@ impl Bag {
         for (name, why) in self.lost {
             settled.insert(name, Some(Slot::Dead(why)));
         }
+        // A fire that failed left the cursor ahead of what was written.
+        let failed = residency.lock().unwrap().failure();
         for (slot, moved) in self.given {
             let Some(&name) = self.returns.get(&slot) else {
                 continue;
             };
+            if let (Moved::WorkingSet(_), Some(why)) = (moved, &failed) {
+                settled.insert(name, Some(Slot::Dead(format!("a pipeline failed: {why}"))));
+                continue;
+            }
             let landed = match take_out(resources, residency, moved) {
                 Ok(landed) => landed,
                 Err(error) => Slot::Dead(format!("taking `{slot}` from its process: {error}")),

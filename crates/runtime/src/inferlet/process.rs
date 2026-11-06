@@ -789,6 +789,8 @@ impl Process {
             store.data_mut().set_props(props);
             store.data_mut().set_files(files);
             if let Some(lease) = lease {
+                let mut lease = lease;
+                lease.prepare()?;
                 lease.ready(process_id).await?;
                 let (bag, bound) = lease.bind(store.data_mut());
                 store.data_mut().set_handles(bag);

@@ -614,8 +614,12 @@ async fn run_turn(
         tokio::select! {
             _ = cancel.notified() => {
                 tracing::debug!(%req_id, "turn cancelled");
-                if let Some(pid) = &process_id {
-                    let _ = runtime::server::send_client_message(client_id, terminate(pid));
+                match (&process_id, corr) {
+                    (Some(pid), _) => {
+                        let _ = runtime::server::send_client_message(client_id, terminate(pid));
+                    }
+                    (None, Some(corr)) => runtime::server::forget_frame(client_id, corr),
+                    (None, None) => {}
                 }
                 return TurnEnd::Aborted;
             }
@@ -687,9 +691,13 @@ fn turn_terminal(
 ) -> bool {
     match msg {
         ServerMessage::Response {
-            corr_id, result, ..
+            corr_id,
+            ok,
+            result,
+            ..
         } if Some(*corr_id) == corr => {
-            if proc_launch {
+            // A refusal started nothing that could end this turn later.
+            if proc_launch && *ok {
                 if process_id.is_none() {
                     *process_id = Some(result.clone());
                 }

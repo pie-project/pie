@@ -69,6 +69,13 @@ impl Frames {
         }
     }
 
+    /// What tells these pixels from another handle's.
+    pub(crate) fn buffer(&self) -> Option<usize> {
+        match &self.store {
+            FrameStore::Host(v) => Some(Arc::as_ptr(v) as usize),
+        }
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         if bytes.get(4..8) == Some(b"ftyp") {
             return Err("mp4 is not decoded; convert it: \

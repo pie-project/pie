@@ -813,9 +813,11 @@ export class PieClient {
             }
             program = program.program;
         }
-        const moved = Object.fromEntries(
+        const plainObject = input !== null && typeof input === 'object' && !Array.isArray(input);
+        const moved = plainObject ? Object.fromEntries(
             Object.entries(input).filter(([, arg]) => arg instanceof Handle),
-        );
+        ) : {};
+        if (Object.keys(moved).length === 0) return await this.launchProcess(program, input);
         const present = Object.fromEntries(
             Object.entries(moved).filter(([, arg]) => arg.exists),
         );

@@ -129,6 +129,7 @@ async def t_evict(c, prog, whole):
     check("a restored handle resumes exactly", first + r == whole)
     r2 = await run(c, prog, fk2, [first[-1]], 20, drawn=12)
     check("so does its evicted fork", r2 == r)
+    # A peer's restore moved pages under `pair`, which wakes with nothing owed.
     r3 = await run(c, prog, pair, [first[-1]], 20, drawn=12)
     check("nor does either lose it", r3 == r)
     for h in hogs + [w, fk2, pair]: await h.close()
@@ -284,6 +285,46 @@ async def t_clients(c, prog, whole):
         check(f"the {name} client uploads and reads", got["seen"] == want and got["raw"] == 64 * 48 * 3, f"{got['seen']} {got['raw']}")
     await out.close(); await sound.close()
 
+async def t_review(c, prog, whole):
+    S = Path(__file__).parent
+    both = await c.install_program(S / "both.py", force_overwrite=True)
+    # a grammar that does not compile costs only itself
+    w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
+    bad = await c.matcher(regex="(")
+    try:
+        await (await c.run(both, ws=w, matcher=bad)).result(); check("a bad grammar fails its launch", False)
+    except Exception as e: check("a bad grammar fails its launch", True, str(e)[:70])
+    check("and the working set beside it survives", (await w.stat())["state"] == "parked")
+    r = await run(c, prog, w, [first[-1]], 20, drawn=12)
+    check("and resumes exactly", first + r == whole)
+    await w.close()
+    # an empty prefill is a no-op, not a loss
+    w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
+    p = await c.launch_process("prefill", input={"tokens": []}, handles={"ws": w}, returns={"ws": w})
+    await p.result()
+    check("an empty prefill gives the handle back", (await w.stat())["state"] == "parked")
+    await w.close()
+    # a refused read ends its turn: many in a row do not pile up
+    o = await c.frames(); await c.pcm().close() if False else None
+    mk = await c.install_program(S / "mk.py", force_overwrite=True)
+    sound = c.pcm()
+    await (await c.run(mk, out=o, sound=sound, w=8, h=8)).result()
+    for _ in range(40):
+        try: await o.read("tiff")
+        except HandleError: pass
+    check("refused reads end", len(await o.read("raw-rgb8")) == 192)
+    await o.close(); await sound.close()
+    # a launch cancelled while it waits behind a lent handle never runs
+    w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
+    long = await c.launch_process(prog, input={"ws": {"$handle": "ws"}, "tokens": [first[-1]], "max_tokens": 200, "seed": 7, "drawn": 12},
+                                  handles={"ws": w}, returns={"ws": w})
+    queued = asyncio.ensure_future(c.launch_process(prog, input={"ws": {"$handle": "ws"}, "tokens": [1], "max_tokens": 5, "seed": 7},
+                                                    handles={"ws": w}, returns={"ws": w}))
+    await long.result()
+    p2 = await asyncio.wait_for(queued, 30); await p2.result()
+    check("a launch behind a lent handle runs in turn", (await w.stat())["state"] == "parked")
+    await w.close()
+
 async def t_close(c, prog, whole, port=None):
     d = PieClient(c.server_uri if hasattr(c, "server_uri") else URI[0]); await d.connect()
     made = 0
@@ -338,7 +379,7 @@ async def main():
             except Exception: c = None; await asyncio.sleep(1)
         prog = await c.install_program(EX / "working_set_handles.wasm", force_overwrite=True)
         whole = await t_resume(c, prog)
-        for f in (t_lazy, t_order, t_dead, t_many, t_evict, t_quota, t_script, t_matcher, t_media, t_media_js, t_clients, t_close, t_cost):
+        for f in (t_lazy, t_order, t_dead, t_many, t_evict, t_quota, t_script, t_matcher, t_media, t_media_js, t_clients, t_review, t_close, t_cost):
             if args.only and f.__name__ not in args.only.split(","): continue
             try: await asyncio.wait_for(f(c, prog, whole), 120)
             except Exception as e:

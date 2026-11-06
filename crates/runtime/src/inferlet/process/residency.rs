@@ -19,6 +19,8 @@ pub(crate) struct ProcessResidency {
         HashMap<(usize, crate::engine::EngineId, WorkingSetId), KvSuspendHandle>,
     pub(crate) rs_working_sets: HashSet<(usize, crate::engine::EngineId, RsWorkingSetId)>,
     pub(crate) pipelines: Vec<ResidentPipeline>,
+    /// Every pipeline it opened, for whether one failed once it has gone.
+    pub(crate) failures: Vec<crate::pipeline::fire::PipelineFailure>,
 }
 
 #[derive(Clone)]
@@ -28,6 +30,12 @@ pub(crate) struct ResidencySnapshot {
 }
 
 impl ProcessResidency {
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.failures
+            .iter()
+            .find_map(|failure| failure.lock().unwrap().clone())
+    }
+
     pub(crate) fn pipelines(&mut self) -> Vec<PendingFires> {
         let pipelines: Vec<_> = self
             .pipelines

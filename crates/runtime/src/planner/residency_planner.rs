@@ -276,6 +276,19 @@ impl ResidencyPlanner {
         self.set_idle(pid, false);
     }
 
+    /// A recall that came to nothing: back at the end of the line, idle.
+    pub fn rest_holder(self: &Arc<Self>, pid: ProcessId) {
+        self.with_inner(|inner| {
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.key = i64::MIN;
+                proc.seq = u64::MAX - seq;
+            }
+        });
+        self.set_idle(pid, true);
+    }
+
     pub fn register_with_seq(&self, pid: ProcessId, seq: u64) {
         self.with_inner(|inner| {
             let mut proc = Proc::new(seq);

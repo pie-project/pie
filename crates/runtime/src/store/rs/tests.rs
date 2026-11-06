@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::{RsError, RsGeometry, RsStore, RsUnits, RsWorkingSetId};
 
 fn slots(slots: u32) -> RsUnits {
@@ -527,4 +529,57 @@ fn a_snapshot_resumes_at_its_row() {
         free - 1,
         "the checkpoint holds its slot"
     );
+}
+
+/// A set forked at rest shares a host slot with a parent that restores alone.
+#[test]
+fn a_fork_at_rest_keeps_its_slot_when_its_parent_restores() {
+    let mut s = RsStore::new(2, 2, 2, 2);
+    let parent = s.create_working_set(geom());
+    write_state(&mut s, parent);
+    let txn = s
+        .prepare_suspend(&HashSet::from([parent]))
+        .expect("a private slot moves");
+    s.commit_suspend(txn);
+    let child = s.fork(parent).unwrap();
+
+    let mut grant = s.reserve(slots(1)).unwrap();
+    let txn = s
+        .prepare_restore(&HashSet::from([parent]), &mut grant)
+        .unwrap();
+    s.commit_restore(txn);
+    assert_eq!(
+        s.swapped_units(&HashSet::from([child])),
+        slots(1),
+        "the child reads what the host holds"
+    );
+    assert_eq!(s.host_available().slots, 1, "its copy is still in use");
+
+    let mut grant = s.reserve(slots(1)).unwrap();
+    let txn = s
+        .prepare_restore(&HashSet::from([child]), &mut grant)
+        .unwrap();
+    s.commit_restore(txn);
+    s.release_working_set(parent);
+    s.release_working_set(child);
+    s.retire_idle();
+    assert_eq!(s.available().slots, 2, "each slot came back, once");
+    assert_eq!(s.host_available(), s.host_capacity());
+}
+
+#[test]
+fn a_set_is_in_a_move_from_prepare_to_commit() {
+    let mut s = RsStore::new(2, 2, 2, 2);
+    let ws = s.create_working_set(geom());
+    write_state(&mut s, ws);
+    assert!(!s.in_move(ws));
+    let txn = s.prepare_suspend(&HashSet::from([ws])).unwrap();
+    assert!(s.in_move(ws));
+    s.commit_suspend(txn);
+    assert!(!s.in_move(ws));
+    let mut grant = s.reserve(slots(1)).unwrap();
+    let txn = s.prepare_restore(&HashSet::from([ws]), &mut grant).unwrap();
+    assert!(s.in_move(ws));
+    s.abort_restore(txn);
+    assert!(!s.in_move(ws));
 }

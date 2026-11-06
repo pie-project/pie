@@ -136,6 +136,11 @@ pub(crate) fn handles_settled(
     let _ = CLIENT_SERVICES.send(&client_id, SessionMessage::HandlesSettled(settled));
 }
 
+/// The turn behind `corr_id` is cancelled before it had a process.
+pub fn forget_frame(client_id: ClientId, corr_id: u32) {
+    let _ = CLIENT_SERVICES.send(&client_id, SessionMessage::Forget(corr_id));
+}
+
 pub(crate) fn send_event(
     client_id: ClientId,
     process_id: ProcessId,
@@ -198,6 +203,8 @@ enum SessionMessage {
     },
     ClientRequest(ClientMessage),
     HandlesSettled(Vec<(client_api::HandleName, Option<crate::handle::Slot>)>),
+    /// A turn was cancelled: if its frame is still waiting, it never runs.
+    Forget(u32),
     ReceiveFile {
         process_id: ProcessId,
         sender: tokio::sync::oneshot::Sender<Bytes>,
@@ -290,21 +297,24 @@ impl ServiceHandler for Session {
                 if client_msg.uses_handles()
                     && (!self.waiting.is_empty() || self.names_lent(&client_msg))
                 {
-                    self.waiting.push_back(client_msg);
+                    if self.waiting.len() < crate::handle::MAX_WAITING_FRAMES {
+                        self.waiting.push_back(client_msg);
+                    } else if let Some(corr_id) = client_msg.corr_id() {
+                        let why = "quota: too many frames wait on lent handles".to_string();
+                        self.send_response(corr_id, false, why).await;
+                    }
                 } else {
                     self.handle_client_message(client_msg).await;
                 }
             }
             SessionMessage::HandlesSettled(settled) => {
                 self.handles.settle(settled);
-                while self
-                    .waiting
-                    .front()
-                    .is_some_and(|frame| !self.names_lent(frame))
-                {
-                    let frame = self.waiting.pop_front().expect("just seen");
-                    self.handle_client_message(frame).await;
-                }
+                self.run_waiting().await;
+            }
+            SessionMessage::Forget(corr_id) => {
+                self.waiting
+                    .retain(|frame| frame.corr_id() != Some(corr_id));
+                self.run_waiting().await;
             }
             SessionMessage::Event {
                 process_id,
@@ -328,6 +338,17 @@ impl ServiceHandler for Session {
 }
 
 impl Session {
+    async fn run_waiting(&mut self) {
+        while self
+            .waiting
+            .front()
+            .is_some_and(|frame| !self.names_lent(frame))
+        {
+            let frame = self.waiting.pop_front().expect("just seen");
+            self.handle_client_message(frame).await;
+        }
+    }
+
     fn names_lent(&self, frame: &ClientMessage) -> bool {
         match frame {
             ClientMessage::Handles { ops, .. } => ops

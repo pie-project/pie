@@ -196,7 +196,7 @@ impl Inner {
         affinity: Option<u64>,
         pinned: Option<WorkerId>,
         open: &Arc<AtomicBool>,
-    ) -> Result<(ReqId, TokenRx), SessionError> {
+    ) -> Result<(ReqId, TokenRx, WorkerId), SessionError> {
         if let ClientMessage::LaunchProcess { props, session, .. } = &mut input.message {
             client_api::props::from_client(props).map_err(SessionError::Launch)?;
             client_api::props::check_session(session.as_deref()).map_err(SessionError::Launch)?;
@@ -266,8 +266,13 @@ impl Inner {
         match tokio::spawn(async move { inner.dispatch(req_id, &request, affinity, &open).await })
             .await
         {
-            Ok(Ok(_)) => Ok((req_id, TokenRx { rx, lost })),
-            _ if pinned.is_some() => Err(SessionError::HandlesLost),
+            Ok(Ok(worker)) => Ok((req_id, TokenRx { rx, lost }, worker)),
+            // Busy or draining is not gone: the handles are still there.
+            _ if pinned
+                .is_some_and(|worker| !self.router.connected().borrow().contains(&worker)) =>
+            {
+                Err(SessionError::HandlesLost)
+            }
             _ => Err(SessionError::NoWorker),
         }
     }
@@ -619,7 +624,7 @@ impl SessionHandle {
         } else {
             None
         };
-        let (req_id, rx) = self
+        let (req_id, rx, worker) = self
             .inner
             .run_turn(
                 self.session,
@@ -632,14 +637,7 @@ impl SessionHandle {
             )
             .await?;
         if handles && pinned.is_none() {
-            let worker = self
-                .inner
-                .turns
-                .lock()
-                .unwrap()
-                .get(&req_id)
-                .and_then(|turn| turn.worker);
-            *self.holds_handles.lock().unwrap() = worker;
+            *self.holds_handles.lock().unwrap() = Some(worker);
         }
         self.current.lock().unwrap().push(req_id);
         Ok(rx)
@@ -913,6 +911,13 @@ mod tests {
         );
 
         *router.dispatch_worker.lock().unwrap() = None;
+        let busy = handle.turn(handles()).await.err().unwrap();
+        assert!(
+            matches!(busy, SessionError::NoWorker),
+            "still connected, it only said no"
+        );
+
+        router._connected_tx.send(Arc::new(HashSet::new())).unwrap();
         let lost = handle.turn(handles()).await.err().unwrap();
         assert!(matches!(lost, SessionError::HandlesLost));
         assert!(lost.to_string().starts_with("dead"), "{lost}");

@@ -1030,6 +1030,8 @@ impl KvStore {
     /// it takes back what moved before it runs.
     pub fn set_parked(&mut self, ws: WorkingSetId, parked: bool) {
         self.table.set_suspended(&HashSet::from([ws]), parked);
+        // A peer's moves refresh only its own map.
+        self.refresh_flat(ws);
     }
 
     /// Whether a move holds any page `working_sets` map: what they name is
