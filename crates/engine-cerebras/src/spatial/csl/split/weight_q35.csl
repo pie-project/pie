@@ -1,0 +1,450 @@
+// split/weight_q35.csl: the role-split weight PE for Qwen3.5 (weight_pe.csl plus the
+// per-PE parts of Gated DeltaNet and of attention; scratch/split/README.md section 9B).
+// Everything weight_pe.csl says holds; this file adds, per layer kind (KM bit l: layer l
+// is full attention, else GDN):
+// - GDN (GDN 1): the PE's slice of the recurrent state, DV f32 a layer: row r < 128 holds
+//   state row k = r of its column's v head, the column's DV v dims. CY_c multicasts the
+//   column's conv'd q/k dims and the decay; the PE owning k index r (host's role bit)
+//   multicasts (k_r, q_r) along its row inside the k head's columns; every PE decays its
+//   state, sends S^T k and S^T q partials (+ k_r^2, q_r^2, k_r q_r for the l2 norms and
+//   the k.q term) into the column reduction; CY_c returns o (the out_proj's input) and
+//   delta / |k|; the state update follows the out_proj send (off the critical path).
+// - attention (ATT 1): the PE's KV entries (NE positions a row, Dc dims, keys dim-major
+//   with |k| per entry, values entry-major with a ones column so the matvec gives the
+//   softmax sums), scores as Qh matvecs, the segment all-reduce over the kv head's
+//   columns (|q|^2 and the new |k|^2 ride in it: q/k RMSNorm as scalars), exp against a
+//   carried log-sum-exp (LSE), values as Qh matvecs, o/l into the column reduction; CY_c
+//   returns o with a redo flag (a sum outside the window: the PE recomputes from scores).
+//
+// A unit is PX x PY weight PEs plus control PEs: a control column (one PE a
+// row, CX: x's chunk, residuals, norms) and a control row (one PE a column,
+// CY: RoPE, softmax/attention hand-off, SiLU) at the roots of the row and
+// column reductions. A weight PE (r, c) holds, for each of the unit's K
+// layers, the four tiles of its row's x chunk (Hc dims) and its column's
+// outputs, and runs only:
+//   x_r (Hc, + the row's sum of squares)   <- CX_r's multicast along the row
+//   qkv partial (NQ + 1)                    -> reduced down the column into CY_c
+//   o_c (QO)                                <- CY_c's multicast down the column
+//   o-proj partial (Hc)                     -> reduced along the row into CX_r
+//   x2_r (Hc, + its sum of squares)         <- CX_r
+//   gate/up partial (2 Ic + 1)              -> CY_c
+//   act_c (Ic)                              <- CY_c
+//   down partial (Hc)                       -> CX_r
+// The reductions are the ARF streamed halves (docs/cerebras-8b-speed.md 9.5,
+// rm3 ef1): one-way level-1 chains in groups into their ends, the ends'
+// level-2 chain into the root; the root (a control PE) merges both halves.
+// A weight PE's part is one of four sends (chain start, add-forward, group
+// end through a FIFO, the farthest end). Every route and queue colour is
+// static and comes from the host (`rcfg`), so one image serves every weight
+// PE of every unit; no axis switches (X and Y have their own colours).
+//
+// MV: 0 bf16 tiles, @fmachs into f32 (the bf16 build); 1 f16 tiles, @fmach
+// into an f16 accumulator (the IEEE build, the shipped Llama F16 path).
+param memcpy_params;
+param K: u16;          // layers on the unit
+param Hc: u16;         // x dims a row
+param QO: u16;         // o dims a column (the o-proj's inputs)
+param Ic: u16;         // intermediate dims a column
+param MV: u16;         // 0 bf16/f32 acc, 1 f16/f16 acc
+param KM: u16;         // bit l: layer l is full attention
+param NQA: u16;        // attention layers' q|gate|k|v outputs a column
+param NQG: u16;        // GDN layers' q|k|v|z|b|a outputs a column
+param GDN: u16;        // 1: GDN state ops (a unit with GDN layers)
+param ATT: u16;        // 1: attention (a unit with an attention layer)
+param DV: u16;         // GDN v dims a column
+param Qh: u16;         // attention q heads a column (Dc dims each)
+param Dc: u16;         // attention kv dims a column
+param NE: u16;         // KV entries a row a layer (context = NE x rows)
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+const tgt = tile_config.target;
+
+fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+
+// ---------------------------------------------------------------- weights
+// One symbol: per layer [qkv Hc x NQ][o QO x Hc][gu Hc x 2Ic][d Ic x Hc],
+// row-major (a row per input element), bf16 / f16 bits.
+fn nla() u16 { var n: u16 = 0; var l: u16 = 0; while (l < K) : (l += 1) { if (((KM >> l) & 1) == 1) { n += 1; } } return n; }
+const NLA: u16 = nla();
+const NLG: u16 = K - NLA;
+const LWM: u32 = @as(u32, QO) * Hc + @as(u32, Hc) * 2 * Ic + @as(u32, Ic) * Hc;
+const LWA: u32 = @as(u32, Hc) * NQA + LWM;
+const LWG: u32 = @as(u32, Hc) * NQG + LWM;
+const WN: u32 = @as(u32, NLA) * LWA + @as(u32, NLG) * LWG;
+var w = @zeros([WN + 1]u16);
+var w_ptr: [*]u16 = &w;
+
+// ---------------------------------------------------------------- buffers
+const NS: u16 = Qh * NE + Qh + 1;           // the scores' segment all-reduce
+const XN: u16 = mx(mx(mx(Hc, QO), Ic), Qh * NE);
+const YN: u16 = mx(mx(mx(mx(NQA + 1, NQG + 1), 2 * Ic + 1), Hc), mx(NS, 2 * DV + 3));
+var xh = @zeros([XN]@fp16());          // the matvec's x (16-bit)
+var y: [YN]f32 align(16) = @zeros([YN]f32);   // the partial sent
+var y16 = @zeros([if (MV == 1) YN else 1]@fp16());   // MV 1: the f16 accumulator
+const xh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XN} -> xh[i] });
+const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> y[i] });
+const y_d0 = y_d;
+const y16_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> y16[i] });
+var a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> w[i] });
+
+// ---------------------------------------------------------------- fabric
+// Queues: iq2/iq3 the row reduction's level-1 / level-2 inputs, iq4/iq5 the
+// column's, iq6 the row multicast (x), iq7 the column multicast (o, act);
+// oq2 the row reduction's output, oq3 the column's. Colours are bound at init.
+const q_xa = @get_input_queue(2);
+const q_xb = @get_input_queue(3);
+const q_ya = @get_input_queue(4);
+const q_yb = @get_input_queue(5);
+const q_xm = @get_input_queue(6);
+const q_ym = @get_input_queue(7);
+const q_xo = @get_output_queue(2);
+const q_yo = @get_output_queue(3);
+const C_PARK: color = @get_color(16);   // nothing routes it to a ramp
+const ut_a = @get_ut_id(4);
+const ut_b = @get_ut_id(5);
+var fifo_buf = @zeros([32]f32);
+const fifo = @allocate_fifo(fifo_buf);
+
+fn fout(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fin(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+
+// rcfg (host): [0] routes n, [1..1+2n) (colour, low route byte), then
+// [RQ..RQ+8) the queue colours (iq2..iq7, oq2, oq3), [RQ+8] the row role,
+// [RQ+9] the column role. A role: 0 chain start, 1 add-forward, 2 group end
+// (FIFO merge of level 1 and level 2), 3 the farthest group's end.
+const NR: u16 = 12;
+const RQ: u16 = 1 + 2 * NR;
+var rcfg = @zeros([RQ + 18]u32);
+var rcfg_ptr: [*]u32 = &rcfg;
+var role_x: u16 = 0;
+var role_y: u16 = 0;
+var role_s: u16 = 0;    // the scores segment: 0-3 as role_x, 4 its root
+var gsrc: u16 = 0;      // GDN: bit 15 this PE owns k index r, bits 0-7 its q/k dim in CY's multicast
+
+fn iqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
+  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
+}
+fn oqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
+  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
+}
+
+fn init() void {
+  const cc0 = color_config.get_color_config_addr(@get_color(0));
+  var k: u16 = 0;
+  while (k < @as(u16, rcfg[0])) : (k += 1) {
+    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
+    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
+    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
+  }
+  iqc(2, rcfg[RQ]);
+  iqc(3, rcfg[RQ + 1]);
+  iqc(4, rcfg[RQ + 2]);
+  iqc(5, rcfg[RQ + 3]);
+  iqc(6, rcfg[RQ + 4]);
+  iqc(7, rcfg[RQ + 5]);
+  oqc(2, rcfg[RQ + 6]);
+  oqc(3, rcfg[RQ + 7]);
+  role_x = @as(u16, rcfg[RQ + 8]);
+  role_y = @as(u16, rcfg[RQ + 9]);
+  role_s = @as(u16, rcfg[RQ + 10]);
+  gsrc = @as(u16, rcfg[RQ + 11]);
+  sys_mod.unblock_cmd_stream();
+}
+
+// The partial y[0..n) into the row (X) or column reduction.
+fn send_x(n: u16) void {
+  const d = @set_dsd_length(y_d, n);
+  const A = .{ .async = true, .ut_id = ut_b };
+  if (role_x == 0) { @fmovs(fout(q_xo, n), d, A); }
+  else if (role_x == 1) { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
+  else if (role_x == 2) {
+    @fadds(fifo, fin(q_xa, n), d, .{ .async = true, .ut_id = ut_a });
+    @fadds(fout(q_xo, n), fin(q_xb, n), fifo, A);
+  } else { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
+}
+fn send_y(n: u16) void {
+  const d = @set_dsd_length(y_d, n);
+  const A = .{ .async = true, .ut_id = ut_b };
+  if (role_y == 0) { @fmovs(fout(q_yo, n), d, A); }
+  else if (role_y == 1) { @fadds(fout(q_yo, n), fin(q_ya, n), d, A); }
+  else if (role_y == 2) {
+    @fadds(fifo, fin(q_ya, n), d, .{ .async = true, .ut_id = ut_a });
+    @fadds(fout(q_yo, n), fin(q_yb, n), fifo, A);
+  } else { @fadds(fout(q_yo, n), fin(q_ya, n), d, A); }
+}
+
+// ---------------------------------------------------------------- matvec
+const mv_dest = @get_dsr(dsr_dest, 1);
+const mv_src0 = @get_dsr(dsr_src0, 1);
+const mv_src1 = @get_dsr(dsr_src1, 1);
+fn mvs_step(xv: @fp16()) void { @fmachs(mv_dest, mv_src0, mv_src1, xv); }
+fn mvh_step(xv: @fp16()) void { @fmach(mv_dest, mv_src0, mv_src1, xv); }
+
+// y[yo..yo+N) = A x, A at p (R rows of N), x in xh[xo..xo+R).
+fn mv(off: u32, R: u16, N: u16) void { mvp(@ptrcast([*]u16, &w[off]), R, N, 0, 0); }
+fn mvp(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
+  const a = @set_dsd_length(@set_dsd_base_addr(a_d, p), N);
+  const xv = @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, xo), @fp16()), R);
+  const y_d = @increment_dsd_offset(y_d0, @as(i16, yo), f32);
+  if (MV == 1) {
+    const yh = @set_dsd_length(y16_d, N);
+    @fmovh(yh, @as(@fp16(), 0.0));
+    @load_to_dsr(mv_dest, yh, .{ .save_address = false });
+    @load_to_dsr(mv_src0, yh, .{ .save_address = false });
+    @load_to_dsr(mv_src1, a, .{ .save_address = true });
+    @map(mvh_step, xv);
+    @fh2s(@set_dsd_length(y_d, N), yh);
+  } else {
+    const yv = @set_dsd_length(y_d, N);
+    @fmovs(yv, 0.0);
+    @load_to_dsr(mv_dest, yv, .{ .save_address = false });
+    @load_to_dsr(mv_src0, yv, .{ .save_address = false });
+    @load_to_dsr(mv_src1, a, .{ .save_address = true });
+    @map(mvs_step, xv);
+  }
+}
+
+
+// ---------------------------------------------------------------- segment phases
+// The segment collectives borrow the row reduction's queues (iq2, iq3, oq2) and the row
+// multicast's (iq6) on their own colours (rcfg[RQ + 12 ..]: GDN's (k, q) multicast, the
+// scores' level 1, level 2, output, multicast), static routes; mode 0 restores.
+fn qmode(m: u16) void {
+  while ((tile_config.output_queue_status.get_raw() & 0x0100) == 0) {}   // oq2 empty
+  if (m == 0) {
+    iqc(2, rcfg[RQ]); iqc(3, rcfg[RQ + 1]); iqc(6, rcfg[RQ + 4]); oqc(2, rcfg[RQ + 6]);
+  } else if (m == 1) {
+    iqc(6, rcfg[RQ + 12]); oqc(2, rcfg[RQ + 12]);
+  } else {
+    iqc(2, rcfg[RQ + 13]); iqc(3, rcfg[RQ + 14]); oqc(2, rcfg[RQ + 15]); iqc(6, rcfg[RQ + 16]);
+  }
+}
+
+// ---------------------------------------------------------------- GDN
+var st = @zeros([if (GDN == 1) NLG * DV else 1]f32);
+var dl = @zeros([if (GDN == 1) DV else 1]f32);
+var gb = @zeros([if (GDN == 1) 18 else 1]f32);   // CY's multicast: k 8, q 8, decay, pad
+var kq = @zeros([2]f32);
+const st_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> st[i] });
+const dl_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> dl[i] });
+const kq_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2} -> kq[i] });
+fn gdn_mix(g: u16) void {
+  const s = @increment_dsd_offset(st_d, @as(i16, g * DV), f32);
+  @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{18} -> gb[i] }), fin(q_ym, 18));
+  qmode(1);
+  if ((gsrc & 0x8000) != 0) {
+    const j = gsrc & 0xff;
+    kq[0] = gb[j]; kq[1] = gb[8 + j];
+    @fmovs(fout(q_xo, 2), kq_d);
+  } else {
+    @fmovs(kq_d, fin(q_xm, 2));
+  }
+  qmode(0);
+  const kr = kq[0];
+  const qr = kq[1];
+  @fmuls(s, s, gb[16]);
+  @fmuls(@set_dsd_length(y_d, DV), s, kr);
+  @fmuls(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, DV), f32), DV), s, qr);
+  y[2 * DV] = kr * kr;
+  y[2 * DV + 1] = qr * qr;
+  y[2 * DV + 2] = kr * qr;
+  send_y(2 * DV + 3);
+  // o (the out_proj's x) and delta / |k|
+  @fs2h(@set_dsd_length(xh_d, DV), fin(q_ym, DV));
+  @fmovs(dl_d, fin(q_ym, DV));
+}
+fn gdn_update(g: u16) void {
+  const s = @increment_dsd_offset(st_d, @as(i16, g * DV), f32);
+  @fmacs(s, s, dl_d, kq[0]);
+}
+
+// ---------------------------------------------------------------- attention
+const KCW: u16 = Dc * NE;               // keys, dim-major [d][e]
+const VCW: u16 = NE * (Dc + 1);         // values, entry-major [e][d | 1]
+var kc = @zeros([if (ATT == 1) NLA * KCW + 1 else 1]u16);
+var vc = @zeros([if (ATT == 1) NLA * VCW + 1 else 1]u16);
+var kinv = @zeros([if (ATT == 1) NLA * NE else 1]f32);
+var mref = @zeros([if (ATT == 1) NLA * Qh else 1]f32);
+var ab = @zeros([if (ATT == 1) Qh * Dc + 2 * Dc + 2 else 1]f32);   // q | k | v | slot | (pad)
+var sx = @zeros([if (ATT == 1) NS else 1]f32);
+var rq = @zeros([if (ATT == 1) Qh else 1]f32);
+var ex16 = @zeros([if (ATT == 1) NS else 1]u16);
+const sx_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> sx[i] });
+const ex_a = [3]f32 { 12582912.0, -12582912.0, 0.0 };
+const ex_c = [4]f32 { 0.16792157, 0.49999613, 0.99999995, 1.0 };
+// exp(buf) in place (exp_fast's form: 2^k by the exponent bits, a degree-4 polynomial on r)
+fn exp_v(buf: mem1d_dsd, n: u16) void {
+  const p = @set_dsd_length(y_d, n);
+  const kk = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> ex16[i] }), n);
+  const pl = @set_dsd_length(@set_dsd_stride(@set_dsd_base_addr(kk, @ptrcast([*]u16, &y)), 2), n);
+  const ph = @increment_dsd_offset(pl, 1, u16);
+  @fmaxs(buf, buf, -87.0);
+  @fmuls(p, buf, 1.4426950408889634);
+  var c: u16 = 0;
+  while (c < 3) : (c += 1) {
+    @fadds(p, p, ex_a[c]);
+    if (c == 1) { @fmacs(buf, buf, p, -0.6931471805599453); }
+  }
+  @sll16(kk, pl, 7);
+  @fmuls(p, buf, 0.041458580642938614);
+  c = 0;
+  while (c < 4) : (c += 1) {
+    if (c > 0) { @fmuls(p, p, buf); }
+    @fadds(p, p, ex_c[c]);
+  }
+  @add16(ph, ph, kk);
+  @fmovs(buf, p);
+}
+// The scores' segment all-reduce over the kv head's columns (its root: a weight PE).
+fn seg_ar(n: u16) void {
+  const d = @set_dsd_length(sx_d, n);
+  qmode(2);
+  const A = .{ .async = true, .ut_id = ut_b };
+  if (role_s == 4) {
+    @fadds(fifo, fin(q_xb, n), d, .{ .async = true, .ut_id = ut_a });
+    @fadds(fout(q_xo, n), fin(q_xa, n), fifo, A);
+  } else if (role_s == 0) { @fmovs(fout(q_xo, n), d, A); }
+  else if (role_s == 2) {
+    @fadds(fifo, fin(q_xa, n), d, .{ .async = true, .ut_id = ut_a });
+    @fadds(fout(q_xo, n), fin(q_xb, n), fifo, A);
+  } else { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
+  @fmovs(d, fin(q_xm, n));
+  qmode(0);
+}
+fn att_mix(a: u16) void {
+  const kb: u16 = a * KCW;
+  const vb: u16 = a * VCW;
+  const AB: u16 = Qh * Dc + 2 * Dc + 2;
+  @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{AB} -> ab[i] }), fin(q_ym, AB));
+  // the new entry (slot word: bit 15 this row's, bits 0-7 its entry)
+  const sl = @as(u16, @bitcast(u32, ab[AB - 2]));
+  const mine = (sl & 0x8000) != 0;
+  const e0 = sl & 0xff;
+  if (mine) {
+    var d: u16 = 0;
+    while (d < Dc) : (d += 1) {
+      kc[1 + kb + d * NE + e0] = @bitcast(u16, @as(@fp16(), ab[Qh * Dc + d]));
+      vc[1 + vb + e0 * (Dc + 1) + d] = @bitcast(u16, @as(@fp16(), ab[Qh * Dc + Dc + d]));
+    }
+    vc[1 + vb + e0 * (Dc + 1) + Dc] = 0x3c00;   // 1.0
+  }
+  // q as f16 (the score matvecs' x) and |q|^2 a head
+  @fs2h(@set_dsd_length(xh_d, Qh * Dc), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * Dc} -> ab[i] }));
+  var apass: u16 = 0;
+  while (apass < 8) : (apass += 1) {
+    var h: u16 = 0;
+    while (h < Qh) : (h += 1) {
+      mvp(@ptrcast([*]u16, &kc[1 + kb]), Dc, NE, h * Dc, h * NE);
+      @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NE), f32), NE),
+             @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * NE), f32), NE));
+      var ss: f32 = 0.0;
+      var d: u16 = 0;
+      while (d < Dc) : (d += 1) { const v = ab[h * Dc + d]; ss += v * v; }
+      sx[Qh * NE + h] = ss;
+    }
+    var kk: f32 = 0.0;
+    if (mine) { var d: u16 = 0; while (d < Dc) : (d += 1) { const v = ab[Qh * Dc + d]; kk += v * v; } }
+    sx[Qh * NE + Qh] = kk;
+    seg_ar(NS);
+    if (mine) { kinv[a * NE + e0] = sx[Qh * NE + Qh]; }
+    const ki = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kinv[i] });
+    h = 0;
+    while (h < Qh) : (h += 1) {
+      const sh = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NE), f32), NE);
+      @fmuls(sh, sh, @increment_dsd_offset(ki, @as(i16, a * NE), f32));
+      @fmuls(sh, sh, sx[Qh * NE + h]);
+      @fsubs(sh, sh, mref[a * Qh + h]);
+    }
+    exp_v(@set_dsd_length(sx_d, Qh * NE), Qh * NE);
+    @fs2h(@set_dsd_length(xh_d, Qh * NE), @set_dsd_length(sx_d, Qh * NE));
+    h = 0;
+    while (h < Qh) : (h += 1) { mvp(@ptrcast([*]u16, &vc[1 + vb]), NE, Dc + 1, h * NE, h * (Dc + 1)); }
+    send_y(Qh * (Dc + 1));
+    // o (the o_proj's x) and the redo word
+    @fs2h(@set_dsd_length(xh_d, QO), fin(q_ym, QO));
+    @fmovs(@set_dsd_length(sx_d, 1), fin(q_ym, 1));
+    if (sx[0] == 0.0) { apass = 8; } else {
+      @fs2h(@set_dsd_length(xh_d, Qh * Dc), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * Dc} -> ab[i] }));
+      h = 0;
+      while (h < Qh) : (h += 1) { mref[a * Qh + h] += sx[1 + h]; }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- a pass
+fn recv_x(nout: u16) void {
+  @fs2h(@set_dsd_length(xh_d, Hc), fin(q_xm, Hc));
+  @fmovs(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, nout), f32), 1), fin(q_xm, 1));
+}
+fn recv_col(n: u16) void {
+  @fs2h(@set_dsd_length(xh_d, n), fin(q_ym, n));
+}
+
+var la: u16 = 0;
+var lg: u16 = 0;
+fn layer(l: u16, b: u32) u32 {
+  const att = ((KM >> l) & 1) == 1;
+  const NQ = if (att) NQA else NQG;
+  recv_x(NQ);
+  mv(b, Hc, NQ);
+  send_y(NQ + 1);
+  if (ATT == 1 and att) { att_mix(la); }
+  else if (GDN == 1 and !att) { gdn_mix(lg); }
+  else { recv_col(QO); }
+  const bo = b + @as(u32, Hc) * NQ;
+  mv(bo, QO, Hc);
+  send_x(Hc);
+  if (GDN == 1 and !att) { gdn_update(lg); lg += 1; } else { la += 1; }
+  recv_x(2 * Ic);
+  mv(bo + @as(u32, QO) * Hc, Hc, 2 * Ic);
+  send_y(2 * Ic + 1);
+  recv_col(Ic);
+  mv(bo + @as(u32, QO) * Hc + @as(u32, Hc) * 2 * Ic, Ic, Hc);
+  send_x(Hc);
+  return bo + LWM;
+}
+
+var n_steps: u32 = 0;
+const pass_id: local_task_id = @get_local_task_id(8);
+task pass_task() void {
+  var i: u32 = 0;
+  while (i < n_steps) : (i += 1) {
+    var l: u16 = 0;
+    var b: u32 = 0;
+    la = 0;
+    lg = 0;
+    while (l < K) : (l += 1) { b = layer(l, b); }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn compute(steps: u32, start_pos: u32) void {
+  n_steps = steps;
+  @activate(pass_id);
+}
+
+comptime {
+  @bind_local_task(pass_task, pass_id);
+  @initialize_queue(q_xa, .{ .color = C_PARK });
+  @initialize_queue(q_xb, .{ .color = C_PARK });
+  @initialize_queue(q_ya, .{ .color = C_PARK });
+  @initialize_queue(q_yb, .{ .color = C_PARK });
+  @initialize_queue(q_xm, .{ .color = C_PARK });
+  @initialize_queue(q_ym, .{ .color = C_PARK });
+  @initialize_queue(q_xo, .{ .color = C_PARK });
+  @initialize_queue(q_yo, .{ .color = C_PARK });
+  @export_symbol(w_ptr, "w");
+  @export_symbol(rcfg_ptr, "rcfg");
+  @export_symbol(init);
+  @export_symbol(compute);
+}
+//@@ dummies

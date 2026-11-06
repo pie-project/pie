@@ -1,0 +1,238 @@
+// split/weight_pe.csl: the role-split layout's weight PE (scratch/split/README.md).
+//
+// A unit is PX x PY weight PEs plus control PEs: a control column (one PE a
+// row, CX: x's chunk, residuals, norms) and a control row (one PE a column,
+// CY: RoPE, softmax/attention hand-off, SiLU) at the roots of the row and
+// column reductions. A weight PE (r, c) holds, for each of the unit's K
+// layers, the four tiles of its row's x chunk (Hc dims) and its column's
+// outputs, and runs only:
+//   x_r (Hc, + the row's sum of squares)   <- CX_r's multicast along the row
+//   qkv partial (NQ + 1)                    -> reduced down the column into CY_c
+//   o_c (QO)                                <- CY_c's multicast down the column
+//   o-proj partial (Hc)                     -> reduced along the row into CX_r
+//   x2_r (Hc, + its sum of squares)         <- CX_r
+//   gate/up partial (2 Ic + 1)              -> CY_c
+//   act_c (Ic)                              <- CY_c
+//   down partial (Hc)                       -> CX_r
+// The reductions are the ARF streamed halves (docs/cerebras-8b-speed.md 9.5,
+// rm3 ef1): one-way level-1 chains in groups into their ends, the ends'
+// level-2 chain into the root; the root (a control PE) merges both halves.
+// A weight PE's part is one of four sends (chain start, add-forward, group
+// end through a FIFO, the farthest end). Every route and queue colour is
+// static and comes from the host (`rcfg`), so one image serves every weight
+// PE of every unit; no axis switches (X and Y have their own colours).
+//
+// MV: 0 bf16 tiles, @fmachs into f32 (the bf16 build); 1 f16 tiles, @fmach
+// into an f16 accumulator (the IEEE build, the shipped Llama F16 path).
+param memcpy_params;
+param K: u16;          // layers on the unit
+param Hc: u16;         // x dims a row
+param NQ: u16;         // qkv outputs a column
+param QO: u16;         // o dims a column (the o-proj's inputs)
+param Ic: u16;         // intermediate dims a column
+param MV: u16;         // 0 bf16/f32 acc, 1 f16/f16 acc
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+const tgt = tile_config.target;
+
+fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+
+// ---------------------------------------------------------------- weights
+// One symbol: per layer [qkv Hc x NQ][o QO x Hc][gu Hc x 2Ic][d Ic x Hc],
+// row-major (a row per input element), bf16 / f16 bits.
+const LW: u32 = @as(u32, Hc) * NQ + @as(u32, QO) * Hc + @as(u32, Hc) * 2 * Ic + @as(u32, Ic) * Hc;
+const WN: u32 = @as(u32, K) * LW;
+var w = @zeros([WN + 1]u16);
+var w_ptr: [*]u16 = &w;
+
+// ---------------------------------------------------------------- buffers
+const XN: u16 = mx(mx(Hc, QO), Ic);
+const YN: u16 = mx(mx(NQ + 1, 2 * Ic + 1), Hc);
+var xh = @zeros([XN]@fp16());          // the matvec's x (16-bit)
+var y: [YN]f32 align(16) = @zeros([YN]f32);   // the partial sent
+var y16 = @zeros([if (MV == 1) YN else 1]@fp16());   // MV 1: the f16 accumulator
+const xh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XN} -> xh[i] });
+const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> y[i] });
+const y16_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> y16[i] });
+var a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> w[i] });
+
+// ---------------------------------------------------------------- fabric
+// Queues: iq2/iq3 the row reduction's level-1 / level-2 inputs, iq4/iq5 the
+// column's, iq6 the row multicast (x), iq7 the column multicast (o, act);
+// oq2 the row reduction's output, oq3 the column's. Colours are bound at init.
+const q_xa = @get_input_queue(2);
+const q_xb = @get_input_queue(3);
+const q_ya = @get_input_queue(4);
+const q_yb = @get_input_queue(5);
+const q_xm = @get_input_queue(6);
+const q_ym = @get_input_queue(7);
+const q_xo = @get_output_queue(2);
+const q_yo = @get_output_queue(3);
+const C_PARK: color = @get_color(16);   // nothing routes it to a ramp
+const ut_a = @get_ut_id(4);
+const ut_b = @get_ut_id(5);
+var fifo_buf = @zeros([32]f32);
+const fifo = @allocate_fifo(fifo_buf);
+
+fn fout(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fin(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+
+// rcfg (host): [0] routes n, [1..1+2n) (colour, low route byte), then
+// [RQ..RQ+8) the queue colours (iq2..iq7, oq2, oq3), [RQ+8] the row role,
+// [RQ+9] the column role. A role: 0 chain start, 1 add-forward, 2 group end
+// (FIFO merge of level 1 and level 2), 3 the farthest group's end.
+const NR: u16 = 12;
+const RQ: u16 = 1 + 2 * NR;
+var rcfg = @zeros([RQ + 10]u32);
+var rcfg_ptr: [*]u32 = &rcfg;
+var role_x: u16 = 0;
+var role_y: u16 = 0;
+
+fn iqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
+  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
+}
+fn oqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
+  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
+}
+
+fn init() void {
+  const cc0 = color_config.get_color_config_addr(@get_color(0));
+  var k: u16 = 0;
+  while (k < @as(u16, rcfg[0])) : (k += 1) {
+    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
+    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
+    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
+  }
+  iqc(2, rcfg[RQ]);
+  iqc(3, rcfg[RQ + 1]);
+  iqc(4, rcfg[RQ + 2]);
+  iqc(5, rcfg[RQ + 3]);
+  iqc(6, rcfg[RQ + 4]);
+  iqc(7, rcfg[RQ + 5]);
+  oqc(2, rcfg[RQ + 6]);
+  oqc(3, rcfg[RQ + 7]);
+  role_x = @as(u16, rcfg[RQ + 8]);
+  role_y = @as(u16, rcfg[RQ + 9]);
+  sys_mod.unblock_cmd_stream();
+}
+
+// The partial y[0..n) into the row (X) or column reduction.
+fn send_x(n: u16) void {
+  const d = @set_dsd_length(y_d, n);
+  const A = .{ .async = true, .ut_id = ut_b };
+  if (role_x == 0) { @fmovs(fout(q_xo, n), d, A); }
+  else if (role_x == 1) { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
+  else if (role_x == 2) {
+    @fadds(fifo, fin(q_xa, n), d, .{ .async = true, .ut_id = ut_a });
+    @fadds(fout(q_xo, n), fin(q_xb, n), fifo, A);
+  } else { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
+}
+fn send_y(n: u16) void {
+  const d = @set_dsd_length(y_d, n);
+  const A = .{ .async = true, .ut_id = ut_b };
+  if (role_y == 0) { @fmovs(fout(q_yo, n), d, A); }
+  else if (role_y == 1) { @fadds(fout(q_yo, n), fin(q_ya, n), d, A); }
+  else if (role_y == 2) {
+    @fadds(fifo, fin(q_ya, n), d, .{ .async = true, .ut_id = ut_a });
+    @fadds(fout(q_yo, n), fin(q_yb, n), fifo, A);
+  } else { @fadds(fout(q_yo, n), fin(q_ya, n), d, A); }
+}
+
+// ---------------------------------------------------------------- matvec
+const mv_dest = @get_dsr(dsr_dest, 1);
+const mv_src0 = @get_dsr(dsr_src0, 1);
+const mv_src1 = @get_dsr(dsr_src1, 1);
+fn mvs_step(xv: @fp16()) void { @fmachs(mv_dest, mv_src0, mv_src1, xv); }
+fn mvh_step(xv: @fp16()) void { @fmach(mv_dest, mv_src0, mv_src1, xv); }
+
+// y[0..N) = A x, A at word `off` of w (R rows of N), x in xh[0..R).
+fn mv(off: u32, R: u16, N: u16) void {
+  const a = @set_dsd_length(@set_dsd_base_addr(a_d, @ptrcast([*]u16, &w[off])), N);
+  const xv = @set_dsd_length(xh_d, R);
+  if (MV == 1) {
+    const yh = @set_dsd_length(y16_d, N);
+    @fmovh(yh, @as(@fp16(), 0.0));
+    @load_to_dsr(mv_dest, yh, .{ .save_address = false });
+    @load_to_dsr(mv_src0, yh, .{ .save_address = false });
+    @load_to_dsr(mv_src1, a, .{ .save_address = true });
+    @map(mvh_step, xv);
+    @fh2s(@set_dsd_length(y_d, N), yh);
+  } else {
+    const yv = @set_dsd_length(y_d, N);
+    @fmovs(yv, 0.0);
+    @load_to_dsr(mv_dest, yv, .{ .save_address = false });
+    @load_to_dsr(mv_src0, yv, .{ .save_address = false });
+    @load_to_dsr(mv_src1, a, .{ .save_address = true });
+    @map(mvs_step, xv);
+  }
+}
+
+// ---------------------------------------------------------------- a pass
+// x (and its sum of squares, carried in the qkv / gate-up partial's last word).
+fn recv_x(nout: u16) void {
+  @fs2h(@set_dsd_length(xh_d, Hc), fin(q_xm, Hc));
+  @fmovs(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, nout), f32), 1), fin(q_xm, 1));
+}
+fn recv_col(n: u16) void {
+  @fs2h(@set_dsd_length(xh_d, n), fin(q_ym, n));
+}
+
+fn layer(l: u16) void {
+  const b: u32 = @as(u32, l) * LW;
+  recv_x(NQ);
+  mv(b, Hc, NQ);
+  send_y(NQ + 1);
+  recv_col(QO);
+  mv(b + @as(u32, Hc) * NQ, QO, Hc);
+  send_x(Hc);
+  recv_x(2 * Ic);
+  mv(b + @as(u32, Hc) * NQ + @as(u32, QO) * Hc, Hc, 2 * Ic);
+  send_y(2 * Ic + 1);
+  recv_col(Ic);
+  mv(b + @as(u32, Hc) * NQ + @as(u32, QO) * Hc + @as(u32, Hc) * 2 * Ic, Ic, Hc);
+  send_x(Hc);
+}
+
+// The launch only records its argument and activates the pass task (memcpy
+// inlines each exported launch body: keep it thin).
+var n_steps: u32 = 0;
+const pass_id: local_task_id = @get_local_task_id(8);
+task pass_task() void {
+  var i: u32 = 0;
+  while (i < n_steps) : (i += 1) {
+    var l: u16 = 0;
+    while (l < K) : (l += 1) { layer(l); }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn compute(steps: u32, start_pos: u32) void {
+  n_steps = steps;
+  @activate(pass_id);
+}
+
+comptime {
+  @bind_local_task(pass_task, pass_id);
+  @initialize_queue(q_xa, .{ .color = C_PARK });
+  @initialize_queue(q_xb, .{ .color = C_PARK });
+  @initialize_queue(q_ya, .{ .color = C_PARK });
+  @initialize_queue(q_yb, .{ .color = C_PARK });
+  @initialize_queue(q_xm, .{ .color = C_PARK });
+  @initialize_queue(q_ym, .{ .color = C_PARK });
+  @initialize_queue(q_xo, .{ .color = C_PARK });
+  @initialize_queue(q_yo, .{ .color = C_PARK });
+  @export_symbol(w_ptr, "w");
+  @export_symbol(rcfg_ptr, "rcfg");
+  @export_symbol(init);
+  @export_symbol(compute);
+}
+//@@ dummies
