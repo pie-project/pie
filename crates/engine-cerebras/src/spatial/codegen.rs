@@ -86,6 +86,7 @@ mod src {
     pub const TRM_SILU: &str = include_str!("csl/kernels/trm_silu.json");
     pub const TRM_SILH: &str = include_str!("csl/kernels/trm_silh.json");
     pub const TRM_XGI: &str = include_str!("csl/kernels/trm_xgi.json");
+    pub const TRM_XGG: &str = include_str!("csl/kernels/trm_xgg.json");
     pub const HEAD_PACK: &str = include_str!("csl/kernels/head_pack.json");
     pub const EMBED_PACK: &str = include_str!("csl/kernels/embed_pack.json");
     pub const VM_HM: &str = include_str!("csl/vm/guest4hm_vm.csl");
@@ -408,7 +409,8 @@ pub struct Variant {
     /// 512 (+190 B) (`trm_silh.json`); **4096**
     /// (with 512) its f16 gammas made in place in the f32 gammas' words on the
     /// first pass, no copies (`trm_xgi.json`; the host places the weights
-    /// once, after init); **8192** (with 1024 and 4) the grids take 1024 too;
+    /// once, after init); **8192** (with 4) the grids' x g in f16 as 512
+    /// (`trm_xgg.json`; the grids taking 1024 lost: 0538 sp538_t20);
     /// **16384** the head's STREAM argmax in one round of three packed keys
     /// (value bits + row, + 1023 - row, + j), the exact rounds only when two
     /// rows tie at 13 mantissa bits (the feeder multicasts -2 first, which the
@@ -694,7 +696,7 @@ impl Variant {
         // (bits 16384 and 32768 are the head's and the strip's alone)
         if self.trim & 16383 != 0 && (region || self.trim & 4 != 0) {
             if self.trim & 1 == 0 {
-                return Err(format!("gen: {tag}: TRM {} unknown (1 the cuts, 2 and the sums of squares, 4 the grids too, 8 exp at degree 4, 16 the residuals from the fabric, 32 the head's split_x, 64 HV's zero copies, 128 HV's entries once a pass, 256 rsqrt in two Newton steps, 512 x g in f16, 1024 the MLP's act in f16 on every PE: no act all-reduce, 2048 its scales in f16, 4096 512's f16 gammas in place on the first pass, 8192 the grids take 1024, 16384 the head's packed argmax round)", self.trim));
+                return Err(format!("gen: {tag}: TRM {} unknown (1 the cuts, 2 and the sums of squares, 4 the grids too, 8 exp at degree 4, 16 the residuals from the fabric, 32 the head's split_x, 64 HV's zero copies, 128 HV's entries once a pass, 256 rsqrt in two Newton steps, 512 x g in f16, 1024 the MLP's act in f16 on every PE: no act all-reduce, 2048 its scales in f16, 4096 512's f16 gammas in place on the first pass, 8192 the grids' x g in f16, 16384 the head's packed argmax round)", self.trim));
             }
             if self.trim & 128 != 0 && self.trim & 64 == 0 {
                 return Err(format!("gen: {tag}: TRM 128 needs 64 (the zero run)"));
@@ -734,7 +736,11 @@ impl Variant {
                     s = apply_reps("trm_xgi", src::TRM_XGI, &s, tag)?;
                 }
             }
-            if self.trim & 1024 != 0 && (region || self.trim & 8192 != 0) {
+            if self.trim & 8192 != 0 && !region {
+                // (the grids: x g in f16 as bit 512, gammas converted once a pass)
+                s = apply_reps("trm_xgg", src::TRM_XGG, &s, tag)?;
+            }
+            if self.trim & 1024 != 0 && region {
                 // (regions only: act = silu(s g) (s u) in f16 on every PE of a column, from
                 // the gate-up all-reduce, in place of one row an element and the act gather)
                 if self.trim & 16 == 0 {
