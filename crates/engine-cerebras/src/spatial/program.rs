@@ -1698,6 +1698,19 @@ fn serve8b(get: &Get) -> R<ProgramSpec> {
 /// embedding strip as serve8b's.
 fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
     headmode(get, "serve8b_region")?;
+    // A G12 build's layout defaults `G12` to 1, so cslc's out.json omits it
+    // when the params do; its Gemma knobs without it would read as a Qwen /
+    // Llama program (no norms' kinds, an untied head).
+    if get.opt("G12") != Some(1)
+        && let Some(k) = ["KINDS", "QhG", "GsG", "WIN", "W4BUF", "ESB"]
+            .into_iter()
+            .find(|k| get.opt(k).is_some())
+    {
+        return Err(format!(
+            "serve8b_region: param {k} is serve8b_region_g12's (Gemma 4) but the params state \
+             no G12:1; pass G12:1 (the layout's default is not in out.json)"
+        ));
+    }
     // (G12 check builds may keep an f32 pool: KV16 0.)
     let kv16_ok = get.req("KV16")? == 1 || get.opt("G12") == Some(1);
     if get.req("W16")? != 1 || !kv16_ok || get.opt("KVCP").unwrap_or(0) != 0 {

@@ -2144,6 +2144,34 @@ mod tests {
         );
     }
 
+    /// `PLACE_CKPT=<dir> PLACE_PARAMS=<K:V,...>`: a real checkpoint
+    /// validated and placed on the program of those params on a recording
+    /// device (no chip, no simulator: every write's symbol and size checked
+    /// against nothing but the host's own account). The chip's load errors
+    /// before the first launch show here (e.g. Gemma-12B's tied head).
+    #[test]
+    #[ignore]
+    fn place_on_a_recorder() {
+        let dir = std::env::var("PLACE_CKPT").expect("PLACE_CKPT");
+        let params = super::super::program::parse_params(&std::env::var("PLACE_PARAMS").expect("PLACE_PARAMS"));
+        let design = ProgramSpec::from_params(ProgramSpec::infer_design(&params).unwrap(), &params)
+            .expect("the program");
+        let ckpt = Ckpt::open(Path::new(&dir)).expect("the checkpoint");
+        let theta = check_weights(&design, &ckpt, None).expect("the checkpoint fits");
+        let mut rec = super::super::device::Recorder::default().forgetful();
+        for c in design.components() {
+            c.routes(&design, &mut rec).expect("routes");
+        }
+        let w = super::super::component::Weights { ckpt: &ckpt, rope: &theta };
+        for c in design.components() {
+            let t = Instant::now();
+            c.place(&design, &w, &mut rec)
+                .unwrap_or_else(|e| panic!("{}: {e}", c.name()));
+            eprintln!("placed {} in {:.1}s", c.name(), t.elapsed().as_secs_f32());
+        }
+        eprintln!("{} calls", rec.take().len());
+    }
+
     #[test]
     fn bf16_pages_pack_two_a_word_and_back() {
         let cells: Vec<u32> = (0..7).map(|i| 0x3f80 + i).collect();

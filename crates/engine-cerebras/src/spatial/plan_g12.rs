@@ -602,6 +602,38 @@ mod tests {
         assert_eq!(program.gemma12(), Some(plan.knobs));
     }
 
+    /// The tied head on serve8b (Gemma-12B ties lm_head to embed_tokens):
+    /// the planned program takes a checkpoint without `head` (the u4 head
+    /// reads the embedding's codes) and refuses one only on a non-G12
+    /// build; params with the Gemma knobs but no `G12:1` (chip run 0389's,
+    /// cslc's out.json omitting the layout's default) are refused outright
+    /// rather than read as an untied Qwen / Llama program.
+    #[test]
+    fn tied_head_is_served_and_g12_is_never_dropped() {
+        use super::super::ckpt::Ckpt;
+        use super::super::codegen::Design;
+        use super::super::component::Component;
+        use super::super::program::{HeadKind, ProgramSpec};
+        let plan = G12Plan::derive(&spec12(), WaferDims::CS3, goals());
+        let params: Vec<(String, String)> = plan
+            .params()
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let program = ProgramSpec::from_params(Design::Serve8bRegion, &params).unwrap();
+        assert!(program.gemma12().is_some() && program.head.kind == HeadKind::Untied);
+        // A tied checkpoint: embed only, no `head`.
+        let tied = Ckpt::synthetic([("embed".to_string(), vec![262_144, 3840])]);
+        assert!(tied.tied_head().unwrap());
+        program.head.validate(&program, &tied).expect("the tied head on G12");
+        // 0389's params: the same without G12.
+        let no_g12: Vec<_> = params.iter().filter(|(k, _)| k != "G12").cloned().collect();
+        let err = ProgramSpec::from_params(Design::Serve8bRegion, &no_g12).unwrap_err();
+        assert!(err.contains("G12:1"), "{err}");
+        assert!(ProgramSpec::infer_design(&no_g12).is_ok_and(|d| d == Design::Serve8bRegion));
+    }
+
     /// E2B (per-layer embeddings, a shared tail) is serve_g4's, not this plan's.
     #[test]
     fn e2b_is_refused() {
