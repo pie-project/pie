@@ -10,6 +10,10 @@ unsafe extern "C" {
     fn pie_wake();
 }
 
+unsafe extern "C" {
+    fn __wasm_call_ctors();
+}
+
 fn clock_ms() -> f64 {
     unsafe { pie_now() }
 }
@@ -24,6 +28,8 @@ fn wake() {
 
 #[wasm_bindgen]
 pub fn pie_init(log_filter: Option<String>) {
+    // Run the static constructors once; referencing this keeps wasm-ld from wrapping every export to rerun them.
+    unsafe { __wasm_call_ctors() };
     console_error_panic_hook::set_once();
     crate::log::install(log_filter.as_deref().unwrap_or("info"));
     web_std::time::set_clock(clock_ms);
