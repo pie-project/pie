@@ -1738,12 +1738,13 @@ impl BatchScheduler {
         while let Some(item) = pending.front() {
             match item {
                 QueuedItem::Launch(_) => {
+                    // a rotation moves work, it does not do any: counted as progress, a launch run and a held
+                    // close that rotate past each other kept the loop from ever parking (a tab spun at 100% CPU)
                     if Self::rotate_launch_for_wave_work(
                         pending,
                         in_flight_control.copies_only(),
                         !slot_blocks_lifecycle,
                     ) {
-                        progress = true;
                         continue;
                     }
                     break;
