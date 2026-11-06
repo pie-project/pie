@@ -2014,6 +2014,29 @@ mod tests {
         }
     }
 
+    /// XAC's colours on the regions of a Qwen3.5 (Q35R) program: `Q35R_XAC_PARAMS`.
+    #[test]
+    #[ignore]
+    fn q35r_xac_colours() {
+        let p = std::env::var("Q35R_XAC_PARAMS").expect("Q35R_XAC_PARAMS");
+        let lay = lay_of(&p);
+        let Layers::Units { units: u, .. } = lay.layers else { panic!("not serve8b_region") };
+        let units = u.units(&lay);
+        let t = Tables::new(units.clone(), 1, u.rtr).unwrap();
+        for v in units.iter().filter(|v| v.kind == Kind::Region) {
+            for py in 0..v.k.py {
+                for px in 0..v.k.px {
+                    let e = &t.pe[&(v.x0 + px, v.y0 + py)];
+                    let mut cs: Vec<u32> = e.routes.keys().copied().collect();
+                    cs.extend(e.recv.iter().chain(&e.send).map(|r| r[0]));
+                    cs.extend([e.relay, e.fwd_in]);
+                    let bad: Vec<u32> = cs.iter().copied().filter(|c| [0, 1, 2, 15, 16].contains(c) || (5..=10).contains(c)).collect();
+                    assert!(bad.is_empty(), "region {} pe {px},{py}: {bad:?}", v.idx);
+                }
+            }
+        }
+    }
+
     #[test]
     fn lever_d_units_and_tables() {
         let p = "PX:128,PY:152,Hc:27,Dc:8,Gs:16,Ic:112,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:56,\
