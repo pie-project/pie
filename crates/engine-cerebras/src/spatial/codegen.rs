@@ -3156,7 +3156,7 @@ mod tests {
     const Q35W_PINNED: &[(&str, &str)] = &[
         (
             "layout.csl",
-            "379cfb4749ee1a3ab70ee11e76dc7fa76af227313a55f5b055a78020f2c2ff82",
+            "e1955334f5a19320fc3b7118bc7d6351e27f19ac0ae03f932b2a3e4e30846072",
         ),
         (
             "gdn_pe.csl",
@@ -3164,7 +3164,7 @@ mod tests {
         ),
         (
             "attn_pe.csl",
-            "187150bfa8b4f663b3299d025c3721b060c223b2925172a24225fd4c9085331a",
+            "ed19cf829844464ebc647e1feb8caff55241e27eb689d8923c4d94fb70a32587",
         ),
         (
             "head_pe.csl",

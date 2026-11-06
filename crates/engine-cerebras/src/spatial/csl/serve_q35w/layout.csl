@@ -18,6 +18,8 @@ param Ic: u16;
 param Tc: u16;
 param W16: u16;
 param NP: u16;
+// The attention units' NP (0: NP; the GDN units take NP).
+param NPA: u16 = 0;
 param KV16: u16;
 param PROF: u16;
 // GRID 1: Fork 8's qwen2d_paged (B lanes over a paged KV pool; square grids
@@ -148,7 +150,7 @@ layout {
           @set_tile_code(x, y, "attn_pe.csl", .{
             .memcpy_params = mp,
             .P = PX, .Hc = Hc, .Dc = Dc, .Gs = Gs, .Ic = Ic, .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC,
-            .Qh = Qh, .W16 = W16, .NP = NP,
+            .Qh = Qh, .W16 = W16, .NP = if (NPA == 0) NP else NPA,
             .GW = GW, .GH = GH, .NL = GW * GH, .F = F, .HEADMODE = HEADMODE,
             .S2D_VMC = HVMC, .S2D_VMAT = HR2X + 1, .S2D_DBG = DBG, .KVST = KVST,
             .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,

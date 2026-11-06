@@ -341,7 +341,7 @@ impl Q35Plan {
             .enumerate()
             .filter(|(_, k)| **k == LayerKind::Attention)
             .fold(0usize, |m, (l, _)| m | 1 << l);
-        vec![
+        let mut params = vec![
             ("Q35", 1),
             ("PX", g.p),
             ("PY", g.p),
@@ -378,7 +378,10 @@ impl Q35Plan {
             ("HR", self.spec.hidden),
             ("Tc", super::plan::TC),
             ("W16", usize::from(g.w16)),
-            ("NP", 3),
+            // W16: the GDN units' x in two bf16 parts (16 bits of x; 4B
+            // identical to its f32 golden on CS-3, 0374), the attention
+            // units' in three (NPA: at NP 2 their PE keeps 16 B).
+            ("NP", if g.w16 { 2 } else { 3 }),
             ("KV16", 0),
             ("PROF", 0),
             ("GRID", 1),
@@ -391,7 +394,11 @@ impl Q35Plan {
             ("WF32", usize::from(!g.w16)),
             ("DBG", 0),
             ("iters", 1),
-        ]
+        ];
+        if g.w16 {
+            params.push(("NPA", 3));
+        }
+        params
     }
 }
 
@@ -557,6 +564,19 @@ mod tests {
             p.head
         );
         println!("4b params: {}", SpatialPlan::extra(&p.params()));
+        // The program identical to its golden on CS-3 (0374: GDN NP 2,
+        // attention NPA 3), as a set.
+        let mut got: Vec<String> = SpatialPlan::extra(&p.params())
+            .split(',')
+            .map(String::from)
+            .collect();
+        let mut want: Vec<String> = "Q35:1,PX:128,PY:128,Hc:20,Ic:72,GK:8,DK:16,VH:2,DV:16,CW:4,Gs:32,Dc:8,Qh:4,ROT:64,PS:16,NB:2,E:1,B:1,MC:1,KINDS:2290649224,GW:4,GH:8,CAP:64,HEADMODE:2,F:432,HH:864,Vr:288,Gx:16,Gy:18,Gb:1,vocab:248320,HR:2560,Tc:32,W16:1,NP:2,NPA:3,KV16:0,PROF:0,GRID:1,PASSES:3,UNTIED:0,CERT:0,MODE:0,OVL:0,VMC:1,WF32:0,DBG:0,iters:1"
+            .split(',')
+            .map(String::from)
+            .collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
         // 9B: 32 dims a PE leave 256 vocabulary rows, 970 head rows, whose
         // feeder row (485) has no even group; and its Gated DeltaNet unit
         // outgrows a PE at bf16 (both: a later layout).

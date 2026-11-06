@@ -657,6 +657,47 @@ fn exp_poly(buf: mem1d_dsd, tmp: mem1d_dsd) void {
   while (c < 8) : (c += 1) { @fmuls(buf, buf, buf); }
 }
 fn exp_inplace(buf: mem1d_dsd, tmp: mem1d_dsd) void { exp_poly(buf, tmp); }
+// The gates as vectors over every lane (GATEV: the scores' and the trees'
+// buffers, dead after the values, hold 2 x GN words): with e = exp(-|g|) and
+// r = 1/(1 + e) (sigmoid(|g|), by silu_col's Newton steps), sigmoid(g) =
+// 0.5 + sign(g) (r - 0.5), g's sign bit copied into r - 0.5 (>= 0).
+const GN: u16 = B * Qh * Dc;
+const GATEV: bool = 2 * Dc <= TC;
+const ga_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> s[i] });
+const gr_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> s[@as(i16, GN) + i] });
+const ge_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> et[i] });
+const gt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> et[@as(i16, GN) + i] });
+const gg_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> qkv[@as(i16, GT0) + i] });
+const go_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{GN} -> act[i] });
+var g16 = @zeros([1]u16);
+const g16_t = @get_dsd(mem1d_dsd, .{ .base_address = &g16[0], .extent = GN });
+// An f32 run's u16 halves (low: hi 0; high: hi 1).
+fn halves(p: *f32, hi: u16) mem1d_dsd {
+  const d = @set_dsd_stride(@set_dsd_base_addr(g16_t, @ptrcast([*]u16, p)), 2);
+  return if (hi == 1) @increment_dsd_offset(d, 1, u16) else d;
+}
+fn gate_sigmoid() void {
+  @fabss(ga_d, gg_d);
+  @fnegs(ge_d, ga_d);
+  exp_poly(ge_d, gt_d);
+  @fadds(ga_d, ge_d, 1.0);
+  @fmuls(gr_d, ga_d, -0.47058823529411764);
+  @fadds(gr_d, gr_d, 1.411764705882353);
+  var it: u16 = 0;
+  while (it < 3) : (it += 1) {
+    @fmuls(gt_d, ga_d, gr_d);
+    @fnegs(gt_d, gt_d);
+    @fadds(gt_d, gt_d, 2.0);
+    @fmuls(gr_d, gr_d, gt_d);
+  }
+  @fadds(gr_d, gr_d, -0.5);
+  const sg = halves(&et[GN], 0);
+  @and16(sg, halves(&qkv[GT0], 1), @as(u16, 0x8000));
+  const rh = halves(&s[GN], 1);
+  @or16(rh, rh, sg);
+  @fadds(gr_d, gr_d, 0.5);
+  @fmuls(go_d, go_d, gr_d);
+}
 fn silu_col(e: u16) void {
   const g = at(g_col, e);
   const u = at(u_col, e);
@@ -880,11 +921,15 @@ fn layer() void {
   mark(6);
   allreduce(false, o_all, B * Qh * Dc);
   // The gates: o *= sigmoid(gate), element by element (Qh Dc a lane).
-  b = 0;
-  while (b < dims[0]) : (b += 1) {
-    var i: u16 = 0;
-    while (i < Qh * Dc) : (i += 1) {
-      act[b * Qh * Dc + i] *= 1.0 / (1.0 + math.exp_f32(-qkv[GT0 + b * Qh * Dc + i]));
+  if (GATEV) {
+    gate_sigmoid();
+  } else {
+    b = 0;
+    while (b < dims[0]) : (b += 1) {
+      var i: u16 = 0;
+      while (i < Qh * Dc) : (i += 1) {
+        act[b * Qh * Dc + i] *= 1.0 / (1.0 + math.exp_f32(-qkv[GT0 + b * Qh * Dc + i]));
+      }
     }
   }
   mark(7);
