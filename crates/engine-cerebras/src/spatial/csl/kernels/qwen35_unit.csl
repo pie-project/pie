@@ -622,6 +622,10 @@ var vc: [NLA * KCN + 1]KS align(16) = @zeros([NLA * KCN + 1]KS);
 var vc_ptr: [*]KS = &vc;
 var vc_dsd = if (KV16 == 1) @get_dsd(mem1d_dsd, .{ .base_address = &kdummy, .extent = Dc })
              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> vc[i + 1] });
+// The f32 pool's append DSDs (KV16 0), based at a run's first cell.
+var kdummy32 = @zeros([1]f32);
+const kap_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &kdummy32, .extent = DHc });
+const vap_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &kdummy32, .extent = Dc });
 fn kv_store(v: f32) KS {
   if (KV16 == 1) {
     const u = @bitcast(u32, v);
@@ -737,6 +741,12 @@ var kr = @zeros([B]f32);
 var qr = @zeros([B]f32);
 var beta = @zeros([B * VH]f32);
 var decay = @zeros([B * VH]f32);
+const beta_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VH} -> beta[i] });
+const decay_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VH} -> decay[i] });
+const vh_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VH} -> pj[i] });
+const gab_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VH} -> gab[i] });
+var zz = @zeros([VH]f32);
+const zz_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VH} -> zz[i] });
 // The state's reads [b][VH][S^T k | S^T q | k . q], down the columns.
 const RN: u16 = B * VH * GNR;
 var rd = @zeros([RN]f32);
@@ -765,6 +775,7 @@ var gd1 = @zeros([NT1]f32);
 const ga1_d = if (GA_ET) @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> et[i] })
               else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> ga1[i] });
 const gt1_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> gt1[i] });
+fn ge1_d_at(j: u16) f32 { return if (GE_RD) rd[j] else ge1[j]; }
 const ge1_d = if (GE_RD) @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> rd[i] })
               else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> ge1[i] });
 const gr1_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> gr1[i] });
@@ -1132,11 +1143,20 @@ fn attn_layer() void {
     while (e < dims[1]) : (e += 1) {
       if (eblk(b, e) != NONE and epg(b, e) == pg) {
         const blk = @as(u16, eblk(b, e));
+        if (KV16 == 0) {
+          // (an f32 pool: k's two halves into the slot column by stride PS, v's run)
+          const k0 = 1 + la * KCN + blk * Dc * PS + oo;
+          const kh = (b * NH + Qh) * DHc;
+          @fmovs(@set_dsd_stride(@set_dsd_base_addr(kap_dsd, @ptrcast([*]f32, &kc[k0])), PS), at(qd_dsd, kh));
+          @fmovs(@set_dsd_stride(@set_dsd_base_addr(kap_dsd, @ptrcast([*]f32, &kc[k0 + DHc * PS])), PS), at(qd_dsd, QH + kh));
+          @fmovs(@set_dsd_base_addr(vap_dsd, @ptrcast([*]f32, &vc[1 + la * KCN + blk * PS * Dc + oo * Dc])), at(v_dsd, b * Dc));
+        } else {
         var d: u16 = 0;
         while (d < dims[8]) : (d += 1) {   // (rolled)
           const kidx = (if (d < DHc) 0 else QH) + (b * NH + Qh) * DHc + d % DHc;
           kc[1 + la * KCN + blk * Dc * PS + d * PS + oo] = kv_store(qkv[kidx]);
           vc[1 + la * KCN + blk * PS * Dc + oo * Dc + d] = kv_store(qkv[QKN + b * Dc + d]);
+        }
         }
       }
     }
@@ -1299,17 +1319,33 @@ fn gdn_layer() void {
     const k4 = (b * KHN + kh) * 4;
     qr[b] = qk4[k4] * rsqrt(qk4[k4 + 2] + 1.0e-6) * qscale;
     kr[b] = qk4[k4 + 1] * rsqrt(qk4[k4 + 3] + 1.0e-6);
-    // (a v head at a time, the trip count at run time: one copy of the code)
+    // The gates as vectors over the v heads (the shared sigmoid core, no
+    // math library): beta = sigmoid(b) (the gate's sign trick); with z = a +
+    // dt_bias, decay = exp(A softplus(z)), softplus = max(z, 0) + ln(1 + e),
+    // e = exp(-|z|); ln as 2 atanh(e / (2 + e)); the last exp (of a value <= 0)
+    // as the core's exp(-|x|).
+    const pb0 = b * NPJ + NCH + NV;
+    sig_r(at(vh_dsd, pb0), VH);
+    const rv = @set_dsd_length(gr1_d, VH);
+    @fadds(rv, rv, -0.5);
+    const sgv = @set_dsd_length(halves(&gt1[0], 0), VH);
+    @and16(sgv, @set_dsd_length(halves(&pj[pb0], 1), VH), @as(u16, 0x8000));
+    const rhv = @set_dsd_length(halves(&gr1[0], 1), VH);
+    @or16(rhv, rhv, sgv);
+    @fadds(at(beta_dsd, b * VH), rv, 0.5);
+    @fadds(zz_dsd, at(vh_dsd, pb0 + VH), at(gab_dsd, lg * 2 * VH + VH));
+    sig_r(zz_dsd, VH);
     var j: u16 = 0;
     while (j < dims[6]) : (j += 1) {
-      const bv = pj[b * NPJ + NCH + NV + j];
-      const av = pj[b * NPJ + NCH + NV + VH + j] + gab[lg * 2 * VH + VH + j];
-      const e1 = math.exp_f32(-bv);
-      const e2 = math.exp_f32(-(if (av > 0.0) av else -av));
-      beta[b * VH + j] = recip(1.0 + e1);
-      const sp = (if (av > 0.0) av else 0.0) + math.log_f32(1.0 + e2);
-      decay[b * VH + j] = math.exp_f32(gab[lg * 2 * VH + j] * sp);
+      const z = zz[j];
+      const e = ge1_d_at(j);
+      const t = e * recip(2.0 + e);
+      const t2 = t * t;
+      const ln = 2.0 * t * (1.0 + t2 * (1.0 / 3.0 + t2 * (0.2 + t2 * (1.0 / 7.0 + t2 * (1.0 / 9.0 + t2 * (1.0 / 11.0 + t2 * (1.0 / 13.0 + t2 * (1.0 / 15.0))))))));
+      zz[j] = gab[lg * 2 * VH + j] * ((if (z > 0.0) z else 0.0) + ln);
     }
+    sig_r(zz_dsd, VH);
+    @fmovs(at(decay_dsd, b * VH), @set_dsd_length(ge1_d, VH));
   }
   mark(2);
   axis_y();
