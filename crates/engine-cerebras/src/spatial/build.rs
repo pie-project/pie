@@ -1474,10 +1474,11 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             // (with q/k norms, Qwen3-8B: the exact bits alone, 241 - 2, 8 and 256 move its
             // teacher-forced set; 0534: TRM 245 kept 0529's 14 mismatches)
             trim: if cfg.trim {
-                (if plan.spec.qk_norm { 241 } else { 507 })
+                (if plan.spec.qk_norm { 241 } else { 1019 })
                     | (usize::from(cfg.grid_levers && cfg.f16accg) << 2)
-                    // (silu16: TRM 1024, the regions' act in f16, no act all-reduce; inexact)
-                    | (usize::from(cfg.silu16 && !plan.spec.qk_norm) << 10)
+                    // (silu16: TRM 1024, the regions' act in f16, no act all-reduce; inexact;
+                    // with 4096, 512's f16 gammas in place, so that the region fits beside 512)
+                    | (if cfg.silu16 && !plan.spec.qk_norm { 1024 | 4096 } else { 0 })
                     // (and 8192: the grids too, when they take the cuts)
                     | (usize::from(cfg.silu16 && !plan.spec.qk_norm && cfg.grid_levers && cfg.f16accg) << 13)
                     // (xg16: TRM 512 + 4096, x g in f16 with in-place f16 gammas; inexact)
@@ -3064,14 +3065,14 @@ mod llama31_8b {
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1,TRM:511,ARY:16,HVC:1")));
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1,TRM:1023,ARY:16,HVC:1")));
         cfg.arfs = true;
         let (d, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
         let want7 = want.replace("ARF:3", "ARF:7");
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:511,ARY:16,HVC:1")));
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:1023,ARY:16,HVC:1")));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         for (n, text) in d.files_with(lay.model.variant()).unwrap() {
             if n == "region_pe.csl" || n == "grid_pe.csl" {
@@ -3080,18 +3081,18 @@ mod llama31_8b {
                 assert!(text.contains("(trm 64)") && text.contains("(arfs)"), "{n}");
             }
         }
-        // + silu16: TRM 9727 (0538's sp538_t21): the units' act in f16, no act all-reduce
+        // + silu16: TRM 14335 (0538's sp538_t20): the units' act in f16, no act all-reduce
         cfg.silu16 = true;
         let (d, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:9727,ARY:16,HVC:1")));
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:14335,ARY:16,HVC:1")));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         for (n, text) in d.files_with(lay.model.variant()).unwrap() {
             assert_eq!(text.contains("(trm 1024)"), n == "region_pe.csl" || n == "grid_pe.csl", "{n}");
         }
-        // + xg16: TRM 14335 (0538's sp538_t20)
+        // + xg16: the same (512 and 4096 already)
         cfg.xg16 = true;
         let (_, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();

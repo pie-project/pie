@@ -277,7 +277,9 @@ pub const RAN: &[Ran] = &[
                  1,824.0, 1,805.8, 1,820.5, 1,805.7 = 94.6-95.6% of bare (rep 1 1,455.6: the \
                  host fire stall), every stream = golden for 512; + the segment all-reduce \
                  as streamed halves with the kernels' ARF constant fixed (ARF 7) 1,927.8 / \
-                 1,927.2 (0535, regions 34.35-34.51k a pass), golden for 512, 0 mismatches",
+                 1,927.2 (0535, regions 34.35-34.51k a pass), golden for 512, 0 mismatches; + x g \
+                 in f16 (TRM 1023) 1,946.8 / 1,946.3 (0537, regions 33.97-34.14k), golden for \
+                 512, 0 mismatches",
     },
     Ran {
         design: Design::Serve8bRegion,
