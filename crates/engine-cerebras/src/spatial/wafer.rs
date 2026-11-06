@@ -759,7 +759,7 @@ impl WaferModel {
     ) -> R<Vec<VmStep>> {
         use super::guest4::wafer;
         self.unstaged()?;
-        if self.design.hybrid().is_some() {
+        if self.design.hybrid().is_some() || self.design.q35r() {
             return Err(
                 "the head's VM samples no serve_q35 lane (its states run on fire_batch)".into(),
             );
@@ -998,7 +998,7 @@ impl WaferModel {
                 "spatial wafer: batch totals"
             );
         }
-        let recurrent = grid.hybrid().is_some();
+        let recurrent = grid.hybrid().is_some() || grid.q35r();
         if recurrent {
             self.seat_state(lanes)?;
         }
@@ -1117,6 +1117,10 @@ impl WaferModel {
 
     /// Lane slot 0's recurrent state zeroed (its conv window and state).
     fn reset_state(&mut self) -> R<()> {
+        // (serve8b_region Q35R: a pass at write slot 0 zeroes the lane's state)
+        if self.design.q35r() {
+            return Ok(());
+        }
         self.rt
             .launch("reset", &[0])
             .map_err(|e| format!("the recurrent state's reset: {e}"))
@@ -1537,7 +1541,7 @@ impl Wafer {
                             thread: None,
                             vocab: m.design.vocab(),
                             hidden: m.design.hidden(),
-                            recurrent: m.design.hybrid().is_some(),
+                            recurrent: m.design.hybrid().is_some() || m.design.q35r(),
                             group: 1,
                             row_order: match row_order_env(m.design.paged()) {
                                 Ok(o) => o,

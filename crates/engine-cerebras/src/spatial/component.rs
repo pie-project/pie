@@ -260,6 +260,9 @@ impl Component for Layers {
                 dev,
             ),
             Layers::Strips { .. } => super::serve8b::place_layers(spec, w.ckpt, w.rope, dev),
+            Layers::Units { units, .. } if spec.q35r() => {
+                super::serve_q35r::place_layers(spec, units, w.ckpt, dev)
+            }
             Layers::Units { units, .. } => {
                 super::serve8b_region::place_layers(spec, units, w.ckpt, w.rope, dev)
             }
@@ -313,6 +316,8 @@ impl Component for super::program::Head {
             // Gemma 4 on serve8b_region (G12): the u4 head and strip both
             // read the tied embedding's codes.
             HeadKind::Untied if spec.gemma12().is_some() && ckpt.tied_head()? => Ok(()),
+            // (Qwen3.5 on serve8b_region: a tied head's tiles are the embedding's)
+            HeadKind::Untied if spec.q35r() && !ckpt.has("head") && ckpt.tied_head()? => Ok(()),
             HeadKind::Untied | HeadKind::Triples if !ckpt.has("head") => Err(
                 "the checkpoint has no `head`; serve8b serves untied models (a tied one would \
                  need the embedding as the head)"
@@ -330,6 +335,11 @@ impl Component for super::program::Head {
     fn place(&self, spec: &ProgramSpec, w: &Weights, dev: &mut dyn Device) -> R<()> {
         match self.kind {
             HeadKind::Tied => super::serve2d::place_head(spec, w.ckpt, dev),
+            HeadKind::Untied if spec.q35r() => {
+                let table = if w.ckpt.has("head") { "head" } else { "embed" };
+                super::serve8b::head_of(spec, w.ckpt, dev, 2 * spec.hc(), table, true)?;
+                super::serve8b::embed(spec, w.ckpt, dev)
+            }
             HeadKind::Untied => {
                 super::serve8b::head(spec, w.ckpt, dev)?;
                 super::serve8b::embed(spec, w.ckpt, dev)

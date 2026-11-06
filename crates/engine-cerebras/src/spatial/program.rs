@@ -992,6 +992,19 @@ impl ProgramSpec {
         )
     }
 
+    /// Qwen3.5 on serve8b_region (`Q35R 1`: `codegen::serve8b_region_q35`,
+    /// placed by `spatial::serve_q35r`).
+    #[must_use]
+    pub fn q35r(&self) -> bool {
+        self.design == Design::Serve8bRegion && self.knobs.get("Q35R").is_some_and(|v| v.trim() == "1")
+    }
+
+    /// A knob's value as a number (`None`: unset or not a number).
+    #[must_use]
+    pub fn knob_num(&self, k: &str) -> Option<u64> {
+        self.knobs.get(k).and_then(|v| v.trim().parse::<u64>().ok())
+    }
+
     /// Whether the layers' weights and the head's tiles are bf16 (`W16` 1,
     /// `WF32` 0: serve_q35 past 0.8B); else f32.
     #[must_use]
@@ -1017,6 +1030,9 @@ impl ProgramSpec {
         }
         if self.gemma12().is_some() {
             return super::codegen::serve8b_region_g12(variant);
+        }
+        if self.q35r() {
+            return super::codegen::serve8b_region_q35(variant);
         }
         if self.design == Design::ServeGptoss {
             // (the attention units' levers from the model, the MoE units' MOE knob)
@@ -1700,19 +1716,21 @@ fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
     headmode(get, "serve8b_region")?;
     // A G12 build's layout defaults `G12` to 1, so cslc's out.json omits it
     // when the params do; its Gemma knobs without it would read as a Qwen /
-    // Llama program (no norms' kinds, an untied head).
+    // Llama program (no norms' kinds, an untied head). (`KINDS` is also
+    // qwen35_unit's layer mix under Q35R 1.)
+    let q35r = get.opt("Q35R") == Some(1);
     if get.opt("G12") != Some(1)
         && let Some(k) = ["KINDS", "QhG", "GsG", "WIN", "W4BUF", "ESB"]
             .into_iter()
-            .find(|k| get.opt(k).is_some())
+            .find(|k| get.opt(k).is_some() && !(q35r && *k == "KINDS"))
     {
         return Err(format!(
             "serve8b_region: param {k} is serve8b_region_g12's (Gemma 4) but the params state \
              no G12:1; pass G12:1 (the layout's default is not in out.json)"
         ));
     }
-    // (G12 check builds may keep an f32 pool: KV16 0.)
-    let kv16_ok = get.req("KV16")? == 1 || get.opt("G12") == Some(1);
+    // (G12 check builds and qwen35_unit's (Q35R 1) may keep an f32 pool: KV16 0.)
+    let kv16_ok = get.req("KV16")? == 1 || get.opt("G12") == Some(1) || q35r;
     if get.req("W16")? != 1 || !kv16_ok || get.opt("KVCP").unwrap_or(0) != 0 {
         return Err("serve8b_region keeps weights and KV in bf16 and copies pages by the host (W16 1, KV16 1, KVCP 0)".into());
     }

@@ -72,6 +72,7 @@ pub mod serve8b_region;
 pub mod serve_g4;
 pub mod serve_gptoss;
 pub mod serve_q35;
+pub mod serve_q35r;
 pub mod shapes;
 pub mod u4;
 pub mod u4g12;

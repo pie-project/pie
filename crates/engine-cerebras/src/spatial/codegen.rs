@@ -27,6 +27,8 @@ mod src {
     /// Gemma 4 dense's serve8b_region unit (u4g64, sliding and global
     /// layers; `serve8b_region_g12`).
     pub const GEMMA4_UNIT: &str = include_str!("csl/kernels/gemma4_unit.csl");
+    /// Qwen3.5's serve8b_region unit (both layer kinds; `Q35R 1`).
+    pub const QWEN35_UNIT: &str = include_str!("csl/kernels/qwen35_unit.csl");
     /// The fast softmax levers S1-S3 as (old, new) text pairs on
     /// qwen2d_paged8b's or qwen2d_region's pe.csl.
     pub const SOFTMAX_S123: &str = include_str!("csl/kernels/softmax_s123.json");
@@ -3127,6 +3129,51 @@ fn f16_head(text: &str) -> String {
     out
 }
 
+/// qwen35_unit's text where it differs from qwen2d_region's at a lever's
+/// anchor (`(stock, unit's)`), applied to both sides of every pair on that
+/// unit: its c_bc drains, its SiLU's exp in the shared sigmoid core.
+const Q35R_ANCHORS: &[(&str, &str)] = &[
+    (
+        "fn set_axis(x: bool) void {\n  if (GY != 0) {",
+        "fn set_axis(x: bool) void {\n  bc_drain();\n  if (GY != 0) {",
+    ),
+    (
+        "  if (px % Gs == R1) { @fmovs(fout(q_bc_out, n), buf); }\n",
+        "  if (px % Gs == R1) { @fmovs(fout(q_bc_out, n), buf); bc_drain(); }\n",
+    ),
+    (
+        "  if (px % Gs == R1) { @fmovs(fout(q_bc_out, n), buf); oq_drain(); }\n",
+        "  if (px % Gs == R1) { @fmovs(fout(q_bc_out, n), buf); bc_drain(); }\n",
+    ),
+    ("  exp_poly(te_d, tt_d);           // e = exp(-|g|)\n", "  exp_poly(e_, t_);\n"),
+    ("  exp_fast(te_d, tt_d, &tt, MC);  // e = exp(-|g|)\n", "  exp_fast(e_, t_, &gt1, n);\n"),
+    ("const EX_N: u16 = mx2(ACTN, MC);", "const EX_N: u16 = mx2(mx2(ACTN, MC), NT1);"),
+    // LSE's group shifts: the Y axis's from values made once (a region's 234
+    // rows take no power-of-two group).
+    (
+        "comptime { @comptime_assert((Gs & (Gs - 1)) == 0 and (GYv & (GYv - 1)) == 0 and HROUTE == 1); }",
+        "comptime { @comptime_assert((Gs & (Gs - 1)) == 0 and HROUTE == 1); }",
+    ),
+    (
+        "var ar_qt: u16 = 0;    // axis_id / ga()\n",
+        "var ar_qt: u16 = 0;    // axis_id / ga()\n\
+// (qwen35_unit: the Y axis's groups by division, once)\n\
+var NG_Y: u16 = 0;\nvar R2_Y: u16 = 0;\nvar AR_RY: u16 = 0;\nvar AR_QY: u16 = 0;\n\
+fn y_groups() void {\n  NG_Y = PY / GYv;\n  R2_Y = (NG_Y / 2) * GYv + GYv / 2;\n  AR_RY = py % GYv;\n  AR_QY = py / GYv;\n}\n",
+    ),
+    (
+        "    NG = alen >> gsh();\n    R2 = ((NG >> 1) << gsh()) + ra();\n",
+        "    if (NG_Y == 0) { y_groups(); }\n    NG = if (x) alen >> gsh() else NG_Y;\n    R2 = if (x) ((NG >> 1) << gsh()) + ra() else R2_Y;\n",
+    ),
+    (
+        "    ar_r = axis_id & (ga() - 1);\n    ar_qt = axis_id >> gsh();\n",
+        "    ar_r = if (x) axis_id & (ga() - 1) else AR_RY;\n    ar_qt = if (x) axis_id >> gsh() else AR_QY;\n",
+    ),
+];
+
+/// The marker of qwen35_unit's text (its first line).
+const Q35R_MARK: &str = "// qwen35_unit: ";
+
 fn apply_reps(name: &str, json: &str, text: &str, tag: &str) -> R<String> {
     let reps: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("{name}.json: {e}"))?;
@@ -3141,12 +3188,20 @@ fn apply_reps(name: &str, json: &str, text: &str, tag: &str) -> R<String> {
         g12_reps(name, &mut reps)?;
     }
     let mut s = text.to_string();
+    let q35r = text.starts_with(Q35R_MARK);
+    let unit = |t: &str| {
+        Q35R_ANCHORS
+            .iter()
+            .fold(t.to_string(), |t, (a, b)| t.replace(a, b))
+    };
     for (i, r) in reps.iter().enumerate() {
         let Some(r) = r else { continue };
         let (old, new) = (
             r["old"].as_str().unwrap_or(""),
             r["new"].as_str().unwrap_or(""),
         );
+        let (old_u, new_u) = (unit(old), unit(new));
+        let (old, new) = if q35r { (old_u.as_str(), new_u.as_str()) } else { (old, new) };
         let n = s.matches(old).count();
         if old.is_empty() || n != 1 {
             return Err(format!("{name}: {tag} changed: anchor {i} found {n} times"));
@@ -4348,6 +4403,149 @@ fn serve8b_region_files(pipe: bool, grid: &str, region: &str, variant: Variant) 
         ("vm_pe.csl", s8br_vm(pipe)?),
     ])
 }
+
+/// The names qwen35_unit exports past serve8b_region's grids' (`Q35R 1`).
+const Q35R_NAMES: &[(&str, &str)] = &[
+    ("wm", "WS"),
+    ("cw", "f32"),
+    ("cst", "f32"),
+    ("gab", "f32"),
+    ("nw", "f32"),
+    ("st", "f32"),
+    ("lkind", "u16"),
+];
+
+/// serve8b_region's build directory with Qwen3.5's units (`Q35R 1`):
+/// qwen35_unit for the grids and the regions (one image each, both layer
+/// kinds; the host's `lkind` says a layer's), the layout's Qwen3.5 params
+/// (KD, GK/DK/DV for the grids, RGK/RDK/RDV for the regions, VH, CW, the
+/// regions' slots RNLA/RNLG; KINDS for the host), every other program the
+/// units' names as one-word dummies. serve8b_region's own files untouched.
+pub fn serve8b_region_q35(variant: Variant) -> R<Vec<File>> {
+    let mut files = serve8b_region(false, variant)?;
+    for (name, text) in &mut files {
+        *text = match *name {
+            "layout.csl" => q35r_layout(text)?,
+            "grid_pe.csl" | "region_pe.csl" => {
+                s8br_unit("qwen2d_region", src::QWEN35_UNIT, false, variant)?
+            }
+            "paths.csl" | "rt.csl" => continue,
+            _ => q35r_dummies(text),
+        };
+    }
+    Ok(files)
+}
+
+fn q35r_layout(text: &str) -> R<String> {
+    let mut s = patch(
+        text,
+        "param HEADMODE: u16;",
+        "// Q35R 1: Qwen3.5's units (codegen.rs `serve8b_region_q35`: qwen35_unit as\n\
+// both the grids and the regions). KINDS bit L: layer L attends (the host's;\n\
+// passed on to neither). The GDN's k head dim, columns a k head, q/k and v\n\
+// dims a column (grids; R*: the regions), v heads a k head, conv width; the\n\
+// regions' attention and GDN layer slots.\n\
+param Q35R: u16 = 0;\nparam KINDS: u32 = 0;\nparam KD: u16 = 1;\nparam GK: u16 = 1;\nparam DK: u16 = 1;\n\
+param DV: u16 = 1;\nparam RGK: u16 = 1;\nparam RDK: u16 = 1;\nparam RDV: u16 = 1;\nparam VH: u16 = 1;\n\
+param CW: u16 = 4;\nparam RNLA: u16 = 1;\nparam RNLG: u16 = 1;\nparam HEADMODE: u16;",
+        "q35r params",
+    )?;
+    s = patch(
+        &s,
+        ".KVCP = KVCP, .PROF = if (GPROF == 1) 1 else PROF, .GY = GY,",
+        ".KVCP = KVCP, .PROF = if (GPROF == 1) 1 else PROF, .GY = GY, .NLA = 1, .NLG = 1, .KD = KD, .GK = GK, .DK = DK, .VH = VH, .DV = DV, .CW = CW, .UK = q35r_grid_uk(x, y),",
+        "q35r grid params",
+    )?;
+    s = patch(
+        &s,
+        ".KVCP = KVCP, .PROF = PROF, .NL = RNL, .GY = RGY,",
+        ".KVCP = KVCP, .PROF = PROF, .NL = RNL, .GY = RGY, .NLA = q35r_region_n(x, y, 1), .NLG = q35r_region_n(x, y, 0), .KD = KD, .GK = RGK, .DK = RDK, .VH = VH, .DV = RDV, .CW = CW, .UK = q35r_region_uk(x, y),",
+        "q35r region params",
+    )?;
+    // A grid's one layer (the units' order: serve8b_region.rs `Units::units`)
+    // and its kind: the grid image carries that kind's code alone.
+    s = patch(
+        &s,
+        "layout {\n",
+        "// Q35R: a grid's layer kind (UK 1 attention, 2 GDN).\n\
+fn q35r_grid_uk(x: u16, y: u16) u16 {\n\
+  const band: u16 = XC / PX + 1;\n\
+  const l: u16 = if (x < XC) (XC - x + PX - 1) / PX\n\
+    else if (y < PY) 0\n\
+    else if (YD > 0) 1 + RC * RR * RNL + (y - YD) / PY\n\
+    else band + RC * RR * RNL + (y / PY - 1);\n\
+  return if (((KINDS >> l) & 1) == 1) 1 else 2;\n\
+}\n\
+// Q35R: a region's first layer (lever D with YD in region row RR - 2: the\n\
+// units' snake; else 0: unknown), its layers of a kind (attends 1: attention;\n\
+// RNLA / RNLG where unknown, at least 1) and its kinds' code bits.\n\
+fn q35r_region_l0(x: u16, y: u16) u16 {\n\
+  if (YD == 0 or RC != 2 or YD / RPY != RR - 2) { return 0; }\n\
+  const c = x / RPX;\n\
+  const r = y / RPY;\n\
+  const k: u16 = if (r + 2 < RR) 2 * r + (if (r % 2 == 0) 1 - c else c)\n\
+    else if (r + 2 == RR) (if (c == 0) 2 * (RR - 2) else 2 * (RR - 2) + 3)\n\
+    else (if (c == 0) 2 * (RR - 2) + 1 else 2 * (RR - 2) + 2);\n\
+  return 1 + k * RNL;\n\
+}\n\
+fn q35r_region_n(x: u16, y: u16, attends: u16) u16 {\n\
+  const l0 = q35r_region_l0(x, y);\n\
+  if (l0 == 0) { return if (attends == 1) RNLA else RNLG; }\n\
+  var n: u16 = 0;\n\
+  for (@range(u16, RNL)) |i| {\n\
+    if (((KINDS >> (l0 + i)) & 1) == attends) { n += 1; }\n\
+  }\n\
+  return if (n == 0) 1 else n;\n\
+}\n\
+fn q35r_region_uk(x: u16, y: u16) u16 {\n\
+  const l0 = q35r_region_l0(x, y);\n\
+  if (l0 == 0) { return 3; }\n\
+  var uk: u16 = 0;\n\
+  for (@range(u16, RNL)) |i| {\n\
+    uk |= if (((KINDS >> (l0 + i)) & 1) == 1) 1 else 2;\n\
+  }\n\
+  return uk;\n\
+}\n\nlayout {\n",
+        "q35r grid kinds",
+    )?;
+    let names: String = Q35R_NAMES
+        .iter()
+        .map(|(n, ty)| format!("  @export_name(\"{n}\", [*]{ty}, true);\n"))
+        .collect();
+    s = patch(
+        &s,
+        "  @export_name(\"rtab\", [*]u16, true);\n",
+        &format!("  @export_name(\"rtab\", [*]u16, true);\n{names}"),
+        "q35r names",
+    )?;
+    Ok(s)
+}
+
+/// A program's text with one-word dummies of the Qwen3.5 names it lacks.
+fn q35r_dummies(text: &str) -> String {
+    let own = exports(text);
+    let mut decls = Vec::new();
+    let mut lines = Vec::new();
+    for &(n, ty) in Q35R_NAMES {
+        if own.iter().any(|o| o == n) {
+            continue;
+        }
+        decls.push(format!(
+            "var q35r_d_{n} = @zeros([1]{ty});\nvar q35r_d_{n}_ptr: [*]{ty} = &q35r_d_{n};"
+        ));
+        lines.push(format!("  @export_symbol(q35r_d_{n}_ptr, \"{n}\");"));
+    }
+    if decls.is_empty() {
+        return text.to_string();
+    }
+    format!(
+        "{}\n// serve8b_region_q35: Qwen3.5's unit names.\n{}\ncomptime {{\n{}\n}}\n",
+        text.trim_end_matches('\n'),
+        decls.join("\n"),
+        lines.join("\n")
+    )
+}
+
 
 // ---------------------------------------------------------------- serve_gptoss
 
