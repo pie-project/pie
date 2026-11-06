@@ -839,8 +839,8 @@ pub fn gptoss_moe_lev(moe: u16) -> R<String> {
     if moe == 0 {
         return Ok(s);
     }
-    if moe != 1 {
-        return Err(format!("gen: gptoss_moe_lev: MOE {moe} unknown (1: the op cuts)"));
+    if moe != 1 && moe != 3 {
+        return Err(format!("gen: gptoss_moe_lev: MOE {moe} unknown (1: the op cuts, 3: and bf16 matvecs)"));
     }
     let w = |what: &str| format!("gptoss_moe_lev: {what}");
     let s = patch(
@@ -924,7 +924,152 @@ fn exp_fm(buf: mem1d_dsd, p: mem1d_dsd, pb: [*]f32, n: u16) void {\n\
 fn moe_mlp() void {\n",
         &w("exp_fm"),
     )?;
+    let s = if moe & 2 != 0 { moe_bf16(&s)? } else { s };
     Ok(format!("// gptoss_moe (MOE {moe}): codegen::gptoss_moe_lev\n{s}"))
+}
+
+/// MOE bit 2: the decoded MXFP4 values are bf16 (fp4 x 2^-126 in a bf16's
+/// bits; @fmachs keeps the denormals, payload portgpt_probe), so a tile's
+/// three planes decode into one u16 run (rows in input order) and each of its
+/// two block segments is one 16-bit matvec a part of x (NP bf16 parts, made
+/// once a lane for gate/up and once an expert for down): 2-4 map calls a tile
+/// instead of 4-6 f32 ones, 0.5 cycles a weight a part instead of 2. The
+/// decode buffer holds the three planes (SwiGLU's temps alias it; no zero low
+/// halves needed).
+fn moe_bf16(text: &str) -> R<String> {
+    let w = |what: &str| format!("gptoss_moe_lev MOE 2: {what}");
+    let s = patch(
+        text,
+        "var mdec: [mx2(DECN, 2 * SWN)]f32 align(16) = @zeros([mx2(DECN, 2 * SWN)]f32);   // low halves stay zero",
+        r#"// (moe2) a tile's three decoded planes as bf16 (3 DECN u16), SwiGLU's temps
+const MDN: u16 = mx2((3 * DECN + 1) / 2, 3 * SWN);
+var mdec: [MDN]f32 align(16) = @zeros([MDN]f32);
+// (moe2) x's NP bf16 parts (gate/up: the normed lane; down: an expert's act)
+// in the router's xpart (free once the routes are made)
+const MXL: u16 = XMAX;
+comptime { @comptime_assert(XMAX >= Hc and XMAX >= Ic and MDN >= 3 * SWN); }
+var mh16 = @get_dsd(mem1d_dsd, .{ .base_address = &wdummy, .extent = 1 });
+const mxp_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{MXL} -> xpart[i] });
+fn mparts(xv: mem1d_dsd, n: u16) void {
+  const res = @set_dsd_length(myb_v, n);
+  const tmp = @set_dsd_length(mvec_v, n);
+  @fmovs(res, xv);
+  var k: u16 = 0;
+  while (k < NP) : (k += 1) {
+    const part = @set_dsd_length(@increment_dsd_offset(mxp_d, @as(i16, k * MXL), @fp16()), n);
+    @fs2h(part, res);
+    if (k + 1 < NP) {
+      @fh2s(tmp, part);
+      @fsubs(res, res, tmp);
+    }
+  }
+  // (mvec's low halves stay zero: the scales' decode writes high halves only)
+  if (NP > 1) { @fmovs(tmp, 0.0); }
+}"#,
+        &w("mdec"),
+    )?;
+    let old = r#"  const dec = hi_at(&mdec[0], n3);
+  const yb2 = @set_dsd_length(myb_v, 2 * R);
+  @fmovs(yb2, 0.0);
+  var p: u16 = 0;
+  while (p < 3) : (p += 1) {
+    if (p == 0) { @and16(dec, src, @as(u16, 0x81C0)); }   // (moe1) no zero shift
+    else {
+      @sll16(dec, src, 3 * p);
+      @and16(dec, dec, @as(u16, 0x81C0));
+    }
+    const r0 = p * L3;
+    var seg: u16 = 0;
+    while (seg < 2) : (seg += 1) {
+      const lo = mx2(if (seg == 0) 0 else split, r0);
+      const hi = mn2(if (seg == 0) split else L, r0 + L3);
+      if (hi > lo) {
+        const yb = @set_dsd_length(at(myb_v, seg * R), R);
+        @load_to_dsr(mv_dest, yb, .{ .save_address = false });
+        @load_to_dsr(mv_src0, yb, .{ .save_address = false });
+        @load_to_dsr(mv_src1, @set_dsd_length(at(mdec_v, (lo - r0) * R), R), .{ .save_address = true });
+        @map(mv_step, @set_dsd_length(at(xv, lo), hi - lo));
+      }
+    }
+  }
+"#;
+    let new = r#"  // (moe2) the three planes into one bf16 run (rows in input order), then a
+  // 16-bit matvec a segment and part of x (mparts made them)
+  const m16 = @ptrcast([*]u16, &mdec[0]);
+  var p: u16 = 0;
+  while (p < 3) : (p += 1) {
+    const dec = u16_at(@ptrcast([*]u16, &m16[p * n3]), n3);
+    if (p == 0) { @and16(dec, src, @as(u16, 0x81C0)); }
+    else {
+      @sll16(dec, src, 3 * p);
+      @and16(dec, dec, @as(u16, 0x81C0));
+    }
+  }
+  const yb2 = @set_dsd_length(myb_v, 2 * R);
+  @fmovs(yb2, 0.0);
+  var sg: u16 = 0;
+  while (sg < 2) : (sg += 1) {
+    const slo: u16 = if (sg == 0) 0 else split;
+    const shi: u16 = if (sg == 0) split else L;
+    if (shi > slo) {
+      const yb = @set_dsd_length(at(myb_v, sg * R), R);
+      var kp: u16 = 0;
+      while (kp < NP) : (kp += 1) {
+        const wr = @set_dsd_length(@set_dsd_base_addr(mh16, @ptrcast([*]@fp16(), &m16[slo * R])), R);
+        @load_to_dsr(mv_dest, yb, .{ .save_address = false });
+        @load_to_dsr(mv_src0, yb, .{ .save_address = false });
+        @load_to_dsr(mv_src1, wr, .{ .save_address = true });
+        @map(mv16_step, @set_dsd_length(@increment_dsd_offset(mxp_d, @as(i16, kp * MXL + slo), @fp16()), shi - slo));
+      }
+    }
+  }
+"#;
+    let s = patch(&s, old, new, &w("mxmv"))?;
+    let s = patch(
+        &s,
+        "      @fmuls(xn_dsd, xn_dsd, sc * p2k);\n",
+        "      @fmuls(xn_dsd, xn_dsd, sc * p2k);\n      mparts(xn_dsd, Hc);   // (moe2)\n",
+        &w("gate/up parts"),
+    )?;
+    let s = patch(
+        &s,
+        "        @fmuls(a, a, w * p2k);\n",
+        "        @fmuls(a, a, w * p2k);\n        mparts(a, Ic);   // (moe2)\n",
+        &w("down parts"),
+    )?;
+    let s = patch(
+        &s,
+        "  @fmovs(sw_a_d, 0.0);\n  @fmovs(sw_e_d, 0.0);\n",
+        "",
+        &w("SwiGLU's re-zeroing (the bf16 run needs none)"),
+    )?;
+    // Memory for the three planes: SwiGLU's g in the decode run too (after
+    // its two temps), and the dead RoPE tables (never run, never written on
+    // a MoE unit) as one word.
+    let s = patch(
+        &s,
+        "var swg = @zeros([SWN]f32);\n",
+        "",
+        &w("swg"),
+    )?;
+    let s = patch(
+        &s,
+        "const sw_g_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SWN} -> swg[i] });",
+        "const sw_g_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{SWN} -> mdec[@as(i16, 2 * SWN) + i] });   // (moe2)",
+        &w("sw_g_d"),
+    )?;
+    let s = patch(
+        &s,
+        "var rot_c = @zeros([ROT_N * ROT_L * DHc]f32);\n",
+        "var rot_c = @zeros([1]f32);   // (moe2) RoPE never runs on a MoE unit\n",
+        &w("rot_c"),
+    )?;
+    patch(
+        &s,
+        "var rot_s = @zeros([ROT_N * ROT_L * DHc]f32);\n",
+        "var rot_s = @zeros([1]f32);\n",
+        &w("rot_s"),
+    )
 }
 
 /// gpt-oss's attention unit with the paged8b grids' levers (`v`, as
