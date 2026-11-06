@@ -3160,11 +3160,11 @@ const Q35R_ANCHORS: &[(&str, &str)] = &[
     // SPD's exp_fast with its two short loops rolled (trip counts from dims: -~0.4 KB a PE)
     (
         "  var c: u16 = 0;\n  while (c < 3) : (c += 1) {\n    @fadds(p, p, ex_a[c]);",
-        "  var c: u16 = 0;\n  while (c < dims[10]) : (c += 1) {\n    @fadds(p, p, ex_a[c]);",
+        "  var c: u16 = 0;\n  while (c < (if (EXR == 1) dims[10] else 3)) : (c += 1) {\n    @fadds(p, p, ex_a[c]);",
     ),
     (
         "  c = 0;\n  while (c < 6) : (c += 1) {\n    if (c > 0) { @fmuls(p, p, buf); }",
-        "  c = 0;\n  while (c < dims[11]) : (c += 1) {\n    if (c > 0) { @fmuls(p, p, buf); }",
+        "  c = 0;\n  while (c < (if (EXR == 1) dims[11] else 6)) : (c += 1) {\n    if (c > 0) { @fmuls(p, p, buf); }",
     ),
     // (HV) the pool by the layer's attention slot
     ("fn kvoff() u16 { return lw * KCN; }", "fn kvoff() u16 { return la * KCN; }"),
@@ -4469,19 +4469,19 @@ fn q35r_layout(text: &str) -> R<String> {
 param Q35R: u16 = 0;\nparam KINDS: u32 = 0;\nparam KD: u16 = 1;\nparam GK: u16 = 1;\nparam DK: u16 = 1;\n\
 param DV: u16 = 1;\nparam RGK: u16 = 1;\nparam RDK: u16 = 1;\nparam RDV: u16 = 1;\nparam VH: u16 = 1;\n\
 param CW: u16 = 4;\nparam RNLA: u16 = 1;\nparam RNLG: u16 = 1;\n\
-// NPG > 0: the GDN layers' bf16 parts of x (NP the attention layers').\nparam NPG: u16 = 0;\nparam HEADMODE: u16;",
+// NPG > 0: the GDN layers' bf16 parts of x (NP the attention layers').\nparam NPG: u16 = 0;\n// VGATE 1: the GDN gates as vectors; EXR 1: exp_fast's loops rolled (both: code for cycles).\nparam VGATE: u16 = 0;\nparam EXR: u16 = 0;\nparam HEADMODE: u16;",
         "q35r params",
     )?;
     s = patch(
         &s,
         ".KVCP = KVCP, .PROF = if (GPROF == 1) 1 else PROF, .GY = GY,",
-        ".KVCP = KVCP, .PROF = if (GPROF == 1) 1 else PROF, .GY = GY, .NLA = 1, .NLG = 1, .KD = KD, .GK = GK, .DK = DK, .VH = VH, .DV = DV, .CW = CW, .UK = q35r_grid_uk(x, y), .NPG = NPG,",
+        ".KVCP = KVCP, .PROF = if (GPROF == 1) 1 else PROF, .GY = GY, .NLA = 1, .NLG = 1, .KD = KD, .GK = GK, .DK = DK, .VH = VH, .DV = DV, .CW = CW, .UK = q35r_grid_uk(x, y), .NPG = NPG, .VGATE = VGATE, .EXR = EXR,",
         "q35r grid params",
     )?;
     s = patch(
         &s,
         ".KVCP = KVCP, .PROF = PROF, .NL = RNL, .GY = RGY,",
-        ".KVCP = KVCP, .PROF = PROF, .NL = RNL, .GY = RGY, .NLA = q35r_region_n(x, y, 1), .NLG = q35r_region_n(x, y, 0), .KD = KD, .GK = RGK, .DK = RDK, .VH = VH, .DV = RDV, .CW = CW, .UK = q35r_region_uk(x, y), .NPG = NPG,",
+        ".KVCP = KVCP, .PROF = PROF, .NL = RNL, .GY = RGY, .NLA = q35r_region_n(x, y, 1), .NLG = q35r_region_n(x, y, 0), .KD = KD, .GK = RGK, .DK = RDK, .VH = VH, .DV = RDV, .CW = CW, .UK = q35r_region_uk(x, y), .NPG = NPG, .VGATE = VGATE, .EXR = EXR,",
         "q35r region params",
     )?;
     // A grid's one layer (the units' order: serve8b_region.rs `Units::units`)

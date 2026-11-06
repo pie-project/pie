@@ -66,6 +66,8 @@ param VH: u16;         // GDN: v heads a k head
 param DV: u16;         // GDN: v dims a column, a v head (KD / GK)
 param CW: u16;         // GDN: the conv's width
 param NPG: u16 = 0;    // bf16 parts of x on a GDN layer (0: NP)
+param VGATE: u16 = 0;  // 1: the GDN gates as vectors (less code, more cycles)
+param EXR: u16 = 0;    // 1: SPD's exp_fast loops rolled (less code, a few cycles more)
 param UK: u16 = 3;     // the unit's layer kinds: bit 0 attention, bit 1 GDN (the other's code left out)
 param c_r1_0: color;
 param c_r1_1: color;
@@ -1319,6 +1321,7 @@ fn gdn_layer() void {
     const k4 = (b * KHN + kh) * 4;
     qr[b] = qk4[k4] * rsqrt(qk4[k4 + 2] + 1.0e-6) * qscale;
     kr[b] = qk4[k4 + 1] * rsqrt(qk4[k4 + 3] + 1.0e-6);
+    if (VGATE == 1) {
     // The gates as vectors over the v heads (the shared sigmoid core, no
     // math library): beta = sigmoid(b) (the gate's sign trick); with z = a +
     // dt_bias, decay = exp(A softplus(z)), softplus = max(z, 0) + ln(1 + e),
@@ -1346,6 +1349,20 @@ fn gdn_layer() void {
     }
     sig_r(zz_dsd, VH);
     @fmovs(at(decay_dsd, b * VH), @set_dsd_length(ge1_d, VH));
+    } else {
+    // (scalar gates, a v head at a time with one copy of the code: fewer
+    // cycles than the vector form, ~0.85 KB more code)
+    var j: u16 = 0;
+    while (j < dims[6]) : (j += 1) {
+      const bv = pj[b * NPJ + NCH + NV + j];
+      const av = pj[b * NPJ + NCH + NV + VH + j] + gab[lg * 2 * VH + VH + j];
+      const e1 = math.exp_f32(-bv);
+      const e2 = math.exp_f32(-(if (av > 0.0) av else -av));
+      beta[b * VH + j] = recip(1.0 + e1);
+      const sp = (if (av > 0.0) av else 0.0) + math.log_f32(1.0 + e2);
+      decay[b * VH + j] = math.exp_f32(gab[lg * 2 * VH + j] * sp);
+    }
+    }
   }
   mark(2);
   axis_y();
