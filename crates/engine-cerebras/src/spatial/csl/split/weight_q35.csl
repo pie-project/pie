@@ -52,9 +52,12 @@ param NQG: u16;        // GDN layers' q|k|v|z|b|a outputs a column
 param GDN: u16;        // 1: GDN state ops (a unit with GDN layers)
 param ATT: u16;        // 1: attention (a unit with an attention layer)
 param DV: u16;         // GDN v dims a column
+param DK: u16 = 8;     // GDN q / k dims a column (CY's multicast: k DK | q DK | decay | pad)
 param Qh: u16;         // attention q heads a column (Dc dims each)
 param Dc: u16;         // attention kv dims a column
 param NE: u16;         // KV entries a row a layer (context = NE x rows)
+param PYW: u16 = 208;  // weight rows a unit (position p lives on row p % PYW, entry p / PYW)
+param HD: u16 = 256;   // attention head dim (the q/k RMSNorm's mean)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
@@ -77,7 +80,8 @@ var w = @zeros([WN + 1]u16);
 var w_ptr: [*]u16 = &w;
 
 // ---------------------------------------------------------------- buffers
-const NS: u16 = Qh * NE + Qh + 1;           // the scores' segment all-reduce
+const NS: u16 = Qh * NE + Qh + 1;
+const HDF: f32 = @as(f32, HD);           // the scores' segment all-reduce
 const XN: u16 = mx(mx(mx(Hc, QO), Ic), Qh * NE);
 const YN: u16 = mx(mx(mx(mx(NQA + 1, NQG + 1), 2 * Ic + 1), Hc), mx(NS, 2 * DV + 3));
 var xh = @zeros([XN]@fp16());          // the matvec's x (16-bit)
@@ -120,12 +124,13 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
 // (FIFO merge of level 1 and level 2), 3 the farthest group's end.
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 18]u32);
+var rcfg = @zeros([RQ + 18]u32);   // [RQ+17] the row
 var rcfg_ptr: [*]u32 = &rcfg;
 var role_x: u16 = 0;
 var role_y: u16 = 0;
 var role_s: u16 = 0;    // the scores segment: 0-3 as role_x, 4 its root
-var gsrc: u16 = 0;      // GDN: bit 15 this PE owns k index r, bits 0-7 its q/k dim in CY's multicast
+var myrow: u16 = 0;    // this PE's row in the unit's weight rows
+var gsrc: u16 = 0;      // GDN: bit 15 this PE owns k index r, bit 14 alone (the k head in one column), bits 0-7 its q/k dim
 
 fn iqc(comptime qid: u16, c: u32) void {
   const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
@@ -158,6 +163,7 @@ fn init() void {
   role_y = @as(u16, rcfg[RQ + 9]);
   role_s = @as(u16, rcfg[RQ + 10]);
   gsrc = @as(u16, rcfg[RQ + 11]);
+  myrow = @as(u16, rcfg[RQ + 17]);
   sys_mod.unblock_cmd_stream();
 }
 
@@ -233,26 +239,32 @@ fn qmode(m: u16) void {
 // ---------------------------------------------------------------- GDN
 var st = @zeros([if (GDN == 1) NLG * DV else 1]f32);
 var dl = @zeros([if (GDN == 1) DV else 1]f32);
-var gb = @zeros([if (GDN == 1) 18 else 1]f32);   // CY's multicast: k 8, q 8, decay, pad
+var gb = @zeros([if (GDN == 1) 2 * DK + 2 else 1]f32);   // CY's multicast: k DK, q DK, decay, pad
 var kq = @zeros([2]f32);
 const st_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> st[i] });
 const dl_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> dl[i] });
 const kq_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2} -> kq[i] });
 fn gdn_mix(g: u16) void {
   const s = @increment_dsd_offset(st_d, @as(i16, g * DV), f32);
-  @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{18} -> gb[i] }), fin(q_ym, 18));
-  qmode(1);
-  if ((gsrc & 0x8000) != 0) {
+  @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DK + 2} -> gb[i] }), fin(q_ym, 2 * DK + 2));
+  if ((gsrc & 0x4000) != 0) {
     const j = gsrc & 0xff;
-    kq[0] = gb[j]; kq[1] = gb[8 + j];
-    @fmovs(fout(q_xo, 2), kq_d);
+    kq[0] = if ((gsrc & 0x8000) != 0) gb[j] else 0.0;
+    kq[1] = if ((gsrc & 0x8000) != 0) gb[DK + j] else 0.0;
   } else {
-    @fmovs(kq_d, fin(q_xm, 2));
+    qmode(1);
+    if ((gsrc & 0x8000) != 0) {
+      const j = gsrc & 0xff;
+      kq[0] = gb[j]; kq[1] = gb[DK + j];
+      @fmovs(fout(q_xo, 2), kq_d);
+    } else {
+      @fmovs(kq_d, fin(q_xm, 2));
+    }
+    qmode(0);
   }
-  qmode(0);
   const kr = kq[0];
   const qr = kq[1];
-  @fmuls(s, s, gb[16]);
+  @fmuls(s, s, gb[2 * DK]);
   @fmuls(@set_dsd_length(y_d, DV), s, kr);
   @fmuls(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, DV), f32), DV), s, qr);
   y[2 * DV] = kr * kr;
@@ -275,13 +287,13 @@ var kc = @zeros([if (ATT == 1) NLA * KCW + 1 else 1]u16);
 var vc = @zeros([if (ATT == 1) NLA * VCW + 1 else 1]u16);
 var kinv = @zeros([if (ATT == 1) NLA * NE else 1]f32);
 var mref = @zeros([if (ATT == 1) NLA * Qh else 1]f32);
-var ab = @zeros([if (ATT == 1) Qh * Dc + 2 * Dc + 2 else 1]f32);   // q | k | v | slot | (pad)
+var ab = @zeros([if (ATT == 1) Qh * Dc + 2 * Dc + 2 + Qh else 1]f32);
 var sx = @zeros([if (ATT == 1) NS else 1]f32);
 var rq = @zeros([if (ATT == 1) Qh else 1]f32);
 var ex16 = @zeros([if (ATT == 1) NS else 1]u16);
 const sx_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> sx[i] });
-const ex_a = [3]f32 { 12582912.0, -12582912.0, 0.0 };
-const ex_c = [4]f32 { 0.16792157, 0.49999613, 0.99999995, 1.0 };
+const ex_a = [3]f32 { 12582912.0, -12582912.0, 12582912.0 };   // t, then k as a float, then t again (k in the low bits)
+const ex_c = [4]f32 { 0.16790908575057983, 0.5000435709953308, 0.9999634027481079, 0.9999992847442627 };   // region_pe (trm 8)
 // exp(buf) in place (exp_fast's form: 2^k by the exponent bits, a degree-4 polynomial on r)
 fn exp_v(buf: mem1d_dsd, n: u16) void {
   const p = @set_dsd_length(y_d, n);
@@ -321,48 +333,50 @@ fn seg_ar(n: u16) void {
   @fmovs(d, fin(q_xm, n));
   qmode(0);
 }
+fn rsq(v: f32) f32 {
+  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
+  y = y * (1.5 - 0.5 * v * y * y);
+  y = y * (1.5 - 0.5 * v * y * y);
+  y = y * (1.5 - 0.5 * v * y * y);
+  return y;
+}
+// CY's multicast: q (normed weights, RoPE, 1/sqrt(HD) applied) QD | k Dc | v Dc | position |
+// the column's partial sums of squares of the raw q a head (Qh) and of the raw k (1).
+const QD: u16 = Qh * Dc;
+const AB: u16 = QD + 2 * Dc + 2 + Qh;
 fn att_mix(a: u16) void {
   const kb: u16 = a * KCW;
   const vb: u16 = a * VCW;
-  const AB: u16 = Qh * Dc + 2 * Dc + 2;
   @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{AB} -> ab[i] }), fin(q_ym, AB));
-  // the new entry (slot word: bit 15 this row's, bits 0-7 its entry)
-  const sl = @as(u16, @bitcast(u32, ab[AB - 2]));
-  const mine = (sl & 0x8000) != 0;
-  const e0 = sl & 0xff;
+  const pos = @as(u16, ab[QD + 2 * Dc]);
+  const mine = (pos % PYW) == myrow;
+  const e0 = pos / PYW;
   if (mine) {
     var d: u16 = 0;
     while (d < Dc) : (d += 1) {
-      kc[1 + kb + d * NE + e0] = @bitcast(u16, @as(@fp16(), ab[Qh * Dc + d]));
-      vc[1 + vb + e0 * (Dc + 1) + d] = @bitcast(u16, @as(@fp16(), ab[Qh * Dc + Dc + d]));
+      kc[1 + kb + d * NE + e0] = @bitcast(u16, @as(@fp16(), ab[QD + d]));
+      vc[1 + vb + e0 * (Dc + 1) + d] = @bitcast(u16, @as(@fp16(), ab[QD + Dc + d]));
     }
-    vc[1 + vb + e0 * (Dc + 1) + Dc] = 0x3c00;   // 1.0
+    vc[1 + vb + e0 * (Dc + 1) + Dc] = 0x3c00;   // 1.0: the values matvec's last output is the softmax sum
   }
-  // q as f16 (the score matvecs' x) and |q|^2 a head
-  @fs2h(@set_dsd_length(xh_d, Qh * Dc), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * Dc} -> ab[i] }));
+  @fs2h(@set_dsd_length(xh_d, QD), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> ab[i] }));
   var apass: u16 = 0;
   while (apass < 8) : (apass += 1) {
     var h: u16 = 0;
     while (h < Qh) : (h += 1) {
       mvp(@ptrcast([*]u16, &kc[1 + kb]), Dc, NE, h * Dc, h * NE);
-      @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NE), f32), NE),
-             @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * NE), f32), NE));
-      var ss: f32 = 0.0;
-      var d: u16 = 0;
-      while (d < Dc) : (d += 1) { const v = ab[h * Dc + d]; ss += v * v; }
-      sx[Qh * NE + h] = ss;
+      sx[Qh * NE + h] = ab[QD + 2 * Dc + 1 + h];
     }
-    var kk: f32 = 0.0;
-    if (mine) { var d: u16 = 0; while (d < Dc) : (d += 1) { const v = ab[Qh * Dc + d]; kk += v * v; } }
-    sx[Qh * NE + Qh] = kk;
-    seg_ar(NS);
-    if (mine) { kinv[a * NE + e0] = sx[Qh * NE + Qh]; }
+    @fmovs(@set_dsd_length(sx_d, Qh * NE), @set_dsd_length(y_d, Qh * NE));
+    sx[Qh * NE + Qh] = if (mine) ab[QD + 2 * Dc + 1 + Qh] else 0.0;
+    if (role_s != 5) { seg_ar(NS); }
+    if (mine) { kinv[a * NE + e0] = rsq(sx[Qh * NE + Qh] / HDF + 1.0e-6); }
     const ki = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kinv[i] });
     h = 0;
     while (h < Qh) : (h += 1) {
       const sh = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NE), f32), NE);
       @fmuls(sh, sh, @increment_dsd_offset(ki, @as(i16, a * NE), f32));
-      @fmuls(sh, sh, sx[Qh * NE + h]);
+      @fmuls(sh, sh, rsq(sx[Qh * NE + h] / HDF + 1.0e-6));
       @fsubs(sh, sh, mref[a * Qh + h]);
     }
     exp_v(@set_dsd_length(sx_d, Qh * NE), Qh * NE);
@@ -376,7 +390,7 @@ fn att_mix(a: u16) void {
     h = 0;
     while (h < Qh) : (h += 1) { mref[a * Qh + h] += sx[1 + h]; }
     if (sx[0] == 0.0) { apass = 8; } else {
-      @fs2h(@set_dsd_length(xh_d, Qh * Dc), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * Dc} -> ab[i] }));
+      @fs2h(@set_dsd_length(xh_d, QD), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> ab[i] }));
     }
   }
 }
@@ -434,12 +448,12 @@ fn compute(steps: u32, start_pos: u32) void {
 
 comptime {
   @bind_local_task(pass_task, pass_id);
-  @initialize_queue(q_xa, .{ .color = C_PARK });
-  @initialize_queue(q_xb, .{ .color = C_PARK });
-  @initialize_queue(q_ya, .{ .color = C_PARK });
-  @initialize_queue(q_yb, .{ .color = C_PARK });
-  @initialize_queue(q_xm, .{ .color = C_PARK });
-  @initialize_queue(q_ym, .{ .color = C_PARK });
+  @initialize_queue(q_xa, .{ .color = @get_color(13) });   // parked (distinct a queue)
+  @initialize_queue(q_xb, .{ .color = @get_color(14) });   // parked (distinct a queue)
+  @initialize_queue(q_ya, .{ .color = @get_color(17) });   // parked (distinct a queue)
+  @initialize_queue(q_yb, .{ .color = @get_color(18) });   // parked (distinct a queue)
+  @initialize_queue(q_xm, .{ .color = @get_color(19) });   // parked (distinct a queue)
+  @initialize_queue(q_ym, .{ .color = @get_color(20) });   // parked (distinct a queue)
   @initialize_queue(q_xo, .{ .color = C_PARK });
   @initialize_queue(q_yo, .{ .color = C_PARK });
   @export_symbol(w_ptr, "w");

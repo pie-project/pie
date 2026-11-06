@@ -11,6 +11,8 @@
 param memcpy_params;
 param K: u16;          // layers on the unit
 param Hc: u16;         // x dims a row
+param HOSTX: u16 = 0;  // 1 (simulator tests): x is the host's (memcpy), no handoff
+param XG16: u16 = 1;   // 1: f16(x) f16(g) in f16 (TRM 512); 0: x g in f32
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
@@ -91,10 +93,15 @@ fn norm_send(gi: u16) void {
   var ss: f32 = 0.0;
   var i: u16 = 0;
   while (i < Hc) : (i += 1) { const v = x[i]; ss += v * v; }
-  @fs2h(th_d, x_d);
   const g = @increment_dsd_offset(g_d, @as(i16, gi * Hc), @fp16());
-  @fmulh(th_d, th_d, g);
-  @fh2s(t_d, th_d);
+  if (XG16 == 1) {
+    @fs2h(th_d, x_d);
+    @fmulh(th_d, th_d, g);
+    @fh2s(t_d, th_d);
+  } else {
+    @fh2s(t_d, g);
+    @fmuls(t_d, t_d, x_d);
+  }
   t[Hc] = ss;
   @fmovs(fout(q_mc, Hc + 1), t1_d);
 }
@@ -104,7 +111,7 @@ const pass_id: local_task_id = @get_local_task_id(8);
 task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
-    @fmovs(x_d, fin(q_hi, Hc));
+    if (HOSTX == 0) { @fmovs(x_d, fin(q_hi, Hc)); }
     var l: u16 = 0;
     while (l < K) : (l += 1) {
       norm_send(2 * l);
@@ -114,7 +121,7 @@ task pass_task() void {
       reduce();
       @fadds(x_d, x_d, t_d);
     }
-    @fmovs(fout(q_ho, Hc), x_d);
+    if (HOSTX == 0) { @fmovs(fout(q_ho, Hc), x_d); }
   }
   sys_mod.unblock_cmd_stream();
 }
@@ -125,10 +132,10 @@ fn compute(steps: u32, start_pos: u32) void {
 
 comptime {
   @bind_local_task(pass_task, pass_id);
-  @initialize_queue(q_w, .{ .color = C_PARK });
-  @initialize_queue(q_e, .{ .color = C_PARK });
-  @initialize_queue(q_lb, .{ .color = C_PARK });
-  @initialize_queue(q_hi, .{ .color = C_PARK });
+  @initialize_queue(q_w, .{ .color = @get_color(13) });   // parked (distinct a queue)
+  @initialize_queue(q_e, .{ .color = @get_color(14) });   // parked (distinct a queue)
+  @initialize_queue(q_lb, .{ .color = @get_color(17) });   // parked (distinct a queue)
+  @initialize_queue(q_hi, .{ .color = @get_color(18) });   // parked (distinct a queue)
   @initialize_queue(q_lo, .{ .color = C_PARK });
   @initialize_queue(q_mc, .{ .color = C_PARK });
   @initialize_queue(q_ho, .{ .color = C_PARK });

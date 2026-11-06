@@ -222,12 +222,12 @@ fn compute(steps: u32, start_pos: u32) void {
 
 comptime {
   @bind_local_task(pass_task, pass_id);
-  @initialize_queue(q_xa, .{ .color = C_PARK });
-  @initialize_queue(q_xb, .{ .color = C_PARK });
-  @initialize_queue(q_ya, .{ .color = C_PARK });
-  @initialize_queue(q_yb, .{ .color = C_PARK });
-  @initialize_queue(q_xm, .{ .color = C_PARK });
-  @initialize_queue(q_ym, .{ .color = C_PARK });
+  @initialize_queue(q_xa, .{ .color = @get_color(13) });   // parked (distinct a queue)
+  @initialize_queue(q_xb, .{ .color = @get_color(14) });   // parked (distinct a queue)
+  @initialize_queue(q_ya, .{ .color = @get_color(17) });   // parked (distinct a queue)
+  @initialize_queue(q_yb, .{ .color = @get_color(18) });   // parked (distinct a queue)
+  @initialize_queue(q_xm, .{ .color = @get_color(19) });   // parked (distinct a queue)
+  @initialize_queue(q_ym, .{ .color = @get_color(20) });   // parked (distinct a queue)
   @initialize_queue(q_xo, .{ .color = C_PARK });
   @initialize_queue(q_yo, .{ .color = C_PARK });
   @export_symbol(w_ptr, "w");

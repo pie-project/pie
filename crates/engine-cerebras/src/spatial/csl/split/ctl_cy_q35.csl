@@ -26,6 +26,8 @@ param Ic: u16;
 param HR: u16;         // hidden size (RMSNorm)
 param CONV: u16;       // conv kernel (4)
 param NROT: u16;       // rotated pairs a column (partial RoPE)
+param HK: u16 = 128;   // GDN head k dim (q scale 1/sqrt(HK))
+param HV: u16 = 128;   // GDN head v dim (the gated norm's mean)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
@@ -36,7 +38,7 @@ fn nla() u16 { var n: u16 = 0; var l: u16 = 0; while (l < K) : (l += 1) { if (((
 const NLA: u16 = nla();
 const NLG: u16 = K - NLA;
 const NCH: u16 = 2 * DK + DV;              // conv channels a column
-const TN: u16 = mx(mx(NQA + 1, NQG + 1), mx(2 * Ic + 1, 2 * DV + 3));
+const TN: u16 = mx(mx(mx(NQA + 1, NQG + 1), mx(2 * Ic + 1, 2 * DV + 3)), Qh * Dc + 2 * Dc + 2 + Qh);
 const EPS: f32 = 1.0e-6;
 const HID: f32 = @as(f32, HR);
 
@@ -131,7 +133,8 @@ fn reduce(n: u16) void {
 fn mcast(n: u16) void { @fmovs(fout(q_mc, n), uv(0, n)); }
 // A small all-reduce over the control row's segment (n <= 4 words of gsc[2..]).
 fn seg_ar(n: u16) void {
-  const d = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{4} -> gsc[i] }), n);
+  const d = @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{4} -> gsc[i] }), 2, f32), n);
+  if (role_s == 5) { return; }
   if (role_s == 4) {
     @fadds(d, d, fin(q_si, n));
     @fmovs(fout(q_so, n), d);
@@ -211,20 +214,21 @@ fn gdn(g: u16) void {
   // the state reduction: S^T k | S^T q | k^2 | q^2 | k.q
   reduce(2 * DV + 3);
   const ik = rsqrt(t[2 * DV] + EPS);
-  const iq = rsqrt(t[2 * DV + 1] + EPS);
-  const kq = t[2 * DV + 2] * ik * iq;
+  const iq0 = rsqrt(t[2 * DV + 1] + EPS);
+  const kq = t[2 * DV + 2] * ik * iq0;
+  const iq = iq0 * rsqrt(@as(f32, HK));
   var ss: f32 = 0.0;
   var i: u16 = 0;
   while (i < DV) : (i += 1) {
     const dl = (vs[i] - t[i] * ik) * bt;
-    const o = t[DV + i] * iq + dl * kq;
+    const o = t[DV + i] * iq + dl * kq * rsqrt(@as(f32, HK));
     u[i] = o;
     u[DV + i] = dl * ik;
     ss += o * o;
   }
   gsc[2] = ss;
   seg_ar(1);
-  const on = rsqrt(gsc[2] / 128.0 + EPS);
+  const on = rsqrt(gsc[2] / @as(f32, HV) + EPS);
   i = 0;
   while (i < DV) : (i += 1) { u[i] = u[i] * on * gnw[g * DV + i] * silu(zs[i]); }
   mcast(2 * DV);
@@ -268,18 +272,30 @@ fn att(a: u16) void {
   const rr = rsqrt(t[NQA] / HID + EPS);
   @fmuls(tv(0, NQA), tv(0, NQA), rr);
   const qkb = a * (QD + Dc);
-  @fmuls(tv(0, QD), tv(0, QD), @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> qkw[i] }), QD));
-  @fmuls(tv(2 * QD, Dc), tv(2 * QD, Dc), @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> qkw[i] }), @as(i16, qkb + QD), f32), Dc));
-  rope_tables();
+  // the raw q / k sums of squares a head (the weight PEs' segment all-reduce completes them)
   var h: u16 = 0;
+  while (h < Qh) : (h += 1) {
+    var ss: f32 = 0.0;
+    var d: u16 = 0;
+    while (d < Dc) : (d += 1) { const v = t[h * Dc + d]; ss += v * v; }
+    u[QD + 2 * Dc + 1 + h] = ss;
+  }
+  var ks: f32 = 0.0;
+  var d: u16 = 0;
+  while (d < Dc) : (d += 1) { const v = t[2 * QD + d]; ks += v * v; }
+  u[QD + 2 * Dc + 1 + Qh] = ks;
+  const qw = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> qkw[i] });
+  @fmuls(tv(0, QD), tv(0, QD), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb), f32), QD));
+  @fmuls(tv(2 * QD, Dc), tv(2 * QD, Dc), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb + QD), f32), Dc));
+  rope_tables();
+  h = 0;
   while (h < Qh) : (h += 1) { rope(h * Dc); }
   rope(2 * QD);
   @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> gate[i] }), QD), tv(QD, QD));
   @fmovs(uv(0, QD), tv(0, QD));
   @fmovs(uv(QD, 2 * Dc), tv(2 * QD, 2 * Dc));
-  u[QD + 2 * Dc] = @bitcast(f32, tab[1]);
-  u[QD + 2 * Dc + 1] = 0.0;
-  mcast(QD + 2 * Dc + 2);
+  u[QD + 2 * Dc] = @as(f32, tab[0]);
+  mcast(QD + 2 * Dc + 2 + Qh);
   var pass: u16 = 0;
   while (pass < 8) : (pass += 1) {
     reduce(Qh * (Dc + 1));
@@ -287,11 +303,11 @@ fn att(a: u16) void {
     h = 0;
     while (h < Qh) : (h += 1) {
       const l = t[h * (Dc + 1) + Dc];
-      if (l < 3.0e-24 or l > 2.0e30) { bad = 1.0; }
+      if (l < 0.00390625 or l >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
       const il = recip(l);
       var d: u16 = 0;
       while (d < Dc) : (d += 1) { u[h * Dc + d] = t[h * (Dc + 1) + d] * il * sigm(gate[h * Dc + d]); }
-      u[QD + 1 + h] = -ln1(l);
+      u[QD + 1 + h] = ln1(l);
     }
     u[QD] = bad;
     mcast(QD + 1 + Qh);
@@ -330,10 +346,10 @@ fn compute(steps: u32, start_pos: u32) void {
 
 comptime {
   @bind_local_task(pass_task, pass_id);
-  @initialize_queue(q_n, .{ .color = C_PARK });
-  @initialize_queue(q_s, .{ .color = C_PARK });
-  @initialize_queue(q_lb, .{ .color = C_PARK });
-  @initialize_queue(q_si, .{ .color = C_PARK });
+  @initialize_queue(q_n, .{ .color = @get_color(13) });   // parked (distinct a queue)
+  @initialize_queue(q_s, .{ .color = @get_color(14) });   // parked (distinct a queue)
+  @initialize_queue(q_lb, .{ .color = @get_color(17) });   // parked (distinct a queue)
+  @initialize_queue(q_si, .{ .color = @get_color(18) });   // parked (distinct a queue)
   @initialize_queue(q_lo, .{ .color = C_PARK });
   @initialize_queue(q_mc, .{ .color = C_PARK });
   @initialize_queue(q_so, .{ .color = C_PARK });
