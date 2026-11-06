@@ -403,8 +403,9 @@ pub struct Variant {
     /// at degree 3, 1 / (1 + e) by a quadratic and a Newton step; about 1 f16
     /// ulp rms against 0.3 for the f32 SiLU rounded), straight into the down
     /// matvec's f16 x: no act all-reduce (`trm_silu.json`); **2048** (with
-    /// 1024) its two scales applied in f16 after the conversion, their f16
-    /// rounding undone in f32 on the down partial (`trm_silh.json`); **4096**
+    /// 1024) its two scales applied in f16 after the conversion, as stride-0
+    /// operands, their f16 rounding (<= 2^-11 a layer) kept; does not fit beside
+    /// 512 (+190 B) (`trm_silh.json`); **4096**
     /// (with 512) its f16 gammas made in place in the f32 gammas' words on the
     /// first pass, no copies (`trm_xgi.json`; the host places the weights
     /// once, after init); **8192** (with 1024 and 4) the grids take 1024 too;
