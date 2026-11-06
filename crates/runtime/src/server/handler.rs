@@ -550,7 +550,7 @@ impl Session {
             return;
         }
 
-        let room = crate::handle::state_room();
+        let room = crate::handle::state_room;
         let lease = match self.handles.lend(self.id, handles, returns, room) {
             Ok(lease) => lease,
             Err(why) => {

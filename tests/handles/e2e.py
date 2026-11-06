@@ -130,6 +130,17 @@ async def t_evict(c, prog, whole):
     check("a restored handle resumes exactly", first + r == whole)
     r2 = await run(c, prog, fk2, [first[-1]], 20, drawn=12)
     check("so does its evicted fork", r2 == r)
+    # more than one evicted handle comes back as one ask
+    two = await c.install_program(Path(__file__).parent / "both_ws.py", force_overwrite=True)
+    for h in hogs[:3]:
+        await h.close()
+    hogs = hogs[3:]
+    a1, a2 = hogs.pop(0), hogs.pop(0)
+    st = [(await a1.stat())["resident"], (await a2.stat())["resident"]]
+    out = await (await c.run(two, a=a1, b=a2)).result()
+    check("two handles enter a process together", out["ok"], f"resident before: {st}")
+    check("and come back", (await a1.stat())["state"] == "parked" == (await a2.stat())["state"])
+    hogs += [a1, a2]
     # A peer's restore moved pages under `pair`, which wakes with nothing owed.
     r3 = await run(c, prog, pair, [first[-1]], 20, drawn=12)
     check("nor does either lose it", r3 == r)
@@ -335,6 +346,35 @@ async def t_review(c, prog, whole):
     r = await run(c, prog, w, [first[-1]], 20, drawn=12)
     check("and resumes exactly", first + r == whole)
     await w.close()
+    # a handle the guest never took is as it came
+    w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
+    p = await c.launch_process("prefill", input="not what it reads", handles={"ws": w}, returns={"ws": w})
+    try: await p.result(); check("a guest that fails before it takes a handle fails", False)
+    except Exception as e: check("a guest that fails before it takes a handle fails", True, str(e)[:70])
+    check("and the handle is as it came", (await w.stat())["state"] == "parked")
+    r = await run(c, prog, w, [first[-1]], 20, drawn=12)
+    check("and resumes exactly", first + r == whole)
+    await w.close()
+    # an output that never came can be asked for again
+    gen = await c.install_program(S / "mk.py", force_overwrite=True)
+    o, sound = await c.frames(), c.pcm()
+    try:
+        await (await c.run(gen, out=o, sound=sound, w=0, h=0)).result(); check("a failed output fails", False)
+    except Exception as e: check("a failed output fails", True, str(e)[:70])
+    await (await c.run(gen, out=o, sound=sound, w=4, h=4)).result()
+    check("and asks again under the same handle", (await o.stat())["width"] == 4)
+    await o.close(); await sound.close()
+    # forks share: moved together they cost what they share once
+    base = await c.working_set(); await run(c, prog, base, list(range(3000, 3460)), 1)
+    forks = {f"h{i}": await base.fork() for i in range(10)}
+    p = await c.launch_process(prog, input={"tokens": [1], "max_tokens": 1, "seed": 7}, handles=forks, returns=forks)
+    try: await p.result()
+    except Exception as e: check("forks in one launch fit as what they share", "quota" not in str(e), str(e)[:80])
+    else: check("forks in one launch fit as what they share", False, "the guest wants a ws")
+    for f in forks.values():
+        try: await f.close()
+        except HandleError: pass
+    await base.close()
     # handles that cannot share the device are refused, and stay as they were
     hs = []
     for i in range(10):

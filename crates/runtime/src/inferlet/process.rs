@@ -791,10 +791,11 @@ impl Process {
             if let Some(lease) = lease {
                 let mut lease = lease;
                 lease.prepare()?;
-                lease.ready(process_id).await?;
+                lease.claim().await?;
                 let (bag, bound) = lease.bind(store.data_mut());
                 store.data_mut().set_handles(bag);
                 bound.map_err(|e| e.to_string())?;
+                crate::handle::enter(process_id).await?;
             }
 
             let run_interface = RUN_INTERFACE;

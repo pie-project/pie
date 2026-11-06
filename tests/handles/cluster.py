@@ -150,7 +150,13 @@ async def main():
         fresh = await d.working_set()
         x = await asyncio.wait_for(run(d, prog, fresh, PROMPT, 8), 30)
         check("a new session runs on the worker left", x == base)
-        await d.close()
+        # The worker dies with no turn on it: nothing closes the socket until
+        # the session next asks, and then it hears.
+        await asyncio.sleep(1)
+        os.killpg(workers[other].pid, signal.SIGKILL)
+        await asyncio.sleep(10)
+        state = await alive(d, fresh)
+        check("a worker lost between turns is heard at the next", isinstance(state, str) and "dead" in state, str(state)[:120])
         await c.close()
     finally:
         for p in list(workers.values()) + list(procs.values()):

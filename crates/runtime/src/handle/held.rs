@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{MOVE_WAIT, RS_MOVE_POLL};
+use super::{FORK_WAIT, MOVE_WAIT, RS_MOVE_POLL};
 use crate::inferlet::ProcessId;
 use crate::inferlet::host::working_set::Cursor;
 use crate::inferlet::process::ProcessResidency;
@@ -76,56 +76,28 @@ impl Held {
         self.parts.as_ref().expect("taken only by consuming self")
     }
 
-    /// Back on the device, and no one's victim until it has a process.
-    ///
-    /// Its set is parked from the moment it came here, so a peer's eviction
-    /// may have taken pages it shares: what it owes is read here, not known
-    /// from whether its own holder was evicted.
-    pub(super) async fn ready(&self, process: ProcessId) -> Result<(), String> {
-        let Parts { kv, rs, .. } = self.parts();
-        if let Some(rs) = rs {
-            rs_settled(rs, |_| ()).await?;
-        }
-        let rs_home = rs.as_ref().is_none_or(|rs| rs_units(rs).is_zero());
-        let kv_pages = settled(kv, "handle-ready", |store| {
-            let pages = swapped_pages(store, kv)?;
-            if pages == 0 && rs_home {
-                store.set_parked(kv.id, false);
-            }
-            Ok(pages)
-        })
-        .await?;
-        let owed = demand(kv_pages, rs.as_ref());
-        if owed.is_none() {
-            // An eviction that found no page left its fence up.
-            kv.suspend_handle().unfence();
-        }
+    /// Keeps the planner off this set, and answers once it has left it: the
+    /// next owner reads what it owes, and no move may be starting then.
+    pub(super) async fn claim(&self) -> Result<(), String> {
         let Some(planner) = crate::planner::planner_of(self.holder) else {
             return Ok(());
         };
-        planner.recall_holder(self.holder, process, owed);
-        planner
-            .wait_resident(self.holder)
-            .await
-            .map_err(|error| format!("restoring a handle: {error}"))
-    }
-
-    /// A recall that came to nothing: it is at rest again, as if never asked.
-    pub(super) fn rest(&self) {
-        let Parts { kv, .. } = self.parts();
-        let stores = store_registry::get(kv.model, kv.engine);
-        store_registry::with_kv_lock(&stores.kv, "handle-rest", |store| {
-            store.set_parked(kv.id, true);
-        });
-        if let Some(planner) = crate::planner::planner_of(self.holder) {
-            planner.rest_holder(self.holder);
+        planner.claim_holder(self.holder);
+        let deadline = crate::rt::time::Instant::now() + MOVE_WAIT;
+        while planner.holder_moving(self.holder) {
+            if crate::rt::time::Instant::now() >= deadline {
+                return Err("its pages are still moving".to_string());
+            }
+            let _ = crate::rt::time::timeout(RS_MOVE_POLL, std::future::pending::<()>()).await;
         }
+        Ok(())
     }
 
-    /// The pages this set maps, wherever they are.
-    pub(super) fn page_count(&self, store: &KvStore) -> usize {
-        let set = HashSet::from([self.parts().kv.id]);
-        store.held_page_count(&set).unwrap_or(0) + store.swapped_page_count(&set).unwrap_or(0)
+    /// A claim that came to nothing: anyone's to evict again.
+    pub(super) fn unclaim(&self) {
+        if let Some(planner) = crate::planner::planner_of(self.holder) {
+            planner.unclaim_holder(self.holder);
+        }
     }
 
     /// Each store forks under its own lock, with no move of its own under
@@ -222,7 +194,7 @@ async fn settled<T>(
 ) -> Result<T, String> {
     let stores = store_registry::get(kv.model, kv.engine);
     let set = HashSet::from([kv.id]);
-    let deadline = crate::rt::time::Instant::now() + MOVE_WAIT;
+    let deadline = crate::rt::time::Instant::now() + FORK_WAIT;
     loop {
         let ended = store_registry::with_kv_lock(&stores.kv, label, |store| store.moves_ended());
         let notified = ended.notified();
@@ -252,7 +224,7 @@ async fn rs_settled<T>(
     mut f: impl FnMut(&mut RsStore) -> T,
 ) -> Result<T, String> {
     let stores = store_registry::get(rs.model, rs.engine);
-    let deadline = crate::rt::time::Instant::now() + MOVE_WAIT;
+    let deadline = crate::rt::time::Instant::now() + FORK_WAIT;
     loop {
         {
             let mut store = stores.rs.lock().unwrap();

@@ -63,7 +63,8 @@ impl Inner {
         let mut n = 0;
         for proc in self.procs.values() {
             let resident = proc.state == Residency::Resident;
-            if !resident {
+            // A handle at rest off the device is the point of parking it.
+            if !resident && !proc.holder {
                 n += 1;
             }
             proc.resident.store(resident, Ordering::Release);

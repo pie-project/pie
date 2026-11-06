@@ -13,13 +13,17 @@ mod held;
 mod lease;
 mod table;
 
-pub(crate) use lease::{Bag, Kind, Lease, Moved};
+pub(crate) use lease::{Bag, Kind, Lease, Moved, enter};
 pub(crate) use table::{Landing, Table, state_room};
 
 use client_api::{HandleErrorCode, HandleName};
 
 const MOVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const RS_MOVE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// How long a fork holds up its session for a move to end, before it is
+/// refused as `in_use`: the session has output to deliver.
+const FORK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The most handles one session names at once: a name costs almost nothing,
 /// but not nothing, and a client that never closes one should hear so.

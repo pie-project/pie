@@ -96,9 +96,11 @@ def program_file(path: str | Path) -> str:
 class Process:
     """Represents a running process on the server."""
 
-    def __init__(self, client, process_id: str):
+    def __init__(self, client, process_id: str, landing: "list[Handle] | None" = None):
         self.client = client
         self.process_id = process_id
+        # What this process gives back: it exists once the process has ended.
+        self.landing = landing or []
         self.event_queue = self.client.process_event_queues.get(process_id)
         if self.event_queue is None:
             raise Exception(
@@ -124,7 +126,11 @@ class Process:
         if self.event_queue is None:
             raise Exception("Event queue is not available for this process.")
         event_str, value = await self.event_queue.get()
-        return Event(event_str), value
+        event = Event(event_str)
+        if event == Event.Return:
+            for handle in self.landing:
+                handle.exists = True
+        return event, value
 
     async def result(self) -> Any:
         """Drain the process to its end and return what it returned: parsed
@@ -696,8 +702,6 @@ class PieClient:
                 raise HandleError(result)
             raise Exception(f"Failed to launch process: {result}")
 
-        for handle in (returns or {}).values():
-            handle.exists = True
         process_id = result
         queue = asyncio.Queue()
         self.process_event_queues[process_id] = queue
@@ -706,7 +710,7 @@ class PieClient:
             for event_tuple in self.orphan_events.pop(process_id):
                 await queue.put(event_tuple)
 
-        return Process(self, process_id)
+        return Process(self, process_id, landing=list((returns or {}).values()))
 
     async def run(self, program: "Inferlet | str", /, **kwargs: Any) -> Process:
         """Launch an inferlet with keyword arguments as its input.

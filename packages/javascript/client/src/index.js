@@ -173,9 +173,11 @@ export class Process {
      * @param {PieClient} client The PieClient that owns this process.
      * @param {string} processId The UUID of the process.
      */
-    constructor(client, processId) {
+    constructor(client, processId, landing = []) {
         this.client = client;
         this.processId = processId;
+        // What this process gives back: it exists once the process has ended.
+        this.landing = landing;
         this.eventQueue = client.processEventQueues.get(processId);
         if (!this.eventQueue) {
             throw new Error(`Internal error: No event queue for process ${processId}`);
@@ -207,6 +209,9 @@ export class Process {
             throw new Error("Event queue is not available for this process.");
         }
         const [event, value] = await this.eventQueue.get();
+        if (event === "return") {
+            for (const handle of this.landing) handle.exists = true;
+        }
         return { event, value };
     }
 
@@ -804,11 +809,10 @@ export class PieClient {
             throw new Error(`Failed to launch process: ${result}`);
         }
 
-        for (const handle of Object.values(returns)) handle.exists = true;
         const processId = result;
         const queue = this._openProcess(processId);
 
-        return new Process(this, processId);
+        return new Process(this, processId, Object.values(returns));
     }
 
     /**

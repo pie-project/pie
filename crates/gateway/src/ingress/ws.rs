@@ -179,12 +179,12 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
     // them: a fork sent after a launch forks what that launch wrote.
     let (handle_tx, handle_rx) =
         tokio::sync::mpsc::channel::<TurnInput>(client_api::MAX_WAITING_HANDLE_FRAMES);
-    let mut in_order = std::pin::pin!(
+    let mut in_order = Box::pin(
         futures::stream::unfold(handle_rx, |mut rx| async move {
             let req = rx.recv().await?;
             Some((req, rx))
         })
-        .then(admit)
+        .then(admit),
     );
 
     loop {
@@ -199,6 +199,11 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
             },
             Some((corr, turn)) = in_order.next() => match turn {
                 Ok(new_rx) => live.push(corr, new_rx),
+                // Every handle the session had went with its worker.
+                Err(e @ SessionError::HandlesLost) => {
+                    end(&mut tx, corr, &e.to_string()).await;
+                    break;
+                }
                 Err(e) => {
                     if !answer(&mut tx, corr, &e.to_string()).await {
                         break;
@@ -273,6 +278,7 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
     }
 
     drop(admitting);
+    drop(in_order);
     handle.close().await;
 }
 

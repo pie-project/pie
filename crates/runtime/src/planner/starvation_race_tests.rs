@@ -1328,43 +1328,48 @@ fn a_holder_goes_before_every_process_and_oldest_first() {
 }
 
 #[test]
-fn a_recall_takes_the_process_s_place_and_a_failed_one_rests_again() {
+fn a_claimed_holder_is_no_one_s_victim_and_owes_nothing_of_its_own() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let holder = ProcessId::new_v4();
+    planner.register_holder(holder, None);
+    planner.claim_holder(holder);
+    planner.with_inner(|inner| {
+        assert!(!inner.procs[&holder].idle);
+        inner.procs.get_mut(&holder).unwrap().state = Residency::Evicting;
+    });
+    assert!(planner.holder_moving(holder), "the claim waits for this");
+    planner.report_evicted(holder, 3, Default::default());
+    assert!(!planner.holder_moving(holder));
+    planner.with_inner(|inner| {
+        assert!(
+            !inner.queue.values().any(|waiter| waiter.pid == holder),
+            "a holder restores nothing: the process that takes the set does"
+        );
+    });
+    planner.unclaim_holder(holder);
+    planner.with_inner(|inner| assert!(inner.procs[&holder].idle));
+}
+
+#[test]
+fn a_process_that_took_sets_off_the_device_owes_them_as_one_ask() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
     let process = ProcessId::new_v4();
     planner.register(process);
-    let holder = ProcessId::new_v4();
-    planner.register_holder(holder, None);
-
-    planner.recall_holder(holder, process, None);
+    let demand = Demand {
+        kv_pages: 3,
+        rs: Default::default(),
+    };
+    planner.owe(process, demand);
+    assert!(!planner.is_resident(process), "it waits before it runs");
     planner.with_inner(|inner| {
-        assert!(!inner.procs[&holder].idle, "no one's victim on its way in");
-        assert_eq!(inner.procs[&holder].rank(), inner.procs[&process].rank());
-    });
-
-    planner.rest_holder(holder);
-    planner.with_inner(|inner| {
-        assert!(inner.procs[&holder].idle, "anyone's victim again");
-        assert!(inner.procs[&holder].rank() > inner.procs[&process].rank());
+        let asks = inner.queue.values().filter(|waiter| waiter.pid == process);
+        assert_eq!(asks.count(), 1);
     });
 }
 
 #[test]
-fn a_recall_owing_pages_a_peer_moved_queues_a_restore() {
+fn a_handle_at_rest_off_the_device_is_no_contention() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
-    let process = ProcessId::new_v4();
-    planner.register(process);
-    let holder = ProcessId::new_v4();
-    planner.register_holder(holder, None);
-    planner.recall_holder(
-        holder,
-        process,
-        Some(Demand {
-            kv_pages: 3,
-            rs: Default::default(),
-        }),
-    );
-    assert!(
-        !planner.is_resident(holder),
-        "resident to its holder, but its pages went with a peer"
-    );
+    planner.register_holder(ProcessId::new_v4(), Some(Demand::default()));
+    planner.with_inner(|inner| assert_eq!(inner.nonresident_count(), 0));
 }

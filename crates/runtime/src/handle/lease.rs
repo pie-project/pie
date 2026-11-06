@@ -13,6 +13,7 @@ use crate::inferlet::host::grammar::{self, Matcher};
 use crate::inferlet::host::working_set::{self, WorkingSet};
 use crate::inferlet::process::ProcessResidency;
 use crate::inferlet::{ProcessCtx, ProcessId};
+use crate::planner::Demand;
 use crate::server::ClientId;
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::registry as store_registry;
@@ -79,17 +80,17 @@ impl Lease {
         Ok(())
     }
 
-    /// Brings its handles back to the device together or not at all: each
-    /// stays there until the process has it, so one past what the device
-    /// holds would wait on pages only its siblings have.
+    /// Whether what it moves in can ever share the device.
     fn fits(&self) -> Result<(), HandleError> {
+        let sets: HashSet<_> = self.parked().map(|held| held.parts().kv.id).collect();
         let Some(first) = self.parked().next() else {
             return Ok(());
         };
         let kv = &first.parts().kv;
         let stores = store_registry::get(kv.model, kv.engine);
         store_registry::with_kv_lock(&stores.kv, "handle-fits", |store| {
-            let need: usize = self.parked().map(|held| held.page_count(store)).sum();
+            // One count over all of them: forks share pages.
+            let need = store.held_page_count(&sets).unwrap_or(0);
             let capacity = store.capacity_pages() as usize;
             if need > capacity {
                 return Err(HandleError::quota(format!(
@@ -100,10 +101,11 @@ impl Lease {
         })
     }
 
-    pub(crate) async fn ready(&self, process: ProcessId) -> Result<(), String> {
+    /// Readies each handle to leave its holder.
+    pub(crate) async fn claim(&self) -> Result<(), String> {
         self.fits()?;
         for held in self.parked() {
-            held.ready(process).await?;
+            held.claim().await?;
         }
         Ok(())
     }
@@ -123,7 +125,7 @@ impl Lease {
         while let Some(Bound { slot, name, handle }) = self.bound.pop() {
             match bind_one(ctx, handle) {
                 Ok(moved) => {
-                    bag.taken.insert(slot, moved);
+                    bag.taken.insert(slot, (moved, name));
                     bag.lent.push(name);
                 }
                 Err(error) => {
@@ -137,6 +139,57 @@ impl Lease {
         }
         (bag, Ok(()))
     }
+}
+
+/// Brings what `ctx` was bound to the device, as one ask of the planner: a
+/// process that holds some of it while waiting for the rest would wedge, and a
+/// failure here is the process's own, ending it like any restore's.
+pub(crate) async fn enter(process: ProcessId) -> Result<(), String> {
+    let Some(planner) = crate::planner::planner_of(process) else {
+        return Ok(());
+    };
+    let (model, engine) = planner.locus();
+    use crate::inferlet::process::residency;
+    let sets = residency::kv_working_set_ids(process, model, engine);
+    let states = residency::rs_working_set_ids(process, model, engine);
+    let stores = store_registry::get(model, engine);
+    let deadline = crate::rt::time::Instant::now() + super::MOVE_WAIT;
+    let demand = loop {
+        // Reading what is owed and waking the sets is one step: running
+        // readers, they cannot lose another page to a peer's eviction.
+        let kv_pages = store_registry::with_kv_lock(&stores.kv, "handle-enter", |store| {
+            if store.in_move(&sets).unwrap_or(true) {
+                return None;
+            }
+            for &set in &sets {
+                store.set_parked(set, false);
+            }
+            Some(store.swapped_page_count(&sets).unwrap_or(0) as u32)
+        });
+        let rs = {
+            let store = stores.rs.lock().unwrap();
+            (!states.iter().any(|&id| store.in_move(id))).then(|| store.swapped_units(&states))
+        };
+        if let (Some(kv_pages), Some(rs)) = (kv_pages, rs) {
+            break Demand { kv_pages, rs };
+        }
+        if crate::rt::time::Instant::now() >= deadline {
+            return Err("its handles are still moving".to_string());
+        }
+        let _ = crate::rt::time::timeout(super::RS_MOVE_POLL, std::future::pending::<()>()).await;
+    };
+    if demand.is_zero() {
+        // An eviction that found no page left its fence up.
+        for handle in residency::kv_suspend_handles(process, model, engine) {
+            handle.unfence();
+        }
+        return Ok(());
+    }
+    planner.owe(process, demand);
+    planner
+        .wait_resident(process)
+        .await
+        .map_err(|error| format!("restoring its handles: {error}"))
 }
 
 fn bind_one(ctx: &mut ProcessCtx, handle: Slot) -> anyhow::Result<Moved> {
@@ -166,7 +219,7 @@ impl Drop for Lease {
         if self.bound.is_empty() && self.returns.is_empty() {
             return;
         }
-        self.parked().for_each(Held::rest);
+        self.parked().for_each(Held::unclaim);
         let back = self.back();
         let mut settled: Vec<(HandleName, Landing)> = self
             .returns
@@ -203,7 +256,7 @@ pub(crate) struct Moved {
 pub(crate) struct Bag {
     session: ClientId,
     /// Not taken by the guest yet, by name.
-    taken: HashMap<String, Moved>,
+    taken: HashMap<String, (Moved, HandleName)>,
     lent: Vec<HandleName>,
     /// What binding lost, and why.
     lost: Vec<(HandleName, String)>,
@@ -226,7 +279,7 @@ impl Bag {
 
     /// The table rep of what the launch moved in under `name`, once.
     pub(crate) fn take(&mut self, name: &str, kind: Kind) -> Option<u32> {
-        let moved = self.taken.get(name)?;
+        let (moved, _) = self.taken.get(name)?;
         if moved.kind != kind {
             return None;
         }
@@ -271,6 +324,14 @@ impl Bag {
             let Some(&name) = self.returns.get(&slot) else {
                 continue;
             };
+            let landed = match take_out(resources, residency, moved) {
+                Ok(landed) => landed,
+                Err(error) => Slot::Dead(format!("taking `{slot}` from its process: {error}")),
+            };
+            settled.insert(name, Landing::At(landed));
+        }
+        // What the guest never took is as it came, whatever became of the guest.
+        for (slot, (moved, name)) in self.taken {
             let landed = match take_out(resources, residency, moved) {
                 Ok(landed) => landed,
                 Err(error) => Slot::Dead(format!("taking `{slot}` from its process: {error}")),

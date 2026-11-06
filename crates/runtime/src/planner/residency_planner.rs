@@ -246,46 +246,67 @@ impl ResidencyPlanner {
         self.poke();
     }
 
-    /// `process` wants this holder's set: its restore is `process`'s to wait
-    /// for, in `process`'s place in line. `owed` is what the set has off the
-    /// device, which a peer's eviction may have moved under a resident holder.
-    pub fn recall_holder(
-        self: &Arc<Self>,
-        pid: ProcessId,
-        process: ProcessId,
-        owed: Option<Demand>,
-    ) {
+    /// The recurrent slots holders keep on the device, a slot forks share
+    /// counted once: each would need the host if it went there.
+    pub fn resting_rs_slots(&self) -> u32 {
+        let (model, engine) = self.port.locus();
+        let holders: Vec<ProcessId> = self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .filter(|(_, proc)| proc.holder && proc.state == Residency::Resident)
+                .map(|(pid, _)| *pid)
+                .collect()
+        });
+        let resting: HashSet<_> = holders
+            .into_iter()
+            .flat_map(|pid| {
+                crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine)
+            })
+            .collect();
+        crate::store::registry::try_get(model, engine).map_or(0, |stores| {
+            stores.rs.lock().unwrap().suspendable(&resting).slots
+        })
+    }
+
+    /// A launch is taking this holder's set: no one's victim from here.
+    pub fn claim_holder(&self, pid: ProcessId) {
         self.with_inner(|inner| {
-            let rank = inner.procs.get(&process).map(|p| (p.key, p.seq));
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.idle = false;
+            }
+        });
+    }
+
+    /// The launch did not happen.
+    pub fn unclaim_holder(self: &Arc<Self>, pid: ProcessId) {
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.idle = true;
+            }
+        });
+        self.poke();
+    }
+
+    /// Whether an eviction has this holder's set in hand.
+    pub fn holder_moving(&self, pid: ProcessId) -> bool {
+        self.lock_inner()
+            .procs
+            .get(&pid)
+            .is_some_and(|proc| proc.state == Residency::Evicting)
+    }
+
+    /// `pid` took sets that are off the device: it restores them before it
+    /// runs, as if it had been evicted with them.
+    pub fn owe(self: &Arc<Self>, pid: ProcessId, demand: Demand) {
+        self.with_inner(|inner| {
             let Some(proc) = inner.procs.get_mut(&pid) else {
                 return;
             };
-            if let Some((key, seq)) = rank {
-                proc.key = key;
-                proc.seq = seq;
-            }
-            if let Some(owed) = owed {
-                if proc.state == Residency::Resident {
-                    proc.state = Residency::Evicted;
-                    proc.parked = Some(owed);
-                } else if proc.parked.is_some() {
-                    proc.parked = Some(owed);
-                }
-            }
+            proc.state = Residency::Evicted;
+            inner.enqueue(pid, WaitKind::Restore { demand });
         });
-        self.set_idle(pid, false);
-    }
-
-    /// A recall that came to nothing: back at the end of the line, idle.
-    pub fn rest_holder(self: &Arc<Self>, pid: ProcessId) {
-        self.with_inner(|inner| {
-            let seq = inner.next_seq;
-            inner.next_seq += 1;
-            if let Some(proc) = inner.procs.get_mut(&pid) {
-                proc.rest(seq);
-            }
-        });
-        self.set_idle(pid, true);
+        self.poke();
     }
 
     pub fn register_with_seq(&self, pid: ProcessId, seq: u64) {
