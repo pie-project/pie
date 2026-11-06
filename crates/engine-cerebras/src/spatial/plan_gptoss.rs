@@ -322,11 +322,13 @@ MODE:0,OVL:0,VMC:1,CAP:64,iters:1";
 
 /// The levered build (codegen::serve_gptoss_with): the attention units with
 /// the grids' levers at pages of one position (PS 1: HV; NB 32 x E 32 over
-/// the 42 attention rows, 1,344 positions a lane), the MoE units' MOE 1.
+/// the 42 attention rows, 1,344 positions a lane) and ARF 3, the MoE units'
+/// MOE 3 (bf16 decode runs), x in 2 bf16 parts (NP 2: numpy teacher-forced
+/// over both f32 goldens, 0 mismatches).
 pub const GPTOSS_20B_B1_LEV: &str = "PX:128,AY:42,AHc:69,MY:192,MHc:15,HR:2880,Dc:4,Gs:16,Qh:8,\
 Ic:23,NE:32,TK:4,AGY:14,MGY:16,GW:5,GH:5,NL:24,SLW:5592405,WIN:128,RTR:6,RTI:6,PS:1,NB:32,E:32,\
-B:1,MC:1,NP:3,PROF:0,TIME:0,HROUTE:1,KV16:0,HH:1152,Vr:176,Gx:8,Gy:24,vocab:201088,PASSES:3,\
-MODE:0,OVL:0,VMC:1,CAP:64,QKN:0,SPD:1,LSE:1,OP2:1,QKV1:1,OP3:1,GRD:2,MOE:1,iters:1";
+B:1,MC:1,NP:2,PROF:0,TIME:0,HROUTE:1,KV16:0,HH:1152,Vr:176,Gx:8,Gy:24,vocab:201088,PASSES:3,\
+MODE:0,OVL:0,VMC:1,CAP:64,QKN:0,SPD:1,LSE:1,OP2:1,QKV1:1,OP3:1,GRD:3,ARF:3,MOE:3,iters:1";
 
 /// The in-tree build's params for `spec`: [`GPTOSS_20B_B1`] at pages of 16,
 /// [`GPTOSS_20B_B1_LEV`] at pages of 1, if the model is the one they place
@@ -468,11 +470,11 @@ mod tests {
         assert_eq!(prog.rectangle(), (747, 1170));
         let v = prog.model.variant();
         assert!(v.identity_qk_norm && v.speed && v.lse && v.ops2 && v.qkv1);
-        assert!(v.op3 == 1 && v.grid == 2 && v.arf == 0 && v.f16 == 0 && v.eps_bits.is_none());
-        assert_eq!(prog.knob("MOE"), Some("1"));
+        assert!(v.op3 == 1 && v.grid == 3 && v.arf == 3 && v.f16 == 0 && v.eps_bits.is_none());
+        assert_eq!(prog.knob("MOE"), Some("3"));
         let g = prog.gptoss().unwrap();
-        assert!(!g.kv16 && g.qkv1);
-        let files = serve_gptoss_with(v, 1).unwrap();
+        assert!(!g.kv16 && g.qkv1 && g.arf == 3);
+        let files = serve_gptoss_with(v, 3).unwrap();
         let layout = &files.iter().find(|f| f.0 == "layout.csl").unwrap().1;
         for (k, _) in &params {
             assert!(layout.contains(&format!("param {k}:")), "{k} not declared");
@@ -480,7 +482,7 @@ mod tests {
         let attn = &files.iter().find(|f| f.0 == "attn_pe.csl").unwrap().1;
         assert!(attn.contains("gptoss_attn (levered)") && attn.contains("(qkv1)"));
         let moe = &files.iter().find(|f| f.0 == "moe_pe.csl").unwrap().1;
-        assert!(moe.contains("(moe1)"));
+        assert!(moe.contains("(moe1)") && moe.contains("(moe2)"));
         assert!(program_params(&s, 1, 8).is_err());
     }
 
