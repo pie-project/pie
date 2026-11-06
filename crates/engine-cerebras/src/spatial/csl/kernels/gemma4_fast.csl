@@ -23,7 +23,9 @@
 //      values gathered [e][Dc], the scores and the values over (entry,
 //      head) at once;
 //   128 LSE's reference moved only when a pass's sum leaves [2^-30, 2^30]
-//      (any reference in range is exact; the move is the scalar log).
+//      (any reference in range is exact; the move is the scalar log);
+//   256 the softmax's element-wise work over the row's used entries only
+//      (the tables fill a row's entries from 0; the rest stay -1e30).
 // gemma4_layer: a Gemma 4 dense layer over qwen2d_paged's grid (below).
 // Against qwen35_attn: no attention gates; v RMS-normed per head without a
 // weight; the attention's and the MLP's outputs RMS-normed (gamma3, gamma4)
@@ -111,6 +113,20 @@ const FKV: bool = (G4F & 16) != 0 and OWN == 0;
 const FDEF: bool = (G4F & 32) != 0;
 const FHV: bool = (G4F & 64) != 0;
 const FLZ: bool = (G4F & 128) != 0;
+const FNE: bool = (G4F & 256) != 0;
+// (G4F 256) this pass's score slots in use on the row: (last used entry + 1) PS, >= PS.
+var nslot: u16 = TC;
+fn count_slots() void {
+  var n: u16 = 1;
+  var e: u16 = 0;
+  while (e < dims[1]) : (e += 1) {
+    var b: u16 = 0;
+    while (b < dims[0]) : (b += 1) {
+      if (eblk(b, e) != NONE and e + 1 > n) { n = e + 1; }
+    }
+  }
+  nslot = n * PS;
+}
 comptime {
   @comptime_assert(!FLSE or FEXP);
   @comptime_assert(!FQKN or B == 1);       // only a lane's own key is scaled after the scores
@@ -1100,7 +1116,8 @@ fn mark(slot: u16) void {
 
 fn bcast(comptime is_mul: bool) void {
   var t: u16 = 0;
-  while (t < dims[2]) : (t += 1) {
+  const nt = if (FNE) nslot else dims[2];
+  while (t < nt) : (t += 1) {
     const r = at(srow_dsd, t * N2B);
     if (is_mul) { @fmuls(r, r, bcv_dsd); } else { @fsubs(r, r, bcv_dsd); }
   }
@@ -1234,6 +1251,7 @@ fn values_hv() void {
 }
 
 fn scores() void {
+  if (FNE) { count_slots(); }
   if (FHV) { scores_hv(); return; }
   @fmovs(s_scores, -1.0e30);
   var b: u16 = 0;
@@ -1523,14 +1541,17 @@ fn layer() void {
       // and p's sums (o_l); 7: both summed over the rows.
       @fmovs(bcv_dsd, mref_dsd);
       bcast(false);
-      @fnegs(s_scores, s_scores);
-      @fmaxs(s_scores, s_scores, -75.0);
-      @fnegs(s_scores, s_scores);
-      exp_fast(s_scores, et_dsd, &et, eks_d, NS);
+      const nw = if (FNE) nslot * N2B else NS;
+      const su = @set_dsd_length(s_scores, nw);
+      const eu = @set_dsd_length(et_dsd, nw);
+      @fnegs(su, su);
+      @fmaxs(su, su, -75.0);
+      @fnegs(su, su);
+      exp_fast(su, eu, &et, eks_d, nw);
       mark(5);
       values();
-      @fmovs(et_dsd, s_scores);
-      halve(et_dsd, TC, N2B, false);
+      @fmovs(eu, su);
+      halve(eu, if (FNE) nslot else TC, N2B, false);
       @fmovs(o_l, @set_dsd_length(et_dsd, N2B));
       mark(6);
       allreduce(false, o_lall, ACT2);
