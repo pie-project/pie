@@ -1456,6 +1456,23 @@ fn delta(
             } else {
                 (4_194_304 / stride).clamp(1, t)
             };
+            let rounds = t / round;
+            if rounds > 1 && t % round == 0 {
+                // The rounds in a loop: unrolled, the program (and its
+                // compile, a minute at 128 lanes) grows with the fire's lanes.
+                let (yv, slab) = decode_rounds(
+                    fq,
+                    heads,
+                    [lanes.slot, lanes.write],
+                    [hh, dk, dv],
+                    slab,
+                    per,
+                    round,
+                    rounds,
+                    input.rule(),
+                )?;
+                return Ok((yv, slab));
+            }
             let orig_slab = slab;
             let mut slab = slab;
             let mut ys = Vec::new();
@@ -1528,6 +1545,81 @@ fn delta(
         }
     };
     Ok((yv, slab))
+}
+
+/// A decode's `rounds` rounds of `round` lanes, each gathered from the slab,
+/// stepped and landed: the first traced as it is, the rest one loop body.
+/// One slab is carried: a lane's slot is its own, so a round reads no slot an
+/// earlier one wrote (but the sink's), and a second slab beside it would
+/// copy the whole bank.
+#[allow(clippy::too_many_arguments)]
+fn decode_rounds(
+    f: &mut Func,
+    heads: Heads,
+    [slot, write]: [Val; 2],
+    [hh, dk, dv]: [i64; 3],
+    slab: Val,
+    per: i64,
+    round: i64,
+    rounds: i64,
+    rule: bool,
+) -> Built<(Val, Val)> {
+    // `a`: the slab, q, k, v, g, beta, slot, write.
+    let step = |f: &mut Func, lo: Val, a: &[Val]| -> Built<(Val, Val)> {
+        let cut = |f: &mut Func, x: Val| -> Built<Val> {
+            let mut d = f.dims(x).to_vec();
+            let zero = f.const_i(Elem::I32, 0, &[]);
+            let mut starts = vec![lo];
+            starts.extend(std::iter::repeat_n(zero, d.len() - 1));
+            d[0] = round;
+            f.dynamic_slice(x, &starts, &d)
+        };
+        let part = Heads {
+            q: cut(f, a[1])?,
+            k: cut(f, a[2])?,
+            v: cut(f, a[3])?,
+            g: cut(f, a[4])?,
+            beta: cut(f, a[5])?,
+        };
+        let (slot, write) = (cut(f, a[6])?, cut(f, a[7])?);
+        let s = take_slots(f, a[0], slot, per)?;
+        let s = f.reshape(s, &[round, hh, dk, dv])?;
+        let (yv, s) = delta_step(f, &part, s, rule)?;
+        let s = f.reshape(s, &[round, hh * dk * dv])?;
+        Ok((yv, land_slots(f, a[0], slot, write, s, per)?))
+    };
+    let at = |f: &mut Func, x: Val, lo: Val| -> Vec<Val> {
+        let zero = f.const_i(Elem::I32, 0, &[]);
+        let mut starts = vec![lo];
+        starts.extend(std::iter::repeat_n(zero, f.dims(x).len() - 1));
+        starts
+    };
+    let mut args = vec![
+        slab, heads.q, heads.k, heads.v, heads.g, heads.beta, slot, write,
+    ];
+    let lo = f.const_i(Elem::I32, 0, &[]);
+    let (y0, slab) = step(f, lo, &args)?;
+    let mut dims = f.dims(y0).to_vec();
+    dims[0] *= rounds;
+    let ys = f.const_f(f.elem(y0), 0.0, &dims);
+    let starts = at(f, y0, lo);
+    let ys = f.dynamic_update_slice(ys, y0, &starts)?;
+    args[0] = slab;
+    args.insert(0, ys);
+    // `a`: the outputs, then `step`'s.
+    let out = f.for_loop(rounds - 1, &args, |f, c, a| {
+        let one = f.const_i(Elem::I32, 1, &[]);
+        let r = f.add(c, one)?;
+        let n = f.const_i(Elem::I32, round, &[]);
+        let lo = f.mul(r, n)?;
+        let (y, slab) = step(f, lo, &a[1..])?;
+        let starts = at(f, y, lo);
+        let ys = f.dynamic_update_slice(a[0], y, &starts)?;
+        let mut next = vec![ys, slab];
+        next.extend_from_slice(&a[2..]);
+        Ok(next)
+    })?;
+    Ok((out[0], out[1]))
 }
 
 fn gdn_in(

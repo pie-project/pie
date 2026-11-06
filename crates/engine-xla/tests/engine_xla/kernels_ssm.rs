@@ -1083,6 +1083,67 @@ fn the_gated_delta_step_folds_one_token_per_lane() {
     assert_close(&b.read_f32(bank), &want, 1e-5, 1e-4);
 }
 
+/// A decode over a bank of wide slots (a slot's state is blocks of rows)
+/// steps its lanes in rounds, the rounds past the first in a loop: each lane
+/// still folds its token into its own slot.
+#[test]
+fn the_gated_delta_decode_in_rounds_folds_one_token_per_lane() {
+    let g = Gdn {
+        hk: 1,
+        hv: 64,
+        dk: 128,
+        dv: 128,
+    };
+    // A 4 MiB round holds 4 of these 1M-element states: 8 lanes are 2 rounds.
+    let (rows, slots, width) = (8usize, 9usize, 16384usize);
+    let per = g.stride() / width;
+    let mut rng = Rng(23);
+    let (qkv, gates) = gdn_inputs(&mut rng, &g, rows);
+    let bank0 = rng.f32s(slots * g.stride(), -0.5, 0.5);
+    let slot_of = [7i32, 2, 3, 0, 4, 8, 1, 5];
+    let mut b = Bench::new();
+    let x = b.bf16(rows as u32, g.width() as u32, &qkv);
+    let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
+    let gt = b.f32(rows as u32, (2 * g.hv) as u32, &gates);
+    let bank = b.f32((slots * per) as u32, width as u32, &bank0);
+    let sl = b.i32(rows as u32, 1, &slot_of);
+    let y = b.zeros(Dtype::F32, rows as u32, (g.hv * g.dv) as u32);
+    let p = pool(bank, sl);
+    if !b
+        .run(|ctx| {
+            ssm::gated_delta(
+                ctx,
+                x,
+                z,
+                gt,
+                &p,
+                g.hk as u32,
+                g.hv as u32,
+                g.dk as u32,
+                g.dv as u32,
+                y,
+            )
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let mut want = bank0.clone();
+    let got = b.read_f32(y);
+    let w = g.hv * g.dv;
+    for t in 0..rows {
+        let s = slot_of[t] as usize;
+        let yr = g.token(
+            &qkv,
+            &gates,
+            t,
+            &mut want[s * g.stride()..(s + 1) * g.stride()],
+        );
+        assert_close(&got[t * w..(t + 1) * w], &yr, 1e-4, 1e-3);
+    }
+    assert_close(&b.read_f32(bank), &want, 1e-5, 1e-4);
+}
+
 #[test]
 fn the_chunked_gated_delta_matches_the_token_walk() {
     let g = Gdn {
