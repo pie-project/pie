@@ -220,7 +220,7 @@ fn mvp(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
 // multicast's (iq6) on their own colours (rcfg[RQ + 12 ..]: GDN's (k, q) multicast, the
 // scores' level 1, level 2, output, multicast), static routes; mode 0 restores.
 fn qmode(m: u16) void {
-  while ((tile_config.output_queue_status.get_raw() & 0x0100) == 0) {}   // oq2 empty
+  while ((tile_config.output_queue_status.get_raw() & 0x0400) == 0) {}   // oq2 empty (bit 0x100 << q)
   if (m == 0) {
     iqc(2, rcfg[RQ]); iqc(3, rcfg[RQ + 1]); iqc(6, rcfg[RQ + 4]); oqc(2, rcfg[RQ + 6]);
   } else if (m == 1) {
@@ -370,13 +370,13 @@ fn att_mix(a: u16) void {
     h = 0;
     while (h < Qh) : (h += 1) { mvp(@ptrcast([*]u16, &vc[1 + vb]), NE, Dc + 1, h * NE, h * (Dc + 1)); }
     send_y(Qh * (Dc + 1));
-    // o (the o_proj's x) and the redo word
+    // o (the o_proj's x), then the redo word and the heads' log-sum-exp steps (every pass)
     @fs2h(@set_dsd_length(xh_d, QO), fin(q_ym, QO));
-    @fmovs(@set_dsd_length(sx_d, 1), fin(q_ym, 1));
+    @fmovs(@set_dsd_length(sx_d, 1 + Qh), fin(q_ym, 1 + Qh));
+    h = 0;
+    while (h < Qh) : (h += 1) { mref[a * Qh + h] += sx[1 + h]; }
     if (sx[0] == 0.0) { apass = 8; } else {
       @fs2h(@set_dsd_length(xh_d, Qh * Dc), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * Dc} -> ab[i] }));
-      h = 0;
-      while (h < Qh) : (h += 1) { mref[a * Qh + h] += sx[1 + h]; }
     }
   }
 }

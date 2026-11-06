@@ -1,0 +1,141 @@
+// split/ctl_cx.csl: the role-split layout's row control PE (CX_r; scratch/split/README.md).
+//
+// One a unit row, at the middle column: the root of the row reductions (o-proj and down
+// partials of the row's weight PEs, the two halves merged word by word through a FIFO and
+// taken back over a loop-back colour), the row's x chunk (Hc f32), the residuals, the
+// RMSNorm gamma (x rounded to f16 times the f16 gamma: TRM 512's form; the rms scale is
+// applied by CY after the column reduction, from the sum of squares sent here), and the
+// unit handoff of x (in from the unit before, out to the next).
+// A layer: x_r g1 (+ ssq) multicast; o-proj reduction in -> x += o; x g2 (+ ssq) multicast;
+// down reduction in -> x += d; (next layer). The pass ends with x sent on.
+param memcpy_params;
+param K: u16;          // layers on the unit
+param Hc: u16;         // x dims a row
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+const tgt = tile_config.target;
+
+var x = @zeros([Hc]f32);
+var x_ptr: [*]f32 = &x;
+var gam = @zeros([2 * K * Hc]@fp16());   // [layer][g1 | g2], the host's f16 gammas (1 + w)
+var gam_ptr: [*]@fp16() = &gam;
+var t = @zeros([Hc + 1]f32);             // the merged partial; then the multicast's words
+var th = @zeros([Hc]@fp16());
+const x_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> x[i] });
+const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> t[i] });
+const t1_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc + 1} -> t[i] });
+const th_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> th[i] });
+var g_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> gam[i] });
+
+// iq2 / iq3: the west / east halves' level-2 streams; oq2 the merge out on the loop-back
+// colour, iq4 its return; oq3 the row multicast; iq5 / oq4 the handoff in / out.
+const q_w = @get_input_queue(2);
+const q_e = @get_input_queue(3);
+const q_lb = @get_input_queue(4);
+const q_hi = @get_input_queue(5);
+const q_lo = @get_output_queue(2);
+const q_mc = @get_output_queue(3);
+const q_ho = @get_output_queue(4);
+const C_PARK: color = @get_color(16);
+const ut_a = @get_ut_id(4);
+const ut_b = @get_ut_id(5);
+var fifo_buf = @zeros([32]f32);
+const fifo = @allocate_fifo(fifo_buf);
+fn fout(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fin(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+
+// rcfg (host): [0] routes n, [1..1+2n) (colour, low route byte), [RQ..RQ+7) queue colours
+// (iq2..iq5, oq2..oq4), [RQ+7] flags (bit 0 first unit: x from the embedding / host,
+// bit 1 last unit: x to the head).
+const NR: u16 = 8;
+const RQ: u16 = 1 + 2 * NR;
+var rcfg = @zeros([RQ + 8]u32);
+var rcfg_ptr: [*]u32 = &rcfg;
+fn iqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
+  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
+}
+fn oqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
+  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
+}
+fn init() void {
+  const cc0 = color_config.get_color_config_addr(@get_color(0));
+  var k: u16 = 0;
+  while (k < @as(u16, rcfg[0])) : (k += 1) {
+    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
+    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
+    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
+  }
+  iqc(2, rcfg[RQ]); iqc(3, rcfg[RQ + 1]); iqc(4, rcfg[RQ + 2]); iqc(5, rcfg[RQ + 3]);
+  oqc(2, rcfg[RQ + 4]); oqc(3, rcfg[RQ + 5]); oqc(4, rcfg[RQ + 6]);
+  sys_mod.unblock_cmd_stream();
+}
+
+// The row reduction's sum into t (both halves at once; the merge comes back over the loop-back).
+fn reduce() void {
+  @fmovs(fifo, fin(q_e, Hc), .{ .async = true, .ut_id = ut_a });
+  @fadds(fout(q_lo, Hc), fin(q_w, Hc), fifo, .{ .async = true, .ut_id = ut_b });
+  @fmovs(t_d, fin(q_lb, Hc));
+}
+// x g (f16) and the sum of squares of x, multicast along the row (Hc + 1 f32 words).
+fn norm_send(gi: u16) void {
+  var ss: f32 = 0.0;
+  var i: u16 = 0;
+  while (i < Hc) : (i += 1) { const v = x[i]; ss += v * v; }
+  @fs2h(th_d, x_d);
+  const g = @increment_dsd_offset(g_d, @as(i16, gi * Hc), @fp16());
+  @fmulh(th_d, th_d, g);
+  @fh2s(t_d, th_d);
+  t[Hc] = ss;
+  @fmovs(fout(q_mc, Hc + 1), t1_d);
+}
+
+var n_steps: u32 = 0;
+const pass_id: local_task_id = @get_local_task_id(8);
+task pass_task() void {
+  var s: u32 = 0;
+  while (s < n_steps) : (s += 1) {
+    @fmovs(x_d, fin(q_hi, Hc));
+    var l: u16 = 0;
+    while (l < K) : (l += 1) {
+      norm_send(2 * l);
+      reduce();
+      @fadds(x_d, x_d, t_d);
+      norm_send(2 * l + 1);
+      reduce();
+      @fadds(x_d, x_d, t_d);
+    }
+    @fmovs(fout(q_ho, Hc), x_d);
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn compute(steps: u32, start_pos: u32) void {
+  n_steps = steps;
+  @activate(pass_id);
+}
+
+comptime {
+  @bind_local_task(pass_task, pass_id);
+  @initialize_queue(q_w, .{ .color = C_PARK });
+  @initialize_queue(q_e, .{ .color = C_PARK });
+  @initialize_queue(q_lb, .{ .color = C_PARK });
+  @initialize_queue(q_hi, .{ .color = C_PARK });
+  @initialize_queue(q_lo, .{ .color = C_PARK });
+  @initialize_queue(q_mc, .{ .color = C_PARK });
+  @initialize_queue(q_ho, .{ .color = C_PARK });
+  @export_symbol(x_ptr, "x");
+  @export_symbol(gam_ptr, "gam");
+  @export_symbol(rcfg_ptr, "rcfg");
+  @export_symbol(init);
+  @export_symbol(compute);
+}
+//@@ dummies

@@ -1,0 +1,350 @@
+// split/ctl_cy_q35.csl: the role-split layout's column control PE for Qwen3.5 (CY_c;
+// scratch/split/README.md section 3). One a unit column, at the middle row: the root of the
+// column reductions of the column's weight PEs (split/weight_q35.csl) and all of the layer's
+// column-local element-wise work:
+// - GDN: rms scale; conv1d (CONV taps) and SiLU on the column's q / k / v channels; beta =
+//   sigmoid(b), decay = exp(-exp(A) softplus(a + dt)); multicast [k | q | decay]; from the
+//   state reduction delta = (v - S^T k / |k|) beta and o = (S^T q + delta (k.q) / |k|) / |q|
+//   (q pre-scaled by 1/sqrt(dk)); the gated RMSNorm (sums over the v head's columns by a
+//   segment all-reduce on the control row) times silu(z); multicast [o | delta / |k|].
+// - attention: rms scale; the q/k norms' weights (their rms rides in the weight PEs' score
+//   segment all-reduce); partial RoPE from 4-level tables; multicast [q | k | v | slot];
+//   from the values reduction o / l, the sum's log-sum-exp step and the redo flag; o times
+//   sigmoid(gate); multicast [o | redo | steps].
+// - MLP: rms scale, SiLU(g) u, multicast act.
+// Kinds by layer: KM bit l (1 attention). Column dims per kind are params.
+param memcpy_params;
+param K: u16;
+param KM: u16;
+param NQA: u16;        // attention reduction words before ssq: Qh Dc q | Qh Dc gate | Dc k | Dc v
+param NQG: u16;        // GDN: DK q | DK k | DV v | DV z | b | a
+param Qh: u16;
+param Dc: u16;
+param DK: u16;         // GDN q / k dims a column
+param DV: u16;         // GDN v dims a column
+param Ic: u16;
+param HR: u16;         // hidden size (RMSNorm)
+param CONV: u16;       // conv kernel (4)
+param NROT: u16;       // rotated pairs a column (partial RoPE)
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+const tgt = tile_config.target;
+fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+fn nla() u16 { var n: u16 = 0; var l: u16 = 0; while (l < K) : (l += 1) { if (((KM >> l) & 1) == 1) { n += 1; } } return n; }
+const NLA: u16 = nla();
+const NLG: u16 = K - NLA;
+const NCH: u16 = 2 * DK + DV;              // conv channels a column
+const TN: u16 = mx(mx(NQA + 1, NQG + 1), mx(2 * Ic + 1, 2 * DV + 3));
+const EPS: f32 = 1.0e-6;
+const HID: f32 = @as(f32, HR);
+
+var t = @zeros([TN]f32);                   // a reduction's sum
+var u = @zeros([TN]f32);                   // the multicast's words
+const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TN} -> t[i] });
+const u_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TN} -> u[i] });
+fn tv(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(t_d, @as(i16, o), f32), n); }
+fn uv(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(u_d, @as(i16, o), f32), n); }
+
+// GDN per layer: conv window [CONV - 1][NCH], conv weights [CONV][NCH], [A, dt] for b/a,
+// the gated norm's weights (DV), z kept between the two reductions.
+var cwin = @zeros([if (NLG > 0) NLG * (CONV - 1) * NCH else 1]f32);
+var cw = @zeros([if (NLG > 0) NLG * CONV * NCH else 1]f32);
+var gpar = @zeros([if (NLG > 0) NLG * 2 else 1]f32);
+var gnw = @zeros([if (NLG > 0) NLG * DV else 1]f32);
+var zs = @zeros([mx(DV, 1)]f32);
+var vs = @zeros([mx(DV, 1)]f32);
+var gsc = @zeros([4]f32);                  // beta, decay, then the norms' scalars
+// attention per layer: q / k norm weights (Qh Dc, Dc), RoPE tables [4][8][NROT] cos | sin,
+// the gate kept between the reductions, the LSE reference a head.
+var qkw = @zeros([if (NLA > 0) NLA * (Qh * Dc + Dc) else 1]f32);
+var rot = @zeros([if (NLA > 0) 4 * 8 * 2 * NROT else 1]f32);
+var gate = @zeros([if (NLA > 0) Qh * Dc else 1]f32);
+var rc = @zeros([mx(NROT, 1)]f32);
+var rs = @zeros([mx(NROT, 1)]f32);
+var tab = @zeros([4]u32);                  // the host: [position, slot word, 0, 0] a pass
+var cw_ptr: [*]f32 = &cw;
+var gpar_ptr: [*]f32 = &gpar;
+var gnw_ptr: [*]f32 = &gnw;
+var qkw_ptr: [*]f32 = &qkw;
+var rot_ptr: [*]f32 = &rot;
+var tab_ptr: [*]u32 = &tab;
+
+// ---------------------------------------------------------------- fabric
+// iq2 / iq3 the column reduction's two halves, oq2 their merge on the loop-back colour,
+// iq4 its return; oq3 the column multicast; iq5 / oq4 the control row's segment
+// all-reduce (GDN's o-norm sums).
+const q_n = @get_input_queue(2);
+const q_s = @get_input_queue(3);
+const q_lb = @get_input_queue(4);
+const q_si = @get_input_queue(5);
+const q_lo = @get_output_queue(2);
+const q_mc = @get_output_queue(3);
+const q_so = @get_output_queue(4);
+const C_PARK: color = @get_color(16);
+const ut_a = @get_ut_id(4);
+const ut_b = @get_ut_id(5);
+var fifo_buf = @zeros([32]f32);
+const fifo = @allocate_fifo(fifo_buf);
+fn fout(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fin(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+const NR: u16 = 8;
+const RQ: u16 = 1 + 2 * NR;
+var rcfg = @zeros([RQ + 8]u32);
+var rcfg_ptr: [*]u32 = &rcfg;
+var role_s: u16 = 0;     // the segment all-reduce: 0 start, 1 add-forward, 4 root (others multicast)
+fn iqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
+  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
+}
+fn oqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
+  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
+}
+fn init() void {
+  const cc0 = color_config.get_color_config_addr(@get_color(0));
+  var k: u16 = 0;
+  while (k < @as(u16, rcfg[0])) : (k += 1) {
+    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
+    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
+    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
+  }
+  iqc(2, rcfg[RQ]); iqc(3, rcfg[RQ + 1]); iqc(4, rcfg[RQ + 2]); iqc(5, rcfg[RQ + 3]);
+  oqc(2, rcfg[RQ + 4]); oqc(3, rcfg[RQ + 5]); oqc(4, rcfg[RQ + 6]);
+  role_s = @as(u16, rcfg[RQ + 7]);
+  sys_mod.unblock_cmd_stream();
+}
+
+// The column reduction's n words into t (both halves at once, back over the loop-back).
+fn reduce(n: u16) void {
+  @fmovs(fifo, fin(q_s, n), .{ .async = true, .ut_id = ut_a });
+  @fadds(fout(q_lo, n), fin(q_n, n), fifo, .{ .async = true, .ut_id = ut_b });
+  @fmovs(tv(0, n), fin(q_lb, n));
+}
+fn mcast(n: u16) void { @fmovs(fout(q_mc, n), uv(0, n)); }
+// A small all-reduce over the control row's segment (n <= 4 words of gsc[2..]).
+fn seg_ar(n: u16) void {
+  const d = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{4} -> gsc[i] }), n);
+  if (role_s == 4) {
+    @fadds(d, d, fin(q_si, n));
+    @fmovs(fout(q_so, n), d);
+  } else {
+    if (role_s == 0) { @fmovs(fout(q_so, n), d); } else { @fadds(fout(q_so, n), fin(q_si, n), d); }
+    @fmovs(d, fin(q_si, n));
+  }
+}
+
+// ---------------------------------------------------------------- scalar math
+fn rsqrt(v: f32) f32 {
+  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
+  y = y * (1.5 - 0.5 * v * y * y);
+  y = y * (1.5 - 0.5 * v * y * y);
+  y = y * (1.5 - 0.5 * v * y * y);
+  return y;
+}
+fn exp1(x0: f32) f32 {
+  var x: f32 = if (x0 < -87.0) -87.0 else if (x0 > 88.0) 88.0 else x0;
+  var k: f32 = x * 1.4426950408889634 + 12582912.0;
+  k = k - 12582912.0;
+  const r = x - k * 0.6931471805599453;
+  var p: f32 = 0.0013888889;
+  p = p * r + 0.008333334;
+  p = p * r + 0.041666668;
+  p = p * r + 0.16666667;
+  p = p * r + 0.5;
+  p = p * r + 1.0;
+  p = p * r + 1.0;
+  const ki = @as(i16, k) + 127;
+  const s = @bitcast(f32, @as(u32, @as(u16, ki)) << 23);
+  return p * s;
+}
+fn recip(v: f32) f32 { const r = rsqrt(v * v); return if (v < 0.0) -r else r; }
+fn sigm(x: f32) f32 { return recip(1.0 + exp1(-x)); }
+fn silu(x: f32) f32 { return x * sigm(x); }
+fn ln1(x: f32) f32 {
+  // ln(x), x > 0: exponent bits plus 2 atanh((m - 1) / (m + 1)) to the 7th power
+  const b = @bitcast(u32, x);
+  const e = @as(f32, @as(i16, @as(u16, (b >> 23) & 0xff)) - 127);
+  const m = @bitcast(f32, (b & 0x007fffff) | 0x3f800000);
+  const z = (m - 1.0) * recip(m + 1.0);
+  const z2 = z * z;
+  const p = z * (2.0 + z2 * (0.6666667 + z2 * (0.4 + z2 * 0.2857143)));
+  return e * 0.6931471805599453 + p;
+}
+fn softplus(x: f32) f32 { return if (x > 20.0) x else ln1(1.0 + exp1(x)); }
+
+// ---------------------------------------------------------------- layers
+fn gdn(g: u16) void {
+  const N = NQG + 1;
+  reduce(N);
+  const rr = rsqrt(t[NQG] / HID + EPS);
+  @fmuls(tv(0, NQG), tv(0, NQG), rr);
+  // conv1d over the window and the new value, SiLU
+  const wb = g * (CONV - 1) * NCH;
+  var c: u16 = 0;
+  while (c < NCH) : (c += 1) {
+    var acc: f32 = t[c] * cw[g * CONV * NCH + (CONV - 1) * NCH + c];
+    var j: u16 = 0;
+    while (j < CONV - 1) : (j += 1) { acc += cwin[wb + j * NCH + c] * cw[g * CONV * NCH + j * NCH + c]; }
+    j = 0;
+    while (j + 1 < CONV - 1) : (j += 1) { cwin[wb + j * NCH + c] = cwin[wb + (j + 1) * NCH + c]; }
+    cwin[wb + (CONV - 2) * NCH + c] = t[c];
+    t[c] = silu(acc);
+  }
+  // gates
+  const bt = sigm(t[2 * DK + 2 * DV]);
+  const dec = exp1(-exp1(gpar[2 * g]) * softplus(t[2 * DK + 2 * DV + 1] + gpar[2 * g + 1]));
+  @fmovs(uv(0, DK), tv(DK, DK));          // k
+  @fmovs(uv(DK, DK), tv(0, DK));          // q
+  u[2 * DK] = dec;
+  u[2 * DK + 1] = 0.0;
+  @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vs[i] }), DV), tv(2 * DK, DV));
+  @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> zs[i] }), DV), tv(2 * DK + DV, DV));
+  mcast(2 * DK + 2);
+  // the state reduction: S^T k | S^T q | k^2 | q^2 | k.q
+  reduce(2 * DV + 3);
+  const ik = rsqrt(t[2 * DV] + EPS);
+  const iq = rsqrt(t[2 * DV + 1] + EPS);
+  const kq = t[2 * DV + 2] * ik * iq;
+  var ss: f32 = 0.0;
+  var i: u16 = 0;
+  while (i < DV) : (i += 1) {
+    const dl = (vs[i] - t[i] * ik) * bt;
+    const o = t[DV + i] * iq + dl * kq;
+    u[i] = o;
+    u[DV + i] = dl * ik;
+    ss += o * o;
+  }
+  gsc[2] = ss;
+  seg_ar(1);
+  const on = rsqrt(gsc[2] / 128.0 + EPS);
+  i = 0;
+  while (i < DV) : (i += 1) { u[i] = u[i] * on * gnw[g * DV + i] * silu(zs[i]); }
+  mcast(2 * DV);
+}
+
+fn rope_tables() void {
+  // cos / sin of the pass's position for each rotated pair: products of 4 table levels
+  const p = tab[0];
+  var j: u16 = 0;
+  while (j < NROT) : (j += 1) {
+    var c: f32 = 1.0;
+    var s: f32 = 0.0;
+    var lv: u16 = 0;
+    while (lv < 4) : (lv += 1) {
+      const d = @as(u16, (p >> @as(u16, 3 * (3 - lv))) & 7);
+      const o = ((lv * 8 + d) * 2) * NROT + j;
+      const c2 = rot[o];
+      const s2 = rot[o + NROT];
+      const cn = c * c2 - s * s2;
+      s = s * c2 + c * s2;
+      c = cn;
+    }
+    rc[j] = c;
+    rs[j] = s;
+  }
+}
+fn rope(o: u16) void {
+  // pairs (o + 2 j, o + 2 j + 1) of t: the host places each rotated pair's two halves adjacent
+  var j: u16 = 0;
+  while (j < NROT) : (j += 1) {
+    const a = t[o + 2 * j];
+    const b = t[o + 2 * j + 1];
+    t[o + 2 * j] = a * rc[j] - b * rs[j];
+    t[o + 2 * j + 1] = b * rc[j] + a * rs[j];
+  }
+}
+fn att(a: u16) void {
+  const N = NQA + 1;
+  const QD: u16 = Qh * Dc;
+  reduce(N);
+  const rr = rsqrt(t[NQA] / HID + EPS);
+  @fmuls(tv(0, NQA), tv(0, NQA), rr);
+  const qkb = a * (QD + Dc);
+  @fmuls(tv(0, QD), tv(0, QD), @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> qkw[i] }), QD));
+  @fmuls(tv(2 * QD, Dc), tv(2 * QD, Dc), @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> qkw[i] }), @as(i16, qkb + QD), f32), Dc));
+  rope_tables();
+  var h: u16 = 0;
+  while (h < Qh) : (h += 1) { rope(h * Dc); }
+  rope(2 * QD);
+  @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> gate[i] }), QD), tv(QD, QD));
+  @fmovs(uv(0, QD), tv(0, QD));
+  @fmovs(uv(QD, 2 * Dc), tv(2 * QD, 2 * Dc));
+  u[QD + 2 * Dc] = @bitcast(f32, tab[1]);
+  u[QD + 2 * Dc + 1] = 0.0;
+  mcast(QD + 2 * Dc + 2);
+  var pass: u16 = 0;
+  while (pass < 8) : (pass += 1) {
+    reduce(Qh * (Dc + 1));
+    var bad: f32 = 0.0;
+    h = 0;
+    while (h < Qh) : (h += 1) {
+      const l = t[h * (Dc + 1) + Dc];
+      if (l < 3.0e-24 or l > 2.0e30) { bad = 1.0; }
+      const il = recip(l);
+      var d: u16 = 0;
+      while (d < Dc) : (d += 1) { u[h * Dc + d] = t[h * (Dc + 1) + d] * il * sigm(gate[h * Dc + d]); }
+      u[QD + 1 + h] = -ln1(l);
+    }
+    u[QD] = bad;
+    mcast(QD + 1 + Qh);
+    if (bad == 0.0) { pass = 8; }
+  }
+}
+
+fn mlp() void {
+  reduce(2 * Ic + 1);
+  const rr = rsqrt(t[2 * Ic] / HID + EPS);
+  var i: u16 = 0;
+  while (i < Ic) : (i += 1) { u[i] = silu(t[i] * rr) * (t[Ic + i] * rr); }
+  mcast(Ic);
+}
+
+var n_steps: u32 = 0;
+const pass_id: local_task_id = @get_local_task_id(8);
+task pass_task() void {
+  var s: u32 = 0;
+  while (s < n_steps) : (s += 1) {
+    var l: u16 = 0;
+    var la: u16 = 0;
+    var lg: u16 = 0;
+    while (l < K) : (l += 1) {
+      if (((KM >> l) & 1) == 1) { if (NLA > 0) { att(la); } la += 1; }
+      else { if (NLG > 0) { gdn(lg); } lg += 1; }
+      mlp();
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn compute(steps: u32, start_pos: u32) void {
+  n_steps = steps;
+  @activate(pass_id);
+}
+
+comptime {
+  @bind_local_task(pass_task, pass_id);
+  @initialize_queue(q_n, .{ .color = C_PARK });
+  @initialize_queue(q_s, .{ .color = C_PARK });
+  @initialize_queue(q_lb, .{ .color = C_PARK });
+  @initialize_queue(q_si, .{ .color = C_PARK });
+  @initialize_queue(q_lo, .{ .color = C_PARK });
+  @initialize_queue(q_mc, .{ .color = C_PARK });
+  @initialize_queue(q_so, .{ .color = C_PARK });
+  @export_symbol(cw_ptr, "cw");
+  @export_symbol(gpar_ptr, "gpar");
+  @export_symbol(gnw_ptr, "gnw");
+  @export_symbol(qkw_ptr, "qkw");
+  @export_symbol(rot_ptr, "rot");
+  @export_symbol(tab_ptr, "tab");
+  @export_symbol(rcfg_ptr, "rcfg");
+  @export_symbol(init);
+  @export_symbol(compute);
+}
+//@@ dummies
