@@ -406,7 +406,7 @@ pub(crate) fn unit(
             let qkw = 2 * nh * dh + dc;
             put_pe16(k, dev, "wqa", at, nl * hc * qkw, |py, px, out| {
                 let (g, dl) = (px / gs, dl(px));
-                for li in 0..nl {
+                for (li, wv) in wv.iter().enumerate() {
                     for kk in 0..hc {
                         let col = dim(py, kk);
                         for half in [0, dh] {
@@ -417,7 +417,7 @@ pub(crate) fn unit(
                             }
                         }
                         for &dd in &dl {
-                            out.push(col.map_or(0, |c| u32::from(wv[li][(g * d + dd) * hid + c])));
+                            out.push(col.map_or(0, |c| u32::from(wv[(g * d + dd) * hid + c])));
                         }
                     }
                 }
@@ -1115,8 +1115,8 @@ mod tests {
             let y = f16v(h);
             assert_eq!(y.is_sign_negative(), x.is_sign_negative(), "{b:#x}");
             let (lo, hi) = (
-                f16v(h.wrapping_sub(1) & 0x7fff | (h & 0x8000)),
-                f16v((h & 0x7fff) + 1 | (h & 0x8000)),
+                f16v((h.wrapping_sub(1) & 0x7fff) | (h & 0x8000)),
+                f16v(((h & 0x7fff) + 1) | (h & 0x8000)),
             );
             let dist = |v: f64| {
                 if v.is_nan() {

@@ -3038,8 +3038,8 @@ mod llama31_8b {
     }
 
     /// `lever_d` + `hv` (with `speed`, `lse`, `head_one_pass`, CAP 128):
-    /// the plan states 0472's hardware build (lever D, Llama as 1 + 10 x 3
-    /// + 1 at RPY 208; HV's one-position pages), NP pinned to 1 as there,
+    /// the plan states 0472's hardware build (lever D, Llama as
+    /// 1 + 10 x 3 + 1 at RPY 208; HV's one-position pages), NP pinned to 1 as there,
     /// but for its TIME 1.
     #[test]
     fn the_plan_places_llama_3_lever_d_as_0472() {

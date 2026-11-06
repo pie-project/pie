@@ -497,6 +497,7 @@ impl WaferModel {
     /// for each, the max and the mean over its PEs a slot. The units count
     /// under TIME 1 (PROF 0: slot 0 the pass; PROF 1: a slot a phase), the
     /// head always. `zero` writes them back to 0 after the read.
+    #[allow(clippy::type_complexity)]
     pub fn profile(&mut self, zero: bool) -> R<Vec<(Rect, Vec<u32>, Vec<f64>)>> {
         const NP: usize = 16;
         let mut rects = self.design.grid_areas();
@@ -2153,7 +2154,9 @@ mod tests {
     #[ignore]
     fn place_on_a_recorder() {
         let dir = std::env::var("PLACE_CKPT").expect("PLACE_CKPT");
-        let params = super::super::program::parse_params(&std::env::var("PLACE_PARAMS").expect("PLACE_PARAMS"));
+        let params = super::super::program::parse_params(
+            &std::env::var("PLACE_PARAMS").expect("PLACE_PARAMS"),
+        );
         let design = ProgramSpec::from_params(ProgramSpec::infer_design(&params).unwrap(), &params)
             .expect("the program");
         let ckpt = Ckpt::open(Path::new(&dir)).expect("the checkpoint");
@@ -2162,7 +2165,10 @@ mod tests {
         for c in design.components() {
             c.routes(&design, &mut rec).expect("routes");
         }
-        let w = super::super::component::Weights { ckpt: &ckpt, rope: &theta };
+        let w = super::super::component::Weights {
+            ckpt: &ckpt,
+            rope: &theta,
+        };
         for c in design.components() {
             let t = Instant::now();
             c.place(&design, &w, &mut rec)

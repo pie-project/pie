@@ -186,17 +186,17 @@ impl G12Plan {
         }
         let kvd = spec.kv_heads * spec.head_dim;
         let dc = kvd / PX;
-        let gs = if dc > 0 { spec.head_dim / dc } else { 0 };
-        let gsg = if dc > 0 { spec.global_head_dim / dc } else { 0 };
-        let copies = if gsg > 0 { PX / gsg } else { 0 };
+        let gs = spec.head_dim.checked_div(dc).unwrap_or(0);
+        let gsg = spec.global_head_dim.checked_div(dc).unwrap_or(0);
+        let copies = PX.checked_div(gsg).unwrap_or(0);
         if dc * PX != kvd
-            || dc % 2 != 0
+            || !dc.is_multiple_of(2)
             || gs * dc != spec.head_dim
             || gsg * dc != spec.global_head_dim
             || copies == 0
-            || PX % gsg != 0
-            || spec.q_heads % copies != 0
-            || spec.q_heads % spec.kv_heads != 0
+            || !PX.is_multiple_of(gsg)
+            || !spec.q_heads.is_multiple_of(copies)
+            || !spec.q_heads.is_multiple_of(spec.kv_heads)
         {
             blockers.push(format!(
                 "kv {kvd} dims over {PX} columns: Dc {dc}, head_dim {} / global {} do not split evenly",
@@ -213,7 +213,7 @@ impl G12Plan {
             .sum();
         let knobs = G12 {
             kinds,
-            qhg: if copies > 0 { spec.q_heads / copies } else { 0 },
+            qhg: spec.q_heads.checked_div(copies).unwrap_or(0),
             gsg,
             win: spec.window,
             w4buf: W4BUF,
@@ -227,11 +227,7 @@ impl G12Plan {
             layers,
             dc,
             gs,
-            qh: if spec.kv_heads > 0 {
-                spec.q_heads / spec.kv_heads
-            } else {
-                0
-            },
+            qh: spec.q_heads.checked_div(spec.kv_heads).unwrap_or(0),
             ic,
             knobs,
             page_size: goals.page_size,
@@ -306,10 +302,10 @@ impl G12Plan {
         let width = rc * PX + PX + c + vmc + py / 4;
         // The layout's and the handoffs' rules (serve8b_region::Tables: the
         // last region hands down into the column's first grid from its rows).
-        if py % 4 != 0
+        if !py.is_multiple_of(4)
             || py > 2 * PX
-            || rpy % RGY != 0
-            || py % RGY != 0
+            || !rpy.is_multiple_of(RGY)
+            || !py.is_multiple_of(RGY)
             || rpy > 2 * PX
             || py > PX
             || !(rc % 2 == 0 || rr == 1)
@@ -327,9 +323,9 @@ impl G12Plan {
         // VM column; Gy the divisor of F nearest its square root.
         let gx = [8, 4, 2]
             .into_iter()
-            .find(|&gx| c % gx == 0 && (c / gx / 2) * gx + gx / 2 + 1 < c)?;
+            .find(|&gx| c.is_multiple_of(gx) && (c / gx / 2) * gx + gx / 2 + 1 < c)?;
         let gy = (1..=f)
-            .filter(|d| f % d == 0)
+            .filter(|d| f.is_multiple_of(*d))
             .min_by_key(|&d| (d * d).abs_diff(f))?;
         let most = wafer.pe_bytes - STACK_MARGIN;
         let ks = self.ks();
@@ -626,7 +622,10 @@ mod tests {
         // A tied checkpoint: embed only, no `head`.
         let tied = Ckpt::synthetic([("embed".to_string(), vec![262_144, 3840])]);
         assert!(tied.tied_head().unwrap());
-        program.head.validate(&program, &tied).expect("the tied head on G12");
+        program
+            .head
+            .validate(&program, &tied)
+            .expect("the tied head on G12");
         // 0389's params: the same without G12.
         let no_g12: Vec<_> = params.iter().filter(|(k, _)| k != "G12").cloned().collect();
         let err = ProgramSpec::from_params(Design::Serve8bRegion, &no_g12).unwrap_err();

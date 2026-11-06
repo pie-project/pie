@@ -1236,13 +1236,11 @@ var bo = @zeros([Hc]f32);\n\
 var bo_ptr: [*]f32 = &bo;\n\
 var snk = @zeros([NQB]f32);\n\
 var snk_ptr: [*]f32 = &snk;\n\
-
 const bqa_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NH * DHc} -> bqa[i] });\n\
 const bqv_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NH * DHc} -> bqv[i] });\n\
 const bv_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> bv[i] });\n\
 const bo_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> bo[i] });\n\
 const snk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NQB} -> snk[i] });\n\
-
 comptime {\n\
   @export_symbol(bqa_ptr, \"bqa\");\n\
   @export_symbol(bqv_ptr, \"bqv\");\n\
@@ -3174,12 +3172,17 @@ fn g12_reps(name: &str, reps: &mut Vec<Option<serde_json::Value>>) -> R<()> {
     };
     for (k, v) in set {
         if k == "+" {
-            for r in v.as_array().ok_or(format!("g12_ops.json: {name}.+ not a list"))? {
+            for r in v
+                .as_array()
+                .ok_or(format!("g12_ops.json: {name}.+ not a list"))?
+            {
                 reps.push(Some(r.clone()));
             }
             continue;
         }
-        let i: usize = k.parse().map_err(|_| format!("g12_ops.json: {name}.{k} is no index"))?;
+        let i: usize = k
+            .parse()
+            .map_err(|_| format!("g12_ops.json: {name}.{k} is no index"))?;
         let at = reps
             .get_mut(i)
             .ok_or(format!("g12_ops.json: {name} has no patch {i}"))?;
@@ -4153,8 +4156,18 @@ fn g12_unit() -> R<String> {
         "  const lb = W4LOv[w4lay * 10 + m];\n",
         "u4mv layer base (G12)",
     )?;
-    let core = patch(&core, "  if (m != 1 and m != 2) {\n", "  if (W4XNv[m] == 1) {\n", "u4mv x parts (G12)")?;
-    patch(src::GEMMA4_UNIT, "//@@ u4fns\n", &format!("{fns_a}{core}"), tag)
+    let core = patch(
+        &core,
+        "  if (m != 1 and m != 2) {\n",
+        "  if (W4XNv[m] == 1) {\n",
+        "u4mv x parts (G12)",
+    )?;
+    patch(
+        src::GEMMA4_UNIT,
+        "//@@ u4fns\n",
+        &format!("{fns_a}{core}"),
+        tag,
+    )
 }
 
 /// The Gemma layout: serve8b_region's W4 layout taking the layers' kinds
@@ -4205,7 +4218,12 @@ fn g12_rk(x: u16, y: u16) u16 {\n  const c = x / RPX;\n  const ri = (y - PY) / R
           .QhG = QhG, .GsG = GsG, .KND = g12_rk(x, y), .WIN = WIN, .W4BUF = W4BUF,\n",
         tag,
     )?;
-    let s = patch(&s, ".Ve = Vr, .W4H = W4H, .vocab = vocab,", ".Ve = Vr, .W4H = W4H, .ESB = ESB, .vocab = vocab,", tag)?;
+    let s = patch(
+        &s,
+        ".Ve = Vr, .W4H = W4H, .vocab = vocab,",
+        ".Ve = Vr, .W4H = W4H, .ESB = ESB, .vocab = vocab,",
+        tag,
+    )?;
     // Grids may be shorter than wide (Gemma-4-12B: 128 x 96): the handoffs
     // (serve8b_region::Tables), the staircases and the head and strip take
     // rows only; serve8b's [PX, 2 PX] stays the default layout's.
@@ -4229,7 +4247,12 @@ param ESB: u32;      // Gemma: f32 bits of the embedding's scale (sqrt(hidden))\
 const G12ES: f32 = @bitcast(f32, ESB);\n",
         tag,
     )?;
-    patch(&s, "emb[k] = sc * @as(f32, q) + bi;\n", "emb[k] = (sc * @as(f32, q) + bi) * G12ES;\n", tag)
+    patch(
+        &s,
+        "emb[k] = sc * @as(f32, q) + bi;\n",
+        "emb[k] = (sc * @as(f32, q) + bi) * G12ES;\n",
+        tag,
+    )
 }
 
 /// serve8b_region for Gemma 4 dense in u4g64 (`G12 1` on a `W4 1`, `W4H 1`
@@ -4636,7 +4659,11 @@ mod tests {
         let w4 = std::env::var("W4").is_ok_and(|v| v == "1");
         let g12 = std::env::var("G12").is_ok_and(|v| v == "1");
         std::fs::create_dir_all(&dir).unwrap();
-        let files = if g12 { serve8b_region_g12(Variant::default()) } else { d.files_w4(w4) };
+        let files = if g12 {
+            serve8b_region_g12(Variant::default())
+        } else {
+            d.files_w4(w4)
+        };
         for (name, text) in files.expect("generates") {
             std::fs::write(dir.join(name), text).unwrap();
         }
@@ -4742,7 +4769,12 @@ mod tests {
     /// per-call q conversions (their q parts cost 1.8 KB a PE).
     #[test]
     fn g12_takes_spd_lse_op2() {
-        let v = Variant { speed: true, lse: true, ops2: true, ..Variant::default() };
+        let v = Variant {
+            speed: true,
+            lse: true,
+            ops2: true,
+            ..Variant::default()
+        };
         let files = serve8b_region_g12(v).expect("the levers apply to gemma4_unit");
         let plain = serve8b_region_g12(Variant::default()).unwrap();
         for (name, text) in &files {
@@ -4761,7 +4793,11 @@ mod tests {
                     }
                     // (exp_poly stays as exp_rows' fallback for slot rows past act, as on Llama)
                     assert!(text.contains("exp_fast(te_d, tt_d, &tt, MC);"), "{name}");
-                    assert_eq!(text.contains("fn q_parts()"), *name == "grid_pe.csl", "{name}");
+                    assert_eq!(
+                        text.contains("fn q_parts()"),
+                        *name == "grid_pe.csl",
+                        "{name}"
+                    );
                     assert!(text.contains("g12_post(1);"), "{name}");
                 }
                 _ => assert_eq!(text, before, "{name}"),
@@ -4772,23 +4808,47 @@ mod tests {
     #[test]
     fn g12_variant_adds_only_gemma() {
         let w4 = Design::Serve8bRegion.files_w4(true).unwrap();
-        assert_eq!(Design::Serve8bRegion.files_w4(false).unwrap(), Design::Serve8bRegion.files().unwrap());
+        assert_eq!(
+            Design::Serve8bRegion.files_w4(false).unwrap(),
+            Design::Serve8bRegion.files().unwrap()
+        );
         let g12 = serve8b_region_g12(Variant::default()).unwrap();
-        assert_eq!(serve8b_region_g12(Variant::default()).unwrap(), g12, "deterministic");
+        assert_eq!(
+            serve8b_region_g12(Variant::default()).unwrap(),
+            g12,
+            "deterministic"
+        );
         for ((n, a), (m, b)) in w4.iter().zip(&g12) {
             assert_eq!(n, m);
             match *n {
                 "grid_pe.csl" | "region_pe.csl" => {
-                    assert!(b.contains("fn gelu_col(") && !b.contains("silu_col(el)"), "{n}");
-                    assert!(b.contains("const lb = W4LOv[w4lay * 10 + m];") && b.contains("w4at(bp, W4HOv[m], W4Hv[m])"), "{n}");
-                    assert_eq!(b.matches("wmv4(").count(), 6, "{n}: wmv4's definition and five calls");
+                    assert!(
+                        b.contains("fn gelu_col(") && !b.contains("silu_col(el)"),
+                        "{n}"
+                    );
+                    assert!(
+                        b.contains("const lb = W4LOv[w4lay * 10 + m];")
+                            && b.contains("w4at(bp, W4HOv[m], W4Hv[m])"),
+                        "{n}"
+                    );
+                    assert_eq!(
+                        b.matches("wmv4(").count(),
+                        6,
+                        "{n}: wmv4's definition and five calls"
+                    );
                     assert!(!b.contains("\n//@@ u4fns\n"), "{n}");
                 }
                 "layout.csl" => {
-                    assert!(b.contains("param KINDS: u64 = 0;") && b.contains(".KND = g12_gk(x, y)") && b.contains(".KND = g12_rk(x, y)"));
+                    assert!(
+                        b.contains("param KINDS: u64 = 0;")
+                            && b.contains(".KND = g12_gk(x, y)")
+                            && b.contains(".KND = g12_rk(x, y)")
+                    );
                     assert!(b.contains(".ESB = ESB,") && !b.contains("PY >= PX"));
                 }
-                "embed_pe.csl" => assert!(b.contains("(sc * @as(f32, q) + bi) * G12ES") && b.contains("param ESB: u32;")),
+                "embed_pe.csl" => assert!(
+                    b.contains("(sc * @as(f32, q) + bi) * G12ES") && b.contains("param ESB: u32;")
+                ),
                 _ => assert_eq!(a, b, "{n}"),
             }
         }

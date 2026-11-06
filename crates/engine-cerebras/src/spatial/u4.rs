@@ -321,7 +321,13 @@ pub fn blob(t: Tile, rows: &[Option<usize>], cols: &[Vec<Col>], out: &mut Vec<u3
 }
 
 /// [`blob`] for a decode buffer of `buf` u16 words (the header's segments).
-pub fn blob_in(t: Tile, buf: usize, rows: &[Option<usize>], cols: &[Vec<Col>], out: &mut Vec<u32>) -> R<()> {
+pub fn blob_in(
+    t: Tile,
+    buf: usize,
+    rows: &[Option<usize>],
+    cols: &[Vec<Col>],
+    out: &mut Vec<u32>,
+) -> R<()> {
     if rows.len() != t.r || cols.iter().any(|c| c.len() != t.n) {
         return Err(format!(
             "u4 tile {t:?}: {} rows, columns {:?}",
@@ -418,7 +424,10 @@ pub fn blob_in(t: Tile, buf: usize, rows: &[Option<usize>], cols: &[Vec<Col>], o
             }
         }
     }
-    debug_assert_eq!(out.len() - start, t.header_in(buf) + cols.len() * t.layer_words());
+    debug_assert_eq!(
+        out.len() - start,
+        t.header_in(buf) + cols.len() * t.layer_words()
+    );
     Ok(())
 }
 

@@ -888,6 +888,7 @@ pub fn route_words_gx(
 /// of a row) at place `k`: the five colours' (rx, tx1, tx2) with directions
 /// 0 ramp, 1 away from the root, 2 toward it, 3 along the line both ways from
 /// the root (the broadcast); and the role word (see [`route_words_arf`]).
+#[allow(clippy::type_complexity)]
 fn arf_line(n: usize, k: usize, arg: usize) -> ([Option<(usize, usize, usize)>; 5], u32, bool) {
     const RAMP: usize = 0;
     const AWY: usize = 1;

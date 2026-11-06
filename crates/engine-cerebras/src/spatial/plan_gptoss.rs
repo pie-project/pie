@@ -471,7 +471,14 @@ mod tests {
         assert_eq!(prog.rectangle(), (747, 1170));
         let v = prog.model.variant();
         assert!(v.identity_qk_norm && v.speed && v.lse && v.ops2 && v.qkv1);
-        assert!(v.op3 == 1 && v.grid == 3 && v.arf == 3 && v.trim == 8 && v.f16 == 0 && v.eps_bits.is_none());
+        assert!(
+            v.op3 == 1
+                && v.grid == 3
+                && v.arf == 3
+                && v.trim == 8
+                && v.f16 == 0
+                && v.eps_bits.is_none()
+        );
         assert_eq!(prog.knob("MOE"), Some("7"));
         let g = prog.gptoss().unwrap();
         assert!(!g.kv16 && g.qkv1 && g.arf == 3);

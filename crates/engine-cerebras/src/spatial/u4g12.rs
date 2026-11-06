@@ -343,6 +343,7 @@ fn place_unit(lay: &ProgramSpec, g: &G12, ckpt: &Ckpt, v: &Unit, dev: &mut dyn D
         })
         .collect::<R<_>>()?;
     let err = std::cell::RefCell::new(None::<String>);
+    #[allow(clippy::type_complexity)]
     let put = |dev: &mut dyn Device,
                sym: &str,
                m: usize,

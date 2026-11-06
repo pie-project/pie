@@ -343,7 +343,9 @@ impl G4Spec {
             get(k).ok_or_else(|| Refused(format!("{name}: the G12 wafer program has no {k}")))
         };
         if self.ple_dim.is_some() || self.owners() != self.layers() {
-            return no("serve8b_region's Gemma units run no per-layer embeddings or shared kv tail".into());
+            return no(
+                "serve8b_region's Gemma units run no per-layer embeddings or shared kv tail".into(),
+            );
         }
         let (px, py, hc, dc, gs, qh, ic) = (
             need("PX")?,
@@ -363,7 +365,8 @@ impl G4Spec {
             need("RIc")?,
         );
         let (qhg, gsg) = (need("QhG")?, need("GsG")?);
-        let covers = |rows: usize, per: usize| rows * per >= self.hidden && (rows - 1) * per < self.hidden;
+        let covers =
+            |rows: usize, per: usize| rows * per >= self.hidden && (rows - 1) * per < self.hidden;
         if need("HR")? != self.hidden || !covers(py, hc) || !covers(rpy, rhc) {
             return no(format!(
                 "HR {:?} over PY {py} x Hc {hc} and RPY {rpy} x RHc {rhc}: not hidden {}",
@@ -371,8 +374,15 @@ impl G4Spec {
                 self.hidden
             ));
         }
-        let sliding = gs > 0 && px % gs == 0 && px / gs == self.kv_heads && qh * self.kv_heads == self.q_heads;
-        let copies = if gsg > 0 && px % gsg == 0 { px / gsg } else { 0 };
+        let sliding = gs > 0
+            && px % gs == 0
+            && px / gs == self.kv_heads
+            && qh * self.kv_heads == self.q_heads;
+        let copies = if gsg > 0 && px % gsg == 0 {
+            px / gsg
+        } else {
+            0
+        };
         let global = copies > 0
             && self.global_kv_heads > 0
             && copies % self.global_kv_heads == 0
@@ -391,7 +401,10 @@ impl G4Spec {
             ));
         }
         if let Some(l) = (0..self.layers()).find(|&l| self.inter[l] != ic * px) {
-            return no(format!("layer {l}'s MLP is {} wide, not Ic {ic} x PX {px}", self.inter[l]));
+            return no(format!(
+                "layer {l}'s MLP is {} wide, not Ic {ic} x PX {px}",
+                self.inter[l]
+            ));
         }
         let (rc, rr, rnl, ncol) = (need("RC")?, need("RR")?, need("RNL")?, need("NCOL")?);
         if get("YD").unwrap_or(0) != 0 {
@@ -408,10 +421,16 @@ impl G4Spec {
         if let Some(l) = (0..self.layers())
             .find(|&l| (kinds >> l & 1 == 1) != (self.readings[l] == Reading::Global))
         {
-            return no(format!("layer {l} reads {:?}; KINDS says otherwise", self.readings[l]));
+            return no(format!(
+                "layer {l} reads {:?}; KINDS says otherwise",
+                self.readings[l]
+            ));
         }
         if kinds >> self.layers() != 0 {
-            return no(format!("KINDS {kinds:#x} names layers past the {}", self.layers()));
+            return no(format!(
+                "KINDS {kinds:#x} names layers past the {}",
+                self.layers()
+            ));
         }
         if need("vocab")? != self.vocab {
             return no(format!("vocab {:?}, not {}", get("vocab"), self.vocab));
@@ -520,7 +539,11 @@ mod tests {
                 .iter()
                 .map(|(a, b)| (a.clone(), if a == k { v.to_string() } else { b.clone() }))
                 .collect();
-            move |key: &str| p.iter().find(|(a, _)| a == key).and_then(|(_, b)| b.parse().ok())
+            move |key: &str| {
+                p.iter()
+                    .find(|(a, _)| a == key)
+                    .and_then(|(_, b)| b.parse().ok())
+            }
         };
         s.check_program(with("", "")).expect("the linked program");
         for (k, v) in [
