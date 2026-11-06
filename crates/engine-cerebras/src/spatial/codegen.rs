@@ -3148,6 +3148,15 @@ const Q35R_ANCHORS: &[(&str, &str)] = &[
     ("  exp_poly(te_d, tt_d);           // e = exp(-|g|)\n", "  exp_poly(e_, t_);\n"),
     ("  exp_fast(te_d, tt_d, &tt, MC);  // e = exp(-|g|)\n", "  exp_fast(e_, t_, &gt1, n);\n"),
     ("const EX_N: u16 = mx2(ACTN, MC);", "const EX_N: u16 = mx2(mx2(ACTN, MC), NT1);"),
+    // The GDN's full X all-reduces take ARF 3's XA set (axis_xf).
+    (
+        "fn axis_xx() void { set_axis(true); }\n",
+        "fn axis_xx() void { set_axis(true); }\n// The GDN's full X all-reduces (ARF 3: on the streamed-halves XA set, as O and down).\nfn axis_xf() void { axis_xx(); }\n",
+    ),
+    (
+        "fn axis_xf() void { axis_xx(); }\nfn axis_xa() void { set_axis_m(2); }",
+        "fn axis_xf() void { set_axis_m(2); }\nfn axis_xa() void { set_axis_m(2); }",
+    ),
     // (HV) the pool by the layer's attention slot
     ("fn kvoff() u16 { return lw * KCN; }", "fn kvoff() u16 { return la * KCN; }"),
     // LSE's group shifts: the Y axis's from values made once (a region's 234

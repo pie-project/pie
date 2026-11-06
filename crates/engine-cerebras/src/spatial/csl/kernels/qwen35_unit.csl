@@ -288,6 +288,8 @@ fn set_axis(x: bool) void {
 }
 fn axis_y() void { set_axis(false); }
 fn axis_xx() void { set_axis(true); }
+// The GDN's full X all-reduces (ARF 3: on the streamed-halves XA set, as O and down).
+fn axis_xf() void { axis_xx(); }
 
 // dst = a op b, op: sum or max.
 fn op_in(is_max: bool, buf: mem1d_dsd, comptime q: input_queue, n: u16) void {
@@ -1285,7 +1287,7 @@ fn gdn_layer() void {
     qk4[k4 + 2] = sum_sq(pj_ptr, q0, DK);
     qk4[k4 + 3] = sum_sq(pj_ptr, q0 + DK, DK);
   }
-  axis_xx();
+  axis_xf();
   allreduce(false, qk4_dsd, QK4N);
   b = 0;
   while (b < nb) : (b += 1) {
@@ -1336,7 +1338,7 @@ fn gdn_layer() void {
       oss[(b * KHN + kh) * VH + j] = sum_sq(go_ptr, (b * VH + j) * DV, DV);
     }
   }
-  axis_xx();
+  axis_xf();
   allreduce(false, oss_dsd, OSSN);
   @fmovs(hv_all, 0.0);
   b = 0;
