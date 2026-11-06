@@ -1,0 +1,14 @@
+[
+ {
+  "old": "  @fmuls(sg_g, sg_g, sc * 1.4426950408889634);   // a' = s g log2e\n  @fmuls(sg_u, sg_u, sc * 0.6931471805599453);   // u' = s u ln2\n  @fs2h(sg_h, sg_gu);\n",
+  "new": "  // (trm 2048) the scales in f16 on the converted gu; their rounding undone on the down\n  // partial (sg_c, f32)\n  const sgs: @fp16() = @as(@fp16(), sc * 1.4426950408889634);\n  const sus: @fp16() = @as(@fp16(), sc * 0.6931471805599453);\n  sg_c = (sc * 1.4426950408889634) * (sc * 0.6931471805599453) / (@as(f32, sgs) * @as(f32, sus));\n  @fs2h(sg_h, sg_gu);\n  @fmulh(sgG, sgG, sgs);                         // a' = s g log2e\n  @fmulh(sgU, sgU, sus);                         // u' = s u ln2\n"
+ },
+ {
+  "old": "fn silu16(sc: f32) void {",
+  "new": "var sg_c: f32 = 1.0;   // (trm 2048)\nfn silu16(sc: f32) void {"
+ },
+ {
+  "old": "    wmvhx(hv_dsd, wd_dsd, Ic, Hc);\n",
+  "new": "    wmvhx(hv_dsd, wd_dsd, Ic, Hc);\n    @fmuls(hv_dsd, hv_dsd, sg_c);   // (trm 2048)\n"
+ }
+]
