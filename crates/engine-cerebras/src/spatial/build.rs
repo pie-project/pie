@@ -216,6 +216,9 @@ pub struct ServeConfig {
     /// f16 gammas made in place on the first pass (`TRM` bits 512 + 4096;
     /// inexact; fits the Llama region beside `silu16`: 48,352 B).
     pub xg16: bool,
+    /// With `trim`: the head's column argmax in one streamed round of packed
+    /// keys, the exact pair chains only on a tie (`TRM` bit 16384; exact).
+    pub head_pack: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -263,6 +266,7 @@ impl ServeConfig {
             hvc: false,
             silu16: false,
             xg16: false,
+            head_pack: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -350,6 +354,7 @@ impl ServeConfig {
             "hvc",
             "silu16",
             "xg16",
+            "head_pack",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -460,6 +465,7 @@ impl ServeConfig {
             hvc: flag(t, "hvc")?,
             silu16: flag(t, "silu16")?,
             xg16: flag(t, "xg16")?,
+            head_pack: flag(t, "head_pack")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -1128,8 +1134,8 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if cfg.trim && !(cfg.qkv1 && cfg.ops2 && cfg.f16acc && cfg.arfx) {
         return Err("serve8b_region's `trim` needs `qkv1`, `ops2`, `f16acc` and `arfx`".into());
     }
-    if (cfg.silu16 || cfg.xg16) && !cfg.trim {
-        return Err("serve8b_region's `silu16` and `xg16` need `trim`".into());
+    if (cfg.silu16 || cfg.xg16 || cfg.head_pack) && !cfg.trim {
+        return Err("serve8b_region's `silu16`, `xg16` and `head_pack` need `trim`".into());
     }
     if cfg.arfs && !(cfg.arfx && cfg.xac) {
         return Err("serve8b_region's `arfs` needs `arfx` and `xac`".into());
@@ -1476,6 +1482,8 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
                     | (usize::from(cfg.silu16 && !plan.spec.qk_norm && cfg.grid_levers && cfg.f16accg) << 13)
                     // (xg16: TRM 512 + 4096, x g in f16 with in-place f16 gammas; inexact)
                     | (if cfg.xg16 && !plan.spec.qk_norm { 512 | 4096 } else { 0 })
+                    // (head_pack: TRM 16384, the head's packed argmax round; exact)
+                    | (usize::from(cfg.head_pack) << 14)
             } else {
                 0
             },
@@ -3090,6 +3098,13 @@ mod llama31_8b {
         got.retain(|(k, _)| k != "KVST");
         got.sort();
         assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:14335,ARY:16,HVC:1")));
+        // + head_pack: TRM 30719
+        cfg.head_pack = true;
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:30719,ARY:16,HVC:1")));
     }
 
     /// `ops2` on 0472's config states 0480's program: the same parameters
