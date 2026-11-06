@@ -427,6 +427,22 @@ impl Default for WorkingSet {
     }
 }
 
+/// A `WorkingSet` in a typed input is the handle the client wrote there, as
+/// `{"$handle": "<name>"}`.
+impl<'de> serde::Deserialize<'de> for WorkingSet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Marker {
+            #[serde(rename = "$handle")]
+            handle: String,
+        }
+        let Marker { handle } = Marker::deserialize(deserializer)?;
+        WorkingSet::take(&handle).ok_or_else(|| {
+            serde::de::Error::custom(format!("the launch moved in no handle `{handle}`"))
+        })
+    }
+}
+
 /// How many more slots each lane freezes after a fire writes.
 #[derive(Clone, Copy, Default)]
 pub enum Fold<'a> {

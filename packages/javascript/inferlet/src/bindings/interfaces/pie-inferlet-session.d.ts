@@ -39,6 +39,18 @@ export function sendFileAs(data: Blob, name: string): void;
  */
 export function file(name: string): Blob | undefined;
 /**
+ * The working set the launch moved in under `name`, once; none if it
+ * moved no such handle. It is new if nothing has written it yet.
+ */
+export function takeWorkingSet(name: string): WorkingSet | undefined;
+/**
+ * Hands `ws` to the client as what the launch named `name` in its
+ * returns. It lands in the client's session when this process ends, once
+ * its last fire has settled. Refused if the launch expects no such
+ * return, or has one already; `ws` is dropped either way it fails.
+ */
+export function giveWorkingSet(name: string, ws: WorkingSet): void;
+/**
  * Encodes `f` and streams the bytes to the client under `name`, WITHOUT
  * the encoded file ever entering WASM linear memory.
  * 
@@ -85,3 +97,4 @@ export type Frames = import('./pie-inferlet-frames.js').Frames;
 export type Pcm = import('./pie-inferlet-frames.js').Pcm;
 export type ImageFormat = import('./pie-inferlet-frames.js').ImageFormat;
 export type AudioFormat = import('./pie-inferlet-frames.js').AudioFormat;
+export type WorkingSet = import('./pie-inferlet-working-set.js').WorkingSet;

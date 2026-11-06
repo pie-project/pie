@@ -267,7 +267,6 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
     }
 
     drop(admitting);
-    drop(in_order);
     handle.close().await;
 }
 

@@ -253,6 +253,35 @@ export function withUpgradePath(serverUri) {
     return url.toString();
 }
 
+/** A handle op the server refused: unknown, dead, or in use. */
+export class HandleError extends Error {}
+
+/**
+ * A working set this session owns. Lazy: nothing exists on the server until a
+ * process binds it, so making one costs a name.
+ */
+export class WorkingSet {
+    constructor(client, name) {
+        this.client = client;
+        this.name = name;
+    }
+
+    /** An independent copy of this set as it stands. */
+    async fork() {
+        const child = this.client._nextHandle();
+        await this.client._handleOp({ op: "fork", name: child, from: this.name });
+        return new WorkingSet(this.client, child);
+    }
+
+    async stat() {
+        return await this.client._handleOp({ op: "stat", name: this.name });
+    }
+
+    async close() {
+        await this.client._handleOp({ op: "close", name: this.name });
+    }
+}
+
 export class PieClient {
     /**
      * @param {string} serverUri e.g. `ws://127.0.0.1:8080`; a URI with no path
@@ -589,6 +618,30 @@ export class PieClient {
     }
 
     // =========================================================================
+    // Handles
+    // =========================================================================
+
+    _nextHandle() {
+        this.lastHandle = (this.lastHandle ?? 0) + 1;
+        return this.lastHandle;
+    }
+
+    async _handleOp(op) {
+        const { ok, result } = await this._sendMsgAndWait({ type: "handles", ops: [op] });
+        if (!ok) throw new HandleError(result);
+        const [answer] = JSON.parse(result);
+        if (answer.error) throw new HandleError(answer.error);
+        return answer;
+    }
+
+    /** A new, empty working set. */
+    async workingSet() {
+        const name = this._nextHandle();
+        await this._handleOp({ op: "new", name, kind: "working_set" });
+        return new WorkingSet(this, name);
+    }
+
+    // =========================================================================
     // Process Lifecycle
     // =========================================================================
 
@@ -598,15 +651,24 @@ export class PieClient {
      * @param {Object} [input={}] Input parameters object, serialized to JSON.
      * @param {boolean} [captureOutputs=true] Stream outputs to client.
      * @param {Object<string, Uint8Array>} [files={}] Files the inferlet reads with `session.file(name)`.
+     * @param {{handles?: Object<string, WorkingSet>, returns?: Object<string, WorkingSet>}} [moved]
+     *   Handles moved into the process, and what it gives back, by the guest's names.
      * @returns {Promise<Process>}
      */
-    async launchProcess(inferlet, input = {}, captureOutputs = true, files = {}) {
+    async launchProcess(
+        inferlet, input = {}, captureOutputs = true, files = {}, { handles = {}, returns = {} } = {},
+    ) {
+        const names = (moved) => Object.fromEntries(
+            Object.entries(moved).map(([name, handle]) => [name, handle.name]),
+        );
         const msg = {
             type: "launch_process",
             inferlet,
             input: JSON.stringify(input),
             capture_outputs: captureOutputs,
             files,
+            handles: names(handles),
+            returns: names(returns),
         };
         const { ok, result } = await this._sendMsgAndWait(msg);
         if (!ok) {
@@ -646,7 +708,15 @@ export class PieClient {
             }
             program = program.program;
         }
-        return await this.launchProcess(program, input);
+        const moved = Object.fromEntries(
+            Object.entries(input).filter(([, arg]) => arg instanceof WorkingSet),
+        );
+        const marked = Object.fromEntries(
+            Object.keys(moved).map((name) => [name, { $handle: name }]),
+        );
+        return await this.launchProcess(
+            program, { ...input, ...marked }, true, {}, { handles: moved, returns: moved },
+        );
     }
 
     /**

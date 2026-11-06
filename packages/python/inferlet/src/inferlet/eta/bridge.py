@@ -20,6 +20,7 @@ from wit_world.imports import forward as _wit_forward
 from wit_world.imports import model as _wit_model
 from wit_world.imports import pie_inferlet_types as _wit_types
 from wit_world.imports import pipeline as _wit_pipeline
+from wit_world.imports import session as _wit_session
 from wit_world.imports import working_set as _wit_ws
 
 from ..media import Audio, Image
@@ -288,6 +289,24 @@ class WorkingSet:
         out = cls.__new__(cls)
         out.ws = ws
         return out
+
+    @classmethod
+    def take(cls, name: str) -> "WorkingSet":
+        """The handle the launch moved in under `name`, once."""
+        ws = _wit_session.take_working_set(name)
+        if ws is None:
+            raise ValueError(f"the launch moved in no handle `{name}`")
+        return cls._wrap(ws)
+
+    @classmethod
+    def from_input(cls, value) -> "WorkingSet":
+        """The handle a client wrote in the input as `{"$handle": name}`."""
+        return cls.take(value["$handle"])
+
+    def give(self, name: str) -> None:
+        """Hands this set back to the client under the launch's `name`. Unusable after."""
+        ws, self.ws = self.ws, None
+        _wit(_wit_session.give_working_set, name, ws, what="give")
 
     def reserve(self, end: int) -> None:
         """Lets passes write slots below `end`; needed only when the device computes the slots."""

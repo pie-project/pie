@@ -183,6 +183,10 @@ fn is_launch_answer(turn: &TurnState, message: &ServerMessage) -> bool {
 }
 
 impl Inner {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one turn's whole context, as its session has it"
+    )]
     async fn run_turn(
         self: &Arc<Self>,
         session: SessionId,

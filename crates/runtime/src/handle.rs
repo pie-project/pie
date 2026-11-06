@@ -231,12 +231,11 @@ fn owed(
     let kv_pages = store.swapped_page_count(&HashSet::from([kv.id]))? as u32;
     let rs = rs.map_or_else(Default::default, |rs| {
         let stores = store_registry::get(rs.model, rs.engine);
-        let units = stores
+        stores
             .rs
             .lock()
             .unwrap()
-            .swapped_units(&HashSet::from([rs.id]));
-        units
+            .swapped_units(&HashSet::from([rs.id]))
     });
     let demand = Demand { kv_pages, rs };
     Ok((!demand.is_zero()).then_some(demand))

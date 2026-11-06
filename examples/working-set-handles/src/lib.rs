@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 struct Input {
+    /// The handle the client moved in.
+    ws: WorkingSet,
     /// What to write first: the prompt, or a resumed turn's last token.
     tokens: Vec<u32>,
     max_tokens: usize,
@@ -44,7 +46,7 @@ async fn draw(ws: &WorkingSet, pipe: &Pipeline, tokens: &[i32], seed: u32, at: u
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    let ws = WorkingSet::take("ws").ok_or("the launch moved in no `ws`")?;
+    let ws = input.ws;
     let pipe = Pipeline::new();
     let mut tokens: Vec<i32> = input.tokens.iter().map(|&t| t as i32).collect();
     let mut generated = Vec::with_capacity(input.max_tokens);

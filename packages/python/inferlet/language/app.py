@@ -113,6 +113,17 @@ def _load(script: dict) -> types.ModuleType:
     return module
 
 
+def _hydrate(value):
+    """The input with each `{"$handle": name}` the client wrote as the handle."""
+    if isinstance(value, dict):
+        if len(value) == 1 and "$handle" in value:
+            return _inferlet.eta.WorkingSet.from_input(value)
+        return {key: _hydrate(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_hydrate(item) for item in value]
+    return value
+
+
 def _encode(result, fallback) -> str:
     """The `run` return: strings pass through, everything else is JSON."""
     if result is None:
@@ -146,7 +157,7 @@ class Run(exports.Run):
                     f"{script.get('name', 'the program')} defines no `main`; "
                     "a Python inferlet is a module with an `async def main(input: dict)`"
                 )
-            result = fn(input_data)
+            result = fn(_hydrate(input_data))
             if inspect.isawaitable(result):
                 result = await result
             return _encode(result, _inferlet.get_return_value)

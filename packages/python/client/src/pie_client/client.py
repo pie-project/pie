@@ -586,6 +586,10 @@ class PieClient:
     async def run(self, program: "Inferlet | str", /, **kwargs: Any) -> Process:
         """Launch an inferlet with keyword arguments as its input.
 
+        A `WorkingSet` among the keyword arguments moves into the process and
+        comes back under the same handle: the guest finds it where the
+        argument is, and gives it back by the same name.
+
         A decorated function (`@inferlet`) is installed first if the server
         does not hold its exact source yet; a string is an installed
         program's `name@version` (or bare name). Returns the `Process`;
@@ -598,7 +602,9 @@ class PieClient:
                 program = await self.install_program_bytes(
                     program.source.encode("utf-8"), f"{program.name}.py", program.version
                 )
-        return await self.launch_process(program, input=kwargs)
+        moved = {name: arg for name, arg in kwargs.items() if isinstance(arg, WorkingSet)}
+        input = {**kwargs, **{name: {"$handle": name} for name in moved}}
+        return await self.launch_process(program, input=input, handles=moved, returns=moved)
 
     async def attach_process(self, process_id: str) -> Process:
         """Attach to an existing process.
