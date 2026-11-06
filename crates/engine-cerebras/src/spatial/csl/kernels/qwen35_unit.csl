@@ -472,7 +472,7 @@ fn allreduce_seg(buf: mem1d_dsd, n: u16) void {
 
 // Trip counts read at runtime (an exported array the compiler cannot fold):
 // per-lane loops stay loops.
-var dims = @zeros([10]u16);          // B, E, TC, NQB, MC, NH, VH, CW - 1, Dc, ROT_N
+var dims = @zeros([12]u16);          // B, E, TC, NQB, MC, NH, VH, CW - 1, Dc, ROT_N, 3, 6
 var dims_ptr: [*]u16 = &dims;
 
 // ---------------------------------------------------------------- types, sizes
@@ -754,14 +754,19 @@ var oss = @zeros([OSSN]f32);
 const oss_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{OSSN} -> oss[i] });
 // SiLU's scratch over NCH (the conv) and NV (the gated norm).
 const NT1: u16 = mx2(mx2(NCH, NV), B * QO);
-var ga1 = @zeros([NT1]f32);
+// (|g| in et and e in rd where they fit: neither is live at a SiLU or the gate)
+const GA_ET: bool = ETN >= NT1;
+const GE_RD: bool = RN >= NT1;
+var ga1 = @zeros([if (GA_ET) 1 else NT1]f32);
 var gt1 = @zeros([NT1]f32);
-var ge1 = @zeros([NT1]f32);
+var ge1 = @zeros([if (GE_RD) 1 else NT1]f32);
 var gr1 = @zeros([NT1]f32);
 var gd1 = @zeros([NT1]f32);
-const ga1_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> ga1[i] });
+const ga1_d = if (GA_ET) @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> et[i] })
+              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> ga1[i] });
 const gt1_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> gt1[i] });
-const ge1_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> ge1[i] });
+const ge1_d = if (GE_RD) @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> rd[i] })
+              else @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> ge1[i] });
 const gr1_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> gr1[i] });
 const gd1_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT1} -> gd1[i] });
 var qscale: f32 = 0.0;               // 1/sqrt(k_dim)
@@ -1469,6 +1474,8 @@ fn init() void {
   dims[8] = Dc;
   cwh_dsd = @increment_dsd_offset(@set_dsd_stride(@set_dsd_base_addr(cwh_dsd, @ptrcast([*]u16, &cw32[0])), 2), 1, u16);
   dims[9] = ROT_N;
+  dims[10] = 3;
+  dims[11] = 6;
   qscale = rsqrt(@as(f32, KD));
   px = layout_mod.get_x_coord();
   py = layout_mod.get_y_coord();

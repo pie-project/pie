@@ -3157,6 +3157,15 @@ const Q35R_ANCHORS: &[(&str, &str)] = &[
         "fn axis_xf() void { axis_xx(); }\nfn axis_xa() void { set_axis_m(2); }",
         "fn axis_xf() void { set_axis_m(2); }\nfn axis_xa() void { set_axis_m(2); }",
     ),
+    // SPD's exp_fast with its two short loops rolled (trip counts from dims: -~0.4 KB a PE)
+    (
+        "  var c: u16 = 0;\n  while (c < 3) : (c += 1) {\n    @fadds(p, p, ex_a[c]);",
+        "  var c: u16 = 0;\n  while (c < dims[10]) : (c += 1) {\n    @fadds(p, p, ex_a[c]);",
+    ),
+    (
+        "  c = 0;\n  while (c < 6) : (c += 1) {\n    if (c > 0) { @fmuls(p, p, buf); }",
+        "  c = 0;\n  while (c < dims[11]) : (c += 1) {\n    if (c > 0) { @fmuls(p, p, buf); }",
+    ),
     // (HV) the pool by the layer's attention slot
     ("fn kvoff() u16 { return lw * KCN; }", "fn kvoff() u16 { return la * KCN; }"),
     // LSE's group shifts: the Y axis's from values made once (a region's 234
