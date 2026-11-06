@@ -54,8 +54,8 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
 
 // rcfg (host): [0] routes n, [1..1+2n) (colour, low route byte), [RQ..RQ+7) queue colours
 // (iq2..iq5, oq2..oq4), [RQ+7] flags (bit 0 first unit: x from the embedding / host,
-// bit 1 last unit: x to the head).
-const NR: u16 = 8;
+// bit 1: no handoff out (a test's last unit); runtime, so every unit shares the image).
+const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 8]u32);
 var rcfg_ptr: [*]u32 = &rcfg;
@@ -111,7 +111,7 @@ const pass_id: local_task_id = @get_local_task_id(8);
 task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
-    if (HOSTX == 0) { @fmovs(x_d, fin(q_hi, Hc)); }
+    if (HOSTX == 0 and (rcfg[RQ + 7] & 1) == 0) { @fmovs(x_d, fin(q_hi, Hc)); }
     var l: u16 = 0;
     while (l < K) : (l += 1) {
       norm_send(2 * l);
@@ -121,7 +121,7 @@ task pass_task() void {
       reduce();
       @fadds(x_d, x_d, t_d);
     }
-    if (HOSTX == 0) { @fmovs(fout(q_ho, Hc), x_d); }
+    if (HOSTX == 0 and (rcfg[RQ + 7] & 2) == 0) { @fmovs(fout(q_ho, Hc), x_d); }
   }
   sys_mod.unblock_cmd_stream();
 }

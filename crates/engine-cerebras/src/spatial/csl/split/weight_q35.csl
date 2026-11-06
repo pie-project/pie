@@ -122,9 +122,9 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
 // [RQ..RQ+8) the queue colours (iq2..iq7, oq2, oq3), [RQ+8] the row role,
 // [RQ+9] the column role. A role: 0 chain start, 1 add-forward, 2 group end
 // (FIFO merge of level 1 and level 2), 3 the farthest group's end.
-const NR: u16 = 12;
+const NR: u16 = 16;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 18]u32);   // [RQ+17] the row
+var rcfg = @zeros([RQ + 24]u32);   // [RQ+17] the row; [RQ+18..21) the pass-start relay (words, in colour, out colour), [RQ+21..24) the pass-end relay
 var rcfg_ptr: [*]u32 = &rcfg;
 var role_x: u16 = 0;
 var role_y: u16 = 0;
@@ -429,6 +429,19 @@ fn layer(l: u16, b: u32) u32 {
   return bo + LWM;
 }
 
+// Unit handoffs: a weight PE on a handoff path's turn takes x's chunk from one colour and
+// sends it on another (rcfg's relays: at the pass start the next unit's side, at the end the
+// unit's own), on the row multicast's and row reduction's queues (iq6, oq2), which are idle then.
+fn relay(o: u16) void {
+  const n = @as(u16, rcfg[RQ + o]);
+  if (n == 0) { return; }
+  while ((tile_config.output_queue_status.get_raw() & 0x0400) == 0) {}
+  iqc(6, rcfg[RQ + o + 1]);
+  oqc(2, rcfg[RQ + o + 2]);
+  @fmovs(fout(q_xo, n), fin(q_xm, n));
+  qmode(0);
+}
+
 var n_steps: u32 = 0;
 const pass_id: local_task_id = @get_local_task_id(8);
 task pass_task() void {
@@ -438,7 +451,9 @@ task pass_task() void {
     var b: u32 = 0;
     la = 0;
     lg = 0;
+    relay(18);
     while (l < K) : (l += 1) { b = layer(l, b); }
+    relay(21);
   }
   sys_mod.unblock_cmd_stream();
 }

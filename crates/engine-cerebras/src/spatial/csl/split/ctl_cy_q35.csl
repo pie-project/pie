@@ -97,7 +97,7 @@ fn fout(comptime q: output_queue, n: u16) fabout_dsd {
 fn fin(comptime q: input_queue, n: u16) fabin_dsd {
   return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
 }
-const NR: u16 = 8;
+const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 10]u32);
 var rcfg_ptr: [*]u32 = &rcfg;
@@ -334,6 +334,7 @@ const pass_id: local_task_id = @get_local_task_id(8);
 task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
+    tab[0] = pos0 + s;   // the pass's position (launch argument)
     var l: u16 = 0;
     var la: u16 = 0;
     var lg: u16 = 0;
@@ -345,8 +346,10 @@ task pass_task() void {
   }
   sys_mod.unblock_cmd_stream();
 }
+var pos0: u32 = 0;
 fn compute(steps: u32, start_pos: u32) void {
   n_steps = steps;
+  pos0 = start_pos;
   @activate(pass_id);
 }
 
