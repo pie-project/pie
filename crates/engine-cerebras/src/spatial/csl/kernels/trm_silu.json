@@ -14,5 +14,9 @@
  {
   "old": "var ek = @zeros([EX_N]u16);",
   "new": "var ek = @zeros([1]u16);   // (trm 1024) exp_fast's scratch in sg16b (2 Ic >= EX_N)\ncomptime { @comptime_assert(2 * Ic >= EX_N); }"
+ },
+ {
+  "old": "  if ((ARF & 1) != 0 and axis_cur != 1) { arf_ar(buf, n); return; }   // (arf) Y, (arx) XA",
+  "new": "  // (trm 1024) with ARF 7 every all-reduce is a streamed-halves one: the chains' code (phase1 /\n  // phase2, which would hang on ARF 7's segment routes anyway) is dead: -1.3 KB\n  if ((ARF & 1) != 0 and ((ARF & 4) != 0 or axis_cur != 1)) { arf_ar(buf, n); return; }   // (arf) Y, (arx) XA"
  }
 ]
