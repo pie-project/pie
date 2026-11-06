@@ -81,6 +81,8 @@ const q_n = @get_input_queue(2);
 const q_s = @get_input_queue(3);
 const q_lb = @get_input_queue(4);
 const q_si = @get_input_queue(5);
+const q_sm = @get_input_queue(6);    // the segment's multicast (non-roots)
+const q_s2 = @get_input_queue(7);    // a two-half segment root's second half
 const q_lo = @get_output_queue(2);
 const q_mc = @get_output_queue(3);
 const q_so = @get_output_queue(4);
@@ -97,7 +99,7 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
 }
 const NR: u16 = 8;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 8]u32);
+var rcfg = @zeros([RQ + 10]u32);
 var rcfg_ptr: [*]u32 = &rcfg;
 var role_s: u16 = 0;     // the segment all-reduce: 0 start, 1 add-forward, 4 root (others multicast)
 fn iqc(comptime qid: u16, c: u32) void {
@@ -121,6 +123,7 @@ fn init() void {
   iqc(2, rcfg[RQ]); iqc(3, rcfg[RQ + 1]); iqc(4, rcfg[RQ + 2]); iqc(5, rcfg[RQ + 3]);
   oqc(2, rcfg[RQ + 4]); oqc(3, rcfg[RQ + 5]); oqc(4, rcfg[RQ + 6]);
   role_s = @as(u16, rcfg[RQ + 7]);
+  iqc(6, rcfg[RQ + 8]); iqc(7, rcfg[RQ + 9]);
   sys_mod.unblock_cmd_stream();
 }
 
@@ -131,17 +134,20 @@ fn reduce(n: u16) void {
   @fmovs(tv(0, n), fin(q_lb, n));
 }
 fn mcast(n: u16) void { @fmovs(fout(q_mc, n), uv(0, n)); }
-// A small all-reduce over the control row's segment (n <= 4 words of gsc[2..]).
+// A small all-reduce over the control row's segment (n <= 2 words, gsc[2..]): roles 0 chain
+// start, 1 add-forward (q_si in), 4 root of two halves (q_si, q_s2), 6 root of one half (q_si),
+// 5 alone; the root multicasts on q_so, the others take it on q_sm.
 fn seg_ar(n: u16) void {
   const d = @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{4} -> gsc[i] }), 2, f32), n);
   if (role_s == 5) { return; }
-  if (role_s == 4) {
+  if (role_s == 4 or role_s == 6) {
     @fadds(d, d, fin(q_si, n));
+    if (role_s == 4) { @fadds(d, d, fin(q_s2, n)); }
     @fmovs(fout(q_so, n), d);
-  } else {
-    if (role_s == 0) { @fmovs(fout(q_so, n), d); } else { @fadds(fout(q_so, n), fin(q_si, n), d); }
-    @fmovs(d, fin(q_si, n));
+    return;
   }
+  if (role_s == 0) { @fmovs(fout(q_so, n), d); } else { @fadds(fout(q_so, n), fin(q_si, n), d); }
+  @fmovs(d, fin(q_sm, n));
 }
 
 // ---------------------------------------------------------------- scalar math
@@ -350,6 +356,8 @@ comptime {
   @initialize_queue(q_s, .{ .color = @get_color(14) });   // parked (distinct a queue)
   @initialize_queue(q_lb, .{ .color = @get_color(17) });   // parked (distinct a queue)
   @initialize_queue(q_si, .{ .color = @get_color(18) });   // parked (distinct a queue)
+  @initialize_queue(q_sm, .{ .color = @get_color(19) });   // parked (distinct a queue)
+  @initialize_queue(q_s2, .{ .color = @get_color(20) });   // parked (distinct a queue)
   @initialize_queue(q_lo, .{ .color = C_PARK });
   @initialize_queue(q_mc, .{ .color = C_PARK });
   @initialize_queue(q_so, .{ .color = C_PARK });

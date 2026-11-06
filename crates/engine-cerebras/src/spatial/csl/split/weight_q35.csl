@@ -128,7 +128,7 @@ var rcfg = @zeros([RQ + 18]u32);   // [RQ+17] the row
 var rcfg_ptr: [*]u32 = &rcfg;
 var role_x: u16 = 0;
 var role_y: u16 = 0;
-var role_s: u16 = 0;    // the scores segment: 0-3 as role_x, 4 its root
+var role_s: u16 = 0;    // the scores segment: 0-3 as role_x, 4 its root (two halves), 6 a one-half root, 5 alone; a root's multicast loops back to it
 var myrow: u16 = 0;    // this PE's row in the unit's weight rows
 var gsrc: u16 = 0;      // GDN: bit 15 this PE owns k index r, bit 14 alone (the k head in one column), bits 0-7 its q/k dim
 
@@ -325,7 +325,8 @@ fn seg_ar(n: u16) void {
   if (role_s == 4) {
     @fadds(fifo, fin(q_xb, n), d, .{ .async = true, .ut_id = ut_a });
     @fadds(fout(q_xo, n), fin(q_xa, n), fifo, A);
-  } else if (role_s == 0) { @fmovs(fout(q_xo, n), d, A); }
+  } else if (role_s == 6) { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }   // a root of one half
+  else if (role_s == 0) { @fmovs(fout(q_xo, n), d, A); }
   else if (role_s == 2) {
     @fadds(fifo, fin(q_xa, n), d, .{ .async = true, .ut_id = ut_a });
     @fadds(fout(q_xo, n), fin(q_xb, n), fifo, A);
