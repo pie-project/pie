@@ -1189,8 +1189,17 @@ device = ["metal:0"]
             let cfg: Config = toml::from_str(&toml).unwrap();
             assert_eq!(cfg.validate().is_ok(), ok, "metal at depth {depth}");
         }
-        assert_eq!(Config::max_frames(EngineKind::Cerebras), Runahead::UNSTAGED_MAX_FRAMES);
-        for kind in [EngineKind::Cuda, EngineKind::Metal, EngineKind::Vulkan, EngineKind::Wgpu, EngineKind::Xla] {
+        assert_eq!(
+            Config::max_frames(EngineKind::Cerebras),
+            Runahead::UNSTAGED_MAX_FRAMES
+        );
+        for kind in [
+            EngineKind::Cuda,
+            EngineKind::Metal,
+            EngineKind::Vulkan,
+            EngineKind::Wgpu,
+            EngineKind::Xla,
+        ] {
             assert_eq!(Config::max_frames(kind), Runahead::MAX_FRAMES, "{kind:?}");
         }
     }

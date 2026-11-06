@@ -93,7 +93,13 @@ impl RowOrder {
         let r2 = r2g * gy + gr;
         let slack = |r: i64| -> f64 {
             let (g, k) = (r / gy, r % gy);
-            let p1 = if k == gr { gr } else if k < gr { k } else { gy - 1 - k };
+            let p1 = if k == gr {
+                gr
+            } else if k < gr {
+                k
+            } else {
+                gy - 1 - k
+            };
             2.3 * (r2.max(py - 1 - r2) - (r - r2).abs()) as f64
                 + 50.0 * (r2g.max(ng - 1 - r2g) - (g - r2g).abs()) as f64
                 + 12.4 * p1 as f64
@@ -727,7 +733,13 @@ mod tests {
 
     #[test]
     fn the_ar_row_order_is_a_bijection_that_starts_at_the_root() {
-        let shape = Shape { lanes: 1, rows: 152, page_size: 1, blocks: 16, entries: 5 };
+        let shape = Shape {
+            lanes: 1,
+            rows: 152,
+            page_size: 1,
+            blocks: 16,
+            entries: 5,
+        };
         let o = RowOrder::parse("ar:208:16", &shape).unwrap();
         assert_eq!(o.rows()[..5], [104, 103, 105, 102, 106]);
         assert_eq!(o.rows()[205..], [1, 207, 0]);

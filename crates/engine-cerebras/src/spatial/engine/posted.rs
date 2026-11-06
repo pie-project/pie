@@ -54,7 +54,9 @@ struct Landing {
 /// page's end, as always.
 fn continuation_posted_only() -> Option<PostedOnly> {
     static POSTED: std::sync::OnceLock<Option<PostedOnly>> = std::sync::OnceLock::new();
-    *POSTED.get_or_init(|| parse_continuation(std::env::var("PIE_CEREBRAS_CONTINUATION").ok().as_deref()))
+    *POSTED.get_or_init(|| {
+        parse_continuation(std::env::var("PIE_CEREBRAS_CONTINUATION").ok().as_deref())
+    })
 }
 
 /// The posted-only mode: launches of at most `most` rows, and the shortest
@@ -72,15 +74,28 @@ fn parse_continuation(v: Option<&str>) -> Option<PostedOnly> {
     if parts.next() != Some("posted") {
         return None;
     }
-    let most = parts.next().and_then(|t| t.parse().ok()).unwrap_or(usize::MAX).max(1);
-    let tail = parts.next().and_then(|k| k.parse().ok()).unwrap_or(TAIL_MIN);
+    let most = parts
+        .next()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let tail = parts
+        .next()
+        .and_then(|k| k.parse().ok())
+        .unwrap_or(TAIL_MIN);
     Some(PostedOnly { most, tail })
 }
 
 /// A continuation's iterations from the loop's `end`: the lane's pages'
 /// `room`, at most `cap`, and with `posted_only` (at most so many) no further
 /// than the latest posted fire's row (at slot `held`).
-fn continuation_steps(room: usize, cap: usize, end: u32, held: u32, posted_only: Option<PostedOnly>) -> usize {
+fn continuation_steps(
+    room: usize,
+    cap: usize,
+    end: u32,
+    held: u32,
+    posted_only: Option<PostedOnly>,
+) -> usize {
     let steps = room.min(cap);
     let Some(PostedOnly { most, tail }) = posted_only else {
         return steps;

@@ -213,7 +213,11 @@ pub(crate) fn f16_bits(b: u16) -> u16 {
     let half = 1u32 << (sh - 1);
     let q = q + u32::from(r > half || (r == half && q & 1 == 1));
     // q carries the hidden bit for normals (e >= 1): exponent field e - 1 + carry.
-    let bits = if e >= 1 { ((e as u32 - 1) << 10) + q } else { q };
+    let bits = if e >= 1 {
+        ((e as u32 - 1) << 10) + q
+    } else {
+        q
+    };
     sign | bits as u16
 }
 
@@ -428,7 +432,8 @@ pub(crate) fn unit(
                             for h in 0..nh {
                                 for i in 0..dh {
                                     out.push(
-                                        dim(py, kk).map_or(0, |col| qk(li, g, h, dl[half + i], col)),
+                                        dim(py, kk)
+                                            .map_or(0, |col| qk(li, g, h, dl[half + i], col)),
                                     );
                                 }
                             }
@@ -1079,10 +1084,20 @@ mod tests {
     #[test]
     fn f16_bits_round_every_bf16_to_nearest() {
         let f16v = |h: u16| -> f64 {
-            let (s, e, m) = (if h >> 15 == 1 { -1.0 } else { 1.0 }, (h >> 10) & 0x1f, f64::from(h & 0x3ff));
+            let (s, e, m) = (
+                if h >> 15 == 1 { -1.0 } else { 1.0 },
+                (h >> 10) & 0x1f,
+                f64::from(h & 0x3ff),
+            );
             match e {
                 0 => s * m * 2f64.powi(-24),
-                31 => if m == 0.0 { s * f64::INFINITY } else { f64::NAN },
+                31 => {
+                    if m == 0.0 {
+                        s * f64::INFINITY
+                    } else {
+                        f64::NAN
+                    }
+                }
                 _ => s * (1.0 + m / 1024.0) * 2f64.powi(i32::from(e) - 15),
             }
         };
@@ -1099,8 +1114,17 @@ mod tests {
             }
             let y = f16v(h);
             assert_eq!(y.is_sign_negative(), x.is_sign_negative(), "{b:#x}");
-            let (lo, hi) = (f16v(h.wrapping_sub(1) & 0x7fff | (h & 0x8000)), f16v((h & 0x7fff) + 1 | (h & 0x8000)));
-            let dist = |v: f64| if v.is_nan() { f64::INFINITY } else { (v - x).abs() };
+            let (lo, hi) = (
+                f16v(h.wrapping_sub(1) & 0x7fff | (h & 0x8000)),
+                f16v((h & 0x7fff) + 1 | (h & 0x8000)),
+            );
+            let dist = |v: f64| {
+                if v.is_nan() {
+                    f64::INFINITY
+                } else {
+                    (v - x).abs()
+                }
+            };
             let err = dist(y);
             assert!(err <= dist(lo) && err <= dist(hi), "{b:#x}: {x} -> {y}");
             if err > 0.0 && (err == dist(lo) || err == dist(hi)) {

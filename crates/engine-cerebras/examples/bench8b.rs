@@ -135,12 +135,17 @@ fn main() -> Result<(), String> {
     // golden's tokens forced), zeroed first; each unit's and the head's
     // per-slot max and mean over its PEs, a timed pass (CAP - 2 a launch).
     let mut profile = serde_json::Value::Null;
-    if let Some(k) = std::env::var("BENCH8B_PROF").ok().and_then(|v| v.parse::<usize>().ok()) {
+    if let Some(k) = std::env::var("BENCH8B_PROF")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
         let mut run = || -> Result<serde_json::Value, String> {
             m.profile(true)?;
             let at0 = 256.min(seq.len().saturating_sub(cap));
             // (every pass's position inside the lane's pages)
-            let k = k.min((npg as usize * ps).saturating_sub(at0 + 1) / (cap - 1)).max(1);
+            let k = k
+                .min((npg as usize * ps).saturating_sub(at0 + 1) / (cap - 1))
+                .max(1);
             let tp = Instant::now();
             for j in 0..k {
                 let at = at0 + j * (cap - 1);
@@ -180,7 +185,9 @@ fn main() -> Result<(), String> {
                     }
                 }
                 let r1 = |v: &Vec<Vec<f64>>| -> Vec<Vec<f64>> {
-                    v.iter().map(|r| r.iter().map(|x| x.round()).collect()).collect()
+                    v.iter()
+                        .map(|r| r.iter().map(|x| x.round()).collect())
+                        .collect()
                 };
                 headmap = serde_json::json!({"cols": r1(&cols), "rows": r1(&rows), "rows_max": r1(&rmax)});
             }
@@ -214,6 +221,9 @@ fn ar_page_order(
     shape: &engine_cerebras::spatial::paged::Shape,
 ) -> Result<Vec<u32>, String> {
     let o = engine_cerebras::spatial::paged::RowOrder::parse(spec, shape)?;
-    eprintln!("BENCH8B_PAGEORDER rows first: {:?}", &o.rows()[..8.min(o.rows().len())]);
+    eprintln!(
+        "BENCH8B_PAGEORDER rows first: {:?}",
+        &o.rows()[..8.min(o.rows().len())]
+    );
     Ok((0..npg).map(|i| o.map(i)).collect())
 }

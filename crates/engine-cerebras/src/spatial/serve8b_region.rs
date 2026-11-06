@@ -493,7 +493,11 @@ impl Tables {
             }
         } else if same && a.x0 == b.x0 && a.y0.abs_diff(b.y0) == ak.py {
             // (HVC: the rows' columns centred when the unit is wider than tall)
-            let c0 = if self.centred && ak.px >= ak.py { (ak.px - ak.py) / 2 } else { 0 };
+            let c0 = if self.centred && ak.px >= ak.py {
+                (ak.px - ak.py) / 2
+            } else {
+                0
+            };
             for py in 0..ak.py {
                 let c = a.x0 + (c0 + py) % ak.px;
                 let cv = C_V[b.idx % 2][usize::from(py >= ak.px)];
@@ -800,8 +804,16 @@ pub fn route_words_gx(
     for py in 0..py_n {
         for px in 0..px_n {
             let at = (py * px_n + px) * stride;
-            let axes = [(W_, E_, px, px_n, gs), (N_, S_, py, py_n, gy), (W_, E_, px, px_n, gx)];
-            for (ax, (h, t, idv, alen, ga)) in axes.into_iter().enumerate().take(if gx > 0 { 3 } else { 2 }) {
+            let axes = [
+                (W_, E_, px, px_n, gs),
+                (N_, S_, py, py_n, gy),
+                (W_, E_, px, px_n, gx),
+            ];
+            for (ax, (h, t, idv, alen, ga)) in
+                axes.into_iter()
+                    .enumerate()
+                    .take(if gx > 0 { 3 } else { 2 })
+            {
                 let mut cfg = [(0, 0, 0); 5];
                 let r1 = ga / 2;
                 let ng = alen / ga;
@@ -916,7 +928,11 @@ fn arf_line(n: usize, k: usize, arg: usize) -> ([Option<(usize, usize, usize)>; 
     }
     let edge = k == 0 || k == n - 1;
     cfg[4] = Some((TOW, RAMP, if edge { RAMP } else { AWY }));
-    let role = (u32::from(far) << 1) | ((r1 as u32) << 2) | ((s2 as u32) << 3) | ((kk as u32) << 4) | ((gsz as u32) << 12);
+    let role = (u32::from(far) << 1)
+        | ((r1 as u32) << 2)
+        | ((s2 as u32) << 3)
+        | ((kk as u32) << 4)
+        | ((gsz as u32) << 12);
     (cfg, role, false)
 }
 
@@ -952,7 +968,13 @@ pub fn route_words_arf(
     let mut out = vec![0u32; py_n * px_n * stride];
     // One line's abstract routes as this PE's route words: `side` maps the
     // line's directions (1 away, 2 toward; the root: 1 first half, 2 second).
-    let put = |out: &mut [u32], at: usize, n: usize, k: usize, a: usize, (lo, hi): (usize, usize)| -> u32 {
+    let put = |out: &mut [u32],
+               at: usize,
+               n: usize,
+               k: usize,
+               a: usize,
+               (lo, hi): (usize, usize)|
+     -> u32 {
         let (cfg, role, root) = arf_line(n, k, a);
         let first = k < n / 2;
         let dir = |d: usize| match (d, root, first) {
@@ -963,7 +985,9 @@ pub fn route_words_arf(
             _ => hi,
         };
         for (c, f) in cfg.iter().enumerate() {
-            out[at + c] = f.map_or(0, |(rx, t1, t2)| rb[dir(rx)] | rb[5 + dir(t1)] | rb[5 + dir(t2)]);
+            out[at + c] = f.map_or(0, |(rx, t1, t2)| {
+                rb[dir(rx)] | rb[5 + dir(t1)] | rb[5 + dir(t2)]
+            });
         }
         if root {
             out[at + 4] |= rb[5]; // the root's loop-back
@@ -1001,9 +1025,16 @@ pub fn put_routes(
             .ok_or("HROUTE 1 without the program's rbits")?;
         for v in &units {
             // (RGX: the regions' third X route set)
-            let gx = if v.kind == Kind::Grid { 0 } else { lay.model.rgx };
+            let gx = if v.kind == Kind::Grid {
+                0
+            } else {
+                lay.model.rgx
+            };
             if gx > 0 && (!gx.is_power_of_two() || v.k.px % gx != 0 || gx > v.k.px / 2) {
-                return Err(format!("RGX {gx} does not split the region's {} columns", v.k.px));
+                return Err(format!(
+                    "RGX {gx} does not split the region's {} columns",
+                    v.k.px
+                ));
             }
             // (ARF: the regions' Y all-reduces as streamed halves, groups of 8)
             // (GRD bit 1: the grids' too)
@@ -1017,17 +1048,31 @@ pub fn put_routes(
             // (ARF bit 4: the segment all-reduce as streamed halves on each segment too)
             let seg = lay.model.arf & 4 != 0;
             if seg && v.k.px % v.k.gs != 0 {
-                return Err(format!("ARF 7: segments of {} do not split {} columns", v.k.gs, v.k.px));
+                return Err(format!(
+                    "ARF 7: segments of {} do not split {} columns",
+                    v.k.gs, v.k.px
+                ));
             }
             let (words, n) = if arf {
-                (route_words_arf(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), ary, argx, seg), if argx > 0 { 18 } else { 12 })
+                (
+                    route_words_arf(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), ary, argx, seg),
+                    if argx > 0 { 18 } else { 12 },
+                )
             } else {
-                (route_words_gx(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), gx), if gx > 0 { 17 } else { 11 })
+                (
+                    route_words_gx(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), gx),
+                    if gx > 0 { 17 } else { 11 },
+                )
             };
             dev.put("rcfg", rect(v.x0, v.y0, v.k.px, v.k.py), n, &words)?;
         }
     }
-    let mut tables = Tables::new_with(units.clone(), lay.paged().map_or(1, |s| s.lanes), u.rtr, lay.model.hvc)?;
+    let mut tables = Tables::new_with(
+        units.clone(),
+        lay.paged().map_or(1, |s| s.lanes),
+        u.rtr,
+        lay.model.hvc,
+    )?;
     tables.pipe = lay.mmax().is_some();
     for v in &units {
         dev.put16(
@@ -1067,7 +1112,17 @@ pub(crate) fn place_layers(
         for v in u.units(lay) {
             let layers: Vec<usize> = v.layers.clone().collect();
             let qkn = (v.kind == Kind::Grid && lay.model.grid & 4 == 0) || lay.model.mem & 2 == 0;
-            super::serve8b::unit(lay, ckpt, v.k, &layers, (v.x0, v.y0), &rope, false, qkn, dev)?;
+            super::serve8b::unit(
+                lay,
+                ckpt,
+                v.k,
+                &layers,
+                (v.x0, v.y0),
+                &rope,
+                false,
+                qkn,
+                dev,
+            )?;
         }
     }
     Ok(())
@@ -1135,14 +1190,28 @@ pub fn copy_pages(
             }
             for sym in ["kc", "vc"] {
                 let mut a = vec![0u32; v.k.px * k * len];
-                rt.memcpy_d2h(sym, &mut a, rows(rs, k), len, Order::RowMajor, DataType::Bits16)
-                    .map_err(e)?;
+                rt.memcpy_d2h(
+                    sym,
+                    &mut a,
+                    rows(rs, k),
+                    len,
+                    Order::RowMajor,
+                    DataType::Bits16,
+                )
+                .map_err(e)?;
                 let mut d = if rd == rs {
                     a.clone()
                 } else {
                     let mut d = vec![0u32; v.k.px * k * len];
-                    rt.memcpy_d2h(sym, &mut d, rows(rd, k), len, Order::RowMajor, DataType::Bits16)
-                        .map_err(e)?;
+                    rt.memcpy_d2h(
+                        sym,
+                        &mut d,
+                        rows(rd, k),
+                        len,
+                        Order::RowMajor,
+                        DataType::Bits16,
+                    )
+                    .map_err(e)?;
                     d
                 };
                 for (s, t) in a.chunks_exact(len).zip(d.chunks_exact_mut(len)) {
@@ -1627,7 +1696,12 @@ mod tests {
     /// every PE once, and the broadcast reaches every PE once. `word(p, c)`:
     /// PE p's colour c (0..5) word; `(lo, hi)`: the line's directions toward
     /// p - 1 and p + 1 (1 north / 2 south, or 4 west / 3 east).
-    fn check_arf_line(n: usize, word: &dyn Fn(usize, usize) -> u32, role: &dyn Fn(usize) -> u32, (lo, hi): (usize, usize)) {
+    fn check_arf_line(
+        n: usize,
+        word: &dyn Fn(usize, usize) -> u32,
+        role: &dyn Fn(usize) -> u32,
+        (lo, hi): (usize, usize),
+    ) {
         // Where a stream sent by p on colour c lands: every PE whose router
         // passes it to its ramp.
         let lands = |p: usize, c: usize| -> Vec<usize> {
@@ -1641,7 +1715,11 @@ mod tests {
                 for (d, from) in [(lo, hi), (hi, lo)] {
                     if wd & (1 << (5 + d)) != 0 {
                         let q = if d == lo { at - 1 } else { at + 1 };
-                        assert_ne!(word(q, c) & (1 << from), 0, "PE {q} colour {c}: not from {from}");
+                        assert_ne!(
+                            word(q, c) & (1 << from),
+                            0,
+                            "PE {q} colour {c}: not from {from}"
+                        );
                         todo.push((q, word(q, c)));
                     }
                 }
@@ -1689,14 +1767,26 @@ mod tests {
                 if p != root {
                     let to = lands(p, outc[p]);
                     assert_eq!(to.len(), 1, "PE {p}'s stream lands on {to:?}");
-                    assert!(ins[to[0]].contains(&outc[p]), "PE {p} -> {}: colour {}", to[0], outc[p]);
-                    assert!(got[to[0]].iter().all(|(c, _)| *c != outc[p]), "two streams on one queue");
+                    assert!(
+                        ins[to[0]].contains(&outc[p]),
+                        "PE {p} -> {}: colour {}",
+                        to[0],
+                        outc[p]
+                    );
+                    assert!(
+                        got[to[0]].iter().all(|(c, _)| *c != outc[p]),
+                        "two streams on one queue"
+                    );
                     got[to[0]].push((outc[p], v.clone()));
                 }
                 sum[p] = Some(v);
             }
         }
-        assert_eq!(sum[root].as_deref(), Some(&vec![1u32; n][..]), "line of {n}");
+        assert_eq!(
+            sum[root].as_deref(),
+            Some(&vec![1u32; n][..]),
+            "line of {n}"
+        );
         let mut bc = lands(root, 4);
         bc.sort_unstable();
         assert_eq!(bc, (0..n).collect::<Vec<_>>(), "line of {n}: the broadcast");
@@ -1708,8 +1798,24 @@ mod tests {
     fn arf_route_words_reduce_every_row_once() {
         let rb: Vec<u32> = (0..10).map(|i| 1u32 << i).collect();
         // (ARY: Y groups of 8 or 16 rows)
-        for (argx, ary, seg) in [(0, 8, false), (16, 8, false), (16, 16, false), (16, 8, true)] {
-            for (py_n, px_n) in [(208, 2), (24, 1), (17, 1), (9, 1), (3, 1), (5, 256), (4, 33), (3, 17), (3, 3), (152, 128)] {
+        for (argx, ary, seg) in [
+            (0, 8, false),
+            (16, 8, false),
+            (16, 16, false),
+            (16, 8, true),
+        ] {
+            for (py_n, px_n) in [
+                (208, 2),
+                (24, 1),
+                (17, 1),
+                (9, 1),
+                (3, 1),
+                (5, 256),
+                (4, 33),
+                (3, 17),
+                (3, 3),
+                (152, 128),
+            ] {
                 if argx == 0 && px_n > 2 {
                     continue;
                 }
@@ -1719,8 +1825,23 @@ mod tests {
                 if seg && (px_n % gsx != 0 || gsx < 3) {
                     continue;
                 }
-                let w = route_words_arf(&rb, px_n, py_n, gsx, 16.min(py_n.next_power_of_two()), ary, argx, seg);
-                let base = route_words(&rb, px_n, py_n, 32.min(px_n.next_power_of_two()), 16.min(py_n.next_power_of_two()));
+                let w = route_words_arf(
+                    &rb,
+                    px_n,
+                    py_n,
+                    gsx,
+                    16.min(py_n.next_power_of_two()),
+                    ary,
+                    argx,
+                    seg,
+                );
+                let base = route_words(
+                    &rb,
+                    px_n,
+                    py_n,
+                    32.min(px_n.next_power_of_two()),
+                    16.min(py_n.next_power_of_two()),
+                );
                 assert_eq!(w.len(), px_n * py_n * st);
                 for pe in 0..px_n * py_n {
                     if !seg {
@@ -1797,7 +1918,8 @@ mod tests {
             panic!("not serve8b_region")
         };
         fn fill(sym: &str, x: i32, y: i32, i: usize) -> u32 {
-            (x as u32 * 7919 + y as u32 * 104_729 + i as u32 * 31 + u32::from(sym == "vc") * 17) & 0xffff
+            (x as u32 * 7919 + y as u32 * 104_729 + i as u32 * 31 + u32::from(sym == "vc") * 17)
+                & 0xffff
         }
         let rec = crate::spatial::device::Recorder::default().with_fill(fill);
         let mut dev = rec.clone();
@@ -1821,7 +1943,9 @@ mod tests {
                     let mut want: std::collections::HashMap<usize, Vec<u32>> = Default::default();
                     let row = |want: &std::collections::HashMap<usize, Vec<u32>>, r: usize| {
                         want.get(&r).cloned().unwrap_or_else(|| {
-                            (0..len).map(|i| fill(sym, x as i32, (v.y0 + r) as i32, i)).collect()
+                            (0..len)
+                                .map(|i| fill(sym, x as i32, (v.y0 + r) as i32, i))
+                                .collect()
                         })
                     };
                     for &(s, d) in &pairs {
@@ -1831,12 +1955,15 @@ mod tests {
                         let mut t = row(&want, rd);
                         for l in 0..v.nl() {
                             let o = 1 + l * kcn;
-                            t[o + bd * n..o + (bd + 1) * n].copy_from_slice(&a[o + bs * n..o + (bs + 1) * n]);
+                            t[o + bd * n..o + (bd + 1) * n]
+                                .copy_from_slice(&a[o + bs * n..o + (bs + 1) * n]);
                         }
                         want.insert(rd, t);
                     }
                     for (r, w) in &want {
-                        let got = rec.memory(sym, x as i32, (v.y0 + r) as i32).expect("written");
+                        let got = rec
+                            .memory(sym, x as i32, (v.y0 + r) as i32)
+                            .expect("written");
                         assert_eq!(&got, w, "unit at ({}, {}) {sym} x {x} row {r}", v.x0, v.y0);
                     }
                 }
@@ -1853,26 +1980,39 @@ mod tests {
         PROF:0,TIME:1,HROUTE:1,ROT8:1,QKN:0,EPS:925353388,NOLAYER:0,HEADMODE:2,HH:864,Vr:150,Gx:4,Gy:24,\
         vocab:128256,PASSES:3,MODE:2,OVL:0,VMC:1,CAP:128,iters:1,B:1,NP:1,SPD:1,LSE:1";
         // (and Qwen3-8B's: PY 144, NCOL 5 column grids from YD 208)
-        let q = p.replace("PY:152,Hc:27,Dc:8,Gs:16,Ic:112", "PY:144,Hc:29,Dc:8,Gs:16,Ic:96")
-            .replace("RIc:56", "RIc:48").replace("NCOL:1,YD:624", "NCOL:5,YD:208")
-            .replace("QKN:0,EPS:925353388,", "").replace("HH:864,Vr:150,Gx:4", "HH:1152,Vr:132,Gx:8")
-            .replace("vocab:128256", "vocab:151936").replace("CAP:128", "CAP:64");
+        let q = p
+            .replace(
+                "PY:152,Hc:27,Dc:8,Gs:16,Ic:112",
+                "PY:144,Hc:29,Dc:8,Gs:16,Ic:96",
+            )
+            .replace("RIc:56", "RIc:48")
+            .replace("NCOL:1,YD:624", "NCOL:5,YD:208")
+            .replace("QKN:0,EPS:925353388,", "")
+            .replace("HH:864,Vr:150,Gx:4", "HH:1152,Vr:132,Gx:8")
+            .replace("vocab:128256", "vocab:151936")
+            .replace("CAP:128", "CAP:64");
         for p in [p.to_string(), q] {
-        let lay = lay_of(&p);
-        let Layers::Units { units: u, .. } = lay.layers else { panic!("not serve8b_region") };
-        let units = u.units(&lay);
-        let t = Tables::new(units.clone(), 1, u.rtr).unwrap();
-        for v in units.iter().filter(|v| v.kind == Kind::Region) {
-            for py in 0..v.k.py {
-                for px in 0..v.k.px {
-                    let e = &t.pe[&(v.x0 + px, v.y0 + py)];
-                    let mut cs: Vec<u32> = e.routes.keys().copied().collect();
-                    cs.extend(e.recv.iter().chain(&e.send).map(|r| r[0]));
-                    cs.extend([e.relay, e.fwd_in]);
-                    assert!(cs.iter().all(|c| ![0, 1, 2, 15, 16].contains(c) && !(5..=10).contains(c)), "{cs:?}");
+            let lay = lay_of(&p);
+            let Layers::Units { units: u, .. } = lay.layers else {
+                panic!("not serve8b_region")
+            };
+            let units = u.units(&lay);
+            let t = Tables::new(units.clone(), 1, u.rtr).unwrap();
+            for v in units.iter().filter(|v| v.kind == Kind::Region) {
+                for py in 0..v.k.py {
+                    for px in 0..v.k.px {
+                        let e = &t.pe[&(v.x0 + px, v.y0 + py)];
+                        let mut cs: Vec<u32> = e.routes.keys().copied().collect();
+                        cs.extend(e.recv.iter().chain(&e.send).map(|r| r[0]));
+                        cs.extend([e.relay, e.fwd_in]);
+                        assert!(
+                            cs.iter()
+                                .all(|c| ![0, 1, 2, 15, 16].contains(c) && !(5..=10).contains(c)),
+                            "{cs:?}"
+                        );
+                    }
                 }
             }
-        }
         }
     }
 

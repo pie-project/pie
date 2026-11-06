@@ -510,7 +510,10 @@ impl Variant {
                 return Err(format!("gen: {tag}: ARF needs OP2"));
             }
             if self.arf != 1 && self.arf != 3 && self.arf != 7 {
-                return Err(format!("gen: {tag}: ARF {} unknown (1: the Y axis, 3: and X, 7: and the X segments)", self.arf));
+                return Err(format!(
+                    "gen: {tag}: ARF {} unknown (1: the Y axis, 3: and X, 7: and the X segments)",
+                    self.arf
+                ));
             }
             s = apply_reps("arf_ops", src::ARF_OPS, &s, tag)?;
             if self.arf & 2 != 0 {
@@ -519,7 +522,10 @@ impl Variant {
         }
         if self.f16 != 0 {
             if self.f16 > 3 {
-                return Err(format!("gen: {tag}: F16 {} unknown (1 f16, 2 f16 accumulation in the regions, 3 and the grids)", self.f16));
+                return Err(format!(
+                    "gen: {tag}: F16 {} unknown (1 f16, 2 f16 accumulation in the regions, 3 and the grids)",
+                    self.f16
+                ));
             }
             if !self.ops2 {
                 return Err(format!("gen: {tag}: F16 needs OP2"));
@@ -576,7 +582,10 @@ impl Variant {
                     &format!("{tag}'s F16 clamp"),
                 )?;
                 for (old, new) in [
-                    ("    bcv[j] = recip(l);\n", "    bcv[j] = -recip(l);   // (f16) the values carry -p\n"),
+                    (
+                        "    bcv[j] = recip(l);\n",
+                        "    bcv[j] = -recip(l);   // (f16) the values carry -p\n",
+                    ),
                     (
                         "    if (e < 770048.0 or e >= 3735552.0) { bad = 1.0; }\n",
                         "    // (f16) the sum in [2^-8, 2^15); PROF 0 counts the redos by side in prof[2] / prof[3]\n    if (e < 1949696.0) { bad = 1.0; if (PROF == 0) { prof[2] += 1; } }\n    if (e >= 2326528.0) { bad = 1.0; if (PROF == 0) { prof[3] += 1; } }\n",
@@ -638,7 +647,10 @@ impl Variant {
         }
         if self.mem != 0 && unit(4) {
             if self.mem != 1 && self.mem != 3 {
-                return Err(format!("gen: {tag}: MEM {} unknown (1: the code cuts, 3: and q's constant scale)", self.mem));
+                return Err(format!(
+                    "gen: {tag}: MEM {} unknown (1: the code cuts, 3: and q's constant scale)",
+                    self.mem
+                ));
             }
             if self.mem & 2 != 0 && !self.identity_qk_norm {
                 return Err(format!("gen: {tag}: MEM 3 needs the identity q/k norm"));
@@ -662,7 +674,10 @@ impl Variant {
         }
         if self.op3 != 0 && unit(2) {
             if self.op3 != 1 {
-                return Err(format!("gen: {tag}: OP3 {} unknown (1: RoPE a pass)", self.op3));
+                return Err(format!(
+                    "gen: {tag}: OP3 {} unknown (1: RoPE a pass)",
+                    self.op3
+                ));
             }
             if !self.ops2 {
                 return Err(format!("gen: {tag}: OP3 needs OP2"));
@@ -696,7 +711,10 @@ impl Variant {
         // (bits 16384 and 32768 are the head's and the strip's alone)
         if self.trim & 16383 != 0 && (region || self.trim & 4 != 0) {
             if self.trim & 1 == 0 {
-                return Err(format!("gen: {tag}: TRM {} unknown (1 the cuts, 2 and the sums of squares, 4 the grids too, 8 exp at degree 4, 16 the residuals from the fabric, 32 the head's split_x, 64 HV's zero copies, 128 HV's entries once a pass, 256 rsqrt in two Newton steps, 512 x g in f16, 1024 the MLP's act in f16 on every PE: no act all-reduce, 2048 its scales in f16, 4096 512's f16 gammas in place on the first pass, 8192 the grids' x g in f16, 16384 the head's packed argmax round)", self.trim));
+                return Err(format!(
+                    "gen: {tag}: TRM {} unknown (1 the cuts, 2 and the sums of squares, 4 the grids too, 8 exp at degree 4, 16 the residuals from the fabric, 32 the head's split_x, 64 HV's zero copies, 128 HV's entries once a pass, 256 rsqrt in two Newton steps, 512 x g in f16, 1024 the MLP's act in f16 on every PE: no act all-reduce, 2048 its scales in f16, 4096 512's f16 gammas in place on the first pass, 8192 the grids' x g in f16, 16384 the head's packed argmax round)",
+                    self.trim
+                ));
             }
             if self.trim & 128 != 0 && self.trim & 64 == 0 {
                 return Err(format!("gen: {tag}: TRM 128 needs 64 (the zero run)"));
@@ -705,7 +723,9 @@ impl Variant {
                 return Err(format!("gen: {tag}: TRM 16 needs ARF 3"));
             }
             if !(self.qkv1 && self.ops2 && self.f16 >= if region { 2 } else { 3 }) {
-                return Err(format!("gen: {tag}: TRM needs QKV1, OP2 and the unit's f16 accumulation"));
+                return Err(format!(
+                    "gen: {tag}: TRM needs QKV1, OP2 and the unit's f16 accumulation"
+                ));
             }
             s = apply_reps("trm_ops", src::TRM_OPS, &s, tag)?;
             if self.trim & 2 != 0 {
@@ -836,7 +856,15 @@ fn xac(text: &str, tag: &str) -> R<String> {
          \x20 while (i < 4) : (i += 1) { put_route(xaddr[i], rcfg[2 * NCOL + 2 + i]); }\n}\n",
         &what("setup"),
     )?;
-    for (i, (k, c)) in [("c10", "c_r1_0"), ("c11", "c_r1_1"), ("c20", "c_r2_0"), ("c21", "c_r2_1")].into_iter().enumerate() {
+    for (i, (k, c)) in [
+        ("c10", "c_r1_0"),
+        ("c11", "c_r1_1"),
+        ("c20", "c_r2_0"),
+        ("c21", "c_r2_1"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         s = patch(
             &s,
             &format!("  const {k}: u16 = @get_int({c});\n"),
@@ -2331,7 +2359,12 @@ fn apply_reps(name: &str, json: &str, text: &str, tag: &str) -> R<String> {
     let reps: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("{name}.json: {e}"))?;
     let mut s = text.to_string();
-    for (i, r) in reps.as_array().ok_or(format!("{name}.json: not a list"))?.iter().enumerate() {
+    for (i, r) in reps
+        .as_array()
+        .ok_or(format!("{name}.json: not a list"))?
+        .iter()
+        .enumerate()
+    {
         let (old, new) = (
             r["old"].as_str().unwrap_or(""),
             r["new"].as_str().unwrap_or(""),
@@ -3299,20 +3332,41 @@ fn serve8b_region_files(pipe: bool, grid: &str, region: &str, variant: Variant) 
             s8br_unit("qwen2d_region", region, pipe, variant)?,
         ),
         ("head_pe.csl", {
-            let h = if variant.f16 != 0 { f16_head(&s8br_head(pipe)?) } else { s8br_head(pipe)? };
-            let h = if variant.trim & 32 != 0 { head_trim(&h)? } else { h };
+            let h = if variant.f16 != 0 {
+                f16_head(&s8br_head(pipe)?)
+            } else {
+                s8br_head(pipe)?
+            };
+            let h = if variant.trim & 32 != 0 {
+                head_trim(&h)?
+            } else {
+                h
+            };
             // (TRM 16384: the STREAM argmax in one packed round, the exact rounds on a tie)
-            let h = if variant.trim & 16384 != 0 { apply_reps("head_pack", src::HEAD_PACK, &h, "the head")? } else { h };
+            let h = if variant.trim & 16384 != 0 {
+                apply_reps("head_pack", src::HEAD_PACK, &h, "the head")?
+            } else {
+                h
+            };
             // (TRM 32768, testing: every packed round takes the tie path)
             if variant.trim & 32768 != 0 {
-                patch(&h, "const PK_FORCE_TIE: bool = false;", "const PK_FORCE_TIE: bool = true;", "TRM 32768")?
+                patch(
+                    &h,
+                    "const PK_FORCE_TIE: bool = false;",
+                    "const PK_FORCE_TIE: bool = true;",
+                    "TRM 32768",
+                )?
             } else {
                 h
             }
         }),
         ("embed_pe.csl", {
             let e = s8br_plain(embed, "embed_base.csl", "the embedding strip", pipe);
-            if variant.trim & 16384 != 0 { apply_reps("embed_pack", src::EMBED_PACK, &e, "the strip")? } else { e }
+            if variant.trim & 16384 != 0 {
+                apply_reps("embed_pack", src::EMBED_PACK, &e, "the strip")?
+            } else {
+                e
+            }
         }),
         (
             "filler.csl",

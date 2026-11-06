@@ -496,7 +496,12 @@ impl WaferModel {
         const NP: usize = 16;
         let mut rects = self.design.grid_areas();
         let hx = self.design.head_x();
-        rects.push(rect(hx, 0, self.design.chunk_cols() + self.design.vmc(), self.design.hh() + 1));
+        rects.push(rect(
+            hx,
+            0,
+            self.design.chunk_cols() + self.design.vmc(),
+            self.design.hh() + 1,
+        ));
         let mut out = Vec::new();
         for r in rects {
             let a = self.rt.get("prof", r, NP)?;
@@ -522,7 +527,9 @@ impl WaferModel {
     pub fn profile_head_raw(&mut self) -> R<(Vec<u32>, usize)> {
         let hx = self.design.head_x();
         let w = self.design.chunk_cols() + self.design.vmc();
-        let a = self.rt.get("prof", rect(hx, 0, w, self.design.hh() + 1), 16)?;
+        let a = self
+            .rt
+            .get("prof", rect(hx, 0, w, self.design.hh() + 1), 16)?;
         Ok((a, w))
     }
 
@@ -1438,7 +1445,10 @@ fn row_order_env(paged: Option<super::paged::Shape>) -> R<Option<super::paged::R
     match (std::env::var("PIE_CEREBRAS_PAGE_ORDER").ok(), paged) {
         (Some(spec), Some(shape)) => {
             let o = super::paged::RowOrder::parse(&spec, &shape)?;
-            tracing::info!("PIE_CEREBRAS_PAGE_ORDER {spec}: rows first {:?}", &o.rows()[..4.min(o.rows().len())]);
+            tracing::info!(
+                "PIE_CEREBRAS_PAGE_ORDER {spec}: rows first {:?}",
+                &o.rows()[..4.min(o.rows().len())]
+            );
             Ok(Some(o))
         }
         _ => Ok(None),
@@ -1462,7 +1472,8 @@ fn launch_line(
         pages = lanes.iter().map(|l| l.pages.len()).sum::<usize>(),
         pos = lanes.first().map_or(0, |l| l.pos),
         idle_ms = (t0 - idle_from).as_secs_f64() * 1e3,
-        tables_ms = super::serve2d::TABLES_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        tables_ms =
+            super::serve2d::TABLES_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
         ms = t0.elapsed().as_secs_f64() * 1e3,
         "spatial wafer: launch"
     );
@@ -2114,9 +2125,18 @@ mod tests {
         // The page order relabels the expanded kernel pages (row 104 first).
         w.row_order = Some(super::super::paged::RowOrder::parse("ar:208:16", &kernel).unwrap());
         assert_eq!(w.kernel_pages(&[0])[..3], [104, 103, 105]);
-        assert_eq!(w.kernel_lanes(vec![super::super::serve2d::BatchLane {
-            pos: 0, slot: 0, pages: vec![0], visible: None, forced: vec![], state: None,
-        }])[0].pages[..2], [104, 103]);
+        assert_eq!(
+            w.kernel_lanes(vec![super::super::serve2d::BatchLane {
+                pos: 0,
+                slot: 0,
+                pages: vec![0],
+                visible: None,
+                forced: vec![],
+                state: None,
+            }])[0]
+                .pages[..2],
+            [104, 103]
+        );
     }
 
     #[test]

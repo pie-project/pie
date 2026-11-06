@@ -831,7 +831,15 @@ fn table_areas(areas: Vec<Rect>, merge: bool, units: bool, py: usize) -> Vec<(Re
             && area == i64::from(x1 - x0) * i64::from(y1 - y0)
             && same.iter().all(|b| (b.y - y0) % a.h == 0);
         if tiles {
-            out.push((Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, a.h as usize));
+            out.push((
+                Rect {
+                    x: x0,
+                    y: y0,
+                    w: x1 - x0,
+                    h: y1 - y0,
+                },
+                a.h as usize,
+            ));
         } else {
             out.extend(same.into_iter().map(|b| (*b, b.h as usize)));
         }

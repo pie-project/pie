@@ -1182,7 +1182,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         } else {
             (4, 2 * 2 * g.px / g.px + 1)
         };
-        if !g.dc.is_multiple_of(4) || !g.ic.is_multiple_of(2) || plan.layers < band + rc * rr * rnl + 1
+        if !g.dc.is_multiple_of(4)
+            || !g.ic.is_multiple_of(2)
+            || plan.layers < band + rc * rr * rnl + 1
         {
             return Err(format!(
                 "{}: serve8b_region's option A does not take this grid ({g:?})",
@@ -1269,7 +1271,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
                 hh + 1
             ));
         }
-    let f = hh / 2;
+        let f = hh / 2;
         if f < g.py || f >= yl {
             return Err(format!(
                 "{}: serve8b_region's feeder row {f} is not between the grids' {} and {yl}",
@@ -1465,14 +1467,32 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             lse: cfg.lse,
             ops2: cfg.ops2,
             qkv1: cfg.qkv1,
-            arf: if cfg.arfs { 7 } else if cfg.arfx { 3 } else { usize::from(cfg.arf) },
-            f16: if cfg.f16accg { 3 } else if cfg.f16acc { 2 } else { usize::from(cfg.f16) },
+            arf: if cfg.arfs {
+                7
+            } else if cfg.arfx {
+                3
+            } else {
+                usize::from(cfg.arf)
+            },
+            f16: if cfg.f16accg {
+                3
+            } else if cfg.f16acc {
+                2
+            } else {
+                usize::from(cfg.f16)
+            },
             // (MEM 3 where the q/k norm is the identity: q's scale a constant)
-            mem: if cfg.mem { if plan.spec.qk_norm { 1 } else { 3 } } else { 0 },
+            mem: if cfg.mem {
+                if plan.spec.qk_norm { 1 } else { 3 }
+            } else {
+                0
+            },
             op3: usize::from(cfg.op3),
             // (the grids' levers: ARF 1, OP3 2, MEM 4; MEM's only with ARF)
             grid: if cfg.grid_levers {
-                usize::from(cfg.arf) | (usize::from(cfg.op3) << 1) | (usize::from(cfg.mem && cfg.arf) << 2)
+                usize::from(cfg.arf)
+                    | (usize::from(cfg.op3) << 1)
+                    | (usize::from(cfg.mem && cfg.arf) << 2)
             } else {
                 0
             },
@@ -2712,9 +2732,16 @@ mod qwen3_8b {
         };
         let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
         let mut cfg = ServeConfig::new(goals);
-        (cfg.region, cfg.speed, cfg.lse, cfg.hv, cfg.lever_d, cfg.head_one_pass) =
+        (
+            cfg.region,
+            cfg.speed,
+            cfg.lse,
+            cfg.hv,
+            cfg.lever_d,
+            cfg.head_one_pass,
+        ) = (true, true, true, true, true, true);
+        (cfg.ops2, cfg.qkv1, cfg.arf, cfg.arfx, cfg.mem, cfg.op3) =
             (true, true, true, true, true, true);
-        (cfg.ops2, cfg.qkv1, cfg.arf, cfg.arfx, cfg.mem, cfg.op3) = (true, true, true, true, true, true);
         (cfg.f16acc, cfg.f16accg, cfg.grid_levers, cfg.xac) = (true, true, true, true);
         cfg.pins.set("NP", 1).unwrap();
         let (_, p) = params(&plan, &cfg).unwrap();
@@ -2744,9 +2771,16 @@ mod qwen3_8b {
         };
         let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
         let mut cfg = ServeConfig::new(goals);
-        (cfg.region, cfg.speed, cfg.lse, cfg.hv, cfg.lever_d, cfg.head_one_pass) =
+        (
+            cfg.region,
+            cfg.speed,
+            cfg.lse,
+            cfg.hv,
+            cfg.lever_d,
+            cfg.head_one_pass,
+        ) = (true, true, true, true, true, true);
+        (cfg.ops2, cfg.qkv1, cfg.arf, cfg.arfx, cfg.mem, cfg.op3) =
             (true, true, true, true, true, true);
-        (cfg.ops2, cfg.qkv1, cfg.arf, cfg.arfx, cfg.mem, cfg.op3) = (true, true, true, true, true, true);
         (cfg.f16acc, cfg.f16accg, cfg.grid_levers, cfg.xac) = (true, true, true, true);
         (cfg.trim, cfg.arfs, cfg.hvc) = (true, true, true);
         cfg.pins.set("NP", 1).unwrap();
@@ -3048,10 +3082,24 @@ mod llama31_8b {
     fn the_plan_places_llama_3_grid_levers_as_0522() {
         let (plan, mut cfg) = cfg_for(1, false);
         cfg.goals.cap = Some(128);
-        (cfg.speed, cfg.lse, cfg.ops2, cfg.qkv1, cfg.head_one_pass, cfg.hv, cfg.lever_d) =
-            (true, true, true, true, true, true, true);
-        (cfg.arf, cfg.arfx, cfg.mem, cfg.op3, cfg.f16acc, cfg.f16accg, cfg.grid_levers) =
-            (true, true, true, true, true, true, true);
+        (
+            cfg.speed,
+            cfg.lse,
+            cfg.ops2,
+            cfg.qkv1,
+            cfg.head_one_pass,
+            cfg.hv,
+            cfg.lever_d,
+        ) = (true, true, true, true, true, true, true);
+        (
+            cfg.arf,
+            cfg.arfx,
+            cfg.mem,
+            cfg.op3,
+            cfg.f16acc,
+            cfg.f16accg,
+            cfg.grid_levers,
+        ) = (true, true, true, true, true, true, true);
         cfg.pins.set("NP", 1).unwrap();
         let plan = SpatialPlan::derive(&plan.spec, WaferDims::CS3, cfg.goals).unwrap();
         let (_, p) = params(&plan, &cfg).unwrap();
@@ -3070,26 +3118,44 @@ mod llama31_8b {
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1")));
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1"))
+        );
         // + trim + ary16 + hvc: TRM 511, ARY 16, HVC 1 (0534's sp534_t14); + arfs: ARF 7
         (cfg.trim, cfg.ary16, cfg.hvc) = (true, true, true);
         let (_, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1,TRM:1023,ARY:16,HVC:1")));
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1,TRM:1023,ARY:16,HVC:1"))
+        );
         cfg.arfs = true;
         let (d, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
         let want7 = want.replace("ARF:3", "ARF:7");
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:1023,ARY:16,HVC:1")));
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:1023,ARY:16,HVC:1"))
+        );
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         for (n, text) in d.files_with(lay.model.variant()).unwrap() {
             if n == "region_pe.csl" || n == "grid_pe.csl" {
-                assert!(text.contains("(trm) y starts at 0") && text.contains("(trm 2)") && text.contains("(trm 8)"), "{n}");
-                assert!(text.contains("(trm) both halves' q heads in one op") && text.contains("(trm 16)"), "{n}");
+                assert!(
+                    text.contains("(trm) y starts at 0")
+                        && text.contains("(trm 2)")
+                        && text.contains("(trm 8)"),
+                    "{n}"
+                );
+                assert!(
+                    text.contains("(trm) both halves' q heads in one op")
+                        && text.contains("(trm 16)"),
+                    "{n}"
+                );
                 assert!(text.contains("(trm 64)") && text.contains("(arfs)"), "{n}");
             }
         }
@@ -3099,7 +3165,10 @@ mod llama31_8b {
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:6143,ARY:16,HVC:1")));
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:6143,ARY:16,HVC:1"))
+        );
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         for (n, text) in d.files_with(lay.model.variant()).unwrap() {
             assert_eq!(text.contains("(trm 1024)"), n == "region_pe.csl", "{n}");
@@ -3110,21 +3179,30 @@ mod llama31_8b {
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:14335,ARY:16,HVC:1")));
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:14335,ARY:16,HVC:1"))
+        );
         // + head_pack: TRM 30719
         cfg.head_pack = true;
         let (_, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:30719,ARY:16,HVC:1")));
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:30719,ARY:16,HVC:1"))
+        );
         // + silu16h: TRM 32767 (everything)
         cfg.silu16h = true;
         let (_, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:32767,ARY:16,HVC:1")));
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:32767,ARY:16,HVC:1"))
+        );
     }
 
     /// `ops2` on 0472's config states 0480's program: the same parameters
@@ -3360,19 +3438,34 @@ mod llama31_8b {
             match *n {
                 "region_pe.csl" => {
                     assert!(!a.contains("fn arf_ar(") && b.contains("fn arf_ar("), "{n}");
-                    assert!(b.contains("wmvh(gb, wgu_dsd, xn_dsd, Hc, 2 * Ic, false);"), "{n}");
+                    assert!(
+                        b.contains("wmvh(gb, wgu_dsd, xn_dsd, Hc, 2 * Ic, false);"),
+                        "{n}"
+                    );
                     assert!(b.contains("@as(@fp16(), @bitcast(f32, u))"), "{n}");
-                    assert!(b.contains("const R2X: u16 =") && b.contains("prof[slot] += lo - t_lo;"), "{n}");
-                    assert!(b.contains("fn axis_xa()") && b.contains("3 * NCOL + 3"), "{n}");
+                    assert!(
+                        b.contains("const R2X: u16 =") && b.contains("prof[slot] += lo - t_lo;"),
+                        "{n}"
+                    );
+                    assert!(
+                        b.contains("fn axis_xa()") && b.contains("3 * NCOL + 3"),
+                        "{n}"
+                    );
                     assert!(b.contains("rope_tab();   // (op3)"), "{n}");
-                    assert!(b.contains("const QSCL: f32") && !b.contains("const qkn_a"), "{n}");
+                    assert!(
+                        b.contains("const QSCL: f32") && !b.contains("const qkn_a"),
+                        "{n}"
+                    );
                 }
                 "grid_pe.csl" => {
                     assert!(!b.contains("fn arf_ar(") && !b.contains("fn wmvh("), "{n}");
                     assert!(b.contains("@as(@fp16(), @bitcast(f32, u))"), "{n}");
                 }
                 "head_pe.csl" => {
-                    assert!(a.contains("]bf16);") && !b.contains("]bf16);") && b.contains("@fp16()"), "{n}");
+                    assert!(
+                        a.contains("]bf16);") && !b.contains("]bf16);") && b.contains("@fp16()"),
+                        "{n}"
+                    );
                 }
                 _ => assert_eq!(a, b, "{n}"),
             }
@@ -3391,7 +3484,8 @@ mod llama31_8b {
     #[test]
     fn grid_levers_state_grd_and_patch_the_grids() {
         let (plan, mut cfg) = cfg_for(1, false);
-        (cfg.speed, cfg.lse, cfg.ops2, cfg.qkv1, cfg.arf, cfg.arfx) = (true, true, true, true, true, true);
+        (cfg.speed, cfg.lse, cfg.ops2, cfg.qkv1, cfg.arf, cfg.arfx) =
+            (true, true, true, true, true, true);
         (cfg.f16acc, cfg.f16accg, cfg.mem, cfg.op3) = (true, true, true, true);
         let (d, p0) = params(&plan, &cfg).unwrap();
         cfg.grid_levers = true;
@@ -3406,9 +3500,20 @@ mod llama31_8b {
         let b = d.files_with(lay.model.variant()).unwrap();
         for ((n, x), (_, y)) in a.iter().zip(&b) {
             if *n == "grid_pe.csl" {
-                assert!(!x.contains("fn arf_ar(") && y.contains("fn arf_ar(") && y.contains("fn axis_xa()"), "{n}");
-                assert!(y.contains("rope_tab();   // (op3)") && y.contains("fn rope_vec()"), "{n}");
-                assert!(y.contains("const QSCL: f32") && !y.contains("const qkn_a"), "{n}");
+                assert!(
+                    !x.contains("fn arf_ar(")
+                        && y.contains("fn arf_ar(")
+                        && y.contains("fn axis_xa()"),
+                    "{n}"
+                );
+                assert!(
+                    y.contains("rope_tab();   // (op3)") && y.contains("fn rope_vec()"),
+                    "{n}"
+                );
+                assert!(
+                    y.contains("const QSCL: f32") && !y.contains("const qkn_a"),
+                    "{n}"
+                );
             } else {
                 assert_eq!(x, y, "{n}");
             }
@@ -3417,7 +3522,10 @@ mod llama31_8b {
         cfg.arfx = false;
         cfg.mem = false;
         let (_, p) = params(&plan, &cfg).unwrap();
-        assert_eq!(p.iter().find(|e| e.0 == "GRD").map(|e| e.1.as_str()), Some("2"));
+        assert_eq!(
+            p.iter().find(|e| e.0 == "GRD").map(|e| e.1.as_str()),
+            Some("2")
+        );
         cfg.op3 = false;
         assert!(params(&plan, &cfg).is_err(), "grid_levers with no lever");
     }
