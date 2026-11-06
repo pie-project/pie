@@ -47,6 +47,8 @@ pub struct ProcessCtx {
     prewarm_permit: Option<OrderedPermit>,
     props: client_api::Props,
     files: Arc<client_api::Files>,
+    /// What this launch was lent, and what it has given back.
+    handles: Option<crate::handle::Bag>,
     bind_admitted: bool,
     execution_seated: bool,
     execution_admitted: bool,
@@ -77,6 +79,7 @@ impl Drop for ProcessCtx {
             terminate_fences,
             bind_permit,
             std::mem::take(&mut self.scratch_dir),
+            self.handles.take(),
         );
     }
 }
@@ -220,6 +223,7 @@ impl ProcessCtx {
             prewarm_permit: None,
             props: client_api::Props::new(),
             files: Arc::default(),
+            handles: None,
             bind_admitted: false,
             execution_seated: false,
             execution_admitted: false,
@@ -262,6 +266,14 @@ impl ProcessCtx {
 
     pub(crate) fn file(&self, name: &str) -> Option<Vec<u8>> {
         self.files.get(name).map(|bytes| bytes.to_vec())
+    }
+
+    pub(crate) fn set_handles(&mut self, handles: crate::handle::Bag) {
+        self.handles = Some(handles);
+    }
+
+    pub(crate) fn handles(&mut self) -> Option<&mut crate::handle::Bag> {
+        self.handles.as_mut()
     }
 
     pub(crate) fn set_files(&mut self, files: Arc<client_api::Files>) {

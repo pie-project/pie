@@ -172,6 +172,33 @@ impl pie::inferlet::session::Host for ProcessCtx {
         Ok(ProcessCtx::file(self, &name))
     }
 
+    async fn take_working_set(
+        &mut self,
+        name: String,
+    ) -> Result<Option<Resource<crate::inferlet::host::working_set::WorkingSet>>> {
+        Ok(self
+            .handles()
+            .and_then(|handles| handles.take(&name))
+            .map(Resource::new_own))
+    }
+
+    async fn give_working_set(
+        &mut self,
+        name: String,
+        ws: Resource<crate::inferlet::host::working_set::WorkingSet>,
+    ) -> Result<Result<(), String>> {
+        match self.handles() {
+            Some(handles) if handles.expects(&name) => {
+                handles.give(name, ws.rep());
+                Ok(Ok(()))
+            }
+            _ => {
+                pie::inferlet::working_set::HostWorkingSet::drop(self, ws).await?;
+                Ok(Err(format!("this launch expects no working set `{name}`")))
+            }
+        }
+    }
+
     async fn receive_blocking(&mut self) -> Result<Option<String>> {
         let process_id = self.id();
         let message = idle_while(

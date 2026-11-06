@@ -173,7 +173,7 @@ impl Inner {
     }
 
     pub(super) fn reschedule(&mut self, order_of: impl Fn(&ProcessId) -> (i64, bool)) {
-        for (pid, proc) in &mut self.procs {
+        for (pid, proc) in self.procs.iter_mut().filter(|(_, proc)| !proc.holder) {
             (proc.key, proc.held) = order_of(pid);
         }
         let held_restores: Vec<EntryKey> = self

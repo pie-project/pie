@@ -224,6 +224,17 @@ impl KvWorkingSet {
         self.lifecycle.release();
     }
 
+    /// This set leaves its owner alive: the owner's hold on the planner, and
+    /// the seats that fed its fires, go back. A seat keeps nothing between
+    /// fires, so the next fire takes any free one; none may be in flight.
+    pub fn leave_owner(&self) {
+        debug_assert_eq!(self.lifecycle.active_fire_leases.load(Ordering::Acquire), 0);
+        drop(self.lifecycle.departure.lock().unwrap().take());
+        let stores = crate::store::registry::get(self.model, self.engine);
+        stores.seats.lock().unwrap().release(self.id);
+        stores.seats_freed.notify_waiters();
+    }
+
     /// Holds `departure` until this set is released: its owner's pages are
     /// not back before then. A set released already holds nothing.
     pub fn hold_departure(&self, departure: Arc<crate::planner::Departure>) {

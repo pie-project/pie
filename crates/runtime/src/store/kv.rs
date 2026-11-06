@@ -1026,6 +1026,16 @@ impl KvStore {
         Arc::clone(&self.moved)
     }
 
+    pub fn is_suspended(&self, ws: WorkingSetId) -> Result<bool, KvStoreError> {
+        Ok(self.table.is_suspended(ws)?)
+    }
+
+    /// Whether a move holds any page `working_sets` map: what they name is
+    /// not where the flat map says until it ends.
+    pub fn in_move(&self, working_sets: &HashSet<WorkingSetId>) -> Result<bool, KvStoreError> {
+        Ok(self.table.in_move(working_sets)?)
+    }
+
     pub fn fork(&mut self, ws: WorkingSetId) -> Result<WorkingSetId, KvStoreError> {
         let child = self.table.fork(ws)?;
         self.refresh_flat(child);

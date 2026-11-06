@@ -22,6 +22,17 @@ fn remove_scratch(dir: Option<&std::path::Path>) {
     }
 }
 
+/// After the last fire, so what the guest gave is at rest when it moves.
+fn settle_handles(
+    handles: Option<crate::handle::Bag>,
+    context: &mut TeardownFireContext,
+    residency: &Mutex<crate::inferlet::process::ProcessResidency>,
+) {
+    if let Some(handles) = handles {
+        handles.settle(&mut context.resources, residency);
+    }
+}
+
 pub(crate) fn defer_resource_teardown(
     process_id: uuid::Uuid,
     resources: wasmtime::component::ResourceTable,
@@ -29,6 +40,7 @@ pub(crate) fn defer_resource_teardown(
     terminate_fences: Option<Vec<crate::scheduler::worker::TerminateFence>>,
     bind_permit: Option<super::ordered::OrderedPermit>,
     scratch_dir: Option<std::path::PathBuf>,
+    handles: Option<crate::handle::Bag>,
 ) {
     let capped_execution = terminate_fences.is_some();
     let snapshot = residency.lock().unwrap().teardown_snapshot();
@@ -45,6 +57,7 @@ pub(crate) fn defer_resource_teardown(
             .all(|fires| fires.lock().unwrap().is_empty())
     {
         crate::inferlet::process::release_bind_permit(context.bind_permit.take());
+        settle_handles(handles, &mut context, &residency);
         drop(context);
         remove_scratch(scratch_dir.as_deref());
         return;
@@ -56,6 +69,9 @@ pub(crate) fn defer_resource_teardown(
              ResourceTable to avoid recycling pages under native work"
         );
         crate::inferlet::process::release_bind_permit(context.bind_permit.take());
+        if let Some(handles) = handles {
+            handles.abandon();
+        }
         std::mem::forget(context);
         remove_scratch(scratch_dir.as_deref());
         return;
@@ -75,6 +91,7 @@ pub(crate) fn defer_resource_teardown(
         let channel_close_batches =
             crate::pipeline::channel::detach_channel_close_notifications(&mut context.resources);
         crate::inferlet::process::release_bind_permit(context.bind_permit.take());
+        settle_handles(handles, &mut context, &residency);
         drop(context);
         remove_scratch(scratch_dir.as_deref());
         for (engine_id, ids) in channel_close_batches {

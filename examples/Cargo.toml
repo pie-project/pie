@@ -17,6 +17,7 @@ members = [
     "mirostat-v2-sampling",
     "mtp-speculative-decoding",
     "naive-baseline",
+    "working-set-handles",
     "naive-masked",
     "prefix-tree-kv-cache",
     "repetition-penalty",

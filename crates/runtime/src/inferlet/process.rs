@@ -410,7 +410,7 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
     clippy::too_many_arguments,
     reason = "one spawn request, as its callers have it"
 )]
-pub fn spawn(
+pub(crate) fn spawn(
     username: String,
     program_name: ProgramName,
     input: String,
@@ -418,6 +418,7 @@ pub fn spawn(
     client_id: Option<ClientId>,
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
+    lease: Option<crate::handle::Lease>,
     arrival: Arrival,
     executors: Vec<String>,
 ) -> Result<ProcessId> {
@@ -431,6 +432,7 @@ pub fn spawn(
         Arc::new(Mutex::new(result_tx)),
         None,
         None,
+        lease,
         arrival,
         executors,
     )
@@ -450,6 +452,7 @@ fn spawn_inner(
     result_tx: SharedResultTx,
     inherit_seq: Option<u64>,
     inherit_client_pid: Option<ProcessId>,
+    lease: Option<crate::handle::Lease>,
     arrival: Arrival,
     executors: Vec<String>,
 ) -> Result<ProcessId> {
@@ -459,6 +462,10 @@ fn spawn_inner(
     crate::offload::executors::set(id, executors.clone());
     crate::policy::schedule::alias(id, inherit_client_pid.unwrap_or(id));
     crate::planner::assign(id, inherit_client_pid);
+    // Its handles' pages are where they are: it goes to them.
+    if let Some(engine) = lease.as_ref().and_then(crate::handle::Lease::engine) {
+        crate::planner::place(id, engine);
+    }
     let departure = crate::planner::planner_of(id).and_then(|planner| {
         match inherit_seq {
             Some(seq) => planner.register_with_seq(id, seq),
@@ -476,6 +483,7 @@ fn spawn_inner(
         client_id,
         capture_outputs,
         result_tx,
+        lease,
         arrival,
         executors,
         departure,
@@ -669,6 +677,7 @@ impl Process {
         client_id: Option<ClientId>,
         capture_outputs: bool,
         result_tx: SharedResultTx,
+        lease: Option<crate::handle::Lease>,
         arrival: Arrival,
         executors: Vec<String>,
         departure: Option<Arc<crate::planner::Departure>>,
@@ -681,6 +690,7 @@ impl Process {
             files.clone(),
             capture_outputs,
             result_tx.clone(),
+            lease,
             arrival.clone(),
         );
         let handle = crate::rt::spawn(task);
@@ -744,6 +754,7 @@ impl Process {
         files: Arc<client_api::Files>,
         capture_outputs: bool,
         result_tx: SharedResultTx,
+        lease: Option<crate::handle::Lease>,
         arrival: Arrival,
     ) {
         // A process arrives, as a policy sees it, before it waits: every gate
@@ -777,6 +788,11 @@ impl Process {
             store.data_mut().install_prewarm_permit(prewarm_permit);
             store.data_mut().set_props(props);
             store.data_mut().set_files(files);
+            if let Some(lease) = lease {
+                lease.ready(process_id).await?;
+                let bag = lease.bind(store.data_mut()).map_err(|e| e.to_string())?;
+                store.data_mut().set_handles(bag);
+            }
 
             let run_interface = RUN_INTERFACE;
 
@@ -865,6 +881,7 @@ impl Process {
             self.result_tx.clone(),
             seq,
             Some(self.client_pid),
+            None,
             self.arrival.clone(),
             self.executors.clone(),
         );

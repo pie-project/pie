@@ -26,6 +26,8 @@ pub(super) struct Proc {
     pub(super) respawn: bool,
     pub(super) signal: Arc<Notify>,
     pub(super) resident: Arc<AtomicBool>,
+    /// A handle's stand-in: never ran, so its leaving is no completion.
+    pub(super) holder: bool,
     /// Waiting on its client: a victim for anyone, however old it is.
     pub(super) idle: bool,
     /// What an idle eviction freed; it asks for it back only once it wakes.
@@ -62,6 +64,7 @@ impl Proc {
             respawn: false,
             signal: Arc::new(Notify::new()),
             resident: Arc::new(AtomicBool::new(true)),
+            holder: false,
             idle: false,
             parked: None,
             seatless: false,

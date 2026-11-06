@@ -437,6 +437,8 @@ mod tests {
             props: Props::new(),
             session: Some("conv-1".into()),
             files: Default::default(),
+            handles: Default::default(),
+            returns: Default::default(),
             cluster_props: Props::new(),
             executors: Vec::new(),
         };

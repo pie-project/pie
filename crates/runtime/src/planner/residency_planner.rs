@@ -220,6 +220,45 @@ impl ResidencyPlanner {
         });
     }
 
+    /// Registers what holds a handle's working set between processes: idle
+    /// from the start, so the first to want its pages takes them. It ranks
+    /// past every process, the longest parked last of all: a turn resumes
+    /// what it just left, so the handle left longest goes first, where the
+    /// youngest process would. `parked` is what it owes the device, for a set
+    /// that comes already evicted.
+    pub fn register_holder(self: &Arc<Self>, pid: ProcessId, parked: Option<Demand>) {
+        self.with_inner(|inner| {
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            let mut proc = Proc::new(u64::MAX - seq);
+            proc.key = i64::MIN;
+            proc.holder = true;
+            proc.admitted = true;
+            proc.idle = true;
+            if let Some(demand) = parked {
+                proc.state = Residency::Evicted;
+                proc.resident.store(false, Ordering::Release);
+                proc.parked = Some(demand);
+            }
+            inner.procs.insert(pid, proc);
+        });
+        self.re_arm_idle_reclaim();
+        self.poke();
+    }
+
+    /// `process` wants this holder's set: its restore is `process`'s to wait
+    /// for, in `process`'s place in line.
+    pub fn recall_holder(self: &Arc<Self>, pid: ProcessId, process: ProcessId) {
+        self.with_inner(|inner| {
+            let rank = inner.procs.get(&process).map(|p| (p.key, p.seq));
+            if let (Some((key, seq)), Some(proc)) = (rank, inner.procs.get_mut(&pid)) {
+                proc.key = key;
+                proc.seq = seq;
+            }
+        });
+        self.set_idle(pid, false);
+    }
+
     pub fn register_with_seq(&self, pid: ProcessId, seq: u64) {
         self.with_inner(|inner| {
             let mut proc = Proc::new(seq);
@@ -582,10 +621,9 @@ impl ResidencyPlanner {
                 }
                 inner.to_end.waiting.retain(|(_, waiting)| *waiting != pid);
             }
-            if departed
-                .as_ref()
-                .is_some_and(|proc| proc.admitted && proc.state == Residency::Resident)
-            {
+            if departed.as_ref().is_some_and(|proc| {
+                proc.admitted && !proc.holder && proc.state == Residency::Resident
+            }) {
                 inner.completion_credit = inner.completion_credit.saturating_add(1);
             }
             inner.settle_eviction(pid);

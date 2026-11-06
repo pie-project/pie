@@ -485,6 +485,8 @@ impl Session {
         mut props: client_api::Props,
         session: Option<String>,
         files: client_api::Files,
+        handles: client_api::Handles,
+        returns: client_api::Handles,
         cluster_props: client_api::Props,
         executors: Vec<String>,
     ) {
@@ -548,6 +550,14 @@ impl Session {
             return;
         }
 
+        let lease = match self.handles.lend(self.id, handles, returns) {
+            Ok(lease) => lease,
+            Err(why) => {
+                self.send_response(corr_id, false, format!("launch refused: {why}"))
+                    .await;
+                return;
+            }
+        };
         let client_id = if capture_outputs { Some(self.id) } else { None };
         match process::spawn(
             self.username.clone(),
@@ -557,6 +567,7 @@ impl Session {
             client_id,
             capture_outputs,
             None,
+            lease,
             crate::policy::Arrival {
                 tenant: self.tenant.clone(),
                 session,

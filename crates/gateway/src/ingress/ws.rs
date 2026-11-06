@@ -175,6 +175,16 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
         async move { (corr, handle.turn(req).await) }
     };
     let mut admitting = futures::stream::FuturesUnordered::new();
+    // Handle frames keep the order they were sent in, a waiting launch among
+    // them: a fork sent after a launch forks what that launch wrote.
+    let (handle_tx, handle_rx) = tokio::sync::mpsc::unbounded_channel::<TurnInput>();
+    let mut in_order = std::pin::pin!(
+        futures::stream::unfold(handle_rx, |mut rx| async move {
+            let req = rx.recv().await?;
+            Some((req, rx))
+        })
+        .then(admit)
+    );
 
     loop {
         tokio::select! {
@@ -182,6 +192,14 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                 Ok(new_rx) => live.push(corr, new_rx),
                 Err(e) => {
                     if !answer(&mut tx, corr, &SessionError::to_string(&e)).await {
+                        break;
+                    }
+                }
+            },
+            Some((corr, turn)) = in_order.next() => match turn {
+                Ok(new_rx) => live.push(corr, new_rx),
+                Err(e) => {
+                    if !answer(&mut tx, corr, &e.to_string()).await {
                         break;
                     }
                 }
@@ -218,6 +236,9 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
 
             incoming = rx_ws.next() => match incoming {
                 Some(Ok(frame @ (Message::Text(_) | Message::Binary(_)))) => match read(&frame) {
+                    Ok(Incoming::Turn(req)) if req.message.uses_handles() => {
+                        let _ = handle_tx.send(*req);
+                    }
                     Ok(Incoming::Turn(req)) if is_launch(&req) => admitting.push(admit(*req)),
                     Ok(Incoming::Turn(req)) => {
                         let req = *req;
@@ -246,6 +267,7 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
     }
 
     drop(admitting);
+    drop(in_order);
     handle.close().await;
 }
 

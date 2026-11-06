@@ -146,6 +146,31 @@ class Process:
         await self.client.terminate_process(self.process_id)
 
 
+class HandleError(Exception):
+    """A handle op was refused: unknown, dead, or in use."""
+
+
+class WorkingSet:
+    """A working set this session owns. Lazy: nothing exists on the server
+    until a process binds it, so making one costs a name."""
+
+    def __init__(self, client: "PieClient", name: int):
+        self.client = client
+        self.name = name
+
+    async def fork(self) -> "WorkingSet":
+        """An independent copy of this set as it stands."""
+        child = self.client._next_handle()
+        await self.client._handle_op({"op": "fork", "name": child, "from": self.name})
+        return WorkingSet(self.client, child)
+
+    async def stat(self) -> dict:
+        return await self.client._handle_op({"op": "stat", "name": self.name})
+
+    async def close(self) -> None:
+        await self.client._handle_op({"op": "close", "name": self.name})
+
+
 class PieClient:
     """
     An asynchronous client for interacting with the Pie WebSocket server.
@@ -163,6 +188,7 @@ class PieClient:
             or the upgrade is rejected before the socket opens.
         """
         self.server_uri = server_uri
+        self._last_handle = 0
         self.identity = identity
         self.ws = None
         self.listener_task = None
@@ -492,12 +518,33 @@ class PieClient:
     # Process Lifecycle
     # =========================================================================
 
+    def _next_handle(self) -> int:
+        self._last_handle += 1
+        return self._last_handle
+
+    async def _handle_op(self, op: dict) -> dict:
+        ok, result = await self._send_msg_and_wait({"type": "handles", "ops": [op]})
+        if not ok:
+            raise HandleError(result)
+        answer = json.loads(result)[0]
+        if "error" in answer:
+            raise HandleError(answer["error"])
+        return answer
+
+    async def working_set(self) -> WorkingSet:
+        """A new, empty working set."""
+        name = self._next_handle()
+        await self._handle_op({"op": "new", "name": name, "kind": "working_set"})
+        return WorkingSet(self, name)
+
     async def launch_process(
         self,
         inferlet: str,
         input: dict | list | None = None,
         capture_outputs: bool = True,
         files: dict[str, bytes] | None = None,
+        handles: "dict[str, WorkingSet] | None" = None,
+        returns: "dict[str, WorkingSet] | None" = None,
     ) -> Process:
         """Launch a process. Returns a Process object for interaction.
 
@@ -505,6 +552,11 @@ class PieClient:
         :param input: A dict of input parameters, serialized to JSON.
         :param capture_outputs: If True, process outputs are streamed to the client.
         :param files: Files the inferlet reads with `session.file(name)`.
+        :param handles: Handles moved into the process, by the name its guest
+            takes each under. A moved handle cannot be used until it comes
+            back: fork first to keep one.
+        :param returns: What the process gives back, by the name it gives each
+            under.
         :return: A Process object for the launched inferlet.
         """
         msg = {
@@ -513,6 +565,8 @@ class PieClient:
             "input": json.dumps(input if input is not None else {}),
             "capture_outputs": capture_outputs,
             "files": files or {},
+            "handles": {name: h.name for name, h in (handles or {}).items()},
+            "returns": {name: h.name for name, h in (returns or {}).items()},
         }
         ok, result = await self._send_msg_and_wait(msg)
 

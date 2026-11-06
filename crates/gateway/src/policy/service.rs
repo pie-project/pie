@@ -644,6 +644,8 @@ mod tests {
                 props: serde_json::from_value(props).unwrap(),
                 session: None,
                 files: Default::default(),
+                handles: Default::default(),
+                returns: Default::default(),
                 cluster_props: Props::new(),
                 executors: Vec::new(),
             },

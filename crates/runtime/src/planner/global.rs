@@ -122,6 +122,11 @@ fn fewest(engines: &[usize], running: impl Iterator<Item = usize> + Clone) -> us
         .unwrap_or(0)
 }
 
+/// Puts `pid` on `engine`, where its working sets already are.
+pub fn place(pid: ProcessId, engine: usize) {
+    engines().write().unwrap().insert(pid, engine);
+}
+
 /// The engine `pid` runs on.
 pub fn engine_of(pid: ProcessId) -> usize {
     ENGINE_OF

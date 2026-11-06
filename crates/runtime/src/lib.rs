@@ -7,6 +7,7 @@ extern crate wasmtime_web as wasmtime_wasi;
 pub mod bootstrap;
 pub mod catalog;
 pub mod engine;
+pub(crate) mod handle;
 pub mod inferlet;
 pub mod model;
 pub mod offload;

@@ -243,6 +243,8 @@ impl Launch {
                 props: self.props.clone(),
                 session: self.session.clone(),
                 files: Default::default(),
+                handles: Default::default(),
+                returns: Default::default(),
                 cluster_props: Props::new(),
                 executors: Vec::new(),
             },

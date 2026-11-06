@@ -443,6 +443,8 @@ impl Client {
             props,
             session,
             files,
+            handles: Default::default(),
+            returns: Default::default(),
             cluster_props: Props::new(),
             executors: Vec::new(),
         };

@@ -158,6 +158,7 @@ impl RoutingHandle {
         req: &Request,
         affinity: Option<AffinityKey>,
         preferred: Option<WorkerId>,
+        pinned: Option<WorkerId>,
     ) -> Result<Dispatched, RouteError> {
         let candidates = {
             let table = self.routing.borrow();
@@ -167,6 +168,9 @@ impl RoutingHandle {
             if let Some(at) = preferred.and_then(|p| candidates.iter().position(|&w| w == p)) {
                 let worker = candidates.remove(at);
                 candidates.insert(0, worker);
+            }
+            if let Some(pinned) = pinned {
+                candidates.retain(|&worker| worker == pinned);
             }
             candidates
         };
@@ -443,6 +447,8 @@ mod tests {
                 props: Default::default(),
                 session: None,
                 files: Default::default(),
+                handles: Default::default(),
+                returns: Default::default(),
                 cluster_props: Default::default(),
                 executors: Vec::new(),
             };
@@ -467,6 +473,8 @@ mod tests {
             props: Default::default(),
             session: None,
             files: Default::default(),
+            handles: Default::default(),
+            returns: Default::default(),
             cluster_props: Default::default(),
             executors: Vec::new(),
         };
@@ -512,7 +520,7 @@ mod tests {
             request.message = ClientMessage::ListProcesses { corr_id: 1 };
             assert_eq!(h.admit(&request), AdmissionDecision::Admit);
             assert_eq!(
-                h.dispatch_with_retry(&reg, &request, None, None)
+                h.dispatch_with_retry(&reg, &request, None, None, None)
                     .await
                     .unwrap_err(),
                 RouteError::NoCandidate
@@ -536,7 +544,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let d = h
-            .dispatch_with_retry(&reg, &req(), Some(42), None)
+            .dispatch_with_retry(&reg, &req(), Some(42), None, None)
             .await
             .unwrap();
         assert_eq!(d.worker_id, WorkerId(1));
@@ -569,7 +577,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let d = h
-            .dispatch_with_retry(&reg, &req(), Some(99), None)
+            .dispatch_with_retry(&reg, &req(), Some(99), None, None)
             .await
             .unwrap();
         assert_eq!(d.worker_id, accepting);
@@ -600,14 +608,14 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let d = h
-            .dispatch_with_retry(&accept_all(), &req(), Some(99), Some(preferred))
+            .dispatch_with_retry(&accept_all(), &req(), Some(99), Some(preferred), None)
             .await
             .unwrap();
         assert_eq!(d.worker_id, preferred);
 
         // One that is not connected is no candidate: the default order holds.
         let d = h
-            .dispatch_with_retry(&accept_all(), &req(), Some(99), Some(WorkerId(9)))
+            .dispatch_with_retry(&accept_all(), &req(), Some(99), Some(WorkerId(9)), None)
             .await
             .unwrap();
         assert_eq!(d.worker_id, order[0]);
@@ -622,7 +630,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let err = h
-            .dispatch_with_retry(&reg, &req(), None, None)
+            .dispatch_with_retry(&reg, &req(), None, None, None)
             .await
             .unwrap_err();
         assert_eq!(err, RouteError::NoCandidate);
@@ -645,7 +653,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let err = h
-            .dispatch_with_retry(&reg, &req(), Some(5), None)
+            .dispatch_with_retry(&reg, &req(), Some(5), None, None)
             .await
             .unwrap_err();
         assert_eq!(err, RouteError::Exhausted { attempts: 2 });

@@ -723,6 +723,7 @@ fn corr_id_of(m: &ClientMessage) -> Option<u32> {
         | Query { corr_id, .. }
         | AddProgram { corr_id, .. }
         | LaunchProcess { corr_id, .. }
+        | Handles { corr_id, .. }
         | AttachProcess { corr_id, .. }
         | TerminateProcess { corr_id, .. }
         | ListProcesses { corr_id }

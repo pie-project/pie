@@ -5,6 +5,55 @@ use crate::Props;
 /// Files a launch attaches, by name; the guest reads them with `session.file`.
 pub type Files = std::collections::BTreeMap<String, serde_bytes::ByteBuf>;
 
+/// A session's own name for a handle: the client picks it, as 9P picks a fid,
+/// so a name can be used before the server has answered for it.
+pub type HandleName = u64;
+
+/// Handles a launch deals in, by the name the guest knows each under.
+pub type Handles = std::collections::BTreeMap<String, HandleName>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandleKind {
+    WorkingSet,
+}
+
+/// What a client can do to a handle without running anything: its lifetime,
+/// never its contents. Computing on one is a process's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum HandleOp {
+    /// Names an empty handle. Nothing exists until a process binds it.
+    New {
+        name: HandleName,
+        kind: HandleKind,
+    },
+    /// `name` starts as `from` stands. Neither sees the other's writes.
+    Fork {
+        name: HandleName,
+        from: HandleName,
+    },
+    Close {
+        name: HandleName,
+    },
+    Stat {
+        name: HandleName,
+    },
+}
+
+impl HandleOp {
+    /// The names this op needs settled before it runs.
+    pub fn touches(&self) -> impl Iterator<Item = HandleName> {
+        let (first, second) = match *self {
+            HandleOp::New { name, .. } | HandleOp::Close { name } | HandleOp::Stat { name } => {
+                (name, None)
+            }
+            HandleOp::Fork { name, from } => (name, Some(from)),
+        };
+        std::iter::once(first).chain(second)
+    }
+}
+
 pub const CHUNK_SIZE_BYTES: usize = 256 * 1024;
 pub const QUERY_MODEL_STATUS: &str = "model_status";
 
@@ -58,6 +107,12 @@ pub enum ClientMessage {
         session: Option<String>,
         #[serde(default)]
         files: Files,
+        /// Handles moved into the process, by the name it takes each under.
+        #[serde(default)]
+        handles: Handles,
+        /// What the process gives back: the name each lands on in the session.
+        #[serde(default)]
+        returns: Handles,
         /// Set by the worker, never on the wire.
         #[serde(skip)]
         cluster_props: Props,
@@ -66,6 +121,11 @@ pub enum ClientMessage {
         #[serde(skip)]
         executors: Vec<String>,
     },
+
+    /// Run in order; each op answers in the response's JSON array, and one
+    /// that fails does not stop the rest.
+    #[serde(rename = "handles")]
+    Handles { corr_id: u32, ops: Vec<HandleOp> },
 
     #[serde(rename = "attach_process")]
     AttachProcess { corr_id: u32, process_id: String },
@@ -94,6 +154,19 @@ pub enum ClientMessage {
 }
 
 impl ClientMessage {
+    /// Whether this frame deals in handles: such frames stay in order with
+    /// each other, on the worker that holds the session's handles.
+    #[must_use]
+    pub fn uses_handles(&self) -> bool {
+        match self {
+            ClientMessage::Handles { .. } => true,
+            ClientMessage::LaunchProcess {
+                handles, returns, ..
+            } => !handles.is_empty() || !returns.is_empty(),
+            _ => false,
+        }
+    }
+
     pub fn corr_id(&self) -> Option<u32> {
         match self {
             ClientMessage::AuthIdentify { corr_id, .. }
@@ -102,6 +175,7 @@ impl ClientMessage {
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::AddProgram { corr_id, .. }
             | ClientMessage::LaunchProcess { corr_id, .. }
+            | ClientMessage::Handles { corr_id, .. }
             | ClientMessage::AttachProcess { corr_id, .. }
             | ClientMessage::TerminateProcess { corr_id, .. }
             | ClientMessage::ListProcesses { corr_id }
@@ -119,6 +193,7 @@ impl ClientMessage {
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::AddProgram { corr_id, .. }
             | ClientMessage::LaunchProcess { corr_id, .. }
+            | ClientMessage::Handles { corr_id, .. }
             | ClientMessage::AttachProcess { corr_id, .. }
             | ClientMessage::TerminateProcess { corr_id, .. }
             | ClientMessage::ListProcesses { corr_id }
