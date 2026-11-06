@@ -206,6 +206,8 @@ class Media(Handle):
                 data = bytes(value)
             elif event == Event.Return:
                 return data if data is not None else b""
+            elif event == Event.Error:
+                raise HandleError(value)
 
     async def save(self, path: "str | Path", format: str | None = None) -> None:
         """Writes this handle to `path`, encoded as its suffix says."""

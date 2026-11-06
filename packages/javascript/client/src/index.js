@@ -326,6 +326,7 @@ export class Media extends Handle {
             const [event, value] = await reader.recv();
             if (event === "file") data = value;
             if (event === "return") return data;
+            if (event === "error") throw new HandleError(value);
         }
     }
 }

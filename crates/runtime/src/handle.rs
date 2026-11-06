@@ -287,6 +287,9 @@ impl Slot {
     }
 }
 
+/// Encoding is slow and the session has other frames to serve.
+pub(crate) type Encode = Box<dyn FnOnce() -> Result<Vec<u8>, String> + Send>;
+
 /// A session's handles. An actor owns it, so names resolve in the order the
 /// client sent them.
 #[derive(Debug)]
@@ -388,8 +391,10 @@ impl Table {
         Ok(())
     }
 
-    /// Encodes a handle for a client to download.
-    pub(crate) fn read(&self, name: HandleName, format: &str) -> Result<(Vec<u8>, String), String> {
+    /// What encodes a handle for a client, and the name of the file. It owns
+    /// what it reads, which is never written, so it runs on while the table
+    /// moves on.
+    pub(crate) fn read(&self, name: HandleName, format: &str) -> Result<(Encode, String), String> {
         use crate::inferlet::host::frames::{
             audio_extension, audio_format, image_extension, image_format,
         };
@@ -397,16 +402,18 @@ impl Table {
             Some(Slot::Frames(frames)) => {
                 let format =
                     image_format(format).ok_or_else(|| format!("no image format `{format}`"))?;
+                let frames = frames.clone();
                 Ok((
-                    frames.encode(format)?,
+                    Box::new(move || frames.encode(format)),
                     format!("{name}.{}", image_extension(format)),
                 ))
             }
             Some(Slot::Pcm(pcm)) => {
                 let format =
                     audio_format(format).ok_or_else(|| format!("no audio format `{format}`"))?;
+                let pcm = pcm.clone();
                 Ok((
-                    pcm.encode(format),
+                    Box::new(move || Ok(pcm.encode(format))),
                     format!("{name}.{}", audio_extension(format)),
                 ))
             }

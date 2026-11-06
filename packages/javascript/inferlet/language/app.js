@@ -101,6 +101,12 @@ function hydrate(value) {
   if (value.kind === 'matcher' && '$handle' in value) {
     return inferlet.grammar.Matcher.take(value.$handle);
   }
+  if (value.kind === 'frames' && '$handle' in value) {
+    return inferlet.frames.Frames.take(value.$handle);
+  }
+  if (value.kind === 'pcm' && '$handle' in value) {
+    return inferlet.frames.Pcm.take(value.$handle);
+  }
   const keys = Object.keys(value);
   if (keys.length === 1 && keys[0] === '$handle') {
     return inferlet.eta.WorkingSet.fromInput(value);

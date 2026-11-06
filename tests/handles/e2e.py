@@ -224,11 +224,32 @@ async def t_media(c, prog, whole):
     try:
         await out.read("tiff"); check("a format that is none is refused", False)
     except HandleError as e: check("a format that is none is refused", "tiff" in str(e), str(e))
+    # Whichever way the encoder goes, a reader hears how it ended.
+    try:
+        video = await asyncio.wait_for(out.read("mp4"), 20)
+        check("a reader hears how an encoder ended", len(video) > 0, f"{len(video)} bytes")
+    except HandleError as e:
+        check("a reader hears how an encoder ended", True, str(e)[:80])
+    many = await asyncio.gather(*(out.read("png") for _ in range(4)))
+    check("reads run side by side", all(b == png for b in many))
+    r2 = await (await c.run(see, image=out)).result()
+    check("the handle was free the whole time", r2 == r)
     bad = await c.frames(b"not a picture")
     try:
         await (await c.run(see, image=bad)).result(); check("bytes that decode to nothing fail their launch", False)
     except Exception as e: check("bytes that decode to nothing fail their launch", True, str(e)[:80])
     for h in (out, sound, twin, up): await h.close()
+
+async def t_media_js(c, prog, whole):
+    S = Path(__file__).parent
+    mk = await c.install_program(S / "mk.js", force_overwrite=True)
+    see = await c.install_program(S / "see.js", force_overwrite=True)
+    out, sound = await c.frames(), c.pcm()
+    await (await c.run(mk, out=out, sound=sound, w=64, h=48)).result()
+    check("a JS guest gives pictures and sound", (await out.stat())["width"] == 64 and (await sound.stat())["samples"] == 400)
+    r = await (await c.run(see, image=out)).result()
+    check("and takes them by typed input", r["width"] == 64 and r["tokens"] > 0, str(r))
+    await out.close(); await sound.close()
 
 async def t_close(c, prog, whole, port=None):
     d = PieClient(c.server_uri if hasattr(c, "server_uri") else URI[0]); await d.connect()
@@ -284,7 +305,7 @@ async def main():
             except Exception: c = None; await asyncio.sleep(1)
         prog = await c.install_program(EX / "working_set_handles.wasm", force_overwrite=True)
         whole = await t_resume(c, prog)
-        for f in (t_lazy, t_order, t_dead, t_many, t_evict, t_quota, t_script, t_matcher, t_media, t_close, t_cost):
+        for f in (t_lazy, t_order, t_dead, t_many, t_evict, t_quota, t_script, t_matcher, t_media, t_media_js, t_close, t_cost):
             if args.only and f.__name__ not in args.only.split(","): continue
             try: await asyncio.wait_for(f(c, prog, whole), 120)
             except Exception as e:

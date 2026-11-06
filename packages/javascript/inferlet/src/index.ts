@@ -26,3 +26,4 @@ export * as grammar from './grammar.js';
 export * as mask from './mask.js';
 export * as tools from './tools.js';
 export * as media from './media.js';
+export * as frames from './frames.js';

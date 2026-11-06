@@ -787,7 +787,7 @@ impl Session {
         let read = uuid::Uuid::parse_str(reader)
             .map_err(|_| "a reader is a UUID".to_string())
             .and_then(|id| Ok((id, self.handles.read(name, format)?)));
-        let (id, (data, file)) = match read {
+        let (id, (encode, file)) = match read {
             Ok(read) => read,
             Err(why) => {
                 self.send_response(corr_id, false, why).await;
@@ -795,13 +795,18 @@ impl Session {
             }
         };
         self.send_response(corr_id, true, id.to_string()).await;
-        self.send_file_download(id, data.into(), Some(file)).await;
-        self.send(ServerMessage::ProcessEvent {
-            process_id: id.to_string(),
-            event: "return".to_string(),
-            value: String::new(),
-        })
-        .await;
+        let client_id = self.id;
+        crate::rt::spawn(async move {
+            let ended = match crate::rt::spawn_blocking(encode).await {
+                Ok(Ok(data)) => {
+                    let _ = super::send_file(client_id, id, data.into(), Some(file));
+                    process::ProcessEvent::Return(String::new())
+                }
+                Ok(Err(why)) => process::ProcessEvent::Error(why),
+                Err(error) => process::ProcessEvent::Error(error.to_string()),
+            };
+            let _ = super::send_event(client_id, id, &ended);
+        });
     }
 
     pub(super) async fn send_file_download(
