@@ -4,7 +4,10 @@
 //!
 //! - `build_program tiny-pipe`: the tiny serve2d_pipe preset (plan + config);
 //! - `build_program params <design> <K:V,...> [system]`: explicit parameters,
-//!   for checking a design against a build compiled elsewhere.
+//!   for checking a design against a build compiled elsewhere;
+//! - `build_program sources <design> <K:V,...> <dir>`: only the build
+//!   directory's sources for those parameters (their model variant) written
+//!   to `<dir>`, for compiling a shape the registry does not hold by hand.
 
 use engine_cerebras::sdk::Target;
 use engine_cerebras::spatial::build;
@@ -18,6 +21,21 @@ fn main() -> Result<(), String> {
             let (plan, cfg) = build::presets::pipe_config();
             let (d, p) = build::params(&plan, &cfg)?;
             (d, p, false)
+        }
+        "sources" => {
+            let d = Design::parse(args.get(2).ok_or("a design")?).ok_or("unknown design")?;
+            let p = engine_cerebras::spatial::program::parse_params(
+                args.get(3).ok_or("K:V,... params")?,
+            );
+            let dir = std::path::PathBuf::from(args.get(4).ok_or("an output directory")?);
+            let program = ProgramSpec::from_params(d, &p)?;
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            for (name, text) in program.files()? {
+                std::fs::write(dir.join(name), text).map_err(|e| e.to_string())?;
+            }
+            let (w, h) = program.rectangle();
+            println!("{} {w} {h}", dir.display());
+            return Ok(());
         }
         "params" => {
             let d = Design::parse(args.get(2).ok_or("a design")?).ok_or("unknown design")?;

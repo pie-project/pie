@@ -145,10 +145,14 @@ kernels and sizes them.
    - quantized projections or KV.
 
    **Cheap variants are recorded as `Need`s, not refused:**
-   - `IdentityQkNorm`: no q/k norm (Llama). It needs a kernel flag that skips
-     the two scales. Not built.
-   - `RopeTable`: a stated frequency table. Placement only: write the table to
-     `rot_c`/`rot_s` and fold YaRN's mscale into the q/k norm weights.
+   - `IdentityQkNorm`: no q/k norm (Llama). serve8b_region's units are
+     generated without it (codegen's `Variant`, the program's `QKN` 0; the
+     host writes ones as the norm weights); the other designs refuse it.
+   - `RopeTable`: a stated frequency table. Placement only: serve8b and
+     serve8b_region write the table to `rot_c`/`rot_s` (`wafer::Rotary`);
+     YaRN's mscale is refused (not yet folded into the q/k norm weights).
+   - An RMSNorm eps other than 1e-6 (Llama's 1e-5) is the units' `EPS`
+     variant on serve8b_region.
    - `LmHeadPlacement`: an untied head on serve2d. head2d supports
      `UNTIED`, but serve2d's placement reads `embed_tokens` for the logits
      (serve8b's head2d_v10 places `lm_head`; it serves untied models only).
@@ -198,9 +202,10 @@ kernels and sizes them.
    A program without them (the strip programs, serve28*, no longer served)
    is refused.
 
-   They also refuse what the placement can't do yet: an untied head, an eps
-   other than the CSL's 1e-6, missing q/k norms, a stated RoPE table, or
-   another softmax scale. The engine runs `ModelSpec::check_program` on
+   They also refuse what the program or placement can't do: an untied head
+   off serve8b*, an eps or q/k norms other than the program's (`EPS`,
+   `QKN`), a stated RoPE table off serve8b/serve8b_region, or another
+   softmax scale. The engine runs `ModelSpec::check_program` on
    every program it loads.
 
 6. **`build::program(plan, ServeConfig)`.** The design for the plan's
@@ -220,7 +225,7 @@ kernels and sizes them.
 | Qwen3-8B | paged8b | 128 × 160, 26, 96, 4 | 4 / 4 / 1 | 47,952 | not as serve2d (Qh 2 and square grids; 5 × 7 = 35 grids fit, 36 needed); `build` places it as serve8b (strips) or serve8b_region (units), the hardware builds exactly |
 | Qwen3-14B | paged8b | 128 × 288, 18, 136, 5 | 4 / 4 / 1 | 47,664 | none: 40 grids, 20 fit |
 | Qwen3-32B | paged8b | 128 × 512, 10, 200, 8 | 4 / 8 / 1 | 48,272 | none: 64 grids, 10 fit |
-| Llama 3.1 8B | paged8b + IdentityQkNorm, RopeTable | 128 × 192, 22, 112, 4 | 4 / 4 / 1 | 47,216 | none: 32 grids, 30 fit |
+| Llama 3.1 8B | paged8b + IdentityQkNorm, RopeTable | 128 × 192, 22, 112, 4 | 4 / 4 / 1 | 47,216 | as grids none: 32 grids, 30 fit; serve8b_region with `rows` 152 (Hc 27, GY 8, NCOL 3, HH 864, Vr 150): 755 × 1112 |
 
 The tests (`cargo test -p engine-cerebras plan`) reproduce the builds
 validated on CS-3:

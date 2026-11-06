@@ -132,7 +132,7 @@ const S8BR_HW: &str = "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:240,RHc:
     CAP:64,iters:1,B:1,NP:3";
 
 /// The model a program's params describe, as checkpoint shapes.
-fn shapes(g: &ProgramSpec, untied: bool) -> Vec<(String, Vec<usize>)> {
+pub(super) fn shapes(g: &ProgramSpec, untied: bool) -> Vec<(String, Vec<usize>)> {
     let (hid, d, qh, vocab) = (g.hidden(), g.head_dim(), g.qh(), g.vocab());
     let nkv = g.px() / g.gs();
     let (qdim, inter) = (nkv * qh * d, g.px() * g.ic());
@@ -432,11 +432,16 @@ fn run_spec(sc: &Scenario, design: ProgramSpec) -> Phases {
     let paged = grid.paged();
     let logit_lanes = grid.logit_lanes();
     let mut phases: Phases = Vec::new();
-    let mut m =
-        match WaferModel::on_device(Box::new(rec.clone()), design, weights, Some(1.0e6), ring) {
-            Ok(m) => m,
-            Err(e) => panic!("{}: the load fails: {e}", sc.name),
-        };
+    let mut m = match WaferModel::on_device(
+        Box::new(rec.clone()),
+        design,
+        weights,
+        Some(super::wafer::Rotary::theta(1.0e6)),
+        ring,
+    ) {
+        Ok(m) => m,
+        Err(e) => panic!("{}: the load fails: {e}", sc.name),
+    };
     phases.push(("load", rec.take()));
     let mut note = |phases: &mut Phases, phase: &'static str, ok: bool| {
         let mut calls = rec.take();
@@ -983,7 +988,7 @@ fn vm_launch_control(name: &str) -> (Vec<u32>, Vec<bool>, Vec<bool>) {
         Box::new(rec.clone()),
         design,
         Weights::Place(&ckpt),
-        Some(1.0e6),
+        Some(super::wafer::Rotary::theta(1.0e6)),
         ring,
     )
     .expect("the load");
@@ -1069,7 +1074,7 @@ fn the_abi_covers_every_call_and_the_sources_export_it() {
     for (sc, phases) in runs() {
         let spec = ProgramSpec::from_params(sc.built, &sc.params).unwrap();
         let abi = spec.abi();
-        let files = sc.built.files().unwrap();
+        let files = spec.files().unwrap();
         let exports = super::codegen::layout_exports(&files[0].1);
         for (owner, sym) in &abi {
             assert!(

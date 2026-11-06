@@ -1,6 +1,8 @@
 //! The plan for a hybrid model (Qwen3.5 dense): Gated DeltaNet units and
-//! gated-attention units, one square f32 grid a layer as serve2d's, in the
-//! model's layer order, and serve2d's f32 head beside them.
+//! gated-attention units, one square grid a layer as serve2d's, in the
+//! model's layer order, and serve2d's head beside them. Weights and head
+//! tiles are f32 where they fit (0.8B), else bf16 (`W16`: 4B), x then split
+//! into three bf16 parts so a matvec stays exact in x.
 //!
 //! Both units keep serve2d's split of the hidden state (row `py` holds
 //! hidden chunk `py`, `Hc` dims) and of the MLP (`Ic` rows a column). They
@@ -38,6 +40,14 @@ pub struct GdnUnit {
     pub conv_width: usize,
     pub lanes: usize,
     pub mlp_chunk: usize,
+    /// bf16 weights (`W16`).
+    pub w16: bool,
+}
+
+/// A W16 matvec's scratch a PE: x's f32 remainder twice over and its three
+/// bf16 parts, `n` elements each.
+fn split_bytes(w16: bool, n: usize) -> usize {
+    if w16 { (4 + 4 + 2 * 3) * n } else { 0 }
 }
 
 /// The GDN unit's fixed bytes a PE (code, runtime, collectives) and a
@@ -45,6 +55,18 @@ pub struct GdnUnit {
 /// 39,120 B at B 8 (the model: 30,240 and 39,680).
 const FIXED: usize = 22_384;
 const LANE_MISC: usize = 82;
+
+/// The W16 path's code a unit (its matvec over x's parts, the rebasing),
+/// fitted to the units' links at 4B's dims: the GDN unit ends at 44,384 B
+/// (the model's f32-fitted terms say 41,296), the attention unit at 46,720 B
+/// at NB 4 (they say 47,308).
+const GDN_W16_CODE: usize = 3_088;
+const ATTN_W16_OVER: usize = 588;
+
+/// What serve_q35's program adds to a unit (serve2d's handoffs and
+/// staircases, the other programs' names, KV staging), as linked at 0.8B:
+/// the GDN grids end 3,882 B past the unit alone, the attention grids 3,952.
+pub const WRAP: usize = 3_952;
 
 impl GdnUnit {
     /// A column's projection outputs: q and k (`DK` each), v and z (`VH x
@@ -60,10 +82,9 @@ impl GdnUnit {
 
     /// A PE's estimated bytes (f32 weights and state).
     pub fn bytes(&self) -> usize {
-        let weights = self.hc * self.proj()
-            + self.conv_channels() * self.conv_width
-            + self.vh * self.dv * self.hc
-            + 3 * self.hc * self.ic;
+        let matrices = self.hc * self.proj() + self.vh * self.dv * self.hc + 3 * self.hc * self.ic;
+        let weight = if self.w16 { 2 } else { 4 };
+        let xmax = self.hc.max(self.vh * self.dv).max(self.ic);
         // gamma1/2, the gated norm's weight, -exp(A_log) and dt_bias.
         let tables = 2 * self.hc + self.vh * self.dv + 2 * self.vh;
         // x and the handoff's x, the projection and its sum of squares, the
@@ -74,7 +95,14 @@ impl GdnUnit {
             + self.vh * self.dv
             + (self.conv_width - 1) * self.conv_channels()
             + LANE_MISC;
-        FIXED + 4 * (weights + tables + self.lanes * lane + self.mlp_chunk * (3 * self.ic + 1))
+        FIXED
+            + if self.w16 { GDN_W16_CODE } else { 0 }
+            + weight * matrices
+            + split_bytes(self.w16, xmax)
+            + 4 * (self.conv_channels() * self.conv_width
+                + tables
+                + self.lanes * lane
+                + self.mlp_chunk * (3 * self.ic + 1))
     }
 }
 
@@ -90,9 +118,19 @@ pub struct AttnUnit {
 impl AttnUnit {
     /// A PE's estimated bytes: the paged grid's, plus the gates' weights
     /// and their lane buffer.
+    /// serve2d's paged grid at f32 (its code), its weights at bf16 under
+    /// `W16`, the gates' weights and outputs, the W16 matvec's scratch.
     pub fn bytes(&self) -> usize {
         let g = &self.grid;
-        g.bytes(false) + 4 * g.qh * g.dc * (g.hc + g.lanes)
+        let f32_grid = Grid { w16: false, ..*g };
+        let (weights, gates) = (f32_grid.weight_bytes(), g.qh * g.dc * g.hc);
+        let weight = if g.w16 { 2 } else { 4 };
+        f32_grid.bytes(false) - weights
+            + weights / 4 * weight
+            + weight * gates
+            + 4 * g.qh * g.dc * g.lanes
+            + split_bytes(g.w16, g.hc.max(g.qh * g.dc).max(g.ic))
+            - if g.w16 { ATTN_W16_OVER } else { 0 }
     }
 }
 
@@ -114,7 +152,21 @@ pub struct Q35Plan {
 }
 
 impl Q35Plan {
+    /// The plan at f32 where it places a program, else at bf16 (`W16`).
     pub fn derive(spec: &ModelSpec, wafer: WaferDims, goals: Goals) -> Result<Q35Plan, Refused> {
+        match Self::place(spec, wafer, goals, false) {
+            Ok(p) if p.program.is_some() => Ok(p),
+            f32 => Self::place(spec, wafer, goals, true).or(f32),
+        }
+    }
+
+    /// The plan with f32 or (`w16`) bf16 weights and head tiles.
+    pub fn place(
+        spec: &ModelSpec,
+        wafer: WaferDims,
+        goals: Goals,
+        w16: bool,
+    ) -> Result<Q35Plan, Refused> {
         let name = &spec.name;
         let Some(hy) = &spec.hybrid else {
             return refuse(format!("{name}: not a hybrid (plan it with SpatialPlan)"));
@@ -157,6 +209,7 @@ impl Q35Plan {
             conv_width: g.conv_width,
             lanes,
             mlp_chunk,
+            w16,
         };
         // Attention: Gs columns a kv head of Dc dims, turned pairs a column.
         let gs = p / spec.kv_heads;
@@ -189,9 +242,10 @@ impl Q35Plan {
             blocks: goals.blocks.unwrap_or(1),
             entries: 1,
             mlp_chunk,
-            w16: false,
+            w16,
             kv16: false,
             host_copy: goals.host_copy,
+            w4: false,
         };
         let mut attn = AttnUnit {
             grid,
@@ -208,6 +262,7 @@ impl Q35Plan {
                     ..attn
                 })
                 .bytes()
+                    + WRAP
                     <= wafer.pe_bytes
             {
                 nb *= 2;
@@ -217,9 +272,9 @@ impl Q35Plan {
         }
         let mut blockers = Vec::new();
         for (what, bytes) in [("Gated DeltaNet", gdn.bytes()), ("attention", attn.bytes())] {
-            if bytes > wafer.pe_bytes {
+            if bytes + WRAP > wafer.pe_bytes {
                 blockers.push(format!(
-                    "the {what} unit wants {bytes} bytes a PE (of {}) at B {lanes}",
+                    "the {what} unit wants {bytes} bytes a PE (and the program's {WRAP}; of {}) at B {lanes}",
                     wafer.pe_bytes
                 ));
             }
@@ -236,7 +291,7 @@ impl Q35Plan {
             if gh < 4 || width > wafer.width || height > wafer.height {
                 continue;
             }
-            let Some(head) = SpatialPlan::head32(spec, &grid, height, gh) else {
+            let Some(head) = SpatialPlan::head_s2d(spec, &grid, height, gh, !w16) else {
                 continue;
             };
             if best.is_none_or(|(b, _)| width * height < b.width * b.height) {
@@ -286,7 +341,7 @@ impl Q35Plan {
             .enumerate()
             .filter(|(_, k)| **k == LayerKind::Attention)
             .fold(0usize, |m, (l, _)| m | 1 << l);
-        vec![
+        let mut params = vec![
             ("Q35", 1),
             ("PX", g.p),
             ("PY", g.p),
@@ -322,8 +377,11 @@ impl Q35Plan {
             // builds carry (the head's: three passes, exact, tied).
             ("HR", self.spec.hidden),
             ("Tc", super::plan::TC),
-            ("W16", 0),
-            ("NP", 3),
+            ("W16", usize::from(g.w16)),
+            // W16: the GDN units' x in two bf16 parts (16 bits of x; 4B
+            // identical to its f32 golden on CS-3, 0374), the attention
+            // units' in three (NPA: at NP 2 their PE keeps 16 B).
+            ("NP", if g.w16 { 2 } else { 3 }),
             ("KV16", 0),
             ("PROF", 0),
             ("GRID", 1),
@@ -333,10 +391,14 @@ impl Q35Plan {
             ("MODE", 0),
             ("OVL", 0),
             ("VMC", h.vmc),
-            ("WF32", 1),
+            ("WF32", usize::from(!g.w16)),
             ("DBG", 0),
             ("iters", 1),
-        ]
+        ];
+        if g.w16 {
+            params.push(("NPA", 3));
+        }
+        params
     }
 }
 
@@ -469,15 +531,58 @@ mod tests {
     }
 
     /// The larger dense ones split (32 v heads over 16 k heads: VH 2), but
-    /// serve2d's f32 head holds too few vocabulary rows a PE at their
-    /// hidden for 248k rows beside 32 grids: they want the bf16 head.
+    /// serve2d's f32 head holds too few vocabulary rows a PE at 4B's and
+    /// 9B's hidden for 248k rows beside 32 grids: they plan at bf16 (`W16`,
+    /// bf16 head tiles). 4B's units and head fit; 9B's do not yet.
     #[test]
-    fn qwen35_4b_and_9b_want_the_bf16_head() {
-        for name in ["qwen35-d4b-bf16-kv-bf16", "qwen35-d9b-bf16-kv-bf16"] {
-            let s = spec(name);
-            let err = Q35Plan::derive(&s, WaferDims::CS3, Goals::lanes(1)).expect_err(name);
-            assert!(err.0.contains("head beside them"), "{err}");
-        }
+    fn qwen35_4b_and_9b_plan_at_bf16() {
+        let s = spec("qwen35-d4b-bf16-kv-bf16");
+        let err = Q35Plan::place(&s, WaferDims::CS3, Goals::lanes(1), false).expect_err("f32");
+        assert!(err.0.contains("head beside them"), "{err}");
+        let p = Q35Plan::derive(&s, WaferDims::CS3, Goals::lanes(1)).expect("4b");
+        let g = p.gdn;
+        assert!(g.w16 && p.attn.grid.w16 && !p.head.f32);
+        assert_eq!((g.hc, g.ic, g.gk, g.dk, g.vh, g.dv), (20, 72, 8, 16, 2, 16));
+        assert_eq!((p.attn.grid.gs, p.attn.grid.dc, p.attn.grid.qh), (32, 8, 4));
+        // The units as linked at 4B (NB 4 measured; the plan takes NB 2).
+        assert_eq!(g.bytes(), 44_384);
+        let nb4 = AttnUnit {
+            grid: Grid {
+                blocks: 4,
+                ..p.attn.grid
+            },
+            ..p.attn
+        };
+        assert_eq!(nb4.bytes(), 46_720);
+        assert_eq!(p.attn.grid.blocks, 2);
+        assert_eq!((p.placement.gw, p.placement.gh), (4, 8));
+        assert!(p.program.is_some(), "{:?}", p.blockers);
+        println!(
+            "4b: gdn {} attn {} head {:?}",
+            g.bytes(),
+            p.attn.bytes(),
+            p.head
+        );
+        println!("4b params: {}", SpatialPlan::extra(&p.params()));
+        // The program identical to its golden on CS-3 (0374: GDN NP 2,
+        // attention NPA 3), as a set.
+        let mut got: Vec<String> = SpatialPlan::extra(&p.params())
+            .split(',')
+            .map(String::from)
+            .collect();
+        let mut want: Vec<String> = "Q35:1,PX:128,PY:128,Hc:20,Ic:72,GK:8,DK:16,VH:2,DV:16,CW:4,Gs:32,Dc:8,Qh:4,ROT:64,PS:16,NB:2,E:1,B:1,MC:1,KINDS:2290649224,GW:4,GH:8,CAP:64,HEADMODE:2,F:432,HH:864,Vr:288,Gx:16,Gy:18,Gb:1,vocab:248320,HR:2560,Tc:32,W16:1,NP:2,NPA:3,KV16:0,PROF:0,GRID:1,PASSES:3,UNTIED:0,CERT:0,MODE:0,OVL:0,VMC:1,WF32:0,DBG:0,iters:1"
+            .split(',')
+            .map(String::from)
+            .collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+        // 9B: 32 dims a PE leave 256 vocabulary rows, 970 head rows, whose
+        // feeder row (485) has no even group; and its Gated DeltaNet unit
+        // outgrows a PE at bf16 (both: a later layout).
+        let s = spec("qwen35-d9b-bf16-kv-bf16");
+        let err = Q35Plan::derive(&s, WaferDims::CS3, Goals::lanes(1)).expect_err("9b");
+        assert!(err.0.contains("head beside them"), "{err}");
     }
 
     /// A non-hybrid model is not this plan's.

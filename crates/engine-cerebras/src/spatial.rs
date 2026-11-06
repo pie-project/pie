@@ -38,7 +38,7 @@
 //! - [`plan`], [`shapes`], [`build`]: the plan, the hardware-validated
 //!   shapes, the build of a [`program::ProgramSpec`];
 //! - [`program`], [`component`]: the typed program and its components'
-//!   host halves and ABI ([`serve2d`], [`serve_q35`], [`serve8b`], [`serve8b_region`]: the
+//!   host halves and ABI ([`serve2d`], [`serve_q35`], [`serve_g4`], [`serve8b`], [`serve8b_region`]: the
 //!   designs' tile layouts and route rules);
 //! - [`device`], [`wafer`]: the [`device::Device`] the host drives, and the
 //!   driver;
@@ -56,15 +56,25 @@ mod golden;
 pub mod guest4;
 pub mod manifest;
 pub mod model;
+pub mod model_g4;
+pub mod model_moe;
+pub mod moe_place;
 pub mod paged;
 pub mod plan;
+pub mod plan_g12;
+pub mod plan_g4;
+pub mod plan_gptoss;
 pub mod plan_q35;
 pub mod program;
 pub mod serve2d;
 pub mod serve8b;
 pub mod serve8b_region;
+pub mod serve_g4;
+pub mod serve_gptoss;
 pub mod serve_q35;
 pub mod shapes;
+pub mod u4;
+pub mod u4g12;
 pub mod wafer;
 
 pub use config::SpatialBoot;

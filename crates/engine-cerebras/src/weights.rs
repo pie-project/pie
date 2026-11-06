@@ -571,10 +571,10 @@ impl TensorSink for Landing<'_> {
 /// Weights for a dry shell (`Shell::load_dry`): the handle table a landing would
 /// mint, and no buffers.
 impl Weights {
+    /// A dry shell lands nothing, so any dtype goes: the spatial engine's
+    /// wafer program places the weights itself (gpt-oss's MXFP4 experts
+    /// included).
     pub(crate) fn dry(handles: &Handles, trace: &Trace, _prescale: bool) -> Result<Weights> {
-        for param in &trace.params {
-            dense_only(&param.name, param.dtype)?;
-        }
         let sizes: Vec<u64> = trace
             .params
             .iter()

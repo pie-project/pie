@@ -34,6 +34,7 @@ use std::collections::BTreeMap;
 use super::codegen::Design;
 use super::guest4::wafer::{HeadGeometry, VmLayout, VmLimits};
 use super::paged::Shape;
+use super::serve_gptoss::{Gpt, Slots};
 use super::serve8b::Kernel;
 use super::serve8b_region::{Units, VmBlock};
 use super::wafer::rect;
@@ -64,6 +65,108 @@ pub struct Model {
     /// `CAP`: head iterations a launch (a launch runs at most `CAP - 1`
     /// passes).
     pub cap: usize,
+    /// `QKN`: the units norm q and k per head (0: Llama's identity; the
+    /// units' sources are generated without the norm, codegen's `Variant`).
+    pub qk_norm: bool,
+    /// `EPS`: the RMSNorm epsilon's f32 bits (0: the kernels' 1e-6).
+    pub eps_bits: u32,
+    /// `SPD` 1: the units carry the speed op cuts (`Variant::speed`).
+    pub speed: bool,
+    /// `LSE` 1: the units' softmax against a carried reference (`Variant::lse`).
+    pub lse: bool,
+    /// `OP2` 1: the second op cuts (`Variant::ops2`).
+    pub ops2: bool,
+    /// `RGX`: the regions' X full all-reduces' phase-1 group (0: RGs;
+    /// `Variant::rgx`).
+    pub rgx: usize,
+    /// `QKV1` 1: one QKV matvec over fused rows (`Variant::qkv1`).
+    pub qkv1: bool,
+    /// `ARF`: the regions' FIFO dual-input all-reduces (`Variant::arf`; 0 off).
+    pub arf: usize,
+    /// `F16`: 1 an IEEE f16 build (no `--fp16-format=bf16`; the host writes
+    /// f16 weights), 2 also the regions' weight matvecs accumulating in f16
+    /// (`Variant::f16`). 0: bf16.
+    pub f16: usize,
+    /// `MEM`: the region kernel's code cuts (`Variant::mem`; 0 off).
+    pub mem: usize,
+    /// `OP3`: the regions' third op cuts (`Variant::op3`; 0 off).
+    pub op3: usize,
+    /// `GRD`: bits of the regions' levers the grids take too (`Variant::grid`; 0 off).
+    pub grid: usize,
+    /// `F16CL` 1: the regions' f16 copy clamped, 0515's redo window (`Variant::f16cl`).
+    pub f16cl: bool,
+    /// `XAC` 1 (with ARF 3, KVCP 0): the regions' XA all-reduces on their own
+    /// colours (`Variant::xac`).
+    pub xac: bool,
+    /// `TRM` bits: the units' op cuts (`Variant::trim`; 0 off).
+    pub trim: usize,
+    /// `ARY`: rows a group of the ARF Y all-reduces' streamed halves (the
+    /// host's route words; 0: 8).
+    pub ary: usize,
+    /// `HVC` 1: vertical handoffs on centred columns (the host's tables).
+    pub hvc: bool,
+}
+
+impl Model {
+    /// The dims, Qwen3's q/k norms and the kernels' epsilon.
+    #[must_use]
+    pub fn dims(hidden: usize, qh: usize, vocab: usize, cap: usize) -> Model {
+        Model {
+            hidden,
+            qh,
+            vocab,
+            cap,
+            qk_norm: true,
+            eps_bits: 0,
+            speed: false,
+            lse: false,
+            ops2: false,
+            rgx: 0,
+            qkv1: false,
+            arf: 0,
+            f16: 0,
+            mem: 0,
+            op3: 0,
+            grid: 0,
+            f16cl: false,
+            xac: false,
+            trim: 0,
+            ary: 0,
+            hvc: false,
+        }
+    }
+
+    /// The RMSNorm epsilon the units compute with.
+    #[must_use]
+    pub fn eps(&self) -> f32 {
+        if self.eps_bits == 0 {
+            super::model::KERNEL_EPS
+        } else {
+            f32::from_bits(self.eps_bits)
+        }
+    }
+
+    /// What the units' sources are generated for.
+    #[must_use]
+    pub fn variant(&self) -> super::codegen::Variant {
+        super::codegen::Variant {
+            identity_qk_norm: !self.qk_norm,
+            eps_bits: (self.eps_bits != 0).then_some(self.eps_bits),
+            speed: self.speed,
+            lse: self.lse,
+            ops2: self.ops2,
+            rgx: self.rgx > 0,
+            qkv1: self.qkv1,
+            arf: u16::try_from(self.arf).unwrap_or(0),
+            f16: u16::try_from(self.f16).unwrap_or(0),
+            mem: u16::try_from(self.mem).unwrap_or(0),
+            op3: u16::try_from(self.op3).unwrap_or(0),
+            grid: u16::try_from(self.grid).unwrap_or(0),
+            f16cl: self.f16cl,
+            xac: self.xac,
+            trim: u16::try_from(self.trim).unwrap_or(0),
+        }
+    }
 }
 
 /// The decoder layers' pipeline.
@@ -79,6 +182,9 @@ pub enum Layers {
         gh: usize,
         tc: usize,
         hybrid: Option<Hybrid>,
+        /// serve_g4: Gemma 4's layers on the grids (`grid` is a sliding
+        /// layer's of the shared prefix; [`Gemma`] the rest).
+        gemma: Option<Gemma>,
     },
     /// serve8b: bf16 grids in strips; strips past the first `full` skip
     /// their westmost slot.
@@ -90,6 +196,9 @@ pub enum Layers {
     },
     /// serve8b_region: grids and several-layer regions.
     Units { grid: Kernel, units: Units },
+    /// serve_gptoss: per layer an attention unit over a MoE grid (`grid`,
+    /// whose rows the head's chunk triples follow) in a slot.
+    Gptoss { grid: Kernel, gpt: Gpt },
 }
 
 /// serve_q35's layer mix and its Gated DeltaNet unit's splits: layer `l`
@@ -106,6 +215,74 @@ pub struct Hybrid {
     pub dv: usize,
     pub cw: usize,
     pub rot: usize,
+}
+
+/// serve_g4's Gemma 4 layers: `nl` grids (the last strip's missing ones are
+/// fillers), layer `l` reading globally where bit `l` of `kinds` is set
+/// (`dcg` dims a column, else `dcs`), the first `nown` owning their kv (the
+/// shared tail after them reads its reading's source's), the MLP `ics`
+/// rows a column (the tail's `ict`), `pc` PLE dims a column, the PLE
+/// region's `npc` columns of `rpp` vocabulary rows a PE; `esb`/`psb` the
+/// f32 bits of sqrt(hidden) and sqrt(PLE)/sqrt(2); `win` the sliding
+/// layers' window (slots a query sees, its own included; 0: every slot);
+/// `g1` the grids' all-reduce groups (0: `Gs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gemma {
+    pub kinds: u64,
+    pub nl: usize,
+    pub nown: usize,
+    pub dcs: usize,
+    pub dcg: usize,
+    pub ics: usize,
+    pub ict: usize,
+    pub pc: usize,
+    pub npc: usize,
+    pub rpp: usize,
+    pub esb: u32,
+    pub psb: u32,
+    pub win: usize,
+    /// The all-reduces' phase-1 group (`G1`; 0: `Gs`).
+    pub g1: usize,
+}
+
+impl Gemma {
+    /// Whether layer `l` reads globally.
+    #[must_use]
+    pub fn global(&self, l: usize) -> bool {
+        self.kinds >> l & 1 == 1
+    }
+
+    /// Layer `l`'s kv dims a column.
+    #[must_use]
+    pub fn dc(&self, l: usize) -> usize {
+        if self.global(l) { self.dcg } else { self.dcs }
+    }
+
+    /// Layer `l`'s MLP rows a column.
+    #[must_use]
+    pub fn ic(&self, l: usize) -> usize {
+        if l < self.nown { self.ics } else { self.ict }
+    }
+
+    /// The layer whose kv layer `l` reads: itself below `nown`, else the
+    /// last owning layer of its reading.
+    #[must_use]
+    pub fn source(&self, l: usize) -> usize {
+        if l < self.nown {
+            return l;
+        }
+        (0..self.nown)
+            .rev()
+            .find(|&j| self.global(j) == self.global(l))
+            .unwrap_or(l)
+    }
+
+    /// The PLE row's u32 words a lane (a strip's `gw` layers, two bf16 a
+    /// word).
+    #[must_use]
+    pub fn row_words(&self, gw: usize, p: usize) -> usize {
+        gw * p * self.pc / 2
+    }
 }
 
 impl Hybrid {
@@ -140,7 +317,8 @@ impl Layers {
         match *self {
             Layers::Grids { grid, .. }
             | Layers::Strips { grid, .. }
-            | Layers::Units { grid, .. } => grid,
+            | Layers::Units { grid, .. }
+            | Layers::Gptoss { grid, .. } => grid,
         }
     }
 }
@@ -163,6 +341,10 @@ pub enum HeadKind {
     /// head2d_v10 over bf16 tiles of `lm_head` (an untied head), `PY / 2`
     /// chunk columns, and the embedding strip east of it.
     Untied,
+    /// head2d_v10 as serve_gptoss carries it: `PY / 3` chunk columns of
+    /// the MoE grid's row triples, the embedding strip of the attention
+    /// unit's rows east of it.
+    Triples,
 }
 
 /// The head: `hh` region rows of `vr` vocabulary rows (its feeder row
@@ -297,6 +479,8 @@ impl ProgramSpec {
             Design::Serve2d | Design::Serve2dPipe | Design::ServeQ35 => serve2d(design, &get)?,
             Design::Serve8b => serve8b(&get)?,
             Design::Serve8bRegion | Design::Serve8bRegionPipe => serve8b_region(design, &get)?,
+            Design::ServeG4 => serve_g4(&get)?,
+            Design::ServeGptoss => serve_gptoss(&get)?,
         };
         spec.order = params.iter().map(|(k, _)| k.clone()).collect();
         spec.knobs = params
@@ -485,8 +669,12 @@ impl ProgramSpec {
     /// PIE) are a build of.
     pub fn infer_design(params: &[(String, String)]) -> R<Design> {
         let get = Get(params);
-        Ok(if get.opt("Q35") == Some(1) {
+        Ok(if get.opt("NOWN").is_some() && get.opt("NPC").is_some() {
+            Design::ServeG4
+        } else if get.opt("Q35") == Some(1) {
             Design::ServeQ35
+        } else if get.opt("NE").is_some() && get.opt("AY").is_some() {
+            Design::ServeGptoss
         } else if get.opt("RPX").is_some() {
             if get.opt("PIPE") == Some(1) {
                 Design::Serve8bRegionPipe
@@ -528,6 +716,58 @@ impl ProgramSpec {
             .collect()
     }
 
+    /// A knob's text (a parameter no component holds), if the program has it.
+    #[must_use]
+    pub fn knob(&self, k: &str) -> Option<&str> {
+        self.knobs.get(k).map(String::as_str)
+    }
+
+    /// The units hold u4g64 weights (`W4 1`: codegen's W4 variant of
+    /// serve8b_region, placed by `spatial::u4`).
+    #[must_use]
+    pub fn weights_u4(&self) -> bool {
+        self.knobs.get("W4").is_some_and(|v| v.trim() == "1")
+    }
+
+    /// Gemma 4 dense on serve8b_region (`G12 1` on a `W4 1`, `W4H 1` build:
+    /// `codegen::serve8b_region_g12`, placed by `spatial::u4g12`): its kinds,
+    /// the global kind's shape, the window, the decode buffer, the embedding's
+    /// scale.
+    #[must_use]
+    pub fn gemma12(&self) -> Option<super::u4g12::G12> {
+        let knob = |k: &str| self.knobs.get(k).and_then(|v| v.trim().parse::<u64>().ok());
+        if knob("G12") != Some(1) || !self.head_u4() {
+            return None;
+        }
+        Some(super::u4g12::G12 {
+            kinds: knob("KINDS").unwrap_or(0),
+            qhg: knob("QhG").unwrap_or(0) as usize,
+            gsg: knob("GsG").unwrap_or(0) as usize,
+            win: knob("WIN").unwrap_or(0) as usize,
+            w4buf: knob("W4BUF").unwrap_or(1024) as usize,
+            esb: knob("ESB").unwrap_or(0) as u32,
+            kv16: knob("KV16") != Some(0),
+        })
+    }
+
+    /// Bytes of a KV cell: the layers' width, or f32 on a G12 check build
+    /// with `KV16 0` (an f32 pool: the tiny simulator's exact comparison).
+    #[must_use]
+    pub fn kv_bytes(&self) -> usize {
+        if self.gemma12().is_some_and(|g| !g.kv16) {
+            4
+        } else {
+            self.layers.kv_bytes()
+        }
+    }
+
+    /// The head's lm_head tiles and the embedding strip hold u4g64 too
+    /// (`W4H 1`, on a `W4 1` build: `spatial::u4::place_head`/`place_embed`).
+    #[must_use]
+    pub fn head_u4(&self) -> bool {
+        self.weights_u4() && self.knobs.get("W4H").is_some_and(|v| v.trim() == "1")
+    }
+
     /// The typed parameter `k`, from the component that holds it (`None`:
     /// a knob, or a parameter this design's components do not hold).
     #[must_use]
@@ -539,6 +779,23 @@ impl ProgramSpec {
             "Qh" => Some(m.qh),
             "vocab" => Some(m.vocab),
             "CAP" => Some(m.cap),
+            "QKN" => Some(usize::from(m.qk_norm)),
+            "EPS" => Some(m.eps_bits as usize),
+            "SPD" => Some(usize::from(m.speed)),
+            "LSE" => Some(usize::from(m.lse)),
+            "OP2" => Some(usize::from(m.ops2)),
+            "RGX" => Some(m.rgx),
+            "QKV1" => Some(usize::from(m.qkv1)),
+            "ARF" => Some(m.arf),
+            "F16" => Some(m.f16),
+            "MEM" => Some(m.mem),
+            "OP3" => Some(m.op3),
+            "GRD" => Some(m.grid),
+            "F16CL" => Some(usize::from(m.f16cl)),
+            "XAC" => Some(usize::from(m.xac)),
+            "TRM" => Some(m.trim),
+            "ARY" => Some(m.ary),
+            "HVC" => Some(usize::from(m.hvc)),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -576,7 +833,52 @@ impl ProgramSpec {
                 "ROT" => Some(h.rot),
                 _ => None,
             },
+            (
+                Layers::Grids {
+                    gemma: Some(g),
+                    grid,
+                    ..
+                },
+                _,
+            ) => match k {
+                "P" => Some(grid.px),
+                "DcS" => Some(g.dcs),
+                "DcG" => Some(g.dcg),
+                "IcS" => Some(g.ics),
+                "IcT" => Some(g.ict),
+                "PC" => Some(g.pc),
+                "KINDS" => usize::try_from(g.kinds).ok(),
+                "NL" => Some(g.nl),
+                "NOWN" => Some(g.nown),
+                "NPC" => Some(g.npc),
+                "RPP" => Some(g.rpp),
+                "ESB" => Some(g.esb as usize),
+                "PSB" => Some(g.psb as usize),
+                "WIN" => Some(g.win),
+                "G1" => Some(g.g1),
+                _ => None,
+            },
             (Layers::Strips { full, .. }, "GS") => Some(full),
+            (Layers::Gptoss { gpt: g, .. }, _) => match k {
+                "AY" => Some(g.slots.ay),
+                "AHc" => Some(g.slots.ahc),
+                "MY" => Some(g.slots.my),
+                "MHc" => Some(g.slots.mhc),
+                "GW" => Some(g.slots.gw),
+                "GH" => Some(g.slots.gh),
+                "NL" => Some(g.slots.nl),
+                "NE" => Some(g.ne),
+                "TK" => Some(g.tk),
+                "AGY" => Some(g.agy),
+                "MGY" => Some(g.mgy),
+                "SLW" => usize::try_from(g.slw).ok(),
+                "WIN" => Some(g.win),
+                "RTR" => Some(g.rtr),
+                "RTI" => Some(g.rti),
+                "HROUTE" => Some(usize::from(g.hroute)),
+                "KV16" => Some(usize::from(g.kv16)),
+                _ => None,
+            },
             (Layers::Units { units: u, .. }, _) => match k {
                 "RPX" => Some(u.rpx),
                 "RPY" => Some(u.rpy),
@@ -588,6 +890,7 @@ impl ProgramSpec {
                 "RC" => Some(u.rc),
                 "RR" => Some(u.rr),
                 "NCOL" => Some(u.ncol),
+                "YD" => Some(u.yd),
                 "RTR" => Some(u.rtr),
                 "GY" => Some(u.gy),
                 "RGY" => Some(u.rgy),
@@ -689,6 +992,43 @@ impl ProgramSpec {
         )
     }
 
+    /// Whether the layers' weights and the head's tiles are bf16 (`W16` 1,
+    /// `WF32` 0: serve_q35 past 0.8B); else f32.
+    #[must_use]
+    pub fn w16(&self) -> bool {
+        self.knobs.get("W16").is_some_and(|v| v.trim() == "1")
+    }
+
+    /// The program's build directory: its design's files for the model's
+    /// variant and, at `W4 1`, its u4g64 units ([`Design::files_for`]);
+    /// serve_q35w's for a W16 serve_q35 (serve_q35 itself stays #1412's f32
+    /// program); serve8b_region's Gemma 4 units for a `G12 1` program
+    /// ([`super::codegen::serve8b_region_g12`]); serve_gptoss's levered units with its `MOE` knob
+    /// ([`super::codegen::serve_gptoss_with`]).
+    pub fn files(&self) -> Result<Vec<super::codegen::File>, String> {
+        let (variant, u4) = (self.model.variant(), self.weights_u4());
+        if self.design == Design::ServeQ35 && self.w16() {
+            if variant != super::codegen::Variant::default() || u4 {
+                return Err(format!(
+                    "serve_q35w: no model variant ({variant:?}) or u4g64 (W4) units"
+                ));
+            }
+            return super::codegen::serve_q35w();
+        }
+        if self.gemma12().is_some() {
+            return super::codegen::serve8b_region_g12(variant);
+        }
+        if self.design == Design::ServeGptoss {
+            // (the attention units' levers from the model, the MoE units' MOE knob)
+            let moe = self
+                .knob("MOE")
+                .map_or(Ok(0), |v| v.trim().parse::<u16>())
+                .map_err(|e| format!("MOE: {e}"))?;
+            return super::codegen::serve_gptoss_with(variant, moe);
+        }
+        self.design.files_for(variant, u4)
+    }
+
     /// serve_q35's layer mix (`None`: every layer attends).
     #[must_use]
     pub fn hybrid(&self) -> Option<Hybrid> {
@@ -702,6 +1042,15 @@ impl ProgramSpec {
     #[must_use]
     pub fn attends(&self, l: usize) -> bool {
         self.hybrid().is_none_or(|h| h.attends(l))
+    }
+
+    /// serve_g4's Gemma 4 layers.
+    #[must_use]
+    pub fn gemma(&self) -> Option<Gemma> {
+        match self.layers {
+            Layers::Grids { gemma, .. } => gemma,
+            _ => None,
+        }
     }
 
     // ------------------------------------------------------- the geometry
@@ -747,12 +1096,21 @@ impl ProgramSpec {
         match self.layers {
             Layers::Grids { gw, .. } | Layers::Strips { gw, .. } => gw,
             Layers::Units { .. } => 0,
+            Layers::Gptoss { gpt, .. } => gpt.slots.gw,
         }
     }
     pub fn gh(&self) -> usize {
         match self.layers {
             Layers::Grids { gh, .. } | Layers::Strips { gh, .. } => gh,
             Layers::Units { .. } => 0,
+            Layers::Gptoss { gpt, .. } => gpt.slots.gh,
+        }
+    }
+    /// serve_gptoss's params beyond its MoE grid.
+    pub fn gptoss(&self) -> Option<Gpt> {
+        match self.layers {
+            Layers::Gptoss { gpt, .. } => Some(gpt),
+            _ => None,
         }
     }
     pub fn hh(&self) -> usize {
@@ -846,7 +1204,9 @@ impl ProgramSpec {
         match self.layers {
             Layers::Strips { full, gw, gh, .. } => full * gw + (gh - full) * (gw - 1),
             Layers::Units { units, .. } => units.layers(),
+            Layers::Grids { gemma: Some(g), .. } => g.nl,
             Layers::Grids { gw, gh, .. } => gw * gh,
+            Layers::Gptoss { gpt, .. } => gpt.slots.nl,
         }
     }
 
@@ -855,6 +1215,7 @@ impl ProgramSpec {
         match self.head.kind {
             HeadKind::Tied => self.py(),
             HeadKind::Untied => self.py() / 2,
+            HeadKind::Triples => self.py() / 3,
         }
     }
 
@@ -865,6 +1226,12 @@ impl ProgramSpec {
         match self.layers {
             Layers::Units { units, .. } => units
                 .units(self)
+                .iter()
+                .map(|u| rect(u.x0, u.y0, u.k.px, u.k.py))
+                .collect(),
+            Layers::Gptoss { gpt, .. } => gpt
+                .slots
+                .units()
                 .iter()
                 .map(|u| rect(u.x0, u.y0, u.k.px, u.k.py))
                 .collect(),
@@ -884,6 +1251,22 @@ impl ProgramSpec {
                     rect(x, y, px, py)
                 })
                 .collect(),
+            // serve_g4: the full strips, then the last one's layers (its
+            // missing grids are fillers).
+            Layers::Grids {
+                gemma: Some(g), gw, ..
+            } => {
+                let (full, rest) = (g.nl / gw, g.nl % gw);
+                let mut a = Vec::new();
+                if full > 0 {
+                    a.push(rect(0, 0, gw * px, full * py));
+                }
+                if rest > 0 {
+                    let x = if full % 2 == 0 { gw - rest } else { 0 };
+                    a.push(rect(x * px, full * py, rest * px, py));
+                }
+                a
+            }
             Layers::Grids { gw, gh, .. } => vec![rect(0, 0, gw * px, gh * py)],
         }
     }
@@ -896,7 +1279,10 @@ impl ProgramSpec {
         let (px, py, hh) = (self.px(), self.py(), self.hh());
         let head = hh + 1;
         match self.layers {
-            Layers::Grids { gw, gh, .. } => (gw * px + py + self.vmc(), (gh * py).max(head)),
+            Layers::Grids { gw, gh, gemma, .. } => (
+                gw * px + py + self.vmc() + gemma.map_or(0, |g| g.npc),
+                (gh * py).max(head),
+            ),
             Layers::Strips { gw, gh, .. } => {
                 (gw * px + py / 2 + self.vmc() + py / 4, (gh * py).max(head))
             }
@@ -904,10 +1290,23 @@ impl ProgramSpec {
                 // The band and regions (RC RPX), the grid column (PX), the
                 // head and the strip, and VMX's 5-column VM block.
                 let vw = if u.vm.is_some() { 5 } else { 0 };
-                let lh = (py + u.rr * u.rpy).max(py * (1 + u.ncol));
+                let lh = if u.yd > 0 {
+                    (u.rr * u.rpy).max(u.yd + u.ncol.max(1) * py)
+                } else {
+                    (py + u.rr * u.rpy).max(py * (1 + u.ncol))
+                };
                 (
                     u.rc * u.rpx + px + py / 2 + self.vmc() + py / 4 + vw,
                     lh.max(head),
+                )
+            }
+            // The slots, the head's chunk triples and VM columns, the strip
+            // (one column an attention row).
+            Layers::Gptoss { gpt, .. } => {
+                let s = gpt.slots;
+                (
+                    s.gw * px + py / 3 + self.vmc() + s.ay,
+                    (s.gh * (s.ay + s.my)).max(head),
                 )
             }
         }
@@ -985,6 +1384,12 @@ impl ProgramSpec {
                     .unwrap_or(&all[0]);
                 return (unit.x0, unit.y0);
             }
+            // serve_gptoss: the layer's attention unit (its pool).
+            Layers::Gptoss { gpt, .. } => {
+                let all = gpt.slots.units();
+                let unit = all.get(2 * l).unwrap_or(&all[0]);
+                return (unit.x0, unit.y0);
+            }
             // serve8b: strips past the full ones skip their westmost slot.
             Layers::Strips { full, .. } if l >= full * gw => {
                 let m = l - full * gw;
@@ -1025,6 +1430,23 @@ fn model(get: &Get) -> R<Model> {
         qh: get.req("Qh")?,
         vocab: get.req("vocab")?,
         cap: get.req("CAP")?,
+        qk_norm: get.opt("QKN").unwrap_or(1) != 0,
+        eps_bits: u32::try_from(get.opt("EPS").unwrap_or(0)).map_err(|e| format!("EPS: {e}"))?,
+        speed: get.opt("SPD").unwrap_or(0) != 0,
+        lse: get.opt("LSE").unwrap_or(0) != 0,
+        ops2: get.opt("OP2").unwrap_or(0) != 0,
+        rgx: get.opt("RGX").unwrap_or(0),
+        qkv1: get.opt("QKV1").unwrap_or(0) != 0,
+        arf: get.opt("ARF").unwrap_or(0),
+        f16: get.opt("F16").unwrap_or(0),
+        mem: get.opt("MEM").unwrap_or(0),
+        op3: get.opt("OP3").unwrap_or(0),
+        grid: get.opt("GRD").unwrap_or(0),
+        f16cl: get.opt("F16CL").unwrap_or(0) != 0,
+        xac: get.opt("XAC").unwrap_or(0) != 0,
+        trim: get.opt("TRM").unwrap_or(0),
+        ary: get.opt("ARY").unwrap_or(0),
+        hvc: get.opt("HVC").unwrap_or(0) != 0,
     })
 }
 
@@ -1059,8 +1481,10 @@ fn headmode(get: &Get, what: &str) -> R<()> {
 /// serve2d / serve2d_pipe: f32 qwen2d grids, head2d east of them.
 fn serve2d(design: Design, get: &Get) -> R<ProgramSpec> {
     headmode(get, "serve2d with head2d")?;
-    if get.req("W16")? != 0 || get.req("KV16")? != 0 || get.req("WF32")? != 1 {
-        return Err("the engine places f32 weights and KV (W16 0, KV16 0, WF32 1)".into());
+    // serve_q35 also places bf16 weights with bf16 head tiles (W16 1, WF32 0).
+    let w16 = design == Design::ServeQ35 && get.req("W16")? == 1 && get.req("WF32")? == 0;
+    if !w16 && (get.req("W16")? != 0 || get.req("WF32")? != 1) || get.req("KV16")? != 0 {
+        return Err("the engine places f32 weights and KV (W16 0, KV16 0, WF32 1; serve_q35 also W16 1, WF32 0)".into());
     }
     let grid = kernel(get)?;
     let host_copy = get.opt("KVCP").unwrap_or(1) == 0;
@@ -1073,6 +1497,7 @@ fn serve2d(design: Design, get: &Get) -> R<ProgramSpec> {
             gh: get.req("GH")?,
             tc: get.req("Tc")?,
             hybrid: None,
+            gemma: None,
         },
         stage: Stage::Single,
         head: head(get, true)?,
@@ -1145,6 +1570,76 @@ fn serve2d(design: Design, get: &Get) -> R<ProgramSpec> {
     Ok(spec)
 }
 
+/// serve_g4: Gemma 4's layers as bf16 gemma4_layer grids (serpentine as
+/// serve2d's), the f32 head2d over the tied embedding, the PLE region east
+/// of it; a paged pool on every grid (the shared tail's its own, fed by
+/// the handoff), the head's argmax.
+fn serve_g4(get: &Get) -> R<ProgramSpec> {
+    let p = get.req("P")?;
+    let hc = get.req("Hc")?;
+    let g = Gemma {
+        kinds: get.req("KINDS")? as u64,
+        nl: get.req("NL")?,
+        nown: get.req("NOWN")?,
+        dcs: get.req("DcS")?,
+        dcg: get.req("DcG")?,
+        ics: get.req("IcS")?,
+        ict: get.req("IcT")?,
+        pc: get.req("PC")?,
+        npc: get.req("NPC")?,
+        rpp: get.req("RPP")?,
+        esb: u32::try_from(get.req("ESB")?).map_err(|e| e.to_string())?,
+        psb: u32::try_from(get.req("PSB")?).map_err(|e| e.to_string())?,
+        win: get.opt("WIN").unwrap_or(0),
+        g1: get.opt("G1").unwrap_or(0),
+    };
+    let (gw, gh) = (get.req("GW")?, get.req("GH")?);
+    if g.nl > gw * gh || g.nl <= (gh - 1) * gw || g.nown > g.nl {
+        return Err(format!(
+            "serve_g4: {} layers do not fill {gw} x {gh} grids (the last strip part)",
+            g.nl
+        ));
+    }
+    if get.opt("VM").unwrap_or(0) != 0 || get.opt("KVST").unwrap_or(0) != 0 {
+        return Err("serve_g4 carries no VM and no KV staging (VM 0, KVST 0)".into());
+    }
+    let grid = Kernel {
+        px: p,
+        py: p,
+        hc,
+        dc: g.dcs,
+        gs: get.req("Gs")?,
+        ic: g.ics,
+    };
+    let spec = ProgramSpec {
+        design: Design::ServeG4,
+        model: Model::dims(p * hc, get.req("Qh")?, get.req("vocab")?, get.req("CAP")?),
+        layers: Layers::Grids {
+            grid,
+            gw,
+            gh,
+            tc: 0,
+            hybrid: None,
+            gemma: Some(g),
+        },
+        stage: Stage::Single,
+        head: head(get, true)?,
+        kv: Kv::Paged {
+            shape: shape(get, p)?,
+            copy: PageCopy::Kernels,
+            staging: 0,
+        },
+        sampler: Sampler::Argmax,
+        knobs: BTreeMap::new(),
+        raw: BTreeMap::new(),
+        order: Vec::new(),
+    };
+    if spec.gs() == 0 || spec.gx() == 0 || spec.vmc() != 1 || p % spec.gs() != 0 {
+        return Err(format!("serve_g4 params do not make a layout: {spec:?}"));
+    }
+    Ok(spec)
+}
+
 /// serve8b: bf16 grids in strips, head2d_v10 and the embedding strip.
 fn serve8b(get: &Get) -> R<ProgramSpec> {
     headmode(get, "serve8b")?;
@@ -1203,7 +1698,22 @@ fn serve8b(get: &Get) -> R<ProgramSpec> {
 /// embedding strip as serve8b's.
 fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
     headmode(get, "serve8b_region")?;
-    if get.req("W16")? != 1 || get.req("KV16")? != 1 || get.opt("KVCP").unwrap_or(0) != 0 {
+    // A G12 build's layout defaults `G12` to 1, so cslc's out.json omits it
+    // when the params do; its Gemma knobs without it would read as a Qwen /
+    // Llama program (no norms' kinds, an untied head).
+    if get.opt("G12") != Some(1)
+        && let Some(k) = ["KINDS", "QhG", "GsG", "WIN", "W4BUF", "ESB"]
+            .into_iter()
+            .find(|k| get.opt(k).is_some())
+    {
+        return Err(format!(
+            "serve8b_region: param {k} is serve8b_region_g12's (Gemma 4) but the params state \
+             no G12:1; pass G12:1 (the layout's default is not in out.json)"
+        ));
+    }
+    // (G12 check builds may keep an f32 pool: KV16 0.)
+    let kv16_ok = get.req("KV16")? == 1 || get.opt("G12") == Some(1);
+    if get.req("W16")? != 1 || !kv16_ok || get.opt("KVCP").unwrap_or(0) != 0 {
         return Err("serve8b_region keeps weights and KV in bf16 and copies pages by the host (W16 1, KV16 1, KVCP 0)".into());
     }
     let grid = kernel(get)?;
@@ -1219,6 +1729,19 @@ fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
             "serve8b_region: RC RPX {} is not whole grids of {px}",
             rc * rpx
         ));
+    }
+    let yd = get.opt("YD").unwrap_or(0);
+    if yd > 0 {
+        // The last region: in row RR - 2 (RR odd, the snake) or row 1 (the
+        // U); the column's first grid within its rows.
+        let (rr, ncol) = (get.req("RR")?, get.req("NCOL")?);
+        let k = yd / rpy.max(1);
+        let row_ok = k == 1 || (rr % 2 == 1 && k + 2 == rr);
+        if rc != 2 || rr < 3 || ncol == 0 || !row_ok || yd + grid.py > (k + 1) * rpy {
+            return Err(format!(
+                "serve8b_region YD {yd}: lever D takes RC 2, RR >= 3, NCOL >= 1 and the column's first grid within the rows of region row 1 or (RR odd) RR - 2 (RC {rc}, RR {rr}, NCOL {ncol})"
+            ));
+        }
     }
     let u = Units {
         rpx,
@@ -1237,7 +1760,12 @@ fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
         hroute: get.opt("HROUTE").unwrap_or(0) == 1,
         rot8: get.opt("ROT8").unwrap_or(0) == 1,
         nolayer: get.opt("NOLAYER").unwrap_or(0) == 1,
-        band: rc * rpx / px + 1,
+        band: if get.opt("YD").unwrap_or(0) > 0 {
+            1
+        } else {
+            rc * rpx / px + 1
+        },
+        yd: get.opt("YD").unwrap_or(0),
         vm: match (get.opt("VMX"), get.opt("VMREAL")) {
             (Some(1), Some(1)) => Some(VmBlock {
                 max_ops: get.req("max_ops")?,
@@ -1318,6 +1846,100 @@ fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
     Ok(spec)
 }
 
+/// serve_gptoss: attention units over MoE grids in slots, head2d_v10 on
+/// the MoE rows' triples, the strip east of it; the pool on the attention
+/// units (`AY` rows), its pages copied by the host.
+fn serve_gptoss(get: &Get) -> R<ProgramSpec> {
+    let px = get.req("PX")?;
+    let (my, mhc) = (get.req("MY")?, get.req("MHc")?);
+    let slots = Slots {
+        px,
+        ay: get.req("AY")?,
+        ahc: get.req("AHc")?,
+        my,
+        mhc,
+        gw: get.req("GW")?,
+        gh: get.req("GH")?,
+        nl: get.req("NL")?,
+    };
+    let (dc, gs, ic) = (get.req("Dc")?, get.req("Gs")?, get.req("Ic")?);
+    let gpt = Gpt {
+        slots,
+        dc,
+        gs,
+        ic,
+        ne: get.req("NE")?,
+        tk: get.req("TK")?,
+        agy: get.req("AGY")?,
+        mgy: get.req("MGY")?,
+        slw: get
+            .0
+            .iter()
+            .find(|(k, _)| k == "SLW")
+            .and_then(|(_, v)| v.trim().parse().ok())
+            .ok_or("no param SLW")?,
+        win: get.req("WIN")?,
+        rtr: get.req("RTR")?,
+        rti: get.req("RTI")?,
+        hroute: get.opt("HROUTE").unwrap_or(0) == 1,
+        // Absent: the bf16 pool the first builds had.
+        kv16: get.opt("KV16").unwrap_or(1) == 1,
+        qkv1: get.opt("QKV1").unwrap_or(0) == 1,
+        arf: get.opt("ARF").unwrap_or(0),
+    };
+    let grid = Kernel {
+        px,
+        py: my,
+        hc: mhc,
+        dc,
+        gs,
+        ic,
+    };
+    let mut head = head(get, false)?;
+    head.kind = HeadKind::Triples;
+    let spec = ProgramSpec {
+        design: Design::ServeGptoss,
+        model: model(get)?,
+        layers: Layers::Gptoss { grid, gpt },
+        stage: Stage::Single,
+        head,
+        kv: Kv::Paged {
+            shape: shape(get, slots.ay)?,
+            copy: PageCopy::Host,
+            staging: 0,
+        },
+        sampler: Sampler::Argmax,
+        knobs: BTreeMap::new(),
+        raw: BTreeMap::new(),
+        order: Vec::new(),
+    };
+    let hid = spec.hidden();
+    let c = spec.chunk_cols();
+    let ok = gs > 0
+        && px % gs == 0
+        && dc.is_multiple_of(2)
+        && slots.nl > 0
+        && slots.nl <= slots.gw + slots.gw * (slots.gh - 1)
+        && slots.gw % 2 == 1
+        && slots.ay * slots.ahc >= hid
+        && my * mhc >= hid
+        && my.is_multiple_of(3)
+        && px * ic >= gpt.ne.min(1)
+        && spec.gx() > 0
+        && c.is_multiple_of(spec.gx())
+        && spec.vmc() <= 1
+        && spec.hh().is_multiple_of(2)
+        && c * 3 * mhc >= hid
+        && slots.ay.is_multiple_of(gpt.agy.max(1))
+        && my.is_multiple_of(gpt.mgy.max(1));
+    if !ok {
+        return Err(format!(
+            "serve_gptoss params do not make a layout: {spec:?}"
+        ));
+    }
+    Ok(spec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1390,7 +2012,7 @@ mod tests {
             let spec = ProgramSpec::from_params(design, &params).unwrap();
             let Some(abi) = spec.vm_abi() else { continue };
             seen += 1;
-            let files = design.files().unwrap();
+            let files = spec.files().unwrap();
             let all: String = files.iter().map(|f| f.1.as_str()).collect();
             // gring: guest4hm's `[2]u32`, guest4hz's `[if (CONC) 4 else 3]`
             // (VMCONC's fourth word the host writes as it needs).

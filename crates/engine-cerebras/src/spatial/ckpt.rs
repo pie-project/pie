@@ -20,11 +20,16 @@ enum Dtype {
     Bf16,
     F16,
     F32,
+    /// Bytes as stored (gpt-oss's MXFP4 codes and E8M0 scales): read raw
+    /// by [`Ckpt::hf_u8`]; widened, each byte's value. Also packed u4g64
+    /// codes (`Ckpt::u4g64`).
+    U8,
 }
 
 impl Dtype {
     fn bytes(self) -> usize {
         match self {
+            Dtype::U8 => 1,
             Dtype::Bf16 | Dtype::F16 => 2,
             Dtype::F32 => 4,
         }
@@ -44,6 +49,17 @@ impl Entry {
     fn elems(&self) -> usize {
         self.shape.iter().product()
     }
+}
+
+/// A matrix landed in u4g64 ([`Ckpt::u4g64`]): `rows` x `cols`, two codes a
+/// byte (low nibble first), a bf16 scale and bias a row and 64 columns.
+#[derive(Debug, Clone)]
+pub struct U4Landed {
+    pub rows: usize,
+    pub cols: usize,
+    pub codes: Vec<u8>,
+    pub scales: Vec<u16>,
+    pub biases: Vec<u16>,
 }
 
 /// A tensor widened to `f32`, row-major.
@@ -73,9 +89,11 @@ pub struct Ckpt {
 }
 
 enum Inner {
-    /// A Hugging Face directory, read lazily by transformers name.
+    /// A Hugging Face directory, read lazily by transformers name: each
+    /// file one path, or its pieces in order (`<file>.partNN`, as the CS-3
+    /// session stages files under 2 GiB).
     Files {
-        paths: Vec<PathBuf>,
+        paths: Vec<Vec<PathBuf>>,
         entries: HashMap<String, Entry>,
     },
     /// A test checkpoint: every named tensor of its shape, its values a
@@ -236,8 +254,8 @@ impl Ckpt {
         let index = dir.join("model.safetensors.index.json");
         let (paths, entries) = if dir.join("model.safetensors").exists() {
             let path = dir.join("model.safetensors");
-            let entries = safetensors(&path, 0)?;
-            (vec![path], entries)
+            let entries = safetensors(std::slice::from_ref(&path), 0)?;
+            (vec![vec![path]], entries)
         } else if index.exists() {
             let map: serde_json::Value = serde_json::from_str(
                 &std::fs::read_to_string(&index)
@@ -253,15 +271,21 @@ impl Ckpt {
             files.sort_unstable();
             files.dedup();
             let mut entries = HashMap::new();
-            let paths: Vec<PathBuf> = files.iter().map(|f| dir.join(f)).collect();
+            let paths: Vec<Vec<PathBuf>> = files.iter().map(|f| vec![dir.join(f)]).collect();
             for (i, path) in paths.iter().enumerate() {
                 entries.extend(safetensors(path, i)?);
+            }
+            (paths, entries)
+        } else if let Some(paths) = shards(dir)? {
+            let mut entries = HashMap::new();
+            for (i, pieces) in paths.iter().enumerate() {
+                entries.extend(safetensors(pieces, i)?);
             }
             (paths, entries)
         } else {
             let path = dir.join("weights.npz");
             let entries = npz(&path)?;
-            (vec![path], entries)
+            (vec![vec![path]], entries)
         };
         Ok(Ckpt {
             inner: Inner::Files { paths, entries },
@@ -378,9 +402,7 @@ impl Ckpt {
                 let Some(e) = found else {
                     return Ok(None);
                 };
-                let path = &paths[e.file];
-                let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-                let raw = read_at(&mut file, e.offset, e.elems() * e.dtype.bytes())?;
+                let raw = read_pieces(&paths[e.file], e.offset, e.elems() * e.dtype.bytes())?;
                 Ok(Some((e.dtype, e.shape.clone(), raw)))
             }
             #[cfg(test)]
@@ -463,6 +485,64 @@ impl Ckpt {
         Ok((shape, bits))
     }
 
+    /// `name` landed in u4g64 (MLX's affine 4-bit codes, groups of 64
+    /// along a row), as Pie's u4g64 deployments keep it: beside no
+    /// `<base>.weight`, `<base>.codes` (U8, `[rows, cols / 2]`, two codes a
+    /// byte, the low nibble first), `<base>.scales` and `<base>.biases`
+    /// (BF16, `[rows, cols / 64]`); `<base>` its transformers name less
+    /// `.weight`. `None`: not landed so.
+    pub fn u4g64(&self, name: &str) -> R<Option<U4Landed>> {
+        let Inner::Files { paths, entries } = &self.inner else {
+            return Ok(None);
+        };
+        let Some(base) =
+            transformers_name(name).and_then(|n| n.strip_suffix(".weight").map(String::from))
+        else {
+            return Ok(None);
+        };
+        let read = |suffix: &str, dtype: Dtype| -> R<Option<(Vec<usize>, Vec<u8>)>> {
+            let Some(e) = entries.get(&format!("{base}.{suffix}")) else {
+                return Ok(None);
+            };
+            if e.dtype != dtype || e.shape.len() != 2 {
+                return Err(format!(
+                    "{base}.{suffix}: {:?} {:?} (want 2-d {dtype:?})",
+                    e.dtype, e.shape
+                ));
+            }
+            let raw = read_pieces(&paths[e.file], e.offset, e.elems() * e.dtype.bytes())?;
+            Ok(Some((e.shape.clone(), raw)))
+        };
+        let Some((cs, codes)) = read("codes", Dtype::U8)? else {
+            return Ok(None);
+        };
+        let (Some((ss, s)), Some((bs, b))) =
+            (read("scales", Dtype::Bf16)?, read("biases", Dtype::Bf16)?)
+        else {
+            return Err(format!("{base}.codes without its scales and biases"));
+        };
+        let (rows, cols) = (cs[0], 2 * cs[1]);
+        if ss != [rows, cols / 64] || bs != ss {
+            return Err(format!(
+                "{base}: codes {cs:?}, scales {ss:?}, biases {bs:?}"
+            ));
+        }
+        let words = |raw: Vec<u8>| -> Vec<u16> {
+            raw.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        };
+        Ok(Some(U4Landed {
+            rows,
+            cols,
+            codes,
+            scales: words(s),
+            biases: words(b),
+        }))
+    }
+
     pub fn get(&self, name: &str) -> R<Tensor> {
         let (dtype, shape, raw) = self.need(name)?;
         Ok(Tensor {
@@ -470,6 +550,144 @@ impl Ckpt {
             data: widen(dtype, &raw),
         })
     }
+
+    /// A Hugging Face directory's tensor by its name past the language
+    /// model's trunk (`model.language_model.`, `model.` or none), widened
+    /// to f32: what serve_g4 places (Gemma 4's own names).
+    pub fn hf(&self, leaf: &str) -> R<Tensor> {
+        let (dtype, shape, raw) = self.hf_raw(leaf, None)?;
+        Ok(Tensor {
+            shape,
+            data: widen(dtype, &raw),
+        })
+    }
+
+    /// [`Ckpt::hf`]'s tensor as bf16 bits (a bf16 tensor's untouched).
+    pub fn hf_bits(&self, leaf: &str) -> R<(Vec<usize>, Vec<u16>)> {
+        let (dtype, shape, raw) = self.hf_raw(leaf, None)?;
+        Ok((shape, bf16_bits_of(dtype, &raw)))
+    }
+
+    /// Rows `lo..hi` of [`Ckpt::hf`]'s tensor `leaf` as bf16 bits (a bf16
+    /// tensor's untouched), and the whole tensor's shape: a large table
+    /// read a band of rows at a time.
+    pub fn hf_rows_bits(&self, leaf: &str, lo: usize, hi: usize) -> R<(Vec<usize>, Vec<u16>)> {
+        let (dtype, shape, raw) = self.hf_raw(leaf, Some((lo, hi)))?;
+        Ok((shape, bf16_bits_of(dtype, &raw)))
+    }
+
+    /// [`Ckpt::hf`]'s tensor's bytes as stored, of a `U8` tensor (MXFP4
+    /// blocks and scales).
+    pub fn hf_u8(&self, leaf: &str) -> R<(Vec<usize>, Vec<u8>)> {
+        let (dtype, shape, raw) = self.hf_raw(leaf, None)?;
+        if dtype != Dtype::U8 {
+            return Err(format!("{leaf} is {dtype:?}, not U8"));
+        }
+        Ok((shape, raw))
+    }
+
+    fn hf_raw(&self, leaf: &str, rows: Option<(usize, usize)>) -> R<Raw> {
+        let Inner::Files { paths, entries } = &self.inner else {
+            return Err(format!(
+                "{leaf}: this placement reads a Hugging Face directory (`spatial_ckpt`), \
+                 not the landed planes"
+            ));
+        };
+        let e = TRUNKS
+            .iter()
+            .find_map(|t| entries.get(&format!("{t}{leaf}")))
+            .ok_or_else(|| format!("the checkpoint has no tensor {leaf}"))?;
+        let row = e.shape.iter().skip(1).product::<usize>() * e.dtype.bytes();
+        let n = e.shape.first().copied().unwrap_or(1);
+        let (lo, hi) = rows.unwrap_or((0, n));
+        if lo > hi || hi > n {
+            return Err(format!("{leaf}: rows {lo}..{hi} of {n}"));
+        }
+        let raw = read_pieces(
+            &paths[e.file],
+            e.offset + (lo * row) as u64,
+            (hi - lo) * row,
+        )?;
+        Ok((e.dtype, e.shape.clone(), raw))
+    }
+}
+
+/// Raw tensor bytes as bf16 bits (a bf16 tensor's untouched).
+fn bf16_bits_of(dtype: Dtype, raw: &[u8]) -> Vec<u16> {
+    match dtype {
+        Dtype::Bf16 => raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect(),
+        _ => widen(dtype, raw).iter().map(|&x| bf16_bits(x)).collect(),
+    }
+}
+
+/// `len` bytes at `offset` of a file stored as `pieces` in order.
+fn read_pieces(pieces: &[PathBuf], mut offset: u64, len: usize) -> R<Vec<u8>> {
+    let mut out = Vec::with_capacity(len);
+    for path in pieces {
+        if out.len() == len {
+            break;
+        }
+        let size = std::fs::metadata(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len();
+        if offset >= size {
+            offset -= size;
+            continue;
+        }
+        let n = (len - out.len()).min((size - offset) as usize);
+        let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        out.extend(read_at(&mut file, offset, n)?);
+        offset = 0;
+    }
+    if out.len() != len {
+        return Err(format!(
+            "{}: {len} bytes past its end",
+            pieces
+                .first()
+                .map_or(String::new(), |p| p.display().to_string())
+        ));
+    }
+    Ok(out)
+}
+
+/// A directory's `*.safetensors` files without an index, each whole or as
+/// its pieces `<file>.partNN` (`None`: there are none).
+fn shards(dir: &Path) -> R<Option<Vec<Vec<PathBuf>>>> {
+    let mut files: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
+    let listing = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for entry in listing.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".safetensors") {
+            files.insert(name, vec![entry.path()]);
+        } else if let Some((file, part)) = name.rsplit_once(".part")
+            && file.ends_with(".safetensors")
+            && part.len() == 2
+            && part.bytes().all(|b| b.is_ascii_digit())
+        {
+            let pieces = files.entry(file.to_string()).or_default();
+            // A whole file wins over its pieces.
+            if !(pieces.len() == 1 && pieces[0].file_name() == Some(file.as_ref())) {
+                pieces.push(entry.path());
+            }
+        }
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        files
+            .into_values()
+            .map(|mut p| {
+                p.sort();
+                p
+            })
+            .collect(),
+    ))
 }
 
 /// Collects the executor's planes by plan param name.
@@ -543,6 +761,7 @@ fn widen(dtype: Dtype, raw: &[u8]) -> Vec<f32> {
             .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
+        Dtype::U8 => raw.iter().map(|&b| f32::from(b)).collect(),
     }
 }
 
@@ -569,10 +788,10 @@ fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-fn safetensors(path: &Path, shard: usize) -> R<HashMap<String, Entry>> {
-    let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let n = u64_at(&read_at(&mut file, 0, 8)?, 0);
-    let header: serde_json::Value = serde_json::from_slice(&read_at(&mut file, 8, n as usize)?)
+fn safetensors(pieces: &[PathBuf], shard: usize) -> R<HashMap<String, Entry>> {
+    let path = &pieces[0];
+    let n = u64_at(&read_pieces(pieces, 0, 8)?, 0);
+    let header: serde_json::Value = serde_json::from_slice(&read_pieces(pieces, 8, n as usize)?)
         .map_err(|e| format!("{}: header: {e}", path.display()))?;
     let base = 8 + n;
     let mut entries = HashMap::new();
@@ -584,6 +803,7 @@ fn safetensors(path: &Path, shard: usize) -> R<HashMap<String, Entry>> {
             Some("BF16") => Dtype::Bf16,
             Some("F16") => Dtype::F16,
             Some("F32") => Dtype::F32,
+            Some("U8") => Dtype::U8,
             other => {
                 return Err(format!(
                     "{name}: dtype {other:?} is not a float the wafer takes"

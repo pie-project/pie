@@ -26,7 +26,7 @@ use super::device::Device;
 use super::program::Layers;
 use super::program::ProgramSpec;
 use super::serve8b::{Kernel, Rope};
-use super::wafer::{inv_freq, rect};
+use super::wafer::rect;
 use crate::sdk::{DataType, Order};
 
 type R<T> = std::result::Result<T, String>;
@@ -51,6 +51,10 @@ const C_A_HOP: [u32; 2] = [2, 3];
 /// Re-chunk B: one leg color, hops alternate.
 const C_B_LEG: u32 = 3;
 const C_B_HOP: [u32; 2] = [4, 14];
+/// Re-chunk C (lever D: layer 0's grid into the region west of it): legs by
+/// dest row parity, the third where a parity's last leg left the same row
+/// (the grid's last rows feed several dest rows); hops C_A_HOP.
+const C_C_LEG: [u32; 3] = [19, 20, 17];
 const RT_I: usize = 3;
 const RT_O: usize = 3;
 
@@ -78,8 +82,13 @@ pub struct Units {
     pub rot8: bool,
     /// The units skip their layers (checking the handoffs): no weights.
     pub nolayer: bool,
-    /// Grids in the top band, layer 0's included (XC / PX + 1).
+    /// Grids in the top band, layer 0's included (XC / PX + 1; 1 under `YD`).
     pub band: usize,
+    /// `YD` > 0 (lever D): no band; the regions from row 0 (RC 2), entered
+    /// from layer 0's grid to their east, and the last NCOL layers' grids
+    /// down the column from (XC, YD) beside the last region (in region row
+    /// RR - 2, RR odd, or row 1). 0: option A.
+    pub yd: usize,
     /// The eta VM as the block east of the strip (`VMX`, `VMREAL`).
     pub vm: Option<VmBlock>,
 }
@@ -102,6 +111,9 @@ pub const NVC: usize = 5;
 pub enum Kind {
     Grid,
     Region,
+    /// serve_gptoss's units.
+    Attn,
+    Moe,
 }
 
 /// One layer unit: its kind, place and layers.
@@ -162,6 +174,38 @@ impl Units {
             });
         };
         let xc = self.rc * self.rpx;
+        if self.yd > 0 {
+            // Lever D: layer 0 at (XC, 0); the regions (RC 2 x RR) entered at
+            // (1, 0); the last NCOL grids down the column from (XC, YD), east
+            // of the last region. YD in region row RR - 2 (RR odd): from (1,
+            // 0) by rows 0..RR-3 (east-west, then west-east, ...), then (0,
+            // RR-2), (0, RR-1), (1, RR-1), (1, RR-2). YD in region row 1 (any
+            // RR): down column 0 from (0, 0), back up column 1 to (1, 1).
+            add(Kind::Grid, xc, 0);
+            let mut cells: Vec<(usize, usize)> = Vec::new();
+            if self.yd / self.rpy == 1 && self.rr != 3 {
+                cells.push((1, 0));
+                cells.extend((0..self.rr).map(|r| (0, r)));
+                cells.extend((1..self.rr).rev().map(|r| (1, r)));
+            } else {
+                for r in 0..self.rr.saturating_sub(2) {
+                    if r % 2 == 0 {
+                        cells.extend([(1, r), (0, r)]);
+                    } else {
+                        cells.extend([(0, r), (1, r)]);
+                    }
+                }
+                let (a, b) = (self.rr.saturating_sub(2), self.rr.saturating_sub(1));
+                cells.extend([(0, a), (0, b), (1, b), (1, a)]);
+            }
+            for (c, r) in cells {
+                add(Kind::Region, c * self.rpx, r * self.rpy);
+            }
+            for k in 0..self.ncol.max(1) {
+                add(Kind::Grid, xc, self.yd + k * lay.py());
+            }
+            return out;
+        }
         for i in 0..self.band {
             add(Kind::Grid, xc - i * lay.px(), 0);
         }
@@ -199,13 +243,19 @@ struct Pe {
 /// Every unit PE's routes, pieces in and out, relay color and forward
 /// color.
 pub struct Tables {
-    units: Vec<Unit>,
-    lanes: u32,
+    pub(crate) units: Vec<Unit>,
+    pub(crate) lanes: u32,
     rtr: usize,
+    /// Pieces a PE receives (RT_I; serve_gptoss's S2D_RTI).
+    pub(crate) rti: usize,
     pe: HashMap<(usize, usize), Pe>,
     /// serve8b_region_pipe's ring: the last unit's x to the head carries
     /// the micro-batch word (`nsend` bit 8).
     pub pipe: bool,
+    /// `HVC` 1: a vertical handoff sends row py down column (PX - PY) / 2 + py
+    /// (rows centred on the unit's columns) instead of column py, so the
+    /// next unit's row multicast reaches its far column sooner.
+    centred: bool,
 }
 
 fn step(d: u32) -> (isize, isize) {
@@ -227,10 +277,23 @@ fn opp(d: u32) -> u32 {
 }
 
 /// A source piece: (source fabric y, source offset, dest offset, words a lane).
-type Piece = (usize, u32, u32, u32);
+pub(crate) type Piece = (usize, u32, u32, u32);
 
 impl Tables {
     pub fn new(units: Vec<Unit>, lanes: usize, rtr: usize) -> R<Tables> {
+        Tables::new_with(units, lanes, rtr, false)
+    }
+
+    /// [`Tables::new`], `centred`: `HVC`'s vertical handoff columns.
+    pub fn new_with(units: Vec<Unit>, lanes: usize, rtr: usize, centred: bool) -> R<Tables> {
+        let mut t = Tables::empty(units, lanes, rtr);
+        t.centred = centred;
+        t.build()?;
+        Ok(t)
+    }
+
+    /// Every unit PE with no routes or pieces yet.
+    pub(crate) fn empty(units: Vec<Unit>, lanes: usize, rtr: usize) -> Tables {
         let mut pe = HashMap::new();
         for u in &units {
             for y in u.y0..u.y0 + u.k.py {
@@ -246,15 +309,25 @@ impl Tables {
                 }
             }
         }
-        let mut t = Tables {
+        Tables {
             units,
             lanes: lanes as u32,
             rtr,
+            rti: RT_I,
             pe,
             pipe: false,
-        };
-        t.build()?;
-        Ok(t)
+            centred: false,
+        }
+    }
+
+    pub(crate) fn set_relay(&mut self, x: usize, y: usize, c: u32) -> R<()> {
+        self.at(x, y)?.relay = c;
+        Ok(())
+    }
+
+    pub(crate) fn set_fwd_in(&mut self, x: usize, y: usize, c: u32) -> R<()> {
+        self.at(x, y)?.fwd_in = c;
+        Ok(())
     }
 
     fn at(&mut self, x: usize, y: usize) -> R<&mut Pe> {
@@ -263,7 +336,15 @@ impl Tables {
             .ok_or_else(|| format!("a path leaves the units at ({x}, {y})"))
     }
 
-    fn route(&mut self, x: usize, y: usize, color: u32, rx: u32, t1: u32, t2: u32) -> R<()> {
+    pub(crate) fn route(
+        &mut self,
+        x: usize,
+        y: usize,
+        color: u32,
+        rx: u32,
+        t1: u32,
+        t2: u32,
+    ) -> R<()> {
         let e = self.at(x, y)?;
         let r = (rx, t1, t2);
         match e.routes.get(&color) {
@@ -277,7 +358,7 @@ impl Tables {
 
     /// A point-to-point path through corner points (straight segments):
     /// RAMP in at the first, RAMP out at the last.
-    fn leg(&mut self, color: u32, pts: &[(usize, usize)]) -> R<()> {
+    pub(crate) fn leg(&mut self, color: u32, pts: &[(usize, usize)]) -> R<()> {
         let mut cells = vec![pts[0]];
         let mut dirs = Vec::new();
         for w in pts.windows(2) {
@@ -319,7 +400,14 @@ impl Tables {
 
     /// Unit `u`'s row `row` takes `color` at column `xin` (from `rxin`, or
     /// RAMP: that PE multicasts its own) and every PE of the row gets it.
-    fn row_mcast(&mut self, color: u32, u: &Unit, row: usize, xin: usize, rxin: u32) -> R<()> {
+    pub(crate) fn row_mcast(
+        &mut self,
+        color: u32,
+        u: &Unit,
+        row: usize,
+        xin: usize,
+        rxin: u32,
+    ) -> R<()> {
         let y = u.y0 + row;
         let (xa, xb) = (u.x0, u.x0 + u.k.px - 1);
         for x in xa..=xb {
@@ -347,12 +435,12 @@ impl Tables {
         Ok(())
     }
 
-    fn recv(&mut self, x: usize, y: usize, color: u32, off: u32, n: u32) -> R<()> {
+    pub(crate) fn recv(&mut self, x: usize, y: usize, color: u32, off: u32, n: u32) -> R<()> {
         self.at(x, y)?.recv.push([color, off, n]);
         Ok(())
     }
 
-    fn send(&mut self, x: usize, y: usize, color: u32, off: u32, n: u32) -> R<()> {
+    pub(crate) fn send(&mut self, x: usize, y: usize, color: u32, off: u32, n: u32) -> R<()> {
         self.at(x, y)?.send.push([color, off, n]);
         Ok(())
     }
@@ -404,8 +492,14 @@ impl Tables {
                 self.recv_row(b, py, r, None)?;
             }
         } else if same && a.x0 == b.x0 && a.y0.abs_diff(b.y0) == ak.py {
+            // (HVC: the rows' columns centred when the unit is wider than tall)
+            let c0 = if self.centred && ak.px >= ak.py {
+                (ak.px - ak.py) / 2
+            } else {
+                0
+            };
             for py in 0..ak.py {
-                let c = a.x0 + py % ak.px;
+                let c = a.x0 + (c0 + py) % ak.px;
                 let cv = C_V[b.idx % 2][usize::from(py >= ak.px)];
                 self.leg(cv, &[(c, a.y0 + py), (c, b.y0 + py)])?;
                 self.send(c, a.y0 + py, cv, 0, ak.hc as u32)?;
@@ -416,6 +510,12 @@ impl Tables {
             }
         } else if a.x0 == b.x0 && b.y0 == a.y0 + ak.py && ak.px <= bk.px {
             self.rechunk_a(a, b, r)?;
+        } else if a.kind == Kind::Grid
+            && b.kind == Kind::Region
+            && a.x0 == b.x0 + bk.px
+            && a.y0 == b.y0
+        {
+            self.rechunk_c(a, b, r)?;
         } else if b.x0 == a.x0 + ak.px
             && b.y0 >= a.y0
             && b.y0 + bk.py <= a.y0 + ak.py
@@ -435,7 +535,7 @@ impl Tables {
     }
 
     /// Dest row g's pieces: (source row, source offset, dest offset, n).
-    fn pieces(a: &Unit, b: &Unit, g: usize) -> Vec<(usize, u32, u32, u32)> {
+    pub(crate) fn pieces(a: &Unit, b: &Unit, g: usize) -> Vec<(usize, u32, u32, u32)> {
         let (lo, hi) = (g * b.k.hc, ((g + 1) * b.k.hc).min(a.k.py * a.k.hc));
         let mut out = Vec::new();
         let mut d = lo;
@@ -453,7 +553,7 @@ impl Tables {
     /// `dest`. Down (A): top first, each adds its own after what it
     /// forwards; up (B): bottom first, each sends its own first.
     #[allow(clippy::too_many_arguments)]
-    fn chain(
+    pub(crate) fn chain(
         &mut self,
         col: usize,
         srcs: &[Piece],
@@ -499,7 +599,7 @@ impl Tables {
     /// A grid above a region: dest row g's pieces chained down column
     /// a.x0 + g mod a.PX, then down to (that column, b's row g), which
     /// multicasts the row.
-    fn rechunk_a(&mut self, a: &Unit, b: &Unit, r: u32) -> R<()> {
+    pub(crate) fn rechunk_a(&mut self, a: &Unit, b: &Unit, r: u32) -> R<()> {
         for g in 0..b.k.py {
             let p = Tables::pieces(a, b, g);
             if p.is_empty() {
@@ -560,9 +660,52 @@ impl Tables {
         Ok(())
     }
 
+    /// Lever D: a grid east of a region, both from the same row. Dest row
+    /// g's pieces chained down grid column a.x0 + g mod a.PX (hops C_A_HOP),
+    /// then on C_C_LEG[g % 2] (or [2]) west along the last source's row into the
+    /// region, to its column b.x0 + b.PX - ceil(b.PY / 2) + g / 2, and down
+    /// to row g, whose PE multicasts the row. A leg's columns increase with
+    /// g within its color and its source rows strictly, so a row's westward
+    /// leg crosses only columns of later rows, whose legs start below it.
+    fn rechunk_c(&mut self, a: &Unit, b: &Unit, r: u32) -> R<()> {
+        let mut prev = [usize::MAX; 3];
+        for g in 0..b.k.py {
+            let p = Tables::pieces(a, b, g);
+            if p.is_empty() {
+                continue;
+            }
+            let col = a.x0 + g % a.k.px;
+            let srcs: Vec<Piece> = p
+                .iter()
+                .map(|&(row, so, d, n)| (a.y0 + row, so, d, n))
+                .collect();
+            let yg = b.y0 + g;
+            let last = srcs[srcs.len() - 1].0;
+            if last > yg {
+                return Err("re-chunk C: a source row below its dest row".into());
+            }
+            let xg = b.x0 + b.k.px - b.k.py.div_ceil(2) + g / 2;
+            let mut pts = vec![(col, last), (xg, last)];
+            if last != yg {
+                pts.push((xg, yg));
+            }
+            let dest = (xg, yg);
+            let k = if prev[g % 2] == last { 2 } else { g % 2 };
+            if prev[k] == last {
+                return Err("re-chunk C: three dest rows' legs leave one row".into());
+            }
+            prev[k] = last;
+            self.chain(col, &srcs, C_A_HOP, C_C_LEG[k], &pts, dest, true)?;
+            self.at(dest.0, dest.1)?.relay = r;
+            self.row_mcast(r, b, g, xg, D_RAMP)?;
+            self.recv_row(b, g, r, Some(xg))?;
+        }
+        Ok(())
+    }
+
     /// Words of a PE's table.
     pub fn rtn(&self) -> usize {
-        7 + 4 * self.rtr + 3 * RT_I + 3 * RT_O
+        7 + 4 * self.rtr + 3 * self.rti + 3 * RT_O
     }
 
     /// Unit `u`'s `rtab`, `PY` x `PX` PEs of [`Tables::rtn`] words (16-bit
@@ -570,14 +713,14 @@ impl Tables {
     /// tx2) x RTR, (color, off, n) x 3 in, (color, off, n) x 3 out]`.
     pub fn table(&self, u: &Unit) -> R<Vec<u32>> {
         let rtn = self.rtn();
-        let (oi, oo) = (7 + 4 * self.rtr, 7 + 4 * self.rtr + 3 * RT_I);
+        let (oi, oo) = (7 + 4 * self.rtr, 7 + 4 * self.rtr + 3 * self.rti);
         let mut t = vec![0u32; u.k.py * u.k.px * rtn];
         for py in 0..u.k.py {
             for px in 0..u.k.px {
                 let e = &self.pe[&(u.x0 + px, u.y0 + py)];
                 let one_color = |v: &[[u32; 3]]| v.iter().all(|p| p[0] == v[0][0]);
                 if e.routes.len() > self.rtr
-                    || e.recv.len() > RT_I
+                    || e.recv.len() > self.rti
                     || e.send.len() > RT_O
                     || !one_color(&e.recv)
                     || !one_color(&e.send)
@@ -637,19 +780,39 @@ impl Tables {
 /// (c_r1_0, c_r1_1, c_r2_0, c_r2_1, c_bc) on X, then on Y, then c_bc's
 /// group broadcast, each `rb[rx] | rb[5 + tx1] | rb[5 + tx2]`.
 pub fn route_words(rb: &[u32], px_n: usize, py_n: usize, gs: usize, gy: usize) -> Vec<u32> {
+    route_words_gx(rb, px_n, py_n, gs, gy, 0)
+}
+
+/// [`route_words`], and with `gx` > 0 (RGX) 6 more a PE: the X axis's
+/// five words in phase-1 groups of `gx`, then log2(gx) (17 a PE).
+pub fn route_words_gx(
+    rb: &[u32],
+    px_n: usize,
+    py_n: usize,
+    gs: usize,
+    gy: usize,
+    gx: usize,
+) -> Vec<u32> {
+    let stride = if gx > 0 { 17 } else { 11 };
     const RAMP: usize = 0;
     const N_: usize = 1;
     const S_: usize = 2;
     const E_: usize = 3;
     const W_: usize = 4;
     let word = |(rx, t1, t2): (usize, usize, usize)| rb[rx] | rb[5 + t1] | rb[5 + t2];
-    let mut out = vec![0u32; py_n * px_n * 11];
+    let mut out = vec![0u32; py_n * px_n * stride];
     for py in 0..py_n {
         for px in 0..px_n {
-            let at = (py * px_n + px) * 11;
-            for (ax, (h, t, idv, alen, ga)) in [(W_, E_, px, px_n, gs), (N_, S_, py, py_n, gy)]
-                .into_iter()
-                .enumerate()
+            let at = (py * px_n + px) * stride;
+            let axes = [
+                (W_, E_, px, px_n, gs),
+                (N_, S_, py, py_n, gy),
+                (W_, E_, px, px_n, gx),
+            ];
+            for (ax, (h, t, idv, alen, ga)) in
+                axes.into_iter()
+                    .enumerate()
+                    .take(if gx > 0 { 3 } else { 2 })
             {
                 let mut cfg = [(0, 0, 0); 5];
                 let r1 = ga / 2;
@@ -695,7 +858,7 @@ pub fn route_words(rb: &[u32], px_n: usize, py_n: usize, gs: usize, gy: usize) -
                     (h, RAMP, t)
                 };
                 for (c, &f) in cfg.iter().enumerate() {
-                    out[at + 5 * ax + c] = word(f);
+                    out[at + if ax == 2 { 11 } else { 5 * ax } + c] = word(f);
                 }
             }
             let (r, r1) = (px % gs, gs / 2);
@@ -713,6 +876,136 @@ pub fn route_words(rb: &[u32], px_n: usize, py_n: usize, gs: usize, gy: usize) -
                 (W_, RAMP, E_)
             };
             out[at + 10] = word(g);
+            if gx > 0 {
+                out[at + 16] = gx.trailing_zeros();
+            }
+        }
+    }
+    out
+}
+
+/// ARF's routes and role on one line of `n` PEs (rows of a column, or columns
+/// of a row) at place `k`: the five colours' (rx, tx1, tx2) with directions
+/// 0 ramp, 1 away from the root, 2 toward it, 3 along the line both ways from
+/// the root (the broadcast); and the role word (see [`route_words_arf`]).
+#[allow(clippy::type_complexity)]
+fn arf_line(n: usize, k: usize, arg: usize) -> ([Option<(usize, usize, usize)>; 5], u32, bool) {
+    const RAMP: usize = 0;
+    const AWY: usize = 1;
+    const TOW: usize = 2;
+    let mut cfg = [None; 5];
+    let root = n / 2;
+    if k == root {
+        // (the root's line ends: AWY = the first half's side, TOW = the second's)
+        cfg[2] = Some((AWY, RAMP, RAMP));
+        cfg[3] = Some((TOW, RAMP, RAMP));
+        cfg[4] = Some((RAMP, AWY, TOW));
+        return (cfg, 1, true);
+    }
+    let first = k < root;
+    let half = usize::from(!first);
+    let d = if first { root - k } else { k - root };
+    let dmax = if first { root } else { n - 1 - root };
+    let nq = dmax.div_ceil(arg);
+    let q = (d - 1) / arg;
+    let kk = d - q * arg;
+    let far = q + 1 == nq;
+    let gsz = if far { dmax - q * arg } else { arg };
+    let (r1, s2) = (d % 2, (q + half) % 2);
+    let r2 = 1 - s2;
+    if kk < gsz {
+        cfg[r1] = Some((AWY, RAMP, RAMP));
+    }
+    if kk > 1 {
+        cfg[1 - r1] = Some((RAMP, TOW, TOW));
+    }
+    if kk == 1 {
+        cfg[2 + s2] = Some((RAMP, TOW, TOW));
+        if !far {
+            cfg[2 + r2] = Some((AWY, RAMP, RAMP));
+        }
+    } else if !far {
+        cfg[2 + r2] = Some((AWY, TOW, TOW));
+    }
+    let edge = k == 0 || k == n - 1;
+    cfg[4] = Some((TOW, RAMP, if edge { RAMP } else { AWY }));
+    let role = (u32::from(far) << 1)
+        | ((r1 as u32) << 2)
+        | ((s2 as u32) << 3)
+        | ((kk as u32) << 4)
+        | ((gsz as u32) << 12);
+    (cfg, role, false)
+}
+
+/// ARF's words a region PE: [`route_words`]' 11 with the Y set replaced by
+/// the streamed-halves routes (docs/cerebras-8b-speed.md 9.5 / 10), then the
+/// PE's Y role: bit 0 the root (row py_n / 2), bit 1 in its half's farthest
+/// group, bit 2 its level-1 input colour c_r1[k % 2], bit 3 its level-2 output
+/// colour c_r2[(q + half) % 2], bits 4..12 its 1-based place in its group
+/// (1: the group's end, next to the root's side), bits 12..20 the group's size
+/// (12 words a PE). `arg`: rows a group, a power of two. `argx` > 0 (ARF 3):
+/// also the X axis's full all-reduces' set and role, the same streamed halves
+/// along the row (root column px_n / 2, groups of `argx` columns): words
+/// 12..17 and 17 (18 words a PE). `seg` (ARF bit 4): the X set (words 0..5)
+/// as streamed halves on each segment of `gs` columns (root at its column
+/// gs / 2, groups of 8) and its role in word 10 (the group broadcast's word).
+#[allow(clippy::too_many_arguments)]
+pub fn route_words_arf(
+    rb: &[u32],
+    px_n: usize,
+    py_n: usize,
+    gs: usize,
+    gy: usize,
+    arg: usize,
+    argx: usize,
+    seg: bool,
+) -> Vec<u32> {
+    const N_: usize = 1;
+    const S_: usize = 2;
+    const E_: usize = 3;
+    const W_: usize = 4;
+    let stride = if argx > 0 { 18 } else { 12 };
+    let base = route_words(rb, px_n, py_n, gs, gy);
+    let mut out = vec![0u32; py_n * px_n * stride];
+    // One line's abstract routes as this PE's route words: `side` maps the
+    // line's directions (1 away, 2 toward; the root: 1 first half, 2 second).
+    let put = |out: &mut [u32],
+               at: usize,
+               n: usize,
+               k: usize,
+               a: usize,
+               (lo, hi): (usize, usize)|
+     -> u32 {
+        let (cfg, role, root) = arf_line(n, k, a);
+        let first = k < n / 2;
+        let dir = |d: usize| match (d, root, first) {
+            (0, _, _) => 0,
+            (1, true, _) => lo,
+            (2, true, _) => hi,
+            (1, false, true) | (2, false, false) => lo,
+            _ => hi,
+        };
+        for (c, f) in cfg.iter().enumerate() {
+            out[at + c] = f.map_or(0, |(rx, t1, t2)| {
+                rb[dir(rx)] | rb[5 + dir(t1)] | rb[5 + dir(t2)]
+            });
+        }
+        if root {
+            out[at + 4] |= rb[5]; // the root's loop-back
+        }
+        role
+    };
+    for py in 0..py_n {
+        for px in 0..px_n {
+            let (at, b) = ((py * px_n + px) * stride, (py * px_n + px) * 11);
+            out[at..at + 11].copy_from_slice(&base[b..b + 11]);
+            out[at + 11] = put(&mut out, at + 5, py_n, py, arg, (N_, S_));
+            if argx > 0 {
+                out[at + 17] = put(&mut out, at + 12, px_n, px, argx, (W_, E_));
+            }
+            if seg {
+                out[at + 10] = put(&mut out, at, gs, px % gs, 8, (W_, E_));
+            }
         }
     }
     out
@@ -727,16 +1020,65 @@ pub fn put_routes(
     rbits: Option<&[u32]>,
 ) -> R<()> {
     let units = u.units(lay);
-    if u.hroute {
+    if let (true, Some(g)) = (u.hroute, lay.gemma12()) {
+        let rb = rbits
+            .filter(|b| b.len() >= 10)
+            .ok_or("HROUTE 1 without the program's rbits")?;
+        super::u4g12::put_rcfg(lay, u, &g, dev, rb)?;
+    } else if u.hroute {
         let rb = rbits
             .filter(|b| b.len() >= 10)
             .ok_or("HROUTE 1 without the program's rbits")?;
         for v in &units {
-            let words = route_words(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v));
-            dev.put("rcfg", rect(v.x0, v.y0, v.k.px, v.k.py), 11, &words)?;
+            // (RGX: the regions' third X route set)
+            let gx = if v.kind == Kind::Grid {
+                0
+            } else {
+                lay.model.rgx
+            };
+            if gx > 0 && (!gx.is_power_of_two() || v.k.px % gx != 0 || gx > v.k.px / 2) {
+                return Err(format!(
+                    "RGX {gx} does not split the region's {} columns",
+                    v.k.px
+                ));
+            }
+            // (ARF: the regions' Y all-reduces as streamed halves, groups of 8)
+            // (GRD bit 1: the grids' too)
+            let arf = (v.kind != Kind::Grid || lay.model.grid & 1 != 0) && lay.model.arf != 0;
+            if arf && gx > 0 {
+                return Err("ARF with RGX: not built".into());
+            }
+            let argx = if lay.model.arf & 2 != 0 { 16 } else { 0 };
+            // (ARY: the Y groups' rows, 8 by default; 0495: 16 is ~15 cycles faster at 208 rows)
+            let ary = if lay.model.ary > 0 { lay.model.ary } else { 8 };
+            // (ARF bit 4: the segment all-reduce as streamed halves on each segment too)
+            let seg = lay.model.arf & 4 != 0;
+            if seg && v.k.px % v.k.gs != 0 {
+                return Err(format!(
+                    "ARF 7: segments of {} do not split {} columns",
+                    v.k.gs, v.k.px
+                ));
+            }
+            let (words, n) = if arf {
+                (
+                    route_words_arf(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), ary, argx, seg),
+                    if argx > 0 { 18 } else { 12 },
+                )
+            } else {
+                (
+                    route_words_gx(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), gx),
+                    if gx > 0 { 17 } else { 11 },
+                )
+            };
+            dev.put("rcfg", rect(v.x0, v.y0, v.k.px, v.k.py), n, &words)?;
         }
     }
-    let mut tables = Tables::new(units.clone(), lay.paged().map_or(1, |s| s.lanes), u.rtr)?;
+    let mut tables = Tables::new_with(
+        units.clone(),
+        lay.paged().map_or(1, |s| s.lanes),
+        u.rtr,
+        lay.model.hvc,
+    )?;
     tables.pipe = lay.mmax().is_some();
     for v in &units {
         dev.put16(
@@ -755,10 +1097,13 @@ pub(crate) fn place_layers(
     lay: &ProgramSpec,
     u: &Units,
     ckpt: &Ckpt,
-    rope_theta: f64,
+    rope: &super::wafer::Rotary,
     dev: &mut dyn Device,
 ) -> R<()> {
-    let inv_freq = inv_freq(rope_theta, lay.gs() * lay.dc());
+    if let Some(g) = lay.gemma12() {
+        return super::u4g12::place_layers(lay, u, &g, ckpt, dev);
+    }
+    let inv_freq = rope.inv_freq(lay.gs() * lay.dc())?;
     let rope = if u.rot8 {
         Rope {
             units: &[512, 64, 8, 1],
@@ -775,7 +1120,18 @@ pub(crate) fn place_layers(
     if !u.nolayer {
         for v in u.units(lay) {
             let layers: Vec<usize> = v.layers.clone().collect();
-            super::serve8b::unit(lay, ckpt, v.k, &layers, (v.x0, v.y0), &rope, false, dev)?;
+            let qkn = (v.kind == Kind::Grid && lay.model.grid & 4 == 0) || lay.model.mem & 2 == 0;
+            super::serve8b::unit(
+                lay,
+                ckpt,
+                v.k,
+                &layers,
+                (v.x0, v.y0),
+                &rope,
+                false,
+                qkn,
+                dev,
+            )?;
         }
     }
     Ok(())
@@ -784,8 +1140,107 @@ pub(crate) fn place_layers(
 /// `copy_kv`'s whole pages by the host: for every unit, the source and
 /// destination rows' `kc`/`vc` read, each of its layers' block patched
 /// (block b of layer l at `1 + l NB Dc PS + b Dc PS`), the destination row
-/// written back. Only between launches.
+/// written back. Only between launches. A run of pairs `(s + i, d + i)`
+/// whose rows do not wrap (one block each side: an HV build's PIE page is
+/// 16 kernel pages on 16 consecutive rows) moves as one read of its source
+/// rows, one of its destination rows and one write: three row-rect memcpys
+/// a unit and array instead of three a kernel page. (HV builds, PS 1;
+/// other page sizes copy a pair at a time.)
 pub fn copy_pages(
+    lay: &ProgramSpec,
+    u: &Units,
+    rt: &mut dyn Device,
+    pairs: &[(u32, u32)],
+) -> R<()> {
+    let shape = lay
+        .paged()
+        .ok_or("serve8b_region without its paged shape")?;
+    if shape.page_size != 1 {
+        // (pages of PIE's size: a pair at a time, the pinned protocol)
+        return copy_pages_each(lay, u, rt, pairs);
+    }
+    let e = |e: crate::sdk::Error| e.to_string();
+    let units = u.units(lay);
+    if let Some(&(src, dst)) = pairs
+        .iter()
+        .find(|&&(s, d)| s as usize >= shape.pages() || d as usize >= shape.pages())
+    {
+        return Err(format!(
+            "page copy {src} -> {dst} outside a pool of {}",
+            shape.pages()
+        ));
+    }
+    let pairs: Vec<(usize, usize)> = pairs
+        .iter()
+        .filter(|&&(s, d)| s != d)
+        .map(|&(s, d)| (s as usize, d as usize))
+        .collect();
+    for v in &units {
+        let p = v.k.py;
+        let n = shape.page_size * v.k.dc;
+        let kcn = shape.blocks * n;
+        let len = v.nl() * kcn + 1;
+        let rows = |r: usize, k: usize| rect(v.x0, v.y0 + r, v.k.px, k);
+        let mut i = 0;
+        while i < pairs.len() {
+            let (s0, d0) = pairs[i];
+            let (rs, bs, rd, bd) = (s0 % p, s0 / p, d0 % p, d0 / p);
+            let mut k = 1;
+            while i + k < pairs.len()
+                && pairs[i + k] == (s0 + k, d0 + k)
+                && rs + k < p
+                && rd + k < p
+            {
+                k += 1;
+            }
+            // Row ranges that overlap without being the same: a pair at a time.
+            if rs != rd && rs.max(rd) < rs.min(rd) + k {
+                k = 1;
+            }
+            for sym in ["kc", "vc"] {
+                let mut a = vec![0u32; v.k.px * k * len];
+                rt.memcpy_d2h(
+                    sym,
+                    &mut a,
+                    rows(rs, k),
+                    len,
+                    Order::RowMajor,
+                    DataType::Bits16,
+                )
+                .map_err(e)?;
+                let mut d = if rd == rs {
+                    a.clone()
+                } else {
+                    let mut d = vec![0u32; v.k.px * k * len];
+                    rt.memcpy_d2h(
+                        sym,
+                        &mut d,
+                        rows(rd, k),
+                        len,
+                        Order::RowMajor,
+                        DataType::Bits16,
+                    )
+                    .map_err(e)?;
+                    d
+                };
+                for (s, t) in a.chunks_exact(len).zip(d.chunks_exact_mut(len)) {
+                    for l in 0..v.nl() {
+                        let o = 1 + l * kcn;
+                        t[o + bd * n..o + (bd + 1) * n]
+                            .copy_from_slice(&s[o + bs * n..o + (bs + 1) * n]);
+                    }
+                }
+                rt.memcpy_h2d(sym, &d, rows(rd, k), len, Order::RowMajor, DataType::Bits16)
+                    .map_err(e)?;
+            }
+            i += k;
+        }
+    }
+    Ok(())
+}
+
+/// [`copy_pages`] a pair at a time (every unit's rows per pair).
+fn copy_pages_each(
     lay: &ProgramSpec,
     u: &Units,
     rt: &mut dyn Device,
@@ -1228,6 +1683,208 @@ mod tests {
     }
 
     /// The VM's per-fire control: bit lane CAP + iteration, every VM row.
+    /// RGX's third route set is the X axis's at groups of RGX, its last
+    /// word log2(RGX); the first 11 words a PE are as without it.
+    #[test]
+    fn rgx_route_words_add_the_x_axis_at_its_group() {
+        let rb: Vec<u32> = (0..10).map(|i| 1u32 << i).collect();
+        let (px, py) = (256, 208);
+        let base = route_words(&rb, px, py, 32, 16);
+        let g16 = route_words(&rb, px, py, 16, 16);
+        let gx = route_words_gx(&rb, px, py, 32, 16, 16);
+        assert_eq!(gx.len(), px * py * 17);
+        for pe in 0..px * py {
+            assert_eq!(gx[pe * 17..pe * 17 + 11], base[pe * 11..pe * 11 + 11]);
+            assert_eq!(gx[pe * 17 + 11..pe * 17 + 16], g16[pe * 11..pe * 11 + 5]);
+            assert_eq!(gx[pe * 17 + 16], 4);
+        }
+    }
+
+    /// One line of ARF words, run as the kernel's arf_ar runs them: every
+    /// stream lands on the queue its PE's role reads, the root's sum counts
+    /// every PE once, and the broadcast reaches every PE once. `word(p, c)`:
+    /// PE p's colour c (0..5) word; `(lo, hi)`: the line's directions toward
+    /// p - 1 and p + 1 (1 north / 2 south, or 4 west / 3 east).
+    fn check_arf_line(
+        n: usize,
+        word: &dyn Fn(usize, usize) -> u32,
+        role: &dyn Fn(usize) -> u32,
+        (lo, hi): (usize, usize),
+    ) {
+        // Where a stream sent by p on colour c lands: every PE whose router
+        // passes it to its ramp.
+        let lands = |p: usize, c: usize| -> Vec<usize> {
+            assert_ne!(word(p, c) & 1, 0, "PE {p} colour {c}: not from its ramp");
+            let mut out = vec![];
+            let mut todo = vec![(p, word(p, c))];
+            while let Some((at, wd)) = todo.pop() {
+                if wd & (1 << 5) != 0 && at != p || (at == p && wd & (1 << 5) != 0 && c == 4) {
+                    out.push(at);
+                }
+                for (d, from) in [(lo, hi), (hi, lo)] {
+                    if wd & (1 << (5 + d)) != 0 {
+                        let q = if d == lo { at - 1 } else { at + 1 };
+                        assert_ne!(
+                            word(q, c) & (1 << from),
+                            0,
+                            "PE {q} colour {c}: not from {from}"
+                        );
+                        todo.push((q, word(q, c)));
+                    }
+                }
+            }
+            out
+        };
+        // Each PE's inputs (colour) and output colour, as arf_ar reads them.
+        let root = n / 2;
+        let mut ins: Vec<Vec<usize>> = vec![vec![]; n];
+        let mut outc = vec![0usize; n];
+        for p in 0..n {
+            let r = role(p);
+            let (r1, s2) = (((r >> 2) & 1) as usize, ((r >> 3) & 1) as usize);
+            let (kk, gs) = ((r >> 4) & 0xff, (r >> 12) & 0xff);
+            if r & 1 != 0 {
+                assert_eq!(p, root);
+                ins[p] = vec![2, 3];
+                outc[p] = 4;
+            } else if kk > 1 {
+                ins[p] = if kk < gs { vec![r1] } else { vec![] };
+                outc[p] = 1 - r1;
+            } else if r & 2 != 0 {
+                ins[p] = if gs > 1 { vec![r1] } else { vec![] };
+                outc[p] = 2 + s2;
+            } else {
+                ins[p] = vec![r1, 3 - s2];
+                outc[p] = 2 + s2;
+            }
+        }
+        // Dataflow: a PE's sum (PEs counted) once all its inputs landed.
+        let mut sum: Vec<Option<Vec<u32>>> = vec![None; n];
+        let mut got: Vec<Vec<(usize, Vec<u32>)>> = vec![vec![]; n];
+        for _ in 0..n + 1 {
+            for p in 0..n {
+                if sum[p].is_some() || got[p].len() < ins[p].len() {
+                    continue;
+                }
+                let mut v = vec![0u32; n];
+                v[p] += 1;
+                for (_, g) in &got[p] {
+                    for (a, b) in v.iter_mut().zip(g) {
+                        *a += b;
+                    }
+                }
+                if p != root {
+                    let to = lands(p, outc[p]);
+                    assert_eq!(to.len(), 1, "PE {p}'s stream lands on {to:?}");
+                    assert!(
+                        ins[to[0]].contains(&outc[p]),
+                        "PE {p} -> {}: colour {}",
+                        to[0],
+                        outc[p]
+                    );
+                    assert!(
+                        got[to[0]].iter().all(|(c, _)| *c != outc[p]),
+                        "two streams on one queue"
+                    );
+                    got[to[0]].push((outc[p], v.clone()));
+                }
+                sum[p] = Some(v);
+            }
+        }
+        assert_eq!(
+            sum[root].as_deref(),
+            Some(&vec![1u32; n][..]),
+            "line of {n}"
+        );
+        let mut bc = lands(root, 4);
+        bc.sort_unstable();
+        assert_eq!(bc, (0..n).collect::<Vec<_>>(), "line of {n}: the broadcast");
+    }
+
+    /// ARF's Y words (and ARF 3's X words), run on every line as the kernel's
+    /// arf_ar runs them; the other words are route_words' own.
+    #[test]
+    fn arf_route_words_reduce_every_row_once() {
+        let rb: Vec<u32> = (0..10).map(|i| 1u32 << i).collect();
+        // (ARY: Y groups of 8 or 16 rows)
+        for (argx, ary, seg) in [
+            (0, 8, false),
+            (16, 8, false),
+            (16, 16, false),
+            (16, 8, true),
+        ] {
+            for (py_n, px_n) in [
+                (208, 2),
+                (24, 1),
+                (17, 1),
+                (9, 1),
+                (3, 1),
+                (5, 256),
+                (4, 33),
+                (3, 17),
+                (3, 3),
+                (152, 128),
+            ] {
+                if argx == 0 && px_n > 2 {
+                    continue;
+                }
+                let st = if argx > 0 { 18 } else { 12 };
+                let (px_n, py_n): (usize, usize) = (px_n, py_n);
+                let gsx = 32.min(px_n.next_power_of_two());
+                if seg && (px_n % gsx != 0 || gsx < 3) {
+                    continue;
+                }
+                let w = route_words_arf(
+                    &rb,
+                    px_n,
+                    py_n,
+                    gsx,
+                    16.min(py_n.next_power_of_two()),
+                    ary,
+                    argx,
+                    seg,
+                );
+                let base = route_words(
+                    &rb,
+                    px_n,
+                    py_n,
+                    32.min(px_n.next_power_of_two()),
+                    16.min(py_n.next_power_of_two()),
+                );
+                assert_eq!(w.len(), px_n * py_n * st);
+                for pe in 0..px_n * py_n {
+                    if !seg {
+                        assert_eq!(w[pe * st..pe * st + 5], base[pe * 11..pe * 11 + 5], "X set");
+                        assert_eq!(w[pe * st + 10], base[pe * 11 + 10], "group broadcast");
+                    }
+                }
+                // (ARF bit 4: every segment of gsx columns a line of its own)
+                if seg {
+                    for py in 0..py_n {
+                        for s0 in (0..px_n).step_by(gsx) {
+                            let word = |p: usize, c: usize| w[(py * px_n + s0 + p) * st + c];
+                            let role = |p: usize| w[(py * px_n + s0 + p) * st + 10];
+                            check_arf_line(gsx, &word, &role, (4, 3));
+                        }
+                    }
+                }
+                for px in 0..px_n {
+                    let word = |p: usize, c: usize| w[(p * px_n + px) * st + 5 + c];
+                    let role = |p: usize| w[(p * px_n + px) * st + 11];
+                    check_arf_line(py_n, &word, &role, (1, 2));
+                }
+                // (a line of 2 has one half: ARF needs >= 3 PEs; regions are 256 x 208)
+                if argx > 0 && px_n >= 3 {
+                    for py in 0..py_n {
+                        let word = |p: usize, c: usize| w[(py * px_n + p) * st + 12 + c];
+                        let role = |p: usize| w[(py * px_n + p) * st + 17];
+                        check_arf_line(px_n, &word, &role, (4, 3));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn vmctl_marks_the_skipped_turns() {
         let params = "PX:8,PY:16,Hc:3,Dc:8,Gs:8,Ic:24,RPX:16,RPY:24,RHc:2,RDc:4,RGs:16,RIc:12,RNL:2,RGY:8,RC:2,RR:2,\
@@ -1252,6 +1909,223 @@ mod tests {
                 .unwrap_err()
                 .contains("lanes")
         );
+    }
+
+    /// Lever D (`YD`): Llama 3.1 8B as layer 0's grid, 10 regions of
+    /// 256 x 208 (30 layers) and the last grid at (512, 624).
+    /// The batched host page copy moves what a pair at a time did: an HV
+    /// build's PIE pages (16 kernel pages on consecutive rows each), one
+    /// whose rows meet its source's (a pair at a time), on every unit.
+    #[test]
+    fn page_copies_move_runs_of_rows_as_pairs_did() {
+        let p = "PX:128,PY:152,Hc:27,Dc:8,Gs:16,Ic:112,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:56,\
+        RNL:3,RGY:16,GY:8,RC:2,RR:5,NCOL:1,YD:624,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
+        PROF:0,TIME:1,HROUTE:1,ROT8:1,QKN:0,EPS:925353388,NOLAYER:0,HEADMODE:2,HH:864,Vr:150,Gx:4,Gy:24,\
+        vocab:128256,PASSES:3,MODE:2,OVL:0,VMC:1,CAP:128,iters:1,B:1,NP:1,SPD:1,LSE:1";
+        let lay = lay_of(p);
+        let Layers::Units { units: u, .. } = &lay.layers else {
+            panic!("not serve8b_region")
+        };
+        fn fill(sym: &str, x: i32, y: i32, i: usize) -> u32 {
+            (x as u32 * 7919 + y as u32 * 104_729 + i as u32 * 31 + u32::from(sym == "vc") * 17)
+                & 0xffff
+        }
+        let rec = crate::spatial::device::Recorder::default().with_fill(fill);
+        let mut dev = rec.clone();
+        // PIE pages 3 -> 40 and 12 -> 13 (16 kernel pages each), then kernel
+        // pages 5 -> 9 (rows 5 and 9: they meet within a run of 5).
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        for (s, d) in [(3u32, 40u32), (12, 13)] {
+            pairs.extend((0..16).map(|o| (s * 16 + o, d * 16 + o)));
+        }
+        pairs.extend((0..5).map(|o| (5 + o, 9 + o)));
+        copy_pages(&lay, u, &mut dev, &pairs).unwrap();
+        let shape = lay.paged().unwrap();
+        for v in u.units(&lay) {
+            let pr = v.k.py;
+            let n = shape.page_size * v.k.dc;
+            let kcn = shape.blocks * n;
+            let len = v.nl() * kcn + 1;
+            for sym in ["kc", "vc"] {
+                for x in [v.x0, v.x0 + v.k.px - 1] {
+                    // Expected rows, a pair at a time from the fill.
+                    let mut want: std::collections::HashMap<usize, Vec<u32>> = Default::default();
+                    let row = |want: &std::collections::HashMap<usize, Vec<u32>>, r: usize| {
+                        want.get(&r).cloned().unwrap_or_else(|| {
+                            (0..len)
+                                .map(|i| fill(sym, x as i32, (v.y0 + r) as i32, i))
+                                .collect()
+                        })
+                    };
+                    for &(s, d) in &pairs {
+                        let (s, d) = (s as usize, d as usize);
+                        let (rs, bs, rd, bd) = (s % pr, s / pr, d % pr, d / pr);
+                        let a = row(&want, rs);
+                        let mut t = row(&want, rd);
+                        for l in 0..v.nl() {
+                            let o = 1 + l * kcn;
+                            t[o + bd * n..o + (bd + 1) * n]
+                                .copy_from_slice(&a[o + bs * n..o + (bs + 1) * n]);
+                        }
+                        want.insert(rd, t);
+                    }
+                    for (r, w) in &want {
+                        let got = rec
+                            .memory(sym, x as i32, (v.y0 + r) as i32)
+                            .expect("written");
+                        assert_eq!(&got, w, "unit at ({}, {}) {sym} x {x} row {r}", v.x0, v.y0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// XAC's colours (0, 1, 2, 15) and the park colour 16 route through no
+    /// region PE (codegen.rs `xac`), nor do the collectives' 5-10.
+    #[test]
+    fn xac_colours_are_free_on_regions() {
+        let p = "PX:128,PY:152,Hc:27,Dc:8,Gs:16,Ic:112,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:56,\
+        RNL:3,RGY:16,GY:8,RC:2,RR:5,NCOL:1,YD:624,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
+        PROF:0,TIME:1,HROUTE:1,ROT8:1,QKN:0,EPS:925353388,NOLAYER:0,HEADMODE:2,HH:864,Vr:150,Gx:4,Gy:24,\
+        vocab:128256,PASSES:3,MODE:2,OVL:0,VMC:1,CAP:128,iters:1,B:1,NP:1,SPD:1,LSE:1";
+        // (and Qwen3-8B's: PY 144, NCOL 5 column grids from YD 208)
+        let q = p
+            .replace(
+                "PY:152,Hc:27,Dc:8,Gs:16,Ic:112",
+                "PY:144,Hc:29,Dc:8,Gs:16,Ic:96",
+            )
+            .replace("RIc:56", "RIc:48")
+            .replace("NCOL:1,YD:624", "NCOL:5,YD:208")
+            .replace("QKN:0,EPS:925353388,", "")
+            .replace("HH:864,Vr:150,Gx:4", "HH:1152,Vr:132,Gx:8")
+            .replace("vocab:128256", "vocab:151936")
+            .replace("CAP:128", "CAP:64");
+        for p in [p.to_string(), q] {
+            let lay = lay_of(&p);
+            let Layers::Units { units: u, .. } = lay.layers else {
+                panic!("not serve8b_region")
+            };
+            let units = u.units(&lay);
+            let t = Tables::new(units.clone(), 1, u.rtr).unwrap();
+            for v in units.iter().filter(|v| v.kind == Kind::Region) {
+                for py in 0..v.k.py {
+                    for px in 0..v.k.px {
+                        let e = &t.pe[&(v.x0 + px, v.y0 + py)];
+                        let mut cs: Vec<u32> = e.routes.keys().copied().collect();
+                        cs.extend(e.recv.iter().chain(&e.send).map(|r| r[0]));
+                        cs.extend([e.relay, e.fwd_in]);
+                        assert!(
+                            cs.iter()
+                                .all(|c| ![0, 1, 2, 15, 16].contains(c) && !(5..=10).contains(c)),
+                            "{cs:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lever_d_units_and_tables() {
+        let p = "PX:128,PY:152,Hc:27,Dc:8,Gs:16,Ic:112,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:56,\
+        RNL:3,RGY:16,GY:8,RC:2,RR:5,NCOL:1,YD:624,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
+        PROF:0,TIME:1,HROUTE:1,ROT8:1,QKN:0,EPS:925353388,NOLAYER:0,HEADMODE:2,HH:864,Vr:150,Gx:4,Gy:24,\
+        vocab:128256,PASSES:3,MODE:2,OVL:0,VMC:1,CAP:128,iters:1,B:1,NP:1,SPD:1,LSE:1";
+        let lay = lay_of(p);
+        let Layers::Units { units: u, .. } = lay.layers else {
+            panic!("not serve8b_region")
+        };
+        let units = u.units(&lay);
+        assert_eq!((units.len(), lay.layers(), lay.head_x()), (12, 32, 640));
+        let at: Vec<_> = units.iter().map(|v| (v.x0, v.y0, v.layers.start)).collect();
+        assert_eq!(
+            at,
+            vec![
+                (512, 0, 0),
+                (256, 0, 1),
+                (0, 0, 4),
+                (0, 208, 7),
+                (256, 208, 10),
+                (256, 416, 13),
+                (0, 416, 16),
+                (0, 624, 19),
+                (0, 832, 22),
+                (256, 832, 25),
+                (256, 624, 28),
+                (512, 624, 31)
+            ]
+        );
+        assert_eq!(lay.rectangle().1, 1040);
+        let t = Tables::new(units.clone(), 1, u.rtr).unwrap();
+        for v in &units {
+            assert_eq!(t.table(v).unwrap().len(), v.k.px * v.k.py * t.rtn());
+        }
+        // (HVC: the vertical handoffs on centred columns build too, every route
+        // conflict-free, and differ from the default only there)
+        let tc = Tables::new_with(units.clone(), 1, u.rtr, true).unwrap();
+        let mut changed = 0;
+        for v in &units {
+            let (a, b) = (t.table(v).unwrap(), tc.table(v).unwrap());
+            assert_eq!(a.len(), b.len());
+            changed += usize::from(a != b);
+        }
+        assert!(changed >= 5, "{changed} units' tables changed");
+        let bad = p.replace("YD:624", "YD:432");
+        assert!(
+            ProgramSpec::of_pairs(
+                &bad.split(',')
+                    .map(|q| q
+                        .split_once(':')
+                        .map(|(k, v)| (k, v.parse().unwrap()))
+                        .unwrap())
+                    .collect::<Vec<_>>()
+            )
+            .is_err()
+        );
+    }
+
+    /// Lever D for Qwen3-8B (36 layers): layer 0's grid, 10 regions of
+    /// 256 x 208 by the U (down column 0, back up column 1 to (1, 1)) and
+    /// the last 5 grids down the column from (512, 208).
+    #[test]
+    fn lever_d_u_units_and_tables() {
+        let p = "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:48,RNL:3,RGY:16,\
+        RC:2,RR:5,NCOL:5,YD:208,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,PROF:0,TIME:0,\
+        HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,PASSES:3,MODE:2,OVL:0,\
+        VMC:1,CAP:64,iters:1,B:1,NP:1,SPD:1,LSE:1";
+        let lay = lay_of(p);
+        let Layers::Units { units: u, .. } = lay.layers else {
+            panic!("not serve8b_region")
+        };
+        let units = u.units(&lay);
+        assert_eq!((units.len(), lay.layers()), (16, 36));
+        let at: Vec<_> = units.iter().map(|v| (v.x0, v.y0, v.layers.start)).collect();
+        assert_eq!(
+            at,
+            vec![
+                (512, 0, 0),
+                (256, 0, 1),
+                (0, 0, 4),
+                (0, 208, 7),
+                (0, 416, 10),
+                (0, 624, 13),
+                (0, 832, 16),
+                (256, 832, 19),
+                (256, 624, 22),
+                (256, 416, 25),
+                (256, 208, 28),
+                (512, 208, 31),
+                (512, 352, 32),
+                (512, 496, 33),
+                (512, 640, 34),
+                (512, 784, 35)
+            ]
+        );
+        assert_eq!(lay.rectangle().1, 1153);
+        let t = Tables::new(units.clone(), 1, u.rtr).unwrap();
+        for v in &units {
+            assert_eq!(t.table(v).unwrap().len(), v.k.px * v.k.py * t.rtn());
+        }
     }
 
     #[test]

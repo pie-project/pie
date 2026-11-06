@@ -156,6 +156,84 @@ pub struct ServeConfig {
     /// regions) instead of serve8b's strips; with the `pipeline` goal, as
     /// serve8b_region_pipe's ring (`mmax` micro-batches).
     pub region: bool,
+    /// serve8b_region(_pipe): the units' op cuts (`SPD` 1, codegen's
+    /// `Variant::speed`; cerebras-8b-speed).
+    pub speed: bool,
+    /// serve8b_region(_pipe), with `speed`: the softmax against a carried
+    /// log-sum-exp, no max all-reduce (`LSE` 1, codegen's `Variant::lse`).
+    pub lse: bool,
+    /// serve8b_region(_pipe), with `lse`: the second op cuts (`OP2` 1,
+    /// codegen's `Variant::ops2`).
+    pub ops2: bool,
+    /// serve8b_region(_pipe), with `ops2` at B 1: q, k and v as one matvec
+    /// (`QKV1` 1, codegen's `Variant::qkv1`).
+    pub qkv1: bool,
+    /// serve8b_region(_pipe), with `ops2`: the regions' Y all-reduces with FIFO
+    /// dual-input merges (`ARF` 1, codegen's `Variant::arf`).
+    pub arf: bool,
+    /// With `arf`: also the regions' X full all-reduces (`ARF` 3).
+    pub arfx: bool,
+    /// serve8b_region(_pipe), with `ops2`: an IEEE f16 build (`F16` 1);
+    /// `f16acc` also the regions' f16-accumulating matvecs (`F16` 2).
+    pub f16: bool,
+    pub f16acc: bool,
+    /// With `f16acc`: the grids' weight matvecs accumulate in f16 too (`F16` 3).
+    pub f16accg: bool,
+    /// serve8b_region(_pipe), with `arf`: the region kernel's bit-exact code
+    /// cuts (`MEM` 1, codegen's `Variant::mem`).
+    pub mem: bool,
+    /// serve8b_region(_pipe), with `ops2`: the regions' RoPE tables once a
+    /// pass (`OP3` 1, codegen's `Variant::op3`).
+    pub op3: bool,
+    /// serve8b_region(_pipe), with `arf`, `op3` or `mem`: the grids take those
+    /// levers too (`GRD`, codegen's `Variant::grid`).
+    pub grid_levers: bool,
+    /// With `f16acc`: the regions' f16 probability copy clamped with 0515's redo
+    /// window (`F16CL` 1, codegen's `Variant::f16cl`; Llama: 0526).
+    pub f16_clamp: bool,
+    /// With `arfx`: the regions' XA all-reduces on their own colours (`XAC` 1,
+    /// codegen's `Variant::xac`).
+    pub xac: bool,
+    /// With `qkv1`, `ops2` and `f16acc` (B 1): the units' op cuts (`TRM`,
+    /// codegen's `Variant::trim`: 1 the exact cuts, 2 x's sums of squares by
+    /// a scalar loop, 8 exp at degree 4; 4 the grids too with `f16accg`).
+    pub trim: bool,
+    /// With `arfx` and `xac`: the segment all-reduce as streamed halves too
+    /// (`ARF` 7, codegen's arfs_ops; the host's X set as segment lines).
+    pub arfs: bool,
+    /// With `arf`: the ARF Y streamed halves in groups of 16 rows (`ARY` 16;
+    /// the host's route words).
+    pub ary16: bool,
+    /// serve8b_region(_pipe): vertical handoffs on centred columns (`HVC` 1;
+    /// the host's tables).
+    pub hvc: bool,
+    /// With `trim`, models without q/k norms: the regions' MLP act in f16 on
+    /// every PE of a column from the gate-up all-reduce, no act all-reduce
+    /// (`TRM` bit 1024, with 4096; not 8192: the grids lose with it, 0538; inexact,
+    /// so not for the q/k-norm models' exact bits).
+    pub silu16: bool,
+    /// With `trim`, models without q/k norms: the regions' x g in f16, its
+    /// f16 gammas made in place on the first pass (`TRM` bits 512 + 4096), and
+    /// the grids' (8192, when they take the cuts); inexact.
+    pub xg16: bool,
+    /// With `trim`: the head's column argmax in one streamed round of packed
+    /// keys, the exact pair chains only on a tie (`TRM` bit 16384; exact).
+    pub head_pack: bool,
+    /// With `silu16`: its two scales in f16 after the conversion (`TRM` 2048;
+    /// inexact; 0540 sp540_t27 2,033.3 tok/s, golden, 0 mismatches).
+    pub silu16h: bool,
+    /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
+    /// exact three-part x (`MODE` 0): a third of the head's matvec.
+    pub head_one_pass: bool,
+    /// serve8b_region, with `lse`: the attention vectorized over a kv head's
+    /// query heads (HV): one-position kernel pages (`PS` 1, `NB` the plan's
+    /// blocks x PIE's page size, `E` 5). PIE keeps its page size; the
+    /// engine expands each PIE page into its kernel pages
+    /// ([`super::wafer::Wafer::page_as`]).
+    pub hv: bool,
+    /// serve8b_region: lever D (`YD`), every layer but the first and last
+    /// in regions of `RPY` 208 (no band; the last grid at (XC, YD)).
+    pub lever_d: bool,
     pub pins: Pins,
 }
 
@@ -171,6 +249,31 @@ impl ServeConfig {
             spec: None,
             smp: false,
             region: false,
+            speed: false,
+            lse: false,
+            ops2: false,
+            qkv1: false,
+            arf: false,
+            arfx: false,
+            f16: false,
+            f16acc: false,
+            f16accg: false,
+            mem: false,
+            op3: false,
+            grid_levers: false,
+            f16_clamp: false,
+            xac: false,
+            trim: false,
+            arfs: false,
+            ary16: false,
+            hvc: false,
+            silu16: false,
+            xg16: false,
+            head_pack: false,
+            silu16h: false,
+            head_one_pass: false,
+            hv: false,
+            lever_d: false,
             pins: Pins::default(),
         }
     }
@@ -181,7 +284,7 @@ impl ServeConfig {
     /// directory is configured. Keys (all optional):
     /// - the plan's goals: `lanes`, `grid_lanes`, `page_size` (default
     ///   `page_size`, PIE's), `blocks`, `max_blocks`, `mlp_chunk`, `cap`,
-    ///   `pipeline`, `host_copy`;
+    ///   `pipeline`, `host_copy`, `rows` (a paged8b grid's PY);
     /// - serve2d_pipe: `mmax`, `hb`, `hlm`, `smp`, and `[spec]` (`history`,
     ///   `table`, `out`);
     /// - `region`: a paged8b (8B) plan as serve8b_region's units;
@@ -234,6 +337,32 @@ impl ServeConfig {
             "vm_b",
             "pins",
             "region",
+            "rows",
+            "speed",
+            "lse",
+            "ops2",
+            "qkv1",
+            "arf",
+            "arfx",
+            "f16",
+            "f16acc",
+            "f16accg",
+            "mem",
+            "op3",
+            "grid_levers",
+            "f16_clamp",
+            "xac",
+            "trim",
+            "arfs",
+            "ary16",
+            "hvc",
+            "silu16",
+            "xg16",
+            "head_pack",
+            "silu16h",
+            "head_one_pass",
+            "hv",
+            "lever_d",
         ];
         if let Some(k) = t.keys().find(|k| !known.contains(&k.as_str())) {
             return Err(format!("[cerebras.spatial.serve]: unknown key `{k}`"));
@@ -250,6 +379,7 @@ impl ServeConfig {
             cap: int(t, "cap")?,
             pipeline: flag(t, "pipeline")?,
             host_copy: flag(t, "host_copy")?,
+            rows: int(t, "rows")?,
         };
         let spec = match t.get("spec") {
             None => None,
@@ -320,6 +450,31 @@ impl ServeConfig {
             spec,
             smp: flag(t, "smp")?,
             region: flag(t, "region")?,
+            speed: flag(t, "speed")?,
+            lse: flag(t, "lse")?,
+            ops2: flag(t, "ops2")?,
+            qkv1: flag(t, "qkv1")?,
+            arf: flag(t, "arf")?,
+            arfx: flag(t, "arfx")?,
+            f16: flag(t, "f16")?,
+            f16acc: flag(t, "f16acc")?,
+            f16accg: flag(t, "f16accg")?,
+            mem: flag(t, "mem")?,
+            op3: flag(t, "op3")?,
+            grid_levers: flag(t, "grid_levers")?,
+            f16_clamp: flag(t, "f16_clamp")?,
+            xac: flag(t, "xac")?,
+            trim: flag(t, "trim")?,
+            arfs: flag(t, "arfs")?,
+            ary16: flag(t, "ary16")?,
+            hvc: flag(t, "hvc")?,
+            silu16: flag(t, "silu16")?,
+            xg16: flag(t, "xg16")?,
+            head_pack: flag(t, "head_pack")?,
+            silu16h: flag(t, "silu16h")?,
+            head_one_pass: flag(t, "head_one_pass")?,
+            hv: flag(t, "hv")?,
+            lever_d: flag(t, "lever_d")?,
             pins: match t.get("pins") {
                 None => Pins::default(),
                 Some(v) => {
@@ -345,6 +500,11 @@ pub fn build_for(
     target: crate::sdk::Target,
     system: bool,
 ) -> R<PathBuf> {
+    if spec.moe.is_some() {
+        let program = gptoss_program(spec, cfg)?;
+        tracing::info!(design = program.design.name(), model = %spec.name, "spatial build: the plan's program");
+        return compile(&program, target, system);
+    }
     if spec.hybrid.is_some() {
         let program = q35_program(spec, cfg)?;
         tracing::info!(design = program.design.name(), model = %spec.name, "spatial build: the plan's program");
@@ -355,6 +515,44 @@ pub fn build_for(
     let program = program(&plan, cfg)?;
     tracing::info!(design = program.design.name(), model = %spec.name, "spatial build: the plan's program");
     compile(&program, target, system)
+}
+
+/// The serve_g4 program PIE builds for Gemma 4 `spec` under `cfg`: its
+/// plan's parameters, the compile (cached).
+pub fn build_g4(
+    spec: &super::model_g4::G4Spec,
+    cfg: &ServeConfig,
+    target: crate::sdk::Target,
+    system: bool,
+) -> R<PathBuf> {
+    let program = g4_program(spec, cfg)?;
+    tracing::info!(design = program.design.name(), model = %spec.name, "spatial build: the plan's program");
+    compile(&program, target, system)
+}
+
+/// Gemma 4's serve_g4 program: its plan's parameters, as given (the
+/// config's pins and VM images are serve2d's and serve8b's).
+pub fn g4_program(spec: &super::model_g4::G4Spec, cfg: &ServeConfig) -> R<ProgramSpec> {
+    let plan = super::plan_g4::G4Plan::derive(spec, super::plan::WaferDims::CS3, cfg.goals)
+        .map_err(|e| e.to_string())?;
+    let Some(params) = plan.params() else {
+        return Err(format!(
+            "{}: no serve_g4 program places the model: {}",
+            spec.name,
+            plan.blockers.join("; ")
+        ));
+    };
+    if cfg.region || cfg.vm.is_some() || cfg.pins.gw.is_some() {
+        return Err(format!(
+            "{}: serve_g4 takes no `region`, VM image or pins",
+            spec.name
+        ));
+    }
+    let params: super::program::Params = params
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    ProgramSpec::from_params(Design::ServeG4, &params)
 }
 
 /// A hybrid model's serve_q35 program: its plan's parameters, as given
@@ -381,6 +579,21 @@ pub fn q35_program(spec: &super::model::ModelSpec, cfg: &ServeConfig) -> R<Progr
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     ProgramSpec::from_params(Design::ServeQ35, &params)
+}
+
+/// A MoE model's serve_gptoss program: the validated layout's params
+/// (the f32 pool, `KV16` 0), its lanes and page size the config's.
+pub fn gptoss_program(spec: &super::model::ModelSpec, cfg: &ServeConfig) -> R<ProgramSpec> {
+    if cfg.region || cfg.vm.is_some() || cfg.pins.gw.is_some() || cfg.mmax.is_some() {
+        return Err(format!(
+            "{}: serve_gptoss takes no `region`, ring, VM image or pins",
+            spec.name
+        ));
+    }
+    let params =
+        super::plan_gptoss::program_params(spec, cfg.goals.lanes.max(1), cfg.goals.page_size)
+            .map_err(|e| e.to_string())?;
+    ProgramSpec::from_params(Design::ServeGptoss, &params)
 }
 
 /// The design a plan's family builds: paged8b grids go into serve8b.
@@ -474,12 +687,7 @@ fn serve8b(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Draft> {
     });
     let spec = ProgramSpec::new(
         Design::Serve8b,
-        Model {
-            hidden: g.hidden,
-            qh: g.qh,
-            vocab: plan.vocab,
-            cap,
-        },
+        Model::dims(g.hidden, g.qh, plan.vocab, cap),
         Layers::Strips {
             grid: kernel(g),
             gw: p.gw,
@@ -542,6 +750,343 @@ fn serve8b(plan: &SpatialPlan, cfg: &ServeConfig) -> R<Draft> {
     Ok(Draft { spec, stated: st })
 }
 
+/// The regions' Y phase-1 group (it must divide `RPY`).
+const RGY: usize = 16;
+
+/// serve8b_region's units: the grid (one layer a unit, the band and the
+/// column), `RC` x `RR` regions of `RPX` x `RPY` holding `RNL` layers each,
+/// and the head's rows (`hh`, `vr`, `vmc`) that go with them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Placement {
+    grid: super::plan::Grid,
+    rpx: usize,
+    rpy: usize,
+    rnl: usize,
+    rc: usize,
+    rr: usize,
+    band: usize,
+    ncol: usize,
+    hh: usize,
+    vr: usize,
+    vmc: usize,
+    /// The head and embedding strip hold u4g64 (`W4H` 1): a u4 plan whose
+    /// bf16 head or strip PE does not fit.
+    head4: bool,
+    /// The search's cost estimate (lower is faster; see `unit_cost`).
+    cost: usize,
+}
+
+/// A unit layer's estimated cycles: a fixed part (norms, attention,
+/// collectives), the matvecs by the PE's tile elements (u4 decode costs
+/// about 2 cycles an element on the simulator, bf16 about 0.6) and the
+/// collectives' hops. Only for ranking placements.
+/// On u4 units, each tile's groups add their epilogue (a few short f32
+/// ops of N, about 120 cycles of overhead and 2 a column) and each
+/// segment its scalar setup: group-aligned hidden tiles (`64 % Hc == 0`,
+/// one group) cost less than a tile straddling two.
+fn unit_cost(g: &super::plan::Grid) -> usize {
+    let elems = g.hc * ((2 * g.qh + 2) * g.dc + 3 * g.ic);
+    let per = if g.w4 { 20 } else { 6 };
+    let groups = if g.w4 {
+        super::u4::tiles(g.hc, g.dc, g.gs, g.qh, g.ic, g.lanes == 1)
+            .iter()
+            .filter(|t| t.r > 0)
+            .map(|t| t.g * (120 + 2 * t.n) + 60 * t.segs())
+            .sum()
+    } else {
+        0
+    };
+    8000 + elems * per / 10 + 20 * (g.px + g.py) + groups
+}
+
+/// A unit PE's image must end this far below the top of its memory (the
+/// stack is not counted by the linker).
+const STACK_MARGIN: usize = 768;
+
+/// The placement at `grid` with these regions when it fits the wafer and
+/// its PEs: the shape rules of the layout (and `program::serve8b_region`),
+/// the head beside the column, the feeder row between the grids' rows, the
+/// byte model of `plan::Grid` for grid and region PEs (`check_bytes`).
+#[allow(clippy::too_many_arguments)]
+fn place_at(
+    plan: &SpatialPlan,
+    grid: super::plan::Grid,
+    (rpx, rpy, rnl, rc, rr): (usize, usize, usize, usize, usize),
+    vm: bool,
+    ring: bool,
+    check_bytes: bool,
+    grow_head: bool,
+) -> Option<Placement> {
+    let wafer = super::plan::WaferDims::CS3;
+    let g = grid;
+    if rpx == 0 || rpy == 0 || !(rc * rpx).is_multiple_of(g.px) || !rpx.is_multiple_of(g.px) {
+        return None;
+    }
+    let wide = rpx / g.px;
+    let (rgs, ric) = (wide * g.gs, g.ic / wide);
+    let rdc = g.dc / wide;
+    if !g.py.is_multiple_of(4)
+        || !rpy.is_multiple_of(RGY)
+        || rdc * wide != g.dc
+        || !rdc.is_multiple_of(2)
+        || ric * wide != g.ic
+        || g.hidden.div_ceil(rpy) * rpy < g.hidden
+    {
+        return None;
+    }
+    let band = rc * rpx / g.px + 1;
+    let ncol = plan.layers.checked_sub(band + rc * rr * rnl)?;
+    let c = g.py / 2;
+    let (hh, vr, vmc, vw) = if vm {
+        let vr = 160;
+        let mut hh = plan.vocab.div_ceil(vr);
+        hh += hh % 2;
+        while !(4..=28).step_by(2).any(|x| (hh / 2) % x == 0) {
+            hh += 2;
+        }
+        (hh, vr, 0, 5)
+    } else {
+        // The grid column's height; with `grow_head` (option A) the first
+        // taller one (to 2 YL at most: the feeder half above the last
+        // layer) whose strip tiles (Vr rows of 4 Hc dims) pass STRIP_TABLE,
+        // with a feeder half F that a row group of 16-24 divides, when the
+        // column's own does not and a taller one does (Qwen3-8B's 1152 rows
+        // hold as is; Llama's 3 column grids are short for its vocabulary).
+        // Vr even (head2d_v10's row pairs).
+        let vr_of = |hh: usize| plan.vocab.div_ceil(hh).next_multiple_of(2);
+        let fits = |hh: usize| {
+            vr_of(hh) * 4 * g.hc * 2 <= STRIP_TABLE
+                && (16..=24).step_by(2).any(|x| (hh / 2).is_multiple_of(x))
+        };
+        let mut hh = g.py * (1 + ncol);
+        if grow_head
+            && !fits(hh)
+            && let Some(taller) = (hh..(2 * g.py * ncol).min(wafer.height))
+                .step_by(2)
+                .find(|&hh| fits(hh))
+        {
+            hh = taller;
+        }
+        (hh, vr_of(hh), 1, 0)
+    };
+    let width = rc * rpx + g.px + c + vmc + g.py / 4 + vw;
+    if c * 2 * g.hc < g.hidden {
+        return None;
+    }
+    let f = hh / 2;
+    if width > wafer.width
+        || hh + 1 > wafer.height
+        || g.py + rr * rpy > wafer.height
+        || g.py * (1 + ncol) > wafer.height
+        || f < g.py
+        || f >= g.py * ncol
+    {
+        return None;
+    }
+    let region = super::plan::Grid {
+        px: rpx,
+        py: rpy,
+        hc: g.hidden.div_ceil(rpy),
+        dc: rdc,
+        gs: rgs,
+        ic: ric,
+        ..g
+    };
+    // The deepest pool (up to the plan's) both unit kinds hold; B 1 without
+    // a ring stages KV pages (`KVST` 1, as `serve8b_region` builds it).
+    let most = wafer.pe_bytes - STACK_MARGIN;
+    let staging = |nl: usize| {
+        if g.lanes == 1 && !ring {
+            super::plan::Grid::staging_bytes(nl)
+        } else {
+            0
+        }
+    };
+    let fits = |nb: usize| {
+        let (g, r) = (
+            super::plan::Grid { blocks: nb, ..g },
+            super::plan::Grid {
+                blocks: nb,
+                ..region
+            },
+        );
+        g.bytes(ring) + staging(1) <= most
+            && (rc * rr == 0 || r.region_bytes(rnl, ring) + staging(rnl) <= most)
+    };
+    // The head's PEs (no VM block): their rows at CAP 1 (serve8b_region then
+    // picks the CAP the final root holds, `plan::final_root_bytes`) and the
+    // embedding strip's; bf16, or u4g64 on a u4 plan when bf16 does not fit.
+    let head_fits = |u4: bool| {
+        super::plan::final_root_bytes(vr, g.hc, g.lanes, g.lanes.min(4), ring.then_some(12), 1, u4)
+            <= most
+            && super::plan::embed_bytes(vr, g.hc, g.lanes, u4) <= most
+    };
+    let head4 = if !check_bytes || vm || head_fits(false) {
+        false
+    } else if g.w4 && head_fits(true) {
+        true
+    } else {
+        return None;
+    };
+    let (g, region) = if check_bytes {
+        let nb = (1..=g.blocks).rev().find(|&nb| fits(nb))?;
+        (
+            super::plan::Grid { blocks: nb, ..g },
+            super::plan::Grid {
+                blocks: nb,
+                ..region
+            },
+        )
+    } else {
+        (g, region)
+    };
+    let cost = (band + ncol) * unit_cost(&g) + rc * rr * rnl * unit_cost(&region);
+    Some(Placement {
+        grid: g,
+        rpx,
+        rpy,
+        rnl,
+        rc,
+        rr,
+        band,
+        ncol,
+        hh,
+        vr,
+        vmc,
+        head4,
+        cost,
+    })
+}
+
+/// serve8b_region's placement for `plan`: option A (`RC` 2, `RNL` 3, `RR`
+/// 4, `RPY` 240, regions twice the grid's width; the shape built and run
+/// for Qwen3-8B) when it takes the plan's bf16 grid; else (and for u4g64
+/// units, whose bytes a layer differ) the cheapest
+/// placement (`unit_cost`) that fits, over grids of the plan's columns and
+/// at least its rows (16-row steps), regions one or two grids wide of
+/// 16-row steps, 1 to 4 layers a region, up to 4 x 8 regions.
+/// Why no placement fits (feasibility studies): over the search's shapes
+/// that fit the wafer's geometry, the one whose worse unit kind (grid or
+/// region PE) overshoots least, at one KV block: its shape, the grid and
+/// region bytes and its head's final root at CAP 1, against the PE's room.
+#[cfg(test)]
+pub(crate) fn placement_report(plan: &SpatialPlan, ring: bool) -> String {
+    let g = plan.grid;
+    let wafer = super::plan::WaferDims::CS3;
+    let most = wafer.pe_bytes - STACK_MARGIN;
+    let mut best: Option<(isize, String)> = None;
+    for py in (g.py..=wafer.height / 2).step_by(16) {
+        let grid = super::plan::Grid {
+            py,
+            hc: g.hidden.div_ceil(py),
+            blocks: 1,
+            ..g
+        };
+        for wide in [1, 2] {
+            for rpy in (64..=wafer.height - py).step_by(16) {
+                for rnl in 1..=4 {
+                    for rc in 1..=4 {
+                        for rr in 1..=8 {
+                            let at = (wide * g.px, rpy, rnl, rc, rr);
+                            let Some(p) = place_at(plan, grid, at, false, ring, false, false)
+                            else {
+                                continue;
+                            };
+                            let r = super::plan::Grid {
+                                px: p.rpx,
+                                py: p.rpy,
+                                hc: g.hidden.div_ceil(p.rpy),
+                                dc: g.dc * g.px / p.rpx,
+                                gs: g.gs * p.rpx / g.px,
+                                ic: g.ic * g.px / p.rpx,
+                                ..p.grid
+                            };
+                            let gb = p.grid.bytes(ring);
+                            let rb = r.region_bytes(rnl, ring);
+                            let hb = super::plan::final_root_bytes(
+                                p.vr,
+                                p.grid.hc,
+                                g.lanes,
+                                g.lanes.min(4),
+                                ring.then_some(12),
+                                1,
+                                g.w4,
+                            );
+                            let eb = super::plan::embed_bytes(p.vr, p.grid.hc, g.lanes, g.w4);
+                            // The units only: the head is reported, not ranked.
+                            let over = [gb, rb]
+                                .iter()
+                                .map(|&b| b as isize - most as isize)
+                                .max()
+                                .unwrap_or(0);
+                            if best.as_ref().is_none_or(|(o, _)| over < *o) {
+                                best = Some((
+                                    over,
+                                    format!(
+                                        "grid {}x{} Hc {} Ic {} {gb} B; regions {}x{} RNL {rnl} {rc}x{rr} {rb} B; NCOL {}; head Vr {} {hb} B, strip {eb} B{}; room {most} B (worst over {over})",
+                                        p.grid.px,
+                                        p.grid.py,
+                                        p.grid.hc,
+                                        p.grid.ic,
+                                        p.rpx,
+                                        p.rpy,
+                                        p.ncol,
+                                        p.vr,
+                                        if g.w4 { " (u4)" } else { "" }
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best.map_or_else(|| "no shape fits the wafer's geometry".into(), |(_, s)| s)
+}
+
+fn placement(plan: &SpatialPlan, vm: bool, ring: bool) -> R<Placement> {
+    let g = plan.grid;
+    if !g.w4
+        && g.dc.is_multiple_of(4)
+        && g.ic.is_multiple_of(2)
+        && let Some(p) = place_at(plan, g, (2 * g.px, 240, 3, 2, 4), vm, ring, false, true)
+    {
+        return Ok(p);
+    }
+    let wafer = super::plan::WaferDims::CS3;
+    let mut best: Option<Placement> = None;
+    for py in (g.py..=wafer.height / 2).step_by(16) {
+        let grid = super::plan::Grid {
+            py,
+            hc: g.hidden.div_ceil(py),
+            ..g
+        };
+        for wide in [1, 2] {
+            for rpy in (64..=wafer.height - py).step_by(16) {
+                for rnl in 1..=4 {
+                    for rc in 1..=4 {
+                        for rr in 1..=8 {
+                            let at = (wide * g.px, rpy, rnl, rc, rr);
+                            if let Some(p) = place_at(plan, grid, at, vm, ring, true, false)
+                                && best.is_none_or(|b| p.cost < b.cost)
+                            {
+                                best = Some(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best.ok_or_else(|| {
+        format!(
+            "{}: no serve8b_region placement of {} layers fits the wafer (grids of {} columns, regions 1-2 grids wide, 1-4 layers a region)",
+            plan.spec.name, plan.layers, g.px
+        )
+    })
+}
+
 /// serve8b_region's placement of a paged8b plan ("option A"): the
 /// plan's grid for the first and last layers (a top band of `RC RPX / PX
 /// + 1` grids, `NCOL` grids down the column beside the head) and between
@@ -562,58 +1107,211 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         .pipeline
         .then(|| pipe_shape(plan.grid.lanes, cfg))
         .transpose()?;
-    let g = &plan.grid;
-    let wafer = super::plan::WaferDims::CS3;
-    let (rc, rnl, rr, rpy, rgy) = (2, 3, 4, 240, 16);
-    let (rpx, band) = (2 * g.px, 2 * 2 * g.px / g.px + 1);
-    if !g.dc.is_multiple_of(4) || !g.ic.is_multiple_of(2) || plan.layers < band + rc * rr * rnl + 1
-    {
-        return Err(format!(
-            "{}: serve8b_region's option A does not take this grid ({g:?})",
-            plan.spec.name
-        ));
+    if cfg.ops2 && !cfg.lse {
+        return Err("serve8b_region's second op cuts (`ops2`) need `lse`".into());
     }
-    let ncol = plan.layers - band - rc * rr * rnl;
-    let c = g.py / 2;
-    // With an eta VM (VMX): the guest4hz VM as a 5-column block east of
-    // the strip, Vr 160 vocab rows a head PE (32 a VM column: required) and
-    // the fewest head rows HH >= vocab / Vr, even (F = HH / 2), whose feeder
-    // half F has an even row group Gy <= 28 (Gy must divide F; evenness and
-    // the cap of 28, the group the Vr 160 fits were measured at, are this
-    // plan's choices, not head2d_v10's limits); without, the head as tall
-    // as the grid column, VMC 1.
-    let (hh, vr, vmc, vw) = match cfg.vm {
-        Some(_) => {
-            let vr = 160;
-            let mut hh = plan.vocab.div_ceil(vr);
-            hh += hh % 2;
-            while !(4..=28).step_by(2).any(|x| (hh / 2) % x == 0) {
-                hh += 2;
+    if cfg.qkv1 && !cfg.ops2 {
+        return Err("serve8b_region's one QKV matvec (`qkv1`) needs `ops2`".into());
+    }
+    if (cfg.arf || cfg.f16 || cfg.f16acc) && !cfg.ops2 {
+        return Err("serve8b_region's `arf` / `f16` / `f16acc` need `ops2`".into());
+    }
+    if cfg.f16accg && !cfg.f16acc {
+        return Err("serve8b_region's grid f16 accumulation (`f16accg`) needs `f16acc`".into());
+    }
+    if cfg.arfx && !cfg.arf {
+        return Err("serve8b_region's X all-reduces (`arfx`) need `arf`".into());
+    }
+    if cfg.op3 && !cfg.ops2 {
+        return Err("serve8b_region's `op3` needs `ops2`".into());
+    }
+    if cfg.mem && !cfg.arf {
+        return Err("serve8b_region's code cuts (`mem`) need `arf`".into());
+    }
+    if cfg.grid_levers && !(cfg.arf || cfg.op3) {
+        return Err("serve8b_region's `grid_levers` needs `arf` or `op3`".into());
+    }
+    if cfg.f16_clamp && !cfg.f16acc {
+        return Err("serve8b_region's `f16_clamp` needs `f16acc`".into());
+    }
+    if cfg.xac && !cfg.arfx {
+        return Err("serve8b_region's `xac` needs `arfx`".into());
+    }
+    if cfg.trim && !(cfg.qkv1 && cfg.ops2 && cfg.f16acc && cfg.arfx) {
+        return Err("serve8b_region's `trim` needs `qkv1`, `ops2`, `f16acc` and `arfx`".into());
+    }
+    if cfg.silu16h && !cfg.silu16 {
+        return Err("serve8b_region's `silu16h` needs `silu16`".into());
+    }
+    if (cfg.silu16 || cfg.xg16 || cfg.head_pack) && !cfg.trim {
+        return Err("serve8b_region's `silu16`, `xg16` and `head_pack` need `trim`".into());
+    }
+    if cfg.arfs && !(cfg.arfx && cfg.xac) {
+        return Err("serve8b_region's `arfs` needs `arfx` and `xac`".into());
+    }
+    if cfg.ary16 && !cfg.arf {
+        return Err("serve8b_region's `ary16` needs `arf`".into());
+    }
+    if cfg.hv && !cfg.lse {
+        return Err("serve8b_region's HV (`hv`) needs `lse` (and `speed`)".into());
+    }
+    // Lever D (`lever_d`): its fixed all-region layout; else the placement
+    // (option A for bf16 plans, the search for u4).
+    let (gv, rpx, rpy, rnl, rc, rr, band, ncol, hh, vr, vmc, head4, rgy, yd) = if cfg.lever_d {
+        let g = &plan.grid;
+        let wafer = super::plan::WaferDims::CS3;
+        if g.w4 {
+            return Err("serve8b_region's lever D (`lever_d`) takes bf16 units only".into());
+        }
+        // Lever D: layer 0's grid, RC x RR regions of RNL layers from row 0 at
+        // RPY 208 (RGY 16 divides it; RR 5 is the most the wafer's rows hold),
+        // the remaining NCOL layers' grids down the column.
+        let (rc, rnl, rpy, rgy) = (2, 3, if cfg.lever_d { 208 } else { 240 }, 16);
+        let rpx = 2 * g.px;
+        let (rr, band) = if cfg.lever_d {
+            let rr = 5;
+            if plan.layers < 2 + rc * rr * rnl || rr * rpy > wafer.height {
+                return Err(format!(
+                    "{}: serve8b_region's lever D takes {} layers or more, not {}",
+                    plan.spec.name,
+                    2 + rc * rr * rnl,
+                    plan.layers
+                ));
             }
-            (hh, vr, 0, 5)
+            (rr, 1)
+        } else {
+            (4, 2 * 2 * g.px / g.px + 1)
+        };
+        if !g.dc.is_multiple_of(4)
+            || !g.ic.is_multiple_of(2)
+            || plan.layers < band + rc * rr * rnl + 1
+        {
+            return Err(format!(
+                "{}: serve8b_region's option A does not take this grid ({g:?})",
+                plan.spec.name
+            ));
         }
-        None => {
-            let hh = g.py * (1 + ncol);
-            (hh, plan.vocab.div_ceil(hh), 1, 0)
-        }
-    };
-    let width = rc * rpx + g.px + c + vmc + g.py / 4 + vw;
-    if width > wafer.width || hh + 1 > wafer.height || g.py + rr * rpy > wafer.height {
-        return Err(format!(
-            "{}: serve8b_region's {width} x {} does not fit the wafer",
-            plan.spec.name,
-            hh + 1
-        ));
-    }
-    let f = hh / 2;
-    if f < g.py || f >= g.py * ncol {
-        return Err(format!(
-            "{}: serve8b_region's feeder row {f} is not between the grids' {} and {}",
-            plan.spec.name,
-            g.py,
+        let ncol = plan.layers - band - rc * rr * rnl;
+        // The last layer's grid row (the layout's YL): the head's feeder half F
+        // lies in [PY, YL).
+        // One column grid: beside the snake's last region (row RR - 2, as
+        // 0472 ran); more: beside the U's (row 1), so they fit below it.
+        let yd = match (cfg.lever_d, ncol) {
+            (false, _) => 0,
+            (true, 1) => (rr - 2) * rpy,
+            (true, _) => rpy,
+        };
+        let yl = if cfg.lever_d {
+            yd + (ncol - 1) * g.py
+        } else {
             g.py * ncol
-        ));
-    }
+        };
+        // The head's height as option A's (its hardware-validated heads: Llama
+        // 864, Qwen3-8B 1152): its column grids' count.
+        let ncol_a = if cfg.lever_d {
+            plan.layers.saturating_sub(2 * 2 + 1 + rc * 4 * rnl)
+        } else {
+            ncol
+        };
+        let c = g.py / 2;
+        // With an eta VM (VMX): the guest4hz VM as a 5-column block east of
+        // the strip, Vr 160 vocab rows a head PE (32 a VM column: required) and
+        // the fewest head rows HH >= vocab / Vr, even (F = HH / 2), whose feeder
+        // half F has an even row group Gy <= 28 (Gy must divide F; evenness and
+        // the cap of 28, the group the Vr 160 fits were measured at, are this
+        // plan's choices, not head2d_v10's limits); without, the head as tall
+        // as the grid column, VMC 1.
+        let (hh, vr, vmc, vw) = match cfg.vm {
+            Some(_) => {
+                let vr = 160;
+                let mut hh = plan.vocab.div_ceil(vr);
+                hh += hh % 2;
+                while !(4..=28).step_by(2).any(|x| (hh / 2) % x == 0) {
+                    hh += 2;
+                }
+                (hh, vr, 0, 5)
+            }
+            None => {
+                // The grid column's height; taller (to 2 YL at most: the feeder
+                // half above the last layer) while the strip's tiles (Vr rows
+                // of 4 Hc dims) pass STRIP_TABLE, with a feeder half F that a
+                // row group of 16-24 divides (Qwen3-8B's 1152 rows hold as is;
+                // Llama's 3 column grids are short for its vocabulary).
+                // Vr even (head2d_v10's row pairs).
+                let vr_of = |hh: usize| plan.vocab.div_ceil(hh).next_multiple_of(2);
+                let fits = |hh: usize| {
+                    vr_of(hh) * 4 * g.hc * 2 <= STRIP_TABLE
+                        && (16..=24).step_by(2).any(|x| (hh / 2).is_multiple_of(x))
+                };
+                let mut hh = g.py * (1 + ncol_a);
+                if !fits(hh) {
+                    hh = (hh..(2 * g.py * ncol_a).min(wafer.height))
+                        .step_by(2)
+                        .find(|&hh| fits(hh))
+                        .ok_or_else(|| {
+                            format!(
+                                "{}: serve8b_region's strip holds no {}-row vocabulary beside {ncol} column grids of PY {}",
+                                plan.spec.name, plan.vocab, g.py
+                            )
+                        })?;
+                }
+                (hh, vr_of(hh), 1, 0)
+            }
+        };
+        let width = rc * rpx + g.px + c + vmc + g.py / 4 + vw;
+        let lh = if cfg.lever_d {
+            (rr * rpy).max(yd + ncol * g.py)
+        } else {
+            g.py + rr * rpy
+        };
+        if width > wafer.width || hh + 1 > wafer.height || lh > wafer.height {
+            return Err(format!(
+                "{}: serve8b_region's {width} x {} does not fit the wafer",
+                plan.spec.name,
+                hh + 1
+            ));
+        }
+        let f = hh / 2;
+        if f < g.py || f >= yl {
+            return Err(format!(
+                "{}: serve8b_region's feeder row {f} is not between the grids' {} and {yl}",
+                plan.spec.name, g.py
+            ));
+        }
+        (
+            *g, rpx, rpy, rnl, rc, rr, band, ncol, hh, vr, vmc, false, rgy, yd,
+        )
+    } else {
+        let pl = placement(plan, cfg.vm.is_some(), pipe.is_some())?;
+        let Placement {
+            rpx,
+            rpy,
+            rnl,
+            rc,
+            rr,
+            band,
+            ncol,
+            hh,
+            vr,
+            vmc,
+            head4,
+            ..
+        } = pl;
+        let rgy = RGY;
+        (
+            pl.grid, rpx, rpy, rnl, rc, rr, band, ncol, hh, vr, vmc, head4, rgy, 0,
+        )
+    };
+    let g = &gv;
+    let c = g.py / 2;
+    // The grids' Y phase-1 group: Gs, or the largest even divisor of PY
+    // below it (152 rows: 8).
+    let grid_gy = (2..=g.gs)
+        .rev()
+        .step_by(2)
+        .find(|x| g.py.is_multiple_of(*x))
+        .unwrap_or(2);
+    let f = hh / 2;
     let gx = [16, 8, 4, 2]
         .into_iter()
         .find(|x| c.is_multiple_of(*x) && c / x >= 2)
@@ -642,24 +1340,51 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         Some((_, pcap)) => cap.min(pcap),
         None => cap,
     };
+    // The final root's head PE holds `in_tokens`/`out_tokens` of MMAX x B x
+    // CAP (`plan::final_root_bytes`): the largest CAP (halving) that fits it.
+    let cap = if cfg.vm.is_some() {
+        cap
+    } else {
+        let hlb = g.lanes.min(4);
+        let mmax = pipe.map(|(m, _)| m);
+        let most = super::plan::WaferDims::CS3.pe_bytes - STACK_MARGIN;
+        let fits = |c: usize| {
+            super::plan::final_root_bytes(vr, g.hc, g.lanes, hlb, mmax, c, head4) <= most
+        };
+        let mut c = cap;
+        while c > 1 && !fits(c) {
+            c /= 2;
+        }
+        if !fits(c) || (cfg.goals.cap.is_some() && c < cap) {
+            return Err(format!(
+                "serve8b_region: the final root's head PE (Vr {vr}, {} dims, B {}, MMAX {}) holds CAP {c} at most, not {cap}",
+                2 * g.hc,
+                g.lanes,
+                mmax.unwrap_or(1)
+            ));
+        }
+        c
+    };
     let units = Units {
         rpx,
         rpy,
         rhc: g.hidden.div_ceil(rpy),
-        rdc: g.dc / 2,
-        rgs: 2 * g.gs,
-        ric: g.ic / 2,
+        rdc: g.dc * g.px / rpx,
+        rgs: g.gs * rpx / g.px,
+        ric: g.ic * g.px / rpx,
         rnl,
         rc,
         rr,
         ncol,
-        rtr: 4,
-        gy: g.gs,
+        // Lever D: the grid's bottom row carries three re-chunk legs and E.
+        rtr: if cfg.lever_d { 5 } else { 4 },
+        gy: grid_gy,
         rgy,
         hroute: true,
         rot8: true,
         nolayer: false,
         band,
+        yd,
         vm: None,
     };
     let mut st: Vec<Stated> = Vec::new();
@@ -730,10 +1455,74 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     let spec = ProgramSpec::new(
         design,
         Model {
-            hidden: g.hidden,
-            qh: g.qh,
-            vocab: plan.vocab,
-            cap,
+            // Llama: no q/k norms, its own epsilon (the units' sources
+            // follow, codegen's `Variant`).
+            qk_norm: plan.spec.qk_norm,
+            eps_bits: if plan.spec.rms_eps == super::model::KERNEL_EPS {
+                0
+            } else {
+                plan.spec.rms_eps.to_bits()
+            },
+            speed: cfg.speed,
+            lse: cfg.lse,
+            ops2: cfg.ops2,
+            qkv1: cfg.qkv1,
+            arf: if cfg.arfs {
+                7
+            } else if cfg.arfx {
+                3
+            } else {
+                usize::from(cfg.arf)
+            },
+            f16: if cfg.f16accg {
+                3
+            } else if cfg.f16acc {
+                2
+            } else {
+                usize::from(cfg.f16)
+            },
+            // (MEM 3 where the q/k norm is the identity: q's scale a constant)
+            mem: if cfg.mem {
+                if plan.spec.qk_norm { 1 } else { 3 }
+            } else {
+                0
+            },
+            op3: usize::from(cfg.op3),
+            // (the grids' levers: ARF 1, OP3 2, MEM 4; MEM's only with ARF)
+            grid: if cfg.grid_levers {
+                usize::from(cfg.arf)
+                    | (usize::from(cfg.op3) << 1)
+                    | (usize::from(cfg.mem && cfg.arf) << 2)
+            } else {
+                0
+            },
+            f16cl: cfg.f16_clamp,
+            xac: cfg.xac,
+            // (TRM: every bit, the grids' with their f16 accumulation; 0533: TRM 479
+            // 1,903.1 / 1,902.5 tok/s and TRM 255 1,897.4 / 1,897.7, both = golden)
+            // (with q/k norms, Qwen3-8B: the exact bits alone, 241 - 2, 8 and 256 move its
+            // teacher-forced set; 0534: TRM 245 kept 0529's 14 mismatches)
+            trim: if cfg.trim {
+                (if plan.spec.qk_norm { 241 } else { 1019 })
+                    | (usize::from(cfg.grid_levers && cfg.f16accg) << 2)
+                    // (silu16: TRM 1024, the regions' act in f16, no act all-reduce; inexact;
+                    // with 4096, 512's f16 gammas in place, so that the region fits beside 512)
+                    | (if cfg.silu16 && !plan.spec.qk_norm { 1024 | 4096 } else { 0 })
+                    // (not 8192, the grids too: 0538 sp538_t20, grids +0.14k / +0.11k)
+                    // (xg16: TRM 512 + 4096, x g in f16 with in-place f16 gammas; inexact)
+                    | (if cfg.xg16 && !plan.spec.qk_norm { 512 | 4096 } else { 0 })
+                    // (and 8192: the grids' x g in f16, when they take the cuts)
+                    | (usize::from(cfg.xg16 && !plan.spec.qk_norm && cfg.grid_levers && cfg.f16accg) << 13)
+                    // (head_pack: TRM 16384, the head's packed argmax round; exact)
+                    | (usize::from(cfg.head_pack) << 14)
+                    // (silu16h: TRM 2048, the SiLU's scales in f16)
+                    | (usize::from(cfg.silu16h && cfg.silu16 && !plan.spec.qk_norm) << 11)
+            } else {
+                0
+            },
+            ary: if cfg.ary16 { 16 } else { 0 },
+            hvc: cfg.hvc,
+            ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
             grid: kernel(g),
@@ -752,7 +1541,17 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             defer: false,
         },
         Kv::Paged {
-            shape: pool(g, g.py.min(rpy)),
+            shape: if cfg.hv {
+                // HV: one-position kernel pages, PIE's pages' worth a block.
+                Shape {
+                    page_size: 1,
+                    blocks: g.blocks * g.page_size,
+                    entries: 5,
+                    ..pool(g, g.py.min(rpy))
+                }
+            } else {
+                pool(g, g.py.min(rpy))
+            },
             copy: PageCopy::Host,
             staging,
         },
@@ -764,6 +1563,62 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         ]
         .map(Typed),
     );
+    // Stated only where they differ from the layout's defaults (Qwen3's
+    // builds keep their parameters).
+    if grid_gy != g.gs {
+        st.push(Typed("GY"));
+    }
+    if !plan.spec.qk_norm {
+        st.push(Typed("QKN"));
+    }
+    if plan.spec.rms_eps != super::model::KERNEL_EPS {
+        st.push(Typed("EPS"));
+    }
+    if cfg.speed {
+        st.push(Typed("SPD"));
+    }
+    if cfg.lse {
+        st.push(Typed("LSE"));
+    }
+    if cfg.ops2 {
+        st.push(Typed("OP2"));
+    }
+    if cfg.qkv1 {
+        st.push(Typed("QKV1"));
+    }
+    if cfg.arf {
+        st.push(Typed("ARF"));
+    }
+    if cfg.f16 || cfg.f16acc {
+        st.push(Typed("F16"));
+    }
+    if cfg.mem {
+        st.push(Typed("MEM"));
+    }
+    if cfg.op3 {
+        st.push(Typed("OP3"));
+    }
+    if cfg.grid_levers {
+        st.push(Typed("GRD"));
+    }
+    if cfg.f16_clamp {
+        st.push(Typed("F16CL"));
+    }
+    if cfg.xac {
+        st.push(Typed("XAC"));
+    }
+    if cfg.trim {
+        st.push(Typed("TRM"));
+    }
+    if cfg.ary16 {
+        st.push(Typed("ARY"));
+    }
+    if cfg.hvc {
+        st.push(Typed("HVC"));
+    }
+    if cfg.lever_d {
+        st.push(Typed("YD"));
+    }
     st.extend([
         Knob("MC", g.mlp_chunk),
         Knob("W16", usize::from(g.w16)),
@@ -781,16 +1636,28 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
         Knob("Gy", gy),
         Typed("vocab"),
         Knob("PASSES", 3),
-        Knob("MODE", 0),
+        Knob("MODE", if cfg.head_one_pass { 2 } else { 0 }),
         Knob("OVL", 0),
         Typed("VMC"),
         Typed("CAP"),
         Knob("iters", 1),
         Typed("B"),
-        Knob("NP", if pipe.is_some() { 1 } else { 3 }),
+        // u4g64 units take x as one bf16 part, as MLX's bf16 activations.
+        Knob("NP", if pipe.is_some() || g.w4 { 1 } else { 3 }),
     ]);
+    if g.w4 {
+        st.push(Knob("W4", 1));
+    }
+    if head4 {
+        st.push(Knob("W4H", 1));
+    }
     Ok(Draft { spec, stated: st })
 }
+
+/// The bytes of a serve8b_region strip PE's embedding tiles (`Vr` rows of
+/// 4 `Hc` bf16 dims) the head's height is chosen for: 32 KiB (Qwen3-8B's
+/// validated strip holds 30.6 KB).
+const STRIP_TABLE: usize = 32 * 1024;
 
 /// serve8b_region_pipe's micro-batches (`mmax`, or the most validated) and
 /// CAP for `lanes`: only the validated shapes; the rest are unrun.
@@ -893,18 +1760,14 @@ fn serve2d(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Draft> {
     let mmax = cfg.mmax.unwrap_or(p.mmax.unwrap_or(1));
     let spec = ProgramSpec::new(
         design,
-        Model {
-            hidden: g.hidden,
-            qh: g.qh,
-            vocab: plan.vocab,
-            cap: p.cap,
-        },
+        Model::dims(g.hidden, g.qh, plan.vocab, p.cap),
         Layers::Grids {
             grid: kernel(g),
             gw: p.gw,
             gh: p.gh,
             tc: super::plan::TC,
             hybrid: None,
+            gemma: None,
         },
         match (pipe, mmax) {
             (true, m) if m > 0 => Stage::Ring { mmax: m },
@@ -1104,13 +1967,13 @@ impl Pins {
         if let Some(v) = self.gw {
             match &mut spec.layers {
                 Layers::Grids { gw, .. } | Layers::Strips { gw, .. } => *gw = v,
-                Layers::Units { .. } => {}
+                Layers::Units { .. } | Layers::Gptoss { .. } => {}
             }
         }
         if let Some(v) = self.gh {
             match &mut spec.layers {
                 Layers::Grids { gh, .. } | Layers::Strips { gh, .. } => *gh = v,
-                Layers::Units { .. } => {}
+                Layers::Units { .. } | Layers::Gptoss { .. } => {}
             }
         }
         spec.head.hh = self.hh.unwrap_or(spec.head.hh);
@@ -1171,6 +2034,10 @@ pub fn program(plan: &SpatialPlan, cfg: &ServeConfig) -> R<ProgramSpec> {
         Design::Serve8bRegion | Design::Serve8bRegionPipe => serve8b_region(plan, cfg, d)?,
         Design::Serve2d | Design::Serve2dPipe => serve2d(plan, cfg, d)?,
         Design::ServeQ35 => return Err("serve_q35 builds from a hybrid plan (q35_program)".into()),
+        Design::ServeG4 => return Err("serve_g4 builds from a Gemma 4 plan (g4_program)".into()),
+        Design::ServeGptoss => {
+            return Err("serve_gptoss builds from a MoE plan (gptoss_program)".into());
+        }
     };
     cfg.pins.apply(&mut draft);
     // The head's VM on the final geometry (serve8b_region's is its block).
@@ -1180,7 +2047,7 @@ pub fn program(plan: &SpatialPlan, cfg: &ServeConfig) -> R<ProgramSpec> {
         let b = cfg.vm_b.map(|(img, _)| limits(&img));
         draft.spec.sampler = draft.spec.head_sampler(limits(&vm), b, false);
     }
-    let files = d.files()?;
+    let files = d.files_w4(plan.grid.w4)?;
     let layout = &files
         .iter()
         .find(|f| f.0 == "layout.csl")
@@ -1270,7 +2137,7 @@ pub fn compile(program: &ProgramSpec, target: crate::sdk::Target, system: bool) 
     use crate::sdk::{Arch, Compile, Cslc};
     let (design, params) = (program.design, &program.to_params());
     shapes::check(design, params)?;
-    let files = design.files()?;
+    let files = program.files()?;
     let (w, h) = program.rectangle();
     let (w, h) = (w as u32, h as u32);
     let (fabric_dims, fabric_offsets) = crate::sdk::cslc::memcpy_fabric(w, h);
@@ -1375,6 +2242,7 @@ pub mod presets {
             kv: poem_ir::Dtype::F32,
             norm_plus_one: false,
             hybrid: None,
+            moe: None,
         }
     }
 
@@ -1706,7 +2574,7 @@ mod qwen3_8b {
         ModelSpec::read(&d.trace(poem_ir::Platform::Cerebras)).expect("qwen3-8b reads")
     }
 
-    fn sorted(extra: &str) -> Vec<(String, String)> {
+    pub(super) fn sorted(extra: &str) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = extra
             .split(',')
             .map(|kv| {
@@ -1807,6 +2675,129 @@ mod qwen3_8b {
             let p2: Vec<(String, String)> = p.clone();
             assert_eq!(rectangle(d, &p2).unwrap(), (749, 1153));
         }
+    }
+
+    /// Lever D for Qwen3-8B (36 layers: 1 + 10 x 3 + 5): the U order, the
+    /// five column grids from (512, 208), the head as option A's (HH 1152);
+    /// with `hv`, `speed`, `lse`, `head_one_pass` (the payload speed8b_qld).
+    #[test]
+    fn the_plan_places_qwen3_8b_lever_d() {
+        let goals = Goals {
+            blocks: Some(1),
+            host_copy: false,
+            grid_lanes: 1,
+            ..Goals::lanes(1)
+        };
+        let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+        let mut cfg = ServeConfig::new(goals);
+        cfg.region = true;
+        cfg.speed = true;
+        cfg.lse = true;
+        cfg.hv = true;
+        cfg.lever_d = true;
+        cfg.head_one_pass = true;
+        cfg.pins.set("NP", 1).unwrap();
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            sorted(
+                "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:48,RNL:3,\
+                 RGY:16,RC:2,RR:5,NCOL:5,YD:208,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
+                 PROF:0,TIME:0,HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,\
+                 PASSES:3,MODE:2,OVL:0,VMC:1,CAP:64,iters:1,B:1,NP:1,KVST:1,SPD:1,LSE:1"
+            )
+        );
+        let lay =
+            crate::spatial::program::ProgramSpec::from_params(d, &p).expect("serve8b_region D");
+        assert_eq!(lay.layers(), 36);
+        let num = |k: &str| p.iter().find(|e| e.0 == k).and_then(|e| e.1.parse().ok());
+        plan.spec
+            .check_program(num)
+            .expect("the model takes the lever D program");
+        assert_eq!(rectangle(d, &p).unwrap(), (749, 1153));
+    }
+
+    /// The Pie bundle's Qwen3-8B config (qx4: lever D + ops2 + qkv1 + arf +
+    /// arfx + mem + op3 + f16acc + f16accg) with `grid_levers` and `xac`
+    /// states 0529's sp529_qx7 program (TIME 1 there; KVST the engine's).
+    #[test]
+    fn the_plan_places_qwen3_8b_grid_levers_and_xac_as_0529() {
+        let goals = Goals {
+            blocks: Some(1),
+            host_copy: false,
+            grid_lanes: 1,
+            ..Goals::lanes(1)
+        };
+        let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+        let mut cfg = ServeConfig::new(goals);
+        (
+            cfg.region,
+            cfg.speed,
+            cfg.lse,
+            cfg.hv,
+            cfg.lever_d,
+            cfg.head_one_pass,
+        ) = (true, true, true, true, true, true);
+        (cfg.ops2, cfg.qkv1, cfg.arf, cfg.arfx, cfg.mem, cfg.op3) =
+            (true, true, true, true, true, true);
+        (cfg.f16acc, cfg.f16accg, cfg.grid_levers, cfg.xac) = (true, true, true, true);
+        cfg.pins.set("NP", 1).unwrap();
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(
+            got,
+            sorted(
+                "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:48,RNL:3,\
+                 RGY:16,RC:2,RR:5,NCOL:5,YD:208,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
+                 PROF:0,TIME:0,HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,\
+                 PASSES:3,MODE:2,OVL:0,VMC:1,CAP:64,iters:1,B:1,NP:1,SPD:1,LSE:1,OP2:1,QKV1:1,ARF:3,MEM:1,\
+                 OP3:1,F16:3,GRD:7,XAC:1"
+            )
+        );
+    }
+
+    /// ... and with `trim`, `arfs` and `hvc` states 0535's sp535_qt15 (TIME 1 there).
+    #[test]
+    fn the_plan_places_qwen3_8b_trim_arfs_hvc_as_0535() {
+        let goals = Goals {
+            blocks: Some(1),
+            host_copy: false,
+            grid_lanes: 1,
+            ..Goals::lanes(1)
+        };
+        let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+        let mut cfg = ServeConfig::new(goals);
+        (
+            cfg.region,
+            cfg.speed,
+            cfg.lse,
+            cfg.hv,
+            cfg.lever_d,
+            cfg.head_one_pass,
+        ) = (true, true, true, true, true, true);
+        (cfg.ops2, cfg.qkv1, cfg.arf, cfg.arfx, cfg.mem, cfg.op3) =
+            (true, true, true, true, true, true);
+        (cfg.f16acc, cfg.f16accg, cfg.grid_levers, cfg.xac) = (true, true, true, true);
+        (cfg.trim, cfg.arfs, cfg.hvc) = (true, true, true);
+        cfg.pins.set("NP", 1).unwrap();
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(
+            got,
+            sorted(
+                "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:48,RNL:3,\
+                 RGY:16,RC:2,RR:5,NCOL:5,YD:208,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
+                 PROF:0,TIME:0,HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,\
+                 PASSES:3,MODE:2,OVL:0,VMC:1,CAP:64,iters:1,B:1,NP:1,SPD:1,LSE:1,OP2:1,QKV1:1,ARF:7,MEM:1,\
+                 OP3:1,F16:3,GRD:7,XAC:1,TRM:245,HVC:1"
+            )
+        );
     }
 
     /// `region` with `pipeline` is the validated serve8b_region_pipe builds (B 4 x 4
@@ -1953,5 +2944,679 @@ mod qwen3_8b {
                 crate::spatial::program::ProgramSpec::from_params(d, &p).expect("serve8b_region");
             assert_eq!(lay.layers(), 36);
         }
+    }
+}
+
+#[cfg(test)]
+mod llama31_8b {
+    use super::*;
+    use crate::spatial::codegen::Variant;
+    use crate::spatial::model::ModelSpec;
+    use crate::spatial::plan::WaferDims;
+
+    fn spec() -> ModelSpec {
+        let catalog = poem_compiler::catalog::repository();
+        let d = catalog
+            .parse("llama31-8b-bf16-kv-bf16")
+            .expect("llama31-8b parses");
+        ModelSpec::read(&d.trace(poem_ir::Platform::Cerebras)).expect("llama31-8b reads")
+    }
+
+    fn cfg_for(b: usize, pipeline: bool) -> (SpatialPlan, ServeConfig) {
+        let goals = Goals {
+            blocks: Some(1),
+            host_copy: true,
+            grid_lanes: 4,
+            pipeline,
+            rows: Some(152),
+            ..Goals::lanes(b)
+        };
+        let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+        let mut cfg = ServeConfig::new(goals);
+        cfg.region = true;
+        (plan, cfg)
+    }
+
+    /// Llama 3.1 8B as serve8b_region's units: 152-row grids (GY 8; 160
+    /// would be 761 columns), 3 column grids and a head grown to 864 rows so
+    /// the strip's tiles hold the vocabulary, the units built without q/k
+    /// norms at eps 1e-5. The model takes the program; the full rectangle
+    /// fits the wafer.
+    #[test]
+    fn the_plan_places_llama_3_regions() {
+        let (plan, cfg) = cfg_for(1, false);
+        let (d, p) = params(&plan, &cfg).unwrap();
+        assert_eq!(d, Design::Serve8bRegion);
+        let get = |k: &str| p.iter().find(|e| e.0 == k).and_then(|e| e.1.parse().ok());
+        for (k, v) in [
+            ("PY", 152),
+            ("Hc", 27),
+            ("Ic", 112),
+            ("RIc", 56),
+            ("GY", 8),
+            ("NCOL", 3),
+            ("HH", 864),
+            ("Vr", 150),
+            ("Gx", 4),
+            ("Gy", 24),
+            ("QKN", 0),
+            ("EPS", 1e-5f32.to_bits() as usize),
+        ] {
+            assert_eq!(get(k), Some(v), "{k}");
+        }
+        plan.spec
+            .check_program(get)
+            .expect("the model takes serve8b_region");
+        assert_eq!(rectangle(d, &p).unwrap(), (755, 1112));
+        let lay = ProgramSpec::from_params(d, &p).expect("serve8b_region");
+        assert_eq!(lay.layers(), 32);
+        assert!(!lay.model.qk_norm);
+        // The generated units differ from Qwen3's by the variant alone.
+        let qwen = d.files().unwrap();
+        let llama = d.files_with(lay.model.variant()).unwrap();
+        for ((n, a), (_, b)) in qwen.iter().zip(&llama) {
+            let unit = *n == "grid_pe.csl" || *n == "region_pe.csl";
+            assert_eq!(a == b, !unit, "{n}");
+            if unit {
+                assert!(a.contains("allreduce_seg(ssq3_dsd, NH * B);"));
+                assert!(!b.contains("allreduce_seg(ssq3_dsd, NH * B);"), "{n}");
+                assert!(b.contains("const EPS: f32 = 1.0e-5;"), "{n}");
+            }
+        }
+        // Qwen3-8B's model refuses a Llama program, and Llama a Qwen3 one.
+        let qwen3 = poem_compiler::catalog::repository()
+            .parse("qwen3-8b-bf16-kv-bf16")
+            .unwrap()
+            .trace(poem_ir::Platform::Cerebras);
+        let qwen3 = ModelSpec::read(&qwen3).unwrap();
+        assert!(qwen3.check_program(get).is_err());
+        let qwen_get = |k: &str| match k {
+            "QKN" | "EPS" => None,
+            _ => get(k),
+        };
+        assert!(plan.spec.check_program(qwen_get).is_err());
+    }
+
+    /// `lever_d` + `hv` (with `speed`, `lse`, `head_one_pass`, CAP 128):
+    /// the plan states 0472's hardware build (lever D, Llama as
+    /// 1 + 10 x 3 + 1 at RPY 208; HV's one-position pages), NP pinned to 1 as there,
+    /// but for its TIME 1.
+    #[test]
+    fn the_plan_places_llama_3_lever_d_as_0472() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.goals.cap = Some(128);
+        cfg.speed = true;
+        cfg.lse = true;
+        cfg.head_one_pass = true;
+        cfg.hv = true;
+        cfg.lever_d = true;
+        cfg.pins.set("NP", 1).unwrap();
+        let plan = SpatialPlan::derive(&plan.spec, WaferDims::CS3, cfg.goals).unwrap();
+        let (d, p) = params(&plan, &cfg).unwrap();
+        assert_eq!(d, Design::Serve8bRegion);
+        let want = "PX:128,PY:152,Hc:27,Dc:8,Gs:16,Ic:112,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:56,RNL:3,\
+                    RGY:16,GY:8,RC:2,RR:5,NCOL:1,YD:624,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,\
+                    KVCP:0,PROF:0,TIME:0,HROUTE:1,ROT8:1,QKN:0,EPS:925353388,NOLAYER:0,HEADMODE:2,HH:864,\
+                    Vr:150,Gx:4,Gy:24,vocab:128256,PASSES:3,MODE:2,OVL:0,VMC:1,CAP:128,iters:1,B:1,NP:1,\
+                    SPD:1,LSE:1";
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(got, super::qwen3_8b::sorted(want));
+        assert_eq!(rectangle(d, &p).unwrap().1, 1040);
+        let lay = ProgramSpec::from_params(d, &p).expect("serve8b_region D");
+        assert_eq!(lay.layers(), 32);
+        let num = |k: &str| p.iter().find(|e| e.0 == k).and_then(|e| e.1.parse().ok());
+        plan.spec
+            .check_program(num)
+            .expect("the model takes the lever D program");
+        // HV without LSE, and D on a layer count it cannot take, are refused.
+        cfg.lse = false;
+        assert!(params(&plan, &cfg).is_err());
+    }
+
+    /// The Pie bundle's Llama config (x4: ops2 + qkv1 + arf + arfx + mem + op3 +
+    /// f16acc + f16accg) with `grid_levers` states 0522's sp522_g7 program
+    /// (TIME 1 there; KVST the engine's).
+    #[test]
+    fn the_plan_places_llama_3_grid_levers_as_0522() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.goals.cap = Some(128);
+        (
+            cfg.speed,
+            cfg.lse,
+            cfg.ops2,
+            cfg.qkv1,
+            cfg.head_one_pass,
+            cfg.hv,
+            cfg.lever_d,
+        ) = (true, true, true, true, true, true, true);
+        (
+            cfg.arf,
+            cfg.arfx,
+            cfg.mem,
+            cfg.op3,
+            cfg.f16acc,
+            cfg.f16accg,
+            cfg.grid_levers,
+        ) = (true, true, true, true, true, true, true);
+        cfg.pins.set("NP", 1).unwrap();
+        let plan = SpatialPlan::derive(&plan.spec, WaferDims::CS3, cfg.goals).unwrap();
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let want = "PX:128,PY:152,Hc:27,Dc:8,Gs:16,Ic:112,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:56,RNL:3,\
+                    RGY:16,GY:8,RC:2,RR:5,NCOL:1,YD:624,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,\
+                    KVCP:0,PROF:0,TIME:0,HROUTE:1,ROT8:1,QKN:0,EPS:925353388,NOLAYER:0,HEADMODE:2,HH:864,\
+                    Vr:150,Gx:4,Gy:24,vocab:128256,PASSES:3,MODE:2,OVL:0,VMC:1,CAP:128,iters:1,B:1,NP:1,\
+                    SPD:1,LSE:1,OP2:1,QKV1:1,ARF:3,F16:3,MEM:3,OP3:1,GRD:7";
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(got, super::qwen3_8b::sorted(want));
+        // + f16_clamp + xac: 0527's sp527_gx7
+        (cfg.f16_clamp, cfg.xac) = (true, true);
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1"))
+        );
+        // + trim + ary16 + hvc: TRM 511, ARY 16, HVC 1 (0534's sp534_t14); + arfs: ARF 7
+        (cfg.trim, cfg.ary16, cfg.hvc) = (true, true, true);
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want},F16CL:1,XAC:1,TRM:1023,ARY:16,HVC:1"))
+        );
+        cfg.arfs = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        let want7 = want.replace("ARF:3", "ARF:7");
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:1023,ARY:16,HVC:1"))
+        );
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        for (n, text) in d.files_with(lay.model.variant()).unwrap() {
+            if n == "region_pe.csl" || n == "grid_pe.csl" {
+                assert!(
+                    text.contains("(trm) y starts at 0")
+                        && text.contains("(trm 2)")
+                        && text.contains("(trm 8)"),
+                    "{n}"
+                );
+                assert!(
+                    text.contains("(trm) both halves' q heads in one op")
+                        && text.contains("(trm 16)"),
+                    "{n}"
+                );
+                assert!(text.contains("(trm 64)") && text.contains("(arfs)"), "{n}");
+            }
+        }
+        // + silu16: TRM 6143 (0538's sp538_t19, 1,997.6 tok/s): the regions' act in f16, no act all-reduce
+        cfg.silu16 = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:6143,ARY:16,HVC:1"))
+        );
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        for (n, text) in d.files_with(lay.model.variant()).unwrap() {
+            assert_eq!(text.contains("(trm 1024)"), n == "region_pe.csl", "{n}");
+        }
+        // + xg16: the grids' x g in f16 too (8192; 512 and 4096 already)
+        cfg.xg16 = true;
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:14335,ARY:16,HVC:1"))
+        );
+        // + head_pack: TRM 30719
+        cfg.head_pack = true;
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:30719,ARY:16,HVC:1"))
+        );
+        // + silu16h: TRM 32767 (everything)
+        cfg.silu16h = true;
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(
+            got,
+            super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:32767,ARY:16,HVC:1"))
+        );
+    }
+
+    /// `ops2` on 0472's config states 0480's program: the same parameters
+    /// plus OP2 1 (0480 ran OP2's unit files hand-copied into 0472's build;
+    /// the codegen's files for these parameters are byte-identical to them).
+    #[test]
+    fn the_plan_places_llama_3_lever_d_with_ops2_as_0480() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.goals.cap = Some(128);
+        cfg.speed = true;
+        cfg.lse = true;
+        cfg.ops2 = true;
+        cfg.head_one_pass = true;
+        cfg.hv = true;
+        cfg.lever_d = true;
+        cfg.pins.set("NP", 1).unwrap();
+        let plan = SpatialPlan::derive(&plan.spec, WaferDims::CS3, cfg.goals).unwrap();
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let mut off = cfg.clone();
+        off.ops2 = false;
+        let (_, mut base) = params(&plan, &off).unwrap();
+        base.push(("OP2".to_string(), "1".to_string()));
+        let (mut got, mut want) = (p.clone(), base);
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+        let lay = ProgramSpec::from_params(d, &p).expect("serve8b_region D + OP2");
+        assert!(lay.model.ops2 && lay.layers() == 32);
+    }
+
+    /// `speed` states SPD 1 (and `head_one_pass` MODE 2): the units' files
+    /// carry the op cuts (the exp on both kernels, the scores' and RoPE's on
+    /// the regions only), the rest is the default build's.
+    #[test]
+    fn speed_states_spd_and_patches_the_units() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.speed = true;
+        cfg.head_one_pass = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
+        assert_eq!(get("SPD").as_deref(), Some("1"));
+        assert_eq!(get("MODE").as_deref(), Some("2"));
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        assert!(lay.model.speed);
+        let base = d
+            .files_with(Variant {
+                speed: false,
+                ..lay.model.variant()
+            })
+            .unwrap();
+        let fast = d.files_with(lay.model.variant()).unwrap();
+        for ((n, a), (_, b)) in base.iter().zip(&fast) {
+            match *n {
+                "grid_pe.csl" => {
+                    assert!(b.contains("fn exp_fast(") && !a.contains("fn exp_fast("));
+                    assert!(!b.contains("fn q_parts("));
+                }
+                "region_pe.csl" => {
+                    assert!(b.contains("fn exp_fast(") && b.contains("fn q_parts("));
+                    assert!(b.contains("fn rope_vec("));
+                }
+                _ => assert_eq!(a, b, "{n}"),
+            }
+        }
+    }
+
+    /// `lse` (with `speed`) states LSE 1: both units' files drop the max
+    /// all-reduce (the attention runs as a loop that a bad pass repeats) and
+    /// the collectives' soft divide/modulo; `lse` without `speed` is refused.
+    #[test]
+    fn lse_states_lse_and_patches_both_units() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.speed = true;
+        cfg.lse = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
+        assert_eq!(get("LSE").as_deref(), Some("1"));
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        assert!(lay.model.lse && lay.model.speed);
+        let base = d
+            .files_with(Variant {
+                lse: false,
+                ..lay.model.variant()
+            })
+            .unwrap();
+        let lse = d.files_with(lay.model.variant()).unwrap();
+        for ((n, a), (_, b)) in base.iter().zip(&lse) {
+            match *n {
+                "grid_pe.csl" | "region_pe.csl" => {
+                    assert!(a.contains("allreduce(true, red_dsd, NQB);"), "{n}");
+                    assert!(!b.contains("allreduce(true,"), "{n}");
+                    assert!(
+                        b.contains("while (apass < 8)") && b.contains("fn gsh()"),
+                        "{n}"
+                    );
+                    assert!(!b.contains("  const r = axis_id % ga();\n"), "{n}");
+                    assert!(b.contains("    ar_qt = axis_id >> gsh();\n"), "{n}");
+                    assert!(b.contains("fn q_parts("), "{n}");
+                    assert_eq!(b.contains("fn rope_vec("), *n == "region_pe.csl", "{n}");
+                    assert!(b.contains("const HV: bool = PS == 1;"), "{n}");
+                }
+                _ => assert_eq!(a, b, "{n}"),
+            }
+        }
+        let alone = Variant {
+            speed: false,
+            ..lay.model.variant()
+        };
+        assert!(d.files_with(alone).is_err());
+    }
+
+    /// `ops2` (with `lse`) states OP2 1: both units' SiLU element runs as
+    /// scalars at MC 1, set_axis returns on the axis it already has, PROF 1
+    /// splits the MLP's marks; nothing else changes; without `lse` it is
+    /// refused.
+    #[test]
+    fn ops2_states_op2_and_patches_both_units() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.speed = true;
+        cfg.lse = true;
+        cfg.ops2 = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
+        assert_eq!(get("OP2").as_deref(), Some("1"));
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        assert!(lay.model.ops2);
+        let base = d
+            .files_with(Variant {
+                ops2: false,
+                ..lay.model.variant()
+            })
+            .unwrap();
+        let op2 = d.files_with(lay.model.variant()).unwrap();
+        for ((n, a), (_, b)) in base.iter().zip(&op2) {
+            match *n {
+                "grid_pe.csl" | "region_pe.csl" => {
+                    assert!(!a.contains("fn silu1(") && b.contains("fn silu1("), "{n}");
+                    assert!(b.contains("  if (axis_cur == want) { return; }\n"), "{n}");
+                    assert!(
+                        b.contains("    mark(14);\n") && !a.contains("mark(14)"),
+                        "{n}"
+                    );
+                }
+                _ => assert_eq!(a, b, "{n}"),
+            }
+        }
+        let alone = Variant {
+            lse: false,
+            speed: true,
+            ..lay.model.variant()
+        };
+        assert!(d.files_with(alone).is_err());
+        cfg.lse = false;
+        assert!(params(&plan, &cfg).is_err());
+    }
+
+    /// `qkv1` (with `ops2`) states QKV1 1: both units run one QKV matvec
+    /// over `wqa`'s fused rows (wqv, wv as dummies); nothing else changes;
+    /// without `ops2` it is refused.
+    #[test]
+    fn qkv1_states_qkv1_and_patches_both_units() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.speed = true;
+        cfg.lse = true;
+        cfg.ops2 = true;
+        cfg.qkv1 = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
+        assert_eq!(get("QKV1").as_deref(), Some("1"));
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        assert!(lay.model.qkv1);
+        let base = d
+            .files_with(Variant {
+                qkv1: false,
+                ..lay.model.variant()
+            })
+            .unwrap();
+        let one = d.files_with(lay.model.variant()).unwrap();
+        for ((n, a), (_, b)) in base.iter().zip(&one) {
+            match *n {
+                "grid_pe.csl" | "region_pe.csl" => {
+                    assert!(
+                        a.contains("wqv_dsd, xb, Hc, sc_s);") && !b.contains("wqv_dsd, xb"),
+                        "{n}"
+                    );
+                    assert!(
+                        b.contains("{QKW} -> qkv[i] }), wqa_dsd, xb, Hc, sc_s);"),
+                        "{n}"
+                    );
+                    assert!(b.contains("var wv: [2]WS align(16)"), "{n}");
+                }
+                _ => assert_eq!(a, b, "{n}"),
+            }
+        }
+        cfg.ops2 = false;
+        assert!(params(&plan, &cfg).is_err());
+    }
+
+    /// `arf` states ARF 1 (the regions' Y all-reduces, grids unchanged);
+    /// `f16acc` states F16 2 (KV and the head in f16 in both units' files,
+    /// the regions' f16-accumulating matvecs); without `ops2` both are refused.
+    #[test]
+    fn arf_and_f16acc_state_their_params_and_patch_the_units() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        cfg.speed = true;
+        cfg.lse = true;
+        cfg.ops2 = true;
+        cfg.qkv1 = true;
+        cfg.arf = true;
+        cfg.arfx = true;
+        cfg.f16acc = true;
+        cfg.mem = true;
+        cfg.op3 = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
+        assert_eq!(get("ARF").as_deref(), Some("3"));
+        assert_eq!(get("F16").as_deref(), Some("2"));
+        assert_eq!(get("MEM").as_deref(), Some("3"));
+        assert_eq!(get("OP3").as_deref(), Some("1"));
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        assert_eq!((lay.model.arf, lay.model.f16, lay.model.mem), (3, 2, 3));
+        let base = d
+            .files_with(Variant {
+                arf: 0,
+                f16: 0,
+                mem: 0,
+                op3: 0,
+                ..lay.model.variant()
+            })
+            .unwrap();
+        let new = d.files_with(lay.model.variant()).unwrap();
+        for ((n, a), (_, b)) in base.iter().zip(&new) {
+            match *n {
+                "region_pe.csl" => {
+                    assert!(!a.contains("fn arf_ar(") && b.contains("fn arf_ar("), "{n}");
+                    assert!(
+                        b.contains("wmvh(gb, wgu_dsd, xn_dsd, Hc, 2 * Ic, false);"),
+                        "{n}"
+                    );
+                    assert!(b.contains("@as(@fp16(), @bitcast(f32, u))"), "{n}");
+                    assert!(
+                        b.contains("const R2X: u16 =") && b.contains("prof[slot] += lo - t_lo;"),
+                        "{n}"
+                    );
+                    assert!(
+                        b.contains("fn axis_xa()") && b.contains("3 * NCOL + 3"),
+                        "{n}"
+                    );
+                    assert!(b.contains("rope_tab();   // (op3)"), "{n}");
+                    assert!(
+                        b.contains("const QSCL: f32") && !b.contains("const qkn_a"),
+                        "{n}"
+                    );
+                }
+                "grid_pe.csl" => {
+                    assert!(!b.contains("fn arf_ar(") && !b.contains("fn wmvh("), "{n}");
+                    assert!(b.contains("@as(@fp16(), @bitcast(f32, u))"), "{n}");
+                }
+                "head_pe.csl" => {
+                    assert!(
+                        a.contains("]bf16);") && !b.contains("]bf16);") && b.contains("@fp16()"),
+                        "{n}"
+                    );
+                }
+                _ => assert_eq!(a, b, "{n}"),
+            }
+        }
+        cfg.ops2 = false;
+        assert!(params(&plan, &cfg).is_err());
+        cfg.ops2 = true;
+        cfg.arf = false;
+        assert!(params(&plan, &cfg).is_err(), "mem / arfx without arf");
+        cfg.mem = false;
+        assert!(params(&plan, &cfg).is_err(), "arfx without arf");
+    }
+
+    /// `grid_levers` states GRD (ARF 1, OP3 2, MEM 4) and patches the grid
+    /// kernel with the regions' levers; the regions' sources stay as without it.
+    #[test]
+    fn grid_levers_state_grd_and_patch_the_grids() {
+        let (plan, mut cfg) = cfg_for(1, false);
+        (cfg.speed, cfg.lse, cfg.ops2, cfg.qkv1, cfg.arf, cfg.arfx) =
+            (true, true, true, true, true, true);
+        (cfg.f16acc, cfg.f16accg, cfg.mem, cfg.op3) = (true, true, true, true);
+        let (d, p0) = params(&plan, &cfg).unwrap();
+        cfg.grid_levers = true;
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.clone());
+        assert_eq!(get("GRD").as_deref(), Some("7"));
+        assert!(p0.iter().all(|e| e.0 != "GRD"));
+        let base = ProgramSpec::from_params(d, &p0).unwrap();
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        assert_eq!(lay.model.grid, 7);
+        let a = d.files_with(base.model.variant()).unwrap();
+        let b = d.files_with(lay.model.variant()).unwrap();
+        for ((n, x), (_, y)) in a.iter().zip(&b) {
+            if *n == "grid_pe.csl" {
+                assert!(
+                    !x.contains("fn arf_ar(")
+                        && y.contains("fn arf_ar(")
+                        && y.contains("fn axis_xa()"),
+                    "{n}"
+                );
+                assert!(
+                    y.contains("rope_tab();   // (op3)") && y.contains("fn rope_vec()"),
+                    "{n}"
+                );
+                assert!(
+                    y.contains("const QSCL: f32") && !y.contains("const qkn_a"),
+                    "{n}"
+                );
+            } else {
+                assert_eq!(x, y, "{n}");
+            }
+        }
+        cfg.arf = false;
+        cfg.arfx = false;
+        cfg.mem = false;
+        let (_, p) = params(&plan, &cfg).unwrap();
+        assert_eq!(
+            p.iter().find(|e| e.0 == "GRD").map(|e| e.1.as_str()),
+            Some("2")
+        );
+        cfg.op3 = false;
+        assert!(params(&plan, &cfg).is_err(), "grid_levers with no lever");
+    }
+
+    /// The ring at PY 152: B 1 x 12 at CAP 32 ran on hardware (0402) and
+    /// builds; B 4 x 4 has not run there and stays refused.
+    #[test]
+    fn the_llama_3_ring_b1_ran_on_hardware() {
+        let (plan, cfg) = cfg_for(1, true);
+        let (d, p) = params(&plan, &cfg).unwrap();
+        assert_eq!(d, Design::Serve8bRegionPipe);
+        let get = |k: &str| p.iter().find(|e| e.0 == k).map(|e| e.1.as_str());
+        assert_eq!(
+            (get("PY"), get("B"), get("MMAX"), get("CAP")),
+            (Some("152"), Some("1"), Some("12"), Some("32"))
+        );
+        let (plan, cfg) = cfg_for(4, true);
+        let e = params(&plan, &cfg).unwrap_err();
+        assert!(e.contains("PY:152 is unsupported"), "{e}");
+    }
+
+    /// Without the rows pin the plan's 160 rows are too wide for the head
+    /// and strip (option A at 160 rows is 761 columns; the placement search
+    /// finds no other shape), and serve8b's strips do not hold 32 layers.
+    #[test]
+    fn llama_3_wants_its_rows_pinned() {
+        let goals = Goals {
+            blocks: Some(1),
+            host_copy: true,
+            grid_lanes: 4,
+            ..Goals::lanes(1)
+        };
+        let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+        let mut cfg = ServeConfig::new(goals);
+        cfg.region = true;
+        let g = plan.grid;
+        assert_eq!(g.py, 160);
+        assert!(
+            place_at(
+                &plan,
+                g,
+                (2 * g.px, 240, 3, 2, 4),
+                false,
+                false,
+                false,
+                true
+            )
+            .is_none()
+        );
+        let e = params(&plan, &cfg).unwrap_err();
+        assert!(e.contains("no serve8b_region placement"), "{e}");
+        cfg.region = false;
+        assert!(params(&plan, &cfg).is_err());
+    }
+
+    /// The checkpoint config's llama3 scaling gives the trace's table.
+    #[test]
+    fn the_config_rope_scaling_is_the_traces_table() {
+        let config = serde_json::json!({
+            "rope_theta": 500000.0,
+            "max_position_embeddings": 131072,
+            "rope_scaling": {
+                "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192, "rope_type": "llama3"
+            }
+        });
+        let r = crate::spatial::wafer::Rotary::of_config(&config, 128)
+            .unwrap()
+            .unwrap();
+        let s = spec();
+        let want = &s.rope_table.as_ref().unwrap().inv_freq;
+        let got = r.table.as_ref().unwrap();
+        assert_eq!(got.len(), 64);
+        for (a, b) in got.iter().zip(want) {
+            assert!((a - b).abs() <= 1e-6 * b.abs(), "{a} {b}");
+        }
+        assert_eq!(r.inv_freq(128).unwrap(), *got);
+        assert!(r.inv_freq(64).is_err());
+        assert!(r.theta_only("serve2d").is_err());
+        // transformers 5 spells it rope_parameters; a plain config has none.
+        let v5 = serde_json::json!({ "rope_parameters": config["rope_scaling"].clone() });
+        let mut v5 = v5;
+        v5["rope_parameters"]["rope_theta"] = serde_json::json!(500000.0);
+        let r5 = crate::spatial::wafer::Rotary::of_config(&v5, 128)
+            .unwrap()
+            .unwrap();
+        assert_eq!(r5.table, r.table);
+        let plain = serde_json::json!({ "rope_theta": 1.0e6 });
+        let p = crate::spatial::wafer::Rotary::of_config(&plain, 128)
+            .unwrap()
+            .unwrap();
+        assert!(p.table.is_none());
     }
 }

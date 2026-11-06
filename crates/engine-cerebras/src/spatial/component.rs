@@ -23,14 +23,14 @@ use super::program::{HeadKind, Kv, Layers, PageCopy, ProgramSpec, Sampler, Stage
 use super::serve2d::{BatchLane, VmTurns};
 use super::serve8b::Kernel;
 use super::wafer::rect;
-use crate::sdk::{DataType, Order};
+use crate::sdk::{DataType, Order, Rect};
 
 type R<T> = std::result::Result<T, String>;
 
-/// What a load places: the checkpoint and RoPE's theta.
+/// What a load places: the checkpoint and RoPE's frequencies.
 pub struct Weights<'a> {
     pub ckpt: &'a Ckpt,
-    pub rope_theta: f64,
+    pub rope: &'a super::wafer::Rotary,
 }
 
 /// One part of a wafer program, as the host drives it.
@@ -108,6 +108,14 @@ impl Layers {
                 .into_iter()
                 .map(|v| (v.x0, v.y0, v.k, v.layers.len()))
                 .collect(),
+            // serve_gptoss: the attention units (the pool's).
+            Layers::Gptoss { gpt, .. } => gpt
+                .slots
+                .units()
+                .into_iter()
+                .filter(|v| v.kind == super::serve8b_region::Kind::Attn)
+                .map(|v| (v.x0, v.y0, v.k, 1))
+                .collect(),
             Layers::Grids { grid, .. } | Layers::Strips { grid, .. } => (0..spec.layers())
                 .map(|l| {
                     let (x, y) = spec.origin(l);
@@ -117,11 +125,19 @@ impl Layers {
         }
     }
 
-    /// Bytes of one KV cell: f32 on the qwen2d grids, bf16 on paged8b's.
+    /// Bytes of one KV cell: f32 on the qwen2d grids, bf16 on paged8b's,
+    /// either on serve_gptoss's (`KV16`).
     #[must_use]
     pub fn kv_bytes(&self) -> usize {
         match self {
             Layers::Grids { .. } => 4,
+            Layers::Gptoss { gpt, .. } => {
+                if gpt.kv16 {
+                    2
+                } else {
+                    4
+                }
+            }
             Layers::Strips { .. } | Layers::Units { .. } => 2,
         }
     }
@@ -133,6 +149,7 @@ impl Component for Layers {
             Layers::Grids { .. } => "qwen2d grids",
             Layers::Strips { .. } => "paged8b strips",
             Layers::Units { .. } => "paged8b units",
+            Layers::Gptoss { .. } => "gpt-oss units",
         }
     }
 
@@ -140,6 +157,19 @@ impl Component for Layers {
         use abi::Symbol as S;
         let f32s = |names: &[&'static str]| names.iter().map(|&n| S::var32(n)).collect::<Vec<_>>();
         match self {
+            // serve_g4's gemma4_layer grids (bf16 projections) and the PLE
+            // region's tables.
+            Layers::Grids { gemma: Some(_), .. } => {
+                let mut out: Vec<S> = ["wqa", "wqv", "wv", "wo", "wgu", "wd", "wpm", "wpg", "wpp"]
+                    .into_iter()
+                    .map(S::var16)
+                    .collect();
+                out.extend(f32s(&[
+                    "qkn_w", "rot_c", "rot_s", "gamma1", "gamma2", "gamma3", "gamma4", "gamma5",
+                    "scal", "pnw", "ptab",
+                ]));
+                out
+            }
             // qwen2d's one-sequence grids, and qwen2d_paged's.
             // serve_q35's two units, every name either exports.
             Layers::Grids {
@@ -157,6 +187,21 @@ impl Component for Layers {
                     "gamma2",
                 ]),
             },
+            // gptoss_attn's and gptoss_moe's tiles, the handoff tables.
+            Layers::Gptoss { gpt, .. } => {
+                let mut out: Vec<S> = ["wqa", "wqv", "wv", "wo", "rw", "rtab"]
+                    .into_iter()
+                    .map(S::var16)
+                    .collect();
+                out.extend(f32s(&[
+                    "bqa", "bqv", "bv", "snk", "bo", "rot_c", "rot_s", "gamma1", "gamma2", "mx",
+                    "rb", "gub", "dnb", "mcfg",
+                ]));
+                if gpt.hroute {
+                    out.extend(f32s(&["rbits", "rcfg"]));
+                }
+                out
+            }
             // paged8b's bf16 tiles and f32 vectors, and the handoff tables.
             Layers::Strips { .. } | Layers::Units { .. } => {
                 let mut out: Vec<S> = ["wqa", "wqv", "wv", "wo", "wgu", "wd", "rtab"]
@@ -191,19 +236,40 @@ impl Component for Layers {
                 };
                 super::serve8b_region::put_routes(spec, units, dev, rbits.as_deref())
             }
+            Layers::Gptoss { gpt, .. } => {
+                super::serve_gptoss::put_routes(gpt, spec.paged().map_or(1, |s| s.lanes), dev)
+            }
         }
     }
 
     fn place(&self, spec: &ProgramSpec, w: &Weights, dev: &mut dyn Device) -> R<()> {
         match self {
+            Layers::Grids { gemma: Some(_), .. } => super::serve_g4::place(spec, w.ckpt, dev),
             Layers::Grids {
                 hybrid: Some(_), ..
-            } => super::serve_q35::place_layers(spec, w.ckpt, w.rope_theta, dev),
-            Layers::Grids { .. } => super::serve2d::place_layers(spec, w.ckpt, w.rope_theta, dev),
-            Layers::Strips { .. } => super::serve8b::place_layers(spec, w.ckpt, w.rope_theta, dev),
+            } => super::serve_q35::place_layers(
+                spec,
+                w.ckpt,
+                w.rope.theta_only(spec.design.name())?,
+                dev,
+            ),
+            Layers::Grids { .. } => super::serve2d::place_layers(
+                spec,
+                w.ckpt,
+                w.rope.theta_only(spec.design.name())?,
+                dev,
+            ),
+            Layers::Strips { .. } => super::serve8b::place_layers(spec, w.ckpt, w.rope, dev),
             Layers::Units { units, .. } => {
-                super::serve8b_region::place_layers(spec, units, w.ckpt, w.rope_theta, dev)
+                super::serve8b_region::place_layers(spec, units, w.ckpt, w.rope, dev)
             }
+            Layers::Gptoss { gpt, .. } => super::serve_gptoss::place_units(
+                gpt,
+                spec.hidden(),
+                spec.paged().map_or(1, |s| s.lanes),
+                w.ckpt,
+                dev,
+            ),
         }
     }
 }
@@ -215,6 +281,7 @@ impl Component for super::program::Head {
         match self.kind {
             HeadKind::Tied => "head2d",
             HeadKind::Untied => "head2d_v10",
+            HeadKind::Triples => "head2d_v10 (triples)",
         }
     }
 
@@ -232,7 +299,7 @@ impl Component for super::program::Head {
             Kv::Sequence => S::var32(SYM.logits),
             Kv::Paged { .. } => S::var32(SYM.logit_lanes),
         });
-        if self.kind == HeadKind::Untied {
+        if self.kind != HeadKind::Tied {
             // The embedding strip's table.
             out.push(S::var32("etab"));
         }
@@ -241,9 +308,12 @@ impl Component for super::program::Head {
 
     /// The tied head computes the logits from the embedding; the untied
     /// one places `lm_head` (and the embedding apart).
-    fn validate(&self, _spec: &ProgramSpec, ckpt: &Ckpt) -> R<()> {
+    fn validate(&self, spec: &ProgramSpec, ckpt: &Ckpt) -> R<()> {
         match self.kind {
-            HeadKind::Untied if !ckpt.has("head") => Err(
+            // Gemma 4 on serve8b_region (G12): the u4 head and strip both
+            // read the tied embedding's codes.
+            HeadKind::Untied if spec.gemma12().is_some() && ckpt.tied_head()? => Ok(()),
+            HeadKind::Untied | HeadKind::Triples if !ckpt.has("head") => Err(
                 "the checkpoint has no `head`; serve8b serves untied models (a tied one would \
                  need the embedding as the head)"
                     .into(),
@@ -263,6 +333,13 @@ impl Component for super::program::Head {
             HeadKind::Untied => {
                 super::serve8b::head(spec, w.ckpt, dev)?;
                 super::serve8b::embed(spec, w.ckpt, dev)
+            }
+            // serve_gptoss: chunk columns of three MoE rows; a strip column
+            // an attention row.
+            HeadKind::Triples => {
+                super::serve8b::head_with(spec, w.ckpt, dev, 3 * spec.hc())?;
+                let a = spec.gptoss().ok_or("a head of triples off serve_gptoss")?;
+                super::serve8b::embed_with(spec, w.ckpt, dev, a.slots.ay, a.slots.ahc)
             }
         }
     }
@@ -286,7 +363,7 @@ impl Component for Kv {
         // The pool's cells at the KV's width; the staging slots as the
         // design packs them (f32 or bf16 pairs in 32-bit words, bf16 one a
         // word).
-        let w = if spec.layers.kv_bytes() == 2 {
+        let w = if spec.kv_bytes() == 2 {
             S::var16
         } else {
             S::var32
@@ -339,7 +416,7 @@ impl Kv {
             cols: spec.px(),
             shape,
             cells: spec.dc() * shape.page_size,
-            data_type: if spec.layers.kv_bytes() == 2 {
+            data_type: if spec.kv_bytes() == 2 {
                 DataType::Bits16
             } else {
                 DataType::Bits32
@@ -364,6 +441,9 @@ impl Kv {
                 super::serve8b::copy_pages(spec, dev, pairs)
             }
             (Layers::Grids { .. }, PageCopy::Kernels) => paged::copy_pages(dev, &SYM, pairs),
+            (Layers::Gptoss { .. }, PageCopy::Kernels) => {
+                Err("serve_gptoss has no copy kernels".into())
+            }
             (_, PageCopy::Host) => paged::copy_pages_host(dev, &Kv::host_pool(spec, shape), pairs),
         }
     }
@@ -374,7 +454,11 @@ impl Kv {
     pub fn page_words(&self, spec: &ProgramSpec) -> Option<usize> {
         let (shape, _, _) = self.paged().ok()?;
         match spec.layers {
-            Layers::Grids { .. } => Some(paged::page_words(&Kv::host_pool(spec, shape))),
+            // serve_g4's pools differ by reading (Dc): no host tier.
+            Layers::Grids { gemma: Some(_), .. } => None,
+            Layers::Grids { .. } | Layers::Gptoss { .. } => {
+                Some(paged::page_words(&Kv::host_pool(spec, shape)))
+            }
             _ => super::serve8b::page_words(spec).ok(),
         }
     }
@@ -382,7 +466,7 @@ impl Kv {
     /// Bytes of one page's host copy: its cells at the KV's own width.
     #[must_use]
     pub fn page_bytes(&self, spec: &ProgramSpec) -> Option<usize> {
-        self.page_words(spec).map(|n| n * spec.layers.kv_bytes())
+        self.page_words(spec).map(|n| n * spec.kv_bytes())
     }
 
     /// `pages`' cells off the device, through the staging slots on a build
@@ -395,8 +479,11 @@ impl Kv {
         pages: &[u32],
     ) -> R<Vec<Vec<u32>>> {
         let (shape, _, staging) = self.paged()?;
+        if spec.gemma().is_some() {
+            return Err("serve_g4's pages stay on the wafer (no host tier)".into());
+        }
         match spec.layers {
-            Layers::Grids { .. } => {
+            Layers::Grids { .. } | Layers::Gptoss { .. } => {
                 let pool = Kv::host_pool(spec, shape);
                 if staging > 0 {
                     paged::read_pages_staged(dev, &pool, staging, pages)
@@ -419,8 +506,11 @@ impl Kv {
         pages: &[(u32, Vec<u32>)],
     ) -> R<()> {
         let (shape, _, staging) = self.paged()?;
+        if spec.gemma().is_some() {
+            return Err("serve_g4's pages stay on the wafer (no host tier)".into());
+        }
         match spec.layers {
-            Layers::Grids { .. } => {
+            Layers::Grids { .. } | Layers::Gptoss { .. } => {
                 let pool = Kv::host_pool(spec, shape);
                 if staging > 0 {
                     paged::write_pages_staged(dev, &pool, staging, pages)
@@ -476,14 +566,19 @@ impl Stage {
                 let n = mmax * shape.row_words();
                 super::serve2d::head_h2d(spec, dev, SYM.ring_table, &mtab, spec.feeder(), 1, n)
             }
+            (Stage::Single, Layers::Gptoss { gpt, .. }) => {
+                let lanes: Vec<BatchLane> = mbs.iter().flat_map(|mb| mb.iter().cloned()).collect();
+                super::serve_gptoss::put_tables(gpt, shape, dev, &table_rows(&lanes, gpt.slots.ay)?)
+            }
             (Stage::Single, layers) => {
                 // Every fabric row of the grids: its grid row's table row (a
                 // serve8b_region unit's: its own rows').
                 let lanes: Vec<BatchLane> = mbs.iter().flat_map(|mb| mb.iter().cloned()).collect();
                 let units = matches!(layers, Layers::Units { .. });
                 let mut tabs: Vec<(usize, Vec<u32>)> = Vec::new();
-                for grids in spec.grid_areas() {
-                    let rows = if units { grids.h as usize } else { spec.py() };
+                // (HV builds, PS 1: same-height units in one call each)
+                let merge = units && shape.page_size == 1;
+                for (grids, rows) in table_areas(spec.grid_areas(), merge, units, spec.py()) {
                     if !tabs.iter().any(|t| t.0 == rows) {
                         tabs.push((rows, table_rows(&lanes, rows)?));
                     }
@@ -491,13 +586,24 @@ impl Stage {
                     let all: Vec<u32> = (0..grids.h as usize / rows)
                         .flat_map(|_| tab.iter().copied())
                         .collect();
-                    dev.memcpy_h2d_rowbcast(
-                        SYM.table,
-                        &all,
-                        grids,
-                        shape.row_words(),
-                        DataType::Bits32,
-                    )
+                    if merge {
+                        // (HV builds: queued; the launch after them waits)
+                        dev.memcpy_h2d_rowbcast_nonblock(
+                            SYM.table,
+                            all,
+                            grids,
+                            shape.row_words(),
+                            DataType::Bits32,
+                        )
+                    } else {
+                        dev.memcpy_h2d_rowbcast(
+                            SYM.table,
+                            &all,
+                            grids,
+                            shape.row_words(),
+                            DataType::Bits32,
+                        )
+                    }
                     .map_err(e)?;
                 }
                 Ok(())
@@ -693,4 +799,53 @@ pub mod abi {
         }
         out
     }
+}
+
+/// The rects the paged tables go to (and their units' rows), one row broadcast each: serve8b_region's
+/// units of one height (regions; their tables are the same) that tile a
+/// rectangle exactly as one rect (the table repeated down it), so a launch
+/// writes the 10 regions of lever D in one call instead of ten (`merge`:
+/// HV builds); every other area as it is.
+fn table_areas(areas: Vec<Rect>, merge: bool, units: bool, py: usize) -> Vec<(Rect, usize)> {
+    if !merge {
+        return areas
+            .into_iter()
+            .map(|a| (a, if units { a.h as usize } else { py }))
+            .collect();
+    }
+    let mut out: Vec<(Rect, usize)> = Vec::new();
+    let mut seen: Vec<i32> = Vec::new();
+    for a in &areas {
+        if seen.contains(&a.h) {
+            continue;
+        }
+        seen.push(a.h);
+        let same: Vec<&Rect> = areas.iter().filter(|b| b.h == a.h).collect();
+        let (x0, y0) = (
+            same.iter().map(|b| b.x).min().unwrap_or(0),
+            same.iter().map(|b| b.y).min().unwrap_or(0),
+        );
+        let (x1, y1) = (
+            same.iter().map(|b| b.x + b.w).max().unwrap_or(0),
+            same.iter().map(|b| b.y + b.h).max().unwrap_or(0),
+        );
+        let area: i64 = same.iter().map(|b| i64::from(b.w) * i64::from(b.h)).sum();
+        let tiles = same.len() > 1
+            && area == i64::from(x1 - x0) * i64::from(y1 - y0)
+            && same.iter().all(|b| (b.y - y0) % a.h == 0);
+        if tiles {
+            out.push((
+                Rect {
+                    x: x0,
+                    y: y0,
+                    w: x1 - x0,
+                    h: y1 - y0,
+                },
+                a.h as usize,
+            ));
+        } else {
+            out.extend(same.into_iter().map(|b| (*b, b.h as usize)));
+        }
+    }
+    out
 }

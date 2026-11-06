@@ -192,8 +192,11 @@ impl Cslc {
                 .arg(compile.channels.to_string());
         }
         // The 16-bit float type (`f16`) is brain float: the models' half
-        // format, and what the host rounds bf16 handles to.
-        cmd.arg("--fp16-format=bf16");
+        // format, and what the host rounds bf16 handles to. (A program with
+        // `F16` > 0 computes in IEEE f16: its host writes f16 weights.)
+        if !compile.params.iter().any(|(k, v)| k == "F16" && v != "0") {
+            cmd.arg("--fp16-format=bf16");
+        }
         for (k, v) in &compile.params {
             cmd.arg(format!("--params={k}:{v}"));
         }

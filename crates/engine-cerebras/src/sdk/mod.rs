@@ -674,6 +674,52 @@ impl Runtime {
         Ok(())
     }
 
+    /// [`Runtime::memcpy_h2d_rowbcast`] without waiting: queued ahead of
+    /// later calls, `data` kept until [`Runtime::wait_pending`].
+    pub fn memcpy_h2d_rowbcast_nonblock(
+        &mut self,
+        symbol: &str,
+        data: Vec<u32>,
+        rect: Rect,
+        elems_per_pe: usize,
+        data_type: DataType,
+    ) -> Result<()> {
+        let id = self.rpc.id(symbol, RpcKind::Var)?;
+        let expected = (rect.h.max(0) as usize) * elems_per_pe;
+        if data.len() != expected {
+            return Err(Error::Size {
+                symbol: symbol.into(),
+                expected,
+                actual: data.len(),
+            });
+        }
+        let rowbcast = self.api().memcpy_h2d_rowbcast.ok_or_else(|| {
+            Error::MissingSymbol(
+                "cerebras::SdkRuntime::memcpy_h2d_rowbcast".into(),
+                "this SDK has no row-broadcast copy (the batched builds' tables need it)".into(),
+            )
+        })?;
+        let opts = MemcpyOptions::new(false, data_type as i32, Order::RowMajor as i32, true);
+        let mut task = Task::empty();
+        // SAFETY: data moves into `pending` and lives until the task is waited on.
+        unsafe {
+            (rowbcast)(
+                &mut task,
+                self.this(),
+                id,
+                data.as_ptr() as *mut c_void,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                elems_per_pe as i32,
+                &opts,
+            )
+        };
+        self.pending.push((task, data));
+        Ok(())
+    }
+
     /// Copies `data` into `symbol` like [`Runtime::memcpy_h2d`] without
     /// waiting: the copy is queued ahead of later calls, and
     /// [`Runtime::wait_pending`] (or any later blocking call's caller) ends it.

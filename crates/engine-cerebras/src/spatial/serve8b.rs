@@ -18,7 +18,7 @@
 use super::ckpt::Ckpt;
 use super::device::Device;
 use super::program::ProgramSpec;
-use super::wafer::{inv_freq, rect};
+use super::wafer::rect;
 
 type R<T> = std::result::Result<T, String>;
 
@@ -188,6 +188,48 @@ pub fn put_routes(lay: &ProgramSpec, dev: &mut dyn Device) -> R<()> {
     Ok(())
 }
 
+/// bf16 bits to IEEE f16 bits, round to nearest even (subnormals kept,
+/// overflow to infinity): the 16-bit weights of an `F16` program (compiled
+/// without `--fp16-format=bf16`).
+pub(crate) fn f16_bits(b: u16) -> u16 {
+    let u = u32::from(b) << 16;
+    let sign = ((u >> 16) & 0x8000) as u16;
+    let a = u & 0x7fff_ffff;
+    if a >= 0x7f80_0000 {
+        return sign | 0x7c00 | if a > 0x7f80_0000 { 0x200 } else { 0 };
+    }
+    let e = (a >> 23) as i32 - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7c00;
+    }
+    let m = (a & 0x7f_ffff) | 0x80_0000; // 24 bits with the hidden one
+    // f16's value is m * 2^(e - 15 - 23); its unit in the last place is
+    // 2^(max(e, 1) - 15 - 10): shift m right by 13 + (1 - e) below the normals.
+    let sh = 13 + (1 - e).max(0) as u32;
+    if sh > 24 + 1 {
+        return sign;
+    }
+    let (q, r) = (m >> sh, m & ((1 << sh) - 1));
+    let half = 1u32 << (sh - 1);
+    let q = q + u32::from(r > half || (r == half && q & 1 == 1));
+    // q carries the hidden bit for normals (e >= 1): exponent field e - 1 + carry.
+    let bits = if e >= 1 {
+        ((e as u32 - 1) << 10) + q
+    } else {
+        q
+    };
+    sign | bits as u16
+}
+
+/// The 16-bit weights as the program reads them: bf16 bits, or f16 under `F16`.
+pub(crate) fn f16_if(lay: &ProgramSpec, m: Vec<u16>) -> Vec<u16> {
+    // (PIE_CEREBRAS_F16_RAW=1, diagnostics: keep the bf16 bits in an F16 build)
+    if lay.model.f16 == 0 || std::env::var("PIE_CEREBRAS_F16_RAW").is_ok_and(|v| v == "1") {
+        return m;
+    }
+    m.into_iter().map(f16_bits).collect()
+}
+
 /// A 2-D tensor's bf16 bits, its shape checked.
 pub(crate) fn matrix(ckpt: &Ckpt, name: &str, rows: usize, cols: usize) -> R<Vec<u16>> {
     let (shape, bits) = ckpt.bits(name)?;
@@ -231,7 +273,7 @@ pub struct Rope<'a> {
 
 /// Per-PE blocks of a `k.py` x `k.px` unit, one leading pad element a PE,
 /// 16-bit: `f(py, px, out)` appends a PE's elements.
-fn put_pe16(
+pub(crate) fn put_pe16(
     k: Kernel,
     dev: &mut dyn Device,
     sym: &str,
@@ -274,10 +316,10 @@ fn put_pe32(
 pub(crate) fn place_layers(
     lay: &ProgramSpec,
     ckpt: &Ckpt,
-    rope_theta: f64,
+    rope: &super::wafer::Rotary,
     dev: &mut dyn Device,
 ) -> R<()> {
-    let inv_freq = inv_freq(rope_theta, lay.gs() * lay.dc());
+    let inv_freq = rope.inv_freq(lay.gs() * lay.dc())?;
     let rope = Rope {
         units: &[256, 16, 1],
         len: 16,
@@ -292,7 +334,7 @@ pub(crate) fn place_layers(
         ic: lay.ic(),
     };
     for l in 0..lay.layers() {
-        unit(lay, ckpt, k, &[l], lay.origin(l), &rope, true, dev)?;
+        unit(lay, ckpt, k, &[l], lay.origin(l), &rope, true, true, dev)?;
     }
     Ok(())
 }
@@ -314,6 +356,7 @@ pub(crate) fn unit(
     at: (usize, usize),
     rope: &Rope,
     kv_first: bool,
+    qkn: bool,
     dev: &mut dyn Device,
 ) -> R<()> {
     let (pxn, hc, dc, gs, ic) = (k.px, k.hc, k.dc, k.gs, k.ic);
@@ -325,7 +368,7 @@ pub(crate) fn unit(
     let mats = |w: &str, rows: usize, cols: usize| -> R<Vec<Vec<u16>>> {
         layers
             .iter()
-            .map(|&l| matrix(ckpt, &name(l, w), rows, cols))
+            .map(|&l| matrix(ckpt, &name(l, w), rows, cols).map(|m| f16_if(lay, m)))
             .collect()
     };
     let vecs = |w: &str, n: usize| -> R<Vec<Vec<f32>>> {
@@ -343,107 +386,155 @@ pub(crate) fn unit(
     };
     // Hidden dim (py, hc), or None in the padding past HR.
     let dim = |py: usize, kk: usize| Some(py * hc + kk).filter(|&x| x < hid);
-    let wq = mats("q", nq * d, hid)?;
-    let wk = mats("k", nkv * d, hid)?;
-    // Layer li's head h's (Qh: k's) row of dim dd of kv head g.
-    let qk = |li: usize, g: usize, h: usize, dd: usize, col: usize| -> u32 {
-        if h < qh {
-            u32::from(wq[li][((g * qh + h) * d + dd) * hid + col])
+    if lay.weights_u4() {
+        super::u4::place_unit(lay, ckpt, k, layers, at, dev)?;
+    } else {
+        let wq = mats("q", nq * d, hid)?;
+        let wk = mats("k", nkv * d, hid)?;
+        // Layer li's head h's (Qh: k's) row of dim dd of kv head g.
+        let qk = |li: usize, g: usize, h: usize, dd: usize, col: usize| -> u32 {
+            if h < qh {
+                u32::from(wq[li][((g * qh + h) * d + dd) * hid + col])
+            } else {
+                u32::from(wk[li][(g * d + dd) * hid + col])
+            }
+        };
+        if lay.model.qkv1 {
+            // QKV1: wqa holds each layer's [hc][q a | q v | v] rows (the kernel's
+            // one QKV matvec); wqv and wv are the kernel's dummies, not written.
+            let wv = mats("v", nkv * d, hid)?;
+            let qkw = 2 * nh * dh + dc;
+            put_pe16(k, dev, "wqa", at, nl * hc * qkw, |py, px, out| {
+                let (g, dl) = (px / gs, dl(px));
+                for (li, wv) in wv.iter().enumerate() {
+                    for kk in 0..hc {
+                        let col = dim(py, kk);
+                        for half in [0, dh] {
+                            for h in 0..nh {
+                                for i in 0..dh {
+                                    out.push(col.map_or(0, |c| qk(li, g, h, dl[half + i], c)));
+                                }
+                            }
+                        }
+                        for &dd in &dl {
+                            out.push(col.map_or(0, |c| u32::from(wv[(g * d + dd) * hid + c])));
+                        }
+                    }
+                }
+            })?;
+            drop((wq, wk, wv));
         } else {
-            u32::from(wk[li][(g * d + dd) * hid + col])
+            for (sym, half) in [("wqa", 0), ("wqv", dh)] {
+                put_pe16(k, dev, sym, at, nl * hc * nh * dh, |py, px, out| {
+                    let (g, dl) = (px / gs, dl(px));
+                    for li in 0..nl {
+                        for kk in 0..hc {
+                            for h in 0..nh {
+                                for i in 0..dh {
+                                    out.push(
+                                        dim(py, kk)
+                                            .map_or(0, |col| qk(li, g, h, dl[half + i], col)),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                })?;
+            }
+            drop((wq, wk));
+            let wv = mats("v", nkv * d, hid)?;
+            put_pe16(k, dev, "wv", at, nl * hc * dc, |py, px, out| {
+                let (g, dl) = (px / gs, dl(px));
+                for w in &wv {
+                    for kk in 0..hc {
+                        for &dd in &dl {
+                            out.push(
+                                dim(py, kk).map_or(0, |col| u32::from(w[(g * d + dd) * hid + col])),
+                            );
+                        }
+                    }
+                }
+            })?;
+            drop(wv);
         }
-    };
-    for (sym, half) in [("wqa", 0), ("wqv", dh)] {
-        put_pe16(k, dev, sym, at, nl * hc * nh * dh, |py, px, out| {
+        let wo = mats("o", hid, nq * d)?;
+        put_pe16(k, dev, "wo", at, nl * qh * dc * hc, |py, px, out| {
             let (g, dl) = (px / gs, dl(px));
+            for w in &wo {
+                for h in 0..qh {
+                    for &dd in &dl {
+                        let c = (g * qh + h) * d + dd;
+                        for kk in 0..hc {
+                            out.push(dim(py, kk).map_or(0, |row| u32::from(w[row * nq * d + c])));
+                        }
+                    }
+                }
+            }
+        })?;
+        drop(wo);
+        let wg = mats("gate", inter, hid)?;
+        let wu = mats("up", inter, hid)?;
+        put_pe16(k, dev, "wgu", at, nl * hc * 2 * ic, |py, px, out| {
             for li in 0..nl {
                 for kk in 0..hc {
+                    for (w, i) in [&wg[li], &wu[li]]
+                        .into_iter()
+                        .flat_map(|w| (0..ic).map(move |i| (w, i)))
+                    {
+                        out.push(
+                            dim(py, kk).map_or(0, |col| u32::from(w[(px * ic + i) * hid + col])),
+                        );
+                    }
+                }
+            }
+        })?;
+        drop((wg, wu));
+        let wd = mats("down", hid, inter)?;
+        put_pe16(k, dev, "wd", at, nl * ic * hc, |py, px, out| {
+            for w in &wd {
+                for i in 0..ic {
+                    for kk in 0..hc {
+                        out.push(
+                            dim(py, kk).map_or(0, |row| u32::from(w[row * inter + px * ic + i])),
+                        );
+                    }
+                }
+            }
+        })?;
+        drop(wd);
+    }
+    // Without q/k norms (Llama; the units built without them) the weights
+    // are ones: q's still carries 1/sqrt(head_dim).
+    let (qn, kn) = if lay.model.qk_norm {
+        (vecs("q_norm", d)?, vecs("k_norm", d)?)
+    } else {
+        let ones = vec![vec![1.0f32; d]; nl];
+        (ones.clone(), ones)
+    };
+    let scale = (d as f64).sqrt() as f32;
+    // (MEM 3 regions: q's scale is the kernel's constant, qkn_w one word)
+    if qkn {
+        put_pe32(k, dev, "qkn_w", at, nl * 2 * nh * dh, |_, px, out| {
+            let dl = dl(px);
+            for li in 0..nl {
+                for half in [0, dh] {
                     for h in 0..nh {
                         for i in 0..dh {
-                            out.push(dim(py, kk).map_or(0, |col| qk(li, g, h, dl[half + i], col)));
+                            let dd = dl[half + i];
+                            out.push(
+                                if h < qh {
+                                    qn[li][dd] / scale
+                                } else {
+                                    kn[li][dd]
+                                }
+                                .to_bits(),
+                            );
                         }
                     }
                 }
             }
         })?;
     }
-    drop((wq, wk));
-    let wv = mats("v", nkv * d, hid)?;
-    put_pe16(k, dev, "wv", at, nl * hc * dc, |py, px, out| {
-        let (g, dl) = (px / gs, dl(px));
-        for w in &wv {
-            for kk in 0..hc {
-                for &dd in &dl {
-                    out.push(dim(py, kk).map_or(0, |col| u32::from(w[(g * d + dd) * hid + col])));
-                }
-            }
-        }
-    })?;
-    drop(wv);
-    let wo = mats("o", hid, nq * d)?;
-    put_pe16(k, dev, "wo", at, nl * qh * dc * hc, |py, px, out| {
-        let (g, dl) = (px / gs, dl(px));
-        for w in &wo {
-            for h in 0..qh {
-                for &dd in &dl {
-                    let c = (g * qh + h) * d + dd;
-                    for kk in 0..hc {
-                        out.push(dim(py, kk).map_or(0, |row| u32::from(w[row * nq * d + c])));
-                    }
-                }
-            }
-        }
-    })?;
-    drop(wo);
-    let wg = mats("gate", inter, hid)?;
-    let wu = mats("up", inter, hid)?;
-    put_pe16(k, dev, "wgu", at, nl * hc * 2 * ic, |py, px, out| {
-        for li in 0..nl {
-            for kk in 0..hc {
-                for (w, i) in [&wg[li], &wu[li]]
-                    .into_iter()
-                    .flat_map(|w| (0..ic).map(move |i| (w, i)))
-                {
-                    out.push(dim(py, kk).map_or(0, |col| u32::from(w[(px * ic + i) * hid + col])));
-                }
-            }
-        }
-    })?;
-    drop((wg, wu));
-    let wd = mats("down", hid, inter)?;
-    put_pe16(k, dev, "wd", at, nl * ic * hc, |py, px, out| {
-        for w in &wd {
-            for i in 0..ic {
-                for kk in 0..hc {
-                    out.push(dim(py, kk).map_or(0, |row| u32::from(w[row * inter + px * ic + i])));
-                }
-            }
-        }
-    })?;
-    drop(wd);
-    let qn = vecs("q_norm", d)?;
-    let kn = vecs("k_norm", d)?;
-    let scale = (d as f64).sqrt() as f32;
-    put_pe32(k, dev, "qkn_w", at, nl * 2 * nh * dh, |_, px, out| {
-        let dl = dl(px);
-        for li in 0..nl {
-            for half in [0, dh] {
-                for h in 0..nh {
-                    for i in 0..dh {
-                        let dd = dl[half + i];
-                        out.push(
-                            if h < qh {
-                                qn[li][dd] / scale
-                            } else {
-                                kn[li][dd]
-                            }
-                            .to_bits(),
-                        );
-                    }
-                }
-            }
-        }
-    })?;
     for (sym, sin) in [("rot_c", false), ("rot_s", true)] {
         put_pe32(
             k,
@@ -494,7 +585,7 @@ pub(crate) fn unit(
 /// Writes a table of `HH` region rows, `w` PEs of `n` words each, built
 /// [`BLOCK`] rows at a time by `tile(r0, r1)`, to the region rows at
 /// columns `x0..` (skipping the feeder row F, as `_region_rows`).
-fn region_rows(
+pub(crate) fn region_rows(
     lay: &ProgramSpec,
     dev: &mut dyn Device,
     sym: &str,
@@ -523,7 +614,7 @@ fn region_rows(
 }
 
 /// Two bf16 to a u32 word, element 2k in the low half.
-fn pack(lo: u16, hi: u16) -> u32 {
+pub(crate) fn pack(lo: u16, hi: u16) -> u32 {
     u32::from(lo) | (u32::from(hi) << 16)
 }
 
@@ -531,9 +622,19 @@ fn pack(lo: u16, hi: u16) -> u32 {
 /// holds dims c Hh .. of vocab rows ry Vr .., dim-major, two to a word; a
 /// zero VM column after the root column; the final norm on the feeder row.
 pub(crate) fn head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()> {
-    let (vr, c_n, hid, vmc) = (lay.vr(), lay.chunk_cols(), lay.hidden(), lay.vmc());
-    let hh2 = 2 * lay.hc();
+    if lay.head_u4() {
+        super::u4::place_head(lay, ckpt, dev)?;
+        return head_gamma(lay, ckpt, dev, 2 * lay.hc());
+    }
+    head_with(lay, ckpt, dev, 2 * lay.hc())
+}
+
+/// [`head`] with `hh2` dims a chunk column (serve8b's pairs of grid rows,
+/// serve_gptoss's triples).
+pub(crate) fn head_with(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device, hh2: usize) -> R<()> {
+    let (vr, hid) = (lay.vr(), lay.hidden());
     let (shape, lm) = ckpt.bits("head")?;
+    let lm = f16_if(lay, lm);
     let v = shape[0];
     if shape.len() != 2 || shape[1] != hid || v > lay.vocab() || lay.vocab() > lay.hh() * vr {
         return Err(format!(
@@ -542,14 +643,8 @@ pub(crate) fn head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()
             lay.hh() * vr
         ));
     }
-    let r2x = lay.r2x();
     // Head columns (VM included): chunk column c, or None for the VM's.
-    let cols: Vec<Option<usize>> = (0..c_n)
-        .flat_map(|c| {
-            let vm = if c == r2x { vmc } else { 0 };
-            std::iter::once(Some(c)).chain(std::iter::repeat_n(None, vm))
-        })
-        .collect();
+    let cols = head_cols(lay);
     let n = hh2 * vr / 2;
     let el = |row: usize, c: usize, j: usize| -> u16 {
         let (k, vv) = (j / vr, j % vr);
@@ -575,6 +670,23 @@ pub(crate) fn head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()
         t
     })?;
     drop(lm);
+    head_gamma(lay, ckpt, dev, hh2)
+}
+
+/// The head's chunk columns, the VM's (`None`) after the root column.
+pub(crate) fn head_cols(lay: &ProgramSpec) -> Vec<Option<usize>> {
+    let (r2x, vmc) = (lay.r2x(), lay.vmc());
+    (0..lay.chunk_cols())
+        .flat_map(|c| {
+            let vm = if c == r2x { vmc } else { 0 };
+            std::iter::once(Some(c)).chain(std::iter::repeat_n(None, vm))
+        })
+        .collect()
+}
+
+/// The final norm on the head's feeder row (`hh2` dims a chunk column).
+fn head_gamma(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device, hh2: usize) -> R<()> {
+    let (hid, cols) = (lay.hidden(), head_cols(lay));
     let g = vector(ckpt, "final_norm", hid)?;
     let gam: Vec<u32> = cols
         .iter()
@@ -593,8 +705,22 @@ pub(crate) fn head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()
 /// column EC-1-c, ry) holds dims [c He, (c+1) He) of vocab rows ry Vr ..,
 /// row-major bf16, two to a word.
 pub(crate) fn embed(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()> {
+    if lay.head_u4() {
+        return super::u4::place_embed(lay, ckpt, dev);
+    }
+    embed_with(lay, ckpt, dev, lay.py() / 4, 4 * lay.hc())
+}
+
+/// [`embed`] over `ec` strip columns of `he` dims (a PE's words padded to
+/// whole words when `Vr He` is odd).
+pub(crate) fn embed_with(
+    lay: &ProgramSpec,
+    ckpt: &Ckpt,
+    dev: &mut dyn Device,
+    ec: usize,
+    he: usize,
+) -> R<()> {
     let (ve, hid) = (lay.vr(), lay.hidden());
-    let (ec, he) = (lay.py() / 4, 4 * lay.hc());
     let (shape, em) = ckpt.bits("embed")?;
     let v = shape[0];
     if shape.len() != 2 || shape[1] != hid || v > lay.hh() * ve {
@@ -603,11 +729,11 @@ pub(crate) fn embed(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<(
             lay.hh() * ve
         ));
     }
-    let n = ve * he / 2;
+    let n = (ve * he).div_ceil(2);
     let el = |row: usize, c: usize, j: usize| -> u16 {
         let (vv, k) = (j / he, j % he);
         let (vocab_row, d) = (row * ve + vv, c * he + k);
-        if vocab_row < v && d < hid {
+        if vv < ve && vocab_row < v && d < hid {
             em[vocab_row * hid + d]
         } else {
             0
@@ -952,6 +1078,62 @@ pub fn page_in_many(lay: &ProgramSpec, dev: &mut dyn Device, pages: &[(u32, Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every bf16 value goes to its nearest f16 (ties to even), subnormals
+    /// included; past f16's range to infinity; NaN stays NaN.
+    #[test]
+    fn f16_bits_round_every_bf16_to_nearest() {
+        let f16v = |h: u16| -> f64 {
+            let (s, e, m) = (
+                if h >> 15 == 1 { -1.0 } else { 1.0 },
+                (h >> 10) & 0x1f,
+                f64::from(h & 0x3ff),
+            );
+            match e {
+                0 => s * m * 2f64.powi(-24),
+                31 => {
+                    if m == 0.0 {
+                        s * f64::INFINITY
+                    } else {
+                        f64::NAN
+                    }
+                }
+                _ => s * (1.0 + m / 1024.0) * 2f64.powi(i32::from(e) - 15),
+            }
+        };
+        for b in 0..=u16::MAX {
+            let x = f64::from(f32::from_bits(u32::from(b) << 16));
+            let h = f16_bits(b);
+            if x.is_nan() {
+                assert!(f16v(h).is_nan(), "{b:#x}");
+                continue;
+            }
+            if x.abs() >= 65520.0 {
+                assert_eq!(f16v(h), x.signum() * f64::INFINITY, "{b:#x}");
+                continue;
+            }
+            let y = f16v(h);
+            assert_eq!(y.is_sign_negative(), x.is_sign_negative(), "{b:#x}");
+            let (lo, hi) = (
+                f16v((h.wrapping_sub(1) & 0x7fff) | (h & 0x8000)),
+                f16v(((h & 0x7fff) + 1) | (h & 0x8000)),
+            );
+            let dist = |v: f64| {
+                if v.is_nan() {
+                    f64::INFINITY
+                } else {
+                    (v - x).abs()
+                }
+            };
+            let err = dist(y);
+            assert!(err <= dist(lo) && err <= dist(hi), "{b:#x}: {x} -> {y}");
+            if err > 0.0 && (err == dist(lo) || err == dist(hi)) {
+                assert_eq!(h & 1, 0, "{b:#x}: a tie goes to even");
+            }
+        }
+        assert_eq!(f16_bits(0x3f80), 0x3c00);
+        assert_eq!(f16_bits(0xc000), 0xc000);
+    }
 
     /// A simulator build (HEADMODE 2, B 2): 5 layers in strips of
     /// 2, 2 and 1 grids.

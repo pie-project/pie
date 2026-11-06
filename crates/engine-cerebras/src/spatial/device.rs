@@ -51,6 +51,19 @@ pub trait Device {
         data_type: DataType,
     ) -> sdk::Result<()>;
 
+    /// [`Device::memcpy_h2d_rowbcast`] queued without waiting (the default
+    /// waits).
+    fn memcpy_h2d_rowbcast_nonblock(
+        &mut self,
+        symbol: &str,
+        data: Vec<u32>,
+        rect: Rect,
+        elems_per_pe: usize,
+        data_type: DataType,
+    ) -> sdk::Result<()> {
+        self.memcpy_h2d_rowbcast(symbol, &data, rect, elems_per_pe, data_type)
+    }
+
     /// [`Device::memcpy_h2d`] queued without waiting.
     fn memcpy_h2d_nonblock(
         &mut self,
@@ -203,6 +216,17 @@ impl Device for Runtime {
         Runtime::memcpy_h2d_rowbcast(self, symbol, data, rect, elems_per_pe, data_type)
     }
 
+    fn memcpy_h2d_rowbcast_nonblock(
+        &mut self,
+        symbol: &str,
+        data: Vec<u32>,
+        rect: Rect,
+        elems_per_pe: usize,
+        data_type: DataType,
+    ) -> sdk::Result<()> {
+        Runtime::memcpy_h2d_rowbcast_nonblock(self, symbol, data, rect, elems_per_pe, data_type)
+    }
+
     fn memcpy_h2d_nonblock(
         &mut self,
         symbol: &str,
@@ -348,6 +372,19 @@ mod recorder {
                 .memory
                 .get(&(symbol.to_string(), x, y))
                 .cloned()
+        }
+
+        /// Every (symbol, x, y) and its words, sorted.
+        pub fn dump(&self) -> Vec<((String, i32, i32), Vec<u32>)> {
+            let mut out: Vec<_> = self
+                .state
+                .borrow()
+                .memory
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            out.sort();
+            out
         }
 
         /// The calls so far, and the log emptied.

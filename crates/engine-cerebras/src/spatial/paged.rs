@@ -54,6 +54,80 @@ impl Shape {
     }
 }
 
+/// Kernel pages relabelled so a lane's consecutive pages fill a `py`-row
+/// unit's rows by their all-reduce slack (`ar:<py>:<gy>`; bench8b
+/// `BENCH8B_PAGEORDER`, the wafer handle's `PIE_CEREBRAS_PAGE_ORDER`): page
+/// k is (k / py) py + order[k % py], `order` the rows of the grouped
+/// two-phase all-reduce (groups of gy into R2 = (py/gy/2) gy + gy/2, then
+/// R2's broadcast) by modelled slack: 2.3 cycles a row of broadcast skew, 50
+/// a phase-2 group hop, 12.4 a phase-1 hop. At PS 1 the rows holding one
+/// position more than the others are the first T mod py of `order`: the
+/// ones the o/l all-reduce waits for least (0488: -0.2k a region layer).
+/// Only whole blocks of `py` below E P (the pool's entries a row times its
+/// rows) are relabelled: every page there leaves each pool row at most E
+/// pages (E P / py blocks hold <= E a row), and the pages from there on stay
+/// as they are, so a lane of up to E P positions still fits the tables and
+/// the map is a bijection on the pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowOrder {
+    py: u32,
+    order: Vec<u32>,
+    limit: u32,
+}
+
+impl RowOrder {
+    /// `spec` = `ar:<py>:<gy>` over the kernel pool `shape`.
+    pub fn parse(spec: &str, shape: &Shape) -> R<RowOrder> {
+        let f: Vec<&str> = spec.split(':').collect();
+        let bad = || format!("page order {spec:?}: want ar:<py>:<gy>");
+        if f.len() != 3 || f[0] != "ar" {
+            return Err(bad());
+        }
+        let py: i64 = f[1].parse().map_err(|_| bad())?;
+        let gy: i64 = f[2].parse().map_err(|_| bad())?;
+        if py <= 0 || gy <= 0 || py % gy != 0 {
+            return Err(bad());
+        }
+        let ng = py / gy;
+        let (gr, r2g) = (gy / 2, ng / 2);
+        let r2 = r2g * gy + gr;
+        let slack = |r: i64| -> f64 {
+            let (g, k) = (r / gy, r % gy);
+            let p1 = if k == gr {
+                gr
+            } else if k < gr {
+                k
+            } else {
+                gy - 1 - k
+            };
+            2.3 * (r2.max(py - 1 - r2) - (r - r2).abs()) as f64
+                + 50.0 * (r2g.max(ng - 1 - r2g) - (g - r2g).abs()) as f64
+                + 12.4 * p1 as f64
+        };
+        let mut order: Vec<i64> = (0..py).collect();
+        order.sort_by(|&a, &b| slack(b).total_cmp(&slack(a)).then(a.cmp(&b)));
+        let py = py as u32;
+        Ok(RowOrder {
+            py,
+            order: order.into_iter().map(|r| r as u32).collect(),
+            limit: ((shape.pages().min(shape.entries * shape.rows) as u32) / py) * py,
+        })
+    }
+
+    /// The rows, best first.
+    pub fn rows(&self) -> &[u32] {
+        &self.order
+    }
+
+    /// Kernel page `k`'s relabelled page.
+    pub fn map(&self, k: u32) -> u32 {
+        if k >= self.limit {
+            return k;
+        }
+        (k / self.py) * self.py + self.order[(k % self.py) as usize]
+    }
+}
+
 /// One lane of a pass: the RoPE position it rotates by, the KV slot it
 /// appends at, the pool pages its table names (logical page i is
 /// `pages[i]`) and the slots it attends (`None`: every slot up to its own).
@@ -655,6 +729,37 @@ mod tests {
             pages,
             visible: None,
         }
+    }
+
+    #[test]
+    fn the_ar_row_order_is_a_bijection_that_starts_at_the_root() {
+        let shape = Shape {
+            lanes: 1,
+            rows: 152,
+            page_size: 1,
+            blocks: 16,
+            entries: 5,
+        };
+        let o = RowOrder::parse("ar:208:16", &shape).unwrap();
+        assert_eq!(o.rows()[..5], [104, 103, 105, 102, 106]);
+        assert_eq!(o.rows()[205..], [1, 207, 0]);
+        let mut seen: Vec<u32> = (0..16 * 152).map(|k| o.map(k)).collect();
+        assert_eq!(o.map(208 + 1), 208 + 103);
+        assert_eq!(o.map(16 * 152 - 1), 16 * 152 - 1);
+        // Relabelled below 3 x 208 = 624 (<= 5 x 152), in place from there:
+        // every prefix of a lane's pages keeps <= E pages a pool row.
+        assert_eq!((o.map(623) % 208, o.map(624)), (0, 624));
+        for t in [532u32, 624, 700, 760] {
+            let mut n = vec![0usize; 152];
+            for k in 0..t {
+                n[(o.map(k) % 152) as usize] += 1;
+            }
+            assert!(n.iter().all(|&c| c <= 5), "{t} positions");
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (0..16 * 152).collect::<Vec<u32>>());
+        assert!(RowOrder::parse("ar:208:15", &shape).is_err());
+        assert!(RowOrder::parse("bad", &shape).is_err());
     }
 
     #[test]

@@ -188,6 +188,131 @@ pub(crate) fn inv_freq(rope_theta: f64, d: usize) -> Vec<f32> {
         .collect()
 }
 
+/// RoPE's frequencies a placement writes: `theta`'s, unless a table is
+/// stated (a llama3/YaRN scaling: the trace's, or the checkpoint config's
+/// `rope_scaling`), `d / 2` inverse frequencies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rotary {
+    pub theta: f64,
+    pub table: Option<Vec<f32>>,
+}
+
+impl Rotary {
+    #[must_use]
+    pub fn theta(theta: f64) -> Rotary {
+        Rotary { theta, table: None }
+    }
+
+    /// The inverse frequencies over `d` dims: the table's, or theta's.
+    pub fn inv_freq(&self, d: usize) -> R<Vec<f32>> {
+        match &self.table {
+            None => Ok(inv_freq(self.theta, d)),
+            Some(t) if t.len() == d / 2 => Ok(t.clone()),
+            Some(t) => Err(format!(
+                "RoPE table of {} frequencies for a head of {d} dims",
+                t.len()
+            )),
+        }
+    }
+
+    /// Theta, on placements that build frequencies from theta alone.
+    pub fn theta_only(&self, what: &str) -> R<f64> {
+        match self.table {
+            None => Ok(self.theta),
+            Some(_) => Err(format!(
+                "{what}'s placement builds RoPE from theta; a scaled table (llama3/YaRN) \
+                 is serve8b's and serve8b_region's"
+            )),
+        }
+    }
+
+    /// The checkpoint config's: `rope_theta` (or `rope_parameters`'), and
+    /// its `rope_scaling` turned into a table over `d` dims (`None`: no
+    /// theta stated).
+    pub fn of_config(config: &serde_json::Value, d: usize) -> R<Option<Rotary>> {
+        let params = &config["rope_parameters"];
+        let Some(theta) = config["rope_theta"]
+            .as_f64()
+            .or_else(|| params["rope_theta"].as_f64())
+        else {
+            return Ok(None);
+        };
+        let scaling = match &config["rope_scaling"] {
+            serde_json::Value::Object(_) => &config["rope_scaling"],
+            _ => params,
+        };
+        let max = config["max_position_embeddings"]
+            .as_u64()
+            .and_then(|m| u32::try_from(m).ok());
+        let table = match poem::rope::RopeScaling::of(&JsonDict(scaling), max)
+            .map_err(|e| format!("config.json's rope scaling: {e}"))?
+        {
+            None => None,
+            Some(s) => {
+                let pairs = u32::try_from(d / 2).map_err(|e| e.to_string())?;
+                let f = s
+                    .freqs(theta as f32, pairs, pairs)
+                    .map_err(|e| format!("config.json's rope scaling: {e}"))?;
+                if f.mscale != 1.0 {
+                    return Err(format!(
+                        "config.json's rope scaling scales cos/sin by {} (YaRN): not placed",
+                        f.mscale
+                    ));
+                }
+                Some(f.inv_freq)
+            }
+        };
+        Ok(Some(Rotary { theta, table }))
+    }
+}
+
+/// A `rope_scaling` dict of a config.json, read by key.
+struct JsonDict<'a>(&'a serde_json::Value);
+
+impl poem::rope::Entries for JsonDict<'_> {
+    fn number(&self, key: &str) -> anyhow::Result<Option<f64>> {
+        match &self.0[key] {
+            serde_json::Value::Null => Ok(None),
+            v => v
+                .as_f64()
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("rope scaling's `{key}` is a number, not {v}")),
+        }
+    }
+    fn numbers(&self, key: &str) -> anyhow::Result<Option<Vec<f64>>> {
+        match &self.0[key] {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::Array(a) => a
+                .iter()
+                .map(|v| {
+                    v.as_f64()
+                        .ok_or_else(|| anyhow::anyhow!("rope scaling's `{key}` holds {v}"))
+                })
+                .collect::<anyhow::Result<_>>()
+                .map(Some),
+            v => anyhow::bail!("rope scaling's `{key}` is a list, not {v}"),
+        }
+    }
+    fn text(&self, key: &str) -> anyhow::Result<Option<String>> {
+        match &self.0[key] {
+            serde_json::Value::Null => Ok(None),
+            v => v
+                .as_str()
+                .map(|t| Some(t.to_string()))
+                .ok_or_else(|| anyhow::anyhow!("rope scaling's `{key}` is a string, not {v}")),
+        }
+    }
+    fn flag(&self, key: &str) -> anyhow::Result<Option<bool>> {
+        match &self.0[key] {
+            serde_json::Value::Null => Ok(None),
+            v => v
+                .as_bool()
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("rope scaling's `{key}` is a bool, not {v}")),
+        }
+    }
+}
+
 /// What a load places: a checkpoint's weights, or nothing (a host-protocol
 /// check of a shape too large to fill).
 #[derive(Clone, Copy)]
@@ -196,41 +321,47 @@ pub enum Weights<'a> {
     Skip,
 }
 
-/// Refuses `ckpt` where a component of `design` cannot place it; RoPE's
-/// theta: `rope_theta` (the model's), else the checkpoint
-/// config's, else 1e6.
-fn check_weights(design: &ProgramSpec, ckpt: &Ckpt, rope_theta: Option<f64>) -> R<f64> {
+/// Refuses `ckpt` where a component of `design` cannot place it; RoPE:
+/// `rope` (the model's), else the checkpoint config's (its theta and
+/// scaling), else theta 1e6.
+fn check_weights(design: &ProgramSpec, ckpt: &Ckpt, rope: Option<Rotary>) -> R<Rotary> {
     for c in design.components() {
         c.validate(design, ckpt)?;
     }
-    let config_theta = ckpt.config()["rope_theta"].as_f64();
-    if let (Some(theta), Some(config)) = (rope_theta, config_theta)
-        && (theta - config).abs() > 1e-6 * config.abs()
+    // (serve_gptoss places its own YaRN tables and mscale, serve_gptoss::yarn_inv_freq:
+    // the generic table's refusal of an mscale is not its)
+    let config = match Rotary::of_config(ckpt.config(), design.head_dim()) {
+        Err(_) if design.gptoss().is_some() => None,
+        r => r?,
+    };
+    if let (Some(rope), Some(config)) = (&rope, &config)
+        && ((rope.theta - config.theta).abs() > 1e-6 * config.theta.abs()
+            || rope.table.is_some() != config.table.is_some())
     {
         tracing::warn!(
-            theta,
-            config,
-            "spatial wafer: the checkpoint config's rope_theta differs from the model's"
+            theta = rope.theta,
+            config = config.theta,
+            "spatial wafer: the checkpoint config's RoPE differs from the model's"
         );
     }
-    Ok(rope_theta.or(config_theta).unwrap_or(1.0e6))
+    Ok(rope.or(config).unwrap_or(Rotary::theta(1.0e6)))
 }
 
 impl WaferModel {
-    /// [`WaferModel::open_with`] on a Hugging Face directory, RoPE's theta
-    /// from its config.
+    /// [`WaferModel::open_with`] on a Hugging Face directory, RoPE from its
+    /// config.
     pub fn open(program: &Path, ckpt_dir: &Path, platform: Platform) -> R<WaferModel> {
         WaferModel::open_with(program, Ckpt::open(ckpt_dir)?, platform, None)
     }
 
-    /// Loads `program` and places `ckpt`'s weights; RoPE's theta is
-    /// `rope_theta` (the model's, from its trace), else the checkpoint
-    /// config's (else 1e6).
+    /// Loads `program` and places `ckpt`'s weights; RoPE is `rope` (the
+    /// model's, from its trace), else the checkpoint config's (else theta
+    /// 1e6).
     pub fn open_with(
         program: &Path,
         ckpt: Ckpt,
         platform: Platform,
-        rope_theta: Option<f64>,
+        rope: Option<Rotary>,
     ) -> R<WaferModel> {
         let design = read_design(program)?;
         // The VM's out ring's words, from the program's own account.
@@ -239,13 +370,7 @@ impl WaferModel {
         let mut rt = Runtime::new(sdk, program, platform, "WARNING").map_err(|e| e.to_string())?;
         rt.load();
         rt.run();
-        WaferModel::on_device(
-            Box::new(rt),
-            design,
-            Weights::Place(&ckpt),
-            rope_theta,
-            ring,
-        )
+        WaferModel::on_device(Box::new(rt), design, Weights::Place(&ckpt), rope, ring)
     }
 
     /// The loaded program `design` on `dev` (loaded and running): its
@@ -255,12 +380,12 @@ impl WaferModel {
         mut rt: Box<dyn Device>,
         design: ProgramSpec,
         weights: Weights,
-        rope_theta: Option<f64>,
+        rope: Option<Rotary>,
         ring: usize,
     ) -> R<WaferModel> {
-        let rope_theta = match weights {
-            Weights::Place(ckpt) => Some(check_weights(&design, ckpt, rope_theta)?),
-            Weights::Skip => rope_theta,
+        let rope = match weights {
+            Weights::Place(ckpt) => Some(check_weights(&design, ckpt, rope)?),
+            Weights::Skip => rope,
         };
         let started = Instant::now();
         // The route tables `init` applies.
@@ -277,8 +402,8 @@ impl WaferModel {
             "spatial wafer: program loaded"
         );
         let started = Instant::now();
-        if let (Weights::Place(ckpt), Some(rope_theta)) = (weights, rope_theta) {
-            let w = super::component::Weights { ckpt, rope_theta };
+        if let (Weights::Place(ckpt), Some(rope)) = (weights, &rope) {
+            let w = super::component::Weights { ckpt, rope };
             for c in design.components() {
                 c.place(&design, &w, &mut *rt)?;
             }
@@ -365,6 +490,53 @@ impl WaferModel {
 
     pub fn design(&self) -> &ProgramSpec {
         &self.design
+    }
+
+    /// The profile counters (`prof`, 16 words a PE) of every layer unit
+    /// (serve8b_region's grid areas, in layer order) and of the head block:
+    /// for each, the max and the mean over its PEs a slot. The units count
+    /// under TIME 1 (PROF 0: slot 0 the pass; PROF 1: a slot a phase), the
+    /// head always. `zero` writes them back to 0 after the read.
+    #[allow(clippy::type_complexity)]
+    pub fn profile(&mut self, zero: bool) -> R<Vec<(Rect, Vec<u32>, Vec<f64>)>> {
+        const NP: usize = 16;
+        let mut rects = self.design.grid_areas();
+        let hx = self.design.head_x();
+        rects.push(rect(
+            hx,
+            0,
+            self.design.chunk_cols() + self.design.vmc(),
+            self.design.hh() + 1,
+        ));
+        let mut out = Vec::new();
+        for r in rects {
+            let a = self.rt.get("prof", r, NP)?;
+            let n = a.len() / NP;
+            let mut mx = vec![0u32; NP];
+            let mut mean = vec![0f64; NP];
+            for pe in a.chunks(NP) {
+                for s in 0..NP {
+                    mx[s] = mx[s].max(pe[s]);
+                    mean[s] += pe[s] as f64 / n as f64;
+                }
+            }
+            if zero {
+                self.rt.write("prof", r, NP, &vec![0u32; a.len()])?;
+            }
+            out.push((r, mx, mean));
+        }
+        Ok(out)
+    }
+
+    /// The head block's profile counters per PE (16 words a PE, row-major over
+    /// [`Self::profile`]'s head rectangle), and that rectangle's width.
+    pub fn profile_head_raw(&mut self) -> R<(Vec<u32>, usize)> {
+        let hx = self.design.head_x();
+        let w = self.design.chunk_cols() + self.design.vmc();
+        let a = self
+            .rt
+            .get("prof", rect(hx, 0, w, self.design.hh() + 1), 16)?;
+        Ok((a, w))
     }
 
     /// Why the head's VM cannot take `table` (no VM, or a table past its
@@ -992,7 +1164,7 @@ impl WaferModel {
     /// (the host tier's suspension). Only between launches.
     pub fn page_out(&mut self, pages: &[u32]) -> R<Vec<Vec<u32>>> {
         let grid = &self.design;
-        let bf16 = grid.layers.kv_bytes() == 2;
+        let bf16 = grid.kv_bytes() == 2;
         // A staged copy is one with no fire inside it: the flag stays up
         // past an error midway, and fires refuse while it is.
         self.staged = true;
@@ -1013,7 +1185,7 @@ impl WaferModel {
             .kv
             .page_words(grid)
             .ok_or("the host keeps no pages of this build")?;
-        let bf16 = grid.layers.kv_bytes() == 2;
+        let bf16 = grid.kv_bytes() == 2;
         self.staged = true;
         let cells: Vec<(u32, Vec<u32>)> = pages
             .iter()
@@ -1192,6 +1364,41 @@ enum Job {
     },
 }
 
+impl Job {
+    /// The job's name in the slow-job line.
+    fn kind(&self) -> &'static str {
+        match self {
+            Job::Forward { .. } => "forward",
+            Job::Greedy { .. } => "greedy",
+            Job::Batch { .. } => "batch",
+            Job::Posted { .. } => "posted",
+            Job::Copy { .. } => "copy",
+            Job::CopyState { .. } => "copy_state",
+            Job::PageOut { .. } => "page_out",
+            Job::PageIn { .. } => "page_in",
+            Job::VmLoad { .. } => "vm_load",
+            Job::VmStep { .. } => "vm_step",
+            Job::VmLoadLanes { .. } => "vm_load_lanes",
+            Job::VmSeedBank { .. } => "vm_seed_bank",
+            Job::VmFire { .. } => "vm_fire",
+            Job::VmPlaceLanes { .. } => "vm_place_lanes",
+        }
+    }
+}
+
+/// Logs a wafer-thread job that took over 50 ms when it ends (dropped); a
+/// launch (`batch`, `posted`) says so itself when slow for its steps.
+struct SlowJob(&'static str, std::time::Instant);
+
+impl Drop for SlowJob {
+    fn drop(&mut self) {
+        let ms = self.1.elapsed().as_secs_f64() * 1e3;
+        if ms > 50.0 && !matches!(self.0, "batch" | "posted") {
+            tracing::warn!(kind = self.0, ms, "spatial wafer: a slow job");
+        }
+    }
+}
+
 type Answer = R<(Vec<u32>, Vec<Vec<f32>>)>;
 /// Each lane's tokens and logits rows.
 pub(crate) type BatchAnswer = R<super::serve2d::BatchOut>;
@@ -1225,17 +1432,80 @@ pub struct Wafer {
     pub hidden: usize,
     /// The build has recurrent layers (serve_q35): lanes carry their state.
     pub recurrent: bool,
+    /// Kernel pages a PIE page (1: the program's pages are PIE's). A build
+    /// whose pages are shorter than PIE's (HV, `PS` 1) keeps PIE's page
+    /// size: PIE page `g` is kernel pages `g * group .. (g + 1) * group`
+    /// (offset `o` in kernel page `g * group + o / PS`), expanded here at
+    /// the handle: the lanes' page tables, the page copies and the host
+    /// tier's pages. `paged` and `page_bytes` are PIE's view.
+    pub group: u32,
+    /// `PIE_CEREBRAS_PAGE_ORDER` (`ar:<py>:<gy>`): kernel pages relabelled
+    /// onto the rows by all-reduce slack ([`super::paged::RowOrder`]),
+    /// after the group expansion, on every page the handle passes on.
+    pub row_order: Option<super::paged::RowOrder>,
+}
+
+/// The handle's page order from `PIE_CEREBRAS_PAGE_ORDER`, over a kernel
+/// pool of `paged`'s pages (unset or no pool: none).
+fn row_order_env(paged: Option<super::paged::Shape>) -> R<Option<super::paged::RowOrder>> {
+    match (std::env::var("PIE_CEREBRAS_PAGE_ORDER").ok(), paged) {
+        (Some(spec), Some(shape)) => {
+            let o = super::paged::RowOrder::parse(&spec, &shape)?;
+            tracing::info!(
+                "PIE_CEREBRAS_PAGE_ORDER {spec}: rows first {:?}",
+                &o.rows()[..4.min(o.rows().len())]
+            );
+            Ok(Some(o))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// One launch's account: how long the wafer thread waited for it (`idle_ms`,
+/// since its previous job), how long it ran (`ms`, tables to tokens), its
+/// passes and lanes, and the kernel pages its lanes name.
+fn launch_line(
+    kind: &str,
+    lanes: &[super::serve2d::BatchLane],
+    steps: usize,
+    idle_from: std::time::Instant,
+    t0: std::time::Instant,
+) {
+    tracing::info!(
+        kind,
+        steps,
+        lanes = lanes.len(),
+        pages = lanes.iter().map(|l| l.pages.len()).sum::<usize>(),
+        pos = lanes.first().map_or(0, |l| l.pos),
+        idle_ms = (t0 - idle_from).as_secs_f64() * 1e3,
+        tables_ms =
+            super::serve2d::TABLES_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        ms = t0.elapsed().as_secs_f64() * 1e3,
+        "spatial wafer: launch"
+    );
+}
+
+/// A page job's account (`copy_pages`, `page_out`, `page_in`): its kernel
+/// pages, the wafer thread's wait for it and its time.
+fn job_line(kind: &str, pages: usize, idle_from: std::time::Instant, t0: std::time::Instant) {
+    tracing::info!(
+        kind,
+        pages,
+        idle_ms = (t0 - idle_from).as_secs_f64() * 1e3,
+        ms = t0.elapsed().as_secs_f64() * 1e3,
+        "spatial wafer: page job"
+    );
 }
 
 impl Wafer {
     /// Loads `program` (the compiler's output directory) on `platform` and
-    /// places `ckpt` (RoPE's theta `rope_theta`, else the checkpoint
-    /// config's); returns once the model answers.
+    /// places `ckpt` (RoPE `rope`, else the checkpoint config's); returns
+    /// once the model answers.
     pub fn open(
         program: PathBuf,
         ckpt: Ckpt,
         platform: Platform,
-        rope_theta: Option<f64>,
+        rope: Option<Rotary>,
     ) -> R<Wafer> {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
@@ -1245,7 +1515,7 @@ impl Wafer {
         let thread = std::thread::Builder::new()
             .name("spatial-wafer".into())
             .spawn(move || {
-                let mut model = match WaferModel::open_with(&program, ckpt, platform, rope_theta) {
+                let mut model = match WaferModel::open_with(&program, ckpt, platform, rope) {
                     Ok(m) => {
                         let g = &m.design;
                         let (paged, (launch_lanes, logit_lanes)) =
@@ -1268,6 +1538,14 @@ impl Wafer {
                             vocab: m.design.vocab(),
                             hidden: m.design.hidden(),
                             recurrent: m.design.hybrid().is_some(),
+                            group: 1,
+                            row_order: match row_order_env(m.design.paged()) {
+                                Ok(o) => o,
+                                Err(e) => {
+                                    let _ = ready_tx.send(Err(e));
+                                    return;
+                                }
+                            },
                         }));
                         m
                     }
@@ -1276,14 +1554,25 @@ impl Wafer {
                         return;
                     }
                 };
+                // The end of the previous job: a launch's `idle_ms` is the
+                // wafer thread's wait for it (the host's share between launches).
+                let mut idle_from = std::time::Instant::now();
                 for job in job_rx {
+                    // (Every job the wafer thread runs, timed when slow: the
+                    // host-stall hunt.)
+                    let job_t0 = std::time::Instant::now();
+                    let job_kind = job.kind();
+                    let _slow = SlowJob(job_kind, job_t0);
                     let answer = match job {
                         Job::Batch {
                             lanes,
                             steps,
                             logits,
                         } => {
+                            let t0 = std::time::Instant::now();
                             let reply = model.fire_batch(&lanes, steps, logits);
+                            launch_line("batch", &lanes, steps, idle_from, t0);
+                            idle_from = std::time::Instant::now();
                             if batch_tx.send(reply).is_err() {
                                 break;
                             }
@@ -1297,8 +1586,11 @@ impl Wafer {
                         } => {
                             // The poster may have gone (its lanes diverged):
                             // the launch still ran, in order.
+                            let t0 = std::time::Instant::now();
                             let _ = reply.send(model.fire_batch(&lanes, steps, false));
+                            launch_line("posted", &lanes, steps, idle_from, t0);
                             landed();
+                            idle_from = std::time::Instant::now();
                             continue;
                         }
                         Job::VmLoad { program, seeds } => {
@@ -1360,14 +1652,20 @@ impl Wafer {
                             continue;
                         }
                         Job::PageOut { pages } => {
+                            let t0 = std::time::Instant::now();
                             let reply = model.page_out(&pages).map(|words| (words, Vec::new()));
+                            job_line("page_out", pages.len(), idle_from, t0);
+                            idle_from = std::time::Instant::now();
                             if batch_tx.send(reply).is_err() {
                                 break;
                             }
                             continue;
                         }
                         Job::PageIn { pages } => {
+                            let t0 = std::time::Instant::now();
                             let reply = model.page_in(&pages).map(|()| (Vec::new(), Vec::new()));
+                            job_line("page_in", pages.len(), idle_from, t0);
+                            idle_from = std::time::Instant::now();
                             if batch_tx.send(reply).is_err() {
                                 break;
                             }
@@ -1383,7 +1681,10 @@ impl Wafer {
                             continue;
                         }
                         Job::Copy { pairs } => {
+                            let t0 = std::time::Instant::now();
                             let reply = model.copy_pages(&pairs).map(|()| (Vec::new(), Vec::new()));
+                            job_line("copy_pages", pairs.len(), idle_from, t0);
+                            idle_from = std::time::Instant::now();
                             if batch_tx.send(reply).is_err() {
                                 break;
                             }
@@ -1400,6 +1701,7 @@ impl Wafer {
                             extra,
                         } => model.greedy(&tokens, start, extra).map(|a| (a, Vec::new())),
                     };
+                    idle_from = std::time::Instant::now();
                     tracing::info!(
                         launches = model.launches,
                         steps = model.steps,
@@ -1411,10 +1713,12 @@ impl Wafer {
                 }
             })
             .map_err(|e| format!("spawning the wafer thread: {e}"))?;
-        let facts = ready_rx
+        let mut facts = ready_rx
             .recv()
             .map_err(|_| "the wafer thread died while loading".to_string())??;
+        let row_order = facts.row_order.take();
         Ok(Wafer {
+            row_order,
             jobs: Some(job_tx),
             answers: ans_rx,
             batch_answers: batch_rx,
@@ -1422,6 +1726,57 @@ impl Wafer {
             thread: Some(thread),
             ..facts
         })
+    }
+
+    /// Pages PIE's way: `page_size` positions a page, a whole number of
+    /// the program's (which then divide its blocks a row). Sets
+    /// [`Wafer::group`] and turns `paged` and `page_bytes` into PIE's
+    /// view; a page size the program's pages do not tile is left alone
+    /// (the load's check then refuses it).
+    pub fn page_as(&mut self, page_size: usize) {
+        let Some(shape) = self.paged else { return };
+        if self.group != 1 || shape.page_size == 0 || page_size <= shape.page_size {
+            return;
+        }
+        let g = page_size / shape.page_size;
+        if g * shape.page_size != page_size || !shape.blocks.is_multiple_of(g) {
+            return;
+        }
+        self.group = g as u32;
+        self.paged = Some(super::paged::Shape {
+            page_size,
+            blocks: shape.blocks / g,
+            ..shape
+        });
+        self.page_bytes = self.page_bytes.map(|b| b * g);
+    }
+
+    /// PIE page `p`'s kernel page `o` (of `group`), relabelled by the page
+    /// order when there is one.
+    fn kpage(&self, p: u32, o: u32) -> u32 {
+        let k = p * self.group + o;
+        self.row_order.as_ref().map_or(k, |r| r.map(k))
+    }
+
+    /// PIE page ids as the program's (each `group` kernel pages, in order).
+    fn kernel_pages(&self, pages: &[u32]) -> Vec<u32> {
+        let g = self.group;
+        pages
+            .iter()
+            .flat_map(|&p| (0..g).map(move |o| self.kpage(p, o)))
+            .collect()
+    }
+
+    fn kernel_lanes(
+        &self,
+        mut lanes: Vec<super::serve2d::BatchLane>,
+    ) -> Vec<super::serve2d::BatchLane> {
+        if self.group > 1 || self.row_order.is_some() {
+            for l in &mut lanes {
+                l.pages = self.kernel_pages(&l.pages);
+            }
+        }
+        lanes
     }
 
     /// [`WaferModel::fire_batch`] on the wafer's thread.
@@ -1432,6 +1787,7 @@ impl Wafer {
         logits: bool,
     ) -> BatchAnswer {
         let _busy = Busy::start();
+        let lanes = self.kernel_lanes(lanes);
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?
@@ -1456,6 +1812,7 @@ impl Wafer {
         reply: mpsc::Sender<BatchAnswer>,
         landed: Box<dyn FnOnce() + Send>,
     ) -> R<()> {
+        let lanes = self.kernel_lanes(lanes);
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?
@@ -1531,6 +1888,7 @@ impl Wafer {
         inputs: Vec<StepInput>,
     ) -> R<Vec<VmStep>> {
         let _busy = Busy::start();
+        let lanes = self.kernel_lanes(lanes);
         self.vm_job(Job::VmFire {
             lanes,
             sampled,
@@ -1589,20 +1947,44 @@ impl Wafer {
     /// [`WaferModel::page_out`] on the wafer's thread.
     pub fn page_out(&mut self, pages: Vec<u32>) -> R<Vec<Vec<u32>>> {
         let _busy = Busy::start();
+        let g = self.group as usize;
+        let pages = self.kernel_pages(&pages);
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?
             .send(Job::PageOut { pages })
             .map_err(|_| "the wafer thread went away".to_string())?;
-        self.batch_answers
+        let words = self
+            .batch_answers
             .recv()
             .map_err(|_| "the wafer thread went away".to_string())?
-            .map(|(words, _)| words)
+            .map(|(words, _)| words)?;
+        // A PIE page's words: its kernel pages' in order.
+        Ok(words.chunks(g.max(1)).map(|c| c.concat()).collect())
     }
 
     /// [`WaferModel::page_in`] on the wafer's thread.
     pub fn page_in(&mut self, pages: Vec<(u32, Vec<u32>)>) -> R<()> {
         let _busy = Busy::start();
+        let g = self.group;
+        let pages = if g > 1 || self.row_order.is_some() {
+            let mut out = Vec::new();
+            for (p, words) in pages {
+                let n = words.len() / g as usize;
+                if n * g as usize != words.len() {
+                    return Err(format!(
+                        "page {p}'s host copy is {} words, not {g} kernel pages' worth",
+                        words.len()
+                    ));
+                }
+                for (o, c) in words.chunks(n.max(1)).enumerate() {
+                    out.push((self.kpage(p, o as u32), c.to_vec()));
+                }
+            }
+            out
+        } else {
+            pages
+        };
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?
@@ -1630,6 +2012,12 @@ impl Wafer {
 
     pub fn copy_pages(&mut self, pairs: Vec<(u32, u32)>) -> R<()> {
         let _busy = Busy::start();
+        let g = self.group;
+        let pairs: Vec<(u32, u32)> = pairs
+            .into_iter()
+            .flat_map(|(s, d)| (0..g).map(move |o| (s, d, o)))
+            .map(|(s, d, o)| (self.kpage(s, o), self.kpage(d, o)))
+            .collect();
         self.jobs
             .as_ref()
             .ok_or("the wafer is closed")?
@@ -1689,6 +2077,106 @@ impl Drop for Wafer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An HV build (PS 1, NB 16, E 5 on 152 rows) paged PIE's way (16):
+    /// 152 PIE pages of 16, each 16 kernel pages in order; a 531-position
+    /// lane on PIE pages 0..34 makes a kernel table (at most 4 a row).
+    #[test]
+    fn hv_pages_as_pie_pages() {
+        let mut w = Wafer {
+            jobs: None,
+            answers: mpsc::channel().1,
+            batch_answers: mpsc::channel().1,
+            vm_answers: mpsc::channel().1,
+            paged: Some(super::super::paged::Shape {
+                lanes: 1,
+                rows: 152,
+                page_size: 1,
+                blocks: 16,
+                entries: 5,
+            }),
+            cap: 128,
+            launch_lanes: 1,
+            logit_lanes: 1,
+            positions: 760,
+            vm: None,
+            vm_b: None,
+            page_bytes: Some(100),
+            thread: None,
+            vocab: 0,
+            hidden: 0,
+            recurrent: false,
+            group: 1,
+            row_order: None,
+        };
+        let kernel = w.paged.unwrap();
+        w.page_as(16);
+        let pie = w.paged.unwrap();
+        assert_eq!(
+            (w.group, pie.page_size, pie.pages(), w.page_bytes),
+            (16, 16, 152, Some(1600))
+        );
+        assert_eq!(w.kernel_pages(&[2, 0])[..3], [32, 33, 34]);
+        assert_eq!(w.kernel_pages(&[2, 0])[16..18], [0, 1]);
+        let lane = super::super::paged::Lane {
+            pos: 530,
+            slot: 530,
+            pages: w.kernel_pages(&(0..34).collect::<Vec<u32>>()),
+            visible: None,
+        };
+        assert!(super::super::paged::table(&kernel, &[lane], 1).is_ok());
+        // A second call, or a page size the kernel's do not tile, changes nothing.
+        w.page_as(16);
+        assert_eq!(w.group, 16);
+        // The page order relabels the expanded kernel pages (row 104 first).
+        w.row_order = Some(super::super::paged::RowOrder::parse("ar:208:16", &kernel).unwrap());
+        assert_eq!(w.kernel_pages(&[0])[..3], [104, 103, 105]);
+        assert_eq!(
+            w.kernel_lanes(vec![super::super::serve2d::BatchLane {
+                pos: 0,
+                slot: 0,
+                pages: vec![0],
+                visible: None,
+                forced: vec![],
+                state: None,
+            }])[0]
+                .pages[..2],
+            [104, 103]
+        );
+    }
+
+    /// `PLACE_CKPT=<dir> PLACE_PARAMS=<K:V,...>`: a real checkpoint
+    /// validated and placed on the program of those params on a recording
+    /// device (no chip, no simulator: every write's symbol and size checked
+    /// against nothing but the host's own account). The chip's load errors
+    /// before the first launch show here (e.g. Gemma-12B's tied head).
+    #[test]
+    #[ignore]
+    fn place_on_a_recorder() {
+        let dir = std::env::var("PLACE_CKPT").expect("PLACE_CKPT");
+        let params = super::super::program::parse_params(
+            &std::env::var("PLACE_PARAMS").expect("PLACE_PARAMS"),
+        );
+        let design = ProgramSpec::from_params(ProgramSpec::infer_design(&params).unwrap(), &params)
+            .expect("the program");
+        let ckpt = Ckpt::open(Path::new(&dir)).expect("the checkpoint");
+        let theta = check_weights(&design, &ckpt, None).expect("the checkpoint fits");
+        let mut rec = super::super::device::Recorder::default().forgetful();
+        for c in design.components() {
+            c.routes(&design, &mut rec).expect("routes");
+        }
+        let w = super::super::component::Weights {
+            ckpt: &ckpt,
+            rope: &theta,
+        };
+        for c in design.components() {
+            let t = Instant::now();
+            c.place(&design, &w, &mut rec)
+                .unwrap_or_else(|e| panic!("{}: {e}", c.name()));
+            eprintln!("placed {} in {:.1}s", c.name(), t.elapsed().as_secs_f32());
+        }
+        eprintln!("{} calls", rec.take().len());
+    }
 
     #[test]
     fn bf16_pages_pack_two_a_word_and_back() {

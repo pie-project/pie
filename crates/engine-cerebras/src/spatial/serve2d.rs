@@ -350,7 +350,9 @@ fn place_paged_layer(
 }
 
 /// head2d's f32 tiles (one block): region PE (c, ry) holds dims c*Hc.. of
-/// vocabulary rows ry*Vr.., dim-major after one leading pad; the guest VM
+/// vocabulary rows ry*Vr.., dim-major after one leading pad (a `W16`
+/// serve_q35 build: bf16, two to a word, element 2k in the low half, no
+/// pad); the guest VM
 /// column (if any) after the root column gets zeros; the feeder row holds
 /// the final norm's gamma.
 pub(crate) fn place_head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()> {
@@ -361,7 +363,14 @@ pub(crate) fn place_head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -
     }
     let hid = lay.hidden();
     let have = emb.shape[0].min(lay.vocab());
-    let n = hc * vr + 1;
+    let w16 = lay.w16();
+    if w16 && !(hc * vr).is_multiple_of(2) {
+        return Err(format!(
+            "bf16 head tiles of Hc {hc} x Vr {vr} are not whole words"
+        ));
+    }
+    let n = if w16 { hc * vr / 2 } else { hc * vr + 1 };
+    let lead = usize::from(!w16);
     let r2x = lay.r2x();
     // Fabric column q of the block -> chunk column (None: the VM column).
     let vmc = lay.vmc();
@@ -383,11 +392,11 @@ pub(crate) fn place_head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -
     }
     let tile_rows = |rows: std::ops::Range<usize>, qs: std::ops::Range<usize>| -> Vec<f32> {
         let w = qs.len();
-        let mut t = vec![0f32; rows.len() * w * n];
+        let mut t = vec![0f32; rows.len() * w * (hc * vr + lead)];
         for (yi, ry) in rows.enumerate() {
             for (qi, q) in qs.clone().enumerate() {
                 let Some(c) = chunk(q) else { continue };
-                let base = (yi * w + qi) * n + 1;
+                let base = (yi * w + qi) * (hc * vr + lead) + lead;
                 for h in 0..hc {
                     let dim = c * hc + h;
                     if dim >= hid {
@@ -405,6 +414,17 @@ pub(crate) fn place_head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -
         t
     };
     let words = |t: &[f32]| -> Vec<u32> { t.iter().map(|x| x.to_bits()).collect() };
+    let tile_words = |t: &[f32]| -> Vec<u32> {
+        if w16 {
+            t.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[a, b]| u32::from(bf16(*a)) | (u32::from(bf16(*b)) << 16))
+                .collect()
+        } else {
+            words(t)
+        }
+    };
     let hx = lay.head_x();
     // The regions above and below the feeder row, a band at a time.
     for qs in &segments {
@@ -417,7 +437,7 @@ pub(crate) fn place_head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -
                     "wt",
                     rect(hx + qs.start, y0 + (y - lo), qs.len(), rows),
                     n,
-                    &words(&t),
+                    &tile_words(&t),
                 )?;
                 y += rows;
             }
@@ -442,6 +462,12 @@ pub(crate) fn place_head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -
         dev.put("gam", rect(hx + qs.start, f, qs.len(), 1), hc, &words(&gam))?;
     }
     Ok(())
+}
+
+/// `x` to bf16, round to nearest even (exact for a bf16 checkpoint's values).
+pub(crate) fn bf16(x: f32) -> u16 {
+    let u = x.to_bits();
+    ((u + 0x7fff + ((u >> 16) & 1)) >> 16) as u16
 }
 
 /// One launch: the forced tokens, `steps` head iterations from `start`;
@@ -601,6 +627,10 @@ pub struct VmTurns<'a> {
     pub nforce: Option<&'a [u32]>,
 }
 
+/// The last launch's host time writing its tables and turns (ns): the
+/// wafer's per-launch account reads it.
+pub(crate) static TABLES_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// [`fire`] on a VM build with `vm`'s turns (`None`: the head's argmax every
 /// lane).
 pub fn fire_lanes(
@@ -662,8 +692,13 @@ pub fn fire_lanes(
     let mbs: Vec<&[BatchLane]> = lanes.chunks(b_n).collect();
     let slots = lay.mmax().unwrap_or(1);
     let e = |e: crate::sdk::Error| e.to_string();
+    let t_tables = std::time::Instant::now();
     lay.stage.write_tables(lay, rt, &mbs, &table_rows)?;
     lay.sampler.write_turns(lay, rt, &mbs, vm, vm_written)?;
+    TABLES_NS.store(
+        u64::try_from(t_tables.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let mut inn = vec![SAMPLE; slots * b_n * lay.cap()];
     for (m, mb) in mbs.iter().enumerate() {
         for b in 0..b_n {
@@ -675,6 +710,7 @@ pub fn fire_lanes(
     let (rx, ry) = lay.root();
     let one = rect(rx, ry, 1, 1);
     let words = inn.len();
+    let t_in = std::time::Instant::now();
     rt.memcpy_h2d_nonblock(
         SYM.in_tokens,
         inn,
@@ -687,8 +723,10 @@ pub fn fire_lanes(
     // DEFER: every lane of the launch on the VM, two micro-batches or more.
     let all_vm = vm.is_some_and(|t| (0..mbs.len() * b_n).all(|v| t.sampled.get(v) == Some(&1)));
     let args = lay.compute_args(steps, mbs.len(), all_vm);
+    let t_launch = std::time::Instant::now();
     rt.launch_nonblock(SYM.compute, &args).map_err(e)?;
     let mut out = vec![0u32; words];
+    let t_read = std::time::Instant::now();
     let read = rt.memcpy_d2h(
         SYM.out_tokens,
         &mut out,
@@ -697,8 +735,23 @@ pub fn fire_lanes(
         Order::RowMajor,
         DataType::Bits32,
     );
+    let t_wait = std::time::Instant::now();
     rt.wait_pending();
     read.map_err(e)?;
+    // (A launch far slower than its steps: where its host time went.)
+    let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+    let t_end = std::time::Instant::now();
+    if ms(t_tables, t_end) > 20.0 + 1.5 * steps as f64 {
+        tracing::warn!(
+            steps,
+            tables_ms = ms(t_tables, t_in),
+            in_tokens_ms = ms(t_in, t_launch),
+            launch_ms = ms(t_launch, t_read),
+            d2h_ms = ms(t_read, t_wait),
+            wait_ms = ms(t_wait, t_end),
+            "spatial wafer: a slow launch"
+        );
+    }
     lay.stage.check_launch(lay, rt)?;
     // Lane i is micro-batch i / B's lane i % B: [i][CAP] either way.
     let tokens: Vec<Vec<u32>> = (0..lanes.len())

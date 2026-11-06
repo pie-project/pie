@@ -28,6 +28,7 @@ param RGs: u16;
 param RIc: u16;
 param RNL: u16;
 param RGY: u16;        // the regions' Y phase-1 group (0: RGs; must divide RPY: 16 at 256 x 240)
+param GY: u16 = 0;     // the grids' Y phase-1 group (0: Gs; must divide PY)
 param RC: u16;         // region columns
 param RR: u16;         // region rows
 param NCOL: u16;       // grids in the column below layer 0
@@ -47,6 +48,11 @@ param PROF: u16;
 param TIME: u16;
 param HROUTE: u16;     // 1: the host writes the collectives' route bits (`rcfg`, Fork 8)
 param ROT8: u16;       // 1: RoPE tables of 4 x 8
+// The model variant the units' sources were generated for (codegen.rs `Variant`;
+// the layout passes neither on): QKN 0, no q/k RMSNorm; EPS, the RMSNorm
+// epsilon's f32 bits (0: the kernels' 1e-6).
+param QKN: u16 = 1;
+param EPS: u32 = 0;
 param NOLAYER: u16 = 0;    // 1 (checking the handoffs alone): the units skip their layers
 param PIPE: u16 = 0;       // serve8b_region_pipe: 1 runs micro-batches round the ring (compute's start_pos = nmb)
 param MMAX: u16 = 1;       // micro-batches a launch at most (units' mtab, the head's token rows)
@@ -182,7 +188,7 @@ layout {
           .S2D_PIPE = PIPE, .S2D_MMAX = MMAX, .memcpy_params = mp, .KVST = KVST,
           .PX = PX, .PY = PY, .Hc = Hc, .HR = HR, .Dc = Dc, .Gs = Gs, .Qh = Qh, .Ic = Ic,
           .PS = PS, .NB = NB, .E = E, .B = B, .MC = MC, .W16 = W16, .NP = NP, .KV16 = KV16,
-          .KVCP = KVCP, .PROF = PROF, .HROUTE = HROUTE, .ROT8 = ROT8, .S2D_TIME = TIME, .S2D_RTR = RTR, .S2D_NOLAYER = NOLAYER,
+          .KVCP = KVCP, .PROF = PROF, .GY = GY, .HROUTE = HROUTE, .ROT8 = ROT8, .S2D_TIME = TIME, .S2D_RTR = RTR, .S2D_NOLAYER = NOLAYER,
           .c_r1_0 = C_R1_0, .c_r1_1 = C_R1_1, .c_r2_0 = C_R2_0, .c_r2_1 = C_R2_1,
           .c_bc = C_BC, .c_gb = C_GB, .GBC = 1, .c_gbc = C_GBC,
         });
