@@ -207,6 +207,10 @@ pub struct ServeConfig {
     /// serve8b_region(_pipe): vertical handoffs on centred columns (`HVC` 1;
     /// the host's tables).
     pub hvc: bool,
+    /// With `trim`, models without q/k norms: the regions' MLP act in f16 on
+    /// every PE of a column from the gate-up all-reduce, no act all-reduce
+    /// (`TRM` bit 1024; inexact, so not for the q/k-norm models' exact bits).
+    pub silu16: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -252,6 +256,7 @@ impl ServeConfig {
             arfs: false,
             ary16: false,
             hvc: false,
+            silu16: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -337,6 +342,7 @@ impl ServeConfig {
             "arfs",
             "ary16",
             "hvc",
+            "silu16",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -445,6 +451,7 @@ impl ServeConfig {
             arfs: flag(t, "arfs")?,
             ary16: flag(t, "ary16")?,
             hvc: flag(t, "hvc")?,
+            silu16: flag(t, "silu16")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -1113,6 +1120,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if cfg.trim && !(cfg.qkv1 && cfg.ops2 && cfg.f16acc && cfg.arfx) {
         return Err("serve8b_region's `trim` needs `qkv1`, `ops2`, `f16acc` and `arfx`".into());
     }
+    if cfg.silu16 && !cfg.trim {
+        return Err("serve8b_region's `silu16` needs `trim`".into());
+    }
     if cfg.arfs && !(cfg.arfx && cfg.xac) {
         return Err("serve8b_region's `arfs` needs `arfx` and `xac`".into());
     }
@@ -1450,7 +1460,10 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             // (with q/k norms, Qwen3-8B: the exact bits alone, 241 - 2, 8 and 256 move its
             // teacher-forced set; 0534: TRM 245 kept 0529's 14 mismatches)
             trim: if cfg.trim {
-                (if plan.spec.qk_norm { 241 } else { 507 }) | (usize::from(cfg.grid_levers && cfg.f16accg) << 2)
+                (if plan.spec.qk_norm { 241 } else { 507 })
+                    | (usize::from(cfg.grid_levers && cfg.f16accg) << 2)
+                    // (silu16: TRM 1024, the regions' act in f16, no act all-reduce; inexact)
+                    | (usize::from(cfg.silu16 && !plan.spec.qk_norm) << 10)
             } else {
                 0
             },
@@ -3046,6 +3059,17 @@ mod llama31_8b {
                 assert!(text.contains("(trm) both halves' q heads in one op") && text.contains("(trm 16)"), "{n}");
                 assert!(text.contains("(trm 64)") && text.contains("(arfs)"), "{n}");
             }
+        }
+        // + silu16: TRM 1535 (0538's sp538_t17b): the regions' act in f16, no act all-reduce
+        cfg.silu16 = true;
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:1535,ARY:16,HVC:1")));
+        let lay = ProgramSpec::from_params(d, &p).unwrap();
+        for (n, text) in d.files_with(lay.model.variant()).unwrap() {
+            assert_eq!(text.contains("(trm 1024)"), n == "region_pe.csl", "{n}");
         }
     }
 

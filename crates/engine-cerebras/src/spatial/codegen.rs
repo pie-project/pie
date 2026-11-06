@@ -85,6 +85,7 @@ mod src {
     pub const TRM_XG: &str = include_str!("csl/kernels/trm_xg.json");
     pub const TRM_SILU: &str = include_str!("csl/kernels/trm_silu.json");
     pub const TRM_SILH: &str = include_str!("csl/kernels/trm_silh.json");
+    pub const TRM_XGI: &str = include_str!("csl/kernels/trm_xgi.json");
     pub const VM_HM: &str = include_str!("csl/vm/guest4hm_vm.csl");
     pub const VM_HZ: &str = include_str!("csl/vm/guest4hz_vm.csl");
     /// Every design's runtime route and queue-color helpers.
@@ -401,7 +402,10 @@ pub struct Variant {
     /// ulp rms against 0.3 for the f32 SiLU rounded), straight into the down
     /// matvec's f16 x: no act all-reduce (`trm_silu.json`); **2048** (with
     /// 1024) its two scales applied in f16 after the conversion, their f16
-    /// rounding undone in f32 on the down partial (`trm_silh.json`).
+    /// rounding undone in f32 on the down partial (`trm_silh.json`); **4096**
+    /// (with 512) its f16 gammas made in place in the f32 gammas' words on the
+    /// first pass, no copies (`trm_xgi.json`; the host places the weights
+    /// once, after init).
     pub trim: u16,
 }
 
@@ -679,8 +683,8 @@ impl Variant {
             s = apply_reps("arfs_ops", src::ARFS_OPS, &s, tag)?;
         }
         if self.trim != 0 && (region || self.trim & 4 != 0) {
-            if self.trim & 1 == 0 || self.trim > 4095 {
-                return Err(format!("gen: {tag}: TRM {} unknown (1 the cuts, 2 and the sums of squares, 4 the grids too, 8 exp at degree 4, 16 the residuals from the fabric, 32 the head's split_x, 64 HV's zero copies, 128 HV's entries once a pass, 256 rsqrt in two Newton steps, 512 x g in f16, 1024 the MLP's act in f16 on every PE: no act all-reduce, 2048 its scales in f16)", self.trim));
+            if self.trim & 1 == 0 || self.trim > 8191 {
+                return Err(format!("gen: {tag}: TRM {} unknown (1 the cuts, 2 and the sums of squares, 4 the grids too, 8 exp at degree 4, 16 the residuals from the fabric, 32 the head's split_x, 64 HV's zero copies, 128 HV's entries once a pass, 256 rsqrt in two Newton steps, 512 x g in f16, 1024 the MLP's act in f16 on every PE: no act all-reduce, 2048 its scales in f16, 4096 512's f16 gammas in place on the first pass)", self.trim));
             }
             if self.trim & 128 != 0 && self.trim & 64 == 0 {
                 return Err(format!("gen: {tag}: TRM 128 needs 64 (the zero run)"));
@@ -716,6 +720,9 @@ impl Variant {
             if self.trim & 512 != 0 && region {
                 // (regions only: x g in f16, the gammas converted in the pass prologue)
                 s = apply_reps("trm_xg", src::TRM_XG, &s, tag)?;
+                if self.trim & 4096 != 0 {
+                    s = apply_reps("trm_xgi", src::TRM_XGI, &s, tag)?;
+                }
             }
             if self.trim & 1024 != 0 && region {
                 // (regions only: act = silu(s g) (s u) in f16 on every PE of a column, from
