@@ -30,6 +30,10 @@ use crate::store::rs::working_set::RsWorkingSet;
 
 const MOVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The most handles one session names at once: a name costs almost nothing,
+/// but not nothing, and a client that never closes one should hear so.
+const MAX_HANDLES: usize = 4096;
+
 struct Parts {
     kv: KvWorkingSet,
     rs: Option<RsWorkingSet>,
@@ -143,6 +147,14 @@ impl Held {
             None => None,
         };
         Ok(Held::park(kv_child, rs_child, cursor.clone()))
+    }
+
+    /// Whether its next write takes state it does not hold yet.
+    fn shares_state(&self) -> bool {
+        self.parts().rs.as_ref().is_some_and(|rs| {
+            let stores = store_registry::get(rs.model, rs.engine);
+            stores.rs.lock().unwrap().shares_state(rs.id)
+        })
     }
 
     fn leave_planner(&self) {
@@ -320,6 +332,9 @@ impl Table {
 
     fn claim(&self, name: HandleName) -> Result<(), String> {
         match self.slots.get(&name) {
+            None if self.slots.len() >= MAX_HANDLES => Err(format!(
+                "quota: this session names {MAX_HANDLES} handles; close one"
+            )),
             None | Some(Slot::Dead(_)) => Ok(()),
             Some(_) => Err(format!("handle {name} is already in use")),
         }
@@ -359,19 +374,19 @@ impl Table {
         {
             return Err("its handles are on different engines".to_string());
         }
-        let unborn = handles
+        let growing = handles
             .values()
-            .filter(|name| {
-                matches!(
-                    self.slots.get(name),
-                    Some(Slot::Unborn(HandleKind::WorkingSet))
-                )
+            .filter(|name| match self.slots.get(name) {
+                Some(Slot::Unborn(HandleKind::WorkingSet)) => true,
+                Some(Slot::Parked(held)) => held.shares_state(),
+                _ => false,
             })
             .count();
-        if state_room.is_some_and(|room| (room as usize) < unborn) {
+        if state_room.is_some_and(|room| (room as usize) < growing) {
             return Err(format!(
-                "quota: {unborn} new working set(s) would leave more recurrent state at rest \
-                 than the host holds; close a handle, or raise `[engine] max_state_slots`"
+                "quota: {growing} working set(s) taking new state would leave more recurrent \
+                 state at rest than the host holds; close a handle, or raise \
+                 `[engine] max_state_slots`"
             ));
         }
         let mut landing = HashSet::new();
@@ -696,11 +711,38 @@ mod tests {
     #[tokio::test]
     async fn handle_every_case() {
         an_unborn_handle_is_a_name_and_nothing_else().await;
+        a_session_names_only_so_many().await;
         a_name_is_taken_once().await;
         one_bad_op_does_not_stop_the_rest().await;
         a_launch_moves_all_it_names_or_none().await;
         a_name_a_launch_promises_waits_like_one_it_took().await;
         a_settled_end_lands_each_name().await;
+    }
+
+    async fn a_session_names_only_so_many() {
+        let mut table = Table::default();
+        for name in 0..MAX_HANDLES as HandleName {
+            table
+                .slots
+                .insert(name, Slot::Unborn(HandleKind::WorkingSet));
+        }
+        let over = answer(&mut table, new(MAX_HANDLES as HandleName)).await;
+        assert!(over["error"].as_str().unwrap().starts_with("quota"));
+        let fork = HandleOp::Fork {
+            name: MAX_HANDLES as HandleName,
+            from: 0,
+        };
+        assert!(
+            answer(&mut table, fork).await["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("quota")
+        );
+        answer(&mut table, HandleOp::Close { name: 0 }).await;
+        assert_eq!(
+            answer(&mut table, new(MAX_HANDLES as HandleName)).await["ok"],
+            true
+        );
     }
 
     async fn an_unborn_handle_is_a_name_and_nothing_else() {

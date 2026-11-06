@@ -410,6 +410,12 @@ impl RsStore {
         Ok(self.working_sets.insert(entry))
     }
 
+    /// Whether `ws` shares a slot with a fork: its next write takes its own.
+    pub fn shares_state(&self, ws: RsWorkingSetId) -> bool {
+        self.entry(ws)
+            .is_ok_and(|entry| Self::slots(entry).any(|id| self.ref_count(id) > 1))
+    }
+
     /// Releases `ws`, returning how many slots it was the last holder of.
     pub fn release_working_set(&mut self, ws: RsWorkingSetId) -> usize {
         let Some(entry) = self.working_sets.remove(ws) else {

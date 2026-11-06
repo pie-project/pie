@@ -42,9 +42,12 @@ async def t_resume(c, prog):
     st = await b.stat()
     rest = await run(c, prog, b, [first[-1]], 20, drawn=12)
     check("resume across processes equals one run", first + rest == whole, f"stat={st}")
-    d = await c.working_set(); e = await c.working_set(); e2 = await c.working_set()
+    await a.close(); await b.close()
+    d = await c.working_set()
     x = await run(c, prog, d, PROMPT, 32); check("the run is repeatable", x == whole)
+    await d.close()
     # fork rolls back
+    e = await c.working_set()
     f = await run(c, prog, e, PROMPT, 12)
     ck = await e.fork()
     r1 = await run(c, prog, e, [f[-1]], 20, drawn=12)
@@ -53,7 +56,7 @@ async def t_resume(c, prog):
     r3 = await run(c, prog, ck, [999], 8, drawn=99)
     ck2 = await e.fork()
     check("forks diverge independently", r3 != r2[:8] or True, str(r3[:4]))
-    for h in (a, b, d, e, e2, ck, ck2): await h.close()
+    for h in (e, ck, ck2): await h.close()
     return whole
 
 async def t_lazy(c, prog, whole):
@@ -141,6 +144,15 @@ async def t_quota(c, prog, whole):
     check("past the host a launch is refused, not starved", refused and "quota" in refused, f"{len(hs)} rest; {refused and refused[:90]}")
     x = await run(c, prog, hs[0], [999], 2, drawn=50)
     check("what rests still runs", len(x) == 2)
+    # a fork shares its state until it writes, and then wants its own
+    twin = await hs[1].fork()
+    try:
+        await run(c, prog, twin, [999], 2, drawn=50); check("a fork that would grow past the host is refused", False)
+    except Exception as e:
+        check("a fork that would grow past the host is refused", "quota" in str(e), str(e)[:90])
+    check("and refused, keeps its handle", (await twin.stat())["state"] == "parked")
+    await twin.close()
+    check("closing the fork frees its twin", len(await run(c, prog, hs[1], [999], 2, drawn=50)) == 2)
     await hs[0].close()
     y = await c.working_set(); z = await run(c, prog, y, PROMPT, 32)
     check("and closing one makes room", z == whole)
