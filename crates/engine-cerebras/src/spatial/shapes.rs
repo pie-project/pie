@@ -284,7 +284,9 @@ pub const RAN: &[Ran] = &[
                  packed argmax round (TRM 22527) 2,025.7 / 2,025.1 and + the SiLU's scales in \
                  f16 (TRM 24575) 2,033.3 / 2,032.5 (0540, regions 32.37-32.63k), golden for \
                  512, 0 mismatches; Pie B 1 on TRM 22527 (0541, depth 63, posted:64) \
-                 1,993.2-2,010.6, every stream = golden for 512",
+                 1,993.2-2,010.6, every stream = golden for 512; + the grids' x g in f16 \
+                 (TRM 32767) 2,043.9 / 2,043.6 / 2,044.3 / 2,044.0 (0543), golden for 512, 0 \
+                 mismatches, Pie B 1 on it 2,007.9-2,028.7 (0543), every stream = golden",
     },
     Ran {
         design: Design::Serve8bRegion,
