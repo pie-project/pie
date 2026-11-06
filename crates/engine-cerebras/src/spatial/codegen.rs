@@ -1189,6 +1189,143 @@ var hv_b = @zeros([E]u16);\n",
   b = 0;\n  while (!HVL and b < dims[0]) : (b += 1) {\n    var e: u16 = 0;\n    while (e < dims[1]) : (e += 1) {\n      if (ebits(b, e) != 0) {\n",
         &w("hvl values"),
     )?;
+    // HVR: runs of the listed entries (consecutive entries in consecutive
+    // blocks: a lane's pages in order) taken as vectors: a long run's scores
+    // by Qh Dc ops over its entries, its values by a matvec a head (y = o[h],
+    // the run's v rows, x = its p[.][h]); the subtraction from the reference
+    // over every row in one op, a long sum by a halving tree in act. Each
+    // score and o element sees the same ops in the same order; the sum's
+    // order changes past 8 rows.
+    let s = patch(
+        &s,
+        "hv_np = e + 1;\n}\n}\n}\n",
+        "hv_np = e + 1;\n}\n}\n\
+  // (gpt-oss hvr) the entries' runs: consecutive entries in consecutive blocks\n\
+  hv_nr = 0;\n\
+  var k: u16 = 0;\n\
+  while (k < hv_nb) {\n\
+    var l: u16 = 1;\n\
+    var go: bool = true;\n\
+    while (go and k + l < hv_nb) {\n\
+      if (hv_e[k + l] == hv_e[k] + l and hv_b[k + l] == hv_b[k] + l) { l += 1; } else { go = false; }\n\
+    }\n\
+    hv_rk[hv_nr] = k;\n\
+    hv_rl[hv_nr] = l;\n\
+    hv_nr += 1;\n\
+    k += l;\n\
+  }\n\
+}\n\
+var hv_nr: u16 = 0;\n\
+var hv_rk = @zeros([E]u16);\n\
+var hv_rl = @zeros([E]u16);\n\
+const HVR_S: u16 = 6;   // (hvr) a run this long takes the vector scores\n\
+const HVR_V: u16 = 3;   // ... and the values' matvecs\n\
+const sr_t = @get_dsd(mem1d_dsd, .{ .tensor_access = |k|{TC} -> s[k * @as(i16, NQB)] });\n\
+const kr_t = @get_dsd(mem1d_dsd, .{ .tensor_access = |k|{NB} -> kc[1 + k * @as(i16, Dc)] });\n\
+const s_rows = @get_dsd(mem4d_dsd, .{ .tensor_access = |t, j|{TC + 1, NQB} -> s[t * iNQB + j] });\n\
+const bcv_rows = @get_dsd(mem4d_dsd, .{ .tensor_access = |t, j|{TC + 1, NQB} -> bcv[j] });\n",
+        &w("hvr runs"),
+    )?;
+    let s = patch(
+        &s,
+        "var hk: u16 = 0;\n\
+while (hk < hv_nb) : (hk += 1) {\n\
+const kb0 = 1 + kvoff() + hv_b[hk] * Dc;\n\
+const run = @set_dsd_length(at(srow_dsd, hv_e[hk] * NQB), Qh);\n\
+@fmovs(run, 0.0);\n\
+for (@range(u16, Dc)) |d| {\n\
+const qo = (if (d < DHc) 0 else QH) + d % DHc;\n\
+@fmacs(run, run, @increment_dsd_offset(qf_t, @as(i16, qo), f32), kc[kb0 + d]);\n\
+}\n\
+}\n",
+        "var rr: u16 = 0;\n\
+while (rr < hv_nr) : (rr += 1) {\n\
+const k0 = hv_rk[rr];\n\
+const nk = hv_rl[rr];\n\
+if (nk >= HVR_S) {\n\
+// (gpt-oss hvr) the run's scores: for each head and dim, over its entries\n\
+const e0 = hv_e[k0];\n\
+const b0 = hv_b[k0];\n\
+@fmovs(@set_dsd_length(at(s_flat, e0 * NQB), nk * NQB), 0.0);\n\
+var hh: u16 = 0;\n\
+while (hh < Qh) : (hh += 1) {\n\
+const sh = @set_dsd_length(@increment_dsd_offset(sr_t, @as(i16, e0 * NQB + hh), f32), nk);\n\
+for (@range(u16, Dc)) |d| {\n\
+const kd = @set_dsd_length(@increment_dsd_offset(kr_t, @as(i16, b0 * Dc + d), f32), nk);\n\
+@fmacs(sh, sh, kd, qkv[(if (d < DHc) 0 else QH) + hh * DHc + d % DHc]);\n\
+}\n\
+}\n\
+} else {\n\
+var hk: u16 = k0;\n\
+while (hk < k0 + nk) : (hk += 1) {\n\
+const kb0 = 1 + kvoff() + hv_b[hk] * Dc;\n\
+const run = @set_dsd_length(at(srow_dsd, hv_e[hk] * NQB), Qh);\n\
+@fmovs(run, 0.0);\n\
+for (@range(u16, Dc)) |d| {\n\
+const qo = (if (d < DHc) 0 else QH) + d % DHc;\n\
+@fmacs(run, run, @increment_dsd_offset(qf_t, @as(i16, qo), f32), kc[kb0 + d]);\n\
+}\n\
+}\n\
+}\n\
+}\n",
+        &w("hvr scores"),
+    )?;
+    let s = patch(
+        &s,
+        "var vk: u16 = 0;\n\
+while (vk < hv_nb) : (vk += 1) {\n\
+const vb = kat(vc_dsd, hv_b[vk] * Dc);\n\
+const xo = hv_e[vk] * NQB;\n\
+for (@range(u16, Qh)) |h| {\n\
+const od = at(od_dsd, h * Dc);\n\
+@fmacs(od, od, vb, s[xo + h]);\n\
+}\n\
+}\n",
+        "var vr: u16 = 0;\n\
+while (vr < hv_nr) : (vr += 1) {\n\
+const k0 = hv_rk[vr];\n\
+const nk = hv_rl[vr];\n\
+if (nk >= HVR_V) {\n\
+// (gpt-oss hvr) the run's values: a matvec a head over its entries' v rows\n\
+const vb0 = kat(vc_dsd, hv_b[k0] * Dc);\n\
+var hh: u16 = 0;\n\
+while (hh < Qh) : (hh += 1) {\n\
+const xv = @set_dsd_length(@increment_dsd_offset(sr_t, @as(i16, hv_e[k0] * NQB + hh), f32), nk);\n\
+kmv(at(od_dsd, hh * Dc), vb0, xv, nk, sc_et);\n\
+}\n\
+} else {\n\
+var vk: u16 = k0;\n\
+while (vk < k0 + nk) : (vk += 1) {\n\
+const vb = kat(vc_dsd, hv_b[vk] * Dc);\n\
+const xo = hv_e[vk] * NQB;\n\
+for (@range(u16, Qh)) |h| {\n\
+const od = at(od_dsd, h * Dc);\n\
+@fmacs(od, od, vb, s[xo + h]);\n\
+}\n\
+}\n\
+}\n\
+}\n",
+        &w("hvr values"),
+    )?;
+    let s = patch(
+        &s,
+        "    while (t < ns) : (t += 1) { const r = at(srow_dsd, t * NQB); @fsubs(r, bcv_dsd, r); }\n",
+        "    if (ns > 0) { @fsubs(s_rows, bcv_rows, s_rows); }   // (gpt-oss hvr) mref - s, every row in one op\n",
+        &w("hvr subtraction"),
+    )?;
+    let s = patch(
+        &s,
+        "    while (t < ns) : (t += 1) { @fadds(osum_dsd, osum_dsd, at(srow_dsd, t * NQB)); }\n",
+        "    if (ns < 8) {\n\
+      while (t < ns) : (t += 1) { @fadds(osum_dsd, osum_dsd, at(srow_dsd, t * NQB)); }\n\
+    } else {\n\
+      // (gpt-oss hvr) a long sum by a halving tree in act (free after the exp)\n\
+      @fmovs(@set_dsd_length(act_flat, ns * NQB), @set_dsd_length(s_flat, ns * NQB));\n\
+      halve(act_flat, ns, NQB, false);\n\
+      @fmovs(osum_dsd, @set_dsd_length(act_flat, NQB));\n\
+    }\n",
+        &w("hvr sum"),
+    )?;
     // LSE's shift group arithmetic wants power-of-two groups; the attention
     // unit's rows (AY 42) take AGY 14: divisions there (once an axis switch).
     let s = patch(
