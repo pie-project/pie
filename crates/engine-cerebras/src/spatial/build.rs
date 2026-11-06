@@ -211,6 +211,10 @@ pub struct ServeConfig {
     /// every PE of a column from the gate-up all-reduce, no act all-reduce
     /// (`TRM` bit 1024; inexact, so not for the q/k-norm models' exact bits).
     pub silu16: bool,
+    /// With `trim`, models without q/k norms: the regions' x g in f16, its
+    /// f16 gammas made in place on the first pass (`TRM` bits 512 + 4096;
+    /// inexact; fits the Llama region beside `silu16`: 48,352 B).
+    pub xg16: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -257,6 +261,7 @@ impl ServeConfig {
             ary16: false,
             hvc: false,
             silu16: false,
+            xg16: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -343,6 +348,7 @@ impl ServeConfig {
             "ary16",
             "hvc",
             "silu16",
+            "xg16",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -452,6 +458,7 @@ impl ServeConfig {
             ary16: flag(t, "ary16")?,
             hvc: flag(t, "hvc")?,
             silu16: flag(t, "silu16")?,
+            xg16: flag(t, "xg16")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -1120,8 +1127,8 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if cfg.trim && !(cfg.qkv1 && cfg.ops2 && cfg.f16acc && cfg.arfx) {
         return Err("serve8b_region's `trim` needs `qkv1`, `ops2`, `f16acc` and `arfx`".into());
     }
-    if cfg.silu16 && !cfg.trim {
-        return Err("serve8b_region's `silu16` needs `trim`".into());
+    if (cfg.silu16 || cfg.xg16) && !cfg.trim {
+        return Err("serve8b_region's `silu16` and `xg16` need `trim`".into());
     }
     if cfg.arfs && !(cfg.arfx && cfg.xac) {
         return Err("serve8b_region's `arfs` needs `arfx` and `xac`".into());
@@ -1464,6 +1471,8 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
                     | (usize::from(cfg.grid_levers && cfg.f16accg) << 2)
                     // (silu16: TRM 1024, the regions' act in f16, no act all-reduce; inexact)
                     | (usize::from(cfg.silu16 && !plan.spec.qk_norm) << 10)
+                    // (xg16: TRM 512 + 4096, x g in f16 with in-place f16 gammas; inexact)
+                    | (if cfg.xg16 && !plan.spec.qk_norm { 512 | 4096 } else { 0 })
             } else {
                 0
             },
@@ -3071,6 +3080,13 @@ mod llama31_8b {
         for (n, text) in d.files_with(lay.model.variant()).unwrap() {
             assert_eq!(text.contains("(trm 1024)"), n == "region_pe.csl", "{n}");
         }
+        // + xg16: TRM 6143 (0538's sp538_t19)
+        cfg.xg16 = true;
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:6143,ARY:16,HVC:1")));
     }
 
     /// `ops2` on 0472's config states 0480's program: the same parameters
