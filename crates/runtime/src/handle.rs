@@ -23,6 +23,7 @@ use crate::inferlet::{ProcessCtx, ProcessId};
 use crate::planner::Demand;
 use crate::server::ClientId;
 use crate::store::kv::working_set::KvWorkingSet;
+use crate::store::kv::{KvStore, KvStoreError};
 use crate::store::registry as store_registry;
 use crate::store::rs::working_set::RsWorkingSet;
 
@@ -66,7 +67,14 @@ impl Held {
         register_residency(holder, Arc::downgrade(&residency));
         crate::planner::place(holder, kv.engine);
         if let Some(planner) = crate::planner::planner_for(kv.model, kv.engine) {
-            planner.register_holder(holder, evicted(&kv, rs.as_ref()));
+            let stores = store_registry::get(kv.model, kv.engine);
+            let owes = store_registry::with_kv_lock(&stores.kv, "handle-park", |store| {
+                // Parked, it is no running reader: a pair of forks at rest
+                // cannot keep the pages they share on the device.
+                store.set_parked(kv.id, true);
+                owed(store, &kv, rs.as_ref()).unwrap_or(None)
+            });
+            planner.register_holder(holder, owes);
         }
         Held {
             holder,
@@ -80,11 +88,28 @@ impl Held {
     }
 
     /// Back on the device, and no one's victim until it has a process.
+    ///
+    /// Its set is parked from the moment it came here, so a peer's eviction
+    /// may have taken pages it shares: what it owes is read here, not known
+    /// from whether its own holder was evicted.
     async fn ready(&self, process: ProcessId) -> Result<(), String> {
+        let Parts { kv, rs, .. } = self.parts();
+        let owed = settled(kv, "handle-ready", |store| {
+            let owed = owed(store, kv, rs.as_ref())?;
+            if owed.is_none() {
+                store.set_parked(kv.id, false);
+            }
+            Ok(owed)
+        })
+        .await?;
+        if owed.is_none() {
+            // An eviction that found no page left its fence up.
+            kv.suspend_handle().unfence();
+        }
         let Some(planner) = crate::planner::planner_of(self.holder) else {
             return Ok(());
         };
-        planner.recall_holder(self.holder, process);
+        planner.recall_holder(self.holder, process, owed);
         planner
             .wait_resident(self.holder)
             .await
@@ -94,39 +119,14 @@ impl Held {
     async fn fork(&self) -> Result<Held, String> {
         let Parts { kv, rs, cursor } = self.parts();
         let stores = store_registry::get(kv.model, kv.engine);
-        let set = HashSet::from([kv.id]);
-        let deadline = crate::rt::time::Instant::now() + MOVE_WAIT;
-        let child = loop {
-            let ended =
-                store_registry::with_kv_lock(&stores.kv, "handle-fork", |s| s.moves_ended());
-            let notified = ended.notified();
-            let mut notified = std::pin::pin!(notified);
-            notified.as_mut().enable();
-            // What a set names under a move is not where the flat map says,
-            // so a child mapped from it would keep pages the move frees.
-            let forked = store_registry::with_kv_lock(&stores.kv, "handle-fork", |s| {
-                if s.in_move(&set)? {
-                    return Ok(None);
-                }
-                let child = s.fork(kv.id)?;
-                if let Some(owner) = s.owner_of(kv.id) {
-                    s.set_owner(child, owner)?;
-                }
-                if s.is_suspended(kv.id)? {
-                    s.mark_suspended(&HashSet::from([child]));
-                }
-                Ok::<_, crate::store::kv::KvStoreError>(Some(child))
-            })
-            .map_err(|error| error.to_string())?;
-            if let Some(child) = forked {
-                break child;
+        let child = settled(kv, "handle-fork", |store| {
+            let child = store.fork(kv.id)?;
+            if let Some(owner) = store.owner_of(kv.id) {
+                store.set_owner(child, owner)?;
             }
-            let now = crate::rt::time::Instant::now();
-            if now >= deadline {
-                return Err("its pages are still moving".to_string());
-            }
-            let _ = crate::rt::time::timeout(deadline - now, notified).await;
-        };
+            Ok(child)
+        })
+        .await?;
         let kv_child = kv.forked(child);
         let rs_child = match rs {
             Some(rs) => {
@@ -162,15 +162,17 @@ impl Held {
     fn stat(&self) -> Value {
         let Parts { kv, cursor, .. } = self.parts();
         let stores = store_registry::get(kv.model, kv.engine);
-        let suspended = store_registry::with_kv_lock(&stores.kv, "handle-stat", |s| {
-            s.is_suspended(kv.id).unwrap_or(false)
+        let swapped = store_registry::with_kv_lock(&stores.kv, "handle-stat", |store| {
+            store
+                .swapped_page_count(&HashSet::from([kv.id]))
+                .unwrap_or(0)
         });
         json!({
             "state": "parked",
             "tokens": cursor.tail.unwrap_or(cursor.folded),
             "folded": cursor.folded,
             "engine": kv.engine,
-            "resident": !suspended,
+            "resident": swapped == 0,
         })
     }
 }
@@ -187,23 +189,57 @@ impl Drop for Held {
     }
 }
 
-/// What a set evicted already owes the device, for its holder to ask back.
-fn evicted(kv: &KvWorkingSet, rs: Option<&RsWorkingSet>) -> Option<Demand> {
+/// Runs `f` on the store once no move holds a page `kv` maps: what a set
+/// names under a move is not where the flat map says.
+async fn settled<T>(
+    kv: &KvWorkingSet,
+    label: &'static str,
+    mut f: impl FnMut(&mut KvStore) -> Result<T, KvStoreError>,
+) -> Result<T, String> {
     let stores = store_registry::get(kv.model, kv.engine);
     let set = HashSet::from([kv.id]);
-    let kv_pages = store_registry::with_kv_lock(&stores.kv, "handle-park", |s| {
-        s.is_suspended(kv.id)
-            .unwrap_or(false)
-            .then(|| s.swapped_page_count(&set).unwrap_or(0) as u32)
-    })?;
+    let deadline = crate::rt::time::Instant::now() + MOVE_WAIT;
+    loop {
+        let ended = store_registry::with_kv_lock(&stores.kv, label, |store| store.moves_ended());
+        let notified = ended.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
+        let done = store_registry::with_kv_lock(&stores.kv, label, |store| {
+            if store.in_move(&set)? {
+                return Ok(None);
+            }
+            f(store).map(Some)
+        })
+        .map_err(|error| error.to_string())?;
+        if let Some(done) = done {
+            return Ok(done);
+        }
+        let now = crate::rt::time::Instant::now();
+        if now >= deadline {
+            return Err("its pages are still moving".to_string());
+        }
+        let _ = crate::rt::time::timeout(deadline - now, notified).await;
+    }
+}
+
+/// What the set has off the device.
+fn owed(
+    store: &KvStore,
+    kv: &KvWorkingSet,
+    rs: Option<&RsWorkingSet>,
+) -> Result<Option<Demand>, KvStoreError> {
+    let kv_pages = store.swapped_page_count(&HashSet::from([kv.id]))? as u32;
     let rs = rs.map_or_else(Default::default, |rs| {
-        stores
+        let stores = store_registry::get(rs.model, rs.engine);
+        let units = stores
             .rs
             .lock()
             .unwrap()
-            .swapped_units(&HashSet::from([rs.id]))
+            .swapped_units(&HashSet::from([rs.id]));
+        units
     });
-    Some(Demand { kv_pages, rs })
+    let demand = Demand { kv_pages, rs };
+    Ok((!demand.is_zero()).then_some(demand))
 }
 
 #[derive(Debug)]
@@ -285,6 +321,7 @@ impl Table {
         session: ClientId,
         handles: Handles,
         returns: Handles,
+        state_room: Option<u32>,
     ) -> Result<Option<Lease>, String> {
         if handles.is_empty() && returns.is_empty() {
             return Ok(None);
@@ -311,6 +348,16 @@ impl Table {
             && engines.any(|engine| engine != first)
         {
             return Err("its handles are on different engines".to_string());
+        }
+        let unborn = handles
+            .values()
+            .filter(|name| matches!(self.slots.get(name), Some(Slot::Unborn)))
+            .count();
+        if state_room.is_some_and(|room| (room as usize) < unborn) {
+            return Err(format!(
+                "quota: {unborn} new working set(s) would leave more recurrent state at rest \
+                 than the host holds; close a handle, or raise `[engine] max_state_slots`"
+            ));
         }
         let mut landing = HashSet::new();
         for (slot, &name) in &returns {
@@ -349,6 +396,26 @@ impl Table {
             };
         }
     }
+}
+
+/// How many more sets can come to rest on the most open engine, where it has
+/// recurrent state to hold. That state has no disk tier and a running lane
+/// may want every device slot, so what rests must fit the host: past that, a
+/// fire would starve on state nothing can move.
+pub(crate) fn state_room() -> Option<u32> {
+    store_registry::all_for_model(0)
+        .iter()
+        .filter_map(|stores| {
+            let rs = stores.rs.lock().unwrap();
+            let device = rs.capacity().slots;
+            (device > 0).then(|| {
+                rs.available()
+                    .slots
+                    .saturating_add(rs.host_available().slots)
+                    .saturating_sub(device)
+            })
+        })
+        .max()
 }
 
 fn refusal(name: HandleName, slot: Option<&Slot>) -> String {
@@ -593,15 +660,18 @@ mod tests {
     async fn a_launch_moves_all_it_names_or_none() {
         let mut table = Table::default();
         answer(&mut table, new(1)).await;
-        let refused = table.lend(7, names(&[("a", 1), ("b", 2)]), Handles::new());
+        let refused = table.lend(7, names(&[("a", 1), ("b", 2)]), Handles::new(), None);
         assert!(refused.unwrap_err().starts_with("unknown"));
         assert!(!table.lent(1), "the known one stays");
-        let twice = table.lend(7, names(&[("a", 1), ("b", 1)]), Handles::new());
+        let twice = table.lend(7, names(&[("a", 1), ("b", 1)]), Handles::new(), None);
         assert!(twice.unwrap_err().contains("bound twice"));
         assert!(!table.lent(1));
+        let full = table.lend(7, names(&[("a", 1)]), Handles::new(), Some(0));
+        assert!(full.unwrap_err().starts_with("quota"));
+        assert!(!table.lent(1), "a full host moves nothing");
         assert!(
             table
-                .lend(7, Handles::new(), Handles::new())
+                .lend(7, Handles::new(), Handles::new(), None)
                 .unwrap()
                 .is_none()
         );
@@ -611,12 +681,17 @@ mod tests {
         let mut table = Table::default();
         answer(&mut table, new(1)).await;
         let lease = table
-            .lend(7, names(&[("ws", 1)]), names(&[("ws", 1), ("child", 2)]))
+            .lend(
+                7,
+                names(&[("ws", 1)]),
+                names(&[("ws", 1), ("child", 2)]),
+                None,
+            )
             .unwrap()
             .unwrap();
         assert!(table.lent(1) && table.lent(2));
         assert_eq!(lease.engine(), None, "an unborn handle is on no engine");
-        let in_use = table.lend(7, names(&[("ws", 1)]), Handles::new());
+        let in_use = table.lend(7, names(&[("ws", 1)]), Handles::new(), None);
         assert!(in_use.unwrap_err().contains("in a process"));
         spent(lease);
     }
@@ -636,11 +711,13 @@ mod tests {
         assert!(gone["error"].as_str().unwrap().starts_with("unknown"));
         let dead = answer(&mut table, HandleOp::Stat { name: 2 }).await;
         assert!(dead["error"].as_str().unwrap().contains("did not give"));
-        let refused = table.lend(7, names(&[("ws", 2)]), Handles::new());
+        let refused = table.lend(7, names(&[("ws", 2)]), Handles::new(), None);
         assert!(refused.unwrap_err().starts_with("dead"), "the reason stays");
         answer(&mut table, new(2)).await;
         assert!(
-            table.lend(7, names(&[("ws", 2)]), Handles::new()).is_ok(),
+            table
+                .lend(7, names(&[("ws", 2)]), Handles::new(), None)
+                .is_ok(),
             "a dead name is free"
         );
     }

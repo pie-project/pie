@@ -550,7 +550,8 @@ impl Session {
             return;
         }
 
-        let lease = match self.handles.lend(self.id, handles, returns) {
+        let room = crate::handle::state_room();
+        let lease = match self.handles.lend(self.id, handles, returns, room) {
             Ok(lease) => lease,
             Err(why) => {
                 self.send_response(corr_id, false, format!("launch refused: {why}"))

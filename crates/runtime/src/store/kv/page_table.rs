@@ -1644,10 +1644,6 @@ impl KvPageTable {
         readers
     }
 
-    pub fn is_suspended(&self, ws: WorkingSetId) -> Result<bool, KvTableError> {
-        Ok(self.entry(ws)?.suspended)
-    }
-
     pub fn set_suspended(&mut self, working_sets: &HashSet<WorkingSetId>, suspended: bool) {
         for &ws in working_sets {
             if let Ok(entry) = self.entry_mut(ws) {

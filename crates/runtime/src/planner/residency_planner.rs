@@ -247,13 +247,30 @@ impl ResidencyPlanner {
     }
 
     /// `process` wants this holder's set: its restore is `process`'s to wait
-    /// for, in `process`'s place in line.
-    pub fn recall_holder(self: &Arc<Self>, pid: ProcessId, process: ProcessId) {
+    /// for, in `process`'s place in line. `owed` is what the set has off the
+    /// device, which a peer's eviction may have moved under a resident holder.
+    pub fn recall_holder(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        process: ProcessId,
+        owed: Option<Demand>,
+    ) {
         self.with_inner(|inner| {
             let rank = inner.procs.get(&process).map(|p| (p.key, p.seq));
-            if let (Some((key, seq)), Some(proc)) = (rank, inner.procs.get_mut(&pid)) {
+            let Some(proc) = inner.procs.get_mut(&pid) else {
+                return;
+            };
+            if let Some((key, seq)) = rank {
                 proc.key = key;
                 proc.seq = seq;
+            }
+            if let Some(owed) = owed {
+                if proc.state == Residency::Resident {
+                    proc.state = Residency::Evicted;
+                    proc.parked = Some(owed);
+                } else if proc.parked.is_some() {
+                    proc.parked = Some(owed);
+                }
             }
         });
         self.set_idle(pid, false);

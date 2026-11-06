@@ -1026,8 +1026,10 @@ impl KvStore {
         Arc::clone(&self.moved)
     }
 
-    pub fn is_suspended(&self, ws: WorkingSetId) -> Result<bool, KvStoreError> {
-        Ok(self.table.is_suspended(ws)?)
+    /// A parked set reads nothing: whatever it shares is free to move, and
+    /// it takes back what moved before it runs.
+    pub fn set_parked(&mut self, ws: WorkingSetId, parked: bool) {
+        self.table.set_suspended(&HashSet::from([ws]), parked);
     }
 
     /// Whether a move holds any page `working_sets` map: what they name is
