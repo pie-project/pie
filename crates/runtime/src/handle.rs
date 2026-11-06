@@ -246,7 +246,7 @@ fn owed(
 pub(crate) enum Slot {
     /// Named, and nothing else yet: a process makes it, on its own engine.
     Unborn(HandleKind),
-    Parked(Held),
+    Parked(Box<Held>),
     /// Host memory and nothing else: it moves as it is. The lock is for
     /// `Sync`, which the actor holding the table needs and it alone reaches.
     Matcher(Mutex<Matcher>),
@@ -290,7 +290,7 @@ impl Table {
                 self.claim(name)?;
                 let child = match self.slots.get(&from) {
                     Some(Slot::Unborn(kind)) => Slot::Unborn(kind.clone()),
-                    Some(Slot::Parked(held)) => Slot::Parked(held.fork().await?),
+                    Some(Slot::Parked(held)) => Slot::Parked(Box::new(held.fork().await?)),
                     Some(Slot::Matcher(matcher)) => {
                         Slot::Matcher(Mutex::new(matcher.lock().unwrap().fork()))
                     }
@@ -664,7 +664,7 @@ fn take_out(
             held.rs_working_sets.remove(&(rs.model, rs.engine, rs.id));
         }
     }
-    Ok(Slot::Parked(Held::park(kv, rs, cursor)))
+    Ok(Slot::Parked(Box::new(Held::park(kv, rs, cursor))))
 }
 
 #[cfg(test)]
