@@ -1834,6 +1834,7 @@ fn serve_gptoss(get: &Get) -> R<ProgramSpec> {
         // Absent: the bf16 pool the first builds had.
         kv16: get.opt("KV16").unwrap_or(1) == 1,
         qkv1: get.opt("QKV1").unwrap_or(0) == 1,
+        arf: get.opt("ARF").unwrap_or(0),
     };
     let grid = Kernel {
         px,

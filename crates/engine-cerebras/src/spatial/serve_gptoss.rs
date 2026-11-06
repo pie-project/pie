@@ -17,7 +17,7 @@ use super::device::Device;
 use super::moe_place::{MoeGrid, MoeLayer, MoeTiles, pack_moe};
 use super::paged::{NONE, Shape};
 use super::serve8b::Kernel;
-use super::serve8b_region::{Kind, Piece, Tables, Unit, route_words};
+use super::serve8b_region::{Kind, Piece, Tables, Unit, route_words, route_words_arf};
 use super::wafer::rect;
 use crate::sdk::DataType;
 
@@ -242,6 +242,11 @@ pub struct Gpt {
     /// QKV matvec, `wqa` = [Hc][q a | q v | v]; `wqv` and `wv` are 2-word
     /// dummies the host does not write.
     pub qkv1: bool,
+    /// `ARF` (the levered attention units with GRD 1): their Y (and with bit
+    /// 2 their X) full all-reduces as FIFO streamed halves; the host writes
+    /// those units' ARF route words (12 a PE, 18 under ARF 3). The MoE units
+    /// keep the grouped all-reduce.
+    pub arf: usize,
 }
 
 impl Gpt {
@@ -827,6 +832,14 @@ pub fn put_routes(gpt: &Gpt, lanes: usize, dev: &mut dyn Device) -> R<()> {
             } else {
                 gpt.mgy
             };
+            if u.kind == Kind::Attn && gpt.arf != 0 {
+                // (ARF) streamed halves: rows in groups of 8, ARF 3 columns in groups of 16
+                let argx = if gpt.arf & 2 != 0 { 16 } else { 0 };
+                let words = route_words_arf(&rb, u.k.px, u.k.py, gpt.gs, gy, 8, argx, false);
+                let n = if argx > 0 { 18 } else { 12 };
+                dev.put("rcfg", rect(u.x0, u.y0, u.k.px, u.k.py), n, &words)?;
+                continue;
+            }
             let words = route_words(&rb, u.k.px, u.k.py, gpt.gs, gy);
             dev.put("rcfg", rect(u.x0, u.y0, u.k.px, u.k.py), 11, &words)?;
         }

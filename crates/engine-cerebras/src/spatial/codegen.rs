@@ -943,10 +943,10 @@ pub fn gptoss_attn_lev(v: Variant) -> R<String> {
     if !(v.identity_qk_norm && v.speed && v.lse) {
         return Err("gen: gptoss_attn_lev: needs the identity q/k norm, SPD and LSE".into());
     }
-    if (v.op3 != 0 && v.grid & 2 == 0) || v.grid & !2 != 0 {
-        return Err("gen: gptoss_attn_lev: OP3 comes as the grids' GRD 2 (no other GRD bit ported)".into());
+    if (v.op3 != 0 && v.grid & 2 == 0) || (v.arf != 0 && v.grid & 1 == 0) || v.grid & !3 != 0 {
+        return Err("gen: gptoss_attn_lev: OP3 and ARF come as the grids' GRD 2 and 1 (no other GRD bit ported)".into());
     }
-    if v.arf != 0 || v.f16 != 0 || v.mem != 0 || v.trim != 0 || v.xac || v.rgx || v.eps_bits.is_some() {
+    if v.arf & 4 != 0 || v.f16 != 0 || v.mem != 0 || v.trim != 0 || v.xac || v.rgx || v.eps_bits.is_some() {
         return Err(format!("gen: gptoss_attn_lev: lever not ported ({v:?})"));
     }
     let tag = "qwen2d_paged8b/pe.csl";
@@ -3989,7 +3989,7 @@ pub fn serve_gptoss_with(v: Variant, moe: u16) -> R<Vec<File>> {
             "param NOLAYER: u16 = 0;",
             "param QKN: u16 = 1;      // (0: the gpt-oss units' identity q/k norm, as the levers state it)\n\
 param SPD: u16 = 0;      // the attention units' levers (codegen::gptoss_attn_lev)\n\
-param LSE: u16 = 0;\nparam OP2: u16 = 0;\nparam OP3: u16 = 0;\nparam GRD: u16 = 0;\nparam MOE: u16 = 0;      // the MoE units' (codegen::gptoss_moe_lev)\nparam QKV1: u16 = 0;   // wqa = [Hc][q a | q v | v], wqv / wv dummies\n\
+param LSE: u16 = 0;\nparam OP2: u16 = 0;\nparam OP3: u16 = 0;\nparam GRD: u16 = 0;\nparam ARF: u16 = 0;      // (the hosts write the attention units' ARF route words)\nparam MOE: u16 = 0;      // the MoE units' (codegen::gptoss_moe_lev)\nparam QKV1: u16 = 0;   // wqa = [Hc][q a | q v | v], wqv / wv dummies\n\
 param NOLAYER: u16 = 0;",
             "serve_gptoss layout's lever params",
         )?
@@ -4063,7 +4063,8 @@ mod tests {
             ops2: on("OP2"),
             qkv1: on("QKV1"),
             op3: u16::from(on("OP3")),
-            grid: if on("OP3") { 2 } else { 0 },
+            arf: p.iter().find(|(a, _)| a == "ARF").map_or(0, |(_, b)| b.parse().unwrap()),
+            grid: (if on("OP3") { 2 } else { 0 }) | (if on("ARF") { 1 } else { 0 }),
             ..Variant::default()
         };
         std::fs::create_dir_all(&dir).unwrap();
