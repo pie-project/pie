@@ -716,6 +716,12 @@ impl ProgramSpec {
             .collect()
     }
 
+    /// A knob's text (a parameter no component holds), if the program has it.
+    #[must_use]
+    pub fn knob(&self, k: &str) -> Option<&str> {
+        self.knobs.get(k).map(String::as_str)
+    }
+
     /// The units hold u4g64 weights (`W4 1`: codegen's W4 variant of
     /// serve8b_region, placed by `spatial::u4`).
     #[must_use]
@@ -964,7 +970,8 @@ impl ProgramSpec {
     /// The program's build directory: its design's files for the model's
     /// variant and, at `W4 1`, its u4g64 units ([`Design::files_for`]);
     /// serve_q35w's for a W16 serve_q35 (serve_q35 itself stays #1412's f32
-    /// program).
+    /// program); serve_gptoss's levered units with its `MOE` knob
+    /// ([`super::codegen::serve_gptoss_with`]).
     pub fn files(&self) -> Result<Vec<super::codegen::File>, String> {
         let (variant, u4) = (self.model.variant(), self.weights_u4());
         if self.design == Design::ServeQ35 && self.w16() {
@@ -974,6 +981,14 @@ impl ProgramSpec {
                 ));
             }
             return super::codegen::serve_q35w();
+        }
+        if self.design == Design::ServeGptoss {
+            // (the attention units' levers from the model, the MoE units' MOE knob)
+            let moe = self
+                .knob("MOE")
+                .map_or(Ok(0), |v| v.trim().parse::<u16>())
+                .map_err(|e| format!("MOE: {e}"))?;
+            return super::codegen::serve_gptoss_with(variant, moe);
         }
         self.design.files_for(variant, u4)
     }
@@ -1818,6 +1833,7 @@ fn serve_gptoss(get: &Get) -> R<ProgramSpec> {
         hroute: get.opt("HROUTE").unwrap_or(0) == 1,
         // Absent: the bf16 pool the first builds had.
         kv16: get.opt("KV16").unwrap_or(1) == 1,
+        qkv1: get.opt("QKV1").unwrap_or(0) == 1,
     };
     let grid = Kernel {
         px,

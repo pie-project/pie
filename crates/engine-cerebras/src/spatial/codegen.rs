@@ -986,7 +986,7 @@ fn clip_window(b: u16) void {\n\
     let s = patch(
         &s,
         "    if (HV) { hv_find(); }\n",
-        "    if (HV) { hv_find(); }\n    if (WIN > 0) {\n      var b: u16 = 0;\n      while (b < dims[0]) : (b += 1) { clip_window(b); }\n    }\n",
+        "    if (WIN > 0) {\n      var b: u16 = 0;\n      while (b < dims[0]) : (b += 1) { clip_window(b); }\n    }\n    if (HV) { hv_find(); }   // (gpt-oss) after the window's clip: the scored entries\n",
         &w("the window's call"),
     )?;
     let s = patch(
@@ -1108,6 +1108,73 @@ comptime {\n\
         "  @fadds(x_all, x_all, hv_all);\n  mark(9);\n",
         "  @fadds(x_all, x_all, hv_all);\n  b = 0;\n  while (b < dims[0]) : (b += 1) { @fadds(at(x_dsd, b * Hc), at(x_dsd, b * Hc), bo_d); }\n  mark(9);\n",
         &w("o bias"),
+    )?;
+    // HVL (KV16 0, as TRM 128 at f16): the pass's scored entries listed once
+    // in hv_find (lane 0, e order), the scores' and values' loops over them
+    // alone, Dc and Qh unrolled: the same ops in the same order.
+    let s = patch(
+        &s,
+        "    if (eblk(0, e) != NONE and epg(0, e) == pg) { hv_we = eblk(0, e); }\n  }\n}\n",
+        "    if (eblk(0, e) != NONE and epg(0, e) == pg) { hv_we = eblk(0, e); }\n  }\n\
+  // (gpt-oss hvl) the pass's scored entries (lane 0, in e order)\n\
+  hv_nb = 0;\n\
+  hv_np = 0;\n\
+  e = 0;\n\
+  while (e < dims[1]) : (e += 1) {\n\
+    if (ebits(0, e) != 0) {\n\
+      hv_e[hv_nb] = e;\n\
+      hv_b[hv_nb] = @as(u16, eblk(0, e));\n\
+      hv_nb += 1;\n\
+      hv_np = e + 1;\n\
+    }\n\
+  }\n\
+}\n\
+const HVL: bool = HV and KV16 == 0;\n\
+var hv_nb: u16 = 0;\n\
+var hv_np: u16 = 0;\n\
+var hv_e = @zeros([E]u16);\n\
+var hv_b = @zeros([E]u16);\n",
+        &w("hvl entries"),
+    )?;
+    let s = patch(
+        &s,
+        "  hv_n = 0;\n  b = 0;\n  while (b < dims[0]) : (b += 1) {\n    var e: u16 = 0;\n    while (e < dims[1]) : (e += 1) {\n      const bits = ebits(b, e);\n      if (HV and bits != 0) {\n",
+        "  hv_n = 0;\n\
+  if (HVL) {\n\
+    // (gpt-oss hvl) s[e][0..Qh) = sum over d of k[d] q[h][d], the listed entries\n\
+    hv_n = hv_np;\n\
+    var hk: u16 = 0;\n\
+    while (hk < hv_nb) : (hk += 1) {\n\
+      const kb0 = 1 + kvoff() + hv_b[hk] * Dc;\n\
+      const run = @set_dsd_length(at(srow_dsd, hv_e[hk] * NQB), Qh);\n\
+      @fmovs(run, 0.0);\n\
+      for (@range(u16, Dc)) |d| {\n\
+        const qo = (if (d < DHc) 0 else QH) + d % DHc;\n\
+        @fmacs(run, run, @increment_dsd_offset(qf_t, @as(i16, qo), f32), kc[kb0 + d]);\n\
+      }\n\
+    }\n\
+  }\n\
+  b = 0;\n  while (!HVL and b < dims[0]) : (b += 1) {\n    var e: u16 = 0;\n    while (e < dims[1]) : (e += 1) {\n      const bits = ebits(b, e);\n      if (HV and bits != 0) {\n",
+        &w("hvl scores"),
+    )?;
+    let s = patch(
+        &s,
+        "  @fmovs(o_all, 0.0);\n  b = 0;\n  while (b < dims[0]) : (b += 1) {\n    var e: u16 = 0;\n    while (e < dims[1]) : (e += 1) {\n      if (ebits(b, e) != 0) {\n",
+        "  @fmovs(o_all, 0.0);\n\
+  if (HVL) {\n\
+    // (gpt-oss hvl) the listed entries' values, the heads unrolled\n\
+    var vk: u16 = 0;\n\
+    while (vk < hv_nb) : (vk += 1) {\n\
+      const vb = kat(vc_dsd, hv_b[vk] * Dc);\n\
+      const xo = hv_e[vk] * NQB;\n\
+      for (@range(u16, Qh)) |h| {\n\
+        const od = at(od_dsd, h * Dc);\n\
+        @fmacs(od, od, vb, s[xo + h]);\n\
+      }\n\
+    }\n\
+  }\n\
+  b = 0;\n  while (!HVL and b < dims[0]) : (b += 1) {\n    var e: u16 = 0;\n    while (e < dims[1]) : (e += 1) {\n      if (ebits(b, e) != 0) {\n",
+        &w("hvl values"),
     )?;
     // LSE's shift group arithmetic wants power-of-two groups; the attention
     // unit's rows (AY 42) take AGY 14: divisions there (once an axis switch).
@@ -3920,7 +3987,8 @@ pub fn serve_gptoss_with(v: Variant, moe: u16) -> R<Vec<File>> {
         patch(
             src::gpt::LAYOUT,
             "param NOLAYER: u16 = 0;",
-            "param SPD: u16 = 0;      // the attention units' levers (codegen::gptoss_attn_lev)\n\
+            "param QKN: u16 = 1;      // (0: the gpt-oss units' identity q/k norm, as the levers state it)\n\
+param SPD: u16 = 0;      // the attention units' levers (codegen::gptoss_attn_lev)\n\
 param LSE: u16 = 0;\nparam OP2: u16 = 0;\nparam OP3: u16 = 0;\nparam GRD: u16 = 0;\nparam MOE: u16 = 0;      // the MoE units' (codegen::gptoss_moe_lev)\nparam QKV1: u16 = 0;   // wqa = [Hc][q a | q v | v], wqv / wv dummies\n\
 param NOLAYER: u16 = 0;",
             "serve_gptoss layout's lever params",

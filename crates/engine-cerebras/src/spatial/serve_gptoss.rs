@@ -238,6 +238,10 @@ pub struct Gpt {
     pub hroute: bool,
     /// `KV16`: the pool in bf16 (else f32).
     pub kv16: bool,
+    /// `QKV1` (the levered attention units, codegen::gptoss_attn_lev): one
+    /// QKV matvec, `wqa` = [Hc][q a | q v | v]; `wqv` and `wv` are 2-word
+    /// dummies the host does not write.
+    pub qkv1: bool,
 }
 
 impl Gpt {
@@ -465,29 +469,51 @@ pub fn place_attn(
             u32::from(wk[krow(px, c) * hidden + x])
         }
     };
-    for (sym, half) in [("wqa", 0), ("wqv", dh)] {
-        put16(dev, sym, u, hc * nh * dh, |py, px, out| {
+    let wvx = |px: usize, c: usize, x: usize| -> u32 {
+        if x < hidden {
+            u32::from(wv[krow(px, c) * hidden + x])
+        } else {
+            0
+        }
+    };
+    if gpt.qkv1 {
+        // (QKV1) one matvec: a row's [q a | q v | v]; wqv, wv stay dummies
+        put16(dev, "wqa", u, hc * (2 * nh * dh + dc), |py, px, out| {
             for i in 0..hc {
-                for h in 0..nh {
-                    for c in 0..dh {
-                        out.push(wqk(px, h, half + c, py * hc + i));
+                let x = py * hc + i;
+                for half in [0, dh] {
+                    for h in 0..nh {
+                        for c in 0..dh {
+                            out.push(wqk(px, h, half + c, x));
+                        }
                     }
+                }
+                for c in 0..dc {
+                    out.push(wvx(px, c, x));
+                }
+            }
+        })?;
+    } else {
+        for (sym, half) in [("wqa", 0), ("wqv", dh)] {
+            put16(dev, sym, u, hc * nh * dh, |py, px, out| {
+                for i in 0..hc {
+                    for h in 0..nh {
+                        for c in 0..dh {
+                            out.push(wqk(px, h, half + c, py * hc + i));
+                        }
+                    }
+                }
+            })?;
+        }
+        put16(dev, "wv", u, hc * dc, |py, px, out| {
+            for i in 0..hc {
+                let x = py * hc + i;
+                for c in 0..dc {
+                    out.push(wvx(px, c, x));
                 }
             }
         })?;
     }
-    put16(dev, "wv", u, hc * dc, |py, px, out| {
-        for i in 0..hc {
-            let x = py * hc + i;
-            for c in 0..dc {
-                out.push(if x < hidden {
-                    u32::from(wv[krow(px, c) * hidden + x])
-                } else {
-                    0
-                });
-            }
-        }
-    })?;
     let bqk = |px: usize, h: usize, c: usize| {
         if h < qh {
             bq[qrow(px, h, c)]
