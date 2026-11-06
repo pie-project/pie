@@ -279,7 +279,12 @@ pub const RAN: &[Ran] = &[
                  as streamed halves with the kernels' ARF constant fixed (ARF 7) 1,927.8 / \
                  1,927.2 (0535, regions 34.35-34.51k a pass), golden for 512, 0 mismatches; + x g \
                  in f16 (TRM 1023) 1,946.8 / 1,946.3 (0537, regions 33.97-34.14k), golden for \
-                 512, 0 mismatches",
+                 512, 0 mismatches; + the MLP's act in f16 on every PE, no act all-reduce, \
+                 the f16 gammas in place (TRM 6143) 1,997.6 / 1,997.3 (0538); + the head's \
+                 packed argmax round (TRM 22527) 2,025.7 / 2,025.1 and + the SiLU's scales in \
+                 f16 (TRM 24575) 2,033.3 / 2,032.5 (0540, regions 32.37-32.63k), golden for \
+                 512, 0 mismatches; Pie B 1 on TRM 22527 (0541, depth 63, posted:64) \
+                 1,993.2-2,010.6, every stream = golden for 512",
     },
     Ran {
         design: Design::Serve8bRegion,
@@ -312,7 +317,8 @@ pub const RAN: &[Ran] = &[
                  inexact bits (2: another summation order, 8: exp at degree 4) move Qwen's; \
                  the exact bits (TRM 245) + HVC 1 1,537.7 / 1,539.4 and + ARY 16 1,539.4 / \
                  1,538.5 (0534), both with 0529's 14 mismatches exactly; + ARF 7 1,564.0 / \
-                 1,563.6 (0535, regions 36.6-36.9k a pass), the same 14",
+                 1,563.6 (0535, regions 36.6-36.9k a pass), the same 14; + the head's packed \
+                 argmax round (TRM 16629, exact) 1,566.1 / 1,564.5 (0540), the same 14",
     },
 ];
 
