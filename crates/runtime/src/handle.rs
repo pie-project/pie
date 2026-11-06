@@ -249,7 +249,7 @@ pub(crate) enum Slot {
     Parked(Box<Held>),
     /// Host memory and nothing else: it moves as it is. The lock is for
     /// `Sync`, which the actor holding the table needs and it alone reaches.
-    Matcher(Mutex<Matcher>),
+    Matcher(Box<Mutex<Matcher>>),
     /// In a process, or promised by one: frames naming it wait.
     Lent,
     /// Gone for a reason the next use hears.
@@ -292,7 +292,7 @@ impl Table {
                     Some(Slot::Unborn(kind)) => Slot::Unborn(kind.clone()),
                     Some(Slot::Parked(held)) => Slot::Parked(Box::new(held.fork().await?)),
                     Some(Slot::Matcher(matcher)) => {
-                        Slot::Matcher(Mutex::new(matcher.lock().unwrap().fork()))
+                        Slot::Matcher(Box::new(Mutex::new(matcher.lock().unwrap().fork())))
                     }
                     other => return Err(refusal(from, other)),
                 };
@@ -642,11 +642,8 @@ fn take_out(
     use wasmtime::component::Resource;
     let rep = match moved {
         Moved::Matcher(rep) => {
-            return Ok(Slot::Matcher(Mutex::new(resources.delete(Resource::<
-                Matcher,
-            >::new_own(
-                rep
-            ))?)));
+            let matcher = resources.delete(Resource::<Matcher>::new_own(rep))?;
+            return Ok(Slot::Matcher(Box::new(Mutex::new(matcher))));
         }
         Moved::WorkingSet(rep) => rep,
     };
