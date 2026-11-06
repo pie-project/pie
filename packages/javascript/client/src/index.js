@@ -323,7 +323,7 @@ export class Media extends Handle {
         }
         let data = new Uint8Array();
         for (;;) {
-            const [event, value] = await reader.recv();
+            const { event, value } = await reader.recv();
             if (event === "file") data = value;
             if (event === "return") return data;
             if (event === "error") throw new HandleError(value);
@@ -725,7 +725,11 @@ export class PieClient {
     async frames(data) {
         const name = this._nextHandle();
         if (data === undefined) return new Frames(this, name, false);
-        await this._handleOp({ op: "new", name, kind: { frames: data } });
+        // A Buffer goes out as msgpack bin; a bare Uint8Array as an extension.
+        const bytes = typeof Buffer !== 'undefined' && !Buffer.isBuffer(data)
+            ? Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+            : data;
+        await this._handleOp({ op: "new", name, kind: { frames: bytes } });
         return new Frames(this, name);
     }
 

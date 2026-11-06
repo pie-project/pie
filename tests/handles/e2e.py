@@ -4,8 +4,8 @@
     PIE_HOME=/tmp/pie-test python3 tests/handles/e2e.py --log /tmp/e.log \\
         --ctx 512 --slots 12 --kv-budget 216MiB
 
-Build first: `pie` for the engine, and `working-set-handles` for wasm32-wasip3
-in examples/. A token here is drawn by position, so a turn split across
+Build first: `pie` for the engine, `working-set-handles` for wasm32-wasip3 in
+examples/, and `--example handles` of pie-client for t_clients. A token here is drawn by position, so a turn split across
 processes must draw exactly what one process does. `--slots 4` with
 `--kv-budget 116MiB --only t_quota,t_close` reaches the host's limit; `t_cost`
 wants the default pool.
@@ -251,6 +251,39 @@ async def t_media_js(c, prog, whole):
     check("and takes them by typed input", r["width"] == 64 and r["tokens"] > 0, str(r))
     await out.close(); await sound.close()
 
+async def t_clients(c, prog, whole):
+    import json, tempfile
+    S = Path(__file__).parent
+    mk = await c.install_program(S / "mk.py", force_overwrite=True)
+    see = await c.install_program(S / "see.py", force_overwrite=True)
+    out, sound = await c.frames(), c.pcm()
+    await (await c.run(mk, out=out, sound=sound, w=64, h=48)).result()
+    data = await out.read("png")
+    want = await (await c.run(see, image=out)).result()
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        f.write(data)
+    spec = {"uri": URI[0], "prog": prog, "see": see, "png": f.name, "prompt": PROMPT}
+    runs = {
+        "js": ["node", str(S / "client.mjs"), json.dumps(spec)],
+        "rust": [str(ROOT / "target/release/examples/handles"), URI[0], prog, see, f.name, json.dumps(PROMPT)],
+    }
+    for name, argv in runs.items():
+        with tempfile.TemporaryFile() as err:
+            done = await asyncio.create_subprocess_exec(*argv, stdout=subprocess.PIPE, stderr=err)
+            try:
+                stdout, _ = await asyncio.wait_for(done.communicate(), 60)
+            except asyncio.TimeoutError:
+                done.kill(); await done.wait(); err.seek(0)
+                check(f"the {name} client", False, "hung after: " + err.read().decode()[-200:]); continue
+            err.seek(0); stderr = err.read()
+        if done.returncode != 0:
+            check(f"the {name} client", False, stderr.decode()[-300:]); continue
+        got = json.loads(stdout.decode().strip().splitlines()[-1])
+        check(f"the {name} client resumes and forks", got["tokens"] == whole, str(got["stat"]))
+        check(f"the {name} client hears a closed handle", "unknown" in got["closed"], got["closed"])
+        check(f"the {name} client uploads and reads", got["seen"] == want and got["raw"] == 64 * 48 * 3, f"{got['seen']} {got['raw']}")
+    await out.close(); await sound.close()
+
 async def t_close(c, prog, whole, port=None):
     d = PieClient(c.server_uri if hasattr(c, "server_uri") else URI[0]); await d.connect()
     made = 0
@@ -305,7 +338,7 @@ async def main():
             except Exception: c = None; await asyncio.sleep(1)
         prog = await c.install_program(EX / "working_set_handles.wasm", force_overwrite=True)
         whole = await t_resume(c, prog)
-        for f in (t_lazy, t_order, t_dead, t_many, t_evict, t_quota, t_script, t_matcher, t_media, t_media_js, t_close, t_cost):
+        for f in (t_lazy, t_order, t_dead, t_many, t_evict, t_quota, t_script, t_matcher, t_media, t_media_js, t_clients, t_close, t_cost):
             if args.only and f.__name__ not in args.only.split(","): continue
             try: await asyncio.wait_for(f(c, prog, whole), 120)
             except Exception as e:
