@@ -19,7 +19,7 @@ impl Runahead {
     /// cerebras shell: a posted frame is a host queue entry). Only the
     /// cerebras kind accepts a `frame_dispatch_depth` past [`Self::MAX_FRAMES`];
     /// every depth up to it means what it always did.
-    pub const UNSTAGED_MAX_FRAMES: u8 = 63;
+    pub const UNSTAGED_MAX_FRAMES: u8 = 127;
 
     pub const F1: Runahead = Runahead {
         frames_in_flight: 1,
