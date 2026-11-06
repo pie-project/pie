@@ -687,6 +687,12 @@ fn read_hybrid(trace: &Trace) -> Result<ModelSpec, Refused> {
     let (mut vocab, mut embed, mut head, mut q_heads) = (None, None, None, None);
     let (mut final_norms, mut eps) = (0usize, None::<f32>);
     for node in &trace.nodes {
+        // The self-drafting MTP head runs only for a lane that drafts (reads
+        // `mtp.drafts`); the wafer program does not draft, so a deployment
+        // with the head (Qwen3.5's `-mtp`) reads as its text decoder.
+        if trace.facts.implies(&node.guard, poem_ir::Builtin::Drafts) {
+            continue;
+        }
         let op_name = node.op.name();
         let at = |why: &str| match node.layer {
             Some(l) => format!("{name}: layer {l}: {op_name}: {why}"),
@@ -1342,6 +1348,27 @@ mod tests {
                 (layers, hidden, vh),
                 "{name}"
             );
+        }
+    }
+
+    /// A deployment with Qwen3.5's self-drafting MTP head (and vision, which
+    /// the Cerebras trace does not carry) reads as the text decoder alone:
+    /// the head's ops run only for a drafting lane.
+    #[test]
+    fn the_mtp_head_is_left_to_a_drafting_lane() {
+        for (with, plain) in [
+            (
+                "qwen35-d4b-vision-mtp-bf16-kv-bf16",
+                "qwen35-d4b-bf16-kv-bf16",
+            ),
+            (
+                "qwen35-d0.8b-vision-mtp-bf16-kv-bf16",
+                "qwen35-d0.8b-bf16-kv-bf16",
+            ),
+        ] {
+            let (mut a, b) = (spec(with).expect(with), spec(plain).expect(plain));
+            a.name.clone_from(&b.name);
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "{with}");
         }
     }
 
