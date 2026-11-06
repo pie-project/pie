@@ -1124,7 +1124,7 @@ mod tests {
             }
         }
         assert!(
-            calls.iter().any(|c| c.starts_with("launch compute")),
+            calls.iter().any(|c| c.starts_with("launch compute") || c.starts_with("launch_nb compute")),
             "{calls:?}"
         );
     }

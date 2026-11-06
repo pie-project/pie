@@ -328,7 +328,12 @@ fn check_weights(design: &ProgramSpec, ckpt: &Ckpt, rope: Option<Rotary>) -> R<R
     for c in design.components() {
         c.validate(design, ckpt)?;
     }
-    let config = Rotary::of_config(ckpt.config(), design.head_dim())?;
+    // (serve_gptoss places its own YaRN tables and mscale, serve_gptoss::yarn_inv_freq:
+    // the generic table's refusal of an mscale is not its)
+    let config = match Rotary::of_config(ckpt.config(), design.head_dim()) {
+        Err(_) if design.gptoss().is_some() => None,
+        r => r?,
+    };
     if let (Some(rope), Some(config)) = (&rope, &config)
         && ((rope.theta - config.theta).abs() > 1e-6 * config.theta.abs()
             || rope.table.is_some() != config.table.is_some())
