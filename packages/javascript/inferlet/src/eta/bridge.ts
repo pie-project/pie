@@ -289,6 +289,11 @@ export class WorkingSet {
     return this.ws.cachedTokens();
   }
 
+  /** Later rows stop reading the whole pages inside frozen `[start, end)`; returns the slots dropped. */
+  forget(start: number, end: number): number {
+    return wit('forget', () => this.ws.forget(start, end));
+  }
+
   /** A child sharing the frozen part, with a copy of the buffer. */
   fork(on: Pipeline): WorkingSet {
     return WorkingSet.wrap(wit('fork', () => this.ws.fork(on.wit)));

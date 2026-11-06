@@ -802,6 +802,7 @@ impl FrameShell for Shell {
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut token_injects: Vec<crate::inputs::TokenInject> = Vec::new();
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
+        let mut kv_rows: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut fresh: Vec<u32> = Vec::new();
@@ -1133,6 +1134,7 @@ impl FrameShell for Shell {
                         None => positions
                             .extend((0..rows_here).map(|at| narrow(u64::from(have) + at as u64))),
                     }
+                    kv_rows.extend((0..rows_here).map(|at| narrow(u64::from(have) + at as u64)));
                     match &device_writes[source] {
                         Some((slots, offsets)) => {
                             writes.extend(slots.iter().zip(offsets).map(|(&page, &off)| {
@@ -1161,6 +1163,7 @@ impl FrameShell for Shell {
                                 .get(at)
                                 .map_or_else(|| narrow(u64::from(have) + at as u64), |&p| p as i32),
                         );
+                        kv_rows.push(narrow(u64::from(have) + at as u64));
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
@@ -1184,6 +1187,9 @@ impl FrameShell for Shell {
                 let at = row.row_offset as usize * MROPE_COORDS;
                 triples[at..at + shot.token_positions.len()].copy_from_slice(shot.token_positions);
             }
+            // The rotation rides its own table, and the plain one is the causal
+            // bound: a KV row.
+            positions = kv_rows;
             triples
         };
         super::btrace::mark("lanes");

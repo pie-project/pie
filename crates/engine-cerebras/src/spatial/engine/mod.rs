@@ -388,6 +388,7 @@ impl Engine for Spatial {
             },
             has_lora: false,
             has_attn_page_mask: false,
+            rotates_by_table: false,
             draft_block: 0,
             draft_mask_token: 0,
             draft_proposals_from: 1,

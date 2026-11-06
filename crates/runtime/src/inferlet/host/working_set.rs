@@ -226,6 +226,43 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         })?))
     }
 
+    async fn forget(
+        &mut self,
+        this: Resource<WorkingSet>,
+        start: u32,
+        end: u32,
+    ) -> Result<Result<u32, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let model = crate::model::model();
+        if !model.eta_caps().rotates_by_table || model.rs_caps().has_state() {
+            return Ok(Err(
+                "this model cannot forget: its rows rotate by their slots, or a recurrent \
+                 state has already folded them"
+                    .to_string(),
+            ));
+        }
+        let (kv_rep, cursor) = {
+            let ws = self.ctx().table.get(&this)?;
+            (ws.kv, ws.cursor())
+        };
+        if !cursor.folded_exact || end > cursor.folded {
+            return Ok(Err(format!(
+                "forget reaches {end}, past the frozen {} slot(s)",
+                cursor.folded
+            )));
+        }
+        let kv = kv_of(self, kv_rep)?;
+        let stores = store_registry::get(kv.model, kv.engine);
+        let page = stores.kv_page_size.max(1);
+        let (first, last) = (start.div_ceil(page), end / page);
+        // An empty span still gives up what waited on another reader.
+        let (pages, from) = (u64::from(first)..u64::from(last), u64::from(first * page));
+        Ok(match kv.forget(pages, from) {
+            Ok(()) => Ok(last.saturating_sub(first) * page),
+            Err(error) => Err(error.to_string()),
+        })
+    }
+
     async fn drop(&mut self, this: Resource<WorkingSet>) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.delete(this)?;

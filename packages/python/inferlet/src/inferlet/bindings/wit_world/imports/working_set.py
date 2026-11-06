@@ -50,6 +50,15 @@ class WorkingSet:
         cached tokens.
         """
         raise NotImplementedError
+    def forget(self, start: int, end: int) -> int:
+        """
+        Later rows of this working set and its forks no longer read the
+        whole pages inside frozen `[start, end)`; rows keep their positions
+        and nothing is recomputed. Returns the slots dropped.
+        
+        Raises: `wit_world.types.Err(wit_world.imports.types.Error)`
+        """
+        raise NotImplementedError
     def fork(self, on: pipeline.Pipeline) -> Self:
         """
         A child that shares the frozen part and gets a copy of the buffer,
