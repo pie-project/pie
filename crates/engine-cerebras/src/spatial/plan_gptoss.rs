@@ -461,7 +461,7 @@ mod tests {
     /// units' (every param declared by the layout), QKV1's host layout.
     #[test]
     fn the_levered_params_state_the_levered_units() {
-        use crate::spatial::codegen::{serve_gptoss_with, Design};
+        use crate::spatial::codegen::{Design, serve_gptoss_with};
         use crate::spatial::program::ProgramSpec;
         let s = spec("gptoss-20b-bf16-mxfp4-kv-bf16");
         let params = program_params(&s, 1, 1).unwrap();
