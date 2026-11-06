@@ -209,7 +209,7 @@ pub struct ServeConfig {
     pub hvc: bool,
     /// With `trim`, models without q/k norms: the regions' MLP act in f16 on
     /// every PE of a column from the gate-up all-reduce, no act all-reduce
-    /// (`TRM` bit 1024; with the grids' cuts also 8192, the grids too; inexact,
+    /// (`TRM` bit 1024, with 4096; not 8192: the grids lose with it, 0538; inexact,
     /// so not for the q/k-norm models' exact bits).
     pub silu16: bool,
     /// With `trim`, models without q/k norms: the regions' x g in f16, its
@@ -1479,8 +1479,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
                     // (silu16: TRM 1024, the regions' act in f16, no act all-reduce; inexact;
                     // with 4096, 512's f16 gammas in place, so that the region fits beside 512)
                     | (if cfg.silu16 && !plan.spec.qk_norm { 1024 | 4096 } else { 0 })
-                    // (and 8192: the grids too, when they take the cuts)
-                    | (usize::from(cfg.silu16 && !plan.spec.qk_norm && cfg.grid_levers && cfg.f16accg) << 13)
+                    // (not 8192, the grids too: 0538 sp538_t20, grids +0.14k / +0.11k)
                     // (xg16: TRM 512 + 4096, x g in f16 with in-place f16 gammas; inexact)
                     | (if cfg.xg16 && !plan.spec.qk_norm { 512 | 4096 } else { 0 })
                     // (head_pack: TRM 16384, the head's packed argmax round; exact)
@@ -3081,16 +3080,16 @@ mod llama31_8b {
                 assert!(text.contains("(trm 64)") && text.contains("(arfs)"), "{n}");
             }
         }
-        // + silu16: TRM 14335 (0538's sp538_t20): the units' act in f16, no act all-reduce
+        // + silu16: TRM 6143 (0538's sp538_t19, 1,997.6 tok/s): the regions' act in f16, no act all-reduce
         cfg.silu16 = true;
         let (d, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:14335,ARY:16,HVC:1")));
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:6143,ARY:16,HVC:1")));
         let lay = ProgramSpec::from_params(d, &p).unwrap();
         for (n, text) in d.files_with(lay.model.variant()).unwrap() {
-            assert_eq!(text.contains("(trm 1024)"), n == "region_pe.csl" || n == "grid_pe.csl", "{n}");
+            assert_eq!(text.contains("(trm 1024)"), n == "region_pe.csl", "{n}");
         }
         // + xg16: the same (512 and 4096 already)
         cfg.xg16 = true;
@@ -3098,14 +3097,14 @@ mod llama31_8b {
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:14335,ARY:16,HVC:1")));
-        // + head_pack: TRM 30719
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:6143,ARY:16,HVC:1")));
+        // + head_pack: TRM 22527
         cfg.head_pack = true;
         let (_, p) = params(&plan, &cfg).unwrap();
         let mut got = p.clone();
         got.retain(|(k, _)| k != "KVST");
         got.sort();
-        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:30719,ARY:16,HVC:1")));
+        assert_eq!(got, super::qwen3_8b::sorted(&format!("{want7},F16CL:1,XAC:1,TRM:22527,ARY:16,HVC:1")));
     }
 
     /// `ops2` on 0472's config states 0480's program: the same parameters
