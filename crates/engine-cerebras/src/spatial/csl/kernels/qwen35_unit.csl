@@ -65,6 +65,7 @@ param DK: u16;         // GDN: q/k dims a column (KD / GK)
 param VH: u16;         // GDN: v heads a k head
 param DV: u16;         // GDN: v dims a column, a v head (KD / GK)
 param CW: u16;         // GDN: the conv's width
+param NPG: u16 = 0;    // bf16 parts of x on a GDN layer (0: NP)
 param UK: u16 = 3;     // the unit's layer kinds: bit 0 attention, bit 1 GDN (the other's code left out)
 param c_r1_0: color;
 param c_r1_1: color;
@@ -693,9 +694,17 @@ const pj_all = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PJN} -> pj[i] });
 const pj_ssq = @get_dsd(mem1d_dsd, .{ .tensor_access = |b|{B} -> pj[@as(i16, B * NPJ) + b] });
 // The conv: taps [slot][CW][NCH] (tap i reads the row CW - 1 - i back), the
 // window [slot][b][CW - 1][NCH], oldest first.
-var cw = @zeros([NLG * CW * NCH]f32);
-var cw_ptr: [*]f32 = &cw;
+// (bf16, as the checkpoint's: a tap widens into cw32's high halves, whose
+// low halves stay zero, before its multiply)
+var cw = @zeros([NLG * CW * NCH]u16);
+var cw_ptr: [*]u16 = &cw;
 const cw_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NCH} -> cw[i] });
+var cw32 = @zeros([NCH]f32);
+const cw32_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NCH} -> cw32[i] });
+var cwh_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &g16[0], .extent = NCH });
+fn tap(off: u16) void {
+  @mov16(cwh_dsd, @increment_dsd_offset(cw_dsd, @as(i16, off), u16));
+}
 var cst = @zeros([NLG * B * CWm * NCH]f32);
 var cst_ptr: [*]f32 = &cst;
 const cst_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NCH} -> cst[i] });
@@ -791,10 +800,10 @@ fn mvany(comptime a16: bool, y: mem1d_dsd, a: mem1d_dsd, xv: mem1d_dsd, n: u16, 
     const tmp = @set_dsd_length(at(scr, n), n);
     @fmovs(res, xv);
     var k: u16 = 0;
-    while (k < NP) : (k += 1) {
+    while (k < npv) : (k += 1) {   // (the layer kind's parts: NP, NPG on a GDN layer)
       const part = @set_dsd_length(@increment_dsd_offset(xpart_dsd, @as(i16, k * XMAX), @fp16()), n);
       @fs2h(part, res);
-      if (k + 1 < NP) {
+      if (k + 1 < npv) {
         @fh2s(tmp, part);
         @fsubs(res, res, tmp);
       }
@@ -1251,11 +1260,13 @@ fn gdn_layer() void {
     const pb = at(@set_dsd_length(pj_dsd, NCH), b * NPJ);
     const wb = (lg * B + b) * CWm * NCH;
     const tb = lg * CW * NCH;
-    @fmuls(cy_dsd, at(cw_dsd, tb + CWm * NCH), pb);
+    tap(tb + CWm * NCH);
+    @fmuls(cy_dsd, cw32_dsd, pb);
     var i: u16 = 0;
     var ci: u16 = 0;
     while (i < dims[7]) : (i += 1) {
-      @fmuls(ctt_dsd, at(cw_dsd, tb + ci), at(cst_dsd, wb + ci));
+      tap(tb + ci);
+      @fmuls(ctt_dsd, cw32_dsd, at(cst_dsd, wb + ci));
       @fadds(cy_dsd, cy_dsd, ctt_dsd);
       ci += NCH;
     }
@@ -1408,6 +1419,7 @@ fn mlp() void {
 var lkind = @zeros([2 * NL]u16);
 var lkind_ptr: [*]u16 = &lkind;
 var lw: u16 = 0;
+var npv: u16 = NP;     // the current layer's x parts
 var la: u16 = 0;
 var lg: u16 = 0;
 fn set_layer(l: u16) void {
@@ -1417,11 +1429,13 @@ fn set_layer(l: u16) void {
     wd_dsd = @set_dsd_base_addr(wd_dsd, @ptrcast([*]@fp16(), &wd[1 + l * Ic * Hc]));
   }
   if (lkind[2 * l] == 1) {
+    npv = if (NPG > 0) NPG else NP;
     lg = lkind[2 * l + 1];
     wp_dsd = @set_dsd_base_addr(wp_dsd, @ptrcast([*]@fp16(), &wm[1 + l * MW]));
     wog_dsd = @set_dsd_base_addr(wog_dsd, @ptrcast([*]@fp16(), &wm[1 + l * MW + OOG]));
     return;
   }
+  npv = NP;
   la = lkind[2 * l + 1];
   const a = la;
   if (KV16 == 1) {
@@ -1451,6 +1465,7 @@ fn init() void {
   dims[6] = VH;
   dims[7] = CWm;
   dims[8] = Dc;
+  cwh_dsd = @increment_dsd_offset(@set_dsd_stride(@set_dsd_base_addr(cwh_dsd, @ptrcast([*]u16, &cw32[0])), 2), 1, u16);
   dims[9] = ROT_N;
   qscale = rsqrt(@as(f32, KD));
   px = layout_mod.get_x_coord();

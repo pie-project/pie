@@ -112,7 +112,7 @@ struct Split {
 
 fn split(lay: &ProgramSpec, kind: Kind) -> R<Split> {
     let k = |n: &str| -> R<usize> {
-        lay.knob_num(n)
+        lay.knob(n)
             .map(|v| v as usize)
             .ok_or_else(|| format!("serve8b_region Q35R: no {n}"))
     };
@@ -183,6 +183,11 @@ fn put(
             .collect();
         return dev.put(sym, r, t.n + 1, &words);
     }
+    if sym == "cw" {
+        // (the conv's taps in bf16, no pad)
+        let words: Vec<u32> = t.data.iter().map(|&x| u32::from(bf16(x))).collect();
+        return dev.put16(sym, r, t.n, &words);
+    }
     if W16.contains(&sym) || KV16.contains(&sym) {
         let words: Vec<u32> = t
             .data
@@ -210,10 +215,10 @@ pub(crate) fn place_layers(
             lay.layers()
         ));
     }
-    if lay.knob_num("KINDS") != Some(m.kinds()) {
+    if lay.knob("KINDS") != Some(m.kinds()) {
         return Err(format!(
             "the program's KINDS {:?} is not the checkpoint's layer mix {}",
-            lay.knob_num("KINDS"),
+            lay.knob("KINDS"),
             m.kinds()
         ));
     }
@@ -538,7 +543,7 @@ fn unit(
         }
     }
     let b = lay.launch_lanes();
-    let kv16 = lay.param("KV16").or(lay.knob_num("KV16").map(|v| v as usize)) != Some(0);
+    let kv16 = lay.param("KV16").or(lay.knob("KV16").map(|v| v as usize)) != Some(0);
     let st = Tile::new(pes, sp.nlg * b * nv);
     let cst = Tile::new(pes, sp.nlg * b * (cw - 1) * nch);
     let pool = Tile::new(pes, sp.nla * kcn);
@@ -565,6 +570,34 @@ fn unit(
         .flat_map(|_| slots.iter().flat_map(|&(kind, s)| [u32::from(kind), s as u32]))
         .collect();
     dev.put16("lkind", rect(at.0, at.1, pxn, pyn), 2 * nl, &lk)
+}
+
+/// A unit's KV slots and the pool's memcpy width for the host's page
+/// copies: the unit's attention layers (at least one) and 32-bit cells for an
+/// f32 pool on a Q35R build; else every layer, bf16.
+pub(crate) fn kv_of(
+    lay: &ProgramSpec,
+    units: &Units,
+    v: &super::serve8b_region::Unit,
+) -> (usize, crate::sdk::DataType) {
+    use crate::sdk::DataType;
+    if !lay.q35r() {
+        return (v.layers.len(), DataType::Bits16);
+    }
+    let kv16 = lay.param("KV16").or(lay.knob("KV16").map(|x| x as usize)) != Some(0);
+    let dt = if kv16 { DataType::Bits16 } else { DataType::Bits32 };
+    let attends = |l: usize| (lay.knob("KINDS").unwrap_or(0) >> l) & 1 == 1;
+    let n = match v.kind {
+        Kind::Grid => 1,
+        Kind::Region
+            if units.yd > 0 && units.rc == 2 && units.yd / units.rpy + 2 == units.rr =>
+        {
+            v.layers.clone().filter(|&l| attends(l)).count().max(1)
+        }
+        Kind::Region => lay.knob("RNLA").unwrap_or(1) as usize,
+        Kind::Attn | Kind::Moe => v.layers.len(),
+    };
+    (n, dt)
 }
 
 #[cfg(test)]

@@ -479,7 +479,7 @@ mod tests {
                 && v.f16 == 0
                 && v.eps_bits.is_none()
         );
-        assert_eq!(prog.knob("MOE"), Some("7"));
+        assert_eq!(prog.knob_str("MOE"), Some("7"));
         let g = prog.gptoss().unwrap();
         assert!(!g.kv16 && g.qkv1 && g.arf == 3);
         let files = serve_gptoss_with(v, 7).unwrap();

@@ -718,7 +718,7 @@ impl ProgramSpec {
 
     /// A knob's text (a parameter no component holds), if the program has it.
     #[must_use]
-    pub fn knob(&self, k: &str) -> Option<&str> {
+    pub fn knob_str(&self, k: &str) -> Option<&str> {
         self.knobs.get(k).map(String::as_str)
     }
 
@@ -1001,7 +1001,7 @@ impl ProgramSpec {
 
     /// A knob's value as a number (`None`: unset or not a number).
     #[must_use]
-    pub fn knob_num(&self, k: &str) -> Option<u64> {
+    pub fn knob(&self, k: &str) -> Option<u64> {
         self.knobs.get(k).and_then(|v| v.trim().parse::<u64>().ok())
     }
 
@@ -1037,7 +1037,7 @@ impl ProgramSpec {
         if self.design == Design::ServeGptoss {
             // (the attention units' levers from the model, the MoE units' MOE knob)
             let moe = self
-                .knob("MOE")
+                .knob_str("MOE")
                 .map_or(Ok(0), |v| v.trim().parse::<u16>())
                 .map_err(|e| format!("MOE: {e}"))?;
             return super::codegen::serve_gptoss_with(variant, moe);

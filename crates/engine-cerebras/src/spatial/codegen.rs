@@ -4409,7 +4409,7 @@ fn serve8b_region_files(pipe: bool, grid: &str, region: &str, variant: Variant) 
 /// The names qwen35_unit exports past serve8b_region's grids' (`Q35R 1`).
 const Q35R_NAMES: &[(&str, &str)] = &[
     ("wm", "WS"),
-    ("cw", "f32"),
+    ("cw", "u16"),
     ("cst", "f32"),
     ("gab", "f32"),
     ("nw", "f32"),
@@ -4449,19 +4449,20 @@ fn q35r_layout(text: &str) -> R<String> {
 // regions' attention and GDN layer slots.\n\
 param Q35R: u16 = 0;\nparam KINDS: u32 = 0;\nparam KD: u16 = 1;\nparam GK: u16 = 1;\nparam DK: u16 = 1;\n\
 param DV: u16 = 1;\nparam RGK: u16 = 1;\nparam RDK: u16 = 1;\nparam RDV: u16 = 1;\nparam VH: u16 = 1;\n\
-param CW: u16 = 4;\nparam RNLA: u16 = 1;\nparam RNLG: u16 = 1;\nparam HEADMODE: u16;",
+param CW: u16 = 4;\nparam RNLA: u16 = 1;\nparam RNLG: u16 = 1;\n\
+// NPG > 0: the GDN layers' bf16 parts of x (NP the attention layers').\nparam NPG: u16 = 0;\nparam HEADMODE: u16;",
         "q35r params",
     )?;
     s = patch(
         &s,
         ".KVCP = KVCP, .PROF = if (GPROF == 1) 1 else PROF, .GY = GY,",
-        ".KVCP = KVCP, .PROF = if (GPROF == 1) 1 else PROF, .GY = GY, .NLA = 1, .NLG = 1, .KD = KD, .GK = GK, .DK = DK, .VH = VH, .DV = DV, .CW = CW, .UK = q35r_grid_uk(x, y),",
+        ".KVCP = KVCP, .PROF = if (GPROF == 1) 1 else PROF, .GY = GY, .NLA = 1, .NLG = 1, .KD = KD, .GK = GK, .DK = DK, .VH = VH, .DV = DV, .CW = CW, .UK = q35r_grid_uk(x, y), .NPG = NPG,",
         "q35r grid params",
     )?;
     s = patch(
         &s,
         ".KVCP = KVCP, .PROF = PROF, .NL = RNL, .GY = RGY,",
-        ".KVCP = KVCP, .PROF = PROF, .NL = RNL, .GY = RGY, .NLA = q35r_region_n(x, y, 1), .NLG = q35r_region_n(x, y, 0), .KD = KD, .GK = RGK, .DK = RDK, .VH = VH, .DV = RDV, .CW = CW, .UK = q35r_region_uk(x, y),",
+        ".KVCP = KVCP, .PROF = PROF, .NL = RNL, .GY = RGY, .NLA = q35r_region_n(x, y, 1), .NLG = q35r_region_n(x, y, 0), .KD = KD, .GK = RGK, .DK = RDK, .VH = VH, .DV = RDV, .CW = CW, .UK = q35r_region_uk(x, y), .NPG = NPG,",
         "q35r region params",
     )?;
     // A grid's one layer (the units' order: serve8b_region.rs `Units::units`)

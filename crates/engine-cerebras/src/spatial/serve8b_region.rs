@@ -128,6 +128,7 @@ pub struct Unit {
 }
 
 impl Unit {
+    #[cfg(test)]
     fn nl(&self) -> usize {
         self.layers.len()
     }
@@ -1179,7 +1180,8 @@ pub fn copy_pages(
         let p = v.k.py;
         let n = shape.page_size * v.k.dc;
         let kcn = shape.blocks * n;
-        let len = v.nl() * kcn + 1;
+        let (nlk, dt) = super::serve_q35r::kv_of(lay, u, v);
+        let len = nlk * kcn + 1;
         let rows = |r: usize, k: usize| rect(v.x0, v.y0 + r, v.k.px, k);
         let mut i = 0;
         while i < pairs.len() {
@@ -1199,38 +1201,24 @@ pub fn copy_pages(
             }
             for sym in ["kc", "vc"] {
                 let mut a = vec![0u32; v.k.px * k * len];
-                rt.memcpy_d2h(
-                    sym,
-                    &mut a,
-                    rows(rs, k),
-                    len,
-                    Order::RowMajor,
-                    DataType::Bits16,
-                )
-                .map_err(e)?;
+                rt.memcpy_d2h(sym, &mut a, rows(rs, k), len, Order::RowMajor, dt)
+                    .map_err(e)?;
                 let mut d = if rd == rs {
                     a.clone()
                 } else {
                     let mut d = vec![0u32; v.k.px * k * len];
-                    rt.memcpy_d2h(
-                        sym,
-                        &mut d,
-                        rows(rd, k),
-                        len,
-                        Order::RowMajor,
-                        DataType::Bits16,
-                    )
-                    .map_err(e)?;
+                    rt.memcpy_d2h(sym, &mut d, rows(rd, k), len, Order::RowMajor, dt)
+                        .map_err(e)?;
                     d
                 };
                 for (s, t) in a.chunks_exact(len).zip(d.chunks_exact_mut(len)) {
-                    for l in 0..v.nl() {
+                    for l in 0..nlk {
                         let o = 1 + l * kcn;
                         t[o + bd * n..o + (bd + 1) * n]
                             .copy_from_slice(&s[o + bs * n..o + (bs + 1) * n]);
                     }
                 }
-                rt.memcpy_h2d(sym, &d, rows(rd, k), len, Order::RowMajor, DataType::Bits16)
+                rt.memcpy_h2d(sym, &d, rows(rd, k), len, Order::RowMajor, dt)
                     .map_err(e)?;
             }
             i += k;
@@ -1266,29 +1254,30 @@ fn copy_pages_each(
             let p = v.k.py;
             let n = shape.page_size * v.k.dc;
             let kcn = shape.blocks * n;
-            let len = v.nl() * kcn + 1;
+            let (nlk, dt) = super::serve_q35r::kv_of(lay, u, v);
+        let len = nlk * kcn + 1;
             let (rs, bs, rd, bd) = (src % p, src / p, dst % p, dst / p);
             let row = |r: usize| rect(v.x0, v.y0 + r, v.k.px, 1);
             for sym in ["kc", "vc"] {
                 let mut a = vec![0u32; v.k.px * len];
-                rt.memcpy_d2h(sym, &mut a, row(rs), len, Order::RowMajor, DataType::Bits16)
+                rt.memcpy_d2h(sym, &mut a, row(rs), len, Order::RowMajor, dt)
                     .map_err(e)?;
                 let mut d = if rd == rs {
                     a.clone()
                 } else {
                     let mut d = vec![0u32; v.k.px * len];
-                    rt.memcpy_d2h(sym, &mut d, row(rd), len, Order::RowMajor, DataType::Bits16)
+                    rt.memcpy_d2h(sym, &mut d, row(rd), len, Order::RowMajor, dt)
                         .map_err(e)?;
                     d
                 };
                 for (s, t) in a.chunks_exact(len).zip(d.chunks_exact_mut(len)) {
-                    for l in 0..v.nl() {
+                    for l in 0..nlk {
                         let o = 1 + l * kcn;
                         t[o + bd * n..o + (bd + 1) * n]
                             .copy_from_slice(&s[o + bs * n..o + (bs + 1) * n]);
                     }
                 }
-                rt.memcpy_h2d(sym, &d, row(rd), len, Order::RowMajor, DataType::Bits16)
+                rt.memcpy_h2d(sym, &d, row(rd), len, Order::RowMajor, dt)
                     .map_err(e)?;
             }
         }
