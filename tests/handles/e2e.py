@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "packages/python/client/src"))
 from pie_client import PieClient
 from pie_client.client import HandleError
-PIE = ROOT / "target/release/pie"
+PIE = Path(os.environ.get("PIE_BIN", ROOT / "target/release/pie"))
 HOME = Path(os.environ["PIE_HOME"])  # a home of its own: `pie config init`, then
                                      # `pie model import`; languages/ for t_script
 EX = ROOT / "examples/target/wasm32-wasip3/release"
