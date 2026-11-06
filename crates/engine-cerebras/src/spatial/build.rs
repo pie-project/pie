@@ -2687,6 +2687,39 @@ mod qwen3_8b {
         );
     }
 
+    /// ... and with `trim`, `arfs` and `hvc` states 0535's sp535_qt15 (TIME 1 there).
+    #[test]
+    fn the_plan_places_qwen3_8b_trim_arfs_hvc_as_0535() {
+        let goals = Goals {
+            blocks: Some(1),
+            host_copy: false,
+            grid_lanes: 1,
+            ..Goals::lanes(1)
+        };
+        let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+        let mut cfg = ServeConfig::new(goals);
+        (cfg.region, cfg.speed, cfg.lse, cfg.hv, cfg.lever_d, cfg.head_one_pass) =
+            (true, true, true, true, true, true);
+        (cfg.ops2, cfg.qkv1, cfg.arf, cfg.arfx, cfg.mem, cfg.op3) = (true, true, true, true, true, true);
+        (cfg.f16acc, cfg.f16accg, cfg.grid_levers, cfg.xac) = (true, true, true, true);
+        (cfg.trim, cfg.arfs, cfg.hvc) = (true, true, true);
+        cfg.pins.set("NP", 1).unwrap();
+        let (_, p) = params(&plan, &cfg).unwrap();
+        let mut got = p.clone();
+        got.retain(|(k, _)| k != "KVST");
+        got.sort();
+        assert_eq!(
+            got,
+            sorted(
+                "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:48,RNL:3,\
+                 RGY:16,RC:2,RR:5,NCOL:5,YD:208,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
+                 PROF:0,TIME:0,HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,\
+                 PASSES:3,MODE:2,OVL:0,VMC:1,CAP:64,iters:1,B:1,NP:1,SPD:1,LSE:1,OP2:1,QKV1:1,ARF:7,MEM:1,\
+                 OP3:1,F16:3,GRD:7,XAC:1,TRM:245,HVC:1"
+            )
+        );
+    }
+
     /// `region` with `pipeline` is the validated serve8b_region_pipe builds (B 4 x 4
     /// micro-batches at CAP 16, B 2 x 8 and B 1 x 12 at CAP 32); more
     /// micro-batches, a larger CAP, other lanes or grids, the VM or staging

@@ -52,35 +52,48 @@ struct Landing {
 /// landed, so a launch that takes every posted row leaves the next one few
 /// (0560 at depth 63: 127, 125, 8, 4, 80, 52, ...). Unset (or `pages`): to the
 /// page's end, as always.
-fn continuation_posted_only() -> Option<usize> {
-    static POSTED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+fn continuation_posted_only() -> Option<PostedOnly> {
+    static POSTED: std::sync::OnceLock<Option<PostedOnly>> = std::sync::OnceLock::new();
     *POSTED.get_or_init(|| parse_continuation(std::env::var("PIE_CEREBRAS_CONTINUATION").ok().as_deref()))
 }
 
-/// The posted-only bound `PIE_CEREBRAS_CONTINUATION` states (`None`: pages).
-fn parse_continuation(v: Option<&str>) -> Option<usize> {
-    let v = v?;
-    let (mode, most) = v.split_once(':').unwrap_or((v, ""));
-    (mode == "posted").then(|| most.parse().unwrap_or(usize::MAX).max(1))
+/// The posted-only mode: launches of at most `most` rows, and the shortest
+/// last launch a short posted run keeps back (`tail`; 0: none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PostedOnly {
+    most: usize,
+    tail: usize,
+}
+
+/// The posted-only bound `PIE_CEREBRAS_CONTINUATION` states
+/// (`posted[:T[:K]]`; `None`: pages).
+fn parse_continuation(v: Option<&str>) -> Option<PostedOnly> {
+    let mut parts = v?.split(':');
+    if parts.next() != Some("posted") {
+        return None;
+    }
+    let most = parts.next().and_then(|t| t.parse().ok()).unwrap_or(usize::MAX).max(1);
+    let tail = parts.next().and_then(|k| k.parse().ok()).unwrap_or(TAIL_MIN);
+    Some(PostedOnly { most, tail })
 }
 
 /// A continuation's iterations from the loop's `end`: the lane's pages'
 /// `room`, at most `cap`, and with `posted_only` (at most so many) no further
 /// than the latest posted fire's row (at slot `held`).
-fn continuation_steps(room: usize, cap: usize, end: u32, held: u32, posted_only: Option<usize>) -> usize {
+fn continuation_steps(room: usize, cap: usize, end: u32, held: u32, posted_only: Option<PostedOnly>) -> usize {
     let steps = room.min(cap);
-    let Some(most) = posted_only else {
+    let Some(PostedOnly { most, tail }) = posted_only else {
         return steps;
     };
     let posted = (held + 1).saturating_sub(end) as usize;
-    if posted < most && posted <= steps {
+    if tail > 0 && posted < most && posted <= steps {
         // Fewer rows posted than a launch takes: the stream's end (or a
         // guest running behind). The host hands a launch's answers on one
         // by one (~0.1 ms a token on the CS-3, 0561), so a last launch of
         // all of them leaves that whole burst after the wafer is done: keep
         // a short launch for the last rows, the earlier burst handed on
         // while it runs (it takes ~0.6 ms a step).
-        let tail = TAIL_MIN.max(posted.div_ceil(6));
+        let tail = tail.max(posted.div_ceil(6));
         if posted >= 2 * tail {
             return posted - tail;
         }
@@ -88,7 +101,7 @@ fn continuation_steps(room: usize, cap: usize, end: u32, held: u32, posted_only:
     steps.min(most).min(posted)
 }
 
-/// The shortest last launch [`continuation_steps`] keeps back.
+/// The shortest last launch [`continuation_steps`] keeps back by default.
 const TAIL_MIN: usize = 8;
 
 /// The continuation lanes worth one launch, from each candidate's
@@ -378,28 +391,32 @@ pub(super) fn post(queue: &mut VecDeque<Posted>, frame: FrameId, steps: &[Step])
 
 #[cfg(test)]
 mod tests {
-    use super::{continuation_steps, launch_of, parse_continuation};
+    use super::{PostedOnly, TAIL_MIN, continuation_steps, launch_of, parse_continuation};
 
     #[test]
     fn a_posted_only_continuation_stops_at_the_latest_posted_row() {
+        let at = |most, tail| Some(PostedOnly { most, tail });
+        let all = at(usize::MAX, TAIL_MIN);
         // Pages to slot 544, the loop at 528, the last fire's row at 529.
-        let all = Some(usize::MAX);
         assert_eq!(continuation_steps(16, 127, 528, 529, None), 16);
         assert_eq!(continuation_steps(16, 127, 528, 529, all), 2);
         // A short posted run (the end) keeps its last rows for a launch of their own.
-        assert_eq!(continuation_steps(61, 127, 483, 529, Some(64)), 39);
-        assert_eq!(continuation_steps(61, 127, 522, 529, Some(64)), 8);
+        assert_eq!(continuation_steps(61, 127, 483, 529, at(64, 8)), 39);
+        assert_eq!(continuation_steps(61, 127, 522, 529, at(64, 8)), 8);
+        // ... unless the tail is off.
+        assert_eq!(continuation_steps(61, 127, 483, 529, at(64, 0)), 47);
         // Mid-stream, fires posted far ahead: the cap, then the pages.
         assert_eq!(continuation_steps(200, 127, 100, 300, all), 127);
         assert_eq!(continuation_steps(60, 127, 100, 300, all), 60);
-        assert_eq!(continuation_steps(60, 127, 100, 300, Some(84)), 60);
+        assert_eq!(continuation_steps(60, 127, 100, 300, at(84, 8)), 60);
         assert_eq!(continuation_steps(60, 127, 100, 99, all), 0);
         // posted:84 keeps launches even.
-        assert_eq!(continuation_steps(200, 127, 100, 300, Some(84)), 84);
+        assert_eq!(continuation_steps(200, 127, 100, 300, at(84, 8)), 84);
         assert_eq!(parse_continuation(None), None);
         assert_eq!(parse_continuation(Some("pages")), None);
         assert_eq!(parse_continuation(Some("posted")), all);
-        assert_eq!(parse_continuation(Some("posted:84")), Some(84));
+        assert_eq!(parse_continuation(Some("posted:84")), at(84, 8));
+        assert_eq!(parse_continuation(Some("posted:64:0")), at(64, 0));
     }
 
     #[test]
