@@ -1738,13 +1738,15 @@ impl BatchScheduler {
         while let Some(item) = pending.front() {
             match item {
                 QueuedItem::Launch(_) => {
-                    // a rotation moves work, it does not do any: counted as progress, a launch run and a held
-                    // close that rotate past each other kept the loop from ever parking (a tab spun at 100% CPU)
                     if Self::rotate_launch_for_wave_work(
                         pending,
                         in_flight_control.copies_only(),
                         !slot_blocks_lifecycle,
                     ) {
+                        // in a browser tab the loop shares its thread with the GPU's callbacks: a rotation moves
+                        // work without doing any, and counted as progress, a launch run and a held close rotating
+                        // past each other kept the loop from ever parking (the tab spun at 100% CPU, no token out)
+                        progress |= !cfg!(target_arch = "wasm32");
                         continue;
                     }
                     break;
