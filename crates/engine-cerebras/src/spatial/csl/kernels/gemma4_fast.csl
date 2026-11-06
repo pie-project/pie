@@ -21,7 +21,9 @@
 //      expansion (needs 8);
 //   64 HV: pages of one position (PS 1, B 1): a row's entries' keys and
 //      values gathered [e][Dc], the scores and the values over (entry,
-//      head) at once.
+//      head) at once;
+//   128 LSE's reference moved only when a pass's sum leaves [2^-30, 2^30]
+//      (any reference in range is exact; the move is the scalar log).
 // gemma4_layer: a Gemma 4 dense layer over qwen2d_paged's grid (below).
 // Against qwen35_attn: no attention gates; v RMS-normed per head without a
 // weight; the attention's and the MLP's outputs RMS-normed (gamma3, gamma4)
@@ -108,6 +110,7 @@ const FPLE: bool = (G4F & 8) != 0 and PC > 0;
 const FKV: bool = (G4F & 16) != 0 and OWN == 0;
 const FDEF: bool = (G4F & 32) != 0;
 const FHV: bool = (G4F & 64) != 0;
+const FLZ: bool = (G4F & 128) != 0;
 comptime {
   @comptime_assert(!FLSE or FEXP);
   @comptime_assert(!FQKN or B == 1);       // only a lane's own key is scaled after the scores
@@ -1546,7 +1549,7 @@ fn layer() void {
       }
       while (j < dims[3]) : (j += 1) {
         const l = act[B * Qh * Dc + j];
-        mref[j] += ln_approx(l);
+        if (!FLZ or !(l >= 9.313226e-10 and l < 1.0737418e9)) { mref[j] += ln_approx(l); }
         @fmuls(at(oa_dsd, j * Dc), at(oa_dsd, j * Dc), recip(l));
       }
     } else {
