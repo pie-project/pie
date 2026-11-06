@@ -4428,9 +4428,10 @@ pub fn serve8b_region_q35(variant: Variant) -> R<Vec<File>> {
     for (name, text) in &mut files {
         *text = match *name {
             "layout.csl" => q35r_layout(text)?,
-            "grid_pe.csl" | "region_pe.csl" => {
-                s8br_unit("qwen2d_region", src::QWEN35_UNIT, false, variant)?
-            }
+            // (the grids take the regions' levers only by GRD's bits, as
+            // serve8b_region's grids: the host writes their routes so)
+            "grid_pe.csl" => s8br_unit("qwen2d_paged8b", src::QWEN35_UNIT, false, variant)?,
+            "region_pe.csl" => s8br_unit("qwen2d_region", src::QWEN35_UNIT, false, variant)?,
             "paths.csl" | "rt.csl" => continue,
             _ => q35r_dummies(text),
         };
