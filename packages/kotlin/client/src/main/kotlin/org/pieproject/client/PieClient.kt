@@ -1,5 +1,6 @@
 package org.pieproject.client
 
+import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -17,19 +18,27 @@ import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 
 /** A client of a pie server: a remote `pie serve`, or a `PieServer` in this process. */
 public class PieClient private constructor(private val transport: PieTransport) : AutoCloseable {
     private val lock = Any()
     private var nextCorrelationId = 0
+    private var lastHandle = 0L
     private val pending = HashMap<Int, CompletableDeferred<String>>()
     private val processes = HashMap<String, Channel<PieProcess.Event>>()
 
-    /** Files part-way through their chunks, by hash. */
-    private val downloads = HashMap<String, Pair<ServerFrame.FileChunk, java.io.ByteArrayOutputStream>>()
+    /** Files part-way through their chunks, by process and hash: two reads of one handle share a hash. */
+    private val downloads = HashMap<Pair<String, String>, Pair<ServerFrame.FileChunk, java.io.ByteArrayOutputStream>>()
 
     /** Events that arrived before their process's launch response. */
     private val early = HashMap<String, MutableList<ServerFrame>>()
@@ -77,15 +86,31 @@ public class PieClient private constructor(private val transport: PieTransport) 
         input: T,
         captureOutputs: Boolean = true,
         json: Json = Json,
-    ): PieProcess = launch(inferlet, json.encodeToJsonElement(input), captureOutputs)
+        handles: Map<String, Handle> = emptyMap(),
+        returns: Map<String, Handle> = emptyMap(),
+    ): PieProcess = launch(inferlet, json.encodeToJsonElement(input), captureOutputs, handles, returns)
 
-    /** Launches an inferlet with [input] as its JSON input. */
+    /**
+     * Launches an inferlet with [input] as its JSON input. [handles] move into
+     * the process, by the name its guest takes each under, and cannot be used
+     * until they come back: fork first to keep one. [returns] is what the
+     * process gives back, by the name it gives each under.
+     */
     public suspend fun launch(
         inferlet: String,
         input: JsonElement = JsonObject(emptyMap()),
         captureOutputs: Boolean = true,
+        handles: Map<String, Handle> = emptyMap(),
+        returns: Map<String, Handle> = emptyMap(),
     ): PieProcess {
-        val id = request(ClientFrame.Launch(inferlet, input.toString(), captureOutputs))
+        val frame = ClientFrame.Launch(
+            inferlet, input.toString(), captureOutputs, handles.mapValues { it.value.name }, returns.mapValues { it.value.name },
+        )
+        val id = try {
+            request(frame)
+        } catch (error: PieException.RequestFailed) {
+            throw HandleErrorCode.of(error.reason)?.let { PieException.HandleFailed(it, error.reason) } ?: error
+        }
         val events = Channel<PieProcess.Event>(Channel.UNLIMITED)
         events.invokeOnClose { cause ->
             if (cause is CancellationException) scope.launch { terminate(id) }
@@ -95,6 +120,127 @@ public class PieClient private constructor(private val transport: PieTransport) 
             early.remove(id)?.forEach(::route)
         }
         return PieProcess(id, events.consumeAsFlow(), this)
+    }
+
+    /** A new, empty working set. */
+    public suspend fun workingSet(): WorkingSet {
+        val name = nextHandle()
+        handleOp(HandleOp.New(name, HandleOp.Kind.WorkingSet))
+        return WorkingSet(this, name)
+    }
+
+    /**
+     * A matcher at the start of one grammar, or of any JSON given none. The
+     * grammar compiles where a process binds it, and an error in it fails that
+     * launch.
+     */
+    public suspend fun matcher(jsonSchema: String? = null, regex: String? = null, ebnf: String? = null): Matcher {
+        val grammar = when {
+            jsonSchema != null -> HandleOp.Grammar.JsonSchema(jsonSchema)
+            regex != null -> HandleOp.Grammar.Regex(regex)
+            ebnf != null -> HandleOp.Grammar.Ebnf(ebnf)
+            else -> HandleOp.Grammar.Json
+        }
+        val name = nextHandle()
+        handleOp(HandleOp.New(name, HandleOp.Kind.Matcher(grammar)))
+        return Matcher(this, name)
+    }
+
+    /**
+     * An upload, if [data] is given: encoded pictures, which decode where a
+     * process binds them. Else a name for a process to give pictures to.
+     */
+    public suspend fun frames(data: ByteArray? = null): Frames {
+        val name = nextHandle()
+        if (data != null) handleOp(HandleOp.New(name, HandleOp.Kind.Frames(data)))
+        return Frames(this, name)
+    }
+
+    /** A name for a process to give sound to. */
+    public fun pcm(): Pcm = Pcm(this, nextHandle())
+
+    /** A new working set as [snapshot] stands. */
+    public suspend fun loadSnapshot(snapshot: String): WorkingSet {
+        val name = nextHandle()
+        handleOp(HandleOp.Load(name, snapshot))
+        return WorkingSet(this, name)
+    }
+
+    /** Handles loaded from it stay. */
+    public suspend fun deleteSnapshot(snapshot: String) {
+        handleOp(HandleOp.DeleteSnapshot(snapshot))
+    }
+
+    /** Each snapshot under [prefix]. */
+    public suspend fun listSnapshots(prefix: String = ""): List<Snapshot> {
+        val answer = handleOp(HandleOp.ListSnapshots(prefix))
+        return try {
+            answer.getValue("snapshots").jsonArray.map {
+                val snapshot = it.jsonObject
+                snapshot(snapshot.getValue("name").jsonPrimitive.content, snapshot)
+            }
+        } catch (error: RuntimeException) {
+            throw PieException.MalformedFrame("a snapshot list: ${error.message}")
+        }
+    }
+
+    internal suspend fun save(name: Long, snapshot: String): Snapshot {
+        val answer = handleOp(HandleOp.Save(name, snapshot))
+        return try {
+            snapshot(snapshot, answer)
+        } catch (error: RuntimeException) {
+            throw PieException.MalformedFrame("a save's answer: ${error.message}")
+        }
+    }
+
+    private fun snapshot(name: String, answer: JsonObject) =
+        Snapshot(name, answer.getValue("tokens").jsonPrimitive.long, answer.getValue("bytes").jsonPrimitive.long)
+
+    internal fun nextHandle(): Long = synchronized(lock) { ++lastHandle }
+
+    /** Sends [op] alone and returns its answer. */
+    internal suspend fun handleOp(op: HandleOp): JsonObject {
+        val result = handleRequest(ClientFrame.Handles(op))
+        val answer = try {
+            Json.parseToJsonElement(result) as JsonArray
+        } catch (error: RuntimeException) {
+            throw PieException.MalformedFrame("a handle answer: ${error.message}")
+        }.firstOrNull() as? JsonObject ?: throw PieException.MalformedFrame("a handle answer that is not an object")
+        val error = answer["error"] ?: return answer
+        val reason = (error as? JsonPrimitive)?.contentOrNull ?: error.toString()
+        val code = HandleErrorCode.named((answer["code"] as? JsonPrimitive)?.contentOrNull)
+        throw PieException.HandleFailed(code ?: HandleErrorCode.of(reason), reason)
+    }
+
+    private suspend fun handleRequest(frame: ClientFrame): String = try {
+        request(frame)
+    } catch (error: PieException.RequestFailed) {
+        throw PieException.HandleFailed(HandleErrorCode.of(error.reason), error.reason)
+    }
+
+    internal suspend fun read(name: Long, format: String): ByteArray {
+        // Picked here so the channel is open before the first chunk can arrive.
+        val reader = UUID.randomUUID().toString()
+        val events = Channel<PieProcess.Event>(Channel.UNLIMITED)
+        synchronized(lock) {
+            failure?.let { throw it }
+            processes[reader] = events
+        }
+        try {
+            handleRequest(ClientFrame.ReadHandle(name, format, reader))
+            var data = ByteArray(0)
+            for (event in events) {
+                if (event is PieProcess.Event.File) data = event.bytes
+            }
+            return data
+        } catch (error: PieException.ProcessFailed) {
+            throw PieException.HandleFailed(HandleErrorCode.of(error.reason), error.reason)
+        } finally {
+            synchronized(lock) {
+                processes.remove(reader)
+                downloads.keys.removeAll { it.first == reader }
+            }
+        }
     }
 
     internal suspend fun signal(processId: String, message: String) {
@@ -152,14 +298,15 @@ public class PieClient private constructor(private val transport: PieTransport) 
 
     private fun collect(chunk: ServerFrame.FileChunk) {
         val events = processes[chunk.processId] ?: return
-        val started = downloads[chunk.hash] ?: if (chunk.index == 0) {
-            (chunk to java.io.ByteArrayOutputStream()).also { downloads[chunk.hash] = it }
+        val key = chunk.processId to chunk.hash
+        val started = downloads[key] ?: if (chunk.index == 0) {
+            (chunk to java.io.ByteArrayOutputStream()).also { downloads[key] = it }
         } else {
             return
         }
         started.second.write(chunk.data)
         if (chunk.index == chunk.total - 1) {
-            downloads.remove(chunk.hash)
+            downloads.remove(key)
             events.trySend(PieProcess.Event.File(started.first.name, started.second.toByteArray()))
         }
     }

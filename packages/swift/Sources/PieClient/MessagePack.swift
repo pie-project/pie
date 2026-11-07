@@ -30,6 +30,11 @@ enum MessagePack: Equatable, Sendable {
         if case .bool(let b) = self { return b }
         return nil
     }
+
+    var binary: Data? {
+        if case .binary(let bytes) = self { return bytes }
+        return nil
+    }
 }
 
 struct MessagePackError: Error, CustomStringConvertible {
