@@ -152,8 +152,14 @@ async def t_keep(c, prog, whole):
         rest = [(await x.stat())["resident"] for x in hogs]
         if not all(rest): break
     check("the policy's key outranks age at rest", (await kept.stat())["resident"] and not all(rest), str(rest))
-    await run(c, prog, kept, [1], 2, drawn=80)
-    check("props stay through a lend", True)
+    await kept.set_props({"keep": -1, "head": 160}); await asyncio.sleep(0.2)
+    before = await run(c, prog, kept, [1], 2, drawn=80)
+    check("props stay through a lend", (await kept.stat())["resident"])
+    h = await c.working_set(); hogs.append(h); await run(c, prog, h, list(range(9000, 9000 + N)), 2)
+    st = await kept.stat()
+    check("a key on a head outlasts its tail", 0 < st["swapped_pages"] <= (st["tokens"] - 160) // 16 + 1, str(st))
+    z = await run(c, prog, kept, [1], 2, drawn=81)
+    check("and a set split so resumes", len(z) == 2 and (await kept.stat())["resident"], str(z))
     bad = None
     try: await kept.set_props({"": 1})
     except HandleError as e: bad = e

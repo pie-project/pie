@@ -667,6 +667,27 @@ fn a_move_under_way_keeps_only_the_pages_it_holds() {
     );
 }
 
+fn a_sweep_takes_readers_in_order_and_a_kept_head_last() {
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(14));
+    let a = store.create_working_set();
+    commit_fresh(&mut store, a, 2, 1);
+    let b = store.create_working_set();
+    commit_fresh(&mut store, b, 2, 1);
+    store.mark_suspended(&HashSet::from([a, b]));
+    let page = u64::from(store.page_size);
+    let sweep = store
+        .prepare_sweep(&HashSet::new(), usize::MAX, &[(b, page), (a, 0)], 1)
+        .unwrap()
+        .expect("something to move");
+    assert_eq!(sweep.page_count(), 1, "no more than was wanted");
+    assert!(store.table.in_move(&HashSet::from([b])).unwrap());
+    assert!(!store.table.in_move(&HashSet::from([a])).unwrap());
+    store.commit_suspend(sweep).unwrap();
+    let moved = store.swapped_page_count(&HashSet::from([b])).unwrap();
+    assert_eq!(moved, 1, "the head b keeps stayed");
+}
+
+#[test]
 fn a_sweep_suspends_only_the_readers_of_what_it_moves() {
     let mut store = KvStore::new_with_swap(8, 8, 0, h(14));
     let a = store.create_working_set();

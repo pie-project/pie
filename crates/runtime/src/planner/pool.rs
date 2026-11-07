@@ -42,7 +42,7 @@ pub trait PoolPort: Send + Sync + 'static {
         &self,
         keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
         room: usize,
-        order: &[crate::store::kv::page_table::WorkingSetId],
+        order: &[(crate::store::kv::page_table::WorkingSetId, u64)],
         wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn>;
     fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn>;
@@ -200,7 +200,7 @@ impl PoolPort for RegistryPool {
         &self,
         keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
         room: usize,
-        order: &[crate::store::kv::page_table::WorkingSetId],
+        order: &[(crate::store::kv::page_table::WorkingSetId, u64)],
         wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         if !self.suspend_capable {

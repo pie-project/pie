@@ -1785,9 +1785,16 @@ impl KvStore {
         &mut self,
         keep: &HashSet<WorkingSetId>,
         room: usize,
-        order: &[WorkingSetId],
+        order: &[(WorkingSetId, u64)],
         wanted: usize,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
+        // In tokens as a policy states them, in pages here.
+        let page = u64::from(self.page_size.max(1));
+        let order: Vec<_> = order
+            .iter()
+            .map(|&(ws, tokens)| (ws, tokens.div_ceil(page)))
+            .collect();
+        let order = &order[..];
         let mut pages = self.table.stranded_pages(keep, order, wanted);
         if self.swap_available() < pages.len().min(room) {
             self.drop_entries_off_device();

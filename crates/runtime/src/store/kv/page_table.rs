@@ -1437,11 +1437,13 @@ impl KvPageTable {
     }
 
     /// A running reader kept them on the device and has gone since: readers
-    /// in `order`, then the rest, until `wanted` pages are found.
+    /// in `order`, then the rest, until `wanted` pages are found. The pages
+    /// `order` keeps, the first of a reader's, go only once nothing else will
+    /// do.
     pub fn stranded_pages(
         &self,
         keep: &HashSet<WorkingSetId>,
-        order: &[WorkingSetId],
+        order: &[(WorkingSetId, u64)],
         wanted: usize,
     ) -> Vec<(TriePageLocation, PhysicalKvPageId)> {
         let mut running = FxHashSet::default();
@@ -1457,33 +1459,47 @@ impl KvPageTable {
                 running.insert(location);
             });
         }
+        let mut kept = FxHashSet::default();
+        for &(ws, pages) in order {
+            let mut at = 0;
+            let _ = self.visit_working_set_locations(ws, |location| {
+                if at < pages {
+                    kept.insert(location);
+                }
+                at += 1;
+            });
+        }
         // Reader by reader, so a sweep short of room moves whole readers.
         let (mut seen, mut pages) = (FxHashSet::default(), Vec::new());
-        let ordered: FxHashSet<_> = order.iter().copied().collect();
+        let ordered: FxHashSet<_> = order.iter().map(|&(ws, _)| ws).collect();
         let rest = self.working_sets.iter().map(|(ws, _)| ws);
-        for ws in order
+        let readers: Vec<_> = order
             .iter()
-            .copied()
+            .map(|&(ws, _)| ws)
             .chain(rest.filter(|ws| !ordered.contains(ws)))
-        {
-            if pages.len() >= wanted {
-                break;
-            }
-            if !self
-                .working_sets
-                .get(ws)
-                .is_some_and(|entry| entry.suspended)
-            {
-                continue;
-            }
-            let _ = self.visit_working_set_locations(ws, |location| {
-                if running.contains(&location) || !seen.insert(location) {
-                    return;
+            .filter(|&ws| {
+                self.working_sets
+                    .get(ws)
+                    .is_some_and(|entry| entry.suspended)
+            })
+            .collect();
+        for spare_kept in [false, true] {
+            for &ws in &readers {
+                if pages.len() >= wanted {
+                    return pages;
                 }
-                if let Ok(KvPageBacking::Resident(id)) = self.backing_at(&location) {
-                    pages.push((location, id));
-                }
-            });
+                let _ = self.visit_working_set_locations(ws, |location| {
+                    if running.contains(&location)
+                        || (!spare_kept && kept.contains(&location))
+                        || !seen.insert(location)
+                    {
+                        return;
+                    }
+                    if let Ok(KvPageBacking::Resident(id)) = self.backing_at(&location) {
+                        pages.push((location, id));
+                    }
+                });
+            }
         }
         pages
     }

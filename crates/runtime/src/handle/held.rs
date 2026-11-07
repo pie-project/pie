@@ -188,6 +188,7 @@ impl Held {
             "folded": cursor.folded,
             "engine": kv.engine,
             "resident": swapped == 0,
+            "swapped_pages": swapped,
         })
     }
 }

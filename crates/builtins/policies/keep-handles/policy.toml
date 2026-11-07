@@ -8,6 +8,10 @@ grants = ["retention", "discard"]
 type = "int"
 doc = "A resting handle's retention key: the lowest leaves the device first."
 
+[props.head]
+type = "int"
+doc = "Tokens at the start of a resting handle that stay on the device past its tail."
+
 [props.weak]
 type = "bool"
 doc = "This handle may be discarded to make room for others to rest."

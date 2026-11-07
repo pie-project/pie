@@ -145,7 +145,8 @@ impl ResidencyPlanner {
         let room = swap_free.saturating_sub(swap_total / HOST_RESERVE_DIVISOR) as usize;
         let (model, engine) = self.port.locus();
         // What rests goes in the order it would be evicted, and no more of
-        // it than is wanted: a policy's keys hold here too.
+        // it than is wanted: a policy's keys hold here too, the head of a set
+        // they keep going last.
         let order: Vec<_> = self
             .with_inner(|inner| {
                 let mut holders: Vec<_> = inner
@@ -159,7 +160,10 @@ impl ResidencyPlanner {
             })
             .into_iter()
             .flat_map(|(_, pid)| {
+                let head = holder_head(pid);
                 crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine)
+                    .into_iter()
+                    .map(move |ws| (ws, head))
             })
             .collect();
         let keep: HashSet<_> = self
@@ -804,4 +808,16 @@ impl ResidencyPlanner {
 fn holder_key(pid: ProcessId) -> i64 {
     use crate::policy::retention::{Installed, Keys};
     Installed.key_at(Some(pid), u64::MAX)
+}
+
+/// The tokens a holder's keys keep above the whole of it.
+fn holder_head(pid: ProcessId) -> u64 {
+    use crate::policy::retention::{Installed, Keys};
+    let whole = holder_key(pid);
+    Installed
+        .steps(pid)
+        .into_iter()
+        .filter(|&upto| upto > 0 && Installed.key_at(Some(pid), upto - 1) > whole)
+        .max()
+        .unwrap_or(0)
 }
