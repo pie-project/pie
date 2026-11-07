@@ -22,7 +22,8 @@ const q_lb = @get_input_queue(4);
 const q_lo = @get_output_queue(2);
 const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
-var fifo_buf = @zeros([32]f32);
+param FIFOW: u16 = 32;
+var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
 fn fout(comptime q: output_queue, n: u16) fabout_dsd {
   return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);

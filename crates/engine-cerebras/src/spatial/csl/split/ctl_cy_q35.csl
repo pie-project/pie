@@ -14,6 +14,7 @@
 // - MLP: rms scale, SiLU(g) u, multicast act.
 // Kinds by layer: KM bit l (1 attention). Column dims per kind are params.
 param memcpy_params;
+param DIAG: u16 = 0;   // 1 (diagnostics): no layers (handoffs, head and I/O only)
 param K: u16;
 param KM: u16;
 param NQA: u16;        // attention reduction words before ssq: Qh Dc q | Qh Dc gate | Dc k | Dc v
@@ -89,7 +90,8 @@ const q_so = @get_output_queue(4);
 const C_PARK: color = @get_color(16);
 const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
-var fifo_buf = @zeros([32]f32);
+param FIFOW: u16 = 32;
+var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
 fn fout(comptime q: output_queue, n: u16) fabout_dsd {
   return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
@@ -174,7 +176,7 @@ fn exp1(x0: f32) f32 {
   const s = @bitcast(f32, @as(u32, @as(u16, ki)) << 23);
   return p * s;
 }
-fn recip(v: f32) f32 { const r = rsqrt(v * v); return if (v < 0.0) -r else r; }
+fn recip(v: f32) f32 { const a = if (v < 0.0) -v else v; const r = rsqrt(a); return if (v < 0.0) -(r * r) else r * r; }   // (not rsqrt(v v): v v overflows past 1.8e19, e.g. 1 + e^87 in a sigmoid)
 fn sigm(x: f32) f32 { return recip(1.0 + exp1(-x)); }
 fn silu(x: f32) f32 { return x * sigm(x); }
 fn ln1(x: f32) f32 {
@@ -338,10 +340,12 @@ task pass_task() void {
     var l: u16 = 0;
     var la: u16 = 0;
     var lg: u16 = 0;
-    while (l < K) : (l += 1) {
+    while ((DIAG & 1) == 0 and l < (if ((DIAG & 2) != 0) 1 else K)) : (l += 1) {
+      if ((DIAG & 16) != 0) { continue; }
+      if ((DIAG & 8) != 0) { reduce(if (((KM >> l) & 1) == 1) NQA + 1 else NQG + 1); continue; }
       if (((KM >> l) & 1) == 1) { if (NLA > 0) { att(la); } la += 1; }
       else { if (NLG > 0) { gdn(lg); } lg += 1; }
-      mlp();
+      if ((DIAG & 4) == 0) { mlp(); }
     }
   }
   sys_mod.unblock_cmd_stream();

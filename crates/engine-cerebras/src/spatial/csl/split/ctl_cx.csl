@@ -9,6 +9,7 @@
 // A layer: x_r g1 (+ ssq) multicast; o-proj reduction in -> x += o; x g2 (+ ssq) multicast;
 // down reduction in -> x += d; (next layer). The pass ends with x sent on.
 param memcpy_params;
+param DIAG: u16 = 0;   // 1 (diagnostics): no layers (handoffs, head and I/O only)
 param K: u16;          // layers on the unit
 param Hc: u16;         // x dims a row
 param HOSTX: u16 = 0;  // 1 (simulator tests): x is the host's (memcpy), no handoff
@@ -21,6 +22,8 @@ const tgt = tile_config.target;
 
 var x = @zeros([Hc]f32);
 var x_ptr: [*]f32 = &x;
+var xdbg = @zeros([K * Hc]f32);   // x after each layer of the last pass (diagnostics, host-read)
+var xdbg_ptr: [*]f32 = &xdbg;
 var gam = @zeros([2 * K * Hc]@fp16());   // [layer][g1 | g2], the host's f16 gammas (1 + w)
 var gam_ptr: [*]@fp16() = &gam;
 var t = @zeros([Hc + 1]f32);             // the merged partial; then the multicast's words
@@ -43,7 +46,8 @@ const q_ho = @get_output_queue(4);
 const C_PARK: color = @get_color(16);
 const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
-var fifo_buf = @zeros([32]f32);
+param FIFOW: u16 = 32;
+var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
 fn fout(comptime q: output_queue, n: u16) fabout_dsd {
   return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
@@ -113,13 +117,18 @@ task pass_task() void {
   while (s < n_steps) : (s += 1) {
     if (HOSTX == 0 and (rcfg[RQ + 7] & 1) == 0) { @fmovs(x_d, fin(q_hi, Hc)); }
     var l: u16 = 0;
-    while (l < K) : (l += 1) {
+    while ((DIAG & 1) == 0 and l < (if ((DIAG & 2) != 0) 1 else K)) : (l += 1) {
       norm_send(2 * l);
+      if ((DIAG & 8) == 0) {
       reduce();
       @fadds(x_d, x_d, t_d);
+      }
+      if ((DIAG & 4) == 0) {
       norm_send(2 * l + 1);
       reduce();
       @fadds(x_d, x_d, t_d);
+      }
+      @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{K * Hc} -> xdbg[i] }), @as(i16, l * Hc), f32), Hc), x_d);
     }
     if (HOSTX == 0 and (rcfg[RQ + 7] & 2) == 0) { @fmovs(fout(q_ho, Hc), x_d); }
   }
@@ -140,6 +149,7 @@ comptime {
   @initialize_queue(q_mc, .{ .color = C_PARK });
   @initialize_queue(q_ho, .{ .color = C_PARK });
   @export_symbol(x_ptr, "x");
+  @export_symbol(xdbg_ptr, "xdbg");
   @export_symbol(gam_ptr, "gam");
   @export_symbol(rcfg_ptr, "rcfg");
   @export_symbol(init);

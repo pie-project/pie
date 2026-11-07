@@ -41,6 +41,7 @@
 // MV: 0 bf16 tiles, @fmachs into f32 (the bf16 build); 1 f16 tiles, @fmach
 // into an f16 accumulator (the IEEE build, the shipped Llama F16 path).
 param memcpy_params;
+param DIAG: u16 = 0;   // 1 (diagnostics): no layers (handoffs, head and I/O only)
 param K: u16;          // layers on the unit
 param Hc: u16;         // x dims a row
 param QO: u16;         // o dims a column (the o-proj's inputs)
@@ -103,12 +104,14 @@ const q_ya = @get_input_queue(4);
 const q_yb = @get_input_queue(5);
 const q_xm = @get_input_queue(6);
 const q_ym = @get_input_queue(7);
-const q_xo = @get_output_queue(2);
+const q_xo = @get_output_queue(5);   // (not 2: the row add-forward op takes iq2, and an op on iq N and oq N shares queue N's microthread)
 const q_yo = @get_output_queue(3);
+const q_ao = @get_output_queue(4);   // the segment / GDN exchange / relay sends: rebinding it never touches the reductions' queues
 const C_PARK: color = @get_color(16);   // nothing routes it to a ramp
 const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
-var fifo_buf = @zeros([32]f32);
+param FIFOW: u16 = 32;
+var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
 
 fn fout(comptime q: output_queue, n: u16) fabout_dsd {
@@ -157,7 +160,7 @@ fn init() void {
   iqc(5, rcfg[RQ + 3]);
   iqc(6, rcfg[RQ + 4]);
   iqc(7, rcfg[RQ + 5]);
-  oqc(2, rcfg[RQ + 6]);
+  oqc(5, rcfg[RQ + 6]);
   oqc(3, rcfg[RQ + 7]);
   role_x = @as(u16, rcfg[RQ + 8]);
   role_y = @as(u16, rcfg[RQ + 9]);
@@ -226,13 +229,15 @@ fn mvp(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
 // multicast's (iq6) on their own colours (rcfg[RQ + 12 ..]: GDN's (k, q) multicast, the
 // scores' level 1, level 2, output, multicast), static routes; mode 0 restores.
 fn qmode(m: u16) void {
-  while ((tile_config.output_queue_status.get_raw() & 0x0400) == 0) {}   // oq2 empty (bit 0x100 << q)
+  // the row / column reductions keep their queues (an async add-forward may still wait on its
+  // input): the segments use iq3 / iq5 (unused level-2 inputs), iq6 (idle row multicast), oq4
+  while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}   // oq4 empty
   if (m == 0) {
-    iqc(2, rcfg[RQ]); iqc(3, rcfg[RQ + 1]); iqc(6, rcfg[RQ + 4]); oqc(2, rcfg[RQ + 6]);
+    iqc(3, rcfg[RQ + 1]); iqc(5, rcfg[RQ + 3]); iqc(6, rcfg[RQ + 4]);
   } else if (m == 1) {
-    iqc(6, rcfg[RQ + 12]); oqc(2, rcfg[RQ + 12]);
+    iqc(6, rcfg[RQ + 12]); oqc(4, rcfg[RQ + 12]);
   } else {
-    iqc(2, rcfg[RQ + 13]); iqc(3, rcfg[RQ + 14]); oqc(2, rcfg[RQ + 15]); iqc(6, rcfg[RQ + 16]);
+    iqc(3, rcfg[RQ + 13]); iqc(5, rcfg[RQ + 14]); oqc(4, rcfg[RQ + 15]); iqc(6, rcfg[RQ + 16]);
   }
 }
 
@@ -256,7 +261,7 @@ fn gdn_mix(g: u16) void {
     if ((gsrc & 0x8000) != 0) {
       const j = gsrc & 0xff;
       kq[0] = gb[j]; kq[1] = gb[DK + j];
-      @fmovs(fout(q_xo, 2), kq_d);
+      @fmovs(fout(q_ao, 2), kq_d);
     } else {
       @fmovs(kq_d, fin(q_xm, 2));
     }
@@ -301,6 +306,9 @@ fn exp_v(buf: mem1d_dsd, n: u16) void {
   const pl = @set_dsd_length(@set_dsd_stride(@set_dsd_base_addr(kk, @ptrcast([*]u16, &y)), 2), n);
   const ph = @increment_dsd_offset(pl, 1, u16);
   @fmaxs(buf, buf, -87.0);
+  @fnegs(buf, buf);              // and at most 88 (-max(-x, -88)): past it 2^k's exponent bits wrap (a
+  @fmaxs(buf, buf, -88.0);       // reference swung low by an empty pass sends unwritten entries' 0 - mref up)
+  @fnegs(buf, buf);
   @fmuls(p, buf, 1.4426950408889634);
   var c: u16 = 0;
   while (c < 3) : (c += 1) {
@@ -323,14 +331,11 @@ fn seg_ar(n: u16) void {
   qmode(2);
   const A = .{ .async = true, .ut_id = ut_b };
   if (role_s == 4) {
-    @fadds(fifo, fin(q_xb, n), d, .{ .async = true, .ut_id = ut_a });
-    @fadds(fout(q_xo, n), fin(q_xa, n), fifo, A);
-  } else if (role_s == 6) { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }   // a root of one half
-  else if (role_s == 0) { @fmovs(fout(q_xo, n), d, A); }
-  else if (role_s == 2) {
-    @fadds(fifo, fin(q_xa, n), d, .{ .async = true, .ut_id = ut_a });
-    @fadds(fout(q_xo, n), fin(q_xb, n), fifo, A);
-  } else { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
+    @fadds(fifo, fin(q_yb, n), d, .{ .async = true, .ut_id = ut_a });
+    @fadds(fout(q_ao, n), fin(q_xb, n), fifo, A);
+  } else if (role_s == 6) { @fadds(fout(q_ao, n), fin(q_xb, n), d, A); }   // a root of one half
+  else if (role_s == 0) { @fmovs(fout(q_ao, n), d, A); }
+  else { @fadds(fout(q_ao, n), fin(q_xb, n), d, A); }
   @fmovs(d, fin(q_xm, n));
   qmode(0);
 }
@@ -365,7 +370,7 @@ fn att_mix(a: u16) void {
   while (apass < 8) : (apass += 1) {
     var h: u16 = 0;
     while (h < Qh) : (h += 1) {
-      mvp(@ptrcast([*]u16, &kc[1 + kb]), Dc, NE, h * Dc, h * NE);
+      kvmv(@ptrcast([*]u16, &kc[1 + kb]), Dc, NE, h * Dc, h * NE);
       sx[Qh * NE + h] = ab[QD + 2 * Dc + 1 + h];
     }
     @fmovs(@set_dsd_length(sx_d, Qh * NE), @set_dsd_length(y_d, Qh * NE));
@@ -381,9 +386,16 @@ fn att_mix(a: u16) void {
       @fsubs(sh, sh, mref[a * Qh + h]);
     }
     exp_v(@set_dsd_length(sx_d, Qh * NE), Qh * NE);
-    @fs2h(@set_dsd_length(xh_d, Qh * NE), @set_dsd_length(sx_d, Qh * NE));
+    // f16 probabilities clamped at the f16 max (-max(-p, -65504); SDK 2.10 has no @fmins): an
+    // early pass against a cold log-sum-exp can exceed it (inf -> NaN values); the clamped sum
+    // still marks the pass bad and moves the reference by >= ln 65504 a redo
+    const sp = @set_dsd_length(sx_d, Qh * NE);
+    @fnegs(sp, sp);
+    @fmaxs(sp, sp, -65504.0);
+    @fnegs(sp, sp);
+    @fs2h(@set_dsd_length(xh_d, Qh * NE), sp);
     h = 0;
-    while (h < Qh) : (h += 1) { mvp(@ptrcast([*]u16, &vc[1 + vb]), NE, Dc + 1, h * NE, h * (Dc + 1)); }
+    while (h < Qh) : (h += 1) { kvmv(@ptrcast([*]u16, &vc[1 + vb]), NE, Dc + 1, h * NE, h * (Dc + 1)); }
     send_y(Qh * (Dc + 1));
     // o (the o_proj's x), then the redo word and the heads' log-sum-exp steps (every pass)
     @fs2h(@set_dsd_length(xh_d, QO), fin(q_ym, QO));
@@ -394,6 +406,20 @@ fn att_mix(a: u16) void {
       @fs2h(@set_dsd_length(xh_d, QD), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> ab[i] }));
     }
   }
+}
+
+// KV matvecs (scores, values with the softmax sums): f16 operands, f32 accumulation (@fmachs):
+// an f16 accumulator overflows on a cold log-sum-exp pass (sums of probabilities up to 65504
+// each), and the reference step ln(l) must stay finite
+fn kvmv(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
+  const a = @set_dsd_length(@set_dsd_base_addr(a_d, p), N);
+  const xv = @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, xo), @fp16()), R);
+  const yv = @set_dsd_length(@increment_dsd_offset(y_d0, @as(i16, yo), f32), N);
+  @fmovs(yv, 0.0);
+  @load_to_dsr(mv_dest, yv, .{ .save_address = false });
+  @load_to_dsr(mv_src0, yv, .{ .save_address = false });
+  @load_to_dsr(mv_src1, a, .{ .save_address = true });
+  @map(mvs_step, xv);
 }
 
 // ---------------------------------------------------------------- a pass
@@ -412,7 +438,9 @@ fn layer(l: u16, b: u32) u32 {
   const NQ = if (att) NQA else NQG;
   recv_x(NQ);
   mv(b, Hc, NQ);
+  if ((DIAG & 16) != 0) { send_x(Hc); return b; }   // (diagnostics) the row multicast and the row reduction only
   send_y(NQ + 1);
+  if ((DIAG & 8) != 0) { return b; }                // (diagnostics) the row multicast and the column reduction only
   if (ATT == 1 and att) { att_mix(la); }
   else if (GDN == 1 and !att) { gdn_mix(lg); }
   else { recv_col(QO); }
@@ -420,12 +448,14 @@ fn layer(l: u16, b: u32) u32 {
   mv(bo, QO, Hc);
   send_x(Hc);
   if (GDN == 1 and !att) { gdn_update(lg); lg += 1; } else { la += 1; }
+  if ((DIAG & 4) == 0) {
   recv_x(2 * Ic);
   mv(bo + @as(u32, QO) * Hc, Hc, 2 * Ic);
   send_y(2 * Ic + 1);
   recv_col(Ic);
   mv(bo + @as(u32, QO) * Hc + @as(u32, Hc) * 2 * Ic, Ic, Hc);
   send_x(Hc);
+  }
   return bo + LWM;
 }
 
@@ -435,10 +465,10 @@ fn layer(l: u16, b: u32) u32 {
 fn relay(o: u16) void {
   const n = @as(u16, rcfg[RQ + o]);
   if (n == 0) { return; }
-  while ((tile_config.output_queue_status.get_raw() & 0x0400) == 0) {}
+  while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}
   iqc(6, rcfg[RQ + o + 1]);
-  oqc(2, rcfg[RQ + o + 2]);
-  @fmovs(fout(q_xo, n), fin(q_xm, n));
+  oqc(4, rcfg[RQ + o + 2]);
+  @fmovs(fout(q_ao, n), fin(q_xm, n));
   qmode(0);
 }
 
@@ -452,7 +482,7 @@ task pass_task() void {
     la = 0;
     lg = 0;
     relay(18);
-    while (l < K) : (l += 1) { b = layer(l, b); }
+    while ((DIAG & 1) == 0 and l < (if ((DIAG & 2) != 0) 1 else K)) : (l += 1) { b = layer(l, b); }
     relay(21);
   }
   sys_mod.unblock_cmd_stream();
@@ -472,6 +502,7 @@ comptime {
   @initialize_queue(q_ym, .{ .color = @get_color(20) });   // parked (distinct a queue)
   @initialize_queue(q_xo, .{ .color = C_PARK });
   @initialize_queue(q_yo, .{ .color = C_PARK });
+  @initialize_queue(q_ao, .{ .color = C_PARK });
   @export_symbol(w_ptr, "w");
   @export_symbol(rcfg_ptr, "rcfg");
   @export_symbol(init);
