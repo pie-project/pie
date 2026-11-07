@@ -472,7 +472,20 @@ pub(super) async fn save(held: &Held, tenant: &str, name: &str) -> Result<Value,
             std::fs::create_dir_all(&s)
         })
         .await?;
-        let spent = write_pages(kv.engine, &stores, &set, &tmp, &shared, budget, &root).await;
+        let mut created = Vec::new();
+        // Written beside the pages, never shared: it counts in full.
+        let state_len = state.as_ref().map_or(0, |(_, bytes)| bytes.len() as u64);
+        let spent = write_pages(
+            kv.engine,
+            &stores,
+            &set,
+            &tmp,
+            &shared,
+            budget.saturating_sub(state_len),
+            &root,
+            &mut created,
+        )
+        .await;
         let result = match spent {
             Ok((files, bytes)) => {
                 let spent = Spent { files, bytes };
@@ -492,7 +505,14 @@ pub(super) async fn save(held: &Held, tenant: &str, name: &str) -> Result<Value,
             Err(error) => Err(error),
         };
         if result.is_err() {
-            let _ = blocking(move || std::fs::remove_dir_all(tmp)).await;
+            // The pages this save put down are linked from nothing once its
+            // directory is gone: left there, they would count against the
+            // budget until a restart sweeps them.
+            let _ = blocking(move || {
+                std::fs::remove_dir_all(&tmp)?;
+                unlink_unread(&shared, &created)
+            })
+            .await;
         }
         result
     }
@@ -505,10 +525,30 @@ fn store_domain(stores: &store_registry::Stores) -> Hash256 {
     store_registry::with_kv_lock(&stores.kv, "snapshot-domain", |kv| kv.domain())
 }
 
+/// Removes each of `names` under `shared` that no snapshot links, with what a
+/// write of it cut short left.
+fn unlink_unread(shared: &Path, names: &[String]) -> std::io::Result<()> {
+    for name in names {
+        for path in [shared.join(name), shared.join(format!("part-{name}"))] {
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.nlink() == 1 => std::fs::remove_file(&path)?,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Each page into `tmp`, linked from `shared` where a page of the same bytes
 /// is there already: the file names, and the bytes written. A sealed page's
 /// key says so without reading it; one a decode wrote has none, so its bytes
-/// are read and hashed.
+/// are read and hashed. What it puts down under `shared` is named in
+/// `created` as it goes, so a save that fails can take it back. A run that
+/// would pass `budget`, what the pages may take, is refused before it is
+/// written.
+#[allow(clippy::too_many_arguments, reason = "one snapshot's parts")]
 async fn write_pages(
     engine: usize,
     stores: &store_registry::Stores,
@@ -517,6 +557,7 @@ async fn write_pages(
     shared: &Path,
     budget: u64,
     root: &Path,
+    created: &mut Vec<String>,
 ) -> Result<(Vec<String>, u64), HandleError> {
     let mut files = vec![String::new(); set.pages.len()];
     let mut wanted = Vec::new();
@@ -530,6 +571,16 @@ async fn write_pages(
         let root = root.to_path_buf();
         blocking(move || used(&root)).await?
     };
+    let refuse = |total: u64| {
+        HandleError::quota(format!(
+            "snapshots would pass the budget by {} bytes; delete one, or raise \
+             `[runtime] snapshot_budget`",
+            total - budget
+        ))
+    };
+    if have > budget {
+        return Err(refuse(have));
+    }
     let mut written = 0;
     for run in wanted.chunks(CHUNK_PAGES) {
         let backings: Vec<_> = run.iter().map(|&at| set.pages[at].backing).collect();
@@ -550,11 +601,24 @@ async fn write_pages(
             files[*at] = name.clone();
         }
         let shared = shared.to_path_buf();
+        let fresh: Vec<(usize, String, Vec<u8>)> = {
+            let shared = shared.clone();
+            blocking(move || {
+                let mut seen = HashSet::new();
+                Ok(named
+                    .into_iter()
+                    .filter(|(_, name, _)| seen.insert(name.clone()) && !shared.join(name).exists())
+                    .collect())
+            })
+            .await?
+        };
+        let adding: u64 = fresh.iter().map(|(_, _, bytes)| bytes.len() as u64).sum();
+        if have + written + adding > budget {
+            return Err(refuse(have + written + adding));
+        }
+        created.extend(fresh.iter().map(|(_, name, _)| name.clone()));
         written += blocking(move || {
-            let fresh: Vec<_> = named
-                .iter()
-                .filter(|(_, name, _)| !shared.join(name).exists())
-                .collect();
+            let fresh: Vec<_> = fresh.iter().collect();
             // A sync is the cost of a save: they run side by side.
             let each = fresh.len().div_ceil(SYNCS).max(1);
             std::thread::scope(|scope| {
@@ -572,13 +636,6 @@ async fn write_pages(
                 .sum::<u64>())
         })
         .await?;
-        if have + written > budget {
-            return Err(HandleError::quota(format!(
-                "snapshots would take {} bytes of the {budget} allowed; delete one, or raise \
-                 `[runtime] snapshot_budget`",
-                have + written
-            )));
-        }
     }
     let (tmp, shared, names) = (tmp.join(KV), shared.to_path_buf(), files.clone());
     blocking(move || {
@@ -942,6 +999,29 @@ mod tests {
         assert!(pages.join("linked").exists(), "a snapshot reads it");
         assert!(!pages.join("orphan").exists());
         assert!(!pages.join("part-x").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_takes_back_only_what_nothing_links() {
+        let root = std::env::temp_dir().join(format!("pie-snapshots-{}", Uuid::new_v4()));
+        let shared = root.join(SHARED).join("domain");
+        let kept = root.join("s00").join(KV);
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(shared.join("mine"), b"a").unwrap();
+        std::fs::write(shared.join("part-cut"), b"b").unwrap();
+        std::fs::write(shared.join("theirs"), b"c").unwrap();
+        std::fs::hard_link(shared.join("theirs"), kept.join("0")).unwrap();
+        std::fs::write(shared.join("unnamed"), b"d").unwrap();
+
+        let names = ["mine", "cut", "theirs", "never"].map(String::from);
+        unlink_unread(&shared, &names).unwrap();
+
+        assert!(!shared.join("mine").exists());
+        assert!(!shared.join("part-cut").exists(), "a write cut short");
+        assert!(shared.join("theirs").exists(), "a snapshot links it");
+        assert!(shared.join("unnamed").exists(), "not this save's");
         std::fs::remove_dir_all(root).unwrap();
     }
 
