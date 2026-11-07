@@ -188,6 +188,19 @@ pub trait Engine: Send {
         Err(self.unsupported("write_host_kv"))
     }
 
+    /// The bytes of host rs rows: `slots`' state, then `pages`' buffers, one
+    /// after another, once every copy into them has landed.
+    fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> Result<Vec<u8>> {
+        let _ = (slots, pages);
+        Err(self.unsupported("read_host_state"))
+    }
+
+    /// Writes `bytes`, laid out as [`Engine::read_host_state`] returns them.
+    fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> Result<()> {
+        let _ = (slots, pages, bytes);
+        Err(self.unsupported("write_host_state"))
+    }
+
     fn disconnect(&self, message: &str) {
         let _ = message;
     }

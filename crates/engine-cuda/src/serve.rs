@@ -432,6 +432,27 @@ impl Shell {
         self.device.synchronize()
     }
 
+    /// Where in the host rows `slots`' state, then `pages`' buffers, lie.
+    fn state_spans(&self, slots: &[u32], pages: &[u32]) -> Vec<(u32, u64, u64)> {
+        let state = self.pools.state_slot_bytes();
+        let page = self.buffers.as_ref().map_or(0, Buffers::slot_bytes);
+        let slots = slots.iter().map(|&slot| (slot, 0, state));
+        let pages = pages.iter().map(|&row| (row, state, page));
+        slots.chain(pages).collect()
+    }
+
+    pub fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> Result<Vec<u8>> {
+        self.device.synchronize()?;
+        let spans = self.state_spans(slots, pages);
+        self.pools.read_host_rows(&spans)
+    }
+
+    pub fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> Result<()> {
+        self.device.synchronize()?;
+        let spans = self.state_spans(slots, pages);
+        self.pools.write_host_rows(&spans, bytes)
+    }
+
     pub fn copy_pages_host(&mut self, to_host: bool, moves: &[(u32, u32)]) -> Result<()> {
         let stream = self.device.stream();
         let state_bytes = self.pools.state_slot_bytes();

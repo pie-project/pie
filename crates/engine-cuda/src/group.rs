@@ -543,6 +543,30 @@ impl Engine for Group {
         })
     }
 
+    /// Rank after rank, as kv is.
+    fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> EngineResult<Vec<u8>> {
+        let mut out = Vec::new();
+        for rank in 0..self.ranks.len() {
+            out.extend(self.on(rank, |shell| shell.read_host_state(slots, pages))?);
+        }
+        Ok(out)
+    }
+
+    fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> EngineResult<()> {
+        let ranks = self.ranks.len();
+        if ranks == 0 || !bytes.len().is_multiple_of(ranks) {
+            return Err(Error::Device(format!(
+                "{} bytes of host state do not split across {ranks} ranks",
+                bytes.len()
+            )));
+        }
+        let share = bytes.len() / ranks;
+        for (rank, bytes) in bytes.chunks(share).enumerate() {
+            self.on(rank, |shell| shell.write_host_state(slots, pages, bytes))?;
+        }
+        Ok(())
+    }
+
     /// Rank after rank: each holds its own heads of every slot.
     fn read_host_kv(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
         let mut out = Vec::new();

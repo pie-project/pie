@@ -94,19 +94,40 @@ pub enum HandleOp {
         name: HandleName,
         props: Props,
     },
+    /// Keeps a resting working set as it stands under `snapshot`, past this
+    /// session and this server. The handle stays as it was.
+    Save {
+        name: HandleName,
+        snapshot: String,
+    },
+    /// `name` starts as a snapshot stands.
+    Load {
+        name: HandleName,
+        snapshot: String,
+    },
+    /// Handles loaded from it stay.
+    DeleteSnapshot {
+        snapshot: String,
+    },
+    ListSnapshots {
+        prefix: String,
+    },
 }
 
 impl HandleOp {
     /// The names this op needs settled before it runs.
     pub fn touches(&self) -> impl Iterator<Item = HandleName> {
         let (first, second) = match self {
+            HandleOp::DeleteSnapshot { .. } | HandleOp::ListSnapshots { .. } => (None, None),
             HandleOp::New { name, .. }
             | HandleOp::Close { name }
             | HandleOp::Stat { name }
-            | HandleOp::SetProps { name, .. } => (*name, None),
-            HandleOp::Fork { name, from } => (*name, Some(*from)),
+            | HandleOp::SetProps { name, .. }
+            | HandleOp::Save { name, .. }
+            | HandleOp::Load { name, .. } => (Some(*name), None),
+            HandleOp::Fork { name, from } => (Some(*name), Some(*from)),
         };
-        std::iter::once(first).chain(second)
+        first.into_iter().chain(second)
     }
 }
 

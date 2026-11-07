@@ -295,6 +295,11 @@ pub(crate) enum HostKvOp {
     /// A copy of device pages into host slots, then a read of those slots:
     /// one item on the lane, with no completion to settle between.
     CopyRead(::engine::KvCopy, Vec<u32>),
+    /// The bytes of host kv slots.
+    Read(Vec<u32>),
+    /// The bytes of host rs rows: state slots, then buffer pages.
+    ReadState(Vec<u32>, Vec<u32>),
+    WriteState(Vec<u32>, Vec<u32>, Vec<u8>),
     /// The engine's tap groups (`Engine::tap_groups`), as JSON.
     TapGroups,
 }

@@ -872,6 +872,13 @@ pub struct RuntimeConfig {
     /// plane's are `[cluster] cluster_policies`.
     #[serde(default)]
     pub worker_policy: Option<String>,
+    /// What handle snapshots may take on disk; past it a save is refused.
+    #[serde(default = "default_snapshot_budget")]
+    pub snapshot_budget: ByteSize,
+}
+
+fn default_snapshot_budget() -> ByteSize {
+    ByteSize::from_mib(64 * 1024)
 }
 
 impl Default for RuntimeConfig {
@@ -883,6 +890,7 @@ impl Default for RuntimeConfig {
             frame_dispatch_depth: default_frame_dispatch_depth(),
             max_concurrent_processes: None,
             worker_policy: None,
+            snapshot_budget: default_snapshot_budget(),
         }
     }
 }

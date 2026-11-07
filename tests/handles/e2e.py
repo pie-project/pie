@@ -190,6 +190,29 @@ async def t_weak(c, prog, whole):
     check("and runs on", z == whole)
     await strong.close(); await y.close()
 
+async def t_snapshot(c, prog, whole):
+    w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
+    saved = await w.save("s/one"); check("a save says what it kept", saved["tokens"] == (await w.stat())["tokens"], str(saved))
+    second = await run(c, prog, w, [first[-1]], 8, drawn=12)
+    await w.save("s/two")
+    two = await c.load_snapshot("s/two"); st = await two.stat()
+    check("a load comes off the device", st["state"] == "parked" and not st["resident"], str(st))
+    rest = await run(c, prog, two, [second[-1]], 12, drawn=20)
+    check("a loaded set resumes exactly", first + second + rest == whole)
+    one = await c.load_snapshot("s/one"); r = await run(c, prog, one, [first[-1]], 20, drawn=12)
+    check("and so does an older one", first + r == whole)
+    try: await w.save("s/one"); check("a name taken is refused", False)
+    except HandleError as e: check("a name taken is refused", e.code == "in_use", str(e))
+    listed = await c.list_snapshots("s/")
+    check("they list", [s["name"] for s in listed] == ["s/one", "s/two"], str(listed))
+    await c.delete_snapshot("s/one"); await c.delete_snapshot("s/two")
+    check("delete gives the name back", await c.list_snapshots("s/") == [])
+    r2 = await run(c, prog, two, [1], 2, drawn=60); check("what was loaded stays", len(r2) == 2)
+    for bad, code in (("s/none", "unknown"), ("x" * 101, "invalid")):
+        try: await c.load_snapshot(bad); check("a bad load is refused", False)
+        except HandleError as e: check("a bad load is refused", e.code == code, str(e))
+    for h in (w, two, one): await h.close()
+
 async def t_script(c, prog, whole):
     S = Path(__file__).parent
     for file in ("turn.py", "turn.js"):
@@ -354,7 +377,7 @@ async def main():
             except Exception: c = None; await asyncio.sleep(1)
         prog = await c.install_program(EX / "working_set_handles.wasm", force_overwrite=True)
         whole = await t_resume(c, prog)
-        for f in (t_lazy, t_order, t_dead, t_evict, t_quota, t_script, t_matcher, t_media, t_clients, t_failed, t_close, t_keep, t_weak):
+        for f in (t_lazy, t_order, t_dead, t_evict, t_quota, t_script, t_matcher, t_media, t_clients, t_failed, t_snapshot, t_close, t_keep, t_weak):
             if args.only and f.__name__ not in args.only.split(","): continue
             if not args.only and f in (t_keep, t_weak): continue
             try: await asyncio.wait_for(f(c, prog, whole), 120)

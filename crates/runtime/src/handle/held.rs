@@ -11,6 +11,8 @@ use crate::inferlet::host::working_set::Cursor;
 use crate::inferlet::process::ProcessResidency;
 use crate::inferlet::process::residency::{register_residency, unregister_residency};
 use crate::planner::Demand;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::store::kv::page_table::ExportedSet;
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::kv::{KvStore, KvStoreError};
 use crate::store::registry as store_registry;
@@ -119,7 +121,7 @@ impl Held {
             }
             None => None,
         };
-        let child = settled(kv, "handle-fork", |store| Ok(store.fork(kv.id)?)).await;
+        let child = settled(kv, "handle-fork", |store| store.fork(kv.id)).await;
         match child {
             Ok(child) => Ok(Held::park(
                 holder,
@@ -157,6 +159,16 @@ impl Held {
     pub(super) fn into_parts(mut self) -> Parts {
         self.leave_planner();
         self.parts.take().expect("taken only by consuming self")
+    }
+
+    /// Its pages as a snapshot reads them, held where they stand until the
+    /// pin goes back: no move holds one now.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) async fn pinned(
+        &self,
+    ) -> Result<(crate::store::kv::ReaderPin, ExportedSet), String> {
+        let kv = &self.parts().kv;
+        settled(kv, "handle-export", |store| store.export(kv.id)).await
     }
 
     /// Its tokens, what of them are folded, and its recurrent slots.

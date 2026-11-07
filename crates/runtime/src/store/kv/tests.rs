@@ -667,6 +667,7 @@ fn a_move_under_way_keeps_only_the_pages_it_holds() {
     );
 }
 
+#[test]
 fn a_sweep_takes_readers_in_order_and_a_kept_head_last() {
     let mut store = KvStore::new_with_swap(8, 8, 0, h(14));
     let a = store.create_working_set();
@@ -674,7 +675,7 @@ fn a_sweep_takes_readers_in_order_and_a_kept_head_last() {
     let b = store.create_working_set();
     commit_fresh(&mut store, b, 2, 1);
     store.mark_suspended(&HashSet::from([a, b]));
-    let page = u64::from(store.page_size);
+    let page = u64::from(store.page_size.max(1));
     let sweep = store
         .prepare_sweep(&HashSet::new(), usize::MAX, &[(b, page), (a, 0)], 1)
         .unwrap()

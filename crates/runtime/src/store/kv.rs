@@ -1014,6 +1014,29 @@ impl KvStore {
         ))
     }
 
+    /// `ws` as a snapshot reads it, pinned where it stands until the pin is
+    /// released.
+    pub fn export(
+        &mut self,
+        ws: WorkingSetId,
+    ) -> Result<(ReaderPin, page_table::ExportedSet), KvStoreError> {
+        let set = self.table.exported(ws)?;
+        let nodes = self.table.pin_working_sets(&HashSet::from([ws]))?;
+        Ok((ReaderPin { nodes }, set))
+    }
+
+    /// A working set of its own from what `slots` hold.
+    pub fn import(
+        &mut self,
+        set: page_table::ExportedSet,
+        slots: Vec<HostKvSlotId>,
+    ) -> Result<WorkingSetId, KvStoreError> {
+        let backings = slots.into_iter().map(KvPageBacking::Swapped).collect();
+        let ws = self.table.imported(set, backings)?;
+        self.refresh_flat(ws);
+        Ok(ws)
+    }
+
     pub fn release_reader(&mut self, pin: ReaderPin) {
         let freed = self.table.unpin_terminals(&pin.nodes);
         let epoch = self.current_epoch();

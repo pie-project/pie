@@ -1104,6 +1104,18 @@ impl Engine for Cuda {
             .map_err(fault)
     }
 
+    fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?
+            .read_host_state(slots, pages)
+            .map_err(fault)
+    }
+
+    fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> EngineResult<()> {
+        self.loaded_mut()?
+            .write_host_state(slots, pages, bytes)
+            .map_err(fault)
+    }
+
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);

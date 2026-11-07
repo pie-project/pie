@@ -2298,6 +2298,55 @@ impl Pools {
         Ok(())
     }
 
+    /// Reads `(row, from, bytes)` spans of the host rs rows, in order.
+    pub fn read_host_rows(&mut self, spans: &[(u32, u64, u64)]) -> Result<Vec<u8>> {
+        let rows = self.backed_rows(spans)?;
+        let mut out = Vec::new();
+        for &(row, from, bytes) in spans {
+            let (pinned, at) = rows.place(row, 0).expect("backed above");
+            out.extend_from_slice(pinned.view(at + from, bytes).expect("inside its chunk"));
+        }
+        Ok(out)
+    }
+
+    /// Writes `bytes`, laid out as [`Self::read_host_rows`] returns them.
+    pub fn write_host_rows(&mut self, spans: &[(u32, u64, u64)], bytes: &[u8]) -> Result<()> {
+        let need: u64 = spans.iter().map(|&(.., bytes)| bytes).sum();
+        if bytes.len() as u64 != need {
+            return Err(Fault::Ceiling {
+                what: "bytes of host rs rows",
+                need,
+                have: bytes.len() as u64,
+            });
+        }
+        let rows = self.backed_rows(spans)?;
+        let mut from = 0;
+        for &(row, offset, len) in spans {
+            let (pinned, at) = rows.place(row, 0).expect("backed above");
+            let at = usize::try_from(at + offset).unwrap_or(usize::MAX);
+            let len = usize::try_from(len).unwrap_or(0);
+            assert!(
+                pinned.write(at, &bytes[from..from + len]),
+                "inside its chunk"
+            );
+            from += len;
+        }
+        Ok(())
+    }
+
+    fn backed_rows(&mut self, spans: &[(u32, u64, u64)]) -> Result<&Shelf> {
+        let Some(host) = self.host.as_mut() else {
+            return Err(Fault::Ceiling {
+                what: "host rs rows",
+                need: spans.len() as u64,
+                have: 0,
+            });
+        };
+        host.rows
+            .back(spans.iter().map(|&(row, ..)| row), "host rs rows")?;
+        Ok(&host.rows)
+    }
+
     /// The host kv shelf, with the chunks holding `slots` pinned.
     fn paged_shelf(&mut self, slots: &[u32]) -> Result<&Shelf> {
         let Some(host) = self.host.as_mut() else {

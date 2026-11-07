@@ -104,6 +104,7 @@ frame_dispatch_depth     = 15    # ahead, so every lane rides each wafer loop
 
 const TAIL: &str = r#"# max_concurrent_processes = 64    # omit: from the engine's max_forward_requests
 # worker_policy            = "noop"  # a PLEX worker policy: built-in name or .wasm path
+# snapshot_budget          = "64GiB"  # what handle snapshots may take on disk
 
 [sandbox]
 # The box an inferlet runs in: its walls, and its size.

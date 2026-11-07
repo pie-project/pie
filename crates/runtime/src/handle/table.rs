@@ -224,6 +224,47 @@ impl Table {
                 }
                 None => Err(refusal(name, None)),
             },
+            #[cfg(not(target_arch = "wasm32"))]
+            HandleOp::Save { name, snapshot } => match self.slots.get(&name) {
+                Some(Slot::Parked(held)) => {
+                    held.claim().await.map_err(HandleError::moving)?;
+                    let saved = super::snapshot::save(held, &self.tenant, &snapshot).await;
+                    held.unclaim();
+                    saved
+                }
+                Some(Slot::Unborn(_)) => Err(HandleError::invalid(format!(
+                    "handle {name} holds nothing yet: a process has not bound it"
+                ))),
+                Some(Slot::Matcher(_) | Slot::Frames(_) | Slot::Pcm(_)) => Err(
+                    HandleError::invalid(format!("handle {name} is not a working set")),
+                ),
+                other => Err(refusal(name, other)),
+            },
+            #[cfg(not(target_arch = "wasm32"))]
+            HandleOp::Load { name, snapshot } => {
+                self.claim(name)?;
+                let meta = Meta::default();
+                let held = super::snapshot::load(meta.id, &self.tenant, &snapshot).await?;
+                self.slots.insert(name, Slot::Parked(Box::new(held)));
+                self.meta.insert(name, meta);
+                self.rested(name);
+                Ok(json!({ "ok": true }))
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            HandleOp::DeleteSnapshot { snapshot } => {
+                super::snapshot::delete(&self.tenant, &snapshot).await
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            HandleOp::ListSnapshots { prefix } => {
+                super::snapshot::list(&self.tenant, &prefix).await
+            }
+            #[cfg(target_arch = "wasm32")]
+            HandleOp::Save { .. }
+            | HandleOp::Load { .. }
+            | HandleOp::DeleteSnapshot { .. }
+            | HandleOp::ListSnapshots { .. } => {
+                Err(HandleError::invalid("this build keeps no snapshots"))
+            }
             HandleOp::SetProps { name, props } => {
                 let slot = self.slots.get(&name);
                 if matches!(slot, None | Some(Slot::Dead(_) | Slot::Lent)) {

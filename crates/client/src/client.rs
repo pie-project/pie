@@ -581,6 +581,36 @@ impl Client {
             .map(drop)
     }
 
+    /// Keeps a resting working set under `snapshot`, past this session and
+    /// this server. The handle stays as it was.
+    pub async fn save_handle(&self, name: HandleName, snapshot: &str) -> Result<String> {
+        let snapshot = snapshot.to_string();
+        self.handle_op(HandleOp::Save { name, snapshot }).await
+    }
+
+    /// A new handle as `snapshot` stands.
+    pub async fn load_snapshot(&self, snapshot: &str) -> Result<HandleName> {
+        let name = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let snapshot = snapshot.to_string();
+        self.handle_op(HandleOp::Load { name, snapshot }).await?;
+        Ok(name)
+    }
+
+    /// Handles loaded from it stay.
+    pub async fn delete_snapshot(&self, snapshot: &str) -> Result<()> {
+        let snapshot = snapshot.to_string();
+        self.handle_op(HandleOp::DeleteSnapshot { snapshot })
+            .await
+            .map(drop)
+    }
+
+    /// The snapshots whose names start with `prefix`: each one's name,
+    /// tokens and bytes, as JSON.
+    pub async fn list_snapshots(&self, prefix: &str) -> Result<String> {
+        let prefix = prefix.to_string();
+        self.handle_op(HandleOp::ListSnapshots { prefix }).await
+    }
+
     pub async fn close_handle(&self, name: HandleName) -> Result<()> {
         self.handle_op(HandleOp::Close { name }).await.map(drop)
     }

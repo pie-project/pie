@@ -81,6 +81,24 @@ pub struct TriePageLocation {
 
 type Runs = SmallVec<[Range<u32>; 2]>;
 
+/// A page as a snapshot keeps it.
+#[derive(Debug, Clone)]
+pub struct ExportedPage {
+    pub backing: KvPageBacking,
+    pub key: Option<Hash256>,
+    pub token_hashes: Vec<Option<Hash256>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportedSet {
+    pub pages: Vec<ExportedPage>,
+    pub page_len: u64,
+    pub folded: u64,
+    pub prompt_pages: u64,
+    pub supplied: u64,
+    pub logged: Vec<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PublishedPage {
     pub id: PhysicalKvPageId,
@@ -1761,6 +1779,66 @@ impl KvPageTable {
 
     pub fn held_pages(&self, working_sets: &HashSet<WorkingSetId>) -> Result<usize, KvTableError> {
         Ok(self.locations(working_sets)?.len())
+    }
+
+    /// Every page of `ws`, first to last, and what the table knows of it.
+    pub fn exported(&self, ws: WorkingSetId) -> Result<ExportedSet, KvTableError> {
+        let entry = self.entry(ws)?;
+        let mut locations = Vec::with_capacity(entry.mapped_len as usize);
+        self.visit_working_set_locations(ws, |location| locations.push(location))?;
+        let mut pages = Vec::with_capacity(locations.len());
+        for location in locations {
+            pages.push(ExportedPage {
+                backing: self.backing_at(&location)?,
+                key: self.page_key_at(&location),
+                token_hashes: self.token_hashes_at(&location).unwrap_or_default().to_vec(),
+            });
+        }
+        let entry = self.entry(ws)?;
+        Ok(ExportedSet {
+            pages,
+            page_len: entry.page_len,
+            folded: entry.folded,
+            prompt_pages: entry.prompt_pages,
+            supplied: entry.supplied,
+            logged: entry.logged.clone(),
+        })
+    }
+
+    /// A working set of `pages`' own, as [`Self::exported`] said one stood,
+    /// with every page at `backings`.
+    pub fn imported(
+        &mut self,
+        set: ExportedSet,
+        backings: Vec<KvPageBacking>,
+    ) -> Result<WorkingSetId, KvTableError> {
+        let mapped_len = backings.len() as u64;
+        let (token_hashes, page_hashes) = set
+            .pages
+            .into_iter()
+            .map(|page| (page.token_hashes, page.key))
+            .unzip();
+        let node = self.nodes.insert(KvTrieNode {
+            parent: None,
+            children: SmallVec::new(),
+            pages: Pages::Owned {
+                backings,
+                token_hashes,
+                page_hashes,
+            },
+            exact_anchors: 0,
+            path_anchors: 0,
+        });
+        let ws = self.create_working_set();
+        self.move_terminal(ws, Some(node))?;
+        let entry = self.entry_mut(ws)?;
+        entry.page_len = set.page_len;
+        entry.mapped_len = mapped_len;
+        entry.folded = set.folded;
+        entry.prompt_pages = set.prompt_pages;
+        entry.supplied = set.supplied;
+        entry.logged = set.logged;
+        Ok(ws)
     }
 
     pub fn pin_working_sets(
