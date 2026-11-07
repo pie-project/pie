@@ -2640,7 +2640,9 @@ impl Shell {
                 if !snaps.is_empty() && rs_snaps.is_empty() {
                     rs_snaps.resize(at_lane as usize * 2 * MAX, 0);
                 }
-                if !rs_snaps.is_empty() {
+                // Lane 0 leaves the table empty above, so emptiness cannot
+                // stand for "no lane has snapshots".
+                if !snaps.is_empty() || !rs_snaps.is_empty() {
                     let mut entry = [0i32; 2 * MAX];
                     for (at, snap) in snaps.iter().enumerate() {
                         entry[at] = narrow(u64::from(snap.row));
