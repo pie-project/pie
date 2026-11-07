@@ -179,13 +179,15 @@ fn fault(fault: Fault) -> Error {
 
 const DEFAULT_STATE_SLOTS: u32 = 256;
 
-fn bake_budgets(budgets: &LoadBudgets) -> Budget {
+/// The load's budgets: its logit readouts sized to what `trace` reads, not a
+/// general figure, so a vocab-wide head carves only the rows a fire can read.
+fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,
         buckets: budgets.buckets.clone(),
         max_adapters: budgets.max_adapters,
-        readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE,
+        readouts_per_lane: poem_compiler::arena::readouts_per_lane(trace),
     }
 }
 
@@ -351,11 +353,14 @@ impl Engine for Vulkan {
             residency.disk_kv_dir.clone(),
             residency.kv_seats.unwrap_or(budgets.max_lanes),
         );
+        let budget = bake_budgets(&budgets, &trace);
+        let max_readouts =
+            u32::try_from(poem_compiler::arena::readouts_ceiling(&budget)).unwrap_or(u32::MAX);
         let mut shell = Shell::load(Boot {
             trace,
             contract: &contract,
             checkpoint: &path,
-            budget: bake_budgets(&budgets),
+            budget,
             patches,
 
             profile: None::<DeviceProfile>,
@@ -415,6 +420,8 @@ impl Engine for Vulkan {
 
                 elastic_page_bytes: 0,
                 elastic_budget_pages: 0,
+                slab_kv_page_bytes: shell.kv_page_bytes(),
+                elastic_state_slot_bytes: 0,
                 disk_kv_pages,
                 one_frame_when_short: false,
                 seated_first: false,
@@ -433,10 +440,7 @@ impl Engine for Vulkan {
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
                 prefill_rows: 0,
-                max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
-                    &budgets,
-                )))
-                .unwrap_or(u32::MAX),
+                max_readouts,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -483,6 +487,14 @@ impl Engine for Vulkan {
             },
             caps,
         })
+    }
+
+    fn commit_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
+        self.loaded_mut()?.resize_pool(kv_pages).map_err(fault)
+    }
+
+    fn release_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
+        self.loaded_mut()?.resize_pool(kv_pages).map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {

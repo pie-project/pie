@@ -108,6 +108,9 @@ pub struct Pools {
     slabs: Vec<Buffer>,
     shapes: Vec<Shape>,
     paging: Paging,
+    /// The kv pages the slabs hold, up to what `paging` declares: a slab
+    /// cannot give memory back, so a smaller pool is smaller slabs.
+    pages: u64,
 
     watermark: engine::frame::Demand,
 
@@ -213,6 +216,7 @@ impl Pools {
         Ok(Pools {
             slabs,
             shapes,
+            pages: paging.pages(),
             paging,
             watermark: engine::frame::Demand::ZERO,
             state_scratch,
@@ -299,7 +303,7 @@ impl Pools {
                                      geometry"
                             ),
                         })?;
-                    let cells = self.paging.pages() * u64::from(self.paging.page_size);
+                    let cells = self.pages * u64::from(self.paging.page_size);
                     let plane = |at: u64, bytes: u64, width: u64| -> Result<Tensor> {
                         Ok(Tensor::new(
                             handles.bind(slab, at, bytes)?,
@@ -372,14 +376,11 @@ impl Pools {
         if src == dst {
             return Ok(());
         }
-        engine::frame::Supply::commit(
-            self,
-            engine::frame::Demand {
-                kv_pages: 0,
-                state_slots: src.max(dst) + 1,
-                workspace: 0,
-            },
-        )?;
+        self.admit(engine::frame::Demand {
+            kv_pages: 0,
+            state_slots: src.max(dst) + 1,
+            workspace: 0,
+        })?;
         let Some(scratch) = self.state_scratch.as_ref() else {
             return Ok(());
         };
@@ -417,14 +418,11 @@ impl Pools {
             }
         }
 
-        engine::frame::Supply::commit(
-            self,
-            engine::frame::Demand {
-                kv_pages: highest,
-                state_slots: 0,
-                workspace: 0,
-            },
-        )?;
+        self.admit(engine::frame::Demand {
+            kv_pages: highest,
+            state_slots: 0,
+            workspace: 0,
+        })?;
         for (slab, plane, cell) in self.kv_planes() {
             for span in moves {
                 if span.tokens == 0 {
@@ -546,14 +544,11 @@ impl Pools {
         slots: &[u32],
     ) -> Result<()> {
         Spill::room(self.disk.as_ref(), "disk kv pages", slots)?;
-        engine::frame::Supply::commit(
-            self,
-            engine::frame::Demand {
-                kv_pages: pages.iter().map(|&page| page + 1).max().unwrap_or(0),
-                state_slots: 0,
-                workspace: 0,
-            },
-        )?;
+        self.admit(engine::frame::Demand {
+            kv_pages: pages.iter().map(|&page| page + 1).max().unwrap_or(0),
+            state_slots: 0,
+            workspace: 0,
+        })?;
         let Some(mut disk) = self.disk.take() else {
             return Ok(());
         };
@@ -584,14 +579,11 @@ impl Pools {
             });
         }
         Spill::room(self.parked.as_ref(), "parked rs rows", rows)?;
-        engine::frame::Supply::commit(
-            self,
-            engine::frame::Demand {
-                kv_pages: 0,
-                state_slots: device_slots.iter().map(|&slot| slot + 1).max().unwrap_or(0),
-                workspace: 0,
-            },
-        )?;
+        self.admit(engine::frame::Demand {
+            kv_pages: 0,
+            state_slots: device_slots.iter().map(|&slot| slot + 1).max().unwrap_or(0),
+            workspace: 0,
+        })?;
         let Some(mut parked) = self.parked.take() else {
             return Ok(());
         };
@@ -716,10 +708,75 @@ fn slot_file(error: std::io::Error) -> Fault {
     }
 }
 
-impl engine::frame::Supply for Pools {
-    type Error = Fault;
+impl Pools {
+    /// Moves the kv into slabs of `pages` pages, keeping what the lower pages
+    /// hold. The new slabs are all made before any copy, so a refused one
+    /// leaves the pool as it stood. The caller has drained the frames.
+    pub fn resize(&mut self, device: &Context, pages: u64) -> Result<()> {
+        let pages = pages.clamp(1, self.paging.pages());
+        if pages == self.pages {
+            return Ok(());
+        }
+        let page_size = u64::from(self.paging.page_size);
+        let (cells, kept) = (pages * page_size, pages.min(self.pages) * page_size);
+        let mut moved = Vec::new();
+        for (at, shape) in self.shapes.iter().enumerate() {
+            let Shape::Kv {
+                head_dim,
+                kv_heads,
+                dtype,
+                values_at,
+                values_width,
+                ..
+            } = *shape
+            else {
+                continue;
+            };
+            let element = u64::from(elem_size(dtype));
+            let keys = u64::from(kv_heads) * u64::from(head_dim) * element;
+            let values = values_width * element;
+            let own_values = values_at != 0;
+            let bytes = cells * keys + if own_values { cells * values } else { 0 };
+            moved.push((at, keys, values, own_values, Buffer::zeroed(device, bytes)?));
+        }
+        let mut frame = device.frame()?;
+        for (at, keys, values, own_values, next) in &moved {
+            let slab = &self.slabs[*at];
+            frame.copy(slab, 0, next, 0, kept * keys)?;
+            if *own_values {
+                let Shape::Kv { values_at, .. } = self.shapes[*at] else {
+                    continue;
+                };
+                frame.copy(slab, values_at, next, cells * keys, kept * values)?;
+            }
+        }
+        frame.commit()?;
+        for (at, keys, values, own_values, next) in moved {
+            self.slabs[at] = next;
+            let Shape::Kv {
+                plane_bytes,
+                values_at,
+                values_bytes,
+                ..
+            } = &mut self.shapes[at]
+            else {
+                continue;
+            };
+            *plane_bytes = cells * keys;
+            *values_at = if own_values { *plane_bytes } else { 0 };
+            *values_bytes = if values == 0 {
+                *plane_bytes
+            } else {
+                cells * values
+            };
+        }
+        self.pages = pages;
+        Ok(())
+    }
 
-    fn commit(&mut self, demand: engine::frame::Demand) -> Result<()> {
+    /// Checks a frame's or copy's reach against the pool and lifts the
+    /// watermark over it.
+    pub fn admit(&mut self, demand: engine::frame::Demand) -> Result<()> {
         if demand.state_slots > self.paging.slots {
             return Err(Fault::Ceiling {
                 what: "recurrent slots",
@@ -727,12 +784,11 @@ impl engine::frame::Supply for Pools {
                 have: u64::from(self.paging.slots),
             });
         }
-        let pages = self.paging.pages();
-        if u64::from(demand.kv_pages) > pages {
+        if u64::from(demand.kv_pages) > self.pages {
             return Err(Fault::Ceiling {
                 what: "kv pages",
                 need: u64::from(demand.kv_pages),
-                have: pages,
+                have: self.pages,
             });
         }
 
@@ -747,7 +803,7 @@ impl engine::frame::Supply for Pools {
         Ok(())
     }
 
-    fn trim(&mut self, hint: engine::frame::Demand) {
+    pub fn trim(&mut self, hint: engine::frame::Demand) {
         self.watermark = engine::frame::Demand {
             kv_pages: self.watermark.kv_pages.min(hint.kv_pages),
             state_slots: self.watermark.state_slots.min(hint.state_slots),
@@ -847,6 +903,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_resized_pool_keeps_its_low_pages_in_keys_and_values() {
+        if !crate::device::present() {
+            eprintln!("no Vulkan device on this machine; skipping");
+            return;
+        }
+        let device = Context::bind(
+            &crate::DeviceBoot::default(),
+            engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        )
+        .expect("a Vulkan device");
+        let paging = Paging {
+            page_size: 16,
+            pages_per_slot: 1,
+            slots: 2,
+            pages: 4,
+            window: None,
+        };
+        let cell = 3 * 4u64;
+        let page = u64::from(paging.page_size) * cell;
+        let plane = 4 * page;
+        let mut pools = Pools {
+            slabs: vec![Buffer::zeroed(&device, 2 * plane).expect("a kv slab")],
+            shapes: vec![Shape::Kv {
+                space: 0,
+                head_dim: 3,
+                kv_heads: 1,
+                dtype: STATE_DTYPE,
+                plane_bytes: plane,
+                values_at: plane,
+                values_width: 3,
+                values_bytes: plane,
+            }],
+            pages: 4,
+            paging,
+            watermark: engine::frame::Demand::ZERO,
+            state_scratch: None,
+            disk: None,
+            parked: None,
+            parked_pages: None,
+        };
+        let bytes: Vec<u8> = (0..2 * plane).map(|at| (at % 251) as u8).collect();
+        let mut staged = Buffer::host(&device, 2 * plane).expect("a host buffer");
+        staged.write(0, &bytes).expect("staged");
+        let mut frame = device.frame().expect("a frame");
+        frame
+            .copy(&staged, 0, &pools.slabs[0], 0, 2 * plane)
+            .expect("uploaded");
+        frame.commit().expect("committed");
+        let read = |pools: &Pools, bytes: u64| {
+            let mut frame = device.frame().expect("a frame");
+            frame
+                .copy(&pools.slabs[0], 0, &staged, 0, bytes)
+                .expect("downloaded");
+            frame.commit().expect("committed");
+            let mut back = vec![0u8; usize::try_from(bytes).expect("small")];
+            staged.read(0, &mut back).expect("read back");
+            back
+        };
+
+        pools.resize(&device, 2).expect("shrunk");
+        assert_eq!(pools.bytes(), 4 * page, "a smaller slab");
+        let back = read(&pools, 4 * page);
+        let page = page as usize;
+        assert_eq!(back[..2 * page], bytes[..2 * page], "the keys stay");
+        assert_eq!(
+            back[2 * page..4 * page],
+            bytes[4 * page..6 * page],
+            "the values follow the keys to their new offset"
+        );
+        assert!(
+            pools
+                .admit(engine::frame::Demand {
+                    kv_pages: 3,
+                    ..engine::frame::Demand::ZERO
+                })
+                .is_err()
+        );
+
+        pools.resize(&device, 4).expect("grown");
+        let back = read(&pools, 8 * page as u64);
+        assert_eq!(back[..2 * page], bytes[..2 * page]);
+        assert_eq!(back[4 * page..6 * page], bytes[4 * page..6 * page]);
+        assert!(back[2 * page..4 * page].iter().all(|&b| b == 0));
+        assert!(back[6 * page..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
     fn kv_pages_and_rs_slots_come_back_from_disk_where_they_are_restored() {
         if !crate::device::present() {
             eprintln!("no Vulkan device on this machine; skipping");
@@ -888,6 +1031,7 @@ mod tests {
                     dtype: STATE_DTYPE,
                 },
             ],
+            pages: paging.pages(),
             paging,
             watermark: engine::frame::Demand::ZERO,
             state_scratch: None,

@@ -6,6 +6,8 @@ use engine::rs::{LanePlan, Run};
 use kernels_metal::Tensor;
 use poem_ir::{Def, Dim, Dtype, Gather, Operation, Ssm, Trace, Ty, ValueId};
 
+#[cfg(target_vendor = "apple")]
+use crate::device::elastic;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
 use crate::store::kv::Paging;
@@ -304,6 +306,9 @@ impl Layout {
 #[derive(Debug)]
 pub struct Buffers {
     slab: Buffer,
+    /// The memory under `slab` where it gains it as pages are handed out.
+    #[cfg(target_vendor = "apple")]
+    store: Option<(elastic::Arena, elastic::Elastic)>,
     page_tokens: u32,
     slots: u32,
     page_bytes: u64,
@@ -336,8 +341,25 @@ impl Buffers {
         let page_tokens = paging.page_size.max(1);
         let (plane_at, page_bytes, bytes) = Self::geometry(layout, paging);
         let slots = paging.slots.max(1);
+        #[cfg(target_vendor = "apple")]
+        let store = device
+            .sparse()?
+            .map(|sparse| {
+                let arena = elastic::Arena::new(elastic::pages_up(bytes.max(256)));
+                let store = elastic::create(&sparse, &arena, bytes.max(256))?;
+                Ok::<_, Fault>((arena, store))
+            })
+            .transpose()?;
         Ok(Buffers {
+            #[cfg(target_vendor = "apple")]
+            slab: match &store {
+                Some((_, store)) => store.view(),
+                None => Buffer::zeroed(device, bytes.max(256))?,
+            },
+            #[cfg(not(target_vendor = "apple"))]
             slab: Buffer::zeroed(device, bytes.max(256))?,
+            #[cfg(target_vendor = "apple")]
+            store,
             page_tokens,
             slots,
             page_bytes,
@@ -348,6 +370,46 @@ impl Buffers {
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.slab.bytes()
+    }
+
+    /// Whether the slab gains memory as pages are handed out.
+    #[must_use]
+    pub fn elastic(&self) -> bool {
+        #[cfg(target_vendor = "apple")]
+        {
+            self.store.is_some()
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            false
+        }
+    }
+
+    /// Maps the slab under its first `pages` pages.
+    pub fn commit(&mut self, pages: u32) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        if let Some((_, buffer)) = &mut self.store {
+            let bytes = elastic::pages_up(u64::from(pages) * self.page_bytes);
+            elastic::grow_all(&mut [elastic::Target { buffer, bytes }])?;
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = pages;
+        Ok(())
+    }
+
+    /// Gives back the slab past its first `pages` pages.
+    #[allow(unsafe_code)]
+    pub fn release(&mut self, pages: u32) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        if let Some((_, buffer)) = &mut self.store {
+            let bytes = elastic::pages_up(u64::from(pages) * self.page_bytes);
+            // SAFETY: the caller's contract, `Engine::release_state`: no
+            // frame reads the pages released.
+            unsafe { elastic::shrink_all(&mut [elastic::Target { buffer, bytes }])? };
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = pages;
+        Ok(())
     }
 
     #[must_use]

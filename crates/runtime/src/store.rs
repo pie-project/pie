@@ -1,3 +1,4 @@
+pub mod extent;
 pub(crate) mod genmap;
 pub(crate) mod kv;
 pub(crate) mod pool;
@@ -130,7 +131,7 @@ pub fn kv_tokens() -> (u64, u64) {
             let cached: u64 = kv.cached_working_sets().iter().map(|set| set.pages).sum();
             (
                 u64::from(kv.capacity_pages()),
-                kv.available_pages() as u64,
+                u64::from(kv.capacity_pages() - kv.pages_out()),
                 cached,
             )
         });
@@ -150,7 +151,7 @@ pub fn kv_census() -> (usize, usize, usize, usize) {
     };
     registry::with_kv_lock(&stores.kv, "other", |kv| {
         let total = kv.capacity_pages() as usize;
-        let free = kv.available_pages();
+        let free = (kv.capacity_pages() - kv.pages_out()) as usize;
         let idle = kv.reclaimable_cache_pages() as usize;
         (
             free,
@@ -173,12 +174,11 @@ pub fn kv_pressure_bucket() -> u8 {
     let Some(stores) = registry::try_get(0, 0) else {
         return 0;
     };
-    let (total, available) = registry::with_kv_lock(&stores.kv, "other", |kv| {
-        (kv.capacity_pages(), kv.available_pages())
+    let (total, used) = registry::with_kv_lock(&stores.kv, "other", |kv| {
+        (kv.capacity_pages(), kv.pages_out())
     });
     if total == 0 {
         return 0;
     }
-    let used = total.saturating_sub(available as u32);
     (f64::from(used) / f64::from(total) * 255.0).round() as u8
 }

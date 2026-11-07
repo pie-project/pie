@@ -147,7 +147,7 @@ impl ResidencyPlanner {
                     proc.state == Residency::Resident && !inner.killing.contains(&pid)
                 })
             });
-            if !rs_free.covers(demand.rs) && resident {
+            if !rs_free.covers(demand.rs) && resident && !self.port.grow_rs(demand.rs) {
                 // What this frees may be what an older waiter parked on.
                 if self.reclaim_idle_once() {
                     self.pages_freed();

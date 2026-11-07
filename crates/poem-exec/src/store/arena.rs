@@ -56,6 +56,31 @@ mod tests {
         (trace, compiled)
     }
 
+    #[test]
+    fn a_narrower_carve_is_a_smaller_prefix_that_holds_its_fire() {
+        let trace = poem_compiler::catalog::deployment(DEPLOYMENT)
+            .expect("the catalog ships the smoke's deployment")
+            .trace(Platform::Cuda);
+        let budget = Budget::new(512, 8192);
+        let budgets = poem_compiler::Budgets::of(budget.clone());
+        let compiled =
+            compile(&trace, &budget, &DeviceProfile::default()).expect("the deployment bakes");
+        let ladder =
+            poem_compiler::arena_ladder(&trace, &budgets, &compiled).expect("the rungs carve");
+        assert!(!ladder.is_empty());
+        assert!(
+            ladder
+                .windows(2)
+                .all(|rung| rung[0].1.bytes <= rung[1].1.bytes)
+        );
+        for (ceiling, map) in &ladder {
+            assert!(map.bytes < compiled.arena.bytes);
+            for rect in rects(map, ceiling.tokens, ceiling.lanes).iter().flatten() {
+                assert!(rect.offset + rect.bytes <= map.bytes);
+            }
+        }
+    }
+
     fn rects(map: &ArenaMap, tokens: u64, lanes: u64) -> Vec<Option<Rect>> {
         (0..map.placements.len())
             .map(|at| {

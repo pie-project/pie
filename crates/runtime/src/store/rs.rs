@@ -239,6 +239,17 @@ pub struct RsStore {
     checkpoints: HashMap<Hash256, RsCheckpoint>,
     /// Slots a suspend or restore has between its prepare and commit.
     moving: HashSet<RsSlotId>,
+    /// Where state gains memory as it is handed out, how far it has.
+    extent: Option<StateExtent>,
+}
+
+/// How far the state slots and buffer pages have memory under them; both
+/// pools move as one, a slot and a page at each number.
+#[derive(Debug, Clone, Copy, Default)]
+struct StateExtent {
+    target: u32,
+    mapped: u32,
+    short: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -299,7 +310,140 @@ impl RsStore {
             pending_touch: Vec::new(),
             checkpoints: HashMap::new(),
             moving: HashSet::new(),
+            extent: None,
         }
+    }
+
+    /// State starts with no memory under it and gains it as it is asked for.
+    pub fn commit_on_demand(&mut self) {
+        self.extent = Some(StateExtent {
+            target: self.slots.capacity().max(self.pages.capacity()),
+            ..StateExtent::default()
+        });
+        self.set_limit(0);
+    }
+
+    fn set_limit(&mut self, limit: u32) {
+        self.slots.set_limit(limit);
+        self.pages.set_limit(limit);
+    }
+
+    fn limit(&self) -> u32 {
+        self.slots.limit().max(self.pages.limit())
+    }
+
+    /// Asks for `need` more than stand free; whether committing can add any.
+    pub fn note_short(&mut self, need: RsUnits) -> bool {
+        let limit = self.limit();
+        let Some(extent) = &mut self.extent else {
+            return false;
+        };
+        extent.short = extent.short.max(need.slots.max(need.pages));
+        limit < extent.target
+    }
+
+    /// The numbers to commit up to next, keeping `step` free and covering
+    /// what a waiter is short of; `None` while enough stand free.
+    pub fn next_extent(&self, step: u32) -> Option<u32> {
+        let extent = self.extent?;
+        let free = self.slots.available().min(self.pages.available()) as u32;
+        let lacking = step.max(extent.short).saturating_sub(free);
+        let limit = self.limit();
+        (lacking > 0 && limit < extent.target)
+            .then(|| (limit + lacking.next_multiple_of(step.max(1))).min(extent.target))
+    }
+
+    pub fn set_committed(&mut self, limit: u32) {
+        let committed = limit;
+        let limit = self.extent.map_or(limit, |extent| limit.min(extent.target));
+        let gained = limit.saturating_sub(self.limit());
+        self.set_limit(limit);
+        if let Some(extent) = &mut self.extent {
+            extent.mapped = extent.mapped.max(committed);
+            extent.short = extent.short.saturating_sub(gained);
+        }
+    }
+
+    /// A refused commit stands what is committed as the most there is.
+    pub fn hold_extent(&mut self) {
+        let limit = self.limit();
+        if let Some(extent) = &mut self.extent {
+            extent.target = limit;
+            extent.short = 0;
+        }
+    }
+
+    /// Moves the target; a fall stops handing out numbers past it at once.
+    pub fn set_target(&mut self, target: u32) {
+        let limit = self.limit();
+        if let Some(extent) = &mut self.extent {
+            extent.target = target;
+            if target < limit {
+                self.set_limit(target);
+            }
+        }
+    }
+
+    pub fn mapped(&self) -> u32 {
+        self.extent.map_or(0, |extent| extent.mapped)
+    }
+
+    /// What stands free, with what the target allows and nothing has
+    /// committed: the planner plans as over a whole pool, as it does for kv.
+    pub fn free(&self) -> RsUnits {
+        let room = self
+            .extent
+            .map_or(0, |extent| extent.target.saturating_sub(self.limit()));
+        self.available().add(RsUnits {
+            slots: room,
+            pages: room,
+        })
+    }
+
+    pub fn note_released(&mut self, mapped: u32) {
+        if let Some(extent) = &mut self.extent {
+            extent.mapped = mapped;
+        }
+    }
+
+    /// Where memory can stop now: past the highest number still out.
+    pub fn held_end(&mut self) -> u32 {
+        self.retire_idle();
+        self.slots.held_end().max(self.pages.held_end())
+    }
+
+    /// What is asked for now and, of that, what checkpoints do not merely
+    /// keep: as far as the highest number out, so that holding it cuts
+    /// nothing off, and a waiter's on top.
+    pub fn demand(&self) -> (u32, u32) {
+        let extent = self.extent.unwrap_or_default();
+        let reach = self.slots.high_end().max(self.pages.high_end());
+        let out = |pool: &Pool<RsSlotId>| pool.limit() - pool.available() as u32;
+        let wanted = out(&self.slots).max(out(&self.pages));
+        let kept: HashSet<RsSlotId> = self
+            .checkpoints
+            .values()
+            .filter_map(|entry| self.working_sets.get(entry.snapshot))
+            .flat_map(Self::slots)
+            .filter(|&id| !self.is_page(id))
+            .collect();
+        let live = kept.len() as u32;
+        (
+            reach.max(wanted).saturating_add(extent.short),
+            wanted.saturating_sub(live).saturating_add(extent.short),
+        )
+    }
+
+    /// Drops the checkpoints reading a number past the limit.
+    pub fn reclaim_tail(&mut self) -> usize {
+        let limit = self.limit();
+        let past = |id: RsSlotId, store: &Self| store.engine_id(id) >= limit && !store.is_host(id);
+        self.drop_checkpoints(|store, snapshot| {
+            store
+                .working_sets
+                .get(snapshot)
+                .is_some_and(|entry| Self::slots(entry).any(|id| past(id, store)))
+        })
     }
 
     /// The state is a window ring of kv pages, drawn from the buffer pages.

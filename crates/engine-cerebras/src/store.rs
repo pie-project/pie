@@ -794,10 +794,10 @@ impl Pools {
     }
 }
 
-impl engine::frame::Supply for Pools {
-    type Error = Fault;
-
-    fn commit(&mut self, demand: engine::frame::Demand) -> Result<()> {
+impl Pools {
+    /// Checks a frame's or copy's reach against the pool and lifts the
+    /// watermark over it.
+    pub fn admit(&mut self, demand: engine::frame::Demand) -> Result<()> {
         if demand.state_slots > self.paging.slots {
             return Err(Fault::Ceiling {
                 what: "recurrent slots",
@@ -823,7 +823,7 @@ impl engine::frame::Supply for Pools {
         Ok(())
     }
 
-    fn trim(&mut self, hint: engine::frame::Demand) {
+    pub fn trim(&mut self, hint: engine::frame::Demand) {
         self.watermark = engine::frame::Demand {
             kv_pages: self.watermark.kv_pages.min(hint.kv_pages),
             state_slots: self.watermark.state_slots.min(hint.state_slots),

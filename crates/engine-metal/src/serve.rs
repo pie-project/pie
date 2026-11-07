@@ -28,7 +28,7 @@ use crate::weights::{AdapterPlane, Weights};
 use crate::window::Windows;
 
 use engine::fire::Masking;
-use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Supply};
+use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase};
 use engine::runahead::Runahead;
 use eta_ir::registry::Stage;
 
@@ -252,6 +252,7 @@ pub struct Shell {
     ane: Option<crate::ane::Ane>,
     weights: Weights,
     arena: Arena,
+    arena_ladder: Vec<(FireRows, poem_compiler::ArenaMap)>,
     pools: Pools,
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     rs_buffers: Option<crate::rs::Buffers>,
@@ -699,6 +700,7 @@ impl PreparedLoad<'_> {
             }
         }
         let arena = Arena::reserve(&device, &compiled.arena)?;
+        let arena_ladder = poem_compiler::arena_ladder(&boot.trace, &budgets, &compiled)?;
         let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
         let rs_buffers = match &rs_layout {
             Some(layout) => Some(crate::rs::Buffers::reserve(&device, layout, paging)?),
@@ -891,6 +893,7 @@ impl PreparedLoad<'_> {
             ane,
             weights,
             arena,
+            arena_ladder,
             pools,
             rs_layout,
             rs_buffers,
@@ -981,7 +984,6 @@ impl Shell {
             .rs_buffers
             .as_ref()
             .map_or(0, crate::rs::Buffers::page_bytes);
-        let unstated = budget.is_none();
         let budget = match budget {
             Some(bytes) => bytes,
             None => engine::disk::unstated_budget(
@@ -993,13 +995,7 @@ impl Shell {
                 self.pools.page_bytes()?,
             ),
         };
-        match self.pools.seat_disk(dir, budget, buffered) {
-            Err(_) if unstated => {
-                self.pools.unseat_disk();
-                Ok(0)
-            }
-            seated => seated,
-        }
+        self.pools.seat_disk(dir, budget, buffered)
     }
 
     #[must_use]
@@ -1267,6 +1263,75 @@ impl Shell {
     #[must_use]
     pub fn pool_residency(&self) -> (u64, u64) {
         (self.pools.committed_bytes(), self.pools.high_water_bytes())
+    }
+
+    /// See `Engine::commit_pool`.
+    pub fn commit_pool(&mut self, kv_pages: u32) -> Result<()> {
+        self.pools.commit(Demand {
+            kv_pages,
+            ..self.pools.watermark()
+        })
+    }
+
+    /// See `Engine::commit_state`.
+    pub fn commit_state(&mut self, slots: u32) -> Result<()> {
+        self.pools.commit(Demand {
+            state_slots: slots,
+            ..self.pools.watermark()
+        })?;
+        match &mut self.rs_buffers {
+            Some(buffers) => buffers.commit(slots),
+            None => Ok(()),
+        }
+    }
+
+    /// See `Engine::release_state`.
+    pub fn release_state(&mut self, slots: u32) -> Result<()> {
+        let mut kept = self.pools.watermark();
+        kept.state_slots = kept.state_slots.min(slots);
+        self.pools.trim(kept);
+        self.pools.release()?;
+        match &mut self.rs_buffers {
+            Some(buffers) => buffers.release(slots),
+            None => Ok(()),
+        }
+    }
+
+    /// What a state slot and its buffer page take, where both gain memory as
+    /// they are handed out.
+    #[must_use]
+    pub fn elastic_state_slot_bytes(&self) -> u64 {
+        if !self.pools.has_state() || self.pools.elastic_page_bytes() == 0 {
+            return 0;
+        }
+        let buffer = self.rs_buffers.as_ref().map_or(Some(0), |buffers| {
+            buffers.elastic().then(|| buffers.page_bytes())
+        });
+        buffer.map_or(0, |buffer| self.pools.state_slot_bytes() + buffer)
+    }
+
+    /// See `Engine::release_scratch`.
+    #[allow(unsafe_code)]
+    pub fn release_scratch(&mut self) -> Result<()> {
+        self.drain()?;
+        let narrowest = self
+            .arena_ladder
+            .first()
+            .map_or(self.compiled.arena.bytes, |(_, map)| map.bytes);
+        #[cfg(target_vendor = "apple")]
+        // SAFETY: drained just above, on the one thread that submits.
+        unsafe {
+            self.arena.forget(narrowest)?;
+        }
+        Ok(())
+    }
+
+    /// See `Engine::release_pool`.
+    pub fn release_pool(&mut self, kv_pages: u32) -> Result<()> {
+        let mut kept = self.pools.watermark();
+        kept.kv_pages = kept.kv_pages.min(kv_pages);
+        self.pools.trim(kept);
+        self.pools.release()
     }
 
     /// The elastic pool's reporting unit and its budget in that unit; both
@@ -1551,6 +1616,10 @@ impl Shell {
         attachments: &[Attached],
     ) -> Result<Vec<Vec<f32>>> {
         use engine::frame::Shell as FrameShell;
+        // A caller firing directly has no runtime to commit ahead of it.
+        let paging = self.pools.paging();
+        self.commit_pool(u32::try_from(paging.pages()).unwrap_or(u32::MAX))?;
+        self.commit_state(paging.slots)?;
         let prepared = FrameShell::prepare(
             self,
             StepView {
@@ -2479,6 +2548,7 @@ impl Shell {
         let lane_count = composition.lane_count();
 
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
+        let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -2564,6 +2634,7 @@ impl Shell {
                 have,
                 rows: row.rows,
             });
+            kv_less.push(seated.kv_less);
             tables.push(match &device_pages[source] {
                 Some(pages) => std::borrow::Cow::Owned(pages.clone()),
                 None => std::borrow::Cow::Borrowed(seated.pages),
@@ -2640,7 +2711,9 @@ impl Shell {
                 if !snaps.is_empty() && rs_snaps.is_empty() {
                     rs_snaps.resize(at_lane as usize * 2 * MAX, 0);
                 }
-                if !rs_snaps.is_empty() {
+                // Lane 0 leaves the table empty above, so emptiness cannot
+                // stand for "no lane has snapshots".
+                if !snaps.is_empty() || !rs_snaps.is_empty() {
                     let mut entry = [0i32; 2 * MAX];
                     for (at, snap) in snaps.iter().enumerate() {
                         entry[at] = narrow(u64::from(snap.row));
@@ -2757,7 +2830,10 @@ impl Shell {
             kv_pages: seats
                 .iter()
                 .zip(&tables)
-                .map(|(seat, table)| {
+                .zip(&kv_less)
+                // A kv-less lane takes no pages, so none is committed for it.
+                .filter(|(_, free)| !**free)
+                .map(|((seat, table), _)| {
                     let after = u64::from(seat.have).saturating_add(u64::from(seat.rows));
                     let pages = after.div_ceil(page_size).max(1);
                     if table.is_empty() {
@@ -2782,7 +2858,7 @@ impl Shell {
                 .max(snap_slots),
             workspace: 0,
         };
-        Supply::commit(&mut self.pools, demand)?;
+        self.pools.admit(demand)?;
 
         if !beginning.is_empty() && self.pools.has_state() {
             self.drain()?;
@@ -3176,7 +3252,7 @@ impl Shell {
         let readouts_ceiling = poem_compiler::arena::readouts_ceiling(&self.budgets.tokens);
         if readout_rows.len() as u64 > readouts_ceiling {
             return Err(Fault::Ceiling {
-                what: "rows one fire reads logits for (READOUTS_PER_LANE per lane)",
+                what: "rows one fire reads logits for",
                 need: readout_rows.len() as u64,
                 have: readouts_ceiling,
             });
@@ -3220,19 +3296,22 @@ impl Shell {
         let group_masks =
             self.inputs[arm].stage_group_masks(&self.device, &self.handles, &group_masks)?;
 
-        let slots = self.arena.slots(
-            &self.handles,
-            &self.compiled.arena,
-            FireRows {
-                tokens: u64::from(rows),
-                lanes: u64::from(lane_count),
-                patches: u64::from(composition.patch_rows()),
-                images: u64::from(composition.images()),
-                voxels: u64::from(composition.voxel_widest()),
-                clips: u64::from(composition.clips()),
-                readouts: readout_rows.len() as u64,
-            },
-        )?;
+        let fire = FireRows {
+            tokens: u64::from(rows),
+            lanes: u64::from(lane_count),
+            patches: u64::from(composition.patch_rows()),
+            images: u64::from(composition.images()),
+            voxels: u64::from(composition.voxel_widest()),
+            clips: u64::from(composition.clips()),
+            readouts: readout_rows.len() as u64,
+        };
+        let carve = self
+            .arena_ladder
+            .iter()
+            .find(|(ceiling, _)| covers(ceiling, &fire))
+            .map_or(&self.compiled.arena, |(_, map)| map);
+        self.arena.cover(carve.bytes)?;
+        let slots = self.arena.slots(&self.handles, carve, fire)?;
         let caches = self.pools.table(
             &self.handles,
             &self.inputs[arm].seats(&self.handles, &bound, pages, rows, lane_count),
@@ -4318,4 +4397,15 @@ impl Shell {
         }
         Ok(staged)
     }
+}
+
+/// Whether every row count of `fire` fits under `ceiling`.
+fn covers(ceiling: &FireRows, fire: &FireRows) -> bool {
+    fire.tokens <= ceiling.tokens
+        && fire.lanes <= ceiling.lanes
+        && fire.patches <= ceiling.patches
+        && fire.images <= ceiling.images
+        && fire.voxels <= ceiling.voxels
+        && fire.clips <= ceiling.clips
+        && fire.readouts <= ceiling.readouts
 }

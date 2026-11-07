@@ -368,7 +368,8 @@ const STORES: Cache = Cache {
             .iter()
             .map(|stores| {
                 store_registry::with_kv_lock(&stores.kv, "policy-memory", |kv| {
-                    (u64::from(kv.capacity_pages()), kv.available_pages() as u64)
+                    let capacity = kv.capacity_pages();
+                    (u64::from(capacity), u64::from(capacity - kv.pages_out()))
                 })
             })
             .fold((0, 0), |(c, a), (cc, aa)| (c + cc, a + aa))

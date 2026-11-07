@@ -27,7 +27,7 @@ use crate::weights::Weights;
 use crate::window::Windows;
 
 use engine::fire::Masking;
-use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Supply};
+use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase};
 use engine::runahead::Runahead;
 
 /// What a readout plane holds: the lane's readout rows, a row or voxel
@@ -1247,6 +1247,30 @@ impl Shell {
         self.rows_of(&landed)
     }
 
+    /// Moves the pool to slabs of `kv_pages` pages, the only way a slab gives
+    /// memory back: frames stop here until the copy lands.
+    pub fn resize_pool(&mut self, kv_pages: u32) -> Result<()> {
+        self.drain()?;
+        // The rows of the last fire and the frames kept to replay bind the
+        // slabs this replaces.
+        self.handles.rewind();
+        self.recorder.forget();
+        let before = self.pools.bytes();
+        let resized = self.pools.resize(&self.device, u64::from(kv_pages));
+        tracing::debug!(
+            kv_pages,
+            before,
+            after = self.pools.bytes(),
+            "kv pool resized"
+        );
+        resized
+    }
+
+    #[must_use]
+    pub fn kv_page_bytes(&self) -> u64 {
+        self.pools.page_bytes()
+    }
+
     pub fn drain(&mut self) -> Result<()> {
         while !self.inflight.is_empty() {
             self.harvest_one()?;
@@ -2234,7 +2258,7 @@ impl Shell {
 
             workspace: 0,
         };
-        Supply::commit(&mut self.pools, demand)?;
+        self.pools.admit(demand)?;
 
         if !beginning.is_empty() && self.pools.has_state() {
             self.drain()?;
@@ -2558,7 +2582,7 @@ impl Shell {
         let readouts_ceiling = poem_compiler::arena::readouts_ceiling(&self.budgets.tokens);
         if readouts > readouts_ceiling {
             return Err(Fault::Ceiling {
-                what: "rows one fire reads logits for (READOUTS_PER_LANE per lane)",
+                what: "rows one fire reads logits for",
                 need: readouts,
                 have: readouts_ceiling,
             });

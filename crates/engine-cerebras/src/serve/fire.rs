@@ -419,14 +419,11 @@ impl Shell {
             }
         }
 
-        Supply::commit(
-            &mut self.pools,
-            Demand {
-                kv_pages: u32::try_from(demand_pages).unwrap_or(u32::MAX),
-                state_slots: demand_slots,
-                workspace: 0,
-            },
-        )?;
+        self.pools.admit(Demand {
+            kv_pages: u32::try_from(demand_pages).unwrap_or(u32::MAX),
+            state_slots: demand_slots,
+            workspace: 0,
+        })?;
         for slot in beginning {
             self.pools.clear(&self.device, &self.handles, slot)?;
         }

@@ -36,6 +36,7 @@ pub fn build_without_engine(
     metadata: runtime::model::ModelMetadata,
 ) -> Result<runtime::bootstrap::Config> {
     let model = runtime::bootstrap::ModelConfig {
+        memory_tolerance: user.model.memory_tolerance,
         name: user.model.name.clone(),
         model_id: deployment.to_string(),
         kv_page_size: ENGINELESS_PAGE_SIZE as usize,
@@ -121,6 +122,17 @@ fn scheduler(runtime: &config::RuntimeConfig) -> runtime::bootstrap::SchedulerCo
     }
 }
 
+/// A kv page's bytes where the pool can change size; zero where it cannot.
+fn resizable_kv_page_bytes(pools: &engine::caps::PoolFacts) -> u64 {
+    if pools.slab_kv_page_bytes > 0 {
+        return pools.slab_kv_page_bytes;
+    }
+    pools
+        .elastic_page_bytes
+        .saturating_mul(pools.elastic_budget_pages)
+        / u64::from(pools.kv_pages.max(1))
+}
+
 fn build_model(
     m: &config::ModelConfig,
     runtime: &config::RuntimeConfig,
@@ -150,6 +162,9 @@ fn build_model(
             let disk_kept = kept_disk(m, group, &g);
             runtime::bootstrap::EngineConfig {
                 total_pages: g.caps.pools.kv_pages as usize,
+                resizable_kv_page_bytes: resizable_kv_page_bytes(&g.caps.pools),
+                pool_whole_at_load: g.caps.pools.slab_kv_page_bytes > 0,
+                elastic_state_slot_bytes: g.caps.pools.elastic_state_slot_bytes,
                 window_pages: g.caps.pools.window_pages,
                 window_tokens: g.caps.pools.window_tokens,
                 cpu_pages: g.caps.pools.host_kv_pages as usize,
@@ -192,6 +207,7 @@ fn build_model(
         .collect();
 
     Ok(runtime::bootstrap::ModelConfig {
+        memory_tolerance: m.memory_tolerance,
         name: m.name.clone(),
         model_id: engines_facts,
         kv_page_size: group0_caps.pools.kv_page_size as usize,

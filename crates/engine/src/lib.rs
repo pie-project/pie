@@ -10,7 +10,7 @@
 pub mod adapter;
 pub mod caps;
 pub mod channel;
-#[cfg(any(unix, windows))]
+#[cfg(any(unix, windows, target_arch = "wasm32"))]
 pub mod disk;
 pub mod engine;
 pub mod error;

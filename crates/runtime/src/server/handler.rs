@@ -35,10 +35,8 @@ impl Session {
                         let (mut u, mut t) = (0u64, 0u64);
                         for stores in crate::store::registry::all_for_model(0) {
                             crate::store::registry::with_kv_lock(&stores.kv, "other", |kv| {
-                                let capacity = kv.capacity_pages() as u64;
-                                let available = kv.available_pages() as u64;
-                                u += capacity - available;
-                                t += capacity;
+                                u += u64::from(kv.pages_out());
+                                t += u64::from(kv.capacity_pages());
                             });
                         }
                         (u, t)

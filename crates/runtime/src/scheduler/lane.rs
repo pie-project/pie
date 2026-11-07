@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow};
 
 use super::stats::SchedulerStats;
 
-use super::worker::{BindRespond, HostKvOp, PreLaunchCopy, QueuedItem};
+use super::worker::{BindRespond, HostKvOp, PoolOp, PreLaunchCopy, QueuedItem};
 
 pub(super) type LaunchResult = std::result::Result<SubmissionCompletion, String>;
 
@@ -133,8 +133,14 @@ fn fail_request(request: LaneRequest, why: &str) {
                 _ => {}
             }
             let commit = Lane::commit_on_failure(&item, why);
-            if let QueuedItem::HostKv { response, .. } = *item {
-                let _ = response.send(Err(anyhow!("{why}")));
+            match *item {
+                QueuedItem::HostKv { response, .. } => {
+                    let _ = response.send(Err(anyhow!("{why}")));
+                }
+                QueuedItem::Pool { response, .. } => {
+                    let _ = response.send(Err(anyhow!("{why}")));
+                }
+                _ => {}
             }
             let _ = reply.send(commit);
         }
@@ -481,7 +487,8 @@ impl Lane {
             }
             QueuedItem::CloseInstance { .. }
             | QueuedItem::CloseChannels { .. }
-            | QueuedItem::HostKv { .. } => LaneCommit::None,
+            | QueuedItem::HostKv { .. }
+            | QueuedItem::Pool { .. } => LaneCommit::None,
         }
     }
 
@@ -785,6 +792,20 @@ impl Lane {
                         LaneCommit::refused(message)
                     }
                 }
+            }
+            QueuedItem::Pool { op, response } => {
+                let result = backend(engine).and_then(|engine| {
+                    match op {
+                        PoolOp::Commit(pages) => engine.commit_pool(pages),
+                        PoolOp::Release(pages) => engine.release_pool(pages),
+                        PoolOp::CommitState(slots) => engine.commit_state(slots),
+                        PoolOp::ReleaseState(slots) => engine.release_state(slots),
+                        PoolOp::ReleaseScratch => engine.release_scratch(),
+                    }
+                    .map_err(anyhow::Error::from)
+                });
+                let _ = response.send(result);
+                LaneCommit::None
             }
             QueuedItem::HostKv { op, response } => {
                 let result = backend(engine).and_then(|engine| match op {

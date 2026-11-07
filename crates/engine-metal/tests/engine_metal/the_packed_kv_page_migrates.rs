@@ -207,16 +207,12 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
     };
 
     let mut pools = Pools::reserve(&rig.device, &trace, paging, &facts).expect("reserve packed KV");
-    // An elastic pool maps memory under the pages a frame states; the append
-    // below writes outside any frame, so the pages are stated here.
-    engine::frame::Supply::commit(
-        &mut pools,
-        engine::frame::Demand {
+    pools
+        .commit(engine::frame::Demand {
             kv_pages: PAGES as u32,
             ..engine::frame::Demand::ZERO
-        },
-    )
-    .expect("map the pages");
+        })
+        .expect("map the pages");
     let seats = seats(rig);
     let table = pools
         .table(&rig.handles, &seats, false)

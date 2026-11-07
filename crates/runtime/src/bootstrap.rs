@@ -115,6 +115,8 @@ pub struct RuntimeConfig {
 }
 
 pub struct ModelConfig {
+    /// How much congestion the system may show before this gives memory back.
+    pub memory_tolerance: crate::governor::Tolerance,
     pub name: String,
     pub model_id: String,
     pub kv_page_size: usize,
@@ -126,6 +128,13 @@ pub struct ModelConfig {
 
 pub struct EngineConfig {
     pub total_pages: usize,
+    /// Bytes a kv page takes where the pool can change size; zero: it cannot.
+    pub resizable_kv_page_bytes: u64,
+    /// The pool starts whole rather than growing on demand.
+    pub pool_whole_at_load: bool,
+    /// What a state slot takes where it gains memory as it is handed out;
+    /// zero: the load holds them whole.
+    pub elastic_state_slot_bytes: u64,
     pub window_pages: u32,
     pub window_tokens: u32,
     pub cpu_pages: usize,
@@ -251,6 +260,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let bound_port = config.port;
 
     let ModelConfig {
+        memory_tolerance,
         name,
         model_id,
         kv_page_size,
@@ -419,6 +429,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     )?;
 
     let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
+    let resizable: Vec<(u64, bool, u64)> = engine_configs
+        .iter()
+        .map(|d| {
+            (
+                d.resizable_kv_page_bytes,
+                d.pool_whole_at_load,
+                d.elastic_state_slot_bytes,
+            )
+        })
+        .collect();
     let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
     let arena_disk_pages: Vec<u32> = engine_configs.iter().map(|d| d.disk_pages).collect();
     let arena_disk_kept: Vec<Option<KeptDisk>> =
@@ -498,15 +518,28 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     // A planner for each engine: each holds its own kv pages, and a process
     // runs on one of them.
+    let mut extents = Vec::new();
     for engine in 0..engines.len().max(1) {
+        let mut pool = crate::planner::RegistryPool::new(arena_model_idx, engine, kv_swap_capable);
+        if let Some(&(page_bytes, whole, slot_bytes)) =
+            resizable.get(engine).filter(|(bytes, ..)| *bytes > 0)
+        {
+            let extent = crate::store::extent::Extent::new(
+                arena_model_idx,
+                engine,
+                page_bytes,
+                whole,
+                slot_bytes,
+            );
+            extents.push(extent.clone());
+            pool = pool.with_extent(extent);
+        }
         crate::planner::init_planner(
             arena_model_idx,
             engine,
-            crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
-                crate::planner::RegistryPool::new(arena_model_idx, engine, kv_swap_capable),
-            ))
-            .seated_first(seated_first)
-            .seat_to_end(seat_to_end),
+            crate::planner::ResidencyPlanner::new(std::sync::Arc::new(pool))
+                .seated_first(seated_first)
+                .seat_to_end(seat_to_end),
         );
     }
     // After the gates and the planner it orders exist.
@@ -611,6 +644,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     crate::scheduler::set_frame_size(scheduler.frame_size as usize);
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
+    for extent in &extents {
+        extent.start();
+        crate::governor::run::start(extent.clone(), memory_tolerance);
+    }
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,

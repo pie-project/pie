@@ -7,6 +7,9 @@ use anyhow::Result;
 use worker::embedded::{Embedded, Engine, Settings, Summary};
 
 pub const MODELS_DIR: &str = "/models";
+/// The OPFS directory of a tab's slot files. Its files are named per open, so
+/// there is no per-checkpoint directory to digest the artifact for.
+const KV_DIR: &str = "pie-kv";
 
 pub struct Mount {
     pub len: u64,
@@ -22,6 +25,7 @@ pub async fn boot(
     let artifact = PathBuf::from(MODELS_DIR).join(model_name);
     let mut config = settings.config(&artifact, &PathBuf::from("/"))?;
     config.server.worker_threads = 1;
+    config.model.disk_kv_dir = Some(PathBuf::from(KV_DIR));
     let Mount { len, fetch } = mount;
     ztensor::memfs::mount_lazy(&artifact, len, fetch);
     tracing::info!(

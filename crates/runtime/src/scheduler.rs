@@ -190,6 +190,16 @@ pub(crate) async fn write_host_kv(engine_id: usize, slots: Vec<u32>, bytes: Vec<
         .map(drop)
 }
 
+pub(crate) fn narrow(engine_id: usize, on: bool) {
+    if let Ok(scheduler) = scheduler_handle(engine_id) {
+        scheduler.narrow(on);
+    }
+}
+
+pub(crate) async fn pool(engine_id: usize, op: worker::PoolOp) -> Result<()> {
+    scheduler_handle(engine_id)?.pool(op).await
+}
+
 /// The engine's host-tier layout, once asked.
 pub(crate) async fn host_kv_layout(engine_id: usize) -> Option<state::PageLayout> {
     static LAYOUTS: std::sync::Mutex<Vec<Option<Option<state::PageLayout>>>> =

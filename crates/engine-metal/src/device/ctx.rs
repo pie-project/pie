@@ -203,9 +203,15 @@ impl Context {
     /// could not hand this one (app memory, wired and compressed pages; the
     /// file cache is counted as handed). Measured before a load wires anything,
     /// it is what `device_memory_share` yields to, as on CUDA. 0
-    /// where the system does not say.
+    /// where the system does not say, and where memory is mapped as it is
+    /// asked for: a pool sized by what others hold at the moment of the load
+    /// would serve differently for it, and the Governor answers them as they
+    /// change.
     #[must_use]
     pub fn held_elsewhere(&self) -> u64 {
+        if matches!(self.sparse(), Ok(Some(_))) {
+            return 0;
+        }
         available_memory().map_or(0, |available| {
             self.working_set
                 .saturating_sub(available.min(self.working_set))

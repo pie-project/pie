@@ -258,8 +258,16 @@ impl ResidencyPlanner {
             .map(|pid| held_page_count(pid, model, engine))
             .sum::<u32>()
             .saturating_add(self.port.reclaimable_idle());
-        let (free, total) = self.port.device_stats();
-        let device = ratio((free.saturating_add(reclaimable).min(total), total));
+        let (_, total) = self.port.device_stats();
+        // Over what is out, not what the target leaves: a low target holds
+        // no one back, and a launch held here would never raise it.
+        let device = ratio((
+            total
+                .saturating_sub(self.port.device_out())
+                .saturating_add(reclaimable)
+                .min(total),
+            total,
+        ));
         let mut bucket = (device.max(ratio((swap_free, swap_total))) * 255.0).round() as u8;
         if self.nonresident.load(Ordering::Acquire) != 0
             || self.waiters.load(Ordering::Acquire) != 0

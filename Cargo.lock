@@ -1733,6 +1733,7 @@ dependencies = [
  "serde",
  "state",
  "thiserror 2.0.21",
+ "web-std",
 ]
 
 [[package]]
@@ -5074,6 +5075,7 @@ dependencies = [
  "grammar",
  "http",
  "ipnet",
+ "libc",
  "lru",
  "media",
  "opentelemetry 0.33.1",

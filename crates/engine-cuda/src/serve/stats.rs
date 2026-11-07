@@ -149,6 +149,20 @@ impl Shell {
         self.accounting
     }
 
+    /// See `Engine::commit_pool`.
+    pub fn commit_pool(&mut self, kv_pages: u32) -> crate::Result<()> {
+        let state_slots = if self.pools.has_state() {
+            self.pools.paging().slots
+        } else {
+            0
+        };
+        self.pools.commit(engine::frame::Demand {
+            kv_pages,
+            state_slots,
+            workspace: 0,
+        })
+    }
+
     #[must_use]
     pub fn elastic(&self) -> (u64, u64, u64, u64) {
         (

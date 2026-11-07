@@ -282,7 +282,21 @@ enum SchedulerItem {
         op: HostKvOp,
         response: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
     },
+    Pool {
+        op: PoolOp,
+        response: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     Stop,
+}
+
+/// A change to how much of the pool has memory under it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PoolOp {
+    Commit(u32),
+    Release(u32),
+    CommitState(u32),
+    ReleaseState(u32),
+    ReleaseScratch,
 }
 
 /// A read or write of host kv slots' bytes, behind every copy queued before
@@ -422,6 +436,10 @@ pub(super) enum QueuedItem {
     HostKv {
         op: HostKvOp,
         response: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+    },
+    Pool {
+        op: PoolOp,
+        response: tokio::sync::oneshot::Sender<Result<()>>,
     },
     CloseInstance {
         id: ::engine::InstanceId,
@@ -865,6 +883,17 @@ impl SchedulerHandle {
 
     pub(crate) async fn host_kv(&self, op: HostKvOp) -> Result<Vec<u8>> {
         self.request(|response| SchedulerItem::HostKv { op, response })
+            .await?
+    }
+
+    /// Keeps waves to [`::engine::frame::NARROW_WAVE`], or stops.
+    pub(crate) fn narrow(&self, on: bool) {
+        self.inner.stats.narrow_waves.store(on, Ordering::Relaxed);
+    }
+
+    /// Between frames, on the lane that owns the engine.
+    pub(crate) async fn pool(&self, op: PoolOp) -> Result<()> {
+        self.request(|response| SchedulerItem::Pool { op, response })
             .await?
     }
 
@@ -1320,6 +1349,7 @@ impl BatchScheduler {
                 QueuedItem::RegisterChannelsBind { .. } => "RegisterChannelsBind".to_string(),
                 QueuedItem::CopyTracked { plan, .. } => format!("CopyTracked({})", plan.label()),
                 QueuedItem::HostKv { op, .. } => format!("HostKv({op:?})"),
+                QueuedItem::Pool { op, .. } => format!("Pool({op:?})"),
                 QueuedItem::CloseInstance { id, .. } => format!("CloseInstance {id}"),
                 QueuedItem::CloseChannels { ids } => format!("CloseChannels x{}", ids.len()),
             };
@@ -1537,6 +1567,9 @@ impl BatchScheduler {
             SchedulerItem::CopyTracked { plan, completion } => {
                 pending.push_back(QueuedItem::CopyTracked { plan, completion });
             }
+            SchedulerItem::Pool { op, response } => {
+                pending.push_back(QueuedItem::Pool { op, response });
+            }
             SchedulerItem::HostKv { op, response } => {
                 pending.push_back(QueuedItem::HostKv { op, response });
             }
@@ -1641,7 +1674,7 @@ impl BatchScheduler {
     const fn standalone_copy(item: &QueuedItem) -> bool {
         matches!(
             item,
-            QueuedItem::CopyTracked { .. } | QueuedItem::HostKv { .. }
+            QueuedItem::CopyTracked { .. } | QueuedItem::HostKv { .. } | QueuedItem::Pool { .. }
         )
     }
 
@@ -1738,6 +1771,7 @@ impl BatchScheduler {
             stopping,
         );
         let mut close_rotations = 0usize;
+        let mut rotated = false;
         let hold_closes = !stopping && frame_policy.has_pending_binds();
         let slot_blocks_lifecycle = in_flight_control.holds_launches();
         while let Some(item) = pending.front() {
@@ -1748,7 +1782,7 @@ impl BatchScheduler {
                         in_flight_control.copies_only(),
                         !slot_blocks_lifecycle,
                     ) {
-                        progress = true;
+                        rotated = true;
                         continue;
                     }
                     break;
@@ -1785,6 +1819,9 @@ impl BatchScheduler {
                         progress = true;
                         continue;
                     }
+                    // Launches and this close would swap places until its batch
+                    // lands, and a browser lands it only after the worker parks.
+                    rotated = false;
                     let rot_stop = close_rotations >= pending.len()
                         || !pending.iter().skip(1).any(|item| {
                             !matches!(
@@ -1830,7 +1867,7 @@ impl BatchScheduler {
             Self::post_control(engine_loop, replies, instances, in_flight_control, item);
             progress = true;
         }
-        (progress, wait_hint)
+        (progress || rotated, wait_hint)
     }
 
     fn post_control(
@@ -2580,6 +2617,64 @@ mod tests {
         a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
         a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
         a_launch_waits_for_the_copy_queued_ahead_of_it();
+        a_pass_that_only_reorders_lets_the_worker_park();
+    }
+
+    /// A browser's single thread lands the batch a close waits on only after
+    /// the worker parks, so a pass that reports progress here never ends.
+    fn a_pass_that_only_reorders_lets_the_worker_park() {
+        let instance = ::engine::InstanceId(1);
+        let mut pending = PendingQueue::default();
+        pending.push_back(QueuedItem::CloseInstance {
+            id: instance,
+            pacing_wait_id: 0,
+        });
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(Box::new(
+            PendingRequest {
+                lora_program: false,
+                logical_fire_id: 9,
+                request: crate::engine::FireRequest::default(),
+                instance_id: instance,
+                completion: crate::engine::WorkItemCompletion::new(1, 0),
+                process_id: None,
+                pipeline_id: None,
+                prelaunch_copy: None,
+                prelaunch_state_copy: None,
+                frame: Some(FrameStamp {
+                    lane: ProcessId::from_u128(5),
+                    seq: 0,
+                    slot: 0,
+                    fires: 1,
+                }),
+            },
+        ))));
+        let stats = Arc::new(SchedulerStats::default());
+        let mut lane = Lane::spawn(0, Some(Box::new(PanickingEngine)), Arc::clone(&stats));
+        let (progress, _) = BatchScheduler::dispatch_ready_items(
+            &lane,
+            &mut LaneReplies::default(),
+            &mut HashMap::new(),
+            &mut pending,
+            &mut VecDeque::new(),
+            &mut InFlightControls::default(),
+            16,
+            SchedulerLimits {
+                max_forward_requests: 8,
+                max_forward_tokens: 64,
+                max_page_refs: 64,
+                max_context: 0,
+                prefill_rows: 0,
+                max_readouts: 0,
+            },
+            &stats,
+            &mut FramePolicy::new(1, 64, 4096, None),
+            &mut ScanCache::default(),
+            &mut SlotBuffer::new(),
+            false,
+        );
+        assert!(!progress, "nothing left the queue");
+        assert_eq!(pending.len(), 2);
+        lane.shutdown();
     }
 
     fn a_launch_waits_for_the_copy_queued_ahead_of_it() {
