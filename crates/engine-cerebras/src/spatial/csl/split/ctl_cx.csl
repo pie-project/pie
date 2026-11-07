@@ -67,7 +67,7 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
 // bit 1: no handoff out (a test's last unit); runtime, so every unit shares the image).
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 8]u32);
+var rcfg = @zeros([RQ + 9]u32);
 var rcfg_ptr: [*]u32 = &rcfg;
 fn iqc(comptime qid: u16, c: u32) void {
   const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
@@ -79,6 +79,38 @@ fn oqc(comptime qid: u16, c: u32) void {
   const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
   @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
 }
+// Input-queue colours from the host without a transient duplicate (the fabric refuses two input
+// queues on one colour, even for a moment): a queue takes its colour only when no other queue still
+// holds it; a cycle goes through the host's spare colour (rcfg's tmp word).
+var qcur = [4]u16 { 13, 14, 17, 18 };
+fn iq_any(q: u16, c: u16) void {
+  if (q == 0) { iqc(2, c); }
+  else if (q == 1) { iqc(3, c); }
+  else if (q == 2) { iqc(4, c); }
+  else if (q == 3) { iqc(5, c); }
+}
+fn bind_iqs(fin: *[4]u16, tmp: u16) void {
+  var done = @zeros([4]u16);
+  var left: u16 = 4;
+  var guard: u16 = 0;
+  while (left > 0 and guard < 32) : (guard += 1) {
+    var prog = false;
+    var i: u16 = 0;
+    while (i < 4) : (i += 1) {
+      if (done[i] != 0) { continue; }
+      var clash = false;
+      var j: u16 = 0;
+      while (j < 4) : (j += 1) { if (j != i and done[j] == 0 and qcur[j] == fin.*[i]) { clash = true; } }
+      if (!clash) { iq_any(i, fin.*[i]); qcur[i] = fin.*[i]; done[i] = 1; left -= 1; prog = true; }
+    }
+    if (!prog) {
+      i = 0;
+      while (i < 4 and done[i] != 0) : (i += 1) {}
+      iq_any(i, tmp); qcur[i] = tmp;
+    }
+  }
+}
+
 fn init() void {
   const cc0 = color_config.get_color_config_addr(@get_color(0));
   var k: u16 = 0;
@@ -87,7 +119,8 @@ fn init() void {
     const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
     @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
   }
-  iqc(2, rcfg[RQ]); iqc(3, rcfg[RQ + 1]); iqc(4, rcfg[RQ + 2]); iqc(5, rcfg[RQ + 3]);
+  var fq = [4]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]) };
+  bind_iqs(&fq, @as(u16, rcfg[RQ + 8]));
   oqc(2, rcfg[RQ + 4]); oqc(3, rcfg[RQ + 5]); oqc(4, rcfg[RQ + 6]);
   timestamp.enable_tsc();
   sys_mod.unblock_cmd_stream();
