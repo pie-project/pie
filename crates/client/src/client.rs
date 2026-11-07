@@ -81,6 +81,19 @@ struct DownloadState {
     name: Option<String>,
 }
 
+/// How a process is launched, past its program and input.
+#[derive(Debug, Clone, Default)]
+pub struct Launch {
+    pub capture_outputs: bool,
+    pub session: Option<String>,
+    pub props: Props,
+    pub files: Files,
+    /// Moved into the process, each under its slot.
+    pub handles: Handles,
+    /// The names what the process gives lands on.
+    pub returns: Handles,
+}
+
 pub struct Client {
     inner: Arc<ClientInner>,
     reader_handle: task::JoinHandle<()>,
@@ -442,33 +455,29 @@ impl Client {
         props: Props,
         files: Files,
     ) -> Result<Process> {
-        self.launch_process_moving(
+        self.launch(
             inferlet,
             input,
-            capture_outputs,
-            session,
-            props,
-            files,
-            Handles::new(),
-            Handles::new(),
+            Launch {
+                capture_outputs,
+                session,
+                props,
+                files,
+                ..Default::default()
+            },
         )
         .await
     }
 
-    /// Launches with `handles` moved into the process, and `returns` the
-    /// names what it gives lands on.
-    #[allow(clippy::too_many_arguments, reason = "one launch, as the wire has it")]
-    pub async fn launch_process_moving(
-        &self,
-        inferlet: String,
-        input: String,
-        capture_outputs: bool,
-        session: Option<String>,
-        props: Props,
-        files: Files,
-        handles: Handles,
-        returns: Handles,
-    ) -> Result<Process> {
+    pub async fn launch(&self, inferlet: String, input: String, launch: Launch) -> Result<Process> {
+        let Launch {
+            capture_outputs,
+            session,
+            props,
+            files,
+            handles,
+            returns,
+        } = launch;
         let msg = ClientMessage::LaunchProcess {
             corr_id: 0,
             inferlet,

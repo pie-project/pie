@@ -1,7 +1,7 @@
 //! The Rust client against a real server, for `tests/handles/e2e.py`: argv is
 //! the uri, the program, a PNG and a viewer, and a JSON list of prompt tokens.
 
-use client::client::{Client, ProcessEvent};
+use client::client::{Client, Launch, ProcessEvent};
 use client::message::Handles;
 
 async fn turn(
@@ -17,15 +17,15 @@ async fn turn(
     });
     let moved = Handles::from([("ws".to_string(), ws)]);
     let mut process = client
-        .launch_process_moving(
+        .launch(
             prog.to_string(),
             input.to_string(),
-            true,
-            None,
-            Default::default(),
-            Default::default(),
-            moved.clone(),
-            moved,
+            Launch {
+                capture_outputs: true,
+                handles: moved.clone(),
+                returns: moved,
+                ..Default::default()
+            },
         )
         .await
         .expect("launch");
@@ -67,15 +67,15 @@ async fn main() {
     let input = serde_json::json!({"image": {"$handle": "image", "kind": "frames"}});
     let moved = Handles::from([("image".to_string(), up)]);
     let mut viewer = client
-        .launch_process_moving(
+        .launch(
             see.clone(),
             input.to_string(),
-            true,
-            None,
-            Default::default(),
-            Default::default(),
-            moved.clone(),
-            moved,
+            Launch {
+                capture_outputs: true,
+                handles: moved.clone(),
+                returns: moved,
+                ..Default::default()
+            },
         )
         .await
         .expect("launch");

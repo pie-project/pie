@@ -321,6 +321,10 @@ struct Cache {
     discard: fn(ProcessId),
     memory: fn() -> (u64, u64),
     swap: fn() -> (u64, u64),
+    /// Recurrent state slots on the device, then where they rest: capacity
+    /// and what is free, as `memory` and `swap` have it for kv.
+    state: fn() -> (u64, u64),
+    state_swap: fn() -> (u64, u64),
 }
 
 const STORES: Cache = Cache {
@@ -370,6 +374,29 @@ const STORES: Cache = Cache {
                 })
             })
             .fold((0, 0), |(c, a), (cc, aa)| (c + cc, a + aa))
+    },
+    state: || {
+        store_registry::all_for_model(0)
+            .iter()
+            .map(|stores| {
+                let rs = stores.rs.lock().unwrap();
+                (
+                    u64::from(rs.capacity().slots),
+                    u64::from(rs.available().slots),
+                )
+            })
+            .fold((0, 0), |(c, a), (cc, aa)| (c + cc, a + aa))
+    },
+    state_swap: || {
+        let stores = store_registry::all_for_model(0);
+        let capacity: u32 = stores
+            .iter()
+            .map(|stores| stores.rs.lock().unwrap().host_capacity().slots)
+            .sum();
+        let room: u32 = (0..stores.len())
+            .filter_map(|engine| crate::handle::state_room(Some(engine)))
+            .sum();
+        (u64::from(capacity), u64::from(room))
     },
     discard: |owner| {
         let mut freed = 0;
@@ -924,6 +951,23 @@ impl Plane for Snapshot {
                     };
                     Some(Value::Int((pages * u64::from(*page_size)) as i64))
                 }
+                // Hybrid models run out of these before they run out of kv.
+                // Free at rest is what more handles can still come to rest
+                // on: state has no disk tier, so past it they are refused.
+                "capacity-slots" | "used-slots" => {
+                    let (capacity, available) = (self.cache.state)();
+                    Some(Value::Int(match name {
+                        "capacity-slots" => capacity,
+                        _ => capacity.saturating_sub(available),
+                    } as i64))
+                }
+                "swap-capacity-slots" | "swap-used-slots" => {
+                    let (capacity, available) = (self.cache.state_swap)();
+                    Some(Value::Int(match name {
+                        "swap-capacity-slots" => capacity,
+                        _ => capacity.saturating_sub(available),
+                    } as i64))
+                }
                 _ => None,
             },
             _ => None,
@@ -975,6 +1019,8 @@ mod tests {
         discard: |_| {},
         memory: || (100, 40),
         swap: || (400, 300),
+        state: || (4, 1),
+        state_swap: || (8, 3),
     };
 
     fn arrive(registry: &mut Registry, tenant: &str, session: Option<&str>) -> ProcessId {
@@ -1086,6 +1132,8 @@ mod tests {
         discard: |_| {},
         memory: || (100, 40),
         swap: || (400, 300),
+        state: || (4, 1),
+        state_swap: || (8, 3),
     };
 
     #[test]
@@ -1261,6 +1309,10 @@ mod tests {
         assert_eq!(ws(gone, "tokens"), show(Some(Value::Int(64))));
         let worker = |name| show(plane.attr(&Subject::Worker(WORKER.to_string()), name));
         assert_eq!(worker("capacity-tokens"), show(Some(Value::Int(1600))));
+        assert_eq!(worker("capacity-slots"), show(Some(Value::Int(4))));
+        assert_eq!(worker("used-slots"), show(Some(Value::Int(3))));
+        assert_eq!(worker("swap-capacity-slots"), show(Some(Value::Int(8))));
+        assert_eq!(worker("swap-used-slots"), show(Some(Value::Int(5))));
         // 60 of 100 pages are taken, 6 of them by what is cached.
         assert_eq!(worker("used-tokens"), show(Some(Value::Int(864))));
         // 100 of 400 pages below the device hold suspended kv.
