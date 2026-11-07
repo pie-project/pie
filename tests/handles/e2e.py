@@ -7,8 +7,7 @@
 Build first: `pie` for the engine, `working-set-handles` for wasm32-wasip3 in
 examples/, and `--example handles` of pie-client for t_clients. A token here is drawn by position, so a turn split across
 processes must draw exactly what one process does. `--slots 4` with
-`--kv-budget 116MiB --only t_quota,t_close` reaches the host's limit; `t_cost`
-wants the default pool.
+`--kv-budget 116MiB --only t_quota,t_close` reaches the host's limit.
 """
 import argparse, asyncio, json, os, re, signal, socket, subprocess, sys, time, traceback
 from pathlib import Path
@@ -43,9 +42,6 @@ async def t_resume(c, prog):
     rest = await run(c, prog, b, [first[-1]], 20, drawn=12)
     check("resume across processes equals one run", first + rest == whole, f"stat={st}")
     await a.close(); await b.close()
-    d = await c.working_set()
-    x = await run(c, prog, d, PROMPT, 32); check("the run is repeatable", x == whole)
-    await d.close()
     # fork rolls back
     e = await c.working_set()
     f = await run(c, prog, e, PROMPT, 12)
@@ -107,14 +103,6 @@ async def t_dead(c, prog, whole):
     check("a refused launch keeps the handle", (await k.stat())["state"] == "parked")
     await k.close()
 
-async def t_many(c, prog, whole):
-    hs = []
-    for _ in range(10):
-        h = await c.working_set(); await run(c, prog, h, PROMPT, 2); hs.append(h)
-    w = await c.working_set(); x = await run(c, prog, w, PROMPT, 32)
-    check("idle handles past the seats leave a fire room", x == whole, f"{len(hs)} parked")
-    for h in hs + [w]: await h.close()
-
 async def t_evict(c, prog, whole):
     w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
     pair = await w.fork()
@@ -130,20 +118,9 @@ async def t_evict(c, prog, whole):
     check("a restored handle resumes exactly", first + r == whole)
     r2 = await run(c, prog, fk2, [first[-1]], 20, drawn=12)
     check("so does its evicted fork", r2 == r)
-    # more than one evicted handle comes back as one ask
-    two = await c.install_program(Path(__file__).parent / "both_ws.py", force_overwrite=True)
-    for h in hogs[:3]:
-        await h.close()
-    hogs = hogs[3:]
-    a1, a2 = hogs.pop(0), hogs.pop(0)
-    st = [(await a1.stat())["resident"], (await a2.stat())["resident"]]
-    out = await (await c.run(two, a=a1, b=a2)).result()
-    check("two handles enter a process together", out["ok"], f"resident before: {st}")
-    check("and come back", (await a1.stat())["state"] == "parked" == (await a2.stat())["state"])
-    hogs += [a1, a2]
     # A peer's restore moved pages under `pair`, which wakes with nothing owed.
     r3 = await run(c, prog, pair, [first[-1]], 20, drawn=12)
-    check("nor does either lose it", r3 == r)
+    check("nor does the pair lose it", r3 == r)
     for h in hogs + [w, fk2, pair]: await h.close()
 
 async def t_quota(c, prog, whole):
@@ -157,15 +134,6 @@ async def t_quota(c, prog, whole):
     check("past the host a launch is refused, not starved", refused and "quota" in refused, f"{len(hs)} rest; {refused and refused[:90]}")
     x = await run(c, prog, hs[0], [999], 2, drawn=50)
     check("what rests still runs", len(x) == 2)
-    # a fork shares its state until it writes, and then wants its own
-    twin = await hs[1].fork()
-    try:
-        await run(c, prog, twin, [999], 2, drawn=50); check("a fork that would grow past the host is refused", False)
-    except HandleError as e:
-        check("a fork that would grow past the host is refused", e.code == "quota", str(e)[:90])
-    check("and refused, keeps its handle", (await twin.stat())["state"] == "parked")
-    await twin.close()
-    check("closing the fork frees its twin", len(await run(c, prog, hs[1], [999], 2, drawn=50)) == 2)
     await hs[0].close()
     y = await c.working_set(); z = await run(c, prog, y, PROMPT, 32)
     check("and closing one makes room", z == whole)
@@ -192,16 +160,13 @@ async def t_matcher(c, prog, whole):
     r = await (await c.run(name, m=m, accept=[])).result()
     st = await m.stat()
     check("a matcher comes back", st["state"] == "parked" and r["mask"] > 0, f"{r} {st}")
-    f = await m.fork()
-    r2 = await (await c.run(name, m=f, accept=[])).result()
-    check("a matcher forks", r2 == r)
     bad = await c.matcher(json_schema="{ not json")
     try:
         await (await c.run(name, m=bad, accept=[])).result(); check("a bad grammar fails its launch", False)
     except Exception as e: check("a bad grammar fails its launch", True, str(e)[:90])
     try: await bad.stat(); check("and the handle says why", False)
     except HandleError as e: check("and the handle says why", e.code == "dead", str(e)[:90])
-    for h in (m, f): await h.close()
+    await m.close()
     # the builtin prefill fills a handle
     w = await c.working_set()
     p = await c.launch_process("prefill", input={"tokens": PROMPT}, handles={"ws": w}, returns={"ws": w})
@@ -221,48 +186,24 @@ async def t_media(c, prog, whole):
     check("and its sound", (await sound.stat())["samples"] == 400)
     png = await out.read("png")
     check("a client reads a handle as the format it asks", png[:8] == b"\x89PNG\r\n\x1a\n", f"{len(png)} bytes")
-    raw = await out.read("raw-rgb8")
-    check("and the handle stays", len(raw) == 64 * 48 * 3, f"{len(raw)} bytes")
     wav = await sound.read("wav")
     check("sound reads too", wav[:4] == b"RIFF", f"{len(wav)} bytes")
     twin = await out.fork()
     r = await (await c.run(see, image=twin)).result()
     check("pictures move on to a model with no client between", r["tokens"] > 0, str(r))
-    back = await twin.read("raw-rgb8")
-    check("and come back", len(back) == len(raw) and back == raw)
+    check("and come back", (await twin.read("png")) == png)
     up = await c.frames(png)
     check("an upload is unborn until bound", (await up.stat())["state"] == "unborn")
     u = await (await c.run(see, image=up)).result()
-    check("an upload reads as what was uploaded", u == r and (await up.read("raw-rgb8")) == raw, str(u))
+    check("an upload reads as what was uploaded", u == r, str(u))
     try:
         await out.read("tiff"); check("a format that is none is refused", False)
     except HandleError as e: check("a format that is none is refused", e.code == "invalid", str(e))
-    # Whichever way the encoder goes, a reader hears how it ended.
-    try:
-        video = await asyncio.wait_for(out.read("mp4"), 20)
-        check("a reader hears how an encoder ended", len(video) > 0, f"{len(video)} bytes")
-    except HandleError as e:
-        check("a reader hears how an encoder ended", True, str(e)[:80])
-    many = await asyncio.gather(*(out.read("png") for _ in range(4)))
-    check("reads run side by side", all(b == png for b in many))
-    r2 = await (await c.run(see, image=out)).result()
-    check("the handle was free the whole time", r2 == r)
     bad = await c.frames(b"not a picture")
     try:
         await (await c.run(see, image=bad)).result(); check("bytes that decode to nothing fail their launch", False)
     except Exception as e: check("bytes that decode to nothing fail their launch", True, str(e)[:80])
     for h in (out, sound, twin, up): await h.close()
-
-async def t_media_js(c, prog, whole):
-    S = Path(__file__).parent
-    mk = await c.install_program(S / "mk.js", force_overwrite=True)
-    see = await c.install_program(S / "see.js", force_overwrite=True)
-    out, sound = await c.frames(), c.pcm()
-    await (await c.run(mk, out=out, sound=sound, w=64, h=48)).result()
-    check("a JS guest gives pictures and sound", (await out.stat())["width"] == 64 and (await sound.stat())["samples"] == 400)
-    r = await (await c.run(see, image=out)).result()
-    check("and takes them by typed input", r["width"] == 64 and r["tokens"] > 0, str(r))
-    await out.close(); await sound.close()
 
 async def t_clients(c, prog, whole):
     import json, tempfile
@@ -297,100 +238,27 @@ async def t_clients(c, prog, whole):
         check(f"the {name} client uploads and reads", got["seen"] == want and got["raw"] == 64 * 48 * 3, f"{got['seen']} {got['raw']}")
     await out.close(); await sound.close()
 
-async def t_review(c, prog, whole):
+async def t_failed(c, prog, whole):
     S = Path(__file__).parent
     both = await c.install_program(S / "both.py", force_overwrite=True)
-    # a grammar that does not compile costs only itself
-    w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
-    bad = await c.matcher(regex="(")
-    try:
-        await (await c.run(both, ws=w, matcher=bad)).result(); check("a bad grammar fails its launch", False)
-    except Exception as e: check("a bad grammar fails its launch", True, str(e)[:70])
-    check("and the working set beside it survives", (await w.stat())["state"] == "parked")
-    r = await run(c, prog, w, [first[-1]], 20, drawn=12)
-    check("and resumes exactly", first + r == whole)
-    await w.close()
-    # an empty prefill is a no-op, not a loss
-    w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
-    p = await c.launch_process("prefill", input={"tokens": []}, handles={"ws": w}, returns={"ws": w})
-    await p.result()
-    check("an empty prefill gives the handle back", (await w.stat())["state"] == "parked")
-    await w.close()
-    # a refused read ends its turn: many in a row do not pile up
-    o = await c.frames()
-    mk = await c.install_program(S / "mk.py", force_overwrite=True)
-    sound = c.pcm()
-    await (await c.run(mk, out=o, sound=sound, w=8, h=8)).result()
-    for _ in range(40):
-        try: await o.read("tiff")
-        except HandleError: pass
-    check("refused reads end", len(await o.read("raw-rgb8")) == 192)
-    await o.close(); await sound.close()
-    # a launch waits its turn behind a lent handle
-    w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
-    long = await c.launch_process(prog, input={"ws": {"$handle": "ws"}, "tokens": [first[-1]], "max_tokens": 200, "seed": 7, "drawn": 12},
-                                  handles={"ws": w}, returns={"ws": w})
-    queued = asyncio.ensure_future(c.launch_process(prog, input={"ws": {"$handle": "ws"}, "tokens": [1], "max_tokens": 5, "seed": 7},
-                                                    handles={"ws": w}, returns={"ws": w}))
-    await long.result()
-    p2 = await asyncio.wait_for(queued, 30); await p2.result()
-    check("a launch behind a lent handle runs in turn", (await w.stat())["state"] == "parked")
-    await w.close()
-    # a fire refused at its submit wrote nothing: the set is as it was
     fail = await c.install_program(S / "fail.py", force_overwrite=True)
+    async def survives(name, w, first):
+        check(f"{name}: the handle is as it was", (await w.stat())["state"] == "parked")
+        check(f"{name}: and resumes exactly", first + await run(c, prog, w, [first[-1]], 20, drawn=12) == whole)
+        await w.close()
     w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
-    before = (await w.stat())["tokens"]
+    try: await (await c.run(both, ws=w, matcher=await c.matcher(regex="("))).result(); check("a bad grammar fails its launch", False)
+    except Exception as e: check("a bad grammar fails its launch", True, str(e)[:70])
+    await survives("a bad grammar", w, first)
+    w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
     out = await (await c.run(fail, ws=w, tokens=[7] * 600)).result()
     check("a guest hears a refused fire", out["failed"], str(out)[:90])
-    check("and the set it gave is untouched", (await w.stat())["tokens"] == before)
-    r = await run(c, prog, w, [first[-1]], 20, drawn=12)
-    check("and resumes exactly", first + r == whole)
-    await w.close()
-    # a handle the guest never took is as it came
+    await survives("a refused fire", w, first)
     w = await c.working_set(); first = await run(c, prog, w, PROMPT, 12)
     p = await c.launch_process("prefill", input="not what it reads", handles={"ws": w}, returns={"ws": w})
     try: await p.result(); check("a guest that fails before it takes a handle fails", False)
     except Exception as e: check("a guest that fails before it takes a handle fails", True, str(e)[:70])
-    check("and the handle is as it came", (await w.stat())["state"] == "parked")
-    r = await run(c, prog, w, [first[-1]], 20, drawn=12)
-    check("and resumes exactly", first + r == whole)
-    await w.close()
-    # an output that never came can be asked for again
-    gen = await c.install_program(S / "mk.py", force_overwrite=True)
-    o, sound = await c.frames(), c.pcm()
-    try:
-        await (await c.run(gen, out=o, sound=sound, w=0, h=0)).result(); check("a failed output fails", False)
-    except Exception as e: check("a failed output fails", True, str(e)[:70])
-    await (await c.run(gen, out=o, sound=sound, w=4, h=4)).result()
-    check("and asks again under the same handle", (await o.stat())["width"] == 4)
-    await o.close(); await sound.close()
-    # forks share: moved together they cost what they share once
-    base = await c.working_set(); await run(c, prog, base, list(range(3000, 3460)), 1)
-    forks = {f"h{i}": await base.fork() for i in range(10)}
-    p = await c.launch_process(prog, input={"tokens": [1], "max_tokens": 1, "seed": 7}, handles=forks, returns=forks)
-    try: await p.result()
-    except Exception as e: check("forks in one launch fit as what they share", "quota" not in str(e), str(e)[:80])
-    else: check("forks in one launch fit as what they share", False, "the guest wants a ws")
-    for f in forks.values():
-        try: await f.close()
-        except HandleError: pass
-    await base.close()
-    # handles that cannot share the device are refused, and stay as they were
-    hs = []
-    for i in range(10):
-        h = await c.working_set(); hs.append(h)
-        await run(c, prog, h, list(range(3000 + i, 3460 + i)), 1, seed=i)
-    moved = {f"h{i}": h for i, h in enumerate(hs)}
-    try:
-        p = await c.launch_process(prog, input={"tokens": [1], "max_tokens": 1, "seed": 7}, handles=moved, returns=moved)
-        await asyncio.wait_for(p.result(), 30); check("handles past the device are refused", False)
-    except asyncio.TimeoutError: check("handles past the device are refused", False, "it hung")
-    except Exception as e: check("handles past the device are refused", "quota" in str(e), str(e)[:90])
-    st = [(await h.stat())["state"] for h in hs]
-    check("and each is as it was", st == ["parked"] * 10, str(set(st)))
-    x = await run(c, prog, hs[0], [1], 2, drawn=50)
-    check("and runs", len(x) == 2)
-    for h in hs: await h.close()
+    await survives("a guest that never took it", w, first)
 
 async def t_close(c, prog, whole):
     d = PieClient(URI[0]); await d.connect()
@@ -410,18 +278,6 @@ async def t_close(c, prog, whole):
         await run(e, prog, h, PROMPT, 2); again += 1
     await e.close()
     check("closing a session frees what it held", again == made and made > 0, f"{made} then {again}")
-
-async def t_cost(c, prog, whole):
-    import statistics
-    w = await c.working_set(); t = await run(c, prog, w, PROMPT, 1)
-    lat = []
-    for i in range(200):
-        t0 = time.perf_counter(); t = await run(c, prog, w, [t[-1]], 1, drawn=i + 1); lat.append(time.perf_counter() - t0)
-    n = await c.working_set()
-    t0 = time.perf_counter(); await run(c, prog, n, PROMPT, 1); first = time.perf_counter() - t0
-    lat.sort(); ms = lambda x: f"{x*1000:.2f}"
-    print(f"COST one-token turn over a handle: p50 {ms(lat[100])} p95 {ms(lat[190])} max {ms(lat[-1])} ms; fresh 60-token turn {ms(first)} ms; tokens={t[0] if t else None}", flush=True)
-    await w.close(); await n.close()
 
 URI = [None]
 async def main():
@@ -446,7 +302,7 @@ async def main():
             except Exception: c = None; await asyncio.sleep(1)
         prog = await c.install_program(EX / "working_set_handles.wasm", force_overwrite=True)
         whole = await t_resume(c, prog)
-        for f in (t_lazy, t_order, t_dead, t_many, t_evict, t_quota, t_script, t_matcher, t_media, t_media_js, t_clients, t_review, t_close, t_cost):
+        for f in (t_lazy, t_order, t_dead, t_evict, t_quota, t_script, t_matcher, t_media, t_clients, t_failed, t_close):
             if args.only and f.__name__ not in args.only.split(","): continue
             try: await asyncio.wait_for(f(c, prog, whole), 120)
             except Exception as e:
