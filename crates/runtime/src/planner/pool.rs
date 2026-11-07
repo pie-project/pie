@@ -42,6 +42,8 @@ pub trait PoolPort: Send + Sync + 'static {
         &self,
         keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
         room: usize,
+        order: &[crate::store::kv::page_table::WorkingSetId],
+        wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn>;
     fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn>;
 }
@@ -198,14 +200,18 @@ impl PoolPort for RegistryPool {
         &self,
         keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
         room: usize,
+        order: &[crate::store::kv::page_table::WorkingSetId],
+        wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         if !self.suspend_capable {
             return None;
         }
-        self.with_kv_tagged("planner-sweep", |kv| kv.prepare_sweep(keep, room))
-            .inspect_err(|error| tracing::warn!(%error, "planner: sweep prepare failed"))
-            .ok()
-            .flatten()
+        self.with_kv_tagged("planner-sweep", |kv| {
+            kv.prepare_sweep(keep, room, order, wanted)
+        })
+        .inspect_err(|error| tracing::warn!(%error, "planner: sweep prepare failed"))
+        .ok()
+        .flatten()
     }
 
     fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn> {

@@ -8,6 +8,7 @@ members = [
     "priority",
     "fair",
     "deadline",
+    "keep-handles",
     "keep-session",
     "offload",
     "session-affinity",

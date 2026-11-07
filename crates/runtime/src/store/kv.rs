@@ -1785,12 +1785,14 @@ impl KvStore {
         &mut self,
         keep: &HashSet<WorkingSetId>,
         room: usize,
+        order: &[WorkingSetId],
+        wanted: usize,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
-        let mut pages = self.table.stranded_pages(keep);
+        let mut pages = self.table.stranded_pages(keep, order, wanted);
         if self.swap_available() < pages.len().min(room) {
             self.drop_entries_off_device();
             // Dropping can compact the pages just listed: list them again.
-            pages = self.table.stranded_pages(keep);
+            pages = self.table.stranded_pages(keep, order, wanted);
         }
         let available = self.make_swap_room(pages.len().min(room));
         pages.truncate(room.min(available));

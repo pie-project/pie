@@ -68,6 +68,18 @@ pub struct Arrival {
     pub props: Props,
 }
 
+/// A resting handle, for the worker policy to read.
+#[derive(Debug, Clone)]
+pub(crate) struct Resting {
+    pub client: crate::server::ClientId,
+    pub tenant: String,
+    pub session: Option<String>,
+    pub props: Props,
+    pub tokens: u64,
+    pub folded: u64,
+    pub slots: u32,
+}
+
 /// Each is a no-op when no policy is loaded.
 #[derive(Debug, Clone)]
 pub(crate) enum Event {
@@ -84,6 +96,14 @@ pub(crate) enum Event {
     Offloaded(ProcessId, String, u32),
     /// A pass meant for another worker ran here instead, and why.
     OffloadFailed(ProcessId, String),
+    /// A working set a client holds came to rest, under an id it keeps for
+    /// life.
+    HandleRested(ProcessId, Resting),
+    /// All its props, and which of them changed.
+    HandleProps(ProcessId, Props, Vec<String>),
+    /// A process has it now: out of the policy's reach until it rests again.
+    HandleLent(ProcessId),
+    HandleGone(ProcessId, By),
     /// The session id is `<tenant>/<session>`.
     SessionProps(String, Props),
     SessionClosed(String),

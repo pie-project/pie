@@ -135,7 +135,7 @@ impl ResidencyPlanner {
 
     /// Not what the head and restores under way read: they would bring it
     /// straight back.
-    pub(super) fn sweep_stranded(self: &Arc<Self>) -> bool {
+    pub(super) fn sweep_stranded(self: &Arc<Self>, wanted: u32) -> bool {
         if self.sweep_exhausted.load(Ordering::Acquire)
             || self.sweeping.swap(true, Ordering::AcqRel)
         {
@@ -144,6 +144,24 @@ impl ResidencyPlanner {
         let (swap_free, swap_total) = self.swap_stats();
         let room = swap_free.saturating_sub(swap_total / HOST_RESERVE_DIVISOR) as usize;
         let (model, engine) = self.port.locus();
+        // What rests goes in the order it would be evicted, and no more of
+        // it than is wanted: a policy's keys hold here too.
+        let order: Vec<_> = self
+            .with_inner(|inner| {
+                let mut holders: Vec<_> = inner
+                    .procs
+                    .iter()
+                    .filter(|(_, proc)| proc.holder)
+                    .map(|(pid, proc)| (std::cmp::Reverse(proc.rank()), *pid))
+                    .collect();
+                holders.sort_unstable();
+                holders
+            })
+            .into_iter()
+            .flat_map(|(_, pid)| {
+                crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine)
+            })
+            .collect();
         let keep: HashSet<_> = self
             .with_inner(|inner| {
                 let mut pids: Vec<ProcessId> = inner
@@ -161,7 +179,10 @@ impl ResidencyPlanner {
             })
             .collect();
         let txn = (room > 0)
-            .then(|| self.port.prepare_sweep(&keep, room))
+            .then(|| {
+                self.port
+                    .prepare_sweep(&keep, room, &order, wanted as usize)
+            })
             .flatten();
         let Some(txn) = txn else {
             self.sweeping.store(false, Ordering::Release);
@@ -232,6 +253,7 @@ impl ResidencyPlanner {
             inner.next_seq += 1;
             let mut proc = Proc::new(0);
             proc.rest(seq);
+            proc.kept = holder_key(pid);
             proc.holder = true;
             proc.admitted = true;
             proc.idle = true;
@@ -244,6 +266,23 @@ impl ResidencyPlanner {
         });
         self.re_arm_idle_reclaim();
         self.poke();
+    }
+
+    /// Reads each holder's retention key again: the table has changed.
+    pub fn rekey_holders(&self) {
+        self.with_inner(|inner| {
+            for (pid, proc) in inner.procs.iter_mut().filter(|(_, proc)| proc.holder) {
+                proc.kept = holder_key(*pid);
+            }
+        });
+    }
+
+    /// Whether a holder's state is on the device, if it is one here.
+    pub fn holder_resident(&self, pid: ProcessId) -> Option<bool> {
+        self.with_inner(|inner| {
+            let proc = inner.procs.get(&pid).filter(|proc| proc.holder)?;
+            Some(proc.state == Residency::Resident)
+        })
     }
 
     /// The recurrent slots holders keep on the device, a slot forks share
@@ -759,4 +798,10 @@ impl ResidencyPlanner {
         self.with_inner(|inner| inner.accum.absorb(reservation));
         true
     }
+}
+
+/// What the whole of a holder keeps: a key on a prefix keeps only that prefix.
+fn holder_key(pid: ProcessId) -> i64 {
+    use crate::policy::retention::{Installed, Keys};
+    Installed.key_at(Some(pid), u64::MAX)
 }

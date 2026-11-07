@@ -7,7 +7,9 @@
 Build first: `pie` for the engine, `working-set-handles` for wasm32-wasip3 in
 examples/, and `--example handles` of pie-client for t_clients. A token here is drawn by position, so a turn split across
 processes must draw exactly what one process does. `--slots 4` with
-`--kv-budget 116MiB --only t_quota,t_close` reaches the host's limit.
+`--kv-budget 116MiB --only t_quota,t_close` reaches the host's limit. A policy
+gets its own runs: `--policy keep-handles --only t_keep --ctx 512 --slots 12
+--kv-budget 216MiB`, and `--only t_weak --ctx 512 --slots 4 --kv-budget 116MiB`.
 """
 import argparse, asyncio, json, os, re, signal, socket, subprocess, sys, time, traceback
 from pathlib import Path
@@ -23,7 +25,7 @@ a = argparse.ArgumentParser()
 a.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
 a.add_argument("--ctx", type=int, default=0); a.add_argument("--slots", type=int, default=0)
 a.add_argument("--kv-budget", default=""); a.add_argument("--log", required=True)
-a.add_argument("--only", default="")
+a.add_argument("--only", default=""); a.add_argument("--policy", default="")
 args = a.parse_args()
 PROMPT = list(range(1000, 1060))
 results = []
@@ -138,6 +140,49 @@ async def t_quota(c, prog, whole):
     y = await c.working_set(); z = await run(c, prog, y, PROMPT, 32)
     check("and closing one makes room", z == whole)
     for h in hs[1:] + [y]: await h.close()
+
+async def t_keep(c, prog, whole):
+    N = 300
+    kept = await c.working_set(); await run(c, prog, kept, list(range(3000, 3000 + N)), 2)
+    await kept.set_props({"keep": 10}); await asyncio.sleep(0.2)
+    hogs = []
+    for i in range(10):
+        h = await c.working_set(); hogs.append(h)
+        await run(c, prog, h, list(range(4000 + 500 * i, 4000 + 500 * i + N)), 2)
+        rest = [(await x.stat())["resident"] for x in hogs]
+        if not all(rest): break
+    check("the policy's key outranks age at rest", (await kept.stat())["resident"] and not all(rest), str(rest))
+    await run(c, prog, kept, [1], 2, drawn=80)
+    check("props stay through a lend", True)
+    bad = None
+    try: await kept.set_props({"": 1})
+    except HandleError as e: bad = e
+    check("a bad prop is refused", bad is not None and bad.code == "invalid", str(bad))
+    t = asyncio.ensure_future(run(c, prog, kept, [1], 2, drawn=40))
+    await asyncio.sleep(0); await asyncio.sleep(0.005)
+    await kept.set_props({"keep": 30}); await t
+    check("sent while lent, they land with it", True)
+    for h in hogs + [kept]: await h.close()
+
+async def t_weak(c, prog, whole):
+    strong = await c.working_set(); await run(c, prog, strong, PROMPT, 2)
+    weak, refused = [], None
+    for i in range(24):
+        h = await c.working_set()
+        try:
+            await run(c, prog, h, PROMPT, 2); await h.set_props({"weak": True, "keep": i}); weak.append(h)
+        except Exception as e: refused = str(e); break
+        await asyncio.sleep(0.05)
+    check("weak handles make room: no launch was refused", refused is None, str(refused))
+    dead = []
+    for h in weak:
+        try: await h.stat()
+        except HandleError as e: dead.append(e)
+    check("a policy's discard is heard, by name", dead and all(e.code == "dead" and "keep-handles" in str(e) for e in dead), f"{len(dead)}/{len(weak)} {dead[:1]}")
+    check("the rest stands", (await strong.stat())["state"] == "parked")
+    y = await c.working_set(); z = await run(c, prog, y, PROMPT, 32)
+    check("and runs on", z == whole)
+    await strong.close(); await y.close()
 
 async def t_script(c, prog, whole):
     S = Path(__file__).parent
@@ -287,6 +332,7 @@ async def main():
     t = re.sub(r'^source = "[^"]*"', f'source = "{args.model}"', t, flags=re.M)
     t = re.sub(r'^listen = "[^"]*"', f'listen = "127.0.0.1:{port}"', t, flags=re.M)
     if args.kv_budget: t = t.replace('# device_kv_budget     = "20GiB"', f'device_kv_budget = "{args.kv_budget}"')
+    if args.policy: t = t.replace('# worker_policy            = "noop"', f'worker_policy = "{args.policy}"')
     if args.ctx: t = t.replace("# max_model_len   = 32768", f"max_model_len = {args.ctx}\n#")
     if args.slots: t = t.replace("# max_state_slots = 256", f"max_state_slots = {args.slots}\n#")
     cfg.write_text(t)
@@ -302,8 +348,9 @@ async def main():
             except Exception: c = None; await asyncio.sleep(1)
         prog = await c.install_program(EX / "working_set_handles.wasm", force_overwrite=True)
         whole = await t_resume(c, prog)
-        for f in (t_lazy, t_order, t_dead, t_evict, t_quota, t_script, t_matcher, t_media, t_clients, t_failed, t_close):
+        for f in (t_lazy, t_order, t_dead, t_evict, t_quota, t_script, t_matcher, t_media, t_clients, t_failed, t_close, t_keep, t_weak):
             if args.only and f.__name__ not in args.only.split(","): continue
+            if not args.only and f in (t_keep, t_weak): continue
             try: await asyncio.wait_for(f(c, prog, whole), 120)
             except Exception as e:
                 check(f.__name__, False, repr(e)[:300]); traceback.print_exc()

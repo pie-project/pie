@@ -69,7 +69,7 @@ pub enum GrammarSource {
 
 /// What a client can do to a handle without running anything: its lifetime,
 /// never its contents. Computing on one is a process's.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum HandleOp {
     /// Names an empty handle. Nothing exists until a process binds it.
@@ -88,15 +88,22 @@ pub enum HandleOp {
     Stat {
         name: HandleName,
     },
+    /// Merges `props`, as a process's are merged, for the worker policy to
+    /// read while the handle rests. A fork starts with none.
+    SetProps {
+        name: HandleName,
+        props: Props,
+    },
 }
 
 impl HandleOp {
     /// The names this op needs settled before it runs.
     pub fn touches(&self) -> impl Iterator<Item = HandleName> {
         let (first, second) = match self {
-            HandleOp::New { name, .. } | HandleOp::Close { name } | HandleOp::Stat { name } => {
-                (*name, None)
-            }
+            HandleOp::New { name, .. }
+            | HandleOp::Close { name }
+            | HandleOp::Stat { name }
+            | HandleOp::SetProps { name, .. } => (*name, None),
             HandleOp::Fork { name, from } => (*name, Some(*from)),
         };
         std::iter::once(first).chain(second)

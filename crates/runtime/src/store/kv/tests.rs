@@ -586,12 +586,12 @@ fn a_suspend_takes_shared_pages_to_the_host_in_place() {
     store.retire_idle();
     assert!(
         store
-            .prepare_sweep(&HashSet::from([c]), usize::MAX)
+            .prepare_sweep(&HashSet::from([c]), usize::MAX, &[], usize::MAX)
             .unwrap()
             .is_none()
     );
     let sweep = store
-        .prepare_sweep(&HashSet::new(), usize::MAX)
+        .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX)
         .unwrap()
         .unwrap();
     let mut granted = store.reserve_device_pages(4).unwrap();
@@ -676,7 +676,7 @@ fn a_sweep_suspends_only_the_readers_of_what_it_moves() {
     // Suspended with nothing moved, as a kv-less eviction leaves them.
     store.mark_suspended(&HashSet::from([a, b]));
     let sweep = store
-        .prepare_sweep(&HashSet::new(), 2)
+        .prepare_sweep(&HashSet::new(), 2, &[], usize::MAX)
         .unwrap()
         .expect("room for two pages");
     assert_eq!(sweep.page_count(), 2);
@@ -694,7 +694,7 @@ fn a_sweep_suspends_only_the_readers_of_what_it_moves() {
     // It runs: the next sweep leaves it alone.
     assert!(
         store
-            .prepare_sweep(&HashSet::new(), usize::MAX)
+            .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX)
             .unwrap()
             .is_none()
     );

@@ -1436,10 +1436,13 @@ impl KvPageTable {
         Ok(staying)
     }
 
-    /// A running reader kept them on the device and has gone since.
+    /// A running reader kept them on the device and has gone since: readers
+    /// in `order`, then the rest, until `wanted` pages are found.
     pub fn stranded_pages(
         &self,
         keep: &HashSet<WorkingSetId>,
+        order: &[WorkingSetId],
+        wanted: usize,
     ) -> Vec<(TriePageLocation, PhysicalKvPageId)> {
         let mut running = FxHashSet::default();
         for (ws, entry) in self.working_sets.iter() {
@@ -1456,8 +1459,21 @@ impl KvPageTable {
         }
         // Reader by reader, so a sweep short of room moves whole readers.
         let (mut seen, mut pages) = (FxHashSet::default(), Vec::new());
-        for (ws, entry) in self.working_sets.iter() {
-            if !entry.suspended {
+        let ordered: FxHashSet<_> = order.iter().copied().collect();
+        let rest = self.working_sets.iter().map(|(ws, _)| ws);
+        for ws in order
+            .iter()
+            .copied()
+            .chain(rest.filter(|ws| !ordered.contains(ws)))
+        {
+            if pages.len() >= wanted {
+                break;
+            }
+            if !self
+                .working_sets
+                .get(ws)
+                .is_some_and(|entry| entry.suspended)
+            {
                 continue;
             }
             let _ = self.visit_working_set_locations(ws, |location| {

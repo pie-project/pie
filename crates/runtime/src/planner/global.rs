@@ -147,6 +147,12 @@ pub fn planner_of(pid: ProcessId) -> Option<Arc<ResidencyPlanner>> {
     planner_for(0, engine_of(pid))
 }
 
+pub fn rekey_holders() {
+    for planner in planners() {
+        planner.rekey_holders();
+    }
+}
+
 /// Every engine's planner, engine 0's first: for what frees pages or
 /// changes the order on all of them.
 pub fn planners() -> Vec<Arc<ResidencyPlanner>> {

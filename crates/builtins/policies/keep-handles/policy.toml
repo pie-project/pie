@@ -1,0 +1,13 @@
+# Orders resting handles by what their client says of them, and drops the ones
+# it says it can lose when recurrent state runs short.
+plane = "worker"
+subscribe = ["retained", "discarded", "prop-changed"]
+grants = ["retention", "discard"]
+
+[props.keep]
+type = "int"
+doc = "A resting handle's retention key: the lowest leaves the device first."
+
+[props.weak]
+type = "bool"
+doc = "This handle may be discarded to make room for others to rest."

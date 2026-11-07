@@ -551,7 +551,10 @@ impl Session {
         }
 
         let room = crate::handle::state_room;
-        let lease = match self.handles.lend(self.id, handles, returns, room) {
+        let lease = match self
+            .handles
+            .lend(self.id, handles, returns, session.as_deref(), room)
+        {
             Ok(lease) => lease,
             Err(why) => {
                 self.send_response(corr_id, false, why.to_string()).await;

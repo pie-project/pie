@@ -3,14 +3,19 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use client_api::{GrammarSource, HandleErrorCode, HandleKind, HandleName, HandleOp, Handles};
+use client_api::{
+    GrammarSource, HandleErrorCode, HandleKind, HandleName, HandleOp, Handles, Props,
+};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use super::held::Held;
 use super::lease::{Bound, Lease};
 use super::{HandleError, MAX_HANDLES, MAX_MEDIA_BYTES};
+use crate::inferlet::ProcessId;
 use crate::inferlet::host::frames::{Frames, Pcm};
 use crate::inferlet::host::grammar::Matcher;
+use crate::policy::{self, By, Event, Resting};
 use crate::server::ClientId;
 use crate::store::registry as store_registry;
 
@@ -56,6 +61,26 @@ impl Slot {
     }
 }
 
+/// What a name keeps through every move of what it holds.
+#[derive(Debug)]
+struct Meta {
+    /// How the worker policy knows it, for its whole life.
+    id: ProcessId,
+    props: Props,
+    /// The session of the launch that last had it.
+    session: Option<String>,
+}
+
+impl Default for Meta {
+    fn default() -> Self {
+        Meta {
+            id: Uuid::new_v4(),
+            props: Props::new(),
+            session: None,
+        }
+    }
+}
+
 /// Where a name stands once a process has ended.
 #[derive(Debug)]
 pub(crate) enum Landing {
@@ -71,7 +96,10 @@ pub(crate) type Encode = Box<dyn FnOnce() -> Result<Vec<u8>, String> + Send>;
 /// client sent them.
 #[derive(Debug)]
 pub(crate) struct Table {
+    client: ClientId,
+    tenant: String,
     slots: HashMap<HandleName, Slot>,
+    meta: HashMap<HandleName, Meta>,
     /// What each lent handle held: in a process, it is held all the same.
     lent_media: HashMap<HandleName, usize>,
     max_media_bytes: usize,
@@ -79,15 +107,64 @@ pub(crate) struct Table {
 
 impl Default for Table {
     fn default() -> Self {
-        Table {
-            slots: HashMap::new(),
-            lent_media: HashMap::new(),
-            max_media_bytes: MAX_MEDIA_BYTES,
-        }
+        Table::new(0, String::new())
     }
 }
 
 impl Table {
+    pub(crate) fn new(client: ClientId, tenant: String) -> Self {
+        Table {
+            client,
+            tenant,
+            slots: HashMap::new(),
+            meta: HashMap::new(),
+            lent_media: HashMap::new(),
+            max_media_bytes: MAX_MEDIA_BYTES,
+        }
+    }
+
+    /// Its session has ended: what rests here is gone with it.
+    pub(crate) fn closed(&self) {
+        for meta in self.meta.values() {
+            policy::report(Event::HandleGone(meta.id, By::Client));
+        }
+    }
+
+    /// Tells the worker policy a working set under `name` has come to rest.
+    fn rested(&self, name: HandleName) {
+        let (Some(Slot::Parked(held)), Some(meta)) = (self.slots.get(&name), self.meta.get(&name))
+        else {
+            return;
+        };
+        let (tokens, folded, slots) = held.measure();
+        policy::report(Event::HandleRested(
+            meta.id,
+            Resting {
+                client: self.client,
+                tenant: self.tenant.clone(),
+                session: meta.session.clone(),
+                props: meta.props.clone(),
+                tokens,
+                folded,
+                slots,
+            },
+        ));
+    }
+
+    /// The worker policy dropped the working set it knows as `id`. One a
+    /// process has by now is out of its reach: a policy ends that process.
+    pub(crate) fn discard(&mut self, id: ProcessId, why: String) {
+        let found = self.meta.iter().find_map(|(&name, meta)| {
+            (meta.id == id && matches!(self.slots.get(&name), Some(Slot::Parked(_))))
+                .then_some(name)
+        });
+        if let Some(name) = found {
+            self.slots.insert(name, Slot::Dead(why));
+            self.meta.remove(&name);
+            policy::report(Event::HandleGone(id, By::Policy));
+        }
+    }
+
     pub(crate) fn lent(&self, name: HandleName) -> bool {
         matches!(self.slots.get(&name), Some(Slot::Lent))
     }
@@ -110,10 +187,12 @@ impl Table {
                 let slot = Slot::Unborn(kind);
                 self.room_for(&slot)?;
                 self.slots.insert(name, slot);
+                self.meta.insert(name, Meta::default());
                 Ok(json!({ "ok": true }))
             }
             HandleOp::Fork { name, from } => {
                 self.claim(name)?;
+                let meta = Meta::default();
                 let child = match self.slots.get(&from) {
                     Some(Slot::Unborn(kind)) => {
                         let child = Slot::Unborn(kind.clone());
@@ -121,7 +200,7 @@ impl Table {
                         child
                     }
                     Some(Slot::Parked(held)) => {
-                        let child = held.fork().await.map_err(HandleError::moving)?;
+                        let child = held.fork(meta.id).await.map_err(HandleError::moving)?;
                         Slot::Parked(Box::new(child))
                     }
                     Some(Slot::Matcher(matcher)) => {
@@ -132,12 +211,34 @@ impl Table {
                     other => return Err(refusal(from, other)),
                 };
                 self.slots.insert(name, child);
+                self.meta.insert(name, meta);
+                self.rested(name);
                 Ok(json!({ "ok": true }))
             }
             HandleOp::Close { name } => match self.slots.remove(&name) {
-                Some(_) => Ok(json!({ "ok": true })),
+                Some(_) => {
+                    if let Some(meta) = self.meta.remove(&name) {
+                        policy::report(Event::HandleGone(meta.id, By::Client));
+                    }
+                    Ok(json!({ "ok": true }))
+                }
                 None => Err(refusal(name, None)),
             },
+            HandleOp::SetProps { name, props } => {
+                let slot = self.slots.get(&name);
+                if matches!(slot, None | Some(Slot::Dead(_) | Slot::Lent)) {
+                    return Err(refusal(name, slot));
+                }
+                let parked = matches!(slot, Some(Slot::Parked(_)));
+                let meta = self.meta.entry(name).or_default();
+                let (merged, names) =
+                    client_api::props::merge(&meta.props, props).map_err(HandleError::invalid)?;
+                meta.props = merged.clone();
+                if parked && !names.is_empty() {
+                    policy::report(Event::HandleProps(meta.id, merged, names));
+                }
+                Ok(json!({ "ok": true }))
+            }
             HandleOp::Stat { name } => match self.slots.get(&name) {
                 Some(Slot::Unborn(HandleKind::WorkingSet)) => {
                     Ok(json!({ "state": "unborn", "tokens": 0, "folded": 0, "engine": null }))
@@ -245,6 +346,7 @@ impl Table {
         session: ClientId,
         handles: Handles,
         returns: Handles,
+        launch_session: Option<&str>,
         state_room: impl FnOnce(Option<usize>) -> Option<u32>,
     ) -> Result<Option<Lease>, HandleError> {
         if handles.is_empty() && returns.is_empty() {
@@ -304,11 +406,18 @@ impl Table {
                 self.claim_beside(name, landing.len() - 1)?;
             }
         }
+        let mut ids = HashMap::new();
+        for &name in handles.values().chain(returns.values()) {
+            let meta = self.meta.entry(name).or_default();
+            meta.session = launch_session.map(str::to_string);
+            ids.insert(name, meta.id);
+        }
         let bound = handles
             .into_iter()
             .map(|(slot, name)| {
                 let handle = self.slots.insert(name, Slot::Lent).expect("checked above");
                 self.lent_media.insert(name, handle.media_bytes());
+                policy::report(Event::HandleLent(ids[&name]));
                 Bound { slot, name, handle }
             })
             .collect();
@@ -319,6 +428,7 @@ impl Table {
             session,
             bound,
             returns,
+            ids,
         }))
     }
 
@@ -328,6 +438,7 @@ impl Table {
             self.slots.remove(&name);
             self.lent_media.remove(&name);
             let Landing::At(slot) = landing else {
+                self.meta.remove(&name);
                 continue;
             };
             let slot = match self.room_for(&slot) {
@@ -335,6 +446,7 @@ impl Table {
                 Err(why) => Slot::Dead(why.to_string()),
             };
             self.slots.insert(name, slot);
+            self.rested(name);
         }
     }
 }
@@ -533,18 +645,30 @@ mod tests {
     async fn a_launch_moves_all_it_names_or_none() {
         let mut table = Table::default();
         answer(&mut table, new(1)).await;
-        let refused = table.lend(7, names(&[("a", 1), ("b", 2)]), Handles::new(), |_| None);
+        let refused = table.lend(
+            7,
+            names(&[("a", 1), ("b", 2)]),
+            Handles::new(),
+            None,
+            |_| None,
+        );
         assert!(refused.unwrap_err().to_string().starts_with("unknown"));
         assert!(!table.lent(1), "the known one stays");
-        let twice = table.lend(7, names(&[("a", 1), ("b", 1)]), Handles::new(), |_| None);
+        let twice = table.lend(
+            7,
+            names(&[("a", 1), ("b", 1)]),
+            Handles::new(),
+            None,
+            |_| None,
+        );
         assert!(twice.unwrap_err().to_string().contains("bound twice"));
         assert!(!table.lent(1));
-        let full = table.lend(7, names(&[("a", 1)]), Handles::new(), |_| Some(0));
+        let full = table.lend(7, names(&[("a", 1)]), Handles::new(), None, |_| Some(0));
         assert!(full.unwrap_err().to_string().starts_with("quota"));
         assert!(!table.lent(1), "a full host moves nothing");
         assert!(
             table
-                .lend(7, Handles::new(), Handles::new(), |_| None)
+                .lend(7, Handles::new(), Handles::new(), None, |_| None)
                 .unwrap()
                 .is_none()
         );
@@ -558,13 +682,14 @@ mod tests {
                 7,
                 names(&[("ws", 1)]),
                 names(&[("ws", 1), ("child", 2)]),
+                None,
                 |_| None,
             )
             .unwrap()
             .unwrap();
         assert!(table.lent(1) && table.lent(2));
         assert_eq!(lease.engine(), None, "an unborn handle is on no engine");
-        let in_use = table.lend(7, names(&[("ws", 1)]), Handles::new(), |_| None);
+        let in_use = table.lend(7, names(&[("ws", 1)]), Handles::new(), None, |_| None);
         assert!(in_use.unwrap_err().to_string().contains("in a process"));
         spent(lease);
     }
@@ -584,7 +709,7 @@ mod tests {
         assert!(gone["error"].as_str().unwrap().starts_with("unknown"));
         let dead = answer(&mut table, HandleOp::Stat { name: 2 }).await;
         assert!(dead["error"].as_str().unwrap().contains("did not give"));
-        let refused = table.lend(7, names(&[("ws", 2)]), Handles::new(), |_| None);
+        let refused = table.lend(7, names(&[("ws", 2)]), Handles::new(), None, |_| None);
         assert!(
             refused.unwrap_err().to_string().starts_with("dead"),
             "the reason stays"
@@ -592,9 +717,49 @@ mod tests {
         answer(&mut table, new(2)).await;
         assert!(
             table
-                .lend(7, names(&[("ws", 2)]), Handles::new(), |_| None)
+                .lend(7, names(&[("ws", 2)]), Handles::new(), None, |_| None)
                 .is_ok(),
             "a dead name is free"
+        );
+    }
+
+    #[tokio::test]
+    async fn props_merge_until_the_name_is_closed_and_a_fork_starts_with_none() {
+        let mut table = Table::default();
+        answer(&mut table, new(1)).await;
+        let set = |name, props| HandleOp::SetProps {
+            name,
+            props: serde_json::from_value(props).unwrap(),
+        };
+        answer(&mut table, set(1, json!({"a": 1, "b": 2}))).await;
+        answer(&mut table, set(1, json!({"a": null}))).await;
+        assert_eq!(
+            serde_json::to_value(&table.meta[&1].props.0).unwrap(),
+            json!({"b": 2})
+        );
+
+        answer(&mut table, HandleOp::Fork { name: 2, from: 1 }).await;
+        assert!(table.meta[&2].props.is_empty());
+        assert_ne!(table.meta[&1].id, table.meta[&2].id);
+
+        answer(&mut table, HandleOp::Close { name: 1 }).await;
+        assert!(!table.meta.contains_key(&1));
+        let gone = answer(&mut table, set(1, json!({"a": 1}))).await;
+        assert!(
+            gone["error"].as_str().unwrap().starts_with("unknown"),
+            "{gone}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_reaches_a_handle_only_at_rest() {
+        let mut table = Table::default();
+        answer(&mut table, new(1)).await;
+        let id = table.meta[&1].id;
+        table.discard(id, "gone".to_string());
+        assert!(
+            matches!(table.slots.get(&1), Some(Slot::Unborn(_))),
+            "nothing was there to drop"
         );
     }
 }

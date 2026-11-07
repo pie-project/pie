@@ -195,6 +195,11 @@ class Handle:
     async def stat(self) -> dict:
         return await self.client._handle_op({"op": "stat", "name": self.name})
 
+    async def set_props(self, props: dict) -> None:
+        """Merges `props` for the worker policy to read while this rests; None
+        removes one. Sent while a process has it, they land with it."""
+        await self.client._handle_op({"op": "set_props", "name": self.name, "props": props})
+
     async def close(self) -> None:
         await self.client._handle_op({"op": "close", "name": self.name})
 

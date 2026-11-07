@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 use super::{FORK_WAIT, MOVE_WAIT, RS_MOVE_POLL};
 use crate::inferlet::ProcessId;
@@ -41,9 +40,15 @@ impl std::fmt::Debug for Held {
 
 impl Held {
     /// Takes `kv` and `rs` out of their process: no fire may be in flight.
-    pub(crate) fn park(kv: KvWorkingSet, rs: Option<RsWorkingSet>, cursor: Cursor) -> Self {
+    /// `holder` names it to the planner and the retention table, and what it
+    /// leaves in the cache stays under that name.
+    pub(crate) fn park(
+        holder: ProcessId,
+        kv: KvWorkingSet,
+        rs: Option<RsWorkingSet>,
+        cursor: Cursor,
+    ) -> Self {
         kv.leave_owner();
-        let holder = Uuid::new_v4();
         let residency = Arc::new(Mutex::new(ProcessResidency::default()));
         {
             let mut held = residency.lock().unwrap();
@@ -61,6 +66,7 @@ impl Held {
                 // Parked, it is no running reader: a pair of forks at rest
                 // cannot keep the pages they share on the device.
                 store.set_parked(kv.id, true);
+                let _ = store.set_owner(kv.id, holder);
                 swapped_pages(store, &kv).unwrap_or(0)
             });
             planner.register_holder(holder, demand(swapped, rs.as_ref()));
@@ -102,7 +108,7 @@ impl Held {
 
     /// Each store forks under its own lock, with no move of its own under
     /// way: a move of the other's cannot touch what this one holds.
-    pub(super) async fn fork(&self) -> Result<Held, String> {
+    pub(super) async fn fork(&self, holder: ProcessId) -> Result<Held, String> {
         let Parts { kv, rs, cursor } = self.parts();
         let rs_child = match rs {
             Some(rs) => {
@@ -113,16 +119,14 @@ impl Held {
             }
             None => None,
         };
-        let child = settled(kv, "handle-fork", |store| {
-            let child = store.fork(kv.id)?;
-            if let Some(owner) = store.owner_of(kv.id) {
-                store.set_owner(child, owner)?;
-            }
-            Ok(child)
-        })
-        .await;
+        let child = settled(kv, "handle-fork", |store| Ok(store.fork(kv.id)?)).await;
         match child {
-            Ok(child) => Ok(Held::park(kv.forked(child), rs_child, cursor.clone())),
+            Ok(child) => Ok(Held::park(
+                holder,
+                kv.forked(child),
+                rs_child,
+                cursor.clone(),
+            )),
             Err(why) => {
                 if let Some(rs) = rs_child {
                     rs.release();
@@ -153,6 +157,21 @@ impl Held {
     pub(super) fn into_parts(mut self) -> Parts {
         self.leave_planner();
         self.parts.take().expect("taken only by consuming self")
+    }
+
+    /// Its tokens, what of them are folded, and its recurrent slots.
+    pub(super) fn measure(&self) -> (u64, u64, u32) {
+        let Parts { rs, cursor, .. } = self.parts();
+        let slots = rs.as_ref().map_or(0, |rs| {
+            let stores = store_registry::get(rs.model, rs.engine);
+            let held = stores.rs.lock().unwrap().held([rs.id]);
+            held.slots
+        });
+        (
+            u64::from(cursor.tail.unwrap_or(cursor.folded)),
+            u64::from(cursor.folded),
+            slots,
+        )
     }
 
     pub(super) fn stat(&self) -> Value {

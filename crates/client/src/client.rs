@@ -572,6 +572,15 @@ impl Client {
         Ok(name)
     }
 
+    /// Merges `props` for the worker policy to read while the handle rests;
+    /// a null removes one. One sent while a process has the handle lands
+    /// with it.
+    pub async fn set_handle_props(&self, name: HandleName, props: Props) -> Result<()> {
+        self.handle_op(HandleOp::SetProps { name, props })
+            .await
+            .map(drop)
+    }
+
     pub async fn close_handle(&self, name: HandleName) -> Result<()> {
         self.handle_op(HandleOp::Close { name }).await.map(drop)
     }

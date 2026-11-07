@@ -306,6 +306,12 @@ export class Handle {
         return await this.client._handleOp({ op: "stat", name: this.name });
     }
 
+    /** Merges `props` for the worker policy to read while this rests; null
+     *  removes one. Sent while a process has it, they land with it. */
+    async setProps(props) {
+        await this.client._handleOp({ op: "set_props", name: this.name, props });
+    }
+
     async close() {
         await this.client._handleOp({ op: "close", name: this.name });
     }
