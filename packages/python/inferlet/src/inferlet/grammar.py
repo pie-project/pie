@@ -22,6 +22,7 @@ from typing import Sequence
 
 from componentize_py_types import Err as _WitErr
 from wit_world.imports import grammar as _grammar
+from wit_world.imports import session as _wit_session
 
 
 class GrammarError(Exception):
@@ -78,6 +79,19 @@ class Matcher:
         m = cls.__new__(cls)
         m._inner = inner
         return m
+
+    @classmethod
+    def take(cls, name: str) -> "Matcher":
+        """The handle the launch moved in under `name`, once."""
+        inner = _wit_session.take_matcher(name)
+        if inner is None:
+            raise GrammarError(f"the launch moved in no matcher `{name}`")
+        return cls._wrap(inner)
+
+    def give(self, name: str) -> None:
+        """Hands this matcher back to the client under the launch's `name`. Unusable after."""
+        inner, self._inner = self._inner, None
+        _wit("give", _wit_session.give_matcher, name, inner)
 
     def accept_tokens(self, token_ids: Sequence[int]) -> None:
         """Advance the match by ``token_ids``; a token the grammar forbids

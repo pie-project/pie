@@ -63,7 +63,8 @@ impl Inner {
         let mut n = 0;
         for proc in self.procs.values() {
             let resident = proc.state == Residency::Resident;
-            if !resident {
+            // A handle at rest off the device is the point of parking it.
+            if !resident && !proc.holder {
                 n += 1;
             }
             proc.resident.store(resident, Ordering::Release);
@@ -173,7 +174,7 @@ impl Inner {
     }
 
     pub(super) fn reschedule(&mut self, order_of: impl Fn(&ProcessId) -> (i64, bool)) {
-        for (pid, proc) in &mut self.procs {
+        for (pid, proc) in self.procs.iter_mut().filter(|(_, proc)| !proc.holder) {
             (proc.key, proc.held) = order_of(pid);
         }
         let held_restores: Vec<EntryKey> = self

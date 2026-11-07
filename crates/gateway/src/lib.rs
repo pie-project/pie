@@ -125,6 +125,7 @@ impl TurnRouter for RouteBackend {
         &self,
         req: &Request,
         affinity: Option<u64>,
+        pinned: Option<WorkerId>,
     ) -> std::result::Result<WorkerId, DispatchFail> {
         let router = self.router_for(req);
         let placed: Request;
@@ -146,7 +147,7 @@ impl TurnRouter for RouteBackend {
         };
         let worker = self
             .routing
-            .dispatch_with_retry(&self.workers, req, affinity, preferred)
+            .dispatch_with_retry(&self.workers, req, affinity, preferred, pinned)
             .await
             .map_err(|_| DispatchFail)?
             .worker_id;

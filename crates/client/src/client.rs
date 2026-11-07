@@ -1,6 +1,9 @@
 use crate::crypto::ParsedPrivateKey;
 use crate::error::{Error, Result};
-use crate::message::{CHUNK_SIZE_BYTES, ClientMessage, Files, Props, ServerMessage};
+use crate::message::{
+    CHUNK_SIZE_BYTES, ClientMessage, Files, GrammarSource, HandleKind, HandleName, HandleOp,
+    Handles, Props, ServerMessage,
+};
 use crate::utils::IdPool;
 use base64::Engine;
 use bytes::Bytes;
@@ -10,6 +13,7 @@ use rmp_serde::{decode, encode};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -81,6 +85,7 @@ pub struct Client {
     inner: Arc<ClientInner>,
     reader_handle: task::JoinHandle<()>,
     writer_handle: task::JoinHandle<()>,
+    next_handle: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -224,6 +229,7 @@ impl Client {
             inner,
             reader_handle,
             writer_handle,
+            next_handle: AtomicU64::new(1),
         }
     }
 
@@ -232,6 +238,7 @@ impl Client {
             inner,
             reader_handle,
             writer_handle,
+            ..
         } = self;
         reader_handle.abort();
         let _ = reader_handle.await;
@@ -435,6 +442,33 @@ impl Client {
         props: Props,
         files: Files,
     ) -> Result<Process> {
+        self.launch_process_moving(
+            inferlet,
+            input,
+            capture_outputs,
+            session,
+            props,
+            files,
+            Handles::new(),
+            Handles::new(),
+        )
+        .await
+    }
+
+    /// Launches with `handles` moved into the process, and `returns` the
+    /// names what it gives lands on.
+    #[allow(clippy::too_many_arguments, reason = "one launch, as the wire has it")]
+    pub async fn launch_process_moving(
+        &self,
+        inferlet: String,
+        input: String,
+        capture_outputs: bool,
+        session: Option<String>,
+        props: Props,
+        files: Files,
+        handles: Handles,
+        returns: Handles,
+    ) -> Result<Process> {
         let msg = ClientMessage::LaunchProcess {
             corr_id: 0,
             inferlet,
@@ -443,6 +477,8 @@ impl Client {
             props,
             session,
             files,
+            handles,
+            returns,
             cluster_props: Props::new(),
             executors: Vec::new(),
         };
@@ -460,6 +496,99 @@ impl Client {
             inner: Arc::clone(&self.inner),
             event_rx: rx,
         })
+    }
+
+    /// A new, empty working set. Nothing exists on the server until a process
+    /// binds it.
+    pub async fn new_working_set(&self) -> Result<HandleName> {
+        let name = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.handle_op(HandleOp::New {
+            name,
+            kind: HandleKind::WorkingSet,
+        })
+        .await?;
+        Ok(name)
+    }
+
+    /// A new matcher at the start of `grammar`, which compiles where a process
+    /// binds it.
+    pub async fn new_matcher(&self, grammar: GrammarSource) -> Result<HandleName> {
+        let name = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.handle_op(HandleOp::New {
+            name,
+            kind: HandleKind::Matcher(grammar),
+        })
+        .await?;
+        Ok(name)
+    }
+
+    /// Uploads encoded pictures, which decode where a process binds them.
+    pub async fn new_frames(&self, encoded: Vec<u8>) -> Result<HandleName> {
+        let name = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.handle_op(HandleOp::New {
+            name,
+            kind: HandleKind::Frames(encoded.into()),
+        })
+        .await?;
+        Ok(name)
+    }
+
+    /// Downloads a `Frames` or `Pcm` handle as `format`: its file arrives as
+    /// a process's would, and the handle stays.
+    pub async fn read_handle(&self, name: HandleName, format: String) -> Result<Process> {
+        // Picked here so events are routed before the first chunk can arrive.
+        let reader = Uuid::new_v4().to_string();
+        let rx = attach_process_events(&self.inner, &reader);
+        let msg = ClientMessage::ReadHandle {
+            corr_id: 0,
+            name,
+            format,
+            reader: reader.clone(),
+        };
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
+        if !ok {
+            return Err(Error::request("Read handle", result));
+        }
+        Ok(Process {
+            id: reader,
+            inner: Arc::clone(&self.inner),
+            event_rx: rx,
+        })
+    }
+
+    /// An independent copy of `from` as it stands.
+    pub async fn fork_handle(&self, from: HandleName) -> Result<HandleName> {
+        let name = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.handle_op(HandleOp::Fork { name, from }).await?;
+        Ok(name)
+    }
+
+    pub async fn close_handle(&self, name: HandleName) -> Result<()> {
+        self.handle_op(HandleOp::Close { name }).await.map(drop)
+    }
+
+    /// The handle's state, tokens and residency, as JSON.
+    pub async fn stat_handle(&self, name: HandleName) -> Result<String> {
+        self.handle_op(HandleOp::Stat { name }).await
+    }
+
+    /// Runs one op, and answers what it answered: a refusal is an error.
+    async fn handle_op(&self, op: HandleOp) -> Result<String> {
+        let msg = ClientMessage::Handles {
+            corr_id: 0,
+            ops: vec![op],
+        };
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
+        if !ok {
+            return Err(Error::request("Handle op", result));
+        }
+        let answers: Vec<serde_json::Value> = serde_json::from_str(&result)
+            .map_err(|e| Error::request("Handle op", e.to_string()))?;
+        let answer = answers.into_iter().next().unwrap_or_default();
+        match answer.get("error").and_then(serde_json::Value::as_str) {
+            Some(error) => Err(Error::request("Handle op", error.to_string())),
+            None => Ok(answer.to_string()),
+        }
     }
 
     pub async fn attach_process(&self, process_id: &str) -> Result<Process> {

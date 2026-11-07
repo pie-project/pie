@@ -381,6 +381,20 @@ impl WorkingSet {
         }
     }
 
+    /// The handle the launch moved in under `name`.
+    pub fn take(name: &str) -> Option<WorkingSet> {
+        crate::pie::inferlet::session::take_working_set(name)
+            .map(|ws| WorkingSet { ws: Rc::new(ws) })
+    }
+
+    /// Hands this set back to the client under the launch's `name`: every
+    /// pass bound to it must be dropped first.
+    pub fn give(self, name: &str) -> Result<(), String> {
+        let ws = Rc::try_unwrap(self.ws)
+            .map_err(|_| format!("`{name}` is still bound to a forward pass"))?;
+        crate::pie::inferlet::session::give_working_set(name, ws)
+    }
+
     /// Lets passes write slots below `end`: needed only by a pass whose slots
     /// are computed on the device.
     pub fn reserve(&self, end: u32) -> Result<(), String> {
@@ -410,6 +424,17 @@ impl WorkingSet {
 impl Default for WorkingSet {
     fn default() -> Self {
         WorkingSet::new()
+    }
+}
+
+/// A `WorkingSet` in a typed input is the handle the client wrote there, as
+/// `{"$handle": "<name>"}`.
+impl<'de> serde::Deserialize<'de> for WorkingSet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let handle = crate::handle_marker(deserializer)?;
+        WorkingSet::take(&handle).ok_or_else(|| {
+            serde::de::Error::custom(format!("the launch moved in no handle `{handle}`"))
+        })
     }
 }
 

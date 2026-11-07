@@ -2,6 +2,8 @@ interface session {
 
     use types.{blob, error};
     use frames.{frames, pcm, image-format, audio-format};
+    use working-set.{working-set};
+    use grammar.{matcher};
 
     // Sends a message to the remote user client
     send: func(message: string);
@@ -40,6 +42,37 @@ interface session {
     /// The file the client attached to this run under `name`
     /// (`pie run --file name=path`), or none.
     file: func(name: string) -> option<blob>;
+
+    /// The working set the launch moved in under `name`, once; none if it
+    /// moved no such handle. It is new if nothing has written it yet.
+    take-working-set: func(name: string) -> option<working-set>;
+
+    /// Hands `ws` to the client as what the launch named `name` in its
+    /// returns. It lands in the client's session when this process ends, once
+    /// its last fire has settled. Refused if the launch expects no such
+    /// return, or has one already; `ws` is dropped either way it fails.
+    give-working-set: func(name: string, ws: working-set) -> result<_, error>;
+
+    /// `take-working-set` for a matcher: it stands where the client left it,
+    /// or at the start of the grammar it wrote.
+    take-matcher: func(name: string) -> option<matcher>;
+
+    /// `give-working-set` for a matcher.
+    give-matcher: func(name: string, matcher: matcher) -> result<_, error>;
+
+    /// `take-working-set` for pictures: a process's output, or a client's
+    /// upload, decoded.
+    take-frames: func(name: string) -> option<frames>;
+
+    /// `give-working-set` for pictures: the client saves them or moves them
+    /// on to another process, and they never cross linear memory.
+    give-frames: func(name: string, f: frames) -> result<_, error>;
+
+    /// `take-frames` for sound.
+    take-pcm: func(name: string) -> option<pcm>;
+
+    /// `give-frames` for sound.
+    give-pcm: func(name: string, p: pcm) -> result<_, error>;
 
     /// Encodes `f` and streams the bytes to the client under `name`, WITHOUT
     /// the encoded file ever entering WASM linear memory.

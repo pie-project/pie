@@ -23,7 +23,8 @@ impl ResidencyPlanner {
                 kv_pages: freed,
                 rs: rs_freed,
             };
-            if proc.idle || proc.held {
+            // A holder owes nothing: whoever takes its set asks for it back.
+            if proc.idle || proc.held || proc.holder {
                 proc.parked = Some(demand);
                 return;
             }

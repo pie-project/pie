@@ -46,6 +46,8 @@ pub enum SessionError {
     Draining,
     Launch(String),
     Refused(String),
+    /// The worker holding the session's handles is gone, and they with it.
+    HandlesLost,
 }
 
 impl std::fmt::Display for SessionError {
@@ -56,6 +58,9 @@ impl std::fmt::Display for SessionError {
             SessionError::Draining => f.write_str("gateway draining"),
             SessionError::Launch(r) => write!(f, "launch refused: {r}"),
             SessionError::Refused(r) => write!(f, "refused by the cluster policy: {r}"),
+            SessionError::HandlesLost => {
+                f.write_str("dead: the worker holding this session's handles is gone")
+            }
         }
     }
 }
@@ -104,6 +109,7 @@ pub trait TurnRouter: Send + Sync + 'static {
         &self,
         req: &Request,
         affinity: Option<u64>,
+        pinned: Option<WorkerId>,
     ) -> Result<WorkerId, DispatchFail>;
 
     async fn cancel(&self, worker: WorkerId, req: ReqId);
@@ -124,6 +130,8 @@ pub trait TurnRouter: Send + Sync + 'static {
 
 struct TurnState {
     worker: Option<WorkerId>,
+    /// Goes to this worker or nowhere: it holds what the turn names.
+    pinned: Option<WorkerId>,
     request: Request,
     affinity: Option<u64>,
     /// The client has been handed output: a process event (a message, a
@@ -175,6 +183,10 @@ fn is_launch_answer(turn: &TurnState, message: &ServerMessage) -> bool {
 }
 
 impl Inner {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one turn's whole context, as its session has it"
+    )]
     async fn run_turn(
         self: &Arc<Self>,
         session: SessionId,
@@ -182,8 +194,9 @@ impl Inner {
         user: &str,
         mut input: TurnInput,
         affinity: Option<u64>,
+        pinned: Option<WorkerId>,
         open: &Arc<AtomicBool>,
-    ) -> Result<(ReqId, TokenRx), SessionError> {
+    ) -> Result<(ReqId, TokenRx, WorkerId), SessionError> {
         if let ClientMessage::LaunchProcess { props, session, .. } = &mut input.message {
             client_api::props::from_client(props).map_err(SessionError::Launch)?;
             client_api::props::check_session(session.as_deref()).map_err(SessionError::Launch)?;
@@ -230,6 +243,7 @@ impl Inner {
                 req_id,
                 TurnState {
                     worker: None,
+                    pinned,
                     request: request.clone(),
                     affinity,
                     emitted: false,
@@ -252,7 +266,13 @@ impl Inner {
         match tokio::spawn(async move { inner.dispatch(req_id, &request, affinity, &open).await })
             .await
         {
-            Ok(Ok(_)) => Ok((req_id, TokenRx { rx, lost })),
+            Ok(Ok(worker)) => Ok((req_id, TokenRx { rx, lost }, worker)),
+            // Busy or draining is not gone: the handles are still there.
+            _ if pinned
+                .is_some_and(|worker| !self.router.connected().borrow().contains(&worker)) =>
+            {
+                Err(SessionError::HandlesLost)
+            }
             _ => Err(SessionError::NoWorker),
         }
     }
@@ -267,7 +287,13 @@ impl Inner {
         affinity: Option<u64>,
         open: &AtomicBool,
     ) -> Result<WorkerId, DispatchFail> {
-        let worker = match self.router.dispatch(request, affinity).await {
+        let pinned = self
+            .turns
+            .lock()
+            .unwrap()
+            .get(&req_id)
+            .and_then(|turn| turn.pinned);
+        let worker = match self.router.dispatch(request, affinity, pinned).await {
             Ok(worker) => worker,
             Err(DispatchFail) => {
                 self.end(req_id, Outcome::Failed, By::Host);
@@ -362,6 +388,7 @@ impl Sessions {
             affinity_key,
             current: Mutex::new(Vec::new()),
             open: Arc::new(AtomicBool::new(true)),
+            holds_handles: Mutex::new(None),
         };
         match handle.turn(first).await {
             Ok(rx) => Ok((handle, rx)),
@@ -496,8 +523,9 @@ impl Sessions {
             if old == target || turn.outcome.is_some() {
                 return false;
             }
-            // Run again, it would send what the client already has.
-            if turn.emitted {
+            // Run again, it would send what the client already has, or find
+            // the handles it names left behind.
+            if turn.emitted || turn.request.message.uses_handles() {
                 Err(turn.request.clone())
             } else {
                 relaunch(turn, old);
@@ -511,7 +539,7 @@ impl Sessions {
                 self.inner.router.moved(
                     &request,
                     None,
-                    "it has sent output, so it finishes where it runs",
+                    "it has sent output or names handles, so it finishes where it runs",
                 );
                 return false;
             }
@@ -584,11 +612,19 @@ pub struct SessionHandle {
     affinity_key: Option<u64>,
     current: Mutex<Vec<ReqId>>,
     open: Arc<AtomicBool>,
+    /// Where this session's handles are, from its first frame that names one.
+    holds_handles: Mutex<Option<WorkerId>>,
 }
 
 impl SessionHandle {
     pub async fn turn(&self, next: TurnInput) -> Result<TokenRx, SessionError> {
-        let (req_id, rx) = self
+        let handles = next.message.uses_handles();
+        let pinned = if handles {
+            *self.holds_handles.lock().unwrap()
+        } else {
+            None
+        };
+        let (req_id, rx, worker) = self
             .inner
             .run_turn(
                 self.session,
@@ -596,9 +632,13 @@ impl SessionHandle {
                 &self.user,
                 next,
                 self.affinity_key,
+                pinned,
                 &self.open,
             )
             .await?;
+        if handles && pinned.is_none() {
+            *self.holds_handles.lock().unwrap() = Some(worker);
+        }
         self.current.lock().unwrap().push(req_id);
         Ok(rx)
     }
@@ -679,7 +719,9 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                     };
                     if turn.outcome.is_some() {
                         Next::End
-                    } else if turn.emitted {
+                    } else if turn.emitted || turn.request.message.uses_handles() {
+                        // Its handles went with the worker: run again, it
+                        // would be a turn on state that no longer exists.
                         turn.lost.store(true, Ordering::Release);
                         tracing::info!(req = %req_id, from = %old, "a turn that sent output lost its worker");
                         Next::Lost(turn.sink.clone(), turn.process.clone())
@@ -731,6 +773,7 @@ mod tests {
         dispatch_worker: Mutex<Option<WorkerId>>,
         dispatched: Mutex<Vec<ReqId>>,
         affinities: Mutex<Vec<Option<u64>>>,
+        pins: Mutex<Vec<Option<WorkerId>>>,
         cancels: Mutex<Vec<(WorkerId, ReqId)>>,
         ended: Mutex<Vec<SessionId>>,
         held: AtomicBool,
@@ -753,6 +796,7 @@ mod tests {
                 dispatch_worker: Mutex::new(worker),
                 dispatched: Mutex::new(Vec::new()),
                 affinities: Mutex::new(Vec::new()),
+                pins: Mutex::new(Vec::new()),
                 cancels: Mutex::new(Vec::new()),
                 ended: Mutex::new(Vec::new()),
                 held: AtomicBool::new(false),
@@ -781,7 +825,9 @@ mod tests {
             &self,
             req: &Request,
             affinity: Option<u64>,
+            pinned: Option<WorkerId>,
         ) -> Result<WorkerId, DispatchFail> {
+            self.pins.lock().unwrap().push(pinned);
             self.dispatched.lock().unwrap().push(req.req_id);
             self.messages.lock().unwrap().push(req.message.clone());
             self.affinities.lock().unwrap().push(affinity);
@@ -827,12 +873,68 @@ mod tests {
                 props: Default::default(),
                 session: None,
                 files: Default::default(),
+                handles: Default::default(),
+                returns: Default::default(),
                 cluster_props: Default::default(),
                 executors: Vec::new(),
             },
             blobs: Vec::new(),
             priority: Priority::Normal,
         }
+    }
+
+    fn handles() -> TurnInput {
+        TurnInput {
+            message: ClientMessage::Handles {
+                corr_id: 5,
+                ops: Vec::new(),
+            },
+            blobs: Vec::new(),
+            priority: Priority::Normal,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_with_handles_goes_nowhere_but_where_they_are() {
+        let router = MockRouter::new(Some(WorkerId(7)));
+        let sessions = Sessions::new(router.clone());
+        let (handle, _rx) = sessions
+            .create(ident(), handles(), Affinity::Sticky)
+            .await
+            .unwrap();
+        let _ = handle.turn(handles()).await.unwrap();
+        let _ = handle.turn(launch()).await.unwrap();
+        assert_eq!(
+            *router.pins.lock().unwrap(),
+            [None, Some(WorkerId(7)), None],
+            "the first frame pins; a turn naming no handle stays free"
+        );
+
+        *router.dispatch_worker.lock().unwrap() = None;
+        let busy = handle.turn(handles()).await.err().unwrap();
+        assert!(
+            matches!(busy, SessionError::NoWorker),
+            "still connected, it only said no"
+        );
+
+        router._connected_tx.send(Arc::new(HashSet::new())).unwrap();
+        let lost = handle.turn(handles()).await.err().unwrap();
+        assert!(matches!(lost, SessionError::HandlesLost));
+        assert!(lost.to_string().starts_with("dead"), "{lost}");
+    }
+
+    #[tokio::test]
+    async fn a_turn_naming_handles_is_never_run_again() {
+        let router = MockRouter::new(Some(WorkerId(7)));
+        let sessions = Sessions::new(router.clone());
+        let (handle, _rx) = sessions
+            .create(ident(), handles(), Affinity::Sticky)
+            .await
+            .unwrap();
+        let req = router.dispatched.lock().unwrap()[0];
+        assert!(!sessions.migrate(req, WorkerId(8)).await);
+        assert_eq!(router.dispatched.lock().unwrap().len(), 1);
+        drop(handle);
     }
 
     fn event(event: &str) -> Tokens {

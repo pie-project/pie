@@ -20,6 +20,7 @@ describe('package surface', () => {
     expect(Object.keys(inferlet).sort()).toEqual([
       'chat',
       'eta',
+      'frames',
       'grammar',
       'mask',
       'media',

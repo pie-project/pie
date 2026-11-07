@@ -220,6 +220,95 @@ impl ResidencyPlanner {
         });
     }
 
+    /// Registers what holds a handle's working set between processes: idle
+    /// from the start, so the first to want its pages takes them. It ranks
+    /// past every process, the longest parked last of all: a turn resumes
+    /// what it just left, so the handle left longest goes first, where the
+    /// youngest process would. `parked` is what it owes the device, for a set
+    /// that comes already evicted.
+    pub fn register_holder(self: &Arc<Self>, pid: ProcessId, parked: Option<Demand>) {
+        self.with_inner(|inner| {
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            let mut proc = Proc::new(0);
+            proc.rest(seq);
+            proc.holder = true;
+            proc.admitted = true;
+            proc.idle = true;
+            if let Some(demand) = parked {
+                proc.state = Residency::Evicted;
+                proc.resident.store(false, Ordering::Release);
+                proc.parked = Some(demand);
+            }
+            inner.procs.insert(pid, proc);
+        });
+        self.re_arm_idle_reclaim();
+        self.poke();
+    }
+
+    /// The recurrent slots holders keep on the device, a slot forks share
+    /// counted once: each would need the host if it went there.
+    pub fn resting_rs_slots(&self) -> u32 {
+        let (model, engine) = self.port.locus();
+        let holders: Vec<ProcessId> = self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .filter(|(_, proc)| proc.holder && proc.state == Residency::Resident)
+                .map(|(pid, _)| *pid)
+                .collect()
+        });
+        let resting: HashSet<_> = holders
+            .into_iter()
+            .flat_map(|pid| {
+                crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine)
+            })
+            .collect();
+        crate::store::registry::try_get(model, engine).map_or(0, |stores| {
+            stores.rs.lock().unwrap().suspendable(&resting).slots
+        })
+    }
+
+    /// A launch is taking this holder's set: no one's victim from here.
+    pub fn claim_holder(&self, pid: ProcessId) {
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.idle = false;
+            }
+        });
+    }
+
+    /// The launch did not happen.
+    pub fn unclaim_holder(self: &Arc<Self>, pid: ProcessId) {
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.idle = true;
+            }
+        });
+        self.poke();
+    }
+
+    /// Whether an eviction has this holder's set in hand.
+    pub fn holder_moving(&self, pid: ProcessId) -> bool {
+        self.lock_inner()
+            .procs
+            .get(&pid)
+            .is_some_and(|proc| proc.state == Residency::Evicting)
+    }
+
+    /// `pid` took sets that are off the device: it restores them before it
+    /// runs, as if it had been evicted with them.
+    pub fn owe(self: &Arc<Self>, pid: ProcessId, demand: Demand) {
+        self.with_inner(|inner| {
+            let Some(proc) = inner.procs.get_mut(&pid) else {
+                return;
+            };
+            proc.state = Residency::Evicted;
+            inner.enqueue(pid, WaitKind::Restore { demand });
+        });
+        self.poke();
+    }
+
     pub fn register_with_seq(&self, pid: ProcessId, seq: u64) {
         self.with_inner(|inner| {
             let mut proc = Proc::new(seq);
@@ -582,10 +671,9 @@ impl ResidencyPlanner {
                 }
                 inner.to_end.waiting.retain(|(_, waiting)| *waiting != pid);
             }
-            if departed
-                .as_ref()
-                .is_some_and(|proc| proc.admitted && proc.state == Residency::Resident)
-            {
+            if departed.as_ref().is_some_and(|proc| {
+                proc.admitted && !proc.holder && proc.state == Residency::Resident
+            }) {
                 inner.completion_credit = inner.completion_credit.saturating_add(1);
             }
             inner.settle_eviction(pid);

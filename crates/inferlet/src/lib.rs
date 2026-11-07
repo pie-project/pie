@@ -95,12 +95,91 @@ pub mod session {
     pub use crate::pie::inferlet::session::*;
 }
 
+/// The name in a `{"$handle": name}` a client wrote where a handle goes.
+pub(crate) fn handle_marker<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    #[derive(serde::Deserialize)]
+    struct Marker {
+        #[serde(rename = "$handle")]
+        handle: String,
+    }
+    Ok(<Marker as serde::Deserialize>::deserialize(deserializer)?.handle)
+}
+
 pub mod frames {
     pub use crate::pie::inferlet::frames::{AudioFormat, Frames, ImageFormat, Pcm};
+    use crate::pie::inferlet::session;
+
+    impl Frames {
+        /// The handle the launch moved in under `name`.
+        pub fn take(name: &str) -> Option<Frames> {
+            session::take_frames(name)
+        }
+
+        /// Hands these pictures to the client under the launch's `name`.
+        pub fn give(self, name: &str) -> Result<(), String> {
+            session::give_frames(name, self)
+        }
+    }
+
+    impl Pcm {
+        /// The handle the launch moved in under `name`.
+        pub fn take(name: &str) -> Option<Pcm> {
+            session::take_pcm(name)
+        }
+
+        /// Hands this sound to the client under the launch's `name`.
+        pub fn give(self, name: &str) -> Result<(), String> {
+            session::give_pcm(name, self)
+        }
+    }
+
+    /// `Frames` in a typed input is the handle the client wrote there.
+    impl<'de> serde::Deserialize<'de> for Frames {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let handle = crate::handle_marker(deserializer)?;
+            Frames::take(&handle).ok_or_else(|| {
+                serde::de::Error::custom(format!("the launch moved in no frames `{handle}`"))
+            })
+        }
+    }
+
+    /// `Pcm` in a typed input is the handle the client wrote there.
+    impl<'de> serde::Deserialize<'de> for Pcm {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let handle = crate::handle_marker(deserializer)?;
+            Pcm::take(&handle).ok_or_else(|| {
+                serde::de::Error::custom(format!("the launch moved in no pcm `{handle}`"))
+            })
+        }
+    }
 }
 
 pub mod grammar {
     pub use crate::pie::inferlet::grammar::*;
+
+    impl Matcher {
+        /// The handle the launch moved in under `name`.
+        pub fn take(name: &str) -> Option<Matcher> {
+            crate::pie::inferlet::session::take_matcher(name)
+        }
+
+        /// Hands this matcher back to the client under the launch's `name`.
+        pub fn give(self, name: &str) -> Result<(), String> {
+            crate::pie::inferlet::session::give_matcher(name, self)
+        }
+    }
+
+    /// A `Matcher` in a typed input is the handle the client wrote there.
+    impl<'de> serde::Deserialize<'de> for Matcher {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let handle = crate::handle_marker(deserializer)?;
+            Matcher::take(&handle).ok_or_else(|| {
+                serde::de::Error::custom(format!("the launch moved in no matcher `{handle}`"))
+            })
+        }
+    }
 }
 
 pub mod media {

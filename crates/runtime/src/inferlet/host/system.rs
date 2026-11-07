@@ -17,7 +17,10 @@ impl pie::inferlet::system::Host for ProcessCtx {
     }
 
     async fn declare_restartable(&mut self) -> Result<()> {
-        crate::inferlet::process::declare_restartable(self.id());
+        // Run again from its input, it would find its handles spent.
+        if self.handles().is_none() {
+            crate::inferlet::process::declare_restartable(self.id());
+        }
         Ok(())
     }
 }

@@ -4,7 +4,7 @@ pub(crate) mod inbox;
 
 pub use data_transfer::InFlightUpload;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
@@ -128,6 +128,19 @@ pub async fn recv_messages(
 static CLIENT_SERVICES: LazyLock<ServiceMap<ClientId, SessionMessage>> =
     LazyLock::new(ServiceMap::new);
 
+/// Where a process's end left its handles. A session gone by now drops them.
+pub(crate) fn handles_settled(
+    client_id: ClientId,
+    settled: Vec<(client_api::HandleName, crate::handle::Landing)>,
+) {
+    let _ = CLIENT_SERVICES.send(&client_id, SessionMessage::HandlesSettled(settled));
+}
+
+/// The turn behind `corr_id` is cancelled before it had a process.
+pub fn forget_frame(client_id: ClientId, corr_id: u32) {
+    let _ = CLIENT_SERVICES.send(&client_id, SessionMessage::Forget(corr_id));
+}
+
 pub(crate) fn send_event(
     client_id: ClientId,
     process_id: ProcessId,
@@ -189,6 +202,9 @@ enum SessionMessage {
         name: Option<String>,
     },
     ClientRequest(ClientMessage),
+    HandlesSettled(Vec<(client_api::HandleName, crate::handle::Landing)>),
+    /// A turn was cancelled: if its frame is still waiting, it never runs.
+    Forget(u32),
     ReceiveFile {
         process_id: ProcessId,
         sender: tokio::sync::oneshot::Sender<Bytes>,
@@ -216,6 +232,9 @@ struct Session {
     pub(super) launched_processes: HashSet<ProcessId>,
     pub(super) installed_programs: HashSet<ProgramName>,
     pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
+    pub(super) handles: crate::handle::Table,
+    /// Frames naming a lent handle, in order: they run once it lands.
+    pub(super) waiting: VecDeque<ClientMessage>,
     out_tx: mpsc::Sender<WireServerMessage>,
 }
 
@@ -237,6 +256,8 @@ impl Session {
             launched_processes: HashSet::new(),
             installed_programs: HashSet::new(),
             file_waiters: HashMap::new(),
+            handles: Default::default(),
+            waiting: VecDeque::new(),
             out_tx,
         }
     }
@@ -273,7 +294,27 @@ impl ServiceHandler for Session {
     async fn handle(&mut self, msg: SessionMessage) {
         match msg {
             SessionMessage::ClientRequest(client_msg) => {
-                self.handle_client_message(client_msg).await;
+                if client_msg.uses_handles()
+                    && (!self.waiting.is_empty() || self.names_lent(&client_msg))
+                {
+                    if self.waiting.len() < client_api::MAX_WAITING_HANDLE_FRAMES {
+                        self.waiting.push_back(client_msg);
+                    } else if let Some(corr_id) = client_msg.corr_id() {
+                        let why = "quota: too many frames wait on lent handles".to_string();
+                        self.send_response(corr_id, false, why).await;
+                    }
+                } else {
+                    self.handle_client_message(client_msg).await;
+                }
+            }
+            SessionMessage::HandlesSettled(settled) => {
+                self.handles.settle(settled);
+                self.run_waiting().await;
+            }
+            SessionMessage::Forget(corr_id) => {
+                self.waiting
+                    .retain(|frame| frame.corr_id() != Some(corr_id));
+                self.run_waiting().await;
             }
             SessionMessage::Event {
                 process_id,
@@ -297,6 +338,34 @@ impl ServiceHandler for Session {
 }
 
 impl Session {
+    async fn run_waiting(&mut self) {
+        while self
+            .waiting
+            .front()
+            .is_some_and(|frame| !self.names_lent(frame))
+        {
+            let frame = self.waiting.pop_front().expect("just seen");
+            self.handle_client_message(frame).await;
+        }
+    }
+
+    fn names_lent(&self, frame: &ClientMessage) -> bool {
+        match frame {
+            ClientMessage::Handles { ops, .. } => ops
+                .iter()
+                .flat_map(client_api::HandleOp::touches)
+                .any(|name| self.handles.lent(name)),
+            ClientMessage::ReadHandle { name, .. } => self.handles.lent(*name),
+            ClientMessage::LaunchProcess {
+                handles, returns, ..
+            } => handles
+                .values()
+                .chain(returns.values())
+                .any(|&name| self.handles.lent(name)),
+            _ => false,
+        }
+    }
+
     async fn send(&self, msg: WireServerMessage) {
         if self.out_tx.send(msg).await.is_err() {
             tracing::error!("inproc session sink closed for client {}", self.id);
@@ -382,6 +451,8 @@ impl Session {
                 props,
                 session,
                 files,
+                handles,
+                returns,
                 cluster_props,
                 executors,
             } => {
@@ -393,10 +464,28 @@ impl Session {
                     props,
                     session,
                     files,
+                    handles,
+                    returns,
                     cluster_props,
                     executors,
                 )
                 .await
+            }
+
+            ClientMessage::ReadHandle {
+                corr_id,
+                name,
+                format,
+                reader,
+            } => {
+                self.handle_read_handle(corr_id, name, &format, &reader)
+                    .await
+            }
+
+            ClientMessage::Handles { corr_id, ops } => {
+                let answers = self.handles.apply(ops).await;
+                self.send_response(corr_id, true, serde_json::Value::from(answers).to_string())
+                    .await;
             }
 
             ClientMessage::AttachProcess {
@@ -448,6 +537,93 @@ impl Session {
 mod tests {
     use super::*;
     use crate::inferlet::process::probe::{self, Seen};
+
+    fn launch_on(corr_id: u32, name: client_api::HandleName) -> ClientMessage {
+        ClientMessage::LaunchProcess {
+            corr_id,
+            inferlet: "chat".into(),
+            input: String::new(),
+            capture_outputs: true,
+            props: Default::default(),
+            session: None,
+            files: Default::default(),
+            handles: client_api::Handles::from([("ws".to_string(), name)]),
+            returns: Default::default(),
+            cluster_props: Default::default(),
+            executors: Vec::new(),
+        }
+    }
+
+    /// A session with handle 1 lent to a process.
+    async fn lent_session() -> (Session, mpsc::Receiver<WireServerMessage>) {
+        let (tx, rx) = mpsc::channel(8);
+        let mut session = Session::new_inproc(
+            9,
+            install_state(0),
+            tx,
+            "acme".to_string(),
+            "al".to_string(),
+        );
+        session
+            .handles
+            .apply(vec![client_api::HandleOp::New {
+                name: 1,
+                kind: client_api::HandleKind::WorkingSet,
+            }])
+            .await;
+        let lease = session
+            .handles
+            .lend(
+                9,
+                client_api::Handles::from([("ws".to_string(), 1)]),
+                client_api::Handles::new(),
+                |_| None,
+            )
+            .unwrap();
+        std::mem::forget(lease);
+        (session, rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_cancelled_while_it_waits_never_runs() {
+        let (mut session, _rx) = lent_session().await;
+        session
+            .handle(SessionMessage::ClientRequest(launch_on(5, 1)))
+            .await;
+        session
+            .handle(SessionMessage::ClientRequest(launch_on(6, 1)))
+            .await;
+        assert_eq!(session.waiting.len(), 2, "both name what is lent");
+
+        session.handle(SessionMessage::Forget(5)).await;
+        let left: Vec<_> = session.waiting.iter().map(ClientMessage::corr_id).collect();
+        assert_eq!(left, [Some(6)], "the other keeps its place");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frames_waiting_on_a_handle_are_bounded() {
+        let (mut session, mut rx) = lent_session().await;
+        for corr_id in 0..client_api::MAX_WAITING_HANDLE_FRAMES as u32 {
+            session
+                .handle(SessionMessage::ClientRequest(launch_on(corr_id, 1)))
+                .await;
+        }
+        session
+            .handle(SessionMessage::ClientRequest(launch_on(9999, 1)))
+            .await;
+        assert_eq!(session.waiting.len(), client_api::MAX_WAITING_HANDLE_FRAMES);
+        let WireServerMessage::Response {
+            corr_id,
+            ok,
+            result,
+            ..
+        } = rx.recv().await.expect("an answer")
+        else {
+            panic!("a response");
+        };
+        assert_eq!((corr_id, ok), (9999, false));
+        assert!(result.starts_with("quota"), "{result}");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_session_owns_only_its_own_tenant_and_users_processes() {

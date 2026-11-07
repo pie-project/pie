@@ -30,6 +30,7 @@
 interface media {
 
     use types.{error};
+    use frames.{frames};
 
     // A visual span's extent in merged-token units.
     record merged-grid {
@@ -48,6 +49,12 @@ interface media {
         // it by the package's `frame` and cuts it into patch rows. Errors if
         // the model reads no stills or the bytes don't decode.
         from-bytes: static func(bytes: list<u8>)
+            -> result<image, error>;
+
+        // A one-frame `frames` as `from-bytes` reads an encoded still: pixels
+        // a process made, or a client uploaded, go on to a model with no
+        // codec between. Errors on more than one frame.
+        from-frames: static func(f: borrow<frames>)
             -> result<image, error>;
 
         // THE SPAN, AS THE SEQUENCE CARRIES IT: prefix + placeholder run

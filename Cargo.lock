@@ -4181,6 +4181,7 @@ dependencies = [
  "ring",
  "rmp-serde",
  "rsa",
+ "serde_json",
  "ssh-key",
  "thiserror 2.0.21",
  "tokio",

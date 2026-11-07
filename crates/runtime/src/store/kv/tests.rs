@@ -1565,3 +1565,35 @@ fn a_persist_hint_of_a_process_that_mapped_in_a_cached_run_goes_out() {
     store.release_working_set(ws, store.current_epoch());
     assert_eq!(store.persist_hints(), vec![(keys[3], 32)]);
 }
+
+/// A peer's eviction moves pages under a parked set, and a peer's restore puts
+/// them back elsewhere: the map a parked set wakes with is the table's.
+#[test]
+fn a_parked_set_wakes_with_the_pages_its_peers_moved() {
+    let mut s = KvStore::new_with_swap(8, 8, 0, h(40));
+    let a = s.create_working_set();
+    commit_fresh(&mut s, a, 3, 1);
+    let b = s.fork(a).unwrap();
+    s.set_parked(a, true);
+    s.set_parked(b, true);
+
+    let txn = s
+        .prepare_suspend(&HashSet::from([a]))
+        .unwrap()
+        .expect("no running reader keeps them");
+    assert_eq!(s.commit_suspend(txn).unwrap(), 3);
+    s.retire_idle();
+    let _elsewhere = s.reserve_device_pages(5).unwrap();
+    let mut granted = s.reserve_device_pages(3).unwrap();
+    let txn = s
+        .prepare_restore(&HashSet::from([a]), &mut granted)
+        .unwrap();
+    assert_eq!(s.commit_restore(txn).unwrap(), 3);
+
+    assert_eq!(s.swapped_page_count(&HashSet::from([b])).unwrap(), 0);
+    s.set_parked(b, false);
+    assert_eq!(
+        s.flat_table(b).unwrap().to_vec(),
+        s.table.flatten(b).unwrap()
+    );
+}

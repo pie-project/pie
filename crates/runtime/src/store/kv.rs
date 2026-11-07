@@ -1026,6 +1026,20 @@ impl KvStore {
         Arc::clone(&self.moved)
     }
 
+    /// A parked set reads nothing: whatever it shares is free to move, and
+    /// it takes back what moved before it runs.
+    pub fn set_parked(&mut self, ws: WorkingSetId, parked: bool) {
+        self.table.set_suspended(&HashSet::from([ws]), parked);
+        // A peer's moves refresh only its own map.
+        self.refresh_flat(ws);
+    }
+
+    /// Whether a move holds any page `working_sets` map: what they name is
+    /// not where the flat map says until it ends.
+    pub fn in_move(&self, working_sets: &HashSet<WorkingSetId>) -> Result<bool, KvStoreError> {
+        Ok(self.table.in_move(working_sets)?)
+    }
+
     pub fn fork(&mut self, ws: WorkingSetId) -> Result<WorkingSetId, KvStoreError> {
         let child = self.table.fork(ws)?;
         self.refresh_flat(child);

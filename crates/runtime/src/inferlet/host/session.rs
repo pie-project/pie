@@ -1,3 +1,4 @@
+use crate::handle::{Kind, Moved};
 use crate::inferlet::host::frames::{Frames, Pcm, audio_extension, image_extension};
 use crate::inferlet::host::pie;
 use crate::inferlet::host::pie::inferlet::frames::{AudioFormat, ImageFormat};
@@ -20,6 +21,19 @@ async fn idle_while<T>(pid: crate::inferlet::ProcessId, wait: impl Future<Output
         planner.set_idle(pid, false);
     }
     out
+}
+
+impl ProcessCtx {
+    /// Whether the launch expected `name`, which then lands with it at exit.
+    fn gave(&mut self, name: &str, kind: Kind, rep: u32) -> bool {
+        match self.handles() {
+            Some(handles) if handles.expects(name) => {
+                handles.give(name.to_string(), Moved { kind, rep });
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 fn suggested_name(name: &str, extension: &str) -> String {
@@ -170,6 +184,84 @@ impl pie::inferlet::session::Host for ProcessCtx {
 
     async fn file(&mut self, name: String) -> Result<Option<Vec<u8>>> {
         Ok(ProcessCtx::file(self, &name))
+    }
+
+    async fn take_working_set(
+        &mut self,
+        name: String,
+    ) -> Result<Option<Resource<crate::inferlet::host::working_set::WorkingSet>>> {
+        Ok(self
+            .handles()
+            .and_then(|handles| handles.take(&name, Kind::WorkingSet))
+            .map(Resource::new_own))
+    }
+
+    async fn take_frames(&mut self, name: String) -> Result<Option<Resource<Frames>>> {
+        Ok(self
+            .handles()
+            .and_then(|handles| handles.take(&name, Kind::Frames))
+            .map(Resource::new_own))
+    }
+
+    async fn give_frames(
+        &mut self,
+        name: String,
+        f: Resource<Frames>,
+    ) -> Result<Result<(), String>> {
+        if self.gave(&name, Kind::Frames, f.rep()) {
+            return Ok(Ok(()));
+        }
+        pie::inferlet::frames::HostFrames::drop(self, f).await?;
+        Ok(Err(format!("this launch expects no frames `{name}`")))
+    }
+
+    async fn take_pcm(&mut self, name: String) -> Result<Option<Resource<Pcm>>> {
+        Ok(self
+            .handles()
+            .and_then(|handles| handles.take(&name, Kind::Pcm))
+            .map(Resource::new_own))
+    }
+
+    async fn give_pcm(&mut self, name: String, p: Resource<Pcm>) -> Result<Result<(), String>> {
+        if self.gave(&name, Kind::Pcm, p.rep()) {
+            return Ok(Ok(()));
+        }
+        pie::inferlet::frames::HostPcm::drop(self, p).await?;
+        Ok(Err(format!("this launch expects no pcm `{name}`")))
+    }
+
+    async fn take_matcher(
+        &mut self,
+        name: String,
+    ) -> Result<Option<Resource<crate::inferlet::host::grammar::Matcher>>> {
+        Ok(self
+            .handles()
+            .and_then(|handles| handles.take(&name, Kind::Matcher))
+            .map(Resource::new_own))
+    }
+
+    async fn give_matcher(
+        &mut self,
+        name: String,
+        matcher: Resource<crate::inferlet::host::grammar::Matcher>,
+    ) -> Result<Result<(), String>> {
+        if self.gave(&name, Kind::Matcher, matcher.rep()) {
+            return Ok(Ok(()));
+        }
+        pie::inferlet::grammar::HostMatcher::drop(self, matcher).await?;
+        Ok(Err(format!("this launch expects no matcher `{name}`")))
+    }
+
+    async fn give_working_set(
+        &mut self,
+        name: String,
+        ws: Resource<crate::inferlet::host::working_set::WorkingSet>,
+    ) -> Result<Result<(), String>> {
+        if self.gave(&name, Kind::WorkingSet, ws.rep()) {
+            return Ok(Ok(()));
+        }
+        pie::inferlet::working_set::HostWorkingSet::drop(self, ws).await?;
+        Ok(Err(format!("this launch expects no working set `{name}`")))
     }
 
     async fn receive_blocking(&mut self) -> Result<Option<String>> {

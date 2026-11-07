@@ -216,6 +216,8 @@ impl ResidencyPlanner {
                 .iter()
                 .filter(|(pid, proc)| {
                     proc.admitted
+                        // On its way into a process: it was asked back.
+                        && (!proc.holder || proc.idle)
                         && if seating {
                             proc.idle || proc.held
                         } else {
@@ -387,6 +389,7 @@ impl ResidencyPlanner {
                         .filter_map(|((pid, quote), &rs)| {
                             let proc = inner.procs.get(pid)?;
                             if (proc.rank() <= head_rank && !proc.idle && !proc.held)
+                                || (proc.holder && !proc.idle)
                                 || proc.state != Residency::Resident
                                 || inner.host_swap_blocked.contains(pid)
                                 || inner.prepare_blocked.contains(pid)

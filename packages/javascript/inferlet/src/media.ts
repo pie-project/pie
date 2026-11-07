@@ -7,6 +7,7 @@
 // beside the tokens (`fwd.media(0, [img])`).
 
 import * as _media from 'pie:inferlet/media@0.3.0';
+import type * as _frames from 'pie:inferlet/frames@0.3.0';
 
 export class MediaError extends Error {
   constructor(message: string) {
@@ -36,6 +37,11 @@ export class Image {
 
   static fromBytes(data: Uint8Array): Image {
     return new Image(wit('image', () => _media.Image.fromBytes(data)));
+  }
+
+  /** One picture a process made or a client uploaded, with no codec between. */
+  static fromFrames(frames: { readonly handle: _frames.Frames }): Image {
+    return new Image(wit('image', () => _media.Image.fromFrames(frames.handle)));
   }
 
   /** The placeholder run this span enters the sequence as. */

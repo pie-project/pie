@@ -485,6 +485,8 @@ impl Session {
         mut props: client_api::Props,
         session: Option<String>,
         files: client_api::Files,
+        handles: client_api::Handles,
+        returns: client_api::Handles,
         cluster_props: client_api::Props,
         executors: Vec<String>,
     ) {
@@ -548,6 +550,14 @@ impl Session {
             return;
         }
 
+        let room = crate::handle::state_room;
+        let lease = match self.handles.lend(self.id, handles, returns, room) {
+            Ok(lease) => lease,
+            Err(why) => {
+                self.send_response(corr_id, false, why.to_string()).await;
+                return;
+            }
+        };
         let client_id = if capture_outputs { Some(self.id) } else { None };
         match process::spawn(
             self.username.clone(),
@@ -557,6 +567,7 @@ impl Session {
             client_id,
             capture_outputs,
             None,
+            lease,
             crate::policy::Arrival {
                 tenant: self.tenant.clone(),
                 session,
@@ -761,6 +772,40 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Answers as a launch does, so the file comes under an id every layer
+    /// between here and the client already routes.
+    pub(super) async fn handle_read_handle(
+        &mut self,
+        corr_id: u32,
+        name: client_api::HandleName,
+        format: &str,
+        reader: &str,
+    ) {
+        let read = uuid::Uuid::parse_str(reader)
+            .map_err(|_| "invalid: a reader is a UUID".to_string())
+            .and_then(|id| Ok((id, self.handles.read(name, format)?)));
+        let (id, (encode, file)) = match read {
+            Ok(read) => read,
+            Err(why) => {
+                self.send_response(corr_id, false, why).await;
+                return;
+            }
+        };
+        self.send_response(corr_id, true, id.to_string()).await;
+        let client_id = self.id;
+        crate::rt::spawn(async move {
+            let ended = match crate::rt::spawn_blocking(encode).await {
+                Ok(Ok(data)) => {
+                    let _ = super::send_file(client_id, id, data.into(), Some(file));
+                    process::ProcessEvent::Return(String::new())
+                }
+                Ok(Err(why)) => process::ProcessEvent::Error(why),
+                Err(error) => process::ProcessEvent::Error(error.to_string()),
+            };
+            let _ = super::send_event(client_id, id, &ended);
+        });
     }
 
     pub(super) async fn send_file_download(

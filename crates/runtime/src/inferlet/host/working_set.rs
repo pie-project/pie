@@ -96,6 +96,53 @@ fn new_rs(ctx: &mut ProcessCtx) -> Result<u32> {
     Ok(ctx.ctx().table.push(ws)?.rep())
 }
 
+/// A working set made for `ctx` where it runs: what a handle no process has
+/// touched yet becomes when one binds it.
+pub(crate) fn materialize(ctx: &mut ProcessCtx) -> Result<u32> {
+    let kv = new_kv(ctx)?;
+    let rs = if crate::model::model().rs_caps().has_state() {
+        Some(new_rs(ctx)?)
+    } else {
+        None
+    };
+    Ok(ctx
+        .ctx()
+        .table
+        .push(WorkingSet {
+            kv,
+            rs,
+            cursor: Arc::new(Mutex::new(Cursor::default())),
+        })?
+        .rep())
+}
+
+/// `ctx` takes a working set made elsewhere, as if it had made it.
+pub(crate) fn adopt(
+    ctx: &mut ProcessCtx,
+    kv: KvWorkingSet,
+    rs: Option<RsWorkingSet>,
+    cursor: Cursor,
+) -> Result<u32> {
+    ctx.register_kv_working_set(&kv);
+    let kv = ctx.ctx().table.push(kv)?.rep();
+    let rs = match rs {
+        Some(rs) => {
+            ctx.register_rs_working_set(rs.model, rs.engine, rs.id);
+            Some(ctx.ctx().table.push(rs)?.rep())
+        }
+        None => None,
+    };
+    Ok(ctx
+        .ctx()
+        .table
+        .push(WorkingSet {
+            kv,
+            rs,
+            cursor: Arc::new(Mutex::new(cursor)),
+        })?
+        .rep())
+}
+
 pub(crate) fn kv_of(ctx: &mut ProcessCtx, rep: u32) -> Result<KvWorkingSet> {
     let res: Resource<KvWorkingSet> = Resource::new_borrow(rep);
     Ok(ctx.ctx().table.get(&res)?.clone())
@@ -106,17 +153,7 @@ impl pie::inferlet::working_set::Host for ProcessCtx {}
 impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
     async fn new(&mut self) -> Result<Resource<WorkingSet>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        let kv = new_kv(self)?;
-        let rs = if crate::model::model().rs_caps().has_state() {
-            Some(new_rs(self)?)
-        } else {
-            None
-        };
-        Ok(self.ctx().table.push(WorkingSet {
-            kv,
-            rs,
-            cursor: Arc::new(Mutex::new(Cursor::default())),
-        })?)
+        Ok(Resource::new_own(materialize(self)?))
     }
 
     async fn reserve(

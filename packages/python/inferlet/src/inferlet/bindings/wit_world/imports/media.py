@@ -61,6 +61,16 @@ class Image:
     """
     
     @classmethod
+    def from_frames(cls, f: Any) -> Self:
+        """
+        A one-frame `frames` as `from-bytes` reads an encoded still: pixels
+        a process made, or a client uploaded, go on to a model with no
+        codec between. Errors on more than one frame.
+
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    @classmethod
     def from_bytes(cls, bytes: bytes) -> Self:
         """
         Encoded still image (PNG / JPEG / …). The host decodes it, frames

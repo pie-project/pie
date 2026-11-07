@@ -15,6 +15,7 @@ import * as witForward from 'pie:inferlet/forward@0.3.0';
 import * as witModel from 'pie:inferlet/model@0.3.0';
 import * as witPipeline from 'pie:inferlet/pipeline@0.3.0';
 import * as witWs from 'pie:inferlet/working-set@0.3.0';
+import * as witSession from 'pie:inferlet/session@0.3.0';
 
 import { Audio, Image } from '../media.js';
 import { Builder, DslChannel } from './builder.js';
@@ -272,6 +273,23 @@ export class WorkingSet {
     const out: WorkingSet = Object.create(WorkingSet.prototype);
     out.ws = ws;
     return out;
+  }
+
+  /** The handle the launch moved in under `name`, once. */
+  static take(name: string): WorkingSet {
+    const ws = witSession.takeWorkingSet(name);
+    if (ws === undefined) throw new Error(`the launch moved in no handle \`${name}\``);
+    return WorkingSet.wrap(ws);
+  }
+
+  /** The handle a client wrote in the input as `{"$handle": name}`. */
+  static fromInput(value: { $handle: string }): WorkingSet {
+    return WorkingSet.take(value.$handle);
+  }
+
+  /** Hands this set back to the client under the launch's `name`. Unusable after. */
+  give(name: string): void {
+    wit('give', () => witSession.giveWorkingSet(name, this.ws));
   }
 
   /** Lets passes write slots below `end`; needed only when the device computes the slots. */

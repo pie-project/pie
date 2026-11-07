@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 import json
 import msgpack
 import websockets
@@ -95,9 +96,11 @@ def program_file(path: str | Path) -> str:
 class Process:
     """Represents a running process on the server."""
 
-    def __init__(self, client, process_id: str):
+    def __init__(self, client, process_id: str, landing: "list[Handle] | None" = None):
         self.client = client
         self.process_id = process_id
+        # What this process gives back: it exists once the process has ended.
+        self.landing = landing or []
         self.event_queue = self.client.process_event_queues.get(process_id)
         if self.event_queue is None:
             raise Exception(
@@ -123,7 +126,11 @@ class Process:
         if self.event_queue is None:
             raise Exception("Event queue is not available for this process.")
         event_str, value = await self.event_queue.get()
-        return Event(event_str), value
+        event = Event(event_str)
+        if event == Event.Return:
+            for handle in self.landing:
+                handle.exists = True
+        return event, value
 
     async def result(self) -> Any:
         """Drain the process to its end and return what it returned: parsed
@@ -146,6 +153,109 @@ class Process:
         await self.client.terminate_process(self.process_id)
 
 
+HANDLE_CODES = ("unknown", "dead", "quota", "in_use", "invalid")
+
+
+class HandleError(Exception):
+    """A handle op or launch was refused. `code` says how: `unknown`, `dead`,
+    `quota`, `in_use` or `invalid`."""
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code or _refusal_code(message)
+
+
+def _refusal_code(message: str) -> str | None:
+    """The code a refusal's text starts with, if it is one."""
+    code = message.split(":", 1)[0]
+    return code if code in HANDLE_CODES else None
+
+
+class Handle:
+    """State this session owns between processes. Lazy: nothing exists on the
+    server until a process binds it, so making one costs a name."""
+
+    def __init__(self, client: "PieClient", name: int, exists: bool = True):
+        self.client = client
+        self.name = name
+        # False for an output a process has yet to make: it can land, and
+        # there is nothing yet to move in.
+        self.exists = exists
+
+    def marker(self, slot: str) -> dict:
+        """What the input carries where this handle goes."""
+        return {"$handle": slot}
+
+    async def fork(self) -> "Handle":
+        """An independent copy of this handle as it stands."""
+        child = self.client._next_handle()
+        await self.client._handle_op({"op": "fork", "name": child, "from": self.name})
+        return type(self)(self.client, child)
+
+    async def stat(self) -> dict:
+        return await self.client._handle_op({"op": "stat", "name": self.name})
+
+    async def close(self) -> None:
+        await self.client._handle_op({"op": "close", "name": self.name})
+
+
+class WorkingSet(Handle):
+    """One sequence's model state."""
+
+
+class Media(Handle):
+    """Host memory a process made or a client uploaded: it moves on to another
+    process without crossing the client, and comes down only when asked."""
+
+    async def read(self, format: str) -> bytes:
+        """The whole of this handle, encoded as `format`. It stays."""
+        # Picked here so the queue is open before the first chunk can arrive.
+        reader_id = str(uuid.uuid4())
+        reader = self.client._open_reader(reader_id)
+        ok, result = await self.client._send_msg_and_wait(
+            {"type": "read_handle", "name": self.name, "format": format, "reader": reader_id}
+        )
+        if not ok:
+            self.client._close_reader(reader_id)
+            raise HandleError(result)
+        data = None
+        while True:
+            event, value = await reader.recv()
+            if event == Event.File:
+                data = bytes(value)
+            elif event == Event.Return:
+                return data if data is not None else b""
+            elif event == Event.Error:
+                raise HandleError(value)
+
+    async def save(self, path: "str | Path", format: str | None = None) -> None:
+        """Writes this handle to `path`, encoded as its suffix says."""
+        path = Path(path)
+        path.write_bytes(await self.read(format or path.suffix.lstrip(".")))
+
+
+class Frames(Media):
+    """Pictures, or one: `count` frames of RGB8."""
+
+    def marker(self, slot: str) -> dict:
+        return {"$handle": slot, "kind": "frames"}
+
+
+class Pcm(Media):
+    """Sound: interleaved samples at a rate."""
+
+    def marker(self, slot: str) -> dict:
+        return {"$handle": slot, "kind": "pcm"}
+
+
+class Matcher(Handle):
+    """A grammar match in progress. It stands where it stood across processes
+    with the working set it constrains: move and fork them together."""
+
+    def marker(self, slot: str) -> dict:
+        return {"$handle": slot, "kind": "matcher"}
+
+
 class PieClient:
     """
     An asynchronous client for interacting with the Pie WebSocket server.
@@ -163,6 +273,7 @@ class PieClient:
             or the upgrade is rejected before the socket opens.
         """
         self.server_uri = server_uri
+        self._last_handle = 0
         self.identity = identity
         self.ws = None
         self.listener_task = None
@@ -492,12 +603,75 @@ class PieClient:
     # Process Lifecycle
     # =========================================================================
 
+    def _open_reader(self, reader_id: str) -> Process:
+        """A process-like stream that is listening before anything is sent."""
+        self.process_event_queues[reader_id] = asyncio.Queue()
+        return Process(self, reader_id)
+
+    def _close_reader(self, reader_id: str) -> None:
+        self.process_event_queues.pop(reader_id, None)
+
+    def _next_handle(self) -> int:
+        self._last_handle += 1
+        return self._last_handle
+
+    async def _handle_op(self, op: dict) -> dict:
+        ok, result = await self._send_msg_and_wait({"type": "handles", "ops": [op]})
+        if not ok:
+            raise HandleError(result)
+        answer = json.loads(result)[0]
+        if "error" in answer:
+            raise HandleError(answer["error"], answer.get("code"))
+        return answer
+
+    async def working_set(self) -> WorkingSet:
+        """A new, empty working set."""
+        name = self._next_handle()
+        await self._handle_op({"op": "new", "name": name, "kind": "working_set"})
+        return WorkingSet(self, name)
+
+    async def matcher(
+        self,
+        *,
+        json_schema: str | None = None,
+        regex: str | None = None,
+        ebnf: str | None = None,
+    ) -> Matcher:
+        """A matcher at the start of one grammar, or of any JSON given none.
+        The grammar compiles where a process binds it, and an error in it
+        fails that launch."""
+        source: Any = "json"
+        if json_schema is not None:
+            source = {"json_schema": json_schema}
+        elif regex is not None:
+            source = {"regex": regex}
+        elif ebnf is not None:
+            source = {"ebnf": ebnf}
+        name = self._next_handle()
+        await self._handle_op({"op": "new", "name": name, "kind": {"matcher": source}})
+        return Matcher(self, name)
+
+    async def frames(self, data: bytes | None = None) -> Frames:
+        """An upload, if `data` is given: encoded pictures, which decode where
+        a process binds them. Else a name for a process to give pictures to."""
+        name = self._next_handle()
+        if data is None:
+            return Frames(self, name, exists=False)
+        await self._handle_op({"op": "new", "name": name, "kind": {"frames": bytes(data)}})
+        return Frames(self, name)
+
+    def pcm(self) -> Pcm:
+        """A name for a process to give sound to."""
+        return Pcm(self, self._next_handle(), exists=False)
+
     async def launch_process(
         self,
         inferlet: str,
         input: dict | list | None = None,
         capture_outputs: bool = True,
         files: dict[str, bytes] | None = None,
+        handles: "dict[str, Handle] | None" = None,
+        returns: "dict[str, Handle] | None" = None,
     ) -> Process:
         """Launch a process. Returns a Process object for interaction.
 
@@ -505,6 +679,11 @@ class PieClient:
         :param input: A dict of input parameters, serialized to JSON.
         :param capture_outputs: If True, process outputs are streamed to the client.
         :param files: Files the inferlet reads with `session.file(name)`.
+        :param handles: Handles moved into the process, by the name its guest
+            takes each under. A moved handle cannot be used until it comes
+            back: fork first to keep one.
+        :param returns: What the process gives back, by the name it gives each
+            under.
         :return: A Process object for the launched inferlet.
         """
         msg = {
@@ -513,10 +692,14 @@ class PieClient:
             "input": json.dumps(input if input is not None else {}),
             "capture_outputs": capture_outputs,
             "files": files or {},
+            "handles": {name: h.name for name, h in (handles or {}).items()},
+            "returns": {name: h.name for name, h in (returns or {}).items()},
         }
         ok, result = await self._send_msg_and_wait(msg)
 
         if not ok:
+            if _refusal_code(result):
+                raise HandleError(result)
             raise Exception(f"Failed to launch process: {result}")
 
         process_id = result
@@ -527,10 +710,14 @@ class PieClient:
             for event_tuple in self.orphan_events.pop(process_id):
                 await queue.put(event_tuple)
 
-        return Process(self, process_id)
+        return Process(self, process_id, landing=list((returns or {}).values()))
 
     async def run(self, program: "Inferlet | str", /, **kwargs: Any) -> Process:
         """Launch an inferlet with keyword arguments as its input.
+
+        A `Handle` among the keyword arguments moves into the process and
+        comes back under the same handle: the guest finds it where the
+        argument is, and gives it back by the same name.
 
         A decorated function (`@inferlet`) is installed first if the server
         does not hold its exact source yet; a string is an installed
@@ -544,7 +731,11 @@ class PieClient:
                 program = await self.install_program_bytes(
                     program.source.encode("utf-8"), f"{program.name}.py", program.version
                 )
-        return await self.launch_process(program, input=kwargs)
+        moved = {name: arg for name, arg in kwargs.items() if isinstance(arg, Handle)}
+        present = {name: arg for name, arg in moved.items() if arg.exists}
+        input = {name: arg for name, arg in kwargs.items() if name not in moved}
+        input |= {name: arg.marker(name) for name, arg in present.items()}
+        return await self.launch_process(program, input=input, handles=present, returns=moved)
 
     async def attach_process(self, process_id: str) -> Process:
         """Attach to an existing process.

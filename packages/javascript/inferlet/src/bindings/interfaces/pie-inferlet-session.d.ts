@@ -39,6 +39,45 @@ export function sendFileAs(data: Blob, name: string): void;
  */
 export function file(name: string): Blob | undefined;
 /**
+ * The working set the launch moved in under `name`, once; none if it
+ * moved no such handle. It is new if nothing has written it yet.
+ */
+export function takeWorkingSet(name: string): WorkingSet | undefined;
+/**
+ * Hands `ws` to the client as what the launch named `name` in its
+ * returns. It lands in the client's session when this process ends, once
+ * its last fire has settled. Refused if the launch expects no such
+ * return, or has one already; `ws` is dropped either way it fails.
+ */
+export function giveWorkingSet(name: string, ws: WorkingSet): void;
+/**
+ * `take-working-set` for a matcher: it stands where the client left it,
+ * or at the start of the grammar it wrote.
+ */
+export function takeMatcher(name: string): Matcher | undefined;
+/**
+ * `give-working-set` for a matcher.
+ */
+export function giveMatcher(name: string, matcher: Matcher): void;
+/**
+ * `take-working-set` for pictures: a process's output, or a client's
+ * upload, decoded.
+ */
+export function takeFrames(name: string): Frames | undefined;
+/**
+ * `give-working-set` for pictures: the client saves them or moves them
+ * on to another process, and they never cross linear memory.
+ */
+export function giveFrames(name: string, f: Frames): void;
+/**
+ * `take-frames` for sound.
+ */
+export function takePcm(name: string): Pcm | undefined;
+/**
+ * `give-frames` for sound.
+ */
+export function givePcm(name: string, p: Pcm): void;
+/**
  * Encodes `f` and streams the bytes to the client under `name`, WITHOUT
  * the encoded file ever entering WASM linear memory.
  * 
@@ -85,3 +124,5 @@ export type Frames = import('./pie-inferlet-frames.js').Frames;
 export type Pcm = import('./pie-inferlet-frames.js').Pcm;
 export type ImageFormat = import('./pie-inferlet-frames.js').ImageFormat;
 export type AudioFormat = import('./pie-inferlet-frames.js').AudioFormat;
+export type WorkingSet = import('./pie-inferlet-working-set.js').WorkingSet;
+export type Matcher = import('./pie-inferlet-grammar.js').Matcher;

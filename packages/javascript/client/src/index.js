@@ -173,9 +173,11 @@ export class Process {
      * @param {PieClient} client The PieClient that owns this process.
      * @param {string} processId The UUID of the process.
      */
-    constructor(client, processId) {
+    constructor(client, processId, landing = []) {
         this.client = client;
         this.processId = processId;
+        // What this process gives back: it exists once the process has ended.
+        this.landing = landing;
         this.eventQueue = client.processEventQueues.get(processId);
         if (!this.eventQueue) {
             throw new Error(`Internal error: No event queue for process ${processId}`);
@@ -207,6 +209,9 @@ export class Process {
             throw new Error("Event queue is not available for this process.");
         }
         const [event, value] = await this.eventQueue.get();
+        if (event === "return") {
+            for (const handle of this.landing) handle.exists = true;
+        }
         return { event, value };
     }
 
@@ -251,6 +256,114 @@ export function withUpgradePath(serverUri) {
         url.pathname = '/v1/ws';
     }
     return url.toString();
+}
+
+const HANDLE_CODES = ["unknown", "dead", "quota", "in_use", "invalid"];
+
+/** The code a refusal's text starts with, if it is one. */
+function refusalCode(message) {
+    const code = message.split(":", 1)[0];
+    return HANDLE_CODES.includes(code) ? code : null;
+}
+
+/**
+ * A handle op or launch was refused. `code` says how: `unknown`, `dead`,
+ * `quota`, `in_use` or `invalid`.
+ */
+export class HandleError extends Error {
+    constructor(message, code = null) {
+        super(message);
+        this.code = code ?? refusalCode(message);
+    }
+}
+
+/**
+ * State this session owns between processes. Lazy: nothing exists on the
+ * server until a process binds it, so making one costs a name.
+ */
+export class Handle {
+    constructor(client, name, exists = true) {
+        this.client = client;
+        this.name = name;
+        // False for an output a process has yet to make: it can land, and
+        // there is nothing yet to move in.
+        this.exists = exists;
+    }
+
+    /** What the input carries where this handle goes. */
+    marker(slot) {
+        return { $handle: slot };
+    }
+
+    /** An independent copy of this handle as it stands. */
+    async fork() {
+        const child = this.client._nextHandle();
+        await this.client._handleOp({ op: "fork", name: child, from: this.name });
+        return new this.constructor(this.client, child);
+    }
+
+    async stat() {
+        return await this.client._handleOp({ op: "stat", name: this.name });
+    }
+
+    async close() {
+        await this.client._handleOp({ op: "close", name: this.name });
+    }
+}
+
+/** One sequence's model state. */
+export class WorkingSet extends Handle {}
+
+/**
+ * A grammar match in progress. It stands where it stood across processes with
+ * the working set it constrains: move and fork them together.
+ */
+export class Matcher extends Handle {
+    marker(slot) {
+        return { $handle: slot, kind: "matcher" };
+    }
+}
+
+/**
+ * Host memory a process made or a client uploaded: it moves on to another
+ * process without crossing the client, and comes down only when asked.
+ */
+export class Media extends Handle {
+    /** The whole of this handle, encoded as `format`. It stays. */
+    async read(format) {
+        // Picked here so the queue is open before the first chunk can arrive.
+        const readerId = globalThis.crypto.randomUUID();
+        this.client._openProcess(readerId);
+        const reader = new Process(this.client, readerId);
+        const { ok, result } = await this.client._sendMsgAndWait({
+            type: "read_handle", name: this.name, format, reader: readerId,
+        });
+        if (!ok) {
+            this.client.processEventQueues.delete(readerId);
+            throw new HandleError(result);
+        }
+        let data = new Uint8Array();
+        for (;;) {
+            const { event, value } = await reader.recv();
+            if (event === "file") data = value;
+            if (event === "return") return data;
+            if (event === "error") throw new HandleError(value);
+        }
+    }
+}
+
+/** Pictures, or one: `count` frames of RGB8. */
+export class Frames extends Media {
+    marker(slot) {
+        return { $handle: slot, kind: "frames" };
+    }
+}
+
+/** Sound: interleaved samples at a rate. */
+export class Pcm extends Media {
+    marker(slot) {
+        return { $handle: slot, kind: "pcm" };
+    }
 }
 
 export class PieClient {
@@ -589,6 +702,79 @@ export class PieClient {
     }
 
     // =========================================================================
+    // Handles
+    // =========================================================================
+
+    /** The queue a process's events arrive on, with any that came first. */
+    _openProcess(processId) {
+        const queue = new AsyncQueue();
+        this.processEventQueues.set(processId, queue);
+        if (this.orphanEvents.has(processId)) {
+            for (const tuple of this.orphanEvents.get(processId)) {
+                queue.put(tuple);
+            }
+            this.orphanEvents.delete(processId);
+        }
+        return queue;
+    }
+
+    _nextHandle() {
+        this.lastHandle = (this.lastHandle ?? 0) + 1;
+        return this.lastHandle;
+    }
+
+    async _handleOp(op) {
+        const { ok, result } = await this._sendMsgAndWait({ type: "handles", ops: [op] });
+        if (!ok) throw new HandleError(result);
+        const [answer] = JSON.parse(result);
+        if (answer.error) throw new HandleError(answer.error, answer.code);
+        return answer;
+    }
+
+    /** A new, empty working set. */
+    async workingSet() {
+        const name = this._nextHandle();
+        await this._handleOp({ op: "new", name, kind: "working_set" });
+        return new WorkingSet(this, name);
+    }
+
+    /**
+     * An upload, if `data` is given: encoded pictures, which decode where a
+     * process binds them. Else a name for a process to give pictures to.
+     * @param {Uint8Array} [data]
+     */
+    async frames(data) {
+        const name = this._nextHandle();
+        if (data === undefined) return new Frames(this, name, false);
+        // A Buffer goes out as msgpack bin; a bare Uint8Array as an extension.
+        const bytes = typeof Buffer !== 'undefined' && !Buffer.isBuffer(data)
+            ? Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+            : data;
+        await this._handleOp({ op: "new", name, kind: { frames: bytes } });
+        return new Frames(this, name);
+    }
+
+    /** A name for a process to give sound to. */
+    pcm() {
+        return new Pcm(this, this._nextHandle(), false);
+    }
+
+    /**
+     * A matcher at the start of one grammar, or of any JSON given none. The
+     * grammar compiles where a process binds it, and an error fails that launch.
+     * @param {{jsonSchema?: string, regex?: string, ebnf?: string}} [grammar]
+     */
+    async matcher({ jsonSchema, regex, ebnf } = {}) {
+        let source = "json";
+        if (jsonSchema !== undefined) source = { json_schema: jsonSchema };
+        else if (regex !== undefined) source = { regex };
+        else if (ebnf !== undefined) source = { ebnf };
+        const name = this._nextHandle();
+        await this._handleOp({ op: "new", name, kind: { matcher: source } });
+        return new Matcher(this, name);
+    }
+
+    // =========================================================================
     // Process Lifecycle
     // =========================================================================
 
@@ -598,33 +784,35 @@ export class PieClient {
      * @param {Object} [input={}] Input parameters object, serialized to JSON.
      * @param {boolean} [captureOutputs=true] Stream outputs to client.
      * @param {Object<string, Uint8Array>} [files={}] Files the inferlet reads with `session.file(name)`.
+     * @param {{handles?: Object<string, Handle>, returns?: Object<string, Handle>}} [moved]
+     *   Handles moved into the process, and what it gives back, by the guest's names.
      * @returns {Promise<Process>}
      */
-    async launchProcess(inferlet, input = {}, captureOutputs = true, files = {}) {
+    async launchProcess(
+        inferlet, input = {}, captureOutputs = true, files = {}, { handles = {}, returns = {} } = {},
+    ) {
+        const names = (moved) => Object.fromEntries(
+            Object.entries(moved).map(([name, handle]) => [name, handle.name]),
+        );
         const msg = {
             type: "launch_process",
             inferlet,
             input: JSON.stringify(input),
             capture_outputs: captureOutputs,
             files,
+            handles: names(handles),
+            returns: names(returns),
         };
         const { ok, result } = await this._sendMsgAndWait(msg);
         if (!ok) {
+            if (refusalCode(result)) throw new HandleError(result);
             throw new Error(`Failed to launch process: ${result}`);
         }
 
         const processId = result;
-        const queue = new AsyncQueue();
-        this.processEventQueues.set(processId, queue);
-        // Replay orphan events
-        if (this.orphanEvents.has(processId)) {
-            for (const tuple of this.orphanEvents.get(processId)) {
-                queue.put(tuple);
-            }
-            this.orphanEvents.delete(processId);
-        }
+        const queue = this._openProcess(processId);
 
-        return new Process(this, processId);
+        return new Process(this, processId, Object.values(returns));
     }
 
     /**
@@ -646,7 +834,23 @@ export class PieClient {
             }
             program = program.program;
         }
-        return await this.launchProcess(program, input);
+        const plainObject = input !== null && typeof input === 'object' && !Array.isArray(input);
+        const moved = plainObject ? Object.fromEntries(
+            Object.entries(input).filter(([, arg]) => arg instanceof Handle),
+        ) : {};
+        if (Object.keys(moved).length === 0) return await this.launchProcess(program, input);
+        const present = Object.fromEntries(
+            Object.entries(moved).filter(([, arg]) => arg.exists),
+        );
+        const plain = Object.fromEntries(
+            Object.entries(input).filter(([name]) => !(name in moved)),
+        );
+        const marked = Object.fromEntries(
+            Object.entries(present).map(([name, arg]) => [name, arg.marker(name)]),
+        );
+        return await this.launchProcess(
+            program, { ...plain, ...marked }, true, {}, { handles: present, returns: moved },
+        );
     }
 
     /**

@@ -985,6 +985,7 @@ async fn run_prefill(tokens: &[u32]) -> Result<()> {
         None,
         false,
         Some(tx),
+        None,
         crate::policy::Arrival::default(),
         Vec::new(),
     )?;

@@ -614,8 +614,12 @@ async fn run_turn(
         tokio::select! {
             _ = cancel.notified() => {
                 tracing::debug!(%req_id, "turn cancelled");
-                if let Some(pid) = &process_id {
-                    let _ = runtime::server::send_client_message(client_id, terminate(pid));
+                match (&process_id, corr) {
+                    (Some(pid), _) => {
+                        let _ = runtime::server::send_client_message(client_id, terminate(pid));
+                    }
+                    (None, Some(corr)) => runtime::server::forget_frame(client_id, corr),
+                    (None, None) => {}
                 }
                 return TurnEnd::Aborted;
             }
@@ -687,9 +691,13 @@ fn turn_terminal(
 ) -> bool {
     match msg {
         ServerMessage::Response {
-            corr_id, result, ..
+            corr_id,
+            ok,
+            result,
+            ..
         } if Some(*corr_id) == corr => {
-            if proc_launch {
+            // A refusal started nothing that could end this turn later.
+            if proc_launch && *ok {
                 if process_id.is_none() {
                     *process_id = Some(result.clone());
                 }
@@ -723,6 +731,8 @@ fn corr_id_of(m: &ClientMessage) -> Option<u32> {
         | Query { corr_id, .. }
         | AddProgram { corr_id, .. }
         | LaunchProcess { corr_id, .. }
+        | Handles { corr_id, .. }
+        | ReadHandle { corr_id, .. }
         | AttachProcess { corr_id, .. }
         | TerminateProcess { corr_id, .. }
         | ListProcesses { corr_id }
@@ -740,7 +750,9 @@ enum ProcBinding {
 impl ProcBinding {
     fn of(m: &ClientMessage) -> Self {
         match m {
-            ClientMessage::LaunchProcess { .. } => Self::FromReply,
+            ClientMessage::LaunchProcess { .. } | ClientMessage::ReadHandle { .. } => {
+                Self::FromReply
+            }
             ClientMessage::AttachProcess { process_id, .. } => Self::Known(process_id.clone()),
             _ => Self::None,
         }
@@ -759,5 +771,27 @@ fn upload_chunk_info(m: &ClientMessage) -> Option<(usize, usize)> {
             ..
         } => Some((*chunk_index, *total_chunks)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod handle_turn_tests {
+    use super::*;
+
+    fn reply(ok: bool) -> ServerMessage {
+        ServerMessage::Response {
+            corr_id: 3,
+            ok,
+            result: "why, or an id".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_refused_launch_or_read_ends_its_turn() {
+        let mut process = None;
+        assert!(turn_terminal(&reply(false), Some(3), true, &mut process));
+        assert_eq!(process, None, "a refusal names no process");
+        assert!(!turn_terminal(&reply(true), Some(3), true, &mut process));
+        assert_eq!(process.as_deref(), Some("why, or an id"));
     }
 }

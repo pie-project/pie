@@ -17,6 +17,8 @@ struct PipelineScopeState {
     id: PipelineScopeId,
     closed: std::sync::atomic::AtomicBool,
     drained: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Why its pipeline failed, once it has.
+    failure: crate::pipeline::fire::PipelineFailure,
 }
 
 impl std::fmt::Debug for PipelineScope {
@@ -30,7 +32,16 @@ impl std::fmt::Debug for PipelineScope {
 }
 
 impl PipelineScope {
+    #[cfg(test)]
     pub(crate) fn new(drained: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self::failing_as(Default::default(), drained)
+    }
+
+    /// A scope whose pipeline records its failure in `failure`.
+    pub(crate) fn failing_as(
+        failure: crate::pipeline::fire::PipelineFailure,
+        drained: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
         static NEXT_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             state: std::sync::Arc::new(PipelineScopeState {
@@ -39,8 +50,13 @@ impl PipelineScope {
                 )),
                 closed: std::sync::atomic::AtomicBool::new(false),
                 drained: Box::new(drained),
+                failure,
             }),
         }
+    }
+
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.state.failure.lock().unwrap().clone()
     }
 
     pub(crate) fn id(&self) -> PipelineScopeId {

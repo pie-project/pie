@@ -26,6 +26,8 @@ pub(super) struct Proc {
     pub(super) respawn: bool,
     pub(super) signal: Arc<Notify>,
     pub(super) resident: Arc<AtomicBool>,
+    /// A handle's stand-in: never ran, so its leaving is no completion.
+    pub(super) holder: bool,
     /// Waiting on its client: a victim for anyone, however old it is.
     pub(super) idle: bool,
     /// What an idle eviction freed; it asks for it back only once it wakes.
@@ -50,6 +52,13 @@ impl Proc {
         Rank::of(self.key, self.seq)
     }
 
+    /// A holder at rest: past every process, whose rank is what goes first,
+    /// and the longest parked past all. `order` counts up as holders park.
+    pub(super) fn rest(&mut self, order: u64) {
+        self.key = i64::MIN;
+        self.seq = u64::MAX - order;
+    }
+
     pub(super) fn new(seq: u64) -> Self {
         Self {
             seq,
@@ -62,6 +71,7 @@ impl Proc {
             respawn: false,
             signal: Arc::new(Notify::new()),
             resident: Arc::new(AtomicBool::new(true)),
+            holder: false,
             idle: false,
             parked: None,
             seatless: false,

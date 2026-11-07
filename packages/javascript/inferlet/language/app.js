@@ -94,6 +94,26 @@ function parseInput(raw) {
   }
 }
 
+/** The input with each `{"$handle": name}` the client wrote as the handle. */
+function hydrate(value) {
+  if (Array.isArray(value)) return value.map(hydrate);
+  if (value === null || typeof value !== 'object') return value;
+  if (value.kind === 'matcher' && '$handle' in value) {
+    return inferlet.grammar.Matcher.take(value.$handle);
+  }
+  if (value.kind === 'frames' && '$handle' in value) {
+    return inferlet.frames.Frames.take(value.$handle);
+  }
+  if (value.kind === 'pcm' && '$handle' in value) {
+    return inferlet.frames.Pcm.take(value.$handle);
+  }
+  const keys = Object.keys(value);
+  if (keys.length === 1 && keys[0] === '$handle') {
+    return inferlet.eta.WorkingSet.fromInput(value);
+  }
+  return Object.fromEntries(keys.map((key) => [key, hydrate(value[key])]));
+}
+
 function encode(result) {
   if (result == null) return '';
   if (typeof result === 'string') return result;
@@ -126,7 +146,7 @@ export const run = {
           'that exports `function main(input)` (or exports it as its default)',
         );
       }
-      return encode(await fn(inputData));
+      return encode(await fn(hydrate(inputData)));
     } catch (e) {
       throw describeError(e);
     }

@@ -131,6 +131,33 @@ impl pie::inferlet::media::HostImage for ProcessCtx {
         Ok(Ok(self.ctx().table.push(image)?))
     }
 
+    async fn from_frames(
+        &mut self,
+        f: Resource<crate::inferlet::host::frames::Frames>,
+    ) -> Result<Result<Resource<Image>, String>> {
+        let frames = self.ctx().table.get(&f)?;
+        if frames.count != 1 {
+            return Ok(Err(format!(
+                "image.from-frames: {} frames are not a still",
+                frames.count
+            )));
+        }
+        let (height, width) = (frames.height, frames.width);
+        let rgb = match frames.rgb8() {
+            Ok(rgb) => rgb.to_vec(),
+            Err(why) => return Ok(Err(why)),
+        };
+        let span = Rgb8::new(height, width, rgb)
+            .map_err(|fault| fault.to_string())
+            .and_then(|rgb| encode(&rgb, Budget::Still));
+        Ok(match span {
+            Ok(span) => Ok(self.ctx().table.push(Image {
+                span: Arc::new(span),
+            })?),
+            Err(why) => Err(why),
+        })
+    }
+
     async fn tokens(&mut self, this: Resource<Image>) -> Result<Vec<u32>> {
         Ok(self.ctx().table.get(&this)?.span.tokens())
     }

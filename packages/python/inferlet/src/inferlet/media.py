@@ -72,6 +72,14 @@ class Image(_Span):
         except _WitErr as e:
             raise MediaError(f"image: {e.value}") from None
 
+    @classmethod
+    def from_frames(cls, frames) -> "Image":
+        """One picture a process made or a client uploaded, with no codec between."""
+        try:
+            return cls(_media.Image.from_frames(frames.handle))
+        except _WitErr as e:
+            raise MediaError(f"image: {e.value}") from None
+
     def grid(self) -> MergedGrid:
         g = self._inner.grid()
         return MergedGrid(g.t, g.h, g.w)

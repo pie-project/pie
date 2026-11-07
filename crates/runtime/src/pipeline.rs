@@ -24,15 +24,16 @@ impl Pipeline {
     pub fn new() -> Self {
         let fires = Arc::new(PendingFireQueue::new());
         let weak_fires = Arc::downgrade(&fires);
+        let failure: PipelineFailure = Arc::new(Mutex::new(None));
         LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             fires,
-            failure: Arc::new(Mutex::new(None)),
-            scope: crate::store::PipelineScope::new(move || {
+            scope: crate::store::PipelineScope::failing_as(failure.clone(), move || {
                 weak_fires
                     .upgrade()
                     .is_none_or(|fires| fires.lock().unwrap().is_empty())
             }),
+            failure,
             frame_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }

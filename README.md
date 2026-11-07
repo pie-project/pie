@@ -108,6 +108,49 @@ client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
 print(client.chat.completions.create(model="default", messages=[{"role": "user", "content": "Hi"}]).choices[0].message.content)
 ```
 
+A program is short and its state need not be. A client can own the state, and
+run a new program on it each turn: nothing stays loaded between turns, a fork
+costs no device memory, and a turn resumes exactly where the last one stopped.
+
+```python
+ws = await client.working_set()                    # a name; nothing exists yet
+await (await client.run("chat@0.1.0", ws=ws, prompt="Hi")).result()
+checkpoint = await ws.fork()                       # to come back to
+await (await client.run("chat@0.1.0", ws=ws, prompt="Go on")).result()
+await (await client.run("chat@0.1.0", ws=checkpoint, prompt="Instead...")).result()
+```
+
+The inferlet finds the handle in its input and gives it back:
+
+```python
+async def main(input: dict) -> dict:
+    ws = input["ws"]                     # a WorkingSet, moved in
+    ...
+    ws.give("ws")
+    return {"text": text}
+```
+
+A handle is in one place at a time, so the client's next use waits for the
+program to give it back. It lives as long as the client's connection, on one
+worker, and the planner may move it off the device while it rests. If that
+worker is lost the connection closes and says so; a turn is never run again on
+what no longer exists. A `client.matcher(json_schema=...)` moves the same way,
+beside the working set it constrains.
+
+Pictures and sound work the same: a program gives them to the client, which
+saves them in the format it wants, or moves them on to another program with no
+bytes crossing the client:
+
+```python
+out = await client.frames()
+await (await client.run("image-gen@0.1.0", out=out, prompt="a cat")).result()
+await out.save("cat.png")
+await (await client.run("caption@0.1.0", image=out)).result()
+```
+
+See
+[`examples/working-set-handles`](examples/working-set-handles).
+
 To embed in a process, use [`pie-server`](https://pypi.org/project/pie-server/)
 (Python) or [`@pie-project/server`](https://www.npmjs.com/package/@pie-project/server)
 (Node and WebGPU browsers).

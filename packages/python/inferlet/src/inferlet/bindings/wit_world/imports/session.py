@@ -9,6 +9,8 @@ import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
 from ..imports import frames
+from ..imports import working_set
+from ..imports import grammar
 import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
@@ -66,6 +68,61 @@ def file(name: str) -> Optional[bytes]:
     """
     The file the client attached to this run under `name`
     (`pie run --file name=path`), or none.
+    """
+    raise NotImplementedError
+def take_working_set(name: str) -> Optional[working_set.WorkingSet]:
+    """
+    The working set the launch moved in under `name`, once; none if it
+    moved no such handle. It is new if nothing has written it yet.
+    """
+    raise NotImplementedError
+def give_working_set(name: str, ws: working_set.WorkingSet) -> None:
+    """
+    Hands `ws` to the client as what the launch named `name` in its
+    returns. It lands in the client's session when this process ends, once
+    its last fire has settled. Refused if the launch expects no such
+    return, or has one already; `ws` is dropped either way it fails.
+
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
+def take_matcher(name: str) -> Optional[grammar.Matcher]:
+    """
+    `take-working-set` for a matcher: it stands where the client left it,
+    or at the start of the grammar it wrote.
+    """
+    raise NotImplementedError
+def give_matcher(name: str, matcher: grammar.Matcher) -> None:
+    """
+    `give-working-set` for a matcher.
+
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
+def take_frames(name: str) -> Optional[frames.Frames]:
+    """
+    `take-working-set` for pictures: a process's output, or a client's
+    upload, decoded.
+    """
+    raise NotImplementedError
+def give_frames(name: str, f: frames.Frames) -> None:
+    """
+    `give-working-set` for pictures: the client saves them or moves them
+    on to another process, and they never cross linear memory.
+
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
+def take_pcm(name: str) -> Optional[frames.Pcm]:
+    """
+    `take-frames` for sound.
+    """
+    raise NotImplementedError
+def give_pcm(name: str, p: frames.Pcm) -> None:
+    """
+    `give-frames` for sound.
+
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError
 def send_frames(f: frames.Frames, format: frames.ImageFormat, name: str) -> None:

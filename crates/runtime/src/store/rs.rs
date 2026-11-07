@@ -226,6 +226,8 @@ pub struct RsStore {
     pending_touch: Vec<u32>,
     /// Checkpoints: hidden forks no process holds.
     checkpoints: HashMap<Hash256, RsCheckpoint>,
+    /// Slots a suspend or restore has between its prepare and commit.
+    moving: HashSet<RsSlotId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,6 +287,7 @@ impl RsStore {
             last_touch: Vec::new(),
             pending_touch: Vec::new(),
             checkpoints: HashMap::new(),
+            moving: HashSet::new(),
         }
     }
 
@@ -408,6 +411,18 @@ impl RsStore {
             *self.refs.entry(id).or_insert(1) += 1;
         }
         Ok(self.working_sets.insert(entry))
+    }
+
+    /// Whether a move holds a slot `ws` names.
+    pub fn in_move(&self, ws: RsWorkingSetId) -> bool {
+        self.entry(ws)
+            .is_ok_and(|entry| Self::slots(entry).any(|id| self.moving.contains(&id)))
+    }
+
+    /// Whether `ws` shares a slot with a fork: its next write takes its own.
+    pub fn shares_state(&self, ws: RsWorkingSetId) -> bool {
+        self.entry(ws)
+            .is_ok_and(|entry| Self::slots(entry).any(|id| self.ref_count(id) > 1))
     }
 
     /// Releases `ws`, returning how many slots it was the last holder of.
@@ -1287,6 +1302,7 @@ impl RsStore {
                 .get(snapshot)
                 .is_some_and(|entry| Self::slots(entry).any(|id| moving.contains(&id)))
         });
+        self.moving.extend(slots.iter().copied());
         Some(self.txn(working_sets, slots.into_iter().zip(host).collect()))
     }
 
@@ -1325,6 +1341,7 @@ impl RsStore {
         let held = self.held_within(&scope);
         let mut freed = Vec::new();
         for (device, host) in txn.moves {
+            self.moving.remove(&device);
             // A set released while the copy ran holds nothing; what it still
             // holds is as private and settled as the prepare found it, since
             // the process is fenced.
@@ -1349,6 +1366,9 @@ impl RsStore {
     }
 
     pub fn abort_suspend(&mut self, txn: RsResidencyTxn) {
+        for (device, _) in &txn.moves {
+            self.moving.remove(device);
+        }
         self.release_host(txn.moves.into_iter().map(|(_, host)| host));
     }
 
@@ -1367,6 +1387,7 @@ impl RsStore {
         }
         let mut slots = granted.slots.drain(..need.slots as usize);
         let mut pages = granted.pages.drain(..need.pages as usize);
+        self.moving.extend(swapped.iter().copied());
         let moves = swapped
             .into_iter()
             .map(|host| {
@@ -1386,20 +1407,32 @@ impl RsStore {
     pub fn commit_restore(&mut self, txn: RsResidencyTxn) -> usize {
         let mut restored = 0;
         for (host, device) in txn.moves {
-            if self.swap_within(&txn.scope, host, device) == 0 {
+            self.moving.remove(&host);
+            let within = self.swap_within(&txn.scope, host, device);
+            if within == 0 {
                 self.release_device([device]);
+                continue;
+            }
+            restored += 1;
+            // A fork made at rest reads the host copy still.
+            let others = self.ref_count(host) - within;
+            if others > 0 {
+                self.refs.insert(host, others);
+                self.refs.insert(device, within);
                 continue;
             }
             if let Some(count) = self.refs.remove(&host) {
                 self.refs.insert(device, count);
             }
             self.release_host([host]);
-            restored += 1;
         }
         restored
     }
 
     pub fn abort_restore(&mut self, txn: RsResidencyTxn) {
+        for (host, _) in &txn.moves {
+            self.moving.remove(host);
+        }
         self.release_device(txn.moves.into_iter().map(|(_, device)| device));
     }
 

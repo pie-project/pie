@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from componentize_py_types import Err as _WitErr
 from wit_world.imports import frames as _frames
+from wit_world.imports import session as _wit_session
 
 if TYPE_CHECKING:
     from .eta.bridge import Channel
@@ -57,6 +58,19 @@ class Frames:
     def handle(self):
         """The WIT resource, for the raw ``session.send_frames``."""
         return self._inner
+
+    @classmethod
+    def take(cls, name: str) -> "Frames":
+        """The handle the launch moved in under `name`, once."""
+        inner = _wit_session.take_frames(name)
+        if inner is None:
+            raise FramesError(f"the launch moved in no frames `{name}`")
+        return cls(inner)
+
+    def give(self, name: str) -> None:
+        """Hands these pictures to the client under the launch's `name`. Unusable after."""
+        inner, self._inner = self._inner, None
+        _call("give", _wit_session.give_frames, name, inner)
 
     @classmethod
     def from_channel(
@@ -126,6 +140,19 @@ class Pcm:
 
     def __init__(self, inner) -> None:
         self._inner = inner
+
+    @classmethod
+    def take(cls, name: str) -> "Pcm":
+        """The handle the launch moved in under `name`, once."""
+        inner = _wit_session.take_pcm(name)
+        if inner is None:
+            raise FramesError(f"the launch moved in no pcm `{name}`")
+        return cls(inner)
+
+    def give(self, name: str) -> None:
+        """Hands this sound to the client under the launch's `name`. Unusable after."""
+        inner, self._inner = self._inner, None
+        _call("give", _wit_session.give_pcm, name, inner)
 
     @property
     def handle(self):

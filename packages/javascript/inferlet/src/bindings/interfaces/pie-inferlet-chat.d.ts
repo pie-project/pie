@@ -79,7 +79,7 @@ export interface EventDone {
  * 
  * ## `"low"`
  */
-export type ReasoningEffort = "xhigh" | "medium" | "low";
+export type ReasoningEffort = 'xhigh' | 'medium' | 'low';
 
 export class Decoder {
   constructor()
