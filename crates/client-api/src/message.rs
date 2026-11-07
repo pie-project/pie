@@ -228,6 +228,18 @@ impl ClientMessage {
         }
     }
 
+    /// The handles this frame needs settled before it runs.
+    pub fn handle_names(&self) -> Vec<HandleName> {
+        match self {
+            ClientMessage::Handles { ops, .. } => ops.iter().flat_map(HandleOp::touches).collect(),
+            ClientMessage::ReadHandle { name, .. } => vec![*name],
+            ClientMessage::LaunchProcess {
+                handles, returns, ..
+            } => handles.values().chain(returns.values()).copied().collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn corr_id(&self) -> Option<u32> {
         match self {
             ClientMessage::AuthIdentify { corr_id, .. }

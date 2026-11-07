@@ -233,7 +233,8 @@ struct Session {
     pub(super) installed_programs: HashSet<ProgramName>,
     pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
     pub(super) handles: crate::handle::Table,
-    /// Frames naming a lent handle, in order: they run once it lands.
+    /// Frames naming a lent handle, or a handle an earlier frame here names,
+    /// in order: each handle's frames run as sent, once it lands.
     pub(super) waiting: VecDeque<ClientMessage>,
     out_tx: mpsc::Sender<WireServerMessage>,
 }
@@ -294,9 +295,7 @@ impl ServiceHandler for Session {
     async fn handle(&mut self, msg: SessionMessage) {
         match msg {
             SessionMessage::ClientRequest(client_msg) => {
-                if client_msg.uses_handles()
-                    && (!self.waiting.is_empty() || self.names_lent(&client_msg))
-                {
+                if client_msg.uses_handles() && self.must_wait(&client_msg) {
                     if self.waiting.len() < client_api::MAX_WAITING_HANDLE_FRAMES {
                         self.waiting.push_back(client_msg);
                     } else if let Some(corr_id) = client_msg.corr_id() {
@@ -339,31 +338,44 @@ impl ServiceHandler for Session {
 
 impl Session {
     async fn run_waiting(&mut self) {
-        while self
-            .waiting
-            .front()
-            .is_some_and(|frame| !self.names_lent(frame))
-        {
-            let frame = self.waiting.pop_front().expect("just seen");
+        while let Some(at) = self.next_ready() {
+            let frame = self.waiting.remove(at).expect("just found");
             self.handle_client_message(frame).await;
         }
     }
 
-    fn names_lent(&self, frame: &ClientMessage) -> bool {
-        match frame {
-            ClientMessage::Handles { ops, .. } => ops
-                .iter()
-                .flat_map(client_api::HandleOp::touches)
-                .any(|name| self.handles.lent(name)),
-            ClientMessage::ReadHandle { name, .. } => self.handles.lent(*name),
-            ClientMessage::LaunchProcess {
-                handles, returns, ..
-            } => handles
-                .values()
-                .chain(returns.values())
-                .any(|&name| self.handles.lent(name)),
-            _ => false,
+    /// The first waiting frame nothing holds up: what it names is settled,
+    /// and no frame before it names any of that.
+    fn next_ready(&self) -> Option<usize> {
+        let mut ahead = HashSet::new();
+        for (at, frame) in self.waiting.iter().enumerate() {
+            let names = frame.handle_names();
+            if !names.iter().any(|name| self.blocked(&ahead, *name)) {
+                return Some(at);
+            }
+            ahead.extend(names);
         }
+        None
+    }
+
+    fn must_wait(&self, frame: &ClientMessage) -> bool {
+        let ahead: HashSet<_> = self
+            .waiting
+            .iter()
+            .flat_map(ClientMessage::handle_names)
+            .collect();
+        frame
+            .handle_names()
+            .iter()
+            .any(|name| self.blocked(&ahead, *name))
+    }
+
+    fn blocked(
+        &self,
+        ahead: &HashSet<client_api::HandleName>,
+        name: client_api::HandleName,
+    ) -> bool {
+        ahead.contains(&name) || self.handles.lent(name)
     }
 
     async fn send(&self, msg: WireServerMessage) {
@@ -598,6 +610,35 @@ mod tests {
         session.handle(SessionMessage::Forget(5)).await;
         let left: Vec<_> = session.waiting.iter().map(ClientMessage::corr_id).collect();
         assert_eq!(left, [Some(6)], "the other keeps its place");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_passes_those_waiting_on_other_handles() {
+        let (mut session, _rx) = lent_session().await;
+        let stat = |corr_id, name| ClientMessage::Handles {
+            corr_id,
+            ops: vec![client_api::HandleOp::Stat { name }],
+        };
+        let fork = ClientMessage::Handles {
+            corr_id: 7,
+            ops: vec![client_api::HandleOp::Fork { name: 2, from: 1 }],
+        };
+        session.handle(SessionMessage::ClientRequest(fork)).await;
+        assert_eq!(session.waiting.len(), 1, "it reads what is lent");
+
+        session
+            .handle(SessionMessage::ClientRequest(stat(8, 2)))
+            .await;
+        assert_eq!(session.waiting.len(), 2, "it names what the fork makes");
+
+        session
+            .handle(SessionMessage::ClientRequest(stat(9, 3)))
+            .await;
+        assert_eq!(
+            session.waiting.len(),
+            2,
+            "an unrelated handle does not wait"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
