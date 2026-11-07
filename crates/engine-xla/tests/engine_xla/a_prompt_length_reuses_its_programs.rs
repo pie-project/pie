@@ -3,8 +3,9 @@
 //! before the prompt's end (where a hybrid keeps its recurrent state) leaves
 //! a tail whose length reaches no program text. Nor do the slots and pages a
 //! maintenance program (a slot's reset, a state or kv copy) moves: a new
-//! request lands in a new slot. Over a dry device: nothing runs, every new
-//! program is counted.
+//! request lands in a new slot. Nor does a decode's lane count grow its
+//! program past a round of recurrent state. Over a dry device: nothing runs,
+//! every new program is counted.
 
 use std::path::Path;
 
@@ -139,5 +140,40 @@ fn the_slots_a_request_lands_in_trace_no_new_program() {
         first + 1,
         "{} programs past the first slot's {first} and the four-run copy's one",
         texts.len() - first
+    );
+}
+
+/// The text of a decode of `lanes` lanes, each at 300 rows.
+fn decode_text(shell: &mut Shell, lanes: u32) -> usize {
+    let facts = shell.trace().facts.clone();
+    let pages: Vec<u32> = (0..CONTEXT / PAGE).collect();
+    let token = [7u32];
+    let seated: Vec<Seated<'_>> = (0..lanes)
+        .map(|lane| {
+            let mut seated = Seated::of(Lane {
+                slot: lane % SLOTS,
+                word: facts.word(&Request::new(1, false)),
+                tokens: &token,
+            });
+            seated.pages = &pages[..301u32.div_ceil(PAGE) as usize];
+            seated.held = Some(300);
+            seated
+        })
+        .collect();
+    shell.fire_full(&seated).expect("the decode fires");
+    let texts = shell.device().dry_texts();
+    texts.last().map(String::len).expect("the decode traced a program")
+}
+
+#[test]
+fn a_hybrid_decode_program_does_not_grow_with_its_lanes() {
+    let mut shell = shell("qwen35-d0.8b-bf16-kv-bf16");
+    let at_32 = decode_text(&mut shell, 32);
+    let at_64 = decode_text(&mut shell, 64);
+    // Unrolled, each round of 16 lanes added its gather, step and scatter to
+    // every recurrent layer: 64 lanes traced 1.6 times 32's text.
+    assert!(
+        at_64 * 10 <= at_32 * 11,
+        "a decode of 64 lanes traced {at_64} bytes and one of 32 lanes {at_32}"
     );
 }

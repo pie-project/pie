@@ -22,6 +22,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("Metal"),
                 .linkedFramework("Security"),
+                .linkedFramework("IOKit"),
                 .linkedLibrary("iconv"),
             ]
         ),
