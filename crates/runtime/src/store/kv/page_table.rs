@@ -81,6 +81,24 @@ pub struct TriePageLocation {
 
 type Runs = SmallVec<[Range<u32>; 2]>;
 
+/// A page as a snapshot keeps it.
+#[derive(Debug, Clone)]
+pub struct ExportedPage {
+    pub backing: KvPageBacking,
+    pub key: Option<Hash256>,
+    pub token_hashes: Vec<Option<Hash256>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportedSet {
+    pub pages: Vec<ExportedPage>,
+    pub page_len: u64,
+    pub folded: u64,
+    pub prompt_pages: u64,
+    pub supplied: u64,
+    pub logged: Vec<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PublishedPage {
     pub id: PhysicalKvPageId,
@@ -1436,10 +1454,15 @@ impl KvPageTable {
         Ok(staying)
     }
 
-    /// A running reader kept them on the device and has gone since.
+    /// A running reader kept them on the device and has gone since: readers
+    /// in `order`, then the rest, until `wanted` pages are found. The pages
+    /// `order` keeps, the first of a reader's, go only once nothing else will
+    /// do.
     pub fn stranded_pages(
         &self,
         keep: &HashSet<WorkingSetId>,
+        order: &[(WorkingSetId, u64)],
+        wanted: usize,
     ) -> Vec<(TriePageLocation, PhysicalKvPageId)> {
         let mut running = FxHashSet::default();
         for (ws, entry) in self.working_sets.iter() {
@@ -1454,20 +1477,47 @@ impl KvPageTable {
                 running.insert(location);
             });
         }
+        let mut kept = FxHashSet::default();
+        for &(ws, pages) in order {
+            let mut at = 0;
+            let _ = self.visit_working_set_locations(ws, |location| {
+                if at < pages {
+                    kept.insert(location);
+                }
+                at += 1;
+            });
+        }
         // Reader by reader, so a sweep short of room moves whole readers.
         let (mut seen, mut pages) = (FxHashSet::default(), Vec::new());
-        for (ws, entry) in self.working_sets.iter() {
-            if !entry.suspended {
-                continue;
+        let ordered: FxHashSet<_> = order.iter().map(|&(ws, _)| ws).collect();
+        let rest = self.working_sets.iter().map(|(ws, _)| ws);
+        let readers: Vec<_> = order
+            .iter()
+            .map(|&(ws, _)| ws)
+            .chain(rest.filter(|ws| !ordered.contains(ws)))
+            .filter(|&ws| {
+                self.working_sets
+                    .get(ws)
+                    .is_some_and(|entry| entry.suspended)
+            })
+            .collect();
+        for spare_kept in [false, true] {
+            for &ws in &readers {
+                if pages.len() >= wanted {
+                    return pages;
+                }
+                let _ = self.visit_working_set_locations(ws, |location| {
+                    if running.contains(&location)
+                        || (!spare_kept && kept.contains(&location))
+                        || !seen.insert(location)
+                    {
+                        return;
+                    }
+                    if let Ok(KvPageBacking::Resident(id)) = self.backing_at(&location) {
+                        pages.push((location, id));
+                    }
+                });
             }
-            let _ = self.visit_working_set_locations(ws, |location| {
-                if running.contains(&location) || !seen.insert(location) {
-                    return;
-                }
-                if let Ok(KvPageBacking::Resident(id)) = self.backing_at(&location) {
-                    pages.push((location, id));
-                }
-            });
         }
         pages
     }
@@ -1729,6 +1779,66 @@ impl KvPageTable {
 
     pub fn held_pages(&self, working_sets: &HashSet<WorkingSetId>) -> Result<usize, KvTableError> {
         Ok(self.locations(working_sets)?.len())
+    }
+
+    /// Every page of `ws`, first to last, and what the table knows of it.
+    pub fn exported(&self, ws: WorkingSetId) -> Result<ExportedSet, KvTableError> {
+        let entry = self.entry(ws)?;
+        let mut locations = Vec::with_capacity(entry.mapped_len as usize);
+        self.visit_working_set_locations(ws, |location| locations.push(location))?;
+        let mut pages = Vec::with_capacity(locations.len());
+        for location in locations {
+            pages.push(ExportedPage {
+                backing: self.backing_at(&location)?,
+                key: self.page_key_at(&location),
+                token_hashes: self.token_hashes_at(&location).unwrap_or_default().to_vec(),
+            });
+        }
+        let entry = self.entry(ws)?;
+        Ok(ExportedSet {
+            pages,
+            page_len: entry.page_len,
+            folded: entry.folded,
+            prompt_pages: entry.prompt_pages,
+            supplied: entry.supplied,
+            logged: entry.logged.clone(),
+        })
+    }
+
+    /// A working set of `pages`' own, as [`Self::exported`] said one stood,
+    /// with every page at `backings`.
+    pub fn imported(
+        &mut self,
+        set: ExportedSet,
+        backings: Vec<KvPageBacking>,
+    ) -> Result<WorkingSetId, KvTableError> {
+        let mapped_len = backings.len() as u64;
+        let (token_hashes, page_hashes) = set
+            .pages
+            .into_iter()
+            .map(|page| (page.token_hashes, page.key))
+            .unzip();
+        let node = self.nodes.insert(KvTrieNode {
+            parent: None,
+            children: SmallVec::new(),
+            pages: Pages::Owned {
+                backings,
+                token_hashes,
+                page_hashes,
+            },
+            exact_anchors: 0,
+            path_anchors: 0,
+        });
+        let ws = self.create_working_set();
+        self.move_terminal(ws, Some(node))?;
+        let entry = self.entry_mut(ws)?;
+        entry.page_len = set.page_len;
+        entry.mapped_len = mapped_len;
+        entry.folded = set.folded;
+        entry.prompt_pages = set.prompt_pages;
+        entry.supplied = set.supplied;
+        entry.logged = set.logged;
+        Ok(ws)
     }
 
     pub fn pin_working_sets(

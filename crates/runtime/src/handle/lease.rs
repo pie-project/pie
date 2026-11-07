@@ -35,6 +35,8 @@ pub(super) struct Bound {
 pub(crate) struct Lease {
     pub(super) session: ClientId,
     pub(super) bound: Vec<Bound>,
+    /// Each name's holder id, which what lands on it rests under.
+    pub(super) ids: HashMap<HandleName, ProcessId>,
     pub(super) returns: Handles,
 }
 
@@ -121,6 +123,7 @@ impl Lease {
             lost: Vec::new(),
             given: Vec::new(),
             returns: std::mem::take(&mut self.returns),
+            ids: std::mem::take(&mut self.ids),
         };
         while let Some(Bound { slot, name, handle }) = self.bound.pop() {
             match bind_one(ctx, handle) {
@@ -262,6 +265,7 @@ pub(crate) struct Bag {
     lost: Vec<(HandleName, String)>,
     given: Vec<(String, Moved)>,
     returns: Handles,
+    ids: HashMap<HandleName, ProcessId>,
 }
 
 impl Bag {
@@ -324,7 +328,7 @@ impl Bag {
             let Some(&name) = self.returns.get(&slot) else {
                 continue;
             };
-            let landed = match take_out(resources, residency, moved) {
+            let landed = match take_out(resources, residency, moved, self.ids[&name]) {
                 Ok(landed) => landed,
                 Err(error) => Slot::Dead(format!("taking `{slot}` from its process: {error}")),
             };
@@ -332,7 +336,7 @@ impl Bag {
         }
         // What the guest never took is as it came, whatever became of the guest.
         for (slot, (moved, name)) in self.taken {
-            let landed = match take_out(resources, residency, moved) {
+            let landed = match take_out(resources, residency, moved, self.ids[&name]) {
                 Ok(landed) => landed,
                 Err(error) => Slot::Dead(format!("taking `{slot}` from its process: {error}")),
             };
@@ -346,6 +350,7 @@ fn take_out(
     resources: &mut wasmtime::component::ResourceTable,
     residency: &Mutex<ProcessResidency>,
     moved: Moved,
+    holder: ProcessId,
 ) -> anyhow::Result<Slot> {
     use wasmtime::component::Resource;
     let rep = moved.rep;
@@ -386,5 +391,5 @@ fn take_out(
         }
         return Ok(Slot::Dead(format!("its pipeline failed: {why}")));
     }
-    Ok(Slot::Parked(Box::new(Held::park(kv, rs, cursor))))
+    Ok(Slot::Parked(Box::new(Held::park(holder, kv, rs, cursor))))
 }

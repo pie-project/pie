@@ -135,6 +135,54 @@ pub(crate) async fn read_device_kv(
         .await
 }
 
+/// Pages on `tier` copied into host slots `slots`, and those slots' bytes.
+pub(crate) async fn read_tier_kv(
+    engine_id: usize,
+    tier: ::engine::MemoryDomain,
+    pages: Vec<u32>,
+    slots: Vec<u32>,
+) -> Result<Vec<u8>> {
+    let copy = ::engine::KvCopy {
+        src: tier,
+        dst: ::engine::MemoryDomain::HostPinned,
+        src_page_ids: pages,
+        dst_page_ids: slots.clone(),
+        moves: Vec::new(),
+        windowed: Vec::new(),
+    };
+    scheduler_handle(engine_id)?
+        .host_kv(worker::HostKvOp::CopyRead(copy, slots))
+        .await
+}
+
+pub(crate) async fn read_host_kv(engine_id: usize, slots: Vec<u32>) -> Result<Vec<u8>> {
+    scheduler_handle(engine_id)?
+        .host_kv(worker::HostKvOp::Read(slots))
+        .await
+}
+
+pub(crate) async fn read_host_state(
+    engine_id: usize,
+    slots: Vec<u32>,
+    pages: Vec<u32>,
+) -> Result<Vec<u8>> {
+    scheduler_handle(engine_id)?
+        .host_kv(worker::HostKvOp::ReadState(slots, pages))
+        .await
+}
+
+pub(crate) async fn write_host_state(
+    engine_id: usize,
+    slots: Vec<u32>,
+    pages: Vec<u32>,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    scheduler_handle(engine_id)?
+        .host_kv(worker::HostKvOp::WriteState(slots, pages, bytes))
+        .await
+        .map(drop)
+}
+
 pub(crate) async fn write_host_kv(engine_id: usize, slots: Vec<u32>, bytes: Vec<u8>) -> Result<()> {
     scheduler_handle(engine_id)?
         .host_kv(worker::HostKvOp::Write(slots, bytes))

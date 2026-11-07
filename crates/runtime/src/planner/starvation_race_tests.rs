@@ -143,6 +143,8 @@ impl PoolPort for RacePool {
         &self,
         _keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
         _room: usize,
+        _order: &[(crate::store::kv::page_table::WorkingSetId, u64)],
+        _wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
@@ -1256,6 +1258,8 @@ impl PoolPort for RingPool {
         &self,
         _keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
         _room: usize,
+        _order: &[(crate::store::kv::page_table::WorkingSetId, u64)],
+        _wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }

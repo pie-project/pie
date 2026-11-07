@@ -69,7 +69,7 @@ pub enum GrammarSource {
 
 /// What a client can do to a handle without running anything: its lifetime,
 /// never its contents. Computing on one is a process's.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum HandleOp {
     /// Names an empty handle. Nothing exists until a process binds it.
@@ -88,18 +88,46 @@ pub enum HandleOp {
     Stat {
         name: HandleName,
     },
+    /// Merges `props`, as a process's are merged, for the worker policy to
+    /// read while the handle rests. A fork starts with none.
+    SetProps {
+        name: HandleName,
+        props: Props,
+    },
+    /// Keeps a resting working set as it stands under `snapshot`, past this
+    /// session and this server. The handle stays as it was.
+    Save {
+        name: HandleName,
+        snapshot: String,
+    },
+    /// `name` starts as a snapshot stands.
+    Load {
+        name: HandleName,
+        snapshot: String,
+    },
+    /// Handles loaded from it stay.
+    DeleteSnapshot {
+        snapshot: String,
+    },
+    ListSnapshots {
+        prefix: String,
+    },
 }
 
 impl HandleOp {
     /// The names this op needs settled before it runs.
     pub fn touches(&self) -> impl Iterator<Item = HandleName> {
         let (first, second) = match self {
-            HandleOp::New { name, .. } | HandleOp::Close { name } | HandleOp::Stat { name } => {
-                (*name, None)
-            }
-            HandleOp::Fork { name, from } => (*name, Some(*from)),
+            HandleOp::DeleteSnapshot { .. } | HandleOp::ListSnapshots { .. } => (None, None),
+            HandleOp::New { name, .. }
+            | HandleOp::Close { name }
+            | HandleOp::Stat { name }
+            | HandleOp::SetProps { name, .. }
+            | HandleOp::Save { name, .. }
+            | HandleOp::Load { name, .. } => (Some(*name), None),
+            HandleOp::Fork { name, from } => (Some(*name), Some(*from)),
         };
-        std::iter::once(first).chain(second)
+        first.into_iter().chain(second)
     }
 }
 
@@ -225,6 +253,18 @@ impl ClientMessage {
                 handles, returns, ..
             } => !handles.is_empty() || !returns.is_empty(),
             _ => false,
+        }
+    }
+
+    /// The handles this frame needs settled before it runs.
+    pub fn handle_names(&self) -> Vec<HandleName> {
+        match self {
+            ClientMessage::Handles { ops, .. } => ops.iter().flat_map(HandleOp::touches).collect(),
+            ClientMessage::ReadHandle { name, .. } => vec![*name],
+            ClientMessage::LaunchProcess {
+                handles, returns, ..
+            } => handles.values().chain(returns.values()).copied().collect(),
+            _ => Vec::new(),
         }
     }
 

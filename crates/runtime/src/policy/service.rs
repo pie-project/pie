@@ -223,7 +223,7 @@ fn run(program: Program, events: Receiver<Event>) {
                     retention = commit.retention.as_ref().map(|t| t.steps.len()),
                     "worker policy call"
                 );
-                enact(&mut registry, commit);
+                enact(&mut registry, commit, program.name());
             }
             Err(Fault::Dead(error)) => {
                 tracing::error!(policy = program.name(), %error, "worker policy is dead; its tables are withdrawn");
@@ -276,7 +276,7 @@ fn by_rule(offload: wit::Offload) -> super::offload::Rule {
     }
 }
 
-fn enact(registry: &mut Registry, commit: Commit) {
+fn enact(registry: &mut Registry, commit: Commit, policy: &str) {
     if let Some(table) = commit.schedule {
         schedule::install(Some(by_process(table)));
     }
@@ -292,6 +292,7 @@ fn enact(registry: &mut Registry, commit: Commit) {
     }
     if let Some(table) = commit.retention {
         retention::install(Some(by_owner(table)));
+        crate::planner::rekey_holders();
     }
     for (id, reason) in commit.terminate {
         if let Ok(pid) = ProcessId::from_str(&id) {
@@ -300,8 +301,15 @@ fn enact(registry: &mut Registry, commit: Commit) {
         }
     }
     for id in commit.discard {
-        if let Ok(owner) = ProcessId::from_str(&id) {
-            (registry.cache.discard)(owner);
+        let Ok(owner) = ProcessId::from_str(&id) else {
+            continue;
+        };
+        match registry.handles.get(&owner) {
+            Some(handle) => {
+                let why = format!("the worker policy `{policy}` discarded it");
+                crate::server::discard_handle(handle.resting.client, owner, why);
+            }
+            None => (registry.cache.discard)(owner),
         }
     }
     for (of, name, value) in commit.publish {
@@ -321,6 +329,12 @@ struct Cache {
     discard: fn(ProcessId),
     memory: fn() -> (u64, u64),
     swap: fn() -> (u64, u64),
+    /// Recurrent state slots on the device, then where they rest: capacity
+    /// and what is free, as `memory` and `swap` have it for kv.
+    state: fn() -> (u64, u64),
+    state_swap: fn() -> (u64, u64),
+    /// Whether a resting handle's state is on the device now.
+    resident: fn(ProcessId) -> Option<bool>,
 }
 
 const STORES: Cache = Cache {
@@ -371,6 +385,30 @@ const STORES: Cache = Cache {
             })
             .fold((0, 0), |(c, a), (cc, aa)| (c + cc, a + aa))
     },
+    state: || {
+        store_registry::all_for_model(0)
+            .iter()
+            .map(|stores| {
+                let rs = stores.rs.lock().unwrap();
+                (
+                    u64::from(rs.capacity().slots),
+                    u64::from(rs.available().slots),
+                )
+            })
+            .fold((0, 0), |(c, a), (cc, aa)| (c + cc, a + aa))
+    },
+    state_swap: || {
+        let stores = store_registry::all_for_model(0);
+        let capacity: u32 = stores
+            .iter()
+            .map(|stores| stores.rs.lock().unwrap().host_capacity().slots)
+            .sum();
+        let room: u32 = (0..stores.len())
+            .filter_map(|engine| crate::handle::state_room(Some(engine)))
+            .sum();
+        (u64::from(capacity), u64::from(room))
+    },
+    resident: |holder| crate::planner::planner_of(holder)?.holder_resident(holder),
     discard: |owner| {
         let mut freed = 0;
         for stores in store_registry::all_for_model(0) {
@@ -478,6 +516,13 @@ fn prop_value((name, value): (String, serde_json::Value)) -> Option<(String, Val
     Some((name, value))
 }
 
+/// A handle at rest, and since when.
+#[derive(Debug, Clone)]
+struct Rest {
+    resting: super::Resting,
+    since_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 struct Retained {
     tenant: String,
@@ -491,6 +536,7 @@ struct Registry {
     exited: HashMap<ProcessId, Proc>,
     terminated: HashSet<ProcessId>,
     retained: HashMap<ProcessId, Retained>,
+    handles: HashMap<ProcessId, Rest>,
     sessions: HashMap<String, Props>,
     cache: Cache,
     prompts: HashMap<ProcessId, (Arc<[u64]>, usize)>,
@@ -505,6 +551,7 @@ impl Registry {
             exited: HashMap::new(),
             terminated: HashSet::new(),
             retained: HashMap::new(),
+            handles: HashMap::new(),
             sessions: HashMap::new(),
             cache,
             prompts: HashMap::new(),
@@ -634,6 +681,31 @@ impl Registry {
                 );
                 return vec![exited, Edge::Retained(id.to_string())];
             }
+            Event::HandleRested(id, resting) => {
+                let rest = Rest {
+                    resting,
+                    since_ms: now_ms(),
+                };
+                self.handles.insert(id, rest);
+                Some(Edge::Retained(id.to_string()))
+            }
+            Event::HandleProps(id, props, names) => self.handles.get_mut(&id).map(|rest| {
+                rest.resting.props = props;
+                Edge::PropChanged(wit::Change {
+                    subject: Subject::WorkingSet(id.to_string()),
+                    names,
+                })
+            }),
+            Event::HandleLent(id) => {
+                self.handles.remove(&id);
+                None
+            }
+            Event::HandleGone(id, by) => self.handles.remove(&id).map(|_| {
+                Edge::Discarded(wit::Transition {
+                    subject: id.to_string(),
+                    by: wit_by(by),
+                })
+            }),
             Event::SessionProps(session, changes) => {
                 let current = self.sessions.remove(&session).unwrap_or_default();
                 let (merged, names) = match client_api::props::merge(&current, changes) {
@@ -729,6 +801,11 @@ impl Registry {
                 .iter()
                 .map(|(id, retained)| (id.to_string(), retained.clone()))
                 .collect(),
+            handles: self
+                .handles
+                .iter()
+                .map(|(id, rest)| (id.to_string(), rest.clone()))
+                .collect(),
             sessions: self.sessions.clone(),
             held: self.held.clone(),
             cache: self.cache,
@@ -749,6 +826,7 @@ struct Snapshot {
     procs: HashMap<String, Proc>,
     exited: HashMap<String, Proc>,
     retained: HashMap<String, Retained>,
+    handles: HashMap<String, Rest>,
     sessions: HashMap<String, Props>,
     held: Arc<PromptIndex>,
     cache: Cache,
@@ -816,9 +894,9 @@ impl Plane for Snapshot {
             // Cluster subjects: the worker plane sees none.
             SubjectKind::Group | SubjectKind::Link => Vec::new(),
             SubjectKind::WorkingSet => {
-                let mut ids: Vec<String> = self.cached().0.keys().cloned().collect();
-                ids.sort_unstable();
-                ids
+                let ids: BTreeSet<&String> =
+                    self.cached().0.keys().chain(self.handles.keys()).collect();
+                ids.into_iter().cloned().collect()
             }
         }
     }
@@ -873,6 +951,22 @@ impl Plane for Snapshot {
                     _ => None,
                 }
             }
+            Subject::WorkingSet(id) if self.handles.contains_key(id) => {
+                let Rest { resting, since_ms } = &self.handles[id];
+                match name {
+                    "tenant" => Some(Value::Text(resting.tenant.clone())),
+                    "session" => text(resting.session.as_ref()),
+                    "tokens" => Some(Value::Int(resting.tokens as i64)),
+                    "folded-tokens" => Some(Value::Int(resting.folded as i64)),
+                    "recurrent-slots" => Some(Value::Int(i64::from(resting.slots))),
+                    "resident" => ProcessId::from_str(id)
+                        .ok()
+                        .and_then(self.cache.resident)
+                        .map(Value::Boolean),
+                    "last-use-ms" => Some(Value::Int(*since_ms as i64)),
+                    _ => None,
+                }
+            }
             Subject::WorkingSet(id) => {
                 let (sets, page_size) = self.cached();
                 let set = sets.get(id)?;
@@ -924,6 +1018,23 @@ impl Plane for Snapshot {
                     };
                     Some(Value::Int((pages * u64::from(*page_size)) as i64))
                 }
+                // Hybrid models run out of these before they run out of kv.
+                // Free at rest is what more handles can still come to rest
+                // on: state has no disk tier, so past it they are refused.
+                "capacity-slots" | "used-slots" => {
+                    let (capacity, available) = (self.cache.state)();
+                    Some(Value::Int(match name {
+                        "capacity-slots" => capacity,
+                        _ => capacity.saturating_sub(available),
+                    } as i64))
+                }
+                "swap-capacity-slots" | "swap-used-slots" => {
+                    let (capacity, available) = (self.cache.state_swap)();
+                    Some(Value::Int(match name {
+                        "swap-capacity-slots" => capacity,
+                        _ => capacity.saturating_sub(available),
+                    } as i64))
+                }
                 _ => None,
             },
             _ => None,
@@ -940,6 +1051,10 @@ impl Plane for Snapshot {
                 let value = self.sessions.get(id)?.get(name)?;
                 prop_value((name.to_string(), value.clone())).map(|(_, value)| value)
             }
+            Subject::WorkingSet(id) => {
+                let value = self.handles.get(id)?.resting.props.get(name)?;
+                prop_value((name.to_string(), value.clone())).map(|(_, value)| value)
+            }
             _ => None,
         }
     }
@@ -954,7 +1069,8 @@ impl Plane for Snapshot {
 
     fn discardable(&self, working_set: &str) -> bool {
         // A live one ends with its owner: terminate that instead.
-        self.cached().0.contains_key(working_set) && !self.procs.contains_key(working_set)
+        self.handles.contains_key(working_set)
+            || (self.cached().0.contains_key(working_set) && !self.procs.contains_key(working_set))
     }
 }
 
@@ -975,6 +1091,9 @@ mod tests {
         discard: |_| {},
         memory: || (100, 40),
         swap: || (400, 300),
+        state: || (4, 1),
+        state_swap: || (8, 3),
+        resident: |_| None,
     };
 
     fn arrive(registry: &mut Registry, tenant: &str, session: Option<&str>) -> ProcessId {
@@ -1086,7 +1205,78 @@ mod tests {
         discard: |_| {},
         memory: || (100, 40),
         swap: || (400, 300),
+        state: || (4, 1),
+        state_swap: || (8, 3),
+        resident: |_| None,
     };
+
+    #[test]
+    fn a_resting_handle_is_a_working_set_the_policy_reads_and_may_discard() {
+        let mut registry = Registry::new(TEST_CACHE);
+        let id = ProcessId::new_v4();
+        let rest = Event::HandleRested(
+            id,
+            crate::policy::Resting {
+                client: 1,
+                tenant: "t".into(),
+                session: Some("chat".into()),
+                props: props(json!({"pico/frozen-tokens": 512})),
+                tokens: 640,
+                folded: 512,
+                slots: 1,
+            },
+        );
+        assert!(
+            matches!(&registry.apply(rest.clone())[..], [Edge::Retained(seen)] if *seen == id.to_string())
+        );
+
+        let plane = registry.snapshot();
+        let of = Subject::WorkingSet(id.to_string());
+        assert_eq!(plane.candidates(SubjectKind::WorkingSet), [id.to_string()]);
+        assert_eq!(show(plane.attr(&of, "tokens")), show(Some(Value::Int(640))));
+        assert_eq!(
+            show(plane.attr(&of, "folded-tokens")),
+            show(Some(Value::Int(512)))
+        );
+        assert_eq!(
+            show(plane.attr(&of, "recurrent-slots")),
+            show(Some(Value::Int(1)))
+        );
+        assert_eq!(
+            show(plane.attr(&of, "session")),
+            show(Some(Value::Text("chat".into())))
+        );
+        assert_eq!(
+            show(plane.prop(&of, "pico/frozen-tokens")),
+            show(Some(Value::Int(512)))
+        );
+        assert!(plane.discardable(&id.to_string()));
+
+        let changed = Event::HandleProps(id, props(json!({"a": 1})), vec!["a".to_string()]);
+        let edges = registry.apply(changed);
+        let [Edge::PropChanged(change)] = &edges[..] else {
+            panic!("{edges:?}");
+        };
+        assert_eq!(change.names, ["a"]);
+        assert_eq!(
+            show(registry.snapshot().prop(&of, "a")),
+            show(Some(Value::Int(1)))
+        );
+
+        assert!(
+            registry.apply(Event::HandleLent(id)).is_empty(),
+            "lent is silent"
+        );
+        assert!(
+            registry
+                .snapshot()
+                .candidates(SubjectKind::WorkingSet)
+                .is_empty()
+        );
+        registry.apply(rest);
+        let edges = registry.apply(Event::HandleGone(id, By::Policy));
+        assert!(matches!(&edges[..], [Edge::Discarded(gone)] if gone.subject == id.to_string()));
+    }
 
     #[test]
     fn a_session_s_props_change_between_its_processes_and_it_closes() {
@@ -1261,6 +1451,10 @@ mod tests {
         assert_eq!(ws(gone, "tokens"), show(Some(Value::Int(64))));
         let worker = |name| show(plane.attr(&Subject::Worker(WORKER.to_string()), name));
         assert_eq!(worker("capacity-tokens"), show(Some(Value::Int(1600))));
+        assert_eq!(worker("capacity-slots"), show(Some(Value::Int(4))));
+        assert_eq!(worker("used-slots"), show(Some(Value::Int(3))));
+        assert_eq!(worker("swap-capacity-slots"), show(Some(Value::Int(8))));
+        assert_eq!(worker("swap-used-slots"), show(Some(Value::Int(5))));
         // 60 of 100 pages are taken, 6 of them by what is cached.
         assert_eq!(worker("used-tokens"), show(Some(Value::Int(864))));
         // 100 of 400 pages below the device hold suspended kv.

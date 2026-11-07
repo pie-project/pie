@@ -51,8 +51,8 @@ pub struct RingGeometry {
 /// index it was written for; `committed` is the position the window is
 /// anchored at and `head` the position written up to, in tokens; `retired`
 /// counts the leading pages, in sequence order, already given back.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct RingState {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RingState {
     retired: u32,
     committed: u32,
     head: u32,
@@ -166,6 +166,17 @@ impl RsGrant {
 pub struct RsCopyPlan {
     pub slots: Vec<(u32, u32)>,
     pub pages: Vec<(u32, u32)>,
+}
+
+/// What a set holds, in its own numbering: see [`RsEntry`].
+#[derive(Debug, Clone)]
+pub struct RsExport {
+    pub folded: Option<RsSlotId>,
+    pub buffer: Vec<Option<RsSlotId>>,
+    pub base: u32,
+    pub frozen: u32,
+    /// A window's position, when the state is one: `buffer` is its pages.
+    pub ring: Option<RingState>,
 }
 
 /// Token `t` of page `p` holds slot `base + p * page + t`.
@@ -402,6 +413,51 @@ impl RsStore {
             base: 0,
             frozen: 0,
             ring: self.ring.map(|_| RingState::default()),
+        })
+    }
+
+    /// What a snapshot keeps of `ws`, on the rows it stands on now.
+    pub fn export(&self, ws: RsWorkingSetId) -> Result<RsExport, RsError> {
+        let entry = self.entry(ws)?;
+        Ok(RsExport {
+            folded: entry.folded,
+            buffer: entry.buffer.clone(),
+            base: entry.base,
+            frozen: entry.frozen,
+            ring: entry.ring,
+        })
+    }
+
+    /// Whether `id` is a host row already.
+    pub fn on_host(&self, id: RsSlotId) -> bool {
+        self.is_host(id)
+    }
+
+    /// Host rows for a read or a write that is none of the planner's: state
+    /// slots first, then buffer pages. `None` if the host lacks either.
+    pub fn take_host(&mut self, slots: usize, pages: usize) -> Option<Vec<RsSlotId>> {
+        let mut rows = self.host_slots.try_alloc_n(slots)?;
+        let Some(buffer) = self.host_pages.try_alloc_n(pages) else {
+            self.host_slots.release_reserved(rows);
+            return None;
+        };
+        rows.extend(buffer);
+        Some(rows)
+    }
+
+    pub fn give_host(&mut self, rows: Vec<RsSlotId>) {
+        self.release_host(rows);
+    }
+
+    /// A set of its own on host rows, as `export` said one stood.
+    pub fn import(&mut self, geom: RsGeometry, set: RsExport) -> RsWorkingSetId {
+        self.working_sets.insert(RsEntry {
+            geom,
+            folded: set.folded,
+            buffer: set.buffer,
+            base: set.base,
+            frozen: set.frozen,
+            ring: set.ring,
         })
     }
 

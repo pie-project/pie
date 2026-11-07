@@ -68,6 +68,8 @@ pub struct Config {
     pub host: String,
     pub port: u16,
     pub cache_dir: PathBuf,
+    /// Where snapshots of handles are kept, and how many bytes of them.
+    pub snapshots: Option<(PathBuf, u64)>,
     /// The built-in inferlets: registered at boot beside whatever
     /// `cache_dir` holds, each shadowed by a copy of its own name and
     /// version installed there.
@@ -622,6 +624,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
 fn verify_config(config: &Config) -> Result<()> {
     #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some((dir, budget)) = &config.snapshots {
+        crate::handle::snapshot::configure(dir.clone(), *budget);
+    }
     fs::create_dir_all(&config.cache_dir)
         .with_context(|| format!("Could not create cache dir: {:?}", config.cache_dir))?;
 

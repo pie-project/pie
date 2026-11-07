@@ -36,7 +36,7 @@ pub use diagnostics::{PlannerDiagnostics, PlannerQueueEntry};
 pub use error::{PlannerError, StarveCause};
 pub use global::{
     assign, engine_of, init_planner, persist_run, place, planner, planner_for, planner_of,
-    planners, release, wake,
+    planners, rekey_holders, release, wake,
 };
 pub use grant::{AllocationGrant, Demand};
 pub use pool::{PoolPort, RegistryPool};

@@ -38,6 +38,8 @@ pub(super) struct Proc {
     pub(super) reseating: bool,
     /// It has been granted pages: a seated lane whose next claim is growth.
     pub(super) seated: bool,
+    /// A holder's retention key: among those at rest, the lowest goes first.
+    pub(super) kept: i64,
     /// The most device kv pages and rs units it has held at a grant, for
     /// [`super::to_end::ToEnd`].
     pub(super) peak: (u32, crate::store::rs::RsUnits),
@@ -49,7 +51,7 @@ pub(super) struct Proc {
 
 impl Proc {
     pub(super) fn rank(&self) -> Rank {
-        Rank::of(self.key, self.seq)
+        Rank::of(self.key, self.seq).kept(self.kept)
     }
 
     /// A holder at rest: past every process, whose rank is what goes first,
@@ -63,6 +65,7 @@ impl Proc {
         Self {
             seq,
             key: 0,
+            kept: 0,
             held: false,
             state: Residency::Resident,
             restore_retried: false,

@@ -11,6 +11,8 @@
 
 mod held;
 mod lease;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod snapshot;
 mod table;
 
 pub(crate) use lease::{Bag, Kind, Lease, Moved, enter};

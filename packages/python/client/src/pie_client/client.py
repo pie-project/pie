@@ -195,6 +195,16 @@ class Handle:
     async def stat(self) -> dict:
         return await self.client._handle_op({"op": "stat", "name": self.name})
 
+    async def save(self, snapshot: str) -> dict:
+        """Keeps this working set at rest under `snapshot`, past this session
+        and this server. It stays as it was."""
+        return await self.client._handle_op({"op": "save", "name": self.name, "snapshot": snapshot})
+
+    async def set_props(self, props: dict) -> None:
+        """Merges `props` for the worker policy to read while this rests; None
+        removes one. Sent while a process has it, they land with it."""
+        await self.client._handle_op({"op": "set_props", "name": self.name, "props": props})
+
     async def close(self) -> None:
         await self.client._handle_op({"op": "close", "name": self.name})
 
@@ -629,6 +639,21 @@ class PieClient:
         name = self._next_handle()
         await self._handle_op({"op": "new", "name": name, "kind": "working_set"})
         return WorkingSet(self, name)
+
+    async def load_snapshot(self, snapshot: str) -> WorkingSet:
+        """A new working set as `snapshot` stands."""
+        name = self._next_handle()
+        await self._handle_op({"op": "load", "name": name, "snapshot": snapshot})
+        return WorkingSet(self, name)
+
+    async def delete_snapshot(self, snapshot: str) -> None:
+        """Handles loaded from it stay."""
+        await self._handle_op({"op": "delete_snapshot", "snapshot": snapshot})
+
+    async def list_snapshots(self, prefix: str = "") -> list[dict]:
+        """Each snapshot under `prefix`: its name, tokens and bytes."""
+        answer = await self._handle_op({"op": "list_snapshots", "prefix": prefix})
+        return answer["snapshots"]
 
     async def matcher(
         self,

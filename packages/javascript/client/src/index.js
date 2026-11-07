@@ -306,6 +306,18 @@ export class Handle {
         return await this.client._handleOp({ op: "stat", name: this.name });
     }
 
+    /** Keeps this working set at rest under `snapshot`, past this session and
+     *  this server. It stays as it was. */
+    async save(snapshot) {
+        return await this.client._handleOp({ op: "save", name: this.name, snapshot });
+    }
+
+    /** Merges `props` for the worker policy to read while this rests; null
+     *  removes one. Sent while a process has it, they land with it. */
+    async setProps(props) {
+        await this.client._handleOp({ op: "set_props", name: this.name, props });
+    }
+
     async close() {
         await this.client._handleOp({ op: "close", name: this.name });
     }
@@ -729,6 +741,23 @@ export class PieClient {
         const [answer] = JSON.parse(result);
         if (answer.error) throw new HandleError(answer.error, answer.code);
         return answer;
+    }
+
+    /** A new working set as `snapshot` stands. */
+    async loadSnapshot(snapshot) {
+        const name = this._nextHandle();
+        await this._handleOp({ op: "load", name, snapshot });
+        return new WorkingSet(this, name);
+    }
+
+    /** Handles loaded from it stay. */
+    async deleteSnapshot(snapshot) {
+        await this._handleOp({ op: "delete_snapshot", snapshot });
+    }
+
+    /** Each snapshot under `prefix`: its name, tokens and bytes. */
+    async listSnapshots(prefix = "") {
+        return (await this._handleOp({ op: "list_snapshots", prefix })).snapshots;
     }
 
     /** A new, empty working set. */

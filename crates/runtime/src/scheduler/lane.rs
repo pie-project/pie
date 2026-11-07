@@ -796,6 +796,14 @@ impl Lane {
                         .copy_kv(&copy)
                         .and_then(|()| engine.read_host_kv(&slots))
                         .map_err(Into::into),
+                    HostKvOp::Read(slots) => engine.read_host_kv(&slots).map_err(Into::into),
+                    HostKvOp::ReadState(slots, pages) => {
+                        engine.read_host_state(&slots, &pages).map_err(Into::into)
+                    }
+                    HostKvOp::WriteState(slots, pages, bytes) => engine
+                        .write_host_state(&slots, &pages, &bytes)
+                        .map(|()| Vec::new())
+                        .map_err(Into::into),
                     HostKvOp::TapGroups => {
                         Ok(serde_json::to_vec(&engine.tap_groups()).unwrap_or_default())
                     }

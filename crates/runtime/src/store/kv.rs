@@ -1014,6 +1014,29 @@ impl KvStore {
         ))
     }
 
+    /// `ws` as a snapshot reads it, pinned where it stands until the pin is
+    /// released.
+    pub fn export(
+        &mut self,
+        ws: WorkingSetId,
+    ) -> Result<(ReaderPin, page_table::ExportedSet), KvStoreError> {
+        let set = self.table.exported(ws)?;
+        let nodes = self.table.pin_working_sets(&HashSet::from([ws]))?;
+        Ok((ReaderPin { nodes }, set))
+    }
+
+    /// A working set of its own from what `slots` hold.
+    pub fn import(
+        &mut self,
+        set: page_table::ExportedSet,
+        slots: Vec<HostKvSlotId>,
+    ) -> Result<WorkingSetId, KvStoreError> {
+        let backings = slots.into_iter().map(KvPageBacking::Swapped).collect();
+        let ws = self.table.imported(set, backings)?;
+        self.refresh_flat(ws);
+        Ok(ws)
+    }
+
     pub fn release_reader(&mut self, pin: ReaderPin) {
         let freed = self.table.unpin_terminals(&pin.nodes);
         let epoch = self.current_epoch();
@@ -1785,12 +1808,21 @@ impl KvStore {
         &mut self,
         keep: &HashSet<WorkingSetId>,
         room: usize,
+        order: &[(WorkingSetId, u64)],
+        wanted: usize,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
-        let mut pages = self.table.stranded_pages(keep);
+        // In tokens as a policy states them, in pages here.
+        let page = u64::from(self.page_size.max(1));
+        let order: Vec<_> = order
+            .iter()
+            .map(|&(ws, tokens)| (ws, tokens.div_ceil(page)))
+            .collect();
+        let order = &order[..];
+        let mut pages = self.table.stranded_pages(keep, order, wanted);
         if self.swap_available() < pages.len().min(room) {
             self.drop_entries_off_device();
             // Dropping can compact the pages just listed: list them again.
-            pages = self.table.stranded_pages(keep);
+            pages = self.table.stranded_pages(keep, order, wanted);
         }
         let available = self.make_swap_room(pages.len().min(room));
         pages.truncate(room.min(available));

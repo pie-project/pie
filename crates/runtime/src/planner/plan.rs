@@ -95,7 +95,7 @@ impl ResidencyPlanner {
                     if self.absorb_free(count) || self.reclaim_idle_once() {
                         continue;
                     }
-                    if self.sweep_stranded() {
+                    if self.sweep_stranded(count) {
                         return;
                     }
                     fund_by_eviction

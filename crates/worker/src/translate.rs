@@ -79,6 +79,10 @@ fn runtime_config(
         host: user.server.listen.ip().to_string(),
         port: user.server.listen.port(),
         cache_dir: home.join("inferlets"),
+        snapshots: Some((
+            home.join("snapshots"),
+            user.runtime.snapshot_budget.as_bytes(),
+        )),
         builtin_programs,
         verbose: user.server.verbose,
         log_dir: Some(home.join("logs")),
