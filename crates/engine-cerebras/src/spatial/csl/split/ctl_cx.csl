@@ -19,6 +19,12 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
+const timestamp = @import_module("<time>");
+// TSC stamps of the last pass (host-read): the pass start (x in), each layer's end, after x out
+var tdbg = @zeros([K + 2]u32);
+var tdbg_ptr: [*]u32 = &tdbg;
+var tsc = @zeros([3]u16);
+fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
 
 var x = @zeros([Hc]f32);
 var x_ptr: [*]f32 = &x;
@@ -83,6 +89,7 @@ fn init() void {
   }
   iqc(2, rcfg[RQ]); iqc(3, rcfg[RQ + 1]); iqc(4, rcfg[RQ + 2]); iqc(5, rcfg[RQ + 3]);
   oqc(2, rcfg[RQ + 4]); oqc(3, rcfg[RQ + 5]); oqc(4, rcfg[RQ + 6]);
+  timestamp.enable_tsc();
   sys_mod.unblock_cmd_stream();
 }
 
@@ -116,6 +123,7 @@ task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
     if (HOSTX == 0 and (rcfg[RQ + 7] & 1) == 0) { @fmovs(x_d, fin(q_hi, Hc)); }
+    stamp(0);
     var l: u16 = 0;
     while ((DIAG & 1) == 0 and l < (if ((DIAG & 2) != 0) 1 else K)) : (l += 1) {
       norm_send(2 * l);
@@ -129,8 +137,10 @@ task pass_task() void {
       @fadds(x_d, x_d, t_d);
       }
       @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{K * Hc} -> xdbg[i] }), @as(i16, l * Hc), f32), Hc), x_d);
+      stamp(l + 1);
     }
     if (HOSTX == 0 and (rcfg[RQ + 7] & 2) == 0) { @fmovs(fout(q_ho, Hc), x_d); }
+    stamp(K + 1);
   }
   sys_mod.unblock_cmd_stream();
 }
@@ -150,6 +160,7 @@ comptime {
   @initialize_queue(q_ho, .{ .color = C_PARK });
   @export_symbol(x_ptr, "x");
   @export_symbol(xdbg_ptr, "xdbg");
+  @export_symbol(tdbg_ptr, "tdbg");
   @export_symbol(gam_ptr, "gam");
   @export_symbol(rcfg_ptr, "rcfg");
   @export_symbol(init);

@@ -64,6 +64,13 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
+const NTD: u16 = 1 + 9 * K;
+const timestamp = @import_module("<time>");
+var tdbg = @zeros([NTD]u32);   // TSC stamps of the last pass, by phase (host-read, diagnostics)
+var tdbg_ptr: [*]u32 = &tdbg;
+var tsc = @zeros([3]u16);
+fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
+
 
 fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
 
@@ -167,6 +174,7 @@ fn init() void {
   role_s = @as(u16, rcfg[RQ + 10]);
   gsrc = @as(u16, rcfg[RQ + 11]);
   myrow = @as(u16, rcfg[RQ + 17]);
+  timestamp.enable_tsc();
   sys_mod.unblock_cmd_stream();
 }
 
@@ -366,36 +374,40 @@ fn att_mix(a: u16) void {
     vc[1 + vb + e0 * (Dc + 1) + Dc] = 0x3c00;   // 1.0: the values matvec's last output is the softmax sum
   }
   @fs2h(@set_dsd_length(xh_d, QD), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> ab[i] }));
+  // live entries only: position p lives on row p % PYW as entry p / PYW, so every row's live
+  // entries are below p / PYW + 1 (a row's one unwritten entry scores 0 and adds 0: its ones column is 0)
+  const NEl: u16 = if (pos / PYW + 1 < NE) pos / PYW + 1 else NE;
+  const nsl: u16 = Qh * NEl + Qh + 1;
   var apass: u16 = 0;
   while (apass < 8) : (apass += 1) {
     var h: u16 = 0;
     while (h < Qh) : (h += 1) {
+      // keys are dim-major rows of NE: the matvec spans them all (cheap), only NEl are kept
       kvmv(@ptrcast([*]u16, &kc[1 + kb]), Dc, NE, h * Dc, h * NE);
-      sx[Qh * NE + h] = ab[QD + 2 * Dc + 1 + h];
+      @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl),
+             @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * NE), f32), NEl));
+      sx[Qh * NEl + h] = ab[QD + 2 * Dc + 1 + h];
     }
-    @fmovs(@set_dsd_length(sx_d, Qh * NE), @set_dsd_length(y_d, Qh * NE));
-    sx[Qh * NE + Qh] = if (mine) ab[QD + 2 * Dc + 1 + Qh] else 0.0;
-    if (role_s != 5) { seg_ar(NS); }
-    if (mine) { kinv[a * NE + e0] = rsq(sx[Qh * NE + Qh] / HDF + 1.0e-6); }
+    sx[Qh * NEl + Qh] = if (mine) ab[QD + 2 * Dc + 1 + Qh] else 0.0;
+    if (role_s != 5) { seg_ar(nsl); }
+    if (mine) { kinv[a * NE + e0] = rsq(sx[Qh * NEl + Qh] / HDF + 1.0e-6); }
     const ki = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kinv[i] });
     h = 0;
     while (h < Qh) : (h += 1) {
-      const sh = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NE), f32), NE);
+      const sh = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl);
       @fmuls(sh, sh, @increment_dsd_offset(ki, @as(i16, a * NE), f32));
-      @fmuls(sh, sh, rsq(sx[Qh * NE + h] / HDF + 1.0e-6));
+      @fmuls(sh, sh, rsq(sx[Qh * NEl + h] / HDF + 1.0e-6));
       @fsubs(sh, sh, mref[a * Qh + h]);
     }
-    exp_v(@set_dsd_length(sx_d, Qh * NE), Qh * NE);
-    // f16 probabilities clamped at the f16 max (-max(-p, -65504); SDK 2.10 has no @fmins): an
-    // early pass against a cold log-sum-exp can exceed it (inf -> NaN values); the clamped sum
-    // still marks the pass bad and moves the reference by >= ln 65504 a redo
-    const sp = @set_dsd_length(sx_d, Qh * NE);
+    exp_v(@set_dsd_length(sx_d, Qh * NEl), Qh * NEl);
+    // f16 probabilities clamped at the f16 max (-max(-p, -65504); SDK 2.10 has no @fmins)
+    const sp = @set_dsd_length(sx_d, Qh * NEl);
     @fnegs(sp, sp);
     @fmaxs(sp, sp, -65504.0);
     @fnegs(sp, sp);
-    @fs2h(@set_dsd_length(xh_d, Qh * NE), sp);
+    @fs2h(@set_dsd_length(xh_d, Qh * NEl), sp);
     h = 0;
-    while (h < Qh) : (h += 1) { kvmv(@ptrcast([*]u16, &vc[1 + vb]), NE, Dc + 1, h * NE, h * (Dc + 1)); }
+    while (h < Qh) : (h += 1) { kvmv(@ptrcast([*]u16, &vc[1 + vb]), NEl, Dc + 1, h * NEl, h * (Dc + 1)); }
     send_y(Qh * (Dc + 1));
     // o (the o_proj's x), then the redo word and the heads' log-sum-exp steps (every pass)
     @fs2h(@set_dsd_length(xh_d, QO), fin(q_ym, QO));
@@ -437,23 +449,32 @@ fn layer(l: u16, b: u32) u32 {
   const att = ((KM >> l) & 1) == 1;
   const NQ = if (att) NQA else NQG;
   recv_x(NQ);
+  stamp(1 + 9 * l);
   mv(b, Hc, NQ);
+  stamp(2 + 9 * l);
   if ((DIAG & 16) != 0) { send_x(Hc); return b; }   // (diagnostics) the row multicast and the row reduction only
   send_y(NQ + 1);
+  stamp(3 + 9 * l);
   if ((DIAG & 8) != 0) { return b; }                // (diagnostics) the row multicast and the column reduction only
   if (ATT == 1 and att) { att_mix(la); }
   else if (GDN == 1 and !att) { gdn_mix(lg); }
   else { recv_col(QO); }
+  stamp(4 + 9 * l);
   const bo = b + @as(u32, Hc) * NQ;
   mv(bo, QO, Hc);
+  stamp(5 + 9 * l);
   send_x(Hc);
   if (GDN == 1 and !att) { gdn_update(lg); lg += 1; } else { la += 1; }
   if ((DIAG & 4) == 0) {
   recv_x(2 * Ic);
+  stamp(6 + 9 * l);
   mv(bo + @as(u32, QO) * Hc, Hc, 2 * Ic);
+  stamp(7 + 9 * l);
   send_y(2 * Ic + 1);
   recv_col(Ic);
+  stamp(8 + 9 * l);
   mv(bo + @as(u32, QO) * Hc + @as(u32, Hc) * 2 * Ic, Ic, Hc);
+  stamp(9 + 9 * l);
   send_x(Hc);
   }
   return bo + LWM;
@@ -482,6 +503,7 @@ task pass_task() void {
     la = 0;
     lg = 0;
     relay(18);
+    stamp(0);
     while ((DIAG & 1) == 0 and l < (if ((DIAG & 2) != 0) 1 else K)) : (l += 1) { b = layer(l, b); }
     relay(21);
   }
@@ -505,6 +527,7 @@ comptime {
   @initialize_queue(q_ao, .{ .color = C_PARK });
   @export_symbol(w_ptr, "w");
   @export_symbol(rcfg_ptr, "rcfg");
+  @export_symbol(tdbg_ptr, "tdbg");
   @export_symbol(init);
   @export_symbol(compute);
 }
