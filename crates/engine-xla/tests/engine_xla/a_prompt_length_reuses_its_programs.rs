@@ -162,7 +162,10 @@ fn decode_text(shell: &mut Shell, lanes: u32) -> usize {
         .collect();
     shell.fire_full(&seated).expect("the decode fires");
     let texts = shell.device().dry_texts();
-    texts.last().map(String::len).expect("the decode traced a program")
+    texts
+        .last()
+        .map(String::len)
+        .expect("the decode traced a program")
 }
 
 #[test]
