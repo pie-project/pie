@@ -27,6 +27,8 @@ pub struct Settings {
     /// the pool fills what `device_memory_share` leaves.
     pub device_kv_budget: Option<ByteSize>,
     pub device_memory_share: f64,
+    /// See [`crate::config::ModelConfig::memory_tolerance`].
+    pub memory_tolerance: runtime::governor::Tolerance,
     pub sandbox_memory_mb: u64,
     pub max_concurrent_processes: Option<usize>,
     pub frame_size: u32,
@@ -46,6 +48,7 @@ impl Default for Settings {
             max_model_len: 4096,
             device_kv_budget: None,
             device_memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+            memory_tolerance: runtime::governor::Tolerance::Dedicated,
             sandbox_memory_mb: 512,
             max_concurrent_processes: None,
             frame_size: 8,
@@ -93,6 +96,7 @@ impl Settings {
 
         config.engine.options = self.engine_options(kind, home);
         config.model.device_kv_budget = self.device_kv_budget;
+        config.model.memory_tolerance = self.memory_tolerance;
         config.model.device_memory_share = self.device_memory_share;
         if self.max_voxels.is_some() {
             config.model.max_voxels = self.max_voxels;

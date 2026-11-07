@@ -54,6 +54,14 @@ pub struct PoolFacts {
     pub adapter_banks: u32,
     pub elastic_page_bytes: u64,
     pub elastic_budget_pages: u64,
+    /// A kv page's bytes in a pool whole from its load that can move to
+    /// slabs of another size between frames; zero where it cannot.
+    #[serde(default)]
+    pub slab_kv_page_bytes: u64,
+    /// What a state slot and its buffer page take where they gain memory as
+    /// they are handed out; zero where the load holds them whole.
+    #[serde(default)]
+    pub elastic_state_slot_bytes: u64,
     /// The windowed kv pool, page 0 its null page; zero when the model
     /// declares no windowed space or the engine pages its sliding rows in
     /// full. `window_tokens` is the model's fact: the window its sliding

@@ -1,3 +1,7 @@
+/// The lanes and tokens of a wave while memory is short: wide enough to keep
+/// a prompt moving, narrow enough to keep to a small carve of the scratch.
+pub const NARROW_WAVE: (usize, usize) = (16, 4096);
+
 pub trait Prepared {
     fn demand(&self) -> Demand;
 }
@@ -75,16 +79,6 @@ impl Demand {
                 other.workspace
             },
         }
-    }
-}
-
-pub trait Supply {
-    type Error;
-
-    fn commit(&mut self, demand: Demand) -> std::result::Result<(), Self::Error>;
-
-    fn trim(&mut self, hint: Demand) {
-        let _ = hint;
     }
 }
 

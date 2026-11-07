@@ -124,6 +124,11 @@ fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
 fn fault(fault: Fault) -> Error {
     match fault {
         Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
+        Fault::Refused { bytes } => Error::Exhausted {
+            resource: "device memory",
+            wanted: bytes,
+            available: 0,
+        },
         Fault::PatchPayload { .. } => Error::Invalid(fault.to_string()),
         Fault::Bake(_)
         | Fault::Load(_)
@@ -176,13 +181,15 @@ const MIN_FITTED_FORWARD_TOKENS: u32 = 512;
 
 const DEFAULT_STATE_SLOTS: u32 = 256;
 
-fn bake_budgets(budgets: &LoadBudgets) -> Budget {
+/// The load's budgets: its logit readouts sized to what `trace` reads, not a
+/// general figure, so a vocab-wide head carves only the rows a fire can read.
+fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,
         buckets: budgets.buckets.clone(),
         max_adapters: budgets.max_adapters,
-        readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE,
+        readouts_per_lane: poem_compiler::arena::readouts_per_lane(trace),
     }
 }
 
@@ -402,7 +409,7 @@ impl Engine for Metal {
             let mut fitted = poem_compiler::fit_voxels(
                 &trace,
                 poem_compiler::Budgets {
-                    tokens: bake_budgets(&budgets),
+                    tokens: bake_budgets(&budgets, &trace),
                     patches: patch_ladder(&trace, &budgets),
                     voxels: poem_compiler::VoxelLadder::of(
                         &trace,
@@ -429,7 +436,7 @@ impl Engine for Metal {
                 trace: trace.clone(),
                 contract: &contract,
                 checkpoint: &path,
-                budget: bake_budgets(&budgets),
+                budget: bake_budgets(&budgets, &trace),
                 patches: patch_ladder(&trace, &budgets),
                 voxels,
                 profile: None::<DeviceProfile>,
@@ -553,6 +560,7 @@ impl Engine for Metal {
                 kv_page_size: paging.page_size,
                 state_slots: if state_rows { paging.slots } else { 0 },
                 state_slot_bytes: shell.state_slot_bytes(),
+                elastic_state_slot_bytes: shell.elastic_state_slot_bytes(),
                 adapter_banks: shell
                     .banks()
                     .iter()
@@ -582,7 +590,7 @@ impl Engine for Metal {
                     .neural_engine()
                     .map_or(0, crate::ane::Ane::prefill_rows),
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
-                    &budgets,
+                    &budgets, &trace,
                 )))
                 .unwrap_or(u32::MAX),
             },
@@ -643,6 +651,26 @@ impl Engine for Metal {
         self.loaded_mut()?
             .register_adapter(registration.id, &planes)
             .map_err(fault)
+    }
+
+    fn commit_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_pool(kv_pages).map_err(fault)
+    }
+
+    fn release_scratch(&mut self) -> EngineResult<()> {
+        self.loaded_mut()?.release_scratch().map_err(fault)
+    }
+
+    fn release_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_pool(kv_pages).map_err(fault)
+    }
+
+    fn commit_state(&mut self, slots: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_state(slots).map_err(fault)
+    }
+
+    fn release_state(&mut self, slots: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_state(slots).map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {

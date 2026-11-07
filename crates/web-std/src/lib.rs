@@ -3,6 +3,8 @@ pub mod executor;
 pub mod time;
 
 #[cfg(target_arch = "wasm32")]
+pub mod opfs;
+#[cfg(target_arch = "wasm32")]
 pub mod thread;
 
 #[cfg(target_arch = "wasm32")]

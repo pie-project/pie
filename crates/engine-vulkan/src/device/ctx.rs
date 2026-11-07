@@ -37,6 +37,20 @@ fn instance_gate() -> std::sync::MutexGuard<'static, ()> {
     GATE.lock().expect("gate lock poisoned")
 }
 
+/// What it takes to see a layered driver (MoltenVK), which the loader hides
+/// from an instance that does not ask for it.
+fn portability(exts: &[vk::ExtensionProperties]) -> (Vec<*const c_char>, vk::InstanceCreateFlags) {
+    let name = ash::khr::portability_enumeration::NAME;
+    if has_extension(exts, name) {
+        (
+            vec![name.as_ptr()],
+            vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR,
+        )
+    } else {
+        (Vec::new(), vk::InstanceCreateFlags::empty())
+    }
+}
+
 #[must_use]
 pub fn present() -> bool {
     let Ok(entry) = entry() else {
@@ -44,7 +58,13 @@ pub fn present() -> bool {
     };
     let _gate = instance_gate();
     let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
-    let info = vk::InstanceCreateInfo::default().application_info(&app);
+    // SAFETY: a global query of the loaded entry, with no handles.
+    let exts = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+    let (portability, flags) = portability(&exts);
+    let info = vk::InstanceCreateInfo::default()
+        .application_info(&app)
+        .flags(flags)
+        .enabled_extension_names(&portability);
     // SAFETY: `info` and `app` outlive the call, and the gate serializes
     // instance creation and destruction across the process. The instance is
     // used only here, its physical devices come from it, and it is destroyed
@@ -513,19 +533,20 @@ impl Context {
         } else {
             Vec::new()
         };
-        let mut enabled_exts: Vec<*const c_char> = Vec::new();
-        if validated {
-            enabled_exts.push(ash::ext::debug_utils::NAME.as_ptr());
-        }
         let instance_exts =
             // SAFETY: a global query of the loaded entry, with no handles.
             unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+        let (mut enabled_exts, flags) = portability(&instance_exts);
+        if validated {
+            enabled_exts.push(ash::ext::debug_utils::NAME.as_ptr());
+        }
         let props2 = has_extension(
             &instance_exts,
             ash::khr::get_physical_device_properties2::NAME,
         );
         let info = vk::InstanceCreateInfo::default()
             .application_info(&app)
+            .flags(flags)
             .enabled_layer_names(&enabled_layers)
             .enabled_extension_names(&enabled_exts);
         // SAFETY: `info` names only layers and extensions found above, its
@@ -786,6 +807,10 @@ impl Context {
         }
         if enabled.coopmat {
             exts.push(ash::khr::cooperative_matrix::NAME.as_ptr());
+        }
+        // A device that states it must have it named.
+        if has_extension(&device_exts, ash::khr::portability_subset::NAME) {
+            exts.push(ash::khr::portability_subset::NAME.as_ptr());
         }
         let priorities = [1.0f32];
         let queues = [vk::DeviceQueueCreateInfo::default()

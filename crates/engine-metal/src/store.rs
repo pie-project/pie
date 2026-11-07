@@ -675,14 +675,11 @@ impl Pools {
                 have: u64::from(self.paging.slots),
             });
         }
-        engine::frame::Supply::commit(
-            self,
-            engine::frame::Demand {
-                kv_pages: 0,
-                state_slots: slot.saturating_add(1),
-                workspace: 0,
-            },
-        )?;
+        self.admit(engine::frame::Demand {
+            kv_pages: 0,
+            state_slots: slot.saturating_add(1),
+            workspace: 0,
+        })?;
         for at in 0..self.shapes.len() {
             let Shape::State {
                 stride,
@@ -720,14 +717,11 @@ impl Pools {
                 highest = highest.max(page.saturating_add(1));
             }
         }
-        engine::frame::Supply::commit(
-            self,
-            engine::frame::Demand {
-                kv_pages: highest,
-                state_slots: 0,
-                workspace: 0,
-            },
-        )?;
+        self.admit(engine::frame::Demand {
+            kv_pages: highest,
+            state_slots: 0,
+            workspace: 0,
+        })?;
         for (plane, cell) in self.kv_planes()? {
             let slab = self.planes[plane].buffer();
             for span in moves {
@@ -838,12 +832,6 @@ impl Pools {
         Ok(Spill::slots(self.disk.as_ref()))
     }
 
-    pub fn unseat_disk(&mut self) {
-        self.disk = None;
-        self.parked = None;
-        self.parked_pages = None;
-    }
-
     #[must_use]
     pub fn parked_slots(&self) -> u32 {
         Spill::slots(self.parked.as_ref())
@@ -858,14 +846,11 @@ impl Pools {
     /// with `slots[i]`.
     pub fn spill_kv(&mut self, to_disk: bool, pages: &[u32], slots: &[u32]) -> Result<()> {
         Spill::room(self.disk.as_ref(), "disk kv pages", slots)?;
-        engine::frame::Supply::commit(
-            self,
-            engine::frame::Demand {
-                kv_pages: pages.iter().map(|&page| page + 1).max().unwrap_or(0),
-                state_slots: 0,
-                workspace: 0,
-            },
-        )?;
+        self.admit(engine::frame::Demand {
+            kv_pages: pages.iter().map(|&page| page + 1).max().unwrap_or(0),
+            state_slots: 0,
+            workspace: 0,
+        })?;
         let page_size = u64::from(self.paging.page_size);
         let layout: Vec<(usize, u64)> = self
             .kv_planes()?
@@ -887,14 +872,11 @@ impl Pools {
             });
         }
         Spill::room(self.parked.as_ref(), "parked rs rows", rows)?;
-        engine::frame::Supply::commit(
-            self,
-            engine::frame::Demand {
-                kv_pages: 0,
-                state_slots: device.iter().map(|&slot| slot + 1).max().unwrap_or(0),
-                workspace: 0,
-            },
-        )?;
+        self.admit(engine::frame::Demand {
+            kv_pages: 0,
+            state_slots: device.iter().map(|&slot| slot + 1).max().unwrap_or(0),
+            workspace: 0,
+        })?;
         let layout = self.state_planes();
         match self.parked.as_mut() {
             Some(parked) => parked.copy(&mut self.planes, &layout, None, out, device, rows),
@@ -933,14 +915,11 @@ impl Pools {
                 highest = highest.max(slot.saturating_add(1));
             }
         }
-        engine::frame::Supply::commit(
-            self,
-            engine::frame::Demand {
-                kv_pages: 0,
-                state_slots: highest,
-                workspace: 0,
-            },
-        )?;
+        self.admit(engine::frame::Demand {
+            kv_pages: 0,
+            state_slots: highest,
+            workspace: 0,
+        })?;
         for shape in &self.shapes {
             let Shape::State {
                 stride,
@@ -1045,47 +1024,8 @@ impl Pools {
         }
     }
 
-    /// Give back the memory above what the watermark needs.
-    ///
-    /// The watermark is what `trim` has lowered it to; this is the half of
-    /// a trim that touches the device, kept apart from `Supply::trim`
-    /// because it has a precondition that trait cannot state: the caller
-    /// has drained every frame that could read the pages released. A fixed
-    /// pool releases nothing and answers `Ok`.
-    pub fn release(&mut self) -> Result<()> {
-        #[cfg(target_vendor = "apple")]
-        {
-            if self.arena.is_none() {
-                return Ok(());
-            }
-            let want = self.wanted(self.watermark);
-            let mut targets: Vec<elastic::Target<'_>> = self
-                .planes
-                .iter_mut()
-                .zip(want)
-                .filter_map(|(plane, bytes)| match plane {
-                    Plane::Elastic { store, .. } => Some(elastic::Target {
-                        buffer: store,
-                        bytes,
-                    }),
-                    Plane::Fixed(_) => None,
-                })
-                .collect();
-            // SAFETY: the caller's contract, stated above — no frame in
-            // flight reads these planes.
-            unsafe { elastic::shrink_all(&mut targets) }
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            Ok(())
-        }
-    }
-}
-
-impl engine::frame::Supply for Pools {
-    type Error = Fault;
-
-    fn commit(&mut self, demand: engine::frame::Demand) -> Result<()> {
+    /// Refuses what no extent of this pool could hold.
+    fn within(&self, demand: engine::frame::Demand) -> Result<()> {
         if self.has_state() && demand.state_slots > self.paging.slots {
             return Err(Fault::Ceiling {
                 what: "recurrent slots",
@@ -1108,7 +1048,13 @@ impl engine::frame::Supply for Pools {
                 have: 0,
             });
         }
-        let union = self.watermark.union(demand);
+        Ok(())
+    }
+
+    /// Maps memory under `extent`: see `Engine::commit_pool`.
+    pub fn commit(&mut self, extent: engine::frame::Demand) -> Result<()> {
+        self.within(extent)?;
+        let union = self.watermark.union(extent);
         if union != self.watermark {
             self.grow(union)?;
             self.watermark = union;
@@ -1116,12 +1062,85 @@ impl engine::frame::Supply for Pools {
         Ok(())
     }
 
-    fn trim(&mut self, hint: engine::frame::Demand) {
+    /// Checks that what `demand` touches is committed: an unmapped page read
+    /// by a kernel faults the whole queue.
+    pub fn admit(&self, demand: engine::frame::Demand) -> Result<()> {
+        self.within(demand)?;
+        // A frame numbers its lanes' slots whether or not the model keeps
+        // state in them.
+        let demand = engine::frame::Demand {
+            state_slots: if self.has_state() {
+                demand.state_slots
+            } else {
+                0
+            },
+            ..demand
+        };
+        let committed = self.watermark;
+        if self.arena_backed() && committed.union(demand) != committed {
+            return Err(Fault::Ceiling {
+                what: "committed kv pages",
+                need: u64::from(demand.kv_pages),
+                have: u64::from(committed.kv_pages),
+            });
+        }
+        Ok(())
+    }
+
+    /// Lowers the watermark to `hint`; [`Pools::release`] gives back the
+    /// memory above it.
+    pub fn trim(&mut self, hint: engine::frame::Demand) {
         self.watermark = engine::frame::Demand {
             kv_pages: self.watermark.kv_pages.min(hint.kv_pages),
             state_slots: self.watermark.state_slots.min(hint.state_slots),
             workspace: self.watermark.workspace.min(hint.workspace),
         };
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn arena_backed(&self) -> bool {
+        self.arena.is_some()
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    fn arena_backed(&self) -> bool {
+        false
+    }
+
+    /// Give back the memory above what the watermark needs.
+    ///
+    /// The watermark is what `trim` has lowered it to; this is the half of
+    /// a trim that touches the device, kept apart from [`Pools::trim`]
+    /// because it has a precondition: no frame reads the pages released,
+    /// though frames over those below may run on. A fixed pool releases
+    /// nothing and answers `Ok`.
+    pub fn release(&mut self) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if self.arena.is_none() {
+                return Ok(());
+            }
+            let want = self.wanted(self.watermark);
+            let mut targets: Vec<elastic::Target<'_>> = self
+                .planes
+                .iter_mut()
+                .zip(want)
+                .filter_map(|(plane, bytes)| match plane {
+                    Plane::Elastic { store, .. } => Some(elastic::Target {
+                        buffer: store,
+                        bytes,
+                    }),
+                    Plane::Fixed(_) => None,
+                })
+                .collect();
+            // SAFETY: the caller's contract, stated above: no frame reads the
+            // tail. A remap beside running frames was probed clean.
+            unsafe { elastic::shrink_all(&mut targets) }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Ok(())
+        }
     }
 }
 
@@ -1502,15 +1521,13 @@ mod tests {
             Plane::Fixed(_) => unreachable!(),
         };
 
-        engine::frame::Supply::commit(
-            &mut pools,
-            engine::frame::Demand {
+        pools
+            .commit(engine::frame::Demand {
                 kv_pages: 2,
                 state_slots: 0,
                 workspace: 0,
-            },
-        )
-        .expect("two pages fit");
+            })
+            .expect("two pages fit");
         assert!(plane < elastic::TILE, "the test planes fit inside one tile");
         assert_eq!(
             pools.committed_bytes(),
@@ -1555,7 +1572,7 @@ mod tests {
         );
 
         // Releasing to a lower watermark hands the memory back.
-        engine::frame::Supply::trim(&mut pools, engine::frame::Demand::ZERO);
+        pools.trim(engine::frame::Demand::ZERO);
         pools.release().expect("released");
         assert_eq!(pools.committed_bytes(), 0);
         assert_eq!(pools.high_water_bytes(), 2 * elastic::TILE);
@@ -1574,15 +1591,13 @@ mod tests {
         let mut pools = kv_pools(&device, backing);
         let plane = pools.planes[0].bytes();
         let bytes: Vec<u8> = (0..2 * plane).map(|at| (at % 251) as u8).collect();
-        engine::frame::Supply::commit(
-            &mut pools,
-            engine::frame::Demand {
+        pools
+            .commit(engine::frame::Demand {
                 kv_pages: 4,
                 state_slots: 0,
                 workspace: 0,
-            },
-        )
-        .expect("the whole pool fits");
+            })
+            .expect("the whole pool fits");
         pools.planes[0]
             .write(0, &bytes[..plane as usize])
             .expect("the keys written");
@@ -1643,7 +1658,6 @@ mod tests {
             pools.read_slot(0).expect("seat 0"),
             vec![0u8; bytes as usize]
         );
-        assert_eq!(pools.watermark().state_slots, 4);
     }
 
     fn a_slot_past_the_pool_is_a_ceiling() {

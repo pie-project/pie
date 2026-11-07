@@ -426,6 +426,45 @@ pub fn fit_voxels(
     budgets
 }
 
+/// The widths a narrower carve is worth having at. Tokens and lanes price
+/// apart: a lane reads out whole vocabularies, so few long lanes cost far
+/// less than many short ones, however long.
+const ARENA_RUNG_TOKENS: [u32; 4] = [256, 1024, 4096, u32::MAX];
+const ARENA_RUNG_LANES: [u32; 3] = [16, 64, 256];
+
+/// Carves of `compiled`'s arena for narrower fires, smallest first, each
+/// with the fire it covers. Every carve starts at offset 0, so a smaller one
+/// is a prefix of the store and memory can stop where it ends.
+pub fn arena_ladder(
+    trace: &Trace,
+    budgets: &Budgets,
+    compiled: &CompiledModel,
+) -> Result<Vec<(FireRows, ArenaMap)>, Error> {
+    // As the arena for every fire was carved: `compile_axes`.
+    let serial = arena::Concurrency::sequential(&compiled.regions, trace.nodes.len());
+    let concurrency = if compiled.arena_forked.is_some() {
+        &serial
+    } else {
+        &compiled.concurrency
+    };
+    let rungs = ARENA_RUNG_TOKENS
+        .iter()
+        .flat_map(|&tokens| ARENA_RUNG_LANES.map(|lanes| (tokens, lanes)));
+    let mut ladder = Vec::new();
+    for (tokens, lanes) in rungs {
+        let mut narrow = budgets.clone();
+        narrow.tokens.max_tokens = narrow.tokens.max_tokens.min(tokens);
+        narrow.tokens.max_lanes = narrow.tokens.max_lanes.min(lanes);
+        narrow.tokens.buckets.retain(|&rows| rows <= tokens);
+        let map = arena::carve(trace, &narrow, &compiled.classes, concurrency)?;
+        if map.bytes < compiled.arena.bytes {
+            ladder.push((FireRows::ceilings(&narrow), map));
+        }
+    }
+    ladder.sort_by_key(|(_, map)| map.bytes);
+    Ok(ladder)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

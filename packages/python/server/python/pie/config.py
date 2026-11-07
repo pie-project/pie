@@ -94,10 +94,13 @@ class ModelConfig:
     device_kv_budget: Optional[str] = None
     # The share of the device's memory the load may take; omit for 0.9.
     device_memory_share: Optional[float] = None
+    # How much congestion the system may show before memory goes back:
+    # "dedicated", "aggressive", "balanced", "polite".
+    memory_tolerance: Optional[str] = None
     # Pinned host bytes for suspended kv; omit for every seat at full context.
     host_kv_budget: Optional[str] = None
     # Disk bytes suspended kv spills to below the host (the only tier on metal
-    # and vulkan); omit for the engine's default, "0B" for off.
+    # and vulkan); omit for the engine's default. The tier is always on.
     disk_kv_budget: Optional[str] = None
     disk_kv_dir: Optional[str] = None
     # Keep the disk tier for the next run (cuda): a restart takes back the
@@ -184,7 +187,7 @@ class Config:
                     source = repo_id
         model: dict = {"name": m.name, "source": source}
         for name in ("weight_precision", "kv_dtype", "drafter", "weight_dtype", "device_weight_budget",
-                     "host_weight_budget", "device_kv_budget", "device_memory_share", "host_kv_budget",
+                     "host_weight_budget", "device_kv_budget", "device_memory_share", "memory_tolerance", "host_kv_budget",
                      "disk_kv_budget", "disk_kv_dir", "disk_kv_persistent",
                      "max_patches", "max_images", "max_voxels", "max_clips"):
             put(model, name, getattr(m, name))

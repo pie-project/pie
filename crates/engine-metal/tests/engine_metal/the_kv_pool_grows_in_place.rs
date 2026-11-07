@@ -15,9 +15,7 @@ use engine_metal::Fault;
 use engine_metal::device::elastic::{self, TILE, Target, pages_for_bytes};
 use engine_metal::device::{Context, ElasticArena, Sparse};
 
-/// Big enough to need more than one chunk would be 256 MiB; these tests stay
-/// small so they can run on a loaded machine, and the multi-chunk path is
-/// covered by arithmetic rather than by allocating a gigabyte.
+/// Under one chunk of 16 MiB; the multi-chunk path is covered by arithmetic.
 const VIRTUAL: u64 = 8 * 1024 * 1024;
 
 fn sparse() -> Option<(Context, std::sync::Arc<Sparse>)> {

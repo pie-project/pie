@@ -125,6 +125,12 @@ impl Recorder {
         self.refused.is_none()
     }
 
+    /// Drops every recording: each names the slabs it was recorded over, and
+    /// a replay after those slabs change would land in the old ones.
+    pub(crate) fn forget(&mut self) {
+        self.by_key.clear();
+    }
+
     pub(crate) fn insert(&mut self, key: Key, recording: Recording) {
         self.recorded.set(self.recorded.get() + 1);
         recording.used.set(self.tick());

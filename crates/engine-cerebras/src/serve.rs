@@ -18,7 +18,7 @@ use std::path::Path;
 
 use checkpoint::contract::ModelContract;
 use engine::fire::Masking;
-use engine::frame::{Demand, Supply};
+use engine::frame::Demand;
 use kernels_cerebras::Tensor;
 use poem_compiler::{Budget, Budgets, CompiledModel, DeviceProfile, FireRows, compile_axes};
 use poem_exec::fire::{At, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};

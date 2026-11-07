@@ -71,12 +71,14 @@ source = "Qwen/Qwen3.5-0.8B"
 # Device memory, per device. The share is of the device's memory, less what
 # other processes hold when the engine starts; the kv pool fills what the
 # share leaves past the weights, unless its bytes are stated.
+# memory_tolerance     = "dedicated"  # or aggressive, balanced, polite: gives memory back
+                                       # under pressure and when demand falls
 # device_memory_share  = 0.90
 # device_kv_budget     = "20GiB"  # kv pages and state slots; refused if it does not fit
 # device_weight_budget = "18GiB"  # omit for uncapped
 # Suspended kv goes to the host, then the disk.
 # host_kv_budget       = "32GiB"
-# disk_kv_budget       = "200GiB"  # "0B" turns the disk tier off
+# disk_kv_budget       = "200GiB"  # the tier is always on
 # disk_kv_dir          = "/nvme/pie"  # omit for $PIE_HOME/cache/kv/<digest>
 # disk_kv_persistent   = false    # keep the disk tier as cache for the next run
 "#;

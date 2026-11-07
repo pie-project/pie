@@ -6,6 +6,12 @@ use poem_exec::KernelError;
 pub enum Fault {
     Deviceless,
 
+    /// The system would not back `bytes` more: memory it is short of, not a
+    /// load's arithmetic.
+    Refused {
+        bytes: u64,
+    },
+
     Device {
         call: &'static str,
         why: String,
@@ -161,6 +167,9 @@ impl Fault {
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Refused { bytes } => {
+                write!(f, "the system would not back {bytes} bytes more")
+            }
             Self::Deviceless => write!(
                 f,
                 "this build has no Metal in it: the target is not an Apple one, so the \

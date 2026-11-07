@@ -27,7 +27,7 @@ use crate::weights::Weights;
 use crate::window::Windows;
 
 use engine::fire::Masking;
-use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Supply};
+use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase};
 use engine::runahead::Runahead;
 
 /// What a readout plane holds: the lane's readout rows, a row or voxel
@@ -995,11 +995,77 @@ impl Shell {
         Ok(())
     }
 
+    /// Unstated `budget`: `seats` sequences at `context` and at least the pool,
+    /// within a quarter of the free space. No `dir`, no tier.
+    pub fn seat_disk_kv(
+        &mut self,
+        budget: Option<u64>,
+        dir: Option<&Path>,
+        seats: u32,
+        context: u32,
+    ) -> Result<u32> {
+        let Some(dir) = dir else { return Ok(0) };
+        let paging = self.pools.paging();
+        let buffered = self
+            .rs_buffers
+            .as_ref()
+            .map_or(0, |buffers| buffers.pages().1);
+        let unstated = budget.is_none();
+        let budget = budget.unwrap_or_else(|| {
+            engine::disk::unstated_budget(
+                dir,
+                u64::from(paging.slots),
+                self.pools.state_slot_bytes() + buffered,
+                paging.pages(),
+                u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1))),
+                self.pools.kv_page_bytes(),
+            )
+        });
+        if let Err(error) = self.pools.seat_disk(dir, budget, buffered) {
+            if !unstated {
+                return Err(error);
+            }
+            self.pools.unseat_disk();
+        }
+        Ok(self.pools.disk_pages())
+    }
+
+    #[must_use]
+    pub fn parked_state_slots(&self) -> u32 {
+        self.pools.parked_slots()
+    }
+
+    #[must_use]
+    pub fn parked_buffer_pages(&self) -> u32 {
+        self.pools.parked_pages()
+    }
+
     #[must_use]
     pub fn buffer_pages(&self) -> u32 {
         self.rs_buffers
             .as_ref()
             .map_or(0, crate::rs::Buffers::page_count)
+    }
+
+    pub fn spill_kv(&mut self, to_disk: bool, device: &[u32], disk: &[u32]) -> Result<()> {
+        self.pools.spill_kv(&self.device, to_disk, device, disk)
+    }
+
+    pub fn park_state(&mut self, out: bool, device: &[u32], rows: &[u32]) -> Result<()> {
+        self.pools.park_state(&self.device, out, device, rows)
+    }
+
+    pub fn park_pages(&mut self, out: bool, pages: &[u32], rows: &[u32]) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let buffers = self.rs_buffers.as_ref().ok_or(Fault::Ceiling {
+            what: "recurrent buffer pages",
+            need: 1,
+            have: 0,
+        })?;
+        self.pools
+            .park_pages(&self.device, out, pages, rows, buffers.pages())
     }
 
     pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
@@ -1199,6 +1265,20 @@ impl Shell {
             .iter()
             .map(|pair| bf16(u16::from_le_bytes(*pair)))
             .collect())
+    }
+
+    /// Moves the pool to slabs of `kv_pages` pages, the only way a slab gives
+    /// memory back: frames stop here until the copy lands.
+    pub fn resize_pool(&mut self, kv_pages: u32) -> Result<()> {
+        self.drain()?;
+        // The rows of the last fire bind the slabs this replaces.
+        self.handles.rewind();
+        self.pools.resize(&self.device, u64::from(kv_pages))
+    }
+
+    #[must_use]
+    pub fn kv_page_bytes(&self) -> u64 {
+        self.pools.kv_page_bytes()
     }
 
     pub fn drain(&mut self) -> Result<()> {
@@ -1939,7 +2019,7 @@ impl Shell {
 
             workspace: 0,
         };
-        Supply::commit(&mut self.pools, demand)?;
+        self.pools.admit(demand)?;
 
         if !beginning.is_empty() && self.pools.has_state() {
             self.drain()?;

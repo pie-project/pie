@@ -584,26 +584,62 @@ impl ResidencyPlanner {
 
     /// A worker with no host or disk tier leaves it running.
     pub(super) fn pause_held(self: &Arc<Self>) {
-        if !self.port.suspend_capable() {
-            ptrace!("pause_held: cannot suspend");
-            return;
-        }
-        let held: Vec<(ProcessId, Rank)> = self.with_inner(|inner| {
+        let held: Vec<ProcessId> = self.with_inner(|inner| {
             inner
                 .procs
                 .iter()
-                .filter(|(pid, proc)| {
-                    proc.held
-                        && proc.admitted
-                        && proc.state == Residency::Resident
-                        && !inner.host_swap_blocked.contains(*pid)
-                        && !inner.prepare_blocked.contains(*pid)
-                })
-                .map(|(pid, proc)| (*pid, proc.rank()))
+                .filter(|(_, proc)| proc.held)
+                .map(|(pid, _)| *pid)
                 .collect()
         });
-        ptrace!("pause_held candidates={}", held.len());
-        if held.is_empty() {
+        self.pause(held, |proc| proc.held);
+    }
+
+    /// Suspends the processes reading pages past the pool's limit: they come
+    /// back below it. A process moves whole, never a page at a time, so a
+    /// shrink does not turn into a fault per decode.
+    pub fn vacate_tail(self: &Arc<Self>) {
+        // What a waiter has gathered may lie in the tail: it gathers again.
+        let gathered = self.with_inner(|inner| std::mem::take(&mut inner.accum));
+        drop(gathered);
+        self.poke();
+        let (model, engine) = self.port.locus();
+        let tail = self.port.working_sets_past_limit();
+        if tail.is_empty() {
+            return;
+        }
+        let pids: Vec<ProcessId> = self.with_inner(|inner| inner.procs.keys().copied().collect());
+        let readers = pids
+            .into_iter()
+            .filter(|&pid| {
+                crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine)
+                    .iter()
+                    .any(|ws| tail.contains(ws))
+            })
+            .collect();
+        self.pause(readers, |_| true);
+    }
+
+    /// Suspends those of `pids` that are running and a lower tier can hold.
+    fn pause(self: &Arc<Self>, pids: Vec<ProcessId>, still: fn(&Proc) -> bool) {
+        if !self.port.suspend_capable() {
+            ptrace!("pause: cannot suspend");
+            return;
+        }
+        let pausable: Vec<(ProcessId, Rank)> = self.with_inner(|inner| {
+            pids.iter()
+                .filter_map(|pid| {
+                    let proc = inner.procs.get(pid)?;
+                    (proc.admitted
+                        && proc.state == Residency::Resident
+                        && !inner.host_swap_blocked.contains(pid)
+                        && !inner.prepare_blocked.contains(pid))
+                    .then(|| (*pid, proc.rank()))
+                })
+                .collect()
+        });
+        ptrace!("pause candidates={}", pausable.len());
+        if pausable.is_empty() {
             return;
         }
         let (model, engine) = self.port.locus();
@@ -615,10 +651,10 @@ impl ResidencyPlanner {
             },
         };
         let (picks, unhostable) =
-            self.quote_and_pick(held, everything, self.swap_room(), model, engine);
+            self.quote_and_pick(pausable, everything, self.swap_room(), model, engine);
         // No tier takes them: they keep running.
         ptrace!(
-            "pause_held picks={} unhostable={} room={:?}",
+            "pause picks={} unhostable={} room={:?}",
             picks.len(),
             unhostable.len(),
             self.swap_room()
@@ -629,7 +665,7 @@ impl ResidencyPlanner {
                 if !inner
                     .procs
                     .get(&pid)
-                    .is_some_and(|proc| proc.held && proc.state == Residency::Resident)
+                    .is_some_and(|proc| still(proc) && proc.state == Residency::Resident)
                 {
                     continue;
                 }

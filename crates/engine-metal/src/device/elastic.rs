@@ -19,7 +19,7 @@
 //!
 //! * [`TILE`] (256 KiB) is the sparse page: the granularity Metal will map at,
 //!   and therefore what every offset and length here is rounded to.
-//! * [`CHUNK`] (256 MiB) is the placement heap: the granularity physical
+//! * [`CHUNK`] (16 MiB) is the placement heap: the granularity physical
 //!   memory is *acquired* at. Mapping a tile needs a heap to take it from,
 //!   and a heap per tile would be tens of thousands of heaps.
 //! * [`PAGE`] (2 MiB) is neither. It is the unit the budget is *reported* in,
@@ -94,12 +94,13 @@ pub const TILE: u64 = 256 * 1024;
 
 /// The placement-heap size: the granularity physical memory is acquired at.
 ///
-/// Large because a heap is an allocation with its own residency entry, and a
-/// 40 GiB cache mapped a tile at a time would need two and a half million of
-/// them. Large enough that the last chunk of a buffer is usually part-used,
-/// which is why a chunk tracks how much of itself is mapped rather than being
-/// all-or-nothing.
-pub const CHUNK: u64 = 256 * 1024 * 1024;
+/// What memory goes back in, too: a tile unmapped frees nothing until its
+/// whole heap empties, so this is the slack a pool can hold per plane. Small
+/// enough that the slack is not a pressure problem; the residency set's cost
+/// was flat up to 16,384 heaps and a frame's did not move, so the heap count
+/// a 40 GiB cache needs here costs nothing a frame sees. A chunk tracks how
+/// much of itself is mapped because the last one is usually part-used.
+pub const CHUNK: u64 = 16 * 1024 * 1024;
 
 /// The unit budgets are *reported* in, and the step growth is rounded to.
 ///
@@ -804,10 +805,7 @@ fn make_chunk(sparse: &Sparse, bytes: u64) -> Result<Chunk> {
     let heap = sparse
         .device()
         .newHeapWithDescriptor(&descriptor)
-        .ok_or_else(|| Fault::Device {
-            call: "newHeapWithDescriptor",
-            why: format!("a placement heap of {bytes} bytes was refused"),
-        })?;
+        .ok_or(Fault::Refused { bytes })?;
     // SAFETY: the offset is zero and the length is the heap's own size, so
     // the placement is in bounds by construction; the descriptor above
     // declared the heap compatible with this storage mode.
@@ -993,6 +991,23 @@ pub struct Target<'a> {
 /// cannot be priced as one.
 #[cfg(target_vendor = "apple")]
 pub fn grow_all(targets: &mut [Target<'_>]) -> Result<Vec<Option<(u64, u64)>>> {
+    let grown = map_all(targets)?;
+    for (target, range) in targets.iter().zip(&grown) {
+        if let Some((from, to)) = *range {
+            // SAFETY: the tiles were mapped by the flush just waited for,
+            // and no frame has been encoded against them yet -- they did not
+            // exist a moment ago.
+            unsafe { target.buffer.zero(from, to - from)? };
+        }
+    }
+    Ok(grown)
+}
+
+/// [`grow_all`] without the zeroing, for memory no one reads before writing:
+/// a heap's pages are paid on first touch, so what is mapped and not touched
+/// costs an address and nothing else.
+#[cfg(target_vendor = "apple")]
+pub fn map_all(targets: &mut [Target<'_>]) -> Result<Vec<Option<(u64, u64)>>> {
     let mut arena: Option<Arena> = None;
     let mut delta = 0u64;
     for target in targets.iter() {
@@ -1079,14 +1094,6 @@ pub fn grow_all(targets: &mut [Target<'_>]) -> Result<Vec<Option<(u64, u64)>>> {
     if let Some(fault) = first_fault {
         return Err(fault);
     }
-    for (target, range) in targets.iter().zip(&grown) {
-        if let Some((from, to)) = *range {
-            // SAFETY: the tiles were mapped by the flush just waited for,
-            // and no frame has been encoded against them yet -- they did not
-            // exist a moment ago.
-            unsafe { target.buffer.zero(from, to - from)? };
-        }
-    }
     Ok(grown)
 }
 
@@ -1139,9 +1146,9 @@ fn shrink(buffer: &mut Elastic, bytes: u64) -> (bool, Vec<Chunk>) {
 ///
 /// # Safety
 ///
-/// No frame may be reading the tiles this takes away: the caller has
-/// drained every command buffer that could touch these buffers. The mapping
-/// queue cannot check that, because the frame queue signals nothing.
+/// No frame may be reading the tiles this takes away; frames over the tiles
+/// below them may run on. The mapping queue cannot check that, because the
+/// frame queue signals nothing.
 ///
 /// # Errors
 ///

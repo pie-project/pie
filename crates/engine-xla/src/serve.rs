@@ -19,7 +19,7 @@ use std::path::Path;
 use crate::handle::Tensor;
 use checkpoint::contract::ModelContract;
 use engine::fire::Masking;
-use engine::frame::{Demand, Supply};
+use engine::frame::Demand;
 use poem_compiler::{Budget, Budgets, CompiledModel, FireRows, compile_axes};
 use poem_exec::feeds::classes_running;
 use poem_exec::fire::{At, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
@@ -1403,14 +1403,11 @@ impl Shell {
             }
         }
 
-        Supply::commit(
-            &mut self.pools,
-            Demand {
-                kv_pages: u32::try_from(demand_pages).unwrap_or(u32::MAX),
-                state_slots: demand_slots,
-                workspace: 0,
-            },
-        )?;
+        self.pools.admit(Demand {
+            kv_pages: u32::try_from(demand_pages).unwrap_or(u32::MAX),
+            state_slots: demand_slots,
+            workspace: 0,
+        })?;
         self.pools
             .clear_slots(&self.device, &self.handles, &beginning)?;
         // The windowed pages the runtime copies before this fire (a fork's

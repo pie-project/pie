@@ -8,13 +8,28 @@ use super::holdings::{swapped_page_count, swapped_rs_units};
 use super::proc::Residency;
 use super::wait::{EntryKey, WaitKind, Waiter};
 use super::{ProcessId, ResidencyPlanner, exec};
+use crate::store::rs::RsUnits;
 
 enum Step {
-    Absorb { count: u32, fund_by_eviction: bool },
-    ShortRs { fund_by_eviction: bool },
-    ServeAllocation { key: EntryKey, demand: Demand },
-    ServeAllocationBurst { extra: u32 },
-    ServeRestore { key: EntryKey, pid: ProcessId },
+    Absorb {
+        count: u32,
+        fund_by_eviction: bool,
+    },
+    ShortRs {
+        need: RsUnits,
+        fund_by_eviction: bool,
+    },
+    ServeAllocation {
+        key: EntryKey,
+        demand: Demand,
+    },
+    ServeAllocationBurst {
+        extra: u32,
+    },
+    ServeRestore {
+        key: EntryKey,
+        pid: ProcessId,
+    },
     Release(DevicePageReservation),
     Done,
 }
@@ -62,9 +77,10 @@ impl ResidencyPlanner {
                 // rs slots are taken whole when the head is served; a short
                 // pool is funded as paged pages are, by suspending holders.
                 let need = waiter.rs_need();
-                if !rs_free.covers(need.add(inner.seating_reserve(pid, rs_growth, need, rs_total)))
-                {
+                let seated = need.add(inner.seating_reserve(pid, rs_growth, need, rs_total));
+                if !rs_free.covers(seated) {
                     return Step::ShortRs {
+                        need: seated.sub(rs_free),
                         fund_by_eviction: !is_restore || inner.fleet_stalled(),
                     };
                 }
@@ -92,7 +108,13 @@ impl ResidencyPlanner {
                     count,
                     fund_by_eviction,
                 } => {
-                    if self.absorb_free(count) || self.reclaim_idle_once() {
+                    if self.absorb_free(count) {
+                        continue;
+                    }
+                    if self.port.grow(count) {
+                        return;
+                    }
+                    if self.reclaim_idle_once() {
                         continue;
                     }
                     if self.sweep_stranded(count) {
@@ -100,7 +122,13 @@ impl ResidencyPlanner {
                     }
                     fund_by_eviction
                 }
-                Step::ShortRs { fund_by_eviction } => {
+                Step::ShortRs {
+                    need,
+                    fund_by_eviction,
+                } => {
+                    if self.port.grow_rs(need) {
+                        return;
+                    }
                     if self.reclaim_idle_once() || self.yield_head_checkpoints() {
                         continue;
                     }
@@ -108,6 +136,9 @@ impl ResidencyPlanner {
                 }
                 Step::ServeAllocation { key, demand } => {
                     let Some(rs) = self.reserve_rs_slots(demand.rs) else {
+                        if self.port.grow_rs(demand.rs) {
+                            return;
+                        }
                         continue;
                     };
                     let outcome = self.with_inner(|inner| {
@@ -178,6 +209,9 @@ impl ResidencyPlanner {
                         continue;
                     }
                     let Some(slots) = self.reserve_rs_slots(need.rs) else {
+                        if self.port.grow_rs(need.rs) {
+                            return;
+                        }
                         continue;
                     };
                     let boarded = self.with_inner(|inner| {

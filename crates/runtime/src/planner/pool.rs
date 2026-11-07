@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::store::extent::Extent;
 use crate::store::rs::RsUnits;
 
 /// The window-ring pages a seated lane past its window holds beyond its
@@ -9,6 +10,12 @@ const RING_GROWTH: u32 = 2;
 
 pub trait PoolPort: Send + Sync + 'static {
     fn device_stats(&self) -> (u32, u32);
+    /// Device pages handed out. A target below the pool is room the target
+    /// can rise into, so this is not `device_stats`' complement there.
+    fn device_out(&self) -> u32 {
+        let (free, total) = self.device_stats();
+        total.saturating_sub(free)
+    }
     fn host_stats(&self) -> (u32, u32);
     fn disk_stats(&self) -> (u32, u32);
     fn rs_stats(&self) -> (RsUnits, RsUnits);
@@ -23,6 +30,21 @@ pub trait PoolPort: Send + Sync + 'static {
     /// window is let go. Fixed state slots never grow.
     fn rs_growth(&self) -> RsUnits {
         RsUnits::default()
+    }
+    /// Asks for `count` pages more than stand free now; true when memory
+    /// is on its way, and `pages_freed` follows it.
+    fn grow(&self, count: u32) -> bool {
+        let _ = count;
+        false
+    }
+    /// Asks for `need` more state than stands free; as [`Self::grow`].
+    fn grow_rs(&self, need: RsUnits) -> bool {
+        let _ = need;
+        false
+    }
+    /// The working sets reading pages past the pool's limit.
+    fn working_sets_past_limit(&self) -> HashSet<crate::store::kv::page_table::WorkingSetId> {
+        HashSet::new()
     }
     fn reserve_device(
         &self,
@@ -54,6 +76,7 @@ pub struct RegistryPool {
     suspend_capable: bool,
     /// The last count of reclaimable idle pages and when it was taken.
     reclaimable: parking_lot::Mutex<Option<(crate::rt::Instant, u32)>>,
+    extent: Option<Extent>,
 }
 
 /// How long a count of reclaimable idle pages stands: counting walks every
@@ -68,7 +91,14 @@ impl RegistryPool {
             engine,
             suspend_capable,
             reclaimable: parking_lot::Mutex::new(None),
+            extent: None,
         }
+    }
+
+    /// Commits the pool's pages on demand rather than holding them whole.
+    pub fn with_extent(mut self, extent: Extent) -> Self {
+        self.extent = Some(extent);
+        self
     }
 
     fn with_kv_tagged<R>(
@@ -94,6 +124,10 @@ impl PoolPort for RegistryPool {
         })
     }
 
+    fn device_out(&self) -> u32 {
+        self.with_kv_tagged("planner-device-out", |kv| kv.pages_out())
+    }
+
     fn host_stats(&self) -> (u32, u32) {
         self.with_kv_tagged("planner-host-stats", |kv| {
             (kv.host_swap_available() as u32, kv.host_swap_capacity())
@@ -107,7 +141,7 @@ impl PoolPort for RegistryPool {
     }
 
     fn rs_stats(&self) -> (RsUnits, RsUnits) {
-        self.with_rs(|rs| (rs.available(), rs.capacity()))
+        self.with_rs(|rs| (rs.free(), rs.capacity()))
     }
 
     fn rs_growth(&self) -> RsUnits {
@@ -160,9 +194,50 @@ impl PoolPort for RegistryPool {
         &self,
         count: u32,
     ) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>> {
-        self.with_kv_tagged("planner-reserve", |kv| {
-            kv.reserve_device_pages(count as usize)
-        })
+        let (pages, due) = self.with_kv_tagged("planner-reserve", |kv| {
+            let pages = kv.reserve_device_pages(count as usize);
+            let due = self.extent.as_ref().is_some_and(|extent| {
+                if pages.is_none() {
+                    kv.note_short(count);
+                }
+                pages.is_none() || kv.commit_due(extent.step())
+            });
+            (pages, due)
+        });
+        if due && let Some(extent) = &self.extent {
+            extent.wake();
+        }
+        pages
+    }
+
+    fn working_sets_past_limit(&self) -> HashSet<crate::store::kv::page_table::WorkingSetId> {
+        self.with_kv_tagged("planner-tail", |kv| kv.working_sets_past_limit())
+    }
+
+    fn grow(&self, count: u32) -> bool {
+        let Some(extent) = &self.extent else {
+            return false;
+        };
+        let growing = self.with_kv_tagged("planner-grow", |kv| {
+            kv.note_short(count);
+            kv.can_commit()
+        });
+        if growing {
+            extent.wake();
+            return true;
+        }
+        extent.ask()
+    }
+
+    fn grow_rs(&self, need: RsUnits) -> bool {
+        let Some(extent) = &self.extent else {
+            return false;
+        };
+        if self.with_rs(|rs| rs.note_short(need)) {
+            extent.wake();
+            return true;
+        }
+        extent.state_on_demand() && extent.ask()
     }
 
     fn reserve_device_up_to(
@@ -170,7 +245,7 @@ impl PoolPort for RegistryPool {
         count: u32,
     ) -> Vec<crate::store::kv::page_table::PhysicalKvPageId> {
         self.with_kv_tagged("planner-reserve-up-to", |kv| {
-            let take = (kv.available_pages() as u32).min(count);
+            let take = (kv.free_committed() as u32).min(count);
             if take == 0 {
                 return Vec::new();
             }
@@ -185,7 +260,18 @@ impl PoolPort for RegistryPool {
     }
 
     fn reserve_rs(&self, need: RsUnits) -> Option<crate::store::rs::RsGrant> {
-        self.with_rs(|rs| rs.reserve(need))
+        let (grant, due) = self.with_rs(|rs| {
+            let grant = rs.reserve(need);
+            let due = self
+                .extent
+                .as_ref()
+                .is_some_and(|extent| rs.next_extent(extent.state_step()).is_some());
+            (grant, due)
+        });
+        if due && let Some(extent) = &self.extent {
+            extent.wake();
+        }
+        grant
     }
 
     fn release_rs(&self, grant: crate::store::rs::RsGrant) {

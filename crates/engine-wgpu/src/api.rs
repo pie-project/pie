@@ -13,7 +13,7 @@ use engine::fire::{
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
+use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
 use eta_ir::registry::{GeometryClass, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -226,13 +226,15 @@ fn runahead_of(frames_in_flight: u8) -> engine::runahead::Runahead {
 
 const DEFAULT_STATE_SLOTS: u32 = 256;
 
-fn bake_budgets(budgets: &LoadBudgets) -> Budget {
+/// The load's budgets: its logit readouts sized to what `trace` reads, not a
+/// general figure, so a vocab-wide head carves only the rows a fire can read.
+fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,
         buckets: budgets.buckets.clone(),
         max_adapters: budgets.max_adapters,
-        readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE,
+        readouts_per_lane: poem_compiler::arena::readouts_per_lane(trace),
     }
 }
 
@@ -393,11 +395,19 @@ impl Engine for Wgpu {
             budgets.max_lanes,
         );
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
-        let shell = Shell::load(Boot {
+        let (disk_kv_budget, disk_kv_dir, seats) = (
+            residency.disk_kv_budget,
+            residency.disk_kv_dir.clone(),
+            residency.kv_seats.unwrap_or(budgets.max_lanes),
+        );
+        let budget = bake_budgets(&budgets, &trace);
+        let max_readouts =
+            u32::try_from(poem_compiler::arena::readouts_ceiling(&budget)).unwrap_or(u32::MAX);
+        let mut shell = Shell::load(Boot {
             trace,
             contract: &contract,
             checkpoint: &path,
-            budget: bake_budgets(&budgets),
+            budget,
             patches,
             voxels,
 
@@ -412,6 +422,14 @@ impl Engine for Wgpu {
             handed: self.handed.take(),
         })
         .map_err(fault)?;
+        let disk_kv_pages = shell
+            .seat_disk_kv(
+                disk_kv_budget,
+                disk_kv_dir.as_deref(),
+                seats,
+                budgets.max_context,
+            )
+            .map_err(fault)?;
         let weights_resident = !shell.weights_stream();
 
         let trace_name = shell.trace().name.clone();
@@ -451,6 +469,11 @@ impl Engine for Wgpu {
 
                 elastic_page_bytes: 0,
                 elastic_budget_pages: 0,
+                slab_kv_page_bytes: shell.kv_page_bytes(),
+                elastic_state_slot_bytes: 0,
+                disk_kv_pages,
+                host_state_slots: shell.parked_state_slots(),
+                host_buffer_pages: shell.parked_buffer_pages(),
                 ..PoolFacts::default()
             },
             limits: FireLimits {
@@ -459,10 +482,7 @@ impl Engine for Wgpu {
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
                 prefill_rows: 0,
-                max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
-                    &budgets,
-                )))
-                .unwrap_or(u32::MAX),
+                max_readouts,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -517,6 +537,14 @@ impl Engine for Wgpu {
             },
             caps,
         })
+    }
+
+    fn commit_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
+        self.loaded_mut()?.resize_pool(kv_pages).map_err(fault)
+    }
+
+    fn release_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
+        self.loaded_mut()?.resize_pool(kv_pages).map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
@@ -731,12 +759,16 @@ impl Engine for Wgpu {
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
-
-        let served = self
-            .caps
-            .as_ref()
-            .is_some_and(|caps| copy.src == caps.device.domain && copy.dst == caps.device.domain);
-        if !served {
+        let device = self.caps.as_ref().map(|caps| caps.device.domain);
+        if let Some((MemoryDomain::LocalDisk, out, pages, slots)) =
+            device.and_then(|device| copy.tier_move(device))
+        {
+            return self
+                .loaded_mut()?
+                .spill_kv(out, pages, slots)
+                .map_err(fault);
+        }
+        if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),
                 engine: "wgpu",
@@ -748,7 +780,6 @@ impl Engine for Wgpu {
     }
 
     fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        copy.device_only("wgpu")?;
         for (at, move_) in copy.moves.iter().enumerate() {
             if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
                 return Err(Error::Invalid(format!(
@@ -756,18 +787,27 @@ impl Engine for Wgpu {
                 )));
             }
         }
+        let ends = |moves: &[engine::transfer::StateMove]| -> (Vec<u32>, Vec<u32>) {
+            moves.iter().map(|m| (m.src_slot_id, m.dst_slot_id)).unzip()
+        };
+        let ((src, dst), (page_src, page_dst)) = (ends(&copy.moves), ends(&copy.pages));
         let shell = self.loaded_mut()?;
-        for move_ in &copy.moves {
-            shell
-                .copy_state(move_.src_slot_id, move_.dst_slot_id)
-                .map_err(fault)?;
-        }
-        let pages: Vec<(u32, u32)> = copy
-            .pages
-            .iter()
-            .map(|m| (m.src_slot_id, m.dst_slot_id))
-            .collect();
-        shell.copy_pages(&pages).map_err(fault)
+        let copied: crate::error::Result<()> = match copy.direction {
+            StateDirection::DeviceToDevice => src
+                .iter()
+                .zip(&dst)
+                .try_for_each(|(&src, &dst)| shell.copy_state(src, dst))
+                .and_then(|()| {
+                    shell.copy_pages(&page_src.into_iter().zip(page_dst).collect::<Vec<_>>())
+                }),
+            StateDirection::DeviceToHost => shell
+                .park_state(true, &src, &dst)
+                .and_then(|()| shell.park_pages(true, &page_src, &page_dst)),
+            StateDirection::HostToDevice => shell
+                .park_state(false, &dst, &src)
+                .and_then(|()| shell.park_pages(false, &page_dst, &page_src)),
+        };
+        copied.map_err(fault)
     }
 }
 

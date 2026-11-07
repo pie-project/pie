@@ -2760,15 +2760,13 @@ fn wide(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
 }
 
-impl engine::frame::Supply for Pools {
-    type Error = Fault;
-
-    fn commit(&mut self, demand: engine::frame::Demand) -> Result<()> {
+impl Pools {
+    /// See `Engine::commit_pool`.
+    pub fn commit(&mut self, demand: engine::frame::Demand) -> Result<()> {
         if let Some(highest) = demand.state_slots.checked_sub(1) {
             slab_row(self.has_state(), self.paging.slots, highest)?;
         }
-        let capacity =
-            u64::from(self.paging.slots).saturating_mul(u64::from(self.paging.pages_per_slot));
+        let capacity = self.paging.pages();
         if u64::from(demand.kv_pages) > capacity {
             return Err(Fault::Ceiling {
                 what: "kv pages",

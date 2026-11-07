@@ -260,20 +260,12 @@ fn land(
         frames_in_flight,
     )?;
     if request.residency.disk_kv_budget != Some(0) && request.residency.disk_kv_dir.is_none() {
-        match crate::disk::kv_dir(cache_dir, snapshot_dir) {
-            // Each rank of an expert-parallel group keeps its own requests' kv.
-            Ok(dir) => {
-                request.residency.disk_kv_dir = Some(match overrides.ep {
-                    Some(_) => dir.join(format!("rank{}", overrides.rank.unwrap_or(0))),
-                    None => dir,
-                });
-            }
-            Err(error) if request.residency.disk_kv_budget.is_none() => {
-                tracing::warn!(%error, "no directory for the default disk kv tier; serving without it");
-                request.residency.disk_kv_budget = Some(0);
-            }
-            Err(error) => return Err(error),
-        }
+        let dir = crate::disk::kv_dir(cache_dir, snapshot_dir)?;
+        // Each rank of an expert-parallel group keeps its own requests' kv.
+        request.residency.disk_kv_dir = Some(match overrides.ep {
+            Some(_) => dir.join(format!("rank{}", overrides.rank.unwrap_or(0))),
+            None => dir,
+        });
     }
     let deployment = request.trace.name.clone();
     let disk_kv_dir = request.residency.disk_kv_dir.clone();

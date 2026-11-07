@@ -29,6 +29,9 @@ thiserror = "2.0"
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-std = { path = "../web-std" }
+
 [dev-dependencies]
 
 [lints]

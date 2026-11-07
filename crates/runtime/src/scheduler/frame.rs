@@ -693,8 +693,15 @@ impl FramePolicy {
         let mid_boundary = self.boundary_open();
 
         let k = self.k;
-        let max_wave_rows = self.max_wave_rows;
-        let max_wave_tokens = self.max_wave_tokens;
+        let (mut max_wave_rows, mut max_wave_tokens) = (self.max_wave_rows, self.max_wave_tokens);
+        if self
+            .stats
+            .as_ref()
+            .is_some_and(|stats| stats.narrow_waves.load(Ordering::Relaxed))
+        {
+            max_wave_rows = max_wave_rows.min(::engine::frame::NARROW_WAVE.0);
+            max_wave_tokens = max_wave_tokens.min(::engine::frame::NARROW_WAVE.1);
+        }
         let max_wave_readouts = self.max_wave_readouts;
         // One frame of prompts on the card at a time: prompts arriving behind
         // it bind together into the next, while decodes keep running ahead.
@@ -783,11 +790,13 @@ impl FramePolicy {
                 }
                 let fits = live.iter().all(|fire| {
                     let reading = wave_readouts[fire.wave];
-                    wave_rows[fire.wave] + fire.rows <= max_wave_rows
-                        && wave_tokens[fire.wave] + fire.tokens <= max_wave_tokens
-                        && (max_wave_readouts == 0
-                            || reading == 0
-                            || reading + fire.readouts <= max_wave_readouts)
+                    // A lane wider than the wave still takes one of its own.
+                    wave_rows[fire.wave] == 0
+                        || wave_rows[fire.wave] + fire.rows <= max_wave_rows
+                            && wave_tokens[fire.wave] + fire.tokens <= max_wave_tokens
+                            && (max_wave_readouts == 0
+                                || reading == 0
+                                || reading + fire.readouts <= max_wave_readouts)
                 });
                 if !fits {
                     continue;

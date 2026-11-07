@@ -495,6 +495,11 @@ pub struct ModelConfig {
     /// (tier T1), written with its unit (`"64GiB"`). Omit for uncapped.
     #[serde(default)]
     pub host_weight_budget: Option<ByteSize>,
+    /// How much congestion the system may show before this gives memory
+    /// back: `dedicated` never does, then `aggressive`, `balanced`, `polite`.
+    /// All but `dedicated` also give back what demand stopped asking for.
+    #[serde(default)]
+    pub memory_tolerance: runtime::governor::Tolerance,
     /// How many device bytes the kv pages and recurrent-state slots take
     /// (`"20GiB"`), per device. Omit to fill what `device_memory_share`
     /// leaves once the weights and working set are down. A budget the device
@@ -527,8 +532,8 @@ pub struct ModelConfig {
     /// and Vulkan keep no host tier, so there it is the only one, and
     /// suspended rs slots go to it too. Omit for four host tiers' worth on
     /// cuda, or every seat at full context elsewhere, within a quarter of
-    /// the free space there (skipped when the disk cannot take it); `"0B"`
-    /// turns the disk tier off.
+    /// the free space there. The tier is always on: it is what keeps a
+    /// session when memory is taken back.
     #[serde(default)]
     pub disk_kv_budget: Option<ByteSize>,
     /// Where the disk tier's slot files go. Omit for
@@ -813,6 +818,11 @@ impl ModelConfig {
             self.device_kv_budget.is_none_or(|b| b.as_bytes() > 0),
             "model.device_kv_budget is zero, and no load serves without a kv pool; \
              state a real budget or omit the key to fill what device_memory_share leaves"
+        );
+        ensure!(
+            self.disk_kv_budget.is_none_or(|b| b.as_bytes() > 0),
+            "model.disk_kv_budget is zero, and the disk tier is what keeps a session when \
+             memory is taken back; state a real budget or omit the key"
         );
         ensure!(
             self.host_kv_budget.is_none_or(|b| b.as_bytes() > 0),

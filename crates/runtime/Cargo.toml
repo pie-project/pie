@@ -127,6 +127,9 @@ getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 [target.'cfg(all(target_vendor = "apple", not(target_os = "macos")))'.dependencies]
 wasmtime = { version = "49.0.2", default-features = false, features = ["pulley"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_vendor = "apple")'.dependencies]
 engine-metal = { path = "../engine-metal", optional = true }
 

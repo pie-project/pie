@@ -697,6 +697,8 @@ impl Engine for Cuda {
                     .unwrap_or(0),
                 elastic_page_bytes,
                 elastic_budget_pages,
+                slab_kv_page_bytes: 0,
+                elastic_state_slot_bytes: 0,
                 window_pages: paging.window.map_or(0, |_| {
                     u32::try_from(paging.window_pages()).unwrap_or(u32::MAX)
                 }),
@@ -791,6 +793,10 @@ impl Engine for Cuda {
         self.loaded_mut()?
             .register_adapter(registration.id, &planes)
             .map_err(fault)
+    }
+
+    fn commit_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_pool(kv_pages).map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
