@@ -189,7 +189,8 @@ pub trait Engine: Send {
     }
 
     /// The bytes of host rs rows: `slots`' state, then `pages`' buffers, one
-    /// after another, once every copy into them has landed.
+    /// after another, once every copy into them has landed. For a model whose
+    /// state is a window, `pages` are host windowed pages and `slots` empty.
     fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> Result<Vec<u8>> {
         let _ = (slots, pages);
         Err(self.unsupported("read_host_state"))

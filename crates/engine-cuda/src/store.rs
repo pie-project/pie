@@ -231,6 +231,45 @@ pub fn host_pool(
     let pages = pages + left.checked_div(page_bytes).unwrap_or(0);
     (clamp(rows), clamp(pages), clamp(window_pages))
 }
+/// `slots` of `shelf`, one after another, each its planes in order.
+fn read_shelf(shelf: &Shelf, slots: &[u32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &slot in slots {
+        for (plane, &bytes) in shelf.planes.iter().enumerate() {
+            let (pinned, at) = shelf.place(slot, plane).expect("backed by the caller");
+            out.extend_from_slice(pinned.view(at, bytes).expect("inside its chunk"));
+        }
+    }
+    out
+}
+
+/// Writes `bytes`, as [`read_shelf`] lays them out, into `slots` of `shelf`.
+fn write_shelf(shelf: &Shelf, slots: &[u32], bytes: &[u8], what: &'static str) -> Result<()> {
+    let slot_bytes: u64 = shelf.planes.iter().sum();
+    let need = slots.len() as u64 * slot_bytes;
+    if bytes.len() as u64 != need {
+        return Err(Fault::Ceiling {
+            what,
+            need,
+            have: bytes.len() as u64,
+        });
+    }
+    let mut from = 0;
+    for &slot in slots {
+        for (plane, &len) in shelf.planes.iter().enumerate() {
+            let (pinned, at) = shelf.place(slot, plane).expect("backed by the caller");
+            let len = usize::try_from(len).unwrap_or(0);
+            let at = usize::try_from(at).unwrap_or(usize::MAX);
+            assert!(
+                pinned.write(at, &bytes[from..from + len]),
+                "inside its chunk"
+            );
+            from += len;
+        }
+    }
+    Ok(())
+}
+
 fn slot_file(error: std::io::Error) -> Fault {
     Fault::Integrity {
         at: "kv slot file",
@@ -2259,43 +2298,34 @@ impl Pools {
     /// Host kv slots `slots`, one after another, each its planes in order.
     /// The caller has synchronized every copy into them.
     pub fn read_host_kv(&mut self, slots: &[u32]) -> Result<Vec<u8>> {
-        let shelf = self.paged_shelf(slots)?;
-        let mut out = Vec::new();
-        for &slot in slots {
-            for (plane, &bytes) in shelf.planes.iter().enumerate() {
-                let (pinned, at) = shelf.place(slot, plane).expect("backed above");
-                out.extend_from_slice(pinned.view(at, bytes).expect("inside its chunk"));
-            }
-        }
-        Ok(out)
+        Ok(read_shelf(self.host_shelf(false, slots)?, slots))
     }
 
     /// Writes `bytes`, as [`Self::read_host_kv`] lays them out, into host kv
     /// slots `slots`.
     pub fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()> {
-        let slot_bytes = usize::try_from(self.host_kv_slot_bytes()).unwrap_or(0);
-        if bytes.len() != slots.len() * slot_bytes {
-            return Err(Fault::Ceiling {
-                what: "bytes of host kv slots",
-                need: (slots.len() * slot_bytes) as u64,
-                have: bytes.len() as u64,
-            });
-        }
-        let shelf = self.paged_shelf(slots)?;
-        let mut from = 0;
-        for &slot in slots {
-            for (plane, &len) in shelf.planes.iter().enumerate() {
-                let (pinned, at) = shelf.place(slot, plane).expect("backed above");
-                let len = usize::try_from(len).unwrap_or(0);
-                let at = usize::try_from(at).unwrap_or(usize::MAX);
-                assert!(
-                    pinned.write(at, &bytes[from..from + len]),
-                    "inside its chunk"
-                );
-                from += len;
-            }
-        }
-        Ok(())
+        write_shelf(
+            self.host_shelf(false, slots)?,
+            slots,
+            bytes,
+            "bytes of host kv slots",
+        )
+    }
+
+    /// Host windowed pages `pages`, a ring's on the host, laid out as
+    /// [`Self::read_host_kv`] lays out kv slots.
+    pub fn read_host_window(&mut self, pages: &[u32]) -> Result<Vec<u8>> {
+        Ok(read_shelf(self.host_shelf(true, pages)?, pages))
+    }
+
+    /// Writes `bytes`, as [`Self::read_host_window`] lays them out.
+    pub fn write_host_window(&mut self, pages: &[u32], bytes: &[u8]) -> Result<()> {
+        write_shelf(
+            self.host_shelf(true, pages)?,
+            pages,
+            bytes,
+            "bytes of host windowed pages",
+        )
     }
 
     /// Reads `(row, from, bytes)` spans of the host rs rows, in order.
@@ -2347,17 +2377,28 @@ impl Pools {
         Ok(&host.rows)
     }
 
-    /// The host kv shelf, with the chunks holding `slots` pinned.
-    fn paged_shelf(&mut self, slots: &[u32]) -> Result<&Shelf> {
+    /// The host kv (or, `windowed`, windowed) shelf, with the chunks
+    /// holding `slots` pinned.
+    fn host_shelf(&mut self, windowed: bool, slots: &[u32]) -> Result<&Shelf> {
+        let what = if windowed {
+            "host windowed pages"
+        } else {
+            "host kv pages"
+        };
         let Some(host) = self.host.as_mut() else {
             return Err(Fault::Ceiling {
-                what: "host kv pages",
+                what,
                 need: 1,
                 have: 0,
             });
         };
-        host.paged.back(slots.iter().copied(), "host kv pages")?;
-        Ok(&host.paged)
+        let shelf = if windowed {
+            &mut host.windowed
+        } else {
+            &mut host.paged
+        };
+        shelf.back(slots.iter().copied(), what)?;
+        Ok(shelf)
     }
 
     /// `slot`'s recurrent state, read on `stream` behind the fires that

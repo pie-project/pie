@@ -51,8 +51,8 @@ pub struct RingGeometry {
 /// index it was written for; `committed` is the position the window is
 /// anchored at and `head` the position written up to, in tokens; `retired`
 /// counts the leading pages, in sequence order, already given back.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct RingState {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RingState {
     retired: u32,
     committed: u32,
     head: u32,
@@ -175,6 +175,8 @@ pub struct RsExport {
     pub buffer: Vec<Option<RsSlotId>>,
     pub base: u32,
     pub frozen: u32,
+    /// A window's position, when the state is one: `buffer` is its pages.
+    pub ring: Option<RingState>,
 }
 
 /// Token `t` of page `p` holds slot `base + p * page + t`.
@@ -414,19 +416,16 @@ impl RsStore {
         })
     }
 
-    /// What a snapshot keeps of `ws`, on the rows it stands on now; `None`
-    /// for a ring, whose state is its kv window.
-    pub fn export(&self, ws: RsWorkingSetId) -> Result<Option<RsExport>, RsError> {
+    /// What a snapshot keeps of `ws`, on the rows it stands on now.
+    pub fn export(&self, ws: RsWorkingSetId) -> Result<RsExport, RsError> {
         let entry = self.entry(ws)?;
-        if entry.ring.is_some() {
-            return Ok(None);
-        }
-        Ok(Some(RsExport {
+        Ok(RsExport {
             folded: entry.folded,
             buffer: entry.buffer.clone(),
             base: entry.base,
             frozen: entry.frozen,
-        }))
+            ring: entry.ring,
+        })
     }
 
     /// Whether `id` is a host row already.
@@ -458,7 +457,7 @@ impl RsStore {
             buffer: set.buffer,
             base: set.base,
             frozen: set.frozen,
-            ring: None,
+            ring: set.ring,
         })
     }
 

@@ -27,7 +27,7 @@ use crate::store::kv::page_table::{ExportedPage, ExportedSet, HostKvSlotId, KvPa
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::registry as store_registry;
 use crate::store::rs::working_set::RsWorkingSet;
-use crate::store::rs::{RsExport, RsGeometry, RsSlotId};
+use crate::store::rs::{RingState, RsExport, RsGeometry, RsSlotId};
 
 const VERSION: u32 = 1;
 /// Names are file names here, written out in hex.
@@ -136,6 +136,12 @@ struct SavedState {
     base: u32,
     frozen: u32,
     bytes: u64,
+    /// The window's position, for a model whose state is one: `buffer` is
+    /// then its windowed pages, and `window_tokens` the window.
+    #[serde(default)]
+    ring: Option<RingState>,
+    #[serde(default)]
+    window_tokens: u32,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -341,8 +347,12 @@ async fn read_state(
                 row_pages.push(row);
             }
         }
-        for (kind, (device, slots)) in [(TierKind::Rs, slot_moves), (TierKind::RsPages, page_moves)]
-        {
+        let pages_kind = if set.ring.is_some() {
+            TierKind::Window
+        } else {
+            TierKind::RsPages
+        };
+        for (kind, (device, slots)) in [(TierKind::Rs, slot_moves), (pages_kind, page_moves)] {
             if device.is_empty() {
                 continue;
             }
@@ -380,6 +390,8 @@ async fn read_state(
             base: set.base,
             frozen: set.frozen,
             bytes: bytes.len() as u64,
+            ring: set.ring,
+            window_tokens: crate::model::model().rs_caps().window_tokens,
         },
         bytes,
     ))
@@ -444,14 +456,7 @@ pub(super) async fn save(held: &Held, tenant: &str, name: &str) -> Result<Value,
             Some(rs) => {
                 let set = stores.rs.lock().unwrap().export(rs.id);
                 let set = set.map_err(|error| failed("reading recurrent state", error))?;
-                match set {
-                    Some(set) => Some((rs, set)),
-                    None => {
-                        return Err(HandleError::invalid(
-                            "a window model's state cannot be kept yet",
-                        ));
-                    }
-                }
+                Some((rs, set))
             }
             None => None,
         };
@@ -801,6 +806,8 @@ async fn load_state(
     if !caps.has_state()
         || caps.state_size != geom.state_size
         || caps.buffer_page_size != geom.buffer_page_tokens
+        || caps.window_tokens != saved.window_tokens
+        || (caps.window_tokens > 0) != saved.ring.is_some()
     {
         return Err(HandleError::invalid(
             "its recurrent state is not this model's",
@@ -839,6 +846,7 @@ async fn load_state(
             .collect(),
         base: saved.base,
         frozen: saved.frozen,
+        ring: saved.ring,
     };
     let id = store.import(geom, set);
     Ok(RsWorkingSet::new(0, engine, id, geom))

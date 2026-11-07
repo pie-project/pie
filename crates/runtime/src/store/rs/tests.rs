@@ -52,7 +52,8 @@ fn tests_every_case() {
 // A windowed model's state is a ring: a fire takes the pages it writes,
 // the pages behind the committed position's window retire, a write moves the
 // head back without touching a page, a fork shares the ring and copies
-// only the page it overwrites, and a suspend parks the ring on the host.
+// only the page it overwrites, a suspend parks the ring on the host, and what
+// a snapshot keeps of it comes back where it stood.
 fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
     use super::{RingAdvance, RingGeometry};
     use std::collections::HashSet;
@@ -128,6 +129,15 @@ fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
     assert!(txn.is_ring() && txn.copy_plan().pages.len() == 3);
     assert_eq!(s.commit_suspend(txn), pages(3));
     assert_eq!((s.held([ws]), s.swapped_units(&set)), (pages(0), pages(3)));
+    let kept = s.export(ws).unwrap();
+    assert_eq!(kept.buffer.iter().flatten().count(), 3);
+    let back = s.import(geom(), kept);
+    assert_eq!(
+        s.ring_positions(back),
+        s.ring_positions(ws),
+        "a kept ring comes back where it stood"
+    );
+    s.working_sets.remove(back);
     assert_eq!(s.available().pages, 7);
     let mut granted = s.reserve(pages(3)).unwrap();
     let txn = s.prepare_restore(&set, &mut granted).unwrap();

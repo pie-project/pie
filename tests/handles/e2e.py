@@ -213,6 +213,21 @@ async def t_snapshot(c, prog, whole):
         except HandleError as e: check("a bad load is refused", e.code == code, str(e))
     for h in (w, two, one): await h.close()
 
+async def t_long_snapshot(c, prog, whole):
+    # past a sliding window: what a ring retired stays out, what it holds comes back
+    long = [1000 + (i * 37) % 3000 for i in range(args.ctx - 80 if args.ctx else 700)]
+    # gpt-oss draws otherwise on the first prompt this long a server takes (on
+    # main too); the second is what every later one draws
+    cold = await c.working_set(); await run(c, prog, cold, long, 1); await cold.close()
+    a = await c.working_set(); one = await run(c, prog, a, long, 48)
+    b = await c.working_set(); first = await run(c, prog, b, long, 24)
+    await b.save("l/one"); await b.close()
+    back = await c.load_snapshot("l/one")
+    rest = await run(c, prog, back, [first[-1]], 24, drawn=24)
+    check("a long set saved and loaded resumes exactly", first + rest == one, f"{len(first + rest)}")
+    await c.delete_snapshot("l/one")
+    for h in (a, back): await h.close()
+
 async def t_script(c, prog, whole):
     S = Path(__file__).parent
     for file in ("turn.py", "turn.js"):
@@ -377,7 +392,7 @@ async def main():
             except Exception: c = None; await asyncio.sleep(1)
         prog = await c.install_program(EX / "working_set_handles.wasm", force_overwrite=True)
         whole = await t_resume(c, prog)
-        for f in (t_lazy, t_order, t_dead, t_evict, t_quota, t_script, t_matcher, t_media, t_clients, t_failed, t_snapshot, t_close, t_keep, t_weak):
+        for f in (t_lazy, t_order, t_dead, t_evict, t_quota, t_script, t_matcher, t_media, t_clients, t_failed, t_snapshot, t_long_snapshot, t_close, t_keep, t_weak):
             if args.only and f.__name__ not in args.only.split(","): continue
             if not args.only and f in (t_keep, t_weak): continue
             try: await asyncio.wait_for(f(c, prog, whole), 120)
