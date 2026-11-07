@@ -1213,7 +1213,8 @@ mod tests {
 
     #[test]
     fn a_resting_handle_is_a_working_set_the_policy_reads_and_may_discard() {
-        let mut registry = Registry::new(TEST_CACHE);
+        // Not TEST_CACHE: its sets are a static the other tests fill as they run.
+        let mut registry = Registry::new(NO_CACHE);
         let id = ProcessId::new_v4();
         let rest = Event::HandleRested(
             id,
