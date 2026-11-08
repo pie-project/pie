@@ -1003,9 +1003,14 @@ pub(crate) fn per_row(
 }
 
 /// The per-row walk of a sliding window: each row walks its own window,
-/// from the page its window starts in, a fixed number of chunks (the window
-/// and a page, in chunks of `c`), so rows at different positions read their
-/// windows and not the span between the lowest and the highest of them.
+/// from the page its window starts in, at most a fixed number of chunks (the
+/// window and a page, in chunks of `c`), so rows at different positions read
+/// their windows and not the span between the lowest and the highest of them.
+/// The walk stops after the last chunk any row still admits a key in: while
+/// the context is shorter than the window, the chunks past every row's `hi`
+/// hold no admitted key (each would leave the online softmax as it was), and
+/// reading them cost Gemma-4's 1024-key windows about three times the keys a
+/// batch of 400-token contexts has (v6e, 64 lanes: 15 of a 38 ms step).
 #[allow(clippy::too_many_arguments)]
 fn per_row_window(
     f: &mut Func,
@@ -1045,9 +1050,12 @@ fn per_row_window(
     let at = f.reshape(at, &[r * n * np])?;
     let table = take(f, geom.pt, at)?;
     let table = f.reshape(table, &[r, n * np])?;
-    let mut st = init(f, &[r, h.kvh, h.g], h.dv).to_vec();
-    for ci in 0..n {
-        let start = with_i(f, base, ci * c, Func::add)?;
+    let st0 = init(f, &[r, h.kvh, h.g], h.dv).to_vec();
+    // Chunk `ci` (an i32 scalar) of every row's window.
+    let chunk = |f: &mut Func, ci: Val, st: &[Val]| -> Built<Vec<Val>> {
+        let off = with_i(f, ci, c, Func::mul)?;
+        let ob = f.broadcast(off, &[r], &[])?;
+        let start = f.add(base, ob)?;
         let io = f.iota(Elem::I32, &[r, c], 1);
         let sb = f.broadcast(start, &[r, c], &[0])?;
         let kp = f.add(io, sb)?;
@@ -1055,7 +1063,9 @@ fn per_row_window(
         let lbc = f.broadcast(lane, &[r, c], &[0])?;
         let x = with_i(f, lbc, span, Func::mul)?;
         let x = f.add(x, kc)?;
-        let page = f.slice(table, &[0, ci * np], &[r, (ci + 1) * np], &[1, 1])?;
+        let zero = scalar_i(f, 0);
+        let at = with_i(f, ci, np, Func::mul)?;
+        let page = f.dynamic_slice(table, &[zero, at], &[r, np])?;
         let page = f.reshape(page, &[r * np])?;
         let (k, v) = match fetch_pages(f, planes, h, page)? {
             Some(kv) => kv,
@@ -1077,8 +1087,36 @@ fn per_row_window(
         let lt = f.compare(Cmp::Lt, kp, hi)?;
         let range = f.and(ge, lt)?;
         let lg = logits(f, rule, h, rows, x, kp, None, range)?;
-        st = step(f, Layout::PerRow, h, s, &lg, scale, v, &st)?;
-    }
+        step(f, Layout::PerRow, h, s, &lg, scale, v, st)
+    };
+    let st = if n == 1 {
+        let zero = scalar_i(f, 0);
+        chunk(f, zero, &st0)?
+    } else {
+        // The chunks any row admits a key in: row `i` reads keys up to its
+        // `hi`, `cdiv(hi - base, c)` chunks from its window's first page.
+        let reach = f.sub(rows.hi, base)?;
+        let none = f.like_i(reach, 0);
+        let reach = f.max(reach, none)?;
+        let reach = with_i(f, reach, c - 1, Func::add)?;
+        let reach = with_i(f, reach, c, Func::div)?;
+        let bound = f.reduce(reach, &[0], Fold::Max)?;
+        let bound = clamp_i(f, bound, 0, n)?;
+        let zero = scalar_i(f, 0);
+        let mut carried = vec![zero];
+        carried.extend_from_slice(&st0);
+        let out = f.while_loop(
+            &carried,
+            |f, a| f.compare(Cmp::Lt, a[0], bound),
+            |f, a| {
+                let next = with_i(f, a[0], 1, Func::add)?;
+                let mut st = chunk(f, a[0], &a[1..])?;
+                st.insert(0, next);
+                Ok(st)
+            },
+        )?;
+        out[1..].to_vec()
+    };
     finish(f, Layout::PerRow, &st)
 }
 
