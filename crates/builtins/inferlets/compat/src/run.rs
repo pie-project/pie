@@ -59,9 +59,6 @@ fn pair_prompt(tokens: &[u32], scored: &[Logprob]) -> Vec<(u32, Option<Logprob>)
         .collect()
 }
 
-/// Each report takes a lock on the host.
-const REPORT_EVERY: u32 = 32;
-
 /// The constraint a request puts on the output, as a live guide.
 fn constraint(req: &Request) -> Result<Option<Box<dyn Guide>>, String> {
     let forced = req.forces_tool_call();
@@ -134,16 +131,15 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
     let sink = RefCell::new(sink);
     let mut prompt = prompt::build(req)?;
     let prompt_len = prompt.tokens.len();
-    // The worker's policy sees the prompt while this process still waits.
-    let prompt_tokens = prompt.tokens.len() as u32;
-    inferlet::session::set_tokens(prompt_tokens, 0);
-    // How long the system turn is, which only this process counts: a client
-    // that asks it kept on disk (`persist-system`) names it so.
+    // What only this process counts, for the worker's policy while it
+    // still waits: the prompt's length, and the system turn's, which a
+    // client that asks it kept on disk (`persist-system`) names so.
+    let mut counted = inferlet::serde_json::json!({ "prompt-tokens": prompt.tokens.len() });
     if let Some(system) = prompt.system {
-        let props = inferlet::serde_json::json!({ "system-tokens": system }).to_string();
-        // Refused, it costs only the persisting.
-        let _ = inferlet::session::set_props(&props);
+        counted["system-tokens"] = system.into();
     }
+    // Refused, it costs only the policy's estimate and the persisting.
+    let _ = inferlet::session::set_props(&counted.to_string());
     // A turn continued here goes on after what the client was sent.
     let continued = crate::continuation::get()
         .map(|c| c.tokens)
@@ -191,9 +187,6 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
             logprobs.push((token, logprob));
         }
         generated += 1;
-        if generated == 1 || generated.is_multiple_of(REPORT_EVERY) {
-            inferlet::session::set_tokens(prompt_tokens, generated);
-        }
         if stop_tokens.contains(&token) {
             if req.ignore_eos || generated as usize <= req.min_tokens {
                 return ControlFlow::Continue(());
@@ -218,9 +211,9 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
         &mut on_token,
     )
     .await?;
-    let (sampled, cached_tokens) = (done.sampled, done.cached);
+    let sampled = done.sampled;
+    let cached_tokens = inferlet::session::cached_tokens() as usize;
     let mut sink = sink.into_inner();
-    inferlet::session::set_tokens(prompt_tokens, generated);
     if let Some(e) = error {
         return Err(e);
     }

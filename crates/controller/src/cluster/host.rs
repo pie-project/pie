@@ -708,7 +708,6 @@ struct Proc {
     props: Arc<HashMap<String, Value>>,
     prompt: Option<Arc<[u64]>>,
     worker: Option<String>,
-    counted: Option<(u64, u64)>,
 }
 
 /// A run some worker keeps whole, and the workers (pools among them) that
@@ -779,11 +778,6 @@ enum Local {
         id: String,
         worker: String,
     },
-    Counted {
-        id: String,
-        prompt: u64,
-        generated: u64,
-    },
     Exited {
         id: String,
         outcome: Outcome,
@@ -831,15 +825,6 @@ impl Registry {
                 ProcessEvent::Dispatched { req, worker } => Local::Dispatched {
                     id: pid(gateway, req),
                     worker: worker.0.to_string(),
-                },
-                ProcessEvent::Counted {
-                    req,
-                    prompt,
-                    generated,
-                } => Local::Counted {
-                    id: pid(gateway, req),
-                    prompt,
-                    generated,
                 },
                 ProcessEvent::Moved { req, worker, why } => Local::Moved {
                     id: pid(gateway, req),
@@ -962,7 +947,6 @@ impl Registry {
                         props: Arc::new(props.into_iter().filter_map(prop_value).collect()),
                         prompt,
                         worker: None,
-                        counted: None,
                     },
                 );
                 edges.push(Edge::Arrived(id));
@@ -981,16 +965,6 @@ impl Registry {
                         process: id,
                         worker,
                     }));
-                }
-            }
-            Local::Counted {
-                id,
-                prompt,
-                generated,
-            } => {
-                tracing::debug!(process = %id, prompt, generated, "cluster policy: a process counted its tokens");
-                if let Some(proc) = self.procs.get_mut(&id) {
-                    proc.counted = Some((prompt, generated));
                 }
             }
             Local::Exited { id, outcome } => {
@@ -1566,19 +1540,14 @@ impl Plane for Snapshot {
                     "state" if !live => None,
                     "state" if proc.worker.is_some() => text("running"),
                     "state" => text("pending"),
-                    // An exited process has told the router its counts; before
-                    // that its prompt is estimated from its text.
-                    "prompt-tokens" => int(proc.counted.map(|(prompt, _)| prompt).or_else(|| {
-                        proc.prompt.as_ref().map(|blocks| {
-                            (blocks.len() as f64 * PROMPT_BLOCK_BYTES as f64 * TOKENS_PER_BYTE)
-                                as u64
-                        })
+                    // Estimated from its text: the router sees no tokens.
+                    "prompt-tokens" => int(proc.prompt.as_ref().map(|blocks| {
+                        (blocks.len() as f64 * PROMPT_BLOCK_BYTES as f64 * TOKENS_PER_BYTE) as u64
                     })),
                     "max-tokens" => match proc.props.get(client_api::props::MAX_TOKENS) {
                         Some(Value::Int(n)) if *n >= 0 => Some(Value::Int(*n)),
                         _ => None,
                     },
-                    "generated-tokens" => int(proc.counted.map(|(_, generated)| generated)),
                     "arrival-ms" => Some(Value::Int(proc.arrival_ms as i64)),
                     "tenant" => text(proc.tenant.clone()),
                     "session" => proc.session.clone().and_then(text),
@@ -2242,7 +2211,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exited_process_is_read_with_its_counts_by_the_call_about_its_exit() {
+    fn an_exited_process_is_read_by_the_call_about_its_exit() {
         let mut registry = Registry::default();
         let mut edges = Vec::new();
         let arrived = |id: &str| Local::Arrived {
@@ -2259,11 +2228,6 @@ mod tests {
                 id: "1".into(),
                 worker: "7".into(),
             },
-            Local::Counted {
-                id: "1".into(),
-                prompt: 120,
-                generated: 30,
-            },
             Local::Exited {
                 id: "1".into(),
                 outcome: Outcome::Completed,
@@ -2275,15 +2239,9 @@ mod tests {
         let plane = registry.snapshot(&table(0), &Tables::default());
         let of = |id: &str, name| format!("{:?}", plane.attr(&Subject::Process(id.into()), name));
         let int = |n| format!("{:?}", Some(Value::Int(n)));
-        assert_eq!(of("1", "generated-tokens"), int(30));
-        assert_eq!(of("1", "prompt-tokens"), int(120));
         assert_eq!(of("1", "worker"), format!("{:?}", text("7")));
         assert_eq!(of("1", "state"), "None");
-        assert_eq!(
-            of("2", "prompt-tokens"),
-            "None",
-            "the router never sees a live process's counts"
-        );
+        assert_eq!(of("2", "prompt-tokens"), "None", "no prompt, no estimate");
         assert_eq!(plane.candidates(SubjectKind::Process), ["2"]);
         let worker = |name| format!("{:?}", plane.attr(&Subject::Worker("1".into()), name));
         assert_eq!(worker("waiting"), int(5));

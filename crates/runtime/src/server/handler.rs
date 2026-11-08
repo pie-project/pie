@@ -517,14 +517,15 @@ impl Session {
             executors,
         ) {
             Ok(process_id) => {
+                // Uncaptured, the process is detached: nothing of it comes
+                // here, and this session's close does not end it. Its id
+                // is how a client attaches to it, or terminates it, later.
                 if capture_outputs {
                     self.attached_processes.push(process_id);
                     self.launched_processes.insert(process_id);
-                    self.send_response(corr_id, true, process_id.to_string())
-                        .await;
-                } else {
-                    self.send_response(corr_id, true, String::new()).await;
                 }
+                self.send_response(corr_id, true, process_id.to_string())
+                    .await;
             }
             Err(e) => {
                 self.send_response(corr_id, false, e.to_string()).await;

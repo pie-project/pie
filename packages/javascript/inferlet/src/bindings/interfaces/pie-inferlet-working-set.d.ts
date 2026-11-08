@@ -15,11 +15,6 @@ export class WorkingSet {
   */
   folded(): number;
   /**
-  * Slots mapped in from state the runtime already held: a prompt's
-  * cached tokens.
-  */
-  cachedTokens(): number;
-  /**
   * A child that shares the frozen part and gets a copy of the buffer,
   * ordered on `on`.
   */

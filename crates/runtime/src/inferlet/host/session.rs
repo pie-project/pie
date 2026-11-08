@@ -102,15 +102,8 @@ impl pie::inferlet::session::Host for ProcessCtx {
         Ok(Ok(()))
     }
 
-    async fn set_tokens(&mut self, prompt: u32, generated: u32) -> Result<()> {
-        crate::policy::tokens::set(
-            crate::policy::schedule::plex_id(self.id()),
-            crate::policy::tokens::Counts {
-                prompt: prompt.into(),
-                generated: generated.into(),
-            },
-        );
-        Ok(())
+    async fn cached_tokens(&mut self) -> Result<u32> {
+        Ok(u32::try_from(self.tokens_cached()).unwrap_or(u32::MAX))
     }
 
     async fn send_to(&mut self, process: String, message: String) -> Result<Result<(), String>> {

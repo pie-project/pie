@@ -316,10 +316,6 @@ class WorkingSet:
         """The frozen length; while a device-counted fold is in flight, the length before it."""
         return self.ws.folded()
 
-    def cached_tokens(self) -> int:
-        """Slots the runtime mapped in from state it already held rather than computed."""
-        return self.ws.cached_tokens()
-
     def fork(self, on: "Pipeline") -> "WorkingSet":
         """A child sharing the frozen part, with a copy of the buffer."""
         return WorkingSet._wrap(_wit(self.ws.fork, on.wit, what="fork"))

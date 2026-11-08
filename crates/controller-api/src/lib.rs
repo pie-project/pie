@@ -272,11 +272,6 @@ pub enum ProcessEvent {
         req: u64,
         worker: WorkerId,
     },
-    Counted {
-        req: u64,
-        prompt: u64,
-        generated: u64,
-    },
     /// A running process moved to `worker`, or (none) could not.
     Moved {
         req: u64,

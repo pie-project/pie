@@ -417,9 +417,6 @@ class WorkingSetStub:
     def folded(self) -> int:
         return 0
 
-    def cached_tokens(self) -> int:
-        return 0
-
     def fork(self, on):
         return WorkingSetStub()
 

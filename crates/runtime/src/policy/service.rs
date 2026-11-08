@@ -14,7 +14,6 @@ use client_api::props::{PROMPT_BLOCK_BYTES, PromptIndex, TOKENS_PER_BYTE};
 use super::program::{self, Commit, Fault, LoadError, Plane, Program, Retention, Table};
 use super::retention;
 use super::schedule;
-use super::tokens;
 use super::wit::{self, Edge, Subject, SubjectKind, Value};
 use super::{By, Event, Outcome};
 use crate::inferlet::process::{self, ProcessId};
@@ -614,9 +613,9 @@ impl Registry {
             }
             Event::Cached(pid, tokens) => {
                 let id = schedule::plex_id(pid);
-                tracing::debug!(process = %id, tokens, "worker policy: cached tokens looked up");
+                tracing::debug!(process = %id, tokens, "worker policy: a fire mapped in cached tokens");
                 if let Some(proc) = self.procs.get_mut(&id) {
-                    proc.cached_tokens = Some(proc.cached_tokens.unwrap_or(0).max(tokens));
+                    proc.cached_tokens = Some(proc.cached_tokens.unwrap_or(0) + tokens);
                 }
                 None
             }
@@ -654,11 +653,7 @@ impl Registry {
                     return Vec::new();
                 };
                 proc.settle(now_ms());
-                tracing::debug!(
-                    process = %id,
-                    counts = ?tokens::get(id),
-                    "worker policy: a process exited"
-                );
+                tracing::debug!(process = %id, "worker policy: a process exited");
                 self.exited.insert(id, proc.clone());
                 let exited = Edge::Exited(wit::Exit {
                     process: id.to_string(),
@@ -736,10 +731,18 @@ impl Registry {
             }
             Event::Kept(owner, tokens) => {
                 if let Some((blocks, held)) = self.prompts.get_mut(&owner) {
-                    // Tokens a block makes: the owner's own count where it
-                    // gave one, else a guess.
-                    let per_block = tokens::get(owner)
-                        .map(|counts| counts.prompt)
+                    // Tokens a block makes: the count the owner's props
+                    // claim, else a guess.
+                    let claimed = self
+                        .procs
+                        .get(&owner)
+                        .or_else(|| self.exited.get(&owner))
+                        .and_then(|proc| proc.props.get(client_api::props::PROMPT_TOKENS))
+                        .and_then(|value| match value {
+                            Value::Int(n) => u64::try_from(*n).ok(),
+                            _ => None,
+                        });
+                    let per_block = claimed
                         .filter(|&prompt| prompt > 0 && !blocks.is_empty())
                         .map_or(TOKENS_PER_BYTE * PROMPT_BLOCK_BYTES as f64, |prompt| {
                             prompt as f64 / blocks.len() as f64
@@ -910,19 +913,13 @@ impl Plane for Snapshot {
                     (None, Some(proc)) => (proc, false),
                     (None, None) => return None,
                 };
-                let counts = || ProcessId::from_str(id).ok().and_then(tokens::get);
                 let int = |n: Option<u64>| n.map(|n| Value::Int(n as i64));
                 match name {
                     "state" if live => Some(Value::Text(proc.state.name().into())),
                     "state" => None,
-                    "prompt-tokens" => int(counts().map(|c| c.prompt)),
-                    "generated-tokens" => int(counts().map(|c| c.generated)),
                     "arrival-ms" => Some(Value::Int(proc.arrival_ms as i64)),
                     "service-ms" => int(Some(proc.times(now_ms(), live).0)),
                     "waited-ms" => int(Some(proc.times(now_ms(), live).1)),
-                    "first-token-ms" => int(ProcessId::from_str(id)
-                        .ok()
-                        .and_then(tokens::first_token_ms)),
                     "worker" => Some(Value::Text(WORKER.into())),
                     "restarts" => Some(Value::Int(proc.restarts as i64)),
                     // What the runtime mapped in once it has run; before,
@@ -1318,7 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn a_process_counts_its_own_tokens_and_the_call_about_its_exit_still_reads_them() {
+    fn the_call_about_a_process_exit_still_reads_it() {
         let mut registry = Registry::new(TEST_CACHE);
         let id = arrive(&mut registry, "t", None);
         let of = |registry: &Registry, name| {
@@ -1328,21 +1325,7 @@ mod tests {
                     .attr(&Subject::Process(id.to_string()), name),
             )
         };
-        let int = |n| show(Some(Value::Int(n)));
-        assert_eq!(of(&registry, "prompt-tokens"), show(None));
-        tokens::set(
-            id,
-            tokens::Counts {
-                prompt: 100,
-                generated: 7,
-            },
-        );
-        assert_eq!(of(&registry, "prompt-tokens"), int(100));
-        assert_eq!(of(&registry, "generated-tokens"), int(7));
-
-        tokens::exit(id);
         registry.apply(Event::Exited(id, Outcome::Completed));
-        assert_eq!(of(&registry, "generated-tokens"), int(7));
         assert_eq!(of(&registry, "tenant"), show(Some(Value::Text("t".into()))));
         assert_eq!(of(&registry, "state"), show(None), "not live");
         let plane = registry.snapshot();
@@ -1424,7 +1407,7 @@ mod tests {
         assert_eq!(
             of(&registry, gone),
             show(Some(Value::Int(32))),
-            "its longest hit"
+            "what its fires mapped in"
         );
         assert_eq!(of(&registry, live), show(None), "it never looked");
 

@@ -29,6 +29,10 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
         self.id()
     }
 
+    fn note_cached(&mut self, rows: u64) {
+        self.add_cached_tokens(rows);
+    }
+
     async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
         crate::inferlet::process::gate::drain_pending_fires(self).await
     }

@@ -407,12 +407,6 @@ impl WorkingSet {
         self.ws.folded()
     }
 
-    /// Slots mapped in from state the runtime already held: a prompt's cached
-    /// tokens.
-    pub fn cached_tokens(&self) -> u32 {
-        self.ws.cached_tokens()
-    }
-
     /// A child sharing the frozen part, with a copy of the buffer.
     pub fn fork(&self, on: &Pipeline) -> Result<WorkingSet, String> {
         Ok(WorkingSet {

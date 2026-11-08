@@ -248,7 +248,7 @@ pub async fn generate(
     draft: model::BlockDrafter,
     sampled: Option<(f32, u32)>,
     on_token: &mut dyn FnMut(u32) -> ControlFlow<()>,
-) -> Result<(usize, usize)> {
+) -> Result<usize> {
     let block = draft.rows;
     // The first block row whose pick is a proposal (1 for DFlash, 0 for DSpark),
     // and the widest verify a block feeds: the anchor and every proposal.
@@ -268,11 +268,10 @@ pub async fn generate(
     let mut anchor = pass(&pipe, &ws, &prompt, 0, Round::Prompt(ends), pick)
         .await?
         .tokens[0];
-    let cached = ws.cached_tokens() as usize;
     let mut generated = 1;
     if on_token(anchor as u32).is_break() || generated == max_tokens {
         pipe.close();
-        return Ok((generated, cached));
+        return Ok(generated);
     }
     let mut held = prompt.len() as u32;
     let mut survivors = 0;
@@ -336,7 +335,7 @@ pub async fn generate(
             generated += 1;
             if on_token(anchor as u32).is_break() || generated == max_tokens {
                 pipe.close();
-                return Ok((generated, cached));
+                return Ok(generated);
             }
             continue;
         };
@@ -387,10 +386,10 @@ pub async fn generate(
             generated += 1;
             if on_token(token as u32).is_break() || generated == max_tokens {
                 pipe.close();
-                return Ok((generated, cached));
+                return Ok(generated);
             }
         }
     }
     pipe.close();
-    Ok((generated, cached))
+    Ok(generated)
 }

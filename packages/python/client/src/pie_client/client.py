@@ -693,6 +693,9 @@ class PieClient:
         :param inferlet: A name (`text-completion`), or `name@<hash>` for one build.
         :param input: A dict of input parameters, serialized to JSON.
         :param capture_outputs: If True, process outputs are streamed to the client.
+            If False the process is detached: no event reaches this client and
+            closing it does not end the process; `attach_process` with the
+            returned process's id receives what it sends from then on.
         :param files: Files the inferlet reads with `session.file(name)`.
         :param handles: Handles moved into the process, by the name its guest
             takes each under. A moved handle cannot be used until it comes

@@ -120,8 +120,6 @@ pub trait TurnRouter: Send + Sync + 'static {
 
     fn launched(&self, _req: ReqId, _process: &str, _worker: WorkerId) {}
 
-    fn counted(&self, _req: &Request, _prompt: u64, _generated: u64) {}
-
     fn ended(&self, _req: &Request, _outcome: Outcome, _by: By) {}
 
     /// A running turn moved to `worker`, or (`None`) could not.
@@ -466,12 +464,6 @@ impl Sessions {
                 self.inner.end(req_id, Outcome::Cancelled, By::Client);
                 Control::Abort
             }
-        }
-    }
-
-    pub fn counted(&self, req_id: ReqId, prompt: u64, generated: u64) {
-        if let Some(turn) = self.inner.turns.lock().unwrap().get(&req_id) {
-            self.inner.router.counted(&turn.request, prompt, generated);
         }
     }
 

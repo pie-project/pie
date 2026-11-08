@@ -254,10 +254,6 @@ impl GatewayInbound for InboundServer {
         self.sessions.feed_from(req_id, chunk, from).await
     }
 
-    async fn counted(self, _: tarpc::context::Context, req_id: ReqId, prompt: u64, generated: u64) {
-        self.sessions.counted(req_id, prompt, generated);
-    }
-
     async fn report(self, _: tarpc::context::Context, worker_id: WorkerId, status: WorkerStatus) {
         tracing::trace!(
             worker = %worker_id,

@@ -24,10 +24,6 @@ interface working-set {
         // length before it.
         folded: func() -> u32;
 
-        // Slots mapped in from state the runtime already held: a prompt's
-        // cached tokens.
-        cached-tokens: func() -> u32;
-
         // A child that shares the frozen part and gets a copy of the buffer,
         // ordered on `on`.
         fork: func(on: borrow<pipeline>) -> result<working-set, error>;

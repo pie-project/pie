@@ -302,11 +302,6 @@ export class WorkingSet {
     return this.ws.folded();
   }
 
-  /** Slots the runtime mapped in from state it already held rather than computed. */
-  cachedTokens(): number {
-    return this.ws.cachedTokens();
-  }
-
   /** A child sharing the frozen part, with a copy of the buffer. */
   fork(on: Pipeline): WorkingSet {
     return WorkingSet.wrap(wit('fork', () => this.ws.fork(on.wit)));

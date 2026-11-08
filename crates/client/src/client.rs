@@ -84,6 +84,10 @@ struct DownloadState {
 /// How a process is launched, past its program and input.
 #[derive(Debug, Clone, Default)]
 pub struct Launch {
+    /// Stream the process's output here. Without, it is detached: no event
+    /// reaches this client and closing it does not end the process;
+    /// [`Client::attach_process`] with the returned id receives what it
+    /// sends from then on.
     pub capture_outputs: bool,
     pub session: Option<String>,
     pub props: Props,

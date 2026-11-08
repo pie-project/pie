@@ -2588,11 +2588,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             full = rows_of_lanes(&full, &[Some((supplied, rows))], true, page_size);
             stamp_lane_words(&mut full, &switched, &lanes_of, false, None);
             pass_slots = pass_slots.map(|slots| slots[supplied as usize..].to_vec());
-            let total = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-                kv.supplied_tokens(ws.id)
-            })
-            .unwrap_or(0);
-            crate::policy::report(crate::policy::Event::Cached(pid, total));
+            ctx.note_cached(u64::from(supplied));
+            crate::policy::report(crate::policy::Event::Cached(pid, u64::from(supplied)));
         }
         // Where the pass keeps its state: the checkpoint rows it reaches,
         // floored to whole pages it keys, each the end of a fire of its own.

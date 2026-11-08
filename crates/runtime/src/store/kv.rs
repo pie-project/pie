@@ -1280,10 +1280,6 @@ impl KvStore {
         Ok(self.table.set_owner(ws, owner)?)
     }
 
-    pub fn supplied_tokens(&self, ws: WorkingSetId) -> Result<u64, KvStoreError> {
-        Ok(self.table.supplied(ws)?)
-    }
-
     /// Maps in only when the pages `ws` holds are the run's first.
     pub fn attach_run(
         &mut self,
@@ -1321,8 +1317,6 @@ impl KvStore {
             Err(error) => return Err(error.into()),
         }
         let pages = run.len() as u64 - held;
-        self.table
-            .add_supplied(ws, pages * u64::from(page_size.max(1)))?;
         // What was mapped in is sealed, so frozen: a prompt's.
         self.table
             .freeze(ws, run.len() as u64 * u64::from(page_size.max(1)))?;

@@ -166,15 +166,16 @@ def receive_file_blocking() -> Optional[bytes]:
 def set_props(props: str) -> None:
     """
     Merges `props`, a JSON object, into this process's PLEX props; a `null`
-    removes a name. `router/` names are dropped and props over the limits
-    refused.
+    removes a name. `cluster/` names are the cluster policy's, left as they
+    are; props over the limits are refused.
     
     Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError
-def set_tokens(prompt: int, generated: int) -> None:
+def cached_tokens() -> int:
     """
-    This process's own token counts, for the scheduling policy: report
-    `prompt` as soon as it is tokenized.
+    Prompt tokens this process's passes found already cached, and so
+    mapped in rather than computed, so far: what a usage report calls
+    cached.
     """
     raise NotImplementedError

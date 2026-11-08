@@ -125,9 +125,6 @@ export class WorkingSetStub {
   folded() {
     return 0;
   }
-  cachedTokens() {
-    return 0;
-  }
   fork() {
     return new WorkingSetStub();
   }

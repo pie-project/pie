@@ -9,7 +9,6 @@
 pub mod offload;
 pub mod retention;
 pub mod schedule;
-pub mod tokens;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod manifest;
@@ -85,6 +84,7 @@ pub(crate) struct Resting {
 pub(crate) enum Event {
     Arrived(ProcessId, Arrival),
     PropsChanged(ProcessId, Props, Vec<String>),
+    /// One of its fires found this many tokens cached and mapped them in.
     Cached(ProcessId, u64),
     Kept(ProcessId, u64),
     CacheEmptied(ProcessId, By),

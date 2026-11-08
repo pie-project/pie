@@ -107,13 +107,11 @@ impl Guide for Matcher {
     }
 }
 
-/// What [`generate`] did: how many tokens it sampled, how many of the
-/// prompt's were mapped in from the prefix cache, and, where asked, the
+/// What [`generate`] did: how many tokens it sampled and, where asked, the
 /// logprob of every prompt token after the first.
 #[derive(Clone, Debug, Default)]
 pub struct Generated {
     pub sampled: usize,
-    pub cached: usize,
     pub prompt_logprobs: Vec<Logprob>,
 }
 
@@ -540,14 +538,13 @@ pub async fn generate(
         && (2..=16).contains(&draft.rows)
     {
         let sampled = sampled.then_some((sampling.temperature, sampling.seed));
-        let (sampled, cached) =
+        let sampled =
             crate::speculative::generate(prompt, ends, max_tokens, draft, sampled, &mut |t| {
                 on_token(t, None)
             })
             .await?;
         return Ok(Generated {
             sampled,
-            cached,
             prompt_logprobs: Vec::new(),
         });
     }
@@ -660,8 +657,6 @@ pub async fn generate(
             take_logprob(lp_ch.as_ref()).await?,
         ),
     };
-    let cached = ws.cached_tokens();
-
     let mut sampled = 0usize;
     if carried_on.is_none() {
         sampled = 1;
@@ -675,7 +670,6 @@ pub async fn generate(
             pipe.close();
             return Ok(Generated {
                 sampled,
-                cached: cached as usize,
                 prompt_logprobs,
             });
         }
@@ -785,7 +779,6 @@ pub async fn generate(
     pipe.close();
     Ok(Generated {
         sampled,
-        cached: cached as usize,
         prompt_logprobs,
     })
 }

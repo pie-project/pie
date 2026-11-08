@@ -48,6 +48,10 @@ pub const PERSIST_SYSTEM: &str = "persist-system";
 /// counts them (the compat inferlet sets it).
 pub const SYSTEM_TOKENS: &str = "system-tokens";
 
+/// How many tokens the prompt takes, as the inferlet that tokenized it
+/// counts them (the compat inferlet sets it once it has).
+pub const PROMPT_TOKENS: &str = "prompt-tokens";
+
 /// How many leading tokens `props` ask to be kept on disk: `persist-prefix-
 /// tokens`, else `system-tokens` under `persist-system`.
 #[must_use]
@@ -190,7 +194,13 @@ impl PromptIndex {
 }
 
 pub fn merge(current: &Props, changes: Props) -> Result<(Props, Vec<String>), String> {
-    let mut merged = current.clone();
+    // The cluster policy's props are its own: a client's changes neither
+    // set them nor count them against its limits, and they stay as they are.
+    let (cluster, mut merged): (BTreeMap<_, _>, BTreeMap<_, _>) = current
+        .0
+        .clone()
+        .into_iter()
+        .partition(|(name, _)| name.starts_with(CLUSTER_PREFIX));
     for (name, value) in changes {
         if value.is_null() {
             merged.remove(&name);
@@ -198,7 +208,9 @@ pub fn merge(current: &Props, changes: Props) -> Result<(Props, Vec<String>), St
             merged.insert(name, value);
         }
     }
+    let mut merged = Props(merged);
     from_client(&mut merged)?;
+    merged.extend(cluster);
     let changed: BTreeSet<&String> = current
         .keys()
         .chain(merged.keys())
@@ -395,6 +407,16 @@ mod tests {
         );
         changed.sort();
         assert_eq!(changed, ["new", "priority", "tier"]);
+
+        // What the cluster policy set survives a client's merge untouched.
+        let current = props(json!({"cluster/priority": 9, "tier": "gold"}));
+        let changes = props(json!({"system-tokens": 12, "cluster/priority": 1}));
+        let (merged, changed) = merge(&current, changes).unwrap();
+        assert_eq!(
+            merged,
+            props(json!({"cluster/priority": 9, "tier": "gold", "system-tokens": 12}))
+        );
+        assert_eq!(changed, ["system-tokens"]);
 
         let many: Props = (0..MAX_PROPS)
             .map(|i| (format!("p{i}"), json!(i)))

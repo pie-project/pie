@@ -18,9 +18,6 @@ pub trait GatewayInbound {
 
     async fn push_tokens(req_id: ReqId, chunk: Tokens) -> Control;
 
-    /// For the cluster policy, ahead of the exit event.
-    async fn counted(req_id: ReqId, prompt: u64, generated: u64);
-
     async fn report(worker_id: WorkerId, status: WorkerStatus);
 
     async fn redirect(req_id: ReqId);
