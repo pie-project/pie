@@ -1,6 +1,7 @@
 //! The role-split program's placement: every PE's `rcfg` and its tiles,
-//! copy for copy as the host reference (`run.py`) sends them (the same
-//! rectangles in the same order, so the per-PE bytes match).
+//! copy for copy as the Python host reference it was checked against sent
+//! them (the same rectangles in the same order: 569 copies over the 9B's
+//! 643 x 1153 PEs, sha256 each; `examples/split_place.rs`).
 
 use super::SplitSpec;
 use super::geo::Geo;

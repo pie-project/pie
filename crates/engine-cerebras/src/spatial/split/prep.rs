@@ -3,8 +3,9 @@
 //! `hemb`, `embed`, `meta.json`): 8 units of 256 x 256 weight PEs, 4 layers
 //! each (GDN, GDN, GDN, attention), the head 128 columns x 1153 rows (216
 //! vocabulary rows x 32 dims a PE). Weights as IEEE f16 bits, rounded to
-//! nearest even from the checkpoint's bf16. Element for element the host
-//! reference's (`prep9b.py`, `prep_hemb.py`).
+//! nearest even from the checkpoint's bf16. Element for element the Python
+//! prep's (`tools/split/prep_q35.py` at the 9B's dims, which also covers
+//! other Qwen3.5 sizes and geometries).
 
 use std::io::Write;
 use std::path::Path;

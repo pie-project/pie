@@ -1,6 +1,6 @@
 //! The role-split placement on a recording device: every copy as
-//! `sym x y w h n bits sha256(words)` a line, the host reference's mock
-//! format (scratch/split/pie/mock), to compare copy for copy.
+//! `sym x y w h n bits sha256(words)` a line, to compare two placements
+//! (or a placement against a reference log) copy for copy.
 //!
 //! `split_place <prep dir> <prefix> <overrides k=v,...> <out log>`
 

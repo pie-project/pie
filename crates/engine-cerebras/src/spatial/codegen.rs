@@ -431,8 +431,8 @@ pub struct Variant {
     /// t clamped at -24 instead of -15 and e kept as e 2^9 on the way (2^(n + 9) from m's
     /// bits; e 2^-9 for 1 + e, (e' a) 2^-9 for a e), so no f16 subnormal flushes a sig(a)
     /// to 0 for a < -10.05. 1024 alone loses up to 4.3e-4 |u| there, which moved Qwen3-8B's
-    /// layers 1-4 (silu16 rms 2-4e-3 relative against ~6e-4; scratch/q8s). +18 cycles at Ic
-    /// 48 (one PE, simulator: 566 against 548), bit-equal to scratch/q8s/emu/emu16.py.
+    /// layers 1-4 (silu16 rms 2-4e-3 relative against ~6e-4). +18 cycles at Ic 48 (one PE,
+    /// simulator: 566 against 548), bit-equal to `silu16w` in tools/emu/silu16.py.
     pub slw: bool,
 }
 

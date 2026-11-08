@@ -1,6 +1,7 @@
 //! The role-split wafer's geometry: PE kinds, routes and queue colours
-//! (`rcfg`) of every PE. A word-for-word port of the host reference
-//! (`split_geo.py`); see the module docs of [`super`] for the layout.
+//! (`rcfg`) of every PE. A word-for-word port of the Python host reference
+//! the kernels were brought up with; see the module docs of [`super`] and
+//! `split/README.md` for the layout.
 //!
 //! Units of PX x PY weight PEs (+ the CX column at local x = PX / 2, the CY
 //! row at local y = PY / 2, a filler corner), unit (ux, uy) at
@@ -45,6 +46,16 @@ fn opp(d: char) -> char {
     }
 }
 
+// Colours. The rows' and columns' reductions (level 1: XA / XB, YA / YB;
+// level 2: X2 / Y2) and multicasts (MX, MY), the roots' loop-back (LB); on
+// the weight rows the scores segment (SA / SB chain, SM multicast) and GDN's
+// (k, q) exchange (SG); on the CY row the o-norm segment (CS / CS2, CM); the
+// handoffs (HA, HB, HX; HV the vertical ones leaving even / odd units); the
+// head's relay north (HN), column multicast (HM) and row word (HR3); the
+// wafer token loop's max-reduce (WA / WB / WC2) and winner multicast (WM),
+// and the embedding return (VA up the head column, VS down, HS between the
+// CX row pair, HE west into unit 0's CX). A PE's unused input queues park on
+// colours nothing routes to its ramp (never its own send colour).
 const XA: u32 = 1;
 const XB: u32 = 2;
 const MX: u32 = 3;

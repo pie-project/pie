@@ -207,7 +207,7 @@ pub struct ServeConfig {
     /// serve8b_region(_pipe): vertical handoffs on centred columns (`HVC` 1;
     /// the host's tables).
     pub hvc: bool,
-    /// With `trim` (any model; Qwen3-8B since scratch/q8s): the regions' MLP act in f16 on
+    /// With `trim` (any model, Qwen3-8B included): the regions' MLP act in f16 on
     /// every PE of a column from the gate-up all-reduce, no act all-reduce
     /// (`TRM` bit 1024, with 4096; not 8192: the grids lose with it, 0538; inexact,
     /// but golden on Llama and, in host emulation, on Qwen3-8B).
@@ -223,8 +223,9 @@ pub struct ServeConfig {
     /// inexact; 0540 sp540_t27 2,033.3 tok/s, golden, 0 mismatches).
     pub silu16h: bool,
     /// With `silu16`: its wide tail (`SLW` 1: no f16 subnormal flush of a sig(a) at
-    /// a < -10; exact to ~1 ulp there; +18 cycles a layer). Qwen3-8B needs it (scratch/q8s:
-    /// 1024 alone flips 3 of 512 teacher-forced tokens in host emulation); Llama's t29 ran without.
+    /// a < -10; exact to ~1 ulp there; +18 cycles a layer). Qwen3-8B needs it (1024 alone
+    /// flips 3 of 512 teacher-forced tokens in host emulation, tools/emu/tf_qwen3_8b.py);
+    /// Llama's t29 ran without.
     pub silu16w: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
@@ -1512,7 +1513,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             // 1,903.1 / 1,902.5 tok/s and TRM 255 1,897.4 / 1,897.7, both = golden)
             // (q/k-norm models, Qwen3-8B, take the same bits: 0534's "241, the exact bits
             // alone" kept the teacher-forced set against a golden of the u4 model; against the
-            // bf16 model's own f32 golden (scratch/q8s, 512 tokens) qt22's stream is golden and
+            // bf16 model's own f32 golden (512 tokens) qt22's stream is golden and
             // the host emulation of every bit keeps it)
             trim: if cfg.trim {
                 1019
@@ -2817,7 +2818,7 @@ mod qwen3_8b {
         );
     }
 
-    /// Qwen3-8B with the Llama levers (scratch/q8s): qg3's program (sp535_qt15: lever D, HV,
+    /// Qwen3-8B with the Llama levers: qg3's program (sp535_qt15: lever D, HV,
     /// ARF 7, F16 3, GRD 7, XAC, HVC) + `silu16`, `silu16h`, `xg16`, `head_pack` states
     /// TRM 32767, as Llama's t29 (its MEM stays 1: q/k norms).
     #[test]
