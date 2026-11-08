@@ -1,0 +1,144 @@
+// split/ple_gemma.csl: a PE outside the units and the head (scratch/split/gemma/README.md 1): routes only, or a
+// PLE storage PE. Storage: the per-layer-input values (f16 bits) of a range of NT token ids [t0, t0 + NT), LV values a
+// token (the values of its weight column for every unit below it, top unit first), token-major. Every step it takes
+// the winning id from its row's TB (the head control row's word: the id, or -1 on a launch's last step); the owner
+// turns its PB route to its ramp (the column's top storage PE sends from its ramp always), waits DLY cycles (the
+// previous owner below restores its route first), and sends its LV values (f32) + a sequence word (the next pass's
+// position + 1) down the column. A switched route goes back at the next step (the words have long drained: every CY
+// on the bus pre-posts its receive).
+param memcpy_params;
+param NTW: u16 = 1;     // table words (NT LV)
+param DLY: u16 = 1500;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+const tgt = tile_config.target;
+const timestamp = @import_module("<time>");
+
+var tbl = @zeros([NTW]u16);
+var tbl_ptr: [*]u16 = &tbl;
+var ob = @zeros([64]f32);
+var tw = @zeros([1]f32);
+const tw_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> tw[i] });
+const ob_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{64} -> ob[i] });
+const tb_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{64} -> tbl[i] });
+const q_tb = @get_input_queue(2);
+const q_pb = @get_output_queue(2);
+const C_PARK: color = @get_color(16);
+fn fout(comptime q: output_queue, n: u16) fabout_dsd {
+  return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
+}
+fn fin(comptime q: input_queue, n: u16) fabin_dsd {
+  return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
+}
+const NR: u16 = 8;
+const RQ: u16 = 1 + 2 * NR;
+var rcfg = @zeros([RQ + 7]u32);   // [RQ] flags (bit 0 storage, 1 takes TB, 2 the column's top), t0, NT, LV, PB, TB, spare
+var rcfg_ptr: [*]u32 = &rcfg;
+var pfl: u16 = 0;
+var t0: u32 = 0;
+var nt: u32 = 0;
+var lv: u16 = 0;
+var pb_addr: u16 = 0;
+var pb_orig: u16 = 0;
+var dirty = false;
+var tsc = @zeros([3]u16);
+var sends = @zeros([2]u32);       // (diagnostics) steps this PE sent, the last id
+var sends_ptr: [*]u32 = &sends;
+fn iqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.input_queue_config.in_queue_addr_range);
+  @set_config(addr, (v & 0xffe0) | @as(u16, c), tile_config.input_queue_config.in_queue_addr_range);
+}
+fn oqc(comptime qid: u16, c: u32) void {
+  const addr = tile_config.output_queue_config.get_output_queue_config_addr(qid);
+  const v: u16 = @get_config(addr, tile_config.output_queue_config.out_queue_addr_range);
+  @set_config(addr, (v & 0xfe0f) | (@as(u16, c) << 4), tile_config.output_queue_config.out_queue_addr_range);
+}
+fn init() void {
+  const cc0 = color_config.get_color_config_addr(@get_color(0));
+  var k: u16 = 0;
+  while (k < @as(u16, rcfg[0])) : (k += 1) {
+    const addr = cc0 + @as(u16, rcfg[1 + 2 * k]);
+    const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
+    @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
+  }
+  pfl = @as(u16, rcfg[RQ]);
+  t0 = rcfg[RQ + 1];
+  nt = rcfg[RQ + 2];
+  lv = @as(u16, rcfg[RQ + 3]);
+  iqc(2, rcfg[RQ + 5]);
+  if ((pfl & 1) != 0) {
+    oqc(2, rcfg[RQ + 4]);
+    pb_addr = cc0 + @as(u16, rcfg[RQ + 4]);
+    pb_orig = @get_config(pb_addr, tgt.color_addr_range) & 0xff;
+  }
+  timestamp.enable_tsc();
+  sys_mod.unblock_cmd_stream();
+}
+fn restore() void {
+  if (!dirty) { return; }
+  while ((tile_config.output_queue_status.get_raw() & 0x0400) == 0) {}   // oq2 empty
+  const r = @get_config(pb_addr, tgt.color_addr_range) & 0xff00;
+  @set_config(pb_addr, r | pb_orig, tgt.color_addr_range);
+  dirty = false;
+}
+fn wait(n: u16) void {
+  timestamp.get_timestamp(&tsc);
+  const st = tsc[0];
+  var el: u16 = 0;
+  while (el < n) {
+    timestamp.get_timestamp(&tsc);
+    el = if (tsc[0] >= st) tsc[0] - st else (0xffff - st) + tsc[0] + 1;
+  }
+}
+
+var n_steps: u32 = 0;
+var pos0: u32 = 0;
+const pass_id: local_task_id = @get_local_task_id(8);
+task pass_task() void {
+  var s: u32 = 0;
+  while (s < n_steps) : (s += 1) {
+    if ((pfl & 2) != 0) {
+      @fmovs(tw_d, fin(q_tb, 1));
+      restore();
+      const tv = tw[0];
+      if ((pfl & 1) != 0 and tv >= 0.0) {
+        const t = @as(u32, tv);
+        if (t >= t0 and t < t0 + nt) {
+          const j = @as(u16, t - t0);
+          if ((pfl & 4) == 0) {
+            const r = @get_config(pb_addr, tgt.color_addr_range) & 0xff00;
+            @set_config(pb_addr, r | 0x80 | (pb_orig & 0x1f), tgt.color_addr_range);
+            dirty = true;
+          }
+          @fh2s(@set_dsd_length(ob_d, lv), @set_dsd_length(@increment_dsd_offset(@set_dsd_base_addr(tb_d, @ptrcast([*]@fp16(), &tbl[0])), @as(i16, j * lv), @fp16()), lv));
+          ob[lv] = @as(f32, pos0 + s + 2);
+          wait(DLY);
+          @fmovs(fout(q_pb, lv + 1), @set_dsd_length(ob_d, lv + 1));
+          sends[0] += 1;
+          sends[1] = t;
+        }
+      }
+    }
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn compute(steps: u32, start_pos: u32) void {
+  n_steps = steps;
+  pos0 = start_pos;
+  @activate(pass_id);
+}
+
+comptime {
+  @bind_local_task(pass_task, pass_id);
+  @initialize_queue(q_tb, .{ .color = @get_color(13) });
+  @initialize_queue(q_pb, .{ .color = C_PARK });
+  @export_symbol(tbl_ptr, "ptab");
+  @export_symbol(rcfg_ptr, "rcfg");
+  @export_symbol(sends_ptr, "psend");
+  @export_symbol(init);
+  @export_symbol(compute);
+}
+//@@ dummies
