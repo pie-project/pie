@@ -315,11 +315,135 @@ impl Device {
             return Ok(Vec::new());
         }
         let exe = program.exe.as_ref().ok_or(Fault::Deviceless)?;
+        let at = profile::before(self.api());
         let (outs, done) = exe.execute(self.device()?, args)?;
-        if wait {
+        if wait || at.is_some() {
             done.wait()?;
         }
+        if let Some(at) = at {
+            profile::after(at, program.text_bytes);
+        }
         Ok(outs)
+    }
+}
+
+/// `PIE_XLA_PROFILE=<skip>:<count>[,<skip>:<count>...]`: a device trace of
+/// runs `skip..skip+count` (every program run counts), written as an
+/// `XSpace` beside `PIE_BENCH_SERVER_LOG` (or under `PIE_XLA_PROFILE_DIR`).
+/// Each traced run waits for the device.
+mod profile {
+    use std::sync::Mutex;
+
+    struct State {
+        runs: u64,
+        windows: Vec<(u64, u64)>,
+        live: Option<(crate::pjrt::profiler::Profiler, u64, std::time::Instant)>,
+        sizes: Vec<usize>,
+        seq: u32,
+    }
+
+    static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+    fn windows() -> Vec<(u64, u64)> {
+        std::env::var("PIE_XLA_PROFILE")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|w| {
+                        let (a, b) = w.split_once(':')?;
+                        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn dir() -> std::path::PathBuf {
+        if let Some(d) = std::env::var_os("PIE_XLA_PROFILE_DIR") {
+            return d.into();
+        }
+        if let Some(log) = std::env::var_os("PIE_BENCH_SERVER_LOG") {
+            let p = std::path::PathBuf::from(log);
+            if let Some(parent) = p.parent() {
+                return parent.to_path_buf();
+            }
+        }
+        std::env::temp_dir()
+    }
+
+    /// The run's index when it is traced.
+    pub(super) fn before(api: Option<&std::sync::Arc<crate::pjrt::Api>>) -> Option<u64> {
+        let mut guard = STATE.lock().ok()?;
+        let state = guard.get_or_insert_with(|| State {
+            runs: 0,
+            windows: windows(),
+            live: None,
+            sizes: Vec::new(),
+            seq: 0,
+        });
+        if state.windows.is_empty() {
+            return None;
+        }
+        let at = state.runs;
+        state.runs += 1;
+        if state.live.is_none()
+            && let Some(&(skip, count)) = state.windows.first()
+            && at == skip
+            && let Some(api) = api
+        {
+            match crate::pjrt::profiler::Profiler::start(api) {
+                Ok(p) => {
+                    eprintln!("PIE_XLA_PROFILE: tracing runs {skip}..{}", skip + count);
+                    state.live = Some((p, skip + count, std::time::Instant::now()));
+                    state.sizes.clear();
+                }
+                Err(e) => {
+                    eprintln!("PIE_XLA_PROFILE: the profiler did not start: {e}");
+                    state.windows.remove(0);
+                }
+            }
+        }
+        state.live.as_ref().map(|_| at)
+    }
+
+    pub(super) fn after(at: u64, text_bytes: usize) {
+        let Ok(mut guard) = STATE.lock() else {
+            return;
+        };
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        state.sizes.push(text_bytes);
+        let end = state.live.as_ref().map(|l| l.1);
+        if end != Some(at + 1) {
+            return;
+        }
+        let Some((p, _, t0)) = state.live.take() else {
+            return;
+        };
+        state.windows.remove(0);
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let seq = state.seq;
+        state.seq += 1;
+        match p.finish() {
+            Ok(bytes) => {
+                let d = dir();
+                let _ = std::fs::create_dir_all(&d);
+                let path = d.join(format!(
+                    "xla-profile-{}-{seq}.xplane.pb",
+                    std::process::id()
+                ));
+                let wrote = std::fs::write(&path, &bytes);
+                eprintln!(
+                    "PIE_XLA_PROFILE: {} runs in {ms:.1}ms (program texts {:?} B); {} bytes -> {} ({wrote:?})",
+                    state.sizes.len(),
+                    state.sizes,
+                    bytes.len(),
+                    path.display()
+                );
+            }
+            Err(e) => eprintln!("PIE_XLA_PROFILE: collect failed: {e}"),
+        }
     }
 }
 
