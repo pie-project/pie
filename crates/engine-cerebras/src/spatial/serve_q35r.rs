@@ -239,7 +239,17 @@ pub(crate) fn place_layers(
             sp.nla = na.max(1);
             sp.nlg = (layers.len() - na).max(1);
         }
-        unit(lay, &m, ckpt, v.k, &layers, (v.x0, v.y0), sp, units.rot8, dev)?;
+        unit(
+            lay,
+            &m,
+            ckpt,
+            v.k,
+            &layers,
+            (v.x0, v.y0),
+            sp,
+            units.rot8,
+            dev,
+        )?;
         tracing::info!(
             unit = v.idx,
             layers = ?layers,
@@ -265,10 +275,14 @@ fn unit(
     let pes = pxn * pyn;
     let (hid, inter) = (m.hidden, m.inter);
     if pxn * ic != inter {
-        return Err(format!("Q35R: {pxn} columns x Ic {ic} is not inter {inter}"));
+        return Err(format!(
+            "Q35R: {pxn} columns x Ic {ic} is not inter {inter}"
+        ));
     }
     if pyn * hc < hid {
-        return Err(format!("Q35R: {pyn} rows x Hc {hc} hold less than hidden {hid}"));
+        return Err(format!(
+            "Q35R: {pyn} rows x Hc {hc} hold less than hidden {hid}"
+        ));
     }
     let nl = layers.len();
     let dim = |py: usize, kk: usize| Some(py * hc + kk).filter(|&x| x < hid);
@@ -404,7 +418,11 @@ fn unit(
         for c in 0..pxn {
             let (g, j) = (c / gs, c % gs);
             let prs = &pairs[j * dh..(j + 1) * dh];
-            let dl: Vec<usize> = prs.iter().map(|t| t.0).chain(prs.iter().map(|t| t.1)).collect();
+            let dl: Vec<usize> = prs
+                .iter()
+                .map(|t| t.0)
+                .chain(prs.iter().map(|t| t.1))
+                .collect();
             let head_rows = |hi: usize| -> Vec<(&Tensor, usize)> {
                 if hi < qh {
                     dl.iter().map(|&dd| (&qg, q_row(qh * g + hi, dd))).collect()
@@ -489,7 +507,11 @@ fn unit(
         let in_a = tensor(ckpt, &n("in_a"), &[m.vh, hid])?;
         let conv = ckpt.get(&n("conv"))?;
         if conv.data.len() != qkvn * cw {
-            return Err(format!("{}: {:?}, not {qkvn} x {cw}", n("conv"), conv.shape));
+            return Err(format!(
+                "{}: {:?}, not {qkvn} x {cw}",
+                n("conv"),
+                conv.shape
+            ));
         }
         let a_log = tensor(ckpt, &n("a_log"), &[m.vh])?;
         let dt_bias = tensor(ckpt, &n("dt_bias"), &[m.vh])?;
@@ -567,7 +589,11 @@ fn unit(
         put(dev, sym, t, at, (pxn, pyn), kv16)?;
     }
     let lk: Vec<u32> = (0..pes)
-        .flat_map(|_| slots.iter().flat_map(|&(kind, s)| [u32::from(kind), s as u32]))
+        .flat_map(|_| {
+            slots
+                .iter()
+                .flat_map(|&(kind, s)| [u32::from(kind), s as u32])
+        })
         .collect();
     dev.put16("lkind", rect(at.0, at.1, pxn, pyn), 2 * nl, &lk)
 }
@@ -585,13 +611,15 @@ pub(crate) fn kv_of(
         return (v.layers.len(), DataType::Bits16);
     }
     let kv16 = lay.param("KV16").or(lay.knob("KV16").map(|x| x as usize)) != Some(0);
-    let dt = if kv16 { DataType::Bits16 } else { DataType::Bits32 };
+    let dt = if kv16 {
+        DataType::Bits16
+    } else {
+        DataType::Bits32
+    };
     let attends = |l: usize| (lay.knob("KINDS").unwrap_or(0) >> l) & 1 == 1;
     let n = match v.kind {
         Kind::Grid => 1,
-        Kind::Region
-            if units.yd > 0 && units.rc == 2 && units.yd / units.rpy + 2 == units.rr =>
-        {
+        Kind::Region if units.yd > 0 && units.rc == 2 && units.yd / units.rpy + 2 == units.rr => {
             v.layers.clone().filter(|&l| attends(l)).count().max(1)
         }
         Kind::Region => lay.knob("RNLA").unwrap_or(1) as usize,
@@ -609,9 +637,13 @@ mod tests {
     /// first layer under lever D's snake.
     fn layout_l0(c: usize, r: usize, rr: usize, rnl: usize) -> usize {
         let k = if r + 2 < rr {
-            2 * r + if r % 2 == 0 { 1 - c } else { c }
+            2 * r + if r.is_multiple_of(2) { 1 - c } else { c }
         } else if r + 2 == rr {
-            if c == 0 { 2 * (rr - 2) } else { 2 * (rr - 2) + 3 }
+            if c == 0 {
+                2 * (rr - 2)
+            } else {
+                2 * (rr - 2) + 3
+            }
         } else if c == 0 {
             2 * (rr - 2) + 1
         } else {
@@ -638,7 +670,11 @@ mod tests {
             for v in units.units(&lay) {
                 if v.kind == Kind::Region {
                     let (c, r) = (v.x0 / units.rpx, v.y0 / units.rpy);
-                    assert_eq!(layout_l0(c, r, units.rr, units.rnl), v.layers.start, "{c},{r}");
+                    assert_eq!(
+                        layout_l0(c, r, units.rr, units.rnl),
+                        v.layers.start,
+                        "{c},{r}"
+                    );
                     n += 1;
                 }
             }

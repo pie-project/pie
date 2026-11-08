@@ -18,17 +18,9 @@ fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
     }
 }
 
-/// A copy of `words` (n a PE) into `sym` over the rectangle (none if empty).
-fn put(
-    d: &mut dyn Device,
-    sym: &str,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    words: &[u32],
-    b16: bool,
-) -> R<()> {
+/// A copy of `words` (n a PE) into `sym` over the rectangle `[x, y, w, h]`
+/// (none if empty).
+fn put(d: &mut dyn Device, sym: &str, [x, y, w, h]: [u32; 4], words: &[u32], b16: bool) -> R<()> {
     if w * h == 0 {
         return Ok(());
     }
@@ -77,19 +69,25 @@ pub fn place(d: &mut dyn Device, g: &Geo, spec: &SplitSpec) -> R<()> {
             let rc = cfgs((r0..r1).flat_map(|r| {
                 (c0..c1).map(move |c| g.rcfg_weight(x0u + g.wl(c, xc), y0u + g.wl(r, yc), r))
             }))?;
-            put(d, "rcfg", x0, y0, c1 - c0, r1 - r0, &rc, false)?;
+            put(d, "rcfg", [x0, y0, c1 - c0, r1 - r0], &rc, false)?;
             let mut rb = r0;
             while rb < r1 {
                 let re = (rb + 16).min(r1);
                 let blk = wu.block(None, (rb as usize, re as usize), (c0 as usize, c1 as usize))?;
-                put(d, "w", x0, y0u + g.wl(rb, yc), c1 - c0, re - rb, &blk, true)?;
+                put(
+                    d,
+                    "w",
+                    [x0, y0u + g.wl(rb, yc), c1 - c0, re - rb],
+                    &blk,
+                    true,
+                )?;
                 rb = re;
             }
         }
         for (r0, r1) in [(0, yc), (yc, py)] {
             let y0 = y0u + g.wl(r0, yc);
             let rc = cfgs((r0..r1).map(|r| g.rcfg_cx(x0u + xc, y0u + g.wl(r, yc), u == 0)))?;
-            put(d, "rcfg", x0u + xc, y0, 1, r1 - r0, &rc, false)?;
+            put(d, "rcfg", [x0u + xc, y0, 1, r1 - r0], &rc, false)?;
             let n = gam.shape[2];
             let mut v = Vec::new();
             gam.words(
@@ -97,12 +95,12 @@ pub fn place(d: &mut dyn Device, g: &Geo, spec: &SplitSpec) -> R<()> {
                 (r1 - r0) as usize * n,
                 &mut v,
             )?;
-            put(d, "gam", x0u + xc, y0, 1, r1 - r0, &v, true)?;
+            put(d, "gam", [x0u + xc, y0, 1, r1 - r0], &v, true)?;
         }
         for (c0, c1) in [(0, xc), (xc, px)] {
             let x0 = x0u + g.wl(c0, xc);
             let rc = cfgs((c0..c1).map(|c| g.rcfg_cy(x0u + g.wl(c, xc), y0u + yc)))?;
-            put(d, "rcfg", x0, y0u + yc, c1 - c0, 1, &rc, false)?;
+            put(d, "rcfg", [x0, y0u + yc, c1 - c0, 1], &rc, false)?;
             for (sym, a) in &cy_syms {
                 // [NU][PX][n] or [PX][n]
                 let (base, n) = if a.shape.len() == 3 {
@@ -112,7 +110,7 @@ pub fn place(d: &mut dyn Device, g: &Geo, spec: &SplitSpec) -> R<()> {
                 };
                 let mut v = Vec::new();
                 a.words(base + c0 as usize * n, (c1 - c0) as usize * n, &mut v)?;
-                put(d, sym, x0, y0u + yc, c1 - c0, 1, &v, false)?;
+                put(d, sym, [x0, y0u + yc, c1 - c0, 1], &v, false)?;
             }
         }
         tracing::info!(
@@ -135,14 +133,14 @@ pub fn place(d: &mut dyn Device, g: &Geo, spec: &SplitSpec) -> R<()> {
         while rb < hr {
             let re = (rb + 64).min(hr);
             let rc = cfgs((rb..re).flat_map(|y| (c0..c1).map(move |c| g.rcfg_head(g.hx(c), y))))?;
-            put(d, "rcfg", x0, rb, c1 - c0, re - rb, &rc, false)?;
+            put(d, "rcfg", [x0, rb, c1 - c0, re - rb], &rc, false)?;
             let blk = hw.block(None, (rb as usize, re as usize), (c0 as usize, c1 as usize))?;
-            put(d, "hw", x0, rb, c1 - c0, re - rb, &blk, true)?;
+            put(d, "hw", [x0, rb, c1 - c0, re - rb], &blk, true)?;
             let n = hg.shape[1];
             let mut one = Vec::new();
             hg.words(c0 as usize * n, (c1 - c0) as usize * n, &mut one)?;
             let all: Vec<u32> = (rb..re).flat_map(|_| one.iter().copied()).collect();
-            put(d, "hg", x0, rb, c1 - c0, re - rb, &all, false)?;
+            put(d, "hg", [x0, rb, c1 - c0, re - rb], &all, false)?;
             rb = re;
         }
     }
@@ -153,13 +151,13 @@ pub fn place(d: &mut dyn Device, g: &Geo, spec: &SplitSpec) -> R<()> {
             while rb < hr {
                 let re = (rb + 64).min(hr);
                 let blk = he.block(None, (rb as usize, re as usize), (c0 as usize, c1 as usize))?;
-                put(d, "hemb", g.hx(c0), rb, c1 - c0, re - rb, &blk, true)?;
+                put(d, "hemb", [g.hx(c0), rb, c1 - c0, re - rb], &blk, true)?;
                 rb = re;
             }
         }
     }
     let vr = spec.int("VR").ok_or("split meta: no VR")?;
     let rc = cfgs((0..hr).map(|y| g.rcfg_hctl(hx0 + hxc, y, vr)))?;
-    put(d, "rcfg", hx0 + hxc, 0, 1, hr, &rc, false)?;
+    put(d, "rcfg", [hx0 + hxc, 0, 1, hr], &rc, false)?;
     Ok(())
 }

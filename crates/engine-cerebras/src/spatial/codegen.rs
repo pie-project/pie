@@ -3159,9 +3159,18 @@ const Q35R_ANCHORS: &[(&str, &str)] = &[
         "  if (px % Gs == R1) { @fmovs(fout(q_bc_out, n), buf); oq_drain(); }\n",
         "  if (px % Gs == R1) { @fmovs(fout(q_bc_out, n), buf); bc_drain(); }\n",
     ),
-    ("  exp_poly(te_d, tt_d);           // e = exp(-|g|)\n", "  exp_poly(e_, t_);\n"),
-    ("  exp_fast(te_d, tt_d, &tt, MC);  // e = exp(-|g|)\n", "  exp_fast(e_, t_, &gt1, n);\n"),
-    ("const EX_N: u16 = mx2(ACTN, MC);", "const EX_N: u16 = mx2(mx2(ACTN, MC), NT1);"),
+    (
+        "  exp_poly(te_d, tt_d);           // e = exp(-|g|)\n",
+        "  exp_poly(e_, t_);\n",
+    ),
+    (
+        "  exp_fast(te_d, tt_d, &tt, MC);  // e = exp(-|g|)\n",
+        "  exp_fast(e_, t_, &gt1, n);\n",
+    ),
+    (
+        "const EX_N: u16 = mx2(ACTN, MC);",
+        "const EX_N: u16 = mx2(mx2(ACTN, MC), NT1);",
+    ),
     // The GDN's full X all-reduces take ARF 3's XA set (axis_xf).
     (
         "fn axis_xx() void { set_axis(true); }\n",
@@ -3181,7 +3190,10 @@ const Q35R_ANCHORS: &[(&str, &str)] = &[
         "  c = 0;\n  while (c < (if (EXR == 1) dims[11] else 6)) : (c += 1) {\n    if (c > 0) { @fmuls(p, p, buf); }",
     ),
     // (HV) the pool by the layer's attention slot
-    ("fn kvoff() u16 { return lw * KCN; }", "fn kvoff() u16 { return la * KCN; }"),
+    (
+        "fn kvoff() u16 { return lw * KCN; }",
+        "fn kvoff() u16 { return la * KCN; }",
+    ),
     // LSE's group shifts: the Y axis's from values made once (a region's 234
     // rows take no power-of-two group).
     (
@@ -3235,7 +3247,11 @@ fn apply_reps(name: &str, json: &str, text: &str, tag: &str) -> R<String> {
             r["new"].as_str().unwrap_or(""),
         );
         let (old_u, new_u) = (unit(old), unit(new));
-        let (old, new) = if q35r { (old_u.as_str(), new_u.as_str()) } else { (old, new) };
+        let (old, new) = if q35r {
+            (old_u.as_str(), new_u.as_str())
+        } else {
+            (old, new)
+        };
         let n = s.matches(old).count();
         if old.is_empty() || n != 1 {
             return Err(format!("{name}: {tag} changed: anchor {i} found {n} times"));
@@ -4581,7 +4597,6 @@ fn q35r_dummies(text: &str) -> String {
         lines.join("\n")
     )
 }
-
 
 // ---------------------------------------------------------------- serve_gptoss
 

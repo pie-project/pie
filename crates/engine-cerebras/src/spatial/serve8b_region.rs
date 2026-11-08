@@ -1255,7 +1255,7 @@ fn copy_pages_each(
             let n = shape.page_size * v.k.dc;
             let kcn = shape.blocks * n;
             let (nlk, dt) = super::serve_q35r::kv_of(lay, u, v);
-        let len = nlk * kcn + 1;
+            let len = nlk * kcn + 1;
             let (rs, bs, rd, bd) = (src % p, src / p, dst % p, dst / p);
             let row = |r: usize| rect(v.x0, v.y0 + r, v.k.px, 1);
             for sym in ["kc", "vc"] {
@@ -2020,7 +2020,9 @@ mod tests {
     fn q35r_xac_colours() {
         let p = std::env::var("Q35R_XAC_PARAMS").expect("Q35R_XAC_PARAMS");
         let lay = lay_of(&p);
-        let Layers::Units { units: u, .. } = lay.layers else { panic!("not serve8b_region") };
+        let Layers::Units { units: u, .. } = lay.layers else {
+            panic!("not serve8b_region")
+        };
         let units = u.units(&lay);
         let t = Tables::new(units.clone(), 1, u.rtr).unwrap();
         for v in units.iter().filter(|v| v.kind == Kind::Region) {
@@ -2030,7 +2032,11 @@ mod tests {
                     let mut cs: Vec<u32> = e.routes.keys().copied().collect();
                     cs.extend(e.recv.iter().chain(&e.send).map(|r| r[0]));
                     cs.extend([e.relay, e.fwd_in]);
-                    let bad: Vec<u32> = cs.iter().copied().filter(|c| [0, 1, 2, 15, 16].contains(c) || (5..=10).contains(c)).collect();
+                    let bad: Vec<u32> = cs
+                        .iter()
+                        .copied()
+                        .filter(|c| [0, 1, 2, 15, 16].contains(c) || (5..=10).contains(c))
+                        .collect();
                     assert!(bad.is_empty(), "region {} pe {px},{py}: {bad:?}", v.idx);
                 }
             }

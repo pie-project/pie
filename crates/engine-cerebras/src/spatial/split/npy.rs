@@ -79,14 +79,13 @@ impl Npy {
             .map_err(|e| format!("{}: {e}", self.name))?;
         if self.elem == 2 {
             out.extend(
-                b.chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]) as u32),
+                b.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes(*c) as u32),
             );
         } else {
-            out.extend(
-                b.chunks_exact(4)
-                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
-            );
+            out.extend(b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)));
         }
         Ok(())
     }

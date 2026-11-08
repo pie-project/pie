@@ -136,7 +136,7 @@ fn main() {
     hg.words(0, hcn * hdc, &mut gv).unwrap();
     let mut worst = 0f64;
     let mut big = 0f64;
-    for v in 0..l.len() {
+    for (v, &lv) in l.iter().enumerate() {
         let (rr, j) = (v / vr, v % vr);
         let mut acc = 0f64;
         for c in 0..hcn {
@@ -146,7 +146,7 @@ fn main() {
             }
         }
         let rf = acc / rms;
-        worst = worst.max((rf - l[v] as f64).abs());
+        worst = worst.max((rf - lv as f64).abs());
         big = big.max(rf.abs());
     }
     let rel = worst / big.max(1e-30);

@@ -1001,7 +1001,8 @@ impl ProgramSpec {
     /// placed by `spatial::serve_q35r`).
     #[must_use]
     pub fn q35r(&self) -> bool {
-        self.design == Design::Serve8bRegion && self.knobs.get("Q35R").is_some_and(|v| v.trim() == "1")
+        self.design == Design::Serve8bRegion
+            && self.knobs.get("Q35R").is_some_and(|v| v.trim() == "1")
     }
 
     /// A knob's value as a number (`None`: unset or not a number).

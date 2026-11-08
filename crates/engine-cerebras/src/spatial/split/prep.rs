@@ -92,8 +92,10 @@ impl Ckpt {
             .map_err(|e| e.to_string())?;
         Ok((
             shape.clone(),
-            raw.chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            raw.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect(),
         ))
     }
@@ -110,12 +112,16 @@ impl Ckpt {
             .map_err(|e| e.to_string())?;
         match dt.as_str() {
             "BF16" => Ok(raw
-                .chunks_exact(2)
-                .map(|c| bf(u16::from_le_bytes([c[0], c[1]])))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| bf(u16::from_le_bytes(*c)))
                 .collect()),
             "F32" => Ok(raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()),
             d => Err(format!("{name} is {d}")),
         }
@@ -269,7 +275,9 @@ pub fn unit(ckpt: &Ckpt, u: usize) -> R<Vec<u16>> {
         .map(|&c| (0..16).map(|k| (c / 8) * 128 + (c % 8) * 16 + k).collect())
         .collect();
     let pd: Vec<[usize; 4]> = cs.iter().map(|&c| perm(c % 64)).collect();
-    let mut blob: Vec<Vec<u16>> = vec![Vec::with_capacity(3 * 3360 + 3200); PX * PY];
+    let mut blob: Vec<Vec<u16>> = (0..PX * PY)
+        .map(|_| Vec::with_capacity(3 * 3360 + 3200))
+        .collect();
     for l in 4 * u..4 * u + 4 {
         let lp = format!("{P}layers.{l}.");
         if l % 4 < 3 {

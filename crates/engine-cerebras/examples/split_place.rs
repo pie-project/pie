@@ -58,13 +58,14 @@ impl Device for Log {
     }
     fn memcpy_h2d_rowbcast(
         &mut self,
-        _: &str,
+        s: &str,
         _: &[u32],
         _: Rect,
         _: usize,
         _: DataType,
     ) -> sdk::Result<()> {
-        unimplemented!()
+        // (the role-split placement makes no row broadcasts)
+        Err(sdk::Error::WrongKind(s.to_string(), sdk::RpcKind::Var))
     }
     fn memcpy_h2d_nonblock(
         &mut self,

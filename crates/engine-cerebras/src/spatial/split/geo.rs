@@ -89,6 +89,15 @@ fn or(a: Option<u32>, b: Option<u32>) -> Option<u32> {
 /// A chain member: (role, send colour, level-1 recv, level-2 recv).
 pub type Role = (u32, u32, Option<u32>, Option<u32>);
 
+/// A single-level line member: (role, send colour, recv colour).
+type LineRole = (u32, u32, Option<u32>);
+
+/// A chain root's receive colours, one a half (`None`: that half is empty).
+type RootQ = (Option<u32>, Option<u32>);
+
+/// A CY segment member: (role, recv, send, multicast, level-2 recv).
+type CySeg = (u32, Option<u32>, Option<u32>, Option<u32>, Option<u32>);
+
 #[derive(Default, Clone)]
 struct Cxq {
     inn: Option<u32>,
@@ -140,15 +149,15 @@ pub struct Geo {
     wrole_x: HashMap<P, Role>,
     wrole_y: HashMap<P, Role>,
     cxq: HashMap<P, Cxq>,
-    cyseg: HashMap<P, (u32, Option<u32>, Option<u32>, Option<u32>, Option<u32>)>,
+    cyseg: HashMap<P, CySeg>,
     wseg: HashMap<P, (u32, [Option<u32>; 4])>,
     gsrc: HashMap<P, (u32, Option<u32>)>,
     hrole: HashMap<P, u32>,
     hrow: HashMap<P, Role>,
-    rootq: HashMap<P, (Option<u32>, Option<u32>)>,
+    rootq: HashMap<P, RootQ>,
     wrow: HashMap<P, Role>,
     hturn: HashMap<P, u32>,
-    wroot: Option<(u32, u32, (Option<u32>, Option<u32>))>,
+    wroot: Option<(u32, u32, RootQ)>,
 }
 
 type R<T> = std::result::Result<T, String>;
@@ -260,10 +269,7 @@ impl Geo {
         b: u32,
         m: u32,
         lp: bool,
-    ) -> R<(
-        Vec<(P, (u32, u32, Option<u32>))>,
-        (Option<u32>, Option<u32>),
-    )> {
+    ) -> R<(Vec<(P, LineRole)>, RootQ)> {
         let mut out = Vec::new();
         let n = pts.len();
         for (i, &p) in pts.iter().enumerate() {
@@ -335,7 +341,7 @@ impl Geo {
         c2: [u32; 2],
         m: u32,
         g: u32,
-    ) -> R<(Vec<(P, Role)>, (Option<u32>, Option<u32>))> {
+    ) -> R<(Vec<(P, Role)>, RootQ)> {
         if g == 0 {
             let (o, h) = self.line(pts, root, a, b, m, false)?;
             return Ok((
@@ -504,9 +510,15 @@ impl Geo {
         let (px, py, xc, yc) = (self.p.px, self.p.py, self.xc, self.yc);
         // A segment (scores, GDN's (k, q), the o-norm) is a line of adjacent PEs: it must not span
         // the control column (the gap at local x = XC).
-        for (n, sw) in [("SWA", self.p.swa), ("SWG", self.p.swg), ("SWV", self.p.swv)] {
+        for (n, sw) in [
+            ("SWA", self.p.swa),
+            ("SWG", self.p.swg),
+            ("SWV", self.p.swv),
+        ] {
             if sw == 0 || xc % sw != 0 {
-                return Err(format!("split geometry: {n} {sw} does not divide XC {xc} (a segment would span the control column)"));
+                return Err(format!(
+                    "split geometry: {n} {sw} does not divide XC {xc} (a segment would span the control column)"
+                ));
             }
         }
         for u in 0..self.order.len() {

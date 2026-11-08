@@ -2831,10 +2831,25 @@ mod qwen3_8b {
         let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
         let mut cfg = ServeConfig::new(goals);
         cfg.region = true;
-        (cfg.speed, cfg.lse, cfg.ops2, cfg.qkv1, cfg.head_one_pass, cfg.hv, cfg.lever_d) =
-            (true, true, true, true, true, true, true);
-        (cfg.arf, cfg.arfx, cfg.arfs, cfg.mem, cfg.op3, cfg.f16acc, cfg.f16accg, cfg.grid_levers) =
-            (true, true, true, true, true, true, true, true);
+        (
+            cfg.speed,
+            cfg.lse,
+            cfg.ops2,
+            cfg.qkv1,
+            cfg.head_one_pass,
+            cfg.hv,
+            cfg.lever_d,
+        ) = (true, true, true, true, true, true, true);
+        (
+            cfg.arf,
+            cfg.arfx,
+            cfg.arfs,
+            cfg.mem,
+            cfg.op3,
+            cfg.f16acc,
+            cfg.f16accg,
+            cfg.grid_levers,
+        ) = (true, true, true, true, true, true, true, true);
         (cfg.xac, cfg.trim, cfg.hvc) = (true, true, true);
         cfg.pins.set("NP", 1).unwrap();
         let want = "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:48,RNL:3,\
@@ -2863,7 +2878,11 @@ mod qwen3_8b {
         assert!(lay.model.qk_norm);
         for (n, text) in d.files_with(lay.model.variant()).unwrap() {
             assert_eq!(text.contains("(trm 1024)"), n == "region_pe.csl", "{n}");
-            assert_eq!(text.contains("(slw) e' = e 2^9"), n == "region_pe.csl", "{n}");
+            assert_eq!(
+                text.contains("(slw) e' = e 2^9"),
+                n == "region_pe.csl",
+                "{n}"
+            );
         }
     }
 
