@@ -170,6 +170,7 @@ fn init() void {
   role_s = @as(u16, rcfg[RQ + 7]);
   timestamp.enable_tsc();
   vinit();
+  vinit2();
   var g: u16 = 0;
   while (CONVQK == 1 and g < NLG) : (g += 1) { gpar[2 * g] = -exp1(gpar[2 * g]); }
   
@@ -312,6 +313,49 @@ fn vsilu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
   @fmuls(dst, dst, r);
 }
 
+// dst = silu(src), the lean form (SILUQ 1): e = exp(-|x|) (the sign bit set by one or16 on the high
+// halves, a lower clamp only), 1 / (1 + e) by the quadratic and one Newton step (~1e-4), no copies
+param SILUQ: u16 = 1;
+var vah = vk_d;
+fn vinit2() void { vah = @increment_dsd_offset(@set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, &va)), 2), 1, u16); }
+fn vsiluq(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
+  const x = @set_dsd_length(va_d, n);       // -|x|, then d = 1 + e
+  const p = @set_dsd_length(vb_d, n);       // exp's p, then e
+  const r = @set_dsd_length(vc_d, n);
+  const kk = @set_dsd_length(vk_d, n);
+  const pl = @set_dsd_length(vpl, n);
+  const ph = @increment_dsd_offset(pl, 1, u16);
+  @fmovs(x, src);
+  @or16(@set_dsd_length(vah, n), @set_dsd_length(vah, n), 0x8000);   // -|x|
+  @fmaxs(x, x, -87.0);
+  @fmuls(p, x, 1.4426950408889634);
+  var c: u16 = 0;
+  while (c < 3) : (c += 1) {
+    @fadds(p, p, ex_a[c]);
+    if (c == 1) { @fmacs(x, x, p, -0.6931471805599453); }
+  }
+  @sll16(kk, pl, 7);
+  @fmuls(p, x, 0.041458580642938614);
+  c = 0;
+  while (c < 4) : (c += 1) {
+    if (c > 0) { @fmuls(p, p, x); }
+    @fadds(p, p, ex_c[c]);
+  }
+  @add16(ph, ph, kk);                       // p = e
+  @fadds(x, p, 1.0);                        // d
+  @fmuls(r, x, 0.323112507040746);
+  @fadds(r, r, -1.4540415401729079);
+  @fmuls(r, r, x);
+  @fadds(r, r, 2.1207294161729284);         // 1 / d to 1%
+  @fmuls(dst, x, r);
+  @fsubs(dst, 2.0, dst);
+  @fmuls(r, r, dst);                        // to ~1e-4
+  @fmuls(dst, src, p);
+  @fmaxs(dst, dst, src);
+  @fmuls(dst, dst, r);
+}
+fn vsil(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void { if (SILUQ == 1) { vsiluq(dst, src, n); } else { vsilu(dst, src, n); } }
+
 // ---------------------------------------------------------------- layers
 // conv1d (CONV taps) over channels [o, o + n): u[o..) = the window's taps and t's new value; the
 // window is a ring (row wp the oldest, wp advancing once a pass): the new raw value replaces the oldest
@@ -390,7 +434,7 @@ fn gdn_pre1(g: u16) f32 {
   // on the path to the multicast: q / k's rms scale, conv and SiLU, the decay (v, z, beta after it)
   @fmuls(tv(0, 2 * DK), tv(0, 2 * DK), rr);
   conv(g, 0, 2 * DK);
-  vsilu(tv(0, 2 * DK), uv(0, 2 * DK), 2 * DK);
+  vsil(tv(0, 2 * DK), uv(0, 2 * DK), 2 * DK);
   if (GDEC == 0) { gdec = exp1(gpar[2 * g] * softplus(t[2 * DK + 2 * DV + 1] * rr + gpar[2 * g + 1])); }   // gpar[2 g] = -exp(A) (init)
   @fmovs(uv(0, DK), tv(DK, DK));          // k
   @fmovs(uv(DK, DK), tv(0, DK));          // q
@@ -403,7 +447,7 @@ fn gdn_pre1(g: u16) f32 {
   conv(g, 2 * DK, DV);
   // conv(v) | z side by side in u, one SiLU pass into v | z
   @fmovs(uv(2 * DK + DV, DV), tv(2 * DK + DV, DV));
-  vsilu(vz_d, uv(2 * DK, 2 * DV), 2 * DV);
+  vsil(vz_d, uv(2 * DK, 2 * DV), 2 * DV);
   const bt = sigm(t[2 * DK + 2 * DV]);
   return bt;
 }
