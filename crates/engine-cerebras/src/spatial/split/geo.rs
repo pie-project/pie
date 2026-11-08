@@ -502,6 +502,13 @@ impl Geo {
 
     pub fn build(&mut self, has_att: bool, has_gdn: bool) -> R<()> {
         let (px, py, xc, yc) = (self.p.px, self.p.py, self.xc, self.yc);
+        // A segment (scores, GDN's (k, q), the o-norm) is a line of adjacent PEs: it must not span
+        // the control column (the gap at local x = XC).
+        for (n, sw) in [("SWA", self.p.swa), ("SWG", self.p.swg), ("SWV", self.p.swv)] {
+            if sw == 0 || xc % sw != 0 {
+                return Err(format!("split geometry: {n} {sw} does not divide XC {xc} (a segment would span the control column)"));
+            }
+        }
         for u in 0..self.order.len() {
             let (x0, y0) = self.unit_origin(u);
             for r in 0..py {
