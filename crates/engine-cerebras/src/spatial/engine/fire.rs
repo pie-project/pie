@@ -257,18 +257,35 @@ impl Spatial {
         let greedy = greedy && last_only && lookahead > 0;
         let width = self.readout.as_ref().map_or(0, |(_, w)| *w as usize);
         let fed: Vec<u32> = history.iter().chain(tokens).copied().collect();
-        if greedy {
-            // A token loop that already ran these rows answers them.
-            let last = fed.len() - 1;
-            let c = &self.kv.cached;
-            if c.tokens.len() > last
-                && c.tokens[..=last] == fed[..]
-                && let Some(token) = c.argmax.get(last).copied().flatten()
-            {
-                self.ahead_hits += 1;
-                self.kv.write(slot, pages, history, tokens)?;
-                return Ok((vec![one_hot(width, Some(token))], true));
+        // The role-split program runs its token loops back to back: the next
+        // is posted as one lands, so the wafer runs while rows are answered.
+        let posting = self.split_posting();
+        if posting {
+            self.land_split(false)?;
+        }
+        loop {
+            if greedy {
+                // A token loop that already ran these rows answers them.
+                let last = fed.len() - 1;
+                let c = &self.kv.cached;
+                if c.tokens.len() > last
+                    && c.tokens[..=last] == fed[..]
+                    && let Some(token) = c.argmax.get(last).copied().flatten()
+                {
+                    self.ahead_hits += 1;
+                    self.kv.write(slot, pages, history, tokens)?;
+                    if posting {
+                        self.post_split()?;
+                    }
+                    return Ok((vec![one_hot(width, Some(token))], true));
+                }
             }
+            // Nothing else runs while a posted loop is out: it lands first.
+            if posting && self.split_posted.is_some() {
+                self.land_split(true)?;
+                continue;
+            }
+            break;
         }
         let agree = self.kv.agreement(&history);
         // This greedy row picks up where the cache's last token loop ended
@@ -302,6 +319,7 @@ impl Spatial {
             let room = (pages.len() as u32 * self.kv.page_size)
                 .saturating_sub(start + tokens.len() as u32) as usize;
             let bounded = self.model.as_ref().is_some_and(|w| w.split)
+                && !posting
                 && std::env::var("PIE_CEREBRAS_LOOP_ROOM").map_or(true, |v| v != "off")
                 && !pages.is_empty();
             let steps = if bounded { steps.min(room) } else { steps };
@@ -326,6 +344,9 @@ impl Spatial {
             cached.argmax.resize(cached.tokens.len(), None);
             let token = cached.argmax[fed.len() - 1].unwrap_or_default();
             self.kv.write(slot, pages, history, tokens)?;
+            if posting {
+                self.post_split()?;
+            }
             return Ok((vec![one_hot(width, Some(token))], true));
         }
         let which = logits_wanted(rows, tokens.len());
@@ -343,6 +364,70 @@ impl Spatial {
             },
             false,
         ))
+    }
+
+    /// Whether greedy loops are posted back to back (the role-split
+    /// program; `PIE_CEREBRAS_SPLIT_POST=0`: one loop at a time).
+    fn split_posting(&self) -> bool {
+        self.model.as_ref().is_some_and(|w| w.split)
+            && self.lookahead() > 0
+            && std::env::var("PIE_CEREBRAS_SPLIT_POST").map_or(true, |v| v != "0")
+    }
+
+    /// The posted loop's rows into the cache (waiting for it, or only if it
+    /// has landed).
+    fn land_split(&mut self, wait: bool) -> EngineResult<()> {
+        let Some((token, start)) = self.split_posted else {
+            return Ok(());
+        };
+        let Some(answer) = self.model()?.take_posted(wait) else {
+            return Ok(());
+        };
+        self.split_posted = None;
+        let argmax = answer.map_err(Error::Device)?;
+        let c = &mut self.kv.cached;
+        if c.tokens.len() != start || argmax.is_empty() {
+            // The cache moved on (it never does while a loop is out).
+            tracing::warn!(
+                start,
+                held = c.tokens.len(),
+                "spatial: a posted token loop dropped"
+            );
+            return Ok(());
+        }
+        c.tokens.push(token);
+        c.tokens.extend_from_slice(&argmax[..argmax.len() - 1]);
+        c.argmax.extend(argmax.iter().map(|&t| Some(t)));
+        self.ahead_runs += 1;
+        Ok(())
+    }
+
+    /// The next loop posted from the cache's end (fed its last argmax),
+    /// twice the last one's steps up to the lookahead.
+    fn post_split(&mut self) -> EngineResult<()> {
+        if self.split_posted.is_some() {
+            return Ok(());
+        }
+        let lookahead = self.lookahead();
+        let c = &mut self.kv.cached;
+        let Some(Some(token)) = c.argmax.last().copied() else {
+            return Ok(());
+        };
+        if c.argmax.len() != c.tokens.len() {
+            return Ok(());
+        }
+        let start = c.tokens.len();
+        c.next_loop = (c.next_loop.max(FIRST_LOOP) * 2).min(lookahead);
+        let steps = c.next_loop;
+        let w = self.model()?;
+        if start + 1 >= w.positions {
+            return Ok(());
+        }
+        w.post_greedy(&[token], start, steps)
+            .map_err(Error::Device)?;
+        self.split_posted = Some((token, start));
+        tracing::info!(start, steps, "spatial: split token loop posted");
+        Ok(())
     }
 
     /// The most steps a greedy lane's token loop runs past its row (0: none):

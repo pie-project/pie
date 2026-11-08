@@ -83,6 +83,9 @@ pub struct Spatial {
     refilled: u64,
     /// Greedy rows a token loop answered, and the loops run.
     ahead_hits: u64,
+    /// The role-split program's posted token loop: the token it was fed and
+    /// its position.
+    split_posted: Option<(u32, usize)>,
     ahead_runs: u64,
     /// A paged lane's token loop run ahead on the wafer, by sequence slot:
     /// the slot its next row writes, then each row's expected token and the
@@ -133,6 +136,7 @@ impl Spatial {
             paged_fires: 0,
             refilled: 0,
             ahead_hits: 0,
+            split_posted: None,
             ahead_runs: 0,
             paged_ahead: std::collections::HashMap::new(),
             one_hot: fire::OneHotRow::default(),

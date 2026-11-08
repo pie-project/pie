@@ -1304,6 +1304,13 @@ enum Job {
         start: usize,
         extra: usize,
     },
+    /// A token loop posted without waiting (the role-split program): its
+    /// answer on the posted channel.
+    PostGreedy {
+        tokens: Vec<u32>,
+        start: usize,
+        extra: usize,
+    },
     /// A batched build's launch (answered on the batch channel).
     Batch {
         lanes: Vec<super::serve2d::BatchLane>,
@@ -1374,6 +1381,7 @@ impl Job {
         match self {
             Job::Forward { .. } => "forward",
             Job::Greedy { .. } => "greedy",
+            Job::PostGreedy { .. } => "post_greedy",
             Job::Batch { .. } => "batch",
             Job::Posted { .. } => "posted",
             Job::Copy { .. } => "copy",
@@ -1449,6 +1457,8 @@ pub struct Wafer {
     pub row_order: Option<super::paged::RowOrder>,
     /// The role-split program ([`super::split`]).
     pub split: bool,
+    /// Posted token loops' answers (the role-split program).
+    posted: mpsc::Receiver<Answer>,
 }
 
 /// The handle's page order from `PIE_CEREBRAS_PAGE_ORDER`, over a kernel
@@ -1556,6 +1566,7 @@ impl Wafer {
                                 }
                             },
                             split: false,
+                            posted: mpsc::channel().1,
                         }));
                         m
                     }
@@ -1710,6 +1721,9 @@ impl Wafer {
                             start,
                             extra,
                         } => model.greedy(&tokens, start, extra).map(|a| (a, Vec::new())),
+                        Job::PostGreedy { .. } => {
+                            Err("posted token loops are the role-split program's".into())
+                        }
                     };
                     idle_from = std::time::Instant::now();
                     tracing::info!(
@@ -1734,6 +1748,7 @@ impl Wafer {
             batch_answers: batch_rx,
             vm_answers: vm_rx,
             thread: Some(thread),
+            posted: mpsc::channel().1,
             ..facts
         })
     }
@@ -1749,6 +1764,7 @@ impl Wafer {
             .ok_or("the checkpoint config states no vocab_size")? as usize;
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
+        let (post_tx, post_rx) = mpsc::channel::<Answer>();
         let (ready_tx, ready_rx) = mpsc::channel::<R<(usize, usize, usize)>>();
         let thread = std::thread::Builder::new()
             .name("spatial-wafer".into())
@@ -1776,6 +1792,27 @@ impl Wafer {
                 let mut idle_from = Instant::now();
                 for job in job_rx {
                     let t0 = Instant::now();
+                    if let Job::PostGreedy {
+                        tokens,
+                        start,
+                        extra,
+                    } = job
+                    {
+                        let a = m.greedy(&tokens, start, extra).map(|a| (a, Vec::new()));
+                        tracing::info!(
+                            rows = tokens.len(),
+                            steps = extra + 1,
+                            pos = start,
+                            idle_ms = (t0 - idle_from).as_secs_f64() * 1e3,
+                            ms = t0.elapsed().as_secs_f64() * 1e3,
+                            "spatial wafer: split token loop launch (posted)"
+                        );
+                        idle_from = Instant::now();
+                        if post_tx.send(a).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     let answer = match job {
                         Job::Greedy {
                             tokens,
@@ -1845,6 +1882,7 @@ impl Wafer {
             group: 1,
             row_order: None,
             split: true,
+            posted: post_rx,
         })
     }
 
@@ -2167,6 +2205,38 @@ impl Wafer {
             .map(|(argmax, _)| argmax)
     }
 
+    /// Posts a token loop (the role-split program): its answer comes from
+    /// [`Wafer::take_posted`], in order.
+    pub fn post_greedy(&mut self, tokens: &[u32], start: usize, extra: usize) -> R<()> {
+        self.jobs
+            .as_ref()
+            .ok_or("the wafer is closed")?
+            .send(Job::PostGreedy {
+                tokens: tokens.to_vec(),
+                start,
+                extra,
+            })
+            .map_err(|_| "the wafer thread went away".to_string())
+    }
+
+    /// A posted loop's argmax after each row (as [`Wafer::greedy`]'s):
+    /// waiting for it, or `None` if it has not landed.
+    pub fn take_posted(&mut self, wait: bool) -> Option<R<Vec<u32>>> {
+        let got = if wait {
+            let _busy = Busy::start();
+            self.posted
+                .recv()
+                .map_err(|_| "the wafer thread went away".to_string())
+        } else {
+            match self.posted.try_recv() {
+                Ok(a) => Ok(a),
+                Err(mpsc::TryRecvError::Empty) => return None,
+                Err(_) => Err("the wafer thread went away".to_string()),
+            }
+        };
+        Some(got.and_then(|a| a.map(|(argmax, _)| argmax)))
+    }
+
     pub fn forward(&mut self, tokens: &[u32], start: usize, which: Logits) -> Answer {
         let _busy = Busy::start();
         self.jobs
@@ -2229,6 +2299,7 @@ mod tests {
             group: 1,
             row_order: None,
             split: false,
+            posted: mpsc::channel().1,
         };
         let kernel = w.paged.unwrap();
         w.page_as(16);
