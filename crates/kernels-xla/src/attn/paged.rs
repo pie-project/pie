@@ -996,6 +996,35 @@ pub(crate) fn per_row(
             },
         )?;
         out[1..].to_vec()
+    } else if let Some(t) = table {
+        // Visit only the chunks up to the last listed key of any row: past
+        // it every entry is negative (a selection's unfilled slots), so a
+        // chunk there admits nothing. A top-2048 selection of a 576-token
+        // context walked 256 chunks of 8 at 1792 rows, 72 holding keys.
+        let w = f.dims(t)[1];
+        let listed = cmp_i(f, Cmp::Ge, t, 0)?;
+        let j = f.iota(Elem::I32, &[r, w], 1);
+        let j = with_i(f, j, 1, Func::add)?;
+        let none = f.like_i(j, 0);
+        let last = f.select(listed, j, none)?;
+        let top = f.reduce(last, &[0, 1], Fold::Max)?;
+        let top = with_i(f, top, c - 1, Func::add)?;
+        let top = with_i(f, top, c, Func::div)?;
+        let bound = clamp_i(f, top, 0, n)?;
+        let zero = scalar_i(f, 0);
+        let mut carried = vec![zero];
+        carried.extend_from_slice(&st0);
+        let out = f.while_loop(
+            &carried,
+            |f, a| f.compare(Cmp::Lt, a[0], bound),
+            |f, a| {
+                let next = with_i(f, a[0], 1, Func::add)?;
+                let mut st = body(f, a[0], &a[1..])?;
+                st.insert(0, next);
+                Ok(st)
+            },
+        )?;
+        out[1..].to_vec()
     } else {
         f.for_loop(n, &st0, body)?
     };
