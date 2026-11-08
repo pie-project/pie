@@ -115,6 +115,8 @@ fn init() void {
 
 // ---------------------------------------------------------------- the wafer token loop
 param CAP: u16 = 64;
+param WFORCE: u32 = 0;   // (diagnostics) != 0: the root's winner is (s WFORCE + 7) % (VR WFN), not the argmax
+param WFN: u32 = 1;
 var ring = @zeros([CAP]u32);     // the root: the winner id of each step of the last launch
 var ring_ptr: [*]u32 = &ring;
 var wrole: u16 = 0;              // 0 chain start, 1 add-forward, 2 group end, 3 farthest end, 4 root (| 8 low half, | 16 high half)
@@ -134,6 +136,7 @@ fn wloop(s: u32, best: f32, id: f32) void {
   if ((wrole & 4) != 0) {
     if ((wrole & 8) != 0) { @fmovs(wr_d, fin(q_w1, 2)); wmerge(); }
     if ((wrole & 16) != 0) { @fmovs(wr_d, fin(q_w2, 2)); wmerge(); }
+    if (WFORCE != 0) { wm[1] = @as(f32, (s * WFORCE + 7) % (@as(u32, VR) * @as(u32, WFN))); }   // (diagnostics) a forced winner sequence
     if (s < CAP) { ring[s] = @as(u32, wm[1]); }
     if (s < 64) { stamp(2 + @as(u16, s)); }
     @fmovs(fout(q_wo, 2), wm_d);
