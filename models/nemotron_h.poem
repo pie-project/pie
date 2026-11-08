@@ -32,6 +32,11 @@ DEPLOYMENTS = [
     deployment("nemotron3-super-mini", weights = RELEASE, kv = dtype.bf16),
     deployment("nemotron3-ultra", weights = dtype.bf16, kv = dtype.bf16),
     deployment("nemotron3-ultra-mini", weights = dtype.bf16, kv = dtype.bf16),
+    # Ultra's miniature as mlx_lm.convert quantizes it (affine 4-bit in
+    # 64-wide groups): every projection, the routed experts, the embedding
+    # and the head; the router, the norms, the conv and the SSM parameters as
+    # the release keeps them.
+    deployment("nemotron3-ultra-mini", weights = dtype.u4g64, kv = dtype.bf16),
     # Nano as released (bf16), and modelopt's NVFP4 export (attention and the
     # Mamba-2 ahead of it bf16, the rest NVFP4 against bf16 activations: the
     # experts' 1856 rows are no whole number of the 128-row blocks the
@@ -141,18 +146,21 @@ def layout(id, deploy):
     if deploy.drafter != None or deploy.parts:
         fail("{} has no draft head or parts here; not {}".format(id, deploy))
     plain = deploy.weights == [dtype.bf16]
-    if d.pattern == ULTRA and not plain:
-        fail("{} ships as released: every weight bf16; not {}".format(id, deploy))
+    mlx4 = deploy.weights == [dtype.u4g64]
+    if d.pattern == ULTRA and not plain and not mlx4:
+        fail("{} ships as released, every weight bf16, or as mlx_lm quantizes it (u4g64); not {}".format(id, deploy))
     if d.pattern == SUPER and not plain and deploy.weights != [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8]:
         fail("{} ships as released: bf16, NVFP4 experts against NVFP4 activations and its FP8 projections; not {}".format(id, deploy))
-    w, experts, f8 = (dtype.bf16, dtype.bf16, dtype.bf16) if plain else deploy.weights
+    w, experts, f8 = (dtype.bf16, dtype.bf16, dtype.bf16) if plain else (dtype.u4g64, dtype.u4g64, dtype.u4g64) if mlx4 else deploy.weights
+    # what mlx_lm leaves unquantized: a weight no Linear or Embedding holds (the router, the conv)
+    dense = dtype.bf16 if mlx4 else w
     hidden = d.hidden
     inner = d.mamba_heads * d.mamba_head_dim
     conv_dim = inner + 2 * d.groups * d.state_dim
     bc = d.groups * d.state_dim
 
     def proj(name, kind, l, shape):
-        kept = plain or (l in BF16_AT[kind] if kind in BF16_AT else l not in FP8_AT[kind])
+        kept = plain or mlx4 or (l in BF16_AT[kind] if kind in BF16_AT else l not in FP8_AT[kind])
         return weight(shape, w if kept else f8)
 
     def mamba(l):
@@ -160,8 +168,8 @@ def layout(id, deploy):
         return struct(
             # tensor parallel: a rank holds a share of the Mamba heads and of the B/C groups
             in_proj = proj(n("in_proj"), "in_proj", l, [inner + conv_dim + d.mamba_heads, hidden]),
-            conv = weight([conv_dim, d.conv_kernel], w),
-            conv_bias = weight([conv_dim], w),
+            conv = weight([conv_dim, d.conv_kernel], dense),
+            conv_bias = weight([conv_dim], dense),
             a_log = weight([d.mamba_heads], dtype.f32),
             dt_bias = weight([d.mamba_heads], dtype.f32),
             d = weight([d.mamba_heads], dtype.f32),
@@ -185,7 +193,7 @@ def layout(id, deploy):
     def moe(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         return struct(
-            router = weight([d.experts, hidden], w),
+            router = weight([d.experts, hidden], dense),
             bias = weight([d.experts], dtype.f32),
             down_latent = proj(n("fc1_latent"), "fc1_latent", l, [d.latent, hidden]),
             up_latent = proj(n("fc2_latent"), "fc2_latent", l, [hidden, d.latent]),
@@ -329,17 +337,29 @@ def nano_layout(id, deploy):
 BF = raw(dtype.bf16)
 
 def formats(m):
-    return [format(
-        "transformers",
-        recognizes = lambda checkpoint: has("backbone.embeddings.weight"),
-        read = lambda reads: read(m, reads),
-        states = [
-            config("hidden_size", m.hidden),
-            config("num_hidden_layers", len(m.layers)),
-            config("n_routed_experts", m.experts),
-            config("mamba_num_heads", m.mamba_heads),
-        ],
-    )]
+    states = [
+        config("hidden_size", m.hidden),
+        config("num_hidden_layers", len(m.layers)),
+        config("n_routed_experts", m.experts),
+        config("mamba_num_heads", m.mamba_heads),
+    ]
+    # mlx_lm.convert's checkpoint: the release's names, each layer's experts
+    # stacked (`switch_mlp.fc1` their up legs, `fc2` their down) and the
+    # quantized weights' scales and biases beside them
+    return [
+        format(
+            "transformers",
+            recognizes = lambda checkpoint: has("backbone.embeddings.weight") and not has("backbone.embeddings.scales"),
+            read = lambda reads: read(m, reads),
+            states = states,
+        ),
+        format(
+            "mlx_lm",
+            recognizes = lambda checkpoint: has("backbone.embeddings.scales"),
+            read = lambda reads: read(m, reads, mlx = True),
+            states = states,
+        ),
+    ]
 
 def bank(reads, w, stems):
     """A routed bank: NVFP4 legs as the export stores them, or bf16 planes
@@ -353,7 +373,7 @@ def bank(reads, w, stems):
         dims[w.cut_axis] = -1
     reads.read_expr(w, concat(0, [src(s + ".weight") for s in stems]).transmute(dims, BF))
 
-def read(m, reads):
+def read(m, reads, mlx = False):
     reads.read(m.embed, "backbone.embeddings.weight")
     reads.read(m.final_norm, "backbone.norm_f.weight")
     reads.read(m.head, "lm_head.weight")
@@ -384,9 +404,13 @@ def read(m, reads):
             if f.down_latent != None:
                 read_weight(reads, f.down_latent, mixer("fc1_latent_proj.weight"), quantized = "widen")
                 read_weight(reads, f.up_latent, mixer("fc2_latent_proj.weight"), quantized = "widen")
-            expert = lambda e, leaf: mixer("experts.{}.{}".format(e, leaf))
-            bank(reads, f.up, [expert(e, "up_proj") for e in range(m.experts)])
-            bank(reads, f.down, [expert(e, "down_proj") for e in range(m.experts)])
+            if mlx:
+                reads.read(f.up, mixer("switch_mlp.fc1.weight"))
+                reads.read(f.down, mixer("switch_mlp.fc2.weight"))
+            else:
+                expert = lambda e, leaf: mixer("experts.{}.{}".format(e, leaf))
+                bank(reads, f.up, [expert(e, "up_proj") for e in range(m.experts)])
+                bank(reads, f.down, [expert(e, "down_proj") for e in range(m.experts)])
             read_weight(reads, f.shared_up, mixer("shared_experts.up_proj.weight"), quantized = "widen")
             read_weight(reads, f.shared_down, mixer("shared_experts.down_proj.weight"), quantized = "widen")
 
