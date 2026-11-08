@@ -1054,7 +1054,7 @@ fn gmm_spec(
         return None;
     }
     let (p, e) = (fan.pairs(), fan.experts);
-    let tm = tuning.moe_gmm_tm;
+    let tm = gmm_rows(p, e, tuning.moe_gmm_tm);
     let spec = Gmm {
         // Every active expert's rows round up to whole tiles.
         tiles: (p + tm - 1) / tm + e.min(p),
@@ -1068,6 +1068,21 @@ fn gmm_spec(
         orient: Orient::of(e * fan.n, fan.k),
     };
     spec.out_width().ok().map(|_| spec)
+}
+
+/// The rows of one grouped-matmul tile for `p` pairs over `e` experts: the
+/// profile's tile, doubled while an expert still holds twice its rows on
+/// average, up to 128. A tile's dot loads its expert's block into the MXU
+/// whatever its rows, so an expert's run cut into tiles of 16 loads the same
+/// weights once per 16 rows: at a 640-row prefill of Gemma-4-26B's 32-expert
+/// cut (160 rows an expert) 352 tiles where 72 of 128 rows read the same.
+fn gmm_rows(p: i64, e: i64, base: i64) -> i64 {
+    let per = p / e.min(p).max(1);
+    let mut tm = base.max(16);
+    while tm < 128 && tm * 2 <= per {
+        tm *= 2;
+    }
+    tm
 }
 
 /// The routed matmul through the grouped-matmul kernel: the pairs sorted by
