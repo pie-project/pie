@@ -217,9 +217,10 @@ impl Weights {
             bank_planes.insert(pairing.scales);
             bank_planes.extend(pairing.biases);
         }
+        let routed = routed_dense(trace, &bank_planes);
         let shape_of = |at: usize| -> (u64, u64) {
             let p = &trace.params[at];
-            if bank_planes.contains(&at) {
+            if bank_planes.contains(&at) || routed.contains(&at) {
                 bank_rectangle(p.dtype, &p.shape)
             } else {
                 rectangle(&p.shape)
@@ -714,6 +715,60 @@ fn gemm_only(
     (out, tied)
 }
 
+/// The plain (unquantized) routed banks `[E, N, K]` every reader of which
+/// is a routed matmul. They land `[E·N, K]`, as a quantized bank's planes
+/// do (`bank_rectangle`): landed `[E, N·K]`, the `[E·N, K]` every routed
+/// matmul reads is a relayout of the whole bank on the TPU (a tile of the
+/// landed plane holds rows of 8-16 experts), every layer of every fire
+/// (Gemma-4-26B-A4B's 32-expert cut on v6e: ~14 ms a layer, 2 tok/s).
+fn routed_dense(
+    trace: &Trace,
+    banks: &std::collections::BTreeSet<usize>,
+) -> std::collections::BTreeSet<usize> {
+    use poem_ir::{Def, Linear, Operands, Operation};
+    let param_of = |v: poem_ir::ValueId| match trace.values.get(v.0 as usize).map(|d| &d.def) {
+        Some(Def::Weight(p)) => Some(*p as usize),
+        _ => None,
+    };
+    let mut out = std::collections::BTreeSet::new();
+    let mut other = std::collections::BTreeSet::new();
+    let mut inputs = Vec::new();
+    for node in &trace.nodes {
+        inputs.clear();
+        node.op.inputs(&mut inputs);
+        let bank = match &node.op {
+            Operation::Linear(Linear::MoeSelect { bank, .. }) => Some(*bank),
+            Operation::Linear(Linear::MatmulGrouped { w, .. }) => Some(*w),
+            _ => None,
+        };
+        for &v in &inputs {
+            let Some(p) = param_of(v) else { continue };
+            if Some(v) == bank {
+                out.insert(p);
+            } else {
+                other.insert(p);
+            }
+        }
+    }
+    for decl in &trace.values {
+        if let Def::Merge(arms) = &decl.def {
+            other.extend(arms.iter().filter_map(|(v, _)| param_of(*v)));
+        }
+    }
+    out.retain(|&p| {
+        let param = &trace.params[p];
+        !other.contains(&p)
+            && !banks.contains(&p)
+            && param.source != ParamSource::Registered
+            && param.shape.len() >= 3
+            && matches!(
+                param.dtype,
+                Dtype::Bf16 | Dtype::F16 | Dtype::F32 | Dtype::E4m3 | Dtype::E5m2
+            )
+    });
+    out
+}
+
 /// Rows a transposed sub-byte codes plane pads its output axis to.
 pub(crate) const CODES_TILE: u64 = 128;
 
@@ -1066,9 +1121,10 @@ impl Weights {
             bank_planes.insert(pairing.scales);
             bank_planes.extend(pairing.biases);
         }
+        let routed = routed_dense(trace, &bank_planes);
         let shape_of = |at: usize| -> (u64, u64) {
             let p = &trace.params[at];
-            if bank_planes.contains(&at) {
+            if bank_planes.contains(&at) || routed.contains(&at) {
                 bank_rectangle(p.dtype, &p.shape)
             } else {
                 rectangle(&p.shape)
