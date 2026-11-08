@@ -17,7 +17,7 @@ const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
 const timestamp = @import_module("<time>");
-var tdbg = @zeros([2 + 64]u32);   // TSC: the pass start, after the argmax; the max-reduce root: each step's winner (2 + s)
+var tdbg = @zeros([2 + 64 + 4]u32);   // + [66..70): the last step's row reduction in, argmax, max-reduce done, row word out   // TSC: the pass start, after the argmax; the max-reduce root: each step's winner (2 + s)
 var tdbg_ptr: [*]u32 = &tdbg;
 var tsc = @zeros([3]u16);
 fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
@@ -157,12 +157,14 @@ fn wloop(s: u32, best: f32, id: f32) void {
     @fmovs(fout(q_wo, 2), wm_d);
     @fmovs(wm_d, fin(q_wm, 2));
   }
+  stamp(68);
   const win = @as(u32, wm[1]);
   const base = rcfg[RQ + 4];
   if (s + 1 >= n_steps) { wo[0] = -1.0e9; }
   else if (win >= base and win < base + @as(u32, VR)) { wo[0] = @as(f32, win - base); }
   else { wo[0] = -(1.0 + @as(f32, win / @as(u32, VR))); }
   @fmovs(fout(q_ww, 1), wo_d);
+  stamp(69);
 }
 
 var n_steps: u32 = 0;
@@ -174,6 +176,7 @@ task pass_task() void {
     @fmovs(fifo, fin(q_e, VR), .{ .async = true, .ut_id = ut_a });
     @fadds(fout(q_lo, VR), fin(q_w, VR), fifo, .{ .async = true, .ut_id = ut_b });
     @fmovs(t_d, fin(q_lb, VR));
+    stamp(66);
     var best: f32 = t[0];
     var bi: u16 = 0;
     var j: u16 = 1;
@@ -197,6 +200,7 @@ task pass_task() void {
     res[0] = best;
     res[1] = @as(f32, rcfg[RQ + 4] + @as(u32, bi));
     res[2] += 1.0;
+    stamp(67);
     if (wl_on) { wloop(s, best, res[1]); }
     stamp(1);
   }

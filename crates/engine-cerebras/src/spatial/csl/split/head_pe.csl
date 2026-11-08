@@ -135,6 +135,7 @@ fn init() void {
   wfl = @as(u16, rcfg[RQ + 11]);
   va_addr = color_config.get_color_config_addr(@get_color(0)) + @as(u16, rcfg[RQ + 13]);
   va_orig = @get_config(va_addr, tgt.color_addr_range) & 0xff;
+  timestamp.enable_tsc();
   role_r = @as(u16, rcfg[RQ + 7]);
   role_x = @as(u16, rcfg[RQ + 8]);
   sys_mod.unblock_cmd_stream();
@@ -232,12 +233,19 @@ fn hloop() void {
   if (to) { @fmovs(fout(q_he, H2), fin(q_hn, H2)); }   // (iq5: HS)
 }
 
+const timestamp = @import_module("<time>");
+var tdbg = @zeros([6]u32);   // TSC of the last step: start, x in, matvec done, partial sent, loop phase done
+var tdbg_ptr: [*]u32 = &tdbg;
+var tsc = @zeros([3]u16);
+fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
 var n_steps: u32 = 0;
 const pass_id: local_task_id = @get_local_task_id(8);
 task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
+    stamp(0);
     recv_x();
+    stamp(1);
     va_restore();
     @fmuls(xr_d, x_d, hg_d);
     @fmovs(y_d, 0.0);
@@ -263,8 +271,11 @@ task pass_task() void {
       }
     }
     if (HACC16 == 1) { @fh2s(y_d, yh_d); }
+    stamp(2);
     send_r();
+    stamp(3);
     if ((wfl & 1) != 0) { hloop(); }
+    stamp(4);
   }
   sys_mod.unblock_cmd_stream();
 }
@@ -288,6 +299,7 @@ comptime {
   @initialize_queue(q_he, .{ .color = C_PARK });
   @initialize_queue(q_hs, .{ .color = C_PARK });
   @export_symbol(hemb_ptr, "hemb");
+  @export_symbol(tdbg_ptr, "tdbg");
   @export_symbol(hw_ptr, "hw");
   @export_symbol(hg_ptr, "hg");
   @export_symbol(rcfg_ptr, "rcfg");
