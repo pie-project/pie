@@ -4,7 +4,7 @@
 //! its persistent disk tier, cut at its own page. A worker without one is
 //! passed over by the host.
 
-use policy::{Replicate, Site, Subject, SubjectKind, Tier, attr, candidates, capability, cluster};
+use policy::{Replicate, Site, Subject, SubjectKind, Tier, attr, candidates, capability, cluster, prop};
 
 #[derive(Default)]
 struct PersistPrefix;
@@ -31,7 +31,7 @@ impl cluster::Policy for PersistPrefix {
             .into_iter()
             .filter_map(|group| {
                 let of = Subject::Group(group.clone());
-                let tokens = u32::try_from(attr(&of, "persist-tokens").int()?).ok()?;
+                let tokens = u32::try_from(prop(&of, "persist-tokens").int()?).ok()?;
                 let at: Vec<Site> = ids(attr(&of, "sites").json()?)
                     .into_iter()
                     .map(|worker| Site {

@@ -1550,13 +1550,9 @@ impl Plane for Snapshot {
                     "state" if proc.worker.is_some() => text("running"),
                     "state" => text("pending"),
                     // Estimated from its text: the router sees no tokens.
-                    "prompt-tokens" => int(proc.prompt.as_ref().map(|blocks| {
+                    "prompt-tokens-estimate" => int(proc.prompt.as_ref().map(|blocks| {
                         (blocks.len() as f64 * PROMPT_BLOCK_BYTES as f64 * TOKENS_PER_BYTE) as u64
                     })),
-                    "max-tokens" => match proc.props.get(client_api::props::MAX_TOKENS) {
-                        Some(Value::Int(n)) if *n >= 0 => Some(Value::Int(*n)),
-                        _ => None,
-                    },
                     "arrival-ms" => Some(Value::Int(proc.arrival_ms as i64)),
                     "tenant" => text(proc.tenant.clone()),
                     "session" => proc.session.clone().and_then(text),
@@ -1564,7 +1560,7 @@ impl Plane for Snapshot {
                     _ => {
                         // What the worker holds of its prompt, estimated
                         // from its text: there are no tokens here.
-                        let worker = name.strip_prefix("cached-tokens/")?;
+                        let worker = name.strip_prefix("cached-tokens-estimate/")?;
                         let prompt = proc.prompt.as_ref()?;
                         self.workers.get(worker)?;
                         let held = self
@@ -1625,11 +1621,6 @@ impl Plane for Snapshot {
                         )
                         .unwrap_or_default(),
                     )),
-                    // The leading tokens of it a process asked kept on
-                    // disk (`persist-prefix-tokens`, `persist-system`).
-                    "persist-tokens" => group
-                        .persist_tokens
-                        .map(|tokens| Value::Int(i64::try_from(tokens).unwrap_or(i64::MAX))),
                     _ => None,
                 }
             }
@@ -1695,6 +1686,14 @@ impl Plane for Snapshot {
                 let value = self.sessions.get(id)?.get(name)?;
                 prop_value((name.to_string(), value.clone())).map(|(_, value)| value)
             }
+            // The most leading tokens of it any process holding it asked
+            // kept on disk (`persist-prefix-tokens`, `persist-system`): a
+            // request, not a measure.
+            Subject::Group(id) if name == "persist-tokens" => self
+                .groups
+                .get(id)?
+                .persist_tokens
+                .map(|tokens| Value::Int(i64::try_from(tokens).unwrap_or(i64::MAX))),
             _ => None,
         }
     }
@@ -1791,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_process_is_sized_from_its_prompt_text_and_its_limit() {
+    fn a_pending_process_is_sized_from_its_prompt_text() {
         let mut registry = Registry::default();
         let mut edges = Vec::new();
         let props = serde_json::from_value(serde_json::json!({
@@ -1811,8 +1810,11 @@ mod tests {
         );
         let plane = registry.snapshot(&table(0), &Tables::default());
         let of = |name| format!("{:?}", plane.attr(&Subject::Process("1".into()), name));
-        assert_eq!(of("prompt-tokens"), format!("{:?}", Some(Value::Int(160))));
-        assert_eq!(of("max-tokens"), format!("{:?}", Some(Value::Int(64))));
+        assert_eq!(
+            of("prompt-tokens-estimate"),
+            format!("{:?}", Some(Value::Int(160)))
+        );
+        assert_eq!(of("max-tokens"), "None", "a client's word is its prop");
     }
 
     #[test]
@@ -1843,11 +1845,15 @@ mod tests {
         let of = |id: &str, name| format!("{:?}", plane.attr(&Subject::Process(id.into()), name));
         // 1000 bytes: fifteen whole 64-byte blocks, at a guessed 16 tokens each.
         assert_eq!(
-            of("2", "cached-tokens/1"),
+            of("2", "cached-tokens-estimate/1"),
             format!("{:?}", Some(Value::Int(240)))
         );
-        assert_eq!(of("2", "cached-tokens/9"), "None", "no such worker");
-        assert_eq!(of("3", "cached-tokens/1"), "None", "no prompt");
+        assert_eq!(
+            of("2", "cached-tokens-estimate/9"),
+            "None",
+            "no such worker"
+        );
+        assert_eq!(of("3", "cached-tokens-estimate/1"), "None", "no prompt");
         assert_eq!(of("2", "cached-tokens"), "None");
     }
 
@@ -2162,7 +2168,9 @@ mod tests {
         );
         let plane = registry.snapshot(&table(0), &Tables::default());
         let attr = |name| plane.attr(&Subject::Group("g".into()), name);
-        assert!(matches!(attr("persist-tokens"), Some(Value::Int(40))));
+        let prop = |name| plane.prop(&Subject::Group("g".into()), name);
+        assert!(matches!(prop("persist-tokens"), Some(Value::Int(40))));
+        assert!(attr("persist-tokens").is_none(), "a request is a prop");
         assert!(matches!(attr("disk-sites"), Some(Value::Json(json)) if json == "[\"1\"]"));
     }
 
@@ -2248,7 +2256,11 @@ mod tests {
         let int = |n| format!("{:?}", Some(Value::Int(n)));
         assert_eq!(of("1", "worker"), format!("{:?}", text("7")));
         assert_eq!(of("1", "state"), "None");
-        assert_eq!(of("2", "prompt-tokens"), "None", "no prompt, no estimate");
+        assert_eq!(
+            of("2", "prompt-tokens-estimate"),
+            "None",
+            "no prompt, no estimate"
+        );
         assert_eq!(plane.candidates(SubjectKind::Process), ["2"]);
         let worker = |name| format!("{:?}", plane.attr(&Subject::Worker("1".into()), name));
         assert_eq!(worker("waiting"), int(5));

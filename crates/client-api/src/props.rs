@@ -48,10 +48,6 @@ pub const PERSIST_SYSTEM: &str = "persist-system";
 /// counts them (the compat inferlet sets it).
 pub const SYSTEM_TOKENS: &str = "system-tokens";
 
-/// How many tokens the prompt takes, as the inferlet that tokenized it
-/// counts them (the compat inferlet sets it once it has).
-pub const PROMPT_TOKENS: &str = "prompt-tokens";
-
 /// How many leading tokens `props` ask to be kept on disk: `persist-prefix-
 /// tokens`, else `system-tokens` under `persist-system`.
 #[must_use]

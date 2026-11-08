@@ -1,8 +1,9 @@
 //! Sends a launch where its prompt is cached, unless that piles turns on
 //! one worker (after SGLang's cache-aware router).
 //!
-//! The gateway knows what it sent where: `cached-tokens/<worker>` is how
-//! much of a launch's prompt went to that worker before. A launch goes to
+//! The gateway knows what it sent where: `cached-tokens-estimate/<worker>`
+//! is how much of a launch's prompt went to that worker before, and
+//! `prompt-tokens-estimate` how long the prompt is. A launch goes to
 //! the worker holding the most of it, if that is at least
 //! [`CACHE_THRESHOLD`] of the prompt; else to the least loaded. When the
 //! busiest worker runs [`BALANCE_ABS`] more turns than the idlest and
@@ -113,11 +114,11 @@ fn choose(of: &Subject, load: &BTreeMap<String, i64>) -> String {
     if hi - lo > BALANCE_ABS && hi as f64 > BALANCE_REL * lo as f64 {
         return idlest();
     }
-    let prompt = attr(of, "prompt-tokens").int().unwrap_or(0);
+    let prompt = attr(of, "prompt-tokens-estimate").int().unwrap_or(0);
     let best = load
         .iter()
         .map(|(w, n)| {
-            let held = attr(of, &format!("cached-tokens/{w}")).int().unwrap_or(0);
+            let held = attr(of, &format!("cached-tokens-estimate/{w}")).int().unwrap_or(0);
             (held, -n, w.clone())
         })
         .max();

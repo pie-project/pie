@@ -726,22 +726,8 @@ impl Registry {
             }
             Event::Kept(owner, tokens) => {
                 if let Some((blocks, held)) = self.prompts.get_mut(&owner) {
-                    // Tokens a block makes: the count the owner's props
-                    // claim, else a guess.
-                    let claimed = self
-                        .procs
-                        .get(&owner)
-                        .or_else(|| self.exited.get(&owner))
-                        .and_then(|proc| proc.props.get(client_api::props::PROMPT_TOKENS))
-                        .and_then(|value| match value {
-                            Value::Int(n) => u64::try_from(*n).ok(),
-                            _ => None,
-                        });
-                    let per_block = claimed
-                        .filter(|&prompt| prompt > 0 && !blocks.is_empty())
-                        .map_or(TOKENS_PER_BYTE * PROMPT_BLOCK_BYTES as f64, |prompt| {
-                            prompt as f64 / blocks.len() as f64
-                        });
+                    // Tokens a block makes, guessed from its bytes.
+                    let per_block = TOKENS_PER_BYTE * PROMPT_BLOCK_BYTES as f64;
                     let covered = blocks.len().min((tokens as f64 / per_block) as usize);
                     if covered > *held {
                         *held = covered;
@@ -917,13 +903,13 @@ impl Plane for Snapshot {
                     "waited-ms" => int(Some(proc.times(now_ms(), live).1)),
                     "worker" => Some(Value::Text(WORKER.into())),
                     "restarts" => Some(Value::Int(proc.restarts as i64)),
-                    // What the runtime mapped in once it has run; before,
-                    // what the cache holds of its prompt text.
-                    "cached-tokens" => int(proc.cached_tokens.or_else(|| {
-                        proc.prompt
-                            .as_ref()
-                            .map(|prompt| self.held.held_tokens(prompt))
-                    })),
+                    // What its fires mapped in, once one has looked.
+                    "cached-tokens" => int(proc.cached_tokens),
+                    // What the cache holds of its prompt text, guessed.
+                    "cached-tokens-estimate" => int(proc
+                        .prompt
+                        .as_ref()
+                        .map(|prompt| self.held.held_tokens(prompt))),
                     "tenant" => Some(Value::Text(proc.tenant.clone())),
                     "session" => proc.session.clone().map(Value::Text),
                     _ => None,
@@ -1351,13 +1337,14 @@ mod tests {
             ));
             schedule::plex_id(pid)
         };
-        let cached = |registry: &Registry, id: ProcessId| {
+        let read = |registry: &Registry, id: ProcessId, name: &str| {
             show(
                 registry
                     .snapshot()
-                    .attr(&Subject::Process(id.to_string()), "cached-tokens"),
+                    .attr(&Subject::Process(id.to_string()), name),
             )
         };
+        let cached = |registry: &Registry, id| read(registry, id, "cached-tokens-estimate");
         let tokens = |n: i64| show(Some(Value::Int(n)));
         let first = with_prompt(&mut registry, &text);
         let second = with_prompt(&mut registry, &format!("{text}and more"));
@@ -1365,11 +1352,21 @@ mod tests {
         // Ten 64-byte blocks' worth, at a guessed 16 tokens a block.
         registry.apply(Event::Kept(first, 160));
         assert_eq!(cached(&registry, second), tokens(160));
+        assert_eq!(
+            read(&registry, second, "cached-tokens"),
+            show(None),
+            "a guess is no measure"
+        );
         registry.apply(Event::Cached(second, 96));
         assert_eq!(
-            cached(&registry, second),
+            read(&registry, second, "cached-tokens"),
             tokens(96),
             "once it ran, what it got"
+        );
+        assert_eq!(
+            cached(&registry, second),
+            tokens(160),
+            "the guess stands apart"
         );
         let third = with_prompt(&mut registry, &text);
         registry.apply(Event::CacheEmptied(first, By::Host));
