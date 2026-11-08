@@ -531,6 +531,70 @@ fn a_long_windowed_decode_reads_only_its_window() {
     long_decode_in(8, 2, 256, Some(512));
 }
 
+/// A sliding-window decode's walk stops after the last chunk any row admits
+/// a key in: while every lane's context is shorter than the window, the
+/// chunks past it are skipped. Skipping them changes no bit of the answer:
+/// the same fire walked over every chunk of the window, unrolled, as the walk
+/// ran before its bound (`Chunks::window_reach` off), answers the same bytes.
+#[test]
+fn a_window_walk_bounded_by_its_rows_reach_answers_the_same_bits() {
+    // (q heads, kv heads, head width, window, most pages a lane holds): the
+    // first three keep every context under the window (the bound cuts the
+    // walk), the last puts some lanes past it (the bound is the whole walk).
+    for (qh, kvh, d, window, most) in [
+        (8usize, 2usize, 128usize, 1024u32, 40usize),
+        (8, 2, 256, 512, 20),
+        (16, 8, 128, 1024, 8),
+        (8, 2, 128, 256, 40),
+    ] {
+        let walked = |reach: bool| -> Option<Vec<u8>> {
+            let mut rng = Rng(11);
+            let ps = 16;
+            let lanes: Vec<Vec<i32>> = (0..64)
+                .map(|l| {
+                    (0..1 + (l * 37) % most)
+                        .map(|p| ((p * 13 + l) % 90) as i32)
+                        .collect()
+                })
+                .collect();
+            let pool = Pool::new(&mut rng, ps, kvh, d, 90, lanes, most as u32);
+            let rows: Vec<(i32, i32)> = (0..64)
+                .map(|l| {
+                    let cap = pool.capacity(l) as i32;
+                    (l as i32, cap - 1 - (l as i32 % 5).min(cap - 1))
+                })
+                .collect();
+            let fire = Fire::plain(&rows);
+            let n = rows.len();
+            let q = rng.bf16s(n * qh * d, 1.0);
+            let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
+            tuning.chunks.window_reach = reach;
+            let mut b = Bench::new().with_tuning(tuning);
+            let kv = pool.bind(&mut b);
+            let plan = fire.decode(&mut b);
+            let qt = b.bf16(n as u32, (qh * d) as u32, &q);
+            let o = b.zeros(Dtype::Bf16, n as u32, (qh * d) as u32);
+            let ran = b
+                .run(|ctx| {
+                    low::attend(
+                        ctx,
+                        attn::decode(qt, &plan, Some(window), d as u32, 0.125, o)?,
+                        kv,
+                    )
+                })
+                .unwrap();
+            ran.then(|| b.bytes(o).to_vec())
+        };
+        let (Some(bounded), Some(every)) = (walked(true), walked(false)) else {
+            return;
+        };
+        assert!(
+            bounded == every,
+            "window {window}, {kvh}x{d} kv heads: the bounded walk answered other bits than every chunk's"
+        );
+    }
+}
+
 fn long_decode(qh: usize, kvh: usize, d: usize) {
     long_decode_in(qh, kvh, d, None);
 }

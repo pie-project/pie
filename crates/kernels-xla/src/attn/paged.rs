@@ -896,7 +896,19 @@ pub(crate) fn per_row(
     if let (KeyList::Range, Some(w)) = (keys, rule.window)
         && let Some(walk) = PageWalk::of(f, planes, Some(lane), c)?
     {
-        return per_row_window(f, planes, h, rule, rows, lane, &walk, c, w, scale);
+        return per_row_window(
+            f,
+            planes,
+            h,
+            rule,
+            rows,
+            lane,
+            &walk,
+            c,
+            w,
+            scale,
+            ch.window_reach,
+        );
     }
     let n = cdiv(total, c);
     let table = match keys {
@@ -1023,6 +1035,7 @@ fn per_row_window(
     c: i64,
     window: i64,
     scale: f64,
+    bounded: bool,
 ) -> Built<Flashed> {
     let Planes::Paged { geom, .. } = *planes else {
         return bad("the per-row walk reads a paged pool");
@@ -1092,6 +1105,15 @@ fn per_row_window(
     let st = if n == 1 {
         let zero = scalar_i(f, 0);
         chunk(f, zero, &st0)?
+    } else if !bounded {
+        // Every chunk of the window, unrolled, as the walk ran before its
+        // bound (`Chunks::window_reach` off: the bit-identity check).
+        let mut st = st0;
+        for ci in 0..n {
+            let at = scalar_i(f, ci);
+            st = chunk(f, at, &st)?;
+        }
+        st
     } else {
         // The chunks any row admits a key in: row `i` reads keys up to its
         // `hi`, `cdiv(hi - base, c)` chunks from its window's first page.
