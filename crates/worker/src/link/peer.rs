@@ -583,9 +583,9 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
         let now = runtime::offload::directory::sealed_keys();
         let disk = runtime::offload::directory::persisted_keys();
         let hints = runtime::offload::directory::persist_hints();
-        let published: Vec<(String, String, String)> = runtime::policy::published()
+        let published: Vec<(String, String)> = runtime::policy::published()
             .into_iter()
-            .map(|(of, name, value)| (of, name, value.to_string()))
+            .map(|(name, value)| (name, value.to_string()))
             .collect();
         let runs: std::collections::HashMap<[u8; 32], Vec<[u8; 32]>> =
             runtime::offload::directory::cached_runs()

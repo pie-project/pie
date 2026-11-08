@@ -9,7 +9,6 @@ export type * as PieInferletModel030 from './interfaces/pie-inferlet-model.js'; 
 export type * as PieInferletPipeline030 from './interfaces/pie-inferlet-pipeline.js'; // import pie:inferlet/pipeline@0.3.0
 export type * as PieInferletReasoning030 from './interfaces/pie-inferlet-reasoning.js'; // import pie:inferlet/reasoning@0.3.0
 export type * as PieInferletSession030 from './interfaces/pie-inferlet-session.js'; // import pie:inferlet/session@0.3.0
-export type * as PieInferletSpeech030 from './interfaces/pie-inferlet-speech.js'; // import pie:inferlet/speech@0.3.0
 export type * as PieInferletSystem030 from './interfaces/pie-inferlet-system.js'; // import pie:inferlet/system@0.3.0
 export type * as PieInferletTokenizer030 from './interfaces/pie-inferlet-tokenizer.js'; // import pie:inferlet/tokenizer@0.3.0
 export type * as PieInferletTools030 from './interfaces/pie-inferlet-tools.js'; // import pie:inferlet/tools@0.3.0

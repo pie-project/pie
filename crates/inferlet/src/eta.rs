@@ -383,8 +383,11 @@ impl WorkingSet {
 
     /// The handle the launch moved in under `name`.
     pub fn take(name: &str) -> Option<WorkingSet> {
-        crate::pie::inferlet::session::take_working_set(name)
-            .map(|ws| WorkingSet { ws: Rc::new(ws) })
+        use crate::pie::inferlet::session::{Handle, HandleKind, take};
+        match take(name, HandleKind::WorkingSet)? {
+            Handle::WorkingSet(ws) => Some(WorkingSet { ws: Rc::new(ws) }),
+            _ => None,
+        }
     }
 
     /// Hands this set back to the client under the launch's `name`: every
@@ -392,7 +395,10 @@ impl WorkingSet {
     pub fn give(self, name: &str) -> Result<(), String> {
         let ws = Rc::try_unwrap(self.ws)
             .map_err(|_| format!("`{name}` is still bound to a forward pass"))?;
-        crate::pie::inferlet::session::give_working_set(name, ws)
+        crate::pie::inferlet::session::give(
+            name,
+            crate::pie::inferlet::session::Handle::WorkingSet(ws),
+        )
     }
 
     /// Lets passes write slots below `end`: needed only by a pass whose slots
@@ -405,12 +411,6 @@ impl WorkingSet {
     /// before it.
     pub fn folded(&self) -> u32 {
         self.ws.folded()
-    }
-
-    /// Slots mapped in from state the runtime already held: a prompt's cached
-    /// tokens.
-    pub fn cached_tokens(&self) -> u32 {
-        self.ws.cached_tokens()
     }
 
     /// A child sharing the frozen part, with a copy of the buffer.
@@ -1143,10 +1143,12 @@ impl Pipeline {
         wit_forward::park(&self.wit);
     }
 
-    /// How many pipelines are open on the engine, this one included.
+    /// The host's advice to a program that trades compute for latency:
+    /// whether no other pipeline is active beside this one, so its fires
+    /// batch alone. It may change from one frame to the next.
     #[must_use]
-    pub fn live() -> u32 {
-        wit_pipeline::live()
+    pub fn speculation_advised(&self) -> bool {
+        self.wit.speculation_advised()
     }
 }
 

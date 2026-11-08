@@ -62,22 +62,11 @@ class Decoder:
 
 
 
-def equip(tools: List[str]) -> List[int]:
-    """
-    Register available tools (list of JSON schema strings)
-    
-    Raises: `componentize_py_types.Err(wit_world.imports.str)`
-    """
-    raise NotImplementedError
-def answer(name: str, value: str) -> List[int]:
-    """
-    Provide a tool result (after a tool-call reply)
-    """
-    raise NotImplementedError
 def answers(results: List[Tuple[str, str]]) -> List[int]:
     """
-    Consecutive tool results (name, value), as the template writes them
-    together.
+    Tool results (name, value) that follow one another, as the template
+    writes them together. One result is a list of one; tools are declared
+    by `chat.open`.
     """
     raise NotImplementedError
 def assistant_calls(message: str, calls: List[ToolCall], current: bool) -> List[int]:
@@ -92,10 +81,5 @@ def format(tools: List[str]) -> Optional[grammar.Grammar]:
     """
     Returns the grammar that constrains well-formed tool-call output for
     this model and toolset, or none if the model has no enforceable format.
-    """
-    raise NotImplementedError
-def create_matcher(tools: List[str]) -> grammar.Matcher:
-    """
-    Create a grammar matcher to force-generate tool calls
     """
     raise NotImplementedError

@@ -1,5 +1,5 @@
 interface tools {
-    use grammar.{grammar, matcher};
+    use grammar.{grammar};
     use types.{error};
 
     /// A complete tool call parsed out of the model's output.
@@ -15,14 +15,9 @@ interface tools {
         call(tool-call),
     }
 
-    /// Register available tools (list of JSON schema strings)
-    equip: func(tools: list<string>) -> result<list<u32>, error>;
-
-    /// Provide a tool result (after a tool-call reply)
-    answer: func(name: string, value: string) -> list<u32>;
-
-    /// Consecutive tool results (name, value), as the template writes them
-    /// together.
+    /// Tool results (name, value) that follow one another, as the template
+    /// writes them together. One result is a list of one; tools are declared
+    /// by `chat.open`.
     answers: func(results: list<tuple<string, string>>) -> list<u32>;
 
     /// An earlier assistant turn: `message`, then the calls it made in the
@@ -34,9 +29,6 @@ interface tools {
     /// Returns the grammar that constrains well-formed tool-call output for
     /// this model and toolset, or none if the model has no enforceable format.
     format: func(tools: list<string>) -> option<grammar>;
-
-    /// Create a grammar matcher to force-generate tool calls
-    create-matcher: func(tools: list<string>) -> matcher;
 
     /// Detects tool calls in generated tokens.
     resource decoder {

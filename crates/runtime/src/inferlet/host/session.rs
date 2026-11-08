@@ -2,6 +2,7 @@ use crate::handle::{Kind, Moved};
 use crate::inferlet::host::frames::{Frames, Pcm, audio_extension, image_extension};
 use crate::inferlet::host::pie;
 use crate::inferlet::host::pie::inferlet::frames::{AudioFormat, ImageFormat};
+use crate::inferlet::host::pie::inferlet::session::{Handle, HandleKind};
 use crate::inferlet::process;
 use crate::inferlet::{ProcessCtx, ProcessEvent};
 use crate::server;
@@ -102,31 +103,8 @@ impl pie::inferlet::session::Host for ProcessCtx {
         Ok(Ok(()))
     }
 
-    async fn set_tokens(&mut self, prompt: u32, generated: u32) -> Result<()> {
-        crate::policy::tokens::set(
-            crate::policy::schedule::plex_id(self.id()),
-            crate::policy::tokens::Counts {
-                prompt: prompt.into(),
-                generated: generated.into(),
-            },
-        );
-        Ok(())
-    }
-
-    async fn send_to(&mut self, process: String, message: String) -> Result<Result<(), String>> {
-        let Ok(target) = process.parse::<crate::inferlet::ProcessId>() else {
-            return Ok(Err(format!("send-to: {process} is not a process id")));
-        };
-        let target = process::resolve(target);
-        let owner = process::get_client_id(self.id()).await.ok().flatten();
-        if owner.is_none() || process::get_client_id(target).await.ok().flatten() != owner {
-            return Ok(Err(format!("send-to: no process {process} of this client")));
-        }
-        crate::planner::wake(target);
-        if let Err(err) = server::inbox::send(target.to_string(), message) {
-            return Ok(Err(format!("send-to: {err}")));
-        }
-        Ok(Ok(()))
+    async fn cached_tokens(&mut self) -> Result<u32> {
+        Ok(u32::try_from(self.tokens_cached()).unwrap_or(u32::MAX))
     }
 
     async fn send(&mut self, message: String) -> Result<()> {
@@ -135,20 +113,12 @@ impl pie::inferlet::session::Host for ProcessCtx {
         Ok(())
     }
 
-    async fn send_file(&mut self, data: Vec<u8>) -> Result<()> {
+    async fn send_file(&mut self, data: Vec<u8>, name: Option<String>) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let process_id = self.id();
         if let Ok(Some(client_id)) = process::get_client_id(process_id).await {
-            server::send_file(client_id, process_id, data.into(), None)?;
-        }
-        Ok(())
-    }
-
-    async fn send_file_as(&mut self, data: Vec<u8>, name: String) -> Result<()> {
-        crate::inferlet::process::gate::residency_gate(self).await?;
-        let process_id = self.id();
-        if let Ok(Some(client_id)) = process::get_client_id(process_id).await {
-            server::send_file(client_id, process_id, data.into(), Some(bare_name(&name)))?;
+            let name = name.as_deref().map(bare_name);
+            server::send_file(client_id, process_id, data.into(), name)?;
         }
         Ok(())
     }
@@ -186,82 +156,48 @@ impl pie::inferlet::session::Host for ProcessCtx {
         Ok(ProcessCtx::file(self, &name))
     }
 
-    async fn take_working_set(
-        &mut self,
-        name: String,
-    ) -> Result<Option<Resource<crate::inferlet::host::working_set::WorkingSet>>> {
-        Ok(self
+    async fn take(&mut self, name: String, kind: HandleKind) -> Result<Option<Handle>> {
+        let moved = match kind {
+            HandleKind::WorkingSet => Kind::WorkingSet,
+            HandleKind::Matcher => Kind::Matcher,
+            HandleKind::Frames => Kind::Frames,
+            HandleKind::Pcm => Kind::Pcm,
+        };
+        let Some(rep) = self
             .handles()
-            .and_then(|handles| handles.take(&name, Kind::WorkingSet))
-            .map(Resource::new_own))
+            .and_then(|handles| handles.take(&name, moved))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(match kind {
+            HandleKind::WorkingSet => Handle::WorkingSet(Resource::new_own(rep)),
+            HandleKind::Matcher => Handle::Matcher(Resource::new_own(rep)),
+            HandleKind::Frames => Handle::Frames(Resource::new_own(rep)),
+            HandleKind::Pcm => Handle::Pcm(Resource::new_own(rep)),
+        }))
     }
 
-    async fn take_frames(&mut self, name: String) -> Result<Option<Resource<Frames>>> {
-        Ok(self
-            .handles()
-            .and_then(|handles| handles.take(&name, Kind::Frames))
-            .map(Resource::new_own))
-    }
-
-    async fn give_frames(
-        &mut self,
-        name: String,
-        f: Resource<Frames>,
-    ) -> Result<Result<(), String>> {
-        if self.gave(&name, Kind::Frames, f.rep()) {
+    async fn give(&mut self, name: String, h: Handle) -> Result<Result<(), String>> {
+        let (kind, rep, what) = match &h {
+            Handle::WorkingSet(ws) => (Kind::WorkingSet, ws.rep(), "working set"),
+            Handle::Matcher(matcher) => (Kind::Matcher, matcher.rep(), "matcher"),
+            Handle::Frames(f) => (Kind::Frames, f.rep(), "frames"),
+            Handle::Pcm(p) => (Kind::Pcm, p.rep(), "pcm"),
+        };
+        if self.gave(&name, kind, rep) {
             return Ok(Ok(()));
         }
-        pie::inferlet::frames::HostFrames::drop(self, f).await?;
-        Ok(Err(format!("this launch expects no frames `{name}`")))
-    }
-
-    async fn take_pcm(&mut self, name: String) -> Result<Option<Resource<Pcm>>> {
-        Ok(self
-            .handles()
-            .and_then(|handles| handles.take(&name, Kind::Pcm))
-            .map(Resource::new_own))
-    }
-
-    async fn give_pcm(&mut self, name: String, p: Resource<Pcm>) -> Result<Result<(), String>> {
-        if self.gave(&name, Kind::Pcm, p.rep()) {
-            return Ok(Ok(()));
+        match h {
+            Handle::WorkingSet(ws) => {
+                pie::inferlet::working_set::HostWorkingSet::drop(self, ws).await?
+            }
+            Handle::Matcher(matcher) => {
+                pie::inferlet::grammar::HostMatcher::drop(self, matcher).await?
+            }
+            Handle::Frames(f) => pie::inferlet::frames::HostFrames::drop(self, f).await?,
+            Handle::Pcm(p) => pie::inferlet::frames::HostPcm::drop(self, p).await?,
         }
-        pie::inferlet::frames::HostPcm::drop(self, p).await?;
-        Ok(Err(format!("this launch expects no pcm `{name}`")))
-    }
-
-    async fn take_matcher(
-        &mut self,
-        name: String,
-    ) -> Result<Option<Resource<crate::inferlet::host::grammar::Matcher>>> {
-        Ok(self
-            .handles()
-            .and_then(|handles| handles.take(&name, Kind::Matcher))
-            .map(Resource::new_own))
-    }
-
-    async fn give_matcher(
-        &mut self,
-        name: String,
-        matcher: Resource<crate::inferlet::host::grammar::Matcher>,
-    ) -> Result<Result<(), String>> {
-        if self.gave(&name, Kind::Matcher, matcher.rep()) {
-            return Ok(Ok(()));
-        }
-        pie::inferlet::grammar::HostMatcher::drop(self, matcher).await?;
-        Ok(Err(format!("this launch expects no matcher `{name}`")))
-    }
-
-    async fn give_working_set(
-        &mut self,
-        name: String,
-        ws: Resource<crate::inferlet::host::working_set::WorkingSet>,
-    ) -> Result<Result<(), String>> {
-        if self.gave(&name, Kind::WorkingSet, ws.rep()) {
-            return Ok(Ok(()));
-        }
-        pie::inferlet::working_set::HostWorkingSet::drop(self, ws).await?;
-        Ok(Err(format!("this launch expects no working set `{name}`")))
+        Ok(Err(format!("this launch expects no {what} `{name}`")))
     }
 
     async fn receive_blocking(&mut self) -> Result<Option<String>> {

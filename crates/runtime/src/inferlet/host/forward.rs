@@ -378,6 +378,10 @@ impl ProcessCtx {
         }
         crate::inferlet::process::ensure_execution_admitted(self).await;
         crate::inferlet::process::gate::residency_gate(self).await?;
+        let pipeline = self.ctx().table.get(&on)?;
+        if !pipeline.scope.is_closed() {
+            pipeline.set_active(true);
+        }
         crate::pipeline::fire::submit_frame(self, on, slot_reps).await
     }
 }
@@ -1019,7 +1023,7 @@ impl ProcessCtx {
                 if total > max_rows as u64 {
                     return Ok(Err(format!(
                         "this pass's lanes bind {total} rows; one fire carries at most \
-                         {max_rows} (`model.max-latent-rows()`)"
+                         {max_rows} (`model.max-pass-rows()`)"
                     )));
                 }
                 Some(FloatPass {

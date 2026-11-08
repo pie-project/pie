@@ -57,12 +57,11 @@ class TestGrammar:
 
 
 class TestTools:
-    def test_equip_answer_format(self):
-        assert tools.equip(["a", "b"]) == [10, 2]
-        assert tools.answer("f", "xyz") == [11, 1, 3]
+    def test_answers_calls_format(self):
+        assert tools.answers([("f", "xyz"), ("g", "")]) == [11, 4, 1]
+        assert tools.assistant_calls("", [tools.ToolCall("f", "{}")], True) == [12, 1, 1]
         assert tools.format([]) is None
         assert str(tools.format(["a"])) == "tools"
-        assert tools.create_matcher(["a"]).mask() == [0b101]
 
     def test_decoder_events(self):
         d = tools.Decoder()

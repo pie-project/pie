@@ -83,15 +83,15 @@ class Matcher:
     @classmethod
     def take(cls, name: str) -> "Matcher":
         """The handle the launch moved in under `name`, once."""
-        inner = _wit_session.take_matcher(name)
-        if inner is None:
+        handle = _wit_session.take(name, _wit_session.HandleKind.MATCHER)
+        if handle is None:
             raise GrammarError(f"the launch moved in no matcher `{name}`")
-        return cls._wrap(inner)
+        return cls._wrap(handle.value)
 
     def give(self, name: str) -> None:
         """Hands this matcher back to the client under the launch's `name`. Unusable after."""
         inner, self._inner = self._inner, None
-        _wit("give", _wit_session.give_matcher, name, inner)
+        _wit("give", _wit_session.give, name, _wit_session.Handle_Matcher(inner))
 
     def accept_tokens(self, token_ids: Sequence[int]) -> None:
         """Advance the match by ``token_ids``; a token the grammar forbids

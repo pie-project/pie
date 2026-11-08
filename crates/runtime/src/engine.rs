@@ -131,13 +131,3 @@ pub mod verbs {
         }
     }
 }
-
-pub async fn generate_audio(
-    _engine_idx: EngineId,
-    _prompt: &[u32],
-    _max_frames: u32,
-) -> anyhow::Result<Vec<f32>> {
-    Err(anyhow::anyhow!(
-        "generate_audio is not wired to engine backends yet"
-    ))
-}

@@ -17,9 +17,9 @@ interface reads {
     ///   replication table asks for) and `retention/key` (the key its
     ///   retention table names; none is key 0);
     /// - any subject's `published/<program>/<name>`, what that program
-    ///   published (`cluster-writes.publish`). On a worker subject, a
-    ///   worker policy's own `published/<name>` shares the prefix; where a
-    ///   name reads as both, the cluster program's value is the one read.
+    ///   published (`cluster-writes.publish`), and a worker's
+    ///   `published/@worker/<name>`, what its own worker policy published
+    ///   (`worker-writes.publish`).
     ///
     /// A launch's gate holds it until every program has heard it and the
     /// edges their calls' changes carry have reached the others, so a
@@ -69,10 +69,10 @@ interface worker-writes {
     /// Where passes run: `default` for every process no entry names.
     install-offload: func(entries: list<tuple<id, offload>>, default: option<offload>);
 
-    /// A value for the cluster plane to read, as attr `published/<name>` of
-    /// `of`: this worker, or a process on it. Level-triggered; `none`
-    /// withdraws it. The one way a worker policy speaks to the cluster.
-    publish: func(of: subject, name: string, val: option<value>);
+    /// A value for the cluster plane to read, as this worker's attr
+    /// `published/@worker/<name>`. Level-triggered; `none` withdraws it. The
+    /// one way a worker policy speaks to the cluster.
+    publish: func(name: string, val: option<value>);
 }
 
 /// The cluster plane's process tables.

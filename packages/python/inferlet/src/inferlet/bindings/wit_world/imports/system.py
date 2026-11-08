@@ -13,19 +13,9 @@ from componentize_py_async_support.streams import StreamReader, StreamWriter, By
 from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
-def version() -> str:
-    """
-    Returns the runtime version string
-    """
-    raise NotImplementedError
 def instance_id() -> str:
     """
     Returns a unique identifier for the running instance
-    """
-    raise NotImplementedError
-def username() -> str:
-    """
-    Returns the username of the user who invoked the inferlet
     """
     raise NotImplementedError
 def declare_restartable() -> None:

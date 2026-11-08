@@ -53,10 +53,9 @@ pub mod latent;
 pub mod model {
     pub use crate::pie::inferlet::model::{
         BlockDrafter, InputAxis, InputDecl, LaneDecl, LatentSpace, OutputDecl, RowCount,
-        ScheduleFact, ScheduleKind, SwitchDecl, architecture, channel_capacity,
-        default_system_speculation, draft_block, frame_size, kv_page_size, lane, latent,
-        max_latent_rows, name, output_vocab_size, rs_state_size, run_ahead_window, schedule,
-        submit_deadline_us, switches,
+        ScheduleFact, ScheduleKind, SwitchDecl, architecture, channel_capacity, draft_block,
+        frame_size, kv_page_size, lane, latent, max_pass_rows, name, output_vocab_size,
+        rs_state_size, run_ahead_window, schedule, submit_deadline_us, switches,
     };
 
     /// What a lane under these `(name, value)` switches binds.
@@ -109,29 +108,35 @@ pub(crate) fn handle_marker<'de, D: serde::Deserializer<'de>>(
 
 pub mod frames {
     pub use crate::pie::inferlet::frames::{AudioFormat, Frames, ImageFormat, Pcm};
-    use crate::pie::inferlet::session;
+    use crate::pie::inferlet::session::{self, Handle, HandleKind};
 
     impl Frames {
         /// The handle the launch moved in under `name`.
         pub fn take(name: &str) -> Option<Frames> {
-            session::take_frames(name)
+            match session::take(name, HandleKind::Frames)? {
+                Handle::Frames(frames) => Some(frames),
+                _ => None,
+            }
         }
 
         /// Hands these pictures to the client under the launch's `name`.
         pub fn give(self, name: &str) -> Result<(), String> {
-            session::give_frames(name, self)
+            session::give(name, Handle::Frames(self))
         }
     }
 
     impl Pcm {
         /// The handle the launch moved in under `name`.
         pub fn take(name: &str) -> Option<Pcm> {
-            session::take_pcm(name)
+            match session::take(name, HandleKind::Pcm)? {
+                Handle::Pcm(pcm) => Some(pcm),
+                _ => None,
+            }
         }
 
         /// Hands this sound to the client under the launch's `name`.
         pub fn give(self, name: &str) -> Result<(), String> {
-            session::give_pcm(name, self)
+            session::give(name, Handle::Pcm(self))
         }
     }
 
@@ -162,12 +167,17 @@ pub mod grammar {
     impl Matcher {
         /// The handle the launch moved in under `name`.
         pub fn take(name: &str) -> Option<Matcher> {
-            crate::pie::inferlet::session::take_matcher(name)
+            use crate::pie::inferlet::session::{Handle, HandleKind, take};
+            match take(name, HandleKind::Matcher)? {
+                Handle::Matcher(matcher) => Some(matcher),
+                _ => None,
+            }
         }
 
         /// Hands this matcher back to the client under the launch's `name`.
         pub fn give(self, name: &str) -> Result<(), String> {
-            crate::pie::inferlet::session::give_matcher(name, self)
+            use crate::pie::inferlet::session::{Handle, give};
+            give(name, Handle::Matcher(self))
         }
     }
 

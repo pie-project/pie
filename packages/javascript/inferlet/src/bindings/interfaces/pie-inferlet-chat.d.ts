@@ -11,20 +11,13 @@ export function prefix(): Uint32Array;
 export function system(message: string): Uint32Array;
 export function firstUser(message: string): Uint32Array;
 export function user(message: string): Uint32Array;
-export function systemUser(system: string, user: string): Uint32Array;
 export function assistant(message: string): Uint32Array;
-/**
- * The system turn of a request the model answers with thinking, as its
- * template renders it: the template's reasoning-effort instruction ahead
- * of `message`, in a system turn of its own when `message` is `none`.
- * `system(message)` (or nothing) where the template has no instruction.
- */
-export function systemThinking(message: string | undefined, effort: ReasoningEffort): Uint32Array;
 /**
  * The system turn a conversation opens with, as the template writes it
  * from the request's system message, its tools, and the reasoning effort
  * of a request the model answers with thinking (`none` for one it
- * answers without).
+ * answers without). Some templates fold the tools, or the effort, into
+ * the system turn, so this is the one way to open with them.
  */
 export function open(system: string | undefined, tools: Array<string>, effort: ReasoningEffort | undefined): Uint32Array;
 /**

@@ -55,6 +55,8 @@ pub struct ProcessCtx {
     admission_wait_us: u64,
     residency_flag: Option<Arc<AtomicBool>>,
     limits: wasmtime::StoreLimits,
+    /// Prompt tokens this process's fires found cached and mapped in.
+    cached_tokens: u64,
 }
 
 impl Drop for ProcessCtx {
@@ -229,6 +231,7 @@ impl ProcessCtx {
             execution_admitted: false,
             admission_wait_us: 0,
             residency_flag: None,
+            cached_tokens: 0,
             limits: wasmtime::StoreLimitsBuilder::new()
                 .memory_size(policy.memory_limit)
                 .build(),
@@ -241,6 +244,14 @@ impl ProcessCtx {
 
     pub fn id(&self) -> ProcessId {
         self.id
+    }
+
+    pub(crate) fn tokens_cached(&self) -> u64 {
+        self.cached_tokens
+    }
+
+    pub(crate) fn add_cached_tokens(&mut self, rows: u64) {
+        self.cached_tokens = self.cached_tokens.saturating_add(rows);
     }
 
     pub(crate) fn is_resident_fast(&mut self) -> bool {

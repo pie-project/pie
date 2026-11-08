@@ -14,7 +14,6 @@ use client_api::props::{PROMPT_BLOCK_BYTES, PromptIndex, TOKENS_PER_BYTE};
 use super::program::{self, Commit, Fault, LoadError, Plane, Program, Retention, Table};
 use super::retention;
 use super::schedule;
-use super::tokens;
 use super::wit::{self, Edge, Subject, SubjectKind, Value};
 use super::{By, Event, Outcome};
 use crate::inferlet::process::{self, ProcessId};
@@ -312,13 +311,8 @@ fn enact(registry: &mut Registry, commit: Commit, policy: &str) {
             None => (registry.cache.discard)(owner),
         }
     }
-    for (of, name, value) in commit.publish {
-        let of = match of {
-            Subject::Worker(_) => "worker".to_string(),
-            Subject::Process(id) => format!("process:{id}"),
-            _ => continue,
-        };
-        super::publish(of, name, value.and_then(|v| wit_json(&v)));
+    for (name, value) in commit.publish {
+        super::publish(name, value.and_then(|v| wit_json(&v)));
     }
 }
 
@@ -614,9 +608,9 @@ impl Registry {
             }
             Event::Cached(pid, tokens) => {
                 let id = schedule::plex_id(pid);
-                tracing::debug!(process = %id, tokens, "worker policy: cached tokens looked up");
+                tracing::debug!(process = %id, tokens, "worker policy: a fire mapped in cached tokens");
                 if let Some(proc) = self.procs.get_mut(&id) {
-                    proc.cached_tokens = Some(proc.cached_tokens.unwrap_or(0).max(tokens));
+                    proc.cached_tokens = Some(proc.cached_tokens.unwrap_or(0) + tokens);
                 }
                 None
             }
@@ -654,11 +648,7 @@ impl Registry {
                     return Vec::new();
                 };
                 proc.settle(now_ms());
-                tracing::debug!(
-                    process = %id,
-                    counts = ?tokens::get(id),
-                    "worker policy: a process exited"
-                );
+                tracing::debug!(process = %id, "worker policy: a process exited");
                 self.exited.insert(id, proc.clone());
                 let exited = Edge::Exited(wit::Exit {
                     process: id.to_string(),
@@ -736,14 +726,8 @@ impl Registry {
             }
             Event::Kept(owner, tokens) => {
                 if let Some((blocks, held)) = self.prompts.get_mut(&owner) {
-                    // Tokens a block makes: the owner's own count where it
-                    // gave one, else a guess.
-                    let per_block = tokens::get(owner)
-                        .map(|counts| counts.prompt)
-                        .filter(|&prompt| prompt > 0 && !blocks.is_empty())
-                        .map_or(TOKENS_PER_BYTE * PROMPT_BLOCK_BYTES as f64, |prompt| {
-                            prompt as f64 / blocks.len() as f64
-                        });
+                    // Tokens a block makes, guessed from its bytes.
+                    let per_block = TOKENS_PER_BYTE * PROMPT_BLOCK_BYTES as f64;
                     let covered = blocks.len().min((tokens as f64 / per_block) as usize);
                     if covered > *held {
                         *held = covered;
@@ -910,28 +894,22 @@ impl Plane for Snapshot {
                     (None, Some(proc)) => (proc, false),
                     (None, None) => return None,
                 };
-                let counts = || ProcessId::from_str(id).ok().and_then(tokens::get);
                 let int = |n: Option<u64>| n.map(|n| Value::Int(n as i64));
                 match name {
                     "state" if live => Some(Value::Text(proc.state.name().into())),
                     "state" => None,
-                    "prompt-tokens" => int(counts().map(|c| c.prompt)),
-                    "generated-tokens" => int(counts().map(|c| c.generated)),
                     "arrival-ms" => Some(Value::Int(proc.arrival_ms as i64)),
                     "service-ms" => int(Some(proc.times(now_ms(), live).0)),
                     "waited-ms" => int(Some(proc.times(now_ms(), live).1)),
-                    "first-token-ms" => int(ProcessId::from_str(id)
-                        .ok()
-                        .and_then(tokens::first_token_ms)),
                     "worker" => Some(Value::Text(WORKER.into())),
                     "restarts" => Some(Value::Int(proc.restarts as i64)),
-                    // What the runtime mapped in once it has run; before,
-                    // what the cache holds of its prompt text.
-                    "cached-tokens" => int(proc.cached_tokens.or_else(|| {
-                        proc.prompt
-                            .as_ref()
-                            .map(|prompt| self.held.held_tokens(prompt))
-                    })),
+                    // What its fires mapped in, once one has looked.
+                    "cached-tokens" => int(proc.cached_tokens),
+                    // What the cache holds of its prompt text, guessed.
+                    "cached-tokens-estimate" => int(proc
+                        .prompt
+                        .as_ref()
+                        .map(|prompt| self.held.held_tokens(prompt))),
                     "tenant" => Some(Value::Text(proc.tenant.clone())),
                     "session" => proc.session.clone().map(Value::Text),
                     _ => None,
@@ -1318,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn a_process_counts_its_own_tokens_and_the_call_about_its_exit_still_reads_them() {
+    fn the_call_about_a_process_exit_still_reads_it() {
         let mut registry = Registry::new(TEST_CACHE);
         let id = arrive(&mut registry, "t", None);
         let of = |registry: &Registry, name| {
@@ -1328,21 +1306,7 @@ mod tests {
                     .attr(&Subject::Process(id.to_string()), name),
             )
         };
-        let int = |n| show(Some(Value::Int(n)));
-        assert_eq!(of(&registry, "prompt-tokens"), show(None));
-        tokens::set(
-            id,
-            tokens::Counts {
-                prompt: 100,
-                generated: 7,
-            },
-        );
-        assert_eq!(of(&registry, "prompt-tokens"), int(100));
-        assert_eq!(of(&registry, "generated-tokens"), int(7));
-
-        tokens::exit(id);
         registry.apply(Event::Exited(id, Outcome::Completed));
-        assert_eq!(of(&registry, "generated-tokens"), int(7));
         assert_eq!(of(&registry, "tenant"), show(Some(Value::Text("t".into()))));
         assert_eq!(of(&registry, "state"), show(None), "not live");
         let plane = registry.snapshot();
@@ -1373,13 +1337,14 @@ mod tests {
             ));
             schedule::plex_id(pid)
         };
-        let cached = |registry: &Registry, id: ProcessId| {
+        let read = |registry: &Registry, id: ProcessId, name: &str| {
             show(
                 registry
                     .snapshot()
-                    .attr(&Subject::Process(id.to_string()), "cached-tokens"),
+                    .attr(&Subject::Process(id.to_string()), name),
             )
         };
+        let cached = |registry: &Registry, id| read(registry, id, "cached-tokens-estimate");
         let tokens = |n: i64| show(Some(Value::Int(n)));
         let first = with_prompt(&mut registry, &text);
         let second = with_prompt(&mut registry, &format!("{text}and more"));
@@ -1387,11 +1352,21 @@ mod tests {
         // Ten 64-byte blocks' worth, at a guessed 16 tokens a block.
         registry.apply(Event::Kept(first, 160));
         assert_eq!(cached(&registry, second), tokens(160));
+        assert_eq!(
+            read(&registry, second, "cached-tokens"),
+            show(None),
+            "a guess is no measure"
+        );
         registry.apply(Event::Cached(second, 96));
         assert_eq!(
-            cached(&registry, second),
+            read(&registry, second, "cached-tokens"),
             tokens(96),
             "once it ran, what it got"
+        );
+        assert_eq!(
+            cached(&registry, second),
+            tokens(160),
+            "the guess stands apart"
         );
         let third = with_prompt(&mut registry, &text);
         registry.apply(Event::CacheEmptied(first, By::Host));
@@ -1424,7 +1399,7 @@ mod tests {
         assert_eq!(
             of(&registry, gone),
             show(Some(Value::Int(32))),
-            "its longest hit"
+            "what its fires mapped in"
         );
         assert_eq!(of(&registry, live), show(None), "it never looked");
 

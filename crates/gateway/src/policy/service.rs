@@ -393,14 +393,6 @@ impl Cluster {
         });
     }
 
-    pub fn counted(&self, req: &Request, prompt: u64, generated: u64) {
-        self.send(ProcessEvent::Counted {
-            req: req.req_id.0,
-            prompt,
-            generated,
-        });
-    }
-
     pub fn session_props(&self, id: String, changes: Props) {
         if self.active() {
             let mut told = self.shared.told.lock().unwrap();

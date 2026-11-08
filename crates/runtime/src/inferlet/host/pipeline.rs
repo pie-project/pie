@@ -6,11 +6,7 @@ pub use crate::pipeline::Pipeline;
 
 use super::pie;
 
-impl pie::inferlet::pipeline::Host for ProcessCtx {
-    async fn live(&mut self) -> anyhow::Result<u32> {
-        Ok(u32::try_from(Pipeline::live()).unwrap_or(u32::MAX))
-    }
-}
+impl pie::inferlet::pipeline::Host for ProcessCtx {}
 
 impl pie::inferlet::pipeline::HostPipeline for ProcessCtx {
     async fn new(&mut self) -> anyhow::Result<Resource<Pipeline>> {
@@ -19,6 +15,10 @@ impl pie::inferlet::pipeline::HostPipeline for ProcessCtx {
         self.register_pipeline(&pipeline.scope, &pipeline.fires);
         crate::scheduler::worker::notify_lane_open(pipeline.scope.scheduler_id(), self.id());
         Ok(self.ctx().table.push(pipeline)?)
+    }
+
+    async fn speculation_advised(&mut self, this: Resource<Pipeline>) -> anyhow::Result<bool> {
+        Ok(self.ctx().table.get(&this)?.speculation_advised())
     }
 
     async fn close(&mut self, this: Resource<Pipeline>) -> anyhow::Result<()> {

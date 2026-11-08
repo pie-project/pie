@@ -44,12 +44,6 @@ class WorkingSet:
         length before it.
         """
         raise NotImplementedError
-    def cached_tokens(self) -> int:
-        """
-        Slots mapped in from state the runtime already held: a prompt's
-        cached tokens.
-        """
-        raise NotImplementedError
     def fork(self, on: pipeline.Pipeline) -> Self:
         """
         A child that shares the frozen part and gets a copy of the buffer,

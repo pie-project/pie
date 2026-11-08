@@ -181,12 +181,6 @@ impl TurnRouter for RouteBackend {
         located.launches.insert(req, process.to_string());
     }
 
-    fn counted(&self, req: &Request, prompt: u64, generated: u64) {
-        if let Some(router) = self.router_for(req) {
-            router.counted(req, prompt, generated);
-        }
-    }
-
     fn moved(&self, req: &Request, worker: Option<WorkerId>, why: &str) {
         if let Some(router) = self.router_for(req) {
             router.moved(req, worker, why);

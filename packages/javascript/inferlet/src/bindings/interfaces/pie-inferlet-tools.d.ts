@@ -1,15 +1,8 @@
 /** @module Interface pie:inferlet/tools@0.3.0 **/
 /**
- * Register available tools (list of JSON schema strings)
- */
-export function equip(tools: Array<string>): Uint32Array;
-/**
- * Provide a tool result (after a tool-call reply)
- */
-export function answer(name: string, value: string): Uint32Array;
-/**
- * Consecutive tool results (name, value), as the template writes them
- * together.
+ * Tool results (name, value) that follow one another, as the template
+ * writes them together. One result is a list of one; tools are declared
+ * by `chat.open`.
  */
 export function answers(results: Array<[string, string]>): Uint32Array;
 /**
@@ -24,12 +17,7 @@ export function assistantCalls(message: string, calls: Array<ToolCall>, current:
  * this model and toolset, or none if the model has no enforceable format.
  */
 export function format(tools: Array<string>): Grammar | undefined;
-/**
- * Create a grammar matcher to force-generate tool calls
- */
-export function createMatcher(tools: Array<string>): Matcher;
 export type Grammar = import('./pie-inferlet-grammar.js').Grammar;
-export type Matcher = import('./pie-inferlet-grammar.js').Matcher;
 export type Error = import('./pie-inferlet-types.js').Error;
 /**
  * A complete tool call parsed out of the model's output.

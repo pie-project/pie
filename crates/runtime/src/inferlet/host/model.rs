@@ -58,10 +58,6 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(model::model().arch().to_string())
     }
 
-    async fn default_system_speculation(&mut self) -> Result<bool> {
-        Ok(false)
-    }
-
     async fn draft_block(&mut self) -> Result<Option<pie::inferlet::model::BlockDrafter>> {
         let caps = model::model().eta_caps();
         Ok(
@@ -148,7 +144,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
             }))
     }
 
-    async fn max_latent_rows(&mut self) -> Result<u32> {
+    async fn max_pass_rows(&mut self) -> Result<u32> {
         let limits = crate::engine::get_spec(0)?.limits;
         Ok(u32::try_from(limits.max_forward_tokens).unwrap_or(u32::MAX))
     }

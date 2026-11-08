@@ -277,9 +277,9 @@ export class WorkingSet {
 
   /** The handle the launch moved in under `name`, once. */
   static take(name: string): WorkingSet {
-    const ws = witSession.takeWorkingSet(name);
-    if (ws === undefined) throw new Error(`the launch moved in no handle \`${name}\``);
-    return WorkingSet.wrap(ws);
+    const handle = witSession.take(name, 'working-set');
+    if (handle?.tag !== 'working-set') throw new Error(`the launch moved in no handle \`${name}\``);
+    return WorkingSet.wrap(handle.val);
   }
 
   /** The handle a client wrote in the input as `{"$handle": name}`. */
@@ -289,7 +289,7 @@ export class WorkingSet {
 
   /** Hands this set back to the client under the launch's `name`. Unusable after. */
   give(name: string): void {
-    wit('give', () => witSession.giveWorkingSet(name, this.ws));
+    wit('give', () => witSession.give(name, { tag: 'working-set', val: this.ws }));
   }
 
   /** Lets passes write slots below `end`; needed only when the device computes the slots. */
@@ -300,11 +300,6 @@ export class WorkingSet {
   /** The frozen length; while a device-counted fold is in flight, the length before it. */
   folded(): number {
     return this.ws.folded();
-  }
-
-  /** Slots the runtime mapped in from state it already held rather than computed. */
-  cachedTokens(): number {
-    return this.ws.cachedTokens();
   }
 
   /** A child sharing the frozen part, with a copy of the buffer. */

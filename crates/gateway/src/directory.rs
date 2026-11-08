@@ -62,7 +62,7 @@ impl Directory {
         self.view.pools.clone()
     }
 
-    /// What each worker's policy published about the worker itself.
+    /// What each worker's policy published about it.
     pub fn published_by_workers(&self) -> HashMap<WorkerId, HashMap<String, serde_json::Value>> {
         self.view
             .published

@@ -628,10 +628,6 @@ async fn run_turn(
                     return TurnEnd::Aborted;
                 };
                 let terminal = turn_terminal(&msg, corr, proc_launch, &mut process_id);
-                if terminal {
-                    // Ahead of the exit, which its client may leave on.
-                    push_counted(gateway, req_id, process_id.as_deref()).await;
-                }
                 match gateway.push_tokens(push_ctx(), req_id, Tokens::Chunk(msg)).await {
                     Ok(Control::Continue) => {}
                     Ok(Control::Abort) => {
@@ -652,19 +648,6 @@ async fn run_turn(
             }
         }
     }
-}
-
-async fn push_counted(gateway: &GatewayInboundClient, req_id: ReqId, process_id: Option<&str>) {
-    let Some(counts) = process_id
-        .and_then(|pid| pid.parse().ok())
-        .and_then(runtime::policy::tokens::get)
-    else {
-        return;
-    };
-    // A transport error is the Eos's to report.
-    let _ = gateway
-        .counted(push_ctx(), req_id, counts.prompt, counts.generated)
-        .await;
 }
 
 async fn push_eos(gateway: &GatewayInboundClient, req_id: ReqId) -> TurnEnd {
@@ -750,6 +733,12 @@ enum ProcBinding {
 impl ProcBinding {
     fn of(m: &ClientMessage) -> Self {
         match m {
+            // A detached launch sends nothing after its answer, so its turn
+            // ends there.
+            ClientMessage::LaunchProcess {
+                capture_outputs: false,
+                ..
+            } => Self::None,
             ClientMessage::LaunchProcess { .. } | ClientMessage::ReadHandle { .. } => {
                 Self::FromReply
             }
@@ -784,6 +773,33 @@ mod handle_turn_tests {
             ok,
             result: "why, or an id".to_string(),
         }
+    }
+
+    #[test]
+    fn a_detached_launch_ends_its_turn_at_its_answer() {
+        let launch = |capture_outputs| ClientMessage::LaunchProcess {
+            corr_id: 3,
+            inferlet: "probe".to_string(),
+            input: String::new(),
+            capture_outputs,
+            props: Default::default(),
+            session: None,
+            files: Default::default(),
+            handles: Default::default(),
+            returns: Default::default(),
+            cluster_props: Default::default(),
+            executors: Vec::new(),
+        };
+        assert!(ProcBinding::of(&launch(true)).is_process());
+        let detached = ProcBinding::of(&launch(false));
+        assert!(!detached.is_process());
+        let mut process = None;
+        assert!(turn_terminal(
+            &reply(true),
+            Some(3),
+            detached.is_process(),
+            &mut process
+        ));
     }
 
     #[test]

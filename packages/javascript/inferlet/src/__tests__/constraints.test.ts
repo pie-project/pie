@@ -61,12 +61,11 @@ describe('grammar', () => {
 });
 
 describe('tools', () => {
-  it('equips, answers, formats', () => {
-    expect(Array.from(tools.equip(['a', 'b']))).toEqual([10, 2]);
-    expect(Array.from(tools.answer('f', 'xyz'))).toEqual([11, 1, 3]);
+  it('answers, replays calls, formats', () => {
+    expect(Array.from(tools.answers([['f', 'xyz'], ['g', '']]))).toEqual([11, 4, 1]);
+    expect(Array.from(tools.assistantCalls('', [{ name: 'f', argumentsJson: '{}' }], true))).toEqual([12, 1, 1]);
     expect(tools.format([])).toBeUndefined();
     expect(tools.format(['a'])!.toString()).toBe('tools');
-    expect(Array.from(tools.createMatcher(['a']).mask())).toEqual([0b101]);
   });
 
   it('decodes events', () => {

@@ -62,7 +62,6 @@ def _make_model() -> types.ModuleType:
     m.SwitchDecl = SwitchDeclStub
     m.name = lambda: "mock-model"
     m.architecture = lambda: "qwen3_5"
-    m.default_system_speculation = lambda: False
     m.submit_deadline_us = lambda: 50_000
     m.output_vocab_size = lambda: 151936
     m.kv_page_size = lambda: 16
@@ -171,15 +170,20 @@ class SessionSpy:
 
     def __init__(self) -> None:
         self.sent: list[str] = []
-        self.sent_files: list[bytes] = []
+        self.sent_files: list[tuple[bytes, str | None]] = []
         self.to_receive: list[str | None] = []
         self.files_to_receive: list[bytes | None] = []
+        # What the launch moved in, by name: (kind, handle).
+        self.moved_in: dict[str, tuple[object, object]] = {}
+        self.given: list[tuple[str, object]] = []
 
     def reset(self) -> None:
         self.sent.clear()
         self.sent_files.clear()
         self.to_receive.clear()
         self.files_to_receive.clear()
+        self.moved_in.clear()
+        self.given.clear()
 
 
 SESSION_SPY = SessionSpy()
@@ -194,16 +198,32 @@ def _make_session(spy: SessionSpy) -> types.ModuleType:
     async def receive() -> str | None:
         return spy.to_receive.pop(0) if spy.to_receive else None
 
-    def send_file(data: bytes) -> None:
-        spy.sent_files.append(data)
+    def send_file(data: bytes, name: str | None) -> None:
+        spy.sent_files.append((data, name))
 
     async def receive_file() -> bytes | None:
         return spy.files_to_receive.pop(0) if spy.files_to_receive else None
+
+    m.HandleKind = enum.Enum("HandleKind", ["WORKING_SET", "MATCHER", "FRAMES", "PCM"])
+    for case in ("WorkingSet", "Matcher", "Frames", "Pcm"):
+        setattr(m, f"Handle_{case}", dataclass(type(f"Handle_{case}", (), {"__annotations__": {"value": object}})))
+
+    def take(name: str, kind):
+        held = spy.moved_in.get(name)
+        if held is None or held[0] != kind:
+            return None
+        del spy.moved_in[name]
+        return held[1]
+
+    def give(name: str, h) -> None:
+        spy.given.append((name, h))
 
     m.send = send
     m.receive = receive
     m.send_file = send_file
     m.receive_file = receive_file
+    m.take = take
+    m.give = give
     return m
 
 
@@ -272,15 +292,17 @@ def _make_chat() -> types.ModuleType:
     m.prefix = lambda: [0]
     m.system = lambda message: [1, *(ord(c) for c in message)]
     m.first_user = lambda message: [2, *(ord(c) for c in message)]
-    m.system_user = lambda system, user: [4, *(ord(c) for c in system), *(ord(c) for c in user)]
-    m.first_user = lambda message: [2, *(ord(c) for c in message)]
     m.user = lambda message: [3, *(ord(c) for c in message)]
-    m.system_user = lambda system, user: [4]
     m.assistant = lambda message: [5, *(ord(c) for c in message)]
     m.cue = lambda: [6]
     m.cue_without_thinking = lambda: [6, 7]
     m.ReasoningEffort = enum.Enum("ReasoningEffort", ["XHIGH", "MEDIUM", "LOW"])
-    m.system_thinking = lambda message, effort: [1, effort.value, *(ord(c) for c in message or "")]
+    m.open = lambda system, tools, effort: [
+        1,
+        *(ord(c) for c in system or ""),
+        len(tools),
+        effort.value if effort else 0,
+    ]
     m.seal = lambda: [7]
     m.stop_tokens = lambda: [8, 9]
     return m
@@ -415,9 +437,6 @@ class WorkingSetStub:
         pass
 
     def folded(self) -> int:
-        return 0
-
-    def cached_tokens(self) -> int:
         return 0
 
     def fork(self, on):
@@ -595,10 +614,9 @@ def _make_tools() -> types.ModuleType:
     m.Event_Call = ToolsEventCall
     m.ToolCall = ToolCallStub
     m.Decoder = ToolsDecoderStub
-    m.equip = lambda tools: [10, len(tools)]
-    m.answer = lambda name, value: [11, len(name), len(value)]
+    m.answers = lambda results: [11, *(len(name) + len(value) for name, value in results)]
+    m.assistant_calls = lambda message, calls, current: [12, len(calls), int(current)]
     m.format = lambda tools: GrammarStub("tools") if tools else None
-    m.create_matcher = lambda tools: MatcherStub(GrammarStub("tools"))
     return m
 
 

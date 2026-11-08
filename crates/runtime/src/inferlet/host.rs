@@ -7,7 +7,6 @@ pub mod model;
 pub mod pipeline;
 pub mod reasoning;
 pub mod session;
-pub mod speech;
 pub mod system;
 pub mod tokenizer;
 pub mod tools;
@@ -27,6 +26,10 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
 
     fn process_id(&self) -> uuid::Uuid {
         self.id()
+    }
+
+    fn note_cached(&mut self, rows: u64) {
+        self.add_cached_tokens(rows);
     }
 
     async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
@@ -53,7 +56,6 @@ wasmtime::component::bindgen!({
         "pie:inferlet/media.audio": media::Audio,
         "pie:inferlet/frames.frames": frames::Frames,
         "pie:inferlet/frames.pcm": frames::Pcm,
-        "pie:inferlet/speech.speech": speech::Speech,
         "pie:inferlet/chat.decoder": chat::Decoder,
         "pie:inferlet/tools.decoder": tools::Decoder,
         "pie:inferlet/reasoning.decoder": reasoning::Decoder,
@@ -76,7 +78,6 @@ pub fn add_to_linker(
     pie::inferlet::forward::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::session::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::media::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
-    pie::inferlet::speech::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::frames::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::system::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::chat::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;

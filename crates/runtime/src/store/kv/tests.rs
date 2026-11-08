@@ -901,7 +901,6 @@ fn a_working_set_maps_in_what_another_sealed() {
     );
     assert_eq!(store.mapped_len(ws).unwrap(), 3);
     assert_eq!(store.page_len(ws).unwrap(), 5, "the reservation stays");
-    assert_eq!(store.supplied_tokens(ws).unwrap(), 48);
     assert_eq!(store.available_pages(), 12, "nothing allocated");
     let theirs: Vec<_> = run[..3]
         .iter()
@@ -927,7 +926,7 @@ fn a_pass_maps_in_more_after_what_it_mapped_in() {
     let keys = keys_ahead(&store, ws, 16, &tokens[16..]);
     let run = store.cached_run(&keys);
     assert_eq!(store.attach_run(ws, &run, 4, 16).unwrap(), 3);
-    assert_eq!(store.supplied_tokens(ws).unwrap(), 64);
+    assert_eq!(store.mapped_len(ws).unwrap(), 4);
 
     // Its own first page, computed, is not the path's: nothing maps in.
     let own = store.create_working_set();

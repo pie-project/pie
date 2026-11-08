@@ -22,11 +22,6 @@ export function architecture(): string {
   return _model.architecture();
 }
 
-/** Whether greedy generation should use the system drafter by default. */
-export function defaultSystemSpeculation(): boolean {
-  return _model.defaultSystemSpeculation();
-}
-
 /** How long a pipeline may hold a frame's wait-set, in microseconds. */
 export function submitDeadlineUs(): number {
   return Number(_model.submitDeadlineUs());
@@ -98,9 +93,9 @@ export function schedule(): ScheduleFact | undefined {
   return _model.schedule();
 }
 
-/** The most rows one lane may carry. */
-export function maxLatentRows(): number {
-  return _model.maxLatentRows();
+/** The most rows one pass may bind, across all its lanes. */
+export function maxPassRows(): number {
+  return _model.maxPassRows();
 }
 
 export type {

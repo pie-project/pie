@@ -95,7 +95,6 @@ pub struct ExportedSet {
     pub page_len: u64,
     pub folded: u64,
     pub prompt_pages: u64,
-    pub supplied: u64,
     pub logged: Vec<u32>,
 }
 
@@ -134,7 +133,6 @@ struct WorkingSetEntry {
     /// Past them a decode wrote, and the cache lets that go first.
     prompt_pages: u64,
     owner: Option<ProcessId>,
-    supplied: u64,
     /// As far as every write since is known.
     logged: Vec<u32>,
     /// One that never settles leaves the log cut there.
@@ -151,7 +149,6 @@ impl WorkingSetEntry {
             folded: 0,
             prompt_pages: 0,
             owner: None,
-            supplied: 0,
             logged: Vec::new(),
             pending: BTreeMap::new(),
         }
@@ -823,16 +820,6 @@ impl KvPageTable {
 
     pub fn owner(&self, ws: WorkingSetId) -> Result<Option<ProcessId>, KvTableError> {
         Ok(self.entry(ws)?.owner)
-    }
-
-    pub fn add_supplied(&mut self, ws: WorkingSetId, tokens: u64) -> Result<u64, KvTableError> {
-        let entry = self.entry_mut(ws)?;
-        entry.supplied += tokens;
-        Ok(entry.supplied)
-    }
-
-    pub fn supplied(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
-        Ok(self.entry(ws)?.supplied)
     }
 
     pub fn page_hash_at(
@@ -1832,7 +1819,6 @@ impl KvPageTable {
             page_len: entry.page_len,
             folded: entry.folded,
             prompt_pages: entry.prompt_pages,
-            supplied: entry.supplied,
             logged: entry.logged.clone(),
         })
     }
@@ -1868,7 +1854,6 @@ impl KvPageTable {
         entry.mapped_len = mapped_len;
         entry.folded = set.folded;
         entry.prompt_pages = set.prompt_pages;
-        entry.supplied = set.supplied;
         entry.logged = set.logged;
         Ok(ws)
     }

@@ -104,7 +104,6 @@ struct Manifest {
     page_len: u64,
     folded: u64,
     prompt_pages: u64,
-    supplied: u64,
     logged: Vec<u32>,
     /// Each page's key, where sealed.
     pages: Vec<Option<String>>,
@@ -693,7 +692,6 @@ async fn finish(
         page_len: set.page_len,
         folded: set.folded,
         prompt_pages: set.prompt_pages,
-        supplied: set.supplied,
         logged: set.logged.clone(),
         pages: set
             .pages
@@ -812,7 +810,6 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
         page_len,
         folded,
         prompt_pages,
-        supplied,
         logged,
         ..
     } = manifest;
@@ -829,7 +826,6 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
         page_len,
         folded,
         prompt_pages,
-        supplied,
         logged,
     };
     let host_slots = slots.into_iter().map(HostKvSlotId).collect();

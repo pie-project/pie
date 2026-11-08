@@ -8,33 +8,21 @@ interface session {
     // Sends a message to the remote user client
     send: func(message: string);
 
-    // Receives an incoming message from the remote user client, or from
-    // another process through `send-to`
+    // Receives an incoming message from the remote user client
     receive: async func() -> option<string>;
 
-    // A pipe between processes: delivers `message` to the inbox of `process`
-    // (its `system.instance-id`), where its `receive` returns it, without
-    // the message leaving the engine. Both processes must belong to the same
-    // client. The receiver counts as woken at once, so if it was parked its
-    // KV starts coming back before it reads the message.
-    send-to: func(process: string, message: string) -> result<_, error>;
-
-    // Sends a file to the remote user client
-    send-file: func(data: blob);
-
-    /// `send-file` with a suggested file name, so what arrives at the client
-    /// is a named file rather than an anonymous blob.
+    /// Sends a file to the remote user client, under a suggested file name
+    /// if it has one.
     ///
     /// The bytes are already a guest value here -- that is what makes this
-    /// `send-file` and not `send-frames`. What it adds is the one thing
-    /// `send-file` cannot say: WHAT THE FILE IS. `pie run -o DIR` writes an
-    /// unnamed file as `file-0000.bin`, which is the right answer for a blob
-    /// nobody described and the wrong one for a guest that knows it just
-    /// produced `image.latent.f32`.
+    /// `send-file` and not `send-frames`. The name says WHAT THE FILE IS:
+    /// `pie run -o DIR` writes an unnamed file as `file-0000.bin`, which is
+    /// the right answer for a blob nobody described and the wrong one for a
+    /// guest that knows it just produced `image.latent.f32`.
     ///
     /// `name` is a suggestion and not a path, exactly as in `send-frames`:
     /// the host keeps the last component and the client sanitises again.
-    send-file-as: func(data: blob, name: string);
+    send-file: func(data: blob, name: option<string>);
 
     // Receives an incoming file from the remote user client
     receive-file: async func() -> option<blob>;
@@ -43,36 +31,35 @@ interface session {
     /// (`pie run --file name=path`), or none.
     file: func(name: string) -> option<blob>;
 
-    /// The working set the launch moved in under `name`, once; none if it
-    /// moved no such handle. It is new if nothing has written it yet.
-    take-working-set: func(name: string) -> option<working-set>;
+    /// What a launch moves in, and a process gives back, by kind.
+    enum handle-kind {
+        working-set,
+        matcher,
+        frames,
+        pcm,
+    }
 
-    /// Hands `ws` to the client as what the launch named `name` in its
-    /// returns. It lands in the client's session when this process ends, once
-    /// its last fire has settled. Refused if the launch expects no such
-    /// return, or has one already; `ws` is dropped either way it fails.
-    give-working-set: func(name: string, ws: working-set) -> result<_, error>;
+    /// One handle a launch moved in, or one a process gives back.
+    variant handle {
+        working-set(working-set),
+        matcher(matcher),
+        frames(frames),
+        pcm(pcm),
+    }
 
-    /// `take-working-set` for a matcher: it stands where the client left it,
-    /// or at the start of the grammar it wrote.
-    take-matcher: func(name: string) -> option<matcher>;
+    /// The handle of `kind` the launch moved in under `name`, once; none if
+    /// it moved no such handle, and one of another kind stays where it is.
+    /// A working set is new if nothing has written it yet; a matcher stands
+    /// where the client left it, or at the start of the grammar it wrote;
+    /// frames and pcm are a process's output, or a client's upload, decoded.
+    take: func(name: string, kind: handle-kind) -> option<handle>;
 
-    /// `give-working-set` for a matcher.
-    give-matcher: func(name: string, matcher: matcher) -> result<_, error>;
-
-    /// `take-working-set` for pictures: a process's output, or a client's
-    /// upload, decoded.
-    take-frames: func(name: string) -> option<frames>;
-
-    /// `give-working-set` for pictures: the client saves them or moves them
-    /// on to another process, and they never cross linear memory.
-    give-frames: func(name: string, f: frames) -> result<_, error>;
-
-    /// `take-frames` for sound.
-    take-pcm: func(name: string) -> option<pcm>;
-
-    /// `give-frames` for sound.
-    give-pcm: func(name: string, p: pcm) -> result<_, error>;
+    /// Hands `h` to the client as what the launch named `name` in its
+    /// returns. It lands in the client's session when this process ends,
+    /// once its last fire has settled; frames and pcm never cross linear
+    /// memory. Refused if the launch expects no such return, or has one
+    /// already; `h` is dropped either way it fails.
+    give: func(name: string, h: handle) -> result<_, error>;
 
     /// Encodes `f` and streams the bytes to the client under `name`, WITHOUT
     /// the encoded file ever entering WASM linear memory.
@@ -105,11 +92,12 @@ interface session {
     receive-file-blocking: func() -> option<blob>;
 
     /// Merges `props`, a JSON object, into this process's PLEX props; a `null`
-    /// removes a name. `router/` names are dropped and props over the limits
-    /// refused.
+    /// removes a name. `cluster/` names are the cluster policy's, left as they
+    /// are; props over the limits are refused.
     set-props: func(props: string) -> result<_, error>;
 
-    /// This process's own token counts, for the scheduling policy: report
-    /// `prompt` as soon as it is tokenized.
-    set-tokens: func(prompt: u32, generated: u32);
+    /// Prompt tokens this process's passes found already cached, and so
+    /// mapped in rather than computed, so far: what a usage report calls
+    /// cached.
+    cached-tokens: func() -> u32;
 }

@@ -929,9 +929,6 @@ impl Process {
                 (Err(_), true, _) | (_, false, By::Host) => Outcome::Failed,
                 (_, false, By::Client | By::Policy) => Outcome::Cancelled,
             };
-            // Before the client hears of the exit, so whoever it tells
-            // can read the process's last counts.
-            crate::policy::tokens::exit(self.client_pid);
             crate::policy::report(crate::policy::Event::Exited(self.client_pid, outcome));
             if let Some(tx) = self.result_tx.lock().unwrap().take() {
                 let _ = tx.send(result.clone());

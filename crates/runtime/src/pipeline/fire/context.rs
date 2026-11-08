@@ -5,6 +5,10 @@ pub trait FireContext {
 
     fn process_id(&self) -> uuid::Uuid;
 
+    /// A fire of this process's found `rows` already cached and mapped them
+    /// in rather than computed them.
+    fn note_cached(&mut self, _rows: u64) {}
+
     async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
         Ok(())
     }

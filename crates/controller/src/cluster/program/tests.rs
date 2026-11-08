@@ -6,6 +6,7 @@ use crate::cluster::wit::Dispatch;
 struct Fake {
     processes: Vec<(String, Vec<(String, Value)>)>,
     attrs: Vec<(String, String, Value)>,
+    group_props: Vec<(String, String, Value)>,
     workers: Vec<String>,
     groups: Vec<String>,
 }
@@ -32,6 +33,12 @@ impl Fake {
             .push((process.to_string(), name.to_string(), value));
         self
     }
+
+    fn group_prop(mut self, group: &str, name: &str, value: Value) -> Self {
+        self.group_props
+            .push((group.to_string(), name.to_string(), value));
+        self
+    }
 }
 
 impl Plane for Fake {
@@ -55,6 +62,13 @@ impl Plane for Fake {
     }
 
     fn prop(&self, of: &Subject, name: &str) -> Option<Value> {
+        if let Subject::Group(id) = of {
+            return self
+                .group_props
+                .iter()
+                .find(|(g, n, _)| g == id && n == name)
+                .map(|(_, _, value)| value.clone());
+        }
         let Subject::Process(id) = of else {
             return None;
         };
@@ -159,7 +173,7 @@ fn persist_prefix_keeps_the_asked_prefix_on_disk_where_the_group_is() {
         groups: vec!["asked".into(), "not".into()],
         ..Fake::default()
     }
-    .attr("asked", "persist-tokens", Value::Int(40))
+    .group_prop("asked", "persist-tokens", Value::Int(40))
     .attr("asked", "sites", Value::Json(r#"["1","7"]"#.into()))
     .attr("not", "sites", Value::Json(r#"["1"]"#.into()));
     let copied = Edge::Copied(types::Residency {
@@ -236,9 +250,9 @@ fn cache_aware_follows_the_cache_until_one_worker_piles_up() {
         plane
             .with(id, &[])
             .attr(id, "state", Value::Text("pending".into()))
-            .attr(id, "prompt-tokens", Value::Int(prompt))
-            .attr(id, "cached-tokens/1", Value::Int(on_1))
-            .attr(id, "cached-tokens/2", Value::Int(on_2))
+            .attr(id, "prompt-tokens-estimate", Value::Int(prompt))
+            .attr(id, "cached-tokens-estimate/1", Value::Int(on_1))
+            .attr(id, "cached-tokens-estimate/2", Value::Int(on_2))
     };
     let running = |plane: Fake, id: &str, on: &str| {
         plane

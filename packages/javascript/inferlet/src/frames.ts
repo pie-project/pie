@@ -34,14 +34,14 @@ export class Frames {
 
   /** The handle the launch moved in under `name`, once. */
   static take(name: string): Frames {
-    const inner = _session.takeFrames(name);
-    if (inner === undefined) throw new FramesError(`the launch moved in no frames \`${name}\``);
-    return new Frames(inner);
+    const handle = _session.take(name, 'frames');
+    if (handle?.tag !== 'frames') throw new FramesError(`the launch moved in no frames \`${name}\``);
+    return new Frames(handle.val);
   }
 
   /** Hands these pictures to the client under the launch's `name`. Unusable after. */
   give(name: string): void {
-    wit('give', () => _session.giveFrames(name, this.handle));
+    wit('give', () => _session.give(name, { tag: 'frames', val: this.handle }));
   }
 
   get width(): number {
@@ -69,14 +69,14 @@ export class Pcm {
 
   /** The handle the launch moved in under `name`, once. */
   static take(name: string): Pcm {
-    const inner = _session.takePcm(name);
-    if (inner === undefined) throw new FramesError(`the launch moved in no pcm \`${name}\``);
-    return new Pcm(inner);
+    const handle = _session.take(name, 'pcm');
+    if (handle?.tag !== 'pcm') throw new FramesError(`the launch moved in no pcm \`${name}\``);
+    return new Pcm(handle.val);
   }
 
   /** Hands this sound to the client under the launch's `name`. Unusable after. */
   give(name: string): void {
-    wit('give', () => _session.givePcm(name, this.handle));
+    wit('give', () => _session.give(name, { tag: 'pcm', val: this.handle }));
   }
 
   get rate(): number {

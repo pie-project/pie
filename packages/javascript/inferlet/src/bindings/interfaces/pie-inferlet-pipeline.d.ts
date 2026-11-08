@@ -1,10 +1,4 @@
 /** @module Interface pie:inferlet/pipeline@0.3.0 **/
-/**
- * How many pipelines are open on the engine, this one included: a
- * program that trades compute for latency (speculation) reads whether
- * it is alone.
- */
-export function live(): number;
 
 export class Pipeline {
   constructor()
@@ -17,4 +11,12 @@ export class Pipeline {
   * Resource drop has exactly these semantics.
   */
   close(): void;
+  /**
+  * The host's advice to a program that trades compute for latency
+  * (speculation): whether no other pipeline is active beside this
+  * one, so its fires batch alone. A pipeline is active from its
+  * making, and again from each submit, until it parks or closes.
+  * Advice, not a count; it may change from one frame to the next.
+  */
+  speculationAdvised(): boolean;
 }

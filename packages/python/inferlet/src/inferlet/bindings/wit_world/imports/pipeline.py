@@ -41,6 +41,15 @@ class Pipeline:
         Resource drop has exactly these semantics.
         """
         raise NotImplementedError
+    def speculation_advised(self) -> bool:
+        """
+        The host's advice to a program that trades compute for latency
+        (speculation): whether no other pipeline is active beside this
+        one, so its fires batch alone. A pipeline is active from its
+        making, and again from each submit, until it parks or closes.
+        Advice, not a count; it may change from one frame to the next.
+        """
+        raise NotImplementedError
     def __enter__(self) -> Self:
         """Returns self"""
         return self
@@ -51,12 +60,3 @@ class Pipeline:
         """
         raise NotImplementedError
 
-
-
-def live() -> int:
-    """
-    How many pipelines are open on the engine, this one included: a
-    program that trades compute for latency (speculation) reads whether
-    it is alone.
-    """
-    raise NotImplementedError

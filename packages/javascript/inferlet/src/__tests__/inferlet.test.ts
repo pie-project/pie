@@ -46,7 +46,6 @@ describe('model', () => {
   it('reports identity', () => {
     expect(model.name()).toBe('mock-model');
     expect(model.architecture()).toBe('qwen3_5');
-    expect(model.defaultSystemSpeculation()).toBe(false);
   });
 
   it('reports recurrent state and declared switches', () => {
@@ -150,6 +149,11 @@ describe('chat fillers', () => {
     expect(Array.from(chat.cue())).toEqual([6]);
     expect(Array.from(chat.seal())).toEqual([7]);
     expect(Array.from(chat.stopTokens())).toEqual([8, 9]);
+  });
+
+  it('opens a conversation as the template writes it', () => {
+    expect(Array.from(chat.open('s', ['t1', 't2'], 'medium'))).toEqual([1, 115, 2, 1]);
+    expect(Array.from(chat.systemUser('s', 'u'))).toEqual([1, 115, 0, 0, 3, 117]);
   });
 });
 

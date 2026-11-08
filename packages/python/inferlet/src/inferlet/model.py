@@ -51,11 +51,6 @@ def architecture() -> str:
     return _model.architecture()
 
 
-def default_system_speculation() -> bool:
-    """Whether greedy generation should use the system drafter by default."""
-    return _model.default_system_speculation()
-
-
 def submit_deadline_us() -> int:
     """How long a pipeline may hold a frame's wait-set, in microseconds."""
     return _model.submit_deadline_us()
@@ -136,6 +131,6 @@ def schedule():
     return _model.schedule()
 
 
-def max_latent_rows() -> int:
-    """The most rows one lane may carry."""
-    return _model.max_latent_rows()
+def max_pass_rows() -> int:
+    """The most rows one pass may bind, across all its lanes."""
+    return _model.max_pass_rows()

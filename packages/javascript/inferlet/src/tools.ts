@@ -1,11 +1,11 @@
 // Tool calling — `pie:inferlet/tools`.
 //
-// Equip tool specs into the prompt, constrain generation to well-formed
-// calls, and parse the calls back out.
+// Open a conversation with tool specs (`chat.open`), constrain generation to
+// well-formed calls, parse the calls back out, and answer them.
 
 import * as _tools from 'pie:inferlet/tools@0.3.0';
 
-import { Grammar, GrammarError, Matcher } from './grammar.js';
+import { Grammar, GrammarError } from './grammar.js';
 
 export interface ToolCall {
   readonly name: string;
@@ -23,30 +23,25 @@ export interface EventCall {
 
 export type Event = EventStart | EventCall;
 
-/** Token sequence declaring `tools` (JSON specs) to the model. */
-export function equip(tools: string[]): Uint32Array {
-  try {
-    return _tools.equip(tools);
-  } catch (e: unknown) {
-    const payload = (e as { payload?: unknown })?.payload;
-    throw new GrammarError(`tools.equip: ${typeof payload === 'string' ? payload : String(e)}`);
-  }
+/** Tool results `[name, value]` that follow one another, as the template
+ *  writes them together; one result is a list of one. */
+export function answers(results: Array<[string, string]>): Uint32Array {
+  return _tools.answers(results);
 }
 
-/** Token sequence returning a tool's result to the model. */
-export function answer(name: string, value: string): Uint32Array {
-  return _tools.answer(name, value);
+/**
+ * An earlier assistant turn: `message`, then the `calls` it made in the
+ * template's call syntax. `current` marks a turn after the conversation's
+ * last user query, which some templates replay with its reasoning.
+ */
+export function assistantCalls(message: string, calls: ToolCall[], current: boolean): Uint32Array {
+  return _tools.assistantCalls(message, [...calls], current);
 }
 
 /** The grammar of a well-formed call to one of `tools`, if the template has one. */
 export function format(tools: string[]): Grammar | undefined {
   const g = _tools.format(tools);
   return g ? new Grammar(g) : undefined;
-}
-
-/** A matcher over `format`'s grammar. */
-export function createMatcher(tools: string[]): Matcher {
-  return new Matcher(_tools.createMatcher(tools));
 }
 
 /** Parses generated tokens into tool-call events. */

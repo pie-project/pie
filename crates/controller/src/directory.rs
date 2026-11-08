@@ -28,9 +28,8 @@ struct Inner {
     /// a cluster policy places.
     runs: HashMap<WorkerId, HashMap<Key, Arc<Vec<Key>>>>,
     pools: HashSet<WorkerId>,
-    /// What each worker's policy published, by subject and name.
-    /// As JSON text.
-    published: HashMap<WorkerId, HashMap<(String, String), String>>,
+    /// What each worker's policy published about it, by name, as JSON text.
+    published: HashMap<WorkerId, HashMap<String, String>>,
     /// The pages each worker's persistent disk tier keeps a copy of.
     disk: HashMap<WorkerId, HashSet<Key>>,
     /// The runs whose owner asked a prefix kept on disk, by last key: the
@@ -150,11 +149,8 @@ impl Directory {
     }
 
     /// Everything `worker`'s policy has published, replacing what it had.
-    pub fn report_published(&self, worker: WorkerId, published: Vec<(String, String, String)>) {
-        let map = published
-            .into_iter()
-            .map(|(of, name, json)| ((of, name), json))
-            .collect();
+    pub fn report_published(&self, worker: WorkerId, published: Vec<(String, String)>) {
+        let map = published.into_iter().collect();
         self.inner.lock().unwrap().published.insert(worker, map);
     }
 
@@ -229,8 +225,7 @@ impl Directory {
                     .map(|(w, map)| {
                         let mut own: Vec<(String, String)> = map
                             .iter()
-                            .filter(|((of, _), _)| of == "worker")
-                            .map(|((_, name), json)| (name.clone(), json.clone()))
+                            .map(|(name, json)| (name.clone(), json.clone()))
                             .collect();
                         own.sort_unstable();
                         (*w, own)
@@ -513,10 +508,7 @@ mod tests {
                 added: run.clone(),
                 full: true,
                 runs_added: vec![run.clone()],
-                published: Some(vec![
-                    ("worker".into(), "load".into(), "7".into()),
-                    ("process:1".into(), "x".into(), "1".into()),
-                ]),
+                published: Some(vec![("load".into(), "7".into())]),
                 disk_added: vec![key(1)],
                 disk_tier: Some((16, true)),
                 ..StateReport::default()
@@ -532,7 +524,7 @@ mod tests {
         assert_eq!(
             view.published,
             vec![(WorkerId(3), vec![("load".to_string(), "7".to_string())])],
-            "what a worker published about itself"
+            "what a worker's policy published about it"
         );
         assert_eq!(view.disk_tiers, vec![(WorkerId(3), (16, true))]);
         assert_eq!(view.disk, vec![(WorkerId(3), vec![key(1)])]);

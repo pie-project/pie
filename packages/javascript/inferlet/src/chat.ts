@@ -42,10 +42,18 @@ export function firstUser(message: string): Uint32Array {
   return _chat.firstUser(message);
 }
 
-/** A system message followed by the first user turn, as the model's
- *  template spells that pair. */
-export function systemUser(system: string, user: string): Uint32Array {
-  return _chat.systemUser(system, user);
+/**
+ * A system message, then the first user turn: `open` with the message and
+ * no tools, then `user` (or `firstUser` where the template opened with
+ * nothing).
+ */
+export function systemUser(system: string, message: string): Uint32Array {
+  const opened = open(system);
+  const turn = opened.length ? user(message) : firstUser(message);
+  const tokens = new Uint32Array(opened.length + turn.length);
+  tokens.set(opened);
+  tokens.set(turn, opened.length);
+  return tokens;
 }
 
 /** Token sequence for an assistant-role message (history replay). */
@@ -71,13 +79,14 @@ export function cueWithoutThinking(): Uint32Array {
 export type ReasoningEffort = _chat.ReasoningEffort;
 
 /**
- * The system turn of a request the model answers with thinking, as its
- * template renders it: the template's reasoning-effort instruction ahead of
- * `message`, in a system turn of its own when `message` is undefined.
- * `system(message)` where the template has none.
+ * The system turn a conversation opens with, as the model's template writes
+ * it from the system message, the tools (JSON specs) and, for a request the
+ * model answers with thinking, its reasoning `effort`. Some templates fold
+ * the tools or the effort into the system turn, so this is the one way to
+ * open with them.
  */
-export function systemThinking(message?: string, effort: ReasoningEffort = 'xhigh'): Uint32Array {
-  return _chat.systemThinking(message, effort);
+export function open(system?: string, tools: string[] = [], effort?: ReasoningEffort): Uint32Array {
+  return _chat.open(system, tools, effort);
 }
 
 /** `cue`, or `cueWithoutThinking` when `think` is false. */

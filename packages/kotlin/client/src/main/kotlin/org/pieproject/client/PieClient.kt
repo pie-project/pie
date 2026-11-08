@@ -357,7 +357,7 @@ public class PieProcess internal constructor(
         /** A `session::send` from the inferlet. */
         public data class Message(public val text: String) : Event
 
-        /** A file the inferlet sent (`session::send_file_as`, `send_frames`), under the name it gave, if any. */
+        /** A file the inferlet sent (`session::send_file` with a name, `send_frames`), under the name it gave, if any. */
         public class File(public val name: String?, public val bytes: ByteArray) : Event
 
         /** What `main` returned; always the last event. */

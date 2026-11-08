@@ -62,14 +62,14 @@ export class Matcher {
 
   /** The handle the launch moved in under `name`, once. */
   static take(name: string): Matcher {
-    const inner = _session.takeMatcher(name);
-    if (inner === undefined) throw new GrammarError(`the launch moved in no matcher \`${name}\``);
-    return new Matcher(inner);
+    const handle = _session.take(name, 'matcher');
+    if (handle?.tag !== 'matcher') throw new GrammarError(`the launch moved in no matcher \`${name}\``);
+    return new Matcher(handle.val);
   }
 
   /** Hands this matcher back to the client under the launch's `name`. Unusable after. */
   give(name: string): void {
-    wit('give', () => _session.giveMatcher(name, this.inner));
+    wit('give', () => _session.give(name, { tag: 'matcher', val: this.inner }));
   }
 
   /** Advance the match by `tokenIds`; a forbidden token throws `GrammarError`. */

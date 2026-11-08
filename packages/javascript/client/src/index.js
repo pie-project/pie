@@ -819,7 +819,10 @@ export class PieClient {
      * Launches a process. Returns a Process object for interaction.
      * @param {string} inferlet A name (`text-completion`), or `name@<hash>` for one build.
      * @param {Object} [input={}] Input parameters object, serialized to JSON.
-     * @param {boolean} [captureOutputs=true] Stream outputs to client.
+     * @param {boolean} [captureOutputs=true] Stream outputs to client. False
+     *   detaches the process: no event reaches this client and closing it
+     *   does not end the process; `attachProcess` with the returned
+     *   process's id receives what it sends from then on.
      * @param {Object<string, Uint8Array>} [files={}] Files the inferlet reads with `session.file(name)`.
      * @param {{handles?: Object<string, Handle>, returns?: Object<string, Handle>}} [moved]
      *   Handles moved into the process, and what it gives back, by the guest's names.

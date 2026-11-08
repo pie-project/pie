@@ -11,10 +11,6 @@ export function name(): string;
  * Returns the model architecture identifier (e.g. "gemma4", "qwen3_6")
  */
 export function architecture(): string;
-/**
- * Whether the bound model enables system speculation by default
- */
-export function defaultSystemSpeculation(): boolean;
 export function draftBlock(): BlockDrafter | undefined;
 /**
  * Every switch the bound model declares; empty for a one-path model.
@@ -27,9 +23,9 @@ export function lane(switches: Array<[string, string]>): LaneDecl;
 export function latent(): LatentSpace | undefined;
 export function schedule(): ScheduleFact | undefined;
 /**
- * The most rows one lane may carry. Static.
+ * The most rows one pass may bind, across all its lanes. Static.
  */
-export function maxLatentRows(): number;
+export function maxPassRows(): number;
 /**
  * Logits/output dimension (= hf_config.vocab_size). May EXCEED the
  * tokenizer's vocabs() token count due to padding. Use THIS for

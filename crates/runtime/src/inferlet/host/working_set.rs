@@ -180,16 +180,6 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         Ok(self.ctx().table.get(&this)?.cursor().folded)
     }
 
-    async fn cached_tokens(&mut self, this: Resource<WorkingSet>) -> Result<u32> {
-        let kv_rep = self.ctx().table.get(&this)?.kv;
-        let ws = kv_of(self, kv_rep)?;
-        let stores = store_registry::get(ws.model, ws.engine);
-        let tokens = store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-            kv.supplied_tokens(ws.id)
-        });
-        Ok(u32::try_from(tokens.unwrap_or(0)).unwrap_or(u32::MAX))
-    }
-
     async fn fork(
         &mut self,
         this: Resource<WorkingSet>,

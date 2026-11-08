@@ -12,7 +12,6 @@
 export const modelStub = {
   name: () => 'mock-model',
   architecture: () => 'qwen3_5',
-  defaultSystemSpeculation: () => false,
   outputVocabSize: () => 151936,
   kvPageSize: () => 16,
   frameSize: () => 1,
@@ -125,9 +124,6 @@ export class WorkingSetStub {
   folded() {
     return 0;
   }
-  cachedTokens() {
-    return 0;
-  }
   fork() {
     return new WorkingSetStub();
   }
@@ -217,11 +213,11 @@ export const chatScript: { events: Variant[]; last?: ScriptedDecoder } = {
 
 export const chatStub = {
   prefix: () => Uint32Array.from([0]),
-  systemUser: (s: string, u: string) => Uint32Array.from([4, s.length, u.length]),
   system: (m: string) => Uint32Array.from([1, ...[...m].map((c) => c.charCodeAt(0))]),
   firstUser: (m: string) => Uint32Array.from([2, ...[...m].map((c) => c.charCodeAt(0))]),
   user: (m: string) => Uint32Array.from([3, ...[...m].map((c) => c.charCodeAt(0))]),
-  systemUser: () => Uint32Array.from([4]),
+  open: (s: string | undefined, tools: string[], effort?: string) =>
+    Uint32Array.from([1, ...[...(s ?? '')].map((c) => c.charCodeAt(0)), tools.length, effort ? 1 : 0]),
   assistant: (m: string) => Uint32Array.from([5, ...[...m].map((c) => c.charCodeAt(0))]),
   cue: () => Uint32Array.from([6]),
   seal: () => Uint32Array.from([7]),
@@ -307,10 +303,11 @@ export class MatcherStub {
 export const grammarStub = { Grammar: GrammarStub, Matcher: MatcherStub };
 
 export const toolsStub = {
-  equip: (tools: string[]) => Uint32Array.from([10, tools.length]),
-  answer: (name: string, value: string) => Uint32Array.from([11, name.length, value.length]),
+  answers: (results: Array<[string, string]>) =>
+    Uint32Array.from([11, ...results.map(([n, v]) => n.length + v.length)]),
+  assistantCalls: (_m: string, calls: unknown[], current: boolean) =>
+    Uint32Array.from([12, calls.length, current ? 1 : 0]),
   format: (tools: string[]) => (tools.length ? new GrammarStub('tools') : undefined),
-  createMatcher: () => new MatcherStub(new GrammarStub('tools')),
   Decoder: class {
     n = 0;
     feed() {

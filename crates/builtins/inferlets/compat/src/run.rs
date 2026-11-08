@@ -59,9 +59,6 @@ fn pair_prompt(tokens: &[u32], scored: &[Logprob]) -> Vec<(u32, Option<Logprob>)
         .collect()
 }
 
-/// Each report takes a lock on the host.
-const REPORT_EVERY: u32 = 32;
-
 /// The constraint a request puts on the output, as a live guide.
 fn constraint(req: &Request) -> Result<Option<Box<dyn Guide>>, String> {
     let forced = req.forces_tool_call();
@@ -76,7 +73,10 @@ fn constraint(req: &Request) -> Result<Option<Box<dyn Guide>>, String> {
         if callable.is_empty() {
             return Err("tool_choice names a tool that is not in `tools`".into());
         }
-        return Ok(Some(Box::new(tools::create_matcher(&callable))));
+        // A model with no tool-call syntax cannot be held to one.
+        let grammar = tools::format(&callable)
+            .ok_or("tool_choice forces a call, but this model has no tool-call format")?;
+        return Ok(Some(Box::new(Matcher::new(&grammar))));
     }
     let grammar = match &req.response_format {
         ResponseFormat::Text => return Ok(None),
@@ -134,9 +134,6 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
     let sink = RefCell::new(sink);
     let mut prompt = prompt::build(req)?;
     let prompt_len = prompt.tokens.len();
-    // The worker's policy sees the prompt while this process still waits.
-    let prompt_tokens = prompt.tokens.len() as u32;
-    inferlet::session::set_tokens(prompt_tokens, 0);
     // How long the system turn is, which only this process counts: a client
     // that asks it kept on disk (`persist-system`) names it so.
     if let Some(system) = prompt.system {
@@ -191,9 +188,6 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
             logprobs.push((token, logprob));
         }
         generated += 1;
-        if generated == 1 || generated.is_multiple_of(REPORT_EVERY) {
-            inferlet::session::set_tokens(prompt_tokens, generated);
-        }
         if stop_tokens.contains(&token) {
             if req.ignore_eos || generated as usize <= req.min_tokens {
                 return ControlFlow::Continue(());
@@ -218,9 +212,9 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
         &mut on_token,
     )
     .await?;
-    let (sampled, cached_tokens) = (done.sampled, done.cached);
+    let sampled = done.sampled;
+    let cached_tokens = inferlet::session::cached_tokens() as usize;
     let mut sink = sink.into_inner();
-    inferlet::session::set_tokens(prompt_tokens, generated);
     if let Some(e) = error {
         return Err(e);
     }

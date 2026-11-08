@@ -62,15 +62,15 @@ class Frames:
     @classmethod
     def take(cls, name: str) -> "Frames":
         """The handle the launch moved in under `name`, once."""
-        inner = _wit_session.take_frames(name)
-        if inner is None:
+        handle = _wit_session.take(name, _wit_session.HandleKind.FRAMES)
+        if handle is None:
             raise FramesError(f"the launch moved in no frames `{name}`")
-        return cls(inner)
+        return cls(handle.value)
 
     def give(self, name: str) -> None:
         """Hands these pictures to the client under the launch's `name`. Unusable after."""
         inner, self._inner = self._inner, None
-        _call("give", _wit_session.give_frames, name, inner)
+        _call("give", _wit_session.give, name, _wit_session.Handle_Frames(inner))
 
     @classmethod
     def from_channel(
@@ -144,15 +144,15 @@ class Pcm:
     @classmethod
     def take(cls, name: str) -> "Pcm":
         """The handle the launch moved in under `name`, once."""
-        inner = _wit_session.take_pcm(name)
-        if inner is None:
+        handle = _wit_session.take(name, _wit_session.HandleKind.PCM)
+        if handle is None:
             raise FramesError(f"the launch moved in no pcm `{name}`")
-        return cls(inner)
+        return cls(handle.value)
 
     def give(self, name: str) -> None:
         """Hands this sound to the client under the launch's `name`. Unusable after."""
         inner, self._inner = self._inner, None
-        _call("give", _wit_session.give_pcm, name, inner)
+        _call("give", _wit_session.give, name, _wit_session.Handle_Pcm(inner))
 
     @property
     def handle(self):

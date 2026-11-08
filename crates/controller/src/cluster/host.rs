@@ -556,6 +556,10 @@ fn gate_of<'a>(manifests: impl Iterator<Item = &'a super::manifest::Manifest>) -
     manifests.map(|m| m.gate_ms).max().unwrap_or(0)
 }
 
+/// Where a worker policy's publications read, on its worker: no cluster
+/// program's, whatever it is named.
+const WORKER_PUBLISHED: &str = "published/@worker/";
+
 fn program_name(spec: &str) -> String {
     std::path::Path::new(spec)
         .file_stem()
@@ -708,7 +712,6 @@ struct Proc {
     props: Arc<HashMap<String, Value>>,
     prompt: Option<Arc<[u64]>>,
     worker: Option<String>,
-    counted: Option<(u64, u64)>,
 }
 
 /// A run some worker keeps whole, and the workers (pools among them) that
@@ -779,11 +782,6 @@ enum Local {
         id: String,
         worker: String,
     },
-    Counted {
-        id: String,
-        prompt: u64,
-        generated: u64,
-    },
     Exited {
         id: String,
         outcome: Outcome,
@@ -831,15 +829,6 @@ impl Registry {
                 ProcessEvent::Dispatched { req, worker } => Local::Dispatched {
                     id: pid(gateway, req),
                     worker: worker.0.to_string(),
-                },
-                ProcessEvent::Counted {
-                    req,
-                    prompt,
-                    generated,
-                } => Local::Counted {
-                    id: pid(gateway, req),
-                    prompt,
-                    generated,
                 },
                 ProcessEvent::Moved { req, worker, why } => Local::Moved {
                     id: pid(gateway, req),
@@ -962,7 +951,6 @@ impl Registry {
                         props: Arc::new(props.into_iter().filter_map(prop_value).collect()),
                         prompt,
                         worker: None,
-                        counted: None,
                     },
                 );
                 edges.push(Edge::Arrived(id));
@@ -981,16 +969,6 @@ impl Registry {
                         process: id,
                         worker,
                     }));
-                }
-            }
-            Local::Counted {
-                id,
-                prompt,
-                generated,
-            } => {
-                tracing::debug!(process = %id, prompt, generated, "cluster policy: a process counted its tokens");
-                if let Some(proc) = self.procs.get_mut(&id) {
-                    proc.counted = Some((prompt, generated));
                 }
             }
             Local::Exited { id, outcome } => {
@@ -1526,6 +1504,11 @@ impl Plane for Snapshot {
     }
 
     fn attr(&self, of: &Subject, name: &str) -> Option<Value> {
+        // What a worker's own policy published, apart from any program's.
+        if let (Subject::Worker(id), Some(name)) = (of, name.strip_prefix(WORKER_PUBLISHED)) {
+            let value = self.published.get(id)?.get(name)?.clone();
+            return prop_value((String::new(), value)).map(|(_, value)| value);
+        }
         // What a cluster program published, under its name.
         if let Some(said) = name
             .strip_prefix("published/")
@@ -1566,19 +1549,10 @@ impl Plane for Snapshot {
                     "state" if !live => None,
                     "state" if proc.worker.is_some() => text("running"),
                     "state" => text("pending"),
-                    // An exited process has told the router its counts; before
-                    // that its prompt is estimated from its text.
-                    "prompt-tokens" => int(proc.counted.map(|(prompt, _)| prompt).or_else(|| {
-                        proc.prompt.as_ref().map(|blocks| {
-                            (blocks.len() as f64 * PROMPT_BLOCK_BYTES as f64 * TOKENS_PER_BYTE)
-                                as u64
-                        })
+                    // Estimated from its text: the router sees no tokens.
+                    "prompt-tokens-estimate" => int(proc.prompt.as_ref().map(|blocks| {
+                        (blocks.len() as f64 * PROMPT_BLOCK_BYTES as f64 * TOKENS_PER_BYTE) as u64
                     })),
-                    "max-tokens" => match proc.props.get(client_api::props::MAX_TOKENS) {
-                        Some(Value::Int(n)) if *n >= 0 => Some(Value::Int(*n)),
-                        _ => None,
-                    },
-                    "generated-tokens" => int(proc.counted.map(|(_, generated)| generated)),
                     "arrival-ms" => Some(Value::Int(proc.arrival_ms as i64)),
                     "tenant" => text(proc.tenant.clone()),
                     "session" => proc.session.clone().and_then(text),
@@ -1586,7 +1560,7 @@ impl Plane for Snapshot {
                     _ => {
                         // What the worker holds of its prompt, estimated
                         // from its text: there are no tokens here.
-                        let worker = name.strip_prefix("cached-tokens/")?;
+                        let worker = name.strip_prefix("cached-tokens-estimate/")?;
                         let prompt = proc.prompt.as_ref()?;
                         self.workers.get(worker)?;
                         let held = self
@@ -1616,12 +1590,6 @@ impl Plane for Snapshot {
                     _ => None,
                 }
             }
-            Subject::Worker(id) if name.starts_with("published/") => self
-                .published
-                .get(id)
-                .and_then(|map| map.get(&name["published/".len()..]))
-                .and_then(|value| prop_value((String::new(), value.clone())))
-                .map(|(_, value)| value),
             Subject::Worker(id) if self.pools.contains(id) => match name {
                 "pool" => Some(Value::Boolean(true)),
                 _ => None,
@@ -1653,11 +1621,6 @@ impl Plane for Snapshot {
                         )
                         .unwrap_or_default(),
                     )),
-                    // The leading tokens of it a process asked kept on
-                    // disk (`persist-prefix-tokens`, `persist-system`).
-                    "persist-tokens" => group
-                        .persist_tokens
-                        .map(|tokens| Value::Int(i64::try_from(tokens).unwrap_or(i64::MAX))),
                     _ => None,
                 }
             }
@@ -1723,6 +1686,14 @@ impl Plane for Snapshot {
                 let value = self.sessions.get(id)?.get(name)?;
                 prop_value((name.to_string(), value.clone())).map(|(_, value)| value)
             }
+            // The most leading tokens of it any process holding it asked
+            // kept on disk (`persist-prefix-tokens`, `persist-system`): a
+            // request, not a measure.
+            Subject::Group(id) if name == "persist-tokens" => self
+                .groups
+                .get(id)?
+                .persist_tokens
+                .map(|tokens| Value::Int(i64::try_from(tokens).unwrap_or(i64::MAX))),
             _ => None,
         }
     }
@@ -1819,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_process_is_sized_from_its_prompt_text_and_its_limit() {
+    fn a_pending_process_is_sized_from_its_prompt_text() {
         let mut registry = Registry::default();
         let mut edges = Vec::new();
         let props = serde_json::from_value(serde_json::json!({
@@ -1839,8 +1810,11 @@ mod tests {
         );
         let plane = registry.snapshot(&table(0), &Tables::default());
         let of = |name| format!("{:?}", plane.attr(&Subject::Process("1".into()), name));
-        assert_eq!(of("prompt-tokens"), format!("{:?}", Some(Value::Int(160))));
-        assert_eq!(of("max-tokens"), format!("{:?}", Some(Value::Int(64))));
+        assert_eq!(
+            of("prompt-tokens-estimate"),
+            format!("{:?}", Some(Value::Int(160)))
+        );
+        assert_eq!(of("max-tokens"), "None", "a client's word is its prop");
     }
 
     #[test]
@@ -1871,11 +1845,15 @@ mod tests {
         let of = |id: &str, name| format!("{:?}", plane.attr(&Subject::Process(id.into()), name));
         // 1000 bytes: fifteen whole 64-byte blocks, at a guessed 16 tokens each.
         assert_eq!(
-            of("2", "cached-tokens/1"),
+            of("2", "cached-tokens-estimate/1"),
             format!("{:?}", Some(Value::Int(240)))
         );
-        assert_eq!(of("2", "cached-tokens/9"), "None", "no such worker");
-        assert_eq!(of("3", "cached-tokens/1"), "None", "no prompt");
+        assert_eq!(
+            of("2", "cached-tokens-estimate/9"),
+            "None",
+            "no such worker"
+        );
+        assert_eq!(of("3", "cached-tokens-estimate/1"), "None", "no prompt");
         assert_eq!(of("2", "cached-tokens"), "None");
     }
 
@@ -2009,8 +1987,12 @@ mod tests {
             Some(Value::Int(4))
         ));
         assert!(
-            matches!(plane.attr(&worker, "published/mark"), Some(Value::Text(t)) if t == "own"),
+            matches!(plane.attr(&worker, "published/@worker/mark"), Some(Value::Text(t)) if t == "own"),
             "the worker's own policy's value stands beside the programs'"
+        );
+        assert!(
+            plane.attr(&worker, "published/mark").is_none(),
+            "no program is named `mark`"
         );
 
         registry.say(
@@ -2186,7 +2168,9 @@ mod tests {
         );
         let plane = registry.snapshot(&table(0), &Tables::default());
         let attr = |name| plane.attr(&Subject::Group("g".into()), name);
-        assert!(matches!(attr("persist-tokens"), Some(Value::Int(40))));
+        let prop = |name| plane.prop(&Subject::Group("g".into()), name);
+        assert!(matches!(prop("persist-tokens"), Some(Value::Int(40))));
+        assert!(attr("persist-tokens").is_none(), "a request is a prop");
         assert!(matches!(attr("disk-sites"), Some(Value::Json(json)) if json == "[\"1\"]"));
     }
 
@@ -2242,7 +2226,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exited_process_is_read_with_its_counts_by_the_call_about_its_exit() {
+    fn an_exited_process_is_read_by_the_call_about_its_exit() {
         let mut registry = Registry::default();
         let mut edges = Vec::new();
         let arrived = |id: &str| Local::Arrived {
@@ -2259,11 +2243,6 @@ mod tests {
                 id: "1".into(),
                 worker: "7".into(),
             },
-            Local::Counted {
-                id: "1".into(),
-                prompt: 120,
-                generated: 30,
-            },
             Local::Exited {
                 id: "1".into(),
                 outcome: Outcome::Completed,
@@ -2275,14 +2254,12 @@ mod tests {
         let plane = registry.snapshot(&table(0), &Tables::default());
         let of = |id: &str, name| format!("{:?}", plane.attr(&Subject::Process(id.into()), name));
         let int = |n| format!("{:?}", Some(Value::Int(n)));
-        assert_eq!(of("1", "generated-tokens"), int(30));
-        assert_eq!(of("1", "prompt-tokens"), int(120));
         assert_eq!(of("1", "worker"), format!("{:?}", text("7")));
         assert_eq!(of("1", "state"), "None");
         assert_eq!(
-            of("2", "prompt-tokens"),
+            of("2", "prompt-tokens-estimate"),
             "None",
-            "the router never sees a live process's counts"
+            "no prompt, no estimate"
         );
         assert_eq!(plane.candidates(SubjectKind::Process), ["2"]);
         let worker = |name| format!("{:?}", plane.attr(&Subject::Worker("1".into()), name));

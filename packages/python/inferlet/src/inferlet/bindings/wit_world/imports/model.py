@@ -165,11 +165,6 @@ def architecture() -> str:
     Returns the model architecture identifier (e.g. "gemma4", "qwen3_6")
     """
     raise NotImplementedError
-def default_system_speculation() -> bool:
-    """
-    Whether the bound model enables system speculation by default
-    """
-    raise NotImplementedError
 def draft_block() -> Optional[BlockDrafter]:
     raise NotImplementedError
 def switches() -> List[SwitchDecl]:
@@ -188,9 +183,9 @@ def latent() -> Optional[LatentSpace]:
     raise NotImplementedError
 def schedule() -> Optional[ScheduleFact]:
     raise NotImplementedError
-def max_latent_rows() -> int:
+def max_pass_rows() -> int:
     """
-    The most rows one lane may carry. Static.
+    The most rows one pass may bind, across all its lanes. Static.
     """
     raise NotImplementedError
 def output_vocab_size() -> int:

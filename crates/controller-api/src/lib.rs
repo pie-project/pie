@@ -192,9 +192,9 @@ pub struct StateReport {
     pub runs_removed: Vec<[u8; 32]>,
     /// A pool: it loads no model and keeps what it is sent.
     pub pool: bool,
-    /// What the worker policy published for the cluster plane, as
-    /// `(subject, name, JSON value)`; all of it, whenever any changes.
-    pub published: Option<Vec<(String, String, String)>>,
+    /// What the worker policy published about this worker for the cluster
+    /// plane, as `(name, JSON value)`; all of it, whenever any changes.
+    pub published: Option<Vec<(String, String)>>,
     /// Pages the persistent disk tier gained and lost a copy of since the
     /// last report (all of it when `full`).
     #[serde(default)]
@@ -234,8 +234,8 @@ pub struct DirectoryView {
     pub pools: Vec<WorkerId>,
     /// Where each worker serves its pages' bytes.
     pub peers: Vec<(WorkerId, String)>,
-    /// What each worker's policy published about the worker itself, as
-    /// `(name, JSON value)`.
+    /// What each worker's policy published about it, as `(name, JSON
+    /// value)`.
     pub published: Vec<(WorkerId, Vec<(String, String)>)>,
     /// Each worker's kv page in tokens, and whether its disk tier is kept.
     pub disk_tiers: Vec<(WorkerId, (u32, bool))>,
@@ -271,11 +271,6 @@ pub enum ProcessEvent {
     Dispatched {
         req: u64,
         worker: WorkerId,
-    },
-    Counted {
-        req: u64,
-        prompt: u64,
-        generated: u64,
     },
     /// A running process moved to `worker`, or (none) could not.
     Moved {

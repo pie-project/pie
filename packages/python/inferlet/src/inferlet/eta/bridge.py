@@ -293,10 +293,10 @@ class WorkingSet:
     @classmethod
     def take(cls, name: str) -> "WorkingSet":
         """The handle the launch moved in under `name`, once."""
-        ws = _wit_session.take_working_set(name)
-        if ws is None:
+        handle = _wit_session.take(name, _wit_session.HandleKind.WORKING_SET)
+        if handle is None:
             raise ValueError(f"the launch moved in no handle `{name}`")
-        return cls._wrap(ws)
+        return cls._wrap(handle.value)
 
     @classmethod
     def from_input(cls, value) -> "WorkingSet":
@@ -306,7 +306,7 @@ class WorkingSet:
     def give(self, name: str) -> None:
         """Hands this set back to the client under the launch's `name`. Unusable after."""
         ws, self.ws = self.ws, None
-        _wit(_wit_session.give_working_set, name, ws, what="give")
+        _wit(_wit_session.give, name, _wit_session.Handle_WorkingSet(ws), what="give")
 
     def reserve(self, end: int) -> None:
         """Lets passes write slots below `end`; needed only when the device computes the slots."""
@@ -315,10 +315,6 @@ class WorkingSet:
     def folded(self) -> int:
         """The frozen length; while a device-counted fold is in flight, the length before it."""
         return self.ws.folded()
-
-    def cached_tokens(self) -> int:
-        """Slots the runtime mapped in from state it already held rather than computed."""
-        return self.ws.cached_tokens()
 
     def fork(self, on: "Pipeline") -> "WorkingSet":
         """A child sharing the frozen part, with a copy of the buffer."""
