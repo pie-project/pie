@@ -31,28 +31,6 @@ constexpr float kEmpty = -5e4f;
 // A masked score: below the running maximum's floor, so it weighs nothing.
 constexpr float kMasked = -3.0e38f;
 
-// A float in cluster block `rank`'s shared memory, at the address `at` holds
-// in this block's.
-__device__ __forceinline__ float ld_cluster(const float* at, unsigned rank) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    const unsigned local = static_cast<unsigned>(__cvta_generic_to_shared(at));
-    unsigned remote;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(local), "r"(rank));
-    float v;
-    asm volatile("ld.shared::cluster.f32 %0, [%1];" : "=f"(v) : "r"(remote) : "memory");
-    return v;
-#else
-    return rank == 0 ? *at : 0.f;
-#endif
-}
-
-__device__ __forceinline__ void sync_cluster() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::
-                     : "memory");
-#endif
-}
-
 __device__ __forceinline__ void cp16(void* dst, const void* src, bool live) {
     const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
