@@ -316,6 +316,7 @@ fn vsilu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
 // dst = silu(src), the lean form (SILUQ 1): e = exp(-|x|) (the sign bit set by one or16 on the high
 // halves, a lower clamp only), 1 / (1 + e) by the quadratic and one Newton step (~1e-4), no copies
 param SILUQ: u16 = 1;
+param SILUQN: u16 = 2;   // Newton steps (2: bit-identical to vsilu; 1 flipped golden3's token 146 with HACC16, 0744)
 var vah = vk_d;
 fn vinit2() void { vah = @increment_dsd_offset(@set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, &va)), 2), 1, u16); }
 fn vsiluq(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
@@ -347,9 +348,12 @@ fn vsiluq(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
   @fadds(r, r, -1.4540415401729079);
   @fmuls(r, r, x);
   @fadds(r, r, 2.1207294161729284);         // 1 / d to 1%
-  @fmuls(dst, x, r);
-  @fsubs(dst, 2.0, dst);
-  @fmuls(r, r, dst);                        // to ~1e-4
+  var k: u16 = 0;
+  while (k < SILUQN) : (k += 1) {           // Newton: 1 step ~1e-4, 2 steps = vsilu's arithmetic
+    @fmuls(dst, x, r);
+    @fsubs(dst, 2.0, dst);
+    @fmuls(r, r, dst);
+  }
   @fmuls(dst, src, p);
   @fmaxs(dst, dst, src);
   @fmuls(dst, dst, r);
@@ -568,7 +572,7 @@ fn att(a: u16) void {
     while (h < Qh) : (h += 1) {
       const l = t[h * (Dc + 1) + Dc];
       if (l < 0.00390625 or l >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
-      ilh[h] = if (ATTL != 0) recip2(l) else recip(l);
+      ilh[h] = if (ATTL == 1) recip2(l) else recip(l);   // (ATTL 2 keeps recip's three steps: exact)
       if (ATTV == 0) {
         var d: u16 = 0;
         while (d < Dc) : (d += 1) { u[h * Dc + d] = t[h * (Dc + 1) + d] * ilh[h] * gate[h * Dc + d]; }
