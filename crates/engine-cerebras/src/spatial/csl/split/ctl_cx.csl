@@ -30,6 +30,9 @@ var x = @zeros([Hc]f32);
 var x_ptr: [*]f32 = &x;
 var xdbg = @zeros([K * Hc]f32);   // x after each layer of the last pass (diagnostics, host-read)
 var xdbg_ptr: [*]f32 = &xdbg;
+var xred = @zeros([2 * K * Hc]f32);   // each row reduction's sum of the last pass (diagnostics)
+var xred_ptr: [*]f32 = &xred;
+fn keep_red(i: u16) void { @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |j|{2 * K * Hc} -> xred[j] }), @as(i16, i * Hc), f32), Hc), t_d); }
 var gam = @zeros([2 * K * Hc]@fp16());   // [layer][g1 | g2], the host's f16 gammas (1 + w)
 var gam_ptr: [*]@fp16() = &gam;
 var t = @zeros([Hc + 1]f32);             // the merged partial; then the multicast's words
@@ -162,11 +165,13 @@ task pass_task() void {
       norm_send(2 * l);
       if ((DIAG & 8) == 0) {
       reduce();
+      keep_red(2 * l);
       @fadds(x_d, x_d, t_d);
       }
       if ((DIAG & 4) == 0) {
       norm_send(2 * l + 1);
       reduce();
+      keep_red(2 * l + 1);
       @fadds(x_d, x_d, t_d);
       }
       @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{K * Hc} -> xdbg[i] }), @as(i16, l * Hc), f32), Hc), x_d);
@@ -193,6 +198,7 @@ comptime {
   @initialize_queue(q_ho, .{ .color = C_PARK });
   @export_symbol(x_ptr, "x");
   @export_symbol(xdbg_ptr, "xdbg");
+  @export_symbol(xred_ptr, "xred");
   @export_symbol(tdbg_ptr, "tdbg");
   @export_symbol(gam_ptr, "gam");
   @export_symbol(rcfg_ptr, "rcfg");

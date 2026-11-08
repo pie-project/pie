@@ -117,9 +117,17 @@ const q_ao = @get_output_queue(4);   // the segment / GDN exchange / relay sends
 const C_PARK: color = @get_color(16);   // nothing routes it to a ramp
 const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
+const ut_xa = @get_ut_id(2);
+const ut_xb = @get_ut_id(3);
 param FIFOW: u16 = 32;
 var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
+// one FIFO per user (the row reduction, the column reduction, the scores segment): a FIFO
+// shared across them gave wrong two-level row sums in unit 1's attention layer on the CS-3 (0730)
+var fifo_xbuf = @zeros([FIFOW]f32);
+const fifo_x = @allocate_fifo(fifo_xbuf);
+var fifo_sbuf = @zeros([FIFOW]f32);
+const fifo_s = @allocate_fifo(fifo_sbuf);
 
 fn fout(comptime q: output_queue, n: u16) fabout_dsd {
   return @set_dsd_length(@get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = q }), n);
@@ -211,12 +219,14 @@ fn init() void {
 // The partial y[0..n) into the row (X) or column reduction.
 fn send_x(n: u16) void {
   const d = @set_dsd_length(y_d, n);
-  const A = .{ .async = true, .ut_id = ut_b };
+  // (the row's async ops on microthreads 2 / 3, the ids of their input queues, as the column's
+  // run on 4 / 5: the two-level row reduction went wrong on the CS-3 with 4 / 5, 0727)
+  const A = .{ .async = true, .ut_id = ut_xb };
   if (role_x == 0) { @fmovs(fout(q_xo, n), d, A); }
   else if (role_x == 1) { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
   else if (role_x == 2) {
-    @fadds(fifo, fin(q_xa, n), d, .{ .async = true, .ut_id = ut_a });
-    @fadds(fout(q_xo, n), fin(q_xb, n), fifo, A);
+    @fadds(fifo_x, fin(q_xa, n), d, .{ .async = true, .ut_id = ut_xa });
+    @fadds(fout(q_xo, n), fin(q_xb, n), fifo_x, A);
   } else { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
 }
 fn send_y(n: u16) void {
@@ -267,15 +277,17 @@ fn mvp(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
 // multicast's (iq6) on their own colours (rcfg[RQ + 12 ..]: GDN's (k, q) multicast, the
 // scores' level 1, level 2, output, multicast), static routes; mode 0 restores.
 fn qmode(m: u16) void {
-  // the row / column reductions keep their queues (an async add-forward may still wait on its
-  // input): the segments use iq3 / iq5 (unused level-2 inputs), iq6 (idle row multicast), oq4
+  // the row / column reductions keep their queues (iq2-iq5: an async add-forward may still wait on
+  // its input, and rebinding a live level-2 input queue gave wrong two-level row sums on the CS-3,
+  // 0725-0731): the segments use iq7 (the column multicast, idle then) and iq6 (the row multicast), oq4
   while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}   // oq4 empty
   if (m == 0) {
-    iqc(3, rcfg[RQ + 1]); iqc(5, rcfg[RQ + 3]); iqc(6, rcfg[RQ + 4]);
+    iqc(6, rcfg[RQ + 4]); iqc(7, rcfg[RQ + 5]);
   } else if (m == 1) {
     iqc(6, rcfg[RQ + 12]); oqc(4, rcfg[RQ + 12]);
   } else {
-    iqc(3, rcfg[RQ + 13]); iqc(5, rcfg[RQ + 14]); oqc(4, rcfg[RQ + 15]); iqc(6, rcfg[RQ + 16]);
+    iqc(7, rcfg[RQ + 13]); oqc(4, rcfg[RQ + 15]);
+    iqc(6, if (role_s == 4) rcfg[RQ + 14] else rcfg[RQ + 16]);
   }
 }
 
@@ -367,16 +379,22 @@ fn exp_v(buf: mem1d_dsd, n: u16) void {
 fn seg_ar(n: u16) void {
   const d = @set_dsd_length(sx_d, n);
   qmode(2);
-  const A = .{ .async = true, .ut_id = ut_b };
-  if (role_s == 4) {
-    @fadds(fifo, fin(q_yb, n), d, .{ .async = true, .ut_id = ut_a });
-    @fadds(fout(q_ao, n), fin(q_xb, n), fifo, A);
-  } else if (role_s == 6) { @fadds(fout(q_ao, n), fin(q_xb, n), d, A); }   // a root of one half
-  else if (role_s == 0) { @fmovs(fout(q_ao, n), d, A); }
-  else { @fadds(fout(q_ao, n), fin(q_xb, n), d, A); }
-  @fmovs(d, fin(q_xm, n));
+  if (role_s == 4) {            // a root of two halves: both into d (blocking), then the multicast
+    @fadds(d, d, fin(q_ym, n));
+    @fadds(d, d, fin(q_xm, n));
+    @fmovs(fout(q_ao, n), d);
+  } else if (role_s == 6) {     // a root of one half
+    @fadds(d, d, fin(q_ym, n));
+    @fmovs(fout(q_ao, n), d);
+  } else {
+    const A = .{ .async = true, .ut_id = ut_b };
+    if (role_s == 0) { @fmovs(fout(q_ao, n), d, A); }
+    else { @fadds(fout(q_ao, n), fin(q_ym, n), d, A); }
+    @fmovs(d, fin(q_xm, n));
+  }
   qmode(0);
 }
+
 fn rsq(v: f32) f32 {
   var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
   y = y * (1.5 - 0.5 * v * y * y);
