@@ -169,6 +169,8 @@ fn init() void {
   role_s = @as(u16, rcfg[RQ + 7]);
   timestamp.enable_tsc();
   vinit();
+  var g: u16 = 0;
+  while (CONVQK == 1 and g < NLG) : (g += 1) { gpar[2 * g] = -exp1(gpar[2 * g]); }
   
   sys_mod.unblock_cmd_stream();
 }
@@ -300,7 +302,28 @@ fn vsilu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
 }
 
 // ---------------------------------------------------------------- layers
-fn gdn(g: u16) void {
+// conv1d (CONV taps) over channels [o, o + n): u[o..) = the window's taps and t's new value; the
+// window is a ring (row wp the oldest, wp advancing once a pass): the new raw value replaces the oldest
+var wp: u16 = 0;
+fn conv(g: u16, o: u16, n: u16) void {
+  const wb = g * (CONV - 1) * NCH;
+  const cwb = g * CONV * NCH;
+  const cwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NCH} -> cw[i] });
+  const cwn = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NCH} -> cwin[i] });
+  const acc = @set_dsd_length(va_d, n);
+  const cv = uv(o, n);
+  @fmuls(cv, tv(o, n), @set_dsd_length(@increment_dsd_offset(cwd, @as(i16, cwb + (CONV - 1) * NCH + o), f32), n));
+  var j: u16 = 0;
+  while (j < CONV - 1) : (j += 1) {
+    var r = wp + j;
+    if (r >= CONV - 1) { r -= CONV - 1; }
+    @fmuls(acc, @set_dsd_length(@increment_dsd_offset(cwn, @as(i16, wb + r * NCH + o), f32), n),
+           @set_dsd_length(@increment_dsd_offset(cwd, @as(i16, cwb + j * NCH + o), f32), n));
+    @fadds(cv, cv, acc);
+  }
+  @fmovs(@set_dsd_length(@increment_dsd_offset(cwn, @as(i16, wb + wp * NCH + o), f32), n), tv(o, n));
+}
+fn gdn_pre0(g: u16) f32 {
   const N = NQG + 1;
   reduce(N);
   stamp(1 + 6 * cl + 0);
@@ -339,6 +362,40 @@ fn gdn(g: u16) void {
   const zd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> zs[i] }), DV);
   vsilu(uv(0, DV), zd, DV);                // silu(z) while the weight PEs work
   @fmovs(zd, uv(0, DV));
+  return bt;
+}
+param CONVQK: u16 = 1;   // 1: q / k's conv and SiLU before the multicast, v / z / beta after it, the window a ring
+param ATTV: u16 = 1;     // 1: attention's o / l times the gate as vector ops
+fn gdn(g: u16) void {
+  const bt = if (CONVQK == 1) gdn_pre1(g) else gdn_pre0(g);
+  gdn_post(g, bt);
+}
+fn gdn_pre1(g: u16) f32 {
+  const N = NQG + 1;
+  reduce(N);
+  stamp(1 + 6 * cl + 0);
+  const rr = rsqrt(t[NQG] / HID + EPS);
+  // on the path to the multicast: q / k's rms scale, conv and SiLU, the decay (v, z, beta after it)
+  @fmuls(tv(0, 2 * DK), tv(0, 2 * DK), rr);
+  conv(g, 0, 2 * DK);
+  vsilu(tv(0, 2 * DK), uv(0, 2 * DK), 2 * DK);
+  const dec = exp1(gpar[2 * g] * softplus(t[2 * DK + 2 * DV + 1] * rr + gpar[2 * g + 1]));   // gpar[2 g] = -exp(A) (init)
+  @fmovs(uv(0, DK), tv(DK, DK));          // k
+  @fmovs(uv(DK, DK), tv(0, DK));          // q
+  u[2 * DK] = dec;
+  u[2 * DK + 1] = 0.0;
+  mcast(2 * DK + 2);
+  stamp(1 + 6 * cl + 1);
+  @fmuls(tv(2 * DK, NQG - 2 * DK), tv(2 * DK, NQG - 2 * DK), rr);
+  conv(g, 2 * DK, DV);
+  vsilu(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vs[i] }), DV), uv(2 * DK, DV), DV);
+  const bt = sigm(t[2 * DK + 2 * DV]);
+  const zd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> zs[i] }), DV);
+  vsilu(zd, tv(2 * DK + DV, DV), DV);      // silu(z) while the weight PEs work
+  return bt;
+}
+fn gdn_post(g: u16, bt: f32) void {
+  const zd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> zs[i] }), DV);
   // the state reduction: S^T k | S^T q | k^2 | q^2 | k.q
   reduce(2 * DV + 3);
   stamp(1 + 6 * cl + 2);
@@ -399,6 +456,11 @@ fn rope(o: u16) void {
     t[o + 2 * j + 1] = b * rc[j] + a * rs[j];
   }
 }
+var ilh = @zeros([mx(Qh, 1)]f32);
+const t4 = @get_dsd(mem4d_dsd, .{ .tensor_access = |h, d|{Qh, Dc} -> t[h * @as(i16, Dc + 1) + d] });
+const il4 = @get_dsd(mem4d_dsd, .{ .tensor_access = |h, d|{Qh, Dc} -> ilh[h] });
+const o4 = @get_dsd(mem4d_dsd, .{ .tensor_access = |h, d|{Qh, Dc} -> u[h * @as(i16, Dc) + d] });
+const g4 = @get_dsd(mem4d_dsd, .{ .tensor_access = |h, d|{Qh, Dc} -> gate[h * @as(i16, Dc) + d] });
 fn att(a: u16) void {
   const N = NQA + 1;
   const QD: u16 = Qh * Dc;
@@ -442,11 +504,20 @@ fn att(a: u16) void {
     while (h < Qh) : (h += 1) {
       const l = t[h * (Dc + 1) + Dc];
       if (l < 0.00390625 or l >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
-      const il = recip(l);
-      var d: u16 = 0;
-      while (d < Dc) : (d += 1) { u[h * Dc + d] = t[h * (Dc + 1) + d] * il * gate[h * Dc + d]; }
-      u[QD + 1 + h] = ln1(l);
+      ilh[h] = recip(l);
+      if (ATTV == 0) {
+        var d: u16 = 0;
+        while (d < Dc) : (d += 1) { u[h * Dc + d] = t[h * (Dc + 1) + d] * ilh[h] * gate[h * Dc + d]; }
+      }
     }
+    if (ATTV == 1) {
+      // o / l, then the gate (vector ops over the heads; every operand the same 2-D access, so the
+      // walk order of a mem4d DSD's indices does not matter)
+      @fmuls(o4, t4, il4);
+      @fmuls(o4, o4, g4);
+    }
+    h = 0;
+    while (h < Qh) : (h += 1) { u[QD + 1 + h] = ln1(t[h * (Dc + 1) + Dc]); }
     u[QD] = bad;
     mcast(QD + 1 + Qh);
     stamp(1 + 6 * cl + 3);
@@ -454,10 +525,66 @@ fn att(a: u16) void {
   }
 }
 
+// The MLP's SiLU in f16 (sf16's silu16, the f32-scaled form: s g log2e and s u ln2 in f32,
+// rounded once; emu/tf9.py's _s16 mode: 0 TF mismatches over golden3's 256)
+param SILU16: u16 = 1;
+var hg = @zeros([2 * Ic]@fp16());   // G | U
+var ht = @zeros([Ic]@fp16());
+var hm = @zeros([Ic]@fp16());
+var hp = @zeros([Ic]@fp16());
+var hq = @zeros([Ic]@fp16());
+var hww = @zeros([Ic]@fp16());
+var hu16 = @zeros([Ic]u16);
+const h_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Ic} -> hg[i] });
+const HG = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> hg[i] });
+const HU = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> hg[@as(i16, Ic) + i] });
+const HT = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> ht[i] });
+const HM = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> hm[i] });
+const HP = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> hp[i] });
+const HQ = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> hq[i] });
+const HW = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> hww[i] });
+const HB = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> hu16[i] });
+fn hb(d: [*]@fp16()) mem1d_dsd { return @set_dsd_base_addr(HB, @ptrcast([*]u16, d)); }
+fn silu16(rr: f32) void {
+  @fmuls(tv(0, Ic), tv(0, Ic), rr * 1.4426950408889634);
+  @fmuls(tv(Ic, Ic), tv(Ic, Ic), rr * 0.6931471805599453);
+  @fs2h(h_d, tv(0, 2 * Ic));
+  @or16(hb(&ht), hb(&hg), 0x8000);            // t = -|a'|
+  @fmaxh(HT, HT, @as(@fp16(), -15.0));
+  @faddh(HM, HT, @as(@fp16(), 1536.0));       // m = t + 1536: round(t) in its low bits
+  @faddh(HP, HM, @as(@fp16(), -1536.0));      // n
+  @fsubh(HQ, HT, HP);                         // r = t - n in [-0.5, 0.5]
+  @fmulh(HP, HQ, @as(@fp16(), 0.05516966520599117));
+  @faddh(HP, HP, @as(@fp16(), 0.24260644929856207));
+  @fmulh(HP, HP, HQ);
+  @faddh(HP, HP, @as(@fp16(), 0.6932608957863087));
+  @fmulh(HP, HP, HQ);
+  @faddh(HP, HP, @as(@fp16(), 0.9999283788785166));   // 2^r
+  @add16(hb(&hm), hb(&hm), 0x9a0f);           // n + 15 (1536's bits 0x6600)
+  @sll16(hb(&hm), hb(&hm), 10);               // 2^n
+  @fmulh(HP, HP, HM);                         // e = exp(-|a|)
+  @faddh(HW, HP, @as(@fp16(), 1.0));          // d = 1 + e in (1, 2]
+  @fmulh(HQ, HW, @as(@fp16(), 0.323112507040746));
+  @faddh(HQ, HQ, @as(@fp16(), -1.4540415401729079));
+  @fmulh(HQ, HQ, HW);
+  @faddh(HQ, HQ, @as(@fp16(), 2.1207294161729284));   // 1/d to 1%
+  @fmulh(HW, HW, HQ);
+  @fsubh(HW, @as(@fp16(), 2.0), HW);
+  @fmulh(HQ, HQ, HW);                         // 1/d to 1e-4
+  @fmulh(HP, HP, HG);                         // a' e
+  @fmaxh(HP, HP, HG);                         // a' (a >= 0) or a' e (a < 0)
+  @fmulh(HP, HP, HU);
+  @fmulh(HP, HP, HQ);
+}
 fn mlp() void {
   reduce(2 * Ic + 1);
   stamp(1 + 6 * cl + 4);
   const rr = rsqrt(t[2 * Ic] / HID + EPS);
+  if (SILU16 == 1) {
+    silu16(rr);
+    @fh2s(fout(q_mc, Ic), HP);
+    return;
+  }
   @fmuls(tv(0, 2 * Ic), tv(0, 2 * Ic), rr);
   vsilu(uv(0, Ic), tv(0, Ic), Ic);
   @fmuls(uv(0, Ic), uv(0, Ic), tv(Ic, Ic));
@@ -483,6 +610,7 @@ task pass_task() void {
       if ((DIAG & 4) == 0) { mlp(); }
       stamp(1 + 6 * l + 5);
     }
+    if (CONVQK == 1) { wp = if (wp + 1 >= CONV - 1) 0 else wp + 1; }
   }
   sys_mod.unblock_cmd_stream();
 }
