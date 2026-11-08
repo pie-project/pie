@@ -9,6 +9,17 @@
 use engine_cerebras::sdk::{Platform, Runtime, Sdk, Simulator, Target};
 use engine_cerebras::spatial::split::{SplitModel, SplitSpec, argmax};
 
+fn f16(h: u16) -> f32 {
+    let s = if h >> 15 == 1 { -1.0 } else { 1.0 };
+    let e = ((h >> 10) & 0x1f) as i32;
+    let m = (h & 0x3ff) as f32;
+    s * if e == 0 {
+        m * 2f32.powi(-24)
+    } else {
+        (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+    }
+}
+
 fn run(m: &mut SplitModel, prompt: &[u32], n: usize, steps: usize) -> Vec<u32> {
     let mut got = Vec::new();
     let mut feed = prompt.to_vec();
@@ -84,11 +95,65 @@ fn main() {
             if good { "ok" } else { "BAD" }
         );
     }
-    // A logits row: the prompt's last row's lgt argmax is the first token.
+    // A logits row: the prompt's last row's lgt argmax is the first token,
+    // and the scaled row is the head's matvec over the final norm of the
+    // last unit's x (a host reference from the prep's tiles).
     let (_, l) = m.forward(&prompt, 0, true).unwrap();
-    let best = argmax(&l.unwrap()).unwrap();
+    let l = l.unwrap();
+    let best = argmax(&l).unwrap();
     ok &= best == want[0];
     println!("LOGITS argmax {best} want {}", want[0]);
+    let g = spec.geo().unwrap();
+    let (lx, ly) = g.unit_origin(g.units() - 1);
+    let hc = spec.int("Hc").unwrap() as usize;
+    let py = spec.int("PY").unwrap();
+    let mut x = Vec::new();
+    for (r0, r1) in [(0, g.yc), (g.yc, py)] {
+        let y0 = ly + r0 + u32::from(r0 >= g.yc);
+        let r = engine_cerebras::sdk::Rect {
+            x: (lx + g.xc) as i32,
+            y: y0 as i32,
+            w: 1,
+            h: (r1 - r0) as i32,
+        };
+        x.extend(
+            m.dev
+                .get("x", r, hc)
+                .unwrap()
+                .into_iter()
+                .map(f32::from_bits),
+        );
+    }
+    let rms = (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len() as f64 + 1e-6).sqrt();
+    let hw = spec.npy("hw").unwrap();
+    let hg = spec.npy("hg").unwrap();
+    let (hr, hcn, per) = (hw.shape[0], hw.shape[1], hw.shape[2]);
+    let vr = spec.int("VR").unwrap() as usize;
+    let hdc = per / vr;
+    let mut w = Vec::new();
+    hw.words(0, hr * hcn * per, &mut w).unwrap();
+    let mut gv = Vec::new();
+    hg.words(0, hcn * hdc, &mut gv).unwrap();
+    let mut worst = 0f64;
+    let mut big = 0f64;
+    for v in 0..l.len() {
+        let (rr, j) = (v / vr, v % vr);
+        let mut acc = 0f64;
+        for c in 0..hcn {
+            for d in 0..hdc {
+                let h = f16(w[(rr * hcn + c) * per + d * vr + j] as u16) as f64;
+                acc += h * f32::from_bits(gv[c * hdc + d]) as f64 * x[c * hdc + d] as f64;
+            }
+        }
+        let rf = acc / rms;
+        worst = worst.max((rf - l[v] as f64).abs());
+        big = big.max(rf.abs());
+    }
+    let rel = worst / big.max(1e-30);
+    ok &= rel < 2e-2;
+    println!(
+        "LOGITS scaled vs host reference: max |diff| {worst:.5} of max |logit| {big:.4} (rel {rel:.2e}), rms {rms:.4}"
+    );
     println!(
         "{}",
         if ok {

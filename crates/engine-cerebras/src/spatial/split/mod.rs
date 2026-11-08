@@ -143,6 +143,11 @@ pub struct SplitModel {
     yc: u32,
     x_cx: u32,
     hctl: u32,
+    /// The last unit's CX column (the final residual x, the head's input).
+    last_cx: (u32, u32),
+    eps: f32,
+    /// Prompt rows forced through the token loop (`PIE_CEREBRAS_SPLIT_FORCE=1`).
+    force: bool,
 }
 
 impl SplitModel {
@@ -197,6 +202,16 @@ impl SplitModel {
             py: g.p.py,
             yc: g.yc,
             x_cx: u0.0 + g.xc,
+            last_cx: {
+                let (x, y) = g.unit_origin(g.units() - 1);
+                (x + g.xc, y)
+            },
+            force: std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1"),
+            eps: spec
+                .meta
+                .get("EPS")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-6) as f32,
             hctl: g.hx0 + g.hxc,
             hemb,
         })
@@ -271,12 +286,49 @@ impl SplitModel {
 
     /// `tokens` at `start..` one pass a launch (no reads).
     fn feed(&mut self, tokens: &[u32], start: usize) -> R<()> {
+        if self.force && self.wl && tokens.len() > 1 {
+            for (i, chunk) in tokens.chunks(self.cap).enumerate() {
+                self.forced(chunk, start + i * self.cap, 0, false)?;
+            }
+            return Ok(());
+        }
         for (i, &t) in tokens.iter().enumerate() {
             self.put_x(t)?;
             self.launch(1, start + i)?;
             self.fed.push(t);
         }
         Ok(())
+    }
+
+    /// `tokens` and `extra` passes past them in one launch
+    /// (`PIE_CEREBRAS_SPLIT_FORCE=1`, a build with the head's force table):
+    /// the first token's x from the host, then the root's winner at steps
+    /// s < n - 1 forced to `tokens[s + 1]` (the ring keeps the argmax). The
+    /// ring's first `n + extra` words when `read`.
+    fn forced(&mut self, tokens: &[u32], start: usize, extra: usize, read: bool) -> R<Vec<u32>> {
+        let n = tokens.len();
+        let root = Rect {
+            x: self.hctl as i32,
+            y: (self.hr / 2) as i32,
+            w: 1,
+            h: 1,
+        };
+        self.put_x(tokens[0])?;
+        if n > 1 {
+            self.dev.put("force", root, n - 1, &tokens[1..])?;
+            self.dev.put("nforce", root, 1, &[(n - 1) as u32])?;
+        }
+        self.launch(n + extra, start)?;
+        if n > 1 {
+            self.dev.put("nforce", root, 1, &[0])?;
+        }
+        self.fed.extend_from_slice(tokens);
+        if !read {
+            return Ok(Vec::new());
+        }
+        let ring = self.ring(n + extra)?;
+        self.fed.extend_from_slice(&ring[n - 1..n - 1 + extra]);
+        Ok(ring)
     }
 
     /// The ring's first `n` winners.
@@ -305,6 +357,16 @@ impl SplitModel {
         let extra = extra
             .min(self.cap - 1)
             .min(self.positions.saturating_sub(start + n));
+        if self.force && n > 1 {
+            // the feed's head in whole launches, its tail and the loop one launch
+            let tail = n.min(self.cap - extra);
+            let head = n - tail;
+            self.feed(&tokens[..head], start)?;
+            let ring = self.forced(&tokens[head..], start + head, extra, true)?;
+            let mut out = vec![0u32; head];
+            out.extend(ring);
+            return Ok(out);
+        }
         self.feed(&tokens[..n - 1], start)?;
         let last = start + n - 1;
         self.put_x(tokens[n - 1])?;
@@ -318,7 +380,7 @@ impl SplitModel {
     }
 
     /// `tokens` at `start..`; with `logits`, the last row's (the head rows'
-    /// `lgt`: positive-scale logits, the final norm's rms left out).
+    /// `lgt`, scaled by the final norm's 1/rms of the last unit's x).
     pub fn forward(
         &mut self,
         tokens: &[u32],
@@ -340,7 +402,30 @@ impl SplitModel {
             },
             self.vr as usize,
         )?;
-        let mut l: Vec<f32> = w.into_iter().map(f32::from_bits).collect();
+        // `lgt` leaves out the final norm's 1/rms (argmax needs no scale):
+        // the rms of the head's input, the last unit's x.
+        let hc = self.hcc as usize;
+        let mut ss = 0f64;
+        for (r0, r1) in [(0, self.yc), (self.yc, self.py)] {
+            let y0 = self.last_cx.1 + r0 + u32::from(r0 >= self.yc);
+            let x = self.dev.get(
+                "x",
+                Rect {
+                    x: self.last_cx.0 as i32,
+                    y: y0 as i32,
+                    w: 1,
+                    h: (r1 - r0) as i32,
+                },
+                hc,
+            )?;
+            ss += x
+                .iter()
+                .map(|&b| f64::from(f32::from_bits(b)).powi(2))
+                .sum::<f64>();
+        }
+        let n = (self.py as usize * hc) as f64;
+        let scale = (1.0 / (ss / n + f64::from(self.eps)).sqrt()) as f32;
+        let mut l: Vec<f32> = w.into_iter().map(|b| f32::from_bits(b) * scale).collect();
         l.truncate(self.vocab);
         let mut am = vec![0u32; tokens.len()];
         if let Some(best) = argmax(&l) {
