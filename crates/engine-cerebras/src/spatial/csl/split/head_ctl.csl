@@ -25,6 +25,9 @@ fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]
 var t: [VR]f32 align(16) = @zeros([VR]f32);
 const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> t[i] });
 var t_ptr: [*]f32 = &t;           // "lgt": the row's VR logits of the last step (the host's full-logits path)
+param VARG: u16 = 1;   // 1: the row argmax as vector maxes + a first-match scan
+var tm: [VR]f32 align(16) = @zeros([VR]f32);
+const tm_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> tm[i] });
 var res = @zeros([4]f32);
 var res_ptr: [*]f32 = &res;
 const q_w = @get_input_queue(2);
@@ -167,7 +170,23 @@ task pass_task() void {
     var best: f32 = t[0];
     var bi: u16 = 0;
     var j: u16 = 1;
-    while (j < VR) : (j += 1) { if (t[j] > best) { best = t[j]; bi = j; } }
+    if (VARG == 1) {
+      // the row max by a halving tree of vector maxes, then the first index holding it (= the scalar
+      // scan's first maximum)
+      @fmovs(tm_d, t_d);
+      var n: u16 = VR;
+      while (n > 1) : (n -= n / 2) {
+        const h = n / 2;
+        @fmaxs(@set_dsd_length(tm_d, h), @set_dsd_length(tm_d, h), @set_dsd_length(@increment_dsd_offset(tm_d, @as(i16, n - h), f32), h));
+      }
+      best = tm[0];
+      j = 0;
+      while (j < VR and t[j] != best) : (j += 1) {}
+      bi = if (j < VR) j else 0;
+      if (j >= VR) { best = t[0]; }   // (no match: NaNs)
+    } else {
+      while (j < VR) : (j += 1) { if (t[j] > best) { best = t[j]; bi = j; } }
+    }
     res[0] = best;
     res[1] = @as(f32, rcfg[RQ + 4] + @as(u32, bi));
     res[2] += 1.0;

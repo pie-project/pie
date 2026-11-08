@@ -474,13 +474,39 @@ fn att_mix(a: u16) void {
     @fs2h(@set_dsd_length(xh_d, QO), fin(q_ym, QO));
     @fmovs(@set_dsd_length(sx_d, 1 + Qh), fin(q_ym, 1 + Qh));
     h = 0;
-    while (h < Qh) : (h += 1) { mref[a * Qh + h] += sx[1 + h]; }
+    if (ATTL == 1 and sx[0] == 0.0) {   // the logs after the o_proj send (lse_late), off the path
+      while (h < Qh) : (h += 1) { lpend[h] = sx[1 + h]; }
+      lpa = a + 1;
+    } else {
+      while (h < Qh) : (h += 1) { mref[a * Qh + h] += if (ATTL == 1) lnw(sx[1 + h]) else sx[1 + h]; }
+    }
     if (sx[0] == 0.0) { apass = 8; } else {
       @fs2h(@set_dsd_length(xh_d, QD), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> ab[i] }));
     }
   }
 }
 
+// ATTL 1: CY sends the softmax sums raw; their logs update the log-sum-exp references here
+param ATTL: u16 = 1;
+var lpend = @zeros([if (ATTL == 1) Qh else 1]f32);
+var lpa: u16 = 0;   // 1 + the layer whose logs are pending
+fn lnw(x: f32) f32 {
+  const bb = @bitcast(u32, x);
+  const e = @as(f32, @as(i16, @as(u16, (bb >> 23) & 0xff)) - 127);
+  const m = @bitcast(f32, (bb & 0x007fffff) | 0x3f800000);
+  const r = rsq(m + 1.0);
+  const z = (m - 1.0) * r * r;
+  const z2 = z * z;
+  const p = z * (2.0 + z2 * (0.6666667 + z2 * (0.4 + z2 * 0.2857143)));
+  return e * 0.6931471805599453 + p;
+}
+fn lse_late() void {
+  if (lpa == 0) { return; }
+  const a = lpa - 1;
+  var h: u16 = 0;
+  while (h < Qh) : (h += 1) { mref[a * Qh + h] += lnw(lpend[h]); }
+  lpa = 0;
+}
 // KV matvecs (scores, values with the softmax sums): f16 operands, f32 accumulation (@fmachs):
 // an f16 accumulator overflows on a cold log-sum-exp pass (sums of probabilities up to 65504
 // each), and the reference step ln(l) must stay finite
@@ -496,8 +522,12 @@ fn kvmv(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
 }
 
 // ---------------------------------------------------------------- a pass
+param SSQL: u16 = 1;   // 1: x's sum of squares arrives after x (ctl_cx.csl): taken after the matvec
 fn recv_x(nout: u16) void {
   @fs2h(@set_dsd_length(xh_d, Hc), fin(q_xm, Hc));
+  if (SSQL == 0) { recv_ss(nout); }
+}
+fn recv_ss(nout: u16) void {
   @fmovs(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, nout), f32), 1), fin(q_xm, 1));
 }
 fn recv_col(n: u16) void {
@@ -512,6 +542,7 @@ fn layer(l: u16, b: u32) u32 {
   recv_x(NQ);
   stamp(1 + 9 * l);
   mv(b, Hc, NQ);
+  if (SSQL == 1) { recv_ss(NQ); }
   stamp(2 + 9 * l);
   if ((DIAG & 16) != 0) { send_x(Hc); return b; }   // (diagnostics) the row multicast and the row reduction only
   send_y(NQ + 1);
@@ -525,11 +556,12 @@ fn layer(l: u16, b: u32) u32 {
   mv(bo, QO, Hc);
   stamp(5 + 9 * l);
   send_x(Hc);
-  if (GDN == 1 and !att) { gdn_update(lg); lg += 1; } else { la += 1; }
+  if (GDN == 1 and !att) { gdn_update(lg); lg += 1; } else { if (ATT == 1 and ATTL == 1) { lse_late(); } la += 1; }
   if ((DIAG & 4) == 0) {
   recv_x(2 * Ic);
   stamp(6 + 9 * l);
   mv(bo + @as(u32, QO) * Hc, Hc, 2 * Ic);
+  if (SSQL == 1) { recv_ss(2 * Ic); }
   stamp(7 + 9 * l);
   send_y(2 * Ic + 1);
   recv_col(Ic);

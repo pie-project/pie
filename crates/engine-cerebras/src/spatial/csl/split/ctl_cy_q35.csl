@@ -63,8 +63,8 @@ var cwin = @zeros([if (NLG > 0) NLG * (CONV - 1) * NCH else 1]f32);
 var cw = @zeros([if (NLG > 0) NLG * CONV * NCH else 1]f32);
 var gpar = @zeros([if (NLG > 0) NLG * 2 else 1]f32);
 var gnw = @zeros([if (NLG > 0) NLG * DV else 1]f32);
-var zs = @zeros([mx(DV, 1)]f32);
-var vs = @zeros([mx(DV, 1)]f32);
+var vz = @zeros([2 * mx(DV, 1)]f32);     // v | z (one SiLU pass over both)
+const vz_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * mx(DV, 1)} -> vz[i] });
 var gsc = @zeros([4]f32);                  // beta, decay, then the norms' scalars
 // attention per layer: q / k norm weights (Qh Dc, Dc), RoPE tables [4][8][NROT] cos | sin,
 // the gate kept between the reductions, the LSE reference a head.
@@ -222,6 +222,16 @@ fn exp1(x0: f32) f32 {
   const s = @bitcast(f32, @as(u32, @as(u16, ki)) << 23);
   return p * s;
 }
+// ATTL 1: the softmax sums go out raw (the weight PEs take their logs off the path) and 1 / l takes two
+// Newton steps (o goes to f16)
+param ATTL: u16 = 1;
+fn rsqrt2(v: f32) f32 {
+  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
+  y = y * (1.5 - 0.5 * v * y * y);
+  y = y * (1.5 - 0.5 * v * y * y);
+  return y;
+}
+fn recip2(v: f32) f32 { const a = if (v < 0.0) -v else v; const r = rsqrt2(a); return if (v < 0.0) -(r * r) else r * r; }
 fn recip(v: f32) f32 { const a = if (v < 0.0) -v else v; const r = rsqrt(a); return if (v < 0.0) -(r * r) else r * r; }   // (not rsqrt(v v): v v overflows past 1.8e19, e.g. 1 + e^87 in a sigmoid)
 fn sigm(x: f32) f32 { return recip(1.0 + exp1(-x)); }
 fn silu(x: f32) f32 { return x * sigm(x); }
@@ -356,11 +366,11 @@ fn gdn_pre0(g: u16) f32 {
   @fmovs(uv(DK, DK), tv(0, DK));          // q
   u[2 * DK] = dec;
   u[2 * DK + 1] = if (tab[0] == 0) 1.0 else 0.0;
-  @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vs[i] }), DV), tv(2 * DK, DV));
-  @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> zs[i] }), DV), tv(2 * DK + DV, DV));
+  @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vz[i] }), DV), tv(2 * DK, DV));
+  @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vz[@as(i16, DV) + i] }), DV), tv(2 * DK + DV, DV));
   mcast(2 * DK + 2);
   stamp(1 + 6 * cl + 1);
-  const zd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> zs[i] }), DV);
+  const zd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vz[@as(i16, DV) + i] }), DV);
   vsilu(uv(0, DV), zd, DV);                // silu(z) while the weight PEs work
   @fmovs(zd, uv(0, DV));
   return bt;
@@ -390,10 +400,10 @@ fn gdn_pre1(g: u16) f32 {
   if (GDEC == 1) { gdec = exp1(gpar[2 * g] * softplus(t[2 * DK + 2 * DV + 1] * rr + gpar[2 * g + 1])); }   // (off the path: see gdn_post)
   @fmuls(tv(2 * DK, NQG - 2 * DK), tv(2 * DK, NQG - 2 * DK), rr);
   conv(g, 2 * DK, DV);
-  vsilu(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vs[i] }), DV), uv(2 * DK, DV), DV);
+  // conv(v) | z side by side in u, one SiLU pass into v | z
+  @fmovs(uv(2 * DK + DV, DV), tv(2 * DK + DV, DV));
+  vsilu(vz_d, uv(2 * DK, 2 * DV), 2 * DV);
   const bt = sigm(t[2 * DK + 2 * DV]);
-  const zd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> zs[i] }), DV);
-  vsilu(zd, tv(2 * DK + DV, DV), DV);      // silu(z) while the weight PEs work
   return bt;
 }
 // GDEC 1: the weight PEs send S^T k / S^T q of the undecayed state; the decay scales the sums here and
@@ -401,7 +411,7 @@ fn gdn_pre1(g: u16) f32 {
 param GDEC: u16 = 1;
 var gdec: f32 = 1.0;
 fn gdn_post(g: u16, bt: f32) void {
-  const zd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> zs[i] }), DV);
+  const zd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vz[@as(i16, DV) + i] }), DV);
   // the state reduction: S^T k | S^T q | k^2 | q^2 | k.q
   reduce(2 * DV + 3);
   stamp(1 + 6 * cl + 2);
@@ -410,7 +420,7 @@ fn gdn_post(g: u16, bt: f32) void {
   const iq0 = rsqrt(t[2 * DV + 1] + EPS);
   const kq = t[2 * DV + 2] * ik * iq0;
   const iq = iq0 * rsqrt(@as(f32, HK));
-  const vsd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vs[i] }), DV);
+  const vsd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vz[i] }), DV);
   const dl = uv(DV, DV);
   const o = uv(0, DV);
   @fmuls(dl, tv(0, DV), ik);
@@ -433,9 +443,13 @@ fn gdn_post(g: u16, bt: f32) void {
   stamp(1 + 6 * cl + 3);
 }
 
-fn rope_tables() void {
-  // cos / sin of the pass's position for each rotated pair: products of 4 table levels
-  const p = tab[0];
+param ROPEP: u16 = 1;   // 1: the tables for the next position are computed after the multicast (off the path)
+var rope_at: u32 = 0xffffffff;   // the position rc / rs hold
+fn rope_tables() void { rope_tables_at(tab[0]); }
+fn rope_tables_at(p: u32) void {
+  // cos / sin of position p for each rotated pair: products of 4 table levels
+  if (rope_at == p) { return; }
+  rope_at = p;
   var j: u16 = 0;
   while (j < NROT) : (j += 1) {
     var c: f32 = 1.0;
@@ -465,10 +479,6 @@ fn rope(o: u16) void {
   }
 }
 var ilh = @zeros([mx(Qh, 1)]f32);
-const t4 = @get_dsd(mem4d_dsd, .{ .tensor_access = |h, d|{Qh, Dc} -> t[h * @as(i16, Dc + 1) + d] });
-const il4 = @get_dsd(mem4d_dsd, .{ .tensor_access = |h, d|{Qh, Dc} -> ilh[h] });
-const o4 = @get_dsd(mem4d_dsd, .{ .tensor_access = |h, d|{Qh, Dc} -> u[h * @as(i16, Dc) + d] });
-const g4 = @get_dsd(mem4d_dsd, .{ .tensor_access = |h, d|{Qh, Dc} -> gate[h * @as(i16, Dc) + d] });
 fn att(a: u16) void {
   const N = NQA + 1;
   const QD: u16 = Qh * Dc;
@@ -502,6 +512,7 @@ fn att(a: u16) void {
   u[QD + 2 * Dc] = @as(f32, tab[0]);
   mcast(QD + 2 * Dc + 2 + Qh);
   stamp(1 + 6 * cl + 1);
+  if (ROPEP == 1 and NLA == 1) { rope_tables_at(tab[0] + 1); }   // (one attention layer a unit: the next pass's tables)
   var gi: u16 = 0;   // the output gate's sigmoid while the weight PEs run the scores
   while (gi < QD) : (gi += 1) { gate[gi] = sigm(gate[gi]); }
   var pass: u16 = 0;
@@ -512,20 +523,23 @@ fn att(a: u16) void {
     while (h < Qh) : (h += 1) {
       const l = t[h * (Dc + 1) + Dc];
       if (l < 0.00390625 or l >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
-      ilh[h] = recip(l);
+      ilh[h] = if (ATTL == 1) recip2(l) else recip(l);
       if (ATTV == 0) {
         var d: u16 = 0;
         while (d < Dc) : (d += 1) { u[h * Dc + d] = t[h * (Dc + 1) + d] * ilh[h] * gate[h * Dc + d]; }
       }
     }
     if (ATTV == 1) {
-      // o / l, then the gate (vector ops over the heads; every operand the same 2-D access, so the
-      // walk order of a mem4d DSD's indices does not matter)
-      @fmuls(o4, t4, il4);
-      @fmuls(o4, o4, g4);
+      // o / l, then the gate: two vector ops a head (a mem4d form tripped cslc: "operand does not dominate")
+      const gd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> gate[i] });
+      var hh: u16 = 0;
+      while (hh < Qh) : (hh += 1) {
+        @fmuls(uv(hh * Dc, Dc), tv(hh * (Dc + 1), Dc), ilh[hh]);
+        @fmuls(uv(hh * Dc, Dc), uv(hh * Dc, Dc), @increment_dsd_offset(gd, @as(i16, hh * Dc), f32));
+      }
     }
     h = 0;
-    while (h < Qh) : (h += 1) { u[QD + 1 + h] = ln1(t[h * (Dc + 1) + Dc]); }
+    while (h < Qh) : (h += 1) { u[QD + 1 + h] = if (ATTL == 1) t[h * (Dc + 1) + Dc] else ln1(t[h * (Dc + 1) + Dc]); }
     u[QD] = bad;
     mcast(QD + 1 + Qh);
     stamp(1 + 6 * cl + 3);

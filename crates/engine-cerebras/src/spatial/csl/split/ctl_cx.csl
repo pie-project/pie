@@ -138,10 +138,11 @@ fn reduce() void {
   @fmovs(t_d, fin(q_lb, Hc));
 }
 // x g (f16) and the sum of squares of x, multicast along the row (Hc + 1 f32 words).
+param SSQL: u16 = 1;   // 1: x g goes first, the sum of squares (only CY needs it, after the column reduction) last
 fn norm_send(gi: u16) void {
   var ss: f32 = 0.0;
   var i: u16 = 0;
-  while (i < Hc) : (i += 1) { const v = x[i]; ss += v * v; }
+  if (SSQL == 0) { while (i < Hc) : (i += 1) { const v = x[i]; ss += v * v; } }
   const g = @increment_dsd_offset(g_d, @as(i16, gi * Hc), @fp16());
   if (XG16 == 1) {
     @fs2h(th_d, x_d);
@@ -150,6 +151,13 @@ fn norm_send(gi: u16) void {
   } else {
     @fh2s(t_d, g);
     @fmuls(t_d, t_d, x_d);
+  }
+  if (SSQL == 1) {
+    @fmovs(fout(q_mc, Hc), t_d);
+    while (i < Hc) : (i += 1) { const v = x[i]; ss += v * v; }
+    t[Hc] = ss;
+    @fmovs(fout(q_mc, 1), @increment_dsd_offset(@set_dsd_length(t1_d, 1), @as(i16, Hc), f32));
+    return;
   }
   t[Hc] = ss;
   @fmovs(fout(q_mc, Hc + 1), t1_d);
