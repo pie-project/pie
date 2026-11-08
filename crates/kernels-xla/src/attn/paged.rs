@@ -1096,8 +1096,13 @@ pub(crate) fn blocked(
 ) -> Built<Flashed> {
     let r = f.dims(rows.q)[0];
     let qh = h.qh().max(1);
-    let br = ch.block_rows.min(round_up(r, 8));
-    let nb = cdiv(r, br);
+    let wide = ch.block_rows.min(round_up(r, 8));
+    // As many blocks as `wide` rows need, each an even share of the rows: a
+    // 640-row prefill ran two blocks of 512 (384 rows of padding through
+    // every chunk's dots); now two of 320. The chunk width still follows
+    // `wide`, so every row walks the chunks it did.
+    let nb = cdiv(r, wide);
+    let br = round_up(cdiv(r, nb), 16).min(wide);
     let rp = nb * br;
     let rows_p = if rp > r {
         rows.map(f, &mut |f, v| pad_rows(f, v, rp - r))?
@@ -1105,7 +1110,7 @@ pub(crate) fn blocked(
         *rows
     };
     let width = (h.kvh * (h.d + h.dv)).max(1);
-    let fit = pow2_floor((ch.budget / (br * qh)).min(ch.budget / width).max(8));
+    let fit = pow2_floor((ch.budget / (wide * qh)).min(ch.budget / width).max(8));
     let c = ch.block_keys.min(fit).min(round_up(keys.max(1), 8));
     // Lanes narrower than a chunk: walk them a span at a time, so no chunk
     // straddles two lanes (the mask is then read as a window, below).
