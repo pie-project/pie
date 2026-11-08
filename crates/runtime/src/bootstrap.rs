@@ -662,10 +662,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
 fn verify_config(config: &Config) -> Result<()> {
     #[cfg(not(target_arch = "wasm32"))]
-    #[cfg(not(target_arch = "wasm32"))]
     if let Some((dir, budget)) = &config.snapshots {
         crate::handle::snapshot::configure(dir.clone(), *budget);
     }
+    #[cfg(not(target_arch = "wasm32"))]
     fs::create_dir_all(&config.cache_dir)
         .with_context(|| format!("Could not create cache dir: {:?}", config.cache_dir))?;
 
