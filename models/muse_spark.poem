@@ -33,8 +33,8 @@ DEPLOYMENTS = [
     deployment("muse-spark-open-mini-l4", weights = dtype.bf16, kv = dtype.bf16),
     deployment("muse-spark-open-mini-l4", weights = MXFP4, kv = dtype.bf16),
     # A miniature quantized by mlx under the release's names (affine 4-bit in
-    # 64-wide groups): the embedding, the head, every projection and every
-    # layer's experts; the norms, gates and router as released.
+    # 64-wide groups): the embedding, every projection and every layer's
+    # experts; the head, norms, gates and router as released.
     deployment("muse-spark-open-mini-l4", weights = dtype.u4g64, kv = dtype.bf16),
     # Keys and values e4m3 under a unit scale (vLLM's `fp8` KV).
     deployment("muse-spark-open", weights = NVFP4_A4, kv = dtype.e4m3),
@@ -148,7 +148,9 @@ def layout(id, deploy):
         top_k = d.top_k,
         inter = iw,
         embed = weight([d.vocab, hidden], w),
-        lm_head = weight([d.vocab, hidden], w),
+        # bf16 in mlx's 4-bit cut too: mlx-lm casts the head's input to the
+        # head weight's dtype, a quantized head's uint32 codes
+        lm_head = weight([d.vocab, hidden], dtype.bf16 if mlx4 else w),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
