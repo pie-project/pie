@@ -616,6 +616,22 @@ pub(crate) fn serves_this_deployment(path: &Path, backend: &str, deployment: &st
         .map_err(|mismatch| Fault::Recipe(mismatch.refuse(&path.display().to_string())))
 }
 
+/// The bytes landing every mxfp4 bank pre-scaled (e5m2, `Mxfp4Prescale`)
+/// adds to its e2m1 codes: the codes once more. Zero when the profile never
+/// pre-scales.
+pub(crate) fn prescale_bytes(trace: &Trace, engine: &Engine) -> Result<u64> {
+    if engine.prescale != Mxfp4Prescale::Fits {
+        return Ok(0);
+    }
+    trace
+        .params
+        .iter()
+        .filter(|p| p.dtype == Dtype::Mxfp4)
+        .try_fold(0u64, |sum, p| {
+            plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
+        })
+}
+
 /// The dense bf16 params every reader of which is a gemm taking it as its
 /// weight (`y = act · wᵀ`). They land transposed, `[K, N]` with the output
 /// axis minor: XLA's TPU gemm streams a `[N, K]` weight at ~1.2-1.4 TB/s

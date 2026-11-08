@@ -506,11 +506,22 @@ impl Shell {
         } else {
             weight_floor
         };
-        let room = working.map_or(u64::MAX, |working| {
-            working
-                .saturating_sub(weight_floor)
-                .saturating_sub(tpu.headroom())
-        });
+        let room_at = |floor: u64| {
+            working.map_or(u64::MAX, |working| {
+                working.saturating_sub(floor).saturating_sub(tpu.headroom())
+            })
+        };
+        let room = room_at(weight_floor);
+        // An mxfp4 bank lands pre-scaled where the weights leave room for it
+        // (under 5/8 of the HBM, as a dry device of this size decides), but
+        // the pool sized first took that room: every bank landed as codes,
+        // and a fire past a few rows decoded the whole bank to bf16 in every
+        // layer (v6e gpt-oss mini24-e32 at 256 lanes: 290 of a 338 ms step).
+        // Its doubled codes are held back from the pool when the pool keeps
+        // a whole context of pages beside them.
+        let prescale = crate::weights::prescale_bytes(&boot.trace, &engine)?;
+        let held_back = (prescale > 0 && weight_floor < tpu.hbm_bytes() / 8 * 5)
+            .then(|| room_at(weight_floor.saturating_add(prescale)));
         let least = u64::from(boot.context.div_ceil(boot.page_size.max(1)));
         // A plane's cells are addressed by a 32-bit word, and a device with
         // no limit fills to `FILL_PAGES` when no budget is stated.
@@ -526,6 +537,10 @@ impl Shell {
             paging_at(pages, slots)
                 .and_then(|paging| crate::store::pool_demand(&boot.trace, paging))
                 .unwrap_or(u64::MAX)
+        };
+        let room = match held_back {
+            Some(rest) if boot.kv_budget.is_none() && demand(least, boot.slots) <= rest => rest,
+            _ => room,
         };
         let (fit, slots) = engine::fit::pool_for(boot.kv_budget, boot.slots, least, room, demand)
             .map_err(|short| Fault::Residency(short.to_string()))?;
