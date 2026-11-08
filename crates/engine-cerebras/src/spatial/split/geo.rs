@@ -260,7 +260,10 @@ impl Geo {
         b: u32,
         m: u32,
         lp: bool,
-    ) -> R<(Vec<(P, (u32, u32, Option<u32>))>, (Option<u32>, Option<u32>))> {
+    ) -> R<(
+        Vec<(P, (u32, u32, Option<u32>))>,
+        (Option<u32>, Option<u32>),
+    )> {
         let mut out = Vec::new();
         let n = pts.len();
         for (i, &p) in pts.iter().enumerate() {
@@ -336,7 +339,9 @@ impl Geo {
         if g == 0 {
             let (o, h) = self.line(pts, root, a, b, m, false)?;
             return Ok((
-                o.into_iter().map(|(p, v)| (p, (v.0, v.1, v.2, None))).collect(),
+                o.into_iter()
+                    .map(|(p, v)| (p, (v.0, v.1, v.2, None)))
+                    .collect(),
                 h,
             ));
         }
@@ -447,7 +452,11 @@ impl Geo {
 
     fn path(&mut self, pts: &[P], c: u32) -> R<()> {
         for (i, &p) in pts.iter().enumerate() {
-            let r = if i == 0 { RX_R } else { rx(Self::dirn(p, pts[i - 1])) };
+            let r = if i == 0 {
+                RX_R
+            } else {
+                rx(Self::dirn(p, pts[i - 1]))
+            };
             let t = if i == pts.len() - 1 {
                 TX_R
             } else {
@@ -462,8 +471,15 @@ impl Geo {
         let n = pts.len();
         for (i, &p) in pts.iter().enumerate() {
             if i == src {
-                let t = (if i > 0 { tx(Self::dirn(p, pts[i - 1])) } else { 0 })
-                    | (if i < n - 1 { tx(Self::dirn(p, pts[i + 1])) } else { 0 });
+                let t = (if i > 0 {
+                    tx(Self::dirn(p, pts[i - 1]))
+                } else {
+                    0
+                }) | (if i < n - 1 {
+                    tx(Self::dirn(p, pts[i + 1]))
+                } else {
+                    0
+                });
                 self.add(p.0, p.1, c, RX_R | t)?;
                 continue;
             }
@@ -506,7 +522,8 @@ impl Geo {
                         let root = seg.len() / 2;
                         let (o, (lo, hi)) = self.line(&seg, root, SA, SB, SM, false)?;
                         for (p, (role, snd, rcv)) in o {
-                            self.wseg.insert(p, (role, [rcv, None, Some(snd), Some(SM)]));
+                            self.wseg
+                                .insert(p, (role, [rcv, None, Some(snd), Some(SM)]));
                         }
                         let two = lo.is_some() && hi.is_some();
                         self.wseg.insert(
@@ -534,7 +551,14 @@ impl Geo {
                         for (i, &p) in seg.iter().enumerate() {
                             self.gsrc.insert(
                                 p,
-                                (if i == own { 0x8000 | (r % self.p.dkg) } else { 0 }, Some(SG)),
+                                (
+                                    if i == own {
+                                        0x8000 | (r % self.p.dkg)
+                                    } else {
+                                        0
+                                    },
+                                    Some(SG),
+                                ),
                             );
                         }
                     }
@@ -562,8 +586,7 @@ impl Geo {
                 let cpts: Vec<P> = (0..px).map(|c| (x0 + self.wl(c, xc), y)).collect();
                 let mut s0 = 0;
                 while s0 < px as usize {
-                    let seg: Vec<P> =
-                        cpts[s0..(s0 + self.p.swv as usize).min(cpts.len())].to_vec();
+                    let seg: Vec<P> = cpts[s0..(s0 + self.p.swv as usize).min(cpts.len())].to_vec();
                     s0 += self.p.swv as usize;
                     if seg.len() == 1 {
                         self.cyseg.insert(seg[0], (5, None, None, None, None));
@@ -657,7 +680,9 @@ impl Geo {
                 let st: i64 = if xcc > xa { 1 } else { -1 };
                 let yb = b0.1 + pr;
                 let vs: i64 = if yb > ya { 1 } else { -1 };
-                let p1: Vec<P> = range_step(xa, xcc + st, st).map(|x| (x as u32, ya)).collect();
+                let p1: Vec<P> = range_step(xa, xcc + st, st)
+                    .map(|x| (x as u32, ya))
+                    .collect();
                 self.path(&p1, HA)?;
                 let p2: Vec<P> = range_step(ya as i64, yb as i64 + vs, vs)
                     .map(|y| (xcc as u32, y as u32))
@@ -670,11 +695,16 @@ impl Geo {
                 self.relay.entry((xcc as u32, ya)).or_default().post = Some((HA, hv));
                 self.relay.entry((xcc as u32, yb)).or_default().pre = Some((hv, HB));
                 self.cxq.entry((xa as u32, ya)).or_default().out = Some(HA);
-                self.cxq.entry(((b0.0 as i64 + xc) as u32, yb)).or_default().inn = Some(HB);
+                self.cxq
+                    .entry(((b0.0 as i64 + xc) as u32, yb))
+                    .or_default()
+                    .inn = Some(HB);
             } else {
                 let xb = b0.0 as i64 + xc;
                 let st: i64 = if xb > xa { 1 } else { -1 };
-                let p: Vec<P> = range_step(xa, xb + st, st).map(|x| (x as u32, ya)).collect();
+                let p: Vec<P> = range_step(xa, xb + st, st)
+                    .map(|x| (x as u32, ya))
+                    .collect();
                 self.path(&p, HX)?;
                 self.cxq.entry((xa as u32, ya)).or_default().out = Some(HX);
                 self.cxq.entry((xb as u32, ya)).or_default().inn = Some(HX);
@@ -728,7 +758,9 @@ impl Geo {
     }
 
     fn parks(&self, p: P, n: usize) -> R<Vec<u32>> {
-        let mut free: Vec<u32> = (0..NCOL).filter(|&c| self.get_route(p, c).is_none()).collect();
+        let mut free: Vec<u32> = (0..NCOL)
+            .filter(|&c| self.get_route(p, c).is_none())
+            .collect();
         free.extend((0..NCOL).filter(|&c| {
             self.get_route(p, c)
                 .is_some_and(|b| b & TX_R == 0 && (b & 0xe0) != RX_R)
@@ -762,9 +794,18 @@ impl Geo {
 
     pub fn rcfg_weight(&self, x: u32, y: u32, r: u32) -> R<Vec<u32>> {
         let p = (x, y);
-        let rx_ = *self.wrole_x.get(&p).ok_or_else(|| format!("{p:?}: no row role"))?;
-        let ry_ = *self.wrole_y.get(&p).ok_or_else(|| format!("{p:?}: no column role"))?;
-        let need = [rx_.2, rx_.3, ry_.2, ry_.3].iter().filter(|v| v.is_none()).count();
+        let rx_ = *self
+            .wrole_x
+            .get(&p)
+            .ok_or_else(|| format!("{p:?}: no row role"))?;
+        let ry_ = *self
+            .wrole_y
+            .get(&p)
+            .ok_or_else(|| format!("{p:?}: no column role"))?;
+        let need = [rx_.2, rx_.3, ry_.2, ry_.3]
+            .iter()
+            .filter(|v| v.is_none())
+            .count();
         let pk = self.parks(p, need)?;
         let mut it = pk.into_iter();
         let mut w = self.words(p, 16)?;
@@ -832,8 +873,11 @@ impl Geo {
         let p = (x, y);
         let pk = self.parks(p, 4)?;
         let mut w = self.words(p, 12)?;
-        let (role, si, so, sm, s2) =
-            self.cyseg.get(&p).copied().unwrap_or((5, None, None, None, None));
+        let (role, si, so, sm, s2) = self
+            .cyseg
+            .get(&p)
+            .copied()
+            .unwrap_or((5, None, None, None, None));
         let (lo, hi) = self.rootq[&p];
         let q = [
             lo.unwrap(),
@@ -873,7 +917,11 @@ impl Geo {
                 pk[0]
             },
         ];
-        let tr = if self.p.wl { self.hturn.get(&p).copied().unwrap_or(0) } else { 0 };
+        let tr = if self.p.wl {
+            self.hturn.get(&p).copied().unwrap_or(0)
+        } else {
+            0
+        };
         if tr & 1 != 0 && tr & 2 == 0 {
             q[3] = VA;
         }
@@ -891,7 +939,11 @@ impl Geo {
         }
         let q7 = if self.p.wl { HR3 } else { pk[5] };
         let fl = u32::from(self.p.wl) | (tr << 1);
-        let oq = if self.p.wl { [VA, VS, HE, HS] } else { [pk[6]; 4] };
+        let oq = if self.p.wl {
+            [VA, VS, HE, HS]
+        } else {
+            [pk[6]; 4]
+        };
         let fin = [q[0], q[1], q[2], q[3], q[4], q7];
         w.extend_from_slice(&q);
         w.push(if ro.0 == 3 { 1 } else { ro.0 });

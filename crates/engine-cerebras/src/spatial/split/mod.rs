@@ -62,11 +62,7 @@ impl SplitSpec {
             };
             meta.insert(k.to_string(), val);
         }
-        Ok(SplitSpec {
-            prep,
-            prefix,
-            meta,
-        })
+        Ok(SplitSpec { prep, prefix, meta })
     }
 
     pub fn int(&self, k: &str) -> Option<u32> {
@@ -153,14 +149,28 @@ impl SplitModel {
     pub fn open(mut dev: Box<dyn Device>, spec: &SplitSpec, vocab: usize) -> R<SplitModel> {
         let t0 = std::time::Instant::now();
         let g = spec.geo()?;
-        tracing::info!(ms = t0.elapsed().as_millis() as u64, w = g.w, h = g.h, "split: geometry built");
+        tracing::info!(
+            ms = t0.elapsed().as_millis() as u64,
+            w = g.w,
+            h = g.h,
+            "split: geometry built"
+        );
         let t1 = std::time::Instant::now();
         place::place(dev.as_mut(), &g, spec)?;
         tracing::info!(s = t1.elapsed().as_secs_f64(), "split: placed");
         dev.call("init", &[]).map_err(|e| format!("init: {e}"))?;
         // A launch can return before every PE ran it: a read from every PE
         // waits for each one's init.
-        dev.get("rcfg", Rect { x: 0, y: 0, w: g.w as i32, h: g.h as i32 }, 1)?;
+        dev.get(
+            "rcfg",
+            Rect {
+                x: 0,
+                y: 0,
+                w: g.w as i32,
+                h: g.h as i32,
+            },
+            1,
+        )?;
         let wl = g.p.wl;
         let hemb = spec.npy("hemb")?;
         let u0 = g.unit_origin(0);
@@ -214,7 +224,12 @@ impl SplitModel {
             let y0 = r0 + u32::from(r0 >= self.yc);
             self.dev.put(
                 "x",
-                Rect { x: self.x_cx as i32, y: y0 as i32, w: 1, h: (r1 - r0) as i32 },
+                Rect {
+                    x: self.x_cx as i32,
+                    y: y0 as i32,
+                    w: 1,
+                    h: (r1 - r0) as i32,
+                },
                 hc,
                 &e[r0 as usize * hc..r1 as usize * hc],
             )?;
@@ -244,7 +259,11 @@ impl SplitModel {
             ));
         }
         let keep = self.fed[..start].to_vec();
-        tracing::info!(rows = start, held = self.fed.len(), "split: sequence replayed from 0");
+        tracing::info!(
+            rows = start,
+            held = self.fed.len(),
+            "split: sequence replayed from 0"
+        );
         self.fed.clear();
         self.feed(&keep, 0)
     }
@@ -263,7 +282,12 @@ impl SplitModel {
     fn ring(&mut self, n: usize) -> R<Vec<u32>> {
         self.dev.get(
             "ring",
-            Rect { x: self.hctl as i32, y: (self.hr / 2) as i32, w: 1, h: 1 },
+            Rect {
+                x: self.hctl as i32,
+                y: (self.hr / 2) as i32,
+                w: 1,
+                h: 1,
+            },
             n,
         )
     }
@@ -294,7 +318,12 @@ impl SplitModel {
 
     /// `tokens` at `start..`; with `logits`, the last row's (the head rows'
     /// `lgt`: positive-scale logits, the final norm's rms left out).
-    pub fn forward(&mut self, tokens: &[u32], start: usize, logits: bool) -> R<(Vec<u32>, Option<Vec<f32>>)> {
+    pub fn forward(
+        &mut self,
+        tokens: &[u32],
+        start: usize,
+        logits: bool,
+    ) -> R<(Vec<u32>, Option<Vec<f32>>)> {
         self.seat(start)?;
         self.feed(tokens, start)?;
         if !logits {
@@ -302,7 +331,12 @@ impl SplitModel {
         }
         let w = self.dev.get(
             "lgt",
-            Rect { x: self.hctl as i32, y: 0, w: 1, h: self.hr as i32 },
+            Rect {
+                x: self.hctl as i32,
+                y: 0,
+                w: 1,
+                h: self.hr as i32,
+            },
             self.vr as usize,
         )?;
         let mut l: Vec<f32> = w.into_iter().map(f32::from_bits).collect();

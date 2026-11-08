@@ -296,9 +296,19 @@ impl Spatial {
                     .max(ahead.map_or(0, |fires| (fires as usize).min(lookahead)));
                 c.next_loop
             };
+            // A program whose loop runs far (the role-split's 256 passes) runs
+            // no further than the lane's pages (`PIE_CEREBRAS_LOOP_ROOM=off`:
+            // the lookahead alone): the rows past a sequence's end are waste.
+            let room = (pages.len() as u32 * self.kv.page_size)
+                .saturating_sub(start + tokens.len() as u32) as usize;
+            let bounded = self.model.as_ref().is_some_and(|w| w.split)
+                && std::env::var("PIE_CEREBRAS_LOOP_ROOM").map_or(true, |v| v != "off")
+                && !pages.is_empty();
+            let steps = if bounded { steps.min(room) } else { steps };
             tracing::info!(
                 rows = tokens.len(),
                 steps,
+                room,
                 fires_after = ?ahead,
                 "spatial: token loop"
             );

@@ -1447,6 +1447,8 @@ pub struct Wafer {
     /// onto the rows by all-reduce slack ([`super::paged::RowOrder`]),
     /// after the group expansion, on every page the handle passes on.
     pub row_order: Option<super::paged::RowOrder>,
+    /// The role-split program ([`super::split`]).
+    pub split: bool,
 }
 
 /// The handle's page order from `PIE_CEREBRAS_PAGE_ORDER`, over a kernel
@@ -1511,6 +1513,9 @@ impl Wafer {
         platform: Platform,
         rope: Option<Rotary>,
     ) -> R<Wafer> {
+        if super::split::is_split(&program) {
+            return Wafer::open_split(program, &ckpt, platform);
+        }
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
         let (batch_tx, batch_rx) = mpsc::channel::<BatchAnswer>();
@@ -1550,6 +1555,7 @@ impl Wafer {
                                     return;
                                 }
                             },
+                            split: false,
                         }));
                         m
                     }
@@ -1729,6 +1735,116 @@ impl Wafer {
             vm_answers: vm_rx,
             thread: Some(thread),
             ..facts
+        })
+    }
+
+    /// The role-split program ([`super::split`]) on its own thread: one
+    /// sequence, greedy rows by the wafer token loop, logits rows by `lgt`.
+    fn open_split(program: PathBuf, ckpt: &Ckpt, platform: Platform) -> R<Wafer> {
+        let spec = super::split::SplitSpec::from_env()?.ok_or("PIE_CEREBRAS_SPLIT is unset")?;
+        let cfg = ckpt.config();
+        let vocab = cfg["text_config"]["vocab_size"]
+            .as_u64()
+            .or_else(|| cfg["vocab_size"].as_u64())
+            .ok_or("the checkpoint config states no vocab_size")? as usize;
+        let (job_tx, job_rx) = mpsc::channel::<Job>();
+        let (ans_tx, ans_rx) = mpsc::channel::<Answer>();
+        let (ready_tx, ready_rx) = mpsc::channel::<R<(usize, usize, usize)>>();
+        let thread = std::thread::Builder::new()
+            .name("spatial-wafer".into())
+            .spawn(move || {
+                let open = || -> R<super::split::SplitModel> {
+                    let sdk = Sdk::open().map_err(|e| e.to_string())?;
+                    let mut rt =
+                        Runtime::new(sdk, &program, platform, "WARNING").map_err(|e| e.to_string())?;
+                    let t0 = Instant::now();
+                    rt.load();
+                    rt.run();
+                    tracing::info!(s = t0.elapsed().as_secs_f64(), "split: program loaded");
+                    super::split::SplitModel::open(Box::new(rt), &spec, vocab)
+                };
+                let mut m = match open() {
+                    Ok(m) => {
+                        let _ = ready_tx.send(Ok((m.cap, m.positions, m.hidden)));
+                        m
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let mut idle_from = Instant::now();
+                for job in job_rx {
+                    let t0 = Instant::now();
+                    let answer = match job {
+                        Job::Greedy {
+                            tokens,
+                            start,
+                            extra,
+                        } => {
+                            let a = m.greedy(&tokens, start, extra).map(|a| (a, Vec::new()));
+                            tracing::info!(
+                                rows = tokens.len(),
+                                steps = extra + 1,
+                                pos = start,
+                                idle_ms = (t0 - idle_from).as_secs_f64() * 1e3,
+                                ms = t0.elapsed().as_secs_f64() * 1e3,
+                                "spatial wafer: split token loop launch"
+                            );
+                            a
+                        }
+                        Job::Forward {
+                            tokens,
+                            start,
+                            which,
+                        } => match which {
+                            Logits::None => m.forward(&tokens, start, false).map(|(a, _)| (a, Vec::new())),
+                            Logits::Last => m
+                                .forward(&tokens, start, true)
+                                .map(|(a, l)| (a, l.into_iter().collect())),
+                            Logits::All => (|| {
+                                let (mut am, mut rows) = (Vec::new(), Vec::new());
+                                for (i, &t) in tokens.iter().enumerate() {
+                                    let (a, l) = m.forward(&[t], start + i, true)?;
+                                    am.extend(a);
+                                    rows.extend(l);
+                                }
+                                Ok((am, rows))
+                            })(),
+                        },
+                        _ => Err("the role-split program runs one sequence: no batched, paged or VM jobs".into()),
+                    };
+                    idle_from = Instant::now();
+                    tracing::info!(launches = m.launches, steps = m.steps, "spatial wafer: totals");
+                    if ans_tx.send(answer).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| format!("spawning the wafer thread: {e}"))?;
+        let (cap, positions, hidden) = ready_rx
+            .recv()
+            .map_err(|_| "the wafer thread died while loading".to_string())??;
+        Ok(Wafer {
+            jobs: Some(job_tx),
+            answers: ans_rx,
+            batch_answers: mpsc::channel().1,
+            paged: None,
+            cap,
+            launch_lanes: 1,
+            logit_lanes: 1,
+            positions,
+            vm: None,
+            vm_b: None,
+            page_bytes: None,
+            vm_answers: mpsc::channel().1,
+            thread: Some(thread),
+            vocab,
+            hidden,
+            recurrent: false,
+            group: 1,
+            row_order: None,
+            split: true,
         })
     }
 
@@ -2112,6 +2228,7 @@ mod tests {
             recurrent: false,
             group: 1,
             row_order: None,
+            split: false,
         };
         let kernel = w.paged.unwrap();
         w.page_as(16);

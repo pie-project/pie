@@ -55,7 +55,11 @@ impl Npy {
         let shape = rest[a + 1..b]
             .split(',')
             .filter(|t| !t.trim().is_empty())
-            .map(|t| t.trim().parse::<usize>().map_err(|e| format!("{name}: {e}")))
+            .map(|t| {
+                t.trim()
+                    .parse::<usize>()
+                    .map_err(|e| format!("{name}: {e}"))
+            })
             .collect::<R<Vec<_>>>()?;
         Ok(Npy {
             file,
@@ -74,9 +78,15 @@ impl Npy {
             .read_exact_at(&mut b, self.data + (at * self.elem) as u64)
             .map_err(|e| format!("{}: {e}", self.name))?;
         if self.elem == 2 {
-            out.extend(b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32));
+            out.extend(
+                b.chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]) as u32),
+            );
         } else {
-            out.extend(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+            out.extend(
+                b.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
         }
         Ok(())
     }
@@ -89,13 +99,26 @@ impl Npy {
     /// The `[i0][r0..r1][c0..c1][..]` block of a 3- or 4-D array as words,
     /// C order (`i0` only on 4-D... arrays with a leading axis: pass `None`
     /// for a 3-D array).
-    pub fn block(&self, lead: Option<usize>, rows: (usize, usize), cols: (usize, usize)) -> R<Vec<u32>> {
-        let sh = if lead.is_some() { &self.shape[1..] } else { &self.shape[..] };
+    pub fn block(
+        &self,
+        lead: Option<usize>,
+        rows: (usize, usize),
+        cols: (usize, usize),
+    ) -> R<Vec<u32>> {
+        let sh = if lead.is_some() {
+            &self.shape[1..]
+        } else {
+            &self.shape[..]
+        };
         let inner: usize = sh[2..].iter().product();
         let base = lead.map_or(0, |i| i * self.stride0());
         let mut out = Vec::with_capacity((rows.1 - rows.0) * (cols.1 - cols.0) * inner);
         for r in rows.0..rows.1 {
-            self.words(base + (r * sh[1] + cols.0) * inner, (cols.1 - cols.0) * inner, &mut out)?;
+            self.words(
+                base + (r * sh[1] + cols.0) * inner,
+                (cols.1 - cols.0) * inner,
+                &mut out,
+            )?;
         }
         Ok(out)
     }

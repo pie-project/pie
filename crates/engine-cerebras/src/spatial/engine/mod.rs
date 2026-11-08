@@ -184,12 +184,15 @@ impl Spatial {
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .ok_or_else(|| Error::Load(format!("{}: no readable out.json", out_json.display())))?;
-        let get = model::out_json_params(&json);
-        match spec {
-            Read::Dense(spec) => spec.check_program(get),
-            Read::Gemma(g) => g.check_program(get),
+        // The role-split program carries its own model (the prep's tiles).
+        if !super::split::is_split(Path::new(&program)) {
+            let get = model::out_json_params(&json);
+            match spec {
+                Read::Dense(spec) => spec.check_program(get),
+                Read::Gemma(g) => g.check_program(get),
+            }
+            .map_err(|e| Error::Load(e.to_string()))?;
         }
-        .map_err(|e| Error::Load(e.to_string()))?;
         Ok(program)
     }
 

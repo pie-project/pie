@@ -4,8 +4,8 @@
 
 use super::SplitSpec;
 use super::geo::Geo;
-use crate::spatial::device::Device;
 use crate::sdk::Rect;
+use crate::spatial::device::Device;
 
 type R<T> = std::result::Result<T, String>;
 
@@ -19,7 +19,16 @@ fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
 }
 
 /// A copy of `words` (n a PE) into `sym` over the rectangle (none if empty).
-fn put(d: &mut dyn Device, sym: &str, x: u32, y: u32, w: u32, h: u32, words: &[u32], b16: bool) -> R<()> {
+fn put(
+    d: &mut dyn Device,
+    sym: &str,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    words: &[u32],
+    b16: bool,
+) -> R<()> {
     if w * h == 0 {
         return Ok(());
     }
@@ -83,7 +92,11 @@ pub fn place(d: &mut dyn Device, g: &Geo, spec: &SplitSpec) -> R<()> {
             put(d, "rcfg", x0u + xc, y0, 1, r1 - r0, &rc, false)?;
             let n = gam.shape[2];
             let mut v = Vec::new();
-            gam.words(u * gam.stride0() + r0 as usize * n, (r1 - r0) as usize * n, &mut v)?;
+            gam.words(
+                u * gam.stride0() + r0 as usize * n,
+                (r1 - r0) as usize * n,
+                &mut v,
+            )?;
             put(d, "gam", x0u + xc, y0, 1, r1 - r0, &v, true)?;
         }
         for (c0, c1) in [(0, xc), (xc, px)] {
@@ -102,13 +115,20 @@ pub fn place(d: &mut dyn Device, g: &Geo, spec: &SplitSpec) -> R<()> {
                 put(d, sym, x0, y0u + yc, c1 - c0, 1, &v, false)?;
             }
         }
-        tracing::info!(unit = u, s = t0.elapsed().as_secs_f64(), "split: unit placed");
+        tracing::info!(
+            unit = u,
+            s = t0.elapsed().as_secs_f64(),
+            "split: unit placed"
+        );
     }
     // the head
     let (hx0, hxc, hc, hr) = (g.hx0, g.hxc, g.p.hc, g.p.hr);
     let hw = spec.npy("hw")?;
     let hg = spec.npy("hg")?;
-    let halves: Vec<(u32, u32)> = [(0, hxc), (hxc, hc)].into_iter().filter(|(a, b)| b > a).collect();
+    let halves: Vec<(u32, u32)> = [(0, hxc), (hxc, hc)]
+        .into_iter()
+        .filter(|(a, b)| b > a)
+        .collect();
     for &(c0, c1) in &halves {
         let x0 = g.hx(c0);
         let mut rb = 0;
