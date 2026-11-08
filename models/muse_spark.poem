@@ -32,6 +32,10 @@ DEPLOYMENTS = [
     deployment("muse-spark-open", weights = MXFP4, kv = dtype.bf16),
     deployment("muse-spark-open-mini-l4", weights = dtype.bf16, kv = dtype.bf16),
     deployment("muse-spark-open-mini-l4", weights = MXFP4, kv = dtype.bf16),
+    # A miniature quantized by mlx under the release's names (affine 4-bit in
+    # 64-wide groups): the embedding, the head, every projection and every
+    # layer's experts; the norms, gates and router as released.
+    deployment("muse-spark-open-mini-l4", weights = dtype.u4g64, kv = dtype.bf16),
     # Keys and values e4m3 under a unit scale (vLLM's `fp8` KV).
     deployment("muse-spark-open", weights = NVFP4_A4, kv = dtype.e4m3),
     deployment("muse-spark-open-mini-l8", weights = NVFP4_A4, kv = dtype.e4m3),
@@ -77,12 +81,13 @@ def full(l):
     return l % 4 == 1
 
 def layout(id, deploy):
-    if deploy.weights not in [[dtype.bf16, dtype.nvfp4], [dtype.bf16, dtype.nvfp4a4], [dtype.bf16, dtype.mxfp4], [dtype.bf16]]:
-        fail("{} stores its weights bf16 with NVFP4 or MXFP4 experts, not {}".format(id, deploy.weights))
+    mlx4 = deploy.weights == [dtype.u4g64]
+    if deploy.weights not in [[dtype.bf16, dtype.nvfp4], [dtype.bf16, dtype.nvfp4a4], [dtype.bf16, dtype.mxfp4], [dtype.bf16]] and not mlx4:
+        fail("{} stores its weights bf16 with NVFP4 or MXFP4 experts, or every weight mlx's 4-bit, not {}".format(id, deploy.weights))
     d = DIMS[id]
     if id != "muse-spark-open" and (deploy.layers or deploy.experts):
         d = dims(layers = deploy.layers or d.layers, experts = deploy.experts or d.experts)
-    w = dtype.bf16
+    w = dtype.u4g64 if mlx4 else dtype.bf16
     routed = deploy.weights[1] if len(deploy.weights) > 1 else w
     hidden = d.hidden
     hd = d.head_dim
@@ -186,6 +191,12 @@ def huggingface(m, reads):
         reads.read(w.pool_norm, n("mlp.pre_expert_norm.weight"))
         reads.read_over(w.expert_scale, n("mlp.experts.post_expert_norm.weight"), lambda x: x.bias(1.0))
         reads.read(w.unpool, n("mlp.post_expert_proj.weight"))
+        if has(n("mlp.experts.gate_proj.weight")):
+            # mlx's 4-bit cut: each leg one stacked bank, as mlx-lm loads it
+            reads.read(w.gate, n("mlp.experts.gate_proj.weight"))
+            reads.read(w.up, n("mlp.experts.up_proj.weight"))
+            reads.read(w.down, n("mlp.experts.down_proj.weight"))
+            continue
         if not has(n("mlp.experts.gate_up_proj")):
             for bank, leg in [(w.gate, "gate"), (w.up, "up"), (w.down, "down")]:
                 quark_bank(reads, bank, [n("mlp.experts.{}.{}_proj.weight".format(e, leg)) for e in range(m.experts)])
