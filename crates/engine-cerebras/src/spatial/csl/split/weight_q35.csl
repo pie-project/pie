@@ -302,6 +302,7 @@ const kq_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2} -> kq[i] });
 fn gdn_mix(g: u16) void {
   const s = @increment_dsd_offset(st_d, @as(i16, g * DV), f32);
   @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DK + 2} -> gb[i] }), fin(q_ym, 2 * DK + 2));
+  if (gb[2 * DK + 1] != 0.0) { @fmovs(@set_dsd_length(s, DV), 0.0); }   // position 0: a new sequence
   if ((gsrc & 0x4000) != 0) {
     const j = gsrc & 0xff;
     kq[0] = if ((gsrc & 0x8000) != 0) gb[j] else 0.0;
@@ -319,7 +320,7 @@ fn gdn_mix(g: u16) void {
   }
   const kr = kq[0];
   const qr = kq[1];
-  @fmuls(s, s, gb[2 * DK]);
+  if (GDEC == 0) { @fmuls(s, s, gb[2 * DK]); }   // (GDEC 1: CY scales the sums; the decay comes back with delta)
   @fmuls(@set_dsd_length(y_d, DV), s, kr);
   @fmuls(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, DV), f32), DV), s, qr);
   y[2 * DV] = kr * kr;
@@ -329,9 +330,14 @@ fn gdn_mix(g: u16) void {
   // o (the out_proj's x) and delta / |k|
   @fs2h(@set_dsd_length(xh_d, DV), fin(q_ym, DV));
   @fmovs(dl_d, fin(q_ym, DV));
+  if (GDEC == 1) { @fmovs(gdec_d, fin(q_ym, 1)); }
 }
+param GDEC: u16 = 1;   // 1: the state decays at the update (the decay from CY's second multicast)
+var gdecw = @zeros([1]f32);
+const gdec_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> gdecw[i] });
 fn gdn_update(g: u16) void {
   const s = @increment_dsd_offset(st_d, @as(i16, g * DV), f32);
+  if (GDEC == 1) { @fmuls(s, s, gdecw[0]); }
   @fmacs(s, s, dl_d, kq[0]);
 }
 
@@ -413,6 +419,13 @@ fn att_mix(a: u16) void {
   const pos = @as(u16, ab[QD + 2 * Dc]);
   const mine = (pos % PYW) == myrow;
   const e0 = pos / PYW;
+  if (pos == 0) {   // a new sequence: no live entries, the log-sum-exp reference restarts
+    @mov16(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{KCW} -> kc[1 + i] }), @as(i16, kb), u16), @as(u16, 0));
+    @mov16(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[1 + i] }), @as(i16, vb), u16), @as(u16, 0));
+    @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kinv[i] }), @as(i16, a * NE), f32), NE), 0.0);
+    var hh: u16 = 0;
+    while (hh < Qh) : (hh += 1) { mref[a * Qh + hh] = 0.0; }
+  }
   if (mine) {
     var d: u16 = 0;
     while (d < Dc) : (d += 1) {

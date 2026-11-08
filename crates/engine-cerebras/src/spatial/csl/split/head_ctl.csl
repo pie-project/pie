@@ -24,6 +24,7 @@ fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]
 
 var t: [VR]f32 align(16) = @zeros([VR]f32);
 const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> t[i] });
+var t_ptr: [*]f32 = &t;           // "lgt": the row's VR logits of the last step (the host's full-logits path)
 var res = @zeros([4]f32);
 var res_ptr: [*]f32 = &res;
 const q_w = @get_input_queue(2);
@@ -114,7 +115,7 @@ fn init() void {
 }
 
 // ---------------------------------------------------------------- the wafer token loop
-param CAP: u16 = 64;
+param CAP: u16 = 256;   // the ring (steps a launch); entries 0..63 as before
 param WFORCE: u32 = 0;   // (diagnostics) != 0: the root's winner is (s WFORCE + 7) % (VR WFN), not the argmax
 param WFN: u32 = 1;
 var ring = @zeros([CAP]u32);     // the root: the winner id of each step of the last launch
@@ -192,6 +193,7 @@ comptime {
   @initialize_queue(q_wo, .{ .color = @get_color(16) });
   @initialize_queue(q_ww, .{ .color = @get_color(16) });
   @export_symbol(ring_ptr, "ring");
+  @export_symbol(t_ptr, "lgt");
   @export_symbol(res_ptr, "res");
   @export_symbol(tdbg_ptr, "tdbg");
   @export_symbol(rcfg_ptr, "rcfg");

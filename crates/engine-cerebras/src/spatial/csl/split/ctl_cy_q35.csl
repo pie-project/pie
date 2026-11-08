@@ -351,10 +351,11 @@ fn gdn_pre0(g: u16) f32 {
   // gates
   const bt = sigm(t[2 * DK + 2 * DV]);
   const dec = exp1(-exp1(gpar[2 * g]) * softplus(t[2 * DK + 2 * DV + 1] + gpar[2 * g + 1]));
+  gdec = dec;
   @fmovs(uv(0, DK), tv(DK, DK));          // k
   @fmovs(uv(DK, DK), tv(0, DK));          // q
   u[2 * DK] = dec;
-  u[2 * DK + 1] = 0.0;
+  u[2 * DK + 1] = if (tab[0] == 0) 1.0 else 0.0;
   @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vs[i] }), DV), tv(2 * DK, DV));
   @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> zs[i] }), DV), tv(2 * DK + DV, DV));
   mcast(2 * DK + 2);
@@ -379,13 +380,14 @@ fn gdn_pre1(g: u16) f32 {
   @fmuls(tv(0, 2 * DK), tv(0, 2 * DK), rr);
   conv(g, 0, 2 * DK);
   vsilu(tv(0, 2 * DK), uv(0, 2 * DK), 2 * DK);
-  const dec = exp1(gpar[2 * g] * softplus(t[2 * DK + 2 * DV + 1] * rr + gpar[2 * g + 1]));   // gpar[2 g] = -exp(A) (init)
+  if (GDEC == 0) { gdec = exp1(gpar[2 * g] * softplus(t[2 * DK + 2 * DV + 1] * rr + gpar[2 * g + 1])); }   // gpar[2 g] = -exp(A) (init)
   @fmovs(uv(0, DK), tv(DK, DK));          // k
   @fmovs(uv(DK, DK), tv(0, DK));          // q
-  u[2 * DK] = dec;
-  u[2 * DK + 1] = 0.0;
+  u[2 * DK] = if (GDEC == 0) gdec else 0.0;
+  u[2 * DK + 1] = if (tab[0] == 0) 1.0 else 0.0;   // position 0: the weight PEs zero this layer's state
   mcast(2 * DK + 2);
   stamp(1 + 6 * cl + 1);
+  if (GDEC == 1) { gdec = exp1(gpar[2 * g] * softplus(t[2 * DK + 2 * DV + 1] * rr + gpar[2 * g + 1])); }   // (off the path: see gdn_post)
   @fmuls(tv(2 * DK, NQG - 2 * DK), tv(2 * DK, NQG - 2 * DK), rr);
   conv(g, 2 * DK, DV);
   vsilu(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vs[i] }), DV), uv(2 * DK, DV), DV);
@@ -394,11 +396,16 @@ fn gdn_pre1(g: u16) f32 {
   vsilu(zd, tv(2 * DK + DV, DV), DV);      // silu(z) while the weight PEs work
   return bt;
 }
+// GDEC 1: the weight PEs send S^T k / S^T q of the undecayed state; the decay scales the sums here and
+// rides at the end of the second multicast for the state update (S = dec S + k delta / |k|)
+param GDEC: u16 = 1;
+var gdec: f32 = 1.0;
 fn gdn_post(g: u16, bt: f32) void {
   const zd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> zs[i] }), DV);
   // the state reduction: S^T k | S^T q | k^2 | q^2 | k.q
   reduce(2 * DV + 3);
   stamp(1 + 6 * cl + 2);
+  if (GDEC == 1) { @fmuls(tv(0, 2 * DV), tv(0, 2 * DV), gdec); }
   const ik = rsqrt(t[2 * DV] + EPS);
   const iq0 = rsqrt(t[2 * DV + 1] + EPS);
   const kq = t[2 * DV + 2] * ik * iq0;
@@ -421,7 +428,8 @@ fn gdn_post(g: u16, bt: f32) void {
   @fmuls(o, o, on);
   @fmuls(o, o, @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> gnw[i] }), @as(i16, g * DV), f32), DV));
   @fmuls(o, o, zd);
-  mcast(2 * DV);
+  u[2 * DV] = gdec;
+  mcast(2 * DV + GDEC);
   stamp(1 + 6 * cl + 3);
 }
 
@@ -597,6 +605,10 @@ task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
     tab[0] = pos0 + s;   // the pass's position (launch argument)
+    if (tab[0] == 0) {   // a new sequence: the conv windows restart (the weight PEs reset their GDN state on u[2 DK + 1])
+      @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (NLG > 0) NLG * (CONV - 1) * NCH else 1} -> cwin[i] }), 0.0);
+      wp = 0;
+    }
     stamp(0);
     var l: u16 = 0;
     var la: u16 = 0;
