@@ -1314,6 +1314,7 @@ impl Shell {
     #[allow(unsafe_code)]
     pub fn release_scratch(&mut self) -> Result<()> {
         self.drain()?;
+        #[cfg(target_vendor = "apple")]
         let narrowest = self
             .arena_ladder
             .first()
