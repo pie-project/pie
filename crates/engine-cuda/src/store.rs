@@ -552,6 +552,9 @@ pub struct Pools {
     /// `[model] device_kv_budget`: the bytes the cache rows take, never cut
     /// to fit; `None` fills what the card hands out.
     budget: Option<u64>,
+    /// The state slots `fit_the_card` keeps whatever the declared context
+    /// seats (`keep_slots`).
+    kept_slots: u32,
     airborne: Option<Airborne>,
     committed_kv_pages: u32,
     committed_state_slots: u32,
@@ -878,6 +881,7 @@ impl Pools {
             asked: paging.pages(),
             ceiling: paging.pages(),
             budget,
+            kept_slots: 0,
             airborne: None,
             committed_kv_pages: 0,
             committed_state_slots: 0,
@@ -896,6 +900,13 @@ impl Pools {
     /// the slots rather than leave them growth past what it sized.
     pub fn seat_buffered(&mut self, slot_bytes: u64, unit: u64) {
         self.buffered = (slot_bytes, unit.max(1));
+    }
+
+    /// The state slots the fit keeps while the pages beside them seat one
+    /// sequence at the declared context, rather than cut them to the
+    /// sequences the pages seat there: a slot for each lane a fire batches.
+    pub fn keep_slots(&mut self, slots: u32) {
+        self.kept_slots = slots;
     }
 
     pub fn watch(&mut self, airborne: Airborne) {
@@ -1183,6 +1194,19 @@ impl Pools {
             let floor = state_slots_within(self.paging.slots, cut, one_sequence, |slots| {
                 self.declared_reshaped(0, slots)
             });
+            // The kept slots (`keep_slots`) stay while the pages beside them
+            // still seat one sequence, as TensorRT-LLM's state pool holds a
+            // slot for each of `max_batch_size` and its kv takes the rest.
+            let kept = self.kept_slots.min(self.paging.slots);
+            let floor = if kept > floor
+                && pages_within(self.ceiling, cut, |pages| {
+                    self.declared_reshaped(pages, kept)
+                }) >= one_slot
+            {
+                kept
+            } else {
+                floor
+            };
             let slots = balanced_state_slots(self.paging.slots, floor, one_slot, |slots| {
                 pages_within(self.ceiling, cut, |pages| {
                     self.declared_reshaped(pages, slots)

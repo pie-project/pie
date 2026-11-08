@@ -108,6 +108,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             );
         }
     }
+    let stated_slots = boot.slots;
     boot.slots = poem_compiler::state_slots(
         boot.slots,
         &boot.trace,
@@ -116,6 +117,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             per_lane => per_lane.saturating_mul(boot.budget.max_lanes).max(1),
         },
     );
+    // Slots the config states or the profile derives a lane each are kept at
+    // the fit up to the lanes a fire batches; the fixed default is fitted.
+    let kept_slots = if stated_slots > 0 || engine.state_slots_per_lane > 0 {
+        boot.slots
+    } else {
+        0
+    };
 
     kernels_cuda::disk::install(boot.cache_dir);
 
@@ -427,6 +435,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         profile,
         regions,
         anchored,
+        kept_slots,
     })
 }
 
@@ -623,6 +632,7 @@ impl Shell {
             profile,
             regions: folded,
             anchored,
+            kept_slots,
         } = bake(&mut boot)?;
         // Every generated kernel compiled and loaded now, before a fire can
         // ask for one.
@@ -862,6 +872,7 @@ impl Shell {
         }
         let buffers = Buffers::reserve(&boot.trace, paging, budgets.tokens.max_tokens, &pools)?;
         let mut pools = pools;
+        pools.keep_slots(kept_slots.min(boot.budget.max_lanes));
         if let Some(buffers) = &buffers {
             pools.seat_buffered(buffers.slot_bytes(), buffers.map_unit());
         }
@@ -1661,6 +1672,8 @@ pub(super) struct Baked {
     pub(super) regions: std::collections::BTreeMap<u64, kernels_ir::Region>,
     /// The anchored region each `fused.anchored` of the trace names, by key.
     pub(super) anchored: std::collections::BTreeMap<u64, kernels_ir::Anchored>,
+    /// The state slots `Pools::keep_slots` keeps, before the lanes cap them.
+    pub(super) kept_slots: u32,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,
