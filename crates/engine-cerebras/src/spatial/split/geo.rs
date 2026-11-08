@@ -169,9 +169,17 @@ pub struct Geo {
     wrow: HashMap<P, Role>,
     hturn: HashMap<P, u32>,
     wroot: Option<(u32, u32, RootQ)>,
+    /// Explicit unit origins (Gemma's layout, `gemma.rs`); `None`: the UNX x UNY snake.
+    origins: Option<Vec<(u32, u32)>>,
+    /// Route slots in a weight PE's rcfg (16; Gemma 18).
+    wnr: usize,
+    /// Words a unit handoff relays (Hc; Gemma 2 Hc + 1).
+    hand_n: u32,
 }
 
 type R<T> = std::result::Result<T, String>;
+
+pub mod gemma;
 
 impl Geo {
     pub fn new(p: Params) -> Geo {
@@ -214,6 +222,9 @@ impl Geo {
             wrow: HashMap::new(),
             hturn: HashMap::new(),
             wroot: None,
+            origins: None,
+            wnr: 16,
+            hand_n: 0,
         }
     }
 
@@ -223,6 +234,9 @@ impl Geo {
     }
 
     pub fn unit_origin(&self, u: usize) -> (u32, u32) {
+        if let Some(o) = &self.origins {
+            return o[u];
+        }
         let (ux, uy) = self.order[u];
         (ux * self.uw, uy * self.uh)
     }
@@ -232,7 +246,7 @@ impl Geo {
     }
 
     pub fn units(&self) -> usize {
-        self.order.len()
+        self.origins.as_ref().map_or(self.order.len(), |o| o.len())
     }
 
     fn route(&self, p: P) -> &Vec<(u32, u32)> {
@@ -532,7 +546,7 @@ impl Geo {
                 ));
             }
         }
-        for u in 0..self.order.len() {
+        for u in 0..self.units() {
             let (x0, y0) = self.unit_origin(u);
             for r in 0..py {
                 let y = y0 + self.wl(r, yc);
@@ -641,10 +655,10 @@ impl Geo {
                 }
             }
         }
-        for u in 0..self.order.len().saturating_sub(1) {
+        for u in 0..self.units().saturating_sub(1) {
             self.handoff(u, u + 1)?;
         }
-        self.head_in(self.order.len() - 1)?;
+        self.head_in(self.units() - 1)?;
         for y in 0..self.p.hr {
             let pts: Vec<P> = (0..=self.p.hc).map(|i| (self.hx0 + i, y)).collect();
             let (o, h) = self.line2(&pts, self.hxc as usize, XA, XB, X2, HR3, self.p.g2h)?;
@@ -665,12 +679,14 @@ impl Geo {
         self.wrow.extend(o);
         self.wroot = Some((self.hx0 + self.hxc, hr / 2, h));
         let u0 = self.unit_origin(0);
-        if u0.1 != 0 || self.unit_origin(self.order.len() - 1).1 != 0 {
+        // (explicit origins: the paths' clash checks guard the layout; unit 0's CX rows from its origin)
+        if self.origins.is_none() && (u0.1 != 0 || self.unit_origin(self.units() - 1).1 != 0) {
             return Err("the wafer loop wants unit 0 and the last unit on row 0".into());
         }
+        let ty = if self.origins.is_some() { u0.1 } else { 0 };
         for c in 0..self.p.hc {
             let x = self.hx(c);
-            let (te, to) = (self.wl(2 * c, yc), self.wl(2 * c + 1, yc));
+            let (te, to) = (ty + self.wl(2 * c, yc), ty + self.wl(2 * c + 1, yc));
             if to != te + 1 || to >= hr {
                 return Err(format!("head column {c}: CX rows {te} / {to}"));
             }
@@ -697,8 +713,17 @@ impl Geo {
     }
 
     fn handoff(&mut self, ua: usize, ub: usize) -> R<()> {
-        let ((ax, _), (bx, _)) = (self.order[ua], self.order[ub]);
         let (a0, b0) = (self.unit_origin(ua), self.unit_origin(ub));
+        let (ax, bx) = if self.origins.is_some() {
+            (a0.0, b0.0)
+        } else {
+            (self.order[ua].0, self.order[ub].0)
+        };
+        if ax != bx && a0.1 != b0.1 {
+            return Err(format!(
+                "units {ua} / {ub}: a horizontal handoff joins units on the same rows"
+            ));
+        }
         let (xc, yc, py) = (self.xc as i64, self.yc, self.p.py);
         for r in 0..py {
             let pr = self.wl(r, yc);
@@ -838,7 +863,7 @@ impl Geo {
             .count();
         let pk = self.parks(p, need)?;
         let mut it = pk.into_iter();
-        let mut w = self.words(p, 16)?;
+        let mut w = self.words(p, self.wnr)?;
         let mut nx = |v: Option<u32>| v.unwrap_or_else(|| it.next().unwrap());
         let q = [
             nx(rx_.2),
@@ -856,8 +881,13 @@ impl Geo {
         let (gs, gc) = self.gsrc.get(&p).copied().unwrap_or((0x4000, None));
         let gc = gc.unwrap_or(q[4]);
         let rel = self.relay.get(&p).cloned().unwrap_or_default();
-        let pre = rel.pre.map_or([0, 0, 0], |(a, b)| [self.p.hcc, a, b]);
-        let post = rel.post.map_or([0, 0, 0], |(a, b)| [self.p.hcc, a, b]);
+        let hn = if self.hand_n > 0 {
+            self.hand_n
+        } else {
+            self.p.hcc
+        };
+        let pre = rel.pre.map_or([0, 0, 0], |(a, b)| [hn, a, b]);
+        let post = rel.post.map_or([0, 0, 0], |(a, b)| [hn, a, b]);
         w.extend_from_slice(&q);
         w.extend_from_slice(&[rx_.0, ry_.0, role_s, gs, gc]);
         w.extend(sq);

@@ -17,6 +17,7 @@
 pub mod geo;
 pub mod npy;
 pub mod place;
+pub mod place_gemma;
 pub mod prep;
 
 use std::path::{Path, PathBuf};
@@ -148,11 +149,89 @@ pub struct SplitModel {
     eps: f32,
     /// Prompt rows forced through the token loop (`PIE_CEREBRAS_SPLIT_FORCE=1`).
     force: bool,
+    /// Unit 0's top row (Gemma's units sit off the origin).
+    x_y0: u32,
+    /// Gemma 4: the per-layer-input words of a launch's first token, its softcap.
+    gemma: Option<GemmaPle>,
+}
+
+/// Gemma's step-0 PLE words: each unit column's storage files and the CY rows that take them.
+pub struct GemmaPle {
+    cols: Vec<GCol>,
+    px: u32,
+    xc: u32,
+    softcap: f32,
+}
+
+struct GCol {
+    nt: u32,
+    lv: u32,
+    files: Vec<(u32, u32, Npy)>,
+    /// (x origin, CY row) of each unit on the bus
+    cys: Vec<(u32, u32)>,
+}
+
+impl GemmaPle {
+    /// Token `v`'s words for column `ci`: [PX][lv] f32 bits + the sequence word (position + 1).
+    fn words(&self, ci: usize, v: u32, pos: usize) -> R<Vec<u32>> {
+        let c = &self.cols[ci];
+        let (k, j) = (v / c.nt, v % c.nt);
+        let (r0, _, f) = c
+            .files
+            .iter()
+            .find(|(r0, r1, _)| k >= *r0 && k < *r1)
+            .ok_or_else(|| format!("split gemma: no PLE file for token {v}"))?;
+        let inner = f.shape[2];
+        let mut raw = Vec::with_capacity((self.px * c.lv) as usize);
+        for col in 0..self.px as usize {
+            f.words(
+                ((k - r0) as usize * self.px as usize + col) * inner + (j * c.lv) as usize,
+                c.lv as usize,
+                &mut raw,
+            )?;
+        }
+        let mut out = Vec::with_capacity((self.px * (c.lv + 1)) as usize);
+        for col in 0..self.px as usize {
+            for i in 0..c.lv as usize {
+                out.push(f16_to_f32(raw[col * c.lv as usize + i] as u16).to_bits());
+            }
+            out.push(((pos + 1) as f32).to_bits());
+        }
+        Ok(out)
+    }
+}
+
+fn f16_to_f32(h: u16) -> f32 {
+    let s = u32::from(h >> 15) << 31;
+    let e = u32::from((h >> 10) & 0x1f);
+    let m = u32::from(h & 0x3ff);
+    let bits = if e == 0 {
+        if m == 0 {
+            s
+        } else {
+            // subnormal: renormalise
+            let mut e2 = 127 - 15 + 1;
+            let mut m2 = m;
+            while m2 & 0x400 == 0 {
+                m2 <<= 1;
+                e2 -= 1;
+            }
+            s | (e2 << 23) | ((m2 & 0x3ff) << 13)
+        }
+    } else if e == 31 {
+        s | 0x7f80_0000 | (m << 13)
+    } else {
+        s | ((e + 127 - 15) << 23) | (m << 13)
+    };
+    f32::from_bits(bits)
 }
 
 impl SplitModel {
     /// Places the prep on `dev` (a loaded, running program) and runs init.
     pub fn open(mut dev: Box<dyn Device>, spec: &SplitSpec, vocab: usize) -> R<SplitModel> {
+        if let Some(name) = spec.meta.get("geo").and_then(|v| v.as_str()) {
+            return SplitModel::open_gemma(dev, spec, vocab, &name.to_string());
+        }
         let t0 = std::time::Instant::now();
         let g = spec.geo()?;
         tracing::info!(
@@ -215,7 +294,162 @@ impl SplitModel {
                 .unwrap_or(1e-6) as f32,
             hctl: g.hx0 + g.hxc,
             hemb,
+            x_y0: 0,
+            gemma: None,
         })
+    }
+
+    /// Gemma 4 (`scratch/split/gemma/README.md`): the geometry the meta names (geo/gemma.rs), placed.
+    fn open_gemma(
+        mut dev: Box<dyn Device>,
+        spec: &SplitSpec,
+        vocab: usize,
+        name: &str,
+    ) -> R<SplitModel> {
+        let t0 = std::time::Instant::now();
+        let dflt = if name == "tiny" { 2 } else { 16 };
+        let mut gg = geo::gemma::GemmaGeo::new(
+            name,
+            spec.int("G2").unwrap_or(dflt),
+            spec.int("G2W")
+                .unwrap_or(if name == "tiny" { 2 } else { 24 }),
+        )?;
+        gg.build()?;
+        tracing::info!(
+            ms = t0.elapsed().as_millis() as u64,
+            w = gg.g.w,
+            h = gg.g.h,
+            "split gemma: geometry built"
+        );
+        let t1 = std::time::Instant::now();
+        place_gemma::place(dev.as_mut(), &gg, spec)?;
+        tracing::info!(s = t1.elapsed().as_secs_f64(), "split gemma: placed");
+        dev.call("init", &[]).map_err(|e| format!("init: {e}"))?;
+        let g = &gg.g;
+        dev.get(
+            "rcfg",
+            Rect {
+                x: 0,
+                y: 0,
+                w: g.w as i32,
+                h: g.h as i32,
+            },
+            1,
+        )?;
+        let hemb = spec.npy("hemb")?;
+        let u0 = g.unit_origin(0);
+        let vr = spec.need("VR")?;
+        let metacols = spec
+            .meta
+            .get("cols")
+            .and_then(|v| v.as_array())
+            .ok_or("split gemma meta: no cols")?;
+        let mut cols = Vec::new();
+        for (ci, mc) in metacols.iter().enumerate() {
+            let mut files = Vec::new();
+            for f in mc["files"].as_array().ok_or("cols: files")? {
+                files.push((
+                    f["r0"].as_u64().unwrap_or(0) as u32,
+                    f["r1"].as_u64().unwrap_or(0) as u32,
+                    spec.npy(f["name"].as_str().ok_or("cols: name")?)?,
+                ));
+            }
+            let cys = gg.cols[ci]
+                .units
+                .iter()
+                .map(|&u| {
+                    let (x, y) = g.unit_origin(u);
+                    (x, y + g.yc)
+                })
+                .collect();
+            cols.push(GCol {
+                nt: mc["nt"].as_u64().ok_or("cols: nt")? as u32,
+                lv: mc["lv"].as_u64().ok_or("cols: lv")? as u32,
+                files,
+                cys,
+            });
+        }
+        let gemma = GemmaPle {
+            cols,
+            px: g.p.px,
+            xc: g.xc,
+            softcap: spec
+                .meta
+                .get("SOFTCAP")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(30.0) as f32,
+        };
+        Ok(SplitModel {
+            vocab,
+            hidden: spec.need("H")? as usize,
+            cap: spec.int("CAP").unwrap_or(256) as usize,
+            positions: (spec.need("NEG")? * g.p.py) as usize,
+            fed: Vec::new(),
+            launches: 0,
+            steps: 0,
+            wl: true,
+            hr: g.p.hr,
+            hc: g.p.hc,
+            vr,
+            hdc: hemb.shape[2] as u32 / vr,
+            hcc: g.p.hcc,
+            py: g.p.py,
+            yc: g.yc,
+            x_cx: u0.0 + g.xc,
+            last_cx: {
+                let (x, y) = g.unit_origin(g.units() - 1);
+                (x + g.xc, y)
+            },
+            force: std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1"),
+            eps: spec
+                .meta
+                .get("EPS")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-6) as f32,
+            hctl: g.hx0 + g.hxc,
+            hemb,
+            x_y0: u0.1,
+            gemma: Some(gemma),
+            dev,
+        })
+    }
+
+    /// Gemma: token `v`'s PLE words into every CY row on each bus (a launch's step 0 at `pos`).
+    fn put_pl(&mut self, v: u32, pos: usize) -> R<()> {
+        let Some(gp) = self.gemma.as_ref() else {
+            return Ok(());
+        };
+        let mut copies = Vec::new();
+        for ci in 0..gp.cols.len() {
+            let w = gp.words(ci, v, pos)?;
+            let n = (gp.cols[ci].lv + 1) as usize;
+            for &(x0, y) in &gp.cols[ci].cys {
+                for (c0, c1) in [(0, gp.xc), (gp.xc, gp.px)] {
+                    let x = x0 + c0 + u32::from(c0 >= gp.xc);
+                    copies.push((
+                        x,
+                        y,
+                        c1 - c0,
+                        n,
+                        w[c0 as usize * n..c1 as usize * n].to_vec(),
+                    ));
+                }
+            }
+        }
+        for (x, y, w, n, words) in copies {
+            self.dev.put(
+                "pl",
+                Rect {
+                    x: x as i32,
+                    y: y as i32,
+                    w: w as i32,
+                    h: 1,
+                },
+                n,
+                &words,
+            )?;
+        }
+        Ok(())
     }
 
     /// Token `v`'s embedding row (bf16 bits), from the head's tiles.
@@ -238,7 +472,7 @@ impl SplitModel {
         let e: Vec<u32> = self.embedding(v)?.into_iter().map(|b| b << 16).collect();
         let hc = self.hcc as usize;
         for (r0, r1) in [(0, self.yc), (self.yc, self.py)] {
-            let y0 = r0 + u32::from(r0 >= self.yc);
+            let y0 = self.x_y0 + r0 + u32::from(r0 >= self.yc);
             self.dev.put(
                 "x",
                 Rect {
@@ -295,6 +529,7 @@ impl SplitModel {
         }
         for (i, &t) in tokens.iter().enumerate() {
             self.put_x(t)?;
+            self.put_pl(t, start + i)?;
             self.launch(1, start + i)?;
             self.fed.push(t);
         }
@@ -315,6 +550,7 @@ impl SplitModel {
             h: 1,
         };
         self.put_x(tokens[0])?;
+        self.put_pl(tokens[0], start)?;
         if n > 1 {
             self.dev.put("force", root, n - 1, &tokens[1..])?;
             self.dev.put("nforce", root, 1, &[(n - 1) as u32])?;
@@ -381,6 +617,7 @@ impl SplitModel {
         self.feed(&tokens[..n - 1], start)?;
         let last = start + n - 1;
         self.put_x(tokens[n - 1])?;
+        self.put_pl(tokens[n - 1], last)?;
         self.launch(1 + extra, last)?;
         self.fed.push(tokens[n - 1]);
         let ring = self.ring(1 + extra)?;
@@ -439,6 +676,13 @@ impl SplitModel {
         let mut l: Vec<f32> = w.into_iter().map(|b| f32::from_bits(b) * scale).collect();
         // the head's padded rows (ids >= vocab) never reach sampling or the argmax
         l.truncate(self.vocab);
+        if let Some(gp) = &self.gemma {
+            // Gemma's final logit softcap (monotone: the argmax is the wafer's)
+            let c = gp.softcap;
+            for v in l.iter_mut() {
+                *v = c * (*v / c).tanh();
+            }
+        }
         let mut am = vec![0u32; tokens.len()];
         if let Some(best) = argmax(&l) {
             *am.last_mut().unwrap() = best;
@@ -462,6 +706,8 @@ pub fn argmax(l: &[f32]) -> Option<u32> {
 /// out.json has the unit grid.
 pub fn is_split(program: &Path) -> bool {
     std::env::var("PIE_CEREBRAS_SPLIT").is_ok_and(|v| !v.is_empty())
-        && std::fs::read_to_string(program.join("out.json"))
-            .is_ok_and(|s| s.contains("\"UNX\"") && s.contains("\"UNY\""))
+        && std::fs::read_to_string(program.join("out.json")).is_ok_and(|s| {
+            (s.contains("\"UNX\"") && s.contains("\"UNY\""))
+                || (s.contains("\"NTW\"") && s.contains("\"Ic1\"")) // Gemma's layout (mkfull_gemma.py)
+        })
 }

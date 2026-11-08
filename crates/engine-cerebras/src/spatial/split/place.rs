@@ -21,7 +21,7 @@ fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
 
 /// A copy of `words` (n a PE) into `sym` over the rectangle `[x, y, w, h]`
 /// (none if empty).
-fn put(d: &mut dyn Device, sym: &str, [x, y, w, h]: [u32; 4], words: &[u32], b16: bool) -> R<()> {
+pub(super) fn put(d: &mut dyn Device, sym: &str, [x, y, w, h]: [u32; 4], words: &[u32], b16: bool) -> R<()> {
     if w * h == 0 {
         return Ok(());
     }
@@ -34,7 +34,7 @@ fn put(d: &mut dyn Device, sym: &str, [x, y, w, h]: [u32; 4], words: &[u32], b16
 }
 
 /// rcfg rows for a rectangle (row-major, one PE's words after another).
-fn cfgs(rows: impl Iterator<Item = R<Vec<u32>>>) -> R<Vec<u32>> {
+pub(super) fn cfgs(rows: impl Iterator<Item = R<Vec<u32>>>) -> R<Vec<u32>> {
     let mut out = Vec::new();
     let mut width = None;
     for w in rows {
