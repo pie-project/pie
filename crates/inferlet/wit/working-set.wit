@@ -31,6 +31,11 @@ interface working-set {
         // A child that shares the frozen part and gets a copy of the buffer,
         // ordered on `on`.
         fork: func(on: borrow<pipeline>) -> result<working-set, error>;
+
+        // Later rows of this working set and its forks no longer read the
+        // whole pages inside frozen `[start, end)`; rows keep their positions
+        // and nothing is recomputed. Returns the slots dropped.
+        forget: func(start: u32, end: u32) -> result<u32, error>;
     }
 
 }

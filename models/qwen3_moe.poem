@@ -221,13 +221,13 @@ def caches(m, c):
         c.kv(kv, w.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
 
 def forward(m, inputs):
-    positions = inputs.positions()
+    positions = inputs.mrope_positions()
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
     routes = inputs.adapter_routes()
 
     def block(l, w, y):
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, w, positions, qk_norm = "head")
+        o = attention(x, inputs, m, w, positions, qk_norm = "head", tabled = True)
         y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
         return ops.elemwise.residual_add(moe(x, m, w), y)

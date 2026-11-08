@@ -275,6 +275,7 @@ pub struct EtaCaps {
     pub draft_mask_token: u32,
     pub draft_proposals_from: u32,
     pub has_attn_page_mask: bool,
+    pub rotates_by_table: bool,
     pub has_lora: bool,
     pub adapter_attachments: bool,
     /// [`::engine::Capabilities::rs_snapshots`], the least of the engines'.
