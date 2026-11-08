@@ -191,6 +191,32 @@ fn what(name: &str) -> &'static str {
 }
 
 impl ModelSpec {
+    /// A role-split program's stand-in (split/: the program and its prep carry the model, so the trace's
+    /// structure is not the kernels' to check): the trace's name, every shape field 0.
+    pub fn for_split(trace: &Trace) -> ModelSpec {
+        ModelSpec {
+            name: trace.name.clone(),
+            layers: 0,
+            hidden: 0,
+            q_heads: 0,
+            kv_heads: 0,
+            head_dim: 0,
+            inter: 0,
+            vocab: 0,
+            tied: true,
+            qk_norm: false,
+            rope_theta: 0.0,
+            rope_table: None,
+            rms_eps: KERNEL_EPS,
+            sm_scale: 1.0,
+            weights: Dtype::Bf16,
+            kv: Dtype::Bf16,
+            norm_plus_one: false,
+            hybrid: None,
+            moe: None,
+        }
+    }
+
     /// Reads the spec off `trace`, or refuses: the first op or field that
     /// the spatial kernels do not implement, with its layer.
     pub fn read(trace: &Trace) -> Result<ModelSpec, Refused> {

@@ -267,7 +267,18 @@ impl Engine for Spatial {
             poem_compiler::state_slots(budgets.slots, &trace, crate::api::DEFAULT_STATE_SLOTS);
         // The model as the spatial kernels see it: refused here unless its
         // structure is one they implement (spatial/plan.rs).
-        let spec = Read::of(&trace).map_err(|e| Error::Load(e.to_string()))?;
+        // (a role-split program carries its own model, its prep's tiles: a trace the kernels' reader
+        // refuses is still served by it; split/mod.rs)
+        let split = self
+            .spatial
+            .program
+            .as_ref()
+            .is_some_and(|p| super::split::is_split(Path::new(p)));
+        let spec = match Read::of(&trace) {
+            Ok(s) => s,
+            Err(_) if split => Read::Dense(model::ModelSpec::for_split(&trace)),
+            Err(e) => return Err(Error::Load(e.to_string())),
+        };
         // The weights land by the trace's params (the shell takes the trace).
         let weights_trace = trace.clone();
         self.params = match &spec {
