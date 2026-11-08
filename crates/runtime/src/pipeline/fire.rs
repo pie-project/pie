@@ -3089,10 +3089,12 @@ pub async fn submit_frame<C: FireContext>(
 }
 
 pub fn park_frame<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
+    let pipeline = ctx.resources().get(&this)?;
+    // Parked, it holds no batch, whatever the frame size.
+    pipeline.set_active(false);
     if crate::scheduler::configured_frame_size() == 1 {
         return Ok(());
     }
-    let pipeline = ctx.resources().get(&this)?;
     if pipeline.scope.is_closed() {
         return Ok(());
     }
@@ -3227,6 +3229,7 @@ async fn pipeline_close_inner<C: FireContext>(
     this: &Resource<Pipeline>,
 ) -> Anyhow<()> {
     let state = ctx.resources().get(this).ok().map(|pipeline| {
+        pipeline.set_active(false);
         let first_close = pipeline.scope.close();
         (
             first_close,

@@ -378,6 +378,10 @@ impl ProcessCtx {
         }
         crate::inferlet::process::ensure_execution_admitted(self).await;
         crate::inferlet::process::gate::residency_gate(self).await?;
+        let pipeline = self.ctx().table.get(&on)?;
+        if !pipeline.scope.is_closed() {
+            pipeline.set_active(true);
+        }
         crate::pipeline::fire::submit_frame(self, on, slot_reps).await
     }
 }

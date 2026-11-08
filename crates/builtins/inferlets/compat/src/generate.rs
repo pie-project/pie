@@ -522,6 +522,7 @@ pub async fn generate(
         return Err("prompt logprobs score a text prompt; this one carries pictures".into());
     }
     let sampled = sampling.temperature > 0.0;
+    let pipe = Pipeline::new();
     if sampling.speculative
         && (!sampled || (sampling.speculative_sampled && sampling.untruncated()))
         && !sampling.penalized()
@@ -532,16 +533,22 @@ pub async fn generate(
         && images.is_empty()
         // Beside other requests the run-ahead decode below batches with
         // theirs; drafting would cost all of them.
-        && Pipeline::live() == 0
+        && pipe.speculation_advised()
         && let Some(draft) = model::draft_block()
         && draft.proposals_from <= 1
         && (2..=16).contains(&draft.rows)
     {
         let sampled = sampled.then_some((sampling.temperature, sampling.seed));
         let sampled =
-            crate::speculative::generate(prompt, ends, max_tokens, draft, sampled, &mut |t| {
-                on_token(t, None)
-            })
+            crate::speculative::generate(
+                pipe,
+                prompt,
+                ends,
+                max_tokens,
+                draft,
+                sampled,
+                &mut |t| on_token(t, None),
+            )
             .await?;
         return Ok(Generated {
             sampled,
@@ -552,7 +559,6 @@ pub async fn generate(
     let n = prompt.len() as u32;
 
     let ws = WorkingSet::new();
-    let pipe = Pipeline::new();
 
     let penalized = sampling.penalized();
     let present: Vec<f32> = if penalized {

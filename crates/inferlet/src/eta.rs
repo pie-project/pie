@@ -1137,10 +1137,12 @@ impl Pipeline {
         wit_forward::park(&self.wit);
     }
 
-    /// How many pipelines are open on the engine, this one included.
+    /// The host's advice to a program that trades compute for latency:
+    /// whether no other pipeline is active beside this one, so its fires
+    /// batch alone. It may change from one frame to the next.
     #[must_use]
-    pub fn live() -> u32 {
-        wit_pipeline::live()
+    pub fn speculation_advised(&self) -> bool {
+        self.wit.speculation_advised()
     }
 }
 

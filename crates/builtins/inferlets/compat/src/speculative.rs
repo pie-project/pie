@@ -239,9 +239,10 @@ fn rungs(widest: u32) -> Vec<u32> {
     out
 }
 
-/// Generate as the target would, drafting where it pays: greedily, or with
-/// `sampled`'s `(temperature, seed)` by speculative sampling.
+/// Generate on `pipe` as the target would, drafting where it pays: greedily,
+/// or with `sampled`'s `(temperature, seed)` by speculative sampling.
 pub async fn generate(
+    pipe: Pipeline,
     prompt: &[u32],
     ends: &[u32],
     max_tokens: usize,
@@ -255,7 +256,6 @@ pub async fn generate(
     let from = draft.proposals_from.min(1) as usize;
     let widest = block + 1 - from as u32;
     let ws = WorkingSet::new();
-    let pipe = Pipeline::new();
     let prompt: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let pick = sampled.map(|(temperature, seed)| Pick {
         temperature,
@@ -299,7 +299,7 @@ pub async fn generate(
             (None, _) => None,
             // Beside other requests a plain fire batches with theirs for
             // nearly nothing, and a round would cost all of them.
-            _ if Pipeline::live() > 1 => None,
+            _ if !pipe.speculation_advised() => None,
             (Some(_), _) if rounds < 2 => Some(widest),
             (Some(_), _) if wait > 1 => {
                 wait -= 1;
