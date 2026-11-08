@@ -122,12 +122,22 @@ pub struct Bench {
     arrays: Vec<Array>,
     /// The module text of the last `run`, for a failing test to print.
     pub last_module: String,
+    /// The kernel decisions a `run` lowers under (the registry's v6e
+    /// defaults when unset).
+    tuning: Option<kernels_xla::tuning::Tuning>,
 }
 
 impl Bench {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Runs lower under `tuning` instead of the defaults.
+    #[must_use]
+    pub fn with_tuning(mut self, tuning: kernels_xla::tuning::Tuning) -> Self {
+        self.tuning = Some(tuning);
+        self
     }
 
     /// A handle over raw little-endian bytes.
@@ -262,6 +272,7 @@ impl Bench {
             return Ok(None);
         };
         let tracer = Tracer {
+            tuning: self.tuning.unwrap_or(kernels_xla::tuning::Tuning::DEFAULT),
             func: RefCell::new(Func::new("main")),
             env: RefCell::new(Roots {
                 shapes: self
@@ -273,7 +284,7 @@ impl Bench {
             }),
         };
         body(&tracer).map_err(|e| e.to_string())?;
-        let Tracer { func, env } = tracer;
+        let Tracer { func, env, .. } = tracer;
         let mut func = func.into_inner();
         let env = env.into_inner();
         let written: Vec<u32> = env.written.iter().copied().collect();
@@ -360,6 +371,7 @@ impl Bench {
             return Ok(false);
         };
         let tracer = Tracer {
+            tuning: self.tuning.unwrap_or(kernels_xla::tuning::Tuning::DEFAULT),
             func: RefCell::new(Func::new("main")),
             env: RefCell::new(Roots {
                 shapes: self
@@ -371,7 +383,7 @@ impl Bench {
             }),
         };
         body(&tracer).map_err(|e| e.to_string())?;
-        let Tracer { func, env } = tracer;
+        let Tracer { func, env, .. } = tracer;
         let func = func.into_inner();
         let env = env.into_inner();
         let written: Vec<u32> = env.written.iter().copied().collect();
@@ -448,6 +460,7 @@ impl Env for Roots {
 }
 
 struct Tracer {
+    tuning: kernels_xla::tuning::Tuning,
     func: RefCell<Func>,
     env: RefCell<Roots>,
 }
@@ -459,7 +472,7 @@ impl Emit for Tracer {
     ) -> Result<(), kernels_xla::Error> {
         let mut func = self.func.borrow_mut();
         let mut env = self.env.borrow_mut();
-        let mut cx = Cx::new(&mut func, &mut *env);
+        let mut cx = Cx::new(&mut func, &mut *env).with_tuning(self.tuning);
         body(&mut cx)
     }
 }

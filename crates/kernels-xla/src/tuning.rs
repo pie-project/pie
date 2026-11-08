@@ -198,6 +198,11 @@ pub struct Chunks {
     pub budget: i64,
     pub block_rows: i64,
     pub block_keys: i64,
+    /// Whether a sliding-window decode walk stops after the last chunk any
+    /// row admits a key in (`attn::paged`'s window walk). Always on from a
+    /// profile; off walks every chunk of the window, as the walk did before
+    /// the bound, which a test sets to check the bound changes no bit.
+    pub window_reach: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,6 +257,7 @@ impl Tuning {
             budget: 1 << 24,
             block_rows: 512,
             block_keys: 512,
+            window_reach: true,
         },
         ssm: SsmChunks {
             chunk: 64,
@@ -298,6 +304,7 @@ impl Tuning {
                 budget: n(profile.get::<AttnBudgetMi>().0) << 20,
                 block_rows: n(profile.get::<AttnBlockRows>().0),
                 block_keys: n(profile.get::<AttnBlockKeys>().0),
+                window_reach: true,
             },
             ssm: SsmChunks {
                 chunk: n(profile.get::<SsmChunk>().0),
