@@ -28,7 +28,7 @@ use crate::service::{ServiceHandler, ServiceMap};
 
 use self::ordered::{OrderedPermit, OrderedSemaphore};
 use super::linker;
-use super::program::ProgramName;
+use super::program::Program;
 
 const RUN_INTERFACE: &str = "pie:inferlet/run@0.3.0";
 
@@ -412,7 +412,7 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
 )]
 pub(crate) fn spawn(
     username: String,
-    program_name: ProgramName,
+    program: Program,
     input: String,
     files: Arc<client_api::Files>,
     client_id: Option<ClientId>,
@@ -424,7 +424,7 @@ pub(crate) fn spawn(
 ) -> Result<ProcessId> {
     spawn_inner(
         username,
-        program_name,
+        program,
         input,
         files,
         client_id,
@@ -444,7 +444,7 @@ pub(crate) fn spawn(
 )]
 fn spawn_inner(
     username: String,
-    program_name: ProgramName,
+    program: Program,
     input: String,
     files: Arc<client_api::Files>,
     client_id: Option<ClientId>,
@@ -477,7 +477,7 @@ fn spawn_inner(
         id,
         inherit_client_pid.unwrap_or(id),
         username,
-        program_name,
+        program,
         input,
         files,
         client_id,
@@ -638,7 +638,7 @@ struct Process {
     process_id: ProcessId,
     client_pid: ProcessId,
     username: String,
-    program: ProgramName,
+    program: Program,
     input: String,
     files: Arc<client_api::Files>,
     start_time: Instant,
@@ -671,7 +671,7 @@ impl Process {
         process_id: ProcessId,
         client_pid: ProcessId,
         username: String,
-        program: ProgramName,
+        program: Program,
         input: String,
         files: Arc<client_api::Files>,
         client_id: Option<ClientId>,
@@ -749,7 +749,7 @@ impl Process {
     async fn run(
         process_id: ProcessId,
         username: String,
-        program: ProgramName,
+        program: Program,
         input: String,
         files: Arc<client_api::Files>,
         capture_outputs: bool,
@@ -1081,9 +1081,9 @@ mod tests {
             process_id,
             client_pid,
             username: "test".to_string(),
-            program: ProgramName {
+            program: Program {
                 name: "test".to_string(),
-                version: "0.0.0".to_string(),
+                hash: crate::inferlet::program::ProgramHash::of(b"test"),
             },
             input: String::new(),
             files: Arc::default(),

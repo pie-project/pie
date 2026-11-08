@@ -2,14 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Inferlet, inferlet, programFile, withUpgradePath } from '../src/index.js';
 
-test('a function becomes a module exporting it, named and versioned by its source', () => {
+test('a function becomes a module exporting it, named by it and keyed by its source', () => {
   const tokenCount = inferlet(async function tokenCount(input) {
     return pie.model.encode(input.prompt).length;
   });
   assert.ok(tokenCount instanceof Inferlet);
   assert.equal(tokenCount.name, 'tokenCount');
-  assert.match(tokenCount.version, /^0\.\d+\.\d+$/);
-  assert.equal(tokenCount.program, `tokenCount@${tokenCount.version}`);
+  assert.match(tokenCount.hash, /^[0-9a-f]{64}$/);
+  assert.equal(tokenCount.program, `tokenCount@${tokenCount.hash}`);
   assert.equal(tokenCount.file, 'tokenCount.js');
   assert.match(tokenCount.source, /^export const main = async function tokenCount\(input\)/);
 });
@@ -21,12 +21,12 @@ test('a program file is named by its stem, an entry script by its directory', ()
   assert.throws(() => programFile('/x/notes.txt'));
 });
 
-test('the same source is the same version and an edit is a new one', () => {
+test('the same source is the same build and an edit is a new one', () => {
   const a = inferlet((input) => input.x);
   const b = inferlet((input) => input.x);
   const c = inferlet((input) => input.x + 1);
-  assert.equal(a.version, b.version);
-  assert.notEqual(a.version, c.version);
+  assert.equal(a.program, b.program);
+  assert.notEqual(a.program, c.program);
 });
 
 test('a method shorthand is refused, an arrow and a function are taken', () => {

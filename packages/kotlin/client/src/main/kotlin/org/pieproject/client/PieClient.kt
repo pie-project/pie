@@ -80,7 +80,7 @@ public class PieClient private constructor(private val transport: PieTransport) 
         request(ClientFrame.Ping)
     }
 
-    /** Launches an installed inferlet (`name` or `name@version`); [input] is encoded as the JSON its `main` receives. */
+    /** Launches an installed inferlet (`name` or `name@<hash>`); [input] is encoded as the JSON its `main` receives. */
     public suspend inline fun <reified T> launch(
         inferlet: String,
         input: T,

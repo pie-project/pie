@@ -497,11 +497,9 @@ class PieClient:
         return await self._send_msg_and_wait(msg)
 
     async def check_program(self, inferlet: str) -> bool:
-        """Whether the server holds `inferlet`, given as `name@version`."""
-        if "@" not in inferlet:
-            raise ValueError("Version required: use 'name@version' format")
-        name, version = inferlet.rsplit("@", 1)
-        msg = {"type": "check_program", "name": name, "version": version}
+        """Whether `inferlet` (`name`, or `name@<hash prefix>`) names a
+        program this session can launch."""
+        msg = {"type": "check_program", "inferlet": inferlet}
         ok, result = await self._send_msg_and_wait(msg)
         if not ok:
             raise Exception(f"CheckProgram failed: {result}")
@@ -547,28 +545,20 @@ class PieClient:
             raise Exception(f"Upload failed: {result}")
         return result
 
-    async def install_program(
-        self, path: str | Path, version: str | None = None, force_overwrite: bool = False
-    ) -> str:
+    async def install_program(self, path: str | Path) -> str:
+        """Install the program at `path` under its name, for this session's
+        tenant. Returns the `name@<hash>` that launches this build for good;
+        installing the same bytes again only makes it the name's latest."""
         path = Path(path)
-        return await self.install_program_bytes(
-            path.read_bytes(), program_file(path), version, force_overwrite
-        )
+        return await self.install_program_bytes(path.read_bytes(), program_file(path))
 
-    async def install_program_bytes(
-        self,
-        program_bytes: bytes,
-        file: str,
-        version: str | None = None,
-        force_overwrite: bool = False,
-    ) -> str:
+    async def install_program_bytes(self, program_bytes: bytes, file: str) -> str:
+        """`install_program` for bytes, which came as `file`."""
         program_hash = blake3.blake3(program_bytes).hexdigest()
         template = {
             "type": "add_program",
             "program_hash": program_hash,
             "file": file,
-            "version": version,
-            "force_overwrite": force_overwrite,
         }
         return await self._upload_chunked(program_bytes, template)
 
@@ -700,7 +690,7 @@ class PieClient:
     ) -> Process:
         """Launch a process. Returns a Process object for interaction.
 
-        :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
+        :param inferlet: A name (`text-completion`), or `name@<hash>` for one build.
         :param input: A dict of input parameters, serialized to JSON.
         :param capture_outputs: If True, process outputs are streamed to the client.
         :param files: Files the inferlet reads with `session.file(name)`.
@@ -746,7 +736,7 @@ class PieClient:
 
         A decorated function (`@inferlet`) is installed first if the server
         does not hold its exact source yet; a string is an installed
-        program's `name@version` (or bare name). Returns the `Process`;
+        program's name, or `name@<hash>` for one build. Returns the `Process`;
         `await process.result()` waits for what it returns.
         """
         if isinstance(program, Inferlet):
@@ -754,7 +744,7 @@ class PieClient:
                 program = program.program
             else:
                 program = await self.install_program_bytes(
-                    program.source.encode("utf-8"), f"{program.name}.py", program.version
+                    program.source.encode("utf-8"), f"{program.name}.py"
                 )
         moved = {name: arg for name, arg in kwargs.items() if isinstance(arg, Handle)}
         present = {name: arg for name, arg in moved.items() if arg.exists}

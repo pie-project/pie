@@ -2,12 +2,12 @@
 import pytest
 
 from pie_client import Inferlet, inferlet
-from pie_client.inferlet import hashed_version
+import blake3
 
 LIMIT = 3
 
 
-def test_a_function_becomes_a_program_named_and_versioned_by_its_source():
+def test_a_function_becomes_a_program_named_by_it_and_keyed_by_its_source():
     @inferlet
     async def token_count(prompt: str, repeat: int = 1):
         """How many tokens the model's tokenizer sees."""
@@ -17,8 +17,8 @@ def test_a_function_becomes_a_program_named_and_versioned_by_its_source():
 
     assert isinstance(token_count, Inferlet)
     assert token_count.name == "token-count"
-    assert token_count.version == hashed_version(token_count.source)
-    assert token_count.program == f"token-count@{token_count.version}"
+    assert token_count.hash == blake3.blake3(token_count.source.encode()).hexdigest()
+    assert token_count.program == f"token-count@{token_count.hash}"
     assert token_count.source.startswith("async def token_count(prompt: str, repeat: int = 1):")
 
 
@@ -33,7 +33,7 @@ def test_the_source_ends_with_a_main_that_spreads_the_input():
 
 
 
-def test_the_same_source_is_the_same_version_and_an_edit_is_a_new_one():
+def test_the_same_source_is_the_same_build_and_an_edit_is_a_new_one():
     def first():
         def f(x: int):
             return x
@@ -52,18 +52,16 @@ def test_the_same_source_is_the_same_version_and_an_edit_is_a_new_one():
 
         return f
 
-    assert inferlet(first()).version == inferlet(again()).version
-    assert inferlet(first()).version != inferlet(edited()).version
-    assert hashed_version("x") != hashed_version("y")
-    assert all(part.isdigit() for part in hashed_version("x").split("."))
+    assert inferlet(first()).program == inferlet(again()).program
+    assert inferlet(first()).program != inferlet(edited()).program
 
 
-def test_options_override_what_is_derived():
-    @inferlet(name="echo", version="1.2.0")
+def test_a_name_overrides_the_functions():
+    @inferlet(name="echo")
     def anything(x: str):
         return x
 
-    assert (anything.name, anything.version) == ("echo", "1.2.0")
+    assert anything.name == "echo"
     assert anything("hi") == "hi", "the function still runs locally"
 
 

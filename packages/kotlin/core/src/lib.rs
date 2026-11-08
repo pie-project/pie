@@ -143,14 +143,12 @@ pub extern "system" fn Java_org_pieproject_server_NativeCore_install<'a>(
     handle: jlong,
     program: JByteArray,
     file: JString,
-    version: JString,
 ) -> JString<'a> {
     throwing(&mut env, |env| {
         let program = env.convert_byte_array(&program)?;
         let file = string(env, &file)?;
-        let version = optional_string(env, &version)?;
         let name = server(handle)?
-            .install(program, &file, version.as_deref())
+            .install(program, &file)
             .map_err(|e| e.context("install"))?;
         Ok(env.new_string(name)?)
     })

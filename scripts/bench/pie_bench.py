@@ -785,7 +785,7 @@ async def run(args: argparse.Namespace):
     wasm = bench_inferlet_wasm(args.inferlet_dir)
 
     async with pie_client(args) as (client, engine_config):
-        pkg = await client.install_program(wasm, force_overwrite=True)
+        pkg = await client.install_program(wasm)
 
         first_output_text: list[str | None] = [None]
         output_token_ids_by_process: dict[str, list[int]] = {}

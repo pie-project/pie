@@ -10,7 +10,7 @@ use crate::inferlet::host;
 use crate::service::{Service, ServiceHandler};
 
 use super::process::{OutputMode, ProcessCtx, ProcessId};
-use super::program::{self, ProgramName};
+use super::program::{self, Program, ProgramHash};
 use super::sandbox::{FsPolicy, InstancePolicy, NetworkPolicy};
 
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
@@ -29,29 +29,30 @@ pub fn spawn(engine: &Engine, fs: FsPolicy, network: NetworkPolicy, memory_limit
 pub async fn instantiate(
     process_id: ProcessId,
     username: String,
-    program_name: &ProgramName,
+    program: &Program,
     output: OutputMode,
 ) -> Result<(Store<ProcessCtx>, Instance)> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Instantiate {
         process_id,
         username,
-        program_name: program_name.clone(),
+        program: program.clone(),
         output,
         response: tx,
     })?;
     rx.await?
 }
 
-pub(crate) fn invalidate(program_name: &ProgramName) {
-    let _ = SERVICE.send(Message::Invalidate {
-        program_name: program_name.clone(),
-    });
+/// Drop what is linked of these builds: nothing runs them by name any more.
+pub(crate) fn forget(hashes: Vec<ProgramHash>) {
+    if !hashes.is_empty() {
+        let _ = SERVICE.send(Message::Forget { hashes });
+    }
 }
 
-type InstancePreKey = (ProgramName, u64);
 type InstancePreCell = Arc<OnceCell<InstancePre<ProcessCtx>>>;
-type InstancePreCache = Arc<Mutex<HashMap<InstancePreKey, InstancePreCell>>>;
+/// By the hash of the program linked: its bytes never change under it.
+type InstancePreCache = Arc<Mutex<HashMap<ProgramHash, InstancePreCell>>>;
 type BaseLinkerCache = Arc<OnceCell<Arc<WasmLinker<ProcessCtx>>>>;
 
 struct Linker {
@@ -112,22 +113,11 @@ impl Linker {
         Ok(linker)
     }
 
-    fn instance_pre_cell(
-        cache: &InstancePreCache,
-        program_name: &ProgramName,
-        generation: u64,
-    ) -> (InstancePreCell, bool) {
+    fn instance_pre_cell(cache: &InstancePreCache, hash: &ProgramHash) -> InstancePreCell {
         let mut cache = cache.lock().unwrap();
-        cache.retain(|(name, cached_generation), _| {
-            name != program_name || *cached_generation == generation
-        });
-        match cache.entry((program_name.clone(), generation)) {
-            Entry::Occupied(entry) => (Arc::clone(entry.get()), true),
-            Entry::Vacant(entry) => {
-                let cell = Arc::new(OnceCell::new());
-                entry.insert(Arc::clone(&cell));
-                (cell, false)
-            }
+        match cache.entry(hash.clone()) {
+            Entry::Occupied(entry) => Arc::clone(entry.get()),
+            Entry::Vacant(entry) => Arc::clone(entry.insert(Arc::new(OnceCell::new()))),
         }
     }
 
@@ -146,14 +136,13 @@ impl Linker {
         instance_pre_cache: InstancePreCache,
         process_id: ProcessId,
         username: String,
-        program_name: &ProgramName,
+        program: &Program,
         output: OutputMode,
     ) -> Result<(Store<ProcessCtx>, Instance)> {
-        let main = program::get_wasm_component(program_name)
+        let main = program::get_wasm_component(program)
             .await
-            .ok_or_else(|| anyhow!("Component not found for program: {}", program_name))?;
+            .ok_or_else(|| anyhow!("{program} is not loaded"))?;
 
-        let generation = main.generation;
         let component = main.component;
         let language = main.script.is_some();
 
@@ -164,8 +153,7 @@ impl Linker {
 
         let base_linker = Self::base_linker(&engine, &base_linker_cache).await?;
 
-        let (cell, _cache_hit) =
-            Self::instance_pre_cell(&instance_pre_cache, program_name, generation);
+        let cell = Self::instance_pre_cell(&instance_pre_cache, &program.hash);
         let pre = cell
             .get_or_try_init(|| async {
                 Self::linker_for(&engine, &base_linker, &component, language, &policy)?
@@ -217,12 +205,12 @@ enum Message {
     Instantiate {
         process_id: ProcessId,
         username: String,
-        program_name: ProgramName,
+        program: Program,
         output: OutputMode,
         response: oneshot::Sender<Result<(Store<ProcessCtx>, Instance)>>,
     },
-    Invalidate {
-        program_name: ProgramName,
+    Forget {
+        hashes: Vec<ProgramHash>,
     },
 }
 
@@ -234,7 +222,7 @@ impl ServiceHandler for Linker {
             Message::Instantiate {
                 process_id,
                 username,
-                program_name,
+                program,
                 output,
                 response,
             } => {
@@ -244,24 +232,18 @@ impl ServiceHandler for Linker {
                 let pre_cache = Arc::clone(&self.instance_pre_cache);
                 crate::rt::spawn(async move {
                     let result = Linker::instantiate(
-                        engine,
-                        policy,
-                        base_cache,
-                        pre_cache,
-                        process_id,
-                        username,
-                        &program_name,
+                        engine, policy, base_cache, pre_cache, process_id, username, &program,
                         output,
                     )
                     .await;
                     let _ = response.send(result);
                 });
             }
-            Message::Invalidate { program_name } => {
-                self.instance_pre_cache
-                    .lock()
-                    .unwrap()
-                    .retain(|(name, _), _| name != &program_name);
+            Message::Forget { hashes } => {
+                let mut cache = self.instance_pre_cache.lock().unwrap();
+                for hash in &hashes {
+                    cache.remove(hash);
+                }
             }
         }
     }

@@ -54,6 +54,7 @@ listen = "127.0.0.1:8080"   # loopback. Exposing the port is an edit here.
 verbose = false
 # worker_threads  = 16        # derived from visible CPUs, capped at 64
 # max_upload      = "256MiB"
+# allow_upload    = true      # false: clients run only the built-ins and `pie inferlet install`s
 
 # [telemetry]
 # endpoint     = "http://localhost:4317"  # an OTLP collector; omit to export none

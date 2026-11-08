@@ -3,7 +3,7 @@ use std::process::Command;
 
 use anyhow::Result;
 
-use runtime::inferlet::program::{Language, Repository};
+use runtime::inferlet::program::{Language, Program, ProgramHash, ProgramRef, Repository};
 
 use crate::ui::{Mark, Palette};
 
@@ -278,16 +278,16 @@ fn absent_because(name: &str) -> String {
     }
 }
 
-/// The newest version of `name` installed under the inferlets directory.
-fn installed_version(name: &str) -> Option<String> {
-    let mut repo = Repository::new(crate::paths::inferlets_dir());
-    repo.refresh();
-    repo.newest(name).map(|program| program.version)
+/// What the operator installed of `name` under the inferlets directory,
+/// which serves in place of the built-in.
+fn installed(name: &str) -> Option<Program> {
+    let repo = Repository::new(crate::paths::inferlets_dir());
+    repo.resolve(None, &ProgramRef::parse(name).ok()?).ok()
 }
 
 /// The programs behind the HTTP routes are built into this binary, one per
-/// API. A copy installed on disk shadows the built-in one; a pie built with
-/// `PIE_BUILTINS=skip` has none.
+/// API. The operator's install of the same name serves in its place; a pie
+/// built with `PIE_BUILTINS=skip` has none.
 fn check_builtin_inferlets() -> Checks {
     let mut programs: Vec<&str> = gateway::ingress::compat::ROUTES
         .iter()
@@ -305,31 +305,26 @@ fn check_builtin_inferlets() -> Checks {
                 .map(|(route, _)| *route)
                 .collect();
             let routes = routes.join(", ");
-            match (builtins::find(name), installed_version(name)) {
+            let builtin = builtins::find(name).map(|builtin| Program {
+                name: name.to_string(),
+                hash: ProgramHash::of(builtin.component),
+            });
+            match (builtin, installed(name)) {
                 (Some(builtin), None) => (
                     name.to_string(),
-                    format!("{name}@{} built in, serves {routes}", builtin.version),
+                    format!("{builtin} built in, serves {routes}"),
                     Status::Pass,
                 ),
-                (Some(builtin), Some(installed)) if installed != builtin.version => (
+                (Some(builtin), Some(installed)) => (
                     name.to_string(),
                     format!(
-                        "{name}@{} built in; {name}@{installed} in {inferlets_dir} shadows it for {routes}",
-                        builtin.version
-                    ),
-                    Status::Pass,
-                ),
-                (Some(builtin), Some(_)) => (
-                    name.to_string(),
-                    format!(
-                        "{name}@{} built in; the copy in {inferlets_dir} is what serves {routes}",
-                        builtin.version
+                        "{builtin} built in; {installed} in {inferlets_dir} serves {routes} in its place"
                     ),
                     Status::Pass,
                 ),
                 (None, Some(installed)) => (
                     name.to_string(),
-                    format!("{name}@{installed} installed, serves {routes} (not built into this pie)"),
+                    format!("{installed} installed, serves {routes} (not built into this pie)"),
                     Status::Pass,
                 ),
                 (None, None) => (

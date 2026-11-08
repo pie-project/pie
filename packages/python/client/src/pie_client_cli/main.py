@@ -75,20 +75,13 @@ def submit(
     inferlet: Annotated[
         Optional[str],
         typer.Argument(
-            help="Name of an inferlet installed on the server (e.g., 'text-completion@0.1.0')"
+            help="An inferlet installed on the server: a name, or `name@<hash>` for one build"
         ),
     ] = None,
     path: Annotated[
         Optional[Path],
         typer.Option(
             "--path", "-p", help="Path to a local inferlet: a .wasm component or a .py/.js script"
-        ),
-    ] = None,
-    version: Annotated[
-        Optional[str],
-        typer.Option(
-            "--version",
-            help="Version to install a --path inferlet as (default: the one it declares, else a hash)",
         ),
     ] = None,
     config: ConfigOption = None,
@@ -112,14 +105,13 @@ def submit(
 
     You can specify an inferlet either by installed name or by path (mutually exclusive):
 
-    - By name: pie-client submit text-completion@0.1.0 -- --prompt "hello"
+    - By name: pie-client submit text-completion -- --prompt "hello"
     - By path: pie-client submit --path ./my_inferlet.wasm -- --prompt "hello"
     """
     try:
         submit_cmd.handle_submit_command(
             inferlet=inferlet,
             path=expand_path(path),
-            version=version,
             config=expand_path(config),
             host=host,
             port=port,
@@ -144,23 +136,10 @@ def install(
         Path,
         typer.Argument(help="Path to a local inferlet: a .wasm component or a .py/.js script"),
     ],
-    version: Annotated[
-        Optional[str],
-        typer.Option(
-            "--version",
-            help="Version to install as (default: the one the inferlet declares, else a hash)",
-        ),
-    ] = None,
     config: ConfigOption = None,
     host: HostOption = None,
     port: PortOption = None,
     username: UsernameOption = None,
-    force: Annotated[
-        bool,
-        typer.Option(
-            "-f", "--force", help="Force reinstall even if already installed."
-        ),
-    ] = False,
 ) -> None:
     """Install an inferlet to a running Pie engine without launching it.
 
@@ -171,12 +150,10 @@ def install(
     try:
         install_cmd.handle_install_command(
             path=expand_path(path),
-            version=version,
             config=expand_path(config),
             host=host,
             port=port,
             username=username,
-            force=force,
         )
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)

@@ -4,7 +4,7 @@ A Python inferlet is its source, not a build. The host installs this
 component once, and for each Python program it launches an instance of it
 with the program's source folded into the launch input:
 
-    {"__pie_script__": {"name": "beam-search@0.1.0", "file": "beam-search.py",
+    {"__pie_script__": {"name": "beam-search@3f9a1c2b5d7e", "file": "beam-search.py",
                         "source": "..."},
      "input": "<the caller's input, verbatim>"}
 

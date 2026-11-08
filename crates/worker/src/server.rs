@@ -122,14 +122,16 @@ impl Server {
         self.listen_addr
     }
 
-    /// Installs a program (`file` names it: `x.wasm`, `x.py`, ...); returns
-    /// its `name@version`.
-    pub fn install(&self, program: Vec<u8>, file: &str, version: Option<&str>) -> Result<String> {
+    /// Installs a program among the system's, which every session runs
+    /// (`file` names it: `x.wasm`, `x.py`, ...); returns its
+    /// `name@<hash>`.
+    pub fn install(&self, program: Vec<u8>, file: &str) -> Result<String> {
+        use runtime::inferlet::program::{self, Namespace};
         self.with(|live| {
-            let name = live.runtime.block_on(runtime::inferlet::program::add(
-                program, file, version, true,
-            ))?;
-            Ok(name.to_string())
+            let program = live
+                .runtime
+                .block_on(program::add(Namespace::System, file, program))?;
+            Ok(program.pinned())
         })
     }
 

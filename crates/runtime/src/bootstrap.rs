@@ -70,9 +70,8 @@ pub struct Config {
     pub cache_dir: PathBuf,
     /// Where snapshots of handles are kept, and how many bytes of them.
     pub snapshots: Option<(PathBuf, u64)>,
-    /// The built-in inferlets: registered at boot beside whatever
-    /// `cache_dir` holds, each shadowed by a copy of its own name and
-    /// version installed there.
+    /// The built-in inferlets: the system's programs, each under whatever
+    /// the operator installs of its name in `cache_dir`.
     pub builtin_programs: Vec<BuiltinProgram>,
     pub verbose: bool,
     pub log_dir: Option<PathBuf>,
@@ -87,7 +86,6 @@ pub struct Config {
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltinProgram {
     pub name: &'static str,
-    pub version: &'static str,
     pub component: &'static [u8],
 }
 
@@ -107,6 +105,9 @@ pub struct RuntimeConfig {
     pub network_allowed_hosts: Vec<String>,
 
     pub max_upload_mb: usize,
+    /// Whether a client may install its own programs; without, the
+    /// system's alone run.
+    pub allow_upload: bool,
     /// Where the `<language>.wasm` language components live.
     pub languages_dir: PathBuf,
     /// Where wasmtime caches compiled code across boots; `None` compiles
@@ -256,7 +257,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             .saturating_mul(1024 * 1024),
     );
     let max_upload_bytes = config.runtime.max_upload_mb.saturating_mul(1024 * 1024);
-    server::init(max_upload_bytes);
+    server::init(max_upload_bytes, config.runtime.allow_upload);
     let bound_port = config.port;
 
     let ModelConfig {

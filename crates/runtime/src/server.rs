@@ -16,7 +16,7 @@ use dashmap::DashMap;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::inferlet::process;
-use crate::inferlet::{ProcessEvent, ProcessId, ProgramName};
+use crate::inferlet::{ProcessEvent, ProcessId};
 use crate::service::{ServiceHandler, ServiceMap};
 
 pub type ClientId = u32;
@@ -26,7 +26,7 @@ static SESSION_OUTBOX: LazyLock<
     DashMap<ClientId, Arc<TokioMutex<mpsc::Receiver<WireServerMessage>>>>,
 > = LazyLock::new(DashMap::new);
 
-fn install_state(max_upload_bytes: usize) -> Arc<ServerState> {
+fn install_state(max_upload_bytes: usize, allow_upload: bool) -> Arc<ServerState> {
     if let Some(state) = STATE.get() {
         return Arc::clone(state);
     }
@@ -34,6 +34,7 @@ fn install_state(max_upload_bytes: usize) -> Arc<ServerState> {
     let state = Arc::new(ServerState {
         next_client_id: AtomicU32::new(1),
         max_upload_bytes,
+        allow_upload,
     });
     let _ = STATE.set(Arc::clone(&state));
     STATE.get().cloned().unwrap_or(state)
@@ -46,8 +47,10 @@ fn get_state() -> Result<Arc<ServerState>> {
         .ok_or_else(|| anyhow!("server not initialized; call server::init first"))
 }
 
-pub(crate) fn init(max_upload_bytes: usize) {
-    let _ = install_state(max_upload_bytes);
+/// `allow_upload` false refuses every client's program: the system's alone
+/// run.
+pub(crate) fn init(max_upload_bytes: usize, allow_upload: bool) {
+    let _ = install_state(max_upload_bytes, allow_upload);
     inbox::spawn();
 }
 
@@ -192,6 +195,7 @@ pub(crate) async fn receive_file(client_id: ClientId, process_id: ProcessId) -> 
 struct ServerState {
     next_client_id: AtomicU32,
     pub(super) max_upload_bytes: usize,
+    pub(super) allow_upload: bool,
 }
 
 #[derive(Debug)]
@@ -236,7 +240,6 @@ struct Session {
     /// capture — the launcher owns them, so its close ends them (below);
     /// processes merely attached to are another session's and only detach.
     pub(super) launched_processes: HashSet<ProcessId>,
-    pub(super) installed_programs: HashSet<ProgramName>,
     pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
     pub(super) handles: crate::handle::Table,
     /// Frames naming a lent handle, or a handle an earlier frame here names,
@@ -262,7 +265,6 @@ impl Session {
             inflight_uploads: DashMap::new(),
             attached_processes: Vec::new(),
             launched_processes: HashSet::new(),
-            installed_programs: HashSet::new(),
             file_waiters: HashMap::new(),
             handles,
             waiting: VecDeque::new(),
@@ -430,11 +432,9 @@ impl Session {
                     .await;
             }
 
-            ClientMessage::CheckProgram {
-                corr_id,
-                name,
-                version,
-            } => self.handle_check_program(corr_id, name, version).await,
+            ClientMessage::CheckProgram { corr_id, inferlet } => {
+                self.handle_check_program(corr_id, &inferlet).await
+            }
 
             ClientMessage::Query {
                 corr_id,
@@ -446,8 +446,6 @@ impl Session {
                 corr_id,
                 program_hash,
                 file,
-                version,
-                force_overwrite,
                 chunk_index,
                 total_chunks,
                 chunk_data,
@@ -456,8 +454,6 @@ impl Session {
                     corr_id,
                     program_hash,
                     file,
-                    version,
-                    force_overwrite,
                     chunk_index,
                     total_chunks,
                     chunk_data,
@@ -580,7 +576,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let mut session = Session::new_inproc(
             9,
-            install_state(0),
+            install_state(0, true),
             tx,
             "acme".to_string(),
             "al".to_string(),
@@ -604,6 +600,39 @@ mod tests {
             .unwrap();
         std::mem::forget(lease);
         (session, rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_server_that_takes_no_uploads_refuses_the_first_chunk() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let state = Arc::new(ServerState {
+            next_client_id: AtomicU32::new(1),
+            max_upload_bytes: 1024,
+            allow_upload: false,
+        });
+        let mut session = Session::new_inproc(9, state, tx, "acme".into(), "al".into());
+        let chunk = |chunk_index| ClientMessage::AddProgram {
+            corr_id: 4,
+            program_hash: blake3::hash(b"xy").to_hex().to_string(),
+            file: "probe.py".to_string(),
+            chunk_index,
+            total_chunks: 2,
+            chunk_data: vec![b'x' + chunk_index as u8],
+        };
+        session
+            .handle(SessionMessage::ClientRequest(chunk(0)))
+            .await;
+        let Some(WireServerMessage::Response {
+            corr_id,
+            ok,
+            result,
+        }) = rx.recv().await
+        else {
+            panic!("an answer to the upload");
+        };
+        assert_eq!((corr_id, ok), (4, false));
+        assert!(result.contains("no uploads"), "{result}");
+        assert!(session.inflight_uploads.is_empty(), "nothing of it is kept");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -680,7 +709,7 @@ mod tests {
     async fn a_session_owns_only_its_own_tenant_and_users_processes() {
         let session = Session::new_inproc(
             8,
-            install_state(0),
+            install_state(0, true),
             mpsc::channel(1).0,
             "acme".to_string(),
             "alice".to_string(),
@@ -705,7 +734,7 @@ mod tests {
 
         let mut session = Session::new_inproc(
             7,
-            install_state(0),
+            install_state(0, true),
             mpsc::channel(1).0,
             DEFAULT_TENANT.to_string(),
             DEFAULT_USER.to_string(),

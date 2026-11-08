@@ -1,5 +1,6 @@
 import asyncio
 import io
+import blake3
 import msgpack
 import signal
 import sys
@@ -55,8 +56,6 @@ class PythonClientTests(unittest.IsolatedAsyncioTestCase):
                 "type": "add_program",
                 "program_hash": "hash",
                 "file": "demo.wasm",
-                "version": None,
-                "force_overwrite": False,
             },
         )
 
@@ -64,19 +63,22 @@ class PythonClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.pending_requests, {})
         self.assertEqual(len(client.ws.sent), 1)
 
-    async def test_install_sends_the_file_name_and_version_and_returns_the_id(self):
+    async def test_install_sends_the_file_name_and_hash_and_returns_the_build(self):
+        pinned = "demo@" + blake3.blake3(b"source").hexdigest()
         client = PieClient("ws://example.invalid")
-        client.ws = RespondingWebSocket(client, result="demo@1.2.0")
+        client.ws = RespondingWebSocket(client, result=pinned)
 
-        installed = await client.install_program_bytes(b"source", "demo.py", "1.2.0")
+        installed = await client.install_program_bytes(b"source", "demo.py")
 
-        self.assertEqual(installed, "demo@1.2.0")
+        self.assertEqual(installed, pinned)
         [frame] = client.ws.sent
         self.assertEqual(frame["type"], "add_program")
         self.assertEqual(frame["file"], "demo.py")
-        self.assertEqual(frame["version"], "1.2.0")
-        self.assertFalse(frame["force_overwrite"])
-        self.assertNotIn("manifest", frame)
+        self.assertEqual(frame["program_hash"], blake3.blake3(b"source").hexdigest())
+        self.assertEqual(
+            set(frame),
+            {"type", "corr_id", "program_hash", "file", "chunk_index", "total_chunks", "chunk_data"},
+        )
 
     def test_a_program_is_named_by_its_file_or_its_directory(self):
         self.assertEqual(program_file("/a/b/text_completion.wasm"), "text-completion.wasm")

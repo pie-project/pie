@@ -75,13 +75,13 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #input_fn
 
-        const __PIE_PACKAGE_TEXT: &str =
-            concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION"));
+        // The name the program installs under, whatever its file is called.
+        const __PIE_NAME_TEXT: &str = env!("CARGO_PKG_NAME");
         #[used]
-        #[unsafe(link_section = "pie.package")]
-        static __PIE_PACKAGE: [u8; __PIE_PACKAGE_TEXT.len()] = {
-            let text = __PIE_PACKAGE_TEXT.as_bytes();
-            let mut bytes = [0u8; __PIE_PACKAGE_TEXT.len()];
+        #[unsafe(link_section = "pie.name")]
+        static __PIE_NAME: [u8; __PIE_NAME_TEXT.len()] = {
+            let text = __PIE_NAME_TEXT.as_bytes();
+            let mut bytes = [0u8; __PIE_NAME_TEXT.len()];
             let mut i = 0;
             while i < bytes.len() {
                 bytes[i] = text[i];

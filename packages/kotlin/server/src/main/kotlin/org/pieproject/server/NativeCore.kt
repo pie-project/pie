@@ -8,7 +8,7 @@ internal object NativeCore {
     external fun start(artifact: String, config: String, home: String, listen: String?): Long
     external fun summary(handle: Long): String
     external fun listenAddr(handle: Long): String?
-    external fun install(handle: Long, program: ByteArray, file: String, version: String?): String
+    external fun install(handle: Long, program: ByteArray, file: String): String
     external fun installLanguage(handle: Long, language: String, component: ByteArray)
     external fun openSession(handle: Long): Int
     external fun closeSession(handle: Long, session: Int)

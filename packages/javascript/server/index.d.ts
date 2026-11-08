@@ -38,7 +38,8 @@ export class Server {
   readonly running: boolean;
   /** A language component (`python`, `javascript`) from bytes or a URL. */
   installLanguage(language: 'python' | 'javascript' | string, source: Uint8Array | ArrayBuffer | URL | string): Promise<string>;
-  install(source: Uint8Array | ArrayBuffer | URL | string, file?: string | null, version?: string | null): Promise<string>;
+  /** Installs a program among the system's; resolves to its `name@<hash>`. */
+  install(source: Uint8Array | ArrayBuffer | URL | string, file?: string | null): Promise<string>;
   /** A `PieClient` connected to this engine; closed by `shutdown()`. */
   connect(options?: { identity?: string }): Promise<PieClient>;
   /** Stop the engine and release it. Idempotent. */

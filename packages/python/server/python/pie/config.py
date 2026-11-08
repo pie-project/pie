@@ -22,6 +22,8 @@ class ServerConfig:
     verbose: Optional[bool] = None
     worker_threads: Optional[int] = None
     max_upload_mb: Optional[int] = None
+    # False: clients run only the built-ins and what the operator installed.
+    allow_upload: Optional[bool] = None
 
 
 @dataclass

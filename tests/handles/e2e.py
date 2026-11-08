@@ -100,7 +100,7 @@ async def t_dead(c, prog, whole):
     # a launch that fails before running gives its handle back
     k = await c.working_set(); x = await run(c, prog, k, PROMPT, 12)
     try:
-        await c.launch_process("no-such-program@9.9.9", input={}, handles={"ws": k}, returns={"ws": k}); 
+        await c.launch_process("no-such-program", input={}, handles={"ws": k}, returns={"ws": k}); 
     except Exception: pass
     check("a refused launch keeps the handle", (await k.stat())["state"] == "parked")
     await k.close()
@@ -231,7 +231,7 @@ async def t_long_snapshot(c, prog, whole):
 async def t_script(c, prog, whole):
     S = Path(__file__).parent
     for file in ("turn.py", "turn.js"):
-        name = await c.install_program(S / file, force_overwrite=True)
+        name = await c.install_program(S / file)
         a = await c.working_set(); b = await c.working_set()
         one = (await (await c.run(name, ws=a, tokens=PROMPT, max_tokens=16)).result())["tokens"]
         first = (await (await c.run(name, ws=b, tokens=PROMPT, max_tokens=6)).result())["tokens"]
@@ -243,7 +243,7 @@ async def t_script(c, prog, whole):
 
 async def t_matcher(c, prog, whole):
     S = Path(__file__).parent
-    name = await c.install_program(S / "m.py", force_overwrite=True)
+    name = await c.install_program(S / "m.py")
     m = await c.matcher(regex="[0-9]+")
     check("a matcher is unborn until bound", (await m.stat())["state"] == "unborn")
     r = await (await c.run(name, m=m, accept=[])).result()
@@ -266,8 +266,8 @@ async def t_matcher(c, prog, whole):
 
 async def t_media(c, prog, whole):
     S = Path(__file__).parent
-    mk = await c.install_program(S / "mk.py", force_overwrite=True)
-    see = await c.install_program(S / "see.py", force_overwrite=True)
+    mk = await c.install_program(S / "mk.py")
+    see = await c.install_program(S / "see.py")
     out, sound = await c.frames(), c.pcm()
     await (await c.run(mk, out=out, sound=sound, w=64, h=48)).result()
     st = await out.stat()
@@ -297,8 +297,8 @@ async def t_media(c, prog, whole):
 async def t_clients(c, prog, whole):
     import json, tempfile
     S = Path(__file__).parent
-    mk = await c.install_program(S / "mk.py", force_overwrite=True)
-    see = await c.install_program(S / "see.py", force_overwrite=True)
+    mk = await c.install_program(S / "mk.py")
+    see = await c.install_program(S / "see.py")
     out, sound = await c.frames(), c.pcm()
     await (await c.run(mk, out=out, sound=sound, w=64, h=48)).result()
     data = await out.read("png")
@@ -329,8 +329,8 @@ async def t_clients(c, prog, whole):
 
 async def t_failed(c, prog, whole):
     S = Path(__file__).parent
-    both = await c.install_program(S / "both.py", force_overwrite=True)
-    fail = await c.install_program(S / "fail.py", force_overwrite=True)
+    both = await c.install_program(S / "both.py")
+    fail = await c.install_program(S / "fail.py")
     async def survives(name, w, first):
         check(f"{name}: the handle is as it was", (await w.stat())["state"] == "parked")
         check(f"{name}: and resumes exactly", first + await run(c, prog, w, [first[-1]], 20, drawn=12) == whole)
@@ -390,7 +390,7 @@ async def main():
             try:
                 URI[0] = f"ws://127.0.0.1:{port}"; c = PieClient(URI[0]); await c.connect(); break
             except Exception: c = None; await asyncio.sleep(1)
-        prog = await c.install_program(EX / "working_set_handles.wasm", force_overwrite=True)
+        prog = await c.install_program(EX / "working_set_handles.wasm")
         whole = await t_resume(c, prog)
         for f in (t_lazy, t_order, t_dead, t_evict, t_quota, t_script, t_matcher, t_media, t_clients, t_failed, t_snapshot, t_long_snapshot, t_close, t_keep, t_weak):
             if args.only and f.__name__ not in args.only.split(","): continue

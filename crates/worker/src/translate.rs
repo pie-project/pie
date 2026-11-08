@@ -56,7 +56,6 @@ pub fn builtins() -> Vec<runtime::bootstrap::BuiltinProgram> {
         .iter()
         .map(|b| runtime::bootstrap::BuiltinProgram {
             name: b.name,
-            version: b.version,
             component: b.component,
         })
         .collect()
@@ -103,6 +102,7 @@ fn runtime_config(
             allow_network: user.sandbox.allow_network,
             network_allowed_hosts: user.sandbox.network_allowed_hosts.clone(),
             max_upload_mb: user.server.max_upload.as_mib() as usize,
+            allow_upload: user.server.allow_upload,
             languages_dir: home.join("languages"),
             compile_cache_dir: Some(home.join("cache").join("wasmtime")),
         },

@@ -262,7 +262,7 @@ fn resolve(target: Target) -> Result<Plan> {
 
     match crate::ops::inferlet::resolve_installed(&spec) {
         Ok(program) => Ok(Plan {
-            program: program.to_string(),
+            program: program.pinned(),
             upload: None,
         }),
         Err(error) => match curated {
@@ -277,9 +277,9 @@ fn resolve(target: Target) -> Result<Plan> {
 }
 
 fn plan_local(path: &Path) -> Result<Plan> {
-    let artifact = load_artifact(path, None)?;
+    let artifact = load_artifact(path)?;
     Ok(Plan {
-        program: artifact.identity.name.to_string(),
+        program: artifact.identity.program.pinned(),
         upload: Some((path.to_path_buf(), artifact)),
     })
 }
@@ -417,12 +417,7 @@ async fn drive(
 
     if let Some((path, artifact)) = &plan.upload {
         let installed = client
-            .add_program_bytes(
-                &artifact.bytes,
-                &artifact.file,
-                Some(&artifact.identity.name.version),
-                true,
-            )
+            .add_program_bytes(&artifact.bytes, &artifact.file)
             .await
             .with_context(|| format!("uploading {}", path.display()))?;
         if installed != *program {
@@ -556,7 +551,7 @@ mod tests {
         assert!(looks_like_a_file("build/x.wasm"));
         assert!(looks_like_a_file("./text-completion"));
         assert!(!looks_like_a_file("text-completion"));
-        assert!(!looks_like_a_file("text-completion@0.1.0"));
+        assert!(!looks_like_a_file("text-completion@3f9a1c2b"));
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("probe.py");
         std::fs::write(&script, "").unwrap();

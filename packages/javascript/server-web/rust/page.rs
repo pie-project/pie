@@ -217,14 +217,11 @@ pub fn pie_boot_lazy(
 }
 
 #[wasm_bindgen]
-pub fn pie_install_program(
-    bytes: Vec<u8>,
-    file: String,
-    version: Option<String>,
-) -> js_sys::Promise {
+pub fn pie_install_program(bytes: Vec<u8>, file: String) -> js_sys::Promise {
+    use runtime::inferlet::program::{self, Namespace};
     promise(async move {
-        let name = runtime::inferlet::program::add(bytes, &file, version.as_deref(), true).await?;
-        Ok(JsValue::from_str(&name.to_string()))
+        let program = program::add(Namespace::System, &file, bytes).await?;
+        Ok(JsValue::from_str(&program.pinned()))
     })
 }
 

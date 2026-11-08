@@ -93,9 +93,9 @@ export async function connect() {
   return c;
 }
 
-export async function install(bytes, file, version = null) {
+export async function install(bytes, file) {
   const copy = new Uint8Array(bytes).slice();
-  return await ready().call("install", [copy, file, version], { transfer: [copy.buffer] });
+  return await ready().call("install", [copy, file], { transfer: [copy.buffer] });
 }
 
 /** Hand the runtime a language component (`"python"`, `"javascript"`)
@@ -206,13 +206,13 @@ export class Server {
     return installLanguage(language, bytes, ready_);
   }
 
-  async install(source, file = null, version = null) {
+  async install(source, file = null) {
     this.#alive();
     if (!file) {
       if (isBytes(source)) throw new Error("Server.install: bytes need `file`, the program's file name (`x.wasm`, `x.py`, `x.js`)");
       file = programFile(new URL(source, location.href));
     }
-    return install(await bytesOf(source), file, version);
+    return install(await bytesOf(source), file);
   }
 
   /** A `PieClient` connected in-page. */

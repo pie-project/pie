@@ -237,6 +237,11 @@ pub struct ServerConfig {
     /// Largest blob a client may upload in one request.
     #[serde(default = "default_max_upload")]
     pub max_upload: ByteSize,
+    /// Whether clients may install their own programs, each tenant under
+    /// its own names. Off, a client runs only the system's: the built-ins
+    /// and what `pie inferlet install` put here.
+    #[serde(default = "default_true")]
+    pub allow_upload: bool,
 }
 
 impl Default for ServerConfig {
@@ -246,6 +251,7 @@ impl Default for ServerConfig {
             verbose: false,
             worker_threads: default_worker_threads(),
             max_upload: default_max_upload(),
+            allow_upload: true,
         }
     }
 }

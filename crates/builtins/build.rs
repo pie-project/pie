@@ -15,7 +15,6 @@ use std::process::Command;
 
 struct Builtin {
     name: String,
-    version: String,
     dir: PathBuf,
 }
 
@@ -83,9 +82,8 @@ fn main() {
                 fs::copy(&wasm, &staged)
                     .unwrap_or_else(|e| panic!("{} was not built: {e}", wasm.display()));
                 generated.push_str(&format!(
-                    "    Builtin {{ name: {:?}, version: {:?}, component: include_bytes!({:?}) }},\n",
+                    "    Builtin {{ name: {:?}, component: include_bytes!({:?}) }},\n",
                     builtin.name,
-                    builtin.version,
                     staged.display().to_string(),
                 ));
             }
@@ -111,13 +109,8 @@ fn find_builtins(workspace: &Path) -> Vec<Builtin> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        let version = text
-            .lines()
-            .find_map(|line| string_value(line, "version"))
-            .unwrap_or_else(|| panic!("{}: no version", cargo_toml.display()));
         builtins.push(Builtin {
             name,
-            version,
             dir: entry.path(),
         });
     }
@@ -128,17 +121,6 @@ fn find_builtins(workspace: &Path) -> Vec<Builtin> {
         workspace.display()
     );
     builtins
-}
-
-/// The string a `key = "..."` line holds, for the few keys this needs
-/// without a TOML parser.
-fn string_value(line: &str, key: &str) -> Option<String> {
-    let (k, v) = line.split_once('=')?;
-    if k.trim() != key {
-        return None;
-    }
-    let v = v.trim().split('#').next()?.trim();
-    v.strip_prefix('"')?.strip_suffix('"').map(str::to_string)
 }
 
 fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin]) {
