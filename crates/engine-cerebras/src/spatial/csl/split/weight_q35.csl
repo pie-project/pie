@@ -69,7 +69,8 @@ const timestamp = @import_module("<time>");
 var tdbg = @zeros([NTD]u32);   // TSC stamps of the last pass, by phase (host-read, diagnostics)
 var tdbg_ptr: [*]u32 = &tdbg;
 var tsc = @zeros([3]u16);
-fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
+param TSTAMP: u16 = 1;   // 0: the phase stamps compile out (off the critical path; tdbg reads zeros)
+fn stamp(i: u16) void { if (TSTAMP == 0) { return; } timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
 
 
 fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
