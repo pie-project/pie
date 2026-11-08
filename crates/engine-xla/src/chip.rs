@@ -311,7 +311,7 @@ macro_rules! seeded {
     };
 }
 
-seeded!("v6e.toml", "v7.toml");
+seeded!("v5e.toml", "v6e.toml", "v7.toml");
 
 pub static SHELF: Shelf = Shelf {
     backend: "xla",
@@ -375,7 +375,8 @@ mod tests {
             ("TPU v6 lite", Tpu::V6E, Some("v6e.toml")),
             ("TPU v6e", Tpu::V6E, Some("v6e.toml")),
             ("TPU7x", Tpu::V7, Some("v7.toml")),
-            ("TPU v5 lite", Tpu::of("TPU v5e"), None),
+            ("TPU v5 lite", Tpu::of("TPU v5e"), Some("v5e.toml")),
+            ("TPU v5e", Tpu::of("TPU v5e"), Some("v5e.toml")),
             ("TPU v5p", Tpu::of("TPU v5"), None),
             ("TPU v9 ultra", Tpu::UNKNOWN, None),
             ("", Tpu::UNKNOWN, None),
