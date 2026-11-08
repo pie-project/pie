@@ -486,17 +486,23 @@ pub fn small(ckpt: &Ckpt) -> R<Arrays> {
 
 /// The head's weight tiles `[HR][HC][HDc VR]` (f16 bits: (R, c, d VR + j)
 /// = lm_head[R VR + j][c HDc + d]) and the embedding's `[HR][HC][VR HDc]`
-/// (bf16 bits: (R, c, j HDc + d) = embed[R VR + j][c HDc + d]); rows past
-/// the vocabulary 0.
+/// (bf16 bits: (R, c, j HDc + d) = embed[R VR + j][c HDc + d]). The head
+/// holds HR VR rows, more than the vocabulary: the lm_head's rows past it are
+/// copies of its last row, so their logits tie with it and the argmax (the
+/// first maximum) never picks a padded id; zero rows would win whenever every
+/// real logit is negative. The embedding's padded rows stay 0 (never sent).
 pub fn head(ckpt: &Ckpt, name: &str, f16: bool) -> R<Vec<u16>> {
     let m = Mat::of(ckpt, name)?;
     let v = m.bits.len() / m.cols;
     let mut out = vec![0u16; HR * HC * HDC * VR];
     for r in 0..HR {
         for j in 0..VR {
-            let row = r * VR + j;
+            let mut row = r * VR + j;
             if row >= v {
-                continue;
+                if !f16 || v == 0 {
+                    continue;
+                }
+                row = v - 1;
             }
             for c in 0..HC {
                 for d in 0..HDC {

@@ -186,7 +186,8 @@ impl SplitModel {
         let vr = spec.need("VR")?;
         Ok(SplitModel {
             dev,
-            vocab,
+            // (the prep's vocabulary, when it states one, bounds the caller's)
+            vocab: spec.int("V").map_or(vocab, |v| vocab.min(v as usize)),
             hidden: spec.need("H")? as usize,
             cap: spec.int("CAP").unwrap_or(256) as usize,
             positions: (spec.need("NE")? * g.p.py) as usize,
@@ -331,9 +332,11 @@ impl SplitModel {
         Ok(ring)
     }
 
-    /// The ring's first `n` winners.
+    /// The ring's first `n` winners. An id past the vocabulary (a padded
+    /// head row: the prep pads with the last real row so none can win) is
+    /// refused rather than handed on.
     fn ring(&mut self, n: usize) -> R<Vec<u32>> {
-        self.dev.get(
+        let ring = self.dev.get(
             "ring",
             Rect {
                 x: self.hctl as i32,
@@ -342,7 +345,15 @@ impl SplitModel {
                 h: 1,
             },
             n,
-        )
+        )?;
+        if let Some(&id) = ring.iter().find(|&&id| id as usize >= self.vocab) {
+            return Err(format!(
+                "split: the token loop chose id {id}, past the vocabulary ({}): a padded head row \
+                 won (re-prep: padded rows must copy the last real row)",
+                self.vocab
+            ));
+        }
+        Ok(ring)
     }
 
     /// The token loop: `tokens` at `start..`, then `extra` passes each fed
@@ -426,6 +437,7 @@ impl SplitModel {
         let n = (self.py as usize * hc) as f64;
         let scale = (1.0 / (ss / n + f64::from(self.eps)).sqrt()) as f32;
         let mut l: Vec<f32> = w.into_iter().map(|b| f32::from_bits(b) * scale).collect();
+        // the head's padded rows (ids >= vocab) never reach sampling or the argmax
         l.truncate(self.vocab);
         let mut am = vec![0u32; tokens.len()];
         if let Some(best) = argmax(&l) {

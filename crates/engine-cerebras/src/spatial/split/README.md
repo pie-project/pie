@@ -36,7 +36,11 @@ column 0, then up column 1, and so on.
   flag and log-sum-exp steps, and the MLP SiLU.
 - **Head** (`head_pe.csl`, `head_ctl.csl`). HC columns of HDc dims by HR rows of VR vocabulary rows.
   The head holds lm_head and the embedding tiles of the same vocabulary slice. Each row's control
-  PE reduces the logits and takes the row argmax.
+  PE reduces the logits and takes the row argmax. The head has HR x VR rows, more than the
+  vocabulary (9B / 4B / 0.8B: 249,048 over 248,320). The prep fills the lm_head rows past the
+  vocabulary with copies of its last row, so they tie with it and the first-maximum argmax keeps
+  the real, lower id; zero rows would win whenever every real logit is negative. The host also
+  truncates logits rows to the vocabulary and refuses a ring id past it.
 - **Wafer token loop** (`WL 1`). The rows' (max, id) pairs are max-reduced down the head control
   column. The root records the winner in `ring`, or takes `force[s]` for a forced prompt. The
   winner row's head PEs send their embedding slices back to unit 0's CX rows, so a launch runs

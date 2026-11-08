@@ -181,9 +181,11 @@ if os.environ.get("PREP_NOHEAD"):
 hname = P + "embed_tokens.weight" if tied or "lm_head.weight" not in T else "lm_head.weight"
 Wh = get(hname)
 hw = np.lib.format.open_memmap(os.path.join(out, PRE + "hw.npy"), "w+", np.uint16, (HR, HC, HDc * VR))
+# rows past the vocabulary are copies of its last row: their logits tie with it and the argmax (the
+# first maximum) keeps the real, lower id; zero rows would win whenever every real logit is negative
 for R in range(HR):
     lo, hi = R * VR, min((R + 1) * VR, V)
-    blk = np.zeros((VR, H), np.float32)
+    blk = np.repeat(np.asarray(Wh[V - 1:V], np.float32), VR, axis=0)
     if hi > lo:
         blk[:hi - lo] = Wh[lo:hi]
     hw[R] = f16(blk.reshape(VR, HC, HDc).transpose(1, 2, 0)).reshape(HC, -1)
