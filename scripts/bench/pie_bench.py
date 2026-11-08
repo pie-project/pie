@@ -219,6 +219,28 @@ def is_cumulative_status_key(key: str) -> bool:
             "total_requests_processed",
             "total_tokens_processed",
             "wave_fires",
+            # The frame scheduler's quorum counters count from the server's
+            # boot: undiffed, a run's device idle carried every earlier
+            # cell's on a shared server (a c1 cell's idle into a c128's).
+            "device_idle_us",
+            "device_idle_gaps",
+            "idle_break_control",
+            "idle_break_depth",
+            "idle_park_control_us",
+            "idle_park_other_us",
+            "accept_us",
+            "accept_calls",
+            "turnaround_sum_us",
+            "turnaround_n",
+            "lane_launch_us",
+            "lane_launch_n",
+            "lane_prefill_us",
+            "lane_prefill_n",
+            "lane_control_us",
+            "lane_control_n",
+            "seal_events",
+            "seal_while_executing",
+            "dispatch_blocked_holds",
         }
     )
 
