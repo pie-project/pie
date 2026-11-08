@@ -105,6 +105,8 @@ pub struct Model {
     pub ary: usize,
     /// `HVC` 1: vertical handoffs on centred columns (the host's tables).
     pub hvc: bool,
+    /// `SLW` 1 (with `TRM` 1024): the f16 SiLU's wide tail (`Variant::slw`).
+    pub slw: bool,
 }
 
 impl Model {
@@ -133,6 +135,7 @@ impl Model {
             trim: 0,
             ary: 0,
             hvc: false,
+            slw: false,
         }
     }
 
@@ -165,6 +168,7 @@ impl Model {
             f16cl: self.f16cl,
             xac: self.xac,
             trim: u16::try_from(self.trim).unwrap_or(0),
+            slw: self.slw,
         }
     }
 }
@@ -796,6 +800,7 @@ impl ProgramSpec {
             "TRM" => Some(m.trim),
             "ARY" => Some(m.ary),
             "HVC" => Some(usize::from(m.hvc)),
+            "SLW" => Some(usize::from(m.slw)),
             "PX" => Some(g.px),
             "PY" => Some(g.py),
             "Hc" => Some(g.hc),
@@ -1463,6 +1468,7 @@ fn model(get: &Get) -> R<Model> {
         trim: get.opt("TRM").unwrap_or(0),
         ary: get.opt("ARY").unwrap_or(0),
         hvc: get.opt("HVC").unwrap_or(0) != 0,
+        slw: get.opt("SLW").unwrap_or(0) != 0,
     })
 }
 

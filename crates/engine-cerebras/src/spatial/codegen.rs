@@ -92,6 +92,7 @@ mod src {
     pub const TRM_XG: &str = include_str!("csl/kernels/trm_xg.json");
     pub const TRM_SILU: &str = include_str!("csl/kernels/trm_silu.json");
     pub const TRM_SILH: &str = include_str!("csl/kernels/trm_silh.json");
+    pub const TRM_SLW: &str = include_str!("csl/kernels/trm_slw.json");
     pub const TRM_XGI: &str = include_str!("csl/kernels/trm_xgi.json");
     pub const TRM_XGG: &str = include_str!("csl/kernels/trm_xgg.json");
     pub const HEAD_PACK: &str = include_str!("csl/kernels/head_pack.json");
@@ -426,6 +427,13 @@ pub struct Variant {
     /// **32768** (testing, with 16384) every packed round takes the tie path.
     /// 16384 and 32768 touch the head and the strip alone.
     pub trim: u16,
+    /// `SLW` 1 (regions, with `TRM` 1024): the f16 SiLU's wide tail (`trm_slw.json`):
+    /// t clamped at -24 instead of -15 and e kept as e 2^9 on the way (2^(n + 9) from m's
+    /// bits; e 2^-9 for 1 + e, (e' a) 2^-9 for a e), so no f16 subnormal flushes a sig(a)
+    /// to 0 for a < -10.05. 1024 alone loses up to 4.3e-4 |u| there, which moved Qwen3-8B's
+    /// layers 1-4 (silu16 rms 2-4e-3 relative against ~6e-4; scratch/q8s). +18 cycles at Ic
+    /// 48 (one PE, simulator: 566 against 548), bit-equal to scratch/q8s/emu/emu16.py.
+    pub slw: bool,
 }
 
 impl Variant {
@@ -781,6 +789,12 @@ impl Variant {
                     return Err(format!("gen: {tag}: TRM 2048 needs 1024"));
                 }
                 s = apply_reps("trm_silh", src::TRM_SILH, &s, tag)?;
+            }
+            if self.slw && region {
+                if self.trim & 1024 == 0 {
+                    return Err(format!("gen: {tag}: SLW needs TRM 1024"));
+                }
+                s = apply_reps("trm_slw", src::TRM_SLW, &s, tag)?;
             }
         }
         if let Some(bits) = self.eps_bits {

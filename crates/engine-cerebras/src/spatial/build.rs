@@ -222,6 +222,10 @@ pub struct ServeConfig {
     /// With `silu16`: its two scales in f16 after the conversion (`TRM` 2048;
     /// inexact; 0540 sp540_t27 2,033.3 tok/s, golden, 0 mismatches).
     pub silu16h: bool,
+    /// With `silu16`: its wide tail (`SLW` 1: no f16 subnormal flush of a sig(a) at
+    /// a < -10; exact to ~1 ulp there; +18 cycles a layer). Qwen3-8B needs it (scratch/q8s:
+    /// 1024 alone flips 3 of 512 teacher-forced tokens in host emulation); Llama's t29 ran without.
+    pub silu16w: bool,
     /// The head's argmax round from bf16(x) alone (`MODE` 2) instead of the
     /// exact three-part x (`MODE` 0): a third of the head's matvec.
     pub head_one_pass: bool,
@@ -271,6 +275,7 @@ impl ServeConfig {
             xg16: false,
             head_pack: false,
             silu16h: false,
+            silu16w: false,
             head_one_pass: false,
             hv: false,
             lever_d: false,
@@ -360,6 +365,7 @@ impl ServeConfig {
             "xg16",
             "head_pack",
             "silu16h",
+            "silu16w",
             "head_one_pass",
             "hv",
             "lever_d",
@@ -472,6 +478,7 @@ impl ServeConfig {
             xg16: flag(t, "xg16")?,
             head_pack: flag(t, "head_pack")?,
             silu16h: flag(t, "silu16h")?,
+            silu16w: flag(t, "silu16w")?,
             head_one_pass: flag(t, "head_one_pass")?,
             hv: flag(t, "hv")?,
             lever_d: flag(t, "lever_d")?,
@@ -1140,6 +1147,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     if cfg.trim && !(cfg.qkv1 && cfg.ops2 && cfg.f16acc && cfg.arfx) {
         return Err("serve8b_region's `trim` needs `qkv1`, `ops2`, `f16acc` and `arfx`".into());
     }
+    if cfg.silu16w && !cfg.silu16 {
+        return Err("serve8b_region's `silu16w` needs `silu16`".into());
+    }
     if cfg.silu16h && !cfg.silu16 {
         return Err("serve8b_region's `silu16h` needs `silu16`".into());
     }
@@ -1524,6 +1534,7 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             },
             ary: if cfg.ary16 { 16 } else { 0 },
             hvc: cfg.hvc,
+            slw: cfg.trim && cfg.silu16 && cfg.silu16w,
             ..Model::dims(g.hidden, g.qh, plan.vocab, cap)
         },
         Layers::Units {
@@ -1617,6 +1628,9 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
     }
     if cfg.hvc {
         st.push(Typed("HVC"));
+    }
+    if cfg.trim && cfg.silu16 && cfg.silu16w {
+        st.push(Typed("SLW"));
     }
     if cfg.lever_d {
         st.push(Typed("YD"));
@@ -2839,6 +2853,9 @@ mod qwen3_8b {
         assert_eq!(got(&cfg), sorted(&format!("{want},TRM:1023")));
         (cfg.silu16, cfg.silu16h, cfg.xg16, cfg.head_pack) = (true, true, true, true);
         assert_eq!(got(&cfg), sorted(&format!("{want},TRM:32767")));
+        // + silu16w: the f16 SiLU's wide tail (SLW 1), regions only
+        cfg.silu16w = true;
+        assert_eq!(got(&cfg), sorted(&format!("{want},TRM:32767,SLW:1")));
         let (d, p) = params(&plan, &cfg).unwrap();
         let num = |k: &str| p.iter().find(|e| e.0 == k).and_then(|e| e.1.parse().ok());
         plan.spec.check_program(num).expect("the model takes it");
@@ -2846,6 +2863,7 @@ mod qwen3_8b {
         assert!(lay.model.qk_norm);
         for (n, text) in d.files_with(lay.model.variant()).unwrap() {
             assert_eq!(text.contains("(trm 1024)"), n == "region_pe.csl", "{n}");
+            assert_eq!(text.contains("(slw) e' = e 2^9"), n == "region_pe.csl", "{n}");
         }
     }
 
