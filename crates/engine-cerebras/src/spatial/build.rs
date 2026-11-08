@@ -207,12 +207,12 @@ pub struct ServeConfig {
     /// serve8b_region(_pipe): vertical handoffs on centred columns (`HVC` 1;
     /// the host's tables).
     pub hvc: bool,
-    /// With `trim`, models without q/k norms: the regions' MLP act in f16 on
+    /// With `trim` (any model; Qwen3-8B since scratch/q8s): the regions' MLP act in f16 on
     /// every PE of a column from the gate-up all-reduce, no act all-reduce
     /// (`TRM` bit 1024, with 4096; not 8192: the grids lose with it, 0538; inexact,
-    /// so not for the q/k-norm models' exact bits).
+    /// but golden on Llama and, in host emulation, on Qwen3-8B).
     pub silu16: bool,
-    /// With `trim`, models without q/k norms: the regions' x g in f16, its
+    /// With `trim` (any model): the regions' x g in f16, its
     /// f16 gammas made in place on the first pass (`TRM` bits 512 + 4096), and
     /// the grids' (8192, when they take the cuts); inexact.
     pub xg16: bool,
@@ -1500,23 +1500,25 @@ fn serve8b_region(plan: &SpatialPlan, cfg: &ServeConfig, design: Design) -> R<Dr
             xac: cfg.xac,
             // (TRM: every bit, the grids' with their f16 accumulation; 0533: TRM 479
             // 1,903.1 / 1,902.5 tok/s and TRM 255 1,897.4 / 1,897.7, both = golden)
-            // (with q/k norms, Qwen3-8B: the exact bits alone, 241 - 2, 8 and 256 move its
-            // teacher-forced set; 0534: TRM 245 kept 0529's 14 mismatches)
+            // (q/k-norm models, Qwen3-8B, take the same bits: 0534's "241, the exact bits
+            // alone" kept the teacher-forced set against a golden of the u4 model; against the
+            // bf16 model's own f32 golden (scratch/q8s, 512 tokens) qt22's stream is golden and
+            // the host emulation of every bit keeps it)
             trim: if cfg.trim {
-                (if plan.spec.qk_norm { 241 } else { 1019 })
+                1019
                     | (usize::from(cfg.grid_levers && cfg.f16accg) << 2)
                     // (silu16: TRM 1024, the regions' act in f16, no act all-reduce; inexact;
                     // with 4096, 512's f16 gammas in place, so that the region fits beside 512)
-                    | (if cfg.silu16 && !plan.spec.qk_norm { 1024 | 4096 } else { 0 })
+                    | (if cfg.silu16 { 1024 | 4096 } else { 0 })
                     // (not 8192, the grids too: 0538 sp538_t20, grids +0.14k / +0.11k)
                     // (xg16: TRM 512 + 4096, x g in f16 with in-place f16 gammas; inexact)
-                    | (if cfg.xg16 && !plan.spec.qk_norm { 512 | 4096 } else { 0 })
+                    | (if cfg.xg16 { 512 | 4096 } else { 0 })
                     // (and 8192: the grids' x g in f16, when they take the cuts)
-                    | (usize::from(cfg.xg16 && !plan.spec.qk_norm && cfg.grid_levers && cfg.f16accg) << 13)
+                    | (usize::from(cfg.xg16 && cfg.grid_levers && cfg.f16accg) << 13)
                     // (head_pack: TRM 16384, the head's packed argmax round; exact)
                     | (usize::from(cfg.head_pack) << 14)
                     // (silu16h: TRM 2048, the SiLU's scales in f16)
-                    | (usize::from(cfg.silu16h && cfg.silu16 && !plan.spec.qk_norm) << 11)
+                    | (usize::from(cfg.silu16h && cfg.silu16) << 11)
             } else {
                 0
             },
@@ -2760,7 +2762,8 @@ mod qwen3_8b {
         );
     }
 
-    /// ... and with `trim`, `arfs` and `hvc` states 0535's sp535_qt15 (TIME 1 there).
+    /// ... and with `trim`, `arfs` and `hvc` states 0535's sp535_qt15 (TIME 1 there) but
+    /// TRM 1023: q/k-norm models take every op cut since qwen3-8b-speed (0535 ran 245).
     #[test]
     fn the_plan_places_qwen3_8b_trim_arfs_hvc_as_0535() {
         let goals = Goals {
@@ -2795,9 +2798,55 @@ mod qwen3_8b {
                  RGY:16,RC:2,RR:5,NCOL:5,YD:208,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
                  PROF:0,TIME:0,HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,\
                  PASSES:3,MODE:2,OVL:0,VMC:1,CAP:64,iters:1,B:1,NP:1,SPD:1,LSE:1,OP2:1,QKV1:1,ARF:7,MEM:1,\
-                 OP3:1,F16:3,GRD:7,XAC:1,TRM:245,HVC:1"
+                 OP3:1,F16:3,GRD:7,XAC:1,TRM:1023,HVC:1"
             )
         );
+    }
+
+    /// Qwen3-8B with the Llama levers (scratch/q8s): qg3's program (sp535_qt15: lever D, HV,
+    /// ARF 7, F16 3, GRD 7, XAC, HVC) + `silu16`, `silu16h`, `xg16`, `head_pack` states
+    /// TRM 32767, as Llama's t29 (its MEM stays 1: q/k norms).
+    #[test]
+    fn the_plan_places_qwen3_8b_with_the_llama_levers() {
+        let goals = Goals {
+            blocks: Some(1),
+            host_copy: false,
+            grid_lanes: 1,
+            ..Goals::lanes(1)
+        };
+        let plan = SpatialPlan::derive(&spec(), WaferDims::CS3, goals).expect("a plan");
+        let mut cfg = ServeConfig::new(goals);
+        cfg.region = true;
+        (cfg.speed, cfg.lse, cfg.ops2, cfg.qkv1, cfg.head_one_pass, cfg.hv, cfg.lever_d) =
+            (true, true, true, true, true, true, true);
+        (cfg.arf, cfg.arfx, cfg.arfs, cfg.mem, cfg.op3, cfg.f16acc, cfg.f16accg, cfg.grid_levers) =
+            (true, true, true, true, true, true, true, true);
+        (cfg.xac, cfg.trim, cfg.hvc) = (true, true, true);
+        cfg.pins.set("NP", 1).unwrap();
+        let want = "PX:128,PY:144,Hc:29,Dc:8,Gs:16,Ic:96,RPX:256,RPY:208,RHc:20,RDc:4,RGs:32,RIc:48,RNL:3,\
+                    RGY:16,RC:2,RR:5,NCOL:5,YD:208,RTR:5,HR:4096,Qh:4,PS:1,NB:16,E:5,MC:1,W16:1,KV16:1,KVCP:0,\
+                    PROF:0,TIME:0,HROUTE:1,ROT8:1,NOLAYER:0,HEADMODE:2,HH:1152,Vr:132,Gx:8,Gy:24,vocab:151936,\
+                    PASSES:3,MODE:2,OVL:0,VMC:1,CAP:64,iters:1,B:1,NP:1,SPD:1,LSE:1,OP2:1,QKV1:1,ARF:7,MEM:1,\
+                    OP3:1,F16:3,GRD:7,XAC:1,HVC:1";
+        let got = |cfg: &ServeConfig| {
+            let (_, p) = params(&plan, cfg).unwrap();
+            let mut g = p.clone();
+            g.retain(|(k, _)| k != "KVST");
+            g.sort();
+            g
+        };
+        // trim alone: every op cut (TRM 1023 = 1019 + the grids' 4), as Llama's
+        assert_eq!(got(&cfg), sorted(&format!("{want},TRM:1023")));
+        (cfg.silu16, cfg.silu16h, cfg.xg16, cfg.head_pack) = (true, true, true, true);
+        assert_eq!(got(&cfg), sorted(&format!("{want},TRM:32767")));
+        let (d, p) = params(&plan, &cfg).unwrap();
+        let num = |k: &str| p.iter().find(|e| e.0 == k).and_then(|e| e.1.parse().ok());
+        plan.spec.check_program(num).expect("the model takes it");
+        let lay = crate::spatial::program::ProgramSpec::from_params(d, &p).expect("serve8b_region");
+        assert!(lay.model.qk_norm);
+        for (n, text) in d.files_with(lay.model.variant()).unwrap() {
+            assert_eq!(text.contains("(trm 1024)"), n == "region_pe.csl", "{n}");
+        }
     }
 
     /// `region` with `pipeline` is the validated serve8b_region_pipe builds (B 4 x 4
