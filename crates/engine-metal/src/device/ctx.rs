@@ -209,6 +209,8 @@ impl Context {
     /// change.
     #[must_use]
     pub fn held_elsewhere(&self) -> u64 {
+        // the sparse mapping is Metal 4's, so only an Apple build asks for it
+        #[cfg(target_vendor = "apple")]
         if matches!(self.sparse(), Ok(Some(_))) {
             return 0;
         }
