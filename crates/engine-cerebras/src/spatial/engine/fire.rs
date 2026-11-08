@@ -323,6 +323,15 @@ impl Spatial {
                 && std::env::var("PIE_CEREBRAS_LOOP_ROOM").map_or(true, |v| v != "off")
                 && !pages.is_empty();
             let steps = if bounded { steps.min(room) } else { steps };
+            // With the prompt forced through the loop (PIE_CEREBRAS_SPLIT_FORCE=1),
+            // the waited-for launch is the prompt alone: its first token right
+            // after the prefill, every later loop posted.
+            let steps =
+                if posting && std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1") {
+                    0
+                } else {
+                    steps
+                };
             tracing::info!(
                 rows = tokens.len(),
                 steps,
@@ -424,7 +433,9 @@ impl Spatial {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(32);
-        c.next_loop = (c.next_loop.max(FIRST_LOOP) * 2).min(lookahead).min(most.max(1));
+        c.next_loop = (c.next_loop.max(FIRST_LOOP) * 2)
+            .min(lookahead)
+            .min(most.max(1));
         let steps = c.next_loop;
         let w = self.model()?;
         if start + 1 >= w.positions {
