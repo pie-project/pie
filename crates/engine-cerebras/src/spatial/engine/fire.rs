@@ -417,7 +417,14 @@ impl Spatial {
             return Ok(());
         }
         let start = c.tokens.len();
-        c.next_loop = (c.next_loop.max(FIRST_LOOP) * 2).min(lookahead);
+        // A loop's rows come back when it ends: the request's last rows wait
+        // for its whole loop, so posted loops stay short
+        // (`PIE_CEREBRAS_SPLIT_LOOP`, default 32 steps past the row).
+        let most = std::env::var("PIE_CEREBRAS_SPLIT_LOOP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32);
+        c.next_loop = (c.next_loop.max(FIRST_LOOP) * 2).min(lookahead).min(most.max(1));
         let steps = c.next_loop;
         let w = self.model()?;
         if start + 1 >= w.positions {
