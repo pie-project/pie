@@ -10,4 +10,4 @@ pub(crate) mod sandbox;
 
 pub use process::ProcessId;
 pub(crate) use process::{ProcessCtx, ProcessEvent};
-pub use program::ProgramName;
+pub use program::Program;

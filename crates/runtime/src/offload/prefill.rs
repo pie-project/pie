@@ -971,10 +971,11 @@ pub const PROGRAM: &str = "prefill";
 
 async fn run_prefill(tokens: &[u32]) -> Result<()> {
     use crate::inferlet::program;
-    let name = program::newest(PROGRAM)
+    let reference = program::ProgramRef::parse(PROGRAM)?;
+    let name = program::resolve(None, &reference)
         .await
-        .ok_or_else(|| anyhow!("the built-in `prefill` program is not installed"))?;
-    program::install(&name).await?;
+        .map_err(|why| anyhow!("the built-in `prefill` program: {why}"))?;
+    program::load(&name).await?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let input = serde_json::json!({ "tokens": tokens }).to_string();
     crate::inferlet::process::spawn(

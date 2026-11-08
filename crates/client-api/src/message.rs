@@ -143,12 +143,10 @@ pub enum ClientMessage {
     #[serde(rename = "auth_prove")]
     AuthProve { corr_id: u32, signature: String },
 
+    /// Whether `inferlet` (`name`, or `name@<hash prefix>`) names a program
+    /// this session can launch: answers `true` or `false`.
     #[serde(rename = "check_program")]
-    CheckProgram {
-        corr_id: u32,
-        name: String,
-        version: String,
-    },
+    CheckProgram { corr_id: u32, inferlet: String },
 
     #[serde(rename = "query")]
     Query {
@@ -157,13 +155,14 @@ pub enum ClientMessage {
         record: String,
     },
 
+    /// Installs the bytes, which came as `file`, under their name in the
+    /// session's tenant; answers `name@<hash>`, which launches this build
+    /// for good. The same bytes again only make it the name's latest.
     #[serde(rename = "add_program")]
     AddProgram {
         corr_id: u32,
         program_hash: String,
         file: String,
-        version: Option<String>,
-        force_overwrite: bool,
         chunk_index: usize,
         total_chunks: usize,
         #[serde(with = "serde_bytes")]

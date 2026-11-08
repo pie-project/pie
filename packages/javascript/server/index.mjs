@@ -145,13 +145,13 @@ export class Server {
     return handle.installLanguage(language, Buffer.from(await bytesOf(source)));
   }
 
-  async install(source, file = null, version = null) {
+  async install(source, file = null) {
     const handle = this.#alive();
     if (!file) {
       if (isBytes(source)) throw new Error('Server.install: bytes need `file`, the program\'s file name (`x.wasm`, `x.py`, `x.js`)');
       file = programFile(urlOf(source));
     }
-    return handle.install(Buffer.from(await bytesOf(source)), file, version ?? undefined);
+    return handle.install(Buffer.from(await bytesOf(source)), file);
   }
 
   /** A `PieClient` connected to this engine (over Node's `ws`, which can send the identity header). Closed by `shutdown()`. */

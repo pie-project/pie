@@ -1,9 +1,10 @@
 use bytes::Bytes;
 use client_api::message::ServerMessage;
 
+use crate::inferlet::ProcessId;
 use crate::inferlet::process;
 use crate::inferlet::program;
-use crate::inferlet::{ProcessId, ProgramName};
+use crate::inferlet::program::{Namespace, ProgramRef};
 use crate::model;
 
 use super::data_transfer::{ChunkResult, InFlightUpload};
@@ -11,17 +12,16 @@ use super::inbox;
 use super::{MAX_INFLIGHT_UPLOADS, Session, UploadKey};
 
 impl Session {
-    pub(super) async fn handle_check_program(&self, corr_id: u32, name: String, version: String) {
-        let full_name = format!("{}@{}", name, version);
-        let program_name = match ProgramName::parse(&full_name) {
-            Ok(p) => p,
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
+    pub(super) async fn handle_check_program(&self, corr_id: u32, inferlet: &str) {
+        match ProgramRef::parse(inferlet) {
+            Ok(reference) => {
+                let found = program::resolve(Some(&self.tenant), &reference)
+                    .await
+                    .is_ok();
+                self.send_response(corr_id, true, found.to_string()).await;
             }
-        };
-        let exists = program::is_registered(&program_name).await;
-        self.send_response(corr_id, true, exists.to_string()).await;
+            Err(e) => self.send_response(corr_id, false, e.to_string()).await,
+        }
     }
 
     pub(super) async fn handle_query(&mut self, corr_id: u32, subject: String, _record: String) {
@@ -354,23 +354,27 @@ impl Session {
 }
 
 impl Session {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the add-program frame's fields, as they arrive off the wire"
-    )]
     pub(super) async fn handle_add_program(
         &mut self,
         corr_id: u32,
         program_hash: String,
         file: String,
-        version: Option<String>,
-        force_overwrite: bool,
         chunk_index: usize,
         total_chunks: usize,
         chunk_data: Vec<u8>,
     ) {
         let key = UploadKey::Program(corr_id);
         if !self.inflight_uploads.contains_key(&key) {
+            // Refused before a byte is kept: the whole upload is not waited for.
+            if !self.state.allow_upload {
+                self.send_response(
+                    corr_id,
+                    false,
+                    "this server runs its own programs alone; it takes no uploads".to_string(),
+                )
+                .await;
+                return;
+            }
             if chunk_index != 0 {
                 self.send_response(corr_id, false, "First chunk index must be 0".to_string())
                     .await;
@@ -387,13 +391,7 @@ impl Session {
             }
             self.inflight_uploads.insert(
                 key.clone(),
-                InFlightUpload::new(
-                    total_chunks,
-                    file,
-                    version,
-                    force_overwrite,
-                    self.state.max_upload_bytes,
-                ),
+                InFlightUpload::new(total_chunks, file, self.state.max_upload_bytes),
             );
         }
 
@@ -406,12 +404,7 @@ impl Session {
                 drop(inflight);
                 self.inflight_uploads.remove(&key);
             }
-            ChunkResult::Complete {
-                buffer,
-                file,
-                version,
-                force_overwrite,
-            } => {
+            ChunkResult::Complete { buffer, file } => {
                 drop(inflight);
                 self.inflight_uploads.remove(&key);
 
@@ -428,40 +421,10 @@ impl Session {
                     return;
                 }
 
-                if let Ok(identity) = program::identify(&file, version.as_deref(), &buffer)
-                    && program::is_builtin_name(&identity.name.name).await
-                {
-                    self.send_response(
-                        corr_id,
-                        false,
-                        format!(
-                            "'{}' is the name of a built-in program; upload under another name",
-                            identity.name.name
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-
-                match program::add(buffer, &file, version.as_deref(), force_overwrite).await {
-                    Ok(program_name) => {
-                        if force_overwrite {
-                            self.installed_programs.remove(&program_name);
-                        }
-                        match program::install(&program_name).await {
-                            Ok(()) => {
-                                self.installed_programs.insert(program_name.clone());
-                                self.send_response(corr_id, true, program_name.to_string())
-                                    .await;
-                            }
-                            Err(e) => {
-                                self.send_response(corr_id, false, e.to_string()).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.send_response(corr_id, false, e.to_string()).await;
-                    }
+                let namespace = Namespace::Tenant(self.tenant.clone());
+                match program::add(namespace, &file, buffer).await {
+                    Ok(program) => self.send_response(corr_id, true, program.pinned()).await,
+                    Err(e) => self.send_response(corr_id, false, format!("{e:#}")).await,
                 }
             }
         }
@@ -503,38 +466,15 @@ impl Session {
                 value,
             )
         }));
-        // A bare `name` is its newest installed version: how the gateway's
-        // fixed routes reach the built-in inferlets.
-        let program_name = if inferlet.contains('@') {
-            match ProgramName::parse(&inferlet) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.send_response(corr_id, false, e.to_string()).await;
-                    return;
-                }
-            }
-        } else {
-            match program::newest(&inferlet).await {
-                Some(p) => p,
-                None => {
-                    self.send_response(
-                        corr_id,
-                        false,
-                        format!("no program named '{inferlet}' is installed"),
-                    )
-                    .await;
-                    return;
-                }
-            }
-        };
-
-        if !self.installed_programs.contains(&program_name) {
-            if let Err(e) = program::install(&program_name).await {
-                self.send_response(corr_id, false, e.to_string()).await;
+        // A bare `name` runs its latest install, the tenant's own before the
+        // system's: how the gateway's fixed routes reach the built-ins.
+        let program = match self.launchable(&inferlet).await {
+            Ok(program) => program,
+            Err(e) => {
+                self.send_response(corr_id, false, format!("{e:#}")).await;
                 return;
             }
-            self.installed_programs.insert(program_name.clone());
-        }
+        };
 
         if crate::store::registry::all_for_model(0).is_empty() {
             self.send_response(
@@ -562,7 +502,7 @@ impl Session {
         let client_id = if capture_outputs { Some(self.id) } else { None };
         match process::spawn(
             self.username.clone(),
-            program_name,
+            program,
             input,
             std::sync::Arc::new(files),
             client_id,
@@ -594,6 +534,14 @@ impl Session {
 }
 
 impl Session {
+    /// The program `inferlet` names for this session's tenant, compiled.
+    async fn launchable(&self, inferlet: &str) -> anyhow::Result<program::Program> {
+        let reference = ProgramRef::parse(inferlet)?;
+        let program = program::resolve(Some(&self.tenant), &reference).await?;
+        program::load(&program).await?;
+        Ok(program)
+    }
+
     fn parse_process_id(uuid_str: &str) -> Option<ProcessId> {
         uuid_str.parse().ok()
     }
@@ -733,13 +681,7 @@ impl Session {
             }
             self.inflight_uploads.insert(
                 key.clone(),
-                InFlightUpload::new(
-                    total_chunks,
-                    String::new(),
-                    None,
-                    false,
-                    self.state.max_upload_bytes,
-                ),
+                InFlightUpload::new(total_chunks, String::new(), self.state.max_upload_bytes),
             );
         }
 

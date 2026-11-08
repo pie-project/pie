@@ -70,11 +70,11 @@ const char *pie_server_summary(const pie_server *server);
    or NULL without `listen`; valid until pie_server_free. */
 const char *pie_server_listen_addr(const pie_server *server);
 
-/* Installs a program (`file` names it: `x.wasm`, `x.py`, `x.js`); `version`
-   may be NULL. Stores its `name@version` in `*name`, for pie_string_free. */
+/* Installs a program among the system's (`file` names it: `x.wasm`, `x.py`,
+   `x.js`). Stores its `name@<hash>`, which launches this build, in `*name`,
+   for pie_string_free. */
 pie_status pie_server_install(pie_server *server, const uint8_t *bytes, size_t len,
-                              const char *file, const char *version, char **name,
-                              char **error);
+                              const char *file, char **name, char **error);
 
 /* Installs a language component (`python`, `javascript`). */
 pie_status pie_server_install_language(pie_server *server, const char *language,

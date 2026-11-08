@@ -38,7 +38,7 @@
       const client = await connect();
       let refused;
       try {
-        await client.launchProcess("text-completion@0.3.0", {});
+        await client.launchProcess("text-completion", {});
         refused = "launched?!";
       } catch (e) {
         refused = String(e.message ?? e);

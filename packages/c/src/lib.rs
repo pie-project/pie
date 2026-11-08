@@ -196,7 +196,6 @@ pub unsafe extern "C" fn pie_server_install(
     bytes: *const u8,
     len: usize,
     file: *const c_char,
-    version: *const c_char,
     name: *mut *mut c_char,
     error: *mut *mut c_char,
 ) -> pie_status {
@@ -205,10 +204,9 @@ pub unsafe extern "C" fn pie_server_install(
             let server = self::server(server)?;
             let name = out_arg(name, "name")?;
             let file = str_arg(file, "file")?;
-            let version = opt_str_arg(version, "version")?;
             let program = bytes_arg(bytes, len, "bytes")?.to_vec();
             let installed = server
-                .install(program, file, version)
+                .install(program, file)
                 .map_err(|e| Failure::of(server, "install", e))?;
             *name = to_c(installed);
             Ok(())

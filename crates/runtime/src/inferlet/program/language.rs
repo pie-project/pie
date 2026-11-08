@@ -55,3 +55,12 @@ impl std::fmt::Display for Language {
 pub fn artifact_extension(language: Option<Language>) -> &'static str {
     language.map_or("wasm", Language::extension)
 }
+
+/// What a program is, as a sentence names it: `component`, or
+/// `python script`.
+pub fn kind(language: Option<Language>) -> String {
+    match language {
+        None => "component".to_string(),
+        Some(language) => format!("{language} script"),
+    }
+}

@@ -51,17 +51,11 @@ impl Server {
     }
 
     #[napi(ts_return_type = "Promise<string>")]
-    pub fn install(
-        &self,
-        bytes: Buffer,
-        file: String,
-        version: Option<String>,
-    ) -> Result<AsyncTask<Install>> {
+    pub fn install(&self, bytes: Buffer, file: String) -> Result<AsyncTask<Install>> {
         Ok(AsyncTask::new(Install {
             server: self.live("install")?,
             bytes: bytes.to_vec(),
             file,
-            version,
         }))
     }
 
@@ -118,7 +112,6 @@ pub struct Install {
     server: Live,
     bytes: Vec<u8>,
     file: String,
-    version: Option<String>,
 }
 
 #[napi]
@@ -128,11 +121,7 @@ impl Task for Install {
 
     fn compute(&mut self) -> Result<String> {
         self.server
-            .install(
-                std::mem::take(&mut self.bytes),
-                &self.file,
-                self.version.as_deref(),
-            )
+            .install(std::mem::take(&mut self.bytes), &self.file)
             .map_err(|e| failed("install", format!("{e:#}")))
     }
 

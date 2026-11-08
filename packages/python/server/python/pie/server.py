@@ -90,7 +90,6 @@ class Server:
         self,
         source: str | os.PathLike[str] | bytes,
         file: str | None = None,
-        version: str | None = None,
     ) -> str:
         if isinstance(source, bytes):
             if file is None:
@@ -102,7 +101,7 @@ class Server:
             if file is None:
                 file = program_file(path)
             source = path.read_bytes()
-        return await asyncio.to_thread(self._alive().install, source, file, version)
+        return await asyncio.to_thread(self._alive().install, source, file)
 
     async def connect(self) -> "PieClient":
         """A `PieClient` connected to this engine; closed by `shutdown()`."""

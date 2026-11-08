@@ -52,17 +52,10 @@ impl PyEngineHandle {
         Ok(name.to_string())
     }
 
-    #[pyo3(signature = (bytes, file, version=None))]
-    fn install(
-        &self,
-        py: Python<'_>,
-        bytes: &[u8],
-        file: &str,
-        version: Option<&str>,
-    ) -> PyResult<String> {
+    fn install(&self, py: Python<'_>, bytes: &[u8], file: &str) -> PyResult<String> {
         let server = self.live()?;
         let bytes = bytes.to_vec();
-        py.detach(|| server.install(bytes, file, version))
+        py.detach(|| server.install(bytes, file))
             .map_err(|e| PyRuntimeError::new_err(format!("install: {e:#}")))
     }
 

@@ -16,7 +16,7 @@ client = PieClient("ws://127.0.0.1:8080")
 await client.connect()
 await client.authenticate("me")
 # an inferlet the server holds, as installed by `pie inferlet install`
-process = await client.launch_process("my-inferlet@0.1.0", {"prompt": "The capital of France is"})
+process = await client.launch_process("my-inferlet", {"prompt": "The capital of France is"})
 event, value = await process.recv()
 ```
 

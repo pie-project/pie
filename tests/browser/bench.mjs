@@ -127,7 +127,7 @@ export async function runCorners(client, program, log = () => {}, opts = {}) {
   }, (d) => d.startsWith("error"));
   await check("unknown program → launch refused", async () => {
     try {
-      await client.launchProcess("no-such-program@9.9.9", { prompt: SHORT });
+      await client.launchProcess("no-such-program", { prompt: SHORT });
       return "launched?!";
     } catch (e) {
       return `refused: ${e.message.slice(0, 80)}`;

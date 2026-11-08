@@ -342,23 +342,12 @@ impl Client {
         }
     }
 
-    /// Whether the server holds `name@version`.
+    /// Whether `inferlet` (`name`, or `name@<hash prefix>`) names a program
+    /// this session can launch.
     pub async fn check_program(&self, inferlet: &str) -> Result<bool> {
-        use regex::Regex;
-        use std::sync::LazyLock;
-
-        static RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"^([a-zA-Z0-9][a-zA-Z0-9_-]*)@(\d+\.\d+\.\d+)$").unwrap());
-
-        let caps = RE.captures(inferlet).ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "Invalid program identifier '{inferlet}': expected 'name@major.minor.patch'"
-            ))
-        })?;
         let msg = ClientMessage::CheckProgram {
             corr_id: 0,
-            name: caps[1].to_string(),
-            version: caps[2].to_string(),
+            inferlet: inferlet.to_string(),
         };
         let (ok, result) = self.send_msg_and_wait(msg).await?;
         if ok {
@@ -368,12 +357,9 @@ impl Client {
         }
     }
 
-    pub async fn add_program(
-        &self,
-        path: &Path,
-        version: Option<&str>,
-        force_overwrite: bool,
-    ) -> Result<String> {
+    /// Installs the program at `path` under its name, for this session's
+    /// tenant; returns the `name@<hash>` that launches this build for good.
+    pub async fn add_program(&self, path: &Path) -> Result<String> {
         let blob = fs::read(path).map_err(|source| Error::Io {
             path: path.to_path_buf(),
             source,
@@ -382,17 +368,11 @@ impl Client {
             .file_name()
             .and_then(|f| f.to_str())
             .ok_or_else(|| Error::InvalidInput(format!("{path:?} has no file name")))?;
-        self.add_program_bytes(&blob, file, version, force_overwrite)
-            .await
+        self.add_program_bytes(&blob, file).await
     }
 
-    pub async fn add_program_bytes(
-        &self,
-        blob: &[u8],
-        file: &str,
-        version: Option<&str>,
-        force_overwrite: bool,
-    ) -> Result<String> {
+    /// [`Client::add_program`] for bytes, which came as `file`.
+    pub async fn add_program_bytes(&self, blob: &[u8], file: &str) -> Result<String> {
         let program_hash = hash_blob(blob);
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let (tx, rx) = oneshot::channel();
@@ -412,8 +392,6 @@ impl Client {
                 corr_id: *corr_id_guard,
                 program_hash: program_hash.clone(),
                 file: file.to_string(),
-                version: version.map(str::to_string),
-                force_overwrite,
                 chunk_index,
                 total_chunks,
                 chunk_data: blob[start..end].to_vec(),

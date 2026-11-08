@@ -10,18 +10,22 @@ use wasmtime::component::Component;
 
 use crate::service::{Service, ServiceHandler};
 
+mod identity;
 mod language;
 mod repository;
-pub use language::{Language, artifact_extension};
-pub use repository::Repository;
+pub use identity::{
+    Identity, NAME_SECTION, Namespace, Program, ProgramHash, ProgramRef, check_name, identify,
+    name_section,
+};
+pub use language::{Language, kind};
+pub use repository::{Listed, Reclaimed, Repository};
 
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
 /// Start the program service over `programs_dir`. Language components come
 /// from `languages_dir` (`<language>.wasm`) on first use, or from bytes via
-/// [`add_language`]. Each of `builtins` is registered unless the directory
-/// already holds that name and version: a copy installed on disk shadows
-/// the built-in one.
+/// [`add_language`]. The built-ins are the system's, under whatever the
+/// operator installs of the same name.
 pub fn spawn(
     wasm_engine: &WasmEngine,
     programs_dir: PathBuf,
@@ -29,12 +33,9 @@ pub fn spawn(
     builtins: &[crate::bootstrap::BuiltinProgram],
 ) -> Result<()> {
     let mut repository = Repository::new(programs_dir);
-
-    repository.refresh();
     for builtin in builtins {
-        let name = ProgramName::parse(&format!("{}@{}", builtin.name, builtin.version))
-            .context("a built-in inferlet's name")?;
-        repository.add_builtin(name, builtin.component);
+        check_name(builtin.name).context("a built-in inferlet's name")?;
+        repository.add_builtin(builtin.name, builtin.component);
     }
 
     SERVICE
@@ -43,118 +44,54 @@ pub fn spawn(
     Ok(())
 }
 
-pub async fn add(
-    binary: Vec<u8>,
-    file: &str,
-    version: Option<&str>,
-    force_overwrite: bool,
-) -> Result<ProgramName> {
-    let identity = identify(file, version, &binary)?;
+/// Install `binary`, which came as `file`, under its name in `namespace`.
+/// It is compiled first: what does not compile is refused, and the name
+/// keeps the build it ran.
+pub async fn add(namespace: Namespace, file: &str, binary: Vec<u8>) -> Result<Program> {
+    let identity = identify(file, &binary)?;
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Add {
-        binary,
+        namespace,
         identity: identity.clone(),
-        force_overwrite,
+        binary,
         response: tx,
     })?;
     rx.await??;
-    Ok(identity.name)
+    Ok(identity.program)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Identity {
-    pub name: ProgramName,
-    pub language: Option<Language>,
+/// The program `reference` names for `tenant`; `None` looks in the
+/// system's alone.
+pub async fn resolve(tenant: Option<&str>, reference: &ProgramRef) -> Result<Program> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::Resolve {
+        tenant: tenant.map(str::to_string),
+        reference: reference.clone(),
+        response: tx,
+    })?;
+    rx.await?
 }
 
-pub const PACKAGE_SECTION: &str = "pie.package";
-
-pub fn identify(file: &str, version: Option<&str>, bytes: &[u8]) -> Result<Identity> {
-    let path = std::path::Path::new(file);
-    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let language = match extension {
-        "wasm" => None,
-        other => Some(Language::from_extension(other).ok_or_else(|| {
-            anyhow!(
-                "{file}: not a program pie can install; a program is a `.wasm` component or a \
-                 `.py` / `.js` script"
-            )
-        })?),
-    };
-    if language.is_none()
-        && let Some(package) = package_section(bytes)
-    {
-        let name = ProgramName::parse(&package)
-            .with_context(|| format!("{file}: its {PACKAGE_SECTION} section"))?;
-        if let Some(version) = version
-            && version != name.version
-        {
-            anyhow::bail!(
-                "{file} names itself {name}; a version of {version} would be the package's \
-                 Cargo.toml saying so"
-            );
-        }
-        return Ok(Identity { name, language });
-    }
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("{file}: no file name to name the program by"))?;
-    let name = stem.replace('_', "-");
-    let version = match version {
-        Some(version) => version.to_string(),
-        None => language
-            .and_then(|language| declared_version(bytes, language))
-            .unwrap_or_else(|| hashed_version(bytes)),
-    };
-    let name = ProgramName::parse(&format!("{name}@{version}"))
-        .with_context(|| format!("{file} cannot name a program"))?;
-    Ok(Identity { name, language })
+/// Compile `program`, unless it already is: once per hash, whoever runs
+/// it and under whatever name.
+pub async fn load(program: &Program) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::Load {
+        program: program.clone(),
+        response: tx,
+    })?;
+    rx.await?
 }
 
-pub fn package_section(bytes: &[u8]) -> Option<String> {
-    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
-        let Ok(wasmparser::Payload::CustomSection(section)) = payload else {
-            continue;
-        };
-        if section.name() == PACKAGE_SECTION {
-            return std::str::from_utf8(section.data())
-                .ok()
-                .map(|s| s.trim().to_string());
-        }
-    }
-    None
-}
-
-fn declared_version(source: &[u8], language: Language) -> Option<String> {
-    static PYTHON: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
-        fancy_regex::Regex::new(r#"(?m)^__version__\s*=\s*["'](\d+\.\d+\.\d+)["']"#).unwrap()
-    });
-    static JAVASCRIPT: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
-        fancy_regex::Regex::new(r#"(?m)^export\s+const\s+version\s*=\s*["'](\d+\.\d+\.\d+)["']"#)
-            .unwrap()
-    });
-    let source = std::str::from_utf8(source).ok()?;
-    let re = match language {
-        Language::Python => &*PYTHON,
-        Language::JavaScript => &*JAVASCRIPT,
-    };
-    re.captures(source)
-        .ok()
-        .flatten()
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-}
-
-pub fn hashed_version(bytes: &[u8]) -> String {
-    let digest = blake3::hash(bytes);
-    let d = digest.as_bytes();
-    format!(
-        "0.{}.{}",
-        u16::from_be_bytes([d[0], d[1]]),
-        u16::from_be_bytes([d[2], d[3]])
-    )
+pub async fn get_wasm_component(program: &Program) -> Option<InstalledComponent> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE
+        .send(Message::GetWasmComponent {
+            program: program.clone(),
+            response: tx,
+        })
+        .ok();
+    rx.await.ok().flatten()
 }
 
 /// A language component from bytes, for a host with no languages directory
@@ -193,100 +130,14 @@ pub fn precompile_component(engine: &WasmEngine, wasm_binary: &[u8]) -> Result<V
         .map_err(|e| anyhow!("precompiling the component: {e}"))
 }
 
-pub async fn is_registered(name: &ProgramName) -> bool {
-    let (tx, rx) = oneshot::channel();
-    SERVICE
-        .send(Message::Exists {
-            name: name.clone(),
-            response: tx,
-        })
-        .ok();
-    rx.await.unwrap_or(false)
-}
-
-pub async fn is_builtin_name(name: &str) -> bool {
-    let (tx, rx) = oneshot::channel();
-    SERVICE
-        .send(Message::IsBuiltinName {
-            name: name.to_string(),
-            response: tx,
-        })
-        .ok();
-    rx.await.unwrap_or(false)
-}
-
-/// The newest installed version of a program named `name`.
-pub async fn newest(name: &str) -> Option<ProgramName> {
-    let (tx, rx) = oneshot::channel();
-    SERVICE
-        .send(Message::Newest {
-            name: name.to_string(),
-            response: tx,
-        })
-        .ok();
-    rx.await.ok().flatten()
-}
-
-pub async fn install(name: &ProgramName) -> Result<()> {
-    let (tx, rx) = oneshot::channel();
-    SERVICE.send(Message::Install {
-        name: name.clone(),
-        response: tx,
-    })?;
-    rx.await?
-}
-
-pub async fn get_wasm_component(name: &ProgramName) -> Option<InstalledComponent> {
-    let (tx, rx) = oneshot::channel();
-    SERVICE
-        .send(Message::GetWasmComponent {
-            name: name.clone(),
-            response: tx,
-        })
-        .ok();
-    rx.await.ok().flatten()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ProgramName {
-    pub name: String,
-    pub version: String,
-}
-
-impl ProgramName {
-    pub fn parse(s: &str) -> Result<Self> {
-        static RE: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
-            fancy_regex::Regex::new(r"^([a-zA-Z0-9][a-zA-Z0-9_-]*)@(\d+\.\d+\.\d+)$").unwrap()
-        });
-
-        let caps = RE.captures(s)?.ok_or_else(|| {
-            anyhow!(
-                "Invalid program identifier '{}': expected 'name@major.minor.patch'",
-                s
-            )
-        })?;
-
-        Ok(Self {
-            name: caps.get(1).unwrap().as_str().to_string(),
-            version: caps.get(2).unwrap().as_str().to_string(),
-        })
-    }
-}
-
-impl std::fmt::Display for ProgramName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{}", self.name, self.version)
-    }
-}
-
 /// A script program's source, handed to its language component at launch.
 #[derive(Debug)]
 pub struct Script {
-    /// `name@version`, for the language component's messages.
+    /// `name@<short hash>`, for the language component's messages.
     pub name: String,
     /// The file name tracebacks quote.
     pub file: String,
-    pub source: String,
+    pub source: Arc<str>,
 }
 
 impl Script {
@@ -297,7 +148,7 @@ impl Script {
             "__pie_script__": {
                 "name": self.name,
                 "file": self.file,
-                "source": self.source,
+                "source": &*self.source,
             },
             "input": input,
         })
@@ -308,8 +159,8 @@ impl Script {
 struct ProgramService {
     wasm_engine: WasmEngine,
     repository: Repository,
-    installed: HashMap<ProgramName, InstalledProgram>,
-    generation: u64,
+    /// Compiled, by the hash of what was compiled.
+    loaded: HashMap<ProgramHash, Loaded>,
     languages_dir: PathBuf,
     /// Handed over as bytes, compiled on first use.
     language_binaries: HashMap<Language, Vec<u8>>,
@@ -321,15 +172,15 @@ struct ProgramService {
 }
 
 #[derive(Clone)]
-struct InstalledProgram {
+struct Loaded {
     component: Component,
-    script: Option<Arc<Script>>,
+    /// A script's source and language: the component is its language's.
+    script: Option<(Language, Arc<str>)>,
 }
 
 #[derive(Clone)]
 pub struct InstalledComponent {
     pub component: Component,
-    pub generation: u64,
     /// `Some` for a script program: the component is its language's
     /// language component, and this is what that component runs.
     pub script: Option<Arc<Script>>,
@@ -340,8 +191,7 @@ impl ProgramService {
         ProgramService {
             wasm_engine: wasm_engine.clone(),
             repository,
-            installed: HashMap::new(),
-            generation: 0,
+            loaded: HashMap::new(),
             languages_dir,
             language_binaries: HashMap::new(),
             language_precompiled: HashMap::new(),
@@ -349,46 +199,19 @@ impl ProgramService {
         }
     }
 
-    fn get_component(&self, name: &ProgramName) -> Option<InstalledComponent> {
-        self.installed.get(name).map(|p| InstalledComponent {
-            component: p.component.clone(),
-            generation: self.generation,
-            script: p.script.clone(),
+    fn get_component(&self, program: &Program) -> Option<InstalledComponent> {
+        let loaded = self.loaded.get(&program.hash)?;
+        let script = loaded.script.as_ref().map(|(language, source)| {
+            Arc::new(Script {
+                name: program.to_string(),
+                file: format!("{}.{}", program.name, language.extension()),
+                source: Arc::clone(source),
+            })
+        });
+        Some(InstalledComponent {
+            component: loaded.component.clone(),
+            script,
         })
-    }
-
-    fn uninstall(&mut self, name: &ProgramName) -> bool {
-        if self.installed.remove(name).is_none() {
-            return false;
-        }
-        super::linker::invalidate(name);
-        self.bump_generation();
-        true
-    }
-
-    fn bump_generation(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-    }
-
-    async fn add(
-        &mut self,
-        binary: Vec<u8>,
-        identity: Identity,
-        force_overwrite: bool,
-    ) -> Result<()> {
-        let stored = self
-            .repository
-            .add(
-                binary,
-                identity.name.clone(),
-                identity.language,
-                force_overwrite,
-            )
-            .await?;
-        if stored {
-            self.uninstall(&identity.name);
-        }
-        Ok(())
     }
 
     fn add_language(&mut self, language: Language, wasm_binary: Vec<u8>) {
@@ -448,51 +271,82 @@ impl ProgramService {
         Ok(component)
     }
 
-    async fn install(&mut self, name: &ProgramName) -> Result<()> {
-        if self.installed.contains_key(name) {
+    async fn add(
+        &mut self,
+        namespace: Namespace,
+        identity: Identity,
+        binary: Vec<u8>,
+    ) -> Result<()> {
+        self.repository.admit(&namespace, &identity)?;
+        let program = &identity.program;
+        if !self.loaded.contains_key(&program.hash) {
+            let loaded = self
+                .compile(program, binary.clone(), identity.language)
+                .await?;
+            self.loaded.insert(program.hash.clone(), loaded);
+        }
+        self.repository.add(namespace, &identity, binary).await?;
+        self.unload_unnamed();
+        Ok(())
+    }
+
+    /// Drop what is compiled of builds no name runs any more (removed or
+    /// pruned since), here and in the linker. A process running one keeps
+    /// its own reference.
+    fn unload_unnamed(&mut self) {
+        let named = self.repository.named();
+        let unnamed: Vec<ProgramHash> = self
+            .loaded
+            .keys()
+            .filter(|hash| !named.contains(*hash))
+            .cloned()
+            .collect();
+        for hash in &unnamed {
+            self.loaded.remove(hash);
+        }
+        super::linker::forget(unnamed);
+    }
+
+    async fn load(&mut self, program: &Program) -> Result<()> {
+        if self.loaded.contains_key(&program.hash) {
             return Ok(());
         }
+        let (binary, language) = self.repository.fetch(&program.hash).await?;
+        let loaded = self.compile(program, binary, language).await?;
+        self.loaded.insert(program.hash.clone(), loaded);
+        Ok(())
+    }
 
-        let language = self
-            .repository
-            .language(name)
-            .ok_or_else(|| anyhow!("{}", self.repository.not_installed(name)))?;
-
-        let binary = self.repository.fetch_binary(name).await?;
-
-        let (component, script) = match language {
-            None => (
-                compile_wasm_component(&self.wasm_engine, binary).await?,
-                None,
-            ),
+    async fn compile(
+        &mut self,
+        program: &Program,
+        binary: Vec<u8>,
+        language: Option<Language>,
+    ) -> Result<Loaded> {
+        Ok(match language {
+            None => Loaded {
+                component: compile_wasm_component(&self.wasm_engine, binary)
+                    .await
+                    .with_context(|| format!("compiling {program}"))?,
+                script: None,
+            },
             Some(language) => {
                 let source = String::from_utf8(binary)
-                    .map_err(|e| anyhow!("{name} is not UTF-8 {language} source: {e}"))?;
-                let script = Script {
-                    name: name.to_string(),
-                    file: format!("{}.{}", name.name, language.extension()),
-                    source,
-                };
-                (
-                    self.language_component(language).await?,
-                    Some(Arc::new(script)),
-                )
+                    .map_err(|e| anyhow!("{program} is not UTF-8 {language} source: {e}"))?;
+                Loaded {
+                    component: self.language_component(language).await?,
+                    script: Some((language, source.into())),
+                }
             }
-        };
-
-        self.installed
-            .insert(name.clone(), InstalledProgram { component, script });
-        self.bump_generation();
-
-        Ok(())
+        })
     }
 }
 
 enum Message {
     Add {
-        binary: Vec<u8>,
+        namespace: Namespace,
         identity: Identity,
-        force_overwrite: bool,
+        binary: Vec<u8>,
         response: oneshot::Sender<Result<()>>,
     },
 
@@ -508,28 +362,19 @@ enum Message {
         response: oneshot::Sender<Result<()>>,
     },
 
-    Exists {
-        name: ProgramName,
-        response: oneshot::Sender<bool>,
+    Resolve {
+        tenant: Option<String>,
+        reference: ProgramRef,
+        response: oneshot::Sender<Result<Program>>,
     },
 
-    Newest {
-        name: String,
-        response: oneshot::Sender<Option<ProgramName>>,
-    },
-
-    IsBuiltinName {
-        name: String,
-        response: oneshot::Sender<bool>,
-    },
-
-    Install {
-        name: ProgramName,
+    Load {
+        program: Program,
         response: oneshot::Sender<Result<()>>,
     },
 
     GetWasmComponent {
-        name: ProgramName,
+        program: Program,
         response: oneshot::Sender<Option<InstalledComponent>>,
     },
 }
@@ -538,19 +383,14 @@ impl ServiceHandler for ProgramService {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
-        // An install, removal or replacement on disk since the last message
-        // is seen now; a replaced program's compiled form is dropped.
-        for stale in self.repository.refresh() {
-            self.uninstall(&stale);
-        }
         match msg {
             Message::Add {
-                binary,
+                namespace,
                 identity,
-                force_overwrite,
+                binary,
                 response,
             } => {
-                let _ = response.send(self.add(binary, identity, force_overwrite).await);
+                let _ = response.send(self.add(namespace, identity, binary).await);
             }
             Message::AddLanguage {
                 language,
@@ -568,20 +408,21 @@ impl ServiceHandler for ProgramService {
                 self.add_precompiled_language(language, precompiled);
                 let _ = response.send(Ok(()));
             }
-            Message::Exists { name, response } => {
-                let _ = response.send(self.repository.exists(&name));
+            Message::Resolve {
+                tenant,
+                reference,
+                response,
+            } => {
+                // The disk as it stands: what another process installed or
+                // removed is seen. Nothing compiled goes stale; a hash is
+                // its bytes.
+                let _ = response.send(self.repository.resolve(tenant.as_deref(), &reference));
             }
-            Message::Newest { name, response } => {
-                let _ = response.send(self.repository.newest(&name));
+            Message::Load { program, response } => {
+                let _ = response.send(self.load(&program).await);
             }
-            Message::IsBuiltinName { name, response } => {
-                let _ = response.send(self.repository.has_builtin_named(&name));
-            }
-            Message::Install { name, response } => {
-                let _ = response.send(self.install(&name).await);
-            }
-            Message::GetWasmComponent { name, response } => {
-                let _ = response.send(self.get_component(&name));
+            Message::GetWasmComponent { program, response } => {
+                let _ = response.send(self.get_component(&program));
             }
         }
     }

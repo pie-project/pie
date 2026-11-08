@@ -111,12 +111,12 @@ public class PieServer private constructor(private val handle: Long) : AutoClose
         return PieClient.connect(transport)
     }
 
-    /** Installs a program; [file] names it (`x.wasm`, `x.py`, `x.js`). Returns its `name@version`, which `PieClient.launch` takes. */
-    public suspend fun install(program: ByteArray, file: String, version: String? = null): String =
-        withContext(Dispatchers.IO) { NativeCore.install(handle, program, file, version) }
+    /** Installs a program among the system's; [file] names it (`x.wasm`, `x.py`, `x.js`). Returns its `name@<hash>`, which `PieClient.launch` takes. */
+    public suspend fun install(program: ByteArray, file: String): String =
+        withContext(Dispatchers.IO) { NativeCore.install(handle, program, file) }
 
-    public suspend fun install(file: File, version: String? = null): String =
-        install(withContext(Dispatchers.IO) { file.readBytes() }, file.name, version)
+    public suspend fun install(file: File): String =
+        install(withContext(Dispatchers.IO) { file.readBytes() }, file.name)
 
     /** Installs [language], so script inferlets in it install and run. */
     public suspend fun install(language: Language) {

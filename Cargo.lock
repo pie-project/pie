@@ -4178,7 +4178,6 @@ dependencies = [
  "p384 0.14.0",
  "pem",
  "pie-client-api",
- "regex",
  "ring",
  "rmp-serde",
  "rsa",

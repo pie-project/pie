@@ -131,14 +131,15 @@ public final class PieServer: Sendable {
         }
     }
 
-    /// Installs a program; `file` names it (`x.wasm`, `x.py`, `x.js`).
-    /// Returns its `name@version`, which `PieClient.launch` takes.
-    public func install(_ program: Data, file: String, version: String? = nil) async throws -> String {
+    /// Installs a program among the system's; `file` names it (`x.wasm`,
+    /// `x.py`, `x.js`). Returns its `name@<hash>`, which `PieClient.launch`
+    /// takes.
+    public func install(_ program: Data, file: String) async throws -> String {
         try await Self.blocking { [handle] in
             var name: UnsafeMutablePointer<CChar>?
             try Self.check { error in
                 program.withUnsafeBytes { bytes in
-                    pie_server_install(handle.pointer, bytes.baseAddress, bytes.count, file, version, &name, error)
+                    pie_server_install(handle.pointer, bytes.baseAddress, bytes.count, file, &name, error)
                 }
             }
             defer { pie_string_free(name) }
@@ -146,8 +147,8 @@ public final class PieServer: Sendable {
         }
     }
 
-    public func install(contentsOf url: URL, version: String? = nil) async throws -> String {
-        try await install(Data(contentsOf: url), file: url.lastPathComponent, version: version)
+    public func install(contentsOf url: URL) async throws -> String {
+        try await install(Data(contentsOf: url), file: url.lastPathComponent)
     }
 
     /// Installs `language`, so script inferlets in it install and run.

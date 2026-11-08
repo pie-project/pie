@@ -129,13 +129,18 @@ export class ReceivedFile extends Bytes {
 }
 
 export class Inferlet {
-    constructor({ fn, name, version, source }) {
-        Object.assign(this, { fn, name, version, source });
+    constructor({ fn, name, source }) {
+        Object.assign(this, { fn, name, source });
     }
 
-    /** `name@version`, the id the server launches by. */
+    /** The blake3 hash of the source: the build, as the server keys it. */
+    get hash() {
+        return hashBytes(new TextEncoder().encode(this.source));
+    }
+
+    /** `name@<hash>`, which launches exactly this source. */
     get program() {
-        return `${this.name}@${this.version}`;
+        return `${this.name}@${this.hash}`;
     }
 
     get file() {
@@ -149,8 +154,8 @@ export class Inferlet {
  * reaches the inferlet library through the `pie` global the language component provides
  * (`pie.model.encode(...)`, `pie.eta`, ...) and everything else through
  * its one `input` argument; a closure over the caller's variables is a
- * ReferenceError on the server. The version is a hash of the source, so
- * an edit is a new program and an unchanged one is never re-uploaded.
+ * ReferenceError on the server. The program is the hash of its source, so
+ * an edit is a new build and an unchanged one is never re-uploaded.
  * @param {Function} fn
  * @returns {Inferlet}
  */
@@ -162,10 +167,9 @@ export function inferlet(fn, options = {}) {
     const isPlain = /^(async\s+)?function\b/.test(text) || /^(async\s*)?(\(|[A-Za-z_$][\w$]*\s*=>)/.test(text);
     if (!isPlain) throw new TypeError('inferlet() takes a function declaration, function expression or arrow function');
     const source = `export const main = ${text};\n`;
-    const name = options.name ?? (fn.name || 'inferlet').replace(/_/g, '-');
-    const digest = hashBytes(new TextEncoder().encode(source));
-    const version = options.version ?? `0.${parseInt(digest.slice(0, 4), 16)}.${parseInt(digest.slice(4, 8), 16)}`;
-    return new Inferlet({ fn, name, version, source });
+    // As the server names it from its file: `_` reads as `-`.
+    const name = (options.name ?? (fn.name || 'inferlet')).replace(/_/g, '-');
+    return new Inferlet({ fn, name, source });
 }
 
 export class Process {
@@ -619,17 +623,13 @@ export class PieClient {
     }
 
     /**
-     * Check if a program exists on the server.
-     * The inferlet must be in name@version format (e.g., "text-completion@0.1.0").
-     * @param {string} inferlet The inferlet name (e.g., "text-completion@0.1.0").
+     * Whether `inferlet` (`name`, or `name@<hash prefix>`) names a program
+     * this session can launch.
+     * @param {string} inferlet
      * @returns {Promise<boolean>}
      */
     async checkProgram(inferlet) {
-        const idx = inferlet.lastIndexOf('@');
-        if (idx === -1) throw new Error("Version required: use 'name@version' format");
-        const name = inferlet.substring(0, idx);
-        const version = inferlet.substring(idx + 1);
-        const msg = { type: "check_program", name, version };
+        const msg = { type: "check_program", inferlet };
         const { ok, result } = await this._sendMsgAndWait(msg);
         if (ok) return result === "true";
         throw new Error(`CheckProgram failed: ${result}`);
@@ -639,17 +639,27 @@ export class PieClient {
     // Program Upload
     // =========================================================================
 
-    async installProgram(path, version = null, forceOverwrite = false) {
+    /**
+     * Installs the program at `path` under its name, for this session's
+     * tenant. Resolves to the `name@<hash>` that launches this build for
+     * good; the same bytes again only make it the name's latest.
+     * @param {string} path
+     * @returns {Promise<string>}
+     */
+    async installProgram(path) {
         const fs = await import('fs');
         const { resolve } = await import('path');
         const programBytes = fs.readFileSync(path);
-        return await this.installProgramBytes(programBytes, programFile(resolve(path)), version, forceOverwrite);
+        return await this.installProgramBytes(programBytes, programFile(resolve(path)));
     }
 
     /**
+     * `installProgram` for bytes, which came as `file`.
      * @param {Uint8Array} programBytes
+     * @param {string} file
+     * @returns {Promise<string>}
      */
-    async installProgramBytes(programBytes, file, version = null, forceOverwrite = false) {
+    async installProgramBytes(programBytes, file) {
         // msgpack-lite encodes a Node Buffer as `bin`, which is what the
         // server's `chunk_data` is; a bare Uint8Array would go out as an
         // array of numbers and the upload would never be answered.
@@ -673,8 +683,6 @@ export class PieClient {
                 corr_id,
                 program_hash: programHash,
                 file,
-                version,
-                force_overwrite: forceOverwrite,
                 chunk_index: i,
                 total_chunks: totalChunks,
                 chunk_data: programBytes.slice(start, end),
@@ -809,7 +817,7 @@ export class PieClient {
 
     /**
      * Launches a process. Returns a Process object for interaction.
-     * @param {string} inferlet The inferlet name (e.g., "text-completion@0.1.0").
+     * @param {string} inferlet A name (`text-completion`), or `name@<hash>` for one build.
      * @param {Object} [input={}] Input parameters object, serialized to JSON.
      * @param {boolean} [captureOutputs=true] Stream outputs to client.
      * @param {Object<string, Uint8Array>} [files={}] Files the inferlet reads with `session.file(name)`.
@@ -847,8 +855,8 @@ export class PieClient {
     /**
      * Launches an inferlet with `input` as its input object. A function
      * readied by `inferlet()` is installed first if the server does not
-     * hold its exact source yet; a string is an installed program's
-     * `name@version`. Returns the `Process`; `await process.result()`
+     * hold its exact source yet; a string is an installed program's name,
+     * or `name@<hash>` for one build. Returns the `Process`; `await process.result()`
      * waits for what it returns.
      * @param {Inferlet|string} program
      * @param {object} input
@@ -856,12 +864,11 @@ export class PieClient {
      */
     async run(program, input = {}) {
         if (program instanceof Inferlet) {
-            if (!(await this.checkProgram(program.program))) {
-                await this.installProgramBytes(
-                    new TextEncoder().encode(program.source), program.file, program.version,
+            program = (await this.checkProgram(program.program))
+                ? program.program
+                : await this.installProgramBytes(
+                    new TextEncoder().encode(program.source), program.file,
                 );
-            }
-            program = program.program;
         }
         const plainObject = input !== null && typeof input === 'object' && !Array.isArray(input);
         const moved = plainObject ? Object.fromEntries(

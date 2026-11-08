@@ -154,7 +154,6 @@ def compose_components(
 def handle_submit_command(
     inferlet: Optional[str] = None,
     path: Optional[Path] = None,
-    version: Optional[str] = None,
     config: Optional[Path] = None,
     host: Optional[str] = None,
     port: Optional[int] = None,
@@ -162,19 +161,19 @@ def handle_submit_command(
     capture_outputs: bool = True,
     link: Optional[list[Path]] = None,
     arguments: Optional[list[str]] = None,
-    force_overwrite: bool = False,
 ) -> None:
     """Handle the `pie-cli submit` command.
 
     You can specify an inferlet either by installed name or by path (mutually exclusive):
-    - By name: pie-client submit text-completion@0.1.0 -- --prompt "hello"
+    - By name: pie-client submit text-completion -- --prompt "hello"
+      (or `name@<hash>`, for one build)
     - By path: pie-client submit --path ./my_inferlet.wasm -- --prompt "hello"
 
     Steps:
     1. Creates a client configuration from config file and command-line arguments
     2. Connects to the Pie engine server
     3. If using path and libraries are specified, composes them with the inferlet using wac
-    4. Uploads the inferlet; the server answers with the `name@version` to launch (path mode only)
+    4. Uploads the inferlet; the server answers with the `name@<hash>` to launch (path mode only)
     5. Launches the inferlet with the provided arguments
     6. When capturing outputs, streams the inferlet output with signal handling
     """
@@ -215,13 +214,9 @@ def handle_submit_command(
                 with tempfile.TemporaryDirectory() as composed_dir:
                     composed_path = Path(composed_dir) / path.name
                     compose_components(path, link, composed_path)
-                    inferlet_name = engine.install_program(
-                        client, composed_path, version, force_overwrite=force_overwrite
-                    )
+                    inferlet_name = engine.install_program(client, composed_path)
             else:
-                inferlet_name = engine.install_program(
-                    client, path, version, force_overwrite=force_overwrite
-                )
+                inferlet_name = engine.install_program(client, path)
             typer.echo(f"✅ Installed {inferlet_name}.")
 
             # Launch the instance

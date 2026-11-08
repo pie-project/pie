@@ -34,7 +34,7 @@ network_allowed_hosts = ["*"]
 TOML
 "$pie" doctor || true
 
-"$pie" inferlet remove text-completion@0.3.0 >/dev/null 2>&1 || true
+"$pie" inferlet remove text-completion >/dev/null 2>&1 || true
 log="${RUNNER_TEMP:-/tmp}/pie-serve.log"
 "$pie" serve > "$log" 2>&1 &
 serve=$!
@@ -55,9 +55,9 @@ submit text-completion | grep -q '^error' || { echo "expected: not installed"; e
 submit text-completion | grep -q "^ok.*Paris" || { echo "expected: Paris"; exit 1; }
 "$pie" inferlet install "$nb"
 submit naive-baseline | grep -q "^ok.*sampler" || { echo "expected: the second program's output"; exit 1; }
-"$pie" inferlet install "$tc" --force
+"$pie" inferlet install "$tc"
 submit text-completion | grep -q "^ok.*Paris" || { echo "expected: Paris after the replacement"; exit 1; }
-"$pie" inferlet remove text-completion@0.3.0
+"$pie" inferlet remove text-completion
 submit text-completion | grep -q '^error' || { echo "expected: removed"; exit 1; }
 "$pie" inferlet remove naive-baseline
 if grep -q 'panicked at' "$log"; then echo "the server panicked"; grep -A3 'panicked at' "$log"; exit 1; fi

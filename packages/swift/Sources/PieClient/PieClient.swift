@@ -66,7 +66,7 @@ public actor PieClient {
         _ = try await request(.ping)
     }
 
-    /// Launches an installed inferlet (`name` or `name@version`); `input` is
+    /// Launches an installed inferlet (`name` or `name@<hash>`); `input` is
     /// encoded as the JSON its `main` receives.
     public nonisolated func launch(
         _ inferlet: String,

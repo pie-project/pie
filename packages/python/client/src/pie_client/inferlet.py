@@ -17,9 +17,8 @@ inside it or passed in as an argument. A closure over a local, or a use of
 a module-level name, is refused here with the name, since the server would
 only discover it as a NameError.
 
-The name is derived from the function's, the version from a hash of the
-source (so an edit is a new program and an unchanged one is never
-re-uploaded). The language component calls the module's `main` with the
+The name is derived from the function's; the program is the hash of its
+source, so an edit is a new build and an unchanged one is never re-uploaded. The language component calls the module's `main` with the
 caller's input as one object, so the source is sent with a `main` appended
 that spreads that object over the function's keyword parameters.
 """
@@ -41,13 +40,17 @@ import blake3
 class Inferlet:
     fn: Callable[..., Any]
     name: str
-    version: str
     source: str
 
     @property
+    def hash(self) -> str:
+        """The blake3 hash of the source: the build, as the server keys it."""
+        return blake3.blake3(self.source.encode("utf-8")).hexdigest()
+
+    @property
     def program(self) -> str:
-        """`name@version`, the id the server launches by."""
-        return f"{self.name}@{self.version}"
+        """`name@<hash>`, which launches exactly this source."""
+        return f"{self.name}@{self.hash}"
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """The function still runs locally when called directly."""
@@ -58,10 +61,9 @@ def inferlet(
     fn: Callable[..., Any] | None = None,
     *,
     name: str | None = None,
-    version: str | None = None,
 ) -> Any:
-    """Mark a function as an inferlet. Bare (`@inferlet`) or with options
-    (`@inferlet(name="beam-search", version="1.2.0")`)."""
+    """Mark a function as an inferlet. Bare (`@inferlet`) or with a name
+    (`@inferlet(name="beam-search")`)."""
 
     def wrap(fn: Callable[..., Any]) -> Inferlet:
         source = function_source(fn)
@@ -69,8 +71,8 @@ def inferlet(
         source = with_entry(source, fn)
         return Inferlet(
             fn=fn,
-            name=name or fn.__name__.replace("_", "-"),
-            version=version or hashed_version(source),
+            # As the server names it from its file: `_` reads as `-`.
+            name=(name or fn.__name__).replace("_", "-"),
             source=source,
         )
 
@@ -139,10 +141,3 @@ def check_self_contained(fn: Callable[..., Any], source: str) -> None:
             f"{fn.__name__} uses {names} without binding it; an inferlet must be "
             "self-contained -- import inside the function, or pass the value as an argument"
         )
-
-
-def hashed_version(source: str) -> str:
-    """A semver-shaped version that is a function of the source, so the
-    server's copy is content-addressed: `0.<16 bits>.<16 bits>`."""
-    digest = blake3.blake3(source.encode("utf-8")).hexdigest()
-    return f"0.{int(digest[:4], 16)}.{int(digest[4:8], 16)}"

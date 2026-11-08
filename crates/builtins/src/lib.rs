@@ -8,7 +8,6 @@ use std::borrow::Cow;
 #[derive(Clone, Copy, Debug)]
 pub struct Builtin {
     pub name: &'static str,
-    pub version: &'static str,
     pub component: &'static [u8],
 }
 
@@ -51,7 +50,6 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), ALL.len(), "duplicate names");
         for b in ALL {
-            assert!(!b.version.is_empty(), "{}: no version", b.name);
             assert!(
                 b.component.starts_with(b"\0asm"),
                 "{}: component is not wasm",

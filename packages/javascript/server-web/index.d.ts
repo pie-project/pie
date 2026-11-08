@@ -34,7 +34,8 @@ export function bootLazy(
 
 export function awaitCache(): Promise<void>;
 
-export function install(bytes: Uint8Array | ArrayBuffer, file: string, version?: string | null): Promise<string>;
+/** Installs a program among the system's; resolves to its `name@<hash>`. */
+export function install(bytes: Uint8Array | ArrayBuffer, file: string): Promise<string>;
 
 export function client(): PieClient;
 
@@ -73,7 +74,7 @@ export class Server {
     source: Uint8Array | ArrayBuffer | URL | string,
     options?: { precompiled?: Uint8Array | ArrayBuffer | URL | string },
   ): Promise<string>;
-  install(source: Uint8Array | ArrayBuffer | URL | string, file?: string | null, version?: string | null): Promise<string>;
+  install(source: Uint8Array | ArrayBuffer | URL | string, file?: string | null): Promise<string>;
   connect(): Promise<PieClient>;
   memoryBytes(): Promise<number>;
   awaitCache(): Promise<void>;

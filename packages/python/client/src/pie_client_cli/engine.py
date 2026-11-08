@@ -276,27 +276,22 @@ def attach_process(client: PieClient, instance_id: str) -> Process:
     )
 
 
-def install_program(
-    client: PieClient,
-    path: str | Path,
-    version: Optional[str] = None,
-    force_overwrite: bool = False,
-) -> str:
-    """Install a program (sync wrapper); returns the installed `name@version`.
+def install_program(client: PieClient, path: str | Path) -> str:
+    """Install a program (sync wrapper); returns the `name@<hash>` that
+    launches this build.
 
     Args:
         client: The PieClient instance.
         path: The `.wasm` component or `.py` / `.js` script; its file name names the program.
-        version: The version to install as; None takes the artifact's own, else a hash of its bytes.
-        force_overwrite: If True, overwrite an existing program with the same name+version.
     """
     return asyncio.get_event_loop().run_until_complete(
-        client.install_program(path, version, force_overwrite=force_overwrite)
+        client.install_program(path)
     )
 
 
 def check_program(client: PieClient, inferlet: str) -> bool:
-    """Whether the server holds `inferlet` (`name@version`); sync wrapper."""
+    """Whether `inferlet` (`name`, or `name@<hash>`) names a program this
+    session can launch; sync wrapper."""
     return asyncio.get_event_loop().run_until_complete(client.check_program(inferlet))
 
 
@@ -306,10 +301,8 @@ def launch_process(
     input: dict,
     capture_outputs: bool = True,
 ) -> Process:
-    """Launch a process (sync wrapper).
-
-    The inferlet must be in name@version format (e.g., "text-completion@0.1.0").
-    """
+    """Launch a process (sync wrapper): `inferlet` is a name, or
+    `name@<hash>` for one build."""
     return asyncio.get_event_loop().run_until_complete(
         client.launch_process(inferlet, input, capture_outputs)
     )

@@ -114,10 +114,10 @@ costs no device memory, and a turn resumes exactly where the last one stopped.
 
 ```python
 ws = await client.working_set()                    # a name; nothing exists yet
-await (await client.run("chat@0.1.0", ws=ws, prompt="Hi")).result()
+await (await client.run("chat", ws=ws, prompt="Hi")).result()
 checkpoint = await ws.fork()                       # to come back to
-await (await client.run("chat@0.1.0", ws=ws, prompt="Go on")).result()
-await (await client.run("chat@0.1.0", ws=checkpoint, prompt="Instead...")).result()
+await (await client.run("chat", ws=ws, prompt="Go on")).result()
+await (await client.run("chat", ws=checkpoint, prompt="Instead...")).result()
 ```
 
 The inferlet finds the handle in its input and gives it back:
@@ -143,9 +143,9 @@ bytes crossing the client:
 
 ```python
 out = await client.frames()
-await (await client.run("image-gen@0.1.0", out=out, prompt="a cat")).result()
+await (await client.run("image-gen", out=out, prompt="a cat")).result()
 await out.save("cat.png")
-await (await client.run("caption@0.1.0", image=out)).result()
+await (await client.run("caption", image=out)).result()
 ```
 
 See

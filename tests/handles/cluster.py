@@ -98,7 +98,7 @@ async def main():
                     raise SystemExit(f"{name} exited {p.returncode}")
             try:
                 c = PieClient(uri); await c.connect()
-                prog = await c.install_program(EX / "working_set_handles.wasm", force_overwrite=True)
+                prog = await c.install_program(EX / "working_set_handles.wasm")
                 h = await c.working_set()
                 base = await asyncio.wait_for(run(c, prog, h, PROMPT, 8), 30)
                 break
