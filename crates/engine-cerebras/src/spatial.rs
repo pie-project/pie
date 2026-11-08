@@ -74,6 +74,7 @@ pub mod serve_gptoss;
 pub mod serve_q35;
 pub mod serve_q35r;
 pub mod shapes;
+pub mod split;
 pub mod u4;
 pub mod u4g12;
 pub mod wafer;
