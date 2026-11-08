@@ -144,6 +144,10 @@ const mv_dest = @get_dsr(dsr_dest, 1);
 const mv_src0 = @get_dsr(dsr_src0, 1);
 const mv_src1 = @get_dsr(dsr_src1, 1);
 fn mvs_step(xv: @fp16()) void { @fmachs(mv_dest, mv_src0, mv_src1, xv); }
+fn mvh_step(xv: @fp16()) void { @fmach(mv_dest, mv_src0, mv_src1, xv); }
+param HACC16: u16 = 0;   // 1: the logit partials accumulate in f16 (y16), then widen once
+var y16 = @zeros([if (HACC16 == 1) VR else 1]@fp16());
+const yh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (HACC16 == 1) VR else 1} -> y16[i] });
 
 fn recv_x() void {
   const H2: u16 = HDc / 2;
@@ -237,6 +241,7 @@ task pass_task() void {
     va_restore();
     @fmuls(xr_d, x_d, hg_d);
     @fmovs(y_d, 0.0);
+    if (HACC16 == 1) { @fmovh(yh_d, @as(@fp16(), 0.0)); }
     var k: u16 = 0;
     while (k < NPX) : (k += 1) {
       @fs2h(xp_d, xr_d);
@@ -245,11 +250,19 @@ task pass_task() void {
         @fsubs(xr_d, xr_d, x_d);
       }
       const a = @set_dsd_base_addr(a_d, @ptrcast([*]@fp16(), &hw[0]));
-      @load_to_dsr(mv_dest, y_d, .{ .save_address = false });
-      @load_to_dsr(mv_src0, y_d, .{ .save_address = false });
-      @load_to_dsr(mv_src1, a, .{ .save_address = true });
-      @map(mvs_step, xp_d);
+      if (HACC16 == 1) {   // f16 accumulation (@fmach, the weight PEs' F16 path): the 32-dim partial in f16
+        @load_to_dsr(mv_dest, yh_d, .{ .save_address = false });
+        @load_to_dsr(mv_src0, yh_d, .{ .save_address = false });
+        @load_to_dsr(mv_src1, a, .{ .save_address = true });
+        @map(mvh_step, xp_d);
+      } else {
+        @load_to_dsr(mv_dest, y_d, .{ .save_address = false });
+        @load_to_dsr(mv_src0, y_d, .{ .save_address = false });
+        @load_to_dsr(mv_src1, a, .{ .save_address = true });
+        @map(mvs_step, xp_d);
+      }
     }
+    if (HACC16 == 1) { @fh2s(y_d, yh_d); }
     send_r();
     if ((wfl & 1) != 0) { hloop(); }
   }

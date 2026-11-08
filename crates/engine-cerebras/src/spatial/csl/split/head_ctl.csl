@@ -123,6 +123,12 @@ param WFORCE: u32 = 0;   // (diagnostics) != 0: the root's winner is (s WFORCE +
 param WFN: u32 = 1;
 var ring = @zeros([CAP]u32);     // the root: the winner id of each step of the last launch
 var ring_ptr: [*]u32 = &ring;
+// "force" / "nforce" (host-written, the root): steps s < nforce[0] take force[s] as the next token instead of
+// the argmax (the embedding return path included): a prompt and the decode loop in one launch
+var force = @zeros([CAP]u32);
+var force_ptr: [*]u32 = &force;
+var nforce = @zeros([1]u32);
+var nforce_ptr: [*]u32 = &nforce;
 var wrole: u16 = 0;              // 0 chain start, 1 add-forward, 2 group end, 3 farthest end, 4 root (| 8 low half, | 16 high half)
 var wl_on = false;
 var wm = @zeros([2]f32);         // (value, id) carried
@@ -140,8 +146,9 @@ fn wloop(s: u32, best: f32, id: f32) void {
   if ((wrole & 4) != 0) {
     if ((wrole & 8) != 0) { @fmovs(wr_d, fin(q_w1, 2)); wmerge(); }
     if ((wrole & 16) != 0) { @fmovs(wr_d, fin(q_w2, 2)); wmerge(); }
+    if (s < CAP) { ring[s] = @as(u32, wm[1]); }   // the argmax (also under a forced step: teacher-forced checks)
     if (WFORCE != 0) { wm[1] = @as(f32, (s * WFORCE + 7) % (@as(u32, VR) * @as(u32, WFN))); }   // (diagnostics) a forced winner sequence
-    if (s < CAP) { ring[s] = @as(u32, wm[1]); }
+    if (s < nforce[0] and s < CAP) { wm[1] = @as(f32, force[s]); }   // the host's forced tokens (a prompt in the same launch)
     if (s < 64) { stamp(2 + @as(u16, s)); }
     @fmovs(fout(q_wo, 2), wm_d);
   } else {
@@ -212,6 +219,8 @@ comptime {
   @initialize_queue(q_wo, .{ .color = @get_color(16) });
   @initialize_queue(q_ww, .{ .color = @get_color(16) });
   @export_symbol(ring_ptr, "ring");
+  @export_symbol(force_ptr, "force");
+  @export_symbol(nforce_ptr, "nforce");
   @export_symbol(t_ptr, "lgt");
   @export_symbol(res_ptr, "res");
   @export_symbol(tdbg_ptr, "tdbg");
