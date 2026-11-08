@@ -524,7 +524,7 @@ fn att(a: u16) void {
     while (h < Qh) : (h += 1) {
       const l = t[h * (Dc + 1) + Dc];
       if (l < 0.00390625 or l >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
-      ilh[h] = if (ATTL == 1) recip2(l) else recip(l);
+      ilh[h] = if (ATTL != 0) recip2(l) else recip(l);
       if (ATTV == 0) {
         var d: u16 = 0;
         while (d < Dc) : (d += 1) { u[h * Dc + d] = t[h * (Dc + 1) + d] * ilh[h] * gate[h * Dc + d]; }
@@ -540,10 +540,18 @@ fn att(a: u16) void {
       }
     }
     h = 0;
-    while (h < Qh) : (h += 1) { u[QD + 1 + h] = if (ATTL == 1) t[h * (Dc + 1) + Dc] else ln1(t[h * (Dc + 1) + Dc]); }
+    while (h < Qh) : (h += 1) {
+      const lh = t[h * (Dc + 1) + Dc];
+      u[QD + 1 + h] = if (ATTL == 1) lh else if (ATTL == 2 and bad == 0.0) 0.0 else ln1(lh);
+    }
     u[QD] = bad;
     mcast(QD + 1 + Qh);
     stamp(1 + 6 * cl + 3);
+    if (ATTL == 2 and bad == 0.0) {   // the logs off the path (CY waits for the gate / up reduction next)
+      h = 0;
+      while (h < Qh) : (h += 1) { u[h] = ln1(t[h * (Dc + 1) + Dc]); }
+      mcast(Qh);
+    }
     if (bad == 0.0) { pass = 8; }
   }
 }
