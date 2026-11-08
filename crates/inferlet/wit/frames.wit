@@ -1,4 +1,4 @@
-// Pixel / sample OUTPUT — the inverse of `media`, and the sibling of `speech`.
+// Pixel / sample OUTPUT — the inverse of `media`.
 // See design.md D11.
 //
 // Part of the `pie:inferlet` package. The vendored copies live under the
@@ -88,7 +88,7 @@ interface frames {
     // A host-side handle to decoded pixels: `count` frames of `width` x
     // `height` interleaved RGB8, in presentation order.
     //
-    // Self-describing, like `speech`: the guest never hardcodes a model's
+    // Self-describing: the guest never hardcodes a model's
     // latent geometry or frame rate, it asks. A still image is a handle with
     // `count() == 1`; `fps()` is then meaningless and reads 0.
     resource frames {

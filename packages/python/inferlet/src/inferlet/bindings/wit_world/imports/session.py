@@ -23,19 +23,7 @@ def send(message: str) -> None:
     raise NotImplementedError
 async def receive() -> Optional[str]:
     """
-    Receives an incoming message from the remote user client, or from
-    another process through `send-to`
-    """
-    raise NotImplementedError
-def send_to(process: str, message: str) -> None:
-    """
-    A pipe between processes: delivers `message` to the inbox of `process`
-    (its `system.instance-id`), where its `receive` returns it, without
-    the message leaving the engine. Both processes must belong to the same
-    client. The receiver counts as woken at once, so if it was parked its
-    KV starts coming back before it reads the message.
-    
-    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    Receives an incoming message from the remote user client
     """
     raise NotImplementedError
 def send_file(data: bytes) -> None:

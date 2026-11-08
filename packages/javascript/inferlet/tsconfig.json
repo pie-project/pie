@@ -82,12 +82,6 @@
       "pie:inferlet/session@0.3.0": [
         "./src/bindings/interfaces/pie-inferlet-session.js"
       ],
-      "pie:inferlet/speech": [
-        "./src/bindings/interfaces/pie-inferlet-speech.js"
-      ],
-      "pie:inferlet/speech@0.3.0": [
-        "./src/bindings/interfaces/pie-inferlet-speech.js"
-      ],
       "pie:inferlet/system": [
         "./src/bindings/interfaces/pie-inferlet-system.js"
       ],

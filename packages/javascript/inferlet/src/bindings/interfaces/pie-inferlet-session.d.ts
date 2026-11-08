@@ -4,16 +4,6 @@
  */
 export function send(message: string): void;
 /**
- * Receives an incoming message from the remote user client, or from
- * another process through `send-to`
- * A pipe between processes: delivers `message` to the inbox of `process`
- * (its `system.instance-id`), where its `receive` returns it, without
- * the message leaving the engine. Both processes must belong to the same
- * client. The receiver counts as woken at once, so if it was parked its
- * KV starts coming back before it reads the message.
- */
-export function sendTo(process: string, message: string): void;
-/**
  * Sends a file to the remote user client
  */
 export function sendFile(data: Blob): void;

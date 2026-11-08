@@ -1,13 +1,7 @@
 interface system {
 
-    // Returns the runtime version string
-    version: func() -> string;
-
     // Returns a unique identifier for the running instance
     instance-id: func() -> string;
-
-    // Returns the username of the user who invoked the inferlet
-    username: func() -> string;
 
     // Declare that this program may be re-run from the beginning by the
     // runtime, discarding everything it has produced so far.

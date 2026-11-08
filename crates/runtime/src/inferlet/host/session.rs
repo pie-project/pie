@@ -106,22 +106,6 @@ impl pie::inferlet::session::Host for ProcessCtx {
         Ok(u32::try_from(self.tokens_cached()).unwrap_or(u32::MAX))
     }
 
-    async fn send_to(&mut self, process: String, message: String) -> Result<Result<(), String>> {
-        let Ok(target) = process.parse::<crate::inferlet::ProcessId>() else {
-            return Ok(Err(format!("send-to: {process} is not a process id")));
-        };
-        let target = process::resolve(target);
-        let owner = process::get_client_id(self.id()).await.ok().flatten();
-        if owner.is_none() || process::get_client_id(target).await.ok().flatten() != owner {
-            return Ok(Err(format!("send-to: no process {process} of this client")));
-        }
-        crate::planner::wake(target);
-        if let Err(err) = server::inbox::send(target.to_string(), message) {
-            return Ok(Err(format!("send-to: {err}")));
-        }
-        Ok(Ok(()))
-    }
-
     async fn send(&mut self, message: String) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         deliver(self.id(), &ProcessEvent::Message(message), "session.send").await;

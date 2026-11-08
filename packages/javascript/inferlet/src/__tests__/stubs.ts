@@ -12,7 +12,6 @@
 export const modelStub = {
   name: () => 'mock-model',
   architecture: () => 'qwen3_5',
-  defaultSystemSpeculation: () => false,
   outputVocabSize: () => 151936,
   kvPageSize: () => 16,
   frameSize: () => 1,

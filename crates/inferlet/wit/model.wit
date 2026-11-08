@@ -12,9 +12,6 @@ interface model {
     // Returns the model architecture identifier (e.g. "gemma4", "qwen3_6")
     architecture: func() -> string;
 
-    // Whether the bound model enables system speculation by default
-    default-system-speculation: func() -> bool;
-
     // What a guest needs to seed a BLOCK drafter's draft pass: the rows one
     // pass carries (the anchor and `rows - 1` mask slots) and the id every
     // row but the first carries in. Facts the head was trained
@@ -146,8 +143,8 @@ interface model {
     }
     schedule: func() -> option<schedule-fact>;
 
-    // The most rows one lane may carry. Static.
-    max-latent-rows: func() -> u32;
+    // The most rows one pass may bind, across all its lanes. Static.
+    max-pass-rows: func() -> u32;
 
     // Logits/output dimension (= hf_config.vocab_size). May EXCEED the
     // tokenizer's vocabs() token count due to padding. Use THIS for

@@ -46,7 +46,6 @@ describe('model', () => {
   it('reports identity', () => {
     expect(model.name()).toBe('mock-model');
     expect(model.architecture()).toBe('qwen3_5');
-    expect(model.defaultSystemSpeculation()).toBe(false);
   });
 
   it('reports recurrent state and declared switches', () => {

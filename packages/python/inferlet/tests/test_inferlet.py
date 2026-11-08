@@ -84,7 +84,6 @@ class TestModel:
 
         assert model.name() == "mock-model"
         assert model.architecture() == "qwen3_5"
-        assert model.default_system_speculation() is False
 
     def test_state_and_switches(self):
         from inferlet import model
