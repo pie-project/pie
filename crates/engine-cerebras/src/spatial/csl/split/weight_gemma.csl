@@ -29,6 +29,7 @@ param PYW: u16 = 128;
 param HDS: u16 = 256;
 param HDG: u16 = 512;
 param ATTL: u16 = 2;
+param WIN: u16 = 0;    // > 0: the sliding window (the ring of NES PYW entries is longer: older entries are masked)
 param TSTAMP: u16 = 0;
 param FIFOW: u16 = 32;
 
@@ -79,6 +80,7 @@ var pv = @zeros([NC * DcG]f32);      // the pending entry's raw v a cache
 var pks = @zeros([NC]f32);           // its |k|^2, |v|^2 partials (this column's)
 var pvs = @zeros([NC]f32);
 var pend = @zeros([NC]u16);
+var spos = @zeros([if (WIN > 0) sum_ne() else 1]f32);   // (WIN > 0) a sliding entry's position + 1
 
 // ---------------------------------------------------------------- buffers
 const NEM: u16 = mx(NES, NEG);
@@ -350,7 +352,7 @@ fn cache_reset(c: u16) void {
   i = 0;
   while (i < cvw(c)) : (i += 1) { vc[1 + voff(c) + i] = 0; }
   i = 0;
-  while (i < cne(c)) : (i += 1) { kinv[eoff(c) + i] = 0.0; }
+  while (i < cne(c)) : (i += 1) { kinv[eoff(c) + i] = 0.0; if (WIN > 0) { spos[eoff(c) + i] = 0.0; } }
   pend[c] = 0;
 }
 // the new entry of cache c (this row's): k into the keys (f16), v and the two partials pending
@@ -366,6 +368,7 @@ fn cache_put(c: u16, pos: u32, k: [*]f32, v: [*]f32, ks: f32, vs: f32) void {
   pks[c] = ks;
   pvs[c] = vs;
   pend[c] = 1;
+  if (WIN > 0 and !cg(c)) { spos[eoff(c) + e] = @as(f32, pos + 1); }
 }
 fn cache_fin(c: u16, pos: u32, kss: f32, vss: f32, ihd: f32) void {
   const e = cslot(c, pos);
@@ -465,6 +468,13 @@ fn att_mix(l: u16, pos_out: *u32) void {
       @fmuls(sh, sh, @set_dsd_length(@increment_dsd_offset(ki, @as(i16, e0), f32), NEl));
       @fmuls(sh, sh, rsq(sx[Qh * NEl + h] * ihd + 1.0e-6));
       @fsubs(sh, sh, mref[l * Qh + h]);
+      if (WIN > 0 and !cg(c)) {   // entries out of the window (or never written) score -1e30: exp -> 0
+        var e: u16 = 0;
+        while (e < NEl) : (e += 1) {
+          const sp = spos[e0 + e];
+          if (sp == 0.0 or @as(f32, pos + 1) - sp >= @as(f32, WIN)) { sx[h * NEl + e] = -1.0e30; }
+        }
+      }
     }
     exp_v(@set_dsd_length(sx_d, Qh * NEl), Qh * NEl);
     const sp = @set_dsd_length(sx_d, Qh * NEl);
