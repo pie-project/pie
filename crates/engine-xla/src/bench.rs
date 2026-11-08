@@ -284,7 +284,7 @@ impl Bench {
             }),
         };
         body(&tracer).map_err(|e| e.to_string())?;
-        let Tracer { func, env } = tracer;
+        let Tracer { func, env, .. } = tracer;
         let mut func = func.into_inner();
         let env = env.into_inner();
         let written: Vec<u32> = env.written.iter().copied().collect();
@@ -383,7 +383,7 @@ impl Bench {
             }),
         };
         body(&tracer).map_err(|e| e.to_string())?;
-        let Tracer { func, env } = tracer;
+        let Tracer { func, env, .. } = tracer;
         let func = func.into_inner();
         let env = env.into_inner();
         let written: Vec<u32> = env.written.iter().copied().collect();
