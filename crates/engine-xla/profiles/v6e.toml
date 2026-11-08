@@ -8,6 +8,10 @@ assumes = { generation = 6 }
 [engine]
 pad.row_steps = 4
 
+# diag: prefill row blocks of 128, so a block of a many-lane fire spans fewer lanes' keys
+[kernel]
+attn.block_rows = 128
+
 [provenance]
 measured = [
   "engine.pad.row_steps",
