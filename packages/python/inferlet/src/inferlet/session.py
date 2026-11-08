@@ -50,10 +50,7 @@ async def receive() -> str:
 def send_file(data: bytes, name: str | None = None) -> None:
     """Send binary file data to the client, under a suggested file ``name``
     if given (a name, not a path: the client keeps its last part)."""
-    if name is None:
-        _session.send_file(data)
-    else:
-        _session.send_file_as(data, name)
+    _session.send_file(data, name)
 
 
 def send_frames(

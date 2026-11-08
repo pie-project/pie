@@ -383,8 +383,11 @@ impl WorkingSet {
 
     /// The handle the launch moved in under `name`.
     pub fn take(name: &str) -> Option<WorkingSet> {
-        crate::pie::inferlet::session::take_working_set(name)
-            .map(|ws| WorkingSet { ws: Rc::new(ws) })
+        use crate::pie::inferlet::session::{Handle, HandleKind, take};
+        match take(name, HandleKind::WorkingSet)? {
+            Handle::WorkingSet(ws) => Some(WorkingSet { ws: Rc::new(ws) }),
+            _ => None,
+        }
     }
 
     /// Hands this set back to the client under the launch's `name`: every
@@ -392,7 +395,10 @@ impl WorkingSet {
     pub fn give(self, name: &str) -> Result<(), String> {
         let ws = Rc::try_unwrap(self.ws)
             .map_err(|_| format!("`{name}` is still bound to a forward pass"))?;
-        crate::pie::inferlet::session::give_working_set(name, ws)
+        crate::pie::inferlet::session::give(
+            name,
+            crate::pie::inferlet::session::Handle::WorkingSet(ws),
+        )
     }
 
     /// Lets passes write slots below `end`: needed only by a pass whose slots

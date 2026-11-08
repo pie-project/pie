@@ -355,7 +355,7 @@ public struct PieProcess: Sendable {
         case stderr(String)
         /// A `session::send` from the inferlet.
         case message(String)
-        /// A file the inferlet sent (`session::send_file_as`, `send_frames`),
+        /// A file the inferlet sent (`session::send_file` with a name, `send_frames`),
         /// under the name it gave, if any.
         case file(name: String?, data: Data)
         /// What `main` returned; always the last event.

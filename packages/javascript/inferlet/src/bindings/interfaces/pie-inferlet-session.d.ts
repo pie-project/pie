@@ -4,24 +4,19 @@
  */
 export function send(message: string): void;
 /**
- * Sends a file to the remote user client
- */
-export function sendFile(data: Blob): void;
-/**
- * `send-file` with a suggested file name, so what arrives at the client
- * is a named file rather than an anonymous blob.
+ * Sends a file to the remote user client, under a suggested file name
+ * if it has one.
  * 
  * The bytes are already a guest value here -- that is what makes this
- * `send-file` and not `send-frames`. What it adds is the one thing
- * `send-file` cannot say: WHAT THE FILE IS. `pie run -o DIR` writes an
- * unnamed file as `file-0000.bin`, which is the right answer for a blob
- * nobody described and the wrong one for a guest that knows it just
- * produced `image.latent.f32`.
+ * `send-file` and not `send-frames`. The name says WHAT THE FILE IS:
+ * `pie run -o DIR` writes an unnamed file as `file-0000.bin`, which is
+ * the right answer for a blob nobody described and the wrong one for a
+ * guest that knows it just produced `image.latent.f32`.
  * 
  * `name` is a suggestion and not a path, exactly as in `send-frames`:
  * the host keeps the last component and the client sanitises again.
  */
-export function sendFileAs(data: Blob, name: string): void;
+export function sendFile(data: Blob, name: string | undefined): void;
 /**
  * Receives an incoming file from the remote user client
  * The file the client attached to this run under `name`
@@ -29,44 +24,21 @@ export function sendFileAs(data: Blob, name: string): void;
  */
 export function file(name: string): Blob | undefined;
 /**
- * The working set the launch moved in under `name`, once; none if it
- * moved no such handle. It is new if nothing has written it yet.
+ * The handle of `kind` the launch moved in under `name`, once; none if
+ * it moved no such handle, and one of another kind stays where it is.
+ * A working set is new if nothing has written it yet; a matcher stands
+ * where the client left it, or at the start of the grammar it wrote;
+ * frames and pcm are a process's output, or a client's upload, decoded.
  */
-export function takeWorkingSet(name: string): WorkingSet | undefined;
+export function take(name: string, kind: HandleKind): Handle | undefined;
 /**
- * Hands `ws` to the client as what the launch named `name` in its
- * returns. It lands in the client's session when this process ends, once
- * its last fire has settled. Refused if the launch expects no such
- * return, or has one already; `ws` is dropped either way it fails.
+ * Hands `h` to the client as what the launch named `name` in its
+ * returns. It lands in the client's session when this process ends,
+ * once its last fire has settled; frames and pcm never cross linear
+ * memory. Refused if the launch expects no such return, or has one
+ * already; `h` is dropped either way it fails.
  */
-export function giveWorkingSet(name: string, ws: WorkingSet): void;
-/**
- * `take-working-set` for a matcher: it stands where the client left it,
- * or at the start of the grammar it wrote.
- */
-export function takeMatcher(name: string): Matcher | undefined;
-/**
- * `give-working-set` for a matcher.
- */
-export function giveMatcher(name: string, matcher: Matcher): void;
-/**
- * `take-working-set` for pictures: a process's output, or a client's
- * upload, decoded.
- */
-export function takeFrames(name: string): Frames | undefined;
-/**
- * `give-working-set` for pictures: the client saves them or moves them
- * on to another process, and they never cross linear memory.
- */
-export function giveFrames(name: string, f: Frames): void;
-/**
- * `take-frames` for sound.
- */
-export function takePcm(name: string): Pcm | undefined;
-/**
- * `give-frames` for sound.
- */
-export function givePcm(name: string, p: Pcm): void;
+export function give(name: string, h: Handle): void;
 /**
  * Encodes `f` and streams the bytes to the client under `name`, WITHOUT
  * the encoded file ever entering WASM linear memory.
@@ -117,3 +89,36 @@ export type ImageFormat = import('./pie-inferlet-frames.js').ImageFormat;
 export type AudioFormat = import('./pie-inferlet-frames.js').AudioFormat;
 export type WorkingSet = import('./pie-inferlet-working-set.js').WorkingSet;
 export type Matcher = import('./pie-inferlet-grammar.js').Matcher;
+/**
+ * What a launch moves in, and a process gives back, by kind.
+ * # Variants
+ * 
+ * ## `"working-set"`
+ * 
+ * ## `"matcher"`
+ * 
+ * ## `"frames"`
+ * 
+ * ## `"pcm"`
+ */
+export type HandleKind = 'working-set' | 'matcher' | 'frames' | 'pcm';
+/**
+ * One handle a launch moved in, or one a process gives back.
+ */
+export type Handle = HandleWorkingSet | HandleMatcher | HandleFrames | HandlePcm;
+export interface HandleWorkingSet {
+  tag: 'working-set',
+  val: WorkingSet,
+}
+export interface HandleMatcher {
+  tag: 'matcher',
+  val: Matcher,
+}
+export interface HandleFrames {
+  tag: 'frames',
+  val: Frames,
+}
+export interface HandlePcm {
+  tag: 'pcm',
+  val: Pcm,
+}

@@ -15,6 +15,42 @@ import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
 
+class HandleKind(Enum):
+    """
+    What a launch moves in, and a process gives back, by kind.
+    """
+    WORKING_SET = 0
+    MATCHER = 1
+    FRAMES = 2
+    PCM = 3
+
+
+@dataclass
+class Handle_WorkingSet:
+    value: working_set.WorkingSet
+
+
+@dataclass
+class Handle_Matcher:
+    value: grammar.Matcher
+
+
+@dataclass
+class Handle_Frames:
+    value: frames.Frames
+
+
+@dataclass
+class Handle_Pcm:
+    value: frames.Pcm
+
+
+Handle = Union[Handle_WorkingSet, Handle_Matcher, Handle_Frames, Handle_Pcm]
+"""
+One handle a launch moved in, or one a process gives back.
+"""
+
+
 
 def send(message: str) -> None:
     """
@@ -26,22 +62,16 @@ async def receive() -> Optional[str]:
     Receives an incoming message from the remote user client
     """
     raise NotImplementedError
-def send_file(data: bytes) -> None:
+def send_file(data: bytes, name: Optional[str]) -> None:
     """
-    Sends a file to the remote user client
-    """
-    raise NotImplementedError
-def send_file_as(data: bytes, name: str) -> None:
-    """
-    `send-file` with a suggested file name, so what arrives at the client
-    is a named file rather than an anonymous blob.
+    Sends a file to the remote user client, under a suggested file name
+    if it has one.
     
     The bytes are already a guest value here -- that is what makes this
-    `send-file` and not `send-frames`. What it adds is the one thing
-    `send-file` cannot say: WHAT THE FILE IS. `pie run -o DIR` writes an
-    unnamed file as `file-0000.bin`, which is the right answer for a blob
-    nobody described and the wrong one for a guest that knows it just
-    produced `image.latent.f32`.
+    `send-file` and not `send-frames`. The name says WHAT THE FILE IS:
+    `pie run -o DIR` writes an unnamed file as `file-0000.bin`, which is
+    the right answer for a blob nobody described and the wrong one for a
+    guest that knows it just produced `image.latent.f32`.
     
     `name` is a suggestion and not a path, exactly as in `send-frames`:
     the host keeps the last component and the client sanitises again.
@@ -58,57 +88,22 @@ def file(name: str) -> Optional[bytes]:
     (`pie run --file name=path`), or none.
     """
     raise NotImplementedError
-def take_working_set(name: str) -> Optional[working_set.WorkingSet]:
+def take(name: str, kind: HandleKind) -> Optional[Handle]:
     """
-    The working set the launch moved in under `name`, once; none if it
-    moved no such handle. It is new if nothing has written it yet.
-    """
-    raise NotImplementedError
-def give_working_set(name: str, ws: working_set.WorkingSet) -> None:
-    """
-    Hands `ws` to the client as what the launch named `name` in its
-    returns. It lands in the client's session when this process ends, once
-    its last fire has settled. Refused if the launch expects no such
-    return, or has one already; `ws` is dropped either way it fails.
-
-    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    The handle of `kind` the launch moved in under `name`, once; none if
+    it moved no such handle, and one of another kind stays where it is.
+    A working set is new if nothing has written it yet; a matcher stands
+    where the client left it, or at the start of the grammar it wrote;
+    frames and pcm are a process's output, or a client's upload, decoded.
     """
     raise NotImplementedError
-def take_matcher(name: str) -> Optional[grammar.Matcher]:
+def give(name: str, h: Handle) -> None:
     """
-    `take-working-set` for a matcher: it stands where the client left it,
-    or at the start of the grammar it wrote.
-    """
-    raise NotImplementedError
-def give_matcher(name: str, matcher: grammar.Matcher) -> None:
-    """
-    `give-working-set` for a matcher.
-
-    Raises: `componentize_py_types.Err(wit_world.imports.str)`
-    """
-    raise NotImplementedError
-def take_frames(name: str) -> Optional[frames.Frames]:
-    """
-    `take-working-set` for pictures: a process's output, or a client's
-    upload, decoded.
-    """
-    raise NotImplementedError
-def give_frames(name: str, f: frames.Frames) -> None:
-    """
-    `give-working-set` for pictures: the client saves them or moves them
-    on to another process, and they never cross linear memory.
-
-    Raises: `componentize_py_types.Err(wit_world.imports.str)`
-    """
-    raise NotImplementedError
-def take_pcm(name: str) -> Optional[frames.Pcm]:
-    """
-    `take-frames` for sound.
-    """
-    raise NotImplementedError
-def give_pcm(name: str, p: frames.Pcm) -> None:
-    """
-    `give-frames` for sound.
+    Hands `h` to the client as what the launch named `name` in its
+    returns. It lands in the client's session when this process ends,
+    once its last fire has settled; frames and pcm never cross linear
+    memory. Refused if the launch expects no such return, or has one
+    already; `h` is dropped either way it fails.
 
     Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """

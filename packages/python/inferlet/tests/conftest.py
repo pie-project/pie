@@ -170,15 +170,20 @@ class SessionSpy:
 
     def __init__(self) -> None:
         self.sent: list[str] = []
-        self.sent_files: list[bytes] = []
+        self.sent_files: list[tuple[bytes, str | None]] = []
         self.to_receive: list[str | None] = []
         self.files_to_receive: list[bytes | None] = []
+        # What the launch moved in, by name: (kind, handle).
+        self.moved_in: dict[str, tuple[object, object]] = {}
+        self.given: list[tuple[str, object]] = []
 
     def reset(self) -> None:
         self.sent.clear()
         self.sent_files.clear()
         self.to_receive.clear()
         self.files_to_receive.clear()
+        self.moved_in.clear()
+        self.given.clear()
 
 
 SESSION_SPY = SessionSpy()
@@ -193,16 +198,32 @@ def _make_session(spy: SessionSpy) -> types.ModuleType:
     async def receive() -> str | None:
         return spy.to_receive.pop(0) if spy.to_receive else None
 
-    def send_file(data: bytes) -> None:
-        spy.sent_files.append(data)
+    def send_file(data: bytes, name: str | None) -> None:
+        spy.sent_files.append((data, name))
 
     async def receive_file() -> bytes | None:
         return spy.files_to_receive.pop(0) if spy.files_to_receive else None
+
+    m.HandleKind = enum.Enum("HandleKind", ["WORKING_SET", "MATCHER", "FRAMES", "PCM"])
+    for case in ("WorkingSet", "Matcher", "Frames", "Pcm"):
+        setattr(m, f"Handle_{case}", dataclass(type(f"Handle_{case}", (), {"__annotations__": {"value": object}})))
+
+    def take(name: str, kind):
+        held = spy.moved_in.get(name)
+        if held is None or held[0] != kind:
+            return None
+        del spy.moved_in[name]
+        return held[1]
+
+    def give(name: str, h) -> None:
+        spy.given.append((name, h))
 
     m.send = send
     m.receive = receive
     m.send_file = send_file
     m.receive_file = receive_file
+    m.take = take
+    m.give = give
     return m
 
 

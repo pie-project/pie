@@ -32,9 +32,10 @@ export function receive(): string | undefined {
     return _session.receiveBlocking();
 }
 
-/** Sends a file (binary data) to the remote user client. */
-export function sendFile(data: Uint8Array): void {
-    _session.sendFile(data);
+/** Sends a file (binary data) to the remote user client, under a suggested
+ *  file `name` if given (a name, not a path: the client keeps its last part). */
+export function sendFile(data: Uint8Array, name?: string): void {
+    _session.sendFile(data, name);
 }
 
 /** Receives a file from the remote user client (synchronous; see `receive`). */

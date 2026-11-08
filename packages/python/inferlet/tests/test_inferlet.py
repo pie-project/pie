@@ -211,11 +211,28 @@ class TestSession:
         with pytest.raises(RuntimeError):
             asyncio.run(session.receive())
 
+    def test_a_handle_is_taken_by_its_kind_and_given_back(self):
+        from wit_world.imports import session as wit
+
+        from inferlet.eta import WorkingSet
+
+        SESSION_SPY.moved_in["ws"] = (wit.HandleKind.WORKING_SET, wit.Handle_WorkingSet("raw"))
+        SESSION_SPY.moved_in["m"] = (wit.HandleKind.MATCHER, wit.Handle_Matcher("raw-m"))
+        with pytest.raises(ValueError):
+            WorkingSet.take("m")
+        assert "m" in SESSION_SPY.moved_in, "one of another kind stays where it is"
+        ws = WorkingSet.take("ws")
+        assert ws.ws == "raw"
+        ws.give("ws")
+        [(name, given)] = SESSION_SPY.given
+        assert name == "ws" and isinstance(given, wit.Handle_WorkingSet) and given.value == "raw"
+
     def test_file_roundtrip(self):
         from inferlet import session
 
         session.send_file(b"\x00\x01")
-        assert SESSION_SPY.sent_files == [b"\x00\x01"]
+        session.send_file(b"\x03", "out.bin")
+        assert SESSION_SPY.sent_files == [(b"\x00\x01", None), (b"\x03", "out.bin")]
 
         SESSION_SPY.files_to_receive.append(b"\x02")
         assert asyncio.run(session.receive_file()) == b"\x02"
