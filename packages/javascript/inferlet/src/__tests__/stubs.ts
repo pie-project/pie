@@ -307,7 +307,6 @@ export const toolsStub = {
   equip: (tools: string[]) => Uint32Array.from([10, tools.length]),
   answer: (name: string, value: string) => Uint32Array.from([11, name.length, value.length]),
   format: (tools: string[]) => (tools.length ? new GrammarStub('tools') : undefined),
-  createMatcher: () => new MatcherStub(new GrammarStub('tools')),
   Decoder: class {
     n = 0;
     feed() {

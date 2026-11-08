@@ -5,7 +5,7 @@
 
 import * as _tools from 'pie:inferlet/tools@0.3.0';
 
-import { Grammar, GrammarError, Matcher } from './grammar.js';
+import { Grammar, GrammarError } from './grammar.js';
 
 export interface ToolCall {
   readonly name: string;
@@ -42,11 +42,6 @@ export function answer(name: string, value: string): Uint32Array {
 export function format(tools: string[]): Grammar | undefined {
   const g = _tools.format(tools);
   return g ? new Grammar(g) : undefined;
-}
-
-/** A matcher over `format`'s grammar. */
-export function createMatcher(tools: string[]): Matcher {
-  return new Matcher(_tools.createMatcher(tools));
 }
 
 /** Parses generated tokens into tool-call events. */

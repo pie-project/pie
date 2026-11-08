@@ -73,7 +73,10 @@ fn constraint(req: &Request) -> Result<Option<Box<dyn Guide>>, String> {
         if callable.is_empty() {
             return Err("tool_choice names a tool that is not in `tools`".into());
         }
-        return Ok(Some(Box::new(tools::create_matcher(&callable))));
+        // A model with no tool-call syntax cannot be held to one.
+        let grammar = tools::format(&callable)
+            .ok_or("tool_choice forces a call, but this model has no tool-call format")?;
+        return Ok(Some(Box::new(Matcher::new(&grammar))));
     }
     let grammar = match &req.response_format {
         ResponseFormat::Text => return Ok(None),

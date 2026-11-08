@@ -595,7 +595,6 @@ def _make_tools() -> types.ModuleType:
     m.equip = lambda tools: [10, len(tools)]
     m.answer = lambda name, value: [11, len(name), len(value)]
     m.format = lambda tools: GrammarStub("tools") if tools else None
-    m.create_matcher = lambda tools: MatcherStub(GrammarStub("tools"))
     return m
 
 

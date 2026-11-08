@@ -115,10 +115,10 @@ pub(crate) enum Event {
     ),
 }
 
-/// What the worker policy published for the cluster plane, by subject
-/// (`worker`, `process:<id>`) and name.
+/// What the worker policy published about this worker for the cluster plane,
+/// by name.
 static PUBLISHED: std::sync::LazyLock<
-    std::sync::RwLock<std::collections::BTreeMap<(String, String), serde_json::Value>>,
+    std::sync::RwLock<std::collections::BTreeMap<String, serde_json::Value>>,
 > = std::sync::LazyLock::new(Default::default);
 
 /// What a policy that stopped published is withdrawn.
@@ -126,25 +126,25 @@ pub(crate) fn withdraw_published() {
     PUBLISHED.write().unwrap().clear();
 }
 
-pub(crate) fn publish(of: String, name: String, value: Option<serde_json::Value>) {
+pub(crate) fn publish(name: String, value: Option<serde_json::Value>) {
     let mut published = PUBLISHED.write().unwrap();
     match value {
         Some(value) => {
-            published.insert((of, name), value);
+            published.insert(name, value);
         }
         None => {
-            published.remove(&(of, name));
+            published.remove(&name);
         }
     }
 }
 
-/// Everything the worker policy has published, as `(subject, name, value)`.
-pub fn published() -> Vec<(String, String, serde_json::Value)> {
+/// Everything the worker policy has published, as `(name, value)`.
+pub fn published() -> Vec<(String, serde_json::Value)> {
     PUBLISHED
         .read()
         .unwrap()
         .iter()
-        .map(|((of, name), value)| (of.clone(), name.clone(), value.clone()))
+        .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
 }
 

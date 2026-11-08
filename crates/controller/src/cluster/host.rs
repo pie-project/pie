@@ -556,6 +556,10 @@ fn gate_of<'a>(manifests: impl Iterator<Item = &'a super::manifest::Manifest>) -
     manifests.map(|m| m.gate_ms).max().unwrap_or(0)
 }
 
+/// Where a worker policy's publications read, on its worker: no cluster
+/// program's, whatever it is named.
+const WORKER_PUBLISHED: &str = "published/@worker/";
+
 fn program_name(spec: &str) -> String {
     std::path::Path::new(spec)
         .file_stem()
@@ -1500,6 +1504,11 @@ impl Plane for Snapshot {
     }
 
     fn attr(&self, of: &Subject, name: &str) -> Option<Value> {
+        // What a worker's own policy published, apart from any program's.
+        if let (Subject::Worker(id), Some(name)) = (of, name.strip_prefix(WORKER_PUBLISHED)) {
+            let value = self.published.get(id)?.get(name)?.clone();
+            return prop_value((String::new(), value)).map(|(_, value)| value);
+        }
         // What a cluster program published, under its name.
         if let Some(said) = name
             .strip_prefix("published/")
@@ -1585,12 +1594,6 @@ impl Plane for Snapshot {
                     _ => None,
                 }
             }
-            Subject::Worker(id) if name.starts_with("published/") => self
-                .published
-                .get(id)
-                .and_then(|map| map.get(&name["published/".len()..]))
-                .and_then(|value| prop_value((String::new(), value.clone())))
-                .map(|(_, value)| value),
             Subject::Worker(id) if self.pools.contains(id) => match name {
                 "pool" => Some(Value::Boolean(true)),
                 _ => None,
@@ -1978,8 +1981,12 @@ mod tests {
             Some(Value::Int(4))
         ));
         assert!(
-            matches!(plane.attr(&worker, "published/mark"), Some(Value::Text(t)) if t == "own"),
+            matches!(plane.attr(&worker, "published/@worker/mark"), Some(Value::Text(t)) if t == "own"),
             "the worker's own policy's value stands beside the programs'"
+        );
+        assert!(
+            plane.attr(&worker, "published/mark").is_none(),
+            "no program is named `mark`"
         );
 
         registry.say(

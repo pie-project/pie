@@ -94,8 +94,3 @@ def format(tools: List[str]) -> Optional[grammar.Grammar]:
     this model and toolset, or none if the model has no enforceable format.
     """
     raise NotImplementedError
-def create_matcher(tools: List[str]) -> grammar.Matcher:
-    """
-    Create a grammar matcher to force-generate tool calls
-    """
-    raise NotImplementedError

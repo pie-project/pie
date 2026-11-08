@@ -24,12 +24,7 @@ export function assistantCalls(message: string, calls: Array<ToolCall>, current:
  * this model and toolset, or none if the model has no enforceable format.
  */
 export function format(tools: Array<string>): Grammar | undefined;
-/**
- * Create a grammar matcher to force-generate tool calls
- */
-export function createMatcher(tools: Array<string>): Matcher;
 export type Grammar = import('./pie-inferlet-grammar.js').Grammar;
-export type Matcher = import('./pie-inferlet-grammar.js').Matcher;
 export type Error = import('./pie-inferlet-types.js').Error;
 /**
  * A complete tool call parsed out of the model's output.

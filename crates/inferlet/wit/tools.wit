@@ -1,5 +1,5 @@
 interface tools {
-    use grammar.{grammar, matcher};
+    use grammar.{grammar};
     use types.{error};
 
     /// A complete tool call parsed out of the model's output.
@@ -34,9 +34,6 @@ interface tools {
     /// Returns the grammar that constrains well-formed tool-call output for
     /// this model and toolset, or none if the model has no enforceable format.
     format: func(tools: list<string>) -> option<grammar>;
-
-    /// Create a grammar matcher to force-generate tool calls
-    create-matcher: func(tools: list<string>) -> matcher;
 
     /// Detects tool calls in generated tokens.
     resource decoder {

@@ -66,7 +66,6 @@ describe('tools', () => {
     expect(Array.from(tools.answer('f', 'xyz'))).toEqual([11, 1, 3]);
     expect(tools.format([])).toBeUndefined();
     expect(tools.format(['a'])!.toString()).toBe('tools');
-    expect(Array.from(tools.createMatcher(['a']).mask())).toEqual([0b101]);
   });
 
   it('decodes events', () => {

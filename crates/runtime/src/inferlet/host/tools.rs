@@ -2,7 +2,6 @@ use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
 use chat_template::{ToolDecoder, ToolEvent};
-use grammar::matcher::GrammarMatcher;
 use std::collections::VecDeque;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -61,26 +60,6 @@ impl pie::inferlet::tools::Host for ProcessCtx {
             crate::inferlet::host::grammar::grammar_compiler().compile_ebnf(&tg.source, "root")?;
         let grammar = crate::inferlet::host::grammar::Grammar { compiled };
         Ok(Some(self.ctx().table.push(grammar)?))
-    }
-
-    async fn create_matcher(
-        &mut self,
-        tools: Vec<String>,
-    ) -> Result<Resource<crate::inferlet::host::grammar::Matcher>> {
-        let model = crate::model::model();
-        let instruct = model.instruct();
-        let stop_tokens = instruct.seal();
-
-        let tg = instruct.tool_call_grammar(&tools).ok_or_else(|| {
-            anyhow::anyhow!("model does not support constrained tool-call generation")
-        })?;
-
-        let compiled =
-            crate::inferlet::host::grammar::grammar_compiler().compile_ebnf(&tg.source, "root")?;
-        let inner = GrammarMatcher::with_compiled(compiled, stop_tokens, 10);
-
-        let matcher = crate::inferlet::host::grammar::Matcher { inner };
-        Ok(self.ctx().table.push(matcher)?)
     }
 }
 

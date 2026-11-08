@@ -62,7 +62,6 @@ class TestTools:
         assert tools.answer("f", "xyz") == [11, 1, 3]
         assert tools.format([]) is None
         assert str(tools.format(["a"])) == "tools"
-        assert tools.create_matcher(["a"]).mask() == [0b101]
 
     def test_decoder_events(self):
         d = tools.Decoder()

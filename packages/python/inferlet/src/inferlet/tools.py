@@ -7,7 +7,7 @@ and parse the calls back out::
     from inferlet import tools
 
     prompt = chat.system(...) + tools.equip([spec_json, ...]) + chat.user(...)
-    matcher = tools.create_matcher([spec_json, ...])   # a grammar.Matcher
+    matcher = grammar.Matcher(tools.format([spec_json, ...]))
     ...
     match tools.Decoder().feed(tokens):
         case tools.Event.Call(call=c): ...
@@ -22,7 +22,7 @@ from typing import Sequence, Union
 from componentize_py_types import Err as _WitErr
 from wit_world.imports import tools as _tools
 
-from .grammar import Grammar, GrammarError, Matcher
+from .grammar import Grammar, GrammarError
 
 
 @dataclass(frozen=True)
@@ -69,11 +69,6 @@ def format(tools: Sequence[str]) -> Grammar | None:  # noqa: A001 — the WIT na
     template has one."""
     g = _tools.format(list(tools))
     return Grammar(g) if g is not None else None
-
-
-def create_matcher(tools: Sequence[str]) -> Matcher:
-    """A matcher over :func:`format`'s grammar."""
-    return Matcher._wrap(_tools.create_matcher(list(tools)))
 
 
 class Decoder:

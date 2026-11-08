@@ -311,13 +311,8 @@ fn enact(registry: &mut Registry, commit: Commit, policy: &str) {
             None => (registry.cache.discard)(owner),
         }
     }
-    for (of, name, value) in commit.publish {
-        let of = match of {
-            Subject::Worker(_) => "worker".to_string(),
-            Subject::Process(id) => format!("process:{id}"),
-            _ => continue,
-        };
-        super::publish(of, name, value.and_then(|v| wit_json(&v)));
+    for (name, value) in commit.publish {
+        super::publish(name, value.and_then(|v| wit_json(&v)));
     }
 }
 

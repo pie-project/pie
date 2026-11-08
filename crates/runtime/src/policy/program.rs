@@ -147,7 +147,7 @@ pub struct Commit {
     pub discard: Vec<String>,
     pub offload: Option<Offloads>,
     /// `(subject, name, value)`, in call order; `None` withdraws.
-    pub publish: Vec<(Subject, String, Option<Value>)>,
+    pub publish: Vec<(String, Option<Value>)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -497,7 +497,7 @@ struct Staged {
     terminate: Vec<(String, String)>,
     discard: Vec<String>,
     offload: Option<Offloads>,
-    publish: Vec<(Subject, String, Option<Value>)>,
+    publish: Vec<(String, Option<Value>)>,
     alarm: Option<u64>,
 }
 
@@ -607,20 +607,16 @@ impl worker_writes::Host for HostState {
         });
     }
 
-    fn publish(&mut self, of: Subject, name: String, val: Option<Value>) {
+    fn publish(&mut self, name: String, val: Option<Value>) {
         self.write("publish", |state| {
             if !state.grants.publish {
                 return Err(Refusal::NotGranted);
-            }
-            // This worker, or a process on it.
-            if !matches!(of, Subject::Worker(_) | Subject::Process(_)) {
-                return Err(Refusal::WrongState);
             }
             let call = state.call()?;
             if call.staged.publish.len() >= MAX_ENTRIES {
                 return Err(Refusal::TooLarge);
             }
-            call.staged.publish.push((of, name, val));
+            call.staged.publish.push((name, val));
             Ok(())
         });
     }
