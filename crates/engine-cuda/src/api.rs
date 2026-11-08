@@ -756,6 +756,12 @@ impl Engine for Cuda {
             classes: shell.classes(),
         };
 
+        // A fire's lanes, rows and readouts bound the scheduler's waves: a
+        // decode wave seats at most `max_lanes` lanes.
+        eprintln!(
+            "engine-cuda: fire limits: {} lanes, {} rows, {} readouts",
+            caps.limits.max_lanes, caps.limits.max_tokens, caps.limits.max_readouts,
+        );
         self.replay = crate::replay::Replay::of(&shell);
         if let Some(sink) = &self.tap_sink {
             shell.on_tapped(sink.clone());
