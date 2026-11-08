@@ -1,5 +1,9 @@
-// split/weight_g12.csl: the role-split weight PE for Gemma 4 12B (scratch/split/gemma12/README.md), from the
-// Gemma 4 draft weight_gemma.csl (cerebras-role-split-gemma, unfinished) without PLE / shared KV. Every layer is
+// split/weight_g12.csl: EXPERIMENTAL, not runnable. The role-split weight PE for Gemma 4 12B (bf16), for the
+// fit study only: it links on a 4 x 4 harness (the attention-row kind at 4k context: 47,056 B, the plain-row
+// kind 44,160 B), but nothing simulates it, no CY / head-control kernel or host placement exists for it, and
+// mkfull.py does not build it. See spatial/split/README.md ("Experimental").
+//
+// Adapted from a Gemma 4 E2B draft without PLE / shared KV. Every layer is
 // attention (KM bit l: global), then the MLP. Per layer, its tiles: [qkv Hc x NQ][o QO x Hc][gate|up Hc x 2Ic]
 // [down Ic x Hc] (f16 bits). Sliding: NQ = QhS DcS q + DcS k + DcS v, QO = QhS DcS. Global (attention_k_eq_v):
 // NQ = QhG DcG q + DcG raw k (CY makes v = v_norm(raw k)), QO = QhG DcG. QhS / QhG per kind: the global kv head
@@ -7,7 +11,7 @@
 // Deferred norms (as the draft): a hidden-input phase's row multicast is [a | b | 4 sums]; the matvec runs on both.
 // Caches: one a layer; sliding a ring of NES entries a row (window / PYW), global NEG entries (context NEG PYW).
 // v is stored normalised: |v|^2 rides the scores segment with |k|^2.
-// Levers (scratch/split/gemma12/README.md 3): XCH (1) the exp in chunks of the matvec buffer and the scores
+// Levers: XCH (1) the exp in chunks of the matvec buffer and the scores
 // written straight into sx (y / y16 no longer sized by Qh NE).
 param memcpy_params;
 param DIAG: u16 = 0;   // 1: no layers (handoffs, head, I/O, the KVS line and its log)

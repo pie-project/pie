@@ -1,6 +1,7 @@
-// split/head_g12.csl: head_pe.csl with TIED 1 (Gemma 4 12B, tied embeddings): the embedding row of the winner is
-// read from the head tile itself (dim-major f16 [HDc][VR]: stride VR) and widened by @fh2s; no hemb copy.
-// split/head_pe.csl: the role-split layout's head weight PE (scratch/split/README.md 3.4).
+// split/head_g12.csl: EXPERIMENTAL, not runnable (links on a 4 x 4 harness only; see weight_g12.csl).
+// head_pe.csl with TIED 1 (Gemma 4 12B, tied embeddings): the embedding row of the winner is read from the
+// head tile itself (dim-major f16 [HDc][VR]: stride VR) and widened by @fh2s; no hemb copy.
+// The rest as head_pe.csl (an earlier copy of it):
 // The head block is HC columns of HDc hidden dims (plus a control column, head_ctl.csl, in the
 // middle) by rows of VR vocabulary rows. A head PE holds its VR x HDc tile of lm_head (f16 bits,
 // row-major [dim][vocab row]) and the final norm's (1 + w) for its dims, takes x's dims (the

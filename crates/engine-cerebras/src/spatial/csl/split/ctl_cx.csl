@@ -1,19 +1,36 @@
-// split/ctl_cx.csl: the role-split layout's row control PE (CX_r; scratch/split/README.md).
+// split/ctl_cx.csl: the role-split row control PE (CX_r). Design and build: spatial/split/README.md.
 //
-// One a unit row, at the middle column: the root of the row reductions (o-proj and down
-// partials of the row's weight PEs, the two halves merged word by word through a FIFO and
-// taken back over a loop-back colour), the row's x chunk (Hc f32), the residuals, the
-// RMSNorm gamma (x rounded to f16 times the f16 gamma: TRM 512's form; the rms scale is
-// applied by CY after the column reduction, from the sum of squares sent here), and the
-// unit handoff of x (in from the unit before, out to the next).
-// A layer: x_r g1 (+ ssq) multicast; o-proj reduction in -> x += o; x g2 (+ ssq) multicast;
-// down reduction in -> x += d; (next layer). The pass ends with x sent on.
+// Role. One a unit row, on the unit's middle column: the row's x chunk (Hc f32), the residuals,
+// the RMSNorm gammas, the root of the row reductions (the o_proj / out_proj and down partials of
+// the row's weight PEs: both halves merged word by word through a FIFO and taken back over a
+// loop-back colour), and the unit handoff of x (in from the unit before, out to the next).
+// A layer: x g1 multicast (then x's sum of squares: CY applies the rms scale after the column
+// reduction); o reduction in -> x += o; x g2 multicast (+ sum of squares); down reduction in ->
+// x += d. The pass ends with x sent on. In the wafer token loop, unit 0's CX rows take the next
+// token's embedding chunk (iq6) instead of the host's x after the first step.
+//
+// Interface. Exports x (f32 [Hc]), gam (f16 [layer][g1 | g2][Hc], the host's 1 + w), xdbg / xred
+// (XKEEP 1: x after each layer, each reduction's sum), rcfg, tdbg (always on: the pass start, each
+// layer's end, after x out), init, compute(steps, start_pos).
+// rcfg (geo.rs rcfg_cx): [0] routes n, [1..1+2n); from RQ: [0..4) iq2..iq5, [4..7) oq2..oq4,
+// [7] flags (bit 0 the first unit: x from the host; bit 1 no handoff out; bit 2 the embedding
+// return of the token loop), [8] the spare colour, [9] iq6.
+// Queues: iq2 / iq3 the west / east halves' level-2 streams, oq2 their merge on the loop-back
+// colour, iq4 its return; oq3 the row multicast; iq5 / oq4 the handoff in / out; iq6 the token
+// loop's embedding chunk.
+//
+// Params. Shape: K, Hc. Levers (default = the shipped 9B build): SSQL 1, XG16 0 (1: x g in f16,
+// TRM 512's form; it flips a near tie on the 9B golden). Diagnostics (default off): XKEEP, DIAG,
+// HOSTX (simulator tests: x is the host's, no handoff). FIFOW: the FIFO depth.
 param memcpy_params;
 param DIAG: u16 = 0;   // 1 (diagnostics): no layers (handoffs, head and I/O only)
 param K: u16;          // layers on the unit
 param Hc: u16;         // x dims a row
 param HOSTX: u16 = 0;  // 1 (simulator tests): x is the host's (memcpy), no handoff
-param XG16: u16 = 1;   // 1: f16(x) f16(g) in f16 (TRM 512); 0: x g in f32
+param XG16: u16 = 0;   // 1: f16(x) f16(g) in f16 (TRM 512); 0: x g in f32
+param SSQL: u16 = 1;   // 1: x g goes first, the sum of squares (only CY needs it, after the column reduction) last
+param XKEEP: u16 = 0;  // 1 (diagnostics): copies of each reduction's sum (xred) and of x after each layer (xdbg)
+param FIFOW: u16 = 32; // the reductions' FIFO depth (words)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
@@ -32,7 +49,6 @@ var xdbg = @zeros([K * Hc]f32);   // x after each layer of the last pass (diagno
 var xdbg_ptr: [*]f32 = &xdbg;
 var xred = @zeros([2 * K * Hc]f32);   // each row reduction's sum of the last pass (diagnostics)
 var xred_ptr: [*]f32 = &xred;
-param XKEEP: u16 = 1;   // 0: no diagnostic copies of the reductions (xred) and of x after each layer (xdbg)
 fn keep_red(i: u16) void { if (XKEEP == 0) { return; } @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |j|{2 * K * Hc} -> xred[j] }), @as(i16, i * Hc), f32), Hc), t_d); }
 var gam = @zeros([2 * K * Hc]@fp16());   // [layer][g1 | g2], the host's f16 gammas (1 + w)
 var gam_ptr: [*]@fp16() = &gam;
@@ -44,8 +60,7 @@ const t1_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc + 1} -> t[i] });
 const th_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> th[i] });
 var g_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> gam[i] });
 
-// iq2 / iq3: the west / east halves' level-2 streams; oq2 the merge out on the loop-back
-// colour, iq4 its return; oq3 the row multicast; iq5 / oq4 the handoff in / out.
+// (queues: see the header)
 const q_w = @get_input_queue(2);
 const q_e = @get_input_queue(3);
 const q_lb = @get_input_queue(4);
@@ -57,7 +72,6 @@ const q_ho = @get_output_queue(4);
 const C_PARK: color = @get_color(16);
 const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
-param FIFOW: u16 = 32;
 var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
 fn fout(comptime q: output_queue, n: u16) fabout_dsd {
@@ -67,12 +81,10 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
   return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
 }
 
-// rcfg (host): [0] routes n, [1..1+2n) (colour, low route byte), [RQ..RQ+7) queue colours
-// (iq2..iq5, oq2..oq4), [RQ+7] flags (bit 0 first unit: x from the embedding / host,
-// bit 1: no handoff out (a test's last unit); runtime, so every unit shares the image).
+// rcfg: see the header (runtime words, so every unit shares the image)
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 10]u32);   // [RQ+8] the spare colour, [RQ+9] iq6's colour
+var rcfg = @zeros([RQ + 10]u32);
 var rcfg_ptr: [*]u32 = &rcfg;
 fn iqc(comptime qid: u16, c: u32) void {
   const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
@@ -139,7 +151,6 @@ fn reduce() void {
   @fmovs(t_d, fin(q_lb, Hc));
 }
 // x g (f16) and the sum of squares of x, multicast along the row (Hc + 1 f32 words).
-param SSQL: u16 = 1;   // 1: x g goes first, the sum of squares (only CY needs it, after the column reduction) last
 fn norm_send(gi: u16) void {
   var ss: f32 = 0.0;
   var i: u16 = 0;

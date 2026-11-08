@@ -1,26 +1,41 @@
-// split/head_pe.csl: the role-split layout's head weight PE (scratch/split/README.md 3.4).
-// The head block is HC columns of HDc hidden dims (plus a control column, head_ctl.csl, in the
-// middle) by rows of VR vocabulary rows. A head PE holds its VR x HDc tile of lm_head (f16 bits,
-// row-major [dim][vocab row]) and the final norm's (1 + w) for its dims, takes x's dims (the
-// last unit's CX rows reach the head by row paths; see relays), and sends its VR logit partials
-// into its row's reduction toward the control column. The final norm's rsqrt is a positive
-// scalar of the token: greedy argmax does not need it.
-// x input roles (rcfg): 0 take the column multicast (HDc words); 1 relay A: take the odd CX
-// row's HDc / 2 words (HX) and send them north (HN); 2 relay B: take the even row's half (HX)
-// and A's half (HN), multicast the HDc words down and up the column (HM), keep them.
-// x is used in NPX f16 parts (x = p0 + p1 + ...) with f32 accumulation (@fmachs).
+// split/head_pe.csl: the role-split head weight PE. Design and build: spatial/split/README.md.
+//
+// Role. The head block is HC columns of HDc hidden dims (plus a control column, head_ctl.csl, in
+// the middle) by HR rows of VR vocabulary rows each. A head PE holds its VR x HDc tile of lm_head
+// (f16 bits, [dim][vocab row]) and the final norm's (1 + w) for its dims, takes x's dims (the last
+// unit's CX rows reach the head by row paths and relays), and sends its VR logit partials into its
+// row's reduction toward the control column. The final norm's rsqrt is a positive scalar of the
+// token: the greedy argmax does not need it (the host applies it to `lgt` rows).
+// x input roles (rcfg): 0 take the column multicast (HDc words); 1 relay A: take the odd CX row's
+// HDc / 2 words (HX) and send them north (HN); 2 relay B: take the even row's half (HX) and A's
+// half (HN), multicast the HDc words down and up the column (HM), keep them.
 // The wafer token loop (rcfg flags bit 0): the PE also holds its VR x HDc tile of the embedding
 // (bf16 bits, [vocab row][dim]). After the logits, every PE takes its row's word from the control
 // PE (iq7): the winner's offset j (this is the winner row), -(1 + the winner's row), or < -1e8 (a
 // launch's last step: nothing). The winner row's PEs send row j of their tile (widened to f32)
-// north on VA (their VA route switched to their ramp for it, restored at the next step) to row 0,
-// which sends it south on VS to the column's CX row pair (te = unit 0's CX row 2c, to = 2c + 1);
-// te sends the first half west on HE and the second on HS to `to`, which sends it west on HE.
-// Row 0 of column 0 is te itself (VA ends there).
+// north on VA (their VA route switched to their ramp for it) to row 0, which sends it south on VS
+// to the column's CX row pair (te = unit 0's CX row 2c, to = 2c + 1); te sends the first half west
+// on HE and the second on HS to `to`, which sends it west on HE. Row 0 of column 0 is te itself.
+// The VA route goes back only after oq4 has drained and the next step's x is in (restoring it
+// right after the send stranded the slice's tail and hung the next winner's column on the CS-3).
+//
+// Interface. Exports hw (u16 lm_head tile), hg (f32 1 + w), hemb (u16 embedding tile), rcfg, tdbg
+// (always on: start, x in, matvec done, partial sent, loop phase done), init, compute.
+// rcfg (geo.rs rcfg_head): from RQ: [0..5) iq2..iq6, [5] oq2, [6] oq3, [7] the row role, [8] the x
+// role, [9] the spare colour, [10] iq7, [11] loop flags (bit 0 on, 1 the VA sink, 2 te, 3 to),
+// [12] the head row, [13..17) oq4..oq7.
+// Queues: iq2 / iq3 the row reduction's inputs (level 1 / FIFO end), iq4 HX, iq5 HN, iq6 HM, iq7 the
+// row word; oq2 the row reduction's send, oq3 HN / HM, oq4 VA, oq5 VS, oq6 HE, oq7 HS.
+//
+// Params. VR, HDc (shape). NPX: x in NPX f16 parts (x = p0 + p1 + ...) with f32 accumulation (1:
+// the shipped build; 2 the exact-x form). HACC16 (measurement, default off): the partials
+// accumulate in f16 (@fmach) and widen once (-1.7k cycles a token on the 9B, but it halves the
+// golden's tightest margin).
 param memcpy_params;
 param VR: u16;
 param HDc: u16;
-param NPX: u16 = 2;
+param NPX: u16 = 1;    // x's f16 parts
+param HACC16: u16 = 0; // 1 (measurement): the logit partials accumulate in f16 (y16), then widen once
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
@@ -42,8 +57,7 @@ const xp_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> xp[i] });
 const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> y[i] });
 var a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> hw[i] });
 
-// iq2 / iq3: the row reduction's inputs (level 1 / FIFO end), iq4 HX, iq5 HN, iq6 HM; oq2 the
-// row reduction's output, oq3 HN / HM.
+// (queues: see the header)
 const q_ra = @get_input_queue(2);
 const q_rb = @get_input_queue(3);
 const q_hx = @get_input_queue(4);
@@ -69,8 +83,7 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
 }
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 17]u32);   // [RQ..RQ+7) iq2..iq6, oq2, oq3; [RQ+7] row role; [RQ+8] x role; [RQ+9] spare;
-// [RQ+10] iq7, [RQ+11] loop flags (bit 0 on, 1 the VA sink, 2 te, 3 to), [RQ+12] the row, [RQ+13..17) oq4..oq7
+var rcfg = @zeros([RQ + 17]u32);   // (see the header)
 var rcfg_ptr: [*]u32 = &rcfg;
 var role_r: u16 = 0;
 var role_x: u16 = 0;
@@ -146,7 +159,6 @@ const mv_src0 = @get_dsr(dsr_src0, 1);
 const mv_src1 = @get_dsr(dsr_src1, 1);
 fn mvs_step(xv: @fp16()) void { @fmachs(mv_dest, mv_src0, mv_src1, xv); }
 fn mvh_step(xv: @fp16()) void { @fmach(mv_dest, mv_src0, mv_src1, xv); }
-param HACC16: u16 = 0;   // 1: the logit partials accumulate in f16 (y16), then widen once
 var y16 = @zeros([if (HACC16 == 1) VR else 1]@fp16());
 const yh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (HACC16 == 1) VR else 1} -> y16[i] });
 
@@ -187,8 +199,7 @@ var va_dirty = false;
 var ww = @zeros([1]f32);
 const ww_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> ww[i] });
 // (a send returns when its wavelets enter the output queue, not when they leave: the route goes back
-// only once oq4 is empty, and only after the next step's x is in, ~a pass later; restoring right
-// after the send stranded the tail of the slice on the CS-3 and hung the next winner's column, 0738)
+// only once oq4 is empty, and only after the next step's x is in, ~a pass later)
 fn va_restore() void {
   if (!va_dirty) { return; }
   while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}   // oq4 empty

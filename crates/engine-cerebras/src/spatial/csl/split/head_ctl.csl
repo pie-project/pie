@@ -1,23 +1,45 @@
-// split/head_ctl.csl: the role-split head's control PE (one a head row, the head's middle
-// column): the root of its row's logit reduction (both halves at once through a FIFO, back
-// over a loop-back colour), then the row's argmax over its VR vocabulary rows: res = [max,
-// the winning vocabulary id (f32 of the integer), passes] for the host (first version: the
-// host takes the max over rows and feeds the embedding; the on-wafer max-reduce and embedding
-// gather are the next step).
-// The wafer token loop (rcfg WL 1): the rows' (max, id) are max-reduced down this column (two-level
-// chains, root at the middle row; ties to the lower id, as the host's argmax); the root keeps the
-// winner in `ring` (one a step) and multicasts it up and down the column; every row then sends its
-// head PEs one word on the row multicast: the winner's offset in its row (the winner row), else
-// -(1 + the winner's row), or -1e9 on a launch's last step (no embedding goes out).
+// split/head_ctl.csl: the role-split head's control PE (one a head row, the head's middle column).
+// Design and build: spatial/split/README.md.
+//
+// Role. The root of its row's logit reduction (both halves at once through a FIFO, back over a
+// loop-back colour), then the row's argmax over its VR vocabulary rows: res = [max, the winning
+// vocabulary id (f32 of the integer), passes] and lgt (the row's VR logits of the last step) for
+// the host. With the wafer token loop on (rcfg WL 1), the rows' (max, id) are max-reduced down
+// this column (two-level chains, root at the middle row; ties to the lower id, as the host's
+// argmax); the root records the winner in `ring` (one a step), takes `force[s]` instead for the
+// first `nforce` steps (a prompt and the decode loop in one launch), and multicasts the winner up
+// and down the column; every row then sends its head PEs one word on the row multicast: the
+// winner's offset in its row (the winner row), else -(1 + the winner's row), or -1e9 on a launch's
+// last step (no embedding goes out).
+//
+// Interface. Exports ring (u32 [CAP]), force (u32 [CAP]), nforce (u32), lgt (f32 [VR]), res,
+// tdbg (always on: [0] pass start, [1] after the argmax, [2 + s] the root's winner of step s < 64
+// (consecutive differences = the token loop's cycles), [66..70) the last step's reduction in,
+// argmax, max-reduce done, row word out), rcfg, init, compute(steps, start_pos).
+// rcfg (geo.rs rcfg_hctl): from RQ: [0..3) iq2..iq4, [3] oq2, [4] this row's first vocabulary id,
+// [5] the spare colour, [6..9) iq5..iq7, [9] oq3, [10] oq4, [11] the max-reduce role, [12] WL.
+// Queues: iq2 / iq3 the row reduction's halves, oq2 / iq4 the loop-back merge; iq5 / iq6 the
+// max-reduce's level-1 / level-2 inputs (a root: its low / high half), iq7 the winner multicast,
+// oq3 the chain's send (the root: the winner multicast), oq4 the row word.
+//
+// Params. VR (vocabulary rows a head row), CAP (ring and force length), VARG (2: block maxima of
+// 8 and a two-level first-match scan; 0: the scalar scan; both give the first maximum), FIFOW.
+// Diagnostics (default off): WFORCE != 0 makes the root's winner (s WFORCE + 7) % (VR WFN), a
+// forced winner sequence that exercises every head row's return path.
 param memcpy_params;
 param VR: u16;
+param VARG: u16 = 2;    // the row argmax: 2 block maxima + a two-level first-match scan (VR % 8 == 0); 0 scalar
+param CAP: u16 = 256;   // the ring / force length (steps a launch)
+param WFORCE: u32 = 0;  // (diagnostics) != 0: the root's winner is (s WFORCE + 7) % (VR WFN), not the argmax
+param WFN: u32 = 1;
+param FIFOW: u16 = 32;  // the reduction's FIFO depth (words)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
 const timestamp = @import_module("<time>");
-var tdbg = @zeros([2 + 64 + 4]u32);   // + [66..70): the last step's row reduction in, argmax, max-reduce done, row word out   // TSC: the pass start, after the argmax; the max-reduce root: each step's winner (2 + s)
+var tdbg = @zeros([2 + 64 + 4]u32);   // TSC stamps (see the header)
 var tdbg_ptr: [*]u32 = &tdbg;
 var tsc = @zeros([3]u16);
 fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
@@ -25,7 +47,6 @@ fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]
 var t: [VR]f32 align(16) = @zeros([VR]f32);
 const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> t[i] });
 var t_ptr: [*]f32 = &t;           // "lgt": the row's VR logits of the last step (the host's full-logits path)
-param VARG: u16 = 2;   // 2: block maxima of 8 + a two-level first-match scan; 1: the tree + a full scan   // 1: the row argmax as vector maxes + a first-match scan
 var tm: [VR]f32 align(16) = @zeros([VR]f32);
 const tm_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> tm[i] });
 var bm = @zeros([VR / 8 + 1]f32);
@@ -44,7 +65,6 @@ const q_wo = @get_output_queue(3);   // the chain's send (the root: the winner m
 const q_ww = @get_output_queue(4);   // the row word
 const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
-param FIFOW: u16 = 32;
 var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
 fn fout(comptime q: output_queue, n: u16) fabout_dsd {
@@ -55,8 +75,7 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
 }
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 13]u32);   // [RQ..RQ+4) iq2, iq3, iq4, oq2; [RQ+4] this row's first vocabulary id; [RQ+5] spare;
-// [RQ+6..9) iq5..iq7, [RQ+9] oq3, [RQ+10] oq4, [RQ+11] the max-reduce role, [RQ+12] WL
+var rcfg = @zeros([RQ + 13]u32);   // (see the header)
 var rcfg_ptr: [*]u32 = &rcfg;
 fn iqc(comptime qid: u16, c: u32) void {
   const addr = tile_config.input_queue_config.get_input_queue_config_addr(qid);
@@ -121,9 +140,6 @@ fn init() void {
 }
 
 // ---------------------------------------------------------------- the wafer token loop
-param CAP: u16 = 256;   // the ring (steps a launch); entries 0..63 as before
-param WFORCE: u32 = 0;   // (diagnostics) != 0: the root's winner is (s WFORCE + 7) % (VR WFN), not the argmax
-param WFN: u32 = 1;
 var ring = @zeros([CAP]u32);     // the root: the winner id of each step of the last launch
 var ring_ptr: [*]u32 = &ring;
 // "force" / "nforce" (host-written, the root): steps s < nforce[0] take force[s] as the next token instead of
@@ -200,20 +216,6 @@ task pass_task() void {
       var b: u16 = 0;
       while (b < NB and bm[b] != best) : (b += 1) {}
       j = 8 * b;
-      while (j < VR and t[j] != best) : (j += 1) {}
-      bi = if (j < VR) j else 0;
-      if (j >= VR) { best = t[0]; }   // (no match: NaNs)
-    } else if (VARG == 1) {
-      // the row max by a halving tree of vector maxes, then the first index holding it (= the scalar
-      // scan's first maximum)
-      @fmovs(tm_d, t_d);
-      var n: u16 = VR;
-      while (n > 1) : (n -= n / 2) {
-        const h = n / 2;
-        @fmaxs(@set_dsd_length(tm_d, h), @set_dsd_length(tm_d, h), @set_dsd_length(@increment_dsd_offset(tm_d, @as(i16, n - h), f32), h));
-      }
-      best = tm[0];
-      j = 0;
       while (j < VR and t[j] != best) : (j += 1) {}
       bi = if (j < VR) j else 0;
       if (j >= VR) { best = t[0]; }   // (no match: NaNs)

@@ -1,18 +1,35 @@
-// split/ctl_cy_q35.csl: the role-split layout's column control PE for Qwen3.5 (CY_c;
-// scratch/split/README.md section 3). One a unit column, at the middle row: the root of the
-// column reductions of the column's weight PEs (split/weight_q35.csl) and all of the layer's
-// column-local element-wise work:
-// - GDN: rms scale; conv1d (CONV taps) and SiLU on the column's q / k / v channels; beta =
-//   sigmoid(b), decay = exp(-exp(A) softplus(a + dt)); multicast [k | q | decay]; from the
-//   state reduction delta = (v - S^T k / |k|) beta and o = (S^T q + delta (k.q) / |k|) / |q|
-//   (q pre-scaled by 1/sqrt(dk)); the gated RMSNorm (sums over the v head's columns by a
-//   segment all-reduce on the control row) times silu(z); multicast [o | delta / |k|].
+// split/ctl_cy_q35.csl: the role-split column control PE for Qwen3.5 (CY_c). Design and build:
+// spatial/split/README.md.
+//
+// Role. One a unit column, on the unit's middle row: the root of the column reductions of the
+// column's weight PEs (weight_q35.csl) and all of the layer's column-local element-wise work:
+// - GDN: rms scale; conv1d (CONV taps, the window a ring) and SiLU on the column's q / k channels,
+//   multicast [k | q | reset]; then (off the path) v / z / beta and the decay
+//   -exp(A) softplus(a + dt); from the state reduction delta = (v - S^T k / |k|) beta and
+//   o = (S^T q + delta (k.q) / |k|) / |q| (q pre-scaled by 1/sqrt(HK)); the gated RMSNorm (sums
+//   over the v head's columns by a segment all-reduce on the control row) times silu(z);
+//   multicast [o | delta / |k| | decay].
 // - attention: rms scale; the q/k norms' weights (their rms rides in the weight PEs' score
-//   segment all-reduce); partial RoPE from 4-level tables; multicast [q | k | v | slot];
-//   from the values reduction o / l, the sum's log-sum-exp step and the redo flag; o times
-//   sigmoid(gate); multicast [o | redo | steps].
-// - MLP: rms scale, SiLU(g) u, multicast act.
-// Kinds by layer: KM bit l (1 attention). Column dims per kind are params.
+//   segment all-reduce); partial RoPE from 4-level tables; multicast [q | k | v | position | the
+//   raw sums of squares]; from the values reduction o / l, the redo flag (a sum outside the f16
+//   probabilities' window) and the log-sum-exp steps; o times sigmoid(gate); multicast [o | redo |
+//   steps] (ATTL 2: the steps follow in a second multicast, off the path).
+// - MLP: rms scale, SiLU(g) u (SILU16 1: in f16, streamed into the multicast), multicast act.
+//
+// Interface. Exports cw (conv weights [layer][CONV][channel]), gpar ([A, dt] a GDN layer), gnw
+// (the gated norm's weights), qkw (q / k norm weights), rot (RoPE tables [4 levels][8][cos | sin]
+// [NROT]), tab (host: [position, ...]), rcfg, tdbg, init, compute(steps, start_pos).
+// rcfg (geo.rs rcfg_cy): [0] routes n, [1..1+2n) (colour, low route byte); from RQ: [0..4) iq2..iq5,
+// [4..7) oq2..oq4, [7] the segment role, [8] iq6, [9] iq7, [10] the spare colour.
+// Queues: iq2 / iq3 the column reduction's two halves, oq2 their merge on the loop-back colour,
+// iq4 its return; oq3 the column multicast; iq5 / oq4 the control row's segment all-reduce (the
+// o-norm sums), iq6 its multicast (non-roots), iq7 a two-half root's second half.
+// Hardware rules: as weight_q35.csl (own queue a flow, no transient duplicate colours, >= 768 B
+// stack room).
+//
+// Params. Shape: K, KM, NQA, NQG, Qh, Dc, DK, DV, Ic, HR (hidden), CONV, NROT, HK, HV. Levers
+// (default = the shipped 9B build): CONVQK 1, ATTV 1, GDEC 1, ROPEP 1, SILU16 1, SILUQ 1, ATTL 2
+// (0: the steps ride with o). Diagnostics (default off): TSTAMP, DIAG (as weight_q35.csl).
 param memcpy_params;
 param DIAG: u16 = 0;   // 1 (diagnostics): no layers (handoffs, head and I/O only)
 param K: u16;
@@ -29,6 +46,15 @@ param CONV: u16;       // conv kernel (4)
 param NROT: u16;       // rotated pairs a column (partial RoPE)
 param HK: u16 = 128;   // GDN head k dim (q scale 1/sqrt(HK))
 param HV: u16 = 128;   // GDN head v dim (the gated norm's mean)
+param CONVQK: u16 = 1; // 1: q / k's conv and SiLU before the multicast, v / z / beta after it, the window a ring
+param ATTV: u16 = 1;   // 1: attention's o / l times the gate as vector ops
+param GDEC: u16 = 1;   // 1: the decay scales the state reduction's sums here (see gdn_post)
+param ROPEP: u16 = 1;  // 1: the next position's RoPE tables after the multicast (one attention layer a unit)
+param SILU16: u16 = 1; // 1: the MLP's SiLU in f16 (silu16)
+param SILUQ: u16 = 1;  // 1: the lean f32 SiLU for GDN's q / k and v | z (same results as vsilu)
+param ATTL: u16 = 2;   // 2: the log-sum-exp steps in a second multicast after o (off the path); 0: with o
+param TSTAMP: u16 = 0; // 1 (diagnostics): phase stamps into tdbg (on the critical path)
+param FIFOW: u16 = 32; // the reduction's FIFO depth (words)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
@@ -39,7 +65,6 @@ const timestamp = @import_module("<time>");
 var tdbg = @zeros([NTD]u32);   // TSC stamps of the last pass, by phase (host-read, diagnostics)
 var tdbg_ptr: [*]u32 = &tdbg;
 var tsc = @zeros([3]u16);
-param TSTAMP: u16 = 1;   // 0: the phase stamps compile out (off the critical path; tdbg reads zeros)
 fn stamp(i: u16) void { if (TSTAMP == 0) { return; } timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
 
 fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
@@ -83,9 +108,7 @@ var rot_ptr: [*]f32 = &rot;
 var tab_ptr: [*]u32 = &tab;
 
 // ---------------------------------------------------------------- fabric
-// iq2 / iq3 the column reduction's two halves, oq2 their merge on the loop-back colour,
-// iq4 its return; oq3 the column multicast; iq5 / oq4 the control row's segment
-// all-reduce (GDN's o-norm sums).
+// (queues: see the header)
 const q_n = @get_input_queue(2);
 const q_s = @get_input_queue(3);
 const q_lb = @get_input_queue(4);
@@ -98,7 +121,6 @@ const q_so = @get_output_queue(4);
 const C_PARK: color = @get_color(16);
 const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
-param FIFOW: u16 = 32;
 var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
 fn fout(comptime q: output_queue, n: u16) fabout_dsd {
@@ -173,7 +195,6 @@ fn init() void {
   vinit2();
   var g: u16 = 0;
   while (CONVQK == 1 and g < NLG) : (g += 1) { gpar[2 * g] = -exp1(gpar[2 * g]); }
-  
   sys_mod.unblock_cmd_stream();
 }
 
@@ -224,16 +245,6 @@ fn exp1(x0: f32) f32 {
   const s = @bitcast(f32, @as(u32, @as(u16, ki)) << 23);
   return p * s;
 }
-// ATTL 1: the softmax sums go out raw (the weight PEs take their logs off the path) and 1 / l takes two
-// Newton steps (o goes to f16)
-param ATTL: u16 = 1;
-fn rsqrt2(v: f32) f32 {
-  var y = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
-  y = y * (1.5 - 0.5 * v * y * y);
-  y = y * (1.5 - 0.5 * v * y * y);
-  return y;
-}
-fn recip2(v: f32) f32 { const a = if (v < 0.0) -v else v; const r = rsqrt2(a); return if (v < 0.0) -(r * r) else r * r; }
 fn recip(v: f32) f32 { const a = if (v < 0.0) -v else v; const r = rsqrt(a); return if (v < 0.0) -(r * r) else r * r; }   // (not rsqrt(v v): v v overflows past 1.8e19, e.g. 1 + e^87 in a sigmoid)
 fn sigm(x: f32) f32 { return recip(1.0 + exp1(-x)); }
 fn silu(x: f32) f32 { return x * sigm(x); }
@@ -314,9 +325,8 @@ fn vsilu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
 }
 
 // dst = silu(src), the lean form (SILUQ 1): e = exp(-|x|) (the sign bit set by one or16 on the high
-// halves, a lower clamp only), 1 / (1 + e) by the quadratic and one Newton step (~1e-4), no copies
-param SILUQ: u16 = 1;
-param SILUQN: u16 = 2;   // Newton steps (2: bit-identical to vsilu; 1 flipped golden3's token 146 with HACC16, 0744)
+// halves, a lower clamp only), 1 / (1 + e) by the quadratic and two Newton steps: vsilu's arithmetic
+// (bit-identical results; one step, ~1e-4, flipped a near tie on the 9B golden), fewer copies
 var vah = vk_d;
 fn vinit2() void { vah = @increment_dsd_offset(@set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, &va)), 2), 1, u16); }
 fn vsiluq(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
@@ -349,7 +359,7 @@ fn vsiluq(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
   @fmuls(r, r, x);
   @fadds(r, r, 2.1207294161729284);         // 1 / d to 1%
   var k: u16 = 0;
-  while (k < SILUQN) : (k += 1) {           // Newton: 1 step ~1e-4, 2 steps = vsilu's arithmetic
+  while (k < 2) : (k += 1) {                // Newton: two steps (vsilu's)
     @fmuls(dst, x, r);
     @fsubs(dst, 2.0, dst);
     @fmuls(r, r, dst);
@@ -424,8 +434,6 @@ fn gdn_pre0(g: u16) f32 {
   @fmovs(zd, uv(0, DV));
   return bt;
 }
-param CONVQK: u16 = 1;   // 1: q / k's conv and SiLU before the multicast, v / z / beta after it, the window a ring
-param ATTV: u16 = 1;     // 1: attention's o / l times the gate as vector ops
 fn gdn(g: u16) void {
   const bt = if (CONVQK == 1) gdn_pre1(g) else gdn_pre0(g);
   gdn_post(g, bt);
@@ -457,7 +465,6 @@ fn gdn_pre1(g: u16) f32 {
 }
 // GDEC 1: the weight PEs send S^T k / S^T q of the undecayed state; the decay scales the sums here and
 // rides at the end of the second multicast for the state update (S = dec S + k delta / |k|)
-param GDEC: u16 = 1;
 var gdec: f32 = 1.0;
 fn gdn_post(g: u16, bt: f32) void {
   const zd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vz[@as(i16, DV) + i] }), DV);
@@ -492,7 +499,6 @@ fn gdn_post(g: u16, bt: f32) void {
   stamp(1 + 6 * cl + 3);
 }
 
-param ROPEP: u16 = 1;   // 1: the tables for the next position are computed after the multicast (off the path)
 var rope_at: u32 = 0xffffffff;   // the position rc / rs hold
 fn rope_tables() void { rope_tables_at(tab[0]); }
 fn rope_tables_at(p: u32) void {
@@ -572,7 +578,7 @@ fn att(a: u16) void {
     while (h < Qh) : (h += 1) {
       const l = t[h * (Dc + 1) + Dc];
       if (l < 0.00390625 or l >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
-      ilh[h] = if (ATTL == 1) recip2(l) else recip(l);   // (ATTL 2 keeps recip's three steps: exact)
+      ilh[h] = recip(l);
       if (ATTV == 0) {
         var d: u16 = 0;
         while (d < Dc) : (d += 1) { u[h * Dc + d] = t[h * (Dc + 1) + d] * ilh[h] * gate[h * Dc + d]; }
@@ -590,7 +596,7 @@ fn att(a: u16) void {
     h = 0;
     while (h < Qh) : (h += 1) {
       const lh = t[h * (Dc + 1) + Dc];
-      u[QD + 1 + h] = if (ATTL == 1) lh else if (ATTL == 2 and bad == 0.0) 0.0 else ln1(lh);
+      u[QD + 1 + h] = if (ATTL == 2 and bad == 0.0) 0.0 else ln1(lh);
     }
     u[QD] = bad;
     mcast(QD + 1 + Qh);
@@ -604,9 +610,8 @@ fn att(a: u16) void {
   }
 }
 
-// The MLP's SiLU in f16 (sf16's silu16, the f32-scaled form: s g log2e and s u ln2 in f32,
-// rounded once; emu/tf9.py's _s16 mode: 0 TF mismatches over golden3's 256)
-param SILU16: u16 = 1;
+// The MLP's SiLU in f16 (silu16, the f32-scaled form: s g log2e and s u ln2 in f32, rounded once;
+// tools/emu/silu16.py emulates it bit for bit, tools/emu/tf_q35.py's _s16 mode)
 var hg = @zeros([2 * Ic]@fp16());   // G | U
 var ht = @zeros([Ic]@fp16());
 var hm = @zeros([Ic]@fp16());
