@@ -17,6 +17,7 @@
 pub mod geo;
 pub mod npy;
 pub mod place;
+pub mod prep;
 
 use std::path::{Path, PathBuf};
 
