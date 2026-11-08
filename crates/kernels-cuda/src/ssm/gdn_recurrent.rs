@@ -96,21 +96,48 @@ fn fused_fits(shape: &Delta, state: &RecurrentPool, qkv: Tensor, y: &Tensor) -> 
 /// blocks an SM at most).
 const FUSED_WARPS: u32 = 4;
 
+/// Warps per block of the fused step where the SM's shared memory seats two
+/// four-warp blocks (100 KiB: A40, L40S): the same eight warps in one block,
+/// which streams the eight value tiles of a head's state rows together where
+/// two blocks each streamed half of every row. Qwen3.8-27B's mini at 128
+/// rows on an A40: 818 to 780 us a step of a layer.
+const FUSED_WARPS_WIDE: u32 = 8;
+
 /// The bytes one warp's stage of the fused step streams: its state tile, the
 /// q and k rows, its value slice and the two gates.
 const FUSED_STAGE: u32 = 4096 + 512 + 32 + 32;
 
-/// The fused step's shared memory a block, double-buffered.
-const FUSED_SMEM: u32 = FUSED_WARPS * 2 * FUSED_STAGE;
+/// The shared memory the runtime keeps a block.
+const BLOCK_RESERVED: u32 = 1024;
 
-/// The fused step's blocks one SM seats: `most`, or fewer where the SM's
-/// shared memory (less the 1 KiB the runtime keeps a block) holds fewer.
-fn fused_blocks_per_sm(smem_per_sm: Option<u32>, most: u32) -> u32 {
-    const RESERVED: u32 = 1024;
+/// The fused step's shared memory a block of `warps`, double-buffered.
+const fn fused_smem(warps: u32) -> u32 {
+    warps * 2 * FUSED_STAGE
+}
+
+/// The fused step's blocks of `warps` one SM seats: `most`, or fewer where
+/// the SM's shared memory (less the 1 KiB the runtime keeps a block) holds
+/// fewer.
+fn fused_blocks_per_sm(smem_per_sm: Option<u32>, most: u32, warps: u32) -> u32 {
     let most = most.max(1);
     smem_per_sm.map_or(most, |bytes| {
-        (bytes / (FUSED_SMEM + RESERVED)).clamp(1, most)
+        (bytes / (fused_smem(warps) + BLOCK_RESERVED)).clamp(1, most)
     })
+}
+
+/// The fused step's warps a block and blocks an SM: four-warp blocks, or
+/// one eight-warp block where the SM's shared memory holds just two of them.
+fn fused_seats(smem_per_sm: Option<u32>, most: u32) -> (u32, u32) {
+    let blocks = fused_blocks_per_sm(smem_per_sm, most, FUSED_WARPS);
+    let fits_wide = smem_per_sm.is_some_and(|bytes| {
+        bytes / (fused_smem(FUSED_WARPS_WIDE) + BLOCK_RESERVED) >= 1
+            && bytes / (fused_smem(FUSED_WARPS) + BLOCK_RESERVED) == 2
+    });
+    if blocks == 2 && fits_wide {
+        (FUSED_WARPS_WIDE, 1)
+    } else {
+        (FUSED_WARPS, blocks)
+    }
 }
 
 impl Delta {
@@ -135,13 +162,17 @@ impl Delta {
                     format!("{} rows of value tiles overflow a grid", self.n),
                 )
             })?;
-        let blocks = tiles
-            .div_ceil(FUSED_WARPS)
-            .min(sms * fused_blocks_per_sm(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks));
+        let (warps, per_sm) = fused_seats(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks);
+        let blocks = tiles.div_ceil(warps).min(sms * per_sm);
+        let entrypoint = if warps == FUSED_WARPS_WIDE {
+            "::pie::ssm::gdn_step_fused<8>"
+        } else {
+            "::pie::ssm::gdn_step_fused<4>"
+        };
         ctx.fire(
             op,
-            Fire::at(kernel(GDN_RECURRENT, "::pie::ssm::gdn_step_fused<4>"))
-                .apply(Launch::grid([blocks, 1, 1], [32 * FUSED_WARPS, 1, 1]).smem(FUSED_SMEM)),
+            Fire::at(kernel(GDN_RECURRENT, entrypoint))
+                .apply(Launch::grid([blocks, 1, 1], [32 * warps, 1, 1]).smem(fused_smem(warps))),
             &[
                 qkv.arg(),
                 gates.arg(),
@@ -169,15 +200,19 @@ mod tests {
     use super::*;
 
     /// Four blocks of the fused step where the SM holds them, as on a B200
-    /// (228 KiB) or an A100 (164 KiB); two on a 100 KiB SM; the profile's
-    /// fewer where it asks (A100's three).
+    /// (228 KiB) or an A100 (164 KiB); one block of eight warps on a 100 KiB
+    /// SM, which holds two of four; the profile's fewer where it asks
+    /// (A100's three).
     #[test]
     fn the_fused_step_seats_what_the_sm_holds() {
-        assert_eq!(fused_blocks_per_sm(Some(233_472), 4), 4);
-        assert_eq!(fused_blocks_per_sm(Some(167_936), 4), 4);
-        assert_eq!(fused_blocks_per_sm(Some(102_400), 4), 2);
-        assert_eq!(fused_blocks_per_sm(Some(16_384), 4), 1);
-        assert_eq!(fused_blocks_per_sm(None, 4), 4);
-        assert_eq!(fused_blocks_per_sm(Some(167_936), 3), 3);
+        assert_eq!(fused_seats(Some(233_472), 4), (4, 4));
+        assert_eq!(fused_seats(Some(167_936), 4), (4, 4));
+        assert_eq!(fused_seats(Some(102_400), 4), (8, 1));
+        assert_eq!(fused_seats(Some(102_400), 3), (8, 1));
+        assert_eq!(fused_seats(Some(102_400), 1), (4, 1));
+        assert_eq!(fused_seats(Some(16_384), 4), (4, 1));
+        assert_eq!(fused_seats(None, 4), (4, 4));
+        assert_eq!(fused_seats(Some(167_936), 3), (4, 3));
+        assert_eq!(fused_seats(Some(167_936), 2), (4, 2));
     }
 }

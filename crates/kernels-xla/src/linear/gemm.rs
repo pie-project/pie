@@ -170,12 +170,36 @@ fn dense(
     Ok((m, n, k))
 }
 
+/// Rows a product against a weight of at least [`WIDE_WEIGHT_BYTES`] is
+/// padded to when it has fewer.
+const MXU_ROWS: i64 = 8;
+
+/// A weight this big is read from HBM by its product, not staged in VMEM
+/// ahead of it.
+const WIDE_WEIGHT_BYTES: i64 = 64 << 20;
+
 /// `act · wᵀ` in f32, `[y.rows, w.rows]`.
+///
+/// A one-row product is a vector against the matrix, which XLA rewrites as a
+/// multiply and a reduce: from VMEM (a weight staged there ahead of it) that
+/// runs at its rate, but against a weight read from HBM it streams at ~440
+/// GB/s (v6e, Gemma-4's [262144, 2816] lm head: 3.4 ms of a 9.5 ms decode
+/// step), a third of what the MXU's dot reads it at. Fewer than
+/// [`MXU_ROWS`] rows against a weight of at least [`WIDE_WEIGHT_BYTES`] are
+/// padded with zero rows, so the product stays a dot, and cut back after.
 fn dense_f32(f: &mut Func, act: Operand, w: Operand, rows: u32) -> Result<Val, Error> {
     let x = act.val;
     let x = head_rows(f, x, rows)?;
     let wv = w.val;
-    project(f, x, wv, false)
+    let m = i64::from(rows);
+    let wbytes = f.ty(wv).elements() * i64::from(f.elem(wv).bits()) / 8;
+    if m >= MXU_ROWS || wbytes < WIDE_WEIGHT_BYTES {
+        return project(f, x, wv, false);
+    }
+    let zero = f.const_f(f.elem(x), 0.0, &[]);
+    let xp = f.pad(x, zero, &[0, 0], &[MXU_ROWS - m, 0], &[0, 0])?;
+    let y = project(f, xp, wv, false)?;
+    Ok(f.slice_axis(y, 0, 0, m)?)
 }
 
 pub fn matmul(f: &mut Func, act: Operand, w: Operand, y: Landing) -> Result<Option<Val>, Error> {
