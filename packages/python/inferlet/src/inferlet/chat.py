@@ -20,7 +20,7 @@ template knowledge lives in the Pie runtime, not in the inferlet library.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
+from typing import Sequence, Union
 
 from wit_world.imports import chat as _chat
 from wit_world.imports.chat import (
@@ -57,10 +57,27 @@ def first_user(message: str) -> list[int]:
     return list(_chat.first_user(message))
 
 
-def system_user(system: str, user: str) -> list[int]:
-    """Token sequence for a system message followed by the first user turn,
-    the way the model's template spells that pair."""
-    return list(_chat.system_user(system, user))
+def open(  # noqa: A001 — the WIT name
+    system: str | None = None,
+    tools: Sequence[str] = (),
+    effort: str | None = None,
+) -> list[int]:
+    """The system turn a conversation opens with, as the model's template
+    writes it from the system message, the tools (JSON specs) and, for a
+    request the model answers with thinking, its reasoning ``effort``
+    (``"xhigh"``, the template's default, ``"medium"`` or ``"low"``). Some
+    templates fold the tools or the effort into the system turn, so this is
+    the one way to open with them."""
+    level = _chat.ReasoningEffort[effort.upper()] if effort is not None else None
+    return list(_chat.open(system, list(tools), level))
+
+
+def system_user(system: str, message: str) -> list[int]:
+    """A system message, then the first user turn: :func:`open` with the
+    message and no tools, then :func:`user` (or :func:`first_user` where the
+    template opened with nothing)."""
+    tokens = open(system)
+    return tokens + (user(message) if tokens else first_user(message))
 
 
 def assistant(message: str) -> list[int]:
@@ -71,15 +88,6 @@ def assistant(message: str) -> list[int]:
 def cue() -> list[int]:
     """Token sequence for the generation cue (tells the model "your turn")."""
     return list(_chat.cue())
-
-
-def system_thinking(message: str | None = None, effort: str = "xhigh") -> list[int]:
-    """The system turn of a request the model answers with thinking, as its
-    template renders it: the template's reasoning-effort instruction
-    (``effort``: ``"xhigh"``, the template's default, ``"medium"`` or
-    ``"low"``) ahead of ``message``, in a system turn of its own when
-    ``message`` is ``None``. :func:`system` where the template has none."""
-    return list(_chat.system_thinking(message, _chat.ReasoningEffort[effort.upper()]))
 
 
 def cue_without_thinking() -> list[int]:

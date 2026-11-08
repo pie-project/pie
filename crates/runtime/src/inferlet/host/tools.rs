@@ -18,18 +18,6 @@ impl std::fmt::Debug for Decoder {
 }
 
 impl pie::inferlet::tools::Host for ProcessCtx {
-    async fn equip(
-        &mut self,
-        tools: Vec<String>,
-    ) -> Result<Result<Vec<u32>, pie::inferlet::types::Error>> {
-        let tokens = crate::model::model().instruct().equip(&tools);
-        Ok(Ok(tokens))
-    }
-
-    async fn answer(&mut self, name: String, value: String) -> Result<Vec<u32>> {
-        Ok(crate::model::model().instruct().answer(&name, &value))
-    }
-
     async fn answers(&mut self, results: Vec<(String, String)>) -> Result<Vec<u32>> {
         Ok(crate::model::model().instruct().answers(&results))
     }

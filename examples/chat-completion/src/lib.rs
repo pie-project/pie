@@ -72,11 +72,14 @@ async fn main(input: Input) -> Result<String> {
     }
 
     // Chat-template the system and user messages, then add the assistant cue.
-    // `cue` asks for a thinking answer, so the system turn is the one the
-    // template writes for a thinking request (Qwen3.8 opens it with its
+    // `cue` asks for a thinking answer, so the conversation opens as the
+    // template writes it for a thinking request (Qwen3.8 opens with its
     // reasoning-effort instruction).
-    let mut prompt_tokens =
-        chat::system_thinking(Some(&input.system), chat::ReasoningEffort::Xhigh);
+    let mut prompt_tokens = chat::open(
+        Some(&input.system),
+        &[],
+        Some(chat::ReasoningEffort::Xhigh),
+    );
     prompt_tokens.extend(chat::user(&input.prompt));
     prompt_tokens.extend(chat::cue());
     if prompt_tokens.is_empty() {

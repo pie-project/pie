@@ -1,17 +1,18 @@
 """
 Tool calling — ``pie:inferlet/tools``.
 
-Equip tool specs into the prompt, constrain generation to well-formed calls,
-and parse the calls back out::
+Open a conversation with tool specs, constrain generation to well-formed
+calls, parse the calls back out, and answer them::
 
-    from inferlet import tools
+    from inferlet import chat, grammar, tools
 
-    prompt = chat.system(...) + tools.equip([spec_json, ...]) + chat.user(...)
+    prompt = chat.open("...", [spec_json, ...]) + chat.user(...)
     matcher = grammar.Matcher(tools.format([spec_json, ...]))
     ...
     match tools.Decoder().feed(tokens):
         case tools.Event.Call(call=c): ...
         case tools.Event.Start(): ...
+    prompt += tools.answers([(c.name, result)])
 """
 
 from __future__ import annotations
@@ -51,17 +52,19 @@ class Event:
 AnyEvent = Union[Event.Start, Event.Call]
 
 
-def equip(tools: Sequence[str]) -> list[int]:
-    """Token sequence declaring ``tools`` (JSON specs) to the model."""
-    try:
-        return list(_tools.equip(list(tools)))
-    except _WitErr as e:
-        raise GrammarError(f"tools.equip: {e.value}") from None
+def answers(results: Sequence[tuple[str, str]]) -> list[int]:
+    """Tool results ``(name, value)`` that follow one another, as the
+    model's template writes them together; one result is a list of one."""
+    return list(_tools.answers([(name, value) for name, value in results]))
 
 
-def answer(name: str, value: str) -> list[int]:
-    """Token sequence returning a tool's result to the model."""
-    return list(_tools.answer(name, value))
+def assistant_calls(message: str, calls: Sequence[ToolCall], current: bool) -> list[int]:
+    """An earlier assistant turn: ``message``, then the ``calls`` it made in
+    the template's call syntax. ``current`` marks a turn after the
+    conversation's last user query, which some templates replay with its
+    reasoning."""
+    raw = [_tools.ToolCall(c.name, c.arguments_json) for c in calls]
+    return list(_tools.assistant_calls(message, raw, current))
 
 
 def format(tools: Sequence[str]) -> Grammar | None:  # noqa: A001 — the WIT name

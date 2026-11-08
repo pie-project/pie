@@ -247,6 +247,13 @@ class TestChatFillers:
         assert chat.stop_tokens() == [8, 9]
         assert isinstance(chat.system("s"), list)
 
+    def test_a_conversation_opens_as_the_template_writes_it(self):
+        from inferlet import chat
+
+        assert chat.open("s", ["t1", "t2"], "medium") == [1, ord("s"), 2, 2]
+        assert chat.open() == [1, 0, 0]
+        assert chat.system_user("s", "u") == [1, ord("s"), 0, 0, 3, ord("u")]
+
 
 class TestChatDecoder:
     def teardown_method(self):

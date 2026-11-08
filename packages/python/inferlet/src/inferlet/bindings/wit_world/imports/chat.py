@@ -82,24 +82,15 @@ def first_user(message: str) -> List[int]:
     raise NotImplementedError
 def user(message: str) -> List[int]:
     raise NotImplementedError
-def system_user(system: str, user: str) -> List[int]:
-    raise NotImplementedError
 def assistant(message: str) -> List[int]:
-    raise NotImplementedError
-def system_thinking(message: Optional[str], effort: ReasoningEffort) -> List[int]:
-    """
-    The system turn of a request the model answers with thinking, as its
-    template renders it: the template's reasoning-effort instruction ahead
-    of `message`, in a system turn of its own when `message` is `none`.
-    `system(message)` (or nothing) where the template has no instruction.
-    """
     raise NotImplementedError
 def open(system: Optional[str], tools: List[str], effort: Optional[ReasoningEffort]) -> List[int]:
     """
     The system turn a conversation opens with, as the template writes it
     from the request's system message, its tools, and the reasoning effort
     of a request the model answers with thinking (`none` for one it
-    answers without).
+    answers without). Some templates fold the tools, or the effort, into
+    the system turn, so this is the one way to open with them.
     """
     raise NotImplementedError
 def cue() -> List[int]:

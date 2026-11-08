@@ -62,22 +62,11 @@ class Decoder:
 
 
 
-def equip(tools: List[str]) -> List[int]:
-    """
-    Register available tools (list of JSON schema strings)
-    
-    Raises: `componentize_py_types.Err(wit_world.imports.str)`
-    """
-    raise NotImplementedError
-def answer(name: str, value: str) -> List[int]:
-    """
-    Provide a tool result (after a tool-call reply)
-    """
-    raise NotImplementedError
 def answers(results: List[Tuple[str, str]]) -> List[int]:
     """
-    Consecutive tool results (name, value), as the template writes them
-    together.
+    Tool results (name, value) that follow one another, as the template
+    writes them together. One result is a list of one; tools are declared
+    by `chat.open`.
     """
     raise NotImplementedError
 def assistant_calls(message: str, calls: List[ToolCall], current: bool) -> List[int]:

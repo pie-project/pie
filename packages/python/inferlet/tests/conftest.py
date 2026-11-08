@@ -271,15 +271,17 @@ def _make_chat() -> types.ModuleType:
     m.prefix = lambda: [0]
     m.system = lambda message: [1, *(ord(c) for c in message)]
     m.first_user = lambda message: [2, *(ord(c) for c in message)]
-    m.system_user = lambda system, user: [4, *(ord(c) for c in system), *(ord(c) for c in user)]
-    m.first_user = lambda message: [2, *(ord(c) for c in message)]
     m.user = lambda message: [3, *(ord(c) for c in message)]
-    m.system_user = lambda system, user: [4]
     m.assistant = lambda message: [5, *(ord(c) for c in message)]
     m.cue = lambda: [6]
     m.cue_without_thinking = lambda: [6, 7]
     m.ReasoningEffort = enum.Enum("ReasoningEffort", ["XHIGH", "MEDIUM", "LOW"])
-    m.system_thinking = lambda message, effort: [1, effort.value, *(ord(c) for c in message or "")]
+    m.open = lambda system, tools, effort: [
+        1,
+        *(ord(c) for c in system or ""),
+        len(tools),
+        effort.value if effort else 0,
+    ]
     m.seal = lambda: [7]
     m.stop_tokens = lambda: [8, 9]
     return m
@@ -591,8 +593,8 @@ def _make_tools() -> types.ModuleType:
     m.Event_Call = ToolsEventCall
     m.ToolCall = ToolCallStub
     m.Decoder = ToolsDecoderStub
-    m.equip = lambda tools: [10, len(tools)]
-    m.answer = lambda name, value: [11, len(name), len(value)]
+    m.answers = lambda results: [11, *(len(name) + len(value) for name, value in results)]
+    m.assistant_calls = lambda message, calls, current: [12, len(calls), int(current)]
     m.format = lambda tools: GrammarStub("tools") if tools else None
     return m
 

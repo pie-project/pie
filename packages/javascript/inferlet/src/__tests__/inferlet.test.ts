@@ -150,6 +150,11 @@ describe('chat fillers', () => {
     expect(Array.from(chat.seal())).toEqual([7]);
     expect(Array.from(chat.stopTokens())).toEqual([8, 9]);
   });
+
+  it('opens a conversation as the template writes it', () => {
+    expect(Array.from(chat.open('s', ['t1', 't2'], 'medium'))).toEqual([1, 115, 2, 1]);
+    expect(Array.from(chat.systemUser('s', 'u'))).toEqual([1, 115, 0, 0, 3, 117]);
+  });
 });
 
 describe('chat decoder', () => {
