@@ -371,6 +371,17 @@ pub fn topk(
         let pos_t = cmp_i(f, Cmp::Gt, total, 0)?;
         let nkeys = f.select(pos_t, nkeys, zero)?;
         let nkeys = clamp_i(f, nkeys, 0, nk)?;
+        if nk <= kk {
+            // No row can hold more keys than the budget: each takes all of
+            // its keys, in order, what the bisected selection answers for a
+            // row with no more than `top_k` (a 768-token context against
+            // GLM-5.3's 2048), without scoring a key or scattering a slot.
+            let j = f.iota(Elem::I32, &[n, kk], 1);
+            let nkb = f.broadcast(nkeys, &[n, kk], &[0])?;
+            let live = f.compare(Cmp::Lt, j, nkb)?;
+            let none = f.like_i(j, -1);
+            return Ok(f.select(live, j, none)?);
+        }
         let scores = index_scores(
             f, qv, w, table, indices, indptr, req, nkeys, nk, stride, ps, compact,
         )?;
