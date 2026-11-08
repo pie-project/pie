@@ -125,11 +125,15 @@ def e4b(layers):
 E2B = trunk(hidden = 1536, layers = 35, q_heads = 8, kv_heads = 1, global_kv_heads = 1, inter = 6144,
             window = 512, shared_tail = 20, ple_dim = 256, full_every = 5, wide_tail = True)
 
-def a4b(experts):
-    return trunk(hidden = 2816, layers = 30, q_heads = 16, kv_heads = 8, global_kv_heads = 2, inter = 2112,
+def a4b(experts, layers = 30):
+    return trunk(hidden = 2816, layers = layers, q_heads = 16, kv_heads = 8, global_kv_heads = 2, inter = 2112,
                  window = 1024, moe = struct(experts = experts, top_k = 8, inter = 704))
 
 A4B = a4b(128)
+
+def g12b(layers):
+    return trunk(hidden = 3840, layers = layers, q_heads = 16, kv_heads = 8, global_kv_heads = 1,
+                 inter = 15360, window = 1024)
 
 def g31b(layers):
     return trunk(hidden = 5376, layers = layers, q_heads = 32, kv_heads = 16, global_kv_heads = 4,
@@ -140,8 +144,7 @@ TRUNKS = {
     "gemma4-26b-a4b-mini-e64": a4b(64),
     "gemma4-31b": g31b(60),
     "gemma4-31b-mini-l30": g31b(30),
-    "gemma4-12b": trunk(hidden = 3840, layers = 48, q_heads = 16, kv_heads = 8, global_kv_heads = 1,
-                        inter = 15360, window = 1024),
+    "gemma4-12b": g12b(48),
     "gemma4-e2b": E2B,
     "gemma4-e4b": e4b(42),
     "gemma4-e4b-mini-l1": e4b(1),
@@ -214,8 +217,10 @@ def layout(id, deploy):
     d = TRUNKS[id]
     if id.startswith("gemma4-31b") and deploy.layers:
         d = g31b(deploy.layers)
-    if id.startswith("gemma4-26b-a4b") and deploy.experts:
-        d = a4b(deploy.experts)
+    if id.startswith("gemma4-26b-a4b") and (deploy.layers or deploy.experts):
+        d = a4b(deploy.experts or d.moe.experts, layers = deploy.layers or d.layers)
+    if id == "gemma4-12b" and deploy.layers:
+        d = g12b(deploy.layers)
     weights = deploy.weights
     drafter = deploy.drafter
     vision = "vision" in deploy.parts
