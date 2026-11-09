@@ -23,6 +23,7 @@ ap.add_argument("--tdbg", type=int, default=0); ap.add_argument("--override", de
 ap.add_argument("--golden", default="golden.json")
 ap.add_argument("--steps0", type=int, default=0, help="(bisect) one launch of 0 steps, then a d2h")
 ap.add_argument("--prof", default="", help="(TSTAMP 1 builds) units (comma) whose PEs' phase stamps to read (last step); also in the report")
+ap.add_argument("--d2h-delay", type=float, default=0.0, help="(bisect) seconds a step to wait after a launch before the ring's read (no pending d2h during the loop)")
 ap.add_argument("--noweights", type=int, default=0, help="(probes) no weight / head tiles placed (zeros): routes, roles and tables only")
 a = ap.parse_args()
 t00 = time.time()
@@ -164,6 +165,8 @@ for rep in range(a.reps):
         put("nforce", *ROOT, 1, 1, np.array([len(fl)], np.uint32))
         tw = time.time()
         runner.launch("compute", np.uint32(S_), np.uint32(t), nonblock=False)
+        if a.d2h_delay > 0:
+            time.sleep(a.d2h_delay * S_)
         # (a launch returns before the PEs finish it: the ring's read waits for the root's last step)
         runner.memcpy_d2h(ring, sym("ring"), *ROOT, 1, 1, CAP, **k32)
         walls += [(time.time() - tw) / S_] * S_
