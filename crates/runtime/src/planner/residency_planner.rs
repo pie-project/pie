@@ -21,10 +21,11 @@ use super::{ProcessId, exec};
 
 pub(super) const HOST_RESERVE_DIVISOR: u32 = 8;
 
-/// The fixed state sets a running working set takes: the one it holds and
-/// the one a write copies into while a snapshot or fork still reads the
-/// first (`state-chunk` decision 4). Derived, not configured.
-pub(super) const SETS_PER_WORKING_SET: u32 = 2;
+/// The fixed state sets a working set holds, resting or running
+/// (`state-chunk` decision 4). The copy-on-write set a lane's write takes
+/// while a fork or snapshot still reads the first is held apart, once for
+/// the pool: one per lane a fire runs ([`ResidencyPlanner::cow_lanes`]).
+pub(super) const FIXED_SETS_PER_WORKING_SET: u32 = 1;
 
 /// It suspends no process of its own.
 const SWEEP: ProcessId = ProcessId::nil();
@@ -53,6 +54,9 @@ pub struct ResidencyPlanner {
     to_end_notify: Notify,
     /// Told when a process charged against the state pool leaves.
     uncharged: Notify,
+    /// The lanes one fire runs: the copy-on-write sets the state pool keeps
+    /// back from admission.
+    cow_lanes: u32,
     /// What its waiters lack that only the policy can free.
     pub(super) short: parking_lot::Mutex<Shortfall>,
     /// Where that is said (`pressure::raise`, for this planner's engine).
@@ -79,6 +83,7 @@ impl ResidencyPlanner {
             seat_to_end: false,
             to_end_notify: Notify::new(),
             uncharged: Notify::new(),
+            cow_lanes: 1,
             short: parking_lot::Mutex::new(Shortfall::default()),
             sink,
         }
@@ -229,6 +234,15 @@ impl ResidencyPlanner {
     #[must_use]
     pub fn seat_spread(mut self, on: bool) -> Self {
         self.inner.get_mut().to_end.spread = on;
+        self
+    }
+
+    /// The lanes one fire runs (`max_forward_requests`): each may write a
+    /// copy of a fixed set a fork or snapshot still reads, so the state pool
+    /// keeps that many sets back from admission. At least one.
+    #[must_use]
+    pub fn cow_lanes(mut self, lanes: u32) -> Self {
+        self.cow_lanes = lanes.max(1);
         self
     }
 
@@ -526,16 +540,20 @@ impl ResidencyPlanner {
         }
     }
 
-    /// The processes the state pool runs at once: each takes
-    /// [`SETS_PER_WORKING_SET`] fixed sets, and at least one runs. `None`
+    /// The processes the state pool runs at once: each holds
+    /// [`FIXED_SETS_PER_WORKING_SET`] fixed sets, beside the copy-on-write
+    /// sets kept once for a fire's lanes, and at least one runs. `None`
     /// where the model keeps no fixed state.
     pub(super) fn state_seats(&self) -> Option<usize> {
         let (_, total) = self.port.rs_stats();
-        (total.slots > 0).then(|| (total.slots / SETS_PER_WORKING_SET).max(1) as usize)
+        (total.slots > 0).then(|| {
+            (total.slots.saturating_sub(self.cow_lanes) / FIXED_SETS_PER_WORKING_SET).max(1)
+                as usize
+        })
     }
 
-    /// Holds `pid` back until the state pool has the fixed sets it takes
-    /// free of those already charged, so a pool of fixed state never runs
+    /// Holds `pid` back until the state pool has the fixed set it holds
+    /// free of those already charged and the lanes' copy-on-write reserve, so a pool of fixed state never runs
     /// more working sets than it can write: the runtime frees no state on
     /// its own to make room for one admitted past it.
     async fn admit_state(&self, pid: ProcessId) {

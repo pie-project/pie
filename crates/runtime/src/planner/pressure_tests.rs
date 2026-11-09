@@ -234,36 +234,48 @@ fn a_waiter_the_planner_funds_itself_raises_nothing() {
 }
 
 #[test]
-fn admission_charges_two_fixed_sets_a_process_against_the_state_pool() {
+fn admission_charges_one_fixed_set_a_process_beside_the_lanes_copy_reserve() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
-    // Five state slots seat two processes: each takes the set it holds and
-    // the one its write copies into.
+    // Five state slots and one lane a fire: one slot stays back for the
+    // lane's copy-on-write, and four processes each hold the set they run.
     let model = crate::store::registry::register_model(16, &[8], &[5]);
-    let planner = Arc::new(ResidencyPlanner::new(
-        Arc::new(KeptPool::new(8, 0, model)) as Arc<dyn PoolPort>
-    ));
-    assert_eq!(planner.state_seats(), Some(2));
-    let [a, b, c, d] = [(); 4].map(|_| ProcessId::new_v4());
-    for pid in [a, b, c, d] {
+    let planner = Arc::new(
+        ResidencyPlanner::new(Arc::new(KeptPool::new(8, 0, model)) as Arc<dyn PoolPort>)
+            .cow_lanes(1),
+    );
+    assert_eq!(planner.state_seats(), Some(4));
+    let pids = [(); 6].map(|_| ProcessId::new_v4());
+    for pid in pids {
         planner.register(pid);
     }
-    assert!(planner.admit(a).now_or_never().is_some());
-    assert!(planner.admit(b).now_or_never().is_some());
-    let mut third = Box::pin(planner.admit(c));
+    for &pid in &pids[..4] {
+        assert!(planner.admit(pid).now_or_never().is_some());
+    }
+    let mut fifth = Box::pin(planner.admit(pids[4]));
     assert!(
-        third.as_mut().now_or_never().is_none(),
-        "a third would write state the pool cannot hold"
+        fifth.as_mut().now_or_never().is_none(),
+        "a fifth would take the lane's copy-on-write set"
     );
     assert!(
-        planner.admit(a).now_or_never().is_some(),
+        planner.admit(pids[0]).now_or_never().is_some(),
         "one charged already is not charged again"
     );
-    planner.unregister(a);
-    assert!(third.as_mut().now_or_never().is_some(), "a leaves: c runs");
-    let mut fourth = Box::pin(planner.admit(d));
-    assert!(fourth.as_mut().now_or_never().is_none());
-    planner.unregister(b);
-    assert!(fourth.as_mut().now_or_never().is_some());
+    planner.unregister(pids[0]);
+    assert!(
+        fifth.as_mut().now_or_never().is_some(),
+        "one leaves: the next runs"
+    );
+    let mut sixth = Box::pin(planner.admit(pids[5]));
+    assert!(sixth.as_mut().now_or_never().is_none());
+    planner.unregister(pids[1]);
+    assert!(sixth.as_mut().now_or_never().is_some());
+
+    // A fire's lanes all copying: what is left after their reserve, and
+    // never under one process.
+    let wide = ResidencyPlanner::new(Arc::new(KeptPool::new(8, 0, model)) as Arc<dyn PoolPort>);
+    assert_eq!(wide.cow_lanes(3).state_seats(), Some(2));
+    let wider = ResidencyPlanner::new(Arc::new(KeptPool::new(8, 0, model)) as Arc<dyn PoolPort>);
+    assert_eq!(wider.cow_lanes(64).state_seats(), Some(1));
 }
 
 #[test]

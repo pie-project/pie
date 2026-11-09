@@ -276,8 +276,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     // A model with fixed recurrent state is admitted by its planner, which
-    // charges each process the fixed sets a running working set takes
-    // against the state pool (`ResidencyPlanner::admit`): no cap here.
+    // charges each process the fixed set its working set holds against the
+    // state pool, beside a copy-on-write set per lane a fire runs
+    // (`ResidencyPlanner::admit`): no cap here.
     let has_state = engine_configs.iter().any(|d| d.rs_cache_slots > 0);
     let admission_cap = config
         .max_concurrent_processes
@@ -431,6 +432,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let kv_swap_capable = engine_configs
         .first()
         .is_some_and(|d| d.cpu_pages > 0 || d.disk_pages > 0);
+    // The lanes one fire runs on each engine: the copy-on-write sets its
+    // state pool keeps back from admission.
+    let fire_lanes: Vec<u32> = engine_configs
+        .iter()
+        .map(|d| d.limits.max_forward_requests as u32)
+        .collect();
     let seated_first = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seated_first);
     let seat_to_end = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seat_to_end);
     let seat_spread = seat_to_end && engine_configs.iter().all(|d| d.seat_spread);
@@ -512,6 +519,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             engine,
             crate::planner::ResidencyPlanner::new(std::sync::Arc::new(pool))
                 .seated_first(seated_first)
+                .cow_lanes(fire_lanes.get(engine).copied().unwrap_or(1))
                 .seat_to_end(seat_to_end)
                 .seat_spread(seat_spread),
         );
