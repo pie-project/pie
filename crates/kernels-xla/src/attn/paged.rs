@@ -16,8 +16,8 @@
 //!
 //! Scores are `q · k` with bf16 operands and f32 accumulation (every product
 //! exact), then scaled; probabilities meet values in bf16, one MXU pass, as
-//! vLLM-TPU's and FlashAttention's do. A row with no admitted key answers zeros
-//! (and a `-inf` log-sum-exp), never NaN.
+//! FlashAttention's do. A row with no admitted key answers zeros (and a `-inf`
+//! log-sum-exp), never NaN.
 
 #![allow(clippy::too_many_arguments)]
 
