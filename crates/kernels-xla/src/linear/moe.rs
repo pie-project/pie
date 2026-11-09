@@ -1846,8 +1846,10 @@ pub fn weighted_sum(
         ));
     }
     let (t, k, w) = (i64::from(y.rows), i64::from(top_k), i64::from(y.width));
-    let r = routed.f32(f);
-    let r = f.reshape(r, &[t, k, w])?;
+    // Folded while bf16: the fold relays the rows out (a token's `k` rows
+    // pad a sublane tile), at half the bytes f32 rows take.
+    let r = f.reshape(routed.val, &[t, k, w])?;
+    let r = f.convert(r, Elem::F32);
     let g = weights.val;
     let g = f.broadcast(g, &[t, k, w], &[0, 1])?;
     let v = f.mul(r, g)?;
@@ -1897,14 +1899,16 @@ pub fn bias_sum(
     let hi = f.const_i(Elem::I32, experts - 1, &[]);
     let ids = f.clamp(lo, r, hi)?;
     let rows = f.take_rows(b, ids)?;
+    // Folded while bf16, as `weighted_sum` folds its rows.
+    let rows = f.reshape(rows, &[t, k, w])?;
     let rows = f.convert(rows, Elem::F32);
     let g = weights.val;
     let g = f.reshape(g, &[t * k])?;
     let zf = f.const_f(Elem::F32, 0.0, &[t * k]);
     let g = f.select(routed, g, zf)?;
-    let g = f.broadcast(g, &[t * k, w], &[0])?;
+    let g = f.reshape(g, &[t, k])?;
+    let g = f.broadcast(g, &[t, k, w], &[0, 1])?;
     let v = f.mul(rows, g)?;
-    let v = f.reshape(v, &[t, k, w])?;
     let v = f.reduce(v, &[1], Fold::Sum)?;
     let v = f.add(xv, v)?;
     Ok(v)
