@@ -39,7 +39,7 @@ DEPLOYMENTS = [
 # their indexer picks per kv head, with routed experts and one shared. Every
 # MLP is a clamped SwiGLU-OAI.
 
-def dims(layers = 60, experts = 128):
+def dims(layers = 60, experts = 128, theta = 5000000.0):
     return struct(
         hidden = 6144,
         layers = layers,
@@ -48,7 +48,7 @@ def dims(layers = 60, experts = 128):
         kv_heads = 4,
         head_dim = 128,
         rotary_dim = 64,
-        theta = 5000000.0,
+        theta = theta,
         dense_inter = 12288,
         experts = experts,
         top_k = min(4, experts),
@@ -153,8 +153,9 @@ def layout(id, deploy):
     if not mixed and (len(deploy.weights) != 1 or deploy.weights[0] not in [dtype.bf16, dtype.u4g64, MX8]) or deploy.parts or deploy.drafter != None:
         fail("{} does not ship {}".format(id, deploy))
     d = DIMS[id]
-    if deploy.layers or deploy.experts:
-        d = dims(layers = deploy.layers or d.layers, experts = deploy.experts or d.experts)
+    if deploy.layers or deploy.experts or mixed:
+        # MiniMax-M3.1-Flash (the mixed release) states rope_theta 1e7, M3 5e6
+        d = dims(layers = deploy.layers or d.layers, experts = deploy.experts or d.experts, theta = 10000000.0 if mixed else d.theta)
     mix = mix_of(deploy.weights if mixed else deploy.weights[0])
     dense = compute(mix.proj)
 
