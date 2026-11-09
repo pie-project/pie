@@ -155,6 +155,8 @@ pub struct XlaEngineOptions {
     /// The longest sequence (prompt + output) one lane holds, in tokens.
     /// Omit for the engine default (4096).
     pub max_model_len: Option<u32>,
+    /// Tokens a kv page holds. Omit for the engine default (16).
+    pub kv_page_size: Option<u32>,
     /// Trace and compile the fire shapes a server meets first at load, so
     /// no early request waits on a compile. Slower to load.
     pub prewarm: bool,
@@ -162,6 +164,10 @@ pub struct XlaEngineOptions {
 
 impl XlaEngineOptions {
     pub(super) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.kv_page_size != Some(0),
+            "engine.kv_page_size must be > 0; omit it for the engine's default"
+        );
         limits_are_positive(self.max_forward_tokens, self.max_forward_requests)
     }
 }

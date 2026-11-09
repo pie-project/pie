@@ -753,6 +753,7 @@ pub(crate) fn create_engine_backend(
             let defaults = engine::Budgets::default();
             let (max_lanes, max_tokens) =
                 XLA_FIRE.or(opts.max_forward_requests, opts.max_forward_tokens);
+            let page_size = opts.kv_page_size.unwrap_or(defaults.page_size).max(1);
             (
                 backend,
                 engine::Budgets {
@@ -760,12 +761,12 @@ pub(crate) fn create_engine_backend(
                     max_tokens,
                     buckets: Vec::new(),
                     max_adapters: adapters.seats(),
-                    page_size: defaults.page_size,
+                    page_size,
                     max_context: opts
                         .max_model_len
                         .filter(|&len| len > 0)
                         .unwrap_or(defaults.max_context)
-                        .max(defaults.page_size),
+                        .max(page_size),
                     context_declared: false,
                     slots: opts.max_state_slots.map_or(0, |slots| slots.max(1)),
                     max_patches: patch_ceilings.0,
