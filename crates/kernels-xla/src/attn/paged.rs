@@ -912,6 +912,12 @@ pub(crate) fn per_row(
     };
     let width = (h.kvh * (h.d + h.dv)).max(h.qh()).max(1);
     let c = pow2_floor((ch.budget / (r * width)).max(8)).min(round_up(total, 8));
+    // A chunk narrower than a page would gather its keys one by one: it
+    // takes the page.
+    let c = match keys {
+        KeyList::Range if geom.ps > 0 && c < geom.ps => geom.ps.min(round_up(total, 8)),
+        _ => c,
+    };
     // A windowed row admits at most `window` keys: chunks of about that
     // width (whole pages), walked from the lowest admitted one, read the
     // window and not the whole span.
