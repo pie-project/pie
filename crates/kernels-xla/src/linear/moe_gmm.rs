@@ -629,12 +629,7 @@ impl Gmm {
             let live = b.cmpi(ICmp::Slt, blk.grid.ids[1], nt)?;
             b.when(live, |b| {
                 let y = if self.widens() {
-                    let x = b.vload_all(blk.ins[0])?;
-                    let w = b.vload_all(blk.ins[1])?;
-                    let s = b.vload_all(blk.ins[2])?;
-                    let w = widen_codes(b, w, s, groups, cols)?;
-                    let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
-                    b.matmul(x, w, acc, false)?
+                    widen_dot(b, blk, tm, groups, cols)?
                 } else if self.tile {
                     tile_dot(b, blk, tm, groups, cols)?
                 } else {
@@ -706,6 +701,35 @@ impl Gmm {
 /// e4m3 codes `w` (`[K, cols]`) as bf16, each times its 128-code block's
 /// f32 factor (`s`: `[K / 128, cols]`), the product rounded once, as the
 /// bf16 deployment holds the weight.
+/// A prompt tile's rows against block-FP8 codes (`ins[1]`, `[K, cols]`)
+/// under f32 factors a 128 of K (`ins[2]`): the codes widened a chunk of K at
+/// a time (four 128-code blocks) and each chunk's dot taken as it lands, so
+/// the VPU widens the next chunk while the MXU contracts this one. f32
+/// `[tm, cols]`.
+fn widen_dot(
+    b: &mut Body,
+    blk: &crate::mosaic::Blocks,
+    tm: i64,
+    groups: i64,
+    cols: i64,
+) -> Built<V> {
+    let zero = b.index(0);
+    let mut acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
+    let mut g = 0;
+    while g < groups {
+        let n = (groups - g).min(4);
+        let at = b.index(g * 128);
+        let x = b.vload(blk.ins[0], &[zero, at], &[tm, n * 128])?;
+        let w = b.vload(blk.ins[1], &[at, zero], &[n * 128, cols])?;
+        let row = b.index(g);
+        let s = b.vload(blk.ins[2], &[row, zero], &[n, cols])?;
+        let w = widen_codes(b, w, s, n, cols)?;
+        acc = b.matmul(x, w, acc, false)?;
+        g += n;
+    }
+    Ok(acc)
+}
+
 fn widen_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
     use crate::mosaic::MTy;
     let k = groups * 128;
