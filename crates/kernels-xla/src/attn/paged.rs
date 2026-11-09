@@ -15,10 +15,9 @@
 //!   one dense `dot_general` per chunk (the prefill shape).
 //!
 //! Scores are `q · k` with bf16 operands and f32 accumulation (every product
-//! exact), then scaled; probabilities meet values as a two-term bf16 split
-//! (`p = hi + lo`), which keeps the value reduction f32-accurate at two MXU
-//! passes. A row with no admitted key answers zeros (and a `-inf` log-sum-exp),
-//! never NaN.
+//! exact), then scaled; probabilities meet values in bf16, one MXU pass, as
+//! FlashAttention's do. A row with no admitted key answers zeros (and a `-inf`
+//! log-sum-exp), never NaN.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -641,35 +640,17 @@ enum Layout {
     Blocked,
 }
 
-/// `x` as `hi + lo`, both bf16: `hi` is `x` with its low 16 mantissa bits
-/// cleared (exact in bf16), `lo` the rest rounded (`|lo| < 2⁻⁷|x|`), so
-/// `hi + lo` holds `x` to ~2⁻¹⁶. The split is by bits, not by an f32→bf16→f32
-/// round trip, which XLA's excess-precision rewrite folds back to `x`.
-pub(crate) fn split_bf16(f: &mut Func, x: Val) -> Built<(Val, Val)> {
-    let bits = f.bitcast(x, Elem::U32)?;
-    let keep = f.like_i(bits, 0xFFFF_0000);
-    let bits = f.and(bits, keep)?;
-    let hi32 = f.bitcast(bits, Elem::F32)?;
-    let lo = f.sub(x, hi32)?;
-    Ok((f.convert(hi32, Elem::Bf16), f.convert(lo, Elem::Bf16)))
-}
-
-/// `p · v` in f32 from bf16 values: `p` split as `hi + lo`, two bf16 passes.
+/// `p · v` in f32 from bf16 values, `p` in bf16: one MXU pass (a prefill's
+/// blocks took two, `p` split as `hi + lo`: v5e Qwen3-0.6B pf256-512 44.0k
+/// against 48.5k tok/s, Raw prefill 36.5k against 40.2k).
 fn pv(f: &mut Func, lay: Layout, p: Val, v: Val) -> Built<Val> {
     let split = f.ty(v).rank() == 3;
-    let dot = |f: &mut Func, x: Val| match lay {
-        Layout::PerRow if split => by_head(f, x, v, 1),
-        Layout::PerRow => f.dot_general_at(x, v, &[0, 1], &[0, 2], &[3], &[1], Elem::F32, false),
-        Layout::Blocked => f.dot_general_at(x, v, &[0], &[1], &[3], &[0], Elem::F32, false),
-    };
-    if lay == Layout::PerRow {
-        let pb = f.convert(p, Elem::Bf16);
-        return dot(f, pb);
+    let pb = f.convert(p, Elem::Bf16);
+    match lay {
+        Layout::PerRow if split => by_head(f, pb, v, 1),
+        Layout::PerRow => f.dot_general_at(pb, v, &[0, 1], &[0, 2], &[3], &[1], Elem::F32, false),
+        Layout::Blocked => f.dot_general_at(pb, v, &[0], &[1], &[3], &[0], Elem::F32, false),
     }
-    let (hi, lo) = split_bf16(f, p)?;
-    let a = dot(f, hi)?;
-    let b = dot(f, lo)?;
-    f.add(a, b)
 }
 
 /// Whether the per-row walk reads kv heads as 128-aligned column slices of
