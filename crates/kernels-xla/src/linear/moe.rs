@@ -1120,96 +1120,10 @@ fn gmm(
     valid: Val,
     ids: Val,
 ) -> Result<Val, Error> {
-    use crate::linear::moe_gmm::Orient;
-    let (p, e, n, tm) = (fan.pairs(), fan.experts, fan.n, spec.tm);
-    let (tiles, rows) = (spec.tiles, spec.tiles * spec.tm);
-    let top = f.const_i(Elem::I32, e, &[p]);
-    let key = f.select(valid, r, top)?;
-    let iota = f.iota(Elem::I32, &[p], 0);
-    let by = f.sort(&[key, iota], 0, true, |fq, a, b| {
-        fq.compare(Cmp::Lt, a[0], b[0])
-    })?;
-    let (skey, perm) = (by[0], by[1]);
-    // Rows per expert, and each expert's first sorted position and tile.
-    let counts = {
-        let ks = f.broadcast(skey, &[p, e], &[0])?;
-        let es = f.iota(Elem::I32, &[p, e], 1);
-        let hit = f.compare(Cmp::Eq, ks, es)?;
-        let one = f.const_i(Elem::I32, 1, &[p, e]);
-        let none = f.const_i(Elem::I32, 0, &[p, e]);
-        let hit = f.select(hit, one, none)?;
-        f.reduce(hit, &[0], Fold::Sum)?
-    };
-    let first = {
-        let upto = f.scan(counts, 0, Fold::Sum)?;
-        f.sub(upto, counts)?
-    };
-    let per = {
-        let more = f.const_i(Elem::I32, tm - 1, &[e]);
-        let c = f.add(counts, more)?;
-        let tt = f.const_i(Elem::I32, tm, &[e]);
-        f.div(c, tt)?
-    };
-    let tend = f.scan(per, 0, Fold::Sum)?;
-    let tstart = f.sub(tend, per)?;
-    let nt = f.slice(tend, &[e - 1], &[e], &[1])?;
-    // Tile `t`'s expert: how many experts' tiles end at or before it.
-    let se = {
-        let ends = f.broadcast(tend, &[tiles, e], &[1])?;
-        let ts = f.iota(Elem::I32, &[tiles, e], 0);
-        let done = f.compare(Cmp::Le, ends, ts)?;
-        let one = f.const_i(Elem::I32, 1, &[tiles, e]);
-        let none = f.const_i(Elem::I32, 0, &[tiles, e]);
-        let done = f.select(done, one, none)?;
-        let se = f.reduce(done, &[1], Fold::Sum)?;
-        let hi = f.const_i(Elem::I32, e - 1, &[tiles]);
-        f.min(se, hi)?
-    };
-    // Padded row `i` holds the `rank`-th row routed to its tile's expert.
-    let xs = {
-        let ri = f.iota(Elem::I32, &[rows], 0);
-        let tt = f.const_i(Elem::I32, tm, &[rows]);
-        let t = f.div(ri, tt)?;
-        let ex = pick_small(f, se, t)?;
-        let base = pick_small(f, tstart, ex)?;
-        let base = f.mul(base, tt)?;
-        let rank = f.sub(ri, base)?;
-        let count = pick_small(f, counts, ex)?;
-        let ntb = f.broadcast(nt, &[rows], &[0])?;
-        let live = f.compare(Cmp::Lt, t, ntb)?;
-        let within = f.compare(Cmp::Lt, rank, count)?;
-        let ok = f.and(live, within)?;
-        let at = pick_small(f, first, ex)?;
-        let at = f.add(at, rank)?;
-        let pair = take_flat(f, perm, at)?;
-        let src = if fan.per_token {
-            let kk = f.const_i(Elem::I32, fan.top_k, &[rows]);
-            f.div(pair, kk)?
-        } else {
-            pair
-        };
-        let zero = f.const_i(Elem::I32, 0, &[rows]);
-        let src = f.select(ok, src, zero)?;
-        f.take_rows(x, src)?
-    };
-    let w = bank.codes.val();
-    let w = match spec.orient {
-        // The bank's layout on the device: a free transpose.
-        Orient::KMajor => f.transpose(w, &[1, 0])?,
-        Orient::NMajor => w,
-    };
-    let kernel = spec.kernel()?;
-    let out = kernel.call(f, &[se, nt, xs, w])?[0];
-    // Pair `i`'s row: its sorted position's rank within its expert's run.
-    let back = f.sort(&[perm, iota], 0, true, |fq, a, b| {
-        fq.compare(Cmp::Lt, a[0], b[0])
-    })?[1];
-    let base = pick_small(f, tstart, ids)?;
-    let tt = f.const_i(Elem::I32, tm, &[p]);
-    let base = f.mul(base, tt)?;
-    let at = pick_small(f, first, ids)?;
-    let rank = f.sub(back, at)?;
-    let dest = f.add(base, rank)?;
+    let (p, e, n) = (fan.pairs(), fan.experts, fan.n);
+    let sorted = sorted(f, spec, fan, x, r, valid, None)?;
+    let out = tiles_of(f, spec, bank, &sorted, sorted.xs)?;
+    let dest = dest(f, &sorted, p)?;
     let offsets = spec.offsets()?;
     if offsets.iter().all(|&o| o == 0) {
         return Ok(f.take_rows(out, dest)?);
@@ -1239,6 +1153,175 @@ fn gmm(
         });
     }
     y.ok_or_else(|| refuse("linear.moe", "no expert"))
+}
+
+/// A fire's pairs sorted by expert into the grouped-matmul kernel's tiles.
+struct Sorted {
+    /// Each tile's expert, and the tile count.
+    se: Val,
+    nt: Val,
+    /// The activation rows tile by tile, and the token each comes from.
+    xs: Val,
+    src: Val,
+    /// The pair each row holds (a pad row: `>= p`).
+    held: Val,
+    /// The weight each row carries (0 for a pad), when the sort carried one.
+    ws: Option<Val>,
+}
+
+/// The pairs sorted by expert (unrouted last), each expert's run of rows
+/// padded to whole tiles of `tm` rows, and `x`'s rows laid out so. The pad
+/// rows sort in with the pairs (expert `e`'s after its pairs, the rest
+/// last), so the sort lays out the padded rows itself: picking each row's
+/// pair out of a sorted order cost a scalar gather (v6e, Gemma-4-26B's
+/// 32-expert cut, 1792 tokens: 109 us a layer).
+fn sorted(
+    f: &mut Func,
+    spec: crate::linear::moe_gmm::Gmm,
+    fan: Fan,
+    x: Val,
+    r: Val,
+    valid: Val,
+    weights: Option<Val>,
+) -> Result<Sorted, Error> {
+    let (p, e, tm) = (fan.pairs(), fan.experts, spec.tm);
+    let (tiles, rows) = (spec.tiles, spec.tiles * spec.tm);
+    let top = f.const_i(Elem::I32, e, &[p]);
+    let key = f.select(valid, r, top)?;
+    // Rows per expert, and each expert's first tile.
+    let counts = {
+        let ks = f.broadcast(key, &[p, e], &[0])?;
+        let es = f.iota(Elem::I32, &[p, e], 1);
+        let hit = f.compare(Cmp::Eq, ks, es)?;
+        let one = f.const_i(Elem::I32, 1, &[p, e]);
+        let none = f.const_i(Elem::I32, 0, &[p, e]);
+        let hit = f.select(hit, one, none)?;
+        f.reduce(hit, &[0], Fold::Sum)?
+    };
+    let per = {
+        let more = f.const_i(Elem::I32, tm - 1, &[e]);
+        let c = f.add(counts, more)?;
+        let tt = f.const_i(Elem::I32, tm, &[e]);
+        f.div(c, tt)?
+    };
+    let tend = f.scan(per, 0, Fold::Sum)?;
+    let nt = f.slice(tend, &[e - 1], &[e], &[1])?;
+    // Tile `t`'s expert: how many experts' tiles end at or before it.
+    let se = {
+        let ends = f.broadcast(tend, &[tiles, e], &[1])?;
+        let ts = f.iota(Elem::I32, &[tiles, e], 0);
+        let done = f.compare(Cmp::Le, ends, ts)?;
+        let one = f.const_i(Elem::I32, 1, &[tiles, e]);
+        let none = f.const_i(Elem::I32, 0, &[tiles, e]);
+        let done = f.select(done, one, none)?;
+        let se = f.reduce(done, &[1], Fold::Sum)?;
+        let hi = f.const_i(Elem::I32, e - 1, &[tiles]);
+        f.min(se, hi)?
+    };
+    // Pad row `c` is the `c / tm`-th routed expert's `c % tm`-th, live while
+    // that expert's run lacks as many rows to a whole tile (at most
+    // `min(e, p)` experts are routed, and `rows - p >= min(e, p)·tm`).
+    let fill = rows - p;
+    let pads = {
+        let tt = f.const_i(Elem::I32, tm, &[e]);
+        let whole = f.mul(per, tt)?;
+        f.sub(whole, counts)?
+    };
+    let zero = f.const_i(Elem::I32, 0, &[e]);
+    let routed = f.compare(Cmp::Gt, counts, zero)?;
+    let one = f.const_i(Elem::I32, 1, &[e]);
+    let ones = f.select(routed, one, zero)?;
+    let rank = f.scan(ones, 0, Fold::Sum)?;
+    let rank = f.sub(rank, ones)?;
+    let c = f.iota(Elem::I32, &[fill], 0);
+    let tf = f.const_i(Elem::I32, tm, &[fill]);
+    let nth = f.div(c, tf)?;
+    let fs = f.rem(c, tf)?;
+    let (fe, lacks) = {
+        let jb = f.broadcast(nth, &[fill, e], &[0])?;
+        let rb = f.broadcast(rank, &[fill, e], &[1])?;
+        let hit = f.compare(Cmp::Eq, jb, rb)?;
+        let on = f.broadcast(routed, &[fill, e], &[1])?;
+        let hit = f.and(hit, on)?;
+        let none = f.const_i(Elem::I32, 0, &[fill, e]);
+        let es = f.iota(Elem::I32, &[fill, e], 1);
+        let fe = f.select(hit, es, none)?;
+        let pb = f.broadcast(pads, &[fill, e], &[1])?;
+        let lacks = f.select(hit, pb, none)?;
+        (f.reduce(fe, &[1], Fold::Sum)?, f.reduce(lacks, &[1], Fold::Sum)?)
+    };
+    let live = f.compare(Cmp::Lt, fs, lacks)?;
+    // Keys: pairs `2e` (unrouted `2E`), live pads `2e + 1`, the rest last.
+    let two = f.const_i(Elem::I32, 2, &[p]);
+    let kp = f.mul(key, two)?;
+    let two = f.const_i(Elem::I32, 2, &[fill]);
+    let kf = f.mul(fe, two)?;
+    let one = f.const_i(Elem::I32, 1, &[fill]);
+    let kf = f.add(kf, one)?;
+    let end = f.const_i(Elem::I32, 2 * e + 1, &[fill]);
+    let kf = f.select(live, kf, end)?;
+    let keys = f.concat(&[kp, kf], 0)?;
+    let iota = f.iota(Elem::I32, &[rows], 0);
+    let mut carried = vec![keys, iota];
+    if let Some(w) = weights {
+        let none = f.const_f(Elem::F32, 0.0, &[fill]);
+        carried.push(f.concat(&[w, none], 0)?);
+    }
+    let by = f.sort(&carried, 0, true, |fq, a, b| {
+        fq.compare(Cmp::Lt, a[0], b[0])
+    })?;
+    let held = by[1];
+    // Padded row `i` holds pair `held[i]` (a pad when `>= p`).
+    let src = {
+        let pp = f.const_i(Elem::I32, p, &[rows]);
+        let pair = f.compare(Cmp::Lt, held, pp)?;
+        let src = if fan.per_token {
+            let kk = f.const_i(Elem::I32, fan.top_k, &[rows]);
+            f.div(held, kk)?
+        } else {
+            held
+        };
+        let zero = f.const_i(Elem::I32, 0, &[rows]);
+        f.select(pair, src, zero)?
+    };
+    let xs = f.take_rows(x, src)?;
+    Ok(Sorted {
+        se,
+        nt,
+        xs,
+        src,
+        held,
+        ws: weights.map(|_| by[2]),
+    })
+}
+
+/// Pair `i`'s row of the kernel's result: where the sort put it.
+fn dest(f: &mut Func, sorted: &Sorted, p: i64) -> Result<Val, Error> {
+    let rows = f.dims(sorted.held)[0];
+    let iota = f.iota(Elem::I32, &[rows], 0);
+    let back = f.sort(&[sorted.held, iota], 0, true, |fq, a, b| {
+        fq.compare(Cmp::Lt, a[0], b[0])
+    })?[1];
+    Ok(f.slice(back, &[0], &[p], &[1])?)
+}
+
+/// The kernel over `xs`, rows laid out tile by tile as `sorted` lays them.
+fn tiles_of(
+    f: &mut Func,
+    spec: crate::linear::moe_gmm::Gmm,
+    bank: &Read,
+    sorted: &Sorted,
+    xs: Val,
+) -> Result<Val, Error> {
+    use crate::linear::moe_gmm::Orient;
+    let w = bank.codes.val();
+    let w = match spec.orient {
+        // The bank's layout on the device: a free transpose.
+        Orient::KMajor => f.transpose(w, &[1, 0])?,
+        Orient::NMajor => w,
+    };
+    let kernel = spec.kernel()?;
+    Ok(kernel.call(f, &[sorted.se, sorted.nt, xs, w])?[0])
 }
 
 /// The routed matmul every select entry lowers to: `y[t*k + s] = W[routes[t,
@@ -1720,6 +1803,145 @@ fn select_entry(
     let prev = y.val;
     let out = routed(f, form, fan, xv, rv, bv, prev, tuning)?;
     Ok(out)
+}
+
+/// The GLU a routed MLP runs between its legs ([`experts`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertGlu {
+    Swiglu,
+    GegluTanh,
+}
+
+/// A routed MLP over dense banks on one sort: the gate-up select, its GLU
+/// and the down select on the same routes run tile by tile in the
+/// grouped-matmul kernel's sorted layout, so the rows between the legs are
+/// never put back in pair order and gathered again; then each token's routed
+/// rows, weighted, summed in f32. Each valid pair's rows are the ones the
+/// three ops land apart. `None` (nothing landed) where the kernel does not
+/// take both banks in one layout, or the fire is a slice's (`routed`).
+#[allow(clippy::too_many_arguments)]
+pub fn experts(
+    f: &mut Func,
+    x: Operand,
+    gate_up: Operand,
+    routes: Operand,
+    packed: Landing,
+    glu: ExpertGlu,
+    intermediate: u32,
+    down: Operand,
+    routed: Landing,
+    weights: Operand,
+    y: Landing,
+    tuning: Tuning,
+) -> Result<Option<Val>, Error> {
+    const OP: &str = "linear.moe_experts";
+    expect(OP, x, &[Dtype::Bf16])?;
+    expect(OP, weights, &[Dtype::F32])?;
+    let up_fan = fan_of(
+        OP,
+        x.rows,
+        x.width,
+        packed.width,
+        routes,
+        Form::Dense(gate_up),
+    )?;
+    let down_fan = fan_of(
+        OP,
+        routes.rows() * routes.width(),
+        intermediate,
+        routed.width,
+        routes,
+        Form::Dense(down),
+    )?;
+    let p = up_fan.pairs();
+    if !matches!(tuning.moe_path, MoePath::Auto { gmm: true })
+        || p <= tuning.moe_costs.slice_pairs
+        || i64::from(packed.rows) != p
+        || i64::from(routed.rows) != p
+        || packed.width != 2 * intermediate
+        || down_fan.experts != up_fan.experts
+        || weights.rows != y.rows
+        || i64::from(weights.width) != up_fan.top_k
+        || i64::from(y.rows) != up_fan.tokens
+        || y.width != routed.width
+    {
+        return Ok(None);
+    }
+    let up_bank = read_bank(f, Form::Dense(gate_up), up_fan)?;
+    let down_bank = read_bank(f, Form::Dense(down), down_fan)?;
+    let elem = |f: &mut Func, b: &Read| f.elem(b.codes.val());
+    let (ue, de) = (elem(f, &up_bank), elem(f, &down_bank));
+    let (Some(up), Some(dn)) = (
+        gmm_spec(up_fan, &up_bank, ue, tuning, Elem::Bf16),
+        gmm_spec(down_fan, &down_bank, de, tuning, Elem::Bf16),
+    ) else {
+        return Ok(None);
+    };
+    let flat = |s: crate::linear::moe_gmm::Gmm| s.offsets().map(|o| o.iter().all(|&v| v == 0));
+    if up.tm != dn.tm || up.tiles != dn.tiles || !flat(up)? || !flat(dn)? {
+        return Ok(None);
+    }
+    let e = up_fan.experts;
+    let r = f.reshape(routes.val, &[p])?;
+    let zero = f.const_i(Elem::I32, 0, &[p]);
+    let top = f.const_i(Elem::I32, e, &[p]);
+    let ge = f.compare(Cmp::Ge, r, zero)?;
+    let lt = f.compare(Cmp::Lt, r, top)?;
+    let valid = f.and(ge, lt)?;
+    // Each pair's weight rides the sort to its row (an unrouted pair's 0).
+    let t = up_fan.tokens;
+    let w = f.reshape(weights.val, &[p])?;
+    let none = f.const_f(Elem::F32, 0.0, &[p]);
+    let w = f.select(valid, w, none)?;
+    let sorted = sorted(f, up, up_fan, x.val, r, valid, Some(w))?;
+    let rows = up.tiles * up.tm;
+    let up_rows = tiles_of(f, up, &up_bank, &sorted, sorted.xs)?;
+    let held = Operand {
+        val: up_rows,
+        rows: rows as u32,
+        width: packed.width,
+        dtype: Dtype::Bf16,
+    };
+    let into = Landing {
+        rows: rows as u32,
+        width: intermediate,
+        dtype: Dtype::Bf16,
+    };
+    let hidden = match glu {
+        ExpertGlu::Swiglu => crate::linear::mlp::swiglu(f, held, intermediate, into)?,
+        ExpertGlu::GegluTanh => crate::linear::mlp::geglu_tanh_packed(f, held, intermediate, into)?,
+    };
+    // The down leg is linear: a row weighted before it lands weighted (the
+    // f32 GLU rounds to bf16 once, as before).
+    let ws = sorted.ws.ok_or_else(|| refuse(OP, "the sort carried no weights"))?;
+    let wb = f.broadcast(ws, &[rows, i64::from(intermediate)], &[0])?;
+    let hidden = f.mul(hidden, wb)?;
+    let hidden = f.convert(hidden, Elem::Bf16);
+    let down_rows = tiles_of(f, dn, &down_bank, &sorted, hidden)?;
+    // Each token's rows summed by one dot against the rows' tokens, one-hot:
+    // picking each pair's row back out was a row gather (v6e, Gemma-4-26B's
+    // 32-expert cut, 1792 tokens: 0.44 ms a layer, and 0.1 ms to sum them).
+    // Rows of tiles past the count are unwritten: zeroed, not read.
+    let n = i64::from(routed.width);
+    let live = {
+        let tt = f.const_i(Elem::I32, up.tm, &[1]);
+        let end = f.mul(sorted.nt, tt)?;
+        let end = f.reshape(end, &[])?;
+        let end = f.broadcast(end, &[rows, n], &[])?;
+        let ri = f.iota(Elem::I32, &[rows, n], 0);
+        f.compare(Cmp::Lt, ri, end)?
+    };
+    let zero = f.const_f(Elem::Bf16, 0.0, &[rows, n]);
+    let ys = f.select(live, down_rows, zero)?;
+    let hot = {
+        let tb = f.broadcast(sorted.src, &[rows, t], &[0])?;
+        let ts = f.iota(Elem::I32, &[rows, t], 1);
+        let hit = f.compare(Cmp::Eq, tb, ts)?;
+        let one = f.const_f(Elem::Bf16, 1.0, &[rows, t]);
+        let off = f.const_f(Elem::Bf16, 0.0, &[rows, t]);
+        f.select(hit, one, off)?
+    };
+    Ok(Some(f.dot_general_at(hot, ys, &[], &[], &[0], &[0], Elem::F32, false)?))
 }
 
 /// A dense (bf16) bank: `bank` holds `[experts, N * K]` (any row shape).
