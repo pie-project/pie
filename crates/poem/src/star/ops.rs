@@ -246,24 +246,6 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "attn",
-        name: "kv_append",
-        params: &["k", "v", "pages", "write_page", "write_offset"],
-        call: |a, heap| {
-            let k: Value = a.next()?;
-            let v: Option<Value> = a.next()?;
-            let pages: ValueId = a.next()?;
-            let write_page: Value = a.next()?;
-            let write_offset: Value = a.next()?;
-            result(
-                heap,
-                dsl("attn.kv_append", || {
-                    ops::attn::kv_append(&k, v.as_ref(), pages, &write_page, &write_offset)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "attn",
         name: "kv_ends",
         params: &["request_of_token", "pages"],
         call: |a, heap| {

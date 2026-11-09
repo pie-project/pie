@@ -75,6 +75,7 @@ RESULTS = {"Value", "(Value, Value)", "(Value, Option<Value>)", "(Value, Value, 
 # results are of types this does not spell, or their packages' spelling keeps
 # an order or a default the op's own signature does not.
 BY_HAND = {
+    "attn::kv_append",
     "conv::conv3d",
     "conv::upsample_nearest",
     "elemwise::norm_gate",

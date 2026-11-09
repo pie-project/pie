@@ -137,6 +137,18 @@ FP8_AT = {
     "o_proj": [69, 78],
 }
 
+# What a layer remembers: a Mamba-2's last taps a channel and its SSM state a
+# head; an attention's keys and values, two planes of its kv heads a token.
+
+def conv_state(d, conv_dim):
+    return state([d.conv_kernel, conv_dim], dtype.bf16)
+
+def ssm_state(d):
+    return state([d.mamba_heads, d.mamba_head_dim, d.state_dim], dtype.f32)
+
+def kv_state(d, deploy):
+    return state([tokens, 2, d.kv_heads, d.head_dim], deploy.kv)
+
 def layout(id, deploy):
     if DIMS[id].latent == None:
         return nano_layout(id, deploy)
@@ -175,8 +187,8 @@ def layout(id, deploy):
             d = weight([d.mamba_heads], dtype.f32),
             norm = weight([inner]),
             out_proj = proj(n("out_proj"), "out_proj", l, [hidden, inner]),
-            conv_state = "conv.{}".format(l),
-            ssm_state = "ssm.{}".format(l),
+            conv_state = conv_state(d, conv_dim),
+            ssm_state = ssm_state(d),
         )
 
     def attention(l):
@@ -187,7 +199,7 @@ def layout(id, deploy):
             k = weight([d.kv_heads * hd, hidden], w),
             v = weight([d.kv_heads * hd, hidden], w),
             o = proj(n("o"), "o_proj", l, [hidden, d.heads * hd]),
-            kv = "kv.{}".format(l),
+            kv = kv_state(d, deploy),
         )
 
     def moe(l):
@@ -231,7 +243,6 @@ def layout(id, deploy):
         top_k = d.top_k,
         scaling = d.scaling,
         eps = d.eps,
-        kv = deploy.kv,
         embed = weight([d.vocab, hidden], w),
         head = weight([d.vocab, hidden], w),
         layers = [layer(l) for l in range(d.layers)],
@@ -272,8 +283,8 @@ def nano_layout(id, deploy):
                 d = weight([d.mamba_heads], dtype.f32),
                 norm = weight([inner]),
                 out_proj = weight([hidden, inner], at(l)),
-                conv_state = "conv.{}".format(l),
-                ssm_state = "ssm.{}".format(l),
+                conv_state = conv_state(d, conv_dim),
+                ssm_state = ssm_state(d),
             )
         elif kind == "*":
             hd = d.head_dim
@@ -282,7 +293,7 @@ def nano_layout(id, deploy):
                 k = weight([d.kv_heads * hd, hidden], dtype.bf16),
                 v = weight([d.kv_heads * hd, hidden], dtype.bf16),
                 o = weight([hidden, d.heads * hd], dtype.bf16),
-                kv = "kv.{}".format(l),
+                kv = kv_state(d, deploy),
             )
         else:
             moe = struct(
@@ -321,7 +332,6 @@ def nano_layout(id, deploy):
         top_k = d.top_k,
         scaling = d.scaling,
         eps = d.eps,
-        kv = deploy.kv,
         embed = weight([d.vocab, hidden]),
         head = weight([d.vocab, hidden]),
         layers = [layer(l) for l in range(d.layers)],
@@ -419,16 +429,6 @@ def read(m, reads, mlx = False):
 # whose relu2 experts read the residual (Super's and Ultra's squeezed to the
 # latent width) beside a relu2 shared expert reading it whole.
 
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    plane = m.kv_heads * m.head_dim
-    for w in m.layers:
-        if w.attn != None:
-            c.kv(kv, w.attn.kv, [plane, plane], m.head_dim, heads = True)
-        elif w.mamba != None:
-            c.state(w.mamba.conv_state, [m.conv_kernel, m.conv_dim], dtype.bf16, split = 1)
-            c.state(w.mamba.ssm_state, [m.mamba_heads, m.mamba_head_dim, m.state_dim], dtype.f32, split = 0)
-
 def forward(m, inputs):
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
 
@@ -448,8 +448,6 @@ def forward(m, inputs):
     output("logits", ops.linear.lm_head(x, m.head))
 
 def mamba(x, inputs, m, k):
-    conv_state = inputs.state(k.conv_state)
-    ssm_state = inputs.state(k.ssm_state)
     z, rest = ops.gather.split_rows(ops.linear.matmul(x, k.in_proj), m.inner)
     xbc, dt = ops.gather.split_rows(rest, m.conv_dim)
 
@@ -457,7 +455,7 @@ def mamba(x, inputs, m, k):
         rows = (lambda v: v.on(~fact.single_token())) if chunked else (lambda v: v.on(fact.single_token()))
         conv = ops.ssm.causal_conv1d_chunked if chunked else ops.ssm.causal_conv1d
         return ops.ssm.mamba2(
-            conv(xbc, k.conv, conv_state, m.conv_kernel, k.conv_bias),
+            conv(xbc, k.conv, k.conv_state, m.conv_kernel, k.conv_bias),
             rows(dt),
             rows(z),
             k.a_log,
@@ -465,7 +463,7 @@ def mamba(x, inputs, m, k):
             k.d,
             k.norm,
             m.eps,
-            ssm_state,
+            k.ssm_state,
             m.mamba_heads,
             m.groups,
             m.state_dim,
@@ -476,12 +474,11 @@ def mamba(x, inputs, m, k):
     return ops.linear.matmul(o, k.out_proj)
 
 def attention(x, inputs, m, a):
-    pages = inputs.kv(a.kv)
     d = m.head_dim
     q = ops.linear.matmul(x, a.q)
     k = ops.linear.matmul(x, a.k)
     v = ops.linear.matmul(x, a.v)
-    ops.attn.kv_append(k, v, pages, inputs.write_page(a.kv), inputs.write_offset(a.kv))
+    ops.attn.kv_append(k, v, a.kv)
 
     # Each lane by its kind; a lane may bring its own mask. A lane capturing
     # scores reads them out too.

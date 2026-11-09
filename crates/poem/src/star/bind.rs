@@ -15,7 +15,10 @@ use starlark::values::tuple::TupleRef;
 use starlark::values::{Heap, NoSerialize, StarlarkValue, Value as Star};
 use starlark_derive::{starlark_module, starlark_value};
 
-use crate::star::forward::{CacheHandle, InputHandle, ValueHandle, held, hold, input_of};
+use crate::star::forward::{
+    CacheHandle, InputHandle, ValueHandle, held, hold, input_of, root_input,
+};
+use crate::star::state::{StateDecl, StateValue};
 use crate::star::values::{DtypeValue, predicate, weight};
 use crate::{ValueId, Weight};
 use spelled::*;
@@ -99,14 +102,59 @@ impl<'v> Arg<'v> for Predicate {
     }
 }
 
-/// A cache row an op reads or writes.
+/// A cache row an op reads or writes: a cache, or a state the layout
+/// holds.
 impl<'v> Arg<'v> for ValueId {
     fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
         let v = given(v)?;
+        if let Some(s) = v.downcast_ref::<StateValue>() {
+            return read(&s.0);
+        }
         match v.downcast_ref::<CacheHandle>() {
             Some(h) => Ok(h.0),
-            None => wanted("a cache", v),
+            None => wanted("a cache or a state", v),
         }
+    }
+}
+
+/// The cache row the state `s` lowers to, as the forward reads it.
+fn read(s: &StateDecl) -> anyhow::Result<ValueId> {
+    let input = root_input()?;
+    crate::star::forward::dsl("a state read", || match s.per_token {
+        Some(_) => input.kv(&s.name),
+        None => input.state(&s.name),
+    })
+}
+
+/// A kv row an op writes: a cache, a state the layout holds, or the name of
+/// a row `caches()` declares; the name a row's write positions are found
+/// by where it has one.
+pub(crate) struct Row {
+    pub(crate) id: ValueId,
+    pub(crate) name: Option<String>,
+}
+
+impl<'v> Arg<'v> for Row {
+    fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
+        let v = given(v)?;
+        if let Some(s) = v.downcast_ref::<StateValue>() {
+            return Ok(Row {
+                id: read(&s.0)?,
+                name: Some(s.0.name.clone()),
+            });
+        }
+        if let Some(name) = v.unpack_str() {
+            let input = root_input()?;
+            let id = crate::star::forward::dsl("a kv row", || input.kv(name))?;
+            return Ok(Row {
+                id,
+                name: Some(name.to_string()),
+            });
+        }
+        Ok(Row {
+            id: ValueId::arg(Some(v))?,
+            name: None,
+        })
     }
 }
 
@@ -137,9 +185,13 @@ impl<'v> Arg<'v> for u8 {
     }
 }
 
+/// Text; a state the layout holds stands for its name.
 impl<'v> Arg<'v> for String {
     fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
         let v = given(v)?;
+        if let Some(s) = v.downcast_ref::<StateValue>() {
+            return Ok(s.0.name.clone());
+        }
         match v.unpack_str() {
             Some(s) => Ok(s.to_string()),
             None => wanted("text", v),
