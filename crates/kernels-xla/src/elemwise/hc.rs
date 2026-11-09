@@ -51,6 +51,27 @@ fn streams3(f: &mut Func, t: Operand, m: u32) -> Result<Val, Error> {
     )?)
 }
 
+/// `Σ_s w[:, s] · streams[:, s·H .. (s+1)·H]` of an f32 `[rows, M·H]` row,
+/// `w` an f32 `[rows, M]`, in stream order: each stream a cut of the row
+/// itself, where a `[rows, M, H]` view lays `M` on the sublanes (4 of 8 for
+/// DeepSeek-V4) and relays the row out first.
+fn weighted(f: &mut Func, v: Val, w: Val, m: i64, h: i64) -> Result<Val, Error> {
+    let rows = f.dims(v)[0];
+    let mut acc: Option<Val> = None;
+    for s in 0..m {
+        let x = f.slice_axis(v, 1, s * h, (s + 1) * h)?;
+        let ws = f.slice_axis(w, 1, s, s + 1)?;
+        let ws = f.reshape(ws, &[rows])?;
+        let ws = f.broadcast(ws, &[rows, h], &[0])?;
+        let t = f.mul(x, ws)?;
+        acc = Some(match acc {
+            Some(a) => f.add(a, t)?,
+            None => t,
+        });
+    }
+    acc.ok_or_else(|| refuse("elemwise.hc", "no streams"))
+}
+
 /// A flat f32 plane's first `n` values as `[n]`.
 fn flat(f: &mut Func, t: Operand, n: i64) -> Result<Val, Error> {
     let v = t.f32(f);
@@ -225,10 +246,8 @@ pub fn gates_with(
         let j = f.iota(Elem::I32, &[rows, m, m], 2);
         let on = f.compare(crate::hlo::Cmp::Eq, i, j)?;
         let on = f.convert(on, Elem::F32);
-        let r = streams3(f, streams, fan)?;
-        let p = f.broadcast(pre, &[rows, m, h], &[0, 1])?;
-        let w = f.mul(r, p)?;
-        let li = f.reduce(w, &[1], Fold::Sum)?;
+        let r = streams.f32(f);
+        let li = weighted(f, r, pre, m, h)?;
         return Ok((post, on, li));
     }
 
@@ -254,10 +273,8 @@ pub fn gates_with(
     }
     let comb = f.transpose(comb, &[2, 0, 1])?;
 
-    let r = streams3(f, streams, fan)?;
-    let p = f.broadcast(pre, &[rows, m, h], &[0, 1])?;
-    let w = f.mul(r, p)?;
-    let li = f.reduce(w, &[1], Fold::Sum)?;
+    let r = streams.f32(f);
+    let li = weighted(f, r, pre, m, h)?;
     Ok((post, comb, li))
 }
 
@@ -281,17 +298,24 @@ pub fn fold(
     }
     let (rows, m, h) = (i64::from(y.rows), i64::from(fan), i64::from(x.width));
     let xv = x.f32(f);
-    let r = streams3(f, streams, fan)?;
+    let r = streams.f32(f);
     let post = post_mix.f32(f);
     let comb = comb_mix.f32(f);
     let comb = f.reshape(comb, &[rows, m, m])?;
-    // [rows, i, j] · [rows, i, h] over i → [rows, j, h].
-    let mixed = f.dot_general(comb, r, &[0], &[0], &[1], &[1], Elem::F32)?;
-    let px = f.broadcast(post, &[rows, m, h], &[0, 1])?;
-    let xb = f.broadcast(xv, &[rows, m, h], &[0, 2])?;
-    let px = f.mul(px, xb)?;
-    let out = f.add(px, mixed)?;
-    Ok(out)
+    // Stream `j` of the result, `post[:, j] · x + Σ_i comb[:, i, j] · r_i`,
+    // a cut of the row each (see `weighted`).
+    let mut out = Vec::with_capacity(m as usize);
+    for j in 0..m {
+        let cj = f.slice_axis(comb, 2, j, j + 1)?;
+        let cj = f.reshape(cj, &[rows, m])?;
+        let mixed = weighted(f, r, cj, m, h)?;
+        let pj = f.slice_axis(post, 1, j, j + 1)?;
+        let pj = f.reshape(pj, &[rows])?;
+        let pj = f.broadcast(pj, &[rows, h], &[0])?;
+        let px = f.mul(pj, xv)?;
+        out.push(f.add(px, mixed)?);
+    }
+    Ok(f.concat(&out, 1)?)
 }
 
 /// `y[n, h] = Σ_i (σ(mixes[n, i]·scale[0] + base[i]) + eps) · streams[n, i, h]`.
@@ -329,11 +353,8 @@ pub fn collapse(
     let l = f.add(l, b)?;
     let g = f.sigmoid(l);
     let g = f.offset(g, f64::from(hc_eps))?;
-    let r = streams3(f, streams, fan)?;
-    let g = f.broadcast(g, &[rows, m, h], &[0, 1])?;
-    let w = f.mul(r, g)?;
-    let out = f.reduce(w, &[1], Fold::Sum)?;
-    Ok(out)
+    let r = streams.f32(f);
+    weighted(f, r, g, m, h)
 }
 
 /// `y[n, h] = (1/M) Σ_s normed[n, s, h] · σ(gates[n, s, h])`.
