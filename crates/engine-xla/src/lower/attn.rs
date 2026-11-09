@@ -887,6 +887,7 @@ pub mod pool {
         boundary_pos: Tensor,
         boundary_req: Tensor,
         into: &KvPool,
+        ratio: Option<u32>,
     ) -> Result<(), Error> {
         lower(ctx, |l| {
             let page_indices = l.read(into.page_indices)?;
@@ -895,7 +896,17 @@ pub mod pool {
             let breq = l.read(boundary_req)?;
             let e = l.read(entries)?;
             let keys = l.read(into.keys)?;
-            let y = pool::kv_append(l.f(), e, bpos, breq, page_indices, page_indptr, keys, into)?;
+            let y = pool::kv_append(
+                l.f(),
+                e,
+                bpos,
+                breq,
+                page_indices,
+                page_indptr,
+                keys,
+                into,
+                ratio,
+            )?;
             l.land(into.keys, y)
         })
     }
