@@ -86,7 +86,7 @@ moe_costs! {
         "The rate one dot over the whole bank streams at, in bytes a ns.";
     MoeWholePartialFs = "kernel.moe.cost.whole_partial_fs", 0..=1_000_000, 5_500,
         "What each picked partial of that dot adds, in fs.";
-    MoeOnehotMi = "kernel.moe.cost.onehot_mi", 0..=4096, 64,
+    MoeOnehotMi = "kernel.moe.cost.onehot_mi", 0..=4096, 4096,
         "Up to this many Mi cells of sorted rows by tokens, a routed MLP sums each token's rows by one dot against them, one-hot; past it, it picks them out.";
 }
 
@@ -262,7 +262,7 @@ impl Tuning {
             slice_bytes_per_ns: 1_200,
             whole_bytes_per_ns: 1_450,
             whole_partial_fs: 5_500,
-            onehot_cells: 64 << 20,
+            onehot_cells: 4096 << 20,
         },
         grouped: Grouped {
             max_cells: 2048,
