@@ -1,4 +1,4 @@
-//! Gemma 4 12B's role-split geometry (`scratch/split/host/split_geo_g12.py`, word for word): explicit unit
+//! Gemma 4 12B's role-split geometry (`tools/split/g12/split_geo_g12.py`, word for word): explicit unit
 //! origins, the row-role split (attention rows r < RA with Hc A dims and the scores segments; plain rows with Hc W
 //! dims; handoffs of 2 Hc(r) + 1 words a row) and the head groups (head column c takes x's dims of the CX rows in
 //! its group: the members chain their words to the root on the last unit's CX column, the root sends them east;

@@ -353,7 +353,7 @@ impl SplitModel {
         })
     }
 
-    /// Gemma 4 12B (`scratch/split/gemma12/README.md`): the geometry the meta names (geo/g12.rs), placed.
+    /// Gemma 4 12B (`spatial/split/README.md, Gemma 4 12B`): the geometry the meta names (geo/g12.rs), placed.
     fn open_g12(
         mut dev: Box<dyn Device>,
         spec: &SplitSpec,

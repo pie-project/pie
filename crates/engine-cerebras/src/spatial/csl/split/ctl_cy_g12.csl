@@ -1,5 +1,5 @@
 // split/ctl_cy_g12.csl: the role-split column control PE for Gemma 4 12B (ctl_cy_gemma.csl without PLE / shared KV;
-// scratch/split/gemma12/README.md). A layer:
+// spatial/split/README.md, Gemma 4 12B). A layer:
 // - attention: the reduction [W a | W b | |r|^2, |x|^2, x.p, |p|^2] (deferred norm: s = rsqrt(mean r^2 + eps), the
 //   input's rms from |x + s p|^2), t = rr (W a + s W b) = [q (Qh Dc) | k Dc (| v Dc)]; a global layer
 //   (attention_k_eq_v, KEV 1) has no v: v = the raw k (the weight PE stores it normalised, v_norm); the raw |q_h|^2,

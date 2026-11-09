@@ -1,4 +1,4 @@
-// split/weight_g12.csl: the role-split weight PE for Gemma 4 12B (bf16; scratch/split/gemma12/README.md): weight_gemma.csl
+// split/weight_g12.csl: the role-split weight PE for Gemma 4 12B (bf16; spatial/split/README.md, Gemma 4 12B): weight_gemma.csl
 // without PLE / shared KV, with attention_k_eq_v on the global layers and the row-role split:
 // - ATT 1 (an attention row, "A"): Hc A dims, the KV entries of its positions (position p on A row p % PYW);
 // - ATT 2 (a plain row, "W"): Hc W dims, no KV: it takes CY's multicasts and sends zeros into each pass's values

@@ -1,4 +1,4 @@
-//! Gemma 4 12B's role-split placement (`scratch/split/host/run_g12.py`'s copies): the units (weights of the
+//! Gemma 4 12B's role-split placement (`tools/split/g12/run_g12.py`'s copies): the units (weights of the
 //! attention / plain rows, rcfg, CX gammas, CY q / k norm weights and RoPE tables), the head (hw, hg) and its
 //! control column.
 

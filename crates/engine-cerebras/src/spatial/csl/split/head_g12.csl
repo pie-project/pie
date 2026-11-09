@@ -1,5 +1,5 @@
 // split/head_g12.csl: the role-split head weight PE for Gemma 4 12B (head_pe.csl with a tied head and head groups;
-// scratch/split/gemma12/README.md). A head column takes x's dims of a group of consecutive CX rows (NX <= HDc words,
+// spatial/split/README.md, Gemma 4 12B). A head column takes x's dims of a group of consecutive CX rows (NX <= HDc words,
 // [RQ+17]; the rest of its HDc dims are padding with zero weights): the group's root CX sends them along its row
 // (HX) to the head PE on that row (x role 2), which multicasts the HDc words up and down the column (HM); the other
 // PEs take the multicast (x role 0).
