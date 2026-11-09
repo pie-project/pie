@@ -83,6 +83,19 @@ impl Lower<'_, '_> {
         self.cx.write(t, v)
     }
 
+    /// [`Self::land`], keeping `sums`, the per-head sums of squares the
+    /// kernel landed beside `v`, for the norm that reads `t` next.
+    pub fn land_sums(&mut self, t: Tensor, v: Val, sums: Val) -> Result<(), Error> {
+        self.cx.write(t, v)?;
+        self.cx.keep_sums(t, sums);
+        Ok(())
+    }
+
+    /// The per-head sums of squares landed beside `t`'s current value.
+    pub fn sums(&mut self, t: Tensor) -> Option<Val> {
+        self.cx.sums(t)
+    }
+
     /// Lands the `[rows, 1]` value `v` in column `column` of `t`, the other
     /// columns kept as they were.
     pub fn land_column(&mut self, t: Tensor, column: u32, v: Val) -> Result<(), Error> {
@@ -148,6 +161,28 @@ pub mod linear {
             };
             match v {
                 Some(v) => l.land(y, v),
+                None => Ok(()),
+            }
+        })
+    }
+
+    /// [`quant`] (not the lm head) with `sums` the width of the heads a norm
+    /// of `y` takes next: where the kernel can, it lands the heads' sums of
+    /// squares beside the rows, kept for that norm.
+    pub fn quant_sums(
+        ctx: &Ctx<'_>,
+        act: Tensor,
+        w: Bank,
+        y: Tensor,
+        sums: Option<i64>,
+    ) -> Result<(), Error> {
+        lower(ctx, |l| {
+            let a = l.read(act)?;
+            let w = l.bank(quant::bank_view(w))?;
+            let tuning = l.tuning();
+            match quant::matmul_sums(l.f(), a, w, y.landing(), sums, tuning)? {
+                Some((v, Some(s))) => l.land_sums(y, v, s),
+                Some((v, None)) => l.land(y, v),
                 None => Ok(()),
             }
         })

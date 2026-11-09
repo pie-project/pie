@@ -2183,6 +2183,24 @@ impl Shell {
         Ok((self.device.program(&text, sig)?, probed))
     }
 
+    /// The values a trace's unweighted per-head rms norms read, with their head
+    /// widths.
+    fn head_norms(trace: &Trace) -> Vec<(ValueId, u32)> {
+        trace
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.op {
+                poem_ir::Operation::Elemwise(poem_ir::Elemwise::Rmsnorm {
+                    x,
+                    weight: poem_ir::NormWeight::None,
+                    axis: poem_ir::NormAxis::Head(d),
+                    ..
+                }) => Some((*x, *d)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The program text of one fire's walk, and the values it probes.
     #[allow(clippy::too_many_arguments)]
     fn trace_text(
@@ -2220,7 +2238,8 @@ impl Shell {
             .with_compressor(self.pools.compressors())
             .with_rs(rs)
             .with_readout_rowed(&self.readout_rowed)
-            .with_probes(self.probes.clone());
+            .with_probes(self.probes.clone())
+            .with_head_norms(Self::head_norms(&self.trace));
             walk(
                 &self.trace,
                 &self.compiled,

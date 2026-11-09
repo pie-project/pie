@@ -94,6 +94,11 @@ pub struct Gmm {
     /// run's while a run's tiles go (a plain bank under a whole-`N` block
     /// only: see [`Gmm::prefetching`]).
     pub prefetch: bool,
+    /// A second f32 output beside the rows: each `sums`-wide head's sum of
+    /// squares of the f32 product, as the 128 lane-wise partial sums of its
+    /// lanes (`[rows, N / sums * 128]`), for the per-head norm that follows a
+    /// block-FP8 projection (`tile`, one expert, whole heads a block).
+    pub sums: Option<i64>,
 }
 
 /// How the weights are cut into blocks.
@@ -454,6 +459,18 @@ impl Gmm {
             Cut::Blocked { tn } => (tn, n / tn),
             Cut::Element { width } => (width, 1),
         };
+        if let Some(h) = self.sums
+            && (!self.tile
+                || e != 1
+                || h <= 0
+                || h % 128 != 0
+                || cols % h != 0
+                || !matches!(cut, Cut::Blocked { .. }))
+        {
+            return bad(format!(
+                "{h}-wide head sums over {cols}-column blocks of a [{k}, {e}x{n}] bank"
+            ));
+        }
         let out_width = self.out_width()?;
         let orient = self.orient;
 
@@ -589,6 +606,13 @@ impl Gmm {
             window: Window::Blocked,
             index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![last(b, g)?, g.ids[0]])),
         };
+        let sums = self.sums.map(|h| Operand {
+            array: vec![rows, n / h * 128],
+            elem: Elem::F32,
+            block: vec![tm, cols / h * 128],
+            window: Window::Blocked,
+            index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![last(b, g)?, g.ids[0]])),
+        });
 
         let convert = if self.w == Elem::Bf16 {
             0
@@ -605,8 +629,14 @@ impl Gmm {
         } else {
             0
         };
-        let vmem =
-            2 * tm * k * 2 + 2 * self.block_dma(cols) + convert + scaling + 2 * tm * cols * 4;
+        let vmem = 2 * tm * k * 2
+            + 2 * self.block_dma(cols)
+            + convert
+            + scaling
+            + 2 * tm * cols * 4
+            + self
+                .sums
+                .map_or(0, |h| tm * cols * 4 + 2 * tm * (cols / h * 128) * 4);
         // At least the compiler's own scoped default, where the device has it.
         let floor = (32 << 20).min(self.vmem_cap);
         let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
@@ -619,9 +649,11 @@ impl Gmm {
                 .into_iter()
                 .flatten()
                 .collect(),
-            outs: vec![out],
+            outs: [Some(out), sums].into_iter().flatten().collect(),
             vmem_limit: Some(limit as u64),
-            scratch: vec![],
+            scratch: self.sums.map_or_else(Vec::new, |_| {
+                vec![MTy::Ref(vec![tm, cols], Elem::F32, Space::Vmem)]
+            }),
         };
         kernel.build(|b, blk| {
             let zero = b.index(0);
@@ -665,6 +697,9 @@ impl Gmm {
                 } else {
                     y
                 };
+                if let Some(h) = self.sums {
+                    head_sums(b, y, blk.scratch[0], blk.outs[1], tm, cols, h)?;
+                }
                 let Cut::Element { width } = cut else {
                     let y = b.convert_f(y, self.out)?;
                     return b.vstore_all(y, blk.outs[0]);
@@ -696,6 +731,26 @@ impl Gmm {
             })
         })
     }
+}
+
+/// Each `h`-wide head's lane-wise partial sums of squares of the f32 rows
+/// `y` (`[tm, cols]`, parked in `park`): the head's `h / 128` lane tiles
+/// squared and summed into one, stored as the head's tile of `out`.
+fn head_sums(b: &mut Body, y: V, park: V, out: V, tm: i64, cols: i64, h: i64) -> Built<()> {
+    b.vstore_all(y, park)?;
+    let zero = b.index(0);
+    for head in 0..cols / h {
+        let mut acc = b.splat_f(&[tm, 128], Elem::F32, 0.0)?;
+        for t in 0..h / 128 {
+            let at = b.index(head * h + t * 128);
+            let v = b.vload(park, &[zero, at], &[tm, 128])?;
+            let sq = b.mulf(v, v)?;
+            acc = b.addf(acc, sq)?;
+        }
+        let at = b.index(head * 128);
+        b.vstore(acc, out, &[zero, at])?;
+    }
+    Ok(())
 }
 
 /// e4m3 codes `w` (`[K, cols]`) as bf16, each times its 128-code block's
@@ -873,6 +928,7 @@ mod tests {
             bias: false,
             out: Elem::F32,
             prefetch: false,
+            sums: None,
         }
     }
 

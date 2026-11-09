@@ -641,14 +641,17 @@ pub(crate) fn planes<T: Stored>(
 }
 
 /// `x · wᵀ` for the bank, f32 `[m, n]` (or `out`, where a kernel can land
-/// it so); `x` is `[m, k]` bf16 or f32.
+/// it so); `x` is `[m, k]` bf16 or f32. With `sums`, the block-FP8 kernel
+/// lands each `sums`-wide head's sum of squares beside the rows
+/// (`moe_gmm::Gmm::sums`); no other path does.
 pub(crate) fn contract(
     f: &mut Func,
     x: Val,
     p: &Planes,
     tuning: Tuning,
     out: Elem,
-) -> Result<Val, Error> {
+    sums: Option<i64>,
+) -> Result<(Val, Option<Val>), Error> {
     let g = i64::from(p.groups);
     let n = i64::from(p.codes.rows);
     let k = f.dims(x)[1];
@@ -695,14 +698,15 @@ pub(crate) fn contract(
                 "linear.matmul",
                 "block-FP8 codes land one e4m3 a weight, not packed in bytes",
             )),
-        };
+        }
+        .map(|y| (y, None));
     }
     let mxfp4 = matches!(p.form, Form::Mxfp4);
     let codes = read_codes(f, p.codes, p.bits, mxfp4, n, k)?;
     if let Codes::Weights(_) = codes {
-        return contract_native(f, x, codes, g, None, None, tuning);
+        return contract_native(f, x, codes, g, None, None, tuning).map(|y| (y, None));
     }
-    match p.form {
+    let y = match p.form {
         Form::Affine { biases } => {
             let s = p.scales.f32(f);
             let b = biases.f32(f);
@@ -719,7 +723,7 @@ pub(crate) fn contract(
             // The grouped-matmul kernel streams the codes and widens them in
             // VMEM, where a block of the weight fits it.
             if let Codes::Int(c) = codes
-                && let Some(y) = crate::linear::moe::tile_projection(f, x, c, s, tuning, out)?
+                && let Some(y) = crate::linear::moe::tile_projection(f, x, c, s, tuning, out, sums)?
             {
                 return Ok(y);
             }
@@ -727,14 +731,15 @@ pub(crate) fn contract(
             // weight past a few rows: then the weight decodes once, each
             // rounded to bf16 as the bf16 deployment holds it.
             if grouped(tuning, f.dims(x)[0], g) {
-                return contract_native(f, x, codes, g, Some(s), None, tuning);
+                return contract_native(f, x, codes, g, Some(s), None, tuning).map(|y| (y, None));
             }
             let q = code_values(f, codes, Elem::Bf16)?;
             let q = f.reshape(q, &[n, g, k / g])?;
             let w = materialize(f, q, s, None)?;
             project(f, x, w, true)
         }
-    }
+    }?;
+    Ok((y, None))
 }
 
 /// `y = act · wᵀ` for a quantized bank, its planes read as [`bank_view`]
@@ -746,7 +751,22 @@ pub fn matmul(
     y: Landing,
     tuning: Tuning,
 ) -> Result<Option<Val>, Error> {
-    act_x_wt(f, "linear.matmul", act, w, y, tuning)
+    Ok(act_x_wt(f, "linear.matmul", act, w, y, tuning, None)?.map(|(y, _)| y))
+}
+
+/// [`matmul`], and with `sums` each `sums`-wide head's f32 sum of squares of
+/// the rows where the kernel lands them (`[m, n / sums * 128]`, the 128
+/// lane-wise partials of a head; see `moe_gmm::Gmm::sums`), for the per-head
+/// norm that follows.
+pub fn matmul_sums(
+    f: &mut Func,
+    act: Operand,
+    w: Bank<Operand>,
+    y: Landing,
+    sums: Option<i64>,
+    tuning: Tuning,
+) -> Result<Option<(Val, Option<Val>)>, Error> {
+    act_x_wt(f, "linear.matmul", act, w, y, tuning, sums)
 }
 
 pub fn lm_head(
@@ -756,7 +776,7 @@ pub fn lm_head(
     y: Landing,
     tuning: Tuning,
 ) -> Result<Option<Val>, Error> {
-    act_x_wt(f, "linear.matmul", act, w, y, tuning)
+    Ok(act_x_wt(f, "linear.matmul", act, w, y, tuning, None)?.map(|(y, _)| y))
 }
 
 pub fn act_x_wt(
@@ -766,7 +786,8 @@ pub fn act_x_wt(
     w: Bank<Operand>,
     y: Landing,
     tuning: Tuning,
-) -> Result<Option<Val>, Error> {
+    sums: Option<i64>,
+) -> Result<Option<(Val, Option<Val>)>, Error> {
     let (m, n, k) = extent(op, act, y)?;
     let p = planes(op, &w, n, k)?;
     if m == 0 {
@@ -787,6 +808,5 @@ pub fn act_x_wt(
     } else {
         Elem::F32
     };
-    let out = contract(f, x, &p, tuning, elem)?;
-    Ok(Some(out))
+    Ok(Some(contract(f, x, &p, tuning, elem, sums)?))
 }
