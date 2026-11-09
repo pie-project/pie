@@ -261,6 +261,10 @@ pub struct Func {
     /// The source location every op emitted now carries (`loc("…")`), which
     /// XLA keeps as the op's name in profiles.
     scope: Option<String>,
+    /// Parameters laid out row-major (`pin_row_major`), and whether every
+    /// result is.
+    row_major: Vec<usize>,
+    row_major_results: bool,
 }
 
 fn list<T: fmt::Display>(xs: &[T]) -> String {
@@ -359,6 +363,8 @@ impl Func {
             depth: 1,
             next: 0,
             scope: None,
+            row_major: Vec::new(),
+            row_major_results: false,
         }
     }
 
@@ -446,6 +452,21 @@ impl Func {
         let v = self.fresh(name, ty);
         self.params.push((v, alias));
         v
+    }
+
+    /// Lays parameter `v` out row-major, and the result it is donated to:
+    /// the TPU's own layout for a narrow plane is column-major, which every
+    /// row gather of it copies whole first (a 64-wide rope plane: a copy of
+    /// the pool plane a layer, every fire).
+    pub fn pin_row_major(&mut self, v: Val) {
+        if let Some(at) = self.params.iter().position(|(p, _)| *p == v) {
+            self.row_major.push(at);
+        }
+    }
+
+    /// Lays every result out row-major.
+    pub fn pin_results_row_major(&mut self) {
+        self.row_major_results = true;
     }
 
     /// Donates parameter `param` to result `result`: the executable may
@@ -682,11 +703,45 @@ impl Func {
                 s.push_str(", ");
             }
             let _ = write!(s, "{}: {}", self.name(*v), self.ty(*v));
-            if let Some(out) = alias {
-                let _ = write!(s, " {{tf.aliasing_output = {out} : i32}}");
+            let pinned = self.row_major.contains(&i);
+            match (pinned, alias) {
+                (true, Some(out)) => {
+                    let _ = write!(
+                        s,
+                        " {{mhlo.layout_mode = \"{}\", tf.aliasing_output = {out} : i32}}",
+                        row_major(self.ty(*v))
+                    );
+                }
+                (true, None) => {
+                    let _ = write!(s, " {{mhlo.layout_mode = \"{}\"}}", row_major(self.ty(*v)));
+                }
+                (false, Some(out)) => {
+                    let _ = write!(s, " {{tf.aliasing_output = {out} : i32}}");
+                }
+                (false, None) => {}
             }
         }
-        let _ = writeln!(s, ") -> ({}) {{", self.tys_of(results));
+        let mut outs = String::new();
+        for (i, v) in results.iter().enumerate() {
+            if i > 0 {
+                outs.push_str(", ");
+            }
+            let _ = write!(outs, "{}", self.ty(*v));
+            let pinned = self.row_major_results
+                || self
+                    .params
+                    .iter()
+                    .enumerate()
+                    .any(|(p, (_, a))| *a == Some(i as u32) && self.row_major.contains(&p));
+            if pinned {
+                let _ = write!(
+                    outs,
+                    " {{mhlo.layout_mode = \"{}\"}}",
+                    row_major(self.ty(*v))
+                );
+            }
+        }
+        let _ = writeln!(s, ") -> ({outs}) {{");
         s.push_str(&self.body);
         let _ = writeln!(
             s,
@@ -1949,6 +2004,13 @@ const fn int_max(elem: Elem) -> i64 {
     }
 }
 
+/// `ty`'s row-major layout as XLA writes it, minor dimension first:
+/// `{1,0}` for a plane.
+fn row_major(ty: &Ty) -> String {
+    let dims: Vec<String> = (0..ty.rank()).rev().map(|d| d.to_string()).collect();
+    format!("{{{}}}", dims.join(","))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1964,6 +2026,15 @@ mod tests {
         assert!(text.contains("func.func public @main(%arg0: tensor<2x3xf32>, %arg1: tensor<2x3xf32> {tf.aliasing_output = 0 : i32}) -> (tensor<2x3xf32>, tensor<2xf32>)"));
         assert!(text.contains("\"stablehlo.add\"(%arg0, %arg1)"));
         assert!(text.contains("\"stablehlo.reduce\""));
+    }
+
+    #[test]
+    fn a_row_major_parameter_and_its_result_state_their_layout() {
+        let mut f = Func::new("main");
+        let a = f.param(Ty::new(Elem::Bf16, &[16, 64]), Some(0));
+        f.pin_row_major(a);
+        let text = f.module("m", &[a]);
+        assert!(text.contains("%arg0: tensor<16x64xbf16> {mhlo.layout_mode = \"{1,0}\", tf.aliasing_output = 0 : i32}) -> (tensor<16x64xbf16> {mhlo.layout_mode = \"{1,0}\"})"));
     }
 
     #[test]
