@@ -33,6 +33,10 @@ const G: i64 = 8;
 /// Keys a chunk of a row's walk.
 const CHUNK: i64 = 128;
 
+/// The query heads' lanes: a row's heads padded to a whole vreg row (heads
+/// past `qh` score nothing and are cut off after).
+const QP: i64 = 128;
+
 /// One kernel's static shape.
 #[derive(Clone, Copy, Debug)]
 struct Shape {
@@ -55,8 +59,8 @@ impl Shape {
         // both slots of keys and values, the state, the blocks, room for
         // a chunk's temporaries
         2 * span * (w + wv) * 2
-            + wv * qh.max(128) * 4
-            + 2 * G * (qh * h.d * 2 + wv * qh.max(128) * 4)
+            + wv * QP * 4
+            + 2 * G * (qh * h.d * 2 + h.dv * QP * 4 + 2 * QP * 4)
             + 8 * CHUNK * (w + wv) * 4
     }
 }
@@ -113,18 +117,18 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             whole(vec![slots, wv]),
         ],
         outs: vec![
-            block(vec![rp * dv, qh], Elem::F32, vec![G * dv, qh]),
-            block(vec![rp, qh], Elem::F32, vec![G, qh]),
-            block(vec![rp, qh], Elem::F32, vec![G, qh]),
+            block(vec![rp * dv, QP], Elem::F32, vec![G * dv, QP]),
+            block(vec![rp, QP], Elem::F32, vec![G, QP]),
+            block(vec![rp, QP], Elem::F32, vec![G, QP]),
         ],
         vmem_limit: Some(u64::try_from(vmem_cap).unwrap_or(0)),
         scratch: vec![
             MTy::Ref(vec![2, span, w], Elem::Bf16, Space::Vmem),
             MTy::Ref(vec![2, span, wv], Elem::Bf16, Space::Vmem),
             MTy::Sem(vec![2, 2]),
-            MTy::Ref(vec![1, qh], Elem::F32, Space::Vmem),
-            MTy::Ref(vec![1, qh], Elem::F32, Space::Vmem),
-            MTy::Ref(vec![wv, qh], Elem::F32, Space::Vmem),
+            MTy::Ref(vec![1, QP], Elem::F32, Space::Vmem),
+            MTy::Ref(vec![1, QP], Elem::F32, Space::Vmem),
+            MTy::Ref(vec![wv, QP], Elem::F32, Space::Vmem),
         ],
     };
     k.build(|b, blk| {
@@ -188,30 +192,36 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             copies(b, z, z, false)
         })?;
 
-        // the block-diagonal query's column heads and row heads
-        let dvec = b.splat_i(&[qh, w], d)?;
-        let io = b.iota(&[qh, w], 1);
+        // the block-diagonal query's column heads and row heads (a row
+        // past `qh` falls in no kv head)
+        let dvec = b.splat_i(&[QP, w], d)?;
+        let io = b.iota(&[QP, w], 1);
         let colh = b.divsi(io, dvec)?;
-        let gvec = b.splat_i(&[qh, w], gq)?;
-        let io = b.iota(&[qh, w], 0);
+        let gvec = b.splat_i(&[QP, w], gq)?;
+        let io = b.iota(&[QP, w], 0);
         let rowh = b.divsi(io, gvec)?;
         let diag = b.cmpi(ICmp::Eq, colh, rowh)?;
-        let zq = b.splat_f(&[qh, w], Elem::Bf16, 0.0)?;
-        // a query head's kv head, along the lanes of `[dv, qh]`
-        let gvo = b.splat_i(&[dv, qh], gq)?;
-        let io = b.iota(&[dv, qh], 1);
+        let zq = b.splat_f(&[QP, w], Elem::Bf16, 0.0)?;
+        let qpad = if QP > qh {
+            Some(b.splat_f(&[QP - qh, d], Elem::Bf16, 0.0)?)
+        } else {
+            None
+        };
+        // a query head's kv head, along the lanes of `[dv, QP]`
+        let gvo = b.splat_i(&[dv, QP], gq)?;
+        let io = b.iota(&[dv, QP], 1);
         let head_o = b.divsi(io, gvo)?;
-        let key_s = b.iota(&[CHUNK, qh], 0);
+        let key_s = b.iota(&[CHUNK, QP], 0);
         let key_v = b.iota(&[CHUNK, wv], 0);
-        let ninf_s = b.splat_f(&[CHUNK, qh], Elem::F32, f64::NEG_INFINITY)?;
-        let ninf1 = b.splat_f(&[1, qh], Elem::F32, f64::NEG_INFINITY)?;
-        let z1 = b.splat_f(&[1, qh], Elem::F32, 0.0)?;
-        let o1 = b.splat_f(&[1, qh], Elem::F32, 1.0)?;
-        let zs = b.splat_f(&[CHUNK, qh], Elem::F32, 0.0)?;
-        let za = b.splat_f(&[wv, qh], Elem::F32, 0.0)?;
-        let zo = b.splat_f(&[dv, qh], Elem::F32, 0.0)?;
+        let ninf_s = b.splat_f(&[CHUNK, QP], Elem::F32, f64::NEG_INFINITY)?;
+        let ninf1 = b.splat_f(&[1, QP], Elem::F32, f64::NEG_INFINITY)?;
+        let z1 = b.splat_f(&[1, QP], Elem::F32, 0.0)?;
+        let o1 = b.splat_f(&[1, QP], Elem::F32, 1.0)?;
+        let zs = b.splat_f(&[CHUNK, QP], Elem::F32, 0.0)?;
+        let za = b.splat_f(&[wv, QP], Elem::F32, 0.0)?;
+        let zo = b.splat_f(&[dv, QP], Elem::F32, 0.0)?;
         let zv = b.splat_f(&[CHUNK, wv], Elem::Bf16, 0.0)?;
-        let sc = b.splat_f(&[CHUNK, qh], Elem::F32, scale)?;
+        let sc = b.splat_f(&[CHUNK, QP], Elem::F32, scale)?;
 
         let (z, gn, step1) = (b.i32(0), b.i32(G), b.i32(1));
         b.for_range(z, gn, step1, |b, r| {
@@ -244,6 +254,10 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             let at = b.as_index(at)?;
             let i0 = b.index(0);
             let q = b.vload(q_ref, &[at, i0], &[qh, d])?;
+            let q = match qpad {
+                Some(z) => b.concat(&[q, z], 0)?,
+                None => q,
+            };
             let reps: Vec<V> = (0..kvh).map(|_| q).collect();
             let qt = b.concat(&reps, 1)?;
             let qbd = b.select(diag, qt, zq)?;
@@ -269,25 +283,25 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                 let s = b.matmul(kc, qbd, zs, true)?;
                 let s = b.mulf(s, sc)?;
                 // keys in `[lo_k, hi_k)` only
-                let off = b.broadcast_i(kb, &[CHUNK, qh])?;
+                let off = b.broadcast_i(kb, &[CHUNK, QP])?;
                 let kj = b.addi(key_s, off)?;
-                let lb = b.broadcast_i(lo_k, &[CHUNK, qh])?;
-                let hb = b.broadcast_i(hi_k, &[CHUNK, qh])?;
+                let lb = b.broadcast_i(lo_k, &[CHUNK, QP])?;
+                let hb = b.broadcast_i(hi_k, &[CHUNK, QP])?;
                 let ge = b.cmpi(ICmp::Sge, kj, lb)?;
                 let lt = b.cmpi(ICmp::Slt, kj, hb)?;
                 let valid = b.andi(ge, lt)?;
                 let s = b.select(valid, s, ninf_s)?;
-                let m0 = b.vload(m_sc, &[i0, i0], &[1, qh])?;
+                let m0 = b.vload(m_sc, &[i0, i0], &[1, QP])?;
                 let mx = b.max_rows(s)?;
                 let mn = b.maxf(m0, mx)?;
                 let alive = b.cmpf(true, mn, ninf1)?;
                 let ms = b.select(alive, mn, z1)?;
-                let msb = b.broadcast(ms, &[CHUNK, qh])?;
+                let msb = b.broadcast(ms, &[CHUNK, QP])?;
                 let zz = b.subf(s, msb)?;
                 let p = b.exp(zz)?;
                 let dm = b.subf(m0, ms)?;
                 let corr = b.exp(dm)?;
-                let l0 = b.vload(l_sc, &[i0, i0], &[1, qh])?;
+                let l0 = b.vload(l_sc, &[i0, i0], &[1, QP])?;
                 let l = b.mulf(l0, corr)?;
                 let ps_ = b.sum_rows(p)?;
                 let l = b.addf(l, ps_)?;
@@ -306,27 +320,27 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                 let vc = b.select(held, vc, zv)?;
                 let pb = b.convert_f(p, Elem::Bf16)?;
                 let ov = b.matmul_tl(vc, pb, za)?;
-                let a0 = b.vload(a_sc, &[i0, i0], &[wv, qh])?;
-                let cb = b.broadcast(corr, &[wv, qh])?;
+                let a0 = b.vload(a_sc, &[i0, i0], &[wv, QP])?;
+                let cb = b.broadcast(corr, &[wv, QP])?;
                 let a = b.mulf(a0, cb)?;
                 let a = b.addf(a, ov)?;
                 b.vstore(a, a_sc, &[i0, i0])
             })?;
             // each query head's column off its own kv head's rows
-            let a = b.vload(a_sc, &[i0, i0], &[wv, qh])?;
+            let a = b.vload(a_sc, &[i0, i0], &[wv, QP])?;
             let mut o = zo;
             for kh in 0..kvh {
-                let part = b.slice(a, &[kh * dv, 0], &[dv, qh])?;
-                let khv = b.splat_i(&[dv, qh], kh)?;
+                let part = b.slice(a, &[kh * dv, 0], &[dv, QP])?;
+                let khv = b.splat_i(&[dv, QP], kh)?;
                 let mine = b.cmpi(ICmp::Eq, head_o, khv)?;
                 o = b.select(mine, part, o)?;
             }
-            let m = b.vload(m_sc, &[i0, i0], &[1, qh])?;
-            let l = b.vload(l_sc, &[i0, i0], &[1, qh])?;
+            let m = b.vload(m_sc, &[i0, i0], &[1, QP])?;
+            let l = b.vload(l_sc, &[i0, i0], &[1, QP])?;
             let pos = b.cmpf(true, l, z1)?;
             let inv = b.divf(o1, l)?;
             let inv = b.select(pos, inv, z1)?;
-            let ib = b.broadcast(inv, &[dv, qh])?;
+            let ib = b.broadcast(inv, &[dv, QP])?;
             let o = b.mulf(o, ib)?;
             let dvv = b.i32(dv);
             let ot = b.muli(r, dvv)?;
@@ -398,12 +412,14 @@ pub(crate) fn attend(
     let values = f.convert(values, Elem::Bf16);
     let kern = kernel(&s, vmem_cap)?;
     let out = kern.call(f, &[pt, lane, lo, hi, q, keys, values])?;
-    // `[rp·dv, qh]` as `[r, kvh, g, dv]`
-    let o = f.reshape(out[0], &[rp, h.dv, qh])?;
+    // `[rp·dv, QP]` as `[r, kvh, g, dv]`
+    let o = f.reshape(out[0], &[rp, h.dv, QP])?;
+    let o = f.slice_axis(o, 2, 0, qh)?;
     let o = f.transpose(o, &[0, 2, 1])?;
     let o = f.slice_axis(o, 0, 0, r)?;
     let o = f.reshape(o, &[r, h.kvh, h.g, h.dv])?;
     let stat = |f: &mut Func, x: Val| -> Built<Val> {
+        let x = f.slice_axis(x, 1, 0, qh)?;
         let x = f.slice_axis(x, 0, 0, r)?;
         f.reshape(x, &[r, h.kvh, h.g])
     };
