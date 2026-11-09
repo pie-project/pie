@@ -20,3 +20,4 @@ mod kernels_norm;
 mod kernels_ple;
 mod kernels_rope;
 mod kernels_ssm;
+mod the_pools_read_as_degenerate_chunks;

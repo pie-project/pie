@@ -347,6 +347,29 @@ impl Engine for Spatial {
             .model
             .as_ref()
             .map_or(u32::MAX, |w| u32::try_from(w.positions).unwrap_or(u32::MAX));
+        let pools = PoolFacts {
+            // A batched wafer build reads at most E of a lane's pages on a
+            // row: pages below rows x E fill every row E times over, so no
+            // lane can name more.
+            kv_pages: u32::try_from(paging.pages())
+                .unwrap_or(u32::MAX)
+                .min(wafer_pool.map_or(u32::MAX, |s| (s.rows * s.entries) as u32)),
+            kv_page_size: paging.page_size,
+            state_slots: if state_rows { paging.slots } else { 0 },
+            buffer_pages: shell.buffer_pages(),
+            state_slot_bytes: shell.state_slot_bytes(),
+            adapter_banks: 0,
+            host_kv_pages: self.kv.host_pages,
+            ..PoolFacts::default()
+        };
+        // The wafer keeps a batched build's kv as PIE's pages, a page the
+        // bytes its host copy takes; no padding lane writes a sink here.
+        let mut bytes = crate::store::page_bytes(shell.trace(), paging).map_err(fault)?;
+        if let Some(page) = self.model.as_ref().and_then(|w| w.page_bytes) {
+            bytes.kv_page = page as u64;
+        }
+        let chunks = engine::chunk::ChunkFacts::degenerate(&pools, &bytes);
+        shell.log_chunk_recipe();
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cerebras".to_string(),
@@ -359,22 +382,8 @@ impl Engine for Spatial {
                 storage_max_tile_bytes: u64::MAX,
                 codegen_backend: None,
             },
-            pools: PoolFacts {
-                // A batched wafer build reads at most E of a lane's pages on a
-                // row: pages below rows x E fill every row E times over, so no
-                // lane can name more.
-                kv_pages: u32::try_from(paging.pages())
-                    .unwrap_or(u32::MAX)
-                    .min(wafer_pool.map_or(u32::MAX, |s| (s.rows * s.entries) as u32)),
-                kv_page_size: paging.page_size,
-                state_slots: if state_rows { paging.slots } else { 0 },
-                buffer_pages: shell.buffer_pages(),
-                state_slot_bytes: shell.state_slot_bytes(),
-                adapter_banks: 0,
-                host_kv_pages: self.kv.host_pages,
-                ..PoolFacts::default()
-            },
-            chunks: None,
+            pools,
+            chunks: Some(chunks),
             limits: FireLimits {
                 // The model holds one sequence's cache; a fire's lanes run one
                 // after another, each cache brought back from its tokens.
