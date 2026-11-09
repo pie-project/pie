@@ -1114,7 +1114,7 @@ fn planes(
     if int4::stored_int4(src, &from) {
         return int4::int4_planes(src, w, &[from]);
     }
-    if w.dtype.fp8_blocks().is_some() {
+    if w.dtype.fp8_blocks().is_some() || exponents_beside(src, w, std::slice::from_ref(&from)) {
         return fp8_block_planes(src, w, vec![from]);
     }
     if stored_raw(src, &from)? {
@@ -1166,7 +1166,7 @@ fn planes_fused(
     if parts.iter().all(|part| int4::stored_int4(src, part)) {
         return int4::int4_planes(src, w, &parts);
     }
-    if w.dtype.fp8_blocks().is_some() {
+    if w.dtype.fp8_blocks().is_some() || exponents_beside(src, w, &parts) {
         return fp8_block_planes(src, w, parts);
     }
     if parts.iter().try_fold(true, |all, part| {
@@ -1827,9 +1827,21 @@ fn mx_planes(
     ])
 }
 
+/// Whether `w` is read at the block-FP8 of f32 factors (`e4m3tile128`) from
+/// DeepSeek's planes: e4m3 codes beside `.scale` e8m0 exponents.
+fn exponents_beside(src: &ztensor::Source, w: &Weight, parts: &[String]) -> bool {
+    w.dtype == Dtype::E4m3tile128
+        && parts.iter().all(|part| {
+            part.strip_suffix(".weight")
+                .is_some_and(|stem| src.get(&format!("{stem}.scale")).is_some())
+        })
+}
+
 /// An fp8b128 weight as DeepSeek releases it: raw e4m3 `{stem}.weight` beside
 /// `{stem}.scale` (one e8m0 exponent a 128x128 block), landed as stored; legs
-/// join along their rows, each a whole number of blocks.
+/// join along their rows, each a whole number of blocks. Read at
+/// `e4m3tile128`, each exponent lands as its f32 factor (`2^(e - 127)`,
+/// exact).
 fn fp8_block_planes(
     src: &ztensor::Source,
     w: &Weight,
@@ -1839,10 +1851,14 @@ fn fp8_block_planes(
         name: w.name.clone(),
         detail,
     };
-    let (br, bc) = w
-        .dtype
-        .fp8_blocks()
-        .expect("only a block-fp8 weight reads its exponent planes");
+    let factors = w.dtype == Dtype::E4m3tile128;
+    let (br, bc) = if factors {
+        (128, 128)
+    } else {
+        w.dtype
+            .fp8_blocks()
+            .expect("only a block-fp8 weight reads its exponent planes")
+    };
     let (br, bc) = (i64::from(br), i64::from(bc));
     if w.shape.len() != 2 {
         return Err(illegible(format!(
@@ -1909,12 +1925,21 @@ fn fp8_block_planes(
             vec![n, k],
             encoding(Dtype::E4m3),
         ),
-        TensorContract::new(
-            crate::scales_name(&w.name),
-            joined(axis, scales),
-            vec![(n + br - 1) / br, (k + bc - 1) / bc],
-            encoding(Dtype::E8m0),
-        ),
+        if factors {
+            TensorContract::new(
+                crate::scales_name(&w.name),
+                joined(axis, scales).cast(encoding(Dtype::F32)),
+                vec![(n + br - 1) / br, (k + bc - 1) / bc],
+                encoding(Dtype::F32),
+            )
+        } else {
+            TensorContract::new(
+                crate::scales_name(&w.name),
+                joined(axis, scales),
+                vec![(n + br - 1) / br, (k + bc - 1) / bc],
+                encoding(Dtype::E8m0),
+            )
+        },
     ])
 }
 
