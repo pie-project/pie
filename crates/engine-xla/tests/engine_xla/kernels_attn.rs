@@ -604,6 +604,9 @@ fn a_batched_decode_through_the_page_copy_kernel_answers_the_reference() {
     for (qh, kvh, d) in [(16usize, 8usize, 128usize), (8, 2, 128), (8, 2, 256)] {
         long_decode_with(qh, kvh, d, None, tuning);
     }
+    // a sliding window's rows read only the pages their window covers
+    long_decode_with(8, 2, 128, Some(100), tuning);
+    long_decode_with(8, 2, 256, Some(512), tuning);
 }
 
 fn long_decode(qh: usize, kvh: usize, d: usize) {
