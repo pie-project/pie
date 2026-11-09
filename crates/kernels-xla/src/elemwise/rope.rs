@@ -14,6 +14,7 @@ use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::Func;
 use crate::hlo::{Cmp, Elem, GatherDims, Val};
+use crate::lanes::ci;
 use crate::tensor::{Operand, Stored};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -124,6 +125,27 @@ pub(crate) fn take_cols(f: &mut Func, x: Val, idx: &[i64]) -> Result<Val, Error>
     )?)
 }
 
+/// The run `[a, b)` of a head's columns `t` turns, as a table of its own,
+/// when that run is not the whole head and pairs only within itself.
+fn span(t: &Turn) -> Option<(usize, usize, Turn)> {
+    let moved = |i: usize| t.sign[i] != 0.0;
+    let a = (0..t.unit).find(|&i| moved(i))?;
+    let b = (0..t.unit).rfind(|&i| moved(i))? + 1;
+    let inside = t.partner[a..b]
+        .iter()
+        .all(|&p| (a as i64..b as i64).contains(&p));
+    ((a > 0 || b < t.unit) && inside).then(|| {
+        let sub = Turn {
+            unit: b - a,
+            partner: t.partner[a..b].iter().map(|&p| p - a as i64).collect(),
+            sign: t.sign[a..b].to_vec(),
+            freq: t.freq.iter().map(|fq| fq[a..b].to_vec()).collect(),
+            mscale: t.mscale,
+        };
+        (a, b, sub)
+    })
+}
+
 /// Applies `t` to an f32 `[rows, width]`, `pos` an f32 `[rows, axes]`.
 pub(crate) fn turn(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Val, Error> {
     let dims = f.dims(x).to_vec();
@@ -134,38 +156,21 @@ pub(crate) fn turn(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Val, Erro
     // Only the columns the table turns go through it (a 64-wide rope tail
     // of a 512-wide head: a lane gather and the sines over every column
     // otherwise, 24.6 of a 171 ms DeepSeek-V4 prompt fire on a v5e).
-    let moved = |i: usize| t.sign[i] != 0.0;
-    if let (Some(a), Some(b)) = (
-        (0..t.unit).find(|&i| moved(i)),
-        (0..t.unit).rfind(|&i| moved(i)),
-    ) {
-        let b = b + 1;
-        let inside = t.partner[a..b]
-            .iter()
-            .all(|&p| (a as i64..b as i64).contains(&p));
-        if (a > 0 || b < t.unit) && inside {
-            let sub = Turn {
-                unit: b - a,
-                partner: t.partner[a..b].iter().map(|&p| p - a as i64).collect(),
-                sign: t.sign[a..b].to_vec(),
-                freq: t.freq.iter().map(|fq| fq[a..b].to_vec()).collect(),
-                mscale: t.mscale,
-            };
-            let mid = f.slice_axis(x3, 2, a as i64, b as i64)?;
-            let mid = f.reshape(mid, &[rows, groups * (b - a) as i64])?;
-            let mid = turn(f, mid, pos, &sub)?;
-            let mid = f.reshape(mid, &[rows, groups, (b - a) as i64])?;
-            let mut parts = Vec::with_capacity(3);
-            if a > 0 {
-                parts.push(f.slice_axis(x3, 2, 0, a as i64)?);
-            }
-            parts.push(mid);
-            if b < t.unit {
-                parts.push(f.slice_axis(x3, 2, b as i64, unit)?);
-            }
-            let out = f.concat(&parts, 2)?;
-            return Ok(f.reshape(out, &[rows, width])?);
+    if let Some((a, b, sub)) = span(t) {
+        let mid = f.slice_axis(x3, 2, a as i64, b as i64)?;
+        let mid = f.reshape(mid, &[rows, groups * (b - a) as i64])?;
+        let mid = turn(f, mid, pos, &sub)?;
+        let mid = f.reshape(mid, &[rows, groups, (b - a) as i64])?;
+        let mut parts = Vec::with_capacity(3);
+        if a > 0 {
+            parts.push(f.slice_axis(x3, 2, 0, a as i64)?);
         }
+        parts.push(mid);
+        if b < t.unit {
+            parts.push(f.slice_axis(x3, 2, b as i64, unit)?);
+        }
+        let out = f.concat(&parts, 2)?;
+        return Ok(f.reshape(out, &[rows, width])?);
     }
     let mut ang: Option<Val> = None;
     for (axis, freq) in t.freq.iter().enumerate() {
@@ -322,6 +327,27 @@ pub(crate) fn rotate_all(
     for x in xs {
         if x.width == 0 {
             out.push(None);
+            continue;
+        }
+        // A run of each head's columns turns: only that run widens to f32,
+        // and it is written back over the stored row in place, not the
+        // whole row widened and joined again (DeepSeek-V4's 64-wide tail of
+        // 64 512-wide heads, a 1792-row prompt on a v6e: 5.9 of a 68 ms fire).
+        if let Some((a, b, sub)) = span(t) {
+            let (r, w) = (f.dims(x.val)[0], f.dims(x.val)[1]);
+            let (g, run) = (w / t.unit as i64, (b - a) as i64);
+            let elem = f.elem(x.val);
+            let x3 = f.reshape(x.val, &[r, g, t.unit as i64])?;
+            let mid = f.slice_axis(x3, 2, a as i64, b as i64)?;
+            let mid = f.reshape(mid, &[r, g * run])?;
+            let mid = f.convert(mid, Elem::F32);
+            let mid = turn(f, mid, pos, &sub)?;
+            let mid = f.convert(mid, elem);
+            let mid = f.reshape(mid, &[r, g, run])?;
+            let zero = ci(f, 0);
+            let at = ci(f, a as i64);
+            let x3 = f.dynamic_update_slice(x3, mid, &[zero, zero, at])?;
+            out.push(Some(f.reshape(x3, &[r, w])?));
             continue;
         }
         let v = x.f32(f);
