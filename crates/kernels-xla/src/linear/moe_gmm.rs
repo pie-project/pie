@@ -346,6 +346,25 @@ impl Gmm {
                 let held = b.ref_slice(wbuf, &[slot, z, z], &[1, rb, cb])?;
                 let held = b.ref_squeeze(held)?;
                 let x = b.vload_all(blk.ins[0])?;
+                let nc: i64 = std::env::var("PIE_XLA_GMM_NCHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                if nc > 0 && n % nc == 0 && nc % 128 == 0 && nc < n {
+                    for c in 0..n / nc {
+                        let at = b.i32(c * nc);
+                        let z = b.i32(0);
+                        let w = match orient {
+                            Orient::NMajor => b.vload(held, &[at, z], &[nc, k])?,
+                            Orient::KMajor => b.vload(held, &[z, at], &[k, nc])?,
+                        };
+                        let w = b.convert_f(w, Elem::Bf16)?;
+                        let acc = b.splat_f(&[tm, nc], Elem::F32, 0.0)?;
+                        let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
+                        let y = b.convert_f(y, out_elem)?;
+                        let z = b.i32(0);
+                        let at = b.i32(c * nc);
+                        b.vstore(y, blk.outs[0], &[z, at])?;
+                    }
+                    return Ok(());
+                }
                 let w = b.vload_all(held)?;
                 let w = b.convert_f(w, Elem::Bf16)?;
                 let acc = b.splat_f(&[tm, n], Elem::F32, 0.0)?;
