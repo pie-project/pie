@@ -556,6 +556,9 @@ pub struct Kernel {
     pub prefetch: Vec<Vec<i64>>,
     pub ins: Vec<Operand>,
     pub outs: Vec<Operand>,
+    /// VMEM buffers that persist across grid steps (each `[dims]` of an
+    /// element), after the results.
+    pub scratch: Vec<(Vec<i64>, Elem)>,
     /// The scoped VMEM the kernel may use (the compiler's default is
     /// 32 MiB on v6e).
     pub vmem_limit: Option<u64>,
@@ -567,6 +570,7 @@ pub struct Blocks {
     pub grid: Grid,
     pub ins: Vec<V>,
     pub outs: Vec<V>,
+    pub scratch: Vec<V>,
 }
 
 /// A kernel ready to call from StableHLO.
@@ -623,6 +627,11 @@ impl Kernel {
             .iter()
             .chain(&self.outs)
             .map(|o| MTy::Ref(o.block.clone(), o.elem, Space::Vmem))
+            .chain(
+                self.scratch
+                    .iter()
+                    .map(|(d, e)| MTy::Ref(d.clone(), *e, Space::Vmem)),
+            )
             .collect();
 
         let mut s = String::new();
@@ -638,7 +647,8 @@ impl Kernel {
         let (mut b, vs) = Body::new(&args);
         let (g, rest) = vs.split_at(grid_tys.len());
         let (p, rest) = rest.split_at(pre_tys.len());
-        let (ins, outs) = rest.split_at(self.ins.len());
+        let (ins, rest) = rest.split_at(self.ins.len());
+        let (outs, scratch) = rest.split_at(self.outs.len());
         let blocks = Blocks {
             grid: Grid {
                 ids: g.to_vec(),
@@ -646,6 +656,7 @@ impl Kernel {
             },
             ins: ins.to_vec(),
             outs: outs.to_vec(),
+            scratch: scratch.to_vec(),
         };
         body(&mut b, &blocks)?;
         b.ret(&[]);
@@ -701,10 +712,11 @@ impl Kernel {
         let _ = writeln!(
             s,
             "  }}) {{dimension_semantics = [{sems}], function_type = {}, iteration_bounds = \
-             array<i64: {bounds}>, scalar_prefetch = {} : i64, scratch_operands = 0 : i64, sym_name \
+             array<i64: {bounds}>, scalar_prefetch = {} : i64, scratch_operands = {} : i64, sym_name \
              = \"{}\", tpu.core_type = #tpu.core_type<tc>, window_params = [{windows}]}} : () -> ()",
             fty(&args, &[]),
             self.prefetch.len(),
+            self.scratch.len(),
             self.name
         );
 
@@ -876,6 +888,7 @@ mod tests {
                 window: Window::Blocked,
                 index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
             }],
+            scratch: vec![],
             vmem_limit: None,
         };
         let c = k
