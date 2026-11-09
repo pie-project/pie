@@ -1119,8 +1119,7 @@ fn bf16_rows(spec: Option<crate::linear::moe_gmm::Gmm>) -> Option<crate::linear:
 fn gmm_rows(p: i64, e: i64, base: i64) -> i64 {
     let per = p / e.min(p).max(1);
     let mut tm = base.max(16);
-    let cap: i64 = std::env::var("PIE_XLA_GMM_TM_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
-    while tm < cap && tm * 2 <= per {
+    while tm < 128 && tm * 2 <= per {
         tm *= 2;
     }
     tm

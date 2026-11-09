@@ -182,8 +182,7 @@ impl Gmm {
     /// tile's run and the next run's expert after `se` and `nt`).
     #[must_use]
     pub fn prefetching(&self) -> bool {
-        std::env::var("PIE_XLA_GMM_PREFETCH").is_ok_and(|v| v == "1")
-            && !self.scaled
+        !self.scaled
             && !self.bias
             && matches!(self.cut(), Ok(Cut::Blocked { tn }) if tn == self.n)
     }
@@ -196,13 +195,6 @@ impl Gmm {
             Orient::NMajor => (n, k),
             Orient::KMajor => (k, n),
         };
-        // Each expert's block copied in `parts` concurrent DMAs along its
-        // leading axis (one stream does not fill HBM).
-        let mut parts: i64 = std::env::var("PIE_XLA_GMM_DMAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-        while parts > 1 && rb % (16 * parts) != 0 {
-            parts -= 1;
-        }
-        let part = rb / parts;
         fn last(b: &mut Body, g: &Grid) -> Built<V> {
             let zero = b.index(0);
             let nt = b.load(g.prefetch[1], &[zero])?;
@@ -249,7 +241,7 @@ impl Gmm {
             vmem_limit: Some(limit as u64),
             scratch: vec![
                 MTy::Ref(vec![2, rb, cb], self.w, Space::Vmem),
-                MTy::Sem(vec![2, parts]),
+                MTy::Sem(vec![2]),
             ],
         };
         kernel.build(|b, blk| {
@@ -257,24 +249,18 @@ impl Gmm {
             let bank = blk.ins[1];
             let pre = &blk.grid.prefetch;
             let t = blk.grid.ids[1];
-            // Part `c` of the copy of expert `ex`'s weights into slot `s`.
-            let copy = |b: &mut Body, ex: V, s: V, c: i64| -> Built<(V, V, V)> {
+            // The copy of expert `ex`'s weights into slot `s`.
+            let copy = |b: &mut Body, ex: V, s: V| -> Built<(V, V, V)> {
                 let z = b.i32(0);
                 let nn = b.i32(n);
                 let at = b.muli(ex, nn)?;
-                let off = b.i32(c * part);
                 let src = match orient {
-                    Orient::NMajor => {
-                        let at = b.addi(at, off)?;
-                        b.ref_slice(bank, &[at, z], &[part, k])?
-                    }
-                    Orient::KMajor => b.ref_slice(bank, &[off, at], &[part, n])?,
+                    Orient::NMajor => b.ref_slice(bank, &[at, z], &[n, k])?,
+                    Orient::KMajor => b.ref_slice(bank, &[z, at], &[k, n])?,
                 };
-                let dst = b.ref_slice(wbuf, &[s, off, z], &[1, part, cb])?;
+                let dst = b.ref_slice(wbuf, &[s, z, z], &[1, rb, cb])?;
                 let dst = b.ref_squeeze(dst)?;
-                let ci = b.i32(c);
-                let sem = b.ref_slice(sems, &[s, ci], &[1, 1])?;
-                let sem = b.ref_squeeze(sem)?;
+                let sem = b.ref_slice(sems, &[s], &[1])?;
                 let sem = b.ref_squeeze(sem)?;
                 Ok((src, dst, sem))
             };
@@ -297,28 +283,20 @@ impl Gmm {
                 let first = b.select(at0, at0, moved)?;
                 b.when(at0, |b| {
                     let ex = b.load(pre[0], &[ti])?;
-                    for c in 0..parts {
-                        let (src, dst, sem) = copy(b, ex, slot, c)?;
-                        b.dma_start(src, dst, sem)?;
-                    }
-                    Ok(())
+                    let (src, dst, sem) = copy(b, ex, slot)?;
+                    b.dma_start(src, dst, sem)
                 })?;
                 b.when(first, |b| {
                     let z = b.i32(0);
-                    for c in 0..parts {
-                        let (src, dst, sem) = copy(b, z, slot, c)?;
-                        b.dma_wait(sem, src, dst)?;
-                    }
+                    let (src, dst, sem) = copy(b, z, slot)?;
+                    b.dma_wait(sem, src, dst)?;
                     let nx = b.load(pre[3], &[ti])?;
                     let has = b.cmpi(ICmp::Sge, nx, z)?;
                     b.when(has, |b| {
                         let one = b.i32(1);
                         let other = b.subi(one, slot)?;
-                        for c in 0..parts {
-                            let (src, dst, sem) = copy(b, nx, other, c)?;
-                            b.dma_start(src, dst, sem)?;
-                        }
-                        Ok(())
+                        let (src, dst, sem) = copy(b, nx, other)?;
+                        b.dma_start(src, dst, sem)
                     })
                 })?;
                 let z = b.i32(0);
