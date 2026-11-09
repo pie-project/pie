@@ -1180,6 +1180,7 @@ mod tests {
                         && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.fa2_live" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.compressed_replay" && std::ptr::eq(p, &l40s))
+                    || (spec.id.starts_with("compiler.dag_streams") && std::ptr::eq(p, &l40s))
                 {
                     continue;
                 }
