@@ -245,7 +245,7 @@ impl Shell {
                         // not have taken its memory yet, so each counts as
                         // still to come.
                         loop {
-                            let turn = admit.lock().unwrap_or_else(|e| e.into_inner());
+                            let turn = admit.lock().expect("the warm admission lock poisoned");
                             let busy = running.load(SeqCst) as u64;
                             if busy == 0
                                 || available_memory().is_none_or(|b| b >= need * (busy + 1))
