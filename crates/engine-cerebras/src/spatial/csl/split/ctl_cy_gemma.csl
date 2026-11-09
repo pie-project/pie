@@ -167,6 +167,7 @@ fn init() void {
   timestamp.enable_tsc();
   vinit();
   vinit2();
+  vinit3();
   if ((cfl & 1) != 0 and (DIAG & 32) == 0) { pl_post(); }   // step 0's words: the storage's, on the launch-start TB
   sys_mod.unblock_cmd_stream();
 }
@@ -302,6 +303,61 @@ var vd: [TN]f32 align(16) = @zeros([TN]f32);
 const vd_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TN} -> vd[i] });
 var vah = vk_d;
 fn vinit2() void { vah = @increment_dsd_offset(@set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, &va)), 2), 1, u16); }
+// vgelu on the MLP's Ic (dst u, src t): the same ops, comptime f32 views, the u16 views built once (vinit3), the
+// constant loops unrolled
+const gE = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> va[i] });
+const gP = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> vb[i] });
+const gR = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> vcr[i] });
+const gD = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> vd[i] });
+const gK = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> vk[i] });
+const gS = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> t[i] });
+const gO = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Ic} -> u[i] });
+var gPL = vk_d;
+var gPH = vk_d;
+var gAH = vk_d;
+fn vinit3() void {
+  gPL = @set_dsd_length(vpl, Ic);
+  gPH = @increment_dsd_offset(gPL, 1, u16);
+  gAH = @set_dsd_length(vah, Ic);
+}
+fn vgeluc() void {
+  @fmuls(gE, gS, gS);
+  @fmuls(gE, gE, 0.044715);
+  @fadds(gE, gE, 1.0);
+  @fmuls(gE, gE, gS);
+  @fmuls(gE, gE, 1.5957691216057308);   // y
+  @or16(gAH, gAH, 0x8000);              // -|y|
+  @fmaxs(gE, gE, -87.0);
+  @fmuls(gP, gE, 1.4426950408889634);
+  @fadds(gP, gP, ex_a[0]);
+  @fadds(gP, gP, ex_a[1]);
+  @fmacs(gE, gE, gP, -0.6931471805599453);
+  @fadds(gP, gP, ex_a[2]);
+  @sll16(gK, gPL, 7);
+  @fmuls(gP, gE, 0.041458580642938614);
+  @fadds(gP, gP, ex_c[0]);
+  @fmuls(gP, gP, gE);
+  @fadds(gP, gP, ex_c[1]);
+  @fmuls(gP, gP, gE);
+  @fadds(gP, gP, ex_c[2]);
+  @fmuls(gP, gP, gE);
+  @fadds(gP, gP, ex_c[3]);
+  @add16(gPH, gPH, gK);                 // p = exp(-|y|)
+  @fadds(gD, gP, 1.0);
+  @fmuls(gR, gD, 0.323112507040746);
+  @fadds(gR, gR, -1.4540415401729079);
+  @fmuls(gR, gR, gD);
+  @fadds(gR, gR, 2.1207294161729284);
+  @fmuls(gO, gD, gR);
+  @fsubs(gO, 2.0, gO);
+  @fmuls(gR, gR, gO);
+  @fmuls(gO, gD, gR);
+  @fsubs(gO, 2.0, gO);
+  @fmuls(gR, gR, gO);
+  @fmuls(gO, gS, gP);
+  @fmaxs(gO, gO, gS);
+  @fmuls(gO, gO, gR);
+}
 fn vgelu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
   if (GELUT == 0) { vgelu0(dst, src, n); return; }
   const e = @set_dsd_length(va_d, n);       // y, then -|y| (exp's argument)
@@ -381,15 +437,40 @@ fn rope(kd: u16, o: u16, np: u16) void {
 
 // ---------------------------------------------------------------- layers
 var ilh = @zeros([Qh]f32);
-fn att(l: u16) void {
-  const dc = dcl(l);
-  const NQ = nql(l);
+// (comptime per layer kind: the vector views are comptime DSDs, the loops' bounds constants; the same arithmetic in
+// the same order as the runtime form)
+fn tc(comptime o: u16, comptime n: u16) mem1d_dsd { return @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{n} -> t[@as(i16, o) + i] }); }
+fn uc(comptime o: u16, comptime n: u16) mem1d_dsd { return @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{n} -> u[@as(i16, o) + i] }); }
+fn combinec(comptime n: u16) f32 {
+  const s = rsqrt(t[2 * n] * IHID + EPS);
+  const ss = t[2 * n + 1] + 2.0 * s * t[2 * n + 2] + s * s * t[2 * n + 3];
+  const rr = rsqrt(ss * IHID + EPS);
+  @fmacs(tc(0, n), tc(0, n), tc(n, n), s);
+  @fmuls(tc(0, n), tc(0, n), rr);
+  return s;
+}
+fn ropec(comptime kd: u16, o: u16, comptime np: u16) void {
+  var j: u16 = 0;
+  while (j < np) : (j += 1) {
+    const a = t[o + 2 * j];
+    const b = t[o + 2 * j + 1];
+    t[o + 2 * j] = a * rc[kd * 2 + j] - b * rs[kd * 2 + j];
+    t[o + 2 * j + 1] = b * rc[kd * 2 + j] + a * rs[kd * 2 + j];
+  }
+}
+var posf: f32 = 0.0;    // the step's position as f32 (and + 1), converted once a step
+var posf1: f32 = 0.0;
+fn att(l: u16) void { if (isg(l)) { attk(l, true); } else { attk(l, false); } }
+fn attk(l: u16, comptime g: bool) void {
+  const dc: u16 = if (g) DcG else DcS;
   const QD: u16 = Qh * dc;
-  const kd: u16 = if (isg(l)) 1 else 0;
+  const NQ: u16 = QD + (if (SH == 1) 0 else 2 * dc);
+  const kd: u16 = if (g) 1 else 0;
   const np: u16 = dc / 2;
+  const AB: u16 = QD + 2 * dc + Qh + 4;
   reduce(2 * NQ + 4);
   stamp(1 + 6 * cl + 0);
-  const s = combine(NQ);
+  const s = combinec(NQ);
   const qkb = l * QKS;
   var h: u16 = 0;
   while (h < Qh) : (h += 1) {
@@ -399,11 +480,11 @@ fn att(l: u16) void {
     u[QD + 2 * dc + 1 + h] = ss;
   }
   const qw = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QKS} -> qkw[i] });
-  @fmuls(tv(0, QD), tv(0, QD), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb), f32), QD));
+  @fmuls(tc(0, QD), tc(0, QD), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb), f32), QD));
   rope_tables(kd, tab[0]);
   h = 0;
-  while (h < Qh) : (h += 1) { rope(kd, h * dc, np); }
-  @fmovs(uv(0, QD), tv(0, QD));
+  while (h < Qh) : (h += 1) { ropec(kd, h * dc, np); }
+  @fmovs(uc(0, QD), tc(0, QD));
   if (SH == 0) {
     var ks: f32 = 0.0;
     var vs: f32 = 0.0;
@@ -411,17 +492,17 @@ fn att(l: u16) void {
     while (d < dc) : (d += 1) { const a = t[QD + d]; const b = t[QD + dc + d]; ks += a * a; vs += b * b; }
     u[QD + 2 * dc + 1 + Qh] = ks;
     u[QD + 2 * dc + 2 + Qh] = vs;
-    @fmuls(tv(QD, dc), tv(QD, dc), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb + QD), f32), dc));
-    rope(kd, QD, np);
-    @fmovs(uv(QD, 2 * dc), tv(QD, 2 * dc));
+    @fmuls(tc(QD, dc), tc(QD, dc), @set_dsd_length(@increment_dsd_offset(qw, @as(i16, qkb + QD), f32), dc));
+    ropec(kd, QD, np);
+    @fmovs(uc(QD, 2 * dc), tc(QD, 2 * dc));
   } else {
-    @fmovs(uv(QD, 2 * dc), 0.0);
+    @fmovs(uc(QD, 2 * dc), 0.0);
     u[QD + 2 * dc + 1 + Qh] = 0.0;
     u[QD + 2 * dc + 2 + Qh] = 0.0;
   }
-  u[QD + 2 * dc] = @as(f32, tab[0]);
+  u[QD + 2 * dc] = posf;
   u[QD + 2 * dc + 3 + Qh] = s;
-  mcast(QD + 2 * dc + Qh + 4);
+  @fmovs(fout(q_mc, AB), uc(0, AB));
   stamp(1 + 6 * cl + 1);
   if ((cfl & 2) != 0 and (l == LS or l == LG)) {
     // KVS: [k | v | |k|^2 | |v|^2] (sliding first, then global + the sequence word)
@@ -430,7 +511,7 @@ fn att(l: u16) void {
     const vsv = u[QD + 2 * dc + 2 + Qh];
     u[QD + 2 * dc] = ksv;
     u[QD + 2 * dc + 1] = vsv;
-    u[QD + 2 * dc + 2] = @as(f32, tab[0] + 1);
+    u[QD + 2 * dc + 2] = posf1;
     @fmovs(fout(q_kv, 2 * dc + 2 + (if (l == LG) @as(u16, 1) else 0)), uv(QD, 2 * dc + 2 + (if (l == LG) @as(u16, 1) else 0)));
   }
   var pass: u16 = 0;
@@ -450,12 +531,12 @@ fn att(l: u16) void {
       u[QD + 1 + h] = if (bad == 0.0) 0.0 else ln1(lh);
     }
     u[QD] = bad;
-    mcast(QD + 1 + Qh);
+    @fmovs(fout(q_mc, QD + 1 + Qh), uc(0, QD + 1 + Qh));
     stamp(1 + 6 * cl + 3);
     if (bad == 0.0) {   // (ATTL 2) the logs off the path
       h = 0;
       while (h < Qh) : (h += 1) { u[h] = ln1(t[h * (dc + 1) + dc]); }
-      mcast(Qh);
+      @fmovs(fout(q_mc, Qh), uc(0, Qh));
       pass = 8;
     }
   }
@@ -463,11 +544,11 @@ fn att(l: u16) void {
 fn mlp() void {
   reduce(4 * Ic + 4);
   stamp(1 + 6 * cl + 4);
-  const s1 = combine(2 * Ic);
-  vgelu(uv(0, Ic), tv(0, Ic), Ic);
-  @fmuls(uv(0, Ic), uv(0, Ic), tv(Ic, Ic));
+  const s1 = combinec(2 * Ic);
+  if (GELUT == 0) { vgelu0(uv(0, Ic), tv(0, Ic), Ic); } else { vgeluc(); }
+  @fmuls(uc(0, Ic), uc(0, Ic), tc(Ic, Ic));
   u[Ic] = s1;
-  mcast(Ic + 1);
+  @fmovs(fout(q_mc, Ic + 1), uc(0, Ic + 1));
 }
 var chk = @zeros([1]f32);
 fn pl_wait(pos: u32) void {
@@ -499,6 +580,10 @@ task pass_task() void {
   while (s < n_steps) : (s += 1) {
     tab[0] = pos0 + s;
     stamp(0);
+    posf = @as(f32, tab[0]);
+    posf1 = @as(f32, tab[0] + 1);
+    if (LS != 0xff) { rope_tables(0, tab[0]); }   // (off the path: the first reduction is thousands of cycles out)
+    if (LG != 0xff) { rope_tables(1, tab[0]); }
     if ((cfl & 1) != 0 and (DIAG & 32) == 0) { pl_wait(tab[0]); }   // (DIAG 32: no PLE words; DIAG 64: no KVS)
     if (PLOG == 1 and (cfl & 1) != 0 and s < 64) { plog[2 * @as(u16, s)] = pl[K * pui]; plog[2 * @as(u16, s) + 1] = pl[plv]; }
     if ((DIAG & 1) != 0) {

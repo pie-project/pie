@@ -29,6 +29,7 @@ param PYW: u16 = 128;
 param HDS: u16 = 256;
 param HDG: u16 = 512;
 param ATTL: u16 = 2;
+param WSPEC: u16 = 0;  // 1: the attention mixer specialized a layer kind (larger code; E2B)
 param WIN: u16 = 0;    // > 0: the sliding window (the ring of NES PYW entries is longer: older entries are masked)
 param PLOG: u16 = 0;   // 1: the full model logs each step's KVS words too (kvlog, as DIAG 1)
 param TSTAMP: u16 = 0;
@@ -428,12 +429,17 @@ fn kv_take(pos: u32, s: u32) void {
 var ab = @zeros([QOM + 2 * DcG + Qh + 4]f32);
 const ab_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QOM + 2 * DcG + Qh + 4} -> ab[i] });
 var s_att: f32 = 0.0;
+// WSPEC 1: one copy a layer kind (g 0 sliding, 1 global: the head width and the entry count constants); 0: one
+// runtime copy (g 2; the smaller program)
 fn att_mix(l: u16, pos_out: *u32) void {
-  const dc = dcl(l);
+  if (WSPEC == 1) { if (isg(l)) { attm(l, pos_out, 1); } else { attm(l, pos_out, 0); } } else { attm(l, pos_out, 2); }
+}
+fn attm(l: u16, pos_out: *u32, comptime g: u16) void {
+  const dc: u16 = if (g == 2) dcl(l) else if (g == 1) DcG else DcS;
   const QD: u16 = Qh * dc;
   const AB: u16 = QD + 2 * dc + Qh + 4;
   const c = cache_of(l);
-  const ne = cne(c);
+  const ne: u16 = if (g == 2) cne(c) else if (g == 1) NEG else NES;
   const ihd: f32 = if (isg(l)) IHDG else IHDS;   // (reciprocals: no runtime f32 divide)
   @fmovs(@set_dsd_length(ab_d, AB), fin(q_ym, AB));
   const pos = @as(u32, ab[QD + 2 * dc]);
