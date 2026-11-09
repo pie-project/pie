@@ -346,7 +346,7 @@ pub(crate) fn rotate_all(
             let mid = f.reshape(mid, &[r, g, run])?;
             // Written back over whole 128-lane tiles of the head (the run's
             // untouched neighbours with it), so the update lands in place.
-            let (lo, hi) = if t.unit % 128 == 0 {
+            let (lo, hi) = if t.unit.is_multiple_of(128) {
                 (a / 128 * 128, b.div_ceil(128) * 128)
             } else {
                 (a, b)

@@ -668,7 +668,8 @@ impl Run<'_> {
                     return crate::lower::lower(self.ctx(), |l| {
                         let xv = l.read(self.tensor(*x))?;
                         let wv = l.read(self.tensor(*w))?;
-                        let v = linear::moe::matmul_grouped_fixed(l.f(), xv, wv, *groups, y.landing())?;
+                        let v =
+                            linear::moe::matmul_grouped_fixed(l.f(), xv, wv, *groups, y.landing())?;
                         l.land(y, v)
                     });
                 }
