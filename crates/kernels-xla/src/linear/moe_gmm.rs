@@ -79,6 +79,11 @@ pub struct Gmm {
     /// `[K / 32, E·N]` bytes (`E·N`-minor bank only): the codes convert to
     /// bf16 in VMEM and take their block's power of two, exactly.
     pub scaled: bool,
+    /// An f32 factor per 128 codes of K follows the bank, as `[K / 128,
+    /// E·N]` (`E·N`-minor e4m3 bank only, the factors of its 128x128 blocks
+    /// laid a column each): each 128 codes of K contract on their own and
+    /// their partial takes its block's factors (`tile_dot`).
+    pub tile: bool,
     /// A bf16 bias row per expert follows (`[E, 1, N]`, a blocked cut
     /// only), added to the f32 product before it rounds.
     pub bias: bool,
@@ -101,6 +106,9 @@ enum Cut {
     Element { width: i64 },
 }
 
+/// Rows from which a block-FP8 tile widens its codes (`Gmm::widens`).
+pub const WIDEN_ROWS: i64 = 512;
+
 fn bad<T>(detail: impl Into<String>) -> Built<T> {
     Err(Malformed {
         op: "mosaic.gmm",
@@ -118,11 +126,27 @@ impl Gmm {
         self.k * cols * i64::from(self.w.bits()) / 8
     }
 
+    /// A block-FP8 prompt in one tile widens its block of codes under their
+    /// factors to bf16 once and contracts it a whole K deep: the 128-deep
+    /// dots leave half of a v6e MXU idle, and the widening's VPU work is
+    /// shared by the tile's rows (widened again for each of several tiles,
+    /// it costs more than it saves).
+    fn widens(&self) -> bool {
+        self.tile && self.tiles == 1 && self.tm >= WIDEN_ROWS
+    }
+
     fn cut(&self) -> Built<Cut> {
         let (k, n, e) = (self.k, self.n, self.experts);
         // An e2m1 block counts a byte a code: its bf16 copy in VMEM is what
-        // bounds it.
-        let fits = |cols: i64| k * cols * self.wbytes().max(1) <= self.block_bytes;
+        // bounds it; a block-FP8 one its bf16 slices, or its f32 widening.
+        let per = if self.widens() {
+            4
+        } else if self.tile {
+            2
+        } else {
+            self.wbytes().max(1)
+        };
+        let fits = |cols: i64| k * cols * per <= self.block_bytes;
         let blocked = (1..=n / 128)
             .rev()
             .map(|d| d * 128)
@@ -196,6 +220,7 @@ impl Gmm {
     pub fn prefetching(&self) -> bool {
         self.prefetch
             && !self.scaled
+            && !self.tile
             && !self.bias
             && matches!(self.cut(), Ok(Cut::Blocked { tn }) if tn == self.n)
     }
@@ -343,6 +368,8 @@ impl Gmm {
             Elem::Bf16 | Elem::F8E5m2 | Elem::F8E4m3fn | Elem::F4E2m1fn
         ) || (self.w == Elem::F4E2m1fn) != self.scaled
             || (self.scaled && (self.orient != Orient::KMajor || self.k % 32 != 0))
+            || (self.tile
+                && (self.w != Elem::F8E4m3fn || self.orient != Orient::KMajor || self.k % 128 != 0))
         {
             return bad(format!("{:?} weights (scaled {})", self.w, self.scaled));
         }
@@ -430,8 +457,8 @@ impl Gmm {
         };
         // The exponent bytes of the block's codes: the bank's columns, a row
         // per 32 codes of K.
-        let groups = k / 32;
-        let scales = self.scaled.then(|| {
+        let groups = if self.tile { k / 128 } else { k / 32 };
+        let scales = (self.scaled || self.tile).then(|| {
             let window = bank.window;
             let index: crate::mosaic::IndexMap = match cut {
                 Cut::Blocked { tn } => Box::new(move |b: &mut Body, g: &Grid| {
@@ -456,7 +483,7 @@ impl Gmm {
             };
             Operand {
                 array: vec![groups, e * n],
-                elem: Elem::U8,
+                elem: if self.tile { Elem::F32 } else { Elem::U8 },
                 block: vec![groups, cols],
                 window,
                 index,
@@ -497,6 +524,10 @@ impl Gmm {
         // The scaled codes' exponents widen to f32 beside them.
         let scaling = if self.scaled {
             2 * groups * cols + 4 * k * cols
+        } else if self.widens() {
+            2 * 4 * groups * cols + 4 * k * cols + 4 * groups * 128 * cols
+        } else if self.tile {
+            2 * 4 * groups * cols + 4 * tm * cols
         } else {
             0
         };
@@ -523,16 +554,27 @@ impl Gmm {
             let nt = b.load(blk.grid.prefetch[1], &[zero])?;
             let live = b.cmpi(ICmp::Slt, blk.grid.ids[1], nt)?;
             b.when(live, |b| {
-                let x = b.vload_all(blk.ins[0])?;
-                let w = b.vload_all(blk.ins[1])?;
-                let w = if self.scaled {
+                let y = if self.widens() {
+                    let x = b.vload_all(blk.ins[0])?;
+                    let w = b.vload_all(blk.ins[1])?;
                     let s = b.vload_all(blk.ins[2])?;
-                    scale_codes(b, w, s, groups, cols)?
+                    let w = widen_codes(b, w, s, groups, cols)?;
+                    let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
+                    b.matmul(x, w, acc, false)?
+                } else if self.tile {
+                    tile_dot(b, blk, tm, groups, cols)?
                 } else {
-                    b.convert_f(w, Elem::Bf16)?
+                    let x = b.vload_all(blk.ins[0])?;
+                    let w = b.vload_all(blk.ins[1])?;
+                    let w = if self.scaled {
+                        let s = b.vload_all(blk.ins[2])?;
+                        scale_codes(b, w, s, groups, cols)?
+                    } else {
+                        b.convert_f(w, Elem::Bf16)?
+                    };
+                    let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
+                    b.matmul(x, w, acc, orient == Orient::NMajor)?
                 };
-                let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
-                let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
                 let y = if self.bias {
                     use crate::mosaic::MTy;
                     let r = blk.ins[blk.ins.len() - 1];
@@ -559,6 +601,58 @@ impl Gmm {
             })
         })
     }
+}
+
+/// e4m3 codes `w` (`[K, cols]`) as bf16, each times its 128-code block's
+/// f32 factor (`s`: `[K / 128, cols]`), the product rounded once, as the
+/// bf16 deployment holds the weight.
+fn widen_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
+    use crate::mosaic::MTy;
+    let k = groups * 128;
+    let f32s = |d: &[i64]| MTy::Vector(d.to_vec(), Elem::F32);
+    let w = b.convert_f(w, Elem::F32)?;
+    let s = b.op("vector.shape_cast", &[s], "", &[f32s(&[groups, 1, cols])])[0];
+    let s = b.op("vector.broadcast", &[s], "", &[f32s(&[groups, 128, cols])])[0];
+    let s = b.op("vector.shape_cast", &[s], "", &[f32s(&[k, cols])])[0];
+    let w = b.mulf(w, s)?;
+    b.convert_f(w, Elem::Bf16)
+}
+
+/// A tile's rows against block-FP8 codes (`ins[1]`, `[K, cols]` e4m3) under
+/// f32 factors a 128 of K (`ins[2]`, `[K / 128, cols]`): a dot a 128-code
+/// block of K, its f32 partial scaled by the block's factors and summed, f32
+/// `[tm, cols]`. The codes enter the dot as e4m3 against the bf16 rows (each
+/// code exact): widening them to bf16 on the VPU first holds a v6e to 0.87
+/// TB/s of codes, against 1.43 as they are; widening each to f32 under its
+/// factor, to 0.6.
+fn tile_dot(
+    b: &mut Body,
+    blk: &crate::mosaic::Blocks,
+    tm: i64,
+    groups: i64,
+    cols: i64,
+) -> Built<V> {
+    use crate::mosaic::MTy;
+    let zero = b.index(0);
+    let mut acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
+    for g in 0..groups {
+        let at = b.index(g * 128);
+        let x = b.vload(blk.ins[0], &[zero, at], &[tm, 128])?;
+        let w = b.vload(blk.ins[1], &[at, zero], &[128, cols])?;
+        let z = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
+        let p = b.matmul(x, w, z, false)?;
+        let row = b.index(g);
+        let s = b.vload(blk.ins[2], &[row, zero], &[1, cols])?;
+        let s = b.op(
+            "vector.broadcast",
+            &[s],
+            "",
+            &[MTy::Vector(vec![tm, cols], Elem::F32)],
+        )[0];
+        let p = b.mulf(p, s)?;
+        acc = b.addf(acc, p)?;
+    }
+    Ok(acc)
 }
 
 /// e2m1 codes `w` (`[K, cols]`, as `u4`) as bf16, each times
@@ -651,6 +745,7 @@ mod tests {
             w: Elem::F8E5m2,
             orient,
             scaled: false,
+            tile: false,
             bias: false,
             out: Elem::F32,
             prefetch: false,
