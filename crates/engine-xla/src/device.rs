@@ -349,7 +349,10 @@ impl Device {
     #[must_use]
     pub fn holds(&self, text: &str) -> bool {
         let key = *blake3::hash(text.as_bytes()).as_bytes();
-        self.cache.lock().expect("cache lock poisoned").contains_key(&key)
+        self.cache
+            .lock()
+            .expect("cache lock poisoned")
+            .contains_key(&key)
     }
 
     #[must_use]

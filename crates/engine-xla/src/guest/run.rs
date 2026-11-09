@@ -153,8 +153,7 @@ impl Stages {
         // counts, ~2.4 s each, all inside the measured rounds).
         let top = padded(self.top as usize).max(batch.lanes);
         let rungs = |top: u32| -> Vec<u32> {
-            std::iter::successors(Some(1u32), |&r| (r < top).then(|| r.saturating_mul(2)))
-                .collect()
+            std::iter::successors(Some(1u32), |&r| (r < top).then(|| r.saturating_mul(2))).collect()
         };
         let mut shapes: Vec<Batch> = rungs(top)
             .into_iter()
