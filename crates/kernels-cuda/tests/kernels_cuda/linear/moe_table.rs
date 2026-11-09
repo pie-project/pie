@@ -61,8 +61,16 @@ fn bf16_bank(g: &mut Gpu, lcg: &mut Lcg, experts: usize, n: usize, k: usize) -> 
     g.up(&raw)
 }
 
+/// `g`'s context with the bf16 select on its per-route GEMV alone.
 fn ctx_of(g: &Gpu) -> Ctx {
-    g.ctx()
+    let ctx = g.ctx();
+    let tuning = kernels_cuda::tuning::Tuning {
+        bf16_mma_until: 0,
+        moe_grouped: false,
+        moe_tc5: false,
+        ..ctx.tuning()
+    };
+    ctx.with_tuning(tuning)
 }
 
 #[test]
@@ -96,4 +104,49 @@ fn a_bf16_select_lands_the_same_bits_through_any_table() {
             },
         );
     }
+}
+
+/// The table's cost on the per-route GEMV: `reps` selects over the
+/// contiguous bank against the same over its experts scattered, at a decode
+/// shape (Qwen3-30B-A3B's gate-up: 128 experts, 8 tokens x top 8, 1536 x
+/// 2048). Timing only; run with `--ignored`.
+#[test]
+#[ignore = "timing: run alone with --ignored"]
+fn the_expert_table_costs_the_gemv_nothing_measurable() {
+    let mut g = Gpu::open();
+    let mut lcg = Lcg::seeded(0x7173);
+    let (experts, tokens, top, n, k, reps) = (128usize, 8usize, 8usize, 1536usize, 2048usize, 300);
+    let bank = bf16_bank(&mut g, &mut lcg, experts, n, k);
+    let (xr, _) = lcg.row(tokens * k);
+    let x = t(g.up(&xr), tokens, k, Bf16);
+    let r = t(g.up(&routes(tokens, top, experts)), tokens, top, I32);
+    let y = g.zeros(tokens * top * n * 2);
+    let ctx = ctx_of(&g);
+    let planes = [Plane::of(bank, (n * k * 2) as u64)];
+    let pool = scatter(&mut g, experts, &planes, 0x7173);
+    let time = |g: &Gpu, table: ExpertTable| {
+        let mut yt = t(y, tokens * top, n, Bf16);
+        let bank = t(bank, experts, n * k, Bf16);
+        for _ in 0..20 {
+            moe::matmul_select(&ctx, x, bank, r, &mut yt, table).expect("the select fires");
+        }
+        g.sync();
+        let at = std::time::Instant::now();
+        for _ in 0..reps {
+            moe::matmul_select(&ctx, x, bank, r, &mut yt, table).expect("the select fires");
+        }
+        g.sync();
+        at.elapsed().as_secs_f64() * 1e6 / reps as f64
+    };
+    let mut best = [f64::MAX; 2];
+    for _ in 0..3 {
+        best[0] = best[0].min(time(&g, ExpertTable::RESIDENT));
+        best[1] = best[1].min(time(&g, ExpertTable::located(pool.table, pool.window())));
+    }
+    eprintln!(
+        "TABLE_COST gemv contiguous {:.2} us, scattered table {:.2} us ({:+.1}%)",
+        best[0],
+        best[1],
+        (best[1] / best[0] - 1.0) * 100.0
+    );
 }
