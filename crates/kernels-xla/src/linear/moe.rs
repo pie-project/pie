@@ -1192,6 +1192,7 @@ pub(crate) fn tile_projection(
         tile: true,
         bias: false,
         out: Elem::F32,
+        prefetch: false,
     };
     if spec.out_width().ok() != Some(n) {
         return Ok(None);
