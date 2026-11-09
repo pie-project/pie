@@ -1147,7 +1147,6 @@ fn gmm_spec(
         },
         scaled,
         tile,
-        rows: tile && tm == 16 && fan.n % crate::linear::moe_gmm::ROWS_TN == 0,
         bias: false,
         out: Elem::F32,
     };
@@ -1187,7 +1186,6 @@ pub(crate) fn tile_projection(
         orient: Orient::KMajor,
         scaled: false,
         tile: true,
-        rows: tm == 16 && n % crate::linear::moe_gmm::ROWS_TN == 0,
         bias: false,
         out: Elem::F32,
     };
@@ -1206,27 +1204,13 @@ pub(crate) fn tile_projection(
     };
     // The device's layouts: free transposes.
     let w = f.transpose(codes, &[1, 0])?;
-    let s = if spec.rows {
-        rows_factors(f, factor)?
-    } else {
-        f.transpose(factor, &[1, 0])?
-    };
+    let s = f.transpose(factor, &[1, 0])?;
     let y = kernel.call(f, &[se, nt, xs, w, s])?[0];
     Ok(Some(if tiles * tm > m {
         f.slice_axis(y, 0, 0, m)?
     } else {
         y
     }))
-}
-
-/// A block-FP8 bank's factors a row (`[R, K/128]`, each 128-row group's
-/// rows alike) as one row per 128-row group along K, f32 `[R/128, K]`: what
-/// a decode tile's copies of its rows take (`moe_gmm::Gmm::rows`).
-fn rows_factors(f: &mut Func, factor: Val) -> Result<Val, Error> {
-    let (r, g) = (f.dims(factor)[0], f.dims(factor)[1]);
-    let s = f.slice(factor, &[0, 0], &[r, g], &[TILE, 1])?;
-    let s = f.broadcast(s, &[r / TILE, g, TILE], &[0, 1])?;
-    Ok(f.reshape(s, &[r / TILE, g * TILE])?)
 }
 
 /// A kernel spec landing its rows in bf16 (no bias follows).
@@ -1459,13 +1443,9 @@ fn tile_kernel(
         kernel.call(f, &ops)?[0]
     } else if spec.tile {
         // The factors a row (`[E·N, K/128]`), read `[K/128, E·N]` as the
-        // codes are (or a 128-column group's along K, for a decode tile).
+        // codes are.
         let s = scales.ok_or_else(|| refuse("linear.moe", "block-FP8 codes with no factors"))?;
-        let s = if spec.rows {
-            rows_factors(f, s)?
-        } else {
-            f.transpose(s, &[1, 0])?
-        };
+        let s = f.transpose(s, &[1, 0])?;
         let ops: Vec<Val> = [se, nt, xs, w, s].into_iter().chain(bias).collect();
         kernel.call(f, &ops)?[0]
     } else {
