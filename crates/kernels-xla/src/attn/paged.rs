@@ -1170,9 +1170,6 @@ fn per_row_window(
 
 /// Row blocks against the flat key axis `0..keys`, each block walking only
 /// the chunks its rows' `[lo, hi)` span.
-/// The most row blocks [`blocked`] runs in line rather than as a loop.
-const UNROLLED_BLOCKS: i64 = 16;
-
 pub(crate) fn blocked(
     f: &mut Func,
     planes: &Planes,
@@ -1302,7 +1299,7 @@ pub(crate) fn blocked(
     };
     let whole = if nb == 1 {
         block(f, &rows_p)?
-    } else if nb <= UNROLLED_BLOCKS {
+    } else if nb <= ch.unrolled {
         // A few blocks run one after another in line, each on a static cut
         // of the rows, and join at the end: as a loop, each block's result
         // is written into a copy of the whole carried output (DeepSeek-V4's

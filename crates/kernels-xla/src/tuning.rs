@@ -131,6 +131,14 @@ pub struct AttnBlockRows(pub u32);
 #[decision(id = "kernel.attn.block_keys", constant(set(128, 256, 512, 1024, 2048)), default = 512, tune = search)]
 pub struct AttnBlockKeys(pub u32);
 
+/// The most row blocks of the blocked attention walk that run one after
+/// another in line rather than as a loop: in line, no block's result is
+/// written into a copy of the whole carried output, at a larger program
+/// (more host memory to compile).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.attn.unrolled_blocks", constant(range(1..=16)), default = 16, tune = search)]
+pub struct AttnUnrolledBlocks(pub u32);
+
 /// Tokens per chunk of the scalar-decay (GDN) chunked scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.ssm.chunk", constant(set(16, 32, 64, 128, 256)), default = 64, tune = search)]
@@ -167,6 +175,7 @@ pub fn register(registry: &mut Registry) {
         .add::<AttnBudgetMi>()
         .add::<AttnBlockRows>()
         .add::<AttnBlockKeys>()
+        .add::<AttnUnrolledBlocks>()
         .add::<SsmChunk>()
         .add::<SsmLongChunk>()
         .add::<SsmKdaChunk>();
@@ -198,6 +207,8 @@ pub struct Chunks {
     pub budget: i64,
     pub block_rows: i64,
     pub block_keys: i64,
+    /// Row blocks run in line (see [`AttnUnrolledBlocks`]).
+    pub unrolled: i64,
     /// Whether a sliding-window decode walk stops after the last chunk any
     /// row admits a key in (`attn::paged`'s window walk). Always on from a
     /// profile; off walks every chunk of the window, as the walk did before
@@ -257,6 +268,7 @@ impl Tuning {
             budget: 1 << 24,
             block_rows: 512,
             block_keys: 512,
+            unrolled: 16,
             window_reach: true,
         },
         ssm: SsmChunks {
@@ -304,6 +316,7 @@ impl Tuning {
                 budget: n(profile.get::<AttnBudgetMi>().0) << 20,
                 block_rows: n(profile.get::<AttnBlockRows>().0),
                 block_keys: n(profile.get::<AttnBlockKeys>().0),
+                unrolled: n(profile.get::<AttnUnrolledBlocks>().0),
                 window_reach: true,
             },
             ssm: SsmChunks {
