@@ -1,6 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "../prim/state_map.h"
+
 template <typename T, int WIDTH, int DMAX>
 [[kernel]] void kda_step(
     const device T* mixed          [[buffer(0)]],
@@ -15,6 +17,7 @@ template <typename T, int WIDTH, int DMAX>
     const constant int& head_dim   [[buffer(9)]],
     const constant float& norm_eps [[buffer(10)]],
     const constant float& gate_floor [[buffer(11)]],
+    const device ulong* map        [[buffer(12)]],
     uint3 pos [[thread_position_in_grid]],
     uint3 lpos [[thread_position_in_threadgroup]]) {
   threadgroup float sq[DMAX];
@@ -71,8 +74,8 @@ template <typename T, int WIDTH, int DMAX>
   const float beta =
       1.0f / (1.0f + metal::exp(-float(b[size_t(n) * size_t(heads) + size_t(h)])));
   device float* state =
-      rstate + (size_t(slots[n]) * size_t(heads) + size_t(h)) * size_t(d) *
-                   size_t(d);
+      rstate + pie_state_atom(map, slots + size_t(n) * pie_state_pieces(map), uint(h),
+                              ulong(d) * ulong(d));
   const size_t out = size_t(n) * wide + head;
   const size_t vbase = row + 2 * wide + head;
 
@@ -110,6 +113,7 @@ template <typename T, int WIDTH, int DMAX>
     const constant int& head_dim   [[buffer(10)]],
     const constant float& norm_eps [[buffer(11)]],
     const constant float& gate_floor [[buffer(12)]],
+    const device ulong* map        [[buffer(13)]],
     uint3 pos [[thread_position_in_grid]],
     uint3 lpos [[thread_position_in_threadgroup]]) {
   threadgroup float sq[DMAX];
@@ -135,8 +139,8 @@ template <typename T, int WIDTH, int DMAX>
 
   const float qscale = metal::rsqrt(float(d));
   device float* state =
-      rstate + (size_t(slots[begin]) * size_t(heads) + size_t(h)) * size_t(d) *
-                   size_t(d);
+      rstate + pie_state_atom(map, slots + size_t(begin) * pie_state_pieces(map), uint(h),
+                              ulong(d) * ulong(d));
 
   for (int t = begin; t < end; ++t) {
     const size_t row = size_t(t) * 3 * wide;
@@ -220,6 +224,7 @@ template <typename T, int WIDTH, int DMAX>
     const constant int& head_dim   [[buffer(14)]],
     const constant float& norm_eps [[buffer(15)]],
     const constant float& gate_floor [[buffer(16)]],
+    const device ulong* map        [[buffer(17)]],
     uint3 pos [[thread_position_in_grid]],
     uint3 lpos [[thread_position_in_threadgroup]]) {
   threadgroup float sq[DMAX];
@@ -238,8 +243,8 @@ template <typename T, int WIDTH, int DMAX>
   if (span <= 0) {
     return;
   }
-  const int slot = slots[lane0 + r];
-  if (slot < 0) {
+  const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
+  if (ids[0] < 0) {
     return;
   }
   int keep = commit[lane0 + r];
@@ -254,7 +259,7 @@ template <typename T, int WIDTH, int DMAX>
   const float alpha = metal::exp(a_log[h]);
   const float qscale = metal::rsqrt(float(d));
   const size_t cells = size_t(d) * size_t(d);
-  device float* bank = rstate + (size_t(slot) * size_t(heads) + size_t(h)) * cells;
+  device float* bank = rstate + pie_state_atom(map, ids, uint(h), ulong(cells));
   device float* state = work + (size_t(lane0 + r) * size_t(heads) + size_t(h)) * cells;
 
   for (int vi = tid; vi < d; vi += WIDTH) {
@@ -340,7 +345,7 @@ template <typename T, int WIDTH, int DMAX>
       const device float*, const device float*, device float*,           \
       device float*, device float*,                                      \
       const constant int&, const constant int&, const constant float&,   \
-      const constant float&, uint3, uint3);
+      const constant float&, const device ulong*, uint3, uint3);
 
 #define instantiate_kda_step(name, itype, width, dmax)                   \
   template [[host_name("kda_step_" #name)]]                              \
@@ -349,7 +354,7 @@ template <typename T, int WIDTH, int DMAX>
       const device float*, const device float*, device float*,           \
       const device uint*, device float*,                                 \
       const constant int&, const constant int&, const constant float&,   \
-      const constant float&, uint3, uint3);
+      const constant float&, const device ulong*, uint3, uint3);
 
 #define instantiate_kda_chunked(name, itype, width, dmax)                \
   template [[host_name("kda_chunked_" #name)]]                           \
@@ -358,7 +363,7 @@ template <typename T, int WIDTH, int DMAX>
       const device itype*, const device float*, const device float*,     \
       device float*, const device uint*, device float*,                  \
       const constant int&, const constant int&, const constant float&,   \
-      const constant float&, uint3, uint3);
+      const constant float&, const device ulong*, uint3, uint3);
 
 instantiate_kda_step(bfloat16, bfloat, 128, 256)
 

@@ -165,6 +165,7 @@ pub fn ngram_ids(
             stated(OP, shape.eos)?.arg(),
             map_args[0],
             map_args[1],
+            state.segments.arg(),
         ],
     )
 }
@@ -234,6 +235,7 @@ pub fn ngram_ids_chunked(
             stated(OP, shape.eos)?.arg(),
             map_args[0],
             map_args[1],
+            state.segments.arg(),
         ],
     )
 }
@@ -414,6 +416,7 @@ pub fn ngram_ids_committed(
             stated(OP, shape.eos)?.arg(),
             map_args[0],
             map_args[1],
+            state.segments.arg(),
         ],
     )
 }
@@ -444,6 +447,7 @@ mod tests {
             slots: Tensor::new(11, 1, 8, Dtype::U32),
             conv_state: bank,
             new_conv_state: bank,
+            segments: Tensor::new(12, 1, 7, Dtype::U64),
         }
     }
 

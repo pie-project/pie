@@ -67,11 +67,104 @@ pub struct KvPool {
 pub struct RecurrentPool {
     pub state: Tensor,
 
+    /// A chunk id per piece of each lane's record: `[lanes, pieces]`.
     pub slots: Tensor,
 
     pub conv_state: Tensor,
 
     pub new_conv_state: Tensor,
+
+    /// The bank's segment table, a [`StateMap`]'s [`StateMap::words`] in
+    /// u64; every state kernel addresses the bank through it.
+    pub segments: Tensor,
+}
+
+/// How a fixed state bank is laid out over its segments
+/// (`kernels/prim/state_map.h`): a record's ids name a slot each, a slot
+/// sits in a chunk, a chunk in a segment, and every count is in elements of
+/// the bank.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateMap {
+    /// Elements from one slot of a chunk to the next.
+    pub slot_stride: u64,
+    /// Slots one chunk holds.
+    pub chunk_slots: u32,
+    /// Elements from one chunk of a segment to the next.
+    pub chunk_stride: u64,
+    /// Chunks one segment holds.
+    pub seg_chunks: u32,
+    /// Atoms (heads, channels or frames) one piece of a record holds.
+    pub piece_atoms: u32,
+    /// Pieces one record is cut into.
+    pub pieces: u32,
+    /// Each segment's first element, from the bank's origin.
+    pub bases: Vec<u64>,
+}
+
+impl StateMap {
+    /// Ulongs before the segment bases.
+    pub const HEAD: usize = 6;
+
+    /// The layout every bank had before segments: slot `id` at
+    /// `id * stride`, one piece a record, one segment.
+    #[must_use]
+    pub fn whole(stride: u64) -> Self {
+        Self {
+            slot_stride: stride,
+            chunk_slots: 1,
+            chunk_stride: stride,
+            seg_chunks: u32::MAX,
+            piece_atoms: u32::MAX,
+            pieces: 1,
+            bases: vec![0],
+        }
+    }
+
+    /// The table a kernel reads.
+    #[must_use]
+    pub fn words(&self) -> Vec<u64> {
+        let mut words = vec![
+            self.slot_stride,
+            u64::from(self.chunk_slots),
+            self.chunk_stride,
+            u64::from(self.seg_chunks),
+            u64::from(self.piece_atoms),
+            u64::from(self.pieces),
+        ];
+        words.extend_from_slice(&self.bases);
+        words
+    }
+
+    /// The table's bytes, little-endian as the device reads them.
+    #[must_use]
+    pub fn bytes(&self) -> Vec<u8> {
+        self.words().iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// The first element of the slot `id` names, as the kernels find it.
+    #[must_use]
+    pub fn slot(&self, id: u32) -> u64 {
+        let chunk = id / self.chunk_slots;
+        let seg = (chunk / self.seg_chunks) as usize;
+        self.bases[seg]
+            + u64::from(chunk % self.seg_chunks) * self.chunk_stride
+            + u64::from(id % self.chunk_slots) * self.slot_stride
+    }
+
+    /// The first element of atom `atom` (atoms outermost, `atom_elems`
+    /// each) of the record whose piece ids are `ids`.
+    #[must_use]
+    pub fn atom(&self, ids: &[u32], atom: u32, atom_elems: u64) -> u64 {
+        self.slot(ids[(atom / self.piece_atoms) as usize])
+            + u64::from(atom % self.piece_atoms) * atom_elems
+    }
+
+    /// Whether this is [`StateMap::whole`]'s layout, which needs no piece
+    /// table of its own.
+    #[must_use]
+    pub fn is_whole(&self) -> bool {
+        *self == Self::whole(self.slot_stride)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

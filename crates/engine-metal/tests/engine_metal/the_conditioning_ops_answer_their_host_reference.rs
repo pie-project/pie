@@ -2,9 +2,9 @@
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::Tensor;
 use kernels_metal::elemwise::{gate, modulate, norm, pointwise, rope_axes, sinusoid};
 use kernels_metal::gather;
+use kernels_metal::{StateMap, Tensor};
 use poem_ir::Dtype;
 
 fn noise(at: u64) -> u32 {
@@ -1196,11 +1196,19 @@ fn the_mamba2_walk_answers_the_recurrence() {
     let (_j, hptr) = rig.i32_plane(&[0, T as i32]);
     let (_k, hy) = rig.empty(T * inner, Dtype::Bf16);
     let state = Tensor::new(hs, 1, (H * P * N) as u32, Dtype::F32);
+    let map = StateMap::whole((H * P * N) as u64);
+    let (_m, hmap) = rig.i32_plane(
+        &map.words()
+            .iter()
+            .flat_map(|w| [*w as i32, (*w >> 32) as i32])
+            .collect::<Vec<i32>>(),
+    );
     let pool = RecurrentPool {
         state,
         slots: Tensor::new(hslots, T as u32, 1, Dtype::U32),
         conv_state: state,
         new_conv_state: state,
+        segments: Tensor::new(hmap, 1, map.words().len() as u32, Dtype::U64),
     };
     let m = ssm::Mamba2 {
         a_log: Tensor::new(ha, 1, H as u32, Dtype::F32),
