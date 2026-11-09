@@ -441,6 +441,7 @@ impl Engine for Xla {
             classes: shell.classes(),
         };
         self.programs.seat(budgets.max_lanes);
+        self.programs.seat_readouts(shell.readouts());
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
