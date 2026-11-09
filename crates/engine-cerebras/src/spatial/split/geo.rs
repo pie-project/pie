@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 
+pub mod gptoss;
+
 type P = (u32, u32);
 
 const fn rx(d: char) -> u32 {

@@ -18,6 +18,7 @@ pub mod geo;
 pub mod npy;
 pub mod place;
 pub mod place_gemma;
+pub mod place_gptoss;
 pub mod prep;
 
 use std::path::{Path, PathBuf};

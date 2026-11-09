@@ -277,7 +277,7 @@ def main():
         em.reset()
         if a.trace: em.trace = []
         st = {"rgap": [], "rerr": [], "route": [], "redo": 0}
-        mis = []; gaps = {}; t0 = time.time(); lgs = []
+        mis = []; gaps = {}; t0 = time.time(); lgs = []; amax = []; marg = []
         npre = len(g["prompt_ids"])
         for i, t in enumerate(seq[:-1]):
             lg = em.step(t, o, st)
@@ -286,6 +286,7 @@ def main():
                 want = seq[i + 1]
                 top = int(np.argmax(lg))
                 srt = np.sort(lg)
+                amax.append(top); marg.append(float(srt[-1] - srt[-2]))
                 gap = float(lg[want] - (srt[-2] if top == want else srt[-1]))
                 if top != want: mis.append(j)
                 if j in tight: gaps[j] = round(gap, 5)
@@ -296,7 +297,8 @@ def main():
                      "min_gap": float(min(lgs)), "redo_passes": st["redo"],
                      "router_err_max": float(re_.max()), "router_gap_min": float(rg.min()),
                      "router_gaps_below_err": int(np.sum(rg < re_.max())), "router_gaps_below_2err": int(np.sum(rg < 2 * re_.max())),
-                     "router_decisions": int(rg.size), "routes": st["route"]}
+                     "router_decisions": int(rg.size), "routes": st["route"],
+                     "argmax": amax, "margins": marg}
         print(mode, {k: v for k, v in res[mode].items() if k != "routes"}, flush=True)
         json.dump(res, open(a.out, "w"))
         if a.trace:
