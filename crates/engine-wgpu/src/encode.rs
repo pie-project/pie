@@ -346,15 +346,16 @@ impl Sink<'_> {
                         views.push((dummy.buffer.clone(), 0, dummy.size, false));
                         continue;
                     }
+                    let view = remaining
+                        .next_multiple_of(4)
+                        .min(binding.slab().size.saturating_sub(binding.offset()));
+                    storage_view_fits(views.len(), view, max_binding)
+                        .map_err(|detail| Sink::backend(fire, detail))?;
                     if binding.offset().is_multiple_of(storage_align) {
-                        let size = remaining
-                            .next_multiple_of(4)
-                            .min(binding.slab().size.saturating_sub(binding.offset()))
-                            .min(max_binding);
                         views.push((
                             binding.slab().buffer.clone(),
                             binding.offset(),
-                            size,
+                            view,
                             mutable,
                         ));
                         continue;
@@ -612,5 +613,44 @@ impl Encode for Sink<'_> {
 
     fn target(&self) -> Target {
         Target::Wgsl
+    }
+}
+
+/// Whether argument `at`'s view of `bytes` fits the device's largest storage
+/// binding. A view past it is refused rather than clamped: a clamped view
+/// binds a truncated slab, and the kernel's reads past the cut come back as
+/// whatever robust access answers.
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
+fn storage_view_fits(at: usize, bytes: u64, limit: u64) -> Result<(), String> {
+    if bytes <= limit {
+        return Ok(());
+    }
+    Err(format!(
+        "argument {at} binds a {bytes}-byte view, past this device's \
+         max_storage_buffer_binding_size of {limit} bytes; a view is never \
+         clamped, so the slab must be split to fit the binding"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::storage_view_fits;
+
+    #[test]
+    fn a_view_past_the_binding_limit_is_refused_with_its_sizes() {
+        const LIMIT: u64 = 128 << 20;
+        assert_eq!(storage_view_fits(0, 4, LIMIT), Ok(()));
+        assert_eq!(storage_view_fits(2, LIMIT, LIMIT), Ok(()));
+        let why = storage_view_fits(3, LIMIT + 4, LIMIT).unwrap_err();
+        assert!(why.contains("argument 3"), "got: {why}");
+        assert!(
+            why.contains(&format!("{}-byte view", LIMIT + 4)),
+            "got: {why}"
+        );
+        assert!(why.contains(&format!("of {LIMIT} bytes")), "got: {why}");
+        assert!(
+            why.contains("max_storage_buffer_binding_size"),
+            "got: {why}"
+        );
     }
 }

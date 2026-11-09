@@ -483,7 +483,11 @@ impl Context {
             mappable_primary: features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
             pipeline_cache: features.contains(wgpu::Features::PIPELINE_CACHE),
         };
-        let max_buffer = limits.max_buffer_size;
+        // A slab is bound whole, so no larger than one storage binding takes:
+        // past it a fire refuses the view rather than reading a cut slab.
+        let max_buffer = limits
+            .max_buffer_size
+            .min(limits.max_storage_buffer_binding_size);
         let subgroup_min = enabled.subgroups.then_some(info.subgroup_min_size);
         let poller = host::Poller::start(device.clone());
         let core = Arc::new(Core {
