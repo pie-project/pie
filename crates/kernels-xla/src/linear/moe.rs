@@ -47,7 +47,7 @@ use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Fold, Func, GatherDims, Ty, Val};
 use crate::linear::quant::{
-    Codes, code_values, e8m0, grouped_dot, materialize, offset_dot, read_codes,
+    Codes, TILE, code_values, e8m0, grouped_dot, materialize, offset_dot, read_codes, tile_factor,
 };
 use crate::tensor::{Bank, Landing, Operand, Stored};
 use crate::tuning::{MoePath, Tuning};
@@ -732,6 +732,9 @@ enum Form<T = Operand> {
     },
     /// e2m1 codes, one e8m0 exponent byte per 32 (or pre-scaled weights).
     Mxfp4 { codes: T, scales: T },
+    /// e4m3 codes, one f32 factor a 128x128 block of each expert's `[N, K]`
+    /// (`[E·⌈N/128⌉, K/128]`): a block-FP8 release's experts as released.
+    Tile { codes: T, scales: T },
 }
 
 impl<T> Form<T> {
@@ -740,6 +743,7 @@ impl<T> Form<T> {
             Self::Dense(_) => 16,
             Self::Affine { bits, .. } => bits,
             Self::Mxfp4 { .. } => 4,
+            Self::Tile { .. } => 8,
         }
     }
 
@@ -748,6 +752,7 @@ impl<T> Form<T> {
             Self::Dense(_) => 1,
             Self::Affine { group, .. } => group,
             Self::Mxfp4 { .. } => MXFP4_BLOCK,
+            Self::Tile { .. } => TILE as u32,
         }
     }
 }
@@ -768,6 +773,13 @@ fn form_of<T: Stored>(op: &'static str, bank: Bank<T>) -> Result<Form<T>, Error>
         (None, MXFP4_BLOCK, 4) => {
             expect(op, bank.scales, &[Dtype::U8, Dtype::E8m0])?;
             Ok(Form::Mxfp4 {
+                codes: bank.codes,
+                scales: bank.scales,
+            })
+        }
+        (None, group, 8) if i64::from(group) == TILE && bank.codes.dtype() == Dtype::E4m3 => {
+            expect(op, bank.scales, &[Dtype::F32])?;
+            Ok(Form::Tile {
                 codes: bank.codes,
                 scales: bank.scales,
             })
@@ -807,7 +819,7 @@ impl Fan {
 
 /// Codes a codes plane stores, counted in `bits`-wide codes.
 fn stored_codes(op: &'static str, codes: impl Stored, bits: u32) -> Result<u64, Error> {
-    if codes.dtype() == Dtype::E5m2 {
+    if matches!(codes.dtype(), Dtype::E5m2 | Dtype::E4m3) {
         return Ok(codes.elements());
     }
     if let Some(per) = crate::pack::codes_per_row(codes.dtype(), u64::from(codes.width())) {
@@ -871,7 +883,9 @@ fn fan_of(
             }
             bank.elements() / per
         }
-        Form::Affine { codes, scales, .. } | Form::Mxfp4 { codes, scales } => {
+        Form::Affine { codes, scales, .. }
+        | Form::Mxfp4 { codes, scales }
+        | Form::Tile { codes, scales } => {
             let group = u64::from(form.group());
             if !k64.is_multiple_of(group) {
                 return Err(refuse(
@@ -887,7 +901,13 @@ fn fan_of(
                 ));
             }
             let experts = stored / per;
-            let factors = experts * n64 * (k64 / group);
+            // A block-FP8 factor covers 128 rows as well as 128 codes.
+            let rows = if matches!(form, Form::Tile { .. }) {
+                n64.div_ceil(group)
+            } else {
+                n64
+            };
+            let factors = experts * rows * (k64 / group);
             let planes = match form {
                 Form::Affine { biases, .. } => vec![scales, biases],
                 _ => vec![scales],
@@ -955,6 +975,26 @@ fn read_bank(f: &mut Func, form: Form, fan: Fan) -> Result<Read, Error> {
                 codes: c,
                 factor: Some(f.reshape(s, &[rows, groups])?),
                 bias: Some(f.reshape(b, &[rows, groups])?),
+            }
+        }
+        Form::Tile { codes, scales } => {
+            let c = read_codes(f, codes, 8, false, rows, fan.k)?;
+            // Each expert's block rows repeat over its rows.
+            let nb = (fan.n + TILE - 1) / TILE;
+            let s = f.reshape(scales.val, &[fan.experts, nb * groups])?;
+            let s = f.reshape(s, &[fan.experts * nb, groups])?;
+            let s = tile_factor(f, s, fan.experts * nb * TILE)?;
+            let s = if nb * TILE == fan.n {
+                s
+            } else {
+                let s = f.reshape(s, &[fan.experts, nb * TILE, groups])?;
+                let s = f.slice_axis(s, 1, 0, fan.n)?;
+                f.reshape(s, &[rows, groups])?
+            };
+            Read {
+                codes: c,
+                factor: Some(s),
+                bias: None,
             }
         }
         Form::Mxfp4 { codes, scales } => {

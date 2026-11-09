@@ -551,13 +551,9 @@ fn pairings<'a>(
                     });
                 }
             },
-            ScaleForm::F32Factors => {
-                return Err(Fault::Param {
-                    name: (*name).to_string(),
-                    why: "wants its scales expanded to f32 factors, and every quantized \
-                          point this shell stamps reads them in the width they are stored",
-                });
-            }
+            // A block-FP8 release's e4m3 codes beside its f32 factors, one a
+            // 128x128 block (`kernels_xla::linear::quant`'s `Tile`).
+            ScaleForm::F32Factors => 8,
             ScaleForm::E4m3TensorScaled => {
                 return Err(Fault::Param {
                     name: (*name).to_string(),
@@ -692,6 +688,15 @@ fn gemm_only(
                     ..
                 },
             ) => Some(*w),
+            // A routed block-FP8 bank: its codes land `[K, E·N]` like a gemm
+            // weight's (below).
+            Operation::Linear(Linear::MoeSelect {
+                bank,
+                quantized: true,
+                ..
+            }) if param_of(*bank).is_some_and(|p| trace.params[p].dtype == Dtype::E4m3) => {
+                Some(*bank)
+            }
             _ => None,
         };
         for &v in &inputs {
@@ -726,6 +731,12 @@ fn gemm_only(
             // 45 us a layer). It lands `[K, N]` with N padded to whole
             // 128-lane tiles (`crate::trace` slices the padding off).
             let (n, k) = bank_rectangle(param.dtype, &param.shape);
+            // Block-FP8 codes `[N, K]` land `[K, N]` too: the grouped dot over
+            // their 128-code blocks reads K-major codes at the DMA rate, and
+            // K-minor ones at half of it (v5e, a 6144x24576 projection).
+            if param.dtype == Dtype::E4m3 {
+                return true;
+            }
             let k = kernels_xla::pack::codes_per_row(param.dtype, k).unwrap_or(k);
             return kernels_xla::pack::code_bits(param.dtype).is_some_and(|b| b < 8)
                 && param.dtype != Dtype::Mxfp4
@@ -899,6 +910,11 @@ fn gather_only(
 /// A row-major `[rows, cols]` array of 2-byte elements as `[cols, rows]`,
 /// in cache-sized blocks over a few threads.
 fn transpose_2byte(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    transpose_elems(bytes, rows, cols, 2)
+}
+
+/// `transpose_2byte` for elements `e` bytes wide (block-FP8 codes: one).
+fn transpose_elems(bytes: &[u8], rows: usize, cols: usize, e: usize) -> Vec<u8> {
     const B: usize = 64;
     let mut dst = vec![0u8; bytes.len()];
     let threads = std::thread::available_parallelism()
@@ -907,17 +923,17 @@ fn transpose_2byte(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
     // Each thread fills whole output rows (input columns) `c0..c1`.
     let per = cols.div_ceil(threads).div_ceil(B) * B;
     std::thread::scope(|scope| {
-        for (t, out) in dst.chunks_mut((2 * per * rows).max(2)).enumerate() {
+        for (t, out) in dst.chunks_mut((e * per * rows).max(e)).enumerate() {
             scope.spawn(move || {
                 let c0 = t * per;
                 let c1 = (c0 + per).min(cols);
                 for rb in (0..rows).step_by(B) {
                     for cb in (c0..c1).step_by(B) {
                         for c in cb..(cb + B).min(c1) {
-                            let o = &mut out[2 * (c - c0) * rows..2 * (c - c0 + 1) * rows];
+                            let o = &mut out[e * (c - c0) * rows..e * (c - c0 + 1) * rows];
                             for r in rb..(rb + B).min(rows) {
-                                let at = 2 * (r * cols + c);
-                                o[2 * r..2 * r + 2].copy_from_slice(&bytes[at..at + 2]);
+                                let at = e * (r * cols + c);
+                                o[e * r..e * r + e].copy_from_slice(&bytes[at..at + e]);
                             }
                         }
                     }
@@ -1015,7 +1031,8 @@ impl Landing<'_> {
             return Ok(());
         }
         if self.transposed.contains(&at) {
-            let t = transpose_2byte(bytes, rows as usize, width as usize);
+            let e = if dtype == Dtype::E4m3 { 1 } else { 2 };
+            let t = transpose_elems(bytes, rows as usize, width as usize, e);
             self.buffers[at] = Some(self.device.upload(
                 dtype,
                 u32::try_from(width).unwrap_or(u32::MAX),
@@ -1145,6 +1162,8 @@ impl Weights {
                 Dtype::U2g32 => (32, 2),
                 Dtype::U2g64 => (64, 2),
                 Dtype::U2g128 => (128, 2),
+                // Block FP8: e4m3 codes, one f32 factor a 128x128 block.
+                Dtype::E4m3 if trace.params[scales].dtype == Dtype::F32 => (128, 8),
                 _ => (0, 0),
             };
             pairings.insert(

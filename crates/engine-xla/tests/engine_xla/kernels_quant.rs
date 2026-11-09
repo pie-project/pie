@@ -595,3 +595,64 @@ fn nvfp4_answers_the_host() {
     let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
     assert_close(&b.read_f32(yb), &want, 1e-2 * scale, 1e-2);
 }
+
+// -------------------------------------------------------------- block FP8
+
+/// An e4m3fn byte's value (no NaN among the codes drawn).
+fn e4m3_value(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let (e, m) = (i32::from((b >> 3) & 15), f32::from(b & 7));
+    sign * if e == 0 {
+        m / 8.0 * 2f32.powi(-6)
+    } else {
+        (1.0 + m / 8.0) * 2f32.powi(e - 7)
+    }
+}
+
+#[test]
+fn block_fp8_banks_answer_the_host() {
+    // e4m3 codes under one f32 factor a 128x128 block, 200 rows (a partial
+    // block row) of 384 codes: `m` rows group-batched, `big` rows through
+    // the weight decoded once.
+    let (m, big, n, k) = (5usize, 1400usize, 200usize, 384usize);
+    let (nb, g) = (n.div_ceil(128), k / 128);
+    let codes: Vec<u8> = (0..n * k)
+        .map(|i| {
+            let c = (hash(i, 950) >> 9) as u8;
+            if c & 0x7f == 0x7f { c ^ 1 } else { c }
+        })
+        .collect();
+    let factors: Vec<f32> = (0..nb * g)
+        .map(|i| 0.001 + (hash(i, 951) % 1000) as f32 / 1e4)
+        .collect();
+    let w: Vec<f32> = (0..n * k)
+        .map(|i| e4m3_value(codes[i]) * factors[(i / k / 128) * g + (i % k) / 128])
+        .collect();
+    let xs = data(m * k, 952);
+    let xb = data(big * k, 953);
+    let mut b = Bench::new();
+    let x = b.bf16(m as u32, k as u32, &xs);
+    let xbig = b.bf16(big as u32, k as u32, &xb);
+    let bank = Bank {
+        codes: b.raw(Dtype::E4m3, n as u32, k as u32, codes),
+        scales: b.f32(nb as u32, g as u32, &factors),
+        biases: None,
+        group: 128,
+        bits: 8,
+    };
+    let y = b.zeros(Dtype::F32, m as u32, n as u32);
+    let yb = b.zeros(Dtype::F32, big as u32, n as u32);
+    if !b
+        .run(|ctx| {
+            engine_xla::lower::linear::quant(ctx, false, x, bank, y)?;
+            engine_xla::lower::linear::quant(ctx, false, xbig, bank, yb)
+        })
+        .unwrap()
+    {
+        return;
+    }
+    // Group-batched rows scale exact partials; the decoded weight rounds to
+    // bf16, as the bf16 deployment holds it.
+    assert_close(&b.read_f32(y), &gemm_at(&xs, &w, m, n, k, false), 1e-3, 1e-2);
+    assert_close(&b.read_f32(yb), &gemm_ref(&xb, &w, big, n, k), 1e-3, 1e-2);
+}

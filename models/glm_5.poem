@@ -24,6 +24,7 @@ MODELS = [
 BF = dtype.bf16
 U4 = dtype.u4g64
 F8 = dtype.e4m3tile128a8
+F8W = dtype.e4m3tile128
 NV4 = dtype.nvfp4a4
 NV4W = dtype.nvfp4
 
@@ -40,6 +41,9 @@ DEPLOYMENTS = [
     # Every FP8 tensor of the release as released: the projections too.
     deployment("glm53-mini", weights = [F8, F8], kv = BF),
     deployment("glm53-mini", weights = F8, kv = BF),
+    # ... against bf16 activations, the codes read as they are (a TPU: no
+    # FP8 product; sglang-jax serves the release this way).
+    deployment("glm53-mini", weights = F8W, kv = BF),
     # modelopt's NVFP4 export as vLLM serves it: routed experts NVFP4 against
     # NVFP4 or bf16 activations, attention and shared experts bf16, the dense
     # MLP widened from its per-tensor FP8.
@@ -206,7 +210,7 @@ def layout(id, deploy):
     # e4m3 activations; norms, tables, router, indexer and the latent's
     # up-projection (the absorbs read it as bf16) at bf16, as vLLM reads them.
     proj = w
-    if w == dtype.e4m3tile128a8:
+    if w in [dtype.e4m3tile128a8, dtype.e4m3tile128]:
         w = dtype.bf16
     dense = compute(w)
     hidden = d.hidden
