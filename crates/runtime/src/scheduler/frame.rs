@@ -771,6 +771,20 @@ impl FramePolicy {
             {
                 return None;
             }
+            // Riding decodes take each of the frame's steps: the prompts
+            // beside them spread over the steps too, so none runs decodes alone.
+            let spread = self.prompts_only
+                && k > 1
+                && order.iter().any(|lane| {
+                    self.lanes.get(lane).is_some_and(|state| {
+                        state.frames.front().is_some_and(|front| {
+                            front
+                                .fires
+                                .iter()
+                                .any(|fire| fire.fire_id.is_some() && fire.slot > 0)
+                        })
+                    })
+                });
 
             let mut waves: Vec<Vec<u64>> = vec![Vec::new(); k];
             let mut fire_waves = HashMap::new();
@@ -786,7 +800,7 @@ impl FramePolicy {
                 let Some(front) = lane.frames.front() else {
                     continue;
                 };
-                let live: Vec<PlacedFire> = front
+                let mut live: Vec<PlacedFire> = front
                     .fires
                     .iter()
                     .filter_map(|fire| {
@@ -803,6 +817,12 @@ impl FramePolicy {
                     lane.frames.pop_front();
                     dropped_empty = true;
                     continue;
+                }
+                if spread
+                    && let [fire] = live.as_mut_slice()
+                    && fire.tokens > fire.rows
+                {
+                    fire.wave = (0..k).min_by_key(|&w| wave_tokens[w]).unwrap_or(0);
                 }
                 let fits = live.iter().all(|fire| {
                     let reading = wave_readouts[fire.wave];
