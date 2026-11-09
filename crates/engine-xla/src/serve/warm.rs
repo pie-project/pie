@@ -143,7 +143,7 @@ impl Shell {
             return Err(fault);
         }
         let traced_s = started.elapsed().as_secs_f64();
-        self.compile_deferred(deferred)?;
+        let skipped = self.compile_deferred(deferred)?;
         let touched = shapes.iter().map(Vec::len).max().unwrap_or(0) as u32;
         for slot in 0..touched.min(self.held.len() as u32) {
             self.open(slot)?;
@@ -151,6 +151,7 @@ impl Shell {
         tracing::info!(
             fires = fired,
             programs = self.traced.len(),
+            skipped,
             traced_s,
             s = started.elapsed().as_secs(),
             "xla warm ladder compiled"
@@ -159,8 +160,15 @@ impl Shell {
     }
 
     /// Compiles what the ladder traced, a thread a core up to 8, and seats
-    /// each program under its keys.
-    fn compile_deferred(&mut self, deferred: Vec<super::Deferred>) -> Result<()> {
+    /// each program under its keys; answers how many programs it left out.
+    ///
+    /// A program whose temporaries do not fit the chip's HBM beside the pool
+    /// (PJRT's `RESOURCE_EXHAUSTED`) is left out, not the load: the ladder
+    /// covers shapes a fire may never take, and one that does compiles then
+    /// and fails there, as every shape did before the ladder (Qwen3.8-Flash-
+    /// Next's mini on a v5e refused its whole load over one, "Ran out of
+    /// memory on HBM" at m=9772). Any other compile failure fails the load.
+    fn compile_deferred(&mut self, deferred: Vec<super::Deferred>) -> Result<usize> {
         let mut texts: Vec<(&str, &crate::trace::Signature)> = Vec::new();
         let mut index: Vec<usize> = Vec::with_capacity(deferred.len());
         let mut seen: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
@@ -213,13 +221,25 @@ impl Shell {
         unsafe {
             libc::malloc_trim(0);
         }
+        let exhausted = format!(
+            "(code {})",
+            crate::pjrt::sys::PJRT_Error_Code_RESOURCE_EXHAUSTED
+        );
+        let mut left_out = std::collections::HashSet::new();
         for (d, at) in deferred.into_iter().zip(index) {
             let program = match programs[at].as_ref() {
                 Some(Ok(program)) => std::sync::Arc::clone(program),
                 Some(Err(fault)) => {
+                    let why = fault.to_string();
+                    if why.contains(&exhausted) {
+                        if left_out.insert(at) {
+                            tracing::warn!(%why, "xla warm shape left out: its program does not fit HBM");
+                        }
+                        continue;
+                    }
                     return Err(crate::error::Fault::Program {
                         at: "serve::warm",
-                        why: fault.to_string(),
+                        why,
                     });
                 }
                 None => continue,
@@ -230,7 +250,7 @@ impl Shell {
                 self.shaped.insert(shape_key, program);
             }
         }
-        Ok(())
+        Ok(left_out.len())
     }
 
     fn warm_fire(&mut self, shape: &[Want]) -> Result<()> {
