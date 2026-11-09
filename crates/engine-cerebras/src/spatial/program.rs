@@ -76,9 +76,6 @@ pub struct Model {
     pub lse: bool,
     /// `OP2` 1: the second op cuts (`Variant::ops2`).
     pub ops2: bool,
-    /// `RGX`: the regions' X full all-reduces' phase-1 group (0: RGs;
-    /// `Variant::rgx`).
-    pub rgx: usize,
     /// `QKV1` 1: one QKV matvec over fused rows (`Variant::qkv1`).
     pub qkv1: bool,
     /// `ARF`: the regions' FIFO dual-input all-reduces (`Variant::arf`; 0 off).
@@ -123,7 +120,6 @@ impl Model {
             speed: false,
             lse: false,
             ops2: false,
-            rgx: 0,
             qkv1: false,
             arf: 0,
             f16: 0,
@@ -158,7 +154,6 @@ impl Model {
             speed: self.speed,
             lse: self.lse,
             ops2: self.ops2,
-            rgx: self.rgx > 0,
             qkv1: self.qkv1,
             arf: u16::try_from(self.arf).unwrap_or(0),
             f16: u16::try_from(self.f16).unwrap_or(0),
@@ -756,7 +751,6 @@ impl ProgramSpec {
             "SPD" => Some(usize::from(m.speed)),
             "LSE" => Some(usize::from(m.lse)),
             "OP2" => Some(usize::from(m.ops2)),
-            "RGX" => Some(m.rgx),
             "QKV1" => Some(usize::from(m.qkv1)),
             "ARF" => Some(m.arf),
             "F16" => Some(m.f16),
@@ -1410,7 +1404,6 @@ fn model(get: &Get) -> R<Model> {
         speed: get.opt("SPD").unwrap_or(0) != 0,
         lse: get.opt("LSE").unwrap_or(0) != 0,
         ops2: get.opt("OP2").unwrap_or(0) != 0,
-        rgx: get.opt("RGX").unwrap_or(0),
         qkv1: get.opt("QKV1").unwrap_or(0) != 0,
         arf: get.opt("ARF").unwrap_or(0),
         f16: get.opt("F16").unwrap_or(0),

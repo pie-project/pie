@@ -780,39 +780,19 @@ impl Tables {
 /// (c_r1_0, c_r1_1, c_r2_0, c_r2_1, c_bc) on X, then on Y, then c_bc's
 /// group broadcast, each `rb[rx] | rb[5 + tx1] | rb[5 + tx2]`.
 pub fn route_words(rb: &[u32], px_n: usize, py_n: usize, gs: usize, gy: usize) -> Vec<u32> {
-    route_words_gx(rb, px_n, py_n, gs, gy, 0)
-}
-
-/// [`route_words`], and with `gx` > 0 (RGX) 6 more a PE: the X axis's
-/// five words in phase-1 groups of `gx`, then log2(gx) (17 a PE).
-pub fn route_words_gx(
-    rb: &[u32],
-    px_n: usize,
-    py_n: usize,
-    gs: usize,
-    gy: usize,
-    gx: usize,
-) -> Vec<u32> {
-    let stride = if gx > 0 { 17 } else { 11 };
     const RAMP: usize = 0;
     const N_: usize = 1;
     const S_: usize = 2;
     const E_: usize = 3;
     const W_: usize = 4;
     let word = |(rx, t1, t2): (usize, usize, usize)| rb[rx] | rb[5 + t1] | rb[5 + t2];
-    let mut out = vec![0u32; py_n * px_n * stride];
+    let mut out = vec![0u32; py_n * px_n * 11];
     for py in 0..py_n {
         for px in 0..px_n {
-            let at = (py * px_n + px) * stride;
-            let axes = [
-                (W_, E_, px, px_n, gs),
-                (N_, S_, py, py_n, gy),
-                (W_, E_, px, px_n, gx),
-            ];
-            for (ax, (h, t, idv, alen, ga)) in
-                axes.into_iter()
-                    .enumerate()
-                    .take(if gx > 0 { 3 } else { 2 })
+            let at = (py * px_n + px) * 11;
+            for (ax, (h, t, idv, alen, ga)) in [(W_, E_, px, px_n, gs), (N_, S_, py, py_n, gy)]
+                .into_iter()
+                .enumerate()
             {
                 let mut cfg = [(0, 0, 0); 5];
                 let r1 = ga / 2;
@@ -858,7 +838,7 @@ pub fn route_words_gx(
                     (h, RAMP, t)
                 };
                 for (c, &f) in cfg.iter().enumerate() {
-                    out[at + if ax == 2 { 11 } else { 5 * ax } + c] = word(f);
+                    out[at + 5 * ax + c] = word(f);
                 }
             }
             let (r, r1) = (px % gs, gs / 2);
@@ -876,9 +856,6 @@ pub fn route_words_gx(
                 (W_, RAMP, E_)
             };
             out[at + 10] = word(g);
-            if gx > 0 {
-                out[at + 16] = gx.trailing_zeros();
-            }
         }
     }
     out
@@ -1025,24 +1002,9 @@ pub fn put_routes(
             .filter(|b| b.len() >= 10)
             .ok_or("HROUTE 1 without the program's rbits")?;
         for v in &units {
-            // (RGX: the regions' third X route set)
-            let gx = if v.kind == Kind::Grid {
-                0
-            } else {
-                lay.model.rgx
-            };
-            if gx > 0 && (!gx.is_power_of_two() || v.k.px % gx != 0 || gx > v.k.px / 2) {
-                return Err(format!(
-                    "RGX {gx} does not split the region's {} columns",
-                    v.k.px
-                ));
-            }
             // (ARF: the regions' Y all-reduces as streamed halves, groups of 8)
             // (GRD bit 1: the grids' too)
             let arf = (v.kind != Kind::Grid || lay.model.grid & 1 != 0) && lay.model.arf != 0;
-            if arf && gx > 0 {
-                return Err("ARF with RGX: not built".into());
-            }
             let argx = if lay.model.arf & 2 != 0 { 16 } else { 0 };
             // (ARY: the Y groups' rows, 8 by default; 0495: 16 is ~15 cycles faster at 208 rows)
             let ary = if lay.model.ary > 0 { lay.model.ary } else { 8 };
@@ -1060,10 +1022,7 @@ pub fn put_routes(
                     if argx > 0 { 18 } else { 12 },
                 )
             } else {
-                (
-                    route_words_gx(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v), gx),
-                    if gx > 0 { 17 } else { 11 },
-                )
+                (route_words(rb, v.k.px, v.k.py, v.k.gs, u.y_group(v)), 11)
             };
             dev.put("rcfg", rect(v.x0, v.y0, v.k.px, v.k.py), n, &words)?;
         }
@@ -1674,24 +1633,6 @@ mod tests {
         );
     }
 
-    /// The VM's per-fire control: bit lane CAP + iteration, every VM row.
-    /// RGX's third route set is the X axis's at groups of RGX, its last
-    /// word log2(RGX); the first 11 words a PE are as without it.
-    #[test]
-    fn rgx_route_words_add_the_x_axis_at_its_group() {
-        let rb: Vec<u32> = (0..10).map(|i| 1u32 << i).collect();
-        let (px, py) = (256, 208);
-        let base = route_words(&rb, px, py, 32, 16);
-        let g16 = route_words(&rb, px, py, 16, 16);
-        let gx = route_words_gx(&rb, px, py, 32, 16, 16);
-        assert_eq!(gx.len(), px * py * 17);
-        for pe in 0..px * py {
-            assert_eq!(gx[pe * 17..pe * 17 + 11], base[pe * 11..pe * 11 + 11]);
-            assert_eq!(gx[pe * 17 + 11..pe * 17 + 16], g16[pe * 11..pe * 11 + 5]);
-            assert_eq!(gx[pe * 17 + 16], 4);
-        }
-    }
-
     /// One line of ARF words, run as the kernel's arf_ar runs them: every
     /// stream lands on the queue its PE's role reads, the root's sum counts
     /// every PE once, and the broadcast reaches every PE once. `word(p, c)`:
@@ -1877,6 +1818,7 @@ mod tests {
         }
     }
 
+    /// The VM's per-fire control: bit lane CAP + iteration, every VM row.
     #[test]
     fn vmctl_marks_the_skipped_turns() {
         let params = "PX:8,PY:16,Hc:3,Dc:8,Gs:8,Ic:24,RPX:16,RPY:24,RHc:2,RDc:4,RGs:16,RIc:12,RNL:2,RGY:8,RC:2,RR:2,\
