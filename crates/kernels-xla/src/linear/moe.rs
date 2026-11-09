@@ -1141,6 +1141,13 @@ fn gmm_rows_whole(p: i64, e: i64, base: i64) -> i64 {
     while tm < 128 && tm < per {
         tm *= 2;
     }
+    // An expert holding two 256-row tiles or more takes them: each step
+    // converts its block once for twice the rows, at the same padding
+    // (DeepSeek-V4's 1792-row prompt, 672 rows an expert: its routed
+    // matmuls 10.4 -> 8.0 of a v6e fire).
+    if per >= 512 {
+        tm = 256;
+    }
     tm
 }
 
