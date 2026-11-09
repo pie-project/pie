@@ -7,6 +7,7 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 pub mod offload;
+pub mod pressure;
 pub mod retention;
 pub mod schedule;
 
@@ -22,7 +23,7 @@ pub use manifest::{Manifest, ManifestError};
 #[cfg(not(target_arch = "wasm32"))]
 pub use program::{Commit, Fault, LoadError, Offloads, Plane, Program, Retention, Table};
 #[cfg(not(target_arch = "wasm32"))]
-pub use service::{reload, start};
+pub use service::{reload, start, start_default};
 
 use client_api::Props;
 
@@ -107,6 +108,10 @@ pub(crate) enum Event {
     /// The session id is `<tenant>/<session>`.
     SessionProps(String, Props),
     SessionClosed(String),
+    /// Where a tier's waiters stand now ([`pressure::raise`]): sent when its
+    /// shortfall changes, or stands a while. The policy hears an edge only
+    /// when the band changes.
+    TierPressure(pressure::Tier, pressure::Reading),
     /// Swap the policy for this one (name, component), or for none, loaded
     /// whole first: the answer is why it did not load.
     Reload(

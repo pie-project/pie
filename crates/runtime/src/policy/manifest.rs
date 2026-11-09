@@ -22,6 +22,7 @@ const EDGES: &[&str] = &[
     "timer",
     "offloaded",
     "offload-failed",
+    "tier-pressure",
 ];
 
 const GRANTS: &[&str] = &[
