@@ -40,7 +40,7 @@ for k in OWN:
     d.append("}")
     open(os.path.join(out, f"{k}.csl"), "w").write(body + "\n" + "\n".join(d) + "\n")
 P = ["K", "KM", "Hc", "NQA", "QO", "Qh", "Dc", "NROT", "Ic", "NEX", "TK", "HR", "NLV", "VR"]
-PD = {"DIAG": 0, "TSTAMP": 0, "XKEEP": 0, "FIFOW": 32, "WFORCE": 0, "NE": int(kw.get("NE", 128)), "WIN": int(kw.get("WIN", 128))}
+PD = {"DIAG": 0, "GLUV": 0, "TSTAMP": 0, "XKEEP": 0, "FIFOW": 32, "WFORCE": 0, "NE": int(kw.get("NE", 128)), "WIN": int(kw.get("WIN", 128))}
 L = [f"param {p}: u16;" for p in P] + [f"param {p}: u16 = {v};" for p, v in PD.items()]
 import json as _j, math as _mt
 _m = _j.load(open(os.path.join(os.path.dirname(os.path.abspath(ptxt)), os.path.basename(ptxt).replace("params.txt", "meta.json"))))
@@ -59,7 +59,7 @@ L.append("      if (y >= HB0) {\n"
          "        if (lx == XC and ly == YC) { @set_tile_code(x, y, \"filler.csl\", .{ .memcpy_params = mp }); }\n"
          "        else if (lx == XC) { @set_tile_code(x, y, \"cx.csl\", .{ .memcpy_params = mp, .K = K, .Hc = Hc, .NEX = NEX, .TK = TK, .DIAG = DIAG, .XKEEP = XKEEP }); }\n"
          "        else if (ly == YC and lx < XC) { @set_tile_code(x, y, \"cya.csl\", .{ .memcpy_params = mp, .K = K, .NQA = NQA, .Qh = Qh, .Dc = Dc, .NROT = NROT, .HR = HR, .NLV = NLV, .QSC = QSC, .DIAG = DIAG, .TSTAMP = TSTAMP, .FIFOW = FIFOW }); }\n"
-         "        else if (ly == YC) { @set_tile_code(x, y, \"cym.csl\", .{ .memcpy_params = mp, .K = K, .Ic = Ic, .NEX = NEX, .TK = TK, .HR = HR, .DIAG = DIAG, .TSTAMP = TSTAMP, .FIFOW = FIFOW }); }\n"
+         "        else if (ly == YC) { @set_tile_code(x, y, \"cym.csl\", .{ .memcpy_params = mp, .K = K, .Ic = Ic, .NEX = NEX, .TK = TK, .HR = HR, .GLUV = GLUV, .DIAG = DIAG, .TSTAMP = TSTAMP, .FIFOW = FIFOW }); }\n"
          "        else if (lx < XC) { @set_tile_code(x, y, \"wa.csl\", .{ .memcpy_params = mp, .K = K, .KM = KM, .Hc = Hc, .NQA = NQA, .QO = QO, .Qh = Qh, .Dc = Dc, .NE = NE, .PYW = PY, .WIN = WIN, .DIAG = DIAG, .TSTAMP = TSTAMP, .FIFOW = FIFOW }); }\n"
          "        else { @set_tile_code(x, y, \"wm.csl\", .{ .memcpy_params = mp, .K = K, .Hc = Hc, .Ic = Ic, .NEX = NEX, .TK = TK, .DIAG = DIAG, .TSTAMP = TSTAMP, .FIFOW = FIFOW }); }\n"
          "      }")

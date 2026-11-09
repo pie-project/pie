@@ -17,6 +17,8 @@ Modes: `ref` (f32 everywhere, the reference arithmetic), or `+`-joined kernel sw
   kv32     KV cache in f32
   r16      router x in one f16 part (f32 accumulation)
   rxp2     router x in two f16 parts
+  glv      the SwiGLU as ctl_cy_gptoss_moe GLUV 1: e = exp(-1.702 |g|), 1 / (1 + e) by the quadratic and two Newton
+           steps in f32, glu = max(g, g e) r
   att32    attention matvecs (qkv, o) with f32 accumulation
 Router report: per (position, layer) the 4th / 5th gap of our logits and our logits' error against
 an f64 router on the same x2 (the kernel's router error); counts of gaps below that error."""
@@ -237,8 +239,18 @@ class Emu:
                     gu = (part * sc[:, None]).sum(0, dtype=f32) * f32(2.0 ** Pg) * rr
                     I_ = gu.size // 2
                     gate = gu[:I_] + gub[e, 0::2]; up = gu[I_:] + gub[e, 1::2]
-                    gate = np.minimum(gate, 7.0); up = np.clip(up, -7, 7)
-                    act = ((up + 1) * gate / (1 + np.exp(-gate * 1.702))).astype(f32)
+                    gate = np.minimum(gate, 7.0).astype(f32); up = np.clip(up, -7, 7).astype(f32)
+                    if "glv" in o:
+                        ee = np.exp(-np.abs(gate * f32(1.702))).astype(f32)
+                        d = (ee + f32(1.0)).astype(f32)
+                        r = (d * f32(0.323112507040746)).astype(f32); r = (r + f32(-1.4540415401729079)).astype(f32)
+                        r = (r * d).astype(f32); r = (r + f32(2.1207294161729284)).astype(f32)
+                        for _ in range(2):
+                            tt = (d * r).astype(f32); tt = (f32(2.0) - tt).astype(f32); r = (r * tt).astype(f32)
+                        glu = (np.maximum(gate, (gate * ee).astype(f32)) * r).astype(f32)
+                    else:
+                        glu = (gate / (1 + np.exp(-gate * 1.702))).astype(f32)
+                    act = ((up + 1) * glu).astype(f32)
                     acts.append(ffh(act * p_ * f32(2.0 ** Pd))); Ds.append(Dn)
                     out += p_ * db[e]
                 # down: a MoE column holds Ic 10 dims of each of the 4 experts: f16 accumulation over 40
