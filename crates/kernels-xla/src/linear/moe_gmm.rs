@@ -63,9 +63,14 @@ pub struct Gmm {
     pub k: i64,
     pub n: i64,
     pub experts: i64,
-    /// The bank's element type (bf16, or f8 converted in VMEM).
+    /// The bank's element type (bf16, or f8 converted in VMEM; e2m1 codes
+    /// with `scaled`).
     pub w: Elem,
     pub orient: Orient,
+    /// An e8m0 exponent byte per 32 codes along `K` follows the bank, as
+    /// `[K / 32, E·N]` bytes (`E·N`-minor bank only): the codes convert to
+    /// bf16 in VMEM and take their block's power of two, exactly.
+    pub scaled: bool,
 }
 
 /// How the weights are cut into blocks.
@@ -90,9 +95,16 @@ impl Gmm {
         i64::from(self.w.bits()) / 8
     }
 
+    /// A block's bytes in HBM.
+    fn block_dma(&self, cols: i64) -> i64 {
+        self.k * cols * i64::from(self.w.bits()) / 8
+    }
+
     fn cut(&self) -> Built<Cut> {
         let (k, n, e) = (self.k, self.n, self.experts);
-        let fits = |cols: i64| k * cols * self.wbytes() <= self.block_bytes;
+        // An e2m1 block counts a byte a code: its bf16 copy in VMEM is what
+        // bounds it.
+        let fits = |cols: i64| k * cols * self.wbytes().max(1) <= self.block_bytes;
         let blocked = (1..=n / 128)
             .rev()
             .map(|d| d * 128)
@@ -163,8 +175,13 @@ impl Gmm {
         if self.tm % 16 != 0 || self.tiles < 1 || self.k < 1 || self.n < 1 || self.experts < 1 {
             return bad(format!("{self:?}"));
         }
-        if !matches!(self.w, Elem::Bf16 | Elem::F8E5m2 | Elem::F8E4m3fn) {
-            return bad(format!("{:?} weights", self.w));
+        if !matches!(
+            self.w,
+            Elem::Bf16 | Elem::F8E5m2 | Elem::F8E4m3fn | Elem::F4E2m1fn
+        ) || (self.w == Elem::F4E2m1fn) != self.scaled
+            || (self.scaled && (self.orient != Orient::KMajor || self.k % 32 != 0))
+        {
+            return bad(format!("{:?} weights (scaled {})", self.w, self.scaled));
         }
         let cut = self.cut()?;
         let (k, n, tm, e) = (self.k, self.n, self.tm, self.experts);
@@ -246,6 +263,40 @@ impl Gmm {
             },
             (Orient::NMajor, Cut::Element { .. }) => return bad("an element window over rows"),
         };
+        // The exponent bytes of the block's codes: the bank's columns, a row
+        // per 32 codes of K.
+        let groups = k / 32;
+        let scales = self.scaled.then(|| {
+            let window = bank.window;
+            let index: crate::mosaic::IndexMap = match cut {
+                Cut::Blocked { tn } => Box::new(move |b: &mut Body, g: &Grid| {
+                    let ex = expert(b, g)?;
+                    let per = b.i32(n / tn);
+                    let at = b.muli(ex, per)?;
+                    let at = b.addi(at, g.ids[0])?;
+                    Ok(vec![b.i32(0), at])
+                }),
+                Cut::Element { width } => Box::new(move |b: &mut Body, g: &Grid| {
+                    let ex = expert(b, g)?;
+                    let nn = b.i32(n);
+                    let col = b.muli(ex, nn)?;
+                    let lane = b.i32(128);
+                    let col = b.divsi(col, lane)?;
+                    let col = b.muli(col, lane)?;
+                    let top = b.i32(e * n - width);
+                    let col = b.minsi(col, top)?;
+                    let col = b.assume_multiple(col, 128)?;
+                    Ok(vec![b.i32(0), col])
+                }),
+            };
+            Operand {
+                array: vec![groups, e * n],
+                elem: Elem::U8,
+                block: vec![groups, cols],
+                window,
+                index,
+            }
+        });
         let out = Operand {
             array: vec![rows, out_width],
             elem: Elem::F32,
@@ -254,13 +305,19 @@ impl Gmm {
             index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![last(b, g)?, g.ids[0]])),
         };
 
-        let wb = self.wbytes();
         let convert = if self.w == Elem::Bf16 {
             0
         } else {
             k * cols * 2
         };
-        let vmem = 2 * tm * k * 2 + 2 * k * cols * wb + convert + 2 * tm * cols * 4;
+        // The scaled codes' exponents widen to f32 beside them.
+        let scaling = if self.scaled {
+            2 * groups * cols + 4 * k * cols
+        } else {
+            0
+        };
+        let vmem =
+            2 * tm * k * 2 + 2 * self.block_dma(cols) + convert + scaling + 2 * tm * cols * 4;
         // At least the compiler's own scoped default, where the device has it.
         let floor = (32 << 20).min(self.vmem_cap);
         let limit = (vmem * 2 + (8 << 20)).clamp(floor, self.vmem_cap);
@@ -269,7 +326,10 @@ impl Gmm {
             grid: vec![nblocks, self.tiles],
             semantics: vec![Sem::Arbitrary, Sem::Arbitrary],
             prefetch: vec![vec![self.tiles], vec![1]],
-            ins: vec![xs, bank],
+            ins: [Some(xs), Some(bank), scales]
+                .into_iter()
+                .flatten()
+                .collect(),
             outs: vec![out],
             vmem_limit: Some(limit as u64),
         };
@@ -280,13 +340,67 @@ impl Gmm {
             b.when(live, |b| {
                 let x = b.vload_all(blk.ins[0])?;
                 let w = b.vload_all(blk.ins[1])?;
-                let w = b.convert_f(w, Elem::Bf16)?;
+                let w = if self.scaled {
+                    let s = b.vload_all(blk.ins[2])?;
+                    scale_codes(b, w, s, groups, cols)?
+                } else {
+                    b.convert_f(w, Elem::Bf16)?
+                };
                 let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
                 let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
                 b.vstore_all(y, blk.outs[0])
             })
         })
     }
+}
+
+/// e2m1 codes `w` (`[K, cols]`) as bf16, each times `2^(s - 127)` of its
+/// 32-code block's exponent byte (`s`: `[K / 32, cols]`): an exact product,
+/// the codes holding two significant bits.
+fn scale_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
+    use crate::mosaic::MTy;
+    let k = groups * 32;
+    let w = b.convert_f(w, Elem::F32)?;
+    let wide = MTy::Vector(vec![groups, cols], Elem::I32);
+    let s = b.op("arith.extui", &[s], "", &[wide.clone()])[0];
+    let shift = b.op(
+        "arith.constant",
+        &[],
+        &format!("value = dense<23> : {wide}"),
+        &[wide.clone()],
+    )[0];
+    let s = b.op(
+        "arith.shli",
+        &[s, shift],
+        "overflowFlags = #arith.overflow<none>",
+        &[wide],
+    )[0];
+    let s = b.op(
+        "arith.bitcast",
+        &[s],
+        "",
+        &[MTy::Vector(vec![groups, cols], Elem::F32)],
+    )[0];
+    let s = b.op(
+        "vector.shape_cast",
+        &[s],
+        "",
+        &[MTy::Vector(vec![groups, 1, cols], Elem::F32)],
+    )[0];
+    let s = b.op(
+        "vector.broadcast",
+        &[s],
+        "",
+        &[MTy::Vector(vec![groups, 32, cols], Elem::F32)],
+    )[0];
+    let s = b.op(
+        "vector.shape_cast",
+        &[s],
+        "",
+        &[MTy::Vector(vec![k, cols], Elem::F32)],
+    )[0];
+    let w = b.mulf(w, s)?;
+    b.convert_f(w, Elem::Bf16)
 }
 
 #[cfg(test)]
@@ -304,6 +418,7 @@ mod tests {
             experts: 32,
             w: Elem::F8E5m2,
             orient,
+            scaled: false,
         }
     }
 
