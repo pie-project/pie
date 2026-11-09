@@ -1858,12 +1858,18 @@ pub fn attend_fresh(
             let same_off = f.compare(Cmp::Eq, off, wo)?;
             let filed = f.and(same_page, same_off)?;
             let filed = f.or(filed, alone)?;
+            let filed = if std::env::var_os("PIE_FRESH_NOFILE").is_some() {
+                let t = f.like_i(wp, 1);
+                cmp_i(f, Cmp::Eq, t, 1)?
+            } else {
+                filed
+            };
             let filed = match enabled {
-                Some(en) => {
+                Some(en) if std::env::var_os("PIE_FRESH_NOEN").is_none() => {
                     let plain = cmp_i(f, Cmp::Eq, en, 0)?;
                     f.and(filed, plain)?
                 }
-                None => filed,
+                _ => filed,
             };
             let all = f.reduce(filed, &[0], Fold::And)?;
             let all = f.broadcast(all, &[r], &[])?;
