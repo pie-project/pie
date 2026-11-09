@@ -1,4 +1,5 @@
 #include "ssm/tile_sm80.cuh"
+#include "prim/state_rows.cuh"
 
 namespace pie::ssm {
 
@@ -24,9 +25,7 @@ __global__ void __launch_bounds__(256) mamba2_step(
     const float* __restrict__ A_log,
     const float* __restrict__ dt_bias,
     const float* __restrict__ D,
-    float* __restrict__ state_base,
-    const i32* __restrict__ slot_ids,
-    long long slot_stride_elems,
+    StateRows rows,
     bf16* __restrict__ y,
     int H, int G,
     bool write_state,
@@ -38,15 +37,15 @@ __global__ void __launch_bounds__(256) mamba2_step(
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
     const int h = blockIdx.y;
-    const int slot = slot_ids[r];
-    if (slot < 0) return;
+    const i32* rid = rows.row(r);
+    if (rid[0] < 0) return;
     const int inner = H * M2_P;
     const int g = h / (H / G);
     const int warp = threadIdx.x >> 5;
     const int l = threadIdx.x & 31;
     const bf16* at = xbc + row * (inner + 2 * G * M2_N);
-    float4* st = reinterpret_cast<float4*>(state_base + static_cast<long long>(slot) * slot_stride_elems +
-                                           static_cast<long long>(h) * M2_P * M2_N) + threadIdx.x;
+    float4* st = reinterpret_cast<float4*>(
+        rows.atom<float>(rid, h, static_cast<long long>(M2_P) * M2_N)) + threadIdx.x;
     // Every load out before any is used: the state's eight runs, the lane's
     // columns of B and C, the warp's rows of x.
     float4 s[ROWS];
@@ -105,10 +104,8 @@ __global__ void __launch_bounds__(128) mamba2_scan(
     const float* __restrict__ A_log,
     const float* __restrict__ dt_bias,
     const float* __restrict__ D,
-    float* __restrict__ state_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     const int* __restrict__ commit_len,
     const int* __restrict__ begin_at,
     bool write_state,
@@ -140,7 +137,7 @@ __global__ void __launch_bounds__(128) mamba2_scan(
     const int r = static_cast<int>(blockIdx.x) / H;
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
     if (r >= lanes) return;
-    const GdnLane lane = gdn_lane(r, qo_indptr, slot_ids, commit_len, begin_at, win);
+    const GdnLane lane = gdn_lane(r, qo_indptr, rows, commit_len, begin_at, win);
     if (lane.T <= 0 || lane.slot < 0) return;
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
     const int inner = H * P;
@@ -156,8 +153,7 @@ __global__ void __launch_bounds__(128) mamba2_scan(
     const float neg_a = -__expf(A_log[h]);
     const float bias = dt_bias[h];
     const float skip = D[h];
-    float* state = state_base + static_cast<long long>(lane.slot) * slot_stride_elems +
-                   static_cast<long long>(h) * N * P;
+    float* state = rows.atom<float>(rows.row(lane.rl), h, static_cast<long long>(N) * P);
 
     // The state fragments: two sixteen-row tiles of state columns by the
     // eight eight-wide tiles of the head's dims.

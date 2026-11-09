@@ -28,16 +28,16 @@ pub fn floor(
     );
     debug_assert_eq!(floors.dtype, Dtype::I32, "`{OP}` lands i32 floors");
     let lanes = nonzero(OP, "request lanes", positions.indptr.rows.saturating_sub(1))?;
+    // The floor is one i32: a piece is the whole row.
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, 1)?;
     ctx.fire(
         OP,
         Fire::at(kernel(KV_WINDOW, "::pie::attn::replay_floor"))
             .apply(Launch::grid([lanes, 1, 1], [BLOCK, 1, 1])),
         &[
             positions.data.arg(),
-            state.slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             positions.indptr.arg(),
-            state.slot_stride_elems.arg(),
             floors.arg(),
             i32::from(mark).arg(),
             state.write_state.arg(),

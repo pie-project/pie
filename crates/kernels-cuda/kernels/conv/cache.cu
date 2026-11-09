@@ -1,9 +1,22 @@
 #include "prim/device.cuh"
 #include "prim/voxels.cuh"
+#include "prim/state_rows.cuh"
 
 namespace pie::conv {
 
 using namespace ::pie::voxels;
+
+// Where element `local` (row `local_row`, column `col`) of lane `l`'s frame
+// slab lives: the slab cuts along its frame-position rows, `rows.atoms` of
+// them a piece.
+template <class T>
+__device__ __forceinline__ T* cache_cell(
+    const StateRows& rows, int l, int local_row, int c, int col)
+{
+    const int p = local_row / rows.atoms;
+    return rows.piece<T>(rows.row(l), p)
+        + static_cast<long long>(local_row - p * rows.atoms) * c + col;
+}
 
 __device__ __forceinline__ int cache_lane_of(
     const int* __restrict__ grid, int lanes, int frames, int row, int& base, Lane& out)
@@ -24,14 +37,13 @@ __device__ __forceinline__ int cache_lane_of(
 
 template <class T>
 __global__ __launch_bounds__(256) void cache_gather(
-    const T* __restrict__ slab,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const int* __restrict__ grid,
     T* __restrict__ cache,
     int lanes,
     int frames,
     int c,
-    long long slot_stride,
+    long long row_elems,
     long long total)
 {
     const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -46,24 +58,23 @@ __global__ __launch_bounds__(256) void cache_gather(
         return;
     }
     const long long local = static_cast<long long>(row - base) * c + col;
-    if (local >= slot_stride) {
+    if (local >= row_elems) {
         cache[e] = T{static_cast<unsigned short>(0)};
         return;
     }
-    cache[e] = slab[static_cast<long long>(slot_ids[l]) * slot_stride + local];
+    cache[e] = *cache_cell<const T>(rows, l, static_cast<int>(row - base), c, col);
 }
 
 template <class T>
 __global__ __launch_bounds__(256) void cache_store(
     const T* __restrict__ x,
     const T* __restrict__ cache,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const int* __restrict__ grid,
-    T* __restrict__ slab,
     int lanes,
     int frames,
     int c,
-    long long slot_stride,
+    long long row_elems,
     int x_base,
     long long total)
 {
@@ -79,7 +90,7 @@ __global__ __launch_bounds__(256) void cache_store(
     g.off -= x_base;
     const int local_row = row - base;
     const long long local = static_cast<long long>(local_row) * c + col;
-    if (local >= slot_stride) return;
+    if (local >= row_elems) return;
     const int plane = g.plane();
     const int f = local_row / plane;
     const int hw = local_row - f * plane;
@@ -91,7 +102,7 @@ __global__ __launch_bounds__(256) void cache_store(
     } else {
         value = cache[(static_cast<long long>(base) + static_cast<long long>(f + g.t) * plane + hw) * c + col];
     }
-    slab[static_cast<long long>(slot_ids[l]) * slot_stride + local] = value;
+    *cache_cell<T>(rows, l, local_row, c, col) = value;
 }
 
 }

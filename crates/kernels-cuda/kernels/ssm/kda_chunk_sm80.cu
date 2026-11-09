@@ -1,4 +1,5 @@
 #include "ssm/tile_sm80.cuh"
+#include "prim/state_rows.cuh"
 
 namespace pie::ssm {
 
@@ -10,7 +11,7 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) kda_chunk_prep(
     const float* __restrict__ A_log,
     const float* __restrict__ dt_bias,
     float lower_bound,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
     const int* __restrict__ commit_len,
     const int* __restrict__ begin_at,
@@ -34,7 +35,7 @@ __global__ void __launch_bounds__(KDA16_TASKS * 64, 4) kda_chunk_prep(
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
     if (lanes <= 0 || h >= H) return;
     const int r = gdn_slot_lane<KDA_CH>(s, lanes, qo_indptr, begin_at, win);
-    const GdnLane lane = gdn_lane(r, qo_indptr, slot_ids, commit_len, begin_at, win);
+    const GdnLane lane = gdn_lane(r, qo_indptr, rows, commit_len, begin_at, win);
     if (lane.T <= 0 || lane.slot < 0) return;
     const int j = s - (lane.t0 / KDA_CH + r);
     if (j < 0 || j * KDA_CH >= lane.T) return;
@@ -314,10 +315,8 @@ __device__ __forceinline__ void kda16_walk(
     const bf16* __restrict__ ke,
     const bf16* __restrict__ tb,
     const bf16* __restrict__ pm,
-    float* __restrict__ state_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     const int* __restrict__ commit_len,
     const int* __restrict__ begin_at,
     bool write_state,
@@ -343,7 +342,7 @@ __device__ __forceinline__ void kda16_walk(
         sg = reinterpret_cast<float*>(st + KDA_CH * KDA16_LDT);
     };
 
-    const GdnLane lane = gdn_lane(r, qo_indptr, slot_ids, commit_len, begin_at, win);
+    const GdnLane lane = gdn_lane(r, qo_indptr, rows, commit_len, begin_at, win);
     if (lane.T <= 0 || lane.slot < 0) return;
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
     const int base = lane.t0 / KDA_CH + r;
@@ -354,8 +353,7 @@ __device__ __forceinline__ void kda16_walk(
     // The warp's value columns, within the block's and overall.
     const int cw = (tid >> 5) * 16 * NB;
     const int c0 = vt * BV + cw;
-    float* state = state_base + static_cast<long long>(lane.slot) * slot_stride_elems
-                   + static_cast<long long>(h) * BK * V;
+    float* state = rows.atom<float>(rows.row(lane.rl), h, static_cast<long long>(BK) * V);
 
     // The state fragments: per sixteen value rows, sixteen eight-wide key
     // tiles.
@@ -561,10 +559,8 @@ __global__ void __launch_bounds__(128) kda_chunk_scan(
     const bf16* __restrict__ ke,
     const bf16* __restrict__ tb,
     const bf16* __restrict__ pm,
-    float* __restrict__ state_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     const int* __restrict__ commit_len,
     const int* __restrict__ begin_at,
     bool write_state,
@@ -577,7 +573,7 @@ __global__ void __launch_bounds__(128) kda_chunk_scan(
     const int b = static_cast<int>(blockIdx.x);
     if (lanes * H > wide_at) {
         if (b < lanes * H) {
-            kda16_walk<2>(decay, mixed, qg, kg, ke, tb, pm, state_base, slot_ids, qo_indptr, slot_stride_elems,
+            kda16_walk<2>(decay, mixed, qg, kg, ke, tb, pm, rows, qo_indptr,
                           commit_len, begin_at, write_state, write_state_mask, out, H, b / H, b % H, 0, win);
         }
     } else {
@@ -585,7 +581,7 @@ __global__ void __launch_bounds__(128) kda_chunk_scan(
         const int h = (b >> 1) % H;
         const int r = b / (2 * H);
         if (r >= lanes) return;
-        kda16_walk<1>(decay, mixed, qg, kg, ke, tb, pm, state_base, slot_ids, qo_indptr, slot_stride_elems,
+        kda16_walk<1>(decay, mixed, qg, kg, ke, tb, pm, rows, qo_indptr,
                       commit_len, begin_at, write_state, write_state_mask, out, H, r, h, vt, win);
     }
 }

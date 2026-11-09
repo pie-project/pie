@@ -84,11 +84,12 @@ pub fn mamba2(
     m.check(OP, xbc, dt, z, y, state_dim)?;
     f32_state(OP, state)?;
     seated(OP, state, "mamba2_step", true, false, false)?;
-    let rows = nonzero(OP, "rows", xbc.rows)?;
+    let n = nonzero(OP, "rows", xbc.rows)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
     ctx.fire(
         OP,
         Fire::at(kernel(MAMBA2, "::pie::ssm::mamba2_step"))
-            .apply(Launch::grid([rows, m.heads, 1], [BLOCK, 1, 1])),
+            .apply(Launch::grid([n, m.heads, 1], [BLOCK, 1, 1])),
         &[
             xbc.arg(),
             dt.arg(),
@@ -96,9 +97,7 @@ pub fn mamba2(
             m.a_log.arg(),
             m.dt_bias.arg(),
             m.d.arg(),
-            state.slab.arg(),
-            state.slot_ids.arg(),
-            state.slot_stride_elems.arg(),
+            rows.arg(),
             y.arg(),
             stated(OP, m.heads)?.arg(),
             stated(OP, m.groups)?.arg(),
@@ -134,6 +133,7 @@ pub fn mamba2_chunked(
     let lanes = requests(OP, xbc)?;
     f32_state(OP, state)?;
     seated(OP, state, "mamba2_scan", true, true, true)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
     ctx.fire(
         OP,
         Fire::at(kernel(MAMBA2, "::pie::ssm::mamba2_scan"))
@@ -145,10 +145,8 @@ pub fn mamba2_chunked(
             m.a_log.arg(),
             m.dt_bias.arg(),
             m.d.arg(),
-            state.slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             xbc.indptr.arg(),
-            state.slot_stride_elems.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
             state.write_state.arg(),

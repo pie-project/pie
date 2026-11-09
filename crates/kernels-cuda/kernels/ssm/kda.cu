@@ -1,4 +1,5 @@
 #include "ssm/copy.cuh"
+#include "prim/state_rows.cuh"
 
 namespace pie::ssm {
 
@@ -221,9 +222,7 @@ __global__ void kda_step_fused(
     const float* __restrict__ dt_bias,
     float lower_bound,
     float eps,
-    float* __restrict__ state_base,
-    const i32* __restrict__ slot_ids,
-    long long slot_stride_elems,
+    StateRows rows,
     float* __restrict__ out,
     int H, int D,
     bool write_state,
@@ -235,8 +234,8 @@ __global__ void kda_step_fused(
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
     const int h = blockIdx.y;
-    const int slot = slot_ids[r];
-    if (slot < 0) return;
+    const i32* rid = rows.row(r);
+    if (rid[0] < 0) return;
     const long long rh = (long long)r * H + h;
     const long long width = (long long)H * D;
     const ElemT* row = mixed + (long long)r_row * 3 * width + (long long)h * D;
@@ -246,7 +245,7 @@ __global__ void kda_step_fused(
     const int per = (D + gridDim.z - 1) / gridDim.z;
     const int v0 = blockIdx.z * per;
     const int v1 = min(D, v0 + per);
-    const float* st = state_base + (long long)slot * slot_stride_elems + (long long)h * D * D;
+    const float* st = rows.atom<float>(rid, h, (long long)D * D);
     float* dst = folds(write_state, write_state_mask, r) ? const_cast<float*>(st) : work + rh * D * D;
     float* out_h = out + ((long long)r_row * H + h) * D;
 
@@ -430,9 +429,7 @@ __global__ void kda_step(
     const float* __restrict__ v,
     const float* __restrict__ gate,
     const float* __restrict__ beta,
-    float* __restrict__ state_base,
-    const i32* __restrict__ slot_ids,
-    long long slot_stride_elems,
+    StateRows rows,
     float* __restrict__ out,
     int H, int D,
     bool write_state,
@@ -459,15 +456,15 @@ __global__ void kda_step(
     const float* g_h = gate   + rh * D;
     const float beta_h = beta[rh];
 
-    const int slot = slot_ids[r];
-    if (slot < 0) return;
+    const i32* rid = rows.row(r);
+    if (rid[0] < 0) return;
     // `splits` adjacent blocks share the head's value rows:
     // this block's run of them, and only those copied where the row does not
     // fold.
     const int per = (D + splits - 1) / splits;
     const int v_lo = static_cast<int>(blockIdx.x) % splits * per;
     const int v_hi = min(D, v_lo + per);
-    float* st = state_base + (long long)slot * slot_stride_elems + (long long)h * D * D;
+    float* st = rows.atom<float>(rid, h, (long long)D * D);
     if (!folds(write_state, write_state_mask, r)) {
         float* copy = work + rh * D * D;
         for (int i = v_lo * D + threadIdx.x; i < v_hi * D; i += blockDim.x) copy[i] = st[i];
@@ -536,10 +533,8 @@ __global__ void kda_chunked(
     const float* __restrict__ v,
     const float* __restrict__ gate,
     const float* __restrict__ beta,
-    float* __restrict__ state_base,
-    const i32* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     float* __restrict__ out,
     int H, int D,
     bool write_state,
@@ -568,10 +563,10 @@ __global__ void kda_chunked(
     }
     if (end <= begin) return;
 
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
     float* st = kda_state_or_copy(
-        state_base + (long long)slot * slot_stride_elems + (long long)h * D * D,
+        rows.atom<float>(rid, h, (long long)D * D),
         work, (long long)r * H + h, D, folds(write_state, write_state_mask, rl));
 
     extern __shared__ float smem[];

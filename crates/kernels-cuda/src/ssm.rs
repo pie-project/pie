@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::jit::{
     Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated,
 };
-use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
+use crate::tensor::{RaggedTensor, RecurrentPool, StateRows, Tensor};
 
 const GDN_PREP: &str = "ssm/gdn_prep.cu";
 
