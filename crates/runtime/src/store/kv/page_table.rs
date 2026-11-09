@@ -870,11 +870,15 @@ impl KvPageTable {
         keys
     }
 
-    /// Every sealed page's key, repeats kept: a copy taken under the kv lock
-    /// that the caller hashes after letting it go.
-    pub fn sealed_key_list(&self) -> Vec<Hash256> {
+    pub fn node_ids(&self) -> Vec<NodeId> {
+        self.nodes.iter().map(|(id, _)| id).collect()
+    }
+
+    /// Every sealed page's key in the nodes of `ids`, repeats kept: a copy
+    /// taken under the kv lock that the caller hashes after letting it go.
+    pub fn sealed_key_list(&self, ids: &[NodeId]) -> Vec<Hash256> {
         let mut keys = Vec::new();
-        for (_, node) in self.nodes.iter() {
+        for node in ids.iter().filter_map(|&id| self.nodes.get(id)) {
             if let Pages::Owned { page_hashes, .. } = &node.pages {
                 keys.extend(page_hashes.iter().flatten().copied());
             }

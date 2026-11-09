@@ -878,10 +878,20 @@ impl KvStore {
 
     /// Each cache entry's pages by key, from token 0: the runs this worker
     /// can give whole.
+    #[cfg(test)]
     pub fn cached_runs(&self) -> Vec<Vec<Hash256>> {
-        self.cache
-            .values()
-            .filter_map(|entry| {
+        self.cached_runs_of(&self.cache_ids())
+    }
+
+    pub fn cache_ids(&self) -> Vec<u64> {
+        self.cache.keys().copied().collect()
+    }
+
+    /// [`Self::cached_runs`] of the entries of `ids` still here.
+    pub fn cached_runs_of(&self, ids: &[u64]) -> Vec<Vec<Hash256>> {
+        ids.iter()
+            .filter_map(|id| {
+                let entry = self.cache.get(id)?;
                 let mut keys = self.table.path_keys(entry.path.terminal)?;
                 keys.truncate(entry.path.pages as usize);
                 (!keys.is_empty()).then_some(keys)
@@ -889,9 +899,13 @@ impl KvStore {
             .collect()
     }
 
-    /// Every sealed page's key here, on any tier.
-    pub fn sealed_key_list(&self) -> Vec<Hash256> {
-        self.table.sealed_key_list()
+    pub fn node_ids(&self) -> Vec<NodeId> {
+        self.table.node_ids()
+    }
+
+    /// Every sealed page's key in the nodes of `ids` still here, on any tier.
+    pub fn sealed_key_list(&self, ids: &[NodeId]) -> Vec<Hash256> {
+        self.table.sealed_key_list(ids)
     }
 
     /// Host slots to land pages in that come from another worker; given
