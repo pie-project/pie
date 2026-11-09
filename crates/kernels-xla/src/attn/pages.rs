@@ -538,6 +538,24 @@ fn attend_paired(
         )
     };
     let (even, odd) = (half(f, 0)?, half(f, 1)?);
+    if std::env::var_os("PIE_PAIR_PROBE").is_some() {
+        let hg = Heads { g, ..*h2 };
+        let fe = attend(f, even, keys, values, pt, lane, lo, hi, pages, ps, &hg, scale, vmem_cap)?;
+        let fo = attend(f, odd, keys, values, pt, lane, lo, hi, pages, ps, &hg, scale, vmem_cap)?;
+        let oe = f.slice(fe.o, &[0, 0, 0, 0], &[r, pairs, g, d], &[1, 1, 1, 1])?;
+        let oo = f.slice(fo.o, &[0, 0, 0, d], &[r, pairs, g, 2 * d], &[1, 1, 1, 1])?;
+        let oe = f.reshape(oe, &[r, pairs, 1, g, d])?;
+        let oo = f.reshape(oo, &[r, pairs, 1, g, d])?;
+        let o = f.concat(&[oe, oo], 2)?;
+        let o = f.reshape(o, &[r, h.kvh, g, d])?;
+        let st = |f: &mut Func, a: Val, b2: Val| -> Built<Val> {
+            let a = f.reshape(a, &[r, pairs, 1, g])?;
+            let b2 = f.reshape(b2, &[r, pairs, 1, g])?;
+            let c = f.concat(&[a, b2], 2)?;
+            f.reshape(c, &[r, h.kvh, g])
+        };
+        return Ok(Flashed { o, m: st(f, fe.m, fo.m)?, l: st(f, fe.l, fo.l)? });
+    }
     let q2 = f.concat(&[even, odd], 2)?;
     let fl = attend(
         f, q2, keys, values, pt, lane, lo, hi, pages, ps, h2, scale, vmem_cap,
