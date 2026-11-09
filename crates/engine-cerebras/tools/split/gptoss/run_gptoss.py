@@ -22,7 +22,7 @@ ap.add_argument("--hostck", type=int, default=0); ap.add_argument("--xdbg", type
 ap.add_argument("--tdbg", type=int, default=0); ap.add_argument("--override", default="")
 ap.add_argument("--golden", default="golden.json")
 ap.add_argument("--steps0", type=int, default=0, help="(bisect) one launch of 0 steps, then a d2h")
-ap.add_argument("--prof", type=int, default=-1, help="(TSTAMP 1 builds) unit whose PEs' phase stamps to read (last step)")
+ap.add_argument("--prof", default="", help="(TSTAMP 1 builds) units (comma) whose PEs' phase stamps to read (last step); also in the report")
 ap.add_argument("--noweights", type=int, default=0, help="(probes) no weight / head tiles placed (zeros): routes, roles and tables only")
 a = ap.parse_args()
 t00 = time.time()
@@ -189,7 +189,7 @@ for rep in range(a.reps):
     print("REP " + json.dumps({k: v for k, v in reps[-1].items() if k != "tokens"}), flush=True)
 PROFLINE = [None]
 times = None
-if a.tdbg or a.prof >= 0:
+if a.tdbg or a.prof:
     rb_ = get("tdbg", *ROOT, 1, 1, 70, np.uint32).reshape(-1)
     times = {"loop_cycles": [int(v) for v in np.diff(rb_[2:2 + min(WLS, 64)].astype(np.int64)) % (1 << 32)]}
     cx = []
@@ -199,36 +199,50 @@ if a.tdbg or a.prof >= 0:
         cx.append([int(v) for v in np.diff(tb.astype(np.int64)) % (1 << 32)])
     times["cx_layers"] = cx
     print("TIMES " + json.dumps(times), flush=True)
-if a.prof >= 0:
-    # the last step's stamps of a unit's PEs (TSC; every PE's clock runs from the same start), relative to the
-    # unit's CX pass start: CX [0 pass start, 1 + l layer ends, K + 1 x out]; attention PE [0, then a layer:
-    # x in, qkv sent, mixer done, o_proj sent + x2 dropped]; MoE PE [0, then: att x dropped, routes in, gate|up
-    # sent, down sent]; CYs [0, then: reduce in, multicast out, done]
-    X0p, Y0p = g.unit_origin(a.prof)
-    pts = {"cx_r0": ("x", X0p + XC, Y0p, K + 2), "cx_r80": ("x", X0p + XC, Y0p + g.wl(PY // 2, YC), K + 2),
-           "wa_r0_c0": ("w", X0p, Y0p, 1 + 4 * K), "wa_r0_c63": ("w", X0p + AX - 1, Y0p, 1 + 4 * K),
-           "wa_r159_c0": ("w", X0p, Y0p + g.wl(PY - 1, YC), 1 + 4 * K),
-           "wm_r0_c0": ("w", X0p + XC + 1, Y0p, 1 + 4 * K), "wm_r0_c287": ("w", X0p + XC + MXc, Y0p, 1 + 4 * K),
-           "wm_r159_c287": ("w", X0p + XC + MXc, Y0p + g.wl(PY - 1, YC), 1 + 4 * K),
-           "cya_c0": ("c", X0p, Y0p + YC, 1 + 4 * K), "cym_c0": ("c", X0p + XC + 1, Y0p + YC, 1 + 3 * K),
-           "cym_c287": ("c", X0p + XC + MXc, Y0p + YC, 1 + 3 * K)}
-    raw = {k: get("tdbg", x_, y_, 1, 1, n_, np.uint32).reshape(-1).astype(np.int64) for k, (_, x_, y_, n_) in pts.items()}
-    base = int(raw["cx_r0"][0])
-    prof = {k: [int((int(v) - base) % (1 << 32)) if (int(v) - base) % (1 << 32) < (1 << 31) else int(v) - base for v in arr] for k, arr in raw.items()}
-    prof["root_loop"] = times["loop_cycles"][:8] if times else None
-    # every unit's redo passes a layer over the last launch (attention CY column 0)
-    prof["redo"] = [[int(v) for v in get("tdbg", g.unit_origin(u)[0], g.unit_origin(u)[1] + YC, 1, 1, 1 + 4 * K, np.uint32).reshape(-1)[1 + 3 * K:]] for u in range(NU)]
-    json.dump(prof, open(a.report.replace(".json", "_prof.json"), "w"))
-    PROFLINE[0] = "PROF " + json.dumps({k: (v if k == "redo" else v[1:]) for k, v in prof.items() if k != "root_loop" and v}, separators=(",", ":"))
+PROF = {}
+if a.prof:
+    # the last step's stamps (TSC, the same clock on every PE: checked on the CS-3), relative to unit 0's CX row 0 pass
+    # start: CX [0 pass start, 1 + l layer ends, K + 1 x out]; attention PE [0, then a layer: x in, qkv sent, mixer done,
+    # o_proj sent + x2 dropped]; MoE PE [0, then: att x dropped, routes in, gate|up sent, down sent]; CYs [0, then:
+    # reduce in, multicast out, done]
+    def pe(x_, y_, n_):
+        return get("tdbg", x_, y_, 1, 1, n_, np.uint32).reshape(-1).astype(np.int64)
+    raw = {}
+    for u in [int(v) for v in a.prof.split(",")]:
+        X0p, Y0p = g.unit_origin(u)
+        for r in (0, PY // 2, PY - 1):
+            raw[f"u{u}_cx_r{r}"] = pe(X0p + XC, Y0p + g.wl(r, YC), K + 2)
+        raw[f"u{u}_wa_r0_c0"] = pe(X0p, Y0p, 1 + 4 * K)
+        raw[f"u{u}_wa_r159_c63"] = pe(X0p + AX - 1, Y0p + g.wl(PY - 1, YC), 1 + 4 * K)
+        raw[f"u{u}_wm_r0_c0"] = pe(X0p + XC + 1, Y0p, 1 + 4 * K)
+        raw[f"u{u}_wm_r159_c287"] = pe(X0p + XC + MXc, Y0p + g.wl(PY - 1, YC), 1 + 4 * K)
+        raw[f"u{u}_cya_c0"] = pe(X0p, Y0p + YC, 1 + 4 * K)[:1 + 3 * K]
+        raw[f"u{u}_cym_c0"] = pe(X0p + XC + 1, Y0p + YC, 1 + 3 * K)
+    base = int(raw["u0_cx_r0"][0]) if "u0_cx_r0" in raw else int(next(iter(raw.values()))[0])
+    def rel(v):
+        d = (int(v) - base) % (1 << 32)
+        return d if d < (1 << 31) else d - (1 << 32)
+    PROF = {k: [rel(v) for v in arr] for k, arr in raw.items()}
+    # every CX row's own layer intervals (clock-offset free): x in -> layer 0 end, layer 0 -> layer 1 end, by unit
+    PROF["cx_rows"] = {}
+    for u in [int(v) for v in a.prof.split(",")]:
+        X0p, Y0p = g.unit_origin(u)
+        rows_ = []
+        for (r0, r1) in HALF:
+            t_ = get("tdbg", X0p + XC, Y0p + g.wl(r0, YC), 1, r1 - r0, K + 2, np.uint32).reshape(r1 - r0, K + 2).astype(np.int64)
+            rows_ += [[int(v) for v in np.diff(row) % (1 << 32)] for row in t_]
+        PROF["cx_rows"][f"u{u}"] = rows_
+    PROF["redo"] = [[int(v) for v in pe(g.unit_origin(u)[0], g.unit_origin(u)[1] + YC, 1 + 4 * K)[1 + 3 * K:]] for u in range(NU)]
+    PROFLINE[0] = "PROF " + json.dumps({k: v for k, v in PROF.items() if k.endswith("_cx_r0") or k.endswith("_cx_r159") or k == "redo"}, separators=(",", ":"))
 runner.stop()
 if dumps:
     json.dump(dumps, open(a.report.replace(".json", "_dump.json"), "w"))
-rep = {"diverged": diverged[:4], "force": a.force, "greedy": a.greedy, "wloop": WLS, "ntok": ntok, "reps": reps, "ring_bad": ring_bad[:20],
+rep = {"prof": PROF, "diverged": diverged[:4], "force": a.force, "greedy": a.greedy, "wloop": WLS, "ntok": ntok, "reps": reps, "ring_bad": ring_bad[:20],
        "load_s": round(t_load, 1), "place_s": round(t_place, 1), "times": times,
        "wall_ms_median": reps[-1]["wall_ms_median"], "tok_s_wall": round(1e3 / max(reps[-1]["wall_ms_median"], 1e-6), 1)}
 json.dump(rep, open(a.report, "w"), indent=1)
 lc = (times or {}).get("loop_cycles") or []
-print("SPLIT " + json.dumps({k: v for k, v in rep.items() if k not in ("reps", "times")}), flush=True)
+print("SPLIT " + json.dumps({k: v for k, v in rep.items() if k not in ("reps", "times", "prof")}), flush=True)
 if lc:
     print("LOOP median %d min %d max %d n %d" % (sorted(lc)[len(lc) // 2], min(lc), max(v for v in lc if v < 1 << 31), len(lc)), flush=True)
 if PROFLINE[0]:
