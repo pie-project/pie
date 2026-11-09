@@ -322,6 +322,12 @@ impl Buffers {
         (&self.slab, self.page_bytes)
     }
 
+    /// One buffered page's bytes, every plane's rows and the alignment.
+    #[must_use]
+    pub fn page_bytes(&self) -> u64 {
+        self.page_bytes
+    }
+
     #[must_use]
     pub fn page_count(&self) -> u32 {
         self.slots

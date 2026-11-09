@@ -1276,6 +1276,21 @@ impl Shell {
         self.pools.resize(&self.device, u64::from(kv_pages))
     }
 
+    /// What one page or slot of each pool takes, for the degenerate chunk
+    /// facts: a kv page across every kv plane, an rs buffer page. The
+    /// sliding rows are paged in full, so no windowed page.
+    #[must_use]
+    pub fn degenerate_bytes(&self) -> engine::chunk::DegenerateBytes {
+        engine::chunk::DegenerateBytes {
+            kv_page: self.kv_page_bytes(),
+            window_page: 0,
+            buffer_page: self
+                .rs_buffers
+                .as_ref()
+                .map_or(0, crate::rs::Buffers::page_bytes),
+        }
+    }
+
     #[must_use]
     pub fn kv_page_bytes(&self) -> u64 {
         self.pools.kv_page_bytes()
