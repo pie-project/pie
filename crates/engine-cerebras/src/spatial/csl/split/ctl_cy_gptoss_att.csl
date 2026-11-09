@@ -28,6 +28,8 @@ param NLV: u16 = 5;
 param QSC: f32 = 0.125;   // 1 / sqrt(head dim)
 param TSTAMP: u16 = 0;
 param FIFOW: u16 = 32;
+param CYV: u16 = 0;   // 1: a pass's per-head 1 / (l + exp(sink - mref)) as Qh-word vector ops (exp_fast's form; the reciprocal
+                      // by exponent split, the quadratic and two Newton steps); 0: exp1 and recip a head (scalar)
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
@@ -75,6 +77,23 @@ const rb2_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NRB} -> rb2[i] });
 const rc3_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NRB} -> rc3[i] });
 var ilh = @zeros([Qh]f32);
 var lh = @zeros([Qh]f32);
+var ve: [Qh]f32 align(16) = @zeros([Qh]f32);
+var vs: [Qh]f32 align(16) = @zeros([Qh]f32);
+var vp: [Qh]f32 align(16) = @zeros([Qh]f32);
+var vk = @zeros([Qh]u16);
+const ilh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> ilh[i] });
+const lh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> lh[i] });
+const ve_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> ve[i] });
+const vs_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> vs[i] });
+const vp_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> vp[i] });
+const vk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> vk[i] });
+const snk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> snk[i] });
+const mref_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> mref[i] });
+const DC1: i16 = @as(i16, Dc) + 1;
+const DCI: i16 = @as(i16, Dc);
+const lst_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh} -> t[DCI + i * DC1] });
+// a buffer's high halves (u16, stride 2, offset 1)
+fn hi(a: [*]f32) mem1d_dsd { return @increment_dsd_offset(@set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, a)), 2), 1, u16); }
 
 const q_n = @get_input_queue(2);
 const q_s = @get_input_queue(3);
@@ -186,6 +205,54 @@ fn exp1(x0: f32) f32 {
   return p * s;
 }
 fn recip(v: f32) f32 { const a = if (v < 0.0) -v else v; const r = rsqrt(a); return if (v < 0.0) -(r * r) else r * r; }
+const ex_a = [3]f32 { 12582912.0, -12582912.0, 12582912.0 };
+const ex_c = [4]f32 { 0.16790908575057983, 0.5000435709953308, 0.9999634027481079, 0.9999992847442627 };
+// ve = exp(ve) (Qh words; ctl_cy_gptoss_moe.csl vexp's arithmetic; p in vp, k's bits in vk)
+fn vexpq() void {
+  const pl = @set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, &vp)), 2);
+  const ph = @increment_dsd_offset(pl, 1, u16);
+  @fmaxs(ve_d, ve_d, -87.0);
+  @fnegs(ve_d, ve_d);
+  @fmaxs(ve_d, ve_d, -88.0);
+  @fnegs(ve_d, ve_d);
+  @fmuls(vp_d, ve_d, 1.4426950408889634);
+  var c: u16 = 0;
+  while (c < 3) : (c += 1) {
+    @fadds(vp_d, vp_d, ex_a[c]);
+    if (c == 1) { @fmacs(ve_d, ve_d, vp_d, -0.6931471805599453); }
+  }
+  @sll16(vk_d, pl, 7);
+  @fmuls(vp_d, ve_d, 0.041458580642938614);
+  c = 0;
+  while (c < 4) : (c += 1) {
+    if (c > 0) { @fmuls(vp_d, vp_d, ve_d); }
+    @fadds(vp_d, vp_d, ex_c[c]);
+  }
+  @add16(ph, ph, vk_d);
+  @fmovs(ve_d, vp_d);
+}
+// ilh = 1 / ve (ve > 0, normal): ve = m 2^e, m in [1, 2) (vp), 2^(1 - e) (vs: the exponent field 255 - E, by an xor
+// with 0x7f80), r = 1 / m by the quadratic and two Newton steps (ctl_cy_gptoss_moe GLUV's), x 2^(1 - e) x 0.5
+fn vrecipq() void {
+  @fmovs(vp_d, ve_d);
+  @and16(hi(&vp), hi(&vp), @as(u16, 0x807f));
+  @or16(hi(&vp), hi(&vp), @as(u16, 0x3f80));
+  @fmovs(vs_d, 0.0);
+  @and16(hi(&vs), hi(&ve), @as(u16, 0x7f80));
+  @xor16(hi(&vs), hi(&vs), @as(u16, 0x7f80));
+  @fmuls(ilh_d, vp_d, 0.323112507040746);
+  @fadds(ilh_d, ilh_d, -1.4540415401729079);
+  @fmuls(ilh_d, ilh_d, vp_d);
+  @fadds(ilh_d, ilh_d, 2.1207294161729284);
+  var kn: u16 = 0;
+  while (kn < 2) : (kn += 1) {
+    @fmuls(ve_d, vp_d, ilh_d);
+    @fsubs(ve_d, 2.0, ve_d);
+    @fmuls(ilh_d, ilh_d, ve_d);
+  }
+  @fmuls(ilh_d, ilh_d, vs_d);
+  @fmuls(ilh_d, ilh_d, 0.5);
+}
 fn ln1(x: f32) f32 {
   const b = @bitcast(u32, x);
   const e = @as(f32, @as(i16, @as(u16, (b >> 23) & 0xff)) - 127);
@@ -261,14 +328,28 @@ fn att(l: u16, pos: u32) void {
   while (pass < 8) : (pass += 1) {
     reduce(NV);
     var bad: f32 = 0.0;
-    h = 0;
-    while (h < Qh) : (h += 1) {
-      const lv = t[h * (Dc + 1) + Dc];
-      lh[h] = lv;
-      if (lv < 0.00390625 or lv >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
-      const sk = snk[l * Qh + h] - mref[l * Qh + h];
-      ilh[h] = recip(lv + exp1(sk));
-      @fmuls(uv(h * Dc, Dc), tv(h * (Dc + 1), Dc), ilh[h]);
+    if (CYV == 1) {
+      @fmovs(lh_d, lst_d);
+      @fsubs(ve_d, @increment_dsd_offset(snk_d, @as(i16, l * Qh), f32), @increment_dsd_offset(mref_d, @as(i16, l * Qh), f32));
+      vexpq();
+      @fadds(ve_d, lh_d, ve_d);
+      vrecipq();
+      h = 0;
+      while (h < Qh) : (h += 1) {
+        const lv = lh[h];
+        if (lv < 0.00390625 or lv >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
+        @fmuls(uv(h * Dc, Dc), tv(h * (Dc + 1), Dc), ilh[h]);
+      }
+    } else {
+      h = 0;
+      while (h < Qh) : (h += 1) {
+        const lv = t[h * (Dc + 1) + Dc];
+        lh[h] = lv;
+        if (lv < 0.00390625 or lv >= 32768.0) { bad = 1.0; }   // the f16 probabilities' window
+        const sk = snk[l * Qh + h] - mref[l * Qh + h];
+        ilh[h] = recip(lv + exp1(sk));
+        @fmuls(uv(h * Dc, Dc), tv(h * (Dc + 1), Dc), ilh[h]);
+      }
     }
     u[QD] = bad;
     mcast(QD + 1);

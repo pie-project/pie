@@ -20,6 +20,8 @@ Modes: `ref` (f32 everywhere, the reference arithmetic), or `+`-joined kernel sw
   ftz      f16 subnormal probabilities and attention outputs o flushed to 0 (the weight PE's f16 copies)
   glv      the SwiGLU as ctl_cy_gptoss_moe GLUV 1: e = exp(-1.702 |g|), 1 / (1 + e) by the quadratic and two Newton
            steps in f32, glu = max(g, g e) r
+  cyv      the attention CY's 1 / (l + exp(sink - mref)) as ctl_cy_gptoss_att CYV 1: the exponent split, 1 / m by the
+           quadratic and two Newton steps in f32, x 2^-e (then o = num x that, not num / it)
   att32    attention matvecs (qkv, o) with f32 accumulation
 Router report: per (position, layer) the 4th / 5th gap of our logits and our logits' error against
 an f64 router on the same x2 (the kernel's router error); counts of gaps below that error."""
@@ -181,7 +183,16 @@ class Emu:
                     l_ = p.sum(-1)
                     bad = np.any((l_ < 2 ** -8) | (l_ >= 32768))
                     lt = l_ + np.exp(np.minimum(sink - mref, 88))
-                    o_ = num / lt[:, None]
+                    if "cyv" in o:
+                        mf, ex = np.frexp(lt.astype(f32)); mm_ = (mf * 2).astype(f32)
+                        r = (mm_ * f32(0.323112507040746)).astype(f32); r = (r + f32(-1.4540415401729079)).astype(f32)
+                        r = (r * mm_).astype(f32); r = (r + f32(2.1207294161729284)).astype(f32)
+                        for _ in range(2):
+                            tt = (mm_ * r).astype(f32); tt = (f32(2.0) - tt).astype(f32); r = (r * tt).astype(f32)
+                        il = np.ldexp(r, 1 - ex).astype(f32)
+                        o_ = (num * il[:, None]).astype(f32)
+                    else:
+                        o_ = num / lt[:, None]
                     mref = mref + np.log(np.maximum(l_, 1e-30)).astype(f32)
                     if not bad:
                         break
