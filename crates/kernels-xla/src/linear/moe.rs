@@ -1098,6 +1098,7 @@ fn gmm_spec(
         scaled,
         bias: false,
         out: Elem::F32,
+        prefetch: !mxfp4,
     };
     spec.out_width().ok().map(|_| spec)
 }
@@ -1508,6 +1509,11 @@ struct Sorted {
     held: Val,
     /// The weight each row carries (0 for a pad), when the sort carried one.
     ws: Option<Val>,
+    /// Each tile's run (its expert's rank among the routed ones) and the
+    /// next run's expert (-1 after the last), for a kernel that fetches
+    /// the next expert's weights while a run's tiles go.
+    run: Val,
+    nxt: Val,
 }
 
 /// The pairs sorted by expert (unrouted last), each expert's run of rows
@@ -1629,6 +1635,15 @@ fn sorted(
         f.select(pair, src, zero)?
     };
     let xs = f.take_rows(x, src)?;
+    let run = pick_small(f, rank, se)?;
+    let tend_t = pick_small(f, tend, se)?;
+    let end = f.const_i(Elem::I32, tiles - 1, &[tiles]);
+    let at = f.min(tend_t, end)?;
+    let nx = pick_small(f, se, at)?;
+    let ntb = f.broadcast(nt, &[tiles], &[0])?;
+    let more = f.compare(Cmp::Lt, tend_t, ntb)?;
+    let none = f.const_i(Elem::I32, -1, &[tiles]);
+    let nxt = f.select(more, nx, none)?;
     Ok(Sorted {
         se,
         nt,
@@ -1636,6 +1651,8 @@ fn sorted(
         src,
         held,
         ws: weights.map(|_| by[2]),
+        run,
+        nxt,
     })
 }
 
@@ -1665,6 +1682,9 @@ fn tiles_of(
         Orient::NMajor => w,
     };
     let kernel = spec.kernel()?;
+    if spec.prefetching() {
+        return Ok(kernel.call(f, &[sorted.se, sorted.nt, sorted.run, sorted.nxt, xs, w])?[0]);
+    }
     Ok(kernel.call(f, &[sorted.se, sorted.nt, xs, w])?[0])
 }
 
