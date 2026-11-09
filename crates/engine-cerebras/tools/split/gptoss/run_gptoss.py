@@ -212,8 +212,8 @@ if a.prof:
         X0p, Y0p = g.unit_origin(u)
         for r in (0, PY // 2, PY - 1):
             raw[f"u{u}_cx_r{r}"] = pe(X0p + XC, Y0p + g.wl(r, YC), K + 2 + 4 * K)
-        raw[f"u{u}_wa_r0_c0"] = pe(X0p, Y0p, 1 + 4 * K)
-        raw[f"u{u}_wa_r159_c63"] = pe(X0p + AX - 1, Y0p + g.wl(PY - 1, YC), 1 + 4 * K)
+        raw[f"u{u}_wa_r0_c0"] = pe(X0p, Y0p, 1 + 6 * K)
+        raw[f"u{u}_wa_r159_c63"] = pe(X0p + AX - 1, Y0p + g.wl(PY - 1, YC), 1 + 6 * K)
         raw[f"u{u}_wm_r0_c0"] = pe(X0p + XC + 1, Y0p, 1 + 4 * K)
         raw[f"u{u}_wm_r159_c287"] = pe(X0p + XC + MXc, Y0p + g.wl(PY - 1, YC), 1 + 4 * K)
         raw[f"u{u}_cya_c0"] = pe(X0p, Y0p + YC, 1 + 4 * K)[:1 + 3 * K]

@@ -46,7 +46,7 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
-const NTD: u16 = 1 + 4 * K;
+const NTD: u16 = 1 + 6 * K;   // [0], then a layer's four phase ends; then a layer's o_proj sent, LSE steps in
 const timestamp = @import_module("<time>");
 var tdbg = @zeros([if (TSTAMP == 1) NTD else 1]u32);
 var tdbg_ptr: [*]u32 = &tdbg;
@@ -417,7 +417,9 @@ fn layer(l: u16, a: u16, s: u16) void {
   stamp(3 + 4 * l);
   mv(b + Hc * NQA, QO, Hc);
   send_x(Hc);
+  stamp(1 + 4 * K + 2 * l);
   lse_late();
+  stamp(2 + 4 * K + 2 * l);
   if ((DIAG & 4) == 0) {   // the MoE half's x2 passes this row's multicast: drop it
     @fmovs(@set_dsd_length(sx_d, Hc + 2), fin(q_xm, Hc + 2));
   }
