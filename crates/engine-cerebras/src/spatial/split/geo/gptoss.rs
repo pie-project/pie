@@ -64,6 +64,7 @@ impl GptossGeo {
             g2h: g2,
             wl,
             g2w,
+            gap: None,
         };
         let mut g = Geo::new(p);
         if unx % 2 != 0 {

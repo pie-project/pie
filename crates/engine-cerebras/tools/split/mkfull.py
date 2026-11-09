@@ -2,7 +2,8 @@
 """mkfull.py <outdir>: the role-split whole-program build directory (layout.csl and one source a PE
 kind: weight, cx, cy, head, hctl, filler), from the kernels in src/spatial/csl/split (or $SPLIT_SRC).
 Units UNX x UNY of PX x PY weight PEs (+ the CX column and CY row), the head east of them (HC + 1
-columns, HR rows). Every unit has the same K layers (KM: attention bits). The shape params come
+columns, HR rows). Every unit has the same K layers (KM: attention bits). A gap slot (GAPX, GAPY: a unit count
+one short of the grid) holds relay PEs. The shape params come
 from the prep (prep_q35.py's params.txt); the lever and diagnostic params default to the shipped
 build and can be overridden on the cslc command line (link.sh). See spatial/split/README.md."""
 import os, sys
@@ -12,8 +13,10 @@ os.makedirs(out, exist_ok=True)
 NAMES = [("w", "u16"), ("rcfg", "u32"), ("x", "f32"), ("gam", "@fp16()"), ("cw", "f32"), ("gpar", "f32"),
          ("gnw", "f32"), ("qkw", "f32"), ("rot", "f32"), ("tab", "u32"), ("hw", "u16"), ("hg", "f32"), ("res", "f32"), ("xdbg", "f32"), ("tdbg", "u32"), ("xred", "f32"), ("ring", "u32"), ("hemb", "u16"), ("lgt", "f32"), ("force", "u32"), ("nforce", "u32")]
 OWN = {"weight": ["w", "rcfg", "tdbg"], "cx": ["x", "gam", "rcfg", "xdbg", "tdbg", "xred"], "cy": ["cw", "gpar", "gnw", "qkw", "rot", "tab", "rcfg", "tdbg"],
-       "head": ["hw", "hg", "rcfg", "hemb", "tdbg"], "hctl": ["res", "rcfg", "tdbg", "ring", "lgt", "force", "nforce"], "filler": []}
-SRC = {"weight": "weight_q35.csl", "cx": "ctl_cx.csl", "cy": "ctl_cy_q35.csl", "head": "head_pe.csl", "hctl": "head_ctl.csl"}
+       "head": ["hw", "hg", "rcfg", "hemb", "tdbg"], "hctl": ["res", "rcfg", "tdbg", "ring", "lgt", "force", "nforce"], "filler": [],
+       "relay": ["rcfg"]}
+SRC = {"weight": "weight_q35.csl", "cx": "ctl_cx.csl", "cy": "ctl_cy_q35.csl", "head": "head_pe.csl", "hctl": "head_ctl.csl",
+       "relay": "relay.csl"}
 FILLER = '''param memcpy_params;
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 fn init() void { sys_mod.unblock_cmd_stream(); }
@@ -39,6 +42,7 @@ DEF = [("NPX", 1),                                          # head: x in one f16
        ("SILU16", 1), ("CONVQK", 1), ("ATTV", 1), ("GDEC", 1), ("ATTL", 2),   # CY / weight levers
        ("FIFOW", 32),
        ("GATE", 1), ("SLW", 0),                                 # CY: attention's output gate (Qwen3: 0), silu16's tail
+       ("GAPX", 255), ("GAPY", 255),                            # the unit slot left out of the snake (relay PEs)
        ("DIAG", 0), ("TSTAMP", 0), ("XKEEP", 0), ("HACC16", 0), ("WFORCE", 0)]  # diagnostics / measurement
 L = [f"param {p}: u16;" for p in P] + [f"param {p}: u16 = {v};" for p, v in DEF]
 L += ["param kernel_rows: u16 = 0;", "param kernel_cols: u16 = 0;", "param iters: u16 = 0;"]
@@ -69,6 +73,8 @@ L.append('''layout {
         } else {
           @set_tile_code(x, y, "head.csl", .{ .memcpy_params = mp, .VR = VR, .HDc = 2 * Hc, .NPX = NPX, .HACC16 = HACC16 });
         }
+      } else if (x / UW == GAPX and y / UH == GAPY) {
+        @set_tile_code(x, y, "relay.csl", .{ .memcpy_params = mp });
       } else if (y >= UNY * UH or (lx == XC and ly == YC)) {
         @set_tile_code(x, y, "filler.csl", .{ .memcpy_params = mp });
       } else if (lx == XC) {

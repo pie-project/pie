@@ -144,6 +144,9 @@ pub struct Params {
     pub g2h: u32,
     pub wl: bool,
     pub g2w: u32,
+    /// A unit slot left out of the snake (an odd unit count on an even number of unit
+    /// columns): its PEs only relay the vertical handoff through it (`rcfg_relay`).
+    pub gap: Option<(u32, u32)>,
 }
 
 pub struct Geo {
@@ -199,6 +202,7 @@ impl Geo {
                 order.extend((0..p.uny).rev().map(|uy| (ux, uy)));
             }
         }
+        order.retain(|&s| Some(s) != p.gap);
         Geo {
             p,
             xc,
@@ -848,6 +852,11 @@ impl Geo {
     }
 
     const CT6: [u32; 6] = [13, 14, 17, 18, 19, 20];
+
+    /// A relay PE (the gap slot): its routes only.
+    pub fn rcfg_relay(&self, x: u32, y: u32) -> R<Vec<u32>> {
+        self.words((x, y), 4)
+    }
 
     pub fn rcfg_weight(&self, x: u32, y: u32, r: u32) -> R<Vec<u32>> {
         let p = (x, y);

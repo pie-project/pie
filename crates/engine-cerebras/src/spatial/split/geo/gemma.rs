@@ -183,6 +183,7 @@ impl GemmaGeo {
             g2h: g2,
             wl: true,
             g2w,
+            gap: None,
         };
         let mut g = Geo::new(p);
         let uw = g.uw;

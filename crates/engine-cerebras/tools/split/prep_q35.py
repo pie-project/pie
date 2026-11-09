@@ -67,6 +67,12 @@ tied = bool(cfg.get("tie_word_embeddings", tc.get("tie_word_embeddings", False))
 kinds = ["A" if t == "full_attention" else "G" for t in tc.get("layer_types", ["full_attention"] * NL)]
 NU = NUN
 assert NL == NU * K, (NL, NU, K)
+# one slot short of the grid (an odd count on an even number of unit columns): the last column's row-1 slot
+# stays out of the snake, so the last unit still ends on row 0 (the wafer loop's return); its PEs relay
+GAP = None
+if NU < UNX * UNY:
+    assert NU == UNX * UNY - 1 and UNX % 2 == 0 and UNY >= 3, "one gap slot, on an even number of unit columns, below the turn row"
+    GAP = (UNX - 1, 1)
 pat = kinds[:K]
 assert all(kinds[u * K:(u + 1) * K] == pat for u in range(NU)), "every unit the same layer kinds"
 KM = sum(1 << l for l, k in enumerate(pat) if k == "A")
@@ -228,12 +234,14 @@ np.save(os.path.join(out, PRE + "embrows.npy"), np.asarray(eb)[ids])
 shutil.copy(GOLD, os.path.join(out, PRE + "golden.json"))
 meta = dict(PX=PX, PY=PY, UNX=UNX, UNY=UNY, HC=HC, HR=HR, VR=VR, Hc=Hc, SWA=cpa, SWG=cpk, SWV=cpv, DKG=DK, DKH=hk,
             has_att=KM != 0, has_gdn=NLG > 0, K=K, KM=KM, Ic=Ic, NQA=NQA, NQG=NQG, Qh=Qh, Dc=Dc, DK=DK, DV=DV, NE=NE, HD=hd,
-            NROT=NROT, HK=hk, HV=hv, H=H, GATE=GATE, EPS=tc.get("rms_norm_eps", 1e-6), V=V, model=os.path.basename(MD.rstrip("/")))
+            NROT=NROT, HK=hk, HV=hv, H=H, GATE=GATE, **({"GAPX": GAP[0], "GAPY": GAP[1]} if GAP else {}), EPS=tc.get("rms_norm_eps", 1e-6), V=V, model=os.path.basename(MD.rstrip("/")))
 json.dump(meta, open(os.path.join(out, PRE + "meta.json"), "w"))
 # the compile params (mkfull.py's layout params) for this prep
 cp = dict(PX=PX, PY=PY, UNX=UNX, UNY=UNY, HC=HC, HR=HR, VR=VR, K=K, KM=KM, Hc=Hc, Ic=Ic, NQA=NQA, NQG=NQG, Qh=Qh, Dc=Dc,
           DK=DK, DV=DV, NE=NE, HR_=H, HD=hd, NROT=NROT, HK=hk, HV=hv)
 if Q3:
     cp["GATE"] = 0
+if GAP:
+    cp["GAPX"], cp["GAPY"] = GAP
 open(os.path.join(out, PRE + "params.txt"), "w").write(",".join(f"{k}:{v}" for k, v in cp.items()) + "\n")
 print("prepared", out, json.dumps(meta))

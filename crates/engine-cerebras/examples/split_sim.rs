@@ -129,8 +129,8 @@ fn main() {
                     .map(f32::from_bits),
             );
         }
-        let rms =
-            (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len() as f64 + 1e-6).sqrt();
+        let hidden = spec.int("H").unwrap() as f64;
+        let rms = (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / hidden + 1e-6).sqrt();
         let hw = spec.npy("hw").unwrap();
         let hg = spec.npy("hg").unwrap();
         let (hr, hcn, per) = (hw.shape[0], hw.shape[1], hw.shape[2]);

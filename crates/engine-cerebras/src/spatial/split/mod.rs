@@ -112,6 +112,7 @@ impl SplitSpec {
             g2h: self.int("G2H").unwrap_or(g2),
             wl: self.int("WL").unwrap_or(0) != 0,
             g2w: self.int("G2W").unwrap_or(24),
+            gap: self.int("GAPX").zip(self.int("GAPY")),
         };
         let mut g = geo::Geo::new(p);
         g.build(
@@ -666,7 +667,8 @@ impl SplitModel {
                 .map(|&b| f64::from(f32::from_bits(b)).powi(2))
                 .sum::<f64>();
         }
-        let n = (self.py as usize * hc) as f64;
+        // (over the model's hidden size: a padded hidden's dims past it hold 0)
+        let n = self.hidden as f64;
         let scale = (1.0 / (ss / n + f64::from(self.eps)).sqrt()) as f32 / self.hscale;
         let mut l: Vec<f32> = w.into_iter().map(|b| f32::from_bits(b) * scale).collect();
         // the head's padded rows (ids >= vocab) never reach sampling or the argmax

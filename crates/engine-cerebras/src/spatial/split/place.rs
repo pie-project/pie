@@ -126,6 +126,12 @@ pub fn place(d: &mut dyn Device, g: &Geo, spec: &SplitSpec) -> R<()> {
             "split: unit placed"
         );
     }
+    if let Some((gx, gy)) = g.p.gap {
+        let (x0, y0) = (gx * g.uw, gy * g.uh);
+        let rc =
+            cfgs((y0..y0 + g.uh).flat_map(|y| (x0..x0 + g.uw).map(move |x| g.rcfg_relay(x, y))))?;
+        put(d, "rcfg", [x0, y0, g.uw, g.uh], &rc, false)?;
+    }
     // the head
     let (hx0, hxc, hc, hr) = (g.hx0, g.hxc, g.p.hc, g.p.hr);
     let hw = spec.npy("hw")?;
