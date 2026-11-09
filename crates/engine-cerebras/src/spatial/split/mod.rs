@@ -17,6 +17,7 @@
 pub mod geo;
 pub mod npy;
 pub mod place;
+pub mod place_g12;
 pub mod place_gemma;
 pub mod place_gptoss;
 pub mod prep;
@@ -136,7 +137,8 @@ pub struct SplitModel {
     pub launches: u64,
     pub steps: u64,
     wl: bool,
-    hemb: Npy,
+    /// The head's embedding tiles (untied heads; Gemma 12B reads `embed`).
+    hemb: Option<Npy>,
     hr: u32,
     hc: u32,
     vr: u32,
@@ -160,6 +162,18 @@ pub struct SplitModel {
     hscale: f32,
     /// Gemma 4: the per-layer-input words of a launch's first token, its softcap.
     gemma: Option<GemmaPle>,
+    /// Gemma 4 12B: the CX rows' dims (attention / plain rows), the embedding table, the softcap.
+    g12: Option<G12Rows>,
+}
+
+/// Gemma 4 12B's x layout: runs of CX rows of one width (the attention rows' Hc A, the plain rows' Hc W) on one
+/// side of the CY row, each row's first dim; the embedding table (bf16 [V][H]); the final logit softcap.
+pub struct G12Rows {
+    /// (r0, r1, Hc, the run's first wafer-row offset from the unit's top)
+    runs: Vec<(u32, u32, u32, u32)>,
+    off: Vec<usize>,
+    embed: Npy,
+    softcap: f32,
 }
 
 /// Gemma 4's host side (its step-0 PLE words come from the storage PEs): the final logit softcap.
@@ -174,6 +188,9 @@ impl SplitModel {
             return SplitModel::open_gptoss(dev, spec, vocab);
         }
         if let Some(name) = spec.meta.get("geo").and_then(|v| v.as_str()) {
+            if spec.meta.contains_key("RA") {
+                return SplitModel::open_g12(dev, spec, vocab, name);
+            }
             return SplitModel::open_gemma(dev, spec, vocab, name);
         }
         let t0 = std::time::Instant::now();
@@ -244,8 +261,9 @@ impl SplitModel {
             x_y0: 0,
             band: None,
             hscale: 1.0,
-            hemb,
+            hemb: Some(hemb),
             gemma: None,
+            g12: None,
         })
     }
 
@@ -327,9 +345,104 @@ impl SplitModel {
             root: (g.hx0 + g.hxc, g.p.hr / 2),
             band: None,
             hscale: 1.0,
-            hemb,
+            hemb: Some(hemb),
             x_y0: u0.1,
             gemma: Some(gemma),
+            g12: None,
+            dev,
+        })
+    }
+
+    /// Gemma 4 12B (`scratch/split/gemma12/README.md`): the geometry the meta names (geo/g12.rs), placed.
+    fn open_g12(
+        mut dev: Box<dyn Device>,
+        spec: &SplitSpec,
+        vocab: usize,
+        name: &str,
+    ) -> R<SplitModel> {
+        let t0 = std::time::Instant::now();
+        let tiny = name == "tiny";
+        let mut gg = geo::g12::G12Geo::new(
+            name,
+            spec.int("G2").unwrap_or(if tiny { 2 } else { 16 }),
+            spec.int("G2W").unwrap_or(if tiny { 2 } else { 24 }),
+        )?;
+        gg.build()?;
+        tracing::info!(
+            ms = t0.elapsed().as_millis() as u64,
+            w = gg.g.w,
+            h = gg.g.h,
+            "split g12: geometry built"
+        );
+        let t1 = std::time::Instant::now();
+        place_g12::place(dev.as_mut(), &gg, spec)?;
+        tracing::info!(s = t1.elapsed().as_secs_f64(), "split g12: placed");
+        dev.call("init", &[]).map_err(|e| format!("init: {e}"))?;
+        let g = &gg.g;
+        dev.get(
+            "rcfg",
+            Rect {
+                x: 0,
+                y: 0,
+                w: g.w as i32,
+                h: g.h as i32,
+            },
+            1,
+        )?;
+        let u0 = g.unit_origin(0);
+        let mut off = vec![0usize];
+        for r in 0..g.p.py {
+            off.push(off[r as usize] + gg.hc(r) as usize);
+        }
+        let runs = place_g12::rowblocks(g.p.py, g.yc, gg.ra)
+            .into_iter()
+            .map(|(r0, r1, _)| (r0, r1, gg.hc(r0), g.wl(r0, g.yc)))
+            .collect();
+        let g12 = G12Rows {
+            runs,
+            off,
+            embed: spec.npy("embed")?,
+            softcap: spec
+                .meta
+                .get("SOFTCAP")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(30.0) as f32,
+        };
+        Ok(SplitModel {
+            vocab: spec.int("V").map_or(vocab, |v| vocab.min(v as usize)),
+            hidden: spec.need("H")? as usize,
+            cap: spec.int("CAP").unwrap_or(256) as usize,
+            positions: (spec.need("NEG")? * gg.ra) as usize,
+            fed: Vec::new(),
+            launches: 0,
+            steps: 0,
+            wl: true,
+            hr: g.p.hr,
+            hc: g.p.hc,
+            vr: spec.need("VR")?,
+            hdc: spec.need("HDc")?,
+            hcc: gg.hcw,
+            py: g.p.py,
+            yc: g.yc,
+            x_cx: u0.0 + g.xc,
+            last_cx: {
+                let (x, y) = g.unit_origin(g.units() - 1);
+                (x + g.xc, y)
+            },
+            force: std::env::var("PIE_CEREBRAS_SPLIT_FORCE").is_ok_and(|v| v == "1"),
+            eps: spec
+                .meta
+                .get("EPS")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-6) as f32,
+            hctl: g.hx0 + g.hxc,
+            root: (g.hx0 + g.hxc, g.p.hr / 2),
+            band: None,
+            hscale: 1.0,
+            hemb: None,
+            x_y0: u0.1,
+            gemma: None,
+            g12: Some(g12),
             dev,
         })
     }
@@ -405,8 +518,9 @@ impl SplitModel {
                 .get("HSCALE")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(32768.0) as f32,
-            hemb: spec.npy("hemb")?,
+            hemb: Some(spec.npy("hemb")?),
             gemma: None,
+            g12: None,
             dev,
         })
     }
@@ -437,8 +551,9 @@ impl SplitModel {
             // gpt-oss: [dims-row][vocab column][VR][Hc]
             let (j, k) = (v / self.vr, v % self.vr);
             let mut out = Vec::with_capacity((self.py * self.hcc) as usize);
+            let he = self.hemb.as_ref().ok_or("split: no embedding tiles")?;
             for i in 0..self.py as usize {
-                self.hemb.words(
+                he.words(
                     ((i * hvc as usize + j as usize) * self.vr as usize + k as usize)
                         * self.hcc as usize,
                     self.hcc as usize,
@@ -451,17 +566,42 @@ impl SplitModel {
         let per = (self.vr * self.hdc) as usize;
         let mut out = Vec::with_capacity((self.hc * self.hdc) as usize);
         for c in 0..self.hc as usize {
-            self.hemb.words(
-                (r as usize * self.hc as usize + c) * per + (j * self.hdc) as usize,
-                self.hdc as usize,
-                &mut out,
-            )?;
+            self.hemb
+                .as_ref()
+                .ok_or("split: no embedding tiles")?
+                .words(
+                    (r as usize * self.hc as usize + c) * per + (j * self.hdc) as usize,
+                    self.hdc as usize,
+                    &mut out,
+                )?;
         }
         Ok(out)
     }
 
     /// `v`'s embedding into unit 0's CX column (the next pass's x).
     fn put_x(&mut self, v: u32) -> R<()> {
+        if let Some(gr) = &self.g12 {
+            let h = self.hidden;
+            let mut raw = Vec::with_capacity(h);
+            gr.embed.words(v as usize * h, h, &mut raw)?;
+            let mut e: Vec<u32> = raw.into_iter().map(|b| b << 16).collect();
+            e.resize(*gr.off.last().unwrap(), 0);
+            for &(r0, r1, hc, ly0) in &gr.runs {
+                let (a, b) = (gr.off[r0 as usize], gr.off[r1 as usize]);
+                self.dev.put(
+                    "x",
+                    Rect {
+                        x: self.x_cx as i32,
+                        y: (self.x_y0 + ly0) as i32,
+                        w: 1,
+                        h: (r1 - r0) as i32,
+                    },
+                    hc as usize,
+                    &e[a..b],
+                )?;
+            }
+            return Ok(());
+        }
         let e: Vec<u32> = self.embedding(v)?.into_iter().map(|b| b << 16).collect();
         let hc = self.hcc as usize;
         for (r0, r1) in [(0, self.yc), (self.yc, self.py)] {
@@ -653,7 +793,34 @@ impl SplitModel {
         // the rms of the head's input, the last unit's x.
         let hc = self.hcc as usize;
         let mut ss = 0f64;
+        let mut runs: Vec<(u32, u32, usize, u32)> = Vec::new();
+        if let Some(gr) = &self.g12 {
+            runs.extend(
+                gr.runs
+                    .iter()
+                    .map(|&(r0, r1, h, ly0)| (r0, r1, h as usize, ly0)),
+            );
+        }
+        for &(r0, r1, h, ly0) in &runs {
+            let x = self.dev.get(
+                "x",
+                Rect {
+                    x: self.last_cx.0 as i32,
+                    y: (self.last_cx.1 + ly0) as i32,
+                    w: 1,
+                    h: (r1 - r0) as i32,
+                },
+                h,
+            )?;
+            ss += x
+                .iter()
+                .map(|&b| f64::from(f32::from_bits(b)).powi(2))
+                .sum::<f64>();
+        }
         for (r0, r1) in [(0, self.yc), (self.yc, self.py)] {
+            if self.g12.is_some() {
+                break;
+            }
             let y0 = self.last_cx.1 + r0 + u32::from(r0 >= self.yc);
             let x = self.dev.get(
                 "x",
@@ -676,9 +843,13 @@ impl SplitModel {
         let mut l: Vec<f32> = w.into_iter().map(|b| f32::from_bits(b) * scale).collect();
         // the head's padded rows (ids >= vocab) never reach sampling or the argmax
         l.truncate(self.vocab);
-        if let Some(gp) = &self.gemma {
+        let cap = self
+            .gemma
+            .as_ref()
+            .map(|gp| gp.softcap)
+            .or(self.g12.as_ref().map(|gr| gr.softcap));
+        if let Some(c) = cap {
             // Gemma's final logit softcap (monotone: the argmax is the wafer's)
-            let c = gp.softcap;
             for v in l.iter_mut() {
                 *v = c * (*v / c).tanh();
             }
@@ -710,5 +881,6 @@ pub fn is_split(program: &Path) -> bool {
             (s.contains("\"UNX\"") && s.contains("\"UNY\""))
                 || (s.contains("\"NTW\"") && s.contains("\"Ic1\"")) // Gemma's layout (mkfull_gemma.py)
                 || (s.contains("\"NEX\"") && s.contains("\"QO\"")) // gpt-oss's (mkfull_gptoss.py)
+                || (s.contains("\"HcA\"") && s.contains("\"HcW\"")) // Gemma 12B's (mkfull_g12.py)
         })
 }

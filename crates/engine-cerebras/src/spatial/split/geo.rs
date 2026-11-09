@@ -180,10 +180,15 @@ pub struct Geo {
     wnr: usize,
     /// Words a unit handoff relays (Hc; Gemma 2 Hc + 1).
     hand_n: u32,
+    /// The scores segments on rows below this only (Gemma 12B's attention rows, `g12.rs`).
+    seg_rows: Option<u32>,
+    /// The head's input paths and the wafer loop left to the caller (`g12.rs`'s head groups).
+    skip_head: bool,
 }
 
 type R<T> = std::result::Result<T, String>;
 
+pub mod g12;
 pub mod gemma;
 
 impl Geo {
@@ -231,6 +236,8 @@ impl Geo {
             origins: None,
             wnr: 16,
             hand_n: 0,
+            seg_rows: None,
+            skip_head: false,
         }
     }
 
@@ -564,7 +571,7 @@ impl Geo {
                 }
                 self.add(x0 + xc, y, LB, RX_R | TX_R)?;
                 let wpts: Vec<P> = (0..px).map(|c| (x0 + self.wl(c, xc), y)).collect();
-                if has_att {
+                if has_att && self.seg_rows.is_none_or(|ra| r < ra) {
                     let mut s0 = 0;
                     while s0 < px as usize {
                         let seg: Vec<P> =
@@ -664,7 +671,9 @@ impl Geo {
         for u in 0..self.units().saturating_sub(1) {
             self.handoff(u, u + 1)?;
         }
-        self.head_in(self.units() - 1)?;
+        if !self.skip_head {
+            self.head_in(self.units() - 1)?;
+        }
         for y in 0..self.p.hr {
             let pts: Vec<P> = (0..=self.p.hc).map(|i| (self.hx0 + i, y)).collect();
             let (o, h) = self.line2(&pts, self.hxc as usize, XA, XB, X2, HR3, self.p.g2h)?;
@@ -672,7 +681,7 @@ impl Geo {
             self.rootq.insert((self.hx0 + self.hxc, y), h);
             self.add(self.hx0 + self.hxc, y, LB, RX_R | TX_R)?;
         }
-        if self.p.wl {
+        if self.p.wl && !self.skip_head {
             self.wloop()?;
         }
         Ok(())

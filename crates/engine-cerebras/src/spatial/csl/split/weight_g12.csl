@@ -1,39 +1,36 @@
-// split/weight_g12.csl: EXPERIMENTAL, not runnable. The role-split weight PE for Gemma 4 12B (bf16), for the
-// fit study only: it links on a 4 x 4 harness (the attention-row kind at 4k context: 47,056 B, the plain-row
-// kind 44,160 B), but nothing simulates it, no CY / head-control kernel or host placement exists for it, and
-// mkfull.py does not build it. See spatial/split/README.md ("Experimental").
-//
-// Adapted from a Gemma 4 E2B draft without PLE / shared KV. Every layer is
-// attention (KM bit l: global), then the MLP. Per layer, its tiles: [qkv Hc x NQ][o QO x Hc][gate|up Hc x 2Ic]
-// [down Ic x Hc] (f16 bits). Sliding: NQ = QhS DcS q + DcS k + DcS v, QO = QhS DcS. Global (attention_k_eq_v):
-// NQ = QhG DcG q + DcG raw k (CY makes v = v_norm(raw k)), QO = QhG DcG. QhS / QhG per kind: the global kv head
-// replicated RG times over the unit (RG = PX QhG / 16), so its segment is PX / RG columns.
-// Deferred norms (as the draft): a hidden-input phase's row multicast is [a | b | 4 sums]; the matvec runs on both.
-// Caches: one a layer; sliding a ring of NES entries a row (window / PYW), global NEG entries (context NEG PYW).
-// v is stored normalised: |v|^2 rides the scores segment with |k|^2.
-// Levers: XCH (1) the exp in chunks of the matvec buffer and the scores
-// written straight into sx (y / y16 no longer sized by Qh NE).
+// split/weight_g12.csl: the role-split weight PE for Gemma 4 12B (bf16; scratch/split/gemma12/README.md): weight_gemma.csl
+// without PLE / shared KV, with attention_k_eq_v on the global layers and the row-role split:
+// - ATT 1 (an attention row, "A"): Hc A dims, the KV entries of its positions (position p on A row p % PYW);
+// - ATT 2 (a plain row, "W"): Hc W dims, no KV: it takes CY's multicasts and sends zeros into each pass's values
+//   reduction (the column chains run over every row).
+// Every layer is attention (KM bit l: global, else sliding), then the MLP. Per layer, its tiles:
+// [qkv Hc x NQ][o QO x Hc][gate|up Hc x 2Ic][down Ic x Hc] (f16 bits; QO = Qh Dc; NQ = Qh Dc q + Dc k (+ Dc v on a
+// sliding layer; a global one's v is v_norm(raw k), made by CY), Dc by kind).
+// Deferred norms: a hidden-input phase's row multicast is [a (Hc) | b (Hc) | 4 partial sums]: the PE runs the matvec
+// on a and on b and sends [W a | W b | sums] down the column; CY combines them. The deferred scalar comes back in
+// CY's multicast; column 0's PE adds it as the last word of its row partial (the other PEs add 0), so CX gets it.
+// Caches (A rows): one a layer; sliding a ring of NES entries a row (position p, entry (p / PYW) % NES; WIN > 0
+// masks entries older than the window), global NEG entries (context NEG PYW). v is stored normalised: |v|^2 rides
+// the scores segment with |k|^2; the entry is finalised (1 / |k|, v / |v|) by the first pass that uses it.
 param memcpy_params;
-param DIAG: u16 = 0;   // 1: no layers (handoffs, head, I/O, the KVS line and its log)
+param DIAG: u16 = 0;   // 1: no layers (handoffs, head, I/O)
 param K: u16;
 param Hc: u16;
 param Ic: u16;
 param MV: u16 = 1;
 param KM: u16;         // bit l: layer l is global
-param QhS: u16;
-param QhG: u16;
+param ATT: u16 = 1;    // 1 an attention row, 2 a plain row
+param KEV: u16 = 1;    // 1: a global layer's projection is q | raw k (v = v_norm(raw k), CY's)
+param Qh: u16;
 param DcS: u16;
 param DcG: u16;
 param NES: u16 = 4;
 param NEG: u16;
-param PYW: u16 = 128;
+param PYW: u16 = 128;  // the attention rows
 param HDS: u16 = 256;
 param HDG: u16 = 512;
-param XCH: u16 = 0;
-param ATT: u16 = 1;     // 1 attention rows (A); 2 plain rows (W: no KV, zeros into the values reduction); 0 no attention at all
-param TRIM: u16 = 0;    // 1: u16 offsets / positions, reciprocal head dims (no __divsf3), y16 sized to one matvec (needs XCH 1)
-param KF: u16 = 0;      // 1: 1/|k| folded into the stored key at the entry's finalisation (no kinv array, one fmuls less a head)
-param WIN: u16 = 1024;  // sliding window: a ring slot older than it is masked
+param WSPEC: u16 = 0;  // 1: the attention mixer specialized a layer kind (larger code)
+param WIN: u16 = 0;    // > 0: the sliding window (the ring of NES PYW entries is longer: older entries are masked)
 param TSTAMP: u16 = 0;
 param FIFOW: u16 = 32;
 
@@ -52,19 +49,20 @@ fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
 // ---------------------------------------------------------------- per-layer shapes
 fn isg(l: u16) bool { return ((KM >> l) & 1) == 1; }
 fn dcl(l: u16) u16 { return if (isg(l)) DcG else DcS; }
-fn qhl(l: u16) u16 { return if (isg(l)) QhG else QhS; }
-fn nql(l: u16) u16 { return qhl(l) * dcl(l) + (if (isg(l)) dcl(l) else 2 * dcl(l)); }
+fn nql(l: u16) u16 { return Qh * dcl(l) + (if (isg(l) and KEV == 1) dcl(l) else 2 * dcl(l)); }
 fn lw(l: u16) u32 {
   const H = @as(u32, Hc);
-  return H * nql(l) + @as(u32, qhl(l) * dcl(l)) * H + H * 2 * Ic + @as(u32, Ic) * H;
+  return H * nql(l) + @as(u32, Qh * dcl(l)) * H + H * 2 * Ic + @as(u32, Ic) * H;
 }
 fn wtot() u32 { var n: u32 = 0; var l: u16 = 0; while (l < K) : (l += 1) { n += lw(l); } return n; }
 const WN: u32 = wtot();
+// (a unit's tiles index in u16: offsets as u16 products, no 64-bit multiply helper)
+comptime { @comptime_assert(WN < 65536); }
 var w = @zeros([WN + 1]u16);
 var w_ptr: [*]u16 = &w;
 
-// caches
-const NC: u16 = K;
+// caches (A rows only)
+const NC: u16 = if (ATT == 1) K else 0;
 fn cg(c: u16) bool { return isg(c); }
 fn cne(c: u16) u16 { return if (cg(c)) NEG else NES; }
 fn cdc(c: u16) u16 { return if (cg(c)) DcG else DcS; }
@@ -76,36 +74,33 @@ fn sum_ne() u16 { var n: u16 = 0; var c: u16 = 0; while (c < NC) : (c += 1) { n 
 fn koff(c: u16) u16 { var n: u16 = 0; var i: u16 = 0; while (i < c) : (i += 1) { n += ckw(i); } return n; }
 fn voff(c: u16) u16 { var n: u16 = 0; var i: u16 = 0; while (i < c) : (i += 1) { n += cvw(i); } return n; }
 fn eoff(c: u16) u16 { var n: u16 = 0; var i: u16 = 0; while (i < c) : (i += 1) { n += cne(i); } return n; }
-fn cache_of(l: u16) u16 { return l; }
 var kc = @zeros([sum_kw() + 1]u16);
 var vc = @zeros([sum_vw() + 1]u16);
-var kinv = @zeros([if (KF == 1) 1 else sum_ne()]f32);
-var pk = @zeros([NC * DcG]f32);      // KF 1: the pending entry's key
-const QHM: u16 = mx(QhS, QhG);
-var mref = @zeros([K * QHM]f32);
-var pv = @zeros([NC * DcG]f32);      // the pending entry's raw v a cache
-var pks = @zeros([NC]f32);           // its |k|^2, |v|^2 partials (this column's)
-var pvs = @zeros([NC]f32);
-var pend = @zeros([NC]u16);
+var kinv = @zeros([sum_ne() + 1]f32);
+var mref = @zeros([if (ATT == 1) K * Qh else 1]f32);
+var pv = @zeros([mx(NC, 1) * DcG]f32);   // the pending entry's raw v a cache
+var pks = @zeros([mx(NC, 1)]f32);        // its |k|^2, |v|^2 partials (this column's)
+var pvs = @zeros([mx(NC, 1)]f32);
+var pend = @zeros([mx(NC, 1)]u16);
+fn soff(c: u16) u16 { var n: u16 = 0; var i: u16 = 0; while (i < c) : (i += 1) { if (!cg(i)) { n += cne(i); } } return n; }
+var spos = @zeros([if (WIN > 0 and ATT == 1) soff(NC) else 1]f32);   // (WIN > 0) a sliding entry's position + 1
 
 // ---------------------------------------------------------------- buffers
-const NEM: u16 = mx(NES, NEG);
-const NSE: u16 = mx(QhS * NES, QhG * NEG);           // the scores of a pass (Qh NE)
-const NS: u16 = NSE + QHM + 2;
-const QOM: u16 = mx(QhS * DcS, QhG * DcG);
-const NQM: u16 = mx(QhS * DcS + 2 * DcS, QhG * DcG + DcG);
-const XN: u16 = mx(mx(mx(Hc, QOM), Ic), NSE);
-const YM: u16 = mx(mx(mx(2 * NQM + 4, 4 * Ic + 4), Hc + 1), mx(QhS * (DcS + 1), QhG * (DcG + 1)));
-const YN: u16 = if (XCH == 1) YM else mx(YM, NS);   // XCH 1: the scores land in sx; the exp in chunks of YM
-const Y1: u16 = mx(mx(NQM, 2 * Ic), mx(Hc, QOM));   // one matvec's outputs
-const YNX: u16 = if (XCH == 1) (if (TRIM == 1) Y1 else YM) else YN;
+const NEM: u16 = if (ATT == 1) mx(NES, NEG) else 1;
+const NS: u16 = Qh * NEM + Qh + 2;
+const QOM: u16 = Qh * DcG;
+const NQM: u16 = Qh * DcG + 2 * DcG;
+const XN: u16 = mx(mx(mx(Hc, QOM), Ic), Qh * NEM);
+const YN: u16 = mx(mx(mx(2 * NQM + 4, 4 * Ic + 4), mx(Hc + 1, NS)), Qh * (DcG + 1));
 var xh = @zeros([XN]@fp16());
 var y: [YN]f32 align(16) = @zeros([YN]f32);
-var y16 = @zeros([YNX]@fp16());
+// the f16 accumulator (the largest f16 matvec: 2 Ic, NQ, Hc) and exp_v's 2^k bits (Qh NE u16)
+const Y16N: u16 = mx(mx(2 * Ic, NQM), mx(Hc, Qh * NEM));
+var y16 = @zeros([Y16N]@fp16());
 const xh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XN} -> xh[i] });
 const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> y[i] });
 const y_d0 = y_d;
-const y16_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YNX} -> y16[i] });
+const y16_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Y16N} -> y16[i] });
 var a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> w[i] });
 
 // ---------------------------------------------------------------- fabric (weight_q35's queues)
@@ -123,7 +118,6 @@ const ut_a = @get_ut_id(4);
 const ut_b = @get_ut_id(5);
 const ut_xa = @get_ut_id(2);
 const ut_xb = @get_ut_id(3);
-const ut_k = @get_ut_id(7);          // the KVS receive (iq7's microthread)
 var fifo_buf = @zeros([FIFOW]f32);
 const fifo = @allocate_fifo(fifo_buf);
 var fifo_xbuf = @zeros([FIFOW]f32);
@@ -135,8 +129,7 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
   return @set_dsd_length(@get_dsd(fabin_dsd, .{ .extent = 1, .input_queue = q }), n);
 }
 
-// rcfg (host, split_geo_gemma.rcfg_weight_g): weight_q35's words; [RQ+11] flags (bit 0 column 0, bit 1 KVS
-// consumer, bit 2 the flush unit), [RQ+12] the KVS colour
+// rcfg (host, split_geo_g12.rcfg_weight_g): weight_q35's words; [RQ+11] flags (bit 0 column 0, bit 2 the flush unit)
 const NR: u16 = 18;
 const RQ: u16 = 1 + 2 * NR;
 var rcfg = @zeros([RQ + 25]u32);
@@ -166,8 +159,11 @@ fn iq_any(q: u16, c: u16) void {
   else if (q == 4) { iqc(6, c); }
   else if (q == 5) { iqc(7, c); }
 }
+var done = @zeros([6]u16);
+var fq = @zeros([6]u16);
 fn bind_iqs(fin: *[6]u16, tmp: u16) void {
-  var done = @zeros([6]u16);
+  var z: u16 = 0;
+  while (z < 6) : (z += 1) { done[z] = 0; }
   var left: u16 = 6;
   var guard: u16 = 0;
   while (left > 0 and guard < 32) : (guard += 1) {
@@ -196,7 +192,8 @@ fn init() void {
     const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
     @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
   }
-  var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 4]), @as(u16, rcfg[RQ + 5]) };
+  var q: u16 = 0;
+  while (q < 6) : (q += 1) { fq[q] = @as(u16, rcfg[RQ + q]); }
   bind_iqs(&fq, @as(u16, rcfg[RQ + 24]));
   oqc(5, rcfg[RQ + 6]);
   oqc(3, rcfg[RQ + 7]);
@@ -213,21 +210,19 @@ fn send_x(n: u16) void {
   const d = @set_dsd_length(y_d, n);
   const A = .{ .async = true, .ut_id = ut_xb };
   if (role_x == 0) { @fmovs(fout(q_xo, n), d, A); }
-  else if (role_x == 1) { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
   else if (role_x == 2) {
     @fadds(fifo_x, fin(q_xa, n), d, .{ .async = true, .ut_id = ut_xa });
     @fadds(fout(q_xo, n), fin(q_xb, n), fifo_x, A);
-  } else { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
+  } else { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }   // roles 1, 3
 }
 fn send_y(n: u16) void {
   const d = @set_dsd_length(y_d, n);
   const A = .{ .async = true, .ut_id = ut_b };
   if (role_y == 0) { @fmovs(fout(q_yo, n), d, A); }
-  else if (role_y == 1) { @fadds(fout(q_yo, n), fin(q_ya, n), d, A); }
   else if (role_y == 2) {
     @fadds(fifo, fin(q_ya, n), d, .{ .async = true, .ut_id = ut_a });
     @fadds(fout(q_yo, n), fin(q_yb, n), fifo, A);
-  } else { @fadds(fout(q_yo, n), fin(q_ya, n), d, A); }
+  } else { @fadds(fout(q_yo, n), fin(q_ya, n), d, A); }   // roles 1, 3
 }
 
 // ---------------------------------------------------------------- matvec
@@ -237,7 +232,7 @@ const mv_src1 = @get_dsr(dsr_src1, 1);
 fn mvs_step(xv: @fp16()) void { @fmachs(mv_dest, mv_src0, mv_src1, xv); }
 fn mvh_step(xv: @fp16()) void { @fmach(mv_dest, mv_src0, mv_src1, xv); }
 // y[yo..yo+N) = A x, A at w[off] (R rows of N), x in xh[0..R)
-fn mv(off: u32, R: u16, N: u16, yo: u16) void {
+fn mv(off: u16, R: u16, N: u16, yo: u16) void {
   const a = @set_dsd_length(@set_dsd_base_addr(a_d, @ptrcast([*]u16, &w[off])), N);
   const xv = @set_dsd_length(xh_d, R);
   const yv = @set_dsd_length(@increment_dsd_offset(y_d0, @as(i16, yo), f32), N);
@@ -269,7 +264,7 @@ fn kvmv(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
   @map(mvs_step, xv);
 }
 // A deferred phase: [a | b | 4 sums] in, [W a | W b | sums] out (2 N + 4 words)
-fn mv2(off: u32, N: u16) void {
+fn mv2(off: u16, N: u16) void {
   @fs2h(@set_dsd_length(xh_d, Hc), fin(q_xm, Hc));
   mv(off, Hc, N, 0);
   @fs2h(@set_dsd_length(xh_d, Hc), fin(q_xm, Hc));
@@ -340,6 +335,8 @@ fn exp_v(buf: mem1d_dsd, n: u16) void {
   @add16(ph, ph, kk);
   @fmovs(buf, p);
 }
+const IHDS: f32 = 1.0 / @as(f32, HDS);
+const IHDG: f32 = 1.0 / @as(f32, HDG);
 fn rsq(v: f32) f32 {
   var r = @bitcast(f32, @as(u32, 0x5f3759df) - (@bitcast(u32, v) >> 1));
   r = r * (1.5 - 0.5 * v * r * r);
@@ -349,9 +346,9 @@ fn rsq(v: f32) f32 {
 }
 
 // ---------------------------------------------------------------- caches
-fn cslot(c: u16, pos: u16) u16 {   // (u16 positions: context <= 65535)
-  const e = pos / PYW;
-  return if (cg(c)) e else e % NES;
+fn cslot(c: u16, pos: u32) u16 {
+  const e = pos / @as(u32, PYW);
+  return if (cg(c)) @as(u16, e) else @as(u16, e % @as(u32, NES));
 }
 fn cache_reset(c: u16) void {
   var i: u16 = 0;
@@ -359,98 +356,85 @@ fn cache_reset(c: u16) void {
   i = 0;
   while (i < cvw(c)) : (i += 1) { vc[1 + voff(c) + i] = 0; }
   i = 0;
-  while (KF == 0 and i < cne(c)) : (i += 1) { kinv[eoff(c) + i] = 0.0; }
+  while (i < cne(c)) : (i += 1) { kinv[eoff(c) + i] = 0.0; if (WIN > 0 and !cg(c)) { spos[soff(c) + i] = 0.0; } }
   pend[c] = 0;
 }
 // the new entry of cache c (this row's): k into the keys (f16), v and the two partials pending
-fn cache_put(c: u16, pos: u16, k: [*]f32, v: [*]f32, ks: f32, vs: f32) void {
+fn cache_put(c: u16, pos: u32, k: [*]f32, v: [*]f32, ks: f32, vs: f32) void {
   const e = cslot(c, pos);
   const ne = cne(c);
   const dc = cdc(c);
   var d: u16 = 0;
   while (d < dc) : (d += 1) {
-    if (KF == 1) { pk[c * DcG + d] = k[d]; } else { kc[1 + koff(c) + d * ne + e] = @bitcast(u16, @as(@fp16(), k[d])); }
+    kc[1 + koff(c) + d * ne + e] = @bitcast(u16, @as(@fp16(), k[d]));
     pv[c * DcG + d] = v[d];
   }
   pks[c] = ks;
   pvs[c] = vs;
   pend[c] = 1;
+  if (WIN > 0 and !cg(c)) { spos[soff(c) + e] = @as(f32, pos + 1); }
 }
-fn cache_fin(c: u16, pos: u16, kss: f32, vss: f32, hd: f32) void {
+fn cache_fin(c: u16, pos: u32, kss: f32, vss: f32, ihd: f32) void {
   const e = cslot(c, pos);
   const dc = cdc(c);
-  const ki = rsq(kss * hd + 1.0e-6);
-  const vi = rsq(vss * hd + 1.0e-6);
+  kinv[eoff(c) + e] = rsq(kss * ihd + 1.0e-6);
+  const vi = rsq(vss * ihd + 1.0e-6);
   var d: u16 = 0;
-  if (KF == 1) {
-    const ne = cne(c);
-    while (d < dc) : (d += 1) { kc[1 + koff(c) + d * ne + e] = @bitcast(u16, @as(@fp16(), pk[c * DcG + d] * ki)); }
-    d = 0;
-  } else { kinv[eoff(c) + e] = ki; }
   while (d < dc) : (d += 1) { vc[1 + voff(c) + e * (dc + 1) + d] = @bitcast(u16, @as(@fp16(), pv[c * DcG + d] * vi)); }
   vc[1 + voff(c) + e * (dc + 1) + dc] = 0x3c00;
   pend[c] = 0;
 }
 
 // ---------------------------------------------------------------- attention
-// XCH 1: exp over sx in chunks of YM (exp_v's scratch is y / y16)
-fn exp_c(buf: mem1d_dsd, n: u16) void {
-  if (XCH == 0) { exp_v(buf, n); return; }
-  var o: u16 = 0;
-  while (o < n) : (o += YNX) {
-    const m: u16 = if (n - o < YNX) n - o else YNX;
-    exp_v(@set_dsd_length(@increment_dsd_offset(buf, @as(i16, o), f32), m), m);
-  }
-}
-const sxk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NS} -> sx[i] });
-// the scores of head h: XCH 1 straight into sx[h NEl ..) (N = ne: a head's tail past NEl is overwritten by the
-// next head's and the sums are written after the loop), else into y[h ne ..) and copied
-fn scores(kp: [*]u16, dc: u16, ne: u16, h: u16, NEl: u16) void {
-  if (XCH == 1) {
-    const a = @set_dsd_length(@set_dsd_base_addr(a_d, kp), ne);
-    const xv = @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, h * dc), @fp16()), dc);
-    const yv = @set_dsd_length(@increment_dsd_offset(sxk_d, @as(i16, h * NEl), f32), ne);
-    @fmovs(yv, 0.0);
-    @load_to_dsr(mv_dest, yv, .{ .save_address = false });
-    @load_to_dsr(mv_src0, yv, .{ .save_address = false });
-    @load_to_dsr(mv_src1, a, .{ .save_address = true });
-    @map(mvs_step, xv);
-  } else {
-    kvmv(kp, dc, ne, h * dc, h * ne);
-    @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl),
-           @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * ne), f32), NEl));
-  }
-}
 // CY's multicast: q (weights, RoPE) QD | k Dc | v Dc | position | q's partial |q_h|^2 (Qh) | |k|^2 | |v|^2 | the
 // deferred scalar (AB = QD + 2 Dc + Qh + 4)
-const ABM: u16 = mx(QhS * DcS + 2 * DcS + QhS, QhG * DcG + 2 * DcG + QhG) + 4;
-var ab = @zeros([ABM]f32);
-const ab_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ABM} -> ab[i] });
-const kinv_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NEM} -> kinv[i] });
+var ab = @zeros([QOM + 2 * DcG + Qh + 4]f32);
+const ab_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QOM + 2 * DcG + Qh + 4} -> ab[i] });
 var s_att: f32 = 0.0;
+// WSPEC 1: one copy a layer kind (g 0 sliding, 1 global: the head width and the entry count constants); 0: one
+// runtime copy (g 2; the smaller program)
 fn att_mix(l: u16) void {
-  const dc = dcl(l);
-  const Qh = qhl(l);
+  if (ATT == 2) { if (isg(l)) { attw(l, 1); } else { attw(l, 0); } return; }
+  if (WSPEC != 0) { if (isg(l)) { attm(l, 1); } else { attm(l, 0); } } else { attm(l, 2); }
+}
+// a plain row: CY's multicasts taken, zeros into each pass's values reduction
+fn attw(l: u16, comptime g: u16) void {
+  const dc: u16 = if (g == 1) DcG else DcS;
   const QD: u16 = Qh * dc;
   const AB: u16 = QD + 2 * dc + Qh + 4;
-  const c = cache_of(l);
-  const ne = cne(c);
-  const hd = if (isg(l)) 1.0 / @as(f32, HDG) else 1.0 / @as(f32, HDS);   // (comptime reciprocals)
   @fmovs(@set_dsd_length(ab_d, AB), fin(q_ym, AB));
-  const pos = @as(u16, ab[QD + 2 * dc]);
   s_att = ab[QD + 2 * dc + Qh + 3];
-  const mine = (pos % PYW) == myrow;
+  var apass: u16 = 0;
+  while (apass < 8) : (apass += 1) {
+    @fmovs(@set_dsd_length(y_d, Qh * (dc + 1)), 0.0);
+    send_y(Qh * (dc + 1));
+    @fs2h(@set_dsd_length(xh_d, QD), fin(q_ym, QD));
+    @fmovs(@set_dsd_length(sx_d, 1 + Qh), fin(q_ym, 1 + Qh));
+    if (sx[0] == 0.0) { lpa = l + 1; apass = 8; }
+  }
+}
+fn attm(l: u16, comptime g: u16) void {
+  const dc: u16 = if (g == 2) dcl(l) else if (g == 1) DcG else DcS;
+  const QD: u16 = Qh * dc;
+  const AB: u16 = QD + 2 * dc + Qh + 4;
+  const c = l;
+  const ne: u16 = if (g == 2) cne(c) else if (g == 1) NEG else NES;
+  const ihd: f32 = if (isg(l)) IHDG else IHDS;   // (reciprocals: no runtime f32 divide)
+  @fmovs(@set_dsd_length(ab_d, AB), fin(q_ym, AB));
+  const pos = @as(u32, ab[QD + 2 * dc]);
+  s_att = ab[QD + 2 * dc + Qh + 3];
+  const mine = (pos % @as(u32, PYW)) == @as(u32, myrow);
   if (pos == 0) {
     cache_reset(c);
     var hh: u16 = 0;
-    while (hh < Qh) : (hh += 1) { mref[l * QHM + hh] = 0.0; }
+    while (hh < Qh) : (hh += 1) { mref[l * Qh + hh] = 0.0; }
   }
   if (mine) {
     cache_put(c, pos, @ptrcast([*]f32, &ab[QD]), @ptrcast([*]f32, &ab[QD + dc]), ab[QD + 2 * dc + 1 + Qh], ab[QD + 2 * dc + 2 + Qh]);
   }
   @fs2h(@set_dsd_length(xh_d, QD), @set_dsd_length(ab_d, QD));
-  const eseen = pos / PYW + 1;
-  const NEl: u16 = if (eseen < ne) eseen else ne;
+  const eseen = pos / @as(u32, PYW) + 1;
+  const NEl: u16 = if (eseen < @as(u32, ne)) @as(u16, eseen) else ne;
   const nsl: u16 = Qh * NEl + Qh + 2;
   const kb = koff(c);
   const vb = voff(c);
@@ -458,31 +442,33 @@ fn att_mix(l: u16) void {
   var apass: u16 = 0;
   while (apass < 8) : (apass += 1) {
     var h: u16 = 0;
-    while (h < Qh) : (h += 1) { scores(@ptrcast([*]u16, &kc[1 + kb]), dc, ne, h, NEl); }
-    h = 0;
-    while (h < Qh) : (h += 1) { sx[Qh * NEl + h] = ab[QD + 2 * dc + 1 + h]; }
+    while (h < Qh) : (h += 1) {
+      kvmv(@ptrcast([*]u16, &kc[1 + kb]), dc, ne, h * dc, h * ne);
+      @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl),
+             @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * ne), f32), NEl));
+      sx[Qh * NEl + h] = ab[QD + 2 * dc + 1 + h];
+    }
     const pm = mine and pend[c] != 0;
     sx[Qh * NEl + Qh] = if (pm) pks[c] else 0.0;
     sx[Qh * NEl + Qh + 1] = if (pm) pvs[c] else 0.0;
     if (role_s != 5) { seg_ar(nsl); }
-    if (pm) { cache_fin(c, pos, sx[Qh * NEl + Qh], sx[Qh * NEl + Qh + 1], hd); }
+    if (pm) { cache_fin(c, pos, sx[Qh * NEl + Qh], sx[Qh * NEl + Qh + 1], ihd); }
+    const ki = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NEM} -> kinv[i] });
     h = 0;
     while (h < Qh) : (h += 1) {
       const sh = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl);
-      if (KF == 0) { @fmuls(sh, sh, @set_dsd_length(@increment_dsd_offset(kinv_d, @as(i16, e0), f32), NEl)); }
-      @fmuls(sh, sh, rsq(sx[Qh * NEl + h] * hd + 1.0e-6));
-      @fsubs(sh, sh, mref[l * QHM + h]);
-    }
-    if (!isg(l) and NES * PYW > WIN and NEl == NES) {   // the ring's oldest slot of this row, if past the window
-      const last = pos - ((pos + PYW - myrow) % PYW);   // this row's newest position <= pos (rows > pos % PYW: one ring turn back)
-      const old = last - (NES - 1) * PYW;
-      if (pos - old >= WIN) {
-        const so = cslot(c, old);
-        h = 0;
-        while (h < Qh) : (h += 1) { sx[h * NEl + so] = -1.0e30; }
+      @fmuls(sh, sh, @set_dsd_length(@increment_dsd_offset(ki, @as(i16, e0), f32), NEl));
+      @fmuls(sh, sh, rsq(sx[Qh * NEl + h] * ihd + 1.0e-6));
+      @fsubs(sh, sh, mref[l * Qh + h]);
+      if (WIN > 0 and !cg(c)) {   // entries out of the window (or never written) score -1e30: exp -> 0
+        var e: u16 = 0;
+        while (e < NEl) : (e += 1) {
+          const sp = spos[soff(c) + e];
+          if (sp == 0.0 or @as(f32, pos + 1) - sp >= @as(f32, WIN)) { sx[h * NEl + e] = -1.0e30; }
+        }
       }
     }
-    exp_c(@set_dsd_length(sx_d, Qh * NEl), Qh * NEl);
+    exp_v(@set_dsd_length(sx_d, Qh * NEl), Qh * NEl);
     const sp = @set_dsd_length(sx_d, Qh * NEl);
     @fnegs(sp, sp);
     @fmaxs(sp, sp, -65504.0);
@@ -498,70 +484,53 @@ fn att_mix(l: u16) void {
       apass = 8;
     } else {
       h = 0;
-      while (h < Qh) : (h += 1) { mref[l * QHM + h] += sx[1 + h]; }
+      while (h < Qh) : (h += 1) { mref[l * Qh + h] += sx[1 + h]; }
       @fs2h(@set_dsd_length(xh_d, QD), @set_dsd_length(ab_d, QD));
     }
-  }
-}
-// ATT 2 (a plain row): CY's multicast taken for the deferred scalar, zeros into each pass's values reduction
-// (the chain runs over every row), o and the redo word back; the scores segment runs on the A rows only
-fn att_pass(l: u16) void {
-  const dc = dcl(l);
-  const Qh = qhl(l);
-  const QD: u16 = Qh * dc;
-  const AB: u16 = QD + 2 * dc + Qh + 4;
-  @fmovs(@set_dsd_length(ab_d, AB), fin(q_ym, AB));
-  s_att = ab[QD + 2 * dc + Qh + 3];
-  @fmovs(@set_dsd_length(y_d, Qh * (dc + 1)), 0.0);
-  var apass: u16 = 0;
-  while (apass < 8) : (apass += 1) {
-    send_y(Qh * (dc + 1));
-    @fs2h(@set_dsd_length(xh_d, QD), fin(q_ym, QD));
-    @fmovs(@set_dsd_length(sx_d, 1 + Qh), fin(q_ym, 1 + Qh));
-    if (sx[0] == 0.0) { lpa = l + 1; apass = 8; }
   }
 }
 var lpa: u16 = 0;
 fn lse_late() void {
   if (lpa == 0) { return; }
   const l = lpa - 1;
-  const Qh = qhl(l);
   @fmovs(@set_dsd_length(sx_d, Qh), fin(q_ym, Qh));
-  var h: u16 = 0;
-  while (h < Qh) : (h += 1) { mref[l * QHM + h] += sx[h]; }
+  if (ATT == 1) {
+    var h: u16 = 0;
+    while (h < Qh) : (h += 1) { mref[l * Qh + h] += sx[h]; }
+  }
   lpa = 0;
 }
 
 // ---------------------------------------------------------------- a pass
 var sv2 = @zeros([2]f32);
 const sv2_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2} -> sv2[i] });
-fn layer(l: u16, b: u32) u32 {
+fn layer(l: u16, b: u16) u16 {
   const dc = dcl(l);
   const NQ = nql(l);
-  const QO = qhl(l) * dc;
-  const H = @as(u32, Hc);
-  // attention: qkv (deferred: the previous layer's post-FFN term), the mixer, o | the deferred scalar
+  const QO = Qh * dc;
+  // (offsets as u16 products: no u32 multiply, whose helper __muldi3 costs 332 B)
+  // attention
   mv2(b, NQ);
   stamp(1 + 9 * l);
-  if (ATT == 1) { att_mix(l); } else if (ATT == 2) { att_pass(l); } else { @fs2h(@set_dsd_length(xh_d, QO), fin(q_ym, QO)); s_att = 0.0; }
+  att_mix(l);
   stamp(2 + 9 * l);
-  const bo = if (TRIM == 1) b + @as(u32, Hc * NQ) else b + H * NQ;
+  const bo = b + Hc * NQ;
   mv(bo, QO, Hc, 0);
   send_row(s_att);
   lse_late();
   stamp(3 + 9 * l);
-  // MLP: gate | up (deferred: the post-attention term), act (Ic) | its scalar, down
-  const bg = if (TRIM == 1) bo + @as(u32, QO * Hc) else bo + @as(u32, QO) * H;
+  // MLP: gate | up (deferred), act (Ic) | the post-attention scalar, down
+  const bg = bo + QO * Hc;
   mv2(bg, 2 * Ic);
   stamp(4 + 9 * l);
   @fs2h(@set_dsd_length(xh_d, Ic), fin(q_ym, Ic));
   @fmovs(@set_dsd_length(sv2_d, 1), fin(q_ym, 1));
   stamp(5 + 9 * l);
-  const bd = if (TRIM == 1) bg + @as(u32, Hc * 2 * Ic) else bg + H * 2 * Ic;
+  const bd = bg + Hc * 2 * Ic;
   mv(bd, Ic, Hc, 0);
   send_row(sv2[0]);
   stamp(6 + 9 * l);
-  return if (TRIM == 1) bd + @as(u32, Ic * Hc) else bd + @as(u32, Ic) * H;
+  return bd + Ic * Hc;
 }
 // the last unit's flush: the last layer's post-FFN scalar back to CX
 fn flush() void {
@@ -579,7 +548,7 @@ fn relay(o: u16) void {
   iqc(6, rcfg[RQ + o + 1]);
   oqc(4, rcfg[RQ + o + 2]);
   @fmovs(fout(q_ao, n), fin(q_xm, n));
-  qmode(0);
+  iqc(6, rcfg[RQ + 4]);
 }
 
 var n_steps: u32 = 0;
@@ -588,9 +557,8 @@ const pass_id: local_task_id = @get_local_task_id(8);
 task pass_task() void {
   var i: u32 = 0;
   while (i < n_steps) : (i += 1) {
-    const pos = pos0 + i;
     var l: u16 = 0;
-    var b: u32 = 0;
+    var b: u16 = 0;
     relay(18);
     stamp(0);
     while ((DIAG & 1) == 0 and l < (if ((DIAG & 2) != 0) 1 else K)) : (l += 1) { b = layer(l, b); }
@@ -619,7 +587,6 @@ comptime {
   @export_symbol(w_ptr, "w");
   @export_symbol(rcfg_ptr, "rcfg");
   @export_symbol(tdbg_ptr, "tdbg");
-
   @export_symbol(init);
   @export_symbol(compute);
 }

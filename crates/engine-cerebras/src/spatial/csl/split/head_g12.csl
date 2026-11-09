@@ -1,30 +1,17 @@
-// split/head_g12.csl: EXPERIMENTAL, not runnable (links on a 4 x 4 harness only; see weight_g12.csl).
-// head_pe.csl with TIED 1 (Gemma 4 12B, tied embeddings): the embedding row of the winner is read from the
-// head tile itself (dim-major f16 [HDc][VR]: stride VR) and widened by @fh2s; no hemb copy.
-// The rest as head_pe.csl (an earlier copy of it):
-// The head block is HC columns of HDc hidden dims (plus a control column, head_ctl.csl, in the
-// middle) by rows of VR vocabulary rows. A head PE holds its VR x HDc tile of lm_head (f16 bits,
-// row-major [dim][vocab row]) and the final norm's (1 + w) for its dims, takes x's dims (the
-// last unit's CX rows reach the head by row paths; see relays), and sends its VR logit partials
-// into its row's reduction toward the control column. The final norm's rsqrt is a positive
-// scalar of the token: greedy argmax does not need it.
-// x input roles (rcfg): 0 take the column multicast (HDc words); 1 relay A: take the odd CX
-// row's HDc / 2 words (HX) and send them north (HN); 2 relay B: take the even row's half (HX)
-// and A's half (HN), multicast the HDc words down and up the column (HM), keep them.
-// x is used in NPX f16 parts (x = p0 + p1 + ...) with f32 accumulation (@fmachs).
-// The wafer token loop (rcfg flags bit 0): the PE also holds its VR x HDc tile of the embedding
-// (bf16 bits, [vocab row][dim]). After the logits, every PE takes its row's word from the control
-// PE (iq7): the winner's offset j (this is the winner row), -(1 + the winner's row), or < -1e8 (a
-// launch's last step: nothing). The winner row's PEs send row j of their tile (widened to f32)
-// north on VA (their VA route switched to their ramp for it, restored at the next step) to row 0,
-// which sends it south on VS to the column's CX row pair (te = unit 0's CX row 2c, to = 2c + 1);
-// te sends the first half west on HE and the second on HS to `to`, which sends it west on HE.
-// Row 0 of column 0 is te itself (VA ends there).
+// split/head_g12.csl: the role-split head weight PE for Gemma 4 12B (head_pe.csl with a tied head and head groups;
+// scratch/split/gemma12/README.md). A head column takes x's dims of a group of consecutive CX rows (NX <= HDc words,
+// [RQ+17]; the rest of its HDc dims are padding with zero weights): the group's root CX sends them along its row
+// (HX) to the head PE on that row (x role 2), which multicasts the HDc words up and down the column (HM); the other
+// PEs take the multicast (x role 0).
+// The embedding is the head tile itself (tied: f16 [HDc][VR], the winner's row read with stride VR, widened). The
+// wafer token loop: the winner row's PEs send its NX dims north on VA to row 0, which sends them south on VS to the
+// group's root row (te), which sends them west on HE into unit 0's CX (the group's root; the chain spreads them).
+// Row 0 of a column whose root is row 0 is te itself.
 param memcpy_params;
 param VR: u16;
 param HDc: u16;
-param NPX: u16 = 2;
-param TIED: u16 = 0;
+param NPX: u16 = 1;    // x's f16 parts
+param HACC16: u16 = 0; // 1 (measurement): the logit partials accumulate in f16 (y16), then widen once
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
@@ -46,8 +33,7 @@ const xp_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> xp[i] });
 const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> y[i] });
 var a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> hw[i] });
 
-// iq2 / iq3: the row reduction's inputs (level 1 / FIFO end), iq4 HX, iq5 HN, iq6 HM; oq2 the
-// row reduction's output, oq3 HN / HM.
+// (queues: see the header)
 const q_ra = @get_input_queue(2);
 const q_rb = @get_input_queue(3);
 const q_hx = @get_input_queue(4);
@@ -73,8 +59,7 @@ fn fin(comptime q: input_queue, n: u16) fabin_dsd {
 }
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 17]u32);   // [RQ..RQ+7) iq2..iq6, oq2, oq3; [RQ+7] row role; [RQ+8] x role; [RQ+9] spare;
-// [RQ+10] iq7, [RQ+11] loop flags (bit 0 on, 1 the VA sink, 2 te, 3 to), [RQ+12] the row, [RQ+13..17) oq4..oq7
+var rcfg = @zeros([RQ + 18]u32);   // head_pe's; [RQ+17] NX
 var rcfg_ptr: [*]u32 = &rcfg;
 var role_r: u16 = 0;
 var role_x: u16 = 0;
@@ -123,8 +108,6 @@ fn bind_iqs(fin: *[6]u16, tmp: u16) void {
 }
 
 fn init() void {
-  ebw_d = @set_dsd_stride(@set_dsd_base_addr(@set_dsd_length(ebh_d, HDc), @ptrcast([*]u16, &eb)), 2);
-  ebw_d = @increment_dsd_offset(ebw_d, 1, u16);
   const cc0 = color_config.get_color_config_addr(@get_color(0));
   var k: u16 = 0;
   while (k < @as(u16, rcfg[0])) : (k += 1) {
@@ -142,6 +125,7 @@ fn init() void {
   timestamp.enable_tsc();
   role_r = @as(u16, rcfg[RQ + 7]);
   role_x = @as(u16, rcfg[RQ + 8]);
+  nx = @as(u16, rcfg[RQ + 17]);
   sys_mod.unblock_cmd_stream();
 }
 
@@ -150,20 +134,15 @@ const mv_src0 = @get_dsr(dsr_src0, 1);
 const mv_src1 = @get_dsr(dsr_src1, 1);
 fn mvs_step(xv: @fp16()) void { @fmachs(mv_dest, mv_src0, mv_src1, xv); }
 fn mvh_step(xv: @fp16()) void { @fmach(mv_dest, mv_src0, mv_src1, xv); }
-param HACC16: u16 = 0;   // 1: the logit partials accumulate in f16 (y16), then widen once
 var y16 = @zeros([if (HACC16 == 1) VR else 1]@fp16());
 const yh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (HACC16 == 1) VR else 1} -> y16[i] });
 
+var nx: u16 = 0;
 fn recv_x() void {
-  const H2: u16 = HDc / 2;
   if (role_x == 0) {
     @fmovs(x_d, fin(q_hm, HDc));
-  } else if (role_x == 1) {
-    @fmovs(fout(q_xo, H2), fin(q_hx, H2));
-    @fmovs(x_d, fin(q_hm, HDc));   // B's multicast passes this PE too
   } else {
-    @fmovs(@set_dsd_length(x_d, H2), fin(q_hx, H2));
-    @fmovs(@set_dsd_length(@increment_dsd_offset(x_d, @as(i16, H2), f32), H2), fin(q_hn, H2));
+    @fmovs(@set_dsd_length(x_d, nx), fin(q_hx, nx));
     @fmovs(fout(q_xo, HDc), x_d);
   }
 }
@@ -178,12 +157,10 @@ fn send_r() void {
 }
 
 // ---------------------------------------------------------------- the wafer token loop
-var hemb = @zeros([if (TIED == 1) 1 else VR * HDc + 1]u16);
+var hemb = @zeros([1]u16);
 var hemb_ptr: [*]u16 = &hemb;
 var eb: [HDc]f32 align(16) = @zeros([HDc]f32);
 const eb_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> eb[i] });
-const ebh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> hemb[i] });
-var ebw_d = ebh_d;
 var wfl: u16 = 0;
 var va_addr: u16 = 0;
 var va_orig: u16 = 0;
@@ -191,8 +168,7 @@ var va_dirty = false;
 var ww = @zeros([1]f32);
 const ww_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> ww[i] });
 // (a send returns when its wavelets enter the output queue, not when they leave: the route goes back
-// only once oq4 is empty, and only after the next step's x is in, ~a pass later; restoring right
-// after the send stranded the tail of the slice on the CS-3 and hung the next winner's column, 0738)
+// only once oq4 is empty, and only after the next step's x is in, ~a pass later)
 fn va_restore() void {
   if (!va_dirty) { return; }
   while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}   // oq4 empty
@@ -201,40 +177,34 @@ fn va_restore() void {
   va_dirty = false;
 }
 fn hloop() void {
-  const H2: u16 = HDc / 2;
   @fmovs(ww_d, fin(q_w, 1));
   const w = ww[0];
   if (w < -1.0e8) { return; }
   const sink = (wfl & 2) != 0;
   const te = (wfl & 4) != 0;
-  const to = (wfl & 8) != 0;
   var wrow: u16 = 0;
   if (w >= 0.0) {
     wrow = @as(u16, rcfg[RQ + 12]);
     const j = @as(u16, w);
-    // row j of the tile, bf16 bits into the high halves of f32 words
-    @fmovs(eb_d, 0.0);
-    if (TIED == 1) { var d: u16 = 0; while (d < HDc) : (d += 1) { eb[d] = @as(f32, @bitcast(@fp16(), hw[d * VR + j])); }  } else { @mov16(ebw_d, @increment_dsd_offset(ebh_d, @as(i16, j * HDc), u16)); }
+    // row j of the tied tile (dim-major: stride VR), f16 widened
+    var d: u16 = 0;
+    while (d < nx) : (d += 1) { eb[d] = @as(f32, @bitcast(@fp16(), hw[d * VR + j])); }
+    const e = @set_dsd_length(eb_d, nx);
     if (sink and te) {
-      @fmovs(fout(q_he, H2), @set_dsd_length(eb_d, H2));
-      @fmovs(fout(q_hs, H2), @set_dsd_length(@increment_dsd_offset(eb_d, @as(i16, H2), f32), H2));
+      @fmovs(fout(q_he, nx), e);
     } else if (sink) {
-      @fmovs(fout(q_vs, HDc), eb_d);
+      @fmovs(fout(q_vs, nx), e);
     } else {
       const r = @get_config(va_addr, tgt.color_addr_range) & 0xff00;
       @set_config(va_addr, r | 0x80 | (va_orig & 0x1f), tgt.color_addr_range);
       va_dirty = true;
-      @fmovs(fout(q_va, HDc), eb_d);
+      @fmovs(fout(q_va, nx), e);
     }
   } else {
     wrow = @as(u16, -w - 1.0);
   }
-  if (sink and !te and wrow != 0) { @fmovs(fout(q_vs, HDc), fin(q_hn, HDc)); }   // (iq5: VA here)
-  if (te and !(sink and wrow == 0)) {
-    @fmovs(fout(q_he, H2), fin(q_hm, H2));       // (iq6: VS, or VA in column 0)
-    @fmovs(fout(q_hs, H2), fin(q_hm, H2));
-  }
-  if (to) { @fmovs(fout(q_he, H2), fin(q_hn, H2)); }   // (iq5: HS)
+  if (sink and !te and wrow != 0) { @fmovs(fout(q_vs, nx), fin(q_hn, nx)); }   // (iq5: VA here)
+  if (te and !(sink and wrow == 0)) { @fmovs(fout(q_he, nx), fin(q_hm, nx)); }  // (iq6: VS, or VA at row 0)
 }
 
 const timestamp = @import_module("<time>");
