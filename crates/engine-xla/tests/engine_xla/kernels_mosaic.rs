@@ -31,7 +31,6 @@ fn a_rust_built_mosaic_add_runs_on_the_device() {
         prefetch: vec![],
         ins: vec![block(), block()],
         outs: vec![block()],
-        scratch: vec![],
         vmem_limit: None,
     };
     let compiled = kernel
