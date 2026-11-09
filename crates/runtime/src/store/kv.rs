@@ -136,6 +136,9 @@ pub struct KvStore {
     /// (`persist-prefix-tokens`, `persist-system`): told to the cluster with
     /// the runs it leaves, until it owns none.
     hints: HashMap<ProcessId, u64>,
+    /// The last count of reclaimable cache pages, when it was taken and what
+    /// the walk took: see [`Self::reclaimable_cache_pages`].
+    reclaimable: std::cell::Cell<Option<(Instant, std::time::Duration, u32)>>,
 }
 
 /// A persistent disk tier: a copy on disk of sealed pages, by key. A page
@@ -316,6 +319,7 @@ impl KvStore {
             moved: Arc::new(tokio::sync::Notify::new()),
             persisted: None,
             hints: HashMap::new(),
+            reclaimable: std::cell::Cell::new(None),
         }
     }
 
@@ -577,7 +581,13 @@ impl KvStore {
         self.split_at_steps(&keys);
         self.split_persisted();
         let mut freed = 0;
+        let ordering = Instant::now();
         let mut groups = self.reclaim_order(&keys);
+        // The order walks every cached entry under the lock every guest's
+        // fire waits on: one that took long frees more for what it took, up
+        // to eight times the step.
+        let steps = (ordering.elapsed().as_micros() / 4_000).clamp(1, 8) as usize;
+        let want = (self.pool.capacity() as usize / 64).max(1) * steps;
         'passes: for last in [false, true] {
             let mut later = Vec::new();
             for (key, ids) in std::mem::take(&mut groups) {
@@ -594,7 +604,7 @@ impl KvStore {
                         .collect();
                     freed += self.drop_entries(ids, By::Host, epoch);
                 }
-                if freed >= (self.pool.capacity() as usize / 64).max(1) {
+                if freed >= want {
                     break 'passes;
                 }
             }
@@ -1806,8 +1816,20 @@ impl KvStore {
         Ok(self.table.page_token_hashes(ws, index)?)
     }
 
+    /// Counting walks every cache root and every live reader under the lock
+    /// every guest's fire waits on, and the planner, the governor's tick and
+    /// the census each ask: a count stands a second, or fifty times what its
+    /// walk took when that is longer.
     pub fn reclaimable_cache_pages(&self) -> u32 {
-        self.table.unused_cache_lease_pages()
+        if let Some((at, took, pages)) = self.reclaimable.get()
+            && at.elapsed() < std::time::Duration::from_secs(1).max(took * 50)
+        {
+            return pages;
+        }
+        let began = Instant::now();
+        let pages = self.table.unused_cache_lease_pages();
+        self.reclaimable.set(Some((began, began.elapsed(), pages)));
+        pages
     }
 
     pub fn reclaim_quotes(
