@@ -1061,7 +1061,11 @@ fn gmm_spec(
         return None;
     }
     let (p, e) = (fan.pairs(), fan.experts);
-    let tm = gmm_rows(p, e, tuning.moe_gmm_tm);
+    let tm = if elem == Elem::Bf16 {
+        gmm_rows(p, e, tuning.moe_gmm_tm)
+    } else {
+        gmm_rows_whole(p, e, tuning.moe_gmm_tm)
+    };
     let spec = Gmm {
         // Every active expert's rows round up to whole tiles.
         tiles: (p + tm - 1) / tm + e.min(p),
@@ -1090,6 +1094,23 @@ fn gmm_rows(p: i64, e: i64, base: i64) -> i64 {
     let per = p / e.min(p).max(1);
     let mut tm = base.max(16);
     while tm < 128 && tm * 2 <= per {
+        tm *= 2;
+    }
+    tm
+}
+
+/// The rows of one tile over a bank the kernel converts in VMEM (f8, e2m1
+/// codes): enough for an expert's rows with a quarter to spare, up to 256,
+/// so an expert's run is one step. A second tile on the same block issues no
+/// DMA, and the next expert's block starts loading only a step ahead: at a
+/// 640-row prefill of gpt-oss (80 rows an expert, two tiles of 64) the bank
+/// streamed at 1.0 TB/s on v6e.
+fn gmm_rows_whole(p: i64, e: i64, base: i64) -> i64 {
+    let active = e.min(p).max(1);
+    let per = (p + active - 1) / active;
+    let want = per + per / 4;
+    let mut tm = base.max(16);
+    while tm < 256 && tm < want {
         tm *= 2;
     }
     tm
