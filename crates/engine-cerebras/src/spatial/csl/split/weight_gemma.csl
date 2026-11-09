@@ -72,9 +72,22 @@ fn cvw(c: u16) u16 { return cne(c) * (cdc(c) + 1); }
 fn sum_kw() u16 { var n: u16 = 0; var c: u16 = 0; while (c < NC) : (c += 1) { n += ckw(c); } return n; }
 fn sum_vw() u16 { var n: u16 = 0; var c: u16 = 0; while (c < NC) : (c += 1) { n += cvw(c); } return n; }
 fn sum_ne() u16 { var n: u16 = 0; var c: u16 = 0; while (c < NC) : (c += 1) { n += cne(c); } return n; }
-fn koff(c: u16) u16 { var n: u16 = 0; var i: u16 = 0; while (i < c) : (i += 1) { n += ckw(i); } return n; }
-fn voff(c: u16) u16 { var n: u16 = 0; var i: u16 = 0; while (i < c) : (i += 1) { n += cvw(i); } return n; }
-fn eoff(c: u16) u16 { var n: u16 = 0; var i: u16 = 0; while (i < c) : (i += 1) { n += cne(i); } return n; }
+// a cache's offsets: tables built at comptime (the runtime loops over the caches cost ~40 cycles a call, several a layer)
+fn mkoff(comptime k: u16) [NC + 1]u16 {
+  var r = @zeros([NC + 1]u16);
+  var c: u16 = 0;
+  while (c < NC) : (c += 1) {
+    r[c + 1] = r[c] + (if (k == 0) ckw(c) else if (k == 1) cvw(c) else if (k == 2) cne(c) else if (cg(c)) 0 else cne(c));
+  }
+  return r;
+}
+const KOFF = mkoff(0);
+const VOFF = mkoff(1);
+const EOFF = mkoff(2);
+const SOFF = mkoff(3);
+fn koff(c: u16) u16 { return KOFF[c]; }
+fn voff(c: u16) u16 { return VOFF[c]; }
+fn eoff(c: u16) u16 { return EOFF[c]; }
 fn cache_of(l: u16) u16 { return if (SH == 1) (if (isg(l)) 1 else 0) else l; }
 var kc = @zeros([sum_kw() + 1]u16);
 var vc = @zeros([sum_vw() + 1]u16);
@@ -84,7 +97,7 @@ var pv = @zeros([NC * DcG]f32);      // the pending entry's raw v a cache
 var pks = @zeros([NC]f32);           // its |k|^2, |v|^2 partials (this column's)
 var pvs = @zeros([NC]f32);
 var pend = @zeros([NC]u16);
-fn soff(c: u16) u16 { var n: u16 = 0; var i: u16 = 0; while (i < c) : (i += 1) { if (!cg(i)) { n += cne(i); } } return n; }
+fn soff(c: u16) u16 { return SOFF[c]; }
 var spos = @zeros([if (WIN > 0) soff(NC) else 1]f32);   // (WIN > 0) a sliding entry's position + 1 (sliding caches only)
 
 // ---------------------------------------------------------------- buffers
@@ -316,6 +329,10 @@ fn seg_ar(n: u16) void {
 }
 const ex_a = [3]f32 { 12582912.0, -12582912.0, 12582912.0 };
 const ex_c = [4]f32 { 0.16790908575057983, 0.5000435709953308, 0.9999634027481079, 0.9999992847442627 };
+// the scores' clamp from above: ln(65504) less 7e-5, so exp(XHI) rounds to the f16 max (65504) and a larger score's
+// probability is the f16 max as min(exp(s), 65504) gave (the probabilities only reach the PE as f16)
+const XHI: f32 = 11.0898;
+// y[0..n) = exp(buf[0..n)) (buf clamped to [-87, XHI], then the exp's reduced argument)
 fn exp_v(buf: mem1d_dsd, n: u16) void {
   const p = @set_dsd_length(y_d, n);
   const kk = @set_dsd_length(@set_dsd_base_addr(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> w[i] }), @ptrcast([*]u16, &y16)), n);
@@ -323,7 +340,7 @@ fn exp_v(buf: mem1d_dsd, n: u16) void {
   const ph = @increment_dsd_offset(pl, 1, u16);
   @fmaxs(buf, buf, -87.0);
   @fnegs(buf, buf);
-  @fmaxs(buf, buf, -88.0);
+  @fmaxs(buf, buf, -XHI);
   @fnegs(buf, buf);
   @fmuls(p, buf, 1.4426950408889634);
   var c: u16 = 0;
@@ -339,7 +356,6 @@ fn exp_v(buf: mem1d_dsd, n: u16) void {
     @fadds(p, p, ex_c[c]);
   }
   @add16(ph, ph, kk);
-  @fmovs(buf, p);
 }
 // (WSPEC 2) exp_v on the whole sliding ring's scores (Qh NES): fixed-length views, the u16 ones built once at init
 const NFR: u16 = Qh * NES;
@@ -354,11 +370,11 @@ fn fr_init() void {
   fPL = @set_dsd_length(@set_dsd_stride(@set_dsd_base_addr(fK, @ptrcast([*]u16, &y)), 2), NFR);
   fPH = @increment_dsd_offset(fPL, 1, u16);
 }
-// exp_v(fS) then the clamp and the f16 copy into xh (the same ops as the runtime path)
+// exp_v(fS) and the f16 copy into xh (the same ops as the runtime path)
 fn exp_fr() void {
   @fmaxs(fS, fS, -87.0);
   @fnegs(fS, fS);
-  @fmaxs(fS, fS, -88.0);
+  @fmaxs(fS, fS, -XHI);
   @fnegs(fS, fS);
   @fmuls(fP, fS, 1.4426950408889634);
   @fadds(fP, fP, ex_a[0]);
@@ -375,11 +391,7 @@ fn exp_fr() void {
   @fmuls(fP, fP, fS);
   @fadds(fP, fP, ex_c[3]);
   @add16(fPH, fPH, fK);
-  @fmovs(fS, fP);
-  @fnegs(fS, fS);
-  @fmaxs(fS, fS, -65504.0);
-  @fnegs(fS, fS);
-  @fs2h(fH, fS);
+  @fs2h(fH, fP);
 }
 const IHDS: f32 = 1.0 / @as(f32, HDS);
 const IHDG: f32 = 1.0 / @as(f32, HDG);
@@ -392,9 +404,28 @@ fn rsq(v: f32) f32 {
 }
 
 // ---------------------------------------------------------------- caches
+// the step's position: its row (pos % PYW), entry (pos / PYW) and pos + 1 as f32, worked out once a step and from the
+// last position when it is the next one (a u32 divide by a PYW that is not a power of two, E4B's 160, is a ~270-cycle
+// helper call, and u32 -> f32 ~60: a layer used to pay for several)
+var q_pos: u32 = 0xffffffff;
+var q_row: u16 = 0;
+var q_ent: u16 = 0;
+var q_pf: f32 = 0.0;
+fn posq(pos: u32) void {
+  if (pos == q_pos) { return; }
+  if (q_pos != 0xffffffff and pos == q_pos + 1) {
+    q_row += 1;
+    if (q_row == PYW) { q_row = 0; q_ent += 1; }
+  } else {
+    q_row = @as(u16, pos % @as(u32, PYW));
+    q_ent = @as(u16, pos / @as(u32, PYW));
+  }
+  q_pos = pos;
+  q_pf = @as(f32, pos + 1);
+}
 fn cslot(c: u16, pos: u32) u16 {
-  const e = pos / @as(u32, PYW);
-  return if (cg(c)) @as(u16, e) else @as(u16, e % @as(u32, NES));
+  posq(pos);
+  return if (cg(c)) q_ent else q_ent % NES;
 }
 fn cache_reset(c: u16) void {
   var i: u16 = 0;
@@ -418,7 +449,7 @@ fn cache_put(c: u16, pos: u32, k: [*]f32, v: [*]f32, ks: f32, vs: f32) void {
   pks[c] = ks;
   pvs[c] = vs;
   pend[c] = 1;
-  if (WIN > 0 and !cg(c)) { spos[soff(c) + e] = @as(f32, pos + 1); }
+  if (WIN > 0 and !cg(c)) { spos[soff(c) + e] = q_pf; }
 }
 fn cache_fin(c: u16, pos: u32, kss: f32, vss: f32, ihd: f32) void {
   const e = cslot(c, pos);
@@ -443,7 +474,8 @@ fn kv_post() void {
 }
 var chk = @zeros([1]f32);
 fn kv_take(pos: u32, s: u32) void {
-  const want = @as(f32, pos + 1);
+  posq(pos);
+  const want = q_pf;
   const cd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> chk[i] });
   const sd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> kvb[@as(i16, 16) + i] });
   @fmovs(cd, sd);
@@ -457,7 +489,7 @@ fn kv_take(pos: u32, s: u32) void {
     if (DIAG != 0) { return; }
   }
   if (pos == 0) { cache_reset(0); cache_reset(1); }
-  if (pos % @as(u32, PYW) == @as(u32, myrow)) {
+  if (q_row == myrow) {
     cache_put(0, pos, @ptrcast([*]f32, &kvb[0]), @ptrcast([*]f32, &kvb[DcS]), kvb[2 * DcS], kvb[2 * DcS + 1]);
     const g0 = 2 * DcS + 2;
     cache_put(1, pos, @ptrcast([*]f32, &kvb[g0]), @ptrcast([*]f32, &kvb[g0 + DcG]), kvb[g0 + 2 * DcG], kvb[g0 + 2 * DcG + 1]);
@@ -486,7 +518,8 @@ fn attm(l: u16, pos_out: *u32, comptime g: u16) void {
   const pos = @as(u32, ab[QD + 2 * dc]);
   pos_out.* = pos;
   s_att = ab[QD + 2 * dc + Qh + 3];
-  const mine = (pos % @as(u32, PYW)) == @as(u32, myrow);
+  posq(pos);
+  const mine = q_row == myrow;
   if (pos == 0) {
     if (SH == 0) { cache_reset(c); }
     var hh: u16 = 0;
@@ -496,7 +529,7 @@ fn attm(l: u16, pos_out: *u32, comptime g: u16) void {
     cache_put(c, pos, @ptrcast([*]f32, &ab[QD]), @ptrcast([*]f32, &ab[QD + dc]), ab[QD + 2 * dc + 1 + Qh], ab[QD + 2 * dc + 2 + Qh]);
   }
   @fs2h(@set_dsd_length(xh_d, QD), @set_dsd_length(ab_d, QD));
-  const eseen = pos / @as(u32, PYW) + 1;
+  const eseen = @as(u32, q_ent) + 1;
   // WSPEC 2, a sliding layer: the whole ring every step (NEl a constant), the entries not yet written masked below
   const FR: bool = (WSPEC == 2 and g == 0 and WIN == 0);
   const nseen: u16 = if (eseen < @as(u32, ne)) @as(u16, eseen) else ne;
@@ -532,21 +565,18 @@ fn attm(l: u16, pos_out: *u32, comptime g: u16) void {
       if (FR and nseen < ne) {   // (FR) entries not yet written score -1e30: exp -> 0, f16 0: they add exact zeros
         @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl + nseen), f32), ne - nseen), -1.0e30);
       }
-      if (WIN > 0 and !cg(c)) {   // entries out of the window (or never written) score -1e30: exp -> 0
-        var e: u16 = 0;
-        while (e < NEl) : (e += 1) {
-          const sp = spos[soff(c) + e];
-          if (sp == 0.0 or @as(f32, pos + 1) - sp >= @as(f32, WIN)) { sx[h * NEl + e] = -1.0e30; }
-        }
+    }
+    if (WIN > 0 and !cg(c)) {   // entries out of the window (or never written) score -1e30 in every head: exp -> 0
+      const so = soff(c);
+      var e: u16 = 0;
+      while (e < NEl) : (e += 1) {
+        const sp = spos[so + e];
+        if (sp == 0.0 or q_pf - sp >= @as(f32, WIN)) { h = 0; while (h < Qh) : (h += 1) { sx[h * NEl + e] = -1.0e30; } }
       }
     }
     if (FR) { exp_fr(); } else {
       exp_v(@set_dsd_length(sx_d, Qh * NEl), Qh * NEl);
-      const sp = @set_dsd_length(sx_d, Qh * NEl);
-      @fnegs(sp, sp);
-      @fmaxs(sp, sp, -65504.0);
-      @fnegs(sp, sp);
-      @fs2h(@set_dsd_length(xh_d, Qh * NEl), sp);
+      @fs2h(@set_dsd_length(xh_d, Qh * NEl), @set_dsd_length(y_d, Qh * NEl));
     }
     h = 0;
     while (h < Qh) : (h += 1) { kvmv(@ptrcast([*]u16, &vc[1 + vb]), NEl, dc + 1, h * NEl, h * (dc + 1)); }
