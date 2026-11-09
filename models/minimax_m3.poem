@@ -12,6 +12,10 @@ def m3(id, **kwargs):
 MODELS = [
     m3("minimax-m3", layers = 60),
     m3("minimax-m3-mini", mini = True, layers = 6),
+    # MiniMax-M3.1-Flash read out to bf16 (the ROCm and TPU rows): its own model, since it turns its
+    # rope at 1e7 where M3 turns at 5e6 (its MXFP8 + NVFP4 rows stay with M3's, at 1e7 there)
+    m3("minimax-m31-flash", layers = 60),
+    m3("minimax-m31-flash-mini", mini = True, layers = 6),
 ]
 
 BF = dtype.bf16
@@ -32,6 +36,8 @@ DEPLOYMENTS = [
     deployment("minimax-m3-mini", weights = U4, kv = BF),
     deployment("minimax-m3-mini", weights = MX8, kv = BF),
     deployment("minimax-m3-mini", weights = [MX8, dtype.nvfp4a4], kv = BF),
+    deployment("minimax-m31-flash", weights = BF, kv = BF),
+    deployment("minimax-m31-flash-mini", weights = BF, kv = BF),
 ]
 
 # The weights of MiniMax-M3's language model: GQA with plus-one q/k norms and
@@ -65,6 +71,8 @@ def dims(layers = 60, experts = 128, theta = 5000000.0):
 DIMS = {
     "minimax-m3": dims(),
     "minimax-m3-mini": dims(layers = 6, experts = 8),
+    "minimax-m31-flash": dims(theta = 10000000.0),
+    "minimax-m31-flash-mini": dims(layers = 6, experts = 8, theta = 10000000.0),
 }
 
 NV4 = dtype.nvfp4a4
@@ -209,6 +217,8 @@ def formats(m):
         "huggingface",
         recognizes = lambda c: has("language_model.model.embed_tokens.weight"),
         read = lambda reads: read(m, reads),
+        # a release turning its rope at another base is another model's
+        states = [config("text_config.rope_theta", m.layers[0].attn.theta)],
     )]
 
 def read(m, reads):
