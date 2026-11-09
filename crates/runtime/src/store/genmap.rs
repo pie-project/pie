@@ -14,6 +14,11 @@ impl<M> GenKey<M> {
             _marker: PhantomData,
         }
     }
+
+    /// One number for the key, distinct for every key a map hands out.
+    pub fn to_bits(self) -> u64 {
+        (u64::from(self.generation) << 32) | u64::from(self.index)
+    }
 }
 
 impl<M> Clone for GenKey<M> {

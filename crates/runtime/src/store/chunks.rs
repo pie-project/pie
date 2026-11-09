@@ -14,7 +14,9 @@
 //! chunks past it. A held chunk past that limit stays committed until it is
 //! let go; then its segment is released.
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::policy::pressure::{Bytes, Meter, Tier};
 use crate::store::registry;
@@ -24,6 +26,7 @@ use ::engine::chunk::{
     SlotKind,
 };
 
+use super::kv::page_table::WorkingSetId;
 use super::pool::PoolId;
 use super::slots::{
     Demand, Holder, SegmentState, ShapeKind, Slot, SlotPool, SlotPoolFacts, SlotShape,
@@ -259,6 +262,118 @@ impl<I: PoolId> ShapePool<I> {
 
     pub fn pool(&self) -> &SlotPool {
         &self.slots
+    }
+}
+
+/// Where a lane's state rides when the runtime binds none of its own: a
+/// fixed slot of the seat shape, which takes no memory, held by the lane's
+/// working set. A working set holds one for each lane it fires at once;
+/// lane `i` of its group rides its `i`th.
+#[derive(Debug)]
+pub struct Seats {
+    slots: SlotPool,
+    capacity: u32,
+    held: HashMap<WorkingSetId, Vec<Slot>>,
+    /// A working set let its seats go: a fire short of seats looks again.
+    freed: Arc<tokio::sync::Notify>,
+}
+
+/// The seats a model without state slots holds at once at most.
+const SEATS_UNBOUNDED: u32 = 1 << 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeatsShort {
+    pub need: u32,
+    pub have: u32,
+    pub capacity: u32,
+}
+
+impl std::fmt::Display for SeatsShort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "this fire seats {} more sequence(s) than the pools have room for \
+             ({} seat(s) free of the {} the state slots give)",
+            self.need, self.have, self.capacity
+        )
+    }
+}
+
+impl Seats {
+    /// As many seats as there are state slots; a model without any seats
+    /// as many lanes as it fires.
+    pub fn new(state_slots: u32) -> Self {
+        let capacity = if state_slots == 0 {
+            SEATS_UNBOUNDED
+        } else {
+            state_slots
+        };
+        Self {
+            slots: SlotPool::new(SlotPoolFacts {
+                chunk_bytes: 0,
+                total_chunks: capacity,
+                segment_chunks: capacity.max(1),
+                committed_segments: u32::from(capacity > 0),
+                reserved_chunks: 0,
+                shapes: vec![SlotShape {
+                    kind: ShapeKind::Fixed,
+                    slot_bytes: 0,
+                    slots_per_chunk: 1,
+                }],
+                act_chunks: Vec::new(),
+            }),
+            capacity: state_slots,
+            held: HashMap::new(),
+            freed: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// The seats of `ws`'s first `lanes` lanes, taking what it lacks.
+    pub fn seats(&mut self, ws: WorkingSetId, lanes: usize) -> Result<Vec<u32>, SeatsShort> {
+        let lanes = u32::try_from(lanes).unwrap_or(u32::MAX);
+        let have = self.held.get(&ws).map_or(0, |held| held.len() as u32);
+        if have < lanes {
+            let need = lanes - have;
+            let fresh = self
+                .slots
+                .acquire(Holder::WorkingSet(ws.to_bits()), 0, u64::from(need))
+                .map_err(|_| SeatsShort {
+                    need,
+                    have: self.slots.available(0) as u32,
+                    capacity: self.capacity,
+                })?;
+            self.held.entry(ws).or_default().extend(fresh);
+        }
+        Ok(self.held.get(&ws).map_or_else(Vec::new, |held| {
+            held[..lanes as usize]
+                .iter()
+                .map(|slot| slot.chunk)
+                .collect()
+        }))
+    }
+
+    /// `ws` lets its seats go.
+    pub fn release(&mut self, ws: WorkingSetId) {
+        if let Some(held) = self.held.remove(&ws) {
+            self.slots
+                .release(Holder::WorkingSet(ws.to_bits()), &held, 0);
+            self.freed.notify_waiters();
+        }
+    }
+
+    /// Fires once a working set lets its seats go.
+    pub fn freed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.freed)
+    }
+
+    /// Whether `need` seats could ever stand free at once.
+    pub fn could_seat(&self, need: u32) -> bool {
+        need <= self.slots.total_chunks()
+    }
+
+    #[cfg(test)]
+    pub fn available(&self) -> u32 {
+        self.slots.available(0) as u32
     }
 }
 
@@ -533,6 +648,48 @@ mod tests {
         pool.release_reserved(ids);
         assert_eq!(pool.demand(), Demand::default());
         assert_eq!(pool.available(), 8);
+    }
+
+    fn two_working_sets() -> (WorkingSetId, WorkingSetId) {
+        let mut kv = super::super::kv::KvStore::new(8, [0; 32]);
+        (kv.create_working_set(), kv.create_working_set())
+    }
+
+    #[test]
+    fn two_working_sets_never_share_a_seat_and_a_released_one_is_reissued() {
+        let (a, b) = two_working_sets();
+        let mut seats = Seats::new(2);
+        let first = seats.seats(a, 1).unwrap();
+        assert_eq!(seats.seats(a, 1).unwrap(), first, "a set keeps its seat");
+        let second = seats.seats(b, 1).unwrap();
+        assert_ne!(first, second, "two live sequences, two seats");
+        assert_eq!(seats.available(), 0);
+        seats.release(a);
+        seats.release(a);
+        assert_eq!(seats.available(), 1, "released once, returned once");
+        assert_eq!(seats.seats(b, 2).unwrap(), vec![second[0], first[0]]);
+    }
+
+    #[test]
+    fn a_fire_wider_than_the_seats_is_refused_and_takes_nothing() {
+        let (a, b) = two_working_sets();
+        let mut seats = Seats::new(2);
+        seats.seats(a, 1).unwrap();
+        let refusal = seats.seats(b, 3).unwrap_err();
+        assert_eq!(
+            refusal,
+            SeatsShort {
+                need: 3,
+                have: 1,
+                capacity: 2
+            }
+        );
+        assert_eq!(seats.available(), 1, "a refused ask seats nothing");
+        assert!(!seats.could_seat(3));
+        assert!(
+            Seats::new(0).could_seat(64),
+            "no state slots: no cap to speak of"
+        );
     }
 
     #[test]

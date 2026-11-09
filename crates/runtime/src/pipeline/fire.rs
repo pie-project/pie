@@ -1707,11 +1707,13 @@ pub(crate) fn lane_groups(ids: &[crate::store::kv::page_table::WorkingSetId]) ->
     groups
 }
 
+/// Each lane rides a seat its working set holds: lane `i` of a group its
+/// working set's `i`th.
 pub(crate) fn stamp_lane_slots(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
     groups: &LaneGroups,
-) -> Result<(), crate::store::seat::SeatError> {
+) -> Result<(), crate::store::chunks::SeatsShort> {
     for (ws, lanes) in groups {
         let seats = stores.seats.lock().unwrap().seats(*ws, lanes.len())?;
         for (&lane, &seat) in lanes.iter().zip(&seats) {
@@ -1732,19 +1734,16 @@ pub(crate) async fn seat_lane_slots(
     stores: &crate::store::registry::Stores,
     groups: &LaneGroups,
 ) -> Result<(), String> {
-    use crate::store::seat::SeatError;
     let deadline = crate::rt::time::Instant::now() + SEAT_WAIT;
+    let freed = stores.seats.lock().unwrap().freed();
     loop {
-        let mut freed = Box::pin(stores.seats_freed.notified());
+        let mut freed = Box::pin(freed.notified());
         freed.as_mut().enable();
         let refusal = match stamp_lane_slots(req, stores, groups) {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
-        let fits = match refusal {
-            SeatError::Exhausted { need, capacity, .. } => capacity != 0 && need <= capacity,
-        };
-        if !fits {
+        if !stores.seats.lock().unwrap().could_seat(refusal.need) {
             return Err(format!(
                 "pipeline: seating this fire's lanes: {refusal}; no release can seat it"
             ));

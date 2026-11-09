@@ -55,7 +55,6 @@ impl KvLifecycle {
             kv.retire_idle();
         });
         stores.seats.lock().unwrap().release(self.id);
-        stores.seats_freed.notify_waiters();
         let departure = self.departure.lock().unwrap().take();
         drop(departure);
         if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
@@ -240,7 +239,6 @@ impl KvWorkingSet {
         drop(self.lifecycle.departure.lock().unwrap().take());
         let stores = crate::store::registry::get(self.model, self.engine);
         stores.seats.lock().unwrap().release(self.id);
-        stores.seats_freed.notify_waiters();
     }
 
     /// Holds `departure` until this set is released: its owner's pages are

@@ -1,10 +1,9 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
-use super::chunks::StorePools;
+use super::chunks::{Seats, StorePools};
 use super::kv::KvStore;
 use super::rs::RsStore;
-use super::seat::SeatBook;
 
 static KV_TAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -40,8 +39,7 @@ pub fn with_kv_lock<T>(
 pub struct Stores {
     pub kv: Arc<parking_lot::Mutex<KvStore>>,
     pub rs: Arc<Mutex<RsStore>>,
-    pub seats: Arc<Mutex<SeatBook>>,
-    pub seats_freed: Arc<tokio::sync::Notify>,
+    pub seats: Arc<Mutex<Seats>>,
     pub kv_page_size: u32,
     pub context_pages: u64,
 }
@@ -164,8 +162,7 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
             Some(Stores {
                 kv,
                 rs: Arc::new(Mutex::new(rs)),
-                seats: Arc::new(Mutex::new(SeatBook::new(slots))),
-                seats_freed: Arc::new(tokio::sync::Notify::new()),
+                seats: Arc::new(Mutex::new(Seats::new(slots))),
                 kv_page_size,
                 context_pages: context_pages(max_context, kv_page_size),
             })
@@ -248,8 +245,7 @@ mod tests {
                 0,
                 0,
             ))),
-            seats: Arc::new(Mutex::new(SeatBook::new(num_slots as u32))),
-            seats_freed: Arc::new(tokio::sync::Notify::new()),
+            seats: Arc::new(Mutex::new(Seats::new(num_slots as u32))),
             kv_page_size,
             context_pages: context_pages(max_context, kv_page_size),
         });

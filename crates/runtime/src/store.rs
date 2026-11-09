@@ -5,7 +5,6 @@ pub(crate) mod kv;
 pub(crate) mod pool;
 pub(crate) mod registry;
 pub(crate) mod rs;
-pub(crate) mod seat;
 pub mod segments;
 pub mod slots;
 pub mod weights;
