@@ -2001,7 +2001,6 @@ pub fn attend(
                 && rule.rel.is_none()
                 && rule.bits.is_none()
                 && rule.rbias.is_none()
-                && rule.window.is_none()
                 && rs.enabled.is_none()
                 && !matches!(planes, Planes::Paged { latent: true, .. })
                 && f.elem(keys) == Elem::Bf16

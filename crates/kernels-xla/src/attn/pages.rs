@@ -4,7 +4,8 @@
 //! at 256 lanes three times the keys' own bytes, all rows paying for the
 //! longest. Here each row copies only the pool pages its `[lo, hi)` range
 //! covers into VMEM (a DMA a page), the next row's copies in flight while
-//! this row computes, and walks them in chunks with an online softmax.
+//! this row computes, and walks them in chunks with an online softmax (a
+//! sliding window's row reads only the pages its window covers).
 //!
 //! A row's scores come as `[keys, q heads]`: the key chunk (all kv heads,
 //! `[c, kvh·d]`) times a block-diagonal query (`[qh, kvh·d]`, each query
