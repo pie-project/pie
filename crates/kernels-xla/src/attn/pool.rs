@@ -11,7 +11,7 @@ use dtype::Dtype;
 use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
-use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero, take};
+use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_at_most, nonzero, take};
 use crate::tensor::{KvPool, Landing, Operand, Stored};
 
 /// Keys per step of the pooled readers' flash loop.
@@ -105,7 +105,7 @@ pub(crate) fn compact_view(
     width: u32,
     row: u32,
     page_size: i32,
-) -> Result<Option<(Val, i64)>, Error> {
+) -> Result<Option<(Val, i64, i64)>, Error> {
     if width == 0 || width >= row {
         return Ok(None);
     }
@@ -121,8 +121,55 @@ pub(crate) fn compact_view(
         ));
     }
     let div = i64::from(div);
-    let t = f.reshape(table, &[cells / div, i64::from(row)])?;
-    Ok(Some((t, ps / div)))
+    Ok(Some((table, ps / div, div)))
+}
+
+/// The entries at view cells `cell` (`[m]`) of a compact pool's `[cells,
+/// width]` plane, `div` rows an entry: `[m, div · width]`, gathered row by
+/// row. A `[cells / div, div · width]` view of the plane is a relayout of
+/// all of it on a TPU, in every layer, every fire.
+pub(crate) fn entry_rows(f: &mut Func, table: Val, cell: Val, div: i64) -> Built<Val> {
+    if div == 1 {
+        return f.take_rows(table, cell);
+    }
+    let m = f.dims(cell)[0];
+    let (cells, w) = (f.dims(table)[0], f.dims(table)[1]);
+    if m * div > cells / 4 {
+        // A prompt's reading touches most of the plane: one relayout to the
+        // entry's width costs less than four times the row gathers.
+        let t = f.reshape(table, &[cells / div, div * w])?;
+        return f.take_rows(t, cell);
+    }
+    let c = f.broadcast(cell, &[m, div], &[0])?;
+    let dv = f.like_i(c, div);
+    let c = f.mul(c, dv)?;
+    let k = f.iota(Elem::I32, &[m, div], 1);
+    let c = f.add(c, k)?;
+    let c = f.reshape(c, &[m * div])?;
+    let got = f.take_rows(table, c)?;
+    f.reshape(got, &[m, div * w])
+}
+
+/// Files `rows` (`[n, div · width]`) at view cells `at` of a compact
+/// pool's `[cells, width]` plane, row by row; a cell outside the view drops.
+fn put_entries(f: &mut Func, table: Val, at: Val, rows: Val, div: i64) -> Built<Val> {
+    let n = f.dims(at)[0];
+    let (cells, w) = (f.dims(table)[0], f.dims(table)[1]);
+    let a = f.broadcast(at, &[n, div], &[0])?;
+    let lo = cmp_i(f, Cmp::Ge, a, 0)?;
+    let hi = cmp_i(f, Cmp::Lt, a, cells / div)?;
+    let inside = f.and(lo, hi)?;
+    let dv = f.like_i(a, div);
+    let c = f.mul(a, dv)?;
+    let k = f.iota(Elem::I32, &[n, div], 1);
+    let c = f.add(c, k)?;
+    let drop = f.like_i(c, DROP);
+    let c = f.select(inside, c, drop)?;
+    let c = f.reshape(c, &[n * div])?;
+    let elem = f.elem(table);
+    let rows = f.convert(rows, elem);
+    let rows = f.reshape(rows, &[n * div, w])?;
+    f.put_rows(table, c, rows, Combine::Set)
 }
 
 fn long_enough(op: &'static str, what: &str, t: impl Stored, n: u32) -> Result<(), Error> {
@@ -500,18 +547,16 @@ pub fn kv_append(
     let bpos = flat_i32(f, boundary_pos)?;
     let breq = flat_i32(f, boundary_req)?;
     // A compact pool files the entry at its index, `page_size / div` a page.
-    if let Some((table, ps)) =
+    if let Some((table, ps, div)) =
         compact_view(f, OP, keys.val, keys.width, entries.width, pool.page_size)?
     {
-        let div = i64::from(entries.width / keys.width);
         let dv = f.like_i(bpos, div);
         let c = f.div(bpos, dv)?;
         let neg = cmp_i(f, Cmp::Lt, bpos, 0)?;
         let none = f.like_i(bpos, -1);
         let c = f.select(neg, none, c)?;
         let at = boundary_cell(f, indices, indptr, c, breq, n, ps)?;
-        let y = put_cols(f, table, at, entries.val)?;
-        return Ok(f.reshape(y, &[i64::from(keys.rows), i64::from(keys.width)])?);
+        return Ok(put_entries(f, table, at, entries.val, div)?);
     }
     if keys.width < entries.width {
         return Err(refuse(
@@ -567,9 +612,10 @@ fn pooled_flash(
     nk: i64,
     ratio: i64,
     ps: i64,
-    compact: bool,
+    div: i64,
     scale: f32,
 ) -> Built<(Val, Val)> {
+    let compact = div > 1;
     let qd = f.dims(q).to_vec();
     let (r, h, d) = (qd[0], qd[1], qd[2]);
     let kb = KEY_BLOCK.min(nk.max(1));
@@ -596,9 +642,10 @@ fn pooled_flash(
     let m0 = f.const_f(Elem::F32, f64::NEG_INFINITY, &[r, h]);
     let l0 = f.const_f(Elem::F32, 0.0, &[r, h]);
     let a0 = f.const_f(Elem::F32, 0.0, &[r, h, d]);
-    let out = loop_upto(
+    let out = loop_at_most(
         f,
         count,
+        nb,
         &[m0, l0, a0],
         &[q, table, indices, indptr, req, visible, sel],
         |f, b, cr, inv| {
@@ -633,7 +680,7 @@ fn pooled_flash(
             let rq = f.broadcast(req, &[r, kb], &[0])?;
             let cell = cell_of(f, indices, indptr, rq, pos, ps)?;
             let cell = f.reshape(cell, &[r * kb])?;
-            let k = f.take_rows(table, cell)?;
+            let k = entry_rows(f, table, cell, div)?;
             let k = f.slice_axis(k, 1, 0, d)?;
             let k = f.reshape(k, &[r, kb, d])?;
             let s = f.dot_general(q, k, &[0], &[0], &[2], &[2], Elem::F32)?;
@@ -869,7 +916,7 @@ pub fn lse(
     let qv = call.q.val;
     let pos = flat_i32(f, call.positions)?;
     let req = flat_i32(f, call.request_of_token)?;
-    let (table, ps, compact) = match compact_view(
+    let (table, ps, div) = match compact_view(
         f,
         call.op,
         planes.keys.val,
@@ -877,8 +924,8 @@ pub fn lse(
         call.head_dim,
         entries.page_size,
     )? {
-        Some((t, ps)) => (t, ps, true),
-        None => (planes.keys.val, ps, false),
+        Some((t, ps, div)) => (t, ps, div),
+        None => (planes.keys.val, ps, 1),
     };
     let sel = match call.selection {
         Some((s, _)) => {
@@ -911,7 +958,7 @@ pub fn lse(
         nk,
         rt,
         ps,
-        compact,
+        div,
         call.sm_scale,
     )?;
     Ok((ov, lv))

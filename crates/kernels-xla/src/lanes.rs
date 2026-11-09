@@ -167,6 +167,25 @@ pub(crate) fn loop_upto(
     Ok(out[2..2 + nc].to_vec())
 }
 
+/// [`loop_upto`] with at most `most` steps: one step runs inline, as step 0,
+/// whatever `count` (a body that steps over nothing must leave its carry as
+/// it was). A table a loop reads is laid out again for the loop on a TPU (a
+/// copy into VMEM of the whole of it, every fire), which one step skips.
+pub(crate) fn loop_at_most(
+    f: &mut Func,
+    count: Val,
+    most: i64,
+    carried: &[Val],
+    invariant: &[Val],
+    body: impl FnOnce(&mut Func, Val, &[Val], &[Val]) -> Built<Vec<Val>>,
+) -> Built<Vec<Val>> {
+    if most == 1 {
+        let zero = ci(f, 0);
+        return body(f, zero, carried, invariant);
+    }
+    loop_upto(f, count, carried, invariant, body)
+}
+
 /// Scatters `rows` (`[lanes, stride]`) over the slab at `slot`, dropping the
 /// lanes `write` is false for.
 pub(crate) fn land_rows(f: &mut Func, slab: Val, slot: Val, write: Val, rows: Val) -> Built<Val> {
