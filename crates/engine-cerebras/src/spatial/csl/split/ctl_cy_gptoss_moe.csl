@@ -46,9 +46,19 @@ const HID: f32 = @as(f32, HR);
 var t = @zeros([TN]f32);
 var u = @zeros([mx(TK * Ic, 2 * TK)]f32);
 var g = @zeros([NEX]f32);
+var h = @zeros([NEX]f32);
+var t1 = @zeros([NEX / 2]f32);
+var t2 = @zeros([NEX / 4]f32);
+var t3 = @zeros([NEX / 8]f32);
 const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TN} -> t[i] });
 const u_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{mx(TK * Ic, 2 * TK)} -> u[i] });
 const g_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NEX} -> g[i] });
+const h_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NEX} -> h[i] });
+// d[0..n) = max(s[2 j], s[2 j + 1])
+fn pmax(d: [*]f32, s: [*]f32, n: u16) void {
+  const sd = @set_dsd_stride(@set_dsd_length(@set_dsd_base_addr(h_d, s), n), 2);
+  @fmaxs(@set_dsd_length(@set_dsd_base_addr(h_d, d), n), sd, @increment_dsd_offset(sd, 1, f32));
+}
 fn tv(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(t_d, @as(i16, o), f32), n); }
 fn uv(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(u_d, @as(i16, o), f32), n); }
 var rb = @zeros([K]f32);
@@ -232,19 +242,24 @@ fn router(l: u16) void {
   @fmovs(g_d, 0.0);
   g[rout] = t[0] * rr + rb[l];
   seg_ar(NEX);
-  // top TK in one pass (strictly greater moves up: ties keep the lower expert first)
+  // top TK: TK rounds of the maximum (pairwise maxima: blocks of 2, 4, 8, then over the NEX / 8 blocks), its
+  // first block, the first word in it holding it (ties: the lower expert first, as a stable descending sort),
+  // that word then out (-3.4e38)
+  @fmovs(h_d, g_d);
   var k: u16 = 0;
-  while (k < TK) : (k += 1) { sel[k] = 0xffff; }
-  var e: u16 = 0;
-  while (e < NEX) : (e += 1) {
-    const v = g[e];
-    var pos: u16 = TK;
-    while (pos > 0 and (sel[pos - 1] == 0xffff or v > g[sel[pos - 1]])) : (pos -= 1) {}
-    if (pos < TK) {
-      var j: u16 = TK - 1;
-      while (j > pos) : (j -= 1) { sel[j] = sel[j - 1]; }
-      sel[pos] = e;
-    }
+  while (k < TK) : (k += 1) {
+    pmax(&t1, &h, NEX / 2);
+    pmax(&t2, &t1, NEX / 4);
+    pmax(&t3, &t2, NEX / 8);
+    var m: f32 = t3[0];
+    var b: u16 = 1;
+    while (b < NEX / 8) : (b += 1) { if (t3[b] > m) { m = t3[b]; } }
+    b = 0;
+    while (t3[b] != m) : (b += 1) {}
+    var i: u16 = b * 8;
+    while (h[i] != m) : (i += 1) {}
+    sel[k] = i;
+    h[i] = -3.4e38;
   }
   const m0 = g[sel[0]];
   var sum: f32 = 0.0;

@@ -206,13 +206,15 @@ fn mv(off: u16, R: u16, N: u16) void {
   @fh2s(yv(0, N), yh);
 }
 // y[yo..yo+N) = A x with f32 accumulation (the KV matvecs), A at p (R rows of N), x = xh[xo..xo+R)
-fn kvmv(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
+
+// y[yo..yo+N) = A x with f32 accumulation, A at p (R rows of N), x the DSD xv (R f16 words)
+fn mvx(p: [*]u16, R: u16, N: u16, xv: mem1d_dsd, yo: u16) void {
   const a = @set_dsd_length(@set_dsd_base_addr(a_d, p), N);
   @fmovs(yv(yo, N), 0.0);
   @load_to_dsr(mv_dest, yv(yo, N), .{ .save_address = false });
   @load_to_dsr(mv_src0, yv(yo, N), .{ .save_address = false });
   @load_to_dsr(mv_src1, a, .{ .save_address = true });
-  @map(mvs_step, @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, xo), @fp16()), R));
+  @map(mvs_step, xv);
 }
 
 // ---------------------------------------------------------------- attention
@@ -225,12 +227,15 @@ fn qmode(m: u16) void {
     iqc(6, if (role_s == 4) rcfg[RQ + 14] else rcfg[RQ + 16]);
   }
 }
-const KCW: u16 = Dc * NE;          // full layers' keys, dim-major [d][e]
+const KCW: u16 = Dc * NE;          // full layers' keys, entry-major [e][d]
 const VCW: u16 = NE * (Dc + 1);    // values, entry-major [e][d | 1]
 var kc = @zeros([NLA * KCW + NLS * Dc + 1]u16);
 var vc = @zeros([NLA * VCW + NLS * (Dc + 1) + 1]u16);
 var spos = @zeros([if (NLS > 0) NLS else 1]u16);   // sliding: 1 + the position its entry holds (0: none)
 var mref = @zeros([K * Qh]f32);
+var qt = @zeros([Dc * Qh]@fp16());   // q transposed [d][h] (the scores' matrix: one matvec a live entry)
+const qt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc * Qh} -> qt[i] });
+const kc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> kc[i] });
 const QD: u16 = Qh * Dc;
 const AB: u16 = QD + 2 * Dc + 1;
 var ab = @zeros([AB]f32);
@@ -292,7 +297,6 @@ fn att_mix(l: u16, full: bool, a: u16, s: u16) void {
   var kb: u16 = 0;
   var vb: u16 = 0;
   var e0: u16 = 0;
-  var ne: u16 = 1;
   var nel: u16 = 0;
   if (pos == 0) {   // a new sequence: no live entries, the log-sum-exp reference restarts
     var hh: u16 = 0;
@@ -300,7 +304,7 @@ fn att_mix(l: u16, full: bool, a: u16, s: u16) void {
     if (!full) { spos[s] = 0; }
   }
   if (full) {
-    kb = a * KCW; vb = a * VCW; e0 = pos / PYW; ne = NE;
+    kb = a * KCW; vb = a * VCW; e0 = pos / PYW;
     nel = if (e0 + 1 < NE) e0 + 1 else NE;
     if (pos == 0) { @mov16(@set_dsd_length(@set_dsd_base_addr(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[i] }), @ptrcast([*]u16, &vc[1 + vb])), VCW), @as(u16, 0)); }
   } else {
@@ -312,7 +316,7 @@ fn att_mix(l: u16, full: bool, a: u16, s: u16) void {
     const ee = if (full) e0 else 0;
     var d: u16 = 0;
     while (d < Dc) : (d += 1) {
-      kc[1 + kb + d * ne + ee] = @bitcast(u16, @as(@fp16(), ab[QD + d]));
+      kc[1 + kb + ee * Dc + d] = @bitcast(u16, @as(@fp16(), ab[QD + d]));
       vc[1 + vb + ee * (Dc + 1) + d] = @bitcast(u16, @as(@fp16(), ab[QD + Dc + d]));
     }
     vc[1 + vb + ee * (Dc + 1) + Dc] = 0x3c00;   // 1.0: the values matvec's last output is the softmax sum
@@ -322,16 +326,23 @@ fn att_mix(l: u16, full: bool, a: u16, s: u16) void {
   while (apass < 8) : (apass += 1) {
     var h: u16 = 0;
     if (nel > 0) {
-      @fs2h(@set_dsd_length(xh_d, QD), @set_dsd_length(ab_d, QD));
+      // qt[d][h] = q[h][d] (f16), then the live entries' scores [e][h]: x = the entry's key, A = qt
       while (h < Qh) : (h += 1) {
-        kvmv(@ptrcast([*]u16, &kc[1 + kb]), Dc, ne, h * Dc, h * ne);
-        @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * nel), f32), nel), yv(h * ne, nel));
+        @fs2h(@set_dsd_stride(@set_dsd_length(@increment_dsd_offset(qt_d, @as(i16, h), @fp16()), Dc), Qh),
+              @set_dsd_length(@increment_dsd_offset(ab_d, @as(i16, h * Dc), f32), Dc));
       }
+      var e: u16 = 0;
+      while (e < nel) : (e += 1) {
+        const xk = @set_dsd_base_addr(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> xh[i] }), @ptrcast([*]@fp16(), &kc[1 + kb + e * Dc]));
+        mvx(@ptrcast([*]u16, &qt), Dc, Qh, xk, e * Qh);
+      }
+      @fmovs(@set_dsd_length(sx_d, nsl), yv(0, nsl));
       if (role_s != 5) { seg_ar(nsl); }
-      h = 0;
-      while (h < Qh) : (h += 1) {
-        const sh = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * nel), f32), nel);
-        @fsubs(sh, sh, mref[l * Qh + h]);
+      const mr = @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{K * Qh} -> mref[i] }), @as(i16, l * Qh), f32), Qh);
+      e = 0;
+      while (e < nel) : (e += 1) {
+        const se = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, e * Qh), f32), Qh);
+        @fsubs(se, se, mr);
       }
       const sp = @set_dsd_length(sx_d, nsl);
       exp_v(sp, nsl);
@@ -340,7 +351,10 @@ fn att_mix(l: u16, full: bool, a: u16, s: u16) void {
       @fnegs(sp, sp);
       @fs2h(@set_dsd_length(xh_d, nsl), sp);
       h = 0;
-      while (h < Qh) : (h += 1) { kvmv(@ptrcast([*]u16, &vc[1 + vb]), nel, Dc + 1, h * nel, h * (Dc + 1)); }
+      while (h < Qh) : (h += 1) {
+        const xp = @set_dsd_stride(@set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, h), @fp16()), nel), Qh);
+        mvx(@ptrcast([*]u16, &vc[1 + vb]), nel, Dc + 1, xp, h * (Dc + 1));
+      }
     } else {
       @fmovs(yv(0, Qh * (Dc + 1)), 0.0);
     }

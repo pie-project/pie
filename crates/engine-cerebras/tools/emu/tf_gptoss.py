@@ -217,6 +217,7 @@ class Emu:
             top = np.argsort(-lg, kind="stable")[:4]
             tv = lg[top]; pe = np.exp(tv - tv.max()); pe = (pe / pe.sum()).astype(f32)
             st["route"].append(top.tolist())
+            if st.get("rlog") is not None: st["rlog"].append(lg.astype(f32).view(np.uint32).tolist())
             # ---- experts
             gub = w["mlp.experts.gate_up_proj_bias"]; db = w["mlp.experts.down_proj_bias"]
             out = np.zeros(y.size, f32)
@@ -260,6 +261,7 @@ def main():
     ap.add_argument("model"); ap.add_argument("golden"); ap.add_argument("modes"); ap.add_argument("n", type=int); ap.add_argument("out")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--geo", default="full")
+    ap.add_argument("--rlog", default=None, help="write every router decision's logits (f32 bits) and route (json)")
     ap.add_argument("--trace", default=None, help="write every position's x after each layer (json)")
     a = ap.parse_args()
     global HC, PY, DC, IC, PXM, SWA
@@ -276,7 +278,7 @@ def main():
         o = set(mode.split("+"))
         em.reset()
         if a.trace: em.trace = []
-        st = {"rgap": [], "rerr": [], "route": [], "redo": 0}
+        st = {"rgap": [], "rerr": [], "route": [], "redo": 0, "rlog": [] if a.rlog else None}
         mis = []; gaps = {}; t0 = time.time(); lgs = []; amax = []; marg = []
         npre = len(g["prompt_ids"])
         for i, t in enumerate(seq[:-1]):
@@ -301,6 +303,8 @@ def main():
                      "argmax": amax, "margins": marg}
         print(mode, {k: v for k, v in res[mode].items() if k != "routes"}, flush=True)
         json.dump(res, open(a.out, "w"))
+        if a.rlog:
+            json.dump({"logits": st["rlog"], "routes": st["route"]}, open(a.rlog.replace(".json", f"_{mode}.json"), "w"))
         if a.trace:
             json.dump([t.tolist() for t in em.trace], open(a.trace.replace(".json", f"_{mode}.json"), "w"))
 

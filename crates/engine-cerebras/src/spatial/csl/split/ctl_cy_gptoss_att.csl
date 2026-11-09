@@ -34,7 +34,7 @@ const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
 const timestamp = @import_module("<time>");
-var tdbg = @zeros([1 + 3 * K]u32);
+var tdbg = @zeros([1 + 4 * K]u32);   // stamps [0, 1 + 3 l ..), then (always on) each layer's redo passes, summed over the launch
 var tdbg_ptr: [*]u32 = &tdbg;
 var tsc = @zeros([3]u16);
 fn stamp(i: u16) void { if (TSTAMP == 0) { return; } timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
@@ -62,6 +62,17 @@ var rot = @zeros([NLV * 8 * 2 * NROT]f32);
 var rot_ptr: [*]f32 = &rot;
 var rc = @zeros([NROT]f32);
 var rs = @zeros([NROT]f32);
+const NRB: u16 = (Qh + 1) * NROT;          // rotated pairs a pass (q's heads, then k)
+var rcv = @zeros([NRB]f32);
+var rsv = @zeros([NRB]f32);
+var ra = @zeros([NRB]f32);
+var rb2 = @zeros([NRB]f32);
+var rc3 = @zeros([NRB]f32);
+const rcv_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NRB} -> rcv[i] });
+const rsv_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NRB} -> rsv[i] });
+const ra_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NRB} -> ra[i] });
+const rb2_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NRB} -> rb2[i] });
+const rc3_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NRB} -> rc3[i] });
 var ilh = @zeros([Qh]f32);
 var lh = @zeros([Qh]f32);
 
@@ -206,16 +217,25 @@ fn rope_tables_at(p: u32) void {
     rc[j] = c;
     rs[j] = s;
   }
-}
-// rotated pairs (o + 2 j, o + 2 j + 1) of t
-fn rope(o: u16) void {
-  var j: u16 = 0;
-  while (j < NROT) : (j += 1) {
-    const a = t[o + 2 * j];
-    const b = t[o + 2 * j + 1];
-    t[o + 2 * j] = a * rc[j] - b * rs[j];
-    t[o + 2 * j + 1] = b * rc[j] + a * rs[j];
+  var b: u16 = 0;
+  while (b <= Qh) : (b += 1) {
+    @fmovs(@set_dsd_length(@increment_dsd_offset(rcv_d, @as(i16, b * NROT), f32), NROT), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NROT} -> rc[i] }));
+    @fmovs(@set_dsd_length(@increment_dsd_offset(rsv_d, @as(i16, b * NROT), f32), NROT), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NROT} -> rs[i] }));
   }
+}
+// every rotated pair (a, b) = (t[2 i], t[2 i + 1]) of q's heads and k (t[0 .. QD + Dc), adjacent blocks):
+// a' = a c - b s, b' = b c + a s (the scalar rope()'s operations, word for word)
+fn rope_v() void {
+  const A = @set_dsd_stride(@set_dsd_length(t_d, NRB), 2);
+  const B = @increment_dsd_offset(A, 1, f32);
+  @fmuls(ra_d, A, rcv_d);
+  @fmuls(rb2_d, B, rsv_d);
+  @fsubs(ra_d, ra_d, rb2_d);          // a c - b s
+  @fmuls(rb2_d, B, rcv_d);
+  @fmuls(rc3_d, A, rsv_d);
+  @fadds(rb2_d, rb2_d, rc3_d);        // b c + a s
+  @fmovs(A, ra_d);
+  @fmovs(B, rb2_d);
 }
 
 fn att(l: u16, pos: u32) void {
@@ -225,14 +245,14 @@ fn att(l: u16, pos: u32) void {
   @fmuls(tv(0, NQA), tv(0, NQA), rr);
   @fadds(tv(0, NQA), tv(0, NQA), @set_dsd_base_addr(qb_d, @ptrcast([*]f32, &qb[l * NQA])));
   rope_tables_at(pos);
+  rope_v();
   var h: u16 = 0;
-  while (h < Qh) : (h += 1) { rope(h * Dc); }
-  rope(QD);
   @fmuls(uv(0, QD), tv(0, QD), QSC);
   @fmovs(uv(QD, 2 * Dc), tv(QD, 2 * Dc));
   u[QD + 2 * Dc] = @as(f32, pos);
   mcast(QD + 2 * Dc + 1);
   stamp(2 + 3 * l);
+  if (l == K - 1) { rope_tables_at(pos + 1); }   // (ROPEP) the next pass's tables, off the path
   if (pos == 0) {
     h = 0;
     while (h < Qh) : (h += 1) { mref[l * Qh + h] = 0.0; }
@@ -259,7 +279,7 @@ fn att(l: u16, pos: u32) void {
       mref[l * Qh + h] += st;
     }
     mcast(Qh);
-    if (bad == 0.0) { pass = 8; }
+    if (bad == 0.0) { pass = 8; } else { tdbg[1 + 3 * K + l] += 1; }
   }
   stamp(3 + 3 * l);
 }
@@ -277,6 +297,8 @@ task pass_task() void {
   sys_mod.unblock_cmd_stream();
 }
 fn compute(steps: u32, start_pos: u32) void {
+  var l: u16 = 0;
+  while (l < K) : (l += 1) { tdbg[1 + 3 * K + l] = 0; }
   n_steps = steps;
   pos0 = start_pos;
   @activate(pass_id);
