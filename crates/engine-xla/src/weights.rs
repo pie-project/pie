@@ -706,12 +706,6 @@ fn gemm_only(
                     quant: None,
                     logits: false,
                     ..
-                }
-                | Linear::Matmul {
-                    w,
-                    quant: None,
-                    logits: true,
-                    ..
                 },
             ) => vec![*w],
             // A routed block-FP8 bank: its codes land `[K, E·N]` like a gemm
