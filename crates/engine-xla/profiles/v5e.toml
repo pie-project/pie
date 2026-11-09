@@ -7,6 +7,12 @@ assumes = { generation = 5, hbm_gib = 16 }
 # 128-row rungs from 512 run it at 640
 [engine]
 pad.row_steps = 4
+# a process starts only while the pools hold the started ones to the pages a finished one held, a
+# decoding lane's pages before a waiting prompt's, the starts past them spread over a life: the engine
+# keeps no kv on the host, and gemma-4-E4B's 548 pages restarted the processes they ran short for
+seated_first = true
+seat_to_end = true
+seat_spread = true
 
 # a blocked attention's row blocks as a loop: in line, DeepSeek-V4's 1792-row prompt programs ran a v5e
 # host's 47 GiB out compiling them
@@ -17,4 +23,11 @@ attn.unrolled_blocks = 1
 moe.cost.onehot_mi = 8
 
 [provenance]
-measured = ["engine.pad.row_steps", "kernel.attn.unrolled_blocks", "kernel.moe.cost.onehot_mi"]
+measured = [
+  "engine.pad.row_steps",
+  "engine.seat_spread",
+  "engine.seat_to_end",
+  "engine.seated_first",
+  "kernel.attn.unrolled_blocks",
+  "kernel.moe.cost.onehot_mi",
+]
