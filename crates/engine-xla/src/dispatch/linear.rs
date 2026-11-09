@@ -679,15 +679,19 @@ impl Run<'_> {
                 let bank_v = l.bank(self.planes(*bank))?;
                 let o_y = self.tensor(*y);
                 let tuning = l.tuning();
-                let v = linear::moe::matmul_select_bias(
+                let (v, tiled) = linear::moe::matmul_select_tiled(
                     l.f(),
                     x_v,
                     bank_v,
-                    bias_v,
+                    Some(bias_v),
                     routes_v,
                     y_v,
                     tuning,
+                    self.tiled(*x, *routes),
                 )?;
+                if let Some(t) = tiled {
+                    self.keep_tiled(*y, *routes, t);
+                }
                 l.land(o_y, v)
             }),
             Linear::MoeSelect {
@@ -706,8 +710,19 @@ impl Run<'_> {
                 let bank_v = l.bank(self.planes(*bank))?;
                 let o_y = self.tensor(*y);
                 let tuning = l.tuning();
-                let v =
-                    linear::moe::matmul_select_quant(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                let (v, tiled) = linear::moe::matmul_select_tiled(
+                    l.f(),
+                    x_v,
+                    bank_v,
+                    None,
+                    routes_v,
+                    y_v,
+                    tuning,
+                    self.tiled(*x, *routes),
+                )?;
+                if let Some(t) = tiled {
+                    self.keep_tiled(*y, *routes, t);
+                }
                 l.land(o_y, v)
             }),
             // The forms no builder makes.
@@ -722,7 +737,19 @@ impl Run<'_> {
                 let routed_v = l.read(self.tensor(*routed))?;
                 let weights_v = l.read(self.tensor(*weights))?;
                 let o_y = self.tensor(*y);
-                let v = linear::moe::weighted_sum(l.f(), routed_v, weights_v, o_y.landing())?;
+                let tiled = self
+                    .tiled_routes(*routed)
+                    .and_then(|routes| self.tiled(*routed, routes));
+                let v = match tiled {
+                    Some(t) => linear::moe::weighted_sum_tiled(
+                        l.f(),
+                        t,
+                        routed_v.width,
+                        weights_v,
+                        o_y.landing(),
+                    )?,
+                    None => linear::moe::weighted_sum(l.f(), routed_v, weights_v, o_y.landing())?,
+                };
                 l.land(o_y, v)
             }),
             // The forms no builder makes.

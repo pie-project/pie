@@ -69,6 +69,7 @@ pub enum MTy {
 fn elem_name(e: Elem) -> Built<&'static str> {
     Ok(match e {
         Elem::Pred => "i1",
+        Elem::U4 => "i4",
         Elem::I8 | Elem::U8 => "i8",
         Elem::I16 | Elem::U16 => "i16",
         Elem::I32 | Elem::U32 => "i32",
