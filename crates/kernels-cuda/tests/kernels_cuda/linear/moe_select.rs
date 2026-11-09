@@ -553,7 +553,7 @@ fn the_w8a16_selects_answer_the_routed_dot() {
         let ctx = b.ctx();
         let x = t(x, rows_x, k, Bf16);
         select_fp8_w8a16(
-            &ctx, "test", x, codes, atoms, ex as u32, 128, r, &mut y, None,
+            &ctx, "test", x, codes, atoms, ex as u32, 128, r, &mut y, None, RES,
         )
         .expect("the W8A16 select fires");
         let w = |r: usize, c: usize, i: usize| f64::from(s.value(routes[r] as usize * n + c, k, i));
@@ -592,6 +592,7 @@ fn the_bf16_prefill_selects_answer_the_routed_dot() {
             t(b.up(&routes), tokens, top, I32),
             &mut y,
             glu,
+            RES,
         )
         .expect("the select fires");
         assert!(took, "{what}: the select takes the fire");

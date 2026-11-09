@@ -168,7 +168,8 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_bf16_held(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const u64* __restrict__ expert_table)
 {
     static_assert(kGlu == 0 || kTiles == 2, "a GLU warp is a gate tile and its up tile");
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
@@ -195,7 +196,8 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_bf16_held(
     const bool rows_live = row_base < span;
 
     const int chunks = k >> 5;
-    const bf16* w_e = codes + static_cast<long long>(expert) * n * k;
+    // The expert table (one plane an expert), resolved once a tile.
+    const bf16* w_e = expert_plane(codes, static_cast<long long>(n) * k, expert_table, 1, 0, expert);
     const bf16* wrow[kTiles][2];
 #pragma unroll
     for (int t = 0; t < kTiles; ++t)
