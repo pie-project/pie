@@ -1524,7 +1524,18 @@ impl Shell {
                     .unwrap_or(1)
             })
             .max(pad.page_floor);
-        let _ = canonical;
+        // A canonical fire of prefills alone takes at least the bound one
+        // lane holding all its rows would, so its program is the one its
+        // rows' rung names however the prompts cut them: lanes of unequal
+        // prompts otherwise took bounds the warm ladder never compiled (v6e
+        // gpt-oss's 607-token batched prefill: 1792 rows over 64 lanes at 64
+        // pages, compiled mid-run, 25 s). Decode lanes keep their own bound:
+        // their walk spans it.
+        let max_pages = if canonical && lanes.iter().all(|s| s.lane.tokens.len() > 1) {
+            max_pages.max(rows.div_ceil(paging.page_size.max(1)))
+        } else {
+            max_pages
+        };
         let max_pages = pad.rung(max_pages).min(cap);
 
         let mut windows = Windows::of(
