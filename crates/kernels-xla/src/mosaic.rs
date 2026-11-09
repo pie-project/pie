@@ -493,15 +493,6 @@ impl Body {
         Ok(self.op1("math.exp", &[v], "fastmath = #arith.fastmath<none>", t))
     }
 
-    /// `ln v` elementwise.
-    pub fn log(&mut self, v: V) -> Built<V> {
-        let t = self.ty(v).clone();
-        if !matches!(&t, MTy::Vector(_, e) if e.is_float()) {
-            return bad(format!("log of {t}"));
-        }
-        Ok(self.op1("math.log", &[v], "fastmath = #arith.fastmath<none>", t))
-    }
-
     /// `a > b` elementwise (ordered).
     pub fn gtf(&mut self, a: V, b: V) -> Built<V> {
         if self.ty(a) != self.ty(b) {
@@ -558,10 +549,6 @@ impl Body {
 
     pub fn subf(&mut self, a: V, b: V) -> Built<V> {
         self.float_binary("arith.subf", a, b)
-    }
-
-    pub fn maxf(&mut self, a: V, b: V) -> Built<V> {
-        self.float_binary("arith.maximumf", a, b)
     }
 
     pub fn divf(&mut self, a: V, b: V) -> Built<V> {
