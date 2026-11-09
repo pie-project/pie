@@ -351,6 +351,7 @@ mod tests {
         // the defaults, but for its 256-row attention blocks and flat rope
         let mut want = kernels_xla::tuning::Tuning::DEFAULT;
         want.chunks.block_rows = 256;
+        want.chunks.row_group = 64;
         want.rope_flat_rows = 1024;
         assert_eq!(
             kernels_xla::tuning::Tuning::on(&profile, Tpu::of("TPU v6 lite").vmem_bytes()),

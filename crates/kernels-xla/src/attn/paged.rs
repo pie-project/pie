@@ -1995,6 +1995,24 @@ pub fn attend(
             scale,
             ch,
         )?,
+        // Every row of a walk reads its chunks up to the longest range of
+        // the rows walked with it, and a decode batch holds lanes from a
+        // fresh prompt to a whole context: in groups of rows, each group
+        // stops at its own.
+        _ if ch.row_group > 0 && r > ch.row_group && r % ch.row_group == 0 => {
+            let g = ch.row_group;
+            let mut parts = Vec::new();
+            for at in 0..r / g {
+                let rg = rs.map(f, &mut |f, v| f.slice_axis(v, 0, at * g, (at + 1) * g))?;
+                parts.push(per_row(f, &planes, &heads, &rule, &rg, KeyList::Range, scale, ch)?);
+            }
+            let cat = |f: &mut Func, v: Vec<Val>| f.concat(&v, 0);
+            Flashed {
+                o: cat(f, parts.iter().map(|p| p.o).collect())?,
+                m: cat(f, parts.iter().map(|p| p.m).collect())?,
+                l: cat(f, parts.iter().map(|p| p.l).collect())?,
+            }
+        }
         _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?,
     };
     let lse = match call.lse {
