@@ -595,7 +595,7 @@ impl Body {
     /// A float vector of `x` everywhere.
     pub fn splat_f(&mut self, dims: &[i64], elem: Elem, x: f64) -> Built<V> {
         let t = MTy::Vector(dims.to_vec(), elem);
-        let lit = format!("dense<{x:.9e}> : {t}");
+        let lit = format!("dense<{}> : {t}", float_lit(x, elem)?);
         Ok(self.op1("arith.constant", &[], &format!("value = {lit}"), t))
     }
 
@@ -641,6 +641,14 @@ impl Body {
 
     pub fn subf(&mut self, a: V, b: V) -> Built<V> {
         self.float_binary("arith.subf", a, b)
+    }
+
+    pub fn divf(&mut self, a: V, b: V) -> Built<V> {
+        self.float_binary("arith.divf", a, b)
+    }
+
+    pub fn maxf(&mut self, a: V, b: V) -> Built<V> {
+        self.float_binary("arith.maximumf", a, b)
     }
 
     /// `v` stretched along its unit axes to `dims` (`vector.broadcast`).
@@ -836,6 +844,23 @@ impl Body {
             "vector.multi_reduction",
             &[v, init],
             "kind = #vector.kind<add>, reduction_dims = array<i64: 0>",
+            MTy::Vector(vec![d[1]], e),
+        );
+        self.shape_cast(r, &[1, d[1]])
+    }
+
+    /// The largest of a 2-d f32 vector's rows, kept as `[1, cols]`
+    /// (`vector.multi_reduction` over axis 0).
+    pub fn max_rows(&mut self, v: V) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.len() != 2 || e != Elem::F32 {
+            return bad(format!("a column max of {}", self.ty(v)));
+        }
+        let init = self.splat_f(&[d[1]], e, f64::NEG_INFINITY)?;
+        let r = self.op1(
+            "vector.multi_reduction",
+            &[v, init],
+            "kind = #vector.kind<maximumf>, reduction_dims = array<i64: 0>",
             MTy::Vector(vec![d[1]], e),
         );
         self.shape_cast(r, &[1, d[1]])
@@ -1237,6 +1262,21 @@ impl Compiled {
 
 /// Standard base64 with padding.
 #[must_use]
+/// A float literal MLIR parses: an infinity as its bits.
+fn float_lit(x: f64, elem: Elem) -> Built<String> {
+    if x.is_finite() {
+        return Ok(format!("{x:.9e}"));
+    }
+    let neg = x < 0.0;
+    Ok(match elem {
+        Elem::F32 if neg => "0xFF800000".into(),
+        Elem::F32 => "0x7F800000".into(),
+        Elem::Bf16 if neg => "0xFF80".into(),
+        Elem::Bf16 => "0x7F80".into(),
+        e => return bad(format!("an infinity of {e:?}")),
+    })
+}
+
 pub fn base64(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
