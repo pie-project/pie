@@ -50,14 +50,21 @@ pub(crate) fn put_cols(f: &mut Func, table: Val, at: Val, rows: Val) -> Built<Va
     let (p, w) = (f.dims(table)[1], f.dims(rows)[1]);
     let elem = f.elem(table);
     let rows = f.convert(rows, elem);
+    // A row's cell is its own (a token's state slot, a block's entry), and
+    // each dropped row gets its own slot past the plane: the rows land in
+    // parallel, not one after another.
+    let ok = cmp_i(f, Cmp::Ge, at, 0)?;
+    let below = cmp_i(f, Cmp::Lt, at, f.dims(table)[0])?;
+    let ok = f.and(ok, below)?;
+    let at = apart(f, at, ok)?;
     if p == w {
-        return f.put_rows(table, at, rows, Combine::Set);
+        return f.put_rows_hinted(table, at, rows, Combine::Set, true);
     }
     let n = f.dims(at)[0];
     let at = f.reshape(at, &[n, 1])?;
     let zero = f.const_i(Elem::I32, 0, &[n, 1]);
     let idx = f.concat(&[at, zero], 1)?;
-    f.scatter(
+    f.scatter_hinted(
         table,
         idx,
         rows,
@@ -69,6 +76,7 @@ pub(crate) fn put_cols(f: &mut Func, table: Val, at: Val, rows: Val) -> Built<Va
             ..ScatterDims::default()
         },
         Combine::Set,
+        true,
     )
 }
 
@@ -163,13 +171,25 @@ fn put_entries(f: &mut Func, table: Val, at: Val, rows: Val, div: i64) -> Built<
     let c = f.mul(a, dv)?;
     let k = f.iota(Elem::I32, &[n, div], 1);
     let c = f.add(c, k)?;
-    let drop = f.like_i(c, DROP);
-    let c = f.select(inside, c, drop)?;
     let c = f.reshape(c, &[n * div])?;
+    let inside = f.reshape(inside, &[n * div])?;
     let elem = f.elem(table);
     let rows = f.convert(rows, elem);
     let rows = f.reshape(rows, &[n * div, w])?;
-    f.put_rows(table, c, rows, Combine::Set)
+    // Each entry is filed once, and each dropped row gets its own slot past
+    // the plane, so the rows land in parallel, not one after another.
+    let c = apart(f, c, inside)?;
+    f.put_rows_hinted(table, c, rows, Combine::Set, true)
+}
+
+/// `at` where `keep`, else a slot past any plane of its own: indices that
+/// are pairwise distinct when the kept ones are.
+fn apart(f: &mut Func, at: Val, keep: Val) -> Built<Val> {
+    let n = f.dims(at)[0];
+    let d0 = f.like_i(at, DROP);
+    let io = f.iota(Elem::I32, &[n], 0);
+    let drop = f.sub(d0, io)?;
+    f.select(keep, at, drop)
 }
 
 fn long_enough(op: &'static str, what: &str, t: impl Stored, n: u32) -> Result<(), Error> {
