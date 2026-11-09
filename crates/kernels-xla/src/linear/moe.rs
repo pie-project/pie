@@ -1248,7 +1248,10 @@ fn sorted(
         let fe = f.select(hit, es, none)?;
         let pb = f.broadcast(pads, &[fill, e], &[1])?;
         let lacks = f.select(hit, pb, none)?;
-        (f.reduce(fe, &[1], Fold::Sum)?, f.reduce(lacks, &[1], Fold::Sum)?)
+        (
+            f.reduce(fe, &[1], Fold::Sum)?,
+            f.reduce(lacks, &[1], Fold::Sum)?,
+        )
     };
     let live = f.compare(Cmp::Lt, fs, lacks)?;
     // Keys: pairs `2e` (unrouted `2E`), live pads `2e + 1`, the rest last.
@@ -1909,7 +1912,9 @@ pub fn experts(
     };
     // The down leg is linear: a row weighted before it lands weighted (the
     // f32 GLU rounds to bf16 once, as before).
-    let ws = sorted.ws.ok_or_else(|| refuse(OP, "the sort carried no weights"))?;
+    let ws = sorted
+        .ws
+        .ok_or_else(|| refuse(OP, "the sort carried no weights"))?;
     let wb = f.broadcast(ws, &[rows, i64::from(intermediate)], &[0])?;
     let hidden = f.mul(hidden, wb)?;
     let hidden = f.convert(hidden, Elem::Bf16);
@@ -1937,7 +1942,16 @@ pub fn experts(
         let off = f.const_f(Elem::Bf16, 0.0, &[rows, t]);
         f.select(hit, one, off)?
     };
-    Ok(Some(f.dot_general_at(hot, ys, &[], &[], &[0], &[0], Elem::F32, false)?))
+    Ok(Some(f.dot_general_at(
+        hot,
+        ys,
+        &[],
+        &[],
+        &[0],
+        &[0],
+        Elem::F32,
+        false,
+    )?))
 }
 
 /// A dense (bf16) bank: `bank` holds `[experts, N * K]` (any row shape).
