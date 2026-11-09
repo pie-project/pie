@@ -43,7 +43,7 @@ struct Shape {
 }
 
 /// Buffer bytes a step may hold (both slots, keys and values).
-const BUFFER_BYTES: i64 = 48 << 20;
+const BUFFER_BYTES: i64 = 32 << 20;
 
 impl Shape {
     fn rows_a_step(span: i64, h: &Heads) -> i64 {
@@ -56,7 +56,7 @@ impl Shape {
         let qh = h.qh();
         let buffers = 2 * g * self.span * h.kvh * (h.d + h.dv) * 2;
         let blocks = 2 * (g * qh * h.d * 2 + g * qh * h.dv * 4 + 2 * g * qh * 128 * 4);
-        buffers + blocks + 8 * qh.max(8) * self.span * 4
+        buffers + blocks + 8 * qh.max(8) * self.span * 4 + 4 * self.span * (h.d + h.dv) * 2
     }
 }
 
@@ -127,7 +127,8 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             block(vec![rp * qh, 1], Elem::F32, vec![g * qh, 1]),
             block(vec![rp * qh, 1], Elem::F32, vec![g * qh, 1]),
         ],
-        vmem_limit: Some(u64::try_from(s.vmem().min(vmem_cap)).unwrap_or(0)),
+        // the buffers, and room for the compiler's own temporaries
+        vmem_limit: Some(u64::try_from(vmem_cap).unwrap_or(0)),
         scratch: vec![
             MTy::Ref(vec![2, g, span, w], Elem::Bf16, Space::Vmem),
             MTy::Ref(vec![2, g, span, wv], Elem::Bf16, Space::Vmem),
