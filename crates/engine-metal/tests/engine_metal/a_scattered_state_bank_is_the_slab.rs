@@ -828,7 +828,7 @@ fn frame_cache(rig: &Rig) {
         C,
         Dtype::Bf16,
     );
-    let grid = rig.ints(&grid, Dtype::I32);
+    let grid = rig.tensor(&ints(&grid), records, 4, Dtype::I32);
     let clip_slots: [u32; 3] = [2, 0, 1];
     let slab = Layout::slab(records, stride);
     let scattered = Layout::scattered(records, stride, FRAMES, FRAMES);

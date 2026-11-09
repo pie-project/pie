@@ -2,6 +2,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "../prim/kv_page.h"
+
 METAL_FUNC void sdpa_online_update(float score, thread float &max_score,
                                    thread float &sum_exp_score, thread float &history_scale,
                                    thread float &score_scale) {
@@ -22,7 +24,8 @@ inline void q8_decode_body(const device T *queries, const device T *k_pages,
                            const device T *v_pages, device T *out, const int gqa_factor,
                            const device int *position_ids, const device int *req_of_token,
                            const device uint *kv_page_indices, const device uint *kv_page_indptr,
-                           const int page_size, const int n_kv_heads, const float scale,
+                           const int page_size, const pie_kv_layout kvl,
+                           const int n_kv_heads, const float scale,
                            const device uchar *attention_mask, const uint attention_mask_stride,
                            const device uchar *attention_mask_enabled, const int window,
                            const device T *sinks, device float *lse, threadgroup float *outputs,
@@ -68,10 +71,12 @@ inline void q8_decode_body(const device T *queries, const device T *k_pages,
 
   const bool masked = mask_word != 0;
 
-  auto absorb = [&](size_t slot) {
-    const ulong at = (slot * n_kv_heads + kv_head_idx) * ulong(2 * D);
-    const device char *kb = reinterpret_cast<const device char *>(k_pages) + at;
-    const device char *vb = reinterpret_cast<const device char *>(v_pages) + at;
+  auto absorb = [&](uint page, uint off) {
+    const ulong at = (ulong(off) * n_kv_heads + kv_head_idx) * ulong(2 * D);
+    const device char *kb = reinterpret_cast<const device char *>(k_pages) + kvl.k_offset +
+                            ulong(page) * kvl.k_page + at;
+    const device char *vb = reinterpret_cast<const device char *>(v_pages) + kvl.v_offset +
+                            ulong(page) * kvl.v_page + at;
     const float ks = *reinterpret_cast<const device float *>(kb + D);
     const float vs = *reinterpret_cast<const device float *>(vb + D);
     for (int j = 0; j < qk_per_thread; ++j)
@@ -101,25 +106,21 @@ inline void q8_decode_body(const device T *queries, const device T *k_pages,
 
   if (last_page - first_page + 1 >= BN) {
     for (int pix = first_page + simd_gid; pix <= last_page; pix += BN) {
-      const size_t base = size_t(kv_page_indices[page_base + pix]) * stride;
+      const uint page = kv_page_indices[page_base + pix];
       const int lo = max(kv_start, pix * stride);
       const int hi = min(last_kp, pix * stride + stride - 1);
       for (int kp = lo; kp <= hi; ++kp) {
         if (attends(kp))
-          absorb(base + size_t(kp - pix * stride));
+          absorb(page, uint(kp - pix * stride));
       }
     }
   } else {
     for (int kp = kv_start + simd_gid; kp <= last_kp; kp += BN) {
 
-      size_t slot;
-
       const int page_ix = kp / page_size;
       const int page_off = kp % page_size;
-      slot = size_t(kv_page_indices[page_base + page_ix]) * stride + page_off;
-
       if (attends(kp))
-        absorb(slot);
+        absorb(kv_page_indices[page_base + page_ix], uint(page_off));
     }
   }
 
@@ -173,6 +174,10 @@ template <typename T, int D, int V = D, int MERGE = (V == 256 ? 4 : 1)>
     const device uint &attention_mask_stride [[buffer(13)]],
     const device uchar *attention_mask_enabled [[buffer(14)]],
     const constant int &window [[buffer(15)]], const device T *sinks [[buffer(16)]],
+    const constant ulong& k_page_stride [[buffer(17)]],
+    const constant ulong& v_page_stride [[buffer(18)]],
+    const constant ulong& k_offset [[buffer(19)]],
+    const constant ulong& v_offset [[buffer(20)]],
     uint3 tid [[threadgroup_position_in_grid]], uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]], uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int BN = 32;
@@ -180,7 +185,7 @@ template <typename T, int D, int V = D, int MERGE = (V == 256 ? 4 : 1)>
   threadgroup float max_scores[BN];
   threadgroup float sum_exp_scores[BN];
   q8_decode_body<T, D, V, false, MERGE>(queries, k_pages, v_pages, out, gqa_factor, position_ids,
-                                        req_of_token, kv_page_indices, kv_page_indptr, page_size,
+                                        req_of_token, kv_page_indices, kv_page_indptr, page_size, PIE_KV_LAYOUT_ARGS,
                                         n_kv_heads, scale, attention_mask, attention_mask_stride,
                                         attention_mask_enabled, window, sinks, nullptr, outputs,
                                         max_scores, sum_exp_scores, tid, tpg, simd_gid, simd_lid);
@@ -199,6 +204,10 @@ template <typename T, int D, int V = D>
     const device uchar *attention_mask_enabled [[buffer(14)]],
     const constant int &window [[buffer(15)]], const device T *sinks [[buffer(16)]],
     device float *lse [[buffer(17)]], uint3 tid [[threadgroup_position_in_grid]],
+    const constant ulong& k_page_stride [[buffer(18)]],
+    const constant ulong& v_page_stride [[buffer(19)]],
+    const constant ulong& k_offset [[buffer(20)]],
+    const constant ulong& v_offset [[buffer(21)]],
     uint3 tpg [[threadgroups_per_grid]], uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int BN = 32;
@@ -206,7 +215,7 @@ template <typename T, int D, int V = D>
   threadgroup float max_scores[BN];
   threadgroup float sum_exp_scores[BN];
   q8_decode_body<T, D, V, true>(queries, k_pages, v_pages, out, gqa_factor, position_ids,
-                                req_of_token, kv_page_indices, kv_page_indptr, page_size,
+                                req_of_token, kv_page_indices, kv_page_indptr, page_size, PIE_KV_LAYOUT_ARGS,
                                 n_kv_heads, scale, attention_mask, attention_mask_stride,
                                 attention_mask_enabled, window, sinks, lse, outputs, max_scores,
                                 sum_exp_scores, tid, tpg, simd_gid, simd_lid);
@@ -218,7 +227,7 @@ template <typename T, int D, int V = D>
       const constant int &, const device int *, const device int *, const device uint *,           \
       const device uint *, const constant int &, const constant int &, const constant float &,     \
       const device uchar *, const device uint &, const device uchar *, const constant int &,       \
-      const device itype *, uint3, uint3, uint, uint);
+      const device itype *, PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
 instantiate_sdpa_paged(bfloat16, bfloat, 256, 256)
 instantiate_sdpa_paged(bfloat16, bfloat, 512, 512)
@@ -232,7 +241,7 @@ instantiate_sdpa_paged(bfloat16, bfloat, 64, 64)
       const constant int &, const device int *, const device int *, const device uint *,           \
       const device uint *, const constant int &, const constant int &, const constant float &,     \
       const device uchar *, const device uint &, const device uchar *, const constant int &,       \
-      const device itype *, device float *, uint3, uint3, uint, uint);
+      const device itype *, device float *, PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
 instantiate_sdpa_paged_lse(bfloat16, bfloat, 64, 64)
 instantiate_sdpa_paged_lse(bfloat16, bfloat, 128, 128)
@@ -250,6 +259,10 @@ q8_vector_gqa(const device bfloat *queries [[buffer(0)]], const device bfloat *k
               const device uchar *mask [[buffer(12)]], constant uint &mask_stride [[buffer(13)]],
               const device uchar *enabled [[buffer(14)]], constant int &window [[buffer(15)]],
               const device bfloat *sinks [[buffer(16)]],
+              const constant ulong& k_page_stride [[buffer(17)]],
+              const constant ulong& v_page_stride [[buffer(18)]],
+              const constant ulong& k_offset [[buffer(19)]],
+              const constant ulong& v_offset [[buffer(20)]],
               uint3 tile [[threadgroup_position_in_grid]], uint3 grid [[threadgroups_per_grid]],
               uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   constexpr int D = 256, PER = 8, BN = 32, MERGE = 4;
@@ -272,10 +285,12 @@ q8_vector_gqa(const device bfloat *queries [[buffer(0)]], const device bfloat *k
       o[h][j] = 0;
     }
   }
-  auto absorb = [&](size_t slot) {
-    const size_t at = (slot * kv_heads + kv) * 2 * D;
-    const device char *kb = reinterpret_cast<const device char *>(keys) + at;
-    const device char *vb = reinterpret_cast<const device char *>(values) + at;
+  auto absorb = [&](uint page, uint off) {
+    const size_t at = (size_t(off) * kv_heads + kv) * 2 * D;
+    const device char *kb =
+        reinterpret_cast<const device char *>(keys) + k_offset + ulong(page) * k_page_stride + at;
+    const device char *vb = reinterpret_cast<const device char *>(values) + v_offset +
+                            ulong(page) * v_page_stride + at;
     const float ks = *reinterpret_cast<const device float *>(kb + D);
     const float vs = *reinterpret_cast<const device float *>(vb + D);
     float k[PER], v[PER];
@@ -303,17 +318,16 @@ q8_vector_gqa(const device bfloat *queries [[buffer(0)]], const device bfloat *k
   };
   if (lastpage - firstpage + 1 >= BN) {
     for (int pix = firstpage + sg; pix <= lastpage; pix += BN) {
-      const size_t base = size_t(pages[pagebase + pix]) * page_size;
+      const uint page = pages[pagebase + pix];
       const int lo = max(start, pix * page_size), hi = min(last, pix * page_size + page_size - 1);
       for (int kp = lo; kp <= hi; ++kp)
         if (attends(kp))
-          absorb(base + size_t(kp - pix * page_size));
+          absorb(page, uint(kp - pix * page_size));
     }
   } else {
     for (int kp = start + sg; kp <= last; kp += BN) {
-      const size_t slot = size_t(pages[pagebase + kp / page_size]) * page_size + kp % page_size;
       if (attends(kp))
-        absorb(slot);
+        absorb(pages[pagebase + kp / page_size], uint(kp % page_size));
     }
   }
   threadgroup float ms[GH * BN], ss[GH * BN], outputs[BN * 32 * MERGE];
@@ -350,6 +364,6 @@ q8_vector_gqa(const device bfloat *queries [[buffer(0)]], const device bfloat *k
       const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *,        \
       constant int &, const device int *, const device int *, const device uint *,                 \
       const device uint *, constant int &, constant int &, constant float &, const device uchar *, \
-      constant uint &, const device uchar *, constant int &, const device bfloat *, uint3, uint3,  \
-      uint, uint);
+      constant uint &, const device uchar *, constant int &, const device bfloat *,                \
+      PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 PIE_VECTOR_GQA("q8_vector_gqa_2", 2)

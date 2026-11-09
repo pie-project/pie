@@ -61,6 +61,55 @@ pub struct KvPool {
     /// Whether attention reads this pool through the 8-bit kernels: the
     /// load's `kernel.sdpa.kv_q8`.
     pub q8: bool,
+
+    /// Bytes from one page to the next, keys then values
+    /// (`kernels/prim/kv_page.h`).
+    pub page_stride: [u64; 2],
+
+    /// Bytes from each bound plane's origin to this pool's rows of page 0,
+    /// keys then values.
+    pub plane_offset: [u64; 2],
+}
+
+impl KvPool {
+    /// The page stride of a plane that is its own run of `page_size`-row
+    /// pages, each row `plane.width` wide (a packed 4-bit row is a block of
+    /// `head_dim / 2 + 2` bytes a head).
+    #[must_use]
+    pub fn dense_page_stride(plane: Tensor, page_size: i32, head_dim: u64) -> u64 {
+        let width = u64::from(plane.width);
+        let row = match plane.dtype {
+            Dtype::KvU4 if head_dim != 0 => width / head_dim * (head_dim / 2 + 2),
+            dtype => width * dtype.bits() / 8,
+        };
+        row * u64::from(page_size.unsigned_abs())
+    }
+
+    /// This pool with each plane its own run of `page_size`-row pages from
+    /// the plane's origin: the layout every pool had before page strides.
+    #[must_use]
+    pub fn paged_densely(self) -> Self {
+        Self {
+            page_stride: [
+                Self::dense_page_stride(self.keys, self.page_size, self.head_stride),
+                Self::dense_page_stride(self.values, self.page_size, self.head_stride),
+            ],
+            plane_offset: [0, 0],
+            ..self
+        }
+    }
+
+    /// The four arguments every paged kernel takes last: each plane's page
+    /// stride, then each plane's offset.
+    #[must_use]
+    pub fn page_args(&self) -> [ArgValue; 4] {
+        [
+            ArgValue::Usize(self.page_stride[0]),
+            ArgValue::Usize(self.page_stride[1]),
+            ArgValue::Usize(self.plane_offset[0]),
+            ArgValue::Usize(self.plane_offset[1]),
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

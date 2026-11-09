@@ -2,6 +2,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "../prim/kv_page.h"
+
 template <typename T, int HEAD_DIM_MAX, int SIMDS>
 [[kernel]] void attn_score_capture(
     const device T* q                   [[buffer(0)]],
@@ -18,6 +20,10 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
     const constant float& sm_scale      [[buffer(11)]],
     const constant int& observe         [[buffer(12)]],
     const constant int& kv_max          [[buffer(13)]],
+    const constant ulong& k_page_stride [[buffer(14)]],
+    const constant ulong& v_page_stride [[buffer(15)]],
+    const constant ulong& k_offset [[buffer(16)]],
+    const constant ulong& v_offset [[buffer(17)]],
     uint3 tgid     [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]]) {
@@ -27,6 +33,9 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
 
   const int request = int(tgid.x);
   const int head = int(tgid.y);
+  // The keys plane as the layout places it, in elements.
+  k_pages = pie_kv_plane(k_pages, k_offset);
+  const size_t k_page = k_page_stride / sizeof(T);
   const int lane = int(simd_lid);
   const int warp = int(simd_gid);
   const int tid = warp * 32 + lane;
@@ -82,11 +91,10 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
     float running_max = NEG_INF;
     float running_sum = 0.0f;
     for (int j = warp; j < limit; j += SIMDS) {
-      const size_t slot =
-          size_t(kv_page_indices[page_first + j / page_size]) * size_t(page_size) +
-          size_t(j % page_size);
-      const device T* k_row =
-          k_pages + slot * size_t(row_stride) + size_t(kv_head) * size_t(head_dim);
+      const size_t cell =
+          size_t(kv_page_indices[page_first + j / page_size]) * k_page +
+          size_t(j % page_size) * size_t(row_stride);
+      const device T* k_row = k_pages + cell + size_t(kv_head) * size_t(head_dim);
       float dot = 0.0f;
       for (int u = 0; u < VPT; ++u) {
         const int d = lane + u * 32;
@@ -121,11 +129,10 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
     const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
 
     for (int j = warp; j < limit; j += SIMDS) {
-      const size_t slot =
-          size_t(kv_page_indices[page_first + j / page_size]) * size_t(page_size) +
-          size_t(j % page_size);
-      const device T* k_row =
-          k_pages + slot * size_t(row_stride) + size_t(kv_head) * size_t(head_dim);
+      const size_t cell =
+          size_t(kv_page_indices[page_first + j / page_size]) * k_page +
+          size_t(j % page_size) * size_t(row_stride);
+      const device T* k_row = k_pages + cell + size_t(kv_head) * size_t(head_dim);
       float dot = 0.0f;
       for (int u = 0; u < VPT; ++u) {
         const int d = lane + u * 32;
@@ -151,7 +158,7 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
       const device uint*, const device uint*, const device int*,              \
       device float*, const constant int&, const constant int&,                \
       const constant int&, const constant int&, const constant float&,        \
-      const constant int&, const constant int&, uint3, uint, uint);
+      const constant int&, const constant int&, PIE_KV_LAYOUT_TYPES uint3, uint, uint);
 
 instantiate_attn_score_capture(bfloat16, bfloat, 64)
 instantiate_attn_score_capture(bfloat16, bfloat, 128)

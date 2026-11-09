@@ -90,7 +90,10 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
             seq_stride: (kh * d) as u64,
             head_stride: d as u64,
             q8: false,
-        };
+            page_stride: [0; 2],
+            plane_offset: [0; 2],
+        }
+        .paged_densely();
         // mode 0 is plain causal, 1 a sparse mask, 2 a mask that also admits later keys.
         for (window, mode) in [(None, 0u8), (Some(19u32), 1), (None, 1), (None, 2)] {
             let mask: Vec<u8> = (0..m * np * page).map(|i| u8::from(i % 7 != 0)).collect();

@@ -662,16 +662,21 @@ impl Pools {
                             dtype,
                         ))
                     };
-                    CachePool::Kv(KvPool {
-                        keys: plane(keys, u64::from(kv_heads) * u64::from(head_dim))?,
-                        values: plane(values, values_width)?,
-                        page_indices: seat.page_indices,
-                        page_indptr: seat.page_indptr,
-                        page_size: narrow(u64::from(self.paging.page_size)),
-                        seq_stride: u64::from(kv_heads) * u64::from(head_dim),
-                        head_stride: u64::from(head_dim),
-                        q8,
-                    })
+                    CachePool::Kv(
+                        KvPool {
+                            keys: plane(keys, u64::from(kv_heads) * u64::from(head_dim))?,
+                            values: plane(values, values_width)?,
+                            page_indices: seat.page_indices,
+                            page_indptr: seat.page_indptr,
+                            page_size: narrow(u64::from(self.paging.page_size)),
+                            seq_stride: u64::from(kv_heads) * u64::from(head_dim),
+                            head_stride: u64::from(head_dim),
+                            q8,
+                            page_stride: [0; 2],
+                            plane_offset: [0; 2],
+                        }
+                        .paged_densely(),
+                    )
                 }
                 Shape::State {
                     stride,

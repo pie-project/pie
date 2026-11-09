@@ -107,6 +107,7 @@ fn mma(
             with_lse
         }
     };
+    args.extend(pool.page_args());
     ctx.fire(
         Fire::at(MMA_FILE, entry).apply(Grid::of(
             [lanes, shape.rows.div_ceil(SDPA_TILE).max(1), 1],

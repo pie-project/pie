@@ -1,6 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "../prim/kv_page.h"
+
 
 constant constexpr int kIndexBlock = 256;
 
@@ -169,6 +171,10 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
     const constant int& has_weights    [[buffer(15)]],
     const constant int& sel_stride     [[buffer(16)]],
     const constant int& pitch          [[buffer(17)]],
+    const constant ulong& k_page_stride [[buffer(18)]],
+    const constant ulong& v_page_stride [[buffer(19)]],
+    const constant ulong& k_offset [[buffer(20)]],
+    const constant ulong& v_offset [[buffer(21)]],
     uint3 tgpos     [[threadgroup_position_in_grid]],
     uint3 lid       [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
@@ -184,6 +190,9 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
 
   const int r = req_of_token[t];
   const int pages_first = int(kv_page_indptr[r]);
+  // The keys plane as the layout places it, in elements.
+  key_pages = pie_kv_plane(key_pages, k_offset);
+  const size_t k_page = k_page_stride / sizeof(bfloat);
   const int stride = (ratio > 0) ? ratio : 1;
   int nkeys = (positions[t] + 1) / stride;
   if (nkeys > score_stride) nkeys = score_stride;
@@ -233,7 +242,7 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
         // Two bf16 a word: `dpl` is even and the row is D-aligned, so the
         // slice starts on a 4-byte boundary.
         const device uint* kw = (const device uint*)(
-            key_pages + (size_t(page) * size_t(page_size) + size_t(off)) * size_t(pitch) +
+            key_pages + size_t(page) * k_page + size_t(off) * size_t(pitch) +
             size_t(sub * dpl));
         for (int i = 0; i < kSlice; i += 2) {
           if (i < dpl) {
@@ -275,7 +284,7 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
         const int page = int(kv_page_indices[pages_first + cell / page_size]);
         const int off = cell % page_size;
         const device bfloat* kj =
-            key_pages + (size_t(page) * size_t(page_size) + size_t(off)) * size_t(pitch);
+            key_pages + size_t(page) * k_page + size_t(off) * size_t(pitch);
         for (int h = hh; h < H; h += kLanesPerKey) {
           const device bfloat* qh = qi + size_t(h) * size_t(D);
           float dot = 0.0f;
@@ -414,6 +423,10 @@ constant constexpr int kBlockMaxPer = 8;
     const constant int& score_stride   [[buffer(12)]],
     const constant int& topk           [[buffer(13)]],
     const constant int& block          [[buffer(14)]],
+    const constant ulong& k_page_stride [[buffer(15)]],
+    const constant ulong& v_page_stride [[buffer(16)]],
+    const constant ulong& k_offset [[buffer(17)]],
+    const constant ulong& v_offset [[buffer(18)]],
     uint3 tgpos     [[threadgroup_position_in_grid]],
     uint3 lid       [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
@@ -457,7 +470,9 @@ constant constexpr int kBlockMaxPer = 8;
     const int hi = min(lo + block, abs_q + 1);
     for (int j = lo; j < hi; ++j) {
       const int page = int(kv_page_indices[pages_first + j / page_size]);
-      const device bfloat* kj = key_pages + (size_t(page) * size_t(page_size) + size_t(j % page_size)) * size_t(D);
+      const device bfloat* kj = pie_kv_plane(key_pages, k_offset) +
+                                size_t(page) * (k_page_stride / sizeof(bfloat)) +
+                                size_t(j % page_size) * size_t(D);
       float kv[kBlockMaxPer];
       for (int i = 0; i < per; ++i) kv[i] = float(kj[lane + i * 32]);
       for (int h = 0; h < H; ++h) {

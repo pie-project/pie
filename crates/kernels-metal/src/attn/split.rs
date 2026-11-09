@@ -232,6 +232,10 @@ pub fn try_tables(
                 splits.arg(),
                 q.rows.arg(),
                 tile_base.arg(),
+                pool.page_stride[0].arg(),
+                pool.page_stride[1].arg(),
+                pool.plane_offset[0].arg(),
+                pool.plane_offset[1].arg(),
             ],
         )?;
         ctx.fire(
