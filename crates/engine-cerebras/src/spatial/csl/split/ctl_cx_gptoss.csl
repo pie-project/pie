@@ -34,7 +34,8 @@ const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
 const timestamp = @import_module("<time>");
-var tdbg = @zeros([K + 2]u32);
+var tdbg = @zeros([K + 2 + 4 * K]u32);   // [0] pass start, [1 + l] layer ends, [K + 1] x out; then a layer's
+                                          // x sent, o reduction in, x2 sent, down reduction in
 var tdbg_ptr: [*]u32 = &tdbg;
 var tsc = @zeros([3]u16);
 fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
@@ -167,13 +168,17 @@ task pass_task() void {
     var l: u16 = 0;
     while ((DIAG & 1) == 0 and l < (if ((DIAG & 2) != 0) 1 else K)) : (l += 1) {
       norm_send(@ptrcast([*]f32, &gam[2 * l * Hc]));
+      stamp(K + 2 + 4 * l);
       @fmovs(t_d, fin(q_w, Hc));
+      stamp(K + 3 + 4 * l);
       keep_red(2 * l);
       @fadds(x_d, x_d, t_d);
       @fadds(x_d, x_d, fv(@ptrcast([*]f32, &bo[l * Hc])));
       if ((DIAG & 4) == 0) {
         norm_send(@ptrcast([*]f32, &gam[(2 * l + 1) * Hc]));
+        stamp(K + 4 + 4 * l);
         @fmovs(t2_d, fin(q_e, Hc + 2 * TK));
+        stamp(K + 5 + 4 * l);
         keep_red(2 * l + 1);
         @fadds(x_d, x_d, t_d);
         var k: u16 = 0;

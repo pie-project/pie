@@ -195,7 +195,7 @@ if a.tdbg or a.prof:
     cx = []
     for u in range(NU):
         X0u, Y0u = g.unit_origin(u)
-        tb = get("tdbg", X0u + XC, Y0u, 1, 1, K + 2, np.uint32).reshape(-1)
+        tb = get("tdbg", X0u + XC, Y0u, 1, 1, K + 2 + 4 * K, np.uint32).reshape(-1)[:K + 2]
         cx.append([int(v) for v in np.diff(tb.astype(np.int64)) % (1 << 32)])
     times["cx_layers"] = cx
     print("TIMES " + json.dumps(times), flush=True)
@@ -211,7 +211,7 @@ if a.prof:
     for u in [int(v) for v in a.prof.split(",")]:
         X0p, Y0p = g.unit_origin(u)
         for r in (0, PY // 2, PY - 1):
-            raw[f"u{u}_cx_r{r}"] = pe(X0p + XC, Y0p + g.wl(r, YC), K + 2)
+            raw[f"u{u}_cx_r{r}"] = pe(X0p + XC, Y0p + g.wl(r, YC), K + 2 + 4 * K)
         raw[f"u{u}_wa_r0_c0"] = pe(X0p, Y0p, 1 + 4 * K)
         raw[f"u{u}_wa_r159_c63"] = pe(X0p + AX - 1, Y0p + g.wl(PY - 1, YC), 1 + 4 * K)
         raw[f"u{u}_wm_r0_c0"] = pe(X0p + XC + 1, Y0p, 1 + 4 * K)
@@ -229,8 +229,8 @@ if a.prof:
         X0p, Y0p = g.unit_origin(u)
         rows_ = []
         for (r0, r1) in HALF:
-            t_ = get("tdbg", X0p + XC, Y0p + g.wl(r0, YC), 1, r1 - r0, K + 2, np.uint32).reshape(r1 - r0, K + 2).astype(np.int64)
-            rows_ += [[int(v) for v in np.diff(row) % (1 << 32)] for row in t_]
+            t_ = get("tdbg", X0p + XC, Y0p + g.wl(r0, YC), 1, r1 - r0, K + 2 + 4 * K, np.uint32).reshape(r1 - r0, K + 2 + 4 * K).astype(np.int64)
+            rows_ += [[int(v) for v in np.diff(row[:K + 2]) % (1 << 32)] for row in t_]
         PROF["cx_rows"][f"u{u}"] = rows_
     PROF["redo"] = [[int(v) for v in pe(g.unit_origin(u)[0], g.unit_origin(u)[1] + YC, 1 + 4 * K)[1 + 3 * K:]] for u in range(NU)]
     PROFLINE[0] = "PROF " + json.dumps({k: v for k, v in PROF.items() if k.endswith("_cx_r0") or k.endswith("_cx_r159") or k == "redo"}, separators=(",", ":"))
