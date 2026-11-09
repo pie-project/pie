@@ -385,7 +385,11 @@ fn root_value(
         }
     } else if r.source.on_device() {
         params.push((root, r.source));
-        func.param(ty, None)
+        let p = func.param(ty, None);
+        if r.source.persistent() {
+            func.pin_row_major(p);
+        }
+        p
     } else {
         func.const_i(ty.elem, 0, &ty.dims)
     };

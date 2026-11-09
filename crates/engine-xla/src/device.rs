@@ -201,12 +201,31 @@ impl Device {
         self.zeros(dtype, rows, width).map(Some)
     }
 
+    /// A pool plane of zeros, row-major as every program that reads a pool
+    /// lays it (`Func::pin_row_major`); an upload lands a narrow plane
+    /// column-major.
     pub fn zeros(&self, dtype: Dtype, rows: u32, width: u32) -> Result<Buffer> {
         let ty = storage(dtype, rows, width).ok_or_else(|| Fault::Unbound {
             what: format!("a {dtype:?} plane, which has no storage form on this device"),
         })?;
-        let bytes = element_type(ty.elem).bytes(usize::try_from(ty.elements()).unwrap_or(0));
-        self.upload(dtype, rows, width, &vec![0u8; bytes])
+        let mut f = kernels_xla::hlo::Func::new("main");
+        let z = if ty.elem.is_float() {
+            f.const_f(ty.elem, 0.0, &ty.dims)
+        } else {
+            f.const_i(ty.elem, 0, &ty.dims)
+        };
+        f.pin_results_row_major();
+        let program = self.program(
+            &f.module("zeros", &[z]),
+            Signature {
+                params: Vec::new(),
+                results: vec![None],
+            },
+        )?;
+        let mut outs = self.run(&program, Vec::new(), true)?;
+        outs.pop().ok_or_else(|| Fault::Unbound {
+            what: "the zeros program's plane".into(),
+        })
     }
 
     /// The compiled form of `text`, from the cache or freshly built.
