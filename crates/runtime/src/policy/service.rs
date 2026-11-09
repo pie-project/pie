@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use client_api::Props;
 use client_api::props::{PROMPT_BLOCK_BYTES, PromptIndex, TOKENS_PER_BYTE};
 
+use super::manifest::Manifest;
+use super::pressure::{self, Band, Reading, Tier};
 use super::program::{self, Commit, Fault, LoadError, Plane, Program, Retention, Table};
 use super::retention;
 use super::schedule;
@@ -29,7 +31,7 @@ static EVENTS: OnceLock<Sender<Event>> = OnceLock::new();
 pub fn start(name: &str, component: &[u8]) -> Result<(), LoadError> {
     let (tx, rx) = channel();
     program::spawn(name, component, capability, "pie-policy", move |program| {
-        run(program, rx)
+        run(Some(program), rx)
     })?;
     // A second one's thread ends with its channel.
     if EVENTS.set(tx).is_err() {
@@ -38,6 +40,22 @@ pub fn start(name: &str, component: &[u8]) -> Result<(), LoadError> {
         ));
     }
     tracing::info!(policy = name, "worker policy started");
+    Ok(())
+}
+
+/// Runs the policy thread with no policy, as a worker started without one:
+/// it keeps the record a reload's policy starts from, and the default
+/// tier-pressure responder answers waiters short of room.
+/// One already running stands.
+pub fn start_default() -> Result<(), LoadError> {
+    let (tx, rx) = channel();
+    if EVENTS.set(tx).is_err() {
+        return Ok(());
+    }
+    std::thread::Builder::new()
+        .name("pie-policy".into())
+        .spawn(move || run(None, rx))
+        .map_err(|e| LoadError::Instantiate(format!("spawning its thread: {e}")))?;
     Ok(())
 }
 
@@ -133,14 +151,14 @@ impl Activity {
     }
 }
 
-fn run(program: Program, events: Receiver<Event>) {
+fn run(program: Option<Program>, events: Receiver<Event>) {
     let mut registry = Registry::new(STORES);
     let mut activity = Activity {
         since_ms: now_ms(),
         ..Activity::default()
     };
     // None once it died, or a reload named none, until a reload names one.
-    let mut current = Some(program);
+    let mut current = program;
     loop {
         let first = match current.as_ref().and_then(Program::alarm) {
             Some(at_ms) => {
@@ -189,6 +207,13 @@ fn run(program: Program, events: Receiver<Event>) {
                 }
             }
         }
+        // Tiers whose waiters are short: the policy's to answer if it
+        // listens, else the default responder's.
+        let (left, _) = pressure_round(
+            &mut registry,
+            current.as_ref().map(Program::manifest),
+            &retention::Installed,
+        );
         let Some(program) = current.as_mut() else {
             continue;
         };
@@ -228,11 +253,14 @@ fn run(program: Program, events: Receiver<Event>) {
                 tracing::error!(policy = program.name(), %error, "worker policy is dead; its tables are withdrawn");
                 withdraw();
                 current = None;
+                respond(&registry, &left, &retention::Installed);
                 continue;
             }
             Err(fault) => {
                 activity.discarded += 1;
                 tracing::warn!(policy = program.name(), %fault, "worker policy call discarded");
+                // Its answer to the pressure went with it.
+                respond(&registry, &left, &retention::Installed);
             }
         }
         activity.log(program.name(), now);
@@ -300,20 +328,94 @@ fn enact(registry: &mut Registry, commit: Commit, policy: &str) {
         }
     }
     for id in commit.discard {
-        let Ok(owner) = ProcessId::from_str(&id) else {
-            continue;
-        };
-        match registry.handles.get(&owner) {
-            Some(handle) => {
-                let why = format!("the worker policy `{policy}` discarded it");
-                crate::server::discard_handle(handle.resting.client, owner, why);
-            }
-            None => (registry.cache.discard)(owner),
+        if let Ok(owner) = ProcessId::from_str(&id) {
+            discard(registry, owner, || {
+                format!("the worker policy `{policy}` discarded it")
+            });
         }
     }
     for (name, value) in commit.publish {
         super::publish(name, value.and_then(|v| wit_json(&v)));
     }
+}
+
+/// The `discard` verb: a resting handle goes through its client, a cached
+/// working set from the stores.
+fn discard(registry: &Registry, owner: ProcessId, why: impl FnOnce() -> String) {
+    match registry.handles.get(&owner) {
+        Some(handle) => crate::server::discard_handle(handle.resting.client, owner, why()),
+        None => (registry.cache.discard)(owner),
+    }
+}
+
+/// Whether the policy in `manifest` answers `tier-pressure` itself. One that
+/// listens owns the answer, even an answer of nothing; with none, the
+/// default responder answers.
+fn answers_pressure(manifest: Option<&Manifest>) -> bool {
+    manifest.is_some_and(|manifest| manifest.subscribes("tier-pressure"))
+}
+
+/// A round's tier pressure: answered here by default when the policy in
+/// `manifest` does not listen for it, else left to that policy. Answers the
+/// pressed tiers left to the policy, which fall back to the default if its
+/// call fails, and what the default discarded.
+fn pressure_round(
+    registry: &mut Registry,
+    manifest: Option<&Manifest>,
+    keys: &dyn retention::Keys,
+) -> (Vec<Tier>, Vec<ProcessId>) {
+    let pressed = registry.take_pressed();
+    if pressed.is_empty() || answers_pressure(manifest) {
+        return (pressed, Vec::new());
+    }
+    let discarded = respond(registry, &pressed, keys);
+    (Vec::new(), discarded)
+}
+
+/// The default tier-pressure responder (see [`pressure::choose`]): for each
+/// pressed tier, discards working sets lowest retention key first until what
+/// they free covers the shortfall. Policy-layer code with the policy's own
+/// verb; the stores only carry the discards out. Answers what it discarded.
+fn respond(registry: &Registry, pressed: &[Tier], keys: &dyn retention::Keys) -> Vec<ProcessId> {
+    let mut discarded = Vec::new();
+    for &tier in pressed {
+        let short = registry.pressure[tier.index()].short;
+        if short == 0 {
+            continue;
+        }
+        let candidates = registry
+            .snapshot()
+            .candidates_for(tier, keys)
+            .into_iter()
+            .filter(|c| ProcessId::from_str(&c.id).is_ok_and(|id| !discarded.contains(&id)))
+            .collect();
+        let chosen = pressure::choose(candidates, short);
+        if chosen.is_empty() {
+            tracing::warn!(
+                tier = tier.name(),
+                short,
+                "tier pressure: nothing is left to discard; the waiters wait on the governor"
+            );
+        }
+        for id in chosen {
+            let Ok(owner) = ProcessId::from_str(&id) else {
+                continue;
+            };
+            tracing::info!(
+                tier = tier.name(),
+                short,
+                working_set = %owner,
+                key = keys.key_at(Some(owner), 0),
+                "tier pressure: the default responder discards a working set"
+            );
+            discard(registry, owner, || {
+                "no worker policy answers tier pressure: the default responder discarded it"
+                    .to_string()
+            });
+            discarded.push(owner);
+        }
+    }
+    discarded
 }
 
 #[derive(Clone, Copy)]
@@ -329,6 +431,10 @@ struct Cache {
     state_swap: fn() -> (u64, u64),
     /// Whether a resting handle's state is on the device now.
     resident: fn(ProcessId) -> Option<bool>,
+    /// A tier's bytes, as [`pressure::meter_bytes`] has them.
+    bytes: fn(Tier) -> Option<pressure::Bytes>,
+    /// What a kv page and a state slot take.
+    scale: fn() -> Option<pressure::Scale>,
 }
 
 const STORES: Cache = Cache {
@@ -404,6 +510,8 @@ const STORES: Cache = Cache {
         (u64::from(capacity), u64::from(room))
     },
     resident: |holder| crate::planner::planner_of(holder)?.holder_resident(holder),
+    bytes: pressure::meter_bytes,
+    scale: pressure::common_scale,
     discard: |owner| {
         let mut freed = 0;
         for stores in store_registry::all_for_model(0) {
@@ -537,6 +645,12 @@ struct Registry {
     prompts: HashMap<ProcessId, (Arc<[u64]>, usize)>,
     /// `cached-tokens` before a process has run.
     held: Arc<PromptIndex>,
+    /// Where each tier stands, by [`Tier::index`].
+    pressure: [Reading; 2],
+    /// The band each tier's last edge told of.
+    told: [Band; 2],
+    /// Tiers whose waiters were short in the events a round applied.
+    pressed: [bool; 2],
 }
 
 impl Registry {
@@ -551,7 +665,20 @@ impl Registry {
             cache,
             prompts: HashMap::new(),
             held: Arc::new(PromptIndex::default()),
+            pressure: [Reading::default(); 2],
+            told: [Band::Clear; 2],
+            pressed: [false; 2],
         }
+    }
+
+    /// The tiers pressed since the last round asked, and still short.
+    fn take_pressed(&mut self) -> Vec<Tier> {
+        let pressed = Tier::ALL
+            .into_iter()
+            .filter(|tier| self.pressed[tier.index()] && self.pressure[tier.index()].short > 0)
+            .collect();
+        self.pressed = [false; 2];
+        pressed
     }
 
     fn apply(&mut self, event: Event) -> Vec<Edge> {
@@ -740,6 +867,15 @@ impl Registry {
                 }
                 None
             }
+            // One edge per band crossing: a shortfall that moves within its
+            // band is the default responder's to hear, not the policy's.
+            Event::TierPressure(tier, reading) => {
+                let at = tier.index();
+                self.pressure[at] = reading;
+                self.pressed[at] |= reading.short > 0;
+                let told = std::mem::replace(&mut self.told[at], reading.band);
+                (told != reading.band).then(|| Edge::TierPressure(WORKER.to_string()))
+            }
             Event::CacheEmptied(owner, by) => {
                 Arc::make_mut(&mut self.held).remove(&owner.to_string());
                 if self.procs.contains_key(&owner) {
@@ -795,6 +931,8 @@ impl Registry {
             held: self.held.clone(),
             cache: self.cache,
             cached: OnceCell::new(),
+            pressure: self.pressure,
+            bytes: [OnceCell::new(), OnceCell::new()],
         }
     }
 }
@@ -817,6 +955,9 @@ struct Snapshot {
     cache: Cache,
     /// Read once, when the call first asks.
     cached: OnceCell<(HashMap<String, CachedWorkingSet>, u32)>,
+    pressure: [Reading; 2],
+    /// Each tier's bytes, read once when the call first asks.
+    bytes: [OnceCell<Option<pressure::Bytes>>; 2],
 }
 
 impl Snapshot {
@@ -843,6 +984,106 @@ impl Snapshot {
                 .collect();
             (sets, page_size)
         })
+    }
+
+    fn bytes(&self, tier: Tier) -> Option<pressure::Bytes> {
+        *self.bytes[tier.index()].get_or_init(|| (self.cache.bytes)(tier))
+    }
+
+    /// A worker attr `{tier}-{what}`: the tier's bytes and where its
+    /// waiters stand.
+    fn tier_attr(&self, name: &str) -> Option<Value> {
+        let (tier, what) = Tier::ALL.into_iter().find_map(|tier| {
+            let what = name.strip_prefix(tier.name())?.strip_prefix('-')?;
+            Some((tier, what))
+        })?;
+        let reading = self.pressure[tier.index()];
+        let int = |n: u64| Some(Value::Int(i64::try_from(n).unwrap_or(i64::MAX)));
+        match what {
+            "band" => Some(Value::Text(reading.band.name().into())),
+            "short-bytes" => int(reading.short),
+            _ => {
+                let bytes = self.bytes(tier)?;
+                match what {
+                    "total-bytes" => int(bytes.total),
+                    "state-bytes" => int(bytes.state),
+                    "live-bytes" => int(bytes.live),
+                    // At least what is live and what the waiters are short
+                    // of, whether or not the meter counts the waiters.
+                    "wanted-bytes" => {
+                        int(bytes.wanted.max(bytes.live.saturating_add(reading.short)))
+                    }
+                    "act-bytes" => int(bytes.act),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// What a working set holds: kv bytes, then state bytes, where known.
+    fn held_bytes(&self, id: &str) -> (Option<u64>, Option<u64>) {
+        let Some(scale) = (self.cache.scale)() else {
+            return (None, None);
+        };
+        let known = |n: u64| (n > 0).then_some(n);
+        if let Some(Rest { resting, .. }) = self.handles.get(id) {
+            let page_tokens = u64::from(self.cached().1.max(1));
+            let pages = resting.tokens.div_ceil(page_tokens);
+            let state = u64::from(resting.slots).saturating_mul(scale.state_slot_bytes);
+            return (
+                known(scale.kv_page_bytes).map(|b| b.saturating_mul(pages)),
+                (resting.slots == 0 || scale.state_slot_bytes > 0).then_some(state),
+            );
+        }
+        let pages = self.cached().0.get(id).map(|set| set.pages);
+        (
+            pages
+                .zip(known(scale.kv_page_bytes))
+                .map(|(p, b)| p.saturating_mul(b)),
+            None,
+        )
+    }
+
+    /// The working sets the default responder may discard to make room on
+    /// `tier`, with their keys and what discarding each frees there.
+    fn candidates_for(&self, tier: Tier, keys: &dyn retention::Keys) -> Vec<pressure::Candidate> {
+        let now = now_ms();
+        self.candidates(SubjectKind::WorkingSet)
+            .into_iter()
+            .filter(|id| self.discardable(id))
+            .filter_map(|id| {
+                let owner = ProcessId::from_str(&id).ok()?;
+                let (kv, state) = self.held_bytes(&id);
+                let whole = kv.map(|kv| kv.saturating_add(state.unwrap_or(0)));
+                let (bytes, last_use_ms) = match self.handles.get(&id) {
+                    Some(rest) => {
+                        // A handle frees room only on the tier it rests on.
+                        let here = match (tier, (self.cache.resident)(owner)) {
+                            (Tier::Device, Some(false)) | (Tier::Host, Some(true)) => Some(0),
+                            _ => whole,
+                        };
+                        (here, rest.since_ms)
+                    }
+                    None => {
+                        let set = &self.cached().0[&id];
+                        let ago = set.last_use.elapsed().as_millis() as u64;
+                        // Cached kv may sit on either tier: how much on the
+                        // host is not told.
+                        let here = match tier {
+                            Tier::Device => whole,
+                            Tier::Host => None,
+                        };
+                        (here, now.saturating_sub(ago))
+                    }
+                };
+                Some(pressure::Candidate {
+                    key: keys.key_at(Some(owner), 0),
+                    id,
+                    last_use_ms,
+                    bytes,
+                })
+            })
+            .collect()
     }
 
     fn whose(&self, id: &str) -> (Option<&String>, Option<&String>) {
@@ -938,6 +1179,8 @@ impl Plane for Snapshot {
                     "tokens" => Some(Value::Int(resting.tokens as i64)),
                     "folded-tokens" => Some(Value::Int(resting.folded as i64)),
                     "recurrent-slots" => Some(Value::Int(i64::from(resting.slots))),
+                    "kv-bytes" => self.held_bytes(id).0.map(|n| Value::Int(n as i64)),
+                    "state-bytes" => self.held_bytes(id).1.map(|n| Value::Int(n as i64)),
                     "resident" => ProcessId::from_str(id)
                         .ok()
                         .and_then(self.cache.resident)
@@ -957,6 +1200,7 @@ impl Plane for Snapshot {
                     "tenant" => text(tenant),
                     "session" => text(session),
                     "tokens" => Some(Value::Int((set.pages * u64::from(*page_size)) as i64)),
+                    "kv-bytes" => self.held_bytes(id).0.map(|n| Value::Int(n as i64)),
                     "last-use-ms" => {
                         let ago = set.last_use.elapsed().as_millis() as u64;
                         Some(Value::Int(now_ms().saturating_sub(ago) as i64))
@@ -1014,7 +1258,7 @@ impl Plane for Snapshot {
                         _ => capacity.saturating_sub(available),
                     } as i64))
                 }
-                _ => None,
+                _ => self.tier_attr(name),
             },
             _ => None,
         }
@@ -1073,6 +1317,8 @@ mod tests {
         state: || (4, 1),
         state_swap: || (8, 3),
         resident: |_| None,
+        bytes: |_| None,
+        scale: || None,
     };
 
     fn arrive(registry: &mut Registry, tenant: &str, session: Option<&str>) -> ProcessId {
@@ -1187,6 +1433,8 @@ mod tests {
         state: || (4, 1),
         state_swap: || (8, 3),
         resident: |_| None,
+        bytes: |_| None,
+        scale: || None,
     };
 
     #[test]
@@ -1475,5 +1723,254 @@ mod tests {
         ]
         .map(|(name, value)| (name.to_string(), value));
         assert_eq!(format!("{props:?}"), format!("{expected:?}"));
+    }
+
+    fn pressed(registry: &mut Registry, tier: Tier, band: Band, short: u64) -> Vec<Edge> {
+        registry.apply(Event::TierPressure(tier, Reading { band, short }))
+    }
+
+    #[test]
+    fn a_tier_pressure_edge_fires_once_per_band_crossing() {
+        let mut registry = Registry::new(NO_CACHE);
+        let fired = |edges: Vec<Edge>| match &edges[..] {
+            [] => false,
+            [Edge::TierPressure(worker)] => {
+                assert_eq!(worker, WORKER);
+                true
+            }
+            _ => panic!("{edges:?}"),
+        };
+        use Band::*;
+        use Tier::*;
+        assert!(fired(pressed(&mut registry, Device, Short, 10)));
+        assert!(
+            !fired(pressed(&mut registry, Device, Short, 20)),
+            "same band"
+        );
+        assert!(fired(pressed(&mut registry, Device, Critical, 900)));
+        assert!(!fired(pressed(&mut registry, Device, Critical, 800)));
+        assert!(
+            fired(pressed(&mut registry, Host, Short, 5)),
+            "a tier of its own"
+        );
+        assert_eq!(registry.take_pressed(), [Device, Host]);
+        assert!(registry.take_pressed().is_empty(), "taken once a round");
+        assert!(fired(pressed(&mut registry, Device, Clear, 0)), "relieved");
+        assert!(!fired(pressed(&mut registry, Device, Clear, 0)));
+        assert!(
+            registry.take_pressed().is_empty(),
+            "a clear tier is not pressed"
+        );
+        assert!(fired(pressed(&mut registry, Device, Short, 1)));
+    }
+
+    const BYTES_CACHE: Cache = Cache {
+        bytes: |tier| {
+            Some(match tier {
+                Tier::Device => pressure::Bytes {
+                    total: 1000,
+                    state: 600,
+                    live: 400,
+                    wanted: 700,
+                    act: 100,
+                },
+                Tier::Host => pressure::Bytes {
+                    total: 5000,
+                    state: 50,
+                    live: 50,
+                    wanted: 50,
+                    act: 0,
+                },
+            })
+        },
+        scale: || {
+            Some(pressure::Scale {
+                kv_page_bytes: 64,
+                state_slot_bytes: 32,
+            })
+        },
+        ..NO_CACHE
+    };
+
+    #[test]
+    fn the_worker_reads_each_tier_s_bytes_and_where_its_waiters_stand() {
+        let mut registry = Registry::new(BYTES_CACHE);
+        pressed(&mut registry, Tier::Device, Band::Short, 500);
+        let id = ProcessId::new_v4();
+        registry.apply(Event::HandleRested(
+            id,
+            crate::policy::Resting {
+                client: 1,
+                tenant: "t".into(),
+                session: None,
+                props: Default::default(),
+                tokens: 40,
+                folded: 0,
+                slots: 2,
+            },
+        ));
+        let plane = registry.snapshot();
+        let worker = |name| show(plane.attr(&Subject::Worker(WORKER.to_string()), name));
+        let int = |n: i64| show(Some(Value::Int(n)));
+        assert_eq!(worker("device-total-bytes"), int(1000));
+        assert_eq!(worker("device-state-bytes"), int(600));
+        assert_eq!(worker("device-live-bytes"), int(400));
+        assert_eq!(
+            worker("device-wanted-bytes"),
+            int(900),
+            "what is live and what the waiters are short of"
+        );
+        assert_eq!(worker("device-act-bytes"), int(100));
+        assert_eq!(worker("device-short-bytes"), int(500));
+        assert_eq!(
+            worker("device-band"),
+            show(Some(Value::Text("short".into())))
+        );
+        assert_eq!(worker("host-total-bytes"), int(5000));
+        assert_eq!(worker("host-wanted-bytes"), int(50));
+        assert_eq!(worker("host-short-bytes"), int(0));
+        assert_eq!(worker("host-band"), show(Some(Value::Text("clear".into()))));
+        assert_eq!(worker("disk-total-bytes"), show(None));
+        assert_eq!(worker("device-other-bytes"), show(None));
+        assert_eq!(worker("capacity-slots"), int(4), "slot attrs stand for now");
+
+        let ws = |name| show(plane.attr(&Subject::WorkingSet(id.to_string()), name));
+        assert_eq!(ws("kv-bytes"), int(3 * 64), "40 tokens in pages of 16");
+        assert_eq!(ws("state-bytes"), int(2 * 32));
+
+        // A meter that cannot tell leaves the bytes unread, not zero.
+        let plane = Registry::new(NO_CACHE).snapshot();
+        let worker = plane.attr(&Subject::Worker(WORKER.to_string()), "device-total-bytes");
+        assert_eq!(show(worker), show(None));
+    }
+
+    /// A planner's waiter parked for room, served as discards free it.
+    struct Waiter {
+        short: std::sync::Mutex<u64>,
+        freed: std::sync::Condvar,
+    }
+
+    static WAITER: Waiter = Waiter {
+        short: std::sync::Mutex::new(0),
+        freed: std::sync::Condvar::new(),
+    };
+    static PRESSED: std::sync::Mutex<Vec<(ProcessId, u64)>> = std::sync::Mutex::new(Vec::new());
+    /// The tests on [`PRESSED`] take turns.
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const PAGE_BYTES: u64 = 100;
+
+    const PRESSED_CACHE: Cache = Cache {
+        owns: |owner| PRESSED.lock().unwrap().iter().any(|(o, _)| *o == owner),
+        list: || {
+            let now = crate::rt::Instant::now();
+            let sets = PRESSED
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|&(owner, pages)| CachedWorkingSet {
+                    owner,
+                    entries: 1,
+                    pages,
+                    last_use: now,
+                })
+                .collect();
+            (sets, 16)
+        },
+        discard: |owner| {
+            let mut sets = PRESSED.lock().unwrap();
+            let freed: u64 = sets
+                .iter()
+                .filter(|(o, _)| *o == owner)
+                .map(|(_, pages)| pages * PAGE_BYTES)
+                .sum();
+            sets.retain(|(o, _)| *o != owner);
+            let mut short = WAITER.short.lock().unwrap();
+            *short = short.saturating_sub(freed);
+            WAITER.freed.notify_all();
+        },
+        scale: || {
+            Some(pressure::Scale {
+                kv_page_bytes: PAGE_BYTES,
+                state_slot_bytes: 0,
+            })
+        },
+        ..NO_CACHE
+    };
+
+    /// Three cached working sets, keyed 5, -1 and 0, of 2, 1 and 3 pages.
+    fn three_sets() -> ([ProcessId; 3], impl retention::Keys) {
+        let ids = [
+            ProcessId::new_v4(),
+            ProcessId::new_v4(),
+            ProcessId::new_v4(),
+        ];
+        *PRESSED.lock().unwrap() = vec![(ids[0], 2), (ids[1], 1), (ids[2], 3)];
+        let keys = move |owner: Option<ProcessId>| match owner {
+            Some(owner) if owner == ids[0] => 5,
+            Some(owner) if owner == ids[1] => -1,
+            _ => 0,
+        };
+        (ids, keys)
+    }
+
+    fn remaining() -> Vec<ProcessId> {
+        PRESSED.lock().unwrap().iter().map(|(o, _)| *o).collect()
+    }
+
+    #[test]
+    fn the_default_responder_discards_the_lowest_keys_and_unblocks_a_waiter() {
+        let _turn = TURN.lock().expect("the turn lock poisoned");
+        let mut registry = Registry::new(PRESSED_CACHE);
+        let ([kept, doomed, idle], keys) = three_sets();
+        *WAITER.short.lock().unwrap() = 250;
+        let waiter = std::thread::spawn(|| {
+            let short = WAITER.short.lock().unwrap();
+            let (_short, wait) = WAITER
+                .freed
+                .wait_timeout_while(short, Duration::from_secs(10), |short| *short > 0)
+                .unwrap();
+            !wait.timed_out()
+        });
+
+        pressed(&mut registry, Tier::Device, Band::Short, 250);
+        let (left, discarded) = pressure_round(&mut registry, None, &keys);
+        assert!(left.is_empty(), "answered here");
+        assert_eq!(discarded, [doomed, idle], "-1 then 0: 400 bytes cover 250");
+        assert!(waiter.join().unwrap(), "the waiter was served");
+        assert_eq!(remaining(), [kept], "what a policy keyed 5 stays");
+
+        // Served: nothing more goes.
+        pressed(&mut registry, Tier::Device, Band::Clear, 0);
+        assert!(pressure_round(&mut registry, None, &keys).1.is_empty());
+        PRESSED.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn the_default_responder_stands_back_where_the_policy_answers_tier_pressure() {
+        let _turn = TURN.lock().expect("the turn lock poisoned");
+        let manifest = |name| {
+            let builtin = builtins::policy(name).unwrap();
+            Manifest::of(builtin.component, &|_| true).unwrap()
+        };
+        let answering = manifest("test-pressure");
+        let deaf = manifest("noop");
+        assert!(answers_pressure(Some(&answering)));
+        assert!(!answers_pressure(Some(&deaf)));
+        assert!(!answers_pressure(None));
+
+        let mut registry = Registry::new(PRESSED_CACHE);
+        let (ids, keys) = three_sets();
+        pressed(&mut registry, Tier::Device, Band::Short, 250);
+        let (left, discarded) = pressure_round(&mut registry, Some(&answering), &keys);
+        assert_eq!(left, [Tier::Device], "the policy's to answer");
+        assert!(discarded.is_empty());
+        assert_eq!(remaining(), ids, "nothing discarded");
+
+        // A policy that does not listen gets the default.
+        pressed(&mut registry, Tier::Device, Band::Short, 50);
+        let (left, discarded) = pressure_round(&mut registry, Some(&deaf), &keys);
+        assert!(left.is_empty());
+        assert_eq!(discarded, [ids[1]], "the lowest key alone covers 50");
+        PRESSED.lock().unwrap().clear();
     }
 }

@@ -283,3 +283,30 @@ fn an_overrun_is_cut_off_at_the_deadline() {
         );
     }
 }
+
+#[test]
+fn a_tier_pressure_edge_reaches_a_worker_policy_that_reads_the_tier_s_attrs() {
+    let mut program = load("test-pressure");
+    let worker = || Subject::Worker("self".into());
+    let plane = Fake::default()
+        .attr(worker(), "device-band", Value::Text("short".into()))
+        .attr(worker(), "device-short-bytes", Value::Int(4096))
+        .attr(worker(), "device-total-bytes", Value::Int(1 << 30));
+    let edges = vec![Edge::TierPressure("self".into())];
+    let commit = program.react(Box::new(plane.clone()), edges, 0).unwrap();
+    let published: Vec<_> = commit
+        .publish
+        .iter()
+        .map(|(name, value)| format!("{name}={value:?}"))
+        .collect();
+    assert_eq!(
+        published,
+        [
+            format!("device-band={:?}", Some(Value::Text("short".into()))),
+            format!("device-short-bytes={:?}", Some(Value::Int(4096))),
+            format!("device-total-bytes={:?}", Some(Value::Int(1 << 30))),
+        ]
+    );
+    let commit = program.react(Box::new(plane), arrived("a"), 0).unwrap();
+    assert!(commit.publish.is_empty(), "another edge does not run it");
+}

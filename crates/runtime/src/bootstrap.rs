@@ -444,6 +444,13 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             )
         })
         .collect();
+    let scales: Vec<crate::policy::pressure::Scale> = engine_configs
+        .iter()
+        .map(|d| crate::policy::pressure::Scale {
+            kv_page_bytes: d.resizable_kv_page_bytes,
+            state_slot_bytes: d.rs_cache_slot_bytes,
+        })
+        .collect();
     let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
     let arena_disk_pages: Vec<u32> = engine_configs.iter().map(|d| d.disk_pages).collect();
     let arena_disk_kept: Vec<Option<KeptDisk>> =
@@ -526,6 +533,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // runs on one of them.
     let mut extents = Vec::new();
     for engine in 0..engines.len().max(1) {
+        // What the worker policy reads tier bytes at; a page of unknown size
+        // leaves them unread.
+        crate::policy::pressure::scale(engine, scales.get(engine).copied().unwrap_or_default());
         let mut pool = crate::planner::RegistryPool::new(arena_model_idx, engine, kv_swap_capable);
         if let Some(&(page_bytes, whole, slot_bytes)) =
             resizable.get(engine).filter(|(bytes, ..)| *bytes > 0)
@@ -553,6 +563,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some((name, component)) = &config.policy {
         crate::policy::start(name, component).with_context(|| format!("worker policy {name}"))?;
+    } else {
+        // No policy: the thread still keeps its record, and the default
+        // responder answers tier pressure.
+        crate::policy::start_default().context("the default worker policy thread")?;
     }
     if let Some(period) = std::env::var("PIE_CONTENTION_TRACE_MS")
         .ok()

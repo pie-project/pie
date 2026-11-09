@@ -1,0 +1,5 @@
+# Answers tier pressure itself, with nothing but what it read: the host's
+# default responder must stand back, and its tests read the attrs back.
+plane = "worker"
+subscribe = ["tier-pressure"]
+grants = ["publish"]

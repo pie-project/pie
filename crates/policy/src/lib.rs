@@ -166,6 +166,13 @@ pub mod worker {
         fn on_offload_failed(&mut self, _process: &Id) {}
         fn on_prop_changed(&mut self, _change: &Change) {}
         fn on_closed(&mut self, _session: &Id) {}
+        /// A tier of this worker moved from one pressure band to another
+        /// (worker attrs `{device,host}-band`, `-short-bytes`, and
+        /// `-{total,state,live,wanted,act}-bytes`). Room is made with the
+        /// verbs a policy has: `discard`, or lower retention keys. A worker
+        /// whose policy does not subscribe answers with its own default:
+        /// the lowest retention key goes first.
+        fn on_tier_pressure(&mut self, _worker: &Id) {}
         fn on_timer(&mut self) {}
 
         /// Once per `react`, after every edge: where a policy installs its
@@ -187,6 +194,7 @@ pub mod worker {
                 Edge::OffloadFailed(process) => policy.on_offload_failed(process),
                 Edge::PropChanged(change) => policy.on_prop_changed(change),
                 Edge::Closed(session) => policy.on_closed(session),
+                Edge::TierPressure(worker) => policy.on_tier_pressure(worker),
                 Edge::Timer => policy.on_timer(),
                 // Cluster edges: a worker host does not send them.
                 Edge::Dispatched(_)
@@ -196,7 +204,6 @@ pub mod worker {
                 | Edge::MigrationFailed(_)
                 | Edge::Copied(_)
                 | Edge::Dropped(_)
-                | Edge::TierPressure(_)
                 | Edge::LinkChanged(_)
                 | Edge::PlacementChanged(_)
                 | Edge::ReplicationChanged(_)
