@@ -5,6 +5,7 @@ pub mod index;
 pub mod merge;
 pub mod mla;
 pub mod paged;
+pub(crate) mod pages;
 pub mod pool;
 pub mod ragged;
 pub mod rel;
