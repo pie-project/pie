@@ -122,6 +122,74 @@ pub fn select_fp8_w8a8(
     // (`kernel.moe.fp8a8_ws_from`): 128 routes by 128 weight rows a CTA.
     let ws_from = ctx.tuning().fp8a8_ws_from;
     if hopper_wgmma() && ws_from > 0 && per >= ws_from {
+        // The weight rows by TMA, persistent (`kernel.moe.fp8a8_tma`).
+        if ctx.tuning().fp8a8_tma && y.width.is_multiple_of(256) && !ctx.tuning().fp8a8_ws_narrow {
+            use crate::linear::gemm_sm100::{Map, encode};
+            use cudarc::driver::sys as dr;
+            let stages: u32 = 4;
+            let RouteOrder {
+                order,
+                offsets,
+                work,
+                work_cap,
+            } = route_order_sliced(
+                ctx,
+                OP,
+                routes,
+                &fan,
+                experts,
+                128,
+                true,
+                if KEEP_NEXT.with(core::cell::Cell::get) {
+                    Share::Keep
+                } else {
+                    Share::Take
+                },
+            )?;
+            let map_w = encode(Map {
+                ptr: codes,
+                ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                dims: [x.width, experts * y.width, 0],
+                strides: [u64::from(x.width), 0],
+                boxes: [128, 128, 1],
+                swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            })?;
+            let ctas = (work_cap * (y.width / 256)).min(ctx.multiprocessors().unwrap_or(132));
+            // The jobs' ticket, zero at each fire.
+            let ticket = ctx.scratch(OP, "linear.fp8a8_tma_ticket", 4)? as u64;
+            // SAFETY: the 4 bytes just taken, on this context's stream.
+            let code = unsafe {
+                cudarc::runtime::sys::cudaMemsetAsync(ticket as *mut _, 0, 4, ctx.stream().cast())
+            };
+            if code != cudarc::runtime::sys::cudaError::cudaSuccess {
+                return Err(refuse(OP, format!("cudaMemsetAsync answered {code:?}")));
+            }
+            return ctx.fire(
+                OP,
+                Fire::at(kernel(
+                    SELECT_SM90,
+                    &format!("::pie::linear::moe_select_fp8a8_tma<{stages}>"),
+                ))
+                .apply(
+                    Launch::grid([ctas, 1, 1], [384, 1, 1]).smem(stages * 49152 + 1024 + 128 + 64),
+                ),
+                &[
+                    ArgValue::of(&map_w),
+                    ArgValue::Ptr(xq),
+                    ArgValue::Ptr(xe),
+                    ArgValue::Ptr(order),
+                    ArgValue::Ptr(offsets),
+                    ArgValue::Ptr(work),
+                    ArgValue::Ptr(atoms),
+                    y.arg(),
+                    act_div.arg(),
+                    n.arg(),
+                    stated(OP, x.width)?.arg(),
+                    stated(OP, experts)?.arg(),
+                    ArgValue::Ptr(ticket),
+                ],
+            );
+        }
         // Two 128-row halves a CTA where N is whole 256s (the routes' rows
         // read half as often), four stages; one, six stages.
         let halves: u32 = if y.width.is_multiple_of(256) && !ctx.tuning().fp8a8_ws_narrow {
