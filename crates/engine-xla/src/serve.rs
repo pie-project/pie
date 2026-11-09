@@ -1880,6 +1880,27 @@ impl Shell {
         let program = match found {
             Some(program) => program,
             None => {
+                // (class, lanes, rows) of the shape the ladder did not warm.
+                let mut by: Vec<(u32, u32, u32)> = Vec::new();
+                for l in &descriptor.lanes {
+                    match by.iter_mut().find(|(c, ..)| *c == l.class) {
+                        Some(e) => {
+                            e.1 += 1;
+                            e.2 += l.rows;
+                        }
+                        None => by.push((l.class, 1, l.rows)),
+                    }
+                }
+                tracing::info!(
+                    rows,
+                    bucket = descriptor.bucket,
+                    lanes = lane_count,
+                    max_pages,
+                    readouts = readout_rows.len(),
+                    canonical,
+                    by = ?by,
+                    "xla fire shape not warm"
+                );
                 let program = self.trace_fire(
                     &slots,
                     &caches,
