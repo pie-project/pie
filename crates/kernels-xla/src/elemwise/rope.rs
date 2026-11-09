@@ -248,8 +248,9 @@ fn turn_flat(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
     let dims = f.dims(x).to_vec();
     let (rows, width) = (dims[0], dims[1]);
     let unit = t.unit;
-    let w = usize::try_from(width).unwrap_or(0);
-    let col = |c: usize| c % unit;
+    if 128 % unit != 0 || width % 128 != 0 {
+        return Ok(None);
+    }
     let mut shifts: Vec<i64> = Vec::new();
     for c in 0..unit {
         let d = t.partner[c] - c as i64;
@@ -260,6 +261,24 @@ fn turn_flat(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
     if shifts.len() > 2 {
         return Ok(None);
     }
+    // Every table over one lane tile (the heads repeat within it), laid
+    // across the row's tiles: a tile-aligned reshape, and the sines over 128
+    // columns, not the width's (v5e: 64x the transcendentals cost 2 ms of a
+    // 66 ms 1792-row fire).
+    let lane = 128i64;
+    let blocks = width / lane;
+    let col = |c: usize| c % unit;
+    let wide = |f: &mut Func, v: Val| -> Result<Val, Error> {
+        let v = f.broadcast(v, &[rows, blocks, lane], &[0, 2])?;
+        Ok(f.reshape(v, &[rows, width])?)
+    };
+    let mask = |f: &mut Func, bits: &[i64]| -> Result<Val, Error> {
+        let here = f.const_ints(Elem::I32, bits, &[lane])?;
+        let zero = f.const_i(Elem::I32, 0, &[lane]);
+        let here = f.compare(Cmp::Ne, here, zero)?;
+        let here = f.broadcast(here, &[rows, blocks, lane], &[2])?;
+        Ok(f.reshape(here, &[rows, width])?)
+    };
     let mut ang: Option<Val> = None;
     for (axis, freq) in t.freq.iter().enumerate() {
         if freq.iter().all(|&f| f == 0.0) {
@@ -267,10 +286,10 @@ fn turn_flat(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
         }
         let p = f.slice_axis(pos, 1, axis as i64, axis as i64 + 1)?;
         let p = f.reshape(p, &[rows])?;
-        let p = f.broadcast(p, &[rows, width], &[0])?;
-        let fs: Vec<f64> = (0..w).map(|c| f64::from(freq[col(c)])).collect();
-        let fq = f.const_floats(Elem::F32, &fs, &[width])?;
-        let fq = f.broadcast(fq, &[rows, width], &[1])?;
+        let p = f.broadcast(p, &[rows, lane], &[0])?;
+        let fs: Vec<f64> = (0..128).map(|c| f64::from(freq[col(c)])).collect();
+        let fq = f.const_floats(Elem::F32, &fs, &[lane])?;
+        let fq = f.broadcast(fq, &[rows, lane], &[1])?;
         let a = f.mul(p, fq)?;
         ang = Some(match ang {
             Some(prev) => f.add(prev, a)?,
@@ -283,7 +302,7 @@ fn turn_flat(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
     let mut c = f.cos(ang);
     let mut s = f.sin(ang);
     if t.mscale != 1.0 {
-        let m: Vec<f64> = (0..w)
+        let m: Vec<f64> = (0..128)
             .map(|i| {
                 if t.sign[col(i)] == 0.0 {
                     1.0
@@ -292,15 +311,17 @@ fn turn_flat(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
                 }
             })
             .collect();
-        let m = f.const_floats(Elem::F32, &m, &[width])?;
-        let m = f.broadcast(m, &[rows, width], &[1])?;
+        let m = f.const_floats(Elem::F32, &m, &[lane])?;
+        let m = f.broadcast(m, &[rows, lane], &[1])?;
         c = f.mul(c, m)?;
         s = f.mul(s, m)?;
     }
-    let sign: Vec<f64> = (0..w).map(|i| f64::from(t.sign[col(i)])).collect();
-    let sign = f.const_floats(Elem::F32, &sign, &[width])?;
-    let sign = f.broadcast(sign, &[rows, width], &[1])?;
+    let sign: Vec<f64> = (0..128).map(|i| f64::from(t.sign[col(i)])).collect();
+    let sign = f.const_floats(Elem::F32, &sign, &[lane])?;
+    let sign = f.broadcast(sign, &[rows, lane], &[1])?;
     let s = f.mul(s, sign)?;
+    let c = wide(f, c)?;
+    let s = wide(f, s)?;
     // Each partner `d` lanes on: the row rolled by `d`, picked where it is.
     let mut xp: Option<Val> = None;
     for &d in &shifts {
@@ -315,13 +336,10 @@ fn turn_flat(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
         xp = Some(match xp {
             None => rolled,
             Some(prev) => {
-                let here: Vec<i64> = (0..w)
+                let here: Vec<i64> = (0..128)
                     .map(|i| i64::from(t.partner[col(i)] - col(i) as i64 == d))
                     .collect();
-                let here = f.const_ints(Elem::I32, &here, &[width])?;
-                let zero = f.const_i(Elem::I32, 0, &[width]);
-                let here = f.compare(Cmp::Ne, here, zero)?;
-                let here = f.broadcast(here, &[rows, width], &[1])?;
+                let here = mask(f, &here)?;
                 f.select(here, rolled, prev)?
             }
         });
@@ -333,11 +351,8 @@ fn turn_flat(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
     let b = f.mul(xp, s)?;
     let turned = f.add(a, b)?;
     Ok(Some(if t.sign.contains(&0.0) {
-        let moved: Vec<i64> = (0..w).map(|i| i64::from(t.sign[col(i)] != 0.0)).collect();
-        let moved = f.const_ints(Elem::I32, &moved, &[width])?;
-        let zero = f.const_i(Elem::I32, 0, &[width]);
-        let moved = f.compare(Cmp::Ne, moved, zero)?;
-        let moved = f.broadcast(moved, &[rows, width], &[1])?;
+        let moved: Vec<i64> = (0..128).map(|i| i64::from(t.sign[col(i)] != 0.0)).collect();
+        let moved = mask(f, &moved)?;
         f.select(moved, turned, x)?
     } else {
         turned
