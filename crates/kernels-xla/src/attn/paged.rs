@@ -521,6 +521,13 @@ fn logits(
                 let top = scalar_i(f, 0);
                 f.dynamic_slice(wide, &[top, start], &[rb, c])?
             }
+            // A one-byte plane (no lane states a mask) reads its row's byte
+            // at every key: a broadcast, where a gather of a byte a cell
+            // took 0.1-0.3 ms a layer at 256 decode lanes (v6e gpt-oss).
+            None if pitch == 1 => {
+                let col = f.reshape(plane, &[rb])?;
+                f.broadcast(col, &dims, &[0])?
+            }
             None => {
                 let col = clamp_i(f, kp, 0, pitch - 1)?;
                 let r = f.iota(Elem::I32, &dims, 0);
