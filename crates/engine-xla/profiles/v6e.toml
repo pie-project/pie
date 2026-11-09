@@ -16,6 +16,9 @@ attn.block_rows = 256
 # a prompt's narrow-head rope turns the row as it lies, no `[rows, heads, 64]` relayouts (gpt-oss-20b
 # 4096-row pf256 fire 125.5 -> 123.4 ms; a v5e loses by as much, so it stays off there)
 rope.flat_rows = 1024
+# a batched decode's keys in chunks of 64 Mi elements: 128 keys a row at 256 lanes, not 32, a quarter of
+# the walk's passes (Qwen3-0.6B c256 step 20.9 -> 18.3 ms); one lane's and a prefill's chunks unchanged
+attn.budget_mi = 64
 
 [provenance]
 measured = [
