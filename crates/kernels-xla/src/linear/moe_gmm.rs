@@ -220,6 +220,7 @@ impl Gmm {
     pub fn prefetching(&self) -> bool {
         self.prefetch
             && !self.scaled
+            && !self.tile
             && !self.bias
             && matches!(self.cut(), Ok(Cut::Blocked { tn }) if tn == self.n)
     }
