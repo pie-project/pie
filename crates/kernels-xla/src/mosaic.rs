@@ -44,6 +44,8 @@ fn bad<T>(detail: impl Into<String>) -> Built<T> {
 pub enum Space {
     Vmem,
     Smem,
+    /// Wherever XLA put it (HBM): a kernel reaches it only by DMA.
+    Any,
 }
 
 impl Space {
@@ -51,6 +53,7 @@ impl Space {
         match self {
             Self::Vmem => "#tpu.memory_space<vmem>",
             Self::Smem => "#tpu.memory_space<smem>",
+            Self::Any => "#tpu.memory_space<any>",
         }
     }
 }
@@ -63,6 +66,8 @@ pub enum MTy {
     Index,
     Vector(Vec<i64>, Elem),
     Ref(Vec<i64>, Elem, Space),
+    /// DMA semaphores (`dims` may be empty: one).
+    Sems(Vec<i64>),
 }
 
 /// Mosaic spells integers signless.
@@ -98,6 +103,16 @@ impl fmt::Display for MTy {
             Self::Index => f.write_str("index"),
             Self::Vector(d, e) => write!(f, "vector<{}>", shape(d, *e)),
             Self::Ref(d, e, s) => write!(f, "memref<{}, {}>", shape(d, *e), s.mlir()),
+            Self::Sems(d) => {
+                let mut x = String::new();
+                for n in d {
+                    let _ = write!(x, "{n}x");
+                }
+                write!(
+                    f,
+                    "memref<{x}!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>"
+                )
+            }
         }
     }
 }
@@ -239,7 +254,11 @@ impl Body {
 
     fn int_binary(&mut self, op: &str, a: V, b: V, flags: bool) -> Built<V> {
         let t = self.ty(a).clone();
-        if &t != self.ty(b) || !matches!(t, MTy::I32 | MTy::Index | MTy::I1) {
+        let int = match &t {
+            MTy::Vector(_, e) => matches!(e, Elem::I32 | Elem::Pred),
+            t => matches!(t, MTy::I32 | MTy::Index | MTy::I1),
+        };
+        if &t != self.ty(b) || !int {
             return bad(format!("{op} over {t} and {}", self.ty(b)));
         }
         let attrs = if flags {
@@ -280,16 +299,25 @@ impl Body {
         if self.ty(a) != self.ty(b) {
             return bad(format!("cmpi over {} and {}", self.ty(a), self.ty(b)));
         }
+        let out = self.mask_of(a);
         Ok(self.op1(
             "arith.cmpi",
             &[a, b],
             &format!("predicate = {} : i64", p as i64),
-            MTy::I1,
+            out,
         ))
     }
 
+    /// The i1 type shaped like `v`.
+    fn mask_of(&self, v: V) -> MTy {
+        match self.ty(v) {
+            MTy::Vector(d, _) => MTy::Vector(d.clone(), Elem::Pred),
+            _ => MTy::I1,
+        }
+    }
+
     pub fn select(&mut self, c: V, a: V, b: V) -> Built<V> {
-        if self.ty(a) != self.ty(b) || self.ty(c) != &MTy::I1 {
+        if self.ty(a) != self.ty(b) || self.ty(c) != &self.mask_of(a) {
             return bad("select over mismatched operands");
         }
         let t = self.ty(a).clone();
@@ -399,8 +427,93 @@ impl Body {
     /// A float vector of `x` everywhere.
     pub fn splat_f(&mut self, dims: &[i64], elem: Elem, x: f64) -> Built<V> {
         let t = MTy::Vector(dims.to_vec(), elem);
-        let lit = format!("dense<{x:.9e}> : {t}");
+        let lit = format!("dense<{}> : {t}", float_lit(x, elem)?);
         Ok(self.op1("arith.constant", &[], &format!("value = {lit}"), t))
+    }
+
+    /// `v` (a scalar or a vector) broadcast to `dims` (`vector.broadcast`:
+    /// a vector's unit axes stretch).
+    pub fn broadcast(&mut self, v: V, dims: &[i64]) -> Built<V> {
+        let elem = match self.ty(v) {
+            MTy::I32 => Elem::I32,
+            MTy::Vector(d, e) if d.len() == dims.len() => *e,
+            t => return bad(format!("broadcast of {t} to {dims:?}")),
+        };
+        Ok(self.op1(
+            "vector.broadcast",
+            &[v],
+            "",
+            MTy::Vector(dims.to_vec(), elem),
+        ))
+    }
+
+    /// The i32 index along `axis` of a `dims` vector (`tpu.iota`).
+    pub fn iota(&mut self, dims: &[i64], axis: usize) -> V {
+        self.op1(
+            "tpu.iota",
+            &[],
+            &format!("dimensions = array<i32: {axis}>"),
+            MTy::Vector(dims.to_vec(), Elem::I32),
+        )
+    }
+
+    /// `v` reshaped to `dims`, its elements in order (`vector.shape_cast`).
+    pub fn shape_cast(&mut self, v: V, dims: &[i64]) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.iter().product::<i64>() != dims.iter().product::<i64>() {
+            return bad(format!("shape_cast of {d:?} to {dims:?}"));
+        }
+        Ok(self.op1("vector.shape_cast", &[v], "", MTy::Vector(dims.to_vec(), e)))
+    }
+
+    /// The maximum (`max`) or sum of a 2-d f32 vector along axis 1, kept as
+    /// `[rows, 1]` (`vector.multi_reduction`).
+    pub fn reduce_rows(&mut self, v: V, max: bool) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.len() != 2 || e != Elem::F32 {
+            return bad(format!("a row reduction of {}", self.ty(v)));
+        }
+        let init = self.splat_f(&[d[0]], e, if max { f64::NEG_INFINITY } else { 0.0 })?;
+        let kind = if max { "maximumf" } else { "add" };
+        let r = self.op1(
+            "vector.multi_reduction",
+            &[v, init],
+            &format!("kind = #vector.kind<{kind}>, reduction_dims = array<i64: 1>"),
+            MTy::Vector(vec![d[0]], e),
+        );
+        self.shape_cast(r, &[d[0], 1])
+    }
+
+    /// `e^v` elementwise.
+    pub fn exp(&mut self, v: V) -> Built<V> {
+        let t = self.ty(v).clone();
+        if !matches!(&t, MTy::Vector(_, e) if e.is_float()) {
+            return bad(format!("exp of {t}"));
+        }
+        Ok(self.op1("math.exp", &[v], "fastmath = #arith.fastmath<none>", t))
+    }
+
+    /// `ln v` elementwise.
+    pub fn log(&mut self, v: V) -> Built<V> {
+        let t = self.ty(v).clone();
+        if !matches!(&t, MTy::Vector(_, e) if e.is_float()) {
+            return bad(format!("log of {t}"));
+        }
+        Ok(self.op1("math.log", &[v], "fastmath = #arith.fastmath<none>", t))
+    }
+
+    /// `a > b` elementwise (ordered).
+    pub fn gtf(&mut self, a: V, b: V) -> Built<V> {
+        if self.ty(a) != self.ty(b) {
+            return bad(format!("cmpf over {} and {}", self.ty(a), self.ty(b)));
+        }
+        let out = self.mask_of(a);
+        Ok(self.op1(
+            "arith.cmpf",
+            &[a, b],
+            "fastmath = #arith.fastmath<none>, predicate = 2 : i64",
+            out,
+        ))
     }
 
     fn vec_of(&self, v: V) -> Built<(Vec<i64>, Elem)> {
@@ -443,6 +556,18 @@ impl Body {
         self.float_binary("arith.mulf", a, b)
     }
 
+    pub fn subf(&mut self, a: V, b: V) -> Built<V> {
+        self.float_binary("arith.subf", a, b)
+    }
+
+    pub fn maxf(&mut self, a: V, b: V) -> Built<V> {
+        self.float_binary("arith.maximumf", a, b)
+    }
+
+    pub fn divf(&mut self, a: V, b: V) -> Built<V> {
+        self.float_binary("arith.divf", a, b)
+    }
+
     /// `acc + lhs · rhs` over 2-d vectors, contracting `lhs`'s axis 1 with
     /// `rhs`'s axis 0 (`[m, k]·[k, n]`), or with its axis 1 when `rhs_t`
     /// (`[m, k]·[n, k]ᵀ`). The accumulator's type is the result's.
@@ -480,6 +605,111 @@ impl Body {
     }
 
     // ------------------------------------------------------------ control
+
+    /// The `dims` window of reference `r` at `at` (i32 offsets, one per
+    /// axis) as a reference of its own (`tpu.memref_slice`).
+    pub fn slice_ref(&mut self, r: V, at: &[V], dims: &[i64]) -> Built<V> {
+        let out = match self.ty(r).clone() {
+            MTy::Ref(d, e, s) if d.len() == at.len() && dims.len() == d.len() => {
+                MTy::Ref(dims.to_vec(), e, s)
+            }
+            MTy::Sems(d) if d.len() == at.len() && dims.len() == d.len() => {
+                MTy::Sems(dims.to_vec())
+            }
+            t => return bad(format!("a {dims:?} slice of {t}")),
+        };
+        if at.iter().any(|&v| self.ty(v) != &MTy::I32) {
+            return bad("a reference slice at non-i32 offsets");
+        }
+        let mut ops = vec![r];
+        ops.extend_from_slice(at);
+        Ok(self.op1(
+            "tpu.memref_slice",
+            &ops,
+            &format!("operandSegmentSizes = array<i32: 1, {}, 0>", at.len()),
+            out,
+        ))
+    }
+
+    /// `r` without its leading unit axes (`tpu.memref_squeeze`).
+    pub fn squeeze(&mut self, r: V) -> Built<V> {
+        let drop = |d: &[i64]| {
+            d.iter()
+                .skip_while(|&&n| n == 1)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let out = match self.ty(r).clone() {
+            MTy::Ref(d, e, s) => MTy::Ref(drop(&d), e, s),
+            MTy::Sems(d) => MTy::Sems(drop(&d)),
+            t => return bad(format!("a squeeze of {t}")),
+        };
+        Ok(self.op1("tpu.memref_squeeze", &[r], "", out))
+    }
+
+    /// Starts copying `src` into `dst` (same shape), signalling `sem`
+    /// (`tpu.enqueue_dma`).
+    pub fn dma(&mut self, src: V, dst: V, sem: V) -> Built<()> {
+        self.dma_check(src, dst, sem)?;
+        self.op(
+            "tpu.enqueue_dma",
+            &[src, dst, sem],
+            "operandSegmentSizes = array<i32: 1, 0, 1, 1, 0, 0, 0>, priority = 0 : i32, \
+             strict_ordering = false",
+            &[],
+        );
+        Ok(())
+    }
+
+    /// Waits for the copy of `src` into `dst` that signals `sem`
+    /// (`tpu.wait_dma2`).
+    pub fn dma_wait(&mut self, src: V, dst: V, sem: V) -> Built<()> {
+        self.dma_check(src, dst, sem)?;
+        self.op(
+            "tpu.wait_dma2",
+            &[sem, src, dst],
+            "operandSegmentSizes = array<i32: 1, 1, 1, 0, 0>, strict_ordering = false",
+            &[],
+        );
+        Ok(())
+    }
+
+    fn dma_check(&self, src: V, dst: V, sem: V) -> Built<()> {
+        match (self.ty(src), self.ty(dst), self.ty(sem)) {
+            (MTy::Ref(a, x, _), MTy::Ref(b, y, _), MTy::Sems(s))
+                if a == b && x == y && s.is_empty() =>
+            {
+                Ok(())
+            }
+            (a, b, c) => bad(format!("a copy of {a} into {b} on {c}")),
+        }
+    }
+
+    /// `for i in lb..ub step st { body(i) }` over i32 bounds (`scf.for`, no
+    /// carried values).
+    pub fn for_range(
+        &mut self,
+        lb: V,
+        ub: V,
+        st: V,
+        body: impl FnOnce(&mut Self, V) -> Built<()>,
+    ) -> Built<()> {
+        if [lb, ub, st].iter().any(|&v| self.ty(v) != &MTy::I32) {
+            return bad("scf.for over non-i32 bounds");
+        }
+        let names = self.list(&[lb, ub, st], |b, v| b.names[v.0 as usize].clone());
+        let iv = self.fresh(format!("%iv{}", self.next), MTy::I32);
+        self.next += 1;
+        let ivn = self.names[iv.0 as usize].clone();
+        self.line(&format!("\"stable_mosaic.scf.for\"({names}) ({{"));
+        self.line(&format!("^bb0({ivn}: i32):"));
+        self.depth += 1;
+        body(self, iv)?;
+        self.line("\"stable_mosaic.scf.yield\"() : () -> ()");
+        self.depth -= 1;
+        self.line("}) : (i32, i32, i32) -> ()");
+        Ok(())
+    }
 
     /// `scf.if cond { then }` (no results).
     pub fn when(&mut self, cond: V, then: impl FnOnce(&mut Self) -> Built<()>) -> Built<()> {
@@ -524,6 +754,9 @@ pub enum Window {
     /// The index is an element offset along each axis (it need not be a
     /// multiple of the block; the DMA wants it tile-aligned).
     Element,
+    /// No window: the kernel gets the whole array where it lies
+    /// ([`Space::Any`]) and copies what it reads itself ([`Body::dma`]).
+    Any,
 }
 
 /// The grid ids and the prefetched scalars' references, as a transform or
@@ -558,6 +791,9 @@ pub struct Kernel {
     /// The scoped VMEM the kernel may use (the compiler's default is
     /// 32 MiB on v6e).
     pub vmem_limit: Option<u64>,
+    /// Buffers that live across the grid's steps (Pallas's scratch): VMEM
+    /// references or DMA semaphores.
+    pub scratch: Vec<MTy>,
 }
 
 /// What the kernel body gets: the grid and one VMEM block per operand and
@@ -566,6 +802,7 @@ pub struct Blocks {
     pub grid: Grid,
     pub ins: Vec<V>,
     pub outs: Vec<V>,
+    pub scratch: Vec<V>,
 }
 
 /// A kernel ready to call from StableHLO.
@@ -621,7 +858,14 @@ impl Kernel {
             .ins
             .iter()
             .chain(&self.outs)
-            .map(|o| MTy::Ref(o.block.clone(), o.elem, Space::Vmem))
+            .map(|o| {
+                let space = if o.window == Window::Any {
+                    Space::Any
+                } else {
+                    Space::Vmem
+                };
+                MTy::Ref(o.block.clone(), o.elem, space)
+            })
             .collect();
 
         let mut s = String::new();
@@ -634,10 +878,12 @@ impl Kernel {
         let mut args = grid_tys.clone();
         args.extend(pre_tys.iter().cloned());
         args.extend(block_tys.iter().cloned());
+        args.extend(self.scratch.iter().cloned());
         let (mut b, vs) = Body::new(&args);
         let (g, rest) = vs.split_at(grid_tys.len());
         let (p, rest) = rest.split_at(pre_tys.len());
-        let (ins, outs) = rest.split_at(self.ins.len());
+        let (ins, rest) = rest.split_at(self.ins.len());
+        let (outs, scratch) = rest.split_at(self.outs.len());
         let blocks = Blocks {
             grid: Grid {
                 ids: g.to_vec(),
@@ -645,6 +891,7 @@ impl Kernel {
             },
             ins: ins.to_vec(),
             outs: outs.to_vec(),
+            scratch: scratch.to_vec(),
         };
         body(&mut b, &blocks)?;
         b.ret(&[]);
@@ -663,9 +910,12 @@ impl Kernel {
             .chain(&self.outs)
             .enumerate()
             .map(|(i, o)| {
+                if o.window == Window::Any {
+                    return "{}".to_string();
+                }
                 let bounds = o.block.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
                 let kind = match o.window {
-                    Window::Blocked => String::new(),
+                    Window::Blocked | Window::Any => String::new(),
                     Window::Element => {
                         let z = vec!["0"; o.block.len()].join(", ");
                         format!(", window_kind = #tpu.element_window<[{z}], [{z}]>")
@@ -700,10 +950,11 @@ impl Kernel {
         let _ = writeln!(
             s,
             "  }}) {{dimension_semantics = [{sems}], function_type = {}, iteration_bounds = \
-             array<i64: {bounds}>, scalar_prefetch = {} : i64, scratch_operands = 0 : i64, sym_name \
+             array<i64: {bounds}>, scalar_prefetch = {} : i64, scratch_operands = {} : i64, sym_name \
              = \"{}\", tpu.core_type = #tpu.core_type<tc>, window_params = [{windows}]}} : () -> ()",
             fty(&args, &[]),
             self.prefetch.len(),
+            self.scratch.len(),
             self.name
         );
 
@@ -711,6 +962,9 @@ impl Kernel {
         let mut targs = grid_tys.clone();
         targs.extend(pre_tys.iter().cloned());
         for (i, o) in self.ins.iter().chain(&self.outs).enumerate() {
+            if o.window == Window::Any {
+                continue;
+            }
             let (mut b, vs) = Body::new(&targs);
             let (g, p) = vs.split_at(grid_tys.len());
             let grid = Grid {
@@ -767,6 +1021,21 @@ impl Kernel {
             results,
         })
     }
+}
+
+/// A float literal as MLIR spells it (infinities by their bits).
+fn float_lit(x: f64, elem: Elem) -> Built<String> {
+    if x.is_finite() {
+        return Ok(format!("{x:.9e}"));
+    }
+    let neg = x < 0.0;
+    Ok(match elem {
+        Elem::F32 if neg => "0xFF800000".into(),
+        Elem::F32 => "0x7F800000".into(),
+        Elem::Bf16 if neg => "0xFF80".into(),
+        Elem::Bf16 => "0x7F80".into(),
+        e => return bad(format!("an infinity of {e:?}")),
+    })
 }
 
 fn write_func(s: &mut String, args: &[MTy], body: &str) {
@@ -876,6 +1145,7 @@ mod tests {
                 index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
             }],
             vmem_limit: None,
+            scratch: vec![],
         };
         let c = k
             .build(|b, blk| {

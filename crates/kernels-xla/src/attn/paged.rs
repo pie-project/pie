@@ -26,7 +26,7 @@ use dtype::Dtype;
 use super::{DecodePlan, PrefillPlan};
 use crate::check::expect;
 use crate::error::{Error, refuse};
-use crate::hlo::{Built, Cmp, Elem, Fold, Func, GatherDims, Malformed, Val};
+use crate::hlo::{Built, Cmp, Elem, Fold, Func, GatherDims, Malformed, Ty, Val};
 use crate::tensor::{KvPool, Landing, Operand, RaggedTensor, Stored};
 use crate::tuning::Chunks;
 use crate::tuning::Tuning;
@@ -1943,6 +1943,62 @@ pub fn attend(
             scale,
             ch,
         )?,
+        (Walk::PerRow, None)
+            if rule.rel.is_none()
+                && rule.bits.is_none()
+                && rule.rbias.is_none()
+                && super::pages::fits(geom.span, &heads, tuning.vmem_cap()) =>
+        {
+            // A decode's rows copy their own pages into VMEM; a fire whose
+            // rows carry a custom mask walks them as before.
+            let copied = |f: &mut Func| -> Built<Flashed> {
+                super::pages::attend(
+                    f,
+                    rs.q,
+                    keys,
+                    values,
+                    geom.pt,
+                    lane,
+                    rs.lo,
+                    rs.hi,
+                    geom.pages,
+                    geom.ps,
+                    &heads,
+                    scale,
+                    tuning.vmem_cap(),
+                )
+            };
+            match rs.enabled {
+                None => copied(f)?,
+                Some(en) => {
+                    let on = cmp_i(f, Cmp::Ne, en, 0)?;
+                    let any = f.reduce(on, &[0], Fold::Or)?;
+                    let at = f.convert(any, Elem::I32);
+                    let o = f.dims(rs.q).to_vec();
+                    let stat = Ty::new(Elem::F32, &o[..3]);
+                    let outs = [
+                        Ty::new(Elem::F32, &[o[0], o[1], o[2], heads.dv]),
+                        stat.clone(),
+                        stat,
+                    ];
+                    let plain: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
+                        let fl = copied(f)?;
+                        Ok(vec![fl.o, fl.m, fl.l])
+                    });
+                    let walked: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
+                        let fl =
+                            per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?;
+                        Ok(vec![fl.o, fl.m, fl.l])
+                    });
+                    let out = f.case(at, &outs, vec![plain, walked])?;
+                    Flashed {
+                        o: out[0],
+                        m: out[1],
+                        l: out[2],
+                    }
+                }
+            }
+        }
         _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?,
     };
     let lse = match call.lse {

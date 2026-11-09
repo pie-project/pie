@@ -275,6 +275,7 @@ impl Gmm {
             ins: vec![xs, bank],
             outs: vec![out],
             vmem_limit: Some(limit as u64),
+            scratch: vec![],
         };
         kernel.build(|b, blk| {
             let zero = b.index(0);
