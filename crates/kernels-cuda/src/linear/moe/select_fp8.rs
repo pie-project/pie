@@ -171,7 +171,8 @@ pub fn select_fp8_w8a8(
                     &format!("::pie::linear::moe_select_fp8a8_tma<{stages}>"),
                 ))
                 .apply(
-                    Launch::grid([ctas, 1, 1], [384, 1, 1]).smem(stages * 49152 + 1024 + 128 + 64),
+                    Launch::grid([ctas, 1, 1], [384, 1, 1])
+                        .smem(stages * 49152 + 1024 + 192 + 32768),
                 ),
                 &[
                     ArgValue::of(&map_w),

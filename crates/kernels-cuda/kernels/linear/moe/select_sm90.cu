@@ -1008,9 +1008,10 @@ __device__ __forceinline__ void tma(void* dst, unsigned long long* bar, const Tm
 /// once from memory, an expert's weight rows while its items run), its first
 /// its index and each later one off `ticket` (zero at launch), so an SM
 /// done early takes more; the producer lands the next job's stages under
-/// this one's last MMAs and stores; a consumer whose 64 routes are all past
-/// the slice runs no MMAs. `n` whole 256s, `k` whole 128s. Grid up to the SMs, 384 threads,
-/// `kStages * 49152 + 1024 + 128` bytes of shared memory.
+/// this one's last MMAs and stores, which leave through shared memory in
+/// whole 16-byte chunks; a consumer whose 64 routes are all past the slice
+/// runs no MMAs. `n` whole 256s, `k` whole 128s. Grid up to the SMs, 384
+/// threads, `kStages * 49152 + 1024 + 192 + 32768` bytes of shared memory.
 template <int kStages>
 __global__ void __launch_bounds__(384, 1) moe_select_fp8a8_tma(
     const __grid_constant__ wgfp8tma::TmaMap map_w, const u8* __restrict__ xq,
@@ -1034,6 +1035,9 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp8a8_tma(
     unsigned long long* jfull = empty + kStages;
     unsigned long long* jempty = jfull + 2;
     int* jobq = reinterpret_cast<int*>(jempty + 2);
+    // Each consumer's 64 routes by 128 weight rows of bf16 on their way out,
+    // 16-byte chunks swizzled by row.
+    u8* staged = reinterpret_cast<u8*>(jobq + 4);
 
     const int tid = static_cast<int>(threadIdx.x);
     const int wg = tid >> 7;
@@ -1187,20 +1191,35 @@ __global__ void __launch_bounds__(384, 1) moe_select_fp8a8_tma(
             ew[1] = nw[1];
         }
         if (!live) continue;
+        // The sums through shared memory, so each route's row leaves in
+        // whole 16-byte chunks.
+        u8* tile = staged + c_wg * 16384;
+        long long route[8];
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const int r = c_wg * 64 + 16 * warp + g + 8 * h;
-            if (r >= count) continue;
-            const long long route = order[begin + r];
+        for (int i = 0; i < 8; ++i) {
+            const int r = (lt >> 4) + 8 * i;
+            route[i] = c_wg * 64 + r < count ? order[begin + c_wg * 64 + r] : -1;
+        }
 #pragma unroll
-            for (int hf = 0; hf < 2; ++hf) {
-                bf16* o = out + route * n + row0 + 128 * hf + 2 * c;
+        for (int hf = 0; hf < 2; ++hf) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int r = 16 * warp + g + 8 * h;
 #pragma unroll
                 for (int q = 0; q < 16; ++q) {
-                    *reinterpret_cast<unsigned*>(o + 8 * q) =
+                    *reinterpret_cast<unsigned*>(tile + r * 256 + ((q ^ (r & 7)) << 4) + 4 * c) =
                         pack_bf16x2(acc[hf][4 * q + 2 * h], acc[hf][4 * q + 2 * h + 1]);
                 }
             }
+            asm volatile("bar.sync %0, 128;\n" ::"r"(2 + c_wg) : "memory");
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int r = (lt >> 4) + 8 * i, q = lt & 15;
+                if (route[i] < 0) continue;
+                *reinterpret_cast<uint4*>(out + route[i] * n + row0 + 128 * hf + 8 * q) =
+                    *reinterpret_cast<const uint4*>(tile + r * 256 + ((q ^ (r & 7)) << 4));
+            }
+            asm volatile("bar.sync %0, 128;\n" ::"r"(2 + c_wg) : "memory");
         }
     }
 }
