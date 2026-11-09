@@ -601,7 +601,12 @@ fn a_window_walk_bounded_by_its_rows_reach_answers_the_same_bits() {
 fn a_batched_decode_through_the_page_copy_kernel_answers_the_reference() {
     let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
     tuning.chunks.decode_pages = 8;
-    for (qh, kvh, d) in [(16usize, 8usize, 128usize), (8, 2, 128), (8, 2, 256)] {
+    for (qh, kvh, d) in [
+        (16usize, 8usize, 128usize),
+        (8, 2, 128),
+        (8, 2, 256),
+        (8, 1, 256),
+    ] {
         long_decode_with(qh, kvh, d, None, tuning);
     }
     // a sliding window's rows read only the pages their window covers
