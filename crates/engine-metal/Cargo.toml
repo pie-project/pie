@@ -31,6 +31,7 @@ poem = { package = "pie-poem", path = "../poem" }
 ztensor-compat = { workspace = true }
 
 libc = "0.2"
+tracing = "0.1"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6"
