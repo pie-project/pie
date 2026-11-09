@@ -60,7 +60,7 @@ impl Shape {
         // both slots of keys and values, the state, the blocks, room for
         // a chunk's temporaries
         2 * span * (w + wv) * 2
-            + wv * QP * 4
+            + h.dv * QP * 4
             + 2 * G * (qh * h.d * 4 + h.dv * QP * 4 + 2 * QP * 4)
             + 8 * CHUNK * (w + wv) * 4
     }
@@ -130,7 +130,7 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             MTy::Sem(vec![2, 2]),
             MTy::Ref(vec![1, QP], Elem::F32, Space::Vmem),
             MTy::Ref(vec![1, QP], Elem::F32, Space::Vmem),
-            MTy::Ref(vec![wv, QP], Elem::F32, Space::Vmem),
+            MTy::Ref(vec![dv, QP], Elem::F32, Space::Vmem),
         ],
     };
     k.build(|b, blk| {
@@ -220,7 +220,7 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         let z1 = b.splat_f(&[1, QP], Elem::F32, 0.0)?;
         let o1 = b.splat_f(&[1, QP], Elem::F32, 1.0)?;
         let zs = b.splat_f(&[CHUNK, QP], Elem::F32, 0.0)?;
-        let za = b.splat_f(&[wv, QP], Elem::F32, 0.0)?;
+        let za = b.splat_f(&[dv, QP], Elem::F32, 0.0)?;
         let zo = b.splat_f(&[dv, QP], Elem::F32, 0.0)?;
         let zv = b.splat_f(&[CHUNK, wv], Elem::Bf16, 0.0)?;
         let sc = b.splat_f(&[CHUNK, QP], Elem::F32, scale)?;
@@ -324,22 +324,24 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                 let held = b.andi(ge, lt)?;
                 let vc = b.select(held, vc, zv)?;
                 let pb = b.convert_f(p, Elem::Bf16)?;
-                let ov = b.matmul_tl(vc, pb, za)?;
-                let a0 = b.vload(a_sc, &[i0, i0], &[wv, QP])?;
-                let cb = b.broadcast(corr, &[wv, QP])?;
+                // each kv head's values against every query head's
+                // probabilities, its own query heads' columns kept
+                let mut ov = zo;
+                for kh in 0..kvh {
+                    let vh = b.slice(vc, &[0, kh * dv], &[CHUNK, dv])?;
+                    let oh = b.matmul_tl(vh, pb, zo)?;
+                    let khv = b.splat_i(&[dv, QP], kh)?;
+                    let mine = b.cmpi(ICmp::Eq, head_o, khv)?;
+                    ov = b.select(mine, oh, ov)?;
+                }
+                let a0 = b.vload(a_sc, &[i0, i0], &[dv, QP])?;
+                let cb = b.broadcast(corr, &[dv, QP])?;
                 let a = b.mulf(a0, cb)?;
                 let a = b.addf(a, ov)?;
                 b.vstore(a, a_sc, &[i0, i0])
             })?;
             // each query head's column off its own kv head's rows
-            let a = b.vload(a_sc, &[i0, i0], &[wv, QP])?;
-            let mut o = zo;
-            for kh in 0..kvh {
-                let part = b.slice(a, &[kh * dv, 0], &[dv, QP])?;
-                let khv = b.splat_i(&[dv, QP], kh)?;
-                let mine = b.cmpi(ICmp::Eq, head_o, khv)?;
-                o = b.select(mine, part, o)?;
-            }
+            let o = b.vload(a_sc, &[i0, i0], &[dv, QP])?;
             let m = b.vload(m_sc, &[i0, i0], &[1, QP])?;
             let l = b.vload(l_sc, &[i0, i0], &[1, QP])?;
             let pos = b.cmpf(true, l, z1)?;
