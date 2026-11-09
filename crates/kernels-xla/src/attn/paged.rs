@@ -2004,7 +2004,16 @@ pub fn attend(
             let mut parts = Vec::new();
             for at in 0..r / g {
                 let rg = rs.map(f, &mut |f, v| f.slice_axis(v, 0, at * g, (at + 1) * g))?;
-                parts.push(per_row(f, &planes, &heads, &rule, &rg, KeyList::Range, scale, ch)?);
+                parts.push(per_row(
+                    f,
+                    &planes,
+                    &heads,
+                    &rule,
+                    &rg,
+                    KeyList::Range,
+                    scale,
+                    ch,
+                )?);
             }
             let cat = |f: &mut Func, v: Vec<Val>| f.concat(&v, 0);
             Flashed {
