@@ -42,6 +42,9 @@ struct Shape {
     scale: f64,
 }
 
+/// Keys a row reads a turn (its range only, in chunks).
+const CHUNK: i64 = 128;
+
 /// Pages one copy may move, when the pool holds them in a row.
 const RUN: i64 = 4;
 
@@ -136,6 +139,9 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             MTy::Ref(vec![2, g, span, w], Elem::Bf16, Space::Vmem),
             MTy::Ref(vec![2, g, span, wv], Elem::Bf16, Space::Vmem),
             MTy::Sems(vec![2, 2]),
+            MTy::Ref(vec![qh, 1], Elem::F32, Space::Vmem),
+            MTy::Ref(vec![qh, 1], Elem::F32, Space::Vmem),
+            MTy::Ref(vec![qh, dv], Elem::F32, Space::Vmem),
         ],
     };
     k.build(|b, blk| {
@@ -267,23 +273,24 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         })?;
         copies(b, i, slot, true)?;
 
-        let ninf = b.splat_f(&[qh, span], Elem::F32, f64::NEG_INFINITY)?;
-        let sc = b.splat_f(&[qh, span], Elem::F32, scale)?;
-        let zs = b.splat_f(&[qh, span], Elem::F32, 0.0)?;
+        let (m_sc, l_sc, a_sc) = (blk.scratch[3], blk.scratch[4], blk.scratch[5]);
+        let ninf = b.splat_f(&[qh, CHUNK], Elem::F32, f64::NEG_INFINITY)?;
+        let sc = b.splat_f(&[qh, CHUNK], Elem::F32, scale)?;
+        let zs = b.splat_f(&[qh, CHUNK], Elem::F32, 0.0)?;
         let zo = b.splat_f(&[qh, dv], Elem::F32, 0.0)?;
-        let zv = b.splat_f(&[span, dv], Elem::Bf16, 0.0)?;
+        let zv = b.splat_f(&[CHUNK, dv], Elem::Bf16, 0.0)?;
         let ninf1 = b.splat_f(&[qh, 1], Elem::F32, f64::NEG_INFINITY)?;
         let z1 = b.splat_f(&[qh, 1], Elem::F32, 0.0)?;
         let o1 = b.splat_f(&[qh, 1], Elem::F32, 1.0)?;
         let gqv = b.i32(gq);
-        let gqs = b.broadcast(gqv, &[qh, span])?;
-        let io = b.iota(&[qh, span], 0);
+        let gqs = b.broadcast(gqv, &[qh, CHUNK])?;
+        let io = b.iota(&[qh, CHUNK], 0);
         let head_s = b.divsi(io, gqs)?;
         let gqo = b.broadcast(gqv, &[qh, dv])?;
         let io = b.iota(&[qh, dv], 0);
         let head_o = b.divsi(io, gqo)?;
-        let key_s = b.iota(&[qh, span], 1);
-        let key_v = b.iota(&[span, dv], 0);
+        let key_s = b.iota(&[qh, CHUNK], 1);
+        let key_v = b.iota(&[CHUNK, dv], 0);
         let (z, gn, step1) = (b.i32(0), b.i32(g), b.i32(1));
         b.for_range(z, gn, step1, |b, r| {
             let gv = b.i32(g);
@@ -297,16 +304,7 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             // key `j` of the buffer is position `k0 + j`
             let lo_k = b.subi(l0, k0)?;
             let hi_k = b.subi(l1, k0)?;
-            let lb = b.broadcast(lo_k, &[qh, span])?;
-            let hb = b.broadcast(hi_k, &[qh, span])?;
-            let ge = b.cmpi(ICmp::Sge, key_s, lb)?;
-            let lt = b.cmpi(ICmp::Slt, key_s, hb)?;
-            let valid = b.andi(ge, lt)?;
-            let lbv = b.broadcast(lo_k, &[span, dv])?;
-            let hbv = b.broadcast(hi_k, &[span, dv])?;
-            let ge = b.cmpi(ICmp::Sge, key_v, lbv)?;
-            let lt = b.cmpi(ICmp::Slt, key_v, hbv)?;
-            let held = b.andi(ge, lt)?;
+            let hi_k = b.maxsi(hi_k, lo_k)?;
             let qhv = b.i32(qh);
             let at = b.muli(r, qhv)?;
             let at = b.as_index(at)?;
@@ -314,45 +312,92 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             let q = b.vload(q_ref, &[at, i0], &[qh, d])?;
             let sidx = b.as_index(slot)?;
             let ridx = b.as_index(r)?;
-            let mut s = ninf;
-            for kh in 0..kvh {
-                let col = b.index(kh * d);
-                let kb = b.vload(kbuf, &[sidx, ridx, i0, col], &[1, 1, span, d])?;
-                let kb = b.shape_cast(kb, &[span, d])?;
-                let sh = b.matmul(q, kb, zs, true)?;
-                let khv = b.i32(kh);
-                let khb = b.broadcast(khv, &[qh, span])?;
-                let mine = b.cmpi(ICmp::Eq, head_s, khb)?;
-                s = b.select(mine, sh, s)?;
-            }
-            let s = b.mulf(s, sc)?;
-            let s = b.select(valid, s, ninf)?;
-            let m = b.reduce_rows(s, true)?;
-            let alive = b.gtf(m, ninf1)?;
-            let ms = b.select(alive, m, z1)?;
-            let msb = b.broadcast(ms, &[qh, span])?;
-            let zz = b.subf(s, msb)?;
-            let p = b.exp(zz)?;
-            let l = b.reduce_rows(p, false)?;
-            let pb = b.convert_f(p, Elem::Bf16)?;
-            let mut o = zo;
-            for kh in 0..kvh {
-                let col = b.index(kh * dv);
-                let vb = b.vload(vbuf, &[sidx, ridx, i0, col], &[1, 1, span, dv])?;
-                let vb = b.shape_cast(vb, &[span, dv])?;
-                // a buffer row past the range may hold anything
-                let vb = b.select(held, vb, zv)?;
-                let ov = b.matmul(pb, vb, zo, false)?;
-                let khv = b.i32(kh);
-                let khb = b.broadcast(khv, &[qh, dv])?;
-                let mine = b.cmpi(ICmp::Eq, head_o, khb)?;
-                o = b.select(mine, ov, o)?;
-            }
+            b.vstore(ninf1, m_sc, &[i0, i0])?;
+            b.vstore(z1, l_sc, &[i0, i0])?;
+            b.vstore(zo, a_sc, &[i0, i0])?;
+            // the chunks of keys the row's range covers, an online softmax
+            let cv = b.i32(CHUNK);
+            let c0 = b.divsi(lo_k, cv)?;
+            let top = b.i32(CHUNK - 1);
+            let c1 = b.addi(hi_k, top)?;
+            let c1 = b.divsi(c1, cv)?;
+            let one = b.i32(1);
+            b.for_range(c0, c1, one, |b, c| {
+                let cv = b.i32(CHUNK);
+                let base = b.muli(c, cv)?;
+                let base = b.assume_multiple(base, CHUNK)?;
+                let bidx = b.as_index(base)?;
+                let bs = b.broadcast(base, &[qh, CHUNK])?;
+                let kj = b.addi(key_s, bs)?;
+                let lb = b.broadcast(lo_k, &[qh, CHUNK])?;
+                let hb = b.broadcast(hi_k, &[qh, CHUNK])?;
+                let ge = b.cmpi(ICmp::Sge, kj, lb)?;
+                let lt = b.cmpi(ICmp::Slt, kj, hb)?;
+                let valid = b.andi(ge, lt)?;
+                let bv = b.broadcast(base, &[CHUNK, dv])?;
+                let vj = b.addi(key_v, bv)?;
+                let lbv = b.broadcast(lo_k, &[CHUNK, dv])?;
+                let hbv = b.broadcast(hi_k, &[CHUNK, dv])?;
+                let ge = b.cmpi(ICmp::Sge, vj, lbv)?;
+                let lt = b.cmpi(ICmp::Slt, vj, hbv)?;
+                let held = b.andi(ge, lt)?;
+                let mut s = ninf;
+                for kh in 0..kvh {
+                    let col = b.index(kh * d);
+                    let kb = b.vload(kbuf, &[sidx, ridx, bidx, col], &[1, 1, CHUNK, d])?;
+                    let kb = b.shape_cast(kb, &[CHUNK, d])?;
+                    let sh = b.matmul(q, kb, zs, true)?;
+                    let khv = b.i32(kh);
+                    let khb = b.broadcast(khv, &[qh, CHUNK])?;
+                    let mine = b.cmpi(ICmp::Eq, head_s, khb)?;
+                    s = b.select(mine, sh, s)?;
+                }
+                let s = b.mulf(s, sc)?;
+                let s = b.select(valid, s, ninf)?;
+                let m0 = b.vload(m_sc, &[i0, i0], &[qh, 1])?;
+                let mx = b.reduce_rows(s, true)?;
+                let mn = b.maxf(m0, mx)?;
+                let alive = b.gtf(mn, ninf1)?;
+                let ms = b.select(alive, mn, z1)?;
+                let msb = b.broadcast(ms, &[qh, CHUNK])?;
+                let zz = b.subf(s, msb)?;
+                let p = b.exp(zz)?;
+                let dm = b.subf(m0, ms)?;
+                let corr = b.exp(dm)?;
+                let l0 = b.vload(l_sc, &[i0, i0], &[qh, 1])?;
+                let l = b.mulf(l0, corr)?;
+                let ps = b.reduce_rows(p, false)?;
+                let l = b.addf(l, ps)?;
+                b.vstore(l, l_sc, &[i0, i0])?;
+                b.vstore(mn, m_sc, &[i0, i0])?;
+                let pb = b.convert_f(p, Elem::Bf16)?;
+                let mut o = zo;
+                for kh in 0..kvh {
+                    let col = b.index(kh * dv);
+                    let vb = b.vload(vbuf, &[sidx, ridx, bidx, col], &[1, 1, CHUNK, dv])?;
+                    let vb = b.shape_cast(vb, &[CHUNK, dv])?;
+                    // a buffer row past the range may hold anything
+                    let vb = b.select(held, vb, zv)?;
+                    let ov = b.matmul(pb, vb, zo, false)?;
+                    let khv = b.i32(kh);
+                    let khb = b.broadcast(khv, &[qh, dv])?;
+                    let mine = b.cmpi(ICmp::Eq, head_o, khb)?;
+                    o = b.select(mine, ov, o)?;
+                }
+                let a0 = b.vload(a_sc, &[i0, i0], &[qh, dv])?;
+                let cb = b.broadcast(corr, &[qh, dv])?;
+                let a = b.mulf(a0, cb)?;
+                let a = b.addf(a, o)?;
+                b.vstore(a, a_sc, &[i0, i0])
+            })?;
+            let m = b.vload(m_sc, &[i0, i0], &[qh, 1])?;
+            let l = b.vload(l_sc, &[i0, i0], &[qh, 1])?;
+            let a = b.vload(a_sc, &[i0, i0], &[qh, dv])?;
             let pos = b.gtf(l, z1)?;
             let inv = b.divf(o1, l)?;
             let inv = b.select(pos, inv, z1)?;
             let ib = b.broadcast(inv, &[qh, dv])?;
-            let o = b.mulf(o, ib)?;
+            let o = b.mulf(a, ib)?;
             b.vstore(o, o_ref, &[at, i0])?;
             b.vstore(m, m_ref, &[at, i0])?;
             b.vstore(l, l_ref, &[at, i0])
@@ -460,7 +505,7 @@ mod tests {
         };
         let c = kernel(&s, 100 << 20).unwrap();
         assert!(c.module.contains("tpu.enqueue_dma"));
-        assert!(c.module.contains("scratch_operands = 3 : i64"));
+        assert!(c.module.contains("scratch_operands = 6 : i64"));
         assert_eq!(c.operands.len(), 7);
         if let Some(p) = std::env::var_os("PAGES_DUMP") {
             std::fs::write(p, &c.module).unwrap();

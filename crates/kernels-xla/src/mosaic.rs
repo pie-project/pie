@@ -551,6 +551,10 @@ impl Body {
         self.float_binary("arith.subf", a, b)
     }
 
+    pub fn maxf(&mut self, a: V, b: V) -> Built<V> {
+        self.float_binary("arith.maximumf", a, b)
+    }
+
     pub fn divf(&mut self, a: V, b: V) -> Built<V> {
         self.float_binary("arith.divf", a, b)
     }
