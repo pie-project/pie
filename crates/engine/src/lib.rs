@@ -33,7 +33,8 @@ pub use channel::{
 };
 pub use chunk::{
     ChunkFacts, ChunkRun, ChunkTable, Evacuation, Growth, Pinned, Reserved, ReservedRun,
-    SegmentFacts, ShapeId, SlotCopy, SlotKind, SlotRun, SlotShape,
+    ResidentWeight, SegmentFacts, ShapeId, SlotCopy, SlotKind, SlotRun, SlotShape, WeightAtom,
+    WeightKind, WeightResidency, WeightShape, WeightUses,
 };
 pub use engine::{
     CompletionSink, Engine, KvWrites, StepDone, StepOutcome, TapGroups, TapSink, Tapped,

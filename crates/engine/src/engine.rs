@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::AdapterRegistration;
 use crate::caps::DeviceFacts;
 use crate::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
-use crate::chunk::{Evacuation, SlotCopy};
+use crate::chunk::{Evacuation, SlotCopy, WeightResidency, WeightUses};
 use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
@@ -178,6 +178,24 @@ pub trait Engine: Send {
     fn copy_slots(&mut self, copy: &SlotCopy) -> Result<()> {
         let _ = copy;
         Err(self.unsupported("copy_slots"))
+    }
+
+    /// Which atoms of the streamable weights
+    /// ([`crate::chunk::ChunkFacts::weights`]) are resident from the next
+    /// fire on, and in which pool slots; the whole set each time. The
+    /// runtime calls it once a governor tick at most, ordered before the
+    /// next fire; the engine fills slots newly named (from its host copy)
+    /// before a fire reads them. A use of an atom not named is the
+    /// engine's: it streams through a staging slot and is not kept.
+    fn weight_residency(&mut self, residency: &WeightResidency) -> Result<()> {
+        let _ = residency;
+        Err(self.unsupported("weight_residency"))
+    }
+
+    /// How often fires read each streamable atom since the last call,
+    /// resident or not: the record the runtime orders the weight cache by.
+    fn weight_uses(&mut self) -> Result<WeightUses> {
+        Err(self.unsupported("weight_uses"))
     }
 
     /// Gives back what fires have touched of the scratch, waiting out the

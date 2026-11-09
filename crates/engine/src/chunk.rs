@@ -26,6 +26,12 @@ use crate::caps::PoolFacts;
 use crate::error::{Error, Result};
 use crate::transfer::MemoryDomain;
 
+mod weight;
+
+pub use weight::{
+    ResidentWeight, WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses,
+};
+
 /// A slot shape, by its place in [`ChunkFacts::shapes`]' ids.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
@@ -72,6 +78,10 @@ pub struct ChunkFacts {
     /// And what they held when the last run left is there still.
     #[serde(default)]
     pub disk_kept: bool,
+    /// The streamable weights' slot shapes ([`WeightShape`]), ids apart
+    /// from [`ChunkFacts::shapes`]'. Empty where nothing streams.
+    #[serde(default)]
+    pub weights: Vec<WeightShape>,
 }
 
 /// How the pool's segments stand and may move.
@@ -256,6 +266,11 @@ impl ChunkFacts {
     }
 
     #[must_use]
+    pub fn weight(&self, id: ShapeId) -> Option<&WeightShape> {
+        self.weights.iter().find(|shape| shape.id == id)
+    }
+
+    #[must_use]
     pub fn reserved_chunks(&self) -> u32 {
         self.reserved
             .iter()
@@ -411,6 +426,7 @@ impl ChunkFacts {
             disk_chunks,
             disk_persistent: pools.disk_kv_persistent,
             disk_kept: pools.disk_kv_kept,
+            weights: Vec::new(),
         }
     }
 
@@ -527,6 +543,32 @@ impl ChunkFacts {
                     return invalid(format!("shape {}'s pinned tiers pass the pool", shape.id));
                 }
                 runs.push((format!("shape {}", shape.id), pinned.device));
+            }
+        }
+        for (at, weight) in self.weights.iter().enumerate() {
+            if self.shapes.iter().any(|s| s.id == weight.id)
+                || self.weights[..at].iter().any(|w| w.id == weight.id)
+            {
+                return invalid(format!("weight shape {} is stated twice", weight.id));
+            }
+            if weight.slots_per_chunk == 0 || weight.slot_bytes == 0 || weight.count == 0 {
+                return invalid(format!("weight shape {} is empty", weight.id));
+            }
+            if weight
+                .slot_bytes
+                .saturating_mul(u64::from(weight.slots_per_chunk))
+                > self.chunk_bytes
+            {
+                return invalid(format!(
+                    "weight shape {}'s {} slots of {} bytes are past a chunk's {}",
+                    weight.id, weight.slots_per_chunk, weight.slot_bytes, self.chunk_bytes
+                ));
+            }
+            if weight.floor_slots > weight.count {
+                return invalid(format!(
+                    "weight shape {} stages {} slots of {} atoms",
+                    weight.id, weight.floor_slots, weight.count
+                ));
             }
         }
         for (at, (name, run)) in runs.iter().enumerate() {
