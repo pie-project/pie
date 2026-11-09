@@ -733,38 +733,6 @@ impl ProgramSpec {
         self.knobs.get("W4").is_some_and(|v| v.trim() == "1")
     }
 
-    /// Gemma 4 dense on serve8b_region (`G12 1` on a `W4 1`, `W4H 1` build:
-    /// `codegen::serve8b_region_g12`, placed by `spatial::u4g12`): its kinds,
-    /// the global kind's shape, the window, the decode buffer, the embedding's
-    /// scale.
-    #[must_use]
-    pub fn gemma12(&self) -> Option<super::u4g12::G12> {
-        let knob = |k: &str| self.knobs.get(k).and_then(|v| v.trim().parse::<u64>().ok());
-        if knob("G12") != Some(1) || !self.head_u4() {
-            return None;
-        }
-        Some(super::u4g12::G12 {
-            kinds: knob("KINDS").unwrap_or(0),
-            qhg: knob("QhG").unwrap_or(0) as usize,
-            gsg: knob("GsG").unwrap_or(0) as usize,
-            win: knob("WIN").unwrap_or(0) as usize,
-            w4buf: knob("W4BUF").unwrap_or(1024) as usize,
-            esb: knob("ESB").unwrap_or(0) as u32,
-            kv16: knob("KV16") != Some(0),
-        })
-    }
-
-    /// Bytes of a KV cell: the layers' width, or f32 on a G12 check build
-    /// with `KV16 0` (an f32 pool: the tiny simulator's exact comparison).
-    #[must_use]
-    pub fn kv_bytes(&self) -> usize {
-        if self.gemma12().is_some_and(|g| !g.kv16) {
-            4
-        } else {
-            self.layers.kv_bytes()
-        }
-    }
-
     /// The head's lm_head tiles and the embedding strip hold u4g64 too
     /// (`W4H 1`, on a `W4 1` build: `spatial::u4::place_head`/`place_embed`).
     #[must_use]
@@ -997,14 +965,6 @@ impl ProgramSpec {
         )
     }
 
-    /// Qwen3.5 on serve8b_region (`Q35R 1`: `codegen::serve8b_region_q35`,
-    /// placed by `spatial::serve_q35r`).
-    #[must_use]
-    pub fn q35r(&self) -> bool {
-        self.design == Design::Serve8bRegion
-            && self.knobs.get("Q35R").is_some_and(|v| v.trim() == "1")
-    }
-
     /// A knob's value as a number (`None`: unset or not a number).
     #[must_use]
     pub fn knob(&self, k: &str) -> Option<u64> {
@@ -1021,8 +981,7 @@ impl ProgramSpec {
     /// The program's build directory: its design's files for the model's
     /// variant and, at `W4 1`, its u4g64 units ([`Design::files_for`]);
     /// serve_q35w's for a W16 serve_q35 (serve_q35 itself stays #1412's f32
-    /// program); serve8b_region's Gemma 4 units for a `G12 1` program
-    /// ([`super::codegen::serve8b_region_g12`]); serve_gptoss's levered units with its `MOE` knob
+    /// program); serve_gptoss's levered units with its `MOE` knob
     /// ([`super::codegen::serve_gptoss_with`]).
     pub fn files(&self) -> Result<Vec<super::codegen::File>, String> {
         let (variant, u4) = (self.model.variant(), self.weights_u4());
@@ -1033,12 +992,6 @@ impl ProgramSpec {
                 ));
             }
             return super::codegen::serve_q35w();
-        }
-        if self.gemma12().is_some() {
-            return super::codegen::serve8b_region_g12(variant);
-        }
-        if self.q35r() {
-            return super::codegen::serve8b_region_q35(variant);
         }
         if self.design == Design::ServeGptoss {
             // (the attention units' levers from the model, the MoE units' MOE knob)
@@ -1721,24 +1674,7 @@ fn serve8b(get: &Get) -> R<ProgramSpec> {
 /// embedding strip as serve8b's.
 fn serve8b_region(design: Design, get: &Get) -> R<ProgramSpec> {
     headmode(get, "serve8b_region")?;
-    // A G12 build's layout defaults `G12` to 1, so cslc's out.json omits it
-    // when the params do; its Gemma knobs without it would read as a Qwen /
-    // Llama program (no norms' kinds, an untied head). (`KINDS` is also
-    // qwen35_unit's layer mix under Q35R 1.)
-    let q35r = get.opt("Q35R") == Some(1);
-    if get.opt("G12") != Some(1)
-        && let Some(k) = ["KINDS", "QhG", "GsG", "WIN", "W4BUF", "ESB"]
-            .into_iter()
-            .find(|k| get.opt(k).is_some() && !(q35r && *k == "KINDS"))
-    {
-        return Err(format!(
-            "serve8b_region: param {k} is serve8b_region_g12's (Gemma 4) but the params state \
-             no G12:1; pass G12:1 (the layout's default is not in out.json)"
-        ));
-    }
-    // (G12 check builds and qwen35_unit's (Q35R 1) may keep an f32 pool: KV16 0.)
-    let kv16_ok = get.req("KV16")? == 1 || get.opt("G12") == Some(1) || q35r;
-    if get.req("W16")? != 1 || !kv16_ok || get.opt("KVCP").unwrap_or(0) != 0 {
+    if get.req("W16")? != 1 || get.req("KV16")? != 1 || get.opt("KVCP").unwrap_or(0) != 0 {
         return Err("serve8b_region keeps weights and KV in bf16 and copies pages by the host (W16 1, KV16 1, KVCP 0)".into());
     }
     let grid = kernel(get)?;

@@ -1141,7 +1141,7 @@ impl ModelSpec {
             }
             return super::model_moe::check_gptoss(self, moe, &get);
         }
-        if self.hybrid.is_some() && get("Q35").is_none() && get("Q35R") != Some(1) {
+        if self.hybrid.is_some() && get("Q35").is_none() {
             return no(
                 name,
                 "Gated DeltaNet layers (only a qwen35 program carries them)".into(),
@@ -1218,8 +1218,7 @@ impl ModelSpec {
                     .into(),
             );
         }
-        // (serve8b_region Q35R: a tied head's tiles are the embedding's)
-        if self.tied && untied_head.is_some() && get("Q35R") != Some(1) {
+        if self.tied && untied_head.is_some() {
             return no(
                 name,
                 "a tied head on serve8b, which places lm_head.weight (untied models only)".into(),

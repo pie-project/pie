@@ -47,10 +47,6 @@ SDK's `cslc` at load time, cached by a hash of sources and parameters.
     NE 8, B 3, MC 3: rel 5e-7). No design places it yet: no codegen pin.
   - `qwen2d_region.csl`: several bf16 layers on one region (x stays in
     place between them): serve8b_region's regions.
-  - `qwen35_unit.csl`: Qwen3.5's serve8b_region unit (`Q35R 1`,
-    `codegen::serve8b_region_q35`): GDN and gated attention layers as both
-    the grids and the regions, placed by `spatial::serve_q35r`; the levers'
-    anchors are mapped onto its text by `Q35R_ANCHORS`.
   - `softmax_s123.json`, `softmax_s13_06b.json`: the fast-softmax levers
     (S1: max-shift and rescale as one 2-D op; S2: the max and sum folds as a
     halving tree; S3: the exp sums ride the values all-reduce) as text

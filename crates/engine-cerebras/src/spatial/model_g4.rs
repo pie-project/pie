@@ -250,9 +250,6 @@ impl G4Spec {
     /// width, and the sliding window (`WIN`: a program without it would let
     /// a sliding layer see past the window).
     pub fn check_program(&self, get: impl Fn(&str) -> Option<usize>) -> Result<(), Refused> {
-        if get("G12") == Some(1) {
-            return self.check_program_g12(get);
-        }
         let name = &self.name;
         let no = |why: String| refuse(format!("{name}: the wafer program: {why}"));
         let need = |k: &str| {
@@ -330,132 +327,6 @@ impl G4Spec {
         Ok(())
     }
 
-    /// A serve8b_region Gemma 4 program (`G12 1`, `codegen::serve8b_region_g12`)
-    /// against the model: the hidden size over the grids' and the regions'
-    /// rows, each kind's heads over the columns (`Qh` a kv head of `Gs`
-    /// columns; `QhG` a copy of the global kv heads of `GsG` columns), the
-    /// head dims, the MLP width, the layers the units hold (`KINDS` their
-    /// readings), the window, the vocabulary and the embedding's scale.
-    fn check_program_g12(&self, get: impl Fn(&str) -> Option<usize>) -> Result<(), Refused> {
-        let name = &self.name;
-        let no = |why: String| refuse(format!("{name}: the G12 wafer program: {why}"));
-        let need = |k: &str| {
-            get(k).ok_or_else(|| Refused(format!("{name}: the G12 wafer program has no {k}")))
-        };
-        if self.ple_dim.is_some() || self.owners() != self.layers() {
-            return no(
-                "serve8b_region's Gemma units run no per-layer embeddings or shared kv tail".into(),
-            );
-        }
-        let (px, py, hc, dc, gs, qh, ic) = (
-            need("PX")?,
-            need("PY")?,
-            need("Hc")?,
-            need("Dc")?,
-            need("Gs")?,
-            need("Qh")?,
-            need("Ic")?,
-        );
-        let (rpx, rpy, rhc, rdc, rgs, ric) = (
-            need("RPX")?,
-            need("RPY")?,
-            need("RHc")?,
-            need("RDc")?,
-            need("RGs")?,
-            need("RIc")?,
-        );
-        let (qhg, gsg) = (need("QhG")?, need("GsG")?);
-        let covers =
-            |rows: usize, per: usize| rows * per >= self.hidden && (rows - 1) * per < self.hidden;
-        if need("HR")? != self.hidden || !covers(py, hc) || !covers(rpy, rhc) {
-            return no(format!(
-                "HR {:?} over PY {py} x Hc {hc} and RPY {rpy} x RHc {rhc}: not hidden {}",
-                get("HR"),
-                self.hidden
-            ));
-        }
-        let sliding = gs > 0
-            && px % gs == 0
-            && px / gs == self.kv_heads
-            && qh * self.kv_heads == self.q_heads;
-        let copies = if gsg > 0 && px % gsg == 0 {
-            px / gsg
-        } else {
-            0
-        };
-        let global = copies > 0
-            && self.global_kv_heads > 0
-            && copies % self.global_kv_heads == 0
-            && qhg * copies == self.q_heads;
-        let region = rgs * px == gs * rpx && rdc * rpx == dc * px && ric * rpx == ic * px;
-        if !sliding || !global || !region {
-            return no(format!(
-                "PX {px} Gs {gs} Qh {qh} / GsG {gsg} QhG {qhg} (regions RPX {rpx} RGs {rgs} RDc {rdc} RIc {ric}) for {} q heads over {} sliding and {} global kv heads",
-                self.q_heads, self.kv_heads, self.global_kv_heads
-            ));
-        }
-        if gs * dc != self.head_dim || gsg * dc != self.global_head_dim {
-            return no(format!(
-                "Gs {gs} / GsG {gsg} x Dc {dc} are not head dims {} / {}",
-                self.head_dim, self.global_head_dim
-            ));
-        }
-        if let Some(l) = (0..self.layers()).find(|&l| self.inter[l] != ic * px) {
-            return no(format!(
-                "layer {l}'s MLP is {} wide, not Ic {ic} x PX {px}",
-                self.inter[l]
-            ));
-        }
-        let (rc, rr, rnl, ncol) = (need("RC")?, need("RR")?, need("RNL")?, need("NCOL")?);
-        if get("YD").unwrap_or(0) != 0 {
-            return no("lever D (YD) is not a G12 layout".into());
-        }
-        let units = rc * rpx / px + 1 + rc * rr * rnl + ncol;
-        if units != self.layers() {
-            return no(format!(
-                "{units} layers (RC {rc} RR {rr} RNL {rnl} NCOL {ncol}) for {}",
-                self.layers()
-            ));
-        }
-        let kinds = need("KINDS")? as u64;
-        if let Some(l) = (0..self.layers())
-            .find(|&l| (kinds >> l & 1 == 1) != (self.readings[l] == Reading::Global))
-        {
-            return no(format!(
-                "layer {l} reads {:?}; KINDS says otherwise",
-                self.readings[l]
-            ));
-        }
-        if kinds >> self.layers() != 0 {
-            return no(format!(
-                "KINDS {kinds:#x} names layers past the {}",
-                self.layers()
-            ));
-        }
-        if need("vocab")? != self.vocab {
-            return no(format!("vocab {:?}, not {}", get("vocab"), self.vocab));
-        }
-        if get("WIN").unwrap_or(0) != self.window {
-            return no(format!(
-                "WIN {:?}: the sliding layers see the last {} positions",
-                get("WIN"),
-                self.window
-            ));
-        }
-        let esb = (self.hidden as f32).sqrt().to_bits() as usize;
-        if need("ESB")? != esb {
-            return no(format!(
-                "ESB {:?}: the embedding's scale is sqrt({}) ({esb})",
-                get("ESB"),
-                self.hidden
-            ));
-        }
-        if need("W4")? != 1 || need("W4H")? != 1 {
-            return no("G12 builds hold u4g64 units, head and strip (W4 1, W4H 1)".into());
-        }
-        Ok(())
-    }
-
     /// Weights the model holds (the projections, the MLPs, the embedding):
     /// the engine's account of its size.
     pub fn params(&self) -> f64 {
@@ -525,41 +396,6 @@ mod tests {
         );
         assert_eq!((s.layers(), s.owners(), s.ple_dim), (42, 24, Some(256)));
         assert!(s.inter.iter().all(|&i| i == 10_240));
-    }
-
-    /// Pie's check of a named G12 program (serve8b_region, `G12 1`): the
-    /// linked Gemma-4-12B params pass; one changed model param is refused.
-    #[test]
-    fn gemma4_12b_takes_its_g12_program() {
-        let s = spec("gemma4-12b-u4g64-kv-bf16").expect("12b reads");
-        let linked = "PX:128,W4:1,PY:96,Hc:40,Dc:16,Gs:16,Ic:120,RPX:128,RPY:240,RHc:16,RDc:16,RGs:16,RIc:120,RNL:2,RGY:16,GY:16,RC:4,RR:4,NCOL:11,RTR:4,HR:3840,Qh:2,QhG:4,GsG:32,KINDS:142971416741920,WIN:1024,W4BUF:512,ESB:1115152118,PS:16,NB:1,E:1,B:1,MC:1,W16:1,NP:1,KV16:1,KVCP:0,PROF:0,TIME:0,HROUTE:1,ROT8:1,NOLAYER:0,KVST:0,HEADMODE:2,HH:1152,Vr:228,Gx:8,Gy:24,vocab:262144,PASSES:3,MODE:0,OVL:0,VMC:1,iters:1,W4H:1,CAP:64,G12:1";
-        let params = crate::spatial::program::parse_params(linked);
-        let with = |k: &str, v: &str| {
-            let p: Vec<(String, String)> = params
-                .iter()
-                .map(|(a, b)| (a.clone(), if a == k { v.to_string() } else { b.clone() }))
-                .collect();
-            move |key: &str| {
-                p.iter()
-                    .find(|(a, _)| a == key)
-                    .and_then(|(_, b)| b.parse().ok())
-            }
-        };
-        s.check_program(with("", "")).expect("the linked program");
-        for (k, v) in [
-            ("KINDS", "142971416741921"),
-            ("WIN", "512"),
-            ("NCOL", "10"),
-            ("GsG", "16"),
-            ("Ic", "112"),
-            ("ESB", "0"),
-            ("vocab", "262145"),
-            ("W4H", "0"),
-        ] {
-            assert!(s.check_program(with(k, v)).is_err(), "{k}:{v} passed");
-        }
-        // Without G12 it is a serve_g4 check, which this program is not.
-        assert!(s.check_program(with("G12", "0")).is_err());
     }
 
     #[test]

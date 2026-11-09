@@ -759,7 +759,7 @@ impl WaferModel {
     ) -> R<Vec<VmStep>> {
         use super::guest4::wafer;
         self.unstaged()?;
-        if self.design.hybrid().is_some() || self.design.q35r() {
+        if self.design.hybrid().is_some() {
             return Err(
                 "the head's VM samples no serve_q35 lane (its states run on fire_batch)".into(),
             );
@@ -998,7 +998,7 @@ impl WaferModel {
                 "spatial wafer: batch totals"
             );
         }
-        let recurrent = grid.hybrid().is_some() || grid.q35r();
+        let recurrent = grid.hybrid().is_some();
         if recurrent {
             self.seat_state(lanes)?;
         }
@@ -1117,10 +1117,6 @@ impl WaferModel {
 
     /// Lane slot 0's recurrent state zeroed (its conv window and state).
     fn reset_state(&mut self) -> R<()> {
-        // (serve8b_region Q35R: a pass at write slot 0 zeroes the lane's state)
-        if self.design.q35r() {
-            return Ok(());
-        }
         self.rt
             .launch("reset", &[0])
             .map_err(|e| format!("the recurrent state's reset: {e}"))
@@ -1168,7 +1164,7 @@ impl WaferModel {
     /// (the host tier's suspension). Only between launches.
     pub fn page_out(&mut self, pages: &[u32]) -> R<Vec<Vec<u32>>> {
         let grid = &self.design;
-        let bf16 = grid.kv_bytes() == 2;
+        let bf16 = grid.layers.kv_bytes() == 2;
         // A staged copy is one with no fire inside it: the flag stays up
         // past an error midway, and fires refuse while it is.
         self.staged = true;
@@ -1189,7 +1185,7 @@ impl WaferModel {
             .kv
             .page_words(grid)
             .ok_or("the host keeps no pages of this build")?;
-        let bf16 = grid.kv_bytes() == 2;
+        let bf16 = grid.layers.kv_bytes() == 2;
         self.staged = true;
         let cells: Vec<(u32, Vec<u32>)> = pages
             .iter()
@@ -1558,7 +1554,7 @@ impl Wafer {
                             thread: None,
                             vocab: m.design.vocab(),
                             hidden: m.design.hidden(),
-                            recurrent: m.design.hybrid().is_some() || m.design.q35r(),
+                            recurrent: m.design.hybrid().is_some(),
                             group: 1,
                             row_order: match row_order_env(m.design.paged()) {
                                 Ok(o) => o,

@@ -624,7 +624,7 @@ pub(crate) fn pack(lo: u16, hi: u16) -> u32 {
 pub(crate) fn head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()> {
     if lay.head_u4() {
         super::u4::place_head(lay, ckpt, dev)?;
-        return head_gamma(lay, ckpt, dev, 2 * lay.hc(), false);
+        return head_gamma(lay, ckpt, dev, 2 * lay.hc());
     }
     head_with(lay, ckpt, dev, 2 * lay.hc())
 }
@@ -632,21 +632,8 @@ pub(crate) fn head(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device) -> R<()
 /// [`head`] with `hh2` dims a chunk column (serve8b's pairs of grid rows,
 /// serve_gptoss's triples).
 pub(crate) fn head_with(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device, hh2: usize) -> R<()> {
-    head_of(lay, ckpt, dev, hh2, "head", false)
-}
-
-/// [`head_with`]'s tiles of the checkpoint's `table` (`embed` for a tied
-/// head), the final norm as `1 + w` when `plus_one` (Qwen3.5).
-pub(crate) fn head_of(
-    lay: &ProgramSpec,
-    ckpt: &Ckpt,
-    dev: &mut dyn Device,
-    hh2: usize,
-    table: &str,
-    plus_one: bool,
-) -> R<()> {
     let (vr, hid) = (lay.vr(), lay.hidden());
-    let (shape, lm) = ckpt.bits(table)?;
+    let (shape, lm) = ckpt.bits("head")?;
     let lm = f16_if(lay, lm);
     let v = shape[0];
     if shape.len() != 2 || shape[1] != hid || v > lay.vocab() || lay.vocab() > lay.hh() * vr {
@@ -683,7 +670,7 @@ pub(crate) fn head_of(
         t
     })?;
     drop(lm);
-    head_gamma(lay, ckpt, dev, hh2, plus_one)
+    head_gamma(lay, ckpt, dev, hh2)
 }
 
 /// The head's chunk columns, the VM's (`None`) after the root column.
@@ -697,22 +684,10 @@ pub(crate) fn head_cols(lay: &ProgramSpec) -> Vec<Option<usize>> {
         .collect()
 }
 
-/// The final norm on the head's feeder row (`hh2` dims a chunk column), as
-/// `1 + w` when `plus_one` (Qwen3.5).
-fn head_gamma(
-    lay: &ProgramSpec,
-    ckpt: &Ckpt,
-    dev: &mut dyn Device,
-    hh2: usize,
-    plus_one: bool,
-) -> R<()> {
+/// The final norm on the head's feeder row (`hh2` dims a chunk column).
+fn head_gamma(lay: &ProgramSpec, ckpt: &Ckpt, dev: &mut dyn Device, hh2: usize) -> R<()> {
     let (hid, cols) = (lay.hidden(), head_cols(lay));
-    let mut g = vector(ckpt, "final_norm", hid)?;
-    if plus_one {
-        for w in &mut g {
-            *w += 1.0;
-        }
-    }
+    let g = vector(ckpt, "final_norm", hid)?;
     let gam: Vec<u32> = cols
         .iter()
         .flat_map(|c| (0..hh2).map(move |k| c.map(|c| c * hh2 + k)))
