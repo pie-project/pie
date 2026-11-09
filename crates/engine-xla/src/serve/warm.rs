@@ -88,8 +88,10 @@ impl Shell {
             }
             pages = pad.next(pages);
         }
-        // A prefill pads its lanes to 16, 32 or 64 by its rows (`canonical_pads`):
-        // one lane at every rung and every lane count its rows can take there.
+        // A prefill pads its lanes to 16, 32 or 64 by its rows (`canonical_pads`),
+        // or to 16 where the load holds fewer lanes than that: one lane at
+        // every rung and every lane count its rows can take there.
+        let max_lanes = self.budgets.tokens.max_lanes;
         let mut prev = 0;
         for &b in buckets.iter().filter(|&&b| b <= widest) {
             for (w, lo, hi) in [
@@ -97,8 +99,13 @@ impl Shell {
                 (32, 481, 960),
                 (64, 961, u32::MAX),
             ] {
+                let w = if w <= max_lanes {
+                    w
+                } else {
+                    pad.mixed_host_rung
+                };
                 let rows = (b + 1).saturating_sub(w).min(hi);
-                if b >= 64 && w <= lanes_cap && rows >= lo && rows + w > prev + 1 {
+                if b >= 64 && w <= max_lanes && rows >= lo && rows + w > prev + 1 {
                     shapes.push(vec![fresh(prefill, rows)]);
                 }
             }
