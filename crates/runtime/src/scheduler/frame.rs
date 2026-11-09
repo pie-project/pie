@@ -185,8 +185,8 @@ pub(super) struct FramePolicy {
     idle_dumped: bool,
     pending_binds: BTreeMap<ProcessId, usize>,
     staged: BTreeSet<ProcessId>,
-    /// The seal under way takes prompts alone: the decodes wait out the
-    /// lanes coming off a prompt, which no prompt waits for.
+    /// The seal under way runs while lanes are coming off a prompt: no
+    /// prompt waits for them, and the decodes ready beside them ride along.
     prompts_only: bool,
     pending_slots: u64,
     joins_in_flight: BTreeSet<ProcessId>,
@@ -755,6 +755,22 @@ impl FramePolicy {
             }
             order.extend_from_slice(&continuing);
             order.extend_from_slice(rest);
+            // Decodes ride a seal for the lanes coming off a prompt only
+            // beside a prompt: alone they would split the wave those lanes
+            // rejoin.
+            if self.prompts_only
+                && !order.iter().any(|lane| {
+                    self.lanes.get(lane).is_some_and(|state| {
+                        state.frames.front().is_some_and(|front| {
+                            front.fires.iter().any(|fire| {
+                                fire.fire_id.is_some() && fire.tokens > fire.rows.max(1)
+                            })
+                        })
+                    })
+                })
+            {
+                return None;
+            }
 
             let mut waves: Vec<Vec<u64>> = vec![Vec::new(); k];
             let mut fire_waves = HashMap::new();
@@ -802,11 +818,10 @@ impl FramePolicy {
                     continue;
                 }
                 let prompting = live.iter().any(|fire| fire.tokens > fire.rows);
-                if (self.prompts_only && !prompting)
-                    || (prompting
-                        && !mid_boundary
-                        && !self.prompts_only
-                        && prompting_in_flight.iter().any(|lane| lane != lane_id))
+                if prompting
+                    && !mid_boundary
+                    && !self.prompts_only
+                    && prompting_in_flight.iter().any(|lane| lane != lane_id)
                 {
                     continue;
                 }
@@ -1582,18 +1597,23 @@ mod tests {
         policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1);
         policy.on_fire_enqueued(stamp(c, 0, 0, 1), Some(c), 93, 256, 1);
         let queued: QueuedFireIds = [92, 93].into_iter().collect();
+        let mut sealed =
+            fires(&policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now()));
+        sealed.sort_unstable();
         assert_eq!(
-            fires(&policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now())),
-            vec![93],
-            "c's prompt seals behind a's on the card, b's decode waits to batch with a's"
+            sealed,
+            vec![92, 93],
+            "c's prompt seals behind a's on the card, b's decode rides beside it"
         );
         policy.on_frame_retired([a, b]);
+        policy.on_fire_enqueued(stamp(b, 2, 0, 1), Some(b), 94, 1, 1);
+        let queued: QueuedFireIds = [94].into_iter().collect();
         assert!(
             matches!(
                 plan(&mut policy, &queued, Instant::now()),
                 FramePlan::Hold(_)
             ),
-            "b's decode waits for a's next pass"
+            "with no prompt to ride, b's decode waits for a's next pass"
         );
     }
 
