@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::adapter::AdapterRegistration;
-use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
@@ -374,8 +374,10 @@ impl Engine for Xla {
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, pool_bytes) = shell.footprint();
         let paging = shell.paging();
-        let state_rows = shell.has_state();
         let drafter = shell.trace().drafter;
+        let pools = shell.pool_facts();
+        let chunks = shell.chunk_facts(&pools).map_err(fault)?;
+        shell.log_chunk_recipe(&chunks);
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "xla".to_string(),
@@ -388,22 +390,8 @@ impl Engine for Xla {
                 storage_max_tile_bytes: u64::MAX,
                 codegen_backend: None,
             },
-            pools: PoolFacts {
-                kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-                kv_page_size: paging.page_size,
-                state_slots: if state_rows { paging.slots } else { 0 },
-                buffer_pages: shell.buffer_pages(),
-                state_slot_bytes: shell.state_slot_bytes(),
-                adapter_banks: u32::try_from(shell.banks().len()).unwrap_or(u32::MAX),
-                elastic_page_bytes: 0,
-                elastic_budget_pages: 0,
-                window_pages: paging.window.map_or(0, |_| {
-                    u32::try_from(paging.window_pages()).unwrap_or(u32::MAX)
-                }),
-                window_tokens: paging.window.map_or(0, |window| window.tokens),
-                ..PoolFacts::default()
-            },
-            chunks: None,
+            pools,
+            chunks: Some(chunks),
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,
                 max_tokens: budgets.max_tokens,

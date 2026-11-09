@@ -1832,6 +1832,7 @@ dependencies = [
  "pie-profile",
  "serde_json",
  "toml",
+ "tracing",
  "ztensor",
  "ztensor-compat",
 ]

@@ -97,7 +97,7 @@ fn write_safetensors(path: &Path, tensors: &[(String, Vec<u64>, Vec<f32>)]) {
 /// Every plane `qwen3-micro-text` imports under the transformers layout, filled
 /// with synthetic f32. Norm weights are near zero (rmsnorm here is the +1 form,
 /// so a ~0 weight gives a ~unit scale); projections are small gaussians.
-fn synth_fixture(dir: &Path) {
+pub(crate) fn synth_fixture(dir: &Path) {
     let layer = |l: usize, leaf: &str| format!("model.language_model.layers.{l}.{leaf}");
     let mut t: Vec<(String, Vec<u64>, Vec<f32>)> = Vec::new();
     let mut push = |name: String, shape: Vec<u64>, scale: f32| {
@@ -205,7 +205,7 @@ fn hadamards(trace: &poem_ir::Trace) -> usize {
 /// Load a `micro_text` shell over the shared fixture at weight dtype `w`, with
 /// the rotation on or off. Returns the load error as a string so a caller can
 /// decide whether an unsupported dtype is fatal or merely "not reached".
-fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, String> {
+pub(crate) fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, String> {
     let id = if rotate {
         "qwen3-micro-text-rotated"
     } else {

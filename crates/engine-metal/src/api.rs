@@ -5,7 +5,7 @@ use std::path::Path;
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::adapter::AdapterRegistration;
-use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
@@ -533,15 +533,12 @@ impl Engine for Metal {
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let (pool_committed_bytes, pool_high_water_bytes) = shell.pool_residency();
-        let (elastic_page_bytes, elastic_budget_pages) = shell.pool_elastic();
         let weights_warm = shell.weights_warm();
 
         let paging = shell.paging();
-        let state_rows = shell
-            .trace()
-            .caches
-            .iter()
-            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
+        let pools = shell.pool_facts(disk_kv_pages);
+        let chunks = shell.chunk_facts(&pools).map_err(fault)?;
+        shell.log_chunk_recipe(&chunks);
 
         let caps = Capabilities {
             device: DeviceFacts {
@@ -555,34 +552,8 @@ impl Engine for Metal {
                 storage_max_tile_bytes: shell.max_buffer(),
                 codegen_backend: Some("metal".to_string()),
             },
-            pools: PoolFacts {
-                kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-                kv_page_size: paging.page_size,
-                state_slots: if state_rows { paging.slots } else { 0 },
-                state_slot_bytes: shell.state_slot_bytes(),
-                elastic_state_slot_bytes: shell.elastic_state_slot_bytes(),
-                adapter_banks: shell
-                    .banks()
-                    .iter()
-                    .map(|&(_, adapters, _)| adapters)
-                    .min()
-                    .unwrap_or(0),
-                elastic_page_bytes,
-                elastic_budget_pages,
-                disk_kv_pages,
-                one_frame_when_short: false,
-                seated_first: false,
-                seat_to_end: false,
-                seat_spread: false,
-                buffer_pages: shell.buffer_pages(),
-                host_state_slots: shell.parked_state_slots(),
-                host_buffer_pages: shell.parked_buffer_pages(),
-                // The sliding rows are paged in full here: the model's window
-                // is a fact of the model, its pool is not.
-                window_tokens: poem_exec::store::kv::declared_window(shell.trace()).unwrap_or(0),
-                ..PoolFacts::default()
-            },
-            chunks: None,
+            pools,
+            chunks: Some(chunks),
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,
                 max_tokens: budgets.max_tokens,

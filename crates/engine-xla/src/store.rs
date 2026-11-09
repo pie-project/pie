@@ -217,6 +217,46 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
     Ok(total)
 }
 
+/// One page's bytes in each pool [`pool_demand`] counts, its arithmetic per
+/// page: a kv page across the full pool's planes (compressor planes too),
+/// a windowed page across the windowed pool's, an rs buffer page across
+/// the recurrent-verb planes.
+pub fn page_bytes(trace: &Trace, paging: Paging) -> Result<engine::chunk::DegenerateBytes> {
+    let page = u64::from(paging.page_size);
+    let mut bytes = engine::chunk::DegenerateBytes::default();
+    for row in &trace.caches {
+        let CacheRow::Kv {
+            name,
+            planes,
+            dtype,
+            window,
+            ..
+        } = row
+        else {
+            continue;
+        };
+        let planes = split(name, planes)?;
+        let values = if planes.shared || planes.values == 0 {
+            0
+        } else {
+            planes.values
+        };
+        let row = page * (lanes(planes.keys) + lanes(values)) * elem_bytes(name, *dtype)?;
+        if windowed_row(paging, *window) {
+            bytes.window_page += row;
+        } else {
+            bytes.kv_page += row;
+        }
+    }
+    for (_, width) in compressor_spaces(trace) {
+        bytes.kv_page += 2 * page * lanes(width) * 2;
+    }
+    if let Some(layout) = crate::rs::Layout::read(trace)? {
+        bytes.buffer_page = page * layout.token_bytes;
+    }
+    Ok(bytes)
+}
+
 /// A row-major plane's row as the TPU lays it: whole 128-lane tiles.
 fn lanes(width: u64) -> u64 {
     if width == 0 {

@@ -5,6 +5,7 @@ pub mod arena;
 pub mod blob;
 pub mod boot;
 pub mod chip;
+pub mod chunks;
 pub mod decoded;
 pub mod device;
 mod dispatch;

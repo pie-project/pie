@@ -4,6 +4,7 @@ pub mod bench;
 pub mod blob;
 pub mod boot;
 pub mod chip;
+pub mod chunks;
 pub mod device;
 mod dispatch;
 pub mod dit;

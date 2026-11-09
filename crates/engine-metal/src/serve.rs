@@ -1310,6 +1310,43 @@ impl Shell {
         buffer.map_or(0, |buffer| self.pools.state_slot_bytes() + buffer)
     }
 
+    /// What one page or slot of each pool takes, for the degenerate chunk
+    /// facts: a kv page across every kv plane (compressed pools too), an rs
+    /// buffer page. The sliding rows are paged in full, so no windowed page.
+    pub fn degenerate_bytes(&self) -> Result<engine::chunk::DegenerateBytes> {
+        Ok(engine::chunk::DegenerateBytes {
+            kv_page: self.pools.page_bytes()?,
+            window_page: 0,
+            buffer_page: self
+                .rs_buffers
+                .as_ref()
+                .map_or(0, crate::rs::Buffers::page_bytes),
+        })
+    }
+
+    /// The kv pages, state slots and buffer pages with memory behind them
+    /// now: everything on a fixed pool, the watermark's on an elastic one
+    /// (rs buffers that do not grow are whole).
+    #[must_use]
+    pub fn committed_slots(&self) -> (u32, u32, u32) {
+        let paging = self.pools.paging();
+        let pages = u32::try_from(paging.pages()).unwrap_or(u32::MAX);
+        let buffers = self.buffer_pages();
+        if !self.pools.is_elastic() {
+            return (pages, paging.slots, buffers);
+        }
+        let mark = self.pools.watermark();
+        let buffered = match &self.rs_buffers {
+            Some(rs) if rs.elastic() => mark.state_slots.min(buffers),
+            _ => buffers,
+        };
+        (
+            mark.kv_pages.min(pages),
+            mark.state_slots.min(paging.slots),
+            buffered,
+        )
+    }
+
     /// See `Engine::release_scratch`.
     #[allow(unsafe_code)]
     pub fn release_scratch(&mut self) -> Result<()> {
