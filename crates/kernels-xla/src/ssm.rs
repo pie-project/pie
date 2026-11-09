@@ -1325,12 +1325,21 @@ impl DeltaIn {
     }
 
     fn chunk(&self, rows: i64, lanes: i64, c: crate::tuning::SsmChunks) -> i64 {
-        match self {
-            Self::Gdn { .. } | Self::Mamba2 { .. } if rows >= c.long_chunk * lanes.max(1) => {
-                c.long_chunk
-            }
-            Self::Gdn { .. } | Self::Mamba2 { .. } => c.chunk,
-            Self::Kda { .. } => c.kda_chunk,
+        let (short, long) = match *self {
+            // A chunk's `[C, C]` planes (and their inverse) come once per
+            // value head: with many heads they cost more than the carry's
+            // extra steps short chunks take (v6e: a 1792-row fire of
+            // Qwen3.8-27B's 48 heads 100 ms at 128 rows, 91 at 32; a 640-row
+            // fire of Qwen3.6-35B-A3B's 32 heads 40.5 ms at 128, 34.9 at 32;
+            // Qwen3.5-0.8B's 16 heads lose 19% at 32 and keep 128).
+            Self::Gdn { hv, .. } if hv >= 32 => (c.chunk.min(32), c.long_chunk.min(32)),
+            Self::Gdn { .. } | Self::Mamba2 { .. } => (c.chunk, c.long_chunk),
+            Self::Kda { .. } => return c.kda_chunk,
+        };
+        if rows >= long * lanes.max(1) {
+            long
+        } else {
+            short
         }
     }
 
