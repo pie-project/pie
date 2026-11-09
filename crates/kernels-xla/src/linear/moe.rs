@@ -1138,7 +1138,7 @@ fn gmm_rows_whole(p: i64, e: i64, base: i64) -> i64 {
     let active = e.min(p).max(1);
     let per = (p + active - 1) / active;
     let mut tm = base.max(16);
-    while tm < 128 && tm < per {
+    while tm < 256 && tm < per {
         tm *= 2;
     }
     tm
