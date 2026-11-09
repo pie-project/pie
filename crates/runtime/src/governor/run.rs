@@ -63,7 +63,8 @@ impl Steer {
     }
 
     /// One turn: `read` is the system's state on a tick, or `None` when a
-    /// waiter asked between ticks. A dedicated pool is left as it is.
+    /// waiter asked between ticks. A dedicated pool's size is left as it
+    /// is; its tick still comes.
     pub fn turn(
         &mut self,
         pool: &mut impl PoolTarget,
@@ -71,6 +72,9 @@ impl Steer {
         signal: &mut impl FnMut(Signal),
     ) -> Turn {
         if self.governor.tolerance() == Tolerance::Dedicated {
+            if read.is_some() {
+                pool.ticked();
+            }
             return Turn {
                 target: self.governor.target(),
                 yielding: None,
@@ -110,6 +114,9 @@ impl Steer {
                     });
                 }
             }
+        }
+        if read.is_some() {
+            pool.ticked();
         }
         let mut turn = Turn {
             target,

@@ -374,3 +374,44 @@ fn a_pool_fits_whole_chunks_beside_the_largest_rung() {
             .contains("MiB")
     );
 }
+
+#[test]
+fn weight_shapes_round_trip_and_are_checked() {
+    let mut facts = ChunkFacts::degenerate(&hybrid(), &BYTES);
+    let experts = WeightShape {
+        id: ShapeId(10),
+        kind: WeightKind::Expert,
+        slot_bytes: facts.chunk_bytes / 2,
+        slots_per_chunk: 2,
+        count: 48 * 128,
+        floor_slots: 2 * 8,
+        name: "layers.moe.experts".into(),
+    };
+    facts.weights.push(experts.clone());
+    facts.validate().unwrap();
+    assert_eq!(facts.weight(ShapeId(10)), Some(&experts));
+    assert_eq!(experts.floor_bytes(), 16 * experts.slot_bytes);
+    let text = serde_json::to_string(&facts).unwrap();
+    assert_eq!(serde_json::from_str::<ChunkFacts>(&text).unwrap(), facts);
+
+    let mut clash = facts.clone();
+    clash.weights[0].id = facts.shapes[0].id;
+    let mut too_big = facts.clone();
+    too_big.weights[0].slots_per_chunk = 3;
+    let mut floor = facts.clone();
+    floor.weights[0].floor_slots = floor.weights[0].count + 1;
+    let mut empty = facts.clone();
+    empty.weights[0].count = 0;
+    for bad in [clash, too_big, floor, empty] {
+        assert!(bad.validate().is_err(), "{:?}", bad.weights);
+    }
+}
+
+#[test]
+fn chunk_facts_without_weights_read_as_none() {
+    let facts = ChunkFacts::degenerate(&dense(), &BYTES);
+    let mut value = serde_json::to_value(&facts).unwrap();
+    value.as_object_mut().unwrap().remove("weights");
+    let read: ChunkFacts = serde_json::from_value(value).unwrap();
+    assert!(read.weights.is_empty());
+}

@@ -77,6 +77,8 @@ source = "Qwen/Qwen3.5-0.8B"
 # device_memory_share  = 0.90
 # device_kv_budget     = "20GiB"  # kv pages and state slots; refused if it does not fit
 # device_weight_budget = "18GiB"  # omit for uncapped
+# weight_streaming     = "auto"   # or on, off: MoE experts and PLE rows leave the
+                                  # device under pressure before kv does
 # Suspended kv goes to the host, then the disk.
 # host_kv_budget       = "32GiB"
 # disk_kv_budget       = "200GiB"  # the tier is always on

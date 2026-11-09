@@ -37,6 +37,7 @@ pub fn build_without_engine(
 ) -> Result<runtime::bootstrap::Config> {
     let model = runtime::bootstrap::ModelConfig {
         memory_tolerance: user.model.memory_tolerance,
+        weight_streaming: user.model.weight_streaming,
         name: user.model.name.clone(),
         model_id: deployment.to_string(),
         kv_page_size: ENGINELESS_PAGE_SIZE as usize,
@@ -161,6 +162,7 @@ fn build_model(
             let backend_kind = g.backend.kind().to_string();
             let disk_kept = kept_disk(m, group, &g);
             runtime::bootstrap::EngineConfig {
+                weights_fit: g.facts.weights_resident,
                 total_pages: g.caps.pools.kv_pages as usize,
                 resizable_kv_page_bytes: resizable_kv_page_bytes(&g.caps.pools),
                 pool_whole_at_load: g.caps.pools.slab_kv_page_bytes > 0,
@@ -209,6 +211,7 @@ fn build_model(
 
     Ok(runtime::bootstrap::ModelConfig {
         memory_tolerance: m.memory_tolerance,
+        weight_streaming: m.weight_streaming,
         name: m.name.clone(),
         model_id: engines_facts,
         kv_page_size: group0_caps.pools.kv_page_size as usize,
