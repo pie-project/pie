@@ -187,6 +187,8 @@ fn conv_step(
         } else {
             x_bf16
         };
+        // An f32 bank (the tests') keeps the row as f32.
+        let x_part = f.convert(x_part, f.elem(past));
         f.concat(&[kept, x_part], 1)?
     } else if blocked {
         let width = f.dims(past)[2];
