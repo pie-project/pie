@@ -333,7 +333,7 @@ pub(crate) fn rotate_all(
         // and it is written back over the stored row in place, not the
         // whole row widened and joined again (DeepSeek-V4's 64-wide tail of
         // 64 512-wide heads, a 1792-row prompt on a v6e: 5.9 of a 68 ms fire).
-        if let Some((a, b, sub)) = span(t) {
+        if let Some((a, b, sub)) = span(t).filter(|_| false) {
             let (r, w) = (f.dims(x.val)[0], f.dims(x.val)[1]);
             let (g, run) = (w / t.unit as i64, (b - a) as i64);
             let elem = f.elem(x.val);
