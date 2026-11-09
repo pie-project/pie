@@ -17,6 +17,7 @@ Modes: `ref` (f32 everywhere, the reference arithmetic), or `+`-joined kernel sw
   kv32     KV cache in f32
   r16      router x in one f16 part (f32 accumulation)
   rxp2     router x in two f16 parts
+  ftz      f16 subnormal probabilities and attention outputs o flushed to 0 (the weight PE's f16 copies)
   glv      the SwiGLU as ctl_cy_gptoss_moe GLUV 1: e = exp(-1.702 |g|), 1 / (1 + e) by the quadratic and two Newton
            steps in f32, glu = max(g, g e) r
   att32    attention matvecs (qkv, o) with f32 accumulation
@@ -172,7 +173,10 @@ class Emu:
             else:
                 mref = self.mref[l]
                 for _ in range(8):
-                    p = np.minimum(np.exp(np.clip(s - mref[:, None], -87, 88)), 65504).astype(f16).astype(f32)
+                    p = np.minimum(np.exp(np.clip(s - mref[:, None], -87, 88)), 65504).astype(f16)
+                    if "ftz" in o:
+                        p = np.where(np.abs(p) < f16(6.103515625e-05), f16(0), p)
+                    p = p.astype(f32)
                     num = np.einsum("kgt,ktd->kgd", p.reshape(NKV, NH // NKV, -1), Vc).reshape(NH, HD)
                     l_ = p.sum(-1)
                     bad = np.any((l_ < 2 ** -8) | (l_ >= 32768))
@@ -188,6 +192,8 @@ class Emu:
                 ov = self.Wo[l].T @ att
             else:
                 a16 = ffh(att)
+                if "ftz" in o:
+                    a16 = np.where(np.abs(a16) < f16(6.103515625e-05), f16(0), a16)
                 # a column's o dims (64) by Hc outputs a PE: f16 accumulation over the column's 64 inputs
                 if "att32" in o:
                     ov = (a16[self.operm].astype(f32)[:, None] * self.Wo[l][self.operm]).sum(0, dtype=f32)

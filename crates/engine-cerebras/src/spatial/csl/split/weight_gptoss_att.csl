@@ -39,6 +39,7 @@ param Dc: u16;
 param NE: u16;
 param PYW: u16;
 param WIN: u16 = 128;
+param PFTZ: u16 = 0;   // 1: f16 subnormal probabilities and o values flushed to 0 before their matvecs
 param TSTAMP: u16 = 0;
 param FIFOW: u16 = 32;
 
@@ -235,7 +236,26 @@ var spos = @zeros([if (NLS > 0) NLS else 1]u16);   // sliding: 1 + the position 
 var mref = @zeros([K * Qh]f32);
 var vf = @zeros([Dc + 1]f32);        // one entry's value row widened (the values' scaled adds)
 const vf_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc + 1} -> vf[i] });
-var qt = @zeros([Dc * Qh]@fp16());   // q transposed [d][h] (the scores' matrix: one matvec a live entry)
+var qt = @zeros([Dc * Qh]@fp16());
+var fz = @zeros([if (PFTZ == 1) XN else 1]u16);
+const fz_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (PFTZ == 1) XN else 1} -> fz[i] });
+// xh[0..n) with an exponent field of 0 (zero or subnormal) set to +0: m = the exponent field + 0x7c00 (bit 15 set
+// iff normal), smeared over all 16 bits, then and-ed in
+fn ftz(n: u16) void {
+  if (PFTZ == 0) { return; }
+  const x = @set_dsd_length(@set_dsd_base_addr(fz_d, @ptrcast([*]u16, &xh)), n);
+  const m = @set_dsd_length(fz_d, n);
+  @and16(m, x, @as(u16, 0x7c00));
+  @add16(m, m, @as(u16, 0x7c00));
+  @and16(m, m, @as(u16, 0x8000));
+  const t = @set_dsd_length(@set_dsd_base_addr(fz_d, @ptrcast([*]u16, &y16)), n);
+  var sh: u16 = 1;
+  while (sh < 16) : (sh *= 2) {
+    @slr16(t, m, sh);
+    @or16(m, m, t);
+  }
+  @and16(x, x, m);
+}   // q transposed [d][h] (the scores' matrix: one matvec a live entry)
 const qt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc * Qh} -> qt[i] });
 const kc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> kc[i] });
 const QD: u16 = Qh * Dc;
@@ -352,6 +372,7 @@ fn att_mix(l: u16, full: bool, a: u16, s: u16) void {
       @fmaxs(sp, sp, -65504.0);
       @fnegs(sp, sp);
       @fs2h(@set_dsd_length(xh_d, nsl), sp);
+      ftz(nsl);
       h = 0;
       if (nel <= 4) {
         // few live entries: a head's values as nel scaled adds of the entry's (f32-widened, exact) value row,
@@ -378,6 +399,7 @@ fn att_mix(l: u16, full: bool, a: u16, s: u16) void {
     send_y(Qh * (Dc + 1));
     // o (the o_proj's x), then the redo word and (redo passes) the heads' log-sum-exp steps
     @fs2h(@set_dsd_length(xh_d, QO), fin(q_ym, QO));
+    ftz(QO);
     @fmovs(@set_dsd_length(sx_d, 1), fin(q_ym, 1));
     if (sx[0] == 0.0) {
       lpa = l + 1;

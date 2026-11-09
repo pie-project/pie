@@ -28,6 +28,7 @@ param NEX: u16 = 32;
 param TK: u16 = 4;
 param HOSTX: u16 = 0;
 param XKEEP: u16 = 0;
+param XDLY: u16 = 0;   // (diagnostics) cycles unit 0's CX waits after the token loop's embedding chunk arrives
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const tile_config = @import_module("<tile_config>");
@@ -163,7 +164,15 @@ task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
     if (HOSTX == 0 and (rcfg[RQ + 7] & 1) == 0) { @fmovs(x_d, fin(q_hi, Hc)); }
-    else if (s > 0 and (rcfg[RQ + 7] & 4) != 0) { @fmovs(x_d, fin(q_em, Hc)); }
+    else if (s > 0 and (rcfg[RQ + 7] & 4) != 0) {
+      @fmovs(x_d, fin(q_em, Hc));
+      if (XDLY > 0) {
+        timestamp.get_timestamp(&tsc);
+        const t0 = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16);
+        var tn: u32 = t0;
+        while (tn - t0 < @as(u32, XDLY)) { timestamp.get_timestamp(&tsc); tn = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
+      }
+    }
     stamp(0);
     var l: u16 = 0;
     while ((DIAG & 1) == 0 and l < (if ((DIAG & 2) != 0) 1 else K)) : (l += 1) {
