@@ -40,10 +40,8 @@ pub struct GemmaGeo {
     pub kvrecv: HashSet<P>,
 }
 
-/// The layout a geometry name states (`split_geo_gemma.GEOS`).
-pub fn layout(
-    name: &str,
-) -> R<(
+/// (PX, PY, HC, HR, Hc, SWA, unit origins, columns, KV source unit, KV sharers, K)
+pub type Layout = (
     u32,
     u32,
     u32,
@@ -55,8 +53,10 @@ pub fn layout(
     usize,
     Vec<usize>,
     u32,
-)> {
-    // (PX, PY, HC, HR, Hc, SWA, origins, cols, kvsrc, kvdst, K)
+);
+
+/// The layout a geometry name states (`split_geo_gemma.GEOS`).
+pub fn layout(name: &str) -> R<Layout> {
     match name {
         "tiny" => Ok((
             8,

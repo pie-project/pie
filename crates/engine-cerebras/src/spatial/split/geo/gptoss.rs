@@ -151,7 +151,7 @@ impl GptossGeo {
 
     pub fn build(&mut self) -> R<()> {
         let (px, py, xc, yc, ax) = (self.g.p.px, self.g.p.py, self.g.xc, self.g.yc, self.ax);
-        if ax % self.g.p.swa != 0 || self.mx % self.swr != 0 {
+        if !ax.is_multiple_of(self.g.p.swa) || !self.mx.is_multiple_of(self.swr) {
             return Err("gpt-oss: segments must divide their halves".into());
         }
         for u in 0..self.g.units() {

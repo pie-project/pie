@@ -161,75 +161,9 @@ pub struct SplitModel {
     gemma: Option<GemmaPle>,
 }
 
-/// Gemma's step-0 PLE words: each unit column's storage files and the CY rows that take them.
+/// Gemma 4's host side (its step-0 PLE words come from the storage PEs): the final logit softcap.
 pub struct GemmaPle {
-    cols: Vec<GCol>,
-    px: u32,
-    xc: u32,
     softcap: f32,
-}
-
-struct GCol {
-    nt: u32,
-    lv: u32,
-    files: Vec<(u32, u32, Npy)>,
-    /// (x origin, CY row) of each unit on the bus
-    cys: Vec<(u32, u32)>,
-}
-
-impl GemmaPle {
-    /// Token `v`'s words for column `ci`: [PX][lv] f32 bits + the sequence word (position + 1).
-    fn words(&self, ci: usize, v: u32, pos: usize) -> R<Vec<u32>> {
-        let c = &self.cols[ci];
-        let (k, j) = (v / c.nt, v % c.nt);
-        let (r0, _, f) = c
-            .files
-            .iter()
-            .find(|(r0, r1, _)| k >= *r0 && k < *r1)
-            .ok_or_else(|| format!("split gemma: no PLE file for token {v}"))?;
-        let inner = f.shape[2];
-        let mut raw = Vec::with_capacity((self.px * c.lv) as usize);
-        for col in 0..self.px as usize {
-            f.words(
-                ((k - r0) as usize * self.px as usize + col) * inner + (j * c.lv) as usize,
-                c.lv as usize,
-                &mut raw,
-            )?;
-        }
-        let mut out = Vec::with_capacity((self.px * (c.lv + 1)) as usize);
-        for col in 0..self.px as usize {
-            for i in 0..c.lv as usize {
-                out.push(f16_to_f32(raw[col * c.lv as usize + i] as u16).to_bits());
-            }
-            out.push(((pos + 1) as f32).to_bits());
-        }
-        Ok(out)
-    }
-}
-
-fn f16_to_f32(h: u16) -> f32 {
-    let s = u32::from(h >> 15) << 31;
-    let e = u32::from((h >> 10) & 0x1f);
-    let m = u32::from(h & 0x3ff);
-    let bits = if e == 0 {
-        if m == 0 {
-            s
-        } else {
-            // subnormal: renormalise
-            let mut e2 = 127 - 15 + 1;
-            let mut m2 = m;
-            while m2 & 0x400 == 0 {
-                m2 <<= 1;
-                e2 -= 1;
-            }
-            s | (e2 << 23) | ((m2 & 0x3ff) << 13)
-        }
-    } else if e == 31 {
-        s | 0x7f80_0000 | (m << 13)
-    } else {
-        s | ((e + 127 - 15) << 23) | (m << 13)
-    };
-    f32::from_bits(bits)
 }
 
 impl SplitModel {
@@ -239,7 +173,7 @@ impl SplitModel {
             return SplitModel::open_gptoss(dev, spec, vocab);
         }
         if let Some(name) = spec.meta.get("geo").and_then(|v| v.as_str()) {
-            return SplitModel::open_gemma(dev, spec, vocab, &name.to_string());
+            return SplitModel::open_gemma(dev, spec, vocab, name);
         }
         let t0 = std::time::Instant::now();
         let g = spec.geo()?;
@@ -351,40 +285,7 @@ impl SplitModel {
         let hemb = spec.npy("hemb")?;
         let u0 = g.unit_origin(0);
         let vr = spec.need("VR")?;
-        let metacols = spec
-            .meta
-            .get("cols")
-            .and_then(|v| v.as_array())
-            .ok_or("split gemma meta: no cols")?;
-        let mut cols = Vec::new();
-        for (ci, mc) in metacols.iter().enumerate() {
-            let mut files = Vec::new();
-            for f in mc["files"].as_array().ok_or("cols: files")? {
-                files.push((
-                    f["r0"].as_u64().unwrap_or(0) as u32,
-                    f["r1"].as_u64().unwrap_or(0) as u32,
-                    spec.npy(f["name"].as_str().ok_or("cols: name")?)?,
-                ));
-            }
-            let cys = gg.cols[ci]
-                .units
-                .iter()
-                .map(|&u| {
-                    let (x, y) = g.unit_origin(u);
-                    (x, y + g.yc)
-                })
-                .collect();
-            cols.push(GCol {
-                nt: mc["nt"].as_u64().ok_or("cols: nt")? as u32,
-                lv: mc["lv"].as_u64().ok_or("cols: lv")? as u32,
-                files,
-                cys,
-            });
-        }
         let gemma = GemmaPle {
-            cols,
-            px: g.p.px,
-            xc: g.xc,
             softcap: spec
                 .meta
                 .get("SOFTCAP")

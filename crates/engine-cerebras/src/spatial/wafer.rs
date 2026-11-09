@@ -1568,7 +1568,7 @@ impl Wafer {
                                 }
                             },
                             split: false,
-            split_loop: None,
+                            split_loop: None,
                             posted: mpsc::channel().1,
                         }));
                         m
