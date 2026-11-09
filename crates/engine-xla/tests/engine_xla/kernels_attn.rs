@@ -512,9 +512,13 @@ fn prefill_alike(qh: usize, kvh: usize, d: usize, n0: i32) {
 
 #[test]
 fn a_long_decode_walks_its_keys_in_chunks() {
-    long_decode(8, 2, 64);
-    // 64-wide heads in pairs (gpt-oss: 8 kv heads of 64).
-    long_decode(16, 8, 64);
+    if std::env::var_os("ONLY_B").is_none() {
+        long_decode(8, 2, 64);
+    }
+    if std::env::var_os("ONLY_A").is_none() {
+        // 64-wide heads in pairs (gpt-oss: 8 kv heads of 64).
+        long_decode(16, 8, 64);
+    }
 }
 
 /// Wide heads take the per-kv-head column-slice contraction.
