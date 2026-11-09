@@ -16,6 +16,8 @@ attn.block_rows = 256
 # a prompt's narrow-head rope turns the row as it lies, no `[rows, heads, 64]` relayouts (gpt-oss-20b
 # 4096-row pf256 fire 125.5 -> 123.4 ms; a v5e loses by as much, so it stays off there)
 rope.flat_rows = 1024
+# a decode of 64 rows and more reads each row's own pages through the page-copy kernel
+attn.decode_pages = 64
 
 [provenance]
 measured = [
@@ -23,6 +25,7 @@ measured = [
   "kernel.attn.block_keys",
   "kernel.attn.block_rows",
   "kernel.attn.budget_mi",
+  "kernel.attn.decode_pages",
   "kernel.attn.per_row_max",
   "kernel.moe.cost.dense_all_mi",
   "kernel.moe.cost.loop_row_ns",
