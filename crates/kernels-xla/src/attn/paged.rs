@@ -1170,6 +1170,9 @@ fn per_row_window(
 
 /// Row blocks against the flat key axis `0..keys`, each block walking only
 /// the chunks its rows' `[lo, hi)` span.
+/// The most row blocks [`blocked`] runs in line rather than as a loop.
+const UNROLLED_BLOCKS: i64 = 16;
+
 pub(crate) fn blocked(
     f: &mut Func,
     planes: &Planes,
@@ -1299,6 +1302,25 @@ pub(crate) fn blocked(
     };
     let whole = if nb == 1 {
         block(f, &rows_p)?
+    } else if nb <= UNROLLED_BLOCKS {
+        // A few blocks run one after another in line, each on a static cut
+        // of the rows, and join at the end: as a loop, each block's result
+        // is written into a copy of the whole carried output (DeepSeek-V4's
+        // window blocks, 14 of 128 rows a layer: 1.4 of a 56 ms v6e fire).
+        let mut parts = Vec::with_capacity(nb as usize);
+        for bi in 0..nb {
+            let rb = rows_p.map(f, &mut |f, v| f.slice_axis(v, 0, bi * br, (bi + 1) * br))?;
+            parts.push(block(f, &rb)?);
+        }
+        let join = |f: &mut Func, pick: fn(&Flashed) -> Val| -> Built<Val> {
+            let vs: Vec<Val> = parts.iter().map(pick).collect();
+            f.concat(&vs, 0)
+        };
+        Flashed {
+            o: join(f, |x| x.o)?,
+            m: join(f, |x| x.m)?,
+            l: join(f, |x| x.l)?,
+        }
     } else {
         let st0 = [
             f.const_f(Elem::F32, 0.0, &[rp, h.kvh, h.g, h.dv]),
