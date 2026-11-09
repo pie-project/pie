@@ -1185,6 +1185,13 @@ fn gmm(
         f.take_rows(x, src)?
     };
     let w = bank.codes.val();
+    // e2m1 codes as their bits, bitcast in the bank's own layout (after the
+    // transpose, XLA copies the whole bank to relay the u4 out).
+    let w = if spec.scaled {
+        f.bitcast(w, Elem::U4)?
+    } else {
+        w
+    };
     let w = match spec.orient {
         // The bank's layout on the device: a free transpose.
         Orient::KMajor => f.transpose(w, &[1, 0])?,
@@ -1206,7 +1213,6 @@ fn gmm(
         };
         let s = f.reshape(s, &[e * n, fan.k / 32])?;
         let s = f.transpose(s, &[1, 0])?;
-        let w = f.bitcast(w, Elem::U4)?;
         let ops: Vec<Val> = [se, nt, xs, w, s].into_iter().chain(bias).collect();
         kernel.call(f, &ops)?[0]
     } else {
