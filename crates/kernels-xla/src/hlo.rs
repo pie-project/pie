@@ -566,6 +566,19 @@ impl Func {
         config: &str,
         outs: Vec<Ty>,
     ) -> Vec<Val> {
+        self.custom_call_aliased(target, operands, config, outs, &[])
+    }
+
+    /// [`Func::custom_call`] with `(result, operand)` pairs that share a
+    /// buffer (`output_operand_aliases`).
+    pub fn custom_call_aliased(
+        &mut self,
+        target: &str,
+        operands: &[Val],
+        config: &str,
+        outs: Vec<Ty>,
+        aliases: &[(usize, usize)],
+    ) -> Vec<Val> {
         let layout = |t: &Ty| {
             let r = t.rank();
             let order: Vec<i64> = (0..r as i64).rev().collect();
@@ -585,12 +598,30 @@ impl Func {
                 c => escaped.push(c),
             }
         }
-        let attrs = format!(
+        let mut attrs = format!(
             "api_version = 1 : i32, backend_config = \"{escaped}\", call_target_name = \"{target}\", \
              has_side_effect = false, operand_layouts = [{}], result_layouts = [{}]",
             ins.join(", "),
             res.join(", ")
         );
+        if !aliases.is_empty() {
+            let multi = outs.len() > 1;
+            let list: Vec<String> = aliases
+                .iter()
+                .map(|&(out, operand)| {
+                    let idx = if multi {
+                        out.to_string()
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "#stablehlo.output_operand_alias<output_tuple_indices = [{idx}], \
+                         operand_index = {operand}, operand_tuple_indices = []>"
+                    )
+                })
+                .collect();
+            attrs.push_str(&format!(", output_operand_aliases = [{}]", list.join(", ")));
+        }
         self.op_named("stablehlo.custom_call", operands, &attrs, outs)
     }
 
