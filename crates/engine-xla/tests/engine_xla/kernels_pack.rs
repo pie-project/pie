@@ -524,8 +524,8 @@ fn routed_banks_read_native_codes_and_prescaled_weights_every_way() {
 /// the grouped-matmul kernel under the default profile, the codes converted
 /// and scaled in VMEM: an `E·N`-minor bank in whole lane blocks and in
 /// per-expert element windows (N not whole lane tiles, as gpt-oss's down
-/// bank); one token (a decode), more, and a crowded expert; unrouted pairs;
-/// with and without a bias.
+/// bank); more than one token, and a crowded expert (one token, a decode,
+/// slices its experts out); unrouted pairs; with and without a bias.
 #[test]
 fn mxfp4_codes_run_the_grouped_matmul_kernel() {
     for (e, n, k) in [(4usize, 256usize, 160usize), (4, 192, 160)] {
@@ -581,8 +581,9 @@ fn mxfp4_codes_run_the_grouped_matmul_kernel() {
             if !ran {
                 return;
             }
+            // (One token's pairs are each sliced out of the bank instead.)
             assert!(
-                nat.module.contains("tpu_custom_call"),
+                t == 1 || nat.module.contains("tpu_custom_call"),
                 "the kernel ran for {e}x{n}x{k}"
             );
             for (y, b) in [(plain, None), (biased, Some(&bias[..]))] {
