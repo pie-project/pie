@@ -2301,9 +2301,46 @@ pub(crate) fn scatter_slots(
     let n = first.rows;
     let page = read_rows_i32(f, op, write_page, n)?;
     let off = read_rows_i32(f, op, write_offset, n)?;
+    let ps = i64::from(page_size);
+    let slots = i64::from(pairs[0].1.rows);
+    let paged = i64::from(n) >= PAGE_WRITE_ROWS
+        && ps >= 8
+        && slots % ps == 0
+        && pairs.iter().all(|(src, plane)| {
+            plane.rows == pairs[0].1.rows && src.rows == n && f.elem(src.val) == Elem::Bf16
+        });
+    if !paged {
+        return Ok(slot_rows(f, pairs, ps, page, off)?);
+    }
+    let outs: Vec<crate::hlo::Ty> = pairs
+        .iter()
+        .map(|(_, plane)| f.ty(plane.val).clone())
+        .collect();
+    let runs = page_runs(f, i64::from(n), ps, slots / ps, page, off)?;
+    let rows: crate::hlo::Branch<'_> =
+        Box::new(move |f: &mut Func| slot_rows(f, pairs, ps, page, off));
+    let pages: crate::hlo::Branch<'_> =
+        Box::new(move |f: &mut Func| page_writes(f, pairs, ps, slots / ps, &runs));
+    Ok(f.case(runs.ok, &outs, vec![rows, pages])?)
+}
+
+/// Rows from which `scatter_slots` writes whole pages: a fire this tall is a
+/// prefill's, whose rows fill a lane's pages in runs, and a TPU row scatter
+/// pays for every row it is handed, landing or not (v6e: ~0.12 us a row, a
+/// 1792-row prefill's plane 0.22 ms; its pages written whole, 0.02 ms).
+const PAGE_WRITE_ROWS: i64 = 128;
+
+/// Each row of `src` written to its own slot, one row scatter a plane.
+fn slot_rows(
+    f: &mut Func,
+    pairs: &[(Operand, Operand)],
+    ps: i64,
+    page: Val,
+    off: Val,
+) -> Built<Vec<Val>> {
     let mut out: Vec<Val> = Vec::with_capacity(pairs.len());
     for (at, &(src, plane)) in pairs.iter().enumerate() {
-        let ps = i64::from(page_size);
+        let n = i64::from(src.rows);
         let slots = i64::from(plane.rows);
         let pages = slots / ps;
         let a = cmp_i(f, Cmp::Ge, page, 0)?;
@@ -2316,7 +2353,7 @@ pub(crate) fn scatter_slots(
         let s = with_i(f, page, ps, Func::mul)?;
         let s = f.add(s, off)?;
         let f0 = f.like_i(s, slots);
-        let io = f.iota(Elem::I32, &[i64::from(n)], 0);
+        let io = f.iota(Elem::I32, &[n], 0);
         let far = f.add(f0, io)?;
         let slot = f.select(ok, s, far)?;
         let rows = src.val;
@@ -2327,6 +2364,193 @@ pub(crate) fn scatter_slots(
         let elem = f.elem(table);
         let rows = f.convert(rows, elem);
         out.push(f.put_rows_hinted(table, slot, rows, crate::hlo::Combine::Set, true)?);
+    }
+    Ok(out)
+}
+
+/// A fire's rows read as runs of one page each: run `j` starts at row
+/// `start[j]`, lands at offset `first[j]` of page `page[j]` and is `len[j]`
+/// rows long. `ok` (an i32 0 or 1) says the runs cover every row bound for a
+/// live page, each page in one run, consecutive offsets: then the pages can
+/// be written whole. Rows bound for the sink page (the plane's last, which
+/// padding lanes write and nothing reads back) are left out.
+#[derive(Clone, Copy)]
+struct Runs {
+    start: Val,
+    first: Val,
+    len: Val,
+    page: Val,
+    ok: Val,
+}
+
+fn page_runs(f: &mut Func, n: i64, ps: i64, pages: i64, page: Val, off: Val) -> Built<Runs> {
+    let m = n / ps + 64;
+    let a = cmp_i(f, Cmp::Ge, page, 0)?;
+    let b = cmp_i(f, Cmp::Lt, page, pages - 1)?;
+    let c = cmp_i(f, Cmp::Ge, off, 0)?;
+    let d = cmp_i(f, Cmp::Lt, off, ps)?;
+    let live = f.and(a, b)?;
+    let live = f.and(live, c)?;
+    let live = f.and(live, d)?;
+    let none = f.like_i(page, -1);
+    let key = f.select(live, page, none)?;
+    let before = f.slice_axis(key, 0, 0, n - 1)?;
+    let lead = f.const_i(Elem::I32, -1, &[]);
+    let before = f.pad(before, lead, &[1], &[0], &[0])?;
+    let new = f.compare(Cmp::Ne, key, before)?;
+    let opens = f.and(live, new)?;
+    let opens = f.convert(opens, Elem::I32);
+    let count = f.scan_steps(opens, 0, Fold::Sum)?;
+    let total = f.reduce(opens, &[0], Fold::Sum)?;
+    // run j starts where the running count passes j; it holds the live rows
+    // whose count is j + 1
+    let grid = [m, n];
+    let cg = f.broadcast(count, &grid, &[1])?;
+    let jg = f.iota(Elem::I32, &grid, 0);
+    let before_j = f.compare(Cmp::Le, cg, jg)?;
+    let before_j = f.convert(before_j, Elem::I32);
+    let start = f.reduce(before_j, &[1], Fold::Sum)?;
+    let j1 = with_i(f, jg, 1, Func::add)?;
+    let mine = f.compare(Cmp::Eq, cg, j1)?;
+    let lg = f.broadcast(live, &grid, &[1])?;
+    let mine = f.and(mine, lg)?;
+    let mine = f.convert(mine, Elem::I32);
+    let len = f.reduce(mine, &[1], Fold::Sum)?;
+    let at = clamp_i(f, start, 0, n - 1)?;
+    let first = pick(f, off, at)?;
+    let page_j = pick(f, page, at)?;
+    // every live row sits at its run's first offset plus its place in the run
+    let run = with_i(f, count, 1, Func::sub)?;
+    let run = clamp_i(f, run, 0, m - 1)?;
+    let run_first = pick(f, first, run)?;
+    let run_start = pick(f, start, run)?;
+    let io = f.iota(Elem::I32, &[n], 0);
+    let want = f.sub(io, run_start)?;
+    let want = f.add(want, run_first)?;
+    let off_ok = f.compare(Cmp::Eq, off, want)?;
+    let stray = f.not(off_ok);
+    let stray = f.and(stray, live)?;
+    let stray = f.convert(stray, Elem::I32);
+    let strays = f.reduce(stray, &[0], Fold::Sum)?;
+    // no page in two runs: the live runs' pages, sorted, differ pairwise
+    let jm = f.iota(Elem::I32, &[m], 0);
+    let tb = f.broadcast(total, &[m], &[])?;
+    let used = f.compare(Cmp::Lt, jm, tb)?;
+    let spare = with_i(f, jm, pages, Func::add)?;
+    let keyed = f.select(used, page_j, spare)?;
+    let sorted = f.sort(&[keyed], 0, false, |f, a, b| f.compare(Cmp::Lt, a[0], b[0]))?;
+    let lo = f.slice_axis(sorted[0], 0, 0, m - 1)?;
+    let hi = f.slice_axis(sorted[0], 0, 1, m)?;
+    let twice = f.compare(Cmp::Eq, lo, hi)?;
+    let twice = f.convert(twice, Elem::I32);
+    let twice = f.reduce(twice, &[0], Fold::Sum)?;
+    let fits = cmp_i(f, Cmp::Le, total, m)?;
+    let clean = f.add(strays, twice)?;
+    let clean = cmp_i(f, Cmp::Eq, clean, 0)?;
+    let ok = f.and(fits, clean)?;
+    let ok = f.convert(ok, Elem::I32);
+    Ok(Runs {
+        start,
+        first,
+        len,
+        page: keyed,
+        ok,
+    })
+}
+
+/// `v[at]` for an i32 vector `v` and an i32 index vector `at`.
+fn pick(f: &mut Func, v: Val, at: Val) -> Built<Val> {
+    let k = f.dims(at)[0];
+    let at = f.reshape(at, &[k, 1])?;
+    f.gather(
+        v,
+        at,
+        &GatherDims {
+            collapsed_slice_dims: vec![0],
+            start_index_map: vec![0],
+            index_vector_dim: 1,
+            ..GatherDims::default()
+        },
+        &[1],
+    )
+}
+
+/// The runs' pages written whole: each page's old rows read back, its run's
+/// rows laid over them, the page scattered as one block. A run's rows are
+/// picked by a one-hot product (`[m·ps, n] · [n, w]`, exact: one term a row),
+/// as a row gather lowers to a loop of row slices on a TPU.
+fn page_writes(
+    f: &mut Func,
+    pairs: &[(Operand, Operand)],
+    ps: i64,
+    pages: i64,
+    runs: &Runs,
+) -> Built<Vec<Val>> {
+    let m = f.dims(runs.page)[0];
+    let n = i64::from(pairs[0].0.rows);
+    let at = f.reshape(runs.page, &[m, 1])?;
+    let read = clamp_i(f, runs.page, 0, pages - 1)?;
+    let read = f.reshape(read, &[m, 1])?;
+    let r = f.iota(Elem::I32, &[m, ps], 1);
+    let lo = f.broadcast(runs.first, &[m, ps], &[0])?;
+    let end = f.add(runs.first, runs.len)?;
+    let hi = f.broadcast(end, &[m, ps], &[0])?;
+    let ge = f.compare(Cmp::Ge, r, lo)?;
+    let lt = f.compare(Cmp::Lt, r, hi)?;
+    let laid = f.and(ge, lt)?;
+    // the source row of each laid slot: its run's start, then its place in the run
+    let from = f.sub(runs.start, runs.first)?;
+    let from = f.broadcast(from, &[m, ps], &[0])?;
+    let from = f.add(from, r)?;
+    let none = f.like_i(from, -1);
+    let from = f.select(laid, from, none)?;
+    let from = f.reshape(from, &[m * ps])?;
+    let from = f.broadcast(from, &[m * ps, n], &[0])?;
+    let io = f.iota(Elem::I32, &[m * ps, n], 1);
+    let pick = f.compare(Cmp::Eq, from, io)?;
+    let pick = f.convert(pick, Elem::Bf16);
+    let mut out: Vec<Val> = Vec::with_capacity(pairs.len());
+    for (at_pair, &(src, plane)) in pairs.iter().enumerate() {
+        let table = match at_pair.checked_sub(1) {
+            Some(prev) if pairs[prev].1.val == plane.val => out[prev],
+            _ => plane.val,
+        };
+        let w = i64::from(plane.width);
+        let elem = f.elem(table);
+        let p3 = f.reshape(table, &[pages, ps, w])?;
+        let old = f.gather(
+            p3,
+            read,
+            &GatherDims {
+                offset_dims: vec![1, 2],
+                collapsed_slice_dims: vec![0],
+                start_index_map: vec![0],
+                index_vector_dim: 1,
+                ..GatherDims::default()
+            },
+            &[1, ps, w],
+        )?;
+        let rows = f.convert(src.val, Elem::Bf16);
+        let new = f.dot_general(pick, rows, &[], &[], &[1], &[0], Elem::F32)?;
+        let new = f.convert(new, elem);
+        let new = f.reshape(new, &[m, ps, w])?;
+        let mask = f.broadcast(laid, &[m, ps, w], &[0, 1])?;
+        let merged = f.select(mask, new, old)?;
+        let written = f.scatter_hinted(
+            p3,
+            at,
+            merged,
+            &crate::hlo::ScatterDims {
+                update_window_dims: vec![1, 2],
+                inserted_window_dims: vec![0],
+                scatter_dims_to_operand_dims: vec![0],
+                index_vector_dim: 1,
+                ..crate::hlo::ScatterDims::default()
+            },
+            crate::hlo::Combine::Set,
+            true,
+        )?;
+        out.push(f.reshape(written, &[pages * ps, w])?);
     }
     Ok(out)
 }
