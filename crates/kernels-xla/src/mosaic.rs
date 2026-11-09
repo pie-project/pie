@@ -255,7 +255,11 @@ impl Body {
 
     fn int_binary(&mut self, op: &str, a: V, b: V, flags: bool) -> Built<V> {
         let t = self.ty(a).clone();
-        if &t != self.ty(b) || !matches!(t, MTy::I32 | MTy::Index | MTy::I1) {
+        let int = match &t {
+            MTy::Vector(_, e) => matches!(e, Elem::I32 | Elem::Pred),
+            t => matches!(t, MTy::I32 | MTy::Index | MTy::I1),
+        };
+        if &t != self.ty(b) || !int {
             return bad(format!("{op} over {t} and {}", self.ty(b)));
         }
         let attrs = if flags {
@@ -296,20 +300,156 @@ impl Body {
         if self.ty(a) != self.ty(b) {
             return bad(format!("cmpi over {} and {}", self.ty(a), self.ty(b)));
         }
+        let out = self.mask_of(a);
         Ok(self.op1(
             "arith.cmpi",
             &[a, b],
             &format!("predicate = {} : i64", p as i64),
-            MTy::I1,
+            out,
         ))
     }
 
+    /// The i1 type shaped like `v`: a mask for a vector, a scalar otherwise.
+    fn mask_of(&self, v: V) -> MTy {
+        match self.ty(v) {
+            MTy::Vector(d, _) => MTy::Vector(d.clone(), Elem::Pred),
+            _ => MTy::I1,
+        }
+    }
+
+    /// `a > b` (`gt`) or `a >= b` elementwise over float vectors, ordered.
+    pub fn cmpf(&mut self, gt: bool, a: V, b: V) -> Built<V> {
+        if self.ty(a) != self.ty(b) {
+            return bad(format!("cmpf over {} and {}", self.ty(a), self.ty(b)));
+        }
+        let out = self.mask_of(a);
+        let p = if gt { 2 } else { 3 };
+        Ok(self.op1(
+            "arith.cmpf",
+            &[a, b],
+            &format!("fastmath = #arith.fastmath<none>, predicate = {p} : i64"),
+            out,
+        ))
+    }
+
+    /// `c ? a : b`; `c` is a scalar i1 or a mask shaped like `a`.
     pub fn select(&mut self, c: V, a: V, b: V) -> Built<V> {
-        if self.ty(a) != self.ty(b) || self.ty(c) != &MTy::I1 {
+        let mask = self.mask_of(a);
+        if self.ty(a) != self.ty(b) || (self.ty(c) != &MTy::I1 && self.ty(c) != &mask) {
             return bad("select over mismatched operands");
         }
         let t = self.ty(a).clone();
         Ok(self.op1("arith.select", &[c, a, b], "", t))
+    }
+
+    /// The i32 index along `axis` of a `dims` vector (`tpu.iota`).
+    pub fn iota(&mut self, dims: &[i64], axis: usize) -> V {
+        self.op1(
+            "tpu.iota",
+            &[],
+            &format!("dimensions = array<i32: {axis}>"),
+            MTy::Vector(dims.to_vec(), Elem::I32),
+        )
+    }
+
+    /// `e^v` elementwise.
+    pub fn exp(&mut self, v: V) -> Built<V> {
+        let t = self.ty(v).clone();
+        if !matches!(&t, MTy::Vector(_, e) if e.is_float()) {
+            return bad(format!("exp of {t}"));
+        }
+        Ok(self.op1("math.exp", &[v], "fastmath = #arith.fastmath<none>", t))
+    }
+
+    /// A 2-d vector transposed (`tpu.transpose`).
+    pub fn transpose(&mut self, v: V) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.len() != 2 {
+            return bad(format!("transpose of {}", self.ty(v)));
+        }
+        Ok(self.op1(
+            "tpu.transpose",
+            &[v],
+            "permutation = array<i64: 1, 0>",
+            MTy::Vector(vec![d[1], d[0]], e),
+        ))
+    }
+
+    /// The sum of a 3-d f32 vector over `axis` 1 or 2, that axis dropped
+    /// (`vector.multi_reduction`).
+    pub fn reduce_sum(&mut self, v: V, axis: usize) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.len() != 3 || e != Elem::F32 || !(1..=2).contains(&axis) {
+            return bad(format!("a sum over axis {axis} of {}", self.ty(v)));
+        }
+        let mut out = d.clone();
+        out.remove(axis);
+        let init = self.splat_f(&out, e, 0.0)?;
+        Ok(self.op1(
+            "vector.multi_reduction",
+            &[v, init],
+            &format!("kind = #vector.kind<add>, reduction_dims = array<i64: {axis}>"),
+            MTy::Vector(out, e),
+        ))
+    }
+
+    /// `xs` joined along `axis` (`tpu.concatenate`; one piece is itself).
+    pub fn concat(&mut self, xs: &[V], axis: usize) -> Built<V> {
+        if xs.len() == 1 {
+            return Ok(xs[0]);
+        }
+        let (mut d, e) = self.vec_of(xs[0])?;
+        let mut n = 0;
+        for &x in xs {
+            let (dx, ex) = self.vec_of(x)?;
+            let same = dx
+                .iter()
+                .zip(&d)
+                .enumerate()
+                .all(|(i, (a, b))| i == axis || a == b);
+            if ex != e || dx.len() != d.len() || !same {
+                return bad(format!("concat of {} with {}", self.ty(xs[0]), self.ty(x)));
+            }
+            n += dx[axis];
+        }
+        d[axis] = n;
+        Ok(self.op1(
+            "tpu.concatenate",
+            xs,
+            &format!("dimension = {axis} : i32"),
+            MTy::Vector(d, e),
+        ))
+    }
+
+    /// The `sizes` window of `v` at `offs` (`vector.extract_strided_slice`).
+    pub fn slice(&mut self, v: V, offs: &[i64], sizes: &[i64]) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        let inside = offs
+            .iter()
+            .zip(sizes)
+            .zip(&d)
+            .all(|((o, n), m)| *o >= 0 && o + n <= *m);
+        if offs.len() != d.len() || sizes.len() != d.len() || !inside {
+            return bad(format!("slice {offs:?}+{sizes:?} of {}", self.ty(v)));
+        }
+        let list = |xs: &[i64]| {
+            xs.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let ones = vec![1; d.len()];
+        Ok(self.op1(
+            "vector.extract_strided_slice",
+            &[v],
+            &format!(
+                "offsets = [{}], sizes = [{}], strides = [{}]",
+                list(offs),
+                list(sizes),
+                list(&ones)
+            ),
+            MTy::Vector(sizes.to_vec(), e),
+        ))
     }
 
     /// `v`, promised to be a multiple of `m` (`tpu.assume_multiple`): lets
@@ -520,6 +660,37 @@ impl Body {
         self.float_binary("arith.mulf", a, b)
     }
 
+    pub fn subf(&mut self, a: V, b: V) -> Built<V> {
+        self.float_binary("arith.subf", a, b)
+    }
+
+    /// `v` stretched along its unit axes to `dims` (`vector.broadcast`).
+    pub fn broadcast(&mut self, v: V, dims: &[i64]) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.len() != dims.len() || d.iter().zip(dims).any(|(&a, &b)| a != b && a != 1) {
+            return bad(format!("broadcast of {} to {dims:?}", self.ty(v)));
+        }
+        Ok(self.op1("vector.broadcast", &[v], "", MTy::Vector(dims.to_vec(), e)))
+    }
+
+    /// `v`'s elements, in order, as a `dims` vector (`vector.shape_cast`).
+    pub fn shape_cast(&mut self, v: V, dims: &[i64]) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.iter().product::<i64>() != dims.iter().product::<i64>() {
+            return bad(format!("shape_cast of {} to {dims:?}", self.ty(v)));
+        }
+        Ok(self.op1("vector.shape_cast", &[v], "", MTy::Vector(dims.to_vec(), e)))
+    }
+
+    /// Rows `lo .. lo + n` of a 2-d vector.
+    pub fn rows(&mut self, v: V, lo: i64, n: i64) -> Built<V> {
+        let (d, _) = self.vec_of(v)?;
+        if d.len() != 2 {
+            return bad(format!("rows of {}", self.ty(v)));
+        }
+        self.slice(v, &[lo, 0], &[n, d[1]])
+    }
+
     /// `acc + lhs · rhs` over 2-d vectors, contracting `lhs`'s axis 1 with
     /// `rhs`'s axis 0 (`[m, k]·[k, n]`), or with its axis 1 when `rhs_t`
     /// (`[m, k]·[n, k]ᵀ`). The accumulator's type is the result's.
@@ -556,7 +727,140 @@ impl Body {
         ))
     }
 
+    /// `acc + lhsᵀ · rhs` over 2-d vectors (`[k, m]ᵀ·[k, n]`), the MXU
+    /// reading `lhs` transposed (`transpose_lhs`).
+    pub fn matmul_tl(&mut self, lhs: V, rhs: V, acc: V) -> Built<V> {
+        let (ld, _) = self.vec_of(lhs)?;
+        let (rd, _) = self.vec_of(rhs)?;
+        let (ad, ae) = self.vec_of(acc)?;
+        if ld.len() != 2 || rd.len() != 2 || ld[0] != rd[0] || ad != [ld[1], rd[1]] {
+            return bad(format!(
+                "matmul_tl of {} by {} into {}",
+                self.ty(lhs),
+                self.ty(rhs),
+                self.ty(acc)
+            ));
+        }
+        Ok(self.op1(
+            "tpu.matmul",
+            &[lhs, rhs, acc],
+            "dimension_numbers = #tpu.dot_dimension_numbers<[0], [0], [1], [1], [0, 1, 1, 1], [], []>, \
+             transpose_lhs = false, transpose_lhs_hint = false, transpose_rhs = false",
+            MTy::Vector(ad, ae),
+        ))
+    }
+
+    /// `acc + lhs · rhs` over 2-d or (batch-leading) 3-d vectors: `lc` and
+    /// `rc` name the contracted axis of each (the minor two axes are the
+    /// matrix), `fp32` asks for a full-precision product (six bf16 passes;
+    /// off, one pass over bf16-rounded operands). The result's axes are the
+    /// batch, then `lhs`'s free axis, then `rhs`'s.
+    pub fn matmul_g(
+        &mut self,
+        lhs: V,
+        rhs: V,
+        acc: V,
+        lc: usize,
+        rc: usize,
+        fp32: bool,
+    ) -> Built<V> {
+        let (ld, _) = self.vec_of(lhs)?;
+        let (rd, _) = self.vec_of(rhs)?;
+        let (ad, ae) = self.vec_of(acc)?;
+        let r = ld.len();
+        let b = r - 2;
+        let (lf, rf) = (2 * b + 1 - lc, 2 * b + 1 - rc);
+        let batch_ok = ld[..b] == rd[..b] && ad[..b] == ld[..b];
+        if !(2..=3).contains(&r)
+            || rd.len() != r
+            || ad.len() != r
+            || !(b..r).contains(&lc)
+            || !(b..r).contains(&rc)
+            || !batch_ok
+            || ld[lc] != rd[rc]
+            || ad[b] != ld[lf]
+            || ad[b + 1] != rd[rf]
+        {
+            return bad(format!(
+                "matmul of {} by {} into {} (contracting {lc} with {rc})",
+                self.ty(lhs),
+                self.ty(rhs),
+                self.ty(acc)
+            ));
+        }
+        let bl: Vec<String> = (0..b).map(|i| i.to_string()).collect();
+        let mut order: Vec<String> = Vec::new();
+        for i in 0..b {
+            order.push(format!("0, {i}"));
+        }
+        order.push(format!("0, {lf}"));
+        order.push(format!("1, {rf}"));
+        let dims = format!(
+            "#tpu.dot_dimension_numbers<[{lc}], [{rc}], [{lf}], [{rf}], [{}], [{}], [{}]>",
+            order.join(", "),
+            bl.join(", "),
+            bl.join(", ")
+        );
+        let precision = if fp32 {
+            ", precision = #tpu.contract_precision<fp32>"
+        } else {
+            ""
+        };
+        Ok(self.op1(
+            "tpu.matmul",
+            &[lhs, rhs, acc],
+            &format!(
+                "dimension_numbers = {dims}{precision}, transpose_lhs = false, transpose_lhs_hint = false, \
+                 transpose_rhs = false"
+            ),
+            MTy::Vector(ad, ae),
+        ))
+    }
+
     // ------------------------------------------------------------ control
+
+    /// `for i in lb..ub step st { body(i) }` over i32 bounds (`scf.for`, no
+    /// carried values: state lives in references).
+    pub fn for_range(
+        &mut self,
+        lb: V,
+        ub: V,
+        st: V,
+        body: impl FnOnce(&mut Self, V) -> Built<()>,
+    ) -> Built<()> {
+        if [lb, ub, st].iter().any(|&v| self.ty(v) != &MTy::I32) {
+            return bad("scf.for over non-i32 bounds");
+        }
+        let names = self.list(&[lb, ub, st], |b, v| b.names[v.0 as usize].clone());
+        let iv = self.fresh(format!("%iv{}", self.next), MTy::I32);
+        self.next += 1;
+        let ivn = self.names[iv.0 as usize].clone();
+        self.line(&format!("\"stable_mosaic.scf.for\"({names}) ({{"));
+        self.line(&format!("^bb0({ivn}: i32):"));
+        self.depth += 1;
+        body(self, iv)?;
+        self.line("\"stable_mosaic.scf.yield\"() : () -> ()");
+        self.depth -= 1;
+        self.line("}) : (i32, i32, i32) -> ()");
+        Ok(())
+    }
+
+    /// The sum of a 2-d f32 vector over its rows, kept as `[1, cols]`
+    /// (`vector.multi_reduction` over axis 0).
+    pub fn sum_rows(&mut self, v: V) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if d.len() != 2 || e != Elem::F32 {
+            return bad(format!("a column sum of {}", self.ty(v)));
+        }
+        let init = self.splat_f(&[d[1]], e, 0.0)?;
+        let r = self.op1(
+            "vector.multi_reduction",
+            &[v, init],
+            "kind = #vector.kind<add>, reduction_dims = array<i64: 0>",
+            MTy::Vector(vec![d[1]], e),
+        );
+        self.shape_cast(r, &[1, d[1]])
+    }
 
     /// `scf.if cond { then }` (no results).
     pub fn when(&mut self, cond: V, then: impl FnOnce(&mut Self) -> Built<()>) -> Built<()> {
@@ -907,6 +1211,47 @@ impl Compiled {
             operands,
             &self.config,
             self.results.clone(),
+        ))
+    }
+
+    /// [`Compiled::call`] with result `out` written in place over operand
+    /// `operand` (counting the prefetched arrays), for each pair of
+    /// `aliases`: the kernel writes only the blocks it visits, the rest of
+    /// the operand stands.
+    pub fn call_aliased(
+        &self,
+        f: &mut crate::hlo::Func,
+        operands: &[crate::hlo::Val],
+        aliases: &[(usize, usize)],
+    ) -> Built<Vec<crate::hlo::Val>> {
+        for &(out, operand) in aliases {
+            if self.results.get(out) != self.operands.get(operand) {
+                return bad(format!(
+                    "result {out} cannot stand in for operand {operand}"
+                ));
+            }
+        }
+        if operands.len() != self.operands.len() {
+            return bad(format!(
+                "{} operands for a kernel of {}",
+                operands.len(),
+                self.operands.len()
+            ));
+        }
+        for (i, (&v, want)) in operands.iter().zip(&self.operands).enumerate() {
+            if f.ty(v) != want {
+                return bad(format!(
+                    "operand {i} is {}, the kernel takes {want}",
+                    f.ty(v)
+                ));
+            }
+        }
+        Ok(f.custom_call_aliased(
+            "tpu_custom_call",
+            operands,
+            &self.config,
+            self.results.clone(),
+            aliases,
         ))
     }
 }
