@@ -1171,7 +1171,7 @@ fn per_row_window(
 /// Row blocks against the flat key axis `0..keys`, each block walking only
 /// the chunks its rows' `[lo, hi)` span.
 /// The most row blocks [`blocked`] runs in line rather than as a loop.
-const UNROLLED_BLOCKS: i64 = 16;
+const UNROLLED_BLOCKS: i64 = 1;
 
 pub(crate) fn blocked(
     f: &mut Func,
