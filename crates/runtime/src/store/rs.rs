@@ -893,6 +893,20 @@ impl RsStore {
         self.cache_holds(key, snapshot, true);
     }
 
+    /// The checkpoints among `scope` let go (`hold` false) or take again
+    /// their cache entries' holds: around a move that renames their rows.
+    fn cache_holds_in(&mut self, scope: &HashSet<RsWorkingSetId>, hold: bool) {
+        let kept: Vec<(Hash256, RsWorkingSetId)> = self
+            .checkpoints
+            .iter()
+            .filter(|(_, entry)| scope.contains(&entry.snapshot))
+            .map(|(&key, entry)| (key, entry.snapshot))
+            .collect();
+        for (key, snapshot) in kept {
+            self.cache_holds(key, snapshot, hold);
+        }
+    }
+
     /// The checkpoint `key` takes (`hold`) or lets go its cache entry's
     /// hold on the device rows of `snapshot`.
     fn cache_holds(&mut self, key: Hash256, snapshot: RsWorkingSetId, hold: bool) {
@@ -1727,6 +1741,7 @@ impl RsStore {
         let busy = self.busy_slots();
         let scope: HashSet<RsWorkingSetId> = txn.scope.iter().copied().collect();
         let held = self.held_within(&scope);
+        self.cache_holds_in(&scope, false);
         let mut freed = Vec::new();
         for (device, host) in txn.moves {
             self.moving.remove(&device);
@@ -1749,6 +1764,7 @@ impl RsStore {
             self.recycle(vec![device], epoch);
             freed.push(device);
         }
+        self.cache_holds_in(&scope, true);
         self.retire_idle();
         self.units(freed)
     }
@@ -1794,6 +1810,8 @@ impl RsStore {
 
     /// Swaps each host slot back for its device copy, returning the slots restored.
     pub fn commit_restore(&mut self, txn: RsResidencyTxn) -> usize {
+        let scope: HashSet<RsWorkingSetId> = txn.scope.iter().copied().collect();
+        self.cache_holds_in(&scope, false);
         let mut restored = 0;
         for (host, device) in txn.moves {
             self.moving.remove(&host);
@@ -1815,6 +1833,7 @@ impl RsStore {
             }
             self.release_host([host]);
         }
+        self.cache_holds_in(&scope, true);
         restored
     }
 

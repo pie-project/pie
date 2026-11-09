@@ -230,9 +230,22 @@ impl<I: PoolId> ShapePool<I> {
         self.slots.share(holder, &slots);
     }
 
+    /// Drops `holder`'s reference again. An id holding no cache reference
+    /// is passed over: the store's own count, not this, decides when an id
+    /// goes, so a hold that went astray never stops a release.
     pub fn unshare(&mut self, holder: Holder, ids: &[I]) {
-        let slots = self.slots_of(ids);
-        self.slots.release(holder, &slots, 0);
+        let slots: Vec<Slot> = self
+            .slots_of(ids)
+            .into_iter()
+            .filter(|&slot| {
+                let held = self.slots.refs(slot).1 > 0;
+                debug_assert!(held, "{slot:?} lets go a cache hold it never took");
+                held
+            })
+            .collect();
+        if self.slots.held_by(&holder) >= slots.len() as u64 {
+            self.slots.release(holder, &slots, 0);
+        }
     }
 
     /// The cache entries holding a reference on `id`.
