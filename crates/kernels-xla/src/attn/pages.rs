@@ -42,6 +42,9 @@ struct Shape {
     scale: f64,
 }
 
+/// Pages one copy may move, when the pool holds them in a row.
+const RUN: i64 = 4;
+
 /// Buffer bytes a step may hold (both slots, keys and values).
 const BUFFER_BYTES: i64 = 32 << 20;
 
@@ -162,20 +165,17 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                 let p1 = b.addi(l1, top)?;
                 let p1 = b.divsi(p1, psv)?;
                 let p1 = b.maxsi(p1, p0)?;
-                let one = b.i32(1);
-                b.for_range(p0, p1, one, |b, p| {
-                    let pv = b.i32(pages);
-                    let at = b.muli(ln, pv)?;
-                    let at = b.addi(at, p)?;
-                    let page = b.load(pt, &[at])?;
+                // `n` pages from table entry `at` (consecutive in the pool
+                // when `n > 1`) into the buffer from page `dp` on
+                let copy = |b: &mut Body, page: V, dp: V, n: i64| -> Built<()> {
                     let psv = b.i32(ps);
                     let src_row = b.muli(page, psv)?;
-                    let dp = b.subi(p, p0)?;
                     let dst_row = b.muli(dp, psv)?;
                     let z = b.i32(0);
                     for (plane, buf, width, which) in [(kp, kbuf, w, 0), (vp, vbuf, wv, 1)] {
-                        let src = b.slice_ref(plane, &[src_row, z], &[ps, width])?;
-                        let dst = b.slice_ref(buf, &[slot, r, dst_row, z], &[1, 1, ps, width])?;
+                        let src = b.slice_ref(plane, &[src_row, z], &[n * ps, width])?;
+                        let dst =
+                            b.slice_ref(buf, &[slot, r, dst_row, z], &[1, 1, n * ps, width])?;
                         let dst = b.squeeze(dst)?;
                         let wh = b.i32(which);
                         let sem = b.slice_ref(sems, &[wh, slot], &[1, 1])?;
@@ -187,6 +187,64 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                         }
                     }
                     Ok(())
+                };
+                // Runs of RUN pages a copy where the pool holds them in a
+                // row (a prompt's pages mostly), else a copy a page.
+                let span_p = b.subi(p1, p0)?;
+                let rv = b.i32(RUN - 1);
+                let runs = b.addi(span_p, rv)?;
+                let rv = b.i32(RUN);
+                let runs = b.divsi(runs, rv)?;
+                let (z, one) = (b.i32(0), b.i32(1));
+                b.for_range(z, runs, one, |b, c| {
+                    let rv = b.i32(RUN);
+                    let off = b.muli(c, rv)?;
+                    let base = b.addi(p0, off)?;
+                    let pv = b.i32(pages);
+                    let at = b.muli(ln, pv)?;
+                    let at = b.addi(at, base)?;
+                    let left = b.subi(p1, base)?;
+                    let whole = b.cmpi(ICmp::Sge, left, rv)?;
+                    let part = b.cmpi(ICmp::Slt, left, rv)?;
+                    b.when(whole, |b| {
+                        let first = b.load(pt, &[at])?;
+                        let z = b.i32(0);
+                        let no = b.cmpi(ICmp::Ne, z, z)?;
+                        let mut row = b.cmpi(ICmp::Eq, z, z)?;
+                        for i in 1..RUN {
+                            let iv = b.i32(i);
+                            let ai = b.addi(at, iv)?;
+                            let pi = b.load(pt, &[ai])?;
+                            let want = b.addi(first, iv)?;
+                            let eq = b.cmpi(ICmp::Eq, pi, want)?;
+                            row = b.andi(row, eq)?;
+                        }
+                        let scattered = b.cmpi(ICmp::Eq, row, no)?;
+                        b.when(row, |b| copy(b, first, off, RUN))?;
+                        b.when(scattered, |b| {
+                            for i in 0..RUN {
+                                let iv = b.i32(i);
+                                let ai = b.addi(at, iv)?;
+                                let pi = b.load(pt, &[ai])?;
+                                let di = b.addi(off, iv)?;
+                                copy(b, pi, di, 1)?;
+                            }
+                            Ok(())
+                        })
+                    })?;
+                    b.when(part, |b| {
+                        for i in 0..RUN - 1 {
+                            let iv = b.i32(i);
+                            let has = b.cmpi(ICmp::Slt, iv, left)?;
+                            b.when(has, |b| {
+                                let ai = b.addi(at, iv)?;
+                                let pi = b.load(pt, &[ai])?;
+                                let di = b.addi(off, iv)?;
+                                copy(b, pi, di, 1)
+                            })?;
+                        }
+                        Ok(())
+                    })
                 })
             })
         };
