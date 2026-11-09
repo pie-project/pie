@@ -180,6 +180,9 @@ pub struct Run<'c> {
     /// Routes `linear.group_routes` built (every row's slot `g` routed to
     /// group `g`), with their group count.
     pub(crate) group_routes: Vec<(ValueId, u32)>,
+    /// Boundary positions `attn.pool_boundary` marked, with the ratio their
+    /// blocks close at.
+    pub(crate) boundaries: Vec<(ValueId, u32)>,
     /// Routed results the grouped-matmul kernel left in its tile order, by
     /// value, with the routes value and the span they were cut on: the next
     /// routed op on the same routes reads them as they are.
@@ -228,6 +231,7 @@ impl<'c> Run<'c> {
             readout_rowed: (std::sync::Arc::new(Vec::new()), None),
             full_selections: Vec::new(),
             group_routes: Vec::new(),
+            boundaries: Vec::new(),
             tiled: std::cell::RefCell::new(Vec::new()),
         }
     }
