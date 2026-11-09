@@ -54,8 +54,6 @@ use crate::tuning::{MoePath, Tuning};
 
 const MXFP4_BLOCK: u32 = 32;
 
-/// Pairs past which a block-FP8 bank decodes to bf16 for the fire.
-const TILE_PAIRS: i64 = 2048;
 
 fn nonzero(op: &'static str, what: &str, v: u32) -> Result<u32, Error> {
     if v == 0 {
@@ -1167,12 +1165,13 @@ pub(crate) fn tile_projection(
     use crate::linear::moe_gmm::{Gmm, Orient};
     let (m, k) = (f.dims(x)[0], f.dims(x)[1]);
     let n = f.dims(codes)[0];
-    // Past a few hundred rows the kernel's 128-deep dots leave the MXU half
-    // idle: a prompt's rows read the weight decoded once instead.
-    if !tuning.moe_gmm() || k % TILE != 0 || m > 256 {
+    // A prompt's rows too: the kernel's 128-deep dots leave half of a v6e
+    // MXU idle, and still beat the weight decoded to bf16 for the fire
+    // (24576x6144, 2048 rows: 1.4 ms against 1.7).
+    if !tuning.moe_gmm() || k % TILE != 0 {
         return Ok(None);
     }
-    let tm = (((m + 15) / 16) * 16).min(tuning.moe_gmm_tm.max(16) * 16).max(16);
+    let tm = (((m + 15) / 16) * 16).min(512).max(16);
     let tiles = (m + tm - 1) / tm;
     let spec = Gmm {
         tiles,
@@ -1814,17 +1813,6 @@ fn routed(
     let hi = f.const_i(Elem::I32, e - 1, &[]);
     let ids = f.clamp(lo, r, hi)?;
     let bank = read_bank(f, form, fan)?;
-    // A prompt's pairs: a block-FP8 bank decodes to bf16 once and runs as a
-    // bf16 bank (the FP8 kernel's 128-deep dots leave the MXU half idle).
-    let bank = if matches!(form, Form::Tile { .. }) && p > TILE_PAIRS {
-        Read {
-            codes: Codes::Weights(decode(f, &bank, groups)?),
-            factor: None,
-            bias: None,
-        }
-    } else {
-        bank
-    };
     let x = f.convert(x, Elem::Bf16);
     let rows = f.dims(x)[0];
     let r8 = (rows + 7) / 8 * 8;
