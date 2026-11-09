@@ -1217,6 +1217,7 @@ fn gmm(
         };
         let s = f.reshape(s, &[e * n, fan.k / 32])?;
         let s = f.transpose(s, &[1, 0])?;
+        let w = f.bitcast(w, Elem::U4)?;
         kernel.call(f, &[se, nt, xs, w, s])?[0]
     } else {
         kernel.call(f, &[se, nt, xs, w])?[0]
