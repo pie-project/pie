@@ -1074,6 +1074,8 @@ fn gmm_spec(
         w: elem,
         orient: Orient::of(e * fan.n, fan.k),
         scaled,
+        bias: false,
+        out: Elem::F32,
     };
     spec.out_width().ok().map(|_| spec)
 }
@@ -1104,6 +1106,7 @@ fn gmm(
     fan: Fan,
     bank: &Read,
     scales: Option<Val>,
+    bias: Option<Val>,
     x: Val,
     r: Val,
     valid: Val,
@@ -1188,6 +1191,10 @@ fn gmm(
         Orient::NMajor => w,
     };
     let kernel = spec.kernel()?;
+    let bias = match bias {
+        Some(b) if spec.bias => Some(f.reshape(b, &[e, 1, n])?),
+        _ => None,
+    };
     let out = if spec.scaled {
         // The exponent bytes `[E·N, K/32]`, read `[K/32, E·N]` as the codes
         // are (the TPU lays them `E·N`-minor too).
@@ -1200,9 +1207,11 @@ fn gmm(
         let s = f.reshape(s, &[e * n, fan.k / 32])?;
         let s = f.transpose(s, &[1, 0])?;
         let w = f.bitcast(w, Elem::U4)?;
-        kernel.call(f, &[se, nt, xs, w, s])?[0]
+        let ops: Vec<Val> = [se, nt, xs, w, s].into_iter().chain(bias).collect();
+        kernel.call(f, &ops)?[0]
     } else {
-        kernel.call(f, &[se, nt, xs, w])?[0]
+        let ops: Vec<Val> = [se, nt, xs, w].into_iter().chain(bias).collect();
+        kernel.call(f, &ops)?[0]
     };
     // Pair `i`'s row: its sorted position's rank within its expert's run.
     let back = f.sort(&[perm, iota], 0, true, |fq, a, b| {
@@ -1255,7 +1264,7 @@ fn routed(
     fan: Fan,
     x: Val,
     routes: Val,
-    bias: Option<Val>,
+    mut bias: Option<Val>,
     prev: Val,
     tuning: Tuning,
 ) -> Result<Val, Error> {
@@ -1342,12 +1351,24 @@ fn routed(
         }
         MoePath::All => every_expert(f, &bank, fan, x, ids, groups)?,
         MoePath::Gmm => match grouped {
-            Some(spec) => {
+            Some(mut spec) => {
                 let scales = match form {
                     Form::Mxfp4 { scales, .. } => Some(scales.val),
                     _ => None,
                 };
-                gmm(f, spec, fan, &bank, scales, x, r, valid, ids)?
+                // The bias joins the product inside the kernel where its cut
+                // is whole blocks, and the rows come back rounded, as
+                // `finish` rounds them; a bias it cannot take stays outside,
+                // over the f32 rows.
+                let whole = spec.out_width().ok() == Some(n);
+                spec.bias = bias.is_some() && whole;
+                spec.out = if bias.is_none() || whole {
+                    Elem::Bf16
+                } else {
+                    Elem::F32
+                };
+                let inside = if spec.bias { bias.take() } else { None };
+                gmm(f, spec, fan, &bank, scales, inside, x, r, valid, ids)?
             }
             None => every_expert(f, &bank, fan, x, ids, groups)?,
         },
