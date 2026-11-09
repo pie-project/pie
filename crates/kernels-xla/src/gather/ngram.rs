@@ -125,6 +125,7 @@ fn planes(
     }
     if let Some(m) = map
         && m.dtype() != Dtype::I64
+        && m.dtype() != Dtype::U32
     {
         return Err(refuse(
             op,
@@ -205,9 +206,17 @@ fn hash_lanes(
         window.push(w);
     }
     if let Some(m) = map {
+        // An i64 map may land as its u32 words, two a value: the low word
+        // is the id's i32.
+        let words = f.elem(m) == Elem::U32;
         for w in &mut window {
-            let v = take(f, m, *w)?;
-            *w = f.convert(v, Elem::I32);
+            let at = if words { f.add(*w, *w)? } else { *w };
+            let v = take(f, m, at)?;
+            *w = if words {
+                f.bitcast(v, Elem::I32)?
+            } else {
+                f.convert(v, Elem::I32)
+            };
         }
     }
 
