@@ -103,14 +103,16 @@ fn take_tb(seq: u32) void {
   const t = @as(u32, tv);
   if (t < t0 or t >= t0 + nt) { return; }
   const j = @as(u16, t - t0);
+  @fh2s(@set_dsd_length(ob_d, lv), @set_dsd_length(@increment_dsd_offset(@set_dsd_base_addr(tb_d, @ptrcast([*]@fp16(), &tbl[0])), @as(i16, j * lv), @fp16()), lv));
+  ob[lv] = @as(f32, seq);
+  // the route turns to the ramp only after DLY: the previous step's words, which may cross this router on their
+  // way down, have long passed (a DIAG build's short steps want a longer DLY)
+  wait(DLY);
   if ((pfl & 4) == 0) {
     const r = @get_config(pb_addr, tgt.color_addr_range) & 0xff00;
     @set_config(pb_addr, r | 0x80 | (pb_orig & 0x1f), tgt.color_addr_range);
     dirty = true;
   }
-  @fh2s(@set_dsd_length(ob_d, lv), @set_dsd_length(@increment_dsd_offset(@set_dsd_base_addr(tb_d, @ptrcast([*]@fp16(), &tbl[0])), @as(i16, j * lv), @fp16()), lv));
-  ob[lv] = @as(f32, seq);
-  wait(DLY);
   @fmovs(fout(q_pb, lv + 1), @set_dsd_length(ob_d, lv + 1));
   sends[0] += 1;
   sends[1] = t;

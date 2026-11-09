@@ -55,6 +55,8 @@ fn lw(l: u16) u32 {
 }
 fn wtot() u32 { var n: u32 = 0; var l: u16 = 0; while (l < K) : (l += 1) { n += lw(l); } return n; }
 const WN: u32 = wtot();
+// (a unit's tiles index in u16: offsets as u16 products, no 64-bit multiply helper)
+comptime { @comptime_assert(WN < 65536); }
 var w = @zeros([WN + 1]u16);
 var w_ptr: [*]u16 = &w;
 
@@ -80,7 +82,8 @@ var pv = @zeros([NC * DcG]f32);      // the pending entry's raw v a cache
 var pks = @zeros([NC]f32);           // its |k|^2, |v|^2 partials (this column's)
 var pvs = @zeros([NC]f32);
 var pend = @zeros([NC]u16);
-var spos = @zeros([if (WIN > 0) sum_ne() else 1]f32);   // (WIN > 0) a sliding entry's position + 1
+fn soff(c: u16) u16 { var n: u16 = 0; var i: u16 = 0; while (i < c) : (i += 1) { if (!cg(i)) { n += cne(i); } } return n; }
+var spos = @zeros([if (WIN > 0) soff(NC) else 1]f32);   // (WIN > 0) a sliding entry's position + 1 (sliding caches only)
 
 // ---------------------------------------------------------------- buffers
 const NEM: u16 = mx(NES, NEG);
@@ -91,11 +94,13 @@ const XN: u16 = mx(mx(mx(Hc, QOM), Ic), Qh * NEM);
 const YN: u16 = mx(mx(mx(2 * NQM + 4, 4 * Ic + 4), mx(Hc + 1, NS)), Qh * (DcG + 1));
 var xh = @zeros([XN]@fp16());
 var y: [YN]f32 align(16) = @zeros([YN]f32);
-var y16 = @zeros([YN]@fp16());
+// the f16 accumulator (the largest f16 matvec: 2 Ic, NQ, Hc) and exp_v's 2^k bits (Qh NE u16)
+const Y16N: u16 = mx(mx(2 * Ic, NQM), mx(Hc, Qh * NEM));
+var y16 = @zeros([Y16N]@fp16());
 const xh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XN} -> xh[i] });
 const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> y[i] });
 const y_d0 = y_d;
-const y16_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> y16[i] });
+const y16_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Y16N} -> y16[i] });
 var a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YN} -> w[i] });
 
 // ---------------------------------------------------------------- fabric (weight_q35's queues)
@@ -156,8 +161,11 @@ fn iq_any(q: u16, c: u16) void {
   else if (q == 4) { iqc(6, c); }
   else if (q == 5) { iqc(7, c); }
 }
+var done = @zeros([6]u16);
+var fq = @zeros([6]u16);
 fn bind_iqs(fin: *[6]u16, tmp: u16) void {
-  var done = @zeros([6]u16);
+  var z: u16 = 0;
+  while (z < 6) : (z += 1) { done[z] = 0; }
   var left: u16 = 6;
   var guard: u16 = 0;
   while (left > 0 and guard < 32) : (guard += 1) {
@@ -186,7 +194,8 @@ fn init() void {
     const r = @get_config(addr, tgt.color_addr_range) & 0xff00;
     @set_config(addr, r | @as(u16, rcfg[2 + 2 * k]), tgt.color_addr_range);
   }
-  var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 4]), @as(u16, rcfg[RQ + 5]) };
+  var q: u16 = 0;
+  while (q < 6) : (q += 1) { fq[q] = @as(u16, rcfg[RQ + q]); }
   bind_iqs(&fq, @as(u16, rcfg[RQ + 24]));
   oqc(5, rcfg[RQ + 6]);
   oqc(3, rcfg[RQ + 7]);
@@ -204,21 +213,19 @@ fn send_x(n: u16) void {
   const d = @set_dsd_length(y_d, n);
   const A = .{ .async = true, .ut_id = ut_xb };
   if (role_x == 0) { @fmovs(fout(q_xo, n), d, A); }
-  else if (role_x == 1) { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
   else if (role_x == 2) {
     @fadds(fifo_x, fin(q_xa, n), d, .{ .async = true, .ut_id = ut_xa });
     @fadds(fout(q_xo, n), fin(q_xb, n), fifo_x, A);
-  } else { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }
+  } else { @fadds(fout(q_xo, n), fin(q_xa, n), d, A); }   // roles 1, 3
 }
 fn send_y(n: u16) void {
   const d = @set_dsd_length(y_d, n);
   const A = .{ .async = true, .ut_id = ut_b };
   if (role_y == 0) { @fmovs(fout(q_yo, n), d, A); }
-  else if (role_y == 1) { @fadds(fout(q_yo, n), fin(q_ya, n), d, A); }
   else if (role_y == 2) {
     @fadds(fifo, fin(q_ya, n), d, .{ .async = true, .ut_id = ut_a });
     @fadds(fout(q_yo, n), fin(q_yb, n), fifo, A);
-  } else { @fadds(fout(q_yo, n), fin(q_ya, n), d, A); }
+  } else { @fadds(fout(q_yo, n), fin(q_ya, n), d, A); }   // roles 1, 3
 }
 
 // ---------------------------------------------------------------- matvec
@@ -228,7 +235,7 @@ const mv_src1 = @get_dsr(dsr_src1, 1);
 fn mvs_step(xv: @fp16()) void { @fmachs(mv_dest, mv_src0, mv_src1, xv); }
 fn mvh_step(xv: @fp16()) void { @fmach(mv_dest, mv_src0, mv_src1, xv); }
 // y[yo..yo+N) = A x, A at w[off] (R rows of N), x in xh[0..R)
-fn mv(off: u32, R: u16, N: u16, yo: u16) void {
+fn mv(off: u16, R: u16, N: u16, yo: u16) void {
   const a = @set_dsd_length(@set_dsd_base_addr(a_d, @ptrcast([*]u16, &w[off])), N);
   const xv = @set_dsd_length(xh_d, R);
   const yv = @set_dsd_length(@increment_dsd_offset(y_d0, @as(i16, yo), f32), N);
@@ -260,7 +267,7 @@ fn kvmv(p: [*]u16, R: u16, N: u16, xo: u16, yo: u16) void {
   @map(mvs_step, xv);
 }
 // A deferred phase: [a | b | 4 sums] in, [W a | W b | sums] out (2 N + 4 words)
-fn mv2(off: u32, N: u16) void {
+fn mv2(off: u16, N: u16) void {
   @fs2h(@set_dsd_length(xh_d, Hc), fin(q_xm, Hc));
   mv(off, Hc, N, 0);
   @fs2h(@set_dsd_length(xh_d, Hc), fin(q_xm, Hc));
@@ -352,7 +359,7 @@ fn cache_reset(c: u16) void {
   i = 0;
   while (i < cvw(c)) : (i += 1) { vc[1 + voff(c) + i] = 0; }
   i = 0;
-  while (i < cne(c)) : (i += 1) { kinv[eoff(c) + i] = 0.0; if (WIN > 0) { spos[eoff(c) + i] = 0.0; } }
+  while (i < cne(c)) : (i += 1) { kinv[eoff(c) + i] = 0.0; if (WIN > 0 and !cg(c)) { spos[soff(c) + i] = 0.0; } }
   pend[c] = 0;
 }
 // the new entry of cache c (this row's): k into the keys (f16), v and the two partials pending
@@ -368,7 +375,7 @@ fn cache_put(c: u16, pos: u32, k: [*]f32, v: [*]f32, ks: f32, vs: f32) void {
   pks[c] = ks;
   pvs[c] = vs;
   pend[c] = 1;
-  if (WIN > 0 and !cg(c)) { spos[eoff(c) + e] = @as(f32, pos + 1); }
+  if (WIN > 0 and !cg(c)) { spos[soff(c) + e] = @as(f32, pos + 1); }
 }
 fn cache_fin(c: u16, pos: u32, kss: f32, vss: f32, ihd: f32) void {
   const e = cslot(c, pos);
@@ -384,7 +391,7 @@ fn cache_fin(c: u16, pos: u32, kss: f32, vss: f32, ihd: f32) void {
 // KVS (shared units): the async receive and the pass start's entries
 var kvb = @zeros([17]f32);
 const kvb_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{17} -> kvb[i] });
-var kvlog = @zeros([2 * 64]f32);   // (DIAG 1) a step's KVS words' sum and sequence word
+var kvlog = @zeros([if (DIAG != 0) 2 * 64 else 1]f32);   // (DIAG 1) a step's KVS words' sum and sequence word
 var kvlog_ptr: [*]f32 = &kvlog;
 fn kv_post() void {
   kvb[16] = -1.0;
@@ -471,7 +478,7 @@ fn att_mix(l: u16, pos_out: *u32) void {
       if (WIN > 0 and !cg(c)) {   // entries out of the window (or never written) score -1e30: exp -> 0
         var e: u16 = 0;
         while (e < NEl) : (e += 1) {
-          const sp = spos[e0 + e];
+          const sp = spos[soff(c) + e];
           if (sp == 0.0 or @as(f32, pos + 1) - sp >= @as(f32, WIN)) { sx[h * NEl + e] = -1.0e30; }
         }
       }
@@ -510,43 +517,43 @@ fn lse_late() void {
 // ---------------------------------------------------------------- a pass
 var sv2 = @zeros([2]f32);
 const sv2_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2} -> sv2[i] });
-fn layer(l: u16, b: u32) u32 {
+fn layer(l: u16, b: u16) u16 {
   const dc = dcl(l);
   const NQ = nql(l);
   const QO = Qh * dc;
-  const H = @as(u32, Hc);
+  // (offsets as u16 products: no u32 multiply, whose helper __muldi3 costs 332 B)
   // attention
   mv2(b, NQ);
   stamp(1 + 9 * l);
   var pos: u32 = 0;
   att_mix(l, &pos);
   stamp(2 + 9 * l);
-  const bo = b + H * NQ;
+  const bo = b + Hc * NQ;
   mv(bo, QO, Hc, 0);
   send_row(s_att);
   lse_late();
   stamp(3 + 9 * l);
   // MLP: gate | up (deferred), act (Ic) | the post-attention scalar, down
-  const bg = bo + @as(u32, QO) * H;
+  const bg = bo + QO * Hc;
   mv2(bg, 2 * Ic);
   stamp(4 + 9 * l);
   @fs2h(@set_dsd_length(xh_d, Ic), fin(q_ym, Ic));
   @fmovs(@set_dsd_length(sv2_d, 1), fin(q_ym, 1));
   stamp(5 + 9 * l);
-  const bd = bg + H * 2 * Ic;
+  const bd = bg + Hc * 2 * Ic;
   mv(bd, Ic, Hc, 0);
   send_row(sv2[0]);
   stamp(6 + 9 * l);
   // PLE: the gate (deferred), z | the post-FFN scalar, the projection
-  const bp = bd + @as(u32, Ic) * H;
+  const bp = bd + Ic * Hc;
   mv2(bp, 1);
   @fmovs(sv2_d, fin(q_ym, 2));
   xh[0] = @as(@fp16(), sv2[0]);
   stamp(7 + 9 * l);
-  mv(bp + H, 1, Hc, 0);
+  mv(bp + Hc, 1, Hc, 0);
   send_row(sv2[1]);
   stamp(8 + 9 * l);
-  return bp + 2 * H;
+  return bp + 2 * Hc;
 }
 // the last unit's flush: the last layer's post-PLE scalar back to CX
 fn flush() void {
@@ -576,7 +583,7 @@ task pass_task() void {
   while (i < n_steps) : (i += 1) {
     const pos = pos0 + i;
     var l: u16 = 0;
-    var b: u32 = 0;
+    var b: u16 = 0;
     relay(18);
     if (SH == 1 and (wfl & 2) != 0 and (DIAG & 64) == 0) { kv_take(pos, i); }
     stamp(0);
