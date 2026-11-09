@@ -68,6 +68,25 @@ impl<'a, T> Format<'a, T> {
         self.states.extend(states);
         self
     }
+
+    /// The format's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Whether `src` holds what only this format's checkpoints hold; none for
+    /// a format whose reading is its only test.
+    #[must_use]
+    pub fn recognizes(&self, src: &ztensor::Source) -> Option<bool> {
+        self.recognizes.as_ref().map(|recognizes| recognizes(src))
+    }
+
+    /// What a checkpoint of this format states of the model it holds.
+    #[must_use]
+    pub fn states(&self) -> &[Stated] {
+        &self.states
+    }
 }
 
 /// A configuration value a checkpoint states, and the value the model is

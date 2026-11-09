@@ -364,6 +364,14 @@ impl ForwardHybrid for Model<'_, '_, '_> {
     }
 }
 
+/// A format of a package that recognizes a checkpoint, and what its
+/// checkpoints state of the model it reads them as.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Recognized {
+    pub format: String,
+    pub states: Vec<crate::import::format::Stated>,
+}
+
 impl Package {
     /// The contract that reads `src` into `id`'s deployment `deploy`, by the
     /// one format of `formats(m)` that recognizes it.
@@ -420,6 +428,29 @@ impl Package {
             crate::import::prune(&mut contract, read);
         }
         Ok(contract)
+    }
+
+    /// The formats of `formats(m)` that recognize `src` by what it holds,
+    /// each with what its checkpoints state of the model `id` is built as:
+    /// whether this package's family is `src`'s at all, and where `src`
+    /// departs from `id`, before anything is read.
+    pub fn recognizing(
+        &self,
+        id: &str,
+        deploy: &Deploy,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<Vec<Recognized>, crate::import::Error> {
+        self.formats(id, deploy, src, platform, |built| {
+            built
+                .iter()
+                .filter(|format| format.recognizes(src) == Some(true))
+                .map(|format| Recognized {
+                    format: format.name().to_string(),
+                    states: format.states().to_vec(),
+                })
+                .collect()
+        })
     }
 
     /// `then` of the formats of `formats(m)`, each reading `src` into

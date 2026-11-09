@@ -7,6 +7,7 @@ pub mod costs;
 pub mod error;
 pub mod expert;
 pub mod fuse;
+pub mod kin;
 pub mod layout;
 pub mod lowering;
 pub mod pack;
