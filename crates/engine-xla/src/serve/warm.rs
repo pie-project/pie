@@ -231,11 +231,14 @@ impl Shell {
         }
         // Each compile holds its program's whole HLO and compile state in
         // host memory: at most 8 at once, and no more than the host's free
-        // memory holds at ~1 GiB a MiB of the longest text (v6e,
-        // Qwen3.6-35B-A3B's 12 MiB fires: 108 GB for eight; a v5e host's 47
-        // GB stopped answering).
+        // memory, less 4 GiB for the server beside them, holds at 1.25 GiB a
+        // MiB of the longest text (v6e, Qwen3.6-35B-A3B's 12 MiB fires: 108
+        // GB for eight; a v5e host's 47 GB stopped answering at eight, and
+        // at four of its 10.4 MiB pf256 fires; three fit).
         let longest = texts.iter().map(|(t, _)| t.len() as u64).max().unwrap_or(0);
-        let room = available_memory().map_or(8, |b| b / (longest << 10).max(1)) as usize;
+        let room = available_memory().map_or(8, |b| {
+            b.saturating_sub(4 << 30) / ((longest * 5) << 8).max(1)
+        }) as usize;
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(8)
