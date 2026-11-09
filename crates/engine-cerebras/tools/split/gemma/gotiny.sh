@@ -3,7 +3,7 @@
 # simulator (split_geo_gemma.tiny_geo) from this branch's kernels, stack-room checked. Env: CSL_SDK (the SDK dir).
 # Prep: mk_tiny_gemma.py <model dir>, then prep_gemma.py on it with the tiny geometry.
 T=$(cd $(dirname $0) && pwd); D=$1; P=$(cd $2 && pwd); XP=$3; shift 3
-SDK=${CSL_SDK:-/cra-1900/ing-cloud/pie-bringup-20261027/sdk-2.10.1}
+SDK=${CSL_SDK:?set CSL_SDK to the SDK directory (cslc, cs_python)}
 mkdir -p $D && python3 $T/mkfull_gemma.py $D ${GEO:-tiny} ${GKW:-G2=2,G2W=2} >/dev/null && rm -rf $D/prep && cp -r $P $D/prep && cd $D && rm -rf out
 export SINGULARITYENV_CSL_SUPPRESS_SIMFAB_TRACE=1 SINGULARITYENV_OMP_NUM_THREADS=8 OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 MKL_NUM_THREADS=8
 PAR=$(python3 -c "import sys; d={}; [d.__setitem__(*kv.split(':')) for kv in (open(sys.argv[1]).read().strip()+','+sys.argv[2]).split(',') if kv]; print(','.join(k+':'+v for k,v in d.items()))" $P/params.txt "$XP")

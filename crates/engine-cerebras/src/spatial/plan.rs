@@ -356,7 +356,7 @@ impl Grid {
 
 /// qwen2d_region's image over the grid model at the same tiles (link probe,
 /// 2026-11-04: Qwen3-14B u4 regions 256 x 144, RHc 36, RDc 4, RIc 68, RNL 2:
-/// 47,488 B against 43,510 + `W4_CODE` + staging; see U4G64-README).
+/// 47,488 B against 43,510 + `W4_CODE` + staging).
 pub const REGION_EXTRA: usize = 1_314;
 /// A W4 unit image over the grid model (the u4 matvec's code and what the
 /// model does not count; link probe, 2026-11-04: the Qwen3-14B u4 grid
@@ -1423,7 +1423,7 @@ mod tests {
     /// same per-layer u4 bytes (head_dim 128; attention rows the shape allows,
     /// the rest of the projections folded into `inter`), its own vocab and
     /// tying, then at Qwen3's vocab (the head alone), at B 1 and on the ring,
-    /// the fewest KV blocks. See U4G64-README "Other u4 models".
+    /// the fewest KV blocks.
     #[test]
     #[ignore]
     fn u4_feasibility_print() {
@@ -1529,8 +1529,8 @@ mod tests {
         }
     }
 
-    /// u4 scale duplication and the uniform one-layer layout (`--nocapture`,
-    /// U4G64-README "Scale dedupe"): per model (the feasibility stand-ins),
+    /// u4 scale duplication and the uniform one-layer layout (`--nocapture`):
+    /// per model (the feasibility stand-ins),
     /// a unit PE's bytes at 128-column one-layer units sharing `UNITS` PEs
     /// (rows: the most that fit, and the most with group-aligned hidden
     /// tiles, `64 % Hc == 0` or `Hc % 64 == 0`), as the kernel holds scales
@@ -1539,7 +1539,7 @@ mod tests {
     #[test]
     #[ignore]
     fn u4_dedupe_print() {
-        // Unit PEs of a wafer less the head, strip and VM columns (U4G64-README).
+        // Unit PEs of a wafer less the head, strip and VM columns.
         const UNITS: usize = 757_000;
         let base = spec("qwen3-14b-u4g64-kv-bf16").expect("14b");
         let most = WaferDims::CS3.pe_bytes - 768;

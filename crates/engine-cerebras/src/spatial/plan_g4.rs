@@ -463,7 +463,7 @@ mod tests {
     }
 
     /// E2B's params at B 1: the program built and verified on the CS-3
-    /// (scratch/g4/prog/full.params, plus the sliding window and G1: 0386),
+    /// (plus the sliding window and G1: 0386),
     /// read back as a serve_g4 program.
     #[test]
     fn e2b_params_are_the_chip_programs() {
@@ -525,7 +525,7 @@ mod tests {
     }
 
     /// The unit's bytes against gemma4_layer linked at E2B's dims
-    /// (scratch/g4/real16, SDK 2.10.1: the ELF's allocated sections): never
+    /// (SDK 2.10.1: the ELF's allocated sections): never
     /// under, at most 1.5 KB over.
     #[test]
     fn units_match_their_linked_size() {

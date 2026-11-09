@@ -397,8 +397,7 @@ mod tests {
 
     /// `G4_CMP=<dir>`: the placement of `<dir>/ckpt` (a Hugging Face
     /// directory) for `<dir>/small.params` dumped to `<dir>/rs.bin`, every
-    /// PE's words of every symbol, to set against the bare host's
-    /// (scratch/g4/placecmp/mkplace.py writes both inputs and `py.bin`).
+    /// PE's words of every symbol, to set against a reference placement's.
     #[test]
     #[ignore]
     fn dump_placement() {

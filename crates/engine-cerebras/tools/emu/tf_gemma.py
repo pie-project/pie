@@ -16,7 +16,7 @@ mode = base [_flag ...]:
   _g16     MLP act: f16(gelu(f16 gate) * f16 up)        _g16full: every gelu intermediate in f16
   _h16     head f16(x_normed) . f16(W_embed), f32 accumulation
 Logits compared after the final softcap 30 (monotonic)."""
-import json, math, sys, time
+import json, sys, time
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForImageTextToText

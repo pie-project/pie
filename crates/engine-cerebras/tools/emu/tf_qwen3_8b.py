@@ -30,7 +30,7 @@ A mode is a base + suffixes (underscore-joined):
   _tiny   TRM 2 + 8: sums of squares in sequential f32 per PE chunk; exp and the grids' SiLU
           reciprocal with a deterministic relative error of 2.7e-6 / 1.2e-5
 """
-import json, math, os, sys, time
+import json, os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from silu16 import silu16, silu16w
 import torch

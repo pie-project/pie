@@ -223,8 +223,7 @@ pub(crate) fn f16_bits(b: u16) -> u16 {
 
 /// The 16-bit weights as the program reads them: bf16 bits, or f16 under `F16`.
 pub(crate) fn f16_if(lay: &ProgramSpec, m: Vec<u16>) -> Vec<u16> {
-    // (PIE_CEREBRAS_F16_RAW=1, diagnostics: keep the bf16 bits in an F16 build)
-    if lay.model.f16 == 0 || std::env::var("PIE_CEREBRAS_F16_RAW").is_ok_and(|v| v == "1") {
+    if lay.model.f16 == 0 {
         return m;
     }
     m.into_iter().map(f16_bits).collect()

@@ -135,7 +135,7 @@ class Geo:
         return out, (lo, hi)
 
     def line2(self, pts, root, A, B, C2, M, G):
-        """Two-level streamed halves toward pts[root] (docs/cerebras-8b-speed.md 9.2 / 9.5): each
+        """Two-level streamed halves toward pts[root]: each
         half in groups of G counted from the root (k = distance, group q = (k - 1) // G, its end at
         kk = 1); level-1 one-way chains inside a group into its end (A / B by k), the ends' level-2
         chain into the root (C2[(q + half) % 2]), passing the groups' other members. Returns

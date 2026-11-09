@@ -4,7 +4,7 @@ blocks + E8M0 scales, bf16 elsewhere, the real config's mechanisms: sinks, alter
 YaRN, biases, clamped SwiGLU, top-4 of 8 experts) for split_geo_gptoss's tiny geometry: hidden 32 (4 rows x
 Hc 8), 4 q / 2 kv heads of 8 (Dc 4), intermediate 32 (8 MoE columns x Ic 4), 4 layers (2 units x K 2), vocab
 100, window 4. Then its golden: HF transformers greedy, bf16 compute on HF's MXFP4 dequant (hf_gptoss_golden.py)."""
-import json, os, subprocess, sys
+import json, os, sys
 import numpy as np
 import torch
 from safetensors.torch import save_file

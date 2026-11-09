@@ -933,8 +933,7 @@ mod tests {
     /// `GPT_CMP=<dir>`: the routes and placement of `GPT_CKPT` (a Hugging
     /// Face directory, files whole or in pieces) for `<dir>/small.params`,
     /// dumped to `<dir>/rs.bin` (every PE's words of every symbol), to set
-    /// against the bare host's `py.bin` (scratch/gptoss/placecmp/
-    /// mkplace.py; `rbits` reads 0x111 (i + 1)). `GPT_FORGET`: a full-size
+    /// against a reference placement's (`rbits` reads 0x111 (i + 1)). `GPT_FORGET`: a full-size
     /// run, every call's sha256 to `<dir>/rs_calls.txt` instead.
     #[test]
     #[ignore]

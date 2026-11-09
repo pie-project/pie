@@ -915,7 +915,7 @@ fn arf_line(n: usize, k: usize, arg: usize) -> ([Option<(usize, usize, usize)>; 
 }
 
 /// ARF's words a region PE: [`route_words`]' 11 with the Y set replaced by
-/// the streamed-halves routes (docs/cerebras-8b-speed.md 9.5 / 10), then the
+/// the streamed-halves routes, then the
 /// PE's Y role: bit 0 the root (row py_n / 2), bit 1 in its half's farthest
 /// group, bit 2 its level-1 input colour c_r1[k % 2], bit 3 its level-2 output
 /// colour c_r2[(q + half) % 2], bits 4..12 its 1-based place in its group

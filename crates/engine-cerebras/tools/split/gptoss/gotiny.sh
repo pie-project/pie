@@ -2,7 +2,7 @@
 # gotiny.sh <run dir> <prep dir> <extra params k:v,..> [run_gptoss.py args...]: the gpt-oss tiny program on the
 # simulator (split_geo_gptoss.tiny_geo) from this branch's kernels, stack-room checked. Env: CSL_SDK (the SDK dir).
 T=$(cd $(dirname $0) && pwd); D=$1; P=$(cd $2 && pwd); XP=$3; shift 3
-SDK=${CSL_SDK:-/cra-1900/ing-cloud/pie-bringup-20261027/sdk-2.10.1}
+SDK=${CSL_SDK:?set CSL_SDK to the SDK directory (cslc, cs_python)}
 mkdir -p $D && python3 $T/mkfull_gptoss.py $D tiny $P/params.txt ${MKF:-NE=8,WIN=4} >/dev/null && rm -rf $D/prep && cp -r $P $D/prep && cd $D && rm -rf out
 export SINGULARITYENV_CSL_SUPPRESS_SIMFAB_TRACE=1 SINGULARITYENV_OMP_NUM_THREADS=8 OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 MKL_NUM_THREADS=8
 PAR=$(python3 -c "import sys; d={}; [d.__setitem__(*kv.split(':')) for kv in (open(sys.argv[1]).read().strip()+',NE:8,WIN:4,'+sys.argv[2]).split(',') if kv]; print(','.join(k+':'+v for k,v in d.items()))" $P/params.txt "$XP")
