@@ -5,6 +5,8 @@ pub(crate) mod pool;
 pub(crate) mod registry;
 pub(crate) mod rs;
 pub(crate) mod seat;
+pub mod segments;
+pub mod slots;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PipelineScopeId(u128);
