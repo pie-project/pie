@@ -35,11 +35,12 @@ const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
 const timestamp = @import_module("<time>");
-var tdbg = @zeros([1 + 3 * K]u32);
+var tdbg = @zeros([1 + 4 * K]u32);   // [0 pass, 1 + 3 l reduce in, 2 + 3 l multicast, 3 + 3 l done, 1 + 3 K + l segment done]
 var tdbg_ptr: [*]u32 = &tdbg;
 var tsc = @zeros([3]u16);
 fn stamp(i: u16) void { if (TSTAMP == 0) { return; } timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
 fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+fn fmax(a: f32, b: f32) f32 { return if (b > a) b else a; }
 
 const G2: u16 = 2 * Ic;
 const TN: u16 = TK * G2;
@@ -248,24 +249,33 @@ fn router(l: u16) void {
   @fmovs(g_d, 0.0);
   g[rout] = t[0] * rr + rb[l];
   seg_ar(NEX);
-  // top TK: TK rounds of the maximum (pairwise maxima: blocks of 2, 4, 8, then over the NEX / 8 blocks), its
-  // first block, the first word in it holding it (ties: the lower expert first, as a stable descending sort),
-  // that word then out (-3.4e38)
+  stamp(1 + 3 * K + l);
+  // top TK: the pairwise-maximum tree once (blocks of 2, 4, 8, then over the NEX / 8 blocks); a round takes the
+  // maximum, its first block and in it the leftmost leaf holding it (down the tree: the left child when it holds
+  // the maximum; ties: the lower expert first, as a stable descending sort), that leaf out (-3.4e38) and its
+  // path's maxima redone (the same decisions as a full rebuild a round: every comparison is exact)
   @fmovs(h_d, g_d);
+  pmax(&t1, &h, NEX / 2);
+  pmax(&t2, &t1, NEX / 4);
+  pmax(&t3, &t2, NEX / 8);
   var k: u16 = 0;
   while (k < TK) : (k += 1) {
-    pmax(&t1, &h, NEX / 2);
-    pmax(&t2, &t1, NEX / 4);
-    pmax(&t3, &t2, NEX / 8);
     var m: f32 = t3[0];
     var b: u16 = 1;
     while (b < NEX / 8) : (b += 1) { if (t3[b] > m) { m = t3[b]; } }
     b = 0;
     while (t3[b] != m) : (b += 1) {}
-    var i: u16 = b * 8;
-    while (h[i] != m) : (i += 1) {}
+    var j2: u16 = 2 * b;
+    if (t2[j2] != m) { j2 += 1; }
+    var j1: u16 = 2 * j2;
+    if (t1[j1] != m) { j1 += 1; }
+    var i: u16 = 2 * j1;
+    if (h[i] != m) { i += 1; }
     sel[k] = i;
     h[i] = -3.4e38;
+    t1[j1] = fmax(h[2 * j1], h[2 * j1 + 1]);
+    t2[j2] = fmax(t1[2 * j2], t1[2 * j2 + 1]);
+    t3[b] = fmax(t2[2 * b], t2[2 * b + 1]);
   }
   const m0 = g[sel[0]];
   var sum: f32 = 0.0;

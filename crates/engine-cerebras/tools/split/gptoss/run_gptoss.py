@@ -220,7 +220,7 @@ if a.prof:
         raw[f"u{u}_wm_r0_c0"] = pe(X0p + XC + 1, Y0p, 1 + 4 * K)
         raw[f"u{u}_wm_r159_c287"] = pe(X0p + XC + MXc, Y0p + g.wl(PY - 1, YC), 1 + 4 * K)
         raw[f"u{u}_cya_c0"] = pe(X0p, Y0p + YC, 1 + 4 * K)[:1 + 3 * K]
-        raw[f"u{u}_cym_c0"] = pe(X0p + XC + 1, Y0p + YC, 1 + 3 * K)
+        raw[f"u{u}_cym_c0"] = pe(X0p + XC + 1, Y0p + YC, 1 + 4 * K)
     base = int(raw["u0_cx_r0"][0]) if "u0_cx_r0" in raw else int(next(iter(raw.values()))[0])
     def rel(v):
         d = (int(v) - base) % (1 << 32)
