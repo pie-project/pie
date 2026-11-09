@@ -985,6 +985,28 @@ impl KvPageTable {
             && self.path_prefix_len(owner, last - 1) <= len
     }
 
+    /// The node `root`'s last pages are in: itself, or the one a selection
+    /// takes them from. [`Self::within`] asks it to be `location`'s own or
+    /// above it.
+    pub fn path_owner(&self, root: NodeId) -> Option<NodeId> {
+        let node = self.nodes.get(root)?;
+        match &node.pages {
+            Pages::Owned { .. } => Some(root),
+            Pages::ParentSelection { .. } => node.parent,
+        }
+    }
+
+    /// `node` and every node above it.
+    pub fn lineage(&self, node: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut cursor = Some(node);
+        while let Some(current) = cursor {
+            out.push(current);
+            cursor = self.nodes.get(current).and_then(|n| n.parent);
+        }
+        out
+    }
+
     pub fn descends_from(&self, node: NodeId, ancestor: NodeId) -> bool {
         let mut cursor = Some(node);
         while let Some(current) = cursor {
