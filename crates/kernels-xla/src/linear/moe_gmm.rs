@@ -419,7 +419,7 @@ fn scale_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
             "arith.constant",
             &[],
             &format!("value = dense<{x}> : {t}"),
-            &[t.clone()],
+            std::slice::from_ref(t),
         )[0]
     };
     let bin = |b: &mut Body, op: &str, x: V, y: V| {
@@ -433,15 +433,15 @@ fn scale_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
     };
     // The block's exponent, less one, in an f32 exponent field, every code's.
     let g = int(&[groups, cols]);
-    let e = b.op("arith.extui", &[s], "", &[g.clone()])[0];
+    let e = b.op("arith.extui", &[s], "", std::slice::from_ref(&g))[0];
     let one = splat(b, 1, &g);
     let e = bin(b, "arith.subi", e, one);
     let at = splat(b, 23, &g);
     let e = bin(b, "arith.shli", e, at);
     let e = b.op("vector.shape_cast", &[e], "", &[int(&[groups, 1, cols])])[0];
     let e = b.op("vector.broadcast", &[e], "", &[int(&[groups, 32, cols])])[0];
-    let e = b.op("vector.shape_cast", &[e], "", &[full.clone()])[0];
-    let c = b.op("arith.extui", &[w], "", &[full.clone()])[0];
+    let e = b.op("vector.shape_cast", &[e], "", std::slice::from_ref(&full))[0];
+    let c = b.op("arith.extui", &[w], "", std::slice::from_ref(&full))[0];
     let seven = splat(b, 7, &full);
     let m = bin(b, "arith.andi", c, seven);
     let eight = splat(b, 8, &full);
@@ -461,7 +461,12 @@ fn scale_codes(b: &mut Body, w: V, s: V, groups: i64, cols: i64) -> Built<V> {
         "predicate = 6 : i64",
         &[MTy::Vector(vec![k, cols], Elem::Pred)],
     )[0];
-    let t = b.op("arith.select", &[low, small, big], "", &[full.clone()])[0];
+    let t = b.op(
+        "arith.select",
+        &[low, small, big],
+        "",
+        std::slice::from_ref(&full),
+    )[0];
     let bits = bin(b, "arith.ori", t, sign);
     let f = b.op(
         "arith.bitcast",

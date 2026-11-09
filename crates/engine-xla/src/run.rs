@@ -180,15 +180,17 @@ pub struct Run<'c> {
     /// Routed results the grouped-matmul kernel left in its tile order, by
     /// value, with the routes value and the span they were cut on: the next
     /// routed op on the same routes reads them as they are.
-    tiled: std::cell::RefCell<
-        Vec<(
-            ValueId,
-            ValueId,
-            (u32, u32),
-            kernels_xla::linear::moe::Tiled,
-        )>,
-    >,
+    tiled: std::cell::RefCell<Vec<TiledEntry>>,
 }
+
+/// A tile-ordered routed result: its value, the routes value it was sorted
+/// on, the span `(lane_offset, lanes)` it was cut on, and its rows.
+type TiledEntry = (
+    ValueId,
+    ValueId,
+    (u32, u32),
+    kernels_xla::linear::moe::Tiled,
+);
 
 impl<'c> Run<'c> {
     #[must_use]
