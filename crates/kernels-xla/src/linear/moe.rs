@@ -1139,7 +1139,10 @@ fn gmm_rows_whole(p: i64, e: i64, base: i64) -> i64 {
     let active = e.min(p).max(1);
     let per = (p + active - 1) / active;
     let mut tm = base.max(16);
-    while tm < 128 && tm < per {
+    // A fire past 4096 tokens' pairs fills 256-row tiles nearly whole (v6e
+    // gpt-oss 4096-row prefill: pf256 32.3k tok/s against 31.6k at 128).
+    let cap = if p >= 16384 { 256 } else { 128 };
+    while tm < cap && tm < per {
         tm *= 2;
     }
     tm
