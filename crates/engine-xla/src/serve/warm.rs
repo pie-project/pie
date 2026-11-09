@@ -207,12 +207,17 @@ impl Shell {
         // host memory: at most 8 at once, and no more than the host's free
         // memory, less 4 GiB for the server beside them, holds at 1.25 GiB a
         // MiB of the longest text (v6e, Qwen3.6-35B-A3B's 12 MiB fires: 108
-        // GB for eight; a v5e host's 47 GB stopped answering at eight, and
-        // at four of its 10.4 MiB pf256 fires; three fit).
+        // GB for eight; a v5e host's 47 GB stopped answering at eight, at
+        // four of its 10.4 MiB pf256 fires, and after ~60 programs at three:
+        // the host's use grows as the ladder goes). Each compile also waits
+        // for that much to be free while another runs, and hands its
+        // scratch back when it is done.
         let longest = texts.iter().map(|(t, _)| t.len() as u64).max().unwrap_or(0);
+        let need = ((longest * 5) << 8) + (4 << 30);
         let room = available_memory().map_or(8, |b| {
             b.saturating_sub(4 << 30) / ((longest * 5) << 8).max(1)
         }) as usize;
+        let running = std::sync::atomic::AtomicUsize::new(0);
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(8)
@@ -234,7 +239,20 @@ impl Shell {
                         let Some((text, sig)) = texts.get(at) else {
                             break;
                         };
+                        use std::sync::atomic::Ordering::SeqCst;
+                        while running.load(SeqCst) > 0
+                            && available_memory().is_some_and(|b| b < need)
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        running.fetch_add(1, SeqCst);
                         let program = device.program(text, (*sig).clone());
+                        running.fetch_sub(1, SeqCst);
+                        #[cfg(target_os = "linux")]
+                        // SAFETY: `malloc_trim` only releases free heap pages.
+                        unsafe {
+                            libc::malloc_trim(0);
+                        }
                         if let Ok(mut slot) = slots[at].lock() {
                             *slot = Some(program);
                         }
