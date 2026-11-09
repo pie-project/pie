@@ -348,12 +348,14 @@ fn the_quantizing_products_answer_the_read_back_dot() {
 fn the_w8a16_projections_answer_the_dot() {
     use kernels_cuda::linear::w8a16;
     // (block, m, n, k): the mma.sync kernel at each CTA shape (16, 32 and 64
-    // rows, a part tile of each), and wider fires on the widened plane.
+    // rows, a part tile of each), Hopper's wgmma at 65 to 128 rows, and wider
+    // fires on the widened plane.
     #[rustfmt::skip]
     let cases = [(128, 1, 384, 1024), (128, 5, 200, 640), (128, 16, 512, 2048), (128, 23, 256, 768),
         (128, 64, 136, 512), (128, 100, 256, 1024), (32, 1, 256, 1024), (32, 37, 200, 512),
         (32, 130, 200, 1024), (32, 64, 1280, 5120), (32, 50, 256, 1152), (32, 64, 520, 1536),
-        (128, 48, 384, 2048), (32, 24, 640, 1024), (128, 20, 384, 2048), (128, 256, 384, 1024), (128, 300, 136, 512), (32, 1024, 256, 2048), (128, 777, 520, 640)];
+        (128, 48, 384, 2048), (32, 24, 640, 1024), (128, 20, 384, 2048), (128, 256, 384, 1024), (128, 300, 136, 512), (32, 1024, 256, 2048), (128, 777, 520, 640),
+        (32, 128, 1280, 3072), (128, 65, 384, 2048), (32, 97, 520, 1536)];
     for (gran, m, n, k) in cases {
         let mut b = Bench::new(0xa16 ^ (m * n + k) as u64);
         let (x, xv) = b.bf16(m * k);
