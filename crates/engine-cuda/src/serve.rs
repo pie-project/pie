@@ -119,6 +119,8 @@ pub struct Shell {
     seated_first: bool,
     /// `engine.seat_to_end`.
     seat_to_end: bool,
+    /// `engine.seat_spread`.
+    seat_spread: bool,
     /// `engine.prefill_lanes`.
     prefill_lanes: u32,
     pad: bool,
@@ -395,6 +397,13 @@ impl Shell {
     #[must_use]
     pub fn seat_to_end(&self) -> bool {
         self.seat_to_end
+    }
+
+    /// Whether this load asks the planner to spread the starts the pools do
+    /// not hold to the end at once over a life (`engine.seat_spread`).
+    #[must_use]
+    pub fn seat_spread(&self) -> bool {
+        self.seat_spread
     }
 
     /// Host rs rows: a state slot and a buffer page each, parked apart.

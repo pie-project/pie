@@ -178,6 +178,7 @@ fn build_model(
                 one_frame_when_short: g.caps.pools.one_frame_when_short,
                 seated_first: g.caps.pools.seated_first,
                 seat_to_end: g.caps.pools.seat_to_end,
+                seat_spread: g.caps.pools.seat_spread,
                 rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
                 rs_host_slots: g.caps.pools.host_state_slots as usize,
                 rs_buffer_pages: g.caps.pools.buffer_pages,
