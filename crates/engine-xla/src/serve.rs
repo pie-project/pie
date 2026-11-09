@@ -1063,8 +1063,18 @@ impl Shell {
                 None => by.push((class, word, 1, rows)),
             }
         }
-        // The class that takes the rest of the rows: the one with the most.
-        let host = by.iter().enumerate().max_by_key(|(_, e)| e.3)?.0;
+        // The class that takes the rest of the rows: the one whose lanes are
+        // longest, then the one with the most rows. Decodes beside a prefill
+        // then pad to their own rung, as the warm ladder lays them, however
+        // few rows the prefill holds: as the host, their class took the rest
+        // and the prefill kept its own rows, a program for every prompt tail
+        // or short prompt beside more decodes than its rows (v6e Qwen3.6
+        // c256: 180 decodes beside a prompt).
+        let host = by
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, e)| (e.3 / e.2.max(1), e.3))?
+            .0;
         let pad = self.pad;
         let buckets = &self.budgets.tokens.buckets;
         // A fire that decodes beside its prefill: the prefill's lanes at
