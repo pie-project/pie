@@ -3,6 +3,7 @@
 #include "prim/device.cuh"
 #include "prim/mma_sm80.cuh"
 #include "prim/smem.cuh"
+#include "linear/moe/table.cuh"
 
 #include <cuda_bf16.h>
 
@@ -91,6 +92,23 @@ __device__ __forceinline__ unsigned affine2(unsigned run, int half, unsigned s2,
     return w;
 }
 
+}
+
+// An expert's atom-laid exponents (a Scaled bank's plane 1) and the atom
+// row its weight row 0 is: under an expert table its own plane from row 0
+// (`n` whole 128s, so an expert's atoms are a run of their own), else the
+// bank's from row `expert * n`, as the contiguous bank always read them.
+struct ExpertAtoms {
+    const u8* at;
+    int row0;
+};
+
+__device__ __forceinline__ ExpertAtoms expert_atoms(
+    const u8* atoms, const u64* __restrict__ table, int expert, int n)
+{
+    return table != nullptr
+        ? ExpertAtoms{reinterpret_cast<const u8*>(table[static_cast<long long>(expert) * 2 + 1]), 0}
+        : ExpertAtoms{atoms, expert * n};
 }
 
 }

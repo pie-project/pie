@@ -1222,6 +1222,7 @@ impl Run<'_> {
                         self.tensor(*routes),
                         &mut self.tensor(*y),
                         None,
+                        linear::moe::ExpertTable::RESIDENT,
                     )?
                 {
                     return Ok(());
@@ -1382,6 +1383,7 @@ impl Run<'_> {
                     route_t,
                     &mut out,
                     Glu::Swiglu,
+                    linear::moe::ExpertTable::RESIDENT,
                 );
             }
         }
@@ -1404,6 +1406,7 @@ impl Run<'_> {
                 routes,
                 &mut out,
                 Some(Glu::Relu2),
+                linear::moe::ExpertTable::RESIDENT,
             );
         }
         // The profile first: a tcgen05 device with its grouped GEMM off resolves nothing.
@@ -1491,6 +1494,7 @@ impl Run<'_> {
                 routes,
                 &mut out,
                 Some(glu),
+                linear::moe::ExpertTable::RESIDENT,
             )? {
                 return Ok(true);
             }
@@ -1978,6 +1982,7 @@ impl Run<'_> {
                 routes,
                 &mut self.tensor(y),
                 None,
+                linear::moe::ExpertTable::RESIDENT,
             )?
         {
             return Ok(());
@@ -2394,6 +2399,7 @@ impl Run<'_> {
                         self.tensor(routes),
                         &mut self.tensor(y),
                         None,
+                        linear::moe::ExpertTable::RESIDENT,
                     )?
                 {
                     return Ok(());
@@ -2413,6 +2419,7 @@ impl Run<'_> {
                             codes.rows,
                             route_t,
                             &mut out,
+                            linear::moe::ExpertTable::RESIDENT,
                         );
                     }
                 }
@@ -2452,6 +2459,7 @@ impl Run<'_> {
                         codes.rows,
                         routes,
                         &mut self.tensor(y),
+                        linear::moe::ExpertTable::RESIDENT,
                     );
                 }
                 linear::moe::select_fp8_w8a16(
@@ -2465,6 +2473,7 @@ impl Run<'_> {
                     routes,
                     &mut self.tensor(y),
                     None,
+                    linear::moe::ExpertTable::RESIDENT,
                 )
             }
             stored => Err(kernels_cuda::Error::Backend {
