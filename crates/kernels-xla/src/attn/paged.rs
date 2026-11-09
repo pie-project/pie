@@ -1880,7 +1880,9 @@ pub fn attend_fresh(
             let below = f.min(hi, p0)?;
             let below = f.max(below, lo)?;
             let hi = f.select(all, below, hi)?;
-            (hi, Some((k, v, first)))
+            let wants = f.compare(Cmp::Gt, hi, lo)?;
+            let pooled = f.reduce(wants, &[0], Fold::Or)?;
+            (hi, Some((k, v, first, pooled)))
         }
         None => (hi, None),
     };
@@ -1929,75 +1931,99 @@ pub fn attend_fresh(
     };
     let ch = tuning.chunks;
     let scale = f64::from(call.sm_scale);
-    let flashed = match (walk, sel) {
-        (_, Some((sel, ratio, true))) => {
-            // Each kv head walks its own run over its own key and value
-            // columns, its query heads beside it.
-            let run = f.dims(sel)[1] / heads.kvh;
-            let one = Heads { kvh: 1, ..heads };
-            let mut parts = Vec::new();
-            for j in 0..heads.kvh {
-                let s = f.slice_axis(sel, 1, j * run, (j + 1) * run)?;
-                let table = selected_positions(f, s, qpos, ratio)?;
-                let head = Planes::Paged {
-                    keys: f.slice_axis(keys, 1, j * heads.d, (j + 1) * heads.d)?,
-                    values: f.slice_axis(values, 1, j * heads.dv, (j + 1) * heads.dv)?,
-                    geom,
-                    latent: false,
-                };
-                let mut rj = rs;
-                rj.q = f.slice_axis(q4, 1, j, j + 1)?;
-                parts.push(per_row(
+    let read_pool = |f: &mut Func| -> Built<Flashed> {
+        Ok(match (walk, sel) {
+            (_, Some((sel, ratio, true))) => {
+                // Each kv head walks its own run over its own key and value
+                // columns, its query heads beside it.
+                let run = f.dims(sel)[1] / heads.kvh;
+                let one = Heads { kvh: 1, ..heads };
+                let mut parts = Vec::new();
+                for j in 0..heads.kvh {
+                    let s = f.slice_axis(sel, 1, j * run, (j + 1) * run)?;
+                    let table = selected_positions(f, s, qpos, ratio)?;
+                    let head = Planes::Paged {
+                        keys: f.slice_axis(keys, 1, j * heads.d, (j + 1) * heads.d)?,
+                        values: f.slice_axis(values, 1, j * heads.dv, (j + 1) * heads.dv)?,
+                        geom,
+                        latent: false,
+                    };
+                    let mut rj = rs;
+                    rj.q = f.slice_axis(q4, 1, j, j + 1)?;
+                    parts.push(per_row(
+                        f,
+                        &head,
+                        &one,
+                        &rule,
+                        &rj,
+                        KeyList::Table(table),
+                        scale,
+                        ch,
+                    )?);
+                }
+                let cat = |f: &mut Func, v: Vec<Val>| f.concat(&v, 1);
+                Flashed {
+                    o: cat(f, parts.iter().map(|p| p.o).collect())?,
+                    m: cat(f, parts.iter().map(|p| p.m).collect())?,
+                    l: cat(f, parts.iter().map(|p| p.l).collect())?,
+                }
+            }
+            (_, Some((sel, ratio, false))) => {
+                let table = selected_positions(f, sel, qpos, ratio)?;
+                per_row(
                     f,
-                    &head,
-                    &one,
+                    &planes,
+                    &heads,
                     &rule,
-                    &rj,
+                    &rs,
                     KeyList::Table(table),
                     scale,
                     ch,
-                )?);
+                )?
             }
-            let cat = |f: &mut Func, v: Vec<Val>| f.concat(&v, 1);
-            Flashed {
-                o: cat(f, parts.iter().map(|p| p.o).collect())?,
-                m: cat(f, parts.iter().map(|p| p.m).collect())?,
-                l: cat(f, parts.iter().map(|p| p.l).collect())?,
-            }
-        }
-        (_, Some((sel, ratio, false))) => {
-            let table = selected_positions(f, sel, qpos, ratio)?;
-            per_row(
+            (Walk::Blocked, None) => blocked(
                 f,
                 &planes,
                 &heads,
                 &rule,
                 &rs,
-                KeyList::Table(table),
+                geom.lanes * geom.span,
                 scale,
                 ch,
-            )?
-        }
-        (Walk::Blocked, None) => blocked(
-            f,
-            &planes,
-            &heads,
-            &rule,
-            &rs,
-            geom.lanes * geom.span,
-            scale,
-            ch,
-        )?,
-        _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?,
+            )?,
+            _ => per_row(f, &planes, &heads, &rule, &rs, KeyList::Range, scale, ch)?,
+        })
     };
     let flashed = match fresh {
-        Some((k, v, first)) => {
+        Some((k, v, first, pooled)) => {
             let qb = f.convert(q4, Elem::Bf16);
             let (o, lse) =
                 super::fresh::attend(f, qb, k, v, first, &heads, scale, tuning.vmem_cap())?;
-            super::fresh::fold(f, flashed, o, lse)?
+            // A fire whose rows read nothing from the pool (prompts from
+            // their first position) skips the walk and the fold.
+            let outs = [f.ty(o).clone(), f.ty(lse).clone(), f.ty(lse).clone()];
+            let alone: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
+                let ninf = f.like_f(lse, f64::NEG_INFINITY);
+                let read = f.compare(Cmp::Gt, lse, ninf)?;
+                let one = f.like_f(lse, 1.0);
+                let zero = f.like_f(lse, 0.0);
+                let l = f.select(read, one, zero)?;
+                Ok(vec![o, lse, l])
+            });
+            let both: crate::hlo::Branch<'_> = Box::new(move |f: &mut Func| {
+                let pool = read_pool(f)?;
+                let fl = super::fresh::fold(f, pool, o, lse)?;
+                Ok(vec![fl.o, fl.m, fl.l])
+            });
+            let at = f.convert(pooled, Elem::I32);
+            let out = f.case(at, &outs, vec![alone, both])?;
+            Flashed {
+                o: out[0],
+                m: out[1],
+                l: out[2],
+            }
         }
-        None => flashed,
+        None => read_pool(f)?,
     };
     let lse = match call.lse {
         Some(_) => Some(flashed.lse2(f)?),
