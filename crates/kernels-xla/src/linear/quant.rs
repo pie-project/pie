@@ -346,7 +346,7 @@ pub(crate) fn codes_shape(
 ) -> Result<(), Error> {
     let ok = t.rows() == rows
         && match t.dtype() {
-            Dtype::E5m2 => u64::from(t.width()) == k,
+            Dtype::E5m2 | Dtype::E4m3 => u64::from(t.width()) == k,
             // The stored width is the read value's to tell (a packed dtype's
             // handle may view one code per element, or its raw bytes).
             d if crate::pack::code_elem(d).is_some() => crate::pack::code_bits(d) == Some(bits),
@@ -492,9 +492,31 @@ pub(crate) fn contract_native(
 /// What a bank's planes decode as.
 #[derive(Clone, Copy)]
 pub(crate) enum Form<T = Operand> {
-    Affine { biases: T },
+    Affine {
+        biases: T,
+    },
     Mxfp4,
+    /// e4m3 codes under one f32 factor a 128x128 block (a block-FP8
+    /// release's weights as released): the scales plane is `[⌈n/128⌉, k/128]`.
+    Tile,
 }
+
+/// A block-FP8 bank's `[⌈n/128⌉, G]` f32 factors (`scales`) as one a row,
+/// f32 `[n, G]`: each block row's factors repeated over its 128 rows.
+pub(crate) fn tile_factor(f: &mut Func, scales: Val, n: i64) -> Result<Val, Error> {
+    let (nb, g) = (f.dims(scales)[0], f.dims(scales)[1]);
+    let s = f.convert(scales, Elem::F32);
+    let s = f.broadcast(s, &[nb, TILE, g], &[0, 2])?;
+    let s = f.reshape(s, &[nb * TILE, g])?;
+    Ok(if nb * TILE == n {
+        s
+    } else {
+        f.slice_axis(s, 0, 0, n)?
+    })
+}
+
+/// The rows and columns one block-FP8 factor covers.
+pub(crate) const TILE: i64 = 128;
 
 /// A bank checked against an `[n, k]` projection, its planes as plain views.
 #[derive(Clone, Copy)]
@@ -546,12 +568,16 @@ pub(crate) fn planes<T: Stored>(
     let form = match w.biases {
         Some(b) => Form::Affine { biases: b },
         None if bits == 4 && group == 32 => Form::Mxfp4,
+        None if bits == 8 && i64::from(group) == TILE && w.codes.dtype() == Dtype::E4m3 => {
+            Form::Tile
+        }
         None => {
             return Err(refuse(
                 op,
                 format!(
-                    "the weight is a symmetric {bits}-bit bank in groups of {group}; the only \
-                     symmetric bank read is mxfp4 (4 bits, groups of 32, e8m0 scales)"
+                    "the weight is a symmetric {bits}-bit bank in groups of {group}; the \
+                     symmetric banks read are mxfp4 (4 bits, groups of 32, e8m0 scales) and \
+                     block FP8 (e4m3 codes, an f32 factor a 128x128 block)"
                 ),
             ));
         }
@@ -586,6 +612,23 @@ pub(crate) fn planes<T: Stored>(
         Form::Mxfp4 => {
             let s = factor("scale", w.scales, &[Dtype::E8m0, Dtype::U8])?;
             (s.with_dtype(Dtype::U8), Form::Mxfp4)
+        }
+        Form::Tile => {
+            let s = w.scales;
+            if s.dtype() != Dtype::F32 || s.rows() != n.div_ceil(128) || s.width() != groups {
+                return Err(refuse(
+                    op,
+                    format!(
+                        "the factor plane is {}x{} {:?}, and a {n}x{k} block-FP8 bank has one \
+                         f32 factor a 128x128 block, {}x{groups}",
+                        s.rows(),
+                        s.width(),
+                        s.dtype(),
+                        n.div_ceil(128)
+                    ),
+                ));
+            }
+            (s, Form::Tile)
         }
     };
     Ok(Planes {
@@ -641,6 +684,10 @@ pub(crate) fn contract(f: &mut Func, x: Val, p: &Planes, tuning: Tuning) -> Resu
                     tuning,
                 )
             }
+            Form::Tile => Err(refuse(
+                "linear.matmul",
+                "block-FP8 codes land one e4m3 a weight, not packed in bytes",
+            )),
         };
     }
     let mxfp4 = matches!(p.form, Form::Mxfp4);
@@ -659,6 +706,26 @@ pub(crate) fn contract(f: &mut Func, x: Val, p: &Planes, tuning: Tuning) -> Resu
             let e = f.convert(e, Elem::U32);
             let s = e8m0(f, e)?;
             contract_native(f, x, codes, g, Some(s), None, tuning)
+        }
+        Form::Tile => {
+            let s = tile_factor(f, p.scales.val, n)?;
+            // The grouped-matmul kernel streams the codes and widens them in
+            // VMEM, where a block of the weight fits it.
+            if let Codes::Int(c) = codes
+                && let Some(y) = crate::linear::moe::tile_projection(f, x, c, s, tuning)?
+            {
+                return Ok(y);
+            }
+            // The `[G, m, n]` partials of a group-batched dot outgrow the
+            // weight past a few rows: then the weight decodes once, each
+            // rounded to bf16 as the bf16 deployment holds it.
+            if grouped(tuning, f.dims(x)[0], g) {
+                return contract_native(f, x, codes, g, Some(s), None, tuning);
+            }
+            let q = code_values(f, codes, Elem::Bf16)?;
+            let q = f.reshape(q, &[n, g, k / g])?;
+            let w = materialize(f, q, s, None)?;
+            project(f, x, w, true)
         }
     }
 }

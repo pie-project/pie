@@ -9,7 +9,7 @@ use dtype::Dtype;
 
 use crate::error::{Error, refuse};
 use crate::hlo::{Elem, Func, Val};
-use crate::linear::quant::{Codes, Form, code_values, e8m0, planes, read_codes};
+use crate::linear::quant::{Codes, Form, code_values, e8m0, planes, read_codes, tile_factor};
 use crate::tensor::{Bank, Landing, Operand};
 
 /// `out = decode(w)`, bf16 `[n, k]`.
@@ -63,6 +63,11 @@ pub(crate) fn decode(
             let e = p.scales.val;
             let e = f.convert(e, Elem::U32);
             let s = e8m0(f, e)?;
+            let s = f.broadcast(s, &d, &[0, 1])?;
+            f.mul(c, s)?
+        }
+        Form::Tile => {
+            let s = tile_factor(f, p.scales.val, n)?;
             let s = f.broadcast(s, &d, &[0, 1])?;
             f.mul(c, s)?
         }

@@ -580,6 +580,7 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
             generation = control.generation();
             full = true;
         }
+        let walk = std::time::Instant::now();
         let now = runtime::offload::directory::sealed_keys();
         let disk = runtime::offload::directory::persisted_keys();
         let hints = runtime::offload::directory::persist_hints();
@@ -592,6 +593,7 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
                 .into_iter()
                 .filter_map(|run| Some((*run.last()?, run)))
                 .collect();
+        let walk = walk.elapsed();
         let report = worker_api::StateReport {
             peer: peer.clone(),
             added: if full {
@@ -649,7 +651,10 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
                 full = true;
             }
         }
-        tokio::time::sleep(REPORT_EVERY).await;
+        // The walk reads every cache entry, so a full cache waits it out
+        // fifty times over before the next: what this worker holds is told a
+        // little later, and fires keep the kv lock.
+        tokio::time::sleep(REPORT_EVERY.max(walk * 50)).await;
     }
 }
 

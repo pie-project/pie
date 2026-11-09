@@ -76,6 +76,14 @@ impl ResidencyPlanner {
         self
     }
 
+    /// With `PoolFacts::seat_spread`, the starts the pools do not hold to the
+    /// end at once are spread over a life (see [`super::to_end::ToEnd`]).
+    #[must_use]
+    pub fn seat_spread(mut self, on: bool) -> Self {
+        self.inner.get_mut().to_end.spread = on;
+        self
+    }
+
     /// With `PoolFacts::seated_first`, seated growth doesn't park behind a waiting
     /// prompt, which is seated only within the rings' growth room
     /// (`PoolPort::rs_growth`) and suspends only an idle lane.
@@ -423,9 +431,10 @@ impl ResidencyPlanner {
             notified.as_mut().enable();
             let (_, kv_total) = self.port.device_stats();
             let (_, rs_total) = self.port.rs_stats();
+            let now = std::time::Instant::now();
             let passed = self.with_inner(|inner| {
                 let Some(rank) = inner.procs.get(&pid).map(Proc::rank) else {
-                    return true;
+                    return Ok(());
                 };
                 inner.to_end.waiting.insert((rank, pid));
                 // By pid: a reschedule may have moved its rank since it queued.
@@ -434,19 +443,24 @@ impl ResidencyPlanner {
                     .waiting
                     .first()
                     .is_none_or(|(_, first)| *first != pid)
-                    || !inner.to_end.room(&inner.procs, kv_total, rs_total)
                 {
-                    return false;
+                    return Err(None);
                 }
+                inner.to_end.room(&inner.procs, kv_total, rs_total, now)?;
                 inner.to_end.waiting.retain(|(_, waiting)| *waiting != pid);
-                inner.to_end.live.insert(pid);
-                true
+                inner.to_end.live.insert(pid, now);
+                Ok(())
             });
-            if passed {
-                self.to_end_notify.notify_waiters();
-                return;
+            match passed {
+                Ok(()) => {
+                    self.to_end_notify.notify_waiters();
+                    return;
+                }
+                Err(None) => notified.await,
+                Err(Some(spread)) => {
+                    let _ = crate::rt::time::timeout(spread, notified).await;
+                }
             }
-            notified.await;
         }
     }
 
@@ -738,7 +752,7 @@ impl ResidencyPlanner {
                 inner.admitting.retain(|(_, waiting), _| *waiting != pid);
             }
             if self.seat_to_end {
-                if inner.to_end.live.remove(&pid)
+                if let Some(passed) = inner.to_end.live.remove(&pid)
                     && let Some(proc) = departed.as_ref().filter(|proc| {
                         proc.admitted
                             && proc.state == Residency::Resident
@@ -746,7 +760,7 @@ impl ResidencyPlanner {
                             && proc.peak.0 > 0
                     })
                 {
-                    inner.to_end.learn(proc.peak, proc.first);
+                    inner.to_end.learn(proc.peak, proc.first, passed.elapsed());
                 }
                 inner.to_end.waiting.retain(|(_, waiting)| *waiting != pid);
             }

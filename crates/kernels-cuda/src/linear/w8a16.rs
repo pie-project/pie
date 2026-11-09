@@ -31,6 +31,12 @@ pub const MMA_UNTIL: u32 = 32;
 /// plane once for cuBLAS, which leads there.
 pub const GEMM_UNTIL: u32 = 64;
 
+/// The most rows Hopper's wgmma kernel takes, as one n128 B: a decode of
+/// 65 to 128 lanes reads the codes once rather than widening the plane for
+/// cuBLAS each fire (MiniMax-M3.1-Flash mini60's c128 on an H100 spent 14%
+/// of its GPU time widening).
+const WGMMA_UNTIL: u32 = 128;
+
 /// One CTA shape of the mma.sync kernel: `16 * mt` rows, `8 * n_sub *
 /// warps_n` columns, `warps_k` groups over K.
 #[derive(Clone, Copy)]
@@ -108,8 +114,9 @@ pub fn matmul(
     // A plane at a batch's rows that tiles too few CTAs to fill the card
     // splits K, the codes still read once.
     let sms = ctx.multiprocessors().unwrap_or(108);
-    let tiles = n.div_ceil(128) * m.div_ceil(64);
-    let wgmma = crate::linear::moe::hopper_wgmma() && m >= WGMMA_FROM;
+    let wgmma = crate::linear::moe::hopper_wgmma() && (WGMMA_FROM..=WGMMA_UNTIL).contains(&m);
+    // wgmma's CTA takes every row of the batch.
+    let tiles = n.div_ceil(128) * if wgmma { 1 } else { m.div_ceil(64) };
     let tiled = m > MMA_UNTIL || wgmma;
     // Splits that keep the fire one wave deep at two CTAs an SM.
     let splits = if tiled && tiles < 2 * sms && n.is_multiple_of(2) {
@@ -117,7 +124,7 @@ pub fn matmul(
     } else {
         1
     };
-    if m > GEMM_UNTIL {
+    if m > GEMM_UNTIL && !wgmma {
         // A prefill's rows against the plane widened once, on cuBLAS.
         let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
         let tile = ctx.scratch_stream(op, DECODED_WEIGHT, bytes)? as usize as u64;
@@ -157,13 +164,14 @@ pub fn matmul(
         // Hopper's wgmma, the codes widened once into its A registers.
         let fire = if wgmma {
             const WG_STAGES: u32 = 3;
+            let (rows, stage) = if m > 64 { (128, 50176) } else { (64, 33792) };
             Fire::at(kernel(
                 W8A16_SM90,
-                &format!("::pie::linear::fp8_w8a16_wgmma<{gran}, {WG_STAGES}>"),
+                &format!("::pie::linear::fp8_w8a16_wgmma<{gran}, {WG_STAGES}, {rows}>"),
             ))
             .apply(
                 Launch::grid([n.div_ceil(128), 1, splits], [128, 1, 1])
-                    .smem(WG_STAGES * 33792 + 1024),
+                    .smem(WG_STAGES * stage + 1024),
             )
         } else {
             Fire::at(kernel(

@@ -11,7 +11,7 @@ use dtype::Dtype;
 use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Combine, Elem, Fold, Func, ScatterDims, Val};
-use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_upto, nonzero, take};
+use crate::lanes::{DROP, ci, clamp_i, cmp_i, flat_i32, loop_at_most, nonzero, take};
 use crate::tensor::{KvPool, Landing, Operand, Stored};
 
 /// Keys per step of the pooled readers' flash loop.
@@ -105,7 +105,7 @@ pub(crate) fn compact_view(
     width: u32,
     row: u32,
     page_size: i32,
-) -> Result<Option<(Val, i64)>, Error> {
+) -> Result<Option<(Val, i64, i64)>, Error> {
     if width == 0 || width >= row {
         return Ok(None);
     }
@@ -121,8 +121,55 @@ pub(crate) fn compact_view(
         ));
     }
     let div = i64::from(div);
-    let t = f.reshape(table, &[cells / div, i64::from(row)])?;
-    Ok(Some((t, ps / div)))
+    Ok(Some((table, ps / div, div)))
+}
+
+/// The entries at view cells `cell` (`[m]`) of a compact pool's `[cells,
+/// width]` plane, `div` rows an entry: `[m, div · width]`, gathered row by
+/// row. A `[cells / div, div · width]` view of the plane is a relayout of
+/// all of it on a TPU, in every layer, every fire.
+pub(crate) fn entry_rows(f: &mut Func, table: Val, cell: Val, div: i64) -> Built<Val> {
+    if div == 1 {
+        return f.take_rows(table, cell);
+    }
+    let m = f.dims(cell)[0];
+    let (cells, w) = (f.dims(table)[0], f.dims(table)[1]);
+    if m * div > cells / 4 {
+        // A prompt's reading touches most of the plane: one relayout to the
+        // entry's width costs less than four times the row gathers.
+        let t = f.reshape(table, &[cells / div, div * w])?;
+        return f.take_rows(t, cell);
+    }
+    let c = f.broadcast(cell, &[m, div], &[0])?;
+    let dv = f.like_i(c, div);
+    let c = f.mul(c, dv)?;
+    let k = f.iota(Elem::I32, &[m, div], 1);
+    let c = f.add(c, k)?;
+    let c = f.reshape(c, &[m * div])?;
+    let got = f.take_rows(table, c)?;
+    f.reshape(got, &[m, div * w])
+}
+
+/// Files `rows` (`[n, div · width]`) at view cells `at` of a compact
+/// pool's `[cells, width]` plane, row by row; a cell outside the view drops.
+fn put_entries(f: &mut Func, table: Val, at: Val, rows: Val, div: i64) -> Built<Val> {
+    let n = f.dims(at)[0];
+    let (cells, w) = (f.dims(table)[0], f.dims(table)[1]);
+    let a = f.broadcast(at, &[n, div], &[0])?;
+    let lo = cmp_i(f, Cmp::Ge, a, 0)?;
+    let hi = cmp_i(f, Cmp::Lt, a, cells / div)?;
+    let inside = f.and(lo, hi)?;
+    let dv = f.like_i(a, div);
+    let c = f.mul(a, dv)?;
+    let k = f.iota(Elem::I32, &[n, div], 1);
+    let c = f.add(c, k)?;
+    let drop = f.like_i(c, DROP);
+    let c = f.select(inside, c, drop)?;
+    let c = f.reshape(c, &[n * div])?;
+    let elem = f.elem(table);
+    let rows = f.convert(rows, elem);
+    let rows = f.reshape(rows, &[n * div, w])?;
+    f.put_rows(table, c, rows, Combine::Set)
 }
 
 fn long_enough(op: &'static str, what: &str, t: impl Stored, n: u32) -> Result<(), Error> {
@@ -395,6 +442,117 @@ pub fn gather(
     let (indices, indptr, ps) = paging(f, OP, page_indices, page_indptr, pages.page_size)?;
     let bpos = flat_i32(f, boundary_pos)?;
     let breq = flat_i32(f, boundary_req)?;
+    let bpos = first(f, bpos, n)?;
+    let breq = first(f, breq, n)?;
+    // A lane of k rows closes at most k / ratio + 1 blocks: only those rows
+    // gather their window, the rest land zeros (a prompt of 2048 rows at
+    // ratio 128 closed 16 blocks and gathered 128 state rows for each of the
+    // 2048: 35 of a 165 ms v6e fire).
+    let lanes = i64::try_from(page_indptr.elements())
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1);
+    let most = (n / r + lanes).min(n);
+    let every = move |f: &mut Func| -> Built<Val> {
+        gather_rows(
+            f,
+            bpos,
+            breq,
+            n,
+            indices,
+            indptr,
+            ps,
+            hd,
+            r,
+            coff,
+            window,
+            state_kv,
+            state_score,
+            ape,
+        )
+    };
+    if most < n {
+        let (pick, live, over) = closing(f, bpos, n, most)?;
+        let few = move |f: &mut Func| -> Built<Val> {
+            let neg = f.like_i(pick, -1);
+            let bp = take(f, bpos, pick)?;
+            let bp = f.select(live, bp, neg)?;
+            let br = take(f, breq, pick)?;
+            let got = gather_rows(
+                f,
+                bp,
+                br,
+                most,
+                indices,
+                indptr,
+                ps,
+                hd,
+                r,
+                coff,
+                window,
+                state_kv,
+                state_score,
+                ape,
+            )?;
+            let zero = f.const_f(Elem::F32, 0.0, &[n, hd]);
+            let gone = f.like_i(pick, DROP);
+            let back = f.select(live, pick, gone)?;
+            f.put_rows(zero, back, got, Combine::Set)
+        };
+        let ty = crate::hlo::Ty::new(Elem::F32, &[n, hd]);
+        let out = f.case(
+            over,
+            &[ty],
+            vec![
+                Box::new(move |f| Ok(vec![few(f)?])),
+                Box::new(move |f| Ok(vec![every(f)?])),
+            ],
+        )?;
+        return Ok(out[0]);
+    }
+    Ok(every(f)?)
+}
+
+/// The first `most` of the `n` rows that close a block (`bpos >= 0`), in row
+/// order: their rows (`[most]`, -1 past the count), which are live, and an
+/// i32 flag set when more rows close than `most` holds (rows not each a
+/// lane's run of positions), when the caller reads every row instead.
+fn closing(f: &mut Func, bpos: Val, n: i64, most: i64) -> Built<(Val, Val, Val)> {
+    let has = cmp_i(f, Cmp::Ge, bpos, 0)?;
+    let ti = f.convert(has, Elem::I32);
+    let count = f.reduce(ti, &[0], Fold::Sum)?;
+    let over = cmp_i(f, Cmp::Gt, count, most)?;
+    let over = f.convert(over, Elem::I32);
+    let rank = f.scan(ti, 0, Fold::Sum)?;
+    let one = f.like_i(rank, 1);
+    let rank = f.sub(rank, one)?;
+    let drop = f.like_i(rank, DROP);
+    let at = f.select(has, rank, drop)?;
+    let row = f.iota(Elem::I32, &[n, 1], 0);
+    let none = f.const_i(Elem::I32, -1, &[most, 1]);
+    let pick = f.put_rows(none, at, row, Combine::Set)?;
+    let pick = f.reshape(pick, &[most])?;
+    let live = cmp_i(f, Cmp::Ge, pick, 0)?;
+    Ok((pick, live, over))
+}
+
+/// [`gather`] for the rows whose boundaries are `bpos`/`breq` (`[n]`).
+fn gather_rows(
+    f: &mut Func,
+    bpos: Val,
+    breq: Val,
+    n: i64,
+    indices: Val,
+    indptr: Val,
+    ps: i64,
+    hd: i64,
+    r: i64,
+    coff: i64,
+    window: i64,
+    state_kv: Operand,
+    state_score: Operand,
+    ape: Option<Operand>,
+) -> Built<Val> {
     let sk = state_kv.val;
     let ss = state_score.val;
     let ape = ape.map(|a| a.f32(f));
@@ -489,6 +647,7 @@ pub fn kv_append(
     page_indptr: Operand,
     keys: Operand,
     pool: &KvPool<impl Stored>,
+    ratio: Option<u32>,
 ) -> Result<Val, Error> {
     const OP: &str = "attn.pool_kv_append";
     expect(OP, entries, &[Dtype::Bf16])?;
@@ -499,28 +658,65 @@ pub fn kv_append(
     let (indices, indptr, ps) = paging(f, OP, page_indices, page_indptr, pool.page_size)?;
     let bpos = flat_i32(f, boundary_pos)?;
     let breq = flat_i32(f, boundary_req)?;
+    let bpos = first(f, bpos, n)?;
+    let breq = first(f, breq, n)?;
     // A compact pool files the entry at its index, `page_size / div` a page.
-    if let Some((table, ps)) =
-        compact_view(f, OP, keys.val, keys.width, entries.width, pool.page_size)?
-    {
-        let div = i64::from(entries.width / keys.width);
-        let dv = f.like_i(bpos, div);
-        let c = f.div(bpos, dv)?;
-        let neg = cmp_i(f, Cmp::Lt, bpos, 0)?;
-        let none = f.like_i(bpos, -1);
-        let c = f.select(neg, none, c)?;
-        let at = boundary_cell(f, indices, indptr, c, breq, n, ps)?;
-        let y = put_cols(f, table, at, entries.val)?;
-        return Ok(f.reshape(y, &[i64::from(keys.rows), i64::from(keys.width)])?);
-    }
-    if keys.width < entries.width {
+    let view = compact_view(f, OP, keys.val, keys.width, entries.width, pool.page_size)?;
+    if view.is_none() && keys.width < entries.width {
         return Err(refuse(
             OP,
             "the compressed pool's row is narrower than the entry",
         ));
     }
-    let at = boundary_cell(f, indices, indptr, bpos, breq, n, ps)?;
-    Ok(put_cols(f, keys.val, at, entries.val)?)
+    let (table, rows_v) = (keys.val, f.slice_axis(entries.val, 0, 0, n)?);
+    let file = move |f: &mut Func, bpos: Val, breq: Val, rows_v: Val, n: i64| -> Built<Val> {
+        if let Some((table, ps, div)) = view {
+            let dv = f.like_i(bpos, div);
+            let c = f.div(bpos, dv)?;
+            let neg = cmp_i(f, Cmp::Lt, bpos, 0)?;
+            let none = f.like_i(bpos, -1);
+            let c = f.select(neg, none, c)?;
+            let at = boundary_cell(f, indices, indptr, c, breq, n, ps)?;
+            return put_entries(f, table, at, rows_v, div);
+        }
+        let at = boundary_cell(f, indices, indptr, bpos, breq, n, ps)?;
+        put_cols(f, table, at, rows_v)
+    };
+    // A lane of k rows closes at most k / ratio + 1 blocks: only those rows
+    // are filed, not a dropped write for every row of the fire (a prompt of
+    // 1792 rows at ratio 4: 7168 row writes a layer, 0.8 ms on a v6e).
+    let lanes = i64::try_from(page_indptr.elements())
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1);
+    let most = ratio.map_or(n, |r| (n / i64::from(r.max(1)) + lanes).min(n));
+    // A plane narrower than a lane tile files every row: under the branch
+    // XLA lays it column-major and relays the whole plane in and out (a
+    // 32-wide index pool on a v6e: 1.4 ms a layer).
+    if most < n && f.dims(table)[1] >= 128 {
+        let (pick, live, over) = closing(f, bpos, n, most)?;
+        let few = move |f: &mut Func| -> Built<Val> {
+            let neg = f.like_i(pick, -1);
+            let bp = take(f, bpos, pick)?;
+            let bp = f.select(live, bp, neg)?;
+            let zero = f.like_i(pick, 0);
+            let row = f.select(live, pick, zero)?;
+            let br = take(f, breq, row)?;
+            let got = f.take_rows(rows_v, row)?;
+            file(f, bp, br, got, most)
+        };
+        let ty = f.ty(table).clone();
+        let out = f.case(
+            over,
+            &[ty],
+            vec![
+                Box::new(move |f| Ok(vec![few(f)?])),
+                Box::new(move |f| Ok(vec![file(f, bpos, breq, rows_v, n)?])),
+            ],
+        )?;
+        return Ok(out[0]);
+    }
+    Ok(file(f, bpos, breq, rows_v, n)?)
 }
 
 /// The pool cell of each boundary row, [`DROP`] for a row closing no block.
@@ -567,9 +763,10 @@ fn pooled_flash(
     nk: i64,
     ratio: i64,
     ps: i64,
-    compact: bool,
+    div: i64,
     scale: f32,
 ) -> Built<(Val, Val)> {
+    let compact = div > 1;
     let qd = f.dims(q).to_vec();
     let (r, h, d) = (qd[0], qd[1], qd[2]);
     let kb = KEY_BLOCK.min(nk.max(1));
@@ -596,9 +793,10 @@ fn pooled_flash(
     let m0 = f.const_f(Elem::F32, f64::NEG_INFINITY, &[r, h]);
     let l0 = f.const_f(Elem::F32, 0.0, &[r, h]);
     let a0 = f.const_f(Elem::F32, 0.0, &[r, h, d]);
-    let out = loop_upto(
+    let out = loop_at_most(
         f,
         count,
+        nb,
         &[m0, l0, a0],
         &[q, table, indices, indptr, req, visible, sel],
         |f, b, cr, inv| {
@@ -633,7 +831,7 @@ fn pooled_flash(
             let rq = f.broadcast(req, &[r, kb], &[0])?;
             let cell = cell_of(f, indices, indptr, rq, pos, ps)?;
             let cell = f.reshape(cell, &[r * kb])?;
-            let k = f.take_rows(table, cell)?;
+            let k = entry_rows(f, table, cell, div)?;
             let k = f.slice_axis(k, 1, 0, d)?;
             let k = f.reshape(k, &[r, kb, d])?;
             let s = f.dot_general(q, k, &[0], &[0], &[2], &[2], Elem::F32)?;
@@ -851,6 +1049,7 @@ pub fn lse(
     call: PoolLse<Operand, Landing>,
     planes: Entries,
     entries: &KvPool<impl Stored>,
+    tuning: crate::tuning::Tuning,
 ) -> Result<(Val, Val), Error> {
     let nk = call.walked(entries);
     let (n, hh, dd, rt) = (
@@ -869,7 +1068,7 @@ pub fn lse(
     let qv = call.q.val;
     let pos = flat_i32(f, call.positions)?;
     let req = flat_i32(f, call.request_of_token)?;
-    let (table, ps, compact) = match compact_view(
+    let (table, ps, div) = match compact_view(
         f,
         call.op,
         planes.keys.val,
@@ -877,8 +1076,8 @@ pub fn lse(
         call.head_dim,
         entries.page_size,
     )? {
-        Some((t, ps)) => (t, ps, true),
-        None => (planes.keys.val, ps, false),
+        Some((t, ps, div)) => (t, ps, div),
+        None => (planes.keys.val, ps, 1),
     };
     let sel = match call.selection {
         Some((s, _)) => {
@@ -895,6 +1094,61 @@ pub fn lse(
     let rv = f.like_i(pos, rt);
     let vis = f.add(pos, one)?;
     let vis = f.div(vis, rv)?;
+    // A prompt reading every closed entry of a compact pool: rows in
+    // blocks against whole pages of entries, a dense product a chunk, as a
+    // paged prefill walks its keys, not a gather of every row's entries
+    // (DeepSeek-V4's CSA, 1792 rows against 256 entries each: 35 of a
+    // 165 ms v6e fire).
+    let lanes = f.dims(indptr)[0] - 1;
+    if sel.is_none() && div > 1 && n > tuning.attn_per_row_max * lanes {
+        use super::paged::{Heads, Planes, Rows, Rule, blocked, geometry, with_i};
+        let geom = geometry(f, indptr, indices, ps, i64::from(entries.max_pages))?;
+        let planes = Planes::Paged {
+            keys: table,
+            values: table,
+            geom,
+            latent: true,
+        };
+        let h = Heads {
+            kvh: 1,
+            g: hh,
+            d: dd,
+            dv: dd,
+        };
+        let lane = geom.lane_of(f, req)?;
+        let cap = geom.capacity(f, lane)?;
+        let hi = f.min(vis, cap)?;
+        let zero = f.like_i(hi, 0);
+        let hi = f.max(hi, zero)?;
+        let base = with_i(f, lane, geom.span, Func::mul)?;
+        let hi = f.add(base, hi)?;
+        let q4 = f.reshape(qv, &[n, 1, hh, dd])?;
+        let rows_v = Rows::new(q4, base, hi);
+        let rule = Rule {
+            kp_span: Some(geom.span),
+            ..Rule::default()
+        };
+        let fl = blocked(
+            f,
+            &planes,
+            &h,
+            &rule,
+            &rows_v,
+            geom.lanes * geom.span,
+            f64::from(call.sm_scale),
+            // Blocks of at most 256 rows, most of them inside one lane: a
+            // block's online-softmax state, 64 heads of 512, is read and
+            // written once a chunk, and a 512-row block straddling lanes
+            // walks each lane's chunks.
+            crate::tuning::Chunks {
+                block_rows: tuning.chunks.block_rows.min(256),
+                ..tuning.chunks
+            },
+        )?;
+        let lv = fl.lse2(f)?;
+        let ov = f.reshape(fl.o, &[n, hh, dd])?;
+        return Ok((ov, lv));
+    }
     let keys = match sel {
         Some(s) => Keys::Selected(s),
         None => Keys::All,
@@ -911,7 +1165,7 @@ pub fn lse(
         nk,
         rt,
         ps,
-        compact,
+        div,
         call.sm_scale,
     )?;
     Ok((ov, lv))

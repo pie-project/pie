@@ -348,9 +348,12 @@ mod tests {
         let (profile, report) = resolve("TPU v6 lite", None);
         assert_eq!(report.used, profile::Source::Seeded("v6e.toml".into()));
         assert!(!report.untuned());
+        // the defaults, but for its 256-row attention blocks
+        let mut want = kernels_xla::tuning::Tuning::DEFAULT;
+        want.chunks.block_rows = 256;
         assert_eq!(
             kernels_xla::tuning::Tuning::on(&profile, Tpu::of("TPU v6 lite").vmem_bytes()),
-            kernels_xla::tuning::Tuning::DEFAULT
+            want
         );
         assert_eq!(
             Engine::of(&profile).pad,

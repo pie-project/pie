@@ -148,7 +148,25 @@ impl Weights {
             .enumerate()
             .map(|(at, param)| (param.name.as_str(), at))
             .collect();
-        let pairings = pairings(&landing, &index)?;
+        let mut pairings = pairings(&landing, &index)?;
+        // A block-FP8 release lands its e4m3 codes and f32 block factors as
+        // two plain planes, with no attachment between them: they pair by
+        // name, as the trace declares them.
+        for param in &trace.params {
+            if param.dtype != Dtype::E4m3 {
+                continue;
+            }
+            if let Some(&scales) = index.get(poem_scales(&param.name).as_str())
+                && trace.params[scales].dtype == Dtype::F32
+            {
+                pairings.entry(param.name.as_str()).or_insert(Pairing {
+                    scales,
+                    biases: None,
+                    group: 128,
+                    bits: 8,
+                });
+            }
+        }
         tracing::debug!(
             pairings = pairings.len(),
             attachments = landing.attachments.len(),
@@ -239,7 +257,11 @@ impl Weights {
         // `gather_only`.
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
         for at in gather_only(trace, &codes_planes, engine) {
-            let pairing = pairings[trace.params[at].name.as_str()];
+            let Some(&pairing) = pairings.get(trace.params[at].name.as_str()) else {
+                let (rows, width) = rectangle(&trace.params[at].shape);
+                folded.insert(at, fold_of(rows, width));
+                continue;
+            };
             for plane in [Some(at), Some(pairing.scales), pairing.biases]
                 .into_iter()
                 .flatten()
@@ -338,9 +360,12 @@ impl Weights {
                     });
                 }
                 let (rows, width) = shape_of(at);
-                // A pre-scaled mxfp4 bank is one e5m2 weight per code.
+                // A pre-scaled mxfp4 bank is one e5m2 weight per code; an i64
+                // table two u32 words per value.
                 let width = if stored[at] == p.dtype {
                     width
+                } else if p.dtype == Dtype::I64 {
+                    width * 2
                 } else {
                     kernels_xla::pack::codes_per_row(p.dtype, width).unwrap_or(width)
                 };
@@ -544,13 +569,9 @@ fn pairings<'a>(
                     });
                 }
             },
-            ScaleForm::F32Factors => {
-                return Err(Fault::Param {
-                    name: (*name).to_string(),
-                    why: "wants its scales expanded to f32 factors, and every quantized \
-                          point this shell stamps reads them in the width they are stored",
-                });
-            }
+            // A block-FP8 release's e4m3 codes beside its f32 factors, one a
+            // 128x128 block (`kernels_xla::linear::quant`'s `Tile`).
+            ScaleForm::F32Factors => 8,
             ScaleForm::E4m3TensorScaled => {
                 return Err(Fault::Param {
                     name: (*name).to_string(),
@@ -613,6 +634,22 @@ pub(crate) fn serves_this_deployment(path: &Path, backend: &str, deployment: &st
         .map_err(|mismatch| Fault::Recipe(mismatch.refuse(&path.display().to_string())))
 }
 
+/// The bytes landing every mxfp4 bank pre-scaled (e5m2, `Mxfp4Prescale`)
+/// adds to its e2m1 codes: the codes once more. Zero when the profile never
+/// pre-scales.
+pub(crate) fn prescale_bytes(trace: &Trace, engine: &Engine) -> Result<u64> {
+    if engine.prescale != Mxfp4Prescale::Fits {
+        return Ok(0);
+    }
+    trace
+        .params
+        .iter()
+        .filter(|p| p.dtype == Dtype::Mxfp4)
+        .try_fold(0u64, |sum, p| {
+            plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
+        })
+}
+
 /// The dense bf16 params every reader of which is a gemm taking it as its
 /// weight (`y = act · wᵀ`). They land transposed, `[K, N]` with the output
 /// axis minor: XLA's TPU gemm streams a `[N, K]` weight at ~1.2-1.4 TB/s
@@ -650,12 +687,19 @@ fn gemm_only(
     };
     let mut other = std::collections::BTreeSet::new();
     let mut inputs = Vec::new();
+    let fp8_bank = |op: &Linear| match op {
+        Linear::MoeSelect {
+            bank,
+            quantized: true,
+            ..
+        } if param_of(*bank).is_some_and(|p| trace.params[p].dtype == Dtype::E4m3) => Some(*bank),
+        _ => None,
+    };
     for node in &trace.nodes {
         inputs.clear();
         node.op.inputs(&mut inputs);
         let w = match &node.op {
-            // XLA ships no fused kernels (`crate::FUSIONS` is empty), so no
-            // `Fused` op reaches a trace this reads.
+            // The one fused op XLA forms (`crate::FUSIONS`) holds no matmul.
             Operation::Linear(
                 Linear::Matmul {
                     w,
@@ -669,12 +713,19 @@ fn gemm_only(
                     logits: true,
                     ..
                 },
-            ) => Some(*w),
-            _ => None,
+            ) => vec![*w],
+            // A routed block-FP8 bank: its codes land `[K, E·N]` like a gemm
+            // weight's (below), as the grouped-matmul kernel reads them.
+            Operation::Linear(op @ Linear::MoeSelect { .. }) => fp8_bank(op).into_iter().collect(),
+            Operation::Fused(poem_ir::Fused::MoeExperts { select, down, .. }) => [select, down]
+                .into_iter()
+                .filter_map(|op| fp8_bank(op))
+                .collect(),
+            _ => Vec::new(),
         };
         for &v in &inputs {
             let Some(p) = param_of(v) else { continue };
-            if Some(v) == w {
+            if w.contains(&v) {
                 out.insert(p);
             } else {
                 other.insert(p);
@@ -704,6 +755,13 @@ fn gemm_only(
             // 45 us a layer). It lands `[K, N]` with N padded to whole
             // 128-lane tiles (`crate::trace` slices the padding off).
             let (n, k) = bank_rectangle(param.dtype, &param.shape);
+            // Block-FP8 codes `[N, K]` land `[K, N]` too, as the
+            // grouped-matmul kernel reads them (and XLA's group-batched dot
+            // over their 128-code blocks streams K-major codes at the DMA
+            // rate, K-minor ones at half of it: v5e, 6144x24576).
+            if param.dtype == Dtype::E4m3 {
+                return true;
+            }
             let k = kernels_xla::pack::codes_per_row(param.dtype, k).unwrap_or(k);
             return kernels_xla::pack::code_bits(param.dtype).is_some_and(|b| b < 8)
                 && param.dtype != Dtype::Mxfp4
@@ -737,13 +795,20 @@ fn routed_dense(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let bank = match &node.op {
-            Operation::Linear(Linear::MoeSelect { bank, .. }) => Some(*bank),
-            Operation::Linear(Linear::MatmulGrouped { w, .. }) => Some(*w),
-            _ => None,
+            Operation::Linear(Linear::MoeSelect { bank, .. }) => vec![*bank],
+            Operation::Linear(Linear::MatmulGrouped { w, .. }) => vec![*w],
+            Operation::Fused(poem_ir::Fused::MoeExperts { select, down, .. }) => [select, down]
+                .into_iter()
+                .filter_map(|op| match op.as_ref() {
+                    Linear::MoeSelect { bank, .. } => Some(*bank),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
         };
         for &v in &inputs {
             let Some(p) = param_of(v) else { continue };
-            if Some(v) == bank {
+            if bank.contains(&v) {
                 out.insert(p);
             } else {
                 other.insert(p);
@@ -818,21 +883,19 @@ fn gather_only(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let table = match &node.op {
-            Operation::Gather(
-                Gather::Embed {
-                    table,
-                    weights: None,
-                    scales: None,
-                    concat: false,
-                    ..
-                }
-                | Gather::Embed {
-                    table,
-                    weights: None,
-                    concat: true,
-                    ..
-                },
-            ) => Some(*table),
+            Operation::Gather(Gather::Embed {
+                table,
+                weights: None,
+                scales: None,
+                concat: false,
+                ..
+            }) => Some(*table),
+            Operation::Gather(Gather::Embed {
+                table,
+                weights: None,
+                concat: true,
+                ..
+            }) => Some(*table),
             _ => None,
         };
         for &v in &inputs {
@@ -851,11 +914,20 @@ fn gather_only(
     }
     out.retain(|&p| {
         let param = &trace.params[p];
+        // a dense table only gathers read whose rows do not tile 128 lanes:
+        // `[V, 160]` bf16 landed column-major, every fire relayouted all of it
+        // (9.4 GiB of temporaries for the 6 GiB Qwen3.8-Flash-Next mini's
+        // n-gram table; gpt-oss's 2880-wide embedding, 1.9 ms a fire)
+        let dense = !codes.contains(&p)
+            && param.shape.len() == 2
+            && !param.shape[1].is_multiple_of(128)
+            && matches!(param.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32);
         !other.contains(&p)
-            && codes.contains(&p)
             && param.source != ParamSource::Registered
-            && matches!(kernels_xla::pack::code_bits(param.dtype), Some(2 | 4))
-            && param.dtype != Dtype::Mxfp4
+            && (dense
+                || codes.contains(&p)
+                    && matches!(kernels_xla::pack::code_bits(param.dtype), Some(2 | 4))
+                    && param.dtype != Dtype::Mxfp4)
     });
     out
 }
@@ -863,6 +935,11 @@ fn gather_only(
 /// A row-major `[rows, cols]` array of 2-byte elements as `[cols, rows]`,
 /// in cache-sized blocks over a few threads.
 fn transpose_2byte(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    transpose_elems(bytes, rows, cols, 2)
+}
+
+/// `transpose_2byte` for elements `e` bytes wide (block-FP8 codes: one).
+fn transpose_elems(bytes: &[u8], rows: usize, cols: usize, e: usize) -> Vec<u8> {
     const B: usize = 64;
     let mut dst = vec![0u8; bytes.len()];
     let threads = std::thread::available_parallelism()
@@ -871,17 +948,17 @@ fn transpose_2byte(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
     // Each thread fills whole output rows (input columns) `c0..c1`.
     let per = cols.div_ceil(threads).div_ceil(B) * B;
     std::thread::scope(|scope| {
-        for (t, out) in dst.chunks_mut((2 * per * rows).max(2)).enumerate() {
+        for (t, out) in dst.chunks_mut((e * per * rows).max(e)).enumerate() {
             scope.spawn(move || {
                 let c0 = t * per;
                 let c1 = (c0 + per).min(cols);
                 for rb in (0..rows).step_by(B) {
                     for cb in (c0..c1).step_by(B) {
                         for c in cb..(cb + B).min(c1) {
-                            let o = &mut out[2 * (c - c0) * rows..2 * (c - c0 + 1) * rows];
+                            let o = &mut out[e * (c - c0) * rows..e * (c - c0 + 1) * rows];
                             for r in rb..(rb + B).min(rows) {
-                                let at = 2 * (r * cols + c);
-                                o[2 * r..2 * r + 2].copy_from_slice(&bytes[at..at + 2]);
+                                let at = e * (r * cols + c);
+                                o[e * r..e * r + e].copy_from_slice(&bytes[at..at + e]);
                             }
                         }
                     }
@@ -938,6 +1015,12 @@ impl Landing<'_> {
     fn plain(&mut self, at: usize, bytes: &[u8]) -> Result<()> {
         let dtype = self.trace.params[at].dtype;
         let (rows, width) = (self.shape_of)(at);
+        if dtype == Dtype::I64 {
+            // An i64 table lands as its u32 words: a TPU splits every s64
+            // array a program reads into its halves, the whole table every
+            // fire (DeepSeek-V4's hash routes: 1.6 ms of a 20 ms v6e step).
+            return self.upload(at, Dtype::U32, width * 2, bytes);
+        }
         if self.tied_gemm.contains(&at) {
             let t = transpose_2byte(bytes, rows as usize, width as usize);
             self.gemm_buffers.insert(
@@ -973,7 +1056,8 @@ impl Landing<'_> {
             return Ok(());
         }
         if self.transposed.contains(&at) {
-            let t = transpose_2byte(bytes, rows as usize, width as usize);
+            let e = if dtype == Dtype::E4m3 { 1 } else { 2 };
+            let t = transpose_elems(bytes, rows as usize, width as usize, e);
             self.buffers[at] = Some(self.device.upload(
                 dtype,
                 u32::try_from(width).unwrap_or(u32::MAX),
@@ -1103,6 +1187,8 @@ impl Weights {
                 Dtype::U2g32 => (32, 2),
                 Dtype::U2g64 => (64, 2),
                 Dtype::U2g128 => (128, 2),
+                // Block FP8: e4m3 codes, one f32 factor a 128x128 block.
+                Dtype::E4m3 if trace.params[scales].dtype == Dtype::F32 => (128, 8),
                 _ => (0, 0),
             };
             pairings.insert(
@@ -1137,7 +1223,11 @@ impl Weights {
         let codes_planes: std::collections::BTreeSet<usize> = pairings.keys().copied().collect();
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
         for at in gather_only(trace, &codes_planes, engine) {
-            let pairing = pairings[&at];
+            let Some(&pairing) = pairings.get(&at) else {
+                let (rows, width) = rectangle(&trace.params[at].shape);
+                folded.insert(at, fold_of(rows, width));
+                continue;
+            };
             for plane in [Some(at), Some(pairing.scales), pairing.biases]
                 .into_iter()
                 .flatten()
@@ -1148,7 +1238,17 @@ impl Weights {
                 folded.insert(plane, fold_of(rows, row));
             }
         }
-        let mut stored: Vec<Dtype> = trace.params.iter().map(|p| p.dtype).collect();
+        let mut stored: Vec<Dtype> = trace
+            .params
+            .iter()
+            .map(|p| {
+                if p.dtype == Dtype::I64 {
+                    Dtype::U32
+                } else {
+                    p.dtype
+                }
+            })
+            .collect();
         for (&at, pairing) in &pairings {
             if prescale && trace.params[at].dtype == Dtype::Mxfp4 && pairing.biases.is_none() {
                 stored[at] = Dtype::E5m2;
@@ -1192,6 +1292,8 @@ impl Weights {
                         let (rows, width) = shape_of(at);
                         let width = if stored[at] == p.dtype || folded.contains_key(&at) {
                             width
+                        } else if p.dtype == Dtype::I64 {
+                            width * 2
                         } else {
                             kernels_xla::pack::codes_per_row(p.dtype, width).unwrap_or(width)
                         };

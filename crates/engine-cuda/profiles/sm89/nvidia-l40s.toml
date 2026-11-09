@@ -42,6 +42,14 @@ recording = { use = "bodies", mem_mb = 1024 }
 forward_tokens = 2304
 prefill_lattice_steps = 8
 
+# Independent chains on side streams, as the RTX 4090, H100, sm100 and the RTX PRO 6000 run them:
+# Gemma-4-26B-A4B mini c128 2,211 -> 2,271 tok/s (vLLM 2,298), gemma-4-E4B c256 6,282 -> 6,353,
+# gpt-oss-20b c256 6,929 -> 6,971, Gemma-4-31B mini c32 543 -> 545, pf8-512 6,073 -> 6,110;
+# Gemma-4-26B-A4B mini pf8-512 unchanged (18.6k), its fires past 256 rows.
+[compiler]
+dag_streams = true
+dag_streams_until = 256
+
 [provenance]
 measured = [
   "kernel.gemm.fp8_shadow",

@@ -82,6 +82,10 @@ prefill_lanes = 64
 # gemma-4-31b c128 729 -> 960, gemma-4-26b-a4b c1024 3,906 -> 6,250 tok/s
 seated_first = true
 seat_to_end = true
+# past the 68 / 382 lanes the pools hold to the end at once, the starts go in eight groups over a lane's
+# life, so the lanes finish apart and the pools hold ~90 / ~430 of them, each midway:
+# gemma-4-31b c128 961 -> 1,075 (vLLM 1,068), gemma-4-26b-a4b c1024 6,262 -> 6,805 tok/s (vLLM 6,741)
+seat_spread = true
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"

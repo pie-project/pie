@@ -127,6 +127,46 @@ pub fn embed(
     Ok(rows)
 }
 
+/// [`embed`] over a table landed folded, `[V/F, F·row]` (a bf16 row that is
+/// not whole lane tiles: `engine_xla::weights::gather_only`): row `id` is
+/// part `id % F` of stored row `id / F`.
+pub fn embed_folded(
+    f: &mut Func,
+    ids: Operand,
+    table: Operand,
+    vocab: u32,
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "gather.embed";
+    i32_ids(OP, "token ids", ids)?;
+    same_dtype(OP, table, y)?;
+    nonzero(OP, "the row count this embedding table states", vocab)?;
+    let w = nonzero(OP, "the landing's width", y.width)?;
+    if !table.width.is_multiple_of(w) || table.width == w {
+        return Err(refuse(
+            OP,
+            format!("the {}-wide table rows fold no {w}-wide row", table.width),
+        ));
+    }
+    let fold = table.width / w;
+    let ids = index_vec(f, OP, ids, y.rows)?;
+    let (ids, _) = guarded(f, ids, vocab.min(table.rows.saturating_mul(fold)))?;
+    let ff = f.like_i(ids, i64::from(fold));
+    let at = f.div(ids, ff)?;
+    let part = f.rem(ids, ff)?;
+    let rows = f.take_rows(table.val, at)?;
+    let (n, w) = (i64::from(y.rows), i64::from(w));
+    let mut out = f.slice(rows, &[0, 0], &[n, w], &[1, 1])?;
+    for j in 1..i64::from(fold) {
+        let cut = f.slice(rows, &[0, j * w], &[n, (j + 1) * w], &[1, 1])?;
+        let here = f.like_i(part, j);
+        let here = f.compare(Cmp::Eq, part, here)?;
+        let here = f.broadcast(here, &[n, w], &[0])?;
+        out = f.select(here, cut, out)?;
+    }
+    Ok(out)
+}
+
 /// The vocab-parallel embed: this rank holds table rows `[rank * local,
 /// (rank + 1) * local)`, answers them, and zeroes every other id so an
 /// all-reduce sums the shards. Read from kernels-cuda
@@ -190,33 +230,36 @@ fn concat_shape(op: &'static str, ids: impl Stored, y: impl Stored) -> Result<(u
 }
 
 /// `y[n] = table[ids[n, 0]] ‖ table[ids[n, 1]] ‖ …`; an id outside the
-/// vocabulary lands a zero slice.
+/// vocabulary lands a zero slice. A table that folds `fold` rows into each
+/// stored row (`[V/fold, fold·row]`) is read without a relayout.
 pub fn embed_concat(
     f: &mut Func,
     ids: Operand,
     table: Operand,
     vocab: u32,
+    fold: u32,
     y: Landing,
 ) -> Result<Val, Error> {
     const OP: &str = "gather.embed";
     i32_ids(OP, "token ids", ids)?;
     same_dtype(OP, table, y)?;
     nonzero(OP, "the row count this embedding table states", vocab)?;
+    nonzero(OP, "the rows a stored row folds", fold)?;
     let (heads, width) = concat_shape(OP, ids, y)?;
-    if table.width != width {
+    if u64::from(table.width) != u64::from(width) * u64::from(fold) {
         return Err(refuse(
             OP,
             format!(
-                "the table rows are {} wide and each landed slice {width}",
+                "the table rows are {} wide and each landed slice {width}, {fold} to a stored row",
                 table.width
             ),
         ));
     }
     let n = y.rows * heads;
     let ids = index_vec(f, OP, ids, n)?;
-    let (ids, ok) = guarded(f, ids, vocab.min(table.rows))?;
+    let (ids, ok) = guarded(f, ids, vocab.min(table.rows.saturating_mul(fold)))?;
     let t = table.val;
-    let rows = f.take_rows(t, ids)?;
+    let rows = take_folded(f, t, ids, i64::from(fold), i64::from(width))?;
     let rows = zero_rows(f, rows, ok)?;
     Ok(rows)
 }

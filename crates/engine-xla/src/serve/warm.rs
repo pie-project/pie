@@ -155,6 +155,21 @@ impl Shell {
                 let mut lanes = vec![fresh(decode, 1); d as usize];
                 lanes.push(fresh(prefill, rows));
                 shapes.push(lanes);
+                // A fire this wide holds many prompts beside its decodes: their
+                // lanes pad to 32 or 64 (v6e gpt-oss c256 at 4096-row fires:
+                // 27 prompts and a decode compiled mid-run, twice, 48 s).
+                // (From 4096-row fires: what a narrower fire's short prompts
+                // take compiles on demand.)
+                if b >= widest && widest >= 4096 {
+                    for n in [17u32, 33] {
+                        let each = rows / n;
+                        if each >= 2 && d + 2 * n <= self.budgets.tokens.max_lanes {
+                            let mut lanes = vec![fresh(decode, 1); d as usize];
+                            lanes.extend(std::iter::repeat_n(fresh(prefill, each), n as usize));
+                            shapes.push(lanes);
+                        }
+                    }
+                }
             }
         }
         let started = std::time::Instant::now();
@@ -215,10 +230,16 @@ impl Shell {
             index.push(at);
         }
         // Each compile holds its program's whole HLO and compile state in
-        // host memory: at most 8 at once.
+        // host memory: at most 8 at once, and no more than the host's free
+        // memory holds at ~1 GiB a MiB of the longest text (v6e,
+        // Qwen3.6-35B-A3B's 12 MiB fires: 108 GB for eight; a v5e host's 47
+        // GB stopped answering).
+        let longest = texts.iter().map(|(t, _)| t.len() as u64).max().unwrap_or(0);
+        let room = available_memory().map_or(8, |b| b / (longest << 10).max(1)) as usize;
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(8)
+            .min(room)
             .clamp(1, texts.len().max(1));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let device = &self.device;
@@ -342,4 +363,13 @@ impl Shell {
 /// token lands in the last slot of its `p`-th page; a fresh lane holds none.
 fn held_of(want: &Want, page_size: u32) -> u32 {
     (want.held_pages * page_size).saturating_sub(want.rows.min(1))
+}
+
+/// The host memory free for new allocations (`MemAvailable`), where the host
+/// says.
+fn available_memory() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib << 10)
 }

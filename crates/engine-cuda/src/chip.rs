@@ -106,6 +106,14 @@ pub struct SeatedFirst;
 #[decision(id = "engine.seat_to_end", flag, default = false, tune = engine)]
 pub struct SeatToEnd;
 
+/// With `engine.seat_to_end`, whether more processes than the pools hold to
+/// the end at once start spread over a life (`PoolFacts::seat_spread`), so
+/// they finish apart and the pools hold more of them, each midway, than a
+/// wave started at once that runs to its end together. Off seats the wave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.seat_spread", flag, default = false, tune = engine)]
+pub struct SeatSpread;
+
 /// Whether a windowed pool of short lanes takes a page a lane past its kv
 /// pages (`Paging::spare`), for a card whose ring, not its kv pages, runs
 /// dry first. Off cuts it 1:1.
@@ -175,6 +183,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<OneFrameWhenShort>()
         .add::<SeatedFirst>()
         .add::<SeatToEnd>()
+        .add::<SeatSpread>()
         .add::<WindowSpare>()
         .add::<ForwardTokens>()
         .add::<WalkFireRows>()
@@ -271,6 +280,7 @@ pub struct Engine {
     pub one_frame_when_short: bool,
     pub seated_first: bool,
     pub seat_to_end: bool,
+    pub seat_spread: bool,
     pub window_spare: bool,
     pub forward_tokens: u32,
     pub walk_fire_rows: u32,
@@ -305,6 +315,7 @@ impl Engine {
             one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
             seated_first: profile.on::<SeatedFirst>(&Anywhere),
             seat_to_end: profile.on::<SeatToEnd>(&Anywhere),
+            seat_spread: profile.on::<SeatSpread>(&Anywhere),
             window_spare: profile.on::<WindowSpare>(&Anywhere),
             forward_tokens: profile.get::<ForwardTokens>().0,
             walk_fire_rows: profile.get::<WalkFireRows>().0,
@@ -786,6 +797,7 @@ mod tests {
                 one_frame_when_short: false,
                 seated_first: false,
                 seat_to_end: false,
+                seat_spread: false,
                 window_spare: false,
                 forward_tokens: 0,
                 walk_fire_rows: 0,
@@ -868,6 +880,7 @@ mod tests {
                 one_frame_when_short: false,
                 seated_first: false,
                 seat_to_end: false,
+                seat_spread: false,
                 window_spare: false,
                 forward_tokens: 0,
                 walk_fire_rows: 0,
@@ -1167,6 +1180,7 @@ mod tests {
                         && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.fa2_live" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.compressed_replay" && std::ptr::eq(p, &l40s))
+                    || (spec.id.starts_with("compiler.dag_streams") && std::ptr::eq(p, &l40s))
                 {
                     continue;
                 }
