@@ -66,6 +66,7 @@ impl Shell {
             .saturating_sub(pad.mixed_host_rung)
             .min(self.held.len() as u32);
         let cap = pad.rung(self.paging().pages_per_slot.max(1));
+        let page_size = self.paging().page_size.max(1);
         let pool = self.paging().pages();
         let fresh = |word, rows| Want {
             word,
@@ -122,6 +123,19 @@ impl Shell {
                     // `n - 1` lanes and the padding lane the rest takes (two
                     // or three lanes pad to four).
                     shapes.push(vec![fresh(prefill, b / n); (n - 1) as usize]);
+                    // A lane past `b / n` rows beside them (prompts of unequal
+                    // length) takes a wider page bound: each up to one lane
+                    // holding the whole fire (v6e gpt-oss's 607-token batched
+                    // prefill compiled two such fires mid-run, 20 s each).
+                    let own = (b / n).div_ceil(page_size).max(1);
+                    let mut bound = pad.rung(own.max(pad.page_floor));
+                    let top = pad.rung(b.div_ceil(page_size)).min(cap);
+                    while bound < top {
+                        bound = pad.next(bound).min(top);
+                        let mut lanes = vec![fresh(prefill, b / n); (n - 1) as usize];
+                        lanes[0].held_pages = bound.saturating_sub(own);
+                        shapes.push(lanes);
+                    }
                 }
             }
         }
