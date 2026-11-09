@@ -44,8 +44,9 @@ enum ConvOut {
     Residual,
 }
 
-/// The depthwise causal conv over lanes. `x` `[T, C]` f32, `w` `[C, W]` f32,
-/// `past` `[L, hist * C]` f32 (each lane's kept rows, oldest first). Returns
+/// The depthwise causal conv over lanes. `x` `[T, C]` and `past`
+/// `[L, hist * C]` (each lane's kept rows, oldest first) in one element, bf16
+/// or f32 (the taps move in it and are weighed in f32), `w` `[C, W]` f32. Returns
 /// `y` `[T, C]` and each lane's next kept rows `[L, hist * C]`: the last
 /// `hist` of `past ++ x[begin .. begin + keep]`.
 fn conv_lanes(
@@ -66,17 +67,18 @@ fn conv_lanes(
     // Every row a lane's next window can hold: its kept rows, then x.
     let table = f.concat(&[p, x], 0)?;
     let base = l * hist;
+    let e = f.elem(x);
 
     // Tap k reads x shifted down by its offset; the first rows of each lane
     // (which would read the previous lane) are patched from its kept rows.
-    let zero = f.const_f(Elem::F32, 0.0, &[]);
+    let zero = f.const_f(e, 0.0, &[]);
     let mut acc: Option<Val> = None;
     for k in 0..taps {
         let off = (taps - 1 - k) * dil;
         let shifted = if off == 0 {
             x
         } else if off >= t {
-            f.const_f(Elem::F32, 0.0, &[t, c])
+            f.const_f(e, 0.0, &[t, c])
         } else {
             let xs = f.pad(x, zero, &[off, 0], &[0, 0], &[0, 0])?;
             f.slice_axis(xs, 0, 0, t)?
@@ -110,6 +112,7 @@ fn conv_lanes(
             let patched = f.put_rows(padded, row, kept, crate::hlo::Combine::Set)?;
             f.slice_axis(patched, 0, 0, t)?
         };
+        let tap = f.convert(tap, Elem::F32);
         let wk = f.slice_axis(w, 1, k, k + 1)?;
         let wk = f.reshape(wk, &[c])?;
         let wk = f.broadcast(wk, &[t, c], &[1])?;
@@ -129,7 +132,10 @@ fn conv_lanes(
     };
     let y = match out {
         ConvOut::Silu => f.silu(acc)?,
-        ConvOut::Residual => f.add(acc, x)?,
+        ConvOut::Residual => {
+            let x = f.convert(x, Elem::F32);
+            f.add(acc, x)?
+        }
     };
 
     // The kept rows after `keep` tokens.
@@ -291,8 +297,16 @@ fn conv(
             bias,
         )?
     } else {
-        let past = f.convert(past, Elem::F32);
-        conv_lanes(f, xv, w, past, &lanes, i64::from(dil), out, bias)?
+        // A bf16 slab's taps move in bf16 (they are x's own rows): f32
+        // only where they are weighed.
+        let e = if f.elem(past) == Elem::Bf16 {
+            Elem::Bf16
+        } else {
+            Elem::F32
+        };
+        let past = f.convert(past, e);
+        let xs = f.convert(x.val, e);
+        conv_lanes(f, xs, w, past, &lanes, i64::from(dil), out, bias)?
     };
     let slab = land_slots(f, slab, lanes.slot, lanes.write, next, per)?;
     Ok((yv, slab))
