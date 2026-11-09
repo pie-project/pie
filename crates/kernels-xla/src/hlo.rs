@@ -685,13 +685,14 @@ impl Func {
             if let Some(out) = alias {
                 let _ = write!(
                     s,
-                    " {{mhlo.layout_mode = \"default\", tf.aliasing_output = {out} : i32}}"
+                    " {{mhlo.layout_mode = \"{}\", tf.aliasing_output = {out} : i32}}",
+                    row_major(self.ty(*v))
                 );
             }
         }
-        // An aliased result keeps its parameter's (the device's default)
-        // layout: a result laid out otherwise is a copy of the whole pool
-        // plane every fire (a 64-wide rope plane is column-major on a TPU).
+        // An aliased result and its parameter are both row-major: the TPU
+        // lays a narrow parameter out column-major (a 64-wide rope plane)
+        // and the result row-major, a copy of the whole pool plane a fire.
         let mut outs = String::new();
         for (i, v) in results.iter().enumerate() {
             if i > 0 {
@@ -699,7 +700,11 @@ impl Func {
             }
             let _ = write!(outs, "{}", self.ty(*v));
             if self.params.iter().any(|(_, a)| *a == Some(i as u32)) {
-                outs.push_str(" {mhlo.layout_mode = \"default\"}");
+                let _ = write!(
+                    outs,
+                    " {{mhlo.layout_mode = \"{}\"}}",
+                    row_major(self.ty(*v))
+                );
             }
         }
         let _ = writeln!(s, ") -> ({outs}) {{");
@@ -1965,6 +1970,13 @@ const fn int_max(elem: Elem) -> i64 {
     }
 }
 
+/// `ty`'s row-major layout as XLA writes it, minor dimension first:
+/// `{1,0}` for a plane.
+fn row_major(ty: &Ty) -> String {
+    let dims: Vec<String> = (0..ty.rank()).rev().map(|d| d.to_string()).collect();
+    format!("{{{}}}", dims.join(","))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1977,7 +1989,7 @@ mod tests {
         let c = f.add(a, b).unwrap();
         let s = f.reduce(c, &[1], Fold::Sum).unwrap();
         let text = f.module("m", &[c, s]);
-        assert!(text.contains("func.func public @main(%arg0: tensor<2x3xf32>, %arg1: tensor<2x3xf32> {mhlo.layout_mode = \"default\", tf.aliasing_output = 0 : i32}) -> (tensor<2x3xf32> {mhlo.layout_mode = \"default\"}, tensor<2xf32>)"));
+        assert!(text.contains("func.func public @main(%arg0: tensor<2x3xf32>, %arg1: tensor<2x3xf32> {mhlo.layout_mode = \"{1,0}\", tf.aliasing_output = 0 : i32}) -> (tensor<2x3xf32> {mhlo.layout_mode = \"{1,0}\"}, tensor<2xf32>)"));
         assert!(text.contains("\"stablehlo.add\"(%arg0, %arg1)"));
         assert!(text.contains("\"stablehlo.reduce\""));
     }
