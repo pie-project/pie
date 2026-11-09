@@ -71,6 +71,12 @@ pub struct Gmm {
     /// `[K / 32, E·N]` bytes (`E·N`-minor bank only): the codes convert to
     /// bf16 in VMEM and take their block's power of two, exactly.
     pub scaled: bool,
+    /// A bf16 bias row per expert follows (`[E, 1, N]`, a blocked cut
+    /// only), added to the f32 product before it rounds.
+    pub bias: bool,
+    /// The result's element: f32, or the product (and its bias) rounded to
+    /// bf16 as the select's result is.
+    pub out: Elem,
 }
 
 /// How the weights are cut into blocks.
@@ -299,9 +305,28 @@ impl Gmm {
                 index,
             }
         });
+        let bias = match cut {
+            Cut::Blocked { tn } if self.bias => Some(Operand {
+                array: vec![e, 1, n],
+                elem: Elem::Bf16,
+                block: vec![1, 1, tn],
+                window: Window::Blocked,
+                index: Box::new(move |b: &mut Body, g: &Grid| {
+                    let ex = expert(b, g)?;
+                    Ok(vec![ex, b.i32(0), g.ids[0]])
+                }),
+            }),
+            Cut::Blocked { .. } | Cut::Element { .. } if self.bias => {
+                return bad("a bias over an element window");
+            }
+            _ => None,
+        };
+        if !matches!(self.out, Elem::F32 | Elem::Bf16) || (self.bias && self.out != Elem::Bf16) {
+            return bad(format!("a {:?} result (bias {})", self.out, self.bias));
+        }
         let out = Operand {
             array: vec![rows, out_width],
-            elem: Elem::F32,
+            elem: self.out,
             block: vec![tm, cols],
             window: Window::Blocked,
             index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![last(b, g)?, g.ids[0]])),
@@ -328,7 +353,7 @@ impl Gmm {
             grid: vec![nblocks, self.tiles],
             semantics: vec![Sem::Arbitrary, Sem::Arbitrary],
             prefetch: vec![vec![self.tiles], vec![1]],
-            ins: [Some(xs), Some(bank), scales]
+            ins: [Some(xs), Some(bank), scales, bias]
                 .into_iter()
                 .flatten()
                 .collect(),
@@ -378,6 +403,28 @@ impl Gmm {
                 };
                 let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
                 let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
+                let y = if self.bias {
+                    use crate::mosaic::MTy;
+                    let r = blk.ins[blk.ins.len() - 1];
+                    let row = b.vload_all(r)?;
+                    let row = b.op(
+                        "vector.shape_cast",
+                        &[row],
+                        "",
+                        &[MTy::Vector(vec![1, cols], Elem::Bf16)],
+                    )[0];
+                    let row = b.convert_f(row, Elem::F32)?;
+                    let row = b.op(
+                        "vector.broadcast",
+                        &[row],
+                        "",
+                        &[MTy::Vector(vec![tm, cols], Elem::F32)],
+                    )[0];
+                    b.addf(y, row)?
+                } else {
+                    y
+                };
+                let y = b.convert_f(y, self.out)?;
                 b.vstore_all(y, blk.outs[0])
             })
         })
@@ -469,6 +516,8 @@ mod tests {
             w: Elem::F8E5m2,
             orient,
             scaled: false,
+            bias: false,
+            out: Elem::F32,
         }
     }
 
