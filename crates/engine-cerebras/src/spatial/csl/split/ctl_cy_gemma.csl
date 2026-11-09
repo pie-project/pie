@@ -165,6 +165,8 @@ fn init() void {
   if ((cfl & 2) != 0) { oqc(5, rcfg[RQ + 15]); }
   timestamp.enable_tsc();
   vinit();
+  vinit2();
+  if ((cfl & 1) != 0 and (DIAG & 32) == 0) { pl_post(); }   // step 0's words: the storage's, on the launch-start TB
   sys_mod.unblock_cmd_stream();
 }
 
@@ -262,7 +264,7 @@ fn vexp(buf: mem1d_dsd, n: u16) void {
   @fmovs(buf, p);
 }
 // dst = gelu_tanh(src) = max(x, x e) / (1 + e), e = exp(-|y|), y = 1.5958 x (1 + 0.044715 x^2) (dst != src)
-fn vgelu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
+fn vgelu0(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
   const e = @set_dsd_length(va_d, n);
   const d = @set_dsd_length(vb_d, n);
   const r = @set_dsd_length(vc_d, n);
@@ -291,6 +293,59 @@ fn vgelu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
   @fmuls(dst, dst, r);
 }
 
+// dst = gelu_tanh(src) = max(x, x e) / (1 + e), e = exp(-|y|), y = 1.5958 x (1 + 0.044715 x^2) (dst != src).
+// The trimmed form (GELUT 1, bit-identical to vexp-based GELUT 0: -|y| by setting the sign bit, one clamp for a
+// value <= 0, exp's result used in place of a copy)
+param GELUT: u16 = 1;
+var vd: [TN]f32 align(16) = @zeros([TN]f32);
+const vd_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TN} -> vd[i] });
+var vah = vk_d;
+fn vinit2() void { vah = @increment_dsd_offset(@set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, &va)), 2), 1, u16); }
+fn vgelu(dst: mem1d_dsd, src: mem1d_dsd, n: u16) void {
+  if (GELUT == 0) { vgelu0(dst, src, n); return; }
+  const e = @set_dsd_length(va_d, n);       // y, then -|y| (exp's argument)
+  const p = @set_dsd_length(vb_d, n);       // exp's p, then exp(-|y|)
+  const r = @set_dsd_length(vc_d, n);
+  const d = @set_dsd_length(vd_d, n);
+  const kk = @set_dsd_length(vk_d, n);
+  const pl_ = @set_dsd_length(vpl, n);
+  const ph = @increment_dsd_offset(pl_, 1, u16);
+  @fmuls(e, src, src);
+  @fmuls(e, e, 0.044715);
+  @fadds(e, e, 1.0);
+  @fmuls(e, e, src);
+  @fmuls(e, e, 1.5957691216057308);   // y
+  @or16(@set_dsd_length(vah, n), @set_dsd_length(vah, n), 0x8000);   // -|y|
+  @fmaxs(e, e, -87.0);
+  @fmuls(p, e, 1.4426950408889634);
+  var c: u16 = 0;
+  while (c < 3) : (c += 1) {
+    @fadds(p, p, ex_a[c]);
+    if (c == 1) { @fmacs(e, e, p, -0.6931471805599453); }
+  }
+  @sll16(kk, pl_, 7);
+  @fmuls(p, e, 0.041458580642938614);
+  c = 0;
+  while (c < 4) : (c += 1) {
+    if (c > 0) { @fmuls(p, p, e); }
+    @fadds(p, p, ex_c[c]);
+  }
+  @add16(ph, ph, kk);                       // p = exp(-|y|)
+  @fadds(d, p, 1.0);
+  @fmuls(r, d, 0.323112507040746);
+  @fadds(r, r, -1.4540415401729079);
+  @fmuls(r, r, d);
+  @fadds(r, r, 2.1207294161729284);
+  var k: u16 = 0;
+  while (k < 2) : (k += 1) {
+    @fmuls(dst, d, r);
+    @fsubs(dst, 2.0, dst);
+    @fmuls(r, r, dst);
+  }
+  @fmuls(dst, src, p);
+  @fmaxs(dst, dst, src);
+  @fmuls(dst, dst, r);
+}
 // ---------------------------------------------------------------- RoPE
 fn rope_tables(kd: u16, p: u32) void {
   if (rope_at[kd] == p) { return; }
@@ -468,7 +523,7 @@ task pass_task() void {
         mcast(1);
       }
     }
-    if ((cfl & 1) != 0 and (DIAG & 32) == 0 and s + 1 < n_steps) { pl_post(); }
+    if ((cfl & 1) != 0 and (DIAG & 32) == 0) { pl_post(); }   // (the next pass's, this launch's or the next one's)
   }
   sys_mod.unblock_cmd_stream();
 }

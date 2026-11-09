@@ -140,6 +140,8 @@ var wl_on = false;
 var tb_on = false;
 const q_tb = @get_output_queue(5);
 var tbw = @zeros([1]f32);
+var tin = @zeros([1]u32);          // (TB rows) the launch's first token id, host-written: its PLE words come from the storage
+var tin_ptr: [*]u32 = &tin;
 const tbw_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> tbw[i] });
 var wm = @zeros([2]f32);         // (value, id) carried
 var wr = @zeros([2]f32);         // a received pair
@@ -183,6 +185,7 @@ const pass_id: local_task_id = @get_local_task_id(8);
 task pass_task() void {
   var s: u32 = 0;
   while (s < n_steps) : (s += 1) {
+    if (s == 0 and tb_on) { tbw[0] = @as(f32, tin[0]); @fmovs(fout(q_tb, 1), tbw_d); }
     stamp(0);
     @fmovs(fifo, fin(q_e, VR), .{ .async = true, .ut_id = ut_a });
     @fadds(fout(q_lo, VR), fin(q_w, VR), fifo, .{ .async = true, .ut_id = ut_b });
@@ -255,6 +258,7 @@ comptime {
   @initialize_queue(q_ww, .{ .color = @get_color(16) });
   @initialize_queue(q_tb, .{ .color = @get_color(16) });
   @export_symbol(ring_ptr, "ring");
+  @export_symbol(tin_ptr, "tin");
   @export_symbol(force_ptr, "force");
   @export_symbol(nforce_ptr, "nforce");
   @export_symbol(t_ptr, "lgt");

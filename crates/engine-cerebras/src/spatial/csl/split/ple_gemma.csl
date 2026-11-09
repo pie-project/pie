@@ -94,34 +94,35 @@ fn wait(n: u16) void {
   }
 }
 
+// one TB word: restore a switched route, and send this token's words if it is ours (seq: their pass's position + 1)
+fn take_tb(seq: u32) void {
+  @fmovs(tw_d, fin(q_tb, 1));
+  restore();
+  const tv = tw[0];
+  if ((pfl & 1) == 0 or tv < 0.0) { return; }
+  const t = @as(u32, tv);
+  if (t < t0 or t >= t0 + nt) { return; }
+  const j = @as(u16, t - t0);
+  if ((pfl & 4) == 0) {
+    const r = @get_config(pb_addr, tgt.color_addr_range) & 0xff00;
+    @set_config(pb_addr, r | 0x80 | (pb_orig & 0x1f), tgt.color_addr_range);
+    dirty = true;
+  }
+  @fh2s(@set_dsd_length(ob_d, lv), @set_dsd_length(@increment_dsd_offset(@set_dsd_base_addr(tb_d, @ptrcast([*]@fp16(), &tbl[0])), @as(i16, j * lv), @fp16()), lv));
+  ob[lv] = @as(f32, seq);
+  wait(DLY);
+  @fmovs(fout(q_pb, lv + 1), @set_dsd_length(ob_d, lv + 1));
+  sends[0] += 1;
+  sends[1] = t;
+}
 var n_steps: u32 = 0;
 var pos0: u32 = 0;
 const pass_id: local_task_id = @get_local_task_id(8);
 task pass_task() void {
   var s: u32 = 0;
+  if ((pfl & 2) != 0 and n_steps > 0) { take_tb(pos0 + 1); }   // the launch's first token (head control's tin)
   while (s < n_steps) : (s += 1) {
-    if ((pfl & 2) != 0) {
-      @fmovs(tw_d, fin(q_tb, 1));
-      restore();
-      const tv = tw[0];
-      if ((pfl & 1) != 0 and tv >= 0.0) {
-        const t = @as(u32, tv);
-        if (t >= t0 and t < t0 + nt) {
-          const j = @as(u16, t - t0);
-          if ((pfl & 4) == 0) {
-            const r = @get_config(pb_addr, tgt.color_addr_range) & 0xff00;
-            @set_config(pb_addr, r | 0x80 | (pb_orig & 0x1f), tgt.color_addr_range);
-            dirty = true;
-          }
-          @fh2s(@set_dsd_length(ob_d, lv), @set_dsd_length(@increment_dsd_offset(@set_dsd_base_addr(tb_d, @ptrcast([*]@fp16(), &tbl[0])), @as(i16, j * lv), @fp16()), lv));
-          ob[lv] = @as(f32, pos0 + s + 2);
-          wait(DLY);
-          @fmovs(fout(q_pb, lv + 1), @set_dsd_length(ob_d, lv + 1));
-          sends[0] += 1;
-          sends[1] = t;
-        }
-      }
-    }
+    if ((pfl & 2) != 0) { take_tb(pos0 + s + 2); }
   }
   sys_mod.unblock_cmd_stream();
 }

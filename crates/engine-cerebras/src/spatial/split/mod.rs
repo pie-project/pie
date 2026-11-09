@@ -414,42 +414,14 @@ impl SplitModel {
         })
     }
 
-    /// Gemma: token `v`'s PLE words into every CY row on each bus (a launch's step 0 at `pos`).
-    fn put_pl(&mut self, v: u32, pos: usize) -> R<()> {
-        let Some(gp) = self.gemma.as_ref() else {
+    /// Gemma: the launch's first token id to the head control column (`tin`): its storage PEs look up and send
+    /// its PLE words on the launch-start TB word (one copy a launch).
+    fn put_pl(&mut self, v: u32, _pos: usize) -> R<()> {
+        if self.gemma.is_none() {
             return Ok(());
-        };
-        let mut copies = Vec::new();
-        for ci in 0..gp.cols.len() {
-            let w = gp.words(ci, v, pos)?;
-            let n = (gp.cols[ci].lv + 1) as usize;
-            for &(x0, y) in &gp.cols[ci].cys {
-                for (c0, c1) in [(0, gp.xc), (gp.xc, gp.px)] {
-                    let x = x0 + c0 + u32::from(c0 >= gp.xc);
-                    copies.push((
-                        x,
-                        y,
-                        c1 - c0,
-                        n,
-                        w[c0 as usize * n..c1 as usize * n].to_vec(),
-                    ));
-                }
-            }
         }
-        for (x, y, w, n, words) in copies {
-            self.dev.put(
-                "pl",
-                Rect {
-                    x: x as i32,
-                    y: y as i32,
-                    w: w as i32,
-                    h: 1,
-                },
-                n,
-                &words,
-            )?;
-        }
-        Ok(())
+        let words = vec![v; self.hr as usize];
+        self.dev.put("tin", Rect { x: self.hctl as i32, y: 0, w: 1, h: self.hr as i32 }, 1, &words)
     }
 
     /// Token `v`'s embedding row (bf16 bits), from the head's tiles.
