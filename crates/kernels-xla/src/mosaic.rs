@@ -77,6 +77,7 @@ fn elem_name(e: Elem) -> Built<&'static str> {
         Elem::F32 => "f32",
         Elem::F8E5m2 => "f8E5M2",
         Elem::F8E4m3fn => "f8E4M3FN",
+        Elem::F4E2m1fn => "f4E2M1FN",
         other => return bad(format!("no Mosaic element type for {other:?}")),
     })
 }
