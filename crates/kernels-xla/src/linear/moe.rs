@@ -2524,6 +2524,50 @@ pub fn matmul_grouped(
     Ok(routed(f, form, fan, xv, rv, None, prev, tuning, None)?.0)
 }
 
+/// [`matmul_grouped`] under routes that send each row's slot `g` to group
+/// `g` (`linear.group_routes`): `x [rows, groups*K]` against a dense bf16
+/// `w [groups*N, K]`, one dot batched over the groups, f32. Sorting the
+/// slots by a group every row has, and gathering them back, cost 0.8 of a
+/// 68 ms DeepSeek-V4 prompt fire on a v6e a layer.
+pub fn matmul_grouped_fixed(
+    f: &mut Func,
+    x: Operand,
+    w: Operand,
+    groups: u32,
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "linear.matmul_grouped";
+    let groups = nonzero(OP, "the group count", groups)?;
+    expect(OP, x, &[Dtype::Bf16])?;
+    expect(OP, w, &[Dtype::Bf16])?;
+    let g = i64::from(groups);
+    let (rows, k, n) = (
+        i64::from(x.rows),
+        i64::from(x.width) / g,
+        i64::from(y.width) / g,
+    );
+    if !x.width.is_multiple_of(groups)
+        || !y.width.is_multiple_of(groups)
+        || y.rows != x.rows
+        || i64::from(w.width) != k
+        || i64::from(w.rows) != g * n
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "{groups} groups do not split a {}x{} row against a {}x{} plane into a {}x{} one",
+                x.rows, x.width, w.rows, w.width, y.rows, y.width
+            ),
+        ));
+    }
+    let xv = f.slice_axis(x.val, 0, 0, rows)?;
+    let xv = f.reshape(xv, &[rows, g, k])?;
+    let wv = f.reshape(w.val, &[g, n, k])?;
+    let v = f.dot_general(xv, wv, &[1], &[0], &[2], &[2], Elem::F32)?;
+    let v = f.transpose(v, &[1, 0, 2])?;
+    Ok(f.reshape(v, &[rows, g * n])?)
+}
+
 /// `y[t] = sum_s weights[t, s] * routed[t*k + s]`, in f32.
 pub fn weighted_sum(
     f: &mut Func,
