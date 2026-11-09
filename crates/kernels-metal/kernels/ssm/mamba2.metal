@@ -1,6 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "../prim/state_map.h"
+
 #ifndef PIE_RS_SNAPSHOTS
 #define PIE_RS_SNAPSHOTS 4
 #endif
@@ -20,7 +22,8 @@ METAL_FUNC void mamba2_walk(
     const device T* xbc, const device T* dt, const device T* z,
     const device float* a_log, const device float* dt_bias, const device float* skip_d,
     device float* rstate, device T* y, int heads, int groups, int h,
-    int begin, int end, uint slot, const device int* snap,
+    int begin, int end, const device ulong* map, const device uint* ids,
+    const device int* snap,
     threadgroup float* sb, threadgroup float* sc, uint tid) {
   const int p = int(tid) / 4;
   const int q = int(tid) % 4;
@@ -29,7 +32,7 @@ METAL_FUNC void mamba2_walk(
   const int g = h / (heads / groups);
   const size_t head = size_t(M2_P) * size_t(M2_N);
   const size_t cell = size_t(p) * M2_N + size_t(q) * M2_PER;
-  device float* state = rstate + (size_t(slot) * size_t(heads) + size_t(h)) * head + cell;
+  device float* state = rstate + pie_state_atom(map, ids, uint(h), ulong(head)) + cell;
   float s[M2_PER];
   for (int i = 0; i < M2_PER; ++i) s[i] = state[i];
   const float neg_a = -metal::exp(a_log[h]);
@@ -66,7 +69,10 @@ METAL_FUNC void mamba2_walk(
     // The state as of a snapshot row lands in a slot of its own.
     if (t + 1 == snap_at) {
       device float* landed =
-          rstate + (size_t(snap[PIE_RS_SNAPSHOTS + snapped]) * size_t(heads) + size_t(h)) * head + cell;
+          rstate +
+          pie_state_atom(map, snap + PIE_RS_SNAPSHOTS + snapped * int(pie_state_pieces(map)),
+                         uint(h), ulong(head)) +
+          cell;
       for (int i = 0; i < M2_PER; ++i) landed[i] = s[i];
       ++snapped;
       snap_at = snapped < PIE_RS_SNAPSHOTS && snap[snapped] > 0 ? begin + snap[snapped] : -1;
@@ -90,13 +96,15 @@ template <typename T>
     device T* y                    [[buffer(8)]],
     const constant int& heads      [[buffer(9)]],
     const constant int& groups     [[buffer(10)]],
+    const device ulong* map        [[buffer(11)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint3 lpos [[thread_position_in_threadgroup]]) {
   threadgroup float sb[M2_N];
   threadgroup float sc[M2_N];
   const int r = int(tg.z);
   mamba2_walk<T>(xbc, dt, z, a_log, dt_bias, skip_d, rstate, y, heads, groups, int(tg.y),
-                 r, r + 1, slots[r], nullptr, sb, sc, lpos.x);
+                 r, r + 1, map, slots + size_t(r) * pie_state_pieces(map), nullptr, sb, sc,
+                 lpos.x);
 }
 
 // A prompt's walk a request, its rows `indptr[r]..indptr[r + 1]`, its slot
@@ -117,6 +125,7 @@ template <typename T>
     const constant int& groups     [[buffer(11)]],
     const device int* snaps        [[buffer(12)]],
     const constant int& snap_lane0 [[buffer(13)]],
+    const device ulong* map        [[buffer(14)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint3 lpos [[thread_position_in_threadgroup]]) {
   threadgroup float sb[M2_N];
@@ -128,18 +137,22 @@ template <typename T>
     return;
   }
   const device int* snap =
-      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS : nullptr;
+      snap_lane0 >= 0
+          ? snaps + size_t(snap_lane0 + r) * pie_state_snap_row(map) * PIE_RS_SNAPSHOTS
+          : nullptr;
   mamba2_walk<T>(xbc, dt, z, a_log, dt_bias, skip_d, rstate, y, heads, groups, int(tg.y),
-                 begin, end, slots[begin], snap, sb, sc, lpos.x);
+                 begin, end, map, slots + size_t(begin) * pie_state_pieces(map), snap, sb, sc,
+                 lpos.x);
 }
 
 template [[host_name("mamba2_step_bfloat16")]] [[kernel]] void mamba2_step<bfloat>(
     const device bfloat*, const device bfloat*, const device bfloat*, const device float*,
     const device float*, const device float*, device float*, const device uint*,
-    device bfloat*, const constant int&, const constant int&, uint3, uint3);
+    device bfloat*, const constant int&, const constant int&, const device ulong*, uint3,
+    uint3);
 
 template [[host_name("mamba2_chunked_bfloat16")]] [[kernel]] void mamba2_chunked<bfloat>(
     const device bfloat*, const device int*, const device bfloat*, const device bfloat*,
     const device float*, const device float*, const device float*, device float*,
     const device uint*, device bfloat*, const constant int&, const constant int&,
-    const device int*, const constant int&, uint3, uint3);
+    const device int*, const constant int&, const device ulong*, uint3, uint3);

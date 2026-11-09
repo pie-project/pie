@@ -2,6 +2,7 @@
 using namespace metal;
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
+#include "../prim/kv_page.h"
 // KV is int8_t over a q8 pool, whose cells carry their own scale behind their D codes, and
 // bfloat over a pool stored as it was written: the same split, pack and reduce, as Splash
 // runs its verify rows over bf16 pages.
@@ -19,6 +20,10 @@ template <int GH, typename KV = int8_t, int DD = 256>
     const constant int &window [[buffer(15)]], const device bfloat *sinks [[buffer(16)]],
     device float *workspace [[buffer(17)]], constant uint &splits [[buffer(18)]],
     constant uint &qrows [[buffer(19)]], constant uint &tile_base [[buffer(20)]],
+    const constant ulong& k_page_stride [[buffer(21)]],
+    const constant ulong& v_page_stride [[buffer(22)]],
+    const constant ulong& k_offset [[buffer(23)]],
+    const constant ulong& v_offset [[buffer(24)]],
     uint3 tile [[threadgroup_position_in_grid]], uint3 grid [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]], uint simd_lid [[thread_index_in_simdgroup]]) {
 
@@ -27,6 +32,8 @@ template <int GH, typename KV = int8_t, int DD = 256>
   constexpr bool Q8 = sizeof(KV) == 1;
   // a q8 cell is D codes then a scale, 2 * D bytes; a bf16 cell is D values
   constexpr int W = Q8 ? 2 * D : D;
+  const device KV *kplane = pie_kv_plane(k_pages, k_offset);
+  const device KV *vplane = pie_kv_plane(v_pages, v_offset);
   const uint heads = GH * n_kv_heads, packed_rows = 8 * heads;
   const uint query_words = packed_rows * D / 2;
   workspace += tile.z * (query_words + splits * packed_rows * (D + 2));
@@ -89,8 +96,9 @@ template <int GH, typename KV = int8_t, int DD = 256>
         break;
 
       const uint physical = kv_page_indices[kv_page_indptr[req] + page];
-      const ulong off = (ulong(physical) * N * n_kv_heads + kv) * W;
-      auto k = tensor(const_cast<device KV *>(k_pages) + off, dextents<int, 2>{D, N},
+      const ulong k_at = ulong(physical) * (k_page_stride / sizeof(KV)) + ulong(kv) * W;
+      const ulong v_at = ulong(physical) * (v_page_stride / sizeof(KV)) + ulong(kv) * W;
+      auto k = tensor(const_cast<device KV *>(kplane) + k_at, dextents<int, 2>{D, N},
                       array<int, 2>{1, n_kv_heads * W});
       auto score =
           qkop.template get_destination_cooperative_tensor<decltype(a), decltype(k), float>();
@@ -98,9 +106,9 @@ template <int GH, typename KV = int8_t, int DD = 256>
       score.store(sv);
       if (tid < N) {
         if constexpr (Q8) {
-          kscale[tid] = *reinterpret_cast<const device float *>(k_pages + off +
+          kscale[tid] = *reinterpret_cast<const device float *>(kplane + k_at +
                                                                 ulong(tid) * n_kv_heads * W + D);
-          vscale[tid] = *reinterpret_cast<const device float *>(v_pages + off +
+          vscale[tid] = *reinterpret_cast<const device float *>(vplane + v_at +
                                                                 ulong(tid) * n_kv_heads * W + D);
         } else {
           kscale[tid] = 1.0f;
@@ -154,7 +162,7 @@ template <int GH, typename KV = int8_t, int DD = 256>
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      auto v = tensor(const_cast<device KV *>(v_pages) + off, dextents<int, 2>{D, N},
+      auto v = tensor(const_cast<device KV *>(vplane) + v_at, dextents<int, 2>{D, N},
                       array<int, 2>{1, n_kv_heads * W});
 
       for (ushort i = 0; i < acc.get_capacity(); ++i)
@@ -230,14 +238,14 @@ kernel void pie_q8_batch_reduce(const device float *workspace [[buffer(0)]],
       const device uint *, const constant int &, const constant int &, const constant float &, \
       const device uchar *, const device uint &, const device uchar *, const constant int &, \
       const device bfloat *, device float *, constant uint &, constant uint &, constant uint &, \
-      uint3, uint3, uint, uint); \
+      PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint); \
   template [[host_name("pie_bf16_batch_split_g" #gh)]] [[kernel]] void pie_q8_batch_split<gh, bfloat>( \
       const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *, \
       const constant int &, const device int *, const device int *, const device uint *, \
       const device uint *, const constant int &, const constant int &, const constant float &, \
       const device uchar *, const device uint &, const device uchar *, const constant int &, \
       const device bfloat *, device float *, constant uint &, constant uint &, constant uint &, \
-      uint3, uint3, uint, uint); \
+      PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint); \
   template [[host_name("pie_q8_batch_pack_g" #gh)]] [[kernel]] void pie_q8_batch_pack<gh>( \
       const device bfloat *, device float *, constant uint &, constant uint &, constant uint &, \
       constant uint &, uint); \
@@ -253,7 +261,7 @@ kernel void pie_q8_batch_reduce(const device float *workspace [[buffer(0)]],
       const device uint *, const constant int &, const constant int &, const constant float &, \
       const device uchar *, const device uint &, const device uchar *, const constant int &, \
       const device bfloat *, device float *, constant uint &, constant uint &, constant uint &, \
-      uint3, uint3, uint, uint); \
+      PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint); \
   template [[host_name("pie_q8_batch_pack_g" #gh "_d128")]] [[kernel]] void pie_q8_batch_pack<gh, 128>( \
       const device bfloat *, device float *, constant uint &, constant uint &, constant uint &, \
       constant uint &, uint); \

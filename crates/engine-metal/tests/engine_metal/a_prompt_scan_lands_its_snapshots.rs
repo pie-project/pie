@@ -7,9 +7,9 @@
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::Tensor;
 use kernels_metal::ssm::{self, Committed, RS_SNAPSHOTS, Snapshots};
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
+use kernels_metal::{StateMap, Tensor};
 use poem_ir::Dtype;
 
 const K_HEADS: u32 = 16;
@@ -73,6 +73,13 @@ impl Gpu {
         Tensor::new(self.bind(&b), v.len() as u32, 1, dtype)
     }
 
+    /// A bank's segment table with slots `stride` elements apart.
+    fn map(&self, stride: u64) -> Tensor {
+        let map = StateMap::whole(stride);
+        let b = self.upload(&map.bytes());
+        Tensor::new(self.bind(&b), 1, map.words().len() as u32, Dtype::U64)
+    }
+
     fn snapshots(&self, rows: &[u32], slots: &[u32]) -> Snapshots {
         Snapshots {
             table: self.ints(&table(rows, slots), Dtype::I32),
@@ -132,11 +139,13 @@ fn gated_delta(gpu: &Gpu, dim: u32, tuning: &kernels_metal::Tuning, what: &str) 
     let gates_t = Tensor::new(gpu.bind(&gates_b), T, 2 * V_HEADS, Dtype::F32);
     let y = Tensor::new(gpu.bind(&y_b), T, V_HEADS * dim, Dtype::F32);
     let work = Tensor::new(gpu.bind(&work_b), V_HEADS * dim, dim, Dtype::F32);
+    let segments = gpu.map(bank_floats);
     let pool = |slot: u32, rows: u32| RecurrentPool {
         state,
         slots: gpu.ints(&vec![slot as i32; rows as usize], Dtype::U32),
         conv_state: state,
         new_conv_state: state,
+        segments,
     };
     let indptr = |rows: u32| gpu.ints(&[0, rows as i32], Dtype::I32);
     let scan = |slot: u32, rows: u32, snapshots: Option<Snapshots>| {
@@ -265,11 +274,13 @@ fn a_prompt_scan_lands_its_snapshots() {
     let cy_b = gpu.upload(&vec![0u8; (T * CHANNELS * 2) as usize]);
     let x = Tensor::new(gpu.bind(&x_b), T, CHANNELS, Dtype::Bf16);
     let weight = Tensor::new(gpu.bind(&w_b), CHANNELS, WIDTH, Dtype::Bf16);
+    let conv_segments = gpu.map(u64::from(hist * CHANNELS));
     let conv_pool = |slot: u32, rows: u32| RecurrentPool {
         state: conv,
         slots: gpu.ints(&vec![slot as i32; rows as usize], Dtype::U32),
         conv_state: conv,
         new_conv_state: conv,
+        segments: conv_segments,
     };
     for (slot, rows, snapshots) in [
         (0u32, T, Some(gpu.snapshots(&SNAPS, &[1, 2]))),

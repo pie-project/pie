@@ -129,6 +129,7 @@ pub(super) fn attention(
     } else {
         super::vector_grid(op, shape.q_heads / if paired { 2 } else { 1 }, q.rows)?
     };
+    args.extend(pool.page_args());
     ctx.fire(
         Fire::at(
             if mpp {

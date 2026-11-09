@@ -1,6 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "../prim/state_map.h"
+
 
 constant constexpr int PLE_MAX_NGRAM = 4;
 constant constexpr int PLE_MAX_HEADS = 32;
@@ -60,10 +62,11 @@ inline void ple_hash_row(
     const constant int& eos                 [[buffer(8)]],
     const device long* map                  [[buffer(9)]],
     const constant int& has_map             [[buffer(10)]],
+    const device ulong* segs                [[buffer(11)]],
     uint pos [[thread_position_in_grid]]) {
   const int r = int(pos);
   const int span = ngram - 1;
-  const size_t slab = size_t(slots[r]) * size_t(span);
+  const size_t slab = pie_state_slot(segs, slots[r]);
 
   int window[PLE_MAX_NGRAM];
   const int fresh = ids[r];
@@ -100,6 +103,7 @@ inline void ple_hash_row(
     const constant int& eos                 [[buffer(9)]],
     const device long* map                  [[buffer(10)]],
     const constant int& has_map             [[buffer(11)]],
+    const device ulong* segs                [[buffer(12)]],
     uint pos [[thread_position_in_grid]]) {
   const int r = int(pos);
   const int begin = indptr[r];
@@ -109,7 +113,7 @@ inline void ple_hash_row(
   }
   const int rows = end - begin;
   const int span = ngram - 1;
-  const size_t slab = size_t(slots[begin]) * size_t(span);
+  const size_t slab = pie_state_slot(segs, slots[begin]);
 
   for (int t = 0; t < rows; ++t) {
     int window[PLE_MAX_NGRAM];
@@ -158,6 +162,7 @@ inline void ple_hash_row(
     const constant int& eos                 [[buffer(12)]],
     const device long* map                  [[buffer(13)]],
     const constant int& has_map             [[buffer(14)]],
+    const device ulong* segs                [[buffer(15)]],
     uint pos [[thread_position_in_grid]]) {
   const int r = int(pos);
   int begin = indptr[r];
@@ -173,7 +178,7 @@ inline void ple_hash_row(
     return;
   }
   const int span = ngram - 1;
-  const size_t slab = size_t(slot) * size_t(span);
+  const size_t slab = pie_state_slot(segs, uint(slot));
 
   for (int t = 0; t < rows; ++t) {
     int window[PLE_MAX_NGRAM];

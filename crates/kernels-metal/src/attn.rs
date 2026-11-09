@@ -469,6 +469,7 @@ fn vector(
         lse_plane(op, lse, &shape);
         args.push(lse.arg_mut());
     }
+    args.extend(pool.page_args());
     ctx.fire(
         Fire::at(FILE, entry).apply(Grid::of(
             vector_grid(op, shape.q_heads, shape.rows)?,
@@ -570,6 +571,10 @@ fn selected(
             stated(op, top_k)?.arg(),
             stated(op, ratio)?.arg(),
             i32::from(per_head).arg(),
+            pool.page_stride[0].arg(),
+            pool.page_stride[1].arg(),
+            pool.plane_offset[0].arg(),
+            pool.plane_offset[1].arg(),
         ],
     )
 }
@@ -735,6 +740,7 @@ fn tiled(
         lse_plane(op, lse, &shape);
         args.push(lse.arg_mut());
     }
+    args.extend(pool.page_args());
     ctx.fire(
         Fire::at(FILE, entry).apply(Grid::of(
             tiled_grid(op, shape.q_heads, shape.rows)?,
@@ -1061,6 +1067,10 @@ fn append_paged(
             write_page.arg(),
             write_offset.arg(),
             0_i32.arg(),
+            pool.page_stride[0].arg(),
+            pool.page_stride[1].arg(),
+            pool.plane_offset[0].arg(),
+            pool.plane_offset[1].arg(),
         ],
     )
 }
@@ -1127,7 +1137,10 @@ mod tests {
             seq_stride: u64::from(plane),
             head_stride: u64::from(HEAD_DIM),
             q8: false,
+            page_stride: [0; 2],
+            plane_offset: [0; 2],
         }
+        .paged_densely()
     }
 
     fn decode_plan() -> DecodePlan {
@@ -1565,6 +1578,10 @@ pub mod mla {
                 pool.page_size.arg(),
                 stated(OP, kv_c.width)?.arg(),
                 stated(OP, k_pe.width)?.arg(),
+                pool.page_stride[0].arg(),
+                pool.page_stride[1].arg(),
+                pool.plane_offset[0].arg(),
+                pool.plane_offset[1].arg(),
             ],
         )
     }
@@ -1665,6 +1682,7 @@ pub mod mla {
             );
             args.push(lse.arg_mut());
         }
+        args.extend(pool.page_args());
         ctx.fire(
             Fire::at(FILE, entry).apply(Grid::of(
                 [heads * SIMD * MLA_SPLIT, rows, 1],
@@ -1880,7 +1898,10 @@ pub mod mla {
                 seq_stride: u64::from(RANK),
                 head_stride: u64::from(RANK),
                 q8: false,
+                page_stride: [0; 2],
+                plane_offset: [0; 2],
             }
+            .paged_densely()
         }
 
         #[test]
@@ -2162,6 +2183,10 @@ pub mod index {
                 stated(OP, head_dim)?.arg(),
                 stated(OP, ratio)?.arg(),
                 keys.page_size.arg(),
+                keys.page_stride[0].arg(),
+                keys.page_stride[1].arg(),
+                keys.plane_offset[0].arg(),
+                keys.plane_offset[1].arg(),
             ],
         )
     }
@@ -2348,6 +2373,10 @@ pub mod index {
                 stated(OP, blocks)?.arg(),
                 stated(OP, top_k)?.arg(),
                 stated(OP, block)?.arg(),
+                keys.page_stride[0].arg(),
+                keys.page_stride[1].arg(),
+                keys.plane_offset[0].arg(),
+                keys.plane_offset[1].arg(),
             ],
         )
     }
@@ -2442,6 +2471,10 @@ pub mod index {
                 i32::from(weights.is_some()).arg(),
                 stated(OP, row_stride)?.arg(),
                 pitch.arg(),
+                keys.page_stride[0].arg(),
+                keys.page_stride[1].arg(),
+                keys.plane_offset[0].arg(),
+                keys.plane_offset[1].arg(),
             ],
         )
     }
@@ -2534,7 +2567,10 @@ pub mod index {
                 seq_stride: u64::from(DIM),
                 head_stride: u64::from(DIM),
                 q8: false,
+                page_stride: [0; 2],
+                plane_offset: [0; 2],
             }
+            .paged_densely()
         }
 
         #[test]
@@ -2854,6 +2890,7 @@ pub mod pool {
                 stated(OP, rows)?.arg(),
                 stated(OP, lanes)?.arg(),
                 i32::from(mark).arg(),
+                state.segments.arg(),
             ],
         )
     }
@@ -3028,6 +3065,7 @@ pub mod pool {
             ));
         }
         let rows = nonzero(OP, "rows", kv.rows)?;
+        let slab_page = KvPool::dense_page_stride(state_kv, pages.page_size, 0);
         ctx.fire(
             Fire::at(FILE, entry).apply(Grid::of([width, rows, 1], [width.min(256), 1, 1])),
             &[
@@ -3040,6 +3078,12 @@ pub mod pool {
                 stated(OP, width)?.arg(),
                 pages.page_size.arg(),
                 stated(OP, pitch)?.arg(),
+                // The compressor's two slabs page with the pool, each its own run
+                // of `page_size` rows of `pitch`.
+                slab_page.arg(),
+                slab_page.arg(),
+                0u64.arg(),
+                0u64.arg(),
             ],
         )
     }
@@ -3142,6 +3186,7 @@ pub mod pool {
                 ));
             }
         }
+        let slab_page = KvPool::dense_page_stride(state_kv, pages.page_size, 0);
         ctx.fire(
             Fire::at(FILE, entry).apply(Grid::of([head_dim, rows, 1], [head_dim, 1, 1])),
             &[
@@ -3159,6 +3204,12 @@ pub mod pool {
                 pages.page_size.arg(),
                 i32::from(ape.is_some()).arg(),
                 stated(OP, pitch)?.arg(),
+                // The compressor's two slabs page with the pool, each its own run
+                // of `page_size` rows of `pitch`.
+                slab_page.arg(),
+                slab_page.arg(),
+                0u64.arg(),
+                0u64.arg(),
             ],
         )
     }
@@ -3202,6 +3253,10 @@ pub mod pool {
                 stated(OP, head_dim)?.arg(),
                 pool.page_size.arg(),
                 pitch(OP, pool, head_dim)?.arg(),
+                pool.page_stride[0].arg(),
+                pool.page_stride[1].arg(),
+                pool.plane_offset[0].arg(),
+                pool.plane_offset[1].arg(),
             ],
         )
     }
@@ -3267,6 +3322,10 @@ pub mod pool {
                 entries.page_size.arg(),
                 sm_scale.arg(),
                 pitch(OP, entries, head_dim)?.arg(),
+                entries.page_stride[0].arg(),
+                entries.page_stride[1].arg(),
+                entries.plane_offset[0].arg(),
+                entries.plane_offset[1].arg(),
             ],
         )
     }
@@ -3360,6 +3419,10 @@ pub mod pool {
                 entries.page_size.arg(),
                 sm_scale.arg(),
                 pitch(OP, entries, head_dim)?.arg(),
+                entries.page_stride[0].arg(),
+                entries.page_stride[1].arg(),
+                entries.plane_offset[0].arg(),
+                entries.plane_offset[1].arg(),
             ],
         )
     }

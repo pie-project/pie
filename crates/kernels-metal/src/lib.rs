@@ -27,5 +27,5 @@ pub use encode::{
 };
 pub use error::Error;
 pub use sources::{SOURCES, resolve, source};
-pub use tensor::{Bank, KvPool, RaggedTensor, RecurrentPool, Tensor};
+pub use tensor::{Bank, KvPool, RaggedTensor, RecurrentPool, StateMap, Tensor};
 pub use tuning::Tuning;

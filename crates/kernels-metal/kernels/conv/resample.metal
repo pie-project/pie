@@ -1,4 +1,5 @@
 #include "grid.h"
+#include "../prim/state_map.h"
 
 // `x_base` / `y_base`: `x`'s and `y`'s row 0 in the grids' fire-wide rows.
 
@@ -220,6 +221,7 @@ template <typename T>
     const constant uint& frames       [[buffer(5)]],
     const constant uint& channels     [[buffer(6)]],
     const constant uint& slot_stride  [[buffer(7)]],
+    const device ulong* map           [[buffer(8)]],
     uint2 tid                         [[thread_position_in_grid]]) {
   const uint col = tid.x;
   const uint row = tid.y;
@@ -228,6 +230,7 @@ template <typename T>
 
   int base = 0;
   int found = -1;
+  int plane = 1;
   int at = 0;
   for (uint l = 0; l < clips; ++l) {
     const SpatialClip c = clip_at(grid, int(l));
@@ -235,6 +238,7 @@ template <typename T>
     if (int(row) < at + rows) {
       base = at;
       found = int(l);
+      plane = clip_plane(c);
       break;
     }
     at += rows;
@@ -248,7 +252,12 @@ template <typename T>
     cache[at_out] = static_cast<T>(0.0f);
     return;
   }
-  cache[at_out] = slab[size_t(slot_ids[found]) * size_t(slot_stride) + local];
+  // A slot is `[frames][plane][channels]`, cut into pieces of whole frames.
+  const uint f = (row - uint(base)) / uint(plane);
+  const ulong frame = ulong(plane) * ulong(channels);
+  cache[at_out] =
+      slab[pie_state_atom(map, slot_ids + size_t(found) * pie_state_pieces(map), f, frame) +
+           (local - ulong(f) * frame)];
 }
 
 template <typename T>
@@ -263,6 +272,7 @@ template <typename T>
     const constant uint& channels     [[buffer(7)]],
     const constant uint& slot_stride  [[buffer(8)]],
     const constant uint& x_base       [[buffer(9)]],
+    const device ulong* map           [[buffer(10)]],
     uint2 tid                         [[thread_position_in_grid]]) {
   const uint col = tid.x;
   const uint row = tid.y;
@@ -302,7 +312,9 @@ template <typename T>
                       * size_t(channels)
                   + size_t(col)];
   }
-  slab[size_t(slot_ids[found]) * size_t(slot_stride) + local] = value;
+  const ulong frame = ulong(plane) * ulong(channels);
+  slab[pie_state_atom(map, slot_ids + size_t(found) * pie_state_pieces(map), uint(f), frame) +
+       (local - ulong(f) * frame)] = value;
 }
 
 #define instantiate_cache_gather(name, itype)                              \
@@ -310,7 +322,8 @@ template <typename T>
   [[kernel]] void cache_gather<itype>(                             \
       const device itype*, const device int*, const device int*,           \
       device itype*, const constant uint&, const constant uint&,           \
-      const constant uint&, const constant uint&, uint2);
+      const constant uint&, const constant uint&, const device ulong*,     \
+      uint2);
 
 instantiate_cache_gather(bfloat16, bfloat)
 
@@ -320,6 +333,6 @@ instantiate_cache_gather(bfloat16, bfloat)
       const device itype*, const device itype*, const device int*,         \
       const device int*, device itype*, const constant uint&,              \
       const constant uint&, const constant uint&, const constant uint&,    \
-      const constant uint&, uint2);
+      const constant uint&, const device ulong*, uint2);
 
 instantiate_cache_store(bfloat16, bfloat)

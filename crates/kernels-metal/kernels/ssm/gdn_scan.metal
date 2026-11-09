@@ -4,6 +4,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "../prim/state_map.h"
+
 #ifndef PIE_RS_SNAPSHOTS
 #define PIE_RS_SNAPSHOTS 4
 #endif
@@ -180,13 +182,13 @@ inline void gdn_scan_token(
   }
 }
 
-template <int VROWS, int PER>
+template <int VROWS, int PER, typename I>
 inline device float* gdn_cells(
-    device float* rstate, int slot, int hv, int v_heads, int dv_base, int dk, int dv) {
-  return rstate +
-         ((size_t(slot) * size_t(v_heads) + size_t(hv)) * size_t(dv) +
-          size_t(dv_base)) *
-             size_t(dk);
+    device float* rstate, const device ulong* map, const device I* ids, int hv, int v_heads,
+    int dv_base, int dk, int dv) {
+  (void)v_heads;
+  return rstate + pie_state_atom(map, ids, uint(hv), ulong(dv) * ulong(dk)) +
+         size_t(dv_base) * size_t(dk);
 }
 
 template <int VROWS, int PER>
@@ -221,6 +223,7 @@ template <typename T, int LANES, int VROWS, int PER>
     const constant int& v_dim   [[buffer(9)]],
     const device int* snaps     [[buffer(10)]],
     const constant int& snap_lane0 [[buffer(11)]],
+    const device ulong* map     [[buffer(12)]],
     uint3 pos [[thread_position_in_grid]]) {
   const int lane = int(pos.x) % LANES;
   const int dv_base = int(pos.y) * VROWS;
@@ -237,12 +240,13 @@ template <typename T, int LANES, int VROWS, int PER>
   const int hk = hv / (v_heads / k_heads);
 
   device float* cells =
-      gdn_cells<VROWS, PER>(rstate, int(slots[begin]), hv, v_heads, dv_base, dk, dv);
+      gdn_cells<VROWS, PER>(rstate, map, slots + size_t(begin) * pie_state_pieces(map), hv,
+                            v_heads, dv_base, dk, dv);
   float st[VROWS][PER];
   gdn_load<VROWS, PER>(st, cells, lane, dk);
   // The rows whose state lands in a slot of its own, ascending; 0 ends them.
   const device int* snap =
-      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + n) * 2 * PIE_RS_SNAPSHOTS : nullptr;
+      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + n) * pie_state_snap_row(map) * PIE_RS_SNAPSHOTS : nullptr;
   int snapped = 0;
   int snap_at = snap != nullptr ? begin + snap[0] : -1;
   if constexpr (LANES != 32) {
@@ -252,7 +256,7 @@ template <typename T, int LANES, int VROWS, int PER>
           qkv, gates, y, st, t, lane, dv_base, hv, hk, k_heads, v_heads, dk, dv);
       if (t + 1 == snap_at) {
         gdn_store<VROWS, PER>(
-            gdn_cells<VROWS, PER>(rstate, snap[PIE_RS_SNAPSHOTS + snapped], hv, v_heads, dv_base,
+            gdn_cells<VROWS, PER>(rstate, map, snap + PIE_RS_SNAPSHOTS + snapped * int(pie_state_pieces(map)), hv, v_heads, dv_base,
                                   dk, dv),
             st, lane, dk);
         ++snapped;
@@ -283,7 +287,7 @@ template <typename T, int LANES, int VROWS, int PER>
     gdn_scan_update<LANES, VROWS, PER>(st, k, q, vals, mem, beta, out);
     if (t + 1 == snap_at) {
       gdn_store<VROWS, PER>(
-          gdn_cells<VROWS, PER>(rstate, snap[PIE_RS_SNAPSHOTS + snapped], hv, v_heads, dv_base,
+          gdn_cells<VROWS, PER>(rstate, map, snap + PIE_RS_SNAPSHOTS + snapped * int(pie_state_pieces(map)), hv, v_heads, dv_base,
                                 dk, dv),
           st, lane, dk);
       ++snapped;
@@ -321,7 +325,8 @@ template <typename T, int LANES, int VROWS, int PER>
       const device bfloat*, const device int*, const device float*,            \
       device float*, const device uint*, device float*,                        \
       const constant int&, const constant int&, const constant int&,           \
-      const constant int&, const device int*, const constant int&, uint3);
+      const constant int&, const device int*, const constant int&,           \
+      const device ulong*, uint3);
 
 template <typename T, int LANES, int VROWS, int PER>
 [[kernel]] void gated_delta_scan_step(
@@ -334,6 +339,7 @@ template <typename T, int LANES, int VROWS, int PER>
     const constant int& v_heads [[buffer(6)]],
     const constant int& k_dim   [[buffer(7)]],
     const constant int& v_dim   [[buffer(8)]],
+    const device ulong* map     [[buffer(9)]],
     uint3 pos [[thread_position_in_grid]]) {
   const int lane = int(pos.x) % LANES;
   const int dv_base = int(pos.y) * VROWS;
@@ -344,7 +350,8 @@ template <typename T, int LANES, int VROWS, int PER>
   const int hk = hv / (v_heads / k_heads);
 
   device float* cells =
-      gdn_cells<VROWS, PER>(rstate, int(slots[n]), hv, v_heads, dv_base, dk, dv);
+      gdn_cells<VROWS, PER>(rstate, map, slots + size_t(n) * pie_state_pieces(map), hv,
+                            v_heads, dv_base, dk, dv);
   float st[VROWS][PER];
   gdn_load<VROWS, PER>(st, cells, lane, dk);
   gdn_scan_token<T, LANES, VROWS, PER>(
@@ -358,7 +365,7 @@ template <typename T, int LANES, int VROWS, int PER>
       const device bfloat*, const device float*, device float*,                \
       const device uint*, device float*,                                       \
       const constant int&, const constant int&, const constant int&,           \
-      const constant int&, uint3);
+      const constant int&, const device ulong*, uint3);
 
 template <typename T, int LANES, int VROWS, int PER>
 [[kernel]] void gated_delta_scan_committed(
@@ -377,6 +384,7 @@ template <typename T, int LANES, int VROWS, int PER>
     const constant int& v_dim   [[buffer(12)]],
     const device int* snaps     [[buffer(13)]],
     const constant int& snap_lane0 [[buffer(14)]],
+    const device ulong* map     [[buffer(15)]],
     uint3 pos [[thread_position_in_grid]]) {
   const int lane = int(pos.x) % LANES;
   const int dv_base = int(pos.y) * VROWS;
@@ -391,8 +399,8 @@ template <typename T, int LANES, int VROWS, int PER>
   if (span <= 0) {
     return;
   }
-  const int slot = slots[lane0 + r];
-  if (slot < 0) {
+  const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
+  if (ids[0] < 0) {
     return;
   }
   const int keep = min(commit[lane0 + r], span);
@@ -400,13 +408,13 @@ template <typename T, int LANES, int VROWS, int PER>
   const int dv = v_dim;
   const int hk = hv / (v_heads / k_heads);
 
-  device float* cells = gdn_cells<VROWS, PER>(rstate, slot, hv, v_heads, dv_base, dk, dv);
+  device float* cells = gdn_cells<VROWS, PER>(rstate, map, ids, hv, v_heads, dv_base, dk, dv);
   float st[VROWS][PER];
   gdn_load<VROWS, PER>(st, cells, lane, dk);
   // A lane that snapshots folds its own rows, none replayed: the state as of
   // each of its snapshot rows lands in that row's slot.
   const device int* snap =
-      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS : nullptr;
+      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + r) * pie_state_snap_row(map) * PIE_RS_SNAPSHOTS : nullptr;
   int snapped = 0;
   int snap_at = snap != nullptr ? snap[0] : 0;
   for (int t = 0; t < span; ++t) {
@@ -418,7 +426,7 @@ template <typename T, int LANES, int VROWS, int PER>
     }
     if (t + 1 == snap_at) {
       gdn_store<VROWS, PER>(
-          gdn_cells<VROWS, PER>(rstate, snap[PIE_RS_SNAPSHOTS + snapped], hv, v_heads, dv_base,
+          gdn_cells<VROWS, PER>(rstate, map, snap + PIE_RS_SNAPSHOTS + snapped * int(pie_state_pieces(map)), hv, v_heads, dv_base,
                                 dk, dv),
           st, lane, dk);
       ++snapped;
@@ -434,7 +442,8 @@ template <typename T, int LANES, int VROWS, int PER>
       const device int*, const device int*, const constant int&,               \
       const device float*, device float*, device float*,                       \
       const constant int&, const constant int&, const constant int&,           \
-      const constant int&, const device int*, const constant int&, uint3);
+      const constant int&, const device int*, const constant int&,             \
+      const device ulong*, uint3);
 
 // The rows of a committed scan one pass stages in threadgroup memory.
 constant constexpr int kVerifyChunk = 16;
@@ -582,6 +591,7 @@ template <typename T, int LANES, int SG, int VROWS>
     const constant uint& page_bytes [[buffer(19)]],
     const constant uint& row_bytes [[buffer(20)]],
     const constant int& paged   [[buffer(21)]],
+    const device ulong* map     [[buffer(22)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint lane_u [[thread_index_in_simdgroup]],
     uint sg_u [[simdgroup_index_in_threadgroup]]) {
@@ -612,9 +622,9 @@ template <typename T, int LANES, int SG, int VROWS>
   }
   const int rep = replay[lane0 + r];
   const int span = (indptr[r + 1] - indptr[r]) + rep;
-  const int slot = slots[lane0 + r];
+  const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
   // Uniform over the threadgroup, so its barriers below are too.
-  if (span <= 0 || slot < 0) {
+  if (span <= 0 || ids[0] < 0) {
     return;
   }
   const int own = indptr[r] - rep;
@@ -626,11 +636,11 @@ template <typename T, int LANES, int SG, int VROWS>
   const size_t pitch = 2 * keys + size_t(v_heads) * D;
   const float scale = 1.0f / metal::sqrt(float(D));
 
-  device float* cells = gdn_cells<VROWS, PER>(rstate, slot, hv, v_heads, dv_base, D, D);
+  device float* cells = gdn_cells<VROWS, PER>(rstate, map, ids, hv, v_heads, dv_base, D, D);
   float st[VROWS][PER];
   gdn_load<VROWS, PER>(st, cells, lane, D);
   const device int* snap =
-      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS : nullptr;
+      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + r) * pie_state_snap_row(map) * PIE_RS_SNAPSHOTS : nullptr;
   int snapped = 0;
   int snap_at = snap != nullptr ? snap[0] : 0;
 
@@ -736,7 +746,7 @@ template <typename T, int LANES, int SG, int VROWS>
       }
       if (t + 1 == snap_at) {
         gdn_store<VROWS, PER>(
-            gdn_cells<VROWS, PER>(rstate, snap[PIE_RS_SNAPSHOTS + snapped], hv, v_heads, dv_base,
+            gdn_cells<VROWS, PER>(rstate, map, snap + PIE_RS_SNAPSHOTS + snapped * int(pie_state_pieces(map)), hv, v_heads, dv_base,
                                   D, D),
             st, lane, D);
         ++snapped;
@@ -758,7 +768,7 @@ template <typename T, int LANES, int SG, int VROWS>
       const constant int&, const constant int&, const device int*,             \
       const constant int&, device uchar*, const device int*,                   \
       const constant uint&, const constant uint&, const constant uint&,        \
-      const constant int&, uint3, uint, uint);
+      const constant int&, const device ulong*, uint3, uint, uint);
 
 PIE_GDN_VERIFY(32, 8, 2)
 PIE_GDN_VERIFY(32, 4, 4)

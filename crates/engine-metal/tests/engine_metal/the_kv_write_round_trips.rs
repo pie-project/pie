@@ -309,7 +309,10 @@ fn write_case(rig: &mut Rig, head_dim: usize) {
         seq_stride: width,
         head_stride: head_dim as u64,
         q8: false,
-    };
+        page_stride: [0; 2],
+        plane_offset: [0; 2],
+    }
+    .paged_densely();
     let kt = Tensor::new(hk, TOKENS as u32, width as u32, Dtype::Bf16);
     let vt = Tensor::new(hv, TOKENS as u32, width as u32, Dtype::Bf16);
     let wpt = Tensor::new(w_page, TOKENS as u32, 1, Dtype::U32);

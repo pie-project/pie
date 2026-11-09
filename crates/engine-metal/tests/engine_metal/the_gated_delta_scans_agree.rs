@@ -2,10 +2,10 @@
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::Tensor;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
 use kernels_metal::ssm::{self, Committed};
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
+use kernels_metal::{StateMap, Tensor};
 use poem_ir::Dtype;
 
 const K_HEADS: u32 = 16;
@@ -19,6 +19,9 @@ const T: u32 = 33;
 const J: u32 = 5;
 
 const OLD_FILE: &str = "ssm/gated_delta.metal";
+
+/// The degenerate segment table's length in words: its head and one base.
+const STATE_MAP: [u64; StateMap::HEAD + 1] = [0; StateMap::HEAD + 1];
 
 const SLOTS: u32 = 8;
 const SLOT_OLD_COMMITTED: u32 = 0;
@@ -179,11 +182,17 @@ fn the_scans_agree() {
     let table = |h: u32| Tensor::new(h, 1, 1, Dtype::I32);
     let utable = |h: u32| Tensor::new(h, 1, 1, Dtype::U32);
     let y_of = |s: u32| Tensor::new(h_y[s as usize], T, Y_WIDTH, Dtype::F32);
+    let mut map_b = Buffer::zeroed(&device, STATE_MAP.len() as u64 * 8).expect("map");
+    map_b
+        .write(0, &StateMap::whole(BANK_FLOATS).bytes())
+        .expect("write map");
+    let segments = Tensor::new(bind(&map_b), 1, STATE_MAP.len() as u32, Dtype::U64);
     let pool = |s: u32| RecurrentPool {
         state,
         slots: utable(h_slot[s as usize]),
         conv_state: state,
         new_conv_state: state,
+        segments,
     };
     let committed = |s: u32, commit: u32| Committed {
         replay: table(h_replay),
@@ -220,6 +229,9 @@ fn the_scans_agree() {
                 (K_DIM as i32).arg(),
                 (V_DIM as i32).arg(),
                 splits.arg(),
+                sink.absent().expect("no snapshot table"),
+                (-1i32).arg(),
+                segments.arg(),
             ],
         )
         .expect("the old committed kernel");
@@ -319,6 +331,7 @@ fn the_scans_agree() {
                     (K_DIM as i32).arg(),
                     (V_DIM as i32).arg(),
                     splits.arg(),
+                    segments.arg(),
                 ],
             )
             .expect("the old step kernel");

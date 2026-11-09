@@ -2,6 +2,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "../prim/kv_page.h"
+
 
 constant constexpr int kMaxCkvPer = 16;
 constant constexpr int kMaxKpePer = 4;
@@ -87,15 +89,24 @@ constant constexpr int kMlaSplit = 8;
     const constant int& page_size [[buffer(6)]],
     const constant int& kv_lora   [[buffer(7)]],
     const constant int& rope      [[buffer(8)]],
+    const constant ulong& k_page_stride [[buffer(9)]],
+    const constant ulong& v_page_stride [[buffer(10)]],
+    const constant ulong& k_offset [[buffer(11)]],
+    const constant ulong& v_offset [[buffer(12)]],
     uint2 tid [[thread_position_in_grid]]) {
   const int d = int(tid.x);
   const int row = int(tid.y);
-  const size_t slot = size_t(w_page[row]) * size_t(page_size) + size_t(w_off[row]);
+  const size_t page = size_t(w_page[row]);
+  const size_t off = size_t(w_off[row]);
   if (d < kv_lora) {
-    ckv_pages[slot * size_t(kv_lora) + d] = kv_c[size_t(row) * size_t(kv_lora) + d];
+    pie_kv_plane(ckv_pages, k_offset)[page * (k_page_stride / sizeof(bfloat)) +
+                                      off * size_t(kv_lora) + d] =
+        kv_c[size_t(row) * size_t(kv_lora) + d];
   }
   if (d < rope) {
-    kpe_pages[slot * size_t(rope) + d] = k_pe[size_t(row) * size_t(rope) + d];
+    pie_kv_plane(kpe_pages, v_offset)[page * (v_page_stride / sizeof(bfloat)) +
+                                      off * size_t(rope) + d] =
+        k_pe[size_t(row) * size_t(rope) + d];
   }
 }
 
@@ -157,6 +168,7 @@ inline void mla_naive_paged_body(
     const device int* selection,
     int top_k,
     int page_size,
+    const pie_kv_layout kvl,
     int heads,
     int ckv,
     int kpe,
@@ -202,9 +214,13 @@ inline void mla_naive_paged_body(
       if (j >= j_end) continue;
     }
     const uint page = kv_page_indices[page_base + j / page_size];
-    const size_t slot = size_t(page) * size_t(page_size) + size_t(j % page_size);
-    const device bfloat* ckv_j = ckv_pages + slot * size_t(ckv);
-    const device bfloat* kpe_j = kpe_pages + slot * size_t(kpe);
+    const size_t in_page = size_t(j % page_size);
+    const device bfloat* ckv_j = pie_kv_plane(ckv_pages, kvl.k_offset) +
+                                 size_t(page) * (kvl.k_page / sizeof(bfloat)) +
+                                 in_page * size_t(ckv);
+    const device bfloat* kpe_j = pie_kv_plane(kpe_pages, kvl.v_offset) +
+                                 size_t(page) * (kvl.v_page / sizeof(bfloat)) +
+                                 in_page * size_t(kpe);
 
     float kv[kMaxCkvPer];
     float pd = 0.0f;
@@ -268,6 +284,10 @@ inline void mla_naive_paged_body(
     const constant int& ckv         [[buffer(11)]],
     const constant int& kpe         [[buffer(12)]],
     const constant float& sm_scale  [[buffer(13)]],
+    const constant ulong& k_page_stride [[buffer(14)]],
+    const constant ulong& v_page_stride [[buffer(15)]],
+    const constant ulong& k_offset [[buffer(16)]],
+    const constant ulong& v_offset [[buffer(17)]],
     uint2 gid   [[threadgroup_position_in_grid]],
     uint lane   [[thread_index_in_simdgroup]],
     uint sg     [[simdgroup_index_in_threadgroup]]) {
@@ -276,7 +296,7 @@ inline void mla_naive_paged_body(
   threadgroup float part_acc[kMlaSplit * kMaxCkvPer * 32];
   mla_naive_paged_body(q_nope, q_pe, ckv_pages, kpe_pages, o, position_ids,
                        req_of_token, kv_page_indices, kv_page_indptr,
-                       (const device int*)nullptr, 0, page_size, heads, ckv,
+                       (const device int*)nullptr, 0, page_size, PIE_KV_LAYOUT_ARGS, heads, ckv,
                        kpe, sm_scale, gid, lane, sg,
                        part_m, part_l, part_acc);
 }
@@ -298,6 +318,10 @@ inline void mla_naive_paged_body(
     const constant float& sm_scale  [[buffer(13)]],
     const device int* selection     [[buffer(14)]],
     const constant int& top_k       [[buffer(15)]],
+    const constant ulong& k_page_stride [[buffer(16)]],
+    const constant ulong& v_page_stride [[buffer(17)]],
+    const constant ulong& k_offset [[buffer(18)]],
+    const constant ulong& v_offset [[buffer(19)]],
     uint2 gid   [[threadgroup_position_in_grid]],
     uint lane   [[thread_index_in_simdgroup]],
     uint sg     [[simdgroup_index_in_threadgroup]]) {
@@ -306,7 +330,7 @@ inline void mla_naive_paged_body(
   threadgroup float part_acc[kMlaSplit * kMaxCkvPer * 32];
   mla_naive_paged_body(q_nope, q_pe, ckv_pages, kpe_pages, o, position_ids,
                        req_of_token, kv_page_indices, kv_page_indptr, selection,
-                       top_k, page_size, heads, ckv, kpe, sm_scale, gid, lane, sg,
+                       top_k, page_size, PIE_KV_LAYOUT_ARGS, heads, ckv, kpe, sm_scale, gid, lane, sg,
                        part_m, part_l, part_acc);
 }
 
@@ -328,6 +352,10 @@ inline void mla_naive_paged_body(
     const device int* selection     [[buffer(14)]],
     const constant int& top_k       [[buffer(15)]],
     device float* lse               [[buffer(16)]],
+    const constant ulong& k_page_stride [[buffer(17)]],
+    const constant ulong& v_page_stride [[buffer(18)]],
+    const constant ulong& k_offset [[buffer(19)]],
+    const constant ulong& v_offset [[buffer(20)]],
     uint2 gid   [[threadgroup_position_in_grid]],
     uint lane   [[thread_index_in_simdgroup]],
     uint sg     [[simdgroup_index_in_threadgroup]]) {
@@ -336,6 +364,6 @@ inline void mla_naive_paged_body(
   threadgroup float part_acc[kMlaSplit * kMaxCkvPer * 32];
   mla_naive_paged_body(q_nope, q_pe, ckv_pages, kpe_pages, o, position_ids,
                        req_of_token, kv_page_indices, kv_page_indptr, selection,
-                       top_k, page_size, heads, ckv, kpe, sm_scale, gid, lane, sg,
+                       top_k, page_size, PIE_KV_LAYOUT_ARGS, heads, ckv, kpe, sm_scale, gid, lane, sg,
                        part_m, part_l, part_acc, lse);
 }

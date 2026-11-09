@@ -2,13 +2,17 @@
 
 using namespace metal;
 
+#include "../prim/kv_page.h"
+#include "../prim/state_map.h"
 
-inline size_t pool_paged_slot(
+// The first element of position `pos` of request `req` in a paged plane
+// whose pages are `page_elems` apart and whose rows are `row` wide.
+inline size_t pool_paged_cell(
     const device uint* page_indices,
     const device uint* page_indptr,
-    int req, int pos, int page_size) {
+    int req, int pos, int page_size, size_t page_elems, size_t row) {
   const uint page = page_indices[page_indptr[req] + uint(pos / page_size)];
-  return size_t(page) * size_t(page_size) + size_t(pos % page_size);
+  return size_t(page) * page_elems + size_t(pos % page_size) * row;
 }
 
 
@@ -69,16 +73,20 @@ template <typename T>
     const constant int& width      [[buffer(6)]],
     const constant int& page_size  [[buffer(7)]],
     const constant int& state_pitch[[buffer(8)]],
+    const constant ulong& k_page_stride [[buffer(9)]],
+    const constant ulong& v_page_stride [[buffer(10)]],
+    const constant ulong& k_offset [[buffer(11)]],
+    const constant ulong& v_offset [[buffer(12)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int d = int(gid.x);
   const int i = int(gid.y);
   if (d >= width) return;
-  const size_t slot =
-      size_t(w_page[i]) * size_t(page_size) + size_t(w_off[i]);
-  const size_t dst = slot * size_t(state_pitch) + size_t(d);
+  const size_t in_page = size_t(w_off[i]) * size_t(state_pitch) + size_t(d);
   const size_t src = size_t(i) * size_t(width) + size_t(d);
-  state_kv[dst] = kv[src];
-  state_score[dst] = score[src];
+  pie_kv_plane(state_kv, k_offset)[size_t(w_page[i]) * (k_page_stride / sizeof(T)) + in_page] =
+      kv[src];
+  pie_kv_plane(state_score, v_offset)[size_t(w_page[i]) * (v_page_stride / sizeof(T)) +
+                                      in_page] = score[src];
 }
 
 #define instantiate_pool_state_write(name, itype)                        \
@@ -87,7 +95,7 @@ template <typename T>
       const device itype*, const device itype*, device itype*,           \
       device itype*, const device uint*, const device uint*,             \
       const constant int&, const constant int&, const constant int&,     \
-      uint2);
+      PIE_KV_LAYOUT_TYPES uint2);
 
 instantiate_pool_state_write(bfloat16, bfloat)
 
@@ -109,6 +117,10 @@ template <typename T>
     const constant int& has_ape    [[buffer(12)]],
 
     const constant int& state_pitch[[buffer(13)]],
+    const constant ulong& k_page_stride [[buffer(14)]],
+    const constant ulong& v_page_stride [[buffer(15)]],
+    const constant ulong& k_offset [[buffer(16)]],
+    const constant ulong& v_offset [[buffer(17)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int d = int(gid.x);
   const int c = int(gid.y);
@@ -117,6 +129,10 @@ template <typename T>
   const int window = coff * ratio;
   const int width = coff * head_dim;
   const size_t pitch = size_t(state_pitch);
+  const device T* kvs = pie_kv_plane(state_kv, k_offset);
+  const device T* scores = pie_kv_plane(state_score, v_offset);
+  const size_t k_page = k_page_stride / sizeof(T);
+  const size_t v_page = v_page_stride / sizeof(T);
   const int bpos = boundary_pos[c];
   const int req = boundary_req[c];
 
@@ -130,9 +146,9 @@ template <typename T>
     const int pos = bpos + i - (window - 1);
     if (pos < 0) continue;
     const int col = ((i >= ratio) ? head_dim : 0) + d;
-    const size_t slot =
-        pool_paged_slot(page_indices, page_indptr, req, pos, page_size);
-    float sc = float(state_score[slot * pitch + size_t(col)]);
+    const size_t vcell =
+        pool_paged_cell(page_indices, page_indptr, req, pos, page_size, v_page, pitch);
+    float sc = float(scores[vcell + size_t(col)]);
     if (has_ape != 0) {
       sc += ape[size_t(pos % ratio) * size_t(width) + size_t(col)];
     }
@@ -149,15 +165,17 @@ template <typename T>
     const int pos = bpos + i - (window - 1);
     if (pos < 0) continue;
     const int col = ((i >= ratio) ? head_dim : 0) + d;
-    const size_t slot =
-        pool_paged_slot(page_indices, page_indptr, req, pos, page_size);
-    float sc = float(state_score[slot * pitch + size_t(col)]);
+    const size_t vcell =
+        pool_paged_cell(page_indices, page_indptr, req, pos, page_size, v_page, pitch);
+    float sc = float(scores[vcell + size_t(col)]);
     if (has_ape != 0) {
       sc += ape[size_t(pos % ratio) * size_t(width) + size_t(col)];
     }
     const float e = precise::exp(sc - max_s);
     sum_e += e;
-    acc += e * float(state_kv[slot * pitch + size_t(col)]);
+    const size_t kcell =
+        pool_paged_cell(page_indices, page_indptr, req, pos, page_size, k_page, pitch);
+    acc += e * float(kvs[kcell + size_t(col)]);
   }
   out[size_t(c) * size_t(head_dim) + size_t(d)] =
       T(sum_e > 0.0f ? acc / sum_e : 0.0f);
@@ -170,7 +188,7 @@ template <typename T>
       const device int*, const device int*, const device uint*,          \
       const device uint*, device itype*, const constant int&,            \
       const constant int&, const constant int&, const constant int&,     \
-      const constant int&, const constant int&, uint2);
+      const constant int&, const constant int&, PIE_KV_LAYOUT_TYPES uint2);
 
 instantiate_pool_gather_paged(bfloat16, bfloat)
 
@@ -186,6 +204,10 @@ template <typename T>
     const constant int& head_dim   [[buffer(6)]],
     const constant int& page_size  [[buffer(7)]],
     const constant int& pitch      [[buffer(8)]],
+    const constant ulong& k_page_stride [[buffer(9)]],
+    const constant ulong& v_page_stride [[buffer(10)]],
+    const constant ulong& k_offset [[buffer(11)]],
+    const constant ulong& v_offset [[buffer(12)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int d = int(gid.x);
   const int c = int(gid.y);
@@ -194,9 +216,10 @@ template <typename T>
   // A compact pool (`pitch` a position, `head_dim / pitch` positions an
   // entry) holds an entry from its block's first position on.
   const int div = head_dim / pitch;
-  const size_t slot = pool_paged_slot(
-      page_indices, page_indptr, boundary_req[c], boundary_pos[c] - (div - 1), page_size);
-  comp_kv_pages[slot * size_t(pitch) + size_t(d)] =
+  const size_t cell = pool_paged_cell(
+      page_indices, page_indptr, boundary_req[c], boundary_pos[c] - (div - 1), page_size,
+      k_page_stride / sizeof(T), size_t(pitch));
+  pie_kv_plane(comp_kv_pages, k_offset)[cell + size_t(d)] =
       entries[size_t(c) * size_t(head_dim) + size_t(d)];
 }
 
@@ -205,7 +228,8 @@ template <typename T>
   [[kernel]] void pool_store_entries<itype>(                             \
       const device itype*, device itype*, const device int*,             \
       const device int*, const device uint*, const device uint*,         \
-      const constant int&, const constant int&, const constant int&, uint2);
+      const constant int&, const constant int&, const constant int&,     \
+      PIE_KV_LAYOUT_TYPES uint2);
 
 instantiate_pool_store_entries(bfloat16, bfloat)
 
@@ -221,6 +245,10 @@ template <typename T>
     const constant int& head_dim   [[buffer(6)]],
     const constant int& ratio      [[buffer(7)]],
     const constant int& page_size  [[buffer(8)]],
+    const constant ulong& k_page_stride [[buffer(9)]],
+    const constant ulong& v_page_stride [[buffer(10)]],
+    const constant ulong& k_offset [[buffer(11)]],
+    const constant ulong& v_offset [[buffer(12)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int d = int(gid.x);
   const int c = int(gid.y);
@@ -235,9 +263,9 @@ template <typename T>
   for (int i = 0; i < ratio; ++i) {
     const int pos = bpos + i - (ratio - 1);
     if (pos < 0) continue;
-    const size_t slot =
-        pool_paged_slot(page_indices, page_indptr, req, pos, page_size);
-    acc += float(key_pages[slot * size_t(head_dim) + size_t(d)]);
+    const size_t cell = pool_paged_cell(page_indices, page_indptr, req, pos, page_size,
+                                        k_page_stride / sizeof(T), size_t(head_dim));
+    acc += float(pie_kv_plane(key_pages, k_offset)[cell + size_t(d)]);
   }
   out[size_t(c) * size_t(head_dim) + size_t(d)] = T(acc / float(ratio));
 }
@@ -248,7 +276,7 @@ template <typename T>
       const device itype*, device itype*, const device int*,             \
       const device int*, const device uint*, const device uint*,         \
       const constant int&, const constant int&, const constant int&,     \
-      uint2);
+      PIE_KV_LAYOUT_TYPES uint2);
 
 instantiate_index_block_mean_paged(bfloat16, bfloat)
 
@@ -272,6 +300,10 @@ constant int POOL_HEAD_MAX = 512;
     const constant int& page_size     [[buffer(11)]],
     const constant float& scale       [[buffer(12)]],
     const constant int& pitch         [[buffer(13)]],
+    const constant ulong& k_page_stride [[buffer(14)]],
+    const constant ulong& v_page_stride [[buffer(15)]],
+    const constant ulong& k_offset [[buffer(16)]],
+    const constant ulong& v_offset [[buffer(17)]],
     uint3 tgpos    [[threadgroup_position_in_grid]],
     uint3 lid      [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -310,9 +342,10 @@ constant int POOL_HEAD_MAX = 512;
 
   float local_max = -INFINITY;
   for (int c = tid; c < num_visible; c += POOL_ATTN_BLOCK) {
-    const size_t slot = pool_paged_slot(
-        page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch, page_size);
-    const device bfloat* k_row = comp_kv_pages + slot * size_t(pitch);
+    const device bfloat* k_row =
+        pie_kv_plane(comp_kv_pages, k_offset) +
+        pool_paged_cell(page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch,
+                        page_size, k_page_stride / sizeof(bfloat), size_t(pitch));
     float dot = 0.0f;
     for (int d = 0; d < head_dim; ++d) {
       dot += q_smem[d] * float(k_row[d]);
@@ -338,9 +371,10 @@ constant int POOL_HEAD_MAX = 512;
   float local_z = 0.0f;
 
   for (int c = 0; c < num_visible; ++c) {
-    const size_t slot = pool_paged_slot(
-        page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch, page_size);
-    const device bfloat* k_row = comp_kv_pages + slot * size_t(pitch);
+    const device bfloat* k_row =
+        pie_kv_plane(comp_kv_pages, k_offset) +
+        pool_paged_cell(page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch,
+                        page_size, k_page_stride / sizeof(bfloat), size_t(pitch));
     float dot = 0.0f;
     for (int d = tid; d < head_dim; d += POOL_ATTN_BLOCK) {
       dot += q_smem[d] * float(k_row[d]);
@@ -396,6 +430,10 @@ constant int POOL_HEAD_MAX = 512;
     const constant int& page_size     [[buffer(13)]],
     const constant float& scale       [[buffer(14)]],
     const constant int& pitch         [[buffer(15)]],
+    const constant ulong& k_page_stride [[buffer(16)]],
+    const constant ulong& v_page_stride [[buffer(17)]],
+    const constant ulong& k_offset [[buffer(18)]],
+    const constant ulong& v_offset [[buffer(19)]],
     uint3 tgpos    [[threadgroup_position_in_grid]],
     uint3 lid      [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -439,9 +477,10 @@ constant int POOL_HEAD_MAX = 512;
     const int c = srow[n];
     if (c < 0) break;
     if (c >= num_visible) continue;
-    const size_t slot = pool_paged_slot(
-        page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch, page_size);
-    const device bfloat* k_row = comp_kv_pages + slot * size_t(pitch);
+    const device bfloat* k_row =
+        pie_kv_plane(comp_kv_pages, k_offset) +
+        pool_paged_cell(page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch,
+                        page_size, k_page_stride / sizeof(bfloat), size_t(pitch));
     float dot = 0.0f;
     for (int d = 0; d < head_dim; ++d) {
       dot += q_smem[d] * float(k_row[d]);
@@ -480,9 +519,10 @@ constant int POOL_HEAD_MAX = 512;
     const int c = srow[n];
     if (c < 0) break;
     if (c >= num_visible) continue;
-    const size_t slot = pool_paged_slot(
-        page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch, page_size);
-    const device bfloat* k_row = comp_kv_pages + slot * size_t(pitch);
+    const device bfloat* k_row =
+        pie_kv_plane(comp_kv_pages, k_offset) +
+        pool_paged_cell(page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch,
+                        page_size, k_page_stride / sizeof(bfloat), size_t(pitch));
     float dot = 0.0f;
     for (int d = tid; d < head_dim; d += POOL_ATTN_BLOCK) {
       dot += q_smem[d] * float(k_row[d]);
@@ -536,11 +576,14 @@ constant int POOL_HEAD_MAX = 512;
     const constant int& rows      [[buffer(6)]],
     const constant int& lanes     [[buffer(7)]],
     const constant int& mark      [[buffer(8)]],
+    const device ulong* map       [[buffer(9)]],
     uint t [[thread_position_in_grid]]) {
+  // A lane's floor is one uncuttable piece of its record.
+  (void)stride;
   if (mark == 0) {
     if (int(t) >= rows) return;
     const int slot = slots[t];
-    floors[t] = slot >= 0 ? state[size_t(slot) * size_t(stride)] : 0;
+    floors[t] = slot >= 0 ? state[pie_state_slot(map, uint(slot))] : 0;
     return;
   }
   if (int(t) >= lanes) return;
@@ -550,5 +593,5 @@ constant int POOL_HEAD_MAX = 512;
   const int floor = positions[t0 + n - 1] + 1;
   for (int i = 0; i < n; ++i) floors[t0 + i] = floor;
   const int slot = slots[t0];
-  if (slot >= 0) state[size_t(slot) * size_t(stride)] = floor;
+  if (slot >= 0) state[pie_state_slot(map, uint(slot))] = floor;
 }

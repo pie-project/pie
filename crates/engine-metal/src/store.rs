@@ -3,7 +3,7 @@ pub mod accounting;
 pub mod kv;
 
 use engine::transfer::KvRun;
-use kernels_metal::{KvPool, RecurrentPool, Tensor};
+use kernels_metal::{KvPool, RecurrentPool, StateMap, Tensor};
 use poem_ir::{Attn, CacheRow, Def, Dtype, Operation, Trace};
 
 use crate::device::ctx::Frame;
@@ -184,6 +184,39 @@ pub struct Pools {
     parked_pages: Option<Spill>,
     /// The budget every elastic plane draws on; `None` for a fixed pool.
     arena: Option<elastic::Arena>,
+    /// Every state row's segment table ([`state_maps`]); `None` for a pool
+    /// without state rows.
+    maps: Option<Buffer>,
+}
+
+/// Bytes of one state row's segment table: its head and one segment.
+const STATE_MAP_BYTES: u64 = ((StateMap::HEAD + 1) * 8) as u64;
+
+/// Every state row's segment table, one after another in row order: each
+/// row's plane is one segment and each chunk one slot, so a slot sits where
+/// it always has ([`StateMap::whole`]).
+fn state_maps(device: &Context, shapes: &[Shape]) -> Result<Option<Buffer>> {
+    let tables: Vec<u8> = shapes
+        .iter()
+        .filter_map(|shape| match *shape {
+            Shape::State { stride, .. } => Some(StateMap::whole(stride).bytes()),
+            Shape::Kv { .. } | Shape::Compressed { .. } => None,
+        })
+        .flatten()
+        .collect();
+    if tables.is_empty() {
+        return Ok(None);
+    }
+    debug_assert!((tables.len() as u64).is_multiple_of(STATE_MAP_BYTES));
+    let mut buffer = Buffer::zeroed(device, tables.len() as u64)?;
+    buffer.write(0, &tables)?;
+    Ok(Some(buffer))
+}
+
+/// The first byte of slot `slot` of a state row of `stride` elements of
+/// `dtype`, as its segment table places it.
+fn state_slot_offset(stride: u64, dtype: Dtype, slot: u32) -> u64 {
+    StateMap::whole(stride).slot(slot) * u64::from(elem_size(dtype))
 }
 
 #[derive(Debug)]
@@ -323,6 +356,7 @@ impl Pools {
             }
             shapes.push(row.shape);
         }
+        let maps = state_maps(device, &shapes)?;
         Ok(Pools {
             planes,
             shapes,
@@ -332,6 +366,7 @@ impl Pools {
             parked: None,
             parked_pages: None,
             arena,
+            maps,
         })
     }
 
@@ -498,7 +533,7 @@ impl Pools {
             };
             let bytes = stride * u64::from(elem_size(dtype));
             let mut span = vec![0u8; usize::try_from(bytes).unwrap_or(0)];
-            self.planes[plane].read(u64::from(slot) * bytes, &mut span)?;
+            self.planes[plane].read(state_slot_offset(stride, dtype, slot), &mut span)?;
             out.extend_from_slice(&span);
         }
         Ok(out)
@@ -571,6 +606,7 @@ impl Pools {
     pub fn table(&self, handles: &Handles, seats: &Seats, q8: bool) -> Result<CacheTable> {
         let mut rows = Vec::with_capacity(self.shapes.len());
         let mut compressed = Vec::new();
+        let mut state_row = 0u64;
         let cells = self.paging.pages() * u64::from(self.paging.page_size);
         for shape in &self.shapes {
             rows.push(match *shape {
@@ -626,16 +662,21 @@ impl Pools {
                             dtype,
                         ))
                     };
-                    CachePool::Kv(KvPool {
-                        keys: plane(keys, u64::from(kv_heads) * u64::from(head_dim))?,
-                        values: plane(values, values_width)?,
-                        page_indices: seat.page_indices,
-                        page_indptr: seat.page_indptr,
-                        page_size: narrow(u64::from(self.paging.page_size)),
-                        seq_stride: u64::from(kv_heads) * u64::from(head_dim),
-                        head_stride: u64::from(head_dim),
-                        q8,
-                    })
+                    CachePool::Kv(
+                        KvPool {
+                            keys: plane(keys, u64::from(kv_heads) * u64::from(head_dim))?,
+                            values: plane(values, values_width)?,
+                            page_indices: seat.page_indices,
+                            page_indptr: seat.page_indptr,
+                            page_size: narrow(u64::from(self.paging.page_size)),
+                            seq_stride: u64::from(kv_heads) * u64::from(head_dim),
+                            head_stride: u64::from(head_dim),
+                            q8,
+                            page_stride: [0; 2],
+                            plane_offset: [0; 2],
+                        }
+                        .paged_densely(),
+                    )
                 }
                 Shape::State {
                     stride,
@@ -649,11 +690,22 @@ impl Pools {
                         u32::try_from(stride).unwrap_or(u32::MAX),
                         dtype,
                     );
+                    let maps = self.maps.as_ref().ok_or_else(|| Fault::Unbound {
+                        what: "the state rows' segment tables".to_string(),
+                    })?;
+                    let segments = Tensor::new(
+                        handles.bind(maps, state_row * STATE_MAP_BYTES, STATE_MAP_BYTES)?,
+                        1,
+                        (StateMap::HEAD + 1) as u32,
+                        Dtype::U64,
+                    );
+                    state_row += 1;
                     CachePool::Recurrent(RecurrentPool {
                         state: bank,
                         slots: seats.slot_of_row,
                         conv_state: bank,
                         new_conv_state: bank,
+                        segments,
                     })
                 }
             });
@@ -690,7 +742,7 @@ impl Pools {
                 continue;
             };
             let bytes = stride * u64::from(elem_size(dtype));
-            self.planes[plane].zero(u64::from(slot) * bytes, bytes)?;
+            self.planes[plane].zero(state_slot_offset(stride, dtype, slot), bytes)?;
         }
         Ok(())
     }
@@ -935,7 +987,10 @@ impl Pools {
                 if src == dst {
                     continue;
                 }
-                let (from, to) = (u64::from(src) * bytes, u64::from(dst) * bytes);
+                let (from, to) = (
+                    state_slot_offset(stride, dtype, src),
+                    state_slot_offset(stride, dtype, dst),
+                );
                 slab.span(from, bytes)?;
                 slab.span(to, bytes)?;
                 frame.copy(slab.slab(), from, slab.slab(), to, bytes)?;
@@ -1352,15 +1407,17 @@ mod tests {
 
     fn state_pools(device: &Context, slots: u32, stride: u64) -> Pools {
         let bytes = stride * u64::from(slots) * u64::from(elem_size(STATE_DTYPE));
+        let shapes = vec![Shape::State {
+            stride,
+            dtype: STATE_DTYPE,
+            plane: 0,
+        }];
         Pools {
             planes: vec![Plane::Fixed(
                 Buffer::zeroed(device, bytes).expect("a state slab"),
             )],
-            shapes: vec![Shape::State {
-                stride,
-                dtype: STATE_DTYPE,
-                plane: 0,
-            }],
+            maps: state_maps(device, &shapes).expect("the segment tables"),
+            shapes,
             paging: paging(slots),
             watermark: engine::frame::Demand::ZERO,
             disk: None,
@@ -1464,6 +1521,7 @@ mod tests {
             parked: None,
             parked_pages: None,
             arena,
+            maps: None,
         }
     }
 
@@ -1693,6 +1751,7 @@ mod tests {
             parked: None,
             parked_pages: None,
             arena: None,
+            maps: None,
         };
         let mut frame = device.frame().expect("a frame");
         pools

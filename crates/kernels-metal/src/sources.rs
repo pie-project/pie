@@ -265,12 +265,20 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/prim/gemm_transforms.h")),
     ),
     (
+        "prim/kv_page.h",
+        include_str!(concat!(source_root!(), "/prim/kv_page.h")),
+    ),
+    (
         "prim/mpp.h",
         include_str!(concat!(source_root!(), "/prim/mpp.h")),
     ),
     (
         "prim/register_table.h",
         include_str!(concat!(source_root!(), "/prim/register_table.h")),
+    ),
+    (
+        "prim/state_map.h",
+        include_str!(concat!(source_root!(), "/prim/state_map.h")),
     ),
     (
         "runtime/blit.metal",
