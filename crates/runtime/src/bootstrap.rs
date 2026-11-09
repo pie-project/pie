@@ -118,6 +118,9 @@ pub struct RuntimeConfig {
 pub struct ModelConfig {
     /// How much congestion the system may show before this gives memory back.
     pub memory_tolerance: crate::governor::Tolerance,
+    /// Whether streamable weights may be evicted under pressure; resolved
+    /// per engine against [`EngineConfig::weights_fit`].
+    pub weight_streaming: crate::store::weights::WeightStreaming,
     pub name: String,
     pub model_id: String,
     pub kv_page_size: usize,
@@ -128,6 +131,10 @@ pub struct ModelConfig {
 }
 
 pub struct EngineConfig {
+    /// The model's weights fit the device budget at load
+    /// (`LoadFacts::weights_resident`): what `weight_streaming = auto`
+    /// reads.
+    pub weights_fit: bool,
     pub total_pages: usize,
     /// Bytes a kv page takes where the pool can change size; zero: it cannot.
     pub resizable_kv_page_bytes: u64,
@@ -265,6 +272,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     let ModelConfig {
         memory_tolerance,
+        weight_streaming,
         name,
         model_id,
         kv_page_size,
@@ -461,7 +469,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let engines: Vec<usize> = engine_configs
         .into_iter()
         .map(|d| {
-            engine::register_engine_backend(
+            let streams = weight_streaming.streams(d.weights_fit);
+            let id = engine::register_engine_backend(
                 engine::EngineSpec {
                     device_domain: ::engine::MemoryDomain::HostPinned,
                     num_kv_pages: d.total_pages,
@@ -469,7 +478,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     device_geometry_port_mask: d.device_geometry_port_mask,
                 },
                 d.engine_backend,
-            )
+            );
+            crate::store::weights::set_streaming(id, streams);
+            tracing::info!(
+                engine = id,
+                mode = ?weight_streaming,
+                weights_fit = d.weights_fit,
+                streams,
+                "weight streaming"
+            );
+            id
         })
         .collect();
 

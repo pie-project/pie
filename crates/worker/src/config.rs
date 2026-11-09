@@ -509,6 +509,14 @@ pub struct ModelConfig {
     /// All but `dedicated` also give back what demand stopped asking for.
     #[serde(default)]
     pub memory_tolerance: runtime::governor::Tolerance,
+    /// Whether the streamable weights (routed MoE experts, per-layer
+    /// embedding rows) may leave the device under memory pressure: `on`
+    /// sheds their cache down to the staging floor before any kv or state
+    /// gives way, `off` keeps every weight resident and lets the pressure
+    /// fall on kv and state, `auto` is off when the weights fit the
+    /// device at load and on when they do not.
+    #[serde(default)]
+    pub weight_streaming: runtime::store::weights::WeightStreaming,
     /// How many device bytes the kv pages and recurrent-state slots take
     /// (`"20GiB"`), per device. Omit to fill what `device_memory_share`
     /// leaves once the weights and working set are down. A budget the device
@@ -1203,6 +1211,25 @@ device = ["metal:0"]
         adapters_are_absent_by_default_and_that_is_zero_seats();
         the_seat_count_is_stated_once_or_derived_from_the_roster();
         an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
+        weight_streaming_is_auto_unless_stated();
+    }
+
+    fn weight_streaming_is_auto_unless_stated() {
+        use runtime::store::weights::WeightStreaming;
+        let cfg = Config::parse(MINIMAL_METAL).unwrap();
+        assert_eq!(cfg.model.weight_streaming, WeightStreaming::Auto);
+        for (word, mode) in [("on", WeightStreaming::On), ("off", WeightStreaming::Off)] {
+            let toml = MINIMAL_METAL.replace(
+                "source = \"Qwen/Qwen3-0.6B\"",
+                &format!("source = \"Qwen/Qwen3-0.6B\"\nweight_streaming = \"{word}\""),
+            );
+            assert_eq!(Config::parse(&toml).unwrap().model.weight_streaming, mode);
+        }
+        let bad = MINIMAL_METAL.replace(
+            "source = \"Qwen/Qwen3-0.6B\"",
+            "source = \"Qwen/Qwen3-0.6B\"\nweight_streaming = \"maybe\"",
+        );
+        assert!(Config::parse(&bad).is_err());
     }
 
     fn an_unknown_key_is_refused() {
