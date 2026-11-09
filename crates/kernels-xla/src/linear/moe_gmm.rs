@@ -674,6 +674,10 @@ impl Gmm {
                     let y = b.convert_f(y, self.out)?;
                     return b.vstore_all(y, blk.outs[0]);
                 };
+                if std::env::var_os("PIE_XLA_NO_ROTATE").is_some() {
+                    let y = b.convert_f(y, self.out)?;
+                    return b.vstore_all(y, blk.outs[0]);
+                }
                 // The expert's outputs turned to column 0 in VMEM (gathering
                 // the rows at a per-row column offset afterwards relays every
                 // row out: v6e gpt-oss, 0.2 ms a layer at 4096 tokens).

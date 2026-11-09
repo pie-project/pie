@@ -180,6 +180,7 @@ pub(crate) fn turn(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Val, Erro
     if unit < 128
         && width % 128 == 0
         && rows >= 1024
+        && std::env::var_os("PIE_XLA_NO_FLAT").is_none()
         && let Some(v) = turn_flat(f, x, pos, t)?
     {
         return Ok(v);
