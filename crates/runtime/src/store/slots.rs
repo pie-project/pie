@@ -100,13 +100,27 @@ pub enum Holder {
     WorkingSet(u64),
     CacheEntry(Hash256),
     Snapshot(u64),
+    /// The weight cache's slots of weight shape `shape` (see
+    /// [`super::weights`]): `pinned`, its staging floor (and, not
+    /// streaming, every atom), held whatever the pressure; else the
+    /// resident atoms above the floor, which go first when the pool is
+    /// short.
+    Weights {
+        shape: ShapeId,
+        pinned: bool,
+    },
 }
 
 impl Holder {
-    /// Working sets and snapshots keep their slots live; a cache entry's
-    /// slots are wanted but may go.
+    /// Working sets, snapshots and the weights' staging floor keep their
+    /// slots live; a cache entry's slots, and resident weights above the
+    /// floor, are wanted but may go.
     pub fn is_live(&self) -> bool {
-        !matches!(self, Holder::CacheEntry(_))
+        match self {
+            Holder::CacheEntry(_) => false,
+            Holder::Weights { pinned, .. } => *pinned,
+            Holder::WorkingSet(_) | Holder::Snapshot(_) => true,
+        }
     }
 }
 

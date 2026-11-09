@@ -191,6 +191,9 @@ pub trait PoolTarget {
     fn shrink_rung(&mut self);
     /// The system has settled: fires may take their full rung again.
     fn restore_rung(&mut self);
+    /// A tick's turn is done (not a waiter's): what changes only once a
+    /// tick, as which weights are resident, changes now.
+    fn ticked(&mut self) {}
 }
 
 /// What the loop tells the runtime, which maps it to the policy's
