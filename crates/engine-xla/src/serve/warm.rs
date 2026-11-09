@@ -245,6 +245,7 @@ impl Shell {
         }) as usize;
         let running = std::sync::atomic::AtomicUsize::new(0);
         let admit = std::sync::Mutex::new(());
+        let stop = std::sync::atomic::AtomicBool::new(false);
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(8)
@@ -270,17 +271,30 @@ impl Shell {
                         // Admitted one at a time: a compile in flight may
                         // not have taken its memory yet, so each counts as
                         // still to come.
-                        loop {
+                        let admitted = loop {
                             let turn = admit.lock().expect("the warm admission lock poisoned");
                             let busy = running.load(SeqCst) as u64;
-                            if busy == 0
-                                || available_memory().is_none_or(|b| b >= need * (busy + 1))
-                            {
+                            let free = available_memory();
+                            // Each compiled program also stays in host memory
+                            // (v5e, Qwen3.6-35B-A3B's pf256 ladder: ~0.43 GB
+                            // each, past the host's 47 GB by ~100): once one
+                            // more compile no longer fits, the rest wait for a
+                            // fire to meet them.
+                            if free.is_some_and(|b| b < need) {
+                                stop.store(true, SeqCst);
+                            }
+                            if stop.load(SeqCst) {
+                                break false;
+                            }
+                            if busy == 0 || free.is_none_or(|b| b >= need * (busy + 1)) {
                                 running.fetch_add(1, SeqCst);
-                                break;
+                                break true;
                             }
                             drop(turn);
                             std::thread::sleep(std::time::Duration::from_millis(200));
+                        };
+                        if !admitted {
+                            break;
                         }
                         let program = device.program(text, (*sig).clone());
                         running.fetch_sub(1, SeqCst);
@@ -298,6 +312,13 @@ impl Shell {
         });
         for (at, slot) in slots.into_iter().enumerate() {
             programs[at] = slot.into_inner().ok().flatten();
+        }
+        let waiting = programs.iter().filter(|p| p.is_none()).count();
+        if waiting > 0 {
+            tracing::warn!(
+                waiting,
+                "xla warm ladder stopped: the host's free memory holds no more compiles"
+            );
         }
         // The compiles' scratch is freed by now: hand it back rather than
         // keep it in the allocator's arenas. glibc's call; the other libcs
